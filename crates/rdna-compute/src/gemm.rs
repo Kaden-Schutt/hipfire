@@ -12,6 +12,57 @@ use hip_bridge::{DeviceBuffer, HipResult};
 use std::ffi::c_void;
 use std::sync::OnceLock;
 
+/// Batch ceilings for the LDS-staged HFQ4-G256 GEMMs (`HIPFIRE_HFQ4G256_LDSSTAGE=1`).
+/// The staged kernels win while the grid is small and lose once the added LDS
+/// traffic plus the `__launch_bounds__(256,4)` occupancy cap outweigh the
+/// coalesced loads. Every value below is MEASURED in-engine (`hipfire bench
+/// --matrix`, matched A/B/B/A, runs 5, warmups 10, dense 27B MQ4), 2026-07-29/30:
+///
+///   gfx1201 (R9700, 64 CU, pinned 3.6-27B `86a5f80f…`):
+///     B16 1.0902  B32 1.0489  B64 1.0300  B72 1.0914  B80 1.1079
+///     B96 1.0409  B112 0.9977  B128 0.9096  B512 0.9465  B1024 0.9492
+///   gfx1100 (7900 XTX, 96 CU, 3.5-27B):
+///     B16 1.1044  B32 1.1324  B64 1.1719  B96 1.1786   (>=128 unreachable, see below)
+///   gfx1151 (Strix Halo, 40 CU, 3.5-27B):
+///     B16 1.1132  B24 1.0487  B32 1.0383  B48 1.0023  B64 0.9915
+///
+/// Turn points are NOT a function of CU count (gfx1201 turns at 96-112 with 64 CU,
+/// gfx1151 at 32-48 with 40 CU) — an earlier CU-count reading was an artifact of a
+/// coarse sweep grid. They are also NOT portable from a small model: a 0.8b canary
+/// measured +11..+23% at batch 512-8192 where 27B measures -3.5..-5.4%
+/// (.research/round5-verify-cost.md §17). Measure per arch on a real model.
+///
+/// On gfx11 the staged path is only REACHABLE below the MMQ cutoff: `gemm.rs`
+/// routes `arch_caps.should_use_mmq(batch_size)` (128 on RDNA3/3.5) to the MMQ
+/// kernel before the gfx11 WMMA branch, so batch >= 128 never reaches these
+/// kernels there. gfx12 has no such diversion, which is why only gfx12 shows the
+/// large-batch regression.
+const LDSSTAGE_MAX_BATCH: usize = 96;
+
+/// gfx11 (RDNA3 / RDNA3.5), both dGPU and iGPU. Re-measured on the PINNED 3.6
+/// trunk `86a5f80f…` (the fixture rule: measure 3.6 when it exists), which
+/// reproduced the earlier 3.5 numbers within +/-0.7 percentage points at every
+/// shared batch on both parts:
+///
+///   gfx1100 (7900 XTX, 96 CU): B16 1.0992  B24 1.1150  B32 1.1355
+///                              B48 1.1792  B64 1.1670  B96 1.1754   (all WIN)
+///   gfx1151 (Strix Halo, 40 CU): B16 1.1155  B24 1.0449  B32 1.0452
+///                              B48 1.0054  B64 0.9947  B96 1.0399
+///
+/// The iGPU has a wash band at 48-64 (worst case -0.5%, inside the 0.87-1.25%
+/// run-to-run spread) and then wins again at 96 — reproducible on BOTH model
+/// files. That is the non-staged kernel dipping at 96 (its OFF arm drops
+/// 196.7 -> 190.3 tok/s while the staged arm stays flat at ~198), not the staged
+/// kernel improving. One ceiling of 96 therefore serves both parts: it captures
+/// every measured win and rides a sub-spread wash on the iGPU's 48-64 band. An
+/// earlier dGPU/iGPU split (96 / 32) was collapsed once the iGPU's 96 win
+/// reproduced on the correct fixture — the split bought nothing.
+///
+/// Batches >= 128 never reach these kernels on gfx11: `should_use_mmq` (cutoff
+/// 128) diverts to MMQ before the gfx11 WMMA branch, so the whole reachable
+/// domain is covered.
+const LDSSTAGE_MAX_BATCH_GFX11: usize = 96;
+
 impl Gpu {
     /// CDNA3-only: prefill GEMM used by `gemm_hfq4g256` rocBLAS path.
     ///
@@ -9903,6 +9954,73 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        // LDS-staged multi-wave gate_up (env HIPFIRE_HFQ4G256_LDSSTAGE=1).
+        // gfx11 sister of the gfx12 ldsstage path. Reorders FP32 K accumulation;
+        // K must be a multiple of 512. Batch ceiling: see the measured 3.6-trunk
+        // tables on LDSSTAGE_MAX_BATCH_GFX11 (one value covers dGPU and iGPU).
+        if self.flags.hfq4g256_ldsstage_wmma && k % 512 == 0 && batch_size <= LDSSTAGE_MAX_BATCH_GFX11 {
+            let kname = "gemm_gate_up_hfq4g256_wmma_ldsstage";
+            let ksrc = kernels::GEMM_GATE_UP_HFQ4G256_WMMA_SRC;
+            self.ensure_kernel(kname, ksrc, kname)?;
+            let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
+
+            let mut ag = a_gate.buf.as_ptr();
+            let mut au = a_up.buf.as_ptr();
+            let mut xp = x_f16_ptr;
+            let mut yg = y_gate.buf.as_ptr();
+            let mut yu = y_up.buf.as_ptr();
+            let mut g_m = gate_m as i32;
+            let mut u_m = up_m as i32;
+            let mut k_val = k as i32;
+            let mut n_val = batch_size as i32;
+
+            let mut params: Vec<*mut c_void> = vec![
+                &mut ag as *mut _ as *mut c_void,
+                &mut au as *mut _ as *mut c_void,
+                &mut xp as *mut _ as *mut c_void,
+                &mut yg as *mut _ as *mut c_void,
+                &mut yu as *mut _ as *mut c_void,
+                &mut g_m as *mut _ as *mut c_void,
+                &mut u_m as *mut _ as *mut c_void,
+                &mut k_val as *mut _ as *mut c_void,
+                &mut n_val as *mut _ as *mut c_void,
+            ];
+
+            let total_m = gate_m + up_m;
+            let row_tiles = (total_m + 15) / 16;
+            let batch_tiles = (batch_size + 15) / 16;
+
+            let bytes = crate::profile::gemv_hfq4g256_bytes(gate_m, k)
+                + crate::profile::gemv_hfq4g256_bytes(up_m, k)
+                + batch_size * k * 2
+                + batch_size * total_m * 4 * 2;
+            let timer = crate::profile::begin_timer(&self.hip, "gemm", kname, bytes);
+            let result = self.launch_maybe_blob(
+                kname,
+                [row_tiles as u32, batch_tiles as u32, 1],
+                [256, 1, 1],
+                0,
+                &mut params,
+                || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(ag);
+                    b.push_ptr(au);
+                    b.push_ptr(xp);
+                    b.push_ptr(yg);
+                    b.push_ptr(yu);
+                    b.push_i32(g_m);
+                    b.push_i32(u_m);
+                    b.push_i32(k_val);
+                    b.push_i32(n_val);
+                    b
+                },
+            );
+            if let Some(t) = timer {
+                t.finish(&self.hip);
+            }
+            return result;
+        }
+
         // HIPFIRE_GATE_UP_VARIANT=ldsx routes to the LDS-staged X variant
         // (Gate 1 microbench, opt-in only, default off). See
         // docs/perf-checkpoints/2026-05-01-gate-up-lds-x-share-plan.md.
@@ -10433,6 +10551,90 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        // LDS-staged multi-wave gate_up (env HIPFIRE_HFQ4G256_LDSSTAGE=1).
+        // Reorders FP32 K accumulation; K must be a multiple of 512.
+        //
+        // SMALL-BATCH ONLY (<= LDSSTAGE_MAX_BATCH). Measured 2026-07-29 in-engine
+        // on the pinned Qwen3.6-27B trunk (86a5f80f…), gfx1201 R9700, matched
+        // A/B/B/A, `hipfire bench --matrix --runs 5 --warmups 10`:
+        //
+        //   batch:   16      32      64     128     256     512    1024
+        //   ratio: 1.0902  1.0489  1.0313  0.9152  0.9450  0.9465  0.9492
+        //
+        // The win inverts between 64 and 128: cooperative LDS staging pays for
+        // itself while the grid is small, and past that the added LDS traffic +
+        // the __launch_bounds__(256,4) occupancy cap cost more than the coalesced
+        // loads save. Spec-decode verify runs THIS path at B = trained block 16
+        // (`speculative.rs` calls `forward_prefill_batch_single_chunk_captured_opts`),
+        // so the gate keeps the verify win and leaves bulk prefill untouched.
+        // Cross-validated: the B=16 row (1.0902x) reproduces the 27B DFlash golden
+        // run's end-to-end +9.1% (254.2 -> 277.4 tok/s) from a separate instrument.
+        //
+        // A 0.8b canary is NOT valid for this decision — it measured +11..+23% at
+        // batch 512-8192 where 27B measures -3.5..-5.4% (see
+        // .research/round5-verify-cost.md §17).
+        if self.flags.hfq4g256_ldsstage_wmma && k % 512 == 0 && batch_size <= LDSSTAGE_MAX_BATCH {
+            let kname = "gemm_gate_up_hfq4g256_wmma_gfx12_ldsstage";
+            let ksrc = kernels::GEMM_GATE_UP_HFQ4G256_WMMA_GFX12_SRC;
+            self.ensure_kernel(kname, ksrc, kname)?;
+            let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
+
+            let mut ag = a_gate.buf.as_ptr();
+            let mut au = a_up.buf.as_ptr();
+            let mut xp = x_f16_ptr;
+            let mut yg = y_gate.buf.as_ptr();
+            let mut yu = y_up.buf.as_ptr();
+            let mut g_m = gate_m as i32;
+            let mut u_m = up_m as i32;
+            let mut k_val = k as i32;
+            let mut n_val = batch_size as i32;
+
+            let mut params: Vec<*mut c_void> = vec![
+                &mut ag as *mut _ as *mut c_void,
+                &mut au as *mut _ as *mut c_void,
+                &mut xp as *mut _ as *mut c_void,
+                &mut yg as *mut _ as *mut c_void,
+                &mut yu as *mut _ as *mut c_void,
+                &mut g_m as *mut _ as *mut c_void,
+                &mut u_m as *mut _ as *mut c_void,
+                &mut k_val as *mut _ as *mut c_void,
+                &mut n_val as *mut _ as *mut c_void,
+            ];
+
+            let total_m = gate_m + up_m;
+            let row_tiles = (total_m + 15) / 16;
+            let batch_tiles = (batch_size + 15) / 16;
+
+            let bytes = crate::profile::gemv_hfq4g256_bytes(gate_m, k)
+                + crate::profile::gemv_hfq4g256_bytes(up_m, k)
+                + batch_size * k * 2
+                + batch_size * total_m * 4 * 2;
+            let timer = crate::profile::begin_timer(&self.hip, "gemm", kname, bytes);
+            let result = self.launch_maybe_blob(
+                kname,
+                [row_tiles as u32, batch_tiles as u32, 1],
+                [256, 1, 1],
+                0,
+                &mut params,
+                || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(ag);
+                    b.push_ptr(au);
+                    b.push_ptr(xp);
+                    b.push_ptr(yg);
+                    b.push_ptr(yu);
+                    b.push_i32(g_m);
+                    b.push_i32(u_m);
+                    b.push_i32(k_val);
+                    b.push_i32(n_val);
+                    b
+                },
+            );
+            if let Some(t) = timer {
+                t.finish(&self.hip);
+            }
+            return result;
+        }
         // Adaptive-B batch-tile fast path (env HIPFIRE_GATE_UP_BT): B independent
         // accumulator chains hide the WMMA latency that caps the 1-acc kernel at ~19%
         // of peak. B = clamp(N/16, 1, 12), capped at 12 (B=16 spills VGPR). Byte-exact
@@ -10561,6 +10763,64 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        // LDS-staged multi-wave residual (env HIPFIRE_HFQ4G256_LDSSTAGE=1).
+        // Reorders FP32 K accumulation; K must be a multiple of 512.
+        // SMALL-BATCH ONLY — see the measured batch/ratio table on
+        // `gemm_gate_up_hfq4g256_wmma_gfx12` above. Same crossover applies: this
+        // site serves BOTH o_proj and down_proj in dense prefill/verify
+        // (`GemmHfq4G256Residual`), so an ungated enable regressed 27B prefill
+        // 3.5-5.4% while the verify regime (B=16) gains ~9%.
+        if self.flags.hfq4g256_ldsstage_wmma && k % 512 == 0 && batch_size <= LDSSTAGE_MAX_BATCH {
+            let kname = "gemm_hfq4g256_residual_wmma_gfx12_ldsstage";
+            let ksrc = kernels::GEMM_HFQ4G256_RESIDUAL_WMMA_GFX12_SRC;
+            self.ensure_kernel(kname, ksrc, kname)?;
+            let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
+
+            let mut a_ptr = a_raw.buf.as_ptr();
+            let mut x_ptr = x_f16_ptr;
+            let mut y_ptr = y.buf.as_ptr();
+            let mut m_val = m as i32;
+            let mut k_val = k as i32;
+            let mut bs_val = batch_size as i32;
+
+            let mut params: Vec<*mut c_void> = vec![
+                &mut a_ptr as *mut _ as *mut c_void,
+                &mut x_ptr as *mut _ as *mut c_void,
+                &mut y_ptr as *mut _ as *mut c_void,
+                &mut m_val as *mut _ as *mut c_void,
+                &mut k_val as *mut _ as *mut c_void,
+                &mut bs_val as *mut _ as *mut c_void,
+            ];
+
+            let row_tiles = (m + 15) / 16;
+            let batch_tiles = (batch_size + 15) / 16;
+
+            let bytes = crate::profile::gemv_hfq4g256_bytes(m, k)
+                + batch_size * k * 2
+                + batch_size * m * 4 * 2;
+            let timer = crate::profile::begin_timer(&self.hip, "gemm", kname, bytes);
+            let result = self.launch_maybe_blob(
+                kname,
+                [row_tiles as u32, batch_tiles as u32, 1],
+                [256, 1, 1],
+                0,
+                &mut params,
+                || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(a_ptr);
+                    b.push_ptr(x_ptr);
+                    b.push_ptr(y_ptr);
+                    b.push_i32(m_val);
+                    b.push_i32(k_val);
+                    b.push_i32(bs_val);
+                    b
+                },
+            );
+            if let Some(t) = timer {
+                t.finish(&self.hip);
+            }
+            return result;
+        }
         // Adaptive-B batch-tile (env HIPFIRE_GATE_UP_BT, shared with gate_up/qkvza).
         let bt_b: usize = if hipfire_config::developer_var("HIPFIRE_GATE_UP_BT")
             .map(|v| v != "0" && !v.is_empty())
@@ -14783,6 +15043,62 @@ impl Gpu {
         if self.flags.mw16 {
             return self.gemm_mw16_residual_wmma_via_dequant(a_raw, x, y, m, k, batch_size);
         }
+        // LDS-staged multi-wave residual (env HIPFIRE_HFQ4G256_LDSSTAGE=1).
+        // gfx11 sister of the gfx12 ldsstage path. Reorders FP32 K accumulation;
+        // K must be a multiple of 512. Batch ceiling: see the measured 3.6-trunk
+        // tables on LDSSTAGE_MAX_BATCH_GFX11 (one value covers dGPU and iGPU).
+        if self.flags.hfq4g256_ldsstage_wmma && k % 512 == 0 && batch_size <= LDSSTAGE_MAX_BATCH_GFX11 {
+            let kname = "gemm_hfq4g256_residual_wmma_ldsstage";
+            let ksrc = kernels::GEMM_HFQ4G256_RESIDUAL_WMMA_SRC;
+            self.ensure_kernel(kname, ksrc, kname)?;
+            let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
+
+            let mut a_ptr = a_raw.buf.as_ptr();
+            let mut x_ptr = x_f16_ptr;
+            let mut y_ptr = y.buf.as_ptr();
+            let mut m_val = m as i32;
+            let mut k_val = k as i32;
+            let mut bs_val = batch_size as i32;
+
+            let mut params: Vec<*mut c_void> = vec![
+                &mut a_ptr as *mut _ as *mut c_void,
+                &mut x_ptr as *mut _ as *mut c_void,
+                &mut y_ptr as *mut _ as *mut c_void,
+                &mut m_val as *mut _ as *mut c_void,
+                &mut k_val as *mut _ as *mut c_void,
+                &mut bs_val as *mut _ as *mut c_void,
+            ];
+
+            let row_tiles = (m + 15) / 16;
+            let batch_tiles = (batch_size + 15) / 16;
+
+            let bytes = crate::profile::gemv_hfq4g256_bytes(m, k)
+                + batch_size * k * 2
+                + batch_size * m * 4 * 2;
+            let timer = crate::profile::begin_timer(&self.hip, "gemm", kname, bytes);
+            let result = self.launch_maybe_blob(
+                kname,
+                [row_tiles as u32, batch_tiles as u32, 1],
+                [256, 1, 1],
+                0,
+                &mut params,
+                || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(a_ptr);
+                    b.push_ptr(x_ptr);
+                    b.push_ptr(y_ptr);
+                    b.push_i32(m_val);
+                    b.push_i32(k_val);
+                    b.push_i32(bs_val);
+                    b
+                },
+            );
+            if let Some(t) = timer {
+                t.finish(&self.hip);
+            }
+            return result;
+        }
+
         // Shape-aware default: ksplit only pays for itself when the un-split
         // grid is CU-starved (target wo_residual at M=5120 → 320 blocks,
         // ~3.3/CU on gfx1100 — ksplit 4×'s it to 13/CU). For draft-FFN shapes

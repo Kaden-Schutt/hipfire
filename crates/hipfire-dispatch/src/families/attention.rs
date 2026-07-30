@@ -1232,13 +1232,55 @@ fn dispatch_attend(
                     plan.v_mode_bits,
                 ))
             }
-            // Q8_0 batched: use old batched kernel for short ctx (fewer dispatches,
-            // faster), fall back to tiled kernel for long ctx where LDS would overflow.
-            // LDS = (max_ctx_len + nthreads + head_dim) * 4 bytes; 64KB hardware limit
-            // gives ~16K tokens for head_dim=128. Use 8K threshold for margin.
+            // Q8_0 batched: single-launch LDS-backed kernel for short ctx, tiled
+            // flash kernel (partials + reduce pass) for long ctx.
+            //
+            // The crossover is NOT a capacity margin — it is the measured point
+            // where the LDS kernel stops being faster. Its shared memory grows
+            // LINEARLY with context: (max_ctx_len + nthreads + head_dim) * 4. At
+            // ctx 14336 / head_dim 256 that is 59,392 B of the 65,536 B limit, so
+            // only ONE such workgroup fits per CU and occupancy collapses. The
+            // tiled kernel uses fixed O(tile) LDS and holds occupancy flat. So
+            // "fits in 64 KB" (~16K tokens) is NOT the same question as "is still
+            // faster", and the original 8192-for-margin comment conflated them.
+            //
+            // Measured on gfx1201 (R9700, ROCm 7.14), --kv-mode q8, prefill tok/s,
+            // 3 fresh processes x 3 samples per context, per-rep VRAM verified
+            // constant. Fixtures by digest: 27B `86a5f80f..`, 0.8b `aedfe31b..`.
+            //
+            //   RAISING to 15616 REGRESSES, and worsens as ctx grows:
+            //     ctx      8704   10240   12288   14336
+            //     27B     0.970x  0.902x  0.789x  0.720x
+            //     0.8b    0.948x  0.849x  0.712x  0.637x
+            //
+            //   LOWERING to 4096 WINS, monotonically in ctx:
+            //     ctx      4096*   5120    6144    6656    7168    8192
+            //     27B     0.996x  1.025x  1.052x  1.070x  1.081x  1.123x
+            //     0.8b    0.980x  0.998x  0.999x  1.000x  1.103x  1.163x
+            //     (* ctx 4096 stays on LDS under both arms — same-path control)
+            //
+            // The monotonic rise is the occupancy mechanism above: the further past
+            // the switch, the more LDS the single-pass kernel demands and the worse
+            // its occupancy, while the tiled kernel is flat. The 0.8b is at parity
+            // mid-band and wins only at 7168+, consistent with its much smaller
+            // hidden (1024 vs 5120) making attention a smaller share of prefill;
+            // it shows no regression anywhere, and the 27B is authoritative here.
+            //
+            // Decoded output was byte-identical across arms at ctx ~10K, temp 0
+            // (139/139 and 131/131 characters).
+            //
+            // gfx12 is hoisted (see attention_flash_q8_0_tile_batched.hip: 16 VMEM
+            // loads/lane/row -> 2), which is what flips the ranking; a pre-hoist
+            // gfx1151 measurement showed the opposite. Other arches keep 8192
+            // until measured — do not globalise this without per-arch evidence.
             KernelKey::AttnQ8_0KvBatchedMasked => {
-                const Q8_BATCHED_LDS_CROSSOVER: usize = 8192;
-                if io.max_ctx_len <= Q8_BATCHED_LDS_CROSSOVER {
+                let crossover: usize =
+                    if gpu.arch_caps.is_gfx1200() || gpu.arch_caps.is_gfx1201() {
+                        4096
+                    } else {
+                        8192
+                    };
+                if io.max_ctx_len <= crossover {
                     // Fast path: single-launch batched kernel, LDS-backed attention tile.
                     let positions = io.positions.unwrap();
                     hip!(gpu.attention_q8_0_kv_batched_masked(

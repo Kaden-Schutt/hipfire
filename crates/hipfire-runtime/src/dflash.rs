@@ -63,6 +63,18 @@ pub struct DflashConfig {
     pub mask_token_id: u32,
     pub target_layer_ids: Vec<usize>,
     pub num_target_layers: usize,
+    /// The SWA window the draft artifact declares it was TRAINED with
+    /// (`config.sliding_window`). `Some` only when the artifact sets
+    /// `use_sliding_window: true` AND its `layer_types` match the split the
+    /// windowed path implements — every layer `sliding_attention` except a
+    /// final `full_attention`. `None` when the artifact is silent or declares
+    /// a split we do not implement, in which case windowed mode stays off
+    /// unless `HIPFIRE_DFLASH_WINDOW` forces it.
+    ///
+    /// This is the only width that is correct by construction: running an
+    /// SWA-trained layer over a different span is a train/inference mask
+    /// mismatch, which degrades acceptance silently (verify stays exact).
+    pub declared_window: Option<usize>,
 }
 
 impl DflashConfig {
@@ -112,6 +124,50 @@ impl DflashConfig {
             .filter_map(|v| v.as_u64().map(|x| x as usize))
             .collect();
         let num_target_layers = df.get("num_target_layers").and_then(|v| v.as_u64())? as usize;
+        // The window fields live in the sibling `config` object (HF-style),
+        // not in the `dflash` block, so they are read separately.
+        let declared_window = meta.get("config").and_then(|cfg| {
+            if !cfg
+                .get("use_sliding_window")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+            {
+                return None;
+            }
+            let w = cfg.get("sliding_window").and_then(|v| v.as_u64())? as usize;
+            if w == 0 {
+                return None;
+            }
+            // Honour the declaration only when the per-layer classes match the
+            // split `DflashScratch::new_windowed` implements (layers 0..n-2
+            // sliding, last layer long-reach). A future draft with a different
+            // split must NOT be silently mis-executed.
+            match cfg.get("layer_types").and_then(|v| v.as_array()) {
+                Some(types) => {
+                    let matches_split = types.len() == n_layers
+                        && types.iter().enumerate().all(|(i, t)| {
+                            let s = t.as_str().unwrap_or("");
+                            if i + 1 == n_layers {
+                                s == "full_attention"
+                            } else {
+                                s == "sliding_attention"
+                            }
+                        });
+                    if matches_split {
+                        Some(w)
+                    } else {
+                        eprintln!(
+                            "  DFlash draft declares sliding_window={w} but layer_types do not \
+                             match the implemented split (layers 0..n-2 sliding, last full) — \
+                             not auto-enabling windowed mode"
+                        );
+                        None
+                    }
+                }
+                // No layer_types: trust use_sliding_window + sliding_window.
+                None => Some(w),
+            }
+        });
 
         Some(DflashConfig {
             n_layers,
@@ -127,6 +183,7 @@ impl DflashConfig {
             mask_token_id,
             target_layer_ids,
             num_target_layers,
+            declared_window,
         })
     }
 }

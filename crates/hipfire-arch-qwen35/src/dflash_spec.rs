@@ -85,16 +85,53 @@ pub fn load_dflash_state(
     eviction_active: bool,
 ) -> Result<DflashState, String> {
     let requested_ctx = ctx_capacity;
-    // HIPFIRE_DFLASH_WINDOW=<rows> opts into the windowed draft context
-    // (NInfer 1-full + (n−1)-SWA pattern): layers 0..n−2 attend over the
-    // last `window` rows, the last layer over min(requested, 4×window).
-    // Draft-side VRAM pins at the window size regardless of max_seq, and
-    // requests past the window degrade τ gracefully instead of hitting the
-    // Legacy AR fallback. Unset/0 ⇒ Legacy (cap + AR fallback, unchanged).
-    let window = std::env::var("HIPFIRE_DFLASH_WINDOW")
+    // Open the draft container up-front: its declared SWA window is the
+    // DEFAULT window (below), so the artifact must be parsed before the
+    // windowed-vs-Legacy decision.
+    let draft_hfq = HfqFile::open(Path::new(draft_path)).map_err(|e| format!("{e}"))?;
+    let draft_config = DflashConfig::from_hfq(&draft_hfq)
+        .ok_or_else(|| "draft: failed to parse DflashConfig from HFQ metadata".to_string())?;
+
+    // Windowed draft context (NInfer 1-full + (n−1)-SWA pattern): layers
+    // 0..n−2 attend over the last `window` rows, the last (full-attention)
+    // layer over the ENTIRE supported context (`w_full = requested_ctx`,
+    // unbounded — the NInfer reference keeps one layer genuinely full). Draft-side VRAM pins at the window size
+    // regardless of max_seq, and requests past the window degrade τ
+    // gracefully instead of hitting the Legacy AR fallback.
+    //
+    // The window DEFAULTS to what the draft artifact declares it was trained
+    // with (`config.sliding_window`, honoured only when `use_sliding_window`
+    // is true and `layer_types` match the split we implement — see
+    // `DflashConfig::declared_window`). That is the only width correct by
+    // construction: `qwen36-27b-dflash-mq4` declares `sliding_window: 2048`
+    // with `layer_types: [sliding ×4, full]`, so Legacy — which gives all five
+    // layers full attention — is itself a train/inference mask mismatch on the
+    // four SWA-trained layers. [INFERENCE] faithful masking should therefore be
+    // at least as good as Legacy below the cap, not merely cheaper; the
+    // measured evidence is a 6-turn chain holding τ 4.4–6.1 out to ctx 20695.
+    //
+    //   HIPFIRE_DFLASH_WINDOW=<rows>  explicit override (warns on mismatch)
+    //   HIPFIRE_DFLASH_WINDOW=0       explicit Legacy (cap + AR fallback)
+    //   unset                         draft-declared window, else Legacy
+    let window = match std::env::var("HIPFIRE_DFLASH_WINDOW")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
-        .filter(|&v| v > 0);
+    {
+        Some(0) => None,
+        Some(w) => {
+            if let Some(declared) = draft_config.declared_window {
+                if declared != w {
+                    eprintln!(
+                        "  DFlash window override {w} != draft-declared sliding_window \
+                         {declared} — the draft was trained at {declared}; acceptance may \
+                         degrade (output stays verify-exact)"
+                    );
+                }
+            }
+            Some(w)
+        }
+        None => draft_config.declared_window,
+    };
     let window = match (window, eviction_active) {
         (Some(w), true) => {
             eprintln!(
@@ -119,8 +156,13 @@ pub fn load_dflash_state(
     if let Some(w) = window {
         eprintln!(
             "  DFlash draft windowed: SWA W={w} rows on layers 0..n-2, full-attention \
-             last layer over {} rows (draft VRAM pinned at W; HIPFIRE_DFLASH_WINDOW=0 for Legacy)",
-            requested_ctx.min(4 * w)
+             last layer over all {} rows (draft VRAM pinned at W; HIPFIRE_DFLASH_WINDOW=0 for Legacy){}",
+            requested_ctx,
+            if draft_config.declared_window == Some(w) {
+                " [from draft metadata]"
+            } else {
+                ""
+            }
         );
     } else if ctx_capacity < requested_ctx {
         eprintln!(
@@ -129,9 +171,6 @@ pub fn load_dflash_state(
             requested_ctx, ctx_capacity
         );
     }
-    let draft_hfq = HfqFile::open(Path::new(draft_path)).map_err(|e| format!("{e}"))?;
-    let draft_config = DflashConfig::from_hfq(&draft_hfq)
-        .ok_or_else(|| "draft: failed to parse DflashConfig from HFQ metadata".to_string())?;
     let draft_weights =
         DflashWeights::load(gpu, &draft_hfq, &draft_config).map_err(|e| format!("{e}"))?;
     let block_size = draft_config.block_size;
@@ -155,7 +194,15 @@ pub fn load_dflash_state(
             &draft_config,
             block_size,
             w,
-            requested_ctx.min(4 * w),
+            // w_full UNBOUNDED: the last (full-attention) layer's ring spans
+            // the whole supported context, matching the artifact's
+            // `layer_types: [sliding x(n-1), full_attention]` semantics — the
+            // NInfer reference keeps one layer genuinely unbounded. The prior
+            // `requested_ctx.min(4 * w)` made the "full" layer a 4W-window
+            // (8192 rows at W=2048), so past 8K NO layer had full reach.
+            // Ring VRAM scales with requested_ctx (~270 MB at 32K rows,
+            // kvd=1024, f32 — see DflashScratch::new_windowed docs).
+            requested_ctx,
             requested_ctx,
             draft_weights.has_mq,
         ),
