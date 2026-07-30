@@ -826,6 +826,7 @@ Copyable user, developer, and retained-PM4 TOML profiles are in
 | `HIPFIRE_PROMPT_TOKEN_HEAT` | crates/hipfire-runtime/examples/daemon.rs, crates/hipfire-runtime/examples/dflash_spec_demo.rs |
 | `HIPFIRE_Q8_BATCHED_LEGACY` | crates/rdna-compute/src/feature_flags.rs, crates/rdna-compute/src/gemm.rs |
 | `HIPFIRE_Q8_FLASH_TILE` | crates/rdna-compute/src/attention.rs |
+| `HIPFIRE_Q8_PREFILL_M4` | crates/rdna-compute/src/attention.rs |
 | `HIPFIRE_Q8_PREFILL_WMMA` | crates/hipfire-arch-qwen35/src/qwen35.rs |
 | `HIPFIRE_QA_KV_MODES` | crates/hipfire-runtime/examples/test_inferenceQA.rs |
 | `HIPFIRE_QKVZA_BLOCK_SIZE` | crates/rdna-compute/src/kernels.rs |

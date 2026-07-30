@@ -4,10 +4,10 @@
 
 //! Attention, KV cache, DFlash, pflash, triattn, kv_compact, and vision attention dispatch.
 
+use crate::kernels;
 use crate::DType;
 use crate::Gpu;
 use crate::GpuTensor;
-use crate::kernels;
 use hip_bridge::{DeviceBuffer, HipResult};
 use std::ffi::c_void;
 use std::sync::OnceLock;
@@ -61,9 +61,7 @@ pub fn q8_flash_tile_size(
                 .and_then(|value| value.parse::<usize>().ok())
                 .filter(|value| matches!(value, 16 | 32 | 64 | 128 | 256))
         })
-        .unwrap_or_else(|| {
-            q8_flash_default_tile_size(arch, n_heads, n_kv_heads, head_dim, max_seq)
-        })
+        .unwrap_or_else(|| q8_flash_default_tile_size(arch, n_heads, n_kv_heads, head_dim, max_seq))
 }
 
 const V_MODE_Q8: i32 = 8;
@@ -86,7 +84,9 @@ fn replay_stable_tile_count(
 fn is_wmma_fa_enabled() -> bool {
     use std::sync::OnceLock;
     static GATE: OnceLock<bool> = OnceLock::new();
-    *GATE.get_or_init(|| hipfire_config::developer_var("HIPFIRE_WMMA_FA").map_or(false, |v| v == "1"))
+    *GATE.get_or_init(|| {
+        hipfire_config::developer_var("HIPFIRE_WMMA_FA").map_or(false, |v| v == "1")
+    })
 }
 
 /// Minimum chunk size to engage the WMMA-FA route.
@@ -99,6 +99,39 @@ fn wmma_fa_min_batch() -> usize {
             .and_then(|s| s.parse::<usize>().ok())
             .unwrap_or(16)
     })
+}
+
+/// Experimental four-query Q8 prefill tile. Default-off while the KV-sharing
+/// layout is being validated across the supported architecture matrix.
+pub fn q8_prefill_m4_enabled() -> bool {
+    static GATE: OnceLock<bool> = OnceLock::new();
+    *GATE.get_or_init(|| {
+        hipfire_config::developer_var("HIPFIRE_Q8_PREFILL_M4").map_or(false, |v| v == "1")
+    })
+}
+
+pub fn q8_prefill_m4_eligible(
+    arch: &str,
+    n_heads: usize,
+    head_dim: usize,
+    max_ctx_len: usize,
+    batch_size: usize,
+    partials_numel: usize,
+    tree_mode: bool,
+) -> bool {
+    let max_tiles = max_ctx_len.div_ceil(128);
+    let floats_per_row = n_heads * max_tiles * (2 + head_dim);
+    let partial_rows = if floats_per_row > 0 {
+        partials_numel / floats_per_row
+    } else {
+        0
+    };
+    q8_prefill_m4_enabled()
+        && arch.starts_with("gfx12")
+        && !tree_mode
+        && batch_size % 4 == 0
+        && matches!(head_dim, 128 | 256)
+        && partial_rows >= 4
 }
 
 impl Gpu {
@@ -1842,10 +1875,32 @@ impl Gpu {
         block_cols: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        let use_m4 = q8_prefill_m4_eligible(
+            &self.arch,
+            n_heads,
+            head_dim,
+            max_ctx_len,
+            batch_size,
+            partials.numel(),
+            tree_bias.is_some(),
+        );
+        let (tile_key, tile_src, tile_func) = if use_m4 {
+            (
+                "attention_flash_q8_0_m4_tile_batched",
+                kernels::ATTENTION_FLASH_Q8_0_M4_TILE_BATCHED_SRC,
+                "attention_flash_q8_0_m4_tile_batched",
+            )
+        } else {
+            (
+                "attention_flash_q8_0_tile_batched",
+                kernels::ATTENTION_FLASH_Q8_0_TILE_BATCHED_SRC,
+                "attention_flash_q8_0_tile_batched",
+            )
+        };
         self.launch_asym_flash_batched(
-            "attention_flash_q8_0_tile_batched",
-            kernels::ATTENTION_FLASH_Q8_0_TILE_BATCHED_SRC,
-            "attention_flash_q8_0_tile_batched",
+            tile_key,
+            tile_src,
+            tile_func,
             q,
             k_cache,
             v_cache,
@@ -2048,13 +2103,7 @@ impl Gpu {
         output_gate: Option<&GpuTensor>,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let tile_size = q8_flash_tile_size(
-            &self.arch,
-            n_heads,
-            n_kv_heads,
-            head_dim,
-            max_seq,
-        );
+        let tile_size = q8_flash_tile_size(&self.arch, n_heads, n_kv_heads, head_dim, max_seq);
         // Graph-safe: use max_tiles so the grid is position-independent.
         // The tile kernel exits early for tiles beyond actual seq_len.
         let max_tiles = (max_seq + tile_size - 1) / tile_size;
@@ -2073,7 +2122,8 @@ impl Gpu {
 
         // ── Tile kernel ──
         let gfx1151_tile_dpp = self.arch_caps.is_gfx1151()
-            && hipfire_config::developer_var("HIPFIRE_GFX1151_ATTENTION_TILE_DPP").as_deref() == Ok("1");
+            && hipfire_config::developer_var("HIPFIRE_GFX1151_ATTENTION_TILE_DPP").as_deref()
+                == Ok("1");
         let (tile_module, tile_src) = if gfx1151_tile_dpp {
             (
                 "attention_flash_q8_0_tile_dpp_gfx1151",
@@ -2207,11 +2257,7 @@ impl Gpu {
                 )?;
             } else {
                 const KERNEL: &str = "attention_flash_q8_0_reduce";
-                self.ensure_kernel(
-                    KERNEL,
-                    kernels::ATTENTION_FLASH_Q8_0_REDUCE_SRC,
-                    KERNEL,
-                )?;
+                self.ensure_kernel(KERNEL, kernels::ATTENTION_FLASH_Q8_0_REDUCE_SRC, KERNEL)?;
                 let mut params: Vec<*mut c_void> = vec![
                     &p_ptr as *const _ as *mut c_void,
                     &o_ptr as *const _ as *mut c_void,
@@ -3246,15 +3292,20 @@ impl Gpu {
     ) -> HipResult<()> {
         const TILE_SIZE: usize = 128;
         const WMMA_BLOCK_M: usize = 16;
+        let use_q8_m4_grid = tile_func_name == "attention_flash_q8_0_m4_tile_batched";
         let max_tiles = (max_ctx_len + TILE_SIZE - 1) / TILE_SIZE;
         let stride = 2 + head_dim;
         let per_pos_bytes = n_heads * max_tiles * stride * 4;
         let partials_capacity = partials.numel() * 4;
-        let sub_batch = if per_pos_bytes > 0 {
+        let mut sub_batch = if per_pos_bytes > 0 {
             (partials_capacity / per_pos_bytes).max(1).min(batch_size)
         } else {
             batch_size
         };
+        if use_q8_m4_grid {
+            sub_batch -= sub_batch % 4;
+            sub_batch = sub_batch.max(4);
+        }
 
         let wmma_fa_kernel = if self.arch_caps.has_wmma_w32_gfx12() {
             Some((
@@ -3366,6 +3417,12 @@ impl Gpu {
                 let (grid, lds_bytes): ([u32; 3], u32) = if use_wmma_grid {
                     let m_tiles = (chunk + WMMA_BLOCK_M - 1) / WMMA_BLOCK_M;
                     ([n_heads as u32, m_tiles as u32, max_tiles as u32], 0)
+                } else if use_q8_m4_grid {
+                    let m_tiles = (chunk + 3) / 4;
+                    (
+                        [n_heads as u32, m_tiles as u32, max_tiles as u32],
+                        (4 * TILE_SIZE * 4) as u32,
+                    )
                 } else {
                     (
                         [n_heads as u32, max_tiles as u32, chunk as u32],
@@ -10416,34 +10473,22 @@ mod tests {
 
     #[test]
     fn q8_flash_gfx12_small_dense_shape_uses_tile16_only() {
-        assert_eq!(
-            q8_flash_default_tile_size("gfx1201", 8, 2, 256, 2_048),
-            16
-        );
+        assert_eq!(q8_flash_default_tile_size("gfx1201", 8, 2, 256, 2_048), 16);
         assert_eq!(
             q8_flash_default_tile_size("gfx1201", 16, 2, 256, 2_048),
             128
         );
-        assert_eq!(
-            q8_flash_default_tile_size("gfx1201", 8, 2, 128, 2_048),
-            128
-        );
+        assert_eq!(q8_flash_default_tile_size("gfx1201", 8, 2, 128, 2_048), 128);
     }
 
     #[test]
     fn gfx1151_tile32_default_is_exact_shape_and_arch_only() {
-        assert_eq!(
-            q8_flash_default_tile_size("gfx1151", 16, 2, 256, 2_048),
-            32
-        );
+        assert_eq!(q8_flash_default_tile_size("gfx1151", 16, 2, 256, 2_048), 32);
         assert_eq!(
             q8_flash_default_tile_size("gfx1151", 16, 2, 256, 8_192),
             128
         );
-        assert_eq!(
-            q8_flash_default_tile_size("gfx1100", 1, 1, 64, 8_192),
-            32
-        );
+        assert_eq!(q8_flash_default_tile_size("gfx1100", 1, 1, 64, 8_192), 32);
         assert_eq!(
             q8_flash_default_tile_size("gfx1200", 16, 2, 256, 2_048),
             128

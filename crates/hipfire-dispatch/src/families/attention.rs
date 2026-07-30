@@ -1238,7 +1238,18 @@ fn dispatch_attend(
             // gives ~16K tokens for head_dim=128. Use 8K threshold for margin.
             KernelKey::AttnQ8_0KvBatchedMasked => {
                 const Q8_BATCHED_LDS_CROSSOVER: usize = 8192;
-                if io.max_ctx_len <= Q8_BATCHED_LDS_CROSSOVER {
+                let use_m4 = io.flash_partials.is_some_and(|partials| {
+                    rdna_compute::attention::q8_prefill_m4_eligible(
+                        &gpu.arch,
+                        io.n_heads,
+                        io.head_dim,
+                        io.max_ctx_len,
+                        io.batch_size,
+                        partials.numel(),
+                        io.tree_bias.is_some(),
+                    )
+                });
+                if io.max_ctx_len <= Q8_BATCHED_LDS_CROSSOVER && !use_m4 {
                     // Fast path: single-launch batched kernel, LDS-backed attention tile.
                     let positions = io.positions.unwrap();
                     hip!(gpu.attention_q8_0_kv_batched_masked(
