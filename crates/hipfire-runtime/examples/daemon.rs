@@ -1417,20 +1417,23 @@ fn main() {
             }
         };
         eprintln!("Pre-compiling kernels for {}...", gpu.arch);
-        let mut errors = 0usize;
+        let mut ok = 0usize;
+        let mut failed = 0usize;
         for kv in &["asym3", "q8"] {
             for wq in &["mq4", "mq6", "hfq4", "hfq6", "q8"] {
                 if let Err(e) = gpu.precompile_qwen35(wq, kv, 256) {
+                    if *wq == "mq4" && *kv == "asym3" {
+                        eprintln!("ERROR: required kernel precompile failed: mq4/asym3: {e}");
+                        std::process::exit(1);
+                    }
                     eprintln!("  {wq}/{kv}: {e}");
-                    errors += 1;
+                    failed += 1;
+                } else {
+                    ok += 1;
                 }
             }
         }
-        if errors > 0 {
-            eprintln!("Kernel precompilation finished with {errors} failure(s) — the missing kernels will JIT on first use.");
-        } else {
-            eprintln!("Kernel precompilation done.");
-        }
+        eprintln!("precompile: {ok} ok, {failed} optional failed");
         return;
     }
 
@@ -2169,12 +2172,11 @@ fn main() {
                             12 => "north_mini_code",
                             _ => "qwen3",
                         };
-                        let redline_default = hipfire_runtime::config::a3b_mq4r_redline_default(
-                            &gpu.arch, path, m.arch_id, pp, tp,
-                        );
+                        let redline_default =
+                            hipfire_runtime::config::mq4r_redline_default(&gpu.arch, path, pp, tp);
                         if gpu.replay.configure_model_default(redline_default) && redline_default {
                             eprintln!(
-                                "[redline] enabling fail-closed A3B MQ4R default on {} (transport={})",
+                                "[redline] enabling fail-closed MQ4R default on {} (transport={})",
                                 gpu.arch,
                                 gpu.replay.transport_name()
                             );

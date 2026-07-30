@@ -1274,6 +1274,101 @@ fn dispatch_attend(
             // gfx1151 measurement showed the opposite. Other arches keep 8192
             // until measured — do not globalise this without per-arch evidence.
             KernelKey::AttnQ8_0KvBatchedMasked => {
+                // Query-tiled flash prefill. Its LDS depends only on BR/BC and
+                // never on context, so it has no capacity ceiling and no
+                // occupancy decay. Measured on gfx1151 (nh=8 nkv=2 hd=256,
+                // N=256): ~1.8x the tiled fallback at every context, but it
+                // LOSES to the LDS-backed kernel below ~10.2K (0.67x at 2048,
+                // 0.96x at 8192) because that kernel has 8x the workgroups.
+                // Break-even measured between CTX 10240 (0.95x) and 11264
+                // (1.17x), so it only takes over above MIN_CTX — where it
+                // replaces the 2.3x-worse tiled path outright.
+                // Opt-in until Stage A end-to-end validation completes.
+                // Causal non-tree only; the windowed traffic uses a separate
+                // KernelKey, and batch_size == 1 is decode.
+                // DEFAULT-ON for gfx11xx (RDNA3/3.5), where the WMMA kernel is
+                // validated: faster than the legacy LDS kernel at every context
+                // (1.21x @2048 .. 2.47x @12288), no measurable perplexity
+                // regression (paired n=2048: +0.0066 nats, 95% CI
+                // [-0.0105,+0.0237], not significant; bounded < +2.4% ppl), and
+                // top-1 preserved at 95.2% with divergence confined to
+                // near-ties (f32 top-1 stays inside f16 top-8 in 99.76%).
+                //
+                // Other arches stay OFF by default: the kernel's
+                // __builtin_amdgcn_wmma_f32_16x16x16_f16_w32 is RDNA3+ only,
+                // and gfx12 needs the _gfx12 intrinsic variant this kernel does
+                // not use. HIPFIRE_FLASH_PREFILL=0 forces off anywhere.
+                let flash_default_on = gpu.arch.starts_with("gfx11");
+                let flash_optin = match hipfire_config::developer_var("HIPFIRE_FLASH_PREFILL")
+                    .ok()
+                    .as_deref()
+                {
+                    Some("0") | Some("off") | Some("false") => false,
+                    Some("1") | Some("on") | Some("true") => true,
+                    _ => flash_default_on,
+                };
+                let flash_min_ctx: usize =
+                    hipfire_config::developer_var("HIPFIRE_FLASH_PREFILL_MIN_CTX")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(10240);
+                if flash_optin && io.tree_bias.is_none() && io.batch_size > 1 {
+                    // WMMA is the default variant: it beats the legacy LDS
+                    // kernel at EVERY context (1.21x @2048 .. 2.47x @12288) and
+                    // is ~1.9x the scalar flash kernel, so it needs no MIN_CTX
+                    // gate. The scalar variant keeps its measured break-even.
+                    // It computes in f16 (relative L2 ~1e-3 vs the f32
+                    // reference) — a real precision/speed trade, hence opt-in.
+                    let variant = hipfire_config::developer_var("HIPFIRE_FLASH_PREFILL_KERNEL")
+                        .unwrap_or_else(|_| "wmma".to_owned());
+                    // Kernel bounds: Q8_0 blocks are 32 dims wide, and O_frags
+                    // is a fixed float8_t[MAX_D_CHUNKS=16] => head_dim <= 256.
+                    let wmma_ok = variant != "scalar"
+                        && gpu.arch.starts_with("gfx11")
+                        && io.head_dim % 32 == 0
+                        && io.head_dim <= 256;
+                    if wmma_ok {
+                        return hip!(gpu.attention_q8_0_flash_prefill_wmma(
+                            io.q,
+                            io.k_cache,
+                            io.v_cache,
+                            io.output,
+                            io.positions(),
+                            io.n_heads,
+                            io.n_kv_heads,
+                            io.head_dim,
+                            io.batch_size,
+                        ));
+                    }
+                    if io.max_ctx_len > flash_min_ctx {
+                        let br: usize = hipfire_config::developer_var("HIPFIRE_FLASH_PREFILL_BR")
+                            .ok()
+                            .and_then(|v| v.parse().ok())
+                            .unwrap_or(8);
+                        let bc: usize = hipfire_config::developer_var("HIPFIRE_FLASH_PREFILL_BC")
+                            .ok()
+                            .and_then(|v| v.parse().ok())
+                            .unwrap_or(16);
+                        return hip!(gpu.attention_q8_0_flash_prefill(
+                            io.q,
+                            io.k_cache,
+                            io.v_cache,
+                            io.output,
+                            io.positions(),
+                            io.n_heads,
+                            io.n_kv_heads,
+                            io.head_dim,
+                            io.max_ctx_len,
+                            io.batch_size,
+                            br,
+                            bc,
+                        ));
+                    }
+                }
+                // Arch-aware crossover (ours): gfx1200/gfx1201 measured optimum is
+                // 4096, not the historical 8192 — see the measured table above.
+                // Only reached when the flash-prefill gate above declines (non-gfx11
+                // by default, tree bias, decode, or head_dim out of its bounds).
                 let crossover: usize =
                     if gpu.arch_caps.is_gfx1200() || gpu.arch_caps.is_gfx1201() {
                         4096

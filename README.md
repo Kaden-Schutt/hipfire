@@ -50,18 +50,6 @@ Discord: <https://discord.gg/F3BaywB8Rs>
 
 ## MQ4R + Redline
 
-<p align="center">
-  <img width="1200" alt="A retained command graph flows into a GPU compute engine" src="docs/assets/readme/retained-engine.png" />
-</p>
-
-<table>
-  <tr>
-    <td width="33%"><strong>MQ4R</strong><br />Performance-oriented Qwen 3.6 35B-A3B quantization.</td>
-    <td width="33%"><strong>Redline</strong><br />Validated, retained dispatch replay for the real kernel graph.</td>
-    <td width="33%"><strong>Fail closed</strong><br />Unsafe or incompatible routes return to ordinary HIP dispatch.</td>
-  </tr>
-</table>
-
 MQ4R is the performance-oriented Qwen 3.6 35B-A3B SKU. It combines
 uniform MQ4 attention and gate-side weights with graded routed experts
 and the fused gate path.

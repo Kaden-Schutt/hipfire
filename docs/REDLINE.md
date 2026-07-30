@@ -142,31 +142,32 @@ transport crate.
 ### Model load and automatic default
 
 After a successful model load, the daemon may request Auto via
-`ReplayController::configure_model_default` when the Qwen automatic-default
+`ReplayController::configure_model_default` when the MQ4R runtime-default
 predicate matches. **Current automatic runtime selection is only**
-`a3b_mq4r_redline_default` for the exact Qwen A3B MQ4R predicate. LFM has no
-current automatic selector and is never chosen by path or extension.
+`mq4r_redline_default` for single-GPU `.mq4r` on the exact GPU-arch allowlist.
+Existing LFM `.mq4` registry evidence is not auto-selected because it is not
+`.mq4r` (not because LFM is categorically model-family exempt).
 
-#### Qwen path/extension default
+#### MQ4R runtime default
 
-`a3b_mq4r_redline_default` — source:
+`mq4r_redline_default` — source:
 `crates/hipfire-runtime/src/config.rs`.
 
 ```text
 exact GPU arch is gfx1100 OR gfx1151 OR gfx1201
-AND model arch_id == 6
 AND pipeline parallelism == 1
 AND tensor parallelism == 1
 AND model extension is .mq4r, case-insensitive
 ```
 
-This is a **runtime** automatic product default only: when the predicate
-matches and no explicit backend/manual bypass wins, load-time
-`configure_model_default` requests Auto (retained PM4 when transport is
-unset). It is **not** a registry admission, **not** Section 7 certification,
-and **not** a claim that every model/arch pair has a sealed golden or
-`admissions.yml` row. `gfx1200` and every other GPU arch remain explicit
-opt-in only.
+Model-family agnostic: there is no `arch_id` gate. This is a **runtime**
+automatic product default only: when the predicate matches and no explicit
+backend/manual bypass wins, load-time `configure_model_default` requests Auto
+(retained PM4 when transport is unset). It is **not** a registry admission,
+**not** Section 7 certification, and **not** a claim that every model/arch
+pair has a sealed golden or `admissions.yml` row. Unsupported retained routes
+still fail closed. `gfx1200` and every other GPU arch remain explicit opt-in
+only.
 
 Disable the automatic default by selecting the built-in `hip` profile in the
 config wizard, choosing an explicit backend there, or setting
@@ -179,11 +180,13 @@ Registry owner: [`admissions.yml`](admissions.yml) row
 `lfm25-350m-mq4-gfx1201-retained-pm4-plain-ar` (schema v2). That sealed row is
 product-route / registry **evidence and admission metadata only**. It does
 **not** wire automatic runtime selection, does **not** name a current source
-predicate, and does **not** opt LFM into `configure_model_default`. Current
-LFM retained replay is **not** automatically selected; any usable retained
-route is **explicit opt-in** and must still prove route support. The prior LFM
-screen is relaxed-stationarity evidence until a separate 1% stationary
-certification run completes (see §11.5).
+predicate, and does **not** opt the sealed `.mq4` fixture into
+`configure_model_default`. The sealed LFM artifact is **not** automatically
+selected because it is `.mq4`, not `.mq4r`; model family itself no longer
+blocks `.mq4r`. Any usable non-default retained route is **explicit opt-in**
+and must still prove route support. The prior LFM screen is
+relaxed-stationarity evidence until a separate 1% stationary certification
+run completes (see §11.5).
 
 Exact sealed evidence scope for that row: sealed same immutable snapshot
 bytes (identity MD5 `cb5284b8ad5c6f9e4ca859c0aff0bcd0`, length 229,474,032);
@@ -195,11 +198,11 @@ hash `04305cf1254244f6`.
 
 An explicit `HIPFIRE_REPLAY_BACKEND` selection, config wizard / profile
 backend selection (including the built-in `hip` opt-out), or enabled
-`HIPFIRE_REPLAY_MANUAL_CAPTURE` bypasses the Qwen model default.
+`HIPFIRE_REPLAY_MANUAL_CAPTURE` bypasses the MQ4R runtime default.
 `HIPFIRE_REPLAY_TRANSPORT` does **not**: it changes only the
-transport. Therefore an eligible automatic-default Qwen model still requests
-`Auto` when only the transport is explicit (using that transport); with
-transport unset, it uses `Pm4Ib`. When the automatic Qwen predicate is false
+transport. Therefore an eligible automatic-default `.mq4r` model still
+requests `Auto` when only the transport is explicit (using that transport);
+with transport unset, it uses `Pm4Ib`. When `mq4r_redline_default` is false
 and no backend/manual selection applies, the backend remains ordinary HIP.
 
 Explicit opt-in can exercise broader implementation capability (including LFM
@@ -258,7 +261,7 @@ Ready ◄───────────────────────�
 observed retained AQL or PM4 replay
 ```
 
-The automatic Qwen product path goes **directly** from `Captured` to `Ready`
+The automatic MQ4R product path goes **directly** from `Captured` to `Ready`
 when preparation succeeds. It does **not** traverse `ShadowValidated`, call
 `observe_shadow`, or call `install_prepared_plan`.
 
@@ -284,7 +287,7 @@ stable complete capture
 ```
 
 The controller’s internal `1.03` shadow field is not a durable contributor
-promotion threshold and is not used by the automatic Qwen admission path. Each
+promotion threshold and is not used by the automatic MQ4R admission path. Each
 campaign must state its promotion rule in advance.
 
 ### Exact fail-closed semantics
@@ -625,7 +628,7 @@ with their dates and fixtures. None of these cases is a universal admission.
 |---|---|
 | Intent | Compact dense-model capture, exact-state parity, retained-PM4 example |
 | Baseline route | HipGraph ordinary AR for the dated comparison |
-| Candidate route | Explicitly selected retained PM4. `arch_id=5`, `.mq4` — **not** the automatic `.mq4r` / `arch_id=6` product default |
+| Candidate route | Explicitly selected retained PM4. `arch_id=5`, `.mq4` — **not** the automatic `.mq4r` product default (then and now; `.mq4` is outside `mq4r_redline_default`) |
 | Fixture | Qwen3.5 0.8B dense on gfx1201; dated 2026-07-11 in `crates/redline-dispatch/HIPFIRE-GRAFT.md`. Recoverable row does not pin full model digest or daemon binary digest |
 | Immutable contract | 356 retained dispatches, 21 unique kernels, ordered sequence hash `55f99a58cb4b9363` |
 | Validation | Fifteen consecutive positions bit exact for logits, KV, and recurrent state vs ordinary HIP and exact HIP-kernarg-blob oracle |
@@ -637,23 +640,22 @@ with their dates and fixtures. None of these cases is a universal admission.
 
 ### 11.2 Qwen3.6 35B-A3B MQ4R across gfx1100, gfx1151, and gfx1201
 
-Current automatic predicate `a3b_mq4r_redline_default` is
-extension/architecture based and narrower than full implementation
-capability: exact GPU arch `gfx1100`, `gfx1151`, or `gfx1201`;
-`arch_id=6`; single GPU (`pp=tp=1`); case-insensitive `.mq4r`. `gfx1200`
-and every other arch remain explicit opt-in. Explicit backend selection
-(including the config wizard / profile backend) can request broader
-implemented paths or disable the automatic default. Explicit transport
-changes only the transport. Runtime default ≠ Section 7 certification ≠
-registry admission; sealed golden / fixture rows are not implied for every
-default-eligible arch.
+Current automatic predicate `mq4r_redline_default` is model-family agnostic
+and narrower than full implementation capability: exact GPU arch `gfx1100`,
+`gfx1151`, or `gfx1201`; single GPU (`pp=tp=1`); case-insensitive `.mq4r`.
+No `arch_id` gate. `gfx1200` and every other arch remain explicit opt-in.
+Explicit backend selection (including the config wizard / profile backend)
+can request broader implemented paths or disable the automatic default.
+Explicit transport changes only the transport. Runtime default ≠ Section 7
+certification ≠ registry admission; sealed golden / fixture rows are not
+implied for every default-eligible arch.
 
 | Architecture | Implementation capability | Model performance evidence | Explicit opt-in | Recoverable retained-PM4 evidence under Section 7 | Automatic default |
 |---|---|---|---|---|---|
-| gfx1100 | Yes: gfx11 PM4 lowering exists | Sealed fixture: HIP median 219.649 tok/s, PM4 median 251.798 tok/s (`1.146×`) | Via explicit backend request | Golden row `qwen36-a3b-mq4r-gfx1100-tg128-q8-pm4`: exact model/tool identities, retained route fingerprint, positions 128/255 observed, stationary floor | Yes when complete `a3b_mq4r_redline_default` holds and no wizard/backend/manual-capture bypass wins; measured validation is not admission |
-| gfx1151 | Yes: gfx11 PM4 lowering and gfx1151 experiment knobs | Sealed fixture: HIP median 102.348 tok/s, PM4 median 115.290 tok/s (`1.126×`); coherent Silver high-water 114.209 vs Golden floor 115.021 (-0.812 tok/s, 0.71%, approximately 1 tok/s); ROCm 7.14 is only a hypothesis — neither causality nor absence of a Redline route regression is proven | Via explicit backend request | Golden row `qwen36-a3b-mq4r-gfx1151-tg128-q8-pm4`: exact model/tool identities, retained route fingerprint, positions 128/255 observed; Silver route proof valid | Yes when complete `a3b_mq4r_redline_default` holds and no wizard/backend/manual-capture bypass wins; measured validation is not admission |
+| gfx1100 | Yes: gfx11 PM4 lowering exists | Sealed fixture: HIP median 219.649 tok/s, PM4 median 251.798 tok/s (`1.146×`) | Via explicit backend request | Golden row `qwen36-a3b-mq4r-gfx1100-tg128-q8-pm4`: exact model/tool identities, retained route fingerprint, positions 128/255 observed, stationary floor | Yes when complete `mq4r_redline_default` holds and no wizard/backend/manual-capture bypass wins; measured validation is not admission |
+| gfx1151 | Yes: gfx11 PM4 lowering and gfx1151 experiment knobs | Sealed fixture: HIP median 102.348 tok/s, PM4 median 115.290 tok/s (`1.126×`); coherent Silver high-water 114.209 vs Golden floor 115.021 (-0.812 tok/s, 0.71%, approximately 1 tok/s); ROCm 7.14 is only a hypothesis — neither causality nor absence of a Redline route regression is proven | Via explicit backend request | Golden row `qwen36-a3b-mq4r-gfx1151-tg128-q8-pm4`: exact model/tool identities, retained route fingerprint, positions 128/255 observed; Silver route proof valid | Yes when complete `mq4r_redline_default` holds and no wizard/backend/manual-capture bypass wins; measured validation is not admission |
 | gfx1200 | Yes where gfx12 PM4 lowering applies | Model performance may exist on related RDNA4 SKUs; not this automatic row | Via explicit backend request | Not an automatic-default arch | **No** — remains opt-in only |
-| gfx1201 | Yes: gfx12 PM4 lowering and Qwen adapter | Sealed fixture: HIP median 174.670 tok/s, PM4 median 202.460 tok/s (`1.159×`) | Available | Golden row `qwen36-a3b-mq4r-gfx1201-tg128-q8-pm4`: exact model/tool identities, retained route fingerprint, positions 128/255 observed, stationary floor | Yes when complete `a3b_mq4r_redline_default` holds and no wizard/backend/manual-capture bypass wins; measured validation is not admission |
+| gfx1201 | Yes: gfx12 PM4 lowering and Qwen adapter | Sealed fixture: HIP median 174.670 tok/s, PM4 median 202.460 tok/s (`1.159×`) | Available | Golden row `qwen36-a3b-mq4r-gfx1201-tg128-q8-pm4`: exact model/tool identities, retained route fingerprint, positions 128/255 observed, stationary floor | Yes when complete `mq4r_redline_default` holds and no wizard/backend/manual-capture bypass wins; measured validation is not admission |
 
 Primary gfx1201 case:
 
@@ -669,7 +671,7 @@ Primary gfx1201 case:
 | Conservative PM4 observation | HipGraph 164.220 vs requested retained PM4 174.087 tok/s (`1.06009×`) — closest recoverable conservative observation; not fully certified without timed-arm ledger |
 | Selective fence/wait composition | Tuned HipGraph 165.839 vs retained PM4 plus removal of one proven-independent boundary wait 178.320 tok/s (`1.07526×`) — **combined** PM4 + fence/wait observation, not direct transport alone |
 | Later progression | `docs/perf-checkpoints/2026-07-13-redline-mq4r-110-to-204.md` — productized no-env campaign including TG128 median 203.93 tok/s. Changed kernel stack and graph shape; not a direct transport A/B |
-| Automatic runtime selection | Runtime requests `Auto` on complete `a3b_mq4r_redline_default` (exact `gfx1100`/`gfx1151`/`gfx1201`, `arch_id=6`, `pp=tp=1`, `.mq4r`) unless config wizard/backend selection or enabled manual capture bypasses. Runtime default ≠ guide certification ≠ registry admission |
+| Automatic runtime selection | Runtime requests `Auto` on complete `mq4r_redline_default` (exact `gfx1100`/`gfx1151`/`gfx1201`, `pp=tp=1`, `.mq4r`; no `arch_id` gate) unless config wizard/backend selection or enabled manual capture bypasses. At the dated campaign the then-current predicate was A3B-only (`a3b_mq4r_redline_default`, `arch_id=6`). Runtime default ≠ guide certification ≠ registry admission |
 | Disposition | Strongest recoverable gfx1201 PM4 capture/parity/submission/performance evidence. **Do not call fully certified under this guide** until a positive timed-arm route-proof ledger is archived |
 
 ### 11.3 Rejected gfx1030 Qwen3.6 MQ2 lowering
@@ -712,7 +714,7 @@ retained-PM4 sealed registry evidence/admission record documented in §11.5 and
 | Intent | Reduce LFM2.5-350M dense MQ4 gfx1201 serial-HIP decode launches by fusing RMSNorm plus MQ rotation activation preparation |
 | Baseline route | Serial HIP lowered decode, `HIPFIRE_LFM2_DECODE_FUSION=0`, graph off, Q8 KV |
 | Candidate route | Same serial-HIP path with `HIPFIRE_LFM2_DECODE_FUSION=1`; **not** Redline, AQL, or PM4 |
-| Retained-route admission (2026-07-19 Stage A) | **None — never admitted in that campaign.** The Qwen automatic default (`a3b_mq4r_redline_default`) requires `arch_id==6`; LFM is `arch_id==11` and was excluded from that predicate. `HIPFIRE_REPLAY_MANUAL_CAPTURE=1` bypassed admission and installed no plan. The sole arch-11 predicate then in play, `plan_lfm_decode_fusion`, gated serial-HIP decode **fusion**, not a retained route. The later sealed registry evidence/admission record is §11.5 / [`admissions.yml`](admissions.yml) — it does not reopen or promote Stage A, and it does not wire automatic runtime selection. |
+| Retained-route admission (2026-07-19 Stage A) | **None — never admitted in that campaign.** The then-current Qwen automatic default (`a3b_mq4r_redline_default`) required `arch_id==6`; LFM is `arch_id==11` and was excluded from that historical predicate. (Current policy is model-family agnostic `mq4r_redline_default` on `.mq4r` only; this sealed LFM fixture remains `.mq4` and is still not auto-selected.) `HIPFIRE_REPLAY_MANUAL_CAPTURE=1` bypassed admission and installed no plan. The sole arch-11 predicate then in play, `plan_lfm_decode_fusion`, gated serial-HIP decode **fusion**, not a retained route. The later sealed registry evidence/admission record is §11.5 / [`admissions.yml`](admissions.yml) — it does not reopen or promote Stage A, and it does not wire automatic runtime selection. |
 | Source identity | Baseline `lfm-redline` @ `e8831ae8347f04ac821077ee159c86423b4bf88a`, daemon MD5 `9ee43d2673866775786d8075fb5b6e76`; candidate `feat/lfm-gfx1201-mq4-decode-fusion` @ `518c221756a1065a7560449165bc8817c2ad6176`, daemon MD5 `07d62bbd915416b07ce7783969126dd7` |
 | Fixture | `lfm2.5-350m.mq4` (dense) MD5 `cb5284b8ad5c6f9e4ca859c0aff0bcd0`; prompt fixture MD5 `18cb45e00d424bef16fa9b097d02caf3`; gfx1201; HIP/ROCm 7.2; dated 2026-07-19 |
 | Correctness | Frozen twelve-step decode parity exact; Stage A negatives (default/eager-prefill/spec/graph/capture) did not admit; serve content equality passed |
@@ -872,7 +874,7 @@ Prefer paths and symbols over line numbers.
 
 | Concern | Stable source path and symbols |
 |---|---|
-| Automatic product predicates | `crates/hipfire-runtime/src/config.rs` — `a3b_mq4r_redline_default` only (Qwen path/extension; exact `gfx1100`/`gfx1151`/`gfx1201`). No current LFM automatic selector. |
+| Automatic product predicates | `crates/hipfire-runtime/src/config.rs` — `mq4r_redline_default` only (`.mq4r` + exact `gfx1100`/`gfx1151`/`gfx1201` + `pp=tp=1`; model-family agnostic, no `arch_id` gate). Existing LFM `.mq4` sealed evidence has no automatic selector. |
 | Model-load application and diagnostic handlers | `crates/hipfire-runtime/examples/daemon.rs` — load-time `configure_model_default`; `redline_capture`; `redline_shadow_aql`; `redline_shadow_pm4` |
 | Qwen model boundary and route | `crates/hipfire-arch-qwen35/src/qwen35.rs` — `forward_scratch`; `prepare_scratch_inputs`; `set_forward_eligible`; `should_route_aql`; `should_route_pm4`; `finish_capture`; `prepare_*` |
 | LFM decode path and registry evidence | `crates/hipfire-arch-lfm2moe/src/forward.rs` — `decode_step`; `decode_step_with_graph`; lowered path under `HIPFIRE_FORWARD_LOWERED`. Sealed LFM retained-PM4 evidence/admission: [`admissions.yml`](admissions.yml) row `lfm25-350m-mq4-gfx1201-retained-pm4-plain-ar` (no current runtime selector). |

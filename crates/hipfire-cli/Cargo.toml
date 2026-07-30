@@ -12,7 +12,8 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1"
 clap = { version = "4.6", features = ["derive"] }
-ctrlc = "3"
+ctrlc = { version = "3", features = ["termination"] }
+libc = "0.2"
 hipfire-config = { path = "../hipfire-config" }
 hipfire-client = { path = "../hipfire-client" }
 hipfire-registry = { path = "../hipfire-registry" }

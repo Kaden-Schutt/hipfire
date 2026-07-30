@@ -9,8 +9,8 @@
 //! `void**` arguments: a model adapter must supply explicit resource accesses
 //! and a kernarg ABI to `redline-dispatch` before installing a prepared plan.
 //! Replay remains default-off except for the runtime automatic default
-//! `a3b_mq4r_redline_default` (exact `gfx1100`/`gfx1151`/`gfx1201`, single-GPU
-//! Qwen A3B `arch_id == 6`, case-insensitive `.mq4r`; `gfx1200`/others opt-in)
+//! `mq4r_redline_default` (exact `gfx1100`/`gfx1151`/`gfx1201`, single-GPU,
+//! case-insensitive `.mq4r`; `gfx1200`/others opt-in)
 //! selected by the daemon after model load. Runtime default ≠ Redline
 //! certification/registry admission; built-in `hip` profile or explicit backend
 //! selection disables the automatic default.
@@ -2117,11 +2117,11 @@ impl ReplayController {
     /// An explicit backend selection always wins. Otherwise every successful
     /// model load resets the process-local controller so prepared queues,
     /// command buffers, and fallback state cannot bleed across model swaps.
-    /// The exact A3B MQ4R runtime predicate may default to retained PM4 on
+    /// Eligible single-GPU MQ4R models may default to retained PM4 on
     /// gfx1100, gfx1151, and gfx1201; this is runtime policy, not certification.
     /// All other models return to ordinary HIP. An explicit transport still
     /// overrides the PM4 transport choice for diagnostics.
-    pub fn configure_model_default(&mut self, enable_a3b_mq4r: bool) -> bool {
+    pub fn configure_model_default(&mut self, enable_mq4r: bool) -> bool {
         let manual = manual_capture_requested();
         let backend = hipfire_config::process_value("HIPFIRE_REPLAY_BACKEND");
         let explicit_backend = backend.as_deref().is_some_and(|value| value != "auto");
@@ -2135,7 +2135,7 @@ impl ReplayController {
         }
 
         let transport_override = hipfire_config::process_value("HIPFIRE_REPLAY_TRANSPORT");
-        let transport = if enable_a3b_mq4r
+        let transport = if enable_mq4r
             && !transport_override
                 .as_deref()
                 .is_some_and(|value| value != "auto")
@@ -2144,12 +2144,12 @@ impl ReplayController {
         } else {
             ReplayTransport::from_config()
         };
-        self.apply_model_default(enable_a3b_mq4r, transport);
+        self.apply_model_default(enable_mq4r, transport);
         true
     }
 
-    fn apply_model_default(&mut self, enable_a3b_mq4r: bool, transport: ReplayTransport) {
-        let request = if enable_a3b_mq4r {
+    fn apply_model_default(&mut self, enable_mq4r: bool, transport: ReplayTransport) {
+        let request = if enable_mq4r {
             ReplayBackendRequest::Auto
         } else {
             ReplayBackendRequest::Hip
