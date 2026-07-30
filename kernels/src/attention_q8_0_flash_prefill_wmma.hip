@@ -40,6 +40,9 @@ typedef float __attribute__((ext_vector_type(8))) float8_t;
 #define S_STRIDE 18 // N_TILE + 2 padding, breaks LDS bank conflicts
 #define V_STRIDE 18 // N_TILE + 2 padding
 #define MAX_D_CHUNKS 16 // head_dim / 16, bounded so O_frags is a fixed array
+#ifndef FIXED_HEAD_DIM
+#define FIXED_HEAD_DIM 0
+#endif
 #ifndef SPLIT_Q
 // 1 = carry Q as a double-single (hi+lo) pair through two WMMA passes.
 // Rounding Q to f16 for the A fragment was MEASURED to be the dominant error
@@ -61,6 +64,9 @@ extern "C" __global__ __launch_bounds__(32) void attention_q8_0_flash_prefill_wm
     int batch_size,
     float scale_attn
 ) {
+#if FIXED_HEAD_DIM
+    if (head_dim != FIXED_HEAD_DIM) return;
+#endif
     const int q_tile = blockIdx.x;
     const int h      = blockIdx.y;
     if (h >= n_heads) return;
@@ -79,7 +85,11 @@ extern "C" __global__ __launch_bounds__(32) void attention_q8_0_flash_prefill_wm
     const int kv_h         = h / kv_group;
     const int kv_blk       = kv_h * bph;
     const int q_stride     = n_heads * head_dim;
-    const int d_chunks     = head_dim / 16;
+#if FIXED_HEAD_DIM
+    const int d_chunks = FIXED_HEAD_DIM / 16;
+#else
+    const int d_chunks = head_dim / 16;
+#endif
 
     extern __shared__ char smem_raw[];
     _Float16* Q_lds   = (_Float16*)smem_raw;                        // [M_TILE][head_dim]
@@ -118,12 +128,14 @@ extern "C" __global__ __launch_bounds__(32) void attention_q8_0_flash_prefill_wm
 
     // Output accumulator: C fragment j → row (2*j + half_id), col `half` = dim.
     float8_t O_frags[MAX_D_CHUNKS];
+#pragma unroll
     for (int dc = 0; dc < d_chunks; ++dc)
         O_frags[dc] = (float8_t){0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
 
     // Longest causal window in this tile bounds the key sweep.
     int seq_len = 0;
-    for (int r = 0; r < rows; ++r) seq_len = max(seq_len, positions[q_base + r] + 1);
+    for (int r = 0; r < rows; ++r)
+        seq_len = max(seq_len, positions[q_base + r] + 1);
 
     for (int kt = 0; kt < seq_len; kt += N_TILE) {
         const int t_len = min(N_TILE, seq_len - kt);
@@ -231,6 +243,7 @@ extern "C" __global__ __launch_bounds__(32) void attention_q8_0_flash_prefill_wm
         __syncthreads();
 
         // Rescale the running accumulator before adding this tile.
+        #pragma unroll
         for (int dc = 0; dc < d_chunks; ++dc)
             for (int j = 0; j < 8; ++j)
                 O_frags[dc][j] *= a_lds[2 * j + half_id];
@@ -238,16 +251,19 @@ extern "C" __global__ __launch_bounds__(32) void attention_q8_0_flash_prefill_wm
         // A = P (row `half`, 16 keys); B = V^T (dim, 16 keys).
         half16_t p_reg;
         for (int j = 0; j < 16; ++j) p_reg[j] = S_lds[half * S_STRIDE + j];
+#pragma unroll
         for (int dc = 0; dc < d_chunks; ++dc) {
             const int d = dc * 16 + half;
             half16_t v_reg;
-            for (int j = 0; j < 16; ++j) v_reg[j] = V_lds_T[d * V_STRIDE + j];
+            for (int j = 0; j < 16; ++j)
+                v_reg[j] = V_lds_T[d * V_STRIDE + j];
             O_frags[dc] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(p_reg, v_reg, O_frags[dc]);
         }
         __syncthreads();
     }
 
     // ── Write O = acc / l ───────────────────────────────────────────────
+#pragma unroll
     for (int dc = 0; dc < d_chunks; ++dc) {
         const int d = dc * 16 + half;
         for (int j = 0; j < 8; ++j) {
@@ -255,7 +271,8 @@ extern "C" __global__ __launch_bounds__(32) void attention_q8_0_flash_prefill_wm
             if (r >= rows) continue;
             const float denom = l_lds[r];
             const float inv = (denom > 0.0f) ? (1.0f / denom) : 0.0f;
-            out[(long long)(q_base + r) * q_stride + h * head_dim + d] = O_frags[dc][j] * inv;
+            out[(long long)(q_base + r) * q_stride + h * head_dim + d] =
+                O_frags[dc][j] * inv;
         }
     }
 }

@@ -136,6 +136,9 @@ Values and defaults below match `hipfire-config`, the native CLI, and/or `Runtim
 | `HIPFIRE_MMQ_SCREEN` / `HIPFIRE_MMQ_SCREEN_THRESHOLD` / `HIPFIRE_MMQ_MIN_BATCH` | screening |
 | `HIPFIRE_PREFILL_COMPRESSION` and `HIPFIRE_PREFILL_*` | PFlash + batched prefill knobs (config mirrors) |
 | `HIPFIRE_PREFILL_BATCHED` | RuntimeConfig: on unless `0` (Qwen-style batched prefill gate — **not** the LFM flag) |
+| `HIPFIRE_FLASH_PREFILL` | Developer override for Q8 WMMA flash prefill: `0` forces off, `1` forces on; unset uses the architecture/workload envelope. |
+| `HIPFIRE_FLASH_PREFILL_FIXED_HD` | Developer ablation: fixed-head-dimension specialization is on unless `0`. |
+| `HIPFIRE_FLASH_PREFILL_PREFETCH_V` | Developer ablation: gfx12 V prefetch is on unless `0`. |
 
 ### LFM (arch 11) — branch-scoped optimized prefill
 
@@ -501,6 +504,9 @@ Copyable user, developer, and retained-PM4 TOML profiles are in
 | `HIPFIRE_EP_SKIP_ALLREDUCE` | crates/hipfire-arch-qwen35/src/qwen35.rs |
 | `HIPFIRE_EXPERIMENTAL_` | crates/hipfire-runtime/examples/daemon.rs |
 | `HIPFIRE_EXPERIMENTAL_BUDGET_ALERT` | crates/hipfire-config/src/lib.rs, crates/hipfire-runtime/examples/daemon.rs |
+| `HIPFIRE_FLASH_PREFILL` | crates/hipfire-dispatch/src/families/attention.rs |
+| `HIPFIRE_FLASH_PREFILL_FIXED_HD` | crates/rdna-compute/src/attention.rs |
+| `HIPFIRE_FLASH_PREFILL_PREFETCH_V` | crates/rdna-compute/src/attention.rs |
 | `HIPFIRE_FLASH_PARTIALS_BATCH` | crates/hipfire-arch-qwen35/src/qwen35.rs, crates/hipfire-runtime/src/config.rs |
 | `HIPFIRE_FORCE_ANSWER_SECS` | scripts/test-qwen35-think-cap.sh |
 | `HIPFIRE_FORCE_REBUILD` | crates/hipfire-cli/src/main.rs, scripts/install.sh |
@@ -832,7 +838,6 @@ Copyable user, developer, and retained-PM4 TOML profiles are in
 | `HIPFIRE_PROMPT_TOKEN_HEAT` | crates/hipfire-runtime/examples/daemon.rs, crates/hipfire-runtime/examples/dflash_spec_demo.rs |
 | `HIPFIRE_Q8_BATCHED_LEGACY` | crates/rdna-compute/src/feature_flags.rs, crates/rdna-compute/src/gemm.rs |
 | `HIPFIRE_Q8_FLASH_TILE` | crates/rdna-compute/src/attention.rs |
-| `HIPFIRE_Q8_PREFILL_M4` | crates/rdna-compute/src/attention.rs |
 | `HIPFIRE_Q8_PREFILL_WMMA` | crates/hipfire-arch-qwen35/src/qwen35.rs |
 | `HIPFIRE_QA_KV_MODES` | crates/hipfire-runtime/examples/test_inferenceQA.rs |
 | `HIPFIRE_QKVZA_BLOCK_SIZE` | crates/rdna-compute/src/kernels.rs |

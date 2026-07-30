@@ -3851,6 +3851,12 @@ pub const ATTENTION_Q8_0_FLASH_PREFILL_SRC: &str =
 pub const ATTENTION_Q8_0_FLASH_PREFILL_WMMA_SRC: &str =
     include_str!("../../../kernels/src/attention_q8_0_flash_prefill_wmma.hip");
 
+/// RDNA4 sister of ATTENTION_Q8_0_FLASH_PREFILL_WMMA_SRC. gfx12 splits
+/// each 16-wide contraction into two 8-element half-wave operands and uses
+/// the gfx12-specific WMMA builtin/output mapping.
+pub const ATTENTION_Q8_0_FLASH_PREFILL_WMMA_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/attention_q8_0_flash_prefill_wmma.gfx12.hip");
+
 /// Phase-timed variant of ATTENTION_Q8_0_KV_SRC. Functionally equivalent
 /// to the baseline kernel but instrumented with wall_clock64() around each
 /// of the 3 internal phases (QK^T, softmax, V-weighted-sum). Writes per-head
@@ -3932,8 +3938,6 @@ pub const ATTENTION_FLASH_ASYM2_TILE_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/attention_flash_asym2_tile_batched.hip");
 pub const ATTENTION_FLASH_Q8_0_TILE_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/attention_flash_q8_0_tile_batched.hip");
-pub const ATTENTION_FLASH_Q8_0_M4_TILE_BATCHED_SRC: &str =
-    include_str!("../../../kernels/src/attention_flash_q8_0_m4_tile_batched.hip");
 pub const ATTENTION_FLASH_ASYM_REDUCE_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/attention_flash_asym_reduce_batched.hip");
 

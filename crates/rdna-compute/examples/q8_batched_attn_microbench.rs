@@ -33,6 +33,7 @@ fn main() {
     let hd = env_usize("HD", 256);
     let n = env_usize("N", 512); // query rows in the prefill chunk
     let ctx = env_usize("CTX", 20000); // max_ctx_len — above the 15k cliff
+    let warmups = env_usize("WARMUPS", 3);
     let iters = env_usize("ITERS", 5);
 
     assert!(hd % 32 == 0, "head_dim must be a multiple of 32");
@@ -85,7 +86,9 @@ fn main() {
     );
 
     let time = |gpu: &mut Gpu, f: &dyn Fn(&mut Gpu)| -> f64 {
-        f(gpu); // warmup
+        for _ in 0..warmups {
+            f(gpu);
+        }
         gpu.hip.device_synchronize().unwrap();
         let mut ts = vec![];
         for _ in 0..iters {
@@ -105,11 +108,19 @@ fn main() {
     // while still paying O(ctx) tile-launch + reduce overhead.
     let window = env_usize("WINDOW", 0) as i32;
     let new_ms = time(&mut gpu, &|g: &mut Gpu| {
-        g.attention_flash_q8_0_batched_masked_windowed(
-            &q, &k_cache, &v_cache, &out, &positions, nh, nkv, hd, ctx, ctx, n, &partials, None, 0,
-            0, window,
-        )
-        .expect("windowed batched");
+        if window == 0 {
+            g.attention_flash_q8_0_batched_masked(
+                &q, &k_cache, &v_cache, &out, &positions, nh, nkv, hd, ctx, ctx, n, &partials,
+                None, 0, 0,
+            )
+            .expect("non-windowed batched");
+        } else {
+            g.attention_flash_q8_0_batched_masked_windowed(
+                &q, &k_cache, &v_cache, &out, &positions, nh, nkv, hd, ctx, ctx, n, &partials,
+                None, 0, 0, window,
+            )
+            .expect("windowed batched");
+        }
     });
 
     println!(

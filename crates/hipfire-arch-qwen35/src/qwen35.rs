@@ -7,7 +7,7 @@
 
 use crate::speculative::HiddenStateRingBuffer;
 use hip_bridge::{HipError, HipResult};
-use hipfire_dispatch::context::DispatchCtx;
+use hipfire_dispatch::context::{DispatchCtx, DispatchWorkload};
 use hipfire_dispatch::families::attention::AttnParams;
 use hipfire_dispatch::families::gemv::{GivensRef, WeightRef};
 use hipfire_dispatch::families::kv_tier::{KvTierInputs, KvTierPlan};
@@ -8559,6 +8559,19 @@ fn dump_hidden_localize(
     }
 }
 
+#[inline]
+fn prefill_dispatch_workload(
+    captures_per_token_hidden: bool,
+    captures_rollback_tape: bool,
+    is_tree_verify: bool,
+) -> DispatchWorkload {
+    if captures_per_token_hidden || captures_rollback_tape || is_tree_verify {
+        DispatchWorkload::SpeculativeVerify
+    } else {
+        DispatchWorkload::Standard
+    }
+}
+
 fn forward_prefill_chunk(
     gpu: &mut Gpu,
     weights: &Qwen35Weights,
@@ -8589,6 +8602,15 @@ fn forward_prefill_chunk(
     let n = tokens.len();
     debug_assert!(n > 0);
     debug_assert!(n <= pbs.max_batch);
+    // Target verification is a distinct performance regime from prompt
+    // prefill. DFlash, DSpark/MTP, and tree verify expose that semantic here
+    // through per-position hidden output, a rollback tape, or a tree mask.
+    // Carry it in DispatchCtx so dispatch never needs process-global state.
+    let dispatch_workload = prefill_dispatch_workload(
+        per_token_hidden_out.is_some(),
+        gdn_tape.is_some(),
+        tree_verify.is_some(),
+    );
     let required_tokens = checked_kv_end(start_pos, n, "forward_prefill_chunk")?;
     kv_cache.require_mapped_capacity(required_tokens)?;
     debug_assert!(
@@ -8858,7 +8880,7 @@ fn forward_prefill_chunk(
     // (band==None) seeds zeros — original behavior.
     let mut delta_layer_idx = band.map(|b| b.delta_layer_offset).unwrap_or(0);
     let mut kv_layer_idx = band.map(|b| b.kv_layer_offset).unwrap_or(0);
-    let ctx = DispatchCtx::new(gpu); // hoisted — arch-constant, safe to reuse per-layer
+    let ctx = DispatchCtx::new(gpu).with_workload(dispatch_workload);
 
     for layer_idx in layer_start..layer_end {
         match (&weights.layers[layer_idx], config.layer_types[layer_idx]) {
@@ -17983,6 +18005,27 @@ mod tests {
             "gfx1030",
             false
         ));
+    }
+
+    #[test]
+    fn speculative_verify_has_an_explicit_dispatch_workload() {
+        assert_eq!(
+            prefill_dispatch_workload(false, false, false),
+            DispatchWorkload::Standard
+        );
+        // DFlash and DSpark/MTP verify request per-token target hidden.
+        assert_eq!(
+            prefill_dispatch_workload(true, false, false),
+            DispatchWorkload::SpeculativeVerify
+        );
+        assert_eq!(
+            prefill_dispatch_workload(false, true, false),
+            DispatchWorkload::SpeculativeVerify
+        );
+        assert_eq!(
+            prefill_dispatch_workload(false, false, true),
+            DispatchWorkload::SpeculativeVerify
+        );
     }
 
     #[test]

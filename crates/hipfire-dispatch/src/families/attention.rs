@@ -132,7 +132,7 @@ impl AttentionFamily {
         self.resolve(plan.write_key, ctx, Some(&shape))?; // arch-gate check
         dispatch_kv_write(gpu, plan.write_key, plan, io)?;
         let attend_var = self.resolve(plan.attend_key, ctx, Some(&shape))?;
-        dispatch_attend(gpu, plan.attend_key, attend_var.tile, plan, io)
+        dispatch_attend(ctx, gpu, plan.attend_key, attend_var.tile, plan, io)
     }
 
     /// Full-attention entry point (no KV cache — vision / DFlash cross-attention).
@@ -657,7 +657,49 @@ fn dispatch_kv_write(
 
 // ── Attention dispatch ─────────────────────────────────
 
+/// Default envelope for the gfx12 16-query Q8 WMMA prefill kernel.
+///
+/// R9700/ROCm 7.14, `nh=8,nkv=2,hd=256`, fresh-process medians after three
+/// discarded warmups (five processes, eleven timed kernel iterations each):
+///
+/// - ctx 8K:  #554 M4 5.670 ms, query16 2.836 ms (1.999x)
+/// - ctx 32K: #554 M4 21.524 ms, query16 10.704 ms (2.011x)
+///
+/// At least 128 `(query tile, head)` workgroups are needed to cover the GPU.
+/// Above ~60K the combined K+V working set crosses the R9700 last-level-cache
+/// boundary and the lower-workgroup query16 path can lose, so 32K is the
+/// certified upper bound. Explicit `HIPFIRE_FLASH_PREFILL=1` remains available
+/// for research outside this envelope.
+fn gfx12_query16_default_eligible(
+    n_heads: usize,
+    head_dim: usize,
+    batch_size: usize,
+    max_ctx_len: usize,
+) -> bool {
+    const QUERY_TILE: usize = 16;
+    const MIN_WORKGROUPS: usize = 128;
+    const MIN_CTX: usize = 256;
+    const MAX_CTX: usize = 32_768;
+
+    matches!(head_dim, 64 | 128 | 256)
+        && (MIN_CTX..=MAX_CTX).contains(&max_ctx_len)
+        && batch_size.div_ceil(QUERY_TILE) * n_heads >= MIN_WORKGROUPS
+}
+
+#[inline]
+fn gfx12_query16_workload_eligible(ctx: &DispatchCtx) -> bool {
+    ctx.workload != crate::context::DispatchWorkload::SpeculativeVerify
+}
+
+/// Default-on query16 is measured only on gfx1201 (R9700). Sibling gfx12 atoms
+/// and other families stay opt-in via explicit `HIPFIRE_FLASH_PREFILL=1`.
+#[inline]
+fn gfx12_query16_arch_default_eligible(arch: &str) -> bool {
+    arch == "gfx1201"
+}
+
 fn dispatch_attend(
+    ctx: &DispatchCtx,
     gpu: &mut Gpu,
     key: KernelKey,
     tile: TileImpl,
@@ -1294,11 +1336,22 @@ fn dispatch_attend(
                 // top-1 preserved at 95.2% with divergence confined to
                 // near-ties (f32 top-1 stays inside f16 top-8 in 99.76%).
                 //
-                // Other arches stay OFF by default: the kernel's
-                // __builtin_amdgcn_wmma_f32_16x16x16_f16_w32 is RDNA3+ only,
-                // and gfx12 needs the _gfx12 intrinsic variant this kernel does
-                // not use. HIPFIRE_FLASH_PREFILL=0 forces off anywhere.
-                let flash_default_on = gpu.arch.starts_with("gfx11");
+                // gfx12 has a dedicated source with its different half-wave
+                // operand and accumulator mapping. It is default-on only
+                // inside `gfx12_query16_default_eligible`'s measured envelope;
+                // outside that envelope dispatch falls back directly to the
+                // legacy LDS/tiled paths.
+                // HIPFIRE_FLASH_PREFILL=0 forces off anywhere.
+                let gfx12_query16_route_ok = gpu.arch_caps.has_wmma_w32_gfx12()
+                    && gfx12_query16_arch_default_eligible(&gpu.arch)
+                    && gfx12_query16_workload_eligible(ctx)
+                    && gfx12_query16_default_eligible(
+                        io.n_heads,
+                        io.head_dim,
+                        io.batch_size,
+                        io.max_ctx_len,
+                    );
+                let flash_default_on = gpu.arch.starts_with("gfx11") || gfx12_query16_route_ok;
                 let flash_optin = match hipfire_config::developer_var("HIPFIRE_FLASH_PREFILL")
                     .ok()
                     .as_deref()
@@ -1324,7 +1377,9 @@ fn dispatch_attend(
                     // Kernel bounds: Q8_0 blocks are 32 dims wide, and O_frags
                     // is a fixed float8_t[MAX_D_CHUNKS=16] => head_dim <= 256.
                     let wmma_ok = variant != "scalar"
-                        && gpu.arch.starts_with("gfx11")
+                        && (gpu.arch_caps.has_wmma_w32() || gpu.arch_caps.has_wmma_w32_gfx12())
+                        && (!gpu.arch_caps.has_wmma_w32_gfx12()
+                            || gfx12_query16_workload_eligible(ctx))
                         && io.head_dim % 32 == 0
                         && io.head_dim <= 256;
                     if wmma_ok {
@@ -1369,30 +1424,12 @@ fn dispatch_attend(
                 // 4096, not the historical 8192 — see the measured table above.
                 // Only reached when the flash-prefill gate above declines (non-gfx11
                 // by default, tree bias, decode, or head_dim out of its bounds).
-                let crossover: usize =
-                    if gpu.arch_caps.is_gfx1200() || gpu.arch_caps.is_gfx1201() {
-                        4096
-                    } else {
-                        8192
-                    };
-                // PR #554 (gfx12 M4 Q8 KV reuse): when the M4 tile is eligible the
-                // single-pass LDS kernel is skipped REGARDLESS of context, i.e. the
-                // crossover above is bypassed, not retuned. The three gates are
-                // arch-disjoint by construction: #553's WMMA path requires gfx11,
-                // `q8_prefill_m4_eligible` requires gfx12, and the crossover governs
-                // whatever both decline.
-                let use_m4 = io.flash_partials.is_some_and(|partials| {
-                    rdna_compute::attention::q8_prefill_m4_eligible(
-                        &gpu.arch,
-                        io.n_heads,
-                        io.head_dim,
-                        io.max_ctx_len,
-                        io.batch_size,
-                        partials.numel(),
-                        io.tree_bias.is_some(),
-                    )
-                });
-                if io.max_ctx_len <= crossover && !use_m4 {
+                let crossover: usize = if gpu.arch_caps.is_gfx1200() || gpu.arch_caps.is_gfx1201() {
+                    4096
+                } else {
+                    8192
+                };
+                if io.max_ctx_len <= crossover {
                     // Fast path: single-launch batched kernel, LDS-backed attention tile.
                     let positions = io.positions.unwrap();
                     hip!(gpu.attention_q8_0_kv_batched_masked(
@@ -1549,6 +1586,39 @@ const DISPATCHED_FULL_ATTENTION_KEYS: &[KernelKey] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gfx12_query16_default_envelope_is_conservative() {
+        // 128 query-tile/head workgroups: admitted at both head-count shapes.
+        assert!(gfx12_query16_default_eligible(8, 256, 256, 8_192));
+        assert!(gfx12_query16_default_eligible(4, 256, 512, 32_768));
+
+        // 120 workgroups, short context, long context, and unvalidated HD.
+        assert!(!gfx12_query16_default_eligible(8, 256, 240, 8_192));
+        assert!(!gfx12_query16_default_eligible(8, 256, 256, 255));
+        assert!(!gfx12_query16_default_eligible(8, 256, 256, 32_769));
+        assert!(!gfx12_query16_default_eligible(8, 192, 256, 8_192));
+    }
+
+    #[test]
+    fn gfx12_query16_never_routes_speculative_verify() {
+        let standard = DispatchCtx::for_test("gfx1201");
+        let speculative = DispatchCtx::for_test("gfx1201")
+            .with_workload(crate::context::DispatchWorkload::SpeculativeVerify);
+
+        assert!(gfx12_query16_workload_eligible(&standard));
+        assert!(!gfx12_query16_workload_eligible(&speculative));
+    }
+
+    #[test]
+    fn gfx12_query16_arch_default_admits_only_measured_r9700_target() {
+        // Default admission is measured only on gfx1201 (R9700). Sibling gfx1200,
+        // gfx11, and unknown gfx12-looking atoms stay opt-in-only.
+        assert!(gfx12_query16_arch_default_eligible("gfx1201"));
+        assert!(!gfx12_query16_arch_default_eligible("gfx1200"));
+        assert!(!gfx12_query16_arch_default_eligible("gfx1100"));
+        assert!(!gfx12_query16_arch_default_eligible("gfx1202"));
+    }
 
     /// Bidirectional completeness check for `dispatch_kv_write`.
     /// Every registered KV write key must have an arm, and every arm key

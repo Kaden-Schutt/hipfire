@@ -191,13 +191,14 @@ is ≤1.4% at low pp and ≤0.76% from 2048 up. **The crossover is ctx ≈ 1024,
 4096**, and there is no regime in 128–8192 where the single-pass LDS attention
 kernel measurably *wins* on AR — the sub-1024 points are ties, not losses.
 
-So route, not context, is the separator: the same kernel costs 4% on spec and
-wins 1.9–4.9% on AR. The rule landed accordingly — a route flag
-(`set_dflash_spec_active`, set by `spec_step_dflash`, the entry both the serve
-and bench halves of the DFlash policy funnel through) consulted by
-`q8_prefill_m4_eligible`. The 1024 ctx floor stays as-is because it now matches
-the measured crossover; raising it to 4096 would forfeit 1.9–4.7% of AR prefill
-across 2048–4096 to fix a problem the route flag already fixes.
+Historically, route rather than context was the separator: the same M4 kernel
+cost 4% on spec and won 1.9–4.9% on AR. That intermediate route and its 1024
+context floor have since been removed together with the M4 kernel, superseded
+by the measured 16-query gfx12 path. The replacement carries an explicit
+`DispatchWorkload::SpeculativeVerify` purpose from Qwen35 target verify into
+dispatch, so DFlash and DSpark/MTP cannot enter the wide-query kernel even under
+a forced flash-prefill opt-in. The numbers above remain a forensic record, not a
+description of current dispatch.
 
 Two notes for whoever picks this up next:
 

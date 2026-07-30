@@ -101,120 +101,6 @@ fn wmma_fa_min_batch() -> usize {
     })
 }
 
-/// Four-query Q8 prefill tile (PR #554), with the hoist+widen ported into its K
-/// and V loops. DEFAULT-ON — `q8_prefill_m4_eligible` already restricts it to
-/// gfx12, causal non-tree prefill, head_dim 128/256, M4-aligned batch, sufficient
-/// partial capacity, and `>= q8_prefill_m4_min_ctx()`; this switch only decides
-/// whether that gate is consulted at all. `HIPFIRE_Q8_PREFILL_M4=0` forces off.
-///
-/// MEASURED 2026-07-30, gfx1201 R9700, pinned 3.6-27B trunk `86a5f80f…`,
-/// `bench --matrix` A/B/B/A runs 3 warmups 10, spreads 0.08-0.13%:
-///   pp 4096 1.0486x | 8192 1.0496x | 16384 1.0639x | 20480 1.0698x
-/// The win GROWS with context. Submitted-as-is it LOST at every point
-/// (0.9925 / 0.9563 / 0.9246 / 0.9153) because its per-element scale reload and
-/// scalar byte load competed with the shipped tiled-kernel hoist; the two axes are
-/// orthogonal (reuse across queries, widening across dims), so composing them wins
-/// where picking one did not. The port is bit-exact vs the unhoisted tile
-/// (byte-identical decoded text), so default-on adds no quality risk.
-pub fn q8_prefill_m4_enabled() -> bool {
-    static GATE: OnceLock<bool> = OnceLock::new();
-    *GATE.get_or_init(|| {
-        !matches!(
-            hipfire_config::developer_var("HIPFIRE_Q8_PREFILL_M4")
-                .ok()
-                .as_deref(),
-            Some("0") | Some("off") | Some("false")
-        )
-    })
-}
-
-/// Context floor for the four-query tile. MEASURED 2026-07-30 on gfx1201 (R9700,
-/// pinned 3.6-27B trunk, serve harness, DFlash on): with no floor the tile is
-/// admitted by LINEAR DFlash verify — which carries no tree bias and is a causal
-/// Q8 batched prefill call at B=16 / head_dim 256, so it satisfies every other
-/// condition — and there it COSTS 5.9% (96.3 -> 90.65 tok/s). Proof it was
-/// actually running in verify: per-turn tau moved (2.24 -> 2.20, 1.20 -> 1.18,
-/// 1.45 -> 1.32), and tau is an acceptance count, not a timing artefact.
-///
-/// Cause is regime, not correctness: the tile pays for global partials plus a
-/// separate reduce launch, which the single-pass LDS kernel avoids, so at verify
-/// contexts (tens of tokens, one tile) the overhead dominates. Same reason
-/// `HIPFIRE_FLASH_PREFILL_MIN_CTX` exists for the gfx11 flash kernel.
-///
-/// 1024 is provisional: it cleanly separates the verify regime from bulk prefill
-/// without touching any measured prefill point. Set from a crossover sweep once
-/// the hoisted tile is characterised.
-fn q8_prefill_m4_min_ctx() -> usize {
-    static GATE: OnceLock<usize> = OnceLock::new();
-    *GATE.get_or_init(|| {
-        hipfire_config::developer_var("HIPFIRE_Q8_PREFILL_M4_MIN_CTX")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(1024)
-    })
-}
-
-/// Whether DFlash speculative decode is driving this process.
-///
-/// Set by `spec_step_dflash` — the entry both halves of the DFlash policy
-/// funnel through (`dflash_spec.rs`, serve; `dflash_spec_demo.rs`, bench).
-/// Consulted by [`q8_prefill_m4_eligible`] to disable the four-query tile on
-/// the spec route unconditionally.
-///
-/// MEASURED 2026-07-30, gfx1201 R9700, pinned 3.6-27B trunk `86a5f80f…`,
-/// 27B DFlash golden run, 6 reps per cell, within-cell spreads <= 0.46%:
-///   M4 on  -> 241.86 tok/s (LDS off) / 262.23 (LDS on)
-///   M4 off -> 251.97 tok/s (LDS off) / 273.55 (LDS on)
-/// The tile COSTS 4.01% / 4.14% on spec decode. On AR prefill the same tile
-/// WINS: crossover ~1024, +1.9% at pp 2048 rising to a +4.5-4.9% plateau from
-/// pp 4096 (3 GPUs, A/B/B/A, agreeing to +-0.0006). ROUTE is the separator,
-/// not context — hence a route flag rather than a higher ctx floor.
-///
-/// A ctx floor cannot substitute for this. Under hipGraph capture
-/// `qwen35.rs` bakes `max_ctx_len = kv_cache.physical_cap` so the attention
-/// kernel's LDS is sized for the worst case; any load whose physical cap
-/// clears the floor therefore still admits the tile into verify, and
-/// `HIPFIRE_VERIFY_GRAPH` is default-on, so that is the common case rather
-/// than a corner.
-static DFLASH_SPEC_ACTIVE: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-/// Mark the DFlash spec-decode route active for the remainder of the process.
-pub fn set_dflash_spec_active(active: bool) {
-    DFLASH_SPEC_ACTIVE.store(active, std::sync::atomic::Ordering::Relaxed);
-}
-
-/// True once DFlash spec decode has run in this process.
-pub fn dflash_spec_active() -> bool {
-    DFLASH_SPEC_ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
-}
-
-pub fn q8_prefill_m4_eligible(
-    arch: &str,
-    n_heads: usize,
-    head_dim: usize,
-    max_ctx_len: usize,
-    batch_size: usize,
-    partials_numel: usize,
-    tree_mode: bool,
-) -> bool {
-    let max_tiles = max_ctx_len.div_ceil(128);
-    let floats_per_row = n_heads * max_tiles * (2 + head_dim);
-    let partial_rows = if floats_per_row > 0 {
-        partials_numel / floats_per_row
-    } else {
-        0
-    };
-    q8_prefill_m4_enabled()
-        && !dflash_spec_active()
-        && arch.starts_with("gfx12")
-        && !tree_mode
-        && batch_size % 4 == 0
-        && matches!(head_dim, 128 | 256)
-        && partial_rows >= 4
-        && max_ctx_len >= q8_prefill_m4_min_ctx()
-}
-
 impl Gpu {
     /// DSpark bidirectional staging assembly (on-GPU; replaces a host
     /// d2h+assemble+h2d that forced ~2 stream syncs per stage).
@@ -2039,8 +1925,14 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        assert!(head_dim % 32 == 0, "head_dim {head_dim} must be a multiple of 32");
-        assert!(head_dim <= 256, "head_dim {head_dim} exceeds MAX_D_CHUNKS*16");
+        assert!(
+            head_dim % 32 == 0,
+            "head_dim {head_dim} must be a multiple of 32"
+        );
+        assert!(
+            head_dim <= 256,
+            "head_dim {head_dim} exceeds MAX_D_CHUNKS*16"
+        );
         // HIPFIRE_FLASH_PREFILL_SPLITQ=1 carries Q as a double-single (hi+lo)
         // pair through two WMMA passes per d-chunk. Q's f16 rounding is the
         // dominant error term — f16 Q alone through an otherwise-f32 kernel
@@ -2051,17 +1943,45 @@ impl Gpu {
             .ok()
             .as_deref()
             == Some("1");
-        let module = if split_q {
-            "attention_q8_0_flash_prefill_wmma_splitq"
+        let gfx12 = self.arch_caps.has_wmma_w32_gfx12();
+        let fixed_head_dim = hipfire_config::developer_var("HIPFIRE_FLASH_PREFILL_FIXED_HD")
+            .ok()
+            .as_deref()
+            != Some("0");
+        let fixed_hd = if fixed_head_dim { head_dim } else { 0 };
+        let prefetch_v = hipfire_config::developer_var("HIPFIRE_FLASH_PREFILL_PREFETCH_V")
+            .ok()
+            .as_deref()
+            != Some("0");
+        // gfx12 must see head_dim as a compile-time constant so the unrolled
+        // float8_t output fragments stay in VGPRs. Leaving it dynamic spills
+        // 544 B/thread to scratch (and reserves ~34 MiB of global scratch on
+        // gfx1201), roughly halving this kernel's measured throughput.
+        let pv_suffix = if prefetch_v { "" } else { "_pv0" };
+        let tuning_suffix = pv_suffix;
+        let module = if !fixed_head_dim && split_q {
+            format!("attention_q8_0_flash_prefill_wmma_dynamic_splitq{tuning_suffix}")
+        } else if !fixed_head_dim {
+            format!("attention_q8_0_flash_prefill_wmma_dynamic{tuning_suffix}")
+        } else if gfx12 && split_q {
+            format!("attention_q8_0_flash_prefill_wmma_gfx12_hd{head_dim}_splitq{tuning_suffix}")
+        } else if gfx12 {
+            format!("attention_q8_0_flash_prefill_wmma_gfx12_hd{head_dim}{tuning_suffix}")
+        } else if split_q {
+            format!("attention_q8_0_flash_prefill_wmma_gfx11_hd{head_dim}_splitq{tuning_suffix}")
         } else {
-            "attention_q8_0_flash_prefill_wmma"
+            format!("attention_q8_0_flash_prefill_wmma_gfx11_hd{head_dim}{tuning_suffix}")
+        };
+        let kernel_src = if gfx12 {
+            kernels::ATTENTION_Q8_0_FLASH_PREFILL_WMMA_GFX12_SRC
+        } else {
+            kernels::ATTENTION_Q8_0_FLASH_PREFILL_WMMA_SRC
         };
         let src = format!(
-            "#define SPLIT_Q {}\n{}",
-            split_q as u32,
-            kernels::ATTENTION_Q8_0_FLASH_PREFILL_WMMA_SRC
+            "#define SPLIT_Q {}\n#define FIXED_HEAD_DIM {}\n#define PREFETCH_V {}\n{}",
+            split_q as u32, fixed_hd, prefetch_v as u32, kernel_src
         );
-        self.ensure_kernel(module, &src, "attention_q8_0_flash_prefill_wmma")?;
+        self.ensure_kernel(&module, &src, "attention_q8_0_flash_prefill_wmma")?;
         const M_TILE: usize = 16;
         const N_TILE: usize = 16;
         const S_STRIDE: usize = 18;
@@ -2074,7 +1994,10 @@ impl Gpu {
         // Q(xN planes) f16 + V^T f16 + S f16 + (m,l,alpha) f32
         let lds = (q_planes * M_TILE * head_dim + head_dim * V_STRIDE + M_TILE * S_STRIDE) * 2
             + M_TILE * 3 * 4;
-        assert!(lds <= 64 * 1024, "wmma flash prefill LDS {lds} exceeds 64KB");
+        assert!(
+            lds <= 64 * 1024,
+            "wmma flash prefill LDS {lds} exceeds 64KB"
+        );
 
         let scale = 1.0f32 / (head_dim as f32).sqrt();
         let mut q_ptr = q.buf.as_ptr();
@@ -2153,32 +2076,10 @@ impl Gpu {
         block_cols: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let use_m4 = q8_prefill_m4_eligible(
-            &self.arch,
-            n_heads,
-            head_dim,
-            max_ctx_len,
-            batch_size,
-            partials.numel(),
-            tree_bias.is_some(),
-        );
-        let (tile_key, tile_src, tile_func) = if use_m4 {
-            (
-                "attention_flash_q8_0_m4_tile_batched",
-                kernels::ATTENTION_FLASH_Q8_0_M4_TILE_BATCHED_SRC,
-                "attention_flash_q8_0_m4_tile_batched",
-            )
-        } else {
-            (
-                "attention_flash_q8_0_tile_batched",
-                kernels::ATTENTION_FLASH_Q8_0_TILE_BATCHED_SRC,
-                "attention_flash_q8_0_tile_batched",
-            )
-        };
         self.launch_asym_flash_batched(
-            tile_key,
-            tile_src,
-            tile_func,
+            "attention_flash_q8_0_tile_batched",
+            kernels::ATTENTION_FLASH_Q8_0_TILE_BATCHED_SRC,
+            "attention_flash_q8_0_tile_batched",
             q,
             k_cache,
             v_cache,
@@ -3570,20 +3471,15 @@ impl Gpu {
     ) -> HipResult<()> {
         const TILE_SIZE: usize = 128;
         const WMMA_BLOCK_M: usize = 16;
-        let use_q8_m4_grid = tile_func_name == "attention_flash_q8_0_m4_tile_batched";
         let max_tiles = (max_ctx_len + TILE_SIZE - 1) / TILE_SIZE;
         let stride = 2 + head_dim;
         let per_pos_bytes = n_heads * max_tiles * stride * 4;
         let partials_capacity = partials.numel() * 4;
-        let mut sub_batch = if per_pos_bytes > 0 {
+        let sub_batch = if per_pos_bytes > 0 {
             (partials_capacity / per_pos_bytes).max(1).min(batch_size)
         } else {
             batch_size
         };
-        if use_q8_m4_grid {
-            sub_batch -= sub_batch % 4;
-            sub_batch = sub_batch.max(4);
-        }
 
         let wmma_fa_kernel = if self.arch_caps.has_wmma_w32_gfx12() {
             Some((
@@ -3695,12 +3591,6 @@ impl Gpu {
                 let (grid, lds_bytes): ([u32; 3], u32) = if use_wmma_grid {
                     let m_tiles = (chunk + WMMA_BLOCK_M - 1) / WMMA_BLOCK_M;
                     ([n_heads as u32, m_tiles as u32, max_tiles as u32], 0)
-                } else if use_q8_m4_grid {
-                    let m_tiles = (chunk + 3) / 4;
-                    (
-                        [n_heads as u32, m_tiles as u32, max_tiles as u32],
-                        (4 * TILE_SIZE * 4) as u32,
-                    )
                 } else {
                     (
                         [n_heads as u32, max_tiles as u32, chunk as u32],

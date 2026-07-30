@@ -1,5 +1,9 @@
 # 27B DFlash golden run — LDS-staged weight GEMMs, gfx1201
 
+> **Historical result.** The M4 kernel and `HIPFIRE_Q8_PREFILL_M4` switch used
+> below have since been removed. These commands describe the pinned tree in the
+> identity table; the variable is inert on current HEAD.
+
 Winning config: **`HIPFIRE_HFQ4G256_LDSSTAGE=1`, `HIPFIRE_Q8_PREFILL_M4=0`, `--ctx 2048`** → **277.97 tok/s** decode, **+9.06%** over the same binary with LDS staging off.
 
 | arm | decode tok/s (3 fresh reps) | median | prefill | τ | accept | tokens |

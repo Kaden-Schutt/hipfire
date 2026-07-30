@@ -14581,24 +14581,20 @@ fn generate(
         }
         // Zero DeltaNet state on reset. qwen35 recurrent state lives in the
         // bundle (ModelState::Qwen35), not the always-None m.dn_state/m.kv_cache.
-        // Inlined (disjoint field access) because a `&tokenizer` borrow of `m`
-        // is live here.
-        if let Some(ModelState::Qwen35(b)) = m.state.as_ref() {
-            let dn = &b.dn_state;
-            for s in &dn.s_matrices {
-                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-            }
-            for s in &dn.s_scales {
-                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-            }
-            for s in &dn.conv_states {
-                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-            }
-            for s in &dn.s_ef_residual {
-                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-            }
-        }
+        // Use the canonical reset so newly added recurrent buffers (notably the
+        // Q8 error-feedback residual) cannot leak across rollover boundaries.
         if let Some(ModelState::Qwen35(b)) = m.state.as_mut() {
+            if let Err(e) = b.dn_state.reset(gpu) {
+                emit_active_attempt_error(
+                    stdout,
+                    Some(id),
+                    &format!("context reset failed: {e}"),
+                    "gpu",
+                    true,
+                    false,
+                );
+                return;
+            }
             b.kv_cache.compact_offset = 0;
         }
         if let Some(ModelState::Llama(b)) = m.state.as_mut() {
