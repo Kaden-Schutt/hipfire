@@ -12613,6 +12613,7 @@ struct GenerateVLParams<'a> {
     repeat_penalty: f32,
     repeat_window: usize,
     max_think_tokens: usize,
+    assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix,
 }
 
 fn ckpt_resume_enabled() -> bool {
@@ -14649,8 +14650,7 @@ fn main() {
 
                 // assistant_prefix: "plain", "open_think", or "closed_think"
                 // Controls the ChatML framing after the assistant role header.
-                // Consumed by the text path; VL path does not yet propagate
-                // it (tracked as a follow-up to the post-#169 rebase).
+                // Propagated through both text and Qwen3.5-VL paths.
                 let assistant_prefix = match msg
                     .get("assistant_prefix")
                     .and_then(|v| v.as_str())
@@ -14785,6 +14785,7 @@ fn main() {
                         repeat_penalty,
                         repeat_window,
                         max_think_tokens: vl_max_think_tokens,
+                        assistant_prefix,
                     };
                     if is_dots_ocr {
                         generate_vl_dots_ocr(m, &mut gpu, &mut stdout, &params);
@@ -34221,6 +34222,7 @@ fn generate_vl(
         repeat_penalty,
         repeat_window,
         max_think_tokens,
+        assistant_prefix,
     } = *params;
     // Adaptive KV poison is sticky until unload/reload. Refuse VL generation so a
     // partial tier transition cannot continue writing into mixed-tier state.
@@ -34436,7 +34438,7 @@ fn generate_vl(
         tokenizer,
         system: if m.seq_pos == 0 { system_prompt } else { None },
         user: "", // unused: we pass tokens directly via build_with_user_tokens
-        assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix::Plain, // VL always uses Plain
+        assistant_prefix,
         raw: false,
     }
     .build_with_user_tokens(&user_body);
@@ -34673,11 +34675,14 @@ fn generate_vl(
     let vl_ngram_scope_start = m.conversation_tokens.len();
 
     // Generate. CPU-side sampling — VL path predates the GPU sampler
-    // and downloads logits each step. The order of ops is preserved
-    // from pre-PR3:
-    //   - first sample: top-p only (no penalty, no ngram block);
-    //   - subsequent samples: positional ngram-block, then
-    //     repeat_penalty, then top-p sample.
+    // and downloads logits each step:
+    //   - first sample: top-p only (no repeat penalty);
+    //   - subsequent samples: repeat penalty, then top-p sample.
+    //
+    // Unlike ordinary text generation, do not apply the positional 3..6-gram
+    // ban here. OCR/layout output legitimately repeats table and markup
+    // sequences. The configured LoopGuard remains available for pathological
+    // full-loop termination, and the text paths retain their n-gram policies.
     //
     // Attractor-block uses CPU-side mutation of the downloaded logits
     // vector (`block_attractor_unclosed_cpu`) instead of the previous
@@ -34886,9 +34891,14 @@ fn generate_vl(
                 return;
             }
         };
-        // hunt3 M-D: scope ngram-block + repeat-penalty history to generated-only.
+        // hunt3 M-D: scope repeat-penalty history to generated-only.
+        // Exact transcription legitimately repeats HTML/Markdown n-grams
+        // (`<tr>`, `<td>`, table delimiters, boilerplate). Hard no-repeat
+        // blocking corrupts those outputs by forcing a lower-ranked token
+        // whenever a 3..6-gram recurs. Keep the ordinary configured repeat
+        // penalty in `sample_cpu`, but do not mutate VL logits with an
+        // unconditional no-repeat constraint.
         let vl_ngram_scope = &m.conversation_tokens[vl_ngram_scope_start..];
-        llama::apply_ngram_block(&mut logits, vl_ngram_scope);
         if let Some((open, close)) = think_pair {
             block_attractor_unclosed_cpu(&mut logits, &m.conversation_tokens, open, close, 20, 2);
         }

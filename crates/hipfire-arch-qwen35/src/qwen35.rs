@@ -2874,24 +2874,13 @@ fn load_weight_tensor_raw(
             })
         }
         16 => {
-            // BF16 — widen losslessly to F32 on host, then upload as F32.
-            // bf16 is the high 16 bits of an f32 (same sign/exp, 7 mantissa
-            // bits), so `from_bits((bf16 as u32) << 16)` is exact. The engine
-            // has no native bf16 GEMV for the text arch; the gfx942 bf16 MFMA
-            // GEMM (kernels/src/gemm_bf16_mfma.gfx942.hip) is the perf path and
-            // is documented as a deferred gap. F32 compute over bf16-rounded
-            // weights is a superset-precision oracle.
-            let f32_data: Vec<f32> = data
-                .chunks_exact(2)
-                .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
-                .collect();
-            let bytes: &[u8] = unsafe {
-                std::slice::from_raw_parts(f32_data.as_ptr() as *const u8, f32_data.len() * 4)
-            };
-            let buf = gpu.upload_raw(bytes, &[m, k])?;
+            // Native BF16 storage, F32 accumulation. This is source-exact for
+            // BF16 checkpoints while retaining the two-byte memory traffic;
+            // the unified dispatcher routes it through GemvBf16.
+            let buf = gpu.upload_raw(data, &[m, k])?;
             Ok(WeightTensor {
                 buf,
-                gpu_dtype: DType::F32,
+                gpu_dtype: DType::BF16,
                 m,
                 k,
                 row_stride: 0,
@@ -23639,6 +23628,10 @@ mod tests {
             assert!(
                 !is_batchable_la(DType::HFQ2G256, arch),
                 "HFQ2G256 must fall back"
+            );
+            assert!(
+                !is_batchable_la(DType::BF16, arch),
+                "BF16 must fall back until the batched BF16 dispatch family is wired"
             );
         }
     }

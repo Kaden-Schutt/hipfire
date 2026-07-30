@@ -189,6 +189,19 @@ fn load_f16_gpu(hfq: &HfqFile, gpu: &mut Gpu, name: &str) -> HipResult<GpuTensor
             // F16 — upload directly. Shape records element count, not byte count.
             gpu.upload_raw(data, &[n])
         }
+        2 => {
+            // F32 oracle — the vision kernels consume F16 matrices, so narrow
+            // the lossless decoder-oracle container at load time just as the
+            // ordinary --include-vision ingest does before writing F16.
+            let f16_bytes: Vec<u8> = data
+                .chunks_exact(4)
+                .take(n)
+                .flat_map(|c| {
+                    f32_to_f16(f32::from_le_bytes([c[0], c[1], c[2], c[3]])).to_le_bytes()
+                })
+                .collect();
+            gpu.upload_raw(&f16_bytes, &[n])
+        }
         6 | 7 => {
             // HFQ4 — dequantize to F32, then convert to F16 for gemm_f16.
             // Shape records element count, not byte count.
@@ -199,7 +212,12 @@ fn load_f16_gpu(hfq: &HfqFile, gpu: &mut Gpu, name: &str) -> HipResult<GpuTensor
                 .collect();
             gpu.upload_raw(&f16_bytes, &[n])
         }
-        other => panic!("{name}: unsupported vision quant_type={other} (expected F16=1, HFQ4=6/7)"),
+        other => {
+            panic!(
+                "{name}: unsupported vision quant_type={other} \
+                 (expected F16=1, F32=2, HFQ4=6/7)"
+            )
+        }
     }
 }
 
@@ -270,6 +288,7 @@ pub fn load_vision_weights(
     if let Some((info, _)) = hfq.tensor_data("model.visual.patch_embed.proj.weight") {
         let fmt = match info.quant_type {
             1 => "F16 (direct)",
+            2 => "F32 oracle (narrowing to F16 on load)",
             6 => "HFQ4-G256 (dequanting to F16 on load)",
             7 => "HFQ4-G128 (dequanting to F16 on load)",
             other => &format!("qt={other}"),
@@ -778,6 +797,8 @@ pub fn vision_forward(
     let n = grid_h * grid_w;
     let patch_dim = 3 * config.temporal_patch_size * config.patch_size * config.patch_size;
     let t0 = std::time::Instant::now();
+    let dump_dir = std::env::var_os("HIPFIRE_VL_DUMP_DIR").map(std::path::PathBuf::from);
+    let dump_dir = dump_dir.as_deref();
 
     // Diagnostic stage dumps (env-gated; see `vl_dump_slice`).
     let dump_dir: Option<std::path::PathBuf> =
@@ -794,6 +815,10 @@ pub fn vision_forward(
         "  vision forward (GPU): {} patches, {}x{} grid",
         n, grid_h, grid_w
     );
+
+    if let Some(d) = dd {
+        vl_dump_slice(d, "pixel_values", patches, &[n, patch_dim]);
+    }
 
     // Upload patches [n, patch_dim]
     let x_patches = gpu.upload_f32(patches, &[n * patch_dim])?;

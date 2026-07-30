@@ -538,7 +538,8 @@ pub fn dequant_norm(
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect(),
-        _ => panic!("expected F16/F32 for norm, got qt={quant_type}"),
+        16 => widen_bf16(data),
+        _ => panic!("expected F16/F32/BF16 for norm, got qt={quant_type}"),
     };
     let expected: usize = shape.iter().product();
     assert_eq!(
