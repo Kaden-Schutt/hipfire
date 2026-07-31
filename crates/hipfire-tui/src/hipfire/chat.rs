@@ -12,7 +12,7 @@ use std::{
 };
 
 use anyhow::Result;
-use hipfire_client::stream_openai_chat;
+use hipfire_client::{stream_openai_chat, ClientError, OpenAiSseEvent};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -68,17 +68,35 @@ fn stream_chat_inner(
     if let Some(p) = top_p {
         body["top_p"] = json!(p);
     }
-    stream_openai_chat(
+    match stream_openai_chat(
         host,
         port,
         body,
         Duration::from_secs(600),
-        |chunk| {
-            let _ = tx.send(ChatEvent::Delta(chunk.to_owned()));
+        |event| {
+            match event {
+                OpenAiSseEvent::Reasoning { text } | OpenAiSseEvent::Content { text } => {
+                    let _ = tx.send(ChatEvent::Delta(text));
+                }
+                OpenAiSseEvent::Role { .. }
+                | OpenAiSseEvent::ToolCall { .. }
+                | OpenAiSseEvent::Finish { .. }
+                | OpenAiSseEvent::Usage { .. }
+                | OpenAiSseEvent::Done => {}
+            }
             Ok(())
         },
         || abort.load(Ordering::Relaxed),
-    )?;
-    let _ = tx.send(ChatEvent::Done);
-    Ok(())
+    ) {
+        Ok(()) => {
+            let _ = tx.send(ChatEvent::Done);
+            Ok(())
+        }
+        // Explicit client cancel (Esc) is not an error and is never retried.
+        Err(ClientError::Cancelled) => {
+            let _ = tx.send(ChatEvent::Done);
+            Ok(())
+        }
+        Err(err) => Err(err.into()),
+    }
 }

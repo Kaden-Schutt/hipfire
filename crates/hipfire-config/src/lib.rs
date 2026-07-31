@@ -768,6 +768,28 @@ pub static FIELDS: &[ConfigField] = &[
         Some("HIPFIRE_SERVE_QUEUE_TIMEOUT_MS"),
         "Maximum admission-queue wait."
     ),
+    process_bool_field!(
+        "serve.retry_enabled",
+        "retry_enabled",
+        Serve,
+        false,
+        true,
+        "HIPFIRE_SERVE_RETRY_ENABLED",
+        "Server-owned single retry on typed transient daemon failures; promoted only after merged-path GPU parity."
+    ),
+    process_field!(
+        "serve.retry_backoff_ms",
+        "retry_backoff_ms",
+        Serve,
+        DefaultValue::Integer(50),
+        ValueRule::Integer {
+            min: 0,
+            max: 60000
+        },
+        true,
+        "HIPFIRE_SERVE_RETRY_BACKOFF_MS",
+        "Backoff before the single serve retry; slept outside runtime and admission locks."
+    ),
     field!(
         "experimental.budget_alert",
         "experimental_budget_alert",
