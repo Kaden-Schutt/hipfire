@@ -3416,13 +3416,7 @@ fn quantize_mq2g256_lloyd_gptq(
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(0.0);
-    quantize_mq2g256_lloyd_gptq_with_damping(
-        f32_data,
-        col_weights,
-        signs1,
-        signs2,
-        damping,
-    )
+    quantize_mq2g256_lloyd_gptq_with_damping(f32_data, col_weights, signs1, signs2, damping)
 }
 
 fn quantize_mq2g256_lloyd_gptq_with_damping(
@@ -5389,7 +5383,10 @@ fn awq_eligible(name: &str) -> bool {
     // are excluded — produces an F1-equivalent quant for comparison
     // bench against the same binary's F2 quant. Default (env unset):
     // the full F2 whitelist applies.
-    let f1_only = hipfire_config::developer_var("HIPFIRE_AWQ_F1_ONLY").ok().as_deref() == Some("1");
+    let f1_only = hipfire_config::developer_var("HIPFIRE_AWQ_F1_ONLY")
+        .ok()
+        .as_deref()
+        == Some("1");
     let f1_match =
     // Full-attention input projections (HF naming + fused variants).
     name.ends_with("q_proj.weight")
@@ -6672,7 +6669,10 @@ fn main() {
     // exclusive with the AWQ / Lloyd-tier expert paths (graded is the first
     // arm in the rayon dispatch). Compose with --format mq4 --no-kmap so the
     // DENSE attn/shared weights stay MQ4 and only the 3D experts are graded.
-    let use_moe_graded = hipfire_config::developer_var("HIPFIRE_MOE_GRADED").ok().as_deref() == Some("1");
+    let use_moe_graded = hipfire_config::developer_var("HIPFIRE_MOE_GRADED")
+        .ok()
+        .as_deref()
+        == Some("1");
     let moe_hot_frac: f64 = hipfire_config::developer_var("HIPFIRE_MOE_HOT_FRAC")
         .ok()
         .and_then(|v| v.parse::<f64>().ok())
@@ -6801,7 +6801,10 @@ fn main() {
         || format == "mq4-mq3lloyd-routed"
         || format == "mq4-mq3lloyd-exp";
     let allow_mq3_lloyd_for_mixed = args.allow_mq3_lloyd
-        || hipfire_config::developer_var("HIPFIRE_ALLOW_MQ3_LLOYD").ok().as_deref() == Some("1");
+        || hipfire_config::developer_var("HIPFIRE_ALLOW_MQ3_LLOYD")
+            .ok()
+            .as_deref()
+            == Some("1");
     if use_mq4_mq3lloyd_kmap && !allow_mq3_lloyd_for_mixed {
         eprintln!(
             "note: --format mq4-mq3lloyd-kmap requires --allow-mq3-lloyd or\n\
@@ -6878,7 +6881,10 @@ fn main() {
         || format == "all-mq2-gptq";
     if use_mq4_mq2lloyd_gptq_all
         && imatrix_path.is_none()
-        && hipfire_config::developer_var("HIPFIRE_ALLOW_UNIT_IMATRIX").ok().as_deref() != Some("1")
+        && hipfire_config::developer_var("HIPFIRE_ALLOW_UNIT_IMATRIX")
+            .ok()
+            .as_deref()
+            != Some("1")
     {
         eprintln!("error: --format mq4-mq2lloyd-gptq-all requires --imatrix <PATH>");
         eprintln!(
@@ -7120,8 +7126,11 @@ fn main() {
     // model size validated locally (0.8B / 4B / 9B Qwen 3.5 → multilingual
     // mojibake on all 4 coherence-gate prompts). Refuse by default until
     // Path D Lloyd-Max non-uniform codebooks land (PRD §5.2).
-    let allow_mq2 =
-        args.allow_mq2 || hipfire_config::developer_var("HIPFIRE_ALLOW_MQ2").ok().as_deref() == Some("1");
+    let allow_mq2 = args.allow_mq2
+        || hipfire_config::developer_var("HIPFIRE_ALLOW_MQ2")
+            .ok()
+            .as_deref()
+            == Some("1");
     if use_mq2g256 && !allow_mq2 {
         eprintln!(
             "error: --format mq2 is reserved — empirical quality verdict is collapse on every model\n\
@@ -7141,7 +7150,10 @@ fn main() {
     // vs 9B MQ4 ppl=10. Research-only: same opt-in gate so users don't
     // accidentally ship a 2-bpw model that won't produce coherent output.
     let allow_mq3_lloyd = args.allow_mq3_lloyd
-        || hipfire_config::developer_var("HIPFIRE_ALLOW_MQ3_LLOYD").ok().as_deref() == Some("1");
+        || hipfire_config::developer_var("HIPFIRE_ALLOW_MQ3_LLOYD")
+            .ok()
+            .as_deref()
+            == Some("1");
     if use_mq3g256_lloyd && !allow_mq3_lloyd {
         eprintln!(
             "note: --format mq3-lloyd is research — Lloyd-Max 8-entry codebook +\n\
@@ -7156,7 +7168,10 @@ fn main() {
         std::process::exit(1);
     }
     let allow_mq2_lloyd = args.allow_mq2_lloyd
-        || hipfire_config::developer_var("HIPFIRE_ALLOW_MQ2_LLOYD").ok().as_deref() == Some("1");
+        || hipfire_config::developer_var("HIPFIRE_ALLOW_MQ2_LLOYD")
+            .ok()
+            .as_deref()
+            == Some("1");
     if (use_mq2g256_lloyd
         || use_mq4_mq2lloydexp
         || use_mq4_mq2lloyd_native
@@ -7191,7 +7206,10 @@ fn main() {
     // Quality not yet validated — same opt-in gate as MQ3-Lloyd until ppl
     // numbers land.
     let allow_mq4_lloyd = args.allow_mq4_lloyd
-        || hipfire_config::developer_var("HIPFIRE_ALLOW_MQ4_LLOYD").ok().as_deref() == Some("1");
+        || hipfire_config::developer_var("HIPFIRE_ALLOW_MQ4_LLOYD")
+            .ok()
+            .as_deref()
+            == Some("1");
     if use_mq4g256_lloyd && !allow_mq4_lloyd {
         eprintln!(
             "note: --format mq4-lloyd is research — Lloyd-Max 16-entry codebook +\n\
@@ -7802,7 +7820,11 @@ fn main() {
     // HIPFIRE_NO_SPILL=1 disables the disk spill entirely (hold all tensors in
     // RAM, write output directly). Needed for huge f32 oracles where spill+output
     // would be ~2x the output size on disk — but RAM is ample.
-    let mut spill = if hipfire_config::developer_var("HIPFIRE_NO_SPILL").ok().as_deref() == Some("1") {
+    let mut spill = if hipfire_config::developer_var("HIPFIRE_NO_SPILL")
+        .ok()
+        .as_deref()
+        == Some("1")
+    {
         None
     } else {
         TensorSpill::new(spill_dir).ok()
@@ -8665,12 +8687,12 @@ fn main() {
                 // Expert format by --format: mq2-lloyd (MQ2G256Lloyd, hipx sub-4-bit
                 // target — has deepseek4 indexed-MoE kernels), mq3-lloyd / mq6 (oracle
                 // check / HIPFIRE_MINIMAX_EXPERT_*), else mq4 (MQ4G256, default + validated).
-                let mm_mq6 =
-                    use_mq6g256 || hipfire_config::developer_var_os("HIPFIRE_MINIMAX_EXPERT_MQ6").is_some();
-                let mm_mq2l =
-                    use_mq2g256_lloyd || hipfire_config::developer_var_os("HIPFIRE_MINIMAX_EXPERT_MQ2L").is_some();
-                let mm_mq3l =
-                    use_mq3g256_lloyd || hipfire_config::developer_var_os("HIPFIRE_MINIMAX_EXPERT_MQ3L").is_some();
+                let mm_mq6 = use_mq6g256
+                    || hipfire_config::developer_var_os("HIPFIRE_MINIMAX_EXPERT_MQ6").is_some();
+                let mm_mq2l = use_mq2g256_lloyd
+                    || hipfire_config::developer_var_os("HIPFIRE_MINIMAX_EXPERT_MQ2L").is_some();
+                let mm_mq3l = use_mq3g256_lloyd
+                    || hipfire_config::developer_var_os("HIPFIRE_MINIMAX_EXPERT_MQ3L").is_some();
                 // Per-layer mixed-precision promotion. HIPFIRE_MINIMAX_PROMOTE_MQ4 /
                 // _MQ6 hold comma-separated layer ranges ("12-45,50") whose experts are
                 // forced UP to MQ4 / MQ6 regardless of the base --format. The forward
@@ -8963,22 +8985,32 @@ fn main() {
             // experts-level "+P" / kmap-experts recipe, minus the gfx12-only dense
             // attn promotion). HIPFIRE_MOE_DOWN_MQ6=1 promotes only down. `down_mq6`
             // means "promote THIS expert tensor to MQ6" (gate_up or down).
-            let experts_mq6_all =
-                hipfire_config::developer_var("HIPFIRE_MOE_EXPERTS_MQ6").ok().as_deref() == Some("1");
+            let experts_mq6_all = hipfire_config::developer_var("HIPFIRE_MOE_EXPERTS_MQ6")
+                .ok()
+                .as_deref()
+                == Some("1");
             let down_mq6 = supports_g256
                 && (experts_mq6_all
-                    || (hipfire_config::developer_var("HIPFIRE_MOE_DOWN_MQ6").ok().as_deref() == Some("1")
+                    || (hipfire_config::developer_var("HIPFIRE_MOE_DOWN_MQ6")
+                        .ok()
+                        .as_deref()
+                        == Some("1")
                         && base_name == "down_proj"));
             // HIPFIRE_MOE_EXPERTS_MQ5=1 promotes BOTH gate_up + down to MQ5; the
             // experts-level 5-bit recipe (5.25 bpw, between MQ4 and MQ6).
             // HIPFIRE_MOE_DOWN_MQ5=1 promotes ONLY the expert down_proj to MQ5
             // (gate_up stays MQ4). Kept OUT of `expert_mq5` so `expert_awq_active`
             // still fires; the AWQ branch switches its output format to MQ5.
-            let experts_mq5_all =
-                hipfire_config::developer_var("HIPFIRE_MOE_EXPERTS_MQ5").ok().as_deref() == Some("1");
+            let experts_mq5_all = hipfire_config::developer_var("HIPFIRE_MOE_EXPERTS_MQ5")
+                .ok()
+                .as_deref()
+                == Some("1");
             let down_mq5 = supports_g256
                 && (experts_mq5_all
-                    || (hipfire_config::developer_var("HIPFIRE_MOE_DOWN_MQ5").ok().as_deref() == Some("1")
+                    || (hipfire_config::developer_var("HIPFIRE_MOE_DOWN_MQ5")
+                        .ok()
+                        .as_deref()
+                        == Some("1")
                         && base_name == "down_proj"));
             // mq4-mq2lloydexp round-trip probe: ALWAYS hits routed experts
             // (overrides any kmap promotion). The intent is to inject MQ2
@@ -9088,13 +9120,17 @@ fn main() {
             // HIPFIRE_AWQ_EXPERTS=down restricts expert AWQ to down_proj (the
             // sensitive residual-write projection + the free runtime kernel);
             // unset/=all does both gate_up and down (default).
-            let awq_down_only =
-                hipfire_config::developer_var("HIPFIRE_AWQ_EXPERTS").ok().as_deref() == Some("down");
+            let awq_down_only = hipfire_config::developer_var("HIPFIRE_AWQ_EXPERTS")
+                .ok()
+                .as_deref()
+                == Some("down");
             // HIPFIRE_AWQ_EXPERTS=none keeps DENSE AWQ (attn/lm_head) but emits
             // NO per-expert AWQ — the clean baseline for isolating the expert
             // contribution against an HIPFIRE_AWQ_EXPERTS=down treatment.
-            let awq_experts_none =
-                hipfire_config::developer_var("HIPFIRE_AWQ_EXPERTS").ok().as_deref() == Some("none");
+            let awq_experts_none = hipfire_config::developer_var("HIPFIRE_AWQ_EXPERTS")
+                .ok()
+                .as_deref()
+                == Some("none");
             let expert_awq_active = AWQ_ALPHA.get().is_some()
                 && !awq_experts_none
                 && imatrix_gguf.is_some()
@@ -10553,12 +10589,15 @@ fn main() {
                                 };
                             let data: &[f32] = awq_scaled.as_deref().unwrap_or(&f32_data);
                             // HIPFIRE_LLOYD_K3=1 → ternary "MQ1.58" (3-level codebook, reuses kernel).
-                            let q =
-                                if hipfire_config::developer_var("HIPFIRE_LLOYD_K3").ok().as_deref() == Some("1") {
-                                    quantize_mq2g256_lloyd_k3(data, &signs1, &signs2)
-                                } else {
-                                    quantize_mq2g256_lloyd(data, &signs1, &signs2)
-                                };
+                            let q = if hipfire_config::developer_var("HIPFIRE_LLOYD_K3")
+                                .ok()
+                                .as_deref()
+                                == Some("1")
+                            {
+                                quantize_mq2g256_lloyd_k3(data, &signs1, &signs2)
+                            } else {
+                                quantize_mq2g256_lloyd(data, &signs1, &signs2)
+                            };
                             (q, QuantType::MQ2G256Lloyd, 256u32, "MQ2G256Lloyd")
                         } else {
                             // Fallback to HFQ2-G128 for non-256-aligned (no rotation)
@@ -11151,9 +11190,8 @@ mod gptq_damping_probe {
         eprintln!("  Lloyd                  MSE = {:.6e}", lloyd_mse);
 
         for damping in [0.0_f32, 0.1, 0.3, 0.5, 0.8, 1.0] {
-            let gptq_bytes = quantize_mq2g256_lloyd_gptq_with_damping(
-                weights, &unit, &signs1, &signs2, damping,
-            );
+            let gptq_bytes =
+                quantize_mq2g256_lloyd_gptq_with_damping(weights, &unit, &signs1, &signs2, damping);
             let gptq_recon = dequantize_mq2g256_lloyd_to_f32(&gptq_bytes, n, &signs1, &signs2);
             let gptq_mse = mse(weights, &gptq_recon);
             let delta = ((gptq_mse - lloyd_mse) / lloyd_mse) * 100.0;

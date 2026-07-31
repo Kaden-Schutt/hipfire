@@ -367,10 +367,13 @@ attribute the corresponding inventions per [AGENTS.md](AGENTS.md).
 
 See [CONTRIBUTING.md](CONTRIBUTING.md). Install local hooks with
 `./scripts/install-hooks.sh`. The no-GPU CI subset is
-`./scripts/no-gpu-ci.sh`; it does not replace the hardware gates. Any
-change to kernels, quant formats, dispatch, fusion, rotation, rmsnorm,
-or the spec-decode path must pass `./scripts/coherence-gate-dflash.sh`
-before commit. That is the canonical correctness gate; architecture-specific
+`./scripts/no-gpu-ci.sh`; it does not replace the hardware gates.
+**There is no single canonical correctness gate** — the retired
+`scripts/coherence-gate*.sh` batteries are not acceptance evidence and
+`coherence-gate-dflash.sh` no longer exists. Select the route your change
+owes from [docs/VALIDATION.md](docs/VALIDATION.md): `scripts/serve_harness.py`
+for generation and state-lifecycle changes, `scripts/redline_daemon_harness.py`
+for kernel, dispatch, graph, or Redline-replay changes. Architecture-specific
 work must also pass its channel test, anti-bleed checks, and relevant speed
 gate. Don't bypass the gates with `--no-verify` — see
 [methodology/perf-benchmarking.md](docs/methodology/perf-benchmarking.md).
