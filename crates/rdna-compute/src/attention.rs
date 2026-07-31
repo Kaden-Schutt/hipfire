@@ -5501,11 +5501,12 @@ impl Gpu {
             &mut ms as *mut _ as *mut c_void,
             &mut sc as *mut _ as *mut c_void,
         ];
-        let block_size = (seq_len_hint.max(head_dim) as u32)
-            .next_power_of_two()
-            .min(256);
-        // Extra shared mem for Q head vector preloaded into shared memory
-        let shared_mem = ((seq_len_hint + block_size as usize + head_dim) * 4) as u32;
+        // Fixed-size launch: block 256, LDS = (ATT_Q8_TILE + head_dim + block)
+        // floats regardless of seq_len (v2 kernel tiles positions with online
+        // softmax — O(seq_len) LDS previously faulted past ~15.9k on gfx1100).
+        const ATT_Q8_KV_TILE: usize = 2048;
+        let block_size: u32 = 256;
+        let shared_mem = ((ATT_Q8_KV_TILE + head_dim + block_size as usize) * 4) as u32;
         let bytes =
             crate::profile::attention_q8_0_kv_bytes(n_heads, n_kv_heads, head_dim, seq_len_hint);
         let timer = crate::profile::begin_timer(&self.hip, "attention", "attention_q8_0_kv", bytes);

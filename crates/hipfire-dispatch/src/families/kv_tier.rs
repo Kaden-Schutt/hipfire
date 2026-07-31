@@ -359,7 +359,7 @@ impl KvTierPlan {
 /// `is_boundary` and `quant_q8` branches of `derive`.
 fn q8_attend_key(pos: usize, flash_mode: usize, capture_mode: bool) -> KernelKey {
     let use_flash =
-        capture_mode || flash_mode == 2 || (flash_mode == 1 && pos + 1 >= 2048) || pos + 1 > 15000;
+        capture_mode || flash_mode == 2 || (flash_mode == 1 && pos + 1 >= 2048);
     if use_flash {
         KernelKey::AttnFlashQ8_0
     } else {
