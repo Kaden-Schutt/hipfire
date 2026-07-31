@@ -17,8 +17,10 @@ libc = "0.2"
 hipfire-config = { path = "../hipfire-config" }
 hipfire-client = { path = "../hipfire-client" }
 hipfire-registry = { path = "../hipfire-registry" }
+hipfire-runtime = { path = "../hipfire-runtime", default-features = false, features = ["deltanet"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 tiny_http = "0.12"
 ureq = "3"
+
