@@ -820,46 +820,22 @@ fn quantize_q8hfq(f32_data: &[f32], m: usize, k: usize) -> (Vec<u8>, usize) {
 /// Quantize F32 weights to HFQ4-G256: flat 4-bit with 256-weight groups.
 /// Block: [f32 scale][f32 zero][128B nibbles] = 136 bytes per 256 weights (0.531 B/w).
 /// 18 VGPRs, 100% occupancy on RDNA1. Beats Q4_K at all matrix sizes.
-/// CPU-side FWHT (Walsh-Hadamard Transform) on a 256-element group.
-/// Matches the GPU-side fwht_forward_256 in turbo_common: signs1 → butterfly → scale → signs2.
+/// CPU-side FWHT on a 256-element group.
+///
+/// Thin alias over [`hipfire_quantize::fwht::fwht_256`], which is the canonical
+/// copy (and the one with tests that run under CI's `cargo test --lib`). Must
+/// match `fwht_forward_256` in `kernels/src/turbo_common.h` bit-for-bit.
+#[inline]
 fn cpu_fwht_256(x: &mut [f32], signs1: &[f32], signs2: &[f32]) {
-    assert!(x.len() == 256);
-    for i in 0..256 {
-        x[i] *= signs1[i];
-    }
-    let mut stride = 1;
-    while stride < 256 {
-        let mut i = 0;
-        while i < 256 {
-            for j in 0..stride {
-                let a = x[i + j];
-                let b = x[i + j + stride];
-                x[i + j] = a + b;
-                x[i + j + stride] = a - b;
-            }
-            i += stride * 2;
-        }
-        stride <<= 1;
-    }
-    let scale = 0.0625; // 1/sqrt(256) = 1/16
-    for i in 0..256 {
-        x[i] *= scale * signs2[i];
-    }
+    hipfire_quantize::fwht::fwht_256(x, signs1, signs2)
 }
 
-/// Generate FWHT sign table (matches engine's gen_fwht_signs).
+/// Generate the FWHT sign table (matches the engine's `gen_fwht_signs`).
+///
+/// Thin alias over [`hipfire_quantize::fwht::gen_signs`].
+#[inline]
 pub(crate) fn gen_fwht_signs(seed: u32, n: usize) -> Vec<f32> {
-    let mut state = seed;
-    (0..n)
-        .map(|_| {
-            state = state.wrapping_mul(1103515245).wrapping_add(12345) & 0x7fffffff;
-            if (state >> 16) & 1 == 1 {
-                1.0f32
-            } else {
-                -1.0f32
-            }
-        })
-        .collect()
+    hipfire_quantize::fwht::gen_signs(seed, n)
 }
 
 /// MagnumQuant HFQ4-G256: FWHT-rotated 4-bit quantization.
@@ -1448,61 +1424,25 @@ fn quantize_mfp4g32_2d(
 //
 // Reconstruction:  value = row_scale_a · e4m3_decode(scale_byte) · e2m1_to_f32(nibble)
 
-/// Decode an UNSIGNED E4M3 (FP8, 4 exp bias 7 + 3 mantissa) byte to f32.
-/// Bit-identical to `e4m3_to_f32` for sign=0, restated here standalone so the
-/// mfp4+P scale path is self-contained and matches the gfx942 kernel decode
-/// exactly. exp=0 → subnormal 2^-6·(mant/8); exp=15,mant=7 → NaN (never emitted
-/// by our round-up encoder, which clamps to 448); otherwise 2^(exp-7)·(1+mant/8).
+/// Decode an unsigned E4M3 scale byte.
+///
+/// Thin alias over [`hipfire_quantize::fp8::e4m3_decode`]; kept as a local name
+/// because the mfp4+P / mfp4-E8 encoders below read more clearly with it. The
+/// canonical implementation and its tests live in the lib module so they run
+/// under CI's `cargo test --lib`.
 #[inline]
 fn e4m3_scale_decode(byte: u8) -> f32 {
-    let exp = ((byte >> 3) & 0xf) as i32;
-    let mant = (byte & 0x7) as u32;
-    if exp == 0 {
-        // subnormal (incl. zero): 2^-6 * (mant/8)
-        return (2.0f32).powi(-6) * (mant as f32) / 8.0;
-    }
-    if exp == 0xf && mant == 7 {
-        // E4M3's single NaN code — our encoder never emits it; decode defensively
-        // to the max finite (448) so a stray byte cannot poison a block.
-        return 448.0;
-    }
-    (2.0f32).powi(exp - 7) * (1.0 + (mant as f32) / 8.0)
+    hipfire_quantize::fp8::e4m3_decode(byte)
 }
 
-/// Encode a NON-NEGATIVE f32 scale `s` to an UNSIGNED E4M3 byte, ROUNDED UP
-/// (ceil) to the nearest representable E4M3 value ≥ s. Round-up mirrors mfp4's
-/// UE8M0 ceil intent: the block scale must COVER block_max so e2m1_round never
-/// clips the block max above the [-6,6] E2M1 grid. Sign bit is always 0.
+/// Encode a non-negative f32 scale to the smallest E4M3 code that covers it.
 ///
-/// The decode side (`e4m3_scale_decode` / the gfx942 kernel) MUST be bit-identical;
-/// this function is defined as "smallest E4M3 code whose DECODED value ≥ s", which
-/// is round-trip-exact by construction (we search the decode, not a formula).
-///
-/// Representable unsigned E4M3 (exp 0..15, bias 7, 3 mantissa):
-///   exp=0  : subnormals 0, 2^-9, 2·2^-9 … 7·2^-9   (2^-6·mant/8)
-///   exp1..14, exp15&mant<7 : 2^(exp-7)·(1+mant/8)
-///   exp=15,mant=7 : NaN (excluded)  → max finite = 2^8·1.875 = 448
+/// Thin alias over [`hipfire_quantize::fp8::e4m3_encode_roundup`]. Round-up
+/// (not round-nearest) is required: the block scale must COVER block_max or the
+/// nearest-code search clips the block maximum.
 #[inline]
 fn e4m3_scale_encode_roundup(s: f32) -> u8 {
-    // Non-finite / non-positive guard. s<=0 → smallest code (0x00 == +0.0).
-    if !(s > 0.0) {
-        return 0x00;
-    }
-    if s >= 448.0 {
-        // Saturate to the largest finite E4M3 (exp=15, mant=6 → 0x7E).
-        return 0x7E;
-    }
-    // Find the smallest code in [0x00, 0x7E] (sign=0, NaN 0x7F excluded) whose
-    // decoded value is ≥ s. Codes are monotonically non-decreasing in `byte`
-    // for sign=0 across the exp/mantissa range (standard FP8 ordering), so a
-    // forward scan returns the ceil code. Exhaustive 127-entry scan is trivially
-    // cheap (called once per 32-element block at quant time, offline).
-    for code in 0u8..=0x7E {
-        if e4m3_scale_decode(code) >= s {
-            return code;
-        }
-    }
-    0x7E
+    hipfire_quantize::fp8::e4m3_encode_roundup(s)
 }
 
 /// Quantize one row of K FP32 weights to mfp4+P byte format. Byte-identical to
