@@ -93,9 +93,8 @@ fn main() {
         std::env::var("HIPFIRE_FLASH_PREFILL").unwrap_or_else(|_| "unset".into())
     );
 
-    let tokenizer =
-        hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
-            .expect("tokenizer");
+    let tokenizer = hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
+        .expect("tokenizer");
     let corpus = std::fs::read_to_string(&corpus_path).expect("read corpus");
     let all_tokens: Vec<u32> = tokenizer.encode(&corpus);
     let need = chunks * n_ctx + 1;
@@ -140,8 +139,18 @@ fn main() {
 
         // Prefix [0, scoring_start): builds KV, no capture.
         qwen35::forward_prefill_batch(
-            &mut gpu, &weights, &config, &toks[0..scoring_start], 0, &mut kv_cache,
-            &mut dn_state, &scratch, None, None, None, None,
+            &mut gpu,
+            &weights,
+            &config,
+            &toks[0..scoring_start],
+            0,
+            &mut kv_cache,
+            &mut dn_state,
+            &scratch,
+            None,
+            None,
+            None,
+            None,
         )
         .expect("prefix prefill");
 
@@ -183,8 +192,12 @@ fn main() {
             let lg = &logits[..v];
 
             let maxl = lg.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-            let lse: f64 =
-                lg.iter().map(|&x| ((x - maxl) as f64).exp()).sum::<f64>().ln() + maxl as f64;
+            let lse: f64 = lg
+                .iter()
+                .map(|&x| ((x - maxl) as f64).exp())
+                .sum::<f64>()
+                .ln()
+                + maxl as f64;
             let next_tok = toks[scoring_start + j + 1] as usize;
             let nll = lse - lg[next_tok] as f64;
             total_nll += nll;

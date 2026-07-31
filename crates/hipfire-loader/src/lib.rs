@@ -229,6 +229,18 @@ impl AsstTurnCache {
         self.map.insert(fp, tokens);
         self.order.push_back(fp);
     }
+
+    /// Drop all cached assistant-turn token sequences (authoritative cold reset).
+    pub fn clear(&mut self) {
+        self.map.clear();
+        self.order.clear();
+    }
+
+    /// Read-only emptiness probe for test/snapshot surfaces.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
 }
 
 // ─── ModelState ────────────────────────────────────────────────────────

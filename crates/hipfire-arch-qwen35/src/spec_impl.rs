@@ -9,18 +9,19 @@
 //! daemon's spec loop hands to a `Speculator`, plus [`Qwen35SpecScratch`], the
 //! concrete arch-specific verify scratch a model-free speculator owns behind
 //! `Box<dyn SpecScratch>`. The verify mechanics (batched forward + per-position
-//! lm_head/argmax via `verify_dflash_block`, the DeltaNet snapshot/rewind incl.
-//! the Q8 error-feedback residual the snapshot type omits, and the
-//! full-accept-skip / partial-replay state fixup) all live here so the
-//! speculator stays 100% arch-agnostic. The `DflashSpeculator` impl itself lives
-//! in the sibling [`crate::dflash_spec`] module (alongside `DflashState`, which
-//! it owns).
+//! lm_head/argmax via `verify_dflash_block`, the DeltaNet snapshot/rewind
+//! including the default-on Q8 error-feedback residual folded into
+//! [`DeltaNetSnapshot`], and the full-accept-skip / partial-replay state fixup)
+//! all live here so the speculator stays 100% arch-agnostic. The
+//! `DflashSpeculator` impl itself lives in the sibling [`crate::dflash_spec`]
+//! module (alongside `DflashState`, which it owns).
 
-use crate::qwen35::{self, DeltaNetState};
+use crate::qwen35;
+
 use crate::speculative::{
     apply_topp_trunc, download_hidden_block, sample_categorical,
-    scatter_hidden_block_to_interleaved, verify_dflash_block, xorshift_next_unit,
-    DeltaNetSnapshot, HiddenStateRingBuffer, ModelSlot, VerifyScratch,
+    scatter_hidden_block_to_interleaved, verify_dflash_block, xorshift_next_unit, DeltaNetSnapshot,
+    HiddenStateRingBuffer, ModelSlot, VerifyScratch,
 };
 use hipfire_runtime::spec::{SpecAdvance, SpecScratch, SpecTarget};
 use rdna_compute::{DType, Gpu, GpuTensor};
@@ -40,37 +41,15 @@ fn argmax(logits: &[f32]) -> u32 {
         .0
 }
 
-/// Copy the live `s_ef_residual` into the backup (pre-verify).
-fn save_s_ef(snap: &[GpuTensor], dn: &DeltaNetState, gpu: &mut Gpu) -> Result<(), String> {
-    for (dst, src) in snap.iter().zip(dn.s_ef_residual.iter()) {
-        gpu.hip
-            .memcpy_dtod(&dst.buf, &src.buf, src.buf.size())
-            .map_err(|e| e.to_string())?;
-    }
-    Ok(())
-}
-
-/// Copy the backup back into the live `s_ef_residual` (post-verify, pre-replay).
-fn restore_s_ef(snap: &[GpuTensor], dn: &DeltaNetState, gpu: &mut Gpu) -> Result<(), String> {
-    for (src, dst) in snap.iter().zip(dn.s_ef_residual.iter()) {
-        gpu.hip
-            .memcpy_dtod(&dst.buf, &src.buf, src.buf.size())
-            .map_err(|e| e.to_string())?;
-    }
-    Ok(())
-}
-
 /// Qwen3.5 target-verify scratch for a model-free speculator. Owns the
 /// per-position lm_head/argmax buffers (`VerifyScratch`), the pre-verify
-/// recurrent snapshot (`DeltaNetSnapshot` + the `s_ef_residual` backup the
-/// snapshot type omits), and a `num_extract = 0` hidden ring (zero buffers —
-/// it only satisfies `verify_dflash_block`'s required `&mut` arg; nothing is
-/// written or read).
+/// recurrent+EF snapshot (`DeltaNetSnapshot`), and a `num_extract = 0` hidden
+/// ring (zero buffers — it only satisfies `verify_dflash_block`'s required
+/// `&mut` arg; nothing is written or read).
 pub struct Qwen35SpecScratch {
     verify_scratch: VerifyScratch,
     hidden_rb: HiddenStateRingBuffer,
     target_snap: DeltaNetSnapshot,
-    s_ef_snap: Vec<GpuTensor>,
 }
 
 impl SpecScratch for Qwen35SpecScratch {
@@ -83,7 +62,6 @@ impl SpecScratch for Qwen35SpecScratch {
             verify_scratch,
             hidden_rb,
             target_snap,
-            s_ef_snap,
         } = *self;
         verify_scratch.free_gpu(gpu);
         // `HiddenStateRingBuffer` has no `free_gpu`; free its buffers directly
@@ -95,9 +73,6 @@ impl SpecScratch for Qwen35SpecScratch {
             let _ = gpu.free_tensor(t);
         }
         target_snap.free_gpu(gpu);
-        for t in s_ef_snap {
-            let _ = gpu.free_tensor(t);
-        }
     }
 }
 
@@ -106,13 +81,22 @@ impl SpecTarget for ModelSlot {
         self
     }
 
-    fn reset_recurrent(&mut self, gpu: &mut Gpu) {
+    fn reset_recurrent(&mut self, gpu: &mut Gpu) -> Result<(), String> {
         // Reuse the canonical DeltaNet reset (zeroes s_matrices / s_scales /
         // conv_states / s_ef_residual, stream-aware) rather than re-inlining the
         // memset loop the daemon abort path currently hand-writes, then drop the
         // KV eviction offset so the next conversation rotates from absolute 0.
-        self.dn_state.reset(gpu);
+        self.dn_state
+            .reset(gpu)
+            .map_err(|e| format!("qwen35 reset_recurrent: {e}"))?;
         self.kv_cache.compact_offset = 0;
+        Ok(())
+    }
+
+    fn retry_reset_eligible(&self) -> bool {
+        // Covered by reset_core inventory: DeltaNet + EF residual, KV compact,
+        // daemon graph invalidate + adaptive + host pos/conversation.
+        true
     }
 
     fn new_spec_scratch(
@@ -151,19 +135,11 @@ impl SpecTarget for ModelSlot {
         }
         let target_snap = DeltaNetSnapshot::new_for(gpu, &self.dn_state)
             .map_err(|e| format!("Qwen35SpecScratch DeltaNetSnapshot: {e}"))?;
-        // F16 backups for s_ef_residual (empty when error-feedback is off).
-        let mut s_ef_snap = Vec::with_capacity(self.dn_state.s_ef_residual.len());
-        for t in &self.dn_state.s_ef_residual {
-            s_ef_snap.push(
-                gpu.alloc_tensor(&t.shape, DType::F16)
-                    .map_err(|e| format!("Qwen35SpecScratch s_ef snapshot: {e}"))?,
-            );
-        }
+        // EF residual is folded into DeltaNetSnapshot (empty when EF off).
         Ok(Box::new(Qwen35SpecScratch {
             verify_scratch,
             hidden_rb,
             target_snap,
-            s_ef_snap,
         }))
     }
 
@@ -179,14 +155,15 @@ impl SpecTarget for ModelSlot {
         // Plain target advance, chunked at PREFILL_MAX_BATCH with abort checks
         // between chunks. No hidden extraction — only KV + recurrent state move.
         if reset {
-            self.reset_state(gpu);
+            self.reset_state(gpu)
+                .map_err(|e| format!("qwen35 spec_advance reset: {e}"))?;
         }
         let chunk_max = qwen35::PREFILL_MAX_BATCH;
         let mut off = 0usize;
         let mut pos = start_pos;
         while off < tokens.len() {
             if abort() {
-                self.reset_state(gpu);
+                let _ = self.reset_state(gpu);
                 return Ok(SpecAdvance::Aborted);
             }
             let end = (off + chunk_max).min(tokens.len());
@@ -208,13 +185,15 @@ impl SpecTarget for ModelSlot {
             pos += end - off;
             off = end;
         }
-        // Last-position argmax (the per-token forward left last-token logits in
-        // scratch.logits).
+        // Last-position logits (the per-token forward left last-token logits in
+        // scratch.logits). Hand the host row through for temp>0 first-token draws.
         let logits = gpu
             .download_f32(&self.scratch.logits)
             .map_err(|e| e.to_string())?;
+        let last_argmax = argmax(&logits);
         Ok(SpecAdvance::Ready {
-            last_argmax: argmax(&logits),
+            last_argmax,
+            last_logits: Some(logits),
         })
     }
 
@@ -235,7 +214,6 @@ impl SpecTarget for ModelSlot {
         s.target_snap
             .save_from(&self.dn_state, gpu)
             .map_err(|e| e.to_string())?;
-        save_s_ef(&s.s_ef_snap, &self.dn_state, gpu)?;
         let out = verify_dflash_block(
             gpu,
             self,
@@ -270,7 +248,6 @@ impl SpecTarget for ModelSlot {
         s.target_snap
             .save_from(&self.dn_state, gpu)
             .map_err(|e| e.to_string())?;
-        save_s_ef(&s.s_ef_snap, &self.dn_state, gpu)?;
         // Sampled verify. Run the verify forward with want_full_logits=FALSE: it
         // leaves the per-position logits in `verify_scratch.logits` (GPU) and
         // costs only a discarded GPU argmax — NOT the B×vocab logit D2H. Then do
@@ -302,8 +279,12 @@ impl SpecTarget for ModelSlot {
         let probs_gpu = gpu
             .alloc_tensor(&[b * vocab], DType::F32)
             .map_err(|e| e.to_string())?;
-        let tau_gpu = gpu.alloc_tensor(&[b], DType::F32).map_err(|e| e.to_string())?;
-        let z_gpu = gpu.alloc_tensor(&[b], DType::F32).map_err(|e| e.to_string())?;
+        let tau_gpu = gpu
+            .alloc_tensor(&[b], DType::F32)
+            .map_err(|e| e.to_string())?;
+        let z_gpu = gpu
+            .alloc_tensor(&[b], DType::F32)
+            .map_err(|e| e.to_string())?;
         gpu.softmax_temp_topp_batched_into_f32(
             &logits_batch,
             &probs_gpu,
@@ -361,7 +342,6 @@ impl SpecTarget for ModelSlot {
         s.target_snap
             .restore_to(&mut self.dn_state, gpu)
             .map_err(|e| e.to_string())?;
-        restore_s_ef(&s.s_ef_snap, &self.dn_state, gpu)?;
         qwen35::forward_prefill_batch(
             gpu,
             &self.weights,
@@ -434,7 +414,6 @@ impl SpecTarget for ModelSlot {
         s.target_snap
             .save_from(&self.dn_state, gpu)
             .map_err(|e| e.to_string())?;
-        save_s_ef(&s.s_ef_snap, &self.dn_state, gpu)?;
         let out = verify_dflash_block(
             gpu,
             self,
@@ -494,7 +473,6 @@ impl SpecTarget for ModelSlot {
         s.target_snap
             .save_from(&self.dn_state, gpu)
             .map_err(|e| e.to_string())?;
-        save_s_ef(&s.s_ef_snap, &self.dn_state, gpu)?;
         // Sampled verify: leave the per-position logits on-GPU in
         // verify_scratch.logits (want_full_logits=false), softmax+nucleus on-device,
         // then draw categorically on the host — mirroring verify_block_sampled.
@@ -516,8 +494,12 @@ impl SpecTarget for ModelSlot {
         let probs_gpu = gpu
             .alloc_tensor(&[b * vocab], DType::F32)
             .map_err(|e| e.to_string())?;
-        let tau_gpu = gpu.alloc_tensor(&[b], DType::F32).map_err(|e| e.to_string())?;
-        let z_gpu = gpu.alloc_tensor(&[b], DType::F32).map_err(|e| e.to_string())?;
+        let tau_gpu = gpu
+            .alloc_tensor(&[b], DType::F32)
+            .map_err(|e| e.to_string())?;
+        let z_gpu = gpu
+            .alloc_tensor(&[b], DType::F32)
+            .map_err(|e| e.to_string())?;
         gpu.softmax_temp_topp_batched_into_f32(
             &logits_batch,
             &probs_gpu,
@@ -582,20 +564,12 @@ impl SpecTarget for ModelSlot {
         let dim = self.config.dim;
         let num_extract = layers.len();
 
-        // Snapshot the recurrent state + s_ef residual BEFORE the forward advances
-        // them irreversibly.
+        // Snapshot recurrent + default-on s_ef residual BEFORE the forward advances
+        // them irreversibly (EF lives inside DeltaNetSnapshot).
         let mut snap = DeltaNetSnapshot::new_for(gpu, &self.dn_state)
             .map_err(|e| format!("capture_seed_main_hidden snapshot: {e:?}"))?;
         snap.save_from(&self.dn_state, gpu)
             .map_err(|e| format!("capture_seed_main_hidden save recurrent: {e:?}"))?;
-        let mut s_ef_snap = Vec::with_capacity(self.dn_state.s_ef_residual.len());
-        for t in &self.dn_state.s_ef_residual {
-            s_ef_snap.push(
-                gpu.alloc_tensor(&t.shape, DType::F16)
-                    .map_err(|e| format!("capture_seed_main_hidden s_ef alloc: {e:?}"))?,
-            );
-        }
-        save_s_ef(&s_ef_snap, &self.dn_state, gpu)?;
 
         // Temp 1-slot ring capturing at EXACTLY `layers` (override the evenly-spaced
         // default `new` computes; buffer sizing depends only on the count).
@@ -638,14 +612,10 @@ impl SpecTarget for ModelSlot {
         // regardless of whether the forward/download succeeded, before freeing.
         let restore_result = snap
             .restore_to(&mut self.dn_state, gpu)
-            .map_err(|e| format!("capture_seed_main_hidden restore recurrent: {e:?}"))
-            .and_then(|()| restore_s_ef(&s_ef_snap, &self.dn_state, gpu));
+            .map_err(|e| format!("capture_seed_main_hidden restore recurrent: {e:?}"));
 
-        // Free the temp snapshot, s_ef backup, and ring buffers on every path.
+        // Free the temp snapshot and ring buffers on every path.
         snap.free_gpu(gpu);
-        for t in s_ef_snap {
-            let _ = gpu.free_tensor(t);
-        }
         for t in ring.layer_bufs {
             let _ = gpu.free_tensor(t);
         }

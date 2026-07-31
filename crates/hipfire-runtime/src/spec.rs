@@ -29,8 +29,20 @@ use smallvec::SmallVec;
 
 /// Outcome of one speculative-decode acceptance window, drafter-agnostic.
 ///
-/// The daemon advances by `emit.len()` and reseeds from `next_seed` without
-/// knowing which drafter ran. The two arch result types lower onto this:
+/// # Pending-seed contract (daemon `generate_spec`)
+///
+/// After `Speculator::step(position, seed)`:
+/// - target/drafter state has processed the prior pending seed plus accepted
+///   drafts;
+/// - `emit` is accepted drafts plus the bonus (seed re-echo already stripped);
+/// - `next_seed` is emitted but **unprocessed** (the new pending seed);
+/// - `position` (caller-side) advances by `emit.len()` to the next write slot.
+///
+/// A forced suffix must first commit the current pending seed, then every
+/// forced token except the last; the last forced token becomes the new pending
+/// seed. Safe terminal completion flushes the final pending seed exactly once.
+///
+/// The two arch result types lower onto this:
 /// - qwen35 `SpecStepResult` → `emit = committed[1..]` (the seed re-echo is
 ///   dropped), `next_seed = bonus_token`.
 /// - deepseek4 MTP → `emit = accepted_tokens`, `next_seed = accepted_tokens.last()`.
@@ -72,6 +84,31 @@ impl SpecStep {
             proposed,
             accepted,
         }
+    }
+
+    /// Cap `emit` to at most `max_emit` tokens **after** construction.
+    ///
+    /// Prefer shrinking the draft/verify window *before* GPU commit (see
+    /// [`Speculator::step`]'s `max_emit`). This helper is the last-resort
+    /// parity clamp used when a window still overshoots: it keeps the prefix,
+    /// reseeds from the last kept token, and shrinks `accepted` so τ accounting
+    /// stays consistent with the truncated emit.
+    pub fn cap_emit(mut self, max_emit: usize) -> Self {
+        if max_emit == 0 {
+            self.emit.clear();
+            self.accepted = 0;
+            return self;
+        }
+        if self.emit.len() <= max_emit {
+            return self;
+        }
+        self.emit.truncate(max_emit);
+        // emit = accepted drafts + bonus ⇒ accepted drafts kept = len-1 (or 0).
+        self.accepted = self.accepted.min(max_emit.saturating_sub(1));
+        if let Some(&last) = self.emit.last() {
+            self.next_seed = last;
+        }
+        self
     }
 }
 
@@ -158,8 +195,17 @@ pub trait SpecTarget {
 
     /// Zero the target's recurrent (DeltaNet) state and reset the KV eviction
     /// offset — used by the daemon's mid-generation abort path in place of its
-    /// current inline memset loop.
-    fn reset_recurrent(&mut self, gpu: &mut Gpu);
+    /// current inline memset loop. Returns `Err` when any HIP memset/bind fails
+    /// so production rollback can attest `rolled_back:false`.
+    fn reset_recurrent(&mut self, gpu: &mut Gpu) -> Result<(), String>;
+
+    /// Whether this target's architecture reset-core is complete enough for
+    /// serve-hardening retry. Default `false` (explicitly ineligible). Retry
+    /// candidates override to `true` only when recurrent/EF/KV/cache/graph/
+    /// drafter/adaptive residuals are covered (see `reset_core` inventory).
+    fn retry_reset_eligible(&self) -> bool {
+        false
+    }
 
     // ── Arch-generic speculation primitives ─────────────────────────────────
     //
@@ -525,9 +571,16 @@ pub trait SpecScratch {
 /// Outcome of [`SpecTarget::spec_advance`].
 #[derive(Debug, Clone)]
 pub enum SpecAdvance {
-    /// Advanced to the end; `last_argmax` is the greedy token at the final
-    /// position (the first decode seed on prefill; ignored on replay).
-    Ready { last_argmax: u32 },
+    /// Advanced to the end. `last_argmax` is the greedy token at the final
+    /// position (the first decode seed on prefill when sampling is disabled;
+    /// ignored on replay). `last_logits`, when `Some`, is the host-side vocab
+    /// row already materialized for that position so a sampling-capable
+    /// speculator can draw the first token without a second D2H / lm_head pass.
+    /// Targets that only expose a GPU argmax leave it `None`.
+    Ready {
+        last_argmax: u32,
+        last_logits: Option<Vec<f32>>,
+    },
     /// Client cancelled mid-advance; the target reset its own state.
     Aborted,
 }
@@ -555,8 +608,10 @@ pub trait SpecGrammar {
 /// Outcome of [`Speculator::prefill`].
 #[derive(Debug, Clone)]
 pub enum PrefillOutcome {
-    /// Prompt prefilled; `first_token` is the target's argmax at the last prompt
-    /// position (the seed for the first decode window).
+    /// Prompt prefilled; `first_token` is the target's next-token draw at the
+    /// last prompt position (the seed for the first decode window). At temp≈0
+    /// this is the historical argmax; at temp>0 a sampling-capable speculator
+    /// MUST draw from the target distribution configured via [`Speculator::set_sampling`].
     Ready { first_token: u32 },
     /// Client cancelled mid-prefill. The caller resets conversation state and
     /// emits the aborted/done events; the slot guard restores the target bundle.
@@ -572,6 +627,19 @@ pub struct EvictRetain {
     pub retain_mask: Vec<u32>,
     /// Physical fill before the eviction (rows to compact).
     pub pre_phys: usize,
+}
+
+/// Live post-reset evidence for serve-fault-inject / parity snapshots.
+///
+/// Produced only by Speculators that own DFlash-style scratch. Snapshot writers
+/// MUST treat missing evidence (`None` from [`Speculator::reset_state_evidence`])
+/// as fail-closed dirty — never invent clean from host vestigial checkpoint rings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpecResetEvidence {
+    /// Drafter-local scratch is empty (thlog watermarks zero; host shadow empty).
+    pub drafter_reset: bool,
+    /// Divergent-render / live checkpoint ring is empty.
+    pub checkpoint_empty: bool,
 }
 
 /// A speculative-decode drafter+verifier, owned by the loaded model behind a
@@ -623,6 +691,12 @@ pub trait Speculator {
     /// draft and verify logits (`None` = unconstrained). `temp` is the request
     /// sampling temperature — ignored by greedy-only drafters; the ddtree path
     /// uses it to switch the verify into distribution-preserving SWOR at temp>0.
+    ///
+    /// `max_emit` is the remaining client-visible output budget (`max_tokens -
+    /// generated`). Implementations MUST NOT verify/commit more tokens than this
+    /// budget can absorb: shrink the draft window (and accept walk) so
+    /// `emit.len() <= max_emit` before GPU/KV/drafter state advances past that
+    /// prefix. Callers pass `usize::MAX` when uncapped (benches).
     #[allow(clippy::too_many_arguments)]
     fn step(
         &mut self,
@@ -633,6 +707,7 @@ pub trait Speculator {
         emitted: &[u32],
         grammar: Option<&mut dyn SpecGrammar>,
         temp: f32,
+        max_emit: usize,
     ) -> Result<SpecStep, String>;
 
     /// Compact drafter-local cached state after a target KV eviction the daemon
@@ -642,8 +717,15 @@ pub trait Speculator {
         Ok(())
     }
 
-    /// Advance the target over emitter-FORCED tokens (think-budget force-close,
-    /// empty-turn guards) while keeping drafter-local per-position state in sync.
+    /// Advance the target over a pending-seed GPU transaction (forced
+    /// continuation or terminal flush) while keeping drafter-local per-position
+    /// state in sync.
+    ///
+    /// Daemon callers pass the **commit** slice from `SpecPendingSeedTx`:
+    /// - forced suffix: optional current pending seed (omitted when
+    ///   non-committable, e.g. DS4 empty-event EOS) then `forced[..n-1]`
+    ///   (last forced stays the unprocessed next seed);
+    /// - terminal flush: `[pending_seed]` exactly once before host bake.
     ///
     /// The plain [`SpecTarget::spec_advance`] moves KV + recurrent state only and
     /// performs no hidden extraction, so a drafter that caches one row of target
@@ -672,7 +754,21 @@ pub trait Speculator {
     /// Rewind drafter-LOCAL state for a fresh conversation. The target's KV /
     /// recurrent state is the daemon's concern (it owns the bundle); this clears
     /// only the drafter's own scratch + checkpoint ring.
-    fn reset(&mut self, gpu: &mut Gpu);
+    ///
+    /// Returns `Err` when any HIP free/memset that must succeed for a clean
+    /// drafter fails so production rollback can attest `rolled_back:false`.
+    fn reset(&mut self, gpu: &mut Gpu) -> Result<(), String>;
+
+    /// Live post-reset evidence for serve-fault-inject snapshots.
+    ///
+    /// `None` means the live Speculator does not expose DFlash-style evidence
+    /// (or it is unavailable) — snapshot writers MUST fail closed
+    /// (`drafter_reset`/`checkpoint_empty` = false) rather than inventing
+    /// clean from host vestigial rings. DFlash overrides with truthful
+    /// thlog + checkpoint-ring probes.
+    fn reset_state_evidence(&self) -> Option<SpecResetEvidence> {
+        None
+    }
 
     /// Snapshot drafter-local recurrent state at `position` for divergent-render
     /// prompt-cache reuse. Default no-op for stateless drafters (n-gram).
@@ -784,10 +880,15 @@ pub trait MtpDrafter {
         cache_hit: bool,
     ) -> Result<u32, String>;
 
-    /// One acceptance window: seed at absolute `position`; draft `k`, verify,
-    /// greedily accept the longest matching prefix + bonus. `grammar` is the
-    /// IN-STEP grammar (deepseek4 masks draft+verify logits with it; qwen35
-    /// ignores it and relies on post-hoc grammar in the emission layer).
+    /// One acceptance window: seed at absolute `position`; draft up to `k`,
+    /// verify, greedily accept the longest matching prefix + bonus. `k` is the
+    /// per-call draft budget from [`MtpSpeculator::step`] (already clamped by
+    /// remaining `max_emit`); implementations MUST honor it and MUST NOT draft
+    /// or commit more than `k` candidates (emit ≤ k+1 including bonus). `k == 0`
+    /// means verify `[seed]` only and emit the single bonus token.
+    /// `grammar` is the IN-STEP grammar (deepseek4 masks draft+verify logits
+    /// with it; qwen35 ignores it and relies on post-hoc grammar in the
+    /// emission layer).
     #[allow(clippy::too_many_arguments)]
     fn mtp_step(
         &mut self,
@@ -800,9 +901,25 @@ pub trait MtpDrafter {
         grammar: Option<&mut dyn SpecGrammar>,
     ) -> Result<MtpWindow, String>;
 
+    /// Advance drafter-local MTP state over emitter-forced tokens so the head
+    /// KV / prev_hidden / multi-slot context stay aligned with the target.
+    /// Returns `true` when the drafter advanced the target itself (caller must
+    /// not also `spec_advance`). Default: no drafter-local position state.
+    fn mtp_forced_advance(
+        &mut self,
+        _gpu: &mut Gpu,
+        _target: &mut dyn SpecTarget,
+        _tokens: &[u32],
+        _start_pos: usize,
+        _abort: &dyn Fn() -> bool,
+    ) -> Result<bool, String> {
+        Ok(false)
+    }
+
     /// Reset drafter-local state for a fresh conversation (MTP cache + any
     /// captured graphs). The target's KV/recurrent reset is the daemon's job.
-    fn mtp_reset(&mut self, gpu: &mut Gpu);
+    /// Returns `Err` when any HIP step required for a clean drafter fails.
+    fn mtp_reset(&mut self, gpu: &mut Gpu) -> Result<(), String>;
 
     /// Release all GPU buffers the drafter owns.
     fn mtp_free(self: Box<Self>, gpu: &mut Gpu);
@@ -882,6 +999,13 @@ fn lower_mtp_window(w: MtpWindow) -> Result<SpecStep, String> {
     ))
 }
 
+/// Per-call draft count from remaining client budget. `max_emit == 0` is rejected
+/// by the caller before this helper runs. emit = accepted drafts + bonus, so we
+/// propose at most `max_emit - 1` drafts (`max_emit == 1` → k=0 → verify seed only).
+fn mtp_draft_k(arch_k: usize, max_emit: usize) -> usize {
+    max_emit.saturating_sub(1).min(arch_k)
+}
+
 impl<A: MtpDrafter> Speculator for MtpSpeculator<A> {
     fn name(&self) -> &'static str {
         self.arch.name()
@@ -920,8 +1044,16 @@ impl<A: MtpDrafter> Speculator for MtpSpeculator<A> {
         _emitted: &[u32],
         grammar: Option<&mut dyn SpecGrammar>,
         temp: f32,
+        max_emit: usize,
     ) -> Result<SpecStep, String> {
-        let k = self.arch.k();
+        // Remaining budget caps how many tokens this window may emit
+        // (accepted drafts + bonus). Reject 0 before any trunk/head/KV mutation.
+        // k drafts ⇒ emit ≤ k+1; clamp k so drafts + bonus ≤ max_emit.
+        // max_emit == 1 → k = 0 → verify [seed] only, commit the single bonus.
+        if max_emit == 0 {
+            return Err("MtpSpeculator: max_emit=0 (no remaining output budget)".into());
+        }
+        let k = mtp_draft_k(self.arch.k(), max_emit);
         let eos = target.eos_token();
         // Forward the per-step temp + the request top_p/top_k (stashed by
         // `set_sampling`) to the drafter. Greedy-only drafters ignore it; a
@@ -931,11 +1063,31 @@ impl<A: MtpDrafter> Speculator for MtpSpeculator<A> {
         let window = self
             .arch
             .mtp_step(gpu, target, position, seed, k, eos, grammar)?;
-        lower_mtp_window(window)
+        // Pre-commit budget is authoritative; cap_emit is defensive only.
+        let step = lower_mtp_window(window)?;
+        debug_assert!(
+            step.emit.len() <= max_emit,
+            "MtpSpeculator: drafter committed past max_emit (emit={}, max_emit={})",
+            step.emit.len(),
+            max_emit
+        );
+        Ok(step.cap_emit(max_emit))
     }
 
-    fn reset(&mut self, gpu: &mut Gpu) {
-        self.arch.mtp_reset(gpu);
+    fn on_forced_advance(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+        tokens: &[u32],
+        start_pos: usize,
+        abort: &dyn Fn() -> bool,
+    ) -> Result<bool, String> {
+        self.arch
+            .mtp_forced_advance(gpu, target, tokens, start_pos, abort)
+    }
+
+    fn reset(&mut self, gpu: &mut Gpu) -> Result<(), String> {
+        self.arch.mtp_reset(gpu)
     }
 
     fn block_size(&self) -> usize {
@@ -1042,21 +1194,38 @@ impl EmitOutcome {
 }
 
 /// Terminal flush of a [`SpecEmit`], consumed by value at end of turn. Carries
-/// any final events (e.g. a `tool_calls` event parsed from the full decoded
-/// text) plus the resolved `finish_reason` and parsed tool-call count for the
-/// daemon's `done` envelope. The daemon still owns the length-cap decision
-/// (`generated >= max_tokens` ⇒ `length`), so `finish_reason` here is the
-/// emitter's view (`stop` / `tool_calls`); the caller overrides with `length`
-/// when the loop hit the token cap.
+/// any final events (e.g. a held `tool_calls` event) plus the resolved
+/// `finish_reason` and parsed tool-call count for the daemon's `done` envelope.
+/// The daemon still owns the length-cap decision (`generated >= max_tokens`
+/// without decoded EOT ⇒ `length`), so `finish_reason` here is the emitter's
+/// provisional view (`stop` / `tool_calls` / `malformed_protocol` /
+/// `open_think`); the caller may override with `length` when the loop hit the
+/// token cap without EOT.
+///
+/// Structured `ClientEvent::ToolCalls` on [`Self::events`] are **held** by
+/// `generate_spec` (`hold_tool_calls=true`) until the arch wrapper classifies a
+/// tool-safe terminal.
 #[derive(Debug, Clone, Default)]
 pub struct FinishSummary {
-    /// Final events to render (e.g. the turn's `ToolCalls`).
+    /// Final events to render (e.g. trailing visible Token + held ToolCalls).
     pub events: Vec<ClientEvent>,
-    /// The emitter's finish reason (`stop` or `tool_calls`); the caller may
-    /// override with `length` on a token-cap exit.
+    /// The emitter's finish reason (`stop`, `tool_calls`, `malformed_protocol`,
+    /// or `open_think`); the caller may override with `length` on a pure
+    /// token-cap exit.
     pub finish_reason: &'static str,
     /// Number of tool calls parsed this turn (for the `done` envelope).
+    /// Zero when malformed or when calls must stay suppressed.
     pub tool_calls: usize,
+    /// Producer-authorized visible prose accumulated this turn (think-stripped,
+    /// marker-free). Used for asst-turn cache fingerprinting; empty when the
+    /// emitter does not track a visible channel.
+    pub visible_text: String,
+    /// Emitter-authoritative decoded end-of-turn verdict (token-id EOT and/or
+    /// filter stop_at spanning split byte fragments). Carried into terminal
+    /// lowering so wrappers do not recompute solely from the last token id.
+    pub decoded_eot: bool,
+    /// Unclosed thinking region at finish — nonretryable unsafe terminal.
+    pub open_think: bool,
 }
 
 /// Model-independent context for constructing a turn's [`SpecEmit`].
@@ -1142,6 +1311,12 @@ pub trait SpecEmit {
     /// forces a full KV/recurrent reset for the next turn when true. Default
     /// `false` for emitters without post-hoc grammar enforcement.
     fn grammar_violated(&self) -> bool {
+        false
+    }
+
+    /// Emitter-authoritative decoded EOT (token id and/or filter stop marker).
+    /// Default false; qwen35 overrides so terminal lowering need not re-decode.
+    fn decoded_eot(&self) -> bool {
         false
     }
 
@@ -1484,7 +1659,9 @@ mod tests {
             fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
                 self
             }
-            fn reset_recurrent(&mut self, _gpu: &mut rdna_compute::Gpu) {}
+            fn reset_recurrent(&mut self, _gpu: &mut rdna_compute::Gpu) -> Result<(), String> {
+                Ok(())
+            }
             fn new_spec_scratch(
                 &mut self,
                 _gpu: &mut rdna_compute::Gpu,

@@ -1446,11 +1446,13 @@ pub fn draft_seed_backfill(
         for (row0, slot0, seg_len) in ring_segments(row, row + len, swa_w) {
             // H2D this host segment into the draft ring.
             let seg = &host_hidden[row0 * row_f32..(row0 + seg_len) * row_f32];
-            let src_bytes: &[u8] = unsafe {
-                std::slice::from_raw_parts(seg.as_ptr() as *const u8, seg.len() * 4)
-            };
-            gpu.hip
-                .memcpy_htod_offset(&scratch.target_hidden.buf, slot0 * row_f32 * 4, src_bytes)?;
+            let src_bytes: &[u8] =
+                unsafe { std::slice::from_raw_parts(seg.as_ptr() as *const u8, seg.len() * 4) };
+            gpu.hip.memcpy_htod_offset(
+                &scratch.target_hidden.buf,
+                slot0 * row_f32 * 4,
+                src_bytes,
+            )?;
             // fc + hidden_norm into the proj ring (same slots).
             let th = scratch
                 .target_hidden
@@ -1458,7 +1460,14 @@ pub fn draft_seed_backfill(
             let thp = scratch
                 .target_hidden_proj
                 .sub_offset(slot0 * h, seg_len * h);
-            gemm_dispatch(gpu, &th, &weights.fc, &thp, seg_len, scratch.mq_x_rot.as_ref())?;
+            gemm_dispatch(
+                gpu,
+                &th,
+                &weights.fc,
+                &thp,
+                seg_len,
+                scratch.mq_x_rot.as_ref(),
+            )?;
             gpu.rmsnorm_batched(&thp, &weights.hidden_norm, &thp, seg_len, h, eps)?;
             // Last-layer wk/wv into the full_w ring (its own modulus).
             let mut r2 = row0;
@@ -1470,8 +1479,22 @@ pub fn draft_seed_backfill(
                 let c_slot = r2 % full_w;
                 let k_slot = k_full.sub_offset(c_slot * kvd, step * kvd);
                 let v_slot = v_full.sub_offset(c_slot * kvd, step * kvd);
-                gemm_dispatch(gpu, &thp2, &last_layer.wk, &k_slot, step, scratch.mq_x_rot.as_ref())?;
-                gemm_dispatch(gpu, &thp2, &last_layer.wv, &v_slot, step, scratch.mq_x_rot.as_ref())?;
+                gemm_dispatch(
+                    gpu,
+                    &thp2,
+                    &last_layer.wk,
+                    &k_slot,
+                    step,
+                    scratch.mq_x_rot.as_ref(),
+                )?;
+                gemm_dispatch(
+                    gpu,
+                    &thp2,
+                    &last_layer.wv,
+                    &v_slot,
+                    step,
+                    scratch.mq_x_rot.as_ref(),
+                )?;
                 gpu.rmsnorm_batched(
                     &k_slot,
                     &last_layer.k_norm,
@@ -1655,8 +1678,11 @@ pub fn draft_forward_opts(
                     let src_bytes: &[u8] = unsafe {
                         std::slice::from_raw_parts(seg.as_ptr() as *const u8, seg.len() * 4)
                     };
-                    gpu.hip
-                        .memcpy_htod_offset(&scratch.target_hidden.buf, dst_byte_off, src_bytes)?;
+                    gpu.hip.memcpy_htod_offset(
+                        &scratch.target_hidden.buf,
+                        dst_byte_off,
+                        src_bytes,
+                    )?;
                 }
             } else {
                 upload_slice_f32(gpu, &scratch.target_hidden, th_slice)?;
@@ -1673,8 +1699,11 @@ pub fn draft_forward_opts(
                     let src_bytes: &[u8] = unsafe {
                         std::slice::from_raw_parts(seg.as_ptr() as *const u8, seg.len() * 4)
                     };
-                    gpu.hip
-                        .memcpy_htod_offset(&scratch.target_hidden.buf, dst_byte_off, src_bytes)?;
+                    gpu.hip.memcpy_htod_offset(
+                        &scratch.target_hidden.buf,
+                        dst_byte_off,
+                        src_bytes,
+                    )?;
                 }
             } else {
                 let tail = &th_slice[prev * row_f32..];
@@ -1869,17 +1898,14 @@ pub fn draft_forward_opts(
             let mut row = fill_start;
             while row < l {
                 // Next row where the proj ring or the cache ring wraps.
-                let step = (swa_w.saturating_sub(if swa_w == usize::MAX {
-                    0
-                } else {
-                    row % swa_w
-                }))
-                .min(layer_w.saturating_sub(if layer_w == usize::MAX {
-                    0
-                } else {
-                    row % layer_w
-                }))
-                .min(l - row);
+                let step =
+                    (swa_w.saturating_sub(if swa_w == usize::MAX { 0 } else { row % swa_w }))
+                        .min(layer_w.saturating_sub(if layer_w == usize::MAX {
+                            0
+                        } else {
+                            row % layer_w
+                        }))
+                        .min(l - row);
                 let p_slot = if swa_w == usize::MAX {
                     row
                 } else {
@@ -1910,7 +1936,14 @@ pub fn draft_forward_opts(
                     scratch.mq_x_rot.as_ref(),
                 )?;
                 // Per-head RMSNorm on K delta rows only. batch = step × n_kv_heads.
-                gpu.rmsnorm_batched(&k_slot, &layer.k_norm, &k_slot, step * cfg.n_kv_heads, hd, eps)?;
+                gpu.rmsnorm_batched(
+                    &k_slot,
+                    &layer.k_norm,
+                    &k_slot,
+                    step * cfg.n_kv_heads,
+                    hd,
+                    eps,
+                )?;
                 row += step;
             }
         }
@@ -1933,10 +1966,20 @@ pub fn draft_forward_opts(
         let mut cat_off = 0usize;
         for (_row0, slot0, len) in ring_segments(span_start, l, layer_w) {
             let seg_bytes = len * kvd * 4;
-            gpu.hip
-                .memcpy_dtod_at(&k_cat_l.buf, cat_off, &k_cache_layer.buf, slot0 * kvd * 4, seg_bytes)?;
-            gpu.hip
-                .memcpy_dtod_at(&v_cat_l.buf, cat_off, &v_cache_layer.buf, slot0 * kvd * 4, seg_bytes)?;
+            gpu.hip.memcpy_dtod_at(
+                &k_cat_l.buf,
+                cat_off,
+                &k_cache_layer.buf,
+                slot0 * kvd * 4,
+                seg_bytes,
+            )?;
+            gpu.hip.memcpy_dtod_at(
+                &v_cat_l.buf,
+                cat_off,
+                &v_cache_layer.buf,
+                slot0 * kvd * 4,
+                seg_bytes,
+            )?;
             cat_off += seg_bytes;
         }
         gpu.hip

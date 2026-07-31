@@ -1689,6 +1689,7 @@ fn main() {
                         ddtree_topk,
                         runtime_temp,
                         &mut rng_state,
+                        None, // max_accept: uncapped demo
                     )
                     .expect("ddtree-batched spec step")
                 } else {
@@ -1738,6 +1739,7 @@ fn main() {
                     pld_spine,
                     runtime_repeat_penalty,
                     repeat_window,
+                    None, // max_accept: uncapped demo
                 )
                 .expect("spec step")
             };

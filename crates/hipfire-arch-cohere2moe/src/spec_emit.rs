@@ -255,6 +255,9 @@ impl<'a> SpecEmit for Cohere2MoeEmit<'a> {
             events,
             finish_reason,
             tool_calls,
+            visible_text: String::new(),
+            decoded_eot: false,
+            open_think: false,
         }
     }
 }

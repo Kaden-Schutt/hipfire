@@ -1312,7 +1312,8 @@ pub fn spec_step_mtp_trunk_spine(
     last_committed: u32,
     eos_token_id: u32,
 ) -> HipResult<MtpSpecResult> {
-    spec_step_mtp_compressed_serial(
+    let k = state.max_n;
+    spec_step_mtp_compressed_serial_with_k(
         gpu,
         target,
         head,
@@ -1320,6 +1321,31 @@ pub fn spec_step_mtp_trunk_spine(
         cur_pos,
         last_committed,
         eos_token_id,
+        k,
+    )
+}
+
+/// Budget-aware trunk spine: draft at most `k` candidates (k may be 0).
+#[allow(clippy::too_many_arguments)]
+pub fn spec_step_mtp_trunk_spine_with_k(
+    gpu: &mut Gpu,
+    target: &mut ModelSlot,
+    head: &Qwen35MtpHead,
+    state: &mut MtpSpecState,
+    cur_pos: usize,
+    last_committed: u32,
+    eos_token_id: u32,
+    k: usize,
+) -> HipResult<MtpSpecResult> {
+    spec_step_mtp_compressed_serial_with_k(
+        gpu,
+        target,
+        head,
+        state,
+        cur_pos,
+        last_committed,
+        eos_token_id,
+        k,
     )
 }
 
@@ -2378,6 +2404,8 @@ fn mtp_sampled_accept(
 // times instead of 1 batched, costing extra launch overhead and per-step
 // argmax+D2H. On a 248K-vocab model this is dwarfed by the BW savings.
 // On smaller-vocab models the lossy batched path may still be faster.
+/// Legacy entry: drafts `state.max_n` candidates. Prefer
+/// [`spec_step_mtp_compressed_serial_with_k`] when a per-call budget is known.
 #[allow(clippy::too_many_arguments)]
 pub fn spec_step_mtp_compressed_serial(
     gpu: &mut Gpu,
@@ -2388,7 +2416,35 @@ pub fn spec_step_mtp_compressed_serial(
     last_committed: u32,
     eos_token_id: u32,
 ) -> HipResult<MtpSpecResult> {
-    let max_n = state.max_n;
+    let k = state.max_n;
+    spec_step_mtp_compressed_serial_with_k(
+        gpu,
+        target,
+        head,
+        state,
+        cur_pos,
+        last_committed,
+        eos_token_id,
+        k,
+    )
+}
+
+/// Budget-aware compressed-serial MTP step: draft at most `k` candidates.
+/// `k == 0` verifies `[last_committed]` only and emits the single bonus token.
+#[allow(clippy::too_many_arguments)]
+pub fn spec_step_mtp_compressed_serial_with_k(
+    gpu: &mut Gpu,
+    target: &mut ModelSlot,
+    head: &Qwen35MtpHead,
+    state: &mut MtpSpecState,
+    cur_pos: usize,
+    last_committed: u32,
+    eos_token_id: u32,
+    k: usize,
+) -> HipResult<MtpSpecResult> {
+    // Per-call k is authoritative (remaining max_emit from MtpSpeculator). Never
+    // draft more than state.max_n, and k==0 means verify [seed] only + bonus.
+    let max_n = k.min(state.max_n);
     let dim = target.config.dim;
     let vocab = target.config.vocab_size;
     let trunk_weights: &Qwen35Weights = &target.weights;
@@ -2552,7 +2608,10 @@ pub fn spec_step_mtp_compressed_serial(
     } else {
         Vec::new()
     };
-    let use_device_token_chain = mtp_device_token_chain_enabled_from_env()
+    // k==0 one-token path: never run device-token chain / proposal graph
+    // (both assume max_n ≥ 1 for candidate buffer views).
+    let use_device_token_chain = max_n > 0
+        && mtp_device_token_chain_enabled_from_env()
         && mtp_device_token_chain_eligible_for(trunk_weights.embd_format, use_sampling, use_p_min);
     if use_device_token_chain && !use_full_vocab {
         assert!(
@@ -2561,7 +2620,8 @@ pub fn spec_step_mtp_compressed_serial(
         );
     }
     let proposal_graph_policy = mtp_proposal_graph_policy_from_env();
-    let use_proposal_graph = !state.mtp_proposal_graph_disabled
+    let use_proposal_graph = max_n > 0
+        && !state.mtp_proposal_graph_disabled
         && mtp_proposal_graph_eligible_for(
             proposal_graph_policy,
             use_device_token_chain,

@@ -81,7 +81,7 @@ fn main() {
                 .spec_advance(gpu, &prompt, 0, true, &no_abort, Some(&mut hidden_out))
                 .expect("spec_advance");
             match adv {
-                SpecAdvance::Ready { last_argmax } => {
+                SpecAdvance::Ready { last_argmax, .. } => {
                     eprintln!("[task2]   spec_advance Ready, last_argmax={last_argmax}");
                 }
                 other => panic!("expected SpecAdvance::Ready, got {other:?}"),

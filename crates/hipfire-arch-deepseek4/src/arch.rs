@@ -702,9 +702,10 @@ impl DeepseekV4 {
             .ok()
             .as_deref()
             != Some("0");
-        let expert_layer_end: Option<usize> = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_EXPERT_LAYER_END")
-            .ok()
-            .and_then(|s| s.parse().ok());
+        let expert_layer_end: Option<usize> =
+            hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_EXPERT_LAYER_END")
+                .ok()
+                .and_then(|s| s.parse().ok());
 
         // ── MTP addon HFQ discovery ──────────────────────────────────────
         // Resolves an optional second HFQ holding only `mtp.0.*` tensors so
@@ -2041,9 +2042,10 @@ impl DeepseekV4 {
             .ok()
             .as_deref()
             != Some("0");
-        let expert_layer_end: Option<usize> = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_EXPERT_LAYER_END")
-            .ok()
-            .and_then(|s| s.parse().ok());
+        let expert_layer_end: Option<usize> =
+            hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_EXPERT_LAYER_END")
+                .ok()
+                .and_then(|s| s.parse().ok());
         let comp_f16_wmma = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_COMP_F16_WMMA")
             .map(|s| s != "0")
             .unwrap_or(true);

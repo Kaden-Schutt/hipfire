@@ -58,7 +58,9 @@ fn main() {
     println!("GATE_UP_SEMANTICS seeded_nonzero_y=true expected=overwrite_with_W*X");
 
     if !arch.starts_with("gfx11") {
-        eprintln!("SKIP: this example requires a gfx11-family wave32 WMMA device; current arch={arch}");
+        eprintln!(
+            "SKIP: this example requires a gfx11-family wave32 WMMA device; current arch={arch}"
+        );
         std::process::exit(2);
     }
 
@@ -335,7 +337,11 @@ fn compare(batch: usize, m: usize, candidate: &[f32], reference: &[f32]) -> Metr
             let cand = candidate[idx];
             let refr = reference[idx];
             let finite = cand.is_finite() && refr.is_finite();
-            let abs = if finite { (cand - refr).abs() } else { f32::INFINITY };
+            let abs = if finite {
+                (cand - refr).abs()
+            } else {
+                f32::INFINITY
+            };
             let reference_is_near_zero = refr.abs() < REL_NEAR_ZERO;
             let rel = if finite && !reference_is_near_zero {
                 abs / refr.abs()
@@ -350,8 +356,7 @@ fn compare(batch: usize, m: usize, candidate: &[f32], reference: &[f32]) -> Metr
                 metrics.max_rel_err = metrics.max_rel_err.max(rel);
             }
 
-            let differs = !finite
-                || (abs > ABS_TOL && (reference_is_near_zero || rel > REL_TOL));
+            let differs = !finite || (abs > ABS_TOL && (reference_is_near_zero || rel > REL_TOL));
             if differs {
                 metrics.differing += 1;
                 metrics.row_mod16[row % 16] += 1;
@@ -429,12 +434,8 @@ fn build_hfq4g256(m: usize, k: usize, seed: u8) -> Vec<u8> {
             output[offset..offset + 4].copy_from_slice(&scale.to_le_bytes());
             output[offset + 4..offset + 8].copy_from_slice(&zero.to_le_bytes());
             for byte_index in 0..128 {
-                let random = mix(
-                    seed
-                        ^ ((row as u64) << 24)
-                        ^ ((group as u64) << 12)
-                        ^ byte_index as u64,
-                );
+                let random =
+                    mix(seed ^ ((row as u64) << 24) ^ ((group as u64) << 12) ^ byte_index as u64);
                 output[offset + 8 + byte_index] = (random & 0xff) as u8;
             }
         }

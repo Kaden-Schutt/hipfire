@@ -77,7 +77,7 @@ fn main() {
         .expect("spec_advance");
 
     let last_argmax = match adv {
-        SpecAdvance::Ready { last_argmax } => {
+        SpecAdvance::Ready { last_argmax, .. } => {
             eprintln!("[task2b] spec_advance Ready, last_argmax={last_argmax}");
             last_argmax
         }

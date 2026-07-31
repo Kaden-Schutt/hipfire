@@ -1246,6 +1246,16 @@ impl DsparkBody for Qwen3DsparkBody {
         self.scratch.pbs.max_batch
     }
 
+    fn reset_for_retry(&mut self, gpu: &mut Gpu) {
+        // Block-local KV + asset KV are position-indexed; zero so a cold retry
+        // cannot attend prior-window keys. compact_offset rewind alone is not
+        // enough if physical slots retain values.
+        let _ = self.scratch.kv.clear_gpu(gpu);
+        self.scratch.kv.compact_offset = 0;
+        let _ = self.assets.kv.clear_gpu(gpu);
+        self.assets.kv.compact_offset = 0;
+    }
+
     fn free(self: Box<Self>, gpu: &mut Gpu) {
         self.scratch.free_gpu(gpu);
         let Qwen3DrafterAssets {

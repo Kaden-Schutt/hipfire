@@ -1120,37 +1120,41 @@ impl DeltaNetState {
     /// reuse a single `DeltaNetState` across independent chunks/sequences
     /// without allocating per chunk (which leaks since DeltaNetState has no
     /// Drop). Mirrors `ModelSlot::reset_state` in speculative.rs.
-    pub fn reset(&mut self, gpu: &mut Gpu) {
+    ///
+    /// Returns `Err` on the first HIP memset/memset_async failure so production
+    /// rollback can attest `rolled_back:false`.
+    pub fn reset(&mut self, gpu: &mut Gpu) -> HipResult<()> {
         match gpu.active_stream.as_ref() {
             Some(stream) => {
                 for s in &self.s_matrices {
-                    let _ = gpu.hip.memset_async(&s.buf, 0, s.buf.size(), stream);
+                    gpu.hip.memset_async(&s.buf, 0, s.buf.size(), stream)?;
                 }
                 for s in &self.s_scales {
-                    let _ = gpu.hip.memset_async(&s.buf, 0, s.buf.size(), stream);
+                    gpu.hip.memset_async(&s.buf, 0, s.buf.size(), stream)?;
                 }
                 for s in &self.conv_states {
-                    let _ = gpu.hip.memset_async(&s.buf, 0, s.buf.size(), stream);
+                    gpu.hip.memset_async(&s.buf, 0, s.buf.size(), stream)?;
                 }
                 for s in &self.s_ef_residual {
-                    let _ = gpu.hip.memset_async(&s.buf, 0, s.buf.size(), stream);
+                    gpu.hip.memset_async(&s.buf, 0, s.buf.size(), stream)?;
                 }
             }
             None => {
                 for s in &self.s_matrices {
-                    let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+                    gpu.hip.memset(&s.buf, 0, s.buf.size())?;
                 }
                 for s in &self.s_scales {
-                    let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+                    gpu.hip.memset(&s.buf, 0, s.buf.size())?;
                 }
                 for s in &self.conv_states {
-                    let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+                    gpu.hip.memset(&s.buf, 0, s.buf.size())?;
                 }
                 for s in &self.s_ef_residual {
-                    let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+                    gpu.hip.memset(&s.buf, 0, s.buf.size())?;
                 }
             }
         }
+        Ok(())
     }
 
     /// Multi-GPU companion to `new_with_quant`. Each LA-layer's state is
@@ -1240,6 +1244,10 @@ impl DeltaNetState {
             let _ = gpus.devices[la_to_device[i] as usize].free_tensor(t);
         }
         for (i, t) in self.conv_states.into_iter().enumerate() {
+            let _ = gpus.devices[la_to_device[i] as usize].free_tensor(t);
+        }
+        // Empty today (multi-GPU EF not wired); free if/when residuals land.
+        for (i, t) in self.s_ef_residual.into_iter().enumerate() {
             let _ = gpus.devices[la_to_device[i] as usize].free_tensor(t);
         }
     }
@@ -8783,11 +8791,9 @@ fn forward_prefill_chunk(
         gpu.hip.memcpy_htod(&pbs.positions.buf, positions_bytes)?;
         if let Some(tv) = tree_verify.as_ref() {
             debug_assert_eq!(tv.positions.len(), n, "tree RoPE positions length");
-            let rope_bytes: &[u8] = unsafe {
-                std::slice::from_raw_parts(tv.positions.as_ptr() as *const u8, n * 4)
-            };
-            gpu.hip
-                .memcpy_htod(&pbs.rope_positions.buf, rope_bytes)?;
+            let rope_bytes: &[u8] =
+                unsafe { std::slice::from_raw_parts(tv.positions.as_ptr() as *const u8, n * 4) };
+            gpu.hip.memcpy_htod(&pbs.rope_positions.buf, rope_bytes)?;
         }
     }
 

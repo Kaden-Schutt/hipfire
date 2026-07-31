@@ -181,9 +181,8 @@ fn speculative_decode_impl(
     k: usize,
     mut grammar: Option<SpecGrammar<'_>>,
 ) -> Result<SpecStepResult, String> {
-    if k == 0 {
-        return Err("speculative_decode_step: k must be > 0".to_string());
-    }
+    // k==0 is the one-token path: verify [last_token] only and emit the bonus.
+    // Callers (MtpSpeculator) clamp k from remaining max_emit; max_emit==1 → k=0.
     if cfg.num_nextn_predict_layers == 0 || weights.mtp_layer.is_none() {
         return Err("speculative_decode_step: MTP layer not loaded — \
             quantize with deepseek4-q8-mtp + addon, or set HIPFIRE_DEEPSEEK4_LOAD_MTP=1"

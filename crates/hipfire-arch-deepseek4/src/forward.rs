@@ -48,7 +48,12 @@ mod config_cache {
     /// expert blobs.
     pub(super) fn moe_on() -> bool {
         static V: OnceLock<bool> = OnceLock::new();
-        *V.get_or_init(|| hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MOE").ok().as_deref() != Some("0"))
+        *V.get_or_init(|| {
+            hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MOE")
+                .ok()
+                .as_deref()
+                != Some("0")
+        })
     }
     /// `HIPFIRE_DEEPSEEK4_SKIP_FFN` — diagnostic: zero ffn_out to isolate attn growth.
     pub(super) fn skip_ffn() -> bool {
@@ -69,7 +74,12 @@ mod config_cache {
     /// pos-0 attention path instead of SWA. Default false (i.e. use SWA).
     pub(super) fn attn_pos0() -> bool {
         static V: OnceLock<bool> = OnceLock::new();
-        *V.get_or_init(|| hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_ATTN").ok().as_deref() == Some("pos0"))
+        *V.get_or_init(|| {
+            hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_ATTN")
+                .ok()
+                .as_deref()
+                == Some("pos0")
+        })
     }
     /// `HIPFIRE_DEEPSEEK4_MTP_HEAD_HC` — default ON since 2026-05-21: route
     /// the MTP output (step 8 of mtp_forward) through head-HC mix using
@@ -1514,7 +1524,10 @@ pub fn decode_step_with_graph(
     // `HIPFIRE_DEEPSEEK4_GRAPH=1` (untested — beware kernarg-bake regressions).
     static GRAPH_OPT_ENV: OnceLock<Option<bool>> = OnceLock::new();
     let env_override = *GRAPH_OPT_ENV.get_or_init(|| {
-        match hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_GRAPH").ok().as_deref() {
+        match hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_GRAPH")
+            .ok()
+            .as_deref()
+        {
             Some("1") => Some(true),
             Some("0") => Some(false),
             _ => None,
@@ -2207,7 +2220,12 @@ fn ds4_lower_program() -> superop::LayerProgram {
 fn ds4_forward_lowered_enabled() -> bool {
     use std::sync::OnceLock;
     static F: OnceLock<bool> = OnceLock::new();
-    *F.get_or_init(|| hipfire_config::developer_var("HIPFIRE_FORWARD_LOWERED").ok().as_deref() != Some("0"))
+    *F.get_or_init(|| {
+        hipfire_config::developer_var("HIPFIRE_FORWARD_LOWERED")
+            .ok()
+            .as_deref()
+            != Some("0")
+    })
 }
 
 /// Lowered (#397 Ship 6) per-layer decode loop + final norm/head. Behaviorally
@@ -2382,7 +2400,12 @@ pub fn forward_ep(
                 // scores, and selected top-k indices — discriminates a
                 // systematically-divergent compressor kernel from near-tie
                 // top-k chaos. HIPFIRE_EP_DUMP_IDX=1 to enable.
-                if r == 0 && hipfire_config::developer_var("HIPFIRE_EP_DUMP_IDX").ok().as_deref() == Some("1") {
+                if r == 0
+                    && hipfire_config::developer_var("HIPFIRE_EP_DUMP_IDX")
+                        .ok()
+                        .as_deref()
+                        == Some("1")
+                {
                     let fp = |gpu: &mut rdna_compute::Gpu,
                               t: &Option<rdna_compute::GpuTensor>|
                      -> String {
@@ -3802,7 +3825,9 @@ fn ffn_hash_routed(
             Some(w) => w,
             None => return Ok(()),
         };
-        scratch.idx_i32.extend(scratch.topk_ids.iter().map(|&x| x as i32));
+        scratch
+            .idx_i32
+            .extend(scratch.topk_ids.iter().map(|&x| x as i32));
         scratch
             .idx_bytes
             .extend(scratch.idx_i32.iter().flat_map(|i| i.to_le_bytes()));
@@ -6160,7 +6185,9 @@ fn attention_block_batched_swa_only(
     }
 
     // DEBUG: same-process twin-call test (HIPFIRE_DEEPSEEK4_ATTN_TWIN=1).
-    if layer_idx == 0 && hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_ATTN_TWIN").as_deref() == Ok("1") {
+    if layer_idx == 0
+        && hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_ATTN_TWIN").as_deref() == Ok("1")
+    {
         gpu.deepseek4_attn_swa_batched(
             &pbs.q_batch,
             &pbs.swa_staged_batch,
@@ -6182,7 +6209,9 @@ fn attention_block_batched_swa_only(
     // Re-runs the kernel via the debug variant which also writes
     // max_score and sum_exp per (h, b) so we can compare across runs
     // and find which intermediate first diverges.
-    if layer_idx == 0 && hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_ATTN_DEBUG_BISECT").as_deref() == Ok("1")
+    if layer_idx == 0
+        && hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_ATTN_DEBUG_BISECT").as_deref()
+            == Ok("1")
     {
         // Lazy-alloc debug scratch on the GPU on first call.
         let n_h = n_heads;
@@ -6812,10 +6841,11 @@ fn attention_block_batched_mixed(
 
         // Per-batch n_filled = (start_pos+b+1)/ratio, clamped.
         // n_max across batch = max value, used as kernel's per-batch cap.
-        let max_compressed: usize = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MAX_COMPRESS_POS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(2048);
+        let max_compressed: usize =
+            hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MAX_COMPRESS_POS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(2048);
         let n_per_batch_host: Vec<i32> = (0..batch_size)
             .map(|b| (((start_pos as usize) + b + 1) / ratio).min(max_compressed) as i32)
             .collect();
@@ -6972,10 +7002,11 @@ fn attention_block_batched_mixed(
         }
     } else {
         // ratio == 128: identity gather, no indexer. Per-batch n_compressed.
-        let max_compressed: usize = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MAX_COMPRESS_POS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(2048);
+        let max_compressed: usize =
+            hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MAX_COMPRESS_POS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(2048);
         let max_n_compressed = (((start_pos as usize) + batch_size) / ratio)
             .min(max_compressed)
             .min(topk_max);
@@ -7020,7 +7051,8 @@ fn attention_block_batched_mixed(
         // Head-batched f16-WMMA DSA attention (~4.4× the f32 kernel at prefill
         // batch); falls back to f32 if disabled, shapes don't tile, or the
         // score LDS would exceed 64 KB. max_n_total bounds the LDS (n_valid ≤ win).
-        let use_dsa_wmma = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_DSA_WMMA").as_deref() != Ok("0")
+        let use_dsa_wmma = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_DSA_WMMA").as_deref()
+            != Ok("0")
             && gpu.arch_caps.has_wmma()
             && n_heads % 16 == 0
             && head_dim % 16 == 0;
@@ -7073,7 +7105,8 @@ fn attention_block_batched_mixed(
     } else {
         // Head-batched f16-WMMA gathered DSA attention; f32 fallback on
         // disable / non-tiling shapes / LDS > 64 KB.
-        let use_dsa_wmma = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_DSA_WMMA").as_deref() != Ok("0")
+        let use_dsa_wmma = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_DSA_WMMA").as_deref()
+            != Ok("0")
             && gpu.arch_caps.has_wmma()
             && n_heads % 16 == 0
             && head_dim % 16 == 0;
@@ -7415,7 +7448,10 @@ fn ffn_batched(
     )?;
 
     // ── Routed-expert MoE ───────────────────────────────────────────
-    let do_routed = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MOE").ok().as_deref() != Some("0")
+    let do_routed = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MOE")
+        .ok()
+        .as_deref()
+        != Some("0")
         && layer.expert_gate_up_blob.is_some()
         && layer.expert_w2_blob.is_some();
     if !do_routed {

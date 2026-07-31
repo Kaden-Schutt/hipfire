@@ -82,7 +82,16 @@ fn decode_loop(
     generated.push(first_token);
 
     while generated.len() < max {
-        let step = spec.step(gpu, bundle, position, seed, &generated, None, temp)?;
+        let step = spec.step(
+            gpu,
+            bundle,
+            position,
+            seed,
+            &generated,
+            None,
+            temp,
+            max.saturating_sub(generated.len()).max(1),
+        )?;
         windows += 1;
         proposed += step.proposed as u64;
         accepted += step.accepted as u64;
@@ -345,7 +354,7 @@ fn main() -> Result<(), String> {
     // host scalars (rope_pos etc.) → warmup-length-dependent τ. The daemon pairs
     // reset() with zero_decode_caches() + invalidate_graph_state(); the bench
     // must too, or the A/B measurement is contaminated by the warmup.
-    spec.reset(&mut gpu);
+    let _ = spec.reset(&mut gpu);
     bundle.state.reset();
     bundle.state.zero_decode_caches(&mut gpu);
     gpu.invalidate_graph_state();

@@ -606,6 +606,86 @@ fn sample_unnormalized(w: &[f32], u: f32) -> u32 {
     (w.len() - 1) as u32
 }
 
+/// Host-side temperature + top-k + nucleus sample of one logits row.
+///
+/// Mirrors the Qwen35 chain DFlash prefill / `spec_step_dflash` host path:
+/// softmax(`/temp`) → optional top-k keep+renorm → optional top-p nucleus →
+/// one categorical draw from the shared xorshift stream. Used by
+/// [`crate::spec_ngram::ChainSpeculator`] for the first post-prefill token so
+/// the seed matches later `verify_block_sampled` policy (temp/top_p/top_k) and
+/// the same `rng_state` sequence `set_sampling` reseeds per request.
+///
+/// - `top_k == 0` or `top_k >= vocab` disables the top-k cut.
+/// - `top_p >= 0.999` disables nucleus (matches qwen35 chain prefill).
+/// - Caller must gate greedy (`temp <= 1e-6`) before calling; this always
+///   advances `rng_state` once on the multinomial path.
+pub fn sample_host_nucleus(
+    logits: &[f32],
+    temp: f32,
+    top_p: f32,
+    top_k: usize,
+    rng_state: &mut u64,
+) -> u32 {
+    let mut probs = Vec::with_capacity(logits.len());
+    softmax_temp_into(logits, temp, &mut probs);
+    if top_k > 0 && top_k < probs.len() {
+        let mut order: Vec<usize> = (0..probs.len()).collect();
+        order.sort_by(|&a, &b| {
+            probs[b]
+                .partial_cmp(&probs[a])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let mut kept_mass = 0.0f32;
+        for (rank, &idx) in order.iter().enumerate() {
+            if rank < top_k {
+                kept_mass += probs[idx];
+            } else {
+                probs[idx] = 0.0;
+            }
+        }
+        if kept_mass > 0.0 {
+            let inv = 1.0 / kept_mass;
+            for p in probs.iter_mut() {
+                *p *= inv;
+            }
+        }
+    }
+    if top_p < 0.999 {
+        // In-place nucleus: sort desc, cut at first cum >= top_p, renorm kept.
+        let mut order: Vec<usize> = (0..probs.len()).collect();
+        order.sort_by(|&a, &b| {
+            probs[b]
+                .partial_cmp(&probs[a])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let mut cum = 0.0f64;
+        let mut kept_mass = 0.0f64;
+        let mut cutoff = order.len();
+        for (rank, &idx) in order.iter().enumerate() {
+            cum += probs[idx] as f64;
+            kept_mass += probs[idx] as f64;
+            if cum >= top_p as f64 {
+                cutoff = rank + 1;
+                break;
+            }
+        }
+        let inv = if kept_mass > 0.0 {
+            1.0f64 / kept_mass
+        } else {
+            0.0
+        };
+        for (rank, &idx) in order.iter().enumerate() {
+            if rank < cutoff {
+                probs[idx] = (probs[idx] as f64 * inv) as f32;
+            } else {
+                probs[idx] = 0.0;
+            }
+        }
+    }
+    let u = xorshift_unit(rng_state);
+    sample_unnormalized(&probs, u)
+}
+
 /// Phase-0 instrumentation: append one JSON-lines record describing this cycle's
 /// tree as a per-slot REDUCED categorical `{child_1..child_k, TAIL}` over both the
 /// target `p` (softmax of the verify logits at `temp`) and the draft conditional
@@ -1161,6 +1241,31 @@ mod tests {
             }
         }
         bi as u32
+    }
+
+    #[test]
+    fn sample_host_nucleus_deterministic_and_advances_rng() {
+        // Peaked row: token 2 dominates after softmax; top_k=1 forces it.
+        let logits = [0.0f32, 1.0, 5.0, 0.5];
+        let mut rng_a = 0x13579BDFu64;
+        let mut rng_b = 0x13579BDFu64;
+        let t1 = sample_host_nucleus(&logits, 1.0, 1.0, 1, &mut rng_a);
+        let t2 = sample_host_nucleus(&logits, 1.0, 1.0, 1, &mut rng_b);
+        assert_eq!(t1, 2);
+        assert_eq!(t2, 2);
+        assert_ne!(rng_a, 0x13579BDF, "rng must advance once");
+        assert_eq!(rng_a, rng_b);
+    }
+
+    #[test]
+    fn sample_host_nucleus_top_k_masks_tail() {
+        // Two near-equal peaks; top_k=1 keeps only the higher logit index 0.
+        let logits = [3.0f32, 2.999, -10.0, -10.0];
+        let mut rng = 0x13579BDFu64;
+        for _ in 0..16 {
+            let t = sample_host_nucleus(&logits, 1.0, 1.0, 1, &mut rng);
+            assert_eq!(t, 0, "top_k=1 must never pick the masked tail");
+        }
     }
 
     // A small depth-2, top-2 tree over an 8-token vocab.

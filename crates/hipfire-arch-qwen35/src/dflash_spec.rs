@@ -13,9 +13,10 @@
 
 use crate::qwen35::{self, DeltaNetState, LayerType, Qwen35Config};
 use crate::speculative::{
-    apply_eviction_retain_to_draft, scatter_hidden_block_to_interleaved,
-    seed_target_hidden_from_prompt_abortable, seed_target_hidden_suffix_abortable,
-    spec_step_ddtree_batched, spec_step_dflash, DdtreeScratch, DeltaNetSnapshot, GdnTape,
+    apply_eviction_retain_to_draft, apply_host_nucleus, sample_categorical,
+    scatter_hidden_block_to_interleaved, seed_target_hidden_from_prompt_abortable,
+    seed_target_hidden_suffix_abortable, softmax_temp_into, spec_step_ddtree_batched,
+    spec_step_dflash, xorshift_next_unit, DdtreeScratch, DeltaNetSnapshot, GdnTape,
     HiddenStateRingBuffer, ModelSlot, SpecStepResult, VerifyScratch,
 };
 use hipfire_runtime::dflash::{DflashConfig, DflashScratch, DflashWeights};
@@ -113,7 +114,7 @@ pub fn load_dflash_state(
     //   HIPFIRE_DFLASH_WINDOW=<rows>  explicit override (warns on mismatch)
     //   HIPFIRE_DFLASH_WINDOW=0       explicit Legacy (cap + AR fallback)
     //   unset                         draft-declared window, else Legacy
-    let window = match std::env::var("HIPFIRE_DFLASH_WINDOW")
+    let window = match hipfire_config::developer_var("HIPFIRE_DFLASH_WINDOW")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
     {
@@ -144,7 +145,7 @@ pub fn load_dflash_state(
     };
     let ctx_capacity = match window {
         Some(w) => w,
-        None => match std::env::var("HIPFIRE_DFLASH_CTX_CAP")
+        None => match hipfire_config::developer_var("HIPFIRE_DFLASH_CTX_CAP")
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
         {
@@ -474,22 +475,64 @@ impl Speculator for DflashSpeculator {
             self.df.draft_scratch.thlog.set_resume_checkpoint(ckpt);
         }
 
-        // First emit = target argmax at the final prompt position (seed already
+        // First emit = target draw at the final prompt position (seed already
         // ran the per-token forward; scratch.logits holds the post-prompt logits).
+        // temp≈0 stays the historical host argmax fold (byte-identical greedy).
+        // temp>0 uses the same host nucleus sampler as chain DFlash verify so the
+        // post-prefill seed is not a special greedy exception on distribution-
+        // preserving requests.
         let first_logits = gpu
             .download_f32(&slot.scratch.logits)
             .map_err(|e| e.to_string())?;
-        let first_token = first_logits
-            .iter()
-            .enumerate()
-            .fold((0u32, f32::NEG_INFINITY), |(best, bv), (i, &v)| {
-                if v > bv {
-                    (i as u32, v)
-                } else {
-                    (best, bv)
+        let first_token = if self.sample_temp <= 1e-6 {
+            first_logits
+                .iter()
+                .enumerate()
+                .fold((0u32, f32::NEG_INFINITY), |(best, bv), (i, &v)| {
+                    if v > bv {
+                        (i as u32, v)
+                    } else {
+                        (best, bv)
+                    }
+                })
+                .0
+        } else {
+            let mut probs = Vec::with_capacity(first_logits.len());
+            softmax_temp_into(&first_logits, self.sample_temp, &mut probs);
+            // DDTree SWOR honors temperature only (matches step's tree arm).
+            // Chain mode applies the same host top_k + nucleus cuts as
+            // `spec_step_dflash` so the seed is AR-at-(top_k,top_p).
+            if self.df.ddtree.is_none() {
+                if self.sample_top_k > 0 && self.sample_top_k < probs.len() {
+                    let mut order: Vec<usize> = (0..probs.len()).collect();
+                    order.sort_by(|&a, &b| {
+                        probs[b]
+                            .partial_cmp(&probs[a])
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                    let keep = self.sample_top_k;
+                    let mut kept_mass = 0.0f32;
+                    for (rank, &idx) in order.iter().enumerate() {
+                        if rank < keep {
+                            kept_mass += probs[idx];
+                        } else {
+                            probs[idx] = 0.0;
+                        }
+                    }
+                    if kept_mass > 0.0 {
+                        let inv = 1.0 / kept_mass;
+                        for p in probs.iter_mut() {
+                            *p *= inv;
+                        }
+                    }
                 }
-            })
-            .0;
+                if self.sample_top_p < 0.999 {
+                    apply_host_nucleus(&mut probs, self.sample_top_p);
+                }
+            }
+            let u = xorshift_next_unit(&mut self.rng_state);
+            sample_categorical(&probs, u)
+        };
         Ok(PrefillOutcome::Ready { first_token })
     }
 
@@ -568,17 +611,43 @@ impl Speculator for DflashSpeculator {
         emitted: &[u32],
         _grammar: Option<&mut dyn SpecGrammar>,
         temp: f32,
+        max_emit: usize,
     ) -> Result<SpecStep, String> {
         let slot = target
             .as_any_mut()
             .downcast_mut::<ModelSlot>()
             .ok_or("DflashSpeculator: target is not a Qwen3.5 ModelSlot")?;
 
+        if max_emit == 0 {
+            return Err("DflashSpeculator: max_emit=0 (no remaining output budget)".into());
+        }
+        // Chain DFlash: emit ≤ b (accepted drafts + bonus). Cap block size so the
+        // verify window cannot commit past remaining client budget. b >= 2.
+        // emit = accept + 1 ≤ b when seed is excluded. Prefer b = max_emit
+        // (uniform for max_emit >= 1); max_accept clamps accept before commit
+        // so max_emit == 1 is a true one-token path (accept 0 + bonus).
+        let block_override = {
+            let cfg_b = self.df.block_size.max(2);
+            let want = max_emit.max(2);
+            let b = cfg_b.min(want);
+            if b < cfg_b {
+                Some(b)
+            } else {
+                None
+            }
+        };
+        // accepted drafts + bonus = emit; max accepted drafts = max_emit - 1.
+        let max_accept = Some(max_emit.saturating_sub(1));
+
         // Two-way dispatch from the daemon's old generate_dflash loop: DDTree-
         // batched (SWOR) verify when a tree is configured, else chain-mode DFlash.
         // The grammar arg is ignored — qwen35 enforces tool-call grammar post-hoc
         // in the daemon.
         let result = if let Some(dd) = self.df.ddtree.as_mut() {
+            // Tree node budget is structural; max_accept is the commit bound.
+            // Keep at least 1 node so the tree builder stays well-formed; the
+            // accept clamp drops to 0 drafts when max_emit == 1.
+            let tree_budget = dd.budget.min(max_emit.saturating_sub(1).max(1));
             spec_step_ddtree_batched(
                 gpu,
                 slot,
@@ -595,7 +664,7 @@ impl Speculator for DflashSpeculator {
                 position,
                 seed,
                 None, // ctx_slice = full history
-                dd.budget,
+                tree_budget,
                 dd.topk,
                 // Request temperature → distribution-preserving SWOR verify at
                 // temp>0 (greedy/argmax at temp 0). The ddtree-batched arm is the
@@ -603,6 +672,7 @@ impl Speculator for DflashSpeculator {
                 // greedy, so `supports_temp_verify` gates serve routing to ddtree.
                 temp,
                 &mut self.rng_state,
+                max_accept,
             )
         } else {
             spec_step_dflash(
@@ -630,17 +700,22 @@ impl Speculator for DflashSpeculator {
                 self.sample_top_p, // top_p (1.0 = no truncation)
                 self.sample_top_k, // top_k (0 = top_p-only)
                 &mut self.rng_state,
-                None, // block_size override
-                None, // ngram_cache
+                block_override, // remaining-output budget
+                None,           // ngram_cache
                 emitted,
                 self.sample_cactus, // 0.0 = lossless; >0 = deliberately lossy
                 None,               // pld_spine
                 1.0_f32,            // repeat_penalty (off)
                 0,                  // repeat_window
+                max_accept,
             )
         };
 
-        result.map(lower_qwen35).map_err(|e| e.to_string())
+        result
+            .map(lower_qwen35)
+            // Defense only — accept stage already committed ≤ max_emit.
+            .map(|s| s.cap_emit(max_emit))
+            .map_err(|e| e.to_string())
     }
 
     fn on_evict(&mut self, gpu: &mut Gpu, retain: &EvictRetain) -> Result<(), String> {
@@ -659,7 +734,7 @@ impl Speculator for DflashSpeculator {
         .map_err(|e| e.to_string())
     }
 
-    fn reset(&mut self, gpu: &mut Gpu) {
+    fn reset(&mut self, gpu: &mut Gpu) -> Result<(), String> {
         // Drafter-local reset: invalidate cached suffix projections and free the
         // divergent-render checkpoint ring (the target KV/recurrent reset is the
         // daemon's job — it owns the bundle).
@@ -667,6 +742,17 @@ impl Speculator for DflashSpeculator {
         for (_, snap) in self.checkpoints.drain(..) {
             snap.free_gpu(gpu);
         }
+        Ok(())
+    }
+
+    fn reset_state_evidence(&self) -> Option<hipfire_runtime::spec::SpecResetEvidence> {
+        let th = &self.df.draft_scratch.thlog;
+        Some(hipfire_runtime::spec::SpecResetEvidence {
+            drafter_reset: th.uploaded_rows() == 0
+                && th.proj_cached_rows() == 0
+                && th.full_cached_rows() == 0,
+            checkpoint_empty: self.checkpoints.is_empty(),
+        })
     }
 
     fn block_size(&self) -> usize {
@@ -696,7 +782,10 @@ impl Speculator for DflashSpeculator {
             .downcast_mut::<ModelSlot>()
             .ok_or("DflashSpeculator: target is not a Qwen3.5 ModelSlot")?;
         if let Some(idx) = self.checkpoints.iter().rposition(|(p, _)| *p == position) {
-            let _ = self.checkpoints[idx].1.restore_to(&mut slot.dn_state, gpu);
+            self.checkpoints[idx]
+                .1
+                .restore_to(&mut slot.dn_state, gpu)
+                .map_err(|e| format!("DeltaNetSnapshot::restore_to: {e}"))?;
             for (_, snap) in self.checkpoints.drain(idx + 1..) {
                 snap.free_gpu(gpu);
             }
@@ -747,7 +836,10 @@ impl Speculator for DflashSpeculator {
 /// (`HIPFIRE_CACHE_CKPT_INTERVAL`/`_MAX`, matching the daemon's
 /// `ckpt_interval()`/`ckpt_max()` defaults). Called once at load.
 pub fn build_dflash_speculator(df: DflashState, eviction_is_none: bool) -> Box<dyn Speculator> {
-    let resume_enabled = hipfire_config::developer_var("HIPFIRE_DFLASH_CKPT_RESUME").ok().as_deref() != Some("0")
+    let resume_enabled = hipfire_config::developer_var("HIPFIRE_DFLASH_CKPT_RESUME")
+        .ok()
+        .as_deref()
+        != Some("0")
         && eviction_is_none;
     let ck_interval = hipfire_config::developer_var("HIPFIRE_CACHE_CKPT_INTERVAL")
         .ok()
