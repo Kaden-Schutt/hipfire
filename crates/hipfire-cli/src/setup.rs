@@ -119,6 +119,7 @@ pub(crate) fn setup_command(paths: &crate::Paths, args: crate::SetupArgs) -> Res
 
     // --- 4a. Resolve ROCm root (no mutation) ---
     let rocm_root = resolve_rocm_root(args.rocm_root.as_deref(), args.yes)?;
+    ensure_rocm_complete(&rocm_root)?;
     ensure_not_interrupted()?;
 
     // --- 4b. Resolve GPU arch (no mutation) ---
@@ -360,7 +361,21 @@ fn resolve_rocm_root(explicit: Option<&Path>, yes: bool) -> Result<PathBuf> {
             if io::stdin().is_terminal() && !yes {
                 println!("Multiple ROCm installations found:");
                 for (i, root) in candidates.iter().enumerate() {
-                    println!("  {}. {}", i + 1, root.display());
+                    // Flag roots that carry only a compiler, so the choice is
+                    // informed rather than a coin flip between a usable root
+                    // and one that fails at the end of the install.
+                    let note = match hipfire_config::rocm::missing_components(root).as_slice() {
+                        [] => String::new(),
+                        missing => format!(
+                            "  [incomplete: missing {}]",
+                            missing
+                                .iter()
+                                .map(|m| m.what)
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ),
+                    };
+                    println!("  {}. {}{note}", i + 1, root.display());
                 }
                 let idx = read_numbered_selection(candidates.len(), "ROCm root")?;
                 candidates.remove(idx)
@@ -402,6 +417,59 @@ fn usable_rocm_roots(roots: impl IntoIterator<Item = PathBuf>) -> Vec<PathBuf> {
         candidates.push(key);
     }
     candidates
+}
+
+/// Refuse a ROCm root that carries a device compiler but not the HIP runtime.
+///
+/// Runs before any build so the failure costs seconds, not the three cargo
+/// builds and 38-kernel precompile it used to sit behind. Without this the
+/// first symptom is clang reporting `'hip/hip_runtime.h' file not found` at the
+/// very end of a long install, which names neither the real cause nor the fix.
+fn ensure_rocm_complete(root: &Path) -> Result<()> {
+    // The runtime is resolved at LOAD time across every candidate root and then
+    // the dynamic loader, so its absence from this one root is not proof it is
+    // missing — warn, never block. The reporting box is exactly that case:
+    // `ldconfig -p` knows nothing about libamdhip64, yet the daemon loads it
+    // from a resolved root and reports real VRAM. Blocking on a per-root probe
+    // would have failed an install that works.
+    if hipfire_config::rocm::roots()
+        .iter()
+        .all(|r| hipfire_config::rocm::runtime_library(r).is_none())
+    {
+        eprintln!(
+            "WARNING: no HIP runtime library found under any known ROCm root.\n\
+             \x20        If the daemon later fails to start, install it:"
+        );
+        for line in hipfire_config::rocm::install_guidance() {
+            eprintln!("           {line}");
+        }
+    }
+
+    // Headers, by contrast, must live under THIS root: they reach the device
+    // compiler as --rocm-path=<root> and -I<root>/include, so a copy elsewhere
+    // cannot be used and the compile provably cannot succeed. Hard-fail.
+    if hipfire_config::rocm::is_complete_root(root) {
+        return Ok(());
+    }
+    let mut msg = format!(
+        "ROCm root {} has a device compiler but no HIP headers:\n\n  \
+         missing: hip/hip_runtime.h\n  probed:  {}\n\n\
+         A working device compiler is not sufficient: ROCm ships the compiler, the\n\
+         HIP headers and the HIP runtime as separate packages, so installing only\n\
+         the compiler leaves `hipcc --version` working while every kernel compile\n\
+         fails on this header.\n\n\
+         To install the headers:\n",
+        root.display(),
+        root.join("include")
+            .join("hip")
+            .join("hip_runtime.h")
+            .display(),
+    );
+    for line in hipfire_config::rocm::install_guidance() {
+        msg.push_str(&format!("  {line}\n"));
+    }
+    msg.push_str("\nTo use a different ROCm install instead: --rocm-root PATH");
+    bail!(msg)
 }
 
 fn root_has_device_compiler(root: &Path) -> bool {
@@ -928,11 +996,11 @@ fn path_on_path(bin: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        backup_path_for, cleanup_backups, continue_decision, install_binary_with_backup,
-        metadata_ref_from_parts, parse_gpu_arches, pin_cargo_to_source_target,
-        prompt_line_from_read, restore_config_toml, rollback_replacements,
-        selection_from_prompt_read, snapshot_config_toml, usable_rocm_roots, BinaryReplacement,
-        ContinueDecision, PromptRead,
+        backup_path_for, cleanup_backups, continue_decision, ensure_rocm_complete,
+        install_binary_with_backup, metadata_ref_from_parts, parse_gpu_arches,
+        pin_cargo_to_source_target, prompt_line_from_read, restore_config_toml,
+        rollback_replacements, selection_from_prompt_read, snapshot_config_toml, usable_rocm_roots,
+        BinaryReplacement, ContinueDecision, PromptRead,
     };
     use std::{
         env, fs,
@@ -968,6 +1036,51 @@ mod tests {
 
     /// `/opt/rocm/core`, `core-7`, and `core-7.14` often share one real tree via
     /// symlinks; discovery must collapse them to a single canonical root.
+    /// A compiler-only ROCm root must be rejected up front, naming the packages
+    /// that supply what is missing. Before this the install ran three cargo
+    /// builds and a 38-kernel precompile first, then failed with clang's
+    /// "'hip/hip_runtime.h' file not found" — which names neither cause nor fix.
+    #[test]
+    fn compiler_only_rocm_root_is_rejected_before_any_build() {
+        let tmp = env::temp_dir().join(format!("hipfire-setup-rocm-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(tmp.join("bin")).unwrap();
+        fs::write(tmp.join("bin").join("hipcc"), b"#!/bin/sh\n").unwrap();
+
+        let dirs = hipfire_config::rocm::HIP_RUNTIME_DIRS;
+        let libs = hipfire_config::rocm::HIP_RUNTIME_LIBRARIES;
+
+        let err = ensure_rocm_complete(&tmp).unwrap_err().to_string();
+        assert!(err.contains("hip/hip_runtime.h"), "{err}");
+        assert!(err.contains("--rocm-root"), "{err}");
+        // Guidance is present but its wording is host-dependent, so assert that
+        // some install advice was emitted rather than a specific distro's.
+        assert!(
+            hipfire_config::rocm::install_guidance()
+                .iter()
+                .all(|line| err.contains(line.as_str())),
+            "{err}"
+        );
+
+        // Headers alone are enough to proceed. The runtime is resolved at load
+        // time across all roots and then the loader, so a root without it must
+        // NOT block: the reporting box loads libamdhip64 fine while `ldconfig`
+        // knows nothing about it.
+        fs::create_dir_all(tmp.join("include").join("hip")).unwrap();
+        fs::write(tmp.join("include").join("hip").join("hip_runtime.h"), b"").unwrap();
+        assert!(
+            ensure_rocm_complete(&tmp).is_ok(),
+            "a missing runtime must warn, not block"
+        );
+
+        // And a fully populated root is obviously fine.
+        fs::create_dir_all(tmp.join(dirs[0])).unwrap();
+        fs::write(tmp.join(dirs[0]).join(libs[0]), b"").unwrap();
+        assert!(ensure_rocm_complete(&tmp).is_ok());
+
+        fs::remove_dir_all(&tmp).unwrap();
+    }
+
     #[test]
     #[cfg(target_os = "linux")]
     fn usable_rocm_roots_dedups_symlink_aliases_to_one_canonical() {

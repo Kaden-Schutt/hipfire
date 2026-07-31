@@ -871,9 +871,30 @@ impl KernelCompiler {
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
+            // A missing hip_runtime.h is a missing PACKAGE, not a missing flag.
+            // clang reports it as a bare "file not found" that names neither the
+            // ROCm root it searched nor the component that would supply it, so
+            // spell both out rather than leaving the user to guess.
+            let hint = if stderr.contains("hip/hip_runtime.h") {
+                let root = hipfire_config::rocm::root();
+                let guidance = hipfire_config::rocm::install_guidance()
+                    .into_iter()
+                    .map(|line| format!("\n  {line}"))
+                    .collect::<String>();
+                format!(
+                    "\n\nThe HIP headers are not installed under the ROCm root ({}).\n\
+                     A working hipcc does not imply them — they ship in a separate\n\
+                     package.{guidance}\n\
+                     Run `hipfire diag` for the per-root component inventory.",
+                    root.map(|r| r.display().to_string())
+                        .unwrap_or_else(|| "none resolved".into()),
+                )
+            } else {
+                String::new()
+            };
             return Err(hip_bridge::HipError::new(
                 0,
-                &format!("hipcc compilation failed for {name}:\n{stderr}"),
+                &format!("hipcc compilation failed for {name}:\n{stderr}{hint}"),
             ));
         }
         Ok(())

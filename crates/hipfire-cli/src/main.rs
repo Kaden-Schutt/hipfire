@@ -6177,6 +6177,28 @@ fn diag_command(paths: &Paths, output: OutputArgs) -> Result<()> {
     let gpu_arches = detect_gpu_arches();
     let gpus = detect_amd_drm_cards();
     let hipcc = command_version("hipcc", "--version");
+    // Per-root component inventory. A working `hipcc` says nothing about the
+    // HIP headers or runtime — they are separate packages — so reporting only
+    // the hipcc version made a half-installed ROCm look healthy here while
+    // every kernel compile and dlopen failed elsewhere.
+    let rocm_roots = hipfire_config::rocm::roots()
+        .iter()
+        .filter(|root| root.is_dir())
+        .map(|root| {
+            let missing = hipfire_config::rocm::missing_components(root);
+            serde_json::json!({
+                "path": root.display().to_string(),
+                "device_compiler": hipfire_config::rocm::DEVICE_COMPILERS
+                    .iter()
+                    .find(|name| root.join("bin").join(name).is_file()),
+                "hip_headers": hipfire_config::rocm::is_complete_root(root),
+                "hip_runtime": hipfire_config::rocm::runtime_library(root)
+                    .map(|p| p.display().to_string()),
+                "missing": missing.iter().map(|m| m.what).collect::<Vec<_>>(),
+            })
+        })
+        .collect::<Vec<_>>();
+    let rocm_selected = hipfire_config::rocm::root().map(|p| p.display().to_string());
     let daemon_path = find_daemon(paths);
     let daemon = daemon_path.as_ref().map(|path| path.display().to_string());
     let live_gpu = daemon_path.as_ref().and_then(|daemon| {
@@ -6207,7 +6229,7 @@ fn diag_command(paths: &Paths, output: OutputArgs) -> Result<()> {
         "dri_nodes": list_dri_nodes(),
         "kfd": kfd,
         "amdgpu_loaded": amdgpu_loaded,
-        "rocm": { "hipcc": hipcc },
+        "rocm": { "hipcc": hipcc, "selected_root": rocm_selected, "roots": rocm_roots },
         "daemon": daemon,
         "live_gpu": live_gpu,
         "models": models,
@@ -6244,6 +6266,36 @@ fn diag_command(paths: &Paths, output: OutputArgs) -> Result<()> {
             }
         );
         println!("local models:  {}", models.len());
+        println!(
+            "ROCm root:     {}",
+            rocm_selected.as_deref().unwrap_or("none found")
+        );
+        // Only actionable for a root that HAS a compiler: one without is a shim
+        // directory (the /opt/rocm of a split-tree install), so its "missing"
+        // components are expected rather than a problem to fix.
+        let mut incomplete_toolchain = false;
+        for root in &rocm_roots {
+            let s = |k: &str| root[k].as_str().map(str::to_owned);
+            println!(
+                "  {}\n    compiler: {}   headers: {}   runtime: {}",
+                root["path"].as_str().unwrap_or("?"),
+                s("device_compiler").unwrap_or_else(|| "MISSING".into()),
+                if root["hip_headers"].as_bool().unwrap_or(false) {
+                    "yes"
+                } else {
+                    "MISSING"
+                },
+                s("hip_runtime").unwrap_or_else(|| "MISSING".into()),
+            );
+            let missing = root["missing"].as_array().map(Vec::len).unwrap_or(0);
+            incomplete_toolchain |= missing > 0 && s("device_compiler").is_some();
+        }
+        if incomplete_toolchain {
+            println!("  a ROCm root above has a compiler but no HIP runtime/headers:");
+            for line in hipfire_config::rocm::install_guidance() {
+                println!("    {line}");
+            }
+        }
         println!(
             "config:        {} ({:?})",
             loaded_config.path.display(),

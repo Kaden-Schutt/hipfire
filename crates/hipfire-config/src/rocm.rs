@@ -161,6 +161,138 @@ pub fn is_complete_root(path: &Path) -> bool {
         .is_file()
 }
 
+/// HIP runtime library filenames, most preferred first. Windows ships
+/// `amdhip64.dll` (versioned as `amdhip64_7.dll` from HIP SDK 7.x); ELF
+/// platforms ship `libamdhip64.so` with SONAME variants.
+#[cfg(windows)]
+pub const HIP_RUNTIME_LIBRARIES: &[&str] = &["amdhip64.dll", "amdhip64_7.dll", "amdhip64_6.dll"];
+#[cfg(not(windows))]
+pub const HIP_RUNTIME_LIBRARIES: &[&str] = &[
+    "libamdhip64.so",
+    "libamdhip64.so.7",
+    "libamdhip64.so.6",
+    "libamdhip64.so.5",
+];
+
+/// Directories within a root that hold the HIP runtime library. Windows keeps
+/// DLLs beside the executables in `bin`; ELF platforms use `lib`, or `lib64` on
+/// the Fedora/RHEL layout where ROCm installs into `/usr`.
+#[cfg(windows)]
+pub const HIP_RUNTIME_DIRS: &[&str] = &["bin"];
+#[cfg(not(windows))]
+pub const HIP_RUNTIME_DIRS: &[&str] = &["lib", "lib64"];
+
+/// The HIP runtime library under `root`, if this install ships one.
+///
+/// Deliberately root-scoped, unlike [`library_candidates`], which also offers
+/// bare sonames for the dynamic loader to resolve. Answering "does THIS root
+/// carry the runtime" needs the loader kept out of it.
+pub fn runtime_library(root: &Path) -> Option<PathBuf> {
+    for libdir in HIP_RUNTIME_DIRS {
+        for name in HIP_RUNTIME_LIBRARIES {
+            let p = root.join(libdir).join(name);
+            if p.exists() {
+                return Some(p);
+            }
+        }
+    }
+    None
+}
+
+/// A prerequisite a ROCm root does not provide.
+///
+/// Deliberately carries no package name: what is missing is a fact we can
+/// establish from the filesystem, whereas what to install is a per-distro
+/// guess. Those are separated so a wrong guess can never make the certain part
+/// wrong — see [`install_guidance`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MissingComponent {
+    /// What is absent, in the terms a user would recognise.
+    pub what: &'static str,
+    /// The path that was probed, so the claim is checkable by hand.
+    pub probed: PathBuf,
+}
+
+/// AMD's install documentation — the one answer that is correct on every
+/// distro, and stays correct when package names change again.
+pub const ROCM_INSTALL_DOCS: &str = if cfg!(windows) {
+    "https://rocm.docs.amd.com/projects/install-on-windows/en/latest/"
+} else {
+    "https://rocm.docs.amd.com/projects/install-on-linux/en/latest/"
+};
+
+/// How to install the missing HIP components.
+///
+/// Deliberately thin. Naming a package per distro means maintaining a table of
+/// names hipfire cannot verify and that drift — ROCm 7.14 renaming the whole
+/// `rocm-hip-*` family to `amdrocm-*` is exactly that drift, and is the bug
+/// this code exists to report. So only the apt names are asserted, because
+/// those were checked against real packages; everyone else gets the docs link
+/// plus the probed paths from [`missing_components`], which is enough to find
+/// the package on any distro and cannot go stale.
+pub fn install_guidance() -> Vec<String> {
+    let mut out = Vec::new();
+    let apt = std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).any(|d| d.join("apt-get").exists()))
+        .unwrap_or(false);
+    if apt {
+        out.push(if uses_split_tree_packaging() {
+            // ROCm >= 7.14: rocm-hip-* was renamed, and the unversioned
+            // meta-packages exist, so no version suffix has to be synthesised.
+            "sudo apt install amdrocm-runtime amdrocm-runtime-dev".to_string()
+        } else {
+            "sudo apt install rocm-hip-runtime rocm-hip-dev".to_string()
+        });
+    }
+    out.push(format!("AMD's install guide: {ROCM_INSTALL_DOCS}"));
+    out
+}
+
+/// True when this machine uses ROCm's split-tree packaging (`/opt/rocm/core-*`).
+///
+/// ROCm 7.14 renamed every Debian package: `rocm-hip-runtime` and
+/// `rocm-hip-dev` became `amdrocm-runtime` and `amdrocm-runtime-dev`, and the
+/// old names no longer resolve at all. The split tree is created *by* that
+/// packaging, so its presence identifies the family. This is deliberately a
+/// machine-level probe rather than a property of the selected root — on such an
+/// install `/opt/rocm` itself is a shim that a user may still have selected,
+/// and the package names they need are the same either way.
+fn uses_split_tree_packaging() -> bool {
+    !versioned_siblings(Path::new("/opt/rocm"), "core-").is_empty()
+}
+
+/// Prerequisites missing from `root`, beyond the device compiler.
+///
+/// A root can carry `bin/hipcc` and still be unusable: on ROCm 7.14 the
+/// compiler (`amdrocm-llvm7.14`) is a separate package from the HIP headers
+/// (`amdrocm-runtime-dev7.14`) and the HIP runtime (`amdrocm-runtime7.14`).
+/// Installing only the first leaves `hipcc --version` working while every
+/// kernel compile fails on `hip/hip_runtime.h` and every `dlopen` of
+/// `libamdhip64.so` fails — which is exactly what a "compiler present, nothing
+/// works" report looks like. Callers use this to say so before doing work.
+pub fn missing_components(root: &Path) -> Vec<MissingComponent> {
+    let mut out = Vec::new();
+    if !is_complete_root(root) {
+        out.push(MissingComponent {
+            what: "HIP headers (hip/hip_runtime.h)",
+            probed: root.join("include").join("hip").join("hip_runtime.h"),
+        });
+    }
+    if runtime_library(root).is_none() {
+        out.push(MissingComponent {
+            what: if cfg!(windows) {
+                "HIP runtime (amdhip64.dll)"
+            } else {
+                "HIP runtime (libamdhip64.so)"
+            },
+            probed: root
+                .join(HIP_RUNTIME_DIRS[0])
+                .join(HIP_RUNTIME_LIBRARIES[0]),
+        });
+    }
+    out
+}
+
 /// The first candidate root that is actually usable, falling back to the first
 /// that merely exists.
 ///
@@ -375,6 +507,110 @@ mod tests {
             .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
             .collect();
         assert_eq!(names, vec!["core-7.14", "core-7", "core-6.4"]);
+
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    /// The reported ROCm 7.14 failure: `amdrocm-llvm7.14` installed on its own
+    /// leaves a root with a working `hipcc` and neither the HIP headers nor the
+    /// runtime, which used to surface only as clang's bare "file not found" at
+    /// the end of a full install.
+    #[test]
+    fn a_compiler_only_root_reports_both_hip_components_missing() {
+        let tmp = std::env::temp_dir().join(format!("hipfire-rocm-parts-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let root = tmp.join("core-7.14");
+        std::fs::create_dir_all(root.join("bin")).unwrap();
+        std::fs::write(root.join("bin").join("hipcc"), b"#!/bin/sh\n").unwrap();
+
+        let missing = missing_components(&root);
+        assert_eq!(missing.len(), 2, "{missing:?}");
+        assert!(missing[0].what.contains("hip_runtime.h"));
+        assert_eq!(
+            missing[0].probed,
+            root.join("include").join("hip").join("hip_runtime.h")
+        );
+        assert!(missing[1].what.contains("HIP runtime"));
+
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    /// Guidance always says something useful, and never offers `apt` on a host
+    /// with no apt — an Arch or Windows user reads that as authoritative and is
+    /// sent somewhere that cannot work, which is worse than silence.
+    #[test]
+    fn install_guidance_always_helps_and_never_assumes_apt() {
+        let lines = install_guidance();
+        assert!(!lines.is_empty());
+        assert!(
+            lines.iter().any(|l| l.contains("rocm.docs.amd.com")),
+            "the docs link is the distro-independent answer: {lines:?}"
+        );
+
+        let apt_on_host = std::env::var_os("PATH")
+            .map(|p| std::env::split_paths(&p).any(|d| d.join("apt-get").exists()))
+            .unwrap_or(false);
+        assert_eq!(
+            lines.iter().any(|l| l.contains("apt install")),
+            apt_on_host,
+            "apt advice must appear exactly when apt exists: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_root_with_headers_and_runtime_is_not_missing_anything() {
+        let tmp = std::env::temp_dir().join(format!("hipfire-rocm-full-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let root = tmp.join("core-7.14");
+        // Build the tree through the platform constants so this test exercises
+        // the real Windows layout (bin/amdhip64.dll) when run on Windows.
+        std::fs::create_dir_all(root.join("include").join("hip")).unwrap();
+        std::fs::create_dir_all(root.join(HIP_RUNTIME_DIRS[0])).unwrap();
+        std::fs::write(root.join("include").join("hip").join("hip_runtime.h"), b"").unwrap();
+        std::fs::write(
+            root.join(HIP_RUNTIME_DIRS[0])
+                .join(HIP_RUNTIME_LIBRARIES[0]),
+            b"",
+        )
+        .unwrap();
+
+        assert!(missing_components(&root).is_empty());
+        assert!(runtime_library(&root).is_some());
+
+        // A versioned-only name still counts: Debian ships the unversioned
+        // symlink in the -dev package, which not every install carries, and the
+        // Windows HIP SDK 7.x installs amdhip64_7.dll.
+        std::fs::remove_file(
+            root.join(HIP_RUNTIME_DIRS[0])
+                .join(HIP_RUNTIME_LIBRARIES[0]),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join(HIP_RUNTIME_DIRS[0])
+                .join(HIP_RUNTIME_LIBRARIES[1]),
+            b"",
+        )
+        .unwrap();
+        assert!(runtime_library(&root).is_some());
+
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    /// Fedora/RHEL package ROCm into `/usr`, so the root resolves to `/usr`
+    /// with the runtime in `lib64` rather than `lib`. Probing only `lib` would
+    /// reject a perfectly good install and block the installer on it.
+    #[test]
+    #[cfg(not(windows))]
+    fn a_lib64_layout_is_accepted() {
+        let tmp = std::env::temp_dir().join(format!("hipfire-rocm-lib64-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("include").join("hip")).unwrap();
+        std::fs::create_dir_all(tmp.join("lib64")).unwrap();
+        std::fs::write(tmp.join("include").join("hip").join("hip_runtime.h"), b"").unwrap();
+        std::fs::write(tmp.join("lib64").join("libamdhip64.so"), b"").unwrap();
+
+        assert!(runtime_library(&tmp).is_some());
+        assert!(missing_components(&tmp).is_empty());
 
         std::fs::remove_dir_all(&tmp).unwrap();
     }
