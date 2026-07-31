@@ -361,7 +361,7 @@ if [ -n "$SELECTOR" ] && [ -n "$SELECTOR_KIND" ]; then
     validate_revision "$SELECTOR" "$SELECTOR_KIND"
 fi
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 FORWARDED_ARGS=("${ORIGINAL_ARGS[@]}")
 if [ "$ENV_REF_APPLIED" -eq 1 ]; then
