@@ -6,6 +6,7 @@ license.workspace = true
 description = "Hazard-checked HIP/public-AQL record and replay runtime"
 
 [dependencies]
+hipfire-config = { path = "../hipfire-config" }
 libloading.workspace = true
 redline-rocr = { path = "../redline-rocr" }
 sha2 = "0.10.9"

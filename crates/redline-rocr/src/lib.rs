@@ -50,18 +50,15 @@ pub use runtime::{
 
 /// Load the installed public ROCr runtime without a link-time ROCm dependency.
 pub fn load_symbols() -> Result<Arc<Symbols>, LoadError> {
-    const CANDIDATES: &[&str] = &[
-        "libhsa-runtime64.so",
-        "libhsa-runtime64.so.1",
-        "/opt/rocm/lib/libhsa-runtime64.so",
-    ];
+    let candidates =
+        hipfire_config::rocm::library_candidates(&["libhsa-runtime64.so", "libhsa-runtime64.so.1"]);
     let mut failures = Vec::new();
-    let library = CANDIDATES
+    let library = candidates
         .iter()
         .find_map(|candidate| {
             // SAFETY: loading the installed ROCr runtime is the purpose of this
             // crate. `Symbols` retains the successful library mapping.
-            match unsafe { Library::new(*candidate) } {
+            match unsafe { Library::new(candidate) } {
                 Ok(library) => Some(Arc::new(library)),
                 Err(error) => {
                     failures.push(format!("{candidate}: {error}"));
@@ -70,8 +67,15 @@ pub fn load_symbols() -> Result<Arc<Symbols>, LoadError> {
             }
         })
         .ok_or_else(|| LoadError::Library {
-            candidates: CANDIDATES.join(", "),
-            detail: failures.join("; "),
+            candidates: candidates.join(", "),
+            detail: format!(
+                "{}\n{}",
+                failures.join("; "),
+                hipfire_config::rocm::resolution_failure(
+                    "the HSA runtime (libhsa-runtime64.so)",
+                    &candidates,
+                )
+            ),
         })?;
     let keepalive: Arc<dyn Send + Sync> = library.clone();
     // SAFETY: every lookup is resolved from the public ROCr library retained by

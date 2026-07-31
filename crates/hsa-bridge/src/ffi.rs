@@ -248,8 +248,8 @@ impl HsaLib {
     /// Candidates come from `hipfire_config::rocm`, which honours
     /// `HIPFIRE_ROCM_PATH` / `ROCM_PATH` / `HIP_PATH`, derives the root from a
     /// device compiler on `PATH`, and understands versioned layouts such as
-    /// `/opt/rocm/core-7.14`. Bare sonames are tried last so a correctly
-    /// configured `LD_LIBRARY_PATH` still works. This previously hardcoded
+    /// `/opt/rocm/core-7.14`. Only one selected root is tried; version selection
+    /// is never delegated to a bare loader soname. This previously hardcoded
     /// `/opt/rocm/lib`, which fails on every non-default install.
     pub fn load() -> crate::error::HsaResult<Self> {
         let candidates = hipfire_config::rocm::library_candidates(&[
@@ -274,13 +274,14 @@ impl HsaLib {
                     return Err(crate::error::HsaError::new(
                         0,
                         &format!(
-                            "failed to dlopen libhsa-runtime64.so: {}. Tried: {}. \
-                             Is ROCm installed? Set HIPFIRE_ROCM_PATH or ROCM_PATH \
-                             if it lives outside /opt/rocm.",
+                            "failed to dlopen libhsa-runtime64.so: {}.\n{}",
                             last_err
                                 .map(|e| e.to_string())
                                 .unwrap_or_else(|| "no candidates".into()),
-                            candidates.join(", ")
+                            hipfire_config::rocm::resolution_failure(
+                                "the HSA runtime (libhsa-runtime64.so)",
+                                &candidates,
+                            )
                         ),
                     ));
                 }

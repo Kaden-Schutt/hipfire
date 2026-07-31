@@ -4,12 +4,41 @@ Audience: first install on an AMD GPU host. Goal: install → verify → pull a 
 
 ## Prerequisites
 
-- **Linux:** AMD GPU with `/dev/kfd`, HIP runtime (`libamdhip64.so`). RDNA4 (`gfx1200`/`gfx1201`) needs HIP/ROCm **6.4+**. Strix Halo / gfx115x needs **7.2+**.
+- **Linux:** AMD GPU with `/dev/kfd` plus a ROCm HIP development stack.
+  hipfire JIT-compiles kernels, so a runtime-only install is insufficient: the
+  selected ROCm root must provide `lib/libamdhip64.so` (and
+  `libhsa-runtime64.so`), `include/hip/hip_runtime.h`, and `bin/hipcc`.
+  Install a supported AMD ROCm HIP runtime, development headers, and device
+  compiler via
+  [AMD's live install selector](https://rocm.docs.amd.com/en/latest/install/rocm.html)
+  (choose packages for your GPU, OS, and ROCm version — package names drift;
+  the selector is authoritative).
+- **Supported ROCm range:** Linux with **ROCm 6 or newer** (project baseline from
+  [README.md](../README.md)). **ROCm 6.4+** for RDNA4 (`gfx1200`/`gfx1201`);
+  **ROCm 7.2+** for Strix Halo / gfx115x. hipfire's path resolver does not
+  hardcode a required release — install a supported stack for your GPU.
 - **Windows:** [AMD HIP SDK](https://www.amd.com/en/developer/resources/rocm-hub/hip-sdk.html) (`hipcc` + `amdhip64.dll`).
 - **WSL2:** install AMD WSL GPU support first (`sudo amdgpu-install --usecase=wsl`), then use the Linux installer inside the distro.
 - Disk space for models under `~/.hipfire/models/` (a few GB for small tags; tens of GB for 27B+).
 
 Live model tags, VRAM floors, and formats: [MODELS.md](MODELS.md). Full env list: [env-vars.md](env-vars.md).
+
+For a non-default or side-by-side install, pin one coherent SDK root before
+starting hipfire:
+
+```bash
+export HIPFIRE_ROCM_PATH=/absolute/path/to/rocm
+# If HIPFIRE_ROCM_PATH is unset, ROCM_PATH then HIP_PATH are accepted:
+# export ROCM_PATH=/absolute/path/to/rocm
+# export HIP_PATH=/absolute/path/to/rocm   # or .../hip (normalized to the parent)
+```
+
+Priority is `HIPFIRE_ROCM_PATH` > `ROCM_PATH` > `HIP_PATH`. An explicit override
+is authoritative: once a root is selected, HIP/HSA libraries, headers, and
+`hipcc` stay in that root family — hipfire will not fall back to another install
+or a bare soname. If several complete roots are equally eligible (for example
+multiple `/opt/rocm-*` with no active `/opt/rocm`), discovery refuses to guess;
+set `HIPFIRE_ROCM_PATH` to one absolute root.
 
 ## Install
 

@@ -391,21 +391,13 @@ impl KernelCompiler {
         // Probe for hipcc once at init, not per-kernel. Capture its version line
         // as a toolchain fingerprint for the cache hash (Fix #1).
         //
-        // PATH stays authoritative so an explicit `module load` / PATH choice
-        // still wins. The resolved-root fallback is strictly additive: it only
-        // engages when PATH has no hipcc at all, which is the common
-        // "ROCm installed under /opt/rocm/core-<ver> but not on PATH" case that
-        // previously degraded silently to has_hipcc=false.
-        let hipcc_bin: std::path::PathBuf = if Command::new("hipcc")
-            .arg("--version")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-        {
-            "hipcc".into()
-        } else {
-            hipfire_config::rocm::tool("hipcc").unwrap_or_else(|| "hipcc".into())
-        };
+        // Resolve hipcc through the same selected ROCm root as the runtime and
+        // headers. Probing a bare PATH hipcc first could pair a configured
+        // ROCM_PATH from one version with another version's compiler.
+        let resolved_hipcc = hipfire_config::rocm::tool("hipcc");
+        let hipcc_bin = resolved_hipcc
+            .clone()
+            .unwrap_or_else(|| std::path::PathBuf::from("hipcc"));
         // hipcc resolves its LLVM as $ROCM_PATH/lib/llvm/bin/clang++ and
         // ROCM_PATH defaults to /opt/rocm. On a root elsewhere the probe below
         // still succeeds while every real compile fails, so hand the child the
@@ -433,6 +425,8 @@ impl KernelCompiler {
                 "  HIPFIRE_NO_DEVICE_COMPILER set — treating the device compiler as absent; \
                  pre-compiled blobs will be used verbatim"
             );
+            None
+        } else if resolved_hipcc.is_none() {
             None
         } else {
             let mut probe = Command::new(&hipcc_bin);
@@ -538,6 +532,16 @@ impl KernelCompiler {
             .filter(|d| !same_path(d, self.cache_dir.as_path()))
     }
 
+    fn compiler_unavailable_error(&self, name: &str, action: &str) -> hip_bridge::HipError {
+        let tried = vec![self.hipcc_bin.display().to_string()];
+        let guidance =
+            hipfire_config::rocm::resolution_failure("the ROCm HIP compiler (hipcc)", &tried);
+        hip_bridge::HipError::new(
+            0,
+            &format!("{name}: {action}, but hipcc is unavailable.\n{guidance}"),
+        )
+    }
+
     /// Compile a HIP kernel source string. Returns path to .hsaco file.
     /// Tries pre-compiled blob first (with hash validation), falls back to hipcc.
     pub fn compile(&mut self, name: &str, source: &str) -> HipResult<&Path> {
@@ -607,10 +611,9 @@ impl KernelCompiler {
                 self.compiled.insert(name.to_string(), obj_path);
                 return Ok(&self.compiled[name]);
             }
-            return Err(hip_bridge::HipError::new(
-                0,
-                &format!("{name}: no usable cached kernel image and hipcc unavailable to compile"),
-            ));
+            return Err(
+                self.compiler_unavailable_error(name, "no usable cached kernel image exists")
+            );
         }
 
         Self::hipcc_compile_publish(
@@ -645,9 +648,9 @@ impl KernelCompiler {
     /// hipcc leaves prior durable pairs intact.
     pub(crate) fn recompile(&mut self, name: &str, source: &str) -> HipResult<PathBuf> {
         if !self.has_hipcc {
-            return Err(hip_bridge::HipError::new(
-                0,
-                &format!("{name}: cached kernel image invalid and hipcc unavailable to recompile"),
+            return Err(self.compiler_unavailable_error(
+                name,
+                "the cached kernel image is invalid and must be recompiled",
             ));
         }
 
@@ -775,12 +778,9 @@ impl KernelCompiler {
         // fails with "file not found". Add well-known candidates as -I flags;
         // existence-checked so wrong paths on other distros don't leak in.
         //
-        // Candidates come from the centralised resolver rather than a bare
-        // HIP_PATH read: installs that keep the real tree in
-        // `/opt/rocm/core-<ver>` leave `/opt/rocm` a shim with no `include/`,
-        // so both of the previously hardcoded candidates miss and NO -I was
-        // emitted at all. `rocm::roots()` enumerates the versioned siblings in
-        // priority order, and the existence check below still gates each one.
+        // The include path comes from the same selected root as hipcc and the
+        // runtime. Do not separately prepend ambient HIP_PATH or /opt/rocm:
+        // either could belong to another side-by-side ROCm version.
         //
         // Tell the device compiler where ROCm is rather than relying on its
         // self-relative probe. That probe needs marker files (`bin/.hipVersion`
@@ -791,22 +791,17 @@ impl KernelCompiler {
         // complete root is passed, so a shim directory can never be handed to
         // clang as authoritative; on a conventional install this resolves to
         // the same path clang would have found by itself.
-        if let Some(root) = hipfire_config::rocm::root() {
+        let selected_root = hipfire_config::rocm::root();
+        if let Some(root) = selected_root.as_ref() {
             if hipfire_config::rocm::is_complete_root(&root) {
                 let root = root.to_string_lossy();
                 passthrough.push(format!("--rocm-path={root}"));
                 passthrough.push(format!("--hip-path={root}"));
             }
         }
-        let mut candidates: Vec<String> = hipfire_config::rocm::roots()
-            .iter()
-            .map(|root| root.join("include").to_string_lossy().into_owned())
-            .collect();
-        if let Ok(hip_path) = std::env::var("HIP_PATH") {
-            candidates.insert(0, format!("{hip_path}/include"));
-        }
-        candidates.push("/opt/rocm/include".to_string());
-        for candidate in candidates {
+        if let Some(candidate) =
+            selected_root.map(|root| root.join("include").to_string_lossy().into_owned())
+        {
             if Path::new(&candidate).join("hip/hip_runtime.h").exists() {
                 // Windows hipcc (hipcc.bat) re-tokenises its argv on the inner
                 // clang.exe command line WITHOUT preserving quoting around
@@ -817,7 +812,6 @@ impl KernelCompiler {
                 // Reported in #82.
                 let resolved = Self::win_short_path_if_needed(&candidate);
                 passthrough.push(format!("-I{resolved}"));
-                break;
             }
         }
         for flag in extra_flags.split_whitespace() {
@@ -865,9 +859,15 @@ impl KernelCompiler {
         if let Some(root) = rocm_env_root {
             cmd.env("ROCM_PATH", root);
         }
-        let output = cmd
-            .output()
-            .map_err(|e| hip_bridge::HipError::new(0, &format!("failed to run hipcc: {e}")))?;
+        let output = cmd.output().map_err(|e| {
+            let tried = vec![hipcc_bin.display().to_string()];
+            let guidance =
+                hipfire_config::rocm::resolution_failure("the ROCm HIP compiler (hipcc)", &tried);
+            hip_bridge::HipError::new(
+                0,
+                &format!("failed to run {}: {e}\n{guidance}", hipcc_bin.display()),
+            )
+        })?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1041,12 +1041,9 @@ impl KernelCompiler {
                     self.compiled.insert(name.to_string(), obj_path);
                     continue;
                 }
-                return Err(hip_bridge::HipError::new(
-                    0,
-                    &format!(
-                        "{name}: no usable cached kernel image and hipcc unavailable to compile"
-                    ),
-                ));
+                return Err(
+                    self.compiler_unavailable_error(name, "no usable cached kernel image exists")
+                );
             }
 
             to_compile.push((name.to_string(), source.to_string(), src_hash, module_flags));

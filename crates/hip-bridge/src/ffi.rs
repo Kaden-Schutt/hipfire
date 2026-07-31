@@ -339,59 +339,16 @@ macro_rules! load_optional_fn {
 
 impl HipRuntime {
     /// Load the HIP runtime via dlopen.
-    /// Searches standard paths: /opt/rocm/lib, system library path.
+    /// Uses the shared ROCm resolver so runtime, headers, and hipcc stay within
+    /// one selected installation.
     pub fn load() -> HipResult<Self> {
-        #[cfg(target_os = "windows")]
+        // Windows and Unix share one candidate policy in hipfire_config::rocm so a
+        // selected/configured root never falls through to another install's DLL
+        // (user cache or bare PATH names). HIP_RUNTIME_LIBRARIES already encodes
+        // the host's preferred filenames (amdhip64*.dll vs libamdhip64.so*).
+        let candidates =
+            hipfire_config::rocm::library_candidates(hipfire_config::rocm::HIP_RUNTIME_LIBRARIES);
         let lib = unsafe {
-            let userprofile = std::env::var("USERPROFILE").unwrap_or_default();
-            let hip_path = std::env::var("HIP_PATH").unwrap_or_default();
-            let p1 = format!(r"{userprofile}\.hipfire\runtime\amdhip64.dll");
-            let p2 = format!(r"{hip_path}\bin\amdhip64.dll");
-            // Try unversioned first, then versioned names (HIP SDK 7.x installs amdhip64_7.dll)
-            Library::new(&p1)
-                .or_else(|_| Library::new(&p2))
-                .or_else(|_| Library::new("amdhip64.dll"))
-                .or_else(|_| Library::new("amdhip64_7.dll"))
-                .or_else(|_| Library::new("amdhip64_6.dll"))
-                .or_else(|_| {
-                    // Try versioned names in explicit paths (runtime dir + HIP_PATH)
-                    let rt = format!(r"{userprofile}\.hipfire\runtime");
-                    let hp = format!(r"{hip_path}\bin");
-                    Library::new(&format!(r"{rt}\amdhip64_7.dll"))
-                        .or_else(|_| Library::new(&format!(r"{rt}\amdhip64_6.dll")))
-                        .or_else(|_| Library::new(&format!(r"{hp}\amdhip64_7.dll")))
-                        .or_else(|_| Library::new(&format!(r"{hp}\amdhip64_6.dll")))
-                })
-                .map_err(|e| {
-                    HipError::new(
-                        0,
-                        &format!(
-                            "failed to load amdhip64.dll: {e}. \
-                             Searched: {p1}, {p2}, amdhip64.dll, amdhip64_7.dll, amdhip64_6.dll (PATH). \
-                             Is ROCm/HIP installed?"
-                        ),
-                    )
-                })?
-        };
-
-        #[cfg(not(target_os = "windows"))]
-        let lib = unsafe {
-            // Unversioned first (canonical with rocm-hip-devel symlink), then
-            // versioned SONAMEs. Fedora's `rocm-hip` package ships only
-            // `libamdhip64.so.6` — the unversioned `.so` symlink is in the
-            // `-devel` package which most users don't have. Reported in #64.
-            //
-            // Resolution used to be loader-only here, which silently required
-            // LD_LIBRARY_PATH/ldconfig to already point at ROCm and broke on
-            // side-by-side and /opt/rocm/core-<ver> layouts. hipfire_config::rocm
-            // prepends explicitly resolved roots and keeps the bare sonames last
-            // so a correctly configured loader path still wins nothing away.
-            let candidates = hipfire_config::rocm::library_candidates(&[
-                "libamdhip64.so",
-                "libamdhip64.so.7",
-                "libamdhip64.so.6",
-                "libamdhip64.so.5",
-            ]);
             let mut loaded = None;
             let mut last_err = None;
             for candidate in &candidates {
@@ -406,16 +363,24 @@ impl HipRuntime {
             match loaded {
                 Some(l) => l,
                 None => {
+                    let runtime_label = if cfg!(target_os = "windows") {
+                        "the HIP runtime (amdhip64.dll)"
+                    } else {
+                        "the HIP runtime (libamdhip64.so)"
+                    };
+                    let short_name = if cfg!(target_os = "windows") {
+                        "amdhip64.dll"
+                    } else {
+                        "libamdhip64.so"
+                    };
                     return Err(HipError::new(
                         0,
                         &format!(
-                            "failed to dlopen libamdhip64.so: {}. Tried: {}. \
-                             Is ROCm installed? Set HIPFIRE_ROCM_PATH or ROCM_PATH \
-                             if it lives outside /opt/rocm.",
+                            "failed to load {short_name}: {}.\n{}",
                             last_err
                                 .map(|e| e.to_string())
                                 .unwrap_or_else(|| "no candidates".into()),
-                            candidates.join(", ")
+                            hipfire_config::rocm::resolution_failure(runtime_label, &candidates)
                         ),
                     ));
                 }
