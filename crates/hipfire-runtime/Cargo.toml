@@ -57,6 +57,12 @@ arch-dots-ocr = []
 # and the synthetic-error branches OUT, so HIPFIRE_EP_FAIL_RANK has no effect.
 # Build the GPU cleanup test with `--features deltanet,ep-fault-inject`.
 ep-fault-inject = []
+# serve-fault-inject: test-only GPU fault injection + test_state_snapshot for
+# serve-hardening retry parity. NOT in the default set: production builds
+# compile the generate field, one-shot after-prefill hooks, and snapshot
+# command OUT. Build the GPU parity harness daemon with
+# `--features deltanet,serve-fault-inject`.
+serve-fault-inject = []
 [dependencies]
 hip-bridge = { path = "../hip-bridge" }
 hipfire-config = { path = "../hipfire-config" }

@@ -45,9 +45,11 @@ pub mod model_load;
 pub mod model_source;
 pub mod multi_gpu;
 pub mod paro;
+pub mod reset_core;
 pub mod safetensors_source;
 pub mod sampler;
 pub mod spec;
+
 pub mod spec_ngram;
 pub mod tp_shard;
 #[cfg(feature = "deltanet")]
@@ -58,7 +60,9 @@ pub mod weight_pager;
 pub mod emit_text;
 pub mod eos_filter;
 pub mod prompt_frame;
+pub mod semantic;
 pub mod tokenizer;
+
 pub mod tool_call;
 pub mod weight_backend;
 
