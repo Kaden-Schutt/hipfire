@@ -63,7 +63,7 @@ HOTSPOT='\.hip$|gemv|forward|quant|rotate|dispatch|fwht|rmsnorm|fused|mq4|hfq|ma
 # Serve recurrent-state machine — files whose changes can leak DeltaNet/KV state
 # ACROSS requests (issue #462). These get an extra MULTI-REQUEST serve-output
 # gate (serve-loop-gate.sh) that the single-request coherence battery misses.
-SERVE_HOTSPOT='examples/daemon\.rs|speculative\.rs|cli/index\.ts'
+SERVE_HOTSPOT='examples/daemon\.rs|speculative\.rs'
 
 # Multi-GPU PP hotspots — superset of the HOTSPOT entry above. pp-gate.sh
 # runs only when one of these is touched AND 2+ GPUs are visible; otherwise

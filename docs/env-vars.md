@@ -106,6 +106,8 @@ Values and defaults below match `hipfire-config`, the native CLI, and/or `Runtim
 |---|---|---|
 | `HIPFIRE_SPECULATION` | `off`/`auto`/`ngram`/`dflash`/`mtp`/`dspark` | Canonical selector |
 | `HIPFIRE_DFLASH_DRAFT` | retired engine read | Still appears in legacy gate scripts; product draft discovery uses typed speculation/load policy and registry/filename matching. |
+| `HIPFIRE_DFLASH_CTX_CAP` | **8192**; `0` restores uncapped legacy behavior | Caps draft-side context storage; over-cap requests fall back to AR |
+| `HIPFIRE_DFLASH_WINDOW` | **0 / unset** (legacy), unless declared by draft metadata | Enables bounded draft SWA; refused with CASK eviction |
 | `HIPFIRE_DFLASH_MODE` | RuntimeConfig default **`off`** | Distinct from config `dflash_mode` apply path — product CLI also uses load params |
 | `HIPFIRE_DFLASH_NGRAM_BLOCK` | set/clear from config | |
 | `HIPFIRE_DFLASH_CKPT_RESUME` / `HIPFIRE_CACHE_CKPT_*` | checkpointing | Qwen DFlash path |
@@ -431,6 +433,7 @@ Copyable user, developer, and retained-PM4 TOML profiles are in
 | `HIPFIRE_DEVICES` | crates/hipfire-runtime/src/config.rs, crates/hipfire-runtime/src/multi_gpu.rs |
 | `HIPFIRE_DFLASH_CHAT` | crates/hipfire-runtime/examples/daemon.rs |
 | `HIPFIRE_DFLASH_CKPT_RESUME` | crates/hipfire-arch-qwen35/src/dflash_spec.rs, crates/hipfire-runtime/examples/daemon.rs |
+| `HIPFIRE_DFLASH_CTX_CAP` | crates/hipfire-arch-qwen35/src/dflash_spec.rs, crates/hipfire-runtime/examples/daemon.rs |
 | `HIPFIRE_DFLASH_DRAFT` | crates/hipfire-runtime/src/config.rs, scripts/coherence-gate-dflash.sh |
 | `HIPFIRE_DFLASH_FAST_SAMPLE` | crates/hipfire-arch-qwen35/src/speculative.rs, crates/hipfire-runtime/examples/daemon.rs |
 | `HIPFIRE_DFLASH_LOGIT_DUMP` | crates/hipfire-arch-qwen35/src/speculative.rs |
@@ -452,6 +455,7 @@ Copyable user, developer, and retained-PM4 TOML profiles are in
 | `HIPFIRE_DFLASH_TARGET` | scripts/coherence-gate-dflash.sh |
 | `HIPFIRE_DFLASH_TEMP_SPEC` | crates/hipfire-runtime/examples/daemon.rs |
 | `HIPFIRE_DFLASH_TREE` | crates/hipfire-runtime/src/dflash_generic.rs, crates/rdna-compute/src/feature_flags.rs |
+| `HIPFIRE_DFLASH_WINDOW` | crates/hipfire-arch-qwen35/src/dflash_spec.rs, crates/hipfire-runtime/examples/dflash_spec_demo.rs, crates/hipfire-runtime/src/dflash.rs |
 | `HIPFIRE_DFLASH_ZLAB_SAFETENSORS` | scripts/dflash_spec_debug.py |
 | `HIPFIRE_DIR` | scripts/ab-dispatch-validation.sh, scripts/agentic-gate-jinja-tools.sh |
 | `HIPFIRE_DIVERGENCE_PREFILL` | scripts/gfx906_logit_divergence.sh |

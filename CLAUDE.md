@@ -45,6 +45,15 @@ and cached as `.hsaco` per GPU arch.
   expert pruning), hipfire-tui (chat/settings TUI), redline (experimental
   direct-KMD compute, not wired into serving).
 
+
+### PFlash status
+
+PFlash is retained legacy research, not mainline or production functionality.
+Prefix caching supersedes it for supported serving workloads. Its remaining
+code and artifacts exist only for historical reference and reproduction; do
+not treat PFlash as a production element, recommendation, acceptance route, or
+basis for a current performance claim.
+
 ## Building, testing & gates
 
 ```
@@ -404,7 +413,7 @@ who doesn't have the file.
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence
 
-This project is indexed by GitNexus as **hipfire** (27946 symbols, 86669 relationships, 264 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
+This project is indexed by GitNexus as **hipfire** (31703 symbols, 108481 relationships, 275 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
 
 > Index stale? Run `node .gitnexus/run.cjs analyze` from the project root — it auto-selects an available runner. No `.gitnexus/run.cjs` yet? `npx gitnexus analyze` (npm 11 crash → `npm i -g gitnexus`; #1939).
 

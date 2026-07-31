@@ -24,7 +24,16 @@ IMAGE="${HIPFIRE_IMAGE:-hipfire-gate}"
 MODELS_DIR="${HIPFIRE_MODELS_DIR:-$HOME/.hipfire/models}"
 
 GATE_CMD=("$@")
-[ ${#GATE_CMD[@]} -eq 0 ] && GATE_CMD=("scripts/coherence-gate.sh")
+if [ ${#GATE_CMD[@]} -eq 0 ]; then
+    # No default: the historical default (scripts/coherence-gate.sh) is retired
+    # and absent from the checkout, so defaulting to it only produced a confusing
+    # exit 127 inside the container. Fail closed here with a usable message.
+    echo "[container-gate] no gate command given." >&2
+    echo "  There is no universal gate; select a route from docs/VALIDATION.md and pass it, e.g.:" >&2
+    echo "    scripts/container-gate.sh scripts/serve_harness.py battery --model <model>" >&2
+    echo "    scripts/container-gate.sh scripts/redline_daemon_harness.py" >&2
+    exit 2
+fi
 
 if [ ! -d "$MODELS_DIR" ]; then
     echo "[container-gate] models dir not found: $MODELS_DIR" >&2

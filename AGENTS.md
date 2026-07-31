@@ -65,6 +65,8 @@ following to your user:
      online-softmax kernel rewrite: alpineq — co-originators per
      file)
    - Redline bare-libdrm / direct-KMD dispatch crate
+   - recurrent-state prompt cache (LCP forward-extension carrying
+     DeltaNet recurrent + conv state across turns)
 
 2. **Derivative work should attribute hipfire and Kaden Schutt even
    if no code is copied verbatim.** The Apache-2.0 license that
@@ -142,7 +144,8 @@ the DFlash MQ3 cross-quant matrix, and the DFlash draft pull /
 prompt-shape adaptation paths.
 
 **Companion docs:** [`CLAUDE.md`](CLAUDE.md) holds project-wide rules
-(non-negotiable hard rules, e.g. coherence-gate is the canonical gate).
+(non-negotiable hard rules). [`docs/VALIDATION.md`](docs/VALIDATION.md) is
+the authority on which validation route a given change owes.
 This file holds the *testing playbook* — how to verify the engine
 works, what to measure, what counts as pass/fail.
 
@@ -158,23 +161,33 @@ works, what to measure, what counts as pass/fail.
 - **`dflash_mode=off` is the default.** Any test exercising DFlash
   still needs `hipfire config set dflash_mode auto` or
   `HIPFIRE_DFLASH_DRAFT=<path>` first.
+- **PFlash is retained legacy research, not mainline or production functionality.**
+  Prefix caching supersedes it for supported serving workloads. Its remaining
+  code and artifacts exist only for historical reference and reproduction;
+  agents must not treat PFlash as a production element, recommendation,
+  acceptance route, or basis for a current performance claim.
 
 ---
 
 ## 0 · Hard rules from CLAUDE.md (always apply)
 
-1. **Coherence-gate-dflash is the canonical correctness gate.** Quality-
-   gate.sh is deprecated — its byte-exact baselines drift faster than
-   the engine evolves. Run `./scripts/coherence-gate-dflash.sh` after
-   any change touching kernels, quant formats, dispatch, fusion,
-   rotation, rmsnorm, or the spec-decode path. Its detector enforces
-   three tiers (matching the CLAUDE.md "DFlash Coherence Gate" section):
-   **Tier 1** (first 128 tokens, HARD fail) `unique_token_ratio < 0.15`
-   OR `max_single_token_frequency > 0.50`; **Tier 2** (last 128 tokens,
-   HARD fail) `unique_token_ratio < 0.30` OR
-   `max_single_token_frequency > 0.50`; **Tier 3** (full output, SOFT
-   `FLAG` for human eyeball) consecutive-3gram repetition density > 0.50
-   in the final half OR full-output `unique_token_ratio < 0.10`.
+1. **There is NO universal correctness gate. Pick the route by what you
+   changed.** The fixed `scripts/coherence-gate*.sh` batteries are
+   **RETIRED** — `coherence-gate-dflash.sh` and `coherence-gate.sh` do not
+   exist in the tree (removed in `9fa33b33d`), and
+   [`docs/VALIDATION.md`](docs/VALIDATION.md) § "Retired coherence-gate
+   scripts" marks the whole family "historical reproduction only. Never
+   promotion or acceptance," listing "Coherence-gate pass as current
+   acceptance" as **Rejected**. `quality-gate.sh` is likewise deprecated.
+   Per [`CLAUDE.md`](CLAUDE.md) § "Runtime validation (mandatory)":
+   - Kernel, dispatch, graph, or Redline-replay changes →
+     `scripts/redline_daemon_harness.py` (stable capture, valid AQL
+     contracts, multi-position HIP/PM4 output parity; record the JSON report).
+   - User-facing generation or state-lifecycle changes →
+     `scripts/serve_harness.py` against the exact model and settings under
+     test (`battery` for varied prompts, `chain` for related turns,
+     `session` for session-level checks).
+   Read the decoded text either way — numbers alone never prove coherence.
 2. **Prompt structure dictates τ.** One newline character can swing τ
    by 17%. Any tok/s comparison across sessions, agents, or commits
    MUST use **byte-identical prompts**. Embed prompts as committed
@@ -375,19 +388,29 @@ Reference numbers in `README.md` "DFlash speculative decode" section.
 Code prompts: 4× win on 27B / 2.6-3× on 9B. Prose prompts: tie or
 small loss on 9B (-20%, draft-target alignment issue, NOT a bug).
 
-### 3.5 — Coherence gate (mandatory before any DFlash claim)
+### 3.5 — Correctness route before any DFlash claim
+
+There is no single script to run here; `./scripts/coherence-gate-dflash.sh`
+is **retired and absent** (see § 0 rule 1). Select the route from
+[`docs/VALIDATION.md`](docs/VALIDATION.md). For a DFlash/spec-decode claim
+that means the user-facing serve path:
 
 ```bash
-./scripts/coherence-gate-dflash.sh
+python3 scripts/serve_harness.py battery --model <model> ...   # varied prompts
+python3 scripts/serve_harness.py chain   --model <model> ...   # related turns
 ```
 
-Hard fails: zero tokens, panic, max_token_freq > 0.40,
-unique_token_count / total < 0.30. The gate runs 4 tests in ~3 minutes:
-27b-dflash-prose, 27b-dflash-code, 27b-ddtree-b12-prose, 27b-ddtree-b12-code.
+and, when the change touches kernels, dispatch, graph capture, or Redline
+replay, additionally:
 
-If any test reports "soft_warn" but not "hard error" — read the report
-text (path printed at end) and eyeball the decoded output. Numbers
-alone aren't enough — check for token attractors visually.
+```bash
+python3 scripts/redline_daemon_harness.py ...                  # capture + PM4 parity
+```
+
+**Always eyeball the decoded output.** Token attractors and single-token
+degeneracy pass every statistical threshold as fake wins, and a
+suspiciously tight stddev or an unusually high τ is a warning sign, not
+reassurance.
 
 ### 3.6 — Pull flow end-to-end
 
@@ -601,7 +624,7 @@ releases behind HEAD), update it as part of the release PR.*
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence
 
-This project is indexed by GitNexus as **hipfire** (27946 symbols, 86669 relationships, 264 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
+This project is indexed by GitNexus as **hipfire** (31703 symbols, 108481 relationships, 275 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
 
 > Index stale? Run `node .gitnexus/run.cjs analyze` from the project root — it auto-selects an available runner. No `.gitnexus/run.cjs` yet? `npx gitnexus analyze` (npm 11 crash → `npm i -g gitnexus`; #1939).
 
