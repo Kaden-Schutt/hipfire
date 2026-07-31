@@ -7,6 +7,7 @@ pub mod fp8;
 pub mod fwht;
 pub mod gptq;
 pub mod hessian_io;
-pub mod mq4n;
+pub mod lloyd1d;
+pub mod mqn;
 pub mod safetensors_file;
 pub mod scale_fit;

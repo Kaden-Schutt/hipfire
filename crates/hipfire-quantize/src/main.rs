@@ -191,6 +191,13 @@ struct QuantizeArgs {
     /// search landed, or to A/B its quality effect.
     #[arg(long)]
     no_mq4_scale_search: bool,
+
+    /// Fit MQ*-Lloyd per-block codebooks with the exact optimal 1-D k-means
+    /// instead of 8 Lloyd iterations. Same bytes, same wire format; worth
+    /// +0.70 dB at 3-bit. OFF by default pending a real-model coherence run —
+    /// see the iteration-cap history on `quantize_mq2g256_lloyd`.
+    #[arg(long)]
+    lloyd_optimal: bool,
 }
 
 /// Refuse an `--arch-id` override that strips a qwen3* model (auto-detected
@@ -2884,7 +2891,28 @@ pub(crate) fn quantize_mq3g256_lloyd(f32_data: &[f32], signs1: &[f32], signs2: &
 
             let range = sorted[255] - sorted[0];
             let mut indices = [0u8; 256];
-            if range > 0.0 {
+            if range > 0.0 && hipfire_quantize::lloyd1d::optimal_fit_enabled() {
+                // Globally optimal per-block levels. Lloyd's is coordinate
+                // descent to a LOCAL minimum; in 1-D the global optimum is
+                // computable exactly by DP. Worth +0.70 dB at 3-bit over the
+                // 8-iteration fit at identical bytes and wire format, and
+                // running Lloyd to convergence recovers only 39% of that.
+                let lv = hipfire_quantize::lloyd1d::optimal_levels(&group, 8);
+                cb.copy_from_slice(&lv);
+                for i in 0..256 {
+                    let w = group[i];
+                    let mut best = 0usize;
+                    let mut best_d = (w - cb[0]).abs();
+                    for k in 1..8 {
+                        let d = (w - cb[k]).abs();
+                        if d < best_d {
+                            best_d = d;
+                            best = k;
+                        }
+                    }
+                    indices[i] = best as u8;
+                }
+            } else if range > 0.0 {
                 let max_iter = 8;
                 let mut prev_assignments = [0u8; 256];
                 for it in 0..max_iter {
@@ -3702,7 +3730,27 @@ pub(crate) fn quantize_mq2g256_lloyd(f32_data: &[f32], signs1: &[f32], signs2: &
 
             let range = sorted[255] - sorted[0];
             let mut indices = [0u8; 256];
-            if range > 0.0 {
+            if range > 0.0 && hipfire_quantize::lloyd1d::optimal_fit_enabled() {
+                // See the 3-bit sibling above. At 2-bit the shipped fit is
+                // already within 0.045 dB of this global optimum, so the gain
+                // here is marginal — MQ2-Lloyd's fitter is not where its
+                // remaining error lives.
+                let lv = hipfire_quantize::lloyd1d::optimal_levels(&group, 4);
+                cb.copy_from_slice(&lv);
+                for i in 0..256 {
+                    let w = group[i];
+                    let mut best = 0usize;
+                    let mut best_d = (w - cb[0]).abs();
+                    for k in 1..4 {
+                        let d = (w - cb[k]).abs();
+                        if d < best_d {
+                            best_d = d;
+                            best = k;
+                        }
+                    }
+                    indices[i] = best as u8;
+                }
+            } else if range > 0.0 {
                 // Lloyd's iterations — cap at 8 (REVERTED from 16 on 2026-05-20).
                 //
                 // History: f8cd234 (2026-05-19) bumped 8 → 16 based on the
@@ -6287,6 +6335,11 @@ fn main() {
     if args.no_mq4_scale_search {
         set_mq4_scale_search(false);
         eprintln!("MQ4 scale fit: legacy min/max (--no-mq4-scale-search)");
+    }
+
+    if args.lloyd_optimal {
+        hipfire_quantize::lloyd1d::set_optimal_fit(true);
+        eprintln!("MQ*-Lloyd fit: exact optimal 1-D k-means (--lloyd-optimal)");
     }
 
     // Bound rayon's pool to 80% of cores (default cap; override with --threads N

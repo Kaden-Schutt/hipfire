@@ -14,7 +14,7 @@
 
 use hipfire_quantize::float16::{bf16_to_f32, f16_to_f32};
 use hipfire_quantize::fwht::{fwht_256, gen_signs};
-use hipfire_quantize::mq4n;
+use hipfire_quantize::mqn::{self, Spec};
 use hipfire_quantize::safetensors_file::SafetensorsFile;
 use std::path::Path;
 
