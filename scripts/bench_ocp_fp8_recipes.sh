@@ -37,10 +37,13 @@ INNER="${INNER:-4}"
 COOLDOWN_SECS="${COOLDOWN_SECS:-5}"
 OUT="${OUT:-}"
 
-if [[ ! "$ARCH" =~ ^gfx(11|12)[0-9][0-9]$ ]]; then
-    echo "unsupported or undetected architecture: '$ARCH'" >&2
-    exit 2
-fi
+case "$ARCH" in
+    gfx1100|gfx1101|gfx1102|gfx1103|gfx1150|gfx1151|gfx1152|gfx1200|gfx1201) ;;
+    *)
+        echo "unsupported or undetected architecture: '$ARCH'" >&2
+        exit 2
+        ;;
+esac
 if [[ ! -x "$HIPCC" ]]; then
     echo "hipcc not found: $HIPCC" >&2
     exit 2
