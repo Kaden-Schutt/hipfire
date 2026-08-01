@@ -142,8 +142,8 @@ extern "C" __global__ void fused_gate_up_hfq4g256_wave64_dp4a(
         // dp4a: signed int8 lanes. v_dot4_i32_i8 = sum of 4 signed
         // products, accumulated.
         int sumi = 0;
-        sumi = __builtin_amdgcn_sdot4(int_a, xq_a, sumi, false);
-        sumi = __builtin_amdgcn_sdot4(int_b, xq_b, sumi, false);
+        sumi = HIPFIRE_SDOT4_CALL(int_a, xq_a, sumi, false);
+        sumi = HIPFIRE_SDOT4_CALL(int_b, xq_b, sumi, false);
 
         // Per-sub-block (d, sum_x). Read the half2 for this lane's
         // sub-block and convert.

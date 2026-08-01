@@ -160,14 +160,14 @@ extern "C" __global__ void KERNEL_NAME(
                         const int4 y_v1 = *(const int4*)&tile_y[j * Y_STRIDE + ky_start + 4];
 
                         int sumi = 0;
-                        sumi = __builtin_amdgcn_sdot4(x_v0.x, y_v0.x, sumi, false);
-                        sumi = __builtin_amdgcn_sdot4(x_v0.y, y_v0.y, sumi, false);
-                        sumi = __builtin_amdgcn_sdot4(x_v0.z, y_v0.z, sumi, false);
-                        sumi = __builtin_amdgcn_sdot4(x_v0.w, y_v0.w, sumi, false);
-                        sumi = __builtin_amdgcn_sdot4(x_v1.x, y_v1.x, sumi, false);
-                        sumi = __builtin_amdgcn_sdot4(x_v1.y, y_v1.y, sumi, false);
-                        sumi = __builtin_amdgcn_sdot4(x_v1.z, y_v1.z, sumi, false);
-                        sumi = __builtin_amdgcn_sdot4(x_v1.w, y_v1.w, sumi, false);
+                        sumi = HIPFIRE_SDOT4_CALL(x_v0.x, y_v0.x, sumi, false);
+                        sumi = HIPFIRE_SDOT4_CALL(x_v0.y, y_v0.y, sumi, false);
+                        sumi = HIPFIRE_SDOT4_CALL(x_v0.z, y_v0.z, sumi, false);
+                        sumi = HIPFIRE_SDOT4_CALL(x_v0.w, y_v0.w, sumi, false);
+                        sumi = HIPFIRE_SDOT4_CALL(x_v1.x, y_v1.x, sumi, false);
+                        sumi = HIPFIRE_SDOT4_CALL(x_v1.y, y_v1.y, sumi, false);
+                        sumi = HIPFIRE_SDOT4_CALL(x_v1.z, y_v1.z, sumi, false);
+                        sumi = HIPFIRE_SDOT4_CALL(x_v1.w, y_v1.w, sumi, false);
 
                         const float2 dm_i = x_dm[i];
                         const float2 dsf = __half22float2(ds_j);

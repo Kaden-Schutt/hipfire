@@ -99,8 +99,8 @@ extern "C" __global__ void gemv_hfq4g256(
 
         // dp4a: 2 instructions compute dot(nib[0,2,4,6], xq[0,2,4,6])
         //        + dot(nib[1,3,5,7], xq[1,3,5,7])
-        int dot_sum = __builtin_amdgcn_sdot4(nib_even, xq_even, 0, false);
-        dot_sum = __builtin_amdgcn_sdot4(nib_odd, xq_odd, dot_sum, false);
+        int dot_sum = HIPFIRE_SDOT4_CALL(nib_even, xq_even, 0, false);
+        dot_sum = HIPFIRE_SDOT4_CALL(nib_odd, xq_odd, dot_sum, false);
 
         // Rescale: dot_sum ≈ sum(nib_i * x_i) / x_scale
         float nib_dot_x = (float)dot_sum * x_scale;

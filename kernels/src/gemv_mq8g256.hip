@@ -74,8 +74,8 @@ extern "C" __global__ void gemv_mq8g256(
             int wp1 = *(const int*)(wb + w_off + 4); \
             int xp0 = *(const int*)(xb + w_off); \
             int xp1 = *(const int*)(xb + w_off + 4); \
-            int dot = __builtin_amdgcn_sdot4(wp0, xp0, 0, false); \
-            dot = __builtin_amdgcn_sdot4(wp1, xp1, dot, false); \
+            int dot = HIPFIRE_SDOT4_CALL(wp0, xp0, 0, false); \
+            dot = HIPFIRE_SDOT4_CALL(wp1, xp1, dot, false); \
             acc_var += ws * xs * (float)dot; \
         }
 
@@ -94,8 +94,8 @@ extern "C" __global__ void gemv_mq8g256(
         int wp1 = *(const int*)(wb + w_off + 4);
         int xp0 = *(const int*)(xb + w_off);
         int xp1 = *(const int*)(xb + w_off + 4);
-        int dot = __builtin_amdgcn_sdot4(wp0, xp0, 0, false);
-        dot = __builtin_amdgcn_sdot4(wp1, xp1, dot, false);
+        int dot = HIPFIRE_SDOT4_CALL(wp0, xp0, 0, false);
+        dot = HIPFIRE_SDOT4_CALL(wp1, xp1, dot, false);
         acc0 += ws * xs * (float)dot;
     }
 

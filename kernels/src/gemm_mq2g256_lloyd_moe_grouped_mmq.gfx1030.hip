@@ -162,14 +162,14 @@ extern "C" __global__ void gemm_mq2g256_lloyd_moe_grouped_mmq_gfx1030(
                     int b6 = __shfl(my_b6, src);
                     int b7 = __shfl(my_b7, src);
                     int sumi = 0;
-                    sumi = __builtin_amdgcn_sdot4(a0, b0, sumi, false);
-                    sumi = __builtin_amdgcn_sdot4(a1, b1, sumi, false);
-                    sumi = __builtin_amdgcn_sdot4(a2, b2, sumi, false);
-                    sumi = __builtin_amdgcn_sdot4(a3, b3, sumi, false);
-                    sumi = __builtin_amdgcn_sdot4(a4, b4, sumi, false);
-                    sumi = __builtin_amdgcn_sdot4(a5, b5, sumi, false);
-                    sumi = __builtin_amdgcn_sdot4(a6, b6, sumi, false);
-                    sumi = __builtin_amdgcn_sdot4(a7, b7, sumi, false);
+                    sumi = HIPFIRE_SDOT4_CALL(a0, b0, sumi, false);
+                    sumi = HIPFIRE_SDOT4_CALL(a1, b1, sumi, false);
+                    sumi = HIPFIRE_SDOT4_CALL(a2, b2, sumi, false);
+                    sumi = HIPFIRE_SDOT4_CALL(a3, b3, sumi, false);
+                    sumi = HIPFIRE_SDOT4_CALL(a4, b4, sumi, false);
+                    sumi = HIPFIRE_SDOT4_CALL(a5, b5, sumi, false);
+                    sumi = HIPFIRE_SDOT4_CALL(a6, b6, sumi, false);
+                    sumi = HIPFIRE_SDOT4_CALL(a7, b7, sumi, false);
                     acc[s] += sc * d_x * (float)sumi;
                 }
             }

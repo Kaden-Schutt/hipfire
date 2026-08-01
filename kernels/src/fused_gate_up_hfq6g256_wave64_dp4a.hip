@@ -139,8 +139,8 @@ extern "C" __global__ void fused_gate_up_hfq6g256_wave64_dp4a(
         // signed) so the multiplication is mathematically identical
         // to an unsigned 6-bit × signed int8 product.
         int sumi = 0;
-        sumi = __builtin_amdgcn_sdot4(int_a, xq_a, sumi, false);
-        sumi = __builtin_amdgcn_sdot4(int_b, xq_b, sumi, false);
+        sumi = HIPFIRE_SDOT4_CALL(int_a, xq_a, sumi, false);
+        sumi = HIPFIRE_SDOT4_CALL(int_b, xq_b, sumi, false);
 
         const half2 ds = xb->ds4[sub_in_block];
         const float2 dsf = __half22float2(ds);
