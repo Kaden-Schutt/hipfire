@@ -6804,9 +6804,15 @@ pub fn forward_prefill_batch_with_pbs_opts(
         let chunk_batch = pbs.max_batch;
         let mut chunk_start = 0usize;
         while chunk_start < n {
-            let chunk_end = (chunk_start + chunk_batch).min(n);
+            let remaining = n - chunk_start;
+            let chunk_n = next_prefill_chunk_len(remaining, chunk_batch).ok_or_else(|| {
+                hip_bridge::HipError::new(
+                    0,
+                    "forward_prefill_batch: chunk plan cannot satisfy the two-token minimum",
+                )
+            })?;
+            let chunk_end = chunk_start + chunk_n;
             let chunk = &tokens[chunk_start..chunk_end];
-            let chunk_n = chunk.len();
             // The chunk only reads the ring buffer's head/dims to place its
             // writes. We advance the head AFTER the chunk returns, here in
             // the caller, to keep the mutable borrow scope tight.
@@ -7329,6 +7335,27 @@ fn moe_ffn_batched_admissible_for_dtypes(
 /// Threshold below which batching overhead isn't worth the alloc + per-layer
 /// dispatch — single-token prefill must not take the batched path.
 const MIN_BATCH: usize = 2;
+
+/// Choose the next prefill chunk without leaving an invalid singleton tail.
+///
+/// Batched kernels require at least `MIN_BATCH` rows. When a full chunk would
+/// leave one row, move one row into the tail (for example, 257 → 255 + 2).
+#[inline]
+fn next_prefill_chunk_len(remaining: usize, max_batch: usize) -> Option<usize> {
+    if remaining < MIN_BATCH || max_batch < MIN_BATCH {
+        return None;
+    }
+    if max_batch == MIN_BATCH && remaining % MIN_BATCH != 0 {
+        return None;
+    }
+
+    let chunk = remaining.min(max_batch);
+    if remaining - chunk == 1 {
+        (chunk > MIN_BATCH).then_some(chunk - 1)
+    } else {
+        Some(chunk)
+    }
+}
 
 /// Plan scratch owned by one prefill call.
 ///
@@ -18043,6 +18070,31 @@ mod tests {
         assert_eq!(owned_prefill_scratch_plan(32, 256, false), (32, false));
         assert_eq!(owned_prefill_scratch_plan(256, 256, false), (256, false));
         assert_eq!(owned_prefill_scratch_plan(1024, 256, false), (256, false));
+    }
+
+    #[test]
+    fn prefill_chunk_plan_rebalances_singleton_tail() {
+        fn plan(mut remaining: usize, max_batch: usize) -> Vec<usize> {
+            let mut chunks = Vec::new();
+            while remaining > 0 {
+                let n = next_prefill_chunk_len(remaining, max_batch)
+                    .expect("valid partition should exist");
+                chunks.push(n);
+                remaining -= n;
+            }
+            chunks
+        }
+
+        assert_eq!(plan(256, 256), vec![256]);
+        assert_eq!(plan(257, 256), vec![255, 2]);
+        assert_eq!(plan(258, 256), vec![256, 2]);
+        assert_eq!(plan(513, 256), vec![256, 255, 2]);
+        assert_eq!(plan(129, 128), vec![127, 2]);
+    }
+
+    #[test]
+    fn prefill_chunk_plan_refuses_unpartitionable_minimum_batch() {
+        assert_eq!(next_prefill_chunk_len(3, 2), None);
     }
 
     #[test]
