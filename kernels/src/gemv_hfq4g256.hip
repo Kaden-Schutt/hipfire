@@ -170,27 +170,9 @@ extern "C" __global__ void HIPFIRE_HFQ4G256_KERNEL(
     #undef LOAD_WEIGHT_PACKED
     #undef LOAD_WEIGHT_HEADER
 
-    // Wave32 sum-reduction. The conventional five-step __shfl_down loop looks
-    // like pure ALU but lowers to five ds_bpermute_b32 (LDS hardware), each
-    // separated by a full s_wait_dscnt — five serialized LDS round-trips in
-    // the VALU-idle tail of every row. DPP row_xmask is a lane-XOR inside the
-    // 16-lane row and runs on the VALU, so only the cross-row fold needs a
-    // shuffle. row_xmask NOT row_shr: row_shr lands the sum in the LAST lane
-    // while this reads lane 0. Bit-exact with the shuffle loop (0/4096 blocks
-    // differ, worst delta 0.0) — see benchmarks/kernel-probes/wave32-reduce-dpp/.
-    // row_xmask is GFX10+, so the gfx1010 baseline this file also serves keeps
-    // working.
     float acc = (acc0 + acc1) + (acc2 + acc3);
-#define HFQ4_DPP_XMASK_ADD(x, n)                                               \
-    (x) += __builtin_bit_cast(                                                 \
-        float, __builtin_amdgcn_update_dpp(                                    \
-                   0, __builtin_bit_cast(int, (x)), 0x160 | (n), 0xF, 0xF, true))
-    HFQ4_DPP_XMASK_ADD(acc, 1);
-    HFQ4_DPP_XMASK_ADD(acc, 2);
-    HFQ4_DPP_XMASK_ADD(acc, 4);
-    HFQ4_DPP_XMASK_ADD(acc, 8);
-    acc += __shfl_xor(acc, 16);
-#undef HFQ4_DPP_XMASK_ADD
+    for (int offset = 16; offset > 0; offset >>= 1)
+        acc += __shfl_down(acc, offset);
 
     if (tid == 0) y[row] = acc;
 }
