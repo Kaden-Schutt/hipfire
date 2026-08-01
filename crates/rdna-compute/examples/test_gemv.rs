@@ -31,7 +31,7 @@ fn main() {
     let d_y = gpu.zeros(&[m], rdna_compute::DType::F32).unwrap();
 
     println!("Compiling and launching GEMV kernel ({m}x{k})...");
-    gpu.gemv_f32(&d_a, &d_x, &d_y).unwrap();
+    gpu.gemv_f32(&d_a, &d_x, &d_y, m, k).unwrap();
 
     let y_gpu = gpu.download_f32(&d_y).unwrap();
 

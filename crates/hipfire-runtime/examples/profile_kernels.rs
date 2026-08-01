@@ -33,13 +33,13 @@ fn main() {
     {
         let d_y = gpu.zeros(&[m], rdna_compute::DType::F32).unwrap();
         for _ in 0..n_warmup {
-            gpu.gemv_f32(&d_f32, &d_x, &d_y).unwrap();
+            gpu.gemv_f32(&d_f32, &d_x, &d_y, m, k).unwrap();
         }
         let start = gpu.hip.event_create().unwrap();
         let stop = gpu.hip.event_create().unwrap();
         gpu.hip.event_record(&start, None).unwrap();
         for _ in 0..n_iter {
-            gpu.gemv_f32(&d_f32, &d_x, &d_y).unwrap();
+            gpu.gemv_f32(&d_f32, &d_x, &d_y, m, k).unwrap();
         }
         gpu.hip.event_record(&stop, None).unwrap();
         gpu.hip.event_synchronize(&stop).unwrap();

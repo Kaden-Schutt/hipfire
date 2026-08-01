@@ -169,7 +169,13 @@ fn main() {
     unsafe {
         std::env::set_var("HIPFIRE_NORMALIZE_PROMPT", "0");
         std::env::set_var("HIPFIRE_GRAPH", "0");
-        std::env::set_var("HIPFIRE_KV_MODE", &args.kv_mode);
+        // `f32`/`f16` are example-only KV modes: this harness builds the
+        // unquantized cache itself via `KvCache::new_gpu` below, and neither
+        // is a member of the config's KV_MODES enum, so exporting one panics
+        // process-config validation before the first forward.
+        if !matches!(args.kv_mode.as_str(), "f32" | "f16") {
+            std::env::set_var("HIPFIRE_KV_MODE", &args.kv_mode);
+        }
         std::env::set_var("HIPFIRE_KV_V", &args.kv_v);
         // For prefill scoring, pre-allocate the PrefillBatchScratch via
         // Qwen35Scratch's HIPFIRE_PREFILL_REUSE_PBS hook so the 1175 chunk

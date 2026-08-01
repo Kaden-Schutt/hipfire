@@ -34,7 +34,7 @@ fn main() {
 
     // Warmup all
     for _ in 0..n_warmup {
-        gpu.gemv_f32(&d_f32, &d_x, &d_y1).unwrap();
+        gpu.gemv_f32(&d_f32, &d_x, &d_y1, m, k).unwrap();
         gpu.gemv_q4k(&d_q4k, &d_x, &d_y2, m, k).unwrap();
         gpu.gemv_q4f16_g64(&d_q4f16, &d_x, &d_y3, m, k).unwrap();
         gpu.gemv_q4f16_g64_wide(&d_q4f16, &d_x, &d_y4, m, k)
@@ -47,7 +47,7 @@ fn main() {
     // F32
     gpu.hip.event_record(&start, None).unwrap();
     for _ in 0..n_iter {
-        gpu.gemv_f32(&d_f32, &d_x, &d_y1).unwrap();
+        gpu.gemv_f32(&d_f32, &d_x, &d_y1, m, k).unwrap();
     }
     gpu.hip.event_record(&stop, None).unwrap();
     gpu.hip.event_synchronize(&stop).unwrap();

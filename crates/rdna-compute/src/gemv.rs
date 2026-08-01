@@ -182,14 +182,27 @@ impl Gpu {
         }
     }
 
-    /// y = A * x (matrix-vector multiply, A is [M, K], x is [K], y is [M])
-    pub fn gemv_f32(&mut self, a: &GpuTensor, x: &GpuTensor, y: &GpuTensor) -> HipResult<()> {
+    /// y = A * x (matrix-vector multiply, A is [M, K], x is [K], y is [M]).
+    ///
+    /// `m`/`k` are explicit, matching every sibling GEMV. They used to be
+    /// inferred from `a.shape`, which panicked on any 1-D weight view and
+    /// forced callers to mutate `.shape` by hand before calling (see the
+    /// DeepSeek V4 o_lora path). The dispatch layer already carries `w.m`/
+    /// `w.k`, so inference bought nothing and silently broke the F32 oracle.
+    pub fn gemv_f32(
+        &mut self,
+        a: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_kernel("gemv", kernels::GEMV_SRC, "gemv_f32")?;
         let func = &self.functions["gemv_f32"];
 
-        let m = a.shape[0] as i32;
-        let k = a.shape[1] as i32;
+        let m = m as i32;
+        let k = k as i32;
         let alpha = 1.0f32;
         let beta = 0.0f32;
 

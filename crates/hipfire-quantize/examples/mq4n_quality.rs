@@ -53,10 +53,12 @@ fn legacy_sq_err(g: &[f32; 256]) -> f64 {
 }
 
 fn mq4n_sq_err(g: &[f32; 256]) -> f64 {
-    let mut enc = [0u8; mq4n::GROUP_BYTES];
-    mq4n::encode_group(g, &mut enc);
-    let mut dec = [0.0f32; mq4n::GROUP];
-    mq4n::decode_group(&enc, &mut dec);
+    // `mq4n` was generalized to `mqn`; the MQ4N wire format is what shipped as
+    // RWQ4G256, so the group codec lives under the rwq4 names.
+    let mut enc = [0u8; mqn::RWQ4_GROUP_BYTES];
+    mqn::encode_rwq4_group(g, &mut enc);
+    let mut dec = [0.0f32; mqn::GROUP];
+    mqn::decode_rwq4_group(&enc, &mut dec);
     g.iter()
         .zip(dec.iter())
         .map(|(&a, &b)| {

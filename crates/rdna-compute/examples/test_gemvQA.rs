@@ -51,7 +51,7 @@ fn run() -> Result<String, Outcome> {
     let d_x = gpu.upload_f32(&x, &[k]).map_err(|e| Outcome::Fail(format!("upload x failed: {e}")))?;
     let d_y = gpu.zeros(&[m], rdna_compute::DType::F32).map_err(|e| Outcome::Fail(format!("alloc y failed: {e}")))?;
 
-    gpu.gemv_f32(&d_a, &d_x, &d_y).map_err(|e| Outcome::Fail(format!("gemv_f32 failed: {e}")))?;
+    gpu.gemv_f32(&d_a, &d_x, &d_y, m, k).map_err(|e| Outcome::Fail(format!("gemv_f32 failed: {e}")))?;
     let y_gpu = gpu.download_f32(&d_y).map_err(|e| Outcome::Fail(format!("download failed: {e}")))?;
 
     let mut max_err = 0.0f32;

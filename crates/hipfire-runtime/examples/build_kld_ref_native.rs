@@ -123,11 +123,13 @@ fn main() {
     let output = output.expect("--output required");
 
     // Force determinism knobs (mirror eval_hipfire).
+    // NOT HIPFIRE_KV_MODE: the oracle's F32 KV comes from the explicit
+    // `KvCache::new_gpu` below, and "f32" is not a member of the config's
+    // KV_MODES enum, so setting it panics process-config validation.
     // SAFETY: single-threaded init phase.
     unsafe {
         std::env::set_var("HIPFIRE_NORMALIZE_PROMPT", "0");
         std::env::set_var("HIPFIRE_GRAPH", "0");
-        std::env::set_var("HIPFIRE_KV_MODE", "f32");
     }
 
     // -------- load oracle model + tokenizer --------

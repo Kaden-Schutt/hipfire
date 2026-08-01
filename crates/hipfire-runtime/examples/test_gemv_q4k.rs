@@ -153,7 +153,7 @@ fn main() {
     let d_y4 = gpu.zeros(&[m], rdna_compute::DType::F32).unwrap();
     gpu.hip.event_record(&start, None).unwrap();
     for _ in 0..n_iter {
-        gpu.gemv_f32(&a_gpu, &d_x, &d_y4).unwrap();
+        gpu.gemv_f32(&a_gpu, &d_x, &d_y4, m, k).unwrap();
     }
     gpu.hip.event_record(&stop, None).unwrap();
     gpu.hip.event_synchronize(&stop).unwrap();

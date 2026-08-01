@@ -64,10 +64,10 @@ fn main() {
         let a_f32 = vec![0.01f32; m * k];
         let d_a = gpu.upload_f32(&a_f32, &[m, k]).unwrap();
         let d_y2 = gpu.zeros(&[m], rdna_compute::DType::F32).unwrap();
-        gpu.gemv_f32(&d_a, &d_x, &d_y2).unwrap(); // warmup
+        gpu.gemv_f32(&d_a, &d_x, &d_y2, m, k).unwrap(); // warmup
         gpu.hip.event_record(&start, None).unwrap();
         for _ in 0..n {
-            gpu.gemv_f32(&d_a, &d_x, &d_y2).unwrap();
+            gpu.gemv_f32(&d_a, &d_x, &d_y2, m, k).unwrap();
         }
         gpu.hip.event_record(&stop, None).unwrap();
         gpu.hip.event_synchronize(&stop).unwrap();
