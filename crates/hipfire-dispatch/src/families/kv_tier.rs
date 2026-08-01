@@ -745,7 +745,9 @@ mod tests {
     }
 
     #[test]
-    fn q8_flash_very_long_context() {
+    fn q8_non_flash_very_long_context() {
+        // flash_mode=0 never selects flash merely because pos is large;
+        // only capture / flash_mode=2 / (flash_mode=1 && long) do.
         let inputs = KvTierInputs {
             quant_q8: true,
             pos: 15000,
@@ -755,7 +757,7 @@ mod tests {
         };
         let plan = KvTierPlan::derive(inputs).unwrap();
         assert_eq!(plan.write_key, KernelKey::KvWriteQ8_0);
-        assert_eq!(plan.attend_key, KernelKey::AttnFlashQ8_0);
+        assert_eq!(plan.attend_key, KernelKey::AttnQ8_0Kv);
     }
 
     #[test]

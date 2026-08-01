@@ -122,7 +122,9 @@ extern "C" __global__ void attention_q8_0_kv(
         __syncthreads();  // protect LDS scores before Phase B reads
 
         // Phase B: V-weighted accumulation for this tile.
-        for (int t = tid; t < tile_len; t += nthreads) {
+        // Each thread owns dims d = tid + i*nthreads and must fold every
+        // position's softmax weight into its private acc (no position stride).
+        for (int t = 0; t < tile_len; t++) {
             const float w = scores[t];
             const int pos = tile_start + t;
             const int v_blk_off = kv_head_block_start * 34;
