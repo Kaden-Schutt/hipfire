@@ -432,6 +432,9 @@ struct BenchArgs {
     ctx: Vec<usize>,
     #[arg(long, default_value_t = 128)]
     tg: usize,
+    /// Generated tokens per standard-bench measurement run.
+    #[arg(long, default_value_t = 128)]
+    max_tokens: usize,
     #[arg(long)]
     sustained_tg: Option<usize>,
     #[arg(long, value_delimiter = ',', default_value = "128,8192")]
@@ -6258,6 +6261,7 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
             .unwrap_or("unknown")
     );
     eprintln!("  runs:   {}", args.runs);
+    eprintln!("  max_tokens: {}", args.max_tokens);
     if args.matrix || args.redline {
         bench_matrix(&mut engine, &args, &loaded, &post_diag)
     } else {
@@ -6267,7 +6271,7 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
         let mut wall = Vec::new();
         let mut ttft = Vec::new();
         for _ in 0..args.runs {
-            let done = bench_generate(&mut engine, &prompt, 128)?;
+            let done = bench_generate(&mut engine, &prompt, args.max_tokens as u64)?;
             if let Some(value) = done.get("decode_tok_s").and_then(serde_json::Value::as_f64) {
                 decode.push(value);
             }
@@ -6293,6 +6297,9 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
             "loaded": loaded,
             "gpu": post_diag,
             "vram_free_before_mb": pre_diag.get("vram_free_mb"),
+            "max_tokens": args.max_tokens,
+            "runs": args.runs,
+            "batch": 1,
             "decode_tok_s": sample_stats(&decode),
             "prefill_tok_s": sample_stats(&prefill),
             "wall_tok_s": sample_stats(&wall),
@@ -6605,6 +6612,7 @@ fn profile_command(paths: &Paths, args: ProfileArgs) -> Result<()> {
             pp: vec![128],
             ctx: vec![128],
             tg: 1,
+            max_tokens: 128,
             sustained_tg: None,
             sustained_ctx: vec![128],
             warmups: 1,

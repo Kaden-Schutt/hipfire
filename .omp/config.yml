@@ -1,0 +1,16 @@
+setupVersion: 1
+modelRoles:
+  default: anthropic/claude-opus-5:high
+  conductor: anthropic/claude-opus-5:high
+  foreman: anthropic/claude-sonnet-5:high
+  shepherd: openai-codex/gpt-5.6-sol:high
+  plan: anthropic/claude-opus-5:high
+  slow: openai-codex/gpt-5.6-sol:xhigh
+  reviewer: openai-codex/gpt-5.6-sol:high
+  worker: xai-oauth/grok-4.5:high
+  designer: kimi-code/k3:high
+  composer: xai-oauth/grok-composer-2.5-fast
+  task: xai-oauth/grok-composer-2.5-fast
+  smol: xai-oauth/grok-composer-2.5-fast
+  efficient: kimi-code/k3-256k:high
+  advisor: xai-oauth/grok-4.5:low

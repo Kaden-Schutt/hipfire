@@ -99,13 +99,9 @@ impl Gpu {
         self.bind_thread()?;
         let batch = if x.shape.len() > 1 { x.shape[0] } else { 1 };
         let n = x.shape.last().copied().unwrap() as i32;
-        let warp_reduce = !self.deepseek4_mq2r_route_v1
-            && self.arch == "gfx1151"
-            && n >= 256
-            && hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_RMS_WARP_REDUCE")
-                .ok()
-                .as_deref()
-                == Some("1");
+        // Generic RMSNorm is route-neutral. DeepSeek-only experiments must not
+        // leak into Qwen/MiniMax through process-wide environment state.
+        let warp_reduce = false;
         let symbol = if warp_reduce {
             "rmsnorm_f32_warp_reduce"
         } else {
@@ -4152,14 +4148,46 @@ impl Gpu {
         k: usize,
         eps: f32,
     ) -> HipResult<()> {
+        self.fused_rmsnorm_rotate_mq_plain_with_policy(x, weight, x_rot, x_plain, k, eps, false)
+    }
+
+    /// DeepSeek4-only sibling whose accepted gfx1151 route pins the no-XOR
+    /// reduction. Keeping the policy argument off the generic method prevents
+    /// Qwen/MiniMax from inheriting a loaded DS4 model's route.
+    pub fn deepseek4_fused_rmsnorm_rotate_mq_plain(
+        &mut self,
+        x: &GpuTensor,
+        weight: &GpuTensor,
+        x_rot: &GpuTensor,
+        x_plain: &GpuTensor,
+        k: usize,
+        eps: f32,
+        deepseek4_gfx1151_route: bool,
+    ) -> HipResult<()> {
+        self.fused_rmsnorm_rotate_mq_plain_with_policy(
+            x,
+            weight,
+            x_rot,
+            x_plain,
+            k,
+            eps,
+            deepseek4_gfx1151_route,
+        )
+    }
+
+    fn fused_rmsnorm_rotate_mq_plain_with_policy(
+        &mut self,
+        x: &GpuTensor,
+        weight: &GpuTensor,
+        x_rot: &GpuTensor,
+        x_plain: &GpuTensor,
+        k: usize,
+        eps: f32,
+        deepseek4_gfx1151_route: bool,
+    ) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_mq_signs()?;
-        let nox = self.arch == "gfx1151"
-            && (self.deepseek4_mq2r_route_v1
-                || hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_RMS_PLAIN_NOX")
-                    .ok()
-                    .as_deref()
-                    == Some("1"));
+        let nox = self.arch == "gfx1151" && deepseek4_gfx1151_route;
         let symbol = if nox {
             "fused_rmsnorm_mq_rotate_plain_nox"
         } else {

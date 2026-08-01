@@ -25,6 +25,7 @@ Modes:
             session_coding.json the coherence gate uses.
 """
 import argparse, atexit, errno, json, os, re, shutil, signal, subprocess, sys, tempfile, time, urllib.request
+from pathlib import Path
 
 # Mirror of the Rust configuration schema's reasoning budgets (resolved here so the pre-flight shows the
 # concrete token cap, not just the preset name).
@@ -156,14 +157,18 @@ def build_config(args):
         "max_tokens": args.max_tokens, "sampling": samp, "sampling_source": samp_src,
         "mode": args.mode, "port": args.port, "seed": getattr(args, "seed", None),
         "prompts_file": getattr(args, "prompts_file", None),
+        "prompt_file": getattr(args, "prompt_file", None),
         "replay_route_proof_log": bool(getattr(args, "replay_route_proof_log", False)),
     }
 
 
 
 
-def load_prompt_battery(prompts_file):
-    """Return [(genre, prompt), ...] from a --prompts-file JSON, else the built-in GENRE_BATTERY."""
+def load_prompt_battery(prompts_file, prompt_file=None):
+    """Return the requested prompt rows, or the built-in GENRE_BATTERY."""
+    if prompt_file:
+        text = Path(prompt_file).read_bytes().decode("utf-8")
+        return [("prose", text)]
     if not prompts_file:
         return list(GENRE_BATTERY)
     import json
@@ -177,7 +182,8 @@ def show_config(cfg):
     print(f"  registry tag  : {cfg['tag'] or '(none — sampling cannot be registry-resolved)'}")
     print(f"  kv_mode       : {cfg['kv']}   kv_backend: {cfg.get('kv_backend', 'contiguous')}   mtp_mode: {cfg['mtp']}   mode: {cfg['mode']}")
     print(f"  dflash        : {cfg.get('dflash', 'off')}   draft: {cfg.get('draft') or '(none / filename auto-match)'}")
-    print(f"  seed          : {cfg.get('seed')}   prompts_file: {cfg.get('prompts_file') or '(built-in battery)'}")
+    prompt_source = cfg.get("prompt_file") or cfg.get("prompts_file") or "(built-in battery)"
+    print(f"  seed          : {cfg.get('seed')}   prompt_source: {prompt_source}")
     _cap = cfg['thinking_cap_tokens']
     _thinking_off = cfg['thinking_budget'] == 'off'
     _resolved = 'thinking DISABLED (sentinel cap 1)' if _thinking_off else f'{_cap} tok (CONCRETE cap)'
@@ -760,7 +766,7 @@ def run(cfg, args):
     label = f"{os.path.basename(cfg['model'])}|{cfg['mtp']}|{cfg['mode']}"
     print(f"### RUN {label}  kv={cfg['kv']} sampling={cfg['sampling']} seed={cfg.get('seed')} ###", flush=True)
     rows = []
-    battery = load_prompt_battery(cfg.get("prompts_file"))
+    battery = load_prompt_battery(cfg.get("prompts_file"), cfg.get("prompt_file"))
     if cfg["mode"] == "battery":
         for genre, prompt in battery:
             r = send(cfg, [{"role": "user", "content": prompt}])
@@ -827,9 +833,15 @@ def main():
     ap.add_argument("--seed", type=int, default=None,
                     help="per-request sampler seed (sent in the body -> daemon initial rng_state). The "
                          "certify's coherence arm invokes with a seed-SET (one seed per call) for the rate test.")
-    ap.add_argument("--prompts-file", default=None,
-                    help="JSON [{\"genre\":..,\"prompt\":..}] replacing the built-in genre battery "
-                         "(e.g. battery + the coherence_prompts_<arch> guard set).")
+    prompt_source = ap.add_mutually_exclusive_group()
+    prompt_source.add_argument("--prompts-file", default=None,
+                               help="JSON [{\"genre\":..,\"prompt\":..}] replacing the built-in genre battery "
+                                    "(e.g. battery + the coherence_prompts_<arch> guard set).")
+    prompt_source.add_argument(
+        "--prompt-file",
+        default=None,
+        help="UTF-8 prompt bytes lowered to one prose battery row without newline normalization.",
+    )
     ap.add_argument(
         "--replay-route-proof-log",
         action="store_true",

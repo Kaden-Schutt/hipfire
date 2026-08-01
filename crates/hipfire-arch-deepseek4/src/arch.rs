@@ -15,6 +15,7 @@
 //! so the workspace builds and the metadata parser is exercised by
 //! the tests.
 
+use crate::backend::Mq2rBackend;
 use crate::deepseek4::{
     DeepseekV4Config, DeepseekV4LayerWeights, DeepseekV4State, DeepseekV4Weights, DsparkConfig,
     DsparkWeights,
@@ -630,6 +631,7 @@ impl DeepseekV4 {
         }
 
         Ok(DeepseekV4Weights {
+            mq2r_backend: Mq2rBackend::Portable,
             token_embd: None,
             output_norm: None,
             head: None,
@@ -677,10 +679,6 @@ impl Architecture for DeepseekV4 {
 }
 
 impl DeepseekV4 {
-    fn mq2r_route_v2_eligible(arch: &str) -> bool {
-        arch == "gfx1151"
-    }
-
     fn validate_mq2r_tensor_policy(hfq: &HfqFile, cfg: &DeepseekV4Config) -> Result<(), String> {
         const QT_Q8F16: u8 = 3;
         const QT_MQ2_LLOYD: u8 = 19;
@@ -833,26 +831,11 @@ impl DeepseekV4 {
     ) -> Result<DeepseekV4Weights, String> {
         // Model identity and route identity are intentionally separate.
         // `.mq2r` fixes the exact P3 tensor recipe on every architecture.
-        // gfx1151 selects route v2 by default; other architectures keep the
-        // same artifact and use their portable fallback dispatch. Loading any
-        // other model resets the route so daemon swaps cannot inherit it.
+        // Native eligibility is installed on the returned DS4 weights after
+        // verification; it is never written into the process-wide GPU.
         // This is not automatic Redline admission.
-        gpu.deepseek4_mq2r_route_v1 = false;
         if cfg.mq2r {
             Self::validate_mq2r_tensor_policy(hfq, cfg)?;
-            if Self::mq2r_route_v2_eligible(&gpu.arch) {
-                gpu.deepseek4_mq2r_route_v1 = true;
-                eprintln!(
-                    "deepseek4: MQ2R P3 tensor recipe verified; selected \
-                     gfx1151 route v2 (554 E8 tensors; routed experts qt=19)"
-                );
-            } else {
-                eprintln!(
-                    "deepseek4: MQ2R P3 tensor recipe verified; gfx1151 route v2 \
-                     is ineligible on {}, using portable dispatch",
-                    gpu.arch
-                );
-            }
         }
 
         // Phase 1.5 host walk verifies every expected tensor is in the
@@ -937,6 +920,28 @@ impl DeepseekV4 {
         };
 
         let mut weights = Self::load_weights_host_only_walk(hfq, cfg)?;
+        if cfg.mq2r {
+            weights.mq2r_backend = Mq2rBackend::for_verified_mq2r(gpu);
+            match weights.mq2r_backend {
+                Mq2rBackend::Gfx1151 => eprintln!(
+                    "deepseek4: MQ2R P3 tensor recipe verified; selected \
+                     gfx1151 route v2 (554 E8 tensors; routed experts qt=19)"
+                ),
+                Mq2rBackend::Gfx942(_) => eprintln!(
+                    "deepseek4: MQ2R P3 tensor recipe verified; selected exact \
+                     gfx942 backend (554 E8 tensors; routed experts qt=19)"
+                ),
+                Mq2rBackend::Portable => eprintln!(
+                    "deepseek4: MQ2R P3 tensor recipe verified; no native backend \
+                     for {}, using portable dispatch",
+                    gpu.arch
+                ),
+            }
+            crate::forward::config_cache_log_gfx942_a2_levers(
+                &gpu.arch,
+                weights.mq2r_backend.is_gfx942(),
+            );
+        }
 
         // Drop the mmap BEFORE any tensor uploads. Every upload helper
         // below now uses `tensor_data_pread` (pread + FADV_DONTNEED)
@@ -2269,6 +2274,9 @@ impl DeepseekV4 {
             layers.push(DeepseekV4LayerWeights::new_empty(ratio));
         }
         let mut weights = DeepseekV4Weights {
+            // Safetensors loads do not pass the frozen HFQ tensor-policy
+            // verifier, so they cannot acquire a native MQ2R backend.
+            mq2r_backend: Mq2rBackend::Portable,
             token_embd: None,
             output_norm: None,
             head: None,
@@ -2805,16 +2813,5 @@ mod tests {
         assert_eq!(dense_hfq_dtype(35), Some(DType::MFP4G32E8SOA));
         assert_eq!(dense_hfq_dtype(3), Some(DType::Q8_0));
         assert_eq!(dense_hfq_dtype(19), None);
-    }
-
-    #[test]
-    fn mq2r_route_v2_is_arch_specific_without_arch_locking_the_recipe() {
-        assert!(DeepseekV4::mq2r_route_v2_eligible("gfx1151"));
-        for arch in ["gfx1100", "gfx1150", "gfx1201", "gfx942"] {
-            assert!(
-                !DeepseekV4::mq2r_route_v2_eligible(arch),
-                "{arch} must use its portable route"
-            );
-        }
     }
 }

@@ -52,6 +52,7 @@
 //!   and the raw SWA + compressed-KV KV-cache layout).
 
 pub mod arch;
+mod backend;
 pub mod deepseek4;
 pub mod dsml;
 pub mod dspark_speculator;

@@ -1047,6 +1047,8 @@ pub const GEMV_HFQ3G256_RESIDUAL_GFX1100_SRC: &str =
     include_str!("../../../kernels/src/gemv_hfq3g256_residual.gfx1100.hip");
 pub const GEMV_HFQ3G128_SRC: &str = include_str!("../../../kernels/src/gemv_hfq3g128.hip");
 pub const GEMV_MQ4G256_SRC: &str = include_str!("../../../kernels/src/gemv_mq4g256.hip");
+pub const MQ_ROTATE_X_GFX942_SRC: &str =
+    include_str!("../../../kernels/src/mq_rotate_x.gfx942.hip");
 pub const GEMV_MQ4G128_SRC: &str = include_str!("../../../kernels/src/gemv_mq4g128.hip");
 pub const GEMV_MQ8G256_SRC: &str = include_str!("../../../kernels/src/gemv_mq8g256.hip");
 /// MQ6-G256 GEMV: FWHT-rotated HFQ6 (6-bit, 200 B/group). Uses pre-rotated x.
@@ -1133,6 +1135,22 @@ pub const GEMV_MFP4G32_E8_SOA_SRC: &str =
 /// ONLY dispatched on gfx1151 (Strix Halo); other archs use GEMV_MFP4G32_E8_SOA_SRC.
 pub const GEMV_MFP4G32_E8_SOA_GFX1151_SRC: &str =
     include_str!("../../../kernels/src/gemv_mfp4g32_e8_soa.gfx1151.hip");
+/// gfx942 wave64 mfp4-E8 SoA GEMV. One wave computes two rows as isolated
+/// 32-lane segments; dispatch is chip-strict so no RDNA/Qwen route sees it.
+pub const GEMV_MFP4G32_E8_SOA_GFX942_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mfp4g32_e8_soa.gfx942.hip");
+/// Experimental gfx942 two-wave workgroup variant of the E8-SoA GEMV.
+/// Micro-screen only: no product dispatch selects this source.
+pub const GEMV_MFP4G32_E8_SOA_W128_GFX942_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mfp4g32_e8_soa_w128.gfx942.hip");
+/// Experimental fixed two-job gfx942 E8-SoA GEMV. Each job has a separate
+/// weight/output allocation but shares one activation. Micro-screen only.
+pub const GEMV_MFP4G32_E8_SOA_PAIR_GFX942_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mfp4g32_e8_soa_pair.gfx942.hip");
+/// Experimental gfx942 FP8-MFMA lowering of the MFP4-E8 SoA decode GEMV.
+/// Default-off: used for channel/roofline screening before any product route.
+pub const GEMV_MFP4G32_E8_SOA_FP8_MFMA_GFX942_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mfp4g32_e8_soa_fp8_mfma.gfx942.hip");
 /// gfx1151 grouped E8-SoA GEMV for DeepSeek4's eight O-LoRA blocks.
 pub const GEMV_MFP4G32_E8_SOA_GROUPED_GFX1151_SRC: &str =
     include_str!("../../../kernels/src/gemv_mfp4g32_e8_soa_grouped.gfx1151.hip");
@@ -2769,6 +2787,8 @@ pub const DEQUANTIZE_MFP4G32_P_TO_F16_SRC: &str =
     include_str!("../../../kernels/src/dequantize_mfp4g32_p_to_f16.hip");
 pub const DEQUANTIZE_MFP4G32_E8_TO_F16_SRC: &str =
     include_str!("../../../kernels/src/dequantize_mfp4g32_e8_to_f16.hip");
+pub const DEQUANTIZE_MFP4G32_E8_SOA_TO_F16_GFX942_SRC: &str =
+    include_str!("../../../kernels/src/dequantize_mfp4g32_e8_soa_to_f16.gfx942.hip");
 pub const GEMM_GATE_UP_HFQ4G256_WMMA_SRC: &str =
     include_str!("../../../kernels/src/gemm_gate_up_hfq4g256_wmma.hip");
 // LDS-staged X variant. Opt-in via HIPFIRE_GATE_UP_VARIANT=ldsx for
@@ -5017,9 +5037,25 @@ pub const PFLASH_SCORE_FWHT2_KV_SRC: &str =
 /// MoE indexed kernels. X must be FWHT-pre-rotated by the caller.
 pub const GEMV_MQ2G256_LLOYD_MOE_GATE_UP_INDEXED_SRC: &str =
     include_str!("../../../kernels/src/gemv_mq2g256_lloyd_moe_gate_up_indexed.hip");
+pub const GEMV_MQ2G256_LLOYD_MOE_GATE_UP_INDEXED_GFX942_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mq2g256_lloyd_moe_gate_up_indexed.gfx942.hip");
+pub const GEMV_MQ2G256_LLOYD_MOE_GATE_UP_INDEXED_MFMA_GFX942_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mq2g256_lloyd_moe_gate_up_indexed_mfma.gfx942.hip");
+pub const GEMV_MQ2G256_LLOYD_MOE_GATE_UP_INDEXED_MFMA_F16_GFX942_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mq2g256_lloyd_moe_gate_up_indexed_mfma_f16.gfx942.hip");
 
 pub const GEMV_MQ2G256_LLOYD_MOE_DOWN_INDEXED_SRC: &str =
     include_str!("../../../kernels/src/gemv_mq2g256_lloyd_moe_down_indexed.hip");
+pub const GEMV_MQ2G256_LLOYD_MOE_DOWN_INDEXED_GFX942_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mq2g256_lloyd_moe_down_indexed.gfx942.hip");
+pub const GEMV_MQ2G256_LLOYD_MOE_DOWN_INDEXED_MFMA_GFX942_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mq2g256_lloyd_moe_down_indexed_mfma.gfx942.hip");
+pub const GEMV_MQ2G256_LLOYD_MOE_DOWN_INDEXED_MFMA_F16_GFX942_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mq2g256_lloyd_moe_down_indexed_mfma_f16.gfx942.hip");
+pub const GEMV_MQ2G256_LLOYD_MOE_DOWN_ALLRANKS_GFX942_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mq2g256_lloyd_moe_down_allranks.gfx942.hip");
+pub const GEMV_MQ2G256_LLOYD_MOE_DOWN_EXPANDED_K4_GFX942_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mq2g256_lloyd_moe_down_expanded_k4.gfx942.hip");
 
 /// MQ3-Lloyd MoE indexed family (MiniMax-M2, arch_id=10): routed-experts
 /// gate_up + down with device-side topk routing + per-expert pointer table.
@@ -5058,6 +5094,11 @@ pub const GEMM_MQ2G256_LLOYD_MOE_GROUPED_WMMA_K2_SRC: &str =
 /// dim stays at 16 due to expert-spanning constraint.
 pub const GEMM_MQ2G256_LLOYD_MOE_GROUPED_WMMA_4W_K2_SRC: &str =
     include_str!("../../../kernels/src/gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2.hip");
+
+/// Native gfx942 wave64 MFMA grouped-GEMM for DeepSeek4 MQ2-Lloyd prefill.
+/// Chip-strict dispatch keeps CDNA operand/layout semantics out of RDNA paths.
+pub const GEMM_MQ2G256_LLOYD_MOE_GROUPED_MFMA_GFX942_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mq2g256_lloyd_moe_grouped_mfma.gfx942.hip");
 
 /// i8 WMMA MMQ MoE grouped-GEMM for MQ2-Lloyd weights on gfx1151. Decodes the
 /// 2-bit Lloyd index via an in-kernel int8-codebook LUT and runs i8 WMMA at

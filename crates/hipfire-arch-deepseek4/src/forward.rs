@@ -23,6 +23,7 @@
 //!   - Quantized GEMV (MQ-family) for Q-LoRA, KV, O-LoRA, experts
 //!   - Embedding lookup, lm_head matmul, sampler
 
+use crate::backend::Mq2rBackend;
 use crate::{DeepseekV4Config, DeepseekV4State, DeepseekV4Weights};
 use hipfire_dispatch::context::DispatchCtx;
 use hipfire_dispatch::pipeline::superop::{
@@ -283,6 +284,97 @@ mod config_cache {
                         != Some("0")
                 }))
     }
+    /// `HIPFIRE_DEEPSEEK4_GFX942_COMPRESSOR_GATE` — host-gate non-commit
+    /// compressor commit-stage launches on exact `gfx942` MQ2R ordinary HIP.
+    /// Default OFF; set `=1` to enable. Forced off during hipGraph capture
+    /// so the captured graph retains full sentinel-driven commit nodes
+    /// (see `compressor_forward_impl` decode path). Unvalidated for
+    /// state/output exactness — must stay opt-in until measured.
+    pub(super) fn gfx942_compressor_gate_on(arch: &str, mq2r: bool) -> bool {
+        static V: OnceLock<bool> = OnceLock::new();
+        arch == "gfx942"
+            && mq2r
+            && *V.get_or_init(|| flag_one("HIPFIRE_DEEPSEEK4_GFX942_COMPRESSOR_GATE"))
+    }
+    /// `HIPFIRE_DEEPSEEK4_GFX942_E8_WO_GROUPED` — wire the gfx942 grouped E8
+    /// O-LoRA kernel (`gemv_mfp4g32_e8_soa_grouped_gfx942`) for `wo_a`
+    /// instead of the 8-way `gemv_auto` loop. Default ON for gfx942 route v1
+    /// after the production-shape raw-bit channel passed; set `=0` for the
+    /// serial emergency fallback.
+    /// Separate from `HIPFIRE_DEEPSEEK4_E8_WO_GROUPED` (gfx1151).
+    pub(super) fn gfx942_e8_wo_grouped_on(arch: &str, gfx942_route_v1: bool) -> bool {
+        static V: OnceLock<bool> = OnceLock::new();
+        arch == "gfx942"
+            && gfx942_route_v1
+            && *V.get_or_init(|| {
+                hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_GFX942_E8_WO_GROUPED")
+                    .ok()
+                    .as_deref()
+                    != Some("0")
+            })
+    }
+    /// `HIPFIRE_DEEPSEEK4_GFX942_HC_FINALIZE_FUSED` — replace the three
+    /// scalar mHC finalization launches (alpha, sigmoid/scale, Sinkhorn) with
+    /// their source-order-equivalent single-wave finalizer. Kept opt-in until
+    /// the gfx942 raw-state channel and product screen pass.
+    pub(super) fn gfx942_hc_finalize_fused_on(arch: &str, gfx942_route_v1: bool) -> bool {
+        static V: OnceLock<bool> = OnceLock::new();
+        arch == "gfx942"
+            && gfx942_route_v1
+            && *V.get_or_init(|| flag_one("HIPFIRE_DEEPSEEK4_GFX942_HC_FINALIZE_FUSED"))
+    }
+    /// `HIPFIRE_DEEPSEEK4_GFX942_INDEXER_TOPK_PARALLEL` — F1: admit the
+    /// filtered block-parallel indexer top-K on exact `gfx942` MQ2R.
+    /// Default ON for the gfx942-v1 route after its raw-i32 channel passed;
+    /// set `=0` for the serial emergency fallback. Independent of L1/L3.
+    /// The actual dispatch lives behind the model-owned `Mq2rBackend` and the
+    /// exact-device `Gfx942Device`; this helper is only the emergency kill
+    /// switch and operator-log surface.
+    pub(super) fn gfx942_indexer_topk_parallel_on(arch: &str, mq2r: bool) -> bool {
+        static V: OnceLock<bool> = OnceLock::new();
+        arch == "gfx942"
+            && mq2r
+            && *V.get_or_init(|| {
+                hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_GFX942_INDEXER_TOPK_PARALLEL")
+                    .ok()
+                    .as_deref()
+                    != Some("0")
+            })
+    }
+    /// `HIPFIRE_DEEPSEEK4_GFX942_FFN_OVERLAP` — evaluate the dense shared
+    /// expert and routed MQ2 experts concurrently after their common FFN
+    /// normalization. Eligibility comes from the model-owned exact-gfx942
+    /// backend proof. Default OFF pending the product and boundary gates.
+    pub(super) fn gfx942_ffn_overlap_on(exact_gfx942_backend: bool) -> bool {
+        static V: OnceLock<bool> = OnceLock::new();
+        exact_gfx942_backend && *V.get_or_init(|| flag_one("HIPFIRE_DEEPSEEK4_GFX942_FFN_OVERLAP"))
+    }
+    /// One-shot daemon-log line for A2 gfx942 levers so ABBA runs cannot
+    /// misattribute measurements.
+    pub(super) fn log_gfx942_a2_levers(arch: &str, gfx942_route_v1: bool) {
+        static LOGGED: OnceLock<()> = OnceLock::new();
+        let _ = LOGGED.get_or_init(|| {
+            let l1 = gfx942_compressor_gate_on(arch, gfx942_route_v1);
+            let l3 = gfx942_e8_wo_grouped_on(arch, gfx942_route_v1);
+            let l2 = gfx942_hc_finalize_fused_on(arch, gfx942_route_v1);
+            let f1 = gfx942_indexer_topk_parallel_on(arch, gfx942_route_v1);
+            let ffn_overlap = gfx942_ffn_overlap_on(gfx942_route_v1 && arch == "gfx942");
+            eprintln!(
+                "deepseek4 gfx942 A2 levers: \
+                 L1 compressor_gate={} (HIPFIRE_DEEPSEEK4_GFX942_COMPRESSOR_GATE default OFF, =1 enables) ; \
+                 L3 e8_wo_grouped={} (gfx942-v1 default ON, HIPFIRE_DEEPSEEK4_GFX942_E8_WO_GROUPED=0 disables) ; \
+                 L2 hc_finalize_fused={} (default OFF, HIPFIRE_DEEPSEEK4_GFX942_HC_FINALIZE_FUSED=1 enables) ; \
+                 F1 indexer_topk_parallel={} (gfx942-v1 default ON, HIPFIRE_DEEPSEEK4_GFX942_INDEXER_TOPK_PARALLEL=0 disables) ; \
+                 C1 ffn_overlap={} (default OFF, HIPFIRE_DEEPSEEK4_GFX942_FFN_OVERLAP=1 enables)",
+                if l1 { "ON" } else { "OFF" },
+                if l3 { "ON" } else { "OFF" },
+                if l2 { "ON" } else { "OFF" },
+                if f1 { "ON" } else { "OFF" },
+                if ffn_overlap { "ON" } else { "OFF" },
+            );
+        });
+    }
+
     /// `HIPFIRE_DEEPSEEK4_E8_U4` — use the four-group-unrolled E8-SoA
     /// decode schedule for DeepSeek V4 dense projections on gfx1151. This is
     /// deliberately architecture-owned: the same schedule regresses smaller
@@ -438,6 +530,11 @@ mod config_cache {
     }
 }
 
+/// Crate-visible init log for A2 gfx942 levers (called from arch load path).
+pub(crate) fn config_cache_log_gfx942_a2_levers(arch: &str, gfx942_route_v1: bool) {
+    config_cache::log_gfx942_a2_levers(arch, gfx942_route_v1);
+}
+
 /// DeepSeek V4 GEMV dispatch: switch kernel based on weight dtype.
 ///
 /// - `DType::MQ4G256` (default DeepSeek V4 non-expert quant): consume FWHT-rotated
@@ -479,6 +576,7 @@ fn mfp_e8_row_bytes(dtype: DType, k: usize) -> usize {
 
 fn gemv_auto(
     gpu: &mut Gpu,
+    mq2r_backend: Mq2rBackend,
     weight: &GpuTensor,
     x_rotated: &GpuTensor,
     x_plain: &GpuTensor,
@@ -517,11 +615,13 @@ fn gemv_auto(
             DType::MFP4G32E8 => gpu
                 .gemv_mfp4g32_e8_prerotated(weight, x_rotated, y, m, k)
                 .map_err(|e| format!("gemv MFP4-E8: {e:?}")),
-            DType::MFP4G32E8SOA
-                if config_cache::e8_u4_on(&gpu.arch, gpu.deepseek4_mq2r_route_v1) =>
-            {
-                gpu.gemv_mfp4g32_e8_soa_u4(weight, x_rotated, y, m, k)
-                    .map_err(|e| format!("gemv MFP4-E8-SoA-U4: {e:?}"))
+            DType::MFP4G32E8SOA if config_cache::e8_u4_on(&gpu.arch, mq2r_backend.is_gfx1151()) => {
+                if mq2r_backend.is_gfx1151() {
+                    gpu.gemv_mfp4g32_e8_soa_u4_buffer_cpol_gfx1151(0, weight, x_rotated, y, m, k)
+                } else {
+                    gpu.gemv_mfp4g32_e8_soa_u4(weight, x_rotated, y, m, k)
+                }
+                .map_err(|e| format!("gemv MFP4-E8-SoA-U4: {e:?}"))
             }
             DType::MFP4G32E8SOA => gpu
                 .gemv_mfp4g32_e8_soa_prerotated(weight, x_rotated, y, m, k)
@@ -561,6 +661,7 @@ fn gemv_auto(
 #[allow(dead_code, clippy::too_many_arguments)]
 fn gemv_auto_batched(
     gpu: &mut Gpu,
+    mq2r_backend: Mq2rBackend,
     weight: &GpuTensor,
     x_rotated_batch: &GpuTensor,
     x_plain_batch: &GpuTensor,
@@ -571,6 +672,7 @@ fn gemv_auto_batched(
 ) -> Result<(), String> {
     gemv_auto_batched_wmma(
         gpu,
+        mq2r_backend,
         weight,
         x_rotated_batch,
         x_plain_batch,
@@ -640,6 +742,7 @@ fn e8_batched_gemv_applies(arch: &str, batch_size: usize, k: usize) -> bool {
 
 fn gemv_auto_batched_wmma(
     gpu: &mut Gpu,
+    mq2r_backend: Mq2rBackend,
     weight: &GpuTensor,
     x_rotated_batch: &GpuTensor,
     x_plain_batch: &GpuTensor,
@@ -649,8 +752,8 @@ fn gemv_auto_batched_wmma(
     batch_size: usize,
     x_f16_scratch: Option<&GpuTensor>,
 ) -> Result<(), String> {
-    let e8_b2 = config_cache::e8_prefill_b2_on(&gpu.arch, gpu.deepseek4_mq2r_route_v1);
-    let e8_b4 = config_cache::e8_prefill_b4_on(&gpu.arch, gpu.deepseek4_mq2r_route_v1);
+    let e8_b2 = config_cache::e8_prefill_b2_on(&gpu.arch, mq2r_backend.is_gfx1151());
+    let e8_b4 = config_cache::e8_prefill_b4_on(&gpu.arch, mq2r_backend.is_gfx1151());
     let e8_tiles = e8_prefill_batch_tiles(batch_size, e8_b2, e8_b4);
     match weight.dtype {
         DType::MFP4G32E8SOA if e8_batched_gemv_applies(&gpu.arch, batch_size, k) => gpu
@@ -666,13 +769,27 @@ fn gemv_auto_batched_wmma(
             .gemm_mfp4g32_e8_soa_wmma(weight, x_rotated_batch, y, m, k, batch_size)
             .map_err(|e| format!("gemm MFP4-E8-SoA WMMA B1: {e:?}")),
         DType::MFP4G32E8 | DType::MFP4G32E8SOA | DType::MFP3G32E8 => {
+            if weight.dtype == DType::MFP4G32E8SOA
+                && gpu
+                    .rocblas_gemm_mfp4e8_soa_prefill_auto(
+                        weight,
+                        x_rotated_batch,
+                        y,
+                        m,
+                        k,
+                        batch_size,
+                    )
+                    .map_err(|e| format!("rocBLAS MFP4-E8-SoA prefill: {e:?}"))?
+            {
+                return Ok(());
+            }
             // AoS and non-gfx1151 SoA retain the correctness fallback until an
             // architecture-specific dense batched kernel is admitted.
             for b in 0..batch_size {
                 let x_rot = x_rotated_batch.sub_offset(b * k, k);
                 let x_plain = x_plain_batch.sub_offset(b * k, k);
                 let y_row = y.sub_offset(b * m, m);
-                gemv_auto(gpu, weight, &x_rot, &x_plain, &y_row, m, k)?;
+                gemv_auto(gpu, mq2r_backend, weight, &x_rot, &x_plain, &y_row, m, k)?;
             }
             Ok(())
         }
@@ -1009,8 +1126,26 @@ fn compressor_forward_impl(
         let tmp_plain = state.tmp_plain.as_ref().ok_or_else(|| {
             format!("comp l{layer_idx}: tmp_plain missing (q_lora must run first)")
         })?;
-        gemv_auto(gpu, wkv, x_rotated, tmp_plain, kvb, proj_dim, hidden)?;
-        gemv_auto(gpu, wgate, x_rotated, tmp_plain, scb, proj_dim, hidden)?;
+        gemv_auto(
+            gpu,
+            weights.mq2r_backend,
+            wkv,
+            x_rotated,
+            tmp_plain,
+            kvb,
+            proj_dim,
+            hidden,
+        )?;
+        gemv_auto(
+            gpu,
+            weights.mq2r_backend,
+            wgate,
+            x_rotated,
+            tmp_plain,
+            scb,
+            proj_dim,
+            hidden,
+        )?;
         (kvb, scb)
     };
 
@@ -1233,6 +1368,7 @@ fn compressor_forward_impl(
                 .map_err(|e| format!("comp rope l{layer_idx}: {e:?}"))?;
             } else {
                 gpu.rope_tail_yarn_interleaved(
+                    weights.mq2r_backend.is_gfx1151(),
                     &kv_cache_slot,
                     &kv_cache_slot,
                     &pos_buf,
@@ -1281,6 +1417,23 @@ fn compressor_forward_impl(
         score_state,
         state_rows * proj_dim,
     );
+
+    // L1 (gfx942 MQ2R ordinary HIP): host-gate commit-stage work on non-commit
+    // positions. Ring writes above remain unconditional every token.
+    //
+    // Host condition `(pos+1) % ratio != 0` is equivalent to
+    // `fill_attn_state_host` writing commit_slot = -1, which is the device
+    // sentinel every buf-variant commit kernel early-returns on. Prefill
+    // already host-gates the same boundary (`should_compress` above).
+    // Forced OFF during hipGraph capture so the captured graph retains the
+    // full fixed node set and stays sentinel-driven on replay.
+    if config_cache::gfx942_compressor_gate_on(&gpu.arch, cfg.mq2r)
+        && !gpu.graphs.capture_mode
+        && !(pos + 1).is_multiple_of(ratio)
+    {
+        let _ = (commit_slot_buf, max_compressed, do_rope);
+        return Ok(());
+    }
 
     // Compress event — concat (overlap only) is unconditional within graph;
     // pool/rmsnorm/rope/shift all sentinel-gate on commit_slot_buf.
@@ -1854,7 +2007,16 @@ fn indexer_forward(
         .as_ref()
         .ok_or_else(|| "indexer: q_lat_rot not allocated".to_string())?;
     let q_idx = state._indexer[layer_idx].q_idx.as_ref().unwrap();
-    gemv_auto(gpu, wq_b, q_lat_rot, q_lat, q_idx, h * d, cfg.q_lora_rank)?;
+    gemv_auto(
+        gpu,
+        weights.mq2r_backend,
+        wq_b,
+        q_lat_rot,
+        q_lat,
+        q_idx,
+        h * d,
+        cfg.q_lora_rank,
+    )?;
 
     // 2. Tail RoPE on q_idx with compress_rope_theta (matching is_indexer=true
     //    K-side compressor's RoPE). Use main `pos_buf` (already holds current
@@ -1885,7 +2047,16 @@ fn indexer_forward(
         .as_ref()
         .ok_or_else(|| "indexer: tmp_plain missing".to_string())?;
     let idx_w = state._indexer[layer_idx].idx_weights.as_ref().unwrap();
-    gemv_auto(gpu, weights_proj, tmp, tmp_plain, idx_w, h, cfg.hidden_size)?;
+    gemv_auto(
+        gpu,
+        weights.mq2r_backend,
+        weights_proj,
+        tmp,
+        tmp_plain,
+        idx_w,
+        h,
+        cfg.hidden_size,
+    )?;
 
     // 4. Score: combined relu-weighted dot products.
     // HIP-graphs-safe: read N (n_compressed_4) from attn_state_buf[2]
@@ -1918,16 +2089,24 @@ fn indexer_forward(
 
     // 5. Top-K: read N + K from device buffers.
     let topk = state._indexer[layer_idx].topk_idx_indices.as_ref().unwrap();
-    gpu.indexer_top_k_buf(
-        scores,
-        topk,
-        &n_buf,
-        &k_buf,
-        /*n_idx_heads=*/ 1,
-        max_compressed as i32,
-        k as i32,
-    )
-    .map_err(|e| format!("idx top_k buf l{layer_idx}: {e:?}"))?;
+    let gfx942_parallel =
+        config_cache::gfx942_indexer_topk_parallel_on(&gpu.arch, weights.mq2r_backend.is_gfx942())
+            && weights.mq2r_backend.try_indexer_top_k_buf_parallel(
+                gpu, scores, topk, &n_buf, &k_buf, /*n_idx_heads=*/ 1, k as i32,
+            )?;
+    if !gfx942_parallel {
+        gpu.indexer_top_k_buf(
+            weights.mq2r_backend.is_gfx1151(),
+            scores,
+            topk,
+            &n_buf,
+            &k_buf,
+            /*n_idx_heads=*/ 1,
+            max_compressed as i32,
+            k as i32,
+        )
+        .map_err(|e| format!("idx top_k buf l{layer_idx}: {e:?}"))?;
+    }
     let _ = n; // legacy host-computed; not used after migration
 
     Ok(n)
@@ -2024,11 +2203,27 @@ fn ensure_ffn_overlap_resources(
         created = true;
     }
     if created {
-        eprintln!(
-            "[DeepSeek V4] gfx1151 FFN overlap active: shared expert side stream + routed main stream"
-        );
+        eprintln!("[DeepSeek V4] FFN overlap resources ready");
     }
     Ok(())
+}
+
+/// Materialize the primary and side streams before ordinary gfx942 decode.
+/// The gfx1151 graph path creates its primary capture stream separately, so
+/// this wrapper does not alter that route's launch ordering.
+fn ensure_gfx942_ffn_overlap_resources(
+    cfg: &DeepseekV4Config,
+    state: &mut DeepseekV4State,
+    gpu: &mut Gpu,
+) -> Result<(), String> {
+    if gpu.active_stream.is_none() {
+        gpu.active_stream = Some(
+            gpu.hip
+                .stream_create()
+                .map_err(|e| format!("create gfx942 FFN primary stream: {e:?}"))?,
+        );
+    }
+    ensure_ffn_overlap_resources(cfg, state, gpu)
 }
 
 fn ensure_ffn_split_resource(
@@ -2077,6 +2272,12 @@ pub fn decode_step_with_graph(
         let a = gpu.arch.as_str();
         a.starts_with("gfx11") || a.starts_with("gfx12")
     });
+    // The gfx942 concurrency route is ordinary HIP with two streams. Create
+    // the resources before the direct decode return below; stream creation or
+    // allocation inside graph capture would be illegal.
+    if config_cache::gfx942_ffn_overlap_on(weights.mq2r_backend.is_gfx942()) {
+        ensure_gfx942_ffn_overlap_resources(cfg, state, gpu)?;
+    }
     // DeepSeek V4 retained replay is explicit-opt-in while the MQ2R fixture is
     // being certified. Its dynamic token/position state is staged outside the
     // tape, matching the mature HipGraph boundary. The HC ping-pong route is a
@@ -2799,10 +3000,12 @@ fn ds4_moe_block_core(
     mhc_pre(cfg, weights, state, gpu, layer_idx, /*is_attn=*/ false)?;
     if !skip_ffn {
         let layer = weights.resolve_layer(layer_idx);
+        let gfx942_overlap = config_cache::gfx942_ffn_overlap_on(weights.mq2r_backend.is_gfx942())
+            && !gpu.graphs.capture_mode;
         let overlap = routed_out.is_none()
             && do_mix
             && config_cache::moe_on()
-            && config_cache::ffn_overlap_on(&gpu.arch, cfg.mq2r)
+            && (config_cache::ffn_overlap_on(&gpu.arch, cfg.mq2r) || gfx942_overlap)
             && gpu.active_stream.is_some()
             && state.ffn_overlap_stream.is_some()
             && state.ffn_overlap_fork_event.is_some()
@@ -3667,7 +3870,16 @@ fn mtp_pre_ffn(
         let e_norm = state.mtp_e_norm_scratch.as_ref().unwrap();
         let dummy_rotated = state.mtp_h_norm_scratch.as_ref().unwrap();
         let tmp = state.tmp.as_ref().unwrap();
-        gemv_auto(gpu, mtp_e_proj, dummy_rotated, e_norm, tmp, hidden, hidden)?;
+        gemv_auto(
+            gpu,
+            weights.mq2r_backend,
+            mtp_e_proj,
+            dummy_rotated,
+            e_norm,
+            tmp,
+            hidden,
+            hidden,
+        )?;
     }
     {
         let h_norm_full = state.mtp_h_norm_scratch.as_ref().unwrap();
@@ -3684,6 +3896,7 @@ fn mtp_pre_ffn(
             let dst_row = streams.sub_offset(h * hidden, hidden);
             gemv_auto(
                 gpu,
+                weights.mq2r_backend,
                 mtp_h_proj,
                 dummy_rotated,
                 &h_norm_row,
@@ -3859,6 +4072,7 @@ fn mtp_head_compute(
         let logits = state.logits.as_ref().unwrap();
         gemv_auto(
             gpu,
+            weights.mq2r_backend,
             head,
             final_norm_rot,
             final_norm,
@@ -4162,6 +4376,7 @@ pub fn mtp_forward_batched(
     // dummy_rotated is unused for F32/F16/Q8 weight dtypes (guarded above).
     gemv_auto_batched_wmma(
         gpu,
+        weights.mq2r_backend,
         mtp_e_proj,
         &pbs.mtp_h_norm_batch,
         &pbs.mtp_e_norm_batch,
@@ -4178,6 +4393,7 @@ pub fn mtp_forward_batched(
     // (batch, HC) row.
     gemv_auto_batched_wmma(
         gpu,
+        weights.mq2r_backend,
         mtp_h_proj,
         &pbs.mtp_e_norm_batch,
         &pbs.mtp_h_norm_batch,
@@ -4223,13 +4439,22 @@ pub fn mtp_forward_batched(
     q_lora_batched(
         cfg,
         mtp_layer,
+        weights.mq2r_backend,
         pbs,
         &pbs.hc_x_in_batch,
         gpu,
         mtp_layer_idx,
         n,
     )?;
-    kv_joint_batched(cfg, mtp_layer, pbs, gpu, mtp_layer_idx, n)?;
+    kv_joint_batched(
+        cfg,
+        mtp_layer,
+        weights.mq2r_backend,
+        pbs,
+        gpu,
+        mtp_layer_idx,
+        n,
+    )?;
     apply_tail_rope_batched(cfg, mtp_layer, pbs, gpu, mtp_layer_idx, n)?;
     attention_block_batched_swa_only(cfg, weights, state, pbs, gpu, mtp_layer_idx, start_pos, n)?;
     hc_attn_mix_batched(cfg, pbs, gpu, n)?;
@@ -4250,6 +4475,7 @@ pub fn mtp_forward_batched(
     ffn_batched(
         cfg,
         mtp_layer,
+        weights.mq2r_backend,
         pbs,
         gpu,
         mtp_layer_idx,
@@ -4355,13 +4581,14 @@ fn ffn_prepare(
     //    fused single-launch variant that writes both. Saves one launch
     //    + the duplicate sum-of-squares pass.
     if gate_up_need_fwht {
-        gpu.fused_rmsnorm_rotate_mq_plain(
+        gpu.deepseek4_fused_rmsnorm_rotate_mq_plain(
             hc_x_in,
             ffn_norm,
             ffn_x_rot,
             ffn_x_plain,
             cfg.hidden_size,
             cfg.rms_norm_eps,
+            weights.mq2r_backend.is_gfx1151(),
         )
         .map_err(|e| format!("fused_rmsnorm_rotate_mq_plain ffn layer {layer_idx}: {e:?}"))?;
     } else {
@@ -4405,6 +4632,7 @@ fn ffn_shared_project(
     // 2. gate = x @ shared_w1
     gemv_auto(
         gpu,
+        weights.mq2r_backend,
         shared_w1,
         ffn_x_rot,
         ffn_x_plain,
@@ -4416,6 +4644,7 @@ fn ffn_shared_project(
     // 3. up = x @ shared_w3
     gemv_auto(
         gpu,
+        weights.mq2r_backend,
         shared_w3,
         ffn_x_rot,
         ffn_x_plain,
@@ -4466,7 +4695,16 @@ fn ffn_shared_project(
     // 6. ffn_out = silu_rot @ shared_w2 (down: [hidden, im])
     // shared_w2: rotated path uses silu_rot (FWHT'd), plain path uses
     // `gate` itself (post-silu_mul, no FWHT).
-    gemv_auto(gpu, shared_w2, silu_rot, gate, ffn_out, cfg.hidden_size, im)?;
+    gemv_auto(
+        gpu,
+        weights.mq2r_backend,
+        shared_w2,
+        silu_rot,
+        gate,
+        ffn_out,
+        cfg.hidden_size,
+        im,
+    )?;
 
     Ok(())
 }
@@ -4631,6 +4869,8 @@ fn ffn_routed(
             n_exp: cfg.n_routed_experts,
             route_scale: route_scale_override,
             swiglu_limit: cfg.swiglu_limit,
+            uses_atomic_moe_down: weights.mq2r_backend.uses_atomic_moe_down(),
+            native_mq2_backend: weights.mq2r_backend.bias_aware_native_backend(),
             batch_size: 1,
             x_rot: ffn_x_rot,
             ffn_out: out_target,
@@ -4834,17 +5074,33 @@ fn ffn_hash_routed(
     let up_batch = state.moe_up_batch.as_ref().unwrap();
     let rot_batch = state.moe_rot_batch.as_ref().unwrap();
 
-    gpu.deepseek4_gemv_mq2g256_lloyd_moe_gate_up_indexed(
-        gate_up_ptrs,
-        topk_idx_dev,
-        ffn_x_rot,
-        gate_batch,
-        up_batch,
-        2 * im,
-        cfg.hidden_size,
-        k_top,
-    )
-    .map_err(|e| format!("fused gate_up hash l{layer_idx}: {e:?}"))?;
+    if let Some(native) = weights.mq2r_backend.bias_aware_native_backend() {
+        native
+            .gate_up(
+                gpu,
+                gate_up_ptrs,
+                topk_idx_dev,
+                ffn_x_rot,
+                gate_batch,
+                up_batch,
+                2 * im,
+                cfg.hidden_size,
+                k_top,
+            )
+            .map_err(|e| format!("native gate_up hash l{layer_idx}: {e}"))?;
+    } else {
+        gpu.deepseek4_gemv_mq2g256_lloyd_moe_gate_up_indexed(
+            gate_up_ptrs,
+            topk_idx_dev,
+            ffn_x_rot,
+            gate_batch,
+            up_batch,
+            2 * im,
+            cfg.hidden_size,
+            k_top,
+        )
+        .map_err(|e| format!("fused gate_up hash l{layer_idx}: {e:?}"))?;
+    }
 
     gpu.deepseek4_silu_mul_clamp_f32_batched(
         gate_batch,
@@ -4855,25 +5111,48 @@ fn ffn_hash_routed(
         cfg.swiglu_limit,
     )
     .map_err(|e| format!("deepseek4_silu_mul_clamp batched hash l{layer_idx}: {e:?}"))?;
-    gpu.rotate_x_mq_batched(gate_batch, rot_batch, im, k_top)
-        .map_err(|e| format!("rotate batched hash l{layer_idx}: {e:?}"))?;
+    if let Some(native) = weights.mq2r_backend.bias_aware_native_backend() {
+        native
+            .rotate_x_batched(gpu, gate_batch, rot_batch, im, k_top)
+            .map_err(|e| format!("native rotate hash l{layer_idx}: {e}"))?;
+    } else {
+        gpu.rotate_x_mq_batched(gate_batch, rot_batch, im, k_top)
+            .map_err(|e| format!("rotate batched hash l{layer_idx}: {e:?}"))?;
+    }
 
     // EP: redirect the route-scaled accumulation into the zeroed partial
     // (routed-only) instead of state.ffn_out (shared+routed). The down kernel
     // accumulates `out += w_k · down_k`, so a zeroed partial yields exactly
     // this rank's owned routed contribution.
     let out_target = routed_out.unwrap_or(ffn_out);
-    gpu.deepseek4_gemv_mq2g256_lloyd_moe_down_residual_scaled_indexed(
-        w2_ptrs,
-        topk_idx_dev,
-        topk_w_dev,
-        rot_batch,
-        out_target,
-        cfg.hidden_size,
-        im,
-        k_top,
-    )
-    .map_err(|e| format!("fused down hash l{layer_idx}: {e:?}"))?;
+    if let Some(native) = weights.mq2r_backend.bias_aware_native_backend() {
+        native
+            .down_residual_scaled(
+                gpu,
+                w2_ptrs,
+                topk_idx_dev,
+                topk_w_dev,
+                rot_batch,
+                out_target,
+                cfg.hidden_size,
+                im,
+                k_top,
+            )
+            .map_err(|e| format!("native down hash l{layer_idx}: {e}"))?;
+    } else {
+        gpu.deepseek4_gemv_mq2g256_lloyd_moe_down_residual_scaled_indexed(
+            w2_ptrs,
+            topk_idx_dev,
+            topk_w_dev,
+            rot_batch,
+            out_target,
+            cfg.hidden_size,
+            im,
+            k_top,
+            weights.mq2r_backend.is_gfx1151(),
+        )
+        .map_err(|e| format!("fused down hash l{layer_idx}: {e:?}"))?;
+    }
 
     Ok(())
 }
@@ -5145,6 +5424,7 @@ fn final_norm_and_head(
     // lm_head GEMV. F16 path uses un-rotated final_norm.
     gemv_auto(
         gpu,
+        weights.mq2r_backend,
         head,
         final_norm_rot,
         final_norm,
@@ -5388,6 +5668,7 @@ fn attn_stub(
             // we pass gathered_k as V too). n_valid_swa + n_active_topk
             // come from the device-side attn_state_buf.
             gpu.deepseek4_attn_swa_topk_f32_buf(
+                weights.mq2r_backend.is_gfx1151(),
                 q,
                 swa_k,
                 swa_v,
@@ -5447,6 +5728,7 @@ fn attn_stub(
         let (freq_base, freq_scale, ext_factor, attn_factor, corr_low, corr_high) =
             layer_rope_params(cfg, layer.compress_ratio);
         gpu.rope_tail_yarn_interleaved(
+            weights.mq2r_backend.is_gfx1151(),
             attn_out_raw,
             attn_out_raw,
             pos_buf,
@@ -5534,6 +5816,22 @@ fn attn_stub(
             per_group_in,
         )
         .map_err(|e| format!("grouped E8 wo_a l{layer_idx}: {e:?}"))?;
+    } else if wo_a.dtype == DType::MFP4G32E8SOA
+        && config_cache::gfx942_e8_wo_grouped_on(&gpu.arch, weights.mq2r_backend.is_gfx942())
+        && per_group_in % 256 == 0
+    {
+        // The weight-owned DS4 backend reacquires an exact Gfx942Device proof
+        // before launching. A model swap, Qwen load, broad CDNA3 match, or env
+        // flag cannot grant eligibility.
+        weights.mq2r_backend.grouped_olora_e8(
+            gpu,
+            wo_a,
+            attn_out_raw_rot,
+            wo_a_out,
+            n_groups,
+            o_lora_rank,
+            per_group_in,
+        )?;
     } else {
         for g in 0..n_groups {
             let raw_view = attn_out_raw.sub_offset(g * per_group_in, per_group_in);
@@ -5556,6 +5854,7 @@ fn attn_stub(
             let out_view = wo_a_out.sub_offset(g * o_lora_rank, o_lora_rank);
             gemv_auto(
                 gpu,
+                weights.mq2r_backend,
                 &wo_a_view,
                 &rot_view,
                 &raw_view,
@@ -5579,6 +5878,7 @@ fn attn_stub(
     }
     gemv_auto(
         gpu,
+        weights.mq2r_backend,
         wo_b,
         wo_a_out_rot,
         wo_a_out,
@@ -5688,7 +5988,7 @@ fn moe_route(
     let fused_activation = config_cache::moe_route_fused_activation()
         && gpu.arch_caps.is_gfx1151()
         && gate_w.dtype == DType::MFP4G32E8SOA
-        && config_cache::e8_u4_on(&gpu.arch, gpu.deepseek4_mq2r_route_v1);
+        && config_cache::e8_u4_on(&gpu.arch, weights.mq2r_backend.is_gfx1151());
     if fused_activation {
         gpu.gemv_mfp4g32_e8_soa_u4_buffer_sqrt_softplus_gfx1151(
             gate_w,
@@ -5701,6 +6001,7 @@ fn moe_route(
     } else {
         gemv_auto(
             gpu,
+            weights.mq2r_backend,
             gate_w,
             ffn_x_rot,
             ffn_x_plain,
@@ -5760,6 +6061,8 @@ fn mhc_pre(
         );
     }
     let fused_control_finalize = config_cache::hc_control_finalize_fused_on(&gpu.arch, cfg.mq2r);
+    let fused_finalize = config_cache::hc_finalize_fused_on(&gpu.arch, cfg.mq2r)
+        || config_cache::gfx942_hc_finalize_fused_on(&gpu.arch, weights.mq2r_backend.is_gfx942());
     let control_rsqrt_once = config_cache::hc_control_rsqrt_once_on(&gpu.arch, cfg.mq2r);
     let hc_c_len = if fused_control_finalize {
         if control_rsqrt_once {
@@ -5849,6 +6152,7 @@ fn mhc_pre(
         .map_err(|e| format!("hc_compute_control_vec4_finalize layer {layer_idx}: {e:?}"))?;
     } else {
         gpu.hc_compute_control(
+            weights.mq2r_backend.is_gfx1151(),
             streams,
             hc_fn,
             hc_base,
@@ -5874,7 +6178,7 @@ fn mhc_pre(
             cfg.hc_sinkhorn_iters as i32,
         )
         .map_err(|e| format!("hc_finalize_input_map layer {layer_idx}: {e:?}"))?;
-    } else if config_cache::hc_finalize_fused_on(&gpu.arch, cfg.mq2r) {
+    } else if fused_finalize {
         gpu.hc_finalize_control(
             hc_c_full,
             hc_scale,
@@ -5895,10 +6199,7 @@ fn mhc_pre(
     // COMB (16-dim → 4x4): cross-stream combining matrix, Sinkhorn-
     //   normalized to be doubly stochastic.
     let comb_view = state.hc_c.as_ref().unwrap().sub_offset(8, 16);
-    if !fused_control_finalize
-        && !fused_input_map
-        && !config_cache::hc_finalize_fused_on(&gpu.arch, cfg.mq2r)
-    {
+    if !fused_control_finalize && !fused_input_map && !fused_finalize {
         gpu.hc_sinkhorn_4x4(&comb_view, cfg.hc_eps, cfg.hc_sinkhorn_iters as i32)
             .map_err(|e| format!("hc_sinkhorn_4x4 layer {layer_idx}: {e:?}"))?;
     }
@@ -6088,6 +6389,7 @@ fn apply_tail_rope(
         layer_rope_params(cfg, layer.compress_ratio);
 
     gpu.rope_tail_yarn_interleaved(
+        weights.mq2r_backend.is_gfx1151(),
         q,
         kv,
         pos_buf,
@@ -6152,7 +6454,16 @@ fn kv_joint(
     let kv = state.kv.as_ref().unwrap();
 
     // wkv @ tmp → kv.  Dispatch on weight dtype (MQ4G256 / F32-from-F16).
-    gemv_auto(gpu, wkv, tmp, tmp_plain, kv, kv_dim, cfg.hidden_size)?;
+    gemv_auto(
+        gpu,
+        weights.mq2r_backend,
+        wkv,
+        tmp,
+        tmp_plain,
+        kv,
+        kv_dim,
+        cfg.hidden_size,
+    )?;
 
     // kv_norm RMSNorm in place (upstream DeepSeek V4: `kv = self.kv_norm(kv)`
     // after wkv, before apply_rotary_emb). Was missing — likely
@@ -6264,13 +6575,14 @@ fn q_lora(
     //    outputs are needed (the common DeepSeek V4 case), use the fused variant
     //    that writes both in one launch.
     if wq_a_needs_fwht {
-        gpu.fused_rmsnorm_rotate_mq_plain(
+        gpu.deepseek4_fused_rmsnorm_rotate_mq_plain(
             hc_x_in,
             attn_norm,
             tmp,
             tmp_plain,
             cfg.hidden_size,
             cfg.rms_norm_eps,
+            weights.mq2r_backend.is_gfx1151(),
         )
         .map_err(|e| format!("fused_rmsnorm_rotate_mq_plain layer {layer_idx}: {e:?}"))?;
     } else {
@@ -6289,6 +6601,7 @@ fn q_lora(
     // 2. wq_a @ tmp → q_lat. M = q_lora_rank, K = hidden.
     gemv_auto(
         gpu,
+        weights.mq2r_backend,
         wq_a,
         tmp,
         tmp_plain,
@@ -6339,7 +6652,16 @@ fn q_lora(
     // 4. wq_b @ q_lat_rot → q. M = n_heads * head_dim, K = q_lora_rank.
     //    Use q_lat (un-rotated) for F16 path; q_lat_rot for MQ4 path.
     let q_total = cfg.num_attention_heads * cfg.head_dim;
-    gemv_auto(gpu, wq_b, q_lat_rot, q_lat, q, q_total, cfg.q_lora_rank)?;
+    gemv_auto(
+        gpu,
+        weights.mq2r_backend,
+        wq_b,
+        q_lat_rot,
+        q_lat,
+        q,
+        q_total,
+        cfg.q_lora_rank,
+    )?;
 
     // 4.5. Per-head RMSNorm of Q (upstream DeepSeek V4:
     //     `q *= rsqrt(q.square().mean(-1, keepdim=True) + eps)`).
@@ -7317,6 +7639,7 @@ fn hc_attn_mix_batched(
 #[allow(clippy::too_many_arguments)]
 fn wo_per_group_batched_e8_fallback(
     gpu: &mut Gpu,
+    mq2r_backend: Mq2rBackend,
     wo_a: &GpuTensor,
     x_rotated_batch: &GpuTensor,
     x_plain_batch: &GpuTensor,
@@ -7351,7 +7674,7 @@ fn wo_per_group_batched_e8_fallback(
     }
     if wo_a.dtype == DType::MFP4G32E8SOA
         && batch_size > 16
-        && config_cache::e8_prefill_b2_on(&gpu.arch, gpu.deepseek4_mq2r_route_v1)
+        && config_cache::e8_prefill_b2_on(&gpu.arch, mq2r_backend.is_gfx1151())
     {
         return gpu
             .gemm_mfp4g32_e8_soa_grouped_wmma_b2(
@@ -7389,7 +7712,16 @@ fn wo_per_group_batched_e8_fallback(
             let x_rot = x_rotated_batch.sub_offset(x_off, per_group_in);
             let x_plain = x_plain_batch.sub_offset(x_off, per_group_in);
             let y = y_batch.sub_offset(b * output_stride + g * rank, rank);
-            gemv_auto(gpu, &w, &x_rot, &x_plain, &y, rank, per_group_in)?;
+            gemv_auto(
+                gpu,
+                mq2r_backend,
+                &w,
+                &x_rot,
+                &x_plain,
+                &y,
+                rank,
+                per_group_in,
+            )?;
         }
     }
     Ok(())
@@ -7721,6 +8053,7 @@ fn attention_block_batched_swa_only(
         DType::MFP4G32E8 | DType::MFP4G32E8SOA | DType::MFP3G32E8 => {
             wo_per_group_batched_e8_fallback(
                 gpu,
+                weights.mq2r_backend,
                 wo_a,
                 &pbs.attn_out_raw_rot_batch,
                 &pbs.attn_out_raw_batch,
@@ -7761,6 +8094,7 @@ fn attention_block_batched_swa_only(
     //    F32/Q8/MQ4 dispatch.
     gemv_auto_batched_wmma(
         gpu,
+        weights.mq2r_backend,
         wo_b,
         &pbs.wo_a_out_rot_batch,
         &pbs.wo_a_out_batch,
@@ -8025,6 +8359,7 @@ fn attention_block_batched_mixed(
         } else {
             gemv_auto_batched_wmma(
                 gpu,
+                weights.mq2r_backend,
                 comp_wkv,
                 &pbs.tmp_batch,
                 &pbs.tmp_plain_batch,
@@ -8036,6 +8371,7 @@ fn attention_block_batched_mixed(
             )?;
             gemv_auto_batched_wmma(
                 gpu,
+                weights.mq2r_backend,
                 comp_wgate,
                 &pbs.tmp_batch,
                 &pbs.tmp_plain_batch,
@@ -8056,6 +8392,7 @@ fn attention_block_batched_mixed(
                     .ok_or_else(|| format!("idx_comp_wgate l{layer_idx}"))?;
                 gemv_auto_batched_wmma(
                     gpu,
+                    weights.mq2r_backend,
                     idx_wkv,
                     &pbs.tmp_batch,
                     &pbs.tmp_plain_batch,
@@ -8067,6 +8404,7 @@ fn attention_block_batched_mixed(
                 )?;
                 gemv_auto_batched_wmma(
                     gpu,
+                    weights.mq2r_backend,
                     idx_wgate,
                     &pbs.tmp_batch,
                     &pbs.tmp_plain_batch,
@@ -8250,6 +8588,7 @@ fn attention_block_batched_mixed(
             // wq_b_idx GEMV batched: q_lat_rot_batch → q_idx_batch.
             gemv_auto_batched_wmma(
                 gpu,
+                weights.mq2r_backend,
                 wq_b_idx,
                 &pbs.q_lat_rot_batch,
                 &pbs.q_lat_batch,
@@ -8277,6 +8616,7 @@ fn attention_block_batched_mixed(
             // weights_proj GEMV batched: tmp_batch → idx_w_batch.
             gemv_auto_batched_wmma(
                 gpu,
+                weights.mq2r_backend,
                 weights_proj,
                 &pbs.tmp_batch,
                 &pbs.tmp_plain_batch,
@@ -8638,6 +8978,7 @@ fn attention_block_batched_mixed(
         DType::MFP4G32E8 | DType::MFP4G32E8SOA | DType::MFP3G32E8 => {
             wo_per_group_batched_e8_fallback(
                 gpu,
+                weights.mq2r_backend,
                 wo_a,
                 &pbs.attn_out_raw_rot_batch,
                 &pbs.attn_out_raw_batch,
@@ -8668,6 +9009,7 @@ fn attention_block_batched_mixed(
     // 9. wo_b GEMV batched.
     gemv_auto_batched_wmma(
         gpu,
+        weights.mq2r_backend,
         wo_b,
         &pbs.wo_a_out_rot_batch,
         &pbs.wo_a_out_batch,
@@ -8736,6 +9078,7 @@ fn attention_block_batched_mixed(
 fn ffn_batched(
     cfg: &DeepseekV4Config,
     layer: &crate::deepseek4::DeepseekV4LayerWeights,
+    mq2r_backend: Mq2rBackend,
     pbs: &PrefillBatchScratch,
     gpu: &mut Gpu,
     layer_idx: usize,
@@ -8789,6 +9132,7 @@ fn ffn_batched(
     // 2-3. Shared expert gate + up GEMVs.
     gemv_auto_batched_wmma(
         gpu,
+        mq2r_backend,
         shared_w1,
         &pbs.ffn_x_rot_batch,
         &pbs.ffn_x_plain_batch,
@@ -8800,6 +9144,7 @@ fn ffn_batched(
     )?;
     gemv_auto_batched_wmma(
         gpu,
+        mq2r_backend,
         shared_w3,
         &pbs.ffn_x_rot_batch,
         &pbs.ffn_x_plain_batch,
@@ -8835,6 +9180,7 @@ fn ffn_batched(
     // 6. Shared down GEMV → ffn_out_batch.
     gemv_auto_batched_wmma(
         gpu,
+        mq2r_backend,
         shared_w2,
         &pbs.ffn_shared_rot_batch,
         &pbs.ffn_shared_gate_batch,
@@ -8877,6 +9223,7 @@ fn ffn_batched(
     // 8. Router GEMV: gate.weight @ ffn_x_rot_batch → moe_scores [B, n_exp].
     gemv_auto_batched_wmma(
         gpu,
+        mq2r_backend,
         gate_w,
         &pbs.ffn_x_rot_batch,
         &pbs.ffn_x_plain_batch,
@@ -8931,6 +9278,7 @@ fn ffn_batched(
         batch_size,
         route_scale,
         swiglu_limit: cfg.swiglu_limit,
+        uses_atomic_moe_down: mq2r_backend.uses_atomic_moe_down(),
         layer_idx,
         routing,
         scores: &pbs.moe_scores_batch,
@@ -9181,6 +9529,7 @@ fn compute_batched_head_logits(
     let x_f16 = state.head_x_f16.as_ref().unwrap();
     gemv_auto_batched_wmma(
         gpu,
+        weights.mq2r_backend,
         head,
         norm_batch,
         norm_batch,
@@ -9638,6 +9987,7 @@ fn apply_tail_rope_batched(
 fn kv_joint_batched(
     cfg: &DeepseekV4Config,
     layer: &crate::deepseek4::DeepseekV4LayerWeights,
+    mq2r_backend: Mq2rBackend,
     pbs: &PrefillBatchScratch,
     gpu: &mut Gpu,
     layer_idx: usize,
@@ -9656,6 +10006,7 @@ fn kv_joint_batched(
     // wkv @ tmp → kv.
     gemv_auto_batched_wmma(
         gpu,
+        mq2r_backend,
         wkv,
         &pbs.tmp_batch,
         &pbs.tmp_plain_batch,
@@ -9699,6 +10050,7 @@ fn kv_joint_batched(
 fn q_lora_batched(
     cfg: &DeepseekV4Config,
     layer: &crate::deepseek4::DeepseekV4LayerWeights,
+    mq2r_backend: Mq2rBackend,
     pbs: &PrefillBatchScratch,
     hc_x_in_batch: &GpuTensor, // [B, hidden]
     gpu: &mut Gpu,
@@ -9765,6 +10117,7 @@ fn q_lora_batched(
     // 2. wq_a GEMV batched: tmp* → q_lat_batch. M = q_lora_rank, K = hidden.
     gemv_auto_batched_wmma(
         gpu,
+        mq2r_backend,
         wq_a,
         &pbs.tmp_batch,
         &pbs.tmp_plain_batch,
@@ -9796,6 +10149,7 @@ fn q_lora_batched(
     let q_total = n_heads * head_dim;
     gemv_auto_batched_wmma(
         gpu,
+        mq2r_backend,
         wq_b,
         &pbs.q_lat_rot_batch,
         &pbs.q_lat_batch,
@@ -9997,13 +10351,22 @@ pub fn forward_prefill_batch_chunk(
         }
 
         // Q-LoRA: pbs.hc_x_in_batch → tmp/tmp_plain → q_lat → q_batch.
-        q_lora_batched(cfg, layer, pbs, &pbs.hc_x_in_batch, gpu, layer_idx, n)?;
+        q_lora_batched(
+            cfg,
+            layer,
+            weights.mq2r_backend,
+            pbs,
+            &pbs.hc_x_in_batch,
+            gpu,
+            layer_idx,
+            n,
+        )?;
         if layer_idx == 0 {
             dump_buf(gpu, "04_l0_q_lora_q_batch", &pbs.q_batch);
         }
 
         // Joint KV projection: tmp/tmp_plain → kv_batch.
-        kv_joint_batched(cfg, layer, pbs, gpu, layer_idx, n)?;
+        kv_joint_batched(cfg, layer, weights.mq2r_backend, pbs, gpu, layer_idx, n)?;
         if layer_idx == 0 {
             dump_buf(gpu, "05_l0_kv_joint_kv_batch", &pbs.kv_batch);
         }
@@ -10041,7 +10404,17 @@ pub fn forward_prefill_batch_chunk(
             dump_buf(gpu, "09_l0_mhc_pre_ffn_hc_x_in", &pbs.hc_x_in_batch);
         }
         let hash_routing = layer_idx < cfg.num_hash_layers;
-        ffn_batched(cfg, layer, pbs, gpu, layer_idx, hash_routing, n, tokens)?;
+        ffn_batched(
+            cfg,
+            layer,
+            weights.mq2r_backend,
+            pbs,
+            gpu,
+            layer_idx,
+            hash_routing,
+            n,
+            tokens,
+        )?;
         if layer_idx == 0 {
             dump_buf(gpu, "10_l0_ffn_out", &pbs.ffn_out_batch);
         }
@@ -10415,10 +10788,28 @@ fn dspark_stage_main_kv_to_ring(
             .map_err(|e| format!("dspark alloc main_x rot: {e:?}"))?;
         gpu.rotate_x_mq(main_x, &rot, hidden)
             .map_err(|e| format!("dspark rotate main_x: {e:?}"))?;
-        gemv_auto(gpu, wkv, &rot, main_x, &main_kv, kv_dim, hidden)?;
+        gemv_auto(
+            gpu,
+            Mq2rBackend::Portable,
+            wkv,
+            &rot,
+            main_x,
+            &main_kv,
+            kv_dim,
+            hidden,
+        )?;
         let _ = gpu.free_tensor(rot);
     } else {
-        gemv_auto(gpu, wkv, main_x, main_x, &main_kv, kv_dim, hidden)?;
+        gemv_auto(
+            gpu,
+            Mq2rBackend::Portable,
+            wkv,
+            main_x,
+            main_x,
+            &main_kv,
+            kv_dim,
+            hidden,
+        )?;
     }
     gpu.rmsnorm_f32(&main_kv, kv_norm, &main_kv, cfg.rms_norm_eps)
         .map_err(|e| format!("dspark main_kv norm: {e:?}"))?;
@@ -10639,11 +11030,21 @@ pub fn dspark_forward(
                 .map_err(|e| format!("dspark alloc main_proj rot: {e:?}"))?;
             gpu.rotate_x_mq(main_hidden, &rot, three_h)
                 .map_err(|e| format!("dspark rotate main_hidden: {e:?}"))?;
-            gemv_auto(gpu, main_proj, &rot, main_hidden, &main_x, hidden, three_h)?;
+            gemv_auto(
+                gpu,
+                Mq2rBackend::Portable,
+                main_proj,
+                &rot,
+                main_hidden,
+                &main_x,
+                hidden,
+                three_h,
+            )?;
             let _ = gpu.free_tensor(rot);
         } else {
             gemv_auto(
                 gpu,
+                Mq2rBackend::Portable,
                 main_proj,
                 main_hidden,
                 main_hidden,
@@ -10732,12 +11133,21 @@ pub fn dspark_forward(
                 .hc_x_in_batch
                 .shallow_clone();
             let pbs = state.dspark_pbs.as_ref().unwrap();
-            q_lora_batched(cfg, layer, pbs, &hc_x_in, gpu, s, block)?;
+            q_lora_batched(
+                cfg,
+                layer,
+                Mq2rBackend::Portable,
+                pbs,
+                &hc_x_in,
+                gpu,
+                s,
+                block,
+            )?;
         }
         // 3. block kv from the same attn_norm'd input (reads pbs.tmp*).
         {
             let pbs = state.dspark_pbs.as_ref().unwrap();
-            kv_joint_batched(cfg, layer, pbs, gpu, s, block)?;
+            kv_joint_batched(cfg, layer, Mq2rBackend::Portable, pbs, gpu, s, block)?;
         }
         // 4. tail RoPE on q_batch + block kv_batch at positions position+1..+block.
         {
@@ -10815,6 +11225,7 @@ pub fn dspark_forward(
             ffn_batched(
                 cfg,
                 layer,
+                Mq2rBackend::Portable,
                 pbs,
                 gpu,
                 s,
@@ -10976,11 +11387,20 @@ pub fn dspark_run_body_and_hc_gate(
                 .hc_x_in_batch
                 .shallow_clone();
             let pbs = state.dspark_pbs.as_ref().unwrap();
-            q_lora_batched(cfg, layer, pbs, &hc_x_in, gpu, s, block)?;
+            q_lora_batched(
+                cfg,
+                layer,
+                Mq2rBackend::Portable,
+                pbs,
+                &hc_x_in,
+                gpu,
+                s,
+                block,
+            )?;
         }
         {
             let pbs = state.dspark_pbs.as_ref().unwrap();
-            kv_joint_batched(cfg, layer, pbs, gpu, s, block)?;
+            kv_joint_batched(cfg, layer, Mq2rBackend::Portable, pbs, gpu, s, block)?;
         }
         {
             let pbs = state.dspark_pbs.as_ref().unwrap();
@@ -11042,7 +11462,17 @@ pub fn dspark_run_body_and_hc_gate(
         {
             let pbs = state.dspark_pbs.as_ref().unwrap();
             mhc_pre_batched(cfg, layer, pbs, gpu, s, false, block)?;
-            ffn_batched(cfg, layer, pbs, gpu, s, false, block, &[])?;
+            ffn_batched(
+                cfg,
+                layer,
+                Mq2rBackend::Portable,
+                pbs,
+                gpu,
+                s,
+                false,
+                block,
+                &[],
+            )?;
             hc_ffn_mix_batched(cfg, pbs, gpu, block)?;
         }
     }
@@ -11202,6 +11632,7 @@ fn dspark_wo_project(
     // 9. wo_b GEMV → attn_out_batch.
     gemv_auto_batched_wmma(
         gpu,
+        Mq2rBackend::Portable,
         wo_b,
         &pbs.wo_a_out_rot_batch,
         &pbs.wo_a_out_batch,
@@ -11335,6 +11766,7 @@ fn dspark_forward_head(
         .map_err(|e| format!("dspark alloc head x_f16: {e:?}"))?;
     gemv_auto_batched_wmma(
         gpu,
+        Mq2rBackend::Portable,
         head,
         normed_rot.as_ref().unwrap_or(&normed),
         &normed,
@@ -11406,6 +11838,7 @@ fn dspark_forward_head(
             let conf_i = conf_batch.sub_offset(i, 1);
             gemv_auto(
                 gpu,
+                Mq2rBackend::Portable,
                 confidence_proj,
                 &concat_dev,
                 &concat_dev,
@@ -11424,6 +11857,7 @@ fn dspark_forward_head(
         };
         gemv_auto(
             gpu,
+            Mq2rBackend::Portable,
             markov_w2,
             x_for_w2,
             &emb_dev,
@@ -11657,10 +12091,28 @@ pub fn dspark_head_parity(
             .map_err(|e| format!("parity alloc rot: {e:?}"))?;
         gpu.rotate_x_mq(&mh_dev, &rot, three_h)
             .map_err(|e| format!("parity rotate mh: {e:?}"))?;
-        gemv_auto(gpu, main_proj, &rot, &mh_dev, &pre_dev, hidden, three_h)?;
+        gemv_auto(
+            gpu,
+            Mq2rBackend::Portable,
+            main_proj,
+            &rot,
+            &mh_dev,
+            &pre_dev,
+            hidden,
+            three_h,
+        )?;
         let _ = gpu.free_tensor(rot);
     } else {
-        gemv_auto(gpu, main_proj, &mh_dev, &mh_dev, &pre_dev, hidden, three_h)?;
+        gemv_auto(
+            gpu,
+            Mq2rBackend::Portable,
+            main_proj,
+            &mh_dev,
+            &mh_dev,
+            &pre_dev,
+            hidden,
+            three_h,
+        )?;
     }
     let pre_gpu = gpu
         .download_f32(&pre_dev)
@@ -11723,10 +12175,28 @@ pub fn dspark_head_parity(
             .map_err(|e| format!("parity alloc emb rot: {e:?}"))?;
         gpu.rotate_x_mq(&emb_dev, &rot, rank)
             .map_err(|e| format!("parity rotate emb: {e:?}"))?;
-        gemv_auto(gpu, markov_w2, &rot, &emb_dev, &bias_dev, vocab, rank)?;
+        gemv_auto(
+            gpu,
+            Mq2rBackend::Portable,
+            markov_w2,
+            &rot,
+            &emb_dev,
+            &bias_dev,
+            vocab,
+            rank,
+        )?;
         let _ = gpu.free_tensor(rot);
     } else {
-        gemv_auto(gpu, markov_w2, &emb_dev, &emb_dev, &bias_dev, vocab, rank)?;
+        gemv_auto(
+            gpu,
+            Mq2rBackend::Portable,
+            markov_w2,
+            &emb_dev,
+            &emb_dev,
+            &bias_dev,
+            vocab,
+            rank,
+        )?;
     }
     let bias_gpu = gpu
         .download_f32(&bias_dev)
@@ -11848,6 +12318,44 @@ mod tests {
         assert!(!config_cache::hc_finalize_input_map_on(arch, true));
         assert!(!config_cache::qnorm_rotate_fused_on(arch, true));
         assert!(!config_cache::redline_ffn_split_on(arch, true));
+        // gfx942 A2 levers must not bleed into gfx1151.
+        assert!(!config_cache::gfx942_compressor_gate_on(arch, true));
+        assert!(!config_cache::gfx942_e8_wo_grouped_on(arch, true));
+        assert!(!config_cache::gfx942_hc_finalize_fused_on(arch, true));
+        assert!(!config_cache::gfx942_indexer_topk_parallel_on(arch, true));
+        assert!(!config_cache::gfx942_ffn_overlap_on(false));
+    }
+
+    #[test]
+    fn gfx942_a2_lever_defaults_are_arch_gated() {
+        // L3 and F1 are certified defaults for exact gfx942 route v1; L1 is
+        // still an opt-in experiment.
+        assert!(!config_cache::gfx942_compressor_gate_on("gfx942", true));
+        assert!(config_cache::gfx942_e8_wo_grouped_on("gfx942", true));
+        assert!(!config_cache::gfx942_hc_finalize_fused_on("gfx942", true));
+        assert!(config_cache::gfx942_indexer_topk_parallel_on(
+            "gfx942", true
+        ));
+        // Fail closed on non-mq2r and non-gfx942.
+        assert!(!config_cache::gfx942_compressor_gate_on("gfx942", false));
+        assert!(!config_cache::gfx942_e8_wo_grouped_on("gfx942", false));
+        assert!(!config_cache::gfx942_hc_finalize_fused_on("gfx942", false));
+        assert!(!config_cache::gfx942_indexer_topk_parallel_on(
+            "gfx942", false
+        ));
+        assert!(!config_cache::gfx942_ffn_overlap_on(false));
+        assert!(!config_cache::gfx942_compressor_gate_on("gfx1100", true));
+        assert!(!config_cache::gfx942_e8_wo_grouped_on("gfx1201", true));
+        assert!(!config_cache::gfx942_hc_finalize_fused_on("gfx1201", true));
+        assert!(!config_cache::gfx942_indexer_topk_parallel_on(
+            "gfx1201", true
+        ));
+        assert!(!config_cache::gfx942_compressor_gate_on("gfx1151", true));
+        assert!(!config_cache::gfx942_indexer_topk_parallel_on(
+            "gfx1151", true
+        ));
+        // gfx1151 grouped flag stays gfx1151-only.
+        assert!(!config_cache::e8_wo_grouped_on("gfx942", true));
     }
 
     #[test]

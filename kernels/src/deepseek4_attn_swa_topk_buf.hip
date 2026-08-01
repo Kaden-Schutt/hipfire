@@ -121,14 +121,17 @@ extern "C" __global__ __launch_bounds__(512, 1) void deepseek4_attn_swa_topk_f32
     }
 
     // Phase 4c: warp-wide deterministic sum via __shfl broadcasts in fixed
-    // lane order 0..31. Top-of-kernel `if (h >= n_heads) return;` is
-    // block-uniform, so all wave lanes participate here.
+    // lane order 0..31. Width is explicit 32 because HIP defaults __shfl
+    // width to warpSize, which is 64 on CDNA3; without it every lane would
+    // read physical lanes 0..31 only and upper-half partials would be dropped.
+    // Top-of-kernel `if (h >= n_heads) return;` is block-uniform, so all
+    // wave lanes participate here.
     const int warp_id4 = t >> 5;
     const int lane_id4 = t & 31;
     float ws = 0.0f;
     #pragma unroll
     for (int src = 0; src < 32; ++src) {
-        ws += __shfl(thread_sum, src);
+        ws += __shfl(thread_sum, src, 32);
     }
     if (lane_id4 == 0) {
         warp_scratch[warp_id4] = ws;
@@ -271,7 +274,7 @@ void deepseek4_attn_swa_topk_ilp4_f32_buf(
     float warp_sum = 0.0f;
     #pragma unroll
     for (int source = 0; source < 32; ++source) {
-        warp_sum += __shfl(thread_sum, source);
+        warp_sum += __shfl(thread_sum, source, 32);
     }
     if (lane_id == 0) {
         warp_scratch[warp_id] = warp_sum;
@@ -474,7 +477,7 @@ void deepseek4_attn_swa_topk_scoregrid_f32_buf(
     float warp_sum = 0.0f;
     #pragma unroll
     for (int source = 0; source < 32; ++source) {
-        warp_sum += __shfl(thread_sum, source);
+        warp_sum += __shfl(thread_sum, source, 32);
     }
     if (lane_id == 0) {
         warp_scratch[warp_id] = warp_sum;
@@ -584,7 +587,10 @@ void deepseek4_attn_swa_topk_warp_f32_buf(
             partial += q_lds[i] * k_col[i * stride + col];
         }
         for (int offset = 16; offset > 0; offset >>= 1) {
-            partial += __shfl_down(partial, offset);
+            // Explicit width 32: default warpSize is 64 on CDNA3 and would
+            // mix partials across the two logical 32-lane groups that share
+            // one physical wave.
+            partial += __shfl_down(partial, offset, 32);
         }
         if (lane == 0) {
             scores_lds[p] = partial * inv_scale;
@@ -630,7 +636,7 @@ void deepseek4_attn_swa_topk_warp_f32_buf(
     float warp_sum = 0.0f;
     #pragma unroll
     for (int source = 0; source < 32; ++source) {
-        warp_sum += __shfl(thread_sum, source);
+        warp_sum += __shfl(thread_sum, source, 32);
     }
     if (lane == 0) {
         warp_scratch[warp] = warp_sum;
@@ -660,7 +666,8 @@ void deepseek4_attn_swa_topk_warp_f32_buf(
                      * topk_v[d * topk_window + p];
         }
         for (int offset = 16; offset > 0; offset >>= 1) {
-            partial += __shfl_down(partial, offset);
+            // Explicit width 32: see score-phase comment above.
+            partial += __shfl_down(partial, offset, 32);
         }
         if (lane == 0) {
             attn_out[h * head_dim + d] = partial;

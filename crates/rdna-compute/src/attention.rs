@@ -8597,6 +8597,7 @@ impl Gpu {
     }
     pub fn hc_compute_control(
         &mut self,
+        deepseek4_gfx1151_route: bool,
         x_flat: &GpuTensor, // [x_dim] fp16
         w_fn: &GpuTensor,   // [n_ctrl, x_dim] fp16
         base: &GpuTensor,   // [n_ctrl] fp16
@@ -8605,12 +8606,7 @@ impl Gpu {
         x_dim: i32,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let vec4 = self.arch == "gfx1151"
-            && (self.deepseek4_mq2r_route_v1
-                || hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_HC_CONTROL_VEC4")
-                    .ok()
-                    .as_deref()
-                    == Some("1"));
+        let vec4 = self.arch == "gfx1151" && deepseek4_gfx1151_route;
         let (logical_name, symbol) = if vec4 {
             ("hc_compute_control_vec4", "hc_compute_control_vec4")
         } else {
@@ -9646,6 +9642,7 @@ impl Gpu {
     }
     pub fn indexer_top_k_buf(
         &mut self,
+        deepseek4_gfx1151_route: bool,
         scores: &GpuTensor,
         top_indices: &GpuTensor,
         n_compressed_buf: &GpuTensor,
@@ -9662,16 +9659,6 @@ impl Gpu {
                 .as_deref()
                 == Some("1")
         });
-        static FORCE_PARALLEL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let force_parallel = *FORCE_PARALLEL.get_or_init(|| {
-            hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_INDEXER_TOPK_PARALLEL")
-                .ok()
-                .as_deref()
-                == Some("1")
-        });
-        let parallel = self.arch == "gfx1151"
-            && (self.deepseek4_mq2r_route_v1 || force_parallel)
-            && !force_serial;
         static FORCE_BOUNDED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let force_bounded = *FORCE_BOUNDED.get_or_init(|| {
             hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_INDEXER_TOPK_BOUNDED")
@@ -9693,7 +9680,11 @@ impl Gpu {
                 .as_deref()
                 == Some("1")
         });
-        let (logical_name, source, symbol, block, smem) = if parallel {
+        // gfx1151 and gfx942 own distinct code objects and route identities.
+        // The gfx942 filtered sibling cleared the raw-i32 channel and is pinned
+        // by gfx942-v1; =0 remains an emergency kill switch.
+        let gfx1151_parallel = self.arch == "gfx1151" && deepseek4_gfx1151_route && !force_serial;
+        let (logical_name, source, symbol, block, smem) = if gfx1151_parallel {
             if force_unrolled {
                 (
                     "indexer_top_k_buf_unrolled",
@@ -9871,6 +9862,7 @@ impl Gpu {
     }
     pub fn rope_tail_yarn_interleaved(
         &mut self,
+        deepseek4_gfx1151_route: bool,
         q: &GpuTensor,
         k: &GpuTensor,
         pos_buf: &GpuTensor,
@@ -9887,16 +9879,7 @@ impl Gpu {
         inverse: i32,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        static WIDE_GFX1151: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let wide = self.arch == "gfx1151"
-            && n_rot <= 128
-            && (self.deepseek4_mq2r_route_v1
-                || *WIDE_GFX1151.get_or_init(|| {
-                    hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_ROPE_WIDE")
-                        .ok()
-                        .as_deref()
-                        == Some("1")
-                }));
+        let wide = self.arch == "gfx1151" && n_rot <= 128 && deepseek4_gfx1151_route;
         let (logical_name, symbol, block) = if wide {
             (
                 "rope_tail_yarn_interleaved_wide",
@@ -10945,6 +10928,7 @@ impl Gpu {
 
     pub fn deepseek4_attn_swa_topk_f32_buf(
         &mut self,
+        deepseek4_gfx1151_route: bool,
         q: &GpuTensor,
         swa_k: &GpuTensor,
         swa_v: &GpuTensor,
@@ -10962,19 +10946,10 @@ impl Gpu {
         self.bind_thread()?;
         static WARP_GFX1151: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         static ILP4_GFX1151: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        static SCOREGRID_GFX1151: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         static SCOREGRID_XLANE_GFX1151: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         static SCOREGRID_LARGE_SERIAL_GFX1151: std::sync::OnceLock<bool> =
             std::sync::OnceLock::new();
-        let scoregrid = self.arch == "gfx1151"
-            && head_dim == 512
-            && (self.deepseek4_mq2r_route_v1
-                || *SCOREGRID_GFX1151.get_or_init(|| {
-                    hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_ATTN_SCOREGRID")
-                        .ok()
-                        .as_deref()
-                        == Some("1")
-                }));
+        let scoregrid = self.arch == "gfx1151" && head_dim == 512 && deepseek4_gfx1151_route;
         let ilp4 = self.arch == "gfx1151"
             && head_dim == 512
             && *ILP4_GFX1151.get_or_init(|| {

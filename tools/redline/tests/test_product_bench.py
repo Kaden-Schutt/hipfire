@@ -2298,6 +2298,34 @@ class ServeHarnessWarmTests(unittest.TestCase):
             row = sh.send(cfg, [{"role": "user", "content": "hello"}])
         self.assertEqual(row["request_id"], "chatcmpl-turn-1")
 
+    def test_prompt_file_preserves_exact_text_and_lowers_to_one_prose_row(self):
+        sh = self._load_serve_harness()
+        fixtures = (
+            b"alpha\r\nbeta\r\n",
+            b"alpha\r\nbeta",
+        )
+        with tempfile.TemporaryDirectory() as work_dir:
+            prompt_path = Path(work_dir) / "prompt.txt"
+            for fixture in fixtures:
+                with self.subTest(fixture=fixture):
+                    prompt_path.write_bytes(fixture)
+                    rows = sh.load_prompt_battery(None, str(prompt_path))
+                    self.assertEqual(rows, [("prose", fixture.decode("utf-8"))])
+
+    def test_prompt_file_and_prompts_file_are_mutually_exclusive(self):
+        sh = self._load_serve_harness()
+        argv = [
+            "serve_harness.py",
+            "--self-test",
+            "--prompt-file",
+            "prompt.txt",
+            "--prompts-file",
+            "prompts.json",
+        ]
+        with patch.object(sh.sys, "argv", argv), self.assertRaises(SystemExit) as raised:
+            sh.main()
+        self.assertEqual(raised.exception.code, 2)
+
     def test_write_native_config_emits_route_proof_log_when_requested(self):
         sh = self._load_serve_harness()
         with tempfile.TemporaryDirectory() as home:

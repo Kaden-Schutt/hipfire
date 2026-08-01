@@ -6,6 +6,7 @@
 
 pub mod arch_caps;
 pub mod attention;
+pub mod cdna;
 mod compiler;
 mod dispatch;
 pub mod embedding;

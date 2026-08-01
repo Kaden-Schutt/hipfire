@@ -12,6 +12,8 @@ use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::model_source::ModelSource;
 use serde::{Deserialize, Serialize};
 
+use crate::backend::Mq2rBackend;
+
 /// Per-layer compression mode for the indexer / KV path.
 ///
 /// `compress_ratios` in `config.json` is a per-layer array. The
@@ -805,6 +807,10 @@ impl DeepseekV4LayerWeights {
 /// `mtp.` prefix-skip in `hipfire-quantize` is lifted and MTP
 /// tensors are quantized alongside main layers).
 pub struct DeepseekV4Weights {
+    /// Model-owned execution backend for the frozen MQ2R recipe. This is kept
+    /// off the process-wide Gpu so unrelated architectures and model swaps
+    /// cannot inherit DeepSeek4 dispatch policy.
+    pub(crate) mq2r_backend: Mq2rBackend,
     /// Token embedding table. Stored as raw Q8F16 bytes on GPU
     /// (matches the `embed.weight` quant_type from Phase 1 ingest).
     pub token_embd: Option<rdna_compute::GpuTensor>,

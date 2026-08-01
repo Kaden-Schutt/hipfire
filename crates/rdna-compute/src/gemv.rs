@@ -4,6 +4,59 @@ use crate::dispatch::{DType, Gpu, GpuTensor, FP8_GEMV_MIN_M};
 use crate::kernels;
 use hip_bridge::HipResult;
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+static GFX942_ROTATE_LIVE_VALIDATED: AtomicBool = AtomicBool::new(false);
+
+fn gfx942_rotate_live_validation_enabled() -> bool {
+    hipfire_config::developer_var("HIPFIRE_GFX942_ROTATE_VALIDATE_LIVE")
+        .ok()
+        .as_deref()
+        == Some("1")
+}
+
+fn validate_mq_rotate_live(input: &[f32], output: &[f32], k: usize, batch: usize) {
+    let signs1 = crate::dispatch::gen_fwht_signs(42, 256);
+    let signs2 = crate::dispatch::gen_fwht_signs(1042, 256);
+    let mut mismatches = 0usize;
+    let mut max_abs = 0.0f32;
+    let mut first = None;
+    for row in 0..batch {
+        for group in 0..k / 256 {
+            let offset = row * k + group * 256;
+            let mut values = [0.0f32; 256];
+            for i in 0..256 {
+                values[i] = input[offset + i] * signs1[i];
+            }
+            let mut stride = 1;
+            while stride < 256 {
+                for base in (0..256).step_by(stride * 2) {
+                    for lane in 0..stride {
+                        let a = values[base + lane];
+                        let b = values[base + lane + stride];
+                        values[base + lane] = a + b;
+                        values[base + lane + stride] = a - b;
+                    }
+                }
+                stride *= 2;
+            }
+            for i in 0..256 {
+                let expected = values[i] * 0.0625 * signs2[i];
+                let actual = output[offset + i];
+                let abs = (actual - expected).abs();
+                max_abs = max_abs.max(abs);
+                if actual.to_bits() != expected.to_bits() {
+                    mismatches += 1;
+                    first.get_or_insert((offset + i, actual, expected));
+                }
+            }
+        }
+    }
+    eprintln!(
+        "[gfx942 rotate live oracle] k={k} batch={batch} mismatches={mismatches}/{} max_abs={max_abs:.8e} first={first:?}",
+        k * batch
+    );
+}
 
 /// DIAGNOSTIC: when HIPFIRE_E8_STRIP=1, gemv_mfp4g32_e8 (gfx1151) launches the
 /// compute-stripped kernel instead of the real decode kernel — for measuring
@@ -2203,7 +2256,8 @@ impl Gpu {
         self.bind_thread()?;
         // gfx94x split: opt-in via HIPFIRE_GFX942_RMSNORM_SPLIT=1.
         // Two-kernel path (reduce + rotate) gives 5× more in-flight wave64s
-        // on prefill scale; modest decode change. Math byte-identical.
+        // on prefill scale; modest decode change. It is mathematically
+        // equivalent, but its reduction order is not byte-identical.
         if self.flags.gfx942_rmsnorm_split {
             return self.fused_rmsnorm_rotate_mq_split_gfx942(x, weight, x_rot, k, eps, 1);
         }
@@ -3182,7 +3236,7 @@ impl Gpu {
     /// `dst_ptr`. Must be called by any kernel that overwrites data at
     /// `dst_ptr` since the caches key on raw pointer equality and have
     /// no way to detect data changes otherwise.
-    fn invalidate_x_caches_for(&mut self, dst_ptr: *mut c_void) {
+    pub(crate) fn invalidate_x_caches_for(&mut self, dst_ptr: *mut c_void) {
         self.scratch.invalidate_x_caches_for(dst_ptr)
     }
 
@@ -3292,7 +3346,21 @@ impl Gpu {
     /// Standalone FWHT rotation for MagnumQuant (MQ4). Writes K floats into x_rot.
     pub fn rotate_x_mq(&mut self, x: &GpuTensor, x_rot: &GpuTensor, k: usize) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel("gemv_mq4g256", kernels::GEMV_MQ4G256_SRC, "mq_rotate_x")?;
+        let validate_live = self.arch == "gfx942"
+            && gfx942_rotate_live_validation_enabled()
+            && !GFX942_ROTATE_LIVE_VALIDATED.swap(true, Ordering::Relaxed);
+        let validation_input = if validate_live {
+            self.hip.device_synchronize()?;
+            Some(self.download_f32(x)?)
+        } else {
+            None
+        };
+        let (kernel, source) = if self.arch == "gfx942" {
+            ("mq_rotate_x_gfx942", kernels::MQ_ROTATE_X_GFX942_SRC)
+        } else {
+            ("mq_rotate_x", kernels::GEMV_MQ4G256_SRC)
+        };
+        self.ensure_kernel(kernel, source, kernel)?;
         self.ensure_mq_signs()?;
         let s1 = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
         let s2 = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
@@ -3309,9 +3377,9 @@ impl Gpu {
         let bytes = crate::profile::mq_rotate_bytes(k);
         let timer = crate::profile::begin_timer(&self.hip, "fwht", "mq_rotate_x", bytes);
         let result = self.launch_maybe_blob(
-            "mq_rotate_x",
+            kernel,
             [(k / 256) as u32, 1, 1],
-            [32, 1, 1],
+            [if self.arch == "gfx942" { 64 } else { 32 }, 1, 1],
             0,
             &mut params,
             || {
@@ -3327,6 +3395,11 @@ impl Gpu {
         if let Some(timer) = timer {
             timer.finish(&self.hip);
         }
+        if let Some(input) = validation_input {
+            self.hip.device_synchronize()?;
+            let output = self.download_f32(x_rot)?;
+            validate_mq_rotate_live(&input, &output, k, 1);
+        }
         self.invalidate_x_caches_for(xrp);
         result
     }
@@ -3340,7 +3413,21 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel("gemv_mq4g256", kernels::GEMV_MQ4G256_SRC, "mq_rotate_x")?;
+        let validate_live = self.arch == "gfx942"
+            && gfx942_rotate_live_validation_enabled()
+            && !GFX942_ROTATE_LIVE_VALIDATED.swap(true, Ordering::Relaxed);
+        let validation_input = if validate_live {
+            self.hip.device_synchronize()?;
+            Some(self.download_f32(x)?)
+        } else {
+            None
+        };
+        let (kernel, source) = if self.arch == "gfx942" {
+            ("mq_rotate_x_gfx942", kernels::MQ_ROTATE_X_GFX942_SRC)
+        } else {
+            ("mq_rotate_x", kernels::GEMV_MQ4G256_SRC)
+        };
+        self.ensure_kernel(kernel, source, kernel)?;
         self.ensure_mq_signs()?;
         let s1 = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
         let s2 = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
@@ -3357,9 +3444,9 @@ impl Gpu {
         let bytes = crate::profile::mq_rotate_bytes(k) * batch_size;
         let timer = crate::profile::begin_timer(&self.hip, "fwht", "mq_rotate_x_batched", bytes);
         let result = self.launch_maybe_blob(
-            "mq_rotate_x",
+            kernel,
             [((k / 256) * batch_size) as u32, 1, 1],
-            [32, 1, 1],
+            [if self.arch == "gfx942" { 64 } else { 32 }, 1, 1],
             0,
             &mut params,
             || {
@@ -3374,6 +3461,11 @@ impl Gpu {
         );
         if let Some(timer) = timer {
             timer.finish(&self.hip);
+        }
+        if let Some(input) = validation_input {
+            self.hip.device_synchronize()?;
+            let output = self.download_f32(x_rot)?;
+            validate_mq_rotate_live(&input, &output, k, batch_size);
         }
         self.invalidate_x_caches_for(xrp);
         result
@@ -4009,6 +4101,39 @@ impl Gpu {
             "gemv_mfp4g32_e8_soa requires K%256==0, got K={k}"
         );
 
+        if self.arch_caps.is_gfx942() {
+            const KERNEL: &str = "gemv_mfp4g32_e8_soa_gfx942";
+            self.ensure_kernel(KERNEL, kernels::GEMV_MFP4G32_E8_SOA_GFX942_SRC, KERNEL)?;
+            let a_ptr = a_raw.buf.as_ptr();
+            let x_ptr = x.buf.as_ptr();
+            let y_ptr = y.buf.as_ptr();
+            let m_val = m as i32;
+            let k_val = k as i32;
+            let mut params: Vec<*mut c_void> = vec![
+                &a_ptr as *const _ as *mut c_void,
+                &x_ptr as *const _ as *mut c_void,
+                &y_ptr as *const _ as *mut c_void,
+                &m_val as *const _ as *mut c_void,
+                &k_val as *const _ as *mut c_void,
+            ];
+            return self.launch_maybe_blob(
+                KERNEL,
+                [m.div_ceil(2) as u32, 1, 1],
+                [64, 1, 1],
+                0,
+                &mut params,
+                || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(a_ptr);
+                    b.push_ptr(x_ptr);
+                    b.push_ptr(y_ptr);
+                    b.push_i32(m_val);
+                    b.push_i32(k_val);
+                    b
+                },
+            );
+        }
+
         if self.arch_caps.is_gfx1151() {
             const KERNEL: &str = "gemv_mfp4g32_e8_soa_gfx1151";
             self.ensure_kernel(KERNEL, kernels::GEMV_MFP4G32_E8_SOA_GFX1151_SRC, KERNEL)?;
@@ -4066,6 +4191,121 @@ impl Gpu {
         }
     }
 
+    /// Experimental gfx942 two-wave workgroup E8-SoA GEMV.
+    ///
+    /// This is an explicit micro-screen surface. Product dispatch continues
+    /// to use `gemv_mfp4g32_e8_soa`; no architecture default selects w128.
+    pub fn gemv_mfp4g32_e8_soa_w128_gfx942(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert!(
+            self.arch_caps.is_gfx942(),
+            "two-wave E8 kernel requires gfx942"
+        );
+        assert!(
+            k % 256 == 0,
+            "two-wave E8 kernel requires K%256==0, got K={k}"
+        );
+        const KERNEL: &str = "gemv_mfp4g32_e8_soa_w128_gfx942";
+        self.ensure_kernel(KERNEL, kernels::GEMV_MFP4G32_E8_SOA_W128_GFX942_SRC, KERNEL)?;
+        let a_ptr = a_raw.buf.as_ptr();
+        let x_ptr = x.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &a_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &y_ptr as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            KERNEL,
+            [m.div_ceil(4) as u32, 1, 1],
+            [128, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b
+            },
+        )
+    }
+
+    /// Experimental fixed two-job gfx942 E8-SoA GEMV.
+    ///
+    /// Both jobs consume the same prerotated activation but use independent
+    /// weight and output allocations. This method is an explicit micro-screen
+    /// surface; no product dispatch selects the pair kernel.
+    pub fn gemv_mfp4g32_e8_soa_pair_gfx942(
+        &mut self,
+        a0: &GpuTensor,
+        a1: &GpuTensor,
+        x: &GpuTensor,
+        y0: &GpuTensor,
+        y1: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert!(
+            self.arch_caps.is_gfx942(),
+            "two-job E8 kernel requires gfx942"
+        );
+        assert!(
+            k % 256 == 0,
+            "two-job E8 kernel requires K%256==0, got K={k}"
+        );
+        const KERNEL: &str = "gemv_mfp4g32_e8_soa_pair_gfx942";
+        self.ensure_kernel(KERNEL, kernels::GEMV_MFP4G32_E8_SOA_PAIR_GFX942_SRC, KERNEL)?;
+        let a0_ptr = a0.buf.as_ptr();
+        let a1_ptr = a1.buf.as_ptr();
+        let x_ptr = x.buf.as_ptr();
+        let y0_ptr = y0.buf.as_ptr();
+        let y1_ptr = y1.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &a0_ptr as *const _ as *mut c_void,
+            &a1_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &y0_ptr as *const _ as *mut c_void,
+            &y1_ptr as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            KERNEL,
+            [m.div_ceil(2) as u32, 2, 1],
+            [64, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut blob = hip_bridge::KernargBlob::new();
+                blob.push_ptr(a0_ptr);
+                blob.push_ptr(a1_ptr);
+                blob.push_ptr(x_ptr);
+                blob.push_ptr(y0_ptr);
+                blob.push_ptr(y1_ptr);
+                blob.push_i32(m_val);
+                blob.push_i32(k_val);
+                blob
+            },
+        )
+    }
+
     /// Generic SoA E8 GEMV variant launcher (bench experiments). Same grid/block/
     /// args as gemv_mfp4g32_e8_soa; only the kernel name + source differ.
     pub fn gemv_mfp4g32_e8_soa_variant(
@@ -4102,6 +4342,61 @@ impl Gpu {
             b.push_i32(k_val);
             b
         })
+    }
+
+    /// Experimental gfx942 FP8-MFMA MFP4-E8 decode path. This is a micro-screen
+    /// surface, not product dispatch: activation rounding changes arithmetic.
+    pub fn gemv_mfp4g32_e8_soa_fp8_mfma_gfx942(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert!(
+            self.arch_caps.is_gfx942(),
+            "FP8 MFMA E8 kernel requires gfx942"
+        );
+        assert!(
+            k % 256 == 0,
+            "FP8 MFMA E8 kernel requires K%256==0, got K={k}"
+        );
+        const KERNEL: &str = "gemv_mfp4g32_e8_soa_fp8_mfma_gfx942";
+        self.ensure_kernel(
+            KERNEL,
+            kernels::GEMV_MFP4G32_E8_SOA_FP8_MFMA_GFX942_SRC,
+            KERNEL,
+        )?;
+        let a_ptr = a_raw.buf.as_ptr();
+        let x_ptr = x.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let m_i32 = m as i32;
+        let k_i32 = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &a_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &y_ptr as *const _ as *mut c_void,
+            &m_i32 as *const _ as *mut c_void,
+            &k_i32 as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            KERNEL,
+            [m.div_ceil(16) as u32, 1, 1],
+            [64, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut blob = hip_bridge::KernargBlob::new();
+                blob.push_ptr(a_ptr);
+                blob.push_ptr(x_ptr);
+                blob.push_ptr(y_ptr);
+                blob.push_i32(m_i32);
+                blob.push_i32(k_i32);
+                blob
+            },
+        )
     }
 
     /// One-launch gfx1151 E8-SoA block-diagonal GEMV:
@@ -4220,10 +4515,7 @@ impl Gpu {
         m: usize,
         k: usize,
     ) -> HipResult<()> {
-        let temporal_buffer = self
-            .flags
-            .gfx1151_e8_buffer
-            .unwrap_or(self.deepseek4_mq2r_route_v1);
+        let temporal_buffer = self.flags.gfx1151_e8_buffer.unwrap_or(false);
         if self.arch_caps.is_gfx1151() && temporal_buffer {
             return self.gemv_mfp4g32_e8_soa_u4_buffer_cpol_gfx1151(0, a, x, y, m, k);
         }
@@ -9632,7 +9924,9 @@ impl Gpu {
             )?;
             let block_size = 64u32; // 2 warps, each processes one row
             let grid = ((m + 1) / 2) as u32; // ceil(M/2)
-            return self.launch_maybe_blob(
+            let bytes = m * (k / 32) * 34 + k * 4 + m * 4;
+            let timer = crate::profile::begin_timer(&self.hip, "gemv", "gemv_q8_0_wide", bytes);
+            let result = self.launch_maybe_blob(
                 "gemv_q8_0_wide",
                 [grid, 1, 1],
                 [block_size, 1, 1],
@@ -9640,18 +9934,28 @@ impl Gpu {
                 &mut params,
                 blob_builder,
             );
+            if let Some(t) = timer {
+                t.finish(&self.hip);
+            }
+            return result;
         }
 
         self.ensure_kernel("gemv_q8_0", kernels::GEMV_Q8_0_SRC, "gemv_q8_0")?;
         let block_size = 32u32;
-        self.launch_maybe_blob(
+        let bytes = m * (k / 32) * 34 + k * 4 + m * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "gemv", "gemv_q8_0", bytes);
+        let result = self.launch_maybe_blob(
             "gemv_q8_0",
             [m as u32, 1, 1],
             [block_size, 1, 1],
             0,
             &mut params,
             blob_builder,
-        )
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
     }
 
     /// y = A_q8hfq * x (split-metadata Q8 GEMV, row_stride = padded row bytes)
@@ -9989,38 +10293,14 @@ impl Gpu {
         m: usize,
         k: usize,
         k_top: usize,
+        deepseek4_gfx1151_route: bool,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        // gfx1151 route v3 pins the accepted K8-all kernel. This is route
-        // policy, not MQ2R tensor identity: another architecture may load the
-        // same artifact and fall through to its portable kernel.
-        let rankpair = !self.deepseek4_mq2r_route_v1
-            && self.arch == "gfx1151"
-            && hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MQ2_DOWN_RANKPAIR")
-                .ok()
-                .as_deref()
-                == Some("1");
-        let rowtile2 = !self.deepseek4_mq2r_route_v1
-            && !rankpair
-            && self.arch == "gfx1151"
-            && hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MQ2_DOWN_ROWTILE2")
-                .ok()
-                .as_deref()
-                == Some("1");
-        let k8all = !rankpair
-            && !rowtile2
-            && self.arch == "gfx1151"
-            && k == 2048
-            && (self.deepseek4_mq2r_route_v1
-                || hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MQ2_DOWN_K8ALL")
-                    .ok()
-                    .as_deref()
-                    == Some("1"));
-        let symbol = if rankpair {
-            "gemv_mq2g256_lloyd_moe_down_residual_scaled_rankpair_indexed"
-        } else if rowtile2 {
-            "gemv_mq2g256_lloyd_moe_down_residual_scaled_rowtile2_indexed"
-        } else if k8all {
+        // The accepted gfx1151 K8-all route is explicit model policy. Exact
+        // gfx942 kernels live behind Gfx942Device; this generic method remains
+        // portable on CDNA and for MiniMax/Qwen callers.
+        let k8all = deepseek4_gfx1151_route && self.arch_caps.is_gfx1151() && k == 2048;
+        let symbol = if k8all {
             "gemv_mq2g256_lloyd_moe_down_residual_scaled_k8all_indexed"
         } else {
             "gemv_mq2g256_lloyd_moe_down_residual_scaled_k8_indexed"
@@ -10037,7 +10317,6 @@ impl Gpu {
         let xrp = x_residual.buf.as_ptr();
         let m_val = m as i32;
         let k_val = k as i32;
-        let k_top_val = k_top as i32;
         let mut params: Vec<*mut c_void> = vec![
             &pp as *const _ as *mut c_void,
             &ip as *const _ as *mut c_void,
@@ -10047,9 +10326,6 @@ impl Gpu {
             &m_val as *const _ as *mut c_void,
             &k_val as *const _ as *mut c_void,
         ];
-        if rankpair {
-            params.push(&k_top_val as *const _ as *mut c_void);
-        }
         // MQ2-Lloyd: 72 bytes / 256-weight group.
         let mq2_weight_bytes = m * (k / 256) * 72;
         let bytes = (k_top as usize) * (mq2_weight_bytes + k * 4 + m * 4);
@@ -10061,19 +10337,7 @@ impl Gpu {
         );
         let result = self.launch_maybe_blob(
             symbol,
-            [
-                if rowtile2 {
-                    m.div_ceil(2) as u32
-                } else {
-                    m as u32
-                },
-                if rankpair {
-                    k_top.div_ceil(2) as u32
-                } else {
-                    k_top as u32
-                },
-                1,
-            ],
+            [m as u32, k_top as u32, 1],
             [32, 1, 1],
             0,
             &mut params,
@@ -10086,9 +10350,6 @@ impl Gpu {
                 b.push_ptr(xrp);
                 b.push_i32(m_val);
                 b.push_i32(k_val);
-                if rankpair {
-                    b.push_i32(k_top_val);
-                }
                 b
             },
         );
@@ -10251,23 +10512,10 @@ impl Gpu {
         k_top: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let wavecb = !self.deepseek4_mq2r_route_v1
-            && self.arch == "gfx1151"
-            && hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MQ2_WAVECB")
-                .ok()
-                .as_deref()
-                == Some("1");
-        let (logical_name, symbol) = if wavecb {
-            (
-                "gemv_mq2g256_lloyd_moe_gate_up_indexed_wavecb",
-                "gemv_mq2g256_lloyd_moe_gate_up_k8_indexed_wavecb",
-            )
-        } else {
-            (
-                "gemv_mq2g256_lloyd_moe_gate_up_indexed",
-                "gemv_mq2g256_lloyd_moe_gate_up_k8_indexed",
-            )
-        };
+        // Exact gfx942 implementations are exposed only by Gfx942Device. This
+        // shared API is the portable channel used by MiniMax and DS4 fallback.
+        let logical_name = "gemv_mq2g256_lloyd_moe_gate_up_indexed";
+        let symbol = "gemv_mq2g256_lloyd_moe_gate_up_k8_indexed";
         self.ensure_kernel(
             logical_name,
             kernels::GEMV_MQ2G256_LLOYD_MOE_GATE_UP_INDEXED_SRC,
@@ -10813,11 +11061,12 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel(
-            "gemv_mq2g256_lloyd_moe_down_expanded_k4",
-            kernels::GEMV_MQ2G256_LLOYD_MOE_DOWN_EXPANDED_K4_SRC,
-            "gemv_mq2g256_lloyd_moe_down_expanded_k4",
-        )?;
+        // Exact gfx942 expansion lives behind Gfx942Device. The shared entry
+        // point is intentionally portable for MiniMax and DS4 fallback.
+        let logical_name = "gemv_mq2g256_lloyd_moe_down_expanded_k4";
+        let source = kernels::GEMV_MQ2G256_LLOYD_MOE_DOWN_EXPANDED_K4_SRC;
+        let symbol = "gemv_mq2g256_lloyd_moe_down_expanded_k4";
+        self.ensure_kernel(logical_name, source, symbol)?;
         let pp = expert_ptrs.buf.as_ptr();
         let ip = topk_indices.buf.as_ptr();
         let xp = rot_batch.buf.as_ptr();
@@ -10836,14 +11085,9 @@ impl Gpu {
         ];
         let mq2_weight_bytes = m * (k / 256) * 72;
         let bytes = batch_size * (k_top as usize) * (mq2_weight_bytes + k * 4 + m * 4);
-        let timer = crate::profile::begin_timer(
-            &self.hip,
-            "gemv",
-            "deepseek4_gemv_mq2g256_lloyd_moe_down_expanded_k4",
-            bytes,
-        );
+        let timer = crate::profile::begin_timer(&self.hip, "gemv", logical_name, bytes);
         let result = self.launch_maybe_blob(
-            "gemv_mq2g256_lloyd_moe_down_expanded_k4",
+            symbol,
             [m as u32, k_top as u32, batch_size as u32],
             [32, 1, 1],
             0,

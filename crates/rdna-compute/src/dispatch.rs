@@ -412,11 +412,6 @@ pub struct MmqScreenState {
 pub struct Gpu {
     pub hip: HipRuntime,
     pub arch: String,
-    /// Versioned gfx1151 decode route for the DeepSeek V4 MQ2R tensor recipe.
-    /// This is deliberately route state, not model identity: the same `.mq2r`
-    /// artifact remains loadable on other architectures through their portable
-    /// dispatch. The DeepSeek loader resets it on every model load.
-    pub deepseek4_mq2r_route_v1: bool,
     pub flags: Arc<FeatureFlags>,
     pub arch_caps: crate::arch_caps::ArchCaps,
     pub device_id: i32,
@@ -838,7 +833,6 @@ impl Gpu {
         Ok(Self {
             hip,
             arch,
-            deepseek4_mq2r_route_v1: false,
             flags,
             arch_caps,
             device_id: id,
@@ -1142,6 +1136,61 @@ impl Gpu {
                 &mut params,
             )
         }
+    }
+
+    /// Expand qt=35 MFP4G32E8SOA rows into row-major FP16 on gfx942.
+    ///
+    /// Unlike [`Self::dequantize_mfp4g32_e8_to_f16`], this reads the SoA wire
+    /// layout used by the frozen DeepSeek4 MQ2R dense tier. The output remains
+    /// in the FWHT-rotated domain, matching the rotated activation supplied by
+    /// the normal MFP4E8 projection path.
+    pub fn dequantize_mfp4g32_e8_soa_to_f16_gfx942(
+        &mut self,
+        packed: &DeviceBuffer,
+        expanded: &DeviceBuffer,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert!(
+            self.arch_caps.is_gfx942(),
+            "qt35 SoA staging requires gfx942"
+        );
+        assert!(
+            k % 256 == 0,
+            "qt35 SoA staging requires K%256==0, got K={k}"
+        );
+        const KERNEL: &str = "dequantize_mfp4g32_e8_soa_to_f16_gfx942";
+        self.ensure_kernel(
+            KERNEL,
+            kernels::DEQUANTIZE_MFP4G32_E8_SOA_TO_F16_GFX942_SRC,
+            KERNEL,
+        )?;
+        let packed_ptr = packed.as_ptr();
+        let expanded_ptr = expanded.as_ptr();
+        let m_i32 = m as i32;
+        let k_i32 = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &packed_ptr as *const _ as *mut c_void,
+            &expanded_ptr as *const _ as *mut c_void,
+            &m_i32 as *const _ as *mut c_void,
+            &k_i32 as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            KERNEL,
+            [m as u32, (k / 32).div_ceil(16) as u32, 1],
+            [64, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut blob = hip_bridge::KernargBlob::new();
+                blob.push_ptr(packed_ptr);
+                blob.push_ptr(expanded_ptr);
+                blob.push_i32(m_i32);
+                blob.push_i32(k_i32);
+                blob
+            },
+        )
     }
 
     /// D→D copy with offsets that picks async (on the active stream) when
@@ -1718,6 +1767,30 @@ impl Gpu {
         // same GpuTensor hygiene (tracked in pool if applicable).
         let fp16 = self.alloc_tensor(&[m * k], DType::F16)?;
         self.dequantize_hfq4g256_to_f16(&w_mq4.buf, &fp16.buf, m, k)?;
+        let ptr = fp16.buf.as_ptr();
+        self.fp16_shadow_cache.insert(key, fp16);
+        Ok(Some(ptr))
+    }
+
+    /// Ensure a model-lifetime FP16 shadow of a qt=35 MFP4G32E8SOA matrix.
+    /// This entry is deliberately separate from the HFQ4 helper so adding the
+    /// DeepSeek4 CDNA path cannot change any existing Qwen/HFQ4 dequant route.
+    pub(crate) fn ensure_mfp4e8_soa_fp16_shadow_gfx942(
+        &mut self,
+        weight: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<Option<*mut c_void>> {
+        if self.arch != "gfx942" || self.rocblas.is_none() {
+            return Ok(None);
+        }
+        debug_assert_eq!(weight.dtype, DType::MFP4G32E8SOA);
+        let key = weight.buf.as_ptr() as usize;
+        if let Some(shadow) = self.fp16_shadow_cache.get(&key) {
+            return Ok(Some(shadow.buf.as_ptr()));
+        }
+        let fp16 = self.alloc_tensor(&[m * k], DType::F16)?;
+        self.dequantize_mfp4g32_e8_soa_to_f16_gfx942(&weight.buf, &fp16.buf, m, k)?;
         let ptr = fp16.buf.as_ptr();
         self.fp16_shadow_cache.insert(key, fp16);
         Ok(Some(ptr))

@@ -90,6 +90,87 @@ impl Gpu {
         self.rocblas_gemm_hfq4_generic(w_fp16, x_fp16, y_fp32, m, n, k, 1.0, 0.0)
     }
 
+    /// gfx942 DeepSeek4 qt=35 dense-prefill path.
+    ///
+    /// The first call expands the frozen MFP4G32E8SOA weight into an FP16
+    /// model-lifetime shadow; subsequent calls reuse that shadow and execute a
+    /// native rocBLAS MFMA GEMM. Returns `false` when the exact DS4 MQ2R /
+    /// CDNA / shape / batch contract is not met, so the architecture owner
+    /// can retain its compressed fallback without exposing this route to
+    /// other models. Discovery is opt-in with
+    /// `HIPFIRE_DEEPSEEK4_GFX942_E8_ROCBLAS=1` until the production-shape
+    /// numerical oracle and model coherence gate pass.
+    pub fn rocblas_gemm_mfp4e8_soa_prefill_auto(
+        &mut self,
+        weight: &GpuTensor,
+        x_rotated: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<bool> {
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        static ADMISSION_LOGGED: OnceLock<()> = OnceLock::new();
+        let enabled = *ENABLED.get_or_init(|| {
+            hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_GFX942_E8_ROCBLAS").as_deref()
+                == Ok("1")
+        });
+        if self.arch != "gfx942"
+            || !enabled
+            || weight.dtype != DType::MFP4G32E8SOA
+            || batch_size < self.rocblas_min_batch()
+            || k % 256 != 0
+            || self.rocblas.is_none()
+            || self.graphs.capture_mode
+        {
+            return Ok(false);
+        }
+        // DeepSeek creates its explicit prefill stream after `Gpu` initializes
+        // rocBLAS. Rebind here so the dequant/activation conversions and GEMM
+        // share one ordered stream; otherwise rocBLAS remains on the null
+        // stream and can race both its inputs and downstream consumers.
+        if let (Some(rb), Some(stream)) = (self.rocblas.as_ref(), self.active_stream.as_ref()) {
+            rb.set_stream(stream).map_err(|e| {
+                hip_bridge::HipError::new(
+                    e.status,
+                    &format!("rocblas_set_stream for DS4 gfx942 prefill: {}", e.context),
+                )
+            })?;
+        }
+        ADMISSION_LOGGED.get_or_init(|| {
+            eprintln!("deepseek4 gfx942: admitted qt35 FP16-shadow + rocBLAS prefill route");
+        });
+        let Some(shadow_ptr) = self.ensure_mfp4e8_soa_fp16_shadow_gfx942(weight, m, k)? else {
+            return Ok(false);
+        };
+        // DS4 rewrites stable PBS allocations between projections and layers.
+        // Pointer-keyed `ensure_fp16_x` would therefore reuse stale contents.
+        // Convert on every call until a content-generation-aware cache exists.
+        let x_fp16 = self.convert_fp16_x_uncached(x_rotated, batch_size * k)?;
+        // The uncached conversion overwrote the shared FP16 scratch. Prevent a
+        // later generic `ensure_fp16_x` caller from treating its old source
+        // marker as a valid cache hit. Keep this repair DS4-local so Qwen's
+        // generic conversion policy is unchanged.
+        self.scratch.fp16_x_source_ptr = std::ptr::null_mut();
+        let shadow = unsafe { DeviceBuffer::from_raw(shadow_ptr, m * k * 2) };
+        let x = unsafe { DeviceBuffer::from_raw(x_fp16, batch_size * k * 2) };
+        // The timer begins after staging, so report the actual hot rocBLAS
+        // traffic: expanded FP16 W + staged FP16 X + FP32 Y.
+        let bytes = m * k * 2 + batch_size * k * 2 + batch_size * m * 4;
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "gemm",
+            "gemm_mfp4g32_e8_soa_rocblas_gfx942",
+            bytes,
+        );
+        let result = self.rocblas_gemm_hfq4_prefill(&shadow, &x, &y.buf, m, batch_size, k);
+        if let Some(timer) = timer {
+            timer.finish(&self.hip);
+        }
+        result?;
+        Ok(true)
+    }
+
     /// Same op as `rocblas_gemm_hfq4_prefill` but with Y += alpha·(X·W^T) +
     /// beta·Y. Covers the residual-GEMM pattern (w_down on LA path, wo on
     /// attention path) where the existing hand-rolled kernels fuse the add.
@@ -12125,7 +12206,20 @@ impl Gpu {
         m_total: usize,
         x_src_rows: usize,
     ) -> HipResult<()> {
-        if self.arch_caps.is_gfx1151() && m % 16 == 0 && k % 256 == 0 {
+        if self.arch_caps.is_gfx942() && m % 16 == 0 && k % 256 == 0 {
+            self.gemm_mq2g256_lloyd_moe_grouped_mfma_gfx942(
+                expert_weight_ptrs,
+                expert_tile_ids,
+                sorted_slot_index,
+                x_src,
+                y_grouped,
+                m,
+                k,
+                x_row_div,
+                m_total,
+                x_src_rows,
+            )
+        } else if self.arch_caps.is_gfx1151() && m % 16 == 0 && k % 256 == 0 {
             self.gemm_mq2g256_lloyd_moe_grouped_mmq_gfx1151(
                 expert_weight_ptrs,
                 expert_tile_ids,
@@ -12152,6 +12246,93 @@ impl Gpu {
                 x_src_rows,
             )
         }
+    }
+
+    /// gfx942/CDNA3 grouped MQ2-Lloyd MoE prefill using native wave64 MFMA.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_mq2g256_lloyd_moe_grouped_mfma_gfx942(
+        &mut self,
+        expert_weight_ptrs: &GpuTensor,
+        expert_tile_ids: &GpuTensor,
+        sorted_slot_index: &GpuTensor,
+        x_src: &GpuTensor,
+        y_grouped: &GpuTensor,
+        m: usize,
+        k: usize,
+        x_row_div: usize,
+        m_total: usize,
+        x_src_rows: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if !self.arch_caps.is_gfx942() {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "gemm_mq2g256_lloyd_moe_grouped_mfma_gfx942 requires gfx942; current arch = {}",
+                    self.arch
+                ),
+            ));
+        }
+        debug_assert_eq!(m % 16, 0);
+        debug_assert_eq!(k % 256, 0);
+        let kernel_name = "gemm_mq2g256_lloyd_moe_grouped_mfma_gfx942";
+        self.ensure_kernel(
+            kernel_name,
+            kernels::GEMM_MQ2G256_LLOYD_MOE_GROUPED_MFMA_GFX942_SRC,
+            kernel_name,
+        )?;
+        let x_f16_ptr = self.ensure_fp16_x(x_src, x_src_rows * k)?;
+
+        let ep = expert_weight_ptrs.buf.as_ptr();
+        let tp = expert_tile_ids.buf.as_ptr();
+        let sp = sorted_slot_index.buf.as_ptr();
+        let xp = x_f16_ptr;
+        let yp = y_grouped.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let xrd_val = x_row_div as i32;
+        let mt_val = m_total as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &ep as *const _ as *mut c_void,
+            &tp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+            &xrd_val as *const _ as *mut c_void,
+            &mt_val as *const _ as *mut c_void,
+        ];
+
+        let row_tiles = ((m + 15) / 16) as u32;
+        let slot_tiles = ((m_total + 15) / 16) as u32;
+        let mq2_weight_bytes = m * (k / 256) * 72;
+        let bytes = m_total * k * 2 + m_total * m * 4 + mq2_weight_bytes;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel_name, bytes);
+        let result = self.launch_maybe_blob(
+            kernel_name,
+            [row_tiles, slot_tiles, 1],
+            [64, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ep);
+                b.push_ptr(tp);
+                b.push_ptr(sp);
+                b.push_ptr(xp);
+                b.push_ptr(yp);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(xrd_val);
+                b.push_i32(mt_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
     }
 
     /// Arch-resolved MQ3-Lloyd grouped MoE GEMM (dispatcher entry). Picks the i8
@@ -13752,7 +13933,7 @@ impl Gpu {
         {
             let mfma_v = self.flags.gfx942_mfma_prefill.clone();
             let want = mfma_v.as_deref();
-            if (want == Some("1") || want == Some("2") || want == Some("3") || want == Some("4"))
+            if matches!(want, Some("1" | "2" | "3" | "4"))
                 && self.arch_caps.is_cdna3()
                 && batch_size >= 16
                 && m % 16 == 0
