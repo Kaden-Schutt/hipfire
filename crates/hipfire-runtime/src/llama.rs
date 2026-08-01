@@ -3505,8 +3505,8 @@ impl ForwardScratch {
     }
 
     /// `max_seq` MUST be ≥ the KV cache's `physical_cap` — the flash-decoding
-    /// partials buffer is sized `n_heads × ceil(max_seq/128) × (2 + head_dim)`
-    /// and the asym/flash attends index it by `ceil(physical_cap/128)` tiles.
+    /// partials buffer is sized from the architecture/shape-selected Q8 tile
+    /// and must cover every tile addressable by the cache.
     /// (Was hardcoded to 16 chunks = max_seq 2048; running at a larger cap
     /// overflowed it → silent OOB / garbage on the flash-attention path.)
     pub fn new_with_max_seq(
@@ -3518,10 +3518,16 @@ impl ForwardScratch {
         let q_dim = config.n_heads * config.head_dim;
         let kv_dim = config.n_kv_heads * config.head_dim;
         // Flash-decoding partials: n_heads × max_chunks × (2 + head_dim) floats.
-        // TILE_SIZE = 128 matches the flash attend kernels (attention.rs).
-        let max_chunks = max_seq.div_ceil(128);
-        let partial_stride = 2 + config.head_dim;
-        let partials_size = config.n_heads * max_chunks * partial_stride;
+        // The gfx1100 Q8 kernel uses tile32 (and selected gfx12 shapes tile16),
+        // so a historical fixed tile128 allocation under-sized this buffer by
+        // up to 8x and faulted as soon as llama-family Q8 decode selected flash.
+        let partials_size = llama_flash_partials_len(
+            &gpu.arch,
+            config.n_heads,
+            config.n_kv_heads,
+            config.head_dim,
+            max_seq,
+        );
         Ok(Self {
             x: gpu.alloc_tensor(&[dim], DType::F32)?,
             tmp: gpu.alloc_tensor(&[dim], DType::F32)?,
@@ -3644,12 +3650,39 @@ fn llama_forward_lowered_enabled() -> bool {
     })
 }
 
-/// KV-cache write + single-token attention, extracted verbatim from the hand
-/// [`forward_scratch_layers`] 7-way KV-tier ladder so the lowered path (N5
-/// Phase A3a) can reuse it unchanged. The hand body keeps its own inline copy
-/// (left untouched as the byte-exact reference). Phase A3b replaces this
-/// helper's body with `attention_family()` + `KvTierPlan`; until then it is a
-/// pure extraction (same kernels, same order → byte-identical).
+#[inline]
+fn llama_attention_flash_mode_for(mode: &str, gpu_arch: &str) -> usize {
+    match mode {
+        "never" | "0" | "off" => 0,
+        "always" | "2" | "force" => 2,
+        _ if gpu_arch.starts_with("gfx11") || gpu_arch.starts_with("gfx12") => 2,
+        _ => 1,
+    }
+}
+
+#[inline]
+fn llama_attention_flash_mode(gpu_arch: &str) -> usize {
+    llama_attention_flash_mode_for(crate::config::get().attention_flash_mode.as_str(), gpu_arch)
+}
+
+#[inline]
+fn llama_flash_partials_len(
+    gpu_arch: &str,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    max_seq: usize,
+) -> usize {
+    let flash_tile = rdna_compute::attention::q8_flash_tile_size(
+        gpu_arch, n_heads, n_kv_heads, head_dim, max_seq,
+    );
+    n_heads * max_seq.div_ceil(flash_tile) * (2 + head_dim)
+}
+
+/// KV-cache write + single-token attention for the lowered decode path.
+/// Asym and Q8 tiers use the paired `AttentionFamily` plan; legacy cache
+/// formats retain the hand ladder below. The hand body keeps its own inline
+/// copy as the byte-exact `HIPFIRE_FORWARD_LOWERED=0` reference.
 fn llama_kv_write_attend(
     gpu: &mut Gpu,
     kv_cache: &KvCache,
@@ -3661,15 +3694,15 @@ fn llama_kv_write_attend(
     head_dim: usize,
     kv_dim: usize,
 ) -> HipResult<()> {
-    if kv_cache.quant_asym4 || kv_cache.quant_asym3 || kv_cache.quant_asym2 {
-        // Asym/Givens KV: this hand ladder has no asym kernels, so route
-        // KV-write + flash-attend through the dispatch attention family (the
-        // same path qwen35 uses). tier_inputs() classifies the tier from the
-        // cache's quant flags; run_attention does both write and single-token
-        // attend. (This is the Phase A3b migration the helper doc anticipated.)
+    if kv_cache.quant_asym4 || kv_cache.quant_asym3 || kv_cache.quant_asym2 || kv_cache.quant_q8 {
+        // Route tiers with an established paired plan through the same family
+        // used by qwen35. In particular, Q8 switches from the single-block-per-
+        // head kernel to tiled flash attention according to the shared mode
+        // policy instead of leaving small-head Qwen3 models under-parallelized.
         let ctx = DispatchCtx::new(gpu);
         let plan = KvTierPlan::derive(KvTierInputs {
             pos,
+            flash_mode: llama_attention_flash_mode(&gpu.arch),
             ..kv_cache.tier_inputs()
         })
         .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
@@ -3923,6 +3956,7 @@ fn forward_scratch_layers_lowered(
         config,
         scratch,
         kv_cache: &*kv_cache,
+        flash_mode: llama_attention_flash_mode(&gpu.arch),
         knobs,
         pos,
     };
@@ -3969,6 +4003,7 @@ struct LlamaDense<'a> {
     config: &'a LlamaConfig,
     scratch: &'a ForwardScratch,
     kv_cache: &'a KvCache,
+    flash_mode: usize,
     knobs: crate::arch_spec::DenseKnobs,
     pos: usize,
 }
@@ -4043,6 +4078,7 @@ impl crate::arch_spec::DenseArch for LlamaDense<'_> {
         let c = self.config;
         let plan = KvTierPlan::derive(KvTierInputs {
             pos: self.pos,
+            flash_mode: self.flash_mode,
             ..kv.tier_inputs()
         })
         .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
@@ -10864,6 +10900,27 @@ mod tests {
     // state between a reset and the draw, breaking determinism). Serialize all
     // RNG-touching `sample_full_dist` tests behind this mutex.
     static RNG_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn qwen3_flash_mode_policy_matches_rdna_generation() {
+        assert_eq!(llama_attention_flash_mode_for("auto", "gfx1100"), 2);
+        assert_eq!(llama_attention_flash_mode_for("auto", "gfx1201"), 2);
+        assert_eq!(llama_attention_flash_mode_for("auto", "gfx1030"), 1);
+        assert_eq!(llama_attention_flash_mode_for("never", "gfx1100"), 0);
+        assert_eq!(llama_attention_flash_mode_for("always", "gfx1030"), 2);
+    }
+
+    #[test]
+    fn qwen3_flash_partials_follow_selected_q8_tile() {
+        let max_seq = 32_768;
+        let expected_tile =
+            rdna_compute::attention::q8_flash_tile_size("gfx1100", 16, 8, 128, max_seq);
+        assert_eq!(expected_tile, 32);
+        assert_eq!(
+            llama_flash_partials_len("gfx1100", 16, 8, 128, max_seq),
+            16 * max_seq.div_ceil(expected_tile) * 130
+        );
+    }
 
     // hunt3 M-B (FinalFix): greedy argmax must drop NaN like the GPU kernel
     // (argmax.hip `data[i] > lmax`), never selecting a NaN-indexed token and
