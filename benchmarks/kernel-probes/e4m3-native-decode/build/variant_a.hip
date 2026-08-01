@@ -16,22 +16,9 @@
 //   (4) QUANT_STEP = 0.88 folded into sc (ssc = sc * 0.88f).
 
 #include <hip/hip_runtime.h>
-#include <hip/hip_fp8.h>
 
 // E4M3 (OCP, UNSIGNED scale, bias 7, 3 mantissa) — bit-identical to the CPU
 // `e4m3_scale_decode` in the quantizer and dequantize_mfp4g32_p_to_f16.
-#if defined(__gfx1200__) || defined(__gfx1201__)
-// gfx12 native OCP FP8 (radiowave Fp8Format::E4M3Ocp). Bit-identical to the
-// scalar idiom over codes 1..=126 — the entire range e4m3_encode_roundup can
-// emit; the full-domain mismatches are the NaN slot 0x7F and the negative
-// half, neither reachable for a SCALE. See
-// benchmarks/kernel-probes/e4m3-native-decode/.
-__device__ __forceinline__ float cvt_e4m3_scale_to_f32(unsigned char b) {
-    __hip_fp8_e4m3 v;
-    v.__x = b;
-    return (float)v;
-}
-#else
 __device__ __forceinline__ float cvt_e4m3_scale_to_f32(unsigned char b) {
     const int exp = (b >> 3) & 0xF;
     const unsigned mant = (unsigned)(b & 0x7);
@@ -39,12 +26,11 @@ __device__ __forceinline__ float cvt_e4m3_scale_to_f32(unsigned char b) {
         return 0.015625f * ((float)mant) * 0.125f;
     }
     if (exp == 0xF && mant == 7u) {
-        return 448.0f; // defensive: NaN code -> max finite (never emitted)
+        return 448.0f;
     }
     const float pow2 = __builtin_bit_cast(float, ((unsigned int)(exp + 120)) << 23);
     return pow2 * (1.0f + ((float)mant) * 0.125f);
 }
-#endif
 
 // E8 decode: u32 index → 8 float coords.
 // Bit-exact mirror of e8.rs::decode_index + * QUANT_STEP.

@@ -9,6 +9,7 @@
 // wall (vs the parity/extraction, which this leaves unchanged).
 
 #include <hip/hip_runtime.h>
+#include <hip/hip_fp8.h>
 
 // [coset][nibble] -> coordinate value. coset0: e-7 ; coset1: e-7+0.5.
 __constant__ float E8_LUT2[2][16] = {
@@ -16,14 +17,31 @@ __constant__ float E8_LUT2[2][16] = {
     {-6.5f,-5.5f,-4.5f,-3.5f,-2.5f,-1.5f,-0.5f,0.5f,1.5f,2.5f,3.5f,4.5f,5.5f,6.5f,7.5f,8.5f},
 };
 
+#if defined(__gfx1200__) || defined(__gfx1201__)
+// gfx12 native OCP FP8 (radiowave Fp8Format::E4M3Ocp). Bit-identical to the
+// scalar idiom over codes 1..=126 — the entire range e4m3_encode_roundup can
+// emit; the full-domain mismatches are the NaN slot 0x7F and the negative
+// half, neither reachable for a SCALE. See
+// benchmarks/kernel-probes/e4m3-native-decode/.
+__device__ __forceinline__ float cvt_e4m3_scale_to_f32_lut(unsigned char b) {
+    __hip_fp8_e4m3 v;
+    v.__x = b;
+    return (float)v;
+}
+#else
 __device__ __forceinline__ float cvt_e4m3_scale_to_f32_lut(unsigned char b) {
     const int exp = (b >> 3) & 0xF;
     const unsigned mant = (unsigned)(b & 0x7);
-    if (exp == 0) return 0.015625f * ((float)mant) * 0.125f;
-    if (exp == 0xF && mant == 7u) return 448.0f;
+    if (exp == 0) {
+        return 0.015625f * ((float)mant) * 0.125f;
+    }
+    if (exp == 0xF && mant == 7u) {
+        return 448.0f; // defensive: NaN code -> max finite (never emitted)
+    }
     const float pow2 = __builtin_bit_cast(float, ((unsigned int)(exp + 120)) << 23);
     return pow2 * (1.0f + ((float)mant) * 0.125f);
 }
+#endif
 
 __device__ __forceinline__ void e8_decode_lut(unsigned int idx, float p[8]) {
     const int coset = (int)((idx >> 31) & 1u);

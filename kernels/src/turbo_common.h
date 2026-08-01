@@ -33,6 +33,29 @@ __constant__ float TURBO_C4_256[16] = {
 //   exp==0          → subnormal: 2^-6 * (mant/8)
 //   exp==15,mant==7 → NaN code (encoder never emits) → max finite 448.0
 //   else (normal)   → 2^(exp-7) * (1 + mant/8)
+//
+// gfx12 (gfx1200/gfx1201) has a native OCP FP8 conversion — the same format
+// radiowave admits as `Fp8Format::E4M3Ocp`. Measured on gfx1201:
+//   * 0 mismatches vs the scalar idiom over codes 1..=126, which is the ENTIRE
+//     range `e4m3_encode_roundup` can emit. The 129 full-domain mismatches are
+//     the NaN slot 0x7F and the whole negative half — neither reachable for a
+//     SCALE, which is the only thing this function decodes.
+//   * -46.6% in a decode-bound loop; -12.7% VALU (605→528) on the real
+//     gemv_mfp4g32_e8 kernel at identical VGPR count.
+// See benchmarks/kernel-probes/e4m3-native-decode/.
+//
+// Not gated on a runtime flag: the arch macro is compile-time and the two
+// paths are bit-identical on the reachable domain, so there is nothing to
+// A/B at runtime. gfx11 and earlier keep the scalar idiom — they have no FP8
+// hardware (radiowave models that as `Fp8Lowering::SoftwareDecode`).
+#if defined(__gfx1200__) || defined(__gfx1201__)
+#include <hip/hip_fp8.h>
+__device__ __forceinline__ float cvt_e4m3_scale_to_f32_dq(unsigned char b) {
+    __hip_fp8_e4m3 v;
+    v.__x = b;
+    return (float)v;
+}
+#else
 __device__ __forceinline__ float cvt_e4m3_scale_to_f32_dq(unsigned char b) {
     const int exp = (b >> 3) & 0xF;
     const unsigned mant = (unsigned)(b & 0x7);
@@ -45,6 +68,7 @@ __device__ __forceinline__ float cvt_e4m3_scale_to_f32_dq(unsigned char b) {
     const float pow2 = __builtin_bit_cast(float, ((unsigned int)(exp + 120)) << 23);
     return pow2 * (1.0f + ((float)mant) * 0.125f);
 }
+#endif
 
 
 // In-place FWHT on 128 elements in registers.
