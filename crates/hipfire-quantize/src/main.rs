@@ -893,6 +893,17 @@ pub(crate) fn quantize_mq4g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32])
     output
 }
 
+/// RadioWave Quant 4-bit G256 (RWQ4G256, qt=38): FWHT-rotated MQ4N wire layout.
+///
+/// Same 136 B/group budget as MQ4G256 (4.25 bpw). Header is
+/// `[f32 master][4 × u8 E4M3 sub-scales]` plus 128 B of low-nibble-first codes
+/// over the universal Lloyd-Max Gaussian codebook. Delegates to
+/// [`hipfire_quantize::mqn::encode_rwq4`] — do not reimplement the math here.
+pub(crate) fn quantize_rwq4g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
+    hipfire_quantize::mqn::encode_rwq4(f32_data, |g| cpu_fwht_256(g, signs1, signs2))
+}
+
+
 #[cfg(test)]
 mod mq4_wire_tests {
     use super::*;
@@ -4414,6 +4425,11 @@ pub(crate) enum QuantType {
     // Drop-in cold tier for MQ3G256Lloyd (tag 3 → tag 5).
     MFP2G32E8 = 37, // mfp2-E8: MFP4G32E8 frame, 2-bit lattice (center 1), 9 B/blk, 2.25 bpw.
                     // Drop-in cold tier for MQ2G256Lloyd (tag 1 → tag 6).
+    /// RadioWave Quant 4-bit G256 — successor to MQ4G256 at the same 136 B/group
+    /// (4.25 bpw). FWHT-256 rotation, universal Lloyd-Max Gaussian codebook
+    /// (`CODEBOOK_4BIT`), and 4× E4M3 g64 sub-scales. Wire layout:
+    /// `[f32 master][4×u8 E4M3][128 B nibbles]`. Encoder is `mqn::MQ4N`.
+    RWQ4G256 = 38,
 }
 
 /// Per-tensor precision level assigned by the K-map pre-pass.
@@ -4446,6 +4462,7 @@ fn default_promote_target(base: GgufFormat) -> GgufFormat {
         GgufFormat::Mq2
         | GgufFormat::Mq3
         | GgufFormat::Mq4
+        | GgufFormat::Rwq4
         | GgufFormat::Mq5
         | GgufFormat::Mq6
         | GgufFormat::Mq2Lloyd
@@ -4483,9 +4500,9 @@ fn is_promote_pair_supported(base: GgufFormat, promote: GgufFormat) -> bool {
         (_, Mq2Lloyd | Mq3Lloyd) => false,
 
         // MQ-family upward bit-width (non-Lloyd)
-        (Mq2, Mq3 | Mq4 | Mq5 | Mq6) => true,
-        (Mq3, Mq4 | Mq5 | Mq6) => true,
-        (Mq4, Mq5 | Mq6) => true,
+        (Mq2, Mq3 | Mq4 | Rwq4 | Mq5 | Mq6) => true,
+        (Mq3, Mq4 | Rwq4 | Mq5 | Mq6) => true,
+        (Mq4 | Rwq4, Mq5 | Mq6) => true,
         (Mq5, Mq6) => true,
 
         // HFQ-family upward bit-width
@@ -5706,6 +5723,7 @@ fn mv_to_json(v: &gguf_input::MetaValue) -> serde_json::Value {
 /// | hfq4     | HFQ4G256        | Q8F16     | dense default — no FWHT, plain   |
 /// | hfq6     | HFQ6G256        | Q8F16     | dense + higher quality           |
 /// | mq4      | MQ4G256         | Q8F16     | Qwen3.5+ (DeltaNet) — FWHT-rot   |
+/// | rwq4     | RWQ4G256        | Q8F16     | RadioWave Quant — MQ4N successor |
 /// | mq5      | MQ5G256         | Q8F16     | 5-bit FWHT (5.25 bpw, 168 B/grp) |
 /// | mq6      | MQ6G256         | Q8F16     | Qwen3.5+ (DeltaNet) + higher q   |
 /// | mq3      | MQ3G256         | Q8F16     | Sub-4-bit FWHT (3.25 bpw)        |
@@ -5728,6 +5746,8 @@ enum GgufFormat {
     Mq2Lloyd,
     Mq3Lloyd,
     Mq4Lloyd,
+    /// RadioWave Quant 4-bit — MQ4N wire, qt=38, drop-in MQ4G256 successor.
+    Rwq4,
     Hfp4,      // HFP4G32 — RDNA-optimal FP4 (E2M1 + UE8M0 g32 + FP16 row scale)
     Mfp4,      // MFP4G32 — HFP4G32 + offline FWHT rotation (drop-in MQ4 replacement)
     Mfp4Lloyd, // mfp4 + per-tensor 16-entry Lloyd codebook
@@ -5744,6 +5764,7 @@ impl GgufFormat {
             "hfq4" | "hfq4g256" | "hf4" => Some(Self::Hfq4),
             "hfq6" | "hfq6g256" | "hf6" => Some(Self::Hfq6),
             "mq4" | "mq4g256" | "magnum" => Some(Self::Mq4),
+            "rwq4" | "rwq4g256" | "radiowave" => Some(Self::Rwq4),
             "mq5" | "mq5g256" => Some(Self::Mq5),
             "mq6" | "mq6g256" => Some(Self::Mq6),
             "mq3" | "mq3g256" => Some(Self::Mq3),
@@ -5768,6 +5789,7 @@ impl GgufFormat {
             Self::Hfq4 => "HFQ4G256",
             Self::Hfq6 => "HFQ6G256",
             Self::Mq4 => "MQ4G256",
+            Self::Rwq4 => "RWQ4G256",
             Self::Mq5 => "MQ5G256",
             Self::Mq6 => "MQ6G256",
             Self::Mq3 => "MQ3G256",
@@ -5869,6 +5891,7 @@ fn run_gguf_pipeline(
     let needs_signs = matches!(
         format,
         GgufFormat::Mq4
+            | GgufFormat::Rwq4
             | GgufFormat::Mq6
             | GgufFormat::Mq3
             | GgufFormat::Mq2
@@ -5993,6 +6016,7 @@ fn run_gguf_pipeline(
             quant_params += n_elements as u64;
             match format {
                 GgufFormat::Mq4
+                | GgufFormat::Rwq4
                 | GgufFormat::Mq3
                 | GgufFormat::Mq2
                 | GgufFormat::Mq2Lloyd
@@ -6063,6 +6087,10 @@ fn run_gguf_pipeline(
                     let q = quantize_mq4g256(&f32_data, &signs1, &signs2);
                     (q, QuantType::MQ4G256, 256u32, "MQ4G256")
                 }
+                GgufFormat::Rwq4 => {
+                    let q = quantize_rwq4g256(&f32_data, &signs1, &signs2);
+                    (q, QuantType::RWQ4G256, 256u32, "RWQ4G256")
+                }
                 GgufFormat::Mq5 => {
                     let q = quantize_mq5g256(&f32_data, &signs1, &signs2);
                     (q, QuantType::MQ5G256, 256u32, "MQ5G256")
@@ -6114,6 +6142,10 @@ fn run_gguf_pipeline(
                 GgufFormat::Mq4 => {
                     let q = quantize_mq4g256(&f32_data, &signs1, &signs2);
                     (q, QuantType::MQ4G256, 256u32, "MQ4G256")
+                }
+                GgufFormat::Rwq4 => {
+                    let q = quantize_rwq4g256(&f32_data, &signs1, &signs2);
+                    (q, QuantType::RWQ4G256, 256u32, "RWQ4G256")
                 }
                 GgufFormat::Mq5 => {
                     let q = quantize_mq5g256(&f32_data, &signs1, &signs2);
@@ -6200,6 +6232,10 @@ fn run_gguf_pipeline(
                 GgufFormat::Mq4 => {
                     let q = quantize_mq4g256(&f32_data, &signs1, &signs2);
                     (q, QuantType::MQ4G256, 256u32, "MQ4G256")
+                }
+                GgufFormat::Rwq4 => {
+                    let q = quantize_rwq4g256(&f32_data, &signs1, &signs2);
+                    (q, QuantType::RWQ4G256, 256u32, "RWQ4G256")
                 }
                 GgufFormat::Mq5 => {
                     let q = quantize_mq5g256(&f32_data, &signs1, &signs2);
@@ -6767,6 +6803,7 @@ fn main() {
     // available without a new MoE GEMV kernel).
     let use_mtp_precise = format == "deepseek4-mtp-precise";
     let use_mq4g256 = format == "mq4" || format == "mq4g256" || format == "magnum";
+    let use_rwq4g256 = format == "rwq4" || format == "rwq4g256" || format == "radiowave";
     let use_hfq4g256 = format == "hfq4g256" || format == "hfq4" || format == "hf4";
     let use_hfq3g256 = format == "hfq3g256";
     let use_hfq3g128 = format == "hfq3g128" || format == "hfq3" || format == "hf3"; // default HF3 = G128
@@ -7363,9 +7400,9 @@ fn main() {
     // GGUF input branch: if --input is a `.gguf` file, run the GGUF
     // pipeline and exit. Tensor names are translated GGUF → safetensors
     // style. The 2D quantization target follows --format:
-    //   hfq4 (default for GGUF) | hfq6 | mq4 | mq6
+    //   hfq4 (default for GGUF) | hfq6 | mq4 | rwq4 | mq6
     // Per CLAUDE.md guidance: dense (non-DeltaNet) models should use
-    // hfq4/hfq6. mq4/mq6 are calibrated for Qwen3.5+ — using them on a
+    // hfq4/hfq6. mq4/mq6/rwq4 are calibrated for Qwen3.5+ — using them on a
     // Llama-style model produces correct output (the FWHT cancels in
     // `gemv_mq4g256_with_rotate`) but adds runtime rotation overhead
     // with no quality benefit.
@@ -7375,7 +7412,7 @@ fn main() {
             let gguf_format = GgufFormat::from_flag(format).unwrap_or_else(|| {
                 eprintln!(
                     "GGUF input: --format '{format}' not recognized. \
-                     Supported: hfq4 (default), hfq6, mq4, mq6. \
+                     Supported: hfq4 (default), hfq6, mq4, rwq4, mq6. \
                      Falling back to hfq4."
                 );
                 GgufFormat::Hfq4
@@ -7954,6 +7991,7 @@ fn main() {
     };
     let mut total_quant_error = 0.0f64;
     let mut max_quant_error = 0.0f32;
+    let mut measured_params = 0usize;
     let mut _n_quant_groups = 0u64;
 
     let include_vision = args.include_vision;
@@ -10005,6 +10043,10 @@ fn main() {
                                 };
                                 (q, QuantType::MQ4G256, 256u32, "MQ4G256")
                             }
+                            GgufFormat::Rwq4 => {
+                                let q = quantize_rwq4g256(&f32_data, &signs1, &signs2);
+                                (q, QuantType::RWQ4G256, 256u32, "RWQ4G256")
+                            }
                             GgufFormat::Mq5 => {
                                 // MQ5 + AWQ on lm_head: MQ5G256 is in
                                 // DType::supports_awq_sidecar, so the runtime applies the
@@ -10343,6 +10385,24 @@ fn main() {
                             (q, QuantType::MQ4G256, 256u32, "MQ4G256")
                         } else {
                             // Fallback to standard HFQ4-G128 for non-256-aligned
+                            let q = quantize_hfq4g128(&f32_data);
+                            (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
+                        }
+                    } else if use_rwq4g256 && is_embed {
+                        let q = quantize_q8f16(&f32_data);
+                        (q, QuantType::Q8F16, 32u32, "Q8_F16")
+                    } else if use_rwq4g256 {
+                        let k_dim = if meta.shape.len() == 2 {
+                            meta.shape[1]
+                        } else {
+                            n_elements
+                        };
+                        if k_dim % 256 == 0 {
+                            let signs1 = gen_fwht_signs(42, 256);
+                            let signs2 = gen_fwht_signs(1042, 256);
+                            let q = quantize_rwq4g256(&f32_data, &signs1, &signs2);
+                            (q, QuantType::RWQ4G256, 256u32, "RWQ4G256")
+                        } else {
                             let q = quantize_hfq4g128(&f32_data);
                             (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
                         }
@@ -10875,81 +10935,103 @@ fn main() {
                     }
                 }; // end K-map outer if-else
 
-                // Compute quantization error (skip for Q8 embeddings — always negligible)
+                // Compute quantization error for formats with a CPU dequant reference.
+                // Compare reconstruction against ORIGINAL f32_data in the weight domain.
+                // Formats without a reference leave measured_params untouched so the
+                // summary prints n/a instead of a fabricated 0.00000000.
                 let block_size = gs as usize;
-                let is_hfq4 = label == "HFQ4G256" || label == "HFQ4G128";
-                // Only compute detailed error for HFQ4 tensors — Q8/HFQ6 error is negligible
-                let skip_error = !is_hfq4;
-                let n_blocks = if !skip_error {
-                    (n_elements + block_size - 1) / block_size
-                } else {
-                    0
-                };
-                for b in 0..n_blocks {
-                    let start = b * block_size;
-                    let end = (start + block_size).min(n_elements);
-                    if is_hfq4 {
-                        // Both G128 (72B) and G256 (136B): [f32 scale][f32 zero][nibbles]
-                        let block_bytes = if block_size == 256 { 136 } else { 72 };
-                        let off = b * block_bytes;
-                        let scale = f32::from_le_bytes([
-                            quantized[off],
-                            quantized[off + 1],
-                            quantized[off + 2],
-                            quantized[off + 3],
-                        ]);
-                        let zero = f32::from_le_bytes([
-                            quantized[off + 4],
-                            quantized[off + 5],
-                            quantized[off + 6],
-                            quantized[off + 7],
-                        ]);
-                        for i in 0..(end - start) {
-                            let byte_idx = i / 2;
-                            let nibble = if i % 2 == 0 {
-                                quantized[off + 8 + byte_idx] & 0xF
-                            } else {
-                                quantized[off + 8 + byte_idx] >> 4
-                            };
-                            let dequant = scale * nibble as f32 + zero;
-                            let err = (dequant - f32_data[start + i]).abs();
-                            total_quant_error += err as f64;
-                            max_quant_error = max_quant_error.max(err);
-                        }
-                    } else if label == "Q8_FP16" || label == "Q4asQ8" || label == "Q8_F16" {
-                        // NB: string match because this_q8/this_q4as8 are scoped inside Base block.
-                        let off = b * 34;
-                        let scale =
-                            f16_to_f32(u16::from_le_bytes([quantized[off], quantized[off + 1]]));
-                        for i in 0..(end - start) {
-                            let qval = quantized[off + 2 + i] as i8;
-                            let dequant = scale * qval as f32;
-                            let err = (dequant - f32_data[start + i]).abs();
-                            total_quant_error += err as f64;
-                            max_quant_error = max_quant_error.max(err);
-                        }
+                let measure_hfq4 = label == "HFQ4G256" || label == "HFQ4G128";
+                let measure_mq4 = label == "MQ4G256";
+                let measure_rwq4 = label == "RWQ4G256";
+
+                if measure_hfq4 || measure_mq4 || measure_rwq4 {
+                    // FWHT signs match the encoder (seeds 42 / 1042, n=256).
+                    // Branch-local signs above are out of scope here.
+                    let (signs1, signs2) = if measure_mq4 || measure_rwq4 {
+                        (gen_fwht_signs(42, 256), gen_fwht_signs(1042, 256))
                     } else {
-                        let off = b * 36;
-                        let scale =
-                            f16_to_f32(u16::from_le_bytes([quantized[off], quantized[off + 1]]));
-                        let min_val = f16_to_f32(u16::from_le_bytes([
-                            quantized[off + 2],
-                            quantized[off + 3],
-                        ]));
-                        for i in 0..(end - start) {
-                            let byte_idx = if i < 32 { i } else { i - 32 };
-                            let nibble = if i < 32 {
-                                quantized[off + 4 + byte_idx] & 0xF
-                            } else {
-                                quantized[off + 4 + byte_idx] >> 4
-                            };
-                            let dequant = nibble as f32 * scale + min_val;
-                            let err = (dequant - f32_data[start + i]).abs();
+                        (Vec::new(), Vec::new())
+                    };
+
+                    if measure_rwq4 {
+                        // RWQ4: tested CPU reference → inv FWHT per 256-group → weight domain.
+                        let mut recon = hipfire_quantize::mqn::decode_rwq4(&quantized);
+                        let n_groups = recon.len() / 256;
+                        for g in 0..n_groups {
+                            hipfire_quantize::fwht::inv_fwht_256(
+                                &mut recon[g * 256..(g + 1) * 256],
+                                &signs1,
+                                &signs2,
+                            );
+                        }
+                        let n = n_elements.min(recon.len());
+                        for i in 0..n {
+                            let err = (recon[i] - f32_data[i]).abs();
                             total_quant_error += err as f64;
                             max_quant_error = max_quant_error.max(err);
                         }
+                        measured_params += n;
+                        _n_quant_groups += n_groups as u64;
+                    } else {
+                        // HFQ4 (unrotated) or MQ4 (FWHT-rotated): same 8B affine + nibbles layout.
+                        let n_blocks = (n_elements + block_size - 1) / block_size;
+                        for b in 0..n_blocks {
+                            let start = b * block_size;
+                            let end = (start + block_size).min(n_elements);
+                            // Both G128 (72B) and G256 (136B): [f32 scale][f32 zero][nibbles]
+                            let block_bytes = if block_size == 256 { 136 } else { 72 };
+                            let off = b * block_bytes;
+                            let scale = f32::from_le_bytes([
+                                quantized[off],
+                                quantized[off + 1],
+                                quantized[off + 2],
+                                quantized[off + 3],
+                            ]);
+                            let zero = f32::from_le_bytes([
+                                quantized[off + 4],
+                                quantized[off + 5],
+                                quantized[off + 6],
+                                quantized[off + 7],
+                            ]);
+                            if measure_mq4 {
+                                // Dequant full 256-group in rotated domain, then inv FWHT.
+                                let mut group = [0.0f32; 256];
+                                for i in 0..block_size {
+                                    let byte_idx = i / 2;
+                                    let nibble = if i % 2 == 0 {
+                                        quantized[off + 8 + byte_idx] & 0xF
+                                    } else {
+                                        quantized[off + 8 + byte_idx] >> 4
+                                    };
+                                    group[i] = scale * nibble as f32 + zero;
+                                }
+                                hipfire_quantize::fwht::inv_fwht_256(
+                                    &mut group, &signs1, &signs2,
+                                );
+                                for i in 0..(end - start) {
+                                    let err = (group[i] - f32_data[start + i]).abs();
+                                    total_quant_error += err as f64;
+                                    max_quant_error = max_quant_error.max(err);
+                                }
+                            } else {
+                                // HFQ4G256 / HFQ4G128 — unrotated; keep exact prior math.
+                                for i in 0..(end - start) {
+                                    let byte_idx = i / 2;
+                                    let nibble = if i % 2 == 0 {
+                                        quantized[off + 8 + byte_idx] & 0xF
+                                    } else {
+                                        quantized[off + 8 + byte_idx] >> 4
+                                    };
+                                    let dequant = scale * nibble as f32 + zero;
+                                    let err = (dequant - f32_data[start + i]).abs();
+                                    total_quant_error += err as f64;
+                                    max_quant_error = max_quant_error.max(err);
+                                }
+                            }
+                            _n_quant_groups += 1;
+                        }
+                        measured_params += n_elements;
                     }
-                    _n_quant_groups += 1;
                 }
 
                 eprintln!(
@@ -11149,12 +11231,6 @@ fn main() {
             }
         }
     }
-    let mean_quant_error = if quantized_params > 0 {
-        total_quant_error / quantized_params as f64
-    } else {
-        0.0
-    };
-
     eprintln!("\n=== Quantization Summary ===");
     if skipped_params > 0 {
         eprintln!(
@@ -11166,8 +11242,21 @@ fn main() {
         "  Quantized params: {quantized_params} ({:.1}%)",
         100.0 * quantized_params as f64 / total_params as f64
     );
-    eprintln!("  Mean quant error: {mean_quant_error:.8}");
-    eprintln!("  Max quant error:  {max_quant_error:.8}");
+    if measured_params == 0 {
+        eprintln!("  Mean quant error: n/a (no CPU dequant reference for this format)");
+        eprintln!("  Max quant error:  n/a (no CPU dequant reference for this format)");
+    } else {
+        let mean_quant_error = total_quant_error / measured_params as f64;
+        if (measured_params as u64) < quantized_params {
+            let pct = 100.0 * measured_params as f64 / quantized_params as f64;
+            eprintln!(
+                "  Mean quant error: {mean_quant_error:.8}  (measured over {pct:.1}% of quantized params)"
+            );
+        } else {
+            eprintln!("  Mean quant error: {mean_quant_error:.8}");
+        }
+        eprintln!("  Max quant error:  {max_quant_error:.8}");
+    }
     eprintln!("  Output size:      {:.1} MB", total_bytes as f64 / 1e6);
 
     // ── SP4b: bake prune finalize (rename kept per-expert tensors + patch count) ──
