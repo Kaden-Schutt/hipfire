@@ -691,11 +691,13 @@ fn gfx12_query16_workload_eligible(ctx: &DispatchCtx) -> bool {
     ctx.workload != crate::context::DispatchWorkload::SpeculativeVerify
 }
 
-/// Default-on query16 is measured only on gfx1201 (R9700). Sibling gfx12 atoms
-/// and other families stay opt-in via explicit `HIPFIRE_FLASH_PREFILL=1`.
+/// gfx12 query16 remains explicit-opt-in-only (`HIPFIRE_FLASH_PREFILL=1`) because the full
+/// Qwen3.6-27B Q8 `hipfire bench` pp257 production route faulted on gfx1201 even though the
+/// isolated numerical harness passed. No architecture gets automatic default admission until
+/// production-route repair and re-admission.
 #[inline]
-fn gfx12_query16_arch_default_eligible(arch: &str) -> bool {
-    arch == "gfx1201"
+fn gfx12_query16_arch_default_eligible(_arch: &str) -> bool {
+    false
 }
 
 fn dispatch_attend(
@@ -1611,10 +1613,10 @@ mod tests {
     }
 
     #[test]
-    fn gfx12_query16_arch_default_admits_only_measured_r9700_target() {
-        // Default admission is measured only on gfx1201 (R9700). Sibling gfx1200,
-        // gfx11, and unknown gfx12-looking atoms stay opt-in-only.
-        assert!(gfx12_query16_arch_default_eligible("gfx1201"));
+    fn gfx12_query16_has_no_production_default_admission() {
+        // Production `hipfire bench` pp257 route faulted on gfx1201; kernel is
+        // opt-in-only pending repair. No gfx12 atom gets automatic default admission.
+        assert!(!gfx12_query16_arch_default_eligible("gfx1201"));
         assert!(!gfx12_query16_arch_default_eligible("gfx1200"));
         assert!(!gfx12_query16_arch_default_eligible("gfx1100"));
         assert!(!gfx12_query16_arch_default_eligible("gfx1202"));
