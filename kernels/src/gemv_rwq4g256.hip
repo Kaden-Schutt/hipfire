@@ -29,7 +29,8 @@
 // product and applied once per 8 weights. That factoring is the decode win over
 // MQ4's per-weight `scale * nibble + zero`.
 //
-// gfx10-compatible by construction: wave32 + LDS + __shfl_down only. No WMMA,
+// gfx10-compatible by construction: wave32, LDS, DPP row_xmask (GFX10+) and
+// one __shfl_xor. No WMMA,
 // no VOPD, no dp4a.
 
 // Lloyd-Max optimum for a unit Gaussian, normalized so max|c| == 1. A universal
@@ -148,8 +149,9 @@ extern "C" __global__ void gemv_rwq4g256_prerotated(
     #undef RWQ4_DOT
     #undef RWQ4_EFF
 
-    float acc = (acc0 + acc1) + (acc2 + acc3);
-    for (int offset = 16; offset > 0; offset >>= 1)
-        acc += __shfl_down(acc, offset);
+    // wave32_reduce_add (turbo_common.h) is bit-exact with the conventional
+    // five-step __shfl_down loop but spends four of the five steps on the
+    // VALU via DPP row_xmask instead of five serialized ds_bpermute.
+    float acc = wave32_reduce_add((acc0 + acc1) + (acc2 + acc3));
     if (tid == 0) y[row] = acc;
 }

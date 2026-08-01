@@ -71,6 +71,40 @@ __device__ __forceinline__ float cvt_e4m3_scale_to_f32_dq(unsigned char b) {
 #endif
 
 
+// Full wave32 sum-reduction. Every lane ends with the total.
+//
+// The conventional epilogue
+//     for (int o = 16; o > 0; o >>= 1) acc += __shfl_down(acc, o);
+// looks like pure ALU but lowers to FIVE ds_bpermute_b32 — LDS hardware —
+// each separated by a full `s_wait_dscnt 0x0`, so the tail of every GEMV row
+// is five serialized LDS round-trips while the VALU sits idle.
+//
+// DPP row_xmask is a lane-XOR inside the 16-lane row and runs on the VALU, so
+// four of the five steps cost no LDS traffic and no dscnt wait. Only the
+// cross-row (16 <-> 16) fold still needs a shuffle.
+//
+// row_xmask, NOT row_shr: row_shr accumulates into the LAST lane, while every
+// caller reads lane 0. That variant is bit-wrong here and silently so — it is
+// also the form most DPP reduction examples show.
+//
+// Bit-exact with the __shfl_down loop (0/4096 blocks differ, worst delta 0.0)
+// and faster in proportion to how short the inner loop is — the win is
+// largest at K=1024, which is where the decode GEMVs live. Measured in
+// benchmarks/kernel-probes/wave32-reduce-dpp/.
+#define HIPFIRE_DPP_XMASK_ADD(x, n)                                            \
+    (x) += __builtin_bit_cast(                                                 \
+        float, __builtin_amdgcn_update_dpp(                                    \
+                   0, __builtin_bit_cast(int, (x)), 0x160 | (n), 0xF, 0xF, true))
+
+__device__ __forceinline__ float wave32_reduce_add(float acc) {
+    HIPFIRE_DPP_XMASK_ADD(acc, 1);
+    HIPFIRE_DPP_XMASK_ADD(acc, 2);
+    HIPFIRE_DPP_XMASK_ADD(acc, 4);
+    HIPFIRE_DPP_XMASK_ADD(acc, 8);
+    acc += __shfl_xor(acc, 16);
+    return acc;
+}
+
 // In-place FWHT on 128 elements in registers.
 // signs1/signs2 are ±1.0f arrays in global memory (uploaded once).
 __device__ void fwht_forward_128(float* x,
