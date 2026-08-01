@@ -97,7 +97,14 @@ int main() {
     // ── correctness ─────────────────────────────────────────────────────────
     const int nblk = 4096;
     std::vector<float> h(nblk * 32);
-    for (size_t i = 0; i < h.size(); ++i) h[i] = (float)((i * 2654435761u) % 1000) / 128.0f;
+    // Values that are NOT exactly representable in f32. An earlier version
+    // used n/128.0f, where every partial sum is exact, so ANY reduction order
+    // agreed and the probe reported a false bit-exactness. DPP row_xmask and
+    // __shfl_down associate in OPPOSITE stride order (1,2,4,8,16 vs 16,8,4,2,1),
+    // so on real data they differ at the ULP level. That is reassociation, not
+    // a bug -- but it must be measured, not assumed away.
+    for (size_t i = 0; i < h.size(); ++i)
+        h[i] = (float)((double)((i * 2654435761u) % 1000003u) / 7919.0 - 63.1);
     float *din, *ds, *dd;
     HC(hipMalloc(&din, h.size() * 4));
     HC(hipMalloc(&ds, nblk * 4));
