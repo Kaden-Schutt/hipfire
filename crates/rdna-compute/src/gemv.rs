@@ -4725,18 +4725,27 @@ impl Gpu {
         k: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let mut a_ptr = a_raw.buf.as_ptr();
-        let mut x_ptr = x.buf.as_ptr();
-        let mut y_ptr = y.buf.as_ptr();
-        let mut m_val = m as i32;
-        let mut k_val = k as i32;
+        let a_ptr = a_raw.buf.as_ptr();
+        let x_ptr = x.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
         let mut params: Vec<*mut c_void> = vec![
-            &mut a_ptr as *mut _ as *mut c_void,
-            &mut x_ptr as *mut _ as *mut c_void,
-            &mut y_ptr as *mut _ as *mut c_void,
-            &mut m_val as *mut _ as *mut c_void,
-            &mut k_val as *mut _ as *mut c_void,
+            &a_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &y_ptr as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
         ];
+        let blob_builder = || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(a_ptr);
+            b.push_ptr(x_ptr);
+            b.push_ptr(y_ptr);
+            b.push_i32(m_val);
+            b.push_i32(k_val);
+            b
+        };
 
         // Wave64-native fast path (gfx906/908/94x): 2 rows per block, halves
         // grid.x. Mirrors the HFQ4 sibling at line ~5378. Plan §3.1.1 item 2
@@ -4757,18 +4766,15 @@ impl Gpu {
                 )
             };
             self.ensure_kernel(kname, ksrc, kname)?;
-            let func = &self.functions[kname];
             let grid = ((m as u32) + 1) / 2;
-            return unsafe {
-                self.hip.launch_kernel(
-                    func,
-                    [grid, 1, 1],
-                    [32, 1, 1],
-                    0,
-                    self.stream_ref(),
-                    &mut params,
-                )
-            };
+            return self.launch_maybe_blob(
+                kname,
+                [grid, 1, 1],
+                [32, 1, 1],
+                0,
+                &mut params,
+                blob_builder,
+            );
         }
 
         self.ensure_kernel(
@@ -4776,17 +4782,14 @@ impl Gpu {
             kernels::GEMV_HFQ6G256_RESIDUAL_SRC,
             "gemv_hfq6g256_residual",
         )?;
-        let func = &self.functions["gemv_hfq6g256_residual"];
-        unsafe {
-            self.hip.launch_kernel(
-                func,
-                [m as u32, 1, 1],
-                [32, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        }
+        self.launch_maybe_blob(
+            "gemv_hfq6g256_residual",
+            [m as u32, 1, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            blob_builder,
+        )
     }
     /// HFQ5-G256 GEMV with fused residual add: y[row] += A[row] . x.
     /// Same shape as gemv_hfq5g256; only the final write differs (+= vs =).
@@ -4875,29 +4878,34 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_kernel("gemv_hfq6g256", kernels::GEMV_HFQ6G256_SRC, "gemv_hfq6g256")?;
-        let func = &self.functions["gemv_hfq6g256"];
-        let mut a_ptr = a_raw.buf.as_ptr();
-        let mut x_ptr = x.buf.as_ptr();
-        let mut y_ptr = y.buf.as_ptr();
-        let mut m_val = m as i32;
-        let mut k_val = k as i32;
+        let a_ptr = a_raw.buf.as_ptr();
+        let x_ptr = x.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
         let mut params: Vec<*mut c_void> = vec![
-            &mut a_ptr as *mut _ as *mut c_void,
-            &mut x_ptr as *mut _ as *mut c_void,
-            &mut y_ptr as *mut _ as *mut c_void,
-            &mut m_val as *mut _ as *mut c_void,
-            &mut k_val as *mut _ as *mut c_void,
+            &a_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &y_ptr as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
         ];
-        unsafe {
-            self.hip.launch_kernel(
-                func,
-                [m as u32, 1, 1],
-                [32, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        }
+        self.launch_maybe_blob(
+            "gemv_hfq6g256",
+            [m as u32, 1, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b
+            },
+        )
     }
     /// HFQ5-G256 GEMV. K must be multiple of 256.
     pub fn gemv_hfq5g256(
