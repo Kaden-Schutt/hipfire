@@ -94,19 +94,20 @@ pub enum EmbedPlan {
 
 /// Pure quant_type → plan. GPU-free, unit-testable.
 ///
-/// qt 6 → Raw(HFQ4G256), 7 → Raw(HFQ4G128), 3 → Raw(Q8_0),
+/// qt 6 → Raw(HFQ4G256), 7 → Raw(HFQ4G128), 8 → Raw(HFQ6G256), 3 → Raw(Q8_0),
 /// qt 1|2|16 → HostF32, else → panic with the supported-format list.
 pub fn embed_classify(quant_type: u8) -> HipResult<EmbedPlan> {
     match quant_type {
         6 => Ok(EmbedPlan::Raw(EmbeddingFormat::HFQ4G256)),
         7 => Ok(EmbedPlan::Raw(EmbeddingFormat::HFQ4G128)),
+        8 => Ok(EmbedPlan::Raw(EmbeddingFormat::HFQ6G256)),
         3 => Ok(EmbedPlan::Raw(EmbeddingFormat::Q8_0)),
         1 | 2 | 16 => Ok(EmbedPlan::HostF32),
         other => Err(hip_bridge::HipError::new(
             0,
             &format!(
                 "unsupported embedding quant_type {other}; \
-                 handled: 1 (F16→F32), 2 (F32), 3 (Q8_0), 6 (HFQ4G256), 7 (HFQ4G128), 16 (BF16→F32). \
+                 handled: 1 (F16→F32), 2 (F32), 3 (Q8_0), 6 (HFQ4G256), 7 (HFQ4G128), 8 (HFQ6G256), 16 (BF16→F32). \
                  Add the format to embed_classify to support it."
             ),
         )),
@@ -144,6 +145,7 @@ pub fn embedding_format_dtype(fmt: EmbeddingFormat) -> DType {
     match fmt {
         EmbeddingFormat::HFQ4G256 => DType::HFQ4G256,
         EmbeddingFormat::HFQ4G128 => DType::HFQ4G128,
+        EmbeddingFormat::HFQ6G256 => DType::HFQ6G256,
         EmbeddingFormat::Q8_0 => DType::Q8_0,
         EmbeddingFormat::F32 => DType::F32,
         EmbeddingFormat::Q4K => panic!("embedding_format_dtype: Q4K not valid for tied lm_head"),
@@ -1202,6 +1204,13 @@ mod tests {
         }
     }
     #[test]
+    fn embed_classify_raw_hfq6g256() {
+        match embed_classify(8).unwrap() {
+            EmbedPlan::Raw(EmbeddingFormat::HFQ6G256) => {}
+            other => panic!("expected Raw(HFQ6G256), got {other:?}"),
+        }
+    }
+    #[test]
     fn embed_classify_raw_q8_0() {
         match embed_classify(3).unwrap() {
             EmbedPlan::Raw(EmbeddingFormat::Q8_0) => {}
@@ -1221,6 +1230,7 @@ mod tests {
     fn embed_classify_errors_on_unknown() {
         let err = embed_classify(99).unwrap_err();
         assert!(err.message.contains("unsupported embedding quant_type"));
+        assert!(err.message.contains("8 (HFQ6G256)"));
     }
     #[test]
     fn embedding_format_dtype_mapping() {
@@ -1231,6 +1241,10 @@ mod tests {
         assert_eq!(
             embedding_format_dtype(EmbeddingFormat::HFQ4G128),
             DType::HFQ4G128
+        );
+        assert_eq!(
+            embedding_format_dtype(EmbeddingFormat::HFQ6G256),
+            DType::HFQ6G256
         );
         assert_eq!(embedding_format_dtype(EmbeddingFormat::Q8_0), DType::Q8_0);
         assert_eq!(embedding_format_dtype(EmbeddingFormat::F32), DType::F32);

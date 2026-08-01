@@ -4604,6 +4604,18 @@ pub const EMBEDDING_HFQ4G256_SRC: &str =
 pub const EMBEDDING_HFQ4G256_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/embedding_hfq4g256_batched.hip");
 
+/// HFQ6-G256 embedding lookup: dequantize one row from HFQ6-G256 table to F32.
+/// Block: [f32 scale][f32 zero][192B packed 6-bit] = 200 bytes per 256 elements.
+/// 6-bit unpack is byte-identical to gemv_hfq6g256.hip.
+pub const EMBEDDING_HFQ6G256_SRC: &str =
+    include_str!("../../../kernels/src/embedding_hfq6g256.hip");
+
+/// Batched HFQ6-G256 embedding: dequantize N rows in one launch. Reads token ids
+/// from a device buffer so the launch is hipGraph-captureable — update the buffer
+/// between replays, replay the same graph. Writes into row-major `[N × dim]`.
+pub const EMBEDDING_HFQ6G256_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/embedding_hfq6g256_batched.hip");
+
 /// Batched Q8_0 embedding: same hipGraph-captureable pattern as the HFQ4-G256
 /// variant. 27B MQ4 targets ship with Q8_0-quantized embedding tables, so the
 /// verify hot path needs this variant to enable graph capture on that model.

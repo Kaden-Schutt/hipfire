@@ -1045,6 +1045,9 @@ pub fn forward_step(
         EmbeddingFormat::HFQ4G128 => {
             gpu.embedding_lookup_hfq4g128(&weights.token_embd, &state.x, token, dim)?
         }
+        EmbeddingFormat::HFQ6G256 => {
+            gpu.embedding_lookup_hfq6g256(&weights.token_embd, &state.x, token, dim)?
+        }
         EmbeddingFormat::Q8_0 => {
             gpu.embedding_lookup_q8(&weights.token_embd, &state.x, token, dim)?
         }
@@ -1107,6 +1110,9 @@ pub fn embed_token_row(
         }
         EmbeddingFormat::HFQ4G128 => {
             gpu.embedding_lookup_hfq4g128(&weights.token_embd, &state.x, token, dim)?
+        }
+        EmbeddingFormat::HFQ6G256 => {
+            gpu.embedding_lookup_hfq6g256(&weights.token_embd, &state.x, token, dim)?
         }
         EmbeddingFormat::Q8_0 => {
             gpu.embedding_lookup_q8(&weights.token_embd, &state.x, token, dim)?
@@ -1700,12 +1706,12 @@ pub fn forward_verify_block_batched(
         }
     }
 
-    // Build the [batch × dim] F32 embedding matrix. Q8/HFQ4G256 tables get a
+    // Build the [batch × dim] F32 embedding matrix. Q8/HFQ4G256/HFQ6G256 tables get a
     // single batched GPU lookup (no host round-trip); other formats fall back
     // to the per-token host loop (block is small, so this is cheap and rare).
     let x_batch = gpu.alloc_tensor(&[batch, dim], DType::F32)?;
     match weights.embd_format {
-        EmbeddingFormat::Q8_0 | EmbeddingFormat::HFQ4G256 => {
+        EmbeddingFormat::Q8_0 | EmbeddingFormat::HFQ4G256 | EmbeddingFormat::HFQ6G256 => {
             let tok_ids: Vec<i32> = block.iter().map(|&t| t as i32).collect();
             let tok_bytes: &[u8] =
                 unsafe { std::slice::from_raw_parts(tok_ids.as_ptr() as *const u8, batch * 4) };
@@ -1720,6 +1726,13 @@ pub fn forward_verify_block_batched(
                     dim,
                 )?,
                 EmbeddingFormat::HFQ4G256 => gpu.embedding_lookup_hfq4g256_batched(
+                    &weights.token_embd,
+                    &x_batch,
+                    &tok_buf,
+                    batch,
+                    dim,
+                )?,
+                EmbeddingFormat::HFQ6G256 => gpu.embedding_lookup_hfq6g256_batched(
                     &weights.token_embd,
                     &x_batch,
                     &tok_buf,

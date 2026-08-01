@@ -627,6 +627,7 @@ pub enum EmbeddingFormat {
     Q4K,      // raw Q4K blocks, use GPU dequant kernel
     HFQ4G256, // raw HFQ4-G256 blocks, use GPU dequant kernel
     HFQ4G128, // raw HFQ4-G128 blocks, use GPU dequant kernel
+    HFQ6G256, // raw HFQ6-G256 blocks, use GPU dequant kernel
     Q8_0,     // raw Q8_0 blocks, use GPU dequant kernel
 }
 
@@ -647,6 +648,7 @@ pub fn embedding_lookup_dispatch(
         EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8(table, output, token, dim),
         EmbeddingFormat::HFQ4G256 => gpu.embedding_lookup_hfq4g256(table, output, token, dim),
         EmbeddingFormat::HFQ4G128 => gpu.embedding_lookup_hfq4g128(table, output, token, dim),
+        EmbeddingFormat::HFQ6G256 => gpu.embedding_lookup_hfq6g256(table, output, token, dim),
         EmbeddingFormat::F32 => gpu.embedding_lookup(table, output, token, dim),
     }
 }
@@ -2317,7 +2319,7 @@ fn forward_prefill_chunk(
     // 1. Embed N tokens into pbs.x_batch.
     if matches!(
         weights.embd_format,
-        EmbeddingFormat::HFQ4G256 | EmbeddingFormat::Q8_0
+        EmbeddingFormat::HFQ4G256 | EmbeddingFormat::HFQ6G256 | EmbeddingFormat::Q8_0
     ) {
         if !pre_uploaded {
             let tokens_host: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
@@ -2327,6 +2329,13 @@ fn forward_prefill_chunk(
         }
         match weights.embd_format {
             EmbeddingFormat::HFQ4G256 => gpu.embedding_lookup_hfq4g256_batched(
+                &weights.token_embd,
+                &pbs.x_batch,
+                &pbs.tokens,
+                n,
+                dim,
+            )?,
+            EmbeddingFormat::HFQ6G256 => gpu.embedding_lookup_hfq6g256_batched(
                 &weights.token_embd,
                 &pbs.x_batch,
                 &pbs.tokens,
@@ -2354,7 +2363,9 @@ fn forward_prefill_chunk(
                 EmbeddingFormat::F32 => {
                     gpu.embedding_lookup(&weights.token_embd, &s.x, tok, dim)?
                 }
-                EmbeddingFormat::HFQ4G256 | EmbeddingFormat::Q8_0 => unreachable!(),
+                EmbeddingFormat::HFQ4G256
+                | EmbeddingFormat::HFQ6G256
+                | EmbeddingFormat::Q8_0 => unreachable!(),
             }
             gpu.hip.memcpy_dtod_at(
                 &pbs.x_batch.buf,

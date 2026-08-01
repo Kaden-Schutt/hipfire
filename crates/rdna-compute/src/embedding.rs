@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! GPU-side embedding lookup dispatch methods (HFQ4G256, HFQ4G128, Q8, Q4K).
+//! GPU-side embedding lookup dispatch methods (HFQ4G256, HFQ6G256, HFQ4G128, Q8, Q4K).
 
 use std::ffi::c_void;
 
@@ -139,6 +139,102 @@ impl Gpu {
             t.finish(&self.hip);
         }
         result
+    }
+
+    /// HFQ6-G256 embedding lookup: dequantize one row on GPU, output F32.
+    pub fn embedding_lookup_hfq6g256(
+        &mut self,
+        table: &GpuTensor,
+        output: &GpuTensor,
+        token_id: u32,
+        dim: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "embedding_hfq6g256",
+            kernels::EMBEDDING_HFQ6G256_SRC,
+            "embedding_hfq6g256",
+        )?;
+        let func = &self.functions["embedding_hfq6g256"];
+
+        let mut tp = table.buf.as_ptr();
+        let mut op = output.buf.as_ptr();
+        let mut tid = token_id as i32;
+        let mut d = dim as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut tp as *mut _ as *mut c_void,
+            &mut op as *mut _ as *mut c_void,
+            &mut tid as *mut _ as *mut c_void,
+            &mut d as *mut _ as *mut c_void,
+        ];
+
+        let bytes = crate::profile::embedding_hfq6g256_bytes(dim);
+        let timer =
+            crate::profile::begin_timer(&self.hip, "embedding", "embedding_lookup_hfq6g256", bytes);
+        let result = unsafe {
+            self.hip.launch_kernel(
+                func,
+                [1, 1, 1],
+                [256, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        };
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// Batched HFQ6-G256 embedding lookup. Dequantizes N rows in a single
+    /// launch, reading token ids from a device buffer. hipGraph-capture-safe:
+    /// callers update `token_ids` between replays and replay the same graph.
+    ///
+    /// `output` shape: `[n × dim]` row-major. `token_ids` shape: `[n]` i32.
+    pub fn embedding_lookup_hfq6g256_batched(
+        &mut self,
+        table: &GpuTensor,
+        output: &GpuTensor,
+        token_ids: &GpuTensor,
+        n: usize,
+        dim: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "embedding_hfq6g256_batched",
+            kernels::EMBEDDING_HFQ6G256_BATCHED_SRC,
+            "embedding_hfq6g256_batched",
+        )?;
+
+        let mut tp = table.buf.as_ptr();
+        let mut op = output.buf.as_ptr();
+        let mut tidp = token_ids.buf.as_ptr();
+        let mut d = dim as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut tp as *mut _ as *mut c_void,
+            &mut op as *mut _ as *mut c_void,
+            &mut tidp as *mut _ as *mut c_void,
+            &mut d as *mut _ as *mut c_void,
+        ];
+
+        self.launch_maybe_blob(
+            "embedding_hfq6g256_batched",
+            [n as u32, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(tp);
+                b.push_ptr(op);
+                b.push_ptr(tidp);
+                b.push_i32(d);
+                b
+            },
+        )
     }
 
     /// Batched Q8_0 embedding lookup. Same hipGraph-captureable pattern as

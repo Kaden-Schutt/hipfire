@@ -2673,6 +2673,14 @@ impl Gpu {
             kernels::EMBEDDING_HFQ4G256_BATCHED_SRC.to_string(),
         ));
         specs.push((
+            "embedding_hfq6g256",
+            kernels::EMBEDDING_HFQ6G256_SRC.to_string(),
+        ));
+        specs.push((
+            "embedding_hfq6g256_batched",
+            kernels::EMBEDDING_HFQ6G256_BATCHED_SRC.to_string(),
+        ));
+        specs.push((
             "embedding_q8_batched",
             kernels::EMBEDDING_Q8_BATCHED_SRC.to_string(),
         ));

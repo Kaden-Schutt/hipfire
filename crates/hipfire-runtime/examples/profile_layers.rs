@@ -205,6 +205,9 @@ fn profile_token(
         llama::EmbeddingFormat::HFQ4G128 => gpu
             .embedding_lookup_hfq4g128(&weights.token_embd, &scratch.x, token, dim)
             .unwrap(),
+        llama::EmbeddingFormat::HFQ6G256 => gpu
+            .embedding_lookup_hfq6g256(&weights.token_embd, &scratch.x, token, dim)
+            .unwrap(),
         llama::EmbeddingFormat::Q8_0 => gpu
             .embedding_lookup_q8(&weights.token_embd, &scratch.x, token, dim)
             .unwrap(),

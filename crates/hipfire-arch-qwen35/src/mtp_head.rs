@@ -1992,6 +1992,9 @@ fn embed_lookup_into(
         EmbeddingFormat::HFQ4G128 => {
             gpu.embedding_lookup_hfq4g128(&weights.token_embd, out, token, dim)
         }
+        EmbeddingFormat::HFQ6G256 => {
+            gpu.embedding_lookup_hfq6g256(&weights.token_embd, out, token, dim)
+        }
         EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8(&weights.token_embd, out, token, dim),
         EmbeddingFormat::Q4K => gpu.embedding_lookup_q4k(&weights.token_embd, out, token, dim),
         EmbeddingFormat::F32 => gpu.embedding_lookup(&weights.token_embd, out, token, dim),

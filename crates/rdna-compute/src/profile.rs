@@ -303,6 +303,11 @@ pub fn embedding_hfq4g256_bytes(dim: usize) -> usize {
     hfq4g256_weight_bytes(1, dim) + dim * 4
 }
 
+/// Embedding lookup for HFQ6-G256: reads one row of the embedding table.
+pub fn embedding_hfq6g256_bytes(dim: usize) -> usize {
+    hfq6g256_weight_bytes(1, dim) + dim * 4
+}
+
 /// Conv1D with SiLU, kernel size 4, ring-buffer state: read input + state +
 /// weight, write output + state.
 pub fn conv1d_silu_bytes(n_channels: usize) -> usize {

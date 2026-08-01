@@ -236,6 +236,9 @@ pub fn spec_step_dflash_mtp(
             llama::EmbeddingFormat::HFQ4G128 => {
                 gpu.embedding_lookup_hfq4g128(&target.weights.token_embd, &dst, tok, h)?
             }
+            llama::EmbeddingFormat::HFQ6G256 => {
+                gpu.embedding_lookup_hfq6g256(&target.weights.token_embd, &dst, tok, h)?
+            }
             llama::EmbeddingFormat::Q8_0 => {
                 gpu.embedding_lookup_q8(&target.weights.token_embd, &dst, tok, h)?
             }
@@ -822,6 +825,9 @@ pub fn spec_step_dflash_mtp_tree(
             }
             llama::EmbeddingFormat::HFQ4G128 => {
                 gpu.embedding_lookup_hfq4g128(&target.weights.token_embd, &dst, tok, h)?
+            }
+            llama::EmbeddingFormat::HFQ6G256 => {
+                gpu.embedding_lookup_hfq6g256(&target.weights.token_embd, &dst, tok, h)?
             }
             llama::EmbeddingFormat::Q8_0 => {
                 gpu.embedding_lookup_q8(&target.weights.token_embd, &dst, tok, h)?

@@ -2350,6 +2350,7 @@ fn verify_dflash_block_inner(
         && matches!(
             target.weights.embd_format,
             hipfire_runtime::llama::EmbeddingFormat::HFQ4G256
+                | hipfire_runtime::llama::EmbeddingFormat::HFQ6G256
                 | hipfire_runtime::llama::EmbeddingFormat::Q8_0,
         )
         && verify_scratch.prefill_batch.is_some();
@@ -3083,6 +3084,9 @@ pub fn spec_step_dflash(
                 }
                 hipfire_runtime::llama::EmbeddingFormat::HFQ4G128 => {
                     gpu.embedding_lookup_hfq4g128(&target.weights.token_embd, &dst, tok, h)?
+                }
+                hipfire_runtime::llama::EmbeddingFormat::HFQ6G256 => {
+                    gpu.embedding_lookup_hfq6g256(&target.weights.token_embd, &dst, tok, h)?
                 }
                 hipfire_runtime::llama::EmbeddingFormat::Q8_0 => {
                     gpu.embedding_lookup_q8(&target.weights.token_embd, &dst, tok, h)?
@@ -4193,6 +4197,9 @@ fn run_dflash_draft_for_logits(
             hipfire_runtime::llama::EmbeddingFormat::HFQ4G128 => {
                 gpu.embedding_lookup_hfq4g128(&target.weights.token_embd, &dst, tok, h)?
             }
+            hipfire_runtime::llama::EmbeddingFormat::HFQ6G256 => {
+                gpu.embedding_lookup_hfq6g256(&target.weights.token_embd, &dst, tok, h)?
+            }
             hipfire_runtime::llama::EmbeddingFormat::Q8_0 => {
                 gpu.embedding_lookup_q8(&target.weights.token_embd, &dst, tok, h)?
             }
@@ -4503,6 +4510,9 @@ fn run_dflash_draft_for_topk_gpu(
             }
             hipfire_runtime::llama::EmbeddingFormat::HFQ4G128 => {
                 gpu.embedding_lookup_hfq4g128(&target.weights.token_embd, &dst, tok, h)?
+            }
+            hipfire_runtime::llama::EmbeddingFormat::HFQ6G256 => {
+                gpu.embedding_lookup_hfq6g256(&target.weights.token_embd, &dst, tok, h)?
             }
             hipfire_runtime::llama::EmbeddingFormat::Q8_0 => {
                 gpu.embedding_lookup_q8(&target.weights.token_embd, &dst, tok, h)?

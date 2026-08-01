@@ -209,7 +209,9 @@ fn mtp_device_token_chain_eligible_for(
         && !use_p_min
         && matches!(
             embd_format,
-            llama::EmbeddingFormat::HFQ4G256 | llama::EmbeddingFormat::Q8_0
+            llama::EmbeddingFormat::HFQ4G256
+                | llama::EmbeddingFormat::HFQ6G256
+                | llama::EmbeddingFormat::Q8_0
         )
 }
 
@@ -895,6 +897,9 @@ fn embed_device_token_into(
     match weights.embd_format {
         llama::EmbeddingFormat::HFQ4G256 => {
             gpu.embedding_lookup_hfq4g256_batched(&weights.token_embd, out, token_id, 1, dim)
+        }
+        llama::EmbeddingFormat::HFQ6G256 => {
+            gpu.embedding_lookup_hfq6g256_batched(&weights.token_embd, out, token_id, 1, dim)
         }
         llama::EmbeddingFormat::Q8_0 => {
             gpu.embedding_lookup_q8_batched(&weights.token_embd, out, token_id, 1, dim)
