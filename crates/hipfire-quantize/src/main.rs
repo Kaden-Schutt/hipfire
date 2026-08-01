@@ -4634,7 +4634,24 @@ fn kmap_resolve_mode(name: &str, n_layers: usize, is_moe: bool, kmap_mode: u8) -
             if let Some(fmt) = lm_head_override() {
                 return QuantLevel::Override(fmt);
             }
-        } else if let Some(fmt) = embed_override() {
+            // A SEPARATE lm_head tensor exists only when the model is UNTIED,
+            // so reaching here means the embedding table already serves the
+            // gather and this tensor is pure output GEMV — the single hottest
+            // bandwidth consumer in decode (20.8% of a retained token on
+            // Qwen3.5-0.8B). Q8 doubles its bytes for no benefit, and the
+            // no-kmap path in this same binary already leaves it at the base
+            // format, so Rule 2 was contradicting its own sibling.
+            //
+            // Measured, Qwen3.6-27B dense on gfx1201, `--kmap-dense`:
+            //   lm_head Q8   16.37 GB  33.69 tok/s
+            //   lm_head base 15.69 GB  34.92 tok/s   (+3.65%, -0.68 GB)
+            //
+            // Tied models never reach this branch: their one tensor is named
+            // embed_tokens/token_embd and takes the arm below, which keeps Q8
+            // because the embedding gather needs the precision.
+            return QuantLevel::Base;
+        }
+        if let Some(fmt) = embed_override() {
             return QuantLevel::Override(fmt);
         }
         return QuantLevel::Q8;
@@ -13345,14 +13362,26 @@ mod tests {
         );
     }
 
+    /// Rule 2 splits by tie-ness, which the tensor NAME already encodes.
+    ///
+    /// A tied model has one `embed_tokens`/`token_embd` tensor serving both the
+    /// gather and the output GEMV — it stays Q8 because the gather needs it.
+    /// An untied model has a separate `lm_head`/`output.weight` that is pure
+    /// output GEMV; promoting it to Q8 doubles the bytes of the hottest decode
+    /// tensor for nothing, and disagrees with the no-kmap path, so it stays at
+    /// the base format.
     #[test]
-    fn kmap_embeds_are_q8() {
+    fn kmap_tied_embed_is_q8_but_untied_lm_head_stays_base() {
         assert_eq!(
             kmap_resolve("model.embed_tokens.weight", 64, false),
             QuantLevel::Q8
         );
-        assert_eq!(kmap_resolve("lm_head.weight", 64, false), QuantLevel::Q8);
-        assert_eq!(kmap_resolve("output.weight", 64, false), QuantLevel::Q8);
+        assert_eq!(
+            kmap_resolve("model.language_model.token_embd.weight", 64, false),
+            QuantLevel::Q8
+        );
+        assert_eq!(kmap_resolve("lm_head.weight", 64, false), QuantLevel::Base);
+        assert_eq!(kmap_resolve("output.weight", 64, false), QuantLevel::Base);
     }
 
     #[test]
