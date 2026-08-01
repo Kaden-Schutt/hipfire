@@ -6388,17 +6388,22 @@ fn open_bench_engine(
     Ok((engine, loaded, pre_diag, post_diag))
 }
 
+fn bench_generate_request(prompt: &str, max_tokens: u64) -> serde_json::Value {
+    serde_json::json!({
+        "type": "generate",
+        "id": request_id(),
+        "prompt": prompt,
+        "temperature": 0.0,
+        "top_p": 1.0,
+        "repeat_penalty": 1.1,
+        "max_tokens": max_tokens,
+        "attempt_id": 1,
+    })
+}
+
 fn bench_generate(engine: &mut Engine, prompt: &str, max_tokens: u64) -> Result<serde_json::Value> {
     Ok(engine.generate(
-        &serde_json::json!({
-            "type": "generate",
-            "id": request_id(),
-            "prompt": prompt,
-            "temperature": 0.0,
-            "top_p": 1.0,
-            "repeat_penalty": 1.1,
-            "max_tokens": max_tokens,
-        }),
+        &bench_generate_request(prompt, max_tokens),
         |_| Ok(()),
     )?)
 }
@@ -13380,5 +13385,31 @@ for line in sys.stdin:
         let log = harness.read_requests_log();
         let generates = Task11HttpHarness::ops_of_type(&log, "generate");
         assert_eq!(generates.len(), 1);
+    }
+
+    #[test]
+    fn bench_generate_request_includes_numeric_first_attempt() {
+        let req = bench_generate_request("bench prompt", 37);
+        assert_eq!(
+            req.get("type").and_then(|v| v.as_str()),
+            Some("generate")
+        );
+        assert_eq!(
+            req.get("attempt_id").and_then(|v| v.as_u64()),
+            Some(1)
+        );
+        let id = req
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        assert!(!id.is_empty(), "id must be a non-empty string");
+        assert_eq!(
+            req.get("prompt").and_then(|v| v.as_str()),
+            Some("bench prompt")
+        );
+        assert_eq!(
+            req.get("max_tokens").and_then(|v| v.as_u64()),
+            Some(37)
+        );
     }
 }
