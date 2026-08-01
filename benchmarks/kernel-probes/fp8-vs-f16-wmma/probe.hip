@@ -35,6 +35,7 @@
 using V8H = __attribute__((__vector_size__(8 * sizeof(_Float16)))) _Float16;
 using V2I = __attribute__((__vector_size__(2 * sizeof(int)))) int;
 using V8F = __attribute__((__vector_size__(8 * sizeof(float)))) float;
+using V8I = __attribute__((__vector_size__(8 * sizeof(int)))) int;
 
 #if defined(__gfx1200__) || defined(__gfx1201__)
 #define HAVE_FP8_WMMA 1
@@ -89,6 +90,27 @@ __global__ void __launch_bounds__(32, 8)
     if (tid < 8) out[blockIdx.x * 8 + tid] = acc[tid];
 }
 
+// INT8: same 8 B/lane operands as FP8, but int32 accumulate (EXACT for the
+// raw-nibble MMQ formulation, where FP8 would round).
+template <int WPL>
+__global__ void __launch_bounds__(32, 8)
+    wmma_iu8(const unsigned char* __restrict__ g, float* __restrict__ out, int steps) {
+    __shared__ unsigned char lds[2 * 16 * 16];
+    const int tid = threadIdx.x;
+    for (int i = tid; i < 2 * 16 * 16; i += 32) lds[i] = g[i & 511];
+    __builtin_amdgcn_s_waitcnt(0);
+    __builtin_amdgcn_wave_barrier();
+    V8I acc = {0, 0, 0, 0, 0, 0, 0, 0};
+    for (int s = 0; s < steps; ++s) {
+        V2I a = *(const V2I*)(&lds[(tid & 15) * 8]);
+        V2I b = *(const V2I*)(&lds[256 + (tid & 15) * 8]);
+#pragma unroll
+        for (int w = 0; w < WPL; ++w)
+            acc = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(false, a, false, b, acc, false);
+    }
+    if (tid < 8) out[blockIdx.x * 8 + tid] = (float)acc[tid];
+}
+
 #define HC(x)                                                                  \
     do {                                                                       \
         hipError_t e_ = (x);                                                   \
@@ -107,8 +129,8 @@ int main() {
     hipDeviceProp_t prop;
     HC(hipGetDeviceProperties(&prop, 0));
     printf("arch=%s\n", prop.gcnArchName);
-    printf("both variants: v_wmma_f32_16x16x16, K=16, identical WMMA count.\n");
-    printf("only operand width differs (f16 16 B/lane vs fp8 8 B/lane).\n\n");
+    printf("three variants, all v_wmma 16x16x16 K=16, identical WMMA count per WPL.\n");
+    printf("f16 16 B/lane operands; fp8 and iu8 8 B/lane. iu8 accumulates in int32.\n\n");
 
     const int blocks = 8192;
     const int steps = 512;
@@ -129,16 +151,17 @@ int main() {
     HC(hipMemcpy(dh, hh.data(), 512 * sizeof(_Float16), hipMemcpyHostToDevice));
     HC(hipMemcpy(db, hb.data(), 512, hipMemcpyHostToDevice));
 
-    printf("%-16s %9s %9s %9s %8s %8s\n", "WPL", "f16 ms", "fp8 ms", "delta",
-           "f16 TF", "fp8 TF");
-    printf("%s\n", std::string(68, '-').c_str());
+    printf("%-6s %8s %8s %8s   %8s %8s\n", "WPL", "f16 TF", "fp8 TF", "iu8 TF",
+           "fp8 vs f16", "iu8 vs f16");
+    printf("%s\n", std::string(62, '-').c_str());
 
-    auto run = [&](auto kf16, auto kfp8, int wpl) {
+    auto run = [&](auto kf16, auto kfp8, auto kiu8, int wpl) {
         auto go16 = [&] { kf16(); };
         auto go8 = [&] { kfp8(); };
-        for (int i = 0; i < 40; ++i) { go16(); go8(); }
+        auto goi = [&] { kiu8(); };
+        for (int i = 0; i < 40; ++i) { go16(); go8(); goi(); }
         (void)hipDeviceSynchronize();
-        std::vector<double> t16, t8;
+        std::vector<double> t16, t8, ti;
         for (int r = 0; r < 9; ++r) {
             hipEvent_t a, b;
             (void)hipEventCreate(&a); (void)hipEventCreate(&b);
@@ -150,20 +173,26 @@ int main() {
             for (int i = 0; i < 16; ++i) go8();
             (void)hipEventRecord(b); (void)hipEventSynchronize(b);
             (void)hipEventElapsedTime(&ms, a, b); t8.push_back(ms / 16);
+            (void)hipEventRecord(a);
+            for (int i = 0; i < 16; ++i) goi();
+            (void)hipEventRecord(b); (void)hipEventSynchronize(b);
+            (void)hipEventElapsedTime(&ms, a, b); ti.push_back(ms / 16);
             (void)hipEventDestroy(a); (void)hipEventDestroy(b);
         }
-        const double m16 = med(t16), m8 = med(t8);
+        const double m16 = med(t16), m8 = med(t8), mi = med(ti);
         // Each v_wmma_f32_16x16x16 is 16*16*16 MACs = 8192 flops.
         const double flops = (double)blocks * steps * wpl * 8192.0;
         const double tf16 = flops / (m16 * 1e-3) / 1e12;
         const double tf8 = flops / (m8 * 1e-3) / 1e12;
-        printf("%-16d %9.5f %9.5f %+8.2f%% %8.1f %8.1f\n", wpl, m16, m8,
-               (m8 / m16 - 1.0) * 100.0, tf16, tf8);
+        const double tfi = flops / (mi * 1e-3) / 1e12;
+        printf("%-6d %8.1f %8.1f %8.1f   %+7.2f%%  %+7.2f%%\n", wpl, tf16, tf8, tfi,
+               (m8 / m16 - 1.0) * 100.0, (mi / m16 - 1.0) * 100.0);
     };
 
 #define CASE(W)                                                                \
     run([&] { hipLaunchKernelGGL((wmma_f16<W>), dim3(blocks), dim3(32), 0, 0, dh, o1, steps); }, \
         [&] { hipLaunchKernelGGL((wmma_fp8<W>), dim3(blocks), dim3(32), 0, 0, db, o2, steps); }, \
+        [&] { hipLaunchKernelGGL((wmma_iu8<W>), dim3(blocks), dim3(32), 0, 0, db, o2, steps); }, \
         W)
     CASE(1);
     CASE(2);
