@@ -1762,7 +1762,12 @@ pub const PREFILL_MAX_BATCH: usize = 256;
 pub fn is_batchable_la(dt: DType, arch: &str) -> bool {
     let always_ok = matches!(
         dt,
-        DType::MQ4G256 | DType::HFQ4G256 | DType::MQ6G256 | DType::HFQ6G256 | DType::Q8_0
+        DType::MQ4G256
+            | DType::HFQ4G256
+            | DType::HFQ4G128
+            | DType::MQ6G256
+            | DType::HFQ6G256
+            | DType::Q8_0
     );
     if always_ok {
         return true;
@@ -2268,6 +2273,21 @@ pub fn forward_prefill_batch_chunk_captured(
     )
 }
 
+#[inline]
+fn q8_prefill_family_eligible(
+    gpu_arch: &str,
+    model_arch: ModelArch,
+    quant_q8: bool,
+    is_tree: bool,
+    batch_size: usize,
+) -> bool {
+    model_arch == ModelArch::Qwen3
+        && (gpu_arch.starts_with("gfx11") || gpu_arch == "gfx1201")
+        && quant_q8
+        && !is_tree
+        && batch_size > 1
+}
+
 #[allow(clippy::too_many_arguments)]
 fn forward_prefill_chunk(
     gpu: &mut Gpu,
@@ -2317,7 +2337,7 @@ fn forward_prefill_chunk(
     // 1. Embed N tokens into pbs.x_batch.
     if matches!(
         weights.embd_format,
-        EmbeddingFormat::HFQ4G256 | EmbeddingFormat::Q8_0
+        EmbeddingFormat::HFQ4G256 | EmbeddingFormat::HFQ4G128 | EmbeddingFormat::Q8_0
     ) {
         if !pre_uploaded {
             let tokens_host: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
@@ -2327,6 +2347,13 @@ fn forward_prefill_chunk(
         }
         match weights.embd_format {
             EmbeddingFormat::HFQ4G256 => gpu.embedding_lookup_hfq4g256_batched(
+                &weights.token_embd,
+                &pbs.x_batch,
+                &pbs.tokens,
+                n,
+                dim,
+            )?,
+            EmbeddingFormat::HFQ4G128 => gpu.embedding_lookup_hfq4g128_batched(
                 &weights.token_embd,
                 &pbs.x_batch,
                 &pbs.tokens,
@@ -2345,16 +2372,15 @@ fn forward_prefill_chunk(
     } else {
         for (i, &tok) in tokens.iter().enumerate() {
             match weights.embd_format {
-                EmbeddingFormat::HFQ4G128 => {
-                    gpu.embedding_lookup_hfq4g128(&weights.token_embd, &s.x, tok, dim)?
-                }
                 EmbeddingFormat::Q4K => {
                     gpu.embedding_lookup_q4k(&weights.token_embd, &s.x, tok, dim)?
                 }
                 EmbeddingFormat::F32 => {
                     gpu.embedding_lookup(&weights.token_embd, &s.x, tok, dim)?
                 }
-                EmbeddingFormat::HFQ4G256 | EmbeddingFormat::Q8_0 => unreachable!(),
+                EmbeddingFormat::HFQ4G256 | EmbeddingFormat::HFQ4G128 | EmbeddingFormat::Q8_0 => {
+                    unreachable!()
+                }
             }
             gpu.hip.memcpy_dtod_at(
                 &pbs.x_batch.buf,
@@ -2379,6 +2405,14 @@ fn forward_prefill_chunk(
     } else {
         start_pos + n
     };
+    let q8_family_eligible = q8_prefill_family_eligible(
+        &gpu.arch,
+        config.arch,
+        kv_cache.quant_q8,
+        tree_mask.is_some(),
+        n,
+    );
+    let q8_attn_ctx = q8_family_eligible.then(|| DispatchCtx::new(gpu));
 
     // 2. Per-layer loop.
     for layer_idx in 0..config.n_layers {
@@ -2414,9 +2448,40 @@ fn forward_prefill_chunk(
         }
 
         let qkv_is_q8 = matches!(layer.wq.gpu_dtype, DType::Q8_0);
+        let qkv_is_hfq4g128 = matches!(layer.wq.gpu_dtype, DType::HFQ4G128);
 
         // 3-way fused QKV projection.
-        if qkv_is_6bit {
+        if qkv_is_hfq4g128 {
+            debug_assert!(
+                matches!(layer.wk.gpu_dtype, DType::HFQ4G128)
+                    && matches!(layer.wv.gpu_dtype, DType::HFQ4G128),
+                "llama HFQ4G128 QKV batch requires one uniform wire layout",
+            );
+            gpu.gemm_hfq4g128(
+                &layer.wq.buf,
+                &pbs.x_rot_batch,
+                &pbs.fa_q_batch,
+                layer.wq.m,
+                layer.wq.k,
+                n,
+            )?;
+            gpu.gemm_hfq4g128(
+                &layer.wk.buf,
+                &pbs.x_rot_batch,
+                &pbs.fa_k_batch,
+                layer.wk.m,
+                layer.wk.k,
+                n,
+            )?;
+            gpu.gemm_hfq4g128(
+                &layer.wv.buf,
+                &pbs.x_rot_batch,
+                &pbs.fa_v_batch,
+                layer.wv.m,
+                layer.wv.k,
+                n,
+            )?;
+        } else if qkv_is_6bit {
             gpu.gemm_qkv_hfq6g256(
                 &layer.wq.buf,
                 &layer.wk.buf,
@@ -2612,7 +2677,7 @@ fn forward_prefill_chunk(
                 config.head_dim,
                 n,
             )?;
-        } else {
+        } else if !q8_family_eligible {
             gpu.kv_cache_write_q8_0_batched(
                 &kv_cache.k_gpu[layer_idx],
                 &pbs.fa_k_batch,
@@ -2629,6 +2694,12 @@ fn forward_prefill_chunk(
                 config.head_dim,
                 n,
             )?;
+        } else {
+            debug_assert!(kv_cache.quant_q8);
+            // Standard causal Q8 prefill is paired with its attention launch
+            // below through `AttentionFamily`; that entry point owns K/V writes.
+            // A singleton tail stays on the legacy path above because the
+            // family treats batch_size=1 as decode and expects decode params.
         }
 
         // Batched flash attention (causal, or tree-masked when `tree_mask` is
@@ -2707,6 +2778,48 @@ fn forward_prefill_chunk(
                 n,
                 &pbs.flash_partials,
             )?;
+        } else if q8_family_eligible {
+            debug_assert!(kv_cache.quant_q8);
+            // Ordinary causal Q8 prefill now shares the same paired dispatch
+            // used by Qwen3.5, enabling the existing gfx11/gfx1201 M16 kernel.
+            // Tree verify and singleton tails remain on their legacy paths.
+            let plan = KvTierPlan::derive(KvTierInputs {
+                pos: start_pos,
+                capture_mode: gpu.graphs.capture_mode,
+                batch_size: n,
+                is_tree: false,
+                ..kv_cache.tier_inputs()
+            })
+            .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
+            let io = AttnParams {
+                q: &pbs.fa_q_batch,
+                k: &pbs.fa_k_batch,
+                v: &pbs.fa_v_batch,
+                k_cache: &kv_cache.k_gpu[layer_idx],
+                v_cache: &kv_cache.v_gpu[layer_idx],
+                k_scales: None,
+                v_scales: None,
+                pos_buf: &s.pos_buf,
+                pos: start_pos,
+                positions: Some(&pbs.positions),
+                n_heads: config.n_heads,
+                n_kv_heads: config.n_kv_heads,
+                head_dim: config.head_dim,
+                physical_cap: kv_cache.physical_cap,
+                batch_size: n,
+                max_ctx_len,
+                flash_partials: Some(&pbs.flash_partials),
+                givens_cos: kv_cache.givens_cos.as_ref(),
+                givens_sin: kv_cache.givens_sin.as_ref(),
+                tree_bias: None,
+                block_start: 0,
+                block_cols: 0,
+                output_gate: None,
+                output: &pbs.fa_attn_out_batch,
+            };
+            attention_family()
+                .run_attention(q8_attn_ctx.as_ref().unwrap(), gpu, &plan, &io)
+                .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
         } else if max_ctx_len > LDS_CTX_LIMIT {
             // Tree-masked verify is not yet validated in the long-context Q8
             // regime (ctx > LDS_CTX_LIMIT). The batched-masked kernel below DOES
@@ -2767,6 +2880,7 @@ fn forward_prefill_chunk(
         let wo_is_mq3 = matches!(layer.wo.gpu_dtype, DType::MQ3G256);
         let wo_is_fp4 = matches!(layer.wo.gpu_dtype, DType::HFP4G32 | DType::MFP4G32);
         let wo_is_q8 = matches!(layer.wo.gpu_dtype, DType::Q8_0);
+        let wo_is_hfq4g128 = matches!(layer.wo.gpu_dtype, DType::HFQ4G128);
         let wo_input = if wo_is_mq {
             // F2: AWQ-aware rotate for wo (FullAttention output projection) input.
             rotate_x_mq_batched_for(
@@ -2781,7 +2895,21 @@ fn forward_prefill_chunk(
         } else {
             &pbs.fa_attn_out_batch
         };
-        if wo_is_6bit {
+        if wo_is_hfq4g128 {
+            // The generic G128 GEMM has overwrite semantics. Reuse x_rot_batch
+            // as a dead-after-QKV temporary, then add into the residual stream.
+            let projected = pbs.x_rot_batch.sub_offset(0, n * layer.wo.m);
+            gpu.gemm_hfq4g128(
+                &layer.wo.buf,
+                wo_input,
+                &projected,
+                layer.wo.m,
+                layer.wo.k,
+                n,
+            )?;
+            let x_n = pbs.x_batch.sub_offset(0, n * layer.wo.m);
+            gpu.add_inplace_f32(&x_n, &projected)?;
+        } else if wo_is_6bit {
             gpu.gemm_hfq6g256_residual(
                 &layer.wo.buf,
                 wo_input,
@@ -2844,6 +2972,7 @@ fn forward_prefill_chunk(
         let ffn_is_mq3 = matches!(layer.w_gate.gpu_dtype, DType::MQ3G256);
         let ffn_is_fp4 = matches!(layer.w_gate.gpu_dtype, DType::HFP4G32 | DType::MFP4G32);
         let ffn_is_q8 = matches!(layer.w_gate.gpu_dtype, DType::Q8_0);
+        let ffn_is_hfq4g128 = matches!(layer.w_gate.gpu_dtype, DType::HFQ4G128);
         if ffn_is_mq {
             gpu.fused_rmsnorm_rotate_mq_batched(
                 &pbs.x_batch,
@@ -2863,7 +2992,28 @@ fn forward_prefill_chunk(
                 config.norm_eps,
             )?;
         }
-        if ffn_is_6bit {
+        if ffn_is_hfq4g128 {
+            debug_assert!(
+                matches!(layer.w_up.gpu_dtype, DType::HFQ4G128),
+                "llama HFQ4G128 gate/up batch requires one uniform wire layout",
+            );
+            gpu.gemm_hfq4g128(
+                &layer.w_gate.buf,
+                &pbs.x_rot_batch,
+                &pbs.gate_ffn_batch,
+                layer.w_gate.m,
+                layer.w_gate.k,
+                n,
+            )?;
+            gpu.gemm_hfq4g128(
+                &layer.w_up.buf,
+                &pbs.x_rot_batch,
+                &pbs.up_batch,
+                layer.w_up.m,
+                layer.w_up.k,
+                n,
+            )?;
+        } else if ffn_is_6bit {
             gpu.gemm_gate_up_hfq6g256(
                 &layer.w_gate.buf,
                 &layer.w_up.buf,
@@ -2953,6 +3103,7 @@ fn forward_prefill_chunk(
         let w_down_is_mq3 = matches!(layer.w_down.gpu_dtype, DType::MQ3G256);
         let w_down_is_fp4 = matches!(layer.w_down.gpu_dtype, DType::HFP4G32 | DType::MFP4G32);
         let w_down_is_q8 = matches!(layer.w_down.gpu_dtype, DType::Q8_0);
+        let w_down_is_hfq4g128 = matches!(layer.w_down.gpu_dtype, DType::HFQ4G128);
         if w_down_is_mq {
             // F2: AWQ-aware silu_mul+rotate for w_down input.
             fused_silu_mul_rotate_mq_batched_for(
@@ -2967,7 +3118,21 @@ fn forward_prefill_chunk(
         } else {
             gpu.silu_mul_f32(&pbs.gate_ffn_batch, &pbs.up_batch, &pbs.ffn_hidden_batch)?;
         }
-        if w_down_is_6bit {
+        if w_down_is_hfq4g128 {
+            // gate_ffn_batch is dead after silu_mul and is larger than the
+            // dim-wide down projection output, so it is a safe residual temp.
+            let projected = pbs.gate_ffn_batch.sub_offset(0, n * layer.w_down.m);
+            gpu.gemm_hfq4g128(
+                &layer.w_down.buf,
+                &pbs.ffn_hidden_batch,
+                &projected,
+                layer.w_down.m,
+                layer.w_down.k,
+                n,
+            )?;
+            let x_n = pbs.x_batch.sub_offset(0, n * layer.w_down.m);
+            gpu.add_inplace_f32(&x_n, &projected)?;
+        } else if w_down_is_6bit {
             gpu.gemm_hfq6g256_residual(
                 &layer.w_down.buf,
                 &pbs.ffn_hidden_batch,
@@ -11019,6 +11184,7 @@ mod tests {
             "gfx900", "gfx906", "gfx1010", "gfx1030", "gfx1100", "gfx1200", "gfx942",
         ] {
             assert!(is_batchable_la(DType::HFQ4G256, arch));
+            assert!(is_batchable_la(DType::HFQ4G128, arch));
             assert!(is_batchable_la(DType::MQ4G256, arch));
             assert!(is_batchable_la(DType::HFQ6G256, arch));
             assert!(is_batchable_la(DType::MQ6G256, arch));
@@ -11176,6 +11342,20 @@ mod tests {
         }
     }
     // ── KvCache::tier_inputs() accessor pin test ─────────────────
+
+    #[test]
+    fn q8_prefill_family_stays_inside_validated_qwen3_arch_envelope() {
+        let eligible =
+            |arch, model, q8, tree, batch| q8_prefill_family_eligible(arch, model, q8, tree, batch);
+        assert!(eligible("gfx1100", ModelArch::Qwen3, true, false, 256));
+        assert!(eligible("gfx1201", ModelArch::Qwen3, true, false, 2));
+        assert!(!eligible("gfx1030", ModelArch::Qwen3, true, false, 256));
+        assert!(!eligible("gfx1200", ModelArch::Qwen3, true, false, 256));
+        assert!(!eligible("gfx1100", ModelArch::Llama, true, false, 256));
+        assert!(!eligible("gfx1100", ModelArch::Qwen3, true, true, 256));
+        assert!(!eligible("gfx1100", ModelArch::Qwen3, true, false, 1));
+        assert!(!eligible("gfx1100", ModelArch::Qwen3, false, false, 256));
+    }
 
     #[test]
     fn tier_inputs_q8_is_byte_identical_to_legacy_literal() {
