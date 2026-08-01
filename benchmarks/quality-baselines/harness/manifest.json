@@ -56,7 +56,42 @@
       "producer_cmd": "LD_LIBRARY_PATH=/opt/rocm-7.12/lib cargo run --release -p hipfire-runtime --example build_kld_ref -- --bf16-gguf /home/kread/models-local/Qwen3.6-27B/Qwen3.6-27B-BF16-00001-of-00002.gguf --slice benchmarks/quality-baselines/slice/wikitext2-1024s-2048ctx.txt --top-k 256 --output benchmarks/quality-baselines/refs/qwen3.6-27b-bf16.kldref.bin --llama-perplexity-bin /home/kread/git/llm/llama.cpp/build-strix/bin/llama-perplexity",
       "hf_repo": "hipfire-models/qwen-kldref",
       "hf_repo_type": "dataset",
-      "comment": "27B BF16 reference dump, 2026-05-09, 2h 3m wall, 162 reduced tok/s. Required --no-mmap flag (passed automatically by build_kld_ref) — without it, demand-paging on 50 GB BF16 weights caused eviction-cycle stall on 124 GB UMA. GGUF copied locally to /home/kread/models-local/ from NFS to reduce per-page-fault read time. VM (enertree) shut down to free working-set RAM. Uploaded to hipfire-models/qwen-kldref 2026-05-11."
+      "comment": "27B BF16 reference dump, 2026-05-09, 2h 3m wall, 162 reduced tok/s. Required --no-mmap flag (passed automatically by build_kld_ref) \u2014 without it, demand-paging on 50 GB BF16 weights caused eviction-cycle stall on 124 GB UMA. GGUF copied locally to /home/kread/models-local/ from NFS to reduce per-page-fault read time. VM (enertree) shut down to free working-set RAM. Uploaded to hipfire-models/qwen-kldref 2026-05-11."
+    },
+    "qwen3.5-0.8b-f32-native-16chunk.kldref.bin": {
+      "sha256": "1faa0511c726a82aaa8f80971a0ccdc6f5ab5c31282532f375988a969fadc3c6",
+      "size_bytes": 33783712,
+      "host_arch": "gfx1201",
+      "reference_kind": "hipfire-native-f32-oracle",
+      "comment": "llama-free. Built by build_kld_ref_native from hipfire OWN F32 oracle forward, so the engine-port difference cancels and there is no ~0.30-0.36 nat cross-engine floor. NOT comparable to the llama-sourced bf16 refs in this manifest. 16-chunk subset: fine for A/B, thin for a published absolute number.",
+      "slice_md5": "83b0205a304bf4e52172ecdb05f2e895",
+      "top_k": 256,
+      "n_ctx": 2048,
+      "n_vocab": 248320,
+      "n_chunk": 16,
+      "scored_tokens": 16368,
+      "oracle_nll": 2.818352,
+      "oracle_ppl": 16.7492,
+      "oracle_producer_cmd": "hipfire-quantize --input <Qwen3.5-0.8B safetensors dir> --output oracle-f32.hfq --format oracle",
+      "producer_cmd": "cargo run --release -p hipfire-runtime --features deltanet --example build_kld_ref_native -- --model oracle-f32.hfq --slice benchmarks/quality-baselines/slice/wikitext2-1024s-2048ctx.txt --top-k 256 --n-ctx 2048 --max-chunks 16 --output benchmarks/quality-baselines/refs/qwen3.5-0.8b-f32-native-16chunk.kldref.bin",
+      "consumer_cmd": "cargo run --release -p hipfire-runtime --features deltanet --example eval_hipfire -- --model <cand>.hfq --ref benchmarks/quality-baselines/refs/qwen3.5-0.8b-f32-native-16chunk.kldref.bin --kv-mode f32 --output <cand>.kldseq",
+      "results": {
+        "mq4-no-clip": {
+          "kld": 0.148168,
+          "nll": 2.975116,
+          "ppl": 19.5919
+        },
+        "mq4-plus-clip": {
+          "kld": 0.124486,
+          "nll": 2.932131,
+          "ppl": 18.7676
+        },
+        "rwq4": {
+          "kld": 0.09609,
+          "nll": 2.95198,
+          "ppl": 19.1438
+        }
+      }
     }
   }
 }
