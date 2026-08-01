@@ -38,8 +38,9 @@
 //! | [`MQ3N`] | 8 | 96 | 104 | 3.25 |
 //! | [`MQ2N`] | 8 | 64 | 72 | 2.25 |
 //!
-//! NOTE: no `QuantType` discriminants are assigned and no GPU kernel consumes
-//! these. Validated encoders plus reference decoders, not shippable formats.
+//! `QuantType::RWQ4G256 = 38` ships the MQ4N wire layout (136 B/group). MQ3N/MQ2N
+//! remain research encoders without assigned discriminants.
+
 
 use crate::fp8::{e4m3_decode, e4m3_encode_roundup};
 
@@ -334,6 +335,40 @@ impl Spec {
     }
 }
 
+/// RWQ4G256 group size (weights). Alias of [`GROUP`] for the shippable name.
+pub const RWQ4_GROUP: usize = GROUP;
+/// RWQ4G256 bytes per 256-weight group. Alias of [`MQ4N`]'s `group_bytes`.
+pub const RWQ4_GROUP_BYTES: usize = 136;
+
+/// Encode one already-rotated 256-weight group to the RWQ4G256 / MQ4N wire
+/// layout (136 bytes): `[f32 master LE][4 × u8 E4M3][128 B low-nibble-first]`.
+#[inline]
+pub fn encode_rwq4_group(group: &[f32; GROUP], out: &mut [u8; RWQ4_GROUP_BYTES]) {
+    MQ4N.encode_group(group, out.as_mut_slice());
+}
+
+/// Reference decode of one RWQ4G256 group back to the rotated domain.
+/// Bit-exact with [`Spec::decode_group`] on [`MQ4N`].
+#[inline]
+pub fn decode_rwq4_group(blk: &[u8; RWQ4_GROUP_BYTES], out: &mut [f32; GROUP]) {
+    MQ4N.decode_group(blk.as_slice(), out);
+}
+
+/// Encode a flat weight slice as RWQ4G256, applying `fwht` per 256-group first.
+/// Output length is `ceil(n/256) * 136` bytes.
+#[inline]
+pub fn encode_rwq4(f32_data: &[f32], fwht: impl Fn(&mut [f32]) + Sync) -> Vec<u8> {
+    MQ4N.encode(f32_data, fwht)
+}
+
+/// Decode an RWQ4G256 buffer back to the rotated domain.
+/// `bytes.len()` must be a multiple of [`RWQ4_GROUP_BYTES`].
+#[inline]
+pub fn decode_rwq4(bytes: &[u8]) -> Vec<f32> {
+    debug_assert_eq!(bytes.len() % RWQ4_GROUP_BYTES, 0);
+    MQ4N.decode(bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -542,5 +577,53 @@ mod tests {
             let data = gaussian(GROUP * 5, 3);
             assert_eq!(s.encode(&data, |_| {}).len(), 5 * s.group_bytes);
         }
+    }
+
+    /// RWQ4G256 shippable path: encode → 136 B/group wire → decode → SNR.
+    /// Asserts the frozen layout length and that reconstruction clears 20 dB
+    /// on a deterministic pseudo-random Gaussian (rotated-domain SNR equals
+    /// weight-domain SNR because FWHT is orthonormal).
+    #[test]
+    fn rwq4_wire_round_trip_snr_and_byte_length() {
+        let n_blocks = 8usize;
+        let n = n_blocks * GROUP;
+        let data = gaussian(n, 0xA5A5_5A5A);
+        // Identity "rotation" — SNR is measured in the same domain the
+        // encoder sees; production callers pass the real FWHT.
+        let bytes = encode_rwq4(&data, |_| {});
+        assert_eq!(
+            bytes.len(),
+            n_blocks * RWQ4_GROUP_BYTES,
+            "serialized length must be (n/256)*136"
+        );
+        assert_eq!(bytes.len() % RWQ4_GROUP_BYTES, 0);
+
+        let dec = decode_rwq4(&bytes);
+        assert_eq!(dec.len(), n);
+
+        let mut energy = 0.0f64;
+        let mut err = 0.0f64;
+        for i in 0..n {
+            let a = data[i] as f64;
+            let d = a - dec[i] as f64;
+            energy += a * a;
+            err += d * d;
+        }
+        assert!(energy > 0.0, "probe tensor must be non-zero");
+        let snr_db = 10.0 * (energy / err).log10();
+        assert!(
+            snr_db > 20.0,
+            "RWQ4G256 SNR {snr_db:.2} dB, expected > 20 dB"
+        );
+
+        // Spot-check one group through the fixed-size array helpers.
+        let mut g = [0.0f32; GROUP];
+        g.copy_from_slice(&data[..GROUP]);
+        let mut enc = [0u8; RWQ4_GROUP_BYTES];
+        encode_rwq4_group(&g, &mut enc);
+        assert_eq!(&enc[..], &bytes[..RWQ4_GROUP_BYTES]);
+        let mut back = [0.0f32; GROUP];
+        decode_rwq4_group(&enc, &mut back);
+        assert_eq!(&back[..], &dec[..GROUP]);
     }
 }

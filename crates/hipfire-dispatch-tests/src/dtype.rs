@@ -12,7 +12,7 @@ const QUANTIZED_DTYPES: &[DType] = &[
     DType::MQ2G256Lloyd, DType::MQ3G256Lloyd, DType::MQ4G256Lloyd,
     DType::HFP4G32, DType::MFP4G32,
     DType::HFQ2G256, DType::HFQ2G128, DType::HFQ6G256,
-    DType::ParoQ4G128, DType::Raw,
+    DType::ParoQ4G128, DType::RWQ4G256, DType::Raw,
 ];
 
 /// DTypes that are MQ-family (FWHT-rotated MagnumQuant).
@@ -155,7 +155,7 @@ fn every_rotated_dtype_has_deliberate_post_rotation_variant() {
         match dtype {
             MQ4G256 | MQ4G128 | MQ8G256 | MQ6G256 | MQ5G256 | MQ3G256 | MQ2G256
             | MQ2G256Lloyd | MQ3G256Lloyd | MQ4G256Lloyd | MFP4G32 | MFP4G32Lloyd
-            | MFP4G32P | MFP4G32E8 | MFP4G32E8SOA => Some(Prerotated),
+            | MFP4G32P | MFP4G32E8 | MFP4G32E8SOA | RWQ4G256 => Some(Prerotated),
             MFP3G32E8 | MFP2G32E8 | ParoQ4G128 => Some(Plain),
             F32 | F16 | BF16 | Q4K | Q6K | Q8_0 | Q4F16G64 | Q4F16G32 | Q8HFQ
             | HFQ4G256 | HFQ4G128 | HFQ3G256 | HFQ3G128 | HFP4G32 | HFQ2G256
@@ -170,7 +170,7 @@ fn every_rotated_dtype_has_deliberate_post_rotation_variant() {
         MQ8G256, MQ6G256, MQ5G256, MQ3G256, MQ2G256, MQ2G256Lloyd,
         MQ3G256Lloyd, MQ4G256Lloyd, HFP4G32, MFP4G32, MFP4G32Lloyd,
         MFP4G32P, MFP4G32E8, MFP4G32E8SOA, MFP3G32E8, MFP2G32E8,
-        HFQ2G256, HFQ2G128, HFQ6G256, ParoQ4G128, Raw,
+        HFQ2G256, HFQ2G128, HFQ6G256, ParoQ4G128, RWQ4G256, Raw,
     ];
 
     for dtype in all_dtypes {

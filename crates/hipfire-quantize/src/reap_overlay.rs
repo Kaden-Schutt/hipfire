@@ -8,7 +8,7 @@
 use crate::{
     gen_fwht_signs, quantize_hfq4g256, quantize_hfq6g256, quantize_mq2g256_lloyd,
     quantize_mq3g256_lloyd, quantize_mq4g256, quantize_mq4g256_lloyd, quantize_mq6g256,
-    quantize_q8f16, HfqTensor, QuantType,
+    quantize_q8f16, quantize_rwq4g256, HfqTensor, QuantType,
 };
 use hipfire_reap::plan::{QuantOverride, ReapPlan, Role};
 
@@ -38,6 +38,14 @@ pub fn quantize_to_format(
                 QuantType::MQ4G256,
                 256,
                 quantize_mq4g256(f32_data, &s1, &s2),
+            )
+        }
+        "rwq4" | "rwq4g256" | "radiowave" => {
+            let (s1, s2) = signs();
+            (
+                QuantType::RWQ4G256,
+                256,
+                quantize_rwq4g256(f32_data, &s1, &s2),
             )
         }
         "mq6" | "mq6g256" => {

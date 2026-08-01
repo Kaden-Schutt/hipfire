@@ -185,6 +185,7 @@ pub enum DType {
     HFQ3G256,     // 104 bytes per 256 elements (flat 3-bit, f32 scale+zero)
     HFQ3G128,     // 56 bytes per 128 elements (flat 3-bit, f32 scale+zero)
     MQ4G256,      // MagnumQuant: FWHT-rotated HFQ4-G256 (136 bytes/group, same as HFQ4G256)
+    RWQ4G256,     // RadioWave Quant: FWHT-rotated 4-bit + E4M3 sub-scales (136 bytes/group, qt=38)
     MQ4G128,      // MagnumQuant: FWHT-128-rotated INT4 (72 bytes/group, same layout as HFQ4G128)
     MQ8G256,      // MagnumQuant: FWHT-rotated symmetric INT8, dp4a target (258 bytes/group)
     MQ6G256,      // MagnumQuant: FWHT-rotated HFQ6-G256 (200 bytes/group, same as HFQ6G256)
@@ -246,6 +247,7 @@ impl DType {
             | DType::HFQ2G128
             | DType::HFQ6G256
             | DType::MQ4G256
+            | DType::RWQ4G256
             | DType::MQ4G128
             | DType::MQ6G256
             | DType::MQ5G256
@@ -2644,6 +2646,12 @@ impl Gpu {
                     ));
                 }
             }
+            "rwq4" => {
+                // RWQ4 = FWHT-rotated RadioWave 4-bit (136 B/group). Shares
+                // mq_rotate_x with MQ4; GEMV is a dedicated codebook kernel.
+                specs.push(("gemv_mq4g256", kernels::GEMV_MQ4G256_SRC.to_string()));
+                specs.push(("gemv_rwq4g256", kernels::GEMV_RWQ4G256_SRC.to_string()));
+            }
             "q8" => {
                 specs.push(("gemv_q8_0", kernels::GEMV_Q8_0_SRC.to_string()));
             }
@@ -2881,6 +2889,8 @@ impl Gpu {
                 // MQ4 GEMV module exports both the main GEMV and the standalone
                 // x rotation kernel used by the prerotated dispatch path.
                 "gemv_mq4g256" => vec!["gemv_mq4g256", "mq_rotate_x"],
+                // RWQ4 GEMV: module name differs from the exported symbol.
+                "gemv_rwq4g256" => vec!["gemv_rwq4g256_prerotated"],
                 // Arch-variant HFQ4 GEMV modules all expose the same symbol.
                 n if n.starts_with("gemv_hfq4g256_rdna") => vec!["gemv_hfq4g256"],
                 n if n.starts_with("gemv_hfq4g256_gfx") => vec!["gemv_hfq4g256"],

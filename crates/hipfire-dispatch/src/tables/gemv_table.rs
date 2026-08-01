@@ -84,6 +84,7 @@ fn register_prerotated(registry: &mut KernelRegistry) {
         DType::MFP4G32P,
         DType::MFP4G32E8,
         DType::MFP4G32E8SOA,
+        DType::RWQ4G256,
     ];
     for &dtype in dtypes {
         let Ok(key) = KernelKey::for_gemv_prerotated(dtype) else {

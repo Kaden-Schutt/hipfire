@@ -119,7 +119,7 @@ pub fn dtype_rotation_plan(dtype: DType) -> RotationPlan {
     match dtype {
         MQ4G256 | MQ3G256 | MQ2G256 | MQ5G256 | MQ6G256 | MQ2G256Lloyd | MQ3G256Lloyd
         | MQ4G256Lloyd | MFP4G32 | MFP4G32Lloyd | MFP4G32P | MFP4G32E8 | MFP4G32E8SOA
-        | MFP3G32E8 | MFP2G32E8 => RotationPlan::FwhtG256,
+        | MFP3G32E8 | MFP2G32E8 | RWQ4G256 => RotationPlan::FwhtG256,
         MQ4G128 => RotationPlan::FwhtG128,
         MQ8G256 => RotationPlan::Mq8Internal,
         ParoQ4G128 => RotationPlan::Givens,
@@ -138,7 +138,8 @@ pub fn dtype_post_rotation_variant(dtype: DType) -> GemvVariant {
         // for them. Generic `run_auto` is not a supported route.
         MFP3G32E8 | MFP2G32E8 => GemvVariant::Plain,
         MQ4G256 | MQ3G256 | MQ2G256 | MQ5G256 | MQ6G256 | MQ8G256 | MQ2G256Lloyd | MQ3G256Lloyd
-        | MQ4G256Lloyd | MFP4G32 | MFP4G32Lloyd | MFP4G32P | MFP4G32E8 | MFP4G32E8SOA | MQ4G128 => {
+        | MQ4G256Lloyd | MFP4G32 | MFP4G32Lloyd | MFP4G32P | MFP4G32E8 | MFP4G32E8SOA | MQ4G128
+        | RWQ4G256 => {
             GemvVariant::Prerotated
         }
         _ => GemvVariant::Plain,
@@ -239,6 +240,7 @@ pub enum KernelKey {
     GemvMfp4G32PPrerotated,
     GemvMfp4G32E8Prerotated,
     GemvMfp4G32E8SoaPrerotated,
+    GemvRwq4G256Prerotated,
     // GEMV residual
     GemvHfq4G256Residual,
     GemvHfq3G256Residual,
@@ -624,6 +626,7 @@ impl KernelKey {
         use DType::*;
         match dtype {
             MQ4G256 => Ok(Self::GemvMq4G256Prerotated),
+            RWQ4G256 => Ok(Self::GemvRwq4G256Prerotated),
             MQ3G256 => Ok(Self::GemvMq3G256Prerotated),
             MQ2G256 => Ok(Self::GemvMq2G256Prerotated),
             MQ5G256 => Ok(Self::GemvMq5G256Prerotated),
@@ -677,6 +680,13 @@ impl KernelKey {
             MQ6G256 => Ok(Self::GemvMq6G256Residual),
             MQ3G256Lloyd => Ok(Self::GemvMq3G256LloydResidual),
             MQ4G256Lloyd => Ok(Self::GemvMq4G256LloydResidual),
+            // RWQ4G256 has no residual kernel (prerotated GEMV only).
+            RWQ4G256 => Err(DispatchError::UnsupportedVariant {
+                family: "gemv",
+                variant: "residual",
+                arch: "",
+                quant: "",
+            }),
             _ => Err(DispatchError::UnsupportedVariant {
                 family: "gemv",
                 variant: "residual",
@@ -698,6 +708,13 @@ impl KernelKey {
             MQ6G256 => Ok(Self::GemvMq6G256SwiGLUResidual),
             MQ3G256Lloyd => Ok(Self::GemvMq3G256LloydSwiGLUResidual),
             MQ4G256Lloyd => Ok(Self::GemvMq4G256LloydSwiGLUResidual),
+            // RWQ4G256 has no SwiGLU+residual kernel (prerotated GEMV only).
+            RWQ4G256 => Err(DispatchError::UnsupportedVariant {
+                family: "gemv",
+                variant: "swiglu_residual",
+                arch: "",
+                quant: "",
+            }),
             _ => Err(DispatchError::UnsupportedVariant {
                 family: "gemv",
                 variant: "swiglu_residual",
@@ -729,7 +746,7 @@ impl KernelKey {
             | HFP4G32 | MFP4G32 | MFP4G32Lloyd | MFP4G32P
             | MFP4G32E8 | MFP4G32E8SOA
             | MFP3G32E8 | MFP2G32E8  // mfpN-E8: same RDNA3/4 gating as MFP4G32E8 via e8_with_wmma
-            | ParoQ4G128 => ArchPredicate::Always,
+            | ParoQ4G128 | RWQ4G256 => ArchPredicate::Always,
             HFQ3G256 | HFQ3G128 => ArchPredicate::HasSdot4,
             // MQ3G256 + MQ2/MQ3/MQ4-Lloyd: their GEMV kernels are WMMA-free
             // [32,1,1] wave32 scalar (gemv.rs:1004; kernels.rs:420/750 baseline
@@ -810,5 +827,6 @@ pub fn dtype_needs_rotation(dtype: DType) -> bool {
             | MFP3G32E8
             | MFP2G32E8
             | ParoQ4G128
+            | RWQ4G256
     )
 }

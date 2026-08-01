@@ -3488,6 +3488,64 @@ impl Gpu {
         self.gemv_hfq4g256(a_raw, x_rot, y, m, k)
     }
 
+    /// RadioWave Quant RWQ4-G256 with pre-rotated x. Caller must have called
+    /// `rotate_x_mq` into `x_rot` first (same FWHT-256 as MQ4G256).
+    /// Layout: 136 B/group = f32 master + 4×E4M3 sub-scales + 128 B nibbles.
+    pub fn gemv_rwq4g256_prerotated(
+        &mut self,
+        a_raw: &GpuTensor,
+        x_rot: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert!(
+            k % 256 == 0,
+            "gemv_rwq4g256_prerotated requires K%256==0, got K={k}"
+        );
+        self.ensure_kernel(
+            "gemv_rwq4g256",
+            kernels::GEMV_RWQ4G256_SRC,
+            "gemv_rwq4g256_prerotated",
+        )?;
+        let a_ptr = a_raw.buf.as_ptr();
+        let x_ptr = x_rot.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &a_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &y_ptr as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+        ];
+        let bytes = crate::profile::gemv_hfq4g256_bytes(m, k); // same 136 B/group
+        let timer =
+            crate::profile::begin_timer(&self.hip, "gemv", "gemv_rwq4g256_prerotated", bytes);
+        let result = self.launch_maybe_blob(
+            "gemv_rwq4g256_prerotated",
+            [m as u32, 1, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
     /// MagnumQuant MQ4-G128 with pre-rotated x. Skips the rotation step entirely —
     /// caller must have called `rotate_x_mq_128` into `x_rot` first.
     pub fn gemv_mq4g128_prerotated(

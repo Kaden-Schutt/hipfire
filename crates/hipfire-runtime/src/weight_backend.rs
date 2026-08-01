@@ -395,6 +395,10 @@ pub(crate) const RAW_CODECS: &[RawCodec] = &[
         quant_type: 30,
         dtype: DType::MQ4G256Lloyd,
     },
+    RawCodec {
+        quant_type: 38,
+        dtype: DType::RWQ4G256,
+    },
 ];
 
 /// Look up the passthrough codec for `quant_type`, or `None` if it is host-decode
@@ -1299,6 +1303,7 @@ mod tests {
             (21, DType::HFP4G32),      // wb:459 / hfq:944
             (24, DType::MFP4G32),      // wb:475 / hfq:963
             (30, DType::MQ4G256Lloyd), // wb:443 / hfq:978 (renumbered from 21; do not swap)
+            (38, DType::RWQ4G256),     // wb: RAW_CODECS qt 38 RadioWave Q4
         ];
         for &(qt, dt) in expected {
             let c = raw_codec(qt).unwrap_or_else(|| panic!("no RAW_CODECS row for qt={qt}"));

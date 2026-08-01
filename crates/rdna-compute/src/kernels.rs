@@ -1047,6 +1047,14 @@ pub const GEMV_HFQ3G256_RESIDUAL_GFX1100_SRC: &str =
     include_str!("../../../kernels/src/gemv_hfq3g256_residual.gfx1100.hip");
 pub const GEMV_HFQ3G128_SRC: &str = include_str!("../../../kernels/src/gemv_hfq3g128.hip");
 pub const GEMV_MQ4G256_SRC: &str = include_str!("../../../kernels/src/gemv_mq4g256.hip");
+/// RWQ4-G256 GEMV: RadioWave Quant (4-bit Lloyd codebook + E4M3 sub-scales,
+/// 136 B/group). Uses pre-rotated x. turbo_common.h is prepended so
+/// `cvt_e4m3_scale_to_f32_dq` resolves without a kernels/src -I path.
+pub const GEMV_RWQ4G256_SRC: &str = concat!(
+    include_str!("../../../kernels/src/turbo_common.h"),
+    "\n",
+    include_str!("../../../kernels/src/gemv_rwq4g256.hip"),
+);
 pub const GEMV_MQ4G128_SRC: &str = include_str!("../../../kernels/src/gemv_mq4g128.hip");
 pub const GEMV_MQ8G256_SRC: &str = include_str!("../../../kernels/src/gemv_mq8g256.hip");
 /// MQ6-G256 GEMV: FWHT-rotated HFQ6 (6-bit, 200 B/group). Uses pre-rotated x.

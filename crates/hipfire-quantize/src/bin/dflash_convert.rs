@@ -268,6 +268,11 @@ enum QuantType {
     MQ4G256 = 13,
     MQ6G256 = 15,
     MQ3G256 = 17,
+    /// RadioWave Quant 4-bit G256 — successor to MQ4G256 at the same 136 B/group
+    /// (4.25 bpw). FWHT-256 rotation, universal Lloyd-Max Gaussian codebook
+    /// (`CODEBOOK_4BIT`), and 4× E4M3 g64 sub-scales. Wire layout:
+    /// `[f32 master][4×u8 E4M3][128 B nibbles]`. Encoder is `mqn::MQ4N`.
+    RWQ4G256 = 38,
 }
 
 struct HfqTensor {

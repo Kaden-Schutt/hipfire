@@ -26,6 +26,27 @@ __constant__ float TURBO_C4_256[16] = {
      0.007938f,  0.024249f,  0.041003f,  0.058869f,  0.078505f,  0.101134f,  0.129321f,  0.170807f
 };
 
+// E4M3 (OCP, UNSIGNED scale, bias 7, 3 mantissa) — bit-identical to the
+// Rust `fp8::e4m3_decode` / quantizer `e4m3_scale_decode`. Shared by
+// RWQ4G256 GEMV and any kernel that needs FP8 block scales.
+//   exp = (byte>>3)&0xF ; mant = byte&0x7
+//   exp==0          → subnormal: 2^-6 * (mant/8)
+//   exp==15,mant==7 → NaN code (encoder never emits) → max finite 448.0
+//   else (normal)   → 2^(exp-7) * (1 + mant/8)
+__device__ __forceinline__ float cvt_e4m3_scale_to_f32_dq(unsigned char b) {
+    const int exp = (b >> 3) & 0xF;
+    const unsigned mant = (unsigned)(b & 0x7);
+    if (exp == 0) {
+        return 0.015625f * ((float)mant) * 0.125f;
+    }
+    if (exp == 0xF && mant == 7u) {
+        return 448.0f; // defensive: NaN code → max finite (never emitted)
+    }
+    const float pow2 = __builtin_bit_cast(float, ((unsigned int)(exp + 120)) << 23);
+    return pow2 * (1.0f + ((float)mant) * 0.125f);
+}
+
+
 // In-place FWHT on 128 elements in registers.
 // signs1/signs2 are ±1.0f arrays in global memory (uploaded once).
 __device__ void fwht_forward_128(float* x,
