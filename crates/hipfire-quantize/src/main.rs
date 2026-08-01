@@ -67,6 +67,29 @@ static IMATRIX: OnceLock<HashMap<String, Vec<f32>>> = OnceLock::new();
 // alpha=1 is pure activation-magnitude scaling (no smoothing).
 static AWQ_ALPHA: OnceLock<f32> = OnceLock::new();
 
+/// `--lm-head-format` override, set once from `main`. Unset keeps the
+/// historical Q8_F16 lm_head that Rule 2 has always emitted.
+static LM_HEAD_OVERRIDE: OnceLock<GgufFormat> = OnceLock::new();
+
+fn set_lm_head_override(fmt: GgufFormat) {
+    let _ = LM_HEAD_OVERRIDE.set(fmt);
+}
+
+fn lm_head_override() -> Option<GgufFormat> {
+    LM_HEAD_OVERRIDE.get().copied()
+}
+
+/// `--embed-format` override, set once from `main`. Unset keeps Q8_F16.
+static EMBED_OVERRIDE: OnceLock<GgufFormat> = OnceLock::new();
+
+fn set_embed_override(fmt: GgufFormat) {
+    let _ = EMBED_OVERRIDE.set(fmt);
+}
+
+fn embed_override() -> Option<GgufFormat> {
+    EMBED_OVERRIDE.get().copied()
+}
+
 #[derive(Debug, Parser)]
 #[command(
     name = "hipfire-quantize",
@@ -157,6 +180,25 @@ struct QuantizeArgs {
     /// K-map policy: full, alternating/alt, or typed.
     #[arg(long, default_value = "alternating", value_name = "MODE")]
     kmap_mode: String,
+
+    /// Override the lm_head / output-projection format (default: Q8_F16).
+    ///
+    /// lm_head is bandwidth-bound and the single hottest decode kernel — on
+    /// Qwen3.5-0.8B it is ~28% of GPU busy at Q8 (254 MB read per token at
+    /// ~565 GB/s, measured with rocprofv3). Trading bits here is the cheapest
+    /// decode lever available. Both llama.cpp's Q4_K_M and Unsloth's dynamic
+    /// recipe ship a 6-bit output tensor rather than 8-bit; hipfire's default
+    /// is more conservative than either. Accepts any `--format` name.
+    #[arg(long, value_name = "FORMAT")]
+    lm_head_format: Option<String>,
+
+    /// Override the token-embedding format (default: Q8_F16).
+    ///
+    /// Under `tie_word_embeddings` there is no separate lm_head tensor, so this
+    /// is the flag that moves the hot full-vocab output GEMV. Mirrors
+    /// llama-quantize's `--token-embedding-type`. Accepts any `--format` name.
+    #[arg(long, value_name = "FORMAT")]
+    embed_format: Option<String>,
 
     /// Permit research-only uniform MQ2 output.
     #[arg(long)]
@@ -4439,16 +4481,13 @@ pub(crate) enum QuantType {
 enum QuantLevel {
     /// Store as F16 (norms, biases, 1D tensors).
     F16,
-    /// Store as Q8_F16 (embeddings, lm_head, MoE routers).
+    /// Store as Q8_F16 (embeddings, MoE routers, and lm_head unless
+    /// `--lm-head-format` overrides it).
     Q8,
     /// Promote to 6-bit variant of the base format (edge layers, MoE expert FFN).
     Promote6,
-    /// Override the default for a specific tensor class (today: lm_head)
-    /// to a CLI-specified format. Currently unused on this branch (no emission
-    /// site); kept so origin/master's lm_head-format override match arms
-    /// compile after the merge. Re-wire to `--lm-head-format` when the
-    /// configurable-kmap-pair refactor lands here.
-    #[allow(dead_code)]
+    /// Retarget a specific tensor class to a CLI-chosen format. Today only
+    /// lm_head / `output.weight` emits this, via `--lm-head-format`.
     Override(GgufFormat),
     /// Use the base format as-is.
     Base,
@@ -4584,6 +4623,20 @@ fn kmap_resolve_mode(name: &str, n_layers: usize, is_moe: bool, kmap_mode: u8) -
         || name.contains("lm_head")
         || name.ends_with("output.weight")
     {
+        // Two independent knobs, mirroring llama-quantize's
+        // `--output-tensor-type` / `--token-embedding-type` split.
+        //
+        // Under `tie_word_embeddings` (Qwen3.5/3.6 and most small models) there
+        // is NO separate lm_head tensor — the embedding table *is* the output
+        // projection, so `--embed-format` is what moves the hot vocab GEMV.
+        // Untied models get a real lm_head tensor and `--lm-head-format`.
+        if name.contains("lm_head") || name.ends_with("output.weight") {
+            if let Some(fmt) = lm_head_override() {
+                return QuantLevel::Override(fmt);
+            }
+        } else if let Some(fmt) = embed_override() {
+            return QuantLevel::Override(fmt);
+        }
         return QuantLevel::Q8;
     }
 
@@ -5809,6 +5862,112 @@ impl GgufFormat {
     }
 }
 
+/// Resolve `--lm-head-format` / `--embed-format` for a tensor name.
+/// Split matches `kmap_resolve_mode` Rule 2: lm_head/output.weight →
+/// `lm_head_override()`, embed_tokens/token_embd → `embed_override()`.
+fn tensor_format_override(name: &str) -> Option<GgufFormat> {
+    if name.contains("lm_head") || name.ends_with("output.weight") {
+        lm_head_override()
+    } else if name.contains("embed_tokens") || name.contains("token_embd") {
+        embed_override()
+    } else {
+        None
+    }
+}
+
+/// Plain format→quantize dispatch shared by K-map `QuantLevel::Override` arms
+/// and the kmap-independent `--embed-format` / `--lm-head-format` leading arms.
+/// `signs1`/`signs2` are FWHT tables (seeds 42 / 1042); ignored by non-rotated
+/// formats. `m` is rows, `k` is the K dimension (cols on safetensors, dim0 on GGUF).
+fn quantize_override_format(
+    fmt: GgufFormat,
+    f32_data: &[f32],
+    m: usize,
+    k: usize,
+    signs1: &[f32],
+    signs2: &[f32],
+) -> (Vec<u8>, QuantType, u32, &'static str) {
+    match fmt {
+        GgufFormat::Mq6 => {
+            let q = quantize_mq6g256(f32_data, signs1, signs2);
+            (q, QuantType::MQ6G256, 256u32, "MQ6G256")
+        }
+        GgufFormat::Hfq6 => {
+            let q = quantize_hfq6g256(f32_data);
+            (q, QuantType::HFQ6G256, 256u32, "HFQ6G256")
+        }
+        GgufFormat::Mq4 => {
+            let q = quantize_mq4g256(f32_data, signs1, signs2);
+            (q, QuantType::MQ4G256, 256u32, "MQ4G256")
+        }
+        GgufFormat::Rwq4 => {
+            let q = quantize_rwq4g256(f32_data, signs1, signs2);
+            (q, QuantType::RWQ4G256, 256u32, "RWQ4G256")
+        }
+        GgufFormat::Mq5 => {
+            let q = quantize_mq5g256(f32_data, signs1, signs2);
+            (q, QuantType::MQ5G256, 256u32, "MQ5G256")
+        }
+        GgufFormat::Hfq4 => {
+            let q = quantize_hfq4g256(f32_data);
+            (q, QuantType::HFQ4G256, 256u32, "HFQ4G256")
+        }
+        GgufFormat::Mq3 => {
+            let q = quantize_mq3g256(f32_data, signs1, signs2);
+            (q, QuantType::MQ3G256, 256u32, "MQ3G256")
+        }
+        GgufFormat::Mq2 => {
+            let q = quantize_mq2g256(f32_data, signs1, signs2);
+            (q, QuantType::MQ2G256, 256u32, "MQ2G256")
+        }
+        GgufFormat::Mq2Lloyd => {
+            let q = quantize_mq2g256_lloyd(f32_data, signs1, signs2);
+            (q, QuantType::MQ2G256Lloyd, 256u32, "MQ2G256Lloyd")
+        }
+        GgufFormat::Mq3Lloyd => {
+            let q = quantize_mq3g256_lloyd(f32_data, signs1, signs2);
+            (q, QuantType::MQ3G256Lloyd, 256u32, "MQ3G256Lloyd")
+        }
+        GgufFormat::Mq4Lloyd => {
+            let q = quantize_mq4g256_lloyd(f32_data, signs1, signs2);
+            (q, QuantType::MQ4G256Lloyd, 256u32, "MQ4G256Lloyd")
+        }
+        GgufFormat::Hfp4 => {
+            let q = quantize_hfp4g32_2d(f32_data, m, k);
+            (q, QuantType::HFP4G32, 32u32, "HFP4G32")
+        }
+        GgufFormat::Mfp4 => {
+            let q = quantize_mfp4g32_2d(f32_data, m, k, signs1, signs2);
+            (q, QuantType::MFP4G32, 32u32, "MFP4G32")
+        }
+        GgufFormat::Mfp4Lloyd => {
+            let q = quantize_mfp4g32_lloyd_2d(f32_data, m, k, signs1, signs2);
+            (q, QuantType::MFP4G32Lloyd, 32u32, "MFP4G32Lloyd")
+        }
+        GgufFormat::Mfp4P => {
+            let q = quantize_mfp4g32_p_2d(f32_data, m, k, signs1, signs2);
+            (q, QuantType::MFP4G32P, 32u32, "MFP4G32P")
+        }
+        GgufFormat::Mfp4E8 => {
+            let q = quantize_mfp4g32_e8_2d(f32_data, m, k, signs1, signs2);
+            (q, QuantType::MFP4G32E8, 32u32, "MFP4G32E8")
+        }
+        GgufFormat::Mfp4E8Soa => {
+            let q = quantize_mfp4g32_e8_soa_2d(f32_data, m, k, signs1, signs2);
+            (q, QuantType::MFP4G32E8SOA, 32u32, "MFP4G32E8SOA")
+        }
+        GgufFormat::Mfp3E8 => {
+            let q = quantize_mfp3g32_e8_2d(f32_data, m, k, signs1, signs2);
+            (q, QuantType::MFP3G32E8, 32u32, "MFP3G32E8")
+        }
+        GgufFormat::Mfp2E8 => {
+            let q = quantize_mfp2g32_e8_2d(f32_data, m, k, signs1, signs2);
+            (q, QuantType::MFP2G32E8, 32u32, "MFP2G32E8")
+        }
+    }
+}
+
+
 /// Convert a GGUF file to a hipfire `.hfq`. Per-format quantization target
 /// applies to 2D weight matrices; the embedding table is always Q8F16
 /// (Q4-grade is too lossy for embeddings) and 1D norms stay F16. Tensor
@@ -6004,6 +6163,21 @@ fn run_gguf_pipeline(
                 .flat_map(|&v| f32_to_f16(v).to_le_bytes())
                 .collect();
             (f16_bytes, QuantType::F16, 0u32, "F16")
+        } else if let Some(override_fmt) = tensor_format_override(&out_name) {
+            // --embed-format / --lm-head-format apply even when kmap is empty
+            // (dense models without --kmap-dense). Checked before is_embed so
+            // the Q8 short-circuit cannot swallow the override.
+            let f32_data = gguf_input::tensor_to_f32(info, raw);
+            quant_params += n_elements as u64;
+            if k_dim % 256 == 0 {
+                let s1 = gen_fwht_signs(42, 256);
+                let s2 = gen_fwht_signs(1042, 256);
+                let m = info.shape[0] as usize;
+                quantize_override_format(override_fmt, &f32_data, m, k_dim, &s1, &s2)
+            } else {
+                let q = quantize_q8f16(&f32_data);
+                (q, QuantType::Q8F16, 32u32, "Q8_F16")
+            }
         } else if kmap_level == QuantLevel::Q8 || is_embed {
             // K-map Q8 or embedding
             let f32_data = gguf_input::tensor_to_f32(info, raw);
@@ -6130,92 +6304,12 @@ fn run_gguf_pipeline(
             // so this is a plain quantize on the carried target format.
             let f32_data = gguf_input::tensor_to_f32(info, raw);
             quant_params += n_elements as u64;
-            match override_fmt {
-                GgufFormat::Mq6 => {
-                    let q = quantize_mq6g256(&f32_data, &signs1, &signs2);
-                    (q, QuantType::MQ6G256, 256u32, "MQ6G256")
-                }
-                GgufFormat::Hfq6 => {
-                    let q = quantize_hfq6g256(&f32_data);
-                    (q, QuantType::HFQ6G256, 256u32, "HFQ6G256")
-                }
-                GgufFormat::Mq4 => {
-                    let q = quantize_mq4g256(&f32_data, &signs1, &signs2);
-                    (q, QuantType::MQ4G256, 256u32, "MQ4G256")
-                }
-                GgufFormat::Rwq4 => {
-                    let q = quantize_rwq4g256(&f32_data, &signs1, &signs2);
-                    (q, QuantType::RWQ4G256, 256u32, "RWQ4G256")
-                }
-                GgufFormat::Mq5 => {
-                    let q = quantize_mq5g256(&f32_data, &signs1, &signs2);
-                    (q, QuantType::MQ5G256, 256u32, "MQ5G256")
-                }
-                GgufFormat::Hfq4 => {
-                    let q = quantize_hfq4g256(&f32_data);
-                    (q, QuantType::HFQ4G256, 256u32, "HFQ4G256")
-                }
-                GgufFormat::Mq3 => {
-                    let q = quantize_mq3g256(&f32_data, &signs1, &signs2);
-                    (q, QuantType::MQ3G256, 256u32, "MQ3G256")
-                }
-                GgufFormat::Mq2 => {
-                    let q = quantize_mq2g256(&f32_data, &signs1, &signs2);
-                    (q, QuantType::MQ2G256, 256u32, "MQ2G256")
-                }
-                GgufFormat::Mq2Lloyd => {
-                    let q = quantize_mq2g256_lloyd(&f32_data, &signs1, &signs2);
-                    (q, QuantType::MQ2G256Lloyd, 256u32, "MQ2G256Lloyd")
-                }
-                GgufFormat::Mq3Lloyd => {
-                    let q = quantize_mq3g256_lloyd(&f32_data, &signs1, &signs2);
-                    (q, QuantType::MQ3G256Lloyd, 256u32, "MQ3G256Lloyd")
-                }
-                GgufFormat::Mq4Lloyd => {
-                    let q = quantize_mq4g256_lloyd(&f32_data, &signs1, &signs2);
-                    (q, QuantType::MQ4G256Lloyd, 256u32, "MQ4G256Lloyd")
-                }
-                GgufFormat::Hfp4 => {
-                    let m = info.shape[0] as usize;
-                    let q = quantize_hfp4g32_2d(&f32_data, m, k_dim);
-                    (q, QuantType::HFP4G32, 32u32, "HFP4G32")
-                }
-                GgufFormat::Mfp4 => {
-                    let m = info.shape[0] as usize;
-                    let q = quantize_mfp4g32_2d(&f32_data, m, k_dim, &signs1, &signs2);
-                    (q, QuantType::MFP4G32, 32u32, "MFP4G32")
-                }
-                GgufFormat::Mfp4Lloyd => {
-                    let m = info.shape[0] as usize;
-                    let q = quantize_mfp4g32_lloyd_2d(&f32_data, m, k_dim, &signs1, &signs2);
-                    (q, QuantType::MFP4G32Lloyd, 32u32, "MFP4G32Lloyd")
-                }
-                GgufFormat::Mfp4P => {
-                    let m = info.shape[0] as usize;
-                    let q = quantize_mfp4g32_p_2d(&f32_data, m, k_dim, &signs1, &signs2);
-                    (q, QuantType::MFP4G32P, 32u32, "MFP4G32P")
-                }
-                GgufFormat::Mfp4E8 => {
-                    let m = info.shape[0] as usize;
-                    let q = quantize_mfp4g32_e8_2d(&f32_data, m, k_dim, &signs1, &signs2);
-                    (q, QuantType::MFP4G32E8, 32u32, "MFP4G32E8")
-                }
-                GgufFormat::Mfp4E8Soa => {
-                    let m = info.shape[0] as usize;
-                    let q = quantize_mfp4g32_e8_soa_2d(&f32_data, m, k_dim, &signs1, &signs2);
-                    (q, QuantType::MFP4G32E8SOA, 32u32, "MFP4G32E8SOA")
-                }
-                GgufFormat::Mfp3E8 => {
-                    let m = info.shape[0] as usize;
-                    let q = quantize_mfp3g32_e8_2d(&f32_data, m, k_dim, &signs1, &signs2);
-                    (q, QuantType::MFP3G32E8, 32u32, "MFP3G32E8")
-                }
-                GgufFormat::Mfp2E8 => {
-                    let m = info.shape[0] as usize;
-                    let q = quantize_mfp2g32_e8_2d(&f32_data, m, k_dim, &signs1, &signs2);
-                    (q, QuantType::MFP2G32E8, 32u32, "MFP2G32E8")
-                }
-            }
+            let m = info.shape[0] as usize;
+            // Fresh signs — base format may not have needed FWHT (e.g. hfq4 body
+            // + mq6 lm_head), so outer signs1/signs2 can be empty.
+            let s1 = gen_fwht_signs(42, 256);
+            let s2 = gen_fwht_signs(1042, 256);
+            quantize_override_format(override_fmt, &f32_data, m, k_dim, &s1, &s2)
         } else if k_dim % 256 == 0 {
             // 256-aligned 2D weight — quantize per the chosen format (Base level).
             let f32_data = gguf_input::tensor_to_f32(info, raw);
@@ -6376,6 +6470,24 @@ fn main() {
     if args.lloyd_optimal {
         hipfire_quantize::lloyd1d::set_optimal_fit(true);
         eprintln!("MQ*-Lloyd fit: exact optimal 1-D k-means (--lloyd-optimal)");
+    }
+
+    if let Some(flag) = args.lm_head_format.as_deref() {
+        let Some(fmt) = GgufFormat::from_flag(flag) else {
+            eprintln!("error: --lm-head-format: unknown format {flag:?}");
+            std::process::exit(2);
+        };
+        set_lm_head_override(fmt);
+        eprintln!("lm_head format: {} (--lm-head-format)", fmt.label());
+    }
+
+    if let Some(flag) = args.embed_format.as_deref() {
+        let Some(fmt) = GgufFormat::from_flag(flag) else {
+            eprintln!("error: --embed-format: unknown format {flag:?}");
+            std::process::exit(2);
+        };
+        set_embed_override(fmt);
+        eprintln!("embed format: {} (--embed-format)", fmt.label());
     }
 
     // Bound rayon's pool to 80% of cores (default cap; override with --threads N
@@ -10008,12 +10120,11 @@ fn main() {
                     }
                 } else if let QuantLevel::Override(override_fmt) = kmap_level {
                     // K-map says override (today: lm_head when --lm-head-format set).
-                    // Dispatch on the carried format. For MQ4 with AWQ enabled,
-                    // apply AWQ pre-scaling + emit a sidecar so the runtime
-                    // (once the CUDA-branch AWQ-aware lm_head dispatch lands)
-                    // sees scaled bytes and inverse-divides correctly. For any
-                    // other format, plain quantize (the AWQ wiring outside MQ4
-                    // is a follow-up).
+                    // Dispatch on the carried format. For MQ4/MQ5/MQ3 with AWQ
+                    // enabled, apply AWQ pre-scaling + emit a sidecar so the
+                    // runtime sees scaled bytes and inverse-divides correctly.
+                    // All other formats (and non-AWQ MQ) go through
+                    // quantize_override_format.
                     let k_dim = if meta.shape.len() == 2 {
                         meta.shape[1]
                     } else {
@@ -10043,10 +10154,6 @@ fn main() {
                                 };
                                 (q, QuantType::MQ4G256, 256u32, "MQ4G256")
                             }
-                            GgufFormat::Rwq4 => {
-                                let q = quantize_rwq4g256(&f32_data, &signs1, &signs2);
-                                (q, QuantType::RWQ4G256, 256u32, "RWQ4G256")
-                            }
                             GgufFormat::Mq5 => {
                                 // MQ5 + AWQ on lm_head: MQ5G256 is in
                                 // DType::supports_awq_sidecar, so the runtime applies the
@@ -10068,10 +10175,6 @@ fn main() {
                                     quantize_mq5g256(&f32_data, &signs1, &signs2)
                                 };
                                 (q, QuantType::MQ5G256, 256u32, "MQ5G256")
-                            }
-                            GgufFormat::Mq6 => {
-                                let q = quantize_mq6g256(&f32_data, &signs1, &signs2);
-                                (q, QuantType::MQ6G256, 256u32, "MQ6G256")
                             }
                             GgufFormat::Mq3 => {
                                 // MQ3 + AWQ on lm_head: runtime supports the sidecar via
@@ -10096,112 +10199,15 @@ fn main() {
                                 };
                                 (q, QuantType::MQ3G256, 256u32, "MQ3G256")
                             }
-                            GgufFormat::Hfq4 => {
-                                let q = quantize_hfq4g256(&f32_data);
-                                (q, QuantType::HFQ4G256, 256u32, "HFQ4G256")
-                            }
-                            GgufFormat::Hfq6 => {
-                                let q = quantize_hfq6g256(&f32_data);
-                                (q, QuantType::HFQ6G256, 256u32, "HFQ6G256")
-                            }
-                            // Other Override targets: not yet wired with AWQ;
-                            // emit plain quantization. Used in Phase 0 sweeps
-                            // for non-AWQ lm_head experiments.
-                            GgufFormat::Mq2 => {
-                                let q = quantize_mq2g256(&f32_data, &signs1, &signs2);
-                                (q, QuantType::MQ2G256, 256u32, "MQ2G256")
-                            }
-                            GgufFormat::Mq2Lloyd => {
-                                let q = quantize_mq2g256_lloyd(&f32_data, &signs1, &signs2);
-                                (q, QuantType::MQ2G256Lloyd, 256u32, "MQ2G256Lloyd")
-                            }
-                            GgufFormat::Mq3Lloyd => {
-                                let q = quantize_mq3g256_lloyd(&f32_data, &signs1, &signs2);
-                                (q, QuantType::MQ3G256Lloyd, 256u32, "MQ3G256Lloyd")
-                            }
-                            GgufFormat::Mq4Lloyd => {
-                                let q = quantize_mq4g256_lloyd(&f32_data, &signs1, &signs2);
-                                (q, QuantType::MQ4G256Lloyd, 256u32, "MQ4G256Lloyd")
-                            }
-                            GgufFormat::Mfp4 => {
+                            other => {
                                 let m = if meta.shape.len() == 2 {
                                     meta.shape[0]
                                 } else {
                                     1
                                 };
-                                let q = quantize_mfp4g32_2d(&f32_data, m, k_dim, &signs1, &signs2);
-                                (q, QuantType::MFP4G32, 32u32, "MFP4G32")
-                            }
-                            GgufFormat::Mfp4Lloyd => {
-                                let m = if meta.shape.len() == 2 {
-                                    meta.shape[0]
-                                } else {
-                                    1
-                                };
-                                let q = quantize_mfp4g32_lloyd_2d(
-                                    &f32_data, m, k_dim, &signs1, &signs2,
-                                );
-                                (q, QuantType::MFP4G32Lloyd, 32u32, "MFP4G32Lloyd")
-                            }
-                            GgufFormat::Mfp4P => {
-                                let m = if meta.shape.len() == 2 {
-                                    meta.shape[0]
-                                } else {
-                                    1
-                                };
-                                let q =
-                                    quantize_mfp4g32_p_2d(&f32_data, m, k_dim, &signs1, &signs2);
-                                (q, QuantType::MFP4G32P, 32u32, "MFP4G32P")
-                            }
-                            GgufFormat::Mfp4E8 => {
-                                let m = if meta.shape.len() == 2 {
-                                    meta.shape[0]
-                                } else {
-                                    1
-                                };
-                                let q =
-                                    quantize_mfp4g32_e8_2d(&f32_data, m, k_dim, &signs1, &signs2);
-                                (q, QuantType::MFP4G32E8, 32u32, "MFP4G32E8")
-                            }
-                            GgufFormat::Mfp4E8Soa => {
-                                let m = if meta.shape.len() == 2 {
-                                    meta.shape[0]
-                                } else {
-                                    1
-                                };
-                                let q = quantize_mfp4g32_e8_soa_2d(
-                                    &f32_data, m, k_dim, &signs1, &signs2,
-                                );
-                                (q, QuantType::MFP4G32E8SOA, 32u32, "MFP4G32E8SOA")
-                            }
-                            GgufFormat::Mfp3E8 => {
-                                let m = if meta.shape.len() == 2 {
-                                    meta.shape[0]
-                                } else {
-                                    1
-                                };
-                                let q =
-                                    quantize_mfp3g32_e8_2d(&f32_data, m, k_dim, &signs1, &signs2);
-                                (q, QuantType::MFP3G32E8, 32u32, "MFP3G32E8")
-                            }
-                            GgufFormat::Mfp2E8 => {
-                                let m = if meta.shape.len() == 2 {
-                                    meta.shape[0]
-                                } else {
-                                    1
-                                };
-                                let q =
-                                    quantize_mfp2g32_e8_2d(&f32_data, m, k_dim, &signs1, &signs2);
-                                (q, QuantType::MFP2G32E8, 32u32, "MFP2G32E8")
-                            }
-                            GgufFormat::Hfp4 => {
-                                let m = if meta.shape.len() == 2 {
-                                    meta.shape[0]
-                                } else {
-                                    1
-                                };
-                                let q = quantize_hfp4g32_2d(&f32_data, m, k_dim);
-                                (q, QuantType::HFP4G32, 32u32, "HFP4G32")
+                                quantize_override_format(
+                                    other, &f32_data, m, k_dim, &signs1, &signs2,
+                                )
                             }
                         }
                     } else {
@@ -10229,7 +10235,31 @@ fn main() {
                     // large-dim models (9B: dim=4096, values ~0.016, Q4 step ~0.007)
                     let is_embed = name.contains("embed_tokens");
 
-                    if use_hfq_mixed {
+                    if let Some(override_fmt) = tensor_format_override(name) {
+                        // --embed-format / --lm-head-format apply even when kmap is
+                        // empty (dense without --kmap-dense). Leading arm so the
+                        // scattered is_embed Q8 short-circuits cannot swallow it.
+                        let k_dim = if meta.shape.len() == 2 {
+                            meta.shape[1]
+                        } else {
+                            n_elements
+                        };
+                        if k_dim % 256 == 0 {
+                            let signs1 = gen_fwht_signs(42, 256);
+                            let signs2 = gen_fwht_signs(1042, 256);
+                            let m = if meta.shape.len() == 2 {
+                                meta.shape[0]
+                            } else {
+                                1
+                            };
+                            quantize_override_format(
+                                override_fmt, &f32_data, m, k_dim, &signs1, &signs2,
+                            )
+                        } else {
+                            let q = quantize_q8f16(&f32_data);
+                            (q, QuantType::Q8F16, 32u32, "Q8_F16")
+                        }
+                    } else if use_hfq_mixed {
                         // hfq-mixed: Q8 for attention, HFQ4 for FFN (fits 9B in 8GB VRAM)
                         let is_ffn = name.contains("mlp.") || name.contains("ffn");
                         if !is_ffn {

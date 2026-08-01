@@ -145,3 +145,4 @@ docs/investigations/*/sources/
 
 # Local research scratch (agent surveys, microbenches)
 .research/
+.redline-work/
