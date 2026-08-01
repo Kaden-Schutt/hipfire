@@ -82,10 +82,10 @@ fn main() {
     let a = gpu.upload_raw(&a_h, &[a_h.len()]).expect("weights");
 
     println!(
-        "{:<8} {:>11} {:>11} {:>9} {:>12} {:>11}",
-        "batch", "f16 ms", "iu8 ms", "delta", "f16 TFLOPS", "rel err"
+        "{:<8} {:>10} {:>10} {:>10} {:>11} {:>11}",
+        "batch", "f16 ms", "iu8 ms", "fp8 ms", "iu8 vs f16", "fp8 vs f16"
     );
-    println!("{}", "-".repeat(68));
+    println!("{}", "-".repeat(78));
 
     for &batch in &[16usize, 32, 64, 128, 256, 512] {
         let x_h: Vec<f32> = (0..batch * k).map(|_| rng.unit()).collect();
@@ -96,10 +96,12 @@ fn main() {
         let zero = vec![0.0f32; batch * m];
         let y1 = gpu.upload_f32(&zero, &[batch, m]).expect("y1");
         let y2 = gpu.upload_f32(&zero, &[batch, m]).expect("y2");
+        let y3 = gpu.upload_f32(&zero, &[batch, m]).expect("y3");
 
         for _ in 0..25 {
             gpu.gemm_hfq4g256_residual(&a, &x, &y1, m, k, batch).expect("f16 warm");
             gpu.gemm_hfq4g256_residual_mmq(&a, &x, &y2, m, k, batch).expect("iu8 warm");
+            gpu.gemm_hfq4g256_residual_fp8mmq(&a, &x, &y3, m, k, batch).expect("fp8 warm");
         }
         gpu.hip.device_synchronize().expect("sync");
 
@@ -109,6 +111,8 @@ fn main() {
         let yc2 = gpu.upload_f32(&zero, &[batch, m]).expect("yc2");
         gpu.gemm_hfq4g256_residual(&a, &x, &yc1, m, k, batch).expect("f16 acc");
         gpu.gemm_hfq4g256_residual_mmq(&a, &x, &yc2, m, k, batch).expect("iu8 acc");
+        let yc3 = gpu.upload_f32(&zero, &[batch, m]).expect("yc3");
+        gpu.gemm_hfq4g256_residual_fp8mmq(&a, &x, &yc3, m, k, batch).expect("fp8 acc");
         gpu.hip.device_synchronize().expect("sync");
         let r1 = gpu.download_f32(&yc1).expect("dl f16");
         let r2 = gpu.download_f32(&yc2).expect("dl iu8");
@@ -120,14 +124,23 @@ fn main() {
             den += (*p as f64) * (*p as f64);
         }
         let rel = (num / den.max(1e-30)).sqrt();
+        let r3 = gpu.download_f32(&yc3).expect("dl fp8");
+        let mut n3 = 0.0f64;
+        for (p, q) in r1.iter().zip(r3.iter()) {
+            let d = *p as f64 - *q as f64;
+            n3 += d * d;
+        }
+        let rel3 = (n3 / den.max(1e-30)).sqrt();
 
         const REPS: usize = 7;
         const IT: usize = 10;
         let mut ma = Vec::with_capacity(REPS);
         let mut mb = Vec::with_capacity(REPS);
+        let mut mc = Vec::with_capacity(REPS);
         for _ in 0..REPS {
             let mut ta = Vec::with_capacity(IT);
             let mut tb = Vec::with_capacity(IT);
+            let mut tc = Vec::with_capacity(IT);
             for _ in 0..IT {
                 let s = Instant::now();
                 for _ in 0..4 {
@@ -142,17 +155,30 @@ fn main() {
                 }
                 gpu.hip.device_synchronize().expect("sync");
                 tb.push(s.elapsed().as_secs_f64() * 1e3 / 4.0);
+
+                let s = Instant::now();
+                for _ in 0..4 {
+                    gpu.gemm_hfq4g256_residual_fp8mmq(&a, &x, &y3, m, k, batch).expect("fp8");
+                }
+                gpu.hip.device_synchronize().expect("sync");
+                tc.push(s.elapsed().as_secs_f64() * 1e3 / 4.0);
             }
             ma.push(median(&mut ta));
             mb.push(median(&mut tb));
+            mc.push(median(&mut tc));
         }
         let ta = median(&mut ma);
         let tb = median(&mut mb);
+        let tc = median(&mut mc);
         let flops = 2.0 * m as f64 * k as f64 * batch as f64;
         println!(
-            "{batch:<8} {ta:>11.4} {tb:>11.4} {:>+8.2}% {:>12.1} {rel:>11.3e}",
+            "{batch:<8} {ta:>10.4} {tb:>10.4} {tc:>10.4} {:>+10.2}% {:>10.2}%",
             (tb / ta - 1.0) * 100.0,
-            flops / (ta * 1e-3) / 1e12
+            (tc / ta - 1.0) * 100.0
+        );
+        println!(
+            "{:<8} {:>10} {:>10.3e} {:>10.3e}  (rel err vs f16; f16 {:.1} TFLOPS)",
+            "", "", rel, rel3, flops / (ta * 1e-3) / 1e12
         );
     }
 

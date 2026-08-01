@@ -14195,6 +14195,119 @@ impl Gpu {
         result
     }
 
+    /// FP8 WMMA sibling of [`Self::gemm_hfq4g256_residual_mmq`], gfx12 only.
+    /// Same Q8_1 activations and same tiling; A nibbles widen to E4M3 exactly,
+    /// B (int8) is converted to E4M3 and LOSES precision. Exists to measure
+    /// FP8 against iu8 on a real MQ4 prefill GEMM rather than argue about it.
+    pub fn gemm_hfq4g256_residual_fp8mmq(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let x_q8_ptr = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
+        // gfx12 (RDNA4) uses a separate single-wave 16-row-tile MMQ port; the
+        // RDNA3 LDS-tile source #if-excludes gfx12 (empty stub -> garbage).
+        let is_gfx12 = self.arch_caps.is_rdna4();
+        let kernel_name = if is_gfx12 {
+            // gfx12 port: full_add when the tile is exactly filled (M and N
+            // multiples of 16), else the bounds-clamped residual kernel.
+            if m % 16 == 0 && batch_size % 16 == 0 {
+                "gemm_hfq4g256_residual_fp8mmq_full_add"
+            } else {
+                "gemm_hfq4g256_residual_fp8mmq"
+            }
+        } else if m % 128 == 0 && batch_size % 128 == 0 {
+            "gemm_hfq4g256_residual_fp8mmq_full_add"
+        } else {
+            "gemm_hfq4g256_residual_fp8mmq"
+        };
+        let src = if is_gfx12 {
+            kernels::GEMM_HFQ4G256_RESIDUAL_FP8MMQ_GFX12_SRC
+        } else {
+            kernels::GEMM_HFQ4G256_RESIDUAL_MMQ_SRC
+        };
+        // Module name must be arch-distinct: `ensure_q8_1_mmq_x` already
+        // compiled+loaded the RDNA3 source under module
+        // "gemm_hfq4g256_residual_fp8mmq" (to grab `quantize_q8_1_mmq_ds4`).
+        // The compiler/module cache is keyed by module NAME only, so loading
+        // the gfx12 source under the same name short-circuits to the RDNA3
+        // module — whose body #if-excludes gfx12, leaving the gemm symbols as
+        // empty stubs (output == input buffer, NRMSE ~100%). Use a distinct
+        // module name for gfx12 while keeping the kernel SYMBOL names constant.
+        let module_name = if is_gfx12 {
+            "gemm_hfq4g256_residual_fp8mmq_gfx12"
+        } else {
+            "gemm_hfq4g256_residual_fp8mmq"
+        };
+        self.ensure_kernel(module_name, src, kernel_name)?;
+
+        let mut a_ptr = a_raw.buf.as_ptr();
+        let mut xq_ptr = x_q8_ptr;
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut n_val = batch_size as i32;
+        let mut add_val = 1i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut xq_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+            &mut add_val as *mut _ as *mut c_void,
+        ];
+
+        // gfx12: single-wave 16-row × 16-col tile, block [32,1,1], LDS 0.
+        // RDNA3: 128-row × 128-col LDS-staged tile, block [32,8,1].
+        let (grid, block, shared_mem) = if is_gfx12 {
+            let row_tiles = (m + 15) / 16;
+            let col_tiles = (batch_size + 15) / 16;
+            ([row_tiles as u32, col_tiles as u32, 1], [32u32, 1, 1], 0u32)
+        } else {
+            const MMQ_X: usize = 128;
+            const MMQ_Y: usize = 128;
+            const MMQ_TILE_Y_K: usize = 36;
+            const MMQ_TILE_X_K: usize = 76;
+            let row_tiles = (m + MMQ_Y - 1) / MMQ_Y;
+            let batch_tiles = (batch_size + MMQ_X - 1) / MMQ_X;
+            let shared_mem =
+                ((MMQ_X * MMQ_TILE_Y_K + MMQ_Y * MMQ_TILE_X_K) * std::mem::size_of::<i32>()) as u32;
+            (
+                [row_tiles as u32, batch_tiles as u32, 1],
+                [32u32, 8, 1],
+                shared_mem,
+            )
+        };
+
+        let bytes =
+            crate::profile::gemv_hfq4g256_bytes(m, k) + batch_size * k + batch_size * m * 4 * 2;
+        let timer =
+            crate::profile::begin_timer(&self.hip, "gemm", "gemm_hfq4g256_residual_fp8mmq", bytes);
+        let result =
+            self.launch_maybe_blob(kernel_name, grid, block, shared_mem, &mut params, || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(xq_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(n_val);
+                b.push_i32(add_val);
+                b
+            });
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+
     /// gfx906 dp4a MMQ residual GEMM. Wave-native topology (block 64×2,
     /// tile 128×64) per llama.cpp-gfx906 reference. Distinct from the
     /// RDNA3 i8-WMMA variant above — different block dim, different

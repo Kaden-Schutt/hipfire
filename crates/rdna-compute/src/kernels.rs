@@ -2533,6 +2533,8 @@ pub const GEMM_HFQ4G256_RESIDUAL_MMQ_SRC: &str =
 // RDNA3's #if guard excludes gfx12, so RDNA4 needs this separate source.
 pub const GEMM_HFQ4G256_RESIDUAL_MMQ_GFX12_SRC: &str =
     include_str!("../../../kernels/src/gemm_hfq4g256_residual_mmq.gfx12.hip");
+pub const GEMM_HFQ4G256_RESIDUAL_FP8MMQ_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemm_hfq4g256_residual_fp8mmq.gfx12.hip");
 // gfx906 MMQ kernel (see docs/plans/gfx906-mmq-prd.md and
 // docs/perf-checkpoints/2026-05-05-gfx906-mmq-redesign-final.md).
 // Topology: nwarps=4, runtime-dispatched mmq_x ∈ {8,16,24,32,40,48,56,64},
