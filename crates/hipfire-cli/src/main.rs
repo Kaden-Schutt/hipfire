@@ -6398,6 +6398,9 @@ fn bench_generate_request(prompt: &str, max_tokens: u64) -> serde_json::Value {
         "repeat_penalty": 1.1,
         "max_tokens": max_tokens,
         "attempt_id": 1,
+        "reasoning_effort": "none",
+        "max_think_tokens": 1,
+        "assistant_prefix": "closed_think",
     })
 }
 
@@ -13388,7 +13391,7 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn bench_generate_request_includes_numeric_first_attempt() {
+    fn bench_generate_request_is_first_attempt_in_answer_mode() {
         let req = bench_generate_request("bench prompt", 37);
         assert_eq!(
             req.get("type").and_then(|v| v.as_str()),
@@ -13410,6 +13413,18 @@ for line in sys.stdin:
         assert_eq!(
             req.get("max_tokens").and_then(|v| v.as_u64()),
             Some(37)
+        );
+        assert_eq!(
+            req.get("reasoning_effort").and_then(|v| v.as_str()),
+            Some("none")
+        );
+        assert_eq!(
+            req.get("max_think_tokens").and_then(|v| v.as_u64()),
+            Some(1)
+        );
+        assert_eq!(
+            req.get("assistant_prefix").and_then(|v| v.as_str()),
+            Some("closed_think")
         );
     }
 }
