@@ -4,16 +4,25 @@ This crate is copied from the standalone Redline repository at commit
 `50f59ca` after local gfx1201 and remote R9700 certification. The low-level
 public ROCr ABI provenance is retained in `../redline-rocr/PROVENANCE.md`.
 
-The graft is default-off except for the product-certified single-GPU Qwen A3B
-`.mq4r` route on gfx12, which defaults to `auto` with the retained PM4
-transport. Explicit `HIPFIRE_REPLAY_BACKEND` and `HIPFIRE_REPLAY_TRANSPORT`
-settings take precedence. No replay mode may replace a HIP launch until warmup
-shadow validation proves shared-artifact identity, byte-exact output, intact
-guards, automatic clocks, GPU timing, and two independent speedup samples above
-the configured threshold. Any ABI, capability, parity, timeout, queue-fault,
-or cache-poison failure falls back to HIP for the process. A successful model
-swap resets the process-local controller; non-MQ4R and non-gfx12 models return
-to ordinary HIP rather than inheriting a prior retained tape.
+The graft is default-off except for the runtime automatic default on
+single-GPU `.mq4r` models (`pp=tp=1`) when the exact GPU arch is
+`gfx1100`, `gfx1151`, or `gfx1201`, which defaults to `auto` with the
+retained PM4 transport. The predicate is model-family agnostic (no
+`arch_id` gate). `gfx1200` and all other arches remain opt-in. This is
+runtime default selection only — not Redline certification or registry
+admission. Unsupported retained routes still fail closed. Explicit
+`HIPFIRE_REPLAY_BACKEND` and `HIPFIRE_REPLAY_TRANSPORT` settings take
+precedence. The automatic eligible MQ4R product path records one ordinary
+HIP forward, prepares retained AQL/PM4, and transitions Captured→Ready
+directly on successful preparation; it does not call `observe_shadow`,
+traverse `ShadowValidated`, require two speedup observations, or install
+via the manual controller. The manual controller has the two accepted
+shadow-observation gate; repository promotion remains stricter. Any ABI,
+capability, parity, timeout, queue-fault, or cache-poison failure falls
+back to HIP for the process. A
+successful model swap resets the process-local controller; models outside
+that runtime default predicate return to ordinary HIP rather than
+inheriting a prior retained tape.
 
 The source repository's certified results are:
 
@@ -107,7 +116,7 @@ they are measurement artifacts rather than source inputs.
 The product lifecycle must arm capture at the first eligible plain-AR forward;
 recording from model load accidentally mixes prefill setup into the decode tape
 and correctly triggers fail-closed artifact validation. Reproduce with
-`scripts/redline_product_bench.py --transport pm4`; `.redline-work/` holds the
+`python3 -m tools.redline bench --transport pm4`; `.redline-work/` holds the
 local raw JSON and daemon logs and is not a source artifact.
 
 The user-facing `serve_harness.py` transport/performance gate also completed at
@@ -133,6 +142,6 @@ The existing HipGraph proposal executor is now permitted to capture the same
 full-vocabulary Q8 head. It is token-identical at K=3 (tau 3.4737 and matching
 output), but remains neutral/slightly negative at 186.06 vs 187.95 tok/s, so it
 stays behind the existing explicit `HIPFIRE_MTP_PROPOSAL_GRAPH=on` opt-in. The
-product combination is consequently Redline PM4 for certified ordinary decode
-and the established HIP MTP path for speculative decode; there is no unsafe
-automatic crossover.
+product combination is consequently Redline PM4 for ordinary decode that meets
+the runtime default or an explicit retained route, and the established HIP MTP
+path for speculative decode; there is no unsafe automatic crossover.

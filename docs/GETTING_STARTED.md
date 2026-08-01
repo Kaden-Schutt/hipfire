@@ -4,12 +4,41 @@ Audience: first install on an AMD GPU host. Goal: install → verify → pull a 
 
 ## Prerequisites
 
-- **Linux:** AMD GPU with `/dev/kfd`, HIP runtime (`libamdhip64.so`). RDNA4 (`gfx1200`/`gfx1201`) needs HIP/ROCm **6.4+**. Strix Halo / gfx115x needs **7.2+**.
+- **Linux:** AMD GPU with `/dev/kfd` plus a ROCm HIP development stack.
+  hipfire JIT-compiles kernels, so a runtime-only install is insufficient: the
+  selected ROCm root must provide `lib/libamdhip64.so` (and
+  `libhsa-runtime64.so`), `include/hip/hip_runtime.h`, and `bin/hipcc`.
+  Install a supported AMD ROCm HIP runtime, development headers, and device
+  compiler via
+  [AMD's live install selector](https://rocm.docs.amd.com/en/latest/install/rocm.html)
+  (choose packages for your GPU, OS, and ROCm version — package names drift;
+  the selector is authoritative).
+- **Supported ROCm range:** Linux with **ROCm 6 or newer** (project baseline from
+  [README.md](../README.md)). **ROCm 6.4+** for RDNA4 (`gfx1200`/`gfx1201`);
+  **ROCm 7.2+** for Strix Halo / gfx115x. hipfire's path resolver does not
+  hardcode a required release — install a supported stack for your GPU.
 - **Windows:** [AMD HIP SDK](https://www.amd.com/en/developer/resources/rocm-hub/hip-sdk.html) (`hipcc` + `amdhip64.dll`).
 - **WSL2:** install AMD WSL GPU support first (`sudo amdgpu-install --usecase=wsl`), then use the Linux installer inside the distro.
 - Disk space for models under `~/.hipfire/models/` (a few GB for small tags; tens of GB for 27B+).
 
 Live model tags, VRAM floors, and formats: [MODELS.md](MODELS.md). Full env list: [env-vars.md](env-vars.md).
+
+For a non-default or side-by-side install, pin one coherent SDK root before
+starting hipfire:
+
+```bash
+export HIPFIRE_ROCM_PATH=/absolute/path/to/rocm
+# If HIPFIRE_ROCM_PATH is unset, ROCM_PATH then HIP_PATH are accepted:
+# export ROCM_PATH=/absolute/path/to/rocm
+# export HIP_PATH=/absolute/path/to/rocm   # or .../hip (normalized to the parent)
+```
+
+Priority is `HIPFIRE_ROCM_PATH` > `ROCM_PATH` > `HIP_PATH`. An explicit override
+is authoritative: once a root is selected, HIP/HSA libraries, headers, and
+`hipcc` stay in that root family — hipfire will not fall back to another install
+or a bare soname. If several complete roots are equally eligible (for example
+multiple `/opt/rocm-*` with no active `/opt/rocm`), discovery refuses to guess;
+set `HIPFIRE_ROCM_PATH` to one absolute root.
 
 ## Install
 
@@ -20,10 +49,10 @@ The revision selector controls the managed source checkout under
 
 ```bash
 # Current master:
-curl -fsSL https://raw.githubusercontent.com/Kaden-Schutt/hipfire/master/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/warpfront/hipfire/master/scripts/install.sh | bash
 
 # Integration/testing branch:
-curl -fsSL https://raw.githubusercontent.com/Kaden-Schutt/hipfire/master/scripts/install.sh \
+curl -fsSL https://raw.githubusercontent.com/warpfront/hipfire/master/scripts/install.sh \
   | bash -s -- --branch beta
 ```
 
@@ -36,7 +65,7 @@ inspect the installer itself, then ask it to install the same tag or commit:
 
 ```bash
 PIN=v0.2.1
-curl -fsSL "https://raw.githubusercontent.com/Kaden-Schutt/hipfire/${PIN}/scripts/install.sh" \
+curl -fsSL "https://raw.githubusercontent.com/warpfront/hipfire/${PIN}/scripts/install.sh" \
   -o /tmp/hipfire-install.sh
 sha256sum /tmp/hipfire-install.sh
 less /tmp/hipfire-install.sh
@@ -57,10 +86,10 @@ or copies the daemon, installs the native `hipfire` binary under
 
 ```powershell
 # Current master:
-iex (irm https://raw.githubusercontent.com/Kaden-Schutt/hipfire/master/scripts/install.ps1)
+iex (irm https://raw.githubusercontent.com/warpfront/hipfire/master/scripts/install.ps1)
 
 # Integration/testing branch:
-& ([scriptblock]::Create((irm https://raw.githubusercontent.com/Kaden-Schutt/hipfire/master/scripts/install.ps1))) `
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/warpfront/hipfire/master/scripts/install.ps1))) `
   -Branch beta
 ```
 
@@ -68,7 +97,7 @@ For a reviewed, pinned installation:
 
 ```powershell
 $Pin = "v0.2.1"
-Invoke-WebRequest -Uri "https://raw.githubusercontent.com/Kaden-Schutt/hipfire/$Pin/scripts/install.ps1" `
+Invoke-WebRequest -Uri "https://raw.githubusercontent.com/warpfront/hipfire/$Pin/scripts/install.ps1" `
   -OutFile "$env:TEMP\hipfire-install.ps1"
 Get-FileHash "$env:TEMP\hipfire-install.ps1" -Algorithm SHA256
 notepad "$env:TEMP\hipfire-install.ps1"
@@ -95,7 +124,7 @@ Copy-Item .\kernels\compiled\<arch>\* $env:USERPROFILE\.hipfire\bin\kernels\comp
 ### Source checkout
 
 ```bash
-git clone https://github.com/Kaden-Schutt/hipfire
+git clone https://github.com/warpfront/hipfire
 cd hipfire
 cargo build --release --features deltanet --example daemon -p hipfire-runtime
 cargo build --release -p hipfire-cli
@@ -114,13 +143,13 @@ source checkout, runtime PID/log files, and the PATH entry created by the
 installer. It preserves downloaded models and settings under `~/.hipfire`:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Kaden-Schutt/hipfire/master/scripts/uninstall.sh | bash
+curl -fsSL https://raw.githubusercontent.com/warpfront/hipfire/master/scripts/uninstall.sh | bash
 ```
 
 Preview without changing anything:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Kaden-Schutt/hipfire/master/scripts/uninstall.sh \
+curl -fsSL https://raw.githubusercontent.com/warpfront/hipfire/master/scripts/uninstall.sh \
   | bash -s -- --dry-run
 ```
 

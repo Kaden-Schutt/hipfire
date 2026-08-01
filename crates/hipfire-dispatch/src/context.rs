@@ -1,18 +1,31 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) 2026 Björn Bösel
 // hipfire — see LICENSE and NOTICE in the project root.
-use std::sync::Arc;
+use crate::resource::ResourceManager;
 use rdna_compute::arch_caps::ArchCaps;
 use rdna_compute::feature_flags::FeatureFlags;
 use rdna_compute::Gpu;
-use crate::resource::ResourceManager;
+use std::sync::Arc;
 
-/// Per-session context resolved once at Gpu::init().
-/// Shared immutably across all dispatch calls.
+/// Semantic workload carried through dispatch.
+///
+/// Most kernel choices are shape-driven. Speculative target verification is a
+/// deliberate exception: the gfx12 wide-query attention route has repeatedly
+/// regressed that short-batch regime, even when an opt-in overrides its normal
+/// shape envelope.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DispatchWorkload {
+    Standard,
+    SpeculativeVerify,
+}
+
+/// Hardware snapshot plus call-site semantics shared immutably across a
+/// dispatch sequence.
 pub struct DispatchCtx {
     pub arch: ArchCaps,
     pub flags: Arc<FeatureFlags>,
     pub resources: ResourceManager,
+    pub workload: DispatchWorkload,
 }
 
 impl DispatchCtx {
@@ -27,7 +40,14 @@ impl DispatchCtx {
             arch,
             flags,
             resources: ResourceManager::new(gpu),
+            workload: DispatchWorkload::Standard,
         }
+    }
+
+    /// Attach call-site semantics to this otherwise hardware-derived context.
+    pub fn with_workload(mut self, workload: DispatchWorkload) -> Self {
+        self.workload = workload;
+        self
     }
 
     /// Construct a `DispatchCtx` for the given arch string without a live GPU.
@@ -41,6 +61,7 @@ impl DispatchCtx {
             arch: arch_caps,
             flags,
             resources: crate::resource::ResourceManager::for_test(),
+            workload: DispatchWorkload::Standard,
         }
     }
 }

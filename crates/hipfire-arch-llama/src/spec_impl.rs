@@ -41,10 +41,16 @@ impl SpecTarget for LlamaBundle {
         self
     }
 
-    fn reset_recurrent(&mut self, _gpu: &mut Gpu) {
+    fn reset_recurrent(&mut self, _gpu: &mut Gpu) -> Result<(), String> {
         // Pure attention: no recurrent state to zero. Drop the KV eviction offset
         // so the next conversation rotates from absolute 0.
         self.kv.compact_offset = 0;
+        Ok(())
+    }
+
+    fn retry_reset_eligible(&self) -> bool {
+        // Pure attention: compact_offset rewind is the full residual surface.
+        true
     }
 
     fn new_spec_scratch(
@@ -121,12 +127,15 @@ impl SpecTarget for LlamaBundle {
             .map_err(|e| format!("{e:?}"))?;
         }
         // The last per-token forward_scratch_compute leaves the final token's
-        // logits in scratch.logits.
+        // logits in scratch.logits. Hand the host row through so Generic DFlash
+        // prefill can sample at temp>0 without a second D2H.
         let logits = gpu
             .download_f32(&self.scratch.logits)
             .map_err(|e| format!("{e:?}"))?;
+        let last_argmax = llama::argmax(&logits);
         Ok(SpecAdvance::Ready {
-            last_argmax: llama::argmax(&logits),
+            last_argmax,
+            last_logits: Some(logits),
         })
     }
 

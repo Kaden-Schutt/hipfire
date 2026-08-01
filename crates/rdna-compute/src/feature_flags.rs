@@ -112,6 +112,10 @@ pub struct FeatureFlags {
     pub hfq4_mmq_gfx906_y64: bool,
     pub gate_up_variant: Option<String>,
     pub gate_up_nosync: bool,
+    /// gfx12 LDS-staged HFQ4-G256 residual/gate_up WMMA path. Reorders FP32
+    /// K accumulation across 8 waves (not bit-exact). Default OFF; opt in with
+    /// `HIPFIRE_HFQ4G256_LDSSTAGE=1`. Requires K % 512 == 0 at the launch site.
+    pub hfq4g256_ldsstage_wmma: bool,
     /// RDNA3 QKVZA prefill route that keeps the large QKV/Z projections on
     /// MMQ while sending the narrow beta/alpha tails through dot2.
     /// Opt in with HIPFIRE_QKVZA_SPLIT_TAIL=1.
@@ -414,6 +418,7 @@ impl FeatureFlags {
             hfq4_mmq_gfx906_y64: value("HIPFIRE_HFQ4_MMQ_GFX906_Y64").map_or(false, |v| v == "1"),
             gate_up_variant: value("HIPFIRE_GATE_UP_VARIANT").ok(),
             gate_up_nosync: value("HIPFIRE_GATE_UP_NOSYNC").as_deref() == Ok("1"),
+            hfq4g256_ldsstage_wmma: value("HIPFIRE_HFQ4G256_LDSSTAGE").as_deref() == Ok("1"),
             qkvza_split_tail: parse_bool("HIPFIRE_QKVZA_SPLIT_TAIL").unwrap_or(false),
             gfx942_gemv_v2: parse_bool("HIPFIRE_GFX942_GEMV_V2"),
             gfx942_gemv_v3: value("HIPFIRE_GFX942_GEMV_V3").map_or(false, |v| v == "1"),
@@ -641,6 +646,7 @@ impl FeatureFlags {
             hfq4_mmq_gfx906_y64: false,
             gate_up_variant: None,
             gate_up_nosync: false,
+            hfq4g256_ldsstage_wmma: false,
             qkvza_split_tail: false,
             gfx942_gemv_v2: None,
             gfx942_gemv_v3: false,
@@ -700,7 +706,7 @@ impl FeatureFlags {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hipfire_config::{ConfigLayer, ConfigSource, NamedLayer, ProcessConfig, resolve};
+    use hipfire_config::{resolve, ConfigLayer, ConfigSource, NamedLayer, ProcessConfig};
 
     #[test]
     fn force_unfused_defaults_false_in_test_ctor() {

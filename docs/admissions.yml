@@ -2,19 +2,23 @@
 # Runtime capability ≠ registry admission ≠ Redline certification.
 # No wildcards. No inferred rows. Mismatch fail-closed.
 #
-# Runtime automatic selection MUST be post-load from retained_fixture_evidence()
-# and MUST match this row's loaded fixture evidence; never path or extension
-# inference. On any mismatch, fail closed.
+# This registry records sealed product-route evidence/admission only.
+# It does NOT select runtime defaults. Current automatic runtime selection
+# is only mq4r_redline_default (single-GPU .mq4r on exact gfx1100/gfx1151/
+# gfx1201 with pp=tp=1; model-family agnostic). Existing LFM .mq4 evidence
+# is not auto-selected because it is not .mq4r; any usable LFM retained
+# route remains explicit opt-in and must still prove route support.
 schema_version: 2
 policy:
   inferred_rows: forbidden
   wildcards: forbidden
-  runtime_default_selection: post_load_retained_fixture_evidence
+  runtime_default_selection: none_registry_evidence_only
   mismatch: fail_closed
   certification_note: >
     Registry admission is not canonical Redline certification. Screen numbers
     bound to a record remain product-route evidence only unless a separate
-    certification ladder disposition says otherwise.
+    certification ladder disposition says otherwise. A sealed row does not
+    by itself wire configure_model_default or any automatic runtime selector.
 records:
   - id: lfm25-350m-mq4-gfx1201-retained-pm4-plain-ar
     status: admitted_product_route
@@ -38,9 +42,9 @@ records:
       dispatches: 161
       kernels: 15
       sequence_hash: "04305cf1254244f6"
-    # Explicit runtime knobs that opt out of the admitted retained-PM4 product
-    # default (lowered + fusion + PM4). These are real env overrides, not
-    # exclusion booleans.
+    # Historical/product-route evidence knobs recorded with the sealed screen.
+    # These are not current automatic-default opt-outs: the sealed LFM .mq4
+    # row is not auto-selected (not .mq4r). Current LFM retained use is explicit opt-in only.
     explicit_opt_outs:
       - HIPFIRE_REPLAY_BACKEND=hip
       - HIPFIRE_LFM2_GFX1201_DECODE_FUSION=0
@@ -63,9 +67,16 @@ records:
       caveat: >
         prior screen used relaxed stationarity and is not canonical certification
     runtime_defaults:
-      must_match_loaded_fixture_evidence: true
-      fail_closed_on_mismatch: true
-      selection: retained_fixture_evidence_post_load
+      wires_runtime_selection: false
+      current_runtime_wiring: absent_explicit_opt_in_only
+      automatic_selector: none
+      note: >
+        Registry evidence/admission only. Does not select runtime defaults.
+        Current automatic runtime selection is mq4r_redline_default only
+        (.mq4r path/extension; no arch_id/model-family gate). This sealed
+        LFM .mq4 row is not auto-selected; LFM retained replay requires
+        explicit opt-in and route proof.
       forbidden_selection:
         - path_inference
         - extension_inference
+        - automatic_runtime_default

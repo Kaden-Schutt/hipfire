@@ -119,6 +119,109 @@ impl Gfx12Pm4CommandBuffer {
         timed
     }
 
+    /// Return a copy with a GPU-clock write after every `DISPATCH_DIRECT`,
+    /// plus one before the first, so `N` dispatches yield `N + 1` timestamps
+    /// and `N` per-dispatch deltas at `base_address + slot * 8`.
+    ///
+    /// Diagnostic only, and deliberately not on any certified path:
+    ///
+    ///   * it changes the tape — dword count and sequence hash both move — so
+    ///     an instrumented run can never satisfy a golden fixture identity;
+    ///   * it is an observer effect. On the 0.8b route (338 dispatches, ~5 us
+    ///     each) a sub-microsecond COPY_DATA per dispatch is a measurable
+    ///     fraction of the thing being measured, and it grows the IB ~21%.
+    ///
+    /// It answers a question end-to-end throughput cannot: whether a deficit is
+    /// spread evenly across dispatches (per-dispatch overhead) or concentrated
+    /// in a few (a barrier or cache-release stall).
+    pub fn with_per_dispatch_timestamps(&self, base_address: u64) -> Result<Self, Pm4BuildError> {
+        let mut timed = Self::new();
+        let mut slot = 0_u64;
+        timed.copy_gpu_timestamp(base_address);
+        slot += 1;
+
+        let mut cursor = 0_usize;
+        while cursor < self.dwords.len() {
+            let header = self.dwords[cursor];
+            if header >> 30 != 3 {
+                return Err(Pm4BuildError::MalformedStream { dword: cursor });
+            }
+            let body = ((header >> 16) & 0x3fff) as usize + 1;
+            let next = cursor
+                .checked_add(1 + body)
+                .filter(|end| *end <= self.dwords.len())
+                .ok_or(Pm4BuildError::MalformedStream { dword: cursor })?;
+            timed.dwords.extend_from_slice(&self.dwords[cursor..next]);
+            if (header >> 8) & 0xff == PACKET3_DISPATCH_DIRECT {
+                timed.copy_gpu_timestamp(base_address + slot * 8);
+                slot += 1;
+            }
+            cursor = next;
+        }
+        Ok(timed)
+    }
+
+    /// Timestamp slots [`with_per_dispatch_timestamps`] would write: one per
+    /// dispatch plus a leading baseline. Callers size the buffer with this.
+    pub fn timestamp_slot_count(&self) -> Result<usize, Pm4BuildError> {
+        let mut slots = 1_usize;
+        let mut cursor = 0_usize;
+        while cursor < self.dwords.len() {
+            let header = self.dwords[cursor];
+            if header >> 30 != 3 {
+                return Err(Pm4BuildError::MalformedStream { dword: cursor });
+            }
+            let body = ((header >> 16) & 0x3fff) as usize + 1;
+            let next = cursor
+                .checked_add(1 + body)
+                .filter(|end| *end <= self.dwords.len())
+                .ok_or(Pm4BuildError::MalformedStream { dword: cursor })?;
+            if (header >> 8) & 0xff == PACKET3_DISPATCH_DIRECT {
+                slots += 1;
+            }
+            cursor = next;
+        }
+        Ok(slots)
+    }
+
+    /// Attribute preceding boundary commands to each dispatch span.
+    ///
+    /// Span *i* is every PM4 packet after timestamp *i* through dispatch *i*.
+    /// The entry ownership acquire is therefore part of span 0 metadata and is
+    /// never reported as a mid-tape `acquire_inter_node`.
+    pub fn dispatch_span_attributions(
+        &self,
+    ) -> Result<Vec<Pm4DispatchSpanAttribution>, Pm4BuildError> {
+        let mut attributions = Vec::new();
+        let mut pending = Pm4DispatchSpanAttribution::default();
+        let mut saw_dispatch = false;
+        let mut cursor = 0_usize;
+        while cursor < self.dwords.len() {
+            let header = self.dwords[cursor];
+            if header >> 30 != 3 {
+                return Err(Pm4BuildError::MalformedStream { dword: cursor });
+            }
+            let body = ((header >> 16) & 0x3fff) as usize + 1;
+            let next = cursor
+                .checked_add(1 + body)
+                .filter(|end| *end <= self.dwords.len())
+                .ok_or(Pm4BuildError::MalformedStream { dword: cursor })?;
+            match (header >> 8) & 0xff {
+                PACKET3_DISPATCH_DIRECT => {
+                    attributions.push(pending);
+                    pending = Pm4DispatchSpanAttribution::default();
+                    saw_dispatch = true;
+                }
+                PACKET3_EVENT_WRITE => pending.wait_compute_idle = true,
+                PACKET3_ACQUIRE_MEM if !saw_dispatch => pending.entry_acquire = true,
+                PACKET3_ACQUIRE_MEM => pending.acquire_inter_node = true,
+                _ => {}
+            }
+            cursor = next;
+        }
+        Ok(attributions)
+    }
+
     fn copy_gpu_timestamp(&mut self, address: u64) {
         const COPY_DATA_TIMESTAMP_TO_MEMORY_64: u32 = 9 | (5 << 8) | (1 << 16) | (1 << 20);
         self.dwords.extend_from_slice(&[
@@ -339,6 +442,21 @@ pub enum Pm4BuildError {
     NullKernarg,
     GroupSegmentOverflow,
     GroupSegmentTooLarge(u32),
+    /// Packet walk hit a non-PACKET3 header or a length running past the end.
+    /// Only reachable from the diagnostic timestamp path.
+    MalformedStream {
+        dword: usize,
+    },
+}
+
+/// Boundary commands attributed to one per-dispatch timestamp span.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Pm4DispatchSpanAttribution {
+    /// Ownership acquire emitted before the first dispatch (span 0 only).
+    pub entry_acquire: bool,
+    pub wait_compute_idle: bool,
+    /// Mid-tape acquire between dispatches (never the entry acquire).
+    pub acquire_inter_node: bool,
 }
 
 impl fmt::Display for Pm4BuildError {
@@ -366,6 +484,9 @@ impl fmt::Display for Pm4BuildError {
                 formatter,
                 "group segment size {bytes} cannot be encoded in GFX12 COMPUTE_PGM_RSRC2"
             ),
+            Self::MalformedStream { dword } => {
+                write!(formatter, "malformed PM4 stream at dword {dword}")
+            }
         }
     }
 }
@@ -374,7 +495,173 @@ impl std::error::Error for Pm4BuildError {}
 
 #[cfg(test)]
 mod tests {
+
+    /// Build a stream of `n` DISPATCH_DIRECT packets separated by a filler
+    /// packet, so the walk has to respect packet lengths rather than scanning
+    /// for opcodes.
+    fn synthetic_stream(n: usize) -> Gfx12Pm4CommandBuffer {
+        let mut buffer = Gfx12Pm4CommandBuffer::new();
+        for _ in 0..n {
+            // filler: SET_SH_REG-shaped, 2 body dwords
+            buffer.dwords.push(packet3(PACKET3_SET_SH_REG, 2, false));
+            buffer.dwords.extend_from_slice(&[0xdead, 0xbeef]);
+            // dispatch: 4 body dwords, matching the real emitter
+            buffer
+                .dwords
+                .push(packet3(PACKET3_DISPATCH_DIRECT, 4, true));
+            buffer.dwords.extend_from_slice(&[1, 1, 1, 0]);
+        }
+        buffer
+    }
+
+    #[test]
+    fn per_dispatch_timestamps_emit_one_slot_per_dispatch_plus_baseline() {
+        for n in [1_usize, 3, 8] {
+            let plain = synthetic_stream(n);
+            assert_eq!(plain.timestamp_slot_count().unwrap(), n + 1);
+            let timed = plain.with_per_dispatch_timestamps(0x1000).unwrap();
+
+            // Every original dword survives, in order, as a subsequence.
+            let mut it = timed.dwords().iter();
+            for want in plain.dwords() {
+                assert!(it.any(|got| got == want), "original dword {want:#x} lost");
+            }
+
+            // One COPY_DATA per slot, addresses stepping by 8 from the base.
+            let copies: Vec<usize> = timed
+                .dwords()
+                .iter()
+                .enumerate()
+                .filter(|(_, word)| **word == packet3(PACKET3_COPY_DATA, 5, false))
+                .map(|(index, _)| index)
+                .collect();
+            assert_eq!(copies.len(), n + 1, "expected {} timestamp writes", n + 1);
+            for (slot, index) in copies.iter().enumerate() {
+                let want = 0x1000_u64 + slot as u64 * 8;
+                let lo = timed.dwords()[index + 4] as u64;
+                let hi = timed.dwords()[index + 5] as u64;
+                assert_eq!(lo | (hi << 32), want, "slot {slot} address");
+            }
+        }
+    }
+
+    #[test]
+    fn per_dispatch_timestamps_reject_a_malformed_stream() {
+        let mut bad = Gfx12Pm4CommandBuffer::new();
+        bad.dwords.push(0x0000_0000); // not a PACKET3 header
+        assert!(matches!(
+            bad.with_per_dispatch_timestamps(0x1000),
+            Err(Pm4BuildError::MalformedStream { dword: 0 })
+        ));
+        // A length running past the end must be rejected, not truncated.
+        let mut overrun = Gfx12Pm4CommandBuffer::new();
+        overrun
+            .dwords
+            .push(packet3(PACKET3_DISPATCH_DIRECT, 4, true));
+        assert!(overrun.with_per_dispatch_timestamps(0x1000).is_err());
+    }
     use super::*;
+
+    /// Span i owns every packet after timestamp i through dispatch i.
+    /// Entry acquire is span-0 metadata; mid-tape waits/acquires attach to the
+    /// following dispatch — never rewritten as entry_acquire.
+    #[test]
+    fn dispatch_span_attribution_follows_generated_packet_order() {
+        let mut plain = Gfx12Pm4CommandBuffer::new();
+        plain.acquire_system_gfx12();
+        // dispatch 0 — entry acquire already above
+        plain.dwords.push(packet3(PACKET3_DISPATCH_DIRECT, 4, true));
+        plain.dwords.extend_from_slice(&[1, 1, 1, 0]);
+        // boundary before dispatch 1
+        plain.wait_compute_idle();
+        plain.acquire_inter_node_gfx12();
+        plain.dwords.push(packet3(PACKET3_DISPATCH_DIRECT, 4, true));
+        plain.dwords.extend_from_slice(&[2, 1, 1, 0]);
+        // wait-only boundary before dispatch 2
+        plain.wait_compute_idle();
+        plain.dwords.push(packet3(PACKET3_DISPATCH_DIRECT, 4, true));
+        plain.dwords.extend_from_slice(&[3, 1, 1, 0]);
+        plain.wait_compute_idle();
+
+        let attributions = plain.dispatch_span_attributions().unwrap();
+        assert_eq!(attributions.len(), 3);
+        assert_eq!(
+            attributions[0],
+            Pm4DispatchSpanAttribution {
+                entry_acquire: true,
+                wait_compute_idle: false,
+                acquire_inter_node: false,
+            }
+        );
+        assert_eq!(
+            attributions[1],
+            Pm4DispatchSpanAttribution {
+                entry_acquire: false,
+                wait_compute_idle: true,
+                acquire_inter_node: true,
+            }
+        );
+        assert_eq!(
+            attributions[2],
+            Pm4DispatchSpanAttribution {
+                entry_acquire: false,
+                wait_compute_idle: true,
+                acquire_inter_node: false,
+            }
+        );
+
+        // Timestamp walk must place the baseline before the entry acquire and
+        // each subsequent stamp immediately after its DISPATCH_DIRECT so span 0
+        // covers entry acquire → dispatch 0, span 1 covers wait+acquire →
+        // dispatch 1, etc.
+        let timed = plain.with_per_dispatch_timestamps(0x2000).unwrap();
+        let copies: Vec<usize> = timed
+            .dwords()
+            .iter()
+            .enumerate()
+            .filter(|(_, word)| **word == packet3(PACKET3_COPY_DATA, 5, false))
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(copies.len(), 4);
+
+        let opcode_at = |dword: usize| (timed.dwords()[dword] >> 8) & 0xff;
+        // baseline timestamp is the first packet
+        assert_eq!(copies[0], 0);
+        // first real command after baseline is the entry ACQUIRE_MEM
+        assert_eq!(opcode_at(copies[0] + 6), PACKET3_ACQUIRE_MEM);
+        // each post-dispatch stamp sits immediately after DISPATCH_DIRECT body
+        for &stamp in &copies[1..] {
+            assert_eq!(opcode_at(stamp - 5), PACKET3_DISPATCH_DIRECT);
+        }
+
+        // Reconstruct span contents from timestamp indices and prove flags.
+        let mut cursor = copies[0] + 6; // first dword after baseline timestamp packet
+        let mut reconstructed = Vec::new();
+        for &end in &copies[1..] {
+            let mut attr = Pm4DispatchSpanAttribution::default();
+            let mut saw_dispatch = false;
+            while cursor < end {
+                let header = timed.dwords()[cursor];
+                let body = ((header >> 16) & 0x3fff) as usize + 1;
+                let next = cursor + 1 + body;
+                match (header >> 8) & 0xff {
+                    PACKET3_DISPATCH_DIRECT => saw_dispatch = true,
+                    PACKET3_EVENT_WRITE => attr.wait_compute_idle = true,
+                    PACKET3_ACQUIRE_MEM if reconstructed.is_empty() && !saw_dispatch => {
+                        attr.entry_acquire = true;
+                    }
+                    PACKET3_ACQUIRE_MEM => attr.acquire_inter_node = true,
+                    _ => {}
+                }
+                cursor = next;
+            }
+            assert!(saw_dispatch, "each span must include its dispatch");
+            // skip the timestamp packet itself
+            cursor = end + 6;
+            reconstructed.push(attr);
+        }
+        assert_eq!(reconstructed, attributions);
+    }
 
     #[test]
     fn packet3_count_and_shader_type_match_gfx12_headers() {

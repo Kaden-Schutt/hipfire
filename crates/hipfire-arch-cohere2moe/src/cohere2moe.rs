@@ -549,7 +549,7 @@ impl Cohere2MoeState {
             logits,
             flash_partials,
         } = self;
-        kv.free_gpu(gpu);
+        let _ = kv.free_gpu(gpu);
         let _ = gpu.hip.free(pos_buf);
         for t in [
             h,

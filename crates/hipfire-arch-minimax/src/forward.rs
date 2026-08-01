@@ -107,14 +107,16 @@ pub fn decode_step_with_graph(
 ) -> Result<Vec<f32>, String> {
     use std::sync::OnceLock;
     static GRAPH_ENV: OnceLock<Option<bool>> = OnceLock::new();
-    let env_override =
-        *GRAPH_ENV.get_or_init(
-            || match hipfire_config::developer_var("HIPFIRE_MINIMAX_GRAPH").ok().as_deref() {
-                Some("1") => Some(true),
-                Some("0") => Some(false),
-                _ => None,
-            },
-        );
+    let env_override = *GRAPH_ENV.get_or_init(|| {
+        match hipfire_config::developer_var("HIPFIRE_MINIMAX_GRAPH")
+            .ok()
+            .as_deref()
+        {
+            Some("1") => Some(true),
+            Some("0") => Some(false),
+            _ => None,
+        }
+    });
     // Default OFF — measured only +1.0% on gfx1151 (the sole arch MiniMax fits);
     // the decode gap is GPU-CP dispatch latency, not host-launch overhead, so
     // hipGraph recovers ~nothing here. Opt in with HIPFIRE_MINIMAX_GRAPH=1.
@@ -211,7 +213,8 @@ fn decode_step_body(
     let k_top = cfg.num_experts_per_tok;
     let eps = cfg.rms_norm_eps;
     let seq_len = position as usize + 1;
-    let capture_postattn = hipfire_config::developer_var_os("HIPFIRE_MINIMAX_CAPTURE_POSTATTN").is_some();
+    let capture_postattn =
+        hipfire_config::developer_var_os("HIPFIRE_MINIMAX_CAPTURE_POSTATTN").is_some();
 
     // Device position scalar (i32) for rope / kv-write / attention. Staged from
     // the heap-stable `state.pos_host` so the captured memcpy re-reads it on
@@ -999,7 +1002,12 @@ fn minimax_lower_program() -> superop::LayerProgram {
 fn minimax_forward_lowered_enabled() -> bool {
     use std::sync::OnceLock;
     static F: OnceLock<bool> = OnceLock::new();
-    *F.get_or_init(|| hipfire_config::developer_var("HIPFIRE_FORWARD_LOWERED").ok().as_deref() != Some("0"))
+    *F.get_or_init(|| {
+        hipfire_config::developer_var("HIPFIRE_FORWARD_LOWERED")
+            .ok()
+            .as_deref()
+            != Some("0")
+    })
 }
 
 /// Lowered (#397 Ship 6) per-layer decode loop + final norm/head. Pos scalar is

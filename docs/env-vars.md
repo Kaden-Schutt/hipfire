@@ -3,7 +3,7 @@
 **Owner:** environment-variable inventory (`docs/INDEX.md`).
 **Machine sources:** `HIPFIRE_*` token scan of Rust, Python, and shell sources under the repo (excluding `target/`, `.git/`, etc.).
 **Config schema owner:** [`CONFIG.md`](CONFIG.md) (`crates/hipfire-config/src/lib.rs` + `crates/hipfire-runtime/src/config.rs`).
-**Last checked:** 2026-07-21.
+**Last checked:** 2026-07-31.
 
 For persistent user configuration, prefer `hipfire config set ...` and
 `~/.hipfire/config.toml`. Schema-declared environment variables are retained as
@@ -80,6 +80,8 @@ Values and defaults below match `hipfire-config`, the native CLI, and/or `Runtim
 | `HIPFIRE_MODEL` | Serve/run model tag or path | Also `default_model` config. |
 | `HIPFIRE_DAEMON_BIN` | Daemon binary override | |
 | `HIPFIRE_TUI_BIN` | TUI binary | |
+| `HIPFIRE_ROCM_PATH` | hipfire-specific ROCm SDK root override | Highest priority (`HIPFIRE_ROCM_PATH` > `ROCM_PATH` > `HIP_PATH`). Must provide the runtime, headers, and `hipcc`. Authoritative: no fallback to another install or bare soname. |
+| `ROCM_PATH` / `HIP_PATH` | ROCm/HIP compatibility root overrides | Used only when `HIPFIRE_ROCM_PATH` is unset (`ROCM_PATH` before `HIP_PATH`). `HIP_PATH=<root>/hip` normalizes to `<root>`. Multiple equally eligible roots without an override are refused — set `HIPFIRE_ROCM_PATH`. |
 | `HIPFIRE_LOCAL=1` | Skip attaching to running serve | One-shot local daemon. |
 | `HIPFIRE_REGISTRY_URL` | Dynamic registry fetch URL | |
 | `HIPFIRE_NO_REGISTRY_FETCH=1` | Pin bundled registry | |
@@ -104,6 +106,8 @@ Values and defaults below match `hipfire-config`, the native CLI, and/or `Runtim
 |---|---|---|
 | `HIPFIRE_SPECULATION` | `off`/`auto`/`ngram`/`dflash`/`mtp`/`dspark` | Canonical selector |
 | `HIPFIRE_DFLASH_DRAFT` | retired engine read | Still appears in legacy gate scripts; product draft discovery uses typed speculation/load policy and registry/filename matching. |
+| `HIPFIRE_DFLASH_CTX_CAP` | **8192**; `0` restores uncapped legacy behavior | Caps draft-side context storage; over-cap requests fall back to AR |
+| `HIPFIRE_DFLASH_WINDOW` | **0 / unset** (legacy), unless declared by draft metadata | Enables bounded draft SWA; refused with CASK eviction |
 | `HIPFIRE_DFLASH_MODE` | RuntimeConfig default **`off`** | Distinct from config `dflash_mode` apply path — product CLI also uses load params |
 | `HIPFIRE_DFLASH_NGRAM_BLOCK` | set/clear from config | |
 | `HIPFIRE_DFLASH_CKPT_RESUME` / `HIPFIRE_CACHE_CKPT_*` | checkpointing | Qwen DFlash path |
@@ -132,6 +136,9 @@ Values and defaults below match `hipfire-config`, the native CLI, and/or `Runtim
 | `HIPFIRE_MMQ_SCREEN` / `HIPFIRE_MMQ_SCREEN_THRESHOLD` / `HIPFIRE_MMQ_MIN_BATCH` | screening |
 | `HIPFIRE_PREFILL_COMPRESSION` and `HIPFIRE_PREFILL_*` | PFlash + batched prefill knobs (config mirrors) |
 | `HIPFIRE_PREFILL_BATCHED` | RuntimeConfig: on unless `0` (Qwen-style batched prefill gate — **not** the LFM flag) |
+| `HIPFIRE_FLASH_PREFILL` | Developer override for Q8 WMMA flash prefill: `0` forces off, `1` forces on; unset uses the architecture/workload envelope. |
+| `HIPFIRE_FLASH_PREFILL_FIXED_HD` | Developer ablation: fixed-head-dimension specialization is on unless `0`. |
+| `HIPFIRE_FLASH_PREFILL_PREFETCH_V` | Developer ablation: gfx12 V prefetch is on unless `0`. |
 
 ### LFM (arch 11) — branch-scoped optimized prefill
 
@@ -140,8 +147,8 @@ Values and defaults below match `hipfire-config`, the native CLI, and/or `Runtim
 | `HIPFIRE_LFM2_PREFILL_BATCH` | **opt-in**; require `=1` | **Branch-only; not shipped** as a generic product default. Audited wording: **350M dense MQ4** cohort + **gfx1201** + this flag at `lfm-redline@692a726dde53508cb53de1a74c720e75a7c9f33e` (absent from `origin/beta@202282de…`). Does **not** admit Q8/other cohorts/default-on. |
 | `HIPFIRE_LFM2_PREFILL_MAX_BATCH` | default 256, cap 512 | Chunk size for batched path |
 | `HIPFIRE_LFM2_GRAPH` | LFM graph experiments | Source in LFM crate/daemon |
-| `HIPFIRE_LFM2_GFX1201_DECODE_FUSION` | default on for eligible fixture; `=0` opts out | Request bit for exact gfx1201 350M dense-MQ4 decode fusion. **Unset or `=1`** requests fusion; **`=0`** (or any other set value) disables the request. Actual enablement still requires verified fixture evidence, gfx1201, graph off, and lowered forward (`lfm2_decode_fusion_enabled`). Listed opt-out of the admitted retained-PM4 product default in [`admissions.yml`](admissions.yml). |
-| `HIPFIRE_FORWARD_LOWERED` | default on (LFM and several other arches); `=0` opts out | Shared lowered forward escape hatch. For LFM: **unset or any value other than `0`** keeps the lowered path; **`=0`** forces the legacy hand loop. Lowered-on is required for exact decode fusion and retained-route eligibility. Listed opt-out of the admitted retained-PM4 product default in [`admissions.yml`](admissions.yml). |
+| `HIPFIRE_LFM2_GFX1201_DECODE_FUSION` | request bit; `=0` disables | Request bit for exact gfx1201 350M dense-MQ4 decode fusion. **Unset or `=1`** requests fusion; **`=0`** (or any other set value) disables the request. Actual enablement still depends on implementation support (gfx1201, graph off, lowered forward). Recorded on the sealed LFM [`admissions.yml`](admissions.yml) evidence row; **not** an automatic Redline runtime-default opt-out (LFM has no current automatic selector). |
+| `HIPFIRE_FORWARD_LOWERED` | default on (LFM and several other arches); `=0` opts out | Shared lowered forward escape hatch. For LFM: **unset or any value other than `0`** keeps the lowered path; **`=0`** forces the legacy hand loop. Lowered-on is required for exact decode fusion where that path exists. Recorded on the sealed LFM [`admissions.yml`](admissions.yml) evidence row; **not** an automatic Redline runtime-default opt-out. |
 | Other `HIPFIRE_LFM*` | diag/trace | Inventory |
 
 Eager LFM prefill remains available when the batch flag is off **or** the GPU is not gfx1201. On gfx1201 with `HIPFIRE_LFM2_PREFILL_BATCH=1`, selection is GPU+flag only with **no post-selection fallback** — unsupported cohorts fail closed at the **runtime fixture validation/guard** (exact 350M dense MQ4 fixture only). Source symbol `validate_350m_mq4_admission` is a fixture-shape check only; its name does **not** create a product admission — [`admissions.yml`](admissions.yml) remains the sole authority (schema v2; exactly one earned retained-PM4 product row).
@@ -171,10 +178,11 @@ Policy owner: [`REDLINE.md`](REDLINE.md) (**shipped / ref-pinned**). Timing is n
 
 | Variable | Notes |
 |---|---|
-| `HIPFIRE_REPLAY_BACKEND` | `hip` / `off` / `shadow` / `auto`. Unset may select `auto` from **either** automatic product default: (1) Qwen `gfx12_mq4r_redline_default` — gfx12 + `arch_id==6` + `.mq4r` + pp=tp=1 (path/extension); or (2) exact LFM `lfm2_gfx1201_redline_default` — gfx1201 + `arch_id==11` + verified post-load `retained_fixture_evidence` + `max_seq==2048` + plain AR + pp=tp=1 (never path/extension). `=hip` is an explicit opt-out of the admitted LFM retained-PM4 default. Mismatch vs the sealed LFM row fails closed. |
+| `HIPFIRE_REPLAY_BACKEND` | `hip` / `off` / `shadow` / `auto`. Unset may select `auto` only from the automatic product default `mq4r_redline_default` — exact GPU arch `gfx1100`/`gfx1151`/`gfx1201` + case-insensitive `.mq4r` + pp=tp=1 (model-family agnostic; no `arch_id` gate; `gfx1200` and all other arches remain opt-in). Existing LFM `.mq4` registry evidence is **not** automatically selected because it is not `.mq4r`; any usable non-default retained route is explicit opt-in and must still prove route support. The sealed LFM [`admissions.yml`](admissions.yml) row is registry evidence/admission only and does not wire runtime defaults. Runtime default ≠ Redline certification/registry admission. Built-in `hip` config profile, another explicit backend selection, or `=hip` disables the automatic default. |
 | `HIPFIRE_REPLAY_TRANSPORT` | `pm4` / AQL family |
 | `HIPFIRE_REPLAY_MANUAL_CAPTURE` | Manual capture delimiters |
 | `HIPFIRE_REPLAY_PM4_*` | PM4 research knobs — inventory |
+| `HIPFIRE_REPLAY_ROUTE_PROOF_LOG` | Developer-only / one-shot compat for `diagnostic.replay.route_proof_log`. When `1`/`true`/`on` (or TOML `true`), the daemon emits one post-generate retained-route proof marker per successful request: `HIPFIRE_REPLAY_ROUTE_PROOF transport=<name> position=<n> request_id=<id> replays=<count>`. Off by default; product coherence smoke enables it only via temporary serve_harness `config.toml`, not ambient env. |
 
 ### Chat template
 
@@ -272,10 +280,11 @@ Copyable user, developer, and retained-PM4 TOML profiles are in
 **Do not hand-edit rows below** except by re-running the source scan.
 **Generation method:** token scan over visible `*.rs`, `*.py`, and `*.sh`, excluding ignored/generated files.
 **Columns:** variable; up to two lexical source paths.
-**Count:** 714
+**Count:** 715
 
 | Variable | Example source path(s) |
 |---|---|
+| `HF_ENDPOINT` | crates/hipfire-cli/src/main.rs |
 | `HIPFIRE_9B_MODEL` | scripts/bisect_9b_decode.sh |
 | `HIPFIRE_ADAPTIVE_B_DOWN` | crates/hipfire-runtime/examples/dflash_spec_demo.rs |
 | `HIPFIRE_ADAPTIVE_B_UNSAFE` | crates/hipfire-runtime/examples/dflash_spec_demo.rs |
@@ -323,7 +332,7 @@ Copyable user, developer, and retained-PM4 TOML profiles are in
 | `HIPFIRE_CANARY_MODEL` | scripts/gfx906_fallback_canary.sh |
 | `HIPFIRE_CANARY_PREFILL` | scripts/gfx906_fallback_canary.sh |
 | `HIPFIRE_CANARY_RUNS` | scripts/gfx906_fallback_canary.sh |
-| `HIPFIRE_CASK_OFF` | crates/hipfire-loader/src/lib.rs, scripts/redline_daemon_harness.py, scripts/redline_product_bench.py, scripts/serve_harness.py (retired literal; not consumed by Rust config) |
+| `HIPFIRE_CASK_OFF` | crates/hipfire-loader/src/lib.rs, scripts/redline_daemon_harness.py, tools/redline/product_bench.py, scripts/serve_harness.py (retired literal; not consumed by Rust config) |
 | `HIPFIRE_CASK_SIDECAR` | crates/hipfire-config/src/lib.rs |
 | `HIPFIRE_CHATML` | crates/hipfire-runtime/examples/probe_argmax_agreement.rs |
 | `HIPFIRE_CHAT_CURRENT_DATE` | crates/hipfire-runtime/src/prompt_frame.rs |
@@ -430,6 +439,7 @@ Copyable user, developer, and retained-PM4 TOML profiles are in
 | `HIPFIRE_DEVICES` | crates/hipfire-runtime/src/config.rs, crates/hipfire-runtime/src/multi_gpu.rs |
 | `HIPFIRE_DFLASH_CHAT` | crates/hipfire-runtime/examples/daemon.rs |
 | `HIPFIRE_DFLASH_CKPT_RESUME` | crates/hipfire-arch-qwen35/src/dflash_spec.rs, crates/hipfire-runtime/examples/daemon.rs |
+| `HIPFIRE_DFLASH_CTX_CAP` | crates/hipfire-arch-qwen35/src/dflash_spec.rs, crates/hipfire-runtime/examples/daemon.rs |
 | `HIPFIRE_DFLASH_DRAFT` | crates/hipfire-runtime/src/config.rs, scripts/coherence-gate-dflash.sh |
 | `HIPFIRE_DFLASH_FAST_SAMPLE` | crates/hipfire-arch-qwen35/src/speculative.rs, crates/hipfire-runtime/examples/daemon.rs |
 | `HIPFIRE_DFLASH_LOGIT_DUMP` | crates/hipfire-arch-qwen35/src/speculative.rs |
@@ -451,6 +461,7 @@ Copyable user, developer, and retained-PM4 TOML profiles are in
 | `HIPFIRE_DFLASH_TARGET` | scripts/coherence-gate-dflash.sh |
 | `HIPFIRE_DFLASH_TEMP_SPEC` | crates/hipfire-runtime/examples/daemon.rs |
 | `HIPFIRE_DFLASH_TREE` | crates/hipfire-runtime/src/dflash_generic.rs, crates/rdna-compute/src/feature_flags.rs |
+| `HIPFIRE_DFLASH_WINDOW` | crates/hipfire-arch-qwen35/src/dflash_spec.rs, crates/hipfire-runtime/examples/dflash_spec_demo.rs, crates/hipfire-runtime/src/dflash.rs |
 | `HIPFIRE_DFLASH_ZLAB_SAFETENSORS` | scripts/dflash_spec_debug.py |
 | `HIPFIRE_DIR` | scripts/ab-dispatch-validation.sh, scripts/agentic-gate-jinja-tools.sh |
 | `HIPFIRE_DIVERGENCE_PREFILL` | scripts/gfx906_logit_divergence.sh |
@@ -496,6 +507,9 @@ Copyable user, developer, and retained-PM4 TOML profiles are in
 | `HIPFIRE_EP_SKIP_ALLREDUCE` | crates/hipfire-arch-qwen35/src/qwen35.rs |
 | `HIPFIRE_EXPERIMENTAL_` | crates/hipfire-runtime/examples/daemon.rs |
 | `HIPFIRE_EXPERIMENTAL_BUDGET_ALERT` | crates/hipfire-config/src/lib.rs, crates/hipfire-runtime/examples/daemon.rs |
+| `HIPFIRE_FLASH_PREFILL` | crates/hipfire-dispatch/src/families/attention.rs |
+| `HIPFIRE_FLASH_PREFILL_FIXED_HD` | crates/rdna-compute/src/attention.rs |
+| `HIPFIRE_FLASH_PREFILL_PREFETCH_V` | crates/rdna-compute/src/attention.rs |
 | `HIPFIRE_FLASH_PARTIALS_BATCH` | crates/hipfire-arch-qwen35/src/qwen35.rs, crates/hipfire-runtime/src/config.rs |
 | `HIPFIRE_FORCE_ANSWER_SECS` | scripts/test-qwen35-think-cap.sh |
 | `HIPFIRE_FORCE_REBUILD` | crates/hipfire-cli/src/main.rs, scripts/install.sh |
@@ -927,6 +941,7 @@ Copyable user, developer, and retained-PM4 TOML profiles are in
 | `HIPFIRE_REPLAY_PM4_QUEUES` | crates/rdna-compute/src/replay.rs |
 | `HIPFIRE_REPLAY_PM4_STATEFUL` | crates/rdna-compute/src/replay.rs |
 | `HIPFIRE_REPLAY_PM4_WAIT_POLICY` | crates/rdna-compute/src/replay.rs |
+| `HIPFIRE_REPLAY_ROUTE_PROOF_LOG` | crates/hipfire-config/src/lib.rs (`diagnostic.replay.route_proof_log`), crates/rdna-compute/src/replay.rs, tools/redline/product_bench.py, scripts/serve_harness.py |
 | `HIPFIRE_REPLAY_TRANSPORT` | crates/hipfire-cli/src/main.rs, crates/rdna-compute/src/replay.rs |
 | `HIPFIRE_REPO` | scripts/quantize-dspark.sh |
 | `HIPFIRE_RESIDUAL_CPOL` | crates/rdna-compute/src/gemv.rs |
@@ -1013,6 +1028,6 @@ When adding a user-facing knob:
 1. Prefer a typed field + validation in `crates/hipfire-config/src/lib.rs` ([`CONFIG.md`](CONFIG.md)).
 2. Add the env name to product docs only if operators must set it outside config.
 3. Re-scan so the generated inventory stays complete.
-4. Do not document unearned or widened LFM defaults here (multi-cohort, path/extension selection, or generic default-on beyond the exact sealed [`admissions.yml`](admissions.yml) row). The earned exact LFM retained-PM4 default and its three opt-outs may be documented; planned broader admissions may not.
+4. Do not document unearned or widened LFM defaults here (multi-cohort, path/extension selection of `.mq4`, automatic runtime default for non-`.mq4r`, or generic default-on beyond the exact sealed [`admissions.yml`](admissions.yml) evidence row). That LFM row is registry evidence without current automatic runtime wiring; only `mq4r_redline_default` auto-selects (`.mq4r` + exact GPU arch + pp=tp=1). Planned broader admissions may not be documented as shipped.
 
-**Last inventory verification:** 2026-07-22.
+**Last inventory verification:** 2026-07-29.

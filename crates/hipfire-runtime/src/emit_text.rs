@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Kaden Schutt
 
-//! Model-independent parsing of *emitted* assistant text — think-span state and
-//! Hermes/ChatML and Qwen-native XML `<tool_call>` extraction.
+//! Model-independent parsing of *emitted* assistant text — think-span state,
+//! Hermes/ChatML and Qwen-native XML `<tool_call>` extraction, and the
+//! single-pass stateful tool-output router.
 //!
 //! These helpers used to live in the `daemon` example, where the per-arch
 //! `SpecEmit` impls call them during the decode loop. They are pure
@@ -10,6 +11,12 @@
 //! `<tool_call>{json}</tool_call>`) that every Qwen/LLaMA-family arch shares, so
 //! they belong in the runtime where the arch crates' emitters can reach them —
 //! an example cannot be imported by the arch crates that depend on this crate.
+//!
+//! [`ToolOutputRouter`] is the sole incremental marker authority: it holds
+//! marker prefixes across chunks, emits classifier-authorized [`VisibleText`](crate::semantic::VisibleText)
+//! for prose, buffers complete structured calls, and fails closed on malformed
+//! or truncated protocol. The whole-buffer [`extract_tool_calls_from_text`]
+//! helper remains for legacy callers and stays tolerant of unclosed spans.
 
 /// Whether the model is currently inside an open `<think>` span, from the
 /// generated text so far plus whether thinking was opened via the assistant
@@ -28,97 +35,538 @@ pub fn currently_in_think(raw_str: &str, started_in_think: bool) -> bool {
     }
 }
 
+const TOOL_CALL_OPEN: &str = "<tool_call>";
+const TOOL_CALL_CLOSE: &str = "</tool_call>";
+
+/// Fail-closed terminal from the single-pass tool-output router.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolRouteError {
+    /// Malformed or truncated tool protocol (unclosed span, bad body, stray closer).
+    MalformedToolProtocol {
+        /// Human-readable detail (not a retry class).
+        detail: String,
+    },
+}
+
+impl ToolRouteError {
+    fn malformed(detail: impl Into<String>) -> Self {
+        Self::MalformedToolProtocol {
+            detail: detail.into(),
+        }
+    }
+
+    /// Borrow the detail string when this is a malformed-protocol error.
+    pub fn detail(&self) -> &str {
+        match self {
+            Self::MalformedToolProtocol { detail } => detail,
+        }
+    }
+}
+
+impl std::fmt::Display for ToolRouteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MalformedToolProtocol { detail } => {
+                write!(f, "malformed tool protocol: {detail}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ToolRouteError {}
+
+/// Ordered semantic outputs from [`ToolOutputRouter`].
+///
+/// Protocol markers and raw argument bodies never appear in
+/// [`ToolRouteEvent::VisibleText`].
+#[derive(Debug, Clone)]
+pub enum ToolRouteEvent {
+    /// Classifier-authorized client-visible prose.
+    VisibleText(crate::semantic::VisibleText),
+    /// One complete structured tool call (still subject to terminal gating upstream).
+    ToolCall(crate::prompt_frame::ToolCall),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RouteState {
+    /// Outside a tool-call span; may hold a marker prefix at the tail.
+    Normal,
+    /// Inside `<tool_call>…`, buffering body until closer or finish.
+    InToolCall,
+}
+
+/// Single-pass stateful tool-output router.
+///
+/// Feed decoded assistant text chunks via [`Self::push`]; call [`Self::finish`]
+/// at end-of-generation. Holds marker prefixes across chunk boundaries, emits
+/// ordered prose and complete calls, and latches fail-closed on malformed or
+/// truncated protocol.
+pub struct ToolOutputRouter {
+    state: RouteState,
+    /// Unsettled text: Normal holdback tail, or InToolCall body accumulator
+    /// (may include a trailing partial delimiter still being matched).
+    buf: String,
+    /// Byte-state matcher for `<tool_call>` / `</tool_call>`; carries partial
+    /// match progress across chunks. Each buf byte is fed at most once per
+    /// segment (reset only when a delimiter completes and a new segment begins).
+    cursor: DelimCursor,
+    /// Number of leading bytes in `buf` already consumed by `cursor`.
+    seen: usize,
+    completed: Vec<crate::prompt_frame::ToolCall>,
+    /// Latched fail-closed error; once set, further push/finish return it.
+    malformed: Option<ToolRouteError>,
+}
+
+impl Default for ToolOutputRouter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ToolOutputRouter {
+    /// Fresh router with empty buffers.
+    pub fn new() -> Self {
+        Self {
+            state: RouteState::Normal,
+            buf: String::new(),
+            cursor: DelimCursor::new(),
+            seen: 0,
+            completed: Vec::new(),
+            malformed: None,
+        }
+    }
+
+    /// Structured calls completed so far (not yet terminal-gated by consumers).
+    pub fn tool_calls(&self) -> &[crate::prompt_frame::ToolCall] {
+        &self.completed
+    }
+
+    /// Whether a fail-closed malformed verdict has already latched.
+    pub fn is_malformed(&self) -> bool {
+        self.malformed.is_some()
+    }
+
+    /// Feed one decoded text chunk. May emit zero or more ordered events.
+    ///
+    /// Returns [`Err`] once malformed/truncated protocol is detected; the error
+    /// stays latched for subsequent calls.
+    pub fn push(&mut self, chunk: &str) -> Result<Vec<ToolRouteEvent>, ToolRouteError> {
+        if let Some(err) = self.malformed.clone() {
+            return Err(err);
+        }
+        if chunk.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.buf.push_str(chunk);
+        self.drain()
+    }
+
+    /// End-of-stream: flush held prose, or fail closed on an open tool span.
+    pub fn finish(mut self) -> Result<Vec<ToolRouteEvent>, ToolRouteError> {
+        if let Some(err) = self.malformed.clone() {
+            return Err(err);
+        }
+        // Drain any complete markers still sitting in the buffer first.
+        let mut events = self.drain()?;
+        match self.state {
+            RouteState::Normal => {
+                if !self.buf.is_empty() {
+                    // Finish flushes any held marker prefix as ordinary prose.
+                    events.push(visible_event(std::mem::take(&mut self.buf)));
+                }
+                Ok(events)
+            }
+            RouteState::InToolCall => {
+                // Strict: unclosed tool span at finish is always fail-closed.
+                // Do not fabricate calls from partial bodies (even brace-complete).
+                let err = ToolRouteError::malformed("unclosed <tool_call> span at end of output");
+                self.malformed = Some(err.clone());
+                Err(err)
+            }
+        }
+    }
+
+    fn latch_malformed(&mut self, detail: impl Into<String>) -> ToolRouteError {
+        let err = ToolRouteError::malformed(detail);
+        self.malformed = Some(err.clone());
+        err
+    }
+
+    /// Advance as far as the current buffer allows without waiting on more input.
+    fn drain(&mut self) -> Result<Vec<ToolRouteEvent>, ToolRouteError> {
+        let mut events = Vec::new();
+        loop {
+            if self.malformed.is_some() {
+                // Deliver any prose collected before the latch in this drain.
+                break;
+            }
+            let step = match self.state {
+                RouteState::Normal => self.step_normal(&mut events),
+                RouteState::InToolCall => self.step_in_tool_call(&mut events),
+            };
+            match step {
+                Ok(true) => continue,
+                Ok(false) => break,
+                Err(_) => {
+                    // Malformed latched; still surface events from this drain
+                    // (e.g. prose before a stray closer) so markers never leak
+                    // while prior VisibleText is not dropped.
+                    break;
+                }
+            }
+        }
+        if let Some(err) = self.malformed.clone() {
+            if events.is_empty() {
+                return Err(err);
+            }
+            // Events first; caller sees Malformed on the next push/finish.
+            return Ok(events);
+        }
+        Ok(events)
+    }
+
+    fn step_normal(&mut self, events: &mut Vec<ToolRouteEvent>) -> Result<bool, ToolRouteError> {
+        match self.catch_up_delim() {
+            None => {
+                // Emit everything except a potential marker prefix at the tail.
+                // Holdback length is the longer active delimiter progress (both
+                // progresses are suffixes of the same stream).
+                let hold = self.cursor.hold_len();
+                if self.buf.len() > hold {
+                    let emit_len = utf8_safe_split(&self.buf, self.buf.len() - hold);
+                    if emit_len > 0 {
+                        let head: String = self.buf.drain(..emit_len).collect();
+                        self.seen -= emit_len;
+                        if !head.is_empty() {
+                            events.push(visible_event(head));
+                        }
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            }
+            Some((DelimHit::Close, start, end)) => {
+                // Stray closer (no preceding opener in the unsettled buffer).
+                if start > 0 {
+                    let head: String = self.buf[..start].to_string();
+                    if !head.is_empty() {
+                        events.push(visible_event(head));
+                    }
+                }
+                self.consume_through(end);
+                Err(self.latch_malformed("stray </tool_call> without open span"))
+            }
+            Some((DelimHit::Open, start, end)) => {
+                if start > 0 {
+                    let head: String = self.buf[..start].to_string();
+                    if !head.is_empty() {
+                        events.push(visible_event(head));
+                    }
+                }
+                self.consume_through(end);
+                self.state = RouteState::InToolCall;
+                // Remainder (if any) is a fresh InToolCall segment; catch_up will
+                // feed those bytes once under the new state.
+                Ok(true)
+            }
+        }
+    }
+
+    fn step_in_tool_call(
+        &mut self,
+        events: &mut Vec<ToolRouteEvent>,
+    ) -> Result<bool, ToolRouteError> {
+        match self.catch_up_delim() {
+            None => {
+                // No complete delimiter yet — body (+ partial marker bytes) stays
+                // buffered; cursor already holds partial match state for the tip.
+                Ok(false)
+            }
+            Some((DelimHit::Open, _start, _end)) => {
+                // Nested/stacked reserved opener inside an open span — fail closed.
+                Err(self.latch_malformed("nested <tool_call> opener inside an open tool-call span"))
+            }
+            Some((DelimHit::Close, start, end)) => {
+                let body = self.buf[..start].to_string();
+                self.consume_through(end);
+                self.state = RouteState::Normal;
+                // Parse body once at close with the strict grammar only.
+                match parse_strict_tool_call_body(&body) {
+                    Some(call) => {
+                        self.completed.push(call.clone());
+                        events.push(ToolRouteEvent::ToolCall(call));
+                        Ok(true)
+                    }
+                    None => Err(self.latch_malformed(
+                        "tool_call body is empty, truncated, or not fully valid JSON/Qwen XML",
+                    )),
+                }
+            }
+        }
+    }
+
+    /// Feed unconsumed `buf` bytes into the delimiter cursor exactly once.
+    /// On a hit, returns `(kind, delim_start, delim_end)` in current `buf`
+    /// coordinates. Bytes after `delim_end` have not been fed yet.
+    fn catch_up_delim(&mut self) -> Option<(DelimHit, usize, usize)> {
+        let bytes = self.buf.as_bytes();
+        while self.seen < bytes.len() {
+            let b = bytes[self.seen];
+            self.seen += 1;
+            if let Some(hit) = self.cursor.feed(b) {
+                let dlen = hit.len();
+                let end = self.seen;
+                let start = end - dlen;
+                return Some((hit, start, end));
+            }
+        }
+        None
+    }
+
+    /// Drop `buf[..end]` after a delimiter decision and begin a fresh segment.
+    /// Remaining bytes have not been cursor-fed (catch_up stopped at the hit).
+    fn consume_through(&mut self, end: usize) {
+        let _ = self.buf.drain(..end);
+        self.seen = 0;
+        self.cursor.reset();
+    }
+}
+
+fn visible_event(text: String) -> ToolRouteEvent {
+    ToolRouteEvent::VisibleText(crate::semantic::VisibleText::from_classified(text))
+}
+
+/// Which reserved delimiter completed on the latest fed byte.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DelimHit {
+    Open,
+    Close,
+}
+
+impl DelimHit {
+    fn len(self) -> usize {
+        match self {
+            Self::Open => TOOL_CALL_OPEN.len(),
+            Self::Close => TOOL_CALL_CLOSE.len(),
+        }
+    }
+}
+
+/// Incremental byte-state matcher for the open/close tool-call delimiters.
+///
+/// Each byte is consumed once; partial progress carries across chunk boundaries.
+/// Matching is pure ASCII over the reserved markers, so hit indices always land
+/// on UTF-8 character boundaries of the surrounding `String` buffer.
+#[derive(Debug, Clone, Copy, Default)]
+struct DelimCursor {
+    open: usize,
+    close: usize,
+}
+
+impl DelimCursor {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn reset(&mut self) {
+        self.open = 0;
+        self.close = 0;
+    }
+
+    /// Bytes of unresolved delimiter prefix at the tip (max of both progresses).
+    fn hold_len(self) -> usize {
+        self.open.max(self.close)
+    }
+
+    /// Feed one byte. Returns `Some` when a full delimiter completes on this byte.
+    fn feed(&mut self, b: u8) -> Option<DelimHit> {
+        self.open = advance_kmp(self.open, b, TOOL_CALL_OPEN.as_bytes(), &OPEN_FAIL);
+        self.close = advance_kmp(self.close, b, TOOL_CALL_CLOSE.as_bytes(), &CLOSE_FAIL);
+        // Close is checked first: it is the longer marker and cannot complete on
+        // the same byte as open for these two fixed patterns, but the order keeps
+        // the fail-closed stray-closer / nested-open decisions deterministic.
+        if self.close == TOOL_CALL_CLOSE.len() {
+            self.reset();
+            return Some(DelimHit::Close);
+        }
+        if self.open == TOOL_CALL_OPEN.len() {
+            self.reset();
+            return Some(DelimHit::Open);
+        }
+        None
+    }
+}
+
+/// KMP failure function: `fail[i]` = longest proper prefix of `pat[..=i]`
+/// that is also a suffix of `pat[..=i]`.
+const fn kmp_fail<const N: usize>(pat: &[u8; N]) -> [usize; N] {
+    let mut fail = [0usize; N];
+    let mut i = 1;
+    let mut j = 0;
+    while i < N {
+        if pat[i] == pat[j] {
+            j += 1;
+            fail[i] = j;
+            i += 1;
+        } else if j > 0 {
+            j = fail[j - 1];
+        } else {
+            fail[i] = 0;
+            i += 1;
+        }
+    }
+    fail
+}
+
+// Fixed markers — failure tables computed at compile time.
+const OPEN_BYTES: &[u8; 11] = b"<tool_call>";
+const CLOSE_BYTES: &[u8; 12] = b"</tool_call>";
+const OPEN_FAIL: [usize; 11] = kmp_fail(OPEN_BYTES);
+const CLOSE_FAIL: [usize; 12] = kmp_fail(CLOSE_BYTES);
+
+/// One KMP step: prior state matched `pat[..state]`; feed `b`.
+fn advance_kmp(state: usize, b: u8, pat: &[u8], fail: &[usize]) -> usize {
+    let mut s = state;
+    loop {
+        if s < pat.len() && pat[s] == b {
+            return s + 1;
+        }
+        if s == 0 {
+            return 0;
+        }
+        s = fail[s - 1];
+    }
+}
+
+/// Largest byte index ≤ `n` that does not split a multi-byte UTF-8 codepoint.
+fn utf8_safe_split(s: &str, n: usize) -> usize {
+    let bytes = s.as_bytes();
+    let mut k = n.min(bytes.len());
+    while k > 0 && k < bytes.len() && (bytes[k] & 0b1100_0000) == 0b1000_0000 {
+        k -= 1;
+    }
+    k
+}
+
+/// Strict body parser for [`ToolOutputRouter`]: fully valid JSON object with a
+/// non-empty `name`, or fully valid Qwen native XML. No Form4 / trailing-comma
+/// / empty-args fabrication. Returns `None` → caller latches MalformedToolProtocol.
+fn parse_strict_tool_call_body(body_raw: &str) -> Option<crate::prompt_frame::ToolCall> {
+    let body_clean = strip_chatml_leakage(body_raw);
+    let body = body_clean.trim();
+    if body.is_empty() {
+        return None;
+    }
+    // Nested reserved openers are rejected by the router scanner; refuse here too
+    // if a whole body still contains one (defense in depth).
+    if body.contains(TOOL_CALL_OPEN) {
+        return None;
+    }
+    // Form 1: fully valid JSON only.
+    if let Ok(val) = serde_json::from_str::<serde_json::Value>(body) {
+        let name = val
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if name.is_empty() {
+            return None;
+        }
+        let arguments = val
+            .get("arguments")
+            .cloned()
+            .unwrap_or(serde_json::Value::Object(Default::default()));
+        return Some(crate::prompt_frame::ToolCall { name, arguments });
+    }
+    // Form 3: fully valid Qwen XML (requires </function>, fully consumed params).
+    if let Some((name, arguments)) = extract_qwen_xml_tool_call_strict(body) {
+        return Some(crate::prompt_frame::ToolCall { name, arguments });
+    }
+    None
+}
+
+/// Tolerant body parser for legacy [`extract_tool_calls_from_text`].
+///
+/// Form1 strict JSON → Form3 tolerant Qwen XML → Form4 fallbacks (including
+/// brace-complete non-strict args kept with empty object). Nested openers are
+/// sanitized. Callers decide drop-on-None vs keep.
+fn parse_one_tool_call_body(body_raw: &str) -> Option<crate::prompt_frame::ToolCall> {
+    let body_clean = strip_chatml_leakage(body_raw);
+    // Strip nested `<tool_call>` openers (MQ4 attractor) — legacy only.
+    let mut body_stripped = body_clean.trim_start();
+    while body_stripped.starts_with(TOOL_CALL_OPEN) {
+        body_stripped = body_stripped[TOOL_CALL_OPEN.len()..].trim_start();
+    }
+    let body = body_stripped.trim();
+    if body.is_empty() {
+        return None;
+    }
+    // Form 1: strict JSON parse
+    let mut parsed: Option<(String, serde_json::Value)> = None;
+    if let Ok(val) = serde_json::from_str::<serde_json::Value>(body) {
+        let name = val
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if !name.is_empty() {
+            let arguments = val
+                .get("arguments")
+                .cloned()
+                .unwrap_or(serde_json::Value::Object(Default::default()));
+            parsed = Some((name, arguments));
+        }
+    }
+    // Form 3: Qwen3.5/3.6 native XML before relaxed JSON scan (tolerant).
+    if parsed.is_none() {
+        parsed = extract_qwen_xml_tool_call(body);
+    }
+    // Form 4 (regex fallback).
+    if parsed.is_none() {
+        if let Some(name) = extract_tool_call_name_fallback(body) {
+            if let Some(arguments) = extract_tool_call_arguments_fallback(body) {
+                parsed = Some((name, arguments));
+            } else if tool_call_args_object_complete(body) {
+                // Brace-balanced but non-strict JSON — keep call with empty args.
+                parsed = Some((name, serde_json::Value::Object(Default::default())));
+            }
+            // else: truncated mid-args — unrecoverable.
+        }
+    }
+    parsed.map(|(name, arguments)| crate::prompt_frame::ToolCall { name, arguments })
+}
+
+fn strip_chatml_leakage(body_raw: &str) -> String {
+    body_raw
+        .replace("<|im_start|>", "")
+        .replace("<|im_end|>", "")
+        .replace("<|endoftext|>", "")
+        .replace("<|im_sep|>", "")
+}
+
 /// Extract Hermes/ChatML `<tool_call>{json}</tool_call>` and Qwen-native XML
 /// `<tool_call><function=NAME><parameter=KEY>VALUE</parameter>...` calls from
 /// generated text. Tolerant of truncation (unclosed `<tool_call>`), ChatML
 /// special-token leakage, and stacked/nested openers (MQ4 #111 attractor
 /// shapes). Mirrors the CLI's `parseToolCalls` / `parseOneToolCall`.
+///
+/// Legacy whole-buffer helper for callers not yet on [`ToolOutputRouter`].
+/// Unclosed spans are still recovered when the body is parseable — the
+/// incremental router is strict and fails closed instead.
 pub fn extract_tool_calls_from_text(s: &str) -> Vec<crate::prompt_frame::ToolCall> {
     let mut out: Vec<crate::prompt_frame::ToolCall> = Vec::new();
     let mut search_pos = 0;
-    while let Some(open_rel) = s[search_pos..].find("<tool_call>") {
-        let body_start = search_pos + open_rel + "<tool_call>".len();
+    while let Some(open_rel) = s[search_pos..].find(TOOL_CALL_OPEN) {
+        let body_start = search_pos + open_rel + TOOL_CALL_OPEN.len();
         // Unclosed `<tool_call>` — model hit max_tokens or truncated;
-        // treat the rest of the string as the body. CLI parser does
-        // the same via the `<tool_call>\s*(.*)` regex branch. Without
-        // this, a truncated emit stores `tool_calls=0`, the CLI on the
-        // wire parses `tool_calls=1`, and the asst-turn fingerprint
-        // mismatches on echo-back → cache miss.
-        let (body_end, advance) = match s[body_start..].find("</tool_call>") {
-            Some(i) => (body_start + i, body_start + i + "</tool_call>".len()),
+        // treat the rest of the string as the body (legacy tolerant path).
+        let (body_end, advance) = match s[body_start..].find(TOOL_CALL_CLOSE) {
+            Some(i) => (body_start + i, body_start + i + TOOL_CALL_CLOSE.len()),
             None => (s.len(), s.len()),
         };
         let body_raw = &s[body_start..body_end];
-        // Sanitize ChatML special-token leakage (mirrors CLI's
-        // native parseOneToolCall-compatible sanitizer). qwen3.6:27b
-        // occasionally glues `<|im_start|>` / `<|im_end|>` / etc. into
-        // the JSON body when the tokenizer's special-token boundary
-        // catches the JSON key opener.
-        let body_clean: String = body_raw
-            .replace("<|im_start|>", "")
-            .replace("<|im_end|>", "")
-            .replace("<|endoftext|>", "")
-            .replace("<|im_sep|>", "");
-        // Strip nested `<tool_call>` openers (MQ4 attractor: model
-        // stacks 1-2 nested openers before the JSON body lands).
-        let mut body_stripped = body_clean.trim_start();
-        while body_stripped.starts_with("<tool_call>") {
-            body_stripped = body_stripped["<tool_call>".len()..].trim_start();
-        }
-        let body = body_stripped.trim();
-        if !body.is_empty() {
-            // Form 1: strict JSON parse
-            let mut parsed: Option<(String, serde_json::Value)> = None;
-            if let Ok(val) = serde_json::from_str::<serde_json::Value>(body) {
-                let name = val
-                    .get("name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                if !name.is_empty() {
-                    let arguments = val
-                        .get("arguments")
-                        .cloned()
-                        .unwrap_or(serde_json::Value::Object(Default::default()));
-                    parsed = Some((name, arguments));
-                }
-            }
-            // Form 3: Qwen3.5/3.6 native XML. Check this before the relaxed
-            // JSON scan: a write-file parameter can itself contain JSON keys
-            // named `name`/`arguments`, which must not shadow the outer XML
-            // function name.
-            if parsed.is_none() {
-                parsed = extract_qwen_xml_tool_call(body);
-            }
-            // Form 4 (regex fallback): when JSON and native XML parsing fail,
-            // recover
-            // name + arguments via a relaxed key-delimiter pattern.
-            // Mirrors the native tool-call compatibility parser.
-            if parsed.is_none() {
-                if let Some(name) = extract_tool_call_name_fallback(body) {
-                    if let Some(arguments) = extract_tool_call_arguments_fallback(body) {
-                        // Recovered a complete, strict-valid args object.
-                        parsed = Some((name, arguments));
-                    } else if tool_call_args_object_complete(body) {
-                        // The args object is present and brace-balanced but not
-                        // strict JSON (trailing comma, unquoted key, …) — a
-                        // model formatting glitch, not a truncation. Preserve
-                        // the call by name with empty args (legacy behavior).
-                        parsed = Some((name, serde_json::Value::Object(Default::default())));
-                    }
-                    // else: NO balanced args object — the call was cut off
-                    // mid-value by `max_tokens` or a grammar force-close.
-                    // Dropping it (rather than fabricating empty `{}`) keeps a
-                    // broken call from being delivered as executable: the
-                    // client would otherwise invoke e.g. `write({})` and fail
-                    // schema validation (the write-tool empty-args incident).
-                    // The truncated emission instead surfaces as content +
-                    // finish_reason so the client retries.
-                }
-            }
-            if let Some((name, arguments)) = parsed {
-                out.push(crate::prompt_frame::ToolCall { name, arguments });
-            }
+        if let Some(call) = parse_one_tool_call_body(body_raw) {
+            out.push(call);
         }
         search_pos = advance;
         if advance == s.len() {
@@ -128,14 +576,28 @@ pub fn extract_tool_calls_from_text(s: &str) -> Vec<crate::prompt_frame::ToolCal
     out
 }
 
-/// Parse Qwen3.5/3.6's native tool-call body:
+/// Parse Qwen3.5/3.6's native tool-call body (legacy-tolerant):
 /// `<function=NAME><parameter=KEY>VALUE</parameter>...</function>`.
 ///
 /// The upstream template does not XML-escape parameter values, so this parser
 /// deliberately mirrors the CLI's first-close-tag behavior. Missing parameter
 /// close tags are treated as truncation and reject the call instead of
-/// fabricating partial arguments.
+/// fabricating partial arguments. Missing `</function>` is tolerated (params
+/// scanned to end of body) for legacy whole-buffer recovery.
 fn extract_qwen_xml_tool_call(body: &str) -> Option<(String, serde_json::Value)> {
+    extract_qwen_xml_tool_call_inner(body, /*strict*/ false)
+}
+
+/// Strict Qwen XML: requires closing `</function>` and fully consumed valid
+/// parameter syntax (no trailing garbage after the last parameter).
+fn extract_qwen_xml_tool_call_strict(body: &str) -> Option<(String, serde_json::Value)> {
+    extract_qwen_xml_tool_call_inner(body, /*strict*/ true)
+}
+
+fn extract_qwen_xml_tool_call_inner(
+    body: &str,
+    strict: bool,
+) -> Option<(String, serde_json::Value)> {
     let body = body.trim_start();
     let function_body = body.strip_prefix("<function=")?;
     let name_end = function_body.find('>')?;
@@ -150,13 +612,21 @@ fn extract_qwen_xml_tool_call(body: &str) -> Option<(String, serde_json::Value)>
     }
 
     let after_name = &function_body[name_end + 1..];
-    let params_body = after_name
-        .find("</function>")
-        .map(|end| &after_name[..end])
-        .unwrap_or(after_name);
+    let (params_body, has_function_close) = match after_name.find("</function>") {
+        Some(end) => (&after_name[..end], true),
+        None => (after_name, false),
+    };
+    if strict && !has_function_close {
+        return None;
+    }
+
     let mut arguments = serde_json::Map::new();
     let mut rest = params_body;
     while let Some(open) = rest.find("<parameter=") {
+        // Strict: only whitespace may precede the next parameter tag.
+        if strict && !rest[..open].chars().all(|c| c.is_whitespace()) {
+            return None;
+        }
         rest = &rest[open + "<parameter=".len()..];
         let key_end = rest.find('>')?;
         let key = rest[..key_end].trim();
@@ -173,6 +643,19 @@ fn extract_qwen_xml_tool_call(body: &str) -> Option<(String, serde_json::Value)>
         let value = rest[..value_end].trim();
         arguments.insert(key.to_string(), coerce_qwen_xml_parameter(value));
         rest = &rest[value_end + "</parameter>".len()..];
+    }
+    // Strict: after all parameters, only whitespace may remain before </function>.
+    if strict && !rest.chars().all(|c| c.is_whitespace()) {
+        return None;
+    }
+    // Strict: nothing after </function> either.
+    if strict {
+        if let Some(end) = after_name.find("</function>") {
+            let after_close = &after_name[end + "</function>".len()..];
+            if !after_close.chars().all(|c| c.is_whitespace()) {
+                return None;
+            }
+        }
     }
 
     Some((name.to_string(), serde_json::Value::Object(arguments)))
@@ -365,7 +848,61 @@ pub fn tool_call_args_object_complete(s: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::extract_tool_calls_from_text;
+    use super::{
+        extract_tool_calls_from_text, ToolOutputRouter, ToolRouteError, ToolRouteEvent,
+        TOOL_CALL_CLOSE, TOOL_CALL_OPEN,
+    };
+    use crate::prompt_frame::ToolCall;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Terminal {
+        Ok,
+        Malformed,
+    }
+
+    /// Drive the router with chunks; collect ordered visible prose, calls, terminal.
+    fn feed(chunks: &[&str]) -> (String, Vec<ToolCall>, Terminal) {
+        let mut router = ToolOutputRouter::new();
+        let mut visible = String::new();
+        let mut calls = Vec::new();
+        let mut collect = |evs: Vec<ToolRouteEvent>| {
+            for ev in evs {
+                match ev {
+                    ToolRouteEvent::VisibleText(v) => visible.push_str(v.as_str()),
+                    ToolRouteEvent::ToolCall(c) => calls.push(c),
+                }
+            }
+        };
+        for chunk in chunks {
+            match router.push(chunk) {
+                Ok(evs) => collect(evs),
+                Err(ToolRouteError::MalformedToolProtocol { .. }) => {
+                    return (visible, calls, Terminal::Malformed);
+                }
+            }
+        }
+        match router.finish() {
+            Ok(evs) => {
+                collect(evs);
+                (visible, calls, Terminal::Ok)
+            }
+            Err(ToolRouteError::MalformedToolProtocol { .. }) => {
+                (visible, calls, Terminal::Malformed)
+            }
+        }
+    }
+
+    fn assert_no_protocol_leak(visible: &str) {
+        assert!(
+            !visible.contains("<tool_call") && !visible.contains("</tool_call>"),
+            "visible prose leaked protocol markers: {visible:?}"
+        );
+    }
+
+    fn call_eq(a: &ToolCall, b: &ToolCall) {
+        assert_eq!(a.name, b.name);
+        assert_eq!(a.arguments, b.arguments);
+    }
 
     #[test]
     fn parses_qwen_native_xml_tool_call() {
@@ -403,5 +940,498 @@ mod tests {
     fn rejects_truncated_qwen_native_xml_parameter() {
         let emitted = "<tool_call><function=write_file><parameter=path>/tmp/incomplete";
         assert!(extract_tool_calls_from_text(emitted).is_empty());
+    }
+
+    // ── ToolOutputRouter ─────────────────────────────────────────────
+
+    #[test]
+    fn router_prose_only_is_identity() {
+        let (vis, calls, term) = feed(&["just text, no tool call"]);
+        assert_eq!(vis, "just text, no tool call");
+        assert!(calls.is_empty());
+        assert_eq!(term, Terminal::Ok);
+    }
+
+    #[test]
+    fn router_split_chunks_match_single_push_for_hermes_call() {
+        let full = r#"prelude<tool_call>
+{"name": "read", "arguments": {"path": "/etc/hostname"}}
+</tool_call>tail"#;
+        let (v0, c0, t0) = feed(&[full]);
+        assert_eq!(t0, Terminal::Ok);
+        assert_eq!(v0, "preludetail");
+        assert_eq!(c0.len(), 1);
+        assert_eq!(c0[0].name, "read");
+        assert_eq!(c0[0].arguments["path"], "/etc/hostname");
+        assert_no_protocol_leak(&v0);
+
+        // Every byte boundary of the full string.
+        for split in 1..full.len() {
+            let (v, c, t) = feed(&[&full[..split], &full[split..]]);
+            assert_eq!(t, t0, "split@{split}");
+            assert_eq!(v, v0, "split@{split}");
+            assert_eq!(c.len(), c0.len(), "split@{split}");
+            for (a, b) in c.iter().zip(c0.iter()) {
+                call_eq(a, b);
+            }
+        }
+
+        // Explicit mid-marker splits.
+        let (v, c, t) = feed(&[
+            "prelude<tool_",
+            r#"call>
+{"name": "read", "arguments": {"path": "/etc/hostname"}}
+"#,
+            "</tool_call>tail",
+        ]);
+        assert_eq!(t, Terminal::Ok);
+        assert_eq!(v, v0);
+        assert_eq!(c.len(), 1);
+        call_eq(&c[0], &c0[0]);
+    }
+
+    #[test]
+    fn router_marker_byte_splits_match_whole_string() {
+        let body = r#"{"name":"x","arguments":{}}"#;
+        let full = format!("{TOOL_CALL_OPEN}{body}{TOOL_CALL_CLOSE}");
+        let (v0, c0, t0) = feed(&[full.as_str()]);
+        assert_eq!(t0, Terminal::Ok);
+        assert_eq!(c0.len(), 1);
+
+        for marker in [TOOL_CALL_OPEN, TOOL_CALL_CLOSE] {
+            let start = full.find(marker).expect("marker");
+            for k in 1..marker.len() {
+                let split = start + k;
+                let (v, c, t) = feed(&[&full[..split], &full[split..]]);
+                assert_eq!(t, t0, "marker {marker:?} k={k}");
+                assert_eq!(v, v0, "marker {marker:?} k={k}");
+                assert_eq!(c.len(), 1, "marker {marker:?} k={k}");
+                call_eq(&c[0], &c0[0]);
+            }
+        }
+    }
+
+    #[test]
+    fn router_near_miss_marker_prefixes_flush_as_prose() {
+        let (vis, calls, term) = feed(&["see <tool_", "shed> and </tool_calls> ok"]);
+        assert_eq!(term, Terminal::Ok);
+        assert!(calls.is_empty());
+        assert_eq!(vis, "see <tool_shed> and </tool_calls> ok");
+    }
+
+    #[test]
+    fn router_held_prefix_flushes_on_finish() {
+        let mut r = ToolOutputRouter::new();
+        let evs = r.push("<tool_").expect("push");
+        assert!(evs.is_empty(), "prefix must be held");
+        let fin = r.finish().expect("finish");
+        assert_eq!(fin.len(), 1);
+        match &fin[0] {
+            ToolRouteEvent::VisibleText(v) => assert_eq!(v.as_str(), "<tool_"),
+            other => panic!("expected visible, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn router_qwen_xml_matches_extract_oracle() {
+        let emitted = "<tool_call><function=write_file><parameter=path>/tmp/angle.c</parameter><parameter=content>#include <stdio.h>\nint main(void) { return 3 < 4 ? 0 : 1; }</parameter></function></tool_call>";
+        let (vis, calls, term) = feed(&[emitted]);
+        assert_eq!(term, Terminal::Ok);
+        assert_eq!(vis, "");
+        let oracle = extract_tool_calls_from_text(emitted);
+        assert_eq!(calls.len(), oracle.len());
+        call_eq(&calls[0], &oracle[0]);
+        assert_no_protocol_leak(&vis);
+    }
+
+    #[test]
+    fn router_qwen_xml_type_coercion_and_name_priority() {
+        let a = "<tool_call>\n<function=probe>\n<parameter=count>42</parameter>\n<parameter=enabled>true</parameter>\n<parameter=options>{\"mode\":\"fast\"}</parameter>\n</function>\n</tool_call>";
+        let (vis, calls, term) = feed(&[a]);
+        assert_eq!(term, Terminal::Ok);
+        assert_eq!(calls[0].arguments["count"], 42);
+        assert_eq!(calls[0].arguments["enabled"], true);
+        assert_eq!(calls[0].arguments["options"]["mode"], "fast");
+        assert_no_protocol_leak(&vis);
+
+        let b = "<tool_call><function=write_file><parameter=content>{\"name\":\"wrong\",\"arguments\":{\"x\":1}}</parameter></function></tool_call>";
+        let (_, calls, term) = feed(&[b]);
+        assert_eq!(term, Terminal::Ok);
+        assert_eq!(calls[0].name, "write_file");
+        assert_eq!(calls[0].arguments["content"]["name"], "wrong");
+    }
+
+    #[test]
+    fn router_multi_call_preserves_prose_order() {
+        let full = r#"before<tool_call>
+{"name": "a", "arguments": {"i": 1}}
+</tool_call>mid<tool_call>
+{"name": "b", "arguments": {"i": 2}}
+</tool_call>after"#;
+        let (vis, calls, term) = feed(&[full]);
+        assert_eq!(term, Terminal::Ok);
+        assert_eq!(vis, "beforemidafter");
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "a");
+        assert_eq!(calls[1].name, "b");
+        let oracle = extract_tool_calls_from_text(full);
+        assert_eq!(calls.len(), oracle.len());
+        call_eq(&calls[0], &oracle[0]);
+        call_eq(&calls[1], &oracle[1]);
+        assert_no_protocol_leak(&vis);
+
+        // Chunked across calls.
+        let (v2, c2, t2) = feed(&[
+            "before<tool_call>\n{\"name\": \"a\", \"arguments\": {\"i\": 1}}\n",
+            "</tool_call>mid",
+            "<tool_call>\n{\"name\": \"b\", \"arguments\": {\"i\": 2}}\n</tool_call>after",
+        ]);
+        assert_eq!(t2, Terminal::Ok);
+        assert_eq!(v2, vis);
+        assert_eq!(c2.len(), 2);
+    }
+
+    #[test]
+    fn router_unclosed_span_at_finish_is_malformed() {
+        // Strict router: unclosed span fails closed even if args look complete.
+        // Legacy extract_tool_calls_from_text remains tolerant for old callers.
+        let s = r#"prelude<tool_call>
+{"name": "read", "arguments": {"path": "/etc/hostname"}}"#;
+        let (vis, calls, term) = feed(&[s]);
+        assert_eq!(term, Terminal::Malformed);
+        assert!(
+            calls.is_empty(),
+            "strict router must not emit the unclosed call"
+        );
+        assert_eq!(vis, "prelude");
+        assert_no_protocol_leak(&vis);
+        // Legacy helper still recovers for untouched callers.
+        assert_eq!(extract_tool_calls_from_text(s).len(), 1);
+    }
+
+    #[test]
+    fn router_truncated_args_fail_closed() {
+        let s = "<tool_call>\n{\"name\": \"write\", \"arguments\": {\"path\": \"/tmp/big.zig\", \"content\": \"const std = @im";
+        let (vis, calls, term) = feed(&[s]);
+        assert_eq!(term, Terminal::Malformed);
+        assert!(calls.is_empty());
+        assert_no_protocol_leak(&vis);
+    }
+
+    #[test]
+    fn router_truncated_qwen_xml_parameter_fail_closed() {
+        let emitted = "<tool_call><function=write_file><parameter=path>/tmp/incomplete";
+        let (vis, calls, term) = feed(&[emitted]);
+        assert_eq!(term, Terminal::Malformed);
+        assert!(calls.is_empty());
+        assert_no_protocol_leak(&vis);
+    }
+
+    #[test]
+    fn router_empty_body_fail_closed() {
+        let (vis, calls, term) = feed(&["<tool_call></tool_call>"]);
+        assert_eq!(term, Terminal::Malformed);
+        assert!(calls.is_empty());
+        assert_no_protocol_leak(&vis);
+    }
+
+    #[test]
+    fn router_stray_closer_fail_closed() {
+        let (vis, calls, term) = feed(&["oops</tool_call>"]);
+        assert_eq!(term, Terminal::Malformed);
+        assert!(calls.is_empty());
+        assert_eq!(vis, "oops");
+        assert_no_protocol_leak(&vis);
+    }
+
+    #[test]
+    fn router_chatml_leakage_still_accepts_strict_json() {
+        let s = "<tool_call>\n<|im_start|>{\"name\": \"read\", \"arguments\": {\"path\": \"/x\"}}<|im_end|>\n</tool_call>";
+        let (vis, calls, term) = feed(&[s]);
+        assert_eq!(term, Terminal::Ok);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "read");
+        assert_no_protocol_leak(&vis);
+    }
+
+    #[test]
+    fn router_one_byte_chunks_match_whole_string() {
+        let full = r#"α-prelude<tool_call>
+{"name": "read", "arguments": {"path": "/etc/hostname"}}
+</tool_call>β-tail"#;
+        let (v0, c0, t0) = feed(&[full]);
+        assert_eq!(t0, Terminal::Ok);
+        assert_eq!(v0, "α-preludeβ-tail");
+        assert_eq!(c0.len(), 1);
+        assert_eq!(c0[0].name, "read");
+
+        // Char-at-a-time feed (ASCII body/markers one byte; multibyte scalars whole).
+        let mut router = ToolOutputRouter::new();
+        let mut visible = String::new();
+        let mut calls = Vec::new();
+        let mut collect = |evs: Vec<ToolRouteEvent>| {
+            for ev in evs {
+                match ev {
+                    ToolRouteEvent::VisibleText(v) => visible.push_str(v.as_str()),
+                    ToolRouteEvent::ToolCall(c) => calls.push(c),
+                }
+            }
+        };
+        let mut i = 0;
+        let bytes = full.as_bytes();
+        while i < bytes.len() {
+            let ch_len = if bytes[i] < 0x80 {
+                1
+            } else if bytes[i] < 0xE0 {
+                2
+            } else if bytes[i] < 0xF0 {
+                3
+            } else {
+                4
+            };
+            let piece = std::str::from_utf8(&bytes[i..i + ch_len]).expect("utf8");
+            match router.push(piece) {
+                Ok(evs) => collect(evs),
+                Err(ToolRouteError::MalformedToolProtocol { .. }) => {
+                    panic!("one-byte feed malformed early at i={i}");
+                }
+            }
+            i += ch_len;
+        }
+        match router.finish() {
+            Ok(evs) => collect(evs),
+            Err(e) => panic!("finish: {e}"),
+        }
+        assert_eq!(visible, v0);
+        assert_eq!(calls.len(), 1);
+        call_eq(&calls[0], &c0[0]);
+    }
+
+    #[test]
+    fn router_one_byte_ascii_stream_no_mid_char_index() {
+        // Pure ASCII so every byte is its own &str chunk — matcher must not
+        // panic or disagree with the whole-string path.
+        let full = "pre<tool_call>{\"name\":\"x\",\"arguments\":{}}</tool_call>post";
+        let (v0, c0, t0) = feed(&[full]);
+        assert_eq!(t0, Terminal::Ok);
+        assert_eq!(c0.len(), 1);
+
+        let byte_chunks: Vec<String> = full.bytes().map(|b| (b as char).to_string()).collect();
+        let refs: Vec<&str> = byte_chunks.iter().map(|s| s.as_str()).collect();
+        let (v, c, t) = feed(&refs);
+        assert_eq!(t, t0);
+        assert_eq!(v, v0);
+        assert_eq!(c.len(), 1);
+        call_eq(&c[0], &c0[0]);
+    }
+
+    #[test]
+    fn router_multibyte_utf8_before_and_inside_body_chunked() {
+        // Multibyte scalars immediately before opener, inside JSON string args,
+        // and immediately after closer — split so chunk boundaries fall on
+        // delimiter windows after multibyte content.
+        let full = "说<tool_call>{\"name\":\"写\",\"arguments\":{\"p\":\"路径/α\"}}</tool_call>完";
+        let (v0, c0, t0) = feed(&[full]);
+        assert_eq!(t0, Terminal::Ok);
+        assert_eq!(v0, "说完");
+        assert_eq!(c0.len(), 1);
+        assert_eq!(c0[0].name, "写");
+        assert_eq!(c0[0].arguments["p"], "路径/α");
+
+        // Char-at-a-time (multibyte codepoints stay whole for &str).
+        let chars: Vec<String> = full.chars().map(|c| c.to_string()).collect();
+        let refs: Vec<&str> = chars.iter().map(|s| s.as_str()).collect();
+        let (v, c, t) = feed(&refs);
+        assert_eq!(t, t0);
+        assert_eq!(v, v0);
+        assert_eq!(c.len(), 1);
+        call_eq(&c[0], &c0[0]);
+
+        // Split so the first chunk ends on the last byte of the multibyte
+        // scalar immediately before `<tool_call>`, and the second begins at `<`.
+        let open_at = full.find(TOOL_CALL_OPEN).expect("open");
+        let (v2, c2, t2) = feed(&[&full[..open_at], &full[open_at..]]);
+        assert_eq!(t2, t0);
+        assert_eq!(v2, v0);
+        assert_eq!(c2.len(), 1);
+        call_eq(&c2[0], &c0[0]);
+
+        // Split inside the closer after multibyte body content has been seen.
+        let close_at = full.find(TOOL_CALL_CLOSE).expect("close");
+        for k in 1..TOOL_CALL_CLOSE.len() {
+            let split = close_at + k;
+            let (v3, c3, t3) = feed(&[&full[..split], &full[split..]]);
+            assert_eq!(t3, t0, "close-split k={k}");
+            assert_eq!(v3, v0, "close-split k={k}");
+            assert_eq!(c3.len(), 1, "close-split k={k}");
+            call_eq(&c3[0], &c0[0]);
+        }
+    }
+
+    #[test]
+    fn router_nested_opener_one_byte_chunks_fail_closed() {
+        let nested = "<tool_call>{\"name\":\"a\",\"arguments\":{}}<tool_call>{\"name\":\"b\",\"arguments\":{}}</tool_call>";
+        let (v0, c0, t0) = feed(&[nested]);
+        assert_eq!(t0, Terminal::Malformed);
+        assert!(c0.is_empty());
+        assert_no_protocol_leak(&v0);
+
+        let byte_chunks: Vec<String> = nested.bytes().map(|b| (b as char).to_string()).collect();
+        let refs: Vec<&str> = byte_chunks.iter().map(|s| s.as_str()).collect();
+        let (v, c, t) = feed(&refs);
+        assert_eq!(t, Terminal::Malformed);
+        assert!(c.is_empty());
+        assert_no_protocol_leak(&v);
+    }
+
+    #[test]
+    fn router_nested_opener_split_every_prefix_fail_closed() {
+        // Nested opener assembled one prefix length at a time after a real open.
+        let prefix = "<tool_call>{\"name\":\"a\",\"arguments\":{}}";
+        let nested_open = TOOL_CALL_OPEN;
+        let rest = "{\"name\":\"b\",\"arguments\":{}}</tool_call>";
+        for k in 1..nested_open.len() {
+            let (vis, calls, term) = feed(&[prefix, &nested_open[..k], &nested_open[k..], rest]);
+            assert_eq!(term, Terminal::Malformed, "k={k}");
+            assert!(calls.is_empty(), "k={k}");
+            assert_no_protocol_leak(&vis);
+        }
+    }
+
+    #[test]
+    fn delim_cursor_matches_open_and_close_bytewise() {
+        // Direct unit check: each newly fed byte advances state once; full
+        // markers report Open/Close; partial prefixes hold without completing.
+        let mut c = super::DelimCursor::new();
+        for (i, b) in TOOL_CALL_OPEN.bytes().enumerate() {
+            let hit = c.feed(b);
+            if i + 1 < TOOL_CALL_OPEN.len() {
+                assert!(hit.is_none(), "early open hit at {i}");
+                assert_eq!(c.hold_len(), i + 1);
+            } else {
+                assert_eq!(hit, Some(super::DelimHit::Open));
+                assert_eq!(c.hold_len(), 0);
+            }
+        }
+        for (i, b) in TOOL_CALL_CLOSE.bytes().enumerate() {
+            let hit = c.feed(b);
+            if i + 1 < TOOL_CALL_CLOSE.len() {
+                assert!(hit.is_none(), "early close hit at {i}");
+                assert!(c.hold_len() >= 1);
+            } else {
+                assert_eq!(hit, Some(super::DelimHit::Close));
+            }
+        }
+        // Near-miss does not stick a false open.
+        let mut c = super::DelimCursor::new();
+        for b in b"<tool_shed>" {
+            assert!(c.feed(*b).is_none());
+        }
+        assert_eq!(c.hold_len(), 0);
+    }
+
+    #[test]
+    fn router_nested_opener_fail_closed() {
+        let nested = r#"<tool_call>
+<tool_call>
+{"name": "read", "arguments": {"path": "/x"}}
+</tool_call>"#;
+        let (vis, calls, term) = feed(&[nested]);
+        assert_eq!(term, Terminal::Malformed);
+        assert!(calls.is_empty(), "nested reserved opener must not execute");
+        assert_no_protocol_leak(&vis);
+        // Legacy extract still sanitizes stacked openers for old callers.
+        assert_eq!(extract_tool_calls_from_text(nested).len(), 1);
+    }
+
+    #[test]
+    fn router_nested_opener_split_across_chunks_fail_closed() {
+        let (vis, calls, term) = feed(&[
+            "<tool_call>\n{\"name\": \"a\", \"arguments\": {}}\n",
+            "<tool_",
+            "call>\n{\"name\": \"b\", \"arguments\": {}}\n</tool_call>",
+        ]);
+        assert_eq!(term, Terminal::Malformed);
+        assert!(calls.is_empty());
+        assert_no_protocol_leak(&vis);
+    }
+
+    #[test]
+    fn router_loose_json_fail_closed_legacy_recovers() {
+        // Strict router: only fully valid JSON / Qwen XML. Form4 stays legacy-only.
+        let s =
+            "<tool_call>\nname\": \"read\", \"arguments\": {\"path\": \"/tmp/x\"}\n</tool_call>";
+        let (vis, calls, term) = feed(&[s]);
+        assert_eq!(term, Terminal::Malformed);
+        assert!(calls.is_empty());
+        assert_no_protocol_leak(&vis);
+        let legacy = extract_tool_calls_from_text(s);
+        assert_eq!(legacy.len(), 1);
+        assert_eq!(legacy[0].name, "read");
+        assert_eq!(legacy[0].arguments["path"], "/tmp/x");
+    }
+
+    #[test]
+    fn router_trailing_comma_fail_closed_legacy_keeps() {
+        // Trailing comma is invalid JSON — strict router fails closed; legacy Form4 keeps.
+        let s = r#"<tool_call>
+{"name": "read", "arguments": {"path": "/tmp/x",}}
+</tool_call>"#;
+        let (vis, calls, term) = feed(&[s]);
+        assert_eq!(term, Terminal::Malformed);
+        assert!(calls.is_empty(), "strict must not fabricate empty args");
+        assert_no_protocol_leak(&vis);
+        let legacy = extract_tool_calls_from_text(s);
+        assert_eq!(legacy.len(), 1);
+        assert_eq!(legacy[0].name, "read");
+    }
+
+    #[test]
+    fn router_qwen_xml_missing_function_close_fail_closed() {
+        let s = "<tool_call><function=write_file><parameter=path>/tmp/x</parameter></tool_call>";
+        let (vis, calls, term) = feed(&[s]);
+        assert_eq!(term, Terminal::Malformed);
+        assert!(calls.is_empty());
+        assert_no_protocol_leak(&vis);
+    }
+
+    #[test]
+    fn router_qwen_xml_trailing_garbage_after_params_fail_closed() {
+        let s = "<tool_call><function=write_file><parameter=path>/tmp/x</parameter>TRAIL</function></tool_call>";
+        let (vis, calls, term) = feed(&[s]);
+        assert_eq!(term, Terminal::Malformed);
+        assert!(calls.is_empty());
+        assert_no_protocol_leak(&vis);
+    }
+
+    #[test]
+    fn router_visible_text_never_includes_call_body() {
+        let full = r#"Hi.<tool_call>
+{"name": "bash", "arguments": {"cmd": "echo hi"}}
+</tool_call>Bye."#;
+        let (vis, calls, term) = feed(&[full]);
+        assert_eq!(term, Terminal::Ok);
+        assert_eq!(vis, "Hi.Bye.");
+        assert_eq!(calls.len(), 1);
+        assert!(!vis.contains("bash"));
+        assert!(!vis.contains("echo hi"));
+        assert!(!vis.contains("arguments"));
+        assert_no_protocol_leak(&vis);
+    }
+
+    #[test]
+    fn router_fresh_has_empty_tool_calls() {
+        let r = ToolOutputRouter::new();
+        assert!(r.tool_calls().is_empty());
+        assert!(!r.is_malformed());
+    }
+
+    #[test]
+    fn router_malformed_latches_on_subsequent_push() {
+        let mut r = ToolOutputRouter::new();
+        let err = r.push("<tool_call></tool_call>").expect_err("empty body");
+        assert!(matches!(err, ToolRouteError::MalformedToolProtocol { .. }));
+        let err2 = r.push("more").expect_err("latched");
+        assert_eq!(err2.detail(), err.detail());
     }
 }

@@ -16,62 +16,240 @@ use std::thread;
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
 
-/// Copy .hsaco and .hash files from the persistent install location (cold)
-/// into the tmpfs hot path. Used once at KernelCompiler startup to seed the
-/// hot path after reboot (when /tmp gets cleared) without forcing a full
-/// recompile. Returns on first IO failure without rolling back — the caller
-/// falls back to reading from the cold dir directly.
+/// True when `a` and `b` name the same filesystem object. Lexical equality is
+/// checked first; if both paths exist, canonicalization also equates aliases
+/// (symlinks, `.` / `..` segments) so two-directory logic never treats one
+/// underlying dir as two targets.
+fn same_path(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(ca), Ok(cb)) => ca == cb,
+        _ => false,
+    }
+}
+
+/// True when `path` is an existing nonempty regular file (usable HSACO blob).
+fn nonempty_blob(path: &Path) -> bool {
+    std::fs::metadata(path)
+        .map(|m| m.is_file() && m.len() > 0)
+        .unwrap_or(false)
+}
+
+/// Unique same-dir staging token (pid + counter + nanos) for parallel-safe temps.
+fn unique_token() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("{}_{n}_{nanos}", std::process::id())
+}
+
+/// Validated pair: nonempty regular HSACO **and** matching hash sidecar.
+/// A hash alone never certifies a missing/empty/directory blob. A blob alone
+/// is never treated as hash-validated.
+fn pair_valid(hsaco: &Path, hash: &Path, src_hash: &str) -> bool {
+    if !nonempty_blob(hsaco) {
+        return false;
+    }
+    hash.exists() && {
+        let stored = std::fs::read_to_string(hash).unwrap_or_default();
+        stored.trim() == src_hash
+    }
+}
+
+/// Transactionally publish a blob+hash pair into `dest_dir`.
 ///
-/// Skip rule: if the hot dir already has BOTH a .hsaco AND a matching .hash
-/// for this kernel, that pair was JIT-validated against the current source
-/// (the .hash file is only written after a successful compile()), so it must
-/// NOT be overwritten by a potentially-stale cold blob. Without this guard,
-/// a cold blob whose size differs from the hot one (e.g. checked-in
-/// kernels/compiled/<arch>/foo.hsaco produced by an older ROCm or a stale
-/// source revision) silently downgrades the freshly-JIT'd hot blob on every
-/// process startup. We saw this on gfx906 wave64 FP16 hybrid kernels: same
-/// source, same hipcc, but the cold blob ran ~2× slower than the hot one.
+/// Staging uses same-directory temps so `rename` is atomic on one volume.
+/// Order: stage blob → verify nonempty → stage hash → **invalidate old hash**
+/// → publish blob → publish hash. A crash mid-publish never leaves a hash that
+/// certifies a missing/wrong-generation blob. `force` replaces even when the
+/// destination pair already matches `src_hash`.
+///
+/// When `src_blob` is already the destination blob path, only the hash sidecar
+/// is repaired (still via stage+rename). Never copies a path onto itself.
+fn publish_pair(
+    dest_dir: &Path,
+    name: &str,
+    src_blob: &Path,
+    src_hash: &str,
+    force: bool,
+) -> Result<(), String> {
+    let dest_hsaco = dest_dir.join(format!("{name}.hsaco"));
+    let dest_hash = dest_dir.join(format!("{name}.hash"));
+
+    if !force && pair_valid(&dest_hsaco, &dest_hash, src_hash) {
+        return Ok(());
+    }
+
+    if !nonempty_blob(src_blob) {
+        return Err(format!("{name}: source blob missing or empty"));
+    }
+
+    let token = unique_token();
+    let tmp_hsaco = dest_dir.join(format!(".{name}.{token}.hsaco.tmp"));
+    let tmp_hash = dest_dir.join(format!(".{name}.{token}.hash.tmp"));
+    let cleanup = || {
+        let _ = std::fs::remove_file(&tmp_hsaco);
+        let _ = std::fs::remove_file(&tmp_hash);
+    };
+
+    let same_blob = same_path(src_blob, &dest_hsaco);
+
+    if !same_blob {
+        if let Err(e) = std::fs::copy(src_blob, &tmp_hsaco) {
+            cleanup();
+            return Err(format!("{name}: blob stage failed ({e})"));
+        }
+        if !nonempty_blob(&tmp_hsaco) {
+            cleanup();
+            return Err(format!("{name}: staged blob empty"));
+        }
+    }
+
+    if let Err(e) = std::fs::write(&tmp_hash, src_hash) {
+        cleanup();
+        return Err(format!("{name}: hash stage failed ({e})"));
+    }
+
+    // Invalidate old hash before publishing a replacement blob so an old
+    // sidecar can never certify a new generation.
+    let _ = std::fs::remove_file(&dest_hash);
+
+    if !same_blob {
+        if let Err(e) = std::fs::rename(&tmp_hsaco, &dest_hsaco) {
+            cleanup();
+            return Err(format!("{name}: blob publish failed ({e})"));
+        }
+    }
+
+    if let Err(e) = std::fs::rename(&tmp_hash, &dest_hash) {
+        let _ = std::fs::remove_file(&tmp_hash);
+        return Err(format!("{name}: hash publish failed ({e})"));
+    }
+
+    Ok(())
+}
+
+/// Publish only a nonempty blob into `dest_dir`, removing any orphan hash so
+/// it cannot certify the copied content. Used for hashless cold seed fallback.
+fn publish_blob_only(dest_dir: &Path, name: &str, src_blob: &Path) -> Result<(), String> {
+    let dest_hsaco = dest_dir.join(format!("{name}.hsaco"));
+    let dest_hash = dest_dir.join(format!("{name}.hash"));
+
+    if !nonempty_blob(src_blob) {
+        return Err(format!("{name}: source blob missing or empty"));
+    }
+    if same_path(src_blob, &dest_hsaco) {
+        // Drop orphan hash that would certify this blob under the wrong key.
+        let _ = std::fs::remove_file(&dest_hash);
+        return Ok(());
+    }
+
+    let token = unique_token();
+    let tmp_hsaco = dest_dir.join(format!(".{name}.{token}.hsaco.tmp"));
+    if let Err(e) = std::fs::copy(src_blob, &tmp_hsaco) {
+        let _ = std::fs::remove_file(&tmp_hsaco);
+        return Err(format!("{name}: blob stage failed ({e})"));
+    }
+    if !nonempty_blob(&tmp_hsaco) {
+        let _ = std::fs::remove_file(&tmp_hsaco);
+        return Err(format!("{name}: staged blob empty"));
+    }
+
+    // Remove hash before blob publish so it cannot certify the new content.
+    let _ = std::fs::remove_file(&dest_hash);
+
+    if let Err(e) = std::fs::rename(&tmp_hsaco, &dest_hsaco) {
+        let _ = std::fs::remove_file(&tmp_hsaco);
+        return Err(format!("{name}: blob publish failed ({e})"));
+    }
+    Ok(())
+}
+
+/// Copy a validated hot `.hsaco` into the persistent cold install dir, then
+/// publish the matching `.hash` only after the blob is published.
+///
+/// When `force` is false, a cold pair that is already valid for `src_hash` is
+/// left alone. When `force` is true (post-recompile after a driver-rejected
+/// image), the cold pair is replaced even if its hash already matched.
+///
+/// Optional: never fails the caller. Never copies a path onto itself.
+/// Unwritable cold dirs only warn — hot runtime remains valid.
+fn writeback_cold(name: &str, obj_path: &Path, src_hash: &str, cold: &Path, force: bool) {
+    if let Err(e) = publish_pair(cold, name, obj_path, src_hash, force) {
+        eprintln!(
+            "  WARNING: {name}: cold writeback failed ({e}); \
+             runtime blob remains valid in the hot cache"
+        );
+    }
+}
+
+/// Seed hot from cold using **complete kernel pairs**, never independent
+/// entry-by-entry copies.
+///
+/// - Orphan cold hashes and empty/directory blobs are ignored.
+/// - Skip only when hot is already a nonempty pair with the **same** cold hash.
+/// - Pair replacement publishes blob then hash as a unit (via `publish_pair`).
+/// - Hashless nonempty cold may seed only when hot has no validated pair, and
+///   any orphan hot hash is removed before the blob is published.
 fn seed_hot_from_cold(cold: &Path, hot: &Path) -> std::io::Result<()> {
+    if same_path(cold, hot) {
+        return Ok(());
+    }
     std::fs::create_dir_all(hot)?;
+
     for entry in std::fs::read_dir(cold)? {
         let entry = entry?;
         let src = entry.path();
         let ext = src.extension().and_then(|s| s.to_str()).unwrap_or("");
-        if ext != "hsaco" && ext != "hash" {
+        // Blob-centric: never iterate orphan .hash files as seed units.
+        if ext != "hsaco" {
             continue;
         }
-        let name = match src.file_name() {
-            Some(n) => n,
-            None => continue,
+        if !nonempty_blob(&src) {
+            continue;
+        }
+        let stem = match src.file_stem().and_then(|s| s.to_str()) {
+            Some(s) if !s.is_empty() && !s.starts_with('.') => s,
+            _ => continue,
         };
-        let dst = hot.join(name);
 
-        // Don't clobber a JIT-validated hot pair. A .hash is only written by
-        // a successful KernelCompiler::compile() against the current source,
-        // so if both .hsaco AND .hash exist in hot, that pair is the source
-        // of truth — keep it regardless of size.
-        let stem = src.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-        if !stem.is_empty() {
-            let hot_hsaco = hot.join(format!("{stem}.hsaco"));
-            let hot_hash = hot.join(format!("{stem}.hash"));
-            if hot_hsaco.exists() && hot_hash.exists() {
-                continue;
+        let cold_hash_path = cold.join(format!("{stem}.hash"));
+        let hot_hsaco = hot.join(format!("{stem}.hsaco"));
+        let hot_hash = hot.join(format!("{stem}.hash"));
+
+        let cold_hash = std::fs::read_to_string(&cold_hash_path)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+
+        match &cold_hash {
+            Some(h) => {
+                // Complete cold pair: skip only when hot already matches that hash.
+                if pair_valid(&hot_hsaco, &hot_hash, h) {
+                    continue;
+                }
+                if let Err(e) = publish_pair(hot, stem, &src, h, true) {
+                    return Err(std::io::Error::other(e));
+                }
+            }
+            None => {
+                // Hashless cold fallback: only when hot has no validated pair
+                // (nonempty blob + any hash sidecar written by a prior compile).
+                let hot_has_validated_pair = nonempty_blob(&hot_hsaco) && hot_hash.exists();
+                if hot_has_validated_pair {
+                    continue;
+                }
+                if let Err(e) = publish_blob_only(hot, stem, &src) {
+                    return Err(std::io::Error::other(e));
+                }
             }
         }
-
-        // Otherwise: skip if destination already exists with the same size.
-        // We don't compare mtime because std::fs::copy doesn't preserve it —
-        // the destination mtime is the copy time, which is always later than
-        // the src mtime after an update. `hipfire update` wipes both dirs
-        // before re-copy, so a same-size dst without a paired .hash is a
-        // fresh seed from this install. Different size means an install
-        // pulled in an updated cold blob and we should refresh hot to match.
-        if let (Ok(s_meta), Ok(d_meta)) = (std::fs::metadata(&src), std::fs::metadata(&dst)) {
-            if s_meta.len() == d_meta.len() {
-                continue;
-            }
-        }
-        std::fs::copy(&src, &dst)?;
     }
     Ok(())
 }
@@ -79,15 +257,30 @@ fn seed_hot_from_cold(cold: &Path, hot: &Path) -> std::io::Result<()> {
 /// Cache-key version. Bump when the kernel ABI or hipcc invocation changes in a
 /// way that makes previously-cached `.hsaco` blobs incompatible, to force a clean
 /// recompile instead of loading a stale "invalid device image".
-const KERNEL_CACHE_ABI: u32 = 1;
+const KERNEL_CACHE_ABI: u32 = 2;
 
 /// Compiles HIP kernel sources to code objects, with caching.
-/// Tries pre-compiled blobs first (kernels/compiled/{arch}/), falls back to hipcc.
+///
+/// Two-directory contract:
+/// - **hot** (`cache_dir`): per-process JIT workspace (`.hipfire_kernels/{arch}`
+///   by default). Preferred for lookup after seeding.
+/// - **cold** (`cold_dir`): persistent install location
+///   (`kernels/compiled/{arch}` under the installed binary). Writeback target
+///   so install-time / post-update recompiles refresh the blobs that seed the
+///   next process. Distinct from hot; must not be collapsed into the lookup dir.
+///
+/// `precompiled_dir` is the lookup view: hot when it has blobs, otherwise cold.
+/// Tries that first (with hash validation), falls back to hipcc into hot, then
+/// writeback to cold.
 pub struct KernelCompiler {
     cache_dir: PathBuf,
     arch: String,
     compiled: HashMap<String, PathBuf>,
+    /// Lookup directory for pre-compiled blobs (hot when seeded, else cold).
     precompiled_dir: Option<PathBuf>,
+    /// Persistent install dir (`kernels/compiled/{arch}`). Writeback target;
+    /// kept even when lookup prefers the hot path.
+    cold_dir: Option<PathBuf>,
     has_hipcc: bool,
     pub extra_flags: String,
     /// Exact gfx1151 JIT module names compiled in CU mode. This is an
@@ -98,6 +291,12 @@ pub struct KernelCompiler {
     /// hash so blobs built by a different compiler/ROCm don't get reused across
     /// builds sharing one `.hipfire_kernels` dir (the "invalid device image" trap).
     toolchain_id: String,
+    /// Resolved device-compiler binary. Bare "hipcc" when PATH provides it;
+    /// otherwise an absolute path discovered under a resolved ROCm root.
+    hipcc_bin: std::path::PathBuf,
+    /// ROCM_PATH handed to the spawned compiler so it can find its own LLVM.
+    /// None when the environment already sets it.
+    rocm_env_root: Option<std::path::PathBuf>,
 }
 
 impl KernelCompiler {
@@ -149,22 +348,26 @@ impl KernelCompiler {
                     .filter(|p| p.is_dir())
             });
 
-        // Seed the tmpfs hot path from the persistent install location. /tmp
-        // dies on reboot but the install blobs don't, so first-daemon-after-
-        // boot copies them in. Subsequent daemons see a warm /tmp and skip
-        // this. Copy is incremental — only copies files not already present
-        // (or with stale hash) to avoid churn when both locations agree.
-        // `hipfire update` wipes BOTH /tmp and the install dir, so after an
-        // update + restart we get a fully-fresh re-seed.
+        // Seed the hot path from the persistent install location. Cold survives
+        // reboots / process restarts; hot may not (or may be worktree-local).
+        // Copy is incremental — only copies files not already present as a
+        // JIT-validated hot pair (see seed_hot_from_cold skip rule).
+        // Stale pairs are not wiped by update: hash mismatch in compile()
+        // triggers hipcc and writeback refreshes cold in place.
         // cache_dir is already arch-keyed; the hot dir IS the cache dir.
+        let cold_dir = precompiled_dir;
         let hot_dir = cache_dir.clone();
-        if let Some(ref cold) = precompiled_dir {
+        if let Some(cold) = &cold_dir {
             if let Err(e) = seed_hot_from_cold(cold, &hot_dir) {
-                eprintln!("  hot-path seed failed at {} ({e}) — falling back to install dir reads", hot_dir.display());
+                eprintln!(
+                    "  hot-path seed failed at {} ({e}) — falling back to install dir reads",
+                    hot_dir.display()
+                );
             }
         }
-        // Prefer the hot-path (tmpfs) dir when it exists and has contents.
-        // This is what the `compile()` lookup uses from here on.
+        // Prefer the hot-path dir when it exists and has contents.
+        // This is what the `compile()` lookup uses from here on. Cold stays
+        // on `cold_dir` for writeback even when lookup points at hot.
         let effective_precompiled = if hot_dir.is_dir()
             && std::fs::read_dir(&hot_dir)
                 .map(|mut it| {
@@ -177,7 +380,7 @@ impl KernelCompiler {
         {
             Some(hot_dir.clone())
         } else {
-            precompiled_dir.clone()
+            cold_dir.clone()
         };
 
         if let Some(ref dir) = effective_precompiled {
@@ -187,7 +390,52 @@ impl KernelCompiler {
 
         // Probe for hipcc once at init, not per-kernel. Capture its version line
         // as a toolchain fingerprint for the cache hash (Fix #1).
-        let hipcc_out = Command::new("hipcc").arg("--version").output().ok();
+        //
+        // Resolve hipcc through the same selected ROCm root as the runtime and
+        // headers. Probing a bare PATH hipcc first could pair a configured
+        // ROCM_PATH from one version with another version's compiler.
+        let resolved_hipcc = hipfire_config::rocm::tool("hipcc");
+        let hipcc_bin = resolved_hipcc
+            .clone()
+            .unwrap_or_else(|| std::path::PathBuf::from("hipcc"));
+        // hipcc resolves its LLVM as $ROCM_PATH/lib/llvm/bin/clang++ and
+        // ROCM_PATH defaults to /opt/rocm. On a root elsewhere the probe below
+        // still succeeds while every real compile fails, so hand the child the
+        // selected compiler's installation root unless the operator already
+        // set one that matches.
+        let rocm_env_root = hipfire_config::rocm::compiler_env_root(&hipcc_bin);
+
+        // HIPFIRE_NO_DEVICE_COMPILER=1 makes the engine behave as if no device
+        // compiler exists, so pre-compiled blobs are used verbatim instead of
+        // being recompiled locally.
+        //
+        // This has to be an explicit switch. It used to be achievable by
+        // removing the compiler from PATH, because the probe was a bare
+        // `Command::new("hipcc")`. Resolved-root discovery (added so a ROCm
+        // rooted outside /opt/rocm still works) finds the compiler regardless
+        // of PATH, which silently defeated PATH-shadowing and made
+        // "pin these exact code objects" quietly recompile instead. Verified:
+        // a pinned cross-machine run reported 0 recompiles while actually
+        // executing locally-built blobs.
+        let compiler_disabled = hipfire_config::developer_var_os("HIPFIRE_NO_DEVICE_COMPILER")
+            .is_some_and(|v| v != "0" && !v.is_empty());
+
+        let hipcc_out = if compiler_disabled {
+            eprintln!(
+                "  HIPFIRE_NO_DEVICE_COMPILER set — treating the device compiler as absent; \
+                 pre-compiled blobs will be used verbatim"
+            );
+            None
+        } else if resolved_hipcc.is_none() {
+            None
+        } else {
+            let mut probe = Command::new(&hipcc_bin);
+            probe.arg("--version");
+            if let Some(ref root) = rocm_env_root {
+                probe.env("ROCM_PATH", root);
+            }
+            probe.output().ok()
+        };
         let has_hipcc = hipcc_out
             .as_ref()
             .map(|o| o.status.success())
@@ -218,10 +466,7 @@ impl KernelCompiler {
         if !gfx1151_cumode_modules.is_empty() {
             let mut modules = gfx1151_cumode_modules.iter().cloned().collect::<Vec<_>>();
             modules.sort();
-            eprintln!(
-                "  gfx1151 CU-mode modules: {}",
-                modules.join(",")
-            );
+            eprintln!("  gfx1151 CU-mode modules: {}", modules.join(","));
         }
 
         Ok(Self {
@@ -229,7 +474,10 @@ impl KernelCompiler {
             arch: arch.to_string(),
             compiled: HashMap::new(),
             precompiled_dir,
+            cold_dir,
             has_hipcc,
+            hipcc_bin,
+            rocm_env_root,
             extra_flags,
             gfx1151_cumode_modules,
             toolchain_id,
@@ -276,6 +524,24 @@ impl KernelCompiler {
         format!("{:016x}", hasher.finish())
     }
 
+    /// Persistent install dir for writeback. None when no cold location was
+    /// probed, or when it coincides with the hot cache (nothing extra to sync).
+    fn writeback_dir(&self) -> Option<&Path> {
+        self.cold_dir
+            .as_deref()
+            .filter(|d| !same_path(d, self.cache_dir.as_path()))
+    }
+
+    fn compiler_unavailable_error(&self, name: &str, action: &str) -> hip_bridge::HipError {
+        let tried = vec![self.hipcc_bin.display().to_string()];
+        let guidance =
+            hipfire_config::rocm::resolution_failure("the ROCm HIP compiler (hipcc)", &tried);
+        hip_bridge::HipError::new(
+            0,
+            &format!("{name}: {action}, but hipcc is unavailable.\n{guidance}"),
+        )
+    }
+
     /// Compile a HIP kernel source string. Returns path to .hsaco file.
     /// Tries pre-compiled blob first (with hash validation), falls back to hipcc.
     pub fn compile(&mut self, name: &str, source: &str) -> HipResult<&Path> {
@@ -290,26 +556,30 @@ impl KernelCompiler {
         let module_flags = self.module_flags(name);
         let src_hash = self.cache_hash(name, source);
 
-        // Try pre-compiled .hsaco first, validating with a .hash sidecar file.
-        // If hash is missing/mismatched AND hipcc is available, prefer recompilation.
-        // If hipcc is unavailable (packaged install), use the blob as-is.
-        // See: https://github.com/Kaden-Schutt/hipfire/issues/2
-        if let Some(ref dir) = self.precompiled_dir {
+        // Try pre-compiled .hsaco first. A hit requires a nonempty regular blob;
+        // matching hash certifies it. Hashless/mismatched nonempty blobs may be
+        // used only when hipcc is unavailable (packaged install), with warning.
+        // See: https://github.com/warpfront/hipfire/issues/2
+        if let Some(dir) = &self.precompiled_dir {
             let precompiled = dir.join(format!("{name}.hsaco"));
             let hash_file = dir.join(format!("{name}.hash"));
-            if precompiled.exists() {
-                let hash_ok = hash_file.exists() && {
-                    let stored = std::fs::read_to_string(&hash_file).unwrap_or_default();
-                    stored.trim() == src_hash
-                };
-                if hash_ok {
-                    self.compiled.insert(name.to_string(), precompiled);
-                    return Ok(&self.compiled[name]);
+            if pair_valid(&precompiled, &hash_file, &src_hash) {
+                // Validated pair still refreshes a distinct cold install dir when
+                // that pair is missing, empty, or stale.
+                if let Some(cold) = self.writeback_dir().map(Path::to_path_buf) {
+                    writeback_cold(name, &precompiled, &src_hash, &cold, false);
                 }
-                // No valid hash — only reject if hipcc can recompile
+                self.compiled.insert(name.to_string(), precompiled);
+                return Ok(&self.compiled[name]);
+            }
+            if nonempty_blob(&precompiled) {
                 if !self.has_hipcc {
-                    eprintln!("  WARNING: {name}: using UNVALIDATED pre-compiled blob (hipcc unavailable)");
-                    eprintln!("           Output may be incorrect. Install ROCm SDK or rebuild blobs with matching hashes.");
+                    eprintln!(
+                        "  WARNING: {name}: using UNVALIDATED pre-compiled blob (hipcc unavailable)"
+                    );
+                    eprintln!(
+                        "           Output may be incorrect. Install ROCm SDK or rebuild blobs with matching hashes."
+                    );
                     self.compiled.insert(name.to_string(), precompiled);
                     return Ok(&self.compiled[name]);
                 }
@@ -317,67 +587,98 @@ impl KernelCompiler {
             }
         }
 
-        // Fall back to runtime compilation via hipcc
-        let src_path = self.cache_dir.join(format!("{name}.hip"));
+        // Fall back to runtime compilation via hipcc into the hot cache.
         let obj_path = self.cache_dir.join(format!("{name}.hsaco"));
         let hash_path = self.cache_dir.join(format!("{name}.hash"));
 
-        let cache_valid = obj_path.exists()
-            && hash_path.exists()
-            && std::fs::read_to_string(&hash_path).unwrap_or_default() == src_hash;
-
-        if !cache_valid {
-            Self::hipcc_compile(
-                &self.arch,
-                &src_path,
-                &obj_path,
-                name,
-                source,
-                &self.extra_flags,
-                &module_flags,
-            )?;
-            let _ = std::fs::write(&hash_path, &src_hash);
+        if pair_valid(&obj_path, &hash_path, &src_hash) {
+            if let Some(dir) = self.writeback_dir() {
+                writeback_cold(name, &obj_path, &src_hash, dir, false);
+            }
+            self.compiled.insert(name.to_string(), obj_path);
+            return Ok(&self.compiled[name]);
         }
 
-        // Ensure precompiled dir has valid hash + blob (writeback from cache or fresh compile)
-        if let Some(ref dir) = self.precompiled_dir {
-            let pre_hash = dir.join(format!("{name}.hash"));
-            let pre_valid = pre_hash.exists() && {
-                let stored = std::fs::read_to_string(&pre_hash).unwrap_or_default();
-                stored.trim() == src_hash
-            };
-            if !pre_valid {
-                let pre_hsaco = dir.join(format!("{name}.hsaco"));
-                let _ = std::fs::copy(&obj_path, &pre_hsaco);
-                let _ = std::fs::write(&pre_hash, &src_hash);
+        if !self.has_hipcc {
+            // Nonempty unvalidated hot blob may still be usable on packaged installs.
+            if nonempty_blob(&obj_path) {
+                eprintln!(
+                    "  WARNING: {name}: using UNVALIDATED pre-compiled blob (hipcc unavailable)"
+                );
+                eprintln!(
+                    "           Output may be incorrect. Install ROCm SDK or rebuild blobs with matching hashes."
+                );
+                self.compiled.insert(name.to_string(), obj_path);
+                return Ok(&self.compiled[name]);
             }
+            return Err(
+                self.compiler_unavailable_error(name, "no usable cached kernel image exists")
+            );
+        }
+
+        Self::hipcc_compile_publish(
+            &self.hipcc_bin,
+            self.rocm_env_root.as_deref(),
+            &self.arch,
+            &self.cache_dir,
+            name,
+            source,
+            &src_hash,
+            &self.extra_flags,
+            &module_flags,
+        )?;
+
+        // Ensure cold install dir has valid hash + blob (writeback from hot).
+        // Must target cold_dir, not the lookup view: when hot is preferred for
+        // lookup, precompiled_dir == cache_dir and writing there would leave
+        // the persistent install stale. Failures warn only (see writeback_cold).
+        if let Some(dir) = self.writeback_dir() {
+            writeback_cold(name, &obj_path, &src_hash, dir, false);
         }
 
         self.compiled.insert(name.to_string(), obj_path);
         Ok(&self.compiled[name])
     }
 
-    /// Force a fresh hipcc recompile, evicting any cached / pre-compiled / seeded
-    /// blob for `name` first. Self-heals a `.hsaco` the driver rejects as an invalid
-    /// device image (a stale cross-build or cross-toolchain blob sitting in a shared
-    /// `.hipfire_kernels` cache). Returns the path to the freshly built object.
+    /// Force a fresh hipcc recompile after the driver rejects a loaded image.
+    ///
+    /// Does **not** pre-delete hot/cold artifacts (safe when hot==cold or the
+    /// dirs are aliased). Bypasses all lookup and invokes transactional hipcc
+    /// publication directly. Cold is force-synced only after success. A failed
+    /// hipcc leaves prior durable pairs intact.
     pub(crate) fn recompile(&mut self, name: &str, source: &str) -> HipResult<PathBuf> {
-        self.compiled.remove(name);
-        let _ = std::fs::remove_file(self.cache_dir.join(format!("{name}.hsaco")));
-        let _ = std::fs::remove_file(self.cache_dir.join(format!("{name}.hash")));
-        if let Some(ref dir) = self.precompiled_dir {
-            let _ = std::fs::remove_file(dir.join(format!("{name}.hsaco")));
-            let _ = std::fs::remove_file(dir.join(format!("{name}.hash")));
-        }
         if !self.has_hipcc {
-            return Err(hip_bridge::HipError::new(
-                0,
-                &format!("{name}: cached kernel image invalid and hipcc unavailable to recompile"),
+            return Err(self.compiler_unavailable_error(
+                name,
+                "the cached kernel image is invalid and must be recompiled",
             ));
         }
-        // Cache + blob are now gone → compile() takes the fresh hipcc path.
-        self.compile(name, source)?;
-        Ok(self.compiled[name].clone())
+
+        self.compiled.remove(name);
+
+        let module_flags = self.module_flags(name);
+        let src_hash = self.cache_hash(name, source);
+        let obj_path = self.cache_dir.join(format!("{name}.hsaco"));
+
+        Self::hipcc_compile_publish(
+            &self.hipcc_bin,
+            self.rocm_env_root.as_deref(),
+            &self.arch,
+            &self.cache_dir,
+            name,
+            source,
+            &src_hash,
+            &self.extra_flags,
+            &module_flags,
+        )?;
+
+        // Force-sync distinct cold only after a successful fresh hot compile.
+        if let Some(dir) = self.writeback_dir().map(Path::to_path_buf) {
+            writeback_cold(name, &obj_path, &src_hash, &dir, true);
+        }
+
+        self.compiled.insert(name.to_string(), obj_path.clone());
+        Ok(obj_path)
     }
 
     /// Extract per-kernel hipcc flags from magic comments in the source.
@@ -444,8 +745,100 @@ impl KernelCompiler {
         p.to_string()
     }
 
-    /// Run hipcc for a single kernel. Shared by compile() and compile_batch().
-    fn hipcc_compile(
+    /// Core hipcc argv: genco/arch/O3, then passthrough, then -o out src.
+    fn direct_hipcc_args(
+        arch: &str,
+        src_path: &Path,
+        obj_path: &Path,
+        passthrough: Vec<String>,
+    ) -> Vec<String> {
+        let mut args: Vec<String> = vec![
+            "--genco".into(),
+            format!("--offload-arch={arch}"),
+            "-O3".into(),
+        ];
+        args.extend(passthrough);
+        args.push("-o".into());
+        args.push(obj_path.to_str().unwrap().into());
+        args.push(src_path.to_str().unwrap().into());
+        args
+    }
+
+    /// Build hipcc passthrough flags (include paths, extras, module, per-kernel).
+    fn hipcc_passthrough(
+        name: &str,
+        source: &str,
+        extra_flags: &str,
+        module_flags: &[String],
+    ) -> Vec<String> {
+        let per_kernel = Self::per_kernel_flags(source);
+        let mut passthrough: Vec<String> = Vec::new();
+        // Some hipcc installs (notably V620's CachyOS build of ROCm 7.2) do not
+        // auto-inject the HIP include path, so `#include <hip/hip_runtime.h>`
+        // fails with "file not found". Add well-known candidates as -I flags;
+        // existence-checked so wrong paths on other distros don't leak in.
+        //
+        // The include path comes from the same selected root as hipcc and the
+        // runtime. Do not separately prepend ambient HIP_PATH or /opt/rocm:
+        // either could belong to another side-by-side ROCm version.
+        //
+        // Tell the device compiler where ROCm is rather than relying on its
+        // self-relative probe. That probe needs marker files (`bin/.hipVersion`
+        // and friends) which some installs omit; without them clang reports
+        // "cannot find ROCm device library" and, once headers are supplied by
+        // -I alone, still resolves device math like `rsqrtf` against the host
+        // `/usr/include/math.h` instead of the HIP runtime wrapper. Only a
+        // complete root is passed, so a shim directory can never be handed to
+        // clang as authoritative; on a conventional install this resolves to
+        // the same path clang would have found by itself.
+        let selected_root = hipfire_config::rocm::root();
+        if let Some(root) = selected_root.as_ref() {
+            if hipfire_config::rocm::is_complete_root(&root) {
+                let root = root.to_string_lossy();
+                passthrough.push(format!("--rocm-path={root}"));
+                passthrough.push(format!("--hip-path={root}"));
+            }
+        }
+        if let Some(candidate) =
+            selected_root.map(|root| root.join("include").to_string_lossy().into_owned())
+        {
+            if Path::new(&candidate).join("hip/hip_runtime.h").exists() {
+                // Windows hipcc (hipcc.bat) re-tokenises its argv on the inner
+                // clang.exe command line WITHOUT preserving quoting around
+                // embedded spaces, so an include path inside `Program Files`
+                // gets split at the space and clang sees the half before the
+                // split. Convert to the 8.3 short-path form (e.g.
+                // C:\PROGRA~1\AMD\ROCm\6.4\include) which contains no spaces.
+                // Reported in #82.
+                let resolved = Self::win_short_path_if_needed(&candidate);
+                passthrough.push(format!("-I{resolved}"));
+            }
+        }
+        for flag in extra_flags.split_whitespace() {
+            passthrough.push(flag.to_string());
+        }
+        for flag in module_flags {
+            passthrough.push(flag.clone());
+        }
+        for flag in &per_kernel {
+            passthrough.push(flag.clone());
+        }
+        if !module_flags.is_empty() || !per_kernel.is_empty() {
+            let flags = module_flags
+                .iter()
+                .chain(per_kernel.iter())
+                .cloned()
+                .collect::<Vec<_>>();
+            eprintln!("  {name}: per-kernel flags: {}", flags.join(" "));
+        }
+        passthrough
+    }
+
+    /// Low-level hipcc invocation writing the object to `obj_path` (may be a temp).
+    /// Does not mutate hash sidecars. Shared by the transactional publisher.
+    fn hipcc_compile_to(
+        hipcc_bin: &Path,
+        rocm_env_root: Option<&Path>,
         arch: &str,
         src_path: &Path,
         obj_path: &Path,
@@ -457,70 +850,130 @@ impl KernelCompiler {
         std::fs::write(src_path, source).map_err(|e| {
             hip_bridge::HipError::new(0, &format!("failed to write kernel source: {e}"))
         })?;
-        let _ = std::fs::remove_file(obj_path);
 
-        let extra = extra_flags;
-        let per_kernel = Self::per_kernel_flags(source);
-        let mut args: Vec<String> = vec![
-            "--genco".into(),
-            format!("--offload-arch={arch}"),
-            "-O3".into(),
-        ];
-        // Some hipcc installs (notably V620's CachyOS build of ROCm 7.2) do not
-        // auto-inject the HIP include path, so `#include <hip/hip_runtime.h>`
-        // fails with "file not found". Add well-known candidates as -I flags;
-        // existence-checked so wrong paths on other distros don't leak in.
-        let hip_path = std::env::var("HIP_PATH").unwrap_or_else(|_| "/opt/rocm".to_string());
-        for candidate in [
-            format!("{hip_path}/include"),
-            "/opt/rocm/include".to_string(),
-        ] {
-            if Path::new(&candidate).join("hip/hip_runtime.h").exists() {
-                // Windows hipcc (hipcc.bat) re-tokenises its argv on the inner
-                // clang.exe command line WITHOUT preserving quoting around
-                // embedded spaces, so an include path inside `Program Files`
-                // gets split at the space and clang sees the half before the
-                // split. Convert to the 8.3 short-path form (e.g.
-                // C:\PROGRA~1\AMD\ROCm\6.4\include) which contains no spaces.
-                // Reported in #82.
-                let resolved = Self::win_short_path_if_needed(&candidate);
-                args.push(format!("-I{resolved}"));
-                break;
-            }
-        }
-        for flag in extra.split_whitespace() {
-            args.push(flag.to_string());
-        }
-        for flag in module_flags {
-            args.push(flag.clone());
-        }
-        for flag in &per_kernel {
-            args.push(flag.clone());
-        }
-        if !module_flags.is_empty() || !per_kernel.is_empty() {
-            let flags = module_flags
-                .iter()
-                .chain(per_kernel.iter())
-                .cloned()
-                .collect::<Vec<_>>();
-            eprintln!("  {name}: per-kernel flags: {}", flags.join(" "));
-        }
-        args.push("-o".into());
-        args.push(obj_path.to_str().unwrap().into());
-        args.push(src_path.to_str().unwrap().into());
+        let passthrough = Self::hipcc_passthrough(name, source, extra_flags, module_flags);
+        let args = Self::direct_hipcc_args(arch, src_path, obj_path, passthrough);
 
-        let output = Command::new("hipcc")
-            .args(&args)
-            .output()
-            .map_err(|e| hip_bridge::HipError::new(0, &format!("failed to run hipcc: {e}")))?;
+        let mut cmd = Command::new(hipcc_bin);
+        cmd.args(&args);
+        if let Some(root) = rocm_env_root {
+            cmd.env("ROCM_PATH", root);
+        }
+        let output = cmd.output().map_err(|e| {
+            let tried = vec![hipcc_bin.display().to_string()];
+            let guidance =
+                hipfire_config::rocm::resolution_failure("the ROCm HIP compiler (hipcc)", &tried);
+            hip_bridge::HipError::new(
+                0,
+                &format!("failed to run {}: {e}\n{guidance}", hipcc_bin.display()),
+            )
+        })?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
+            // A missing hip_runtime.h is a missing PACKAGE, not a missing flag.
+            // clang reports it as a bare "file not found" that names neither the
+            // ROCm root it searched nor the component that would supply it, so
+            // spell both out rather than leaving the user to guess.
+            let hint = if stderr.contains("hip/hip_runtime.h") {
+                let root = hipfire_config::rocm::root();
+                let guidance = hipfire_config::rocm::install_guidance()
+                    .into_iter()
+                    .map(|line| format!("\n  {line}"))
+                    .collect::<String>();
+                format!(
+                    "\n\nThe HIP headers are not installed under the ROCm root ({}).\n\
+                     A working hipcc does not imply them — they ship in a separate\n\
+                     package.{guidance}\n\
+                     Run `hipfire diag` for the per-root component inventory.",
+                    root.map(|r| r.display().to_string())
+                        .unwrap_or_else(|| "none resolved".into()),
+                )
+            } else {
+                String::new()
+            };
             return Err(hip_bridge::HipError::new(
                 0,
-                &format!("hipcc compilation failed for {name}:\n{stderr}"),
+                &format!("hipcc compilation failed for {name}:\n{stderr}{hint}"),
             ));
         }
+        Ok(())
+    }
+
+    /// Compile via hipcc into a unique same-dir temp object, then transactionally
+    /// publish the final hot blob+hash. Never writes final hashes directly.
+    /// On any failure, temps are cleaned and prior hot pairs remain intact.
+    /// Hash publication errors are **not** ignored.
+    fn hipcc_compile_publish(
+        hipcc_bin: &Path,
+        rocm_env_root: Option<&Path>,
+        arch: &str,
+        cache_dir: &Path,
+        name: &str,
+        source: &str,
+        src_hash: &str,
+        extra_flags: &str,
+        module_flags: &[String],
+    ) -> HipResult<()> {
+        let src_path = cache_dir.join(format!("{name}.hip"));
+        let final_hsaco = cache_dir.join(format!("{name}.hsaco"));
+        let token = unique_token();
+        let tmp_obj = cache_dir.join(format!(".{name}.{token}.hsaco.tmp"));
+
+        let cleanup_tmp = || {
+            let _ = std::fs::remove_file(&tmp_obj);
+        };
+
+        let compile_result = Self::hipcc_compile_to(
+            hipcc_bin,
+            rocm_env_root,
+            arch,
+            &src_path,
+            &tmp_obj,
+            name,
+            source,
+            extra_flags,
+            module_flags,
+        );
+
+        if let Err(e) = compile_result {
+            cleanup_tmp();
+            return Err(e);
+        }
+
+        if !nonempty_blob(&tmp_obj) {
+            cleanup_tmp();
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("hipcc produced empty object for {name}"),
+            ));
+        }
+
+        // Publish blob then hash via the shared transactional helper.
+        // On failure, leave prior durable pair intact (temps cleaned inside).
+        if let Err(e) = publish_pair(cache_dir, name, &tmp_obj, src_hash, true) {
+            cleanup_tmp();
+            // If publish moved the temp already, final may exist without hash —
+            // that is the safe invalid state (blob without certifying hash).
+            let _ = std::fs::remove_file(&tmp_obj);
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("failed to publish compiled kernel {name}: {e}"),
+            ));
+        }
+
+        // publish_pair copies then leaves the source temp behind when src != dest.
+        cleanup_tmp();
+
+        // Defensive: final pair must be valid after publication.
+        let final_hash = cache_dir.join(format!("{name}.hash"));
+        if !pair_valid(&final_hsaco, &final_hash, src_hash) {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("post-publish pair invalid for {name}"),
+            ));
+        }
+
         Ok(())
     }
 
@@ -528,15 +981,7 @@ impl KernelCompiler {
     /// Kernels already compiled or cached are skipped.
     pub fn compile_batch(&mut self, kernels: &[(&str, &str)]) -> HipResult<()> {
         // Partition into already-done vs needs-work
-        let mut to_compile: Vec<(
-            String,
-            String,
-            String,
-            PathBuf,
-            PathBuf,
-            PathBuf,
-            Vec<String>,
-        )> = Vec::new();
+        let mut to_compile: Vec<(String, String, String, Vec<String>)> = Vec::new();
 
         for &(name, source) in kernels {
             if self.compiled.contains_key(name) {
@@ -546,62 +991,62 @@ impl KernelCompiler {
             let module_flags = self.module_flags(name);
             let src_hash = self.cache_hash(name, source);
 
-            // Check precompiled with valid hash
-            if let Some(ref dir) = self.precompiled_dir {
+            // Check precompiled with valid pair (nonempty blob + matching hash).
+            if let Some(dir) = &self.precompiled_dir {
                 let precompiled = dir.join(format!("{name}.hsaco"));
                 let hash_file = dir.join(format!("{name}.hash"));
-                if precompiled.exists() {
-                    let hash_ok = hash_file.exists() && {
-                        let stored = std::fs::read_to_string(&hash_file).unwrap_or_default();
-                        stored.trim() == src_hash
-                    };
-                    if hash_ok {
-                        self.compiled.insert(name.to_string(), precompiled);
-                        continue;
+                if pair_valid(&precompiled, &hash_file, &src_hash) {
+                    // Same opportunistic cold sync as compile(): a hot hit must
+                    // not skip writeback when the install dir is still stale.
+                    if let Some(cold) = self.writeback_dir().map(Path::to_path_buf) {
+                        writeback_cold(name, &precompiled, &src_hash, &cold, false);
                     }
-                    if !self.has_hipcc {
-                        self.compiled.insert(name.to_string(), precompiled);
-                        continue;
-                    }
+                    self.compiled.insert(name.to_string(), precompiled);
+                    continue;
+                }
+                if nonempty_blob(&precompiled) && !self.has_hipcc {
+                    // Mirror compile()'s two-line warning so a later compile()
+                    // short-circuit via `compiled` cannot suppress it.
+                    eprintln!(
+                        "  WARNING: {name}: using UNVALIDATED pre-compiled blob (hipcc unavailable)"
+                    );
+                    eprintln!(
+                        "           Output may be incorrect. Install ROCm SDK or rebuild blobs with matching hashes."
+                    );
+                    self.compiled.insert(name.to_string(), precompiled);
+                    continue;
                 }
             }
 
-            // Check temp cache
+            // Check temp cache with the same pair-valid helper.
             let obj_path = self.cache_dir.join(format!("{name}.hsaco"));
             let hash_path = self.cache_dir.join(format!("{name}.hash"));
-            let src_path = self.cache_dir.join(format!("{name}.hip"));
 
-            let cache_valid = obj_path.exists()
-                && hash_path.exists()
-                && std::fs::read_to_string(&hash_path).unwrap_or_default() == src_hash;
-
-            if cache_valid {
-                // Writeback to precompiled dir if missing
-                if let Some(ref dir) = self.precompiled_dir {
-                    let pre_hash = dir.join(format!("{name}.hash"));
-                    let pre_valid = pre_hash.exists() && {
-                        let stored = std::fs::read_to_string(&pre_hash).unwrap_or_default();
-                        stored.trim() == src_hash
-                    };
-                    if !pre_valid {
-                        let pre_hsaco = dir.join(format!("{name}.hsaco"));
-                        let _ = std::fs::copy(&obj_path, &pre_hsaco);
-                        let _ = std::fs::write(&pre_hash, &src_hash);
-                    }
+            if pair_valid(&obj_path, &hash_path, &src_hash) {
+                if let Some(dir) = self.writeback_dir() {
+                    writeback_cold(name, &obj_path, &src_hash, dir, false);
                 }
                 self.compiled.insert(name.to_string(), obj_path);
                 continue;
             }
 
-            to_compile.push((
-                name.to_string(),
-                source.to_string(),
-                src_hash,
-                src_path,
-                obj_path,
-                hash_path,
-                module_flags,
-            ));
+            if !self.has_hipcc {
+                if nonempty_blob(&obj_path) {
+                    eprintln!(
+                        "  WARNING: {name}: using UNVALIDATED pre-compiled blob (hipcc unavailable)"
+                    );
+                    eprintln!(
+                        "           Output may be incorrect. Install ROCm SDK or rebuild blobs with matching hashes."
+                    );
+                    self.compiled.insert(name.to_string(), obj_path);
+                    continue;
+                }
+                return Err(
+                    self.compiler_unavailable_error(name, "no usable cached kernel image exists")
+                );
+            }
+
+            to_compile.push((name.to_string(), source.to_string(), src_hash, module_flags));
         }
 
         if to_compile.is_empty() {
@@ -611,44 +1056,50 @@ impl KernelCompiler {
         let n = to_compile.len();
         eprintln!("  compiling {n} kernels in parallel...");
         let arch = self.arch.clone();
-        let precompiled_dir = self.precompiled_dir.clone();
+        let cache_dir = self.cache_dir.clone();
+        let writeback_dir = self.writeback_dir().map(|p| p.to_path_buf());
+        let hipcc_bin = self.hipcc_bin.clone();
+        let rocm_env_root = self.rocm_env_root.clone();
 
         // Shared counter so parallel threads can report "[i/N] name" as each one
         // completes. Ordering follows completion (not launch) — matches the pace
         // of hipcc finishing.
         let done = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
-        // Spawn hipcc in parallel threads
+        // Spawn hipcc in parallel threads — each uses transactional publication.
         let results: Vec<_> = to_compile
             .into_iter()
-            .map(|(name, source, src_hash, src_path, obj_path, hash_path, module_flags)| {
+            .map(|(name, source, src_hash, module_flags)| {
                 let arch = arch.clone();
-                let precompiled_dir = precompiled_dir.clone();
+                let cache_dir = cache_dir.clone();
+                let writeback_dir = writeback_dir.clone();
+                let hipcc_bin = hipcc_bin.clone();
+                let rocm_env_root = rocm_env_root.clone();
                 let extra_flags = self.extra_flags.clone();
                 let done = std::sync::Arc::clone(&done);
                 let handle = thread::spawn(move || {
-                    let result = Self::hipcc_compile(
+                    let result = Self::hipcc_compile_publish(
+                        &hipcc_bin,
+                        rocm_env_root.as_deref(),
                         &arch,
-                        &src_path,
-                        &obj_path,
+                        &cache_dir,
                         &name,
                         &source,
+                        &src_hash,
                         &extra_flags,
                         &module_flags,
                     );
                     if result.is_ok() {
-                        let _ = std::fs::write(&hash_path, &src_hash);
-                        // Write back to precompiled dir
-                        if let Some(ref dir) = precompiled_dir {
-                            let pre_hash = dir.join(format!("{name}.hash"));
-                            let pre_hsaco = dir.join(format!("{name}.hsaco"));
-                            let _ = std::fs::copy(&obj_path, &pre_hsaco);
-                            let _ = std::fs::write(&pre_hash, &src_hash);
+                        let obj_path = cache_dir.join(format!("{name}.hsaco"));
+                        // Write back to cold install dir (blob before hash).
+                        if let Some(dir) = &writeback_dir {
+                            writeback_cold(&name, &obj_path, &src_hash, dir, false);
                         }
                     }
                     let i = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                     let marker = if result.is_ok() { "✓" } else { "✗" };
                     eprintln!("  [{i:>3}/{n}] {marker} {name}");
+                    let obj_path = cache_dir.join(format!("{name}.hsaco"));
                     (name, obj_path, result)
                 });
                 handle
@@ -684,11 +1135,352 @@ mod tests {
             arch: "gfx1151".to_string(),
             compiled: HashMap::new(),
             precompiled_dir: None,
+            cold_dir: None,
             has_hipcc: false,
             extra_flags: extra_flags.to_string(),
             gfx1151_cumode_modules: HashSet::new(),
             toolchain_id: toolchain_id.to_string(),
+            hipcc_bin: PathBuf::from("hipcc"),
+            rocm_env_root: None,
         }
+    }
+
+    #[test]
+    fn cache_abi_invalidates_pre_radiowave_compiler_entries() {
+        assert_eq!(KERNEL_CACHE_ABI, 2);
+    }
+
+    #[test]
+    fn two_dir_writeback_stays_distinct() {
+        // Lookup may prefer hot while cold remains the install writeback target.
+        // Defends the directory-selection invariant without invoking hipcc.
+        let mut c = test_compiler("", "hipcc 7.2");
+        c.cache_dir = PathBuf::from("/tmp/hipfire_hot/gfx1201");
+        c.precompiled_dir = Some(PathBuf::from("/tmp/hipfire_hot/gfx1201"));
+        c.cold_dir = Some(PathBuf::from(
+            "/home/user/.hipfire/bin/kernels/compiled/gfx1201",
+        ));
+
+        assert_eq!(
+            c.writeback_dir(),
+            Some(Path::new(
+                "/home/user/.hipfire/bin/kernels/compiled/gfx1201"
+            )),
+            "writeback must target cold, not the hot lookup view"
+        );
+
+        // When cold coincides with hot there is nothing extra to sync.
+        c.cold_dir = Some(c.cache_dir.clone());
+        assert_eq!(c.writeback_dir(), None);
+    }
+
+    #[test]
+    fn same_path_equates_lexical_identity() {
+        let p = Path::new("/tmp/hipfire_hot/gfx1201");
+        assert!(same_path(p, p));
+        assert!(!same_path(
+            Path::new("/tmp/hipfire_hot/gfx1201"),
+            Path::new("/home/user/.hipfire/bin/kernels/compiled/gfx1201"),
+        ));
+    }
+
+    fn temp_root(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "hipfire_{label}_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ))
+    }
+
+    #[test]
+    fn pair_valid_requires_nonempty_blob() {
+        let root = temp_root("pair_valid");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        let hsaco = root.join("k.hsaco");
+        let hash = root.join("k.hash");
+        std::fs::write(&hash, "deadbeef").unwrap();
+
+        // Missing blob.
+        assert!(!pair_valid(&hsaco, &hash, "deadbeef"));
+
+        // Empty blob.
+        std::fs::write(&hsaco, b"").unwrap();
+        assert!(!nonempty_blob(&hsaco));
+        assert!(!pair_valid(&hsaco, &hash, "deadbeef"));
+
+        // Nonempty blob + matching hash.
+        std::fs::write(&hsaco, b"BLOB").unwrap();
+        assert!(pair_valid(&hsaco, &hash, "deadbeef"));
+
+        // Hash mismatch.
+        assert!(!pair_valid(&hsaco, &hash, "other"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn writeback_cold_skips_self_copy_and_missing_src() {
+        // No real dirs required: missing src → warn path, no panic.
+        // Self-path equality short-circuits before copy.
+        let missing = Path::new("/nonexistent/hipfire_writeback_test/kernel.hsaco");
+        let cold = Path::new("/nonexistent/hipfire_writeback_test_cold");
+        writeback_cold("kernel", missing, "deadbeef", cold, false);
+
+        // Same path → no-op (must not attempt copy-onto-self).
+        writeback_cold(
+            "kernel",
+            missing,
+            "deadbeef",
+            Path::new("/nonexistent"),
+            false,
+        );
+        // The join cold/kernel.hsaco differs from missing above; exercise the
+        // explicit same_path guard with identical paths:
+        writeback_cold(
+            "kernel",
+            Path::new("/nonexistent/kernel.hsaco"),
+            "deadbeef",
+            Path::new("/nonexistent"),
+            false,
+        );
+    }
+
+    #[test]
+    fn writeback_cold_restores_missing_or_empty_blob() {
+        // Verified RED: matching cold hash alone must not skip writeback when
+        // the HSACO is missing or empty.
+        let root = temp_root("wb_missing_blob");
+        let hot = root.join("hot");
+        let cold = root.join("cold");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&hot).unwrap();
+        std::fs::create_dir_all(&cold).unwrap();
+
+        let name = "add_inplace";
+        let src_hash = "abc123hash";
+        let hot_hsaco = hot.join(format!("{name}.hsaco"));
+        std::fs::write(&hot_hsaco, b"HOT_VALID_BLOB").unwrap();
+
+        // Case A: hash present, blob missing.
+        std::fs::write(cold.join(format!("{name}.hash")), src_hash).unwrap();
+        assert!(!cold.join(format!("{name}.hsaco")).exists());
+        writeback_cold(name, &hot_hsaco, src_hash, &cold, false);
+        assert_eq!(
+            std::fs::read(cold.join(format!("{name}.hsaco"))).unwrap(),
+            b"HOT_VALID_BLOB"
+        );
+        assert_eq!(
+            std::fs::read_to_string(cold.join(format!("{name}.hash")))
+                .unwrap()
+                .trim(),
+            src_hash
+        );
+
+        // Case B: hash present, blob empty — still invalid, must restore.
+        std::fs::write(cold.join(format!("{name}.hsaco")), b"").unwrap();
+        writeback_cold(name, &hot_hsaco, src_hash, &cold, false);
+        assert_eq!(
+            std::fs::read(cold.join(format!("{name}.hsaco"))).unwrap(),
+            b"HOT_VALID_BLOB"
+        );
+
+        // No leftover stage temps in cold.
+        let leftovers: Vec<_> = std::fs::read_dir(&cold)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "stage temps must be cleaned up: {leftovers:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn writeback_cold_force_replaces_hash_matching_pair() {
+        // After a driver-rejected image, force must overwrite cold even when
+        // the source hash already matches.
+        let root = temp_root("wb_force");
+        let hot = root.join("hot");
+        let cold = root.join("cold");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&hot).unwrap();
+        std::fs::create_dir_all(&cold).unwrap();
+
+        let name = "add_inplace";
+        let src_hash = "samehash";
+        let hot_hsaco = hot.join(format!("{name}.hsaco"));
+        std::fs::write(&hot_hsaco, b"FRESH_HOT").unwrap();
+        std::fs::write(cold.join(format!("{name}.hsaco")), b"OLD_REJECTED").unwrap();
+        std::fs::write(cold.join(format!("{name}.hash")), src_hash).unwrap();
+
+        // Non-force leaves a valid matching pair alone.
+        writeback_cold(name, &hot_hsaco, src_hash, &cold, false);
+        assert_eq!(
+            std::fs::read(cold.join(format!("{name}.hsaco"))).unwrap(),
+            b"OLD_REJECTED"
+        );
+
+        // Force replaces it.
+        writeback_cold(name, &hot_hsaco, src_hash, &cold, true);
+        assert_eq!(
+            std::fs::read(cold.join(format!("{name}.hsaco"))).unwrap(),
+            b"FRESH_HOT"
+        );
+        assert_eq!(
+            std::fs::read_to_string(cold.join(format!("{name}.hash")))
+                .unwrap()
+                .trim(),
+            src_hash
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn writeback_cold_failed_stage_preserves_prior_pair() {
+        // Missing/empty hot source must not clobber an existing valid cold pair.
+        let root = temp_root("wb_preserve");
+        let cold = root.join("cold");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&cold).unwrap();
+
+        let name = "add_inplace";
+        let src_hash = "keepme";
+        std::fs::write(cold.join(format!("{name}.hsaco")), b"PRIOR_COLD").unwrap();
+        std::fs::write(cold.join(format!("{name}.hash")), src_hash).unwrap();
+
+        let missing_hot = root.join("nope.hsaco");
+        writeback_cold(name, &missing_hot, "newhash", &cold, true);
+
+        assert_eq!(
+            std::fs::read(cold.join(format!("{name}.hsaco"))).unwrap(),
+            b"PRIOR_COLD",
+            "failed force writeback must leave prior cold blob untouched"
+        );
+        assert_eq!(
+            std::fs::read_to_string(cold.join(format!("{name}.hash")))
+                .unwrap()
+                .trim(),
+            src_hash,
+            "failed force writeback must leave prior cold hash untouched"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn validated_hot_lookup_writeback_refreshes_stale_cold() {
+        // End-to-end: hot lookup is hash-valid so compile returns without hipcc,
+        // but a distinct cold install pair is stale and must still be refreshed.
+        let root = temp_root("hot_lookup_wb");
+        let hot = root.join("hot");
+        let cold = root.join("cold");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&hot).unwrap();
+        std::fs::create_dir_all(&cold).unwrap();
+
+        let mut c = test_compiler("", "hipcc 7.2");
+        c.cache_dir = hot.clone();
+        c.precompiled_dir = Some(hot.clone());
+        c.cold_dir = Some(cold.clone());
+        c.has_hipcc = false;
+
+        let name = "add_inplace";
+        let source = "__global__ void add_inplace() {}";
+        let src_hash = c.cache_hash(name, source);
+
+        std::fs::write(hot.join(format!("{name}.hsaco")), b"HOT_BLOB_V1").unwrap();
+        std::fs::write(hot.join(format!("{name}.hash")), &src_hash).unwrap();
+        std::fs::write(cold.join(format!("{name}.hsaco")), b"OLD_COLD_BLOB").unwrap();
+        std::fs::write(cold.join(format!("{name}.hash")), "stale").unwrap();
+
+        let path = c
+            .compile(name, source)
+            .expect("validated hot lookup must succeed without hipcc");
+        assert_eq!(path, &hot.join(format!("{name}.hsaco")));
+
+        let cold_hash = std::fs::read_to_string(cold.join(format!("{name}.hash"))).unwrap();
+        assert_eq!(
+            cold_hash.trim(),
+            src_hash,
+            "stale cold hash must be refreshed from validated hot lookup"
+        );
+        assert_eq!(
+            std::fs::read(cold.join(format!("{name}.hsaco"))).unwrap(),
+            b"HOT_BLOB_V1",
+            "cold blob must be copied from the validated hot pair"
+        );
+        // Hot pair must remain the source of truth (no self-clobber).
+        assert_eq!(
+            std::fs::read(hot.join(format!("{name}.hsaco"))).unwrap(),
+            b"HOT_BLOB_V1"
+        );
+        assert_eq!(
+            std::fs::read_to_string(hot.join(format!("{name}.hash")))
+                .unwrap()
+                .trim(),
+            src_hash
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn validated_hot_lookup_restores_missing_cold_blob() {
+        // End-to-end RED: hot hit + cold hash present + cold hsaco missing
+        // must restore the cold blob (install daemon --precompile path).
+        let root = temp_root("hot_lookup_missing_cold");
+        let hot = root.join("hot");
+        let cold = root.join("cold");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&hot).unwrap();
+        std::fs::create_dir_all(&cold).unwrap();
+
+        let mut c = test_compiler("", "hipcc 7.2");
+        c.cache_dir = hot.clone();
+        c.precompiled_dir = Some(hot.clone());
+        c.cold_dir = Some(cold.clone());
+        c.has_hipcc = false;
+
+        let name = "add_inplace";
+        let source = "__global__ void add_inplace() {}";
+        let src_hash = c.cache_hash(name, source);
+
+        std::fs::write(hot.join(format!("{name}.hsaco")), b"HOT_BLOB_V1").unwrap();
+        std::fs::write(hot.join(format!("{name}.hash")), &src_hash).unwrap();
+        // Cold hash matches, but blob is gone (the verified RED fixture).
+        std::fs::write(cold.join(format!("{name}.hash")), &src_hash).unwrap();
+
+        let path = c
+            .compile(name, source)
+            .expect("validated hot lookup must succeed without hipcc");
+        assert_eq!(path, &hot.join(format!("{name}.hsaco")));
+
+        assert!(
+            cold.join(format!("{name}.hsaco")).exists(),
+            "missing cold hsaco must be restored from validated hot"
+        );
+        assert_eq!(
+            std::fs::read(cold.join(format!("{name}.hsaco"))).unwrap(),
+            b"HOT_BLOB_V1"
+        );
+        assert_eq!(
+            std::fs::read_to_string(cold.join(format!("{name}.hash")))
+                .unwrap()
+                .trim(),
+            src_hash
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -706,6 +1498,33 @@ mod tests {
         assert_ne!(
             base, toolchain_changed,
             "cache key must change when hipcc toolchain changes"
+        );
+    }
+
+    #[test]
+    fn direct_hipcc_args_keep_rocm_as_the_default_compiler() {
+        let args = KernelCompiler::direct_hipcc_args(
+            "gfx1100",
+            Path::new("kernel.hip"),
+            Path::new("kernel.hsaco"),
+            vec!["-I/opt/rocm/include".to_owned()],
+        );
+
+        assert_eq!(
+            args,
+            vec![
+                "--genco",
+                "--offload-arch=gfx1100",
+                "-O3",
+                "-I/opt/rocm/include",
+                "-o",
+                "kernel.hsaco",
+                "kernel.hip",
+            ]
+        );
+        assert!(
+            args.iter().all(|arg| !arg.contains("RADIOWAVE")),
+            "the product compiler must not inject Radiowave"
         );
     }
 
@@ -731,5 +1550,403 @@ mod tests {
 
         candidate.arch = "gfx1100".to_owned();
         assert!(candidate.module_flags("selected").is_empty());
+    }
+
+    /// Write an executable fake hipcc that copies a canned blob to `-o` path,
+    /// or exits nonzero when `fail` is true.
+    fn install_fake_hipcc(bin_dir: &Path, canned_blob: &[u8], fail: bool) -> PathBuf {
+        std::fs::create_dir_all(bin_dir).unwrap();
+        let blob_path = bin_dir.join("canned.hsaco");
+        std::fs::write(&blob_path, canned_blob).unwrap();
+        let hipcc = bin_dir.join("fake_hipcc");
+        let script = if fail {
+            "#!/bin/sh\necho 'fake hipcc failure' >&2\nexit 1\n".to_string()
+        } else {
+            format!(
+                "#!/bin/sh\nout=\"\"\nwhile [ $# -gt 0 ]; do\n  if [ \"$1\" = \"-o\" ]; then out=\"$2\"; shift 2; continue; fi\n  shift\ndone\ncp \"{}\" \"$out\"\n",
+                blob_path.display()
+            )
+        };
+        std::fs::write(&hipcc, script).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&hipcc).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&hipcc, perms).unwrap();
+        }
+        hipcc
+    }
+
+    fn leftover_temps(dir: &Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .map(|rd| {
+                rd.filter_map(|e| e.ok())
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .filter(|n| n.contains(".tmp"))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn seed_orphan_cold_hash_cannot_certify_stale_hot_blob() {
+        // CRITICAL: orphan cold .hash must never be copied beside a stale hot
+        // blob and make compile() accept it as current.
+        let root = temp_root("seed_orphan_hash");
+        let _ = std::fs::remove_dir_all(&root);
+        let cold = root.join("cold");
+        let hot = root.join("hot");
+        std::fs::create_dir_all(&cold).unwrap();
+        std::fs::create_dir_all(&hot).unwrap();
+
+        let name = "k";
+        let current = "current_hash";
+        // Cold has only the current hash (missing blob — repair case).
+        std::fs::write(cold.join(format!("{name}.hash")), current).unwrap();
+        // Hot has a stale-but-loadable blob with no hash.
+        std::fs::write(hot.join(format!("{name}.hsaco")), b"STALE_BLOB").unwrap();
+
+        seed_hot_from_cold(&cold, &hot).unwrap();
+
+        assert!(
+            !hot.join(format!("{name}.hash")).exists(),
+            "orphan cold hash must not be seeded beside a stale hot blob"
+        );
+        assert_eq!(
+            std::fs::read(hot.join(format!("{name}.hsaco"))).unwrap(),
+            b"STALE_BLOB"
+        );
+        // pair_valid must still reject (no matching hash on hot).
+        assert!(!pair_valid(
+            &hot.join(format!("{name}.hsaco")),
+            &hot.join(format!("{name}.hash")),
+            current
+        ));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn seed_pair_replaces_mismatched_hot_pair_as_unit() {
+        let root = temp_root("seed_pair_replace");
+        let _ = std::fs::remove_dir_all(&root);
+        let cold = root.join("cold");
+        let hot = root.join("hot");
+        std::fs::create_dir_all(&cold).unwrap();
+        std::fs::create_dir_all(&hot).unwrap();
+
+        let name = "k";
+        std::fs::write(cold.join(format!("{name}.hsaco")), b"COLD_BLOB").unwrap();
+        std::fs::write(cold.join(format!("{name}.hash")), "cold_hash").unwrap();
+        std::fs::write(hot.join(format!("{name}.hsaco")), b"HOT_OLD").unwrap();
+        std::fs::write(hot.join(format!("{name}.hash")), "hot_old_hash").unwrap();
+
+        seed_hot_from_cold(&cold, &hot).unwrap();
+
+        assert_eq!(
+            std::fs::read(hot.join(format!("{name}.hsaco"))).unwrap(),
+            b"COLD_BLOB"
+        );
+        assert_eq!(
+            std::fs::read_to_string(hot.join(format!("{name}.hash")))
+                .unwrap()
+                .trim(),
+            "cold_hash"
+        );
+        assert!(pair_valid(
+            &hot.join(format!("{name}.hsaco")),
+            &hot.join(format!("{name}.hash")),
+            "cold_hash"
+        ));
+        assert!(
+            leftover_temps(&hot).is_empty(),
+            "no temp residue after pair seed: {:?}",
+            leftover_temps(&hot)
+        );
+
+        // Matching hot pair must not be overwritten.
+        std::fs::write(hot.join(format!("{name}.hsaco")), b"HOT_MATCH").unwrap();
+        std::fs::write(hot.join(format!("{name}.hash")), "cold_hash").unwrap();
+        seed_hot_from_cold(&cold, &hot).unwrap();
+        assert_eq!(
+            std::fs::read(hot.join(format!("{name}.hsaco"))).unwrap(),
+            b"HOT_MATCH",
+            "matching hot pair must be preserved"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn empty_or_directory_blob_rejected_without_hipcc_single_and_batch() {
+        let root = temp_root("empty_dir_blob");
+        let _ = std::fs::remove_dir_all(&root);
+        let hot = root.join("hot");
+        std::fs::create_dir_all(&hot).unwrap();
+
+        let mut c = test_compiler("", "hipcc 7.2");
+        c.cache_dir = hot.clone();
+        c.precompiled_dir = Some(hot.clone());
+        c.has_hipcc = false;
+
+        let name = "add_inplace";
+        let source = "__global__ void add_inplace() {}";
+        let src_hash = c.cache_hash(name, source);
+
+        // Empty file with matching hash.
+        std::fs::write(hot.join(format!("{name}.hsaco")), b"").unwrap();
+        std::fs::write(hot.join(format!("{name}.hash")), &src_hash).unwrap();
+
+        let err = c.compile(name, source).unwrap_err();
+        assert!(
+            err.to_string().contains("hipcc unavailable")
+                || err.to_string().contains("no usable cached"),
+            "empty blob must error without hipcc: {err}"
+        );
+        assert!(!c.compiled.contains_key(name));
+
+        // Directory named like a blob with matching hash.
+        c.compiled.clear();
+        let _ = std::fs::remove_file(hot.join(format!("{name}.hsaco")));
+        std::fs::create_dir(hot.join(format!("{name}.hsaco"))).unwrap();
+        std::fs::write(hot.join(format!("{name}.hash")), &src_hash).unwrap();
+
+        let err = c.compile(name, source).unwrap_err();
+        assert!(
+            err.to_string().contains("hipcc unavailable")
+                || err.to_string().contains("no usable cached"),
+            "directory blob must error without hipcc: {err}"
+        );
+
+        // Batch path must agree.
+        c.compiled.clear();
+        let err = c.compile_batch(&[(name, source)]).unwrap_err();
+        assert!(
+            err.to_string().contains("hipcc unavailable")
+                || err.to_string().contains("no usable cached"),
+            "batch empty/dir blob must error without hipcc: {err}"
+        );
+        assert!(!c.compiled.contains_key(name));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn failed_recompile_preserves_pair_when_hot_equals_cold() {
+        let root = temp_root("recompile_hot_eq_cold");
+        let _ = std::fs::remove_dir_all(&root);
+        let shared = root.join("shared");
+        std::fs::create_dir_all(&shared).unwrap();
+        let hipcc = install_fake_hipcc(&root.join("bin"), b"NEW", true);
+
+        let mut c = test_compiler("", "hipcc 7.2");
+        c.cache_dir = shared.clone();
+        c.precompiled_dir = Some(shared.clone());
+        c.cold_dir = Some(shared.clone());
+        c.has_hipcc = true;
+        c.hipcc_bin = hipcc;
+
+        let name = "k";
+        let source = "__global__ void k() {}";
+        let src_hash = c.cache_hash(name, source);
+        std::fs::write(shared.join(format!("{name}.hsaco")), b"PRIOR_PAIR").unwrap();
+        std::fs::write(shared.join(format!("{name}.hash")), &src_hash).unwrap();
+
+        let err = c.recompile(name, source).unwrap_err();
+        assert!(err.to_string().contains("hipcc"), "{err}");
+
+        assert_eq!(
+            std::fs::read(shared.join(format!("{name}.hsaco"))).unwrap(),
+            b"PRIOR_PAIR",
+            "failed recompile must not delete hot==cold blob"
+        );
+        assert_eq!(
+            std::fs::read_to_string(shared.join(format!("{name}.hash")))
+                .unwrap()
+                .trim(),
+            src_hash,
+            "failed recompile must not delete hot==cold hash"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn failed_recompile_preserves_pair_when_dirs_aliased() {
+        let root = temp_root("recompile_alias");
+        let _ = std::fs::remove_dir_all(&root);
+        let real = root.join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let alias = root.join("alias");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        #[cfg(not(unix))]
+        {
+            let _ = std::fs::remove_dir_all(&root);
+            return;
+        }
+        let hipcc = install_fake_hipcc(&root.join("bin"), b"NEW", true);
+
+        let mut c = test_compiler("", "hipcc 7.2");
+        c.cache_dir = real.clone();
+        c.precompiled_dir = Some(alias.clone());
+        c.cold_dir = Some(alias.clone());
+        c.has_hipcc = true;
+        c.hipcc_bin = hipcc;
+
+        let name = "k";
+        let source = "__global__ void k() {}";
+        let src_hash = c.cache_hash(name, source);
+        std::fs::write(real.join(format!("{name}.hsaco")), b"ALIAS_PRIOR").unwrap();
+        std::fs::write(real.join(format!("{name}.hash")), &src_hash).unwrap();
+
+        let _ = c.recompile(name, source).unwrap_err();
+
+        assert_eq!(
+            std::fs::read(real.join(format!("{name}.hsaco"))).unwrap(),
+            b"ALIAS_PRIOR"
+        );
+        assert_eq!(
+            std::fs::read_to_string(real.join(format!("{name}.hash")))
+                .unwrap()
+                .trim(),
+            src_hash
+        );
+        // writeback_dir must treat alias as same path → no distinct cold.
+        assert_eq!(c.writeback_dir(), None);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn failed_transactional_hipcc_leaves_old_hot_pair_intact() {
+        let root = temp_root("tx_hipcc_fail");
+        let _ = std::fs::remove_dir_all(&root);
+        let hot = root.join("hot");
+        std::fs::create_dir_all(&hot).unwrap();
+        let hipcc = install_fake_hipcc(&root.join("bin"), b"NEW", true);
+
+        let mut c = test_compiler("", "hipcc 7.2");
+        c.cache_dir = hot.clone();
+        c.precompiled_dir = None;
+        c.cold_dir = None;
+        c.has_hipcc = true;
+        c.hipcc_bin = hipcc;
+
+        let name = "k";
+        let source = "__global__ void k() {}";
+        // Prior pair with a different hash so compile must attempt hipcc.
+        std::fs::write(hot.join(format!("{name}.hsaco")), b"OLD_HOT").unwrap();
+        std::fs::write(hot.join(format!("{name}.hash")), "old_hash").unwrap();
+
+        let err = c.compile(name, source).unwrap_err();
+        assert!(err.to_string().contains("hipcc"), "{err}");
+
+        assert_eq!(
+            std::fs::read(hot.join(format!("{name}.hsaco"))).unwrap(),
+            b"OLD_HOT"
+        );
+        assert_eq!(
+            std::fs::read_to_string(hot.join(format!("{name}.hash")))
+                .unwrap()
+                .trim(),
+            "old_hash"
+        );
+        assert!(
+            leftover_temps(&hot).is_empty(),
+            "failed hipcc must clean temps: {:?}",
+            leftover_temps(&hot)
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn successful_publish_pair_has_no_temp_residue() {
+        let root = temp_root("publish_ok");
+        let _ = std::fs::remove_dir_all(&root);
+        let dest = root.join("dest");
+        let src_dir = root.join("src");
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::create_dir_all(&src_dir).unwrap();
+
+        let name = "k";
+        let src_blob = src_dir.join("blob.hsaco");
+        std::fs::write(&src_blob, b"FRESH_BLOB").unwrap();
+        // Prior pair to replace.
+        std::fs::write(dest.join(format!("{name}.hsaco")), b"OLD").unwrap();
+        std::fs::write(dest.join(format!("{name}.hash")), "old").unwrap();
+
+        publish_pair(&dest, name, &src_blob, "new_hash", true).unwrap();
+
+        assert_eq!(
+            std::fs::read(dest.join(format!("{name}.hsaco"))).unwrap(),
+            b"FRESH_BLOB"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dest.join(format!("{name}.hash")))
+                .unwrap()
+                .trim(),
+            "new_hash"
+        );
+        assert!(pair_valid(
+            &dest.join(format!("{name}.hsaco")),
+            &dest.join(format!("{name}.hash")),
+            "new_hash"
+        ));
+        assert!(
+            leftover_temps(&dest).is_empty(),
+            "successful publish must leave no temps: {:?}",
+            leftover_temps(&dest)
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn successful_hipcc_publish_yields_matching_pair_no_temps() {
+        let root = temp_root("hipcc_publish_ok");
+        let _ = std::fs::remove_dir_all(&root);
+        let hot = root.join("hot");
+        std::fs::create_dir_all(&hot).unwrap();
+        let hipcc = install_fake_hipcc(&root.join("bin"), b"COMPILED_OK", false);
+
+        let mut c = test_compiler("", "hipcc 7.2");
+        c.cache_dir = hot.clone();
+        c.precompiled_dir = None;
+        c.cold_dir = None;
+        c.has_hipcc = true;
+        c.hipcc_bin = hipcc;
+
+        let name = "k";
+        let source = "__global__ void k() {}";
+        let src_hash = c.cache_hash(name, source);
+
+        // Stale prior pair forces recompile path.
+        std::fs::write(hot.join(format!("{name}.hsaco")), b"STALE").unwrap();
+        std::fs::write(hot.join(format!("{name}.hash")), "stale").unwrap();
+
+        let path = c.compile(name, source).expect("fake hipcc must succeed");
+        assert_eq!(path, &hot.join(format!("{name}.hsaco")));
+        assert_eq!(std::fs::read(path).unwrap(), b"COMPILED_OK");
+        assert_eq!(
+            std::fs::read_to_string(hot.join(format!("{name}.hash")))
+                .unwrap()
+                .trim(),
+            src_hash
+        );
+        assert!(pair_valid(
+            &hot.join(format!("{name}.hsaco")),
+            &hot.join(format!("{name}.hash")),
+            &src_hash
+        ));
+        assert!(
+            leftover_temps(&hot).is_empty(),
+            "successful hipcc publish must leave no temps: {:?}",
+            leftover_temps(&hot)
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

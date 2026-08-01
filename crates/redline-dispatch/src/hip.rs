@@ -276,23 +276,31 @@ impl HipFns {
 }
 
 fn open_hip_library() -> Result<Library, HipBackendError> {
-    const CANDIDATES: &[&str] = &[
+    let candidates = hipfire_config::rocm::library_candidates(&[
         "libamdhip64.so",
         "libamdhip64.so.7",
-        "/opt/rocm/lib/libamdhip64.so",
-    ];
+        "libamdhip64.so.6",
+        "libamdhip64.so.5",
+    ]);
     let mut failures = Vec::new();
-    for candidate in CANDIDATES {
+    for candidate in &candidates {
         // SAFETY: loading the installed HIP runtime is the purpose of this
         // backend. HipFns retains the successful library handle.
-        match unsafe { Library::new(*candidate) } {
+        match unsafe { Library::new(candidate) } {
             Ok(library) => return Ok(library),
             Err(error) => failures.push(format!("{candidate}: {error}")),
         }
     }
     Err(HipBackendError::LibraryLoad {
-        candidates: CANDIDATES.join(", "),
-        detail: failures.join("; "),
+        candidates: candidates.join(", "),
+        detail: format!(
+            "{}\n{}",
+            failures.join("; "),
+            hipfire_config::rocm::resolution_failure(
+                "the HIP runtime (libamdhip64.so)",
+                &candidates,
+            )
+        ),
     })
 }
 

@@ -10,20 +10,9 @@
 
 use std::sync::OnceLock;
 
-/// Product-certified Redline default: one Qwen A3B MQ4R model on one gfx12 GPU.
-///
-/// Keep this predicate deliberately narrower than the replay implementation's
-/// capability surface. Other models and multi-GPU layouts remain opt-in until
-/// independently certified.
-pub fn gfx12_mq4r_redline_default(
-    gpu_arch: &str,
-    model_path: &str,
-    model_arch_id: u32,
-    pp: usize,
-    tp: usize,
-) -> bool {
-    gpu_arch.starts_with("gfx12")
-        && model_arch_id == 6
+/// Automatic Redline runtime default for single-GPU MQ4R models.
+pub fn mq4r_redline_default(gpu_arch: &str, model_path: &str, pp: usize, tp: usize) -> bool {
+    matches!(gpu_arch, "gfx1100" | "gfx1151" | "gfx1201")
         && pp == 1
         && tp == 1
         && std::path::Path::new(model_path)
@@ -152,8 +141,7 @@ impl RuntimeConfig {
             prompt_cache_capacity: value("HIPFIRE_PROMPT_CACHE_CAP")
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(32),
-            prompt_cache_unbounded: value("HIPFIRE_PROMPT_CACHE_UNBOUNDED").as_deref()
-                == Some("1"),
+            prompt_cache_unbounded: value("HIPFIRE_PROMPT_CACHE_UNBOUNDED").as_deref() == Some("1"),
             experimental_budget_alert: value("HIPFIRE_EXPERIMENTAL_BUDGET_ALERT").as_deref()
                 == Some("1"),
             max_total_think_tokens: value("HIPFIRE_MAX_TOTAL_THINK_TOKENS")
@@ -183,7 +171,7 @@ impl RuntimeConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::{gfx12_mq4r_redline_default, RuntimeConfig};
+    use super::{mq4r_redline_default, RuntimeConfig};
     use hipfire_config::{resolve, ConfigLayer, ConfigSource, NamedLayer, ProcessConfig};
 
     #[test]
@@ -236,54 +224,44 @@ mod tests {
     }
 
     #[test]
-    fn redline_default_is_limited_to_single_gpu_gfx12_a3b_mq4r() {
-        assert!(gfx12_mq4r_redline_default(
+    fn redline_default_is_limited_to_exact_runtime_arches_and_single_gpu_mq4r() {
+        for gpu_arch in ["gfx1100", "gfx1151", "gfx1201"] {
+            assert!(mq4r_redline_default(
+                gpu_arch,
+                "/models/qwen3.6-35b-a3b.mq4r",
+                1,
+                1,
+            ));
+        }
+
+        assert!(mq4r_redline_default(
             "gfx1201",
-            "/models/qwen3.6-35b-a3b.mq4r",
-            6,
-            1,
-            1,
-        ));
-        assert!(gfx12_mq4r_redline_default(
-            "gfx1200",
-            "/models/QWEN3.6-35B-A3B.MQ4R",
-            6,
+            "/models/qwen3.6-27b.mq4r",
             1,
             1,
         ));
 
-        assert!(!gfx12_mq4r_redline_default(
-            "gfx1100",
-            "/models/qwen3.6-35b-a3b.mq4r",
-            6,
+        assert!(!mq4r_redline_default(
+            "gfx1200",
+            "/models/QWEN3.6-35B-A3B.MQ4R",
             1,
             1,
         ));
-        assert!(!gfx12_mq4r_redline_default(
+        assert!(!mq4r_redline_default(
             "gfx1201",
             "/models/qwen3.6-35b-a3b.mq4",
-            6,
             1,
             1,
         ));
-        assert!(!gfx12_mq4r_redline_default(
+        assert!(!mq4r_redline_default(
             "gfx1201",
             "/models/qwen3.6-35b-a3b.mq4r",
-            5,
-            1,
-            1,
-        ));
-        assert!(!gfx12_mq4r_redline_default(
-            "gfx1201",
-            "/models/qwen3.6-35b-a3b.mq4r",
-            6,
             2,
             1,
         ));
-        assert!(!gfx12_mq4r_redline_default(
+        assert!(!mq4r_redline_default(
             "gfx1201",
             "/models/qwen3.6-35b-a3b.mq4r",
-            6,
             1,
             2,
         ));

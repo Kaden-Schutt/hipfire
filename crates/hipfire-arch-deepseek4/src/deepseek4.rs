@@ -1765,7 +1765,8 @@ mod tests {
     /// model card adds or renames fields.
     #[test]
     fn parses_real_deepseek4_config_json() {
-        let real_config_path = "/home/nick/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4-Flash/\
+        let real_config_path =
+            "/home/nick/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4-Flash/\
              snapshots/6976c7ff1b30a1b2cb7805021b8ba4684041f136/config.json";
         let raw_json = match std::fs::read_to_string(real_config_path) {
             Ok(s) => s,

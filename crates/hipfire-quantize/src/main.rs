@@ -5968,7 +5968,7 @@ fn run_gguf_pipeline(
     let auto_arch_id: u32 = match arch_str.as_str() {
         "llama" => 0,
         "qwen3" | "qwen2" => 1,
-        "qwen3_5" | "qwen3_5_text" => 5,
+        "qwen3_5" | "qwen3_5_text" | "qwen35" => 5,
         "qwen3moe" => 6,
         other => {
             // Structural-pillar guard: a qwen3* GGUF that doesn't match an
@@ -7718,7 +7718,7 @@ fn main() {
     let auto_arch_id = match arch_str {
         "llama" => 0u32,
         "qwen3" | "qwen2" => 1,
-        "qwen3_5" | "qwen3_5_text" => 5,
+        "qwen3_5" | "qwen3_5_text" | "qwen35" => 5,
         // Qwen3.5 MoE (Qwen3.5-35B-A3B and friends): hybrid LA+FA attention identical
         // to qwen3_5 dense, but every layer's FFN is MoE with stacked-3D expert
         // tensors (mlp.experts.gate_up_proj/down_proj are [num_experts, ...]).

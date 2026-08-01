@@ -1,5 +1,5 @@
 # hipfire installer for Windows — detects GPU, installs deps, downloads binary + kernels.
-# Usage: irm https://raw.githubusercontent.com/Kaden-Schutt/hipfire/master/scripts/install.ps1 | iex
+# Usage: irm https://raw.githubusercontent.com/warpfront/hipfire/master/scripts/install.ps1 | iex
 param(
     [string]$Ref,
     [string]$Branch,
@@ -17,7 +17,7 @@ $ModelsDir   = "$HipfireDir\models"
 $SrcDir      = "$HipfireDir\src"
 
 # ─── Constants ───────────────────────────────────────────
-$GithubRepo = "Kaden-Schutt/hipfire"
+$GithubRepo = "warpfront/hipfire"
 $InstallRef = if ($env:HIPFIRE_INSTALL_REF) { $env:HIPFIRE_INSTALL_REF } else { "master" }
 $InstallRefKind = if ($env:HIPFIRE_INSTALL_REF) { "auto" } else { "branch" }
 $Selectors = @(

@@ -11,7 +11,7 @@ use rdna_compute::{DType, Gpu, GpuTensor};
 use std::sync::OnceLock;
 
 pub(crate) mod steps;
-pub use steps::{FusedPattern, GemvInput, Step, execute_steps};
+pub use steps::{execute_steps, FusedPattern, GemvInput, Step};
 
 // #397 Ship 6 — forward-as-pipeline C-design lowered super-op substrate (types
 // only at this step; not on any live path until wired behind HIPFIRE_FORWARD_LOWERED).
@@ -591,6 +591,38 @@ pub fn run_moe_decode(
     let down_m = p.routed_down_m;
     let down_k = p.routed_down_k;
 
+    // Nine-path fused MoE (NInfer D3+D4 graft, microbenched 1.40× at A3B dims):
+    // one x-staged CTA per row tile with 8 routed-expert warps replaces the
+    // per-(row,krank) indexed gate_up GEMV, and the down+weighted-combine fold
+    // replaces the expanded down GEMV + combine kernel — 3 launches total
+    // (D3, silu_rotate, D4) vs 4 with 64× less x restaging. Byte-exact with
+    // the replaced kernels by construction (same per-row accumulate order,
+    // same fold order). Gated to the measured shape: k=8, uniform MQ4G256,
+    // no graded tags, no AWQ, mi=512 (down_k), hidden ≤ 2048 (x LDS stage).
+    // Shape rule from .research/microbench/FINDINGS-moe.md: fused wins only
+    // for k≥8 with small per-expert intermediate; LFM-class (k=4, I=1792)
+    // stays on the chain. HIPFIRE_MOE_NINEPATH=0 opts out.
+    static MOE_NINEPATH: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        hipfire_config::developer_var("HIPFIRE_MOE_NINEPATH").unwrap_or_default()
+    });
+    let ninepath_mode = MOE_NINEPATH.as_str();
+    let ninepath_eligible = p.k == 8
+        && p.batch_size == 1
+        && p.hidden <= 2048
+        && p.mi == 512
+        && p.dtypes.routed_gate_up == DType::MQ4G256
+        && p.dtypes.routed_down == DType::MQ4G256
+        && p.expert_dtype_tags.is_none()
+        && p.expert_down_awq_ptrs.is_none()
+        && !p.defer_routed_combine;
+    // Modes: "0"/off = chain; "d3" = D3 only (RESEARCH: 1-ULP codegen
+    // divergence from the baseline gate_up — not byte-exact, and slower);
+    // "1"/"on" = D3+D4 (research); anything else incl. unset = D4 only
+    // (production default: byte-exact with the chain, +0.8% on the A3B
+    // serve battery — .research/microbench/FINDINGS-moe.md).
+    let ninepath_d3 = ninepath_eligible && matches!(ninepath_mode, "1" | "d3" | "on");
+    let ninepath_d4 = ninepath_eligible && !matches!(ninepath_mode, "0" | "off" | "d3");
+
     {
         // ── Routed-expert dispatch via device-indexed merged kernels ──────────
         //
@@ -606,7 +638,17 @@ pub fn run_moe_decode(
         // routed_indexable_mqN flag — so the mixed "mq6-down" file (gate_up MQ4,
         // down MQ6) dispatches the MQ4 gate_up GEMV and the MQ6 down GEMV. The
         // all-MQ4 and all-MQ6 files select the same kernels as before (byte-identical).
-        if res.routed_indexable_paro {
+        if ninepath_d3 {
+            hip!(gpu.gemv_hfq4g256_moe_ninepath_d3(
+                p.expert_gate_up_ptrs,
+                p.topk_indices,
+                xr,
+                p.gate_batch,
+                p.up_batch,
+                p.mi,
+                gate_up_k,
+            ))?;
+        } else if res.routed_indexable_paro {
             hip!(gpu.gemv_paro_q4g128_moe_gate_up_k8_indexed(
                 p.expert_gate_up_ptrs,
                 p.topk_indices,
@@ -768,7 +810,17 @@ pub fn run_moe_decode(
 
         // Expanded write — down GEMV by the DOWN dtype (mixed mq6-down lands here).
         // FIXME(Step 8): replace hardcoded 1 with p.batch_size when grouped prefill lands
-        if let Some(tags) = p.expert_dtype_tags {
+        if ninepath_d4 {
+            hip!(gpu.gemv_hfq4g256_moe_ninepath_d4(
+                p.expert_down_ptrs,
+                p.topk_indices,
+                p.topk_weights,
+                p.rot_batch,
+                out_target,
+                down_m,
+                down_k,
+            ))?;
+        } else if let Some(tags) = p.expert_dtype_tags {
             // Per-expert mixed down (graded MQ6 hot / MQ2-Lloyd cold). One
             // merged kernel; block-per-(row,krank,token) reads tags[expert_id]
             // (block-uniform → no warp divergence) and branches the dequant.
@@ -910,7 +962,7 @@ pub fn run_moe_decode(
                 p.dtypes.routed_down,
                 DType::MQ2G256Lloyd | DType::MQ3G256Lloyd
             ));
-    if !routed_down_self_combines && !p.defer_routed_combine {
+    if !ninepath_d4 && !routed_down_self_combines && !p.defer_routed_combine {
         hip!(gpu.moe_down_combine_k8_batched(
             p.down_expanded,
             p.topk_weights,

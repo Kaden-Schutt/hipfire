@@ -896,6 +896,8 @@ dependencies = [
  "hipfire-client",
  "hipfire-config",
  "hipfire-registry",
+ "hipfire-runtime",
+ "libc",
  "serde",
  "serde_json",
  "sha2",
@@ -1070,6 +1072,7 @@ name = "hsa-bridge"
 version = "0.3.0"
 dependencies = [
  "hip-bridge",
+ "hipfire-config",
  "libloading",
  "thiserror 2.0.18",
 ]
@@ -1747,7 +1750,7 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
 name = "radiowave"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -1952,6 +1955,7 @@ dependencies = [
 name = "redline-dispatch"
 version = "0.3.0"
 dependencies = [
+ "hipfire-config",
  "libloading",
  "proptest",
  "redline-rocr",
@@ -1963,6 +1967,7 @@ dependencies = [
 name = "redline-rocr"
 version = "0.3.0"
 dependencies = [
+ "hipfire-config",
  "libloading",
  "proptest",
 ]

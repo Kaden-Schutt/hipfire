@@ -9,6 +9,8 @@
 //! persistence, validation, and field-level provenance. Runtime crates consume
 //! resolved values; they do not parse user configuration in hot paths.
 
+pub mod rocm;
+
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -330,7 +332,12 @@ const KV_MODES: &[&str] = &[
     "turbo3", "turbo2",
 ];
 const AUTO_ON_OFF: &[&str] = &["auto", "on", "off"];
-const THINKING_BUDGETS: &[&str] = &["low", "med", "high", "xhigh", "max", "uncapped"];
+// `off` disables thinking outright. It resolves to a cap of 1, the engine's
+// established "no thinking" sentinel (the daemon reads
+// `enable_thinking: max_think_tokens != 1`) and the same value the OpenAI
+// `enable_thinking=false` / `reasoning_effort="none"` paths already send. It is
+// NOT 0 — 0 means `uncapped` (think until the model closes the block itself).
+const THINKING_BUDGETS: &[&str] = &["off", "low", "med", "high", "xhigh", "max", "uncapped"];
 const SPECULATION_MODES: &[&str] = &["off", "auto", "ngram", "dflash", "mtp", "dspark"];
 
 macro_rules! field {
@@ -760,6 +767,28 @@ pub static FIELDS: &[ConfigField] = &[
         false,
         Some("HIPFIRE_SERVE_QUEUE_TIMEOUT_MS"),
         "Maximum admission-queue wait."
+    ),
+    process_bool_field!(
+        "serve.retry_enabled",
+        "retry_enabled",
+        Serve,
+        false,
+        true,
+        "HIPFIRE_SERVE_RETRY_ENABLED",
+        "Server-owned single retry on typed transient daemon failures; promoted only after merged-path GPU parity."
+    ),
+    process_field!(
+        "serve.retry_backoff_ms",
+        "retry_backoff_ms",
+        Serve,
+        DefaultValue::Integer(50),
+        ValueRule::Integer {
+            min: 0,
+            max: 60000
+        },
+        true,
+        "HIPFIRE_SERVE_RETRY_BACKOFF_MS",
+        "Backoff before the single serve retry; slept outside runtime and admission locks."
     ),
     field!(
         "experimental.budget_alert",
@@ -2248,7 +2277,7 @@ pub static FIELDS: &[ConfigField] = &[
         experimental: false,
         env_compat: Some("HIPFIRE_REPLAY_BACKEND"),
         include_builtin_in_process_config: false,
-        help: "Preferred launch backend, subject to immutable admission policy.",
+        help: "Preferred launch backend; runtime default selection is distinct from certification/admission.",
     },
     process_field!(
         "replay.transport",
@@ -2258,7 +2287,14 @@ pub static FIELDS: &[ConfigField] = &[
         ValueRule::Enum(&["auto", "aql", "pm4", "pm4_ib", "ib"]),
         true,
         "HIPFIRE_REPLAY_TRANSPORT",
-        "Retained replay transport; auto follows the certified model route."
+        "Retained replay transport; auto follows the runtime default route predicate, not certification/admission."
+    ),
+    diagnostic_bool_field!(
+        "diagnostic.replay.route_proof_log",
+        "replay_route_proof_log",
+        false,
+        "HIPFIRE_REPLAY_ROUTE_PROOF_LOG",
+        "When enabled, the daemon emits one post-generate retained-route proof marker per successful request (fields: transport, position, request_id, replays) so product coherence can prove route identity without enabling capture."
     ),
     diagnostic_bool_field!(
         "diagnostic.replay.manual_capture",
@@ -2266,6 +2302,28 @@ pub static FIELDS: &[ConfigField] = &[
         false,
         "HIPFIRE_REPLAY_MANUAL_CAPTURE",
         "Arm replay recording manually instead of using the model lifecycle."
+    ),
+    diagnostic_bool_field!(
+        "diagnostic.replay.pool_debug",
+        "replay_pool_debug",
+        false,
+        "HIPFIRE_REDLINE_POOL_DEBUG",
+        "Report which memory pool backs the retained indirect buffer."
+    ),
+    diagnostic_bool_field!(
+        "diagnostic.replay.dispatch_profile",
+        "replay_dispatch_profile",
+        false,
+        "HIPFIRE_REDLINE_DISPATCH_PROFILE",
+        "Emit a GPU-clock write per dispatch and report the span distribution. \
+         Changes the tape identity, so an instrumented run cannot satisfy a golden fixture."
+    ),
+    diagnostic_bool_field!(
+        "diagnostic.compiler.no_device_compiler",
+        "no_device_compiler",
+        false,
+        "HIPFIRE_NO_DEVICE_COMPILER",
+        "Treat the device compiler as absent so pre-compiled code objects are used verbatim."
     ),
     diagnostic_field!(
         "diagnostic.replay.pm4_min_parallel_width",
@@ -2438,6 +2496,7 @@ const BOOTSTRAP_ENV: &[&str] = &[
     "HIPFIRE_TUI_BIN",
     "HIPFIRE_CLI_BIN",
     "HIPFIRE_HF_BASE",
+    "HF_ENDPOINT",
     "HIPFIRE_REGISTRY_URL",
     "HIPFIRE_NO_REGISTRY_FETCH",
     "HIPFIRE_KERNEL_CACHE",
@@ -3020,6 +3079,7 @@ pub struct LoadedCatalog {
 pub struct ConfigPaths {
     pub root: PathBuf,
     pub models: PathBuf,
+    pub profiles: PathBuf,
     pub config_toml: PathBuf,
     pub config_json: PathBuf,
     pub models_toml: PathBuf,
@@ -3044,6 +3104,7 @@ impl ConfigPaths {
         let root = root.into();
         Self {
             models: root.join("models"),
+            profiles: root.join("profiles"),
             config_toml: root.join("config.toml"),
             config_json: root.join("config.json"),
             models_toml: root.join("models.toml"),
@@ -3643,6 +3704,10 @@ fn from_json_value(value: &serde_json::Value) -> Option<ConfigValue> {
 }
 
 pub fn write_global_toml(paths: &ConfigPaths, layer: &ConfigLayer) -> Result<()> {
+    write_layer_toml(&paths.config_toml, layer)
+}
+
+fn write_layer_toml(path: &Path, layer: &ConfigLayer) -> Result<()> {
     layer.validate()?;
     let mut root = toml::map::Map::new();
     root.insert(
@@ -3657,10 +3722,10 @@ pub fn write_global_toml(paths: &ConfigPaths, layer: &ConfigLayer) -> Result<()>
     }
     let rendered =
         toml::to_string_pretty(&toml::Value::Table(root)).map_err(|source| ConfigError::Parse {
-            path: paths.config_toml.clone(),
+            path: path.to_owned(),
             message: source.to_string(),
         })?;
-    atomic_write(&paths.config_toml, rendered.as_bytes())
+    atomic_write(path, rendered.as_bytes())
 }
 
 fn insert_toml_path(
@@ -3708,6 +3773,322 @@ fn read_string(path: &Path) -> Result<String> {
     fs::read_to_string(path).map_err(|source| ConfigError::Read {
         path: path.to_owned(),
         source,
+    })
+}
+
+/// Built-in configuration profile names selectable via `hipfire config profile set`.
+///
+/// Custom profiles live under `~/.hipfire/profiles/<name>.toml`. Profile names are
+/// control-plane identifiers only; they are never persisted inside `config.toml`.
+pub const CONFIG_PROFILE_NAMES: &[&str] = &["default", "dev", "hip", "redline"];
+
+/// Origin of a selectable configuration profile.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConfigProfileKind {
+    Builtin,
+    Custom,
+}
+
+/// One built-in or on-disk custom profile entry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConfigProfileEntry {
+    pub name: String,
+    pub kind: ConfigProfileKind,
+    pub path: Option<PathBuf>,
+}
+
+/// Validate a custom profile name.
+///
+/// Accepts a single path segment of ASCII letters, digits, `.`, `_`, or `-`.
+/// Rejects empty names, built-in names, path separators, and traversal markers.
+pub fn validate_config_profile_name(name: &str) -> Result<()> {
+    if name.is_empty() {
+        return Err(ConfigError::InvalidValue {
+            key: "profile".to_owned(),
+            message: "profile name must not be empty".to_owned(),
+        });
+    }
+    if CONFIG_PROFILE_NAMES.contains(&name) {
+        return Err(ConfigError::InvalidValue {
+            key: "profile".to_owned(),
+            message: format!("'{name}' is a built-in profile name and cannot be overwritten"),
+        });
+    }
+    if name == "." || name == ".." || name.contains('/') || name.contains('\\') {
+        return Err(ConfigError::InvalidValue {
+            key: "profile".to_owned(),
+            message: format!("invalid profile name '{name}'"),
+        });
+    }
+    if !name
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
+    {
+        return Err(ConfigError::InvalidValue {
+            key: "profile".to_owned(),
+            message: format!(
+                "invalid profile name '{name}'; use ASCII letters, digits, '.', '_', or '-'"
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Path for a custom profile TOML file under `paths.profiles`.
+pub fn custom_config_profile_path(paths: &ConfigPaths, name: &str) -> Result<PathBuf> {
+    validate_config_profile_name(name)?;
+    Ok(paths.profiles.join(format!("{name}.toml")))
+}
+
+/// Load the sparse layer for a built-in or custom profile.
+pub fn load_config_profile(paths: &ConfigPaths, name: &str) -> Result<ConfigLayer> {
+    if let Some(layer) = builtin_config_profile_layer(name) {
+        return Ok(layer);
+    }
+    let path = custom_config_profile_path(paths, name)?;
+    if !path.exists() {
+        return Err(ConfigError::InvalidValue {
+            key: "profile".to_owned(),
+            message: format!(
+                "unknown profile '{name}'; expected one of {} or a custom profile in {}",
+                CONFIG_PROFILE_NAMES.join(", "),
+                paths.profiles.display()
+            ),
+        });
+    }
+    load_toml_layer(&path)
+}
+
+/// Replace `layer` entirely with the selected profile contents.
+///
+/// Selection is a deterministic full cutover of the sparse global config: every
+/// previous override is discarded and only the profile layer remains.
+pub fn apply_config_profile(
+    layer: &mut ConfigLayer,
+    paths: &ConfigPaths,
+    name: &str,
+) -> Result<()> {
+    *layer = load_config_profile(paths, name)?;
+    Ok(())
+}
+
+/// Snapshot `layer` as a new custom profile. Fails when the name is a built-in,
+/// invalid, or already present on disk.
+pub fn create_config_profile(
+    paths: &ConfigPaths,
+    name: &str,
+    layer: &ConfigLayer,
+) -> Result<PathBuf> {
+    let path = custom_config_profile_path(paths, name)?;
+    if path.exists() {
+        return Err(ConfigError::InvalidValue {
+            key: "profile".to_owned(),
+            message: format!("profile '{name}' already exists at {}", path.display()),
+        });
+    }
+    write_layer_toml(&path, layer)?;
+    Ok(path)
+}
+
+/// List built-in profiles followed by custom on-disk profiles (sorted).
+pub fn list_config_profiles(paths: &ConfigPaths) -> Result<Vec<ConfigProfileEntry>> {
+    let mut entries: Vec<ConfigProfileEntry> = CONFIG_PROFILE_NAMES
+        .iter()
+        .map(|name| ConfigProfileEntry {
+            name: (*name).to_owned(),
+            kind: ConfigProfileKind::Builtin,
+            path: None,
+        })
+        .collect();
+    if paths.profiles.is_dir() {
+        let mut custom = Vec::new();
+        for entry in fs::read_dir(&paths.profiles).map_err(|source| ConfigError::Read {
+            path: paths.profiles.clone(),
+            source,
+        })? {
+            let entry = entry.map_err(|source| ConfigError::Read {
+                path: paths.profiles.clone(),
+                source,
+            })?;
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("toml") {
+                continue;
+            }
+            let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+                continue;
+            };
+            if validate_config_profile_name(stem).is_err() {
+                continue;
+            }
+            custom.push(ConfigProfileEntry {
+                name: stem.to_owned(),
+                kind: ConfigProfileKind::Custom,
+                path: Some(path),
+            });
+        }
+        custom.sort_by(|left, right| left.name.cmp(&right.name));
+        entries.extend(custom);
+    }
+    Ok(entries)
+}
+
+/// Detect which named profile, if any, exactly matches `layer`.
+///
+/// Built-ins are checked first; custom profiles are matched by exact layer
+/// equality against files under `paths.profiles`.
+pub fn detect_config_profile(paths: &ConfigPaths, layer: &ConfigLayer) -> Option<String> {
+    for name in CONFIG_PROFILE_NAMES {
+        if let Some(bundle) = builtin_config_profile_layer(name) {
+            if &bundle == layer {
+                return Some((*name).to_owned());
+            }
+        }
+    }
+    let Ok(entries) = list_config_profiles(paths) else {
+        return None;
+    };
+    for entry in entries {
+        if entry.kind != ConfigProfileKind::Custom {
+            continue;
+        }
+        let Ok(candidate) = load_config_profile(paths, &entry.name) else {
+            continue;
+        };
+        if &candidate == layer {
+            return Some(entry.name);
+        }
+    }
+    None
+}
+
+fn builtin_config_profile_layer(name: &str) -> Option<ConfigLayer> {
+    let pairs = config_profile_bundle(name)?;
+    let mut layer = ConfigLayer::default();
+    for (key, value) in pairs {
+        layer
+            .set(key, value)
+            .expect("built-in profile values must validate");
+    }
+    Some(layer)
+}
+
+fn config_profile_bundle(name: &str) -> Option<Vec<(&'static str, ConfigValue)>> {
+    Some(match name {
+        "default" => vec![
+            ("generation.max_tokens", ConfigValue::Integer(4096)),
+            ("generation.loop_guard_threshold", ConfigValue::Integer(0)),
+            ("generation.loop_guard_window", ConfigValue::Integer(256)),
+            ("reasoning.mode", ConfigValue::String("on".to_owned())),
+            ("reasoning.budget", ConfigValue::String("xhigh".to_owned())),
+            ("reasoning.max_total_tokens", ConfigValue::Integer(0)),
+            ("memory.kv_cache", ConfigValue::String("q8".to_owned())),
+            ("memory.max_seq", ConfigValue::Integer(32768)),
+            ("memory.prompt_cache_capacity", ConfigValue::Integer(32)),
+            ("memory.prompt_cache_unbounded", ConfigValue::Bool(false)),
+            ("attention.flash", ConfigValue::String("auto".to_owned())),
+            ("prompt.normalize", ConfigValue::Bool(true)),
+            ("prompt.default_chatml", ConfigValue::Bool(true)),
+            ("speculation.mode", ConfigValue::String("auto".to_owned())),
+            ("speculation.dflash", ConfigValue::String("off".to_owned())),
+            ("speculation.mtp", ConfigValue::String("auto".to_owned())),
+            ("speculation.mtp_k", ConfigValue::Integer(3)),
+            ("speculation.ngram", ConfigValue::String("off".to_owned())),
+            ("serve.host", ConfigValue::String("0.0.0.0".to_owned())),
+            ("serve.port", ConfigValue::Integer(11435)),
+            ("serve.idle_timeout_seconds", ConfigValue::Integer(300)),
+            ("serve.local", ConfigValue::Bool(false)),
+        ],
+        "dev" => vec![
+            ("hardware.devices", ConfigValue::String("0".to_owned())),
+            ("hardware.allow_mixed_arch", ConfigValue::Bool(false)),
+            ("hardware.tp_use_rccl", ConfigValue::Bool(true)),
+            ("kernel.mmq", ConfigValue::String("auto".to_owned())),
+            ("kernel.prefill_batched", ConfigValue::Bool(true)),
+            ("kernel.lm_head_f16", ConfigValue::String("auto".to_owned())),
+            (
+                "experimental.graph.forward",
+                ConfigValue::String("auto".to_owned()),
+            ),
+            ("experimental.graph.ar", ConfigValue::Bool(true)),
+            ("experimental.graph.moe", ConfigValue::Bool(true)),
+            ("diagnostic.prompt_token_heat", ConfigValue::Bool(false)),
+            ("diagnostic.prompt_heat_json", ConfigValue::Bool(false)),
+            ("diagnostic.prompt_heat_limit", ConfigValue::Integer(64)),
+            (
+                "diagnostic.kernel.gemv_rows",
+                ConfigValue::String("4".to_owned()),
+            ),
+            (
+                "diagnostic.kernel.gfx11_weight_load_policy",
+                ConfigValue::String("buffer".to_owned()),
+            ),
+            ("developer.verify_graph", ConfigValue::Bool(false)),
+            ("developer.dspark_profile", ConfigValue::Bool(true)),
+        ],
+        "hip" => vec![("replay.backend", ConfigValue::String("hip".to_owned()))],
+        "redline" => vec![
+            ("replay.backend", ConfigValue::String("redline".to_owned())),
+            ("replay.transport", ConfigValue::String("pm4".to_owned())),
+            (
+                "replay.pm4_gfx11_vmem_acquire",
+                ConfigValue::String("auto".to_owned()),
+            ),
+            ("diagnostic.replay.manual_capture", ConfigValue::Bool(false)),
+            (
+                "diagnostic.replay.pm4_min_parallel_width",
+                ConfigValue::Integer(2),
+            ),
+            (
+                "diagnostic.replay.pm4_min_parallel_workgroups",
+                ConfigValue::Integer(0),
+            ),
+            (
+                "diagnostic.replay.pm4_native_phases",
+                ConfigValue::Bool(false),
+            ),
+            (
+                "diagnostic.replay.pm4_queues",
+                ConfigValue::String("1".to_owned()),
+            ),
+            (
+                "diagnostic.replay.pm4_register_policy",
+                ConfigValue::String("static".to_owned()),
+            ),
+            (
+                "diagnostic.replay.pm4_wait_policy",
+                ConfigValue::String("resource".to_owned()),
+            ),
+            (
+                "diagnostic.replay.pm4_acquire_policy",
+                ConfigValue::String("required-only".to_owned()),
+            ),
+            ("diagnostic.replay.pm4_gcr_trim", ConfigValue::Bool(true)),
+            (
+                "diagnostic.replay.pm4_dynamic_grid",
+                ConfigValue::Bool(false),
+            ),
+            (
+                "diagnostic.replay.gfx1151_initiator",
+                ConfigValue::String("legacy".to_owned()),
+            ),
+            (
+                "diagnostic.replay.gfx1151_interleave",
+                ConfigValue::String("inherit".to_owned()),
+            ),
+            (
+                "diagnostic.replay.gfx1151_resource_limits",
+                ConfigValue::String("legacy".to_owned()),
+            ),
+            (
+                "diagnostic.replay.gfx1151_cu_count",
+                ConfigValue::String("all".to_owned()),
+            ),
+            (
+                "diagnostic.replay.gfx1151_entry_acquire",
+                ConfigValue::String("system".to_owned()),
+            ),
+        ],
+        _ => return None,
     })
 }
 
@@ -4063,6 +4444,32 @@ mod tests {
     }
 
     #[test]
+    fn diagnostic_replay_route_proof_log_lowers_from_toml() {
+        let mut global = ConfigLayer::default();
+        global
+            .set_cli("diagnostic.replay.route_proof_log", "true")
+            .unwrap();
+        let resolved = resolve([NamedLayer {
+            source: ConfigSource::GlobalUser {
+                path: PathBuf::from("config.toml"),
+            },
+            layer: global,
+        }])
+        .unwrap();
+        let process = ProcessConfig::from_resolved(&resolved).unwrap();
+        assert_eq!(
+            process
+                .legacy_value("HIPFIRE_REPLAY_ROUTE_PROOF_LOG")
+                .as_deref(),
+            Some("1")
+        );
+        assert_eq!(
+            process.values.get("diagnostic.replay.route_proof_log"),
+            Some(&ConfigValue::Bool(true))
+        );
+    }
+
+    #[test]
     fn device_visibility_is_one_synchronized_physical_list() {
         let mut layer = ConfigLayer::default();
         layer.set_cli("hardware.devices", " 3, 1 ").unwrap();
@@ -4123,5 +4530,169 @@ mod tests {
                 panic!("{} is not a valid config profile: {error}", path.display())
             });
         }
+    }
+
+    #[test]
+    fn apply_config_profile_replaces_entire_sparse_layer() {
+        let root = temp_root("profile-replace");
+        let paths = ConfigPaths::under(&root);
+        let mut layer = ConfigLayer::default();
+        layer
+            .set("generation.temperature", ConfigValue::Float(0.42))
+            .unwrap();
+        layer
+            .set(
+                "developer.custom_experiment",
+                ConfigValue::String("drop-me".into()),
+            )
+            .unwrap();
+
+        apply_config_profile(&mut layer, &paths, "dev").unwrap();
+
+        let expected = load_config_profile(&paths, "dev").unwrap();
+        assert_eq!(layer, expected);
+        assert!(layer.get("generation.temperature").is_none());
+        assert!(layer.get("developer.custom_experiment").is_none());
+        assert_eq!(
+            detect_config_profile(&paths, &layer).as_deref(),
+            Some("dev")
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn apply_config_profile_materializes_builtin_bundles() {
+        let root = temp_root("profile-builtins");
+        let paths = ConfigPaths::under(&root);
+        for name in CONFIG_PROFILE_NAMES {
+            let mut layer = ConfigLayer::default();
+            apply_config_profile(&mut layer, &paths, name).unwrap();
+            let expected = builtin_config_profile_layer(name).unwrap();
+            assert_eq!(layer, expected, "profile {name}");
+            assert_eq!(
+                detect_config_profile(&paths, &layer).as_deref(),
+                Some(*name)
+            );
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn hip_profile_is_an_explicit_redline_opt_out() {
+        let paths = ConfigPaths::under(temp_root("profile-hip"));
+        let layer = load_config_profile(&paths, "hip").unwrap();
+        assert_eq!(
+            layer.get("replay.backend"),
+            Some(&ConfigValue::String("hip".to_owned()))
+        );
+        let _ = fs::remove_dir_all(paths.root);
+    }
+
+    #[test]
+    fn apply_config_profile_rejects_unknown_names() {
+        let root = temp_root("profile-unknown");
+        let paths = ConfigPaths::under(&root);
+        let mut layer = ConfigLayer::default();
+        layer.set("serve.port", ConfigValue::Integer(9)).unwrap();
+        let before = layer.clone();
+        let err = apply_config_profile(&mut layer, &paths, "staging").unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("unknown profile 'staging'"), "{message}");
+        assert_eq!(layer, before, "failed apply must not mutate layer");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn create_config_profile_snapshots_and_rejects_duplicates() {
+        let root = temp_root("profile-create");
+        let paths = ConfigPaths::under(&root);
+        let mut layer = ConfigLayer::default();
+        layer.set_cli("memory.kv_cache", "q8").unwrap();
+        layer.set_cli("serve.port", "12000").unwrap();
+
+        let path = create_config_profile(&paths, "lab", &layer).unwrap();
+        assert_eq!(path, paths.profiles.join("lab.toml"));
+        assert!(path.is_file());
+        let loaded = load_config_profile(&paths, "lab").unwrap();
+        assert_eq!(loaded, layer);
+
+        let err = create_config_profile(&paths, "lab", &layer).unwrap_err();
+        assert!(err.to_string().contains("already exists"), "{}", err);
+        let builtin = create_config_profile(&paths, "default", &layer).unwrap_err();
+        assert!(builtin.to_string().contains("built-in"), "{}", builtin);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn validate_config_profile_name_rejects_traversal_and_invalid() {
+        assert!(validate_config_profile_name("lab").is_ok());
+        assert!(validate_config_profile_name("lab-1").is_ok());
+        for bad in [
+            "",
+            "default",
+            "dev",
+            "redline",
+            "hip",
+            "..",
+            "../x",
+            "a/b",
+            "a\\b",
+            "has space",
+            "ü",
+        ] {
+            assert!(
+                validate_config_profile_name(bad).is_err(),
+                "expected rejection for {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn list_config_profiles_includes_builtins_and_custom() {
+        let root = temp_root("profile-list");
+        let paths = ConfigPaths::under(&root);
+        let mut layer = ConfigLayer::default();
+        layer.set_cli("serve.host", "127.0.0.1").unwrap();
+        create_config_profile(&paths, "zeta", &layer).unwrap();
+        create_config_profile(&paths, "alpha", &layer).unwrap();
+        let names: Vec<_> = list_config_profiles(&paths)
+            .unwrap()
+            .into_iter()
+            .map(|entry| (entry.name, entry.kind))
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                ("default".into(), ConfigProfileKind::Builtin),
+                ("dev".into(), ConfigProfileKind::Builtin),
+                ("hip".into(), ConfigProfileKind::Builtin),
+                ("redline".into(), ConfigProfileKind::Builtin),
+                ("alpha".into(), ConfigProfileKind::Custom),
+                ("zeta".into(), ConfigProfileKind::Custom),
+            ]
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn config_profile_bundles_match_documented_examples() {
+        let docs = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../docs/configs");
+        let paths = ConfigPaths::under(temp_root("profile-docs"));
+        let pairs = [
+            ("default", "user.toml"),
+            ("dev", "developer.toml"),
+            ("redline", "redline-pm4.toml"),
+        ];
+        for (name, file) in pairs {
+            let path = docs.join(file);
+            let example = load_toml_layer(&path)
+                .unwrap_or_else(|error| panic!("{} failed to load: {error}", path.display()));
+            let applied = load_config_profile(&paths, name).unwrap();
+            assert_eq!(
+                applied, example,
+                "profile {name} must match docs/configs/{file}"
+            );
+        }
+        let _ = fs::remove_dir_all(paths.root);
     }
 }

@@ -4,7 +4,7 @@
 use radiowave::{
     ArchProfile, CampaignLedger, CampaignStarted, CandidateSubmission, CandidateVerdict,
     CompileRequest, Compiler, Inspector, KernelReport, ResourceAssessment, ResourceContract,
-    SchedulerProfile, Wavefront, resolve_hipcc, support_header_path,
+    SchedulerProfile, Wavefront, materialize_support_header, resolve_hipcc,
 };
 use std::env;
 use std::error::Error;
@@ -22,7 +22,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some("assess") => assess(args.collect()),
         Some("campaign") => campaign(args.collect()),
         Some("header") => {
-            println!("{}", support_header_path().display());
+            let path = materialize_support_header(&support_header_cache_directory())?;
+            println!("{}", path.display());
             Ok(())
         }
         Some("--help" | "-h") | None => {
@@ -31,6 +32,21 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
         Some(command) => Err(format!("unknown command {command}").into()),
     }
+}
+
+fn support_header_cache_directory() -> PathBuf {
+    let cache_root = env::var_os("XDG_CACHE_HOME")
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .or_else(|| {
+            env::var_os("HOME")
+                .filter(|path| !path.is_empty())
+                .map(PathBuf::from)
+                .map(|home| home.join(".cache"))
+        })
+        .unwrap_or_else(env::temp_dir);
+    cache_root.join("radiowave")
 }
 
 fn compile(args: Vec<OsString>) -> Result<(), Box<dyn Error>> {
@@ -46,6 +62,9 @@ fn compile(args: Vec<OsString>) -> Result<(), Box<dyn Error>> {
     let mut defines = Vec::new();
     let mut extra_args = Vec::new();
     let mut inspect = true;
+    // Preserve the existing hipfire/Redline arithmetic contract. Strict math
+    // remains available through --no-fast-math, but beta integration must not
+    // silently change emitted kernels.
     let mut fast_math = true;
     let mut iter = args.into_iter();
     while let Some(arg) = iter.next() {
@@ -74,6 +93,7 @@ fn compile(args: Vec<OsString>) -> Result<(), Box<dyn Error>> {
             }
             Some("--arg") => extra_args.push(next(&mut iter, "--arg")?),
             Some("--no-inspect") => inspect = false,
+            Some("--fast-math") => fast_math = true,
             Some("--no-fast-math") => fast_math = false,
             Some("--help" | "-h") => {
                 usage();
@@ -777,7 +797,7 @@ where
 
 fn usage() {
     println!(
-        "radiowave compile --source KERNEL.hip --output KERNEL.hsaco --arch TARGET [--wave32|--wave64] [--scheduler-profile default|max-ilp|iterative-ilp|memory-clause|pipeline-ilp] [--define NAME=VALUE] [--arg FLAG] [--manifest PATH] [--no-inspect]\n\
+        "radiowave compile --source KERNEL.hip --output KERNEL.hsaco --arch TARGET [--wave32|--wave64] [--scheduler-profile default|max-ilp|iterative-ilp|memory-clause|pipeline-ilp] [--define NAME=VALUE] [--arg FLAG] [--manifest PATH] [--no-inspect] [--fast-math|--no-fast-math]\n\
          radiowave inspect --input KERNEL.hsaco --arch TARGET\n\
          radiowave oracle hip --manifest MANIFEST.json --kernel NAME --workgroup X[,Y,Z] [--output REPORT.json]\n\
          radiowave oracle aco --input ACO.dump --input-artifact SHADER.spv --kernel NAME --arch TARGET --wavefront 32|64 [--workgroup X,Y,Z] [--compiler-version TEXT] [--output REPORT.json]\n\

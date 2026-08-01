@@ -84,7 +84,7 @@ if [ -z "$BASELINE_ARCH" ]; then
 fi
 
 BASELINE_FILE="tests/speed-baselines/${BASELINE_ARCH}.txt"
-MODELS_DIR="${HIPFIRE_MODELS_DIR:-/home/kaden/ClaudeCode/autorocm/hipfire/models}"
+MODELS_DIR="${HIPFIRE_MODELS_DIR:-${HIPFIRE_DIR:-$HOME/.hipfire}/models}"
 
 FAST=0
 UPDATE=0

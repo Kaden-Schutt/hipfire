@@ -71,7 +71,9 @@ fn moe_grouped_m_total_bound(total_slots: usize, n_exp: usize) -> usize {
 /// validation prompt and ~9× faster prefill.
 fn q8_wmma_enabled() -> bool {
     static EN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *EN.get_or_init(|| hipfire_config::developer_var("HIPFIRE_COHERE2MOE_Q8_SCALAR").as_deref() != Ok("1"))
+    *EN.get_or_init(|| {
+        hipfire_config::developer_var("HIPFIRE_COHERE2MOE_Q8_SCALAR").as_deref() != Ok("1")
+    })
 }
 
 #[inline]

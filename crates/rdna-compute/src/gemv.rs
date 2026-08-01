@@ -3201,6 +3201,29 @@ impl Gpu {
         eps: f32,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        let k = n_heads.checked_mul(head_dim).ok_or_else(|| {
+            hip_bridge::HipError::new(1, "gated_norm_rotate_mq_gfx1100: size overflow")
+        })?;
+        if n_heads != 32 || head_dim != 128 {
+            return Err(hip_bridge::HipError::new(
+                1,
+                "gated_norm_rotate_mq_gfx1100: expected 32 heads with head_dim=128",
+            ));
+        }
+        if x.numel() < k || z.numel() < k || weight.numel() < head_dim || x_rot.numel() < k {
+            return Err(hip_bridge::HipError::new(
+                1,
+                &format!(
+                    "gated_norm_rotate_mq_gfx1100: undersized tensor (x={}, z={}, weight={}, x_rot={}, required x/z/x_rot={}, weight={})",
+                    x.numel(),
+                    z.numel(),
+                    weight.numel(),
+                    x_rot.numel(),
+                    k,
+                    head_dim,
+                ),
+            ));
+        }
         self.ensure_mq_signs()?;
         let (module, src, kernel) = if self.arch_caps.is_gfx1151() {
             (
@@ -3237,7 +3260,6 @@ impl Gpu {
             &hd as *const _ as *mut c_void,
             &ep as *const _ as *mut c_void,
         ];
-        let k = n_heads * head_dim;
         let bytes = crate::profile::gated_norm_bytes(k) + crate::profile::mq_rotate_bytes(k);
         let timer = crate::profile::begin_timer(&self.hip, "fused", kernel, bytes);
         let result = self.launch_maybe_blob(
@@ -8538,6 +8560,135 @@ impl Gpu {
     /// expanded slots in fixed rank order into `x_residual`. The caller must
     /// allocate and initially zero `batch_size * ceil(m/4)` f32-sized counter
     /// slots after the `[batch_size * k_top * m]` payload.
+    /// Nine-path fused MoE gate_up (routed k=8, decode T=1): one CTA stages
+    /// x into LDS once; 8 routed-expert warps share it. Replaces
+    /// `gemv_hfq4g256_moe_gate_up_k8_indexed` — byte-exact per-row math.
+    /// Grid: (mi/8, 1, 1); block 256 (8 warps × 32).
+    pub fn gemv_hfq4g256_moe_ninepath_d3(
+        &mut self,
+        expert_ptrs: &GpuTensor,
+        topk_indices: &GpuTensor,
+        x: &GpuTensor,
+        y_gate: &GpuTensor,
+        y_up: &GpuTensor,
+        mi: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemv_hfq4g256_moe_ninepath_d3",
+            kernels::GEMV_HFQ4G256_MOE_NINEPATH_D3_SRC,
+            "gemv_hfq4g256_moe_ninepath_d3",
+        )?;
+        let pp = expert_ptrs.buf.as_ptr();
+        let ip = topk_indices.buf.as_ptr();
+        let xp = x.buf.as_ptr();
+        let ygp = y_gate.buf.as_ptr();
+        let yup = y_up.buf.as_ptr();
+        let mi_val = mi as i32;
+        let k_val = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &pp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &ygp as *const _ as *mut c_void,
+            &yup as *const _ as *mut c_void,
+            &mi_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+        ];
+        let bytes = 8 * crate::profile::gemv_hfq4g256_bytes(2 * mi, k) + k * 4;
+        let timer =
+            crate::profile::begin_timer(&self.hip, "gemv", "gemv_hfq4g256_moe_ninepath_d3", bytes);
+        let result = self.launch_maybe_blob(
+            "gemv_hfq4g256_moe_ninepath_d3",
+            [(mi as u32) / 8, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(pp);
+                b.push_ptr(ip);
+                b.push_ptr(xp);
+                b.push_ptr(ygp);
+                b.push_ptr(yup);
+                b.push_i32(mi_val);
+                b.push_i32(k_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// Nine-path fused MoE down + weighted combine (routed k=8, decode T=1):
+    /// folds the expanded [8 × down_m] intermediate in LDS and applies the
+    /// k-ordered weighted fold in-kernel (no atomics). Replaces
+    /// `gemv_hfq4g256_moe_down_k8_indexed_batched_expanded` +
+    /// `moe_down_combine_k8_batched` — byte-exact at down_k=512.
+    /// Grid: (down_m/16, 1, 1); block 256 (8 warps × 32).
+    pub fn gemv_hfq4g256_moe_ninepath_d4(
+        &mut self,
+        expert_ptrs: &GpuTensor,
+        topk_indices: &GpuTensor,
+        topk_weights: &GpuTensor,
+        rot_batch: &GpuTensor,
+        out: &GpuTensor,
+        down_m: usize,
+        down_k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemv_hfq4g256_moe_ninepath_d4",
+            kernels::GEMV_HFQ4G256_MOE_NINEPATH_D4_SRC,
+            "gemv_hfq4g256_moe_ninepath_d4",
+        )?;
+        let pp = expert_ptrs.buf.as_ptr();
+        let ip = topk_indices.buf.as_ptr();
+        let wp = topk_weights.buf.as_ptr();
+        let xp = rot_batch.buf.as_ptr();
+        let op = out.buf.as_ptr();
+        let dm_val = down_m as i32;
+        let dk_val = down_k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &pp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &dm_val as *const _ as *mut c_void,
+            &dk_val as *const _ as *mut c_void,
+        ];
+        let bytes =
+            8 * crate::profile::gemv_hfq4g256_bytes(down_m, down_k) + 8 * down_k * 4 + down_m * 4;
+        let timer =
+            crate::profile::begin_timer(&self.hip, "gemv", "gemv_hfq4g256_moe_ninepath_d4", bytes);
+        let result = self.launch_maybe_blob(
+            "gemv_hfq4g256_moe_ninepath_d4",
+            [(down_m as u32) / 16, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(pp);
+                b.push_ptr(ip);
+                b.push_ptr(wp);
+                b.push_ptr(xp);
+                b.push_ptr(op);
+                b.push_i32(dm_val);
+                b.push_i32(dk_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn gemv_hfq4g256_moe_down_k8_indexed_last_combine(
         &mut self,

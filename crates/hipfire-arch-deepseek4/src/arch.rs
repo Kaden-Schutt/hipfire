@@ -1892,11 +1892,7 @@ impl DeepseekV4 {
                 "deepseek4: DSpark sidecar draft_head.weight present — \
                  using it for draft logits only"
             );
-            Some(Self::upload_quant_or_f16(
-                source,
-                gpu,
-                "draft_head.weight",
-            )?)
+            Some(Self::upload_quant_or_f16(source, gpu, "draft_head.weight")?)
         } else {
             None
         };

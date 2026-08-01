@@ -116,7 +116,7 @@ in
     github = {
       owner = lib.mkOption {
         type = lib.types.str;
-        default = "Kaden-Schutt";
+        default = "warpfront";
         description = "GitHub repository owner.";
       };
 

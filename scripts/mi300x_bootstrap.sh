@@ -25,7 +25,7 @@ HF_HOME="${HF_HOME:-${WORK}/hf-cache}"
 IMATRIX_DIR="${WORK}/imatrix"
 RESULTS_DIR="${WORK}/results"
 HIPFIRE_BRANCH="${HIPFIRE_BRANCH:-worktree-awq-raw-sumsq-converter}"
-HIPFIRE_REMOTE="${HIPFIRE_REMOTE:-https://github.com/Kaden-Schutt/hipfire.git}"
+HIPFIRE_REMOTE="${HIPFIRE_REMOTE:-https://github.com/warpfront/hipfire.git}"
 TARGET_ARCH="${TARGET_ARCH:-gfx942}"
 
 mkdir -p "$WORK" "$HF_HOME" "$IMATRIX_DIR" "$RESULTS_DIR"

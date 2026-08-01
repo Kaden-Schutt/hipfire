@@ -13,10 +13,10 @@
 # Apache-2.0 — inheriting would fail to resolve AND misstate the license.
 [package]
 name = "radiowave"
-version = "0.1.0"
+version.workspace = true
 edition = "2024"
 rust-version = "1.85"
-license = "Apache-2.0"
+license.workspace = true
 authors = ["Kaden Schutt"]
 repository = "https://github.com/Kaden-Schutt/redline"
 homepage = "https://github.com/Kaden-Schutt/redline"
@@ -24,7 +24,7 @@ description = "Policy-driven HIP compiler and AMDGPU code-object inspector for R
 
 [features]
 default = []
-# Experimental gfx12 OCP FP8 recipe catalog (Wave 2+). Off by default.
+# Experimental RDNA3/RDNA4 OCP FP8 recipe catalog (Wave 2+). Off by default.
 experimental-fp8 = []
 
 [dependencies]

@@ -30,13 +30,16 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::ffi::OsString;
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
 pub const HIP_SUPPORT_HEADER: &str = include_str!("../include/radiowave/hip.h");
+static SUPPORT_HEADER_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -189,6 +192,11 @@ pub struct CompileRequest {
     pub extra_args: Vec<OsString>,
     pub manifest: Option<PathBuf>,
     pub inspect: bool,
+    /// Environment applied only to the hipcc invocation.
+    ///
+    /// This lets callers pin a non-default ROCm root without mutating the
+    /// process environment used by inspection and replay.
+    pub envs: Vec<(OsString, OsString)>,
 }
 
 impl CompileRequest {
@@ -211,11 +219,17 @@ impl CompileRequest {
             extra_args: Vec::new(),
             manifest: None,
             inspect: true,
+            envs: Vec::new(),
         }
     }
 
     pub fn wavefront(mut self, wavefront: Wavefront) -> Self {
         self.wavefront = wavefront;
+        self
+    }
+
+    pub fn env(mut self, key: impl Into<OsString>, value: impl Into<OsString>) -> Self {
+        self.envs.push((key.into(), value.into()));
         self
     }
 
@@ -530,14 +544,13 @@ impl Compiler {
         if !source.is_file() {
             return Err(Error::MissingSource(source));
         }
-        if let Some(parent) = output.parent() {
-            fs::create_dir_all(parent)?;
-        }
-
-        let header = support_header_path();
+        let header = materialize_support_header(output.parent().unwrap_or(cwd.as_path()))?;
         let args = compile_args(request, &source, &output, &header);
         let mut command = Command::new(&request.hipcc);
         command.args(&args).current_dir(&cwd);
+        for (key, value) in &request.envs {
+            command.env(key, value);
+        }
         checked_output(&mut command, "hipcc")?;
 
         let output_sha256 = sha256_file(&output)?;
@@ -750,8 +763,53 @@ impl Inspector {
     }
 }
 
-pub fn support_header_path() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("include/radiowave/hip.h")
+pub fn materialize_support_header(directory: &Path) -> Result<PathBuf> {
+    fs::create_dir_all(directory)?;
+    let digest = sha256_bytes(HIP_SUPPORT_HEADER.as_bytes());
+    let path = directory.join(format!(".radiowave-hip-{digest}.h"));
+    if support_header_matches(&path)? {
+        return Ok(path);
+    }
+
+    let sequence = SUPPORT_HEADER_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let temporary = directory.join(format!(
+        ".radiowave-hip-{digest}.{}.{}.{}.tmp",
+        std::process::id(),
+        timestamp,
+        sequence
+    ));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)?;
+    if let Err(error) = file.write_all(HIP_SUPPORT_HEADER.as_bytes()) {
+        drop(file);
+        let _ = fs::remove_file(&temporary);
+        return Err(error.into());
+    }
+    drop(file);
+
+    if let Err(error) = fs::rename(&temporary, &path) {
+        if support_header_matches(&path)? {
+            let _ = fs::remove_file(&temporary);
+            return Ok(path);
+        }
+        let _ = fs::remove_file(&temporary);
+        return Err(error.into());
+    }
+    Ok(path)
+}
+
+fn support_header_matches(path: &Path) -> Result<bool> {
+    match fs::read(path) {
+        Ok(bytes) => Ok(bytes == HIP_SUPPORT_HEADER.as_bytes()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn compile_args(
@@ -1540,6 +1598,51 @@ amdhsa.kernels:
             serde_json::to_string(&Wavefront::Wave64).unwrap(),
             "\"wave64\""
         );
+    }
+
+    #[test]
+    fn support_header_is_materialized_without_build_tree_dependency() {
+        let directory = env::temp_dir().join(format!(
+            "radiowave-header-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+
+        let first = materialize_support_header(&directory).unwrap();
+        assert_eq!(first.parent(), Some(directory.as_path()));
+        assert_eq!(fs::read_to_string(&first).unwrap(), HIP_SUPPORT_HEADER);
+        assert!(!first.starts_with(env!("CARGO_MANIFEST_DIR")));
+
+        fs::write(&first, "corrupt").unwrap();
+        let second = materialize_support_header(&directory).unwrap();
+        assert_eq!(second, first);
+        assert_eq!(fs::read_to_string(&second).unwrap(), HIP_SUPPORT_HEADER);
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn compile_request_preserves_fast_math_unless_explicitly_disabled() {
+        let mut request = CompileRequest::new("kernel.hip", "kernel.hsaco", "gfx1151");
+        let default_args = compile_args(
+            &request,
+            Path::new("/tmp/kernel.hip"),
+            Path::new("/tmp/kernel.hsaco"),
+            Path::new("/tmp/radiowave.h"),
+        );
+        assert!(default_args.iter().any(|arg| arg == "-ffast-math"));
+
+        request.fast_math = false;
+        let strict_args = compile_args(
+            &request,
+            Path::new("/tmp/kernel.hip"),
+            Path::new("/tmp/kernel.hsaco"),
+            Path::new("/tmp/radiowave.h"),
+        );
+        assert!(!strict_args.iter().any(|arg| arg == "-ffast-math"));
     }
 
     #[test]

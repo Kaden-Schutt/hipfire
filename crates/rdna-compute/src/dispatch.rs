@@ -8,7 +8,7 @@
 use crate::compiler::KernelCompiler;
 use crate::feature_flags::FeatureFlags;
 use crate::kernels;
-use hip_bridge::{DeviceBuffer, HipResult, HipRuntime, Rocblas};
+use hip_bridge::{DeviceBuffer, HipError, HipResult, HipRuntime, Rocblas, VmmArena};
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::atomic::AtomicUsize;
@@ -133,10 +133,23 @@ impl GpuTensor {
     /// `offset_elems` is the number of f32 elements to skip.
     /// The returned tensor is a view — do NOT free it.
     pub fn sub_offset(&self, offset_elems: usize, len_elems: usize) -> GpuTensor {
-        let byte_off = offset_elems * self.dtype.size();
+        let element_size = self.dtype.size();
+        let byte_off = offset_elems
+            .checked_mul(element_size)
+            .expect("tensor sub-view offset overflow");
+        let byte_len = len_elems
+            .checked_mul(element_size)
+            .expect("tensor sub-view length overflow");
+        let byte_end = byte_off
+            .checked_add(byte_len)
+            .expect("tensor sub-view range overflow");
+        assert!(
+            byte_end <= self.buf.size(),
+            "tensor sub-view exceeds accessible buffer prefix"
+        );
         let ptr = unsafe { (self.buf.as_ptr() as *mut u8).add(byte_off) as *mut std::ffi::c_void };
         GpuTensor {
-            buf: unsafe { hip_bridge::DeviceBuffer::from_raw(ptr, len_elems * self.dtype.size()) },
+            buf: unsafe { hip_bridge::DeviceBuffer::from_raw(ptr, byte_len) },
             shape: vec![len_elems],
             dtype: self.dtype,
         }
@@ -411,6 +424,12 @@ pub struct Gpu {
     pub(crate) modules: HashMap<String, hip_bridge::Module>,
     pub(crate) functions: HashMap<String, hip_bridge::Function>,
     pub(crate) pool: crate::pool::GpuPool,
+    /// VMM owners keyed by their base virtual address. VMM-backed tensors use
+    /// non-owning DeviceBuffer views and must bypass GpuPool/hipFree teardown.
+    vmm_arenas: HashMap<usize, VmmArena>,
+    /// Arenas whose cleanup failed before they could enter the owner map.
+    /// They have no tensor owner and are retried during explicit/Gpu teardown.
+    orphan_vmm_arenas: Vec<VmmArena>,
     /// When set, all kernel launches go to this stream instead of null stream.
     pub active_stream: Option<hip_bridge::Stream>,
     /// Scratch buffers for FWHT rotation, FP16/FP8 activation conversion, etc.
@@ -827,6 +846,8 @@ impl Gpu {
             modules: HashMap::new(),
             functions: HashMap::new(),
             pool: crate::pool::GpuPool::new(),
+            vmm_arenas: HashMap::new(),
+            orphan_vmm_arenas: Vec::new(),
             active_stream: None,
             scratch: crate::scratch::ScratchState {
                 mq_signs1: None,
@@ -1795,6 +1816,213 @@ impl Gpu {
         })
     }
 
+    /// Reserve a dense virtual tensor and optionally map its initial prefix.
+    /// The returned tensor follows the normal kernel ABI, but its ownership is
+    /// registered separately so `free_tensor` releases VMM handles instead of
+    /// routing the address through `hipFree`.
+    ///
+    /// # Safety
+    ///
+    /// The returned tensor describes its full reserved shape. The caller must
+    /// keep every operation within the prefix reported by `vmm_mapped_bytes`,
+    /// growing the mapping before any wider access.
+    pub unsafe fn alloc_vmm_tensor(
+        &mut self,
+        shape: &[usize],
+        dtype: DType,
+        initial_mapped_bytes: usize,
+        access_devices: &[i32],
+    ) -> HipResult<GpuTensor> {
+        self.bind_thread()?;
+        let numel = shape
+            .iter()
+            .try_fold(1usize, |product, &dimension| product.checked_mul(dimension))
+            .ok_or_else(|| HipError::new(0, "VMM tensor element count overflowed"))?;
+        let byte_size = numel
+            .checked_mul(dtype.size())
+            .ok_or_else(|| HipError::new(0, "VMM tensor byte size overflowed"))?;
+        let mut arena = VmmArena::reserve(&self.hip, self.device_id, byte_size)?;
+        if initial_mapped_bytes > 0 {
+            if let Err(err) = arena.map_next(&self.hip, initial_mapped_bytes, access_devices) {
+                return Err(self.retain_failed_vmm_arena(arena, err));
+            }
+        }
+        let buf = match arena.owner_buffer(byte_size) {
+            Ok(buf) => buf,
+            Err(err) => {
+                return Err(self.retain_failed_vmm_arena(arena, err));
+            }
+        };
+        let key = buf.as_ptr() as usize;
+        if self.vmm_arenas.contains_key(&key) {
+            let duplicate =
+                HipError::new(0, &format!("duplicate VMM tensor base address 0x{key:x}"));
+            return Err(self.retain_failed_vmm_arena(arena, duplicate));
+        }
+        self.vmm_arenas.insert(key, arena);
+        Ok(GpuTensor {
+            buf,
+            shape: shape.to_vec(),
+            dtype,
+        })
+    }
+
+    fn retain_failed_vmm_arena(
+        &mut self,
+        mut arena: VmmArena,
+        operation_error: HipError,
+    ) -> HipError {
+        let cleanup_error = arena.release(&self.hip).err();
+        if !arena.is_released() {
+            self.orphan_vmm_arenas.push(arena);
+        }
+        match cleanup_error {
+            Some(cleanup) => HipError::new(
+                0,
+                &format!(
+                    "{operation_error}; cleanup also failed: {cleanup}; arena retained for retry"
+                ),
+            ),
+            None => operation_error,
+        }
+    }
+
+    /// Grow the mapped prefix of a VMM-backed tensor by page-aligned bytes.
+    pub fn grow_vmm_tensor(
+        &mut self,
+        tensor: &mut GpuTensor,
+        additional_bytes: usize,
+        access_devices: &[i32],
+    ) -> HipResult<usize> {
+        self.bind_thread()?;
+        let key = tensor.buf.as_ptr() as usize;
+        let logical_bytes = tensor.byte_size();
+        let arena = self.vmm_arenas.get_mut(&key).ok_or_else(|| {
+            HipError::new(
+                0,
+                &format!("tensor at 0x{key:x} is not a registered VMM owner"),
+            )
+        })?;
+        arena.map_next(&self.hip, additional_bytes, access_devices)?;
+        let mapped_bytes = arena.mapped_bytes();
+        tensor.buf = unsafe { arena.owner_buffer(logical_bytes)? };
+        Ok(mapped_bytes)
+    }
+
+    pub fn vmm_mapped_bytes(&self, tensor: &GpuTensor) -> Option<usize> {
+        self.vmm_arenas
+            .get(&(tensor.buf.as_ptr() as usize))
+            .map(VmmArena::mapped_bytes)
+    }
+
+    /// Return the physical allocation granularity for a registered VMM tensor.
+    pub fn vmm_granularity(&self, tensor: &GpuTensor) -> Option<usize> {
+        self.vmm_arenas
+            .get(&(tensor.buf.as_ptr() as usize))
+            .map(VmmArena::granularity)
+    }
+
+    pub fn vmm_allocation_count(&self) -> usize {
+        self.vmm_arenas.len() + self.orphan_vmm_arenas.len()
+    }
+
+    /// Retry teardown for VMM arenas retained after an earlier cleanup error.
+    /// Returns the number of arenas still pending cleanup.
+    pub fn retry_vmm_cleanup(&mut self) -> HipResult<usize> {
+        self.bind_thread()?;
+        self.release_pending_vmm()
+    }
+
+    /// Retry pending VMM arenas and require a fully idle owner table.
+    ///
+    /// Success means `vmm_allocation_count() == 0`. Any remaining registration
+    /// is an error so unload/load cannot claim a clean handoff.
+    pub fn ensure_vmm_cleaned(&mut self) -> HipResult<()> {
+        let live = self.vmm_arenas.len();
+        if live != 0 {
+            return Err(HipError::new(
+                0,
+                &format!(
+                    "refusing VMM cleanup while {live} live VMM tensor owner(s) remain; unload the active model first"
+                ),
+            ));
+        }
+        match self.retry_vmm_cleanup() {
+            Ok(0) => Ok(()),
+            Ok(n) => Err(HipError::new(
+                0,
+                &format!("VMM teardown incomplete: {n} arena(s) still pending"),
+            )),
+            Err(err) => {
+                let n = self.orphan_vmm_arenas.len();
+                if n == 0 {
+                    Err(err)
+                } else {
+                    Err(HipError::new(
+                        err.code,
+                        &format!("{err}; {n} arena(s) still pending"),
+                    ))
+                }
+            }
+        }
+    }
+
+    fn release_pending_vmm(&mut self) -> HipResult<usize> {
+        let mut first_error = None;
+        let mut orphan_index = 0;
+        while orphan_index < self.orphan_vmm_arenas.len() {
+            let (result, released) = {
+                let arena = &mut self.orphan_vmm_arenas[orphan_index];
+                let result = arena.release(&self.hip);
+                (result, arena.is_released())
+            };
+            if released {
+                let released_arena = self.orphan_vmm_arenas.swap_remove(orphan_index);
+                debug_assert!(released_arena.is_released());
+            } else {
+                orphan_index += 1;
+            }
+            if let Err(err) = result {
+                if first_error.is_none() {
+                    first_error = Some(err);
+                }
+            }
+        }
+        match first_error {
+            Some(err) => Err(err),
+            None => Ok(self.orphan_vmm_arenas.len()),
+        }
+    }
+
+    fn release_registered_vmm(&mut self) -> HipResult<usize> {
+        let keys: Vec<usize> = self.vmm_arenas.keys().copied().collect();
+        let mut first_error = None;
+        for key in keys {
+            let (result, released) = {
+                let arena = self.vmm_arenas.get_mut(&key).unwrap();
+                let result = arena.release(&self.hip);
+                (result, arena.is_released())
+            };
+            if released {
+                self.vmm_arenas.remove(&key);
+            }
+            if let Err(err) = result {
+                if first_error.is_none() {
+                    first_error = Some(err);
+                }
+            }
+        }
+        if let Err(err) = self.release_pending_vmm() {
+            if first_error.is_none() {
+                first_error = Some(err);
+            }
+        }
+        match first_error {
+            Some(err) => Err(err),
+            None => Ok(self.vmm_allocation_count()),
+        }
+    }
+
     pub fn upload_f32(&mut self, data: &[f32], shape: &[usize]) -> HipResult<GpuTensor> {
         self.bind_thread()?;
         let tensor = self.alloc_tensor(shape, DType::F32)?;
@@ -1863,10 +2091,51 @@ impl Gpu {
         })
     }
 
+    /// Free a tensor. Contiguous buffers return to the pool. VMM owners run
+    /// arena release once: success removes the registration; failure **retains**
+    /// the arena for [`Self::retry_vmm_cleanup`] / [`Self::ensure_vmm_cleaned`]
+    /// and returns the error (never a false clean free).
     pub fn free_tensor(&mut self, tensor: GpuTensor) -> HipResult<()> {
         self.bind_thread()?;
-        self.pool.free(tensor.buf);
-        Ok(())
+        let key = tensor.buf.as_ptr() as usize;
+        if self.vmm_arenas.contains_key(&key) {
+            if !tensor.buf.is_vmm_owner() {
+                return Err(HipError::new(
+                    0,
+                    &format!("refusing to free borrowed VMM view at 0x{key:x}"),
+                ));
+            }
+            let mut arena = self.vmm_arenas.remove(&key).unwrap();
+            let result = arena.release(&self.hip);
+            if arena.is_released() {
+                result
+            } else {
+                // The tensor owner has been consumed, so keep its still-live
+                // arena only in the pending table. Cleanup retries must never
+                // touch entries in `vmm_arenas`, which are active owners.
+                self.orphan_vmm_arenas.push(arena);
+                match result {
+                    Ok(()) => Err(HipError::new(
+                        0,
+                        &format!(
+                            "VMM tensor at 0x{key:x} reported success but arena is still live"
+                        ),
+                    )),
+                    Err(err) => Err(HipError::new(
+                        err.code,
+                        &format!("{err}; arena retained for retry"),
+                    )),
+                }
+            }
+        } else if tensor.buf.is_borrowed() || tensor.buf.is_vmm_owner() {
+            Err(HipError::new(
+                0,
+                &format!("refusing to pool non-owning tensor at 0x{key:x}"),
+            ))
+        } else {
+            self.pool.free(tensor.buf);
+            Ok(())
+        }
     }
 
     /// Drain the GPU memory pool. Actually calls hipFree on all pooled buffers.
@@ -1919,11 +2188,18 @@ impl Gpu {
             .replay_graph_destroy_all(&self.hip, self.device_id);
     }
 
-    /// Drop captured graph state after a live KV layout switch so the next
-    /// forward captures the current K/V modes and kernarg blobs.
+    /// Drop captured graph state and retained Redline replay after a live KV
+    /// layout switch so the next forward cannot replay stale K/V modes, base
+    /// pointers, or kernarg blobs baked under the prior tier.
     pub fn invalidate_for_kv_mode_switch(&mut self) {
-        // bind_thread: skip — delegates to invalidate_graph_state(), which binds.
+        // bind_thread: skip — invalidate_graph_state binds; replay.poison is CPU.
         self.invalidate_graph_state();
+        // Retained AQL/PM4 tapes capture KV base pointers and tier-dependent
+        // kernargs. Poison so no old tape can run against the new logical layout.
+        if self.replay.is_enabled() || self.replay.state() != crate::replay::ReplayState::Hip {
+            self.replay
+                .poison("KV mode switch invalidated retained Redline replay state");
+        }
     }
 
     // ── Kernel operations ───────────────────────────────────────
@@ -2580,6 +2856,10 @@ impl Gpu {
                     kernels::ATTENTION_Q8_0_KV_BATCHED_SRC.to_string(),
                 ));
                 specs.push((
+                    "attention_q8_0_flash_prefill",
+                    kernels::ATTENTION_Q8_0_FLASH_PREFILL_SRC.to_string(),
+                ));
+                specs.push((
                     "kv_cache_write_q8_0_batched",
                     kernels::KV_CACHE_WRITE_Q8_0_BATCHED_SRC.to_string(),
                 ));
@@ -2721,10 +3001,13 @@ impl Drop for Gpu {
     /// impls call `hipFree` etc. Uses `bind_thread_or_warn` to avoid
     /// panic-in-Drop from `bind_thread`'s `debug_assert!`.
     fn drop(&mut self) {
-        if std::thread::panicking() {
+        if std::thread::panicking() && self.vmm_allocation_count() == 0 {
             return;
         }
         self.bind_thread_or_warn();
+        if let Err(err) = self.release_registered_vmm() {
+            eprintln!("[rdna-compute] failed to release VMM arena during Gpu drop: {err}");
+        }
     }
 }
 
@@ -2896,5 +3179,188 @@ mod tests {
             s1,
             "seed 43 should differ from seed 42"
         );
+    }
+
+    fn try_gpu() -> Option<super::Gpu> {
+        super::Gpu::init().ok()
+    }
+
+    #[test]
+    fn ensure_vmm_cleaned_never_releases_a_live_owner() {
+        let Some(mut gpu) = try_gpu() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        hip_bridge::clear_vmm_faults();
+        let tensor = match unsafe { gpu.alloc_vmm_tensor(&[4096], super::DType::Raw, 0, &[]) } {
+            Ok(tensor) => tensor,
+            Err(_) => {
+                eprintln!("skip: VMM unavailable");
+                return;
+            }
+        };
+        assert_eq!(gpu.vmm_allocation_count(), 1);
+
+        let err = gpu
+            .ensure_vmm_cleaned()
+            .expect_err("load cleanup must refuse a still-owned VMM arena");
+        assert!(err.to_string().contains("live VMM"), "{err}");
+        assert_eq!(gpu.vmm_allocation_count(), 1);
+        assert_eq!(gpu.vmm_mapped_bytes(&tensor), Some(0));
+
+        gpu.free_tensor(tensor).expect("free live owner");
+        assert_eq!(gpu.vmm_allocation_count(), 0);
+    }
+
+    #[test]
+    fn free_tensor_unmap_failure_retains_owner_for_retry() {
+        let Some(mut gpu) = try_gpu() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        hip_bridge::clear_vmm_faults();
+        let chunk = {
+            // Discover granularity via a throwaway arena path.
+            let probe = unsafe { gpu.alloc_vmm_tensor(&[4096], super::DType::Raw, 0, &[]) };
+            match probe {
+                Ok(t) => {
+                    let g = gpu.vmm_granularity(&t).unwrap_or(2 * 1024 * 1024);
+                    let _ = gpu.free_tensor(t);
+                    g
+                }
+                Err(_) => {
+                    eprintln!("skip: VMM unavailable");
+                    return;
+                }
+            }
+        };
+        let access = [gpu.device_id];
+        let tensor = unsafe {
+            gpu.alloc_vmm_tensor(&[chunk], super::DType::Raw, chunk, &access)
+                .expect("alloc vmm")
+        };
+        assert_eq!(gpu.vmm_allocation_count(), 1);
+        hip_bridge::inject_vmm_fault(hip_bridge::VmmFaultKind::Unmap, 1);
+        let err = gpu
+            .free_tensor(tensor)
+            .expect_err("unmap fault must surface");
+        assert!(
+            err.to_string().contains("retained") || err.to_string().contains("injected"),
+            "{err}"
+        );
+        assert_eq!(
+            gpu.vmm_allocation_count(),
+            1,
+            "failed free must keep the arena registered"
+        );
+        // No double-free: retry with faults cleared must release exactly once.
+        hip_bridge::clear_vmm_faults();
+        gpu.ensure_vmm_cleaned().expect("retry cleanup");
+        assert_eq!(gpu.vmm_allocation_count(), 0);
+        // Idle ensure is a no-op success (no double free).
+        gpu.ensure_vmm_cleaned().expect("second ensure on idle");
+    }
+
+    #[test]
+    fn free_tensor_release_failure_retains_owner_for_retry() {
+        let Some(mut gpu) = try_gpu() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        hip_bridge::clear_vmm_faults();
+        let access = [gpu.device_id];
+        let chunk = 2 * 1024 * 1024;
+        let tensor =
+            match unsafe { gpu.alloc_vmm_tensor(&[chunk], super::DType::Raw, chunk, &access) } {
+                Ok(t) => t,
+                Err(_) => {
+                    eprintln!("skip: VMM unavailable");
+                    return;
+                }
+            };
+        assert_eq!(gpu.vmm_allocation_count(), 1);
+        hip_bridge::inject_vmm_fault(hip_bridge::VmmFaultKind::Release, 1);
+        let err = gpu
+            .free_tensor(tensor)
+            .expect_err("release fault must surface");
+        assert!(
+            err.to_string().contains("retained") || err.to_string().contains("injected"),
+            "{err}"
+        );
+        assert_eq!(gpu.vmm_allocation_count(), 1);
+        hip_bridge::clear_vmm_faults();
+        assert_eq!(gpu.retry_vmm_cleanup().expect("retry"), 0);
+        assert_eq!(gpu.vmm_allocation_count(), 0);
+    }
+
+    #[test]
+    fn access_reset_failure_does_not_publish_live_owner() {
+        let Some(mut gpu) = try_gpu() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        hip_bridge::clear_vmm_faults();
+        let access = [gpu.device_id];
+        let chunk = 2 * 1024 * 1024;
+        let before = gpu.vmm_allocation_count();
+        hip_bridge::inject_vmm_fault(hip_bridge::VmmFaultKind::AccessReset, 1);
+        let err = match unsafe { gpu.alloc_vmm_tensor(&[chunk], super::DType::Raw, chunk, &access) }
+        {
+            Ok(tensor) => {
+                let _ = gpu.free_tensor(tensor);
+                panic!("access-reset fault must fail initial map");
+            }
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("injected") || err.to_string().contains("access"),
+            "{err}"
+        );
+        hip_bridge::clear_vmm_faults();
+        // Successful cleanup leaves no pending owner; if cleanup itself failed
+        // the arena stays registered and ensure_vmm_cleaned must still drain it.
+        if gpu.vmm_allocation_count() > before {
+            gpu.ensure_vmm_cleaned()
+                .expect("drain retained after access fault");
+        }
+        assert_eq!(gpu.vmm_allocation_count(), before);
+        // Subsequent alloc works (no poisoned process state).
+        let ok = unsafe { gpu.alloc_vmm_tensor(&[chunk], super::DType::Raw, chunk, &access) }
+            .expect("alloc after access fault");
+        let _ = gpu.free_tensor(ok).expect("free");
+        assert_eq!(gpu.vmm_allocation_count(), before);
+    }
+
+    #[test]
+    fn ensure_vmm_cleaned_refuses_while_pending() {
+        let Some(mut gpu) = try_gpu() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        hip_bridge::clear_vmm_faults();
+        let access = [gpu.device_id];
+        let chunk = 2 * 1024 * 1024;
+        let tensor =
+            match unsafe { gpu.alloc_vmm_tensor(&[chunk], super::DType::Raw, chunk, &access) } {
+                Ok(t) => t,
+                Err(_) => {
+                    eprintln!("skip: VMM unavailable");
+                    return;
+                }
+            };
+        hip_bridge::inject_vmm_fault(hip_bridge::VmmFaultKind::Unmap, 2); // free + ensure attempt
+        let _ = gpu.free_tensor(tensor).expect_err("fault");
+        let err = gpu
+            .ensure_vmm_cleaned()
+            .expect_err("must refuse while pending");
+        assert!(
+            err.to_string().contains("pending") || err.to_string().contains("injected"),
+            "{err}"
+        );
+        assert!(gpu.vmm_allocation_count() >= 1);
+        hip_bridge::clear_vmm_faults();
+        gpu.ensure_vmm_cleaned()
+            .expect("clears after faults drained");
+        assert_eq!(gpu.vmm_allocation_count(), 0);
     }
 }

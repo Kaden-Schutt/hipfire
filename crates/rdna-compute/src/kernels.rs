@@ -1744,6 +1744,10 @@ pub const MOE_TOPK_RENORM_K8_BATCHED_SRC: &str =
 /// expert-pointers table. hipGraph-capture-safe replacement for the
 /// kernarg-pointer variant.
 pub const GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_SRC: &str = concat!(
+    // gfx1151 product: current-toolchain private0-capable occupancy dial.
+    "#if defined(__gfx1151__)\n",
+    "#define HIPFIRE_MOE_GATE_UP_MIN_BLOCKS 12\n",
+    "#endif\n",
     "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
     include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
     include_str!("../../../kernels/src/gemv_hfq4g256_moe_gate_up_indexed.hip")
@@ -2083,6 +2087,21 @@ pub const GEMV_HFQ4G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_SRC: &str = concat!
     include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
     include_str!("../../../kernels/src/gemv_hfq4g256_moe_down_k8_indexed_batched_expanded.hip")
 );
+
+/// Nine-path fused MoE gate_up (routed k=8, decode T=1): one CTA stages the
+/// activation into LDS once and all 8 routed-expert warps share it, replacing
+/// the per-(row,krank) x restaging of `gemv_hfq4g256_moe_gate_up_k8_indexed`.
+/// Byte-exact per-row math with the indexed kernel. See kernel header.
+pub const GEMV_HFQ4G256_MOE_NINEPATH_D3_SRC: &str =
+    include_str!("../../../kernels/src/gemv_hfq4g256_moe_ninepath_d3.hip");
+
+/// Nine-path fused MoE down + weighted combine (routed k=8, decode T=1):
+/// folds the expanded [8 × down_m] intermediate into LDS (never written to
+/// global) and applies the weighted k-ordered fold in the same kernel,
+/// replacing the expanded down GEMV + `moe_down_combine_k8_batched` pair.
+/// Byte-exact with that pair at down_k=512. See kernel header.
+pub const GEMV_HFQ4G256_MOE_NINEPATH_D4_SRC: &str =
+    include_str!("../../../kernels/src/gemv_hfq4g256_moe_ninepath_d4.hip");
 /// Exact gfx1151 temporal-buffer candidate for the K=512 routed down stream.
 /// The kernel ABI, four-row mapping, reduction tree, and launch geometry stay
 /// unchanged; only weight addressing is lowered differently.
@@ -4006,6 +4025,23 @@ pub const ATTENTION_Q8_0_KV_SRC: &str = include_str!("../../../kernels/src/atten
 /// one launch with per-row causal windows from a positions[] array.
 pub const ATTENTION_Q8_0_KV_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/attention_q8_0_kv_batched.hip");
+
+/// Query-tiled Q8_0 flash prefill attention. LDS depends only on BR/BC,
+/// never on context length, so one kernel serves every sequence length.
+pub const ATTENTION_Q8_0_FLASH_PREFILL_SRC: &str =
+    include_str!("../../../kernels/src/attention_q8_0_flash_prefill.hip");
+
+/// WMMA (matrix-core) variant of ATTENTION_Q8_0_FLASH_PREFILL_SRC. Same
+/// algorithm; QK^T and P·V run on RDNA3 wave32 matrix cores, and the Q8
+/// dequant is amortised 16x by the 16x16x16 fragment layout.
+pub const ATTENTION_Q8_0_FLASH_PREFILL_WMMA_SRC: &str =
+    include_str!("../../../kernels/src/attention_q8_0_flash_prefill_wmma.hip");
+
+/// RDNA4 sister of ATTENTION_Q8_0_FLASH_PREFILL_WMMA_SRC. gfx12 splits
+/// each 16-wide contraction into two 8-element half-wave operands and uses
+/// the gfx12-specific WMMA builtin/output mapping.
+pub const ATTENTION_Q8_0_FLASH_PREFILL_WMMA_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/attention_q8_0_flash_prefill_wmma.gfx12.hip");
 
 /// Phase-timed variant of ATTENTION_Q8_0_KV_SRC. Functionally equivalent
 /// to the baseline kernel but instrumented with wall_clock64() around each

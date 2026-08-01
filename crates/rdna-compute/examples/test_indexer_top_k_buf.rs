@@ -29,9 +29,8 @@ fn upload_i32(gpu: &mut Gpu, values: &[i32]) -> GpuTensor {
 
 fn download_i32(gpu: &Gpu, tensor: &GpuTensor, len: usize) -> Vec<i32> {
     let mut values = vec![0i32; len];
-    let bytes = unsafe {
-        std::slice::from_raw_parts_mut(values.as_mut_ptr().cast::<u8>(), len * 4)
-    };
+    let bytes =
+        unsafe { std::slice::from_raw_parts_mut(values.as_mut_ptr().cast::<u8>(), len * 4) };
     gpu.hip
         .memcpy_dtoh(bytes, &tensor.buf)
         .expect("download i32 tensor");
@@ -46,12 +45,12 @@ fn expected_top_k(scores: &[f32], n: usize) -> Vec<i32> {
     }
 
     let mut indices: Vec<usize> = (0..n).collect();
-    indices.sort_unstable_by(|&a, &b| {
-        scores[b]
-            .total_cmp(&scores[a])
-            .then_with(|| a.cmp(&b))
-    });
-    indices.into_iter().take(K).map(|index| index as i32).collect()
+    indices.sort_unstable_by(|&a, &b| scores[b].total_cmp(&scores[a]).then_with(|| a.cmp(&b)));
+    indices
+        .into_iter()
+        .take(K)
+        .map(|index| index as i32)
+        .collect()
 }
 
 fn run_case(gpu: &mut Gpu, n: usize, iters: usize) {
@@ -66,9 +65,7 @@ fn run_case(gpu: &mut Gpu, n: usize, iters: usize) {
             .map(|index| ((index * 109 + 17) % MAX_N) as f32)
             .collect()
     };
-    let scores_gpu = gpu
-        .upload_f32(&scores, &[MAX_N])
-        .expect("upload scores");
+    let scores_gpu = gpu.upload_f32(&scores, &[MAX_N]).expect("upload scores");
     let indices_gpu = gpu
         .alloc_tensor(&[K * 4], DType::Raw)
         .expect("alloc top-k output");

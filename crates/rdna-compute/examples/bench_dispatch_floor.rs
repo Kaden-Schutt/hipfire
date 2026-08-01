@@ -22,8 +22,8 @@
 //   serialized — sync after every launch. Full round-trip; the gap between
 //                the two is how much the queue is hiding.
 
-use rdna_compute::Gpu;
 use rdna_compute::DType;
+use rdna_compute::Gpu;
 use std::time::Instant;
 
 const SRC: &str = r#"
@@ -124,9 +124,7 @@ fn main() {
         }
     }
 
-    eprintln!(
-        "\n  ds4 AR decode issues 1704 small-kernel launches/step totalling 6.559 ms"
-    );
+    eprintln!("\n  ds4 AR decode issues 1704 small-kernel launches/step totalling 6.559 ms");
     eprintln!("  (3.85 us/launch). Multiply the pipelined floor by 1704 to get the");
     eprintln!("  irreducible share; the remainder is what fusion or re-gridding can reach.");
 }

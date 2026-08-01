@@ -299,7 +299,7 @@ done
 - Methodology: `docs/methodology/perf-benchmarking.md` — see the new "eval_hipfire wall-clock is NOT a kernel-speed meter" section for the Q8-specific perf-meter rules.
 - KLD anchor: `benchmarks/quality-baselines/results/2026-05-12-cohort-phase-a-q8-floor-9b/result-table.md` — 0.5735 slice-mean KLD on 256 chunks of Wikitext-2 vs the BF16 ref.
 - Sibling plan: `docs/plans/hfp4-mfp4-rdna3-accel.md` (same template, different quant format).
-- F16 lm_head batched fan-out (parallel work, not in this branch): PR #242 on Kaden-Schutt/hipfire (`feat/f16-lmhead-support`).
+- F16 lm_head batched fan-out (parallel work, not in this branch): PR #242 on warpfront/hipfire (`feat/f16-lmhead-support`).
 - Commits on `feat/q8-prefill-tier2` (vs origin/master):
   - `16fba4fd feat(q8-prefill): wire Q8_0 into batched prefill via gemm_q8_0_batched_chunked` (Tier 2)
   - `582e4097 perf(q8-prefill): bump gemm_q8_0_batched MAX_BATCH 16 → 64`

@@ -263,7 +263,7 @@ Retired `scripts/coherence-gate-*.sh` batteries are **not** acceptance for PP
 - Serve / EP CLI: [`SERVE.md`](SERVE.md), [`CLI.md`](CLI.md)
 - Validation selector: [`VALIDATION.md`](VALIDATION.md)
 - Historical bring-up: [`multi-gpu-bringup-lessons.md`](multi-gpu-bringup-lessons.md)
-- Issue tracker context: [#58](https://github.com/Kaden-Schutt/hipfire/issues/58)
+- Issue tracker context: [#58](https://github.com/warpfront/hipfire/issues/58)
 
 ---
 
@@ -283,7 +283,7 @@ Retired `scripts/coherence-gate-*.sh` batteries are **not** acceptance for PP
 # Multi-GPU Pipeline-Parallel
 
 **Status:** v1 feature-complete on `feat/multi-gpu-pp` branch — tracking
-issue [#58](https://github.com/Kaden-Schutt/hipfire/issues/58). Stages
+issue [#58](https://github.com/warpfront/hipfire/issues/58). Stages
 0–9 of the v2 plan are merged; refusal contracts (DFlash / VL / CASK +
 pp>1) are wired and validated. This doc is the source of truth for
 memory budget, deployment recipes, throughput, and known limitations.

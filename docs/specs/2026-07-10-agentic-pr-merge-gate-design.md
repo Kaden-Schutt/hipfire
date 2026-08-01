@@ -1,6 +1,6 @@
 # Agentic PR Merge-Gate — Design Spec
 
-> Status: **IMPLEMENTED CORE** · Date: 2026-07-11
+> Status: **RETIRED — WORKFLOW PURGED** · Date: 2026-07-27
 > Author: Kaden Schutt
 >
 > An agent-orchestrated, GPU-backed PR pipeline that reads a PR, tests the
@@ -9,6 +9,10 @@
 > when clean, non-clobbering, and meaningfully helpful — lands it (auto for
 > Kaden's PRs; agent-executed on a maintainer's `@claude /merge`), stacking
 > approved PRs on a `staging` merge-train so PR debt never accumulates.
+>
+> Historical design record only. The `gpu-gates.yml` workflow, its dedicated
+> static contract tests, and its self-hosted runner bootstrap were removed.
+> Current GPU validation is manual; see `docs/VALIDATION.md`.
 
 ## 1. Goal
 

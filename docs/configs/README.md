@@ -15,7 +15,29 @@ every default. Missing keys continue to inherit registry or compiled policy.
 Copy only the settings you intend to pin; an explicit value will keep winning
 if a future release changes its default.
 
-The safest way to adopt an example is through the CLI:
+The safest way to adopt an example is through the named profile command:
+
+```bash
+hipfire config profile set default   # docs/configs/user.toml
+hipfire config profile set dev       # docs/configs/developer.toml
+hipfire config profile set redline   # docs/configs/redline-pm4.toml
+```
+
+`hipfire config profile set <name>` replaces the entire sparse global
+`config.toml` with the selected built-in or custom profile. Profile names are
+control-plane identifiers only; they are never stored inside the TOML file.
+Snapshot the current global layer as a custom profile with:
+
+```bash
+hipfire config profile create lab
+# writes ~/.hipfire/profiles/lab.toml
+hipfire config profile set lab
+```
+
+Bare `hipfire config profile` launches the interactive profile wizard. Profiles
+are global-only (`hipfire config <model> profile ...` is rejected).
+
+Individual keys can still be pinned one at a time:
 
 ```bash
 hipfire config set memory.kv_cache q8
@@ -33,7 +55,8 @@ cp docs/configs/user.toml ~/.hipfire/config.toml
 ```
 
 Do not overwrite an existing config. TOML has no table-include or safe textual
-concatenation operation; merge the desired keys or use `hipfire config set`.
+concatenation operation; merge the desired keys or use `hipfire config set`
+(or `hipfire config profile set|create`).
 
 ## Common environment migrations
 
@@ -51,6 +74,7 @@ concatenation operation; merge the desired keys or use `hipfire config set`.
 | `HIPFIRE_REPLAY_BACKEND=redline` | `replay.backend = "redline"` |
 | `HIPFIRE_REPLAY_TRANSPORT=pm4` | `replay.transport = "pm4"` |
 | `HIPFIRE_REPLAY_PM4_QUEUES=2` | `diagnostic.replay.pm4_queues = "2"` |
+| `HIPFIRE_REPLAY_ROUTE_PROOF_LOG=1` | `diagnostic.replay.route_proof_log = true` |
 
 Stable keys are typed and documented by `hipfire config schema`. A remaining
 experimental `HIPFIRE_FOO=value` maps mechanically to
@@ -73,7 +97,7 @@ file they locate. These remain bootstrap inputs:
 
 - `HIPFIRE_HOME`, `HIPFIRE_MODELS_DIR`
 - `HIPFIRE_DAEMON_BIN`, `HIPFIRE_CLI_BIN`, `HIPFIRE_TUI_BIN`
-- `HIPFIRE_REGISTRY_URL`, `HIPFIRE_HF_BASE`, `HIPFIRE_NO_REGISTRY_FETCH`
+- `HIPFIRE_REGISTRY_URL`, `HIPFIRE_HF_BASE` (overrides `HF_ENDPOINT`), `HIPFIRE_NO_REGISTRY_FETCH`
 - `HIPFIRE_KERNEL_CACHE`, `HIPFIRE_SPILL_DIR`, `HIPFIRE_QUANT_DIAG_PATH`
 
 For the authoritative key/default/enum reference, see

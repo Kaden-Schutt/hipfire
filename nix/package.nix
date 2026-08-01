@@ -70,7 +70,7 @@ rustPlatform.buildRustPackage {
 
   meta = with lib; {
     description = "LLM inference for AMD RDNA GPUs";
-    homepage = "https://github.com/Kaden-Schutt/hipfire";
+    homepage = "https://github.com/warpfront/hipfire";
     license = licenses.mit;
     platforms = [ "x86_64-linux" ];
     mainProgram = "hipfire";

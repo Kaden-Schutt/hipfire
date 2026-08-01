@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/Kaden-Schutt/hipfire/releases"><img alt="Stable release v0.2.1" src="https://img.shields.io/badge/stable-v0.2.1-24292f?style=flat-square" /></a>
+  <a href="https://github.com/warpfront/hipfire/releases"><img alt="Stable release v0.2.1" src="https://img.shields.io/badge/stable-v0.2.1-24292f?style=flat-square" /></a>
   <a href="CHANGELOG.md"><img alt="Next release v0.3.0 beta" src="https://img.shields.io/badge/next-v0.3.0%20beta-f04b24?style=flat-square" /></a>
   <a href="docs/MODELS.md"><img alt="54 curated model entries" src="https://img.shields.io/badge/registry-54%20curated%20models-ff8a1f?style=flat-square" /></a>
   <a href="https://discord.gg/F3BaywB8Rs"><img alt="Join Discord" src="https://img.shields.io/badge/chat-Discord-5865F2?style=flat-square" /></a>
@@ -49,18 +49,6 @@ and the per-model repositories recorded in the dynamic registry.
 Discord: <https://discord.gg/F3BaywB8Rs>
 
 ## MQ4R + Redline
-
-<p align="center">
-  <img width="1200" alt="A retained command graph flows into a GPU compute engine" src="docs/assets/readme/retained-engine.png" />
-</p>
-
-<table>
-  <tr>
-    <td width="33%"><strong>MQ4R</strong><br />Performance-oriented Qwen 3.6 35B-A3B quantization.</td>
-    <td width="33%"><strong>Redline</strong><br />Validated, retained dispatch replay for the real kernel graph.</td>
-    <td width="33%"><strong>Fail closed</strong><br />Unsafe or incompatible routes return to ordinary HIP dispatch.</td>
-  </tr>
-</table>
 
 MQ4R is the performance-oriented Qwen 3.6 35B-A3B SKU. It combines
 uniform MQ4 attention and gate-side weights with graded routed experts
@@ -122,7 +110,7 @@ approximately 110 tok/s to 203.9 tok/s. See the
 [gfx1201 campaign report](docs/perf-checkpoints/2026-07-13-redline-mq4r-110-to-204.md)
 and [Redline integration boundary](crates/redline-dispatch/HIPFIRE-GRAFT.md).
 To reproduce the sealed TG128 route, model, and sampling fixture on a supported
-GPU, run `python3 scripts/golden-redline.py`; the
+GPU, run `python3 -m tools.redline golden`; the
 [Golden Redline guide](docs/GOLDEN-REDLINE.md) also covers making the validated
 fixture the serve default and connecting Hermes, Pi, or another
 OpenAI-compatible client.
@@ -229,10 +217,10 @@ is intended. See [CONFIG.md](docs/CONFIG.md) for details.
 Linux with ROCm 6 or newer:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Kaden-Schutt/hipfire/master/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/warpfront/hipfire/master/scripts/install.sh | bash
 
 # Or install the integration branch for testing:
-curl -fsSL https://raw.githubusercontent.com/Kaden-Schutt/hipfire/master/scripts/install.sh \
+curl -fsSL https://raw.githubusercontent.com/warpfront/hipfire/master/scripts/install.sh \
   | bash -s -- --branch beta
 ```
 
@@ -246,7 +234,7 @@ To uninstall a managed Linux install while keeping downloaded models and
 settings:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Kaden-Schutt/hipfire/master/scripts/uninstall.sh | bash
+curl -fsSL https://raw.githubusercontent.com/warpfront/hipfire/master/scripts/uninstall.sh | bash
 ```
 
 Add `--dry-run` to preview it. `--purge` also deletes all data under
@@ -260,15 +248,15 @@ For Windows, source builds, and verifying the install:
 First-class support via Nix flake. See [docs/NIXOS.md](docs/NIXOS.md).
 
 ```bash
-nix develop github:Kaden-Schutt/hipfire  # dev shell with Rust + ROCm
-nix build github:Kaden-Schutt/hipfire    # build package
+nix develop github:warpfront/hipfire  # dev shell with Rust + ROCm
+nix build github:warpfront/hipfire    # build package
 ```
 
 NixOS module:
 
 ```nix
 {
-  inputs.hipfire.url = "github:Kaden-Schutt/hipfire";
+  inputs.hipfire.url = "github:warpfront/hipfire";
   # then in configuration.nix:
   services.hipfire.enable = true;
   services.hipfire.gpuTargets = [ "gfx1100" ];
@@ -355,18 +343,20 @@ the prefill MMQ redesign log is at
 
 ## License
 
-hipfire is dual-licensed under MIT or Apache-2.0 at your option. See
-[LICENSE](LICENSE) (dual-license pointer), [LICENSE-MIT](LICENSE-MIT),
-[LICENSE-APACHE](LICENSE-APACHE), and [NOTICE](NOTICE) for details.
+hipfire is licensed under **Apache-2.0** as of v0.3.0. See
+[LICENSE](LICENSE), [LICENSE-APACHE](LICENSE-APACHE), and
+[NOTICE](NOTICE) for details. Releases up to and including v0.2.1 were
+dual MIT/Apache-2.0; that grant is not revoked.
 
-New contributions default to Apache-2.0 via DCO sign-off; existing
-contributors' MIT-licensed contributions remain MIT unless they opt
-in. Each source file carries an `SPDX-License-Identifier` reflecting
-actual authorship (MIT, Apache-2.0, or `MIT OR Apache-2.0`). See
-[CONTRIBUTING.md](CONTRIBUTING.md) for the contributor side and
+Individual files whose substantive authors have not elected Apache-2.0
+remain MIT-licensed (see [LICENSE-MIT](LICENSE-MIT)) and are identified
+by their per-file `SPDX-License-Identifier`. No contributor's file was
+relicensed in absentia. New contributions default to Apache-2.0 via DCO
+sign-off. See [CONTRIBUTING.md](CONTRIBUTING.md) for the contributor
+side and
 [docs/governance/relicense-2026-05.md](docs/governance/relicense-2026-05.md)
-for the decision record (including the 2026-05-19 course correction
-from a unilateral Apache-2.0 relicense to dual licensing).
+for the decision record (including the 2026-05-19 course correction and
+the v0.3.0 move to outbound Apache-2.0).
 
 Original architectural innovations originating in hipfire are
 catalogued in [PRIOR-ART.md](PRIOR-ART.md); derivative works
@@ -377,10 +367,13 @@ attribute the corresponding inventions per [AGENTS.md](AGENTS.md).
 
 See [CONTRIBUTING.md](CONTRIBUTING.md). Install local hooks with
 `./scripts/install-hooks.sh`. The no-GPU CI subset is
-`./scripts/no-gpu-ci.sh`; it does not replace the hardware gates. Any
-change to kernels, quant formats, dispatch, fusion, rotation, rmsnorm,
-or the spec-decode path must pass `./scripts/coherence-gate-dflash.sh`
-before commit. That is the canonical correctness gate; architecture-specific
+`./scripts/no-gpu-ci.sh`; it does not replace the hardware gates.
+**There is no single canonical correctness gate** — the retired
+`scripts/coherence-gate*.sh` batteries are not acceptance evidence and
+`coherence-gate-dflash.sh` no longer exists. Select the route your change
+owes from [docs/VALIDATION.md](docs/VALIDATION.md): `scripts/serve_harness.py`
+for generation and state-lifecycle changes, `scripts/redline_daemon_harness.py`
+for kernel, dispatch, graph, or Redline-replay changes. Architecture-specific
 work must also pass its channel test, anti-bleed checks, and relevant speed
 gate. Don't bypass the gates with `--no-verify` — see
 [methodology/perf-benchmarking.md](docs/methodology/perf-benchmarking.md).

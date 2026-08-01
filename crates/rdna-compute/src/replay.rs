@@ -8,8 +8,12 @@
 //! the fail-closed selection state. It deliberately does not reinterpret
 //! `void**` arguments: a model adapter must supply explicit resource accesses
 //! and a kernarg ABI to `redline-dispatch` before installing a prepared plan.
-//! Replay remains default-off except for the product-certified, single-GPU
-//! gfx12 Qwen A3B `.mq4r` route selected by the daemon after model load.
+//! Replay remains default-off except for the runtime automatic default
+//! `mq4r_redline_default` (exact `gfx1100`/`gfx1151`/`gfx1201`, single-GPU,
+//! case-insensitive `.mq4r`; `gfx1200`/others opt-in)
+//! selected by the daemon after model load. Runtime default ≠ Redline
+//! certification/registry admission; built-in `hip` profile or explicit backend
+//! selection disables the automatic default.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -245,11 +249,38 @@ impl Pm4Commands {
         }
     }
 
+    fn populate_dispatch_span_boundaries(
+        &self,
+        boundaries: &mut [Pm4DispatchBoundary],
+    ) -> Result<(), String> {
+        let Self::Gfx12(commands) = self else {
+            return Err("per-dispatch PM4 profiling currently requires gfx12".to_owned());
+        };
+        let attributions = commands
+            .dispatch_span_attributions()
+            .map_err(|error| error.to_string())?;
+        if attributions.len() != boundaries.len() {
+            return Err(format!(
+                "generated PM4 dispatch attribution mismatch: expected {}, got {}",
+                boundaries.len(),
+                attributions.len()
+            ));
+        }
+        for (boundary, attribution) in boundaries.iter_mut().zip(attributions) {
+            boundary.entry_acquire = attribution.entry_acquire;
+            boundary.wait_compute_idle = attribution.wait_compute_idle;
+            boundary.acquire_inter_node = attribution.acquire_inter_node;
+        }
+        Ok(())
+    }
+
     fn create_graph(
         &self,
         device: &GpuDevice,
         pool: &KernargPool,
+        ib_pool: Option<&KernargPool>,
         cu_mask: Option<&[u32; 2]>,
+        dispatch_profile: bool,
     ) -> Result<SingleQueuePm4Ib, String> {
         let graph = match self {
             Self::Legacy {
@@ -264,7 +295,22 @@ impl Pm4Commands {
                 architecture: Pm4Architecture::Gfx12,
                 ..
             } => unreachable!("gfx12 never uses the legacy PM4 command variant"),
-            Self::Gfx12(commands) => SingleQueuePm4Ib::create_profiled(device, pool, commands),
+            Self::Gfx12(commands) => {
+                // HIPFIRE_REDLINE_DISPATCH_PROFILE=1 builds a tape carrying one
+                // GPU-clock write per dispatch, so a machine whose retained path
+                // underperforms can report WHERE the time goes instead of only
+                // how much there is. The instrumented tape necessarily has a
+                // different dword count and sequence hash, so such a run cannot
+                // satisfy a golden fixture — it is a diagnostic, not a
+                // certification.
+                if dispatch_profile || dispatch_profile_enabled() {
+                    SingleQueuePm4Ib::create_dispatch_profiled(device, pool, commands)
+                } else if let Some(ib_pool) = ib_pool {
+                    SingleQueuePm4Ib::create_profiled_with_ib_pool(device, pool, ib_pool, commands)
+                } else {
+                    SingleQueuePm4Ib::create_profiled(device, pool, commands)
+                }
+            }
         }
         .map_err(|error| error.to_string())?;
         if let Some(cu_mask) = cu_mask {
@@ -316,6 +362,17 @@ fn radiowave_vmem_only_consumer(
     certifications.get(artifact).is_some_and(|certification| {
         certification.mutable_read_cache(&launch.kernel) == MutableReadCache::VmemOnly
     })
+}
+
+fn pm4_vmem_acquire_enabled(
+    architecture: Pm4Architecture,
+    configured: bool,
+    certifications: &BTreeMap<PathBuf, CodeObjectCertification>,
+    launch: &RecordedHipLaunch,
+) -> bool {
+    architecture != Pm4Architecture::Gfx12
+        && configured
+        && radiowave_vmem_only_consumer(certifications, launch)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1180,9 +1237,11 @@ fn pm4_reorder_window_from_config(name: &str) -> Option<usize> {
     }
 }
 
+/// Architectures admitted to the single-IB reorder pass. `gfx1151` is the arch
+/// the pass was certified on upstream; `gfx1201` is admitted here so the pass
+/// can be screened against the gfx12 retained route, and remains default-off.
 fn pm4_single_ib_reorder_from_config(device_name: &str) -> Option<usize> {
-    device_name
-        .eq_ignore_ascii_case("gfx1151")
+    (device_name.eq_ignore_ascii_case("gfx1151") || device_name.eq_ignore_ascii_case("gfx1201"))
         .then(|| pm4_reorder_window_from_config("HIPFIRE_REPLAY_PM4_SINGLE_IB_REORDER"))
         .flatten()
 }
@@ -2072,6 +2131,11 @@ fn manual_capture_requested() -> bool {
         .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "on"))
 }
 
+fn route_proof_log_requested() -> bool {
+    hipfire_config::process_value("HIPFIRE_REPLAY_ROUTE_PROOF_LOG")
+        .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "on"))
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReplayState {
     Hip,
@@ -2191,6 +2255,7 @@ pub struct ReplayObservation {
     pub count: u64,
     pub first_position: Option<usize>,
     pub last_position: Option<usize>,
+    pub failed: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2199,6 +2264,10 @@ pub struct PreparedReplayIdentity {
     pub packet_count: Option<usize>,
     pub queue_id: u64,
     pub command_dwords: Option<u32>,
+    /// Prepared graph queue width (AQL linear batch is always 1).
+    pub queue_count: usize,
+    /// Prepared graph logical phase count (AQL linear batch is always 1).
+    pub phase_count: usize,
 }
 
 fn pm4_packet_identity(queue_count: usize, phase_count: usize) -> Option<usize> {
@@ -2249,6 +2318,45 @@ impl PreparedLinearAqlReplay {
     }
 }
 
+/// True when the per-dispatch timestamp diagnostic is requested.
+pub fn dispatch_profile_enabled() -> bool {
+    hipfire_config::developer_var_os("HIPFIRE_REDLINE_DISPATCH_PROFILE")
+        .is_some_and(|value| value != "0" && !value.is_empty())
+}
+
+/// Summarise per-dispatch spans so a slow machine reports a distribution
+/// rather than a single throughput number.
+///
+/// The shape is the diagnostic: overhead spread evenly across every dispatch
+/// points at per-dispatch cost (fetch, launch, submission), whereas a few
+/// dispatches dominating points at specific stalls — a barrier or a cache
+/// release. Those two have different causes and different fixes, and an
+/// end-to-end tok/s cannot tell them apart.
+fn report_dispatch_spans(spans: &[u64]) {
+    if spans.is_empty() {
+        return;
+    }
+    let mut sorted: Vec<u64> = spans.to_vec();
+    sorted.sort_unstable();
+    let total: u64 = sorted.iter().sum();
+    let pick = |q: f64| sorted[((sorted.len() - 1) as f64 * q) as usize];
+    // Contribution of the slowest 5% — the number that separates "everything is
+    // slightly slow" from "a handful of dispatches dominate".
+    let tail_start = sorted.len() - sorted.len().div_ceil(20);
+    let tail: u64 = sorted[tail_start..].iter().sum();
+    eprintln!(
+        "[redline] dispatch spans n={} total={}us p50={}ns p90={}ns p99={}ns max={}ns \
+         slowest5%={:.1}% of total",
+        sorted.len(),
+        total / 1_000,
+        pick(0.50),
+        pick(0.90),
+        pick(0.99),
+        sorted[sorted.len() - 1],
+        100.0 * tail as f64 / total.max(1) as f64,
+    );
+}
+
 enum PreparedPm4Graph {
     Single(SingleQueuePm4Ib),
     Phased(PhasedMultiQueuePm4Ib),
@@ -2256,11 +2364,40 @@ enum PreparedPm4Graph {
 
 impl PreparedPm4Graph {
     unsafe fn replay_and_wait_profiled(&mut self) -> Result<GpuMultiQueueTiming, String> {
+        if dispatch_profile_enabled() {
+            if let Self::Single(graph) = self {
+                // Execute the instrumented graph once. Reuse the same timestamp
+                // vector for whole-tape timing and the one-line legacy report.
+                let (timing, spans) = unsafe { graph.replay_and_wait_dispatch_profiled() }
+                    .map_err(|error| error.to_string())?;
+                static REPORTED: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if !REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    report_dispatch_spans(&spans);
+                }
+                return Ok(timing);
+            }
+        }
         match self {
             Self::Single(graph) => unsafe { graph.replay_and_wait_profiled() },
             Self::Phased(graph) => unsafe { graph.replay_and_wait_profiled() },
         }
         .map_err(|error| error.to_string())
+    }
+
+    fn read_dispatch_profile(&mut self) -> Result<Pm4DispatchProfile, String> {
+        match self {
+            Self::Single(graph) => graph
+                .read_dispatch_profile()
+                .map(|(timing, spans_nanoseconds)| Pm4DispatchProfile {
+                    timing,
+                    spans_nanoseconds,
+                })
+                .map_err(|error| error.to_string()),
+            Self::Phased(_) => {
+                Err("per-dispatch PM4 profiling requires a single retained queue".to_owned())
+            }
+        }
     }
 
     fn queue_id(&self) -> u64 {
@@ -2303,6 +2440,22 @@ impl PreparedPm4Graph {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Pm4DispatchBoundary {
+    /// Entry ownership acquire emitted before the first dispatch.
+    /// Distinct from mid-tape `acquire_inter_node`.
+    pub entry_acquire: bool,
+    pub wait_compute_idle: bool,
+    pub acquire_inter_node: bool,
+    pub acquire_vmem: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Pm4DispatchProfile {
+    pub timing: GpuMultiQueueTiming,
+    pub spans_nanoseconds: Vec<u64>,
+}
+
 pub struct PreparedPm4Replay {
     graph: PreparedPm4Graph,
     // Kernels retain their HSA executables and kernargs retain every pointer
@@ -2314,6 +2467,7 @@ pub struct PreparedPm4Replay {
     pm4_architecture: Pm4Architecture,
     dispatch_count: usize,
     command_dwords: u32,
+    dispatch_boundaries: Option<Vec<Pm4DispatchBoundary>>,
 }
 
 impl PreparedPm4Replay {
@@ -2359,12 +2513,33 @@ impl PreparedPm4Replay {
         unsafe { self.graph.replay_and_wait_profiled() }
     }
 
+    /// Replay one instrumented retained graph exactly once.
+    ///
+    /// # Safety
+    ///
+    /// Every captured pointer must remain live, as for [`Self::replay_and_wait`].
+    pub unsafe fn replay_and_wait_dispatch_profiled(
+        &mut self,
+        position: usize,
+    ) -> Result<Pm4DispatchProfile, String> {
+        if self.dispatch_boundaries.is_none() {
+            return Err("prepared PM4 graph has no per-dispatch timestamps".to_owned());
+        }
+        // SAFETY: forwarded from the caller that owns the model allocations.
+        unsafe { self.replay_and_wait(position)? };
+        self.graph.read_dispatch_profile()
+    }
+
     pub fn dispatch_count(&self) -> usize {
         self.dispatch_count
     }
 
     pub fn command_dwords(&self) -> u32 {
         self.command_dwords
+    }
+
+    pub fn dispatch_boundaries(&self) -> Option<&[Pm4DispatchBoundary]> {
+        self.dispatch_boundaries.as_deref()
     }
 
     pub fn queue_id(&self) -> u64 {
@@ -2429,6 +2604,8 @@ pub struct ReplayController {
     radiowave_effect_launches: usize,
     fallback_effect_launches: usize,
     unknown_effect_launches: usize,
+    /// Opt-in latch for daemon-owned post-generate route-proof markers.
+    route_proof_log: bool,
 }
 
 impl ReplayController {
@@ -2478,6 +2655,7 @@ impl ReplayController {
             radiowave_effect_launches: 0,
             fallback_effect_launches: 0,
             unknown_effect_launches: 0,
+            route_proof_log: route_proof_log_requested(),
         }
     }
 
@@ -2494,10 +2672,11 @@ impl ReplayController {
     /// An explicit backend selection always wins. Otherwise every successful
     /// model load resets the process-local controller so prepared queues,
     /// command buffers, and fallback state cannot bleed across model swaps.
-    /// The certified gfx12 MQ4R route defaults to retained PM4; all other
-    /// models return to ordinary HIP. An explicit transport still overrides
-    /// the PM4 transport choice for diagnostics.
-    pub fn configure_model_default(&mut self, enable_gfx12_mq4r: bool) -> bool {
+    /// Eligible single-GPU MQ4R models may default to retained PM4 on
+    /// gfx1100, gfx1151, and gfx1201; this is runtime policy, not certification.
+    /// All other models return to ordinary HIP. An explicit transport still
+    /// overrides the PM4 transport choice for diagnostics.
+    pub fn configure_model_default(&mut self, enable_mq4r: bool) -> bool {
         let manual = manual_capture_requested();
         let backend = hipfire_config::process_value("HIPFIRE_REPLAY_BACKEND");
         let explicit_backend = backend.as_deref().is_some_and(|value| value != "auto");
@@ -2511,7 +2690,7 @@ impl ReplayController {
         }
 
         let transport_override = hipfire_config::process_value("HIPFIRE_REPLAY_TRANSPORT");
-        let transport = if enable_gfx12_mq4r
+        let transport = if enable_mq4r
             && !transport_override
                 .as_deref()
                 .is_some_and(|value| value != "auto")
@@ -2520,12 +2699,12 @@ impl ReplayController {
         } else {
             ReplayTransport::from_config()
         };
-        self.apply_model_default(enable_gfx12_mq4r, transport);
+        self.apply_model_default(enable_mq4r, transport);
         true
     }
 
-    fn apply_model_default(&mut self, enable_gfx12_mq4r: bool, transport: ReplayTransport) {
-        let request = if enable_gfx12_mq4r {
+    fn apply_model_default(&mut self, enable_mq4r: bool, transport: ReplayTransport) {
+        let request = if enable_mq4r {
             ReplayBackendRequest::Auto
         } else {
             ReplayBackendRequest::Hip
@@ -2599,6 +2778,9 @@ impl ReplayController {
                         packet_count: Some(prepared.packet_count()),
                         queue_id: prepared.queue_id(),
                         command_dwords: None,
+                        // Linear AQL is a single-queue, single-phase batch graph.
+                        queue_count: 1,
+                        phase_count: 1,
                     })
             }
             ReplayTransport::Pm4Ib => {
@@ -2612,6 +2794,8 @@ impl ReplayController {
                         ),
                         queue_id: prepared.queue_id(),
                         command_dwords: Some(prepared.command_dwords()),
+                        queue_count: prepared.queue_count(),
+                        phase_count: prepared.phase_count(),
                     })
             }
         }
@@ -2624,6 +2808,37 @@ impl ReplayController {
     /// Start a request-local route-proof window without changing replay state.
     pub fn begin_replay_observation_window(&mut self) {
         self.replay_observation = ReplayObservation::default();
+    }
+
+    /// Invalidate the current request-local proof window after cancellation or
+    /// another request-level failure that is not itself a replay error.
+    pub fn invalidate_replay_observation_window(&mut self) {
+        self.replay_observation.failed = true;
+    }
+
+    /// Build one request-scoped retained-replay proof marker.
+    ///
+    /// The daemon owns request boundaries and stderr emission. Invalid request
+    /// IDs fail closed so an untrusted ID cannot inject or alias log lines.
+    pub fn replay_observation_marker(&self, request_id: &str) -> Option<String> {
+        if !self.route_proof_log
+            || self.replay_observation.failed
+            || self.replay_observation.count == 0
+            || request_id.is_empty()
+            || !request_id.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':')
+            })
+        {
+            return None;
+        }
+        let position = self.replay_observation.first_position?;
+        Some(format!(
+            "HIPFIRE_REPLAY_ROUTE_PROOF transport={} position={} request_id={} replays={}",
+            self.transport_name(),
+            position,
+            request_id,
+            self.replay_observation.count
+        ))
     }
 
     pub fn is_recording(&self) -> bool {
@@ -2884,6 +3099,24 @@ impl ReplayController {
         device_ordinal: usize,
         prefix: usize,
     ) -> Result<(usize, u32, u64), String> {
+        self.prepare_pm4_prefix_inner(device_ordinal, prefix, false)
+    }
+
+    /// Lower a captured prefix to a single GFX12 IB with per-dispatch timestamps.
+    pub fn prepare_pm4_dispatch_profile(
+        &mut self,
+        device_ordinal: usize,
+        prefix: usize,
+    ) -> Result<(usize, u32, u64), String> {
+        self.prepare_pm4_prefix_inner(device_ordinal, prefix, true)
+    }
+
+    fn prepare_pm4_prefix_inner(
+        &mut self,
+        device_ordinal: usize,
+        prefix: usize,
+        dispatch_profile: bool,
+    ) -> Result<(usize, u32, u64), String> {
         if self.recorded.is_empty() {
             return Err("no captured launch sequence".to_owned());
         }
@@ -2899,6 +3132,9 @@ impl ReplayController {
             .select_gpu(GpuSelector::Ordinal(device_ordinal))
             .map_err(|error| error.to_string())?;
         let pm4_architecture = Pm4Architecture::from_device(&device)?;
+        if dispatch_profile && pm4_architecture != Pm4Architecture::Gfx12 {
+            return Err("per-dispatch PM4 profiling currently requires gfx12".to_owned());
+        }
         let dispatch_initiator_policy =
             gfx10_dispatch_initiator_policy(pm4_architecture, device.name());
         let dispatch_interleave = gfx1151_dispatch_interleave(pm4_architecture, device.name());
@@ -3052,7 +3288,9 @@ impl ReplayController {
         // Dynamic direct-dispatch patching is intentionally limited to the
         // certified one-IB path. Multi-queue phases duplicate and reorder
         // command buffers, so a global capture index is not a safe patch key.
-        let queue_limit = if dynamic_grids.is_empty() {
+        let queue_limit = if dispatch_profile {
+            1
+        } else if dynamic_grids.is_empty() {
             self.pm4_queue_policy.resolve(device.name(), usize::MAX)
         } else {
             1
@@ -3060,6 +3298,7 @@ impl ReplayController {
         if cu_mask.is_some() && queue_limit != 1 {
             return Err("gfx1151 CU-mask experiments require single-queue PM4 replay".to_owned());
         }
+        let mut dispatch_boundaries = Vec::new();
         let (graph, command_dwords) = if queue_limit == 1 {
             let recorded = &self.recorded[..prefix];
             let reorder_window = pm4_single_ib_reorder_from_config(device.name());
@@ -3083,9 +3322,10 @@ impl ReplayController {
                     let sequence_hash =
                         replay_sequence_hash(order.iter().map(|index| &recorded[*index]));
                     eprintln!(
-                        "[redline] gfx1151 single-IB reorder(window={window}, scheduler=level): \
+                        "[redline] single-IB reorder(arch={}, window={window}, scheduler=level): \
                          moved={moved}/{prefix} max_displacement={max_displacement} \
-                         execution_sequence_hash={sequence_hash:016x}"
+                         execution_sequence_hash={sequence_hash:016x}",
+                        device.name()
                     );
                     order
                 }
@@ -3102,6 +3342,7 @@ impl ReplayController {
             let mut dependency_waits = 0usize;
             let mut dependency_acquires = 0usize;
             for (position, index) in order.iter().copied().enumerate() {
+                let mut boundary = Pm4DispatchBoundary::default();
                 if position != 0 {
                     let previous_index = order[position - 1];
                     let previous_launch = &self.recorded[previous_index];
@@ -3118,6 +3359,7 @@ impl ReplayController {
                     };
                     if !independent {
                         dependency_waits += 1;
+                        boundary.wait_compute_idle = true;
                         commands.wait_compute_idle();
                     }
                     resource_frontier.advance(current_launch, resources_independent);
@@ -3127,14 +3369,13 @@ impl ReplayController {
                             .acquire_between(previous, current);
                     if acquire {
                         dependency_acquires += 1;
-                        commands.acquire_inter_node(
-                            gfx12_gcr_trim,
-                            gfx11_vmem_acquire
-                                && radiowave_vmem_only_consumer(
-                                    &radiowave_certifications,
-                                    current_launch,
-                                ),
+                        boundary.acquire_vmem = pm4_vmem_acquire_enabled(
+                            pm4_architecture,
+                            gfx11_vmem_acquire,
+                            &radiowave_certifications,
+                            current_launch,
                         );
+                        commands.acquire_inter_node(gfx12_gcr_trim, boundary.acquire_vmem);
                     }
                 } else {
                     resource_frontier.advance(&self.recorded[index], false);
@@ -3147,14 +3388,21 @@ impl ReplayController {
                         kernargs[index].address(),
                     )
                     .map_err(|error| format!("{}: {error}", self.recorded[index].kernel))?;
+                if dispatch_profile {
+                    dispatch_boundaries.push(boundary);
+                }
             }
             commands.wait_compute_idle();
+            if dispatch_profile {
+                commands.populate_dispatch_span_boundaries(&mut dispatch_boundaries)?;
+            }
             let command_dwords = commands.len_dwords();
             if reorder_window.is_some() {
                 eprintln!(
-                    "[redline] gfx1151 single-IB schedule stats: \
+                    "[redline] single-IB schedule stats arch={}: \
                      independent_adjacencies={} dependency_waits={} \
                      dependency_acquires={} terminal_waits=1 command_dwords={command_dwords}",
+                    device.name(),
                     prefix.saturating_sub(1).saturating_sub(dependency_waits),
                     dependency_waits,
                     dependency_acquires,
@@ -3171,7 +3419,37 @@ impl ReplayController {
                     }
                 }
             }
-            let graph = commands.create_graph(&device, &pool, cu_mask.as_ref())?;
+            // HIPFIRE_REDLINE_IB_POOL=vmem: allocate the retained indirect
+            // buffer from a GPU-agent (VRAM) pool so the command processor
+            // fetches the tape from VRAM instead of re-reading it over the
+            // host interface on every replay. Host-read surfaces
+            // (timestamps, completion signals) stay on the CPU-agent pool.
+            // Falls back to the host pool with a warning when no device-local
+            // pool exists.
+            static IB_VMEM: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+                hipfire_config::developer_var("HIPFIRE_REDLINE_IB_POOL").as_deref() == Ok("vmem")
+            });
+            let ib_pool = if *IB_VMEM {
+                match KernargPool::discover_device_local(&device) {
+                    Ok(p) => Some(p),
+                    Err(error) => {
+                        eprintln!(
+                            "[redline] HIPFIRE_REDLINE_IB_POOL=vmem but no device-local pool \
+                             found ({error}); using host pool"
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            let graph = commands.create_graph(
+                &device,
+                &pool,
+                ib_pool.as_ref(),
+                cu_mask.as_ref(),
+                dispatch_profile,
+            )?;
             (PreparedPm4Graph::Single(graph), command_dwords)
         } else {
             let min_parallel_width = pm4_min_parallel_width_from_config();
@@ -3338,11 +3616,12 @@ impl ReplayController {
                         {
                             commands.acquire_inter_node(
                                 gfx12_gcr_trim,
-                                gfx11_vmem_acquire
-                                    && radiowave_vmem_only_consumer(
-                                        &radiowave_certifications,
-                                        current_launch,
-                                    ),
+                                pm4_vmem_acquire_enabled(
+                                    pm4_architecture,
+                                    gfx11_vmem_acquire,
+                                    &radiowave_certifications,
+                                    current_launch,
+                                ),
                             );
                         }
                     } else {
@@ -3398,6 +3677,7 @@ impl ReplayController {
             pm4_architecture,
             dispatch_count: prefix,
             command_dwords,
+            dispatch_boundaries: dispatch_profile.then_some(dispatch_boundaries),
         });
         self.state = ReplayState::Ready;
         Ok((prefix, command_dwords, queue_id))
@@ -3435,12 +3715,43 @@ impl ReplayController {
         self.observe_replay_result(position, result)
     }
 
+    /// Replay one explicitly instrumented PM4 graph exactly once.
+    ///
+    /// # Safety
+    ///
+    /// Captured model allocations and pointed-to buffers must remain live.
+    pub unsafe fn replay_pm4_dispatch_profile(
+        &mut self,
+        position: usize,
+    ) -> Result<Pm4DispatchProfile, String> {
+        let result = {
+            let prepared = self
+                .prepared_pm4
+                .as_mut()
+                .ok_or_else(|| "no prepared PM4 replay".to_owned())?;
+            // SAFETY: forwarded from the model owner.
+            unsafe { prepared.replay_and_wait_dispatch_profiled(position) }
+        };
+        self.observe_replay_result(position, result)
+    }
+
+    pub fn prepared_pm4_dispatch_boundaries(&self) -> Option<&[Pm4DispatchBoundary]> {
+        self.prepared_pm4
+            .as_ref()
+            .and_then(PreparedPm4Replay::dispatch_boundaries)
+    }
     fn observe_replay_result<T>(
         &mut self,
         position: usize,
         result: Result<T, String>,
     ) -> Result<T, String> {
-        let value = result?;
+        let value = match result {
+            Ok(value) => value,
+            Err(error) => {
+                self.replay_observation.failed = true;
+                return Err(error);
+            }
+        };
         self.replay_observation.count = self.replay_observation.count.saturating_add(1);
         self.replay_observation
             .first_position
@@ -3965,6 +4276,21 @@ mod tests {
             pointer_effects("hc_input_map_4stream").map(|effects| effects[1].mode),
             Some(RecordedAccessMode::Read)
         );
+    }
+
+    #[test]
+    fn gfx12_never_reports_gfx11_vmem_acquire() {
+        let kernel = "fused_rmsnorm_mq_rotate";
+        assert!(pm4_vmem_acquire_enabled(
+            Pm4Architecture::Gfx11,
+            true,
+            kernel
+        ));
+        assert!(!pm4_vmem_acquire_enabled(
+            Pm4Architecture::Gfx12,
+            true,
+            kernel
+        ));
     }
 
     #[test]
@@ -4799,14 +5125,13 @@ mod tests {
     }
 
     #[test]
-    fn route_observation_records_only_success_and_resets() {
+    fn route_observation_records_success_failure_and_resets() {
         let mut controller = ReplayController::new(ReplayBackendRequest::Auto);
         let failed: Result<(), String> = Err("dispatch failed".to_owned());
         assert!(controller.observe_replay_result(127, failed).is_err());
-        assert_eq!(
-            controller.replay_observation(),
-            ReplayObservation::default()
-        );
+        assert!(controller.replay_observation().failed);
+
+        controller.begin_replay_observation_window();
 
         controller.observe_replay_result(127, Ok(())).unwrap();
         controller.observe_replay_result(128, Ok(())).unwrap();
@@ -4816,6 +5141,7 @@ mod tests {
                 count: 2,
                 first_position: Some(127),
                 last_position: Some(128),
+                failed: false,
             }
         );
 
@@ -4845,7 +5171,79 @@ mod tests {
                 count: 1,
                 first_position: Some(512),
                 last_position: Some(512),
+                failed: false,
             }
+        );
+    }
+
+    #[test]
+    fn route_proof_marker_is_request_scoped() {
+        let mut controller = ReplayController::new(ReplayBackendRequest::Auto);
+        controller.route_proof_log = true;
+        assert_eq!(
+            controller.replay_observation_marker("chatcmpl-turn-1"),
+            None
+        );
+
+        controller.observe_replay_result(127, Ok(())).unwrap();
+        controller.observe_replay_result(128, Ok(())).unwrap();
+        assert_eq!(
+            controller.replay_observation_marker("chatcmpl-turn-1"),
+            Some(
+                "HIPFIRE_REPLAY_ROUTE_PROOF transport=aql position=127 \
+                 request_id=chatcmpl-turn-1 replays=2"
+                    .to_owned()
+            )
+        );
+        assert_eq!(controller.replay_observation_marker(""), None);
+
+        controller.begin_replay_observation_window();
+        assert_eq!(
+            controller.replay_observation_marker("chatcmpl-turn-2"),
+            None
+        );
+        controller.observe_replay_result(512, Ok(())).unwrap();
+        assert_eq!(
+            controller.replay_observation_marker("invalid request id"),
+            None
+        );
+    }
+
+    #[test]
+    fn route_proof_marker_fails_closed_after_replay_error() {
+        let mut controller = ReplayController::new(ReplayBackendRequest::Auto);
+        controller.route_proof_log = true;
+        controller.observe_replay_result(127, Ok(())).unwrap();
+        assert!(controller
+            .observe_replay_result::<()>(128, Err("dispatch failed".to_owned()))
+            .is_err());
+
+        assert_eq!(
+            controller.replay_observation_marker("chatcmpl-turn-1"),
+            None
+        );
+        controller.observe_replay_result(129, Ok(())).unwrap();
+        assert_eq!(
+            controller.replay_observation_marker("chatcmpl-turn-1"),
+            None
+        );
+    }
+
+    #[test]
+    fn route_proof_marker_fails_closed_after_request_abort() {
+        let mut controller = ReplayController::new(ReplayBackendRequest::Auto);
+        controller.route_proof_log = true;
+        controller.observe_replay_result(127, Ok(())).unwrap();
+        controller.invalidate_replay_observation_window();
+
+        assert_eq!(
+            controller.replay_observation_marker("chatcmpl-turn-1"),
+            None
+        );
+        controller.observe_replay_result(128, Ok(())).unwrap();
+        assert_eq!(
+            controller.replay_observation_marker("chatcmpl-turn-1"),
+            None
         );
     }
 

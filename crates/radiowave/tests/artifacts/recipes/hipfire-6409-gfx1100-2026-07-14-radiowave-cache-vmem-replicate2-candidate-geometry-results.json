@@ -1,0 +1,9 @@
+{
+  "external_archive_sha256": "d4d0911e751e891b952f2983c0a78e05c304b854321ce5f438794ca7a8abda2b",
+  "kind": "radiowave_recipe_provenance",
+  "note": "Full raw result history is externally archived; this fixture is a deterministic provenance record only and does not embed measurement rows.",
+  "original_byte_size": 108494,
+  "original_result_path": "examples/hipfire-6409/results/gfx1100/2026-07-14-radiowave-cache-vmem-replicate2/candidate-geometry/results.json",
+  "original_sha256": "e3d22f1a78810d639b36b9b95d1e1701fd04e7a72524d71677c852f2ae6f61af",
+  "schema_version": 1
+}

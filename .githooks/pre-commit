@@ -20,11 +20,17 @@ set -e
 # List files staged for this commit.
 CHANGED=$(git diff --cached --name-only --diff-filter=ACM)
 
+# ── fmt-bomb backstop (every commit, GPU-free, ~instant) ────────────────
+# Catch a workspace-wide reformat BEFORE it lands, whatever produced it —
+# `cargo fmt`, an IDE format-on-save, a non-Claude agent, muscle memory.
+# Bypass (deliberate reviewed sweep): SKIP_FMT_BOMB_CHECK=1 git commit ...
+"$(git rev-parse --show-toplevel)/scripts/check-fmt-bomb.sh" || exit 1
+
 # ── rustfmt-changed gate (every commit, GPU-free, ~instant) ─────────────
 # Mirror CI's changed-file rustfmt check (scripts/ci-rustfmt-changed.sh) on
 # the staged Rust files. The repo carries historical format debt so we only
 # check files in THIS commit, not the workspace. Fix with:
-#   scripts/fmt-changed.sh
+#   scripts/fmt-changed.sh <master|beta>   # the ref THIS branch was cut from
 # Bypass (e.g. mid-rebase) with: SKIP_FMT_CHECK=1 git commit ...
 if [[ -z "${SKIP_FMT_CHECK:-}" ]]; then
     mapfile -t fmt_files < <(echo "$CHANGED" | grep -E '\.rs$' || true)
@@ -32,7 +38,7 @@ if [[ -z "${SKIP_FMT_CHECK:-}" ]]; then
         if ! rustfmt --edition 2021 --check --config skip_children=true "${fmt_files[@]}"; then
             echo "" >&2
             echo "✗ rustfmt: staged Rust file(s) are not formatted (CI's changed-file gate will flag this)." >&2
-            echo "  Fix:    scripts/fmt-changed.sh && git add -u" >&2
+            echo "  Fix:    scripts/fmt-changed.sh <master|beta> && git add -u" >&2
             echo "  Bypass: SKIP_FMT_CHECK=1 git commit ..." >&2
             echo "  Do NOT run 'cargo fmt' — it reformats the whole workspace's format debt." >&2
             exit 1
@@ -57,7 +63,7 @@ HOTSPOT='\.hip$|gemv|forward|quant|rotate|dispatch|fwht|rmsnorm|fused|mq4|hfq|ma
 # Serve recurrent-state machine — files whose changes can leak DeltaNet/KV state
 # ACROSS requests (issue #462). These get an extra MULTI-REQUEST serve-output
 # gate (serve-loop-gate.sh) that the single-request coherence battery misses.
-SERVE_HOTSPOT='examples/daemon\.rs|speculative\.rs|cli/index\.ts'
+SERVE_HOTSPOT='examples/daemon\.rs|speculative\.rs'
 
 # Multi-GPU PP hotspots — superset of the HOTSPOT entry above. pp-gate.sh
 # runs only when one of these is touched AND 2+ GPUs are visible; otherwise

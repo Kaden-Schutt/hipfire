@@ -5,12 +5,12 @@
 //! HFQ (.hfq) file loader for hipfire-native Q4_F16 quantized models.
 
 use crate::llama::{
-    EmbeddingFormat, LayerWeights, LlamaConfig, LlamaWeights, ModelArch, WeightTensor, f16_to_f32,
+    f16_to_f32, EmbeddingFormat, LayerWeights, LlamaConfig, LlamaWeights, ModelArch, WeightTensor,
 };
-use crate::model_load::{LoadedWeights, WeightSource, load_weights as rt_load_weights};
+use crate::model_load::{load_weights as rt_load_weights, LoadedWeights, WeightSource};
 use crate::weight_backend::{
-    HfqBackend, WeightBackend, decode_raw_codec, flat_name_candidates, load_embedding, raw_codec,
-    resolve_lm_head, reupload_f16_as_f32,
+    decode_raw_codec, flat_name_candidates, load_embedding, raw_codec, resolve_lm_head,
+    reupload_f16_as_f32, HfqBackend, WeightBackend,
 };
 use hip_bridge::{HipError, HipResult};
 use memmap2::Mmap;
@@ -762,7 +762,11 @@ impl HfqFile {
                 hi = hi.max(t.data_offset + t.data_size);
             }
         }
-        if lo < hi { Some((lo, hi)) } else { None }
+        if lo < hi {
+            Some((lo, hi))
+        } else {
+            None
+        }
     }
 
     fn find_tensor(&self, name: &str) -> Option<&HfqTensorInfo> {

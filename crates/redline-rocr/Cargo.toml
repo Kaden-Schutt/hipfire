@@ -2,10 +2,11 @@
 name = "redline-rocr"
 version.workspace = true
 edition = "2024"
-license = "MIT OR Apache-2.0"
+license.workspace = true
 description = "Auditable public ROCr/HSA ABI, resource ownership, and AQL packet publication"
 
 [dependencies]
+hipfire-config = { path = "../hipfire-config" }
 libloading.workspace = true
 
 [dev-dependencies]

@@ -104,7 +104,10 @@ ENV HIPFIRE_DAEMON_BIN=/hipfire/target/release/examples/daemon \
     MODELS_DIR=/root/.hipfire/models
 
 WORKDIR /hipfire
-# Default gate = coherence battery; override by appending another gate script,
-# e.g. `podman run ... hipfire-gate scripts/serve-multiturn-gate.sh`.
+# No default gate: there is no universal correctness battery. The old default
+# (scripts/coherence-gate.sh) is retired AND absent from the checkout, so it
+# execed as "no such file" (127). Fail closed with guidance instead; pick a
+# route from docs/VALIDATION.md and pass it explicitly, e.g.
+#   podman run ... hipfire-gate scripts/serve-multiturn-gate.sh
 ENTRYPOINT ["/bin/bash"]
-CMD ["scripts/coherence-gate.sh"]
+CMD ["-c", "echo '[hipfire-gate] no gate command given.' >&2; echo 'There is no universal gate. Select a validation route from docs/VALIDATION.md and pass it explicitly, e.g.:' >&2; echo '  scripts/serve_harness.py battery --model <model>' >&2; echo '  scripts/redline_daemon_harness.py   # kernel/dispatch/graph/Redline changes' >&2; exit 2"]

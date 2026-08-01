@@ -58,8 +58,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let routed_active =
-        routed_all * cfg.num_experts_per_tok as u128 / cfg.n_routed_experts as u128;
+    let routed_active = routed_all * cfg.num_experts_per_tok as u128 / cfg.n_routed_experts as u128;
     let total = dense_layer + routed_active + head + embedding_row + global;
     let gib = |bytes: u128| bytes as f64 / (1024.0 * 1024.0 * 1024.0);
     println!("model={path}");

@@ -1812,6 +1812,240 @@ impl Gpu {
         result
     }
 
+    /// Query-tiled Q8_0 flash prefill attention.
+    ///
+    /// `br`/`bc` are compile-time tile sizes; each (br, bc) pair compiles to
+    /// its own module so they can be swept without editing the source. LDS is
+    /// a function of br/bc only — never of context length — so this kernel has
+    /// no capacity crossover and no occupancy decay as the context grows.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_q8_0_flash_prefill(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_ctx_len: usize,
+        batch_size: usize,
+        br: usize,
+        bc: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        const NTHREADS: usize = 256;
+        // The kernel's per-thread accumulator is a fixed float[32]; dpt must
+        // fit it or the kernel would silently overrun its stack array.
+        let dpt = head_dim / (NTHREADS / br);
+        assert!(
+            dpt <= 32,
+            "flash prefill dpt {dpt} > 32 (br={br} head_dim={head_dim}); \
+             raise NTHREADS or lower br"
+        );
+        let module = format!("attention_q8_0_flash_prefill_br{br}_bc{bc}");
+        let src = format!(
+            "#define BR {br}\n#define BC {bc}\n#define NTHREADS {NTHREADS}\n{}",
+            kernels::ATTENTION_Q8_0_FLASH_PREFILL_SRC
+        );
+        self.ensure_kernel(&module, &src, "attention_q8_0_flash_prefill")?;
+
+        let bph = head_dim / 32;
+        let lds = (br * bc + 3 * br + br * head_dim) * 4 + 2 * bc * bph * 34;
+        assert!(
+            lds <= 64 * 1024,
+            "flash prefill LDS {lds} exceeds 64KB (br={br} bc={bc})"
+        );
+
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let mut q_ptr = q.buf.as_ptr();
+        let mut k_ptr = k_cache.buf.as_ptr();
+        let mut v_ptr = v_cache.buf.as_ptr();
+        let mut out_ptr = out.buf.as_ptr();
+        let mut pos_ptr = positions.buf.as_ptr();
+        let mut nh = n_heads as i32;
+        let mut nkv = n_kv_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut bs = batch_size as i32;
+        let mut sc = scale;
+        let _ = max_ctx_len; // cache stride derives from n_kv_heads/head_dim
+        let mut params: Vec<*mut c_void> = vec![
+            &mut q_ptr as *mut _ as *mut c_void,
+            &mut k_ptr as *mut _ as *mut c_void,
+            &mut v_ptr as *mut _ as *mut c_void,
+            &mut out_ptr as *mut _ as *mut c_void,
+            &mut pos_ptr as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+            &mut sc as *mut _ as *mut c_void,
+        ];
+        let grid_x = batch_size.div_ceil(br) as u32;
+        self.launch_maybe_blob(
+            "attention_q8_0_flash_prefill",
+            [grid_x, n_heads as u32, 1],
+            [NTHREADS as u32, 1, 1],
+            lds as u32,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(q_ptr);
+                b.push_ptr(k_ptr);
+                b.push_ptr(v_ptr);
+                b.push_ptr(out_ptr);
+                b.push_ptr(pos_ptr);
+                b.push_i32(nh);
+                b.push_i32(nkv);
+                b.push_i32(hd);
+                b.push_i32(bs);
+                b.push_f32(sc);
+                b
+            },
+        )
+    }
+
+    /// WMMA (matrix-core) variant of `attention_q8_0_flash_prefill`.
+    ///
+    /// Fixed 16-query / 16-key tiles (the WMMA fragment shape), one wave32 per
+    /// workgroup. head_dim must be a multiple of 32 (Q8_0 block width) and at
+    /// most 512 so `d_chunks <= MAX_D_CHUNKS`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_q8_0_flash_prefill_wmma(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert!(
+            head_dim % 32 == 0,
+            "head_dim {head_dim} must be a multiple of 32"
+        );
+        assert!(
+            head_dim <= 256,
+            "head_dim {head_dim} exceeds MAX_D_CHUNKS*16"
+        );
+        // HIPFIRE_FLASH_PREFILL_SPLITQ=1 carries Q as a double-single (hi+lo)
+        // pair through two WMMA passes per d-chunk. Q's f16 rounding is the
+        // dominant error term — f16 Q alone through an otherwise-f32 kernel
+        // gives rel_l2 5.36e-4 of a 5.48e-4 total at CTX=12288 — so this is the
+        // accuracy lever. Costs one extra matrix op per d-chunk and a second Q
+        // plane in LDS.
+        let split_q = hipfire_config::developer_var("HIPFIRE_FLASH_PREFILL_SPLITQ")
+            .ok()
+            .as_deref()
+            == Some("1");
+        let gfx12 = self.arch_caps.has_wmma_w32_gfx12();
+        let fixed_head_dim = hipfire_config::developer_var("HIPFIRE_FLASH_PREFILL_FIXED_HD")
+            .ok()
+            .as_deref()
+            != Some("0");
+        let fixed_hd = if fixed_head_dim { head_dim } else { 0 };
+        let prefetch_v = hipfire_config::developer_var("HIPFIRE_FLASH_PREFILL_PREFETCH_V")
+            .ok()
+            .as_deref()
+            != Some("0");
+        // gfx12 must see head_dim as a compile-time constant so the unrolled
+        // float8_t output fragments stay in VGPRs. Leaving it dynamic spills
+        // 544 B/thread to scratch (and reserves ~34 MiB of global scratch on
+        // gfx1201), roughly halving this kernel's measured throughput.
+        let pv_suffix = if prefetch_v { "" } else { "_pv0" };
+        let tuning_suffix = pv_suffix;
+        let module = if !fixed_head_dim && split_q {
+            format!("attention_q8_0_flash_prefill_wmma_dynamic_splitq{tuning_suffix}")
+        } else if !fixed_head_dim {
+            format!("attention_q8_0_flash_prefill_wmma_dynamic{tuning_suffix}")
+        } else if gfx12 && split_q {
+            format!("attention_q8_0_flash_prefill_wmma_gfx12_hd{head_dim}_splitq{tuning_suffix}")
+        } else if gfx12 {
+            format!("attention_q8_0_flash_prefill_wmma_gfx12_hd{head_dim}{tuning_suffix}")
+        } else if split_q {
+            format!("attention_q8_0_flash_prefill_wmma_gfx11_hd{head_dim}_splitq{tuning_suffix}")
+        } else {
+            format!("attention_q8_0_flash_prefill_wmma_gfx11_hd{head_dim}{tuning_suffix}")
+        };
+        let kernel_src = if gfx12 {
+            kernels::ATTENTION_Q8_0_FLASH_PREFILL_WMMA_GFX12_SRC
+        } else {
+            kernels::ATTENTION_Q8_0_FLASH_PREFILL_WMMA_SRC
+        };
+        let src = format!(
+            "#define SPLIT_Q {}\n#define FIXED_HEAD_DIM {}\n#define PREFETCH_V {}\n{}",
+            split_q as u32, fixed_hd, prefetch_v as u32, kernel_src
+        );
+        self.ensure_kernel(&module, &src, "attention_q8_0_flash_prefill_wmma")?;
+        const M_TILE: usize = 16;
+        const N_TILE: usize = 16;
+        const S_STRIDE: usize = 18;
+        const V_STRIDE: usize = 18;
+        // MUST track the kernel's LDS layout: SPLIT_Q adds a second Q plane.
+        // Under-allocating here overruns V_lds_T / S_lds / m_lds and the kernel
+        // silently emits all zeros — observed, and it passed the accuracy gate
+        // until that gate was hardened to reject degenerate output.
+        let q_planes = if split_q { 2 } else { 1 };
+        // Q(xN planes) f16 + V^T f16 + S f16 + (m,l,alpha) f32
+        let lds = (q_planes * M_TILE * head_dim + head_dim * V_STRIDE + M_TILE * S_STRIDE) * 2
+            + M_TILE * 3 * 4;
+        assert!(
+            lds <= 64 * 1024,
+            "wmma flash prefill LDS {lds} exceeds 64KB"
+        );
+
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let mut q_ptr = q.buf.as_ptr();
+        let mut k_ptr = k_cache.buf.as_ptr();
+        let mut v_ptr = v_cache.buf.as_ptr();
+        let mut out_ptr = out.buf.as_ptr();
+        let mut pos_ptr = positions.buf.as_ptr();
+        let mut nh = n_heads as i32;
+        let mut nkv = n_kv_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut bs = batch_size as i32;
+        let mut sc = scale;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut q_ptr as *mut _ as *mut c_void,
+            &mut k_ptr as *mut _ as *mut c_void,
+            &mut v_ptr as *mut _ as *mut c_void,
+            &mut out_ptr as *mut _ as *mut c_void,
+            &mut pos_ptr as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+            &mut sc as *mut _ as *mut c_void,
+        ];
+        let grid_x = batch_size.div_ceil(M_TILE) as u32;
+        self.launch_maybe_blob(
+            "attention_q8_0_flash_prefill_wmma",
+            [grid_x, n_heads as u32, 1],
+            [32, 1, 1],
+            lds as u32,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(q_ptr);
+                b.push_ptr(k_ptr);
+                b.push_ptr(v_ptr);
+                b.push_ptr(out_ptr);
+                b.push_ptr(pos_ptr);
+                b.push_i32(nh);
+                b.push_i32(nkv);
+                b.push_i32(hd);
+                b.push_i32(bs);
+                b.push_f32(sc);
+                b
+            },
+        )
+    }
+
     /// Batched flash attention for Q8_0 KV — tile + reduce two-kernel path.
     /// No LDS capacity limit: tiles seq_len into chunks of `tile_size` only,
     /// so shared memory is O(tile_size), not O(max_ctx_len). Replaces the
@@ -5157,11 +5391,12 @@ impl Gpu {
             &mut ms as *mut _ as *mut c_void,
             &mut sc as *mut _ as *mut c_void,
         ];
-        let block_size = (seq_len_hint.max(head_dim) as u32)
-            .next_power_of_two()
-            .min(256);
-        // Extra shared mem for Q head vector preloaded into shared memory
-        let shared_mem = ((seq_len_hint + block_size as usize + head_dim) * 4) as u32;
+        // Fixed-size launch: block 256, LDS = (ATT_Q8_TILE + head_dim + block)
+        // floats regardless of seq_len (v2 kernel tiles positions with online
+        // softmax — O(seq_len) LDS previously faulted past ~15.9k on gfx1100).
+        const ATT_Q8_KV_TILE: usize = 2048;
+        let block_size: u32 = 256;
+        let shared_mem = ((ATT_Q8_KV_TILE + head_dim + block_size as usize) * 4) as u32;
         let bytes =
             crate::profile::attention_q8_0_kv_bytes(n_heads, n_kv_heads, head_dim, seq_len_hint);
         let timer = crate::profile::begin_timer(&self.hip, "attention", "attention_q8_0_kv", bytes);

@@ -1298,6 +1298,7 @@ mod tests {
             ),
             flags: Arc::new(flags),
             resources: crate::resource::ResourceManager::for_test(),
+            workload: crate::context::DispatchWorkload::Standard,
         };
         // short-circuit: every guard opens with `force_unfused → false`, so even
         // an empty slice returns false. This proves the branch exists.
@@ -1455,6 +1456,7 @@ mod tests {
             ),
             flags: Arc::new(flags),
             resources: crate::resource::ResourceManager::for_test(),
+            workload: crate::context::DispatchWorkload::Standard,
         };
         let empty: &[Step] = &[];
         assert!(

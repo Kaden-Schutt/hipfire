@@ -31,13 +31,13 @@ If you have hardware hipfire does not yet exercise well, this is the path from â
 
 ### 1. Fork, clone, and install hooks
 
-1. Fork `https://github.com/Kaden-Schutt/hipfire` on GitHub (you have no upstream commit bit).
+1. Fork `https://github.com/warpfront/hipfire` on GitHub (you have no upstream commit bit).
 2. Clone **your fork** as `origin`, add upstream for fetch/rebase:
 
 ```bash
 git clone https://github.com/<you>/hipfire.git
 cd hipfire
-git remote add upstream https://github.com/Kaden-Schutt/hipfire.git
+git remote add upstream https://github.com/warpfront/hipfire.git
 git fetch upstream
 git checkout -b port/<arch>-<kernel>   # e.g. port/gfx1201-qkv-wmma or port/gfx942-residual-mfma
 ./scripts/install-hooks.sh             # required; sets core.hooksPath=.githooks
@@ -204,7 +204,7 @@ Guardrails:
 
 ## Communication
 
-- Issues: https://github.com/Kaden-Schutt/hipfire/issues
+- Issues: https://github.com/warpfront/hipfire/issues
 - Ping maintainer when: direction check before a large port, PR ready, channel-test wall after self-debug, or blocked Tier S/C handoff needs a baseline holder.
 - Prefer issue-thread progress notes over pings for routine status.
 
