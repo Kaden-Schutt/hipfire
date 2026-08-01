@@ -1,0 +1,69 @@
+PATH /mnt/scratch/models/deepseek-v4-flash-mq2r/deepseek-v4-flash.mq2r
+file_size 82191362222 arch 9 n_tensors 34223 meta_off 32 meta_len 9162752 json_end 6335693
+architecture deepseek_v4
+config_model_type deepseek_v4 num_experts_per_tok 6 n_routed 256 layers 43 expert_dtype fp4
+after_json_in_meta 2827059 head 2c5c6e2020202020205c22c3a4c2b8c4a220c3a7c4b1c5835c222c5c6e2020202020205c22c3a5c583c2a620c3a4c2bac4a85c222c5c6e2020202020205c22c3
+data_start 9162784 remaining 82182199438
+find b'MQ4R' -1
+find b'MQ4' -1
+find b'MQ2R' -1
+find b'MQ2' -1
+find b'MFP3' -1
+find b'MFP4' -1
+find b'mq4r' -1
+find b'mq2r' -1
+find b'mq4' -1
+find b'mq2' -1
+find b'lloyd' -1
+find b'HFQ' 0
+find b'FWHT' -1
+find b'Q8' 9257037
+find b'BF16' -1
+pad_after_json 2c5c6e2020202020205c22c3a4c2b8c4a220c3a7c4b1c5835c222c5c6e202020 b',\\n      \\"\xc3\xa4\xc2\xb8\xc4\xa2 \xc3\xa7\xc4\xb1\xc5\x83\\",\\n   '
+first_nonzero_rel 0 byte b',\\n      \\"\xc3\xa4\xc2\xb8\xc4\xa2 \xc3\xa7\xc4\xb1\xc5\x83\\",\\n   '
+cat_len 2827059 cat_head_hex 2c5c6e2020202020205c22c3a4c2b8c4a220c3a7c4b1c5835c222c5c6e2020202020205c22c3a5c583c2a620c3a4c2bac4a85c222c5c6e2020202020205c22c3a7c4bec58120c3a6c2b0c4b65c222c5c6e2020202020205c226177206174745c222c5c6e2020202020205c22c3a7c2bac2a220c3a8c2b1c4a85c222c5c6e2020
+embed_in_cat 617741
+embed_tokens_in_meta -1
+key b'embed_tokens' -1
+key b'model.embed' -1
+key b'layers.0' 7172509
+key b'tensor_names' -1
+key b'dtypes' -1
+AT_JSON_END 2c5c6e2020202020205c22c3a4c2b8c4a220c3a7c4b1c5835c222c5c6e2020202020205c22c3a5c583c2a620c3a4c2bac4a85c222c5c6e2020202020205c22c3a7c4bec58120c3a6c2b0c4b65c222c5c6e2020202020205c226177206174745c222c5c6e2020202020205c22c3a7c2bac2a220c3a8c2b1c4a85c222c5c6e2020
+AT_META_END 000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000cb19daf9243affb100406381443fedeea81cd00be6b6e0e94e34e929fe42d706
+AT_DATA 14152219f838e4b6c3f1ba07270bc60f3538042ab1d34ad608ba47087f26fa5f2e3170e0341a35eb06e4f44308c5f881fbd1f13a14361ee93cfaea1f120b3431
+====
+PATH /mnt/scratch/models/existing-deepseek-v4-flash/deepseek-v4-flash.mq2lloyd
+file_size 86184307283 arch 9 n_tensors 34223 meta_off 32 meta_len 9160101 json_end 6335693
+architecture deepseek_v4
+config_model_type deepseek_v4 num_experts_per_tok 6 n_routed 256 layers 43 expert_dtype fp4
+after_json_in_meta 2824408 head 2c5c6e2020202020205c22c3a4c2b8c4a220c3a7c4b1c5835c222c5c6e2020202020205c22c3a5c583c2a620c3a4c2bac4a85c222c5c6e2020202020205c22c3
+data_start 9160133 remaining 86175147150
+find b'MQ4R' -1
+find b'MQ4' -1
+find b'MQ2R' -1
+find b'MQ2' -1
+find b'MFP3' -1
+find b'MFP4' -1
+find b'mq4r' -1
+find b'mq2r' -1
+find b'mq4' -1
+find b'mq2' -1
+find b'lloyd' -1
+find b'HFQ' 0
+find b'FWHT' -1
+find b'Q8' 9254386
+find b'BF16' -1
+pad_after_json 2c5c6e2020202020205c22c3a4c2b8c4a220c3a7c4b1c5835c222c5c6e202020 b',\\n      \\"\xc3\xa4\xc2\xb8\xc4\xa2 \xc3\xa7\xc4\xb1\xc5\x83\\",\\n   '
+first_nonzero_rel 0 byte b',\\n      \\"\xc3\xa4\xc2\xb8\xc4\xa2 \xc3\xa7\xc4\xb1\xc5\x83\\",\\n   '
+cat_len 2824408 cat_head_hex 2c5c6e2020202020205c22c3a4c2b8c4a220c3a7c4b1c5835c222c5c6e2020202020205c22c3a5c583c2a620c3a4c2bac4a85c222c5c6e2020202020205c22c3a7c4bec58120c3a6c2b0c4b65c222c5c6e2020202020205c226177206174745c222c5c6e2020202020205c22c3a7c2bac2a220c3a8c2b1c4a85c222c5c6e2020
+embed_in_cat 617741
+embed_tokens_in_meta -1
+key b'embed_tokens' -1
+key b'model.embed' -1
+key b'layers.0' 7172509
+key b'tensor_names' -1
+key b'dtypes' -1
+AT_JSON_END 2c5c6e2020202020205c22c3a4c2b8c4a220c3a7c4b1c5835c222c5c6e2020202020205c22c3a5c583c2a620c3a4c2bac4a85c222c5c6e2020202020205c22c3a7c4bec58120c3a6c2b0c4b65c222c5c6e2020202020205c226177206174745c222c5c6e2020202020205c22c3a7c2bac2a220c3a8c2b1c4a85c222c5c6e2020
+AT_META_END 666e010218000000004000000000000000000c000000000015006c61796572732e392e68635f66666e5f7363616c650101030000000000000006000000000000000b006e6f726d2e776569676874010100100000000000000020000000000000cb19daf9243affb100406381443fedeea81cd00be6b6e0e94e34e929fe42d706
+AT_DATA 14152219f838e4b6c3f1ba07270bc60f3538042ab1d34ad608ba47087f26fa5f2e3170e0341a35eb06e4f44308c5f881fbd1f13a14361ee93cfaea1f120b3431

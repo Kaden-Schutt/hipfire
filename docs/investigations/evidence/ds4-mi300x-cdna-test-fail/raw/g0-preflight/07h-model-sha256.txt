@@ -1,0 +1,19 @@
+UTC Sat Aug  1 12:23:20 PM UTC 2026
+-rw-rw-r-- 1 1000 1000 82191362222 2026-07-24 22:20:40.157517809 +0000 /mnt/scratch/models/deepseek-v4-flash-mq2r/deepseek-v4-flash.mq2r
+FULL_SHA_DEFERRED_LARGE size=82191362222
+head1MiB_sha256 b0b4ab6f2676b3c6825fe8986e6afa4bae01159437bab4b9ae2698ac2959c44a /mnt/scratch/models/deepseek-v4-flash-mq2r/deepseek-v4-flash.mq2r
+tail1MiB_sha256 321c9032d111d90efbdf99dc65be97a7ca507baef526aaee9fcc3d0944823401 /mnt/scratch/models/deepseek-v4-flash-mq2r/deepseek-v4-flash.mq2r
+-rw------- 1 1000 1000 86184307283 2026-05-27 03:11:10.098000731 +0000 /mnt/scratch/models/existing-deepseek-v4-flash/deepseek-v4-flash.mq2lloyd
+FULL_SHA_DEFERRED_LARGE size=86184307283
+head1MiB_sha256 ffb84df899ae938bd6f27b6eaa6aaf91e87ebedec437b947e77c41bd1692a044 /mnt/scratch/models/existing-deepseek-v4-flash/deepseek-v4-flash.mq2lloyd
+tail1MiB_sha256 321c9032d111d90efbdf99dc65be97a7ca507baef526aaee9fcc3d0944823401 /mnt/scratch/models/existing-deepseek-v4-flash/deepseek-v4-flash.mq2lloyd
+-rw------- 1 1000 1000 1998047355 2026-05-27 03:03:15.078827775 +0000 /mnt/scratch/models/existing-deepseek-v4-flash/deepseek-v4-flash-mtp.mq2lloyd
+596ab559d40319fd070baa34b24f8addcb64245cd0dd61fb468264fded89bfc7  /mnt/scratch/models/existing-deepseek-v4-flash/deepseek-v4-flash-mtp.mq2lloyd
+-rw------- 1 root root 24117248 2026-08-01 08:28:58.382013971 +0000 /root/.hipfire/models/hipfire-deepseek-v4-flash/deepseek-v4-flash-mtp.mq2lloyd
+5c6b8e3d1995b6e5646106a52520adfd84441698e0346dbdc8108a99f63d7b8b  /root/.hipfire/models/hipfire-deepseek-v4-flash/deepseek-v4-flash-mtp.mq2lloyd
+-rw-rw-r-- 1 1000 1000 549221504 2026-04-11 00:03:16.340546734 +0000 /mnt/scratch/models/qwen3.5-0.8b/qwen3.5-0.8b.mq4
+dba721efb8463f14a35778e22ba50bad98caba1aa1ac9672f360f4d8df226e54  /mnt/scratch/models/qwen3.5-0.8b/qwen3.5-0.8b.mq4
+-rw-r--r-- 1 root root 5602871 2026-08-01 08:32:28.192141151 +0000 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model.safetensors.index.json
+98efab455cf08dfbbbaaba6f570e1bf10bf927d2b4c3c453a59c2f6f0e3be92b  /mnt/scratch/models/DeepSeek-V4-Flash-0731/model.safetensors.index.json
+-rw-r--r-- 1 root root 1888 2026-08-01 08:31:55.989780778 +0000 /mnt/scratch/models/DeepSeek-V4-Flash-0731/config.json
+6c8f3d2d3b48707541b88f32f22ef3f0f8a6b57d8523281e2b8d3cdb0ae9a023  /mnt/scratch/models/DeepSeek-V4-Flash-0731/config.json

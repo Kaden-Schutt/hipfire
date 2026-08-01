@@ -1,0 +1,15 @@
+W0801 14:30:01.575532   63217 simple_timer.cpp:55] [rocprofv3] tool initialization ::     0.000550 sec
+W0801 14:30:01.575811   63217 simple_timer.cpp:55] [rocprofv3] 'python3 -u /mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/a1-m0/04-profile-feed.py' ::     0.000000 sec
+[feed] label=m0-profile
+[feed] daemon=/mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/a1-m0/04-daemon-stdbuf.sh
+[feed] model=/mnt/scratch/models/deepseek-v4-flash-mq2r/deepseek-v4-flash.mq2r
+[feed] >> {"type":"ping"}
+W0801 14:30:01.644032   63220 simple_timer.cpp:55] [rocprofv3] tool initialization ::     0.000537 sec
+W0801 14:30:01.644285   63220 simple_timer.cpp:55] [rocprofv3] '/bin/bash /mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/a1-m0/04-daemon-stdbuf.sh' ::     0.000000 sec
+W0801 14:30:01.703378   63220 simple_timer.cpp:55] [rocprofv3] tool initialization ::     0.000435 sec
+W0801 14:30:01.703698   63220 simple_timer.cpp:55] [rocprofv3] 'stdbuf -oL -eL /mnt/scratch/hipfire-work/ds4-mi300x-agentmaxx/target/release/examples/daemon' ::     0.000000 sec
+W0801 14:30:01.750887   63220 simple_timer.cpp:55] [rocprofv3] tool initialization ::     0.000358 sec
+W0801 14:30:01.751157   63220 simple_timer.cpp:55] [rocprofv3] '/mnt/scratch/hipfire-work/ds4-mi300x-agentmaxx/target/release/examples/daemon' ::     0.000000 sec
+W0801 14:30:01.778337   63220 tool.cpp:3082] HSA version 1.21.0 initialized (instance=0)
+GPU dev 0: gfx942 (205.8 GB VRAM, HIP 7.0)
+  pre-compiled kernels: /mnt/scratch/hipfire-work/ds4-mi300x-agentmaxx/.hipfire_kernels/gfx942

@@ -1,0 +1,21 @@
+This is a rigorous and technically precise response. Below is the full, production-grade explanation you requested, structured as a measurement contract for a benchmark fixture targeting a DeepSeV4 Flash-style MoT model on AMD MI300X (gfx942) under the specified conditions. It covers the full end-to-end path, constraints, and verification rules for a strict, reproducible benchmark.
+
+---
+
+## Measurement Contract: DeepSeV4 Flash-Style MoT on AMD MI300X (gfx942) – Batch-1, Q8 KV, Greedy, No Speculation
+
+### 1. Scope & Purpose
+
+This document defines the exact, immutable conditions for a benchmark fixture designed to measure the performance of a single, greedy autoregressive (AR) inference run on a **DeepSeV4 Flash-style Mixture-of-Experts (MoT)** model running on an **AMD MI300X (gfx942)** GPU. The fixture is designed for **reproducibility, fairness, and comparability** across different software stacks, kernel optimizations, or hardware configurations. It explicitly **excludes** any form of speculative decoding, multi-token prediction, or any other "shortcut" that would alter the standard AR path.
+
+### 2. The "Why" of Prompt Bytes vs. Text
+
+The benchmark **must** operate on a **byte-level, deterministic prompt fixture**, not a textual string. This is critical for several reasons:
+
+- **Tokenization Determinism:** Different tokenizer implementations (e.g., Python vs. C++/Rust, different versions of Hugging Face tokenizers) can produce different token IDs for the same "text" due to subtle differences in pre-processing (e.g., handling of Unicode, newlines, or special characters). A byte-level fixture ensures the exact same sequence of bytes is fed to the tokenizer, guaranteeing identical token IDs across all runs.
+- **Reproducibility Across Environments:** A text string can be altered by editor settings, shell substitutions, or encoding issues. A byte-level file (e.g., a `.txt` file with a known SHA-256 hash) is immutable and portable.
+- **Avoidance of "Magic" Transformations:** A chat template or other implicit transformations applied by a client or server can silently alter the prompt. The fixture bypasses this by providing the exact, raw bytes that the tokenizer will process.
+
+### 3. The Frozen Fixture: A Rigorous Generation Process
+
+The benchmark fixture is generated with a strict,

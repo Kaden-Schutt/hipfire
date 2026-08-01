@@ -1,0 +1,11 @@
+hipfire 0.3.0
+  build commit: d4ab7434a9dad15d0bf6456c8f3c12779ac0edb5
+  build ref:    codex/ds4-mi300x-agentmaxx (dirty)
+  build target: x86_64-unknown-linux-gnu
+  source:       build checkout /mnt/scratch/hipfire-work/ds4-mi300x-agentmaxx
+  source ref:   codex/ds4-mi300x-agentmaxx
+  source commit: d4ab7434a9dad15d0bf6456c8f3c12779ac0edb5
+  source state: dirty
+  source/build: match
+  daemon:       /root/.hipfire/bin/daemon
+  daemon sha256: f99f53d81ea6e580a9fed50e09b5ec8e1d8001d7bb56cc1a11a361255ff0c7d4

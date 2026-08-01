@@ -1,0 +1,469 @@
+=== MODEL SEARCH ROOTS ===
+-- listing /root/.hipfire --
+total 52
+drwxr-xr-x  4 root root  4096 Aug  1 08:47 .
+drwx------ 11 root root  4096 Aug  1 12:16 ..
+drwxr-xr-x  2 root root  4096 Aug  1 08:47 bin
+-rw-------  1 root root     6 Aug  1 10:48 daemon.pid
+drwxr-xr-x  3 root root  4096 Aug  1 08:28 models
+-rw-r--r--  1 root root 30809 Aug  1 08:47 registry.cache.json
+-- listing /root/.hipfire/models --
+total 12
+drwxr-xr-x 3 root root 4096 Aug  1 08:28 .
+drwxr-xr-x 4 root root 4096 Aug  1 08:47 ..
+drwx------ 3 1000 1000 4096 Aug  1 08:28 hipfire-deepseek-v4-flash
+-- listing /root/model-downloads --
+total 8
+drwxr-xr-x  2 root root 4096 Aug  1 08:28 .
+drwx------ 11 root root 4096 Aug  1 12:16 ..
+-- listing /root/hipfire-work --
+total 12
+drwxr-xr-x  3 root root 4096 Aug  1 08:27 .
+drwx------ 11 root root 4096 Aug  1 12:16 ..
+drwxrwxr-x 28 root root 4096 Aug  1 10:37 ds4-gfx942-port
+-- listing /mnt/scratch/models --
+total 24
+drwxr-xr-x 6 root root 4096 Aug  1 08:41 .
+drwxr-xr-x 8 root root 4096 Aug  1 12:16 ..
+drwxr-xr-x 5 root root 4096 Aug  1 08:32 DeepSeek-V4-Flash-0731
+drwxr-xr-x 2 root root 4096 Aug  1 08:34 deepseek-v4-flash-mq2r
+drwx------ 3 1000 1000 4096 May 27 03:11 existing-deepseek-v4-flash
+drwxr-xr-x 2 root root 4096 Aug  1 08:41 qwen3.5-0.8b
+-- listing /mnt/scratch/hf-cache --
+total 20
+drwxr-xr-x 3 root root 4096 Aug  1 08:31 .
+drwxr-xr-x 8 root root 4096 Aug  1 12:16 ..
+-rw-r--r-- 1 root root 5698 Aug  1 08:31 .agent_harnesses.json
+drwxr-xr-x 4 root root 4096 Aug  1 08:31 xet
+-- listing /mnt/scratch/hf-python --
+total 300
+drwxr-xr-x 34 root root   4096 Aug  1 08:31 .
+drwxr-xr-x  8 root root   4096 Aug  1 12:16 ..
+drwxr-xr-x  2 root root   4096 Aug  1 08:31 __pycache__
+drwxr-xr-x  3 root root   4096 Aug  1 08:31 _yaml
+drwxr-xr-x  7 root root   4096 Aug  1 08:31 anyio
+drwxr-xr-x  3 root root   4096 Aug  1 08:31 anyio-4.14.2.dist-info
+drwxr-xr-x  2 root root   4096 Aug  1 08:31 bin
+drwxr-xr-x  4 root root   4096 Aug  1 08:31 certifi
+drwxr-xr-x  3 root root   4096 Aug  1 08:31 certifi-2026.7.22.dist-info
+drwxr-xr-x  3 root root   4096 Aug  1 08:31 click
+drwxr-xr-x  3 root root   4096 Aug  1 08:31 click-8.4.2.dist-info
+drwxr-xr-x  4 root root   4096 Aug  1 08:31 filelock
+drwxr-xr-x  3 root root   4096 Aug  1 08:31 filelock-3.32.2.dist-info
+drwxr-xr-x  5 root root   4096 Aug  1 08:31 fsspec
+drwxr-xr-x  3 root root   4096 Aug  1 08:31 fsspec-2026.7.0.dist-info
+drwxr-xr-x  3 root root   4096 Aug  1 08:31 h11
+drwxr-xr-x  3 root root   4096 Aug  1 08:31 h11-0.16.0.dist-info
+drwxr-xr-x  3 root root   4096 Aug  1 08:31 hf_xet
+drwxr-xr-x  4 root root   4096 Aug  1 08:31 hf_xet-1.5.2.dist-info
+drwxr-xr-x  6 root root   4096 Aug  1 08:31 httpcore
+drwxr-xr-x  3 root root   4096 Aug  1 08:31 httpcore-1.0.9.dist-info
+drwxr-xr-x  4 root root   4096 Aug  1 08:31 httpx
+drwxr-xr-x  3 root root   4096 Aug  1 08:31 httpx-0.28.1.dist-info
+drwxr-xr-x  9 root root   4096 Aug  1 08:31 huggingface_hub
+drwxr-xr-x  3 root root   4096 Aug  1 08:31 huggingface_hub-1.26.0.dist-info
+drwxr-xr-x  3 root root   4096 Aug  1 08:31 idna
+drwxr-xr-x  3 root root   4096 Aug  1 08:31 idna-3.18.dist-info
+drwxr-xr-x  4 root root   4096 Aug  1 08:31 packaging
+drwxr-xr-x  3 root root   4096 Aug  1 08:31 packaging-26.2.dist-info
+drwxr-xr-x  3 root root   4096 Aug  1 08:31 pyyaml-6.0.3.dist-info
+drwxr-xr-x  4 root root   4096 Aug  1 08:31 tqdm
+drwxr-xr-x  3 root root   4096 Aug  1 08:31 tqdm-4.70.0.dist-info
+drwxr-xr-x  3 root root   4096 Aug  1 08:31 typing_extensions-4.16.0.dist-info
+-rw-r--r--  1 root root 165012 Aug  1 08:31 typing_extensions.py
+drwxr-xr-x  3 root root   4096 Aug  1 08:31 yaml
+-- listing /workspace --
+ls: cannot access '/workspace': No such file or directory
+-- listing /root/.cache/huggingface --
+total 16
+drwxr-xr-x 2 root root 4096 Aug  1 08:31 .
+drwx------ 5 root root 4096 Aug  1 08:36 ..
+-rw-r--r-- 1 root root 5698 Aug  1 08:31 .agent_harnesses.json
+-- listing /root/.cache/huggingface/hub --
+ls: cannot access '/root/.cache/huggingface/hub': No such file or directory
+-- listing /mnt/scratch --
+total 44
+drwxr-xr-x  8 root root  4096 Aug  1 12:16 .
+drwxr-xr-x  3 root root  4096 Aug  1 08:30 ..
+drwxr-xr-x  3 root root  4096 Aug  1 08:31 hf-cache
+drwxr-xr-x 34 root root  4096 Aug  1 08:31 hf-python
+drwxr-xr-x  3 root root  4096 Aug  1 12:15 hipfire-evidence
+drwxr-xr-x  4 root root  4096 Aug  1 09:35 logs
+drwx------  2 root root 16384 Aug  1 08:21 lost+found
+drwxr-xr-x  6 root root  4096 Aug  1 08:41 models
+
+=== find DeepSeek / MQ / HFQM-ish names ===
+/mnt/scratch/models/DeepSeek-V4-Flash-0731
+/mnt/scratch/models/deepseek-v4-flash-mq2r
+/mnt/scratch/models/deepseek-v4-flash-mq2r/deepseek-v4-flash.mq2r
+/mnt/scratch/models/existing-deepseek-v4-flash
+/mnt/scratch/models/existing-deepseek-v4-flash/.cache/huggingface/download/deepseek-v4-flash-mtp.mq2lloyd.metadata
+/mnt/scratch/models/existing-deepseek-v4-flash/.cache/huggingface/download/deepseek-v4-flash.mq2lloyd.metadata
+/mnt/scratch/models/existing-deepseek-v4-flash/deepseek-v4-flash-mtp.mq2lloyd
+/mnt/scratch/models/existing-deepseek-v4-flash/deepseek-v4-flash.mq2lloyd
+/mnt/scratch/models/qwen3.5-0.8b/qwen3.5-0.8b.mq4
+/root/.hipfire/models/hipfire-deepseek-v4-flash
+/root/.hipfire/models/hipfire-deepseek-v4-flash/deepseek-v4-flash-mtp.mq2lloyd
+/root/hipfire-work/ds4-gfx942-port
+/root/hipfire-work/ds4-gfx942-port/.agent-memory/notes/ds4-g4-batched-e8-gemv-window-collapse.md
+/root/hipfire-work/ds4-gfx942-port/.agent-memory/notes/dspark-ds4-greedy-lazy-verify-falsified.md
+/root/hipfire-work/ds4-gfx942-port/.codeinsight+research/ds4-gfx942-port
+/root/hipfire-work/ds4-gfx942-port/.codeinsight+research/ds4-gfx942-port/codeobjects/gemv_mq2g256_lloyd_moe_down_indexed.gfx942.co
+/root/hipfire-work/ds4-gfx942-port/.codeinsight+research/ds4-gfx942-port/codeobjects/gemv_mq2g256_lloyd_moe_down_indexed.hsaco
+/root/hipfire-work/ds4-gfx942-port/.codeinsight+research/ds4-gfx942-port/codeobjects/gemv_mq2g256_lloyd_moe_gate_up_indexed.gfx942.co
+/root/hipfire-work/ds4-gfx942-port/.codeinsight+research/ds4-gfx942-port/codeobjects/gemv_mq2g256_lloyd_moe_gate_up_indexed.hsaco
+/root/hipfire-work/ds4-gfx942-port/.git/logs/refs/heads/ds4-gfx1151-opt
+/root/hipfire-work/ds4-gfx942-port/.git/refs/heads/ds4-gfx1151-opt
+/root/hipfire-work/ds4-gfx942-port/.hipfire_kernels/gfx942/deepseek4_attn_swa_batched.hash
+/root/hipfire-work/ds4-gfx942-port/.hipfire_kernels/gfx942/deepseek4_attn_swa_batched.hip
+/root/hipfire-work/ds4-gfx942-port/.hipfire_kernels/gfx942/deepseek4_attn_swa_batched.hsaco
+/root/hipfire-work/ds4-gfx942-port/.hipfire_kernels/gfx942/deepseek4_attn_swa_buf.hash
+/root/hipfire-work/ds4-gfx942-port/.hipfire_kernels/gfx942/deepseek4_attn_swa_buf.hip
+/root/hipfire-work/ds4-gfx942-port/.hipfire_kernels/gfx942/deepseek4_attn_swa_buf.hsaco
+/root/hipfire-work/ds4-gfx942-port/.hipfire_kernels/gfx942/deepseek4_attn_swa_topk_batched.hash
+/root/hipfire-work/ds4-gfx942-port/.hipfire_kernels/gfx942/deepseek4_attn_swa_topk_batched.hip
+/root/hipfire-work/ds4-gfx942-port/.hipfire_kernels/gfx942/deepseek4_attn_swa_topk_batched.hsaco
+/root/hipfire-work/ds4-gfx942-port/.hipfire_kernels/gfx942/deepseek4_attn_swa_topk_f32_buf.hash
+/root/hipfire-work/ds4-gfx942-port/.hipfire_kernels/gfx942/deepseek4_attn_swa_topk_f32_buf.hip
+/root/hipfire-work/ds4-gfx942-port/.hipfire_kernels/gfx942/deepseek4_attn_swa_topk_f32_buf.hsaco
+/root/hipfire-work/ds4-gfx942-port/.hipfire_kernels/gfx942/deepseek4_fused_silu_mul_clamp_mq_rotate.hash
+/root/hipfire-work/ds4-gfx942-port/.hipfire_kernels/gfx942/deepseek4_fused_silu_mul_clamp_mq_rotate.hip
+/root/hipfire-work/ds4-gfx942-port/.hipfire_kernels/gfx942/deepseek4_fused_silu_mul_clamp_mq_rotate.hsaco
+/root/hipfire-work/ds4-gfx942-port/.hipfire_kernels/gfx942/deepseek4_moe_topk_bias_aware.hash
+/root/hipfire-work/ds4-gfx942-port/.hipfire_kernels/gfx942/deepseek4_moe_topk_bias_aware.hip
+/root/hipfire-work/ds4-gfx942-port/.hipfire_kernels/gfx942/deepseek4_moe_topk_bias_aware.hsaco
+/root/hipfire-work/ds4-gfx942-port/.hipfire_kernels/gfx942/deepseek4_moe_topk_bias_aware_batched.hash
+/root/hipfire-work/ds4-gfx942-port/.hipfire_kernels/gfx942/deepseek4_moe_topk_bias_aware_batched.hip
+/root/hipfire-work/ds4-gfx942-port/.hipfire_kernels/gfx942/deepseek4_moe_topk_bias_aware_batched.hsaco
+/root/hipfire-work/ds4-gfx942-port/.hipfire_kernels/gfx942/deepseek4_silu_mul_clamp.hash
+/root/hipfire-work/ds4-gfx942-port/.hipfire_kernels/gfx942/deepseek4_silu_mul_clamp.hip
+/root/hipfire-work/ds4-gfx942-port/.hipfire_kernels/gfx942/deepseek4_silu_mul_clamp.hsaco
+/root/hipfire-work/ds4-gfx942-port/.hipfire_kernels/gfx942/deepseek4_topk_kv_gather_batched.hash
+/root/hipfire-work/ds4-gfx942-port/.hipfire_kernels/gfx942/deepseek4_topk_kv_gather_batched.hip
+/root/hipfire-work/ds4-gfx942-port/.hipfire_kernels/gfx942/deepseek4_topk_kv_gather_batched.hsaco
+/root/hipfire-work/ds4-gfx942-port/.hipfire_kernels/gfx942/deepseek4_topk_kv_gather_f32_buf.hash
+/root/hipfire-work/ds4-gfx942-port/.hipfire_kernels/gfx942/deepseek4_topk_kv_gather_f32_buf.hip
+/root/hipfire-work/ds4-gfx942-port/.hipfire_kernels/gfx942/deepseek4_topk_kv_gather_f32_buf.hsaco
+/root/hipfire-work/ds4-gfx942-port/.hipfire_kernels/gfx942/deepseek4_topk_kv_gather_identity_batched.hash
+/root/hipfire-work/ds4-gfx942-port/.hipfire_kernels/gfx942/deepseek4_topk_kv_gather_identity_batched.hip
+/root/hipfire-work/ds4-gfx942-port/.hipfire_kernels/gfx942/deepseek4_topk_kv_gather_identity_batched.hsaco
+/root/hipfire-work/ds4-gfx942-port/.hipfire_kernels/gfx942/deepseek4_topk_kv_gather_identity_f32_buf.hash
+/root/hipfire-work/ds4-gfx942-port/.hipfire_kernels/gfx942/deepseek4_topk_kv_gather_identity_f32_buf.hip
+/root/hipfire-work/ds4-gfx942-port/.hipfire_kernels/gfx942/deepseek4_topk_kv_gather_identity_f32_buf.hsaco
+/root/hipfire-work/ds4-gfx942-port/.hipfire_kernels/gfx942/gemm_mq2g256_lloyd_moe_grouped_mfma_gfx942.hash
+/root/hipfire-work/ds4-gfx942-port/.hipfire_kernels/gfx942/gemm_mq2g256_lloyd_moe_grouped_mfma_gfx942.hip
+/root/hipfire-work/ds4-gfx942-port/.hipfire_kernels/gfx942/gemm_mq2g256_lloyd_moe_grouped_mfma_gfx942.hsaco
+/root/hipfire-work/ds4-gfx942-port/.hipfire_kernels/gfx942/gemm_mq2g256_lloyd_moe_grouped_wmma_k2.hip
+/root/hipfire-work/ds4-gfx942-port/.hipfire_kernels/gfx942/gemv_mq2g256_lloyd_moe_down_expanded_k4.hash
+/root/hipfire-work/ds4-gfx942-port/.hipfire_kernels/gfx942/gemv_mq2g256_lloyd_moe_down_expanded_k4.hip
+/root/hipfire-work/ds4-gfx942-port/.hipfire_kernels/gfx942/gemv_mq2g256_lloyd_moe_down_expanded_k4.hsaco
+/root/hipfire-work/ds4-gfx942-port/.hipfire_kernels/gfx942/gemv_mq2g256_lloyd_moe_down_expanded_k4_gfx942.hash
+/root/hipfire-work/ds4-gfx942-port/.hipfire_kernels/gfx942/gemv_mq2g256_lloyd_moe_down_expanded_k4_gfx942.hip
+/root/hipfire-work/ds4-gfx942-port/.hipfire_kernels/gfx942/gemv_mq2g256_lloyd_moe_down_expanded_k4_gfx942.hsaco
+/root/hipfire-work/ds4-gfx942-port/.hipfire_kernels/gfx942/gemv_mq2g256_lloyd_moe_down_residual_scaled_allranks_gfx942.hash
+/root/hipfire-work/ds4-gfx942-port/.hipfire_kernels/gfx942/gemv_mq2g256_lloyd_moe_down_residual_scaled_allranks_gfx942.hip
+/root/hipfire-work/ds4-gfx942-port/.hipfire_kernels/gfx942/gemv_mq2g256_lloyd_moe_down_residual_scaled_allranks_gfx942.hsaco
+/root/hipfire-work/ds4-gfx942-port/.hipfire_kernels/gfx942/gemv_mq2g256_lloyd_moe_down_residual_scaled_k8_indexed_gfx942.hash
+/root/hipfire-work/ds4-gfx942-port/.hipfire_kernels/gfx942/gemv_mq2g256_lloyd_moe_down_residual_scaled_k8_indexed_gfx942.hip
+/root/hipfire-work/ds4-gfx942-port/.hipfire_kernels/gfx942/gemv_mq2g256_lloyd_moe_down_residual_scaled_k8_indexed_gfx942.hsaco
+/root/hipfire-work/ds4-gfx942-port/.hipfire_kernels/gfx942/gemv_mq2g256_lloyd_moe_down_residual_scaled_k8_indexed_mfma_f16_gfx942.hash
+/root/hipfire-work/ds4-gfx942-port/.hipfire_kernels/gfx942/gemv_mq2g256_lloyd_moe_down_residual_scaled_k8_indexed_mfma_f16_gfx942.hip
+/root/hipfire-work/ds4-gfx942-port/.hipfire_kernels/gfx942/gemv_mq2g256_lloyd_moe_down_residual_scaled_k8_indexed_mfma_f16_gfx942.hsaco
+/root/hipfire-work/ds4-gfx942-port/.hipfire_kernels/gfx942/gemv_mq2g256_lloyd_moe_down_residual_scaled_k8_indexed_mfma_gfx942.hash
+/root/hipfire-work/ds4-gfx942-port/.hipfire_kernels/gfx942/gemv_mq2g256_lloyd_moe_down_residual_scaled_k8_indexed_mfma_gfx942.hip
+/root/hipfire-work/ds4-gfx942-port/.hipfire_kernels/gfx942/gemv_mq2g256_lloyd_moe_down_residual_scaled_k8_indexed_mfma_gfx942.hsaco
+/root/hipfire-work/ds4-gfx942-port/.hipfire_kernels/gfx942/gemv_mq2g256_lloyd_moe_gate_up_indexed_batched_k4.hash
+/root/hipfire-work/ds4-gfx942-port/.hipfire_kernels/gfx942/gemv_mq2g256_lloyd_moe_gate_up_indexed_batched_k4.hip
+/root/hipfire-work/ds4-gfx942-port/.hipfire_kernels/gfx942/gemv_mq2g256_lloyd_moe_gate_up_indexed_batched_k4.hsaco
+/root/hipfire-work/ds4-gfx942-port/.hipfire_kernels/gfx942/gemv_mq2g256_lloyd_moe_gate_up_indexed_gfx942.hash
+/root/hipfire-work/ds4-gfx942-port/.hipfire_kernels/gfx942/gemv_mq2g256_lloyd_moe_gate_up_indexed_gfx942.hip
+/root/hipfire-work/ds4-gfx942-port/.hipfire_kernels/gfx942/gemv_mq2g256_lloyd_moe_gate_up_indexed_gfx942.hsaco
+/root/hipfire-work/ds4-gfx942-port/.hipfire_kernels/gfx942/gemv_mq2g256_lloyd_moe_gate_up_indexed_mfma_f16_gfx942.hash
+/root/hipfire-work/ds4-gfx942-port/.hipfire_kernels/gfx942/gemv_mq2g256_lloyd_moe_gate_up_indexed_mfma_f16_gfx942.hip
+/root/hipfire-work/ds4-gfx942-port/.hipfire_kernels/gfx942/gemv_mq2g256_lloyd_moe_gate_up_indexed_mfma_f16_gfx942.hsaco
+/root/hipfire-work/ds4-gfx942-port/.hipfire_kernels/gfx942/gemv_mq2g256_lloyd_moe_gate_up_indexed_mfma_gfx942.hash
+/root/hipfire-work/ds4-gfx942-port/.hipfire_kernels/gfx942/gemv_mq2g256_lloyd_moe_gate_up_indexed_mfma_gfx942.hip
+/root/hipfire-work/ds4-gfx942-port/.hipfire_kernels/gfx942/gemv_mq2g256_lloyd_moe_gate_up_indexed_mfma_gfx942.hsaco
+/root/hipfire-work/ds4-gfx942-port/.hipfire_kernels/gfx942/gemv_mq4g256.hash
+/root/hipfire-work/ds4-gfx942-port/.hipfire_kernels/gfx942/gemv_mq4g256.hip
+/root/hipfire-work/ds4-gfx942-port/.hipfire_kernels/gfx942/gemv_mq4g256.hsaco
+/root/hipfire-work/ds4-gfx942-port/benchmarks/prompts/deepseek4_mq2r_prose_ctx8192.txt
+/root/hipfire-work/ds4-gfx942-port/benchmarks/quality-baselines/results/2026-05-14-awq-coherence-check/0.8b-a0_0-mq4base__code.txt
+/root/hipfire-work/ds4-gfx942-port/benchmarks/quality-baselines/results/2026-05-14-awq-coherence-check/0.8b-a0_0-mq4base__reason.txt
+/root/hipfire-work/ds4-gfx942-port/benchmarks/quality-baselines/results/2026-05-14-awq-coherence-check/0.8b-a0_0-mq4base__short_qa.txt
+/root/hipfire-work/ds4-gfx942-port/benchmarks/quality-baselines/results/2026-05-18-27b-plain-q8head/qwen36-27b-mq4-plain-q8head-kvq8-c256__gfx1100__prefill.kldseq
+/root/hipfire-work/ds4-gfx942-port/benchmarks/quality-baselines/results/2026-05-18-27b-q8head-v100/qwen36-27b-mq4-awq-gptq-f2-q8head-v100-kvq8-c256__gfx1100__prefill.kldseq
+/root/hipfire-work/ds4-gfx942-port/benchmarks/quality-baselines/results/2026-05-18-9b-q8head-cohort/qwen35-9b-mq4-awq-gptq-f2-q8head-kvq8-c256__gfx1100__prefill.kldseq
+/root/hipfire-work/ds4-gfx942-port/benchmarks/quality-baselines/results/2026-05-18-9b-q8head-cohort/qwen35-9b-mq4-plain-q8head-kvq8-c256__gfx1100__prefill.kldseq
+/root/hipfire-work/ds4-gfx942-port/benchmarks/quality-baselines/results/2026-05-19-27b-lmhead-a100-gfx1100-parity/qwen36-27b-mq4-awq-gptq-f2-lmhead-a100-kvq8-c256__gfx1100__prefill.kldseq
+/root/hipfire-work/ds4-gfx942-port/benchmarks/quality-baselines/results/2026-05-19-9b-lmhead-a100-gfx1100-parity/qwen35-9b-mq4-awq-gptq-f2-lmhead-a100-kvq8-c256__gfx1100__prefill.kldseq
+/root/hipfire-work/ds4-gfx942-port/benchmarks/quality-baselines/results/2026-05-31-kv-vquant/coherence-36-27b-mq4-2026-05-31.md
+/root/hipfire-work/ds4-gfx942-port/benchmarks/results/devlog_20260506_lloyd_mq4_extension.md
+/root/hipfire-work/ds4-gfx942-port/benchmarks/results/devlog_20260507_mq4_lloyd_implementation.md
+/root/hipfire-work/ds4-gfx942-port/benchmarks/results/devlog_20260507_mq4_lloyd_wmma_phase_a.md
+/root/hipfire-work/ds4-gfx942-port/benchmarks/results/devlog_20260508_mq4_lloyd_wmma_phase_c.md
+/root/hipfire-work/ds4-gfx942-port/benchmarks/results/devlog_20260509_mq4_lloyd_gfx1151_bench.md
+/root/hipfire-work/ds4-gfx942-port/benchmarks/results/devlog_20260513_mq4_lloyd_kv_q8_kld.md
+/root/hipfire-work/ds4-gfx942-port/crates/hipfire-arch-deepseek4
+/root/hipfire-work/ds4-gfx942-port/crates/hipfire-arch-deepseek4/examples/deepseek4_chat.rs
+/root/hipfire-work/ds4-gfx942-port/crates/hipfire-arch-deepseek4/examples/deepseek4_decode_bytes.rs
+/root/hipfire-work/ds4-gfx942-port/crates/hipfire-arch-deepseek4/examples/deepseek4_perplexity.rs
+/root/hipfire-work/ds4-gfx942-port/crates/hipfire-arch-deepseek4/examples/deepseek4_prefill_bench.rs
+/root/hipfire-work/ds4-gfx942-port/crates/hipfire-arch-deepseek4/examples/ep_deepseek4.rs
+/root/hipfire-work/ds4-gfx942-port/crates/hipfire-arch-deepseek4/src/deepseek4.rs
+/root/hipfire-work/ds4-gfx942-port/crates/hipfire-dispatch-tests/src/deepseek4.rs
+/root/hipfire-work/ds4-gfx942-port/crates/hipfire-dispatch/src/model_ext/deepseek4.rs
+/root/hipfire-work/ds4-gfx942-port/crates/hipfire-quantize/examples/deepseek4_dequant_check.rs
+/root/hipfire-work/ds4-gfx942-port/crates/hipfire-quantize/src/bin/draft_to_mq4.rs
+/root/hipfire-work/ds4-gfx942-port/crates/hipfire-quantize/src/bin/mq4_merge_mtp.rs
+/root/hipfire-work/ds4-gfx942-port/crates/hipfire-runtime/examples/bench_qwen35_mq4.rs
+/root/hipfire-work/ds4-gfx942-port/crates/hipfire-runtime/examples/diag_mq4_lloyd_multiacc.rs
+/root/hipfire-work/ds4-gfx942-port/crates/hipfire-runtime/examples/profile_prefill_deepseek4.rs
+/root/hipfire-work/ds4-gfx942-port/crates/hipfire-runtime/examples/profile_qwen35_mq4.rs
+/root/hipfire-work/ds4-gfx942-port/crates/radiowave/tests/artifacts/hipfire-deepseek4-gfx1151-2026-07-25-xor-shuffle.json
+/root/hipfire-work/ds4-gfx942-port/crates/radiowave/tests/artifacts/hipfire-deepseek4-mq2r-gfx1151-2026-07-25-e8-temporal-buffer.json
+/root/hipfire-work/ds4-gfx942-port/crates/radiowave/tests/artifacts/hipfire-deepseek4-mq2r-gfx1151-2026-07-25-topk-gather-tiled.json
+/root/hipfire-work/ds4-gfx942-port/crates/rdna-compute/examples/bench_ds4_attn_scoregrid_xlane.rs
+/root/hipfire-work/ds4-gfx942-port/crates/rdna-compute/examples/bench_ds4_topk_kv_gather_tiled.rs
+/root/hipfire-work/ds4-gfx942-port/crates/rdna-compute/examples/bench_mq2g256_lloyd_moe_4w.rs
+/root/hipfire-work/ds4-gfx942-port/crates/rdna-compute/examples/bench_mq4_gate_up.rs
+/root/hipfire-work/ds4-gfx942-port/crates/rdna-compute/examples/bench_qkvza_q8_vs_mq4.rs
+/root/hipfire-work/ds4-gfx942-port/crates/rdna-compute/examples/test_deepseek4_cdna_channels.rs
+/root/hipfire-work/ds4-gfx942-port/crates/rdna-compute/examples/test_gemm_fused_mq4g256_lloyd_wmma.rs
+/root/hipfire-work/ds4-gfx942-port/crates/rdna-compute/examples/test_gemm_mq4g256_lloyd_residual_wmma.rs
+/root/hipfire-work/ds4-gfx942-port/crates/rdna-compute/examples/test_gemv_mq4g256_lloyd_tail.rs
+/root/hipfire-work/ds4-gfx942-port/crates/rdna-compute/examples/test_mq2_grouped_mfma_gfx942.rs
+/root/hipfire-work/ds4-gfx942-port/crates/rdna-compute/examples/test_mq2g256_lloyd_moe_grouped_mmq_gfx1030.rs
+/root/hipfire-work/ds4-gfx942-port/crates/rdna-compute/examples/test_mq4g256_lloyd_fused_parity.rs
+/root/hipfire-work/ds4-gfx942-port/docs/assets/readme/mq4r-performance.svg
+/root/hipfire-work/ds4-gfx942-port/docs/deepseek4-pr-body.md
+/root/hipfire-work/ds4-gfx942-port/docs/design/2026-06-28-dspark-deepseek4-forward-spec.md
+/root/hipfire-work/ds4-gfx942-port/docs/investigations/2026-05-19-a3b-moe-mq4-awq-gptq
+/root/hipfire-work/ds4-gfx942-port/docs/investigations/ds4-gfx1151-ar-roofline-handoff.md
+/root/hipfire-work/ds4-gfx942-port/docs/perf-checkpoints/2026-07-13-redline-mq4r-110-to-204.md
+/root/hipfire-work/ds4-gfx942-port/docs/perf-checkpoints/2026-07-27-ds4-gfx1151-ar-roofline-amendment-1.md
+/root/hipfire-work/ds4-gfx942-port/docs/perf-checkpoints/2026-07-27-ds4-gfx1151-ar-roofline.md
+/root/hipfire-work/ds4-gfx942-port/docs/plans/mq4-lloyd-batch-fanout-phase-d.md
+/root/hipfire-work/ds4-gfx942-port/docs/plans/mq4-lloyd-wmma-prefill.md
+/root/hipfire-work/ds4-gfx942-port/docs/plans/mtp-draft-audit-vs-ds4-2026-06-24.md
+/root/hipfire-work/ds4-gfx942-port/docs/plans/qwen35-mq4-quality-gap.md
+/root/hipfire-work/ds4-gfx942-port/docs/plans/ship6-deepseek4-ep.md
+/root/hipfire-work/ds4-gfx942-port/docs/specs/2026-07-19-mq2-level-set-rescue.md
+/root/hipfire-work/ds4-gfx942-port/docs/specs/2026-07-23-deepseek4-mq2r-e8-recipe.md
+/root/hipfire-work/ds4-gfx942-port/kernels/src/deepseek4_attn_pos0.hip
+/root/hipfire-work/ds4-gfx942-port/kernels/src/deepseek4_attn_swa.hip
+/root/hipfire-work/ds4-gfx942-port/kernels/src/deepseek4_attn_swa_batched.hip
+/root/hipfire-work/ds4-gfx942-port/kernels/src/deepseek4_attn_swa_batched_debug.hip
+/root/hipfire-work/ds4-gfx942-port/kernels/src/deepseek4_attn_swa_buf.hip
+/root/hipfire-work/ds4-gfx942-port/kernels/src/deepseek4_attn_swa_topk_batched.hip
+/root/hipfire-work/ds4-gfx942-port/kernels/src/deepseek4_attn_swa_topk_batched_wmma.hip
+/root/hipfire-work/ds4-gfx942-port/kernels/src/deepseek4_attn_swa_topk_buf.hip
+/root/hipfire-work/ds4-gfx942-port/kernels/src/deepseek4_attn_swa_topk_direct_batched.hip
+/root/hipfire-work/ds4-gfx942-port/kernels/src/deepseek4_attn_swa_topk_direct_wmma.hip
+/root/hipfire-work/ds4-gfx942-port/kernels/src/deepseek4_convert_f32_to_f16.hip
+/root/hipfire-work/ds4-gfx942-port/kernels/src/deepseek4_fused_silu_mul_clamp_mq_rotate.hip
+/root/hipfire-work/ds4-gfx942-port/kernels/src/deepseek4_moe_topk_bias_aware.hip
+/root/hipfire-work/ds4-gfx942-port/kernels/src/deepseek4_moe_topk_bias_aware_batched.hip
+/root/hipfire-work/ds4-gfx942-port/kernels/src/deepseek4_silu_mul_clamp.hip
+/root/hipfire-work/ds4-gfx942-port/kernels/src/deepseek4_topk_kv_gather_batched.hip
+/root/hipfire-work/ds4-gfx942-port/kernels/src/deepseek4_topk_kv_gather_buf.hip
+/root/hipfire-work/ds4-gfx942-port/kernels/src/deepseek4_topk_kv_gather_identity_batched.hip
+/root/hipfire-work/ds4-gfx942-port/kernels/src/deepseek4_topk_kv_gather_identity_buf.hip
+/root/hipfire-work/ds4-gfx942-port/kernels/src/deepseek4_topk_kv_gather_tiled.gfx1151.hip
+/root/hipfire-work/ds4-gfx942-port/kernels/src/fused_gate_up_mq4g256_lloyd.gfx1100.hip
+/root/hipfire-work/ds4-gfx942-port/kernels/src/fused_gate_up_mq4g256_lloyd.hip
+/root/hipfire-work/ds4-gfx942-port/kernels/src/fused_qkv_mq4g256_lloyd.gfx1100.hip
+/root/hipfire-work/ds4-gfx942-port/kernels/src/fused_qkv_mq4g256_lloyd.hip
+/root/hipfire-work/ds4-gfx942-port/kernels/src/fused_qkvza_mq4g256_lloyd.gfx1100.hip
+/root/hipfire-work/ds4-gfx942-port/kernels/src/fused_qkvza_mq4g256_lloyd.hip
+/root/hipfire-work/ds4-gfx942-port/kernels/src/gemm_gate_up_mq4g256_lloyd_wmma.gfx1151.hip
+/root/hipfire-work/ds4-gfx942-port/kernels/src/gemm_gate_up_mq4g256_lloyd_wmma.gfx12.hip
+/root/hipfire-work/ds4-gfx942-port/kernels/src/gemm_gate_up_mq4g256_lloyd_wmma.hip
+/root/hipfire-work/ds4-gfx942-port/kernels/src/gemm_gate_up_mq4g256_lloyd_wmma_mb4.gfx1151.hip
+/root/hipfire-work/ds4-gfx942-port/kernels/src/gemm_gate_up_mq4g256_lloyd_wmma_mb4.hip
+/root/hipfire-work/ds4-gfx942-port/kernels/src/gemm_gate_up_mq4g256_lloyd_wmma_mb4_nosync.gfx1151.hip
+/root/hipfire-work/ds4-gfx942-port/kernels/src/gemm_gate_up_mq4g256_lloyd_wmma_mb4_nosync.hip
+/root/hipfire-work/ds4-gfx942-port/kernels/src/gemm_gate_up_mq4g256_lloyd_wmma_nosync.gfx1151.hip
+/root/hipfire-work/ds4-gfx942-port/kernels/src/gemm_gate_up_mq4g256_lloyd_wmma_nosync.hip
+/root/hipfire-work/ds4-gfx942-port/kernels/src/gemm_mq2g256_lloyd_moe_grouped_mfma.gfx942.hip
+/root/hipfire-work/ds4-gfx942-port/kernels/src/gemm_mq2g256_lloyd_moe_grouped_mmq.gfx1030.hip
+/root/hipfire-work/ds4-gfx942-port/kernels/src/gemm_mq2g256_lloyd_moe_grouped_mmq.gfx1151.hip
+/root/hipfire-work/ds4-gfx942-port/kernels/src/gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2.hip
+/root/hipfire-work/ds4-gfx942-port/kernels/src/gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_cnd.hip
+/root/hipfire-work/ds4-gfx942-port/kernels/src/gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_mmqload.hip
+/root/hipfire-work/ds4-gfx942-port/kernels/src/gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_mmqload_nosync.hip
+/root/hipfire-work/ds4-gfx942-port/kernels/src/gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_n32.hip
+/root/hipfire-work/ds4-gfx942-port/kernels/src/gemm_mq2g256_lloyd_moe_grouped_wmma_8w_k2.hip
+/root/hipfire-work/ds4-gfx942-port/kernels/src/gemm_mq2g256_lloyd_moe_grouped_wmma_k2.hip
+/root/hipfire-work/ds4-gfx942-port/kernels/src/gemm_mq4g256_lloyd_residual_wmma.gfx12.hip
+/root/hipfire-work/ds4-gfx942-port/kernels/src/gemm_mq4g256_lloyd_residual_wmma.hip
+/root/hipfire-work/ds4-gfx942-port/kernels/src/gemm_mq4g256_lloyd_residual_wmma_mb2.hip
+/root/hipfire-work/ds4-gfx942-port/kernels/src/gemm_mq4g256_lloyd_residual_wmma_mb4.gfx1151.hip
+/root/hipfire-work/ds4-gfx942-port/kernels/src/gemm_mq4g256_lloyd_residual_wmma_mb4.hip
+/root/hipfire-work/ds4-gfx942-port/kernels/src/gemm_qkv_mq4g256_lloyd_wmma.gfx1151.hip
+/root/hipfire-work/ds4-gfx942-port/kernels/src/gemm_qkv_mq4g256_lloyd_wmma.gfx12.hip
+/root/hipfire-work/ds4-gfx942-port/kernels/src/gemm_qkv_mq4g256_lloyd_wmma.hip
+/root/hipfire-work/ds4-gfx942-port/kernels/src/gemm_qkv_mq4g256_lloyd_wmma_mb4.gfx1151.hip
+/root/hipfire-work/ds4-gfx942-port/kernels/src/gemm_qkv_mq4g256_lloyd_wmma_mb4.hip
+/root/hipfire-work/ds4-gfx942-port/kernels/src/gemm_qkvza_mq4g256_lloyd_wmma.gfx1151.hip
+/root/hipfire-work/ds4-gfx942-port/kernels/src/gemm_qkvza_mq4g256_lloyd_wmma.gfx12.hip
+/root/hipfire-work/ds4-gfx942-port/kernels/src/gemm_qkvza_mq4g256_lloyd_wmma.hip
+/root/hipfire-work/ds4-gfx942-port/kernels/src/gemm_qkvza_mq4g256_lloyd_wmma_mb4.gfx1151.hip
+/root/hipfire-work/ds4-gfx942-port/kernels/src/gemm_qkvza_mq4g256_lloyd_wmma_mb4.hip
+/root/hipfire-work/ds4-gfx942-port/kernels/src/gemv_mq2g256_lloyd.hip
+/root/hipfire-work/ds4-gfx942-port/kernels/src/gemv_mq2g256_lloyd_moe_down_allranks.gfx942.hip
+/root/hipfire-work/ds4-gfx942-port/kernels/src/gemv_mq2g256_lloyd_moe_down_expanded_k4.gfx942.hip
+/root/hipfire-work/ds4-gfx942-port/kernels/src/gemv_mq2g256_lloyd_moe_down_expanded_k4.hip
+/root/hipfire-work/ds4-gfx942-port/kernels/src/gemv_mq2g256_lloyd_moe_down_indexed.gfx942.hip
+/root/hipfire-work/ds4-gfx942-port/kernels/src/gemv_mq2g256_lloyd_moe_down_indexed.hip
+/root/hipfire-work/ds4-gfx942-port/kernels/src/gemv_mq2g256_lloyd_moe_down_indexed_batched_k4.hip
+/root/hipfire-work/ds4-gfx942-port/kernels/src/gemv_mq2g256_lloyd_moe_down_indexed_mfma.gfx942.hip
+/root/hipfire-work/ds4-gfx942-port/kernels/src/gemv_mq2g256_lloyd_moe_down_indexed_mfma_f16.gfx942.hip
+/root/hipfire-work/ds4-gfx942-port/kernels/src/gemv_mq2g256_lloyd_moe_gate_up_indexed.gfx942.hip
+/root/hipfire-work/ds4-gfx942-port/kernels/src/gemv_mq2g256_lloyd_moe_gate_up_indexed.hip
+/root/hipfire-work/ds4-gfx942-port/kernels/src/gemv_mq2g256_lloyd_moe_gate_up_indexed_batched_k4.hip
+/root/hipfire-work/ds4-gfx942-port/kernels/src/gemv_mq2g256_lloyd_moe_gate_up_indexed_mfma.gfx942.hip
+/root/hipfire-work/ds4-gfx942-port/kernels/src/gemv_mq2g256_lloyd_moe_gate_up_indexed_mfma_f16.gfx942.hip
+/root/hipfire-work/ds4-gfx942-port/kernels/src/gemv_mq4g128.hip
+/root/hipfire-work/ds4-gfx942-port/kernels/src/gemv_mq4g256.hip
+/root/hipfire-work/ds4-gfx942-port/kernels/src/gemv_mq4g256_lloyd.gfx1100.hip
+/root/hipfire-work/ds4-gfx942-port/kernels/src/gemv_mq4g256_lloyd.hip
+/root/hipfire-work/ds4-gfx942-port/kernels/src/gemv_mq4g256_lloyd_multiacc_diag.gfx1100.hip
+/root/hipfire-work/ds4-gfx942-port/kernels/src/gemv_mq4g256_lloyd_residual.gfx1100.hip
+/root/hipfire-work/ds4-gfx942-port/kernels/src/gemv_mq4g256_lloyd_residual.hip
+/root/hipfire-work/ds4-gfx942-port/registry/deepseek4-mq2r-gfx1151-v2.json
+/root/hipfire-work/ds4-gfx942-port/registry/deepseek4-mq2r-gfx1151-v3.json
+/root/hipfire-work/ds4-gfx942-port/scripts/analysis/ds4-gfx1151-roofline
+/root/hipfire-work/ds4-gfx942-port/scripts/coherence-gate-deepseek4-mtp.sh
+/root/hipfire-work/ds4-gfx942-port/scripts/coherence-gate-deepseek4-recall.sh
+/root/hipfire-work/ds4-gfx942-port/scripts/mq3-mq2-sweep.sh
+/root/hipfire-work/ds4-gfx942-port/scripts/mq4_masked_calib.py
+/root/hipfire-work/ds4-gfx942-port/scripts/reap/build_deepseek4_e8_bucket_overlay.sh
+/root/hipfire-work/ds4-gfx942-port/scripts/reap/build_deepseek4_e8_layer_overlay.sh
+/root/hipfire-work/ds4-gfx942-port/scripts/reap/build_deepseek4_e8_p2_p3.sh
+/root/hipfire-work/ds4-gfx942-port/scripts/reap/build_deepseek4_e8_p3_awls_head.sh
+/root/hipfire-work/ds4-gfx942-port/scripts/reap/build_deepseek4_e8_p3_gptq_head.sh
+/root/hipfire-work/ds4-gfx942-port/scripts/reap/build_deepseek4_e8_p3_lsq.sh
+/root/hipfire-work/ds4-gfx942-port/scripts/reap/build_deepseek4_mfp3_p1_gptq.sh
+/root/hipfire-work/ds4-gfx942-port/scripts/reap/collect_deepseek4_mfp3_p1_hessians.sh
+/root/hipfire-work/ds4-gfx942-port/scripts/reap/deepseek4_e8_p1_plan.rs
+/root/hipfire-work/ds4-gfx942-port/scripts/reap/deepseek4_e8_plan.rs
+/root/hipfire-work/ds4-gfx942-port/scripts/reap/deepseek4_mfp3_p1_plan.rs
+/root/hipfire-work/ds4-gfx942-port/scripts/reap/deepseek4_mfp3_p1_subset_plan.rs
+/root/hipfire-work/ds4-gfx942-port/scripts/reap/deepseek4_route_compare.rs
+/root/hipfire-work/ds4-gfx942-port/scripts/reap/run_deepseek4_e8_layer_screen.sh
+/root/hipfire-work/ds4-gfx942-port/scripts/reap/run_deepseek4_e8_phase_quality.sh
+/root/hipfire-work/ds4-gfx942-port/scripts/reap/run_deepseek4_mfp3_p1_quality.sh
+/root/hipfire-work/ds4-gfx942-port/scripts/reap/run_deepseek4_mfp3_p1_standalone_quality.sh
+/root/hipfire-work/ds4-gfx942-port/target/release/.fingerprint/hipfire-arch-deepseek4-a1215dfb09a498f6
+/root/hipfire-work/ds4-gfx942-port/target/release/.fingerprint/hipfire-arch-deepseek4-a1215dfb09a498f6/dep-lib-hipfire_arch_deepseek4
+/root/hipfire-work/ds4-gfx942-port/target/release/.fingerprint/hipfire-arch-deepseek4-a1215dfb09a498f6/lib-hipfire_arch_deepseek4
+/root/hipfire-work/ds4-gfx942-port/target/release/.fingerprint/hipfire-arch-deepseek4-a1215dfb09a498f6/lib-hipfire_arch_deepseek4.json
+/root/hipfire-work/ds4-gfx942-port/target/release/.fingerprint/hipfire-arch-deepseek4-a1215dfb09a498f6/output-lib-hipfire_arch_deepseek4
+/root/hipfire-work/ds4-gfx942-port/target/release/.fingerprint/hipfire-arch-deepseek4-a6c94e3dc8da68f0
+/root/hipfire-work/ds4-gfx942-port/target/release/.fingerprint/hipfire-arch-deepseek4-a6c94e3dc8da68f0/dep-lib-hipfire_arch_deepseek4
+/root/hipfire-work/ds4-gfx942-port/target/release/.fingerprint/hipfire-arch-deepseek4-a6c94e3dc8da68f0/lib-hipfire_arch_deepseek4
+/root/hipfire-work/ds4-gfx942-port/target/release/.fingerprint/hipfire-arch-deepseek4-a6c94e3dc8da68f0/lib-hipfire_arch_deepseek4.json
+/root/hipfire-work/ds4-gfx942-port/target/release/.fingerprint/hipfire-arch-deepseek4-a6c94e3dc8da68f0/output-lib-hipfire_arch_deepseek4
+/root/hipfire-work/ds4-gfx942-port/target/release/.fingerprint/hipfire-runtime-9977fc0eb3202ed3/dep-example-profile_qwen35_mq4
+/root/hipfire-work/ds4-gfx942-port/target/release/.fingerprint/hipfire-runtime-9977fc0eb3202ed3/example-profile_qwen35_mq4
+/root/hipfire-work/ds4-gfx942-port/target/release/.fingerprint/hipfire-runtime-9977fc0eb3202ed3/example-profile_qwen35_mq4.json
+/root/hipfire-work/ds4-gfx942-port/target/release/.fingerprint/hipfire-runtime-a3d6565b428f2fe1/dep-example-bench_qwen35_mq4
+/root/hipfire-work/ds4-gfx942-port/target/release/.fingerprint/hipfire-runtime-a3d6565b428f2fe1/example-bench_qwen35_mq4
+/root/hipfire-work/ds4-gfx942-port/target/release/.fingerprint/hipfire-runtime-a3d6565b428f2fe1/example-bench_qwen35_mq4.json
+/root/hipfire-work/ds4-gfx942-port/target/release/.fingerprint/hipfire-runtime-adf902c068c8e501/dep-example-profile_prefill_deepseek4
+/root/hipfire-work/ds4-gfx942-port/target/release/.fingerprint/hipfire-runtime-adf902c068c8e501/example-profile_prefill_deepseek4
+/root/hipfire-work/ds4-gfx942-port/target/release/.fingerprint/hipfire-runtime-adf902c068c8e501/example-profile_prefill_deepseek4.json
+/root/hipfire-work/ds4-gfx942-port/target/release/.fingerprint/rdna-compute-2b03ce1f3c6e4feb/dep-example-test_deepseek4_cdna_channels
+/root/hipfire-work/ds4-gfx942-port/target/release/.fingerprint/rdna-compute-2b03ce1f3c6e4feb/example-test_deepseek4_cdna_channels
+/root/hipfire-work/ds4-gfx942-port/target/release/.fingerprint/rdna-compute-2b03ce1f3c6e4feb/example-test_deepseek4_cdna_channels.json
+/root/hipfire-work/ds4-gfx942-port/target/release/.fingerprint/rdna-compute-595989622edc6372/dep-example-test_mq2_grouped_mfma_gfx942
+/root/hipfire-work/ds4-gfx942-port/target/release/.fingerprint/rdna-compute-595989622edc6372/example-test_mq2_grouped_mfma_gfx942
+/root/hipfire-work/ds4-gfx942-port/target/release/.fingerprint/rdna-compute-595989622edc6372/example-test_mq2_grouped_mfma_gfx942.json
+/root/hipfire-work/ds4-gfx942-port/target/release/.fingerprint/rdna-compute-6e09deba12d42af4/dep-example-test_deepseek4_cdna_channels
+/root/hipfire-work/ds4-gfx942-port/target/release/.fingerprint/rdna-compute-6e09deba12d42af4/example-test_deepseek4_cdna_channels
+/root/hipfire-work/ds4-gfx942-port/target/release/.fingerprint/rdna-compute-6e09deba12d42af4/example-test_deepseek4_cdna_channels.json
+/root/hipfire-work/ds4-gfx942-port/target/release/deps/hipfire_arch_deepseek4-a1215dfb09a498f6.d
+/root/hipfire-work/ds4-gfx942-port/target/release/deps/hipfire_arch_deepseek4-a6c94e3dc8da68f0.d
+/root/hipfire-work/ds4-gfx942-port/target/release/deps/libhipfire_arch_deepseek4-a1215dfb09a498f6.rlib
+/root/hipfire-work/ds4-gfx942-port/target/release/deps/libhipfire_arch_deepseek4-a1215dfb09a498f6.rmeta
+/root/hipfire-work/ds4-gfx942-port/target/release/deps/libhipfire_arch_deepseek4-a6c94e3dc8da68f0.rlib
+/root/hipfire-work/ds4-gfx942-port/target/release/deps/libhipfire_arch_deepseek4-a6c94e3dc8da68f0.rmeta
+/root/hipfire-work/ds4-gfx942-port/target/release/examples/bench_qwen35_mq4
+/root/hipfire-work/ds4-gfx942-port/target/release/examples/bench_qwen35_mq4-a3d6565b428f2fe1
+/root/hipfire-work/ds4-gfx942-port/target/release/examples/bench_qwen35_mq4-a3d6565b428f2fe1.d
+/root/hipfire-work/ds4-gfx942-port/target/release/examples/bench_qwen35_mq4.d
+/root/hipfire-work/ds4-gfx942-port/target/release/examples/profile_prefill_deepseek4
+/root/hipfire-work/ds4-gfx942-port/target/release/examples/profile_prefill_deepseek4-adf902c068c8e501
+/root/hipfire-work/ds4-gfx942-port/target/release/examples/profile_prefill_deepseek4-adf902c068c8e501.d
+/root/hipfire-work/ds4-gfx942-port/target/release/examples/profile_prefill_deepseek4.d
+/root/hipfire-work/ds4-gfx942-port/target/release/examples/profile_qwen35_mq4
+/root/hipfire-work/ds4-gfx942-port/target/release/examples/profile_qwen35_mq4-9977fc0eb3202ed3
+/root/hipfire-work/ds4-gfx942-port/target/release/examples/profile_qwen35_mq4-9977fc0eb3202ed3.d
+/root/hipfire-work/ds4-gfx942-port/target/release/examples/profile_qwen35_mq4.d
+/root/hipfire-work/ds4-gfx942-port/target/release/examples/test_deepseek4_cdna_channels
+/root/hipfire-work/ds4-gfx942-port/target/release/examples/test_deepseek4_cdna_channels-2b03ce1f3c6e4feb
+/root/hipfire-work/ds4-gfx942-port/target/release/examples/test_deepseek4_cdna_channels-2b03ce1f3c6e4feb.d
+/root/hipfire-work/ds4-gfx942-port/target/release/examples/test_deepseek4_cdna_channels-6e09deba12d42af4
+/root/hipfire-work/ds4-gfx942-port/target/release/examples/test_deepseek4_cdna_channels-6e09deba12d42af4.d
+/root/hipfire-work/ds4-gfx942-port/target/release/examples/test_deepseek4_cdna_channels.d
+/root/hipfire-work/ds4-gfx942-port/target/release/examples/test_mq2_grouped_mfma_gfx942
+/root/hipfire-work/ds4-gfx942-port/target/release/examples/test_mq2_grouped_mfma_gfx942-595989622edc6372
+/root/hipfire-work/ds4-gfx942-port/target/release/examples/test_mq2_grouped_mfma_gfx942-595989622edc6372.d
+/root/hipfire-work/ds4-gfx942-port/target/release/examples/test_mq2_grouped_mfma_gfx942.d
+
+=== broader find under /mnt/scratch and /root for large model-ish files ===
+/mnt/scratch/logs/gfx942-qwen08-mfma/correctness/baseline.events.jsonl
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/config.json
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/inference/config.json
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00001-of-00048.safetensors
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00002-of-00048.safetensors
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00003-of-00048.safetensors
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00004-of-00048.safetensors
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00005-of-00048.safetensors
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00006-of-00048.safetensors
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00007-of-00048.safetensors
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00008-of-00048.safetensors
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00009-of-00048.safetensors
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00010-of-00048.safetensors
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00011-of-00048.safetensors
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00012-of-00048.safetensors
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00013-of-00048.safetensors
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00014-of-00048.safetensors
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00015-of-00048.safetensors
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00016-of-00048.safetensors
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00017-of-00048.safetensors
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00018-of-00048.safetensors
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00019-of-00048.safetensors
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00020-of-00048.safetensors
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00021-of-00048.safetensors
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00022-of-00048.safetensors
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00023-of-00048.safetensors
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00024-of-00048.safetensors
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00025-of-00048.safetensors
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00026-of-00048.safetensors
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00027-of-00048.safetensors
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00028-of-00048.safetensors
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00029-of-00048.safetensors
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00030-of-00048.safetensors
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00031-of-00048.safetensors
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00032-of-00048.safetensors
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00033-of-00048.safetensors
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00034-of-00048.safetensors
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00035-of-00048.safetensors
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00036-of-00048.safetensors
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00037-of-00048.safetensors
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00038-of-00048.safetensors
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00039-of-00048.safetensors
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00040-of-00048.safetensors
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00041-of-00048.safetensors
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00042-of-00048.safetensors
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00043-of-00048.safetensors
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00044-of-00048.safetensors
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00045-of-00048.safetensors
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00046-of-00048.safetensors
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00047-of-00048.safetensors
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00048-of-00048.safetensors
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/model.safetensors.index.json
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/tokenizer.json
+/mnt/scratch/models/qwen3.5-0.8b/qwen3.5-0.8b.mq4

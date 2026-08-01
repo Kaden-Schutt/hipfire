@@ -1,0 +1,1 @@
+=== 06a direct daemon NO WMMA workaround Sat Aug  1 12:53:04 PM UTC 2026 ===

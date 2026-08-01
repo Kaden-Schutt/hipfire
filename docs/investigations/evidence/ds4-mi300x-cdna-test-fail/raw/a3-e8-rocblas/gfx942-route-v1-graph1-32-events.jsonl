@@ -1,0 +1,35 @@
+{"type":"pong"}
+{"type":"loaded","arch":"deepseek4","dim":0,"layers":0,"vocab":0,"vl":false,"cache_capable":true,"retry_reset_eligible":false}
+{"type":"token","id":"g0-gfx942-route-v1-graph1-32","text":":","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-graph1-32","text":" The a","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-graph1-32","text":"rchi","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-graph1-32","text":"tecture","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-graph1-32","text":" ","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-graph1-32","text":"must ","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-graph1-32","text":"ma","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-graph1-32","text":"tc","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-graph1-32","text":"h ","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-graph1-32","text":"t","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-graph1-32","text":"he tar","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-graph1-32","text":"get","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-graph1-32","text":": DeepSee","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-graph1-32","text":"k V4","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-graph1-32","text":" Flash","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-graph1-32","text":" or w","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-graph1-32","text":"hatev","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-graph1-32","text":"e","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-graph1-32","text":"r th","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-graph1-32","text":"e model","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-graph1-32","text":" card","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-graph1-32","text":" sa","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-graph1-32","text":"ys","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-graph1-32","text":". ","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-graph1-32","text":"The","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-graph1-32","text":" ","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-graph1-32","text":"devi","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-graph1-32","text":"ce must","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-graph1-32","text":" be g","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-graph1-32","text":"fx942. The kernel path","attempt_id":1}
+{"type":"commit_ready","id":"g0-gfx942-route-v1-graph1-32","tokens":32,"tok_s":27.35042735042735,"prompt_tokens":2052,"prefill_tokens":2052,"cached_tokens":0,"prefill_ms":14513,"total_ms":15683,"finish_reason":"length","drafter":"ar","attempt_id":1}
+{"type":"aborted","id":"g0-gfx942-route-v1-graph1-32","reason":"client_cancelled","attempt_id":1}
+{"type":"done","id":"g0-gfx942-route-v1-graph1-32","finish_reason":"aborted","prompt_tokens":0,"completion_tokens":32,"prefill_ms":0,"decode_ms":0,"attempt_id":1}

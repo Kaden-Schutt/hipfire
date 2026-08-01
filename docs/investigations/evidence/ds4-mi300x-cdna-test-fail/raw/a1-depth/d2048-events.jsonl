@@ -1,0 +1,34 @@
+{"type":"pong"}
+{"type":"loaded","arch":"deepseek4","dim":0,"layers":0,"vocab":0,"vl":false,"cache_capable":true,"retry_reset_eligible":false}
+{"type":"token","id":"g0-depth-2048","text":"I'll p","attempt_id":1}
+{"type":"token","id":"g0-depth-2048","text":"rovide a c","attempt_id":1}
+{"type":"token","id":"g0-depth-2048","text":"omprehens","attempt_id":1}
+{"type":"token","id":"g0-depth-2048","text":"ive","attempt_id":1}
+{"type":"token","id":"g0-depth-2048","text":" tec","attempt_id":1}
+{"type":"token","id":"g0-depth-2048","text":"hnical anal","attempt_id":1}
+{"type":"token","id":"g0-depth-2048","text":"ysis o","attempt_id":1}
+{"type":"token","id":"g0-depth-2048","text":"f the prod","attempt_id":1}
+{"type":"token","id":"g0-depth-2048","text":"uctio","attempt_id":1}
+{"type":"token","id":"g0-depth-2048","text":"n-gr","attempt_id":1}
+{"type":"token","id":"g0-depth-2048","text":"ade i","attempt_id":1}
+{"type":"token","id":"g0-depth-2048","text":"nf","attempt_id":1}
+{"type":"token","id":"g0-depth-2048","text":"er","attempt_id":1}
+{"type":"token","id":"g0-depth-2048","text":"en","attempt_id":1}
+{"type":"token","id":"g0-depth-2048","text":"c","attempt_id":1}
+{"type":"token","id":"g0-depth-2048","text":"e path","attempt_id":1}
+{"type":"token","id":"g0-depth-2048","text":" for D","attempt_id":1}
+{"type":"token","id":"g0-depth-2048","text":"eep","attempt_id":1}
+{"type":"token","id":"g0-depth-2048","text":"S","attempt_id":1}
+{"type":"token","id":"g0-depth-2048","text":"ee","attempt_id":1}
+{"type":"token","id":"g0-depth-2048","text":"k ","attempt_id":1}
+{"type":"token","id":"g0-depth-2048","text":"V4 Fl","attempt_id":1}
+{"type":"token","id":"g0-depth-2048","text":"ash","attempt_id":1}
+{"type":"token","id":"g0-depth-2048","text":"-s","attempt_id":1}
+{"type":"token","id":"g0-depth-2048","text":"tyle ","attempt_id":1}
+{"type":"token","id":"g0-depth-2048","text":"M","attempt_id":1}
+{"type":"token","id":"g0-depth-2048","text":"oT (Mi","attempt_id":1}
+{"type":"token","id":"g0-depth-2048","text":"xtu","attempt_id":1}
+{"type":"token","id":"g0-depth-2048","text":"re-of-Tensor) model on","attempt_id":1}
+{"type":"commit_ready","id":"g0-depth-2048","tokens":32,"tok_s":2.293906810035842,"prompt_tokens":2052,"prefill_tokens":2052,"cached_tokens":0,"prefill_ms":20804,"total_ms":34755,"finish_reason":"length","drafter":"ar","attempt_id":1}
+{"type":"aborted","id":"g0-depth-2048","reason":"client_cancelled","attempt_id":1}
+{"type":"done","id":"g0-depth-2048","finish_reason":"aborted","prompt_tokens":0,"completion_tokens":32,"prefill_ms":0,"decode_ms":0,"attempt_id":1}

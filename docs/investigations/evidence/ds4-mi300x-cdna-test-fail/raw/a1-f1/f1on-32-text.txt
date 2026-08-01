@@ -1,0 +1,1 @@
+: This is a detailed technical briefing on the measurement contract for benchmarking a DeepSeek V4 Flash-style MoT model on AMD MI300X (gfx

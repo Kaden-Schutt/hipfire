@@ -1,0 +1,18 @@
+{"type":"pong"}
+{"type":"loaded","arch":"deepseek4","dim":0,"layers":0,"vocab":0,"vl":false,"cache_capable":true,"retry_reset_eligible":false}
+{"type":"token","id":"g0-warm","text":"# Produc","attempt_id":1}
+{"type":"token","id":"g0-warm","text":"t","attempt_id":1}
+{"type":"token","id":"g0-warm","text":"ion-Gr","attempt_id":1}
+{"type":"token","id":"g0-warm","text":"a","attempt_id":1}
+{"type":"token","id":"g0-warm","text":"d","attempt_id":1}
+{"type":"token","id":"g0-warm","text":"e Ex","attempt_id":1}
+{"type":"token","id":"g0-warm","text":"pla","attempt_id":1}
+{"type":"token","id":"g0-warm","text":"nation: ","attempt_id":1}
+{"type":"token","id":"g0-warm","text":"Batc","attempt_id":1}
+{"type":"token","id":"g0-warm","text":"h-1","attempt_id":1}
+{"type":"token","id":"g0-warm","text":" Au","attempt_id":1}
+{"type":"token","id":"g0-warm","text":"toreg","attempt_id":1}
+{"type":"token","id":"g0-warm","text":"ressive Decode on Deep","attempt_id":1}
+{"type":"commit_ready","id":"g0-warm","tokens":16,"tok_s":15.36983669548511,"prompt_tokens":2052,"prefill_tokens":2052,"cached_tokens":0,"prefill_ms":20836,"total_ms":21877,"finish_reason":"length","drafter":"ar","attempt_id":1}
+{"type":"aborted","id":"g0-warm","reason":"client_cancelled","attempt_id":1}
+{"type":"done","id":"g0-warm","finish_reason":"aborted","prompt_tokens":0,"completion_tokens":16,"prefill_ms":0,"decode_ms":0,"attempt_id":1}

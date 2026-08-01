@@ -1,0 +1,52 @@
+=== PATH tools ===
+/usr/bin/curl
+total 32
+drwxr-xr-x  2 root root 4096 Aug  1 08:31 .
+drwxr-xr-x 34 root root 4096 Aug  1 08:31 ..
+-rwxr-xr-x  1 root root  221 Aug  1 08:31 hf
+-rwxr-xr-x  1 root root  204 Aug  1 08:31 httpx
+-rwxr-xr-x  1 root root  233 Aug  1 08:31 huggingface-cli
+-rwxr-xr-x  1 root root  207 Aug  1 08:31 idna
+-rwxr-xr-x  1 root root  231 Aug  1 08:31 tiny-agents
+-rwxr-xr-x  1 root root  207 Aug  1 08:31 tqdm
+Traceback (most recent call last):
+  File "/mnt/scratch/hf-python/bin/hf", line 5, in <module>
+    from huggingface_hub.cli.hf import main
+ModuleNotFoundError: No module named 'huggingface_hub'
+Traceback (most recent call last):
+  File "/mnt/scratch/hf-python/bin/huggingface-cli", line 5, in <module>
+    from huggingface_hub.cli.deprecated_cli import main
+ModuleNotFoundError: No module named 'huggingface_hub'
+Traceback (most recent call last):
+  File "/mnt/scratch/hf-python/bin/hf", line 5, in <module>
+    from huggingface_hub.cli.hf import main
+ModuleNotFoundError: No module named 'huggingface_hub'
+Traceback (most recent call last):
+  File "/mnt/scratch/hf-python/bin/huggingface-cli", line 5, in <module>
+    from huggingface_hub.cli.deprecated_cli import main
+ModuleNotFoundError: No module named 'huggingface_hub'
+TOKEN_FILE_HOME:
+ls: cannot access '/root/.cache/huggingface/token': No such file or directory
+ls: cannot access '/root/.huggingface/token': No such file or directory
+TOKEN_EXISTS=NO
+
+=== curl -sI https://huggingface.co ===
+HTTP/2 200 
+content-type: text/html; charset=utf-8
+content-length: 181610
+date: Sat, 01 Aug 2026 12:16:28 GMT
+etag: W/"2c56a-LZIupzvHWunoX98wiEceQ7drAEs"
+x-powered-by: huggingface-moon
+x-request-id: Root=1-6a6de39c-63c28a014faa65a077808092
+ratelimit: "pages";r=97;t=164
+ratelimit-policy: "fixed window";"pages";q=100;w=300
+cross-origin-opener-policy: same-origin
+referrer-policy: strict-origin-when-cross-origin
+x-frame-options: DENY
+x-cache: Hit from cloudfront
+via: 1.1 c4f304e7786da519d49ea9f064843ae4.cloudfront.net (CloudFront)
+x-amz-cf-pop: ATL59-P13
+x-amz-cf-id: AVdSrDJuJEhHHX46IdQ49OQxJ6IptCrJsPaQxUSwCMsfbE8p35xTsw==
+age: 42
+
+

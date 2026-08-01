@@ -1,0 +1,44 @@
+{
+  "label": "m0-warm",
+  "text": "A GPU kernel is a function or small program written by a user that is executed in parallel across many threads on the GPU's cores. It defines the computation to be performed by each individual thread, typically operating on a single element of a large data array.",
+  "text_sha256": "cfe868fcf5b68a1e6e3211e91c28fb569e78912b7a11b2bdbac94f20f4404f91",
+  "prompt": "Explain what a GPU kernel is in two sentences.",
+  "prompt_sha256": "9a151396bc7ae69dcc2c8a5607ec464391419ae94772e1a63cf096c4885342b1",
+  "max_tokens": 64,
+  "temperature": 0.0,
+  "done": {
+    "type": "commit_ready",
+    "id": "g0-m0-warm",
+    "tokens": 51,
+    "tok_s": 35.66433566433567,
+    "prompt_tokens": 14,
+    "prefill_tokens": 14,
+    "cached_tokens": 0,
+    "prefill_ms": 201,
+    "total_ms": 1632,
+    "finish_reason": "stop",
+    "drafter": "ar",
+    "attempt_id": 1
+  },
+  "terminal": {
+    "type": "aborted",
+    "id": "g0-m0-warm",
+    "reason": "client_cancelled",
+    "attempt_id": 1
+  },
+  "loaded": {
+    "type": "loaded",
+    "arch": "deepseek4",
+    "dim": 0,
+    "layers": 0,
+    "vocab": 0,
+    "vl": false,
+    "cache_capable": true,
+    "retry_reset_eligible": false
+  },
+  "elapsed_gen_s": 31.638054370880127,
+  "elapsed_load_s": 74.76386451721191,
+  "n_token_events": 47,
+  "daemon_bin": "/mnt/scratch/hipfire-work/ds4-mi300x-agentmaxx/target/release/examples/daemon",
+  "model": "/mnt/scratch/models/deepseek-v4-flash-mq2r/deepseek-v4-flash.mq2r"
+}
