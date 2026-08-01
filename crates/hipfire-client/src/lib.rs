@@ -3184,22 +3184,9 @@ done
 
     #[cfg(unix)]
     fn dummy_child() -> Child {
-        use std::os::unix::fs::PermissionsExt;
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static N: AtomicU64 = AtomicU64::new(0);
-        let n = N.fetch_add(1, Ordering::Relaxed);
-        let root = env::temp_dir().join(format!(
-            "hipfire-client-dummy-child-{}-{}",
-            std::process::id(),
-            n
-        ));
-        let _ = fs::create_dir_all(&root);
-        let path = root.join("sleep");
-        // Tiny forever-reader so Drop kill is clean.
-        // Unique path per call avoids ETXTBSY when tests race on rewrite.
-        fs::write(&path, "#!/bin/sh\ncat >/dev/null\n").unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
-        Command::new(&path)
+        // A system executable avoids racing a prior test process that still
+        // has a generated script open, which can make spawn fail with ETXTBSY.
+        Command::new("cat")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
