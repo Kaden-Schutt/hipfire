@@ -219,10 +219,12 @@ def sparse_attn(
 ) -> torch.Tensor:
     """Sparse MHA via index gather + softmax with learnable sink (kernel.py:351-366)."""
     bsz, seqlen, n_heads, d = q.shape
-    qf = q.float()
-    kvf = kv.float()
-    sink = attn_sink.float()
-    idx = topk_idxs.long()
+    dev = kv.device
+    qf = q.float().to(dev)
+    kvf = kv.float().to(dev)
+    sink = attn_sink.float().to(dev)
+    # model.py get_*_topk_idxs builds indices on CPU; move to match KV
+    idx = topk_idxs.long().to(dev)
     topk = idx.size(-1)
     valid = idx >= 0
     idx_c = idx.clamp(min=0)

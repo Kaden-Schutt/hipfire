@@ -40,7 +40,7 @@ def _load_tensor(index: Dict[str, Path], name: str, device="cpu") -> torch.Tenso
 def _ue8m0_to_f32(s: torch.Tensor) -> torch.Tensor:
     b = s.view(torch.uint8) if s.dtype == torch.float8_e8m0fnu else s.to(torch.uint8)
     bb = b.to(torch.int64)
-    out = torch.ldexp(torch.ones(bb.shape, dtype=torch.float32), bb.to(torch.int32) - 127)
+    out = torch.ldexp(torch.ones(bb.shape, dtype=torch.float32, device=s.device), bb.to(torch.int32) - 127)
     out = torch.where(b == 0, torch.full_like(out, 2.0 ** -127), out)
     return out
 

@@ -403,21 +403,27 @@ mod config_cache {
     /// hardcoded constant. Caching the combined scale would be wrong the
     /// moment two models with different checkpoint scales are served in one
     /// process.
-    pub(super) fn route_scale(cfg_routed_scaling_factor: f32) -> f32 {
+    pub(super) fn route_scale(cfg_routed_scaling_factor: f32, mq2r: bool) -> f32 {
         static ENV_OVERRIDE: LazyLock<Option<f32>> = LazyLock::new(|| {
             hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_ROUTE_SCALE")
                 .ok()
                 .and_then(|s| s.parse().ok())
         });
         let env_override = *ENV_OVERRIDE;
-        let effective = resolve_route_scale(cfg_routed_scaling_factor, env_override);
-        if env_override.is_some()
-            && (effective - cfg_routed_scaling_factor).abs() > f32::EPSILON
-        {
+        let effective = resolve_route_scale(cfg_routed_scaling_factor, env_override, mq2r);
+        if (effective - cfg_routed_scaling_factor).abs() > f32::EPSILON {
             static LOGGED: OnceLock<()> = OnceLock::new();
             let _ = LOGGED.get_or_init(|| {
+                // Never silent. A route scale that differs from the header is
+                // a compensation, and the last one to go unannounced survived
+                // two months.
+                let src = if env_override.is_some() {
+                    "HIPFIRE_DEEPSEEK4_ROUTE_SCALE"
+                } else {
+                    ".mq2r artifact default (measured optimum)"
+                };
                 eprintln!(
-                    "deepseek4: HIPFIRE_DEEPSEEK4_ROUTE_SCALE={effective} overrides \
+                    "deepseek4: route_scale={effective} from {src} overrides \
                      cfg.routed_scaling_factor={cfg_routed_scaling_factor}"
                 );
             });
@@ -455,12 +461,42 @@ mod config_cache {
     /// property, not a model property, and conflating the two in one constant
     /// is what made this invisible for two months.
     ///
-    /// The contract value therefore stays here, and the compensation stays
-    /// explicit: serve the current MQ2R artifact with
-    /// `HIPFIRE_DEEPSEEK4_ROUTE_SCALE=2.2` (now logged, never silent) until it
-    /// is re-quantized, and re-measure after any re-quant. The real fix is at
-    /// quantization time, where recovering the lost expert magnitude should
-    /// make 1.5 both correct *and* better.
+    /// The contract value stays the silent default for every artifact whose
+    /// header we trust. The one exception is keyed to the **artifact**, never
+    /// to the architecture:
+    ///
+    /// # `.mq2r` ships at 2.0
+    ///
+    /// A route_scale sweep on the 0731 MQ2R (wikitext2 slice md5
+    /// `83b0205a304bf4e52172ecdb05f2e895`, ctx256, fresh process per run) puts
+    /// the minimum at **2.0**, sharply:
+    ///
+    /// | scale | 1.2 | 1.5 | 1.8 | 2.0 | 2.2 | 2.4 | 2.6 |
+    /// |---|---:|---:|---:|---:|---:|---:|---:|
+    /// | PPL | 15.59 | 9.13 | 6.63 | **6.03** | 6.84 | 7.30 | 7.90 |
+    ///
+    /// so serving MQ2R on its header's 1.5 costs ~51% PPL. The optimum is
+    /// **per build**, not per architecture: MQ2R and MQ2-Lloyd differ in tier
+    /// layout (shared expert and `ffn.gate.weight` are qt=3 Q8_0 in Lloyd
+    /// against qt=35 MFP4G32E8SOA in R), so the routed:shared gain each build
+    /// wants is different. The table in the git history recording 2.2 as the
+    /// winner is a Lloyd-era measurement and must not be applied to MQ2R.
+    ///
+    /// This is gated on `cfg.mq2r`, which comes from the `.mq2r` artifact
+    /// suffix or frozen recipe metadata and is never inferred from the
+    /// presence of an E8 tensor — so **MQ2-Lloyd and every other DeepSeek V4
+    /// artifact keep their header value untouched**, and a future re-quant
+    /// inherits 1.5 from its own header rather than this compensation.
+    ///
+    /// It remains a compensation, not a model property: MQ2 expert
+    /// quantization loses routed-expert magnitude and an inflated route scale
+    /// buys it back on the routed branch only. The real fix is at
+    /// quantization time, where recovering that magnitude should make the
+    /// header value both correct *and* better. Re-measure after any re-quant
+    /// and delete this branch when it stops winning.
+    ///
+    /// Precedence: `HIPFIRE_DEEPSEEK4_ROUTE_SCALE` (explicit, logged) beats
+    /// the `.mq2r` default, which beats the checkpoint value.
     ///
     /// The parent-calibration path (`crate::parent`) must always use the
     /// checkpoint value — inheriting a quantization compensation into a
@@ -470,8 +506,15 @@ mod config_cache {
     pub(super) fn resolve_route_scale(
         cfg_routed_scaling_factor: f32,
         env_override: Option<f32>,
+        mq2r: bool,
     ) -> f32 {
-        env_override.unwrap_or(cfg_routed_scaling_factor)
+        /// Measured optimum for the 0731 `.mq2r` build. See the table above.
+        const MQ2R_ROUTE_SCALE: f32 = 2.0;
+        env_override.unwrap_or(if mq2r {
+            MQ2R_ROUTE_SCALE
+        } else {
+            cfg_routed_scaling_factor
+        })
     }
 
     /// `HIPFIRE_DEEPSEEK4_E8_U4` — use the four-group-unrolled E8-SoA
@@ -5137,7 +5180,8 @@ fn ffn_routed(
     let ffn_x_rot = state.ffn_x_rot.as_ref().unwrap();
     let ffn_out = state.ffn_out.as_ref().unwrap();
     // Route-scale: env override (process-cached) else cfg.routed_scaling_factor.
-    let route_scale_override: f32 = config_cache::route_scale(cfg.routed_scaling_factor);
+    let route_scale_override: f32 =
+        config_cache::route_scale(cfg.routed_scaling_factor, cfg.mq2r);
 
     if layer.expert_gate_up_blob.is_some() {
         // Fused MoE dispatch: 2 indexed kernels (gate_up + down) plus
@@ -5312,7 +5356,8 @@ fn ffn_hash_routed(
     let im = cfg.moe_intermediate_size;
     let ffn_x_rot = state.ffn_x_rot.as_ref().unwrap();
     let ffn_out = state.ffn_out.as_ref().unwrap();
-    let route_scale_override: f32 = config_cache::route_scale(cfg.routed_scaling_factor);
+    let route_scale_override: f32 =
+        config_cache::route_scale(cfg.routed_scaling_factor, cfg.mq2r);
     let k_top = k;
 
     // Lazy-alloc moe scratch (shared with ffn_routed via state).
@@ -9662,7 +9707,7 @@ fn ffn_batched(
     let w2_ptrs = layer.expert_w2_ptrs.as_ref().unwrap();
     let n_exp = cfg.n_routed_experts;
     let k_top = cfg.num_experts_per_tok;
-    let route_scale: f32 = config_cache::route_scale(cfg.routed_scaling_factor);
+    let route_scale: f32 = config_cache::route_scale(cfg.routed_scaling_factor, cfg.mq2r);
 
     // 8. Router GEMV: gate.weight @ ffn_x_rot_batch → moe_scores [B, n_exp].
     gemv_auto_batched_wmma(
@@ -12869,34 +12914,68 @@ mod tests {
 
     #[test]
     fn route_scale_defaults_to_cfg_not_hardcoded_2_2() {
-        // Pure combiner: unset env → checkpoint value; set env → override.
+        // Non-mq2r artifacts: unset env → checkpoint value; set env → override.
         // Would fail against the old `unwrap_or(2.2)` silent default whenever
         // the checkpoint scale is anything other than 2.2 (every known DS4
         // checkpoint declares 1.5).
         let cfg_scale = 1.5f32;
         assert_eq!(
-            config_cache::resolve_route_scale(cfg_scale, None),
+            config_cache::resolve_route_scale(cfg_scale, None, false),
             cfg_scale,
             "unset env must use cfg.routed_scaling_factor, not a hardcoded default"
         );
         assert_eq!(
-            config_cache::resolve_route_scale(cfg_scale, Some(2.2)),
+            config_cache::resolve_route_scale(cfg_scale, Some(2.2), false),
             2.2,
             "explicit HIPFIRE_DEEPSEEK4_ROUTE_SCALE override must win"
         );
         assert_eq!(
-            config_cache::resolve_route_scale(cfg_scale, Some(1.0)),
+            config_cache::resolve_route_scale(cfg_scale, Some(1.0), false),
             1.0
         );
         // A second model with a different checkpoint scale must not be pinned
         // to the first model's value (the OnceLock-of-combined-scale bug).
-        assert_eq!(config_cache::resolve_route_scale(3.0, None), 3.0);
+        assert_eq!(config_cache::resolve_route_scale(3.0, None, false), 3.0);
         // Old default must not sneak back in when cfg says 1.5 and env is unset.
         assert_ne!(
-            config_cache::resolve_route_scale(1.5, None),
+            config_cache::resolve_route_scale(1.5, None, false),
             2.2,
             "regression guard: silent 2.2 default must be gone"
         );
+    }
+
+    #[test]
+    fn route_scale_mq2r_ships_2_0_without_touching_other_artifacts() {
+        // The 0731 `.mq2r` sweep (wikitext2 md5 83b0205a…, ctx256) puts the
+        // minimum at 2.0: 15.59/9.13/6.63/6.03/6.84/7.30/7.90 across
+        // 1.2/1.5/1.8/2.0/2.2/2.4/2.6. Serving it on the header's 1.5 costs
+        // ~51% PPL.
+        assert_eq!(
+            config_cache::resolve_route_scale(1.5, None, true),
+            2.0,
+            "the .mq2r artifact must ship at its measured optimum"
+        );
+        // The whole point of gating on the artifact rather than the
+        // architecture: MQ2-Lloyd and every other DeepSeek V4 build keep their
+        // own header value. Lloyd's optimum is a different number — the tier
+        // layouts differ (shared expert and ffn.gate.weight are qt=3 Q8_0 in
+        // Lloyd against qt=35 MFP4G32E8SOA in R) — so pinning it to 2.0 would
+        // move it off its own optimum.
+        assert_eq!(
+            config_cache::resolve_route_scale(1.5, None, false),
+            1.5,
+            "non-mq2r artifacts must be untouched by the mq2r compensation"
+        );
+        // An explicit override still wins over the artifact default, so the
+        // compensation stays escapable while it exists.
+        assert_eq!(
+            config_cache::resolve_route_scale(1.5, Some(2.2), true),
+            2.2,
+            "explicit env override must beat the .mq2r default"
+        );
+        // A future re-quant inherits its own header rather than this
+        // compensation, provided it is not stamped `.mq2r`.
+        assert_eq!(config_cache::resolve_route_scale(1.8, None, false), 1.8);
     }
 
     #[test]
