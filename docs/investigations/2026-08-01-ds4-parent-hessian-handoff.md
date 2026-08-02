@@ -8,6 +8,72 @@ Pre-checkpoint HEAD: `b15edf38d35843b7a9d31bb609214d6abb172d4b`
 
 Host: `mi300x` (`gfx942`, ROCm `/opt/rocm/core-7.14`)
 
+## Checkpoint — 2026-08-02, work in flight
+
+**Read this first.** The sections below were written 2026-08-01 and are still
+accurate as history, but the situation has moved. Short version for anyone
+picking this branch up:
+
+**Goal.** Build a trustworthy full-precision DeepSeek V4 Flash 0731 *parent*
+forward so it can serve as the KLD reference distribution that both 0731
+quantized artifacts (MQ2R, MQ2-Lloyd) get calibrated against. The parent is not
+a shipped artifact — at 150.756 GiB it cannot be. It exists to generate the
+target distribution, the Hessians, and the KLD objective.
+
+**One root cause found and fixed** (`dc4a6cd8f`). `Block.hc_post` contracted the
+wrong axis of the sinkhorn `comb` matrix. PPL at 1024 went 163.892 → 59.507; at
+256 the parent now *beats* both 2-bit quants (8.619 against 11.080 / 11.289).
+Details in "Root cause found" below.
+
+**Why it took so long, and the lesson for anyone touching `parent/*`.** Every
+oracle we had compared `parent/forward.rs` against `parent/*_ref`, and both were
+written from the same reading of `model.py`. A shared misreading is invisible by
+construction, so HC comparisons agreed to ~1e-7 while the model was badly wrong.
+Thirteen-plus hypotheses were eliminated before an *independent* implementation
+(production's forward) exposed it. There is now a PyTorch oracle that imports
+`model.py` verbatim — use it.
+
+**Two defects still open**, cleanly separated by the data:
+
+1. **L37 → L38 residual step of 8.2x** (14221.72 → 116669.77). Present at all
+   four sequence lengths. Weights bit-exact at L36-39; sinkhorn clean at L38
+   (column sums 1.000, host-vs-GPU 1.4e-7). Localised to `moe_out` at L38,
+   which is ~38k against a ~14k incoming residual where L36/L37 attenuate.
+2. **Accuracy step near position 448-512 that then plateaus.** Full-resolution
+   scan shows the parent tracking mq2r to 448, dropping, then holding flat near
+   0.28 while mq2r holds near 0.50. A latching step, not a ramp. Reference-side
+   `index_topk` selection is *refuted* as the cause (the SWA window is exempt
+   from the budget and it never binds below ~2048 tokens); whether *our* path
+   also treats it as a no-op is open.
+
+**Gates 7-9 are conditional now**, not assumed — see "Gates 7-9 are conditional
+on a value test" below. The independent GPTQ cross-reference found our solver
+math already correct, so the program rests on the unproven premise that
+parent-derived calibration beats what the pipeline already ships. The gate is a
+single parent-calibrated MQ2R re-quant measured against the shipped 14.703 at
+1024.
+
+**New tooling on this branch, all reusable:**
+
+- `crates/hipfire-quantize/reference_gptq/` — GPTQ oracle written from the paper,
+  not from our Rust. Catches transposed Hessians, missing damping, missing
+  inverse permutation, missing error feedback.
+- `crates/hipfire-arch-deepseek4/reference_oracle/` — PyTorch harness importing
+  `model.py` verbatim (in flight).
+- `crates/hipfire-arch-deepseek4/scripts/plog_fine_scan.py` — full-resolution
+  position scan; distinguishes a latching step from a ramp.
+- `examples/ds4_parent_loader_oracle.rs`, `ds4_prod_vs_parent_trace.rs`,
+  `ds4_parent_plumbing_probe.rs`.
+
+**Methodology notes that cost us time — please honour them.** Compare PPL and
+geo-mean residual growth only *within* a sequence length; both are
+length-dependent. Position-bucket accuracy is the one length-invariant metric.
+`KLD(P_parent || Q_quant)` is weighted by the parent's own distribution, so a
+sharper-but-still-wrong parent scores *higher* — judge by PPL, top-1 and buckets.
+And `pgrep -f` matches the polling script's own command line: two separate
+pollers hung on this, one for 40 minutes. Use `pgrep -f "[d]s4_..."` or poll for
+output artifacts.
+
 ## Executive state
 
 The Hipfire-native activation dumper and rocBLAS Hessian builder work, but the
