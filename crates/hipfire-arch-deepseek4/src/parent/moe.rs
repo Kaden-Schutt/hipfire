@@ -1236,4 +1236,124 @@ mod tests {
         };
         assert_eq!(r.distinct_experts(), 4);
     }
+
+    /// Gate-6 row-0 explosion guard: routing weight must scale the *pre-w2*
+    /// SwiGLU intermediate, not the expert output (`model.py:609-610`).
+    /// L5 oracle comparison relies on this asymmetry.
+    #[test]
+    fn routing_weight_scales_swiglu_before_down_proj() {
+        let inter = 8usize;
+        let dim = 4usize;
+        let gate = vec![1.0f32; inter];
+        let up = vec![2.0f32; inter];
+        let w_route = 0.75f32;
+        let hid = crate::parent::layer_ref::expert_swiglu_ref(
+            &gate,
+            &up,
+            1,
+            inter,
+            10.0,
+            Some(&[w_route]),
+        );
+        let mut hid_unweighted = vec![0.0f32; inter];
+        swiglu_clamp_silu_mul(&gate, &up, &mut hid_unweighted, 10.0);
+        for j in 0..inter {
+            assert!(
+                (hid[j] - hid_unweighted[j] * w_route).abs() < 1e-6,
+                "slot {j}: weighted {} != unweighted*w {}",
+                hid[j],
+                hid_unweighted[j] * w_route
+            );
+        }
+        // Toy w2 = ones: down-proj of weighted hid == w_route * down(unweighted).
+        let w2 = vec![1.0f32; dim * inter];
+        let mut y_w = vec![0.0f32; dim];
+        let mut y_1 = vec![0.0f32; dim];
+        for n in 0..dim {
+            let mut acc_w = 0.0f32;
+            let mut acc_1 = 0.0f32;
+            for k in 0..inter {
+                acc_w += w2[n * inter + k] * hid[k];
+                acc_1 += w2[n * inter + k] * hid_unweighted[k];
+            }
+            y_w[n] = acc_w;
+            y_1[n] = acc_1;
+        }
+        for n in 0..dim {
+            assert!(
+                (y_w[n] - y_1[n] * w_route).abs() < 1e-5,
+                "down-proj slot {n}: {} != {} * route",
+                y_w[n],
+                y_1[n]
+            );
+        }
+    }
+
+    /// Grouped dispatch must emit each (row, weight) exactly once. Row 0 is
+    /// the first token of every group it joins — double-counting it was the
+    /// leading hypothesis for the residual spike.
+    #[test]
+    fn group_tokens_row0_appears_exactly_topk_times() {
+        // r0 → e0,e1 ; r1 → e2,e1
+        let routing = ParentRouting {
+            weights: vec![0.5, 0.4, 0.6, 0.3],
+            indices: vec![0, 1, 2, 1],
+            rows: 2,
+            topk: 2,
+        };
+        let groups = group_tokens_by_expert(&routing, 4).unwrap();
+        let seen: Vec<(usize, f32)> = groups.iter().flatten().copied().collect();
+        assert_eq!(seen.len(), routing.rows * routing.topk);
+        let r0_count = seen.iter().filter(|(r, _)| *r == 0).count();
+        assert_eq!(
+            r0_count, routing.topk,
+            "row0 must appear exactly topk times, got {seen:?}"
+        );
+        // row0 is first member of e0 and of e1 (insertion order).
+        assert_eq!(groups[0][0], (0, 0.5));
+        assert_eq!(groups[1][0], (0, 0.4));
+        assert_eq!(groups[1][1], (1, 0.3));
+        let r0_w: f32 = seen
+            .iter()
+            .filter(|(r, _)| *r == 0)
+            .map(|(_, w)| *w)
+            .sum();
+        assert!((r0_w - 0.9).abs() < 1e-6);
+    }
+
+    /// Route-scale contract: even a heavily peaked score row (L5 row-0 style)
+    /// must L1-renorm then `* route_scale`, so weights always sum to 1.5 — not
+    /// to the raw top score. Under-renorm was a candidate for MoE blow-up.
+    #[test]
+    fn score_route_weights_sum_to_route_scale() {
+        // 3 rows, peaked and flat score rows — every row must sum to 1.5.
+        let n_exp = 8usize;
+        let topk = 6usize;
+        let rows = 3usize;
+        let mut scores = vec![0.0f32; rows * n_exp];
+        for r in 0..rows {
+            for e in 0..n_exp {
+                scores[r * n_exp + e] = 0.1 + (e as f32) * 0.05 + (r as f32) * 0.01;
+            }
+            // Make row 0 heavily peaked on expert 0 (L5-like).
+            if r == 0 {
+                scores[0] = 10.0;
+            }
+        }
+        let bias = vec![0.0f32; n_exp];
+        let (w, _idx) =
+            score_route_topk(&scores, Some(&bias), rows, n_exp, topk, PARENT_ROUTE_SCALE)
+                .unwrap();
+        for r in 0..rows {
+            let sum: f32 = w[r * topk..(r + 1) * topk].iter().sum();
+            assert!(
+                (sum - PARENT_ROUTE_SCALE).abs() < 1e-5,
+                "row {r} weight sum {sum} != route_scale"
+            );
+        }
+        // Peaked row 0 still sums to route_scale (not ~weight of expert 0 alone).
+        let r0: f32 = w[..topk].iter().sum();
+        assert!((r0 - PARENT_ROUTE_SCALE).abs() < 1e-5);
+    }
+
 }
