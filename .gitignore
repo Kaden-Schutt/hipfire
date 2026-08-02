@@ -158,3 +158,10 @@ redline/db/redline.db
 # with examples/ds4_parent_{inventory,codec}_gate; the durable numbers live
 # in commit messages and docs/investigations/.
 out/
+
+# DeepSeek V4 reference source is third-party and gitignored at
+# .codeinsight+research/; never vendor it into the tracked tree.
+crates/hipfire-arch-deepseek4/reference_oracle/model.py
+crates/hipfire-arch-deepseek4/reference_oracle/kernel.py
+crates/hipfire-arch-deepseek4/reference_oracle/config.json
+crates/hipfire-arch-deepseek4/reference_oracle/__pycache__/

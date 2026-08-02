@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Kaden Schutt <kaden@hipfire.dev>
 from pathlib import Path
 HERE = Path('.').resolve()
 print('HERE', HERE)

@@ -12,6 +12,27 @@ Every previous oracle shared a reading of `model.py` with the parent port. When
 This harness imports `model.py` unmodified so no human re-reading sits between
 the file and the numbers.
 
+## The reference source is NOT vendored here
+
+`model.py`, `kernel.py` and `config.json` are DeepSeek's, not ours. They stay
+**out of the tracked tree** — `.codeinsight+research/` is gitignored precisely
+so third-party reference source is not redistributed from this repository, and
+`.gitignore` now also names those three paths under this directory so a copy
+cannot reappear by accident.
+
+`run_oracle.py::_find_ref_infer` walks up from this directory to
+`.codeinsight+research/ds4-parent-ref/inference/` and imports from there, so
+place the reference at that path and the harness finds it with no
+configuration. If it is missing, the import fails loudly rather than silently
+running against a stale copy — which is the correct behaviour for an oracle
+whose entire value is being independent of our reading.
+
+This is not bureaucracy. hipfire asks derivative work to attribute it (see the
+root `AGENTS.md` and `PRIOR-ART.md`); extending the same courtesy to code we
+depend on is the same principle applied in the other direction. A byte-identical
+copy of `model.py` with no SPDX header or attribution was committed here once
+and removed — do not reintroduce it.
+
 ## What it covers
 
 | Step | What | Pass criterion |
