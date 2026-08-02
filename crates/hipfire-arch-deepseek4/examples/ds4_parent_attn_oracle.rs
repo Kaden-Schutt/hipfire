@@ -22,7 +22,9 @@ use hipfire_arch_deepseek4::parent::attention::{
     PARENT_PER_GROUP_IN, PARENT_Q_LORA, PARENT_Q_WIDTH, PARENT_ROPE_DIM, PARENT_ROPE_THETA,
     PARENT_SWA_WINDOW, PARENT_WO_A_OUT,
 };
-use hipfire_arch_deepseek4::parent::codec::round_to_bf16;
+use hipfire_arch_deepseek4::parent::codec::{
+    act_quant_fp8_inplace_ref, fast_round_scale, round_to_bf16,
+};
 use hipfire_arch_deepseek4::parent::compressor::{
     PARENT_COMPRESS_ROPE_THETA, PARENT_YARN_BETA_FAST, PARENT_YARN_BETA_SLOW, PARENT_YARN_FACTOR,
     PARENT_YARN_ORIG_SEQ,
@@ -44,9 +46,7 @@ const DEFAULT_MODEL: &str = "/mnt/scratch/models/DeepSeek-V4-Flash-0731";
 const DEFAULT_ROWS: usize = 128;
 const START_POS: usize = 0;
 const REPORT_ROWS: &[usize] = &[0, 1, 8, 32, 64, 100, 127];
-/// Layers to compare: (layer_idx, expected_compress_ratio).
 const LAYERS: &[(usize, usize)] = &[(0, 0), (2, 4), (3, 128)];
-
 fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
@@ -436,6 +436,7 @@ fn run_layer(
     let gpu_kv = download_f32(gpu, scratch.kv_f32_ref()?, rows * PARENT_HEAD_DIM)?;
     // After forward, attn_out_f32 holds post-inverse-RoPE (before wo_a).
     let gpu_attn_inv = download_f32(gpu, scratch.attn_out_f32_ref()?, rows * PARENT_Q_WIDTH)?;
+    let gpu_wo_a = download_f32(gpu, scratch.wo_a_out_f32_ref()?, rows * PARENT_WO_A_OUT)?;
 
     if !all_finite(&gpu_o) {
         return Err(format!(
@@ -494,6 +495,47 @@ fn run_layer(
         REPORT_ROWS,
     );
 
+    println!();
+    println!("=== stage: wo_a_out (after grouped wo_a, before wo_b) ===");
+    print_row_table(
+        "wo_a",
+        &gpu_wo_a,
+        &reference.wo_a_out,
+        rows,
+        PARENT_WO_A_OUT,
+        REPORT_ROWS,
+    );
+
+    // Full 128-row scan — sample tables already misled once.
+    println!();
+    println!("=== FULL per-row max_abs scan (all {rows} rows) ===");
+
+    // Act-quant scale diagnostic on wo_b input (wo_a_out) for dirty vs clean rows.
+    // Compare host oracle amax/scale against what act_quant_fp8_inplace_ref produces.
+    if ratio == 0 {
+        dump_act_quant_scales(
+            "wo_b_input",
+            &gpu_wo_a,
+            &reference.wo_a_out,
+            rows,
+            PARENT_WO_A_OUT,
+            128,
+            &[0usize, 1, 7, 8, 16, 46, 68, 100, 127],
+        );
+        dump_act_quant_scales(
+            "wo_a_input_attn_inv",
+            &gpu_attn_inv,
+            &reference.attn_inv_rope,
+            rows,
+            PARENT_Q_WIDTH,
+            128,
+            &[0usize, 1, 7, 8, 16, 46, 68, 100, 127],
+        );
+    }
+    full_row_scan("o", &gpu_o, &reference.o, rows, PARENT_DIM);
+    full_row_scan("attn_inv", &gpu_attn_inv, &reference.attn_inv_rope, rows, PARENT_Q_WIDTH);
+    full_row_scan("wo_a", &gpu_wo_a, &reference.wo_a_out, rows, PARENT_WO_A_OUT);
+
     // Global summary
     let (gmax, gmean, gl2) = metrics(&gpu_o, &reference.o);
     println!();
@@ -501,9 +543,11 @@ fn run_layer(
     let (qmax, _, ql2) = metrics(&gpu_q, &reference.q_post_rope);
     let (kmax, _, kl2) = metrics(&gpu_kv, &reference.kv_post_quant);
     let (amax, _, al2) = metrics(&gpu_attn_inv, &reference.attn_inv_rope);
+    let (wamax, _, wal2) = metrics(&gpu_wo_a, &reference.wo_a_out);
     println!("GLOBAL q_post_rope:   max_abs={qmax:.6e}  l2_rel={ql2:.6e}");
     println!("GLOBAL kv_post_quant: max_abs={kmax:.6e}  l2_rel={kl2:.6e}");
     println!("GLOBAL attn_inv_rope: max_abs={amax:.6e}  l2_rel={al2:.6e}");
+    println!("GLOBAL wo_a_out:      max_abs={wamax:.6e}  l2_rel={wal2:.6e}");
 
     // Flat-vs-growing diagnostic on MAIN-PATH stages (q and kv), not final o.
     let q_low = row_max_abs(&gpu_q, &reference.q_post_rope, 0, PARENT_Q_WIDTH);
@@ -681,6 +725,192 @@ fn print_row_table(
             l2_norm(rf) as f64
         );
     }
+}
+
+/// Compare per-block amax + UE8M0 scale of GPU vs ref activations before a dense linear.
+fn dump_act_quant_scales(
+    name: &str,
+    gpu: &[f32],
+    reference: &[f32],
+    rows: usize,
+    width: usize,
+    block: usize,
+    report: &[usize],
+) {
+    println!();
+    println!("=== act_quant scale probe: {name} (block={block}) ===");
+    println!(
+        "{:>6} {:>10} {:>10} {:>10} {:>12} {:>8} {:>6} {:>12} {:>12}",
+        "row",
+        "in_maxabs",
+        "bf16_neq",
+        "n_diff_sc",
+        "max_amax_rel",
+        "sc0",
+        "expΔ",
+        "bf16_maxabs",
+        "q_out_maxabs"
+    );
+    for &r in report {
+        if r >= rows {
+            continue;
+        }
+        let g = &gpu[r * width..(r + 1) * width];
+        let rf = &reference[r * width..(r + 1) * width];
+        let in_mx = metrics(g, rf).0;
+
+        let g_bf: Vec<f32> = g.iter().map(|&v| round_to_bf16(v)).collect();
+        let r_bf: Vec<f32> = rf.iter().map(|&v| round_to_bf16(v)).collect();
+        let mut bf16_neq = 0usize;
+        let mut bf16_mx = 0.0f64;
+        let mut first_mismatch: Option<(usize, f32, f32, f32, f32)> = None;
+        for i in 0..width {
+            if g_bf[i].to_bits() != r_bf[i].to_bits() {
+                bf16_neq += 1;
+                if first_mismatch.is_none() {
+                    first_mismatch = Some((i, g[i], rf[i], g_bf[i], r_bf[i]));
+                }
+            }
+            let d = (g_bf[i] as f64 - r_bf[i] as f64).abs();
+            if d > bf16_mx {
+                bf16_mx = d;
+            }
+        }
+        if let Some((i, gf, rf, gb, rb)) = first_mismatch {
+            println!(
+                "    first_bf16_mismatch idx={i} f32=({gf:.8e},{rf:.8e}) d_f32={:.3e} bf16=({gb:.8e},{rb:.8e}) d_bf16={:.3e}",
+                (gf as f64 - rf as f64).abs(),
+                (gb as f64 - rb as f64).abs()
+            );
+        }
+
+        let n_blocks = width / block;
+        let mut n_diff = 0usize;
+        let mut max_amax_rel = 0.0f64;
+        let mut max_exp_delta = 0i32;
+        let mut sc0 = 0.0f32;
+        for b in 0..n_blocks {
+            let gs = &g_bf[b * block..(b + 1) * block];
+            let rs = &r_bf[b * block..(b + 1) * block];
+            let mut ag = 0.0f32;
+            let mut ar = 0.0f32;
+            for &v in gs {
+                ag = ag.max(v.abs());
+            }
+            for &v in rs {
+                ar = ar.max(v.abs());
+            }
+            ag = ag.max(1e-4);
+            ar = ar.max(1e-4);
+            let sg = fast_round_scale(ag, 1.0 / 448.0);
+            let sr = fast_round_scale(ar, 1.0 / 448.0);
+            if b == 0 {
+                sc0 = sg;
+            }
+            if sg != sr {
+                n_diff += 1;
+                let eg = sg.log2().round() as i32;
+                let er = sr.log2().round() as i32;
+                max_exp_delta = max_exp_delta.max((eg - er).abs());
+            }
+            let rel = ((ag as f64) - (ar as f64)).abs() / (ar as f64).max(1e-30);
+            if rel > max_amax_rel {
+                max_amax_rel = rel;
+            }
+        }
+
+        let mut g_q = g_bf.clone();
+        let mut r_q = r_bf.clone();
+        let _ = act_quant_fp8_inplace_ref(&mut g_q, width, block);
+        let _ = act_quant_fp8_inplace_ref(&mut r_q, width, block);
+        let q_mx = metrics(&g_q, &r_q).0;
+
+        println!(
+            "{r:>6} {in_mx:>10.3e} {bf16_neq:>10} {n_diff:>10} {max_amax_rel:>12.3e} {sc0:>8.3e} {max_exp_delta:>6} {bf16_mx:>12.3e} {q_mx:>12.3e}"
+        );
+    }
+}
+
+/// Scan every row; print dirty ones (max_abs > floor) and a shape summary.
+fn full_row_scan(name: &str, gpu: &[f32], reference: &[f32], rows: usize, width: usize) {
+    const FLOOR: f64 = 5e-6;
+    let mut dirty: Vec<(usize, f64)> = Vec::new();
+    let mut clean = 0usize;
+    let mut max_all = 0.0f64;
+    let mut argmax = 0usize;
+    let mut per_row = vec![0.0f64; rows];
+    for r in 0..rows {
+        let mx = row_max_abs(gpu, reference, r, width);
+        per_row[r] = mx;
+        if mx > max_all {
+            max_all = mx;
+            argmax = r;
+        }
+        if mx > FLOOR {
+            dirty.push((r, mx));
+        } else {
+            clean += 1;
+        }
+    }
+    println!(
+        "{name}: clean={clean}/{rows} (floor={FLOOR:.0e})  dirty={}  global_max={max_all:.6e} @row{argmax}",
+        dirty.len()
+    );
+    if dirty.is_empty() {
+        return;
+    }
+    // Print every dirty row (capped) so the pattern is visible.
+    let show = dirty.len().min(64);
+    print!("{name} dirty rows:");
+    for i in 0..show {
+        let (r, mx) = dirty[i];
+        print!(" {r}:{mx:.3e}");
+    }
+    if dirty.len() > show {
+        print!(" ...+{}", dirty.len() - show);
+    }
+    println!();
+    // Periodicity probes: count dirty per residue mod 8 / 16 / 32 / 64.
+    for &m in &[8usize, 16, 32, 64] {
+        let mut bins = vec![0usize; m];
+        for &(r, _) in &dirty {
+            bins[r % m] += 1;
+        }
+        let nonzero: Vec<String> = bins
+            .iter()
+            .enumerate()
+            .filter(|(_, &c)| c > 0)
+            .map(|(i, c)| format!("{i}:{c}"))
+            .collect();
+        println!("{name} dirty mod {m}: [{}]", nonzero.join(" "));
+    }
+    // Contiguous runs of dirty.
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    let mut i = 0usize;
+    while i < dirty.len() {
+        let start = dirty[i].0;
+        let mut end = start;
+        let mut j = i + 1;
+        while j < dirty.len() && dirty[j].0 == end + 1 {
+            end = dirty[j].0;
+            j += 1;
+        }
+        runs.push((start, end));
+        i = j;
+    }
+    print!("{name} dirty runs ({}):", runs.len());
+    for (a, b) in runs.iter().take(16) {
+        if a == b {
+            print!(" [{a}]");
+        } else {
+            print!(" [{a}..{b}]");
+        }
+    }
+    if runs.len() > 16 {
+        print!(" ...+{}", runs.len() - 16);
+    }
+    println!();
+    let _ = per_row;
 }
 
 fn metrics(a: &[f32], b: &[f32]) -> (f64, f64, f64) {

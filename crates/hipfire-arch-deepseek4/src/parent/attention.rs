@@ -427,6 +427,12 @@ impl ParentAttnScratch {
         Ok(&self.attn_out_f32)
     }
 
+    /// O-LoRA intermediate after grouped wo_a `[max_rows, o_groups * o_lora]`
+    /// (diagnostic; survives through wo_b).
+    pub fn wo_a_out_f32_ref(&self) -> Result<&GpuTensor, String> {
+        Ok(&self.wo_a_out_f32)
+    }
+
     /// Q-LoRA bottleneck after q_norm `[max_rows, q_lora]` (indexer `qr` input).
     pub fn q_lat_f32_ref(&self) -> &GpuTensor {
         &self.q_lat_f32
