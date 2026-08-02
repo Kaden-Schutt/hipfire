@@ -11708,6 +11708,42 @@ mod gptq_damping_probe {
         eprintln!("  norm      |wh|/|w|       = {norm_ratio:.4}");
         eprintln!("  gain to restore energy   = {energy_gain:.4}");
         eprintln!("  shipped route_scale ratios: 1.8/1.5 = 1.2000, 2.2/1.5 = 1.4667\n");
+        // Per-group spread decides whether a per-group gain beats a global one.
+        // If every group shrinks identically, route_scale is already adequate
+        // and a codebook change buys nothing; if the spread is wide, a global
+        // scalar necessarily over-corrects some experts and under-corrects
+        // others, and only a per-group gain fixes all of them.
+        let mut per_group: Vec<f64> = Vec::with_capacity(n / 256);
+        for g in 0..n / 256 {
+            let (mut d, mut sw) = (0.0f64, 0.0f64);
+            for i in g * 256..(g + 1) * 256 {
+                d += f64::from(recon[i]) * f64::from(w[i]);
+                sw += f64::from(w[i]) * f64::from(w[i]);
+            }
+            if sw > 0.0 {
+                per_group.push(d / sw);
+            }
+        }
+        per_group.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let gmean = per_group.iter().sum::<f64>() / per_group.len() as f64;
+        let gsd = (per_group.iter().map(|v| (v - gmean).powi(2)).sum::<f64>()
+            / per_group.len() as f64)
+            .sqrt();
+        let pick = |q: f64| per_group[((per_group.len() - 1) as f64 * q) as usize];
+        eprintln!(
+            "  per-group retained: mean {gmean:.4} sd {gsd:.4}  \
+             min {:.4} p05 {:.4} p50 {:.4} p95 {:.4} max {:.4}",
+            per_group[0],
+            pick(0.05),
+            pick(0.50),
+            pick(0.95),
+            per_group[per_group.len() - 1]
+        );
+        eprintln!(
+            "  spread as % of mean: sd {:.2}%, p95-p05 {:.2}%\n",
+            100.0 * gsd / gmean,
+            100.0 * (pick(0.95) - pick(0.05)) / gmean
+        );
 
         assert!(
             retained > 0.3 && retained < 1.3,
