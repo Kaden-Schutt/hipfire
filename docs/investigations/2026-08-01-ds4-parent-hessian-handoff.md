@@ -216,8 +216,9 @@ architecture flag. No Qwen-owned body changes.
 4. **One-layer gate** — **PASSED 2026-08-02.** 16-token layer canary, finite
    state, 14/14 sub-block checks against an f64 CPU oracle. See "Gate 4
    evidence" below.
-5. **Parent-forward gate**: full 43-layer 32-token coherent output; finite
-   logits and deterministic fixed-input hashes.
+5. **Parent-forward gate** — **PASSED 2026-08-02.** Full 43-layer forward at
+   32 and 256 tokens, finite logits, deterministic in-process hash, coherent
+   next-token. See "Gate 5 evidence" below.
 6. **Pre-GPTQ quality gate**: save parent reference logits, then measure the
    existing MQ2L and MQ2R artifacts on the exact same token IDs, positions,
    tokenizer, RoPE convention, and engine fingerprint. Record KLD/PPL before
@@ -232,8 +233,9 @@ architecture flag. No Qwen-owned body changes.
 
 ## Gate status (updated 2026-08-02)
 
-Gates 1-4 are closed. The full parent checkpoint is resident on the MI300X and
-one full parent layer executes. Gate 5 (43-layer forward) is the next work.
+Gates 1-5 are closed. The original parent checkpoint runs end to end on the
+MI300X and produces coherent output. Gate 6 (parent logit baseline + MQ2L/MQ2R
+KLD) is the next work.
 
 ### What landed
 
@@ -493,22 +495,112 @@ it may be depressing quantized-artifact quality independently of this work.
   `view_as_complex(unflatten(-1, (-1, 2)))` pairs dims `(2i, 2i+1)`. Layers
   with `compress_ratio == 0` disable YaRN (484-485).
 
+### Gate 5 evidence
+
+`ds4_parent_forward_gate` on `mi300x` (gfx942), all 43 layers with routed
+experts, MTP excluded. **PASS at both 32 and 256 tokens.**
+
+| | 32 tok | 256 tok |
+|---|---:|---:|
+| load | 18.48 s | 19.06 s |
+| forward | 4.478 s | 24.81 s |
+| residency | 161,872,686,172 B | same, delta 0 vs Gate 1 |
+| logits | L2 8453.5, mean -1.164, std 3.990 | L2 2.300e4 |
+| NaN / Inf | 0 / 0 | 0 / 0 |
+| determinism (in-process) | bit-identical | bit-identical |
+| `.plog` | 16,547,864 B | 132,382,744 B |
+
+**Coherence.** `"The capital of France is"` gives top-1 `" Paris"` at logit
+30.19, clear of `"Paris"` (25.52) and `"巴黎"` (25.16). This is the first
+coherent output from the parent checkpoint under hipfire.
+
+Note the gate also prints an argmax decode of the *fixed pseudo-random* token
+sequence, and that output is gibberish. It is correctly labelled
+diagnostic-only: the input is PRNG-generated token ids, not text, so its
+continuation is meaningless. The real prompt is the coherence signal. Do not
+read the fixed-sequence decode as a failure — and do not read a *plausible*
+fixed-sequence decode as a success either.
+
+**Stack stability.** The HC residual norm grows from ~400 to ~631,000 over 43
+layers, geometric mean 1.1917 per layer, with no monotonic trend (the last
+three ratios are 1.0523, 0.9892, 0.9412) and no per-layer ratio outside
+[0.25, 4]. This is not obviously wrong: `hc_post` applies a learned
+`post = 2*sigmoid(...)` factor in (0, 2), and both `hc_pre` and the final
+RMSNorm are scale-invariant, so absolute stream magnitude never reaches the
+logits. `hc_post` is oracle-verified to 9.5e-7. Recorded as an observation to
+re-check against the reference if it ever becomes runnable.
+
+### The act-quant BF16-domain finding
+
+While building the compressor, the host FP8 act-quant oracle was found to
+disagree with the GPU kernel by max_abs 0.25 / mean_rel 2.2e-3 — **contradicting
+Gate 2**, which had certified that pair bit-exact.
+
+Root cause was an implicit input-domain contract, not a kernel bug.
+`kernel.py:41-102` declares `in_dtype = BF16` and the GPU kernel reads a BF16
+buffer, but the host oracle accepted f32 and computed `amax` at full precision.
+When an f32 amax sits just above a power-of-two boundary of `amax/448` and BF16
+rounds it back onto the boundary, `fast_log2_ceil` differs by one and the scale
+differs by exactly 2x:
+
+| | amax | amax/448 | `fast_log2_ceil` | scale |
+|---|---:|---:|---:|---:|
+| f32 | 224.4 | 0.500892 | 0 | 1.0 |
+| BF16 | 224.0 | 0.5 exactly | -1 | 0.5 |
+
+Sparse groups, large absolute error — exactly the observed signature. The host
+oracles now round to BF16 internally (idempotent), so the misuse is impossible
+rather than merely documented. The GPU kernel was correct and is unchanged.
+Gate 2 re-run: **14/14**, including a new case driven by full-f32 near-boundary
+values that fails without the fix. Gate 3 and Gate 4 conclusions hold — both
+already staged BF16-rounded activations.
+
+Lesson for the remaining gates, alongside the `err_ref > 0` rule from Gate 3:
+**an oracle's input domain is part of its contract.** A CPU reference that
+silently accepts a wider type than the kernel it checks will agree on
+synthetic data and diverge on real data.
+
+### Sequence-length coverage — read before trusting a gate run
+
+`compress_ratios` gives 2 layers at ratio 0, 21 at ratio 4, and 20 at ratio 128.
+The number of compress events is `floor(rows / ratio)`, so **short runs do not
+exercise the compressed path**:
+
+| tokens | ratio-4 windows | ratio-128 windows |
+|---:|---:|---:|
+| 32 | 8 | **0** |
+| 256 | 64 | 2 |
+| 1024 | 256 | 8 |
+
+Gate 5's first run at 32 tokens therefore produced zero compress events on all
+20 ratio-128 layers — 47% of the stack ran an SWA-only fallback while the gate
+reported PASS, finite and coherent. The 256-token run engages them. This is
+pinned by `parent::compressor::tests::compress_events_require_enough_rows` so
+the requirement is explicit rather than inferable from a token count.
+
+Residual gap: the *integrated* ratio-128 attention path has been exercised at
+256 tokens as part of the full forward, but not with per-layer instrumentation
+confirming the compressed positions were consumed. The compressor component
+itself was verified standalone on real layer 3 at 128 rows. Gate 6's 1024-token
+calibration run should carry that instrumentation.
+
 ### Not yet done
 
-Gates 5-9. Specifically:
+Gates 6-9. Specifically:
 
-- **Compressor and indexer are unimplemented.** `parent_attention_swa` refuses
-  `compress_ratio != 0`, which is 41 of 43 layers. Gate 5 needs them:
-  the compressor (`model.py:285-384`) and the indexer (`386-440`), including
-  the Hadamard rotation plus FP4 group-32 simulation on the indexer `q` and
-  the indexer compressor's `kv`, and YaRN RoPE with
-  `compress_rope_theta = 160000`.
-- No 43-layer forward, no output head, no saved parent logits. The `.plog`
-  comparator remains unit-tested only, because no real parent logit file
-  exists yet.
-- At 110.9 ms per layer for 16 rows, a naive 43-layer forward is order 5 s per
-  16-token batch. Adequate for a 1K-token calibration run but worth measuring
-  before scaling to 32K.
+- **No pinned parent logit baseline yet.** Both Gate 5 runs used
+  `--skip-shard-hashes`, so their manifests carry placeholders rather than a
+  pin, and the token sequences were pseudo-random rather than a real corpus.
+  Those `.plog` files are smoke artifacts and **must not** be promoted to the
+  Gate 6 baseline.
+- Gate 6 needs: a real 1024-token corpus with a recorded hash, a full-shard-hash
+  manifest, cross-process determinism confirmed (only in-process is proven so
+  far), and then MQ2L/MQ2R logits captured on byte-identical token ids for the
+  KLD comparison. `plog::compare` is written and unit-tested but has never
+  consumed a real parent logit file.
+- Forward cost is 24.8 s per 256 tokens, so a 1024-token capture is order
+  100 s per model plus load. Tractable; measure before scaling to the 8K/16K/32K
+  expansion in gate 8.
 
 
 ## Producer boundary

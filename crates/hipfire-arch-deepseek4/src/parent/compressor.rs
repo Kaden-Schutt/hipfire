@@ -1815,4 +1815,36 @@ mod tests {
         assert_eq!(compressor_proj_dim(PARENT_HEAD_DIM, 128), 512);
         assert_eq!(compressor_proj_dim(PARENT_INDEX_HEAD_DIM, 4), 256);
     }
+
+    /// Which sequence lengths actually engage the compressor, per layer class.
+    ///
+    /// This exists because Gate 5's first run used 32 tokens and therefore
+    /// produced **zero** compress events on every `ratio == 128` layer — 20 of
+    /// 43 — so ~47% of the stack silently ran an SWA-only fallback while the
+    /// gate reported PASS. Finite, coherent, and not exercising the code under
+    /// test. Pin the thresholds so the coverage requirement is explicit rather
+    /// than something a future reader has to infer from a token count.
+    #[test]
+    fn compress_events_require_enough_rows() {
+        // ratio 128: nothing below 128 rows, then one window per 128.
+        assert_eq!(compressor_prefill_n_out(32, 128), 0, "Gate 5 @32 tokens");
+        assert_eq!(compressor_prefill_n_out(127, 128), 0);
+        assert_eq!(compressor_prefill_n_out(128, 128), 1);
+        assert_eq!(compressor_prefill_n_out(256, 128), 2, "Gate 5 @256 tokens");
+        assert_eq!(
+            compressor_prefill_n_out(1024, 128),
+            8,
+            "Gate 6's 1024-token calibration run engages every ratio-128 layer"
+        );
+
+        // ratio 4 engages almost immediately, which is why the ratio-4 layers
+        // looked exercised at 32 tokens even though the ratio-128 ones were not.
+        assert_eq!(compressor_prefill_n_out(3, 4), 0);
+        assert_eq!(compressor_prefill_n_out(4, 4), 1);
+        assert_eq!(compressor_prefill_n_out(32, 4), 8);
+        assert_eq!(compressor_prefill_n_out(1024, 4), 256);
+
+        // ratio 0 layers have no compressor at all.
+        assert_eq!(compressor_prefill_n_out(1024, 0), 0);
+    }
 }
