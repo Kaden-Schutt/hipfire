@@ -230,14 +230,30 @@ pub fn parent_model_forward(
     )
 }
 
-/// Same as [`parent_model_forward`], appending per-layer HC-state L2 norms
-/// into `layer_norms` and per-layer compress-event counts into
+
+/// Per-layer HC residual norms after `hc_post_ffn`.
+///
+/// `median` is the stability statistic: one aggregate L2 over all rows is
+/// dominated by a single massive-activation token (e.g. row 0 at L37→L38:
+/// median 404→413 while aggregate 14222→116670). Verdicts must key on median.
+/// `aggregate` / `p90` / `max` stay for diagnostics.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LayerHcNormStats {
+    pub median: f32,
+    pub p90: f32,
+    pub max: f32,
+    pub aggregate: f32,
+}
+
+/// Same as [`parent_model_forward`], appending per-layer HC residual norm
+/// stats into `layer_norms` and per-layer compress-event counts into
 /// `compress_events` (one entry per loaded layer, absolute layer order).
 ///
-/// Both output vecs are cleared then filled. `compress_events[i]` is the
-/// number of compressed positions the attention path actually consumed for
-/// that layer (from the executed compressor path), paired with the layer's
-/// `compress_ratio`. Cheap: one D2H residual reduction + one usize read.
+/// Both output vecs are cleared then filled. Each `layer_norms` entry is a
+/// [`LayerHcNormStats`]: **`median`** per-row L2 is the stability statistic
+/// (see struct docs); aggregate/p90/max are diagnostic. `compress_events[i]`
+/// is the number of compressed positions the attention path consumed for
+/// that layer, paired with the layer's `compress_ratio`.
 pub fn parent_model_forward_traced(
     gpu: &mut Gpu,
     backend: Ds4ParentBackend,
@@ -247,7 +263,7 @@ pub fn parent_model_forward_traced(
     token_ids: &[u32],
     start_pos: usize,
     logits: &GpuTensor,
-    layer_norms: &mut Vec<f32>,
+    layer_norms: &mut Vec<LayerHcNormStats>,
     compress_events: &mut Vec<(usize /*ratio*/, usize /*events*/)>,
 ) -> Result<(), String> {
     parent_model_forward_inner(
@@ -273,7 +289,7 @@ fn parent_model_forward_inner(
     token_ids: &[u32],
     start_pos: usize,
     logits: &GpuTensor,
-    mut layer_norms: Option<&mut Vec<f32>>,
+    mut layer_norms: Option<&mut Vec<LayerHcNormStats>>,
     mut compress_events: Option<&mut Vec<(usize, usize)>>,
 ) -> Result<(), String> {
     backend.ensure_device(gpu)?;
@@ -379,9 +395,9 @@ fn parent_model_forward_inner(
             // (hc_post_ffn) so the gate's stability series is the actual
             // residual that feeds the next layer / head.
             if layer_norms.is_some() {
-                let hc_l2 = stage_l2(gpu, out, rows * PARENT_HC_DIM)?;
+                let stats = stage_hc_row_norm_stats(gpu, out, rows, PARENT_HC_DIM)?;
                 if let Some(norms) = layer_norms.as_mut() {
-                    norms.push(hc_l2);
+                    norms.push(stats);
                 }
             }
             if let Some(events) = compress_events.as_mut() {
@@ -463,6 +479,49 @@ fn require_elems(t: &GpuTensor, n: usize, name: &str) -> Result<(), String> {
         )));
     }
     Ok(())
+}
+
+
+/// Per-row L2 norms of HC residual `[rows, hc_mult, dim]`, then median/p90/max
+/// and the aggregate L2 over all elements.
+fn stage_hc_row_norm_stats(
+    gpu: &Gpu,
+    t: &GpuTensor,
+    rows: usize,
+    hc_dim: usize,
+) -> Result<LayerHcNormStats, String> {
+    let nelems = rows
+        .checked_mul(hc_dim)
+        .ok_or_else(|| err("stage_hc_row_norm_stats: size overflow"))?;
+    let host = download_f32_prefix(gpu, t, nelems)?;
+    let mut row_l2 = Vec::with_capacity(rows);
+    for r in 0..rows {
+        let base = r * hc_dim;
+        let mut s = 0.0f64;
+        for j in 0..hc_dim {
+            let v = host[base + j] as f64;
+            s += v * v;
+        }
+        row_l2.push(s.sqrt());
+    }
+    let mut sorted = row_l2;
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let n = sorted.len();
+    let median = sorted[n / 2] as f32;
+    let p90 = sorted[((n as f64 * 0.90) as usize).min(n - 1)] as f32;
+    let max = *sorted.last().unwrap_or(&0.0) as f32;
+    // aggregate L2 over the full flat residual (prior statistic).
+    let mut agg = 0.0f64;
+    for &v in &host {
+        let d = v as f64;
+        agg += d * d;
+    }
+    Ok(LayerHcNormStats {
+        median,
+        p90,
+        max,
+        aggregate: agg.sqrt() as f32,
+    })
 }
 
 fn stage_l2(gpu: &Gpu, t: &GpuTensor, nelems: usize) -> Result<f32, String> {

@@ -47,7 +47,9 @@ use hipfire_arch_deepseek4::parent::forward::{
 use hipfire_arch_deepseek4::parent::head::{parent_embed, PARENT_VOCAB};
 use hipfire_arch_deepseek4::parent::inventory::ParentInventory;
 use hipfire_arch_deepseek4::parent::manifest::sha256_file;
-use hipfire_arch_deepseek4::parent::model::{parent_model_forward_traced, ParentModelScratch};
+use hipfire_arch_deepseek4::parent::model::{
+    parent_model_forward_traced, LayerHcNormStats, ParentModelScratch,
+};
 use hipfire_arch_deepseek4::parent::weights::{ParentLoadPlan, ParentWeights};
 use hipfire_arch_deepseek4::parent::Ds4ParentBackend;
 use hipfire_arch_deepseek4::DeepseekV4;
@@ -276,7 +278,7 @@ fn run_parent(args: &Args) -> Result<(), String> {
     let weights = ParentWeights::load(&source, &cfg, &inv, &mut gpu, backend, &plan)?;
     println!("loaded in {:.3} s", load_t0.elapsed().as_secs_f64());
 
-    let mut layer_norms: Vec<f32> = Vec::new();
+    let mut layer_norms: Vec<LayerHcNormStats> = Vec::new();
     let mut compress_events: Vec<(usize, usize)> = Vec::new();
     let logits = zeros_f32(&mut gpu, &[n, PARENT_VOCAB])?;
     let mut scratch = ParentModelScratch::new(&mut gpu, &cfg, n)?;
@@ -295,9 +297,12 @@ fn run_parent(args: &Args) -> Result<(), String> {
     )?;
     println!("forward done in {:.3} s", fwd_t0.elapsed().as_secs_f64());
 
-    let series: Vec<f64> = layer_norms.iter().map(|&x| x as f64).collect();
+    // Median per-row L2, not the aggregate: one massive-activation row (row 0
+    // at L37→L38: median 404→413 against aggregate 14222→116670) dominates the
+    // flat L2 and makes a healthy stack look like it is diverging.
+    let series: Vec<f64> = layer_norms.iter().map(|s| s.median as f64).collect();
     println!();
-    println!("=== parent per-layer HC residual L2 (all {n} rows × 4 × 4096) ===");
+    println!("=== parent per-layer HC residual, MEDIAN per-row L2 ({n} rows) ===");
     print_trajectory("parent", &series);
 
     if let Some(csv) = args.csv.as_ref() {

@@ -36,7 +36,8 @@ use hipfire_arch_deepseek4::parent::manifest::{
     OutputInfo, OutputKind, ParentManifest, ShardInfo, SourceInfo, MANIFEST_SCHEMA,
 };
 use hipfire_arch_deepseek4::parent::model::{
-    assert_compress_events, parent_model_forward, parent_model_forward_traced, ParentModelScratch,
+    assert_compress_events, parent_model_forward, parent_model_forward_traced, LayerHcNormStats,
+    ParentModelScratch,
 };
 use hipfire_arch_deepseek4::parent::plog::PlogWriter;
 use hipfire_arch_deepseek4::parent::weights::{ParentLoadPlan, ParentWeights};
@@ -311,7 +312,7 @@ fn run() -> Result<bool, String> {
     );
 
     // ── 4. Traced full forward ──────────────────────────────────────────
-    let mut layer_norms: Vec<f32> = Vec::new();
+    let mut layer_norms: Vec<LayerHcNormStats> = Vec::new();
     let mut compress_events: Vec<(usize, usize)> = Vec::new();
     let fwd_t0 = Instant::now();
     let fwd_result = parent_model_forward_traced(
@@ -564,7 +565,10 @@ fn run() -> Result<bool, String> {
 
     // ── 6. Per-layer HC L2 + stability ──────────────────────────────────
     println!();
-    println!("=== per-layer HC-state L2 (post hc_post_ffn residual) ===");
+    println!("=== per-layer HC residual norms (post hc_post_ffn) ===");
+    println!(
+        "  statistic for stack_stability = MEDIAN per-row L2; aggregate/p90/max are diagnostic only.\n           Why not aggregate: a single massive-activation row (L37→L38 case: median 404→413 while          aggregate 14222→116670, ratio 8.2x) dominates the flat L2 and false-fails a healthy stack.          See combfix/MEDIAN_TRAJ_ARTIFACT_REPORT.txt."
+    );
     if layer_norms.is_empty() {
         println!("  (none — forward did not complete any layer)");
         checks.push(CheckRow {
@@ -573,11 +577,17 @@ fn run() -> Result<bool, String> {
             detail: "empty".into(),
         });
     } else {
-        for (i, &n) in layer_norms.iter().enumerate() {
-            // layer_norms is in absolute layer order for the layers that ran.
-            println!("  layer {i:>2}: L2 = {n:.6}");
+        for (i, s) in layer_norms.iter().enumerate() {
+            // Absolute layer order for the layers that ran.
+            println!(
+                "  layer {i:>2}: median={:.6}  p90={:.6}  max={:.6}  aggregate={:.6}",
+                s.median, s.p90, s.max, s.aggregate
+            );
         }
-        let (stable, stab_detail) = stability_verdict(&layer_norms);
+        // Verdict keys on median only — aggregate is not more conservative, it is wrong
+        // under massive activations (L37→L38: med 404→413 vs agg 14222→116670).
+        let median_series: Vec<f32> = layer_norms.iter().map(|s| s.median).collect();
+        let (stable, stab_detail) = stability_verdict(&median_series);
         println!();
         println!("=== stability ===");
         println!("{stab_detail}");
