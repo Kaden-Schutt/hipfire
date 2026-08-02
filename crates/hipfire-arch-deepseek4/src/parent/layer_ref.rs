@@ -697,14 +697,25 @@ pub fn expert_swiglu_ref(
 
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Attention SWA f64 oracle (compress_ratio == 0)
+// Attention SWA f64 oracle (main path; compress_ratio 0 / 4 / 128)
 // ═══════════════════════════════════════════════════════════════════════════
 //
 // Authority:
-// - model.py Attention.forward 490-549 (ratio-0 branch)
+// - model.py Attention.forward 490-549
+// - model.py Attention.__init__ 481-488 (RoPE table selection)
 // - kernel.py sparse_attn 277-369
 // - model.py get_window_topk_idxs 260-271
 // - model.py apply_rotary_emb 238-250 (interleaved)
+//
+// Scope:
+// - Models the *main* q/kv/o path including the ratio>0 RoPE table
+//   (YaRN on, original_seq_len=65536, base=compress_rope_theta=160000).
+// - Sparse attention is SWA-window + sink only. Compressed KV contribution
+//   is intentionally out of scope: at the 128-token isolation point the
+//   window already covers the whole sequence, and stage-wise comparison
+//   (pre-attn q/kv, and post-attn when n_active is forced 0) isolates the
+//   main path. Do not treat a final-`o` mismatch under live compress as a
+//   main-path failure without checking pre-attn stages.
 //
 // Projections reuse codec act-quant + f64 matmul over BF16-decoded weights,
 // matching Gate-3's proven BF16≡scaled-FP8 identity (UE8M0 power-of-two
@@ -719,8 +730,27 @@ use crate::parent::attention::{
 };
 use crate::parent::codec::act_quant_fp8_inplace_ref;
 use crate::parent::compressor::{
-    PARENT_YARN_BETA_FAST, PARENT_YARN_BETA_SLOW, PARENT_YARN_FACTOR,
+    PARENT_COMPRESS_ROPE_THETA, PARENT_YARN_BETA_FAST, PARENT_YARN_BETA_SLOW, PARENT_YARN_FACTOR,
+    PARENT_YARN_ORIG_SEQ,
 };
+
+/// RoPE table policy for the main q/kv/o path (`model.py:481-488`).
+///
+/// - `compress_ratio == 0`: plain `rope_theta=10000`, YaRN off (`original_seq_len=0`).
+/// - `compress_ratio > 0`: `compress_rope_theta=160000` + YaRN
+///   (`original_seq_len=65536`, factor/β from config).
+///
+/// Returns `(original_seq_len, rope_theta)`.
+#[inline]
+pub fn attention_main_rope_policy(compress_ratio: usize) -> Result<(usize, f64), String> {
+    match compress_ratio {
+        0 => Ok((0, PARENT_ROPE_THETA as f64)),
+        4 | 128 => Ok((PARENT_YARN_ORIG_SEQ, PARENT_COMPRESS_ROPE_THETA)),
+        other => Err(err_msg(&format!(
+            "attention_main_rope_policy: unsupported compress_ratio={other} (expected 0, 4, or 128)"
+        ))),
+    }
+}
 
 /// Host-side weights for [`attention_swa_ref`] (BF16-decoded dense, F32 sink).
 ///
@@ -920,11 +950,15 @@ pub fn sparse_attn_ref(
     Ok(out)
 }
 
-/// f64 reference for one `compress_ratio == 0` attention block.
+/// f64 reference for one attention block main path (SWA + sink).
 ///
 /// Prefill operating point (`start_pos == 0`): KV store is the current chunk
-/// and window indices are absolute positions into it. Decode-with-history is
-/// not modelled.
+/// and window indices are absolute positions into it. Decode-with-history and
+/// compressed-KV contribution are not modelled (see module comment).
+///
+/// `compress_ratio` selects the main-path RoPE table only:
+/// - `0` → plain base-10000, no YaRN
+/// - `4` / `128` → YaRN + compress_rope_theta (same table the compressor uses)
 ///
 /// `x` is `[rows, dim]` post-attn_norm F32.
 pub fn attention_swa_ref(
@@ -932,7 +966,9 @@ pub fn attention_swa_ref(
     w: &AttnSwARefWeights<'_>,
     rows: usize,
     start_pos: usize,
+    compress_ratio: usize,
 ) -> Result<AttnRefOut, String> {
+    let (original_seq_len, rope_theta) = attention_main_rope_policy(compress_ratio)?;
     attention_swa_ref_cfg(
         x,
         w,
@@ -947,11 +983,15 @@ pub fn attention_swa_ref(
         PARENT_O_GROUPS,
         PARENT_SWA_WINDOW,
         PARENT_RMS_EPS as f64,
-        PARENT_ROPE_THETA as f64,
+        original_seq_len,
+        rope_theta,
     )
 }
 
 /// Configurable core (unit tests use tiny shapes; production uses parent constants).
+///
+/// `rope_original_seq_len == 0` disables YaRN (ratio-0 policy). Nonzero enables
+/// YaRN blending against `rope_theta` (ratio>0 policy uses 65536 / 160000).
 #[allow(clippy::too_many_arguments)]
 pub fn attention_swa_ref_cfg(
     x: &[f32],
@@ -967,6 +1007,7 @@ pub fn attention_swa_ref_cfg(
     o_groups: usize,
     window: usize,
     eps: f64,
+    rope_original_seq_len: usize,
     rope_theta: f64,
 ) -> Result<AttnRefOut, String> {
     if rows == 0 {
@@ -1056,10 +1097,13 @@ pub fn attention_swa_ref_cfg(
     let kv_raw = dense_linear_bf16_ref(x, w.wkv, rows, head_dim, dim)?;
     let kv_post_norm = rms_norm_ref(&kv_raw, w.kv_norm, eps, head_dim);
 
-    // ── 3. Tail RoPE (interleaved), ratio-0: plain theta, no YaRN ────────
+    // ── 3. Tail RoPE (interleaved) ──────────────────────────────────────
+    // ratio==0: original_seq_len=0 → plain theta, no YaRN.
+    // ratio>0: original_seq_len=65536 + compress_rope_theta → YaRN on.
+    // q, kv, and inverse-o all consume this same `freqs` table.
     let freqs = precompute_rope_freqs(
         rope_dim,
-        /*original_seq_len=*/ 0,
+        rope_original_seq_len,
         rope_theta,
         PARENT_YARN_FACTOR,
         PARENT_YARN_BETA_FAST,
@@ -1748,7 +1792,7 @@ mod tests {
         };
         let out = attention_swa_ref_cfg(
             &x, &w, rows, 0, dim, n_heads, head_dim, rope_dim, q_lora, o_lora, o_groups,
-            window, 1e-6, 10_000.0,
+            window, 1e-6, /*rope_original_seq_len=*/ 0, 10_000.0,
         )
         .unwrap();
 
@@ -1840,10 +1884,185 @@ mod tests {
             1,
             4,
             1e-6,
+            /*rope_original_seq_len=*/ 0,
             10_000.0,
         )
         .unwrap_err();
         assert!(err.contains("start_pos"), "{err}");
         assert!(err.starts_with("deepseek4 parent:"), "{err}");
+    }
+
+    #[test]
+    fn attention_main_rope_policy_selects_tables() {
+        let (o0, t0) = attention_main_rope_policy(0).unwrap();
+        assert_eq!(o0, 0);
+        assert!((t0 - 10_000.0).abs() < 1e-12);
+
+        let (o4, t4) = attention_main_rope_policy(4).unwrap();
+        assert_eq!(o4, PARENT_YARN_ORIG_SEQ);
+        assert!((t4 - PARENT_COMPRESS_ROPE_THETA).abs() < 1e-12);
+
+        let (o128, t128) = attention_main_rope_policy(128).unwrap();
+        assert_eq!((o128, t128), (o4, t4));
+
+        let err = attention_main_rope_policy(7).unwrap_err();
+        assert!(err.contains("unsupported compress_ratio=7"), "{err}");
+
+        // Tables must differ enough that a swap is measurable at pos>0.
+        let plain = precompute_rope_freqs(PARENT_ROPE_DIM, o0, t0, PARENT_YARN_FACTOR, PARENT_YARN_BETA_FAST, PARENT_YARN_BETA_SLOW).unwrap();
+        let yarn = precompute_rope_freqs(PARENT_ROPE_DIM, o4, t4, PARENT_YARN_FACTOR, PARENT_YARN_BETA_FAST, PARENT_YARN_BETA_SLOW).unwrap();
+        assert_eq!(plain.len(), yarn.len());
+        let mut max_rel = 0.0f64;
+        for (a, b) in plain.iter().zip(yarn.iter()) {
+            let d = (a - b).abs() / a.abs().max(1e-30);
+            if d > max_rel {
+                max_rel = d;
+            }
+        }
+        assert!(
+            max_rel > 0.1,
+            "ratio-0 vs ratio>0 freq tables must differ substantially; max_rel={max_rel}"
+        );
+    }
+
+    #[test]
+    fn attention_swa_ref_ratio_gt0_rope_hand_differs_from_ratio0() {
+        // Same tiny geometry as the ratio-0 hand test. Only the RoPE policy
+        // changes. At position 0 the two tables agree (angle=0); at position 1
+        // the post-RoPE q/kv must diverge, proving the ratio>0 path consumed
+        // the YaRN table end-to-end on q, kv, and inverse-o.
+        let dim = 128usize;
+        let n_heads = 2usize;
+        let head_dim = 128usize;
+        let rope_dim = 64usize;
+        let q_lora = 128usize;
+        let o_lora = 128usize;
+        let o_groups = 1usize;
+        let window = 4usize;
+        let rows = 2usize;
+        let q_width = n_heads * head_dim;
+        let per_group_in = n_heads / o_groups * head_dim;
+        let wo_a_out = o_groups * o_lora;
+
+        let mut x = vec![0.0f32; rows * dim];
+        for r in 0..rows {
+            for d in 0..dim {
+                x[r * dim + d] = ((r * 3 + d) % 7) as f32 * 0.125 - 0.375;
+            }
+        }
+        let fill = |n: usize, seed: u32| -> Vec<f32> {
+            (0..n)
+                .map(|i| {
+                    let v = ((i as u32).wrapping_mul(1103515245).wrapping_add(seed)) % 17;
+                    (v as f32) * 0.0625 - 0.5
+                })
+                .collect()
+        };
+        let wq_a = fill(q_lora * dim, 1);
+        let wq_b = fill(q_width * q_lora, 2);
+        let wkv = fill(head_dim * dim, 3);
+        let wo_a = fill(wo_a_out * per_group_in, 4);
+        let wo_b = fill(dim * wo_a_out, 5);
+        let q_norm = vec![1.0f32; q_lora];
+        let kv_norm = vec![1.0f32; head_dim];
+        let attn_sink = vec![0.0f32; n_heads];
+        let w = AttnSwARefWeights {
+            wq_a: &wq_a,
+            wq_b: &wq_b,
+            wkv: &wkv,
+            wo_a: &wo_a,
+            wo_b: &wo_b,
+            q_norm: &q_norm,
+            kv_norm: &kv_norm,
+            attn_sink: &attn_sink,
+        };
+
+        let r0 = attention_swa_ref_cfg(
+            &x, &w, rows, 0, dim, n_heads, head_dim, rope_dim, q_lora, o_lora, o_groups,
+            window, 1e-6, 0, 10_000.0,
+        )
+        .unwrap();
+        let (orig, theta) = attention_main_rope_policy(4).unwrap();
+        let r4 = attention_swa_ref_cfg(
+            &x, &w, rows, 0, dim, n_heads, head_dim, rope_dim, q_lora, o_lora, o_groups,
+            window, 1e-6, orig, theta,
+        )
+        .unwrap();
+        // Production wrapper routes ratio through attention_main_rope_policy;
+        // covered by attention_main_rope_policy_selects_tables + the cfg path
+        // below (tiny shapes cannot use PARENT_DIM production constants).
+
+        // Pre-RoPE stages are ratio-independent.
+        assert_eq!(r0.q_post_wb, r4.q_post_wb);
+        assert_eq!(r0.q_post_head_rms, r4.q_post_head_rms);
+        assert_eq!(r0.kv_post_norm, r4.kv_post_norm);
+
+        // Row 0: angle=0 → RoPE is identity under both tables.
+        let mut row0_q = 0.0f32;
+        for i in 0..q_width {
+            row0_q = row0_q.max((r0.q_post_rope[i] - r4.q_post_rope[i]).abs());
+        }
+        assert!(row0_q < 1e-6, "row0 q_post_rope must match across tables; d={row0_q}");
+
+        // Row 1: tables disagree → post-RoPE q/kv must move.
+        let mut row1_q = 0.0f32;
+        for i in q_width..2 * q_width {
+            row1_q = row1_q.max((r0.q_post_rope[i] - r4.q_post_rope[i]).abs());
+        }
+        assert!(
+            row1_q > 1e-3,
+            "row1 q_post_rope must diverge under YaRN table; d={row1_q}"
+        );
+        let mut row1_kv = 0.0f32;
+        for i in head_dim..2 * head_dim {
+            row1_kv = row1_kv.max((r0.kv_post_rope[i] - r4.kv_post_rope[i]).abs());
+        }
+        assert!(
+            row1_kv > 1e-3,
+            "row1 kv_post_rope must diverge under YaRN table; d={row1_kv}"
+        );
+
+        // Inverse-RoPE path also uses the same table: attn_inv must differ on row1.
+        let mut row1_inv = 0.0f32;
+        for i in q_width..2 * q_width {
+            row1_inv = row1_inv.max((r0.attn_inv_rope[i] - r4.attn_inv_rope[i]).abs());
+        }
+        assert!(
+            row1_inv > 1e-4,
+            "row1 attn_inv_rope must diverge (inverse uses same table); d={row1_inv}"
+        );
+
+        // r4 cfg path is the production policy (orig/theta from attention_main_rope_policy(4)).
+        assert_eq!(orig, PARENT_YARN_ORIG_SEQ);
+        assert!((theta - PARENT_COMPRESS_ROPE_THETA).abs() < 1e-12);
+
+        // Hand-check one interleaved pair on row1 head0 under the YaRN table.
+        // q_post_head_rms → rotate by angle = 1 * freqs[0] on the first rope pair.
+        let freqs = precompute_rope_freqs(
+            rope_dim,
+            orig,
+            theta,
+            PARENT_YARN_FACTOR,
+            PARENT_YARN_BETA_FAST,
+            PARENT_YARN_BETA_SLOW,
+        )
+        .unwrap();
+        let tail_off = head_dim - rope_dim;
+        let base = q_width + tail_off; // row1, head0, first rope pair
+        let x0 = r4.q_post_head_rms[base] as f64;
+        let x1 = r4.q_post_head_rms[base + 1] as f64;
+        let (s, c) = (1.0f64 * freqs[0]).sin_cos();
+        let expect0 = (x0 * c - x1 * s) as f32;
+        let expect1 = (x0 * s + x1 * c) as f32;
+        assert!(
+            (r4.q_post_rope[base] - expect0).abs() < 1e-5,
+            "hand rope pair0 real: got={} expect={expect0}",
+            r4.q_post_rope[base]
+        );
+        assert!(
+            (r4.q_post_rope[base + 1] - expect1).abs() < 1e-5,
+            "hand rope pair0 imag: got={} expect={expect1}",
+            r4.q_post_rope[base + 1]
+        );
     }
 }
