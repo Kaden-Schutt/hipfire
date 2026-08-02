@@ -26,14 +26,18 @@
 //! GPU context — same rule as [`crate::backend`]'s `Mq2rBackend`, so a model
 //! swap cannot inherit parent-calibration policy.
 
+pub mod attention;
 pub mod codec;
+pub mod forward;
 pub mod gemm_ref;
+pub mod hc;
 pub mod inventory;
+pub mod layer_ref;
 pub mod linear;
 pub mod manifest;
+pub mod moe;
 pub mod plog;
 pub mod weights;
-
 
 use hipfire_runtime::model_source::ModelSource;
 use rdna_compute::Gpu;
