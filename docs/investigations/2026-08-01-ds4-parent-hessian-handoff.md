@@ -204,10 +204,12 @@ architecture flag. No Qwen-owned body changes.
 
 ## Required gate order
 
-1. **Inventory gate**: all 72,317 source tensors accounted for; every native
-   weight has exactly one valid scale companion; MTP is explicitly excluded.
-2. **Codec gate**: GPU E4M3/UE8M0 and E2M1/UE8M0 decode matches an independent
-   CPU oracle on fixed edge cases and sampled checkpoint values.
+1. **Inventory gate** — **PASSED 2026-08-02.** All 72,317 source tensors
+   accounted for; every native weight has exactly one valid scale companion;
+   MTP is explicitly excluded. See "Gate status" below.
+2. **Codec gate** — **PASSED 2026-08-02.** GPU E4M3/UE8M0 and E2M1/UE8M0
+   decode matches an independent CPU oracle on fixed edge cases and sampled
+   checkpoint values, bit for bit. See "Gate status" below.
 3. **Linear gate**: dense and expert matmul outputs match the checkpoint's
    bundled operator semantics on fixed inputs.
 4. **One-layer gate**: 16-token layer canary with finite state and logits.
@@ -224,6 +226,126 @@ architecture flag. No Qwen-owned body changes.
    and 32K tokens; stop when quant decisions and quality stabilize.
 9. **GPTQ**: only after gates 1--8, apply `gptq.rs` to original parent weights
    and compare RTN versus GPTQ against the saved parent logits.
+
+## Gate status (updated 2026-08-02)
+
+Gates 1 and 2 are closed. Gate 3 is the next work.
+
+### What landed
+
+Commit `f8b98f0a2` (branch `ds4-cdna-test-fail`) adds
+`crates/hipfire-arch-deepseek4/src/parent/`:
+
+| module | role |
+|---|---|
+| `mod.rs` | `Ds4ParentBackend` admission: `model_type=deepseek_v4`, `quant_method=fp8`, `fmt=e4m3`, `scale_fmt=ue8m0`, `weight_block_size=[128,128]`, `expert_dtype=fp4`, exact gfx942. No env override, no portable fallback. |
+| `inventory.rs` | Gate 1. Tensor accounting, scale pairing, dtype/shape contract, MTP exclusion. |
+| `codec.rs` | Gate 2 CPU oracle. E4M3/UE8M0/E2M1 codecs, dense 128x128 and expert per-32 dequant, bit-exact `fast_log2_ceil`/`fast_pow2`/`fast_round_scale` activation-quant reference. |
+| `manifest.rs` | The mandatory evidence manifest, with `validate()`. |
+| `plog.rs` | Gate 6's parent-logit container and KLD/PPL comparator. |
+
+Four new gfx942 kernels: `dequant_fp8_e4m3_ue8m0_blk128_to_bf16`,
+`dequant_fp4_e2m1_ue8m0_g32_to_bf16`, `act_quant_fp8_ue8m0_inplace`
+(block 128 at linears, 64 at the KV simulation sites), and
+`act_quant_fp4_ue8m0_g32_inplace`.
+
+Two executable gates:
+`examples/ds4_parent_inventory_gate.rs`, `examples/ds4_parent_codec_gate.rs`.
+
+### Gate 1 evidence
+
+Run on `mi300x` (gfx942) against `/mnt/scratch/models/DeepSeek-V4-Flash-0731`:
+
+- 72,317 tensors seen, `assert_complete(72317)` PASS, walk time 0.082 s.
+- 35,718 scale pairings verified; **zero** orphan scales, zero unquantized
+  tensors carrying a scale, zero non-expert `I8`, zero unknown dtypes.
+- Main tower 67,612 tensors / 145.301 GiB; 4,705 MTP tensors excluded.
+- Index SHA-256 `98efab455cf08dfbbbaaba6f570e1bf10bf927d2b4c3c453a59c2f6f0e3be92b`;
+  config SHA-256 `6c8f3d2d3b48707541b88f32f22ef3f0f8a6b57d8523281e2b8d3cdb0ae9a023`;
+  all 48 shard SHA-256s recorded in the emitted manifest.
+
+**VRAM residency projection (main tower, weights only):**
+
+| tier | treatment | GiB |
+|---|---|---:|
+| dense `F8_E4M3` | decoded to resident BF16 (2x stored) | 10.910 |
+| routed experts | `I8` + `F8_E8M0` left compressed | 137.062 |
+| `BF16` | as stored | 2.634 |
+| `F32` | as stored | 0.132 |
+| `I64` | as stored | 0.017 |
+| **total** | | **150.756** |
+
+Against a 192 GiB card that is **41.244 GiB of headroom**, so the parent
+forward fits with MTP excluded. This is weights only — KV, activations, and
+expert decode scratch come out of the headroom.
+
+### Gate 2 evidence
+
+`ds4_parent_codec_gate` on `mi300x` (gfx942): **13/13 PASS, exit 0.** Every
+comparison is **bit-exact** against the CPU oracle, not tolerance-based.
+
+- Dense FP8: exhaustive 256x256 (65,536 elements), ragged 260x300 (catches
+  `floor` where `ceil` is required, in both dimensions), NaN propagation for
+  scale byte `0xFF` and E4M3 `0x7F`/`0xFF`.
+- Expert FP4: exhaustive 64x512 (32,768 elements), explicit nibble-order
+  assertion.
+- Activation quant: FP8 at block 128 and 64, FP4 at group 32, including
+  power-of-two amax, just-above-power-of-two amax, values under the `1e-4`
+  and `6*2^-126` floors, all-zero groups, single outliers, and exact RNE
+  midpoints.
+- Real checkpoint samples: `layers.3.attn.wq_a.weight` (`F8_E4M3 [1024,4096]`)
+  decoded to min -0.117188 / max 0.117188 / mean -7e-6 / std 0.023066 /
+  0.001 % exact zeros; `layers.3.ffn.experts.0.w1.weight`
+  (`I8 [2048,2048]` logical `[2048,4096]`) to min -0.125 / max 0.125 /
+  mean 2.4e-5 / std 0.025293 / 12.77 % exact zeros. Both trained-looking; the
+  expert's zero fraction is expected given E2M1's zero codes.
+
+### Findings worth carrying forward
+
+1. **`__builtin_amdgcn_cvt_pk_fp8_f32` on gfx942 is FNUZ, not OCP.** Its max
+   finite magnitude is 240 and its NaN encoding is `0x80`; the parent
+   checkpoint uses OCP `float8_e4m3fn` with max 448. Using the hardware
+   builtin would have silently saturated every activation above 240 — a
+   quality bug no coherence check would catch. `act_quant_fp8_ue8m0_inplace`
+   therefore implements OCP RNE in software, cross-checked against
+   `__hip_cvt_float_to_fp8(v, __HIP_SATFINITE, __HIP_E4M3)` over 101 vectors
+   with zero mismatches.
+2. **E2M1 nibble order is low-nibble-first**, confirmed decisively by the
+   checkpoint's own packer at `inference/convert.py:30-33`
+   (`stack([low, high], dim=-1).flatten`), and again on real bytes in Gate 2.
+   Distributional evidence alone was *not* decisive here, because adjacent
+   logical positions share a 32-wide scale group, so swapping nibbles never
+   crosses a scale boundary.
+3. **`inference/convert.py::cast_e2m1fn_to_e4m3fn` is not the decode path.**
+   It is an opt-in FP4→FP8 re-packing utility selected by `main`'s
+   `expert_dtype` argument. This checkpoint declares `expert_dtype = fp4`, and
+   `model.py::linear()` consumes the FP4 weights directly through `fp4_gemm`
+   with their per-32 E8M0 scales. Do not let the `MAX_OFFSET_BITS = 6`
+   arithmetic in that function leak into the decoder.
+4. **The bundled reference cannot be executed.** `mi300x` has no torch, numpy,
+   safetensors, or tilelang. `parent::codec` is consequently the *only*
+   numerical cross-check that exists, which is why it is tested exhaustively
+   over all 256 E4M3 codes, all 256 UE8M0 bytes, and all 16 E2M1 codes rather
+   than spot-checked.
+5. **The parent checkpoint's tensor names already match hipfire's DS4 loader**
+   (`layers.{l}.attn.wq_a.weight`, `embed.weight`, ...). That is not a
+   coincidence: the on-disk checkpoint is post-`convert.py`, and `convert.py`'s
+   rename table produces exactly those names. No name mapping layer is needed
+   for Gate 3.
+6. `engine.rocm_path` in the emitted manifest reads `/opt/rocm-7.0.2`, not
+   `/opt/rocm/core-7.14`, because it reports what `hipfire_config::rocm::root()`
+   resolves. The kernels were compiled with `/opt/rocm/core-7.14/bin/hipcc`.
+   Both installs are present on the host; if the discrepancy matters for a
+   published result, pin `HIPFIRE_ROCM_PATH` before the producing run.
+
+### Not yet done
+
+Gates 3-9 are untouched. Specifically: no dense or expert matmul has been
+compared against the bundled operator semantics (Gate 3), no parent weights
+have been made resident, no parent forward exists, and no parent logits have
+been saved. The `.plog` comparator is written and unit-tested but has never
+consumed a real parent logit file, because none exists yet.
+
 
 ## Producer boundary
 

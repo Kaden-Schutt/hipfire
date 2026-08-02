@@ -153,3 +153,8 @@ redline/db/redline.db
 
 # Local research scratch (agent surveys, microbenches)
 .research/
+
+# Gate-run artifacts (parent-calibration manifests, gate logs). Regenerate
+# with examples/ds4_parent_{inventory,codec}_gate; the durable numbers live
+# in commit messages and docs/investigations/.
+out/
