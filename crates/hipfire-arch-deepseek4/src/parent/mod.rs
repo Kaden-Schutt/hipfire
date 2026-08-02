@@ -33,6 +33,7 @@ pub mod forward;
 pub mod gemm_ref;
 pub mod hc;
 pub mod head;
+pub mod hessian;
 pub mod indexer;
 pub mod inventory;
 pub mod layer_ref;

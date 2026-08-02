@@ -226,14 +226,18 @@ pub fn parent_model_forward(
         start_pos,
         logits,
         None,
+        None,
     )
 }
 
 /// Same as [`parent_model_forward`], appending per-layer HC-state L2 norms
-/// into `layer_norms` (one `f32` per loaded layer, in absolute layer order).
+/// into `layer_norms` and per-layer compress-event counts into
+/// `compress_events` (one entry per loaded layer, absolute layer order).
 ///
-/// `layer_norms` is cleared then filled. Cheap: one D2H reduction of the
-/// HC residual after each layer.
+/// Both output vecs are cleared then filled. `compress_events[i]` is the
+/// number of compressed positions the attention path actually consumed for
+/// that layer (from the executed compressor path), paired with the layer's
+/// `compress_ratio`. Cheap: one D2H residual reduction + one usize read.
 pub fn parent_model_forward_traced(
     gpu: &mut Gpu,
     backend: Ds4ParentBackend,
@@ -244,6 +248,7 @@ pub fn parent_model_forward_traced(
     start_pos: usize,
     logits: &GpuTensor,
     layer_norms: &mut Vec<f32>,
+    compress_events: &mut Vec<(usize /*ratio*/, usize /*events*/)>,
 ) -> Result<(), String> {
     parent_model_forward_inner(
         gpu,
@@ -255,6 +260,7 @@ pub fn parent_model_forward_traced(
         start_pos,
         logits,
         Some(layer_norms),
+        Some(compress_events),
     )
 }
 
@@ -268,6 +274,7 @@ fn parent_model_forward_inner(
     start_pos: usize,
     logits: &GpuTensor,
     mut layer_norms: Option<&mut Vec<f32>>,
+    mut compress_events: Option<&mut Vec<(usize, usize)>>,
 ) -> Result<(), String> {
     backend.ensure_device(gpu)?;
 
@@ -330,8 +337,13 @@ fn parent_model_forward_inner(
         norms.clear();
         norms.reserve(weights.layers.len());
     }
+    if let Some(events) = compress_events.as_mut() {
+        events.clear();
+        events.reserve(weights.layers.len());
+    }
 
     let mut use_a_as_input = true;
+    let want_trace = layer_norms.is_some() || compress_events.is_some();
     for (i, layer) in weights.layers.iter().enumerate() {
         let layer_idx = layer.layer_idx;
         let (x, out) = if use_a_as_input {
@@ -346,7 +358,7 @@ fn parent_model_forward_inner(
             None
         };
 
-        if layer_norms.is_some() {
+        if want_trace {
             let mut trace = ParentLayerTrace::default();
             parent_layer_forward_traced(
                 gpu,
@@ -366,9 +378,16 @@ fn parent_model_forward_inner(
             // Prefer the downloaded HC residual L2 over the in-trace stage
             // (hc_post_ffn) so the gate's stability series is the actual
             // residual that feeds the next layer / head.
-            let hc_l2 = stage_l2(gpu, out, rows * PARENT_HC_DIM)?;
-            if let Some(norms) = layer_norms.as_mut() {
-                norms.push(hc_l2);
+            if layer_norms.is_some() {
+                let hc_l2 = stage_l2(gpu, out, rows * PARENT_HC_DIM)?;
+                if let Some(norms) = layer_norms.as_mut() {
+                    norms.push(hc_l2);
+                }
+            }
+            if let Some(events) = compress_events.as_mut() {
+                let ratio = layer.compress_ratio;
+                let n = scratch.layer.attn_scratch().last_compress_events();
+                events.push((ratio, n));
             }
             let _ = trace; // stage norms available if a future gate wants them
         } else {
@@ -385,7 +404,7 @@ fn parent_model_forward_inner(
                 input_ids,
                 kv_ring,
                 out,
-                )?;
+            )?;
         }
 
         use_a_as_input = !use_a_as_input;
@@ -478,6 +497,56 @@ fn download_f32_prefix(gpu: &Gpu, t: &GpuTensor, nelems: usize) -> Result<Vec<f3
     Ok(host)
 }
 
+// ── Compress-event gate helper ──────────────────────────────────────────────
+
+/// Fail closed when any `ratio > 0` layer reports zero compress events while
+/// `floor(n_tokens / ratio) > 0`. The counts must come from the executed
+/// attention path ([`ParentAttnScratch::last_compress_events`]); this helper
+/// only asserts the contract.
+///
+/// Expected count for a prefill is
+/// [`crate::parent::compressor::compressor_prefill_n_out`] — used only as the
+/// acceptance target printed next to the observed count, never as a substitute
+/// for the counter.
+pub fn assert_compress_events(
+    events: &[(usize /*ratio*/, usize /*observed*/)],
+    n_tokens: usize,
+) -> Result<(), String> {
+    if events.is_empty() {
+        return Err(err(
+            "assert_compress_events: empty event list — nothing was measured",
+        ));
+    }
+    let mut failures: Vec<String> = Vec::new();
+    for (i, &(ratio, observed)) in events.iter().enumerate() {
+        if ratio == 0 {
+            if observed != 0 {
+                failures.push(format!(
+                    "layer {i}: ratio=0 but observed {observed} compress events"
+                ));
+            }
+            continue;
+        }
+        let expect = crate::parent::compressor::compressor_prefill_n_out(n_tokens, ratio);
+        if expect > 0 && observed == 0 {
+            failures.push(format!(
+                "layer {i}: ratio={ratio} expect>={expect} observed=0 \
+                 (SWA-only fallback; floor({n_tokens}/{ratio})={expect})"
+            ));
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(err(format!(
+            "compress-event assertion failed ({} layer(s)):\n  {}",
+            failures.len(),
+            failures.join("\n  ")
+        )))
+    }
+}
+
+
 // ── Host-side unit tests ────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -519,5 +588,48 @@ mod tests {
                 assert!(!final_is_a, "N={n} should end in hc_b");
             }
         }
+    }
+
+    #[test]
+    fn compress_events_pass_when_ratio_layers_fire() {
+        // 1024 tokens: ratio-128 → 8, ratio-4 → 256, ratio-0 → 0.
+        let events = vec![
+            (0, 0),
+            (0, 0),
+            (128, 8),
+            (4, 256),
+            (128, 8),
+            (0, 0),
+        ];
+        assert!(assert_compress_events(&events, 1024).is_ok());
+    }
+
+    #[test]
+    fn compress_events_fail_silent_zero_on_ratio_layer() {
+        // The Gate-5 bug: ratio-128 with 32 tokens still has floor(32/128)=0
+        // so it is NOT a failure (nothing to fire). At 1024 it is.
+        let short = vec![(128, 0)];
+        assert!(
+            assert_compress_events(&short, 32).is_ok(),
+            "floor(32/128)=0 → zero events is legitimate"
+        );
+        let long = vec![(128, 0)];
+        let err = assert_compress_events(&long, 1024).expect_err("must fail");
+        assert!(err.contains("ratio=128"), "{err}");
+        assert!(err.contains("observed=0"), "{err}");
+        assert!(err.starts_with("deepseek4 parent: "), "{err}");
+    }
+
+    #[test]
+    fn compress_events_empty_is_fail_closed() {
+        let err = assert_compress_events(&[], 1024).expect_err("empty");
+        assert!(err.contains("empty"), "{err}");
+    }
+
+    #[test]
+    fn compress_events_ratio_zero_must_stay_zero() {
+        let bad = vec![(0, 3)];
+        let err = assert_compress_events(&bad, 1024).expect_err("ratio0");
+        assert!(err.contains("ratio=0"), "{err}");
     }
 }

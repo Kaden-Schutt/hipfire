@@ -2,21 +2,30 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Gate 5 of the DS4 parent-checkpoint calibration path: full 43-layer
-//! forward of the ORIGINAL mixed-precision parent checkpoint over a fixed
-//! 32-token sequence, producing saved reference logits (`.plog`) and a
+//! Gate 5/6 of the DS4 parent-checkpoint calibration path: full 43-layer
+//! forward of the ORIGINAL mixed-precision parent checkpoint over a pinned
+//! token sequence, producing saved reference logits (`.plog`) and a
 //! provenance manifest for Gate 6.
 //!
 //! Usage:
 //! ```text
 //! ds4_parent_forward_gate --model /mnt/scratch/models/DeepSeek-V4-Flash-0731 \
-//!                         [--tokens 32] [--plog OUT.plog] [--manifest PATH] \
+//!                         [--tokens 32 | --token-ids tokens.bin] \
+//!                         [--plog OUT.plog] [--manifest PATH] \
 //!                         [--skip-shard-hashes]
 //! ```
+//!
+//! Prefer `--token-ids` (flat u32 LE from `ds4_tokenize_corpus`) for any
+//! promoted artifact. The PRNG path (`--tokens` alone) is smoke-only.
+//!
+//! Cross-process determinism: run
+//! `examples/ds4_parent_forward_gate_determinism.sh` (two separate processes,
+//! compare `logits_sha256`).
 //!
 //! Must run on gfx942 (mi300x).
 
 use hipfire_arch_deepseek4::parent::attention::{PARENT_DIM, PARENT_HEAD_DIM};
+use hipfire_arch_deepseek4::parent::compressor::compressor_prefill_n_out;
 use hipfire_arch_deepseek4::parent::forward::PARENT_HC_MULT;
 use hipfire_arch_deepseek4::parent::head::{
     parent_logits_to_plog, PARENT_HC_DIM, PARENT_VOCAB,
@@ -27,7 +36,7 @@ use hipfire_arch_deepseek4::parent::manifest::{
     OutputInfo, OutputKind, ParentManifest, ShardInfo, SourceInfo, MANIFEST_SCHEMA,
 };
 use hipfire_arch_deepseek4::parent::model::{
-    parent_model_forward, parent_model_forward_traced, ParentModelScratch,
+    assert_compress_events, parent_model_forward, parent_model_forward_traced, ParentModelScratch,
 };
 use hipfire_arch_deepseek4::parent::plog::PlogWriter;
 use hipfire_arch_deepseek4::parent::weights::{ParentLoadPlan, ParentWeights};
@@ -86,15 +95,57 @@ fn run() -> Result<bool, String> {
             model_path.display()
         ));
     }
-    let n_tokens = args.tokens;
+
+    // ── Token sequence (prefer pinned --token-ids) ──────────────────────
+    let (token_ids, token_source_desc, promoted_input) = if let Some(tid) = &args.token_ids {
+        let ids = read_token_ids_file(tid)?;
+        if ids.is_empty() {
+            return Err(format!(
+                "deepseek4 parent: --token-ids {} is empty",
+                tid.display()
+            ));
+        }
+        // Optional --tokens truncates a longer file (never pads).
+        let ids = if args.tokens_explicit && args.tokens < ids.len() {
+            ids[..args.tokens].to_vec()
+        } else if args.tokens_explicit && args.tokens > ids.len() {
+            return Err(format!(
+                "deepseek4 parent: --tokens {} exceeds token-ids length {}",
+                args.tokens,
+                ids.len()
+            ));
+        } else {
+            ids
+        };
+        let desc = format!("token-ids file {}", tid.display());
+        (ids, desc, true)
+    } else {
+        let n = args.tokens;
+        if n == 0 {
+            return Err("deepseek4 parent: --tokens must be > 0".into());
+        }
+        let ids = select_token_ids(TOKEN_SEED, n);
+        let desc = format!(
+            "PRNG smoke sequence seed={TOKEN_SEED:#x} (NOT for promoted artifacts)"
+        );
+        (ids, desc, false)
+    };
+    let n_tokens = token_ids.len();
     if n_tokens == 0 {
-        return Err("deepseek4 parent: --tokens must be > 0".into());
+        return Err("deepseek4 parent: token sequence is empty".into());
     }
 
-    println!("=== ds4_parent_forward_gate (Gate 5) ===");
+    println!("=== ds4_parent_forward_gate (Gate 5/6) ===");
     println!("model: {}", model_path.display());
-    println!("tokens: {n_tokens}  token_seed: {TOKEN_SEED:#x}");
+    println!("tokens: {n_tokens}");
+    println!("token_source: {token_source_desc}");
+    println!("promoted_input: {promoted_input}");
     println!("skip_shard_hashes: {}", args.skip_shard_hashes);
+    if args.skip_shard_hashes && promoted_input {
+        eprintln!(
+            "WARN: --skip-shard-hashes with --token-ids: promoted artifacts require real shard hashes"
+        );
+    }
     if let Some(p) = args.plog.as_ref() {
         println!("plog: {}", p.display());
     }
@@ -202,16 +253,28 @@ fn run() -> Result<bool, String> {
         }
     }
 
-    // ── 2. Fixed token sequence ─────────────────────────────────────────
-    let token_ids = select_token_ids(TOKEN_SEED, n_tokens);
-    print!("token_ids[{n_tokens}] = [");
-    for (i, &t) in token_ids.iter().enumerate() {
+    // ── 2. Token ids (already loaded above) ─────────────────────────────
+    // Print a short prefix/suffix for provenance; full dump is noisy at 1024.
+    let preview_n = n_tokens.min(16);
+    print!("token_ids first[{preview_n}] = [");
+    for (i, &t) in token_ids.iter().take(preview_n).enumerate() {
         if i > 0 {
             print!(", ");
         }
         print!("{t}");
     }
     println!("]");
+    if n_tokens > preview_n {
+        print!("token_ids last[{preview_n}] = [");
+        let start = n_tokens - preview_n;
+        for (i, &t) in token_ids[start..].iter().enumerate() {
+            if i > 0 {
+                print!(", ");
+            }
+            print!("{t}");
+        }
+        println!("]");
+    }
     let token_ids_sha = sha256_bytes(u32_slice_as_le_bytes(&token_ids));
     println!("token_ids_sha256 = {token_ids_sha}");
 
@@ -249,6 +312,7 @@ fn run() -> Result<bool, String> {
 
     // ── 4. Traced full forward ──────────────────────────────────────────
     let mut layer_norms: Vec<f32> = Vec::new();
+    let mut compress_events: Vec<(usize, usize)> = Vec::new();
     let fwd_t0 = Instant::now();
     let fwd_result = parent_model_forward_traced(
         &mut gpu,
@@ -260,6 +324,7 @@ fn run() -> Result<bool, String> {
         /* start_pos */ 0,
         &logits,
         &mut layer_norms,
+        &mut compress_events,
     );
     // Drain device errors so a mid-stack refusal surfaces cleanly.
     let _ = gpu.hip.device_synchronize();
@@ -299,6 +364,114 @@ fn run() -> Result<bool, String> {
         }
     }
 
+    // ── 4b. Per-layer compress-event table ──────────────────────────────
+    println!();
+    println!("=== per-layer compress events ===");
+    println!(
+        "  {:>5}  {:>5}  {:>8}  {:>8}  {}",
+        "layer", "ratio", "observed", "expect", "status"
+    );
+    if compress_events.is_empty() {
+        println!("  (none — forward did not complete)");
+        checks.push(CheckRow {
+            name: "compress_events".into(),
+            pass: false,
+            detail: "empty".into(),
+        });
+    } else {
+        let mut n_ratio0 = 0usize;
+        let mut n_ratio4 = 0usize;
+        let mut n_ratio128 = 0usize;
+        let mut n_zero_fire = 0usize;
+        for (i, &(ratio, observed)) in compress_events.iter().enumerate() {
+            let expect = if ratio == 0 {
+                0
+            } else {
+                compressor_prefill_n_out(n_tokens, ratio)
+            };
+            let status = if ratio == 0 {
+                n_ratio0 += 1;
+                if observed == 0 {
+                    "ok"
+                } else {
+                    "BAD"
+                }
+            } else {
+                if ratio == 4 {
+                    n_ratio4 += 1;
+                } else if ratio == 128 {
+                    n_ratio128 += 1;
+                }
+                if expect > 0 && observed == 0 {
+                    n_zero_fire += 1;
+                    "FAIL-ZERO"
+                } else if observed == expect {
+                    "ok"
+                } else {
+                    "MISMATCH"
+                }
+            };
+            // Always print ratio-128 rows + any non-ok row; summarize the rest.
+            if ratio == 128 || status != "ok" || n_tokens <= 64 {
+                println!(
+                    "  {i:>5}  {ratio:>5}  {observed:>8}  {expect:>8}  {status}"
+                );
+            }
+        }
+        println!(
+            "  summary: layers={}  ratio0={n_ratio0}  ratio4={n_ratio4}  \
+             ratio128={n_ratio128}  zero_fire={n_zero_fire}",
+            compress_events.len()
+        );
+        // Full table dump for ratio-4 summary stats too.
+        let r4_obs: Vec<usize> = compress_events
+            .iter()
+            .filter_map(|&(r, o)| if r == 4 { Some(o) } else { None })
+            .collect();
+        let r128_obs: Vec<usize> = compress_events
+            .iter()
+            .filter_map(|&(r, o)| if r == 128 { Some(o) } else { None })
+            .collect();
+        if !r4_obs.is_empty() {
+            let min = *r4_obs.iter().min().unwrap();
+            let max = *r4_obs.iter().max().unwrap();
+            println!(
+                "  ratio-4 observed: n={} min={min} max={max} expect={}",
+                r4_obs.len(),
+                compressor_prefill_n_out(n_tokens, 4)
+            );
+        }
+        if !r128_obs.is_empty() {
+            let min = *r128_obs.iter().min().unwrap();
+            let max = *r128_obs.iter().max().unwrap();
+            println!(
+                "  ratio-128 observed: n={} min={min} max={max} expect={}",
+                r128_obs.len(),
+                compressor_prefill_n_out(n_tokens, 128)
+            );
+        }
+        match assert_compress_events(&compress_events, n_tokens) {
+            Ok(()) => {
+                checks.push(CheckRow {
+                    name: "compress_events".into(),
+                    pass: true,
+                    detail: format!(
+                        "{} layers; no silent zero-fire on ratio>0",
+                        compress_events.len()
+                    ),
+                });
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                checks.push(CheckRow {
+                    name: "compress_events".into(),
+                    pass: false,
+                    detail: e,
+                });
+            }
+        }
+    }
+
     // If blocked, report which layers are ratio-0 (runnable without sibling).
     if blocked_on_sibling {
         let ratio0: Vec<usize> = (0..cfg.num_hidden_layers)
@@ -310,12 +483,7 @@ fn run() -> Result<bool, String> {
             ratio0.len(),
             cfg.num_hidden_layers
         );
-        println!(
-            "partial ratio-0-only forward not driven here: ParentModelScratch does not \
-             expose &mut layer scratch, and parent_model_forward runs the full loaded \
-             range. Sibling AttnCompIdx must lift the refusal for Gate 5 to complete."
-        );
-        let _ = &mut scratch; // keep scratch live for later free / drop
+        let _ = &mut scratch;
         let _ = &logits;
     }
 
@@ -354,13 +522,26 @@ fn run() -> Result<bool, String> {
              nan={n_nan} inf={n_inf}  nelems={}",
             logits_host.len()
         );
-        println!("argmax per position:");
+        // Cap argmax dump: full dump at ≤64 tokens, else first/last 8.
+        let dump_positions: Vec<usize> = if n_tokens <= 64 {
+            (0..n_tokens).collect()
+        } else {
+            let mut v: Vec<usize> = (0..8).collect();
+            v.extend((n_tokens - 8)..n_tokens);
+            v
+        };
+        println!("argmax per position ({} shown of {n_tokens}):", dump_positions.len());
+        for &r in &dump_positions {
+            let row = &logits_host[r * PARENT_VOCAB..(r + 1) * PARENT_VOCAB];
+            let (idx, val) = argmax(row);
+            // Still fill all argmax_ids for decode.
+            println!("  pos {r:>4}: token={idx}  logit={val:.4}");
+        }
         for r in 0..n_tokens {
             let row = &logits_host[r * PARENT_VOCAB..(r + 1) * PARENT_VOCAB];
             let (idx, val) = argmax(row);
             argmax_ids.push(idx as u32);
             argmax_vals.push(val);
-            println!("  pos {r:>2}: token={idx}  logit={val:.4}");
         }
         let finite_ok = n_nan == 0 && n_inf == 0;
         checks.push(CheckRow {
@@ -666,8 +847,8 @@ fn run() -> Result<bool, String> {
                 token_ids_sha256: token_ids_sha.clone(),
                 n_tokens,
                 description: format!(
-                    "Gate 5 fixed {n_tokens}-token sequence; seed={TOKEN_SEED:#x}; \
-                     ids={token_ids:?}"
+                    "Gate 6 parent baseline: {n_tokens} tokens from {token_source_desc}; \
+                     promoted_input={promoted_input}"
                 ),
             };
             let outputs = vec![OutputInfo {
@@ -728,8 +909,8 @@ fn run() -> Result<bool, String> {
                 token_ids_sha256: token_ids_sha.clone(),
                 n_tokens,
                 description: format!(
-                    "Gate 5 fixed {n_tokens}-token sequence; seed={TOKEN_SEED:#x}; \
-                     ids={token_ids:?} (no plog emitted)"
+                    "Gate 6 parent baseline: {n_tokens} tokens from {token_source_desc}; \
+                     promoted_input={promoted_input} (no plog emitted)"
                 ),
             };
             // validate() forbids outputs without corpus and forbids corpus-
@@ -815,9 +996,9 @@ fn run() -> Result<bool, String> {
         return Ok(false);
     }
     if all_pass {
-        println!("GATE 5: PASS");
+        println!("GATE 5/6: PASS");
     } else {
-        println!("GATE 5: FAIL");
+        println!("GATE 5/6: FAIL");
     }
     Ok(all_pass)
 }
@@ -998,6 +1179,29 @@ fn select_token_ids(seed: u64, n: usize) -> Vec<u32> {
     out
 }
 
+/// Load flat u32 LE token-ids file produced by `ds4_tokenize_corpus`.
+fn read_token_ids_file(path: &Path) -> Result<Vec<u32>, String> {
+    let bytes = std::fs::read(path).map_err(|e| {
+        format!(
+            "deepseek4 parent: read token-ids {}: {e}",
+            path.display()
+        )
+    })?;
+    if bytes.len() % 4 != 0 {
+        return Err(format!(
+            "deepseek4 parent: token-ids file {} has {} bytes (not a multiple of 4)",
+            path.display(),
+            bytes.len()
+        ));
+    }
+    let n = bytes.len() / 4;
+    let mut out = Vec::with_capacity(n);
+    for chunk in bytes.chunks_exact(4) {
+        out.push(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+    }
+    Ok(out)
+}
+
 // ── IO helpers ──────────────────────────────────────────────────────────────
 
 fn zeros_f32(gpu: &mut Gpu, shape: &[usize]) -> Result<GpuTensor, String> {
@@ -1050,6 +1254,10 @@ fn u32_slice_as_le_bytes(v: &[u32]) -> &[u8] {
 struct Args {
     model: String,
     tokens: usize,
+    /// True when the user passed `--tokens` explicitly (allows truncating
+    /// a longer `--token-ids` file).
+    tokens_explicit: bool,
+    token_ids: Option<PathBuf>,
     plog: Option<PathBuf>,
     manifest: Option<PathBuf>,
     skip_shard_hashes: bool,
@@ -1058,6 +1266,8 @@ struct Args {
 fn parse_args() -> Result<Args, String> {
     let mut model: Option<String> = None;
     let mut tokens = DEFAULT_TOKENS;
+    let mut tokens_explicit = false;
+    let mut token_ids: Option<PathBuf> = None;
     let mut plog: Option<PathBuf> = None;
     let mut manifest: Option<PathBuf> = None;
     let mut skip_shard_hashes = false;
@@ -1079,6 +1289,13 @@ fn parse_args() -> Result<Args, String> {
                 if tokens == 0 {
                     return Err("--tokens must be > 0".into());
                 }
+                tokens_explicit = true;
+            }
+            "--token-ids" => {
+                let p = args
+                    .next()
+                    .ok_or_else(|| "flag --token-ids missing value".to_string())?;
+                token_ids = Some(PathBuf::from(p));
             }
             "--plog" => {
                 let p = args
@@ -1096,8 +1313,10 @@ fn parse_args() -> Result<Args, String> {
             "-h" | "--help" => {
                 eprintln!(
                     "usage: ds4_parent_forward_gate --model <dir> \
-                     [--tokens 32] [--plog OUT.plog] [--manifest out/manifest.json] \
-                     [--skip-shard-hashes]"
+                     [--tokens 32 | --token-ids FILE] [--plog OUT.plog] \
+                     [--manifest out/manifest.json] [--skip-shard-hashes]\n\
+                     Prefer --token-ids (flat u32 LE from ds4_tokenize_corpus) \
+                     for any promoted artifact."
                 );
                 std::process::exit(0);
             }
@@ -1109,6 +1328,8 @@ fn parse_args() -> Result<Args, String> {
     Ok(Args {
         model,
         tokens,
+        tokens_explicit,
+        token_ids,
         plog,
         manifest,
         skip_shard_hashes,

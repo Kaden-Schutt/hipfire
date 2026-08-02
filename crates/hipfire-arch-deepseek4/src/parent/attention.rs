@@ -132,6 +132,11 @@ pub struct ParentAttnScratch {
     indexer: ParentIndexerScratch,
     max_rows: usize,
     max_n_compressed: usize,
+    /// Compressed positions actually produced by the main compressor on the
+    /// most recent [`parent_attention_swa`] call. Zero for pure-SWA layers
+    /// and for ratio>0 calls that emitted no compress event. Set from the
+    /// executed compress path — never recomputed by callers from the formula.
+    last_compress_events: usize,
     bytes: usize,
 }
 
@@ -389,6 +394,7 @@ impl ParentAttnScratch {
             indexer,
             max_rows,
             max_n_compressed,
+            last_compress_events: 0,
             bytes,
         })
     }
@@ -459,6 +465,16 @@ impl ParentAttnScratch {
     /// Per-row gathered top-k KV `[max_rows, head_dim, index_topk]` (diagnostic).
     pub fn topk_staged_ref(&self) -> &GpuTensor {
         &self.topk_staged
+    }
+
+    /// Compressed positions consumed by the last attention call (diagnostic).
+    pub fn last_compress_events(&self) -> usize {
+        self.last_compress_events
+    }
+
+    /// Reset the compress-event counter (tests / explicit reuse).
+    pub fn clear_compress_events(&mut self) {
+        self.last_compress_events = 0;
     }
 
 }
@@ -876,6 +892,9 @@ pub fn parent_attention_swa(
 ) -> Result<(), String> {
     backend.ensure_device(gpu)?;
 
+    // Fresh counter every call so a silent zero-fire cannot inherit a prior hit.
+    scratch.last_compress_events = 0;
+
     let ratio = layer.compress_ratio;
     let cfg_ratio = cfg.compress_ratio(layer.layer_idx);
     if ratio != cfg_ratio {
@@ -1078,7 +1097,7 @@ pub fn parent_attention_swa(
             ratio,
         )?;
     } else {
-        // Pure SWA: zero active top-k so a mixed kernel would see n_active=0.
+        // Pure SWA: zero active top-k; compress counter already cleared above.
         let zeros = vec![0i32; rows];
         upload_i32_prefix(gpu, &scratch.n_active_topk, &zeros, rows)?;
     }
@@ -1251,6 +1270,8 @@ fn run_mixed_attn_compress_and_gather(
         )
         .map_err(|e| format!("deepseek4 parent: main compressor: {e}"))?;
     }
+    // Record what this path actually produced (not a post-hoc formula).
+    scratch.last_compress_events = n_compressed;
 
     // Per-row active top-k counts + gather into topk_staged.
     let topk_max = PARENT_ATTN_INDEX_TOPK;
