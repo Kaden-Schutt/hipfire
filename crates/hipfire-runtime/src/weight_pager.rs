@@ -128,6 +128,31 @@ pub enum NormKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TransferHandle(u64);
 
+/// Bounds check for [`Transport::fetch_into`], factored out so the arithmetic
+/// is testable without a GPU.
+///
+/// This is the check that stops a cache-slot write from spilling into the
+/// NEIGHBOURING expert's bytes. That failure mode would not crash — it would
+/// silently corrupt a different expert's weights and show up only as degraded
+/// output, which is precisely the class of bug expert paging must not
+/// introduce. Hence: verify before any I/O, and fail closed.
+pub fn check_fetch_into_bounds(
+    dst_bytes: usize,
+    dst_byte_offset: usize,
+    len: usize,
+) -> Result<(), String> {
+    let end = dst_byte_offset
+        .checked_add(len)
+        .ok_or_else(|| format!("fetch_into: offset {dst_byte_offset} + len {len} overflows"))?;
+    if end > dst_bytes {
+        return Err(format!(
+            "fetch_into: write of {len} B at offset {dst_byte_offset} \
+             exceeds destination of {dst_bytes} B"
+        ));
+    }
+    Ok(())
+}
+
 /// Abstraction over how the pager moves bytes from host storage to VRAM.
 ///
 /// **This is the migration seam for the NVMe→VRAM DMA future.** Today's impl
@@ -153,6 +178,22 @@ pub trait Transport: Send {
         len: usize,
         gpu: &mut Gpu,
     ) -> HipResult<(GpuTensor, TransferHandle)>;
+
+    /// Read `len` bytes from `hfq_offset` directly into an EXISTING device
+    /// buffer at `dst_byte_offset`.
+    ///
+    /// Unlike [`Transport::fetch`] this allocates nothing. That is what lets a
+    /// pager guarantee it never calls an allocator after load: a cache miss
+    /// reuses a slot it already owns, so there is no path from a miss to an
+    /// allocation failure — and, on a swapless box, no path to an OOM kill.
+    fn fetch_into(
+        &mut self,
+        hfq_offset: usize,
+        len: usize,
+        dst: &GpuTensor,
+        dst_byte_offset: usize,
+        gpu: &mut Gpu,
+    ) -> HipResult<TransferHandle>;
 
     /// Block until every handle in `handles` has completed. v0.1 no-op
     /// because `fetch` is synchronous; defined for forward compatibility.
@@ -275,6 +316,33 @@ impl Transport for PreadH2DTransport {
         //    — that interpretation belongs to `WeightTensor` at the call site.
         let tensor = gpu.upload_raw(&self.staging[..len], &[len])?;
         Ok((tensor, self.next_handle()))
+    }
+
+    fn fetch_into(
+        &mut self,
+        hfq_offset: usize,
+        len: usize,
+        dst: &GpuTensor,
+        dst_byte_offset: usize,
+        gpu: &mut Gpu,
+    ) -> HipResult<TransferHandle> {
+        // Bounds-check against the destination BEFORE any I/O. Writing past a
+        // slot would corrupt the neighbouring expert's weights — a silent
+        // quality regression rather than a crash — so fail closed here.
+        check_fetch_into_bounds(dst.byte_size(), dst_byte_offset, len)
+            .map_err(|m| hip_bridge::HipError::new(0, &m))?;
+        // 1. Host: pread into the staging buffer (same path as `fetch`).
+        self.pread_into_staging(hfq_offset, len).map_err(|e| {
+            hip_bridge::HipError::new(
+                0,
+                &format!("pread {len} bytes at offset {hfq_offset}: {e}"),
+            )
+        })?;
+        // 2. GPU: copy into the caller's existing buffer. No allocation.
+        gpu.bind_thread()?;
+        gpu.hip
+            .memcpy_htod_offset(&dst.buf, dst_byte_offset, &self.staging[..len])?;
+        Ok(self.next_handle())
     }
 
     fn wait(&mut self, _handles: &[TransferHandle]) -> HipResult<()> {
@@ -708,6 +776,42 @@ pub fn open_hfq(path: &Path) -> std::io::Result<HfqFile> {
 
 #[cfg(test)]
 mod tests {
+    use super::check_fetch_into_bounds;
+
+    #[test]
+    fn fetch_into_bounds_accepts_an_exact_fit() {
+        // A slot write that ends exactly at the buffer end is legal.
+        assert!(check_fetch_into_bounds(2_359_296 * 4, 2_359_296 * 3, 2_359_296).is_ok());
+    }
+
+    #[test]
+    fn fetch_into_bounds_accepts_slot_zero() {
+        assert!(check_fetch_into_bounds(2_359_296, 0, 2_359_296).is_ok());
+    }
+
+    #[test]
+    fn fetch_into_bounds_rejects_a_write_past_the_end() {
+        // One byte too far: would corrupt whatever follows the pool.
+        let err = check_fetch_into_bounds(2_359_296 * 4, 2_359_296 * 3, 2_359_296 + 1)
+            .expect_err("must reject");
+        assert!(err.contains("exceeds destination"), "got {err}");
+    }
+
+    #[test]
+    fn fetch_into_bounds_rejects_an_off_by_one_slot_index() {
+        // Slot 4 in a 4-slot pool: the classic off-by-one, which would write
+        // into the next blob rather than erroring.
+        let stride = 2_359_296usize;
+        let err = check_fetch_into_bounds(stride * 4, stride * 4, stride).expect_err("must reject");
+        assert!(err.contains("exceeds destination"), "got {err}");
+    }
+
+    #[test]
+    fn fetch_into_bounds_rejects_overflowing_arithmetic() {
+        let err = check_fetch_into_bounds(1024, usize::MAX, 4096).expect_err("must reject");
+        assert!(err.contains("overflows"), "got {err}");
+    }
+
     use super::*;
     use std::io::Write;
 
