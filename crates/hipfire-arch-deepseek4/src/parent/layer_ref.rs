@@ -357,7 +357,29 @@ pub fn hc_pre_ref(
 /// `x` `[rows, dim]`, `residual` `[rows, hc, dim]`, `post` `[rows, hc]`,
 /// `comb` `[rows, hc, hc]` → `y` `[rows, hc, dim]`.
 ///
-/// `y[r,h,d] = post[r,h] * x[r,d] + sum_k comb[r,h,k] * residual[r,k,d]`
+/// `y[r,h,d] = post[r,h] * x[r,d] + sum_k comb[r,k,h] * residual[r,k,d]`
+///
+/// # Contraction axis
+///
+/// The reference is
+/// `torch.sum(comb.unsqueeze(-1) * residual.unsqueeze(-2), dim=2)`. Broadcasting
+/// gives `comb[A,B] * residual[A,d]` and `dim=2` sums over `A`, the **first**
+/// `hc` axis of `comb`:
+///
+/// ```text
+/// y[B,d] = sum_A comb[A][B] * residual[A,d]
+/// ```
+///
+/// This is a *column* contraction, and it is load-bearing rather than a
+/// convention: `hc_split_sinkhorn` (`kernel.py:401-423`) ends its loop on
+/// `comb / comb.sum(-2)`, so the **columns** sum to 1. Summing over `A` is
+/// therefore norm-preserving, while contracting the other axis picks up the row
+/// sums — which are not 1 — and amplifies the residual on every layer.
+///
+/// This originally contracted `comb[r,h,k]`, the transpose. Both this reference
+/// and the GPU path shared the error, so every HC oracle comparison agreed to
+/// ~1e-7 while the composed forward was badly wrong (PPL 163.89 against 14.70
+/// for a 2-bit quant of the same checkpoint).
 pub fn hc_post_ref(
     x: &[f32],
     residual: &[f32],
@@ -380,7 +402,7 @@ pub fn hc_post_ref(
             for d in 0..dim {
                 let mut s = post_h * (x[r * dim + d] as f64);
                 for k in 0..hc_mult {
-                    let c = comb[r * hc_mult * hc_mult + h * hc_mult + k] as f64;
+                    let c = comb[r * hc_mult * hc_mult + k * hc_mult + h] as f64;
                     let res = residual[r * hc_mult * dim + k * dim + d] as f64;
                     s += c * res;
                 }

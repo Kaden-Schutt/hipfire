@@ -370,8 +370,37 @@ pub fn parent_hc_pre(
 /// `x` `[rows, dim]`, residual `[rows, hc, dim]`, post `[rows, hc]`,
 /// comb `[rows, hc, hc]` → `out` `[rows, hc, dim]`.
 ///
-/// Uses `hc_mix_4stream_batched`:
-/// `out[b,s,d] = sum_t comb[b,s,t] * residual[b,t,d] + post[b,s] * x[b,d]`.
+/// `comb` is in **reference orientation** throughout the parent, matching
+/// `hc_post_ref` and `model.py`:
+///
+/// ```text
+/// out[r,B,d] = post[r,B] * x[r,d] + sum_A comb[r,A,B] * residual[r,A,d]
+/// ```
+///
+/// # Why this transposes before dispatch
+///
+/// The reference contracts the **first** hc axis of `comb`: `model.py:692` is
+/// `sum(comb.unsqueeze(-1) * residual.unsqueeze(-2), dim=2)`, which broadcasts
+/// to `comb[A,B] * residual[A,d]` and sums over `A`.
+///
+/// `hc_mix_4stream_batched` contracts the **second** — it reads
+/// `A[stream_out * HC_MULT + s_in]` and computes
+/// `out[h,d] = sum_k A[h][k] * x_in[k,d]`. So the kernel wants `comb^T`.
+/// Production reaches the same kernel with its comb already in that
+/// orientation; the standalone parent builds comb per `model.py` and converts
+/// here, at the one boundary where the kernel's convention applies.
+///
+/// The axis is load-bearing, not a naming convention. `hc_split_sinkhorn` ends
+/// its loop on `comb / comb.sum(-2)` (`kernel.py:420-423`), so the **columns**
+/// sum to 1: contracting `A` is norm-preserving, while contracting the other
+/// axis weights the residual by row sums, which are not 1, and amplifies it on
+/// every layer.
+///
+/// Both this path and `hc_post_ref` originally contracted the second axis, so
+/// every HC oracle agreed to ~1e-7 while the composed forward was badly wrong —
+/// the parent's residual grew 1278x over 43 layers (geo mean 1.186/layer)
+/// against production's 91.8x (1.114/layer), and PPL sat at 163.89 against
+/// 14.70 for a 2-bit quantization of the same checkpoint.
 pub fn parent_hc_post(
     gpu: &mut Gpu,
     backend: Ds4ParentBackend,
@@ -404,16 +433,35 @@ pub fn parent_hc_post(
     require_elems(comb, rows * hc_mult * hc_mult, "hc_post comb")?;
     require_elems(out, rows * hc_mult * dim, "hc_post out")?;
 
-    gpu.hc_mix_4stream_batched(
+    // comb (reference orientation) -> comb^T (kernel orientation). 4x4 per row,
+    // so this is 16 floats per row; the parent favors an explicit conversion at
+    // the boundary over giving `comb` two meanings.
+    let mut ct = gpu
+        .download_f32(comb)
+        .map_err(|e| err(format!("hc_post download comb: {e:?}")))?;
+    for r in 0..rows {
+        let b = r * hc_mult * hc_mult;
+        for i in 0..hc_mult {
+            for j in (i + 1)..hc_mult {
+                ct.swap(b + i * hc_mult + j, b + j * hc_mult + i);
+            }
+        }
+    }
+    let comb_t = gpu
+        .upload_f32(&ct, &[rows, hc_mult, hc_mult])
+        .map_err(|e| err(format!("hc_post upload comb^T: {e:?}")))?;
+
+    let mix = gpu.hc_mix_4stream_batched(
         residual,
-        comb,
+        &comb_t,
         post,
         x,
         out,
         dim as i32,
         rows as i32,
-    )
-    .map_err(|e| err(format!("hc_mix_4stream_batched: {e:?}")))
+    );
+    free_scratch(gpu, comb_t);
+    mix.map_err(|e| err(format!("hc_mix_4stream_batched: {e:?}")))
 }
 
 /// `Block.hc_head` — plain sigmoid path, **no** sinkhorn. Output head only.
