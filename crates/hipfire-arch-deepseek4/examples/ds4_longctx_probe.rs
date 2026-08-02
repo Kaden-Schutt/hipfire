@@ -322,7 +322,32 @@ fn run() -> Result<(), String> {
         print_vram("prefill_done", &gpu, &mut peak)?;
         Some(scratch)
     } else {
+        // Materialize every lazy buffer at a real position-0 boundary before
+        // jumping to the requested synthetic position. Several DS4 scratch
+        // views are initialized by the first forward and cannot safely be
+        // created for the first time at an arbitrary absolute position.
+        state.n_tokens = 0;
+        let bootstrap = match decode_step(
+            &cfg,
+            &weights,
+            &mut state,
+            &mut gpu,
+            next_token,
+            0,
+        ) {
+            Ok(logits) => logits,
+            Err(error) => {
+                let _ = print_vram("bootstrap_failure", &gpu, &mut peak);
+                return Err(format!("synthetic bootstrap cap={}: {error}", args.cap));
+            }
+        };
+        gpu.hip
+            .device_synchronize()
+            .map_err(|e| format!("bootstrap sync: {e:?}"))?;
+        next_token = argmax(&bootstrap);
+        print_vram("synthetic_bootstrap", &gpu, &mut peak)?;
         state.n_tokens = current_pos as u64;
+        println!("SYNTHETIC_JUMP from_position=1 to_position={current_pos}");
         None
     };
 
@@ -345,15 +370,23 @@ fn run() -> Result<(), String> {
 
     // One untimed decode materializes all lazy state and cache allocations.
     let warm_start = Instant::now();
-    let warm_logits = decode_step(
+    let warm_logits = match decode_step(
         &cfg,
         &weights,
         &mut state,
         &mut gpu,
         next_token,
         current_pos as u32,
-    )
-    .map_err(|e| format!("decode warmup cap={} pos={current_pos}: {e}", args.cap))?;
+    ) {
+        Ok(logits) => logits,
+        Err(error) => {
+            let _ = print_vram("decode_failure", &gpu, &mut peak);
+            return Err(format!(
+                "decode warmup cap={} pos={current_pos}: {error}",
+                args.cap
+            ));
+        }
+    };
     gpu.hip.device_synchronize().map_err(|e| format!("warmup sync: {e:?}"))?;
     let warm_s = warm_start.elapsed().as_secs_f64();
     current_pos += 1;
