@@ -104,6 +104,30 @@ fn sigmoid_f32(x: f32) -> f32 {
     1.0 / (1.0 + (-x).exp())
 }
 
+/// HC `post` multiplier. Reference (`kernel.py:394`) hardcodes `2 * sigmoid(...)`.
+///
+/// Default is **2.0** (reference-faithful). Override only for diagnostics via
+/// `HIPFIRE_DEEPSEEK4_PARENT_POST_SCALE` — never adopt production's serving
+/// default of 1.5 as the parent path's permanent value.
+fn hc_post_scale() -> f32 {
+    use std::sync::LazyLock;
+    static SCALE: LazyLock<f32> = LazyLock::new(|| {
+        let v = std::env::var("HIPFIRE_DEEPSEEK4_PARENT_POST_SCALE")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(2.0);
+        if (v - 2.0f32).abs() > f32::EPSILON {
+            eprintln!(
+                "deepseek4 parent: DIAGNOSTIC HIPFIRE_DEEPSEEK4_PARENT_POST_SCALE={v} \
+                 (reference default is 2.0; do not promote serving-tuned values)"
+            );
+        }
+        v
+    });
+    *SCALE
+}
+
+
 /// Host-side `hc_split_sinkhorn` control split (pre/post + comb logits),
 /// matching `kernel.py:391-396` **before** the sinkhorn iterations.
 ///
@@ -145,9 +169,10 @@ fn split_pre_post_comb_logits(
             // pre = sigmoid(mixes * scale[0] + base) + eps
             pre[r * hc_mult + j] =
                 sigmoid_f32(mixes[mbase + j] * s0 + base[j]) + hc_eps;
-            // post = 2 * sigmoid(mixes * scale[1] + base)  — reference hardcodes 2.0
-            post[r * hc_mult + j] =
-                2.0 * sigmoid_f32(mixes[mbase + j + hc_mult] * s1 + base[j + hc_mult]);
+            // post = post_scale * sigmoid(mixes * scale[1] + base)
+            // Reference hardcodes post_scale=2.0 (kernel.py:394).
+            post[r * hc_mult + j] = hc_post_scale()
+                * sigmoid_f32(mixes[mbase + j + hc_mult] * s1 + base[j + hc_mult]);
         }
         let cbase = r * hc_mult * hc_mult;
         for j in 0..hc_mult {

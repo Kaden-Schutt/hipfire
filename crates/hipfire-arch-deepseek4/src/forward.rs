@@ -805,6 +805,242 @@ fn dump_buf(gpu: &mut Gpu, tag: &str, buf: &rdna_compute::GpuTensor) {
     }
 }
 
+/// Opt-in per-layer residual L2 dump for prod-vs-parent trajectory compare.
+///
+/// Set `HIPFIRE_DEEPSEEK4_LAYER_NORM=1`. Emits one line per layer after the
+/// FFN HC mix:
+/// `PROD_LAYER_NORM pos=<p> layer=<l> l2=<f64> nelems=<n>`.
+/// Absolute norms are single-token (`hc_mult * hidden`); compare consecutive
+/// layer *ratios* against the parent multi-row trajectory.
+///
+/// The most recent position's series is also retained in process memory for
+/// [`take_layer_norm_trace`].
+fn dump_residual_layer_norm(
+    gpu: &mut Gpu,
+    state: &DeepseekV4State,
+    layer_idx: usize,
+    position: u32,
+) {
+    use std::sync::LazyLock;
+    static ON: LazyLock<bool> = LazyLock::new(|| {
+        hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_LAYER_NORM")
+            .ok()
+            .as_deref()
+            == Some("1")
+    });
+    if !*ON {
+        return;
+    }
+    let Some(streams) = state.residual_streams.as_ref() else {
+        return;
+    };
+    let _ = gpu.hip.device_synchronize();
+    let Ok(v) = gpu.download_f32(streams) else {
+        return;
+    };
+    let l2: f64 = v
+        .iter()
+        .map(|&x| {
+            let x = x as f64;
+            x * x
+        })
+        .sum::<f64>()
+        .sqrt();
+    eprintln!(
+        "PROD_LAYER_NORM pos={position} layer={layer_idx} l2={l2:.9e} nelems={}",
+        v.len()
+    );
+    // Retain last-seen position's full series (overwrite on position change).
+    if let Ok(mut g) = LAYER_NORM_TRACE.lock() {
+        if g.position != Some(position) {
+            g.position = Some(position);
+            g.l2.clear();
+        }
+        if g.l2.len() == layer_idx {
+            g.l2.push(l2);
+        } else if layer_idx < g.l2.len() {
+            g.l2[layer_idx] = l2;
+        } else {
+            g.l2.resize(layer_idx + 1, f64::NAN);
+            g.l2[layer_idx] = l2;
+        }
+    }
+}
+
+#[derive(Default, Clone, Debug)]
+struct LayerNormTrace {
+    position: Option<u32>,
+    l2: Vec<f64>,
+}
+
+static LAYER_NORM_TRACE: std::sync::LazyLock<std::sync::Mutex<LayerNormTrace>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(LayerNormTrace::default()));
+
+/// Drain the most recent `HIPFIRE_DEEPSEEK4_LAYER_NORM` series
+/// `(position, per_layer_l2)`. Empty when the env gate is off or no layer
+/// has run yet.
+pub fn take_layer_norm_trace() -> Option<(u32, Vec<f64>)> {
+    let mut g = LAYER_NORM_TRACE.lock().ok()?;
+    let pos = g.position?;
+    if g.l2.is_empty() {
+        return None;
+    }
+    let l2 = std::mem::take(&mut g.l2);
+    g.position = None;
+    Some((pos, l2))
+}
+
+/// Opt-in per-stage residual/activation L2 for spike-layer localization.
+/// `HIPFIRE_DEEPSEEK4_STAGE_NORM=1` plus optional
+/// `HIPFIRE_DEEPSEEK4_STAGE_LAYERS=25,26,27` (default those three).
+fn dump_stage_norm(
+    gpu: &mut Gpu,
+    tag: &str,
+    buf: &GpuTensor,
+    layer_idx: usize,
+    position: u32,
+) {
+    use std::sync::LazyLock;
+    static ON: LazyLock<bool> = LazyLock::new(|| {
+        hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_STAGE_NORM")
+            .ok()
+            .as_deref()
+            == Some("1")
+    });
+    if !*ON {
+        return;
+    }
+    static LAYERS: LazyLock<Vec<usize>> = LazyLock::new(|| {
+        hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_STAGE_LAYERS")
+            .ok()
+            .map(|s| {
+                s.split(',')
+                    .filter_map(|t| t.trim().parse().ok())
+                    .collect::<Vec<_>>()
+            })
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| vec![25, 26, 27])
+    });
+    if !LAYERS.contains(&layer_idx) {
+        return;
+    }
+    let _ = gpu.hip.device_synchronize();
+    let Ok(v) = gpu.download_f32(buf) else {
+        return;
+    };
+    let l2: f64 = v
+        .iter()
+        .map(|&x| {
+            let x = x as f64;
+            x * x
+        })
+        .sum::<f64>()
+        .sqrt();
+    eprintln!(
+        "PROD_STAGE_NORM pos={position} layer={layer_idx} stage={tag} l2={l2:.9e} nelems={}",
+        v.len()
+    );
+}
+
+/// Opt-in dump of indexer top-k + compressed KV L2 after `indexer_forward`.
+/// `HIPFIRE_DEEPSEEK4_DUMP_INDEXER=1`; optional
+/// `HIPFIRE_DEEPSEEK4_DUMP_INDEXER_LAYERS=2,4,26` (default those).
+fn dump_indexer_state(
+    gpu: &mut Gpu,
+    state: &DeepseekV4State,
+    layer_idx: usize,
+    position: u32,
+    n_scored: usize,
+) {
+    use std::sync::LazyLock;
+    static ON: LazyLock<bool> = LazyLock::new(|| {
+        hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_DUMP_INDEXER")
+            .ok()
+            .as_deref()
+            == Some("1")
+    });
+    if !*ON {
+        return;
+    }
+    static LAYERS: LazyLock<Vec<usize>> = LazyLock::new(|| {
+        hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_DUMP_INDEXER_LAYERS")
+            .ok()
+            .map(|s| {
+                s.split(',')
+                    .filter_map(|t| t.trim().parse().ok())
+                    .collect::<Vec<_>>()
+            })
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| vec![2, 4, 26])
+    });
+    if !LAYERS.contains(&layer_idx) {
+        return;
+    }
+    let _ = gpu.hip.device_synchronize();
+    let idx = &state._indexer[layer_idx];
+    // topk_idx_indices is DType::F32 storage holding i32 bit patterns.
+    let topk_head = match idx.topk_idx_indices.as_ref() {
+        Some(t) => match gpu.download_f32(t) {
+            Ok(v) => {
+                let idxs: Vec<i32> = v
+                    .iter()
+                    .map(|x| i32::from_le_bytes(x.to_bits().to_le_bytes()))
+                    .collect();
+                let n_pos = idxs.iter().filter(|&&i| i >= 0).count();
+                let head = idxs
+                    .iter()
+                    .take(32)
+                    .map(|i| i.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                format!("n_pos={n_pos} head=[{head}]")
+            }
+            Err(_) => String::from("?"),
+        },
+        None => String::from("none"),
+    };
+    let main_l2 = idx
+        .main_kv_cache
+        .as_ref()
+        .and_then(|t| gpu.download_f32(t).ok())
+        .map(|v| {
+            let n = n_scored.saturating_mul(512).min(v.len());
+            v[..n]
+                .iter()
+                .map(|&x| {
+                    let x = x as f64;
+                    x * x
+                })
+                .sum::<f64>()
+                .sqrt()
+        })
+        .unwrap_or(f64::NAN);
+    let idx_l2 = idx
+        .indexer_kv_cache
+        .as_ref()
+        .and_then(|t| gpu.download_f32(t).ok())
+        .map(|v| {
+            let n = n_scored.saturating_mul(512).min(v.len());
+            v[..n]
+                .iter()
+                .map(|&x| {
+                    let x = x as f64;
+                    x * x
+                })
+                .sum::<f64>()
+                .sqrt()
+        })
+        .unwrap_or(f64::NAN);
+    eprintln!(
+        "PROD_INDEXER pos={position} layer={layer_idx} n_scored={n_scored} \
+         main_kv_l2={main_l2:.9e} idx_kv_l2={idx_l2:.9e} {topk_head}"
+    );
+}
+
+
+
+
+
 #[inline]
 fn e8_prefill_batch_tiles(batch_size: usize, b2_available: bool, b4_available: bool) -> usize {
     if batch_size > 32 && b4_available {
@@ -2905,6 +3141,9 @@ pub fn decode_step_body(
         // bounded but architecturally-trivial logits.
         // Real mHC with corrected kernels (F32 throughout for residuals).
         mhc_pre(cfg, weights, state, gpu, layer_idx, /*is_attn=*/ true)?;
+        if let Some(t) = state.hc_x_in.as_ref() {
+            dump_stage_norm(gpu, "hc_x_in_attn", t, layer_idx, position);
+        }
         q_lora(cfg, weights, state, gpu, layer_idx)?;
 
         // (Q-LoRA call moved above into the fused RMSNorm + GEMV step.)
@@ -2950,16 +3189,26 @@ pub fn decode_step_body(
                     /*is_indexer=*/ true,
                 )?;
                 let _n = indexer_forward(cfg, weights, state, gpu, layer_idx, position)?;
+                dump_indexer_state(gpu, state, layer_idx, position, _n);
             }
         }
 
         // v + vi. Main attention + O-LoRA — STUB.
         attn_stub(cfg, weights, state, gpu, layer_idx)?;
+        if let Some(t) = state.attn_out.as_ref() {
+            dump_stage_norm(gpu, "attn_out", t, layer_idx, position);
+        }
 
         hc_attn_mix(cfg, weights, state, gpu, layer_idx)?;
+        if let Some(t) = state.residual_streams.as_ref() {
+            dump_stage_norm(gpu, "hc_post_attn", t, layer_idx, position);
+        }
 
         // ── 2b. FFN block ─────────────────────────────────────────────
         mhc_pre(cfg, weights, state, gpu, layer_idx, /*is_attn=*/ false)?;
+        if let Some(t) = state.hc_x_in.as_ref() {
+            dump_stage_norm(gpu, "hc_x_in_ffn", t, layer_idx, position);
+        }
         if !skip_ffn {
             ffn_stub(cfg, weights, state, gpu, layer_idx)?;
             if layer_idx < cfg.num_hash_layers {
@@ -2980,7 +3229,14 @@ pub fn decode_step_body(
                 .memset(&ffn_out.buf, 0, ffn_out.byte_size())
                 .map_err(|e| format!("memset ffn_out: {e:?}"))?;
         }
+        if let Some(t) = state.ffn_out.as_ref() {
+            dump_stage_norm(gpu, "ffn_out", t, layer_idx, position);
+        }
         hc_ffn_mix(cfg, weights, state, gpu, layer_idx)?;
+        if let Some(t) = state.residual_streams.as_ref() {
+            dump_stage_norm(gpu, "hc_post_ffn", t, layer_idx, position);
+        }
+        dump_residual_layer_norm(gpu, state, layer_idx, position);
     }
 
     // 3. Final norm + LM head. The head-HC mix INSIDE final_norm_and_head
@@ -3048,6 +3304,7 @@ fn ds4_attn_block(
                 cfg, weights, state, gpu, layer_idx, &tmp_view, position, /*is_indexer=*/ true,
             )?;
             let _n = indexer_forward(cfg, weights, state, gpu, layer_idx, position)?;
+            dump_indexer_state(gpu, state, layer_idx, position, _n);
         }
     }
     attn_stub(cfg, weights, state, gpu, layer_idx)?;
@@ -3480,6 +3737,7 @@ fn decode_step_body_lowered(
         };
         superop::run_layer_program(gpu, &ctx, &program, &mut bind)
             .map_err(|e| format!("ds4 L{layer_idx}: lowered run_layer_program: {e}"))?;
+        dump_residual_layer_norm(gpu, state, layer_idx, position);
     }
     final_norm_and_head(cfg, weights, state, gpu)?;
     state.n_tokens += 1;
