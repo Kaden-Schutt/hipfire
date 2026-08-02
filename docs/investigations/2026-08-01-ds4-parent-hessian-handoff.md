@@ -584,6 +584,71 @@ confirming the compressed positions were consumed. The compressor component
 itself was verified standalone on real layer 3 at 128 rows. Gate 6's 1024-token
 calibration run should carry that instrumentation.
 
+### Which quantized artifacts Gate 6 may compare against
+
+There are **two generations** of DS4 quants on `mi300x` and they are easy to
+confuse: same recipes, near-identical file sizes, different base checkpoints.
+A KLD against the wrong generation measures the difference between two
+*models*, not between a model and its quantization, and is meaningless.
+
+**Eligible for Gate 6 — derived from the 0731 parent:**
+
+| path | bytes | sha256 |
+|---|---:|---|
+| `quantization/deepseek-v4-flash-0731-mq2r-p3/artifacts/deepseek-v4-flash-0731.mq2r` | 82,191,359,851 | `cbf2bbcf…9318cce` |
+| `quantization/deepseek-v4-flash-0731-mq2lloyd/artifacts/deepseek-v4-flash-0731.mq2lloyd` | 86,184,307,563 | see `identity/artifacts.sha256` |
+
+The MQ2R sha256 matches the pin recorded above for the rejected Hessian
+capture, which confirms it is the same P3 artifact. Both directories carry an
+`identity/` tree (`artifacts.sha256`, `engine-fingerprint.json`,
+`trunk-census.txt`, `qt35-actual.tsv`) — use it, do not re-derive provenance.
+
+**NOT eligible — quants of the pre-0731 base:**
+
+| path | bytes | date |
+|---|---:|---|
+| `models/deepseek-v4-flash-mq2r/deepseek-v4-flash.mq2r` | 82,191,362,222 | 2026-07-24 |
+| `models/existing-deepseek-v4-flash/deepseek-v4-flash.mq2lloyd` | 86,184,307,283 | 2026-05-27 |
+
+Note the MQ2R pair differs by only **2,371 bytes** and the MQ2-Lloyd pair by
+**280**. Size is not a discriminator here; only the hash and the path are.
+
+> The `route_scale` perplexity numbers recorded earlier in this document
+> (1.5 → 7.0131, 2.2 → 6.0804 at ctx256) were measured on the **Jul 24
+> pre-0731** MQ2R. They are a valid statement about that artifact and about
+> the routed-vs-shared gain in general, but they are **not** a statement about
+> the 0731 artifact and must not be cited as one. This was caught by asking
+> the obvious provenance question about a file that had simply been assumed
+> current — the same failure mode, one level up, that this whole document
+> exists to prevent. Provenance discipline applies to what you compare
+> against, not only to the thing under test.
+
+### Quant-tier structure (identical across both generations)
+
+`dump_hfq_dtypes` over all four artifacts:
+
+| tier | MQ2-Lloyd build | MQ2R build |
+|---|---|---|
+| routed experts `ffn.experts.N.w{1,2,3}` | qt=19 MQ2-Lloyd, 33,024 tensors, 277,025,390,592 elems | **byte-identical count** |
+| shared expert `ffn.shared_experts.w{1,2,3}` | **qt=3 Q8_0** (8-bit) | **qt=35 MFP4G32E8SOA** (4-bit) |
+| router `ffn.gate.weight` | qt=3 Q8_0 | qt=35 FP4-E8 |
+| dense tier totals | 389 × qt=3, 807 × qt=1 | 554 × qt=35, 641 × qt=1 |
+
+This is the mechanism behind the `route_scale` puzzle. `route_scale` is
+exactly the routed:shared gain
+(`y = s·⟨E_i⟩_w + E_shared(x)`, weights normalized to sum `s`). Between the
+two builds the **routed tier is unchanged and the shared tier was halved in
+precision**, so the optimal value is necessarily build-specific — a constant
+defaulted in the Q8-shared era cannot also be right for a 4-bit shared expert.
+That a *routing* constant is sensitive to which tier the *shared expert* lives
+in is strong evidence for quantization compensation rather than for a routing
+bug in hipfire, since a genuine routing bug would not care.
+
+Independently: the router `gate.weight` itself went Q8 → FP4, so a 4-bit
+router perturbs *which* experts are selected, not merely how much they
+contribute. Two builds are not comparable at a fixed `route_scale` for that
+reason alone.
+
 ### Not yet done
 
 Gates 6-9. Specifically:
@@ -597,7 +662,8 @@ Gates 6-9. Specifically:
   manifest, cross-process determinism confirmed (only in-process is proven so
   far), and then MQ2L/MQ2R logits captured on byte-identical token ids for the
   KLD comparison. `plog::compare` is written and unit-tested but has never
-  consumed a real parent logit file.
+  consumed a real parent logit file. **Use only the 0731-derived artifacts
+  listed above, verified by sha256 before the run, not by filename.**
 - Forward cost is 24.8 s per 256 tokens, so a 1024-token capture is order
   100 s per model plus load. Tractable; measure before scaling to the 8K/16K/32K
   expansion in gate 8.
