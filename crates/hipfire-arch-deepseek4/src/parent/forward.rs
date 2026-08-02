@@ -269,9 +269,19 @@ impl ParentForwardScratch {
         &self.attn
     }
 
+    /// Nested attention scratch (mutable) for stage-content drivers.
+    pub fn attn_scratch_mut(&mut self) -> &mut ParentAttnScratch {
+        &mut self.attn
+    }
+
     /// Nested MoE scratch.
     pub fn moe_scratch(&self) -> &ParentMoeScratch {
         &self.moe
+    }
+
+    /// Nested MoE scratch (mutable) for stage-content drivers.
+    pub fn moe_scratch_mut(&mut self) -> &mut ParentMoeScratch {
+        &mut self.moe
     }
 }
 
