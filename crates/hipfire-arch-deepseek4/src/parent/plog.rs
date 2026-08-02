@@ -241,22 +241,46 @@ pub struct DivergenceReport {
     pub top1_agreement: f64,
     /// Mean `|top5(p) ∩ top5(q)| / 5`.
     pub top5_overlap_mean: f64,
-    /// `exp(mean NLL)` of `target_token_ids[t]` under the reference.
+    /// `exp(mean NLL)` of `token_ids[t + 1]` under the reference, over the
+    /// first `n_tokens - 1` rows. See [`compare`] for why the shift is here.
     pub ppl_reference: f64,
-    /// `exp(mean NLL)` of `target_token_ids[t]` under the candidate.
+    /// `exp(mean NLL)` of `token_ids[t + 1]` under the candidate.
     pub ppl_candidate: f64,
     pub max_abs_logit_delta: f32,
 }
 
-/// Compare two `.plog` files on the same shape against `target_token_ids`.
+/// Compare two `.plog` files on the same shape against `token_ids`.
 ///
 /// KLD is `D_KL(P_reference || Q_candidate)` over softmaxed logits, computed
-/// per position in f64 with max-subtraction log-sum-exp. PPL is
-/// `exp(mean NLL)` of each target under each distribution.
+/// per position in f64 with max-subtraction log-sum-exp, across **all** rows.
+/// KLD needs no targets, so it is unaffected by the shift below.
+///
+/// # The target shift lives here, on purpose
+///
+/// `.plog` row `t` holds the logits **after** position `t`, i.e. the
+/// prediction for token `t + 1`. PPL therefore scores row `t` against
+/// `token_ids[t + 1]`, over rows `0..n-1`; the final row predicts a token
+/// past the end of the sequence and is not scored.
+///
+/// This shift used to be the caller's job, and the caller got it wrong: the
+/// first real Gate 6 run scored row `t` against `token_ids[t]` and reported
+/// perplexities of 5.7e6 (parent) and 1.8e6 (MQ2R) — *worse than the uniform
+/// 129,280* — while both models were independently emitting coherent text and
+/// hitting 30-54% next-token top-1. An empirical shift scan confirmed
+/// `argmax == token_ids[t]` in 0 of 48 sampled rows against
+/// `argmax == token_ids[t + 1]` in 13-26 of 48.
+///
+/// Doing the shift internally makes that misuse impossible, which is the same
+/// lesson as the BF16-vs-f32 `amax` bug: an interface's input convention is
+/// part of its contract, and leaving it implicit means it will eventually be
+/// violated by someone reading only the signature.
+///
+/// `token_ids` is the full sequence the logits were produced from and must
+/// have exactly `n_tokens` entries.
 pub fn compare(
     reference: &PlogReader,
     candidate: &PlogReader,
-    target_token_ids: &[u32],
+    token_ids: &[u32],
 ) -> Result<DivergenceReport, String> {
     if reference.n_tokens() != candidate.n_tokens() || reference.vocab() != candidate.vocab() {
         return Err(format!(
@@ -269,10 +293,10 @@ pub fn compare(
     }
     let n = reference.n_tokens();
     let v = reference.vocab();
-    if target_token_ids.len() != n {
+    if token_ids.len() != n {
         return Err(format!(
-            "deepseek4 parent: target_token_ids len {} != n_tokens {n}",
-            target_token_ids.len()
+            "deepseek4 parent: token_ids len {} != n_tokens {n}",
+            token_ids.len()
         ));
     }
     if n == 0 {
@@ -286,15 +310,12 @@ pub fn compare(
     let mut nll_cand_sum = 0.0f64;
     let mut max_abs_logit_delta = 0.0f32;
 
+    // Row t predicts token t+1, so PPL is scored over rows 0..n-1 only. KLD
+    // needs no target and is accumulated across every row.
+    let mut scored = 0usize;
     for t in 0..n {
         let pref = reference.row(t)?;
         let pcand = candidate.row(t)?;
-        let target = target_token_ids[t] as usize;
-        if target >= v {
-            return Err(format!(
-                "deepseek4 parent: target_token_ids[{t}]={target} out of vocab {v}"
-            ));
-        }
 
         for i in 0..v {
             let d = (pref[i] - pcand[i]).abs();
@@ -303,10 +324,26 @@ pub fn compare(
             }
         }
 
-        let (log_p, nll_p) = log_softmax_and_nll(pref, target);
-        let (log_q, nll_q) = log_softmax_and_nll(pcand, target);
-        nll_ref_sum += nll_p;
-        nll_cand_sum += nll_q;
+        let target = if t + 1 < n {
+            let tgt = token_ids[t + 1] as usize;
+            if tgt >= v {
+                return Err(format!(
+                    "deepseek4 parent: token_ids[{}]={tgt} out of vocab {v}",
+                    t + 1
+                ));
+            }
+            Some(tgt)
+        } else {
+            None
+        };
+
+        let (log_p, nll_p) = log_softmax_and_nll(pref, target.unwrap_or(0));
+        let (log_q, nll_q) = log_softmax_and_nll(pcand, target.unwrap_or(0));
+        if target.is_some() {
+            nll_ref_sum += nll_p;
+            nll_cand_sum += nll_q;
+            scored += 1;
+        }
 
         // D_KL(P||Q) = Σ_i exp(log_p_i) * (log_p_i - log_q_i)
         let mut kld = 0.0f64;
@@ -347,8 +384,19 @@ pub fn compare(
         kld_max,
         top1_agreement: top1_hits as f64 / n as f64,
         top5_overlap_mean: top5_overlap_sum / n as f64,
-        ppl_reference: (nll_ref_sum / n as f64).exp(),
-        ppl_candidate: (nll_cand_sum / n as f64).exp(),
+        // Divide by the number of *scored* rows, not n: the final row has no
+        // in-sequence target. At n = 1 nothing is scored and PPL is NaN, which
+        // is the honest answer rather than exp(0) = 1.
+        ppl_reference: if scored == 0 {
+            f64::NAN
+        } else {
+            (nll_ref_sum / scored as f64).exp()
+        },
+        ppl_candidate: if scored == 0 {
+            f64::NAN
+        } else {
+            (nll_cand_sum / scored as f64).exp()
+        },
         max_abs_logit_delta,
     })
 }
@@ -625,19 +673,28 @@ mod tests {
     fn log_sum_exp_stable_on_huge_logits() {
         let path_a = temp_path("huge-a");
         let path_b = temp_path("huge-b");
+        // Two rows, not one: row t is scored against token_ids[t + 1], so a
+        // single-row file has nothing to score and PPL is legitimately NaN.
+        // Two rows keeps this a real stability check on both KLD and PPL.
         {
-            let mut w = PlogWriter::create(&path_a, 1, 4).unwrap();
+            let mut w = PlogWriter::create(&path_a, 2, 4).unwrap();
             w.push_row(&[800.0, -800.0, 799.0, 100.0]).unwrap();
+            w.push_row(&[-800.0, 800.0, 100.0, 799.0]).unwrap();
             w.finish().unwrap();
         }
         {
-            let mut w = PlogWriter::create(&path_b, 1, 4).unwrap();
+            let mut w = PlogWriter::create(&path_b, 2, 4).unwrap();
             w.push_row(&[790.0, -790.0, 800.0, 50.0]).unwrap();
+            w.push_row(&[-790.0, 790.0, 50.0, 800.0]).unwrap();
             w.finish().unwrap();
         }
         let a = PlogReader::open(&path_a).unwrap();
         let b = PlogReader::open(&path_b).unwrap();
-        let report = compare(&a, &b, &[0u32]).unwrap();
+        // Score row 0 against token 0, which BOTH files rank first. With
+        // logits spanning ±800 any other target gives NLL in the hundreds and
+        // exp() legitimately overflows to +inf — that would be arithmetic
+        // working correctly, not the stability property under test here.
+        let report = compare(&a, &b, &[3u32, 0u32]).unwrap();
         assert!(
             report.kld_mean.is_finite() && !report.kld_mean.is_nan(),
             "kld_mean not finite: {}",
@@ -648,6 +705,53 @@ mod tests {
         assert!(report.kld_max.is_finite());
         let _ = std::fs::remove_file(&path_a);
         let _ = std::fs::remove_file(&path_b);
+    }
+
+    /// Pins the target shift that the first real Gate 6 run got wrong.
+    ///
+    /// Row `t` predicts token `t + 1`. Build a reference whose row `t` puts
+    /// all its mass on `token_ids[t + 1]`: PPL must be ~1. Scoring against
+    /// `token_ids[t]` instead — the old behaviour — would put the mass on a
+    /// token this construction makes deliberately unlikely, and PPL would
+    /// explode. That is exactly the 5.7e6 the parent reported.
+    #[test]
+    fn ppl_scores_row_t_against_token_t_plus_one() {
+        let path = temp_path("shift");
+        let vocab = 8usize;
+        let ids: Vec<u32> = vec![7, 1, 2, 3, 4];
+        let n = ids.len();
+        {
+            let mut w = PlogWriter::create(&path, n, vocab).unwrap();
+            for t in 0..n {
+                let mut row = vec![-30.0f32; vocab];
+                // Confident about the NEXT token; the current token is the
+                // least likely thing to come next in this construction.
+                let next = if t + 1 < n { ids[t + 1] } else { 0 } as usize;
+                row[next] = 30.0;
+                w.push_row(&row).unwrap();
+            }
+            w.finish().unwrap();
+        }
+        let r = PlogReader::open(&path).unwrap();
+        let report = compare(&r, &r, &ids).unwrap();
+
+        assert_eq!(report.kld_mean, 0.0, "self-comparison must be zero KLD");
+        assert!(
+            (report.ppl_reference - 1.0).abs() < 1e-6,
+            "row t must be scored against token_ids[t+1]; got PPL {}",
+            report.ppl_reference
+        );
+        // Guard the other direction: had the shift been dropped, row 0 would
+        // be scored against ids[0] = 7, which row 0 assigns -30.0. Confirm the
+        // construction really would have blown up, so this test cannot pass
+        // vacuously if someone reverts the shift.
+        let mut row0 = vec![-30.0f32; vocab];
+        row0[ids[1] as usize] = 30.0;
+        assert!(
+            row0[ids[0] as usize] < 0.0,
+            "fixture must make the unshifted target improbable"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

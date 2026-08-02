@@ -330,6 +330,10 @@ fn run() -> Result<(), String> {
     println!();
 
     // ── 7. Manifest ─────────────────────────────────────────────────────
+    // probe_environment shells out to `git` with the process cwd. Launch
+    // scripts / nohup often start with cwd=/, which is not a repo — pin to
+    // the worktree that built this binary (or CARGO_MANIFEST_DIR parent).
+    chdir_to_git_worktree()?;
     let manifest_path = args.manifest.clone().unwrap_or_else(|| {
         let mut p = plog_path.to_path_buf();
         p.set_extension("manifest.json");
@@ -616,6 +620,45 @@ fn parse_args() -> Result<Args, String> {
 }
 
 // ── helpers ─────────────────────────────────────────────────────────────────
+fn chdir_to_git_worktree() -> Result<(), String> {
+    // Prefer walking up from the running binary (…/target/release/examples/X
+    // → repo root). Fall back to CARGO_MANIFEST_DIR when present (cargo run).
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(mut p) = exe.parent().map(|p| p.to_path_buf()) {
+            for _ in 0..8 {
+                candidates.push(p.clone());
+                if !p.pop() {
+                    break;
+                }
+            }
+        }
+    }
+    if let Ok(m) = std::env::var("CARGO_MANIFEST_DIR") {
+        let mut p = PathBuf::from(m);
+        candidates.push(p.clone());
+        if p.pop() {
+            candidates.push(p.clone());
+            if p.pop() {
+                candidates.push(p);
+            }
+        }
+    }
+    for c in &candidates {
+        if c.join(".git").exists() {
+            std::env::set_current_dir(c).map_err(|e| {
+                format!(
+                    "deepseek4 parent: chdir to git worktree {}: {e}",
+                    c.display()
+                )
+            })?;
+            return Ok(());
+        }
+    }
+    // Leave cwd alone and let probe_environment surface a clear error.
+    Ok(())
+}
+
 
 fn read_token_ids(path: &Path) -> Result<Vec<u32>, String> {
     let bytes = std::fs::read(path).map_err(|e| {
