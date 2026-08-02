@@ -649,6 +649,44 @@ router perturbs *which* experts are selected, not merely how much they
 contribute. Two builds are not comparable at a fixed `route_scale` for that
 reason alone.
 
+### route_scale sweep on the 0731 MQ2R (standalone PPL)
+
+`deepseek4_perplexity`, ctx 256 / warmup 8 / offset 0, wikitext2 slice md5
+`83b0205a304bf4e52172ecdb05f2e895`, fresh process per point, target verified
+by sha256 against `cbf2bbcf…9318cce` before the sweep ran:
+
+| route_scale | 1.2 | 1.5 | 1.8 | **2.0** | 2.2 | 2.4 | 2.6 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| PPL | 15.59 | 9.13 | 6.63 | **6.03** | 6.84 | 7.30 | 7.90 |
+
+A sharp, unambiguous minimum at **2.0**, monotone on both sides. Three things
+follow.
+
+First, **the optimum is build-specific.** The pre-0731 MQ2R measured earlier
+gave 7.01 at 1.5 and 6.08 at 2.2; the 0731 build gives 9.13 at 1.5 and 6.84 at
+2.2. Same recipe, different base weights, materially different curve. Neither
+the hardcoded 2.2 nor the checkpoint's 1.5 is the optimum for this artifact.
+
+Second, **the compensation is large.** At the checkpoint's declared 1.5 the
+0731 MQ2R scores 9.13 against 6.03 at its optimum — a 51% PPL penalty. A
+routed:shared gain that has to move this far to recover quality is strong
+evidence that MQ2 expert quantization is losing substantial routed-expert
+magnitude, i.e. the constant is compensating for a quantization defect rather
+than expressing a model property.
+
+Third, and this is the actionable one: **the real fix is at quantization
+time.** `route_scale` is a single scalar applied uniformly to the routed
+branch. If the underlying problem is per-expert magnitude loss, recovering it
+in the quantizer would let 1.5 be both correct and better, and would remove a
+per-artifact tuning knob from the serving path entirely.
+
+> This is standalone PPL and is a **bracket only**. The Gate 6 objective is
+> minimum **KLD against the parent**, a different criterion: PPL rewards a
+> quantized model for being confidently right on the corpus, whereas KLD
+> rewards it for matching the teacher's distribution including where the
+> teacher is uncertain. Expect the KLD optimum near but not necessarily at
+> 2.0, and report both.
+
 ### Not yet done
 
 Gates 6-9. Specifically:
