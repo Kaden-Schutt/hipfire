@@ -22834,4 +22834,184 @@ impl Gpu {
         }
         result
     }
+
+    /// gfx942 BF16×BF16→FP32 MFMA GEMM — parent-checkpoint linear path.
+    ///
+    /// Computes `D[batch, M] = B[batch, K] @ A[M, K]^T` (i.e. `x @ W^T`) with
+    /// BF16 operands and an FP32 accumulator, matching
+    /// `kernels/src/gemm_bf16_mfma.gfx942.hip`.
+    ///
+    /// - `a`: row-major BF16 weights `[M, K]`
+    /// - `b`: row-major BF16 activations `[batch, K]`
+    /// - `d`: row-major FP32 output `[batch, M]` (overwritten)
+    ///
+    /// Launch geometry (fixed by the HIP source): block `[256,1,1]`,
+    /// grid `[(M+31)/32, (batch+31)/32, 1]`, static LDS B-tile
+    /// (`32 × 128 × 2 B`). Fail-closed on non-gfx942 and undersized buffers.
+    pub fn gemm_bf16_mfma_gfx942(
+        &mut self,
+        a: &DeviceBuffer,
+        b: &DeviceBuffer,
+        d: &DeviceBuffer,
+        m: usize,
+        k: usize,
+        batch: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if !self.arch_caps.is_gfx942() {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "gemm_bf16_mfma_gfx942 requires gfx942",
+            ));
+        }
+        if m == 0 || k == 0 || batch == 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "gemm_bf16_mfma_gfx942: M, K, batch must be positive (got M={m} K={k} batch={batch})"
+                ),
+            ));
+        }
+        let a_bytes = m
+            .checked_mul(k)
+            .and_then(|e| e.checked_mul(2))
+            .ok_or_else(|| hip_bridge::HipError::new(0, "gemm_bf16_mfma_gfx942: A size overflow"))?;
+        let b_bytes = batch
+            .checked_mul(k)
+            .and_then(|e| e.checked_mul(2))
+            .ok_or_else(|| hip_bridge::HipError::new(0, "gemm_bf16_mfma_gfx942: B size overflow"))?;
+        let d_bytes = batch
+            .checked_mul(m)
+            .and_then(|e| e.checked_mul(4))
+            .ok_or_else(|| hip_bridge::HipError::new(0, "gemm_bf16_mfma_gfx942: D size overflow"))?;
+        if a.size() < a_bytes {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "gemm_bf16_mfma_gfx942: A buffer too small (have {} need {a_bytes})",
+                    a.size()
+                ),
+            ));
+        }
+        if b.size() < b_bytes {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "gemm_bf16_mfma_gfx942: B buffer too small (have {} need {b_bytes})",
+                    b.size()
+                ),
+            ));
+        }
+        if d.size() < d_bytes {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "gemm_bf16_mfma_gfx942: D buffer too small (have {} need {d_bytes})",
+                    d.size()
+                ),
+            ));
+        }
+
+        const KERNEL: &str = "gemm_bf16_mfma_gfx942";
+        self.ensure_kernel(KERNEL, kernels::GEMM_BF16_MFMA_GFX942_SRC, KERNEL)?;
+
+        let a_ptr = a.as_ptr();
+        let b_ptr = b.as_ptr();
+        let d_ptr = d.as_ptr();
+        let m_i32 = m as i32;
+        let k_i32 = k as i32;
+        let batch_i32 = batch as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &a_ptr as *const _ as *mut c_void,
+            &b_ptr as *const _ as *mut c_void,
+            &d_ptr as *const _ as *mut c_void,
+            &m_i32 as *const _ as *mut c_void,
+            &k_i32 as *const _ as *mut c_void,
+            &batch_i32 as *const _ as *mut c_void,
+        ];
+        let grid_x = ((m + 31) / 32) as u32;
+        let grid_y = ((batch + 31) / 32) as u32;
+        let bytes = a_bytes + b_bytes + d_bytes;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", KERNEL, bytes);
+        let result = self.launch_maybe_blob(
+            KERNEL,
+            [grid_x, grid_y, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut blob = hip_bridge::KernargBlob::new();
+                blob.push_ptr(a_ptr);
+                blob.push_ptr(b_ptr);
+                blob.push_ptr(d_ptr);
+                blob.push_i32(m_i32);
+                blob.push_i32(k_i32);
+                blob.push_i32(batch_i32);
+                blob
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// rocBLAS BF16×BF16→FP32 reference for the same orientation as
+    /// [`Self::gemm_bf16_mfma_gfx942`]: `Y[N,M] = X[N,K] @ W[M,K]^T`.
+    ///
+    /// Returns `Err` when rocBLAS is not loaded. Used only as a numerical /
+    /// throughput oracle for the hand-rolled MFMA kernel — not a production
+    /// parent-linear path.
+    pub fn rocblas_gemm_bf16_prefill(
+        &self,
+        w_bf16: &DeviceBuffer, // row-major [M × K]
+        x_bf16: &DeviceBuffer, // row-major [N × K]
+        y_fp32: &DeviceBuffer, // row-major [N × M]
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        use hip_bridge::{RocblasDatatype, RocblasOperation};
+        let rb = self.rocblas.as_ref().ok_or_else(|| {
+            hip_bridge::HipError::new(0, "rocblas_gemm_bf16_prefill: rocBLAS not initialized")
+        })?;
+        if let Some(stream) = self.active_stream.as_ref() {
+            rb.set_stream(stream).map_err(|e| {
+                hip_bridge::HipError::new(
+                    e.status,
+                    &format!("rocblas_set_stream for bf16 gemm: {}", e.context),
+                )
+            })?;
+        }
+        let alpha = 1.0f32;
+        let beta = 0.0f32;
+        unsafe {
+            rb.gemm_ex(
+                RocblasOperation::Transpose,
+                RocblasOperation::None,
+                m as i32,
+                n as i32,
+                k as i32,
+                &alpha as *const f32 as *const c_void,
+                w_bf16.as_ptr(),
+                RocblasDatatype::Bf16,
+                k as i32,
+                x_bf16.as_ptr(),
+                RocblasDatatype::Bf16,
+                k as i32,
+                &beta as *const f32 as *const c_void,
+                y_fp32.as_ptr(),
+                RocblasDatatype::F32,
+                m as i32,
+                y_fp32.as_ptr(),
+                RocblasDatatype::F32,
+                m as i32,
+                RocblasDatatype::F32,
+            )
+            .map_err(|e| {
+                hip_bridge::HipError::new(e.status, &format!("rocblas_gemm_bf16: {}", e.context))
+            })
+        }
+    }
 }

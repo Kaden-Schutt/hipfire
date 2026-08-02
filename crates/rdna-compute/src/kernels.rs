@@ -2801,6 +2801,11 @@ pub const ACT_QUANT_FP8_UE8M0_INPLACE_GFX942_SRC: &str =
 /// Parent FP4 (E2M1) + UE8M0 g32 dynamic act quant, fused quant+dequant in-place BF16 (gfx942).
 pub const ACT_QUANT_FP4_UE8M0_G32_INPLACE_GFX942_SRC: &str =
     include_str!("../../../kernels/src/act_quant_fp4_ue8m0_g32_inplace.gfx942.hip");
+/// BF16×BF16→FP32 MFMA GEMM for parent-checkpoint linears (gfx942).
+/// Layout: A[M,K] BF16 weights, B[batch,K] BF16 acts, D[batch,M] FP32.
+pub const GEMM_BF16_MFMA_GFX942_SRC: &str =
+    include_str!("../../../kernels/src/gemm_bf16_mfma.gfx942.hip");
+
 
 pub const GEMM_GATE_UP_HFQ4G256_WMMA_SRC: &str =
     include_str!("../../../kernels/src/gemm_gate_up_hfq4g256_wmma.hip");

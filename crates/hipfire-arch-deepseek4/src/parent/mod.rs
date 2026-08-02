@@ -27,9 +27,12 @@
 //! swap cannot inherit parent-calibration policy.
 
 pub mod codec;
+pub mod gemm_ref;
 pub mod inventory;
+pub mod linear;
 pub mod manifest;
 pub mod plog;
+pub mod weights;
 
 
 use hipfire_runtime::model_source::ModelSource;
