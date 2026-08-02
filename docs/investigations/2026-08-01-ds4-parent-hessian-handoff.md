@@ -687,6 +687,91 @@ per-artifact tuning knob from the serving path entirely.
 > teacher is uncertain. Expect the KLD optimum near but not necessarily at
 > 2.0, and report both.
 
+### Gate 6 in progress — the parent forward is wrong at long sequence
+
+Gate 6's first real measurement did exactly what a gate is for: it falsified
+something Gate 5 had passed.
+
+**Infrastructure landed.** `ds4_tokenize_corpus` pins a real corpus to a
+byte-identical token-id file that every run consumes, so no producer
+re-tokenizes. `ds4_quant_plog` captures an HFQ model's logits into the same
+`HFPLOG01` container as the parent and **requires** `--expect-sha256`, refusing
+to load an artifact whose hash does not match. All three 1024-token captures
+live under
+`/mnt/scratch/quantization/deepseek-v4-flash-0731-parent-baseline/`:
+
+| file | bytes | note |
+|---|---:|---|
+| `tokens.bin` | 4,096 | 1024 ids, sha256 `48b0f834…5bb86dd`, from the wikitext2 slice md5 `83b0205a…` |
+| `parent_1024.plog` | 529,530,904 | batched prefill |
+| `mq2r_1024.plog` | 529,530,904 | sha256-verified `cbf2bbcf…9318cce` |
+| `mq2lloyd_1024.plog` | 529,530,904 | sha256-verified `a6195336…` |
+
+**A comparator bug found first.** PPL came back at 5.7e6 (parent) and 1.8e6
+(MQ2R) — worse than the uniform 129,280 — while both models emitted coherent
+text. `.plog` row `t` predicts token `t+1`, but `compare()` scored row `t`
+against `token_ids[t]`. A shift scan settled it empirically:
+`argmax == token_ids[t]` in **0/48** sampled rows for both files, against
+`argmax == token_ids[t+1]` in 13/48 (parent) and 26/48 (MQ2R). The shift now
+happens inside `compare()`, same remedy as the BF16 `amax` fix — an
+interface's input convention is part of its contract. KLD never used targets
+and was unaffected.
+
+**The real finding.** With PPL corrected:
+
+| model | PPL | KLD vs parent | top-1 vs parent |
+|---|---:|---:|---:|
+| parent | **163.89** | — | — |
+| MQ2R | 14.70 | 7.676 | 0.3008 |
+| MQ2-Lloyd | 14.56 | 7.659 | 0.3008 |
+
+**The parent is 11x worse than its own 2-bit quantization.** That is not
+possible for a correct teacher.
+
+Triangulation makes it conclusive. Comparing the two quantized artifacts
+**against each other** — different recipes, one with a Q8 shared tier and one
+with FP4-E8 — gives KLD **0.102**, top-1 **0.873**, p95 0.373. Two independent
+quantizations converge; the parent diverges from both by the same amount, to
+six digits of identical top-1 (308/1024). The parent is the outlier, which
+also means the production DS4 path is fine and the defect is in the parent
+code written this session.
+
+Accuracy by position, identical tokens for all three:
+
+| bucket | parent | mq2r | lloyd |
+|---|---:|---:|---:|
+| [1,32) | 0.292 | 0.292 | 0.292 |
+| [32,64) | 0.542 | 0.625 | 0.708 |
+| [64,127) | 0.458 | 0.708 | 0.625 |
+| [128,256) | 0.458 | 0.583 | 0.583 |
+| [256,512) | 0.333 | 0.458 | 0.375 |
+| [512,1022) | **0.208** | 0.500 | 0.542 |
+
+The parent decays progressively while both quants stay flat, and all three
+agree exactly at [1,32) — a clean control. There is **no break at 128**, so
+this is not the ratio-128 compressor switching on; it is cumulative in
+context length. The parent runs batched prefill while the quantized path runs
+sequential decode, so the batched SWA/compressor bookkeeping is the leading
+suspect.
+
+**Why Gate 5 missed it.** Gate 5 checked finiteness, in-process determinism,
+stage-norm sanity, and a **5-token** prompt. None of those exercise long
+context. Its 256-token run *did* emit gibberish on the fixed sequence, and
+that was explained away as "pseudo-random input, so a meaningless
+continuation" — a reasonable-sounding story that turned out to be covering a
+real defect. **A gate that cannot fail teaches nothing:** next-token accuracy
+against a real corpus, compared to a known-good reference, is the check that
+would have caught this on day one, and it costs one perplexity number.
+
+Diagnostic scripts are on the box at `/root/plog_shift_scan.py` (alignment)
+and `/root/plog_pos_scan.py` (accuracy by position); both sample rows rather
+than streaming 529 MB and run in seconds.
+
+> Until this is fixed, `parent_1024.plog` is **not** a baseline and no KLD
+> number derived from it means anything. The route_scale KLD optimization,
+> Gate 7 Hessians, and Gate 9 GPTQ all depend on a correct teacher and are
+> blocked behind it.
+
 ### Not yet done
 
 Gates 6-9. Specifically:
