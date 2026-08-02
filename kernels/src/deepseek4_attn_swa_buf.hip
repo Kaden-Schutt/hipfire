@@ -65,7 +65,7 @@ extern "C" __global__ __launch_bounds__(512, 1) void deepseek4_attn_swa_buf(
         local_max = fmaxf(local_max, attn_sink[h]);
     }
     for (int off = 16; off > 0; off >>= 1) {
-        local_max = fmaxf(local_max, __shfl_down(local_max, off));
+        local_max = fmaxf(local_max, __shfl_down(local_max, off, 32));
     }
     const int warp_id = t >> 5;
     const int lane_id = t & 31;
@@ -79,7 +79,7 @@ extern "C" __global__ __launch_bounds__(512, 1) void deepseek4_attn_swa_buf(
         const int n_warps = (blockDim.x + 31) >> 5;
         float v = (lane_id < n_warps) ? warp_scratch[lane_id] : -1e30f;
         for (int off = 16; off > 0; off >>= 1) {
-            v = fmaxf(v, __shfl_down(v, off));
+            v = fmaxf(v, __shfl_down(v, off, 32));
         }
         if (lane_id == 0) {
             warp_scratch[0] = v;

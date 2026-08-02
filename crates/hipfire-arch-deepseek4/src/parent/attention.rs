@@ -1876,6 +1876,61 @@ mod tests {
         assert_eq!(swa_n_valid(128, 0, 128), 128);
     }
 
+    /// Long batched-prefill SWA visibility (Gate 6 long-seq defect guard).
+    ///
+    /// At `seqlen > window`, every row deep in the batch must still see exactly
+    /// the trailing `window` absolute positions ending at itself — not a
+    /// window anchored at 0, and not a shared `n_valid` for the whole batch.
+    /// The parent stages SWA via `swa_visibility_stage_batched` + per-row
+    /// `n_valid = swa_n_valid(start_pos, r, window)`; this locks the host-side
+    /// index contract those kernels consume.
+    #[test]
+    fn window_topk_long_batch_row_deep_visible_set() {
+        let win = 128usize;
+        let seqlen = 1024usize;
+        let m = get_window_topk_idxs(win, seqlen, 0).unwrap();
+        // Prefill k = min(seqlen, window) = window once seqlen exceeds it.
+        let k = win;
+        assert_eq!(m.len(), seqlen * k);
+
+        // Row 0: only self.
+        let row0: Vec<i32> = m[..k].iter().copied().filter(|&v| v >= 0).collect();
+        assert_eq!(row0, vec![0]);
+        assert_eq!(swa_n_valid(0, 0, win), 1);
+
+        // Row just inside the window: full prefix 0..=r.
+        let r = 127usize;
+        let row: Vec<i32> = m[r * k..(r + 1) * k]
+            .iter()
+            .copied()
+            .filter(|&v| v >= 0)
+            .collect();
+        assert_eq!(row, (0..=r as i32).collect::<Vec<_>>());
+        assert_eq!(swa_n_valid(0, r, win), win);
+
+        // Row deep past the window: exactly [r+1-window, r], length window.
+        // This is the position-decay canary — a window anchored at 0 or a
+        // shared n_valid would fail here.
+        for &r in &[200usize, 512, 1023] {
+            let row: Vec<i32> = m[r * k..(r + 1) * k]
+                .iter()
+                .copied()
+                .filter(|&v| v >= 0)
+                .collect();
+            let start = r + 1 - win;
+            let expect: Vec<i32> = (start..=r).map(|i| i as i32).collect();
+            assert_eq!(
+                row, expect,
+                "row {r}: visible set must be trailing window ending at self"
+            );
+            assert_eq!(row.len(), win);
+            assert_eq!(swa_n_valid(0, r, win), win);
+            assert_eq!(row[0], start as i32);
+            assert_eq!(*row.last().unwrap(), r as i32);
+        }
+    }
+
+
     #[test]
     fn scratch_bytes_formula() {
         // Host-side size accounting for the *own* tiles (compressor/indexer
