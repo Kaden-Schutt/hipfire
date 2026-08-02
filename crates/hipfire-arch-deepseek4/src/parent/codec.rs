@@ -400,6 +400,22 @@ pub fn dequant_expert_fp4_g32(
 /// Groups of `block` along the last dim. `block` is 128 at linear boundaries
 /// and 64 at the KV non-RoPE simulation sites. Fused quantize+dequantize with
 /// BF16 write-back.
+///
+/// # BF16 input domain (contract)
+///
+/// The bundled kernel declares `in_dtype = bfloat16` (`kernel.py:41-42`) and
+/// computes `amax` over BF16 values loaded from the activation tensor. The GPU
+/// path (`act_quant_fp8_ue8m0_inplace_gfx942`) likewise reads `__hip_bfloat16*`.
+///
+/// This oracle therefore **rounds every element to BF16 before amax / scale /
+/// quant**, even though the buffer is `f32`. Callers may hand in full-precision
+/// f32 (e.g. post-RoPE from an f64-accum host path); the rounding is applied
+/// here so a group whose f32 `amax` sits just across a power-of-two boundary
+/// of `amax/448` cannot pick a scale 2× larger than the BF16/GPU path.
+/// Without this, sparse groups near those boundaries show max_abs ≈ 0.25 with
+/// only ~1e-3 mean relative error — exactly the Gate-2-vs-compressor finding.
+///
+/// Idempotent on already-BF16-representable input (Gate 2 synthetic cases).
 pub fn act_quant_fp8_inplace_ref(
     x: &mut [f32],
     last_dim: usize,
@@ -423,6 +439,12 @@ pub fn act_quant_fp8_inplace_ref(
         )));
     }
 
+    // Enter the BF16 domain before any amax. Matches kernel.py in_dtype=BF16
+    // and the GPU kernel's __bfloat162float loads.
+    for v in x.iter_mut() {
+        *v = round_to_bf16(*v);
+    }
+
     let max_inv = 1.0 / FP8_E4M3_MAX;
     for row in x.chunks_mut(last_dim) {
         for group in row.chunks_mut(block) {
@@ -443,9 +465,14 @@ pub fn act_quant_fp8_inplace_ref(
     Ok(())
 }
 
+
 /// `fp4_act_quant(..., inplace=True)` reference (`kernel.py:163-171`).
 ///
 /// Groups of 32 along the last dim. Fused quantize+dequantize with BF16 write-back.
+///
+/// Same BF16 input-domain contract as [`act_quant_fp8_inplace_ref`]: every
+/// element is rounded to BF16 before amax / scale / quant so the host oracle
+/// matches the GPU kernel's `__hip_bfloat16` buffer.
 pub fn act_quant_fp4_inplace_ref(x: &mut [f32], last_dim: usize) -> Result<(), String> {
     const BLOCK: usize = 32;
     if last_dim == 0 {
@@ -461,6 +488,10 @@ pub fn act_quant_fp4_inplace_ref(x: &mut [f32], last_dim: usize) -> Result<(), S
             "act_quant_fp4_inplace_ref: buffer len {} not divisible by last_dim {last_dim}",
             x.len()
         )));
+    }
+
+    for v in x.iter_mut() {
+        *v = round_to_bf16(*v);
     }
 
     let max_inv = 1.0 / FP4_E2M1_MAX;
@@ -838,6 +869,96 @@ mod tests {
         let err = act_quant_fp8_inplace_ref(&mut z, 10, 8).unwrap_err();
         assert!(err.contains("not divisible"), "{err}");
     }
+
+    /// Regression for the Gate-2-vs-compressor finding: full-precision f32
+    /// input whose amax sits just across a power-of-two `fast_round_scale`
+    /// boundary must pick the **BF16-domain** scale, not the f32-domain one.
+    ///
+    /// Isolating numbers (block 64, post-RoPE-like):
+    /// - f32 amax = 224.4 → `fast_round_scale(224.4, 1/448) = 1.0`
+    /// - BF16 amax = 224.0 → `fast_round_scale(224.0, 1/448) = 0.5`
+    /// - GPU kernel reads `__hip_bfloat16` so it uses 0.5; a host oracle that
+    ///   amax'es raw f32 picks 1.0 and the whole group reconstructs ~2× off
+    ///   (max_abs ≈ 0.25, mean_rel ≈ 2e-3) — the reported signature.
+    ///
+    /// Before the BF16-domain fix this test fails: `from_f32` disagrees with
+    /// `from_bf16` at every element of the affected group. After the fix they
+    /// are bit-identical and the amax element reconstructs to 224.0.
+    #[test]
+    fn act_quant_fp8_bf16_domain_power_of_two_boundary() {
+        const BLOCK: usize = 64;
+        let mut x = vec![0.01f32; BLOCK];
+        // 224.4 is NOT BF16-representable; rounds to 224.0.
+        x[0] = 224.4;
+
+        let amax_f32 = 224.4f32;
+        let amax_bf16 = round_to_bf16(224.4);
+        assert_eq!(amax_bf16, 224.0);
+        let s_f32 = fast_round_scale(amax_f32.max(1e-4), 1.0 / 448.0);
+        let s_bf16 = fast_round_scale(amax_bf16.max(1e-4), 1.0 / 448.0);
+        assert_eq!(s_f32, 1.0, "precondition: f32-domain scale must be 1.0");
+        assert_eq!(s_bf16, 0.5, "precondition: bf16-domain scale must be 0.5");
+        assert_ne!(s_f32, s_bf16, "precondition: domains must disagree");
+
+        // Oracle on full-f32 input must match oracle on pre-rounded BF16 input.
+        let mut from_f32 = x.clone();
+        act_quant_fp8_inplace_ref(&mut from_f32, BLOCK, BLOCK).unwrap();
+        let mut from_bf16: Vec<f32> = x.iter().copied().map(round_to_bf16).collect();
+        act_quant_fp8_inplace_ref(&mut from_bf16, BLOCK, BLOCK).unwrap();
+        for i in 0..BLOCK {
+            assert_eq!(
+                from_f32[i].to_bits(),
+                from_bf16[i].to_bits(),
+                "idx {i}: f32-in path {:?} vs bf16-in path {:?}",
+                from_f32[i],
+                from_bf16[i]
+            );
+        }
+        // Multi-row / multi-group post-RoPE-like: several near-boundary amaxes
+        // mixed with ordinary values. last_dim = 448 (= 7*64), matching the
+        // compressor non-RoPE slice (head_dim 512 − rope 64).
+        let last_dim = 448usize;
+        let n_rows = 3usize;
+        let mut rope_like = vec![0.0f32; n_rows * last_dim];
+        // Boundaries of amax/448 at powers of two: 448*2^k for integer k.
+        // Just-above values that BF16 rounds back onto the boundary.
+        let near = [
+            224.4f32,  // → 224, s: 1.0 vs 0.5
+            112.3,     // → 112, s: 0.5 vs 0.25
+            56.2,      // → 56,  s: 0.25 vs 0.125
+            28.1,      // → 28,  s: 0.125 vs 0.0625
+            14.05,     // → 14
+            7.02,      // → 7
+            448.4,     // → 448, s: 2.0 vs 1.0
+        ];
+        for r in 0..n_rows {
+            for g in 0..(last_dim / BLOCK) {
+                let base = r * last_dim + g * BLOCK;
+                for i in 0..BLOCK {
+                    // Full-f32 mantissa junk (bottom 16 bits set) — like f64→f32
+                    // cast from an f64-accum matmul, not a BF16 residual.
+                    let bits = (0.37f32 * (i as f32 + 1.0)).to_bits() | 0x0000_a5a5;
+                    rope_like[base + i] = f32::from_bits(bits) * if i % 2 == 0 { 1.0 } else { -1.0 };
+                }
+                // Plant a near-boundary amax in each group.
+                rope_like[base] = near[g % near.len()];
+            }
+        }
+        let mut a = rope_like.clone();
+        act_quant_fp8_inplace_ref(&mut a, last_dim, BLOCK).unwrap();
+        let mut b: Vec<f32> = rope_like.iter().copied().map(round_to_bf16).collect();
+        act_quant_fp8_inplace_ref(&mut b, last_dim, BLOCK).unwrap();
+        for i in 0..a.len() {
+            assert_eq!(
+                a[i].to_bits(),
+                b[i].to_bits(),
+                "post-rope-like mismatch at {i}: {:?} vs {:?}",
+                a[i],
+                b[i]
+            );
+        }
+    }
+
 
     #[test]
     fn act_quant_fp4_inplace_floor_differs_from_fp8() {

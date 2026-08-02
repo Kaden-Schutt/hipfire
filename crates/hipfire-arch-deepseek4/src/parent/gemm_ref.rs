@@ -31,7 +31,8 @@
 //! which is exactly what the two [`AccumMode`]s quantify.
 
 use super::codec::{
-    e2m1_to_f32, e4m3_to_f32, f32_to_e4m3, fast_round_scale, ue8m0_to_f32, FP8_E4M3_MAX,
+    e2m1_to_f32, e4m3_to_f32, f32_to_e4m3, fast_round_scale, round_to_bf16, ue8m0_to_f32,
+    FP8_E4M3_MAX,
 };
 
 /// Accumulation mode for the GEMM oracles.
@@ -84,6 +85,12 @@ fn f32_to_ue8m0_exact(s: f32) -> Result<u8, String> {
 ///
 /// `x` is interpreted as a row-major `[rows, last_dim]` matrix with
 /// `rows = x.len() / last_dim`. `last_dim` must be divisible by `block`.
+///
+/// # BF16 input domain
+///
+/// Matches [`crate::parent::codec::act_quant_fp8_inplace_ref`]: every element is
+/// rounded to BF16 before amax / scale / quant (`kernel.py` `in_dtype=BF16`).
+/// Callers may pass full-precision f32; the rounding is applied here.
 pub fn act_quant_fp8_codes(
     x: &[f32],
     last_dim: usize,
@@ -113,10 +120,13 @@ pub fn act_quant_fp8_codes(
     let mut scales = vec![0u8; rows * groups];
     let max_inv = 1.0 / FP8_E4M3_MAX;
 
+    // Materialise the BF16-domain view once (kernel.py in_dtype=BF16).
+    let x_bf16: Vec<f32> = x.iter().copied().map(round_to_bf16).collect();
+
     for r in 0..rows {
         for g in 0..groups {
             let base = r * last_dim + g * block;
-            let group = &x[base..base + block];
+            let group = &x_bf16[base..base + block];
             let mut amax = 0.0f32;
             for &v in group {
                 amax = amax.max(v.abs());

@@ -38,6 +38,7 @@ pub mod inventory;
 pub mod layer_ref;
 pub mod linear;
 pub mod manifest;
+pub mod model;
 pub mod moe;
 pub mod plog;
 pub mod weights;

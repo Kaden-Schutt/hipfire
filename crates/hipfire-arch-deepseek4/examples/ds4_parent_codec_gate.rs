@@ -27,8 +27,8 @@
 
 use hipfire_arch_deepseek4::parent::codec::{
     act_quant_fp4_inplace_ref, act_quant_fp8_inplace_ref, dequant_dense_fp8_block128,
-    dequant_expert_fp4_g32, e2m1_to_f32, e4m3_to_f32, round_to_bf16, ue8m0_to_f32, E2M1_LUT,
-    FP4_E2M1_MAX, FP8_E4M3_MAX,
+    dequant_expert_fp4_g32, e2m1_to_f32, e4m3_to_f32, fast_round_scale, round_to_bf16,
+    ue8m0_to_f32, E2M1_LUT, FP4_E2M1_MAX, FP8_E4M3_MAX,
 };
 use rdna_compute::{Gpu, GpuTensor};
 use std::env;
@@ -721,14 +721,13 @@ fn run_act_quant_fp8(
     let last_dim = x_f32.len() / n_rows;
     assert_eq!(last_dim % block, 0);
 
-    // CPU oracle on f32 (writes BF16-rounded f32 back).
+    // CPU oracle rounds to BF16 internally before amax (kernel.py in_dtype=BF16).
     let mut cpu = x_f32.clone();
     act_quant_fp8_inplace_ref(&mut cpu, last_dim, block)?;
 
     // GPU path: upload BF16-rounded inputs (matching the kernel's BF16 domain).
-    // The reference model keeps activations in BF16; inputs to act_quant are BF16.
     let in_bf16: Vec<f32> = x_f32.iter().copied().map(round_to_bf16).collect();
-    // Re-run CPU from the same BF16 inputs so both sides see identical starts.
+    // Re-run CPU from the same BF16 inputs — must bit-agree with f32-in path.
     let mut cpu_from_bf16 = in_bf16.clone();
     act_quant_fp8_inplace_ref(&mut cpu_from_bf16, last_dim, block)?;
 
@@ -739,17 +738,24 @@ fn run_act_quant_fp8(
     let gpu_out = download_bf16_f32(gpu, &d_x, n_rows * last_dim)?;
     free(gpu, d_x);
 
+    // f32-in vs bf16-in host paths must agree (oracle BF16-domain contract).
+    if let Err(e) = compare_bf16_domain(&cpu, &cpu_from_bf16, "cpu-f32in-vs-bf16in", 4) {
+        gate.record(
+            'C',
+            name,
+            false,
+            format!("host f32-in vs bf16-in disagree (BF16-domain contract broken): {e}"),
+        );
+        return Ok(());
+    }
+
     match compare_bf16_domain(&cpu_from_bf16, &gpu_out, name, 8) {
         Ok(()) => {
-            // Also note whether f32-input CPU agreed (informational; not a fail).
-            let f32_agree = compare_bf16_domain(&cpu, &cpu_from_bf16, "cpu-vs-bf16in", 1).is_ok();
             gate.record(
                 'C',
                 name,
                 true,
-                format!(
-                    "rows={n_rows} last_dim={last_dim} block={block} f32_in_agree={f32_agree}"
-                ),
+                format!("rows={n_rows} last_dim={last_dim} block={block} f32_in_agree=true"),
             );
         }
         Err(e) => {
@@ -770,6 +776,129 @@ fn run_act_quant_fp8(
                 }
             }
             gate.record('C', name, false, extra);
+        }
+    }
+    Ok(())
+}
+
+/// Full-precision f32 activations shaped like the compressor post-RoPE site
+/// (`model.py:378`: `kv[..., :-rd]`, block 64, last_dim = 448 = 512−64).
+///
+/// Values carry bottom-16-bit mantissa junk (f64-accum → f32 cast, not a BF16
+/// residual) and deliberately plant amaxes just above power-of-two
+/// `fast_round_scale` boundaries so BF16 rounding flips the scale by 2×.
+/// Gate 2 previously only exercised BF16-clean synthetics and missed this
+/// class — the coverage hole behind the compressor finding.
+fn build_fp8_post_rope_like_cases(n_rows: usize) -> Vec<f32> {
+    const BLOCK: usize = 64;
+    const LAST_DIM: usize = 448; // 7 groups × 64 — compressor non-RoPE slice
+    // Just-above boundaries of amax/448 at powers of two. BF16 rounds each
+    // back onto the boundary, flipping fast_round_scale by exactly one exp.
+    let near = [
+        224.4f32, // s_f32=1.0  vs s_bf16=0.5
+        112.3,    // 0.5 vs 0.25
+        56.2,     // 0.25 vs 0.125
+        28.1,     // 0.125 vs 0.0625
+        14.05,    // 0.0625 vs 0.03125
+        7.02,     // 0.03125 vs 0.015625
+        448.4,    // 2.0 vs 1.0
+    ];
+    let mut x = vec![0.0f32; n_rows * LAST_DIM];
+    for r in 0..n_rows {
+        for g in 0..(LAST_DIM / BLOCK) {
+            let base = r * LAST_DIM + g * BLOCK;
+            for i in 0..BLOCK {
+                // Plant full-f32 mantissa noise (bottom 16 bits set).
+                let bits = (0.37f32 * (i as f32 + 1.0 + r as f32)).to_bits() | 0x0000_a5a5;
+                let v = f32::from_bits(bits);
+                x[base + i] = if i % 2 == 0 { v } else { -v };
+            }
+            x[base] = near[g % near.len()];
+        }
+    }
+    x
+}
+
+fn run_act_quant_fp8_post_rope_like(gpu: &mut Gpu, gate: &mut Gate) -> Result<(), String> {
+    const BLOCK: usize = 64;
+    let n_rows = 4usize;
+    let x_f32 = build_fp8_post_rope_like_cases(n_rows);
+    let last_dim = x_f32.len() / n_rows;
+    assert_eq!(last_dim, 448);
+    assert_eq!(last_dim % BLOCK, 0);
+
+    // Prove the coverage hole is real: f32-domain amax scale ≠ BF16-domain
+    // scale on at least one planted group (otherwise the case is vacuous).
+    let mut n_scale_flip = 0usize;
+    for r in 0..n_rows {
+        for g in 0..(last_dim / BLOCK) {
+            let base = r * last_dim + g * BLOCK;
+            let mut amax_f = 0.0f32;
+            let mut amax_b = 0.0f32;
+            for i in 0..BLOCK {
+                let v = x_f32[base + i];
+                amax_f = amax_f.max(v.abs());
+                amax_b = amax_b.max(round_to_bf16(v).abs());
+            }
+            let s_f = fast_round_scale(amax_f.max(1e-4), 1.0 / 448.0);
+            let s_b = fast_round_scale(amax_b.max(1e-4), 1.0 / 448.0);
+            if s_f != s_b {
+                n_scale_flip += 1;
+            }
+        }
+    }
+    if n_scale_flip == 0 {
+        gate.record(
+            'C',
+            "act_quant_fp8_post_rope_like_block64",
+            false,
+            "vacuous: no group had f32-vs-bf16 scale flip — case construction broken",
+        );
+        return Ok(());
+    }
+
+    // Host oracle on full-f32 (internally BF16-rounds) vs GPU on BF16 buffer.
+    let mut cpu = x_f32.clone();
+    act_quant_fp8_inplace_ref(&mut cpu, last_dim, BLOCK)?;
+
+    let in_bf16: Vec<f32> = x_f32.iter().copied().map(round_to_bf16).collect();
+    let bytes = pack_f32_to_bf16_bytes(&in_bf16);
+    let d_x = upload_bytes(gpu, &bytes)?;
+    gpu.act_quant_fp8_ue8m0_inplace_gfx942(&d_x.buf, n_rows, last_dim, BLOCK)
+        .map_err(|e| format!("act_quant_fp8 post-rope-like launch: {e:?}"))?;
+    let gpu_out = download_bf16_f32(gpu, &d_x, n_rows * last_dim)?;
+    free(gpu, d_x);
+
+    match compare_bf16_domain(&cpu, &gpu_out, "act_quant_fp8_post_rope_like_block64", 8) {
+        Ok(()) => {
+            gate.record(
+                'C',
+                "act_quant_fp8_post_rope_like_block64",
+                true,
+                format!(
+                    "rows={n_rows} last_dim={last_dim} block={BLOCK} \
+                     scale_flips={n_scale_flip} (f32-domain≠bf16-domain amax groups)"
+                ),
+            );
+        }
+        Err(e) => {
+            let mut extra = e.clone();
+            for i in 0..cpu.len() {
+                if cpu[i].to_bits() != gpu_out[i].to_bits()
+                    && !(cpu[i].is_nan() && gpu_out[i].is_nan())
+                {
+                    let row = i / last_dim;
+                    let col = i % last_dim;
+                    let group = col / BLOCK;
+                    extra = format!(
+                        "{e} | row={row} col={col} group={group} \
+                         xin_f32={:?} xin_bf16={:?} cpu={:?} gpu={:?}",
+                        x_f32[i], in_bf16[i], cpu[i], gpu_out[i]
+                    );
+                    break;
+                }
+            }
+            gate.record('C', "act_quant_fp8_post_rope_like_block64", false, extra);
         }
     }
     Ok(())
@@ -1299,6 +1428,9 @@ fn main() -> ExitCode {
     }
     if let Err(e) = run_act_quant_fp8(&mut gpu, &mut gate, 64, "act_quant_fp8_block64") {
         gate.record('C', "act_quant_fp8_block64", false, e);
+    }
+    if let Err(e) = run_act_quant_fp8_post_rope_like(&mut gpu, &mut gate) {
+        gate.record('C', "act_quant_fp8_post_rope_like_block64", false, e);
     }
     if let Err(e) = run_act_quant_fp4(&mut gpu, &mut gate) {
         gate.record('C', "act_quant_fp4_g32", false, e);

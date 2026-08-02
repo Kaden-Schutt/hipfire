@@ -403,24 +403,19 @@ fn parent_layer_forward_inner(
         )));
     }
 
-    // compress_ratio != 0 is refused here with a clear error; attention would
-    // also refuse, but naming the limitation at the layer boundary keeps the
-    // gate from having to dig into the attn error string.
-    let ratio = layer.compress_ratio;
-    if ratio != 0 {
-        return Err(err(format!(
-            "parent_layer_forward refuses compress_ratio={ratio} (layer {layer_idx}); \
-             compressor/indexer path is out of scope for this slice — only \
-             compress_ratio == 0 (pure SWA) is supported"
-        )));
-    }
-    if cfg.compress_ratio(layer_idx) != 0 {
+    // compress_ratio is validated inside parent_attention_swa (0 / 4 / 128).
+    // Layer forward no longer refuses ratio != 0 — compressor/indexer are
+    // owned by ParentAttnScratch and wired through the attention path.
+    let _ratio = layer.compress_ratio;
+    if cfg.compress_ratio(layer_idx) != layer.compress_ratio {
         return Err(err(format!(
             "parent_layer_forward: config.compress_ratios[{layer_idx}] = {} but \
-             layer.compress_ratio claims 0 — refusing rather than guessing",
-            cfg.compress_ratio(layer_idx)
+             layer.compress_ratio claims {} — refusing rather than guessing",
+            cfg.compress_ratio(layer_idx),
+            layer.compress_ratio
         )));
     }
+
 
     // Hash-routed layers need input_ids; score-routed layers must not require
     // them. Error, do not default.
@@ -816,21 +811,19 @@ mod tests {
     }
 
     #[test]
-    fn compress_ratio_refusal_message() {
-        // Pure string-level contract: the layer forward must name the
-        // limitation rather than masking attention's refusal. We exercise
-        // the same format the runtime path emits.
+    fn compress_ratio_mismatch_message() {
+        // Layer forward no longer refuses ratio!=0; it still fails closed on
+        // a config/layer compress_ratio mismatch.
         let layer_idx = 5usize;
-        let ratio = 4usize;
+        let cfg_ratio = 4usize;
+        let layer_ratio = 0usize;
         let msg = err(format!(
-            "parent_layer_forward refuses compress_ratio={ratio} (layer {layer_idx}); \
-             compressor/indexer path is out of scope for this slice — only \
-             compress_ratio == 0 (pure SWA) is supported"
+            "parent_layer_forward: config.compress_ratios[{layer_idx}] = {cfg_ratio} but \
+             layer.compress_ratio claims {layer_ratio} — refusing rather than guessing"
         ));
-        assert!(msg.contains("compress_ratio=4"));
-        assert!(msg.contains("layer 5"));
+        assert!(msg.contains("compress_ratios[5] = 4"));
+        assert!(msg.contains("claims 0"));
         assert!(msg.contains("deepseek4 parent:"));
-        assert!(msg.contains("pure SWA"));
     }
 
     #[test]
@@ -846,6 +839,7 @@ mod tests {
         assert!(msg.contains("input_ids required"));
         assert!(msg.contains("num_hash_layers=3"));
     }
+
 
     #[test]
     fn score_layer_does_not_require_ids() {

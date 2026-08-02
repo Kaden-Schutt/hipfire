@@ -2,24 +2,43 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Parent-checkpoint Multi-head Latent Attention (SWA-only / `compress_ratio == 0`).
+//! Parent-checkpoint Multi-head Latent Attention (SWA + compressor/indexer).
 //!
 //! Operator-semantics authority:
 //! - `.codeinsight+research/ds4-parent-ref/inference/model.py`
-//!   - `Attention.forward` 442-549 (minus the `if self.compress_ratio:` branch)
+//!   - `Attention.forward` 442-549 (all three layer classes)
+//!   - `get_window_topk_idxs` 260-271
+//!   - `get_compress_topk_idxs` 274-283
 //!   - `precompute_freqs_cis` 206-236
 //!   - `apply_rotary_emb` 238-250  → **interleaved** pair convention
 //!     (`view_as_complex(x.float().unflatten(-1, (-1, 2)))` pairs dims
 //!     `(2i, 2i+1)`, NOT half-split `(i, i + n_rot/2)`)
-//!   - `get_window_topk_idxs` 260-271
-//! - config.json (ratio-0 SWA layers disable YaRN):
-//!   `original_seq_len = 0`, `rope_theta = 10000` (`model.py:484-485`)
+//! - config.json:
+//!   - ratio-0 SWA: `original_seq_len = 0`, `rope_theta = 10000`
+//!   - ratio>0: YaRN on, `compress_rope_theta = 160000`, `original_seq_len = 65536`
 //!
-//! This module calls `Gpu` kernels directly. It does **not** thread a weight
-//! provider through `forward.rs` and does **not** implement compressor /
-//! indexer paths — layers with `compress_ratio != 0` are refused.
+//! Layer classes (`compress_ratios`):
+//! - **0** (layers 0,1,40-42): pure SWA over the ring.
+//! - **128**: main compressor (`hadamard=false`) + identity gather of all
+//!   compressed slots into the joint softmax with the SWA window + sink.
+//! - **4**: main compressor + indexer (top-`index_topk` compressed slots).
+//!   The indexer's own compressor is internal (`hadamard=true`); the main
+//!   attention compressor is a separate instance.
+//!
+//! Compressed KV and compressor ring state live in [`ParentAttnScratch`].
+//! Prefill (`start_pos == 0`) is self-contained per call (ring is reset).
+//! Multi-layer **decode** with one shared scratch is not supported — each
+//! layer needs its own persistent compressor ring + main_kv_cache.
 
 use crate::parent::codec::round_to_bf16;
+use crate::parent::compressor::{
+    parent_compressor_forward, ParentCompressorScratch, PARENT_COMPRESS_ROPE_THETA,
+    PARENT_YARN_BETA_FAST, PARENT_YARN_BETA_SLOW, PARENT_YARN_FACTOR, PARENT_YARN_ORIG_SEQ,
+};
+use crate::parent::indexer::{
+    indexer_n_compressed, indexer_n_visible, parent_indexer_forward, ParentIndexerScratch,
+    PARENT_INDEX_TOPK,
+};
 use crate::parent::linear::{parent_linear_dense, ParentDenseWeight};
 use crate::parent::weights::ParentLayerWeights;
 use crate::parent::{Ds4ParentBackend, ParentQuantConfig};
@@ -61,6 +80,8 @@ pub const PARENT_RMS_EPS: f32 = 1e-6;
 pub const PARENT_ROPE_THETA: f32 = 10_000.0;
 /// Block size for the KV non-RoPE FP8 act-quant simulation (`model.py:512`).
 pub const PARENT_KV_ACT_QUANT_BLOCK: usize = 64;
+/// `index_topk` — max compressed slots selected by the indexer.
+pub const PARENT_ATTN_INDEX_TOPK: usize = PARENT_INDEX_TOPK; // 512
 
 // ── Scratch ─────────────────────────────────────────────────────────────────
 
@@ -69,6 +90,10 @@ pub const PARENT_KV_ACT_QUANT_BLOCK: usize = 64;
 /// BF16 staging is deliberately **one** tile that is refilled before every
 /// `parent_linear_dense` call — that API destroys its `x_bf16` input via
 /// in-place act-quant (`inplace=True` in the reference).
+///
+/// Owns compressor + indexer scratch so a layer forward still allocates once.
+/// `main_kv_cache` holds the main-attention compressor output for the current
+/// call (and across decode steps when the same scratch is reused for one layer).
 pub struct ParentAttnScratch {
     /// Destructive BF16 act tile. Width = max linear K = [`PARENT_WO_A_OUT`].
     act_bf16: GpuTensor,
@@ -86,26 +111,47 @@ pub struct ParentAttnScratch {
     wo_a_out_f32: GpuTensor,
     /// Per-row SWA visibility window `[max_rows, head_dim, window]` (K=V tied).
     swa_staged: GpuTensor,
-    /// Per-row `n_valid` for the SWA kernel (`I32` bits, length `max_rows`).
+    /// Per-row gathered top-k compressed KV `[max_rows, head_dim, index_topk]`.
+    topk_staged: GpuTensor,
+    /// Main-attention compressor KV cache `[max_n_compressed, head_dim]` F32.
+    main_kv_cache: GpuTensor,
+    /// Indexer top-k indices `[max_rows, index_topk]` I32 (Raw bytes).
+    topk_idx: GpuTensor,
+    /// Per-row `n_valid` SWA counts (`I32` bits, length `max_rows`).
     n_valid: GpuTensor,
+    /// Per-row active top-k counts (`I32` bits, length `max_rows`).
+    n_active_topk: GpuTensor,
     /// Absolute positions for batched RoPE (`I32` bits, length `max_rows`).
     positions: GpuTensor,
     /// Weight-ones `[head_dim]` reserved for a future device-side per-head RMSNorm.
     #[allow(dead_code)]
     q_head_ones: GpuTensor,
+    /// Main-attention compressor scratch (`hadamard = false`).
+    compressor: ParentCompressorScratch,
+    /// Indexer scratch (owns its own compressor path with `hadamard = true`).
+    indexer: ParentIndexerScratch,
     max_rows: usize,
+    max_n_compressed: usize,
     bytes: usize,
 }
 
 impl ParentAttnScratch {
     /// Allocate reusable scratch for up to `max_rows` tokens.
+    ///
+    /// Compressed-cache capacity is
+    /// `max(max_rows, PARENT_ATTN_INDEX_TOPK)` so a pure-prefill of
+    /// `max_rows` always fits at ratio 4 (`rows/4`) and ratio 128, and the
+    /// identity-gather path never exceeds the top-k staging stride.
     pub fn new(gpu: &mut Gpu, cfg: &ParentQuantConfig, max_rows: usize) -> Result<Self, String> {
-        let _ = cfg; // shapes pinned to the parent checkpoint contract
         if max_rows == 0 {
             return Err("deepseek4 parent: ParentAttnScratch max_rows must be > 0".to_owned());
         }
+        let max_n_compressed = max_rows.max(PARENT_ATTN_INDEX_TOPK);
 
-        // Explicit chain (same pattern as parent/moe.rs).
+        // Nested compressor / indexer scratch first so their sizes are known.
+        let compressor = ParentCompressorScratch::new(gpu, cfg, max_rows)?;
+        let indexer = ParentIndexerScratch::new(gpu, cfg, max_rows)?;
+
         let act_bf16 = gpu
             .alloc_tensor(&[max_rows, PARENT_WO_A_OUT], DType::BF16)
             .map_err(|e| format!("deepseek4 parent: attn act_bf16 alloc: {e:?}"))?;
@@ -181,7 +227,55 @@ impl ParentAttnScratch {
                     return Err(format!("deepseek4 parent: attn swa_staged alloc: {e:?}"));
                 }
             };
-        // I32 buffers: Raw with byte-length shape (dtype.size()==1).
+        let topk_staged = match gpu.alloc_tensor(
+            &[max_rows, PARENT_HEAD_DIM, PARENT_ATTN_INDEX_TOPK],
+            DType::F32,
+        ) {
+            Ok(t) => t,
+            Err(e) => {
+                let _ = gpu.free_tensor(act_bf16);
+                let _ = gpu.free_tensor(kv_nope_bf16);
+                let _ = gpu.free_tensor(q_lat_f32);
+                let _ = gpu.free_tensor(q_f32);
+                let _ = gpu.free_tensor(kv_f32);
+                let _ = gpu.free_tensor(attn_out_f32);
+                let _ = gpu.free_tensor(wo_a_out_f32);
+                let _ = gpu.free_tensor(swa_staged);
+                return Err(format!("deepseek4 parent: attn topk_staged alloc: {e:?}"));
+            }
+        };
+        let main_kv_cache =
+            match gpu.alloc_tensor(&[max_n_compressed, PARENT_HEAD_DIM], DType::F32) {
+                Ok(t) => t,
+                Err(e) => {
+                    let _ = gpu.free_tensor(act_bf16);
+                    let _ = gpu.free_tensor(kv_nope_bf16);
+                    let _ = gpu.free_tensor(q_lat_f32);
+                    let _ = gpu.free_tensor(q_f32);
+                    let _ = gpu.free_tensor(kv_f32);
+                    let _ = gpu.free_tensor(attn_out_f32);
+                    let _ = gpu.free_tensor(wo_a_out_f32);
+                    let _ = gpu.free_tensor(swa_staged);
+                    let _ = gpu.free_tensor(topk_staged);
+                    return Err(format!("deepseek4 parent: attn main_kv_cache alloc: {e:?}"));
+                }
+            };
+        let topk_idx = match alloc_i32_buf(gpu, max_rows * PARENT_ATTN_INDEX_TOPK) {
+            Ok(t) => t,
+            Err(e) => {
+                let _ = gpu.free_tensor(act_bf16);
+                let _ = gpu.free_tensor(kv_nope_bf16);
+                let _ = gpu.free_tensor(q_lat_f32);
+                let _ = gpu.free_tensor(q_f32);
+                let _ = gpu.free_tensor(kv_f32);
+                let _ = gpu.free_tensor(attn_out_f32);
+                let _ = gpu.free_tensor(wo_a_out_f32);
+                let _ = gpu.free_tensor(swa_staged);
+                let _ = gpu.free_tensor(topk_staged);
+                let _ = gpu.free_tensor(main_kv_cache);
+                return Err(e);
+            }
+        };
         let n_valid = match alloc_i32_buf(gpu, max_rows) {
             Ok(t) => t,
             Err(e) => {
@@ -193,6 +287,27 @@ impl ParentAttnScratch {
                 let _ = gpu.free_tensor(attn_out_f32);
                 let _ = gpu.free_tensor(wo_a_out_f32);
                 let _ = gpu.free_tensor(swa_staged);
+                let _ = gpu.free_tensor(topk_staged);
+                let _ = gpu.free_tensor(main_kv_cache);
+                let _ = gpu.free_tensor(topk_idx);
+                return Err(e);
+            }
+        };
+        let n_active_topk = match alloc_i32_buf(gpu, max_rows) {
+            Ok(t) => t,
+            Err(e) => {
+                let _ = gpu.free_tensor(act_bf16);
+                let _ = gpu.free_tensor(kv_nope_bf16);
+                let _ = gpu.free_tensor(q_lat_f32);
+                let _ = gpu.free_tensor(q_f32);
+                let _ = gpu.free_tensor(kv_f32);
+                let _ = gpu.free_tensor(attn_out_f32);
+                let _ = gpu.free_tensor(wo_a_out_f32);
+                let _ = gpu.free_tensor(swa_staged);
+                let _ = gpu.free_tensor(topk_staged);
+                let _ = gpu.free_tensor(main_kv_cache);
+                let _ = gpu.free_tensor(topk_idx);
+                let _ = gpu.free_tensor(n_valid);
                 return Err(e);
             }
         };
@@ -207,7 +322,11 @@ impl ParentAttnScratch {
                 let _ = gpu.free_tensor(attn_out_f32);
                 let _ = gpu.free_tensor(wo_a_out_f32);
                 let _ = gpu.free_tensor(swa_staged);
+                let _ = gpu.free_tensor(topk_staged);
+                let _ = gpu.free_tensor(main_kv_cache);
+                let _ = gpu.free_tensor(topk_idx);
                 let _ = gpu.free_tensor(n_valid);
+                let _ = gpu.free_tensor(n_active_topk);
                 return Err(e);
             }
         };
@@ -223,13 +342,17 @@ impl ParentAttnScratch {
                 let _ = gpu.free_tensor(attn_out_f32);
                 let _ = gpu.free_tensor(wo_a_out_f32);
                 let _ = gpu.free_tensor(swa_staged);
+                let _ = gpu.free_tensor(topk_staged);
+                let _ = gpu.free_tensor(main_kv_cache);
+                let _ = gpu.free_tensor(topk_idx);
                 let _ = gpu.free_tensor(n_valid);
+                let _ = gpu.free_tensor(n_active_topk);
                 let _ = gpu.free_tensor(positions);
                 return Err(format!("deepseek4 parent: attn q_head_ones upload: {e:?}"));
             }
         };
 
-        let bytes = act_bf16.buf.size()
+        let own_bytes = act_bf16.buf.size()
             + kv_nope_bf16.buf.size()
             + q_lat_f32.buf.size()
             + q_f32.buf.size()
@@ -237,9 +360,14 @@ impl ParentAttnScratch {
             + attn_out_f32.buf.size()
             + wo_a_out_f32.buf.size()
             + swa_staged.buf.size()
+            + topk_staged.buf.size()
+            + main_kv_cache.buf.size()
+            + topk_idx.buf.size()
             + n_valid.buf.size()
+            + n_active_topk.buf.size()
             + positions.buf.size()
             + q_head_ones.buf.size();
+        let bytes = own_bytes + compressor.bytes() + indexer.bytes();
 
         Ok(Self {
             act_bf16,
@@ -250,21 +378,32 @@ impl ParentAttnScratch {
             attn_out_f32,
             wo_a_out_f32,
             swa_staged,
+            topk_staged,
+            main_kv_cache,
+            topk_idx,
             n_valid,
+            n_active_topk,
             positions,
             q_head_ones,
+            compressor,
+            indexer,
             max_rows,
+            max_n_compressed,
             bytes,
         })
     }
 
-    /// Total scratch bytes resident on device.
+    /// Total scratch bytes resident on device (own tiles + compressor + indexer).
     pub fn bytes(&self) -> usize {
         self.bytes
     }
 
     pub fn max_rows(&self) -> usize {
         self.max_rows
+    }
+
+    pub fn max_n_compressed(&self) -> usize {
+        self.max_n_compressed
     }
 
     /// Post-RoPE Q buffer `[max_rows, n_heads, head_dim]` (diagnostic).
@@ -281,6 +420,47 @@ impl ParentAttnScratch {
     pub fn attn_out_f32_ref(&self) -> Result<&GpuTensor, String> {
         Ok(&self.attn_out_f32)
     }
+
+    /// Q-LoRA bottleneck after q_norm `[max_rows, q_lora]` (indexer `qr` input).
+    pub fn q_lat_f32_ref(&self) -> &GpuTensor {
+        &self.q_lat_f32
+    }
+
+    /// Main compressor KV cache `[max_n_compressed, head_dim]` (diagnostic).
+    pub fn main_kv_cache_ref(&self) -> &GpuTensor {
+        &self.main_kv_cache
+    }
+
+    /// Indexer top-k indices buffer (diagnostic).
+    pub fn topk_idx_ref(&self) -> &GpuTensor {
+        &self.topk_idx
+    }
+
+    /// Nested compressor scratch.
+    pub fn compressor_scratch(&self) -> &ParentCompressorScratch {
+        &self.compressor
+    }
+
+    /// Nested indexer scratch.
+    pub fn indexer_scratch(&self) -> &ParentIndexerScratch {
+        &self.indexer
+    }
+
+    /// Per-row active top-k counts (`I32` bits, length `max_rows`).
+    pub fn n_active_topk_ref(&self) -> &GpuTensor {
+        &self.n_active_topk
+    }
+
+    /// Per-row SWA staged window `[max_rows, head_dim, window]` (diagnostic).
+    pub fn swa_staged_ref(&self) -> &GpuTensor {
+        &self.swa_staged
+    }
+
+    /// Per-row gathered top-k KV `[max_rows, head_dim, index_topk]` (diagnostic).
+    pub fn topk_staged_ref(&self) -> &GpuTensor {
+        &self.topk_staged
+    }
+
 }
 
 fn alloc_i32_buf(gpu: &mut Gpu, n: usize) -> Result<GpuTensor, String> {
@@ -292,6 +472,7 @@ fn alloc_i32_buf(gpu: &mut Gpu, n: usize) -> Result<GpuTensor, String> {
     gpu.upload_raw(&zeros, &[nbytes])
         .map_err(|e| format!("deepseek4 parent: i32 buf alloc: {e:?}"))
 }
+
 
 
 // ── Host helpers (unit-tested) ──────────────────────────────────────────────
@@ -512,6 +693,84 @@ pub fn get_window_topk_idxs(
     }
 }
 
+/// `get_compress_topk_idxs` (`model.py:274-283`).
+///
+/// Returns a flat `rows * k` row-major `i32` matrix of compressed-slot
+/// indices (already shifted by `offset`), padded with `-1`.
+///
+/// - Prefill (`start_pos == 0`): `k = seqlen / ratio` (integer). Row `r`
+///   sees compressed slots `[0, (r+1)/ratio)` then `-1` pad. Surviving
+///   indices are `slot + offset`.
+/// - Decode (`start_pos > 0`): single row of length
+///   `k = (start_pos + 1) / ratio` with values `arange(k) + offset`
+///   (no future-mask; all committed slots are visible).
+///
+/// `offset` is the absolute base of the compressed region in a unified
+/// KV index space (`model.py:515`: prefill `offset = seqlen`, decode
+/// `offset = window`). The parent path gathers from a *separate*
+/// `main_kv_cache`, so callers typically pass `offset = 0` and treat the
+/// returned values as direct compressed-cache indices.
+pub fn get_compress_topk_idxs(
+    ratio: usize,
+    seqlen: usize,
+    start_pos: usize,
+    offset: usize,
+) -> Result<Vec<i32>, String> {
+    if ratio == 0 {
+        return Err("deepseek4 parent: get_compress_topk_idxs ratio must be > 0".to_owned());
+    }
+    if seqlen == 0 {
+        return Err("deepseek4 parent: get_compress_topk_idxs seqlen must be > 0".to_owned());
+    }
+    let offset_i = offset as i32;
+    if start_pos == 0 {
+        // model.py:279-281
+        //   matrix = arange(seqlen // ratio).repeat(seqlen, 1)
+        //   mask = matrix >= arange(1, seqlen+1).unsqueeze(1) // ratio
+        //   matrix = where(mask, -1, matrix + offset)
+        let k = seqlen / ratio;
+        let mut out = vec![-1i32; seqlen * k.max(1)];
+        if k == 0 {
+            // No compressed slots yet — return rows of empty (k=0) as empty vec
+            // length seqlen*0 = 0, or keep a sentinel length-0 row matrix.
+            return Ok(Vec::new());
+        }
+        for r in 0..seqlen {
+            let cutoff = (r + 1) / ratio;
+            for j in 0..k {
+                let v = if j < cutoff {
+                    j as i32 + offset_i
+                } else {
+                    -1
+                };
+                out[r * k + j] = v;
+            }
+        }
+        Ok(out)
+    } else {
+        // model.py:277: arange(0, (start_pos+1)//ratio) + offset
+        let k = (start_pos + 1) / ratio;
+        let mut out = Vec::with_capacity(k);
+        for j in 0..k {
+            out.push(j as i32 + offset_i);
+        }
+        Ok(out)
+    }
+}
+
+/// Number of compressed slots visible to query row `r` at `start_pos`.
+/// Prefill: `(start_pos + r + 1) / ratio`. Decode: `(start_pos + 1) / ratio`
+/// for every row in a single-token decode; for a multi-token chunk the
+/// identity-gather path uses a per-row count of `(start_pos + r + 1) / ratio`.
+#[inline]
+pub fn compress_n_visible(start_pos: usize, row: usize, ratio: usize) -> usize {
+    if ratio == 0 {
+        return 0;
+    }
+    (start_pos + row + 1) / ratio
+}
+
+
 /// Per-row number of valid SWA positions at absolute position `start_pos + r`.
 pub fn swa_n_valid(start_pos: usize, row: usize, window: usize) -> usize {
     let p = start_pos + row;
@@ -591,7 +850,7 @@ pub fn rms_norm_heads_unit(
 
 // ── Forward ─────────────────────────────────────────────────────────────────
 
-/// SWA-only attention for a `compress_ratio == 0` layer.
+/// Parent attention for every layer class (ratio 0 / 4 / 128).
 ///
 /// - `x` is `[rows, dim]` F32 post-attn_norm.
 /// - `out` is `[rows, dim]` F32 (overwritten).
@@ -600,8 +859,9 @@ pub fn rms_norm_heads_unit(
 ///   current chunk's KVs have been written at slots
 ///   `(start_pos + r) % window`.
 ///
-/// Refuses `layer.compress_ratio != 0` — compressor / indexer are a later
-/// slice. Silently skipping them would produce plausible-but-wrong numbers.
+/// Compressed KV lives in `scratch.main_kv_cache` (not the SWA ring). Prefill
+/// (`start_pos == 0`) resets compressor ring state so each call is
+/// self-contained. Multi-layer decode requires one scratch per layer.
 pub fn parent_attention_swa(
     gpu: &mut Gpu,
     backend: Ds4ParentBackend,
@@ -616,21 +876,32 @@ pub fn parent_attention_swa(
 ) -> Result<(), String> {
     backend.ensure_device(gpu)?;
 
-    if layer.compress_ratio != 0 {
+    let ratio = layer.compress_ratio;
+    let cfg_ratio = cfg.compress_ratio(layer.layer_idx);
+    if ratio != cfg_ratio {
         return Err(format!(
-            "deepseek4 parent: parent_attention_swa refuses compress_ratio={} \
-             (layer {}); compressor/indexer path is out of scope for this slice — \
-             only compress_ratio == 0 (pure SWA) is supported",
-            layer.compress_ratio, layer.layer_idx
+            "deepseek4 parent: config.compress_ratios[{}] = {cfg_ratio} but \
+             layer.compress_ratio claims {ratio} — refusing rather than guessing",
+            layer.layer_idx
         ));
     }
-    // Belt-and-suspenders against a mis-tagged layer_idx vs config.
-    if cfg.compress_ratio(layer.layer_idx) != 0 {
+    if !matches!(ratio, 0 | 4 | 128) {
         return Err(format!(
-            "deepseek4 parent: config.compress_ratios[{}] = {} but layer.compress_ratio \
-             claims 0 — refusing rather than guessing",
-            layer.layer_idx,
-            cfg.compress_ratio(layer.layer_idx)
+            "deepseek4 parent: parent_attention_swa unsupported compress_ratio={ratio} \
+             (layer {}); expected 0, 4, or 128",
+            layer.layer_idx
+        ));
+    }
+    if ratio > 0 && layer.compressor.is_none() {
+        return Err(format!(
+            "deepseek4 parent: layer {} compress_ratio={ratio} but compressor weights missing",
+            layer.layer_idx
+        ));
+    }
+    if ratio == 4 && layer.indexer.is_none() {
+        return Err(format!(
+            "deepseek4 parent: layer {} compress_ratio=4 but indexer weights missing",
+            layer.layer_idx
         ));
     }
     if rows == 0 {
@@ -650,12 +921,18 @@ pub fn parent_attention_swa(
     // Fresh BF16 copy of x for wq_a (destructive act-quant inside linear).
     stage_f32_to_act_bf16(gpu, scratch, x, rows, PARENT_DIM)?;
     let q_lat = scratch.q_lat_f32.sub_offset(0, rows * PARENT_Q_LORA);
-    // Reshape view for gemm output validation: parent_linear_dense checks
-    // out.numel >= m*n via buffer size.
-    parent_linear_dense(gpu, backend, &layer.wq_a, &act_view(scratch, rows, PARENT_DIM)?, rows, &q_lat)
-        .map_err(|e| format!("deepseek4 parent: wq_a linear: {e}"))?;
+    parent_linear_dense(
+        gpu,
+        backend,
+        &layer.wq_a,
+        &act_view(scratch, rows, PARENT_DIM)?,
+        rows,
+        &q_lat,
+    )
+    .map_err(|e| format!("deepseek4 parent: wq_a linear: {e}"))?;
 
-    // q_norm (BF16 weight → host f32 RMSNorm).
+    // q_norm (BF16 weight → host f32 RMSNorm). Keep q_lat on device for the
+    // indexer (`qr` in model.py:502/517) and a host copy for wq_b staging.
     let mut q_lat_host = download_f32_prefix(gpu, &scratch.q_lat_f32, rows * PARENT_Q_LORA)?;
     let q_norm_w = download_bf16_as_f32(gpu, &layer.q_norm, PARENT_Q_LORA)?;
     q_lat_host = rms_norm_host(&q_lat_host, &q_norm_w, PARENT_RMS_EPS, PARENT_Q_LORA)?;
@@ -685,7 +962,6 @@ pub fn parent_attention_swa(
     )?;
 
     // ── 2. KV path: wkv → kv_norm ───────────────────────────────────────
-    // Fresh BF16 copy of x again (wq_a destroyed the previous tile).
     stage_f32_to_act_bf16(gpu, scratch, x, rows, PARENT_DIM)?;
     let kv_out = scratch.kv_f32.sub_offset(0, rows * PARENT_HEAD_DIM);
     parent_linear_dense(
@@ -702,16 +978,28 @@ pub fn parent_attention_swa(
     let kv_norm_w = download_bf16_as_f32(gpu, &layer.kv_norm, PARENT_HEAD_DIM)?;
     kv_host = rms_norm_host(&kv_host, &kv_norm_w, PARENT_RMS_EPS, PARENT_HEAD_DIM)?;
 
-    // ── 3. Tail RoPE (interleaved), ratio-0: plain theta, no YaRN ───────
-    // model.py:484-485 sets original_seq_len=0, rope_theta=args.rope_theta.
-    let freqs = precompute_rope_freqs(
-        PARENT_ROPE_DIM,
-        /*original_seq_len=*/ 0,
-        PARENT_ROPE_THETA as f64,
-        /*factor=*/ 16.0, // unused when original_seq_len == 0
-        /*beta_fast=*/ 32.0,
-        /*beta_slow=*/ 1.0,
-    )?;
+    // ── 3. Tail RoPE (interleaved) ──────────────────────────────────────
+    // ratio==0: plain theta, no YaRN (model.py:484-485).
+    // ratio>0: YaRN + compress_rope_theta (model.py:482-487).
+    let freqs = if ratio == 0 {
+        precompute_rope_freqs(
+            PARENT_ROPE_DIM,
+            /*original_seq_len=*/ 0,
+            PARENT_ROPE_THETA as f64,
+            /*factor=*/ PARENT_YARN_FACTOR,
+            /*beta_fast=*/ PARENT_YARN_BETA_FAST,
+            /*beta_slow=*/ PARENT_YARN_BETA_SLOW,
+        )?
+    } else {
+        precompute_rope_freqs(
+            PARENT_ROPE_DIM,
+            PARENT_YARN_ORIG_SEQ,
+            PARENT_COMPRESS_ROPE_THETA,
+            PARENT_YARN_FACTOR,
+            PARENT_YARN_BETA_FAST,
+            PARENT_YARN_BETA_SLOW,
+        )?
+    };
     let positions: Vec<usize> = (0..rows).map(|r| start_pos + r).collect();
     apply_rope_interleaved_inplace(
         &mut q_host,
@@ -723,7 +1011,6 @@ pub fn parent_attention_swa(
         &freqs,
         /*inverse=*/ false,
     )?;
-    // KV is n_heads_k = 1, layout [rows, head_dim] ≡ [rows, 1, head_dim].
     apply_rope_interleaved_inplace(
         &mut kv_host,
         rows,
@@ -736,23 +1023,17 @@ pub fn parent_attention_swa(
     )?;
 
     // ── 4. FP8 act-quant simulation on non-RoPE KV dims (block 64) ───────
-    // model.py:512: act_quant(kv[..., :-rd], 64, scale_fmt, scale_dtype, True)
     kv_nope_act_quant(gpu, scratch, &mut kv_host, rows)?;
 
-    // Upload post-RoPE / post-quant Q and KV for the attention kernels.
     upload_f32_prefix(gpu, &scratch.q_f32, &q_host, rows * PARENT_Q_WIDTH)?;
     upload_f32_prefix(gpu, &scratch.kv_f32, &kv_host, rows * PARENT_HEAD_DIM)?;
 
-    // ── 5. SWA visibility + attention with attn_sink ────────────────────
-    // Stage per-row windows from pre-chunk ring + this chunk's KV.
-    // For start_pos == 0 and empty ring this is just causal within-chunk KV.
+    // ── 5. SWA visibility staging ───────────────────────────────────────
     {
         let kv_batch = scratch.kv_f32.sub_offset(0, rows * PARENT_HEAD_DIM);
         let staged = scratch
             .swa_staged
             .sub_offset(0, rows * PARENT_HEAD_DIM * PARENT_SWA_WINDOW);
-        // swa_visibility_stage_batched expects shapes via buffer layout;
-        // pass the full scratch tensors (kernel indexes by batch_size).
         gpu.swa_visibility_stage_batched(
             kv_ring,
             &kv_batch,
@@ -773,7 +1054,6 @@ pub fn parent_attention_swa(
         }
         upload_i32_prefix(gpu, &scratch.n_valid, &nv, rows)?;
     }
-    // positions for inverse RoPE
     {
         let mut ps = vec![0i32; rows];
         for r in 0..rows {
@@ -782,34 +1062,78 @@ pub fn parent_attention_swa(
         upload_i32_prefix(gpu, &scratch.positions, &ps, rows)?;
     }
 
+    // ── 5b. Compressor + indexer (ratio > 0) ────────────────────────────
+    // model.py:514-531. Compressed cache is separate from the SWA ring;
+    // gather produces topk_staged for the joint softmax.
+    if ratio > 0 {
+        run_mixed_attn_compress_and_gather(
+            gpu,
+            backend,
+            layer,
+            cfg,
+            scratch,
+            x,
+            rows,
+            start_pos,
+            ratio,
+        )?;
+    } else {
+        // Pure SWA: zero active top-k so a mixed kernel would see n_active=0.
+        let zeros = vec![0i32; rows];
+        upload_i32_prefix(gpu, &scratch.n_active_topk, &zeros, rows)?;
+    }
+
+    // ── 5c. Attention kernel ────────────────────────────────────────────
     {
         let q = scratch.q_f32.sub_offset(0, rows * PARENT_Q_WIDTH);
         let staged = scratch
             .swa_staged
             .sub_offset(0, rows * PARENT_HEAD_DIM * PARENT_SWA_WINDOW);
-        let n_valid = scratch.n_valid.sub_offset(0, rows * 4); // Raw bytes view
-        // n_valid is Raw with shape [nbytes]; sub_offset is in dtype-size units
-        // (1 for Raw). Pass the full buffer — kernel only reads [0, rows).
-        let _ = n_valid;
         let attn_out = scratch.attn_out_f32.sub_offset(0, rows * PARENT_Q_WIDTH);
-        gpu.deepseek4_attn_swa_batched(
-            &q,
-            &staged,
-            &staged, // K=V tied
-            &layer.attn_sink,
-            &scratch.n_valid,
-            &attn_out,
-            PARENT_N_HEADS as i32,
-            PARENT_HEAD_DIM as i32,
-            PARENT_O_GROUPS as i32,
-            PARENT_SWA_WINDOW as i32,
-            rows as i32,
-        )
-        .map_err(|e| format!("deepseek4 parent: deepseek4_attn_swa_batched: {e:?}"))?;
+
+        if ratio == 0 {
+            gpu.deepseek4_attn_swa_batched(
+                &q,
+                &staged,
+                &staged, // K=V tied
+                &layer.attn_sink,
+                &scratch.n_valid,
+                &attn_out,
+                PARENT_N_HEADS as i32,
+                PARENT_HEAD_DIM as i32,
+                PARENT_O_GROUPS as i32,
+                PARENT_SWA_WINDOW as i32,
+                rows as i32,
+            )
+            .map_err(|e| format!("deepseek4 parent: deepseek4_attn_swa_batched: {e:?}"))?;
+        } else {
+            // Joint softmax over SWA + gathered top-k + sink.
+            let topk = scratch
+                .topk_staged
+                .sub_offset(0, rows * PARENT_HEAD_DIM * PARENT_ATTN_INDEX_TOPK);
+            gpu.deepseek4_attn_swa_topk_batched_f32(
+                &q,
+                &staged,
+                &staged, // SWA K=V tied
+                &topk,
+                &topk, // topk K=V tied
+                &layer.attn_sink,
+                &scratch.n_valid,
+                &scratch.n_active_topk,
+                &attn_out,
+                PARENT_N_HEADS as i32,
+                PARENT_HEAD_DIM as i32,
+                PARENT_SWA_WINDOW as i32,
+                PARENT_ATTN_INDEX_TOPK as i32,
+                rows as i32,
+            )
+            .map_err(|e| {
+                format!("deepseek4 parent: deepseek4_attn_swa_topk_batched: {e:?}")
+            })?;
+        }
     }
 
     // ── 6. Inverse tail RoPE on attention output ────────────────────────
-    // model.py:539 apply_rotary_emb(o[..., -rd:], freqs_cis, True)
     let mut attn_host = download_f32_prefix(gpu, &scratch.attn_out_f32, rows * PARENT_Q_WIDTH)?;
     apply_rope_interleaved_inplace(
         &mut attn_host,
@@ -824,14 +1148,8 @@ pub fn parent_attention_swa(
     upload_f32_prefix(gpu, &scratch.attn_out_f32, &attn_host, rows * PARENT_Q_WIDTH)?;
 
     // ── 7. O projection: grouped wo_a then wo_b ─────────────────────────
-    // model.py:542-547
-    //   o = o.view(B, S, n_groups, -1)                 # [rows, 8, 4096]
-    //   wo_a = weight.view(n_groups, o_lora, -1)       # [8, 1024, 4096]
-    //   o = einsum("bsgd,grd->bsgr", o, wo_a)          # [rows, 8, 1024]
-    //   x = wo_b(o.flatten(2))                         # [rows, 4096]
     wo_a_grouped(gpu, backend, &layer.wo_a, scratch, rows)?;
 
-    // wo_b on flattened [rows, 8192]
     let wo_a_host = download_f32_prefix(gpu, &scratch.wo_a_out_f32, rows * PARENT_WO_A_OUT)?;
     stage_f32_slice_to_act_bf16(gpu, scratch, &wo_a_host, rows, PARENT_WO_A_OUT)?;
     let out_view = out.sub_offset(0, rows * PARENT_DIM);
@@ -862,6 +1180,178 @@ pub fn parent_attention_swa(
 
     Ok(())
 }
+
+/// Compressor + (optional) indexer + gather into `scratch.topk_staged`.
+///
+/// Main compressor uses `hadamard = false`. Indexer (ratio==4) calls its own
+/// compressor internally with `hadamard = true` — do not double-call it.
+///
+/// Index space note (`model.py:515`): the reference builds a unified index
+/// over `[SWA_slots | compressed_slots]` with `offset = seqlen` (prefill) or
+/// `window` (decode). Our kernels keep SWA and compressed buffers separate,
+/// so we pass `offset = 0` into the indexer / compress-topk helpers and treat
+/// returned indices as direct `main_kv_cache` row ids. That is the MQ2R
+/// convention and matches the gather kernel's `idx < N_compressed` check.
+fn run_mixed_attn_compress_and_gather(
+    gpu: &mut Gpu,
+    backend: Ds4ParentBackend,
+    layer: &ParentLayerWeights,
+    cfg: &ParentQuantConfig,
+    scratch: &mut ParentAttnScratch,
+    x: &GpuTensor,
+    rows: usize,
+    start_pos: usize,
+    ratio: usize,
+) -> Result<(), String> {
+    // Prefill is self-contained: reset compressor rings so leftover decode
+    // state cannot leak. Decode reuses ring state across calls on the same
+    // layer/scratch.
+    if start_pos == 0 {
+        scratch.compressor.reset_ring(gpu)?;
+    }
+
+    let n_compressed = indexer_n_compressed(start_pos, rows, ratio);
+    if n_compressed > scratch.max_n_compressed {
+        return Err(format!(
+            "deepseek4 parent: n_compressed={n_compressed} exceeds main_kv_cache \
+             capacity {} (start_pos={start_pos} rows={rows} ratio={ratio})",
+            scratch.max_n_compressed
+        ));
+    }
+
+    // Main compressor → main_kv_cache. Always invoke so ring/remainder state
+    // advances even when n_compressed == 0 this call.
+    let comp_w = layer.compressor.as_ref().ok_or_else(|| {
+        format!(
+            "deepseek4 parent: layer {} missing compressor weights",
+            layer.layer_idx
+        )
+    })?;
+    {
+        let out_rows = n_compressed.max(1);
+        let kv_out = {
+            let mut v = scratch
+                .main_kv_cache
+                .sub_offset(0, out_rows * PARENT_HEAD_DIM);
+            v.shape = vec![out_rows, PARENT_HEAD_DIM];
+            v
+        };
+        parent_compressor_forward(
+            gpu,
+            backend,
+            comp_w,
+            cfg,
+            &mut scratch.compressor,
+            x,
+            rows,
+            start_pos,
+            ratio,
+            /*hadamard=*/ false,
+            &kv_out,
+        )
+        .map_err(|e| format!("deepseek4 parent: main compressor: {e}"))?;
+    }
+
+    // Per-row active top-k counts + gather into topk_staged.
+    let topk_max = PARENT_ATTN_INDEX_TOPK;
+    let mut n_active_host = vec![0i32; rows];
+
+    if n_compressed == 0 {
+        upload_i32_prefix(gpu, &scratch.n_active_topk, &n_active_host, rows)?;
+        // Leave topk_staged untouched (kernel skips n_active==0 lanes).
+        return Ok(());
+    }
+
+    if ratio == 4 {
+        // Indexer selects top-k compressed slots. offset=0: indices are
+        // main_kv_cache rows (see function doc).
+        let idx_w = layer.indexer.as_ref().ok_or_else(|| {
+            format!(
+                "deepseek4 parent: layer {} missing indexer weights",
+                layer.layer_idx
+            )
+        })?;
+        let qr = scratch.q_lat_f32.sub_offset(0, rows * PARENT_Q_LORA);
+        // n_active scalar buffer: parent_indexer_forward writes a single i32
+        // (total n_compressed). We then expand to per-row active counts.
+        let n_active_scalar = scratch.n_active_topk.sub_offset(0, 4); // first i32
+        parent_indexer_forward(
+            gpu,
+            backend,
+            idx_w,
+            cfg,
+            &mut scratch.indexer,
+            x,
+            &qr,
+            rows,
+            start_pos,
+            /*offset=*/ 0,
+            layer.layer_idx,
+            &scratch.topk_idx,
+            &n_active_scalar,
+        )
+        .map_err(|e| format!("deepseek4 parent: indexer: {e}"))?;
+
+        // Per-row n_active = min(topk, visible compressed slots).
+        for r in 0..rows {
+            let vis = indexer_n_visible(start_pos, r, ratio).min(n_compressed);
+            n_active_host[r] = topk_max.min(vis) as i32;
+        }
+        upload_i32_prefix(gpu, &scratch.n_active_topk, &n_active_host, rows)?;
+
+        // Gather selected compressed rows into topk_staged.
+        // K_active = topk_max (storage); -1 indices write zeros.
+        let main_kv = scratch
+            .main_kv_cache
+            .sub_offset(0, n_compressed * PARENT_HEAD_DIM);
+        let topk_out = scratch
+            .topk_staged
+            .sub_offset(0, rows * PARENT_HEAD_DIM * topk_max);
+        gpu.deepseek4_topk_kv_gather_batched_f32(
+            &main_kv,
+            &scratch.topk_idx,
+            &topk_out,
+            topk_max as i32,
+            PARENT_HEAD_DIM as i32,
+            n_compressed as i32,
+            topk_max as i32,
+            /*col_offset=*/ 0,
+            /*scale=*/ 1.0,
+            rows as i32,
+        )
+        .map_err(|e| format!("deepseek4 parent: topk gather: {e:?}"))?;
+    } else {
+        // ratio == 128: identity gather of all compressed slots (no indexer).
+        // Cap at topk_max so the staged buffer / joint-softmax window fit.
+        let k_id = n_compressed.min(topk_max);
+        for r in 0..rows {
+            let vis = compress_n_visible(start_pos, r, ratio).min(k_id);
+            n_active_host[r] = vis as i32;
+        }
+        upload_i32_prefix(gpu, &scratch.n_active_topk, &n_active_host, rows)?;
+
+        let main_kv = scratch
+            .main_kv_cache
+            .sub_offset(0, n_compressed * PARENT_HEAD_DIM);
+        let topk_out = scratch
+            .topk_staged
+            .sub_offset(0, rows * PARENT_HEAD_DIM * topk_max);
+        // Identity copies first k_id rows of main_kv into every batch row's
+        // topk slab. Per-row n_active_topk then trims the softmax window.
+        gpu.deepseek4_topk_kv_gather_identity_batched_f32(
+            &main_kv,
+            &topk_out,
+            k_id as i32,
+            PARENT_HEAD_DIM as i32,
+            topk_max as i32,
+            rows as i32,
+        )
+        .map_err(|e| format!("deepseek4 parent: identity gather: {e:?}"))?;
+    }
+
+    Ok(())
+}
+
 
 /// Grouped `wo_a` projection: 8 independent `[1024, 4096] @ [rows, 4096]`
 /// linears written into `scratch.wo_a_out_f32` as `[rows, 8, 1024]`.
@@ -1367,8 +1857,10 @@ mod tests {
 
     #[test]
     fn scratch_bytes_formula() {
-        // Host-side size accounting (no GPU): recompute the allocation footprint.
+        // Host-side size accounting for the *own* tiles (compressor/indexer
+        // nested scratch is additional and GPU-dependent).
         let max_rows = 16usize;
+        let max_n_compressed = max_rows.max(PARENT_ATTN_INDEX_TOPK);
         let act = max_rows * PARENT_WO_A_OUT * 2;
         let kv_nope = max_rows * PARENT_NOPE_DIM * 2;
         let q_lat = max_rows * PARENT_Q_LORA * 4;
@@ -1377,34 +1869,130 @@ mod tests {
         let attn = max_rows * PARENT_Q_WIDTH * 4;
         let wo = max_rows * PARENT_WO_A_OUT * 4;
         let staged = max_rows * PARENT_HEAD_DIM * PARENT_SWA_WINDOW * 4;
+        let topk_staged = max_rows * PARENT_HEAD_DIM * PARENT_ATTN_INDEX_TOPK * 4;
+        let main_kv = max_n_compressed * PARENT_HEAD_DIM * 4;
+        let topk_idx = max_rows * PARENT_ATTN_INDEX_TOPK * 4;
         let n_valid = max_rows * 4;
+        let n_active = max_rows * 4;
         let pos = max_rows * 4;
         let ones = PARENT_HEAD_DIM * 4;
-        let total =
-            act + kv_nope + q_lat + q + kv + attn + wo + staged + n_valid + pos + ones;
-        // ~16 * (8192*2 + 448*2 + 1024*4 + 32768*4 + 512*4 + 32768*4 + 8192*4
-        //        + 512*128*4) + small ≈ 16 * ~0.85 MiB ≈ 13.6 MiB
-        assert!(total > 8 * 1024 * 1024, "total={total}");
-        assert!(total < 32 * 1024 * 1024, "total={total}");
-        // Spot-check the dominant term: two Q-width f32 buffers.
+        let own = act
+            + kv_nope
+            + q_lat
+            + q
+            + kv
+            + attn
+            + wo
+            + staged
+            + topk_staged
+            + main_kv
+            + topk_idx
+            + n_valid
+            + n_active
+            + pos
+            + ones;
+        // Own tiles alone are dominated by topk_staged (~16*512*512*4 ≈ 16 MiB).
+        assert!(own > 16 * 1024 * 1024, "own={own}");
+        assert!(own < 64 * 1024 * 1024, "own={own}");
         assert_eq!(q + attn, 2 * max_rows * 32768 * 4);
+        assert_eq!(PARENT_ATTN_INDEX_TOPK, 512);
     }
 
-    /// Refusal is a feature: construct a fake layer metadata check via the
-    /// pure compress_ratio gate (no GPU).
     #[test]
-    fn refuse_nonzero_ratio_message() {
-        // We cannot call parent_attention_swa without a GPU, but the error
-        // string contract is part of the public API — lock the wording.
+    fn compress_topk_prefill_ratio4() {
+        // seqlen=16, ratio=4 → k = 4 compressed slots.
+        // Row r sees slots [0, (r+1)/4) then -1 pad; offset applied.
         let ratio = 4usize;
-        let layer_idx = 2usize;
+        let seqlen = 16usize;
+        let offset = 0usize;
+        let m = get_compress_topk_idxs(ratio, seqlen, 0, offset).unwrap();
+        let k = seqlen / ratio; // 4
+        assert_eq!(m.len(), seqlen * k);
+        // row 0: (0+1)/4 = 0 → all -1
+        assert!(m[..k].iter().all(|&v| v == -1));
+        // row 3: (3+1)/4 = 1 → [0, -1, -1, -1]
+        assert_eq!(&m[3 * k..4 * k], &[0, -1, -1, -1]);
+        // row 7: (7+1)/4 = 2 → [0, 1, -1, -1]
+        assert_eq!(&m[7 * k..8 * k], &[0, 1, -1, -1]);
+        // row 15: (15+1)/4 = 4 → [0, 1, 2, 3]
+        assert_eq!(&m[15 * k..16 * k], &[0, 1, 2, 3]);
+
+        // offset = seqlen (reference unified-index convention)
+        let m2 = get_compress_topk_idxs(ratio, seqlen, 0, seqlen).unwrap();
+        assert_eq!(&m2[15 * k..16 * k], &[16, 17, 18, 19]);
+        assert_eq!(m2[0], -1);
+    }
+
+    #[test]
+    fn compress_topk_prefill_ratio128_short() {
+        // seqlen=16 < ratio=128 → k=0 → empty matrix.
+        let m = get_compress_topk_idxs(128, 16, 0, 0).unwrap();
+        assert!(m.is_empty());
+        // seqlen=256, ratio=128 → k=2
+        let m = get_compress_topk_idxs(128, 256, 0, 0).unwrap();
+        let k = 2;
+        assert_eq!(m.len(), 256 * k);
+        // row 127: (127+1)/128 = 1 → [0, -1]
+        assert_eq!(&m[127 * k..128 * k], &[0, -1]);
+        // row 255: (255+1)/128 = 2 → [0, 1]
+        assert_eq!(&m[255 * k..256 * k], &[0, 1]);
+    }
+
+    #[test]
+    fn compress_topk_decode_ratio4_and_128() {
+        // Decode start_pos=15, ratio=4 → k = 16/4 = 4; values 0..3 + offset
+        let m = get_compress_topk_idxs(4, 1, 15, 0).unwrap();
+        assert_eq!(m, vec![0, 1, 2, 3]);
+        let m = get_compress_topk_idxs(4, 1, 15, 128).unwrap();
+        assert_eq!(m, vec![128, 129, 130, 131]);
+
+        // Decode start_pos=255, ratio=128 → k = 256/128 = 2
+        let m = get_compress_topk_idxs(128, 1, 255, 0).unwrap();
+        assert_eq!(m, vec![0, 1]);
+
+        // Mid-window decode: start_pos=5, ratio=4 → k = 6/4 = 1
+        let m = get_compress_topk_idxs(4, 1, 5, 0).unwrap();
+        assert_eq!(m, vec![0]);
+
+        // No compress yet: start_pos=2, ratio=4 → k = 0
+        let m = get_compress_topk_idxs(4, 1, 2, 0).unwrap();
+        assert!(m.is_empty());
+    }
+
+    #[test]
+    fn compress_n_visible_table() {
+        assert_eq!(compress_n_visible(0, 0, 4), 0);
+        assert_eq!(compress_n_visible(0, 3, 4), 1);
+        assert_eq!(compress_n_visible(0, 15, 4), 4);
+        assert_eq!(compress_n_visible(0, 15, 128), 0);
+        assert_eq!(compress_n_visible(0, 127, 128), 1);
+        assert_eq!(compress_n_visible(15, 0, 4), 4);
+        assert_eq!(compress_n_visible(0, 0, 0), 0);
+    }
+
+    #[test]
+    fn ratio0_window_unchanged() {
+        // Ratio-0 path still uses pure SWA window indices; compress helper
+        // is not consulted. Lock the prefill window contract.
+        let m = get_window_topk_idxs(128, 16, 0).unwrap();
+        let k = 16;
+        assert_eq!(m[0], 0);
+        assert!(m[1..k].iter().all(|&v| v == -1));
+        let row15: Vec<i32> = m[15 * k..16 * k].to_vec();
+        assert_eq!(row15, (0..16).map(|i| i as i32).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn unsupported_ratio_message() {
+        // Unsupported ratios still fail closed (not silently treated as SWA).
+        let ratio = 7usize;
+        let layer_idx = 9usize;
         let msg = format!(
-            "deepseek4 parent: parent_attention_swa refuses compress_ratio={ratio} \
-             (layer {layer_idx}); compressor/indexer path is out of scope for this slice — \
-             only compress_ratio == 0 (pure SWA) is supported"
+            "deepseek4 parent: parent_attention_swa unsupported compress_ratio={ratio} \
+             (layer {layer_idx}); expected 0, 4, or 128"
         );
-        assert!(msg.contains("refuses compress_ratio=4"));
-        assert!(msg.contains("only compress_ratio == 0"));
+        assert!(msg.contains("unsupported compress_ratio=7"));
+        assert!(msg.contains("expected 0, 4, or 128"));
     }
 
     #[test]
