@@ -8,17 +8,69 @@ Pre-checkpoint HEAD: `b15edf38d35843b7a9d31bb609214d6abb172d4b`
 
 Host: `mi300x` (`gfx942`, ROCm `/opt/rocm/core-7.14`)
 
-## Checkpoint — 2026-08-02, work in flight
+## Checkpoint — 2026-08-02, effort stopped deliberately
 
-**Read this first.** The sections below were written 2026-08-01 and are still
-accurate as history, but the situation has moved. Short version for anyone
-picking this branch up:
+**Read this first.** The sections below were written 2026-08-01 and remain
+accurate as history, but the outcome is different from what they anticipated.
 
-**Goal.** Build a trustworthy full-precision DeepSeek V4 Flash 0731 *parent*
-forward so it can serve as the KLD reference distribution that both 0731
-quantized artifacts (MQ2R, MQ2-Lloyd) get calibrated against. The parent is not
-a shipped artifact — at 150.756 GiB it cannot be. It exists to generate the
-target distribution, the Hessians, and the KLD objective.
+**Where it landed.** The teacher exists, the quants are fixed and shipping, and
+the Rust parent is labelled broken. The effort was stopped by decision, not by
+failure — the remaining GPU time was worth more elsewhere than closing Gates
+7-9.
+
+**The teacher is the PyTorch reference, not `parent/*`.** The original plan was
+a Rust parent forward serving as the KLD reference. That is not what works.
+`crates/hipfire-arch-deepseek4/reference_oracle/` imports the reference
+`model.py` verbatim and scores **PPL 4.693** at 1024 tokens; the Rust
+`parent/*` backend scores **59.507** and is marked NOT A CALIBRATION REFERENCE
+at the top of `src/parent/mod.rs`. Canonical baseline, with digests and a
+measured floor, is at
+`/mnt/scratch/quantization/deepseek-v4-flash-0731-teacher/BASELINE_SUMMARY.txt`.
+
+**The most valuable outcome was a production fix, not a calibration one.**
+`route_scale` was wrong for every DeepSeek V4 artifact. On the same tokens and
+the same binary, MQ2R went **14.703 → 9.254 PPL, a 37% reduction**, from one
+constant. Per-build defaults now ship: `.mq2r` 1.8 (measured at ctx2048),
+other DS4 2.2 (the calibrated value it served on for two months). The
+checkpoint's 1.5 is never used — it costs ~51%. See `resolve_route_scale`.
+
+**Numbers worth carrying forward, all at 1024 tokens on `tokens.bin`:**
+
+| system | PPL | vs teacher |
+|---|---|---|
+| teacher (reference fp8) | 4.693 | — |
+| MQ2R @ route_scale 2.0 | 9.254 | 1.97x |
+| MQ2-Lloyd | 14.564 | 3.10x |
+| `parent/*` | 59.507 | 12.7x |
+
+**The floor, and why it matters.** `ref_fp8` against `ref_exact` — identical
+weights, arithmetic the only difference — gives KLD mean 0.0404 and **top-1
+agreement 0.9297**. The teacher disagrees with itself on 7% of top-1
+predictions. The ceiling is ~0.93, not 1.0. Read every candidate against that.
+
+**Two shortcuts this effort proved invalid:**
+
+1. **Residual magnitude does not predict quality.** `ref_fp8` and `ref_exact`
+   differ 5x in final residual L2 (124858.6 vs 23899.6) at identical PPL. Any
+   magnitude-based stability gate measures nothing established.
+2. **fp8 activation quantization costs 1.5% of PPL** (4.693 vs 4.624). Never a
+   plausible explanation for a large gap.
+
+**The methodological lesson, which cost the most time.** Every oracle compared
+`parent/forward.rs` against `parent/*_ref`, both written from the same reading
+of `model.py`. A shared misreading is invisible by construction: HC comparisons
+agreed to ~1e-7 while the model was badly broken. **Ten measurement artifacts**
+fired before the real defect surfaced, including an "8.2x layer step" that was
+one massive-activation row in an aggregate L2, and an attention divergence that
+turned out to sit at 1.24x its own quantization floor. Establish a comparison's
+floor on a known-correct case *before* calling any gap a defect — and prefer an
+oracle that shares no code with the thing under test.
+
+**What remains open**, should anyone resume: the Rust parent's 12.7x gap is
+unexplained (residuals match the teacher to sub-1%, every measured stage sits
+at floor, the head path is clean — so it lives somewhere in layers 3-41), and
+Gates 7-9 were never run. They are gated on a value test: re-quantize one MQ2R
+build with teacher-derived Hessians and beat **9.254**, not the stale 14.703.
 
 **One root cause found and fixed** (`dc4a6cd8f`). `Block.hc_post` contracted the
 wrong axis of the sinkhorn `comb` matrix. PPL at 1024 went 163.892 → 59.507; at
