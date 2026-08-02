@@ -237,12 +237,37 @@ pub fn parent_model_forward(
 /// dominated by a single massive-activation token (e.g. row 0 at L37→L38:
 /// median 404→413 while aggregate 14222→116670). Verdicts must key on median.
 /// `aggregate` / `p90` / `max` stay for diagnostics.
+///
+/// Position buckets mirror `reference_oracle/residual_pos_traj.py::summarize_rows`
+/// exactly so parent↔oracle LE is comparable:
+/// - `early128_mean` = mean(row_l2[:128]) (includes pos0 when seq≥128)
+/// - `late128_mean`  = mean(row_l2[-128:])
+/// - `late_over_early` = late / max(early, 1e-12)
+/// `early128_ex0_mean` / `late_over_early_ex0` drop pos0 from the early mean
+/// (late never contains pos0 at seq≥128) — the statistic behind the oracle's
+/// "mean LE excl pos0 = 1.026".
 #[derive(Clone, Copy, Debug, Default)]
 pub struct LayerHcNormStats {
     pub median: f32,
     pub p90: f32,
     pub max: f32,
     pub aggregate: f32,
+    /// mean(row_l2[0..min(128,rows)]) — matches oracle `early128_mean`.
+    pub early128_mean: f32,
+    /// mean(row_l2[rows.saturating_sub(128)..]) — matches oracle `late128_mean`.
+    pub late128_mean: f32,
+    /// late128_mean / max(early128_mean, 1e-12) — matches oracle `late_over_early`.
+    pub late_over_early: f32,
+    /// mean(row_l2[1..min(128,rows)]) when rows>1; else 0. Oracle excl-pos0 early.
+    pub early128_ex0_mean: f32,
+    /// late128_mean / max(early128_ex0_mean, 1e-12).
+    pub late_over_early_ex0: f32,
+    pub pos0: f32,
+    /// row_l2[512] when rows>512, else 0.
+    pub pos512: f32,
+    /// row_l2[rows-1] (oracle probe at p1023 when seq=1024).
+    pub pos_last: f32,
+    pub n_rows: u32,
 }
 
 /// Same as [`parent_model_forward`], appending per-layer HC residual norm
@@ -482,8 +507,8 @@ fn require_elems(t: &GpuTensor, n: usize, name: &str) -> Result<(), String> {
 }
 
 
-/// Per-row L2 norms of HC residual `[rows, hc_mult, dim]`, then median/p90/max
-/// and the aggregate L2 over all elements.
+/// Per-row L2 norms of HC residual `[rows, hc_mult, dim]`, then median/p90/max,
+/// aggregate L2, and position buckets matching `residual_pos_traj.py`.
 fn stage_hc_row_norm_stats(
     gpu: &Gpu,
     t: &GpuTensor,
@@ -494,6 +519,13 @@ fn stage_hc_row_norm_stats(
         .checked_mul(hc_dim)
         .ok_or_else(|| err("stage_hc_row_norm_stats: size overflow"))?;
     let host = download_f32_prefix(gpu, t, nelems)?;
+    let row_l2 = hc_per_row_l2(&host, rows, hc_dim);
+    Ok(summarize_hc_row_l2(&row_l2, &host))
+}
+
+/// Dense per-row L2 of a flat `[rows, hc_dim]` F32 residual (host).
+fn hc_per_row_l2(host: &[f32], rows: usize, hc_dim: usize) -> Vec<f64> {
+    debug_assert!(host.len() >= rows.saturating_mul(hc_dim));
     let mut row_l2 = Vec::with_capacity(rows);
     for r in 0..rows {
         let base = r * hc_dim;
@@ -504,24 +536,75 @@ fn stage_hc_row_norm_stats(
         }
         row_l2.push(s.sqrt());
     }
-    let mut sorted = row_l2;
+    row_l2
+}
+
+/// Bucket + percentile summary over per-row HC L2.
+///
+/// early/late windows match `residual_pos_traj.py::summarize_rows` bit-for-bit
+/// (first 128 / last 128, pos0 included in early; LE = late/early).
+fn summarize_hc_row_l2(row_l2: &[f64], host: &[f32]) -> LayerHcNormStats {
+    let n = row_l2.len();
+    if n == 0 {
+        return LayerHcNormStats::default();
+    }
+    let mut sorted = row_l2.to_vec();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let n = sorted.len();
     let median = sorted[n / 2] as f32;
     let p90 = sorted[((n as f64 * 0.90) as usize).min(n - 1)] as f32;
     let max = *sorted.last().unwrap_or(&0.0) as f32;
-    // aggregate L2 over the full flat residual (prior statistic).
+
     let mut agg = 0.0f64;
-    for &v in &host {
+    for &v in host {
         let d = v as f64;
         agg += d * d;
     }
-    Ok(LayerHcNormStats {
+
+    // residual_pos_traj.py:
+    //   early = mean(rr[:128]) if seq >= 128 else mean(rr)
+    //   late  = mean(rr[-128:]) if seq >= 128 else mean(rr)
+    let (early_lo, early_hi) = if n >= 128 { (0, 128) } else { (0, n) };
+    let late_lo = n.saturating_sub(if n >= 128 { 128 } else { n });
+    let early128_mean = mean_slice(&row_l2[early_lo..early_hi]);
+    let late128_mean = mean_slice(&row_l2[late_lo..n]);
+    let late_over_early = (late128_mean / early128_mean.max(1e-12)) as f32;
+
+    // Excl-pos0 early: rr[1:128] (or rr[1:] when short). Late unchanged.
+    let early_ex0_mean = if n > 1 {
+        let hi = if n >= 128 { 128 } else { n };
+        mean_slice(&row_l2[1..hi])
+    } else {
+        0.0
+    };
+    let late_over_early_ex0 = if n > 1 {
+        (late128_mean / early_ex0_mean.max(1e-12)) as f32
+    } else {
+        0.0
+    };
+
+    LayerHcNormStats {
         median,
         p90,
         max,
         aggregate: agg.sqrt() as f32,
-    })
+        early128_mean: early128_mean as f32,
+        late128_mean: late128_mean as f32,
+        late_over_early,
+        early128_ex0_mean: early_ex0_mean as f32,
+        late_over_early_ex0,
+        pos0: row_l2[0] as f32,
+        pos512: if n > 512 { row_l2[512] as f32 } else { 0.0 },
+        pos_last: row_l2[n - 1] as f32,
+        n_rows: n as u32,
+    }
+}
+
+#[inline]
+fn mean_slice(xs: &[f64]) -> f64 {
+    if xs.is_empty() {
+        return 0.0;
+    }
+    xs.iter().sum::<f64>() / xs.len() as f64
 }
 
 fn stage_l2(gpu: &Gpu, t: &GpuTensor, nelems: usize) -> Result<f32, String> {
@@ -691,4 +774,62 @@ mod tests {
         let err = assert_compress_events(&bad, 1024).expect_err("ratio0");
         assert!(err.contains("ratio=0"), "{err}");
     }
+
+    #[test]
+    fn residual_pos_buckets_match_oracle_summarize_rows() {
+        // Synthetic 1024-row L2 curve: pos0 massive, then linear ramp.
+        // Mirrors residual_pos_traj.py::summarize_rows windows exactly.
+        let mut row_l2 = Vec::with_capacity(1024);
+        row_l2.push(1000.0f64); // pos0 massive activation
+        for i in 1..1024 {
+            row_l2.push(10.0 + (i as f64) * 0.01);
+        }
+        // host unused for buckets (aggregate only); pass empty-ish dummy
+        let host = vec![0.0f32; 8];
+        let s = summarize_hc_row_l2(&row_l2, &host);
+
+        let early_ref: f64 = row_l2[..128].iter().sum::<f64>() / 128.0;
+        let late_ref: f64 = row_l2[1024 - 128..].iter().sum::<f64>() / 128.0;
+        let early_ex0_ref: f64 = row_l2[1..128].iter().sum::<f64>() / 127.0;
+        let le_ref = late_ref / early_ref.max(1e-12);
+        let le_ex0_ref = late_ref / early_ex0_ref.max(1e-12);
+
+        // Fields are f32; tolerate single-precision round-trip.
+        let close = |a: f32, b: f64| (a as f64 - b).abs() <= (1e-5 * b.abs().max(1.0));
+
+        assert_eq!(s.n_rows, 1024);
+        assert!(close(s.early128_mean, early_ref), "{} vs {early_ref}", s.early128_mean);
+        assert!(close(s.late128_mean, late_ref), "{} vs {late_ref}", s.late128_mean);
+        assert!(close(s.late_over_early, le_ref), "{} vs {le_ref}", s.late_over_early);
+        assert!(
+            close(s.early128_ex0_mean, early_ex0_ref),
+            "{} vs {early_ex0_ref}",
+            s.early128_ex0_mean
+        );
+        assert!(
+            close(s.late_over_early_ex0, le_ex0_ref),
+            "{} vs {le_ex0_ref}",
+            s.late_over_early_ex0
+        );
+        assert!(close(s.pos0, 1000.0));
+        assert!(close(s.pos512, row_l2[512]));
+        assert!(close(s.pos_last, row_l2[1023]));
+        // pos0 dominates early; excl-pos0 LE is larger
+        assert!(s.late_over_early < s.late_over_early_ex0);
+    }
+
+    #[test]
+    fn residual_pos_buckets_short_seq_uses_full_mean() {
+        // seq < 128: oracle falls back to mean(rr) for both early and late.
+        let row_l2: Vec<f64> = (0..64).map(|i| (i + 1) as f64).collect();
+        let host = vec![1.0f32; 4];
+        let s = summarize_hc_row_l2(&row_l2, &host);
+        let full: f64 = row_l2.iter().sum::<f64>() / 64.0;
+        assert!((s.early128_mean as f64 - full).abs() < 1e-5);
+        assert!((s.late128_mean as f64 - full).abs() < 1e-5);
+        assert!((s.late_over_early - 1.0).abs() < 1e-5);
+        assert_eq!(s.pos512, 0.0); // n <= 512
+        assert!((s.pos_last as f64 - 64.0).abs() < 1e-5);
+    }
+
 }

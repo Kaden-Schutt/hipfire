@@ -613,6 +613,173 @@ fn run() -> Result<bool, String> {
                 stab_detail
             },
         });
+
+        // ── 6b. Per-position residual trajectory (vs residual_pos_traj.py) ──
+        // Buckets match summarize_rows exactly: early=mean[:128], late=mean[-128:],
+        // LE=late/early (pos0 INCLUDED in early). Also report excl-pos0 LE.
+        println!();
+        println!("=== residual position trajectory (HC row L2) ===");
+        println!(
+            "bucket def = residual_pos_traj.py::summarize_rows \
+             (early=mean(row_l2[:128]), late=mean(row_l2[-128:]), LE=late/early; \
+             pos0 included in early). LE_ex0 drops pos0 from early only."
+        );
+        println!(
+            "  {:>5}  {:>5}  {:>10}  {:>10}  {:>8}  {:>8}  {:>10}  {:>10}  {:>10}  {:>10}",
+            "layer",
+            "ratio",
+            "early128",
+            "late128",
+            "LE",
+            "LE_ex0",
+            "p0",
+            "p512",
+            "p_last",
+            "median"
+        );
+        let mut le_sum = 0.0f64;
+        let mut le_ex0_sum = 0.0f64;
+        let mut n_le = 0usize;
+        for (i, s) in layer_norms.iter().enumerate() {
+            let ratio = if i < compress_events.len() {
+                compress_events[i].0
+            } else {
+                cfg.compress_ratio(i)
+            };
+            println!(
+                "  {i:>5}  {ratio:>5}  {:>10.4}  {:>10.4}  {:>8.4}  {:>8.4}  {:>10.2}  {:>10.2}  {:>10.2}  {:>10.2}",
+                s.early128_mean,
+                s.late128_mean,
+                s.late_over_early,
+                s.late_over_early_ex0,
+                s.pos0,
+                s.pos512,
+                s.pos_last,
+                s.median,
+            );
+            le_sum += s.late_over_early as f64;
+            le_ex0_sum += s.late_over_early_ex0 as f64;
+            n_le += 1;
+        }
+        if n_le > 0 {
+            let mean_le = le_sum / n_le as f64;
+            let mean_le_ex0 = le_ex0_sum / n_le as f64;
+            let h0 = layer_norms.first().map(|s| s.aggregate).unwrap_or(0.0);
+            // Note: first layer aggregate is post-L0, not embed. Global growth
+            // uses post-last / post-L0 as a stack-internal proxy; embed h0 is
+            // not separately traced here.
+            let last_agg = layer_norms.last().map(|s| s.aggregate).unwrap_or(0.0);
+            let l0_to_last = if h0 > 0.0 {
+                last_agg as f64 / h0 as f64
+            } else {
+                0.0
+            };
+            println!();
+            println!(
+                "  mean LE (all rows, {} layers)     = {mean_le:.4}   \
+                 (oracle mean LE_all ≈ 0.759)",
+                n_le
+            );
+            println!(
+                "  mean LE excl pos0 ({} layers)     = {mean_le_ex0:.4}   \
+                 (oracle mean LE_ex0 = 1.026)",
+                n_le
+            );
+            println!(
+                "  L0→L{} aggregate growth           = {l0_to_last:.3}   \
+                 (oracle embed→L42 = 487.1; L0 aggregate is post-layer)",
+                n_le.saturating_sub(1)
+            );
+            if layer_norms.len() > 38 {
+                let s38 = &layer_norms[38];
+                let p0_over_med = if s38.median > 0.0 {
+                    s38.pos0 as f64 / s38.median as f64
+                } else {
+                    0.0
+                };
+                println!(
+                    "  L38 pos0/median                  = {p0_over_med:.1}   \
+                     (oracle ≈ 269)"
+                );
+            }
+            // Side-by-side against the pinned oracle probes.
+            // (early/late/LE include pos0 — same columns as RESIDUAL_POS_TRAJ.md)
+            println!();
+            println!("=== residual LE vs reference (oracle residual_pos_traj) ===");
+            println!(
+                "  {:>5}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}",
+                "layer", "parent_LE", "ref_LE", "ratio", "parent_LEex0", "ref_LEex0"
+            );
+            // ref LE_all and LE_ex0 from /tmp/residual_pos_traj.json (seq=1024).
+            let ref_rows: &[(usize, f64, f64)] = &[
+                (0, 1.0455, 1.0451),
+                (2, 0.9561, 0.9609),
+                (10, 0.5990, 0.8944),
+                (20, 0.7397, 0.8950),
+                (30, 1.0046, 1.2140),
+                (38, 0.3450, 1.1052),
+                (42, 0.4862, 1.3111),
+            ];
+            for &(li, ref_le, ref_le_ex0) in ref_rows {
+                if li >= layer_norms.len() {
+                    continue;
+                }
+                let s = &layer_norms[li];
+                let p_le = s.late_over_early as f64;
+                let p_ex = s.late_over_early_ex0 as f64;
+                let ratio = if ref_le > 0.0 { p_le / ref_le } else { 0.0 };
+                println!(
+                    "  L{li:<4}  {p_le:>10.4}  {ref_le:>10.4}  {ratio:>10.4}  {p_ex:>10.4}  {ref_le_ex0:>10.4}"
+                );
+            }
+            let ref_mean_ex0 = 1.0258f64;
+            let mean_ratio = if ref_mean_ex0 > 0.0 {
+                mean_le_ex0 / ref_mean_ex0
+            } else {
+                0.0
+            };
+            println!(
+                "  mean_ex0  {mean_le_ex0:>10.4}  {ref_mean_ex0:>10.4}  {mean_ratio:>10.4}"
+            );
+            // Plain verdict: does LE_ex0 track the reference (near-flat ~1),
+            // or does parent LE rise/stay elevated at depth?
+            let deep = [20usize, 30, 38, 42];
+            let mut max_abs_log_ratio = 0.0f64;
+            let mut worst_layer = 0usize;
+            for &li in &deep {
+                if li >= layer_norms.len() {
+                    continue;
+                }
+                let p = layer_norms[li].late_over_early_ex0 as f64;
+                let r = ref_rows
+                    .iter()
+                    .find(|x| x.0 == li)
+                    .map(|x| x.2)
+                    .unwrap_or(1.0);
+                let lr = (p.max(1e-12) / r.max(1e-12)).ln().abs();
+                if lr > max_abs_log_ratio {
+                    max_abs_log_ratio = lr;
+                    worst_layer = li;
+                }
+            }
+            // "Tracks" if every deep LE_ex0 is within ~25% of ref (ln≈0.223).
+            let tracks = max_abs_log_ratio < 0.223; // ~±25%
+            println!();
+            println!(
+                "VERDICT residual shape: {} (worst deep |ln(parent/ref)|={:.3} at L{})",
+                if tracks {
+                    "TRACKS reference LE_ex0 decline/flatness — residual position shape EXONERATED"
+                } else {
+                    "DIVERGES from reference LE_ex0 — residual position asymmetry still in play"
+                },
+                max_abs_log_ratio,
+                worst_layer
+            );
+            println!(
+                "  note: oracle LE_all falls with depth mainly via pos0 massive act in early bucket; \
+                 LE_ex0 is the position-shape statistic (oracle mean 1.026)."
+            );
+        }
     }
 
     // ── 7. Determinism (same process, twice) ────────────────────────────
@@ -623,6 +790,15 @@ fn run() -> Result<bool, String> {
     if blocked_on_sibling {
         det_detail = "skipped — forward blocked on sibling".into();
         println!("{det_detail}");
+    } else if args.skip_determinism {
+        det_pass = true;
+        det_detail = "skipped via --skip-determinism".into();
+        println!("{det_detail}");
+        if !logits_host.is_empty() {
+            let logits_sha = sha256_bytes(f32_slice_as_le_bytes(&logits_host));
+            println!("logits_sha256 (in-process reference) = {logits_sha}");
+            det_detail = format!("{det_detail}; logits_sha256={logits_sha}");
+        }
     } else {
         // Second forward into a fresh logits tile; compare bit-identical.
         let logits2 = zeros_f32(&mut gpu, &[n_tokens, PARENT_VOCAB])?;
@@ -1271,6 +1447,8 @@ struct Args {
     plog: Option<PathBuf>,
     manifest: Option<PathBuf>,
     skip_shard_hashes: bool,
+    /// Skip the second in-process forward (saves ~1× fwd wall on long seq).
+    skip_determinism: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -1281,6 +1459,7 @@ fn parse_args() -> Result<Args, String> {
     let mut plog: Option<PathBuf> = None;
     let mut manifest: Option<PathBuf> = None;
     let mut skip_shard_hashes = false;
+    let mut skip_determinism = false;
 
     let mut args = std::env::args().skip(1);
     while let Some(flag) = args.next() {
@@ -1320,11 +1499,13 @@ fn parse_args() -> Result<Args, String> {
                 manifest = Some(PathBuf::from(p));
             }
             "--skip-shard-hashes" => skip_shard_hashes = true,
+            "--skip-determinism" => skip_determinism = true,
             "-h" | "--help" => {
                 eprintln!(
                     "usage: ds4_parent_forward_gate --model <dir> \
                      [--tokens 32 | --token-ids FILE] [--plog OUT.plog] \
-                     [--manifest out/manifest.json] [--skip-shard-hashes]\n\
+                     [--manifest out/manifest.json] [--skip-shard-hashes] \
+                     [--skip-determinism]\n\
                      Prefer --token-ids (flat u32 LE from ds4_tokenize_corpus) \
                      for any promoted artifact."
                 );
@@ -1343,6 +1524,7 @@ fn parse_args() -> Result<Args, String> {
         plog,
         manifest,
         skip_shard_hashes,
+        skip_determinism,
     })
 }
 
