@@ -103,6 +103,27 @@ pub fn quantize_mq4_element_with_clamp(w: f64, scale: f64, min_val: f64) -> (f64
 /// Provided for testability; production GPTQ uses
 /// `compute_damped_inv_cholesky_upper` (returns upper-tri U with
 /// U^T·U = H^-1 — the Frantar-Algorithm-1 invariant).
+/// # `initial_damp` is ABSOLUTE; `max_damp_multiplier` is RELATIVE
+///
+/// These two adjacent parameters use opposite conventions, which is a trap:
+///
+/// - `initial_damp` is added straight to the diagonal (`a[(i,i)] += damp`), so
+///   it is in the Hessian's own units.
+/// - `max_damp_multiplier` is scaled by `mean(diag(H))`.
+///
+/// The GPTQ paper's `percdamp` is a **fraction** of `mean(diag(H))`, so a
+/// caller porting `percdamp = 0.01` from the paper or from a reference
+/// implementation must pass `0.01 * mean(diag(H))`, **not** `0.01`. Passing the
+/// bare fraction silently under-damps by however large `mean(diag(H))` is.
+///
+/// This is not hypothetical: an independent PyTorch cross-reference
+/// (`reference_gptq/`, written from the paper rather than from this code)
+/// measured `U` shifting by `max_abs` 4.8e-3 on its test draw between absolute
+/// `0.01` and paper-relative `0.01 * mean(diag)`. Nothing errors; the
+/// factorization succeeds and the quantized weights are quietly worse.
+///
+/// In-tree callers are safe: `e8_gptq` passes a fractional
+/// `LAMBDA * mean(diag)` and is correct. New callers must do the same.
 pub fn cholesky_with_adaptive_damping(
     h: &Mat<f64>,
     initial_damp: f64,
@@ -190,6 +211,15 @@ fn clamped_initial_damp(initial_damp: f64, diag_mean: f64) -> f64 {
 /// Cost vs prior `L_H^{-T}` form: +K²/2 storage (H_inv), +K³/3 flops
 /// (matmul + second Cholesky). At K=12288 that's ~1.2 GB + ~2 minutes
 /// extra per-tensor wall — acceptable for correctness.
+///
+/// # `initial_damp` is ABSOLUTE, not the paper's fractional `percdamp`
+///
+/// It is added directly to the diagonal, while the sibling
+/// `max_damp_multiplier` is scaled by `mean(diag(H))` — opposite conventions on
+/// adjacent parameters. A caller porting `percdamp = 0.01` from the GPTQ paper
+/// must pass `0.01 * mean(diag(H))`. Passing `0.01` bare silently under-damps;
+/// nothing errors and the weights are quietly worse. See
+/// [`cholesky_with_adaptive_damping`] for the measurement behind this warning.
 pub fn compute_damped_inv_cholesky_upper(
     h: &Mat<f64>,
     perm: Option<&[usize]>,
