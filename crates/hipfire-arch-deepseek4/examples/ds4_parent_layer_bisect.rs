@@ -6,12 +6,21 @@
 //! Runs a 128-token parent forward and, for each layer, feeds that layer's
 //! *actual GPU residual* into composed f64 references:
 //!   - FFN-half from GPU `residual_hc` (post-attn), MoE on BF16-staged `moe_x`
-//!   - Attn-half residual: `hc_pre` → BF16-round(`attn_norm`) → `attention_swa_ref`
-//!     → `hc_post`, compared to GPU `residual_hc`
+//!   - Attn-half residual: `hc_pre` → BF16-round(`attn_norm`) → joint
+//!     `attention_swa_ref` (SWA + compressor + indexer when ratio>0) → `hc_post`,
+//!     compared to GPU `residual_hc`
 //!   - Full-layer composition of the two
 //!
-//! Domain rule (bitten four times): GPU linears stage F32→BF16 before GEMM.
+//! The attention oracle MUST carry compressor/indexer weights on ratio>0
+//! layers. Building `AttnSwARefWeights { compressor: None, indexer: None }`
+//! against a GPU that attends the joint window+compressed key set was artifact
+//! #6 of this investigation (fake "23x ratio-4 vs ratio-128 gap").
+//!
+//! Domain rule (bitten many times): GPU linears stage F32→BF16 before GEMM.
 //! Host oracles must consume the same BF16 lattice, not f32 rms_norm tails.
+//!
+//! Floor calibration: layer 0 (ratio 0, no compressor/indexer) must land at
+//! ~1e-6 before any ratio-4/128 number is interpreted.
 //!
 //! ```text
 //! cargo run --release -p hipfire-arch-deepseek4 --example ds4_parent_layer_bisect \
@@ -34,7 +43,7 @@ use hipfire_arch_deepseek4::parent::head::parent_embed;
 use hipfire_arch_deepseek4::parent::inventory::ParentInventory;
 use hipfire_arch_deepseek4::parent::layer_ref::{
     attention_swa_ref, expert_swiglu_ref, gate_hash_ref, gate_ref, hc_post_ref, hc_pre_ref,
-    rms_norm_ref, AttnSwARefWeights, RoutingResult,
+    rms_norm_ref, AttnCompRefWeights, AttnIndexerRefWeights, AttnSwARefWeights, RoutingResult,
 };
 use hipfire_arch_deepseek4::parent::moe::{
     parent_route, PARENT_MOE_INTER, PARENT_ROUTE_SCALE, PARENT_SWIGLU_LIMIT,
@@ -56,9 +65,14 @@ const DEFAULT_ROWS: usize = 128;
 const VOCAB: usize = 129_280;
 /// Position buckets matching `/root/plog_pos_scan.py` (clamped to available rows).
 const BUCKETS: &[(usize, usize)] = &[(0, 1), (1, 32), (32, 64), (64, 128)];
-/// Error floor consistent with ratio-0 attention oracle (~1e-6).
+/// Error floor consistent with ratio-0 attention oracle (~1e-6 abs; ~5e-6 K=8192).
+/// Absolute threshold is deliberately loose vs the true floor so residual growth
+/// deep in the stack does not flag every layer; relative l2 is the primary gate.
 const CLEAN_MAX_ABS: f64 = 5e-5;
 const CLEAN_L2_REL: f64 = 1e-5;
+/// Soft floor check for layer 0 calibration (must reproduce ~1e-6).
+const LAYER0_FLOOR_MAX_ABS: f64 = 5e-5;
+const LAYER0_FLOOR_L2_REL: f64 = 1e-5;
 
 fn main() -> ExitCode {
     match run() {
@@ -100,7 +114,7 @@ fn run() -> Result<(), String> {
     println!("model: {}", model_path.display());
     println!("token_ids: {} (n={rows})", args.token_ids.display());
     println!("start_pos: {start_pos}");
-    println!("scope: full-layer + residual_hc(attn-half) + FFN-half; BF16 domain on attn/MoE inputs");
+    println!("scope: full-layer + residual_hc(attn-half JOINT) + FFN-half; BF16 domain; abs+rel+in_amax+row_dist");
 
     let wall0 = Instant::now();
 
@@ -186,10 +200,10 @@ fn run() -> Result<(), String> {
 
     println!();
     println!(
-        "{:>5} {:>5} {:>10} {:>12} {:>12} {:>12}  buckets(max_abs)",
-        "L", "ratio", "scope", "max_abs", "mean_rel", "l2_rel"
+        "{:>5} {:>5} {:>10} {:>12} {:>12} {:>12} {:>12}  {}",
+        "L", "ratio", "scope", "max_abs", "l2_rel", "in_amax", "row_max", "row_dist"
     );
-    println!("{}", "-".repeat(110));
+    println!("{}", "-".repeat(120));
 
     let mut first_divergent: Option<Divergent> = None;
     let mut rows_out: Vec<LayerReport> = Vec::with_capacity(cfg.num_hidden_layers);
@@ -299,15 +313,20 @@ fn run() -> Result<(), String> {
             PARENT_DIM,
         );
 
-        let ffn_metrics = metrics(&out_gpu, &out_ffn_ref);
+        let ffn_metrics = metrics(&out_gpu, &out_ffn_ref, rows, PARENT_HC_DIM);
         let ffn_buckets = bucket_metrics(&out_gpu, &out_ffn_ref, rows, PARENT_HC_DIM);
 
         // Intermediate FFN checks (diagnostic).
-        let y_m = metrics(&ffn_y_gpu, &y_ref);
-        let post_m = metrics(&post_gpu, &post_ref);
-        let comb_m = metrics(&comb_gpu, &comb_ref);
-        let norm_m = metrics(&ffn_norm_gpu, &ffn_norm_ref);
-        let moe_m = metrics(&moe_gpu, &moe_ref);
+        let y_m = metrics(&ffn_y_gpu, &y_ref, rows, PARENT_DIM);
+        let post_m = metrics(&post_gpu, &post_ref, rows, PARENT_HC_MULT);
+        let comb_m = metrics(
+            &comb_gpu,
+            &comb_ref,
+            rows,
+            PARENT_HC_MULT * PARENT_HC_MULT,
+        );
+        let norm_m = metrics(&ffn_norm_gpu, &ffn_norm_ref, rows, PARENT_DIM);
+        let moe_m = metrics(&moe_gpu, &moe_ref, rows, PARENT_DIM);
         // ── Attn-half residual oracle (GPU residual_hc is post-attn) ─────
         // Same domain trap as MoE: GPU stages F32→BF16 before every linear.
         // `dense_linear_bf16_ref` BF16-rounds inside act_quant, but we still
@@ -328,18 +347,18 @@ fn run() -> Result<(), String> {
         let attn_norm_f32 =
             rms_norm_ref(&attn_y, &hl.attn_norm, PARENT_RMS_EPS as f64, PARENT_DIM);
         let attn_in_bf16: Vec<f32> = attn_norm_f32.iter().copied().map(round_to_bf16).collect();
-        let aw = AttnSwARefWeights {
-            wq_a: &hl.wq_a,
-            wq_b: &hl.wq_b,
-            wkv: &hl.wkv,
-            wo_a: &hl.wo_a,
-            wo_b: &hl.wo_b,
-            q_norm: &hl.q_norm,
-            kv_norm: &hl.kv_norm,
-            attn_sink: &hl.attn_sink,
-            compressor: None,
-            indexer: None,
-        };
+        let aw = hl.attn_ref_weights();
+        // Sanity: ratio>0 must have compressor; ratio==4 must have indexer.
+        if ratio > 0 && aw.compressor.is_none() {
+            return Err(format!(
+                "layer {layer_i} ratio={ratio}: missing main compressor weights in host cache"
+            ));
+        }
+        if ratio == 4 && aw.indexer.is_none() {
+            return Err(format!(
+                "layer {layer_i} ratio=4: missing indexer weights in host cache"
+            ));
+        }
         let attn_ref = attention_swa_ref(&attn_in_bf16, &aw, rows, start_pos, ratio)?;
         let residual_hc_ref = hc_post_ref(
             &attn_ref.o,
@@ -350,7 +369,7 @@ fn run() -> Result<(), String> {
             PARENT_HC_MULT,
             PARENT_DIM,
         );
-        let rhc_metrics = metrics(&residual_hc, &residual_hc_ref);
+        let rhc_metrics = metrics(&residual_hc, &residual_hc_ref, rows, PARENT_HC_DIM);
         let rhc_buckets = bucket_metrics(&residual_hc, &residual_hc_ref, rows, PARENT_HC_DIM);
 
         // ── Full-layer oracle (BF16 domain on attn + MoE inputs) ─────────
@@ -367,81 +386,175 @@ fn run() -> Result<(), String> {
             layer,
             &w_decode,
         )?;
-        let full_metrics = metrics(&out_gpu, &out_full);
+        let full_metrics = metrics(&out_gpu, &out_full, rows, PARENT_HC_DIM);
         let full_buckets = bucket_metrics(&out_gpu, &out_full, rows, PARENT_HC_DIM);
         let scope = "full";
 
-        let (rep_max, rep_mean, rep_l2, rep_buckets) =
-            (full_metrics.0, full_metrics.1, full_metrics.2, full_buckets);
+        // Layer-0 floor calibration — must land ~1e-6 before interpreting anything else.
+        if layer_i == 0 {
+            println!();
+            println!("=== LAYER 0 FLOOR CALIBRATION (ratio=0, no compressor/indexer) ===");
+            println!(
+                "  full:   max_abs={:.4e} l2_rel={:.4e} in_amax={:.4e}  {}",
+                full_metrics.max_abs,
+                full_metrics.l2_rel,
+                full_metrics.in_amax,
+                format_row_dist(&full_metrics.row_max_abs)
+            );
+            println!(
+                "  res_hc: max_abs={:.4e} l2_rel={:.4e} in_amax={:.4e}  {}",
+                rhc_metrics.max_abs,
+                rhc_metrics.l2_rel,
+                rhc_metrics.in_amax,
+                format_row_dist(&rhc_metrics.row_max_abs)
+            );
+            println!(
+                "  ffn:    max_abs={:.4e} l2_rel={:.4e} in_amax={:.4e}  {}",
+                ffn_metrics.max_abs,
+                ffn_metrics.l2_rel,
+                ffn_metrics.in_amax,
+                format_row_dist(&ffn_metrics.row_max_abs)
+            );
+            let l0_ok = full_metrics.max_abs <= LAYER0_FLOOR_MAX_ABS
+                && full_metrics.l2_rel <= LAYER0_FLOOR_L2_REL
+                && rhc_metrics.max_abs <= LAYER0_FLOOR_MAX_ABS
+                && rhc_metrics.l2_rel <= LAYER0_FLOOR_L2_REL;
+            if l0_ok {
+                println!(
+                    "  FLOOR OK: layer 0 reproduces ~1e-6 class floor under joint oracle. \
+                     Proceeding to interpret ratio-4/128 layers."
+                );
+            } else {
+                println!(
+                    "  FLOOR FAIL: layer 0 does NOT reproduce the known ~1e-6 floor. \
+                     Harness is still wrong — DO NOT interpret downstream numbers."
+                );
+            }
+            println!();
+        }
 
-        let dirty = rep_max > CLEAN_MAX_ABS || rep_l2 > CLEAN_L2_REL;
-        if dirty && first_divergent.is_none() {
+        let dirty = full_metrics.max_abs > CLEAN_MAX_ABS || full_metrics.l2_rel > CLEAN_L2_REL;
+        // Prefer relative gate once residual has grown (in_amax >> 1).
+        let dirty_rel = full_metrics.l2_rel > CLEAN_L2_REL
+            || (full_metrics.in_amax > 0.0
+                && full_metrics.max_abs / full_metrics.in_amax > CLEAN_L2_REL * 10.0
+                && full_metrics.max_abs > CLEAN_MAX_ABS);
+        if dirty_rel && first_divergent.is_none() {
             first_divergent = Some(Divergent {
                 layer: layer_i,
                 ratio,
                 scope: scope.to_owned(),
-                max_abs: rep_max,
-                mean_rel: rep_mean,
-                l2_rel: rep_l2,
+                max_abs: full_metrics.max_abs,
+                mean_rel: full_metrics.mean_rel,
+                l2_rel: full_metrics.l2_rel,
+                in_amax: full_metrics.in_amax,
             });
         }
+        let _ = dirty; // kept for future absolute-only diagnostics
 
-        let bucket_s = format_buckets(&rep_buckets);
+        let full_row_max = full_metrics
+            .row_max_abs
+            .iter()
+            .cloned()
+            .fold(0.0f64, f64::max);
         println!(
-            "{layer_i:>5} {ratio:>5} {scope:>10} {rep_max:>12.4e} {rep_mean:>12.4e} {rep_l2:>12.4e}  {bucket_s}"
+            "{layer_i:>5} {ratio:>5} {scope:>10} {:>12.4e} {:>12.4e} {:>12.4e} {:>12.4e}  {}",
+            full_metrics.max_abs,
+            full_metrics.l2_rel,
+            full_metrics.in_amax,
+            full_row_max,
+            format_row_dist(&full_metrics.row_max_abs)
         );
         {
-            let rb = format_buckets(&rhc_buckets);
+            let rmax = rhc_metrics
+                .row_max_abs
+                .iter()
+                .cloned()
+                .fold(0.0f64, f64::max);
             println!(
-                "{:>5} {:>5} {:>10} {:>12.4e} {:>12.4e} {:>12.4e}  {rb}",
+                "{:>5} {:>5} {:>10} {:>12.4e} {:>12.4e} {:>12.4e} {:>12.4e}  {}",
                 "",
                 "",
                 "res_hc",
-                rhc_metrics.0,
-                rhc_metrics.1,
-                rhc_metrics.2
+                rhc_metrics.max_abs,
+                rhc_metrics.l2_rel,
+                rhc_metrics.in_amax,
+                rmax,
+                format_row_dist(&rhc_metrics.row_max_abs)
+            );
+            println!(
+                "      res_hc buckets: {}",
+                format_buckets(&rhc_buckets)
             );
         }
         {
-            let fb = format_buckets(&ffn_buckets);
+            let fmax = ffn_metrics
+                .row_max_abs
+                .iter()
+                .cloned()
+                .fold(0.0f64, f64::max);
             println!(
-                "{:>5} {:>5} {:>10} {:>12.4e} {:>12.4e} {:>12.4e}  {fb}",
+                "{:>5} {:>5} {:>10} {:>12.4e} {:>12.4e} {:>12.4e} {:>12.4e}  {}",
                 "",
                 "",
                 "ffn",
-                ffn_metrics.0,
-                ffn_metrics.1,
-                ffn_metrics.2
+                ffn_metrics.max_abs,
+                ffn_metrics.l2_rel,
+                ffn_metrics.in_amax,
+                fmax,
+                format_row_dist(&ffn_metrics.row_max_abs)
+            );
+            println!(
+                "      ffn buckets: {}",
+                format_buckets(&ffn_buckets)
             );
         }
         // Stage split when FFN or residual_hc is dirty.
-        if ffn_metrics.0 > CLEAN_MAX_ABS
-            || ffn_metrics.2 > CLEAN_L2_REL
-            || rhc_metrics.0 > CLEAN_MAX_ABS
-            || rhc_metrics.2 > CLEAN_L2_REL
+        if ffn_metrics.max_abs > CLEAN_MAX_ABS
+            || ffn_metrics.l2_rel > CLEAN_L2_REL
+            || rhc_metrics.max_abs > CLEAN_MAX_ABS
+            || rhc_metrics.l2_rel > CLEAN_L2_REL
         {
             println!(
                 "      stages: hc_pre.y={:.3e} post={:.3e} comb={:.3e} ffn_norm={:.3e} moe={:.3e} res_hc={:.3e}",
-                y_m.0, post_m.0, comb_m.0, norm_m.0, moe_m.0, rhc_metrics.0
+                y_m.max_abs,
+                post_m.max_abs,
+                comb_m.max_abs,
+                norm_m.max_abs,
+                moe_m.max_abs,
+                rhc_metrics.max_abs
             );
         }
-
 
         rows_out.push(LayerReport {
             layer: layer_i,
             ratio,
             scope: scope.to_owned(),
-            max_abs: rep_max,
-            mean_rel: rep_mean,
-            l2_rel: rep_l2,
-            buckets: rep_buckets,
-            ffn_max_abs: ffn_metrics.0,
-            ffn_mean_rel: ffn_metrics.1,
-            ffn_l2_rel: ffn_metrics.2,
+            max_abs: full_metrics.max_abs,
+            mean_rel: full_metrics.mean_rel,
+            l2_rel: full_metrics.l2_rel,
+            in_amax: full_metrics.in_amax,
+            gpu_amax: full_metrics.gpu_amax,
+            row_max_abs: full_metrics.row_max_abs,
+            buckets: full_buckets,
+            rhc_max_abs: rhc_metrics.max_abs,
+            rhc_mean_rel: rhc_metrics.mean_rel,
+            rhc_l2_rel: rhc_metrics.l2_rel,
+            rhc_in_amax: rhc_metrics.in_amax,
+            rhc_row_max_abs: rhc_metrics.row_max_abs,
+            ffn_max_abs: ffn_metrics.max_abs,
+            ffn_mean_rel: ffn_metrics.mean_rel,
+            ffn_l2_rel: ffn_metrics.l2_rel,
+            ffn_in_amax: ffn_metrics.in_amax,
+            ffn_row_max_abs: ffn_metrics.row_max_abs,
             ffn_buckets,
-            rhc_max_abs: rhc_metrics.0,
-            rhc_l2_rel: rhc_metrics.2,
-            stage_max_abs: [y_m.0, post_m.0, comb_m.0, norm_m.0, moe_m.0],
+            stage_max_abs: [
+                y_m.max_abs,
+                post_m.max_abs,
+                comb_m.max_abs,
+                norm_m.max_abs,
+                moe_m.max_abs,
+            ],
         });
 
         use_a_as_input = !use_a_as_input;
@@ -450,8 +563,8 @@ fn run() -> Result<(), String> {
         if let Some(d) = first_divergent.as_ref() {
             if d.layer == layer_i {
                 println!(
-                    ">> FIRST DIVERGENT layer={} ratio={} scope={} max_abs={:.4e} l2_rel={:.4e}",
-                    d.layer, d.ratio, d.scope, d.max_abs, d.l2_rel
+                    ">> FIRST DIVERGENT layer={} ratio={} scope={} max_abs={:.4e} l2_rel={:.4e} in_amax={:.4e}",
+                    d.layer, d.ratio, d.scope, d.max_abs, d.l2_rel, d.in_amax
                 );
             }
         }
@@ -474,39 +587,91 @@ fn run() -> Result<(), String> {
     println!("total wall (incl load):          {wall_s:.2} s");
     println!("load wall:                       {load_s:.2} s");
     println!("rows: {rows}");
+    println!("oracle: JOINT attention_swa_ref (SWA + compressor + indexer)");
     println!();
-    println!("Per-layer table (primary scope):");
+
+    // Layer-0 floor first — gate every other number on this.
+    if let Some(l0) = rows_out.iter().find(|r| r.layer == 0) {
+        let l0_ok = l0.max_abs <= LAYER0_FLOOR_MAX_ABS
+            && l0.l2_rel <= LAYER0_FLOOR_L2_REL
+            && l0.rhc_max_abs <= LAYER0_FLOOR_MAX_ABS
+            && l0.rhc_l2_rel <= LAYER0_FLOOR_L2_REL;
+        println!("=== LAYER 0 FLOOR (must be ~1e-6 before interpreting anything) ===");
+        println!(
+            "  full   max_abs={:.4e} l2_rel={:.4e} in_amax={:.4e}  {}",
+            l0.max_abs,
+            l0.l2_rel,
+            l0.in_amax,
+            format_row_dist(&l0.row_max_abs)
+        );
+        println!(
+            "  res_hc max_abs={:.4e} l2_rel={:.4e} in_amax={:.4e}  {}",
+            l0.rhc_max_abs,
+            l0.rhc_l2_rel,
+            l0.rhc_in_amax,
+            format_row_dist(&l0.rhc_row_max_abs)
+        );
+        println!(
+            "  ffn    max_abs={:.4e} l2_rel={:.4e} in_amax={:.4e}  {}",
+            l0.ffn_max_abs,
+            l0.ffn_l2_rel,
+            l0.ffn_in_amax,
+            format_row_dist(&l0.ffn_row_max_abs)
+        );
+        if l0_ok {
+            println!("  VERDICT floor: OK — harness reproduces known layer-0 floor.");
+        } else {
+            println!(
+                "  VERDICT floor: FAIL — harness still wrong; ratio-4/128 numbers are inconclusive."
+            );
+        }
+        println!();
+    }
+
+    println!("Per-layer table (full | attn-half | ffn-half):");
     println!(
-        "{:>5} {:>5} {:>10} {:>12} {:>12} {:>12}  {}",
-        "L", "ratio", "scope", "max_abs", "mean_rel", "l2_rel", "buckets max_abs"
+        "{:>5} {:>5} {:>12} {:>12} {:>12}  {:>12} {:>12} {:>12}  {:>12} {:>12} {:>12}  {}",
+        "L",
+        "ratio",
+        "full_abs",
+        "full_l2",
+        "full_inamax",
+        "attn_abs",
+        "attn_l2",
+        "attn_inamax",
+        "ffn_abs",
+        "ffn_l2",
+        "ffn_inamax",
+        "full_row_dist"
     );
     for r in &rows_out {
         println!(
-            "{:>5} {:>5} {:>10} {:>12.4e} {:>12.4e} {:>12.4e}  {}",
+            "{:>5} {:>5} {:>12.4e} {:>12.4e} {:>12.4e}  {:>12.4e} {:>12.4e} {:>12.4e}  {:>12.4e} {:>12.4e} {:>12.4e}  {}",
             r.layer,
             r.ratio,
-            r.scope,
             r.max_abs,
-            r.mean_rel,
             r.l2_rel,
-            format_buckets(&r.buckets)
+            r.in_amax,
+            r.rhc_max_abs,
+            r.rhc_l2_rel,
+            r.rhc_in_amax,
+            r.ffn_max_abs,
+            r.ffn_l2_rel,
+            r.ffn_in_amax,
+            format_row_dist(&r.row_max_abs)
         );
     }
+
+    // Explicit full per-row max dump for each layer (global max already in dist).
     println!();
-    println!("FFN-half only (all layers, from GPU residual_hc):");
-    println!(
-        "{:>5} {:>5} {:>12} {:>12} {:>12}  {}",
-        "L", "ratio", "max_abs", "mean_rel", "l2_rel", "buckets max_abs"
-    );
+    println!("Per-layer GLOBAL max abs error (full / attn / ffn) + argmax row:");
     for r in &rows_out {
+        let (fmax, farg) = argmax_row(&r.row_max_abs);
+        let (amax, aarg) = argmax_row(&r.rhc_row_max_abs);
+        let (mmax, marg) = argmax_row(&r.ffn_row_max_abs);
         println!(
-            "{:>5} {:>5} {:>12.4e} {:>12.4e} {:>12.4e}  {}",
-            r.layer,
-            r.ratio,
-            r.ffn_max_abs,
-            r.ffn_mean_rel,
-            r.ffn_l2_rel,
-            format_buckets(&r.ffn_buckets)
+            "  L{:>2} r={:>3}: full={:.4e}@r{farg}  attn={:.4e}@r{aarg}  ffn={:.4e}@r{marg}  in_amax={:.4e}",
+            r.layer, r.ratio, fmax, amax, mmax, r.in_amax
         );
     }
 
@@ -515,8 +680,20 @@ fn run() -> Result<(), String> {
             println!();
             println!(
                 "FIRST DIVERGING LAYER: L{} compress_ratio={} scope={} \
-                 max_abs={:.6e} mean_rel={:.6e} l2_rel={:.6e}",
-                d.layer, d.ratio, d.scope, d.max_abs, d.mean_rel, d.l2_rel
+                 max_abs={:.6e} mean_rel={:.6e} l2_rel={:.6e} in_amax={:.6e} \
+                 (abs/in_amax={:.3e})",
+                d.layer,
+                d.ratio,
+                d.scope,
+                d.max_abs,
+                d.mean_rel,
+                d.l2_rel,
+                d.in_amax,
+                if d.in_amax > 0.0 {
+                    d.max_abs / d.in_amax
+                } else {
+                    0.0
+                }
             );
             if let Some(rep) = rows_out.iter().find(|r| r.layer == d.layer) {
                 println!(
@@ -528,34 +705,40 @@ fn run() -> Result<(), String> {
                     rep.stage_max_abs[3],
                     rep.stage_max_abs[4]
                 );
+                println!(
+                    "  attn-half: max_abs={:.4e} l2_rel={:.4e} in_amax={:.4e}  {}",
+                    rep.rhc_max_abs,
+                    rep.rhc_l2_rel,
+                    rep.rhc_in_amax,
+                    format_row_dist(&rep.rhc_row_max_abs)
+                );
+                println!(
+                    "  ffn-half:  max_abs={:.4e} l2_rel={:.4e} in_amax={:.4e}  {}",
+                    rep.ffn_max_abs,
+                    rep.ffn_l2_rel,
+                    rep.ffn_in_amax,
+                    format_row_dist(&rep.ffn_row_max_abs)
+                );
             }
         }
         None => {
             println!();
             println!(
-                "NO LAYER DIVERGES above floor (max_abs<{CLEAN_MAX_ABS:.1e}, \
-                 l2_rel<{CLEAN_L2_REL:.1e}). Defect is outside any single layer \
-                 (inter-layer plumbing / KV rings / head / embed) OR in the \
-                 ratio>0 attention half (not covered by this FFN-scoped bisect)."
+                "NO LAYER DIVERGES above floor (max_abs<{CLEAN_MAX_ABS:.1e} OR \
+                 l2_rel<{CLEAN_L2_REL:.1e} with abs/in_amax gate). \
+                 Every layer is correct given its GPU input under the JOINT \
+                 attention oracle. Combined with a clean PlumbingProbe wiring \
+                 result this forces the defect into something neither bisect \
+                 nor plumbing has modelled."
             );
-            let any_ratio0_full = rows_out.iter().any(|r| r.scope == "full" && r.max_abs < CLEAN_MAX_ABS);
-            let ffn_all_clean = rows_out
-                .iter()
-                .all(|r| r.ffn_max_abs < CLEAN_MAX_ABS && r.ffn_l2_rel < CLEAN_L2_REL);
-            if ffn_all_clean && any_ratio0_full {
-                println!(
-                    "  FFN-half clean on all 43 layers; ratio-0 full layer clean. \
-                     Points at ratio>0 attention path (layers 2-42)."
-                );
-            }
         }
     }
 
     // Machine-readable one-liner for hub.
     if let Some(d) = &first_divergent {
         println!(
-            "RESULT first_divergent_layer={} ratio={} scope={} max_abs={:.6e} l2_rel={:.6e} wall_s={wall_s:.2}",
-            d.layer, d.ratio, d.scope, d.max_abs, d.l2_rel
+            "RESULT first_divergent_layer={} ratio={} scope={} max_abs={:.6e} l2_rel={:.6e} in_amax={:.6e} wall_s={wall_s:.2}",
+            d.layer, d.ratio, d.scope, d.max_abs, d.l2_rel, d.in_amax
         );
     } else {
         println!("RESULT first_divergent_layer=none wall_s={wall_s:.2}");
@@ -564,7 +747,7 @@ fn run() -> Result<(), String> {
     Ok(())
 }
 
-// ── Full layer reference (main-path attn + FFN; no compressed KV) ───────────
+// ── Full layer reference (joint attn SWA+compress+indexer + FFN) ────────────
 
 fn full_layer_ref(
     x_hc: &[f32],
@@ -579,7 +762,7 @@ fn full_layer_ref(
     layer: &ParentLayerWeights,
     w_decode: &GpuTensor,
 ) -> Result<Vec<f32>, String> {
-    // Attn half.
+    // Attn half — joint oracle (compressor/indexer wired when ratio > 0).
     let (y, post, comb) = hc_pre_ref(
         x_hc,
         &hl.hc_attn_fn,
@@ -595,18 +778,7 @@ fn full_layer_ref(
     let attn_in = rms_norm_ref(&y, &hl.attn_norm, PARENT_RMS_EPS as f64, PARENT_DIM);
     // Match GPU stage_f32_to_act_bf16 before first attn linear.
     let attn_in_bf16: Vec<f32> = attn_in.iter().copied().map(round_to_bf16).collect();
-    let aw = AttnSwARefWeights {
-        wq_a: &hl.wq_a,
-        wq_b: &hl.wq_b,
-        wkv: &hl.wkv,
-        wo_a: &hl.wo_a,
-        wo_b: &hl.wo_b,
-        q_norm: &hl.q_norm,
-        kv_norm: &hl.kv_norm,
-        attn_sink: &hl.attn_sink,
-        compressor: None,
-        indexer: None,
-    };
+    let aw = hl.attn_ref_weights();
     let attn = attention_swa_ref(&attn_in_bf16, &aw, rows, start_pos, compress_ratio)?;
     let residual_hc = hc_post_ref(
         &attn.o,
@@ -898,6 +1070,18 @@ struct HostLayerWeights {
     wkv: Vec<f32>,
     wo_a: Vec<f32>,
     wo_b: Vec<f32>,
+    /// Main compressor (ratio 4 / 128). All four present or all absent.
+    comp_wkv: Option<Vec<f32>>,
+    comp_wgate: Option<Vec<f32>>,
+    comp_norm: Option<Vec<f32>>,
+    comp_ape: Option<Vec<f32>>,
+    /// Indexer (ratio 4 only). All six present or all absent.
+    ix_wq_b: Option<Vec<f32>>,
+    ix_weights_proj: Option<Vec<f32>>,
+    ix_comp_wkv: Option<Vec<f32>>,
+    ix_comp_wgate: Option<Vec<f32>>,
+    ix_comp_norm: Option<Vec<f32>>,
+    ix_comp_ape: Option<Vec<f32>>,
     hc_attn_fn: Vec<f32>,
     hc_attn_base: Vec<f32>,
     hc_attn_scale: Vec<f32>,
@@ -946,6 +1130,51 @@ impl HostLayerWeights {
             None
         };
 
+        // Main compressor (ratio > 0).
+        let (comp_wkv, comp_wgate, comp_norm, comp_ape) =
+            if let Some(c) = layer.compressor.as_ref() {
+                let proj = c.wkv.shape.get(0).copied().unwrap_or(0);
+                let dim_k = c.wkv.shape.get(1).copied().unwrap_or(PARENT_DIM);
+                (
+                    Some(download_bf16_as_f32(gpu, &c.wkv, proj * dim_k)?),
+                    Some(download_bf16_as_f32(gpu, &c.wgate, proj * dim_k)?),
+                    Some(download_bf16_as_f32(gpu, &c.norm, PARENT_HEAD_DIM)?),
+                    Some(download_f32(
+                        gpu,
+                        &c.ape,
+                        c.ape.shape.iter().product::<usize>().max(1),
+                    )?),
+                )
+            } else {
+                (None, None, None, None)
+            };
+
+        // Indexer (ratio == 4).
+        let (ix_wq_b, ix_weights_proj, ix_comp_wkv, ix_comp_wgate, ix_comp_norm, ix_comp_ape) =
+            if let Some(ix) = layer.indexer.as_ref() {
+                let wq = download_bf16_as_f32(gpu, ix.wq_b.tensor(), ix.wq_b.n() * ix.wq_b.k())?;
+                let wp_n = ix.weights_proj.shape.get(0).copied().unwrap_or(0);
+                let wp_k = ix.weights_proj.shape.get(1).copied().unwrap_or(PARENT_DIM);
+                let wp = download_bf16_as_f32(gpu, &ix.weights_proj, wp_n * wp_k)?;
+                let cproj = ix.compressor_wkv.shape.get(0).copied().unwrap_or(0);
+                let cdim = ix.compressor_wkv.shape.get(1).copied().unwrap_or(PARENT_DIM);
+                (
+                    Some(wq),
+                    Some(wp),
+                    Some(download_bf16_as_f32(gpu, &ix.compressor_wkv, cproj * cdim)?),
+                    Some(download_bf16_as_f32(gpu, &ix.compressor_wgate, cproj * cdim)?),
+                    // index head_dim = 128
+                    Some(download_bf16_as_f32(gpu, &ix.compressor_norm, 128)?),
+                    Some(download_f32(
+                        gpu,
+                        &ix.compressor_ape,
+                        ix.compressor_ape.shape.iter().product::<usize>().max(1),
+                    )?),
+                )
+            } else {
+                (None, None, None, None, None, None)
+            };
+
         Ok(Self {
             attn_norm: download_bf16_as_f32(gpu, &layer.attn_norm, dim)?,
             ffn_norm: download_bf16_as_f32(gpu, &layer.ffn_norm, dim)?,
@@ -957,6 +1186,16 @@ impl HostLayerWeights {
             wkv: download_bf16_as_f32(gpu, layer.wkv.tensor(), wkv_n * wkv_k)?,
             wo_a: download_bf16_as_f32(gpu, layer.wo_a.tensor(), wo_a_n * wo_a_k)?,
             wo_b: download_bf16_as_f32(gpu, layer.wo_b.tensor(), wo_b_n * wo_b_k)?,
+            comp_wkv,
+            comp_wgate,
+            comp_norm,
+            comp_ape,
+            ix_wq_b,
+            ix_weights_proj,
+            ix_comp_wkv,
+            ix_comp_wgate,
+            ix_comp_norm,
+            ix_comp_ape,
             hc_attn_fn: download_f32(gpu, &layer.hc_attn_fn, mix_hc * hc_flat)?,
             hc_attn_base: download_f32(gpu, &layer.hc_attn_base, mix_hc)?,
             hc_attn_scale: download_f32(gpu, &layer.hc_attn_scale, 3)?,
@@ -987,24 +1226,103 @@ impl HostLayerWeights {
             )?,
         })
     }
+
+    /// Build joint-oracle weight views (SWA + compressor + indexer when present).
+    fn attn_ref_weights(&self) -> AttnSwARefWeights<'_> {
+        let compressor = match (
+            self.comp_wkv.as_deref(),
+            self.comp_wgate.as_deref(),
+            self.comp_norm.as_deref(),
+            self.comp_ape.as_deref(),
+        ) {
+            (Some(a), Some(b), Some(c), Some(d)) => Some(AttnCompRefWeights {
+                wkv: a,
+                wgate: b,
+                norm: c,
+                ape: d,
+            }),
+            _ => None,
+        };
+        let indexer = match (
+            self.ix_wq_b.as_deref(),
+            self.ix_weights_proj.as_deref(),
+            self.ix_comp_wkv.as_deref(),
+            self.ix_comp_wgate.as_deref(),
+            self.ix_comp_norm.as_deref(),
+            self.ix_comp_ape.as_deref(),
+        ) {
+            (Some(a), Some(b), Some(c), Some(d), Some(e), Some(f)) => {
+                Some(AttnIndexerRefWeights {
+                    wq_b: a,
+                    weights_proj: b,
+                    compressor_wkv: c,
+                    compressor_wgate: d,
+                    compressor_norm: e,
+                    compressor_ape: f,
+                })
+            }
+            _ => None,
+        };
+        AttnSwARefWeights {
+            wq_a: &self.wq_a,
+            wq_b: &self.wq_b,
+            wkv: &self.wkv,
+            wo_a: &self.wo_a,
+            wo_b: &self.wo_b,
+            q_norm: &self.q_norm,
+            kv_norm: &self.kv_norm,
+            attn_sink: &self.attn_sink,
+            compressor,
+            indexer,
+        }
+    }
 }
 
+
 // ── Metrics / buckets ───────────────────────────────────────────────────────
+
+/// Comparison metrics between GPU tensor `a` and reference `b`.
+///
+/// - `max_abs` / `mean_rel` / `l2_rel`: global elementwise error
+/// - `in_amax`: max |b_i| (reference magnitude — the scale absolute error sits on)
+/// - `gpu_amax`: max |a_i|
+/// - `row_max_abs`: per-row max |a-b| length = rows (full distribution, not sampled)
+#[derive(Clone, Debug)]
+struct CmpMetrics {
+    max_abs: f64,
+    mean_rel: f64,
+    l2_rel: f64,
+    in_amax: f64,
+    gpu_amax: f64,
+    /// Per-row max abs error (length = rows).
+    row_max_abs: Vec<f64>,
+}
 
 struct LayerReport {
     layer: usize,
     ratio: usize,
     scope: String,
+    // full-layer
     max_abs: f64,
     mean_rel: f64,
     l2_rel: f64,
+    in_amax: f64,
+    gpu_amax: f64,
+    row_max_abs: Vec<f64>,
     buckets: Vec<(usize, usize, f64, f64, f64)>,
+    // attn-half (residual_hc)
+    rhc_max_abs: f64,
+    rhc_mean_rel: f64,
+    rhc_l2_rel: f64,
+    rhc_in_amax: f64,
+    rhc_row_max_abs: Vec<f64>,
+    // ffn-half
     ffn_max_abs: f64,
     ffn_mean_rel: f64,
     ffn_l2_rel: f64,
+    ffn_in_amax: f64,
+    ffn_row_max_abs: Vec<f64>,
     ffn_buckets: Vec<(usize, usize, f64, f64, f64)>,
-    rhc_max_abs: f64,
-    rhc_l2_rel: f64,
     stage_max_abs: [f64; 5],
 }
 
@@ -1015,28 +1333,49 @@ struct Divergent {
     max_abs: f64,
     mean_rel: f64,
     l2_rel: f64,
+    in_amax: f64,
 }
 
-fn metrics(a: &[f32], b: &[f32]) -> (f64, f64, f64) {
+fn metrics(a: &[f32], b: &[f32], rows: usize, width: usize) -> CmpMetrics {
     assert_eq!(a.len(), b.len(), "metrics length mismatch");
+    assert_eq!(a.len(), rows * width, "metrics geometry mismatch");
     let mut max_abs = 0.0f64;
     let mut sum_rel = 0.0f64;
     let mut n_rel = 0usize;
     let mut num = 0.0f64;
     let mut den = 0.0f64;
-    for (&x, &y) in a.iter().zip(b.iter()) {
-        let d = (x as f64 - y as f64).abs();
-        if d > max_abs {
-            max_abs = d;
+    let mut in_amax = 0.0f64;
+    let mut gpu_amax = 0.0f64;
+    let mut row_max_abs = vec![0.0f64; rows];
+    for r in 0..rows {
+        let mut rmax = 0.0f64;
+        for c in 0..width {
+            let i = r * width + c;
+            let x = a[i] as f64;
+            let y = b[i] as f64;
+            let d = (x - y).abs();
+            if d > max_abs {
+                max_abs = d;
+            }
+            if d > rmax {
+                rmax = d;
+            }
+            let ay = y.abs();
+            if ay > in_amax {
+                in_amax = ay;
+            }
+            let ax = x.abs();
+            if ax > gpu_amax {
+                gpu_amax = ax;
+            }
+            if ay > 1e-8 {
+                sum_rel += d / ay;
+                n_rel += 1;
+            }
+            num += (x - y) * (x - y);
+            den += y * y;
         }
-        let ay = (y as f64).abs();
-        if ay > 1e-8 {
-            sum_rel += d / ay;
-            n_rel += 1;
-        }
-        let dd = x as f64 - y as f64;
-        num += dd * dd;
-        den += (y as f64) * (y as f64);
+        row_max_abs[r] = rmax;
     }
     let mean_rel = if n_rel > 0 {
         sum_rel / n_rel as f64
@@ -1048,7 +1387,26 @@ fn metrics(a: &[f32], b: &[f32]) -> (f64, f64, f64) {
     } else {
         num.sqrt()
     };
-    (max_abs, mean_rel, l2_rel)
+    CmpMetrics {
+        max_abs,
+        mean_rel,
+        l2_rel,
+        in_amax,
+        gpu_amax,
+        row_max_abs,
+    }
+}
+
+fn argmax_row(row_max: &[f64]) -> (f64, usize) {
+    let mut best = 0.0f64;
+    let mut arg = 0usize;
+    for (i, &v) in row_max.iter().enumerate() {
+        if v > best {
+            best = v;
+            arg = i;
+        }
+    }
+    (best, arg)
 }
 
 fn bucket_metrics(
@@ -1107,6 +1465,28 @@ fn format_buckets(b: &[(usize, usize, f64, f64, f64)]) -> String {
         .map(|(lo, hi, mx, _, l2)| format!("[{lo},{hi})={mx:.2e}/{l2:.2e}"))
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// Full per-row max_abs distribution summary (not a sampled subset).
+fn format_row_dist(row_max: &[f64]) -> String {
+    if row_max.is_empty() {
+        return "empty".into();
+    }
+    let mut sorted = row_max.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let n = sorted.len();
+    let p50 = sorted[n / 2];
+    let p90 = sorted[(n * 9 / 10).min(n - 1)];
+    let p99 = sorted[(n * 99 / 100).min(n - 1)];
+    let global = sorted[n - 1];
+    let mut argmax = 0usize;
+    for (i, &v) in row_max.iter().enumerate() {
+        if v == global {
+            argmax = i;
+            break;
+        }
+    }
+    format!("p50={p50:.3e} p90={p90:.3e} p99={p99:.3e} max={global:.3e}@r{argmax}")
 }
 
 // ── IO helpers ──────────────────────────────────────────────────────────────
