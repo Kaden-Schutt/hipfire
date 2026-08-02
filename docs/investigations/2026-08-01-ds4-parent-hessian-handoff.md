@@ -210,8 +210,9 @@ architecture flag. No Qwen-owned body changes.
 2. **Codec gate** — **PASSED 2026-08-02.** GPU E4M3/UE8M0 and E2M1/UE8M0
    decode matches an independent CPU oracle on fixed edge cases and sampled
    checkpoint values, bit for bit. See "Gate status" below.
-3. **Linear gate**: dense and expert matmul outputs match the checkpoint's
-   bundled operator semantics on fixed inputs.
+3. **Linear gate** — **PASSED 2026-08-02.** Dense and expert matmul outputs
+   match the checkpoint's bundled operator semantics on fixed inputs and on
+   real checkpoint tensors. See "Gate 3 evidence" below.
 4. **One-layer gate**: 16-token layer canary with finite state and logits.
 5. **Parent-forward gate**: full 43-layer 32-token coherent output; finite
    logits and deterministic fixed-input hashes.
@@ -229,7 +230,8 @@ architecture flag. No Qwen-owned body changes.
 
 ## Gate status (updated 2026-08-02)
 
-Gates 1 and 2 are closed. Gate 3 is the next work.
+Gates 1, 2, and 3 are closed, and the full parent checkpoint is resident on
+the MI300X. Gate 4 (one-layer canary) is the next work.
 
 ### What landed
 
@@ -338,13 +340,109 @@ comparison is **bit-exact** against the CPU oracle, not tolerance-based.
    Both installs are present on the host; if the discrepancy matters for a
    published result, pin `HIPFIRE_ROCM_PATH` before the producing run.
 
+### Gate 3 evidence
+
+`ds4_parent_linear_gate` on `mi300x` (gfx942), seed `0xD54CA7E32026`:
+**11 PASS, 1 INCONCLUSIVE, 0 FAIL**, exit 0.
+
+The acceptance criterion is relative, not an invented tolerance. The CPU
+oracle (`parent::gemm_ref`) runs in two modes: `Exact` (f64 ground truth) and
+`ReferenceOrder` (f32, reproducing the tilelang block structure exactly). Then
+`err_ref = ||ReferenceOrder - Exact|| / ||Exact||` is the bundled kernel's own
+rounding, and the GPU must not be materially worse.
+
+| signal | result | reading |
+|---|---|---|
+| bias: mean signed err / stddev | <= 0.08 all cases; **0.005** on both real tensors | no misplaced scale |
+| `err_gpu / err_ref` | 0.64 - 2.56x (bar: 4x) | same summation-order class |
+| `err_gpu / err_seq_f32` | 0.54 - 0.83x | MFMA is *tighter* than naive sequential f32 |
+
+Bias is the defect detector and magnitude is not: a misplaced scale shows up
+as bias at any magnitude, while a different-but-valid summation tree shows up
+as unbiased noise. Both signals are clean, on synthetic cases with deliberately
+wide UE8M0 exponent spread and on `layers.3.attn.wq_a.weight` and
+`layers.3.ffn.experts.0.w1.weight` from the real checkpoint.
+
+The one INCONCLUSIVE case is a tiny expert shape where `err_ref == 0` — every
+term happened to be exactly representable, so no rounding occurred anywhere
+and the comparison measures nothing. It is reported as INCONCLUSIVE rather
+than PASS on purpose. **This is a real trap for later gates:** narrow scale
+ranges make GPU and oracle agree bit-for-bit and produce a pass that is
+evidence of nothing. Any future numeric gate must assert `err_ref > 0` before
+counting a case.
+
+### Full-checkpoint residency (`ds4_parent_residency_gate`, mi300x)
+
+All 43 layers with routed experts, MTP excluded:
+
+| tier | GiB | bytes |
+|---|---:|---:|
+| dense, decoded to resident BF16 | 10.910 | 11,714,691,072 |
+| routed experts, compressed | 137.062 | 147,169,738,752 |
+| BF16 | 2.634 | 2,828,377,344 |
+| F32 | 0.132 | 141,262,684 |
+| I64 | 0.017 | 18,616,320 |
+| **total** | **150.756** | **161,872,686,172** |
+
+Byte-identical to the Gate 1 projection, which was derived independently from
+the safetensors index — two separate code paths agreeing exactly. 41.244 GiB
+headroom on the 192 GiB card. Full load 40.7 s at 3.79 GiB/s; a
+`ParentLoadPlan { layers: 0..1 }` loads in 3.4 s, which is what Gate 4 should
+iterate against.
+
+### Additional findings
+
+7. **`gemm_bf16_mfma.gfx942.hip` had never been executed.** It was compile-
+   and disassembly-validated on 2026-05-19 but its runtime validation was
+   still marked PENDING and it had no Rust wrapper. It now has
+   `Gpu::gemm_bf16_mfma_gfx942` and is bit-exact against both an F32 reference
+   and rocBLAS on every shape tested. Throughput is 13.8 TFLOP/s vs rocBLAS
+   40.9 at `n=32768, k=1024, m=32` — adequate for calibration (a 1K-token
+   forward is order 13 TFLOP total), so correctness and capture-hook
+   friendliness win over raw speed here.
+8. **BF16 decode is exact, not an approximation.** Every UE8M0 scale is a
+   power of two, and an E4M3 code (3-bit mantissa) or E2M1 code (1-bit
+   mantissa) times a power of two is exactly representable in BF16 (7-bit
+   mantissa, wide exponent). So each product term is the identical real number
+   in both the reference's FP8xFP8 formulation and ours, and exact in FP32.
+   Only summation order differs. This is why Gate 3 can demand near-parity
+   rather than a loose tolerance.
+9. **`parent_linear_dense` destroys `x_bf16`**, matching the reference's
+   `inplace=True` activation quantization at the linear boundary. A caller
+   that reuses the buffer for a second projection double-quantizes silently.
+   The forward must fill a per-linear activation scratch from the residual;
+   never hand it a buffer that has to survive.
+
 ### Not yet done
 
-Gates 3-9 are untouched. Specifically: no dense or expert matmul has been
-compared against the bundled operator semantics (Gate 3), no parent weights
-have been made resident, no parent forward exists, and no parent logits have
-been saved. The `.plog` comparator is written and unit-tested but has never
-consumed a real parent logit file, because none exists yet.
+Gates 4-9. No forward pass exists: no layer has been executed end to end, no
+parent logits have been saved, and the `.plog` comparator remains unit-tested
+only, because no real parent logit file exists yet. Gate 4 (16-token
+one-layer canary) is next, and it now has resident weights, a verified linear
+path, and a 3.4 s single-layer load to iterate against.
+
+Parent MoE semantics Gate 4 must reproduce, transcribed from the bundled
+`inference/model.py:592-649`:
+
+- `Expert.forward`: `gate = w1(x).float()`, `up = w3(x).float()`; with
+  `swiglu_limit = 10.0`, `up = clamp(up, -10, 10)` but
+  `gate = clamp(gate, max=10)` — **`gate` has no lower clamp**. Then
+  `x = silu(gate) * up`, the routing weight is applied **here**
+  (`x = weights * x`, before `w2`, not to the expert's output), then
+  `w2(x.to(bf16))`.
+- `MoE.forward`: `y` accumulates in **f32**;
+  `y[idx] += expert(x[idx], weights[idx, top, None])` per selected expert;
+  `y += shared_experts(x)` afterwards; then cast back to the input dtype.
+- `Gate.forward`: `linear(x.float(), self.weight.float())` — f32 scores from
+  an f32-widened BF16 weight, so it takes the plain `F.linear` branch and no
+  activation quantization applies. `scoring_func = "sqrtsoftplus"`,
+  `topk_method = "noaux_tc"`, `num_experts_per_tok = 6`,
+  `norm_topk_prob = true`, `routed_scaling_factor = 1.5`.
+- Activation-quant simulation sites outside the linears
+  (`model.py:375-378, 420-422, 512`): FP8 in-place at block **64** on the
+  non-RoPE KV dims, and Hadamard rotation (`hadamard_transform(x,
+  scale = n^-0.5)`) followed by FP4 in-place at group 32 on the indexer `q`
+  and the indexer compressor's `kv`.
 
 
 ## Producer boundary
