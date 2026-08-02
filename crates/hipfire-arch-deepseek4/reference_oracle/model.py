@@ -1,1 +1,1 @@
-../../../.codeinsight+research/ds4-parent-ref/inference/model.py
+/home/kaden/ClaudeCode/autorocm/hipfire/.claude/worktrees/ds4-mi300x-agentmaxx/.codeinsight+research/ds4-parent-ref/inference/model.py

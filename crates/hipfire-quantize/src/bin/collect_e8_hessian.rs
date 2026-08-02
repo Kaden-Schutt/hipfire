@@ -237,4 +237,36 @@ mod tests {
         assert!((v00 - h.blocks[0][0]).abs() < 1e-3 * (h.blocks[0][0].abs() + 1.0));
         std::fs::remove_file(&path).ok();
     }
+
+    /// Python `reference_gptq/formats.py` E8H1 writer → Rust header/layout reader.
+    #[test]
+    fn python_fixture_e8h1_roundtrip() {
+        let mut path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        path.push("reference_gptq/fixtures/layers.0.mlp.experts.3.gate_up_proj.weight.hblk");
+        assert!(path.is_file(), "missing fixture {path:?}");
+        let b = std::fs::read(&path).unwrap();
+        assert_eq!(read_u32(&b, 0), 0x45_38_48_31, "magic");
+        assert_eq!(read_u32(&b, 4), 2, "n_blocks");
+        assert_eq!(read_u32(&b, 8), 512, "K");
+        assert_eq!(b.len(), 12 + 2 * 256 * 256 * 4);
+
+        // entry block1[3,5] from make_fixtures.py meta
+        let mut meta_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        meta_path.push("reference_gptq/fixtures/e8h1_meta.txt");
+        let meta = std::fs::read_to_string(&meta_path).unwrap();
+        let mut expect35 = None;
+        for line in meta.lines() {
+            if let Some(v) = line.strip_prefix("entry_b1_3_5=") {
+                expect35 = Some(v.parse::<f64>().unwrap());
+            }
+        }
+        let expect35 = expect35.expect("meta entry");
+        let off = 12 + (1 * 256 * 256 + 3 * 256 + 5) * 4;
+        let got = f32::from_le_bytes(b[off..off + 4].try_into().unwrap()) as f64;
+        // f64→f32→f64 store path in the Python writer
+        assert!(
+            (got - expect35).abs() < 1e-5 * (expect35.abs() + 1.0),
+            "block1[3,5] got={got} expect={expect35}"
+        );
+    }
 }
