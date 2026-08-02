@@ -773,6 +773,7 @@ dependencies = [
  "hipfire-dispatch",
  "hipfire-reap",
  "hipfire-runtime",
+ "memmap2",
  "rdna-compute",
  "serde",
  "serde_json",

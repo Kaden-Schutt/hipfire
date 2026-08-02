@@ -2789,6 +2789,19 @@ pub const DEQUANTIZE_MFP4G32_E8_TO_F16_SRC: &str =
     include_str!("../../../kernels/src/dequantize_mfp4g32_e8_to_f16.hip");
 pub const DEQUANTIZE_MFP4G32_E8_SOA_TO_F16_GFX942_SRC: &str =
     include_str!("../../../kernels/src/dequantize_mfp4g32_e8_soa_to_f16.gfx942.hip");
+/// Dense parent FP8 (E4M3) + UE8M0 128×128 block-scale → BF16 (gfx942).
+pub const DEQUANT_FP8_E4M3_UE8M0_BLK128_TO_BF16_GFX942_SRC: &str =
+    include_str!("../../../kernels/src/dequant_fp8_e4m3_ue8m0_blk128_to_bf16.gfx942.hip");
+/// Routed-expert parent FP4 (packed E2M1) + UE8M0 g32 scale → BF16 (gfx942).
+pub const DEQUANT_FP4_E2M1_UE8M0_G32_TO_BF16_GFX942_SRC: &str =
+    include_str!("../../../kernels/src/dequant_fp4_e2m1_ue8m0_g32_to_bf16.gfx942.hip");
+/// Parent FP8 (E4M3 OCP) + UE8M0 dynamic act quant, fused quant+dequant in-place BF16 (gfx942).
+pub const ACT_QUANT_FP8_UE8M0_INPLACE_GFX942_SRC: &str =
+    include_str!("../../../kernels/src/act_quant_fp8_ue8m0_inplace.gfx942.hip");
+/// Parent FP4 (E2M1) + UE8M0 g32 dynamic act quant, fused quant+dequant in-place BF16 (gfx942).
+pub const ACT_QUANT_FP4_UE8M0_G32_INPLACE_GFX942_SRC: &str =
+    include_str!("../../../kernels/src/act_quant_fp4_ue8m0_g32_inplace.gfx942.hip");
+
 pub const GEMM_GATE_UP_HFQ4G256_WMMA_SRC: &str =
     include_str!("../../../kernels/src/gemm_gate_up_hfq4g256_wmma.hip");
 // LDS-staged X variant. Opt-in via HIPFIRE_GATE_UP_VARIANT=ldsx for

@@ -1193,6 +1193,411 @@ impl Gpu {
         )
     }
 
+    /// Dense parent-checkpoint FP8 weight decode on gfx942.
+    ///
+    /// Expands `F8_E4M3 [M,K]` with `F8_E8M0 [ceil(M/128), ceil(K/128)]`
+    /// block scales into row-major BF16 `[M,K]`. Model-lifetime staging —
+    /// not a hot-path decode.
+    ///
+    /// Grid `[M,1,1]`, block `[256,1,1]` (one workgroup per output row).
+    pub fn dequant_fp8_e4m3_ue8m0_blk128_to_bf16_gfx942(
+        &mut self,
+        w: &DeviceBuffer,
+        s: &DeviceBuffer,
+        out: &DeviceBuffer,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if !self.arch_caps.is_gfx942() {
+            return Err(HipError::new(
+                0,
+                "dequant_fp8_e4m3_ue8m0_blk128_to_bf16_gfx942 requires gfx942",
+            ));
+        }
+        if m == 0 || k == 0 {
+            return Err(HipError::new(
+                0,
+                &format!(
+                    "dequant_fp8_e4m3_ue8m0_blk128_to_bf16_gfx942: M and K must be positive (got M={m} K={k})"
+                ),
+            ));
+        }
+        let s_rows = m.div_ceil(128);
+        let s_cols = k.div_ceil(128);
+        let w_bytes = m
+            .checked_mul(k)
+            .ok_or_else(|| HipError::new(0, "dequant_fp8: M*K overflow"))?;
+        let s_bytes = s_rows
+            .checked_mul(s_cols)
+            .ok_or_else(|| HipError::new(0, "dequant_fp8: scale shape overflow"))?;
+        let out_bytes = w_bytes
+            .checked_mul(2)
+            .ok_or_else(|| HipError::new(0, "dequant_fp8: BF16 out size overflow"))?;
+        if w.size() < w_bytes {
+            return Err(HipError::new(
+                0,
+                &format!(
+                    "dequant_fp8_e4m3_ue8m0_blk128_to_bf16_gfx942: w buffer too small (have {} need {w_bytes})",
+                    w.size()
+                ),
+            ));
+        }
+        if s.size() < s_bytes {
+            return Err(HipError::new(
+                0,
+                &format!(
+                    "dequant_fp8_e4m3_ue8m0_blk128_to_bf16_gfx942: s buffer too small (have {} need {s_bytes})",
+                    s.size()
+                ),
+            ));
+        }
+        if out.size() < out_bytes {
+            return Err(HipError::new(
+                0,
+                &format!(
+                    "dequant_fp8_e4m3_ue8m0_blk128_to_bf16_gfx942: out buffer too small (have {} need {out_bytes})",
+                    out.size()
+                ),
+            ));
+        }
+        const KERNEL: &str = "dequant_fp8_e4m3_ue8m0_blk128_to_bf16_gfx942";
+        self.ensure_kernel(
+            KERNEL,
+            kernels::DEQUANT_FP8_E4M3_UE8M0_BLK128_TO_BF16_GFX942_SRC,
+            KERNEL,
+        )?;
+        let w_ptr = w.as_ptr();
+        let s_ptr = s.as_ptr();
+        let out_ptr = out.as_ptr();
+        let m_i32 = m as i32;
+        let k_i32 = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &w_ptr as *const _ as *mut c_void,
+            &s_ptr as *const _ as *mut c_void,
+            &out_ptr as *const _ as *mut c_void,
+            &m_i32 as *const _ as *mut c_void,
+            &k_i32 as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            KERNEL,
+            [m as u32, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut blob = hip_bridge::KernargBlob::new();
+                blob.push_ptr(w_ptr);
+                blob.push_ptr(s_ptr);
+                blob.push_ptr(out_ptr);
+                blob.push_i32(m_i32);
+                blob.push_i32(k_i32);
+                blob
+            },
+        )
+    }
+
+    /// Routed-expert parent-checkpoint FP4 weight decode on gfx942.
+    ///
+    /// Expands packed E2M1 `I8 [M, K/2]` with per-row UE8M0 scales
+    /// `F8_E8M0 [M, K/32]` into row-major BF16 `[M,K]`. Hot path — one
+    /// thread owns one 32-wide K-group.
+    ///
+    /// Grid `[M, ceil((K/32)/256), 1]`, block `[256,1,1]`.
+    /// Requires `K % 32 == 0` (group size) and therefore even `K`.
+    pub fn dequant_fp4_e2m1_ue8m0_g32_to_bf16_gfx942(
+        &mut self,
+        w: &DeviceBuffer,
+        s: &DeviceBuffer,
+        out: &DeviceBuffer,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if !self.arch_caps.is_gfx942() {
+            return Err(HipError::new(
+                0,
+                "dequant_fp4_e2m1_ue8m0_g32_to_bf16_gfx942 requires gfx942",
+            ));
+        }
+        if m == 0 || k == 0 {
+            return Err(HipError::new(
+                0,
+                &format!(
+                    "dequant_fp4_e2m1_ue8m0_g32_to_bf16_gfx942: M and K must be positive (got M={m} K={k})"
+                ),
+            ));
+        }
+        if k % 32 != 0 {
+            return Err(HipError::new(
+                0,
+                &format!(
+                    "dequant_fp4_e2m1_ue8m0_g32_to_bf16_gfx942: K must be a multiple of 32 (got K={k})"
+                ),
+            ));
+        }
+        let n_groups = k / 32;
+        let w_bytes = m
+            .checked_mul(k / 2)
+            .ok_or_else(|| HipError::new(0, "dequant_fp4: packed W size overflow"))?;
+        let s_bytes = m
+            .checked_mul(n_groups)
+            .ok_or_else(|| HipError::new(0, "dequant_fp4: scale size overflow"))?;
+        let out_bytes = m
+            .checked_mul(k)
+            .and_then(|e| e.checked_mul(2))
+            .ok_or_else(|| HipError::new(0, "dequant_fp4: BF16 out size overflow"))?;
+        if w.size() < w_bytes {
+            return Err(HipError::new(
+                0,
+                &format!(
+                    "dequant_fp4_e2m1_ue8m0_g32_to_bf16_gfx942: w buffer too small (have {} need {w_bytes})",
+                    w.size()
+                ),
+            ));
+        }
+        if s.size() < s_bytes {
+            return Err(HipError::new(
+                0,
+                &format!(
+                    "dequant_fp4_e2m1_ue8m0_g32_to_bf16_gfx942: s buffer too small (have {} need {s_bytes})",
+                    s.size()
+                ),
+            ));
+        }
+        if out.size() < out_bytes {
+            return Err(HipError::new(
+                0,
+                &format!(
+                    "dequant_fp4_e2m1_ue8m0_g32_to_bf16_gfx942: out buffer too small (have {} need {out_bytes})",
+                    out.size()
+                ),
+            ));
+        }
+        const KERNEL: &str = "dequant_fp4_e2m1_ue8m0_g32_to_bf16_gfx942";
+        self.ensure_kernel(
+            KERNEL,
+            kernels::DEQUANT_FP4_E2M1_UE8M0_G32_TO_BF16_GFX942_SRC,
+            KERNEL,
+        )?;
+        let w_ptr = w.as_ptr();
+        let s_ptr = s.as_ptr();
+        let out_ptr = out.as_ptr();
+        let m_i32 = m as i32;
+        let k_i32 = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &w_ptr as *const _ as *mut c_void,
+            &s_ptr as *const _ as *mut c_void,
+            &out_ptr as *const _ as *mut c_void,
+            &m_i32 as *const _ as *mut c_void,
+            &k_i32 as *const _ as *mut c_void,
+        ];
+        let groups_y = n_groups.div_ceil(256) as u32;
+        self.launch_maybe_blob(
+            KERNEL,
+            [m as u32, groups_y, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut blob = hip_bridge::KernargBlob::new();
+                blob.push_ptr(w_ptr);
+                blob.push_ptr(s_ptr);
+                blob.push_ptr(out_ptr);
+                blob.push_i32(m_i32);
+                blob.push_i32(k_i32);
+                blob
+            },
+        )
+    }
+
+    /// Parent-checkpoint FP8 activation quant simulation (fused quant+dequant).
+    ///
+    /// In-place over a row-major BF16 buffer shaped `[rows, last_dim]`.
+    /// Groups of `block` contiguous elements along the last dim use a single
+    /// UE8M0 power-of-two scale (`fast_round_scale`) and round through OCP
+    /// E4M3 RNE before writing BF16(`e4m3_to_f32(q) * s`) back.
+    ///
+    /// `block` must be 64 (KV/compressor non-RoPE sites) or 128 (linear
+    /// boundaries). `last_dim % block == 0` is required. Fail-closed on
+    /// anything else — no MQ2R / Raw fallback.
+    ///
+    /// Launch: grid `[rows, last_dim/block, 1]`, block `[64,1,1]` (one wave
+    /// per group).
+    pub fn act_quant_fp8_ue8m0_inplace_gfx942(
+        &mut self,
+        x: &DeviceBuffer,
+        rows: usize,
+        last_dim: usize,
+        block: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if !self.arch_caps.is_gfx942() {
+            return Err(HipError::new(
+                0,
+                "act_quant_fp8_ue8m0_inplace_gfx942 requires gfx942",
+            ));
+        }
+        if block != 64 && block != 128 {
+            return Err(HipError::new(
+                0,
+                &format!(
+                    "act_quant_fp8_ue8m0_inplace_gfx942: block must be 64 or 128 (got {block})"
+                ),
+            ));
+        }
+        if rows == 0 || last_dim == 0 {
+            return Err(HipError::new(
+                0,
+                &format!(
+                    "act_quant_fp8_ue8m0_inplace_gfx942: rows and last_dim must be positive (got rows={rows} last_dim={last_dim})"
+                ),
+            ));
+        }
+        if last_dim % block != 0 {
+            return Err(HipError::new(
+                0,
+                &format!(
+                    "act_quant_fp8_ue8m0_inplace_gfx942: last_dim must be a multiple of block (got last_dim={last_dim} block={block})"
+                ),
+            ));
+        }
+        let need_bytes = rows
+            .checked_mul(last_dim)
+            .and_then(|e| e.checked_mul(2))
+            .ok_or_else(|| {
+                HipError::new(0, "act_quant_fp8_ue8m0_inplace_gfx942: size overflow")
+            })?;
+        if x.size() < need_bytes {
+            return Err(HipError::new(
+                0,
+                &format!(
+                    "act_quant_fp8_ue8m0_inplace_gfx942: buffer too small (have {} need {need_bytes} for {rows}×{last_dim} BF16)",
+                    x.size()
+                ),
+            ));
+        }
+        const KERNEL: &str = "act_quant_fp8_ue8m0_inplace_gfx942";
+        self.ensure_kernel(
+            KERNEL,
+            kernels::ACT_QUANT_FP8_UE8M0_INPLACE_GFX942_SRC,
+            KERNEL,
+        )?;
+        let x_ptr = x.as_ptr();
+        let rows_i32 = rows as i32;
+        let last_dim_i32 = last_dim as i32;
+        let block_i32 = block as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &x_ptr as *const _ as *mut c_void,
+            &rows_i32 as *const _ as *mut c_void,
+            &last_dim_i32 as *const _ as *mut c_void,
+            &block_i32 as *const _ as *mut c_void,
+        ];
+        let n_groups = last_dim / block;
+        self.launch_maybe_blob(
+            KERNEL,
+            [rows as u32, n_groups as u32, 1],
+            [64, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut blob = hip_bridge::KernargBlob::new();
+                blob.push_ptr(x_ptr);
+                blob.push_i32(rows_i32);
+                blob.push_i32(last_dim_i32);
+                blob.push_i32(block_i32);
+                blob
+            },
+        )
+    }
+
+    /// Parent-checkpoint FP4 activation quant simulation (fused quant+dequant).
+    ///
+    /// In-place over a row-major BF16 buffer shaped `[rows, last_dim]`.
+    /// Groups of 32 along the last dim; UE8M0 power-of-two scale via
+    /// `fast_round_scale(amax, 1/6)`, then E2M1 RNE onto
+    /// `{0,.5,1,1.5,2,3,4,6}` (sign preserved) and BF16 write-back.
+    ///
+    /// `last_dim % 32 == 0` is required. Fail-closed otherwise.
+    ///
+    /// Launch: grid `[rows, last_dim/32, 1]`, block `[32,1,1]` (one group
+    /// per 32-lane cohort).
+    pub fn act_quant_fp4_ue8m0_g32_inplace_gfx942(
+        &mut self,
+        x: &DeviceBuffer,
+        rows: usize,
+        last_dim: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if !self.arch_caps.is_gfx942() {
+            return Err(HipError::new(
+                0,
+                "act_quant_fp4_ue8m0_g32_inplace_gfx942 requires gfx942",
+            ));
+        }
+        if rows == 0 || last_dim == 0 {
+            return Err(HipError::new(
+                0,
+                &format!(
+                    "act_quant_fp4_ue8m0_g32_inplace_gfx942: rows and last_dim must be positive (got rows={rows} last_dim={last_dim})"
+                ),
+            ));
+        }
+        if last_dim % 32 != 0 {
+            return Err(HipError::new(
+                0,
+                &format!(
+                    "act_quant_fp4_ue8m0_g32_inplace_gfx942: last_dim must be a multiple of 32 (got last_dim={last_dim})"
+                ),
+            ));
+        }
+        let need_bytes = rows
+            .checked_mul(last_dim)
+            .and_then(|e| e.checked_mul(2))
+            .ok_or_else(|| {
+                HipError::new(0, "act_quant_fp4_ue8m0_g32_inplace_gfx942: size overflow")
+            })?;
+        if x.size() < need_bytes {
+            return Err(HipError::new(
+                0,
+                &format!(
+                    "act_quant_fp4_ue8m0_g32_inplace_gfx942: buffer too small (have {} need {need_bytes} for {rows}×{last_dim} BF16)",
+                    x.size()
+                ),
+            ));
+        }
+        const KERNEL: &str = "act_quant_fp4_ue8m0_g32_inplace_gfx942";
+        self.ensure_kernel(
+            KERNEL,
+            kernels::ACT_QUANT_FP4_UE8M0_G32_INPLACE_GFX942_SRC,
+            KERNEL,
+        )?;
+        let x_ptr = x.as_ptr();
+        let rows_i32 = rows as i32;
+        let last_dim_i32 = last_dim as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &x_ptr as *const _ as *mut c_void,
+            &rows_i32 as *const _ as *mut c_void,
+            &last_dim_i32 as *const _ as *mut c_void,
+        ];
+        let n_groups = last_dim / 32;
+        self.launch_maybe_blob(
+            KERNEL,
+            [rows as u32, n_groups as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut blob = hip_bridge::KernargBlob::new();
+                blob.push_ptr(x_ptr);
+                blob.push_i32(rows_i32);
+                blob.push_i32(last_dim_i32);
+                blob
+            },
+        )
+    }
+
+
     /// D→D copy with offsets that picks async (on the active stream) when
     /// a stream is set and sync otherwise. Captured graphs require async on
     /// the captured stream — sync `hipMemcpy` errors with "would make the
