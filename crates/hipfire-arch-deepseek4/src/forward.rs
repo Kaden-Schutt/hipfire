@@ -228,7 +228,7 @@ pub fn finish_dense_activation_dump() -> Result<(), String> {
 /// path reads are atomic loads.
 mod config_cache {
     use std::sync::atomic;
-    use std::sync::OnceLock;
+    use std::sync::{LazyLock, OnceLock};
 
     fn flag_one(name: &'static str) -> bool {
         hipfire_config::developer_var(name).ok().as_deref() == Some("1")
@@ -393,6 +393,85 @@ mod config_cache {
                 if ffn_overlap { "ON" } else { "OFF" },
             );
         });
+    }
+
+    /// Resolve the routed-MoE scale for one call.
+    ///
+    /// `HIPFIRE_DEEPSEEK4_ROUTE_SCALE` is an explicit process-level override and
+    /// is the only value cached. The silent default is always
+    /// `cfg.routed_scaling_factor` (checkpoint value, typically 1.5) — never a
+    /// hardcoded constant. Caching the combined scale would be wrong the
+    /// moment two models with different checkpoint scales are served in one
+    /// process.
+    pub(super) fn route_scale(cfg_routed_scaling_factor: f32) -> f32 {
+        static ENV_OVERRIDE: LazyLock<Option<f32>> = LazyLock::new(|| {
+            hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_ROUTE_SCALE")
+                .ok()
+                .and_then(|s| s.parse().ok())
+        });
+        let env_override = *ENV_OVERRIDE;
+        let effective = resolve_route_scale(cfg_routed_scaling_factor, env_override);
+        if env_override.is_some()
+            && (effective - cfg_routed_scaling_factor).abs() > f32::EPSILON
+        {
+            static LOGGED: OnceLock<()> = OnceLock::new();
+            let _ = LOGGED.get_or_init(|| {
+                eprintln!(
+                    "deepseek4: HIPFIRE_DEEPSEEK4_ROUTE_SCALE={effective} overrides \
+                     cfg.routed_scaling_factor={cfg_routed_scaling_factor}"
+                );
+            });
+        }
+        effective
+    }
+
+    /// Pure combiner used by [`route_scale`] and unit tests.
+    /// `env_override = None` → checkpoint scale; `Some(v)` → explicit override.
+    ///
+    /// # Do not "fix" this back to a hardcoded 2.2
+    ///
+    /// Until 2026-08-02 the default here was a hardcoded `2.2`, introduced in
+    /// the initial DS4 bring-up (`b263fb3cc`, 2026-05-23) and never derived
+    /// from any checkpoint. Every DeepSeek V4 artifact declares
+    /// `routed_scaling_factor: 1.5` — the 0731 safetensors config, the
+    /// 2026-05-27 `deepseek-v4-flash.mq2lloyd` HFQ header, and the 2026-07-24
+    /// `deepseek-v4-flash.mq2r` HFQ header alike — so `2.2` never matched a
+    /// model. `cfg.routed_scaling_factor` was parsed correctly the whole time
+    /// and simply never read here.
+    ///
+    /// Measured on `mi300x`/gfx942 against
+    /// `deepseek-v4-flash.mq2r`, wikitext2 slice md5
+    /// `83b0205a304bf4e52172ecdb05f2e895`, fresh process per run:
+    ///
+    /// | scale | PPL @ctx256 | PPL @ctx512 |
+    /// |---|---:|---:|
+    /// | 2.2 (old silent default) | 6.0804 | 6.5453 |
+    /// | 1.5 (checkpoint value)   | 7.0131 | 8.1091 |
+    ///
+    /// So the *wrong* value measurably wins on that quantized artifact. The
+    /// reading is that MQ2 expert quantization loses routed-expert magnitude
+    /// and an inflated route scale has been silently compensating: a
+    /// ~1.47x factor applied to the routed branch only. That is an artifact
+    /// property, not a model property, and conflating the two in one constant
+    /// is what made this invisible for two months.
+    ///
+    /// The contract value therefore stays here, and the compensation stays
+    /// explicit: serve the current MQ2R artifact with
+    /// `HIPFIRE_DEEPSEEK4_ROUTE_SCALE=2.2` (now logged, never silent) until it
+    /// is re-quantized, and re-measure after any re-quant. The real fix is at
+    /// quantization time, where recovering the lost expert magnitude should
+    /// make 1.5 both correct *and* better.
+    ///
+    /// The parent-calibration path (`crate::parent`) must always use the
+    /// checkpoint value — inheriting a quantization compensation into a
+    /// reference forward is exactly the failure this whole effort exists to
+    /// prevent.
+    #[inline]
+    pub(super) fn resolve_route_scale(
+        cfg_routed_scaling_factor: f32,
+        env_override: Option<f32>,
+    ) -> f32 {
+        env_override.unwrap_or(cfg_routed_scaling_factor)
     }
 
     /// `HIPFIRE_DEEPSEEK4_E8_U4` — use the four-group-unrolled E8-SoA
@@ -4799,15 +4878,8 @@ fn ffn_routed(
     let im = cfg.moe_intermediate_size;
     let ffn_x_rot = state.ffn_x_rot.as_ref().unwrap();
     let ffn_out = state.ffn_out.as_ref().unwrap();
-    // Route-scale: rarely-overridden; one-shot env read at first call.
-    use std::sync::OnceLock;
-    static ROUTE_SCALE: OnceLock<f32> = OnceLock::new();
-    let route_scale_override: f32 = *ROUTE_SCALE.get_or_init(|| {
-        hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_ROUTE_SCALE")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(2.2)
-    });
+    // Route-scale: env override (process-cached) else cfg.routed_scaling_factor.
+    let route_scale_override: f32 = config_cache::route_scale(cfg.routed_scaling_factor);
 
     if layer.expert_gate_up_blob.is_some() {
         // Fused MoE dispatch: 2 indexed kernels (gate_up + down) plus
@@ -4982,10 +5054,7 @@ fn ffn_hash_routed(
     let im = cfg.moe_intermediate_size;
     let ffn_x_rot = state.ffn_x_rot.as_ref().unwrap();
     let ffn_out = state.ffn_out.as_ref().unwrap();
-    let route_scale_override: f32 = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_ROUTE_SCALE")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(2.2);
+    let route_scale_override: f32 = config_cache::route_scale(cfg.routed_scaling_factor);
     let k_top = k;
 
     // Lazy-alloc moe scratch (shared with ffn_routed via state).
@@ -9335,10 +9404,7 @@ fn ffn_batched(
     let w2_ptrs = layer.expert_w2_ptrs.as_ref().unwrap();
     let n_exp = cfg.n_routed_experts;
     let k_top = cfg.num_experts_per_tok;
-    let route_scale: f32 = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_ROUTE_SCALE")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(2.2);
+    let route_scale: f32 = config_cache::route_scale(cfg.routed_scaling_factor);
 
     // 8. Router GEMV: gate.weight @ ffn_x_rot_batch → moe_scores [B, n_exp].
     gemv_auto_batched_wmma(
@@ -12541,6 +12607,38 @@ mod tests {
         assert!(!config_cache::gfx942_hc_finalize_fused_on(arch, true));
         assert!(!config_cache::gfx942_indexer_topk_parallel_on(arch, true));
         assert!(!config_cache::gfx942_ffn_overlap_on(false));
+    }
+
+    #[test]
+    fn route_scale_defaults_to_cfg_not_hardcoded_2_2() {
+        // Pure combiner: unset env → checkpoint value; set env → override.
+        // Would fail against the old `unwrap_or(2.2)` silent default whenever
+        // the checkpoint scale is anything other than 2.2 (every known DS4
+        // checkpoint declares 1.5).
+        let cfg_scale = 1.5f32;
+        assert_eq!(
+            config_cache::resolve_route_scale(cfg_scale, None),
+            cfg_scale,
+            "unset env must use cfg.routed_scaling_factor, not a hardcoded default"
+        );
+        assert_eq!(
+            config_cache::resolve_route_scale(cfg_scale, Some(2.2)),
+            2.2,
+            "explicit HIPFIRE_DEEPSEEK4_ROUTE_SCALE override must win"
+        );
+        assert_eq!(
+            config_cache::resolve_route_scale(cfg_scale, Some(1.0)),
+            1.0
+        );
+        // A second model with a different checkpoint scale must not be pinned
+        // to the first model's value (the OnceLock-of-combined-scale bug).
+        assert_eq!(config_cache::resolve_route_scale(3.0, None), 3.0);
+        // Old default must not sneak back in when cfg says 1.5 and env is unset.
+        assert_ne!(
+            config_cache::resolve_route_scale(1.5, None),
+            2.2,
+            "regression guard: silent 2.2 default must be gone"
+        );
     }
 
     #[test]
