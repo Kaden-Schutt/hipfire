@@ -27,8 +27,39 @@ use rdna_compute::{DType, Gpu, GpuTensor};
 pub const PARENT_DIM: usize = 4096;
 /// Parent MoE intermediate dimension (`moe_inter_dim`).
 pub const PARENT_MOE_INTER: usize = 2048;
-/// `route_scale` from the parent `config.json`.
+/// Default `route_scale` from the parent `config.json` (checkpoint value).
+/// Diagnostic override: `HIPFIRE_PARENT_ROUTE_SCALE` (logged once when set).
+/// The parent default MUST stay at 1.5 — never bake a serving compensation in.
 pub const PARENT_ROUTE_SCALE: f32 = 1.5;
+
+/// Resolve parent route_scale. Default is the checkpoint value
+/// [`PARENT_ROUTE_SCALE`]. `HIPFIRE_PARENT_ROUTE_SCALE` overrides for
+/// diagnostic sweeps only — logged once. Do not change the default.
+pub fn effective_parent_route_scale() -> f32 {
+    use std::sync::LazyLock;
+    static SCALE: LazyLock<f32> = LazyLock::new(|| {
+        match std::env::var("HIPFIRE_PARENT_ROUTE_SCALE") {
+            Ok(s) => match s.parse::<f32>() {
+                Ok(v) if v.is_finite() && v > 0.0 => {
+                    eprintln!(
+                        "deepseek4 parent: HIPFIRE_PARENT_ROUTE_SCALE={v} overrides \
+                         checkpoint PARENT_ROUTE_SCALE={PARENT_ROUTE_SCALE} (diagnostic only)"
+                    );
+                    v
+                }
+                _ => {
+                    eprintln!(
+                        "deepseek4 parent: ignoring invalid HIPFIRE_PARENT_ROUTE_SCALE={s:?}; \
+                         using checkpoint {PARENT_ROUTE_SCALE}"
+                    );
+                    PARENT_ROUTE_SCALE
+                }
+            },
+            Err(_) => PARENT_ROUTE_SCALE,
+        }
+    });
+    *SCALE
+}
 /// `swiglu_limit` from the parent `config.json`.
 pub const PARENT_SWIGLU_LIMIT: f32 = 10.0;
 
@@ -516,7 +547,7 @@ pub fn parent_route(
             rows,
             n_experts,
             topk,
-            PARENT_ROUTE_SCALE,
+            effective_parent_route_scale(),
         )?;
         (weights, indices)
     } else {
@@ -527,7 +558,7 @@ pub fn parent_route(
             rows,
             n_experts,
             topk,
-            PARENT_ROUTE_SCALE,
+            effective_parent_route_scale(),
         )?
     };
 

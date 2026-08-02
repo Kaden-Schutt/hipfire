@@ -12,12 +12,12 @@
 //! ```text
 //! ds4_quant_plog --model <path.hfq> --expect-sha256 <hex> \
 //!                --token-ids tokens.bin --plog OUT.plog \
-//!                [--route-scale S] [--manifest PATH]
+//!                [--route-scale S] [--manifest PATH] [--trust-sha256]
 //! ```
 //!
-//! `--expect-sha256` is mandatory: the model file is hashed before load and
-//! the run refuses on mismatch. Never re-tokenize here — consume the sibling's
-//! `tokens.bin` so parent and quant see identical ids.
+//! `--expect-sha256` is mandatory. By default the model file is hashed before
+//! load and the run refuses on mismatch. `--trust-sha256` skips the re-hash
+//! when the caller already verified the same path+digest earlier in a campaign.
 //!
 //! Forward shape: the quantized path does not expose a single multi-token
 //! prefill that returns logits at every position (batched prefill returns
@@ -94,26 +94,38 @@ fn run() -> Result<(), String> {
     }
     println!();
 
-    // ── 1. Mandatory model sha256 pin ───────────────────────────────────
+    // ── 1. Model sha256 pin ─────────────────────────────────────────────
+    // Mandatory expect digest. By default we hash the file; --trust-sha256
+    // skips the re-hash when the caller already verified the same path+digest
+    // earlier in the campaign (one verified digest + recorded path is enough
+    // provenance — re-hashing an 82 GB artifact per sweep point is waste).
     println!("=== model sha256 (mandatory) ===");
-    let hash_t0 = Instant::now();
-    let model_sha = sha256_file(model_path)?;
-    let hash_s = hash_t0.elapsed().as_secs_f64();
     let model_bytes = std::fs::metadata(model_path)
         .map_err(|e| format!("deepseek4 parent: model metadata: {e}"))?
         .len();
-    println!(
-        "got:  {model_sha}  ({model_bytes} bytes in {hash_s:.1} s)"
-    );
-    println!("want: {}", args.expect_sha256);
-    if !eq_hex_ci(&model_sha, &args.expect_sha256) {
-        return Err(format!(
-            "deepseek4 parent: model sha256 mismatch — refusing to load \
-             (got {model_sha}, want {}). Filename is not provenance.",
+    let model_sha = if args.trust_sha256 {
+        println!(
+            "trust-sha256: skipping re-hash of {model_bytes} bytes; \
+             accepting --expect-sha256={} (caller verified earlier)",
             args.expect_sha256
-        ));
-    }
-    println!("sha256: OK");
+        );
+        args.expect_sha256.clone()
+    } else {
+        let hash_t0 = Instant::now();
+        let model_sha = sha256_file(model_path)?;
+        let hash_s = hash_t0.elapsed().as_secs_f64();
+        println!("got:  {model_sha}  ({model_bytes} bytes in {hash_s:.1} s)");
+        println!("want: {}", args.expect_sha256);
+        if !eq_hex_ci(&model_sha, &args.expect_sha256) {
+            return Err(format!(
+                "deepseek4 parent: model sha256 mismatch — refusing to load \
+                 (got {model_sha}, want {}). Filename is not provenance.",
+                args.expect_sha256
+            ));
+        }
+        println!("sha256: OK");
+        model_sha
+    };
     println!();
 
     // ── 2. Token ids (byte-identical to parent; never re-tokenize) ─────
@@ -535,6 +547,8 @@ struct Args {
     plog: PathBuf,
     route_scale: Option<f32>,
     manifest: Option<PathBuf>,
+    /// Skip re-hashing the model file; trust --expect-sha256 already verified.
+    trust_sha256: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -544,6 +558,7 @@ fn parse_args() -> Result<Args, String> {
     let mut plog: Option<PathBuf> = None;
     let mut route_scale: Option<f32> = None;
     let mut manifest: Option<PathBuf> = None;
+    let mut trust_sha256 = false;
 
     let mut args = std::env::args().skip(1);
     while let Some(flag) = args.next() {
@@ -591,11 +606,14 @@ fn parse_args() -> Result<Args, String> {
                         .ok_or("deepseek4 parent: --manifest needs a value")?,
                 ));
             }
+            "--trust-sha256" => {
+                trust_sha256 = true;
+            }
             "-h" | "--help" => {
                 eprintln!(
                     "usage: ds4_quant_plog --model <path.hfq> --expect-sha256 <hex> \\\n\
                      \t\t--token-ids tokens.bin --plog OUT.plog \\\n\
-                     \t\t[--route-scale S] [--manifest PATH]"
+                     \t\t[--route-scale S] [--manifest PATH] [--trust-sha256]"
                 );
                 std::process::exit(0);
             }
@@ -629,6 +647,7 @@ fn parse_args() -> Result<Args, String> {
         plog,
         route_scale,
         manifest,
+        trust_sha256,
     })
 }
 
