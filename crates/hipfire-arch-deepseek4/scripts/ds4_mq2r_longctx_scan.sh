@@ -75,15 +75,21 @@ run_plog() {
   log "START plog n=${n} scale=${scale:-default} tag=${tag}"
   local t0 rc t1 wall
   t0=$(date +%s)
-  # Intentionally not set -e around the binary.
+  # Prefer --route-scale CLI: ds4_quant_plog set_var's it before any forward,
+  # and the example log line then matches the forward path. Bare env alone is
+  # read only via hipfire_config::developer_var (process snapshot); the example
+  # still prints effective=2.0 from the mq2r default when CLI is unset, which
+  # misled the 8192 sweep. Always pass CLI when sweeping.
+  # Fresh process per call (this function is invoked once per measurement).
   if [[ -n "$scale" ]]; then
-    env "HIPFIRE_DEEPSEEK4_ROUTE_SCALE=${scale}" \
+    env -u HIPFIRE_DEEPSEEK4_ROUTE_SCALE \
       "$BIN_PLOG" \
       --model "$MODEL" \
       --expect-sha256 "$EXPECT_SHA" \
       --token-ids "$tok" \
       --plog "$plog" \
       --manifest "$man" \
+      --route-scale "$scale" \
       >"$runlog" 2>&1
     rc=$?
   else

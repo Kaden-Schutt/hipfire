@@ -495,25 +495,65 @@ mod config_cache {
     /// header value both correct *and* better. Re-measure after any re-quant
     /// and delete this branch when it stops winning.
     ///
-    /// Precedence: `HIPFIRE_DEEPSEEK4_ROUTE_SCALE` (explicit, logged) beats
-    /// the `.mq2r` default, which beats the checkpoint value.
+    /// # The checkpoint value is NOT usable on this path
+    ///
+    /// `672373ce1` (2026-08-02) changed the default from the long-standing
+    /// hipfire value to `cfg.routed_scaling_factor` on the reasoning that
+    /// `2.2` "never matched a model". That reasoning was right about
+    /// provenance and wrong about behaviour: it silently moved every non-`mq2r`
+    /// DeepSeek V4 artifact from 2.2 to 1.5, and 1.5 is measurably bad here —
+    /// 16.31 PPL at ctx2048 against 10.81 at 2.0, a 51% penalty. This restores
+    /// the calibrated value and keeps the checkpoint out of the decision.
+    ///
+    /// **Both** builds want well above 1.5: MQ2-Lloyd was calibrated at 2.2 in
+    /// the initial bring-up (`b263fb3cc`, 2026-05-23) and ran there for two
+    /// months, and the 0731 MQ2R sweep lands at 2.0. That is the signature of a
+    /// **systematic** shortfall in this crate's MoE routed branch, not a
+    /// per-artifact quantization property — the reference applies 1.5 and
+    /// scores PPL 4.693, so 1.5 is correct for the *model* and wrong for *us*.
+    /// The per-build numbers are fine tuning on top of that gap.
+    ///
+    /// So this is a **known-defect compensation with a measured value**, and it
+    /// stays until the routed-branch shortfall is found. Do not "restore" the
+    /// checkpoint value again on provenance grounds alone; that experiment has
+    /// now been run and it costs ~51%.
+    ///
+    /// Precedence: `HIPFIRE_DEEPSEEK4_ROUTE_SCALE` (explicit, logged) beats the
+    /// per-build default, which beats the checkpoint value. Every deviation
+    /// from the header is logged — a silent one survived two months.
     ///
     /// The parent-calibration path (`crate::parent`) must always use the
-    /// checkpoint value — inheriting a quantization compensation into a
-    /// reference forward is exactly the failure this whole effort exists to
-    /// prevent.
+    /// checkpoint value — inheriting a serving compensation into a reference
+    /// forward is exactly the failure this whole effort exists to prevent.
     #[inline]
     pub(super) fn resolve_route_scale(
         cfg_routed_scaling_factor: f32,
         env_override: Option<f32>,
         mq2r: bool,
     ) -> f32 {
-        /// Measured optimum for the 0731 `.mq2r` build. See the table above.
-        const MQ2R_ROUTE_SCALE: f32 = 2.0;
+        let _ = cfg_routed_scaling_factor;
+        /// Measured optimum for the 0731 `.mq2r` build at ctx2048 (table
+        /// above), the most recent and best-controlled sweep: fresh process per
+        /// run, single methodology, `effective_route_scale` logged per run.
+        ///
+        /// An older ctx256 sweep put the minimum at 2.0, but a second ctx256
+        /// table taken in the same period disagrees with it, so that data is not
+        /// trustworthy enough to override a clean long-context measurement.
+        /// Serving context is also closer to 2048 than to 256.
+        ///
+        /// Caveat worth knowing before re-tuning: 1.8 beats 2.0 by only 1.1% at
+        /// ctx2048 (10.688 against 10.810), which is a narrow margin. Both are
+        /// far from 1.5 (16.306). If you need to defend this number, run
+        /// repeats rather than a single fresh-process pair.
+        const MQ2R_ROUTE_SCALE: f32 = 1.8;
+        /// Calibrated in the initial DS4 bring-up and served for two months.
+        /// Never swept, restored because it is known-good and the alternative
+        /// (1.5) is known-bad. Sweep it and replace with a measured value.
+        const DS4_ROUTE_SCALE: f32 = 2.2;
         env_override.unwrap_or(if mq2r {
             MQ2R_ROUTE_SCALE
         } else {
-            cfg_routed_scaling_factor
+            DS4_ROUTE_SCALE
         })
     }
 
@@ -12913,69 +12953,65 @@ mod tests {
     }
 
     #[test]
-    fn route_scale_defaults_to_cfg_not_hardcoded_2_2() {
-        // Non-mq2r artifacts: unset env → checkpoint value; set env → override.
-        // Would fail against the old `unwrap_or(2.2)` silent default whenever
-        // the checkpoint scale is anything other than 2.2 (every known DS4
-        // checkpoint declares 1.5).
-        let cfg_scale = 1.5f32;
+    fn route_scale_never_uses_the_checkpoint_value_on_this_path() {
+        // The checkpoint declares 1.5 and every DS4 artifact does, but 1.5 is
+        // measurably bad on this crate's MoE path: 16.31 PPL at ctx2048 against
+        // 10.81 at 2.0, a 51% penalty. 672373ce1 moved the default to the
+        // checkpoint on provenance grounds and silently regressed every
+        // non-mq2r artifact from 2.2 to 1.5. This is the guard against that
+        // happening a third time.
+        for cfg_scale in [1.5f32, 1.8, 3.0] {
+            assert_ne!(
+                config_cache::resolve_route_scale(cfg_scale, None, false),
+                cfg_scale,
+                "the checkpoint value must not reach the routed branch unmodified"
+            );
+        }
+        // An explicit override always wins, so the compensation stays escapable.
         assert_eq!(
-            config_cache::resolve_route_scale(cfg_scale, None, false),
-            cfg_scale,
-            "unset env must use cfg.routed_scaling_factor, not a hardcoded default"
-        );
-        assert_eq!(
-            config_cache::resolve_route_scale(cfg_scale, Some(2.2), false),
+            config_cache::resolve_route_scale(1.5, Some(2.2), false),
             2.2,
             "explicit HIPFIRE_DEEPSEEK4_ROUTE_SCALE override must win"
         );
         assert_eq!(
-            config_cache::resolve_route_scale(cfg_scale, Some(1.0), false),
-            1.0
-        );
-        // A second model with a different checkpoint scale must not be pinned
-        // to the first model's value (the OnceLock-of-combined-scale bug).
-        assert_eq!(config_cache::resolve_route_scale(3.0, None, false), 3.0);
-        // Old default must not sneak back in when cfg says 1.5 and env is unset.
-        assert_ne!(
-            config_cache::resolve_route_scale(1.5, None, false),
-            2.2,
-            "regression guard: silent 2.2 default must be gone"
+            config_cache::resolve_route_scale(1.5, Some(1.0), true),
+            1.0,
+            "override must win over the mq2r default too"
         );
     }
 
     #[test]
-    fn route_scale_mq2r_ships_2_0_without_touching_other_artifacts() {
-        // The 0731 `.mq2r` sweep (wikitext2 md5 83b0205a…, ctx256) puts the
-        // minimum at 2.0: 15.59/9.13/6.63/6.03/6.84/7.30/7.90 across
-        // 1.2/1.5/1.8/2.0/2.2/2.4/2.6. Serving it on the header's 1.5 costs
-        // ~51% PPL.
+    fn route_scale_per_build_defaults_mq2r_1_8_others_2_2() {
+        // The 0731 `.mq2r` sweep at ctx2048 (wikitext2 md5 83b0205a…, fresh
+        // process per run, effective_route_scale logged) puts the minimum at
+        // 1.8: 16.306 / 10.688 / 10.810 / 11.174 / 11.408 across
+        // 1.5 / 1.8 / 2.0 / 2.2 / 2.4. An older ctx256 sweep said 2.0, but a
+        // second ctx256 table from the same period contradicts it, so the clean
+        // long-context measurement wins.
         assert_eq!(
             config_cache::resolve_route_scale(1.5, None, true),
-            2.0,
-            "the .mq2r artifact must ship at its measured optimum"
+            1.8,
+            "the .mq2r build must ship at its measured ctx2048 optimum"
         );
-        // The whole point of gating on the artifact rather than the
-        // architecture: MQ2-Lloyd and every other DeepSeek V4 build keep their
-        // own header value. Lloyd's optimum is a different number — the tier
-        // layouts differ (shared expert and ffn.gate.weight are qt=3 Q8_0 in
-        // Lloyd against qt=35 MFP4G32E8SOA in R) — so pinning it to 2.0 would
-        // move it off its own optimum.
+        // MQ2-Lloyd and every other DS4 artifact get the value the arch was
+        // calibrated at in b263fb3cc and served on for two months. 672373ce1
+        // dropped them to the checkpoint's 1.5, which is a ~51% PPL regression;
+        // this asserts they are back.
         assert_eq!(
             config_cache::resolve_route_scale(1.5, None, false),
-            1.5,
-            "non-mq2r artifacts must be untouched by the mq2r compensation"
-        );
-        // An explicit override still wins over the artifact default, so the
-        // compensation stays escapable while it exists.
-        assert_eq!(
-            config_cache::resolve_route_scale(1.5, Some(2.2), true),
             2.2,
-            "explicit env override must beat the .mq2r default"
+            "non-mq2r DS4 must use the calibrated 2.2, not the checkpoint 1.5"
         );
-        // A future re-quant inherits its own header rather than this
-        // compensation, provided it is not stamped `.mq2r`.
-        assert_eq!(config_cache::resolve_route_scale(1.8, None, false), 1.8);
+        // Both defaults sit well above the header value. That is the point:
+        // the reference applies 1.5 and scores PPL 4.693, so 1.5 is right for
+        // the model and wrong for this crate's MoE routed branch. Both builds
+        // needing >1.5 makes it systematic, not per-artifact.
+        for mq2r in [true, false] {
+            assert!(
+                config_cache::resolve_route_scale(1.5, None, mq2r) > 1.5,
+                "routed branch is systematically weak here; compensation must not vanish"
+            );
+        }
     }
 
     #[test]
