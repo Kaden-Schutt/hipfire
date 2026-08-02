@@ -213,7 +213,9 @@ architecture flag. No Qwen-owned body changes.
 3. **Linear gate** — **PASSED 2026-08-02.** Dense and expert matmul outputs
    match the checkpoint's bundled operator semantics on fixed inputs and on
    real checkpoint tensors. See "Gate 3 evidence" below.
-4. **One-layer gate**: 16-token layer canary with finite state and logits.
+4. **One-layer gate** — **PASSED 2026-08-02.** 16-token layer canary, finite
+   state, 14/14 sub-block checks against an f64 CPU oracle. See "Gate 4
+   evidence" below.
 5. **Parent-forward gate**: full 43-layer 32-token coherent output; finite
    logits and deterministic fixed-input hashes.
 6. **Pre-GPTQ quality gate**: save parent reference logits, then measure the
@@ -230,8 +232,8 @@ architecture flag. No Qwen-owned body changes.
 
 ## Gate status (updated 2026-08-02)
 
-Gates 1, 2, and 3 are closed, and the full parent checkpoint is resident on
-the MI300X. Gate 4 (one-layer canary) is the next work.
+Gates 1-4 are closed. The full parent checkpoint is resident on the MI300X and
+one full parent layer executes. Gate 5 (43-layer forward) is the next work.
 
 ### What landed
 
@@ -413,36 +415,100 @@ iterate against.
    The forward must fill a per-linear activation scratch from the residual;
    never hand it a buffer that has to survive.
 
+### Gate 4 evidence
+
+`ds4_parent_layer_gate` on `mi300x` (gfx942), layer 0, 16 rows seeded from
+real `embed.weight` token rows: **PASS, 14/14 oracle checks**, exit 0.
+Output finite (0 NaN, 0 Inf, 0 exactly-zero elements), L2 506.71,
+110.9 ms, 27.5 MiB scratch, layer load 0.70 s.
+
+Every stage with an f64 reference in `parent::layer_ref` was downloaded and
+compared. Agreement is 3.7e-9 to 9.5e-7 max-abs across all HC and norm
+stages — f32 round-off, nothing more:
+
+| stage | max abs | mean rel |
+|---|---:|---:|
+| `hc_pre_attn.y` / `.post` / `.comb` | 3.7e-9 / 1.5e-8 / 8.9e-8 | ~1e-8 - 3e-7 |
+| `attn_norm` | 1.5e-8 | 2.8e-8 |
+| `hc_pre_ffn.y` / `.post` / `.comb` | 2.4e-7 / 1.2e-7 / 4.2e-7 | ~1e-7 - 3e-7 |
+| `ffn_norm` | 2.4e-7 | 3.0e-8 |
+| `hc_post_ffn` | 9.5e-7 | 3.7e-8 |
+| routing (hash, layer 0) | 0 index mismatches, 86 distinct experts | weight sum err 2.4e-7 |
+| expert SwiGLU (shared + routed 254) | scale err 6.7e-9 | — |
+
+**Closed-form norm check.** RMSNorm forces per-row RMS to 1, so post-norm L2
+is `sqrt(rows*dim) * mean_abs(weight)`. Using the checkpoint's own BF16 norm
+weights (`attn_norm` mean_abs 0.029486, `ffn_norm` 0.225120):
+
+| norm | predicted | measured | rel err |
+|---|---:|---:|---:|
+| `attn_norm` | 7.548 | 7.539 | 0.12% |
+| `ffn_norm` | 57.63 | 58.31 | 1.2% |
+
+This is the check that catches a `+1` offset convention, a wrong eps, or a
+transposed norm weight. The reference RMSNorm (`model.py:197-202`) is a
+direct multiply with **no offset**, and the real weights are tightly clustered
+and strictly positive, consistent with that. Note `attn_norm`'s mean weight is
+an order of magnitude below `ffn_norm`'s, so the L2 drop from 237 to 7.5
+across that stage is correct, not a collapse.
+
+### The constant-leak finding
+
+The single most valuable result of this gate is what the *standalone* forward
+avoided. Reusing the MQ2R production path as a reference would have silently
+inherited at least three serving-tuned constants that contradict the
+checkpoint:
+
+1. **`route_scale`** — production reads `HIPFIRE_DEEPSEEK4_ROUTE_SCALE` with
+   `unwrap_or(2.2)` and never reads the config's `routed_scaling_factor`
+   (**1.5**).
+2. **`norm_topk_prob`** — present in config, hardwired on in production
+   forward.
+3. **HC `mhc_pre`** — production uses F16 weights, a hardcoded eps, and an
+   env-driven `post_scale`; the reference is `2*sigmoid(...)`.
+
+Each would have produced finite, plausible, wrong parent logits. Every
+constant in `parent/*` now traces to `config.json` or a checkpoint tensor, and
+no parent path reads an environment variable to choose a number. **Treat that
+as a standing rule for the remaining gates.**
+
+Separately, this is worth a maintainer's judgement on its own terms: if
+`route_scale = 2.2` in the MQ2R serving path is a deliberate, measured tuning,
+it should be recorded as such; if it is drift from `routed_scaling_factor`,
+it may be depressing quantized-artifact quality independently of this work.
+
+### Parent semantics already reproduced (from `inference/model.py`)
+
+- `Expert.forward` (592-611): `up = clamp(up, -10, 10)` but
+  `gate = clamp(gate, max=10)` — **`gate` has no lower clamp**. The routing
+  weight multiplies `silu(gate)*up` **before** `w2`, not the expert's output.
+- `MoE.forward` (614-649): `y` accumulates in **f32**, routed experts first,
+  then `y += shared_experts(x)`, then cast back.
+- `Gate.forward` (551-590): `linear(x.float(), weight.float())`, so no
+  activation quantization. `sqrt(softplus(x))` scoring. Bias shifts scores for
+  **selection only**; the returned weight is the *uncorrected* score, then
+  normalized, then scaled by 1.5.
+- Attention (442-549): FP8 in-place simulation at block **64** on the
+  non-RoPE KV dims. RoPE is **interleaved** —
+  `view_as_complex(unflatten(-1, (-1, 2)))` pairs dims `(2i, 2i+1)`. Layers
+  with `compress_ratio == 0` disable YaRN (484-485).
+
 ### Not yet done
 
-Gates 4-9. No forward pass exists: no layer has been executed end to end, no
-parent logits have been saved, and the `.plog` comparator remains unit-tested
-only, because no real parent logit file exists yet. Gate 4 (16-token
-one-layer canary) is next, and it now has resident weights, a verified linear
-path, and a 3.4 s single-layer load to iterate against.
+Gates 5-9. Specifically:
 
-Parent MoE semantics Gate 4 must reproduce, transcribed from the bundled
-`inference/model.py:592-649`:
-
-- `Expert.forward`: `gate = w1(x).float()`, `up = w3(x).float()`; with
-  `swiglu_limit = 10.0`, `up = clamp(up, -10, 10)` but
-  `gate = clamp(gate, max=10)` — **`gate` has no lower clamp**. Then
-  `x = silu(gate) * up`, the routing weight is applied **here**
-  (`x = weights * x`, before `w2`, not to the expert's output), then
-  `w2(x.to(bf16))`.
-- `MoE.forward`: `y` accumulates in **f32**;
-  `y[idx] += expert(x[idx], weights[idx, top, None])` per selected expert;
-  `y += shared_experts(x)` afterwards; then cast back to the input dtype.
-- `Gate.forward`: `linear(x.float(), self.weight.float())` — f32 scores from
-  an f32-widened BF16 weight, so it takes the plain `F.linear` branch and no
-  activation quantization applies. `scoring_func = "sqrtsoftplus"`,
-  `topk_method = "noaux_tc"`, `num_experts_per_tok = 6`,
-  `norm_topk_prob = true`, `routed_scaling_factor = 1.5`.
-- Activation-quant simulation sites outside the linears
-  (`model.py:375-378, 420-422, 512`): FP8 in-place at block **64** on the
-  non-RoPE KV dims, and Hadamard rotation (`hadamard_transform(x,
-  scale = n^-0.5)`) followed by FP4 in-place at group 32 on the indexer `q`
-  and the indexer compressor's `kv`.
+- **Compressor and indexer are unimplemented.** `parent_attention_swa` refuses
+  `compress_ratio != 0`, which is 41 of 43 layers. Gate 5 needs them:
+  the compressor (`model.py:285-384`) and the indexer (`386-440`), including
+  the Hadamard rotation plus FP4 group-32 simulation on the indexer `q` and
+  the indexer compressor's `kv`, and YaRN RoPE with
+  `compress_rope_theta = 160000`.
+- No 43-layer forward, no output head, no saved parent logits. The `.plog`
+  comparator remains unit-tested only, because no real parent logit file
+  exists yet.
+- At 110.9 ms per layer for 16 rows, a naive 43-layer forward is order 5 s per
+  16-token batch. Adequate for a 1K-token calibration run but worth measuring
+  before scaling to 32K.
 
 
 ## Producer boundary
