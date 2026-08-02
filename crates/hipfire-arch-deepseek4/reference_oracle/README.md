@@ -165,3 +165,39 @@ weights (~1.5–2 GB/layer with experts).
 - `hc_sinkhorn_iters = 20`, `hc_mult = 4`, `swiglu_limit = 10.0`
 - `score_func = sqrtsoftplus`, `n_activated_experts = 6`
 - L0: `compress_ratio=0`, `window_size=128`, plain `rope_theta=10000`
+
+## Landed findings (2026-08-02)
+
+### RoPE frequency tables — CLEARED
+
+See `ROPE_TABLE_DIFF.md`. Parent `precompute_rope_freqs` matches `model.py
+precompute_freqs_cis` to max relative error ~7e-8 on all three configs
+(ratio-0 plain 10k, ratio>0 YaRN 160k, plain-160k counterfactual). Max phase
+error at pos 1000 is ~2e-5 rad — not a defect. Indexer shares the YaRN table
+(code correct; stale "plain" comment in indexer.rs header is wrong).
+
+### Full 43-layer residual trajectory — FLAT across position
+
+See `RESIDUAL_POS_TRAJ.md` and `artifacts/residual_pos_traj.json.compact.json`.
+
+```bash
+# on mi300x with GPU free (~5 min, ~4.7 GiB VRAM peak):
+export PYTHONPATH=/mnt/scratch/torch_oracle_rocm:/mnt/scratch/torch_oracle_harness
+python3 -u residual_pos_traj.py --seq 1024 --layers all --out /tmp/residual_pos_traj.json
+```
+
+Streams one `Block` at a time (imports `model.py` verbatim). Dense per-row HC
+L2 after every layer. **mean late/early excluding pos0 over 43 layers = 1.026**.
+Reference residual does **not** degrade with position; the parent top-1
+collapse after ~448–512 is not residual-growth-with-position in the reference.
+L38 pos0/median = 269× (aggregate residual-growth story already retired).
+
+### Index-space / cardinality — CLEARED at seq≤1024
+
+See `INDEX_SPACE_CONVENTIONS.md`. `index_topk` applies only to compressed half;
+SWA window exempt. At 1024 tokens top-k is a no-op (n_comp ≤ 256 < 512).
+
+### Next localiser
+
+Compressed-KV content / joint softmax value path / SWA staging ≡ abs-gather
+equivalence — per-row attention outputs vs parent dumps, not residual L2.
