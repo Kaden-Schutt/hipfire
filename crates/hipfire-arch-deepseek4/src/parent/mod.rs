@@ -2,6 +2,37 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
+//! # NOT A CALIBRATION REFERENCE (2026-08-02)
+//!
+//! End-to-end on `tokens.bin` (1024 ids, sha `48b0f834...`):
+//!
+//! | system | PPL | top-1 | mean KLD vs ref_fp8 |
+//! |--------|----:|------:|--------------------:|
+//! | **torch teacher (fp8 shim)** | **4.693** | 0.640 | 0 (self) |
+//! | torch teacher (exact f32) | 4.624 | 0.649 | 0.040 |
+//! | **this `parent/*` backend** | **59.507** | ~0.28-0.48 | **2.718** |
+//! | mq2r student (prior) | 14.703 | - | - |
+//!
+//! That is a **12.7x PPL gap** against the teacher and ~67x the teacher's
+//! own fp8-vs-exact KLD control. Component gates (load, HC, MoE, attn smoke,
+//! residual **norms**, L0/L2 stage floors, **head path**) can and do pass
+//! while the full forward remains badly wrong -- do not read a green gate
+//! matrix as "parent is faithful."
+//!
+//! **Must not be used as a calibration reference for Gates 6-9 (or any
+//! Hessian / GPTQ / activation capture).** The production teacher is the
+//! torch residual/PPL harness under `reference_oracle/` (`ref_ppl_e2e.py`,
+//! `ref_fp8_*.plog`). See:
+//! - `reference_oracle/REF_PPL_E2E.md` -- teacher PPL + residual-magnitude note
+//! - `reference_oracle/HEAD_PATH_CONTENT.md` -- head path closed at floor
+//! - `reference_oracle/ATTN_OUT_QUANT_FLOOR.md` -- L0 attn_out at quant floor
+//! - `docs/investigations/2026-08-02-ds4-parent-not-calibration-ref.md`
+//!
+//! Investigation stopped after the head-path check (host + GPU) matched the
+//! teacher at the BF16-act floor on identical residuals. Deep-layer stage
+//! bisect was deliberately not pursued; residual content / full-seq path
+//! remains open but is out of scope for this backend until explicitly reopened.
+//!
 //! DeepSeek V4 Flash **parent-checkpoint** calibration backend.
 //!
 //! This module exists to execute the *original* mixed-precision DeepSeek V4
