@@ -772,6 +772,49 @@ than streaming 529 MB and run in seconds.
 > Gate 7 Hessians, and Gate 9 GPTQ all depend on a correct teacher and are
 > blocked behind it.
 
+#### Elimination ledger — what the defect is NOT
+
+Each closed with evidence at a realistic operating point, not by inspection.
+Recorded because the search space is large and re-treading it is the main way
+this stalls.
+
+| hypothesis | verdict | evidence |
+|---|---|---|
+| `.plog` row misalignment | closed | shift 0 optimal; `argmax==tok[t]` 0/48 for both files |
+| PPL scoring off-by-one | **was real, fixed** | row `t` scored against `token_ids[t]`; shift moved inside `compare()` |
+| batch size / prefill width | closed | a 128-token run **bit-matches** 1024 on every shared bucket |
+| compressed-index `offset=0` | closed | sentinel proves idx 5 → COMP 2005, never SWA 1005 |
+| wave64 `__shfl_down` width | closed | fixed defensively; recaptured plog **byte-identical** |
+| sequential decode vs batched prefill | closed | sequential slightly *worse* (0.484 vs 0.516) |
+| Hyper-Connections gain | closed | f64 oracle ~1e-7 at layers 0/5/20/40 on grown residuals; `post` mean 0.37, not saturating |
+| MoE component paths | closed | f64 oracle ~1e-7 at L5 row 0: routing exact, weight sum exactly 1.5, expert-35 5.7e-6, shared 2.9e-6 |
+| RoPE frequency tables | closed | bit-identical to f64 transcription, both policies; constants from `config.json`, not `ModelArgs` defaults |
+| RoPE table *selection* on ratio>0 | closed | GPU q vs correct YaRN oracle 1.4e-6, vs wrong plain table 21.3 |
+| ratio-0 attention | closed | f64 oracle **flat** across position (row 0 1.19e-6, row 100 1.43e-6) |
+| ratio>0 main attention | closed | same 1e-6 floor and flatness on layers 2 and 3 |
+| row 0's 6e5 residual | red herring | row 0's input direction aligns gate/up (cos 0.498 vs −0.009 isotropic); all three models agree exactly in [1,32); massive first-token activations are documented and functional |
+
+**Two methodology notes worth more than any single elimination.**
+
+*Know the oracle's arithmetic domain.* A layer bisect reported the MoE block
+diverging from an f64 reference by 6.4e-3 at layer 0 — apparently four orders
+above the 1e-6 floor every other block shows. But BF16 carries 8 significant
+bits, so its unit roundoff is `2^-8 = 3.9e-3`, and `parent_linear_expert` runs
+BF16 MFMA while HC and the norms run f32/host-f64 paths. An f64 oracle *should*
+disagree with a bf16 GEMM at ~4e-3, so the apparent signal is the same order as
+the expected floor. This is the third instance this session of the same class
+of mistake (BF16-vs-f32 `amax`, the plog target shift). **A comparison is only
+meaningful once its floor is established on a case known to be correct, or the
+oracle is domain-matched by rounding operands to bf16.**
+
+*Beware relative error on pathological magnitudes.* The same bisect reports FFN
+divergence growing to 4e0 deep in the stack — but the residual there is ~6e5,
+and a relative metric against a huge, possibly degenerate input misleads in
+either direction.
+
+bf16 also cannot explain the gap on its own: both quantized models run at bf16
+or worse and score 14.6 against the parent's 163.89.
+
 ### Not yet done
 
 Gates 6-9. Specifically:

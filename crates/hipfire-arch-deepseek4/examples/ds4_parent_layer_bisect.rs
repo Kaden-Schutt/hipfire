@@ -100,8 +100,7 @@ fn run() -> Result<(), String> {
     println!("model: {}", model_path.display());
     println!("token_ids: {} (n={rows})", args.token_ids.display());
     println!("start_pos: {start_pos}");
-    println!("scope: FFN-half for all layers; full-layer (attn+ffn) for compress_ratio==0");
-    println!();
+    println!("scope: full-layer (attn main-path + FFN) for all ratios; FFN-half always reported");
 
     let wall0 = Instant::now();
 
@@ -298,32 +297,29 @@ fn run() -> Result<(), String> {
         let norm_m = metrics(&ffn_norm_gpu, &ffn_norm_ref);
         let moe_m = metrics(&moe_gpu, &moe_ref);
 
-        // ── Full-layer oracle for ratio-0 ───────────────────────────────
-        let (full_metrics, full_buckets, scope) = if ratio == 0 {
-            let out_full = full_layer_ref_ratio0(
-                &x_host,
-                hl,
-                rows,
-                start_pos,
-                layer_i,
-                &cfg,
-                input_ids,
-                &mut gpu,
-                layer,
-                &w_decode,
-            )?;
-            let m = metrics(&out_gpu, &out_full);
-            let b = bucket_metrics(&out_gpu, &out_full, rows, PARENT_HC_DIM);
-            (Some(m), Some(b), "full")
-        } else {
-            (None, None, "ffn")
-        };
+        // ── Full-layer oracle (main-path attn + FFN). compress_ratio selects
+        // the RoPE table; compressed-KV contribution is not modelled, which
+        // at 128 tokens is the intentional SWA-only complement (n_active may
+        // be nonzero but RatioNAttn confirmed main q/kv ~1e-6 flat).
+        let out_full = full_layer_ref(
+            &x_host,
+            hl,
+            rows,
+            start_pos,
+            layer_i,
+            ratio,
+            &cfg,
+            input_ids,
+            &mut gpu,
+            layer,
+            &w_decode,
+        )?;
+        let full_metrics = metrics(&out_gpu, &out_full);
+        let full_buckets = bucket_metrics(&out_gpu, &out_full, rows, PARENT_HC_DIM);
+        let scope = "full";
 
-        let (rep_max, rep_mean, rep_l2, rep_buckets) = if let Some(m) = full_metrics {
-            (m.0, m.1, m.2, full_buckets.unwrap())
-        } else {
-            (ffn_metrics.0, ffn_metrics.1, ffn_metrics.2, ffn_buckets.clone())
-        };
+        let (rep_max, rep_mean, rep_l2, rep_buckets) =
+            (full_metrics.0, full_metrics.1, full_metrics.2, full_buckets);
 
         let dirty = rep_max > CLEAN_MAX_ABS || rep_l2 > CLEAN_L2_REL;
         if dirty && first_divergent.is_none() {
@@ -341,8 +337,8 @@ fn run() -> Result<(), String> {
         println!(
             "{layer_i:>5} {ratio:>5} {scope:>10} {rep_max:>12.4e} {rep_mean:>12.4e} {rep_l2:>12.4e}  {bucket_s}"
         );
-        // Always print FFN-half line when full was primary, for completeness.
-        if full_metrics.is_some() {
+        // Always print FFN-half for completeness.
+        {
             let fb = format_buckets(&ffn_buckets);
             println!(
                 "{:>5} {:>5} {:>10} {:>12.4e} {:>12.4e} {:>12.4e}  {fb}",
@@ -497,14 +493,15 @@ fn run() -> Result<(), String> {
     Ok(())
 }
 
-// ── Full ratio-0 layer reference ────────────────────────────────────────────
+// ── Full layer reference (main-path attn + FFN; no compressed KV) ───────────
 
-fn full_layer_ref_ratio0(
+fn full_layer_ref(
     x_hc: &[f32],
     hl: &HostLayerWeights,
     rows: usize,
     start_pos: usize,
     layer_idx: usize,
+    compress_ratio: usize,
     cfg: &ParentQuantConfig,
     input_ids: Option<&[u32]>,
     gpu: &mut Gpu,
@@ -535,7 +532,7 @@ fn full_layer_ref_ratio0(
         kv_norm: &hl.kv_norm,
         attn_sink: &hl.attn_sink,
     };
-    let attn = attention_swa_ref(&attn_in, &aw, rows, start_pos, 0)?;
+    let attn = attention_swa_ref(&attn_in, &aw, rows, start_pos, compress_ratio)?;
     let residual_hc = hc_post_ref(
         &attn.o,
         x_hc,
