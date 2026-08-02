@@ -11646,6 +11646,76 @@ mod gptq_damping_probe {
         }
     }
 
+    /// Does MQ2-Lloyd preserve weight magnitude, or does it shrink?
+    ///
+    /// This is the **routed-expert** tier (qt=19) in every DeepSeek V4 build,
+    /// and it is exactly the branch `route_scale` multiplies — the shared
+    /// expert and `ffn.gate` sit on a different tier and are untouched by it.
+    ///
+    /// Motivation: DS4 ships `route_scale` 1.8 (mq2r) and 2.2 (other builds)
+    /// where the checkpoint declares 1.5, and the PyTorch reference scores
+    /// PPL 4.693 at 1.5 — so 1.5 is correct for the model and our routed branch
+    /// is systematically weak. Lloyd-Max centroids are conditional means, so by
+    /// the orthogonality principle `E[w_hat.w] = E[w_hat^2]`, which makes the
+    /// reconstruction provably SHORTER than the source: retained energy is
+    /// `1 - MSE/E[w^2]` and the norm ratio is its square root. If that shortfall
+    /// is large it is a candidate cause, and a global scalar can only ever
+    /// approximate its average — a per-group gain would correct it properly.
+    ///
+    /// The sibling E8 codec was measured at retained ~0.999 (no shrinkage), so
+    /// this tier is the one that matters. Informational: asserts sanity only
+    /// and prints under `--nocapture`.
+    #[test]
+    fn mq2_lloyd_shrinkage_on_routed_expert_tier() {
+        let signs1 = gen_fwht_signs(42, 256);
+        let signs2 = gen_fwht_signs(1042, 256);
+        // Deterministic Gaussian; expert weights are near-Gaussian after the
+        // FWHT incoherence rotation, which is the domain this codec is tuned to.
+        let mut s: u64 = 0x243F_6A88_85A3_08D3;
+        let mut next = move || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            (s >> 11) as f32 / (1u64 << 53) as f32
+        };
+        let n = 256 * 512;
+        let mut w = vec![0.0f32; n];
+        for v in w.iter_mut() {
+            let u1 = next().max(1e-12);
+            let u2 = next();
+            *v = (-2.0 * u1.ln()).sqrt() * (std::f32::consts::TAU * u2).cos();
+        }
+
+        let recon = dequantize_mq2g256_lloyd_to_f32(
+            &quantize_mq2g256_lloyd(&w, &signs1, &signs2),
+            n,
+            &signs1,
+            &signs2,
+        );
+
+        let (mut dot, mut ss_w, mut ss_h) = (0.0f64, 0.0f64, 0.0f64);
+        for i in 0..n {
+            dot += f64::from(recon[i]) * f64::from(w[i]);
+            ss_w += f64::from(w[i]) * f64::from(w[i]);
+            ss_h += f64::from(recon[i]) * f64::from(recon[i]);
+        }
+        let retained = dot / ss_w;
+        let norm_ratio = (ss_h / ss_w).sqrt();
+        let energy_gain = 1.0 / retained;
+
+        eprintln!("\nMQ2-Lloyd shrinkage on the routed-expert tier (n={n})");
+        eprintln!("  retained  E[wh.w]/E[w^2] = {retained:.4}");
+        eprintln!("  norm      |wh|/|w|       = {norm_ratio:.4}");
+        eprintln!("  gain to restore energy   = {energy_gain:.4}");
+        eprintln!("  shipped route_scale ratios: 1.8/1.5 = 1.2000, 2.2/1.5 = 1.4667\n");
+
+        assert!(
+            retained > 0.3 && retained < 1.3,
+            "retained energy {retained} is not a sane round-trip"
+        );
+        assert!(norm_ratio.is_finite() && norm_ratio > 0.0);
+    }
+
     /// Variant of plain Lloyd with tunable iteration count. Used to test
     /// whether the production 8-iter cap is leaving headroom.
     fn quantize_mq2g256_lloyd_niter(
