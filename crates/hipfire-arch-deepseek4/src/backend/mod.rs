@@ -81,7 +81,10 @@ impl Mq2rBackend {
     }
 
     /// Run the exact-gfx942 indexer when this verified model owns that
-    /// backend. `Ok(false)` leaves portable/gfx1151 selection to the caller.
+    /// backend. `bounded` forwards the caller's kernel selection (false: O(N^2)
+    /// reference, true: opt-in O(N log^2 K) bounded bitonic); no defaulting
+    /// happens here. `Ok(false)` leaves portable/gfx1151 selection to the
+    /// caller.
     pub(crate) fn try_indexer_top_k_buf_parallel(
         self,
         gpu: &mut Gpu,
@@ -91,6 +94,7 @@ impl Mq2rBackend {
         k_buf: &GpuTensor,
         n_idx_heads: i32,
         max_k: i32,
+        bounded: bool,
     ) -> Result<bool, String> {
         match self {
             Self::Gfx942(backend) => {
@@ -102,6 +106,7 @@ impl Mq2rBackend {
                     k_buf,
                     n_idx_heads,
                     max_k,
+                    bounded,
                 )?;
                 Ok(true)
             }

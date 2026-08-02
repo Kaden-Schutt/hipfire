@@ -25,6 +25,12 @@ const GROUPED_OLORA_E8_WAVE64X4_CANDIDATE_KERNEL: &str =
 const INDEXER_TOP_K_BUF_PARALLEL_SRC: &str =
     include_str!("../../../../kernels/src/indexer_top_k_buf_parallel.gfx942.hip");
 const INDEXER_TOP_K_BUF_PARALLEL_KERNEL: &str = "indexer_top_k_buf_parallel_gfx942";
+// Re-export of the frozen kernels.rs contract const (single include_str! site;
+// all other gfx942 sources in this file predate the kernels.rs re-export
+// convention and keep their local includes).
+const INDEXER_TOP_K_BUF_BOUNDED_SRC: &str =
+    crate::kernels::INDEXER_TOP_K_BUF_BOUNDED_GFX942_SRC;
+const INDEXER_TOP_K_BUF_BOUNDED_KERNEL: &str = "indexer_top_k_buf_parallel_gfx942_bounded";
 const MQ2_LLOYD_GATE_UP_WAVE64_SRC: &str =
     include_str!("../../../../kernels/src/gemv_mq2g256_lloyd_moe_gate_up_indexed.gfx942.hip");
 const MQ2_LLOYD_GATE_UP_WAVE64_KERNEL: &str = "gemv_mq2g256_lloyd_moe_gate_up_k8_indexed_gfx942";
@@ -392,6 +398,14 @@ impl Gfx942Device<'_> {
 
     /// Exact-gfx942 deterministic indexer top-K.
     ///
+    /// `bounded == false` selects the O(N^2) rank-count reference
+    /// (`indexer_top_k_buf_parallel_gfx942`). `bounded == true` selects the
+    /// opt-in O(N log^2 K) tile-merge bitonic port
+    /// (`indexer_top_k_buf_parallel_gfx942_bounded`): a drop-in with
+    /// identical dispatch shape and byte-identical output. The selected
+    /// symbol keys both `ensure_kernel` and the launch, so the two modules
+    /// never share a cache entry.
+    ///
     /// This is intentionally not exposed through the generic `Gpu` surface:
     /// DeepSeek4 must hold a verified model-owned gfx942 backend before it can
     /// select the CDNA code object.
@@ -403,13 +417,15 @@ impl Gfx942Device<'_> {
         k_buf: &GpuTensor,
         n_idx_heads: i32,
         max_k: i32,
+        bounded: bool,
     ) -> HipResult<()> {
         self.gpu.bind_thread()?;
-        self.gpu.ensure_kernel(
-            INDEXER_TOP_K_BUF_PARALLEL_KERNEL,
-            INDEXER_TOP_K_BUF_PARALLEL_SRC,
-            INDEXER_TOP_K_BUF_PARALLEL_KERNEL,
-        )?;
+        let (src, kernel) = if bounded {
+            (INDEXER_TOP_K_BUF_BOUNDED_SRC, INDEXER_TOP_K_BUF_BOUNDED_KERNEL)
+        } else {
+            (INDEXER_TOP_K_BUF_PARALLEL_SRC, INDEXER_TOP_K_BUF_PARALLEL_KERNEL)
+        };
+        self.gpu.ensure_kernel(kernel, src, kernel)?;
         let scores_ptr = scores.buf.as_ptr();
         let top_indices_ptr = top_indices.buf.as_ptr();
         let n_compressed_ptr = n_compressed_buf.buf.as_ptr();
@@ -423,7 +439,7 @@ impl Gfx942Device<'_> {
             &max_k as *const _ as *mut c_void,
         ];
         self.gpu.launch_maybe_blob(
-            INDEXER_TOP_K_BUF_PARALLEL_KERNEL,
+            kernel,
             [n_idx_heads as u32, 1, 1],
             [256, 1, 1],
             0,

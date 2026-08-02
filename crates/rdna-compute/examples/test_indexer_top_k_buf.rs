@@ -4,11 +4,26 @@
 
 //! Exactness / raw-parity probe for DeepSeek V4's graph-safe indexer top-K.
 //!
-//! Launches SERIAL (`indexer_top_k_buf`) and PARALLEL (`indexer_top_k_buf_parallel`)
-//! against the SAME frozen score buffer and compares the ordered 512-slot i32
-//! outputs element-by-element. Finite cases must match the host oracle and each
-//! other; non-finite cases must match SERIAL↔PARALLEL (eligibility filter) but
-//! are not asserted against the generic total_cmp host oracle.
+//! Launches SERIAL (`indexer_top_k_buf`), PARALLEL (`indexer_top_k_buf_parallel`
+//! on gfx1151 / `indexer_top_k_buf_parallel_gfx942` on gfx942) and — on gfx942
+//! only — BOUNDED (`indexer_top_k_buf_parallel_gfx942_bounded`, a bounded
+//! tile-merge bitonic O(N log^2 K) drop-in for the O(N^2) single-workgroup
+//! rank-count kernel) against the SAME frozen score buffer and compares the
+//! ordered 512-slot i32 outputs element-by-element. Finite cases must match the
+//! host oracle and every other arm that ran; non-finite cases must match across
+//! device arms (eligibility filter) but are not asserted against the generic
+//! total_cmp host oracle.
+//!
+//! Large-N cases (8192 / 32768 / 262144 — the last is 1M context at compressor
+//! ratio 4, the campaign target) skip SERIAL per-case: its dynamic LDS is a
+//! one-byte taken-bitmap per candidate (`smem_fn = max_n` bytes), which exceeds
+//! the 64 KiB LDS limit above N=65536 and is wildly over-occupancy well before
+//! that. Those cases compare BOUNDED_GFX942 against PARALLEL_GFX942 and the
+//! host oracle only, and exist to make the O(N^2) vs O(N log^2 K) gap
+//! measurable in seconds here instead of hours on the full 82 GB model
+//! campaign. Every arm reports warmup + timed-batch wall time (Instant +
+//! device_synchronize host timing, the same idiom as the other rdna-compute
+//! examples) in ms/launch, plus the BOUNDED-vs-PARALLEL_GFX942 speedup ratio.
 //!
 //! Run on the target GPU (MI300X / gfx942 or gfx1151):
 //!   cargo run --release -p rdna-compute --example test_indexer_top_k_buf
@@ -20,7 +35,12 @@ use hip_bridge::KernargBlob;
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::ffi::c_void;
 
-const MAX_N: usize = 2048;
+/// Absolute harness ceiling: 1M context at compressor ratio 4.
+const MAX_N: usize = 262144;
+/// Score-buffer pad length for the original small-N cases. Large-N cases use
+/// an exact-size buffer (`pad_n == n`); SERIAL cannot run there because its
+/// dynamic LDS is one byte per candidate (see `Case::run_serial`).
+const SMALL_PAD_N: usize = 2048;
 const K: usize = 512;
 const N_HEADS: i32 = 1;
 
@@ -29,12 +49,15 @@ const PARALLEL_GFX1151_SRC: &str =
     include_str!("../../../kernels/src/indexer_top_k_buf_parallel.gfx1151.hip");
 const PARALLEL_GFX942_SRC: &str =
     include_str!("../../../kernels/src/indexer_top_k_buf_parallel.gfx942.hip");
+const PARALLEL_GFX942_BOUNDED_SRC: &str =
+    include_str!("../../../kernels/src/indexer_top_k_buf_bounded.gfx942.hip");
 const SERIAL_MODULE: &str = "indexer_top_k_buf";
 const SERIAL_SYMBOL: &str = "indexer_top_k_buf";
 const SERIAL_BLOCK: [u32; 3] = [128, 1, 1];
 const PARALLEL_BLOCK: [u32; 3] = [256, 1, 1];
 const SERIAL_POISON: i32 = -7777;
 const PARALLEL_POISON: i32 = -8888;
+const BOUNDED_POISON: i32 = -9999;
 
 // ─── minimal SHA-256 (no extra crate dep; example-only) ──────────────────────
 
@@ -199,7 +222,8 @@ struct KernelSpec {
     source: &'static str,
     symbol: &'static str,
     block: [u32; 3],
-    /// Dynamic LDS bytes. SERIAL uses max_n_compressed (taken bitmap); PARALLEL uses 0.
+    /// Dynamic LDS bytes. SERIAL uses max_n_compressed (taken bitmap);
+    /// PARALLEL and BOUNDED use 0 (BOUNDED's 8 KiB LDS is statically declared).
     smem_fn: fn(max_n: i32) -> u32,
 }
 
@@ -230,6 +254,15 @@ const PARALLEL_GFX942: KernelSpec = KernelSpec {
     smem_fn: |_| 0,
 };
 
+const PARALLEL_GFX942_BOUNDED: KernelSpec = KernelSpec {
+    label: "BOUNDED_GFX942",
+    module: "indexer_top_k_buf_parallel_gfx942_bounded",
+    source: PARALLEL_GFX942_BOUNDED_SRC,
+    symbol: "indexer_top_k_buf_parallel_gfx942_bounded",
+    block: PARALLEL_BLOCK,
+    smem_fn: |_| 0,
+};
+
 fn parallel_spec(arch: &str) -> &'static KernelSpec {
     match arch {
         "gfx942" => &PARALLEL_GFX942,
@@ -238,11 +271,24 @@ fn parallel_spec(arch: &str) -> &'static KernelSpec {
     }
 }
 
-fn ensure_both(gpu: &mut Gpu, parallel: &KernelSpec) {
+/// Optional third comparison arm: the bounded tile-merge bitonic top-K exists
+/// for gfx942 only; on gfx1151 it is neither compiled nor launched.
+fn bounded_spec(arch: &str) -> Option<&'static KernelSpec> {
+    match arch {
+        "gfx942" => Some(&PARALLEL_GFX942_BOUNDED),
+        _ => None,
+    }
+}
+
+fn ensure_kernels(gpu: &mut Gpu, parallel: &KernelSpec, bounded: Option<&KernelSpec>) {
     gpu.ensure_kernel_public(SERIAL.module, SERIAL.source, SERIAL.symbol)
         .expect("compile SERIAL indexer_top_k_buf");
     gpu.ensure_kernel_public(parallel.module, parallel.source, parallel.symbol)
         .expect("compile PARALLEL indexer_top_k_buf_parallel");
+    if let Some(bounded) = bounded {
+        gpu.ensure_kernel_public(bounded.module, bounded.source, bounded.symbol)
+            .expect("compile BOUNDED indexer_top_k_buf_parallel_gfx942_bounded");
+    }
 }
 
 fn launch_one(
@@ -254,13 +300,16 @@ fn launch_one(
     k_buf: &GpuTensor,
     max_n: i32,
     max_k: i32,
+    log: bool,
 ) {
     let grid = [N_HEADS as u32, 1, 1];
     let smem = (spec.smem_fn)(max_n);
-    eprintln!(
-        "  LAUNCH {} symbol={} grid={:?} block={:?} dynamic_lds={}",
-        spec.label, spec.symbol, grid, spec.block, smem
-    );
+    if log {
+        eprintln!(
+            "  LAUNCH {} symbol={} grid={:?} block={:?} dynamic_lds={}",
+            spec.label, spec.symbol, grid, spec.block, smem
+        );
+    }
     let mut kb = KernargBlob::new();
     kb.push_ptr(scores.buf.as_ptr() as *const c_void);
     kb.push_ptr(out.buf.as_ptr() as *const c_void);
@@ -276,8 +325,24 @@ fn launch_one(
 // ─── score builders ──────────────────────────────────────────────────────────
 
 /// Exact-tie finite pattern from the divergence analysis.
-fn finite_tie_scores() -> Vec<f32> {
-    (0..MAX_N).map(|i| ((37 * i + 11) % 64) as f32).collect()
+fn finite_tie_scores(pad_n: usize) -> Vec<f32> {
+    (0..pad_n).map(|i| ((37 * i + 11) % 64) as f32).collect()
+}
+
+/// Deterministic splitmix64-derived finite scores for the large-N cases.
+/// Reproducible run-to-run (the per-case scores_sha256 makes a run
+/// self-describing); f32 mantissa granularity still forces exact ties at
+/// N=262144, which stresses the index-ASC tiebreak against the host oracle.
+fn finite_large_scores(pad_n: usize) -> Vec<f32> {
+    (0..pad_n)
+        .map(|i| {
+            let mut z = (i as u64).wrapping_add(0x9E37_79B9_7F4A_7C15);
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^= z >> 31;
+            (z >> 40) as f32 / (1u64 << 24) as f32
+        })
+        .collect()
 }
 
 enum CaseKind {
@@ -291,6 +356,13 @@ struct Case {
     name: &'static str,
     n: usize,
     kind: CaseKind,
+    /// Score-buffer length (pad). `n <= pad_n <= MAX_N`; kernels get max_n=pad_n.
+    pad_n: usize,
+    /// Explicit per-case SERIAL skip. SERIAL's dynamic LDS is `max_n` bytes —
+    /// a one-byte taken-bitmap per candidate — which exceeds the 64 KiB LDS
+    /// limit above N=65536 and is wildly over-occupancy well before that, so
+    /// large-N cases compare BOUNDED/PARALLEL against the host oracle only.
+    run_serial: bool,
     scores: Vec<f32>,
 }
 
@@ -308,32 +380,36 @@ fn build_cases() -> Vec<Case> {
             },
             n,
             kind: CaseKind::Finite,
-            scores: finite_tie_scores(),
+            pad_n: SMALL_PAD_N,
+            run_serial: true,
+            scores: finite_tie_scores(SMALL_PAD_N),
         });
     }
 
     // 200 finite + 313 -inf at N=513 → fewer than 512 selectable under SERIAL.
     {
-        let mut scores = finite_tie_scores();
+        let mut scores = finite_tie_scores(SMALL_PAD_N);
         // Keep first 200 finite; fill remaining of the N window with -inf.
         for i in 200..513 {
             scores[i] = f32::NEG_INFINITY;
         }
         // Pad beyond N is unused by kernels but keep deterministic.
-        for i in 513..MAX_N {
+        for i in 513..SMALL_PAD_N {
             scores[i] = f32::NEG_INFINITY;
         }
         cases.push(Case {
             name: "nonfinite_n513_neginf_pool",
             n: 513,
             kind: CaseKind::NegInf,
+            pad_n: SMALL_PAD_N,
+            run_serial: true,
             scores,
         });
     }
 
     // A few NaNs at N=513 — PARALLEL rank-0 collisions expected.
     {
-        let mut scores = finite_tie_scores();
+        let mut scores = finite_tie_scores(SMALL_PAD_N);
         scores[0] = f32::from_bits(0x7fc0_0001); // quiet NaN payload 1
         scores[257] = f32::from_bits(0x7fc0_0002); // quiet NaN payload 2
         scores[400] = f32::NAN;
@@ -341,13 +417,15 @@ fn build_cases() -> Vec<Case> {
             name: "nonfinite_n513_nan",
             n: 513,
             kind: CaseKind::Nan,
+            pad_n: SMALL_PAD_N,
+            run_serial: true,
             scores,
         });
     }
 
     // Several exact -FLT_MAX entries (SERIAL best=-FLT_MAX cannot select via strict >).
     {
-        let mut scores = finite_tie_scores();
+        let mut scores = finite_tie_scores(SMALL_PAD_N);
         for &i in &[10usize, 100, 250, 400, 512] {
             scores[i] = -f32::MAX; // == -FLT_MAX
         }
@@ -355,7 +433,31 @@ fn build_cases() -> Vec<Case> {
             name: "nonfinite_n513_neg_flt_max",
             n: 513,
             kind: CaseKind::NegFltMax,
+            pad_n: SMALL_PAD_N,
+            run_serial: true,
             scores,
+        });
+    }
+
+    // Large-N finite cases — the bounded kernel's reason to exist. SERIAL is
+    // skipped per-case (see Case::run_serial); BOUNDED_GFX942 is compared
+    // against PARALLEL_GFX942 and the host oracle, slot-for-slot. N=262144 is
+    // 1M context at compressor ratio 4, the campaign target; at N=2048 only 4
+    // tiles of the kpad=512 tile loop are exercised, which cannot see the
+    // O(N^2) vs O(N log^2 K) divergence these sizes expose.
+    for &n in &[8192usize, 32768, 262144] {
+        cases.push(Case {
+            name: match n {
+                8192 => "finite_n8192",
+                32768 => "finite_n32768",
+                262144 => "finite_n262144_ctx1m_ratio4",
+                _ => unreachable!(),
+            },
+            n,
+            kind: CaseKind::Finite,
+            pad_n: n,
+            run_serial: false,
+            scores: finite_large_scores(n),
         });
     }
 
@@ -432,17 +534,24 @@ fn ascending_set_hash(values: &[i32]) -> String {
     sha256_i32(&s)
 }
 
+struct ArmSummary {
+    label: &'static str,
+    vs_ref: &'static str,
+    vs_oracle: &'static str,
+    unwritten: usize,
+    duplicates: usize,
+    ms_per_launch: f64,
+}
+
 struct CaseResult {
     name: String,
     n: usize,
     finite: bool,
-    serial_vs_parallel: &'static str,
+    arms_ran: String,
     first_diff_rank: String,
     same_set: bool,
-    serial_unwritten: usize,
-    parallel_unwritten: usize,
-    serial_vs_oracle: &'static str,
-    parallel_vs_oracle: &'static str,
+    arms: Vec<ArmSummary>,
+    speedup_bounded_vs_parallel: Option<f64>,
     accept_fail: bool,
 }
 
@@ -480,194 +589,278 @@ fn score_census(scores: &[f32], n: usize) {
     );
 }
 
-fn run_case(gpu: &mut Gpu, parallel: &KernelSpec, case: &Case) -> CaseResult {
+/// Warmup / timed-batch iteration counts per case. Large N collapses the
+/// batch on purpose: the O(N^2) rank-count arm costs seconds per launch at
+/// N=32768 and minutes at N=262144, so one timed launch already separates it
+/// from the O(N log^2 K) bounded arm.
+fn timing_plan(n: usize) -> (usize, usize) {
+    if n <= 2048 {
+        (3, 10)
+    } else if n <= 8192 {
+        (2, 5)
+    } else if n <= 32768 {
+        (1, 3)
+    } else {
+        (1, 1)
+    }
+}
+
+fn run_case(
+    gpu: &mut Gpu,
+    parallel: &KernelSpec,
+    bounded: Option<&KernelSpec>,
+    case: &Case,
+) -> CaseResult {
     let n = case.n;
-    assert!(n <= MAX_N);
+    let pad_n = case.pad_n;
+    assert!(n <= pad_n && pad_n <= MAX_N);
     let finite = matches!(case.kind, CaseKind::Finite);
 
+    // Arms for this case: SERIAL (unless skipped per-case), the arch PARALLEL,
+    // and BOUNDED_GFX942 when present (gfx942 only; never compiled on gfx1151).
+    let mut arms: Vec<(&KernelSpec, i32)> = Vec::new();
+    if case.run_serial {
+        arms.push((&SERIAL, SERIAL_POISON));
+    }
+    arms.push((parallel, PARALLEL_POISON));
+    if let Some(b) = bounded {
+        arms.push((b, BOUNDED_POISON));
+    }
+    let arms_ran = arms
+        .iter()
+        .map(|(spec, _)| spec.label)
+        .collect::<Vec<_>>()
+        .join("+");
+
     eprintln!(
-        "\n======== CASE {} N={} finite={} ========",
-        case.name, n, finite
+        "\n======== CASE {} N={} finite={} arms={} ========",
+        case.name, n, finite, arms_ran
     );
     score_census(&case.scores, n);
     let scores_sha = sha256_f32(&case.scores);
-    eprintln!("  scores_sha256={scores_sha} (full MAX_N={} buffer)", MAX_N);
+    eprintln!("  scores_sha256={scores_sha} (full pad_n={pad_n} buffer)");
 
     // Build score buffer ONCE, upload ONCE.
     let scores_gpu = gpu
-        .upload_f32(&case.scores, &[MAX_N])
+        .upload_f32(&case.scores, &[pad_n])
         .expect("upload scores");
     let n_gpu = upload_i32(gpu, &[n as i32]);
     let k_gpu = upload_i32(gpu, &[K as i32]);
 
-    // Two independently poisoned output buffers.
-    let serial_poison_host = vec![SERIAL_POISON; K];
-    let parallel_poison_host = vec![PARALLEL_POISON; K];
-    let serial_out = upload_i32(gpu, &serial_poison_host);
-    let parallel_out = upload_i32(gpu, &parallel_poison_host);
-
-    // Launch SERIAL → A, PARALLEL → B from the same input.
-    launch_one(
-        gpu,
-        &SERIAL,
-        &scores_gpu,
-        &serial_out,
-        &n_gpu,
-        &k_gpu,
-        MAX_N as i32,
-        K as i32,
-    );
-    launch_one(
-        gpu,
-        parallel,
-        &scores_gpu,
-        &parallel_out,
-        &n_gpu,
-        &k_gpu,
-        MAX_N as i32,
-        K as i32,
-    );
+    // One independently poisoned output buffer per arm; launch every arm from
+    // the same frozen input.
+    let mut out_bufs = Vec::with_capacity(arms.len());
+    for (spec, poison) in &arms {
+        let poison_host = vec![*poison; K];
+        let out = upload_i32(gpu, &poison_host);
+        launch_one(gpu, spec, &scores_gpu, &out, &n_gpu, &k_gpu, pad_n as i32, K as i32, true);
+        out_bufs.push(out);
+    }
     gpu.hip
         .device_synchronize()
-        .expect("synchronize after dual launch");
+        .expect("synchronize after arm launches");
 
-    let serial = download_i32(gpu, &serial_out, K);
-    let parallel = download_i32(gpu, &parallel_out, K);
+    let mut outs = Vec::with_capacity(arms.len());
+    for out in &out_bufs {
+        outs.push(download_i32(gpu, out, K));
+    }
     let oracle = expected_top_k(&case.scores, n);
 
-    let ss = slot_stats(&serial, n, SERIAL_POISON);
-    let ps = slot_stats(&parallel, n, PARALLEL_POISON);
-
-    let ordered_eq = serial == parallel;
-    let set_eq = same_set(&serial, &parallel);
-    let diff = first_diff(&serial, &parallel);
-    let n_diffs = serial
-        .iter()
-        .zip(parallel.iter())
-        .filter(|(a, b)| a != b)
-        .count();
-
-    let serial_vs_oracle = if serial == oracle { "MATCH" } else { "DIFFER" };
-    let parallel_vs_oracle = if parallel == oracle {
-        "MATCH"
-    } else {
-        "DIFFER"
-    };
-    let serial_vs_parallel = if ordered_eq { "MATCH" } else { "DIFFER" };
-
-    let first_diff_rank = match diff {
-        Some((i, a, b)) => {
-            eprintln!("  first_diff_rank={i} serial={a} parallel={b}");
-            format!("{i}")
+    // Per-arm timing: warmup iterations then a timed batch, Instant +
+    // device_synchronize host wall time (the same idiom as the other
+    // rdna-compute examples). Reuses each arm's own output buffer; the
+    // exactness results above are already downloaded.
+    let (warmup, iters) = timing_plan(n);
+    let mut ms_per_launch = Vec::with_capacity(arms.len());
+    for (i, (spec, _)) in arms.iter().enumerate() {
+        for _ in 0..warmup {
+            launch_one(gpu, spec, &scores_gpu, &out_bufs[i], &n_gpu, &k_gpu, pad_n as i32, K as i32, false);
         }
-        None => {
-            eprintln!("  first_diff_rank=- (ordered arrays identical)");
-            "-".into()
+        gpu.hip.device_synchronize().expect("sync after warmup");
+        let t = std::time::Instant::now();
+        for _ in 0..iters {
+            launch_one(gpu, spec, &scores_gpu, &out_bufs[i], &n_gpu, &k_gpu, pad_n as i32, K as i32, false);
         }
-    };
-
-    eprintln!("  serial_vs_parallel={serial_vs_parallel} n_diffs={n_diffs} same_set={set_eq}");
-    eprintln!(
-        "  serial_slots: poison={} pad_neg1={} real={} oor={} dups={}",
-        ss.poison, ss.pad_neg1, ss.real, ss.out_of_range, ss.duplicates
-    );
-    eprintln!(
-        "  parallel_slots: poison={} pad_neg1={} real={} oor={} dups={}",
-        ps.poison, ps.pad_neg1, ps.real, ps.out_of_range, ps.duplicates
-    );
-    eprintln!(
-        "  serial_ordered_sha256={} serial_set_sha256={}",
-        sha256_i32(&serial),
-        ascending_set_hash(&serial)
-    );
-    eprintln!(
-        "  parallel_ordered_sha256={} parallel_set_sha256={}",
-        sha256_i32(&parallel),
-        ascending_set_hash(&parallel)
-    );
-    eprintln!(
-        "  oracle_ordered_sha256={} serial_vs_oracle={serial_vs_oracle} parallel_vs_oracle={parallel_vs_oracle}",
-        sha256_i32(&oracle)
-    );
-
-    if !ordered_eq {
-        // Print a short window around the first mismatch for operator grepping.
-        if let Some((i, _, _)) = diff {
-            let lo = i.saturating_sub(2);
-            let hi = (i + 3).min(K);
-            eprintln!("  window ranks[{lo}..{hi}):");
-            for r in lo..hi {
-                eprintln!(
-                    "    rank={r} serial={} parallel={} oracle={}",
-                    serial[r], parallel[r], oracle[r]
-                );
-            }
-        }
-    }
-
-    // Characterise non-finite pads specifically.
-    if !finite {
+        gpu.hip.device_synchronize().expect("sync after timed batch");
+        let ms = t.elapsed().as_secs_f64() * 1e3 / iters as f64;
+        ms_per_launch.push(ms);
         eprintln!(
-            "  nonfinite_detail: serial(-1={}, real={}, poison={}) parallel(-1={}, real={}, poison={})",
-            ss.pad_neg1, ss.real, ss.poison, ps.pad_neg1, ps.real, ps.poison
+            "  timing arm={} warmup={} iters={} ms_per_launch={:.3}",
+            spec.label, warmup, iters, ms
         );
     }
 
+    let stats: Vec<SlotStats> = arms
+        .iter()
+        .zip(outs.iter())
+        .map(|((_, poison), out)| slot_stats(out, n, *poison))
+        .collect();
+
+    // Reference arm = first arm (SERIAL when it ran, else PARALLEL). Ordered
+    // equality is the bar: the gfx942 kernels each place a selected index at
+    // its own rank slot, so their outputs must agree slot-for-slot.
+    let reference = &outs[0];
+    let ordered_eq = outs.iter().all(|out| out == reference);
+    let set_eq = outs.iter().all(|out| same_set(reference, out));
+
+    let mut first_diff_rank = "-".to_string();
+    for (i, out) in outs.iter().enumerate().skip(1) {
+        if let Some((r, a, b)) = first_diff(reference, out) {
+            eprintln!(
+                "  first_diff_rank={r} {}={a} {}={b}",
+                arms[0].0.label, arms[i].0.label
+            );
+            first_diff_rank = format!("{r}");
+            // Print a short window around the first mismatch for operator grepping.
+            let lo = r.saturating_sub(2);
+            let hi = (r + 3).min(K);
+            eprintln!("  window ranks[{lo}..{hi}):");
+            for rank in lo..hi {
+                eprintln!(
+                    "    rank={rank} {}={} {}={} oracle={}",
+                    arms[0].0.label, reference[rank], arms[i].0.label, out[rank], oracle[rank]
+                );
+            }
+            break;
+        }
+    }
+    if first_diff_rank == "-" {
+        eprintln!("  first_diff_rank=- (ordered arrays identical)");
+    }
+
+    let n_diffs = outs
+        .iter()
+        .skip(1)
+        .map(|out| {
+            reference
+                .iter()
+                .zip(out.iter())
+                .filter(|(a, b)| a != b)
+                .count()
+        })
+        .collect::<Vec<_>>();
+    eprintln!(
+        "  arms_ordered_eq={} n_diffs_vs_ref={:?} same_set={set_eq}",
+        if ordered_eq { "MATCH" } else { "DIFFER" },
+        n_diffs
+    );
+
+    let mut arm_summaries = Vec::with_capacity(arms.len());
+    for (i, ((spec, _), out)) in arms.iter().zip(outs.iter()).enumerate() {
+        let st = stats[i];
+        let label = spec.label.to_lowercase();
+        let vs_ref = if i == 0 {
+            "REF"
+        } else if out == reference {
+            "MATCH"
+        } else {
+            "DIFFER"
+        };
+        let vs_oracle = if *out == oracle { "MATCH" } else { "DIFFER" };
+        eprintln!(
+            "  {label}_slots: poison={} pad_neg1={} real={} oor={} dups={}",
+            st.poison, st.pad_neg1, st.real, st.out_of_range, st.duplicates
+        );
+        eprintln!(
+            "  {label}_ordered_sha256={} {label}_set_sha256={}",
+            sha256_i32(out),
+            ascending_set_hash(out)
+        );
+        eprintln!("  {label}_vs_ref={vs_ref} {label}_vs_oracle={vs_oracle}");
+        arm_summaries.push(ArmSummary {
+            label: spec.label,
+            vs_ref,
+            vs_oracle,
+            unwritten: st.poison,
+            duplicates: st.duplicates,
+            ms_per_launch: ms_per_launch[i],
+        });
+    }
+    eprintln!("  oracle_ordered_sha256={}", sha256_i32(&oracle));
+
+    // Characterise non-finite pads specifically.
+    if !finite {
+        for (i, (spec, _)) in arms.iter().enumerate() {
+            let st = stats[i];
+            eprintln!(
+                "  nonfinite_detail: {}(-1={}, real={}, poison={})",
+                spec.label, st.pad_neg1, st.real, st.poison
+            );
+        }
+    }
+
     // Acceptance:
-    // - Finite: serial == parallel == oracle, no poison/dups.
-    // - Non-finite: serial == parallel (eligibility filter), no poison/dups.
-    //   Host oracle stays a generic total_cmp sort and may DIFFER; report only.
+    // - Finite: every arm == oracle and == every peer arm, no poison/dups.
+    // - Non-finite: arms agree with each other (eligibility filter), no
+    //   poison/dups. Host oracle stays a generic total_cmp sort and may
+    //   DIFFER; report only.
     let accept_fail = {
         let mut bad = false;
-        if serial != parallel {
-            eprintln!("  ACCEPT_FAIL: SERIAL != PARALLEL");
+        if !ordered_eq {
+            eprintln!("  ACCEPT_FAIL: arms differ in ORDER ({arms_ran})");
             bad = true;
         }
-        if ss.poison != 0 || ps.poison != 0 {
-            eprintln!(
-                "  ACCEPT_FAIL: poisoned/unwritten slots remain (serial={} parallel={})",
-                ss.poison, ps.poison
-            );
-            bad = true;
-        }
-        if ss.duplicates != 0 || ps.duplicates != 0 {
-            eprintln!(
-                "  ACCEPT_FAIL: duplicate indices (serial={} parallel={})",
-                ss.duplicates, ps.duplicates
-            );
-            bad = true;
-        }
-        if finite {
-            if serial != oracle {
-                eprintln!("  ACCEPT_FAIL: SERIAL != host oracle");
+        for (i, (spec, _)) in arms.iter().enumerate() {
+            if stats[i].poison != 0 {
+                eprintln!(
+                    "  ACCEPT_FAIL: poisoned/unwritten slots remain ({}={})",
+                    spec.label, stats[i].poison
+                );
                 bad = true;
             }
-            if parallel != oracle {
-                eprintln!("  ACCEPT_FAIL: PARALLEL != host oracle");
+            if stats[i].duplicates != 0 {
+                eprintln!(
+                    "  ACCEPT_FAIL: duplicate indices ({}={})",
+                    spec.label, stats[i].duplicates
+                );
                 bad = true;
+            }
+        }
+        if finite {
+            for ((spec, _), out) in arms.iter().zip(outs.iter()) {
+                if *out != oracle {
+                    eprintln!("  ACCEPT_FAIL: {} != host oracle", spec.label);
+                    bad = true;
+                }
             }
         }
         if !bad {
             if finite {
-                eprintln!("  ACCEPT: PASS (finite case byte-identical to oracle and peer)");
+                eprintln!("  ACCEPT: PASS (finite case byte-identical to oracle and peer arms)");
             } else {
-                eprintln!("  ACCEPT: PASS (non-finite SERIAL==PARALLEL; oracle reported only)");
+                eprintln!("  ACCEPT: PASS (non-finite arms agree; oracle reported only)");
             }
         }
         bad
+    };
+
+    // The point of the large-N cases: O(N log^2 K) vs O(N^2), in ms/launch.
+    let speedup_bounded_vs_parallel = {
+        let p = arms.iter().position(|(s, _)| s.label == "PARALLEL_GFX942");
+        let b = arms.iter().position(|(s, _)| s.label == "BOUNDED_GFX942");
+        match (p, b) {
+            (Some(p), Some(b)) if ms_per_launch[b] > 0.0 => {
+                let ratio = ms_per_launch[p] / ms_per_launch[b];
+                eprintln!(
+                    "  speedup BOUNDED_GFX942 vs PARALLEL_GFX942: {ratio:.2}x \
+                     ({:.3} ms -> {:.3} ms)",
+                    ms_per_launch[p], ms_per_launch[b]
+                );
+                Some(ratio)
+            }
+            _ => None,
+        }
     };
 
     CaseResult {
         name: case.name.to_string(),
         n,
         finite,
-        serial_vs_parallel,
+        arms_ran,
         first_diff_rank,
         same_set: set_eq,
-        serial_unwritten: ss.poison,
-        parallel_unwritten: ps.poison,
-        serial_vs_oracle,
-        parallel_vs_oracle,
+        arms: arm_summaries,
+        speedup_bounded_vs_parallel,
         accept_fail,
     }
 }
@@ -685,18 +878,29 @@ fn main() {
     eprintln!("arch_ok=true (accepted gfx1151|gfx942)");
 
     let parallel = parallel_spec(arch);
-    ensure_both(&mut gpu, parallel);
+    let bounded = bounded_spec(arch);
+    ensure_kernels(&mut gpu, parallel, bounded);
     eprintln!(
         "kernels_loaded: SERIAL symbol={} block={:?} smem=max_n_compressed; \
-         PARALLEL symbol={} block={:?} smem=0",
-        SERIAL.symbol, SERIAL.block, parallel.symbol, parallel.block
+         PARALLEL symbol={} block={:?} smem=0; BOUNDED {}",
+        SERIAL.symbol,
+        SERIAL.block,
+        parallel.symbol,
+        parallel.block,
+        match bounded {
+            Some(b) => format!(
+                "symbol={} block={:?} smem=0 (static 8 KiB LDS)",
+                b.symbol, b.block
+            ),
+            None => "n/a (gfx942 only; not compiled on this arch)".to_string(),
+        }
     );
 
     let cases = build_cases();
     let mut results = Vec::with_capacity(cases.len());
     let mut any_fail = false;
     for case in &cases {
-        let r = run_case(&mut gpu, parallel, case);
+        let r = run_case(&mut gpu, parallel, bounded, case);
         if r.accept_fail {
             any_fail = true;
         }
@@ -705,24 +909,31 @@ fn main() {
 
     eprintln!("\n======== SUMMARY (machine-greppable) ========");
     for r in &results {
+        let arms_detail = r
+            .arms
+            .iter()
+            .map(|a| {
+                format!(
+                    "{}(vs_ref={} vs_oracle={} unwritten={} dups={} ms_per_launch={:.3})",
+                    a.label, a.vs_ref, a.vs_oracle, a.unwritten, a.duplicates, a.ms_per_launch
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        let speedup = r
+            .speedup_bounded_vs_parallel
+            .map(|s| format!("{s:.2}x"))
+            .unwrap_or_else(|| "n/a".to_string());
         eprintln!(
-            "RESULT case={} N={} finite={} serial_vs_parallel={} first_diff_rank={} same_set={} serial_unwritten={} parallel_unwritten={} serial_vs_oracle={} parallel_vs_oracle={}",
-            r.name,
-            r.n,
-            r.finite,
-            r.serial_vs_parallel,
-            r.first_diff_rank,
-            r.same_set,
-            r.serial_unwritten,
-            r.parallel_unwritten,
-            r.serial_vs_oracle,
-            r.parallel_vs_oracle
+            "RESULT case={} N={} finite={} arms={} first_diff_rank={} same_set={} \
+             speedup_bounded_vs_parallel={} {}",
+            r.name, r.n, r.finite, r.arms_ran, r.first_diff_rank, r.same_set, speedup, arms_detail
         );
     }
 
     if any_fail {
-        eprintln!("OVERALL: FAIL (one or more cases mismatched SERIAL↔PARALLEL or finite oracle)");
+        eprintln!("OVERALL: FAIL (one or more cases mismatched across arms or finite oracle)");
         std::process::exit(1);
     }
-    eprintln!("OVERALL: PASS (all cases SERIAL==PARALLEL; finite matched oracle)");
+    eprintln!("OVERALL: PASS (all arms agree in ORDER; finite cases matched oracle)");
 }

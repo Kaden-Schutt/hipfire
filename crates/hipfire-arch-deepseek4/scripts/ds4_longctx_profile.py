@@ -30,18 +30,10 @@ def classify(name: str) -> str:
         return "compressed_kv_read"
     if "deepseek4_attn_swa" in n or "deepseek4_attn_pos0" in n:
         return "flash_attention"
-    if any(
-        marker in n
-        for marker in (
-            "moe",
-            "expert",
-            "router",
-            "mq2r_e8",
-            "e8_soa",
-            "grouped_e8",
-            "e8_grouped",
-        )
-    ):
+    # Only call-site-specific routed-MoE symbols are safe to assign here.
+    # Generic E8-SoA GEMVs are shared by attention, compressors, FFN and the
+    # head; assigning all of them to MoE would manufacture a large false share.
+    if any(marker in n for marker in ("moe", "expert", "router")):
         return "moe"
     return "rest"
 
@@ -90,9 +82,14 @@ def main() -> None:
         "stats_csv": str(stats),
         "decode_steps": args.decode_steps,
         "gpu_kernel_total_ms_per_decode": total_ns / 1e6 / args.decode_steps,
+        "classification_note": (
+            "moe includes only call-site-specific moe/expert/router symbols; "
+            "generic E8 GEMVs shared by multiple stages remain in rest"
+        ),
         "stages": {},
     }
     print(f"stats_csv={stats}")
+    print(f"classification_note={report['classification_note']}")
     print("stage                    total_ms   ms/decode    share_pct      calls")
     for stage in STAGES:
         duration = totals[stage]["duration_ns"]

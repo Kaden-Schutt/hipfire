@@ -35,7 +35,6 @@ fn parse_args() -> Result<Args, String> {
     let model = it.next().ok_or_else(|| {
         "usage: ds4_longctx_probe MODEL --cap N [--position N | --prefill N] \
          [--batch N] [--decode-reps N] [--topk-sanity] [--generate N]"
-            .to_string()
     })?;
     let mut out = Args {
         model,
@@ -241,6 +240,7 @@ fn report_topk_change(first: &TopkSnapshot, second: &TopkSnapshot) {
     );
 }
 
+
 fn run() -> Result<(), String> {
     let args = parse_args()?;
     std::env::set_var("HIPFIRE_DEEPSEEK4_MAX_COMPRESS_POS", args.cap.to_string());
@@ -389,7 +389,12 @@ fn run() -> Result<(), String> {
     };
     gpu.hip.device_synchronize().map_err(|e| format!("warmup sync: {e:?}"))?;
     let warm_s = warm_start.elapsed().as_secs_f64();
-    current_pos += 1;
+    if let Some(position) = args.position {
+        state.n_tokens = position as u64;
+        current_pos = position;
+    } else {
+        current_pos += 1;
+    }
     next_token = argmax(&warm_logits);
     let mut latest_logits = Some(warm_logits);
     println!("DECODE_WARMUP wall_s={warm_s:.6}");
@@ -397,6 +402,10 @@ fn run() -> Result<(), String> {
 
     let mut decode_times = Vec::with_capacity(args.decode_reps);
     for rep in 0..args.decode_reps {
+        if let Some(position) = args.position {
+            state.n_tokens = position as u64;
+            current_pos = position;
+        }
         gpu.hip.device_synchronize().map_err(|e| format!("decode pre-sync: {e:?}"))?;
         let start = Instant::now();
         let logits = decode_step(
@@ -412,7 +421,9 @@ fn run() -> Result<(), String> {
         let seconds = start.elapsed().as_secs_f64();
         println!("DECODE_REP rep={rep} position={current_pos} wall_s={seconds:.6} tok_s={:.6}", 1.0 / seconds);
         decode_times.push(seconds);
-        current_pos += 1;
+        if args.position.is_none() {
+            current_pos += 1;
+        }
         next_token = argmax(&logits);
         latest_logits = Some(logits);
         print_vram("decode_rep", &gpu, &mut peak)?;

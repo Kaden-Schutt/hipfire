@@ -66,7 +66,8 @@ run_sweep() {
     : >"$OUT/sweep_status.tsv"
     printf 'cap\tposition\trc\n' >>"$OUT/sweep_status.tsv"
     for cap in "${caps[@]}"; do
-        position=$((cap * 4))
+        # Last ratio-4 position that fills this cap exactly.
+        position=$((cap * 4 - 1))
         run_logged "cap_${cap}" "$BIN" "$MODEL" --cap "$cap" --position "$position" --decode-reps 3
         rc=$?
         printf '%s\t%s\t%s\n' "$cap" "$position" "$rc" >>"$OUT/sweep_status.tsv"
@@ -80,17 +81,19 @@ run_sweep() {
 run_profiles() {
     local caps=(2048 32768 262144)
     for cap in "${caps[@]}"; do
-        position=$((cap * 4))
+        # Repeat the last covered position so every profiled decode scans `cap`
+        # candidates without changing the compressor population.
+        position=$((cap * 4 - 1))
         pdir="$OUT/rocprof_cap_${cap}"
         rm -rf "$pdir"
         mkdir -p "$pdir"
         run_logged "rocprof_cap_${cap}" \
             /opt/rocm/core-7.14/bin/rocprofv3 --kernel-trace --stats \
             --output-directory "$pdir" --output-file "cap_${cap}" -- \
-            "$BIN" "$MODEL" --cap "$cap" --position "$position" --decode-reps 2
+            "$BIN" "$MODEL" --cap "$cap" --position "$position" --decode-reps 8
         rc=$?
         if [[ $rc -eq 0 ]]; then
-            python3 "$PROFILE_PY" "$pdir" --decode-steps 4 \
+            python3 "$PROFILE_PY" "$pdir" --decode-steps 10 \
                 --json "$OUT/profile_cap_${cap}.json" \
                 | tee "$OUT/profile_cap_${cap}.txt"
         else
@@ -102,7 +105,7 @@ run_profiles() {
 run_topk() {
     local contexts=(4096 16384 65536)
     for context in "${contexts[@]}"; do
-        cap=$(((context + 3) / 4))
+        cap=$(((context + 3) / 4 + 16))
         extra=()
         if [[ "$context" == "65536" ]]; then
             extra=(--generate 32)
@@ -117,17 +120,66 @@ run_topk() {
     done
 }
 
+run_current_baseline() {
+    local caps=(2048 8192)
+    md5sum "$BIN" | tee "$OUT/current_baseline_binary.md5"
+    for cap in "${caps[@]}"; do
+        position=$((cap * 4 - 1))
+        for run in 1 2 3; do
+            run_logged "current_cap_${cap}_run_${run}" "$BIN" "$MODEL" \
+                --cap "$cap" --position "$position" --decode-reps 3
+        done
+    done
+}
+
+run_crosswall() {
+    md5sum "$BIN" | tee "$OUT/crosswall_binary.md5"
+    HIPFIRE_DEEPSEEK4_GFX942_INDEXER_TOPK_BOUNDED=0 \
+        run_logged "crosswall_cap_2048_pos_12287" "$BIN" "$MODEL" \
+        --cap 2048 --position 12287 --decode-reps 1
+}
+
+run_model_ab() {
+    local caps=(2048 8192 32768)
+    local arms=(A B B A A B)
+    md5sum "$BIN" | tee "$OUT/model_ab_binary.md5"
+    : >"$OUT/model_ab_status.tsv"
+    printf 'cap\tposition\tsequence\tarm\tbounded\trc\n' >>"$OUT/model_ab_status.tsv"
+    for cap in "${caps[@]}"; do
+        position=$((cap * 4 - 1))
+        sequence=0
+        for arm in "${arms[@]}"; do
+            sequence=$((sequence + 1))
+            if [[ "$arm" == "B" ]]; then
+                bounded=1
+            else
+                bounded=0
+            fi
+            HIPFIRE_DEEPSEEK4_GFX942_INDEXER_TOPK_BOUNDED="$bounded" \
+                run_logged "ab_cap_${cap}_seq_${sequence}_arm_${arm}" \
+                "$BIN" "$MODEL" --cap "$cap" --position "$position" --decode-reps 3
+            rc=$?
+            printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+                "$cap" "$position" "$sequence" "$arm" "$bounded" "$rc" \
+                >>"$OUT/model_ab_status.tsv"
+        done
+    done
+}
+
 case "$cmd" in
     sweep) run_sweep ;;
     profile) run_profiles ;;
     topk) run_topk ;;
+    baseline) run_current_baseline ;;
+    crosswall) run_crosswall ;;
+    ab) run_model_ab ;;
     all)
         run_sweep
         run_profiles
         run_topk
         ;;
     *)
-        echo "usage: $0 [all|sweep|profile|topk]" >&2
+        echo "usage: $0 [all|sweep|profile|topk|baseline|crosswall|ab]" >&2
         exit 2
         ;;
 esac

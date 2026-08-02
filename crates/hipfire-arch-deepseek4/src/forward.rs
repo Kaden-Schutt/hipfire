@@ -377,6 +377,44 @@ mod config_cache {
                     != Some("0")
             })
     }
+    /// `HIPFIRE_DEEPSEEK4_GFX942_INDEXER_TOPK_BOUNDED` — F2: select the
+    /// bounded tile-merge bitonic indexer top-K on exact `gfx942` MQ2R
+    /// instead of F1's rank-count kernel. F1's kernel is O(N^2) on a single
+    /// workgroup (`n_idx_heads == 1`), which is what walled long context.
+    /// Requires F1 to be on — it selects which kernel that path dispatches.
+    /// Default ON for the gfx942-v1 route after both promotion conditions
+    /// passed; set `=0` for the emergency fallback to the rank-count kernel.
+    ///
+    /// Exactness (raw-i32 channel, `test_indexer_top_k_buf`, MI300X): 10/10
+    /// PASS, every arm byte-identical in ORDER, finite cases also identical
+    /// to the host oracle. Covers the `n_compressed <= max_k` identity path,
+    /// the N=513 boundary, all three non-finite eligibility cases
+    /// (-inf pool / NaN / -FLT_MAX), and N = 8192 / 32768 / 262144.
+    ///
+    /// Perf (same binary, only this env differing, 3 fresh processes/arm,
+    /// interleaved A,B,B,A,A,B, 18/18 pass): cap 2048 25.046 -> 34.533 tok/s
+    /// (1.38x), cap 8192 3.910 -> 25.957 (6.64x), cap 32768 0.274 -> 13.051
+    /// (47.60x). Isolated kernel: 22.3x at N=8192, 88.3x at N=32768, 715x at
+    /// N=262144. Output is bit-identical at every N and the identity path
+    /// makes it a literal no-op below N = max_k, so short-context product
+    /// shapes are unaffected by construction.
+    ///
+    /// Remaining limit: the grid is still one workgroup, so the tile loop is
+    /// serial on one CU of 304. At N=262144 the bounded kernel is still ~75%
+    /// of projected decode (~324 ms of ~430 ms, ~2.3 tok/s). A multi-block
+    /// two-stage top-K is the next lever; the O(N) indexer scoring under it
+    /// is only ~0.31 ms per 1000 rows.
+    pub(super) fn gfx942_indexer_topk_bounded_on(arch: &str, mq2r: bool) -> bool {
+        static V: OnceLock<bool> = OnceLock::new();
+        arch == "gfx942"
+            && mq2r
+            && *V.get_or_init(|| {
+                hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_GFX942_INDEXER_TOPK_BOUNDED")
+                    .ok()
+                    .as_deref()
+                    != Some("0")
+            })
+    }
     /// `HIPFIRE_DEEPSEEK4_GFX942_FFN_OVERLAP` — evaluate the dense shared
     /// expert and routed MQ2 experts concurrently after their common FFN
     /// normalization. Eligibility comes from the model-owned exact-gfx942
@@ -394,6 +432,7 @@ mod config_cache {
             let l3 = gfx942_e8_wo_grouped_on(arch, gfx942_route_v1);
             let l2 = gfx942_hc_finalize_fused_on(arch, gfx942_route_v1);
             let f1 = gfx942_indexer_topk_parallel_on(arch, gfx942_route_v1);
+            let f2 = gfx942_indexer_topk_bounded_on(arch, gfx942_route_v1);
             let ffn_overlap = gfx942_ffn_overlap_on(gfx942_route_v1 && arch == "gfx942");
             eprintln!(
                 "deepseek4 gfx942 A2 levers: \
@@ -401,11 +440,13 @@ mod config_cache {
                  L3 e8_wo_grouped={} (gfx942-v1 default ON, HIPFIRE_DEEPSEEK4_GFX942_E8_WO_GROUPED=0 disables) ; \
                  L2 hc_finalize_fused={} (default OFF, HIPFIRE_DEEPSEEK4_GFX942_HC_FINALIZE_FUSED=1 enables) ; \
                  F1 indexer_topk_parallel={} (gfx942-v1 default ON, HIPFIRE_DEEPSEEK4_GFX942_INDEXER_TOPK_PARALLEL=0 disables) ; \
+                 F2 indexer_topk_bounded={} (gfx942-v1 default ON, HIPFIRE_DEEPSEEK4_GFX942_INDEXER_TOPK_BOUNDED=0 disables) ; \
                  C1 ffn_overlap={} (default OFF, HIPFIRE_DEEPSEEK4_GFX942_FFN_OVERLAP=1 enables)",
                 if l1 { "ON" } else { "OFF" },
                 if l3 { "ON" } else { "OFF" },
                 if l2 { "ON" } else { "OFF" },
                 if f1 { "ON" } else { "OFF" },
+                if f2 { "ON" } else { "OFF" },
                 if ffn_overlap { "ON" } else { "OFF" },
             );
         });
@@ -1900,8 +1941,32 @@ fn compressor_forward_impl(
         )
         .map_err(|e| format!("comp pool buf no-overlap l{layer_idx}: {e:?}"))?;
     }
-    let commit_row = kv_cache.sub_offset((pos / ratio) * head_dim, head_dim);
-    comp_dbg(&*gpu, "kv_cache(pool)", &commit_row, head_dim);
+    // Debug-only view of the row this position commits into. Built lazily
+    // and bounds-checked on purpose: once `pos / ratio >= max_compressed`
+    // the compressor is saturated, `fill_attn_state_host` writes the -1
+    // commit sentinel, and every buf-variant kernel above and below
+    // early-returns — but row `pos / ratio` does not exist in `kv_cache`.
+    // An eager `sub_offset` here therefore panicked
+    // ("tensor sub-view exceeds accessible buffer prefix") at the first
+    // decode past `max_compressed * ratio`, turning the compressor's
+    // designed graceful saturation into a hard wall — and it did so to
+    // feed a tracer that is off in every non-diagnostic run.
+    let comp_dbg_commit_row = |gpu: &Gpu, name: &str| {
+        if !comp_dump_here {
+            return;
+        }
+        let slot = pos / ratio;
+        if slot >= max_compressed {
+            return;
+        }
+        comp_dbg(
+            gpu,
+            name,
+            &kv_cache.sub_offset(slot * head_dim, head_dim),
+            head_dim,
+        );
+    };
+    comp_dbg_commit_row(&*gpu, "kv_cache(pool)");
     gpu.rmsnorm_f32_at_slot_buf(
         kv_cache,
         norm,
@@ -1910,7 +1975,7 @@ fn compressor_forward_impl(
         cfg.rms_norm_eps,
     )
     .map_err(|e| format!("comp rmsnorm buf l{layer_idx}: {e:?}"))?;
-    comp_dbg(&*gpu, "kv_cache(rmsnorm)", &commit_row, head_dim);
+    comp_dbg_commit_row(&*gpu, "kv_cache(rmsnorm)");
     if do_rope {
         gpu.rope_tail_yarn_interleaved_at_slot_buf(
             kv_cache,
@@ -1927,7 +1992,7 @@ fn compressor_forward_impl(
         )
         .map_err(|e| format!("comp rope buf l{layer_idx}: {e:?}"))?;
     }
-    comp_dbg(&*gpu, "kv_cache(rope)", &commit_row, head_dim);
+    comp_dbg_commit_row(&*gpu, "kv_cache(rope)");
     if overlap {
         gpu.state_overlap_shift_f32_buf(kv_state, &commit_slot_buf, ratio as i32, proj_dim as i32)
             .map_err(|e| format!("comp kv_state shift buf l{layer_idx}: {e:?}"))?;
@@ -1940,7 +2005,7 @@ fn compressor_forward_impl(
         .map_err(|e| format!("comp score_state shift buf l{layer_idx}: {e:?}"))?;
     }
 
-    let _ = (position, max_compressed); // consumed via attn_state_buf
+    let _ = position; // consumed via attn_state_buf
     Ok(())
 }
 
@@ -2526,7 +2591,17 @@ fn indexer_forward(
     let gfx942_parallel =
         config_cache::gfx942_indexer_topk_parallel_on(&gpu.arch, weights.mq2r_backend.is_gfx942())
             && weights.mq2r_backend.try_indexer_top_k_buf_parallel(
-                gpu, scores, topk, &n_buf, &k_buf, /*n_idx_heads=*/ 1, k as i32,
+                gpu,
+                scores,
+                topk,
+                &n_buf,
+                &k_buf,
+                /*n_idx_heads=*/ 1,
+                k as i32,
+                config_cache::gfx942_indexer_topk_bounded_on(
+                    &gpu.arch,
+                    weights.mq2r_backend.is_gfx942(),
+                ),
             )?;
     if !gfx942_parallel {
         gpu.indexer_top_k_buf(
@@ -12962,6 +13037,7 @@ mod tests {
         assert!(!config_cache::redline_ffn_split_on(arch, true));
         // gfx942 A2 levers must not bleed into gfx1151.
         assert!(!config_cache::gfx942_compressor_gate_on(arch, true));
+        assert!(!config_cache::gfx942_indexer_topk_bounded_on(arch, true));
         assert!(!config_cache::gfx942_e8_wo_grouped_on(arch, true));
         assert!(!config_cache::gfx942_hc_finalize_fused_on(arch, true));
         assert!(!config_cache::gfx942_indexer_topk_parallel_on(arch, true));
@@ -13035,6 +13111,7 @@ mod tests {
         // L3 and F1 are certified defaults for exact gfx942 route v1; L1 is
         // still an opt-in experiment.
         assert!(!config_cache::gfx942_compressor_gate_on("gfx942", true));
+        assert!(config_cache::gfx942_indexer_topk_bounded_on("gfx942", true));
         assert!(config_cache::gfx942_e8_wo_grouped_on("gfx942", true));
         assert!(!config_cache::gfx942_hc_finalize_fused_on("gfx942", true));
         assert!(config_cache::gfx942_indexer_topk_parallel_on(
@@ -13042,6 +13119,7 @@ mod tests {
         ));
         // Fail closed on non-mq2r and non-gfx942.
         assert!(!config_cache::gfx942_compressor_gate_on("gfx942", false));
+        assert!(!config_cache::gfx942_indexer_topk_bounded_on("gfx942", false));
         assert!(!config_cache::gfx942_e8_wo_grouped_on("gfx942", false));
         assert!(!config_cache::gfx942_hc_finalize_fused_on("gfx942", false));
         assert!(!config_cache::gfx942_indexer_topk_parallel_on(
@@ -13049,12 +13127,15 @@ mod tests {
         ));
         assert!(!config_cache::gfx942_ffn_overlap_on(false));
         assert!(!config_cache::gfx942_compressor_gate_on("gfx1100", true));
+        assert!(!config_cache::gfx942_indexer_topk_bounded_on("gfx1100", true));
         assert!(!config_cache::gfx942_e8_wo_grouped_on("gfx1201", true));
         assert!(!config_cache::gfx942_hc_finalize_fused_on("gfx1201", true));
         assert!(!config_cache::gfx942_indexer_topk_parallel_on(
             "gfx1201", true
         ));
+        assert!(!config_cache::gfx942_indexer_topk_bounded_on("gfx1201", true));
         assert!(!config_cache::gfx942_compressor_gate_on("gfx1151", true));
+        assert!(!config_cache::gfx942_indexer_topk_bounded_on("gfx1151", true));
         assert!(!config_cache::gfx942_indexer_topk_parallel_on(
             "gfx1151", true
         ));

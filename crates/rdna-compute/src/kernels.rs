@@ -5181,6 +5181,8 @@ pub const INDEXER_TOP_K_BUF_BOUNDED_GFX1151_SRC: &str =
     include_str!("../../../kernels/src/indexer_top_k_buf_bounded.gfx1151.hip");
 pub const INDEXER_TOP_K_BUF_UNROLLED_GFX1151_SRC: &str =
     include_str!("../../../kernels/src/indexer_top_k_buf_unrolled.gfx1151.hip");
+pub const INDEXER_TOP_K_BUF_BOUNDED_GFX942_SRC: &str =
+    include_str!("../../../kernels/src/indexer_top_k_buf_bounded.gfx942.hip");
 
 pub const INDEXER_KV_GATHER_SRC: &str = include_str!("../../../kernels/src/indexer_kv_gather.hip");
 
