@@ -34,7 +34,11 @@ pub struct ParentManifest {
     pub engine: EngineInfo,
     pub source: SourceInfo,
     pub model: ModelInfo,
-    pub corpus: CorpusInfo,
+    /// `None` for producers that consume no corpus at all — an inventory or
+    /// codec gate, for example. It is NOT a way to skip provenance: a
+    /// manifest with no corpus may not carry outputs (see [`Self::validate`]),
+    /// so nothing corpus-derived can ship unpinned.
+    pub corpus: Option<CorpusInfo>,
     pub capture: CaptureInfo,
     pub outputs: Vec<OutputInfo>,
 }
@@ -262,8 +266,36 @@ impl ParentManifest {
                 ));
             }
         }
-        if self.corpus.n_tokens == 0 {
-            return Err("deepseek4 parent: corpus.n_tokens is zero".into());
+        match &self.corpus {
+            Some(corpus) => {
+                if corpus.n_tokens == 0 {
+                    return Err("deepseek4 parent: corpus.n_tokens is zero".into());
+                }
+                if corpus.token_ids_sha256.trim().is_empty() {
+                    return Err("deepseek4 parent: corpus.token_ids_sha256 is empty".into());
+                }
+            }
+            // A corpus-free run is legitimate only when it produced nothing
+            // corpus-derived. Logits, Hessians, and activations are all
+            // functions of the tokens that drove them; shipping one without
+            // naming its corpus is precisely the provenance failure that got
+            // the previous 554-tensor capture rejected.
+            None => {
+                if !self.outputs.is_empty() {
+                    return Err(format!(
+                        "deepseek4 parent: corpus is null but {} output(s) are declared — \
+                         a corpus-derived artifact must pin the corpus that produced it",
+                        self.outputs.len()
+                    ));
+                }
+                if !self.capture.tensors.is_empty() {
+                    return Err(
+                        "deepseek4 parent: corpus is null but capture.tensors is non-empty — \
+                         captured activations must pin the corpus that produced them"
+                            .into(),
+                    );
+                }
+            }
         }
         for (i, t) in self.capture.tensors.iter().enumerate() {
             if t.rows == 0 {
@@ -670,11 +702,11 @@ mod tests {
                     weight_block_size: [128, 128],
                 },
             },
-            corpus: CorpusInfo {
+            corpus: Some(CorpusInfo {
                 token_ids_sha256: "ff".repeat(32),
                 n_tokens: 1024,
                 description: "wikitext-1024".into(),
-            },
+            }),
             capture: CaptureInfo {
                 boundary: CaptureBoundary::PostDynamicFp8,
                 tensors: vec![CaptureTensor {
@@ -891,10 +923,70 @@ mod tests {
     #[test]
     fn validate_rejects_zero_corpus_tokens() {
         let mut m = sample_manifest();
-        m.corpus.n_tokens = 0;
+        m.corpus.as_mut().expect("fixture has a corpus").n_tokens = 0;
         let err = m.validate().unwrap_err();
         assert!(
             err.contains("corpus.n_tokens is zero"),
+            "unexpected err: {err}"
+        );
+    }
+
+    /// A producer that consumes no corpus (the inventory and codec gates)
+    /// must be able to emit a valid manifest. Forcing it to invent a token
+    /// count would be a fabricated provenance field, which is worse than none.
+    #[test]
+    fn validate_accepts_null_corpus_when_nothing_was_produced() {
+        let mut m = sample_manifest();
+        m.corpus = None;
+        m.outputs.clear();
+        m.capture.tensors.clear();
+        m.validate()
+            .expect("an inventory-only run legitimately has no corpus");
+    }
+
+    /// The other half of that bargain: no corpus means no corpus-derived
+    /// artifact. This is the exact hole that let the rejected 554-tensor
+    /// capture ship without naming the model that drove it.
+    #[test]
+    fn validate_rejects_null_corpus_with_declared_outputs() {
+        let mut m = sample_manifest();
+        m.corpus = None;
+        m.capture.tensors.clear();
+        assert!(!m.outputs.is_empty(), "fixture must declare an output");
+        let err = m
+            .validate()
+            .expect_err("outputs without a corpus must be refused");
+        assert!(err.contains("corpus is null"), "unexpected err: {err}");
+    }
+
+    #[test]
+    fn validate_rejects_null_corpus_with_captured_activations() {
+        let mut m = sample_manifest();
+        m.corpus = None;
+        m.outputs.clear();
+        assert!(
+            !m.capture.tensors.is_empty(),
+            "fixture must capture a tensor"
+        );
+        let err = m
+            .validate()
+            .expect_err("captured activations without a corpus must be refused");
+        assert!(
+            err.contains("capture.tensors is non-empty"),
+            "unexpected err: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_empty_corpus_hash() {
+        let mut m = sample_manifest();
+        m.corpus
+            .as_mut()
+            .expect("fixture has a corpus")
+            .token_ids_sha256 = String::new();
+        let err = m.validate().unwrap_err();
+        assert!(
+            err.contains("corpus.token_ids_sha256 is empty"),
             "unexpected err: {err}"
         );
     }
