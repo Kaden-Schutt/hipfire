@@ -815,6 +815,96 @@ either direction.
 bf16 also cannot explain the gap on its own: both quantized models run at bf16
 or worse and score 14.6 against the parent's 163.89.
 
+### Root cause found — `hc_post` contracted the wrong `comb` axis (2026-08-02)
+
+`Block.hc_post` contracted the wrong axis of the sinkhorn `comb` matrix.
+`model.py:692` is
+`torch.sum(comb.unsqueeze(-1) * residual.unsqueeze(-2), dim=2)`, which
+broadcasts to `comb[A,B] * residual[A,d]` and sums over `A`, the **first** hc
+axis:
+
+```text
+y[B,d] = sum_A comb[A][B] * residual[A,d]
+```
+
+`hc_mix_4stream_batched` contracts the **second** (kernel line 46,
+`A[stream_out * HC_MULT + s_in]`), so it requires `comb^T`. The parent passed
+`comb` untransposed. Production reaches the same kernel with its comb already
+in the kernel's orientation, which is why production was never affected.
+
+The axis is load-bearing, not a naming convention: `hc_split_sinkhorn`
+(`kernel.py:401-423`) ends its loop on `comb / comb.sum(-2)`, so the **columns**
+sum to 1. Contracting `A` is norm-preserving; contracting the other axis
+weights the residual by row sums, which are not 1, and amplifies it every
+layer.
+
+**Why it survived thirteen-plus eliminated hypotheses.**
+`layer_ref.rs::hc_post_ref`, the host oracle, contracted the same wrong axis.
+Every HC comparison therefore agreed to ~1e-7 while the model was badly wrong,
+and the layer-0 bisect put the median row at the floor (p50 3.576e-7). A shared
+misreading between `parent/forward.rs` and `parent/*_ref` is invisible by
+construction — the documented cost of the standalone-parent decision, now paid.
+No test caught it either; the tests encode the same convention.
+
+Fixed in `dc4a6cd8f`. `comb` now has one meaning across the parent (reference
+orientation), converted at the single kernel boundary.
+
+### Post-fix state — parent wins at 256, two defects remain
+
+| tokens | parent pre → post | mq2r | lloyd |
+|---|---|---|---|
+| 128 | 23.638 → 11.538 | 9.297 | 8.734 |
+| 256 | 29.644 → **8.619** | 11.080 | 11.289 |
+| 512 | 63.498 → 17.162 | 11.693 | 12.167 |
+| 1024 | 163.892 → 59.507 | 14.703 | 14.564 |
+
+Two independent defects remain, cleanly separated by the data:
+
+1. **L37 → L38 step of 8.2x** (14221.72 → 116669.77), present at *all four*
+   lengths including 128 where `index_topk=512` selection is a complete no-op.
+   Independent of any long-context path. `LoaderOracle` verified the loader
+   bit-exactly but sampled only layers 4 and 26 — layers 36-39 were never
+   checked, and one malformed tensor produces exactly this signature.
+2. **Accuracy step at position 512.** Buckets are position-anchored and
+   length-invariant. The parent beats mq2r in four of six buckets and holds
+   through `[256,512)` at 0.583, then drops to 0.333 in `[512,1022)` where mq2r
+   manages 0.500. `index_topk = 512`. Prior indexer work eliminated *causality*,
+   not *selection correctness*, and ran at 128 tokens where top-k selects
+   everything and the selection logic is never exercised.
+
+Reading KLD here: it rose at 1024 (7.676 → 8.793) while PPL fell 2.75x and
+top-1 rose 0.3008 → 0.3408, and fell at 128 (5.297 → 4.768).
+`KLD(P_parent || Q_quant)` is weighted by the parent's own distribution, so a
+sharper-but-still-wrong parent scores higher. Judge by PPL, top-1 and buckets.
+
+Only compare PPL and geo-mean growth **within a length** — both are
+length-dependent (geo mean 1.1684 at 128, 1.1498 at 512, 1.1410 at 1024).
+Position-bucket accuracy is the one length-invariant metric.
+
+### Gates 7-9 are conditional on a value test (decided 2026-08-02)
+
+Gates 7-9 are **no longer a given**. The independent GPTQ cross-reference
+(`crates/hipfire-quantize/reference_gptq/`) found the solver math already
+correct — exact agreement with the paper reference in f64 — so there is no
+broken GPTQ to fix. The entire program therefore rests on an unproven premise:
+that parent-derived Hessians and parent-KLD calibration produce measurably
+better children than the pipeline already ships.
+
+**The gate:** once the parent is correct, re-quantize *one* MQ2R build with
+parent-derived Hessians and a parent-KLD-swept `route_scale`, and measure
+against the shipped **14.703 at 1024 tokens**. Proceed to the full program only
+if it wins. If it does not, stop — that is a cheap answer, not a wasted one.
+
+Cheap wins to keep regardless of the outcome:
+
+- `route_scale` at quantization time: MQ2R standalone PPL goes 6.63 → **6.03** →
+  6.84 across 1.8/2.0/2.2.
+- The `gptq.rs` absolute-vs-fractional damp footgun: it takes `initial_damp` as
+  an absolute value while `e8_gptq` uses fractional `LAMBDA*mean(diag)`. DS4
+  rides the safe path; other callers must pre-multiply by `mean(diag)`.
+- E8H1 discards cross-block Hessian mass (Frobenius ≈1.25e3 on an N=24, K=512
+  draw). By design, but it is an accuracy ceiling no calibration data can lift.
+
 ### Not yet done
 
 Gates 6-9. Specifically:
