@@ -35,13 +35,12 @@
 //! indexer sibling can call one entry point for both phases.
 
 use crate::parent::attention::{
-    apply_rope_interleaved_inplace, precompute_rope_freqs,
+    apply_rope_interleaved_inplace, precompute_rope_freqs, rms_norm_host,
 };
 use crate::parent::codec::{
     act_quant_fp4_inplace_ref, act_quant_fp8_inplace_ref, hadamard_rotate_ref, round_to_bf16,
 };
 use crate::parent::hc::parent_rms_norm;
-use crate::parent::layer_ref::rms_norm_ref;
 use crate::parent::weights::ParentCompressorWeights;
 use crate::parent::{Ds4ParentBackend, ParentQuantConfig};
 use rdna_compute::{DType, Gpu, GpuTensor};
@@ -1183,8 +1182,8 @@ fn parent_compressor_decode_multi(
         };
 
         if let Some(mut pooled) = compressed {
-            // Host RMSNorm (matches parent_rms_norm / rms_norm_ref).
-            pooled = rms_norm_ref(&pooled, &norm_w, PARENT_RMS_EPS as f64, head_dim);
+            // Host RMSNorm (matches parent_rms_norm / rms_norm_host).
+            pooled = rms_norm_host(&pooled, &norm_w, PARENT_RMS_EPS, head_dim)?;
             let rope_pos = compressor_decode_rope_pos(pos, ratio);
             apply_rope_interleaved_inplace(
                 &mut pooled,
@@ -1358,7 +1357,7 @@ pub fn compressor_prefill_ref(
     };
 
     // RMSNorm
-    pooled = rms_norm_ref(&pooled, norm_w, PARENT_RMS_EPS as f64, head_dim);
+    pooled = rms_norm_host(&pooled, norm_w, PARENT_RMS_EPS, head_dim)?;
 
     // RoPE (YaRN + compress_rope_theta)
     let freqs = precompute_rope_freqs(

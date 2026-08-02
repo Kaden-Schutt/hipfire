@@ -697,7 +697,7 @@ pub fn expert_swiglu_ref(
 
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Attention SWA f64 oracle (main path; compress_ratio 0 / 4 / 128)
+// Attention SWA + compressed f64 oracle (main path; compress_ratio 0 / 4 / 128)
 // ═══════════════════════════════════════════════════════════════════════════
 //
 // Authority:
@@ -705,33 +705,48 @@ pub fn expert_swiglu_ref(
 // - model.py Attention.__init__ 481-488 (RoPE table selection)
 // - kernel.py sparse_attn 277-369
 // - model.py get_window_topk_idxs 260-271
+// - model.py get_compress_topk_idxs 274-283
+// - model.py Compressor.forward 322-383
+// - model.py Indexer.forward 408-439 (ratio==4 selection)
 // - model.py apply_rotary_emb 238-250 (interleaved)
 //
 // Scope:
 // - Models the *main* q/kv/o path including the ratio>0 RoPE table
 //   (YaRN on, original_seq_len=65536, base=compress_rope_theta=160000).
-// - Sparse attention is SWA-window + sink only. Compressed KV contribution
-//   is intentionally out of scope: at the 128-token isolation point the
-//   window already covers the whole sequence, and stage-wise comparison
-//   (pre-attn q/kv, and post-attn when n_active is forced 0) isolates the
-//   main path. Do not treat a final-`o` mismatch under live compress as a
-//   main-path failure without checking pre-attn stages.
+// - Sparse attention is the joint SWA-window + compressed slots + sink
+//   path (`model.py:520,531-533`). Compressed keys are concatenated onto
+//   the sliding-window KV store; topk_idxs = cat([window, compress], -1).
+// - For ratio==4 the oracle runs the indexer selection path (learned
+//   top-k over compressed slots). For ratio==128 it uses identity
+//   `get_compress_topk_idxs`. For ratio==0 there are no compressed keys.
+// - Index space: the reference uses a unified buffer with
+//   `offset = seqlen` (prefill). This oracle mirrors that layout so
+//   `sparse_attn_ref` gathers from one concatenated `kv` tensor.
 //
 // Projections reuse codec act-quant + f64 matmul over BF16-decoded weights,
 // matching Gate-3's proven BF16≡scaled-FP8 identity (UE8M0 power-of-two
 // scales). KV non-RoPE dims use act_quant_fp8_inplace_ref block 64.
 
 use crate::parent::attention::{
-    apply_rope_interleaved_inplace, get_window_topk_idxs, precompute_rope_freqs, swa_n_valid,
-    PARENT_DIM, PARENT_HEAD_DIM, PARENT_HEADS_PER_GROUP, PARENT_KV_ACT_QUANT_BLOCK,
-    PARENT_NOPE_DIM, PARENT_N_HEADS, PARENT_N_KV_HEADS, PARENT_O_GROUPS, PARENT_O_LORA,
-    PARENT_PER_GROUP_IN, PARENT_Q_LORA, PARENT_Q_WIDTH, PARENT_RMS_EPS, PARENT_ROPE_DIM,
-    PARENT_ROPE_THETA, PARENT_SWA_WINDOW, PARENT_WO_A_OUT,
+    apply_rope_interleaved_inplace, get_compress_topk_idxs, get_window_topk_idxs,
+    precompute_rope_freqs, swa_n_valid, PARENT_ATTN_INDEX_TOPK, PARENT_DIM, PARENT_HEAD_DIM,
+    PARENT_HEADS_PER_GROUP, PARENT_KV_ACT_QUANT_BLOCK, PARENT_NOPE_DIM, PARENT_N_HEADS,
+    PARENT_N_KV_HEADS, PARENT_O_GROUPS, PARENT_O_LORA, PARENT_PER_GROUP_IN, PARENT_Q_LORA,
+    PARENT_Q_WIDTH, PARENT_RMS_EPS, PARENT_ROPE_DIM, PARENT_ROPE_THETA, PARENT_SWA_WINDOW,
+    PARENT_WO_A_OUT,
 };
 use crate::parent::codec::act_quant_fp8_inplace_ref;
 use crate::parent::compressor::{
-    PARENT_COMPRESS_ROPE_THETA, PARENT_YARN_BETA_FAST, PARENT_YARN_BETA_SLOW, PARENT_YARN_FACTOR,
-    PARENT_YARN_ORIG_SEQ,
+    compressor_prefill_ref, PARENT_COMPRESS_ROPE_THETA, PARENT_YARN_BETA_FAST,
+    PARENT_YARN_BETA_SLOW, PARENT_YARN_FACTOR, PARENT_YARN_ORIG_SEQ,
+};
+use crate::parent::indexer::{
+    indexer_apply_offset_and_causal_mask, indexer_n_compressed, indexer_n_visible,
+    indexer_oracle_f64, indexer_weights_scale, PARENT_INDEX_HEAD_DIM, PARENT_INDEX_N_HEADS,
+    PARENT_INDEX_TOPK,
+};
+use crate::parent::codec::{
+    act_quant_fp4_inplace_ref, hadamard_rotate_ref, round_to_bf16,
 };
 
 /// RoPE table policy for the main q/kv/o path (`model.py:481-488`).
@@ -751,7 +766,6 @@ pub fn attention_main_rope_policy(compress_ratio: usize) -> Result<(usize, f64),
         ))),
     }
 }
-
 /// Host-side weights for [`attention_swa_ref`] (BF16-decoded dense, F32 sink).
 ///
 /// Dense layouts match the checkpoint / `ParentDenseWeight`:
@@ -762,6 +776,9 @@ pub fn attention_main_rope_policy(compress_ratio: usize) -> Result<(usize, f64),
 /// - `wo_b`: `[dim, o_groups * o_lora]`
 /// - `q_norm` / `kv_norm`: length `q_lora` / `head_dim`
 /// - `attn_sink`: length `n_heads`
+///
+/// Optional compressor / indexer weights are required when
+/// `compress_ratio > 0` (main compressor) and `== 4` (indexer).
 #[derive(Clone, Debug)]
 pub struct AttnSwARefWeights<'a> {
     pub wq_a: &'a [f32],
@@ -772,6 +789,36 @@ pub struct AttnSwARefWeights<'a> {
     pub q_norm: &'a [f32],
     pub kv_norm: &'a [f32],
     pub attn_sink: &'a [f32],
+    /// Main compressor (ratio 4 / 128). `wkv`/`wgate` are `[proj, dim]`,
+    /// `norm` length `head_dim`, `ape` is `[ratio, proj]`.
+    pub compressor: Option<AttnCompRefWeights<'a>>,
+    /// Indexer (ratio 4 only).
+    pub indexer: Option<AttnIndexerRefWeights<'a>>,
+}
+
+/// Main-attention compressor weights for the joint oracle.
+#[derive(Clone, Debug)]
+pub struct AttnCompRefWeights<'a> {
+    pub wkv: &'a [f32],
+    pub wgate: &'a [f32],
+    pub norm: &'a [f32],
+    pub ape: &'a [f32],
+}
+
+/// Indexer weights for the joint oracle (ratio==4).
+///
+/// - `wq_b`: `[index_n_heads * index_head_dim, q_lora]` BF16-decoded
+/// - `weights_proj`: `[index_n_heads, dim]` BF16-decoded
+/// - compressor_* : same layout as [`AttnCompRefWeights`] but with
+///   `head_dim = index_head_dim` and `hadamard=true` path
+#[derive(Clone, Debug)]
+pub struct AttnIndexerRefWeights<'a> {
+    pub wq_b: &'a [f32],
+    pub weights_proj: &'a [f32],
+    pub compressor_wkv: &'a [f32],
+    pub compressor_wgate: &'a [f32],
+    pub compressor_norm: &'a [f32],
+    pub compressor_ape: &'a [f32],
 }
 
 /// Per-stage intermediates + final output from [`attention_swa_ref`].
@@ -783,6 +830,11 @@ pub struct AttnSwARefWeights<'a> {
 /// - `attn_inv_rope`: after inverse RoPE
 /// - `wo_a_out`: after grouped wo_a `[rows, o_groups * o_lora]`
 /// - `o`: final after wo_b `[rows, dim]`
+/// - `window_idxs`: SWA window indices only
+/// - `compress_idxs`: compressed-slot indices (already offset into the
+///   concatenated KV store; empty when ratio==0)
+/// - `joint_idxs`: `cat([window, compress], -1)` fed to sparse attn
+/// - `kv_compress`: compressed KV rows `[n_comp, head_dim]` (empty if none)
 #[derive(Clone, Debug)]
 pub struct AttnRefOut {
     pub o: Vec<f32>,
@@ -796,8 +848,14 @@ pub struct AttnRefOut {
     pub attn_raw: Vec<f32>,
     pub attn_inv_rope: Vec<f32>,
     pub wo_a_out: Vec<f32>,
-    /// Flat `rows * k` window indices used by sparse attn.
+    /// Flat `rows * k_win` window indices used by sparse attn.
     pub window_idxs: Vec<i32>,
+    /// Flat `rows * k_comp` compressed indices (offset into concat KV).
+    pub compress_idxs: Vec<i32>,
+    /// Flat `rows * (k_win + k_comp)` joint top-k indices.
+    pub joint_idxs: Vec<i32>,
+    /// Compressed KV content `[n_comp, head_dim]` (empty when none emitted).
+    pub kv_compress: Vec<f32>,
 }
 
 /// f64-accum dense linear matching the parent BF16×BF16 path:
@@ -950,15 +1008,18 @@ pub fn sparse_attn_ref(
     Ok(out)
 }
 
-/// f64 reference for one attention block main path (SWA + sink).
+/// f64 reference for one attention block (SWA + optional compressed + sink).
 ///
 /// Prefill operating point (`start_pos == 0`): KV store is the current chunk
-/// and window indices are absolute positions into it. Decode-with-history and
-/// compressed-KV contribution are not modelled (see module comment).
+/// concatenated with compressed slots (`model.py:531`). Window indices are
+/// absolute positions into the SWA half; compressed indices are offset by
+/// `rows` into the concatenated store (mirroring `offset = seqlen`).
 ///
-/// `compress_ratio` selects the main-path RoPE table only:
-/// - `0` → plain base-10000, no YaRN
-/// - `4` / `128` → YaRN + compress_rope_theta (same table the compressor uses)
+/// `compress_ratio` selects both the main-path RoPE table and the compressed
+/// contribution:
+/// - `0` → plain base-10000, no YaRN, SWA-only
+/// - `4` → YaRN + compress_rope_theta; main compressor + indexer top-k
+/// - `128` → YaRN + compress_rope_theta; main compressor + identity gather
 ///
 /// `x` is `[rows, dim]` post-attn_norm F32.
 pub fn attention_swa_ref(
@@ -985,6 +1046,7 @@ pub fn attention_swa_ref(
         PARENT_RMS_EPS as f64,
         original_seq_len,
         rope_theta,
+        compress_ratio,
     )
 }
 
@@ -992,6 +1054,9 @@ pub fn attention_swa_ref(
 ///
 /// `rope_original_seq_len == 0` disables YaRN (ratio-0 policy). Nonzero enables
 /// YaRN blending against `rope_theta` (ratio>0 policy uses 65536 / 160000).
+///
+/// `compress_ratio` gates the compressed-key contribution. Tiny unit tests
+/// that only exercise SWA pass `0` (or leave compressor/indexer as `None`).
 #[allow(clippy::too_many_arguments)]
 pub fn attention_swa_ref_cfg(
     x: &[f32],
@@ -1009,6 +1074,7 @@ pub fn attention_swa_ref_cfg(
     eps: f64,
     rope_original_seq_len: usize,
     rope_theta: f64,
+    compress_ratio: usize,
 ) -> Result<AttnRefOut, String> {
     if rows == 0 {
         return Err(err_msg("attention_swa_ref: rows must be > 0"));
@@ -1170,21 +1236,24 @@ pub fn attention_swa_ref_cfg(
         }
     }
 
-    // ── 5. Window indices + sparse attn ─────────────────────────────────
+    // ── 5. Window + compressed indices + joint sparse attn ──────────────
+    // model.py:513-533:
+    //   topk_idxs = cat([window_idxs, compress_topk_idxs], -1)
+    //   kv = cat([kv, kv_compress], dim=1)   # prefill only
+    //   o = sparse_attn(q, kv, sink, topk_idxs, scale)
     let window_idxs =
         get_window_topk_idxs(window, rows, start_pos).map_err(|e| err_msg(&format!("window: {e}")))?;
-    let k_attn = rows.min(window);
-    if window_idxs.len() != rows * k_attn {
+    let k_win = rows.min(window);
+    if window_idxs.len() != rows * k_win {
         return Err(err_msg(&format!(
             "attention_swa_ref: window_idxs len {} != rows*k {}",
             window_idxs.len(),
-            rows * k_attn
+            rows * k_win
         )));
     }
-    // Sanity: n_valid contract
     for r in 0..rows {
         let nv = swa_n_valid(start_pos, r, window);
-        let got = window_idxs[r * k_attn..(r + 1) * k_attn]
+        let got = window_idxs[r * k_win..(r + 1) * k_win]
             .iter()
             .filter(|&&v| v >= 0)
             .count();
@@ -1195,17 +1264,60 @@ pub fn attention_swa_ref_cfg(
         }
     }
 
+    let (kv_compress, compress_idxs, k_comp) = if compress_ratio == 0 {
+        (Vec::new(), Vec::new(), 0usize)
+    } else {
+        build_compressed_contribution(
+            x,
+            &q_lat,
+            w,
+            rows,
+            start_pos,
+            dim,
+            head_dim,
+            compress_ratio,
+            /*offset=*/ rows, // unified index space: compress after SWA slots
+        )?
+    };
+
+    let n_comp = if head_dim == 0 {
+        0
+    } else {
+        kv_compress.len() / head_dim
+    };
+    // Concatenate SWA KV + compressed KV (model.py:531).
+    let mut kv_joint = kv_post_quant.clone();
+    kv_joint.extend_from_slice(&kv_compress);
+    let n_kv = rows + n_comp;
+
+    // Joint topk = cat([window, compress], -1) (model.py:520).
+    let k_attn = k_win + k_comp;
+    let mut joint_idxs = vec![-1i32; rows * k_attn.max(1)];
+    if k_attn > 0 {
+        for r in 0..rows {
+            let dst = r * k_attn;
+            joint_idxs[dst..dst + k_win]
+                .copy_from_slice(&window_idxs[r * k_win..(r + 1) * k_win]);
+            if k_comp > 0 {
+                joint_idxs[dst + k_win..dst + k_attn]
+                    .copy_from_slice(&compress_idxs[r * k_comp..(r + 1) * k_comp]);
+            }
+        }
+    } else {
+        joint_idxs.clear();
+    }
+
     let softmax_scale = 1.0 / (head_dim as f64).sqrt();
     let attn_raw = sparse_attn_ref(
         &q_post_rope,
-        &kv_post_quant,
+        &kv_joint,
         w.attn_sink,
-        &window_idxs,
+        &joint_idxs,
         rows,
         n_heads,
         head_dim,
-        rows,
-        k_attn,
+        n_kv,
+        k_attn.max(1),
         softmax_scale,
     )?;
 
@@ -1264,6 +1376,12 @@ pub fn attention_swa_ref_cfg(
         PARENT_ROPE_THETA,
         PARENT_SWA_WINDOW,
         PARENT_WO_A_OUT,
+        PARENT_ATTN_INDEX_TOPK,
+        PARENT_INDEX_TOPK,
+        PARENT_N_KV_HEADS,
+        compress_ratio,
+        indexer_n_visible(0, 0, 4),
+        indexer_apply_offset_and_causal_mask,
     );
 
     Ok(AttnRefOut {
@@ -1279,7 +1397,228 @@ pub fn attention_swa_ref_cfg(
         attn_inv_rope,
         wo_a_out: wo_a_out_v,
         window_idxs,
+        compress_idxs,
+        joint_idxs,
+        kv_compress,
     })
+}
+
+/// Build compressed KV content + per-query compressed index matrix.
+///
+/// Returns `(kv_compress [n_comp*head_dim], compress_idxs [rows*k_comp], k_comp)`.
+/// `offset` is added to surviving indices (unified KV index space).
+#[allow(clippy::too_many_arguments)]
+fn build_compressed_contribution(
+    x: &[f32],
+    q_lat: &[f32],
+    w: &AttnSwARefWeights<'_>,
+    rows: usize,
+    start_pos: usize,
+    dim: usize,
+    head_dim: usize,
+    compress_ratio: usize,
+    offset: usize,
+) -> Result<(Vec<f32>, Vec<i32>, usize), String> {
+    let comp = w.compressor.as_ref().ok_or_else(|| {
+        err_msg(&format!(
+            "attention_swa_ref: compress_ratio={compress_ratio} requires compressor weights"
+        ))
+    })?;
+
+    // Main compressor (hadamard=false) — model.py:530.
+    let kv_opt = compressor_prefill_ref(
+        x,
+        comp.wkv,
+        comp.wgate,
+        comp.norm,
+        comp.ape,
+        rows,
+        dim,
+        head_dim,
+        compress_ratio,
+        /*hadamard=*/ false,
+    )
+    .map_err(|e| err_msg(&format!("main compressor: {e}")))?;
+    let kv_compress = kv_opt.unwrap_or_default();
+    let n_comp = if head_dim == 0 {
+        0
+    } else {
+        kv_compress.len() / head_dim
+    };
+    let _ = indexer_n_compressed(start_pos, rows, compress_ratio);
+    if n_comp == 0 {
+        return Ok((Vec::new(), Vec::new(), 0));
+    }
+
+    if compress_ratio == 4 {
+        let ix = w.indexer.as_ref().ok_or_else(|| {
+            err_msg("attention_swa_ref: compress_ratio=4 requires indexer weights")
+        })?;
+        let compress_idxs = indexer_select_ref(
+            x,
+            q_lat,
+            ix,
+            rows,
+            start_pos,
+            dim,
+            compress_ratio,
+            offset,
+            n_comp,
+        )?;
+        let k_comp = PARENT_INDEX_TOPK.min(n_comp.max(1));
+        // indexer returns rows * PARENT_INDEX_TOPK; trim/pad to k_comp stride.
+        let mut out = vec![-1i32; rows * k_comp];
+        let src_k = PARENT_INDEX_TOPK;
+        for r in 0..rows {
+            for j in 0..k_comp {
+                out[r * k_comp + j] = if j < src_k {
+                    compress_idxs[r * src_k + j]
+                } else {
+                    -1
+                };
+            }
+        }
+        Ok((kv_compress, out, k_comp))
+    } else {
+        // ratio 128: identity gather of all compressed slots (model.py:519).
+        let compress_idxs = get_compress_topk_idxs(compress_ratio, rows, start_pos, offset)
+            .map_err(|e| err_msg(&format!("compress idxs: {e}")))?;
+        let k_comp = if compress_idxs.is_empty() {
+            0
+        } else {
+            compress_idxs.len() / rows
+        };
+        Ok((kv_compress, compress_idxs, k_comp))
+    }
+}
+
+/// Full indexer selection oracle (model.py:408-439) for ratio==4.
+///
+/// Returns flat `rows * PARENT_INDEX_TOPK` indices already offset + causally
+/// masked. Uses the indexer's own compressor (`hadamard=true`).
+#[allow(clippy::too_many_arguments)]
+fn indexer_select_ref(
+    x: &[f32],
+    q_lat: &[f32],
+    ix: &AttnIndexerRefWeights<'_>,
+    rows: usize,
+    start_pos: usize,
+    dim: usize,
+    ratio: usize,
+    offset: usize,
+    n_comp_main: usize,
+) -> Result<Vec<i32>, String> {
+    let _ = n_comp_main;
+    let n_heads = PARENT_INDEX_N_HEADS;
+    let head_dim = PARENT_INDEX_HEAD_DIM;
+    let q_width = n_heads * head_dim;
+    let q_lora = PARENT_Q_LORA;
+
+    // 1. q = wq_b(qr) via dense FP8 linear (same as main path).
+    let mut q = dense_linear_bf16_ref(q_lat, ix.wq_b, rows, q_width, q_lora)
+        .map_err(|e| err_msg(&format!("indexer wq_b: {e}")))?;
+
+    // 2. Tail RoPE with YaRN + compress_rope_theta (shares Attention.freqs_cis).
+    let freqs = precompute_rope_freqs(
+        PARENT_ROPE_DIM,
+        PARENT_YARN_ORIG_SEQ,
+        PARENT_COMPRESS_ROPE_THETA,
+        PARENT_YARN_FACTOR,
+        PARENT_YARN_BETA_FAST,
+        PARENT_YARN_BETA_SLOW,
+    )
+    .map_err(|e| err_msg(&format!("indexer rope freqs: {e}")))?;
+    let positions: Vec<usize> = (0..rows).map(|r| start_pos + r).collect();
+    apply_rope_interleaved_inplace(
+        &mut q,
+        rows,
+        n_heads,
+        head_dim,
+        PARENT_ROPE_DIM,
+        &positions,
+        &freqs,
+        false,
+    )
+    .map_err(|e| err_msg(&format!("indexer q rope: {e}")))?;
+
+    // 3. Hadamard + FP4 on full head.
+    hadamard_rotate_ref(&mut q, head_dim)
+        .map_err(|e| err_msg(&format!("indexer hadamard: {e}")))?;
+    act_quant_fp4_inplace_ref(&mut q, head_dim)
+        .map_err(|e| err_msg(&format!("indexer fp4: {e}")))?;
+
+    // 4. weights = weights_proj(x) * scale  (plain BF16, no act-quant).
+    let scale = indexer_weights_scale();
+    let mut weights = vec![0.0f32; rows * n_heads];
+    for r in 0..rows {
+        for h in 0..n_heads {
+            let mut acc = 0.0f64;
+            let wb = h * dim;
+            for k in 0..dim {
+                let xv = round_to_bf16(x[r * dim + k]) as f64;
+                let wv = round_to_bf16(ix.weights_proj[wb + k]) as f64;
+                acc += xv * wv;
+            }
+            weights[r * n_heads + h] = (acc * scale) as f32;
+        }
+    }
+
+    // 5. Indexer compressor (hadamard=true) fills its own compressed KV.
+    let kv_opt = compressor_prefill_ref(
+        x,
+        ix.compressor_wkv,
+        ix.compressor_wgate,
+        ix.compressor_norm,
+        ix.compressor_ape,
+        rows,
+        dim,
+        head_dim,
+        ratio,
+        /*hadamard=*/ true,
+    )
+    .map_err(|e| err_msg(&format!("indexer compressor: {e}")))?;
+    let kv = kv_opt.unwrap_or_default();
+    let n_slots = if head_dim == 0 {
+        0
+    } else {
+        kv.len() / head_dim
+    };
+    if n_slots == 0 {
+        return Ok(vec![-1i32; rows * PARENT_INDEX_TOPK]);
+    }
+
+    // 6. Score + top-k + offset/mask (f64 oracle).
+    let q_f64: Vec<f64> = q.iter().map(|&v| v as f64).collect();
+    let kv_f64: Vec<f64> = kv.iter().map(|&v| v as f64).collect();
+    let w_f64: Vec<f64> = weights.iter().map(|&v| v as f64).collect();
+    let k_out = PARENT_INDEX_TOPK.min(n_slots.max(1));
+    let (_scores, topk) = indexer_oracle_f64(
+        &q_f64,
+        &kv_f64,
+        &w_f64,
+        rows,
+        n_heads,
+        head_dim,
+        n_slots,
+        start_pos,
+        ratio,
+        k_out,
+        offset,
+    )
+    .map_err(|e| err_msg(&format!("indexer oracle: {e}")))?;
+
+    // Pad to PARENT_INDEX_TOPK stride if k_out < TOPK.
+    if k_out == PARENT_INDEX_TOPK {
+        Ok(topk)
+    } else {
+        let mut out = vec![-1i32; rows * PARENT_INDEX_TOPK];
+        for r in 0..rows {
+            for j in 0..k_out {
+                out[r * PARENT_INDEX_TOPK + j] = topk[r * k_out + j];
+            }
+        }
+        Ok(out)
+    }
 }
 
 #[cfg(test)]
@@ -1738,6 +2077,63 @@ mod tests {
     }
 
     #[test]
+    fn sparse_attn_joint_window_plus_compress_hand() {
+        // Tiny joint case: 1 query, 1 head, head_dim=2.
+        // Window slots: idx0=[1,0], idx1 masked (-1).
+        // One compressed slot at unified idx2=[0,1].
+        // sink=0 in denom only.
+        // topk = [0, -1, 2]  (window then compress).
+        let q = [1.0f32, 0.0];
+        let kv = [
+            1.0, 0.0, // window 0
+            9.0, 9.0, // window 1 (masked — must not leak)
+            0.0, 1.0, // compressed 0 at offset=2
+        ];
+        let sink = [0.0f32];
+        let idxs = [0i32, -1, 2];
+        let scale = 1.0f64 / (2.0f64).sqrt();
+        let o = sparse_attn_ref(&q, &kv, &sink, &idxs, 1, 1, 2, 3, 3, scale).unwrap();
+
+        let s0 = scale; // q·kv0 * scale
+        let s2 = 0.0f64; // q·kv2 * scale
+        let sk = 0.0f64;
+        let m = s0.max(s2).max(sk);
+        let e0 = (s0 - m).exp();
+        let e2 = (s2 - m).exp();
+        let es = (sk - m).exp();
+        let z = e0 + e2 + es;
+        let p0 = e0 / z;
+        let p2 = e2 / z;
+        let expect0 = p0 * 1.0 + p2 * 0.0;
+        let expect1 = p0 * 0.0 + p2 * 1.0;
+        assert!(
+            (o[0] as f64 - expect0).abs() < 1e-6,
+            "joint o0={} expect={expect0}",
+            o[0]
+        );
+        assert!(
+            (o[1] as f64 - expect1).abs() < 1e-6,
+            "joint o1={} expect={expect1}",
+            o[1]
+        );
+        // Both window and compress contribute; sink takes mass; masked slot silent.
+        assert!(p0 > 0.0 && p2 > 0.0);
+        assert!(p0 + p2 < 1.0 - 1e-6);
+        assert!(o[0].abs() < 2.0 && o[1].abs() < 2.0);
+
+        // Causality pad: compress index -1 must zero the compressed contribution.
+        let idxs_masked = [0i32, -1, -1];
+        let o_m = sparse_attn_ref(&q, &kv, &sink, &idxs_masked, 1, 1, 2, 3, 3, scale).unwrap();
+        let m2 = s0.max(sk);
+        let e0b = (s0 - m2).exp();
+        let esb = (sk - m2).exp();
+        let zb = e0b + esb;
+        let p0b = e0b / zb;
+        assert!((o_m[0] as f64 - p0b * 1.0).abs() < 1e-6);
+        assert!((o_m[1] as f64 - 0.0).abs() < 1e-6);
+    }
+
+    #[test]
     fn attention_swa_ref_tiny_hand_end_to_end() {
         // Tiny shapes chosen so every linear K is divisible by 128 act-quant
         // block... wait, K must be %128==0 for act_quant. Use dim=128,
@@ -1789,10 +2185,12 @@ mod tests {
             q_norm: &q_norm,
             kv_norm: &kv_norm,
             attn_sink: &attn_sink,
+            compressor: None,
+            indexer: None,
         };
         let out = attention_swa_ref_cfg(
             &x, &w, rows, 0, dim, n_heads, head_dim, rope_dim, q_lora, o_lora, o_groups,
-            window, 1e-6, /*rope_original_seq_len=*/ 0, 10_000.0,
+            window, 1e-6, /*rope_original_seq_len=*/ 0, 10_000.0, /*compress_ratio=*/ 0,
         )
         .unwrap();
 
@@ -1872,6 +2270,8 @@ mod tests {
                 q_norm: &vec![1.0f32; 128],
                 kv_norm: &vec![1.0f32; 128],
                 attn_sink: &vec![0.0f32; 2],
+                compressor: None,
+                indexer: None,
             },
             1,
             5,
@@ -1886,6 +2286,7 @@ mod tests {
             1e-6,
             /*rope_original_seq_len=*/ 0,
             10_000.0,
+            /*compress_ratio=*/ 0,
         )
         .unwrap_err();
         assert!(err.contains("start_pos"), "{err}");
@@ -1975,17 +2376,19 @@ mod tests {
             q_norm: &q_norm,
             kv_norm: &kv_norm,
             attn_sink: &attn_sink,
+            compressor: None,
+            indexer: None,
         };
 
         let r0 = attention_swa_ref_cfg(
             &x, &w, rows, 0, dim, n_heads, head_dim, rope_dim, q_lora, o_lora, o_groups,
-            window, 1e-6, 0, 10_000.0,
+            window, 1e-6, 0, 10_000.0, /*compress_ratio=*/ 0,
         )
         .unwrap();
         let (orig, theta) = attention_main_rope_policy(4).unwrap();
         let r4 = attention_swa_ref_cfg(
             &x, &w, rows, 0, dim, n_heads, head_dim, rope_dim, q_lora, o_lora, o_groups,
-            window, 1e-6, orig, theta,
+            window, 1e-6, orig, theta, /*compress_ratio=*/ 0,
         )
         .unwrap();
         // Production wrapper routes ratio through attention_main_rope_policy;

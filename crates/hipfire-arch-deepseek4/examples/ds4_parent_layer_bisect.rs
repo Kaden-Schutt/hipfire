@@ -4,20 +4,20 @@
 //! Hypothesis-free per-layer f64 bisect of the DS4 parent forward.
 //!
 //! Runs a 128-token parent forward and, for each layer, feeds that layer's
-//! *actual GPU residual* into a composed f64 reference of the FFN half
-//! (`hc_pre_ffn` → `ffn_norm` → route/MoE → `hc_post_ffn`), comparing against
-//! the GPU layer output. Layers with `compress_ratio == 0` also get a full
-//! layer reference that includes `attention_swa_ref` (ratio>0 attention is
-//! still owned by the RatioNAttn sibling).
+//! *actual GPU residual* into composed f64 references:
+//!   - FFN-half from GPU `residual_hc` (post-attn), MoE on BF16-staged `moe_x`
+//!   - Attn-half residual: `hc_pre` → BF16-round(`attn_norm`) → `attention_swa_ref`
+//!     → `hc_post`, compared to GPU `residual_hc`
+//!   - Full-layer composition of the two
 //!
-//! Feeding the real GPU intermediate at each layer makes this a per-layer
-//! localization rather than an accumulating end-to-end drift.
+//! Domain rule (bitten four times): GPU linears stage F32→BF16 before GEMM.
+//! Host oracles must consume the same BF16 lattice, not f32 rms_norm tails.
 //!
 //! ```text
 //! cargo run --release -p hipfire-arch-deepseek4 --example ds4_parent_layer_bisect \
 //!   -- --model /mnt/scratch/models/DeepSeek-V4-Flash-0731 \
 //!      --token-ids /mnt/scratch/quantization/deepseek-v4-flash-0731-parent-baseline/tokens.bin \
-//!      --rows 128
+//!      --rows 128 [--max-layers N]
 //! ```
 //!
 //! Must run on gfx942 (mi300x).
@@ -37,7 +37,7 @@ use hipfire_arch_deepseek4::parent::layer_ref::{
     rms_norm_ref, AttnSwARefWeights, RoutingResult,
 };
 use hipfire_arch_deepseek4::parent::moe::{
-    group_tokens_by_expert, PARENT_MOE_INTER, PARENT_ROUTE_SCALE, PARENT_SWIGLU_LIMIT,
+    parent_route, PARENT_MOE_INTER, PARENT_ROUTE_SCALE, PARENT_SWIGLU_LIMIT,
 };
 use hipfire_arch_deepseek4::parent::weights::{
     ParentLayerWeights, ParentLoadPlan, ParentWeights,
@@ -100,7 +100,7 @@ fn run() -> Result<(), String> {
     println!("model: {}", model_path.display());
     println!("token_ids: {} (n={rows})", args.token_ids.display());
     println!("start_pos: {start_pos}");
-    println!("scope: full-layer (attn main-path + FFN) for all ratios; FFN-half always reported");
+    println!("scope: full-layer + residual_hc(attn-half) + FFN-half; BF16 domain on attn/MoE inputs");
 
     let wall0 = Instant::now();
 
@@ -125,20 +125,20 @@ fn run() -> Result<(), String> {
         cfg.n_routed_experts,
         cfg.num_experts_per_tok,
     );
-    if cfg.num_hidden_layers != 43 {
-        return Err(format!(
-            "deepseek4 parent: expected 43 layers, got {}",
-            cfg.num_hidden_layers
-        ));
+    let n_layers = args
+        .max_layers
+        .unwrap_or(cfg.num_hidden_layers)
+        .min(cfg.num_hidden_layers);
+    if n_layers == 0 {
+        return Err("--max-layers must be > 0".into());
     }
-
     let inv = ParentInventory::build(&source, &cfg)?;
     let plan = ParentLoadPlan {
-        layers: 0..cfg.num_hidden_layers,
+        layers: 0..n_layers,
         load_experts: true,
     };
     println!(
-        "load plan: layers={:?} experts=true  (expect ~150.8 GiB)",
+        "load plan: layers={:?} experts=true  (n_layers={n_layers})",
         plan.layers
     );
     let load_t0 = Instant::now();
@@ -154,8 +154,8 @@ fn run() -> Result<(), String> {
     let mut scratch = ParentForwardScratch::new(&mut gpu, &cfg, rows)?;
     let hc_a = zeros_f32(&mut gpu, &[rows, PARENT_HC_MULT, PARENT_DIM])?;
     let hc_b = zeros_f32(&mut gpu, &[rows, PARENT_HC_MULT, PARENT_DIM])?;
-    let mut kv_rings = Vec::with_capacity(cfg.num_hidden_layers);
-    for i in 0..cfg.num_hidden_layers {
+    let mut kv_rings = Vec::with_capacity(n_layers);
+    for i in 0..n_layers {
         let ring = zeros_f32(
             &mut gpu,
             &[PARENT_N_KV_HEADS, PARENT_HEAD_DIM, PARENT_SWA_WINDOW],
@@ -168,9 +168,9 @@ fn run() -> Result<(), String> {
     parent_embed(&mut gpu, backend, &weights, &cfg, &token_ids, &hc_a)?;
 
     // Cache HC weights / norms once (host) for every layer.
-    let mut host_layers = Vec::with_capacity(cfg.num_hidden_layers);
+    let mut host_layers = Vec::with_capacity(n_layers);
     let cache_t0 = Instant::now();
-    for layer in &weights.layers {
+    for layer in weights.layers.iter().take(n_layers) {
         host_layers.push(HostLayerWeights::download(&gpu, layer, &cfg)?);
     }
     println!(
@@ -196,7 +196,7 @@ fn run() -> Result<(), String> {
     let mut use_a_as_input = true;
     let fwd_t0 = Instant::now();
 
-    for layer_i in 0..cfg.num_hidden_layers {
+    for layer_i in 0..n_layers {
         let layer = &weights.layers[layer_i];
         let hl = &host_layers[layer_i];
         let ratio = layer.compress_ratio;
@@ -246,6 +246,12 @@ fn run() -> Result<(), String> {
         let ffn_norm_gpu = download_f32(&gpu, scratch.stream_normed(), rows * PARENT_DIM)?;
 
         // ── FFN-half oracle from GPU residual_hc ────────────────────────
+        // HC / ffn_norm stay on the f32 residual path (matches GPU hc_pre /
+        // rms). MoE must consume the *BF16-staged* activation the GPU block
+        // actually saw (`moe_x_bf16`), plus the GPU's own routing — feeding
+        // f32 `ffn_norm_ref` here manufactures a ~6e-3 max_abs that looks
+        // like a defect but is pure input-domain mismatch (floor calib L0/L5
+        // row0 assembled max_abs 3.6e-7 / 5.7e-6 with BF16 x).
         let (y_ref, post_ref, comb_ref) = hc_pre_ref(
             &residual_hc,
             &hl.hc_ffn_fn,
@@ -260,19 +266,25 @@ fn run() -> Result<(), String> {
         )?;
         let ffn_norm_ref =
             rms_norm_ref(&y_ref, &hl.ffn_norm, PARENT_RMS_EPS as f64, PARENT_DIM);
-        let routing = route_ref(
-            &ffn_norm_ref,
-            hl,
+        let moe_x_bf16 = download_bf16_as_f32(&gpu, scratch.moe_x_bf16(), rows * PARENT_DIM)?;
+        let gpu_routing = parent_route(
+            &mut gpu,
+            backend,
+            layer,
             &cfg,
-            layer_i,
+            scratch.moe_x_bf16(),
             rows,
             input_ids,
         )?;
+        let routing = RoutingResult {
+            weights: gpu_routing.weights,
+            indices: gpu_routing.indices,
+        };
         let moe_ref = moe_ref_host(
             &mut gpu,
             layer,
             hl,
-            &ffn_norm_ref,
+            &moe_x_bf16,
             &routing,
             rows,
             &w_decode,
@@ -296,11 +308,52 @@ fn run() -> Result<(), String> {
         let comb_m = metrics(&comb_gpu, &comb_ref);
         let norm_m = metrics(&ffn_norm_gpu, &ffn_norm_ref);
         let moe_m = metrics(&moe_gpu, &moe_ref);
+        // ── Attn-half residual oracle (GPU residual_hc is post-attn) ─────
+        // Same domain trap as MoE: GPU stages F32→BF16 before every linear.
+        // `dense_linear_bf16_ref` BF16-rounds inside act_quant, but we still
+        // explicitly BF16-round the attn input to match AttnOracle / GPU
+        // `stage_f32_to_act_bf16` and kill any non-quant path divergence.
+        let (attn_y, attn_post, attn_comb) = hc_pre_ref(
+            &x_host,
+            &hl.hc_attn_fn,
+            &hl.hc_attn_scale,
+            &hl.hc_attn_base,
+            rows,
+            PARENT_HC_MULT,
+            PARENT_DIM,
+            PARENT_RMS_EPS as f64,
+            PARENT_HC_SINKHORN_ITERS as usize,
+            PARENT_HC_EPS as f64,
+        )?;
+        let attn_norm_f32 =
+            rms_norm_ref(&attn_y, &hl.attn_norm, PARENT_RMS_EPS as f64, PARENT_DIM);
+        let attn_in_bf16: Vec<f32> = attn_norm_f32.iter().copied().map(round_to_bf16).collect();
+        let aw = AttnSwARefWeights {
+            wq_a: &hl.wq_a,
+            wq_b: &hl.wq_b,
+            wkv: &hl.wkv,
+            wo_a: &hl.wo_a,
+            wo_b: &hl.wo_b,
+            q_norm: &hl.q_norm,
+            kv_norm: &hl.kv_norm,
+            attn_sink: &hl.attn_sink,
+            compressor: None,
+            indexer: None,
+        };
+        let attn_ref = attention_swa_ref(&attn_in_bf16, &aw, rows, start_pos, ratio)?;
+        let residual_hc_ref = hc_post_ref(
+            &attn_ref.o,
+            &x_host,
+            &attn_post,
+            &attn_comb,
+            rows,
+            PARENT_HC_MULT,
+            PARENT_DIM,
+        );
+        let rhc_metrics = metrics(&residual_hc, &residual_hc_ref);
+        let rhc_buckets = bucket_metrics(&residual_hc, &residual_hc_ref, rows, PARENT_HC_DIM);
 
-        // ── Full-layer oracle (main-path attn + FFN). compress_ratio selects
-        // the RoPE table; compressed-KV contribution is not modelled, which
-        // at 128 tokens is the intentional SWA-only complement (n_active may
-        // be nonzero but RatioNAttn confirmed main q/kv ~1e-6 flat).
+        // ── Full-layer oracle (BF16 domain on attn + MoE inputs) ─────────
         let out_full = full_layer_ref(
             &x_host,
             hl,
@@ -337,7 +390,18 @@ fn run() -> Result<(), String> {
         println!(
             "{layer_i:>5} {ratio:>5} {scope:>10} {rep_max:>12.4e} {rep_mean:>12.4e} {rep_l2:>12.4e}  {bucket_s}"
         );
-        // Always print FFN-half for completeness.
+        {
+            let rb = format_buckets(&rhc_buckets);
+            println!(
+                "{:>5} {:>5} {:>10} {:>12.4e} {:>12.4e} {:>12.4e}  {rb}",
+                "",
+                "",
+                "res_hc",
+                rhc_metrics.0,
+                rhc_metrics.1,
+                rhc_metrics.2
+            );
+        }
         {
             let fb = format_buckets(&ffn_buckets);
             println!(
@@ -350,13 +414,18 @@ fn run() -> Result<(), String> {
                 ffn_metrics.2
             );
         }
-        // Stage split when FFN is dirty — pin the sub-block.
-        if ffn_metrics.0 > CLEAN_MAX_ABS || ffn_metrics.2 > CLEAN_L2_REL {
+        // Stage split when FFN or residual_hc is dirty.
+        if ffn_metrics.0 > CLEAN_MAX_ABS
+            || ffn_metrics.2 > CLEAN_L2_REL
+            || rhc_metrics.0 > CLEAN_MAX_ABS
+            || rhc_metrics.2 > CLEAN_L2_REL
+        {
             println!(
-                "      stages: hc_pre.y={:.3e} post={:.3e} comb={:.3e} ffn_norm={:.3e} moe={:.3e}",
-                y_m.0, post_m.0, comb_m.0, norm_m.0, moe_m.0
+                "      stages: hc_pre.y={:.3e} post={:.3e} comb={:.3e} ffn_norm={:.3e} moe={:.3e} res_hc={:.3e}",
+                y_m.0, post_m.0, comb_m.0, norm_m.0, moe_m.0, rhc_metrics.0
             );
         }
+
 
         rows_out.push(LayerReport {
             layer: layer_i,
@@ -370,6 +439,8 @@ fn run() -> Result<(), String> {
             ffn_mean_rel: ffn_metrics.1,
             ffn_l2_rel: ffn_metrics.2,
             ffn_buckets,
+            rhc_max_abs: rhc_metrics.0,
+            rhc_l2_rel: rhc_metrics.2,
             stage_max_abs: [y_m.0, post_m.0, comb_m.0, norm_m.0, moe_m.0],
         });
 
@@ -522,6 +593,8 @@ fn full_layer_ref(
         PARENT_HC_EPS as f64,
     )?;
     let attn_in = rms_norm_ref(&y, &hl.attn_norm, PARENT_RMS_EPS as f64, PARENT_DIM);
+    // Match GPU stage_f32_to_act_bf16 before first attn linear.
+    let attn_in_bf16: Vec<f32> = attn_in.iter().copied().map(round_to_bf16).collect();
     let aw = AttnSwARefWeights {
         wq_a: &hl.wq_a,
         wq_b: &hl.wq_b,
@@ -531,8 +604,10 @@ fn full_layer_ref(
         q_norm: &hl.q_norm,
         kv_norm: &hl.kv_norm,
         attn_sink: &hl.attn_sink,
+        compressor: None,
+        indexer: None,
     };
-    let attn = attention_swa_ref(&attn_in, &aw, rows, start_pos, compress_ratio)?;
+    let attn = attention_swa_ref(&attn_in_bf16, &aw, rows, start_pos, compress_ratio)?;
     let residual_hc = hc_post_ref(
         &attn.o,
         x_hc,
@@ -557,8 +632,10 @@ fn full_layer_ref(
         PARENT_HC_EPS as f64,
     )?;
     let ffn_in = rms_norm_ref(&y2, &hl.ffn_norm, PARENT_RMS_EPS as f64, PARENT_DIM);
-    let routing = route_ref(&ffn_in, hl, cfg, layer_idx, rows, input_ids)?;
-    let moe = moe_ref_host(gpu, layer, hl, &ffn_in, &routing, rows, w_decode)?;
+    // Match GPU `stage_f32_to_bf16` before MoE (same domain as floor calib).
+    let ffn_in_bf16: Vec<f32> = ffn_in.iter().copied().map(round_to_bf16).collect();
+    let routing = route_ref(&ffn_in_bf16, hl, cfg, layer_idx, rows, input_ids)?;
+    let moe = moe_ref_host(gpu, layer, hl, &ffn_in_bf16, &routing, rows, w_decode)?;
     Ok(hc_post_ref(
         &moe,
         &residual_hc,
@@ -591,7 +668,7 @@ fn moe_ref_host(
         pr_indices[i] = routing.indices[i];
         pr_weights[i] = routing.weights[i];
     }
-    // group_tokens_by_expert wants ParentRouting — reimplement grouping inline.
+    // Group (row, weight) by expert id (same contract as group_tokens_by_expert).
     let n_experts = layer.experts.len();
     let mut groups: Vec<Vec<(usize, f32)>> = vec![Vec::new(); n_experts];
     for r in 0..rows {
@@ -606,7 +683,6 @@ fn moe_ref_host(
             groups[eid].push((r, w));
         }
     }
-    let _ = group_tokens_by_expert; // keep import intentional for parity docs
 
     let mut y = vec![0.0f32; rows * dim];
 
@@ -927,6 +1003,8 @@ struct LayerReport {
     ffn_mean_rel: f64,
     ffn_l2_rel: f64,
     ffn_buckets: Vec<(usize, usize, f64, f64, f64)>,
+    rhc_max_abs: f64,
+    rhc_l2_rel: f64,
     stage_max_abs: [f64; 5],
 }
 
@@ -1130,12 +1208,14 @@ struct Args {
     model: String,
     token_ids: PathBuf,
     rows: usize,
+    max_layers: Option<usize>,
 }
 
 fn parse_args() -> Result<Args, String> {
     let mut model = DEFAULT_MODEL.to_owned();
     let mut token_ids = PathBuf::from(DEFAULT_TOKEN_IDS);
     let mut rows = DEFAULT_ROWS;
+    let mut max_layers = None;
     let args: Vec<String> = std::env::args().collect();
     let mut i = 1;
     while i < args.len() {
@@ -1159,6 +1239,15 @@ fn parse_args() -> Result<Args, String> {
                     .map_err(|e| format!("--rows: {e}"))?;
                 i += 2;
             }
+            "--max-layers" => {
+                max_layers = Some(
+                    args.get(i + 1)
+                        .ok_or("--max-layers needs a value")?
+                        .parse()
+                        .map_err(|e| format!("--max-layers: {e}"))?,
+                );
+                i += 2;
+            }
             s if !s.starts_with('-') => {
                 model = s.to_owned();
                 i += 1;
@@ -1173,5 +1262,6 @@ fn parse_args() -> Result<Args, String> {
         model,
         token_ids,
         rows,
+        max_layers,
     })
 }

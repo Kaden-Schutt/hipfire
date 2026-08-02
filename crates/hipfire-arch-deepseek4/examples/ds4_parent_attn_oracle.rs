@@ -1,17 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
-//! GPU parent attention vs f64 `attention_swa_ref` oracle.
+//! GPU parent attention vs f64 joint SWA+compressed `attention_swa_ref` oracle.
 //!
-//! Compares the main q/kv/o path at 128 tokens for:
-//! - layer 0  (`compress_ratio == 0`, plain RoPE base 10000)
-//! - layer 2  (`compress_ratio == 4`, YaRN + compress_rope_theta 160000)
-//! - layer 3  (`compress_ratio == 128`, same YaRN table)
+//! Compares the full attention path at 128 tokens for:
+//! - layer 0  (`compress_ratio == 0`, plain RoPE base 10000) — **floor check**
+//! - layer 2  (`compress_ratio == 4`, YaRN + 32 compress events + indexer)
+//! - layer 3  (`compress_ratio == 128`, YaRN + 1 compress event, identity)
 //!
-//! At 128 tokens the SWA window covers the whole sequence. Compressed KV can
-//! still be *produced* (ratio 4 → 32 slots), but the oracle models SWA+sink
-//! only; stage-wise tables on `q_post_rope` / `kv_post_quant` / `attn_inv_rope`
-//! isolate the main path regardless of live compress contribution to final `o`.
+//! The oracle models the joint softmax over SWA window + compressed keys +
+//! sink (`model.py:520,531-533`). Layer 0 must reproduce the known ~1e-6
+//! floor before layers 2/3 are interpreted.
 //!
 //! ```text
 //! cargo run --release -p hipfire-arch-deepseek4 --example ds4_parent_attn_oracle \
@@ -30,7 +29,8 @@ use hipfire_arch_deepseek4::parent::compressor::{
 };
 use hipfire_arch_deepseek4::parent::inventory::ParentInventory;
 use hipfire_arch_deepseek4::parent::layer_ref::{
-    attention_main_rope_policy, attention_swa_ref, AttnSwARefWeights,
+    attention_main_rope_policy, attention_swa_ref, AttnCompRefWeights, AttnIndexerRefWeights,
+    AttnSwARefWeights,
 };
 use hipfire_arch_deepseek4::parent::weights::{ParentLoadPlan, ParentWeights};
 use hipfire_arch_deepseek4::parent::{Ds4ParentBackend, ParentQuantConfig};
@@ -281,10 +281,90 @@ fn run_layer(
     assert_eq!(layer.wo_b.k(), PARENT_WO_A_OUT);
     let _ = (PARENT_O_GROUPS, PARENT_O_LORA, PARENT_N_KV_HEADS);
 
+    // Optional compressor / indexer weights for the joint oracle.
+    let (comp_wkv, comp_wgate, comp_norm, comp_ape) = if let Some(c) = layer.compressor.as_ref() {
+        let proj = c.wkv.shape.get(0).copied().unwrap_or(0);
+        let dim_k = c.wkv.shape.get(1).copied().unwrap_or(PARENT_DIM);
+        let wkv_c = download_bf16_as_f32(gpu, &c.wkv, proj * dim_k)?;
+        let wgate_c = download_bf16_as_f32(gpu, &c.wgate, proj * dim_k)?;
+        let norm_c = download_bf16_as_f32(gpu, &c.norm, PARENT_HEAD_DIM)?;
+        let ape_n = c.ape.shape.iter().product::<usize>().max(1);
+        let ape_c = download_f32(gpu, &c.ape, ape_n)?;
+        println!(
+            "compressor: wkv=[{proj},{dim_k}] ape_elems={ape_n} ratio={ratio}"
+        );
+        (Some(wkv_c), Some(wgate_c), Some(norm_c), Some(ape_c))
+    } else {
+        (None, None, None, None)
+    };
+    let (ix_wq_b, ix_wp, ix_wkv, ix_wgate, ix_norm, ix_ape) =
+        if let Some(ix) = layer.indexer.as_ref() {
+            let wq = download_bf16_as_f32(gpu, ix.wq_b.tensor(), ix.wq_b.n() * ix.wq_b.k())?;
+            let wp_n = ix.weights_proj.shape.get(0).copied().unwrap_or(0);
+            let wp_k = ix.weights_proj.shape.get(1).copied().unwrap_or(PARENT_DIM);
+            let wp = download_bf16_as_f32(gpu, &ix.weights_proj, wp_n * wp_k)?;
+            let cproj = ix.compressor_wkv.shape.get(0).copied().unwrap_or(0);
+            let cdim = ix.compressor_wkv.shape.get(1).copied().unwrap_or(PARENT_DIM);
+            let cwkv = download_bf16_as_f32(gpu, &ix.compressor_wkv, cproj * cdim)?;
+            let cwgate = download_bf16_as_f32(gpu, &ix.compressor_wgate, cproj * cdim)?;
+            // index head_dim = 128
+            let cnorm = download_bf16_as_f32(gpu, &ix.compressor_norm, 128)?;
+            let cape_n = ix.compressor_ape.shape.iter().product::<usize>().max(1);
+            let cape = download_f32(gpu, &ix.compressor_ape, cape_n)?;
+            println!(
+                "indexer: wq_b=[{},{}] weights_proj=[{wp_n},{wp_k}] comp_wkv=[{cproj},{cdim}]",
+                ix.wq_b.n(),
+                ix.wq_b.k()
+            );
+            (
+                Some(wq),
+                Some(wp),
+                Some(cwkv),
+                Some(cwgate),
+                Some(cnorm),
+                Some(cape),
+            )
+        } else {
+            (None, None, None, None, None, None)
+        };
+
     let (orig, theta) = attention_main_rope_policy(ratio)?;
     println!(
         "oracle RoPE policy: original_seq_len={orig}  theta={theta}  (ratio={ratio})"
     );
+
+    let comp_ref = match (
+        comp_wkv.as_deref(),
+        comp_wgate.as_deref(),
+        comp_norm.as_deref(),
+        comp_ape.as_deref(),
+    ) {
+        (Some(a), Some(b), Some(c), Some(d)) => Some(AttnCompRefWeights {
+            wkv: a,
+            wgate: b,
+            norm: c,
+            ape: d,
+        }),
+        _ => None,
+    };
+    let ix_ref = match (
+        ix_wq_b.as_deref(),
+        ix_wp.as_deref(),
+        ix_wkv.as_deref(),
+        ix_wgate.as_deref(),
+        ix_norm.as_deref(),
+        ix_ape.as_deref(),
+    ) {
+        (Some(a), Some(b), Some(c), Some(d), Some(e), Some(f)) => Some(AttnIndexerRefWeights {
+            wq_b: a,
+            weights_proj: b,
+            compressor_wkv: c,
+            compressor_wgate: d,
+            compressor_norm: e,
+            compressor_ape: f,
+        }),
+        _ => None,
+    };
 
     let wref = AttnSwARefWeights {
         wq_a: &wq_a,
@@ -295,16 +375,27 @@ fn run_layer(
         q_norm: &q_norm,
         kv_norm: &kv_norm,
         attn_sink: &attn_sink,
+        compressor: comp_ref,
+        indexer: ix_ref,
     };
     let t_ref = Instant::now();
     let reference = attention_swa_ref(x_f32, &wref, rows, START_POS, ratio)?;
     println!(
-        "oracle done in {:.2}s  o_finite={} o_l2={:.6}",
+        "oracle done in {:.2}s  o_finite={} o_l2={:.6}  n_comp={} k_comp_stride={}",
         t_ref.elapsed().as_secs_f64(),
         all_finite(&reference.o),
-        l2_norm(&reference.o)
+        l2_norm(&reference.o),
+        if PARENT_HEAD_DIM > 0 {
+            reference.kv_compress.len() / PARENT_HEAD_DIM
+        } else {
+            0
+        },
+        if rows > 0 {
+            reference.compress_idxs.len() / rows
+        } else {
+            0
+        }
     );
-
     // ── GPU path ────────────────────────────────────────────────────────
     let mut scratch = ParentAttnScratch::new(gpu, cfg, rows)?;
     let kv_ring = gpu
@@ -354,10 +445,18 @@ fn run_layer(
 
     // ── Per-row divergence tables ───────────────────────────────────────
     println!();
-    println!("=== final output o[rows, dim] GPU vs oracle (SWA-only oracle) ===");
-    if ratio > 0 {
+    println!("=== final output o[rows, dim] GPU vs JOINT oracle (SWA+compress+sink) ===");
+    if ratio == 0 {
+        println!("(floor check: ratio==0 must stay ~1e-6 flat across rows)");
+    } else {
         println!(
-            "(note: ratio>0 GPU may include compressed KV in softmax; trust q/kv/attn_inv stages more)"
+            "(joint path: n_comp={}, compress events this call={})",
+            if PARENT_HEAD_DIM > 0 {
+                reference.kv_compress.len() / PARENT_HEAD_DIM
+            } else {
+                0
+            },
+            scratch.last_compress_events()
         );
     }
     print_row_table("o", &gpu_o, &reference.o, rows, PARENT_DIM, REPORT_ROWS);
@@ -385,7 +484,7 @@ fn run_layer(
     );
 
     println!();
-    println!("=== stage: attn_inv_rope (GPU attn_out after forward) ===");
+    println!("=== stage: attn_inv_rope (GPU attn_out after forward = post-inv-RoPE) ===");
     print_row_table(
         "attn_inv",
         &gpu_attn_inv,
@@ -445,27 +544,49 @@ fn run_layer(
         }
     );
 
-    // Main-path cleanliness is judged on q_post_rope + kv_post_quant (pre-attn,
-    // independent of compressed contribution). attn_inv is informative when
-    // n_active==0 or ratio==0.
+    // Joint-path cleanliness: for ratio==0, o/attn_inv must match the ~1e-6 floor.
+    // For ratio>0, judge o and attn_inv (the previously un-oracled joint path).
+    let o_low = row_max_abs(&gpu_o, &reference.o, 0, PARENT_DIM);
+    let o_high = row_max_abs(&gpu_o, &reference.o, high_r, PARENT_DIM);
+    println!(
+        "position signature final_o:  row0={o_low:.6e}  row{high_r}={o_high:.6e}  ratio={:.3}",
+        if o_low > 0.0 {
+            o_high / o_low
+        } else {
+            f64::INFINITY
+        }
+    );
+
     let main_high = q_high.max(kv_high);
-    let main_low = q_low.max(kv_low);
-    let implicated = main_high > 1e-2 && main_high > main_low * 5.0;
-    if main_high < 1e-3 && main_low < 1e-3 {
+    let _main_low = q_low.max(kv_low);
+    let joint_high = inv_high.max(o_high);
+    let joint_low = inv_low.max(o_low);
+    let implicated = joint_high > 1e-2 && joint_high > joint_low * 5.0;
+    if ratio == 0 {
+        if joint_high < 2e-5 && main_high < 2e-5 {
+            println!(
+                "VERDICT layer {layer_idx} FLOOR: joint SWA oracle agrees ~1e-6 flat (row0={o_low:.3e} row{high_r}={o_high:.3e})."
+            );
+        } else {
+            println!(
+                "VERDICT layer {layer_idx} FLOOR FAIL: expected ~1e-6, got o row0={o_low:.3e} row{high_r}={o_high:.3e}."
+            );
+        }
+    } else if joint_high < 1e-3 && main_high < 1e-3 {
         println!(
-            "VERDICT layer {layer_idx}: main q/kv path agrees with oracle at all reported rows (clean)."
+            "VERDICT layer {layer_idx}: joint SWA+compress path agrees with oracle (clean)."
         );
     } else if implicated {
         println!(
-            "VERDICT layer {layer_idx}: main-path error GROWS with position \
-             (row{high_r}/row0≈{:.1}x) — RoPE/main path implicated.",
-            main_high / main_low.max(1e-30)
+            "VERDICT layer {layer_idx}: joint-path error GROWS with position \
+             (row{high_r}/row0≈{:.1}x on o/attn_inv) — compress path implicated.",
+            joint_high / joint_low.max(1e-30)
         );
-    } else if main_high > 1e-2 {
+    } else if joint_high > 1e-2 {
         println!(
-            "VERDICT layer {layer_idx}: main-path error is FLAT/elevated \
-             (ratio={:.2}) — not a pure position-decay RoPE bug.",
-            main_high / main_low.max(1e-30)
+            "VERDICT layer {layer_idx}: joint-path error is FLAT/elevated \
+             (ratio={:.2}) — inspect compress keys/idxs.",
+            joint_high / joint_low.max(1e-30)
         );
     } else {
         println!(
