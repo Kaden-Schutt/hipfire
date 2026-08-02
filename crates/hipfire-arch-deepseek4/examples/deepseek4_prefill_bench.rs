@@ -12,7 +12,7 @@
 //!
 //! Usage:
 //!   deepseek4_prefill_bench <model.mq2lloyd> [--prompt FILE] [--tokens N]
-//!       [--reps R] [--warmup W] [--batch B]
+//!       [--reps R] [--warmup W] [--batch B] [--dump-dense-acts DIR]
 //!
 //! Defaults: --tokens 7047 (antirez DGX-Spark prompt size), --reps 3,
 //!           --warmup 1, --batch 1024 (HIPFIRE_DEEPSEEK4_PP_BATCH).
@@ -21,7 +21,10 @@
 //! if longer it is truncated. This keeps the FLOP count fixed across runs
 //! so prefill throughput is comparable regardless of corpus.
 
-use hipfire_arch_deepseek4::{forward::forward_prefill_batch_chunked, DeepseekV4, DeepseekV4State};
+use hipfire_arch_deepseek4::{
+    forward::{finish_dense_activation_dump, forward_prefill_batch_chunked},
+    DeepseekV4, DeepseekV4State,
+};
 use hipfire_runtime::arch::Architecture;
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::tokenizer::Tokenizer;
@@ -37,6 +40,7 @@ fn main() -> Result<(), String> {
     });
 
     let mut prompt_file: Option<String> = None;
+    let mut dump_dense_acts: Option<String> = None;
     let mut variants: Vec<String> = vec!["default".to_string()];
     let mut target_tokens: usize = 7047;
     let mut reps: usize = 3;
@@ -57,6 +61,9 @@ fn main() -> Result<(), String> {
     while let Some(flag) = args.next() {
         match flag.as_str() {
             "--prompt" => prompt_file = Some(args.next().expect("--prompt FILE")),
+            "--dump-dense-acts" => {
+                dump_dense_acts = Some(args.next().expect("--dump-dense-acts DIR"))
+            }
             "--tokens" => target_tokens = args.next().expect("--tokens N").parse().unwrap(),
             "--reps" => reps = args.next().expect("--reps R").parse().unwrap(),
             "--warmup" => warmup = args.next().expect("--warmup W").parse().unwrap(),
@@ -88,6 +95,26 @@ fn main() -> Result<(), String> {
             }
             other => panic!("unknown flag: {other}"),
         }
+    }
+
+    if let Some(out_dir) = &dump_dense_acts {
+        if warmup != 0
+            || reps != 1
+            || variants.len() != 1
+            || batches.len() != 1
+            || e8_batched.len() != 1
+            || prefix != 0
+            || ar_ref != 0
+            || target_tokens == 0
+        {
+            return Err(
+                "--dump-dense-acts requires --warmup 0 --reps 1, one variant/batch/e8 arm, \
+                 --prefix 0, --ar-ref 0, and --tokens > 0"
+                    .to_string(),
+            );
+        }
+        std::env::set_var("HIPFIRE_DS4_DENSE_ACT_DIR", out_dir);
+        eprintln!("Hipfire-native P3 activation capture: {out_dir}");
     }
 
     eprintln!("Loading DeepSeek V4 from {model_path}...");
@@ -300,5 +327,6 @@ fn main() -> Result<(), String> {
             pbs.free_gpu(&mut gpu);
         }
     }
+    finish_dense_activation_dump()?;
     Ok(())
 }

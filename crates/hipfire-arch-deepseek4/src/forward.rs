@@ -171,18 +171,38 @@ fn dump_dense_activation_if_enabled(
     input: &GpuTensor,
     k: usize,
 ) -> Result<(), String> {
+    dump_dense_activations_if_enabled(gpu, &[tensor_name], input, k)
+}
+
+/// Record one logical activation for every weight that consumes it. Keeping
+/// this fan-out here matters for P3: several projections share the same
+/// pre-rotation input, and downloading that input once is far cheaper than one
+/// device synchronization and D2H copy per tensor name.
+fn dump_dense_activations_if_enabled<S: AsRef<str>>(
+    gpu: &Gpu,
+    tensor_names: &[S],
+    input: &GpuTensor,
+    k: usize,
+) -> Result<(), String> {
     let Some(dump) = dense_activation_dump()? else {
         return Ok(());
     };
+    if tensor_names.is_empty() {
+        return Ok(());
+    }
     let values = gpu
         .download_f32(input)
-        .map_err(|e| format!("download dense activation {tensor_name}: {e:?}"))?;
-    dump.lock()
-        .map_err(|_| "dense activation dump mutex poisoned".to_string())?
-        .record(tensor_name, k, &values)
+        .map_err(|e| format!("download dense activation fan-out: {e:?}"))?;
+    let mut dump = dump
+        .lock()
+        .map_err(|_| "dense activation dump mutex poisoned".to_string())?;
+    for tensor_name in tensor_names {
+        dump.record(tensor_name.as_ref(), k, &values)?;
+    }
+    Ok(())
 }
 
-/// Finalize the env-gated P1 activation dump produced by the decode path.
+/// Finalize the env-gated P3 activation dump produced by the decode path.
 ///
 /// Each file uses the `collect_e8_hessian` input contract:
 /// `[u32 n_rows][u32 K][f32 rows...]`. The row count is patched only here so
@@ -197,7 +217,7 @@ pub fn finish_dense_activation_dump() -> Result<(), String> {
     let out_dir = dump.out_dir.clone();
     let (files, rows) = dump.finish()?;
     eprintln!(
-        "Finalized DeepSeek P1 dense activation dump: {files} files, {rows} rows ({})",
+        "Finalized DeepSeek P3 dense activation dump: {files} files, {rows} rows ({})",
         out_dir.display()
     );
     Ok(())
@@ -4622,12 +4642,16 @@ fn ffn_shared_project(
     let silu_rot = state.ffn_silu_rot.as_ref().unwrap();
     let ffn_out = state.ffn_out.as_ref().unwrap();
     let down_needs_fwht = weight_needs_fwht(shared_w2);
-    dump_dense_activation_if_enabled(
-        gpu,
-        &format!("layers.{layer_idx}.ffn.shared_experts.w1.weight"),
-        ffn_x_plain,
-        cfg.hidden_size,
-    )?;
+    if dense_activation_dump_enabled()? {
+        // shared w1/w3 and the routed-expert selector all consume the exact
+        // same post-ffn_norm, pre-FWHT activation.
+        let names = [
+            format!("layers.{layer_idx}.ffn.shared_experts.w1.weight"),
+            format!("layers.{layer_idx}.ffn.shared_experts.w3.weight"),
+            format!("layers.{layer_idx}.ffn.gate.weight"),
+        ];
+        dump_dense_activations_if_enabled(gpu, &names, ffn_x_plain, cfg.hidden_size)?;
+    }
 
     // 2. gate = x @ shared_w1
     gemv_auto(
@@ -5399,11 +5423,12 @@ fn final_norm_compute(
 
 /// Full per-position head: `final_norm_compute` followed by the lm_head GEMV
 /// into `state.logits`. Behaviour unchanged from before the split.
-fn final_norm_and_head(
+fn final_norm_and_head_impl(
     cfg: &DeepseekV4Config,
     weights: &DeepseekV4Weights,
     state: &mut DeepseekV4State,
     gpu: &mut Gpu,
+    capture_head_activation: bool,
 ) -> Result<(), String> {
     final_norm_compute(cfg, weights, state, gpu)?;
 
@@ -5421,6 +5446,10 @@ fn final_norm_and_head(
     let final_norm_rot = state.final_norm_rot.as_ref().unwrap();
     let logits = state.logits.as_ref().unwrap();
 
+    if capture_head_activation {
+        dump_dense_activation_if_enabled(gpu, "head.weight", final_norm, cfg.hidden_size)?;
+    }
+
     // lm_head GEMV. F16 path uses un-rotated final_norm.
     gemv_auto(
         gpu,
@@ -5434,6 +5463,15 @@ fn final_norm_and_head(
     )?;
 
     Ok(())
+}
+
+fn final_norm_and_head(
+    cfg: &DeepseekV4Config,
+    weights: &DeepseekV4Weights,
+    state: &mut DeepseekV4State,
+    gpu: &mut Gpu,
+) -> Result<(), String> {
+    final_norm_and_head_impl(cfg, weights, state, gpu, true)
 }
 
 /// Step 6: Single-position attention (position-0 degenerate case).
@@ -6591,12 +6629,30 @@ fn q_lora(
         gpu.rmsnorm_f32(hc_x_in, attn_norm, tmp_plain, cfg.rms_norm_eps)
             .map_err(|e| format!("rmsnorm_f32 attn-side plain l{layer_idx}: {e:?}"))?;
     }
-    dump_dense_activation_if_enabled(
-        gpu,
-        &format!("layers.{layer_idx}.attn.wq_a.weight"),
-        tmp_plain,
-        cfg.hidden_size,
-    )?;
+    if dense_activation_dump_enabled()? {
+        // These projections all consume the same attention-normalized hidden
+        // state. Capture it once and fan it out to the exact P3 tensor keys.
+        let mut names = vec![
+            format!("layers.{layer_idx}.attn.wq_a.weight"),
+            format!("layers.{layer_idx}.attn.wkv.weight"),
+        ];
+        if layer.compress_ratio != 0 {
+            names.push(format!("layers.{layer_idx}.attn.compressor.wkv.weight"));
+            names.push(format!("layers.{layer_idx}.attn.compressor.wgate.weight"));
+        }
+        if layer.compress_ratio == 4 {
+            names.push(format!(
+                "layers.{layer_idx}.attn.indexer.weights_proj.weight"
+            ));
+            names.push(format!(
+                "layers.{layer_idx}.attn.indexer.compressor.wkv.weight"
+            ));
+            names.push(format!(
+                "layers.{layer_idx}.attn.indexer.compressor.wgate.weight"
+            ));
+        }
+        dump_dense_activations_if_enabled(gpu, &names, tmp_plain, cfg.hidden_size)?;
+    }
 
     // 2. wq_a @ tmp → q_lat. M = q_lora_rank, K = hidden.
     gemv_auto(
@@ -6627,12 +6683,11 @@ fn q_lora(
                 .sub_offset(0, cfg.q_lora_rank);
             gpu.rmsnorm_f32(q_lat, q_norm, &scratch, cfg.rms_norm_eps)
                 .map_err(|e| format!("dense capture q_norm layer {layer_idx}: {e:?}"))?;
-            dump_dense_activation_if_enabled(
-                gpu,
-                &format!("layers.{layer_idx}.attn.wq_b.weight"),
-                &scratch,
-                cfg.q_lora_rank,
-            )?;
+            let mut names = vec![format!("layers.{layer_idx}.attn.wq_b.weight")];
+            if layer.compress_ratio == 4 {
+                names.push(format!("layers.{layer_idx}.attn.indexer.wq_b.weight"));
+            }
+            dump_dense_activations_if_enabled(gpu, &names, &scratch, cfg.q_lora_rank)?;
         }
     } else {
         gpu.rmsnorm_f32(q_lat, q_norm, q_lat, cfg.rms_norm_eps)
@@ -6641,12 +6696,13 @@ fn q_lora(
             gpu.rotate_x_mq(q_lat, q_lat_rot, cfg.q_lora_rank)
                 .map_err(|e| format!("rotate_x_mq q_lat layer {layer_idx}: {e:?}"))?;
         }
-        dump_dense_activation_if_enabled(
-            gpu,
-            &format!("layers.{layer_idx}.attn.wq_b.weight"),
-            q_lat,
-            cfg.q_lora_rank,
-        )?;
+        if dense_activation_dump_enabled()? {
+            let mut names = vec![format!("layers.{layer_idx}.attn.wq_b.weight")];
+            if layer.compress_ratio == 4 {
+                names.push(format!("layers.{layer_idx}.attn.indexer.wq_b.weight"));
+            }
+            dump_dense_activations_if_enabled(gpu, &names, q_lat, cfg.q_lora_rank)?;
+        }
     }
 
     // 4. wq_b @ q_lat_rot → q. M = n_heads * head_dim, K = q_lora_rank.
@@ -7777,6 +7833,7 @@ fn attention_block_batched_swa_only(
     let n_groups = cfg.o_groups;
     let o_lora_rank = cfg.o_lora_rank;
     let groups_o_lora = n_groups * o_lora_rank;
+    let per_group_in = (n_heads / n_groups) * head_dim;
 
     // 1. Lazy-alloc the per-layer SWA ring (zero-init: pre-chunk
     //    visibility for early positions reads zero history correctly).
@@ -7970,6 +8027,18 @@ fn attention_block_batched_swa_only(
         dump_buf(gpu, "06c_l0_inv_rope_raw", &pbs.attn_out_raw_batch);
     }
 
+    if dense_activation_dump_enabled()? {
+        let active = pbs
+            .attn_out_raw_batch
+            .sub_offset(0, batch_size * n_heads * head_dim);
+        dump_dense_activation_if_enabled(
+            gpu,
+            &format!("layers.{layer_idx}.attn.wo_a.weight"),
+            &active,
+            per_group_in,
+        )?;
+    }
+
     // 6. FWHT rotate attn_out_raw_batch → attn_out_raw_rot_batch.
     //    Skip if wo_a doesn't need FWHT input (Q8/F16/F32 weights).
     if weight_needs_fwht(wo_a) {
@@ -7989,7 +8058,6 @@ fn attention_block_batched_swa_only(
     //    F32     → wo_per_group_batched_f32 (single launch).
     //    HFQ4G256→ wo_per_group_batched_hfq4g256 (single launch, MQ4 prerotated).
     //    Q8_0    → wo_per_group_batched_q8_0 (single launch, plain input).
-    let per_group_in = (n_heads / n_groups) * head_dim;
     match wo_a.dtype {
         DType::F32 => {
             gpu.wo_per_group_batched_f32(
@@ -8070,6 +8138,16 @@ fn attention_block_batched_swa_only(
                 "attention_block_batched_mixed l{layer_idx}: unsupported wo_a dtype {other:?}"
             ));
         }
+    }
+
+    if dense_activation_dump_enabled()? {
+        let active = pbs.wo_a_out_batch.sub_offset(0, batch_size * groups_o_lora);
+        dump_dense_activation_if_enabled(
+            gpu,
+            &format!("layers.{layer_idx}.attn.wo_b.weight"),
+            &active,
+            groups_o_lora,
+        )?;
     }
 
     // 8. FWHT rotate wo_a_out_batch → wo_a_out_rot_batch.
@@ -8206,6 +8284,7 @@ fn attention_block_batched_mixed(
     let n_groups = cfg.o_groups;
     let o_lora_rank = cfg.o_lora_rank;
     let groups_o_lora = n_groups * o_lora_rank;
+    let per_group_in = (n_heads / n_groups) * head_dim;
     let topk_max = cfg.index_topk;
     let use_topk_direct = ratio == 4
         && hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_ATTN_TOPK_DIRECT")
@@ -8903,6 +8982,18 @@ fn attention_block_batched_mixed(
         .map_err(|e| format!("rope_tail_yarn_inv_batched l{layer_idx}: {e:?}"))?;
     }
 
+    if dense_activation_dump_enabled()? {
+        let active = pbs
+            .attn_out_raw_batch
+            .sub_offset(0, batch_size * n_heads * head_dim);
+        dump_dense_activation_if_enabled(
+            gpu,
+            &format!("layers.{layer_idx}.attn.wo_a.weight"),
+            &active,
+            per_group_in,
+        )?;
+    }
+
     // 6. FWHT rotate attn_out_raw_batch → attn_out_raw_rot_batch.
     gpu.rotate_x_mq_batched(
         &pbs.attn_out_raw_batch,
@@ -8916,7 +9007,6 @@ fn attention_block_batched_mixed(
     //    F32     → wo_per_group_batched_f32 (single launch).
     //    HFQ4G256→ wo_per_group_batched_hfq4g256 (single launch).
     //    Q8_0    → wo_per_group_batched_q8_0 (single launch, plain input).
-    let per_group_in = (n_heads / n_groups) * head_dim;
     match wo_a.dtype {
         DType::F32 => {
             gpu.wo_per_group_batched_f32(
@@ -8995,6 +9085,16 @@ fn attention_block_batched_mixed(
                 "attention_block_batched_swa_only l{layer_idx}: unsupported wo_a dtype {other:?}"
             ));
         }
+    }
+
+    if dense_activation_dump_enabled()? {
+        let active = pbs.wo_a_out_batch.sub_offset(0, batch_size * groups_o_lora);
+        dump_dense_activation_if_enabled(
+            gpu,
+            &format!("layers.{layer_idx}.attn.wo_b.weight"),
+            &active,
+            groups_o_lora,
+        )?;
     }
 
     // 8. FWHT rotate wo_a_out → wo_a_out_rot.
@@ -9129,6 +9229,16 @@ fn ffn_batched(
         .map_err(|e| format!("rmsnorm_batched ffn-side l{layer_idx}: {e:?}"))?;
     }
 
+    if dense_activation_dump_enabled()? {
+        let active = pbs.ffn_x_plain_batch.sub_offset(0, batch_size * hidden);
+        let names = [
+            format!("layers.{layer_idx}.ffn.shared_experts.w1.weight"),
+            format!("layers.{layer_idx}.ffn.shared_experts.w3.weight"),
+            format!("layers.{layer_idx}.ffn.gate.weight"),
+        ];
+        dump_dense_activations_if_enabled(gpu, &names, &active, hidden)?;
+    }
+
     // 2-3. Shared expert gate + up GEMVs.
     gemv_auto_batched_wmma(
         gpu,
@@ -9165,6 +9275,16 @@ fn ffn_batched(
         cfg.swiglu_limit,
     )
     .map_err(|e| format!("deepseek4_silu_mul_clamp_f32_batched shared l{layer_idx}: {e:?}"))?;
+
+    if dense_activation_dump_enabled()? {
+        let active = pbs.ffn_shared_gate_batch.sub_offset(0, batch_size * im);
+        dump_dense_activation_if_enabled(
+            gpu,
+            &format!("layers.{layer_idx}.ffn.shared_experts.w2.weight"),
+            &active,
+            im,
+        )?;
+    }
 
     // 5. FWHT rotate silu output — skip if shared_w2 doesn't need FWHT.
     if down_needs_fwht {
@@ -9340,7 +9460,9 @@ pub fn final_norm_and_head_last_batched(
     let orig = state.residual_streams.take();
     state.residual_streams = Some(last_streams);
 
-    let result = final_norm_and_head(cfg, weights, state, gpu);
+    // `forward_prefill_batch_chunked` already captured every head input as
+    // one active matrix. Do not append the last row a second time here.
+    let result = final_norm_and_head_impl(cfg, weights, state, gpu, false);
 
     // Restore. Drop the temporary view (it shares the pbs buffer; the
     // underlying buffer is owned by pbs, so leaking the view is fine —
@@ -9540,6 +9662,67 @@ fn compute_batched_head_logits(
         Some(x_f16),
     )?;
     Ok(())
+}
+
+/// Calibration-only head prologue for batched prefill. Normal serving needs
+/// logits only for the last prompt position, but the Hessian needs the
+/// pre-lm_head activation for every row. Stage those rows without issuing the
+/// enormous batched vocabulary projection, then download the completed matrix
+/// once through the standard P3 activation dumper.
+fn capture_head_norm_batched(
+    cfg: &DeepseekV4Config,
+    weights: &DeepseekV4Weights,
+    state: &mut DeepseekV4State,
+    pbs: &PrefillBatchScratch,
+    gpu: &mut Gpu,
+    batch_size: usize,
+) -> Result<(), String> {
+    if !dense_activation_dump_enabled()? {
+        return Ok(());
+    }
+    let hidden = cfg.hidden_size;
+    let stream_len = cfg.hc_mult * hidden;
+    if state
+        .head_norm_batch
+        .as_ref()
+        .map(|tensor| tensor.numel() < batch_size * hidden)
+        .unwrap_or(true)
+    {
+        state.head_norm_batch = Some(
+            gpu.alloc_tensor(&[batch_size, hidden], DType::F32)
+                .map_err(|error| format!("alloc calibration head_norm_batch: {error:?}"))?,
+        );
+    }
+
+    let original = state.residual_streams.take();
+    let result: Result<(), String> = (|| {
+        for row in 0..batch_size {
+            let streams = pbs.streams_batch.sub_offset(row * stream_len, stream_len);
+            state.residual_streams = Some(streams);
+            final_norm_compute(cfg, weights, state, gpu)?;
+            let src = state
+                .final_norm
+                .as_ref()
+                .ok_or_else(|| "calibration final_norm not allocated".to_string())?;
+            let dst = state
+                .head_norm_batch
+                .as_ref()
+                .unwrap()
+                .sub_offset(row * hidden, hidden);
+            gpu.memcpy_dtod_auto(&dst.buf, &src.buf, hidden * 4)
+                .map_err(|error| format!("stage calibration head row {row}: {error:?}"))?;
+        }
+        Ok(())
+    })();
+    state.residual_streams = original;
+    result?;
+
+    let active = state
+        .head_norm_batch
+        .as_ref()
+        .unwrap()
+        .sub_offset(0, batch_size * hidden);
+    dump_dense_activation_if_enabled(gpu, "head.weight", &active, hidden)
 }
 
 /// On-GPU greedy twin of [`final_norm_and_head_all_batched`]: runs the same
@@ -10114,6 +10297,30 @@ fn q_lora_batched(
         .map_err(|e| format!("rmsnorm_batched attn-side plain l{layer_idx}: {e:?}"))?;
     }
 
+    if dense_activation_dump_enabled()? {
+        let active = pbs.tmp_plain_batch.sub_offset(0, batch_size * hidden);
+        let mut names = vec![
+            format!("layers.{layer_idx}.attn.wq_a.weight"),
+            format!("layers.{layer_idx}.attn.wkv.weight"),
+        ];
+        if layer.compress_ratio != 0 {
+            names.push(format!("layers.{layer_idx}.attn.compressor.wkv.weight"));
+            names.push(format!("layers.{layer_idx}.attn.compressor.wgate.weight"));
+        }
+        if layer.compress_ratio == 4 {
+            names.push(format!(
+                "layers.{layer_idx}.attn.indexer.weights_proj.weight"
+            ));
+            names.push(format!(
+                "layers.{layer_idx}.attn.indexer.compressor.wkv.weight"
+            ));
+            names.push(format!(
+                "layers.{layer_idx}.attn.indexer.compressor.wgate.weight"
+            ));
+        }
+        dump_dense_activations_if_enabled(gpu, &names, &active, hidden)?;
+    }
+
     // 2. wq_a GEMV batched: tmp* → q_lat_batch. M = q_lora_rank, K = hidden.
     gemv_auto_batched_wmma(
         gpu,
@@ -10138,6 +10345,15 @@ fn q_lora_batched(
         cfg.rms_norm_eps,
     )
     .map_err(|e| format!("q_norm rmsnorm_batched l{layer_idx}: {e:?}"))?;
+
+    if dense_activation_dump_enabled()? {
+        let active = pbs.q_lat_batch.sub_offset(0, batch_size * q_rank);
+        let mut names = vec![format!("layers.{layer_idx}.attn.wq_b.weight")];
+        if layer.compress_ratio == 4 {
+            names.push(format!("layers.{layer_idx}.attn.indexer.wq_b.weight"));
+        }
+        dump_dense_activations_if_enabled(gpu, &names, &active, q_rank)?;
+    }
 
     // 4. FWHT rotate q_lat → q_lat_rot for the MQ4 wq_b path — skip if not MQ4.
     if wq_b_needs_fwht {
@@ -10598,6 +10814,7 @@ pub fn forward_prefill_batch_chunked(
         let take = remaining.len().min(pbs.max_batch);
         let chunk = &remaining[..take];
         forward_prefill_batch_chunk(cfg, weights, state, gpu, pbs, chunk, pos_cursor as u32)?;
+        capture_head_norm_batched(cfg, weights, state, pbs, gpu, take)?;
         if take == remaining.len() {
             return final_norm_and_head_last_batched(cfg, weights, state, pbs, gpu, take);
         }
