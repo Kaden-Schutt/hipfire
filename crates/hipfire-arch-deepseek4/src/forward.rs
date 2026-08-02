@@ -223,6 +223,22 @@ pub fn finish_dense_activation_dump() -> Result<(), String> {
     Ok(())
 }
 
+/// Effective MoE route scale for a DeepSeek V4 artifact, as the forward path
+/// will actually apply it.
+///
+/// Exposed so capture tools and manifests report the value that runs instead of
+/// re-deriving the precedence rule. A copy of that rule in
+/// `examples/ds4_quant_plog.rs` drifted from the source once already — it still
+/// claimed the `.mq2r` default was 2.0 after the measured optimum moved to 1.8,
+/// which silently mislabelled captures. There must be exactly one place that
+/// decides this.
+///
+/// See [`config_cache::resolve_route_scale`] for the precedence and the
+/// measurements behind each default.
+pub fn effective_route_scale(cfg_routed_scaling_factor: f32, mq2r: bool) -> f32 {
+    config_cache::route_scale(cfg_routed_scaling_factor, mq2r)
+}
+
 /// OnceLock-cached process-policy lookups for the DeepSeek V4 decode hot path.
 /// The generic process snapshot is consulted once per helper; subsequent hot
 /// path reads are atomic loads.

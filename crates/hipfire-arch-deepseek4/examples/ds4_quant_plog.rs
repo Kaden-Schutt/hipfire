@@ -150,7 +150,7 @@ fn run() -> Result<(), String> {
         println!("route_scale: override HIPFIRE_DEEPSEEK4_ROUTE_SCALE={s}");
     } else {
         println!(
-            "route_scale: unset — will use cfg.routed_scaling_factor from the model"
+            "route_scale: unset — will use per-build artifact default (mq2r 1.8 / other DS4 2.2)"
         );
     }
     println!();
@@ -167,14 +167,25 @@ fn run() -> Result<(), String> {
     // Capture path does not need the DSpark sidecar.
     cfg.load_dspark = false;
     let cfg_route = cfg.routed_scaling_factor;
-    let effective_route = route_scale_override.unwrap_or(cfg_route);
-    if route_scale_override.is_none() {
+    // Ask the forward path what it will actually apply rather than re-deriving
+    // the precedence rule here. This block used to carry its own copy and it
+    // drifted — it still said the `.mq2r` default was 2.0 after the measured
+    // optimum moved to 1.8, which silently mislabelled captures.
+    let effective_route = match route_scale_override {
+        Some(s) => s,
+        None => hipfire_arch_deepseek4::forward::effective_route_scale(cfg_route, cfg.mq2r),
+    };
+    if route_scale_override.is_some() {
         println!(
-            "route_scale: using model cfg.routed_scaling_factor={cfg_route} (no override)"
+            "route_scale: effective={effective_route} (HIPFIRE_DEEPSEEK4_ROUTE_SCALE override; cfg.routed_scaling_factor={cfg_route})"
+        );
+    } else if cfg.mq2r {
+        println!(
+            "route_scale: effective={effective_route} (.mq2r artifact default; cfg.routed_scaling_factor={cfg_route})"
         );
     } else {
         println!(
-            "route_scale: effective={effective_route} (cfg.routed_scaling_factor={cfg_route})"
+            "route_scale: effective={effective_route} (DS4 artifact default; cfg.routed_scaling_factor={cfg_route})"
         );
     }
     println!(
@@ -373,8 +384,10 @@ fn run() -> Result<(), String> {
     };
     let route_desc = if let Some(s) = route_scale_override {
         format!("route_scale_override={s} (HIPFIRE_DEEPSEEK4_ROUTE_SCALE); cfg.routed_scaling_factor={cfg_route}")
+    } else if cfg.mq2r {
+        format!("route_scale=1.8 (.mq2r artifact default); cfg.routed_scaling_factor={cfg_route}")
     } else {
-        format!("route_scale=cfg.routed_scaling_factor={cfg_route} (no override)")
+        format!("route_scale=2.2 (DS4 artifact default); cfg.routed_scaling_factor={cfg_route}")
     };
     let corpus = CorpusInfo {
         token_ids_sha256: token_ids_sha.clone(),
