@@ -961,6 +961,7 @@ impl Gpu {
     }
     pub fn deepseek4_topk_kv_gather_f32_buf(
         &mut self,
+        tiled_gfx1151: bool,
         kv_cache: &GpuTensor,
         topk_idx: &GpuTensor,
         out: &GpuTensor,
@@ -973,11 +974,21 @@ impl Gpu {
         scale: f32,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel(
-            "deepseek4_topk_kv_gather_f32_buf",
-            kernels::V4F_TOPK_KV_GATHER_BUF_SRC,
-            "deepseek4_topk_kv_gather_f32_buf",
-        )?;
+        let tiled = tiled_gfx1151 && self.arch == "gfx1151";
+        let (logical_name, source, symbol) = if tiled {
+            (
+                "deepseek4_topk_kv_gather_tiled_gfx1151",
+                kernels::V4F_TOPK_KV_GATHER_TILED_GFX1151_SRC,
+                "deepseek4_topk_kv_gather_tiled_f32_buf",
+            )
+        } else {
+            (
+                "deepseek4_topk_kv_gather_f32_buf",
+                kernels::V4F_TOPK_KV_GATHER_BUF_SRC,
+                "deepseek4_topk_kv_gather_f32_buf",
+            )
+        };
+        self.ensure_kernel(logical_name, source, symbol)?;
         let cp = kv_cache.buf.as_ptr();
         let ip = topk_idx.buf.as_ptr();
         let op = out.buf.as_ptr();
@@ -1012,9 +1023,17 @@ impl Gpu {
             b
         };
         self.launch_maybe_blob(
-            "deepseek4_topk_kv_gather_f32_buf",
-            [max_k as u32, 1, 1],
-            [head_dim as u32, 1, 1],
+            symbol,
+            if tiled {
+                [((max_k + 31) / 32) as u32, ((head_dim + 31) / 32) as u32, 1]
+            } else {
+                [max_k as u32, 1, 1]
+            },
+            if tiled {
+                [256, 1, 1]
+            } else {
+                [head_dim as u32, 1, 1]
+            },
             0,
             &mut params,
             blob_builder,

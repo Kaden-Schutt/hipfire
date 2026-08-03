@@ -474,6 +474,22 @@ mod config_cache {
             && mq2r
             && *V.get_or_init(|| flag_one("HIPFIRE_DEEPSEEK4_GFX1151_INDEXER_TOPK_TWOSTAGE"))
     }
+    /// `HIPFIRE_DEEPSEEK4_TOPK_GATHER_TILED` — use the certified 32x32
+    /// LDS-transpose gather on the exact gfx1151 MQ2R route. Default ON;
+    /// set `=0` for the serial emergency fallback. The device and model-route
+    /// checks live here so the gfx1151 policy cannot bleed into gfx1100,
+    /// gfx942, Qwen, or non-MQ2R DeepSeek artifacts.
+    pub(super) fn gfx1151_topk_gather_tiled_on(arch: &str, mq2r: bool) -> bool {
+        static V: OnceLock<bool> = OnceLock::new();
+        arch == "gfx1151"
+            && mq2r
+            && *V.get_or_init(|| {
+                hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_TOPK_GATHER_TILED")
+                    .ok()
+                    .as_deref()
+                    != Some("0")
+            })
+    }
     /// `HIPFIRE_DEEPSEEK4_INDEXER_TOPK_TWOSTAGE_MIN` — minimum
     /// `max_compress_pos()` at which the two-stage path may be selected.
     /// Default 1024, from the measured standalone-probe crossover against the
@@ -6297,6 +6313,10 @@ fn attn_stub(
                 let main_kv_cache = state._indexer[layer_idx].main_kv_cache.as_ref().unwrap();
                 let gathered_k = state._attention[layer_idx].gathered_k.as_ref().unwrap();
                 gpu.deepseek4_topk_kv_gather_f32_buf(
+                    config_cache::gfx1151_topk_gather_tiled_on(
+                        &gpu.arch,
+                        weights.mq2r_backend.is_gfx1151(),
+                    ),
                     main_kv_cache,
                     topk_idx,
                     gathered_k,
@@ -13161,6 +13181,7 @@ mod tests {
         assert!(!config_cache::redline_ffn_split_on(arch, true));
         // G1 is gfx1151's own two-stage lever: arch-gate passes, default OFF.
         assert!(!config_cache::gfx1151_indexer_topk_two_stage_on(arch, true));
+        assert!(config_cache::gfx1151_topk_gather_tiled_on(arch, true));
         // gfx942 A2 levers must not bleed into gfx1151.
         assert!(!config_cache::gfx942_compressor_gate_on(arch, true));
         assert!(!config_cache::gfx942_indexer_topk_bounded_on(arch, true));
@@ -13169,6 +13190,9 @@ mod tests {
         assert!(!config_cache::gfx942_hc_finalize_fused_on(arch, true));
         assert!(!config_cache::gfx942_indexer_topk_parallel_on(arch, true));
         assert!(!config_cache::gfx942_ffn_overlap_on(false));
+        assert!(!config_cache::gfx1151_topk_gather_tiled_on("gfx1100", true));
+        assert!(!config_cache::gfx1151_topk_gather_tiled_on("gfx942", true));
+        assert!(!config_cache::gfx1151_topk_gather_tiled_on(arch, false));
     }
 
     #[test]
