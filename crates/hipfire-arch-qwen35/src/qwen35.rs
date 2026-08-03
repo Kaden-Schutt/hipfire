@@ -18265,15 +18265,36 @@ mod tests {
 
     #[test]
     fn c2_reject_unknown_router_dtype() {
-        // A completely unknown dtype on the router should be rejected.
-        let _cfg = moe_test_config(8, 8);
-        // Use a dtype that isn't recognized by rotation_plan or known non-rotated list.
-        // MFP4G32 (non-E8) is a known FWHT type actually. Let's use something truly odd.
-        // Actually ALL DType variants are known. The check catches unrecognized
-        // dtypes that aren't in any rotation or known non-rotated category.
-        // For this test, we'll use a dtype that has RotationPlan::None but isn't
-        // in the known non-rotated whitelist. There is no such DType since all
-        // DType variants are known. This test documents the limitation.
+        // A router dtype with no rotation plan and no known non-rotated
+        // whitelist entry must be rejected by validate_frozen_moe_dispatch
+        // (section 6 check_proj on the router). Q8HFQ maps to
+        // RotationPlan::None and is not in the whitelist
+        // (F32/F16/BF16/Q8_0/HFQ4G256/HFQ3G256/HFQ6G256/ParoQ4G128).
+        let cfg = moe_test_config(8, 8);
+        let snap = snapshot_uniform(
+            DType::Q8HFQ,
+            DType::MQ4G256,
+            DType::MQ4G256,
+            DType::MQ4G256,
+            DType::MQ4G256,
+            DType::MQ4G256,
+            DType::MQ4G256,
+            8,
+            false,
+            false,
+        );
+        let (gu, dn) = uniform_pairs(8, DType::MQ4G256, DType::MQ4G256);
+        let err =
+            validate_frozen_moe_dispatch(&cfg, &snap, &gu, &dn, false, false, true, true, true)
+                .expect_err("unrotated non-whitelisted router dtype must be rejected");
+        assert!(
+            err.contains("router"),
+            "rejection must name the router: {err}"
+        );
+        assert!(
+            err.contains("Q8HFQ"),
+            "rejection must name the dtype: {err}"
+        );
     }
 
     // ── Checked GPU cleanup (CPU tests) ─────────────────────────────
@@ -18524,26 +18545,12 @@ mod tests {
         }
         _sig(DeltaNetState::abort_checked);
 
-        // Empty state returns Ok.
-        let _state = DeltaNetState {
-            s_matrices: vec![],
-            s_scales: vec![],
-            conv_states: vec![],
-            s_ef_residual: vec![],
-            quant: StateQuant::FP32,
-        };
-        // abort_checked requires Gpu; can't call on CPU without crash.
-        // Verify the method exists via the signature check above.
-    }
-
-    #[test]
-    fn delta_net_state_abort_checked_ok_on_empty() {
-        // Empty DeltaNetState with no tensors: abort_checked should
-        // succeed immediately (no failures to process).
-        //
-        // We cannot call abort_checked directly (requires real GPU),
-        // but we can verify that the empty state can be constructed
-        // and that the method signature is correct.
+        // The Ok-on-empty outcome itself is GPU-bound: abort_checked
+        // consumes `&mut Gpu`, and Gpu cannot be constructed without a HIP
+        // device, so it is exercised only on hardware.  What is pin-able on
+        // CPU is the Ok-path precondition — an empty state, i.e. no tensors
+        // in any vector, so abort_checked iterates zero tensors and returns
+        // Ok(()) without touching the device.
         let state = DeltaNetState {
             s_matrices: vec![],
             s_scales: vec![],
@@ -18551,9 +18558,10 @@ mod tests {
             s_ef_residual: vec![],
             quant: StateQuant::FP32,
         };
-        // Smoke: the state is well-formed.
-        assert_eq!(state.s_matrices.len(), 0);
-        assert_eq!(state.s_scales.len(), 0);
+        assert!(state.s_matrices.is_empty());
+        assert!(state.s_scales.is_empty());
+        assert!(state.conv_states.is_empty());
+        assert!(state.s_ef_residual.is_empty());
     }
 
     // ── Qwen35Scratch::abort_checked (CPU tests) ────────────────────
