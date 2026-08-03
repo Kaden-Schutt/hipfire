@@ -3205,6 +3205,22 @@ fn ds4_gen_start_contract_version() -> Option<u32> {
     gen_start_contract_version_for_arch(9)
 }
 
+/// Start the DeepSeek4 AR stream before any token/reasoning event is emitted.
+///
+/// DS4 intentionally remains on the correlated legacy stream contract for now,
+/// but the native CLI still requires `gen_start` to be the first event so it can
+/// latch that contract. Keep this helper DS4-owned: Qwen's v2 producer contract
+/// and event folding are independent.
+fn emit_deepseek4_ar_gen_start(stdout: &mut impl std::io::Write, id: &str, think_mode: ThinkMode) {
+    let started_in_think = matches!(think_mode, ThinkMode::High | ThinkMode::Max);
+    emit_gen_start(
+        stdout,
+        id,
+        started_in_think,
+        ds4_gen_start_contract_version(),
+    );
+}
+
 /// Pure `gen_start.contract_version` selection used by the live generate path.
 /// Qwen AR (5/6) advertises v2; DS4 (9) and every other arch stay unset.
 fn gen_start_contract_version_for_arch(arch_id: u32) -> Option<u32> {
@@ -18486,6 +18502,13 @@ fn generate_deepseek4(
         return;
     }
 
+    // The route dispatcher returns directly into this DS4-owned AR loop, so it
+    // does not pass through the generic Qwen generate path that emits gen_start.
+    // Latch the correlated legacy contract before prefill can produce the first
+    // token event. Without this, the native CLI rejects the stream and aborts an
+    // otherwise healthy generation as "token before contract latch".
+    emit_deepseek4_ar_gen_start(stdout, id, think_mode);
+
     // Prefill: batched chunked through PBS. (The MTP-fill prefill variant moved
     // to the drafter's `mtp_prefill`, driven by `generate_deepseek4_spec`.)
     let prefill_result = deepseek4::forward::forward_prefill_batch_chunked(
@@ -24216,6 +24239,17 @@ mod ds4_malformed_terminal_tests {
         assert_eq!(gen_start_contract_version_for_arch(5), Some(2));
         assert_eq!(gen_start_contract_version_for_arch(6), Some(2));
         assert_eq!(super::QWEN_AR_SEMANTIC_CONTRACT_VERSION, 2);
+
+        set_active_attempt_id(23);
+        let mut sink = Vec::new();
+        super::emit_deepseek4_ar_gen_start(&mut sink, "req-ds4", super::ThinkMode::High);
+        let event: serde_json::Value = serde_json::from_slice(&sink).unwrap();
+        assert_eq!(event["type"], "gen_start");
+        assert_eq!(event["id"], "req-ds4");
+        assert_eq!(event["attempt_id"], 23);
+        assert_eq!(event["started_in_think"], true);
+        assert!(event.get("contract_version").is_none());
+        set_active_attempt_id(0);
     }
 
     // ── Task 4 definitive terminal-edge blockers (DS4 cache + empty EOS) ──
