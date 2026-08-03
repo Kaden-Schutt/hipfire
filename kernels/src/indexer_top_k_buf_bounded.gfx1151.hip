@@ -158,11 +158,19 @@ extern "C" __global__ void indexer_top_k_buf_parallel(
     int kpad = 1;
     while (kpad < k) kpad <<= 1;
     if (kpad <= TOPK_MAX_KPAD) {
+        // Canonicalise ineligible entries at LOAD to (-INFINITY, INT_MAX),
+        // identical to out-of-range padding. DS4 fills unused indexer
+        // score-pool slots with -inf and they must never be selected; folding
+        // them into the pad value also keeps NaN out of the comparator, which
+        // a bitonic network requires (it needs a valid total order). Matches
+        // the gfx942 pair and the portable two-stage kernel.
         for (int local = tid; local < kpad; local += threads) {
             const int index = local;
-            cached_scores[local] =
+            const float score =
                 (index < n_compressed) ? scores[scores_base + index] : -INFINITY;
-            cached_indices[local] = (index < n_compressed) ? index : INT_MAX;
+            const bool eligible = score > -FLT_MAX;
+            cached_scores[local] = eligible ? score : -INFINITY;
+            cached_indices[local] = eligible ? index : INT_MAX;
         }
         __syncthreads();
         topk_bitonic_sort_desc(cached_scores, cached_indices, 0, kpad);
@@ -170,10 +178,11 @@ extern "C" __global__ void indexer_top_k_buf_parallel(
         for (int tile = kpad; tile < n_compressed; tile += kpad) {
             for (int local = tid; local < kpad; local += threads) {
                 const int index = tile + local;
-                cached_scores[kpad + local] =
+                const float score =
                     (index < n_compressed) ? scores[scores_base + index] : -INFINITY;
-                cached_indices[kpad + local] =
-                    (index < n_compressed) ? index : INT_MAX;
+                const bool eligible = score > -FLT_MAX;
+                cached_scores[kpad + local] = eligible ? score : -INFINITY;
+                cached_indices[kpad + local] = eligible ? index : INT_MAX;
             }
             __syncthreads();
             topk_bitonic_sort_desc(cached_scores, cached_indices, kpad, kpad);
@@ -189,23 +198,37 @@ extern "C" __global__ void indexer_top_k_buf_parallel(
             topk_bitonic_merge_desc(cached_scores, cached_indices, 2 * kpad);
         }
 
-        for (int rank = tid; rank < max_k; rank += threads)
-            top_indices[output_base + rank] =
-                (rank < k) ? cached_indices[rank] : -1;
+        // Write-time filter: INT_MAX can only come from a canonicalised
+        // ineligible or padding entry, never from a real candidate index.
+        for (int rank = tid; rank < max_k; rank += threads) {
+            int selected = -1;
+            if (rank < k) {
+                const int index = cached_indices[rank];
+                selected = (index == INT_MAX) ? -1 : index;
+            }
+            top_indices[output_base + rank] = selected;
+        }
         return;
     }
 
-    // Exact fallback for unsupported K > TOPK_MAX_KPAD.
+    // Exact fallback for unsupported K > TOPK_MAX_KPAD, carrying the same
+    // eligibility filter as the gfx942 reference. The full max_k prefill (the
+    // old code prefilled only rank >= k) is required because eligibility can
+    // leave ranks unclaimed, and an unwritten rank is an uninitialised index
+    // feeding a KV gather.
+    for (int rank = tid; rank < max_k; rank += threads)
+        top_indices[output_base + rank] = -1;
+    __syncthreads();
     for (int index = tid; index < n_compressed; index += threads) {
         const float score_i = scores[scores_base + index];
+        if (!(score_i > -FLT_MAX)) continue;
         int rank = 0;
         for (int other = 0; other < n_compressed; ++other) {
             const float score_j = scores[scores_base + other];
+            if (!(score_j > -FLT_MAX)) continue;
             rank += (score_j > score_i)
                 || (score_j == score_i && other < index);
         }
         if (rank < k) top_indices[output_base + rank] = index;
     }
-    for (int rank = k + tid; rank < max_k; rank += threads)
-        top_indices[output_base + rank] = -1;
 }
