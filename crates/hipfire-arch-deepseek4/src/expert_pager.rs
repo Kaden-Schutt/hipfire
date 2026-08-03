@@ -1041,6 +1041,12 @@ impl Ds4ExpertPaging {
                 self.bytes_read as f64 / (1024.0 * 1024.0 * 1024.0),
                 self.rt.slots_per_blob(),
             );
+            let (pread_ns, copy_ns) = self.transport.io_split();
+            eprintln!(
+                "deepseek4: expert cache — read split: pread {:.0} ms, h2d copy {:.0} ms",
+                pread_ns as f64 / 1.0e6,
+                copy_ns as f64 / 1.0e6,
+            );
             eprintln!(
                 "deepseek4: expert cache — pointer-table uploads {} done / {} skipped ({:.1}% skipped)",
                 self.table_uploads,

@@ -235,6 +235,12 @@ pub struct PreadH2DTransport {
     /// purely informational; future async impls will key real completion
     /// state on this id.
     next_handle: u64,
+    /// Split of `fetch_into` cost: disk vs host-to-device copy. Decides
+    /// whether a dedicated copy stream (which needs pinned host memory and
+    /// new FFI) is the right optimisation, or whether the pread dominates and
+    /// concurrent reads are.
+    ns_pread: u64,
+    ns_copy: u64,
 }
 
 impl PreadH2DTransport {
@@ -257,6 +263,8 @@ impl PreadH2DTransport {
             path: path.to_path_buf(),
             staging: Vec::new(),
             next_handle: 0,
+            ns_pread: 0,
+            ns_copy: 0,
         })
     }
 
@@ -265,6 +273,11 @@ impl PreadH2DTransport {
     /// io_uring SQE buffers.
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// `(pread_ns, h2d_copy_ns)` accumulated across all `fetch_into` calls.
+    pub fn io_split(&self) -> (u64, u64) {
+        (self.ns_pread, self.ns_copy)
     }
 
     /// Grow the host staging buffer to `len` bytes up front.
@@ -343,17 +356,18 @@ impl Transport for PreadH2DTransport {
         // quality regression rather than a crash — so fail closed here.
         check_fetch_into_bounds(dst.byte_size(), dst_byte_offset, len)
             .map_err(|m| hip_bridge::HipError::new(0, &m))?;
+        let t_pread = std::time::Instant::now();
         // 1. Host: pread into the staging buffer (same path as `fetch`).
         self.pread_into_staging(hfq_offset, len).map_err(|e| {
-            hip_bridge::HipError::new(
-                0,
-                &format!("pread {len} bytes at offset {hfq_offset}: {e}"),
-            )
+            hip_bridge::HipError::new(0, &format!("pread {len} bytes at offset {hfq_offset}: {e}"))
         })?;
+        self.ns_pread += t_pread.elapsed().as_nanos() as u64;
         // 2. GPU: copy into the caller's existing buffer. No allocation.
         gpu.bind_thread()?;
+        let t_copy = std::time::Instant::now();
         gpu.hip
             .memcpy_htod_offset(&dst.buf, dst_byte_offset, &self.staging[..len])?;
+        self.ns_copy += t_copy.elapsed().as_nanos() as u64;
         Ok(self.next_handle())
     }
 
