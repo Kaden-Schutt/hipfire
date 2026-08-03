@@ -505,6 +505,9 @@ mod config_cache {
     /// One-shot daemon-log line for A2 gfx942 levers so ABBA runs cannot
     /// misattribute measurements.
     pub(super) fn log_gfx942_a2_levers(arch: &str, gfx942_route_v1: bool) {
+        if arch != "gfx942" {
+            return;
+        }
         static LOGGED: OnceLock<()> = OnceLock::new();
         let _ = LOGGED.get_or_init(|| {
             let l1 = gfx942_compressor_gate_on(arch, gfx942_route_v1);

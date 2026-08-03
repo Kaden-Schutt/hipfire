@@ -1435,6 +1435,8 @@ fn redline_bench_decode_deepseek4(
                 "packets": identity.packet_count,
                 "queue_id": identity.queue_id,
                 "command_dwords": identity.command_dwords,
+                "queues": identity.queue_count,
+                "phases": identity.phase_count,
             })
         });
         let sequence = gpu.replay.capture_summary();
