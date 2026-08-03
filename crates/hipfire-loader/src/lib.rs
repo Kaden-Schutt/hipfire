@@ -8548,13 +8548,14 @@ mod qwen35_backlog_tests {
         // Release the drain; the enqueue can only complete after the
         // coordinator is dropped (post-drain).
         drain_release_tx.send(()).unwrap();
-        enqueue_done_rx
-            .recv()
-            .expect("enqueue must complete after the drain");
-        // Join AFTER the done signal: a panic in the enqueuer propagates
-        // here with its real message instead of surfacing as a bare
-        // channel-disconnect failure at the recv above.
+        // Store the recv result BEFORE joining: if the enqueuer panics the
+        // channel disconnects, so a bare recv().expect() would mask the real
+        // panic as a channel-disconnect failure.  Joining unconditionally
+        // first propagates the enqueuer's real panic message, then the
+        // stored result asserts the enqueue completed.
+        let enqueue_result = enqueue_done_rx.recv();
         enqueuer.join().expect("enqueuer must finish");
+        enqueue_result.expect("enqueue must complete after the drain");
         driver.join().expect("driver must finish");
 
         // The owner is intact in the backlog — BOTH categories — and the
