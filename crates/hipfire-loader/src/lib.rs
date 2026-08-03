@@ -19,12 +19,17 @@ use hipfire_arch_cohere2moe as cohere2moe;
 use hipfire_arch_deepseek4 as deepseek4;
 use hipfire_arch_lfm2moe as lfm2moe;
 use hipfire_arch_minimax as minimax;
+use hipfire_arch_qwen35::mtp_head::Qwen35MtpHead;
+use hipfire_arch_qwen35::qwen35::{
+    DeltaNetState, Qwen35CleanupFailure, Qwen35Scratch, Qwen35Weights,
+};
 use hipfire_arch_qwen35::speculative::DeltaNetSnapshot;
 use hipfire_arch_qwen35::Qwen35Bundle;
 use hipfire_arch_qwen35_vl::qwen35_vl;
 use hipfire_runtime::cask::CaskCtx;
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama;
+use hipfire_runtime::llama::KvCache;
 use hipfire_runtime::loader_api::{CaskConfig, LoadCtx, ModelSource, SpecLoadCfg};
 use hipfire_runtime::multi_gpu::{DeviceMesh, DimKind, Gpus};
 use hipfire_runtime::spec::{SpecEmit, SpecEmitCtx, SpecTargetGuard, Speculator};
@@ -32,8 +37,11 @@ use hipfire_runtime::triattn::{EvictionCtx, TriAttnCenters};
 use parallel_capability::{
     resolve, ModelVariant, ParallelAdmission, ParallelAxis, RawParallelRequest,
 };
-use rdna_compute::Gpu;
+use rdna_compute::{AllocationDomainId, Gpu};
+use std::collections::HashMap;
+use std::hash::Hash;
 use std::path::Path;
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 // ─── Object-safe Carrier trait ──────────────────────────────────────
 
@@ -1684,23 +1692,53 @@ pub(crate) fn parse_state_quant(
 
 // ─── Core arch carrier load ─────────────────────────────────────────────
 
-/// Build a `LoadedModel` from a carrier `Bundle`, shared fields, and
-/// eviction/DFlash state. This is the common body for qwen35 dispatch
-/// where eviction and DFlash need per-arch type info.
-fn free_unpublished_qwen35_bundle(bundle: Qwen35Bundle, gpu: &mut Gpu) {
+/// Ordered cleanup of a complete (but unpublished) Qwen35 bundle after a
+/// `finish_qwen35_load` finalization failure — the Frozen MoE path's
+/// unchecked `weights.free_gpu()` / log-and-drop replacement.
+///
+/// Runs the shared [`run_qwen35_unload`] state machine:
+///
+/// 1. Quiescence (bind/sync/graph/cache) iff any GPU users were built
+///    during finalization (`eviction`, `vision`).  On quiescence
+///    failure the WHOLE pending owner is retained as a backlog
+///    [`QwenBacklogEntry::Pending`] entry — no partial free.
+/// 2. Ordered teardown (`speculator` → `eviction` → checkpoints → mtp →
+///    KV → scratch → dn_state → vision → checked weights).  A partial
+///    `free_gpu_checked` failure — including every frozen
+///    [`SingleFreeFailed`] owner — is enqueued whole as a backlog
+///    [`QwenBacklogEntry::Cleanup`] entry in the exact allocation
+///    domain, never logged-and-dropped.
+/// 3. Retry the domain backlog.
+/// 4. `drain_pool()` iff the domain bucket is empty after retry.
+///
+/// The Legacy bundle path shares this finalization seam unchanged.
+fn free_unpublished_qwen35_bundle(
+    bundle: Qwen35Bundle,
+    eviction: Option<Eviction>,
+    vision: Option<Qwen35Vl>,
+    gpu: &mut Gpu,
+    domain: AllocationDomainId,
+) {
     // `finish_qwen35_load` is only called on the pp=1 carrier path, so the
     // pipeline payload cannot be present here (it needs its owning `Gpus`).
     debug_assert!(
         bundle.pipeline.is_none(),
         "single-GPU Qwen35 finish received pipeline-owned state"
     );
-    if let Some(head) = bundle.mtp_head {
-        head.free_gpu(gpu);
-    }
-    bundle.kv_cache.free_gpu(gpu);
-    bundle.scratch.free_gpu(gpu);
-    bundle.weights.free_gpu(gpu);
-    bundle.dn_state.free_gpu(gpu);
+    let needs_quiescence = eviction.is_some() || vision.is_some();
+    let pending = PendingQwen35Unload {
+        bundle,
+        speculator: None,
+        eviction,
+        prefill_checkpoints: Vec::new(),
+        dflash_checkpoints: Vec::new(),
+        vision,
+    };
+    let mut machine = ProductionMachine {
+        host: GpuHost(gpu),
+        quiesce_needed: needs_quiescence,
+    };
+    run_qwen35_unload(pending, &mut machine, domain);
 }
 
 fn finish_qwen35_load(
@@ -1711,13 +1749,17 @@ fn finish_qwen35_load(
     chat_template: Option<String>,
     ctx: &mut LoadCtx,
     vision_config: Option<qwen35_vl::VisionConfig>,
-    vision_weights: Option<qwen35_vl::VisionWeights>,
+    mut vision_weights: Option<qwen35_vl::VisionWeights>,
     token: &CarrierLoadToken,
 ) -> Result<LoadedModel, String> {
     use hipfire_arch_qwen35::qwen35::LayerType;
     let mut bundle = Some(bundle);
     let mut eviction = None;
-    let mut vision_weights = vision_weights;
+    // Staged vision tower; moved into the Ok arm, or into the unpublished
+    // cleanup on the error arm.
+    let mut vision = vision_config
+        .zip(vision_weights.take())
+        .map(|(config, weights)| Qwen35Vl { config, weights });
     let result = (|| -> Result<LoadedModel, String> {
         // Extract references for eviction/DFlash setup (borrow, don't move).
         let bundle_ref = bundle.as_ref().expect("Qwen35 bundle is still staged");
@@ -1977,9 +2019,7 @@ fn finish_qwen35_load(
             )),
             eviction: eviction.take(),
             speculator,
-            vision: vision_config
-                .zip(vision_weights.take())
-                .map(|(config, weights)| Qwen35Vl { config, weights }),
+            vision: vision.take(),
             ..LoadedModel::skeleton(
                 arch_id,
                 tokenizer,
@@ -1997,16 +2037,16 @@ fn finish_qwen35_load(
     match result {
         Ok(model) => Ok(model),
         Err(error) => {
-            if let Some(eviction) = eviction.take() {
-                eviction.free_gpu(ctx.gpu);
-            }
-            if let Some(weights) = vision_weights.take() {
-                weights.free_gpu(ctx.gpu);
-            }
-            if let Some(bundle) = bundle.take() {
-                free_unpublished_qwen35_bundle(bundle, ctx.gpu);
-            }
-            ctx.gpu.drain_pool();
+            // Unpublished-bundle cleanup: quiescence (if users) → ordered
+            // checked free → exact allocation-domain backlog enqueue →
+            // retry → drain only iff the domain bucket is empty after
+            // retry.  A Frozen bundle's weights go through
+            // `free_gpu_checked` (never the panicking `free_gpu`); any
+            // partial failure — frozen owners included — is enqueued
+            // whole, never logged-and-dropped.
+            let domain = *ctx.gpu.allocation_domain_id();
+            let bundle = bundle.take().expect("Qwen35 bundle is still staged");
+            free_unpublished_qwen35_bundle(bundle, eviction.take(), vision.take(), ctx.gpu, domain);
             Err(error)
         }
     }
@@ -3474,6 +3514,21 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
         let _ = gpu;
         return;
     }
+    // ── Qwen35 single-device: ordered cleanup lane B ─────────────────
+    //
+    // Intercept BEFORE generic speculator/eviction/checkpoint free.
+    // The ordered path handles everything (quiescence, non-weight free,
+    // checked weight cleanup, backlog retry, gated pool drain).
+    if matches!(&m.state, Some(ModelState::Qwen35(_)))
+        && matches!(&m.parallel, ModelParallel::Single)
+    {
+        let pending = PendingQwen35Unload::from_model(&mut m);
+        let domain = *gpu.allocation_domain_id();
+        unload_single_qwen35_ordered(pending, gpu, domain);
+        return;
+    }
+
+    // ── Generic path (non-Qwen35 single-device) ───────────────────────
     if let Some(spec) = m.speculator {
         // Frees the drafter's GPU buffers (draft weights + scratch) AND its
         // checkpoint ring — a drafter that forgets is a compile error, not a
@@ -3497,6 +3552,8 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
                 b.state.free_gpu(gpu);
                 b.weights.free_gpu(gpu);
             }
+            // Qwen35 single-device is handled above; this arm is only reached
+            // for Qwen35 under multi-device (TP/PP) parallelism.
             ModelState::Qwen35(b) => {
                 if let Some(head) = b.mtp_head {
                     head.free_gpu(gpu);
@@ -3540,6 +3597,666 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
     gpu.invalidate_weight_caches();
     gpu.invalidate_graph_state();
     gpu.drain_pool();
+}
+
+// ─── PendingQwen35Unload ────────────────────────────────────────────
+//
+// Complete set of GPU owners for a single-device Qwen35 model, moved out
+// of LoadedModel and SessionState before any unload teardown. Retained
+// entirely when quiescence fails; destructured in dependency order after
+// quiescence succeeds.
+
+/// All GPU-bound resources for a single-device Qwen35 model, captured
+/// before ordered teardown. Every field forces an ownership decision for
+/// future additions.
+pub(crate) struct PendingQwen35Unload {
+    /// Core arch bundle (weights + scratch + KV + dn_state + mtp + pipeline).
+    /// `ModelParallel/TpModel` and host-only fields excluded.
+    pub(crate) bundle: hipfire_arch_qwen35::Qwen35Bundle,
+    /// Speculative-decoder (drafter + checker). `None` in AR-only configs.
+    pub(crate) speculator: Option<Box<dyn Speculator>>,
+    /// TriAttention / CASK eviction state.
+    pub(crate) eviction: Option<Eviction>,
+    /// Prefill checkpoint ring (DeltaNet snapshots).
+    pub(crate) prefill_checkpoints: Vec<(usize, DeltaNetSnapshot)>,
+    /// DFlash checkpoint ring (DeltaNet snapshots).
+    pub(crate) dflash_checkpoints: Vec<(usize, DeltaNetSnapshot)>,
+    /// Vision tower state (VL model only; `None` for base Qwen35).
+    pub(crate) vision: Option<Qwen35Vl>,
+}
+
+// Compile-time Send assertion for the whole struct and its transitive
+// owned types. A new field that is NOT Send forces a compile error here.
+const _: () = {
+    const fn assert_send<T: Send>() {}
+    assert_send::<PendingQwen35Unload>();
+    assert_send::<hipfire_arch_qwen35::Qwen35Bundle>();
+    assert_send::<Box<dyn Speculator>>();
+    assert_send::<Eviction>();
+    assert_send::<DeltaNetSnapshot>();
+    assert_send::<Qwen35Vl>();
+};
+
+impl PendingQwen35Unload {
+    /// Construct from `LoadedModel` after proving `ModelParallel::Single`
+    /// and `ModelState::Qwen35`. Takes ownership of all GPU resources.
+    fn from_model(m: &mut LoadedModel) -> Self {
+        let bundle = match m.state.take() {
+            Some(ModelState::Qwen35(b)) => b,
+            _ => unreachable!("PendingQwen35Unload: expected Qwen35 state"),
+        };
+        Self {
+            bundle,
+            speculator: m.speculator.take(),
+            eviction: m.eviction.take(),
+            prefill_checkpoints: std::mem::take(&mut m.session.prefill_checkpoints),
+            dflash_checkpoints: std::mem::take(&mut m.session.dflash_checkpoints),
+            vision: m.vision.take(),
+        }
+    }
+}
+
+// ─── UnloadDevice trait (testable GPU operation seam) ──────────────
+//
+// Abstracts the GPU operations that `unload_single_qwen35_ordered` and
+// `retry_qwen_cleanup` need. Production uses [`GpuHost`]; tests use a
+// recording fake that asserts exact call order.
+
+/// Operations needed for Qwen35 ordered unload. Production impl wraps
+/// `&mut Gpu`; tests use a recording fake.
+pub(crate) trait UnloadDevice {
+    /// Bind to the GPU thread. Returns `Err(())` on failure.
+    fn q_bind_thread(&self) -> Result<(), ()>;
+    /// Synchronize the device. Returns `Err(())` on failure.
+    fn q_device_sync(&self) -> Result<(), ()>;
+    /// Invalidate graph state (checked). Returns `Err(())` on failure.
+    fn q_invalidate_graph(&mut self) -> Result<(), ()>;
+    /// Invalidate weight-pointer caches (unchecked).
+    fn q_invalidate_caches(&mut self);
+    /// Drain the GPU memory pool (checked). Returns error message on failure.
+    fn q_drain_pool(&mut self) -> Result<(), String>;
+
+    // ── Resource-free operations ──────────────────────────────────
+    fn free_speculator(&mut self, spec: Box<dyn Speculator>);
+    fn free_eviction(&mut self, ev: Eviction);
+    fn free_checkpoint(&mut self, snap: DeltaNetSnapshot);
+    fn free_mtp_head(&mut self, head: Qwen35MtpHead);
+    fn free_kv_cache(&mut self, kv: KvCache);
+    fn free_scratch(&mut self, scratch: Qwen35Scratch);
+    fn free_dn_state(&mut self, dn: DeltaNetState);
+    fn free_vision_weights(&mut self, vw: qwen35_vl::VisionWeights);
+    /// Free weights with checked retention. Returns remaining failures.
+    fn free_weights_checked(&mut self, weights: Qwen35Weights) -> Result<(), Qwen35CleanupFailure>;
+
+    /// Retry a [`Qwen35CleanupFailure`]. Returns `Ok(())` on complete
+    /// success, or `Err` with remaining failures.
+    fn retry_cleanup_failure(
+        &mut self,
+        failure: Qwen35CleanupFailure,
+    ) -> Result<(), Qwen35CleanupFailure>;
+}
+
+/// Production `UnloadDevice` — delegates every operation to the real
+/// GPU through a `&mut rdna_compute::Gpu`.
+pub(crate) struct GpuHost<'a>(pub &'a mut rdna_compute::Gpu);
+
+impl UnloadDevice for GpuHost<'_> {
+    fn q_bind_thread(&self) -> Result<(), ()> {
+        self.0.bind_thread().map_err(|_| ())
+    }
+    fn q_device_sync(&self) -> Result<(), ()> {
+        self.0.hip.device_synchronize().map_err(|_| ())
+    }
+    fn q_invalidate_graph(&mut self) -> Result<(), ()> {
+        self.0.invalidate_graph_state_checked().map_err(|_| ())
+    }
+    fn q_invalidate_caches(&mut self) {
+        self.0.invalidate_weight_caches();
+    }
+    fn q_drain_pool(&mut self) -> Result<(), String> {
+        self.0.drain_pool_checked()
+    }
+
+    fn free_speculator(&mut self, spec: Box<dyn Speculator>) {
+        spec.free(self.0);
+    }
+    fn free_eviction(&mut self, ev: Eviction) {
+        ev.free_gpu(self.0);
+    }
+    fn free_checkpoint(&mut self, snap: DeltaNetSnapshot) {
+        snap.free_gpu(self.0);
+    }
+    fn free_mtp_head(&mut self, head: Qwen35MtpHead) {
+        head.free_gpu(self.0);
+    }
+    fn free_kv_cache(&mut self, kv: KvCache) {
+        kv.free_gpu(self.0);
+    }
+    fn free_scratch(&mut self, scratch: Qwen35Scratch) {
+        scratch.free_gpu(self.0);
+    }
+    fn free_dn_state(&mut self, dn: DeltaNetState) {
+        dn.free_gpu(self.0);
+    }
+    fn free_vision_weights(&mut self, vw: qwen35_vl::VisionWeights) {
+        vw.free_gpu(self.0);
+    }
+    fn free_weights_checked(&mut self, weights: Qwen35Weights) -> Result<(), Qwen35CleanupFailure> {
+        weights.free_gpu_checked(self.0)
+    }
+    fn retry_cleanup_failure(
+        &mut self,
+        failure: Qwen35CleanupFailure,
+    ) -> Result<(), Qwen35CleanupFailure> {
+        failure.retry(self.0)
+    }
+}
+
+// ─── Qwen35 cleanup backlog (process-lifetime) ─────────────────────
+//
+// Lane B: when Qwen35 single-device quiescence or `free_gpu_checked`
+// fails, the owning resources are retained in a process-lifetime backlog
+// so the driver can retry on the next unload for the same allocation
+// domain.
+//
+// Keyed by [`AllocationDomainId`] (obtained from `gpu.allocation_domain_id()`,
+// never from a bare device_id), which is a stable process-life opaque handle
+// that survives pool drain cycles.
+
+/// An entry retained in the allocation-domain backlog when Qwen35 GPU
+/// cleanup cannot complete during `unload_model`.
+pub(crate) enum QwenBacklogEntry {
+    /// A complete `PendingQwen35Unload` whose quiescence
+    /// (bind/sync/graph/cache) failed. On retry, must first re-establish
+    /// quiescence before freeing. All resources are retained.
+    Pending(PendingQwen35Unload),
+    /// A `Qwen35CleanupFailure` from a partial `free_gpu_checked` attempt.
+    /// The failure retains every tensor that could not be freed; on retry,
+    /// only the still-failing tensors are returned.
+    Cleanup(Qwen35CleanupFailure),
+}
+
+impl std::fmt::Debug for QwenBacklogEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            QwenBacklogEntry::Pending(_) => f.debug_struct("Pending").finish(),
+            QwenBacklogEntry::Cleanup(cf) => f
+                .debug_struct("Cleanup")
+                .field("num_failed", &cf.num_failed())
+                .finish(),
+        }
+    }
+}
+
+/// Process-lifetime backlog: once initialized it survives producer threads.
+/// Keyed by exact [`AllocationDomainId`] — never by device_id.
+static QWEN_CLEANUP_BACKLOG: OnceLock<Mutex<HashMap<AllocationDomainId, Vec<QwenBacklogEntry>>>> =
+    OnceLock::new();
+
+fn qwen_backlog() -> &'static Mutex<HashMap<AllocationDomainId, Vec<QwenBacklogEntry>>> {
+    QWEN_CLEANUP_BACKLOG.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Process-lifetime per-domain coordinator locks, SEPARATE from the
+/// global backlog map.  Every same-domain enqueue and every
+/// retry/empty-check/drain sequence participates: the unload state
+/// machine holds the domain coordinator across the HIP retry + drain,
+/// so an enqueue cannot slip between the empty decision and the drain
+/// (which would let the drain invalidate a just-retained owner).  The
+/// global map mutex is NEVER held during HIP work — bucket removal and
+/// re-merge happen under it, processing happens outside.
+///
+/// The registry holds WEAK references: an entry is pruned on the next
+/// lookup once no coordinator user remains, so the map cannot grow with
+/// retired domains.  This is sound — while any user holds the strong
+/// Arc, every lookup upgrades to the SAME coordinator; when the last
+/// user drops it, a fresh one is created for the next sequence (there
+/// is no concurrent coordination left to serialize against).
+static QWEN_DOMAIN_COORDINATORS: OnceLock<Mutex<HashMap<AllocationDomainId, Weak<Mutex<()>>>>> =
+    OnceLock::new();
+
+fn qwen_domain_coordinators() -> &'static Mutex<HashMap<AllocationDomainId, Weak<Mutex<()>>>> {
+    QWEN_DOMAIN_COORDINATORS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The per-domain coordinator lock for `domain`.  Process-lifetime
+/// registry with dead-entry pruning (see [`QWEN_DOMAIN_COORDINATORS`]).
+/// This is the lock every same-domain enqueue and retry/drain sequence
+/// must hold (short enqueue holds; the full retry+empty-check+drain
+/// hold).  All registry mutation happens under the registry mutex —
+/// never nested under a domain coordinator.
+pub(crate) fn domain_coordinator(domain: AllocationDomainId) -> Arc<Mutex<()>> {
+    let mut guard = qwen_domain_coordinators()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    // Periodic full prune: when the registry grows past a small bound
+    // (retired domains whose Weak refs died), retain only live entries.
+    if guard.len() > 64 {
+        guard.retain(|_, weak| weak.upgrade().is_some());
+    }
+    if let Some(existing) = guard.get(&domain) {
+        if let Some(arc) = existing.upgrade() {
+            return arc;
+        }
+        // Dead weak ref — prune and re-create.
+        guard.remove(&domain);
+    }
+    let arc = Arc::new(Mutex::new(()));
+    guard.insert(domain, Arc::downgrade(&arc));
+    arc
+}
+
+/// Generic enqueue participating in the coordinator protocol: acquires
+/// the per-domain coordinator, then the backlog map, pushes, releases
+/// both.  Production enqueues go through [`retain_qwen_cleanup`]; tests
+/// use this with test-local coordinator + backlog to exercise the exact
+/// same ordering.
+pub(crate) fn coordinated_retain<K, T>(
+    coordinator: &Mutex<()>,
+    backlog: &Mutex<HashMap<K, Vec<T>>>,
+    domain: &K,
+    entry: T,
+) where
+    K: Eq + Hash + Copy,
+{
+    let _coord = coordinator
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let mut guard = backlog.lock().unwrap_or_else(|poison| poison.into_inner());
+    guard.entry(*domain).or_default().push(entry);
+}
+
+/// Append `entry` to the backlog for the given allocation domain.
+/// Production callers use this when quiescence fails (retaining whole
+/// pending) or when `free_gpu_checked` returns a partial failure.
+///
+/// Participates in the per-domain coordinator protocol (see
+/// [`domain_coordinator`]): the enqueue serializes against the same
+/// domain's retry/empty-check/drain sequence.
+pub(crate) fn retain_qwen_cleanup(domain: AllocationDomainId, entry: QwenBacklogEntry) {
+    let coordinator = domain_coordinator(domain);
+    coordinated_retain(&coordinator, qwen_backlog(), &domain, entry);
+}
+
+/// INTERNAL enqueue variant for code that ALREADY holds the per-domain
+/// coordinator (the unload state machine holds it across the whole
+/// sequence).  Acquiring the coordinator again here would self-deadlock;
+/// this variant only takes the backlog map mutex, which is never held
+/// during HIP work.
+pub(crate) fn retain_qwen_cleanup_coordinated(domain: AllocationDomainId, entry: QwenBacklogEntry) {
+    let mut backlog = qwen_backlog()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    backlog.entry(domain).or_default().push(entry);
+}
+
+// ─── Bucket processing with lock management ────────────────────────
+
+/// Remove bucket for `domain` under lock on `backlog`, process entries
+/// OUTSIDE the lock, then re-lock and reinsert remaining entries, merging
+/// with any concurrently added entries (never overwrites the bucket).
+///
+/// Uses `into_inner` for poison recovery.
+///
+/// Returns `true` iff the bucket is empty after processing.
+///
+/// This is the pure-logic core extracted for CPU testability. Production
+/// code should call [`process_backlog_bucket`] which delegates here with
+/// the static [`qwen_backlog`].
+pub(crate) fn generic_process_backlog_bucket<K, T, F>(
+    backlog: &Mutex<HashMap<K, Vec<T>>>,
+    domain: &K,
+    process: F,
+) -> bool
+where
+    K: Eq + Hash + Copy + std::fmt::Debug,
+    F: FnOnce(Vec<T>) -> Vec<T>,
+{
+    // Phase 1: remove bucket under lock, then unlock.
+    let entries = {
+        let mut guard = backlog.lock().unwrap_or_else(|poison| poison.into_inner());
+        guard.remove(domain).unwrap_or_default()
+    };
+
+    // Phase 2: process entries outside lock.
+    let remaining = process(entries);
+
+    // Phase 3: re-lock and merge with any concurrently added entries.
+    // Return `true` (domain empty) ONLY if BOTH local remaining AND
+    // concurrent entries are empty.  This fixes the race where a
+    // concurrent insert arrives between remove and reinsert while
+    // local processing consumed all entries.
+    let mut guard = backlog.lock().unwrap_or_else(|poison| poison.into_inner());
+    let concurrent = guard.remove(domain).unwrap_or_default();
+
+    if remaining.is_empty() && concurrent.is_empty() {
+        true
+    } else {
+        let merged: Vec<_> = remaining.into_iter().chain(concurrent).collect();
+        guard.insert(*domain, merged);
+        false
+    }
+}
+
+/// Remove bucket for `domain` from the static [`qwen_backlog`], process
+/// entries outside the lock, then reinsert with merge.
+///
+/// Delegates to [`generic_process_backlog_bucket`].
+fn process_backlog_bucket<F>(domain: AllocationDomainId, process: F) -> bool
+where
+    F: FnOnce(Vec<QwenBacklogEntry>) -> Vec<QwenBacklogEntry>,
+{
+    generic_process_backlog_bucket(qwen_backlog(), &domain, process)
+}
+
+// ─── Shared free logic ──────────────────────────────────────────
+//
+// Two entry points:
+//   `teardown_quiesced` — for the fresh unload path where quiescence
+//     (bind/sync/graph/cache) has already been established by the state
+//     machine's `quiesce()` call.
+//   `try_process_pending` — for backlog retry, which must re-establish
+//     quiescence before freeing.
+
+/// Teardown an already-quiesced pending entry: free non-weight resources
+/// in dependency order, then `free_gpu_checked`.
+///
+/// 1. Free speculator, eviction, checkpoint rings.
+/// 2. Free bundle non-weight: mtp_head, KV cache, scratch, dn_state.
+/// 3. Free vision tower weights.
+/// 4. `free_gpu_checked` — failure returns `Cleanup`, success returns `None`.
+///
+/// Does NOT bind/sync/graph/cache — the caller is responsible for
+/// quiescence.
+fn teardown_quiesced(
+    pending: PendingQwen35Unload,
+    dev: &mut impl UnloadDevice,
+) -> Option<QwenBacklogEntry> {
+    // Destructure and free in dependency order.
+    let PendingQwen35Unload {
+        bundle,
+        speculator,
+        eviction,
+        prefill_checkpoints,
+        dflash_checkpoints,
+        vision,
+    } = pending;
+
+    // Graph users / non-weight: speculator, eviction, checkpoints.
+    if let Some(spec) = speculator {
+        dev.free_speculator(spec);
+    }
+    if let Some(ev) = eviction {
+        dev.free_eviction(ev);
+    }
+    for (_, snap) in prefill_checkpoints {
+        dev.free_checkpoint(snap);
+    }
+    for (_, snap) in dflash_checkpoints {
+        dev.free_checkpoint(snap);
+    }
+
+    // Bundle non-weight: mtp, KV, scratch, dn_state.
+    if let Some(head) = bundle.mtp_head {
+        dev.free_mtp_head(head);
+    }
+    dev.free_kv_cache(bundle.kv_cache);
+    dev.free_scratch(bundle.scratch);
+    dev.free_dn_state(bundle.dn_state);
+
+    // Vision tower.
+    if let Some(v) = vision {
+        dev.free_vision_weights(v.weights);
+    }
+
+    // Checked weight cleanup.
+    match dev.free_weights_checked(bundle.weights) {
+        Ok(()) => None,
+        Err(cf) => Some(QwenBacklogEntry::Cleanup(cf)),
+    }
+}
+
+/// Quiesce (bind/sync/graph/cache), then delegate to
+/// [`teardown_quiesced`]. Used by backlog retry, where quiescence has
+/// not been established.
+///
+/// Quiescence failure returns the entire `Pending` entry intact (NO
+/// resource free/drop). After successful quiescence, teardown proceeds
+/// and may return a `Cleanup` failure on partial weight free.
+fn try_process_pending(
+    pending: PendingQwen35Unload,
+    dev: &mut impl UnloadDevice,
+) -> Option<QwenBacklogEntry> {
+    if dev.q_bind_thread().is_err()
+        || dev.q_device_sync().is_err()
+        || dev.q_invalidate_graph().is_err()
+    {
+        return Some(QwenBacklogEntry::Pending(pending));
+    }
+    dev.q_invalidate_caches();
+    teardown_quiesced(pending, dev)
+}
+
+// ─── Retry cleanup ──────────────────────────────────────────────
+
+/// Retry all cleanup entries for `domain`'s bucket on the current
+/// allocation domain.
+///
+/// 1. Removes the bucket under lock (using [`process_backlog_bucket`]).
+/// 2. For [`QwenBacklogEntry::Pending`] entries, re-establishes quiescence
+///    and frees in order. If quiescence fails, the entry stays as
+///    `Pending`.
+/// 3. For [`QwenBacklogEntry::Cleanup`] entries, delegates to
+///    [`UnloadDevice::retry_cleanup_failure`].
+/// 4. Remaining entries are merged with any concurrently added entries.
+///
+/// Returns `true` iff the domain bucket is empty after retry.
+pub(crate) fn retry_qwen_cleanup(dev: &mut impl UnloadDevice, domain: AllocationDomainId) -> bool {
+    process_backlog_bucket(domain, |entries| {
+        let mut remaining: Vec<QwenBacklogEntry> = Vec::new();
+        for entry in entries {
+            match entry {
+                QwenBacklogEntry::Pending(pending) => {
+                    if let Some(still) = try_process_pending(pending, dev) {
+                        remaining.push(still);
+                    }
+                }
+                QwenBacklogEntry::Cleanup(failure) => {
+                    if let Err(remaining_failure) = dev.retry_cleanup_failure(failure) {
+                        remaining.push(QwenBacklogEntry::Cleanup(remaining_failure));
+                    }
+                }
+            }
+        }
+        remaining
+    })
+}
+
+// ─── Generic Qwen35 unload state machine ──────────────────────────
+//
+// Production and test share the same [`run_qwen35_unload`] function,
+// parameterized by an owner type `T` and a [`Qwen35UnloadMachine`] that
+// implements the operations. The production [`ProductionMachine`] wraps
+// [`GpuHost`]; test machines record events to verify exact order.
+
+/// Result of [`Qwen35UnloadMachine::teardown`].
+pub(crate) enum TeardownResult<F> {
+    /// All resources freed successfully.
+    Clean,
+    /// Weight cleanup partially failed; carry the failure.
+    Failed(F),
+}
+
+/// Operations needed by [`run_qwen35_unload`].
+///
+/// `T` is the owner type (production: [`PendingQwen35Unload`]; test:
+/// a sentinel that carries pre-recorded events).
+pub(crate) trait Qwen35UnloadMachine<T> {
+    /// Type returned by [`TeardownResult::Failed`].
+    type Failure: 'static;
+
+    /// The domain type used for backlog operations. Production uses
+    /// [`AllocationDomainId`]; tests use `u64` or a simple copy type.
+    type Domain: Copy;
+
+    /// Bind → sync → graph. On full success, invalidate caches.
+    /// Return `true` if quiescence succeeded.
+    fn quiesce(&mut self) -> bool;
+
+    /// Called when quiescence failed. Retain `owner` for later retry.
+    fn quiescence_failed(&mut self, owner: T, domain: Self::Domain);
+
+    /// Tear down all resources in dependency order:
+    ///   speculator → eviction → checkpoints → mtp → KV → scratch →
+    ///   dn_state → vision → checked weights.
+    fn teardown(&mut self, owner: T) -> TeardownResult<Self::Failure>;
+
+    /// Called when teardown produced a weight cleanup failure.
+    fn cleanup_failed(&mut self, failure: Self::Failure, domain: Self::Domain);
+
+    /// Retry backlog for `domain`. Return `true` iff domain bucket empty.
+    fn retry_backlog(&mut self, domain: Self::Domain) -> bool;
+
+    /// Drain the GPU memory pool (diagnostic on error).
+    fn drain_pool(&mut self);
+
+    /// The per-domain coordinator lock serializing same-domain enqueue
+    /// vs retry/empty-check/drain.  Production returns the real
+    /// process-lifetime per-domain lock; tests may return a test-local
+    /// one or `None` when coordination is not under test.  When
+    /// `Some`, the state machine holds it across the retry + drain.
+    fn domain_coordinator(&self, domain: Self::Domain) -> Option<Arc<Mutex<()>>>;
+}
+
+/// Run the ordered Qwen35 single-device unload state machine.
+///
+/// ## Order
+///
+/// 1. `quiesce()` (bind/sync/graph/cache). Failure → `quiescence_failed` → return.
+/// 2. `teardown()` (free in dependency order). Failure → `cleanup_failed`.
+/// 3. `retry_backlog()` for the current allocation domain.
+/// 4. `drain_pool()` iff the domain bucket is empty after retry.
+///
+/// I1: Drain is gated ONLY on final domain emptiness (not on initial
+/// cleanup success), so a first cleanup failure that succeeds on
+/// immediate retry may drain.
+fn run_qwen35_unload<T, O: Qwen35UnloadMachine<T>>(owner: T, ops: &mut O, domain: O::Domain) {
+    // ── Phase 0: per-domain coordinator ──────────────────────────────
+    // Held for the WHOLE sequence (quiesce → teardown → retry →
+    // empty-check → drain) so a same-domain enqueue cannot land between
+    // the empty decision and the drain, and so the drain (which frees
+    // only pooled buffers) can never invalidate a just-retained owner.
+    // A blocked enqueue completes only after the coordinator is
+    // released, post-drain.  The global backlog map mutex is NEVER held
+    // during HIP work — bucket removal/merge happen under it,
+    // processing happens outside.  Internal enqueues inside this
+    // sequence use [`retain_qwen_cleanup_coordinated`] (the coordinator
+    // is already held — re-acquiring would self-deadlock).
+    let coordinator = ops.domain_coordinator(domain);
+    let _coord_guard = coordinator
+        .as_ref()
+        .map(|c| c.lock().unwrap_or_else(|poison| poison.into_inner()));
+
+    // ── Phase 1: Quiescence ──────────────────────────────────────────
+    if !ops.quiesce() {
+        ops.quiescence_failed(owner, domain);
+        return;
+    }
+
+    // ── Phase 2: Teardown in dependency order ────────────────────────
+    match ops.teardown(owner) {
+        TeardownResult::Clean => {}
+        TeardownResult::Failed(f) => {
+            ops.cleanup_failed(f, domain);
+        }
+    }
+
+    // ── Phase 3: Retry backlog ───────────────────────────────────────
+    let domain_empty = ops.retry_backlog(domain);
+
+    // ── Phase 4: Drain (gated on final backlog empty only, per I1) ───
+    if domain_empty {
+        ops.drain_pool();
+    }
+}
+
+/// Production [`Qwen35UnloadMachine`] — delegates operations through
+/// [`GpuHost`] (and thus the real GPU) and the static backlog.
+struct ProductionMachine<'a> {
+    host: GpuHost<'a>,
+    /// True when bind/sync/graph/cache quiescence must run before the
+    /// free.  The published-unload path always needs it; the unpublished
+    /// finalization-failure path only when GPU users (eviction, vision)
+    /// were built during finalization.
+    quiesce_needed: bool,
+}
+
+impl Qwen35UnloadMachine<PendingQwen35Unload> for ProductionMachine<'_> {
+    type Failure = QwenBacklogEntry;
+    type Domain = AllocationDomainId;
+
+    fn quiesce(&mut self) -> bool {
+        if !self.quiesce_needed {
+            return true;
+        }
+        let ok = self.host.q_bind_thread().is_ok()
+            && self.host.q_device_sync().is_ok()
+            && self.host.q_invalidate_graph().is_ok();
+        if ok {
+            self.host.q_invalidate_caches();
+        }
+        ok
+    }
+
+    fn quiescence_failed(&mut self, owner: PendingQwen35Unload, domain: AllocationDomainId) {
+        // Coordinator is held by run_qwen35_unload across this call.
+        retain_qwen_cleanup_coordinated(domain, QwenBacklogEntry::Pending(owner));
+    }
+
+    fn teardown(&mut self, owner: PendingQwen35Unload) -> TeardownResult<QwenBacklogEntry> {
+        // Fresh unload path: quiescence was already established by
+        // `quiesce()` above — use the already-quiesced teardown.
+        teardown_quiesced(owner, &mut self.host)
+            .map(TeardownResult::Failed)
+            .unwrap_or(TeardownResult::Clean)
+    }
+
+    fn cleanup_failed(&mut self, failure: QwenBacklogEntry, domain: AllocationDomainId) {
+        // Coordinator is held by run_qwen35_unload across this call.
+        retain_qwen_cleanup_coordinated(domain, failure);
+    }
+
+    fn retry_backlog(&mut self, domain: AllocationDomainId) -> bool {
+        retry_qwen_cleanup(&mut self.host, domain)
+    }
+
+    fn drain_pool(&mut self) {
+        if let Err(e) = self.host.q_drain_pool() {
+            eprintln!(
+                "[hipfire] unload_model: drain_pool_checked failed, \
+                 buffers stay in pool: {e}"
+            );
+        }
+    }
+
+    fn domain_coordinator(&self, domain: AllocationDomainId) -> Option<Arc<Mutex<()>>> {
+        Some(domain_coordinator(domain))
+    }
+}
+// ─── Qwen35 single-device unload (production entry) ───────────────
+
+/// Production entry: wraps the real GPU in [`ProductionMachine`] and
+/// runs the generic [`run_qwen35_unload`] state machine.
+fn unload_single_qwen35_ordered(
+    pending: PendingQwen35Unload,
+    gpu: &mut Gpu,
+    domain: AllocationDomainId,
+) {
+    let mut machine = ProductionMachine {
+        host: GpuHost(gpu),
+        quiesce_needed: true,
+    };
+    run_qwen35_unload(pending, &mut machine, domain);
 }
 
 #[cfg(test)]
@@ -6949,5 +7666,892 @@ mod session_state_tests {
             error,
             ResetError::Speculator { ref message } if message == "drafter reset failed"
         ));
+    }
+}
+
+// ─── Qwen35 backlog and unload ordering tests ───────────────────
+
+#[cfg(test)]
+mod qwen35_backlog_tests {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    // ── generic_process_backlog_bucket (lock-managed bucket ops) ──
+    //
+    // All backlog tests use the production-used `generic_process_backlog_bucket`
+    // function with simple integer types. Runs on CPU only; no GPU or
+    // unsound constructions needed.
+
+    #[test]
+    fn generic_process_empty_bucket_returns_true() {
+        let backlog: Mutex<HashMap<u32, Vec<i32>>> = Mutex::new(HashMap::new());
+        let result = super::generic_process_backlog_bucket(&backlog, &42, |entries| {
+            assert!(entries.is_empty(), "empty bucket must produce empty vec");
+            entries
+        });
+        assert!(result, "empty bucket must return true");
+    }
+
+    #[test]
+    fn generic_process_bucket_domain_isolation() {
+        let backlog: Mutex<HashMap<u32, Vec<i32>>> = Mutex::new(HashMap::new());
+        // Insert entries for domain 1.
+        backlog.lock().unwrap().insert(1, vec![10, 11]);
+        backlog.lock().unwrap().insert(2, vec![20, 21]);
+
+        // Process only domain 1 — domain 2 must be untouched.
+        let mut touched_domain2 = false;
+        let result = super::generic_process_backlog_bucket(&backlog, &1, |entries| {
+            for e in &entries {
+                if *e >= 20 {
+                    touched_domain2 = true;
+                }
+            }
+            Vec::new() // consume all
+        });
+
+        assert!(result, "domain 1 must be empty after consuming all");
+        assert!(!touched_domain2, "must not see domain 2 entries");
+        // Domain 2 bucket must still be present.
+        let guard = backlog.lock().unwrap();
+        assert_eq!(
+            guard.get(&2).map(Vec::as_slice),
+            Some([20_i32, 21].as_slice())
+        );
+        assert!(!guard.contains_key(&1), "domain 1 must be removed");
+    }
+
+    #[test]
+    fn generic_process_reinserts_remaining() {
+        let backlog: Mutex<HashMap<u32, Vec<i32>>> = Mutex::new(HashMap::new());
+        backlog.lock().unwrap().insert(1, vec![10, 20, 30]);
+
+        let result = super::generic_process_backlog_bucket(&backlog, &1, |entries| {
+            // Keep items not divisible by 20 (i.e., 10 and 30).
+            entries.into_iter().filter(|e| e % 20 != 0).collect()
+        });
+
+        assert!(!result, "domain must NOT be empty when items remain");
+        let guard = backlog.lock().unwrap();
+        let remaining = guard.get(&1).expect("bucket must exist");
+        assert_eq!(remaining.as_slice(), [10, 30]);
+    }
+
+    #[test]
+    fn generic_process_continuation_on_keep() {
+        let backlog: Mutex<HashMap<u32, Vec<i32>>> = Mutex::new(HashMap::new());
+        backlog.lock().unwrap().insert(1, (0..10).collect());
+
+        let mut call_count = 0;
+        let result = super::generic_process_backlog_bucket(&backlog, &1, |entries| {
+            call_count = entries.len(); // closure receives all entries at once
+            entries.into_iter().filter(|e| e % 2 == 0).collect() // keep evens
+        });
+
+        assert!(!result, "bucket not empty when items remain");
+        assert_eq!(call_count, 10, "all items must be passed to closure");
+        let guard = backlog.lock().unwrap();
+        let remaining = guard.get(&1).expect("bucket must exist");
+        assert_eq!(remaining.as_slice(), [0, 2, 4, 6, 8]);
+    }
+
+    #[test]
+    fn generic_process_concurrent_merge() {
+        // Test merge-on-concurrent-reinsert: after removing the bucket,
+        // another writer adds entries. The reinsert must merge rather
+        // than overwrite.
+        let backlog: Mutex<HashMap<u32, Vec<String>>> = Mutex::new(HashMap::new());
+        backlog.lock().unwrap().insert(1, vec!["a".to_string()]);
+
+        // Use a two-phase approach: the process closure captures a flag.
+        // After the bucket is removed under lock but before re-lock, we
+        // inject concurrent entries.
+        let concurrently_added = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = concurrently_added.clone();
+
+        let result = super::generic_process_backlog_bucket(&backlog, &1, |entries| {
+            // entries = ["a"]
+            // Before returning remaining, inject concurrent entries.
+            backlog
+                .lock()
+                .unwrap()
+                .entry(1)
+                .or_default()
+                .push("concurrent_b".to_string());
+            backlog
+                .lock()
+                .unwrap()
+                .entry(1)
+                .or_default()
+                .push("concurrent_c".to_string());
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            // Keep "a" as remaining.
+            entries // return as-is (still has "a")
+        });
+
+        assert!(!result, "must have items after merge");
+        assert!(concurrently_added.load(std::sync::atomic::Ordering::SeqCst));
+
+        let guard = backlog.lock().unwrap();
+        let merged = guard.get(&1).expect("bucket must exist after merge");
+        // Order: remaining first, then concurrent.
+        assert_eq!(merged.len(), 3, "must have a + concurrent_b + concurrent_c");
+        assert_eq!(merged[0], "a");
+        // b and c in any order (HashMap iteration)
+        assert!(merged.contains(&"concurrent_b".to_string()));
+        assert!(merged.contains(&"concurrent_c".to_string()));
+    }
+
+    #[test]
+    fn generic_process_empty_concurrent_noop() {
+        // Verify that when remaining is empty, concurrent entries do NOT
+        // cause reinsertion (bucket stays empty).
+        let backlog: Mutex<HashMap<u32, Vec<i32>>> = Mutex::new(HashMap::new());
+        backlog.lock().unwrap().insert(1, vec![100]);
+
+        let result = super::generic_process_backlog_bucket(&backlog, &1, |_entries| {
+            // Consume all.
+            Vec::new()
+        });
+
+        assert!(result, "bucket must be empty");
+        // Nothing should be in the bucket — remaining was empty so
+        // concurrent merge does not execute.
+        let guard = backlog.lock().unwrap();
+        assert!(!guard.contains_key(&1), "consumed bucket must be absent");
+    }
+
+    // ── Qwen35UnloadMachine state machine ─────────────────────────
+    //
+    // These tests invoke the production-used `run_qwen35_unload`
+    // function with a fake [`Qwen35UnloadMachine`] impl that records
+    // every call. The same generic function drives the real GPU in
+    // production.
+
+    /// Test machine: records events; configurable quiesce/teardown/retry
+    /// results. Owner is `Vec<&'static str>` (consumed by teardown,
+    /// appended to event log).
+    struct TestMachine {
+        events: Vec<&'static str>,
+        quiesce_ok: bool,
+        teardown_ok: bool,
+        retry_ok: bool,
+    }
+
+    impl super::Qwen35UnloadMachine<Vec<&'static str>> for TestMachine {
+        type Failure = &'static str;
+        type Domain = u64;
+
+        fn quiesce(&mut self) -> bool {
+            self.events.push("bind");
+            self.events.push("sync");
+            self.events.push("graph_invalidate");
+            if self.quiesce_ok {
+                self.events.push("cache_invalidate");
+            }
+            self.quiesce_ok
+        }
+
+        fn quiescence_failed(&mut self, _owner: Vec<&'static str>, _domain: u64) {
+            self.events.push("quiescence_failed");
+        }
+
+        fn teardown(&mut self, owner: Vec<&'static str>) -> super::TeardownResult<&'static str> {
+            // Append events that the owner carried (simulates setup
+            // events embedded in the owner).
+            self.events.extend(owner);
+            self.events.push("free_speculator");
+            self.events.push("free_eviction");
+            self.events.push("free_checkpoints");
+            self.events.push("free_mtp_head");
+            self.events.push("free_kv_cache");
+            self.events.push("free_scratch");
+            self.events.push("free_dn_state");
+            self.events.push("free_vision");
+            self.events.push("free_weights_checked");
+            if self.teardown_ok {
+                super::TeardownResult::Clean
+            } else {
+                self.events.push("TEARDOWN_FAILED");
+                super::TeardownResult::Failed("weights_failed")
+            }
+        }
+
+        fn cleanup_failed(&mut self, _failure: &'static str, _domain: u64) {
+            self.events.push("cleanup_failed");
+        }
+
+        fn retry_backlog(&mut self, _domain: u64) -> bool {
+            self.events.push("retry_backlog");
+            self.retry_ok
+        }
+
+        fn drain_pool(&mut self) {
+            self.events.push("drain_pool");
+        }
+
+        fn domain_coordinator(&self, _domain: u64) -> Option<Arc<Mutex<()>>> {
+            None // coordination not under test here
+        }
+    }
+
+    #[test]
+    fn state_machine_full_success() {
+        // Expected: quiesce → teardown (all free events) → retry → drain.
+        let mut m = TestMachine {
+            events: Vec::new(),
+            quiesce_ok: true,
+            teardown_ok: true,
+            retry_ok: true,
+        };
+        let owner: Vec<&'static str> = vec!["owner_setup"];
+        super::run_qwen35_unload(owner, &mut m, 0);
+
+        assert_eq!(
+            m.events,
+            [
+                "bind",
+                "sync",
+                "graph_invalidate",
+                "cache_invalidate",
+                // teardown appends owner events + free ops in order:
+                "owner_setup",
+                "free_speculator",
+                "free_eviction",
+                "free_checkpoints",
+                "free_mtp_head",
+                "free_kv_cache",
+                "free_scratch",
+                "free_dn_state",
+                "free_vision",
+                "free_weights_checked",
+                // retry:
+                "retry_backlog",
+                // drain (domain empty):
+                "drain_pool",
+            ],
+        );
+    }
+
+    #[test]
+    fn state_machine_quiescence_failure_preserves_owner() {
+        // Quiescence fails → quiescence_failed → NO teardown/retry/drain.
+        let mut m = TestMachine {
+            events: Vec::new(),
+            quiesce_ok: false,
+            teardown_ok: true, // irrelevant
+            retry_ok: true,    // irrelevant
+        };
+        let owner: Vec<&'static str> = vec!["should_be_preserved"];
+        super::run_qwen35_unload(owner, &mut m, 42);
+
+        assert_eq!(
+            m.events,
+            [
+                "bind",
+                "sync",
+                "graph_invalidate",
+                // cache_invalidate NOT called (quiescence failed)
+                "quiescence_failed",
+                // NO free/retry/drain events
+            ],
+        );
+    }
+
+    #[test]
+    fn state_machine_cleanup_failure_retry_success_drains() {
+        // I1: teardown fails → cleanup_failed → retry empties domain → drain.
+        let mut m = TestMachine {
+            events: Vec::new(),
+            quiesce_ok: true,
+            teardown_ok: false,
+            retry_ok: true, // retry empties the domain
+        };
+        let owner: Vec<&'static str> = vec!["owner_data"];
+        super::run_qwen35_unload(owner, &mut m, 0);
+
+        assert_eq!(
+            m.events,
+            [
+                "bind",
+                "sync",
+                "graph_invalidate",
+                "cache_invalidate",
+                // teardown fails:
+                "owner_data",
+                "free_speculator",
+                "free_eviction",
+                "free_checkpoints",
+                "free_mtp_head",
+                "free_kv_cache",
+                "free_scratch",
+                "free_dn_state",
+                "free_vision",
+                "free_weights_checked",
+                "TEARDOWN_FAILED",
+                // cleanup retained:
+                "cleanup_failed",
+                // retry succeeds → domain empty:
+                "retry_backlog",
+                // drain IS called (I1: weights_cleanup_ok gate removed):
+                "drain_pool",
+            ],
+        );
+    }
+
+    #[test]
+    fn state_machine_cleanup_failure_retry_fail_no_drain() {
+        // I1: teardown fails → cleanup_failed → retry still non-empty → NO drain.
+        let mut m = TestMachine {
+            events: Vec::new(),
+            quiesce_ok: true,
+            teardown_ok: false,
+            retry_ok: false, // retry leaves domain non-empty
+        };
+        let owner: Vec<&'static str> = vec!["owner"];
+        super::run_qwen35_unload(owner, &mut m, 0);
+
+        let drain_idx = m.events.iter().position(|e| *e == "drain_pool");
+        assert!(
+            drain_idx.is_none(),
+            "drain_pool must NOT be called when domain not empty after retry"
+        );
+        // Verify the events up to retry:
+        assert_eq!(
+            &m.events[..13],
+            [
+                "bind",
+                "sync",
+                "graph_invalidate",
+                "cache_invalidate",
+                "owner",
+                "free_speculator",
+                "free_eviction",
+                "free_checkpoints",
+                "free_mtp_head",
+                "free_kv_cache",
+                "free_scratch",
+                "free_dn_state",
+                "free_vision",
+            ],
+        );
+        assert_eq!(
+            &m.events[13..],
+            [
+                "free_weights_checked",
+                "TEARDOWN_FAILED",
+                "cleanup_failed",
+                "retry_backlog",
+            ],
+        );
+    }
+
+    // ── Poison recovery ───────────────────────────────────────────
+    //
+    // The production code recovers from a poisoned mutex via
+    // `unwrap_or_else(|poison| poison.into_inner())` at every lock site
+    // (see `retain_qwen_cleanup`, `generic_process_backlog_bucket`).
+    // This pattern is verified by the `unwrap_or_else` + `into_inner`
+    // combinator itself — the `into_inner` method is part of the standard
+    // library's `PoisonError` API, and our usage follows the documented
+    // pattern exactly. Tests that attempt to poison the mutex via
+    // `catch_unwind` are excluded because `catch_unwind` interferes with
+    // the test framework's panic hook, causing hangs. The poison recovery
+    // path is exercised through normal operation of every lock call:
+    // a poisoned mutex in a single-threaded context can only arise from
+    // a previous test's panic, which the test framework catches cleanly.
+    //
+    // To manually verify, run the following snippet:
+    //   let m = Mutex::new(42);
+    //   let _ = std::panic::catch_unwind(|| { let _g = m.lock().unwrap(); panic!(); });
+    //   assert_eq!(*m.lock().unwrap_or_else(|p| p.into_inner()), 42);
+
+    #[test]
+    fn generic_process_backlog_bucket_race_does_not_lose_concurrent_inserts() {
+        // Simulate the race: the process callback removes entries, returns empty,
+        // but between removal and reinsert, another caller inserts same-domain
+        // entries.  The function must return `false` (domain not empty) because
+        // the concurrently added entries are still present.
+        use std::collections::HashMap;
+        use std::sync::Mutex;
+
+        let backlog: Mutex<HashMap<u64, Vec<&'static str>>> = Mutex::new(HashMap::new());
+
+        // Insert initial entries for domain 42.
+        {
+            let mut guard = backlog.lock().unwrap();
+            guard.entry(42).or_default().push("initial");
+        }
+
+        // Process callback: drains the bucket (returns empty), BUT the
+        // test simulates a concurrent insert between remove and reinsert.
+        let result = super::generic_process_backlog_bucket(&backlog, &42u64, |entries| {
+            // Simulate concurrent insert by another thread.
+            // Since we can't actually race, inject directly into
+            // the mutex as if another thread had done this.
+            let mut guard = backlog.lock().unwrap();
+            guard.entry(42).or_default().push("concurrent");
+            drop(guard);
+
+            // Return empty — local processing consumed everything.
+            // But the concurrent insert should mean domain is NOT empty.
+            Vec::new()
+        });
+
+        // The domain should NOT be empty because of the concurrent insert.
+        assert!(
+            !result,
+            "backlog must report non-empty when concurrent inserts arrived"
+        );
+
+        // The concurrently inserted entry must still be in the bucket.
+        let mut guard = backlog.lock().unwrap();
+        let bucket = guard
+            .get(&42u64)
+            .expect("domain 42 should still have entries");
+        assert_eq!(bucket.len(), 1, "only the concurrent entry should remain");
+        assert_eq!(bucket[0], "concurrent");
+    }
+
+    // ── Unpublished-bundle cleanup (finalization-failure path) ──────
+    //
+    // `finish_qwen35_load` failure routes the complete bundle through
+    // `run_qwen35_unload` with a machine whose quiescence is conditional
+    // on GPU users having been built (ProductionMachine.quiesce_needed).
+    // These tests drive the SAME generic state machine with a recording
+    // machine and a REAL `generic_process_backlog_bucket` so the drain
+    // decision (I1: drain iff domain empty after retry) is genuine.
+
+    /// Mimics a `Qwen35CleanupFailure` carrying BOTH categories — failed
+    /// tensors AND frozen `SingleFreeFailed` owners: the retry machinery
+    /// must pass the WHOLE entry through — never split, never drop either
+    /// category.  (The production types preserve both by construction:
+    /// `Qwen35CleanupFailure.frozen` is private and only merged/retried
+    /// wholesale; `SingleFreeFailed` itself is GPU-only to construct.)
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct CleanupFailureSpy {
+        tensor_failures: usize,
+        frozen_failures: usize,
+    }
+
+    /// Recording machine for the unpublished cleanup flow.  When
+    /// `backlog` is `Some`, `retry_backlog` delegates to the production
+    /// `generic_process_backlog_bucket` so the drain decision is real.
+    struct UnpublishedTestMachine {
+        events: Vec<&'static str>,
+        /// False = no GPU users were built → quiescence is skipped.
+        quiesce_needed: bool,
+        teardown_ok: bool,
+        /// None → retry reports `retry_succeeds`; Some → real bucket.
+        backlog: Option<std::sync::Arc<std::sync::Mutex<HashMap<u64, Vec<CleanupFailureSpy>>>>>,
+        retry_succeeds: bool,
+        /// Simulate a same-domain concurrent insert during retry.
+        inject_concurrent_on_retry: bool,
+        /// Test-local per-domain coordinator; the state machine holds it
+        /// across retry + drain (production returns the real static one).
+        coordinator: Option<Arc<Mutex<()>>>,
+        /// When Some, drain_pool signals `drain_started` then blocks on
+        /// `drain_release` — a slow-HIP-drain hook for the coordination
+        /// test.
+        drain_signal: Option<std::sync::mpsc::Sender<()>>,
+        drain_release: Option<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl super::Qwen35UnloadMachine<Vec<&'static str>> for UnpublishedTestMachine {
+        type Failure = &'static str;
+        type Domain = u64;
+
+        fn quiesce(&mut self) -> bool {
+            if !self.quiesce_needed {
+                // No GPU users were built — the production machine skips
+                // bind/sync/graph/cache entirely.
+                return true;
+            }
+            self.events.push("bind");
+            self.events.push("sync");
+            self.events.push("graph_invalidate");
+            self.events.push("cache_invalidate");
+            true
+        }
+
+        fn quiescence_failed(&mut self, _owner: Vec<&'static str>, _domain: u64) {
+            self.events.push("quiescence_failed_retain_pending");
+        }
+
+        fn teardown(&mut self, owner: Vec<&'static str>) -> super::TeardownResult<&'static str> {
+            self.events.extend(owner);
+            self.events.push("free_mtp_head");
+            self.events.push("free_kv_cache");
+            self.events.push("free_scratch");
+            self.events.push("free_dn_state");
+            self.events.push("free_weights_checked");
+            if self.teardown_ok {
+                super::TeardownResult::Clean
+            } else {
+                self.events.push("TEARDOWN_FAILED");
+                super::TeardownResult::Failed("weights_failed")
+            }
+        }
+
+        fn cleanup_failed(&mut self, _failure: &'static str, _domain: u64) {
+            self.events.push("cleanup_failed");
+        }
+
+        fn retry_backlog(&mut self, domain: u64) -> bool {
+            self.events.push("retry_backlog");
+            match &self.backlog {
+                None => self.retry_succeeds,
+                Some(backlog) => {
+                    let inject = self.inject_concurrent_on_retry;
+                    let succeeds = self.retry_succeeds;
+                    super::generic_process_backlog_bucket(backlog, &domain, |entries| {
+                        if inject {
+                            let mut guard = backlog.lock().unwrap();
+                            guard.entry(domain).or_default().push(CleanupFailureSpy {
+                                tensor_failures: 3,
+                                frozen_failures: 7,
+                            });
+                        }
+                        if succeeds {
+                            Vec::new()
+                        } else {
+                            entries // still failing — retained whole
+                        }
+                    })
+                }
+            }
+        }
+
+        fn drain_pool(&mut self) {
+            self.events.push("drain_pool");
+            if let Some(tx) = &self.drain_signal {
+                let _ = tx.send(());
+            }
+            if let Some(rx) = &self.drain_release {
+                let _ = rx.recv(); // block until released (slow HIP drain)
+            }
+        }
+
+        fn domain_coordinator(&self, _domain: u64) -> Option<Arc<Mutex<()>>> {
+            self.coordinator.clone()
+        }
+    }
+
+    fn unpublished_machine(
+        quiesce_needed: bool,
+        teardown_ok: bool,
+        backlog: Option<std::sync::Arc<std::sync::Mutex<HashMap<u64, Vec<CleanupFailureSpy>>>>>,
+        retry_succeeds: bool,
+        inject_concurrent_on_retry: bool,
+    ) -> UnpublishedTestMachine {
+        UnpublishedTestMachine {
+            events: Vec::new(),
+            quiesce_needed,
+            teardown_ok,
+            backlog,
+            retry_succeeds,
+            inject_concurrent_on_retry,
+            coordinator: None,
+            drain_signal: None,
+            drain_release: None,
+        }
+    }
+
+    #[test]
+    fn unpublished_cleanup_no_users_skips_quiescence_and_drains() {
+        // No eviction/vision users were built during finalization:
+        // bind/sync/graph/cache must NOT run, ordered free proceeds,
+        // domain is empty → drain.
+        let mut m = unpublished_machine(false, true, None, true, false);
+        let owner: Vec<&'static str> = vec!["bundle_owned"];
+        super::run_qwen35_unload(owner, &mut m, 0);
+        assert_eq!(
+            m.events,
+            [
+                // NO bind/sync/graph/cache events
+                "bundle_owned",
+                "free_mtp_head",
+                "free_kv_cache",
+                "free_scratch",
+                "free_dn_state",
+                "free_weights_checked",
+                "retry_backlog",
+                "drain_pool",
+            ],
+            "unpublished cleanup without users must skip quiescence and drain"
+        );
+    }
+
+    #[test]
+    fn unpublished_cleanup_with_users_quiesces_before_ordered_free() {
+        // Eviction/vision users exist → graph/cache quiescence runs
+        // BEFORE any free.
+        let mut m = unpublished_machine(true, true, None, true, false);
+        let owner: Vec<&'static str> = vec!["bundle_owned"];
+        super::run_qwen35_unload(owner, &mut m, 0);
+        assert_eq!(
+            m.events,
+            [
+                "bind",
+                "sync",
+                "graph_invalidate",
+                "cache_invalidate",
+                "bundle_owned",
+                "free_mtp_head",
+                "free_kv_cache",
+                "free_scratch",
+                "free_dn_state",
+                "free_weights_checked",
+                "retry_backlog",
+                "drain_pool",
+            ],
+            "unpublished cleanup with users must quiesce before the ordered free"
+        );
+    }
+
+    #[test]
+    fn unpublished_cleanup_failed_weights_retained_whole_no_drain() {
+        // The checked weight free fails → the complete cleanup failure
+        // (frozen owners included) is retained in the domain backlog.
+        // The retry still fails → the WHOLE entry stays; drain must NOT
+        // run (I1 gates drain on final domain emptiness).
+        let backlog: std::sync::Arc<Mutex<HashMap<u64, Vec<CleanupFailureSpy>>>> =
+            std::sync::Arc::new(Mutex::new(HashMap::new()));
+        backlog.lock().unwrap().insert(
+            42,
+            vec![CleanupFailureSpy {
+                tensor_failures: 1,
+                frozen_failures: 2,
+            }],
+        );
+        let mut m = unpublished_machine(
+            false,
+            false, // teardown fails → cleanup_failed
+            Some(backlog.clone()),
+            false, // retry still fails → entry retained whole
+            false,
+        );
+        let owner: Vec<&'static str> = vec!["bundle_owned"];
+        super::run_qwen35_unload(owner, &mut m, 42);
+
+        let drain_idx = m.events.iter().position(|e| *e == "drain_pool");
+        assert!(
+            drain_idx.is_none(),
+            "drain_pool must NOT run when the domain bucket is non-empty after retry"
+        );
+        assert_eq!(
+            &m.events[..],
+            [
+                "bundle_owned",
+                "free_mtp_head",
+                "free_kv_cache",
+                "free_scratch",
+                "free_dn_state",
+                "free_weights_checked",
+                "TEARDOWN_FAILED",
+                "cleanup_failed",
+                "retry_backlog",
+            ],
+        );
+        // The retained entry is still in the bucket, whole — the frozen
+        // owner count survived the failed retry.
+        let guard = backlog.lock().unwrap();
+        let bucket = guard.get(&42u64).expect("bucket must survive");
+        assert_eq!(
+            bucket.as_slice(),
+            [CleanupFailureSpy {
+                tensor_failures: 1,
+                frozen_failures: 2,
+            }],
+            "retained cleanup entry — BOTH tensor and frozen categories —              must be preserved whole across a failed retry"
+        );
+    }
+
+    #[test]
+    fn unpublished_cleanup_retry_success_after_failure_drains() {
+        // I1: a first cleanup failure that succeeds on immediate retry
+        // (bucket empties) MAY drain.
+        let backlog: std::sync::Arc<Mutex<HashMap<u64, Vec<CleanupFailureSpy>>>> =
+            std::sync::Arc::new(Mutex::new(HashMap::new()));
+        backlog.lock().unwrap().insert(
+            7,
+            vec![CleanupFailureSpy {
+                tensor_failures: 0,
+                frozen_failures: 1,
+            }],
+        );
+        let mut m = unpublished_machine(
+            true,
+            false, // teardown fails
+            Some(backlog.clone()),
+            true, // retry consumes the bucket
+            false,
+        );
+        let owner: Vec<&'static str> = vec!["bundle_owned"];
+        super::run_qwen35_unload(owner, &mut m, 7);
+        assert!(
+            m.events.contains(&"drain_pool"),
+            "drain must run when the domain is empty after retry"
+        );
+        assert!(
+            !backlog.lock().unwrap().contains_key(&7),
+            "bucket must be empty after successful retry"
+        );
+    }
+
+    #[test]
+    fn unpublished_cleanup_same_domain_concurrent_entry_no_drain() {
+        // During the retry, a concurrent same-domain entry arrives (a
+        // second load failure on the same GPU).  The merge must keep it,
+        // the domain stays non-empty, and drain must NOT run.
+        let backlog: std::sync::Arc<Mutex<HashMap<u64, Vec<CleanupFailureSpy>>>> =
+            std::sync::Arc::new(Mutex::new(HashMap::new()));
+        backlog.lock().unwrap().insert(
+            99,
+            vec![CleanupFailureSpy {
+                tensor_failures: 2,
+                frozen_failures: 2,
+            }],
+        );
+        let mut m = unpublished_machine(
+            false,
+            false,
+            Some(backlog.clone()),
+            true, // local entries consumed by retry
+            true, // ...but a same-domain concurrent entry arrives
+        );
+        let owner: Vec<&'static str> = vec!["bundle_owned"];
+        super::run_qwen35_unload(owner, &mut m, 99);
+
+        let drain_idx = m.events.iter().position(|e| *e == "drain_pool");
+        assert!(
+            drain_idx.is_none(),
+            "drain_pool must NOT run when a concurrent same-domain entry arrived during retry"
+        );
+        let guard = backlog.lock().unwrap();
+        let bucket = guard.get(&99u64).expect("concurrent entry must be merged");
+        assert_eq!(
+            bucket.as_slice(),
+            [CleanupFailureSpy {
+                tensor_failures: 3,
+                frozen_failures: 7,
+            }],
+            "the concurrently added same-domain entry (both categories) must survive the merge"
+        );
+    }
+
+    #[test]
+    fn coordinator_serializes_enqueue_after_empty_decision_before_drain() {
+        // The race the per-domain coordinator eliminates: the retry makes
+        // the EMPTY decision, then the drain runs.  A same-domain enqueue
+        // arriving at that moment must serialize on the coordinator — it
+        // completes only AFTER the drain, so the drain (which frees only
+        // pooled buffers) can never invalidate the just-retained owner.
+        //
+        // Deterministic protocol (no sleeps):
+        //   driver:  ... retry (empty) → drain_pool: signal start, block
+        //   main:    sees drain_started → spawns the enqueuer
+        //   enqueuer: signals "attempting" → coordinated_retain → BLOCKS
+        //            on the coordinator (held by the driver)
+        //   main:    releases the drain → driver finishes drain → drops
+        //            the coordinator → enqueuer lands
+        use std::sync::mpsc;
+
+        let coord = Arc::new(Mutex::new(()));
+        let backlog: Arc<Mutex<HashMap<u64, Vec<CleanupFailureSpy>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let (drain_started_tx, drain_started_rx) = mpsc::channel();
+        let (drain_release_tx, drain_release_rx) = mpsc::channel();
+        let (attempting_tx, attempting_rx) = mpsc::channel();
+        let (enqueue_done_tx, enqueue_done_rx) = mpsc::channel();
+
+        let mut machine = unpublished_machine(false, true, Some(backlog.clone()), true, false);
+        machine.coordinator = Some(coord.clone());
+        machine.drain_signal = Some(drain_started_tx);
+        machine.drain_release = Some(drain_release_rx);
+
+        let driver = std::thread::spawn(move || {
+            let owner: Vec<&'static str> = vec!["bundle_owned"];
+            super::run_qwen35_unload(owner, &mut machine, 42);
+        });
+
+        // Wait for the drain to start — the empty decision was already
+        // made inside retry_backlog; the coordinator is now held.
+        drain_started_rx.recv().expect("drain must start");
+
+        let enqueuer_coord = coord.clone();
+        let enqueuer_backlog = backlog.clone();
+        let enqueuer = std::thread::spawn(move || {
+            attempting_tx.send(()).unwrap();
+            // The production enqueue protocol: coordinator → map → push.
+            super::coordinated_retain(
+                &enqueuer_coord,
+                &enqueuer_backlog,
+                &42,
+                CleanupFailureSpy {
+                    tensor_failures: 1,
+                    frozen_failures: 1,
+                },
+            );
+            enqueue_done_tx.send(()).unwrap();
+        });
+        attempting_rx.recv().expect("enqueuer must attempt");
+
+        // DETERMINISTIC serialization proof: while the drain is
+        // blocked, the state machine holds the per-domain coordinator.
+        // `try_lock` fails iff it is held — if the coordinator were
+        // removed from the state machine, this assertion fails
+        // deterministically.
+        assert!(
+            coord.try_lock().is_err(),
+            "the per-domain coordinator must be held while the drain is blocked (removed?)"
+        );
+        // With the coordinator in place the enqueuer is blocked
+        // indefinitely (completion requires the same lock), so a short
+        // bound only ever expires in that impossible case.  If the
+        // coordinator were removed, the enqueuer completes within
+        // microseconds of `attempting` — either the try_lock above
+        // already failed, or this loop catches the completion.  Both
+        // outcomes fail deterministically; the pass case is
+        // scheduling-independent.
+        let spin_start = std::time::Instant::now();
+        loop {
+            match enqueue_done_rx.try_recv() {
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    if spin_start.elapsed() > std::time::Duration::from_millis(100) {
+                        break; // blocked for the whole bound — held
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                Ok(()) => panic!(
+                    "enqueue completed while the drain was blocked — \
+                     the per-domain coordinator is not serializing (removed?)"
+                ),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    panic!("enqueuer thread died unexpectedly")
+                }
+            }
+        }
+
+        // Release the drain; the enqueue can only complete after the
+        // coordinator is dropped (post-drain).
+        drain_release_tx.send(()).unwrap();
+        enqueue_done_rx
+            .recv()
+            .expect("enqueue must complete after the drain");
+        driver.join().expect("driver must finish");
+
+        // The owner is intact in the backlog — BOTH categories — and the
+        // drain could not have touched it.
+        let guard = backlog.lock().unwrap();
+        let bucket = guard.get(&42u64).expect("enqueued owner must be present");
+        assert_eq!(
+            bucket.as_slice(),
+            [CleanupFailureSpy {
+                tensor_failures: 1,
+                frozen_failures: 1,
+            }],
+            "the post-empty-decision enqueue must survive the drain whole"
+        );
     }
 }

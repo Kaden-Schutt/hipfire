@@ -293,3 +293,14 @@ pub fn build_deepseek4_dspark_speculator(
         supports_temp,
     ))
 }
+
+// ── Send-bound assertions ──────────────────────────────────────────────
+#[cfg(test)]
+mod send_assertions {
+    fn _assert_send<T: Send>() {}
+
+    #[test]
+    fn deepseek4_dspark_body_is_send() {
+        _assert_send::<super::Deepseek4DsparkBody>();
+    }
+}

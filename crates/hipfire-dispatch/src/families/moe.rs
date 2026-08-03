@@ -183,6 +183,15 @@ pub struct MoeDtypes {
     /// Drives the merged dtype-tag-branched gate_up AND down decode kernels.
     pub routed_has_mixed_experts: bool,
     pub has_paro_shared: bool, // ffn.paro_shared.is_some()
+    /// True when any gate-side projection (router, shared_expert_gate/scalar,
+    /// shared gate, shared up) carries an AWQ companion.  When true the fused
+    /// gate kernel is disabled — each weight uses its individual WeightRef path
+    /// which applies the per-weight AWQ scale.
+    pub gate_side_has_awq: bool,
+    /// True when the routed-down projection carries per-expert AWQ companion
+    /// scales.  When true the batched prefill Path 2 (grouped-GEMM) is disabled;
+    /// Path 0/1 (indexed GEMV, per-token fallback) remain eligible.
+    pub routed_down_has_awq: bool,
     /// Per-expert gate_up tiers for intra-layer mixed-tier dispatch. `None`
     /// (default) ⇒ today's uniform path (representative `routed_gate_up` drives
     /// resolution). `Some(table)` with >1 distinct DType marks the layer
@@ -227,6 +236,12 @@ pub struct MoeResolution {
     /// gfx9* has no MQ6 down arm; eval scores per-token = decode).
     pub routed_indexable_mixed_gu4_dn6: bool,
     pub routed_indexable_paro: bool,
+    /// Uniform all-MFP4G32E8 routed experts on the RDNA3 wave32-WMMA family
+    /// (`arch_has_e8_wmma`).  Indexable on the decode GPU-top-K path via the
+    /// E8 indexed/grouped MoE GEMV kernels.  Arch-agnostic `resolve()` never
+    /// admits E8 (`arch_has_e8_wmma=false`); `resolve_arch` with a wave32-WMMA
+    /// arch does.
+    pub routed_indexable_e8: bool,
     /// Uniform all-MQ2-Lloyd routed experts (gate_up == down == MQ2G256Lloyd).
     /// Reuses the ds4/minimax indexed Lloyd MoE GEMVs on the decode GPU-top-K
     /// path: gate_up uses the MQ2-Lloyd indexed GEMV, down uses the MQ2-Lloyd
@@ -265,12 +280,18 @@ impl MoeResolution {
         // kernel (fused_qkvza_hfq4g256 on one rotated xr) is applicable. This is
         // INDEPENDENT of the routed-expert dtype (all MQ-family share the same
         // FwhtG256 rotation), so it can fire on graded files too (redline mq4r).
-        let gate_fusable = d.router == MQ4G256
+        // When any gate-side projection carries an AWQ companion, the fused gate
+        // kernel is disabled — each weight uses its individual WeightRef path
+        // which applies the per-weight AWQ scale.
+        let dtypes_all_mq4 = d.router == MQ4G256
             && d.shared_gate == MQ4G256
             && d.shared_expert_gate == MQ4G256
             && d.shared_expert_up == MQ4G256;
+        let gate_fusable = dtypes_all_mq4 && !d.gate_side_has_awq;
         // gate_side_mq4 keeps the stricter all-MQ4 meaning (incl. routed experts)
         // for the rotate/AWQ branch + callers that assume a uniform-MQ4 FFN.
+        // Gate-side AWQ also disables gate_side_mq4 (the fused rotate+gemv path
+        // cannot interleave AWQ divides).
         let gate_side_mq4 = gate_fusable && d.experts_all_gate_up_mq4;
 
         let routed_gate_up_mq4 = d.routed_gate_up == MQ4G256;
@@ -293,15 +314,14 @@ impl MoeResolution {
         // truth). gate_up stays uniform MQ4, so it pairs with the MQ4 indexed
         // gate_up GEMV; the merged dtype-tag kernel serves the down step.
         let routed_indexable_mixed_per_expert = d.routed_has_mixed_experts;
-        // mfp4/mfp3/mfp2-E8 grouped experts (RDNA3 wave32-WMMA): uniform E8-family
-        // gate_up + down → the gemv_mfp4g32_e8_moe_{gate_up,down}_k8_indexed kernels
-        // (for uniform E8 models). FWHT-rotated (FwhtG256), same as MQ4, so the
-        // shared silu+mul+rotate plumbing applies. Graded mixed-E8 uses the tag-table
-        // path (routed_indexable_mixed_per_expert) rather than this uniform arm.
-        let routed_gate_up_e8 = matches!(d.routed_gate_up, MFP4G32E8 | MFP3G32E8 | MFP2G32E8);
-        let routed_indexable_e8 = arch_has_e8_wmma
-            && routed_gate_up_e8
-            && matches!(d.routed_down, MFP4G32E8 | MFP3G32E8 | MFP2G32E8);
+        // MFP4G32E8 grouped experts (RDNA3 wave32-WMMA): the
+        // gemv_mfp4g32_e8_moe_{gate_up,down}_k8_indexed kernels exist for MFP4G32E8
+        // ONLY. MFP3G32E8 and MFP2G32E8 have no indexed MoE decode path and are
+        // rejected at the dtype-pair level (fallible_dtype_tag) and here.
+        // FWHT-rotated (FwhtG256), same as MQ4, so shared silu+mul+rotate applies.
+        let routed_gate_up_e8 = d.routed_gate_up == MFP4G32E8;
+        let routed_indexable_e8 =
+            arch_has_e8_wmma && routed_gate_up_e8 && d.routed_down == MFP4G32E8;
 
         let routed_dtype_indexable = routed_indexable_mq4
             || routed_indexable_mq5
@@ -347,6 +367,7 @@ impl MoeResolution {
             routed_indexable_mq3lloyd,
             routed_indexable_mixed_per_expert,
             routed_indexable_paro,
+            routed_indexable_e8,
             use_gpu_topk,
             needs_x_rot_local,
             mixed,
@@ -362,6 +383,7 @@ impl MoeResolution {
             || self.routed_indexable_mq2lloyd
             || self.routed_indexable_mq3lloyd
             || self.routed_indexable_paro
+            || self.routed_indexable_e8
     }
 }
 
@@ -743,6 +765,11 @@ impl MoePrefillResolution {
         let is_gfx1151 = arch.is_gfx1151();
         let use_paro_i8 = paro_mode && use_path2 && is_gfx1151 && flags.moe_paro_i8.unwrap_or(true);
         let use_paro_i8_k8 = use_paro_i8 && flags.moe_paro_i8_k8.unwrap_or(true);
+        // Routed-down AWQ suppresses Path 2 (grouped-GEMM): the AWQ divide
+        // must interleave per-expert silu+rotate, which the grouped hot-path
+        // does not support.  Path 0/1 (indexed GEMV paths) remain eligible.
+        let use_path2 = use_path2 && !d.routed_down_has_awq;
+
         let force_mq4_grouped_fp16 =
             use_path2 && is_gfx1151 && d.has_mq6_projection() && flags.moe_grouped_i8.is_none();
         Self {
@@ -1708,6 +1735,8 @@ mod tests {
             routed_down: DType::MQ4G256,
             routed_has_mixed_experts: false,
             has_paro_shared: false,
+            gate_side_has_awq: false,
+            routed_down_has_awq: false,
             per_expert_gate_up: None,
             per_expert_down: None,
         }

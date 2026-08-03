@@ -142,6 +142,8 @@ fn mq4_dtypes() -> MoeDtypes {
         routed_down: DType::MQ4G256,
         routed_has_mixed_experts: false,
         has_paro_shared: false,
+        gate_side_has_awq: false,
+        routed_down_has_awq: false,
         per_expert_gate_up: None,
         per_expert_down: None,
     }

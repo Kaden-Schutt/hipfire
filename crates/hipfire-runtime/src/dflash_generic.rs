@@ -85,6 +85,9 @@ pub enum GenericDflashConstructionStage {
     DsparkAllocation(usize),
     AwqScaleUpload(usize),
     F32KvAllocation(usize),
+    /// Fault injection for Qwen auxiliary construction (DeltaNet,
+    /// scratch, bundle build transaction staging).
+    QwenAuxAllocation(usize),
 }
 
 #[cfg(feature = "dflash-fault-inject")]
@@ -103,6 +106,7 @@ impl GenericDflashConstructionStage {
             Self::DsparkAllocation(_) => "DSpark allocation",
             Self::AwqScaleUpload(_) => "AWQ scale upload",
             Self::F32KvAllocation(_) => "F32 KV allocation",
+            Self::QwenAuxAllocation(_) => "Qwen aux allocation",
         }
     }
 
@@ -120,6 +124,7 @@ impl GenericDflashConstructionStage {
             Self::DsparkAllocation(_) => 10,
             Self::AwqScaleUpload(_) => 11,
             Self::F32KvAllocation(_) => 12,
+            Self::QwenAuxAllocation(_) => 13,
         }
     }
 }
@@ -156,7 +161,8 @@ mod generic_dflash_fault_inject {
                 | GenericDflashConstructionStage::ParoWeightUpload(allocation)
                 | GenericDflashConstructionStage::DsparkAllocation(allocation)
                 | GenericDflashConstructionStage::AwqScaleUpload(allocation)
-                | GenericDflashConstructionStage::F32KvAllocation(allocation) => allocation,
+                | GenericDflashConstructionStage::F32KvAllocation(allocation)
+                | GenericDflashConstructionStage::QwenAuxAllocation(allocation) => allocation,
                 _ => usize::MAX,
             },
             Ordering::SeqCst,
@@ -176,6 +182,7 @@ mod generic_dflash_fault_inject {
                 | GenericDflashConstructionStage::DsparkAllocation(_)
                 | GenericDflashConstructionStage::AwqScaleUpload(_)
                 | GenericDflashConstructionStage::F32KvAllocation(_)
+                | GenericDflashConstructionStage::QwenAuxAllocation(_)
         ) {
             return Ok(());
         }

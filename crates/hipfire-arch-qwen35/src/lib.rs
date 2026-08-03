@@ -81,13 +81,17 @@ pub mod spec_emit;
 pub use arch::Qwen35;
 
 #[cfg(feature = "deltanet")]
-pub use carrier::{load_bundle as load_qwen35_bundle, Qwen35Bundle};
+pub use carrier::{
+    load_bundle as load_qwen35_bundle,
+    load_bundle_frozen_planned as load_qwen35_bundle_frozen_planned, Qwen35Bundle,
+};
 #[cfg(feature = "deltanet")]
 pub use mtp_compose::{spec_step_dflash_mtp_tree, MtpComposeTreeResult, MtpComposeTreeState};
 #[cfg(feature = "deltanet")]
 pub use mtp_speculator::{build_qwen35_mtp_speculator, Qwen35MtpDrafter};
 #[cfg(feature = "deltanet")]
 pub use store::{
-    assemble_qwen35_weights, load_qwen35_hfq_weights, load_qwen35_paro_weights, qtype_dtype,
-    Qwen35ParoSourceResolver, Qwen35SourceLayout, Qwen35SourceResolver, ResolvedQwen35Source,
+    load_qwen35_hfq_weights, load_qwen35_paro_weights, preflight_qwen35_frozen,
+    Qwen35FrozenIneligible, Qwen35FrozenPlan, Qwen35FrozenPreflight, Qwen35LoadError,
+    Qwen35MoeLoadFlags,
 };

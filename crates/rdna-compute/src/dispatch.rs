@@ -1725,6 +1725,15 @@ impl Gpu {
         self.pool.drain(&self.hip);
     }
 
+    /// Drain the GPU memory pool with preserving free, returning an error when
+    /// any buffer could not be freed.  Failed buffers are re-inserted into the
+    /// pool so ownership is retained for retry.  Callers that need checked
+    /// teardown (e.g. Qwen weight cleanup with retry ownership) use this.
+    pub fn drain_pool_checked(&mut self) -> Result<(), String> {
+        self.bind_thread_or_warn();
+        self.pool.drain_checked(&self.hip)
+    }
+
     /// Invalidate every weight-pointer-keyed cache on the Gpu. Must be called
     /// any time a loaded model's weights are about to be freed; otherwise the
     /// next model load can allocate buffers at addresses that previously held

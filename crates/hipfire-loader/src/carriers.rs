@@ -12,9 +12,12 @@ use crate::{
 };
 use crate::{Carrier, CarrierLoadToken};
 use hipfire_arch_minimax::{config_from_safetensors, load_weights_from_safetensors, MiniMaxState};
+use hipfire_arch_qwen35_vl::qwen35_vl::VisionWeights;
+use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::loader_api::{LoadCtx, ModelSource};
 use hipfire_runtime::model_source::ModelSource as _;
 use hipfire_runtime::spec::{InPlaceGuard, SpecEmit, SpecEmitCtx, SpecTargetGuard};
+use rdna_compute::Gpu;
 
 fn dspark_lm_head_vocab(draft_vocab_size: usize, asset_vocab_size: usize) -> usize {
     if draft_vocab_size != 0 {
@@ -119,6 +122,87 @@ fn qwen35_paro_loader_kind(num_experts: usize) -> Qwen35ParoLoaderKind {
         Qwen35ParoLoaderKind::DenseManifest
     } else {
         Qwen35ParoLoaderKind::LegacyMoe
+    }
+}
+
+// ─── Frozen-vs-Legacy selection routing ──────────────────────────────
+//
+// The carrier's decision after the no-GPU-allocation preflight.  Kept
+// as a pure mapping so the selection semantics are testable without
+// hardware: Ineligible models MUST route to the Legacy loader (never a
+// new load failure); Invalid files MUST fail; an Eligible plan is the
+// only input that authorizes Frozen allocation, and nothing after that
+// point may fall back.
+
+/// Route decision from a [`Qwen35FrozenPreflight`] selection.
+pub(crate) enum Qwen35FrozenRoute {
+    /// Frozen allocation authorized by the preflight plan; the plan owns
+    /// the source.
+    Frozen(hipfire_arch_qwen35::Qwen35FrozenPlan),
+    /// Legacy loader fallback; the reason documents the selection and
+    /// the ORIGINAL source is returned for the Legacy load.
+    Legacy(String, ModelSource),
+    /// Neither path can serve the file — the load must fail.
+    Fail(String),
+}
+
+/// Pure routing of a Frozen preflight selection (no GPU, no I/O).
+///
+/// * [`Eligible`](hipfire_arch_qwen35::Qwen35FrozenPreflight::Eligible)
+///   → [`Frozen`](Qwen35FrozenRoute::Frozen) — the ONLY input that
+///   authorizes Frozen allocation; never routes to Legacy.
+/// * [`Ineligible`](hipfire_arch_qwen35::Qwen35FrozenPreflight::Ineligible)
+///   → [`Legacy`](Qwen35FrozenRoute::Legacy) — the model loads through
+///   the existing Legacy path, reusing the exact admitted source; this
+///   is a selection, not a failure.
+/// * [`Invalid`](hipfire_arch_qwen35::Qwen35FrozenPreflight::Invalid)
+///   → [`Fail`](Qwen35FrozenRoute::Fail).
+impl std::fmt::Debug for Qwen35FrozenRoute {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Qwen35FrozenRoute::Frozen(_) => f.debug_struct("Frozen").finish(),
+            Qwen35FrozenRoute::Legacy(reason, _) => {
+                f.debug_struct("Legacy").field("reason", reason).finish()
+            }
+            Qwen35FrozenRoute::Fail(msg) => f.debug_struct("Fail").field("message", msg).finish(),
+        }
+    }
+}
+
+pub(crate) fn route_frozen_selection(
+    selection: hipfire_arch_qwen35::Qwen35FrozenPreflight,
+) -> Qwen35FrozenRoute {
+    match selection {
+        hipfire_arch_qwen35::Qwen35FrozenPreflight::Eligible(plan) => {
+            Qwen35FrozenRoute::Frozen(plan)
+        }
+        hipfire_arch_qwen35::Qwen35FrozenPreflight::Ineligible(reason) => {
+            Qwen35FrozenRoute::Legacy(reason.reason().to_string(), reason.into_source())
+        }
+        hipfire_arch_qwen35::Qwen35FrozenPreflight::Invalid(msg) => Qwen35FrozenRoute::Fail(msg),
+    }
+}
+
+/// Drive one selected route to completion.  The route decides which ONE
+/// of the two load arms runs — an Eligible route can NEVER invoke the
+/// Legacy arm, even when the Frozen load fails operationally (the error
+/// is surfaced, not re-examined).  Pure routing: the closures contain
+/// all GPU work, so the fallback semantics are testable without
+/// hardware.
+pub(crate) fn drive_route<T>(
+    route: Qwen35FrozenRoute,
+    mut frozen: impl FnMut(hipfire_arch_qwen35::Qwen35FrozenPlan) -> Result<T, String>,
+    mut legacy: impl FnMut(ModelSource) -> Result<T, String>,
+) -> Result<T, String> {
+    match route {
+        Qwen35FrozenRoute::Frozen(plan) => frozen(plan),
+        Qwen35FrozenRoute::Legacy(reason, source) => {
+            eprintln!("  qwen35 Frozen preflight: {reason} — using Legacy loader");
+            legacy(source)
+        }
+        Qwen35FrozenRoute::Fail(msg) => Err(format!(
+            "qwen35: model cannot be loaded by either path: {msg}"
+        )),
     }
 }
 
@@ -420,7 +504,7 @@ impl Carrier for Qwen35Carrier {
         let meta = resolve_source_meta(&src, ctx.path)?;
 
         match src {
-            ModelSource::Hfq(mut hfq_file) => {
+            ModelSource::Hfq(hfq_file) => {
                 // ── pp>1 path (pipeline-parallel) — extracted helper ──
                 if ctx.pp > 1 {
                     return load_qwen35_pp(hfq_file, meta, ctx, token);
@@ -466,31 +550,166 @@ impl Carrier for Qwen35Carrier {
                     ctx.kv_physical_cap = Some(physical_cap);
                 }
 
-                // VL detection — loads weights from hfq_file in-place
-                let (vision_config, vision_weights) = {
+                // ── VL probe FIRST (metadata-only) ─────────────────────
+                // Index presence + config parse — NO payload read, NO GPU
+                // allocation.  The vision WEIGHTS upload happens after the
+                // route decision, in the selected path, from the same
+                // artifact (the plan-bound source for Frozen, the returned
+                // source for Legacy).
+                let vision_config = {
                     use hipfire_arch_qwen35_vl::Qwen35Vl;
                     use hipfire_runtime::arch::Architecture;
                     let has_vision = hfq_file
-                        .tensor_data("model.visual.patch_embed.proj.weight")
+                        .find_tensor_info("model.visual.patch_embed.proj.weight")
                         .is_some();
                     let vc = Qwen35Vl::config_from_hfq(&hfq_file).ok();
                     match vc {
                         Some(vc) if has_vision => {
-                            let vw = Qwen35Vl::load_weights(&mut hfq_file, &vc, ctx.gpu)
-                                .map_err(|e| eprintln!("  VL weight load failed: {e}"))
-                                .ok();
                             eprintln!(
                                 "  VL model: vision encoder (hidden={}, layers={})",
                                 vc.hidden_size, vc.num_layers
                             );
-                            (Some(vc), vw)
+                            Some(vc)
                         }
-                        _ => (None, None),
+                        _ => None,
                     }
                 };
 
-                let bundle =
-                    hipfire_arch_qwen35::load_qwen35_bundle(ModelSource::Hfq(hfq_file), ctx)?;
+                // ── Frozen-vs-Legacy selection (exact preflight) ────────
+                // The no-GPU-allocation preflight consumes the source and
+                // decides over the actual admitted Qwen35 MoE variant
+                // (arch_id), config, HFQ manifest metadata, and target
+                // arch.  Ineligible models fall back to the Legacy loader
+                // with the SAME source (never a new load failure); Invalid
+                // files fail; once Eligible the Frozen allocation begins
+                // and never falls back.
+                let flags = hipfire_arch_qwen35::Qwen35MoeLoadFlags::resolve();
+                let selection = hipfire_arch_qwen35::preflight_qwen35_frozen(
+                    ModelSource::Hfq(hfq_file),
+                    &ctx.gpu.arch,
+                    ctx.pp == 1,
+                    flags,
+                );
+
+                // The two load arms share `ctx` through a cell so
+                // `drive_route` can stay a pure CPU-testable seam; exactly
+                // one arm runs per route.
+                let ctx_cell = std::cell::RefCell::new(ctx);
+                let result = drive_route(
+                    route_frozen_selection(selection),
+                    |plan| {
+                        let ctx = &mut *ctx_cell.borrow_mut();
+                        // The arch-owned planned operation performs the
+                        // vision upload from the SEALED plan source
+                        // (immutable borrow only) and then the Frozen
+                        // load.  On bundle failure it aborts the vision
+                        // owner through `vision_abort`; on success it
+                        // returns bundle + vision owner.
+                        let vision_config_ref = vision_config.as_ref();
+                        let vision_closure = |hfq: &HfqFile, gpu: &mut Gpu| {
+                            match vision_config_ref {
+                                Some(vc) => {
+                                    // The underlying loader takes only an
+                                    // IMMUTABLE source borrow — the sealed
+                                    // plan source cannot be mutated or
+                                    // replaced by this closure.
+                                    match hipfire_arch_qwen35_vl::qwen35_vl::load_vision_weights(
+                                        hfq, vc, gpu,
+                                    ) {
+                                        Ok(vw) => Ok(Some(vw)),
+                                        Err(e) => {
+                                            // Preserve the historical
+                                            // warn-and-continue semantics.
+                                            eprintln!("  VL weight load failed: {e}");
+                                            Ok(None)
+                                        }
+                                    }
+                                }
+                                None => Ok(None),
+                            }
+                        };
+                        let vision_abort = |vision_owner: Option<VisionWeights>, gpu: &mut Gpu| {
+                            if let Some(vw) = vision_owner {
+                                vw.free_gpu(gpu);
+                            }
+                        };
+                        // Frozen path: returns Qwen35LoadError on failure,
+                        // which the carrier handles by freeing retained owners
+                        // and enqueuing backlog entries for any that persist.
+                        // No legacy fallback after this point.
+                        match hipfire_arch_qwen35::load_qwen35_bundle_frozen_planned(
+                            plan,
+                            ctx,
+                            vision_closure,
+                            vision_abort,
+                        ) {
+                            Ok(outcome) => Ok((outcome.bundle, outcome.vision)),
+                            Err(load_err) => {
+                                let (msg, frozen_retained, common_cleanup) =
+                                    load_err.try_free(ctx.gpu);
+                                let n_frozen = frozen_retained.len();
+                                let has_common = common_cleanup.is_some();
+                                let domain = *ctx.gpu.allocation_domain_id();
+                                for fail in frozen_retained {
+                                    crate::retain_qwen_cleanup(
+                                        domain,
+                                        crate::QwenBacklogEntry::Cleanup(
+                                            hipfire_arch_qwen35::qwen35::Qwen35CleanupFailure::from_frozen(
+                                                fail,
+                                            ),
+                                        ),
+                                    );
+                                }
+                                if let Some(cf) = common_cleanup {
+                                    crate::retain_qwen_cleanup(
+                                        domain,
+                                        crate::QwenBacklogEntry::Cleanup(cf),
+                                    );
+                                }
+                                let detail = if n_frozen > 0 || has_common {
+                                    format!(
+                                        " ({} frozen + {} common retained in backlog)",
+                                        n_frozen,
+                                        if has_common { 1 } else { 0 }
+                                    )
+                                } else {
+                                    String::new()
+                                };
+                                Err(format!("qwen35 Frozen MoE load: {msg}{detail}"))
+                            }
+                        }
+                    },
+                    |source| {
+                        let ctx = &mut *ctx_cell.borrow_mut();
+                        let ModelSource::Hfq(mut hfq) = source else {
+                            unreachable!("preflight routes only HFQ sources to Legacy")
+                        };
+                        // Vision upload AFTER the route decision, from the
+                        // returned source.
+                        let mut vision_weights = match &vision_config {
+                            Some(vc) => {
+                                use hipfire_runtime::arch::Architecture;
+                                hipfire_arch_qwen35_vl::Qwen35Vl::load_weights(
+                                    &mut hfq, vc, ctx.gpu,
+                                )
+                                .map_err(|e| eprintln!("  VL weight load failed: {e}"))
+                                .ok()
+                            }
+                            None => None,
+                        };
+                        match hipfire_arch_qwen35::load_qwen35_bundle(ModelSource::Hfq(hfq), ctx) {
+                            Ok(b) => Ok((b, vision_weights)),
+                            Err(e) => {
+                                if let Some(vw) = vision_weights.take() {
+                                    vw.free_gpu(ctx.gpu);
+                                }
+                                Err(e)
+                            }
+                        }
+                    },
+                )?;
+                let (bundle, vision_weights) = result;
+                let ctx = ctx_cell.into_inner();
                 finish_qwen35_load(
                     bundle,
                     meta.tokenizer,
@@ -1030,7 +1249,12 @@ impl Carrier for LlamaCarrier {
 
 #[cfg(test)]
 mod tests {
-    use super::{dspark_lm_head_vocab, qwen35_paro_loader_kind, Qwen35ParoLoaderKind};
+    use super::{
+        drive_route, dspark_lm_head_vocab, qwen35_paro_loader_kind, route_frozen_selection,
+        Qwen35FrozenRoute, Qwen35ParoLoaderKind,
+    };
+    use hipfire_runtime::loader_api::ModelSource;
+    use std::io::Write;
 
     #[test]
     fn dspark_lm_head_vocab_preserves_reduced_and_fallback_shapes() {
@@ -1049,6 +1273,351 @@ mod tests {
             qwen35_paro_loader_kind(256),
             Qwen35ParoLoaderKind::LegacyMoe
         );
+    }
+
+    // ── Frozen selection routing (CPU-only, no GPU) ──────────────────
+    //
+    // The preflight + routing decision is fully metadata-driven: a real
+    // on-disk HFQ index (no payloads needed for the selection) and an
+    // arch string.  These tests prove the carrier's selection semantics:
+    // Ineligible → Legacy fallback (never a new load failure), Eligible
+    // → Frozen allocation with NO fallback path, Invalid → fail.
+
+    fn moe_config_json() -> serde_json::Value {
+        serde_json::json!({
+            "hidden_size": 64,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 2,
+            "head_dim": 32,
+            "vocab_size": 128,
+            "layer_types": ["linear_attention", "full_attention"],
+            "num_experts": 8,
+            "num_experts_per_tok": 8,
+            "moe_intermediate_size": 32,
+            "shared_expert_intermediate_size": 32,
+            "tie_word_embeddings": true,
+        })
+    }
+
+    /// First-candidate physical name for a qwen35 manifest entry —
+    /// mirrors the resolver's candidate list (test fixture only).
+    fn qwen35_physical(
+        config: &hipfire_arch_qwen35::qwen35::Qwen35Config,
+        name: &str,
+        layer: Option<usize>,
+    ) -> Option<String> {
+        use hipfire_arch_qwen35::qwen35::LayerType;
+        let stem = match (name, layer) {
+            ("token_embd", None) => "embed_tokens.weight".to_string(),
+            ("output_norm", None) => "norm.weight".to_string(),
+            ("lm_head", None) => "lm_head.weight".to_string(),
+            (name, Some(layer)) => {
+                let rel = match name {
+                    "attn_norm" => "input_layernorm.weight".to_string(),
+                    "ffn_norm" => "post_attention_layernorm.weight".to_string(),
+                    "wq" => "self_attn.q_proj.weight".to_string(),
+                    "wk" => "self_attn.k_proj.weight".to_string(),
+                    "wv" => "self_attn.v_proj.weight".to_string(),
+                    "wo" => {
+                        if config.layer_types[layer] == LayerType::LinearAttention {
+                            "linear_attn.out_proj.weight".to_string()
+                        } else {
+                            "self_attn.o_proj.weight".to_string()
+                        }
+                    }
+                    "q_norm" => "self_attn.q_norm.weight".to_string(),
+                    "k_norm" => "self_attn.k_norm.weight".to_string(),
+                    "wqkv" => "linear_attn.in_proj_qkv.weight".to_string(),
+                    "wz" => "linear_attn.in_proj_z.weight".to_string(),
+                    "w_alpha" => "linear_attn.in_proj_a.weight".to_string(),
+                    "w_beta" => "linear_attn.in_proj_b.weight".to_string(),
+                    "a_log" => "linear_attn.A_log".to_string(),
+                    "dt_bias" => "linear_attn.dt_bias".to_string(),
+                    "conv" => "linear_attn.conv1d.weight".to_string(),
+                    "norm" => "linear_attn.norm.weight".to_string(),
+                    "ffn_gate" => "mlp.gate_proj.weight".to_string(),
+                    "ffn_up" => "mlp.up_proj.weight".to_string(),
+                    "ffn_down" => "mlp.down_proj.weight".to_string(),
+                    "router" => "mlp.gate.weight".to_string(),
+                    "shared_expert_gate" => "mlp.shared_expert_gate.weight".to_string(),
+                    "shared_gate" => "mlp.shared_expert.gate_proj.weight".to_string(),
+                    "shared_up" => "mlp.shared_expert.up_proj.weight".to_string(),
+                    "shared_down" => "mlp.shared_expert.down_proj.weight".to_string(),
+                    name if name.starts_with("expert.") => {
+                        let rest = name.strip_prefix("expert.").unwrap();
+                        let (idx, proj) = rest.split_once('.').unwrap();
+                        format!(
+                            "mlp.experts.{idx}.{}.weight",
+                            match proj {
+                                "gate_up" => "gate_up_proj",
+                                "down" => "down_proj",
+                                _ => return None,
+                            }
+                        )
+                    }
+                    _ => return None,
+                };
+                format!("layers.{layer}.{rel}")
+            }
+            _ => return None,
+        };
+        Some(format!("model.language_model.{stem}"))
+    }
+
+    fn awq_physical(main_physical: &str) -> String {
+        format!(
+            "{}.awq_scale.weight",
+            main_physical.strip_suffix(".weight").unwrap()
+        )
+    }
+
+    /// Write an HFQ index with explicit per-tensor shapes.
+    fn write_selection_fixture_shaped(
+        path: &std::path::Path,
+        arch_id: u32,
+        config_json: &serde_json::Value,
+        extra: &[(&str, Vec<u32>)],
+    ) -> hipfire_arch_qwen35::qwen35::Qwen35Config {
+        use hipfire_runtime::arch::Architecture;
+        let config = hipfire_arch_qwen35::qwen35::config_from_metadata_json(
+            &serde_json::json!({ "config": config_json }).to_string(),
+        )
+        .expect("fixture config must parse");
+        let manifest = <hipfire_arch_qwen35::Qwen35 as Architecture>::weight_manifest(&config);
+
+        let mut tensors: Vec<(String, Vec<u32>)> = Vec::new();
+        for entry in &manifest {
+            let physical = qwen35_physical(&config, &entry.name, entry.layer)
+                .unwrap_or_else(|| panic!("no physical name for {}", entry.name));
+            let shape: Vec<u32> = entry.logical_shape.iter().map(|&d| d as u32).collect();
+            tensors.push((physical, shape));
+        }
+        tensors.extend(
+            extra
+                .iter()
+                .map(|(n, shape)| (n.to_string(), shape.clone())),
+        );
+
+        let metadata = serde_json::json!({ "config": config_json }).to_string();
+        let meta_bytes = metadata.as_bytes();
+        let mut idx = Vec::new();
+        idx.extend_from_slice(&(tensors.len() as u32).to_le_bytes());
+        for (name, shape) in &tensors {
+            idx.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            idx.extend_from_slice(name.as_bytes());
+            idx.push(13); // MQ4G256
+            idx.push(shape.len() as u8);
+            for d in shape {
+                idx.extend_from_slice(&d.to_le_bytes());
+            }
+            idx.extend_from_slice(&0u32.to_le_bytes()); // group_size
+            let size: u64 = shape.iter().map(|&d| d as u64).product::<u64>().max(64);
+            idx.extend_from_slice(&size.to_le_bytes());
+        }
+        let metadata_offset: u64 = 32;
+        let data_offset: u64 = metadata_offset + meta_bytes.len() as u64 + idx.len() as u64;
+        let mut f = std::fs::File::create(path).unwrap();
+        f.write_all(b"HFQM").unwrap();
+        f.write_all(&1u32.to_le_bytes()).unwrap();
+        f.write_all(&arch_id.to_le_bytes()).unwrap();
+        f.write_all(&(tensors.len() as u32).to_le_bytes()).unwrap();
+        f.write_all(&metadata_offset.to_le_bytes()).unwrap();
+        f.write_all(&data_offset.to_le_bytes()).unwrap();
+        f.write_all(meta_bytes).unwrap();
+        f.write_all(&idx).unwrap();
+        for _ in &tensors {
+            f.write_all(&[0u8; 64]).unwrap();
+        }
+        f.flush().unwrap();
+        config
+    }
+
+    fn selection_path(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "hipfire-qwen35-route-{tag}-{}-{}.hfq",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("t")
+        ))
+    }
+
+    fn default_flags() -> hipfire_arch_qwen35::Qwen35MoeLoadFlags {
+        hipfire_arch_qwen35::Qwen35MoeLoadFlags {
+            paged_experts: false,
+            moe_awq_enabled: true,
+        }
+    }
+
+    fn run_selection(
+        path: &std::path::Path,
+        arch: &str,
+    ) -> hipfire_arch_qwen35::Qwen35FrozenPreflight {
+        let hfq = hipfire_runtime::hfq::HfqFile::open(path).expect("fixture opens");
+        hipfire_arch_qwen35::preflight_qwen35_frozen(
+            ModelSource::Hfq(hfq),
+            arch,
+            true,
+            default_flags(),
+        )
+    }
+
+    #[test]
+    fn frozen_selection_dense_routes_to_legacy_without_gpu() {
+        // Dense qwen35 (arch_id 6, num_experts=0): the preflight must
+        // select Legacy BEFORE any manifest work — the fixture carries
+        // zero tensors, proving no source upload is required for the
+        // decision.
+        let path = selection_path("dense");
+        let dense = serde_json::json!({
+            "hidden_size": 64,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 2,
+            "head_dim": 32,
+            "vocab_size": 128,
+            "layer_types": ["linear_attention", "full_attention"],
+            "num_experts": 0,
+        });
+        write_selection_fixture_shaped(&path, 6, &dense, &[]);
+        let selection = run_selection(&path, "gfx1100");
+        match &selection {
+            hipfire_arch_qwen35::Qwen35FrozenPreflight::Ineligible(reason) => {
+                assert!(
+                    reason.reason().contains("dense"),
+                    "expected dense reason, got {}",
+                    reason.reason()
+                );
+            }
+            other => panic!("expected Ineligible for dense, got {other:?}"),
+        }
+        // Routing: Ineligible → Legacy fallback with the ORIGINAL source —
+        // a selection, NOT a load failure.  drive_route must hand the
+        // source to the Legacy arm and never touch the Frozen arm.
+        let route = route_frozen_selection(selection);
+        let legacy_called = std::cell::Cell::new(false);
+        let frozen_called = std::cell::Cell::new(false);
+        let result = drive_route(
+            route,
+            |_plan| {
+                frozen_called.set(true);
+                Err("frozen must not run".to_string())
+            },
+            |source| {
+                legacy_called.set(true);
+                assert!(
+                    matches!(source, ModelSource::Hfq(_)),
+                    "Legacy arm must receive the returned Hfq source"
+                );
+                Ok(42u32)
+            },
+        );
+        assert_eq!(result, Ok(42));
+        assert!(legacy_called.get(), "Legacy arm must run");
+        assert!(
+            !frozen_called.get(),
+            "Frozen arm must not run for Ineligible"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn frozen_selection_eligible_routes_to_frozen_without_fallback() {
+        // Full MoE fixture (8 experts x 2 layers, all MQ4) on gfx1100:
+        // the preflight must authorize Frozen allocation.  The route from
+        // an Eligible selection is Frozen ONLY — there is no Legacy
+        // fallback path after this point.
+        let path = selection_path("eligible");
+        write_selection_fixture_shaped(&path, 6, &moe_config_json(), &[]);
+        let selection = run_selection(&path, "gfx1100");
+        assert!(
+            matches!(
+                selection,
+                hipfire_arch_qwen35::Qwen35FrozenPreflight::Eligible(_)
+            ),
+            "expected Eligible, got {selection:?}"
+        );
+        let route = route_frozen_selection(selection);
+        assert!(
+            matches!(route, Qwen35FrozenRoute::Frozen(_)),
+            "Eligible selection must route to Frozen, got {route:?}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn frozen_selection_eligible_operational_error_never_falls_back() {
+        // Once Eligible, an OPERATIONAL failure of the Frozen load must
+        // surface as a load error — the Legacy arm is never attempted.
+        // This is the no-fallback contract, exercised through the exact
+        // production seam (`drive_route` + `route_frozen_selection`)
+        // without a GPU.
+        let path = selection_path("eligible-err");
+        write_selection_fixture_shaped(&path, 6, &moe_config_json(), &[]);
+        let selection = run_selection(&path, "gfx1100");
+        let route = route_frozen_selection(selection);
+        let legacy_called = std::cell::Cell::new(false);
+        let result: Result<(), String> = drive_route(
+            route,
+            |_plan| Err("frozen load failed: injected OOM".to_string()),
+            |_source| {
+                legacy_called.set(true);
+                Ok(())
+            },
+        );
+        assert!(
+            result.is_err(),
+            "the operational error must be surfaced, got {result:?}"
+        );
+        assert!(
+            !legacy_called.get(),
+            "Legacy must NEVER be attempted after an Eligible selection"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn frozen_selection_invalid_routes_to_fail() {
+        // Routed gate-up AWQ companion: refused by the shared manifest
+        // gate — neither path can serve the file, so the route fails.
+        let path = selection_path("invalid");
+        let config = write_selection_fixture_shaped(&path, 6, &moe_config_json(), &[]);
+        let gate_up = qwen35_physical(&config, "expert.0.gate_up", Some(0)).unwrap();
+        let companion: &'static str = Box::leak(awq_physical(&gate_up).into_boxed_str());
+        let path2 = selection_path("invalid2");
+        write_selection_fixture_shaped(&path2, 6, &moe_config_json(), &[(companion, vec![64])]);
+        let selection = run_selection(&path2, "gfx1100");
+        match &selection {
+            hipfire_arch_qwen35::Qwen35FrozenPreflight::Invalid(msg) => {
+                assert!(msg.contains("AWQ"), "message: {msg}");
+            }
+            other => panic!("expected Invalid for routed gate-up AWQ, got {other:?}"),
+        }
+        let route = route_frozen_selection(selection);
+        match &route {
+            Qwen35FrozenRoute::Fail(msg) => {
+                assert!(msg.contains("AWQ"), "message: {msg}");
+            }
+            other => panic!("expected Fail route, got {other:?}"),
+        }
+        // Fail: neither arm runs.
+        let legacy_called = std::cell::Cell::new(false);
+        let frozen_called = std::cell::Cell::new(false);
+        let result: Result<(), String> = drive_route(
+            route,
+            |_plan| {
+                frozen_called.set(true);
+                Err("frozen must not run".to_string())
+            },
+            |_source| {
+                legacy_called.set(true);
+                Err("legacy must not run".to_string())
+            },
+        );
+        assert!(result.is_err());
+        assert!(!legacy_called.get(), "Legacy arm must not run for Fail");
+        assert!(!frozen_called.get(), "Frozen arm must not run for Fail");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&path2);
     }
 }
 

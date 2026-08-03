@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) 2026 Björn Bösel
 // hipfire — see LICENSE and NOTICE in the project root.
-use std::sync::Arc;
+use crate::resource::ResourceManager;
 use rdna_compute::arch_caps::ArchCaps;
 use rdna_compute::feature_flags::FeatureFlags;
 use rdna_compute::Gpu;
-use crate::resource::ResourceManager;
+use std::sync::Arc;
 
 /// Per-session context resolved once at Gpu::init().
 /// Shared immutably across all dispatch calls.
@@ -27,6 +27,20 @@ impl DispatchCtx {
             arch,
             flags,
             resources: ResourceManager::new(gpu),
+        }
+    }
+
+    /// Construct a `DispatchCtx` for the given arch string without a live
+    /// GPU.  Used by the Qwen35 Frozen preflight (selection must never
+    /// allocate) and by arch-string tests.  `FeatureFlags` still reads
+    /// the process environment, exactly like [`DispatchCtx::new`].
+    pub fn for_arch(arch: &str) -> Self {
+        let flags = Arc::new(FeatureFlags::from_env(arch));
+        let arch_caps = ArchCaps::new(arch, flags.clone());
+        Self {
+            arch: arch_caps,
+            flags,
+            resources: crate::resource::ResourceManager::arch_only(),
         }
     }
 

@@ -417,7 +417,98 @@ them toward completion.
 - **Acceptance criteria:** Expert ownership, compact shard layout, routing, zero/dummy handling, and collective hints derive from the manifest/mesh; routed-expert placements and all derived resources have permanent ownership in the immutable `WeightStore`; architecture consumers use private read-only typed projections with no tensor extraction or typed freeing; rank-branded, non-forgeable allocation tokens enforce origin mesh epoch/rank/physical device/pool epoch; raw-pointer `WeightStoreView` values cannot satisfy acceptance. DeepSeek4/MiniMax preserve accepted Single behavior and named structural EP regression examples (`ep_deepseek4` and `ep_minimax`); their full-model EP>1 parity is deferred and non-blocking; Qwen35 requires a canonical Qwen35-MoE 35B fixture before acceptance: record model SHA-256, prompt MD5, binary digest, exact command/topology, and deterministic pass condition: the emulated EP harness uses Single as the sole baseline (EP=1 is its alias and is not a second required run); prefill parity is exact final-prefill logits plus the first token emitted after prefill, decode parity is exact generated token IDs, with multi-turn/reset; report first logit divergence if tokens differ. This task adopts existing architecture forwards and does not add a new PP/TP/EP support cell.
 - **Validation:** Run manifest shard tests, expert-routing edge cases, transactional load failure, and EP coherence tests; assert token-origin rejection and failed-free token retention, immutable projection/no-extraction/no-typed-free boundaries, and permanent store ownership for placements and derived resources; for DeepSeek4/MiniMax, run deterministic Single parity and the named structural EP regression examples `ep_deepseek4` and `ep_minimax` only; for Qwen35 only, run full deterministic emulated EP>1 parity and assert the invariant that Qwen35Moe EP remains `Planned`/refused before allocation throughout STEP-002, with no `EpArch::Qwen35` and no daemon admission; AXIS-002 remains the sole Qwen admission owner; physical RCCL closure remains HW-001/HW-002 for DeepSeek4/MiniMax and HW-011 after AXIS-002 for Qwen35.
 - **Hardware:** One supported AMD GPU for emulated EP; physical RCCL validation for DeepSeek4/MiniMax requires HW-001/HW-002. Qwen35Moe EP remains refused before allocation through STEP-002; no Qwen `EpArch` or daemon admission is permitted here, and Qwen35 production EP requires HW-011 after AXIS-002, with AXIS-002 as the sole admission owner.
-- **Evidence:** Pending
+- **Evidence:** In progress — not complete. Approved pieces (Oracle Gate B,
+  2026-08-03): single-target frozen-store facade with retained target
+  identity; private ID-only Qwen35 MoE projection with borrowed forward
+  bindings; direct Frozen MoE staging into `SingleWeightStoreBuilder`; exact
+  C2 indexed dispatch admission; source-bound preflight with Legacy fallback;
+  and checked published/unpublished unload plus exact-domain retry backlog.
+  Qwen35Moe EP remains `Planned`/refused before allocation throughout
+  (AXIS-002 sole owner; no `EpArch::Qwen35`; no daemon admission) and the
+  residency boundary script asserts that invariant. Phase B did not follow
+  test-first ordering; that TDD violation is an explicit process failure and
+  no strict-TDD claim is made.   Phase C boundary/evidence:
+  `scripts/check_moe_residency_boundary.sh` is green on this tree and its
+  `--self-test` mode catches a controlled violation fixture. CPU evidence:
+  runtime weight_store 110 passed / 13 GPU ignored; runtime compile-fail
+  doctests 5 passed; qwen35 380 passed / 18 ignored (final merged Oracle
+  remediation added 5 CPU tests + 4 GPU-ignored tests and repaired the
+  stale GPU-ignored `frozen_moe_resident_build_and_bind` fixture); loader
+  132 passed / 10 ignored; dispatch 172 passed / 1 ignored (E8
+  routed_indexable test added); dispatch-tests 70 passed; rdna-compute 61
+  passed;
+  `cargo check -p hipfire-loader --all-targets` and
+  `cargo check --workspace --all-targets` finish with pre-existing warnings;
+  `git diff --check` passes. Final merged Oracle remediation (2026-08-03,
+  strict TDD): the model-wide MQ6 fence is now defined as ANY MoE FFN
+  projection in any layer — router / shared_expert_gate / shared gate/up/
+  down plus every routed expert gate_up/down (uniform or graded) — for BOTH
+  Legacy and Frozen through ONE shared metadata predicate
+  (`MoeFfnMetaView::has_mq6`, generic over the projection key so CPU tests
+  use fabricated projections). `layers_have_mq6_moe`, the Legacy assembly
+  seam (`assembled_legacy_layers_have_mq6`), and the Frozen resident
+  publication all consume it, so the storage kinds cannot diverge; the old
+  snapshot predicate missed graded (non-uniform) routed MQ6 and the Frozen
+  path missed structural MQ6 entirely. The Legacy assembly's own inline
+  routed-only `moe_has_mq6` scan (missed structural MQ6) is replaced by the
+  shared seam — assembly-level regression: real Legacy fixture with
+  shared-only MQ6 layer + pure MQ4 layer → published `moe_has_mq6` true
+  (GPU-ignored `legacy_assembly_derives_model_wide_mq6_fence`, passes on
+  gfx1151); CPU seam test `assembled_layers_mq6_seam_shared_only_layer_and_pure_layer`.
+  Dead `MoeDtypeSnapshot::has_mq6` and `MoeFfnMetaView::proj` deleted
+  (snapshot `has_mq6` test assertions removed with the method). O(1) Frozen
+  binding — decode materializes routed-expert refs only for the Legacy
+  CPU-top-K fallback (`routed_expert_refs_for_params` seam; call-count
+  seam proves Frozen = zero resolutions, Legacy = exactly one); Frozen
+  prefill's unused `routed_experts` Vec and 21 further dead
+  migration-extraction variables removed; `Qwen35BundleBuildError`/
+  `BundleBuildTransaction` made `pub(crate)` (no external consumer);
+  `MoeResolution::routed_indexable()` now includes admitted E8 (new field,
+  E8 test); latent Frozen common-assembly `derived_plans[layer]`
+  index-OOB (panic on any real Frozen load) fixed by gating the plan read
+  to Legacy mode. GPU-ignored tests `frozen_routed_expert_refs_seam_resolves_zero`
+  and `frozen_publication_derives_model_wide_mq6_fence` (routed-MQ6,
+  pure-MQ4, and structural-MQ6 fixtures through the real publication seam)
+  pass on gfx1151 with `--ignored`. The final merged Oracle gate APPROVED on
+  2026-08-03 with zero Critical or Important findings outside accepted
+  STEP-002R. Canonical Qwen35-MoE GPU fixture/parity
+  and VRAM evidence remain absent, so STEP-002 is NOT complete; STEP-002R
+  is accepted debt, not closed.
+
+### STEP-002R Make Qwen35 Frozen Construction Rollback Owner-Preserving
+
+- **Status:** ready
+- **Dependencies:** STEP-002
+- **Goal:** Replace best-effort Qwen35 Frozen pre-publication rollback with
+  origin-preserving, retryable transactions for common weights and every
+  auxiliary allocation.
+- **Acceptance criteria:** Common manifest fulfillment/conversion/assembly,
+  DeltaNet state, Qwen scratch and PrefillBatchScratch, KV construction and
+  reconfiguration, and MTP-head construction preserve every allocation as
+  published, successfully freed, or returned in an exact retry owner; direct
+  uploads retain direct-allocation provenance rather than being fabricated as
+  pooled `GpuTensor`s; replacement transitions cannot double-free; complete
+  `Qwen35CleanupFailure` aggregates retain both tensor and Frozen owners; no
+  `Drop`, logging, string conversion, or best-effort free is a correctness
+  mechanism.
+- **Validation:** Deterministically inject allocation and cleanup failure at
+  every production transaction boundary and assert each allocation identity and
+  origin appears exactly once in published, freed, or retained output. Run
+  repeated failed-load/retry/unload GPU tests and prove post-retry VRAM recovery.
+- **Hardware:** CPU fault-ledger coverage plus one supported AMD GPU with the
+  canonical Qwen35-MoE HFQ fixture.
+- **Evidence:** Created from Oracle Gate A rejection on 2026-07-27. Confirmed
+  debt includes unchecked legacy common fulfillment/assembly rollback,
+  conversion replacement ownership, typed DeltaNet/scratch constructor error
+  propagation, PBS/KV rollback, partial MTP staging, and missing per-allocation
+  fault evidence. Remains accepted debt through Oracle Gate B (2026-08-03) per
+  explicit user decision for this slice; it does not count as exact
+  failed-free retention evidence and must not be represented as such.
+  Recovery checkpoints:
+  `/tmp/opencode/qwen35-post-second-recovery-20260727.patch`,
+  `/tmp/opencode/qwen35-phase-b-20260727.patch`, and
+  `/tmp/opencode/qwen35-phase-b-remediated-20260727.patch` (SHA-256
+  `5a4f3d0b64405a3830871eaca7f5eec0afbf1b976126bbd7ae622d93c220a2e2`).
 
 ### STEP-003 Adopt Step/Manifest For Recurrent And Conv State
 
