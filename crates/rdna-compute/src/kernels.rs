@@ -3858,14 +3858,6 @@ pub const V4F_TOPK_KV_GATHER_IDENTITY_BATCHED_SRC: &str =
 pub const WO_PER_GROUP_BATCHED_F32_SRC: &str =
     include_str!("../../../kernels/src/wo_per_group_batched_f32.hip");
 
-/// DeepSeek V4 per-group O-LoRA batched GEMV — F16 weights, F32 activations.
-/// Required by the `deepseek4-mtp-precise` DSpark sidecar, which keeps dense
-/// drafter weights at training precision. Without it `spec_step` fails closed
-/// with "dspark wo_a: unsupported dtype F16" and the drafter is restricted to
-/// Q8F16 — quant noise the acceptance rate is disproportionately sensitive to.
-pub const WO_PER_GROUP_BATCHED_F16_SRC: &str =
-    include_str!("../../../kernels/src/wo_per_group_batched_f16.hip");
-
 /// DeepSeek V4 per-group O-LoRA batched GEMV for HFQ4G256-packed wo_a.
 /// Single launch in place of B × G separate gemv_mq4g256_prerotated calls.
 /// Collapses ~11k dispatch calls/chunk down to 43 in the DeepSeek V4 prefill path.
