@@ -17,6 +17,39 @@
 //! question about traces, not about hardware — so it is answered here, offline,
 //! with no GPU and no model load.
 //!
+//! MEASURED on a full 43-layer trace (137,742 accesses, 86 buckets, all 256
+//! experts, 256 decode tokens, 8 GB cache):
+//!
+//! ```text
+//!  slots   Belady     LRU     LFU  LeastStale   LRU vs Belady
+//!      8    46.6%   66.6%   68.4%      93.4%     +20.0 pp
+//!     16    33.0%   49.9%   55.5%      83.2%     +16.9 pp
+//!     28    24.2%   38.3%   43.4%      64.3%     +14.1 pp   <- operating point
+//!     64    14.3%   23.0%   24.6%      24.8%      +8.7 pp
+//!    128    10.9%   13.1%   13.3%      13.4%      +2.2 pp
+//!    192    10.4%   11.0%   11.0%      11.0%      +0.6 pp
+//! ```
+//!
+//! Two conclusions, and they pull in opposite directions:
+//!
+//! 1. **The stop rule does NOT fire.** LRU takes 1.58x the misses Belady does
+//!    at 28 slots. There is real headroom for a better policy — unlike the
+//!    earlier 6-layer measurement, which showed a 0.3 pp gap and was WRONG:
+//!    layers 0-3 are hash-routed with repetitive routing, so a trace confined
+//!    to the first 6 layers is mostly hash layers and says nothing about the
+//!    39 score-routed ones.
+//!
+//! 2. **Neither candidate replacement captures it.** Least-Stale is far worse
+//!    (64.3% vs 38.3%) and LFU is worse (43.4%), so SpecMD's finding does not
+//!    transfer to ds4 routing. Implementing P1 as specified would be a
+//!    regression.
+//!
+//! So the gap is open, not closed: it needs a policy neither recency nor
+//! frequency nor observed-staleness expresses. One untested idea is to use the
+//! router's own gate scores — an expert selected with a low weight is less
+//! likely to recur than one selected strongly — which is information the
+//! pager currently throws away.
+//!
 //! Simulation is per `(layer, role)` bucket because that is how the real pager
 //! is organised: each bucket owns `slots` cache entries and evicts within
 //! itself. A trace is replayed independently per bucket and the totals summed.
