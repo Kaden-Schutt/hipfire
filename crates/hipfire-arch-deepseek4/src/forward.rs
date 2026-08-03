@@ -1484,6 +1484,41 @@ fn indexer_forward(
 /// Caller is responsible for sampler integration and KV-state
 /// advancement.
 #[allow(unused_variables, dead_code)]
+/// Per-step logit fingerprint for graph-replay bisection.
+///
+/// Comparing committed tokens is too blunt to debug a numerical divergence:
+/// greedy sampling hides any difference until it happens to flip an argmax,
+/// which on the full model was 41 tokens after the fact. This prints a
+/// checksum of every step's logits so the FIRST differing step is visible.
+///
+/// Enable with `HIPFIRE_DEEPSEEK4_LOGIT_TRACE=1`. Off by default and free
+/// when off (one `OnceLock` bool read).
+fn trace_logits(logits: &[f32], position: u32, path: &str) {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var("HIPFIRE_DEEPSEEK4_LOGIT_TRACE").as_deref() == Ok("1")) {
+        return;
+    }
+    // Sum in f64 over the raw bits as well as the values: the bit sum catches
+    // a difference that cancels in the float sum.
+    let mut fsum = 0f64;
+    let mut bits: u64 = 0;
+    let mut best = (f32::NEG_INFINITY, 0usize);
+    for (i, &v) in logits.iter().enumerate() {
+        fsum += v as f64;
+        bits = bits
+            .wrapping_mul(1099511628211)
+            .wrapping_add(v.to_bits() as u64);
+        if v > best.0 {
+            best = (v, i);
+        }
+    }
+    eprintln!(
+        "[logit-trace] pos={position} path={path} argmax={} max={:.9e} sum={:.9e} fnv={bits:016x}",
+        best.1, best.0, fsum
+    );
+}
+
 pub fn decode_step(
     cfg: &DeepseekV4Config,
     weights: &DeepseekV4Weights,
@@ -1509,8 +1544,11 @@ pub fn decode_step(
 
     let _ = decode_step_body(cfg, weights, state, gpu, token_id, position)?;
     let logits = state.logits.as_ref().unwrap();
-    gpu.download_f32(logits)
-        .map_err(|e| format!("download logits: {e:?}"))
+    let out = gpu
+        .download_f32(logits)
+        .map_err(|e| format!("download logits: {e:?}"))?;
+    trace_logits(&out, position, "direct");
+    Ok(out)
 }
 
 /// HIP-graphs-aware decode_step. Opt-in via `HIPFIRE_DEEPSEEK4_GRAPH=1`.
@@ -1649,8 +1687,11 @@ pub fn decode_step_with_graph(
     // on the null stream — completes after the captured kernels finish
     // because the captured stream is observed by the device).
     let logits = state.logits.as_ref().unwrap();
-    gpu.download_f32(logits)
-        .map_err(|e| format!("download logits (graph path): {e:?}"))
+    let out = gpu
+        .download_f32(logits)
+        .map_err(|e| format!("download logits (graph path): {e:?}"))?;
+    trace_logits(&out, position, "graph");
+    Ok(out)
 }
 
 /// Update `state.attn_state_host = [slot, n_valid]` and copy to the
