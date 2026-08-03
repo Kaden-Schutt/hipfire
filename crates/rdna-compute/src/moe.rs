@@ -25,11 +25,25 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel(
-            "moe_down_combine_k8_batched",
-            kernels::MOE_DOWN_COMBINE_K8_BATCHED_SRC,
-            "moe_down_combine_k8_batched",
-        )?;
+        let use_vec4 = self.arch_caps.is_rdna3_dgpu()
+            && self.flags.moe_down_combine_vec4
+            && k_top == 8
+            && m.is_multiple_of(4);
+        let func_name = if use_vec4 {
+            self.ensure_kernel(
+                "moe_down_combine_k8_batched_vec4",
+                kernels::MOE_DOWN_COMBINE_K8_BATCHED_VEC4_SRC,
+                "moe_down_combine_k8_batched_vec4",
+            )?;
+            "moe_down_combine_k8_batched_vec4"
+        } else {
+            self.ensure_kernel(
+                "moe_down_combine_k8_batched",
+                kernels::MOE_DOWN_COMBINE_K8_BATCHED_SRC,
+                "moe_down_combine_k8_batched",
+            )?;
+            "moe_down_combine_k8_batched"
+        };
         let eop = expert_outputs.buf.as_ptr();
         let wp = topk_weights.buf.as_ptr();
         let xrp = x_residual.buf.as_ptr();
@@ -51,9 +65,10 @@ impl Gpu {
             bytes,
         );
         let block_m: u32 = 256;
-        let grid_x = (m as u32 + block_m - 1) / block_m;
+        let columns_per_thread = if use_vec4 { 4 } else { 1 };
+        let grid_x = (m as u32).div_ceil(block_m * columns_per_thread);
         let result = self.launch_maybe_blob(
-            "moe_down_combine_k8_batched",
+            func_name,
             [grid_x, batch_size as u32, 1],
             [block_m, 1, 1],
             0,
@@ -71,6 +86,87 @@ impl Gpu {
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
+        result
+    }
+
+    /// gfx1100 decode experiment: finish one atomic-free routed-MoE row and
+    /// immediately produce the following layer's RMS-normalized MQ rotation.
+    /// This replaces `moe_down_combine_k8_batched` plus
+    /// `fused_rmsnorm_mq_rotate_vecsum` while retaining the exact arithmetic
+    /// order of both kernels.
+    #[allow(clippy::too_many_arguments)]
+    pub fn moe_down_combine_rmsnorm_mq_rotate_vecsum_gfx1100(
+        &mut self,
+        expert_outputs: &GpuTensor,
+        topk_weights: &GpuTensor,
+        x_residual: &GpuTensor,
+        norm_weight: &GpuTensor,
+        x_rot: &GpuTensor,
+        m: usize,
+        k_top: usize,
+        eps: f32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_mq_signs()?;
+        let (module, src, kernel) = if self.arch_caps.is_gfx1151() {
+            (
+                "moe_down_combine_rmsnorm_mq_rotate_vecsum_gfx1151",
+                kernels::MOE_DOWN_COMBINE_RMSNORM_MQ_ROTATE_VECSUM_GFX1151_SRC,
+                "moe_down_combine_rmsnorm_mq_rotate_vecsum_gfx1151",
+            )
+        } else {
+            (
+                "moe_down_combine_rmsnorm_mq_rotate_vecsum_gfx1100",
+                kernels::MOE_DOWN_COMBINE_RMSNORM_MQ_ROTATE_VECSUM_GFX1100_SRC,
+                "moe_down_combine_rmsnorm_mq_rotate_vecsum",
+            )
+        };
+        self.ensure_kernel(module, src, kernel)?;
+
+        let eop = expert_outputs.buf.as_ptr();
+        let twp = topk_weights.buf.as_ptr();
+        let xrp = x_residual.buf.as_ptr();
+        let nwp = norm_weight.buf.as_ptr();
+        let s1p = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
+        let s2p = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
+        let xop = x_rot.buf.as_ptr();
+        let mv = m as i32;
+        let ktv = k_top as i32;
+        let epsv = eps;
+        let mut params: Vec<*mut c_void> = vec![
+            &eop as *const _ as *mut c_void,
+            &twp as *const _ as *mut c_void,
+            &xrp as *const _ as *mut c_void,
+            &nwp as *const _ as *mut c_void,
+            &s1p as *const _ as *mut c_void,
+            &s2p as *const _ as *mut c_void,
+            &xop as *const _ as *mut c_void,
+            &mv as *const _ as *mut c_void,
+            &ktv as *const _ as *mut c_void,
+            &epsv as *const _ as *mut c_void,
+        ];
+
+        let bytes = (k_top * m + k_top + 2 * m + m + 512 + m) * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "fused", kernel, bytes);
+        let result = self.launch_maybe_blob(kernel, [1, 1, 1], [256, 1, 1], 0, &mut params, || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(eop);
+            b.push_ptr(twp);
+            b.push_ptr(xrp);
+            b.push_ptr(nwp);
+            b.push_ptr(s1p);
+            b.push_ptr(s2p);
+            b.push_ptr(xop);
+            b.push_i32(mv);
+            b.push_i32(ktv);
+            b.push_f32(epsv);
+            b
+        });
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        self.scratch.invalidate_x_caches_for(xrp);
+        self.scratch.invalidate_x_caches_for(xop);
         result
     }
 

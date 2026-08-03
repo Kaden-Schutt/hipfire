@@ -271,6 +271,20 @@ pub fn run_moe_decode(
     // executor and added into x_residual once). `None` → x_residual directly
     // (single-GPU, byte-identical).
     let out_target: &GpuTensor = p.routed_out.unwrap_or(p.x_residual);
+    // gfx1100 experiment: retain one independently schedulable workgroup per
+    // expert rank, but let the last rank for each four-row tile perform the
+    // deterministic expanded-output fold. This is deliberately narrower than
+    // the dtype resolver: mixed/Paro/E8/Lloyd paths keep their existing
+    // kernels and combine semantics.
+    static DOWN_LAST_COMBINE: OnceLock<bool> = OnceLock::new();
+    let down_last_combine = ctx.arch.is_gfx1100()
+        && p.batch_size == 1
+        && p.k == 8
+        && p.expert_dtype_tags.is_none()
+        && p.dtypes.routed_down == DType::MQ4G256
+        && *DOWN_LAST_COMBINE.get_or_init(|| {
+            hipfire_config::developer_var("HIPFIRE_MOE_DOWN_LAST_COMBINE").as_deref() == Ok("1")
+        });
 
     // ── Activation rotation (mirrors qwen35.rs x_rot_local block) ──────────
     let x_rot_local: Option<&GpuTensor> = if res.needs_x_rot_local {
@@ -412,7 +426,7 @@ pub fn run_moe_decode(
         return run_moe_decode_cpu_fallback(ctx, gpu, p, &shared_gate, &shared_up);
     }
     // DIAG: dump router logits before softmax (mirrors qwen35 HIPFIRE_DUMP_HIDDEN)
-    if let Ok(dump_path) = std::env::var("HIPFIRE_DUMP_HIDDEN") {
+    if let Ok(dump_path) = hipfire_config::developer_var("HIPFIRE_DUMP_HIDDEN") {
         if gpu.hip.device_synchronize().is_ok() {
             if let Ok(all) = gpu.download_f32(p.router_logits) {
                 use std::io::Write;
@@ -430,14 +444,79 @@ pub fn run_moe_decode(
             }
         }
     }
-    hip!(gpu.softmax_f32(p.router_logits))?;
-    hip!(gpu.moe_topk_renorm_k8(
-        p.router_logits,
-        p.topk_indices,
-        p.topk_weights,
-        p.n_exp,
-        p.norm_topk_prob
-    ))?;
+    let gfx1100_router_mode = hipfire_config::developer_var("HIPFIRE_GFX1100_ROUTER_W64").ok();
+    let gfx1151_radiowave_fusions = ctx.arch.is_gfx1151();
+    let exact_wave64_router = p.n_exp == 256
+        && ((ctx.arch.is_gfx1100()
+            // The exact fused router is the production gfx1100 path. `0` retains
+            // the two-launch reference path for A/B diagnosis; `approx` retains
+            // the old non-bit-exact research kernel without exposing it by
+            // accident through the former `1` opt-in.
+            && !matches!(gfx1100_router_mode.as_deref(), Some("0" | "approx")))
+            || gfx1151_radiowave_fusions);
+    static ROUTER_SHARED_FUSE: OnceLock<bool> = OnceLock::new();
+    let router_shared_fuse = exact_wave64_router
+        && p.batch_size == 1
+        && !p.skip_shared
+        && p.smi == 512
+        && p.shared_down_w.dtype == DType::MQ4G256
+        && p.shared_down_w.awq_scale.is_none()
+        && *ROUTER_SHARED_FUSE
+            .get_or_init(|| hipfire_config::developer_var("HIPFIRE_MOE_ROUTER_SHARED_FUSE").as_deref() == Ok("1"));
+    let wave64_router = (ctx.arch.is_gfx1201()
+        && hipfire_config::developer_var("HIPFIRE_GFX1201_ROUTER_W64").as_deref() != Ok("0"))
+        || (ctx.arch.is_gfx1100()
+            && p.n_exp == 256
+            // Research-only: faster on gfx1100, but its routing drift can
+            // change greedy trajectories and trigger an attractor.
+            && gfx1100_router_mode.as_deref() == Some("approx"));
+    if router_shared_fuse {
+        let shared_x_rot = unsafe {
+            GpuTensor {
+                buf: gpu.scratch.mq_x_rot.as_ref().unwrap().buf.alias(),
+                shape: vec![gpu.scratch.mq_x_rot.as_ref().unwrap().buf.size() / 4],
+                dtype: DType::F32,
+            }
+        };
+        hip!(
+            gpu.moe_router_softmax_topk_k8_wave64_exact_shared_silu_mq_rotate(
+                p.router_logits,
+                p.topk_indices,
+                p.topk_weights,
+                p.n_exp,
+                p.norm_topk_prob,
+                &shared_gate,
+                &shared_up,
+                &shared_x_rot,
+                p.smi,
+            )
+        )?;
+    } else if exact_wave64_router {
+        hip!(gpu.moe_router_softmax_topk_k8_wave64_exact(
+            p.router_logits,
+            p.topk_indices,
+            p.topk_weights,
+            p.n_exp,
+            p.norm_topk_prob
+        ))?;
+    } else if wave64_router {
+        hip!(gpu.moe_router_softmax_topk_k8_wave64(
+            p.router_logits,
+            p.topk_indices,
+            p.topk_weights,
+            p.n_exp,
+            p.norm_topk_prob
+        ))?;
+    } else {
+        hip!(gpu.softmax_f32(p.router_logits))?;
+        hip!(gpu.moe_topk_renorm_k8(
+            p.router_logits,
+            p.topk_indices,
+            p.topk_weights,
+            p.n_exp,
+            p.norm_topk_prob
+        ))?;
+    }
 
     // ── Shared expert down ───────────────────────────────────────────────────
     // EP: on rank>0 `skip_shared` is set so the replicated shared expert is
@@ -463,7 +542,7 @@ pub fn run_moe_decode(
                     &x_rot_alias,
                     p.smi
                 ))?;
-            } else {
+            } else if !router_shared_fuse {
                 hip!(gpu.fused_silu_mul_rotate_mq(&shared_gate, &shared_up, &x_rot_alias, p.smi))?;
             }
             hip!(gpu.gemv_hfq4g256_residual_sigmoid_scaled_gpu(
@@ -511,6 +590,39 @@ pub fn run_moe_decode(
     let down_m = p.routed_down_m;
     let down_k = p.routed_down_k;
 
+    // Nine-path fused MoE (NInfer D3+D4 graft, microbenched 1.40× at A3B dims):
+    // one x-staged CTA per row tile with 8 routed-expert warps replaces the
+    // per-(row,krank) indexed gate_up GEMV, and the down+weighted-combine fold
+    // replaces the expanded down GEMV + combine kernel — 3 launches total
+    // (D3, silu_rotate, D4) vs 4 with 64× less x restaging. Byte-exact with
+    // the replaced kernels by construction (same per-row accumulate order,
+    // same fold order). Gated to the measured shape: k=8, uniform MQ4G256,
+    // no graded tags, no AWQ, mi=512 (down_k), hidden ≤ 2048 (x LDS stage).
+    // Shape rule from .research/microbench/FINDINGS-moe.md: fused wins only
+    // for k≥8 with small per-expert intermediate; LFM-class (k=4, I=1792)
+    // stays on the chain. HIPFIRE_MOE_NINEPATH=0 opts out.
+    static MOE_NINEPATH: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        hipfire_config::developer_var("HIPFIRE_MOE_NINEPATH").unwrap_or_default()
+    });
+    let ninepath_mode = MOE_NINEPATH.as_str();
+    let ninepath_eligible = p.k == 8
+        && p.batch_size == 1
+        && p.hidden <= 2048
+        && p.mi == 512
+        && p.dtypes.routed_gate_up == DType::MQ4G256
+        && p.dtypes.routed_down == DType::MQ4G256
+        && p.expert_dtype_tags.is_none()
+        && p.expert_down_awq_ptrs.is_none()
+        && !p.defer_routed_combine;
+    // Modes: "0"/off = chain; "d3" = D3 only (RESEARCH: 1-ULP codegen
+    // divergence from the baseline gate_up — not byte-exact, and slower);
+    // "1"/"on" = D3+D4 (research); anything else incl. unset = D4 only
+    // (production default: byte-exact with the chain, +0.8% on the A3B
+    // serve battery — .research/microbench/FINDINGS-moe.md).
+    let ninepath_d3 = ninepath_eligible && matches!(ninepath_mode, "1" | "d3" | "on");
+    let ninepath_d4 =
+        ninepath_eligible && !matches!(ninepath_mode, "0" | "off" | "d3");
+
     {
         // ── Routed-expert dispatch via device-indexed merged kernels ──────────
         //
@@ -522,15 +634,21 @@ pub fn run_moe_decode(
         // per-block.  Uniform quants simply have `expert_dtype_tags = None` and
         // fall through to the single-dtype arms below, which is byte-identical to
         // the old pre-SP2 behaviour.
-        //
-        // `run_moe_decode_mixed` (the old host-bucketing path) is retained below
-        // as dead code for reference and easy revert; it is no longer called.
-        //
         // Select gate_up + down GEMVs by their INDIVIDUAL dtypes, not a coupled
         // routed_indexable_mqN flag — so the mixed "mq6-down" file (gate_up MQ4,
         // down MQ6) dispatches the MQ4 gate_up GEMV and the MQ6 down GEMV. The
         // all-MQ4 and all-MQ6 files select the same kernels as before (byte-identical).
-        if res.routed_indexable_paro {
+        if ninepath_d3 {
+            hip!(gpu.gemv_hfq4g256_moe_ninepath_d3(
+                p.expert_gate_up_ptrs,
+                p.topk_indices,
+                xr,
+                p.gate_batch,
+                p.up_batch,
+                p.mi,
+                gate_up_k,
+            ))?;
+        } else if res.routed_indexable_paro {
             hip!(gpu.gemv_paro_q4g128_moe_gate_up_k8_indexed(
                 p.expert_gate_up_ptrs,
                 p.topk_indices,
@@ -692,7 +810,17 @@ pub fn run_moe_decode(
 
         // Expanded write — down GEMV by the DOWN dtype (mixed mq6-down lands here).
         // FIXME(Step 8): replace hardcoded 1 with p.batch_size when grouped prefill lands
-        if let Some(tags) = p.expert_dtype_tags {
+        if ninepath_d4 {
+            hip!(gpu.gemv_hfq4g256_moe_ninepath_d4(
+                p.expert_down_ptrs,
+                p.topk_indices,
+                p.topk_weights,
+                p.rot_batch,
+                out_target,
+                down_m,
+                down_k,
+            ))?;
+        } else if let Some(tags) = p.expert_dtype_tags {
             // Per-expert mixed down (graded MQ6 hot / MQ2-Lloyd cold). One
             // merged kernel; block-per-(row,krank,token) reads tags[expert_id]
             // (block-uniform → no warp divergence) and branches the dequant.
@@ -786,6 +914,19 @@ pub fn run_moe_decode(
                 p.k,
                 1,
             ))?;
+        } else if down_last_combine {
+            hip!(gpu.gemv_hfq4g256_moe_down_k8_indexed_last_combine(
+                p.expert_down_ptrs,
+                p.topk_indices,
+                p.rot_batch,
+                p.down_expanded,
+                p.topk_weights,
+                out_target,
+                down_m,
+                down_k,
+                p.k,
+                1,
+            ))?;
         } else {
             hip!(gpu.gemv_hfq4g256_moe_down_k8_indexed_batched_expanded(
                 p.expert_down_ptrs,
@@ -815,12 +956,13 @@ pub fn run_moe_decode(
     // experts double-count (atomic + combine) or zero out (expanded written,
     // combine skipped) — silent numerical corruption. The merged kernel's
     // expanded write replaces the standalone Lloyd atomic GEMV.
-    let routed_down_self_combines = p.expert_dtype_tags.is_none()
-        && matches!(
-            p.dtypes.routed_down,
-            DType::MQ2G256Lloyd | DType::MQ3G256Lloyd
-        );
-    if !routed_down_self_combines {
+    let routed_down_self_combines = down_last_combine
+        || (p.expert_dtype_tags.is_none()
+            && matches!(
+                p.dtypes.routed_down,
+                DType::MQ2G256Lloyd | DType::MQ3G256Lloyd
+            ));
+    if !ninepath_d4 && !routed_down_self_combines && !p.defer_routed_combine {
         hip!(gpu.moe_down_combine_k8_batched(
             p.down_expanded,
             p.topk_weights,
@@ -831,318 +973,6 @@ pub fn run_moe_decode(
         ))?;
     }
 
-    Ok(())
-}
-
-/// Intra-layer MIXED-TIER routed-expert dispatch (REAP SP2 Task 3).
-///
-/// [GPU-GATE DEFERRED] Implemented under embargo; the numeric bucketing-
-/// equivalence gate is owed to a GPU session (see
-/// `mixed_dispatch_bucketing_equivalence` stub + the rationale block at the
-/// `res.mixed` branch in `run_moe_decode`).
-///
-/// Runs the gate_up + fused-activation + down for each quant tier present in
-/// the top-k, reusing the existing single-tier indexed kernels. The crux —
-/// rank alignment — is solved by **permute-to-contiguous (Approach A)**:
-/// the top-k is reordered so each tier owns a contiguous rank range, then each
-/// tier's kernels are driven over that range through `GpuTensor::sub_offset`
-/// byte-offset views (the kernels have no output-rank offset arg, but a base
-/// offset on the per-rank buffers gives the same effect since their internal
-/// `krank` starts at 0).
-///
-/// On return, the per-rank `down_expanded` buffer is fully populated and the
-/// device-side `topk_weights` are PERMUTED to match the new rank order, so the
-/// caller's shared `moe_down_combine_k8_batched` (which sums all k slots with
-/// `topk_weights`) yields the correct, permutation-invariant per-token result.
-///
-/// Does NOT call the combine itself (the caller's shared line does), and does
-/// NOT touch `out_target` directly.
-#[allow(clippy::too_many_arguments)]
-fn run_moe_decode_mixed(
-    gpu: &mut Gpu,
-    p: &crate::families::moe::MoeParams,
-    _res: &crate::families::moe::MoeResolution,
-    xr: &GpuTensor,
-    gate_up_k: usize,
-    down_m: usize,
-    down_k: usize,
-    _out_target: &GpuTensor,
-) -> Result<(), DispatchError> {
-    use crate::families::moe_buckets::bucket_topk_by_tier;
-    macro_rules! hip {
-        ($e:expr) => {
-            $e.map_err(|e| DispatchError::Hip(e.to_string()))
-        };
-    }
-
-    let k = p.k;
-    let mi = p.mi;
-
-    // The mixed path is only reachable when per_expert_gate_up is Some AND spans
-    // >1 tier (resolve() guarantees this). per_expert_down is the parallel
-    // table; we bucket by gate_up tier and assert the same expert's down tier
-    // matches (REAP re-quantizes a whole expert to one tier, so gate_up and down
-    // share it — a future split-tier-per-expert model would need separate
-    // gate_up/down bucketing).
-    let tier_of_gate_up =
-        p.dtypes
-            .per_expert_gate_up
-            .as_ref()
-            .ok_or(DispatchError::UnsupportedVariant {
-                family: "moe",
-                variant: "mixed-without-per-expert-gate-up-table",
-                arch: "",
-                quant: "",
-            })?;
-    let tier_of_down = p.dtypes.per_expert_down.as_ref();
-
-    // ── Validate the per-expert tier tables up front (review #6/#7) ──────────
-    // The tables are indexed by routed-expert id (0..n_exp). A mis-sized table
-    // would panic on `tier_of[e]` while bucketing; a table holding a tier the
-    // mixed path has no kernel for would otherwise fail deep in the per-bucket
-    // dispatch with a cryptic `quant: "other"`. Catch both here, clearly.
-    if tier_of_gate_up.len() != p.n_exp {
-        return Err(DispatchError::UnsupportedVariant {
-            family: "moe",
-            variant: "mixed-gate_up-tier-table-len-ne-n_exp",
-            arch: "",
-            quant: "",
-        });
-    }
-    if let Some(td) = tier_of_down {
-        if td.len() != p.n_exp {
-            return Err(DispatchError::UnsupportedVariant {
-                family: "moe",
-                variant: "mixed-down-tier-table-len-ne-n_exp",
-                arch: "",
-                quant: "",
-            });
-        }
-    }
-    // Every gate_up tier must have per-tier kernels (down tiers are checked to
-    // equal the gate_up tier below, so they are transitively covered).
-    if let Some(&bad) = tier_of_gate_up
-        .iter()
-        .find(|t| !crate::families::moe::MIXED_SUPPORTED_TIERS.contains(t))
-    {
-        return Err(DispatchError::UnsupportedVariant {
-            family: "moe",
-            variant: "mixed-unsupported-routed-tier",
-            arch: "",
-            quant: dtype_name(bad),
-        });
-    }
-
-    // ── Host top-k sync (single small D2H; see rationale block) ──────────────
-    // topk_indices are i32 stored in an F32-typed scratch tensor (4-byte slots).
-    let mut idx_bytes = vec![0u8; k * 4];
-    hip!(gpu.hip.memcpy_dtoh(&mut idx_bytes, &p.topk_indices.buf))?;
-    let topk_idx: Vec<u32> = idx_bytes
-        .chunks_exact(4)
-        .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as u32)
-        .collect();
-    let mut w_bytes = vec![0u8; k * 4];
-    hip!(gpu.hip.memcpy_dtoh(&mut w_bytes, &p.topk_weights.buf))?;
-    let topk_w: Vec<f32> = w_bytes
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect();
-
-    // ── Partition by tier, then build the permutation to contiguous ranges ───
-    // tier_of_gate_up.len() == n_exp is enforced above and the router emits ids
-    // < n_exp, so this only fails on a corrupt routing readback — surface it as
-    // a clean error instead of an out-of-bounds panic in the bucketer.
-    let buckets = bucket_topk_by_tier(&topk_idx, tier_of_gate_up).map_err(|bad| {
-        eprintln!(
-            "moe mixed: routed expert id {bad} >= tier table len {}",
-            tier_of_gate_up.len()
-        );
-        DispatchError::UnsupportedVariant {
-            family: "moe",
-            variant: "mixed-routed-expert-id-out-of-range",
-            arch: "",
-            quant: "",
-        }
-    })?;
-    let (perm, ranges) = build_contiguous_permutation(&buckets, k);
-
-    // Assert per-expert down tier agrees with the gate_up tier we bucketed on.
-    if let Some(td) = tier_of_down {
-        for b in &buckets {
-            for &e in &b.experts {
-                if td[e as usize] != b.tier {
-                    return Err(DispatchError::UnsupportedVariant {
-                        family: "moe",
-                        variant: "mixed-expert-gate_up-down-tier-mismatch",
-                        arch: "",
-                        quant: "",
-                    });
-                }
-            }
-        }
-    }
-
-    // ── Re-upload permuted topk_indices + topk_weights to device ─────────────
-    // gate_up/down read topk_indices[rank]; the shared combine reads
-    // topk_weights[rank]. Writing the permuted order into the SAME scratch
-    // buffers keeps every downstream kernel using the contiguous-by-tier rank
-    // order. (Identity permutation ⇒ bytes unchanged ⇒ uniform-equivalent.)
-    let perm_idx: Vec<i32> = perm.iter().map(|&old| topk_idx[old] as i32).collect();
-    let perm_w: Vec<f32> = perm.iter().map(|&old| topk_w[old]).collect();
-    let idx_out: Vec<u8> = perm_idx.iter().flat_map(|v| v.to_le_bytes()).collect();
-    let w_out: Vec<u8> = perm_w.iter().flat_map(|v| v.to_le_bytes()).collect();
-    hip!(gpu.hip.memcpy_htod(&p.topk_indices.buf, &idx_out))?;
-    hip!(gpu.hip.memcpy_htod(&p.topk_weights.buf, &w_out))?;
-
-    // MQ tiers need the FWHT sign tables resident; ensure once if any bucket is
-    // an MQ tier (cheap idempotent no-op when already loaded).
-    if buckets
-        .iter()
-        .any(|b| matches!(b.tier, DType::MQ4G256 | DType::MQ6G256))
-    {
-        hip!(gpu.ensure_mq_signs())?;
-    }
-
-    // ── Per-tier dispatch over each bucket's contiguous rank range ───────────
-    // Every per-rank buffer is sub-offset to the bucket's [lo, lo+n) range so
-    // the kernel's internal `krank ∈ 0..n` lands in the right global slots:
-    //   topk_indices : i32/F32 slots, stride 1   → offset lo,    len n
-    //   gate_batch   : [k × mi] f32              → offset lo*mi, len n*mi
-    //   up_batch     : [k × mi] f32              → offset lo*mi, len n*mi
-    //   rot_batch    : [k × K]  f32 (K=down_k)   → offset lo*K,  len n*K
-    //   down_expanded: [k × M]  f32 (M=down_m)   → offset lo*M,  len n*M
-    // x (xr) is the shared per-token rotated activation — NOT per-rank — so it
-    // is passed whole to every bucket.
-    for (bi, b) in buckets.iter().enumerate() {
-        let (lo, n) = ranges[bi];
-        if n == 0 {
-            continue;
-        }
-        let idx_view = p.topk_indices.sub_offset(lo, n);
-        let gate_view = p.gate_batch.sub_offset(lo * mi, n * mi);
-        let up_view = p.up_batch.sub_offset(lo * mi, n * mi);
-        let rot_view = p.rot_batch.sub_offset(lo * down_k, n * down_k);
-        let down_view = p.down_expanded.sub_offset(lo * down_m, n * down_m);
-
-        // gate_up GEMV (m = 2*mi, gate and up halves), per tier.
-        match b.tier {
-            DType::MQ4G256 => hip!(gpu.gemv_hfq4g256_moe_gate_up_k8_indexed(
-                p.expert_gate_up_ptrs,
-                &idx_view,
-                xr,
-                &gate_view,
-                &up_view,
-                2 * mi,
-                gate_up_k,
-                n,
-            ))?,
-            DType::MQ6G256 => hip!(gpu.gemv_hfq6g256_moe_gate_up_k8_indexed(
-                p.expert_gate_up_ptrs,
-                &idx_view,
-                xr,
-                &gate_view,
-                &up_view,
-                2 * mi,
-                gate_up_k,
-                n,
-            ))?,
-            DType::ParoQ4G128 => hip!(gpu.gemv_paro_q4g128_moe_gate_up_k8_indexed(
-                p.expert_gate_up_ptrs,
-                &idx_view,
-                xr,
-                &gate_view,
-                &up_view,
-                2 * mi,
-                gate_up_k,
-                n,
-            ))?,
-            other => {
-                return Err(DispatchError::UnsupportedVariant {
-                    family: "moe",
-                    variant: "mixed-gate_up-unsupported-tier",
-                    arch: "",
-                    quant: dtype_name(other),
-                })
-            }
-        }
-
-        // Fused silu·mul·rotate over this bucket's n ranks.
-        match b.tier {
-            DType::ParoQ4G128 => {
-                let paro_down =
-                    p.routed_down_paro
-                        .as_ref()
-                        .ok_or(DispatchError::UnsupportedVariant {
-                            family: "moe",
-                            variant: "mixed-paro-without-down-sidecar",
-                            arch: "",
-                            quant: "",
-                        })?;
-                hip!(gpu.fused_silu_mul_givens_rotate_f32(
-                    &gate_view,
-                    &up_view,
-                    &rot_view,
-                    &paro_down.pairs,
-                    &paro_down.theta,
-                    &paro_down.scales,
-                    n,
-                    mi,
-                    paro_down.krot,
-                ))?;
-            }
-            // MQ4 / MQ6 share the FWHT activation (no AWQ on expert down for A3B).
-            _ => {
-                hip!(gpu.fused_silu_mul_rotate_mq_batched(&gate_view, &up_view, &rot_view, mi, n,))?
-            }
-        }
-
-        // down GEMV → expanded write into this bucket's rank slots. k_top = n,
-        // batch_size = 1 ⇒ routing_base = 0 ⇒ reads idx_view[krank], writes
-        // down_view[krank*M] for krank ∈ 0..n. FIXME(Step 8): batch_size.
-        match b.tier {
-            DType::MQ4G256 => hip!(gpu.gemv_hfq4g256_moe_down_k8_indexed_batched_expanded(
-                p.expert_down_ptrs,
-                &idx_view,
-                &rot_view,
-                &down_view,
-                down_m,
-                down_k,
-                n,
-                1,
-            ))?,
-            DType::MQ6G256 => hip!(gpu.gemv_hfq6g256_moe_down_k8_indexed_batched_expanded(
-                p.expert_down_ptrs,
-                &idx_view,
-                &rot_view,
-                &down_view,
-                down_m,
-                down_k,
-                n,
-                1,
-            ))?,
-            DType::ParoQ4G128 => hip!(gpu.gemv_paro_q4g128_moe_down_k8_indexed_batched(
-                p.expert_down_ptrs,
-                &idx_view,
-                &rot_view,
-                &down_view,
-                down_m,
-                down_k,
-                n,
-                1,
-            ))?,
-            other => {
-                return Err(DispatchError::UnsupportedVariant {
-                    family: "moe",
-                    variant: "mixed-down-unsupported-tier",
-                    arch: "",
-                    quant: dtype_name(other),
-                })
-            }
-        }
-    }
-
-    // Combine is the caller's shared `moe_down_combine_k8_batched` (it now reads
-    // the permuted topk_weights → permutation-invariant per-token sum).
     Ok(())
 }
 
@@ -1170,22 +1000,6 @@ fn build_contiguous_permutation(
     }
     debug_assert_eq!(perm.len(), k, "permutation must cover all k ranks");
     (perm, ranges)
-}
-
-/// Static name for a DType (for UnsupportedVariant.quant in the mixed path).
-/// Covers the tiers a routed expert can realistically carry so an
-/// unsupported-tier error names the actual offending tier (e.g. "Q8_0")
-/// instead of a useless "other".
-fn dtype_name(d: DType) -> &'static str {
-    match d {
-        DType::MQ4G256 => "MQ4G256",
-        DType::MQ6G256 => "MQ6G256",
-        DType::ParoQ4G128 => "ParoQ4G128",
-        DType::Q8_0 => "Q8_0",
-        DType::MQ3G256 => "MQ3G256",
-        DType::MQ2G256 => "MQ2G256",
-        _ => "other",
-    }
 }
 
 /// Generic CPU-top-K MoE decode fallback. Restores the per-expert loop #393
@@ -1539,7 +1353,7 @@ pub fn run_moe_decode_bias_aware(
     //    write + fixed-order non-atomic combine into ffn_out — bit-reproducible
     //    for greedy/spec-decode. MOE_DETERMINISTIC=0 uses the faster
     //    atomicAdd-fused path (nondeterministic; bench only).
-    let deterministic = std::env::var("HIPFIRE_DEEPSEEK4_MOE_DETERMINISTIC").as_deref() != Ok("0");
+    let deterministic = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MOE_DETERMINISTIC").as_deref() != Ok("0");
     if deterministic {
         hip!(gpu.deepseek4_gemv_mq2g256_lloyd_moe_down_expanded_k4(
             p.expert_down_ptrs,
@@ -1581,6 +1395,10 @@ pub fn run_moe_decode_bias_aware(
 /// `Lloyd4w` on gfx11+, `Base` otherwise). Selected once per gate_up/down call.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum GroupedLloydVariant {
+    /// i8 WMMA MMQ path (gfx1151): decodes the 2-bit Lloyd index via an int8
+    /// codebook LUT and runs i8 WMMA at ~2x the FP16 rate. Top priority when
+    /// enabled — ~1.7x the FP16 grouped GEMM on the DeepSeek-V4 prefill shape.
+    I8,
     N32,
     Cnd,
     EightW,
@@ -1705,13 +1523,16 @@ pub fn grouped_lloyd_band(
 
 fn select_grouped_lloyd_variant(
     use_lloyd_4w: bool,
+    i8: bool,
     n32: bool,
     cnd: bool,
     eightw: bool,
     use_mmqload: bool,
     use_nosync: bool,
 ) -> GroupedLloydVariant {
-    if use_lloyd_4w && n32 {
+    if i8 {
+        GroupedLloydVariant::I8
+    } else if use_lloyd_4w && n32 {
         GroupedLloydVariant::N32
     } else if use_lloyd_4w && cnd {
         GroupedLloydVariant::Cnd
@@ -1726,6 +1547,10 @@ fn select_grouped_lloyd_variant(
     } else {
         GroupedLloydVariant::Base
     }
+}
+
+fn use_gfx1151_i8_moe(arch: &str) -> bool {
+    arch == "gfx1151"
 }
 
 /// Dispatch one MQ2-Lloyd grouped GEMM. All seven variants share the signature
@@ -1749,6 +1574,18 @@ fn dispatch_grouped_lloyd(
 ) -> Result<(), DispatchError> {
     use GroupedLloydVariant as V;
     let r = match variant {
+        V::I8 => gpu.gemm_mq2g256_lloyd_moe_grouped_mmq_gfx1151(
+            ptrs,
+            tile_ids,
+            slot_index,
+            x,
+            y,
+            m,
+            k,
+            x_row_div,
+            m_total_max,
+            rows,
+        ),
         V::N32 => gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_n32(
             ptrs,
             tile_ids,
@@ -2067,7 +1904,7 @@ pub fn run_moe_prefill_bias_aware(
     }
 
     // DIAG: dump per-layer topk indices ([B, k_top] i32) — off by default.
-    if let Ok(path) = std::env::var("HIPFIRE_DEEPSEEK4_DUMP_TOPK") {
+    if let Ok(path) = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_DUMP_TOPK") {
         use std::io::Write;
         let raw = hip!(gpu.download_f32(p.topk_indices))?;
         let n = batch_size * k_top;
@@ -2091,25 +1928,27 @@ pub fn run_moe_prefill_bias_aware(
     }
 
     // ── Grouped vs scalar gate ────────────────────────────────────────────────
-    let gate_threshold: usize = std::env::var("HIPFIRE_DEEPSEEK4_MOE_GROUPED_GATE")
+    let gate_threshold: usize = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MOE_GROUPED_GATE")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(128);
     let use_grouped = batch_size >= gate_threshold
-        && std::env::var("HIPFIRE_DEEPSEEK4_MOE_GROUPED").as_deref() != Ok("0");
+        && hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MOE_GROUPED").as_deref() != Ok("0");
 
     // Shared research levers (read once; default 4w on gfx11+).
-    let lloyd_4w_base = match std::env::var("HIPFIRE_DEEPSEEK4_MOE_LLOYD_4W").as_deref() {
+    let lloyd_4w_base = match hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MOE_LLOYD_4W").as_deref() {
         Ok("0") => Some(false),
         Ok("1") => Some(true),
         _ => None,
     };
     let arch_4w = gpu.arch.starts_with("gfx11") || gpu.arch.starts_with("gfx12");
-    let n32 = std::env::var("HIPFIRE_DEEPSEEK4_MOE_N32").as_deref() == Ok("1");
-    let cnd = std::env::var("HIPFIRE_DEEPSEEK4_MOE_CND").as_deref() == Ok("1");
-    let eightw = std::env::var("HIPFIRE_DEEPSEEK4_MOE_8W").as_deref() == Ok("1");
-    let mmqload_env = std::env::var("HIPFIRE_DEEPSEEK4_MOE_MMQLOAD").as_deref() == Ok("1");
-    let nosync_env = std::env::var("HIPFIRE_DEEPSEEK4_MOE_NOSYNC").as_deref() == Ok("1");
+    let n32 = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MOE_N32").as_deref() == Ok("1");
+    let cnd = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MOE_CND").as_deref() == Ok("1");
+    let eightw = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MOE_8W").as_deref() == Ok("1");
+    let mmqload_env = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MOE_MMQLOAD").as_deref() == Ok("1");
+    let nosync_env = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MOE_NOSYNC").as_deref() == Ok("1");
+    // i8 MMQ path (gfx1151 only): 2-bit Lloyd → int8 codebook LUT + i8 WMMA.
+    let i8_moe = use_gfx1151_i8_moe(&gpu.arch);
 
     if use_grouped {
         const BLOCK_M: usize = 16;
@@ -2134,8 +1973,11 @@ pub fn run_moe_prefill_bias_aware(
             lloyd_4w_base.unwrap_or(arch_4w) && (2 * im) % 64 == 0 && hidden % 256 == 0;
         let use_mmqload_gu = use_lloyd_4w_gu && mmqload_env;
         let use_nosync_gu = use_mmqload_gu && nosync_env;
+        // i8 path requires (2*im)%16==0 && hidden%256==0 (looser than 4w's %64).
+        let use_i8_gu = i8_moe && (2 * im) % 16 == 0 && hidden % 256 == 0;
         let v_gu = select_grouped_lloyd_variant(
             use_lloyd_4w_gu,
+            use_i8_gu,
             n32,
             cnd,
             eightw,
@@ -2158,7 +2000,7 @@ pub fn run_moe_prefill_bias_aware(
         )?;
 
         // Unscatter + SwiGLU·clamp.
-        let use_fused_unscatter_silu = std::env::var("HIPFIRE_DEEPSEEK4_FUSED_UNSCATTER_SILU")
+        let use_fused_unscatter_silu = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_FUSED_UNSCATTER_SILU")
             .map(|s| s != "0")
             .unwrap_or(false);
         if use_fused_unscatter_silu {
@@ -2198,8 +2040,10 @@ pub fn run_moe_prefill_bias_aware(
         let use_lloyd_4w_dn = lloyd_4w_base.unwrap_or(arch_4w) && hidden % 64 == 0 && im % 256 == 0;
         let use_mmqload_dn = use_lloyd_4w_dn && mmqload_env;
         let use_nosync_dn = use_mmqload_dn && nosync_env;
+        let use_i8_dn = i8_moe && hidden % 16 == 0 && im % 256 == 0;
         let v_dn = select_grouped_lloyd_variant(
             use_lloyd_4w_dn,
+            use_i8_dn,
             n32,
             cnd,
             eightw,
@@ -2259,7 +2103,7 @@ pub fn run_moe_prefill_bias_aware(
         // Down: deterministic expanded+combine (default; bit-reproducible for
         // spec-decode) vs non-deterministic atomic-accumulate.
         let deterministic =
-            std::env::var("HIPFIRE_DEEPSEEK4_MOE_DETERMINISTIC").as_deref() != Ok("0");
+            hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MOE_DETERMINISTIC").as_deref() != Ok("0");
         if deterministic {
             hip!(gpu.deepseek4_gemv_mq2g256_lloyd_moe_down_expanded_k4(
                 p.expert_down_ptrs,
@@ -2506,7 +2350,7 @@ pub fn run_moe_prefill(
 
     let res = MoePrefillResolution::resolve(&p.dtypes, &ctx.arch, &ctx.flags);
     let force_mq4_grouped_fp16 = res.force_mq4_grouped_fp16 || p.force_mq4_grouped_fp16;
-    if std::env::var("HIPFIRE_MOE_PREFILL_TRACE").ok().as_deref() == Some("1") {
+    if hipfire_config::developer_var("HIPFIRE_MOE_PREFILL_TRACE").ok().as_deref() == Some("1") {
         eprintln!(
             "[moe-prefill] arch={} shared=({:?},{:?},{:?},{:?}) routed=({:?},{:?}) \
              path2={} force_mq4_fp16={} grouped_i8={:?}",
@@ -2978,9 +2822,17 @@ pub fn dispatch_fused(
 
 #[cfg(test)]
 mod mixed_dispatch_tests {
-    use super::build_contiguous_permutation;
+    use super::{build_contiguous_permutation, use_gfx1151_i8_moe};
     use crate::families::moe_buckets::bucket_topk_by_tier;
     use rdna_compute::DType::*;
+
+    #[test]
+    fn deepseek4_i8_moe_is_exact_gfx1151_only() {
+        assert!(use_gfx1151_i8_moe("gfx1151"));
+        for arch in ["gfx1100", "gfx1150", "gfx1152", "gfx1200", "gfx1201"] {
+            assert!(!use_gfx1151_i8_moe(arch), "unexpected i8 route on {arch}");
+        }
+    }
 
     /// EQUIVALENCE INVARIANT (host half): an all-ONE-tier table yields the
     /// IDENTITY permutation and a single full-width range. This is the

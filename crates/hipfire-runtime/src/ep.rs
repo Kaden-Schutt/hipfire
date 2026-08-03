@@ -132,7 +132,8 @@ pub fn run_layer_program_ep<B: ForwardBindings>(
             let refs: Vec<&DeviceBuffer> = partials.iter().map(|p| &p.buf).collect();
             static PEER_DECODE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
             let use_peer = *PEER_DECODE.get_or_init(|| {
-                std::env::var("HIPFIRE_EP_PEER_ALLREDUCE_DECODE").as_deref() == Ok("1")
+                hipfire_config::developer_var("HIPFIRE_EP_PEER_ALLREDUCE_DECODE").as_deref()
+                    == Ok("1")
             });
             if use_peer {
                 gpus.all_reduce_sum_f32_peer(&refs, residual_dim)

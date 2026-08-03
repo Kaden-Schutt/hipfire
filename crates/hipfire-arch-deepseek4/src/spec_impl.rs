@@ -55,7 +55,7 @@ impl SpecScratch for Deepseek4DsparkScratch {
 /// Max batch for the trunk-side verify PBS (bootstrap 1-token + verify up to
 /// block+1 tokens). Mirror of `Deepseek4DsparkDrafter::pbs_max_batch`.
 fn dspark_verify_pbs_max_batch() -> usize {
-    std::env::var("HIPFIRE_DEEPSEEK4_PP_BATCH")
+    hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_PP_BATCH")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(1024)
@@ -194,11 +194,19 @@ impl SpecTarget for Deepseek4Bundle {
         self
     }
 
-    fn reset_recurrent(&mut self, _gpu: &mut Gpu) {
-        // n_tokens → 0 + mtp_last_hidden cleared; the position-indexed KV / SWA /
-        // compressed-KV rings are overwritten by the next prefill, never read
-        // beyond n_tokens (see `DeepseekV4State::reset`). No GPU work needed.
+    fn reset_recurrent(&mut self, gpu: &mut Gpu) -> Result<(), String> {
+        // Host counters + MTP residual + graph-warmup flag, then zero every
+        // position-indexed SWA/full/compressed/indexer cache so a fresh
+        // conversation cannot bleed prior-turn residue (pairs with the
+        // daemon's `gpu.invalidate_graph_state()` after this hook).
         self.state.reset();
+        self.state.zero_decode_caches(gpu);
+        Ok(())
+    }
+
+    fn retry_reset_eligible(&self) -> bool {
+        // reset() + zero_decode_caches; daemon pairs invalidate_graph_state.
+        true
     }
 
     fn eos_token(&self) -> u32 {
@@ -255,7 +263,10 @@ impl SpecTarget for Deepseek4Bundle {
         let last_logits =
             result.map_err(|e| format!("Deepseek4Bundle::spec_advance prefill: {e}"))?;
         let last_argmax = crate::spec_decode::logits_argmax(&last_logits) as u32;
-        Ok(SpecAdvance::Ready { last_argmax })
+        Ok(SpecAdvance::Ready {
+            last_argmax,
+            last_logits: Some(last_logits),
+        })
     }
 
     // ── DSpark verify primitives ──────────────────────────────────────────

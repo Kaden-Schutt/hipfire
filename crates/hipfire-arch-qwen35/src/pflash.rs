@@ -96,72 +96,6 @@ impl Default for PflashConfig {
     }
 }
 
-impl PflashConfig {
-    /// Hydrate config from `HIPFIRE_PREFILL_*` env vars. Any missing var
-    /// falls back to the default. Invalid values panic with a clear
-    /// message rather than silently degrading.
-    pub fn from_env() -> Self {
-        let mut cfg = PflashConfig::default();
-        if let Ok(v) = std::env::var("HIPFIRE_PREFILL_COMPRESSION") {
-            cfg.mode = PflashMode::parse(&v).unwrap_or_else(|| {
-                panic!("HIPFIRE_PREFILL_COMPRESSION={v} not in {{off,auto,always}}")
-            });
-        }
-        if let Ok(v) = std::env::var("HIPFIRE_PREFILL_THRESHOLD") {
-            cfg.threshold_tokens = v
-                .parse()
-                .unwrap_or_else(|_| panic!("HIPFIRE_PREFILL_THRESHOLD={v} not a usize"));
-        }
-        if let Ok(v) = std::env::var("HIPFIRE_PREFILL_KEEP_RATIO") {
-            cfg.keep_ratio = v
-                .parse()
-                .unwrap_or_else(|_| panic!("HIPFIRE_PREFILL_KEEP_RATIO={v} not f32"));
-            assert!(
-                cfg.keep_ratio > 0.0 && cfg.keep_ratio <= 1.0,
-                "HIPFIRE_PREFILL_KEEP_RATIO must be in (0, 1], got {}",
-                cfg.keep_ratio
-            );
-        }
-        if let Ok(v) = std::env::var("HIPFIRE_PREFILL_ALPHA") {
-            cfg.alpha = v
-                .parse()
-                .unwrap_or_else(|_| panic!("HIPFIRE_PREFILL_ALPHA={v} not f32"));
-        }
-        if let Ok(v) = std::env::var("HIPFIRE_PREFILL_MIN_KEEP") {
-            cfg.min_keep_tokens = v
-                .parse()
-                .unwrap_or_else(|_| panic!("HIPFIRE_PREFILL_MIN_KEEP={v} not usize"));
-        }
-        if let Ok(v) = std::env::var("HIPFIRE_PREFILL_SINK") {
-            cfg.sink_tokens = v
-                .parse()
-                .unwrap_or_else(|_| panic!("HIPFIRE_PREFILL_SINK={v} not usize"));
-        }
-        if let Ok(v) = std::env::var("HIPFIRE_PREFILL_RECENT") {
-            cfg.recent_tokens = v
-                .parse()
-                .unwrap_or_else(|_| panic!("HIPFIRE_PREFILL_RECENT={v} not usize"));
-        }
-        if let Ok(v) = std::env::var("HIPFIRE_PREFILL_BLOCK") {
-            cfg.block_size = v
-                .parse()
-                .unwrap_or_else(|_| panic!("HIPFIRE_PREFILL_BLOCK={v} not usize"));
-        }
-        if let Ok(v) = std::env::var("HIPFIRE_PREFILL_SPARSE_THRESHOLD") {
-            cfg.sparse_threshold = v
-                .parse()
-                .unwrap_or_else(|_| panic!("HIPFIRE_PREFILL_SPARSE_THRESHOLD={v} not usize"));
-        }
-        if std::env::var("HIPFIRE_PREFILL_PROFILE").ok().as_deref() == Some("1") {
-            cfg.profile = true;
-        }
-        if let Ok(v) = std::env::var("HIPFIRE_PREFILL_DRAFTER") {
-            cfg.drafter_path = Some(v);
-        }
-        cfg
-    }
-}
-
 /// Drafter model variant. Plain Qwen3 / LLaMA-family loads via `llama::*`;
 /// Qwen3.5 hybrid (DeltaNet + FullAttn + optional MoE) loads via `qwen35::*`.
 /// PFlash dispatches at runtime based on which variant is held.
@@ -305,7 +239,7 @@ impl PflashState {
             m.free_gpu(gpu);
         }
         if let Some(kv) = self.drafter_kv.take() {
-            kv.free_gpu(gpu);
+            let _ = kv.free_gpu(gpu);
         }
         self.drafter_tokenizer = None;
         self.drafter_loaded = false;
@@ -524,24 +458,26 @@ pub enum DrafterKvMode {
 }
 
 impl DrafterKvMode {
-    /// Read `HIPFIRE_PFLASH_DRAFTER_KV` env var; defaults to Q8 (current
-    /// production behaviour). Unknown values panic loudly rather than
-    /// silently downgrading. asym3 is intentionally NOT accepted —
+    /// Resolve `speculation.prefill.drafter_kv`; defaults to Q8 (current
+    /// production behaviour). The shared schema rejects unknown values before
+    /// model load. asym3 is intentionally NOT accepted —
     /// banned from drafter scoring per project policy (per-pair Givens
     /// noise localizes error, biasing the head_dim-averaged cosine;
     /// fwht's distributed-noise spectrum is the right shape).
-    pub fn from_env() -> Self {
-        match std::env::var("HIPFIRE_PFLASH_DRAFTER_KV").ok().as_deref() {
+    pub fn from_config() -> Self {
+        match hipfire_config::process_value("HIPFIRE_PFLASH_DRAFTER_KV").as_deref() {
             None | Some("") | Some("q8") | Some("Q8") => DrafterKvMode::Q8,
             Some("fwht4") | Some("FWHT4") => DrafterKvMode::Fwht4,
             Some("fwht3") | Some("FWHT3") => DrafterKvMode::Fwht3,
             Some("fwht2") | Some("FWHT2") => DrafterKvMode::Fwht2,
             Some("asym3") | Some("ASYM3") => panic!(
-                "HIPFIRE_PFLASH_DRAFTER_KV=asym3 is banned for drafter scoring — \
+                "speculation.prefill.drafter_kv=asym3 is banned for drafter scoring — \
                  use fwht3 (similar throughput, better scorer accuracy)"
             ),
             Some(other) => {
-                panic!("HIPFIRE_PFLASH_DRAFTER_KV={other:?} not in {{q8, fwht4, fwht3, fwht2}}")
+                panic!(
+                    "speculation.prefill.drafter_kv={other:?} not in {{q8, fwht4, fwht3, fwht2}}"
+                )
             }
         }
     }
@@ -554,7 +490,7 @@ pub fn load_drafter(
     target_tokenizer: &Tokenizer,
     max_kv_seq: usize,
 ) -> HipResult<()> {
-    let kv_mode = DrafterKvMode::from_env();
+    let kv_mode = DrafterKvMode::from_config();
     let mut hfq = HfqFile::open(path).map_err(|e| {
         hip_bridge::HipError::new(
             0,
@@ -932,8 +868,7 @@ pub fn compute_scores_batched(
         .as_ref()
         .and_then(|m| m.score_layer_idx())
         .unwrap_or(n_layers - 1);
-    let layer_idx = std::env::var("HIPFIRE_PFLASH_SCORE_LAYER")
-        .ok()
+    let layer_idx = hipfire_config::process_value("HIPFIRE_PFLASH_SCORE_LAYER")
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|&i| i < n_layers)
         .unwrap_or(auto_layer);
@@ -1030,7 +965,7 @@ pub fn compute_scores_batched_gpu(
     // positions exceed the small drafter's trained window, but the
     // shallowest FullAttn layer's K is still finite at 21K source.
     //
-    // HIPFIRE_PFLASH_SCORE_LAYER preserves an escape hatch for
+    // `diagnostic.pflash.score_layer` preserves an escape hatch for
     // operators bisecting the issue further or experimenting with
     // alternative scoring layers; if set and in range it overrides the
     // auto-pick.
@@ -1039,8 +974,7 @@ pub fn compute_scores_batched_gpu(
         .as_ref()
         .and_then(|m| m.score_layer_idx())
         .unwrap_or(n_layers - 1);
-    let layer_idx = std::env::var("HIPFIRE_PFLASH_SCORE_LAYER")
-        .ok()
+    let layer_idx = hipfire_config::process_value("HIPFIRE_PFLASH_SCORE_LAYER")
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|&i| i < n_layers)
         .unwrap_or(auto_layer);

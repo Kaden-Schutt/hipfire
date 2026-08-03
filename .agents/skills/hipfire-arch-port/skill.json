@@ -1,7 +1,7 @@
 {
   "name": "hipfire-arch-port",
   "version": "0.1.0",
-  "description": "Port hipfire compute kernels to a new RDNA / CDNA architecture (gfx1201/gfx1200/gfx94x/gfx1150/etc.). Captures the WMMA operand-shape matrix, builtin name table, dispatch routing convention, validation procedure, and known correctness traps. Use this when adding support for a new GPU arch or fixing arch-specific kernel codegen failures.",
+  "description": "Port hipfire compute kernels to a new RDNA / CDNA architecture (gfx1201/gfx1200/gfx94x/gfx1150/etc.). Use when adding support for a new GPU arch, fixing arch-specific kernel codegen failures (e.g. \"Cannot select intrinsic %llvm.amdgcn.wmma...\"), or refactoring rdna-compute arch-conditional dispatch. Captures the workflow for WMMA/MFMA ports, ArchCaps routing, channel/speed validation selection, contributor onboarding, and known correctness traps.",
   "triggers": [
     "port to gfx12",
     "port to gfx1201",
@@ -14,7 +14,9 @@
     "amdgcn.wmma",
     "new arch port",
     "arch fallback",
-    "cross-arch kernel"
+    "cross-arch kernel",
+    "ArchCaps",
+    "rdna-compute dispatch"
   ],
   "entry": "./playbook.md",
   "interpret": "./playbook.md",
@@ -22,11 +24,19 @@
     "playbook": "./playbook.md",
     "wmma-matrix": "./wmma-matrix.md",
     "contributor-onboarding": "./contributor-onboarding.md",
-    "validation": "./validation.md"
+    "validation": "./validation.md",
+    "speculation": "./speculation.md",
+    "arch-port-validation": "../../../docs/methodology/arch-port-validation.md",
+    "validation-routes": "../../../docs/VALIDATION.md"
   },
   "requires": {
-    "rocm": "7.0+",
-    "hipfire-tree": "checkout of https://github.com/Kaden-Schutt/hipfire",
-    "hardware": "the target GPU arch (the port cannot be merged without empirical channel-test on real hardware)"
-  }
+    "rocm": "current checkout-supported ROCm/HIP toolchain",
+    "hipfire-tree": "checkout with crates/rdna-compute and kernels/src",
+    "hardware": "target GPU arch (channel proof required on real hardware; no emulator path)"
+  },
+  "related": [
+    "hipfire-kernel-tuning",
+    "hipfire-kernel-atlas",
+    "hipfire-tester"
+  ]
 }

@@ -1,249 +1,221 @@
 # hipfire arch-port playbook
 
-When you (or an agent helping you) want to add a new GPU arch to
-hipfire, read this end-to-end before touching code. Most of the
-mistakes other arch ports have hit are documented here so you don't
-spend a week chasing them.
+Workflow for adding or repairing a **GPU ISA** path (RDNA/CDNA). Read end-to-end before editing dispatch or `.hip` sources.
 
-## When to use this skill
+Model-family work is out of scope here — see [`docs/architecture-ids.md`](../../../docs/architecture-ids.md) and `crates/hipfire-arch-toy/`.
 
-- A user reports a HIP codegen / kernel-select failure on a new arch
-  (e.g. issue #54: `Cannot select: intrinsic %llvm.amdgcn.wmma...`
-  on gfx1201).
-- You're adding `gfx1200` / `gfx1201` / `gfx1151` / `gfx1152` /
-  `gfx94x` / `gfx950` to the supported list.
-- You see the `(EXPERIMENTAL — opt-in only)` flag on a feature and
-  want to mainstream it on a new arch.
-- You're refactoring `dispatch.rs`'s arch-conditional branches.
+## When to use
 
-## What's in this skill
+- Codegen / intrinsic select failure on a chip hipfire does not yet route correctly.
+- New chip or family: `gfx1200` / `gfx1201` / `gfx115x` / `gfx94x` / etc.
+- `ArchCaps` or GEMM/GEMV arch-branch refactors in `crates/rdna-compute/`.
+- Mainstreaming an env-gated experimental path on hardware that already runs a fallback.
 
-| File | Purpose |
+## Companion files (this skill)
+
+| File | Use |
 |---|---|
-| `playbook.md` (this) | Top-level workflow, when-to-use, contributor pointer |
-| `wmma-matrix.md` | WMMA operand-shape × builtin × lane-layout table per arch |
-| `validation.md` | The three gates every port must pass before merge |
-| `contributor-onboarding.md` | If you have hardware and want to help — start here |
-| `speculation.md` | Step 7 (optional): adding speculative decode to the new arch |
+| `playbook.md` (this) | Sequence + traps |
+| `wmma-matrix.md` | Operand / builtin / lane reference — **re-check ROCm headers** |
+| `validation.md` | Local notes; route selection is **not** owned here |
+| `contributor-onboarding.md` | Hardware owner → PR |
+| `speculation.md` | Optional step after AR is correct |
 
-## The arch-port workflow (6 load-bearing steps + optional step 7)
+## Canonical owners (do not fork inventories)
 
-### 1. Read `wmma-matrix.md` first
+| Fact | Owner |
+|---|---|
+| Validation route for a claim class | [`docs/VALIDATION.md`](../../../docs/VALIDATION.md) |
+| Arch-port correctness method | [`docs/methodology/arch-port-validation.md`](../../../docs/methodology/arch-port-validation.md) |
+| Perf measurement protocol | [`docs/methodology/perf-benchmarking.md`](../../../docs/methodology/perf-benchmarking.md) |
+| Model `arch_id` ↔ crate | [`docs/architecture-ids.md`](../../../docs/architecture-ids.md) |
+| Crate / lifecycle overview | [`docs/ARCHITECTURE.md`](../../../docs/ARCHITECTURE.md) |
+| Route admission | [`docs/admissions.yml`](../../../docs/admissions.yml) (empty → fail closed) |
+| Docs navigation | [`docs/INDEX.md`](../../../docs/INDEX.md) |
 
-Most arch ports involve at least one matrix kernel (GEMM/WMMA/MFMA).
-The matrix doc lists the operand shapes, builtin names, and lane
-layouts for every arch hipfire currently knows about. **The single
-biggest pitfall is assuming an `#ifdef` macro swap of the builtin
-name is enough — it isn't, because operand vector lengths and
-per-lane K-packing differ between archs.**
+**No universal gate.** Implementation (source exists, branch compiles, one harness green) is never certification or admission.
 
-### 2. Check `dispatch.rs` for the existing arch-conditional sites
+---
 
-Every arch-aware GEMM dispatch in `crates/rdna-compute/src/dispatch.rs`
-has the shape:
+## Modular surfaces (current tree)
 
-```rust
-if has_<feature>(&self.arch) {
-    return self.<kernel>_<feature>(...);
-}
-if has_<fallback_feature>(&self.arch) {
-    return self.<kernel>_<fallback_feature>(...);
-}
-return self.<kernel>_baseline(...);
+Post-modular layout that matters for GPU ports:
+
+```
+crates/rdna-compute/src/
+  arch_caps.rs     # ArchCaps atoms + has_wmma / has_wmma_w32 / has_wmma_w32_gfx12 / is_rdna4 / is_cdna3 / is_wave64_native / …
+  kernels.rs       # include_str! registration of .hip sources
+  gemm.rs / gemv.rs / moe.rs / attention.rs / …
+  dispatch.rs      # public Gpu method surface (bind_thread, launch)
+kernels/src/*.hip  # sources; chip/family tags
+scripts/compile-kernels.sh
+scripts/write-kernel-hashes.sh
+
+crates/hipfire-dispatch/   # KernelKey tables, MoE Path-2 pipeline (uses ArchCaps)
+crates/hipfire-arch-*/     # model forward; call Gpu methods — do not bury ISA tables here
+crates/hipfire-runtime/examples/test_kernels.rs
 ```
 
-Style for new dispatch branches: match the surrounding code. Some
-sites use `arch.starts_with(...)` inline, others factor into
-`has_<feature>(arch)` helpers (`has_dot2_f32_f16`, etc.). Either
-shape is fine in principle. The existing helpers are co-located
-near the top of `dispatch.rs` (around lines 30–80) — extend them
-when the same predicate would be tested in 3+ places. Add new
-inline checks when one site needs the test once.
+**Rule:** ISA routing stays in `rdna-compute` (and shared dispatch tables that read `ArchCaps`). Do not scatter per-chip WMMA tables inside individual model crates unless the kernel is crate-local by design (rare; e.g. arch-tagged LFM scan kernels). Prefer shared `kernels/src` + `rdna-compute` registration.
 
-When adding a new arch's dispatch branch, the only invariant is
-**no unreachable code**. The dispatch sites are layered fast-paths
-with fallthrough — multiple archs legitimately share a downstream
-predicate (e.g. `has_dot2_f32_f16` matches RDNA1.5 / RDNA2 / RDNA3
-/ RDNA4 all together for the dot2 fallback), and that's correct
-because they each route there only after the higher-priority
-branches return-or-fall-through.
+---
 
-What you DO need to check after adding a new branch: did your new
-branch make any of the literal conditions in lower-priority
-branches redundant? Specifically:
+## Workflow (6 load-bearing steps + optional 7)
 
-- A literal `... || starts_with("gfxN")` clause where every gfxN-
-  prefixed arch is now matched by your earlier branch → drop the
-  `|| starts_with("gfxN")` clause in the same diff.
-- An entire branch whose predicate is now strictly subsumed by an
-  earlier branch (rare, usually a sign your new branch is too
-  broad).
+### 1. Read WMMA/MFMA facts for the target family
 
-Predicate-style helpers (`has_dot2_f32_f16(arch)`, etc.) typically
-do NOT need narrowing when you add a new arch — the helper
-intentionally covers a broad family, and downstream sites rely on
-that. Edit the helper only if its definition is genuinely wrong
-for the new arch, not because your new branch overlaps with part
-of its set.
+Open [`wmma-matrix.md`](wmma-matrix.md), then verify builtins against the **local** ROCm install. Split by target family — do not run only the RDNA path when porting CDNA.
 
-Run the speed-gate on the baseline arch (gfx1100 on the local
-7900 XTX bench) after the change. If the gate regresses,
-root-cause it (see `validation.md` troubleshooting) rather than
-splitting the diff to dodge the regression.
+**RDNA (WMMA — e.g. gfx11 / gfx12):**
 
-### 3. Closed: "predicate-vs-inline" was a stale-binary artifact
-
-In commit `a048544` (reverted in `1f3bad3`) I replaced six inline
-
-```rust
-if self.arch.starts_with("gfx11") || self.arch.starts_with("gfx12") {
+```bash
+rg --no-heading -n 'wmma_f32_16x16x16_f16' /opt/rocm/include/ | head -20
 ```
 
-calls with a single `has_wmma_f16(&self.arch)` predicate. The
-post-commit speed-gate measured a ~50% prefill regression on
-gfx1100. I reverted on suspicion of an inlining/register-alloc
-issue, but **the regression was a measurement artifact**, not a
-real codegen difference.
+Biggest pitfall: treating gfx12 as a gfx11 builtin rename. Operand vector length, K packing, and C-mapping change. Assume C-mapping is wrong until channel-tested on the target GPU.
 
-**Root cause (re-tested 2026-04-27 in commit 6e100c2):** the
-speed-gate's `ensure_build()` only invokes `cargo build --release`
-when `target/release/examples/bench_qwen35_mq4` does NOT already
-exist. A "stash the change and re-run" flow leaves the previously-
-built binary in place, so the re-bench measures the SAME code as
-the post-change run. Both numbers reflect the same binary; the
-delta is just run-to-run thermal noise.
+**CDNA (MFMA — e.g. gfx94x / gfx942):**
 
-After `rm target/release/examples/bench_qwen35_mq4` and a forced
-rebuild on the predicate refactor:
-
-  clean master rebuild:        1080 tok/s 4b pp32 prefill
-  predicate refactor rebuild:  1138.6 tok/s (+5.4% noise band)
-
-Both well above the 1014 committed floor. The predicate is
-functionally identical to the inline `||` chain for gfx11.
-
-**For contributors today:** if you hit a perf regression after a
-dispatch.rs edit that "should be a no-op", root-cause it before
-working around it:
-
-1. `rm target/release/examples/<bench>` to force a fresh build of
-   the bench binary specifically (the gate's `ensure_build` will
-   then rebuild it).
-2. `cargo clean -p rdna-compute && cargo build --release ...` to
-   invalidate the dispatch-crate artifacts.
-3. `cat /sys/class/drm/card*/device/pp_dpm_sclk` to check DPM state.
-4. `dmesg | tail -40` for firmware errors / SMU mismatch.
-5. `ls /lib/firmware/updates/amdgpu` — if present, may be shadowing
-   kernel firmware (system-side fix only; see troubleshooting).
-6. Re-run the gate.
-
-If the regression survives a clean rebuild AND the system is in
-known-good state, NOW it's a real codegen problem and you can
-investigate the diff. Don't preemptively avoid helper functions
-based on a measurement that hasn't been isolated.
-
-### 4. Author the new arch's kernel(s) as separate `.hip` files
-
-Naming convention: `<existing_kernel_name>.<arch_tag>.hip` (dot-
-separated tag in the middle of the filename, NOT trailing
-underscore). The tag is one of:
-
-- `.gfxNNNN.` — chip-specific (e.g. `.gfx1100.` for Navi 31).
-- `.gfxNN.` — family-wide (e.g. `.gfx12.` for both gfx1200 and
-  gfx1201). `scripts/compile-kernels.sh` resolves family tags as a
-  fallback when no chip-specific variant exists.
-
-Existing examples:
-
-- `kernels/src/gemv_hfq4g256.gfx1100.hip` — gfx1100 chip-specific.
-- `kernels/src/gemv_hfq4g256.gfx1030.v1.hip` ... `.v5.hip` —
-  multiple gfx1030 versions (each registered as an INDEPENDENT kernel
-  in `kernels.rs`, not a fallback override).
-- `kernels/src/gemm_qkv_hfq4g256_wmma.gfx12.hip` — **the canonical
-  gfx12 WMMA reference** (commit 6924f2a). Read this file end-to-end
-  before porting any other gfx11 WMMA kernel — it documents the four
-  load-bearing differences (builtin name, operand vector size, K-split
-  across lane-groups, C-output mapping hypothesis) inline.
-
-Single-file `#ifdef __gfx12__` is fine *only* when:
-- The operand types are identical across archs (rare for WMMA/MFMA).
-- The lane layout is identical (rare).
-- The tuning constants are identical (rare).
-
-For WMMA in particular, **the gfx11 → gfx12 port is NOT a single-file
-ifdef**; operand vector lengths differ (`<16 x fp16>` vs `<8 x fp16>`)
-and per-lane K-packing differs. Use a separate `.gfx12.hip` file.
-
-### 5. Wire the include + dispatch
-
-In `crates/rdna-compute/src/kernels.rs`:
-
-```rust
-pub const GEMM_X_WMMA_GFX12_SRC: &str = include_str!(
-    "../../../kernels/src/gemm_x_wmma_gfx12.hip"
-);
+```bash
+rg --no-heading -n 'mfma_f32_16x16x16' /opt/rocm/include/ | head -20
+# also inventory wave64 / MFMA siblings already in-tree
+ls kernels/src/*mfma* kernels/src/*gfx942* 2>/dev/null | head
 ```
 
-In `crates/rdna-compute/src/dispatch.rs`, add the dispatch branch
-ABOVE the existing gfx11 inline check (per step 3).
+CDNA ports use MFMA builtins and wave64-native dispatch, not WMMA. Assume accumulator/lane layout wrong until channel-tested on the target CDNA GPU.
 
-### 6. Validate against all three gates (see `validation.md`)
+### 2. Map existing routing with `ArchCaps`
 
-A new arch port is merge-ready ONLY when:
+Read `crates/rdna-compute/src/arch_caps.rs`. Prefer capability predicates over raw `starts_with`:
 
-1. **Channel-test passes** on real hardware (the contributor's
-   target arch). This is correctness — `cargo run --release -p
-   hipfire-runtime --example test_kernels` (or the QA variant)
-   emits "OK" for every dispatched kernel on the new arch.
-2. **Coherence gates pass.** Run `./scripts/coherence-gate.sh` for AR
-   arch smoke and `./scripts/coherence-gate-dflash.sh` for the canonical
-   correctness gate when the port touches kernels, quant formats, dispatch,
-   fusion, rotation, rmsnorm, or spec-decode behavior. No panics, no
-   zero-tokens, no timeouts, and no attractor-loop failures.
-3. **Speed-gate passes** on the regression-baseline arch
-   (`./scripts/speed-gate.sh --fast`). The new code path **cannot
-   regress gfx1100** (or whichever arch the baseline lives on).
+| Predicate (examples) | Meaning |
+|---|---|
+| `has_wmma()` | RDNA3 or RDNA4 WMMA present |
+| `has_wmma_w32()` | gfx11-family wave32 WMMA builtins |
+| `has_wmma_w32_gfx12()` / `is_rdna4()` | gfx1200/gfx1201 gfx12 builtins |
+| `is_cdna3()` | gfx940/gfx941/gfx942 CDNA3 MFMA family |
+| `is_wave64_native()` | gfx906/gfx908/CDNA3 wave64-native paths |
+| `has_dot2_f32_f16()` | broad fallback family |
+| `is_gfx1201()` | chip-strict gates (only when product scope is chip-strict) |
 
-If you don't have hardware for the target arch, you cannot merge
-— flag it in the PR and find a contributor with hardware (see
-`contributor-onboarding.md` and #45 watchers).
+Inspect call sites in `crates/rdna-compute/src/gemm.rs` (and related) that already branch. **RDNA WMMA cascade (example):**
 
-### 7. (Optional) Add speculative decode — see `speculation.md`
+```text
+if arch_caps.has_wmma_w32_gfx12() { …_wmma_gfx12… }
+else if arch_caps.has_wmma_w32() { …_wmma… }
+else if arch_caps.has_dot2_f32_f16() { …_dot2… }
+else { baseline }
+```
 
-Once the AR forward pass is correct and gated, you can give the arch
-speculative decoding. The cheap, correctness-preserving win is the
-model-free **n-gram** drafter: `impl SpecTarget` on your bundle
-(`spec_impl.rs`, qwen2 is the template) + add your `arch_id` to two
-registries (`build_speculator`'s gate and `Carrier::spec_target_guard`).
-The daemon stays arch-agnostic and the output is **byte-identical to AR**.
-A learned drafter (DFlash / MTP / EAGLE) is a separate, larger effort on
-the same seam. Full interface contract + pitfalls in `speculation.md`.
+**CDNA MFMA / wave64 cascade (example):**
 
-## Quick reference
+```text
+if arch_caps.is_cdna3() { …_mfma… / …_gfx942… }
+else if arch_caps.is_wave64_native() { …_wave64… }
+else { baseline / RDNA arm }
+```
 
-- WMMA matrix → `wmma-matrix.md`
-- Validation procedure → `validation.md`
-- Contributing without privileged repo access → `contributor-onboarding.md`
-- Adding speculative decode → `speculation.md`
-- gfx11 C-mapping reference: commit `b7ac66a` ("wmma correctness
-  fix"). The mapping `acc[j] = C[2*j + (tid>>4)][tid & 15]` was
-  silently wrong for ~6 weeks before being caught — assume any
-  per-lane mapping for a new arch is wrong until proven by
-  channel-test on hardware.
+When adding a more specific arm:
+
+1. Place it **above** broader arms that previously absorbed the chip.
+2. Drop now-unreachable literal clauses in the **same** diff.
+3. Broad helpers that intentionally cover families (`has_dot2_…`) usually stay wide; edit them only when the definition is wrong for the new chip.
+4. Match surrounding style (predicate helper vs existing pattern).
+
+Also check `crates/hipfire-dispatch/` tables/pipeline if the op goes through `KernelKey` / MoE Path-2 — those arms re-derive WMMA from `ArchCaps` and must stay consistent with `rdna-compute`.
+
+### 3. Treat “should-be-no-op” dispatch refactors as measurement hazards
+
+If speed numbers move after a pure routing tidy:
+
+1. Delete the specific bench binary so the next run rebuilds it (speed-gate `ensure_build` is a no-op when the binary already exists).
+2. `cargo clean -p rdna-compute` when dispatch artifacts may be stale.
+3. Check DPM / thermal / firmware shadowing (`dmesg`, `/lib/firmware/updates/amdgpu`) before blaming codegen.
+4. Re-measure with the protocol in [`docs/methodology/perf-benchmarking.md`](../../../docs/methodology/perf-benchmarking.md).
+
+Do not bypass hooks with `--no-verify` unless the maintainer authorized that exact change in writing.
+
+### 4. Author kernels as tagged `.hip` files
+
+Naming (unambiguous forms — one tag segment, no doubled dots):
+
+| Form | Covers |
+|---|---|
+| `kernels/src/<base_name>.gfxNNNN.hip` | chip-only (e.g. `….gfx1201.hip`, `….gfx942.hip`) |
+| `kernels/src/<base_name>.gfxNN.hip` | family (e.g. `….gfx12.hip` covers gfx1200+gfx1201 via compile-kernels resolution) |
+| `kernels/src/<base_name>.hip` | default / older baseline (no chip/family tag) |
+
+Resolution order in `scripts/compile-kernels.sh`: **chip → family → base**.
+
+Prefer a separate tagged file when operand types or lane layout differ. Single-file `#ifdef` only when types, layout, and tuning are truly identical (rare for WMMA/MFMA).
+
+**Reference patterns to read before forking (by family):**
+- **RDNA / WMMA:** `kernels/src/gemm_qkv_hfq4g256_wmma.gfx12.hip` (and current WMMA siblings registered in `crates/rdna-compute/src/kernels.rs`).
+- **CDNA / MFMA:** `kernels/src/gemm_hfq4g256_residual_mfma.gfx942.hip` (and current MFMA / wave64 siblings).
+
+Do not assume a short “five remaining kernels” list — inventory the tree for the family you are porting.
+
+Crate-local kernels (include from an arch crate) are exceptional; document why they are not in `kernels/src` if you add one.
+
+### 5. Wire registration + launch path
+
+1. `crates/rdna-compute/src/kernels.rs` — `include_str!` + public `const …_SRC`.
+2. `crates/rdna-compute/src/gemm.rs` / `gemv.rs` / … — typed `Gpu` method that `ensure_kernel` + launches (always `bind_thread` on public entry; see `scripts/verify-bind-thread.sh`).
+3. Public selector branch using `ArchCaps` (step 2) — WMMA predicates for RDNA, `is_cdna3` / `is_wave64_native` for CDNA.
+4. Compile-check every arch you touch **first**, e.g.
+   `./scripts/compile-kernels.sh gfx1100 gfx1200 gfx1201` (RDNA) or `./scripts/compile-kernels.sh gfx942` (CDNA) — adjust to the chips under test. All required compiles must succeed.
+5. **Only after** successful compiles, when committing precompiled blobs: `./scripts/write-kernel-hashes.sh` so newly produced `.hsaco` blobs get matching trust sidecars. (The hash script documents “run after `compile-kernels.sh`”.)
+6. Add or extend a **channel** case that forces the new symbol on the target arch (`test_kernels` and/or a focused example under `hipfire-runtime/examples/`). A port with no numeric coverage on its kernel is incomplete.
+
+### 6. Validate by claim class (not a universal triple)
+
+Select routes from [`docs/VALIDATION.md`](../../../docs/VALIDATION.md). For **arch port** claims the selector points at [`docs/methodology/arch-port-validation.md`](../../../docs/methodology/arch-port-validation.md) (channel + speed; **no** retired coherence battery as acceptance).
+
+Minimum practical loop for a new/changed **numeric** ISA kernel path (GPU arch port):
+
+| Layer | What | Notes |
+|---|---|---|
+| Tier C — Channel | `cargo build --release --features deltanet -p hipfire-runtime --example test_kernels` then run `test_kernels` **on target hardware** | Element-wise vs CPU reference. Catches bad C-mapping / MFMA layout that “looks fine” in smoke generation. Required on the **target** GPU. |
+| Bind invariant | `scripts/verify-bind-thread.sh` (or pre-commit when hooks installed) | Public `dispatch.rs` entries must bind HIP thread. **Not** a numeric test. |
+| Model-level manual route | After any new/changed numeric `.hip` path: the model-level manual route for the arch under test (VALIDATION “New/changed `.hip` kernel (numeric)”) | Required — channel alone is not the full GPU-port route. |
+| Tier P — Path parity/oracle | Path-specific parity/state oracle whenever the GPU-port change **can alter forward/state** for a model path that has an oracle | Cosine / logit / KV/conv/`n_tokens` as the oracle defines. **Fail closed:** if no oracle exists, leave parity **blocked** — do not substitute serve smoke. |
+| Tier S — Speed floor | `scripts/speed-gate.sh --fast` (or full) on **every baseline arch** whose shared edited path/predicate the diff can touch | When a committed `tests/speed-baselines/<arch>.txt` exists for that arch. Not optional when the path is shared. Force-rebuild bench binary before A/B. No matching baseline file → speed-floor claim for that arch is **blocked** until earned. |
+| Method / plumbing | Tiny-oracle + per-layer cosine when porting a **model** forward onto existing kernels | See methodology owner — required for model-arch bring-up; also applies under Tier P when a GPU port can break numbers. |
+| User-facing serve | `scripts/serve_harness.py` (or LFM harness when LFM-only) **after** numeric/state routes if numbers can break | Semantics only — not parity proof. |
+| Perf win claim | Methodology owner + identity hashes | Measured ≠ admitted. |
+
+**Retired:** `scripts/coherence-gate*.sh` (including missing `coherence-gate.sh`) are **historical reproduction only**. Never require them for merge, promotion, or benches. See VALIDATION “Retired coherence-gate scripts.”
+
+**Fail closed:** if no oracle exists for a numerical/state claim, the route is **blocked** — do not substitute serve smoke.
+
+**Capability ≠ certification:** green channel on one card does not flip product defaults or fill `admissions.yml`.
+
+If you lack target hardware (or a required baseline-arch box for Tier S), you cannot complete that route — stop at fallback-safe routing, **record the route as blocked**, and hand off to a hardware holder via [`contributor-onboarding.md`](contributor-onboarding.md). Do not merge on “should be identical” alone.
+
+### 7. (Optional) Speculative decode
+
+Only after AR forward is correct. Follow [`speculation.md`](speculation.md): `impl SpecTarget` + registries in `hipfire-loader`. Under **greedy** verification with argmax fallback on miss, committed tokens match greedy AR for a correct `SpecTarget`. That is **not** a blanket claim for temperature sampling, sampled verification, or emitter/rendering behavior. Learned drafters are separate work.
+
+---
 
 ## Known traps
 
-| Trap | Symptom | Memory |
+| Trap | Symptom | Response |
 |---|---|---|
-| WMMA C-mapping wrong | All-WMMA models emit garbage / fail correctness | Commit `b7ac66a` (gfx11 mapping fix). Assume new-arch mapping is wrong until proven on hardware. |
-| Removing "dead" WMMA kernels | Per-cycle GEMM cost ~2× on dispatch path that secretly uses it | PR #32 removed 27B-load-bearing WMMA variants; recovery in commit `9a2c667`. Don't delete WMMA kernel files without checking dispatch.rs `include_str!` references first. |
-| Bypassing speed-gate | Local-env regression masked by `--no-verify` lands on master | This session: commit `a048544` → reverted in `1f3bad3`. Don't do it. |
-| "Should-be-no-op" dispatch.rs refactor regresses speed-gate | The speed-gate's `ensure_build` only rebuilds when the bench binary is absent. Stash-and-re-bench flows can measure the SAME (post-change) binary on both runs. ALWAYS `rm target/release/examples/<bench>` before re-running the gate to compare diffs. | Resolved 2026-04-27 in commit 6e100c2 — re-tested with forced rebuild, no regression. See `playbook.md` step 3. |
-| Greedy degenerate decode | "Engine bug" smoke tests halt; turns out `--temp 0` + `<think>` exhaust max_tokens before model closes | Use `--temp 0.3 --repeat-penalty 1.05` + `--max-tokens 1500+` for 9b in any output-correctness assertion. |
-| Firmware shadowing | `/lib/firmware/updates/amdgpu` overrides kernel firmware → SMU IF mismatch → 50% prefill drop, looks like code regression | System-side fix only: `sudo mv /lib/firmware/updates/amdgpu .bak && sudo reboot`. No code commit. |
+| Wrong WMMA C-mapping | Garbage mats; may still “generate” | Channel-test; instrument `(tid, acc[j])`; see gfx11 fix class `b7ac66a` |
+| Delete “unused” WMMA sources | Large silent slowdown | Grep `include_str!` / `KernelKey` before deleting |
+| Stale bench binary A/B | Fake speed regression/gain | `rm` the bench exe; rebuild; re-run |
+| Firmware shadowing | ~50% prefill drop after “no-op” | System path `/lib/firmware/updates/amdgpu`; not a code claim |
+| Coherence script as merge bar | Policy violation / missing script | Use VALIDATION.md routes only |
+| Env-gated path treated as default-on | False product claims | Read current selector + env flags in source |
+| Chip-strict feature claimed for whole family | Wrong GPU runs or fails closed incorrectly | Prefer `is_rdna4` vs `is_gfx1201` intentionally; document scope |
+| Serve harness as numeric proof | Missed state bugs | Parity/oracle first; serve is semantics |
 
-## Skill discoverability
+## Quick links
 
-This skill lives at `.agents/skills/hipfire-arch-port/`. Triggers in
-`skill.json` cover the obvious phrases. Future agents asking
-"how do I support gfx1XYZ?" should land here directly.
+- WMMA reference → `wmma-matrix.md` (verify ROCm)
+- Validation routes → `docs/VALIDATION.md`
+- Arch-port method → `docs/methodology/arch-port-validation.md`
+- Contributor path → `contributor-onboarding.md`
+- Spec-decode → `speculation.md`
+- Perf protocol → `docs/methodology/perf-benchmarking.md`

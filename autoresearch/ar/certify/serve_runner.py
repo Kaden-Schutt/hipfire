@@ -154,7 +154,7 @@ class LiveServeRunner(_ServeRunner):
         class A:
             pass
         a = A()
-        a.model, a.tag, a.registry = self.model, None, os.path.join(sh.REPO, "cli/registry.json")
+        a.model, a.tag, a.registry = self.model, None, os.path.join(sh.REPO, "registry/v1.json")
         a.kv, a.mtp, a.thinking = self.kv, "off", "med"
         a.max_tokens, a.max_seq = max_tokens, 4096
         a.sampling, a.mode, a.port = sampling, mode, port

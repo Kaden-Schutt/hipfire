@@ -87,10 +87,7 @@ impl LogTailer {
 
     /// Cheap clone of the latest tail snapshot for the UI thread.
     pub fn snapshot(&self) -> LogSnapshot {
-        self.snapshot
-            .lock()
-            .map(|g| g.clone())
-            .unwrap_or_default()
+        self.snapshot.lock().map(|g| g.clone()).unwrap_or_default()
     }
 }
 
@@ -252,7 +249,11 @@ mod tests {
         let p = tmp("midfile.log");
         let mut f = File::create(&p).unwrap();
         for i in 0..6000 {
-            writeln!(f, "log line number {i} with padding text to lengthen the line").unwrap();
+            writeln!(
+                f,
+                "log line number {i} with padding text to lengthen the line"
+            )
+            .unwrap();
         }
         let s = read_tail(&p, 10);
         assert_eq!(s.status, LogStatus::Ok);
@@ -271,7 +272,11 @@ mod tests {
         write!(f, "{big}").unwrap();
         let s = read_tail(&p, 10);
         assert_eq!(s.status, LogStatus::Ok);
-        assert_eq!(s.lines.len(), 1, "the sole long line is kept, not dropped to empty");
+        assert_eq!(
+            s.lines.len(),
+            1,
+            "the sole long line is kept, not dropped to empty"
+        );
         assert!(!s.lines[0].is_empty());
         let _ = std::fs::remove_file(&p);
     }

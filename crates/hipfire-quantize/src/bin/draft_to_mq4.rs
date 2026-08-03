@@ -2,6 +2,7 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
+use hipfire_quantize::float16::f16_to_f32;
 use memmap2::Mmap;
 use std::fs::File;
 use std::io::Write;
@@ -10,37 +11,25 @@ use std::path::Path;
 const HFQ_MAGIC: &[u8; 4] = b"HFQM";
 const HFQ_VERSION: u32 = 1;
 
-fn f16_to_f32(bits: u16) -> f32 {
-    let sign = ((bits >> 15) & 1) as u32;
-    let exp = ((bits >> 10) & 0x1F) as u32;
-    let frac = (bits & 0x3FF) as u32;
-    if exp == 0 {
-        if frac == 0 { return f32::from_bits(sign << 31); }
-        let mut e = 0i32;
-        let mut f = frac;
-        while f & 0x400 == 0 { f <<= 1; e -= 1; }
-        f &= 0x3FF;
-        let exp32 = (127 - 15 + 1 + e) as u32;
-        return f32::from_bits((sign << 31) | (exp32 << 23) | (f << 13));
-    }
-    if exp == 31 {
-        let frac32 = if frac == 0 { 0 } else { frac << 13 | 1 };
-        return f32::from_bits((sign << 31) | (0xFF << 23) | frac32);
-    }
-    f32::from_bits((sign << 31) | ((exp + 127 - 15) << 23) | (frac << 13))
-}
-
 fn gen_fwht_signs(seed: u32, n: usize) -> Vec<f32> {
     let mut state = seed;
-    (0..n).map(|_| {
-        state = state.wrapping_mul(1103515245).wrapping_add(12345) & 0x7fffffff;
-        if (state >> 16) & 1 == 1 { 1.0f32 } else { -1.0f32 }
-    }).collect()
+    (0..n)
+        .map(|_| {
+            state = state.wrapping_mul(1103515245).wrapping_add(12345) & 0x7fffffff;
+            if (state >> 16) & 1 == 1 {
+                1.0f32
+            } else {
+                -1.0f32
+            }
+        })
+        .collect()
 }
 
 fn cpu_fwht_256(x: &mut [f32], signs1: &[f32], signs2: &[f32]) {
     assert!(x.len() == 256);
-    for i in 0..256 { x[i] *= signs1[i]; }
+    for i in 0..256 {
+        x[i] *= signs1[i];
+    }
     let mut stride = 1;
     while stride < 256 {
         let mut i = 0;
@@ -56,7 +45,9 @@ fn cpu_fwht_256(x: &mut [f32], signs1: &[f32], signs2: &[f32]) {
         stride <<= 1;
     }
     let scale = 0.0625;
-    for i in 0..256 { x[i] *= scale * signs2[i]; }
+    for i in 0..256 {
+        x[i] *= scale * signs2[i];
+    }
 }
 
 fn quantize_mq4g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
@@ -112,12 +103,29 @@ fn read_hfq(path: &Path) -> (u32, String, Vec<HfqInTensor>) {
     let mut escape = false;
     let mut json_end = 0;
     for (i, &b) in meta_bytes.iter().enumerate() {
-        if escape { escape = false; continue; }
-        if b == b'\\' && in_str { escape = true; continue; }
-        if b == b'"' { in_str = !in_str; continue; }
+        if escape {
+            escape = false;
+            continue;
+        }
+        if b == b'\\' && in_str {
+            escape = true;
+            continue;
+        }
+        if b == b'"' {
+            in_str = !in_str;
+            continue;
+        }
         if !in_str {
-            if b == b'{' { brace += 1; }
-            if b == b'}' { brace -= 1; if brace == 0 { json_end = i + 1; break; } }
+            if b == b'{' {
+                brace += 1;
+            }
+            if b == b'}' {
+                brace -= 1;
+                if brace == 0 {
+                    json_end = i + 1;
+                    break;
+                }
+            }
         }
     }
     let metadata_json = String::from_utf8_lossy(&meta_bytes[..json_end]).to_string();
@@ -134,19 +142,28 @@ fn read_hfq(path: &Path) -> (u32, String, Vec<HfqInTensor>) {
         pos += 2;
         let name = String::from_utf8_lossy(&mmap[pos..pos + name_len]).to_string();
         pos += name_len;
-        let qt = mmap[pos]; pos += 1;
-        let n_dims = mmap[pos] as usize; pos += 1;
+        let qt = mmap[pos];
+        pos += 1;
+        let n_dims = mmap[pos] as usize;
+        pos += 1;
         let mut shape = Vec::with_capacity(n_dims);
         for _ in 0..n_dims {
             shape.push(u32::from_le_bytes(mmap[pos..pos + 4].try_into().unwrap()));
             pos += 4;
         }
-        let group_size = u32::from_le_bytes(mmap[pos..pos + 4].try_into().unwrap()); pos += 4;
+        let group_size = u32::from_le_bytes(mmap[pos..pos + 4].try_into().unwrap());
+        pos += 4;
         let data_size = u64::from_le_bytes(mmap[pos..pos + 8].try_into().unwrap()) as usize;
         pos += 8;
         let data = mmap[cumulative..cumulative + data_size].to_vec();
         cumulative += data_size;
-        out.push(HfqInTensor { name, quant_type: qt, shape, group_size, data });
+        out.push(HfqInTensor {
+            name,
+            quant_type: qt,
+            shape,
+            group_size,
+            data,
+        });
     }
     (arch_id, metadata_json, out)
 }
@@ -163,7 +180,9 @@ fn write_hfq(path: &Path, arch: u32, metadata_json: &str, tensors: &[HfqInTensor
         index.extend_from_slice(nb);
         index.push(t.quant_type);
         index.push(t.shape.len() as u8);
-        for &d in &t.shape { index.extend_from_slice(&d.to_le_bytes()); }
+        for &d in &t.shape {
+            index.extend_from_slice(&d.to_le_bytes());
+        }
         index.extend_from_slice(&t.group_size.to_le_bytes());
         index.extend_from_slice(&(t.data.len() as u64).to_le_bytes());
     }
@@ -180,7 +199,9 @@ fn write_hfq(path: &Path, arch: u32, metadata_json: &str, tensors: &[HfqInTensor
     f.write_all(&index).unwrap();
     let pad = (data_offset - data_start_unaligned) as usize;
     f.write_all(&vec![0u8; pad]).unwrap();
-    for t in tensors { f.write_all(&t.data).unwrap(); }
+    for t in tensors {
+        f.write_all(&t.data).unwrap();
+    }
 }
 
 fn main() {
@@ -218,15 +239,26 @@ fn main() {
         }
         let m = t.shape[0] as usize;
         let numel = m * k;
-        assert_eq!(t.data.len(), numel * 2, "{}: F16 byte-size mismatch", t.name);
+        assert_eq!(
+            t.data.len(),
+            numel * 2,
+            "{}: F16 byte-size mismatch",
+            t.name
+        );
         let mut f32_data = Vec::with_capacity(numel);
         for c in t.data.chunks_exact(2) {
             let bits = u16::from_le_bytes([c[0], c[1]]);
             f32_data.push(f16_to_f32(bits));
         }
         let mq4 = quantize_mq4g256(&f32_data, &signs1, &signs2);
-        eprintln!("  MQ4 {}: F16 {} MiB -> MQ4 {} MiB  ({}x{})",
-            t.name, t.data.len()/(1024*1024), mq4.len()/(1024*1024), m, k);
+        eprintln!(
+            "  MQ4 {}: F16 {} MiB -> MQ4 {} MiB  ({}x{})",
+            t.name,
+            t.data.len() / (1024 * 1024),
+            mq4.len() / (1024 * 1024),
+            m,
+            k
+        );
         t.quant_type = 13;
         t.group_size = 256;
         t.data = mq4;
@@ -236,6 +268,8 @@ fn main() {
 
     eprintln!("writing {}...", outp.display());
     write_hfq(outp, arch, &meta, &tensors);
-    eprintln!("done. output size: {} MiB",
-        std::fs::metadata(outp).unwrap().len() / (1024*1024));
+    eprintln!(
+        "done. output size: {} MiB",
+        std::fs::metadata(outp).unwrap().len() / (1024 * 1024)
+    );
 }

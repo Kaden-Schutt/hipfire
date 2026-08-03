@@ -438,7 +438,7 @@ fn main() {
         );
         eprintln!("\n✅ tp=1 ANCHOR PASS: EP argmax stream == production forward_scratch.");
         dn_ref.free_gpu(&mut gpus.devices[0]);
-        kv_ref.free_gpu(&mut gpus.devices[0]);
+        let _ = kv_ref.free_gpu(&mut gpus.devices[0]);
     }
 
     eprintln!(

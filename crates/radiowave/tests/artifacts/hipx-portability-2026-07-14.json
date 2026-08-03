@@ -1,0 +1,70 @@
+{
+  "schema_version": 1,
+  "kind": "radiowave_architecture_portability",
+  "date": "2026-07-14",
+  "host": "hipx",
+  "compiler": {
+    "hip_version": "7.2.53211-671d39a71e",
+    "clang": "22.0.0git",
+    "rocm_path": "/opt/rocm-7.2.2"
+  },
+  "probe": "crates/radiowave/tests/fixtures/portable_buffer_probe.hip",
+  "runtime_binary_sha256": "bf0d7edffb98681dee3c492fe8c8a811b2afb5f719cf99d606073e1f640cca08",
+  "performance_promoted": false,
+  "devices": [
+    {
+      "device": 0,
+      "architecture": "gfx1100",
+      "marketing_name": "AMD Radeon RX 7900 XTX",
+      "runtime_output": 42,
+      "wave32_code_object_sha256": "a0b9394b6b0e4631ff0a5192a6c8d7cee0adaa73a340826c44ec921edb056f3d",
+      "wave64_code_object_sha256": "d786e5166267f28052ad9f607dd9bba58f82908f2dd2580678d30fa68b451676",
+      "buffer_loads": 1,
+      "buffer_stores": 1,
+      "spills": 0,
+      "cache_certification": "vmem_only"
+    },
+    {
+      "device": 1,
+      "architecture": "gfx1151",
+      "marketing_name": "Radeon 8060S Graphics",
+      "runtime_output": 42,
+      "wave32_code_object_sha256": "c5e4939c8fec6d0106ec4db95f5447a7d2520c671d012b50a3cd10820241d564",
+      "wave64_code_object_sha256": "0366a01101f888f0990ecfc01bf67f3b5ae9d114e8de6d1bbe344bdf0b827359",
+      "buffer_loads": 1,
+      "buffer_stores": 1,
+      "spills": 0,
+      "cache_certification": "vmem_only"
+    },
+    {
+      "device": 2,
+      "architecture": "gfx1030",
+      "marketing_name": "AMD Radeon RX 6950 XT",
+      "runtime_output": 42,
+      "wave32_code_object_sha256": "ffcd65d3e0cdb45403baad6a8be9dd06994159015fd9a672110f7b79b9073193",
+      "wave64_code_object_sha256": "2414ef6ba1f4de4f7789093b81262f30f11ccbae1a0db527d1fcb200b21bf0cc",
+      "buffer_loads": 1,
+      "buffer_stores": 1,
+      "spills": 0,
+      "cache_certification": "scalar_or_unknown"
+    },
+    {
+      "device": 3,
+      "architecture": "gfx1010",
+      "marketing_name": "AMD Radeon RX 5700 XT",
+      "runtime_output": 42,
+      "wave32_code_object_sha256": "2c8204059d0a4ad6cfb910efc333d9628b80ca7427628c5ac33a2921fb56f4f6",
+      "wave64_code_object_sha256": "f916509a1638a8f660497f098d08c369c1fe77cd76591c1c4f3c0ce7c8ae2fa3",
+      "buffer_loads": 1,
+      "buffer_stores": 1,
+      "spills": 0,
+      "cache_certification": "scalar_or_unknown"
+    }
+  ],
+  "notes": [
+    "The multi-architecture HIP binary returned 42 from a buffer B32 load/add/store on every device.",
+    "Radiowave compiled and inspected spill-free wave32 and wave64 code objects for every target.",
+    "gfx10 legacy kernarg prologue encoding remains conservatively scalar_or_unknown; this does not weaken Redline's cache boundary.",
+    "Correctness-only evidence leaves all non-gfx1201 performance recipes candidate-only."
+  ]
+}

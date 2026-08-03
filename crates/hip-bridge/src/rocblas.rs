@@ -106,22 +106,23 @@ impl Rocblas {
     /// On failure (library missing / symbol missing), returns an error that the
     /// caller can treat as "rocBLAS unavailable, fall back to hand-rolled kernels".
     pub fn load() -> RocblasResult<Self> {
-        let candidates = [
+        // Resolved ROCm roots first, bare sonames last. Replaces a hardcoded
+        // /opt/rocm/lib list that missed side-by-side and core-<ver> layouts.
+        let candidates = hipfire_config::rocm::library_candidates(&[
             "librocblas.so",
             "librocblas.so.7",
             "librocblas.so.6",
             "librocblas.so.5",
-            "/opt/rocm/lib/librocblas.so",
-            "/opt/rocm/lib/librocblas.so.7",
-            "/opt/rocm/lib/librocblas.so.6",
-            "/opt/rocm/lib/librocblas.so.5",
-        ];
+        ]);
         let lib = candidates
             .iter()
             .find_map(|name| unsafe { Library::new(name).ok() })
             .ok_or_else(|| RocblasError {
                 status: 0,
-                context: "dlopen librocblas.so (tried several names) failed".into(),
+                context: format!(
+                    "dlopen librocblas.so failed. Tried: {}",
+                    candidates.join(", ")
+                ),
             })?;
 
         unsafe {

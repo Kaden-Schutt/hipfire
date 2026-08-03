@@ -160,7 +160,7 @@ fn default_routed_scale() -> f32 {
 /// No env ⇒ no-op (`config.reap_keep` stays `None`); the MoE loader then
 /// takes the literal original full-load path — byte-identical to baseline.
 pub fn apply_reap_plan(config: &mut Lfm2MoeConfig) -> Result<(), String> {
-    if let Some(plan) = hipfire_reap::plan::ReapPlan::from_env(
+    if let Some(plan) = hipfire_reap::plan::ReapPlan::from_config(
         "lfm2moe",
         None,
         config.num_hidden_layers,

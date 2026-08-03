@@ -29,9 +29,10 @@ use crate::types::*;
 
 // ── MoE eligibility lattice ────────────────────────────
 
-/// Routed-expert tiers the mixed-tier bucketed decode path can execute: the
-/// tiers for which per-tier indexed gate_up/down GEMV kernels exist (see
-/// `run_moe_decode_mixed`). A per-expert tier table containing any other DType
+/// Routed-expert tiers the mixed-tier graded decode path can execute: the
+/// tiers for which per-tier indexed gate_up/down GEMV kernels exist (served
+/// on-device via `run_moe_decode`'s `expert_dtype_tags` branch). A per-expert
+/// tier table containing any other DType
 /// cannot be served by the mixed path and is rejected up front with a clear
 /// error rather than failing deep in the per-bucket dispatch.
 pub const MIXED_SUPPORTED_TIERS: [DType; 3] = [DType::MQ4G256, DType::MQ6G256, DType::ParoQ4G128];
@@ -271,6 +272,10 @@ pub struct MoeParams<'a> {
     pub n_exp: usize,
     pub norm_topk_prob: bool,
     pub x_rot_prerotated: bool,
+    /// Single-GPU lowered-decode experiment: leave the atomic-free routed
+    /// output expanded so the architecture layer can combine it into the
+    /// residual while producing the next layer's normalized activation.
+    pub defer_routed_combine: bool,
     /// Safetensors layer index (== `MoeFfnWeights.layer_idx`). Only used
     /// by native GPTQ-on-E8 Hessian capture in the CPU-top-K fallback to
     /// build the per-(tensor,expert) key; ignored on the hot path.
@@ -708,7 +713,7 @@ impl MoeFamily {
     ///
     /// Takes no `DispatchCtx`: the bias-aware path dispatches fixed MQ2-Lloyd
     /// kernels with no arch-gated sub-dispatch, so building a `DispatchCtx`
-    /// per layer per token (an uncached `FeatureFlags::from_env` parse) would
+    /// per layer per token (an uncached generic policy parse) would
     /// be pure waste on the decode hot path.
     pub fn run_bias_aware(
         &self,

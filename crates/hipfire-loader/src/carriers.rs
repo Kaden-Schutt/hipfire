@@ -11,6 +11,7 @@ use crate::{
     ModelState,
 };
 use hipfire_arch_minimax::{config_from_safetensors, load_weights_from_safetensors, MiniMaxState};
+use hipfire_runtime::kv_backend::KvBackend;
 use hipfire_runtime::loader_api::{LoadCtx, ModelSource};
 use hipfire_runtime::model_source::ModelSource as _;
 use hipfire_runtime::spec::{InPlaceGuard, SpecEmit, SpecEmitCtx, SpecTargetGuard};
@@ -166,7 +167,7 @@ fn kv_mode_from_ctx(ctx: &LoadCtx) -> String {
     ctx.kv_mode_override
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
-        .unwrap_or_else(|| std::env::var("HIPFIRE_KV_MODE").unwrap_or_default())
+        .unwrap_or_else(|| hipfire_runtime::config::get().kv_mode.clone())
 }
 
 fn resolve_kv_mode(
@@ -203,7 +204,7 @@ fn load_qwen35_pp(
     let pp = ctx.pp;
     let config = hipfire_arch_qwen35::qwen35::config_from_hfq(&hfq_file)
         .map_err(|e| format!("failed to read Qwen3.5 config: {e}"))?;
-    let mut gpus = match std::env::var("HIPFIRE_PP_LAYERS")
+    let mut gpus = match hipfire_config::developer_var("HIPFIRE_PP_LAYERS")
         .ok()
         .filter(|s| !s.is_empty())
     {
@@ -285,6 +286,8 @@ fn load_qwen35_pp(
         scratch: single_scratch,
         kv_cache: kv,
         dn_state: dn,
+        // Adaptive is single-GPU only; PP path never engages the controller.
+        kv_adaptive: None,
     };
     Ok(LoadedModel {
         state: Some(ModelState::Qwen35(bundle)),
@@ -328,6 +331,18 @@ impl Carrier for Qwen35Carrier {
         matches!(arch_id, 5 | 6)
     }
     fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
+        if ctx.kv_backend == KvBackend::Vmm && ctx.pp > 1 {
+            return Err(
+                "qwen35: KV backend 'vmm' currently requires pp=1; use 'contiguous' for pipeline parallelism"
+                    .into(),
+            );
+        }
+        if ctx.kv_backend == KvBackend::Vmm && ctx.cask.sidecar.is_some() {
+            return Err(
+                "qwen35: KV backend 'vmm' does not yet support CASK/TriAttention eviction; disable the sidecar or use 'contiguous'"
+                    .into(),
+            );
+        }
         // Dir + pp>1: early return before any diagnostics/meta resolution,
         // preserving the original error string and preventing tokenizer work.
         if ctx.pp > 1 {
@@ -348,7 +363,7 @@ impl Carrier for Qwen35Carrier {
 
                 // ── pp=1 path (single-GPU) ────────────────────
                 let physical_cap = if ctx.cask.sidecar.is_some() {
-                    let env_override = std::env::var("HIPFIRE_KV_PHYSICAL_CAP")
+                    let env_override = hipfire_config::developer_var("HIPFIRE_KV_PHYSICAL_CAP")
                         .ok()
                         .and_then(|s| s.parse::<usize>().ok());
                     let safety = 256usize;
@@ -382,8 +397,21 @@ impl Carrier for Qwen35Carrier {
                     }
                 };
 
-                let bundle =
-                    hipfire_arch_qwen35::load_qwen35_bundle(ModelSource::Hfq(hfq_file), ctx)?;
+                // Trunk bundle after optional VL upload. On bundle failure, reclaim
+                // any vision weights already on-device (HFQ is single-pass: VL must
+                // load from the same file before the carrier consumes it).
+                let bundle = match hipfire_arch_qwen35::load_qwen35_bundle(
+                    ModelSource::Hfq(hfq_file),
+                    ctx,
+                ) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        if let Some(vw) = vision_weights {
+                            vw.free_gpu(ctx.gpu);
+                        }
+                        return Err(e);
+                    }
+                };
                 finish_qwen35_load(
                     bundle,
                     meta.tokenizer,
@@ -404,16 +432,30 @@ impl Carrier for Qwen35Carrier {
                 if ctx.cask.sidecar.is_some() {
                     eprintln!("  warning: CASK eviction is not supported for safetensors Dir sources; eviction sidecar ignored");
                 }
-                let mut paro_source =
-                    hipfire_arch_qwen35::qwen35::ParoSource::new(&source, &config)
-                        .map_err(|e| format!("ParoSource::new: {e:?}"))?;
-                let paro_layout = hipfire_arch_qwen35::qwen35::Layout::single(config.n_layers);
-                let weights = hipfire_arch_qwen35::qwen35::load_weights(
-                    &mut paro_source,
-                    std::slice::from_mut(ctx.gpu),
-                    &paro_layout,
-                )
-                .map_err(|e| format!("load_weights: {e:?}"))?;
+                // CPU-only before any GPU ownership (parity with HFQ carrier).
+                let dn_quant = crate::parse_state_quant(ctx.state_quant_override)
+                    .map_err(|e| format!("{e}"))?;
+                eprintln!(
+                    "  DeltaNet state quant: {}",
+                    if dn_quant == hipfire_arch_qwen35::qwen35::StateQuant::FP32 {
+                        "FP32"
+                    } else if dn_quant == hipfire_arch_qwen35::qwen35::StateQuant::Q4 {
+                        "Q4"
+                    } else {
+                        "Q8"
+                    }
+                );
+                if config.dim < 2048 && dn_quant != hipfire_arch_qwen35::qwen35::StateQuant::FP32 {
+                    eprintln!(
+                        "  warning: model dim={} (<2048); FP32 DeltaNet state is recommended for small models (current: {})",
+                        config.dim,
+                        if dn_quant == hipfire_arch_qwen35::qwen35::StateQuant::Q4 {
+                            "Q4"
+                        } else {
+                            "Q8"
+                        }
+                    );
+                }
                 let is_kv_layer: Vec<bool> = config
                     .layer_types
                     .iter()
@@ -431,43 +473,64 @@ impl Carrier for Qwen35Carrier {
                     max_seq: ctx.max_seq,
                     physical_cap: Some(ctx.max_seq),
                 };
-                let kv_cache = hipfire_runtime::llama::KvCache::from_mode(
+
+                let mut paro_source =
+                    hipfire_arch_qwen35::qwen35::ParoSource::new(&source, &config)
+                        .map_err(|e| format!("ParoSource::new: {e:?}"))?;
+                let paro_layout = hipfire_arch_qwen35::qwen35::Layout::single(config.n_layers);
+                let weights = hipfire_arch_qwen35::qwen35::load_weights(
+                    &mut paro_source,
+                    std::slice::from_mut(ctx.gpu),
+                    &paro_layout,
+                )
+                .map_err(|e| format!("load_weights: {e:?}"))?;
+                hipfire_runtime::maybe_screen_mmq(&weights, ctx.gpu);
+
+                // Staged GPU free on every post-weight error (VMM arenas via free_gpu).
+                let kv_cache = match hipfire_runtime::llama::KvCache::from_mode_with_backend(
                     mode,
+                    ctx.kv_backend,
                     hipfire_runtime::llama::KvTarget::Single(ctx.gpu),
                     &dims,
-                )
-                .map_err(|e| format!("KvCache: {e}"))?;
-
-                let dn_quant = crate::parse_state_quant(ctx.state_quant_override)
-                    .map_err(|e| format!("{e}"))?;
-                eprintln!(
-                    "  DeltaNet state quant: {}",
-                    if dn_quant == hipfire_arch_qwen35::qwen35::StateQuant::FP32 {
-                        "FP32"
-                    } else if dn_quant == hipfire_arch_qwen35::qwen35::StateQuant::Q4 {
-                        "Q4"
-                    } else {
-                        "Q8"
+                ) {
+                    Ok(k) => k,
+                    Err(e) => {
+                        weights.free_gpu(ctx.gpu);
+                        return Err(format!("KvCache: {e}"));
                     }
-                );
-                if config.dim < 2048 && dn_quant != hipfire_arch_qwen35::qwen35::StateQuant::FP32 {
-                    eprintln!(
-                        "  warning: model dim={} (<2048); FP32 DeltaNet state is recommended for small models (current: {})",
-                        config.dim,
-                        if dn_quant == hipfire_arch_qwen35::qwen35::StateQuant::Q4 { "Q4" } else { "Q8" }
-                    );
-                }
-                let dn_state = hipfire_arch_qwen35::qwen35::DeltaNetState::new_with_quant(
+                };
+
+                let dn_state = match hipfire_arch_qwen35::qwen35::DeltaNetState::new_with_quant(
                     ctx.gpu, &config, dn_quant,
-                )
-                .map_err(|e| format!("DeltaNetState::new_with_quant: {e:?}"))?;
-                let scratch = hipfire_arch_qwen35::qwen35::Qwen35Scratch::new_with_kv_max(
+                ) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        let mut note = format!("DeltaNetState::new_with_quant: {e:?}");
+                        if let Err(fe) = kv_cache.free_gpu(ctx.gpu) {
+                            note = format!("{note}; cleanup also failed: {fe}");
+                        }
+                        weights.free_gpu(ctx.gpu);
+                        return Err(note);
+                    }
+                };
+
+                let scratch = match hipfire_arch_qwen35::qwen35::Qwen35Scratch::new_with_kv_max(
                     ctx.gpu,
                     &config,
                     2048,
                     ctx.max_seq,
-                )
-                .map_err(|e| format!("Qwen35Scratch::new_with_kv_max: {e:?}"))?;
+                ) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        let mut note = format!("Qwen35Scratch::new_with_kv_max: {e:?}");
+                        if let Err(fe) = kv_cache.free_gpu(ctx.gpu) {
+                            note = format!("{note}; cleanup also failed: {fe}");
+                        }
+                        dn_state.free_gpu(ctx.gpu);
+                        weights.free_gpu(ctx.gpu);
+                        return Err(note);
+                    }
+                };
 
                 let bundle = hipfire_arch_qwen35::Qwen35Bundle {
                     config,
@@ -475,6 +538,8 @@ impl Carrier for Qwen35Carrier {
                     scratch,
                     kv_cache,
                     dn_state,
+                    // Dir/safetensors path does not engage adaptive (HFQ carrier only).
+                    kv_adaptive: None,
                 };
                 Ok(LoadedModel {
                     state: Some(ModelState::Qwen35(bundle)),
@@ -545,6 +610,7 @@ impl Carrier for LlamaCarrier {
                 let weights =
                     hipfire_runtime::hfq::load_weights_paroquant_llama(&source, &config, ctx.gpu)
                         .map_err(|e| format!("load_weights_paroquant_llama: {e:?}"))?;
+                hipfire_runtime::maybe_screen_mmq(&weights, ctx.gpu);
                 let mode = resolve_kv_mode(
                     ctx,
                     &hipfire_runtime::kv_mode::DIR_SAFETENSORS_POLICY,
@@ -680,11 +746,12 @@ impl Carrier for LlamaCarrier {
             // conf_threshold ladder: env > CLI arg > 0.1
             // Default 0.1 (sweep-tuned): 0.5 over-truncates (1.46/7 proposed);
             // 0.1 proposes ~6.94/7, +16.6% prose tok/s / +7.1% code tok/s.
-            let conf_threshold = std::env::var("HIPFIRE_QWEN3_DSPARK_CONF_THRESHOLD")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .or(ctx.spec.dspark_conf_threshold)
-                .unwrap_or(0.1f32);
+            let conf_threshold =
+                hipfire_config::developer_var("HIPFIRE_QWEN3_DSPARK_CONF_THRESHOLD")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .or(ctx.spec.dspark_conf_threshold)
+                    .unwrap_or(0.1f32);
 
             eprintln!(
                 "  llama DSpark speculator enabled (sidecar, block={}, conf_threshold={:.2})",
@@ -844,6 +911,7 @@ impl Carrier for DotsOcrCarrier {
                 (config, weights)
             }
         };
+        hipfire_runtime::maybe_screen_mmq(&weights, ctx.gpu);
         let state = hipfire_arch_qwen2::qwen2::Qwen2State::new_with_max_seq(
             ctx.gpu,
             &config.text,
@@ -950,7 +1018,7 @@ impl Carrier for Deepseek4Carrier {
             }
         };
         let state = deepseek4::DeepseekV4State::new(&config)?;
-        let pbs_max_batch: usize = std::env::var("HIPFIRE_DEEPSEEK4_PP_BATCH")
+        let pbs_max_batch: usize = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_PP_BATCH")
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(1024);
@@ -1000,14 +1068,10 @@ impl Carrier for Deepseek4Carrier {
         } else if weights.mtp_layer.is_some() {
             // spec_k resolution MUST mirror daemon.rs:9349 (HIPFIRE_DEEPSEEK4_SPEC_K →
             // HIPFIRE_MTP_K → default 2) so T4's spec.k() matches the bespoke loop's window.
-            let max_n: usize = std::env::var("HIPFIRE_DEEPSEEK4_SPEC_K")
+            let max_n: usize = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_SPEC_K")
                 .ok()
                 .and_then(|s| s.parse().ok())
-                .or_else(|| {
-                    std::env::var("HIPFIRE_MTP_K")
-                        .ok()
-                        .and_then(|s| s.parse().ok())
-                })
+                .or_else(|| Some(hipfire_runtime::config::get().mtp_k))
                 .unwrap_or(2);
             let ctx_capacity = config.max_position_embeddings;
             eprintln!("  deepseek4 MTP speculator enabled (in-weights, K={max_n})");
@@ -1105,6 +1169,7 @@ impl Carrier for MinimaxCarrier {
                 (config, weights)
             }
         };
+        hipfire_runtime::maybe_screen_mmq(&weights, ctx.gpu);
 
         // ── single shared tail (byte-identical to the previous per-arm tails) ──
         let state = MiniMaxState::new_with_max_seq(ctx.gpu, &config, ctx.max_seq)
@@ -1200,6 +1265,7 @@ impl Carrier for Lfm2MoeCarrier {
                 (config, weights)
             }
         };
+        hipfire_runtime::maybe_screen_mmq(&weights, ctx.gpu);
 
         let state = lfm2moe::lfm2moe::Lfm2MoeState::new_with_max_seq(ctx.gpu, &config, ctx.max_seq)
             .map_err(|e| format!("lfm2moe: Lfm2MoeState::new_with_max_seq failed: {e}"))?;

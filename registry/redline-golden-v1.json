@@ -1,0 +1,248 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-07-23",
+  "_comment": "Sealed Redline reproduction fixtures. These records are measured evidence, not admissions or timeless performance guarantees.",
+  "model": {
+    "tag": "qwen3.6:35b-a3b-mq4r",
+    "file": "qwen3.6-35b-a3b.mq4r",
+    "size_bytes": 18700048128,
+    "sha256": "4685c140c46b1a6f31a0fd9053bf09d5faf1d2529d715b84794249b66cde0428",
+    "registry_card_sha256": "6a22ac8300e938c3ca562eeb9b5a3159c4e3c8621b1403a69eb3b43eb8707239",
+    "sampling_profile": "general",
+    "sampling_sha256": "6d64d79ecd36dd3f1b026db2fb1ddbcf2e40433349df61c5c182f482e18c6ce4",
+    "sampling": {
+      "temperature": 1.0,
+      "top_p": 0.95,
+      "top_k": 20,
+      "min_p": 0.0,
+      "presence_penalty": 1.5,
+      "repeat_penalty": 1.0
+    }
+  },
+  "pm4_policy": {
+    "HIPFIRE_REPLAY_PM4_QUEUES": "1",
+    "HIPFIRE_REPLAY_PM4_STATEFUL": "static",
+    "HIPFIRE_REPLAY_PM4_WAIT_POLICY": "resource",
+    "HIPFIRE_REPLAY_PM4_ACQUIRE_POLICY": "required-only",
+    "HIPFIRE_REPLAY_PM4_GCR_TRIM": "1",
+    "HIPFIRE_REPLAY_PM4_NATIVE_PHASES": "0",
+    "HIPFIRE_REPLAY_PM4_DYNAMIC_GRID": "0"
+  },
+  "fixtures": [
+    {
+      "id": "qwen36-a3b-mq4r-gfx1100-tg128-q8-pm4",
+      "architecture": "gfx1100",
+      "reference": {
+        "created_at_utc": "2026-07-22",
+        "source_commit": "76f2a5748959a75c3a9cb484564fe467b6d184d8",
+        "daemon_sha256": "ff93c14e0b7bc2aad8f7bffd6d6c4144d07d1ea8bff69ce92b98a613205bcb27",
+        "report_sha256": "fdacd6f75e7012c96009c3b89063d353947cad8c29a7f290ea2d7dcc856505d3",
+        "hip_median_tok_s": 219.64853355149975,
+        "pm4_min_tok_s": 251.430915438179,
+        "pm4_median_tok_s": 251.79776150956877,
+        "pm4_max_tok_s": 252.00764796747671,
+        "speedup": 1.146366686079109,
+        "historical_headline": {
+          "route_proof_status": "route-unspecified historical measurement",
+          "min_tok_s": 253.04,
+          "median_tok_s": 253.31,
+          "max_tok_s": 253.48
+        }
+      },
+      "acceptance": {
+        "minimum_pm4_tok_s": 245.0,
+        "minimum_speedup": 1.08
+      },
+      "benchmark": {
+        "context": 128,
+        "iterations": 128,
+        "warmups": 10,
+        "warmup_iterations": 32,
+        "runs": 10,
+        "transport": "pm4",
+        "kv_mode": "q8",
+        "max_seq": 2048,
+        "settle_window": 10,
+        "settle_min_runs": 10,
+        "settle_confirmation_runs": 10,
+        "settle_max_runs": 120,
+        "settle_max_slope_pct": 0.05,
+        "settle_max_spread_pct": 1.0,
+        "settle_max_median_drift_pct": 0.5
+      },
+      "route": {
+        "dispatches": 604,
+        "packets": 1,
+        "queues": 1,
+        "phases": 1,
+        "queue_id": 2,
+        "command_dwords": 16832,
+        "unique_kernels": 22,
+        "sequence_hash": "43754a60ca25f47c",
+        "observed_positions": [
+          128,
+          255
+        ]
+      }
+    },
+    {
+      "id": "qwen36-a3b-mq4r-gfx1151-tg128-q8-pm4",
+      "architecture": "gfx1151",
+      "reference": {
+        "created_at_utc": "2026-07-22",
+        "source_commit": "76f2a5748959a75c3a9cb484564fe467b6d184d8",
+        "daemon_sha256": "ff93c14e0b7bc2aad8f7bffd6d6c4144d07d1ea8bff69ce92b98a613205bcb27",
+        "report_sha256": "2cc50777843f3919535540449d119b1b97263ea923c91ff257753d8bbd088dfd",
+        "hip_median_tok_s": 102.34810044125717,
+        "pm4_min_tok_s": 115.21925370186791,
+        "pm4_median_tok_s": 115.28981279309554,
+        "pm4_max_tok_s": 115.41962647862607,
+        "speedup": 1.1264479975304111,
+        "historical_headline": {
+          "route_proof_status": "sealed certification bundle",
+          "min_tok_s": 115.021,
+          "median_tok_s": 115.104,
+          "max_tok_s": 115.185
+        }
+      },
+      "acceptance": {
+        "minimum_pm4_tok_s": 115.021,
+        "minimum_speedup": 1.1
+      },
+      "benchmark": {
+        "context": 128,
+        "iterations": 128,
+        "warmups": 10,
+        "warmup_iterations": 32,
+        "runs": 8,
+        "transport": "pm4",
+        "kv_mode": "q8",
+        "max_seq": 2048,
+        "settle_window": 8,
+        "settle_min_runs": 8,
+        "settle_confirmation_runs": 8,
+        "settle_max_runs": 120,
+        "settle_max_slope_pct": 0.05,
+        "settle_max_spread_pct": 1.0,
+        "settle_max_median_drift_pct": 0.5
+      },
+      "route": {
+        "dispatches": 604,
+        "packets": 1,
+        "queues": 1,
+        "phases": 1,
+        "queue_id": 2,
+        "command_dwords": 16708,
+        "unique_kernels": 23,
+        "sequence_hash": "42f566b752920679",
+        "observed_positions": [
+          128,
+          255
+        ]
+      },
+      "silver_baseline": {
+        "status": "coherent-stopgap",
+        "created_at_utc": "2026-07-27",
+        "source_commit": "8445fca2acd462d8e9d7547de2fe3823874c24bb",
+        "daemon_sha256": "73a89a1ea57f8938ea02e264ebdd55b8d0b11f950a95f08def4553f580dc795f",
+        "cli_sha256": "0b29e68d425c308bcd14507b7791f76864735f9ef9943b6e8d52567ce648c120",
+        "route": {
+          "dispatches": 604,
+          "packets": 1,
+          "queues": 1,
+          "phases": 1,
+          "queue_id": 2,
+          "command_dwords": 16831,
+          "unique_kernels": 23,
+          "sequence_hash": "42f566b752920679"
+        },
+        "high_water": {
+          "report_sha256": "27f04979fc98fe8315936916c67e9b4560fafde0c2408a909c3d069bb81f8234",
+          "hip_median_tok_s": 101.15920674320344,
+          "pm4_min_tok_s": 114.11144400163151,
+          "pm4_median_tok_s": 114.20878617548057,
+          "pm4_max_tok_s": 114.23598909360095,
+          "speedup": 1.1290004128383884,
+          "embedded_coherence": false
+        },
+        "coherence_certification": {
+          "report_sha256": "c728740e9f0446124d75ea850cb363c79cf0dfa4c37d52b1386d7fcc8902f681",
+          "hip_median_tok_s": 101.50382195750399,
+          "pm4_median_tok_s": 113.65174802335181,
+          "speedup": 1.119679494146868,
+          "hip_coherence_valid": true,
+          "pm4_coherence_valid": true,
+          "route_proof_valid": true
+        },
+        "disposition": "Coherent stopgap; the Golden acceptance floor remains unchanged."
+      },
+      "sealed_bundle": {
+        "source_commit": "661cb5d63a08ac4fde6dc9e2cebc45c5db347317",
+        "daemon_sha256": "43b4bcaba90db63c14bcde107c32da77361fd79ef2c4ddbc762ce641dfb4279c",
+        "certification_payload_sha256": "61d80dab7c5f0c266191d46bc926e0c3de8b76ce5bf442f478fd6e17e461c59e",
+        "hip_source_aggregate_sha256": "eeaca7ae5296f922c4ec4e847570a3f244161cf2a13f57b9e8cffc5e4d2d83ea",
+        "dispatch_source_aggregate_sha256": "342286e2306ab0310c927887a92c8463a070b9b96940f27f1f070362341777e0",
+        "hsaco_manifest_sha256": "a26cef6c353ae02c5dfb17fe8d1dfb38be42e158254478365e28e398f799053b",
+        "launches": 604,
+        "unique_kernels": 23,
+        "sequence_hash": "53414b0dc0f988ac"
+      }
+    },
+    {
+      "id": "qwen36-a3b-mq4r-gfx1201-tg128-q8-pm4",
+      "architecture": "gfx1201",
+      "reference": {
+        "created_at_utc": "2026-07-23",
+        "source_commit": "319905cb4dec72330623e5e3a9fae50362cbde1d",
+        "daemon_sha256": "1dee4a5d7d0db3d5484268cab6e688fbf4a0a739a3eded9729b322c1287b704a",
+        "report_sha256": "177c2705b1a1fa905611dcc1e20969fe03a4c225ddce1b5cda32448a42f57170",
+        "hip_median_tok_s": 174.6696293080805,
+        "pm4_min_tok_s": 202.3745360051897,
+        "pm4_median_tok_s": 202.46022224831836,
+        "pm4_max_tok_s": 202.58638556497297,
+        "speedup": 1.159103749463057,
+        "historical_headline": {
+          "route_proof_status": "earlier campaign measurement",
+          "min_tok_s": 203.42,
+          "median_tok_s": 203.93,
+          "max_tok_s": 204.04
+        }
+      },
+      "acceptance": {
+        "minimum_pm4_tok_s": 197.0,
+        "minimum_speedup": 1.1
+      },
+      "benchmark": {
+        "context": 128,
+        "iterations": 128,
+        "warmups": 10,
+        "warmup_iterations": 32,
+        "runs": 10,
+        "transport": "pm4",
+        "kv_mode": "q8",
+        "max_seq": 2048,
+        "settle_window": 10,
+        "settle_min_runs": 10,
+        "settle_confirmation_runs": 10,
+        "settle_max_runs": 120,
+        "settle_max_slope_pct": 0.05,
+        "settle_max_spread_pct": 1.0,
+        "settle_max_median_drift_pct": 0.5
+      },
+      "route": {
+        "dispatches": 733,
+        "packets": 1,
+        "queues": 1,
+        "phases": 1,
+        "queue_id": 2,
+        "command_dwords": 20511,
+        "unique_kernels": 23,
+        "sequence_hash": "3318ffca3daf2338",
+        "observed_positions": [
+          128,
+          255
+        ]
+      }
+    }
+  ]
+}

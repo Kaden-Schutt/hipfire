@@ -27,6 +27,14 @@ pub struct ScratchState {
     pub mq_x_rot_fp8_bytes: usize,
     pub mq_x_q8: Option<DeviceBuffer>,
     pub mq_x_scales: Option<DeviceBuffer>,
+    /// Persistent gfx1100 K=2048 RMSNorm+MQ state shared by the split and
+    /// wavegrid experiments. The wavegrid layout is eight f32 partials, one
+    /// f32 RMS value, and three u32 epoch counters, padded to 64 bytes; the
+    /// split path uses its first f32 as the RMS handoff.
+    pub mq_rmsnorm_wavegrid_scratch: Option<DeviceBuffer>,
+    /// Dedicated F32 temporary for the unfused GEMV-residual alias fallback.
+    /// Lazily allocated and grown on demand; no other scratch path uses it.
+    pub gemv_residual_tmp: Option<GpuTensor>,
     pub paro_x_scratch: Option<GpuTensor>,
     /// Rotation scratch buffers for PARO fused-kernel dispatch. 4 × [k] F32
     /// buffers, lazily allocated and grown on demand. Used by
@@ -71,6 +79,13 @@ pub(crate) fn compile_and_load_kernel(
     }
     let obj_path = compiler.compile(module_name, source)?;
     let obj_path_str = obj_path.to_str().unwrap().to_string();
+    // Alias the launched function name to this arch's compiled artifact so the
+    // retained-PM4 capture can resolve func_name -> owning .hsaco even when the
+    // arch-selected module name differs (e.g. gemv_hfq4g256_residual launched vs
+    // module gemv_hfq4g256_residual_rdna3 on RDNA3). Additive; no-op when equal.
+    if func_name != module_name {
+        compiler.register_func_artifact(func_name, std::path::PathBuf::from(&obj_path_str));
+    }
     if !modules.contains_key(module_name) {
         let module = module_load_or_recompile(hip, compiler, module_name, source, &obj_path_str)?;
         modules.insert(module_name.to_string(), module);
@@ -122,7 +137,7 @@ pub(crate) fn launch_maybe_blob(
     grid: [u32; 3],
     block: [u32; 3],
     shared_mem: u32,
-    params: &mut Vec<*mut c_void>,
+    params: &mut [*mut c_void],
     blob_builder: impl FnOnce() -> KernargBlob,
 ) -> HipResult<()> {
     if capture_mode || force_blob_path {
@@ -188,6 +203,30 @@ impl ScratchState {
         Ok(self.sample_partials.as_ref().unwrap().as_ptr())
     }
 
+    /// Ensure the dedicated GEMV-residual temporary can hold at least
+    /// `min_elems` F32 values, growing on demand and never shrinking.
+    pub fn ensure_gemv_residual_tmp(
+        &mut self,
+        hip: &HipRuntime,
+        device_id: i32,
+        min_elems: usize,
+    ) -> HipResult<&GpuTensor> {
+        crate::graph::bind_thread(hip, device_id)?;
+        let needed_bytes = min_elems * 4;
+        let needs_grow = self
+            .gemv_residual_tmp
+            .as_ref()
+            .map_or(true, |tmp| tmp.buf.size() < needed_bytes);
+        if needs_grow {
+            self.gemv_residual_tmp = Some(GpuTensor {
+                buf: hip.malloc(needed_bytes)?,
+                shape: vec![min_elems],
+                dtype: DType::F32,
+            });
+        }
+        Ok(self.gemv_residual_tmp.as_ref().unwrap())
+    }
+
     /// Lazily initialize MagnumQuant FWHT sign tables (256 floats each, seeds 42 and 1042).
     pub fn ensure_mq_signs(
         &mut self,
@@ -216,6 +255,21 @@ impl ScratchState {
         self.mq_x_rot = Some(x_rot);
         self.mq_x_q8 = Some(x_q8);
         self.mq_x_scales = Some(x_scales);
+        Ok(())
+    }
+
+    /// Lazily allocate and zero the persistent gfx1100 RMSNorm state.
+    pub fn ensure_mq_rmsnorm_wavegrid_scratch(
+        &mut self,
+        hip: &HipRuntime,
+        device_id: i32,
+    ) -> HipResult<()> {
+        crate::graph::bind_thread(hip, device_id)?;
+        if self.mq_rmsnorm_wavegrid_scratch.is_none() {
+            let scratch = hip.malloc(64)?;
+            hip.memset(&scratch, 0, 64)?;
+            self.mq_rmsnorm_wavegrid_scratch = Some(scratch);
+        }
         Ok(())
     }
 

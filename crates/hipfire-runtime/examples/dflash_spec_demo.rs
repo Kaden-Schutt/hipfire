@@ -648,13 +648,78 @@ fn main() {
             draft_scratch_b, draft_cfg.block_size,
         );
     }
-    let mut draft_scratch = DflashScratch::new_with_mq(
-        &mut gpu,
-        &draft_cfg,
-        draft_scratch_b,
-        ctx_capacity,
-        draft_weights.has_mq,
-    )
+    // Windowed draft context (SWA W on layers 0..n-2 + FULL-reach last
+    // layer spanning the entire supported context, `w_full = ctx_capacity`).
+    // DEFAULTS to the window the draft artifact declares it was trained with
+    // (`DflashConfig::declared_window` <- `config.sliding_window`, gated on
+    // `use_sliding_window` and matching `layer_types`); that is the only width
+    // correct by construction. Mirrors `dflash_spec.rs::load_dflash_state` —
+    // keep the two in sync, they are the serve and bench halves of one policy.
+    //   HIPFIRE_DFLASH_WINDOW=<rows>  explicit override (warns on mismatch)
+    //   HIPFIRE_DFLASH_WINDOW=0       explicit Legacy
+    //   unset                         draft-declared window, else Legacy
+    // Refused with CASK eviction (the eviction rebuild is not ring-aware).
+    let dflash_window = match std::env::var("HIPFIRE_DFLASH_WINDOW")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+    {
+        Some(0) => None,
+        Some(w) => {
+            if let Some(declared) = draft_cfg.declared_window {
+                if declared != w {
+                    eprintln!(
+                        "draft: window override {w} != draft-declared sliding_window {declared} \
+                         — the draft was trained at {declared}; acceptance may degrade \
+                         (output stays verify-exact)"
+                    );
+                }
+            }
+            Some(w)
+        }
+        None => draft_cfg.declared_window,
+    };
+    let dflash_window = match (dflash_window, cask_sidecar.is_some()) {
+        (Some(w), true) => {
+            eprintln!(
+                "draft: windowed mode ({w}) disabled — CASK eviction rebuild is not \
+                 ring-aware; using Legacy"
+            );
+            None
+        }
+        (w, _) => w,
+    };
+    let mut draft_scratch = match dflash_window {
+        Some(w) => {
+            eprintln!(
+                "draft: windowed mode W={} (last layer reach: full {}){}",
+                w,
+                ctx_capacity,
+                if draft_cfg.declared_window == Some(w) {
+                    " [from draft metadata]"
+                } else {
+                    ""
+                }
+            );
+            DflashScratch::new_windowed(
+                &mut gpu,
+                &draft_cfg,
+                draft_scratch_b,
+                w,
+                // w_full UNBOUNDED: last (full-attention) layer spans the
+                // whole supported context (mirrors dflash_spec.rs).
+                ctx_capacity,
+                ctx_capacity,
+                draft_weights.has_mq,
+            )
+        }
+        None => DflashScratch::new_with_mq(
+            &mut gpu,
+            &draft_cfg,
+            draft_scratch_b,
+            ctx_capacity,
+            draft_weights.has_mq,
+        ),
+    }
     .expect("alloc draft scratch");
     if draft_weights.has_mq {
         eprintln!("draft: MQ weights detected, FWHT rotation scratch enabled");
@@ -842,7 +907,7 @@ fn main() {
         // ── Per-row tokenize + ChatML wrap ─────────────────────────
         let prompt_normalized =
             hipfire_runtime::tokenizer::maybe_normalize_prompt(row_raw_prompt).into_owned();
-        if std::env::var("HIPFIRE_PROMPT_TOKEN_HEAT").ok().as_deref() == Some("1") {
+        if hipfire_runtime::config::get().prompt_token_heat {
             tokenizer.dump_prompt_heat(&prompt_normalized);
         }
         let mut prompt_tokens = tokenizer.encode(&prompt_normalized);
@@ -1012,8 +1077,21 @@ fn main() {
             0,
             prompt_tokens.len(), // block_size: seed wrote prompt_len contiguous slots
             prompt_tokens.len(), // n_rows:     keep all of them
+            draft_scratch.ctx_modulus(),
         )
         .expect("seed scatter");
+        // Windowed mode + prompt longer than the SWA window: backfill the
+        // last (full-attention) draft layer's long-reach K/V ring from the
+        // cumulative host shadow before the first spec step.
+        hipfire_runtime::dflash::draft_seed_backfill(
+            &mut gpu,
+            &draft_weights,
+            &draft_cfg,
+            &mut draft_scratch,
+            &target_hidden_host,
+            prompt_tokens.len(),
+        )
+        .expect("seed backfill");
         // Seed the upload watermark + per-row absolute positions for the
         // draft's cross-attention RoPE. Pre-eviction these match [0..prompt_len)
         // exactly, so FlashCASK-free runs stay byte-identical.
@@ -1611,6 +1689,7 @@ fn main() {
                         ddtree_topk,
                         runtime_temp,
                         &mut rng_state,
+                        None, // max_accept: uncapped demo
                     )
                     .expect("ddtree-batched spec step")
                 } else {
@@ -1660,6 +1739,7 @@ fn main() {
                     pld_spine,
                     runtime_repeat_penalty,
                     repeat_window,
+                    None, // max_accept: uncapped demo
                 )
                 .expect("spec step")
             };
@@ -1996,7 +2076,9 @@ fn main() {
                 mean_nodes,
                 meta.min_nodes,
                 meta.max_nodes,
-                std::env::var("HIPFIRE_DDTREE_LOGW_CUTOFF").unwrap_or_else(|_| "off".to_string()),
+                hipfire_config::active_or_local_process_config()
+                    .legacy_value("HIPFIRE_DDTREE_LOGW_CUTOFF")
+                    .unwrap_or_else(|| "off".to_string()),
             );
         }
         // Adaptive-B usage report — only meaningful when --adaptive-b is on.

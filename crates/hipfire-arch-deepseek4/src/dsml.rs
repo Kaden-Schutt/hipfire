@@ -26,10 +26,11 @@
 //!     closes. Markers split across token boundaries are buffered
 //!     until they resolve.
 //!
-//! The parser is conservative: any malformed DSML is surfaced as a raw
-//! token stream rather than swallowed — the model occasionally emits a
-//! near-miss like `<DSML|invoke>` and we'd rather forward the bytes than
-//! eat them silently.
+//! The parser is fail-closed on tool protocol: an unclosed
+//! `<｜DSML｜tool_calls>` span at end-of-stream is reported as
+//! [`StreamEvent::Malformed`] and must never be flushed as visible
+//! [`StreamEvent::Token`] text. Callers terminalize with error XOR done
+//! and suppress partial assistant-cache storage.
 
 use serde_json::{json, Value};
 
@@ -66,6 +67,95 @@ pub const TOOL_RESULT_CLOSE: &str = "</tool_result>";
 pub struct ToolCall {
     pub name: String,
     pub arguments: Value,
+}
+
+/// Turn-wide structured-call buffer shared by DS4 AR/EP absorb helpers,
+/// [`crate::spec_emit::Deepseek4Emit`], and focused terminal tests.
+///
+/// Complete `ToolCalls` are retained here and never treated as live wire
+/// events. [`Self::finalize`] is the only release/discard decision point and
+/// requires the production terminal cause (`hit_length_cap`).
+#[derive(Debug, Default, Clone)]
+pub struct DsmlDeferredCalls {
+    calls: Vec<ToolCall>,
+    malformed: Option<String>,
+}
+
+/// Terminal outcome of [`DsmlDeferredCalls::finalize`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum DsmlDeferredOutcome {
+    /// Unclosed/malformed DSML — every buffered call discarded.
+    Malformed { detail: String },
+    /// Token cap — never tool-safe; no calls released.
+    Length,
+    /// Natural stop with no complete calls.
+    Stop,
+    /// Tool-safe terminal; release these calls exactly once.
+    ToolCalls(Vec<ToolCall>),
+}
+
+impl DsmlDeferredCalls {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Number of complete calls buffered so far (may still be discarded).
+    pub fn buffered_len(&self) -> usize {
+        self.calls.len()
+    }
+
+    pub fn is_malformed(&self) -> bool {
+        self.malformed.is_some()
+    }
+
+    pub fn malformed_detail(&self) -> Option<&str> {
+        self.malformed.as_deref()
+    }
+
+    /// Absorb one parser event. Returns `Some` only for live visible channels
+    /// (Token / Reasoning). ToolCalls are buffered; Malformed latches.
+    pub fn absorb(&mut self, ev: StreamEvent) -> Option<StreamEvent> {
+        match ev {
+            StreamEvent::Token(t) => Some(StreamEvent::Token(t)),
+            StreamEvent::Reasoning(t) => Some(StreamEvent::Reasoning(t)),
+            StreamEvent::ToolCalls(calls) => {
+                self.calls.extend(calls);
+                None
+            }
+            StreamEvent::Malformed { detail } => {
+                self.malformed = Some(detail);
+                None
+            }
+        }
+    }
+
+    /// Absorb every event from an iterator (e.g. `parser.feed` / `finish`).
+    /// Returns only the visible Token/Reasoning events, in order.
+    pub fn absorb_all<I>(&mut self, events: I) -> Vec<StreamEvent>
+    where
+        I: IntoIterator<Item = StreamEvent>,
+    {
+        events
+            .into_iter()
+            .filter_map(|ev| self.absorb(ev))
+            .collect()
+    }
+
+    /// Production terminal decision. Length always wins over buffered calls.
+    /// Malformed discards every earlier complete call.
+    pub fn finalize(self, hit_length_cap: bool) -> DsmlDeferredOutcome {
+        if let Some(detail) = self.malformed {
+            return DsmlDeferredOutcome::Malformed { detail };
+        }
+        if hit_length_cap {
+            return DsmlDeferredOutcome::Length;
+        }
+        if self.calls.is_empty() {
+            DsmlDeferredOutcome::Stop
+        } else {
+            DsmlDeferredOutcome::ToolCalls(self.calls)
+        }
+    }
 }
 
 impl ToolCall {
@@ -231,6 +321,11 @@ pub enum StreamEvent {
     /// A completed `<｜DSML｜tool_calls>` block parsed into structured
     /// invocations.
     ToolCalls(Vec<ToolCall>),
+    /// Fail-closed: tool protocol opened but never closed (or otherwise
+    /// truncated) at end-of-stream. Callers must not surface the raw
+    /// marker/body as [`Token`], must not expose executable tool calls,
+    /// and should terminalize with a non-retryable error (not `done`).
+    Malformed { detail: String },
 }
 
 /// Parser state at any moment.
@@ -311,9 +406,13 @@ impl StreamParser {
         events
     }
 
-    /// End-of-stream: flush whatever's buffered. Unclosed `<think>` or
-    /// `<｜DSML｜tool_calls>` blocks are surfaced as best-effort content
-    /// so the user sees the partial.
+    /// End-of-stream: flush whatever's buffered.
+    ///
+    /// - Unclosed `<think>` is still flushed as best-effort reasoning
+    ///   (think is not executable protocol).
+    /// - Unclosed `<｜DSML｜tool_calls>` **fails closed**: emits
+    ///   [`StreamEvent::Malformed`] and never reconstructs the open
+    ///   marker + body as visible [`StreamEvent::Token`] text.
     pub fn finish(mut self) -> Vec<StreamEvent> {
         let mut events = Vec::new();
         match self.state {
@@ -344,10 +443,10 @@ impl StreamParser {
                 }
             }
             State::InToolCalls => {
-                // Malformed: never saw the close. Surface as raw content.
-                let mut raw = String::from(TOOL_CALLS_OPEN);
-                raw.push_str(&self.buf);
-                events.push(StreamEvent::Token(raw));
+                // Fail-closed: never saw the close. Do not flush raw DSML.
+                events.push(StreamEvent::Malformed {
+                    detail: "unclosed DSML tool_calls block at end of output".to_string(),
+                });
             }
         }
         events
@@ -489,8 +588,12 @@ pub fn parse_tool_calls_body(body: &str) -> Vec<ToolCall> {
         // (canonical, per HF encoder) or `<｜DSML｜tool name="` (variant
         // observed from the V4F MQ2-Lloyd checkpoint — see comment on
         // TOOL_OPEN_PREFIX_ALT). Whichever appears first wins.
-        let invoke_hit = body[cursor..].find(INVOKE_OPEN_PREFIX).map(|i| (i, INVOKE_OPEN_PREFIX.len(), INVOKE_CLOSE));
-        let tool_hit = body[cursor..].find(TOOL_OPEN_PREFIX_ALT).map(|i| (i, TOOL_OPEN_PREFIX_ALT.len(), TOOL_CLOSE_ALT));
+        let invoke_hit = body[cursor..]
+            .find(INVOKE_OPEN_PREFIX)
+            .map(|i| (i, INVOKE_OPEN_PREFIX.len(), INVOKE_CLOSE));
+        let tool_hit = body[cursor..]
+            .find(TOOL_OPEN_PREFIX_ALT)
+            .map(|i| (i, TOOL_OPEN_PREFIX_ALT.len(), TOOL_CLOSE_ALT));
         let (open_rel, open_len, close_marker) = match (invoke_hit, tool_hit) {
             (Some(a), Some(b)) if a.0 <= b.0 => a,
             (Some(_), Some(b)) => b,
@@ -517,8 +620,12 @@ pub fn parse_tool_calls_body(body: &str) -> Vec<ToolCall> {
         // Whichever appears FIRST in the body wins so a generic close
         // inside a string param value can't terminate the invoke
         // prematurely if the matched form precedes it.
-        let matched_at = body[body_start..].find(close_marker).map(|i| (i, close_marker.len()));
-        let generic_at = body[body_start..].find(GENERIC_CLOSE).map(|i| (i, GENERIC_CLOSE.len()));
+        let matched_at = body[body_start..]
+            .find(close_marker)
+            .map(|i| (i, close_marker.len()));
+        let generic_at = body[body_start..]
+            .find(GENERIC_CLOSE)
+            .map(|i| (i, GENERIC_CLOSE.len()));
         let (rel_off, used_close_len) = match (matched_at, generic_at) {
             (Some(a), Some(b)) if a.0 <= b.0 => a,
             (Some(_), Some(b)) => b,
@@ -535,7 +642,10 @@ pub fn parse_tool_calls_body(body: &str) -> Vec<ToolCall> {
         let invoke_close = body_start + rel_off;
         let invoke_body = &body[body_start..invoke_close];
         let args = parse_parameters(invoke_body);
-        out.push(ToolCall { name, arguments: args });
+        out.push(ToolCall {
+            name,
+            arguments: args,
+        });
         cursor = invoke_close + used_close_len;
     }
     out
@@ -850,21 +960,60 @@ mod tests {
     }
 
     #[test]
-    fn malformed_tool_call_passes_through_at_finish() {
-        // Opens but never closes — finish() flushes as raw token.
+    fn malformed_unclosed_tool_calls_fail_closed_at_finish() {
+        // Opens but never closes — finish() must report Malformed and
+        // must not surface the open marker / body as Token text.
         let mut p = StreamParser::new();
         let _ = p.feed(TOOL_CALLS_OPEN);
         let _ = p.feed("\n<｜DSML｜invoke name=\"f\">");
         let events = p.finish();
-        let raw: String = events
+        let tokens: String = events
             .iter()
             .filter_map(|e| match e {
                 StreamEvent::Token(t) => Some(t.as_str()),
                 _ => None,
             })
             .collect();
-        assert!(raw.contains(TOOL_CALLS_OPEN));
-        assert!(raw.contains("invoke"));
+        assert!(
+            tokens.is_empty(),
+            "fail-closed must not flush unclosed DSML as Token, got {tokens:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, StreamEvent::ToolCalls(_)))
+                == false,
+            "unclosed protocol must not yield ToolCalls"
+        );
+        let detail = events.iter().find_map(|e| match e {
+            StreamEvent::Malformed { detail } => Some(detail.as_str()),
+            _ => None,
+        });
+        assert!(
+            detail.is_some_and(|d| d.contains("unclosed") && d.contains("tool_calls")),
+            "expected Malformed detail, events={events:?}"
+        );
+    }
+
+    #[test]
+    fn malformed_unclosed_after_prose_keeps_prior_tokens_only() {
+        let mut p = StreamParser::new();
+        let mut events = p.feed("hello ");
+        events.extend(p.feed(TOOL_CALLS_OPEN));
+        events.extend(p.feed("partial"));
+        events.extend(p.finish());
+        let tokens: String = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::Token(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tokens, "hello ");
+        assert!(!tokens.contains(TOOL_CALLS_OPEN));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, StreamEvent::Malformed { .. })));
     }
 
     #[test]

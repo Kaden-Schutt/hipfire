@@ -1,18 +1,85 @@
 # Benchmarks
 
-All measurements on the indicated arch with the engine's then-default
-config (asym3 KV, FlashAttention auto, prompt_normalize=on). Numbers are
-medians across 5 runs unless noted. See
-[methodology/perf-benchmarking.md](methodology/perf-benchmarking.md) for
-the protocol and the noise band you should expect when reproducing.
+Published **historical** tables only. Every number here is a retained,
+fixture-bound observation from an earlier campaign. None of these rows is a
+live floor, product default, admission, or route certificate. Per
+[`INDEX.md`](INDEX.md), a **measured** claim requires a named fixture, binary
+and model identity, and a measurement date on the same report — these tables
+do not carry that full identity manifest, so this page is **historical** only
+(the inventory date below is not a measurement date).
 
-> **KV-mode note:** these numbers were measured pre-fwht3-default (the
-> per-arch default is now `fwht3`/`fwht2`, not `asym3`). They remain
-> valid for `asym3` KV. `fwht3` shares `asym3`'s byte layout and is
-> perf-equivalent (it differs only in K-rotation basis), so the decode /
-> BW figures carry over; the asym3 rows are not re-benched here.
+| Field | Value |
+|---|---|
+| Page state | **historical** (see [`INDEX.md`](INDEX.md)) |
+| Inventory date | 2026-07-19 |
+| Audited source ref | `692a726dde53508cb53de1a74c720e75a7c9f33e` |
+| Comparison base | `origin/beta` @ `9ffb18da9d1377dfbf759db82641ea039b2e522e` |
 
-## Autoregressive decode (no spec) — 7900 XTX (gfx1100)
+## How to read this page
+
+1. Treat every table on this page as **historical** only. Do not upgrade a row
+   to **measured** without a complete per-table date, fixture, and
+   binary/model-identity evidence manifest **and** a fresh protocol-compliant
+   run under
+   [`methodology/perf-benchmarking.md`](methodology/perf-benchmarking.md).
+   Measurement and admission are independent: a complete **measured** row is
+   still not a product default or route certificate. Any product-default or
+   admission claim **additionally** requires an explicit row in
+   [`admissions.yml`](admissions.yml) (schema v2; exactly one earned record — fail closed otherwise).
+2. Many older rows used the then-default `asym3` KV mode. Current clean configs
+   resolve `kv_cache=auto` through the model registry and otherwise fall back to
+   `q8`. Do not compare asym3 rows to q8 rows as one A/B.
+3. Speed floors used by tooling live in `tests/speed-baselines/<arch>.txt` and
+   are exercised by [`scripts/speed-gate.sh`](../scripts/speed-gate.sh) when that
+   path’s policy applies. Those files are **not** reproduced here.
+4. Validation and promotion routes live only in [`VALIDATION.md`](VALIDATION.md).
+   Retired batteries are **historical reproduction only** — never current
+   acceptance for a bench claim.
+5. Redline-attributed numbers require the certification ladder in
+   [`REDLINE.md`](REDLINE.md). Throughput without timed-arm route proof is not a
+   Redline certification.
+
+## Claim language (fail closed)
+
+| Allowed | Forbidden without fresh evidence |
+|---|---|
+| “On \<date\>, fixture \<id\>, median X tok/s” | “Current baseline is X” |
+| “Historical DFlash genre table (asym3, max_tokens=120)” | “DFlash is 4× on 27B” as a present product fact |
+| “Speed-gate floor in `tests/speed-baselines/…`” | Treating any table below as that floor |
+| Link to a dated `perf-checkpoints/` file | Stitching harness exits into an admission |
+
+A bench number without protocol + identity hashes is **rejected** as promotion
+evidence ([`VALIDATION.md`](VALIDATION.md)).
+
+## Reproducing measurements
+
+Protocol owner: [`methodology/perf-benchmarking.md`](methodology/perf-benchmarking.md)
+(warmup, fresh-process, noise band, prompt MD5 discipline).
+
+```bash
+# Canonical CLI surface (pp/decode matrix depends on flags and model)
+hipfire bench qwen3.5:9b
+
+# Optional speed-floor check when that path’s policy applies
+./scripts/speed-gate.sh --fast
+```
+
+For DFlash genre work, use prompt-MD5-pinned fixtures under
+[`benchmarks/prompts/`](../benchmarks/prompts/). Prompt structure swings τ;
+byte-identical prompts are mandatory across sessions.
+
+Optional A/B tooling: [`scripts/probe_commits.sh`](../scripts/probe_commits.sh)
+(also reachable from `scripts/gates.sh --perf`). Neither script creates an
+admission row.
+
+---
+
+## Historical: autoregressive decode (no spec) — 7900 XTX (gfx1100)
+
+**Truth state:** historical
+**Fixture notes:** then-default engine config (asym3 KV, FlashAttention auto,
+`prompt_normalize=on`). Medians across 5 runs unless noted. Not a current q8
+methodology row. No per-row binary/model hash manifest on this page.
 
 | Model | decode | prefill (peak) | effective BW |
 |---|---:|---:|---:|
@@ -21,21 +88,31 @@ the protocol and the noise band you should expect when reproducing.
 | Qwen 3.5 9B MQ4 | **132 tok/s** | **1663 tok/s** | **654 GiB/s** |
 | Qwen 3.5 27B MQ4 | **47 tok/s** | **478 tok/s** | **651 GiB/s** |
 
-9B and 27B decode saturate ~650 GiB/s of the 7900 XTX's 960 GB/s peak
-(68% BW-efficient end-to-end across weights + KV + activations).
-Prefill on the smaller sizes is WMMA-bound on the MQ4 fused
-projections.
+Engineering note retained with the snapshot: 9B and 27B decode saturated
+~650 GiB/s of the 7900 XTX’s 960 GB/s peak (~68% BW-efficient end-to-end across
+weights + KV + activations). Prefill on the smaller sizes was WMMA-bound on the
+MQ4 fused projections **under that fixture**.
 
-## DFlash speculative decode by genre — 7900 XTX
+## Historical: DFlash speculative decode by genre — 7900 XTX
 
-DFlash speedup is **genre-conditional**. Code prompts whose target
-distribution matches the draft win big; long-form prose where the
-target's high-entropy continuations diverge from draft predictions can
-be a net loss.
+**Truth state:** historical (**superseded methodology**)
+**Do not use as a current DFlash baseline.**
 
-5-run medians, asym3 KV, `--no-chatml`, `max_tokens=120`,
-`prompt_normalize=true` (measured pre-fwht3-default; numbers remain
-valid for asym3 KV):
+This table used `asym3` KV and `max_tokens=120`. Current DFlash performance
+claims require the protocol in
+[`methodology/perf-benchmarking.md`](methodology/perf-benchmarking.md) (including
+q8 where that is the active KV path, `max_tokens=256` when that is the campaign
+contract, ≥3 fresh-process runs, prompt and binary hashes) plus the claim-class
+route in [`VALIDATION.md`](VALIDATION.md). A retired battery pass is **not**
+acceptance evidence. No per-row
+binary/model hash manifest on this page.
+
+DFlash speedup in this snapshot was **genre-conditional**. Code prompts whose
+target distribution matched the draft won; long-form prose where high-entropy
+continuations diverged could net-lose.
+
+5-run medians under the historical configuration: asym3 KV, `--no-chatml`,
+`max_tokens=120`, `prompt_normalize=true`:
 
 | Model | genre | AR tok/s | DFlash tok/s | speedup | τ |
 |---|---|---:|---:|---:|---:|
@@ -49,22 +126,21 @@ valid for asym3 KV):
 | Qwen 3.5 9B | prose (Rome) | **122.7** | 98.3 | 0.80× ✗ | 1.20 |
 | Qwen 3.6 27B | code (HumanEval/53) | 44.2 | **185.5** | **4.19×** | 9.25 |
 
-**Default `dflash_mode=off`** as of v0.1.8 — DFlash is opt-in until
-the genre-conditional speedup is more universally a win. Enable it
-globally with `hipfire config set dflash_mode auto` (the engine then
-turns DFlash on for dense Qwen 3.5+ targets and off where it
-historically loses) or per model with `hipfire config qwen3.5:27b set
-dflash_mode on`. The numbers above were measured with DFlash forced
-on.
+**Config context for the snapshot (not a timeless default):** CLI default
+`dflash_mode` is `"off"` (`crates/hipfire-config/src/lib.rs`); DFlash is opt-in until a campaign
+proves a broader win. Enable globally with `hipfire config set dflash_mode auto`
+(dense Qwen 3.5+ on, A3B off unless overridden) or per model with
+`hipfire config qwen3.5:27b set dflash_mode on`. The numbers above were measured
+with DFlash forced on.
 
-## vs ollama (Q4_K_M GGUF) — 7900 XTX
+## Historical: vs ollama (Q4_K_M GGUF) — 7900 XTX
 
-Same machine, same models. hipfire MQ4 (asym3 KV, FlashAttention;
-measured pre-fwht3-default, numbers remain valid for asym3 KV) vs
-ollama default Q4_K_M through llama.cpp's ROCm backend. Matched
-~140-token and ~530-token prompts and matched 128-token generation
-lengths. Ollama numbers extracted from its own `prompt_eval_duration` /
-`eval_duration` reporting via `/api/generate` with `num_predict=128`.
+**Truth state:** historical
+Same-machine snapshot: hipfire MQ4 with asym3 KV and FlashAttention versus
+ollama Q4_K_M through llama.cpp’s ROCm backend. Matched ~140-token and
+~530-token prompts and matched 128-token generation lengths. Ollama numbers from
+its `prompt_eval_duration` / `eval_duration` reporting via `/api/generate` with
+`num_predict=128`. No per-row binary/model hash manifest on this page.
 
 | Model | hf pp128 | oll pp128 | hf pp512 | oll pp512 | hf decode | oll decode | decode× |
 |---|---:|---:|---:|---:|---:|---:|---:|
@@ -72,18 +148,15 @@ lengths. Ollama numbers extracted from its own `prompt_eval_duration` /
 | Qwen 3.5 4B | **3,304** | 1,972 | **3,321** | 2,670 | **165** | 93 | **1.78×** |
 | Qwen 3.5 9B | **1,920** | 1,428 | 1,919 | **1,970** | **122** | 71 | **1.71×** |
 
-hipfire wins decode 1.7–2.1× across the board — that's the user-visible
-number for interactive chat. Prefill is more nuanced: hipfire wins
-decisively on 0.8B / 4B and at pp128 for 9B (batched MQ4 fused
-projections saturate WMMA on small matmuls where llama.cpp's per-token
-GGUF dequant can't), but ollama edges past at pp512 for 9B (the GEMMs
-are large enough there to saturate even without WMMA).
+The retired comparison harness remains available in git history; the table is
+historical evidence, not a currently runnable route.
 
-Harness: [`cli/bench_vs_ollama.ts`](../cli/bench_vs_ollama.ts).
+## Historical: other arches (decode tok/s)
 
-## Other arches
-
-Decode tok/s, default config:
+**Truth state:** historical
+Then-default configuration; not a cross-arch speed-gate matrix and not an
+admission of gfx12 product routes. No per-row binary/model hash manifest on
+this page.
 
 | Arch | Examples | 0.8B | 4B | 9B | 27B |
 |---|---|---:|---:|---:|---:|
@@ -93,33 +166,34 @@ Decode tok/s, default config:
 | GCN5 (gfx906) | MI50 / MI60 | 231 | 61 | 59 | 21 |
 | MI300X (gfx942) | datacenter | 850 | 480 | 320 | 130 |
 
-MI300X is wave64 + MFMA — different kernel family. RDNA4 (gfx1200 /
-gfx1201) ships a dispatch fallback to dot2 today; per-arch WMMA
-kernels are in progress (issue #54). gfx906 (Vega 20) uses the
-nwarps=4 dp4a MMQ kernel for prefill at batch≥16
-(`docs/plans/gfx906-mmq-prd.md`). Decode at batch=1 uses two
-gfx906-specific optimizations from the 2026-05-05 perf
-investigation
-(`docs/perf-checkpoints/2026-05-05-gfx906-decode-investigation.md`):
-the residual-GEMV runs a software-pipelined ILP-injection variant
-(+4.8% on 9B), and the three fused projections (`gate_up`, `qkv`,
-`qkvza`) pre-quantize x to Q8_1 and use `v_dot4_i32_i8` (+9.3% on
-9B). Combined: 50.7 → 58.9 tok/s (+16.2%) on Qwen 3.5 9B. Stock
-llama.cpp Q4_K_M on the same hardware: 61.55 tok/s (1.04× ahead),
-skyne98/iacopPBK fork: 63.48 (1.08× ahead).
+Supporting dated notes (still fixture-bound):
 
-## Reproducing
+- MI300X is wave64 + MFMA — different kernel family from RDNA WMMA paths.
+- RDNA4 (gfx1200 / gfx1201) has gfx12-specific WMMA paths across fused GEMM,
+  attention, and MoE kernels; operations without a gfx12 sibling still fall
+  through typed dispatch tables. Presence of a kernel path ≠ Redline admission
+  and ≠ a row in [`admissions.yml`](admissions.yml).
+- gfx906 (Vega 20) prefill batch≥16 used the nwarps=4 dp4a MMQ kernel
+  (`docs/plans/gfx906-mmq-prd.md`). Decode batch=1 notes from the 2026-05-05
+  investigation
+  (`docs/perf-checkpoints/2026-05-05-gfx906-decode-investigation.md`): residual
+  GEMV software-pipelined ILP variant (+4.8% on 9B under that fixture) and fused
+  projections pre-quantizing x to Q8_1 with `v_dot4_i32_i8` (+9.3% on 9B).
+  Combined historical row: 50.7 → 58.9 tok/s (+16.2%) on Qwen 3.5 9B. Stock
+  llama.cpp Q4_K_M on the same hardware in that note: 61.55 tok/s; skyne98/iacopPBK
+  fork: 63.48.
 
-```bash
-hipfire bench qwen3.5:9b
-```
+## Where new numbers go
 
-Runs the canonical bench (pp32 / pp128 / decode) on a fresh build
-against the committed speed-baselines in
-`tests/speed-baselines/<arch>.txt`. The same harness gates
-pre-commit when kernel or dispatch code changes.
+| Kind of result | Owner |
+|---|---|
+| How to measure | [`methodology/perf-benchmarking.md`](methodology/perf-benchmarking.md) |
+| Bench-suite layout | [`methodology/bench-suite.md`](methodology/bench-suite.md) |
+| Immutable campaign checkpoints | [`perf-checkpoints/`](perf-checkpoints/) (new dated file; do not rewrite old bodies) |
+| Claim → validation route | [`VALIDATION.md`](VALIDATION.md) |
+| Product admission | [`admissions.yml`](admissions.yml) only (schema v2; exactly one earned record) |
+| Redline-attributed claims | [`REDLINE.md`](REDLINE.md) |
+| Speculation capability inventory | [`speculation-support-inventory.md`](speculation-support-inventory.md) (verify in source) |
 
-For DFlash perf comparison, use the prompt-md5-pinned scripts in
-`benchmarks/prompts/` — see `methodology/perf-benchmarking.md` for why
-prompt structure matters as much as model + flags (one stray newline
-swings τ by 17%).
+Do not paste mutable inventory matrices into this page. Do not promote a
+historical row by recency alone.

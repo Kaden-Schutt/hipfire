@@ -253,28 +253,29 @@ impl ReapPlan {
         Self::load_legacy_keepmap(dir, num_layers_expected, orig_experts_expected)
     }
 
-    /// Resolve a REAP plan from the environment for an arch's config loader.
+    /// Resolve a REAP plan from the immutable process policy for an arch's
+    /// config loader.
     ///
     /// Reads `HIPFIRE_REAP_PLAN` (and `legacy_alias_env` if given — e.g. ds4's
     /// `HIPFIRE_DEEPSEEK4_REAP_KEEPMAP`). On a hit it rejects a dense
     /// (`orig_experts == 0`) checkpoint, loads the plan via [`Self::load_any`]
     /// validated against the ORIGINAL counts, logs the active prune, and returns
-    /// `Ok(Some(plan))`. No env var set ⇒ `Ok(None)` (no pruning). The caller
+    /// `Ok(Some(plan))`. No configured path means `Ok(None)` (no pruning). The caller
     /// then overrides its own routed-expert count field to `plan.kept_per_layer()`
     /// and stores the plan — that assignment differs per arch (`num_experts` /
     /// `n_routed_experts` / `num_local_experts`) so it stays at the call site.
     /// Consolidates the env-read + dense-guard + load + log boilerplate that was
     /// duplicated across the four arch loaders (review #10). `arch` names the
     /// caller in the error/log messages.
-    pub fn from_env(
+    pub fn from_config(
         arch: &str,
         legacy_alias_env: Option<&str>,
         num_layers: usize,
         orig_experts: usize,
     ) -> Result<Option<Self>, String> {
-        let dir = std::env::var("HIPFIRE_REAP_PLAN")
+        let dir = hipfire_config::developer_var("HIPFIRE_REAP_PLAN")
             .ok()
-            .or_else(|| legacy_alias_env.and_then(|e| std::env::var(e).ok()));
+            .or_else(|| legacy_alias_env.and_then(|name| hipfire_config::developer_var(name).ok()));
         let Some(dir) = dir else { return Ok(None) };
         // MoE-only feature: a dense (orig_experts == 0) checkpoint has no routed
         // experts to prune. Refuse rather than silently divide-by-zero / mislead.

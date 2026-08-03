@@ -103,7 +103,7 @@ impl MtpDrafter for Deepseek4MtpDrafter {
         // Cold start: reset recurrent state (n_tokens → 0, mtp_last_hidden → None).
         // DeepseekV4State::reset() does no GPU work.
         if !cache_hit {
-            target.reset_recurrent(gpu);
+            target.reset_recurrent(gpu)?;
         }
 
         let bundle = Self::bundle(target)?;
@@ -117,7 +117,7 @@ impl MtpDrafter for Deepseek4MtpDrafter {
         // Lazily build the PBS. Sized identically to the loader's deepseek4_pbs
         // (carriers.rs:645-649): HIPFIRE_DEEPSEEK4_PP_BATCH, default 1024.
         if self.pbs.is_none() {
-            let pbs_max_batch: usize = std::env::var("HIPFIRE_DEEPSEEK4_PP_BATCH")
+            let pbs_max_batch: usize = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_PP_BATCH")
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(1024);
@@ -156,6 +156,9 @@ impl MtpDrafter for Deepseek4MtpDrafter {
             .pbs
             .as_ref()
             .ok_or("Deepseek4MtpDrafter: mtp_step called before mtp_prefill")?;
+
+        // Per-call k from MtpSpeculator is authoritative (already max_emit-clamped).
+        let k = k.min(self.max_n);
 
         // In-step grammar: downcast the erased handle to the concrete ds4 grammar
         // (matcher + decoded-vocab + reusable mask). `None` ⇒ the plain fused step.
@@ -221,6 +224,10 @@ impl MtpDrafter for Deepseek4MtpDrafter {
         }
         .map_err(|e| format!("mtp step: {e}"))?;
 
+        debug_assert!(
+            r.accepted_tokens.len() <= k + 1,
+            "deepseek4 MTP committed past k budget"
+        );
         Ok(MtpWindow {
             committed: r.accepted_tokens,
             accepted: r.n_accepted,
@@ -228,10 +235,58 @@ impl MtpDrafter for Deepseek4MtpDrafter {
         })
     }
 
-    fn mtp_reset(&mut self, _gpu: &mut Gpu) {
+    fn mtp_forced_advance(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+        tokens: &[u32],
+        start_pos: usize,
+        abort: &dyn Fn() -> bool,
+    ) -> Result<bool, String> {
+        // Forced tokens must refresh trunk + MTP SWA/last_hidden together.
+        // prefill_with_mtp_fill is the same fused path as mtp_prefill.
+        if tokens.is_empty() {
+            return Ok(true);
+        }
+        if abort() {
+            return Ok(true);
+        }
+        let bundle = Self::bundle(target)?;
+        let Deepseek4Bundle {
+            config,
+            weights,
+            state,
+            ..
+        } = bundle;
+        if self.pbs.is_none() {
+            let pbs_max_batch: usize = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_PP_BATCH")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(1024);
+            self.pbs = Some(
+                PrefillBatchScratch::new(gpu, config, pbs_max_batch)
+                    .map_err(|e| format!("Deepseek4MtpDrafter forced: alloc PBS: {e}"))?,
+            );
+        }
+        let pbs = self.pbs.as_ref().expect("just built");
+        crate::forward::prefill_with_mtp_fill(
+            config,
+            weights,
+            state,
+            gpu,
+            pbs,
+            tokens,
+            start_pos as u32,
+        )
+        .map_err(|e| format!("deepseek4 MTP forced advance: {e}"))?;
+        Ok(true)
+    }
+
+    fn mtp_reset(&mut self, _gpu: &mut Gpu) -> Result<(), String> {
         // deepseek4's drafter has no drafter-local GPU state besides `pbs`
         // (scratch, not conversation state). The target bundle's recurrent
         // reset (state.reset()) is the daemon's job, per trait contract.
+        Ok(())
     }
 
     fn mtp_free(self: Box<Self>, gpu: &mut Gpu) {

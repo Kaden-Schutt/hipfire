@@ -112,9 +112,10 @@ fn main() -> Result<(), String> {
             target,
             position,
             seed,
-            &[],  // emitted (empty: no prior context for repeat-penalty)
-            None, // grammar
-            0.0,  // temp: greedy
+            &[],        // emitted (empty: no prior context for repeat-penalty)
+            None,       // grammar
+            0.0,        // temp: greedy
+            usize::MAX, // uncapped bench window
         )
         .map_err(|e| format!("step: {e}"))?;
 

@@ -31,15 +31,14 @@ use hipfire_dispatch::pipeline::superop::{
 use hipfire_dispatch::types::DispatchError;
 use rdna_compute::{DType, Gpu, GpuTensor};
 
-/// OnceLock-cached env-var lookups for the DeepSeek V4 decode hot path. Each
-/// `std::env::var` is a syscall (~1μs) — at 43 layers × ~5 lookups per
-/// layer in the un-cached code that was ~200μs/token of pure syscall
-/// overhead. Each helper reads the env once and atomic-loads thereafter.
-mod env_cache {
+/// OnceLock-cached process-policy lookups for the DeepSeek V4 decode hot path.
+/// The generic process snapshot is consulted once per helper; subsequent hot
+/// path reads are atomic loads.
+mod config_cache {
     use std::sync::OnceLock;
 
     fn flag_one(name: &'static str) -> bool {
-        std::env::var(name).ok().as_deref() == Some("1")
+        hipfire_config::developer_var(name).ok().as_deref() == Some("1")
     }
 
     /// `HIPFIRE_DEEPSEEK4_MOE` — default ON. Opt out with "0" for diagnostic
@@ -49,7 +48,12 @@ mod env_cache {
     /// expert blobs.
     pub(super) fn moe_on() -> bool {
         static V: OnceLock<bool> = OnceLock::new();
-        *V.get_or_init(|| std::env::var("HIPFIRE_DEEPSEEK4_MOE").ok().as_deref() != Some("0"))
+        *V.get_or_init(|| {
+            hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MOE")
+                .ok()
+                .as_deref()
+                != Some("0")
+        })
     }
     /// `HIPFIRE_DEEPSEEK4_SKIP_FFN` — diagnostic: zero ffn_out to isolate attn growth.
     pub(super) fn skip_ffn() -> bool {
@@ -60,7 +64,7 @@ mod env_cache {
     pub(super) fn max_compress_pos() -> usize {
         static V: OnceLock<usize> = OnceLock::new();
         *V.get_or_init(|| {
-            std::env::var("HIPFIRE_DEEPSEEK4_MAX_COMPRESS_POS")
+            hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MAX_COMPRESS_POS")
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(2048)
@@ -70,7 +74,12 @@ mod env_cache {
     /// pos-0 attention path instead of SWA. Default false (i.e. use SWA).
     pub(super) fn attn_pos0() -> bool {
         static V: OnceLock<bool> = OnceLock::new();
-        *V.get_or_init(|| std::env::var("HIPFIRE_DEEPSEEK4_ATTN").ok().as_deref() == Some("pos0"))
+        *V.get_or_init(|| {
+            hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_ATTN")
+                .ok()
+                .as_deref()
+                == Some("pos0")
+        })
     }
     /// `HIPFIRE_DEEPSEEK4_MTP_HEAD_HC` — default ON since 2026-05-21: route
     /// the MTP output (step 8 of mtp_forward) through head-HC mix using
@@ -83,7 +92,7 @@ mod env_cache {
     pub(super) fn mtp_head_hc_on() -> bool {
         static V: OnceLock<bool> = OnceLock::new();
         *V.get_or_init(|| {
-            std::env::var("HIPFIRE_DEEPSEEK4_MTP_HEAD_HC")
+            hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MTP_HEAD_HC")
                 .ok()
                 .as_deref()
                 != Some("0")
@@ -200,7 +209,7 @@ fn gemv_auto_batched(
 /// compared with `cmp -l a/x.bin b/x.bin` to find the first byte that
 /// differs — pinpointing which kernel introduces non-determinism.
 fn dump_buf(gpu: &mut Gpu, tag: &str, buf: &rdna_compute::GpuTensor) {
-    let dir = match std::env::var("HIPFIRE_DEEPSEEK4_DUMP_STATE") {
+    let dir = match hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_DUMP_STATE") {
         Ok(d) => d,
         Err(_) => return,
     };
@@ -228,7 +237,7 @@ fn gemv_auto_batched_wmma(
 ) -> Result<(), String> {
     match weight.dtype {
         DType::F32 => {
-            if std::env::var("HIPFIRE_DEEPSEEK4_F32_TRACE").is_ok() {
+            if hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_F32_TRACE").is_ok() {
                 use std::sync::atomic::{AtomicUsize, Ordering};
                 static N: AtomicUsize = AtomicUsize::new(0);
                 let c = N.fetch_add(1, Ordering::Relaxed);
@@ -243,54 +252,19 @@ fn gemv_auto_batched_wmma(
                 .map_err(|e| format!("gemm_f32_register_tiled: {e:?}"))
         }
         DType::Q8_0 => {
-            let wmma_on = std::env::var("HIPFIRE_DEEPSEEK4_Q8_WMMA")
-                .map(|s| s != "0")
-                .unwrap_or(true);
-            if wmma_on && gpu.arch_caps.is_rdna4() {
-                // RDNA4 (gfx12): upstream-tuned gating (unchanged).
-                if let Some(scratch) = x_f16_scratch {
-                    let n = (batch_size * k) as i64;
-                    gpu.deepseek4_convert_f32_to_f16(x_plain_batch, scratch, n)
-                        .map_err(|e| format!("convert_f32_to_f16 (Q8 WMMA): {e:?}"))?;
-                    let opt_out = std::env::var("HIPFIRE_DEEPSEEK4_Q8_4W").as_deref() == Ok("0");
-                    let use_4w = !opt_out
-                        && batch_size >= 256
-                        && m >= 4096
-                        && m % 64 == 0
-                        && k % 32 == 0
-                        && batch_size % 64 == 0;
-                    if use_4w {
-                        return gpu
-                            .gemm_q8_0_wmma_4w(weight, scratch, y, m, k, batch_size)
-                            .map_err(|e| format!("gemm_q8_0_wmma_4w: {e:?}"));
-                    }
-                    return gpu
-                        .gemm_q8_0_wmma(weight, scratch, y, m, k, batch_size)
-                        .map_err(|e| format!("gemm_q8_0_wmma: {e:?}"));
-                }
-            } else if wmma_on && gpu.arch_caps.has_wmma() && m % 64 == 0 && k % 32 == 0 {
-                // gfx11 / RDNA3.5 (gfx1151) Q8_0 WMMA prefill. The activation
-                // is pre-converted to F16 in `scratch`; the kernels honor the
-                // F16 dtype (no re-convert). 4-warp 64×64-tile kernel for
-                // batch%64==0 (~12% over single-warp 16×16; weight-bandwidth-
-                // bound); HIPFIRE_DEEPSEEK4_Q8_4W=0 forces single-warp.
-                if let Some(scratch) = x_f16_scratch {
-                    let n = (batch_size * k) as i64;
-                    gpu.deepseek4_convert_f32_to_f16(x_plain_batch, scratch, n)
-                        .map_err(|e| format!("convert_f32_to_f16 (Q8 WMMA): {e:?}"))?;
-                    let opt_out_4w = std::env::var("HIPFIRE_DEEPSEEK4_Q8_4W").as_deref() == Ok("0");
-                    if !opt_out_4w && batch_size >= 64 && batch_size % 64 == 0 {
-                        return gpu
-                            .gemm_q8_0_wmma_4w(weight, scratch, y, m, k, batch_size)
-                            .map_err(|e| format!("gemm_q8_0_wmma_4w: {e:?}"));
-                    }
-                    return gpu
-                        .gemm_q8_0_wmma(weight, scratch, y, m, k, batch_size)
-                        .map_err(|e| format!("gemm_q8_0_wmma: {e:?}"));
-                }
-            }
-            gpu.gemm_q8_0_batched_chunked(weight, x_plain_batch, y, m, k, batch_size)
-                .map_err(|e| format!("gemm_q8_0_batched_chunked: {e:?}"))
+            // Kernel selection (i8-MMQ / f16-WMMA / scalar) lives in the
+            // dispatch layer (rdna-compute), not here — the resolver reads arch
+            // caps + flags + shape. See `gemm_q8_0_wmma_prefill_auto`.
+            gpu.gemm_q8_0_wmma_prefill_auto(
+                weight,
+                x_plain_batch,
+                x_f16_scratch,
+                y,
+                m,
+                k,
+                batch_size,
+            )
+            .map_err(|e| format!("gemm_q8_0_wmma_prefill_auto: {e:?}"))
         }
         DType::F16 => {
             // gfx12/RDNA4: route through the VALIDATED gfx12 f16 WMMA kernel
@@ -314,7 +288,7 @@ fn gemv_auto_batched_wmma(
             }
         }
         _ => {
-            let wmma_on = std::env::var("HIPFIRE_DEEPSEEK4_HFQ4_WMMA")
+            let wmma_on = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_HFQ4_WMMA")
                 .map(|s| s != "0")
                 .unwrap_or(true);
             if wmma_on {
@@ -487,7 +461,7 @@ fn compressor_forward_impl(
         )
     };
 
-    let max_compressed: usize = std::env::var("HIPFIRE_DEEPSEEK4_MAX_COMPRESS_POS")
+    let max_compressed: usize = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MAX_COMPRESS_POS")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(2048);
@@ -670,7 +644,7 @@ fn compressor_forward_impl(
     // Stage-bisect dump: HIPFIRE_COMP_DUMP="<pos>,<layer>" prints each
     // pipeline stage's output fingerprint at that (position, layer) so the
     // first cross-arch divergent op can be identified. Diagnostic only.
-    let comp_dump_here = std::env::var("HIPFIRE_COMP_DUMP")
+    let comp_dump_here = hipfire_config::developer_var("HIPFIRE_COMP_DUMP")
         .ok()
         .and_then(|s| {
             let mut it = s.split(',');
@@ -1013,7 +987,7 @@ fn compressor_forward_batched(
     let proj_dim = coff * head_dim;
     let state_rows = coff * ratio;
 
-    let max_compressed: usize = std::env::var("HIPFIRE_DEEPSEEK4_MAX_COMPRESS_POS")
+    let max_compressed: usize = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MAX_COMPRESS_POS")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(2048);
@@ -1202,7 +1176,7 @@ fn compressor_forward_batched(
         // See note in `update_pos_array_host` — "start" matches reference
         // ds4 (`comp_pos = pos + 1 - ratio`). Default to that; "mid" / "end"
         // remain available via env var for diagnostic A/B.
-        let rope_pos_mode = std::env::var("HIPFIRE_DEEPSEEK4_COMP_ROPE_POS")
+        let rope_pos_mode = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_COMP_ROPE_POS")
             .ok()
             .unwrap_or_else(|| "start".to_string());
         let positions_host: Vec<i32> = (0..n_events_capped)
@@ -1389,7 +1363,7 @@ fn indexer_forward(
     // running the kernels means the captured graph contains them
     // whether warmup hit them or not, fixing graph replay at early
     // positions.
-    let max_compressed = env_cache::max_compress_pos();
+    let max_compressed = config_cache::max_compress_pos();
     let n = n_filled.min(max_compressed);
 
     let wq_b = layer
@@ -1697,7 +1671,10 @@ pub fn decode_step_with_graph(
     // `HIPFIRE_DEEPSEEK4_GRAPH=1` (untested — beware kernarg-bake regressions).
     static GRAPH_OPT_ENV: OnceLock<Option<bool>> = OnceLock::new();
     let env_override = *GRAPH_OPT_ENV.get_or_init(|| {
-        match std::env::var("HIPFIRE_DEEPSEEK4_GRAPH").ok().as_deref() {
+        match hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_GRAPH")
+            .ok()
+            .as_deref()
+        {
             Some("1") => Some(true),
             Some("0") => Some(false),
             _ => None,
@@ -1855,7 +1832,7 @@ fn fill_attn_state_host(cfg: &DeepseekV4Config, state: &mut DeepseekV4State, pos
     // pos/ratio at commit positions, -1 otherwise (commit kernels
     // early-return on -1).
     let ring_slot_4 = 4 + (pos % 4);
-    let max_compressed = env_cache::max_compress_pos() as i32;
+    let max_compressed = config_cache::max_compress_pos() as i32;
     let commit_slot_4 = if (pos + 1) % 4 == 0 {
         let s = pos / 4;
         if s < max_compressed {
@@ -1936,7 +1913,7 @@ pub(crate) fn update_pos_array_host(
 /// and a different value at replay time, drifting compressor RoPE
 /// across the capture/replay boundary.
 fn fill_pos_array_host(cfg: &DeepseekV4Config, pos_array_host: &mut [i32], position: u32) {
-    let comp_rope_mode = std::env::var("HIPFIRE_DEEPSEEK4_COMP_ROPE_POS").ok();
+    let comp_rope_mode = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_COMP_ROPE_POS").ok();
     let comp_rope_mode = comp_rope_mode.as_deref();
     for layer_idx in 0..=cfg.num_hidden_layers {
         let ratio = if layer_idx < cfg.num_hidden_layers {
@@ -1982,7 +1959,7 @@ pub fn decode_step_body(
     token_id: u32,
     position: u32,
 ) -> Result<Vec<f32>, String> {
-    let skip_ffn = env_cache::skip_ffn();
+    let skip_ffn = config_cache::skip_ffn();
 
     // #397 Ship 6 — forward-as-pipeline. The per-layer decode routes through the
     // super-op executor (run_layer_program) by DEFAULT; HIPFIRE_FORWARD_LOWERED=0
@@ -2403,7 +2380,12 @@ fn ds4_lower_program() -> superop::LayerProgram {
 fn ds4_forward_lowered_enabled() -> bool {
     use std::sync::OnceLock;
     static F: OnceLock<bool> = OnceLock::new();
-    *F.get_or_init(|| std::env::var("HIPFIRE_FORWARD_LOWERED").ok().as_deref() != Some("0"))
+    *F.get_or_init(|| {
+        hipfire_config::developer_var("HIPFIRE_FORWARD_LOWERED")
+            .ok()
+            .as_deref()
+            != Some("0")
+    })
 }
 
 /// Lowered (#397 Ship 6) per-layer decode loop + final norm/head. Behaviorally
@@ -2417,7 +2399,7 @@ fn decode_step_body_lowered(
     token_id: u32,
     position: u32,
 ) -> Result<Vec<f32>, String> {
-    let skip_ffn = env_cache::skip_ffn();
+    let skip_ffn = config_cache::skip_ffn();
     let ctx = DispatchCtx::new(gpu);
     let program = ds4_lower_program();
     for layer_idx in 0..cfg.num_hidden_layers {
@@ -2486,7 +2468,7 @@ pub fn forward_ep(
     );
     assert_eq!(partials.len(), n, "ds4 forward_ep: partials len");
     let hidden = cfg.hidden_size;
-    let skip_ffn = env_cache::skip_ffn();
+    let skip_ffn = config_cache::skip_ffn();
 
     // 1. Per-rank embed + position + token-id staging + residual-stream init
     //    (replicated, deterministic functions of the token → bit-identical
@@ -2509,11 +2491,11 @@ pub fn forward_ep(
     // 2. Per-layer EP program (Attend replicated; Moe all-reduce-EP'd). Rebuild
     //    the N per-rank bindings each layer (disjoint `iter_mut` mutable state
     //    borrows), exactly like the single-GPU lowered loop advances per layer.
-    let timing = std::env::var("HIPFIRE_EP_DECODE_TIMING").is_ok();
+    let timing = hipfire_config::developer_var("HIPFIRE_EP_DECODE_TIMING").is_ok();
     // Divergence-localization dump: HIPFIRE_EP_DUMP_POS="0,64,...,302" prints a
     // per-(position, layer, rank) fingerprint of the residual streams so EP
     // forwards can be compared across tp counts / arches. Diagnostic only.
-    let dump_pos_hit = std::env::var("HIPFIRE_EP_DUMP_POS")
+    let dump_pos_hit = hipfire_config::developer_var("HIPFIRE_EP_DUMP_POS")
         .ok()
         .map(|s| {
             s.split(',')
@@ -2578,7 +2560,12 @@ pub fn forward_ep(
                 // scores, and selected top-k indices — discriminates a
                 // systematically-divergent compressor kernel from near-tie
                 // top-k chaos. HIPFIRE_EP_DUMP_IDX=1 to enable.
-                if r == 0 && std::env::var("HIPFIRE_EP_DUMP_IDX").ok().as_deref() == Some("1") {
+                if r == 0
+                    && hipfire_config::developer_var("HIPFIRE_EP_DUMP_IDX")
+                        .ok()
+                        .as_deref()
+                        == Some("1")
+                {
                     let fp = |gpu: &mut rdna_compute::Gpu,
                               t: &Option<rdna_compute::GpuTensor>|
                      -> String {
@@ -2731,7 +2718,7 @@ pub fn mtp_forward(
     // Step 7: capture full HC residual → mtp_last_hidden (chaining input).
     mtp_capture_hidden(cfg, state, gpu)?;
     // SKIP_HEAD short-circuit (prefill MTP-fill: only the SWA write matters).
-    if std::env::var("HIPFIRE_DEEPSEEK4_MTP_SKIP_HEAD")
+    if hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MTP_SKIP_HEAD")
         .ok()
         .as_deref()
         == Some("1")
@@ -3052,7 +3039,7 @@ fn mtp_head_compute(
     }
     // Run head-HC mix or legacy stream-0 path; result lands in
     // `state.final_norm` via rmsnorm.
-    let use_head_hc = env_cache::mtp_head_hc_on()
+    let use_head_hc = config_cache::mtp_head_hc_on()
         && mtp.mtp_hc_head_fn.is_some()
         && mtp.mtp_hc_head_base.is_some();
     if use_head_hc {
@@ -3602,7 +3589,7 @@ fn ffn_stub(
     // input. So we must keep the gate/up rotation alive when MoE is
     // on (default; opt out with HIPFIRE_DEEPSEEK4_MOE=0), regardless of shared
     // weight dtype.
-    let moe_will_run = env_cache::moe_on();
+    let moe_will_run = config_cache::moe_on();
     let gate_up_need_fwht =
         moe_will_run || weight_needs_fwht(shared_w1) || weight_needs_fwht(shared_w3);
     let down_needs_fwht = weight_needs_fwht(shared_w2);
@@ -3768,7 +3755,7 @@ fn ffn_routed(
     layer_idx: usize,
     routed_out: Option<&GpuTensor>,
 ) -> Result<(), String> {
-    if !env_cache::moe_on() {
+    if !config_cache::moe_on() {
         return Ok(());
     }
     if layer_idx < cfg.num_hash_layers {
@@ -3798,7 +3785,7 @@ fn ffn_routed(
     use std::sync::OnceLock;
     static ROUTE_SCALE: OnceLock<f32> = OnceLock::new();
     let route_scale_override: f32 = *ROUTE_SCALE.get_or_init(|| {
-        std::env::var("HIPFIRE_DEEPSEEK4_ROUTE_SCALE")
+        hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_ROUTE_SCALE")
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(2.2)
@@ -3970,7 +3957,7 @@ fn ffn_hash_routed(
     token_id: u32,
     routed_out: Option<&GpuTensor>,
 ) -> Result<(), String> {
-    if !env_cache::moe_on() {
+    if !config_cache::moe_on() {
         return Ok(());
     }
     let layer = weights.resolve_layer(layer_idx);
@@ -4002,7 +3989,7 @@ fn ffn_hash_routed(
     let im = cfg.moe_intermediate_size;
     let ffn_x_rot = state.ffn_x_rot.as_ref().unwrap();
     let ffn_out = state.ffn_out.as_ref().unwrap();
-    let route_scale_override: f32 = std::env::var("HIPFIRE_DEEPSEEK4_ROUTE_SCALE")
+    let route_scale_override: f32 = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_ROUTE_SCALE")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(2.2);
@@ -4077,25 +4064,37 @@ fn ffn_hash_routed(
             .map_err(|e| format!("hash_router_normalize hash l{layer_idx}: {e:?}"))?;
         }
     } else {
-        // Fallback: d2h + host gather + h2d.
+        // Fallback: d2h + host gather + h2d. Host Vecs live on
+        // `state.hash_topk_host` and are clear+reused across layers.
         let scores_host = gpu
             .download_f32(scores)
             .map_err(|e| format!("d2h scores hash l{layer_idx}: {e:?}"))?;
-        let topk_ids: Vec<u32> = layer.tid2eid_host[row..row + k]
-            .iter()
-            .map(|&i| i.min((n_exp - 1) as u32))
-            .collect();
-        let wts = match gather_normalized_weights(&scores_host, &topk_ids) {
+        let scratch = &mut state.hash_topk_host;
+        scratch.clear();
+        scratch.topk_ids.extend(
+            layer.tid2eid_host[row..row + k]
+                .iter()
+                .map(|&i| i.min((n_exp - 1) as u32)),
+        );
+        let wts = match gather_normalized_weights(&scores_host, &scratch.topk_ids) {
             Some(w) => w,
             None => return Ok(()),
         };
-        let idx_i32: Vec<i32> = topk_ids.iter().map(|&x| x as i32).collect();
-        let idx_bytes: Vec<u8> = idx_i32.iter().flat_map(|i| i.to_le_bytes()).collect();
-        gpu.memcpy_htod_auto(&topk_idx_dev.buf, &idx_bytes)
+        scratch
+            .idx_i32
+            .extend(scratch.topk_ids.iter().map(|&x| x as i32));
+        scratch
+            .idx_bytes
+            .extend(scratch.idx_i32.iter().flat_map(|i| i.to_le_bytes()));
+        gpu.memcpy_htod_auto(&topk_idx_dev.buf, &scratch.idx_bytes)
             .map_err(|e| format!("htod topk_indices hash l{layer_idx}: {e:?}"))?;
-        let w_scaled: Vec<f32> = wts.iter().map(|&w| w * route_scale_override).collect();
-        let w_bytes: Vec<u8> = w_scaled.iter().flat_map(|w| w.to_le_bytes()).collect();
-        gpu.memcpy_htod_auto(&topk_w_dev.buf, &w_bytes)
+        scratch
+            .w_scaled
+            .extend(wts.iter().map(|&w| w * route_scale_override));
+        scratch
+            .w_bytes
+            .extend(scratch.w_scaled.iter().flat_map(|w| w.to_le_bytes()));
+        gpu.memcpy_htod_auto(&topk_w_dev.buf, &scratch.w_bytes)
             .map_err(|e| format!("htod topk_weights hash l{layer_idx}: {e:?}"))?;
     }
 
@@ -4421,7 +4420,7 @@ fn attn_stub(
 
     // SWA is now the production default. Pos-0 path retained only as a
     // diagnostic/regression-check escape hatch via HIPFIRE_DEEPSEEK4_ATTN=pos0.
-    let use_swa = !env_cache::attn_pos0();
+    let use_swa = !config_cache::attn_pos0();
 
     let q = state.q.as_ref().unwrap();
     let kv = state.kv.as_ref().unwrap();
@@ -4958,7 +4957,7 @@ fn mhc_pre(
     use std::sync::OnceLock;
     static POST_SCALE: OnceLock<f32> = OnceLock::new();
     let post_scale = *POST_SCALE.get_or_init(|| {
-        std::env::var("HIPFIRE_DEEPSEEK4_POST_SCALE")
+        hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_POST_SCALE")
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(1.5)
@@ -5491,7 +5490,7 @@ pub(crate) fn precompute_positions_batched(
     let slots_per_pos = (cfg.num_hidden_layers + 1) * POS_SLOTS_PER_LAYER;
     let total_i32s = batch_size * slots_per_pos;
 
-    let comp_rope_mode = std::env::var("HIPFIRE_DEEPSEEK4_COMP_ROPE_POS").ok();
+    let comp_rope_mode = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_COMP_ROPE_POS").ok();
     let comp_rope_mode = comp_rope_mode.as_deref();
 
     let mut host: Vec<i32> = vec![0i32; total_i32s];
@@ -5551,7 +5550,7 @@ pub(crate) fn precompute_attn_state_batched(
 
     let win = cfg.sliding_window as i32;
     let topk = cfg.index_topk as i32;
-    let max_compressed = env_cache::max_compress_pos() as i32;
+    let max_compressed = config_cache::max_compress_pos() as i32;
 
     let mut host: Vec<i32> = vec![0i32; total_i32s];
     for b in 0..batch_size {
@@ -6410,7 +6409,7 @@ fn attention_block_batched_swa_only(
     // calling `deepseek4_attn_swa` (the sequential sibling). Used to isolate
     // whether deepseek4_attn_swa_batched-specific non-determinism is the cause,
     // vs a deeper issue shared with the per-position kernel.
-    if std::env::var("HIPFIRE_DEEPSEEK4_ATTN_PER_POS").as_deref() == Ok("1") {
+    if hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_ATTN_PER_POS").as_deref() == Ok("1") {
         let q_per = n_heads * head_dim;
         let kv_per = head_dim * win;
         let out_per = n_heads * head_dim;
@@ -6455,7 +6454,9 @@ fn attention_block_batched_swa_only(
     }
 
     // DEBUG: same-process twin-call test (HIPFIRE_DEEPSEEK4_ATTN_TWIN=1).
-    if layer_idx == 0 && std::env::var("HIPFIRE_DEEPSEEK4_ATTN_TWIN").as_deref() == Ok("1") {
+    if layer_idx == 0
+        && hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_ATTN_TWIN").as_deref() == Ok("1")
+    {
         gpu.deepseek4_attn_swa_batched(
             &pbs.q_batch,
             &pbs.swa_staged_batch,
@@ -6477,7 +6478,9 @@ fn attention_block_batched_swa_only(
     // Re-runs the kernel via the debug variant which also writes
     // max_score and sum_exp per (h, b) so we can compare across runs
     // and find which intermediate first diverges.
-    if layer_idx == 0 && std::env::var("HIPFIRE_DEEPSEEK4_ATTN_DEBUG_BISECT").as_deref() == Ok("1")
+    if layer_idx == 0
+        && hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_ATTN_DEBUG_BISECT").as_deref()
+            == Ok("1")
     {
         // Lazy-alloc debug scratch on the GPU on first call.
         let n_h = n_heads;
@@ -6574,7 +6577,7 @@ fn attention_block_batched_swa_only(
             // Q8_0 contract: plain (non-FWHT) input. attn_out_raw_batch
             // is [B, n_heads * head_dim] viewable as [B, G, per_group_in].
             // Multi-row variant if HIPFIRE_DEEPSEEK4_WO_MULTIROW=2 or 4.
-            let mr: i32 = std::env::var("HIPFIRE_DEEPSEEK4_WO_MULTIROW")
+            let mr: i32 = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_WO_MULTIROW")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .filter(|&r| r == 2 || r == 4)
@@ -6759,7 +6762,7 @@ fn attention_block_batched_mixed(
     let groups_o_lora = n_groups * o_lora_rank;
     let topk_max = cfg.index_topk;
     let use_topk_direct = ratio == 4
-        && std::env::var("HIPFIRE_DEEPSEEK4_ATTN_TOPK_DIRECT")
+        && hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_ATTN_TOPK_DIRECT")
             .map(|s| s != "0")
             .unwrap_or(gpu.arch == "gfx1151" && batch_size >= 64);
     let mut topk_direct_n_compressed = 0usize;
@@ -6830,7 +6833,7 @@ fn attention_block_batched_mixed(
     // to F16 once and run gemm_f16_x_f16_wmma — measured 26× faster
     // than the F32 register-tiled path on DeepSeek V4 shapes (microbench).
     // Opt out via HIPFIRE_DEEPSEEK4_COMP_F16_WMMA=0.
-    let comp_f16_wmma = std::env::var("HIPFIRE_DEEPSEEK4_COMP_F16_WMMA")
+    let comp_f16_wmma = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_COMP_F16_WMMA")
         .map(|s| s != "0")
         .unwrap_or(true);
     let main_coff = 2; // ratio=4 has overlap=true; ratio=128 has coff=1 → wastes half the buf.
@@ -7107,10 +7110,11 @@ fn attention_block_batched_mixed(
 
         // Per-batch n_filled = (start_pos+b+1)/ratio, clamped.
         // n_max across batch = max value, used as kernel's per-batch cap.
-        let max_compressed: usize = std::env::var("HIPFIRE_DEEPSEEK4_MAX_COMPRESS_POS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(2048);
+        let max_compressed: usize =
+            hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MAX_COMPRESS_POS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(2048);
         let n_per_batch_host: Vec<i32> = (0..batch_size)
             .map(|b| (((start_pos as usize) + b + 1) / ratio).min(max_compressed) as i32)
             .collect();
@@ -7185,7 +7189,7 @@ fn attention_block_batched_mixed(
             let use_indexer_wmma = h_idx == 64
                 && d_idx == 128
                 && (gpu.arch.starts_with("gfx11") || gpu.arch.starts_with("gfx12"))
-                && std::env::var("HIPFIRE_DEEPSEEK4_INDEXER_WMMA")
+                && hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_INDEXER_WMMA")
                     .map(|s| s != "0")
                     .unwrap_or(true);
             if use_indexer_wmma {
@@ -7267,10 +7271,11 @@ fn attention_block_batched_mixed(
         }
     } else {
         // ratio == 128: identity gather, no indexer. Per-batch n_compressed.
-        let max_compressed: usize = std::env::var("HIPFIRE_DEEPSEEK4_MAX_COMPRESS_POS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(2048);
+        let max_compressed: usize =
+            hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MAX_COMPRESS_POS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(2048);
         let max_n_compressed = (((start_pos as usize) + batch_size) / ratio)
             .min(max_compressed)
             .min(topk_max);
@@ -7315,7 +7320,8 @@ fn attention_block_batched_mixed(
         // Head-batched f16-WMMA DSA attention (~4.4× the f32 kernel at prefill
         // batch); falls back to f32 if disabled, shapes don't tile, or the
         // score LDS would exceed 64 KB. max_n_total bounds the LDS (n_valid ≤ win).
-        let use_dsa_wmma = std::env::var("HIPFIRE_DEEPSEEK4_DSA_WMMA").as_deref() != Ok("0")
+        let use_dsa_wmma = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_DSA_WMMA").as_deref()
+            != Ok("0")
             && gpu.arch_caps.has_wmma()
             && n_heads % 16 == 0
             && head_dim % 16 == 0;
@@ -7368,7 +7374,8 @@ fn attention_block_batched_mixed(
     } else {
         // Head-batched f16-WMMA gathered DSA attention; f32 fallback on
         // disable / non-tiling shapes / LDS > 64 KB.
-        let use_dsa_wmma = std::env::var("HIPFIRE_DEEPSEEK4_DSA_WMMA").as_deref() != Ok("0")
+        let use_dsa_wmma = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_DSA_WMMA").as_deref()
+            != Ok("0")
             && gpu.arch_caps.has_wmma()
             && n_heads % 16 == 0
             && head_dim % 16 == 0;
@@ -7471,7 +7478,7 @@ fn attention_block_batched_mixed(
         DType::Q8_0 => {
             // Q8_0 contract: plain (non-FWHT) input. Same layout
             // assumption as the swa-only sibling.
-            let mr: i32 = std::env::var("HIPFIRE_DEEPSEEK4_WO_MULTIROW")
+            let mr: i32 = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_WO_MULTIROW")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .filter(|&r| r == 2 || r == 4)
@@ -7623,7 +7630,7 @@ fn ffn_batched(
     // Routed MoE consumes ffn_x_rot_batch (MQ2-Lloyd → needs FWHT), so keep
     // the gate/up rotation alive when MoE is on. Down rotation only feeds
     // shared_w2 — gate purely on shared_w2 dtype.
-    let moe_will_run = env_cache::moe_on();
+    let moe_will_run = config_cache::moe_on();
     let gate_up_need_fwht =
         moe_will_run || weight_needs_fwht(shared_w1) || weight_needs_fwht(shared_w3);
     let down_needs_fwht = weight_needs_fwht(shared_w2);
@@ -7714,7 +7721,10 @@ fn ffn_batched(
     )?;
 
     // ── Routed-expert MoE ───────────────────────────────────────────
-    let do_routed = std::env::var("HIPFIRE_DEEPSEEK4_MOE").ok().as_deref() != Some("0")
+    let do_routed = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MOE")
+        .ok()
+        .as_deref()
+        != Some("0")
         && layer.expert_gate_up_blob.is_some()
         && layer.expert_w2_blob.is_some();
     if !do_routed {
@@ -7734,7 +7744,7 @@ fn ffn_batched(
     let w2_ptrs = layer.expert_w2_ptrs.as_ref().unwrap();
     let n_exp = cfg.n_routed_experts;
     let k_top = cfg.num_experts_per_tok;
-    let route_scale: f32 = std::env::var("HIPFIRE_DEEPSEEK4_ROUTE_SCALE")
+    let route_scale: f32 = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_ROUTE_SCALE")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(2.2);
@@ -8117,7 +8127,7 @@ pub fn final_norm_and_head_all_batched(
     };
     // Opt-out: HIPFIRE_DEEPSEEK4_BATCH_HEAD=0 forces the legacy per-position
     // scalar loop — used for A/B measurement and as a safety fallback.
-    let batch_head = std::env::var("HIPFIRE_DEEPSEEK4_BATCH_HEAD")
+    let batch_head = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_BATCH_HEAD")
         .map(|s| s != "0")
         .unwrap_or(true);
     if head_needs_fwht || !batch_head {
@@ -8286,7 +8296,7 @@ pub fn final_norm_and_argmax_all_batched(
             .ok_or_else(|| "head not uploaded".to_string())?;
         weight_needs_fwht(head)
     };
-    let batch_head = std::env::var("HIPFIRE_DEEPSEEK4_BATCH_HEAD")
+    let batch_head = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_BATCH_HEAD")
         .map(|s| s != "0")
         .unwrap_or(true);
     if head_needs_fwht || !batch_head {
@@ -8437,7 +8447,7 @@ pub fn final_norm_and_sample_all_batched_lazy(
             .ok_or_else(|| "head not uploaded".to_string())?;
         weight_needs_fwht(head)
     };
-    let batch_head = std::env::var("HIPFIRE_DEEPSEEK4_BATCH_HEAD")
+    let batch_head = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_BATCH_HEAD")
         .map(|s| s != "0")
         .unwrap_or(true);
     if head_needs_fwht || !batch_head {
@@ -8595,7 +8605,7 @@ fn mhc_pre_batched(
 
     let n_ctrl = 24usize;
     let x_dim = cfg.hidden_size * cfg.hc_mult;
-    let post_scale: f32 = std::env::var("HIPFIRE_DEEPSEEK4_POST_SCALE")
+    let post_scale: f32 = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_POST_SCALE")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(1.5);

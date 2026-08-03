@@ -65,6 +65,7 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Qwen2Bundle, S
             (config, weights)
         }
     };
+    hipfire_runtime::maybe_screen_mmq(&weights, ctx.gpu);
     let state = Qwen2State::new_with_max_seq(ctx.gpu, &config, ctx.max_seq)
         .map_err(|e| format!("qwen2: Qwen2State::new_with_max_seq failed: {e:?}"))?;
     Ok(Qwen2Bundle {

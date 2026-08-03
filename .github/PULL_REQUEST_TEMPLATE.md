@@ -21,9 +21,25 @@
 - [ ] `./scripts/no-gpu-ci.sh` passes, or equivalent CI job is green
 - [ ] `cargo build --release --workspace --features deltanet` clean
 - [ ] `cargo test --lib --workspace --features deltanet` passes
-- [ ] If kernel/dispatch changed: `./scripts/coherence-gate.sh` clean
-- [ ] If spec-decode changed: `./scripts/coherence-gate-dflash.sh` clean
+- [ ] **Change gate run and telemetry pasted below.** `python3 -m tools.change_gate plan --base beta`
+      shows what your diff actually owes and what it costs; `run --md gate.md` executes it and emits the
+      report. The gate selects routes from the diff, so an unrelated change does not owe a model battery.
 - [ ] If perf-relevant: `./scripts/speed-gate.sh` within ±2% of locked baselines
+- [ ] Any route reported `blocked` (absent model, wrong arch) is **acknowledged below**, not ignored —
+      a blocked route makes the gate verdict `incomplete`, which is not a pass.
+
+<details><summary>change_gate telemetry</summary>
+
+```
+paste `python3 -m tools.change_gate run --base beta --md -` output here
+```
+
+</details>
+
+Route selection is defined in [`tools/change_gate/routes.py`](../tools/change_gate/routes.py) and route
+policy in [`docs/VALIDATION.md`](../docs/VALIDATION.md). The retired `scripts/coherence-gate*.sh`
+batteries are **not** acceptance evidence and no longer exist in-tree. Adding coverage means adding a
+`Route` + `Rule` there, not resurrecting a fixed battery.
 
 ## Architecture-trait change?
 

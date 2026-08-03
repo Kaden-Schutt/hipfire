@@ -10,6 +10,7 @@ cargo check --workspace --examples
 echo "== Rust no-GPU unit tests =="
 cargo test -p rdna-compute --lib
 cargo test -p hipfire-arch-qwen35 --lib moe_prefill
+cargo test -p hipfire-config -p hipfire-registry -p hipfire-client -p hipfire-cli -p hipfire-tui
 
 echo "== Python CPU tests =="
 if python3 -c 'import pytest, numpy' 2>/dev/null; then
@@ -21,18 +22,9 @@ else
     echo "no-gpu-ci: pytest/numpy missing and uv unavailable" >&2
     exit 1
 fi
+python3 -m unittest tools.redline.tests.test_product_bench tools.redline.tests.test_golden tools.redline.tests.test_serve_diff tools.redline.tests.test_lower tools.redline.tests.test_dispatch_profile tools.change_gate.tests.test_selector tools.change_gate.tests.test_report tools.change_gate.tests.test_routes
+python3 scripts/test_install_revision.py
+python3 scripts/test_uninstall.py
 
 echo "== Env/docs drift check =="
 python3 scripts/check-env-docs.py
-
-if command -v bun >/dev/null 2>&1; then
-    echo "== Bun tests/typecheck =="
-    (
-        cd cli
-        bun install --frozen-lockfile
-        bun test
-        bun run typecheck
-    )
-else
-    echo "no-gpu-ci: bun not found; skipping Bun checks" >&2
-fi

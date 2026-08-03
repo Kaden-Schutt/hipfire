@@ -1,85 +1,244 @@
 # Serve (OpenAI-compatible HTTP)
 
-The daemon exposes an OpenAI-compatible HTTP API on `localhost:11435`
-(configurable via `port` in [CONFIG.md](CONFIG.md)). `hipfire run` will
-automatically route through this daemon when it's up, skipping the
-2–5 s cold-start cost on every invocation.
+`hipfire serve` starts the native Rust HTTP control plane, owns one GPU daemon
+process, and exposes an OpenAI-shaped chat API. Defaults come from typed TOML
+configuration ([CONFIG.md](CONFIG.md)); the HTTP surface is implemented by
+`crates/hipfire-cli` and the shared transport lives in `crates/hipfire-client`.
 
-## Start
+| Field | Default (source) |
+|---|---|
+| Bind host | `serve.host = "0.0.0.0"` |
+| Port | `serve.port = 11435` |
+| Pre-warm model | `serve.default_model = "qwen3.5:9b"` or a positional model arg |
+| Idle unload | `serve.idle_timeout_seconds = 300` (`0` = never) |
+| Max request body | `serve.max_request_bytes = 67108864` (64 MiB) |
+| Admission queue | `serve.max_queue = 64`, `serve.queue_timeout_ms = 30000` |
+| Pid / log | `~/.hipfire/serve.pid`, `~/.hipfire/serve.log` |
+
+Truth state: **shipped / ref-pinned** for the HTTP contract and lifecycle
+below. Branch-only model routes (for example LFM framing details) are not
+implied by this page — see [MODELS.md](MODELS.md) and [VALIDATION.md](VALIDATION.md).
+
+## Security (no auth / no TLS)
+
+The native handler implements **no authentication and no TLS**.
+Anyone who can reach the bind address can call every endpoint, including
+chat completions. Default bind is `0.0.0.0` (all interfaces).
+
+- Prefer loopback for local use: `hipfire serve 127.0.0.1:11435`
+- Expose beyond localhost only behind a trusted network or an authenticated
+  TLS reverse proxy you control. Do not publish the raw port to the internet.
+
+## Start and stop
 
 ```bash
-hipfire serve            # foreground, ctrl-c to stop
-hipfire serve -d         # background; pid in ~/.hipfire/serve.pid, log in ~/.hipfire/serve.log
+hipfire serve                         # foreground; Ctrl-C stops (default bind 0.0.0.0)
+hipfire serve 127.0.0.1:11435         # loopback-only (preferred local bind)
+hipfire serve -d                      # background (setsid/nohup); polls /health up to 300s
+hipfire serve qwen3.5:9b -d           # pre-warm a specific tag this run
+hipfire serve 0.0.0.0:11435 -d        # all-interfaces bind — unauthenticated; see Security
+hipfire serve --no-prewarm -d         # bind first; load on first request
+hipfire serve --kv-mode q8 --idle-timeout 0 -d
+hipfire serve --tp 2 -d               # expert-parallel load (multi-GPU arches)
+
+hipfire ps                            # daemons / quantize / uploads + port state (Linux)
+hipfire stop                          # SIGTERM tracked pid in serve.pid (safe default)
+# Destructive — inspect first (hipfire ps, curl /health, port owner):
+hipfire stop --force                  # also pkill -x daemon + fuser -k <port>/tcp
+hipfire stop --all                    # --force plus pkill orphan quantize jobs
+hipfire restart -d                    # stop --force semantics, then serve again
 ```
 
-`-d` pre-warms `default_model` (`hipfire config set default_model
-qwen3.5:9b`) so the first request returns tokens immediately.
+**Destructive lifecycle flags.** Plain `hipfire stop` only SIGTERMs the tracked
+pid after ownership checks — use that by default. `--force`, `--all`, and
+`restart` call `reapOrphans`: system-wide `pkill -x daemon` (exact name), and
+`fuser -k <port>/tcp` which **SIGKILLs whichever process owns the port**.
+`--all` also runs `pkill -f` against release quantize binaries. Before using
+them, run `hipfire ps`, `curl -s http://127.0.0.1:<port>/health`, and confirm
+the port owner so you do not kill an unrelated daemon or listener.
 
-```bash
-hipfire ps               # list running daemons + their pid/port/model
-hipfire stop             # graceful shutdown
-```
+Flags (also accepted by `restart`):
+
+| Flag | Effect |
+|---|---|
+| `-d` / `--detach` / `--background` | Fork detached child; log → `~/.hipfire/serve.log` |
+| `--kv-mode <m>` | Sets `HIPFIRE_KV_MODE` for this run |
+| `--idle-timeout <s>` | Sets `HIPFIRE_IDLE_TIMEOUT` (0..86400) |
+| `--no-prewarm` | Sets `HIPFIRE_NO_PREWARM=1` |
+| `--tp N` | Sets `HIPFIRE_TP` (1..64) for expert-parallel load |
+
+Positional forms: `[model] [host] [port]`, or `host:port` / `[ipv6]:port`.
+Without a model arg, pre-warm uses `HIPFIRE_MODEL` if set, else
+`cfg.default_model`.
+
+Config and env owners for bind, idle, queue, and body limits:
+[CONFIG.md](CONFIG.md), [env-vars.md](env-vars.md).
+
+## Lifecycle
+
+1. **Bind + pid record.** Serve writes its numeric pid to
+   `~/.hipfire/serve.pid`. `stop` verifies that `/proc/<pid>/cmdline` still
+   identifies a native `hipfire serve` process before signaling it.
+2. **Daemon.** Spawns the Rust `daemon` example over stdio JSON.
+3. **Pre-warm (default).** Loads the chosen model asynchronously. Failures log
+   and leave the process serving; the model loads on the first real request.
+4. **HTTP.** The native server accepts traffic. Only one generation holds the
+   daemon lock at a time (bounded queue).
+5. **Idle eviction.** When `idle_timeout > 0`, an interval unloads the model
+   after idle seconds **and** only when no generation is in flight and the
+   serve lock is free. Next request reloads.
+6. **Stop.** `hipfire stop` validates pid ownership before SIGTERM. Stale reused
+   pids are **not** killed; the pidfile is removed instead.
+
+Detached readiness: parent polls `GET /health` for up to **60 seconds**.
+`/health` means the native process is answering; inspect `model` and
+`loading_model` to distinguish ready, loading, and unloaded state.
 
 ## Endpoints
 
-`POST /v1/chat/completions`
+Implemented paths (anything else → `404`):
+
+| Method | Path | Role |
+|---|---|---|
+| `GET` | `/health` | Liveness JSON: `status`, `model`, `loading_model`, `pid`, `native` |
+| `GET` | `/v1/models` | `{ data: [{ id }, ...] }` from local model files |
+| `GET` | `/stats` | Serve telemetry: uptime, queue depth, requests served, recent decode tok/s |
+| `POST` | `/v1/chat/completions` | Chat completions (stream or non-stream) |
+
+There is **no** `/v1/completions` route in the current CLI serve.
+
+For the sealed MQ4R reproduction, default-model handoff, and copyable Hermes
+Agent / Pi custom-provider configuration, see
+[`GOLDEN-REDLINE.md`](GOLDEN-REDLINE.md).
+
+### `GET /health`
+
+Always `200` while the HTTP server is up. `model` is the loaded tag/path or
+`null` when idle/unloaded; `loading_model` names an asynchronous pre-warm.
 
 ```bash
-curl -N http://localhost:11435/v1/chat/completions \
-    -H "Content-Type: application/json" \
-    -d '{
-      "model": "qwen3.5:9b",
-      "messages": [{"role": "user", "content": "hi"}],
-      "stream": true
-    }'
+# Loopback example (safe default for local smoke):
+curl -s http://127.0.0.1:11435/health
 ```
 
-Streams JSON-encoded SSE chunks until `[DONE]`. Set `"stream": false`
-for a single response payload.
+### `POST /v1/chat/completions`
 
-`POST /v1/completions` — non-chat raw completion. Same shape as OpenAI.
+```bash
+curl -N http://127.0.0.1:11435/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "qwen3.5:9b",
+    "messages": [{"role": "user", "content": "hi"}],
+    "stream": true
+  }'
+```
 
-`GET /v1/models` — list of locally-available tags.
+- **`stream: true`** (typical clients): SSE `data: {chat.completion.chunk}`
+  lines until `data: [DONE]`.
+- **`stream: false` / omitted falsey:** single `chat.completion` JSON body.
+- Oversized body → **413** before the daemon lock (Content-Length or streamed
+  cap at `max_request_bytes`).
+- Saturated admission queue → **503** with `Retry-After`.
+- Invalid JSON body → **400**.
 
-`GET /health` — returns 200 once the model is loaded; 503 during load.
-First-load can take 30 s–2 min on a cold kernel cache.
+Request fields honored by the serve layer (non-exhaustive; sampling falls
+through to per-model / registry / daemon defaults when omitted):
+
+| Field | Notes |
+|---|---|
+| `model` | Tag or path; triggers reload if different from resident model |
+| `messages` | OpenAI chat messages (required for useful chat) |
+| `messages[].content[].image_url` | One base64 PNG/JPEG data URI for VL models; remote URLs and multiple images are rejected |
+| `stream`, `stream_options.include_usage` | Streaming + optional usage on stream end |
+| `temperature`, `top_p`, `top_k`, `min_p`, `repeat_penalty` | Sampling; explicit request values win, otherwise per-model TOML / registry-card values are applied |
+| `presence_penalty`, `frequency_penalty` | Forwarded natively to the daemon (≥ 0); `presence_penalty` also inherits per-model / registry defaults |
+| `max_tokens` | Generation cap |
+| `stop` | Up to 4 strings, each ≤ 64 chars |
+| `tools` | Tool definitions (with structured `messages` when Jinja chat is on) |
+| `chat_template_kwargs.enable_thinking` | `false` forces a no-think turn |
+| `chat_template_kwargs.preserve_thinking` | Keep `<think>` in final non-stream content |
+| `reasoning.effort` / `reasoning_effort` | `none`…`xhigh` → think budget / framing |
+
+When `messages` contains no `system` or `developer` role, the serve layer inserts `prompt.system` from a per-model TOML override or the registry card's `recommended_settings.system_prompt`. A client-supplied system/developer message always wins.
+
+`finish_reason` values emitted to clients: `stop`, `length`, `tool_calls`.
+
+Prefix-cache capable arches (daemon `cache_capable`, or arch allowlist
+`deepseek4` / `qwen3_5` / `qwen3_5_moe`) skip per-request `reset` so multi-turn
+LCP can hit. Other arches reset every request (stateless OpenAI shape).
 
 ## Auto-routing from `hipfire run`
 
 ```bash
-hipfire serve -d                      # daemon up
-hipfire run qwen3.5:9b "..."          # this hits HTTP, ~0 ms cold start
-HIPFIRE_LOCAL=1 hipfire run qwen3.5:9b "..."  # forced one-shot, skips HTTP
+hipfire serve -d
+hipfire run qwen3.5:9b "..."                 # uses HTTP when /health is up
+HIPFIRE_LOCAL=1 hipfire run qwen3.5:9b "..." # force one-shot local daemon
 ```
 
-Auto-routing detects the running daemon by reading
-`~/.hipfire/serve.pid` and probing `/health`. If the daemon is loaded
-on a different model than the request asks for, it'll evict and reload
-— that takes the cold-start hit on the first request after the model
-switch.
+`run` probes `http://<probe-host>:<port>/health` (500 ms). Probe host maps
+`0.0.0.0` / `::` → `127.0.0.1`. If serve is up, `run` POSTs
+`/v1/chat/completions` and does **not** spawn a second daemon. If serve is up
+but the request fails, `run` exits rather than colliding on the GPU lock.
+`--json` / `--no-stream` also force local control.
 
-## Idle eviction
+Model mismatch: serve reloads to the requested model on the chat path (cold
+start cost on that first switched request).
 
-`idle_timeout` (default 300 s) frees VRAM after 5 minutes with no
-requests. The next request reloads automatically. Set to 0 in
-[CONFIG.md](CONFIG.md) to keep weights resident forever — useful when
-you've got spare VRAM and want zero-latency for sporadic requests.
+## Production smoke (GPU)
 
-## Multi-process safety
+User-facing serve behavior is a **manual GPU** route — not proven by
+container builds or no-GPU CI.
 
-Only one daemon at a time can hold port 11435. If you see "address in
-use" errors:
+| Claim | Route | Owner |
+|---|---|---|
+| Generic serve semantics (finish reasons, empty/runaway, cache, timing hooks) | `scripts/serve_harness.py --model <path>` | [VALIDATION.md](VALIDATION.md) |
+| Optional wrapper (serve + optional Redline/perf arms) | `scripts/gates.sh --model <path>` | same |
+
+### Branch-only: LFM framing harness
+
+**Branch-implemented** at audited `lfm-redline@692a726dde53508cb53de1a74c720e75a7c9f33e`; **absent** from comparison base `origin/beta@202282de8759dfa6963ea5184ad2bf2b9259cef6`. Not a shipped/ref-pinned HTTP contract on this page.
+
+| Claim | Route | Owner |
+|---|---|---|
+| LFM2.5 thinking / framing smoke | `scripts/serve_harness.py` with an exact `lfm2.5:*` tag | [VALIDATION.md](VALIDATION.md) |
+
+Example (harness spawns its own serve by default on port `11520`):
 
 ```bash
-pkill -9 daemon bun
-rm ~/.hipfire/serve.pid
-hipfire serve -d
+python3 scripts/serve_harness.py --model ~/.hipfire/models/<file> --tag qwen3.5:9b --mode battery
 ```
 
-## Logs
+No-GPU CI (`.github/workflows/no-gpu-ci.yml` → `scripts/no-gpu-ci.sh`) never
+certifies GPU serve, model coherence, or throughput.
 
-- `~/.hipfire/serve.log` — daemon stdout/stderr. Tail this during
-  first-load to watch layer upload progress.
-- `~/.hipfire/serve.pid` — current daemon pid (deleted on graceful
-  shutdown; stale pid file is the most common reason `hipfire stop`
-  reports "not running").
+## Multi-process notes
+
+- One listener per bind; second serve on the same host/port exits.
+- Prefer plain `hipfire stop` when the pidfile is healthy. Reach for
+  `hipfire stop --force` / `restart` only after `hipfire ps` and `/health`
+  show a stuck orphan or port holder — those paths are destructive
+  (system-wide `pkill -x daemon` + `fuser -k` on the port). Avoid ad-hoc
+  `pkill` unless you know the exact process tree.
+- `hipfire chat` starts a tracked detached native service if none is healthy;
+  stop it explicitly with `hipfire stop` when the session is done.
+
+## Logs and state files
+
+| Path | Role |
+|---|---|
+| `~/.hipfire/serve.log` | Detached stdout/stderr |
+| `~/.hipfire/serve.pid` | Ownership record for stop/ps/restart |
+| `~/.hipfire/config.toml` | Sparse typed global configuration |
+| `~/.hipfire/models.toml` | Local catalog, aliases, registry identities, and per-model overrides |
+| `~/.hipfire/{config,models}.json`, `per_model_config.json` | Legacy migration inputs only |
+
+```bash
+tail -f ~/.hipfire/serve.log
+```
+
+## Related
+
+- CLI inventory: [CLI.md](CLI.md)
+- Chat TUI attach behavior: [CHAT.md](CHAT.md)
+- Containers: [CONTAINER.md](CONTAINER.md)
+- NixOS service: [NIXOS.md](NIXOS.md)

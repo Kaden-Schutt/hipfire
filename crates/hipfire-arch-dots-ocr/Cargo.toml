@@ -12,6 +12,7 @@ description = "dots.ocr (Qwen2-VL family) — Qwen2 text decoder + 42-block Dots
 # docs/plans/dots-ocr-prd.md phase 2 for the bring-up plan.
 
 [dependencies]
+hipfire-config = { path = "../hipfire-config" }
 hipfire-runtime = { path = "../hipfire-runtime" }
 hipfire-arch-qwen2 = { path = "../hipfire-arch-qwen2" }
 hip-bridge = { path = "../hip-bridge" }
