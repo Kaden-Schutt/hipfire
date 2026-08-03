@@ -777,10 +777,31 @@ mod config_cache {
         if cur != E8_BATCHED_GEMV_UNSET {
             return cur;
         }
+        // Default 8 (was 0 = disabled). `e8_batched_gemv_applies` already
+        // requires `arch == "gfx1151"`, so this only changes gfx1151.
+        //
+        // At speculative-verify batch the dense E8 WMMA tile (`tiles=1`, since
+        // `e8_prefill_batch_tiles` only tiles above batch 16/32) wastes 15/16 of
+        // each 16-wide tile and runs at ~22-53 GiB/s, while the batched GEMV
+        // reads the weights once and hits 56-193 GiB/s. Measured across the real
+        // DS4 dense shape mix, DRAM-resident, gfx1151
+        // (`bench_e8_verify_tiles`): the GEMV wins at EVERY shape for every
+        // B in 1..=8 — 1.07x to 6.92x. The b2/b4 tiles are never better than b1.
+        //
+        // End-to-end on the production daemon (0731 MQ2R, `hipfire run --spec
+        // dspark`), reproducible across a 8/0/8 ordering:
+        //     =0   13.2 tok/s   verify_block 144.72 ms/window
+        //     =8   25.8 tok/s   verify_block  74.90 ms/window
+        // i.e. 1.93x on verify and 1.95x end-to-end. AR is unaffected (27.9
+        // both ways) because AR decode is B=1 through a different arm.
+        //
+        // 8 is the cap because `E8_BATCHED_GEMV_BATCHES` is [1..=8, 16] and the
+        // GEMV's margin decays with B (it re-reads x per row): at B=8 it is only
+        // 1.07-1.74x, and at B=16 the WMMA tile wins. Verify runs B<=6.
         let parsed = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_E8_BATCHED_GEMV")
             .ok()
             .and_then(|v| v.trim().parse::<usize>().ok())
-            .unwrap_or(0);
+            .unwrap_or(8);
         E8_BATCHED_GEMV_MAX.store(parsed, atomic::Ordering::Relaxed);
         parsed
     }
