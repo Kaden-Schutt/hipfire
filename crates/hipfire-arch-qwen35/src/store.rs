@@ -2178,7 +2178,7 @@ pub fn load_qwen35_paro_weights(
 /// loader; exact failed-free retention for these domains is NOT claimed.
 #[expect(
     clippy::result_large_err,
-    reason = "Err preserves the common weights + frozen store + cleanup aggregate (all GPU owners) for the loader backlog; flattening would leak on failure"
+    reason = "Err preserves every GPU owner for the loader backlog (common weights, frozen store, staging-retained buffers, builder-retained frozen owners); flattening would leak on failure"
 )]
 pub(crate) fn load_qwen35_hfq_weights_frozen_prepared(
     prepared: PreparedFrozenHfqManifest,
@@ -2892,7 +2892,7 @@ impl MoeFfnStorage {
         not(test),
         expect(
             dead_code,
-            reason = "compile-time ownership seam exercised by type tests"
+            reason = "storage-kind predicate exercised by the MoeFfnStorage behavioral tests (unit-marker semantics); production reads the enum through MoeFfnView instead"
         )
     )]
     pub(crate) fn is_legacy(&self) -> bool {
@@ -3315,7 +3315,7 @@ impl<T, F> CleanupAggregate<T, F> {
         not(test),
         expect(
             dead_code,
-            reason = "compile-time ownership seam exercised by type tests"
+            reason = "cleanup accounting seam exercised by the behavioral CleanupAggregate transition test (opaque owner IDs); no production call site reads counts"
         )
     )]
     pub(crate) fn tensor_count(&self) -> usize {
@@ -3326,7 +3326,7 @@ impl<T, F> CleanupAggregate<T, F> {
         not(test),
         expect(
             dead_code,
-            reason = "compile-time ownership seam exercised by type tests"
+            reason = "cleanup accounting seam exercised by the behavioral CleanupAggregate transition test (opaque owner IDs); no production call site reads counts"
         )
     )]
     pub(crate) fn frozen_count(&self) -> usize {
@@ -3337,7 +3337,7 @@ impl<T, F> CleanupAggregate<T, F> {
         not(test),
         expect(
             dead_code,
-            reason = "compile-time ownership seam exercised by type tests"
+            reason = "cleanup accounting seam exercised by the behavioral CleanupAggregate transition test (opaque owner IDs); no production call site reads counts"
         )
     )]
     pub(crate) fn is_empty(&self) -> bool {
@@ -3705,7 +3705,7 @@ pub(crate) fn is_moe_name(name: &str) -> bool {
     not(test),
     expect(
         dead_code,
-        reason = "compile-time ownership seam exercised by type tests"
+        reason = "name-partition predicate (entry → MoE vs common) exercised by manifest classification tests; production partition_hfq_manifest uses is_moe_name directly"
     )
 )]
 pub(crate) fn is_moe_entry(entry: &WeightEntry) -> bool {
@@ -4250,7 +4250,7 @@ fn plan_frozen_moe(
 /// projection.  Error messages identify the failing layer.
 #[expect(
     clippy::too_many_arguments,
-    reason = "mirrors the C2 per-layer Frozen admission surface: config + layer meta + companion predicate + arch feature flags + dispatch context, one-shot at freeze"
+    reason = "mirrors the C2 per-layer Frozen admission surface: config + layer meta + companion predicate + arch feature flags + dispatch context, shared by the resident-builder freeze and its preflight mirror"
 )]
 fn validate_frozen_moe_layer(
     config: &Qwen35Config,

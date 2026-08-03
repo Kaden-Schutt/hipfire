@@ -91,7 +91,10 @@ impl Qwen35BundleBuildError {
     ///
     /// The `message` and all failure collectors are ALWAYS returned — no
     /// owner can be inadvertently dropped.
-    #[allow(clippy::type_complexity)]
+    #[expect(
+        clippy::type_complexity,
+        reason = "the tuple preserves each rollback-owner category distinctly (message, KV label+tensor pairs, DN retainers, scratch retainers, weights cleanup failure) so the caller folds every category whole into the retry aggregate without cross-category flattening"
+    )]
     pub fn try_free(
         self,
         gpu: &mut Gpu,
