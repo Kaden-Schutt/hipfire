@@ -344,6 +344,65 @@ at `/mnt/scratch/quantization/deepseek-v4-flash-0731-teacher/`), long-context
 ground truth, and calibration compute. Do NOT use it to tune block size,
 thresholds, or to quote tau/accept.
 
+## CONFIRMED ON TARGET: MQ2R DSpark works on gfx1151
+
+The E8 draft-head fix (`c420159e2`) was predicted to transfer, because it is
+recipe-driven and architecture-independent. It does.
+
+gfx1151 (Radeon 8060S / Strix Halo, HIP device 1), 0731 MQ2R trunk
+(sha256 `cbf2bbcf…8cce`, verified on-box) plus a metadata-stamped
+`-dspark.mq2r` sidecar, certified `dspark_bench`, prompt md5
+`70dd00052d9ff000`, 64 tokens greedy:
+
+```
+DSpark  tok/s=14.42  tau=2.286  accept=0.538 (35/65)
+AR      tok/s= 8.39
+                                   => 1.72x
+```
+
+Against the historical gfx1151 measurement for this artifact class — **0 of 89
+accepted, tau 1.016** (`2026-07-24-dspark-mq2r-p3`). So
+`registry/deepseek4-mq2r-gfx1151-v2.json`'s
+`rejected_mq2lloyd_payload_diagnostic_only` and the recipe spec's rejected
+restamp (7.92 vs 30.21 AR) are **disproven on the target hardware**: the sidecar
+was fine, the missing `MFP4G32E8SOA` match arm in
+`dspark_core::gemv_auto_batched_wmma` was the defect. Both records should be
+updated.
+
+### The rig-fidelity prediction held quantitatively
+
+| | MI300X (gfx942) | gfx1151 |
+|---|---|---|
+| controller `ratio = dt/t_ar` | 0.356 | **0.119** |
+| `t_ar` | 36.0 ms | 121.3 ms |
+| `dt` | 12.82 ms | 14.46 ms |
+| DSpark vs AR | 1.09x | **1.72x** |
+| accept | 0.582 | 0.538 |
+
+Marginal draft cost is 3x cheaper on the target, exactly as the flat WMMA
+B-scaling curve predicted — so MI300X UNDERSTATED the win, in the predicted
+direction. Acceptance differs (0.582 vs 0.538), consistent with the WMMA-vs-
+scalar numerics divergence: acceptance measured on MI300X is rig-local.
+
+### Immediate next lever
+
+`ratio = 0.119` means the block controller's objective
+`tau(N)/(t_ar + N*dt)` is very flat in N on gfx1151 — deeper blocks are nearly
+free. The sidecar ships `block=5`. Since the Q8 draft path is flat in B out to
+at least 13 on this part, the optimal block is bounded by ACCEPTANCE, not cost,
+and block=5 is likely leaving throughput on the table. Tune it on gfx1151 —
+never on MI300X.
+
+### hipx staging notes
+
+- `/home/kaden/hipfire-ds4-twostage` is NOT a git repo; deploy by rsync and
+  verify with `git hash-object` / `sha256sum`. Its `dspark_core.rs` diverges from
+  this branch (gfx942-only edits are absent), so patch the E8 arm by ANCHOR, not
+  by line number or wholesale copy.
+- `hipfire-arch-deepseek4` there has no `deltanet` feature; build
+  `-p hipfire-arch-deepseek4 --example dspark_bench` with no `--features`.
+- Artifacts staged at `/home/kaden/.cache/hipfire-surgery/`.
+
 ## Reproduction
 
 ```bash
