@@ -32,10 +32,11 @@ Diagnostics in untouched regions and the unrelated deny-level
 
 ### Correctness First
 
-Fix `qwen35_tp_preflight` with a regression test that proves a non-empty list
-of supported layer types is not rejected merely because the list is non-empty.
-The test must fail before the implementation change and pass afterward. This
-fix is committed separately from lint cleanup.
+Fix `qwen35_tp_preflight` without changing admission policy. Qwen35 has no TP
+manifest, so both current layer variants remain refused for `tp > 1`; replace
+the never-iterating loop with an explicit first-layer lookup and retain the
+existing exact-error tests for both variants. This fix is committed separately
+from lint cleanup.
 
 Review each checked-operation diagnostic in `qwen35.rs` for its actual
 division, overflow, and fallback semantics. Rewrites must preserve behavior;
