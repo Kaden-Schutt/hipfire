@@ -704,6 +704,13 @@ pub struct Ds4ExpertPaging {
     trace: Option<ExpertTrace>,
     bytes_read: u64,
     dispatches: u64,
+    /// Phase timing, nanoseconds. Which of the three costs actually dominates
+    /// paged decode is not obvious: the routing D2H is a full GPU sync, the
+    /// reads are disk, and the table upload is a small H2D. Measure before
+    /// optimising — a wrong guess here designs the wrong overlap.
+    ns_d2h: u64,
+    ns_read: u64,
+    ns_upload: u64,
     table_uploads: u64,
     table_uploads_skipped: u64,
 }
@@ -752,6 +759,9 @@ impl Ds4ExpertPaging {
             trace: ExpertTrace::open(),
             bytes_read: 0,
             dispatches: 0,
+            ns_d2h: 0,
+            ns_read: 0,
+            ns_upload: 0,
             table_uploads: 0,
             table_uploads_skipped: 0,
         }
@@ -794,9 +804,11 @@ impl Ds4ExpertPaging {
             self.topk_bytes.resize(need, 0);
         }
         gpu.bind_thread().map_err(|e| format!("{e:?}"))?;
+        let t0 = std::time::Instant::now();
         gpu.hip
             .memcpy_dtoh(&mut self.topk_bytes[..need], &topk_indices.buf)
             .map_err(|e| format!("d2h topk indices: {e:?}"))?;
+        self.ns_d2h += t0.elapsed().as_nanos() as u64;
         self.experts.clear();
         for c in self.topk_bytes[..need].chunks_exact(4) {
             let v = i32::from_ne_bytes([c[0], c[1], c[2], c[3]]);
@@ -870,6 +882,10 @@ impl Ds4ExpertPaging {
         w2_stride: usize,
         gpu: &mut rdna_compute::Gpu,
     ) -> Result<(), PagerError> {
+        // Use routing already resolved by `prepare_dispatch` for THIS layer if
+        // present; otherwise route now. A mismatch means someone else's
+        // prepare is outstanding, so fall back rather than page the wrong
+        // experts — correct, just without the overlap.
         self.read_topk(topk_indices, count, n_exp, gpu)
             .map_err(|detail| PagerError::Read {
                 key: ExpertKey {
@@ -991,10 +1007,12 @@ impl Ds4ExpertPaging {
             };
             let mut dst = f.slot * stride;
             for seg in &segbuf[..n_seg] {
-                if let Err(e) = self
+                let t_read = std::time::Instant::now();
+                let fetched = self
                     .transport
-                    .fetch_into(seg.offset, seg.len, blob, dst, gpu)
-                {
+                    .fetch_into(seg.offset, seg.len, blob, dst, gpu);
+                self.ns_read += t_read.elapsed().as_nanos() as u64;
+                if let Err(e) = fetched {
                     let err = PagerError::Read {
                         key: f.key,
                         offset: seg.offset,
@@ -1030,6 +1048,15 @@ impl Ds4ExpertPaging {
                 100.0 * self.table_uploads_skipped as f64
                     / (self.table_uploads + self.table_uploads_skipped).max(1) as f64,
             );
+            let ms = |n: u64| n as f64 / 1.0e6;
+            eprintln!(
+                "deepseek4: expert cache — phases: routing d2h {:.0} ms, reads {:.0} ms, \
+                 table upload {:.0} ms (over {} dispatches)",
+                ms(self.ns_d2h),
+                ms(self.ns_read),
+                ms(self.ns_upload),
+                self.dispatches,
+            );
         }
 
         if !dirty {
@@ -1057,17 +1084,19 @@ impl Ds4ExpertPaging {
         for p in shadow {
             self.ptr_bytes.extend_from_slice(&p.to_ne_bytes());
         }
-        gpu.memcpy_htod_auto(&ptr_table.buf, &self.ptr_bytes)
-            .map_err(|e| PagerError::Read {
-                key: ExpertKey {
-                    layer,
-                    expert: 0,
-                    role,
-                },
-                offset: 0,
-                len: self.ptr_bytes.len(),
-                detail: format!("pointer-table upload: {e:?}"),
-            })?;
+        let t_up = std::time::Instant::now();
+        let up = gpu.memcpy_htod_auto(&ptr_table.buf, &self.ptr_bytes);
+        self.ns_upload += t_up.elapsed().as_nanos() as u64;
+        up.map_err(|e| PagerError::Read {
+            key: ExpertKey {
+                layer,
+                expert: 0,
+                role,
+            },
+            offset: 0,
+            len: self.ptr_bytes.len(),
+            detail: format!("pointer-table upload: {e:?}"),
+        })?;
         Ok(())
     }
 }
