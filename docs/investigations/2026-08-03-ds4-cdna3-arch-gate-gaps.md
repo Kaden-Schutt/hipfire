@@ -140,14 +140,41 @@ generation — none of which is reachable until gap 4 is closed.
 
 ## Also settled
 
-- **MQ2R DSpark by metadata restamp is dead.** A sidecar stamped via
-  `scripts/reap/hfq_metadata_stamp.rs` loads and passes
-  `validate_mq2r_dspark_sidecar`, then accepts **0 of 87** drafts (tau 1.016),
-  reproducing the historical gfx1151 result (0 of 89) on a second architecture
-  and a newer checkpoint. `registry/deepseek4-mq2r-gfx1151-v2.json` already
-  records the class as `rejected_mq2lloyd_payload_diagnostic_only`; that
-  rejection holds on CDNA3. A usable MQ2R DSpark needs a real P3-calibrated
-  build. The diagnostic artifact was deleted rather than left as a footgun.
+- **MQ2R DSpark works — the restamp was never the problem.** *(Supersedes an
+  earlier conclusion in this document, and two records in the tree.)* A sidecar
+  stamped via `scripts/reap/hfq_metadata_stamp.rs` initially accepted **0 of
+  87** drafts (tau 1.016), matching the historical gfx1151 result (0 of 89).
+  That was blamed on the artifact. It was a **missing `match` arm**:
+  `dspark_core::gemv_auto_batched_wmma` had arms for F32/Q8_0/F16 and a
+  catch-all `_` that decodes everything else as HFQ4-G256, while MQ2R's trunk
+  head — which the draft lm_head is bound from — is qt=35 MFP4G32E8SOA. E8-SoA
+  bytes decoded as HFQ4-G256 produce garbage draft logits, and
+  `accept_greedy_prefix` (`crates/hipfire-runtime/src/spec.rs:149-178`) is exact
+  u32 equality, so every draft lost. Fixed in `c420159e2`:
+
+  ```
+                    before          after
+    accept          0.000 (0/87)    0.582 (32/55)
+    tau             1.016           2.065
+    DSpark tok/s    19.13           34.70
+    AR control      31.78           31.84      -> 1.09x
+  ```
+
+  0.582 is the **highest acceptance measured in any configuration**, above
+  MQ2-Lloyd's 0.515 on the same sidecar bytes — the expected ordering, since
+  MQ2R is the better-calibrated target. Decoded output is coherent and matches
+  AR but for one near-tie word.
+
+  Two records in the tree are therefore **misattributed** and should be
+  revisited: `registry/deepseek4-mq2r-gfx1151-v2.json` marks the artifact class
+  `rejected_mq2lloyd_payload_diagnostic_only`, and
+  `docs/specs/2026-07-23-deepseek4-mq2r-e8-recipe.md` records a rejected restamp
+  at 7.92 tok/s vs 30.21 AR. The artifact is fine — its 2376 payload tensors are
+  recipe-agnostic Q8/F16 (`scripts/quantize-dspark.sh`, `--format
+  deepseek4-q8-mtp`). Because the defect is recipe-driven and arch-independent,
+  the July gfx1151 measurement is very likely the same bug, not a bad sidecar.
+  Whether a *properly P3-calibrated* sidecar beats this one is now an open
+  question worth asking again, on a fair basis.
 - **The 0731 `-mtp` sidecars are the 3-stage DSpark module**, not MTP: stages
   `mtp.{0,1,2}`, 2376 tensors (791/789/796), no `hnorm`/`e_proj`/`h_proj`. A
   genuine MTP addon is one stage, 797 tensors, with those projections present
