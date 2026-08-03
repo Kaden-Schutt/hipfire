@@ -643,6 +643,49 @@ impl Ds4PagingRuntime {
     }
 }
 
+/// Optional access-trace sink for the offline policy simulator
+/// (`crate::expert_policy`). `HIPFIRE_DEEPSEEK4_EXPERT_TRACE=<path>` records
+/// one `seq,layer,role,expert` row per requested expert.
+///
+/// This is the P0 instrumentation from Kaden's weight-pager spec: decide
+/// whether the eviction policy is worth changing by replaying real routing
+/// offline, rather than by arguing about locality. Off by default.
+struct ExpertTrace {
+    out: std::io::BufWriter<std::fs::File>,
+    seq: u64,
+}
+
+impl ExpertTrace {
+    fn open() -> Option<Self> {
+        let path = std::env::var("HIPFIRE_DEEPSEEK4_EXPERT_TRACE").ok()?;
+        match std::fs::File::create(&path) {
+            Ok(f) => {
+                eprintln!("deepseek4: expert access trace -> {path}");
+                Some(Self {
+                    out: std::io::BufWriter::new(f),
+                    seq: 0,
+                })
+            }
+            Err(e) => {
+                eprintln!("deepseek4: cannot open expert trace {path}: {e}");
+                None
+            }
+        }
+    }
+
+    fn record(&mut self, layer: u16, role: ExpertBlobRole, experts: &[u16]) {
+        use std::io::Write;
+        let r = match role {
+            ExpertBlobRole::GateUp => 'g',
+            ExpertBlobRole::Down => 'd',
+        };
+        for &e in experts {
+            let _ = writeln!(self.out, "{},{layer},{r},{e}", self.seq);
+        }
+        self.seq += 1;
+    }
+}
+
 /// The GPU-touching half of paging: owns the transport and every scratch
 /// buffer, so a cache miss on the forward path allocates nothing.
 pub struct Ds4ExpertPaging {
@@ -658,6 +701,7 @@ pub struct Ds4ExpertPaging {
     /// Bytes actually read from the HFQ. With the hit rate this is the whole
     /// budget/throughput story: a bigger pool is only worth its memory if it
     /// moves these numbers.
+    trace: Option<ExpertTrace>,
     bytes_read: u64,
     dispatches: u64,
     table_uploads: u64,
@@ -705,6 +749,7 @@ impl Ds4ExpertPaging {
             topk_bytes: vec![0u8; max_working_set * 4],
             tile_bytes: Vec::new(),
             tile_experts: Vec::new(),
+            trace: ExpertTrace::open(),
             bytes_read: 0,
             dispatches: 0,
             table_uploads: 0,
@@ -909,6 +954,9 @@ impl Ds4ExpertPaging {
     ) -> Result<(), PagerError> {
         use hipfire_runtime::weight_pager::Transport;
 
+        if let Some(t) = self.trace.as_mut() {
+            t.record(layer, role, experts);
+        }
         let base = blob.buf.as_ptr() as u64;
         // Move scratch out so `self.rt` can borrow mutably alongside it.
         let mut fills = std::mem::take(&mut self.fills);
