@@ -455,6 +455,10 @@ pub struct Ds4PagingRuntime {
     shadow: HashMap<(u16, ExpertBlobRole), Vec<u64>>,
     /// Reusable encode buffer for one pointer table (`2 * n_exp` f32 slots).
     encode_scratch: Vec<f32>,
+    /// Device base pointer of each (layer, role) slot pool, snapshotted at
+    /// construction. A dispatch that hands over a different blob is aiming at
+    /// a pool this pager does not own — see [`Ds4PagingRuntime::plan_dispatch`].
+    expected_base: HashMap<(u16, ExpertBlobRole), u64>,
     n_exp: usize,
 }
 
@@ -478,11 +482,17 @@ impl Ds4PagingRuntime {
                 });
             }
         }
+        // Every entry starts aimed at the pool's base, so entry 0 IS the base.
+        let expected_base = shadow
+            .iter()
+            .filter_map(|(&k, v)| v.first().map(|&b| (k, b)))
+            .collect();
         Ok(Self {
             pager,
             catalog,
             shadow,
             encode_scratch: vec![0f32; 2 * n_exp],
+            expected_base,
             n_exp,
         })
     }
@@ -527,6 +537,23 @@ impl Ds4PagingRuntime {
         out: &mut Vec<SlotFill>,
     ) -> Result<(), PagerError> {
         out.clear();
+        // The blob must be the pool this pager was built over. Layer ids are
+        // not globally unique across ds4's layer-shaped blocks — a DSpark
+        // stage is also `s = 0, 1, 2` — so a mis-wired caller could otherwise
+        // hand over a fully-resident block's blob and have us page layer 0's
+        // experts into it at layer 0's offsets. Check identity, not index.
+        match self.expected_base.get(&(layer, role)) {
+            Some(&want) if want == blob_base => {}
+            _ => {
+                return Err(PagerError::NotCatalogued {
+                    key: ExpertKey {
+                        layer,
+                        expert: 0,
+                        role,
+                    },
+                })
+            }
+        }
         // Distinct-expert count for THIS dispatch. Every one of them must be
         // resident simultaneously, so the pool has to hold all of them.
         let mut distinct = 0usize;
@@ -616,7 +643,17 @@ pub struct Ds4ExpertPaging {
     experts: Vec<u16>,
     ptr_bytes: Vec<u8>,
     topk_bytes: Vec<u8>,
+    /// Bytes actually read from the HFQ. With the hit rate this is the whole
+    /// budget/throughput story: a bigger pool is only worth its memory if it
+    /// moves these numbers.
+    bytes_read: u64,
+    dispatches: u64,
 }
+
+/// How many `ensure_resident` calls between hit-rate reports. One decode token
+/// makes `n_layers * 2` of them (43 * 2 = 86 on ds4), so this is roughly every
+/// 100 tokens — often enough to watch a run, rare enough not to spam.
+const STATS_EVERY: u64 = 8192;
 
 impl Ds4ExpertPaging {
     /// `max_working_set` is the largest number of experts a single dispatch
@@ -637,6 +674,8 @@ impl Ds4ExpertPaging {
             experts: Vec::with_capacity(max_working_set),
             ptr_bytes: vec![0u8; n_exp * 8],
             topk_bytes: vec![0u8; max_working_set * 4],
+            bytes_read: 0,
+            dispatches: 0,
         }
     }
 
@@ -650,6 +689,11 @@ impl Ds4ExpertPaging {
 
     pub fn hit_rate(&self) -> f64 {
         self.rt.hit_rate()
+    }
+
+    /// Bytes read from the HFQ since load.
+    pub fn bytes_read(&self) -> u64 {
+        self.bytes_read
     }
 
     pub fn slots_per_blob(&self) -> usize {
@@ -843,10 +887,26 @@ impl Ds4ExpertPaging {
                     self.fills = fills;
                     return Err(err);
                 }
+                self.bytes_read += seg.len as u64;
                 dst += seg.len;
             }
         }
         self.fills = fills;
+
+        // Periodic hit rate + bytes read. The budget/throughput curve should
+        // be measured, not argued about, so make the inputs to it visible on
+        // any paged run rather than behind another env knob.
+        self.dispatches += 1;
+        if self.dispatches % STATS_EVERY == 0 {
+            let (hits, misses) = self.rt.stats();
+            eprintln!(
+                "deepseek4: expert cache — {:.1}% hits ({hits} hit / {misses} miss), \
+                 {:.1} GiB read from disk, {} slots/blob",
+                self.rt.hit_rate() * 100.0,
+                self.bytes_read as f64 / (1024.0 * 1024.0 * 1024.0),
+                self.rt.slots_per_blob(),
+            );
+        }
 
         // Publish the patched table. Uploaded as native u64 bytes, exactly the
         // encoding the loader writes — the kernel reinterprets each u64 as two
@@ -1153,6 +1213,10 @@ mod tests {
         assert!(!cat.is_empty());
     }
 
+    /// Test pool base. `plan_dispatch` checks blob identity, so every test
+    /// must hand over the same base the runtime was built with.
+    const TEST_BASE: u64 = 0x7f00_0000_0000;
+
     fn runtime_with(n_exp: usize, slots: usize, layers: &[u16]) -> Ds4PagingRuntime {
         let stride = 1024usize;
         let prefixes: Vec<String> = layers.iter().map(|l| format!("layers.{l}")).collect();
@@ -1167,7 +1231,7 @@ mod tests {
         let mut init = Vec::new();
         for &l in layers {
             for role in [ExpertBlobRole::GateUp, ExpertBlobRole::Down] {
-                init.push(((l, role), vec![0u64; n_exp]));
+                init.push(((l, role), vec![TEST_BASE; n_exp]));
             }
         }
         Ds4PagingRuntime::new(Ds4ExpertPager::new(slots), cat, n_exp, init).expect("runtime")
@@ -1182,7 +1246,7 @@ mod tests {
             ExpertBlobRole::GateUp,
             &[3, 9, 1],
             2048,
-            0x1000,
+            TEST_BASE,
             &mut out,
         )
         .expect("plans");
@@ -1192,7 +1256,7 @@ mod tests {
             ExpertBlobRole::GateUp,
             &[3, 9, 1],
             2048,
-            0x1000,
+            TEST_BASE,
             &mut out,
         )
         .expect("plans");
@@ -1209,7 +1273,7 @@ mod tests {
         // silence). Every requested expert must be repointed every dispatch.
         let mut rt = runtime_with(16, 8, &[0]);
         let mut out = Vec::with_capacity(8);
-        let (stride, base) = (2048usize, 0x7f00_0000_0000u64);
+        let (stride, base) = (2048usize, TEST_BASE);
         rt.plan_dispatch(0, ExpertBlobRole::Down, &[5, 2], stride, base, &mut out)
             .expect("plans");
         rt.plan_dispatch(0, ExpertBlobRole::Down, &[5, 2], stride, base, &mut out)
@@ -1224,7 +1288,7 @@ mod tests {
             );
         }
         // Experts nobody asked for keep the loader's entry untouched.
-        assert_eq!(shadow[7], 0, "unrequested expert was repointed");
+        assert_eq!(shadow[7], base, "unrequested expert was repointed");
     }
 
     #[test]
@@ -1239,7 +1303,7 @@ mod tests {
                 ExpertBlobRole::GateUp,
                 &[0, 1, 2, 3, 4],
                 1024,
-                0x1000,
+                TEST_BASE,
                 &mut out,
             )
             .expect_err("must fail closed");
@@ -1265,7 +1329,7 @@ mod tests {
             ExpertBlobRole::GateUp,
             &[7, 7, 7, 1, 1],
             1024,
-            0x1000,
+            TEST_BASE,
             &mut out,
         )
         .expect("2 distinct experts fit in 2 slots");
@@ -1288,14 +1352,14 @@ mod tests {
         // The valid expert in the same request must not have been paged in:
         // a rejected dispatch leaves no half-applied bookkeeping behind.
         assert_eq!(rt.stats(), (0, 0), "residency mutated on a rejected plan");
-        assert_eq!(rt.shadow(0, ExpertBlobRole::GateUp).unwrap()[1], 0);
+        assert_eq!(rt.shadow(0, ExpertBlobRole::GateUp).unwrap()[1], TEST_BASE);
     }
 
     #[test]
     fn encoded_ptr_table_round_trips_the_shadow() {
         let mut rt = runtime_with(4, 2, &[0]);
         let mut out = Vec::new();
-        let (stride, base) = (4096usize, 0x7f12_3456_0000u64);
+        let (stride, base) = (4096usize, TEST_BASE);
         rt.plan_dispatch(0, ExpertBlobRole::Down, &[3], stride, base, &mut out)
             .expect("plans");
         let want = rt.shadow(0, ExpertBlobRole::Down).unwrap().to_vec();
@@ -1306,6 +1370,23 @@ mod tests {
             let hi = enc[e * 2 + 1].to_bits() as u64;
             assert_eq!((hi << 32) | lo, p, "expert {e} pointer did not round-trip");
         }
+    }
+
+    #[test]
+    fn plan_dispatch_rejects_a_blob_this_pager_does_not_own() {
+        // Layer ids repeat across ds4's layer-shaped blocks (a DSpark stage is
+        // also s=0), so a mis-wired caller could hand over a fully-resident
+        // block's blob. Paging into it would corrupt weights silently.
+        let mut rt = runtime_with(8, 4, &[0]);
+        let mut out = Vec::new();
+        let err = rt
+            .plan_dispatch(0, ExpertBlobRole::GateUp, &[1], 1024, 0xDEAD_0000, &mut out)
+            .expect_err("must reject a foreign blob");
+        assert!(
+            matches!(err, PagerError::NotCatalogued { .. }),
+            "got {err:?}"
+        );
+        assert_eq!(rt.stats(), (0, 0), "residency mutated on a rejected plan");
     }
 
     #[test]
@@ -1332,14 +1413,28 @@ mod tests {
 
     #[test]
     fn layers_do_not_share_pointer_tables() {
+        let stride = 1024usize;
         let mut rt = runtime_with(8, 4, &[0, 1]);
         let mut out = Vec::new();
-        rt.plan_dispatch(0, ExpertBlobRole::GateUp, &[2], 1024, 0xA000, &mut out)
-            .expect("plans");
-        assert_ne!(rt.shadow(0, ExpertBlobRole::GateUp).unwrap()[2], 0);
-        assert_eq!(
-            rt.shadow(1, ExpertBlobRole::GateUp).unwrap()[2],
+        // Two experts so the second lands in slot 1 — a repoint that is
+        // distinguishable from the load-time value, which IS slot 0's address.
+        rt.plan_dispatch(
             0,
+            ExpertBlobRole::GateUp,
+            &[2, 5],
+            stride,
+            TEST_BASE,
+            &mut out,
+        )
+        .expect("plans");
+        assert_eq!(
+            rt.shadow(0, ExpertBlobRole::GateUp).unwrap()[5],
+            TEST_BASE + stride as u64,
+            "layer 0 expert 5 should hold slot 1"
+        );
+        assert_eq!(
+            rt.shadow(1, ExpertBlobRole::GateUp).unwrap()[5],
+            TEST_BASE,
             "layer 0 dispatch leaked into layer 1's table"
         );
     }

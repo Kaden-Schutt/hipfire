@@ -31,8 +31,11 @@ cd "$(dirname "$0")/.."
 
 MODEL="${HIPFIRE_DS4_MODEL:-$HOME/.hipfire/models/deepseek-v4-flash-0731.mq2lloyd}"
 EXE=./target/release/examples/daemon
-PROMPT="List three primary colours, comma separated."
-MAX_TOKENS="${PAGING_GATE_MAX_TOKENS:-64}"
+# A prompt that actually generates. A two-word answer proves almost nothing:
+# the more tokens committed, the more expert routings the comparison covers,
+# and the more chances an eviction bug has to surface.
+PROMPT="${PAGING_GATE_PROMPT:-Explain how a hash table works, step by step, and describe what happens on a collision.}"
+MAX_TOKENS="${PAGING_GATE_MAX_TOKENS:-192}"
 LARGE_GB="${PAGING_GATE_LARGE_GB:-70}"
 SMALL_GB="${PAGING_GATE_SMALL_GB:-8}"
 PIN_KERNEL="${PAGING_GATE_PIN_KERNEL:-1}"
