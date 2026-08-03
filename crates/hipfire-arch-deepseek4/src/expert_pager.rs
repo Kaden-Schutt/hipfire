@@ -535,8 +535,14 @@ impl Ds4PagingRuntime {
         stride: usize,
         blob_base: u64,
         out: &mut Vec<SlotFill>,
-    ) -> Result<(), PagerError> {
+    ) -> Result<bool, PagerError> {
         out.clear();
+        // Whether any pointer-table entry actually changed. A dispatch whose
+        // experts are all still in the slots they were last in changes
+        // nothing, and re-uploading an identical table costs a host-to-device
+        // copy per layer per role per token — 86 per token on ds4, on the path
+        // whose per-dispatch overhead dominates paged decode.
+        let mut dirty = false;
         // The blob must be the pool this pager was built over. Layer ids are
         // not globally unique across ds4's layer-shaped blocks — a DSpark
         // stage is also `s = 0, 1, 2` — so a mis-wired caller could otherwise
@@ -605,14 +611,18 @@ impl Ds4PagingRuntime {
             // correct. A routed expert must never be left aimed at whatever
             // the loader wrote (in the EP shard path that is a ZEROED dummy,
             // which produces silence rather than an error).
-            shadow[e as usize] = blob_base + (slot * stride) as u64;
+            let want = blob_base + (slot * stride) as u64;
+            if shadow[e as usize] != want {
+                shadow[e as usize] = want;
+                dirty = true;
+            }
             out.push(SlotFill {
                 key,
                 slot,
                 needs_read,
             });
         }
-        Ok(())
+        Ok(dirty)
     }
 
     /// Encode the host shadow into the two-F32-slot device representation.
@@ -650,12 +660,29 @@ pub struct Ds4ExpertPaging {
     /// moves these numbers.
     bytes_read: u64,
     dispatches: u64,
+    table_uploads: u64,
+    table_uploads_skipped: u64,
 }
 
 /// How many `ensure_resident` calls between hit-rate reports. One decode token
 /// makes `n_layers * 2` of them (43 * 2 = 86 on ds4), so this is roughly every
 /// 100 tokens — often enough to watch a run, rare enough not to spam.
-const STATS_EVERY: u64 = 8192;
+const STATS_EVERY_DEFAULT: u64 = 8192;
+
+/// Dispatches between hit-rate reports. `HIPFIRE_DEEPSEEK4_CACHE_STATS_EVERY`
+/// lowers it for short measurement runs — a 192-token generation only makes
+/// ~2.3k dispatches, so the default would never print.
+fn stats_every() -> u64 {
+    use std::sync::OnceLock;
+    static V: OnceLock<u64> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("HIPFIRE_DEEPSEEK4_CACHE_STATS_EVERY")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(STATS_EVERY_DEFAULT)
+    })
+}
 
 impl Ds4ExpertPaging {
     /// `max_working_set` is the largest number of experts a single dispatch
@@ -680,6 +707,8 @@ impl Ds4ExpertPaging {
             tile_experts: Vec::new(),
             bytes_read: 0,
             dispatches: 0,
+            table_uploads: 0,
+            table_uploads_skipped: 0,
         }
     }
 
@@ -883,13 +912,16 @@ impl Ds4ExpertPaging {
         let base = blob.buf.as_ptr() as u64;
         // Move scratch out so `self.rt` can borrow mutably alongside it.
         let mut fills = std::mem::take(&mut self.fills);
-        let plan = self
+        let dirty = match self
             .rt
-            .plan_dispatch(layer, role, experts, stride, base, &mut fills);
-        if let Err(e) = plan {
-            self.fills = fills;
-            return Err(e);
-        }
+            .plan_dispatch(layer, role, experts, stride, base, &mut fills)
+        {
+            Ok(d) => d,
+            Err(e) => {
+                self.fills = fills;
+                return Err(e);
+            }
+        };
         for f in &fills {
             if !f.needs_read {
                 continue;
@@ -934,7 +966,7 @@ impl Ds4ExpertPaging {
         // be measured, not argued about, so make the inputs to it visible on
         // any paged run rather than behind another env knob.
         self.dispatches += 1;
-        if self.dispatches % STATS_EVERY == 0 {
+        if self.dispatches % stats_every() == 0 {
             let (hits, misses) = self.rt.stats();
             eprintln!(
                 "deepseek4: expert cache — {:.1}% hits ({hits} hit / {misses} miss), \
@@ -943,7 +975,22 @@ impl Ds4ExpertPaging {
                 self.bytes_read as f64 / (1024.0 * 1024.0 * 1024.0),
                 self.rt.slots_per_blob(),
             );
+            eprintln!(
+                "deepseek4: expert cache — pointer-table uploads {} done / {} skipped ({:.1}% skipped)",
+                self.table_uploads,
+                self.table_uploads_skipped,
+                100.0 * self.table_uploads_skipped as f64
+                    / (self.table_uploads + self.table_uploads_skipped).max(1) as f64,
+            );
         }
+
+        if !dirty {
+            // Every requested expert already points at the slot holding it, so
+            // the device table is already correct and the copy is pure cost.
+            self.table_uploads_skipped += 1;
+            return Ok(());
+        }
+        self.table_uploads += 1;
 
         // Publish the patched table. Uploaded as native u64 bytes, exactly the
         // encoding the loader writes — the kernel reinterprets each u64 as two
