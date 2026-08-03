@@ -617,6 +617,101 @@ not a single-shape bench.
 NOT on the list any more: MQ4 sidecar (3.5%), draft head quantization (the head
 is already qt=35 MFP4G32E8SOA ~4-bit), VMM (orthogonal).
 
+## The DSpark sidecar is quantized WRONG for its trunk (root cause of accept=41%)
+
+A drafter should be far cheaper than its target. This one is not:
+
+```
+trunk :  82.19 GB / 43 layers = 1.911 GB per layer
+draft :   6.00 GB /  3 stages = 1.999 GB per stage
+=> a draft stage weighs 1.05x a trunk layer
+```
+
+The sidecar is built by `scripts/quantize-dspark.sh` with
+`--format deepseek4-q8-mtp --include-prefix mtp.`, and that format falls back to
+**Q8F16** (`crates/hipfire-quantize/src/main.rs:5082`, tier selection
+`:7037-7043`). The trunk it drafts for is MQ2R: dense qt=35 MFP4G32E8SOA (~4-bit,
+loader-enforced at `crates/hipfire-arch-deepseek4/src/arch.rs:708-710`) and
+routed experts qt=19 MQ2-Lloyd (~2-bit).
+
+So the draft is quantized 2-4x HEAVIER than the target it predicts.
+
+### Why this caps acceptance, not just cost
+
+Two separate arguments, and the second is the important one:
+
+1. **Cost** — weaker. `draft_block` is only 5.87 ms of the 86.59 ms window
+   (3.5%), so halving draft bytes buys ~3 ms. This is why an earlier "MQ4 the
+   sidecar" proposal was retracted (see above). That retraction was correct
+   about cost.
+2. **Distribution — this is the real defect.** The draft's job is to predict what
+   the TRUNK emits, not what the original checkpoint would emit. At Q8F16 the
+   draft is MORE faithful to the checkpoint than the trunk is. Wherever the
+   trunk's 2-4 bit quantization moves the argmax, the draft confidently predicts
+   the un-quantized token and is rejected. The draft is systematically right
+   about the wrong model. Matching the draft's quantization to the trunk's makes
+   the two share the same quantization error so they agree where it counts.
+
+This is exactly why DFlash's MQ4 drafts work well against MQ4 targets — not
+merely because MQ4 is cheap, but because it is MATCHED.
+
+It also explains the 41% acceptance ceiling better than the earlier
+"restamped metadata" theory did. The restamp was NOT the problem (disproved: the
+missing E8 arm was, `c420159e2`), but the RECIPE MISMATCH always was.
+
+### Why the wrong recipe got applied
+
+The Q8F16 choice is deliberate and correct for the case it was written for. The
+sibling emitter `qwen3-dspark-q8` (`main.rs:6654-6669`) documents it:
+
+    // Quant recipe (small trained drafter — preserve precision):
+    //   2D matmul weights (attn q/k/v/o, mlp gate/up/down) -> Q8F16
+    //   Everything else ... -> F16
+
+"small trained drafter" is true of Qwen3's 5-layer DSpark drafter. DS4's
+"drafter" is not small — it is three full DeepSeek blocks lifted out of the model
+itself via `--include-prefix mtp.`, at 2 GB/stage. The same reasoning appears
+again for `deepseek4-mtp-precise` (`main.rs:7051-7058`), which goes the WRONG
+WAY for our purposes — it upgrades mtp dense to F16 to "eliminate Q8 quant
+noise", doubling the addon, on the theory that "MTP is small enough that the
+precision matters disproportionately". For a 6 GB DS4 sidecar drafting a 2-bit
+trunk, precision-preservation is the bug, not the feature.
+
+Note the two sidecar paths are structurally different and should not be
+conflated: `qwen3-dspark-q8` consumes a SEPARATELY TRAINED drafter checkpoint
+(it validates `architectures` is `Qwen3DSparkModel`/`DSparkDraftModel`/
+`DSparkSpeculator`, `main.rs:6688-6705`), whereas DS4 extracts its own `mtp.*`
+stages from the trunk checkpoint.
+
+### Scoped fix: a trunk-matched DS4 sidecar format
+
+Add a sidecar format that applies the MQ2R P3 recipe under
+`--include-prefix mtp.`: dense/2D `mtp.*` -> qt=35 MFP4G32E8SOA, routed
+`mtp.*` experts -> qt=19 MQ2-Lloyd, norms/HC -> F16. All machinery exists:
+
+- qt=35 emission: `main.rs:6198,6327,6419,6590`; tier name parsing at `:5910`
+  (`"mfp4e8soa" | "mfp4-e8-soa" | "mfp4e8-soa"`), display at `:5934`.
+- MQ2-Lloyd experts are already the default expert tier for the deepseek4
+  family; `deepseek4-mq4lloyd`/`mq3lloyd` (`:7049-7050`) show how to vary ONLY
+  the expert tier while holding the rest, which is the same shape of change.
+- `--include-prefix` already scopes a build to `mtp.*` (`:8273-8275`).
+- The loader contract to satisfy is `validate_mq2r_dspark_sidecar`
+  (`arch.rs:777-806`): metadata `mq2r_sidecar` with
+  `target_recipe == "deepseek4-mq2r-e8-p3-v1"`, `draft_head ==
+  "trunk_mfp4_e8_soa_b4"`, and NO `draft_head.weight` tensor. Emit that block at
+  build time instead of stamping it afterwards
+  (`scripts/reap/hfq_metadata_stamp.rs`).
+
+Expected: sidecar ~6.0 GB -> ~2-3 GB, `draft_block` ~5.87 -> ~3 ms (minor), and
+— the point — acceptance above the current 41%. This is strictly cheaper than
+retraining a drafter and should be tried FIRST; retrain only if matched-recipe
+acceptance still falls short.
+
+**Unproven.** The acceptance argument is mechanistic, not measured. The
+experiment is: build the matched sidecar, run `hipfire run --spec dspark` on
+gfx1151 in both A/B orderings, and compare accept% and tok/s against the current
+41% / 25.8 tok/s.
+
 ## Reproduction
 
 ```bash
