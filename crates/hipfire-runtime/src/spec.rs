@@ -524,7 +524,7 @@ impl<B: SpecTarget> SpecTargetGuard for InPlaceGuard<'_, B> {
 /// arch and this crate depends on none of them — so it is threaded through the
 /// trait erased, mirroring [`SpecGrammar`]. The arch's [`SpecTarget`] impl
 /// recovers it via `scratch.as_any_mut().downcast_mut::<T>()`.
-pub trait SpecScratch {
+pub trait SpecScratch: Send {
     /// Downcast hook for the owning [`SpecTarget`] impl.
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any;
 
@@ -591,7 +591,7 @@ pub struct EvictRetain {
 /// and is agnostic to whether the impl is a DFlash chain, a DDTree tree, an MTP
 /// head, or a future n-gram / EAGLE drafter — chain-vs-tree, K, budget, and
 /// topk are all resolved at build time and stored inside the impl.
-pub trait Speculator {
+pub trait Speculator: Send {
     /// Prefill the prompt: seed the target's hidden state (advancing its KV +
     /// recurrent state) and prime the drafter's cached target-hidden buffer,
     /// returning the target's first token. `prefill_tokens` is the suffix to
@@ -769,7 +769,7 @@ pub struct MtpWindow {
 /// the fused head-draft + trunk-verify kernels. Everything arch-INvariant
 /// (prefill outcome, window→step lowering, position/seed advance) lives once in
 /// [`MtpSpeculator`].
-pub trait MtpDrafter {
+pub trait MtpDrafter: Send {
     /// Prefill `fill_tokens` from absolute `start_pos`: advance the target's
     /// KV/recurrent state AND the MTP head's position-aligned cache, returning
     /// the greedy seed (argmax at the last prefilled position). The central
@@ -1604,5 +1604,40 @@ mod tests {
         };
         assert!(outcome.events.is_empty());
         assert!(summary.events.is_empty());
+    }
+
+    // ── Send bounds (PendingQwen35Unload needs Speculator: Send) ─────────────
+
+    /// Helper: compile-time Send assertion.
+    fn _assert_send<T: Send>() {}
+
+    /// `Box<dyn Speculator>` must be Send for loader-private PendingQwen35Unload.
+    #[test]
+    fn box_dyn_speculator_is_send() {
+        _assert_send::<Box<dyn Speculator>>();
+    }
+
+    /// `Box<dyn SpecScratch>` must be Send (nested inside GenericDflashSpeculator).
+    #[test]
+    fn box_dyn_spec_scratch_is_send() {
+        _assert_send::<Box<dyn SpecScratch>>();
+    }
+
+    /// ChainSpeculator<NgramDrafter> — CPU-only drafter; no GPU fields.
+    #[test]
+    fn chain_speculator_ngram_is_send() {
+        _assert_send::<crate::spec_ngram::ChainSpeculator<crate::spec_ngram::NgramDrafter>>();
+    }
+
+    /// MtpSpeculator<DsparkDrafter> — generic MTP wrapping the DSpark drafter.
+    #[test]
+    fn mtp_speculator_dspark_is_send() {
+        _assert_send::<MtpSpeculator<crate::dspark_core::DsparkDrafter>>();
+    }
+
+    /// GenericDflashSpeculator — arch-agnostic DFlash.
+    #[test]
+    fn generic_dflash_speculator_is_send() {
+        _assert_send::<crate::dflash_generic::GenericDflashSpeculator>();
     }
 }

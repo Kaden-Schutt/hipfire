@@ -6041,6 +6041,21 @@ impl KvTensorStaging {
             let _ = gpu.free_tensor(tensor);
         }
     }
+
+    /// Checked free: returns every GpuTensor whose `free_tensor_checked` failed.
+    /// Caller retains ownership of the returned tensors for retry.
+    fn free_checked(self, gpu: &mut Gpu) -> Vec<GpuTensor> {
+        let mut retained: Vec<GpuTensor> = Vec::new();
+        for tensor in self.tensors.into_iter().rev() {
+            let mut opt = Some(tensor);
+            if let Err(_e) = gpu.free_tensor_checked(&mut opt) {
+                if let Some(t) = opt.take() {
+                    retained.push(t);
+                }
+            }
+        }
+        retained
+    }
 }
 
 fn alloc_kv_with_rotation(
@@ -6499,6 +6514,11 @@ impl KvCache {
         )
     }
 
+    /// Resize real (non-placeholder) tensors to `elems` elements, zeroed.
+    ///
+    /// Allocates all new tensors BEFORE swapping, so a mid-way allocation
+    /// failure preserves the old cache unchanged.  On failure, any newly
+    /// allocated tensors are freed (best-effort).
     fn resize_real_tensors_zeroed(
         gpu: &mut Gpu,
         tensors: &mut [GpuTensor],
@@ -6509,16 +6529,27 @@ impl KvCache {
             .enumerate()
             .filter_map(|(i, t)| (t.numel() > 1).then_some(i))
             .collect();
+
+        // Phase 1: Allocate ALL new tensors before touching the old cache.
+        let mut new: Vec<(usize, GpuTensor)> = Vec::with_capacity(real.len());
         for &i in &real {
-            let placeholder = gpu.zeros(&[1], DType::F32)?;
-            let old = std::mem::replace(&mut tensors[i], placeholder);
-            let _ = gpu.free_tensor(old);
+            match gpu.zeros(&[elems], DType::F32) {
+                Ok(t) => new.push((i, t)),
+                Err(e) => {
+                    // Free any new tensors already allocated — old cache
+                    // is still intact.
+                    for (_, t) in new {
+                        let _ = gpu.free_tensor(t);
+                    }
+                    return Err(e);
+                }
+            }
         }
-        gpu.drain_pool();
-        for &i in &real {
-            let new_tensor = gpu.zeros(&[elems], DType::F32)?;
-            let placeholder = std::mem::replace(&mut tensors[i], new_tensor);
-            let _ = gpu.free_tensor(placeholder);
+
+        // Phase 2: All new tensors ready — swap in place of old ones.
+        for (i, new_tensor) in new {
+            let old = std::mem::replace(&mut tensors[i], new_tensor);
+            let _ = gpu.free_tensor(old);
         }
         gpu.drain_pool();
         Ok(())
@@ -6554,18 +6585,36 @@ impl KvCache {
                 let s2v = Self::gen_fwht_signs(1042, n);
                 let s1b: Vec<u8> = s1v.iter().flat_map(|v| v.to_ne_bytes()).collect();
                 let s2b: Vec<u8> = s2v.iter().flat_map(|v| v.to_ne_bytes()).collect();
-                let s1 = gpu.alloc_tensor(&[n], DType::F32)?;
-                let s2 = gpu.alloc_tensor(&[n], DType::F32)?;
-                gpu.hip.memcpy_htod(&s1.buf, &s1b)?;
-                gpu.hip.memcpy_htod(&s2.buf, &s2b)?;
+                // Stage new sign table allocations: allocate both before
+                // swapping, so a mid-way failure leaves old tables intact.
+                let new_s1 = gpu.alloc_tensor(&[n], DType::F32)?;
+                let new_s2 = match gpu.alloc_tensor(&[n], DType::F32) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        let _ = gpu.free_tensor(new_s1);
+                        return Err(e);
+                    }
+                };
+                if let Err(e) = gpu.hip.memcpy_htod(&new_s1.buf, &s1b) {
+                    let _ = gpu.free_tensor(new_s1);
+                    let _ = gpu.free_tensor(new_s2);
+                    return Err(e);
+                }
+                if let Err(e) = gpu.hip.memcpy_htod(&new_s2.buf, &s2b) {
+                    let _ = gpu.free_tensor(new_s1);
+                    let _ = gpu.free_tensor(new_s2);
+                    return Err(e);
+                }
+                // All allocations + copies succeeded — swap in.
+                // Old tables are freed after new ones are live.
                 if let Some(old) = self.givens_cos.take() {
                     let _ = gpu.free_tensor(old);
                 }
                 if let Some(old) = self.givens_sin.take() {
                     let _ = gpu.free_tensor(old);
                 }
-                self.givens_cos = Some(s1);
-                self.givens_sin = Some(s2);
+                self.givens_cos = Some(new_s1);
+                self.givens_sin = Some(new_s2);
             }
         }
         let v_bpp = Self::v_bytes_per_pos(self.n_kv_heads, self.head_dim, v_mode);
@@ -6625,18 +6674,35 @@ impl KvCache {
             let s2v = Self::gen_fwht_signs(1042, n);
             let s1b: Vec<u8> = s1v.iter().flat_map(|v| v.to_ne_bytes()).collect();
             let s2b: Vec<u8> = s2v.iter().flat_map(|v| v.to_ne_bytes()).collect();
-            let s1 = gpu.alloc_tensor(&[n], DType::F32)?;
-            let s2 = gpu.alloc_tensor(&[n], DType::F32)?;
-            gpu.hip.memcpy_htod(&s1.buf, &s1b)?;
-            gpu.hip.memcpy_htod(&s2.buf, &s2b)?;
+            // Stage sign table allocations: allocate both + copy before
+            // swapping, so mid-way failure leaves old tables intact.
+            let new_s1 = gpu.alloc_tensor(&[n], DType::F32)?;
+            let new_s2 = match gpu.alloc_tensor(&[n], DType::F32) {
+                Ok(t) => t,
+                Err(e) => {
+                    let _ = gpu.free_tensor(new_s1);
+                    return Err(e);
+                }
+            };
+            if let Err(e) = gpu.hip.memcpy_htod(&new_s1.buf, &s1b) {
+                let _ = gpu.free_tensor(new_s1);
+                let _ = gpu.free_tensor(new_s2);
+                return Err(e);
+            }
+            if let Err(e) = gpu.hip.memcpy_htod(&new_s2.buf, &s2b) {
+                let _ = gpu.free_tensor(new_s1);
+                let _ = gpu.free_tensor(new_s2);
+                return Err(e);
+            }
+            // All allocations + copies succeeded — swap in.
             if let Some(old) = self.givens_cos.take() {
                 let _ = gpu.free_tensor(old);
             }
             if let Some(old) = self.givens_sin.take() {
                 let _ = gpu.free_tensor(old);
             }
-            self.givens_cos = Some(s1);
-            self.givens_sin = Some(s2);
+            self.givens_cos = Some(new_s1);
+            self.givens_sin = Some(new_s2);
         }
         // Size V at the FLOOR tier (not the current v_mode). The q8 start phase
         // simply fits fewer positions in this smaller buffer.
@@ -8123,6 +8189,7 @@ impl KvCache {
 
     /// Free all GPU tensors in this cache. Call before drop to return VRAM.
     /// After calling, follow with gpu.drain_pool() to actually release memory.
+    /// Discards failures — prefer [`free_checked`] for ownership-preserving cleanup.
     pub fn free_gpu(self, gpu: &mut Gpu) {
         for t in self.k_gpu {
             let _ = gpu.free_tensor(t);
@@ -8141,6 +8208,56 @@ impl KvCache {
         }
         if let Some(t) = self.givens_sin {
             let _ = gpu.free_tensor(t);
+        }
+    }
+
+    /// Checked GPU cleanup: attempts every tensor independently, retains
+    /// every allocation that could not be freed for retry.
+    ///
+    /// On success all resources are consumed (`Ok(())`). On failure the
+    /// returned `Vec<GpuTensor>` carries the exact original tensors that
+    /// could not be freed.
+    pub fn free_checked(self, gpu: &mut Gpu) -> Result<(), Vec<(String, GpuTensor)>> {
+        let mut failures: Vec<(String, GpuTensor)> = Vec::new();
+
+        /// Helper: try to free a single GpuTensor, collecting label+tensor on failure.
+        fn try_free_one(
+            label: &str,
+            tensor: GpuTensor,
+            gpu: &mut Gpu,
+            failures: &mut Vec<(String, GpuTensor)>,
+        ) {
+            let mut opt = Some(tensor);
+            if let Err(_e) = gpu.free_tensor_checked(&mut opt) {
+                if let Some(t) = opt.take() {
+                    failures.push((label.to_string(), t));
+                }
+            }
+        }
+
+        for (i, t) in self.k_gpu.into_iter().enumerate() {
+            try_free_one(&format!("k_gpu[{i}]"), t, gpu, &mut failures);
+        }
+        for (i, t) in self.v_gpu.into_iter().enumerate() {
+            try_free_one(&format!("v_gpu[{i}]"), t, gpu, &mut failures);
+        }
+        for (i, t) in self.k_scales.into_iter().enumerate() {
+            try_free_one(&format!("k_scales[{i}]"), t, gpu, &mut failures);
+        }
+        for (i, t) in self.v_scales.into_iter().enumerate() {
+            try_free_one(&format!("v_scales[{i}]"), t, gpu, &mut failures);
+        }
+        if let Some(t) = self.givens_cos {
+            try_free_one("givens_cos", t, gpu, &mut failures);
+        }
+        if let Some(t) = self.givens_sin {
+            try_free_one("givens_sin", t, gpu, &mut failures);
+        }
+
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(failures)
         }
     }
 

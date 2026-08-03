@@ -326,3 +326,16 @@ pub fn build_deepseek4_mtp_speculator(max_n: usize, ctx_capacity: usize) -> Box<
         ctx_capacity,
     )))
 }
+
+// ── Send-bound assertions ──────────────────────────────────────────────
+#[cfg(test)]
+mod send_assertions {
+    use hipfire_runtime::spec::MtpSpeculator;
+
+    fn _assert_send<T: Send>() {}
+
+    #[test]
+    fn mtp_speculator_deepseek4_is_send() {
+        _assert_send::<MtpSpeculator<super::Deepseek4MtpDrafter>>();
+    }
+}

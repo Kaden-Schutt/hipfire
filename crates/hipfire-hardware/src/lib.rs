@@ -1025,7 +1025,6 @@ impl Gpus {
             epoch_from_domain(*gpu.allocation_domain_id()),
         )
     }
-
     /// Return the [`WeightAllocationOrigin`] for `rank`, additionally
     /// validating that `mesh` matches the mesh bound to this `Gpus`.
     ///

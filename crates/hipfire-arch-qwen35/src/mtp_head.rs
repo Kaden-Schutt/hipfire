@@ -303,6 +303,89 @@ impl Qwen35MtpHeadWeights {
             let _ = gpu.free_tensor(vmap);
         }
     }
+
+    /// Checked GPU cleanup: attempts every tensor independently using
+    /// `free_tensor_checked`, retaining any that could not be freed.
+    pub fn free_checked(self, gpu: &mut Gpu) -> Vec<super::qwen35::RetainedQwenTensor> {
+        let mut failures = Vec::new();
+
+        macro_rules! try_free {
+            ($label:expr, $tensor:expr) => {
+                let mut opt = Some($tensor);
+                if let Err(_e) = gpu.free_tensor_checked(&mut opt) {
+                    if let Some(t) = opt.take() {
+                        failures.push(super::qwen35::RetainedQwenTensor {
+                            label: $label.into(),
+                            tensor: t,
+                            last_error: "free_tensor_checked failed".into(),
+                        });
+                    }
+                }
+            };
+        }
+
+        try_free!("MtpHeadWeights.shared_head_norm", self.shared_head_norm);
+        try_free!("MtpHeadWeights.enorm", self.enorm);
+        try_free!("MtpHeadWeights.hnorm", self.hnorm);
+        try_free!("MtpHeadWeights.attn_norm", self.attn_norm);
+        try_free!("MtpHeadWeights.attn_post_norm", self.attn_post_norm);
+        try_free!("MtpHeadWeights.attn_q_norm", self.attn_q_norm);
+        try_free!("MtpHeadWeights.attn_k_norm", self.attn_k_norm);
+        try_free!("MtpHeadWeights.eh_proj", self.eh_proj.buf);
+        try_free!("MtpHeadWeights.wq", self.wq.buf);
+        try_free!("MtpHeadWeights.wk", self.wk.buf);
+        try_free!("MtpHeadWeights.wv", self.wv.buf);
+        try_free!("MtpHeadWeights.wo", self.wo.buf);
+        match self.ffn {
+            Qwen35MtpFfnWeights::Dense(ffn) => {
+                try_free!("MtpHeadWeights.ffn.gate", ffn.gate.buf);
+                try_free!("MtpHeadWeights.ffn.up", ffn.up.buf);
+                try_free!("MtpHeadWeights.ffn.down", ffn.down.buf);
+            }
+            Qwen35MtpFfnWeights::Moe(ffn) => {
+                try_free!("MtpHeadWeights.ffn.router", ffn.router.buf);
+                try_free!(
+                    "MtpHeadWeights.ffn.shared_expert_gate",
+                    ffn.shared_expert_gate.buf
+                );
+                try_free!(
+                    "MtpHeadWeights.ffn.shared_expert.gate",
+                    ffn.shared_expert.gate.buf
+                );
+                try_free!(
+                    "MtpHeadWeights.ffn.shared_expert.up",
+                    ffn.shared_expert.up.buf
+                );
+                try_free!(
+                    "MtpHeadWeights.ffn.shared_expert.down",
+                    ffn.shared_expert.down.buf
+                );
+                try_free!(
+                    "MtpHeadWeights.ffn.expert_gate_up_ptrs",
+                    ffn.expert_gate_up_ptrs
+                );
+                try_free!("MtpHeadWeights.ffn.expert_down_ptrs", ffn.expert_down_ptrs);
+                for (i, expert) in ffn.experts.into_iter().enumerate() {
+                    try_free!(
+                        format!("MtpHeadWeights.ffn.experts[{i}].gate_up"),
+                        expert.gate_up.buf
+                    );
+                    try_free!(
+                        format!("MtpHeadWeights.ffn.experts[{i}].down"),
+                        expert.down.buf
+                    );
+                }
+            }
+        }
+        if let Some(t) = self.lm_head_draft {
+            try_free!("MtpHeadWeights.lm_head_draft", t.buf);
+        }
+        if let Some(t) = self.lm_head_draft_vocab_map_gpu {
+            try_free!("MtpHeadWeights.lm_head_draft_vocab_map_gpu", t);
+        }
+
+        failures
+    }
 }
 
 // ─── Scratch ─────────────────────────────────────────────────────────────
@@ -746,6 +829,12 @@ pub struct Qwen35MtpHead {
 impl Qwen35MtpHead {
     pub fn free_gpu(self, gpu: &mut Gpu) {
         self.weights.free_gpu(gpu);
+    }
+
+    /// Checked GPU cleanup: attempts every tensor independently, returns
+    /// those that could not be freed.
+    pub fn free_checked(self, gpu: &mut Gpu) -> Vec<super::qwen35::RetainedQwenTensor> {
+        self.weights.free_checked(gpu)
     }
 }
 

@@ -88,7 +88,7 @@ impl MtpDrafter for Qwen35MtpDrafter {
         }
         self.mtp_prefill_with_abort(gpu, target, fill_tokens, start_pos, cache_hit, &never)
             .map(|token| token.expect("non-abortable qwen35 MTP prefill aborted"))
-        }
+    }
 
     fn mtp_prefill_abortable(
         &mut self,
@@ -101,7 +101,7 @@ impl MtpDrafter for Qwen35MtpDrafter {
     ) -> Result<Option<u32>, String> {
         fn never() -> bool {
             false
-                }
+        }
         let abort = abort.unwrap_or(&never);
         self.mtp_prefill_with_abort(gpu, target, fill_tokens, start_pos, cache_hit, abort)
     }
@@ -243,4 +243,17 @@ pub fn build_qwen35_mtp_speculator(
         max_n,
         ctx_capacity,
     )))
+}
+
+// ── Send-bound assertions ──────────────────────────────────────────────
+#[cfg(test)]
+mod send_assertions {
+    use hipfire_runtime::spec::MtpSpeculator;
+
+    fn _assert_send<T: Send>() {}
+
+    #[test]
+    fn mtp_speculator_qwen35_is_send() {
+        _assert_send::<MtpSpeculator<super::Qwen35MtpDrafter>>();
+    }
 }

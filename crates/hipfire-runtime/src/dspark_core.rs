@@ -266,7 +266,7 @@ impl DsparkWeights {
 /// contract (backward-compatible with Stage 1).  The deepseek4 body always
 /// calls with `ctx_len = 1` (Stage 3 will change this); the qwen3 body uses
 /// the full multi-slot `ctx_len` once Stage 2 wires it.
-pub trait DsparkBody {
+pub trait DsparkBody: Send {
     fn draft_block(
         &mut self,
         gpu: &mut Gpu,
@@ -1519,4 +1519,17 @@ pub fn build_dspark_speculator(
         profiler: DsparkProfiler::new(),
         block_controller,
     }))
+}
+
+// ── Send-bound assertions ──────────────────────────────────────────────
+#[cfg(test)]
+mod send_assertions {
+    /// Helper: compile-time Send assertion.
+    fn _assert_send<T: Send>() {}
+
+    /// `Box<dyn DsparkBody>` must be Send (nested inside DsparkDrafter).
+    #[test]
+    fn box_dyn_dspark_body_is_send() {
+        _assert_send::<Box<dyn super::DsparkBody>>();
+    }
 }

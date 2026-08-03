@@ -862,6 +862,8 @@ pub fn forward_batch(
                         per_expert_gate_up: None,
                         per_expert_down: None,
                         has_paro_shared: false,
+                        gate_side_has_awq: false,
+                        routed_down_has_awq: false,
                     },
                     batch_size: b,
                     mi: moe_inter,

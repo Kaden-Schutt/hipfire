@@ -1609,3 +1609,14 @@ mod tests {
         }
     }
 }
+
+// ── Send-bound assertions ──────────────────────────────────────────────
+#[cfg(test)]
+mod send_assertions {
+    fn _assert_send<T: Send>() {}
+
+    #[test]
+    fn dflash_speculator_is_send() {
+        _assert_send::<super::DflashSpeculator>();
+    }
+}

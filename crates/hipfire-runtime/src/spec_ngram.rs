@@ -32,7 +32,7 @@ use rdna_compute::Gpu;
 /// A token-only block drafter: it proposes a continuation block from the
 /// committed token history and maintains whatever CPU state it needs. The GPU
 /// verify/accept/commit is [`ChainSpeculator`]'s job, not the drafter's.
-pub trait BlockDrafter {
+pub trait BlockDrafter: Send {
     /// Seed drafter state from the full rendered prompt (called at prefill).
     fn prefill_seed(&mut self, prompt_tokens: &[u32]);
 
@@ -203,14 +203,8 @@ impl<D: BlockDrafter> Speculator for ChainSpeculator<D> {
         // (hit → from prefill_start). The central speculative lifecycle already
         // performed the authoritative miss reset.
         let start = if cache_hit { prefill_start } else { 0 };
-        let adv = target.spec_advance_cold_start(
-            gpu,
-            prefill_tokens,
-            start,
-            !cache_hit,
-            abort,
-            None,
-        )?;
+        let adv =
+            target.spec_advance_cold_start(gpu, prefill_tokens, start, !cache_hit, abort, None)?;
         let first_token = match adv {
             SpecAdvance::Aborted => return Ok(PrefillOutcome::Aborted),
             SpecAdvance::Ready { last_argmax } => last_argmax,
@@ -333,5 +327,20 @@ impl<D: BlockDrafter> Speculator for ChainSpeculator<D> {
         if let Some(scratch) = self.scratch.take() {
             scratch.free(gpu);
         }
+    }
+}
+
+// ── Send-bound assertions ──────────────────────────────────────────────
+#[cfg(test)]
+mod send_assertions {
+    use super::*;
+
+    /// Helper: compile-time Send assertion.
+    fn _assert_send<T: Send>() {}
+
+    /// `Box<dyn BlockDrafter>` — for future use if drafter is stored boxed.
+    #[test]
+    fn box_dyn_block_drafter_is_send() {
+        _assert_send::<Box<dyn BlockDrafter>>();
     }
 }

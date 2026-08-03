@@ -1443,3 +1443,14 @@ pub fn build_qwen3_dspark_body(
     };
     Ok(Box::new(Qwen3DsparkBody { assets, scratch }))
 }
+
+// ── Send-bound assertions ──────────────────────────────────────────────
+#[cfg(test)]
+mod send_assertions {
+    fn _assert_send<T: Send>() {}
+
+    #[test]
+    fn qwen3_dspark_body_is_send() {
+        _assert_send::<super::Qwen3DsparkBody>();
+    }
+}

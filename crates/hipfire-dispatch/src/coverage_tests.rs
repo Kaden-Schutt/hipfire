@@ -360,6 +360,8 @@ fn non_k8_and_q8_routed_moe_has_a_dispatch_plan() {
             routed_down: u.routed_down,
             routed_has_mixed_experts: false,
             has_paro_shared: false,
+            gate_side_has_awq: false,
+            routed_down_has_awq: false,
             per_expert_gate_up: None,
             per_expert_down: None,
         };
@@ -420,6 +422,8 @@ fn moe_decode_pre_guard_admits_fallback_and_rejects_invalid() {
         routed_down: MQ4G256,
         routed_has_mixed_experts: false,
         has_paro_shared: false,
+        gate_side_has_awq: false,
+        routed_down_has_awq: false,
         per_expert_gate_up: None,
         per_expert_down: None,
     };
@@ -876,19 +880,46 @@ fn fused_qkv_keys_resolve_on_fleet_archs() {
         // ── HFQ6G256 fused — cross-arch (batched gemm_*_hfq6g256 ladder:
         //    wmma_gfx12/wmma/dp4a/dot2/fp16/scalar). Was wrongly gfx906-only
         //    (HasDp4a), which dead-gated the AWQ A3B trunk on RDNA3/4. ──
-        FusedKeyUse { key: KernelKey::FusedQkvHfq6G256,     archs: ALL },
-        FusedKeyUse { key: KernelKey::FusedQkvzaHfq6G256,   archs: ALL },
-        FusedKeyUse { key: KernelKey::FusedGateUpHfq6G256,  archs: ALL },
+        FusedKeyUse {
+            key: KernelKey::FusedQkvHfq6G256,
+            archs: ALL,
+        },
+        FusedKeyUse {
+            key: KernelKey::FusedQkvzaHfq6G256,
+            archs: ALL,
+        },
+        FusedKeyUse {
+            key: KernelKey::FusedGateUpHfq6G256,
+            archs: ALL,
+        },
         // ── MQ3/MQ4-Lloyd fused (W4: WMMA-free [32,1,1] wave32 scalar, run on
         //    every RDNA gen). Gate is HasWave32 (was a HasWmma dead-gate). Listed
         //    on WMMA_ARCHS here as a MUST-resolve floor; w4_* tests below assert
         //    the full RDNA1/2 admit + CDNA rejection on the GEMV-side siblings. ──
-        FusedKeyUse { key: KernelKey::FusedQkvMq3G256Lloyd,  archs: WMMA_ARCHS },
-        FusedKeyUse { key: KernelKey::FusedQkvMq4G256Lloyd,  archs: WMMA_ARCHS },
-        FusedKeyUse { key: KernelKey::FusedQkvzaMq3G256Lloyd, archs: WMMA_ARCHS },
-        FusedKeyUse { key: KernelKey::FusedQkvzaMq4G256Lloyd, archs: WMMA_ARCHS },
-        FusedKeyUse { key: KernelKey::FusedGateUpMq3G256Lloyd, archs: WMMA_ARCHS },
-        FusedKeyUse { key: KernelKey::FusedGateUpMq4G256Lloyd, archs: WMMA_ARCHS },
+        FusedKeyUse {
+            key: KernelKey::FusedQkvMq3G256Lloyd,
+            archs: WMMA_ARCHS,
+        },
+        FusedKeyUse {
+            key: KernelKey::FusedQkvMq4G256Lloyd,
+            archs: WMMA_ARCHS,
+        },
+        FusedKeyUse {
+            key: KernelKey::FusedQkvzaMq3G256Lloyd,
+            archs: WMMA_ARCHS,
+        },
+        FusedKeyUse {
+            key: KernelKey::FusedQkvzaMq4G256Lloyd,
+            archs: WMMA_ARCHS,
+        },
+        FusedKeyUse {
+            key: KernelKey::FusedGateUpMq3G256Lloyd,
+            archs: WMMA_ARCHS,
+        },
+        FusedKeyUse {
+            key: KernelKey::FusedGateUpMq4G256Lloyd,
+            archs: WMMA_ARCHS,
+        },
         // ── #397 Ship 5.2 slice 2: prefill gate+up dtypes ──
         // HFQ3G256: Always — base `gemm_gate_up_hfq3g256` carries a full
         // cross-arch internal ladder (MMQ→dp4a→dot2→fp16→scalar gfx1010), and
@@ -1157,13 +1188,19 @@ fn w4_lloyd_fused_keys_un_bricked_on_rdna2_not_cdna() {
     for &key in lloyd_fused {
         // RDNA1/2 must now resolve.
         for arch in ["gfx1010", "gfx1030", "gfx1031", "gfx1032"] {
-            if family.resolve(key, &DispatchCtx::for_test(arch), None).is_err() {
+            if family
+                .resolve(key, &DispatchCtx::for_test(arch), None)
+                .is_err()
+            {
                 failures.push(format!("  {:?} dead-gated on {} (FIX B)", key, arch));
             }
         }
         // CDNA wave64 must still Err.
         for arch in ["gfx906", "gfx942"] {
-            if family.resolve(key, &DispatchCtx::for_test(arch), None).is_ok() {
+            if family
+                .resolve(key, &DispatchCtx::for_test(arch), None)
+                .is_ok()
+            {
                 failures.push(format!("  {:?} wrongly admitted on CDNA {}", key, arch));
             }
         }
@@ -1227,7 +1264,10 @@ fn w4_mq3_lloyd_still_rejected_on_cdna_wave64() {
             let ctx = DispatchCtx::for_test(arch);
             for variant in [GemvVariant::Plain, GemvVariant::Prerotated] {
                 if fam.resolve(d, variant, false, &ctx, None).is_ok() {
-                    admitted.push(format!("  {:?} / {:?} wrongly admitted on {}", d, variant, arch));
+                    admitted.push(format!(
+                        "  {:?} / {:?} wrongly admitted on {}",
+                        d, variant, arch
+                    ));
                 }
             }
         }
