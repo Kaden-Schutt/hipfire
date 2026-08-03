@@ -1970,6 +1970,7 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
     let mut request = serde_json::json!({
         "type": "generate",
         "id": "run",
+        "attempt_id": next_attempt_id(),
         "prompt": prompt,
         "max_tokens": max_tokens,
         // `Engine::generate` rejects a request without `attempt_id`
@@ -5252,6 +5253,7 @@ fn finish_sse_stream(sender: mpsc::Sender<ResponseChunk>, result: Result<Complet
                 drop(sender);
                 return;
             }
+            eprintln!("[hipfire] streaming completion failed: {error:#}");
             // Unclean failure: poison the reader instead of framing success/error.
             let _ = sender.send(ResponseChunk {
                 bytes: Vec::new(),
