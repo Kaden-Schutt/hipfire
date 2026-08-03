@@ -135,6 +135,10 @@ fn qwen35_paro_loader_kind(num_experts: usize) -> Qwen35ParoLoaderKind {
 // point may fall back.
 
 /// Route decision from a [`Qwen35FrozenPreflight`] selection.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "variants retain concrete rollback owners until publication"
+)]
 pub(crate) enum Qwen35FrozenRoute {
     /// Frozen allocation authorized by the preflight plan; the plan owns
     /// the source.

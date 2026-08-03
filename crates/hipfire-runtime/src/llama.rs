@@ -6041,21 +6041,6 @@ impl KvTensorStaging {
             let _ = gpu.free_tensor(tensor);
         }
     }
-
-    /// Checked free: returns every GpuTensor whose `free_tensor_checked` failed.
-    /// Caller retains ownership of the returned tensors for retry.
-    fn free_checked(self, gpu: &mut Gpu) -> Vec<GpuTensor> {
-        let mut retained: Vec<GpuTensor> = Vec::new();
-        for tensor in self.tensors.into_iter().rev() {
-            let mut opt = Some(tensor);
-            if let Err(_e) = gpu.free_tensor_checked(&mut opt) {
-                if let Some(t) = opt.take() {
-                    retained.push(t);
-                }
-            }
-        }
-        retained
-    }
 }
 
 fn alloc_kv_with_rotation(
