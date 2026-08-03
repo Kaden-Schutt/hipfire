@@ -406,7 +406,7 @@ impl DeepseekV4 {
         }
         let gate_up_stride = stride_w1 + stride_w3;
 
-        let mut alloc_pool =
+        let alloc_pool =
             |stride: usize, what: &str| -> Result<rdna_compute::GpuTensor, String> {
                 let zeros = vec![0u8; slots * stride];
                 gpu.upload_raw(&zeros, &[slots, stride])
@@ -415,7 +415,7 @@ impl DeepseekV4 {
         let w2_blob = alloc_pool(w2_stride, "w2")?;
         let gate_up_blob = alloc_pool(gate_up_stride, "gate_up")?;
 
-        let mut upload_ptrs = |base: u64,
+        let upload_ptrs = |base: u64,
                                what: &str,
                                gpu: &mut Gpu|
          -> Result<rdna_compute::GpuTensor, String> {
