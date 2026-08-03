@@ -505,26 +505,53 @@ attention bias), pbs must be Some. And a warning worth heeding —
 (7.08 -> 4.51) when the captured region bakes in first-cycle state. That is the
 failure mode to test for.
 
-### Ordered plan
+### MEASURED: verify_block is 90.7% of the window — the draft side is 9.3%
 
-1. **Port DFlash's captured single-chunk verify to DSpark.** Necessary, but +14%
-   on its own does not close a 3.4x gap — so also find why one DS4 verify call
-   costs 121 ms against a 36 ms decode step. A 6-row verify should not cost 3.4
-   single-token steps.
-2. **MQ4 the sidecar.** It is Q8F16 today (`deepseek4-q8-mtp` falls back to
-   Q8F16, quantize main.rs:5082), ~6.0 GB, where DFlash drafts ship MQ4.
-   At ~256 GB/s the measured `dt=14.61ms` ~ 3.7 GB of traffic, so the draft IS
-   weight-bandwidth-bound and halving it should roughly halve `dt`.
-   `deepseek4-mq4lloyd` / `deepseek4-mq3lloyd` already exist. But this only
-   attacks `dt`: at N=5 it saves ~37 ms of a 194 ms window (13.7 -> ~16.9 tok/s),
-   still under AR. Do it AFTER `t_ar`.
-3. **Then revisit block depth.** The Q8 B-curve is flat on gfx1151 out to B=13,
-   so once the window intercept is sane, deep blocks are nearly free and the
-   optimum is bounded by acceptance.
+`HIPFIRE_DSPARK_PROFILE=1` (already in-tree, `dspark_core.rs:10-107`) on the
+production daemon, gfx1151, 0731 MQ2R, 48 tokens / 22 windows:
 
-Note the draft HEAD is not the problem: DSpark binds the trunk head, which under
-MQ2R is qt=35 MFP4G32E8SOA (~4-bit, ~281 MB) — already MQ4-class. The 6.0 GB of
-Q8/F16 draft STAGES are the mass.
+```
+bootstrap (initial-ctx seed capture):    115.35 ms    3.3%   mean=  5.24 ms/window
+draft_block:                             123.99 ms    3.5%   mean=  5.64 ms/window
+run_heads:                                87.24 ms    2.5%   mean=  3.97 ms/window
+verify_block:                           3178.22 ms   90.7%   mean=144.46 ms/window
+rest (accept+commit+etc):                  0.25 ms    0.0%   mean=  0.01 ms/window
+total window time: 3505.04 ms                               mean=159.32 ms/window
+```
+
+This matches the fitted model (`t_ar=120.5ms`, `dt=14.67ms`) and settles the
+plan:
+
+**MQ4-quantizing the sidecar is NOT the lever — retracted.** It targets
+`draft_block`, which is **3.5%** of window time. Even making the ENTIRE draft
+side free (all 9.3%) moves 13.3 -> ~14.7 tok/s, still half of AR's 27.7. The
+earlier reasoning that "dt=14.6ms ~ 3.7GB of traffic so the draft is
+weight-bandwidth-bound" was arithmetically fine but irrelevant: `dt` is the
+MARGINAL cost of one more drafted position, not the draft's share of the window.
+Do not spend a quantization run on this.
+
+**One `verify_block` costs 144 ms against a 36 ms AR decode step — 4x.** That is
+the entire problem. It is a `forward_prefill_batch_chunked` call
+(`spec_impl.rs:253`) over only ~2-3 rows, uncaptured, versus a graph-captured
+`decode_step_with_graph` for AR.
+
+### Ordered plan (revised after measurement)
+
+1. **Attribute the 144 ms verify call.** Run `profile_prefill_deepseek4` (or the
+   in-tree per-kernel profiler) on gfx1151 against a small batch to see where a
+   prefill-shaped forward spends its time versus a decode step. Launch overhead
+   alone is unlikely to explain 144 vs 36 ms — at ~500 uncaptured launches and
+   10-20 us host dispatch that is only 5-10 ms — so the prefill path is probably
+   doing genuinely more work per call (batched compressor GEMMs, grouped MoE,
+   F32->F16 staging) that the decode path avoids at B=1.
+2. **Port DFlash's captured single-chunk verify** (`speculative.rs:2413,2446`,
+   eligibility spec at `:2285-2296`). Reclaims the launch-overhead component;
+   DFlash measured +14% from it. Necessary, not sufficient.
+3. **Then, and only then, revisit block depth.** The Q8 B-curve is flat on
+   gfx1151 out to B=13, so deep blocks are nearly free once the intercept is sane.
+
+NOT on the list any more: MQ4 sidecar (3.5%), draft head quantization (the head
+is already qt=35 MFP4G32E8SOA ~4-bit), VMM (orthogonal).
 
 ## Reproduction
 
