@@ -4,26 +4,79 @@
 
 //! Exactness / raw-parity probe for DeepSeek V4's graph-safe indexer top-K.
 //!
-//! Launches SERIAL (`indexer_top_k_buf`), PARALLEL (`indexer_top_k_buf_parallel`
-//! on gfx1151 / `indexer_top_k_buf_parallel_gfx942` on gfx942) and — on gfx942
-//! only — BOUNDED (`indexer_top_k_buf_parallel_gfx942_bounded`, a bounded
-//! tile-merge bitonic O(N log^2 K) drop-in for the O(N^2) single-workgroup
-//! rank-count kernel) against the SAME frozen score buffer and compares the
-//! ordered 512-slot i32 outputs element-by-element. Finite cases must match the
-//! host oracle and every other arm that ran; non-finite cases must match across
-//! device arms (eligibility filter) but are not asserted against the generic
-//! total_cmp host oracle.
+//! Arms, all launched against the SAME frozen score buffer and compared
+//! slot-for-slot on the ordered 512-slot i32 outputs:
+//!
+//! - SERIAL (`indexer_top_k_buf`) — the original single-workgroup reference,
+//!   with the eligibility discipline (strict `> -FLT_MAX`).
+//! - PARALLEL (arch reference): `indexer_top_k_buf_parallel` on gfx1151,
+//!   `indexer_top_k_buf_parallel_gfx942` on gfx942 — the O(N^2) rank-count on
+//!   one workgroup. NOTE: the gfx1151 reference lacks the eligibility filter
+//!   its gfx942 sibling has, so it FAILS the three non-finite cases today
+//!   (NaN rank-0 collisions leave slots unwritten). That is a known kernel
+//!   bug, attributed per arm below — not a harness defect, and not masked.
+//! - BOUNDED, both arches: `indexer_top_k_buf_bounded.gfx942.hip` (symbol
+//!   `indexer_top_k_buf_parallel_gfx942_bounded`) on gfx942 and
+//!   `indexer_top_k_buf_bounded.gfx1151.hip` on gfx1151 — the bounded
+//!   tile-merge bitonic O(N log^2 K) drop-in for the rank-count kernel. The
+//!   gfx1151 bounded kernel exports the SAME symbol as the gfx1151 reference
+//!   (`indexer_top_k_buf_parallel`) and its header forbids loading both
+//!   implementations under that symbol in one process. `Gpu`'s function cache
+//!   is keyed by symbol (`launch_kernel_blob` resolves
+//!   `functions.get(func_name)`, and `compile_and_load_kernel` early-returns
+//!   on a func_name hit), so a distinct module key alone would silently
+//!   re-launch the reference kernel. This harness therefore textually renames
+//!   the export in its own runtime copy of the source to
+//!   `indexer_top_k_buf_parallel_bounded` under module key
+//!   `indexer_top_k_buf_bounded_gfx1151_harness` (see
+//!   `bounded_gfx1151_spec`); the kernel file itself is untouched, and
+//!   production never sees the rename because `attention.rs` selects exactly
+//!   one gfx1151 variant per process. Like the gfx1151 reference, the gfx1151
+//!   bounded kernel currently lacks the eligibility discipline, so expect it
+//!   to FAIL the non-finite cases pending a kernel fix — again attributed
+//!   per arm, not masked.
+//! - TWOSTAGE, both arches (portable kernel, no arch suffix):
+//!   `kernels/src/indexer_topk_twostage.hip`, a parallel merge tree replacing
+//!   the single-workgroup serial tile loop. Per iteration it is a SEQUENCE,
+//!   not one launch: `indexer_topk_chunk_sort` at grid [n_runs,1,1], then
+//!   ceil(log2(n_runs)) `indexer_topk_merge_round` launches at grid
+//!   [n_pairs,1,1] with run_step = 1<<r and n_pairs = ceil(n_runs /
+//!   (2*run_step)), then `indexer_topk_finalize` at grid [1,1,1]; all block
+//!   [256,1,1], dynamic LDS 0. n_runs = ceil(pad_n/512) derives from the case
+//!   PAD, never the live n — the host's graph-safety contract (launch count
+//!   fixed by max_compressed). Two scratch workspaces of pad_n elements each
+//!   (ws_scores F32, ws_indices i32) carry the sorted runs between launches.
+//!   TWOSTAGE carries the eligibility discipline by contract.
+//!
+//! Finite cases must match the host oracle and every other arm that ran;
+//! non-finite cases assert per-arm agreement with the eligibility-disciplined
+//! reference (SERIAL, which runs on every non-finite case) but are not
+//! asserted against the generic total_cmp host oracle. Verdicts are per arm
+//! per case (VERDICT lines plus the ARM_TALLY summary), so a known-bad arm
+//! cannot mask a genuinely good one; OVERALL stays strict and attributes
+//! failures.
 //!
 //! Large-N cases (8192 / 32768 / 262144 — the last is 1M context at compressor
 //! ratio 4, the campaign target) skip SERIAL per-case: its dynamic LDS is a
 //! one-byte taken-bitmap per candidate (`smem_fn = max_n` bytes), which exceeds
 //! the 64 KiB LDS limit above N=65536 and is wildly over-occupancy well before
-//! that. Those cases compare BOUNDED_GFX942 against PARALLEL_GFX942 and the
-//! host oracle only, and exist to make the O(N^2) vs O(N log^2 K) gap
-//! measurable in seconds here instead of hours on the full 82 GB model
-//! campaign. Every arm reports warmup + timed-batch wall time (Instant +
+//! that. Those cases compare BOUNDED + TWOSTAGE against PARALLEL and the host
+//! oracle only, and exist to make the O(N^2) vs O(N log^2 K) gap measurable in
+//! seconds here instead of hours on the full 82 GB model campaign.
+//!
+//! Crossover sweep (N = 1024 / 2048 / 4096, exact-size pads, splitmix64
+//! scores): the host selects two-stage only above a max_compressed threshold
+//! (default 8192) and that threshold should be measured, not guessed. These
+//! cases bracket it so the TWOSTAGE-vs-BOUNDED ratio crosses 1.0x in-view: at
+//! small run counts the tree is launch-overhead bound, at large G pass bound
+//! — only the per-stage breakdown (chunk-sort / merge-rounds / finalize,
+//! printed per case) distinguishes those.
+//!
+//! Every arm reports warmup + timed-batch wall time (Instant +
 //! device_synchronize host timing, the same idiom as the other rdna-compute
-//! examples) in ms/launch, plus the BOUNDED-vs-PARALLEL_GFX942 speedup ratio.
+//! examples) in ms/launch — for TWOSTAGE that is the wall time of the WHOLE
+//! 1+R+1 launch sequence per iteration, which is what the model pays — plus
+//! the BOUNDED-vs-reference and TWOSTAGE-vs-BOUNDED speedup ratios.
 //!
 //! Run on the target GPU (MI300X / gfx942 or gfx1151):
 //!   cargo run --release -p rdna-compute --example test_indexer_top_k_buf
@@ -51,13 +104,25 @@ const PARALLEL_GFX942_SRC: &str =
     include_str!("../../../kernels/src/indexer_top_k_buf_parallel.gfx942.hip");
 const PARALLEL_GFX942_BOUNDED_SRC: &str =
     include_str!("../../../kernels/src/indexer_top_k_buf_bounded.gfx942.hip");
+const PARALLEL_GFX1151_BOUNDED_SRC: &str =
+    include_str!("../../../kernels/src/indexer_top_k_buf_bounded.gfx1151.hip");
+const TWOSTAGE_SRC: &str = include_str!("../../../kernels/src/indexer_topk_twostage.hip");
 const SERIAL_MODULE: &str = "indexer_top_k_buf";
 const SERIAL_SYMBOL: &str = "indexer_top_k_buf";
 const SERIAL_BLOCK: [u32; 3] = [128, 1, 1];
 const PARALLEL_BLOCK: [u32; 3] = [256, 1, 1];
+/// TWOSTAGE: one portable module (no arch suffix), three symbols launched as
+/// a 1+R+1 sequence. Run width MUST match `TOPK_RUN` in the kernel.
+const TWOSTAGE_MODULE: &str = "indexer_topk_twostage";
+const TWOSTAGE_CHUNK_SORT: &str = "indexer_topk_chunk_sort";
+const TWOSTAGE_MERGE_ROUND: &str = "indexer_topk_merge_round";
+const TWOSTAGE_FINALIZE: &str = "indexer_topk_finalize";
+const TWOSTAGE_LABEL: &str = "TWOSTAGE";
+const TOPK_RUN: usize = 512;
 const SERIAL_POISON: i32 = -7777;
 const PARALLEL_POISON: i32 = -8888;
 const BOUNDED_POISON: i32 = -9999;
+const TWOSTAGE_POISON: i32 = -6666;
 
 // ─── minimal SHA-256 (no extra crate dep; example-only) ──────────────────────
 
@@ -219,7 +284,9 @@ fn expected_top_k(scores: &[f32], n: usize) -> Vec<i32> {
 struct KernelSpec {
     label: &'static str,
     module: &'static str,
-    source: &'static str,
+    /// Cow because BOUNDED_GFX1151's source is a runtime-renamed copy (see
+    /// `bounded_gfx1151_spec`); every other arm is a borrowed include_str!.
+    source: std::borrow::Cow<'static, str>,
     symbol: &'static str,
     block: [u32; 3],
     /// Dynamic LDS bytes. SERIAL uses max_n_compressed (taken bitmap);
@@ -230,7 +297,7 @@ struct KernelSpec {
 const SERIAL: KernelSpec = KernelSpec {
     label: "SERIAL",
     module: SERIAL_MODULE,
-    source: SERIAL_SRC,
+    source: std::borrow::Cow::Borrowed(SERIAL_SRC),
     symbol: SERIAL_SYMBOL,
     block: SERIAL_BLOCK,
     smem_fn: |max_n| max_n as u32,
@@ -239,7 +306,7 @@ const SERIAL: KernelSpec = KernelSpec {
 const PARALLEL_GFX1151: KernelSpec = KernelSpec {
     label: "PARALLEL",
     module: "indexer_top_k_buf_parallel",
-    source: PARALLEL_GFX1151_SRC,
+    source: std::borrow::Cow::Borrowed(PARALLEL_GFX1151_SRC),
     symbol: "indexer_top_k_buf_parallel",
     block: PARALLEL_BLOCK,
     smem_fn: |_| 0,
@@ -248,7 +315,7 @@ const PARALLEL_GFX1151: KernelSpec = KernelSpec {
 const PARALLEL_GFX942: KernelSpec = KernelSpec {
     label: "PARALLEL_GFX942",
     module: "indexer_top_k_buf_parallel_gfx942",
-    source: PARALLEL_GFX942_SRC,
+    source: std::borrow::Cow::Borrowed(PARALLEL_GFX942_SRC),
     symbol: "indexer_top_k_buf_parallel_gfx942",
     block: PARALLEL_BLOCK,
     smem_fn: |_| 0,
@@ -257,7 +324,7 @@ const PARALLEL_GFX942: KernelSpec = KernelSpec {
 const PARALLEL_GFX942_BOUNDED: KernelSpec = KernelSpec {
     label: "BOUNDED_GFX942",
     module: "indexer_top_k_buf_parallel_gfx942_bounded",
-    source: PARALLEL_GFX942_BOUNDED_SRC,
+    source: std::borrow::Cow::Borrowed(PARALLEL_GFX942_BOUNDED_SRC),
     symbol: "indexer_top_k_buf_parallel_gfx942_bounded",
     block: PARALLEL_BLOCK,
     smem_fn: |_| 0,
@@ -271,23 +338,64 @@ fn parallel_spec(arch: &str) -> &'static KernelSpec {
     }
 }
 
-/// Optional third comparison arm: the bounded tile-merge bitonic top-K exists
-/// for gfx942 only; on gfx1151 it is neither compiled nor launched.
-fn bounded_spec(arch: &str) -> Option<&'static KernelSpec> {
+/// Bounded comparison arm, now on BOTH arches: the gfx942 twin exports its
+/// own symbol; the gfx1151 twin exports `indexer_top_k_buf_parallel`,
+/// identical to the gfx1151 reference, and its header forbids loading both
+/// implementations under that symbol in one process.
+///
+/// `compile_and_load_kernel` keys `functions` by func_name and early-returns
+/// on a hit, and `launch_kernel_blob` resolves by the same key — so a
+/// distinct module name alone is NOT enough: the second ensure would no-op
+/// and the "bounded" arm would silently re-launch the reference kernel. The
+/// harness therefore renames the export inside its own runtime copy of the
+/// source (see `bounded_gfx1151_spec`); the kernel file itself is untouched.
+fn bounded_spec(arch: &str) -> Option<KernelSpec> {
     match arch {
-        "gfx942" => Some(&PARALLEL_GFX942_BOUNDED),
+        "gfx942" => Some(PARALLEL_GFX942_BOUNDED),
+        "gfx1151" => Some(bounded_gfx1151_spec()),
         _ => None,
     }
 }
 
+/// gfx1151 bounded arm with the export renamed so the reference and bounded
+/// implementations coexist in one process under distinct `functions` keys.
+/// The rename is a whole-identifier textual substitution in THIS EXAMPLE's
+/// copy of the source — the file has exactly two occurrences of the symbol
+/// (the header comment and the `extern "C"` definition), both renamed
+/// consistently. Production is unaffected: `attention.rs` selects exactly one
+/// gfx1151 variant per process, precisely so it never hits this collision.
+fn bounded_gfx1151_spec() -> KernelSpec {
+    const REF_SYMBOL: &str = "indexer_top_k_buf_parallel";
+    const RENAMED_SYMBOL: &str = "indexer_top_k_buf_parallel_bounded";
+    assert!(
+        PARALLEL_GFX1151_BOUNDED_SRC.contains("void indexer_top_k_buf_parallel("),
+        "gfx1151 bounded kernel no longer exports {REF_SYMBOL}; re-audit the harness rename"
+    );
+    let renamed = PARALLEL_GFX1151_BOUNDED_SRC.replace(REF_SYMBOL, RENAMED_SYMBOL);
+    KernelSpec {
+        label: "BOUNDED_GFX1151",
+        module: "indexer_top_k_buf_bounded_gfx1151_harness",
+        source: std::borrow::Cow::Owned(renamed),
+        symbol: RENAMED_SYMBOL,
+        block: PARALLEL_BLOCK,
+        smem_fn: |_| 0,
+    }
+}
+
 fn ensure_kernels(gpu: &mut Gpu, parallel: &KernelSpec, bounded: Option<&KernelSpec>) {
-    gpu.ensure_kernel_public(SERIAL.module, SERIAL.source, SERIAL.symbol)
+    gpu.ensure_kernel_public(SERIAL.module, &SERIAL.source, SERIAL.symbol)
         .expect("compile SERIAL indexer_top_k_buf");
-    gpu.ensure_kernel_public(parallel.module, parallel.source, parallel.symbol)
+    gpu.ensure_kernel_public(parallel.module, &parallel.source, parallel.symbol)
         .expect("compile PARALLEL indexer_top_k_buf_parallel");
     if let Some(bounded) = bounded {
-        gpu.ensure_kernel_public(bounded.module, bounded.source, bounded.symbol)
-            .expect("compile BOUNDED indexer_top_k_buf_parallel_gfx942_bounded");
+        gpu.ensure_kernel_public(bounded.module, &bounded.source, bounded.symbol)
+            .expect("compile BOUNDED indexer top-K");
+    }
+    // TWOSTAGE: three symbols from one portable module; the first ensure
+    // compiles the module, the rest hit the compiler/module caches.
+    for symbol in [TWOSTAGE_CHUNK_SORT, TWOSTAGE_MERGE_ROUND, TWOSTAGE_FINALIZE] {
+        gpu.ensure_kernel_public(TWOSTAGE_MODULE, TWOSTAGE_SRC, symbol)
+            .expect("compile TWOSTAGE indexer_topk_twostage");
     }
 }
 
@@ -320,6 +428,188 @@ fn launch_one(
     kb.pad_to(16);
     gpu.launch_kernel_blob(spec.symbol, grid, spec.block, smem, kb.as_mut_slice())
         .unwrap_or_else(|e| panic!("launch {} failed: {e:?}", spec.label));
+}
+
+// ─── arms: single-launch kernels and the TWOSTAGE sequence ──────────────────
+
+/// One comparison arm. `Single` is a one-launch kernel described by a
+/// KernelSpec; `TwoStage` is the portable 1+R+1 launch merge-tree sequence
+/// with its own pad_n-element workspaces (see `launch_twostage`).
+#[derive(Clone, Copy)]
+enum Arm<'a> {
+    Single(&'a KernelSpec),
+    TwoStage,
+}
+
+impl Arm<'_> {
+    fn label(self) -> &'static str {
+        match self {
+            Arm::Single(spec) => spec.label,
+            Arm::TwoStage => TWOSTAGE_LABEL,
+        }
+    }
+}
+
+/// Per-case device state shared by every arm launch. `ws_scores`/`ws_indices`
+/// are the TWOSTAGE workspaces: one sorted TOPK_RUN-run per chunk, pad_n
+/// elements each, zero-filled for determinism (the kernels overwrite what
+/// they use).
+struct LaunchCtx<'a> {
+    scores: &'a GpuTensor,
+    n_buf: &'a GpuTensor,
+    k_buf: &'a GpuTensor,
+    ws_scores: &'a GpuTensor,
+    ws_indices: &'a GpuTensor,
+    pad_n: usize,
+    max_k: i32,
+}
+
+fn launch_arm(gpu: &Gpu, arm: Arm, ctx: &LaunchCtx, out: &GpuTensor, log: bool) {
+    match arm {
+        Arm::Single(spec) => launch_one(
+            gpu,
+            spec,
+            ctx.scores,
+            out,
+            ctx.n_buf,
+            ctx.k_buf,
+            ctx.pad_n as i32,
+            ctx.max_k,
+            log,
+        ),
+        Arm::TwoStage => launch_twostage(gpu, ctx, out, log),
+    }
+}
+
+/// Grid/launch-count plan for the two-stage tree: (n_runs, merge rounds).
+/// n_runs derives from the case PAD (the graph-fixed max_compressed), never
+/// the live n; rounds is ceil(log2(n_runs)); total launches per iteration is
+/// 1 + rounds + 1.
+fn twostage_plan(pad_n: usize) -> (u32, u32) {
+    let n_runs = pad_n.div_ceil(TOPK_RUN) as u32;
+    let mut rounds = 0u32;
+    while (1u64 << rounds) < n_runs as u64 {
+        rounds += 1;
+    }
+    (n_runs, rounds)
+}
+
+fn twostage_chunk_sort(gpu: &Gpu, ctx: &LaunchCtx, n_runs: u32, log: bool) {
+    if log {
+        eprintln!(
+            "  LAUNCH TWOSTAGE symbol={} grid=[{n_runs},1,1] block={:?} dynamic_lds=0",
+            TWOSTAGE_CHUNK_SORT, PARALLEL_BLOCK
+        );
+    }
+    let mut kb = KernargBlob::new();
+    kb.push_ptr(ctx.scores.buf.as_ptr() as *const c_void);
+    kb.push_ptr(ctx.ws_scores.buf.as_ptr() as *const c_void);
+    kb.push_ptr(ctx.ws_indices.buf.as_ptr() as *const c_void);
+    kb.push_ptr(ctx.n_buf.buf.as_ptr() as *const c_void);
+    kb.push_i32(n_runs as i32);
+    kb.pad_to(16);
+    gpu.launch_kernel_blob(
+        TWOSTAGE_CHUNK_SORT,
+        [n_runs, 1, 1],
+        PARALLEL_BLOCK,
+        0,
+        kb.as_mut_slice(),
+    )
+    .expect("launch TWOSTAGE chunk_sort failed");
+}
+
+fn twostage_merge_round(
+    gpu: &Gpu,
+    ctx: &LaunchCtx,
+    n_runs: u32,
+    run_step: u32,
+    n_pairs: u32,
+    log: bool,
+) {
+    if log {
+        eprintln!(
+            "  LAUNCH TWOSTAGE symbol={} grid=[{n_pairs},1,1] block={:?} dynamic_lds=0 run_step={run_step}",
+            TWOSTAGE_MERGE_ROUND, PARALLEL_BLOCK
+        );
+    }
+    let mut kb = KernargBlob::new();
+    kb.push_ptr(ctx.ws_scores.buf.as_ptr() as *const c_void);
+    kb.push_ptr(ctx.ws_indices.buf.as_ptr() as *const c_void);
+    kb.push_i32(n_runs as i32);
+    kb.push_i32(run_step as i32);
+    kb.push_i32(n_pairs as i32);
+    kb.pad_to(16);
+    gpu.launch_kernel_blob(
+        TWOSTAGE_MERGE_ROUND,
+        [n_pairs, 1, 1],
+        PARALLEL_BLOCK,
+        0,
+        kb.as_mut_slice(),
+    )
+    .expect("launch TWOSTAGE merge_round failed");
+}
+
+fn twostage_finalize(gpu: &Gpu, ctx: &LaunchCtx, out: &GpuTensor, log: bool) {
+    if log {
+        eprintln!(
+            "  LAUNCH TWOSTAGE symbol={} grid=[1,1,1] block={:?} dynamic_lds=0",
+            TWOSTAGE_FINALIZE, PARALLEL_BLOCK
+        );
+    }
+    let mut kb = KernargBlob::new();
+    kb.push_ptr(ctx.ws_scores.buf.as_ptr() as *const c_void);
+    kb.push_ptr(ctx.ws_indices.buf.as_ptr() as *const c_void);
+    kb.push_ptr(out.buf.as_ptr() as *const c_void);
+    kb.push_ptr(ctx.n_buf.buf.as_ptr() as *const c_void);
+    kb.push_ptr(ctx.k_buf.buf.as_ptr() as *const c_void);
+    kb.push_i32(ctx.max_k);
+    kb.pad_to(16);
+    gpu.launch_kernel_blob(TWOSTAGE_FINALIZE, [1, 1, 1], PARALLEL_BLOCK, 0, kb.as_mut_slice())
+        .expect("launch TWOSTAGE finalize failed");
+}
+
+/// The full two-stage sequence: chunk-sort, ceil(log2(n_runs)) merge rounds
+/// with run_step = 1<<r and n_pairs = ceil(n_runs / (2*run_step)), finalize.
+/// Each timed iteration pays all 1+R+1 launches — that is what the model pays.
+fn launch_twostage(gpu: &Gpu, ctx: &LaunchCtx, out: &GpuTensor, log: bool) {
+    let (n_runs, _) = twostage_plan(ctx.pad_n);
+    twostage_chunk_sort(gpu, ctx, n_runs, log);
+    let mut run_step = 1u32;
+    while run_step < n_runs {
+        let n_pairs = n_runs.div_ceil(2 * run_step);
+        twostage_merge_round(gpu, ctx, n_runs, run_step, n_pairs, log);
+        run_step *= 2;
+    }
+    twostage_finalize(gpu, ctx, out, log);
+}
+
+/// One instrumented sequence with a device_synchronize between stages,
+/// returning (chunk_sort, merge_rounds_total, finalize) ms. The sync
+/// boundaries serialise launches the pipelined sequence would overlap, so
+/// these numbers ATTRIBUTE cost (launch-overhead bound at small G vs pass
+/// bound at large G) rather than price the sequence — ms_per_launch is the
+/// price.
+fn launch_twostage_timed(gpu: &Gpu, ctx: &LaunchCtx, out: &GpuTensor) -> (f64, f64, f64) {
+    let (n_runs, _) = twostage_plan(ctx.pad_n);
+    let t = std::time::Instant::now();
+    twostage_chunk_sort(gpu, ctx, n_runs, false);
+    gpu.hip.device_synchronize().expect("sync after chunk_sort");
+    let chunk_ms = t.elapsed().as_secs_f64() * 1e3;
+
+    let t = std::time::Instant::now();
+    let mut run_step = 1u32;
+    while run_step < n_runs {
+        let n_pairs = n_runs.div_ceil(2 * run_step);
+        twostage_merge_round(gpu, ctx, n_runs, run_step, n_pairs, false);
+        run_step *= 2;
+    }
+    gpu.hip.device_synchronize().expect("sync after merge rounds");
+    let merge_ms = t.elapsed().as_secs_f64() * 1e3;
+
+    let t = std::time::Instant::now();
+    twostage_finalize(gpu, ctx, out, false);
+    gpu.hip.device_synchronize().expect("sync after finalize");
+    (chunk_ms, merge_ms, t.elapsed().as_secs_f64() * 1e3)
 }
 
 // ─── score builders ──────────────────────────────────────────────────────────
@@ -439,6 +729,30 @@ fn build_cases() -> Vec<Case> {
         });
     }
 
+    // Crossover sweep: the host selects two-stage only above a max_compressed
+    // threshold (HIPFIRE_DEEPSEEK4_INDEXER_TOPK_TWOSTAGE_MIN, default 8192)
+    // and that threshold should be measured, not guessed. These cases bracket
+    // it so the TWOSTAGE-vs-BOUNDED ratio crosses 1.0x in-view: at n_runs
+    // 2/4/8 the tree's extra launches may not pay for themselves against one
+    // bounded launch. pad_n == n mirrors the production graph contract
+    // (n_runs from max_compressed, never the live n); scores use the same
+    // splitmix64 distribution as the large-N cases so the sweep is uniform.
+    for &n in &[1024usize, 2048, 4096] {
+        cases.push(Case {
+            name: match n {
+                1024 => "finite_n1024_sweep",
+                2048 => "finite_n2048_sweep",
+                4096 => "finite_n4096_sweep",
+                _ => unreachable!(),
+            },
+            n,
+            kind: CaseKind::Finite,
+            pad_n: n,
+            run_serial: true,
+            scores: finite_large_scores(n),
+        });
+    }
+
     // Large-N finite cases — the bounded kernel's reason to exist. SERIAL is
     // skipped per-case (see Case::run_serial); BOUNDED_GFX942 is compared
     // against PARALLEL_GFX942 and the host oracle, slot-for-slot. N=262144 is
@@ -538,6 +852,10 @@ struct ArmSummary {
     label: &'static str,
     vs_ref: &'static str,
     vs_oracle: &'static str,
+    /// Per-arm per-case verdict: finite = byte-identical to the host oracle;
+    /// non-finite = byte-identical to the eligibility reference (SERIAL).
+    /// Either way requires zero unwritten slots and zero duplicates.
+    verdict: &'static str,
     unwritten: usize,
     duplicates: usize,
     ms_per_launch: f64,
@@ -552,6 +870,10 @@ struct CaseResult {
     same_set: bool,
     arms: Vec<ArmSummary>,
     speedup_bounded_vs_parallel: Option<f64>,
+    speedup_twostage_vs_bounded: Option<f64>,
+    /// (chunk_sort, merge_rounds_total, finalize) ms from the instrumented
+    /// pass; None only if TWOSTAGE somehow did not run.
+    twostage_stage_ms: Option<(f64, f64, f64)>,
     accept_fail: bool,
 }
 
@@ -616,19 +938,21 @@ fn run_case(
     assert!(n <= pad_n && pad_n <= MAX_N);
     let finite = matches!(case.kind, CaseKind::Finite);
 
-    // Arms for this case: SERIAL (unless skipped per-case), the arch PARALLEL,
-    // and BOUNDED_GFX942 when present (gfx942 only; never compiled on gfx1151).
-    let mut arms: Vec<(&KernelSpec, i32)> = Vec::new();
+    // Arms for this case: SERIAL (unless skipped per-case), the arch
+    // PARALLEL reference, BOUNDED (both arches), and TWOSTAGE (portable;
+    // always runs, on every case size including the identity path).
+    let mut arms: Vec<(Arm, i32)> = Vec::new();
     if case.run_serial {
-        arms.push((&SERIAL, SERIAL_POISON));
+        arms.push((Arm::Single(&SERIAL), SERIAL_POISON));
     }
-    arms.push((parallel, PARALLEL_POISON));
+    arms.push((Arm::Single(parallel), PARALLEL_POISON));
     if let Some(b) = bounded {
-        arms.push((b, BOUNDED_POISON));
+        arms.push((Arm::Single(b), BOUNDED_POISON));
     }
+    arms.push((Arm::TwoStage, TWOSTAGE_POISON));
     let arms_ran = arms
         .iter()
-        .map(|(spec, _)| spec.label)
+        .map(|(arm, _)| arm.label())
         .collect::<Vec<_>>()
         .join("+");
 
@@ -646,14 +970,29 @@ fn run_case(
         .expect("upload scores");
     let n_gpu = upload_i32(gpu, &[n as i32]);
     let k_gpu = upload_i32(gpu, &[K as i32]);
+    // TWOSTAGE workspaces: one sorted TOPK_RUN-run per chunk, pad_n elements
+    // each, zero-filled for determinism (the kernels overwrite what they use).
+    let ws_scores = gpu
+        .upload_f32(&vec![0.0f32; pad_n], &[pad_n])
+        .expect("upload ws_scores");
+    let ws_indices = upload_i32(gpu, &vec![0i32; pad_n]);
+    let ctx = LaunchCtx {
+        scores: &scores_gpu,
+        n_buf: &n_gpu,
+        k_buf: &k_gpu,
+        ws_scores: &ws_scores,
+        ws_indices: &ws_indices,
+        pad_n,
+        max_k: K as i32,
+    };
 
     // One independently poisoned output buffer per arm; launch every arm from
     // the same frozen input.
     let mut out_bufs = Vec::with_capacity(arms.len());
-    for (spec, poison) in &arms {
+    for (arm, poison) in &arms {
         let poison_host = vec![*poison; K];
         let out = upload_i32(gpu, &poison_host);
-        launch_one(gpu, spec, &scores_gpu, &out, &n_gpu, &k_gpu, pad_n as i32, K as i32, true);
+        launch_arm(gpu, *arm, &ctx, &out, true);
         out_bufs.push(out);
     }
     gpu.hip
@@ -672,23 +1011,60 @@ fn run_case(
     // exactness results above are already downloaded.
     let (warmup, iters) = timing_plan(n);
     let mut ms_per_launch = Vec::with_capacity(arms.len());
-    for (i, (spec, _)) in arms.iter().enumerate() {
+    for (i, (arm, _)) in arms.iter().enumerate() {
         for _ in 0..warmup {
-            launch_one(gpu, spec, &scores_gpu, &out_bufs[i], &n_gpu, &k_gpu, pad_n as i32, K as i32, false);
+            launch_arm(gpu, *arm, &ctx, &out_bufs[i], false);
         }
         gpu.hip.device_synchronize().expect("sync after warmup");
         let t = std::time::Instant::now();
         for _ in 0..iters {
-            launch_one(gpu, spec, &scores_gpu, &out_bufs[i], &n_gpu, &k_gpu, pad_n as i32, K as i32, false);
+            launch_arm(gpu, *arm, &ctx, &out_bufs[i], false);
         }
         gpu.hip.device_synchronize().expect("sync after timed batch");
         let ms = t.elapsed().as_secs_f64() * 1e3 / iters as f64;
         ms_per_launch.push(ms);
         eprintln!(
             "  timing arm={} warmup={} iters={} ms_per_launch={:.3}",
-            spec.label, warmup, iters, ms
+            arm.label(), warmup, iters, ms
         );
     }
+
+    // TWOSTAGE attribution: report the merge-tree shape (launch count derives
+    // ONLY from pad_n — the graph-safety contract), then an instrumented pass
+    // timing each stage with a device_synchronize boundary. The syncs
+    // serialise launches the pipelined sequence would overlap, so per-stage
+    // numbers attribute cost (launch-overhead bound at small G vs pass bound
+    // at large G) rather than price the sequence; ms_per_launch is the price.
+    let (n_runs, rounds) = twostage_plan(pad_n);
+    eprintln!(
+        "  twostage_plan pad_n={pad_n} n_runs={n_runs} merge_rounds={rounds} launches_per_iter={}",
+        2 + rounds
+    );
+    let twostage_stage_ms = arms
+        .iter()
+        .position(|(arm, _)| matches!(arm, Arm::TwoStage))
+        .map(|i| {
+            for _ in 0..warmup {
+                launch_twostage(gpu, &ctx, &out_bufs[i], false);
+            }
+            gpu.hip
+                .device_synchronize()
+                .expect("sync after twostage stage warmup");
+            let mut acc = (0.0f64, 0.0f64, 0.0f64);
+            for _ in 0..iters {
+                let (c, m, f) = launch_twostage_timed(gpu, &ctx, &out_bufs[i]);
+                acc.0 += c;
+                acc.1 += m;
+                acc.2 += f;
+            }
+            let d = iters as f64;
+            let stage_ms = (acc.0 / d, acc.1 / d, acc.2 / d);
+            eprintln!(
+                "  twostage_stage_ms chunk_sort={:.3} merge_rounds={:.3} finalize={:.3}",
+                stage_ms.0, stage_ms.1, stage_ms.2
+            );
+            stage_ms
+        });
 
     let stats: Vec<SlotStats> = arms
         .iter()
@@ -708,7 +1084,8 @@ fn run_case(
         if let Some((r, a, b)) = first_diff(reference, out) {
             eprintln!(
                 "  first_diff_rank={r} {}={a} {}={b}",
-                arms[0].0.label, arms[i].0.label
+                arms[0].0.label(),
+                arms[i].0.label()
             );
             first_diff_rank = format!("{r}");
             // Print a short window around the first mismatch for operator grepping.
@@ -718,7 +1095,11 @@ fn run_case(
             for rank in lo..hi {
                 eprintln!(
                     "    rank={rank} {}={} {}={} oracle={}",
-                    arms[0].0.label, reference[rank], arms[i].0.label, out[rank], oracle[rank]
+                    arms[0].0.label(),
+                    reference[rank],
+                    arms[i].0.label(),
+                    out[rank],
+                    oracle[rank]
                 );
             }
             break;
@@ -745,10 +1126,20 @@ fn run_case(
         n_diffs
     );
 
+    // Per-arm verdicts, so a known-bad arm (today: both gfx1151 incumbent
+    // kernels on the non-finite cases — they lack the eligibility filter) is
+    // attributed by name and cannot mask an arm that genuinely passes.
+    // - Finite: PASS iff byte-identical to the host oracle, no poison, no
+    //   dups. (Every arm matching the oracle implies mutual ordered
+    //   equality, so this subsumes the old arms-equal check.)
+    // - Non-finite: PASS iff byte-identical to the eligibility-disciplined
+    //   reference (outs[0] == SERIAL, which runs on every non-finite case),
+    //   no poison, no dups. The host oracle stays a generic total_cmp sort
+    //   and may DIFFER; reported only.
     let mut arm_summaries = Vec::with_capacity(arms.len());
-    for (i, ((spec, _), out)) in arms.iter().zip(outs.iter()).enumerate() {
+    for (i, ((arm, _), out)) in arms.iter().zip(outs.iter()).enumerate() {
         let st = stats[i];
-        let label = spec.label.to_lowercase();
+        let label = arm.label().to_lowercase();
         let vs_ref = if i == 0 {
             "REF"
         } else if out == reference {
@@ -767,10 +1158,14 @@ fn run_case(
             ascending_set_hash(out)
         );
         eprintln!("  {label}_vs_ref={vs_ref} {label}_vs_oracle={vs_oracle}");
+        let verdict_ok = st.poison == 0
+            && st.duplicates == 0
+            && if finite { *out == oracle } else { out == reference };
         arm_summaries.push(ArmSummary {
-            label: spec.label,
+            label: arm.label(),
             vs_ref,
             vs_oracle,
+            verdict: if verdict_ok { "PASS" } else { "FAIL" },
             unwritten: st.poison,
             duplicates: st.duplicates,
             ms_per_launch: ms_per_launch[i],
@@ -780,77 +1175,78 @@ fn run_case(
 
     // Characterise non-finite pads specifically.
     if !finite {
-        for (i, (spec, _)) in arms.iter().enumerate() {
+        for (i, (arm, _)) in arms.iter().enumerate() {
             let st = stats[i];
             eprintln!(
                 "  nonfinite_detail: {}(-1={}, real={}, poison={})",
-                spec.label, st.pad_neg1, st.real, st.poison
+                arm.label(), st.pad_neg1, st.real, st.poison
             );
         }
     }
 
-    // Acceptance:
-    // - Finite: every arm == oracle and == every peer arm, no poison/dups.
-    // - Non-finite: arms agree with each other (eligibility filter), no
-    //   poison/dups. Host oracle stays a generic total_cmp sort and may
-    //   DIFFER; report only.
-    let accept_fail = {
-        let mut bad = false;
-        if !ordered_eq {
-            eprintln!("  ACCEPT_FAIL: arms differ in ORDER ({arms_ran})");
-            bad = true;
-        }
-        for (i, (spec, _)) in arms.iter().enumerate() {
-            if stats[i].poison != 0 {
-                eprintln!(
-                    "  ACCEPT_FAIL: poisoned/unwritten slots remain ({}={})",
-                    spec.label, stats[i].poison
-                );
-                bad = true;
-            }
-            if stats[i].duplicates != 0 {
-                eprintln!(
-                    "  ACCEPT_FAIL: duplicate indices ({}={})",
-                    spec.label, stats[i].duplicates
-                );
-                bad = true;
-            }
-        }
-        if finite {
-            for ((spec, _), out) in arms.iter().zip(outs.iter()) {
-                if *out != oracle {
-                    eprintln!("  ACCEPT_FAIL: {} != host oracle", spec.label);
-                    bad = true;
-                }
-            }
-        }
-        if !bad {
+    let mut accept_fail = false;
+    for a in &arm_summaries {
+        eprintln!("  VERDICT case={} arm={} {}", case.name, a.label, a.verdict);
+        if a.verdict == "FAIL" {
+            accept_fail = true;
             if finite {
-                eprintln!("  ACCEPT: PASS (finite case byte-identical to oracle and peer arms)");
-            } else {
-                eprintln!("  ACCEPT: PASS (non-finite arms agree; oracle reported only)");
-            }
-        }
-        bad
-    };
-
-    // The point of the large-N cases: O(N log^2 K) vs O(N^2), in ms/launch.
-    let speedup_bounded_vs_parallel = {
-        let p = arms.iter().position(|(s, _)| s.label == "PARALLEL_GFX942");
-        let b = arms.iter().position(|(s, _)| s.label == "BOUNDED_GFX942");
-        match (p, b) {
-            (Some(p), Some(b)) if ms_per_launch[b] > 0.0 => {
-                let ratio = ms_per_launch[p] / ms_per_launch[b];
                 eprintln!(
-                    "  speedup BOUNDED_GFX942 vs PARALLEL_GFX942: {ratio:.2}x \
-                     ({:.3} ms -> {:.3} ms)",
-                    ms_per_launch[p], ms_per_launch[b]
+                    "  ACCEPT_FAIL detail: {} (vs_oracle={} unwritten={} dups={})",
+                    a.label, a.vs_oracle, a.unwritten, a.duplicates
                 );
-                Some(ratio)
+            } else {
+                eprintln!(
+                    "  ACCEPT_FAIL detail: {} disagrees with the eligibility reference or left \
+                     slots unwritten (vs_ref={} unwritten={} dups={})",
+                    a.label, a.vs_ref, a.unwritten, a.duplicates
+                );
             }
-            _ => None,
         }
+    }
+    if !accept_fail {
+        if finite {
+            eprintln!("  ACCEPT: PASS (finite case byte-identical to oracle for every arm)");
+        } else {
+            eprintln!(
+                "  ACCEPT: PASS (all arms agree with the eligibility reference; oracle reported only)"
+            );
+        }
+    }
+
+    // The point of the large-N and sweep cases: the O(N log^2 K) tree vs the
+    // bounded single-workgroup loop vs the O(N^2) rank-count, in ms/launch.
+    let pos = |label: &str| arms.iter().position(|(a, _)| a.label() == label);
+    let ratio = |num: Option<usize>, den: Option<usize>| match (num, den) {
+        (Some(num), Some(den)) if ms_per_launch[den] > 0.0 => {
+            Some(ms_per_launch[num] / ms_per_launch[den])
+        }
+        _ => None,
     };
+    let speedup_bounded_vs_parallel = bounded.and_then(|b| {
+        let r = ratio(pos(parallel.label), pos(b.label));
+        if let Some(r) = r {
+            eprintln!(
+                "  speedup {} vs {}: {r:.2}x ({:.3} ms -> {:.3} ms)",
+                b.label,
+                parallel.label,
+                ms_per_launch[pos(parallel.label).unwrap()],
+                ms_per_launch[pos(b.label).unwrap()]
+            );
+        }
+        r
+    });
+    let speedup_twostage_vs_bounded = bounded.and_then(|b| {
+        let r = ratio(pos(b.label), pos(TWOSTAGE_LABEL));
+        if let Some(r) = r {
+            eprintln!(
+                "  speedup TWOSTAGE vs {}: {r:.2}x ({:.3} ms -> {:.3} ms)",
+                b.label,
+                ms_per_launch[pos(b.label).unwrap()],
+                ms_per_launch[pos(TWOSTAGE_LABEL).unwrap()]
+            );
+        }
+        r
+    });
 
     CaseResult {
         name: case.name.to_string(),
@@ -861,6 +1257,8 @@ fn run_case(
         same_set: set_eq,
         arms: arm_summaries,
         speedup_bounded_vs_parallel,
+        speedup_twostage_vs_bounded,
+        twostage_stage_ms,
         accept_fail,
     }
 }
@@ -879,28 +1277,34 @@ fn main() {
 
     let parallel = parallel_spec(arch);
     let bounded = bounded_spec(arch);
-    ensure_kernels(&mut gpu, parallel, bounded);
+    ensure_kernels(&mut gpu, parallel, bounded.as_ref());
     eprintln!(
         "kernels_loaded: SERIAL symbol={} block={:?} smem=max_n_compressed; \
-         PARALLEL symbol={} block={:?} smem=0; BOUNDED {}",
+         PARALLEL symbol={} block={:?} smem=0; BOUNDED {}; \
+         TWOSTAGE module={} symbols={},{},{} block={:?} smem=0",
         SERIAL.symbol,
         SERIAL.block,
         parallel.symbol,
         parallel.block,
-        match bounded {
+        match &bounded {
             Some(b) => format!(
-                "symbol={} block={:?} smem=0 (static 8 KiB LDS)",
-                b.symbol, b.block
+                "label={} module={} symbol={} block={:?} smem=0 (static 8 KiB LDS)",
+                b.label, b.module, b.symbol, b.block
             ),
-            None => "n/a (gfx942 only; not compiled on this arch)".to_string(),
-        }
+            None => "n/a (not compiled on this arch)".to_string(),
+        },
+        TWOSTAGE_MODULE,
+        TWOSTAGE_CHUNK_SORT,
+        TWOSTAGE_MERGE_ROUND,
+        TWOSTAGE_FINALIZE,
+        PARALLEL_BLOCK,
     );
 
     let cases = build_cases();
     let mut results = Vec::with_capacity(cases.len());
     let mut any_fail = false;
     for case in &cases {
-        let r = run_case(&mut gpu, parallel, bounded, case);
+        let r = run_case(&mut gpu, parallel, bounded.as_ref(), case);
         if r.accept_fail {
             any_fail = true;
         }
@@ -914,8 +1318,8 @@ fn main() {
             .iter()
             .map(|a| {
                 format!(
-                    "{}(vs_ref={} vs_oracle={} unwritten={} dups={} ms_per_launch={:.3})",
-                    a.label, a.vs_ref, a.vs_oracle, a.unwritten, a.duplicates, a.ms_per_launch
+                    "{}(verdict={} vs_ref={} vs_oracle={} unwritten={} dups={} ms_per_launch={:.3})",
+                    a.label, a.verdict, a.vs_ref, a.vs_oracle, a.unwritten, a.duplicates, a.ms_per_launch
                 )
             })
             .collect::<Vec<_>>()
@@ -924,16 +1328,58 @@ fn main() {
             .speedup_bounded_vs_parallel
             .map(|s| format!("{s:.2}x"))
             .unwrap_or_else(|| "n/a".to_string());
+        let speedup_tvb = r
+            .speedup_twostage_vs_bounded
+            .map(|s| format!("{s:.2}x"))
+            .unwrap_or_else(|| "n/a".to_string());
+        let stages = r
+            .twostage_stage_ms
+            .map(|(c, m, f)| format!("chunk={c:.3},merge={m:.3},finalize={f:.3}"))
+            .unwrap_or_else(|| "n/a".to_string());
         eprintln!(
             "RESULT case={} N={} finite={} arms={} first_diff_rank={} same_set={} \
-             speedup_bounded_vs_parallel={} {}",
-            r.name, r.n, r.finite, r.arms_ran, r.first_diff_rank, r.same_set, speedup, arms_detail
+             speedup_bounded_vs_parallel={} speedup_twostage_vs_bounded={} twostage_stage_ms={} {}",
+            r.name,
+            r.n,
+            r.finite,
+            r.arms_ran,
+            r.first_diff_rank,
+            r.same_set,
+            speedup,
+            speedup_tvb,
+            stages,
+            arms_detail
         );
     }
 
+    // Per-arm tally across cases: a known-bad arm (today both gfx1151
+    // incumbent kernels on the non-finite eligibility cases) is attributed
+    // here by name without masking arms that pass everything.
+    let mut tally: Vec<(&'static str, usize, usize)> = Vec::new();
+    for r in &results {
+        for a in &r.arms {
+            match tally.iter().position(|(label, _, _)| *label == a.label) {
+                Some(idx) => {
+                    tally[idx].2 += 1;
+                    if a.verdict == "PASS" {
+                        tally[idx].1 += 1;
+                    }
+                }
+                None => tally.push((a.label, usize::from(a.verdict == "PASS"), 1)),
+            }
+        }
+    }
+    for (label, pass, total) in &tally {
+        eprintln!("ARM_TALLY arm={label} verdicts_pass={pass}/{total}");
+    }
+
     if any_fail {
-        eprintln!("OVERALL: FAIL (one or more cases mismatched across arms or finite oracle)");
+        eprintln!(
+            "OVERALL: FAIL (one or more arms failed a case — see VERDICT/ARM_TALLY for \
+             attribution; on gfx1151 the incumbent PARALLEL and BOUNDED kernels are KNOWN to \
+             fail the non-finite eligibility cases pending a kernel fix)"
+        );
         std::process::exit(1);
     }
-    eprintln!("OVERALL: PASS (all arms agree in ORDER; finite cases matched oracle)");
+    eprintln!("OVERALL: PASS (every arm passed every case; finite cases matched the oracle)");
 }

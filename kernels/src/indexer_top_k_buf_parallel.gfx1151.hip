@@ -67,11 +67,27 @@ extern "C" __global__ void indexer_top_k_buf_parallel(
 
     for (int i = threadIdx.x; i < n_compressed; i += blockDim.x) {
         const float score_i = scores[scores_base + i];
+        // Outer filter only. An ineligible candidate must never claim a rank,
+        // so this one is load-bearing.
         if (!(score_i > -FLT_MAX)) continue;
         int rank = 0;
         for (int j = 0; j < n_compressed; ++j) {
             const float score_j = scores[scores_base + j];
-            if (!(score_j > -FLT_MAX)) continue;
+            // No inner eligibility test: it is provably redundant here and
+            // costs ~12% because it runs N^2 times. Given score_i > -FLT_MAX,
+            // every ineligible score_j already contributes exactly 0 under
+            // IEEE comparison:
+            //   score_j == -INFINITY : -inf > score_i is false (score_i is
+            //                          strictly greater than -FLT_MAX > -inf),
+            //                          and -inf == score_i is false.
+            //   score_j == -FLT_MAX  : -FLT_MAX > score_i is false and
+            //                          -FLT_MAX == score_i is false, both
+            //                          because score_i > -FLT_MAX.
+            //   score_j is NaN       : every ordered and equality comparison
+            //                          against NaN is false.
+            // So the rank a surviving candidate computes is identical with or
+            // without the test. Measured on gfx1151: 143.4 ms -> 160.9 ms at
+            // N=32768 with the test, back to baseline without it.
             rank += (score_j > score_i) || (score_j == score_i && j < i);
         }
         if (rank < k) top_indices[output_base + rank] = i;

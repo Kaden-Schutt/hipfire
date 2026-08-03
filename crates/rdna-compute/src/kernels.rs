@@ -5183,6 +5183,11 @@ pub const INDEXER_TOP_K_BUF_UNROLLED_GFX1151_SRC: &str =
     include_str!("../../../kernels/src/indexer_top_k_buf_unrolled.gfx1151.hip");
 pub const INDEXER_TOP_K_BUF_BOUNDED_GFX942_SRC: &str =
     include_str!("../../../kernels/src/indexer_top_k_buf_bounded.gfx942.hip");
+/// Portable two-stage indexer top-K (chunk-sort + merge tree). Wave-size
+/// agnostic: selected on gfx942 via F3 and gfx1151 via G1, compiled from one
+/// source through `Gpu::indexer_top_k_two_stage` in attention.rs.
+pub const INDEXER_TOPK_TWOSTAGE_SRC: &str =
+    include_str!("../../../kernels/src/indexer_topk_twostage.hip");
 
 pub const INDEXER_KV_GATHER_SRC: &str = include_str!("../../../kernels/src/indexer_kv_gather.hip");
 

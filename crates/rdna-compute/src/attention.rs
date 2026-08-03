@@ -9753,6 +9753,179 @@ impl Gpu {
             blob_builder,
         )
     }
+    /// F3/G1: multi-block two-stage merge-tree indexer top-K for the DeepSeek
+    /// V4 long-context path. Stage 1 (`indexer_topk_chunk_sort`) bitonic-sorts
+    /// each 512-candidate chunk of `scores` into a per-chunk descending run in
+    /// the `ws_scores` / `ws_indices` workspace (run j at element offset
+    /// j*512); `ceil(log2(n_runs))` rounds of `indexer_topk_merge_round` then
+    /// pairwise-merge runs, keeping the better 512 of each pair;
+    /// `indexer_topk_finalize` writes the surviving run to `top_indices`.
+    /// Output is byte-identical IN ORDER to the incumbent rank-count kernel:
+    /// total order (score desc, index asc), eligibility `score > -FLT_MAX`
+    /// canonicalised at load so NaN never reaches the comparator, and the
+    /// `n_compressed <= max_k` identity fast path (condition is `<= max_k`,
+    /// not `<= k`). Correctness of the decomposition: a global top-K element
+    /// is in the top-K of its own chunk, so the union of per-chunk top-512
+    /// lists contains the global top-512 and every merge round preserves that.
+    ///
+    /// This lives on the generic `Gpu` surface — NOT behind `Gfx942Device`.
+    /// The kernel uses only `__syncthreads()` and block-uniform loop bounds,
+    /// so one portable code object is valid on wave32 (RDNA, gfx1151) and
+    /// wave64 (CDNA, gfx942) alike, and BOTH arches select it (F3 on gfx942,
+    /// G1 on gfx1151). `Gfx942Device` exists to gate CDNA-specific code
+    /// objects; this is not one, so parking it there would needlessly fork
+    /// the gfx1151 route off the shared implementation.
+    ///
+    /// Graph safety: `n_runs` and `rounds` are computed on the HOST from
+    /// `max_compressed` alone, so the launch count (`1 + rounds + 1`) and
+    /// every grid are fixed for a given model config — a captured hipGraph or
+    /// Redline tape is exact. The live candidate count reaches the device
+    /// solely through `n_compressed_buf`, identical to `indexer_top_k_buf`.
+    /// Single-head only: the workspace has no head dimension; ds4 dispatches
+    /// the indexer with `n_idx_heads == 1`.
+    ///
+    /// The sequence is LAUNCH-bound, not work-bound: measured per-launch cost
+    /// is 7.3–13.5 us and barely moves with N (gfx1151: 0.0146 ms at N=512
+    /// with 2 launches vs 0.1245 ms at N=262144 with 11 — 512x the data for
+    /// 8.5x the time). The compute is already negligible, so no per-block
+    /// work-reduction cleverness belongs here. The corollary: hipGraph
+    /// capture is expected to make this materially faster still, because
+    /// graph replay avoids the per-dispatch cost that dominates. Benchmark
+    /// conclusions drawn with graphs disabled do not transfer.
+    #[allow(clippy::too_many_arguments)]
+    pub fn indexer_top_k_two_stage(
+        &mut self,
+        scores: &GpuTensor,
+        ws_scores: &GpuTensor,
+        ws_indices: &GpuTensor,
+        top_indices: &GpuTensor,
+        n_compressed_buf: &GpuTensor,
+        k_buf: &GpuTensor,
+        max_compressed: i32,
+        max_k: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        // One module, three symbols: compile/load once, extract all three.
+        self.ensure_kernel(
+            "indexer_topk_twostage",
+            kernels::INDEXER_TOPK_TWOSTAGE_SRC,
+            "indexer_topk_chunk_sort",
+        )?;
+        self.ensure_kernel(
+            "indexer_topk_twostage",
+            kernels::INDEXER_TOPK_TWOSTAGE_SRC,
+            "indexer_topk_merge_round",
+        )?;
+        self.ensure_kernel(
+            "indexer_topk_twostage",
+            kernels::INDEXER_TOPK_TWOSTAGE_SRC,
+            "indexer_topk_finalize",
+        )?;
+        let sp = scores.buf.as_ptr();
+        let wss = ws_scores.buf.as_ptr();
+        let wsi = ws_indices.buf.as_ptr();
+        let tip = top_indices.buf.as_ptr();
+        let nbp = n_compressed_buf.buf.as_ptr();
+        let kbp = k_buf.buf.as_ptr();
+        // 512 candidates per chunk; rounds = ceil(log2(n_runs)) so repeated
+        // pairwise merges converge to a single surviving run.
+        let n_runs = (max_compressed as usize).div_ceil(512);
+        let mut rounds = 0usize;
+        while (1usize << rounds) < n_runs {
+            rounds += 1;
+        }
+        // Stage 1: sort each chunk into its own run.
+        {
+            let mut nr = n_runs as i32;
+            let mut params: Vec<*mut c_void> = vec![
+                &sp as *const _ as *mut c_void,
+                &wss as *const _ as *mut c_void,
+                &wsi as *const _ as *mut c_void,
+                &nbp as *const _ as *mut c_void,
+                &mut nr as *mut _ as *mut c_void,
+            ];
+            let blob_builder = || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(sp);
+                b.push_ptr(wss);
+                b.push_ptr(wsi);
+                b.push_ptr(nbp);
+                b.push_i32(nr);
+                b
+            };
+            self.launch_maybe_blob(
+                "indexer_topk_chunk_sort",
+                [n_runs as u32, 1, 1],
+                [256, 1, 1],
+                0,
+                &mut params,
+                blob_builder,
+            )?;
+        }
+        // Rounds: pair p merges run p*2*run_step with run p*2*run_step+run_step
+        // into run p*2*run_step. run_step doubles each round; n_pairs halves.
+        for r in 0..rounds {
+            let run_step = 1usize << r;
+            let n_pairs = n_runs.div_ceil(2 << r);
+            let mut nr = n_runs as i32;
+            let mut rs = run_step as i32;
+            let mut np = n_pairs as i32;
+            let mut params: Vec<*mut c_void> = vec![
+                &wss as *const _ as *mut c_void,
+                &wsi as *const _ as *mut c_void,
+                &mut nr as *mut _ as *mut c_void,
+                &mut rs as *mut _ as *mut c_void,
+                &mut np as *mut _ as *mut c_void,
+            ];
+            let blob_builder = || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(wss);
+                b.push_ptr(wsi);
+                b.push_i32(nr);
+                b.push_i32(rs);
+                b.push_i32(np);
+                b
+            };
+            self.launch_maybe_blob(
+                "indexer_topk_merge_round",
+                [n_pairs as u32, 1, 1],
+                [256, 1, 1],
+                0,
+                &mut params,
+                blob_builder,
+            )?;
+        }
+        // Finalize: emit the surviving run as top_indices.
+        {
+            let mut mk = max_k;
+            let mut params: Vec<*mut c_void> = vec![
+                &wss as *const _ as *mut c_void,
+                &wsi as *const _ as *mut c_void,
+                &tip as *const _ as *mut c_void,
+                &nbp as *const _ as *mut c_void,
+                &kbp as *const _ as *mut c_void,
+                &mut mk as *mut _ as *mut c_void,
+            ];
+            let blob_builder = || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(wss);
+                b.push_ptr(wsi);
+                b.push_ptr(tip);
+                b.push_ptr(nbp);
+                b.push_ptr(kbp);
+                b.push_i32(mk);
+                b
+            };
+            self.launch_maybe_blob(
+                "indexer_topk_finalize",
+                [1, 1, 1],
+                [256, 1, 1],
+                0,
+                &mut params,
+                blob_builder,
+            )
+        }
+    }
     pub fn rope_tail_interleaved(
         &mut self,
         q: &GpuTensor,

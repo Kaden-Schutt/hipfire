@@ -415,6 +415,84 @@ mod config_cache {
                     != Some("0")
             })
     }
+    /// `HIPFIRE_DEEPSEEK4_GFX942_INDEXER_TOPK_TWOSTAGE` — F3: select the
+    /// multi-block two-stage merge-tree indexer top-K on exact `gfx942` MQ2R
+    /// instead of F2's single-workgroup bounded kernel. F2 collapsed the
+    /// O(N^2) rank count but its grid is still `[n_idx_heads,1,1]` with
+    /// `n_idx_heads == 1`, so the tile loop is serial on one CU; F3 replaces
+    /// it with a chunk-sort + parallel merge tree whose launch count and
+    /// grids derive only from `max_compressed` (graph-safe). Default ON for
+    /// the gfx942-v1 route after both promotion conditions passed; set `=0`
+    /// to fall back to F2. Selected only when
+    /// `max_compress_pos() >= indexer_topk_two_stage_min()`.
+    ///
+    /// Exactness (raw-i32 channel, `test_indexer_top_k_buf`, MI300X): 13/13
+    /// PASS, all four arms (SERIAL / PARALLEL / BOUNDED / TWOSTAGE)
+    /// byte-identical in ORDER, finite cases also identical to the host
+    /// oracle. Covers the identity path, the N=513 boundary, all three
+    /// non-finite eligibility cases, and N = 8192 / 32768 / 262144. The same
+    /// harness passes on gfx1151.
+    ///
+    /// Perf vs F2 (same binary, only this env differing, 3 fresh processes
+    /// per arm, interleaved A,B,B,A,A,B, 18/18 pass, spread <=0.44% per arm):
+    ///   cap  2048  34.481 -> 36.327 tok/s  (1.054x)
+    ///   cap  8192  25.941 -> 33.367 tok/s  (1.286x)
+    ///   cap 32768  13.043 -> 25.961 tok/s  (1.990x)
+    /// Cumulative against the pre-F2 default on the same box and model:
+    /// 25.046 -> 36.327 (1.5x), 3.910 -> 33.367 (8.5x), 0.274 -> 25.961
+    /// (94.7x). Isolated kernel: 128x vs F2 at N=262144 on gfx942, 44.7x on
+    /// gfx1151.
+    ///
+    /// Caveat on the numbers: every one was taken with graph capture OFF and
+    /// no Redline retained replay. The sequence is launch-bound (7.3-13.5 us
+    /// per launch, near-flat in N) and F3 adds 231 launches per token across
+    /// 21 ratio-4 layers, so a retained-replay path that amortises dispatch
+    /// cost should make F3 look BETTER than these figures, not worse. Do not
+    /// invert that reasoning from a graphs-off benchmark.
+    pub(super) fn gfx942_indexer_topk_two_stage_on(arch: &str, mq2r: bool) -> bool {
+        static V: OnceLock<bool> = OnceLock::new();
+        arch == "gfx942"
+            && mq2r
+            && *V.get_or_init(|| {
+                hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_GFX942_INDEXER_TOPK_TWOSTAGE")
+                    .ok()
+                    .as_deref()
+                    != Some("0")
+            })
+    }
+    /// `HIPFIRE_DEEPSEEK4_GFX1151_INDEXER_TOPK_TWOSTAGE` — G1: the gfx1151
+    /// twin of F3. gfx1151's default indexer top-K is the SAME O(N^2)
+    /// rank-count on one workgroup that F2 removed from gfx942, so the
+    /// two-stage merge tree is the promotion candidate there too. Default
+    /// OFF pending measurement; set `=1` to enable. This is a SEPARATE lever
+    /// from F3, not one shared `*_TWOSTAGE` flag: strict arch gating (no
+    /// gfx942 lever ever bleeding into gfx1151 or vice versa) is enforced by
+    /// the arch-gating unit tests, and the two arches promote independently.
+    pub(super) fn gfx1151_indexer_topk_two_stage_on(arch: &str, mq2r: bool) -> bool {
+        static V: OnceLock<bool> = OnceLock::new();
+        arch == "gfx1151"
+            && mq2r
+            && *V.get_or_init(|| flag_one("HIPFIRE_DEEPSEEK4_GFX1151_INDEXER_TOPK_TWOSTAGE"))
+    }
+    /// `HIPFIRE_DEEPSEEK4_INDEXER_TOPK_TWOSTAGE_MIN` — minimum
+    /// `max_compress_pos()` at which the two-stage path may be selected.
+    /// Default 1024, from the measured standalone-probe crossover against the
+    /// F2 bounded kernel (ms per full sequence): the ONLY losing regime is
+    /// cap 512, where the bounded kernel takes the `n_compressed <= max_k`
+    /// identity fast path and is essentially free (gfx1151: 0.0024 bounded vs
+    /// 0.0146 two-stage, a 6x loss; gfx942: 0.0030 vs 0.0271, 9x). At 1024
+    /// two-stage already wins (gfx1151 0.0255 -> 0.0198, 1.29x), and the win
+    /// grows monotonically: gfx1151 2.64x/5.28x/16.9x/51.9x and gfx942
+    /// 2.70x/8.15x/25.7x/144.9x at N = 2048/8192/32768/262144.
+    pub(super) fn indexer_topk_two_stage_min() -> usize {
+        static V: OnceLock<usize> = OnceLock::new();
+        *V.get_or_init(|| {
+            hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_INDEXER_TOPK_TWOSTAGE_MIN")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(1024)
+        })
+    }
     /// `HIPFIRE_DEEPSEEK4_GFX942_FFN_OVERLAP` — evaluate the dense shared
     /// expert and routed MQ2 experts concurrently after their common FFN
     /// normalization. Eligibility comes from the model-owned exact-gfx942
@@ -433,6 +511,7 @@ mod config_cache {
             let l2 = gfx942_hc_finalize_fused_on(arch, gfx942_route_v1);
             let f1 = gfx942_indexer_topk_parallel_on(arch, gfx942_route_v1);
             let f2 = gfx942_indexer_topk_bounded_on(arch, gfx942_route_v1);
+            let f3 = gfx942_indexer_topk_two_stage_on(arch, gfx942_route_v1);
             let ffn_overlap = gfx942_ffn_overlap_on(gfx942_route_v1 && arch == "gfx942");
             eprintln!(
                 "deepseek4 gfx942 A2 levers: \
@@ -441,12 +520,14 @@ mod config_cache {
                  L2 hc_finalize_fused={} (default OFF, HIPFIRE_DEEPSEEK4_GFX942_HC_FINALIZE_FUSED=1 enables) ; \
                  F1 indexer_topk_parallel={} (gfx942-v1 default ON, HIPFIRE_DEEPSEEK4_GFX942_INDEXER_TOPK_PARALLEL=0 disables) ; \
                  F2 indexer_topk_bounded={} (gfx942-v1 default ON, HIPFIRE_DEEPSEEK4_GFX942_INDEXER_TOPK_BOUNDED=0 disables) ; \
+                 F3 indexer_topk_two_stage={} (gfx942-v1 default ON, HIPFIRE_DEEPSEEK4_GFX942_INDEXER_TOPK_TWOSTAGE=0 disables) ; \
                  C1 ffn_overlap={} (default OFF, HIPFIRE_DEEPSEEK4_GFX942_FFN_OVERLAP=1 enables)",
                 if l1 { "ON" } else { "OFF" },
                 if l3 { "ON" } else { "OFF" },
                 if l2 { "ON" } else { "OFF" },
                 if f1 { "ON" } else { "OFF" },
                 if f2 { "ON" } else { "OFF" },
+                if f3 { "ON" } else { "OFF" },
                 if ffn_overlap { "ON" } else { "OFF" },
             );
         });
@@ -2458,6 +2539,17 @@ fn indexer_forward(
     let max_compressed = config_cache::max_compress_pos();
     let n = n_filled.min(max_compressed);
 
+    // F3/G1 two-stage top-K selection, computed ONCE: gates both the lazy
+    // workspace alloc below and the top-K dispatch further down. Selected
+    // only when the arch lever is on AND the cap is large enough for the
+    // merge tree's extra launches to pay for themselves. Single-head only:
+    // the workspace has no head dimension and ds4 passes n_idx_heads == 1.
+    let two_stage_topk = (config_cache::gfx942_indexer_topk_two_stage_on(
+        &gpu.arch,
+        weights.mq2r_backend.is_gfx942(),
+    ) || config_cache::gfx1151_indexer_topk_two_stage_on(&gpu.arch, cfg.mq2r))
+        && max_compressed >= config_cache::indexer_topk_two_stage_min();
+
     let wq_b = layer
         .indexer_wq_b
         .as_ref()
@@ -2493,6 +2585,22 @@ fn indexer_forward(
                 gpu.alloc_tensor(&[k], DType::F32)
                     .map_err(|e| format!("alloc topk_idx l{layer_idx}: {e:?}"))?,
             );
+        }
+        // Two-stage workspace (~2*max_compressed*4 B per layer) is spent ONLY
+        // when the path can actually dispatch — not when both levers are off.
+        if two_stage_topk {
+            if l_state.topk_ws_scores.is_none() {
+                l_state.topk_ws_scores = Some(
+                    gpu.alloc_tensor(&[max_compressed], DType::F32)
+                        .map_err(|e| format!("alloc topk_ws_scores l{layer_idx}: {e:?}"))?,
+                );
+            }
+            if l_state.topk_ws_indices.is_none() {
+                l_state.topk_ws_indices = Some(
+                    gpu.alloc_tensor(&[max_compressed], DType::F32)
+                        .map_err(|e| format!("alloc topk_ws_indices l{layer_idx}: {e:?}"))?,
+                );
+            }
         }
     }
 
@@ -2588,22 +2696,43 @@ fn indexer_forward(
 
     // 5. Top-K: read N + K from device buffers.
     let topk = state._indexer[layer_idx].topk_idx_indices.as_ref().unwrap();
-    let gfx942_parallel =
-        config_cache::gfx942_indexer_topk_parallel_on(&gpu.arch, weights.mq2r_backend.is_gfx942())
-            && weights.mq2r_backend.try_indexer_top_k_buf_parallel(
-                gpu,
-                scores,
-                topk,
-                &n_buf,
-                &k_buf,
-                /*n_idx_heads=*/ 1,
-                k as i32,
-                config_cache::gfx942_indexer_topk_bounded_on(
-                    &gpu.arch,
-                    weights.mq2r_backend.is_gfx942(),
-                ),
-            )?;
-    if !gfx942_parallel {
+    // F3/G1: two-stage merge tree, when its arch lever is on and the cap
+    // clears the threshold. A selected-and-succeeded two-stage suppresses
+    // both fallbacks below the same way `gfx942_parallel` does.
+    let two_stage = if two_stage_topk {
+        let ws_scores = state._indexer[layer_idx].topk_ws_scores.as_ref().unwrap();
+        let ws_indices = state._indexer[layer_idx].topk_ws_indices.as_ref().unwrap();
+        gpu.indexer_top_k_two_stage(
+            scores,
+            ws_scores,
+            ws_indices,
+            topk,
+            &n_buf,
+            &k_buf,
+            max_compressed as i32,
+            k as i32,
+        )
+        .map_err(|e| format!("idx top_k two-stage l{layer_idx}: {e:?}"))?;
+        true
+    } else {
+        false
+    };
+    let gfx942_parallel = !two_stage
+        && config_cache::gfx942_indexer_topk_parallel_on(&gpu.arch, weights.mq2r_backend.is_gfx942())
+        && weights.mq2r_backend.try_indexer_top_k_buf_parallel(
+            gpu,
+            scores,
+            topk,
+            &n_buf,
+            &k_buf,
+            /*n_idx_heads=*/ 1,
+            k as i32,
+            config_cache::gfx942_indexer_topk_bounded_on(
+                &gpu.arch,
+                weights.mq2r_backend.is_gfx942(),
+            ),
+        )?;
+    if !two_stage && !gfx942_parallel {
         gpu.indexer_top_k_buf(
             weights.mq2r_backend.is_gfx1151(),
             scores,
@@ -13035,9 +13164,12 @@ mod tests {
         assert!(!config_cache::hc_finalize_input_map_on(arch, true));
         assert!(!config_cache::qnorm_rotate_fused_on(arch, true));
         assert!(!config_cache::redline_ffn_split_on(arch, true));
+        // G1 is gfx1151's own two-stage lever: arch-gate passes, default OFF.
+        assert!(!config_cache::gfx1151_indexer_topk_two_stage_on(arch, true));
         // gfx942 A2 levers must not bleed into gfx1151.
         assert!(!config_cache::gfx942_compressor_gate_on(arch, true));
         assert!(!config_cache::gfx942_indexer_topk_bounded_on(arch, true));
+        assert!(!config_cache::gfx942_indexer_topk_two_stage_on(arch, true));
         assert!(!config_cache::gfx942_e8_wo_grouped_on(arch, true));
         assert!(!config_cache::gfx942_hc_finalize_fused_on(arch, true));
         assert!(!config_cache::gfx942_indexer_topk_parallel_on(arch, true));
@@ -13112,6 +13244,7 @@ mod tests {
         // still an opt-in experiment.
         assert!(!config_cache::gfx942_compressor_gate_on("gfx942", true));
         assert!(config_cache::gfx942_indexer_topk_bounded_on("gfx942", true));
+        assert!(config_cache::gfx942_indexer_topk_two_stage_on("gfx942", true));
         assert!(config_cache::gfx942_e8_wo_grouped_on("gfx942", true));
         assert!(!config_cache::gfx942_hc_finalize_fused_on("gfx942", true));
         assert!(config_cache::gfx942_indexer_topk_parallel_on(
@@ -13120,6 +13253,7 @@ mod tests {
         // Fail closed on non-mq2r and non-gfx942.
         assert!(!config_cache::gfx942_compressor_gate_on("gfx942", false));
         assert!(!config_cache::gfx942_indexer_topk_bounded_on("gfx942", false));
+        assert!(!config_cache::gfx942_indexer_topk_two_stage_on("gfx942", false));
         assert!(!config_cache::gfx942_e8_wo_grouped_on("gfx942", false));
         assert!(!config_cache::gfx942_hc_finalize_fused_on("gfx942", false));
         assert!(!config_cache::gfx942_indexer_topk_parallel_on(
@@ -13128,19 +13262,29 @@ mod tests {
         assert!(!config_cache::gfx942_ffn_overlap_on(false));
         assert!(!config_cache::gfx942_compressor_gate_on("gfx1100", true));
         assert!(!config_cache::gfx942_indexer_topk_bounded_on("gfx1100", true));
+        assert!(!config_cache::gfx942_indexer_topk_two_stage_on("gfx1100", true));
         assert!(!config_cache::gfx942_e8_wo_grouped_on("gfx1201", true));
         assert!(!config_cache::gfx942_hc_finalize_fused_on("gfx1201", true));
         assert!(!config_cache::gfx942_indexer_topk_parallel_on(
             "gfx1201", true
         ));
         assert!(!config_cache::gfx942_indexer_topk_bounded_on("gfx1201", true));
+        assert!(!config_cache::gfx942_indexer_topk_two_stage_on("gfx1201", true));
         assert!(!config_cache::gfx942_compressor_gate_on("gfx1151", true));
         assert!(!config_cache::gfx942_indexer_topk_bounded_on("gfx1151", true));
+        assert!(!config_cache::gfx942_indexer_topk_two_stage_on("gfx1151", true));
         assert!(!config_cache::gfx942_indexer_topk_parallel_on(
             "gfx1151", true
         ));
         // gfx1151 grouped flag stays gfx1151-only.
         assert!(!config_cache::e8_wo_grouped_on("gfx942", true));
+        // G1 is the gfx1151 twin of F3 and must not bleed into gfx942 or any
+        // other arch; it also fails closed on non-mq2r and defaults OFF.
+        assert!(!config_cache::gfx1151_indexer_topk_two_stage_on("gfx942", true));
+        assert!(!config_cache::gfx1151_indexer_topk_two_stage_on("gfx1100", true));
+        assert!(!config_cache::gfx1151_indexer_topk_two_stage_on("gfx1201", true));
+        assert!(!config_cache::gfx1151_indexer_topk_two_stage_on("gfx1151", false));
+        assert!(!config_cache::gfx1151_indexer_topk_two_stage_on("gfx1151", true));
     }
 
     #[test]

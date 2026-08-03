@@ -941,6 +941,12 @@ pub struct IndexerLayerState {
     pub idx_weights: Option<rdna_compute::GpuTensor>,
     pub index_score: Option<rdna_compute::GpuTensor>,
     pub topk_idx_indices: Option<rdna_compute::GpuTensor>,
+    /// Two-stage merge-tree top-K workspace (F3/G1), `[max_compressed]` each,
+    /// run j at element offset j*512. `topk_ws_indices` is an F32 tensor
+    /// holding an i32 payload (same convention as `topk_idx_indices`).
+    /// Lazy-alloc by indexer_forward ONLY when the two-stage path is selected.
+    pub topk_ws_scores: Option<rdna_compute::GpuTensor>,
+    pub topk_ws_indices: Option<rdna_compute::GpuTensor>,
 
     // Compressor per-step scratch (re-used main and indexer; sized for
     // the LARGER of the two — main has coff*head_dim = 1024 for ratio=4,
@@ -1374,6 +1380,8 @@ impl DeepseekV4State {
                 idx_weights: None,
                 index_score: None,
                 topk_idx_indices: None,
+                topk_ws_scores: None,
+                topk_ws_indices: None,
                 comp_kv_buf: None,
                 comp_score_buf: None,
                 comp_concat_kv: None,
@@ -1617,6 +1625,8 @@ impl DeepseekV4State {
             free_opt(gpu, &mut l.idx_weights);
             free_opt(gpu, &mut l.index_score);
             free_opt(gpu, &mut l.topk_idx_indices);
+            free_opt(gpu, &mut l.topk_ws_scores);
+            free_opt(gpu, &mut l.topk_ws_indices);
             free_opt(gpu, &mut l.comp_kv_buf);
             free_opt(gpu, &mut l.comp_score_buf);
             free_opt(gpu, &mut l.comp_concat_kv);
