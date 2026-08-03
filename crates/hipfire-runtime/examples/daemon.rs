@@ -18054,6 +18054,28 @@ fn generate_deepseek4_spec(
     if let Some(spec) = m.speculator.as_mut() {
         spec.set_sampling(temp, top_p, top_k, cactus_delta);
     }
+
+    // Open the wire contract before any token can reach the client. The CLI's
+    // stream latch (`StreamContractError::PreStartEvent`) fail-closes on any
+    // event that precedes `gen_start`, so without this every DS4 request over
+    // `hipfire serve` dies with "stream must begin with gen_start; got token
+    // before contract latch". Mirrors generate_dflash's emit before
+    // generate_spec.
+    //
+    // `ds4_gen_start_contract_version()` is None for arch 9 — DS4 does not
+    // advertise semantic contract v2, so the client keeps whole-output tool
+    // extraction. That helper exists precisely for this call site.
+    //
+    // started_in_think follows the DS4 frame mapping documented on ThinkMode
+    // (prompt_frame.rs): NonThink renders `<｜Assistant｜></think>`, so the model
+    // begins in visible-answer mode; High/Max render the `<think>` open-token,
+    // so it begins inside the reasoning span.
+    emit_gen_start(
+        stdout,
+        id,
+        !matches!(think_mode, ThinkMode::NonThink),
+        ds4_gen_start_contract_version(),
+    );
     let prompt_tokens_total = prompt_ids.len();
     let run = match generate_spec(
         m,
@@ -18691,6 +18713,18 @@ fn generate_deepseek4(
             .map(|v| v.as_slice())
             .unwrap_or(&empty_vocab);
         let mut grammar_mask: Vec<bool> = vec![true; decoded_vocab.len()];
+
+        // Open the wire contract before the first sample. Same fail-closed CLI
+        // latch as the spec path: any event ahead of `gen_start` aborts the
+        // stream with "stream must begin with gen_start; got token before
+        // contract latch". Placed after prefill and grammar setup but before
+        // the first `sample_token`, so no token can outrun it.
+        emit_gen_start(
+            stdout,
+            id,
+            !matches!(think_mode, ThinkMode::NonThink),
+            ds4_gen_start_contract_version(),
+        );
 
         // Apply mask to the prefill-returned logits before the first
         // sample (matcher is in `Out` here so this is a no-op, but the
