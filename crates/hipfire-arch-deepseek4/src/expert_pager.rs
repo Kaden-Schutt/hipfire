@@ -643,6 +643,8 @@ pub struct Ds4ExpertPaging {
     experts: Vec<u16>,
     ptr_bytes: Vec<u8>,
     topk_bytes: Vec<u8>,
+    tile_bytes: Vec<u8>,
+    tile_experts: Vec<i32>,
     /// Bytes actually read from the HFQ. With the hit rate this is the whole
     /// budget/throughput story: a bigger pool is only worth its memory if it
     /// moves these numbers.
@@ -674,6 +676,8 @@ impl Ds4ExpertPaging {
             experts: Vec::with_capacity(max_working_set),
             ptr_bytes: vec![0u8; n_exp * 8],
             topk_bytes: vec![0u8; max_working_set * 4],
+            tile_bytes: Vec::new(),
+            tile_experts: Vec::new(),
             bytes_read: 0,
             dispatches: 0,
         }
@@ -728,6 +732,39 @@ impl Ds4ExpertPaging {
             self.experts.push(e);
         }
         Ok(&self.experts)
+    }
+
+    /// Read `n_tiles` i32 expert ids from the scatter's `expert_tile_ids`.
+    ///
+    /// That tensor is `DType::Raw` with its shape in BYTES, so `sub_offset` +
+    /// `download_f32` reads the wrong length — copy the bytes and reinterpret.
+    /// Reuses scratch so a per-layer call allocates nothing after the first.
+    pub fn read_tile_experts(
+        &mut self,
+        expert_tile_ids: &rdna_compute::GpuTensor,
+        n_tiles: usize,
+        gpu: &rdna_compute::Gpu,
+    ) -> Result<&[i32], String> {
+        let need = n_tiles * 4;
+        if expert_tile_ids.byte_size() < need {
+            return Err(format!(
+                "expert_tile_ids holds {} B, need {need} B for {n_tiles} tiles",
+                expert_tile_ids.byte_size()
+            ));
+        }
+        if self.tile_bytes.len() < need {
+            self.tile_bytes.resize(need, 0);
+        }
+        gpu.bind_thread().map_err(|e| format!("{e:?}"))?;
+        gpu.hip
+            .memcpy_dtoh(&mut self.tile_bytes[..need], &expert_tile_ids.buf)
+            .map_err(|e| format!("d2h expert_tile_ids: {e:?}"))?;
+        self.tile_experts.clear();
+        for c in self.tile_bytes[..need].chunks_exact(4) {
+            self.tile_experts
+                .push(i32::from_ne_bytes([c[0], c[1], c[2], c[3]]));
+        }
+        Ok(&self.tile_experts)
     }
 
     /// Whether this layer's experts are paged. False for layers left fully
@@ -1013,6 +1050,59 @@ pub fn window_expert_union(topk: &[u16], start: usize, len: usize, k_top: usize)
         }
     }
     u
+}
+
+/// One expert band: a contiguous tile range of the scatter's expert-ordered
+/// slots, plus the experts it covers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExpertBand {
+    pub tile_begin: usize,
+    pub tile_count: usize,
+    pub experts: Vec<u16>,
+}
+
+/// Group the scatter's per-tile expert ids into bands of at most `slots`
+/// distinct experts.
+///
+/// `tile_experts[t]` is the expert that tile `t` belongs to, in the scatter's
+/// order — experts are contiguous, so a band is a tile RANGE and needs no
+/// gather. This is what turns paged prefill from "re-read experts per token
+/// window" (redundancy grows with prompt length) into "read each expert once
+/// per chunk" (redundancy 1.0).
+///
+/// Tiles with a negative/sentinel expert id are padding and are folded into
+/// the current band without counting against its budget.
+pub fn plan_expert_bands(tile_experts: &[i32], n_exp: usize, slots: usize) -> Vec<ExpertBand> {
+    let mut bands: Vec<ExpertBand> = Vec::new();
+    if slots == 0 {
+        return bands;
+    }
+    let mut begin = 0usize;
+    let mut experts: Vec<u16> = Vec::new();
+    for (t, &e) in tile_experts.iter().enumerate() {
+        let valid = e >= 0 && (e as usize) < n_exp;
+        if valid && !experts.contains(&(e as u16)) && experts.len() == slots {
+            // This tile starts an expert that will not fit — close the band
+            // here so every band's working set fits the pool.
+            bands.push(ExpertBand {
+                tile_begin: begin,
+                tile_count: t - begin,
+                experts: std::mem::take(&mut experts),
+            });
+            begin = t;
+        }
+        if valid && !experts.contains(&(e as u16)) {
+            experts.push(e as u16);
+        }
+    }
+    if begin < tile_experts.len() {
+        bands.push(ExpertBand {
+            tile_begin: begin,
+            tile_count: tile_experts.len() - begin,
+            experts,
+        });
+    }
+    bands
 }
 
 /// `HIPFIRE_DEEPSEEK4_PREFILL_WORK_TRACE=1` — per-layer paged-prefill work
@@ -1449,6 +1539,73 @@ mod tests {
             TEST_BASE,
             "layer 0 dispatch leaked into layer 1's table"
         );
+    }
+
+    #[test]
+    fn bands_cover_every_tile_exactly_once() {
+        // A dropped or duplicated tile is a silently wrong prefill.
+        let tiles: Vec<i32> = vec![0, 0, 1, 2, 2, 2, 3, 4, 5, 5, 6, 7];
+        let bands = plan_expert_bands(&tiles, 256, 3);
+        assert!(bands.len() > 1, "expected several bands, got {bands:?}");
+        let mut next = 0usize;
+        for b in &bands {
+            assert_eq!(b.tile_begin, next, "bands must be contiguous: {bands:?}");
+            assert!(b.tile_count > 0);
+            next = b.tile_begin + b.tile_count;
+        }
+        assert_eq!(next, tiles.len(), "bands must cover every tile");
+    }
+
+    #[test]
+    fn bands_never_exceed_the_pool() {
+        let tiles: Vec<i32> = (0..40).map(|i| i / 2).collect();
+        for slots in [1usize, 3, 7, 16] {
+            for b in plan_expert_bands(&tiles, 256, slots) {
+                assert!(b.experts.len() <= slots, "band {b:?} exceeds {slots} slots");
+            }
+        }
+    }
+
+    #[test]
+    fn bands_read_each_expert_once() {
+        // The whole point: across all bands, every distinct expert appears in
+        // exactly one band, so it is paged in exactly once per chunk.
+        let tiles: Vec<i32> = vec![0, 0, 1, 1, 2, 3, 3, 4, 5, 6, 7, 8];
+        let bands = plan_expert_bands(&tiles, 256, 2);
+        let mut seen: Vec<u16> = Vec::new();
+        for b in &bands {
+            for &e in &b.experts {
+                assert!(!seen.contains(&e), "expert {e} paged in twice: {bands:?}");
+                seen.push(e);
+            }
+        }
+        let mut distinct: Vec<u16> = tiles.iter().map(|&e| e as u16).collect();
+        distinct.sort_unstable();
+        distinct.dedup();
+        seen.sort_unstable();
+        assert_eq!(seen, distinct, "every expert must be covered once");
+    }
+
+    #[test]
+    fn bands_fold_padding_tiles_without_spending_budget() {
+        // Scatter pads with sentinel tiles; they must not consume a slot.
+        let tiles: Vec<i32> = vec![0, -1, -1, 1, -1, 2];
+        let bands = plan_expert_bands(&tiles, 256, 3);
+        assert_eq!(
+            bands.len(),
+            1,
+            "padding should not force a new band: {bands:?}"
+        );
+        assert_eq!(bands[0].experts, vec![0, 1, 2]);
+        assert_eq!(bands[0].tile_count, 6);
+    }
+
+    #[test]
+    fn bands_of_one_slot_still_make_progress() {
+        let tiles: Vec<i32> = vec![0, 1, 2, 3];
+        let bands = plan_expert_bands(&tiles, 256, 1);
+        assert_eq!(bands.len(), 4);
+        assert!(bands.iter().all(|b| b.tile_count == 1));
     }
 
     #[test]

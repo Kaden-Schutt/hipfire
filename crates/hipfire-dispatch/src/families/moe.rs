@@ -732,6 +732,68 @@ impl MoeFamily {
         crate::pipeline::run_moe_prefill_bias_aware(gpu, params)
     }
 
+    /// Banded prefill: routing + scatter only.
+    ///
+    /// Together with [`MoeFamily::prefill_gate_up_band`],
+    /// [`MoeFamily::prefill_activate`], [`MoeFamily::prefill_down_band`] and
+    /// [`MoeFamily::prefill_combine`] this is
+    /// [`MoeFamily::run_bias_aware_prefill`] decomposed so a caller with a
+    /// BOUNDED expert cache can page between the expert GEMMs. The scatter
+    /// orders slots by expert, so an expert band is a contiguous tile range
+    /// and each expert is read exactly once per chunk instead of once per
+    /// token window.
+    ///
+    /// Order: scatter → (page gate_up band → gate_up_band)* → activate →
+    /// (page down band → down_band)* → combine.
+    pub fn prefill_scatter(
+        &self,
+        gpu: &mut rdna_compute::Gpu,
+        params: &MoeBiasAwarePrefillParams,
+    ) -> Result<(), DispatchError> {
+        crate::pipeline::run_moe_prefill_scatter(gpu, params)
+    }
+
+    /// Grouped gate_up GEMM over one expert band's tile range.
+    pub fn prefill_gate_up_band(
+        &self,
+        gpu: &mut rdna_compute::Gpu,
+        params: &MoeBiasAwarePrefillParams,
+        tile_begin: usize,
+        tile_count: usize,
+    ) -> Result<(), DispatchError> {
+        crate::pipeline::run_moe_prefill_gate_up_band(gpu, params, tile_begin, tile_count)
+    }
+
+    /// Unscatter + SwiGLU + rotate over the whole chunk. Run once, between the
+    /// gate_up bands and the down bands.
+    pub fn prefill_activate(
+        &self,
+        gpu: &mut rdna_compute::Gpu,
+        params: &MoeBiasAwarePrefillParams,
+    ) -> Result<(), DispatchError> {
+        crate::pipeline::run_moe_prefill_activate(gpu, params)
+    }
+
+    /// Grouped down GEMM over one expert band's tile range.
+    pub fn prefill_down_band(
+        &self,
+        gpu: &mut rdna_compute::Gpu,
+        params: &MoeBiasAwarePrefillParams,
+        tile_begin: usize,
+        tile_count: usize,
+    ) -> Result<(), DispatchError> {
+        crate::pipeline::run_moe_prefill_down_band(gpu, params, tile_begin, tile_count)
+    }
+
+    /// Weighted combine into `ffn_out`. Run once, after every down band.
+    pub fn prefill_combine(
+        &self,
+        gpu: &mut rdna_compute::Gpu,
+        params: &MoeBiasAwarePrefillParams,
+    ) -> Result<(), DispatchError> {
+        crate::pipeline::run_moe_prefill_combine(gpu, params)
+    }
+
     /// Run a batched/prefill qwen35 MoE routed-expert block (k=8, softmax
     /// top-k, MQ4/MQ6/Paro routed experts): scatter → gate_up → unscatter →
     /// SwiGLU+rotate → down → combine, accumulating into `params.x_batch`.

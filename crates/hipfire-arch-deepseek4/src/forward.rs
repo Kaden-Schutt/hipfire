@@ -7857,17 +7857,19 @@ fn ffn_batched(
 
 /// Routed-expert MoE for one prefill chunk with paging on.
 ///
-/// Routes the whole chunk once to learn the assignment, splits it into
-/// contiguous token windows whose expert union fits the slot pool, then runs
-/// the unchanged prefill MoE per window over `sub_offset` views.
+/// BAND-MAJOR. The scatter orders slots by expert, so a set of experts is a
+/// contiguous tile range. We scatter once, then walk expert bands sized to the
+/// slot pool: each expert is read exactly ONCE per chunk.
 ///
-/// Neutrality note: the family picks grouped-GEMM vs scalar K4 on
-/// `batch_size >= HIPFIRE_DEEPSEEK4_MOE_GROUPED_GATE` (default 128). Windows
-/// are usually smaller than a full chunk, so a paged run can land on the
-/// scalar path where a resident run took the grouped one. Those are different
-/// kernels and may differ in the low bits. Pin the threshold across both runs
-/// when comparing them — which is what `scripts/paging-neutrality-gate.sh`
-/// does.
+/// The previous token-window scheme read each expert once per WINDOW, and
+/// contiguous token windows have essentially uncorrelated expert unions, so
+/// its redundancy grew with prompt length — measured 1.07x at 11 tokens but
+/// 9.06x at 365. Band-major is 1.0x by construction at any length.
+///
+/// Two passes because gate_up and down live in SEPARATE pools, so a band's
+/// gate_up residency does not conflict with any band's down residency, and
+/// SwiGLU is not idempotent — it must run once, between the passes, over the
+/// whole chunk.
 #[allow(clippy::too_many_arguments)]
 fn ffn_batched_routed_paged(
     paging: &std::sync::Mutex<crate::expert_pager::Ds4ExpertPaging>,
@@ -7884,162 +7886,135 @@ fn ffn_batched_routed_paged(
     route_scale: f32,
     swiglu_limit: f32,
 ) -> Result<(), String> {
-    use hipfire_dispatch::families::moe::MoePrefillRouting;
+    let params = hipfire_dispatch::families::moe::MoeBiasAwarePrefillParams {
+        hidden,
+        mi: im,
+        n_exp,
+        k_top,
+        batch_size,
+        route_scale,
+        swiglu_limit,
+        layer_idx,
+        routing: match routing {
+            hipfire_dispatch::families::moe::MoePrefillRouting::Hash { tid2eid, tokens } => {
+                hipfire_dispatch::families::moe::MoePrefillRouting::Hash { tid2eid, tokens }
+            }
+            hipfire_dispatch::families::moe::MoePrefillRouting::BiasAware { gate_bias } => {
+                hipfire_dispatch::families::moe::MoePrefillRouting::BiasAware { gate_bias }
+            }
+        },
+        scores: &pbs.moe_scores_batch,
+        topk_indices: &pbs.moe_topk_indices_batch,
+        topk_weights: &pbs.moe_topk_weights_batch,
+        expert_gate_up_ptrs: layer
+            .expert_gate_up_ptrs
+            .as_ref()
+            .ok_or_else(|| format!("ffn_batched l{layer_idx}: paged gate_up ptr table missing"))?,
+        expert_down_ptrs: layer
+            .expert_w2_ptrs
+            .as_ref()
+            .ok_or_else(|| format!("ffn_batched l{layer_idx}: paged w2 ptr table missing"))?,
+        x_rot: &pbs.ffn_x_rot_batch,
+        ffn_out: &pbs.ffn_out_batch,
+        expert_token_counts: &pbs.moe_expert_token_counts,
+        expert_offsets: &pbs.moe_expert_offsets,
+        sorted_slot_index: &pbs.moe_sorted_slot_index,
+        expert_tile_ids: &pbs.moe_expert_tile_ids,
+        inverse_perm: &pbs.moe_inverse_perm,
+        y_gate_up_grouped: &pbs.moe_y_gate_up_grouped,
+        y_down_grouped: &pbs.moe_y_down_grouped,
+        gate_batch: &pbs.moe_gate_batch,
+        up_batch: &pbs.moe_up_batch,
+        rot_batch: &pbs.moe_rot_batch,
+        down_expert_outputs: &pbs.moe_down_expert_outputs,
+    };
+    let family = hipfire_runtime::llama::moe_family();
 
-    // 1. Route the whole chunk. The family repeats this per window from the
-    //    same scores, so the assignment it acts on is the one read here.
-    match routing {
-        MoePrefillRouting::Hash { tid2eid, tokens } => gpu
-            .hash_router_normalize_f32_batched(
-                tid2eid,
-                &pbs.moe_scores_batch,
-                tokens,
-                &pbs.moe_topk_indices_batch,
-                &pbs.moe_topk_weights_batch,
-                n_exp as i32,
-                k_top as i32,
-                route_scale,
-                batch_size as i32,
-            )
-            .map_err(|e| format!("paged prefill hash route l{layer_idx}: {e:?}"))?,
-        MoePrefillRouting::BiasAware { gate_bias } => gpu
-            .deepseek4_moe_topk_bias_aware_batched_f32(
-                &pbs.moe_scores_batch,
-                gate_bias,
-                &pbs.moe_topk_indices_batch,
-                &pbs.moe_topk_weights_batch,
-                n_exp as i32,
-                k_top as i32,
-                route_scale,
-                batch_size as i32,
-            )
-            .map_err(|e| format!("paged prefill bias-aware route l{layer_idx}: {e:?}"))?,
-    }
+    // 1. Route + scatter once. After this, slots are ordered by expert.
+    family
+        .prefill_scatter(gpu, &params)
+        .map_err(|e| format!("ffn_batched l{layer_idx} paged scatter: {e}"))?;
 
-    // 2. Read the assignment and plan windows.
+    // 2. Read the per-tile expert ids and cut them into bands that fit the pool.
+    let n_tiles = (batch_size * k_top + n_exp * hipfire_dispatch::pipeline::GROUPED_BLOCK_M)
+        / hipfire_dispatch::pipeline::GROUPED_BLOCK_M;
     let mut p = paging
         .lock()
         .map_err(|_| format!("ffn_batched l{layer_idx}: expert pager mutex poisoned"))?;
-    let topk: Vec<u16> = p
-        .read_topk(&pbs.moe_topk_indices_batch, batch_size * k_top, n_exp, gpu)
-        .map_err(|e| format!("paged prefill l{layer_idx}: {e}"))?
-        .to_vec();
-    // Work accounting for the paged prefill. Wall-clock on this box is
-    // confounded by whatever else is reading the same disk, but these counts
-    // are not: `loads` is expert reads actually issued, `distinct` is the
-    // information-theoretic floor (every expert the chunk routes to must be
-    // read at least once), so `loads / distinct` is the redundancy factor
-    // that expert-major reordering would drive to 1.0.
     let miss_before = p.stats().1;
-    let windows =
-        crate::expert_pager::plan_prefill_windows(&topk, batch_size, k_top, p.slots_per_blob())
-            .map_err(|e| format!("paged prefill l{layer_idx}: {e}"))?;
+    let tile_experts: Vec<i32> = p
+        .read_tile_experts(&pbs.moe_expert_tile_ids, n_tiles, gpu)
+        .map_err(|e| format!("ffn_batched l{layer_idx}: {e}"))?
+        .to_vec();
+    let bands = crate::expert_pager::plan_expert_bands(&tile_experts, n_exp, p.slots_per_blob());
 
     let gate_up_blob = layer
         .expert_gate_up_blob
         .as_ref()
         .ok_or_else(|| format!("ffn_batched l{layer_idx}: paged gate_up pool missing"))?;
-    let gate_up_ptrs = layer
-        .expert_gate_up_ptrs
-        .as_ref()
-        .ok_or_else(|| format!("ffn_batched l{layer_idx}: paged gate_up ptr table missing"))?;
     let w2_blob = layer
         .expert_w2_blob
         .as_ref()
         .ok_or_else(|| format!("ffn_batched l{layer_idx}: paged w2 pool missing"))?;
-    let w2_ptrs = layer
-        .expert_w2_ptrs
-        .as_ref()
-        .ok_or_else(|| format!("ffn_batched l{layer_idx}: paged w2 ptr table missing"))?;
 
-    // 3. Page each window's union, then run the unchanged prefill MoE on it.
-    let n_win = windows.len();
-    for (start, len) in windows {
-        let union = crate::expert_pager::window_expert_union(&topk, start, len, k_top);
-        p.page_experts_both(
+    // 3. Pass A — gate_up per band.
+    for b in &bands {
+        p.ensure_resident(
             layer_idx as u16,
-            &union,
+            crate::expert_pager::ExpertBlobRole::GateUp,
+            &b.experts,
             gate_up_blob,
-            gate_up_ptrs,
+            params.expert_gate_up_ptrs,
             layer.expert_gate_up_stride,
+            gpu,
+        )
+        .map_err(|e| format!("ffn_batched l{layer_idx} gate_up band: {e}"))?;
+        family
+            .prefill_gate_up_band(gpu, &params, b.tile_begin, b.tile_count)
+            .map_err(|e| format!("ffn_batched l{layer_idx} gate_up band dispatch: {e}"))?;
+    }
+
+    // 4. Unscatter + SwiGLU + rotate once over the chunk.
+    family
+        .prefill_activate(gpu, &params)
+        .map_err(|e| format!("ffn_batched l{layer_idx} activate: {e}"))?;
+
+    // 5. Pass B — down per band.
+    for b in &bands {
+        p.ensure_resident(
+            layer_idx as u16,
+            crate::expert_pager::ExpertBlobRole::Down,
+            &b.experts,
             w2_blob,
-            w2_ptrs,
+            params.expert_down_ptrs,
             layer.expert_w2_stride,
             gpu,
         )
-        .map_err(|e| format!("ffn_batched l{layer_idx}: {e}"))?;
-
-        let scores_w = pbs.moe_scores_batch.sub_offset(start * n_exp, len * n_exp);
-        let idx_w = pbs
-            .moe_topk_indices_batch
-            .sub_offset(start * k_top, len * k_top);
-        let w_w = pbs
-            .moe_topk_weights_batch
-            .sub_offset(start * k_top, len * k_top);
-        let x_w = pbs.ffn_x_rot_batch.sub_offset(start * hidden, len * hidden);
-        let out_w = pbs.ffn_out_batch.sub_offset(start * hidden, len * hidden);
-        let tokens_w;
-        let routing_w = match routing {
-            MoePrefillRouting::Hash { tid2eid, tokens } => {
-                tokens_w = tokens.sub_offset(start, len);
-                MoePrefillRouting::Hash {
-                    tid2eid,
-                    tokens: &tokens_w,
-                }
-            }
-            MoePrefillRouting::BiasAware { gate_bias } => {
-                MoePrefillRouting::BiasAware { gate_bias }
-            }
-        };
-
-        let params = hipfire_dispatch::families::moe::MoeBiasAwarePrefillParams {
-            hidden,
-            mi: im,
-            n_exp,
-            k_top,
-            batch_size: len,
-            route_scale,
-            swiglu_limit,
-            layer_idx,
-            routing: routing_w,
-            scores: &scores_w,
-            topk_indices: &idx_w,
-            topk_weights: &w_w,
-            expert_gate_up_ptrs: gate_up_ptrs,
-            expert_down_ptrs: w2_ptrs,
-            x_rot: &x_w,
-            ffn_out: &out_w,
-            // Scratch is sized for the whole chunk and indexed from row 0
-            // within a dispatch, so a window reuses the same buffers.
-            expert_token_counts: &pbs.moe_expert_token_counts,
-            expert_offsets: &pbs.moe_expert_offsets,
-            sorted_slot_index: &pbs.moe_sorted_slot_index,
-            expert_tile_ids: &pbs.moe_expert_tile_ids,
-            inverse_perm: &pbs.moe_inverse_perm,
-            y_gate_up_grouped: &pbs.moe_y_gate_up_grouped,
-            y_down_grouped: &pbs.moe_y_down_grouped,
-            gate_batch: &pbs.moe_gate_batch,
-            up_batch: &pbs.moe_up_batch,
-            rot_batch: &pbs.moe_rot_batch,
-            down_expert_outputs: &pbs.moe_down_expert_outputs,
-        };
-        hipfire_runtime::llama::moe_family()
-            .run_bias_aware_prefill(gpu, &params)
-            .map_err(|e| format!("ffn_batched l{layer_idx} paged window dispatch: {e}"))?;
+        .map_err(|e| format!("ffn_batched l{layer_idx} down band: {e}"))?;
+        family
+            .prefill_down_band(gpu, &params, b.tile_begin, b.tile_count)
+            .map_err(|e| format!("ffn_batched l{layer_idx} down band dispatch: {e}"))?;
     }
+
+    // 6. Combine once.
+    family
+        .prefill_combine(gpu, &params)
+        .map_err(|e| format!("ffn_batched l{layer_idx} combine: {e}"))?;
 
     if crate::expert_pager::prefill_work_trace() {
         let loads = p.stats().1 - miss_before;
-        let mut distinct: Vec<u16> = Vec::new();
-        for &e in &topk {
-            if !distinct.contains(&e) {
-                distinct.push(e);
-            }
-        }
-        let floor = 2 * distinct.len() as u64; // both blobs per expert
+        let mut distinct: Vec<i32> = tile_experts
+            .iter()
+            .copied()
+            .filter(|&e| e >= 0 && (e as usize) < n_exp)
+            .collect();
+        distinct.sort_unstable();
+        distinct.dedup();
+        let floor = 2 * distinct.len() as u64;
         eprintln!(
-            "[prefill-work] l{layer_idx} batch={batch_size} windows={n_win} \
+            "[prefill-work] l{layer_idx} batch={batch_size} windows={} \
              distinct={} loads={loads} floor={floor} redundancy={:.2}x",
+            bands.len(),
             distinct.len(),
             if floor == 0 {
                 0.0
