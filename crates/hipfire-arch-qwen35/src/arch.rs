@@ -65,16 +65,18 @@ pub fn qwen35_tp_preflight(cfg: &Qwen35Config, tp: usize) -> Result<(), String> 
         ));
     }
 
-    for (layer, layer_type) in cfg.layer_types.iter().enumerate() {
-        let reason = match layer_type {
-            LayerType::LinearAttention => "DeltaNet wqkv",
-            LayerType::FullAttention => "packed QGate wq",
-        };
-        return Err(format!(
-            "qwen35: Tp={tp} is unsupported for {reason} (layer {layer})"
-        ));
-    }
-    Ok(())
+    // TP refusal is keyed off the first layer only: the loader does not
+    // materialize a TP manifest yet, so admission is structural policy on
+    // the packed layouts, not a per-layer check. An empty `layer_types`
+    // (n_layers == 0) still admits, as before.
+    let reason = match cfg.layer_types.first() {
+        Some(LayerType::LinearAttention) => "DeltaNet wqkv",
+        Some(LayerType::FullAttention) => "packed QGate wq",
+        None => return Ok(()),
+    };
+    Err(format!(
+        "qwen35: Tp={tp} is unsupported for {reason} (layer 0)"
+    ))
 }
 
 impl Architecture for Qwen35 {
