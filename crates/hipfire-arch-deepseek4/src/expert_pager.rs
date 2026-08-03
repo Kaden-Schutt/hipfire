@@ -424,6 +424,233 @@ impl Ds4ExpertPager {
     }
 }
 
+/// Encode a device pointer into the two-F32-slot table representation used by
+/// the indexed MoE GEMV. Pinned by `tests/expert_blob_contract.rs`.
+#[inline]
+pub fn encode_ptr_slots(out: &mut [f32], expert: usize, p: u64) {
+    out[expert * 2] = f32::from_bits((p & 0xffff_ffff) as u32);
+    out[expert * 2 + 1] = f32::from_bits((p >> 32) as u32);
+}
+
+/// What one dispatch must do for a single routed expert.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SlotFill {
+    pub key: ExpertKey,
+    /// Slot index within this (layer, role) blob.
+    pub slot: usize,
+    /// True when the slot does not already hold this expert and must be read.
+    pub needs_read: bool,
+}
+
+/// Everything paging needs at runtime, allocated once at load.
+///
+/// Split from [`Ds4ExpertPager`] so the bookkeeping stays unit-testable
+/// without a GPU: [`Ds4PagingRuntime::plan_dispatch`] is pure and does the
+/// fail-closed catalog check BEFORE any I/O happens.
+pub struct Ds4PagingRuntime {
+    pager: Ds4ExpertPager,
+    catalog: ExpertCatalog,
+    /// Host shadow of every (layer, role) device pointer table, `n_exp` u64s.
+    /// Patched in place, then re-uploaded when a dispatch changes it.
+    shadow: HashMap<(u16, ExpertBlobRole), Vec<u64>>,
+    /// Reusable encode buffer for one pointer table (`2 * n_exp` f32 slots).
+    encode_scratch: Vec<f32>,
+    n_exp: usize,
+}
+
+impl Ds4PagingRuntime {
+    /// Build the runtime. `layers` are the (layer id, HFQ prefix) pairs whose
+    /// experts are pageable; `initial_ptrs` is what the loader wrote into each
+    /// table, so a table that is never touched keeps its load-time contents.
+    pub fn new(
+        pager: Ds4ExpertPager,
+        catalog: ExpertCatalog,
+        n_exp: usize,
+        initial_ptrs: impl IntoIterator<Item = ((u16, ExpertBlobRole), Vec<u64>)>,
+    ) -> Result<Self, PagerError> {
+        let shadow: HashMap<_, _> = initial_ptrs.into_iter().collect();
+        for ((layer, role), v) in shadow.iter() {
+            if v.len() != n_exp {
+                return Err(PagerError::StrideMismatch {
+                    name: format!("layer {layer} {role:?} pointer table"),
+                    got: v.len(),
+                    want: n_exp,
+                });
+            }
+        }
+        Ok(Self {
+            pager,
+            catalog,
+            shadow,
+            encode_scratch: vec![0f32; 2 * n_exp],
+            n_exp,
+        })
+    }
+
+    pub fn slots_per_blob(&self) -> usize {
+        self.pager.slots_per_blob()
+    }
+
+    pub fn stats(&self) -> (u64, u64) {
+        self.pager.stats()
+    }
+
+    pub fn hit_rate(&self) -> f64 {
+        self.pager.hit_rate()
+    }
+
+    pub fn catalog(&self) -> &ExpertCatalog {
+        &self.catalog
+    }
+
+    /// Host shadow of a pointer table, for tests and for re-upload.
+    pub fn shadow(&self, layer: u16, role: ExpertBlobRole) -> Option<&[u64]> {
+        self.shadow.get(&(layer, role)).map(|v| v.as_slice())
+    }
+
+    /// Resolve every expert in `experts` to a slot and patch the host shadow.
+    ///
+    /// Pure bookkeeping: no allocation, no I/O. `out` is filled with one
+    /// [`SlotFill`] per requested expert, in request order; the caller reads
+    /// the bytes for entries with `needs_read` before dispatching.
+    ///
+    /// Fails closed BEFORE mutating anything if the working set cannot fit
+    /// (more distinct experts than slots would make them evict each other
+    /// mid-dispatch) or if any expert is absent from the catalog.
+    pub fn plan_dispatch(
+        &mut self,
+        layer: u16,
+        role: ExpertBlobRole,
+        experts: &[u16],
+        stride: usize,
+        blob_base: u64,
+        out: &mut Vec<SlotFill>,
+    ) -> Result<(), PagerError> {
+        out.clear();
+        // Distinct-expert count for THIS dispatch. Every one of them must be
+        // resident simultaneously, so the pool has to hold all of them.
+        let mut distinct = 0usize;
+        for (i, &e) in experts.iter().enumerate() {
+            if !experts[..i].contains(&e) {
+                distinct += 1;
+            }
+        }
+        if distinct > self.pager.slots_per_blob() {
+            return Err(PagerError::Sizing(PagerSizingError::BelowMinimum {
+                needed_slots: distinct,
+                got_slots: self.pager.slots_per_blob(),
+            }));
+        }
+        // Verify catalog coverage for every expert BEFORE touching residency,
+        // so a bad request cannot leave half-updated bookkeeping behind.
+        for &e in experts {
+            let key = ExpertKey {
+                layer,
+                expert: e,
+                role,
+            };
+            if e as usize >= self.n_exp {
+                return Err(PagerError::NotCatalogued { key });
+            }
+            if self.catalog.segments(key).is_none() {
+                return Err(PagerError::NotCatalogued { key });
+            }
+        }
+        let shadow = self
+            .shadow
+            .get_mut(&(layer, role))
+            .ok_or(PagerError::NotCatalogued {
+                key: ExpertKey {
+                    layer,
+                    expert: 0,
+                    role,
+                },
+            })?;
+        for &e in experts {
+            let key = ExpertKey {
+                layer,
+                expert: e,
+                role,
+            };
+            let (slot, needs_read) = self.pager.resolve_slot(key);
+            // Repoint unconditionally, hits included: cheap, and it removes
+            // any dependence on a previous dispatch having left the entry
+            // correct. A routed expert must never be left aimed at whatever
+            // the loader wrote (in the EP shard path that is a ZEROED dummy,
+            // which produces silence rather than an error).
+            shadow[e as usize] = blob_base + (slot * stride) as u64;
+            out.push(SlotFill {
+                key,
+                slot,
+                needs_read,
+            });
+        }
+        Ok(())
+    }
+
+    /// Encode the host shadow into the two-F32-slot device representation.
+    /// Returns the slice to upload into the layer's pointer table.
+    pub fn encoded_ptr_table(&mut self, layer: u16, role: ExpertBlobRole) -> Option<&[f32]> {
+        let shadow = self.shadow.get(&(layer, role))?;
+        for (e, &p) in shadow.iter().enumerate() {
+            encode_ptr_slots(&mut self.encode_scratch, e, p);
+        }
+        Some(&self.encode_scratch)
+    }
+
+    /// Segments to read for a miss, in blob order.
+    pub fn segments_for(&self, key: ExpertKey) -> Result<&[ExpertSegment], PagerError> {
+        self.catalog
+            .segments(key)
+            .ok_or(PagerError::NotCatalogued { key })
+    }
+}
+
+/// Environment knob that turns paging on. Unset (or unparseable, or `0`) keeps
+/// today's fully-resident behaviour.
+pub const EXPERT_CACHE_GB_ENV: &str = "HIPFIRE_DEEPSEEK4_EXPERT_CACHE_GB";
+
+/// Parse [`EXPERT_CACHE_GB_ENV`]. `None` = page nothing (fully resident,
+/// today's behaviour). Unparseable input yields `None` so a typo degrades to
+/// the safe path rather than to an arbitrary budget.
+pub fn expert_cache_budget_bytes(raw: Option<&str>) -> Option<u64> {
+    let v = raw?.trim().parse::<u64>().ok()?;
+    if v == 0 {
+        return None;
+    }
+    Some(v * 1024 * 1024 * 1024)
+}
+
+/// Bytes usable for the slot pool, given MemAvailable and everything the pager
+/// does NOT own (non-routed weights, KV/SWA caches, per-step scratch, headroom).
+/// Saturates at zero so an over-subscribed box yields a clean sizing error from
+/// [`plan_slots`] rather than an underflowed, enormous budget.
+pub fn auto_budget_bytes(mem_available_bytes: u64, reserved_bytes: u64) -> u64 {
+    mem_available_bytes.saturating_sub(reserved_bytes)
+}
+
+/// Final budget: the smaller of what the user asked for and what actually fits.
+/// Auto-size for convenience; the result is then fixed for the process lifetime.
+pub fn effective_budget_bytes(configured: Option<u64>, auto: u64) -> u64 {
+    match configured {
+        Some(c) => c.min(auto),
+        None => auto,
+    }
+}
+
+/// Read MemAvailable (kB) from /proc/meminfo, in bytes. `None` if unreadable,
+/// in which case the caller must fall back to the configured budget alone.
+pub fn mem_available_bytes() -> Option<u64> {
+    let s = std::fs::read_to_string("/proc/meminfo").ok()?;
+    for line in s.lines() {
+        if let Some(rest) = line.strip_prefix("MemAvailable:") {
+            let kb: u64 = rest.split_whitespace().next()?.parse().ok()?;
+            return Some(kb * 1024);
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -575,6 +802,228 @@ mod tests {
         let cat = ExpertCatalog::build_from(&layers, 4, |s| s, lookup_from(&idx)).expect("builds");
         assert_eq!(cat.len(), 3 * 4 * 2, "3 layers x 4 experts x 2 roles");
         assert!(!cat.is_empty());
+    }
+
+    fn runtime_with(n_exp: usize, slots: usize, layers: &[u16]) -> Ds4PagingRuntime {
+        let stride = 1024usize;
+        let prefixes: Vec<String> = layers.iter().map(|l| format!("layers.{l}")).collect();
+        let idx = fake_index(
+            &prefixes.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+            n_exp,
+            stride,
+        );
+        let pairs: Vec<(u16, String)> =
+            layers.iter().map(|&l| (l, format!("layers.{l}"))).collect();
+        let cat = ExpertCatalog::build_from(&pairs, n_exp, |s| s, lookup_from(&idx)).expect("cat");
+        let mut init = Vec::new();
+        for &l in layers {
+            for role in [ExpertBlobRole::GateUp, ExpertBlobRole::Down] {
+                init.push(((l, role), vec![0u64; n_exp]));
+            }
+        }
+        Ds4PagingRuntime::new(Ds4ExpertPager::new(slots), cat, n_exp, init).expect("runtime")
+    }
+
+    #[test]
+    fn plan_dispatch_reads_on_first_touch_and_reuses_on_the_second() {
+        let mut rt = runtime_with(16, 8, &[0]);
+        let mut out = Vec::with_capacity(8);
+        rt.plan_dispatch(
+            0,
+            ExpertBlobRole::GateUp,
+            &[3, 9, 1],
+            2048,
+            0x1000,
+            &mut out,
+        )
+        .expect("plans");
+        assert!(out.iter().all(|f| f.needs_read), "first touch must read");
+        rt.plan_dispatch(
+            0,
+            ExpertBlobRole::GateUp,
+            &[3, 9, 1],
+            2048,
+            0x1000,
+            &mut out,
+        )
+        .expect("plans");
+        assert!(
+            out.iter().all(|f| !f.needs_read),
+            "second touch must be all hits"
+        );
+    }
+
+    #[test]
+    fn plan_dispatch_repoints_every_requested_expert_including_hits() {
+        // A routed expert left pointing at the loader's entry reads the wrong
+        // weights (or, in the EP shard path, a zeroed dummy that yields
+        // silence). Every requested expert must be repointed every dispatch.
+        let mut rt = runtime_with(16, 8, &[0]);
+        let mut out = Vec::with_capacity(8);
+        let (stride, base) = (2048usize, 0x7f00_0000_0000u64);
+        rt.plan_dispatch(0, ExpertBlobRole::Down, &[5, 2], stride, base, &mut out)
+            .expect("plans");
+        rt.plan_dispatch(0, ExpertBlobRole::Down, &[5, 2], stride, base, &mut out)
+            .expect("plans");
+        let shadow = rt.shadow(0, ExpertBlobRole::Down).unwrap();
+        for f in &out {
+            assert_eq!(
+                shadow[f.key.expert as usize],
+                base + (f.slot * stride) as u64,
+                "expert {} not aimed at its slot",
+                f.key.expert
+            );
+        }
+        // Experts nobody asked for keep the loader's entry untouched.
+        assert_eq!(shadow[7], 0, "unrequested expert was repointed");
+    }
+
+    #[test]
+    fn plan_dispatch_refuses_a_working_set_larger_than_the_pool() {
+        // 4 slots cannot hold 5 distinct experts at once; they would evict
+        // each other mid-dispatch and the kernel would read the wrong weights.
+        let mut rt = runtime_with(16, 4, &[0]);
+        let mut out = Vec::new();
+        let err = rt
+            .plan_dispatch(
+                0,
+                ExpertBlobRole::GateUp,
+                &[0, 1, 2, 3, 4],
+                1024,
+                0x1000,
+                &mut out,
+            )
+            .expect_err("must fail closed");
+        assert!(
+            matches!(
+                err,
+                PagerError::Sizing(PagerSizingError::BelowMinimum {
+                    needed_slots: 5,
+                    got_slots: 4
+                })
+            ),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn plan_dispatch_counts_duplicates_once() {
+        // Prefill unions can repeat an expert; the pool only needs it once.
+        let mut rt = runtime_with(16, 2, &[0]);
+        let mut out = Vec::new();
+        rt.plan_dispatch(
+            0,
+            ExpertBlobRole::GateUp,
+            &[7, 7, 7, 1, 1],
+            1024,
+            0x1000,
+            &mut out,
+        )
+        .expect("2 distinct experts fit in 2 slots");
+        assert_eq!(out.len(), 5, "one fill per request, duplicates included");
+        assert_eq!(out[0].slot, out[1].slot);
+        assert!(out[0].needs_read && !out[1].needs_read);
+    }
+
+    #[test]
+    fn plan_dispatch_rejects_an_uncatalogued_expert_without_mutating_state() {
+        let mut rt = runtime_with(8, 4, &[0]);
+        let mut out = Vec::new();
+        let err = rt
+            .plan_dispatch(0, ExpertBlobRole::GateUp, &[1, 99], 1024, 0x1000, &mut out)
+            .expect_err("must fail closed");
+        assert!(
+            matches!(err, PagerError::NotCatalogued { .. }),
+            "got {err:?}"
+        );
+        // The valid expert in the same request must not have been paged in:
+        // a rejected dispatch leaves no half-applied bookkeeping behind.
+        assert_eq!(rt.stats(), (0, 0), "residency mutated on a rejected plan");
+        assert_eq!(rt.shadow(0, ExpertBlobRole::GateUp).unwrap()[1], 0);
+    }
+
+    #[test]
+    fn encoded_ptr_table_round_trips_the_shadow() {
+        let mut rt = runtime_with(4, 2, &[0]);
+        let mut out = Vec::new();
+        let (stride, base) = (4096usize, 0x7f12_3456_0000u64);
+        rt.plan_dispatch(0, ExpertBlobRole::Down, &[3], stride, base, &mut out)
+            .expect("plans");
+        let want = rt.shadow(0, ExpertBlobRole::Down).unwrap().to_vec();
+        let enc = rt.encoded_ptr_table(0, ExpertBlobRole::Down).unwrap();
+        assert_eq!(enc.len(), 2 * 4);
+        for (e, &p) in want.iter().enumerate() {
+            let lo = enc[e * 2].to_bits() as u64;
+            let hi = enc[e * 2 + 1].to_bits() as u64;
+            assert_eq!((hi << 32) | lo, p, "expert {e} pointer did not round-trip");
+        }
+    }
+
+    #[test]
+    fn layers_do_not_share_pointer_tables() {
+        let mut rt = runtime_with(8, 4, &[0, 1]);
+        let mut out = Vec::new();
+        rt.plan_dispatch(0, ExpertBlobRole::GateUp, &[2], 1024, 0xA000, &mut out)
+            .expect("plans");
+        assert_ne!(rt.shadow(0, ExpertBlobRole::GateUp).unwrap()[2], 0);
+        assert_eq!(
+            rt.shadow(1, ExpertBlobRole::GateUp).unwrap()[2],
+            0,
+            "layer 0 dispatch leaked into layer 1's table"
+        );
+    }
+
+    #[test]
+    fn cache_gb_env_absent_means_fully_resident() {
+        assert_eq!(expert_cache_budget_bytes(None), None);
+    }
+
+    #[test]
+    fn cache_gb_env_parses_to_bytes() {
+        assert_eq!(
+            expert_cache_budget_bytes(Some("40")),
+            Some(40 * 1024 * 1024 * 1024)
+        );
+    }
+
+    #[test]
+    fn cache_gb_env_rejects_garbage_rather_than_defaulting() {
+        assert_eq!(expert_cache_budget_bytes(Some("banana")), None);
+        // Zero is "off", not a zero-byte cache that could never make progress.
+        assert_eq!(expert_cache_budget_bytes(Some("0")), None);
+    }
+
+    #[test]
+    fn auto_budget_subtracts_reservations_from_available() {
+        // 100 GiB available, 10 GiB reserved => 90 GiB usable.
+        let got = auto_budget_bytes(100 * 1024 * 1024 * 1024, 10 * 1024 * 1024 * 1024);
+        assert_eq!(got, 90 * 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn auto_budget_saturates_at_zero_rather_than_underflowing() {
+        // Reservations exceed what's available: must not wrap around.
+        assert_eq!(
+            auto_budget_bytes(4 * 1024 * 1024 * 1024, 9 * 1024 * 1024 * 1024),
+            0
+        );
+    }
+
+    #[test]
+    fn effective_budget_takes_the_smaller_of_configured_and_available() {
+        let avail = 90u64 * 1024 * 1024 * 1024;
+        // Configured smaller than available => configured wins.
+        assert_eq!(
+            effective_budget_bytes(Some(40 * 1024 * 1024 * 1024), avail),
+            40 * 1024 * 1024 * 1024
+        );
+        // Configured larger than available => clamped to available.
+        assert_eq!(
+            effective_budget_bytes(Some(200 * 1024 * 1024 * 1024), avail),
+            avail
+        );
+        // Nothing configured => use all available.
+        assert_eq!(effective_budget_bytes(None, avail), avail);
     }
 
     #[test]

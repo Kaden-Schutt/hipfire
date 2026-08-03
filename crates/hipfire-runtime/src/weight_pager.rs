@@ -267,6 +267,18 @@ impl PreadH2DTransport {
         &self.path
     }
 
+    /// Grow the host staging buffer to `len` bytes up front.
+    ///
+    /// [`Transport::fetch_into`] grows `staging` on demand, which would be an
+    /// allocation on the forward path — exactly what a bounded pager promises
+    /// not to do. Calling this once at load with the largest expert size makes
+    /// every later `fetch_into` allocation-free.
+    pub fn reserve_staging(&mut self, len: usize) {
+        if self.staging.len() < len {
+            self.staging.resize(len, 0);
+        }
+    }
+
     fn next_handle(&mut self) -> TransferHandle {
         let h = TransferHandle(self.next_handle);
         self.next_handle += 1;
