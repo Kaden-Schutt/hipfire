@@ -1015,6 +1015,18 @@ pub fn window_expert_union(topk: &[u16], start: usize, len: usize, k_top: usize)
     u
 }
 
+/// `HIPFIRE_DEEPSEEK4_PREFILL_WORK_TRACE=1` — per-layer paged-prefill work
+/// accounting (windows, distinct experts, actual loads, redundancy factor).
+///
+/// Counts, not timings: wall-clock on a shared box is confounded by anything
+/// else touching the same disk, but "how many expert reads did we issue
+/// versus the minimum possible" is not.
+pub fn prefill_work_trace() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("HIPFIRE_DEEPSEEK4_PREFILL_WORK_TRACE").as_deref() == Ok("1"))
+}
+
 /// Environment knob that turns paging on. Unset (or unparseable, or `0`) keeps
 /// today's fully-resident behaviour.
 pub const EXPERT_CACHE_GB_ENV: &str = "HIPFIRE_DEEPSEEK4_EXPERT_CACHE_GB";

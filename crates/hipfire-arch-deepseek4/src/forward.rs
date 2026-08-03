@@ -7814,6 +7814,13 @@ fn ffn_batched_routed_paged(
         .read_topk(&pbs.moe_topk_indices_batch, batch_size * k_top, n_exp, gpu)
         .map_err(|e| format!("paged prefill l{layer_idx}: {e}"))?
         .to_vec();
+    // Work accounting for the paged prefill. Wall-clock on this box is
+    // confounded by whatever else is reading the same disk, but these counts
+    // are not: `loads` is expert reads actually issued, `distinct` is the
+    // information-theoretic floor (every expert the chunk routes to must be
+    // read at least once), so `loads / distinct` is the redundancy factor
+    // that expert-major reordering would drive to 1.0.
+    let miss_before = p.stats().1;
     let windows =
         crate::expert_pager::plan_prefill_windows(&topk, batch_size, k_top, p.slots_per_blob())
             .map_err(|e| format!("paged prefill l{layer_idx}: {e}"))?;
@@ -7836,6 +7843,7 @@ fn ffn_batched_routed_paged(
         .ok_or_else(|| format!("ffn_batched l{layer_idx}: paged w2 ptr table missing"))?;
 
     // 3. Page each window's union, then run the unchanged prefill MoE on it.
+    let n_win = windows.len();
     for (start, len) in windows {
         let union = crate::expert_pager::window_expert_union(&topk, start, len, k_top);
         p.page_experts_both(
@@ -7908,6 +7916,27 @@ fn ffn_batched_routed_paged(
         hipfire_runtime::llama::moe_family()
             .run_bias_aware_prefill(gpu, &params)
             .map_err(|e| format!("ffn_batched l{layer_idx} paged window dispatch: {e}"))?;
+    }
+
+    if crate::expert_pager::prefill_work_trace() {
+        let loads = p.stats().1 - miss_before;
+        let mut distinct: Vec<u16> = Vec::new();
+        for &e in &topk {
+            if !distinct.contains(&e) {
+                distinct.push(e);
+            }
+        }
+        let floor = 2 * distinct.len() as u64; // both blobs per expert
+        eprintln!(
+            "[prefill-work] l{layer_idx} batch={batch_size} windows={n_win} \
+             distinct={} loads={loads} floor={floor} redundancy={:.2}x",
+            distinct.len(),
+            if floor == 0 {
+                0.0
+            } else {
+                loads as f64 / floor as f64
+            },
+        );
     }
     Ok(())
 }
