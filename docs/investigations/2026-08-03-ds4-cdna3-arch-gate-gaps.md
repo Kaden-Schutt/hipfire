@@ -438,6 +438,94 @@ never on MI300X.
   `-p hipfire-arch-deepseek4 --example dspark_bench` with no `--features`.
 - Artifacts staged at `/home/kaden/.cache/hipfire-surgery/`.
 
+## DSpark on gfx1151 loses to AR — and DFlash is the reference for why
+
+Measured on the PRODUCTION daemon path (gfx1151, 0731 MQ2R trunk
+sha256 `cbf2bbcf…8cce`, `hipfire run`, 64 tokens, temp 0), after fixing
+`hipfire run` (`3d74c9c47`):
+
+```
+--spec off     27.7 tok/s  drafter=ar      tau=1.00
+--spec dspark  13.7 tok/s  drafter=dspark  tau=1.17  accept=39%  (29 windows)
+```
+
+DSpark is a **2x LOSS**. The AR figure corroborates the independent
+product-bench on the same box/model (`hip=24.78`, `auto=27.98` at ctx2048), so
+the baseline is sound. Note this INVERTS the `dspark_bench` picture (1.72x
+"win"): that harness's AR is 8.39 tok/s, ~3x slower than production, so it
+flatters speculation. Do not size speculation with `dspark_bench`.
+
+### The arithmetic
+
+The daemon's own fitted cost model prints `dt=14.61ms t_ar=121.1ms
+(ratio=0.121)`. AR is 27.7 tok/s = **36.1 ms/token**. Break-even needs
+`tau / (t_ar + N*dt) > 1/36.1`:
+
+| N | window ms | break-even tau |
+|---|---|---|
+| 2 | 150.3 | **4.16** |
+| 5 | 194.2 | **5.38** |
+
+Measured tau is **1.17**. DSpark is not marginally behind — it needs tau > 4 to
+break even, which no realistic draft delivers. **The lever is `t_ar`, not tau
+and not draft cost.** Even free drafting (`dt=0`) at tau=2 gives
+2/121.1ms = 16.5 tok/s, still under AR's 27.7.
+
+### What DFlash does differently (the reference)
+
+DFlash works — 4x on 27B code. A wrong hypothesis first, for the record: I
+assumed DS4 verify was on the prefill path while DFlash used a decode path.
+**False.** DFlash's verify is ALSO prefill-batch shaped
+(`crates/hipfire-arch-qwen35/src/speculative.rs:2156,2413,2446,4087`). The
+difference is narrower:
+
+| | verify forward | graph-captured |
+|---|---|---|
+| DFlash | `forward_prefill_batch_single_chunk_captured_opts` | **YES** |
+| DS4 AR decode | `decode_step_with_graph` (forward.rs:3217) | **YES** |
+| **DS4 DSpark verify** | `forward_prefill_batch_chunked` (spec_impl.rs:253) | **NO** |
+
+`spec_impl.rs` contains ZERO graph-capture calls — every "captured" in that file
+refers to hidden states, not hipGraphs. DS4 already owns the machinery
+(`begin_graph_capture`/`end_graph_capture`, forward.rs:3217-3224) and uses it for
+its own AR decode; DSpark verify simply never got it.
+
+DFlash documents the payoff of exactly this change
+(`speculative.rs:2298-2301`): default-on for eligible models, "+14 % tok/s
+25.6->29.2, wall-per-cycle 89->80 ms via coalescing verify kernels into one graph
+replay and saving ~1.3 ms of per-cycle launch overhead". Opt out with
+`HIPFIRE_VERIFY_GRAPH=0`.
+
+Its eligibility rules are also the porting spec (`speculative.rs:2285-2296`): the
+captured forward bakes in N via kernel grid dims, kernel selection, and
+weight/buffer pointers; per-cycle inputs must be device buffers whose CONTENTS
+change. Narrow eligibility: single-chunk only, no tree-verify (per-cycle
+attention bias), pbs must be Some. And a warning worth heeding —
+`HIPFIRE_VERIFY_GRAPH_TREE` is DIAGNOSTIC ONLY, known to collapse tau on code
+(7.08 -> 4.51) when the captured region bakes in first-cycle state. That is the
+failure mode to test for.
+
+### Ordered plan
+
+1. **Port DFlash's captured single-chunk verify to DSpark.** Necessary, but +14%
+   on its own does not close a 3.4x gap — so also find why one DS4 verify call
+   costs 121 ms against a 36 ms decode step. A 6-row verify should not cost 3.4
+   single-token steps.
+2. **MQ4 the sidecar.** It is Q8F16 today (`deepseek4-q8-mtp` falls back to
+   Q8F16, quantize main.rs:5082), ~6.0 GB, where DFlash drafts ship MQ4.
+   At ~256 GB/s the measured `dt=14.61ms` ~ 3.7 GB of traffic, so the draft IS
+   weight-bandwidth-bound and halving it should roughly halve `dt`.
+   `deepseek4-mq4lloyd` / `deepseek4-mq3lloyd` already exist. But this only
+   attacks `dt`: at N=5 it saves ~37 ms of a 194 ms window (13.7 -> ~16.9 tok/s),
+   still under AR. Do it AFTER `t_ar`.
+3. **Then revisit block depth.** The Q8 B-curve is flat on gfx1151 out to B=13,
+   so once the window intercept is sane, deep blocks are nearly free and the
+   optimum is bounded by acceptance.
+
+Note the draft HEAD is not the problem: DSpark binds the trunk head, which under
+MQ2R is qt=35 MFP4G32E8SOA (~4-bit, ~281 MB) — already MQ4-class. The 6.0 GB of
+Q8/F16 draft STAGES are the mass.
+
 ## Reproduction
 
 ```bash
