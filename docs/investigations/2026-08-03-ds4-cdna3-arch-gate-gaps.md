@@ -344,10 +344,12 @@ at `/mnt/scratch/quantization/deepseek-v4-flash-0731-teacher/`), long-context
 ground truth, and calibration compute. Do NOT use it to tune block size,
 thresholds, or to quote tau/accept.
 
-## CONFIRMED ON TARGET: MQ2R DSpark works on gfx1151
+## CONFIRMED ON TARGET: MQ2R DSpark ACCEPTS on gfx1151 (correctness, not a perf claim)
 
 The E8 draft-head fix (`c420159e2`) was predicted to transfer, because it is
-recipe-driven and architecture-independent. It does.
+recipe-driven and architecture-independent. **It does** — as a correctness
+result. The throughput figure below is harness-local and must NOT be quoted as a
+production speedup; see the correction at the end of this section.
 
 gfx1151 (Radeon 8060S / Strix Halo, HIP device 1), 0731 MQ2R trunk
 (sha256 `cbf2bbcf…8cce`, verified on-box) plus a metadata-stamped
@@ -357,17 +359,50 @@ gfx1151 (Radeon 8060S / Strix Halo, HIP device 1), 0731 MQ2R trunk
 ```
 DSpark  tok/s=14.42  tau=2.286  accept=0.538 (35/65)
 AR      tok/s= 8.39
-                                   => 1.72x
 ```
 
-Against the historical gfx1151 measurement for this artifact class — **0 of 89
-accepted, tau 1.016** (`2026-07-24-dspark-mq2r-p3`). So
-`registry/deepseek4-mq2r-gfx1151-v2.json`'s
+**The load-bearing number is `accept=0.538`**, against the historical gfx1151
+measurement for this artifact class of **0 of 89 accepted, tau 1.016**
+(`2026-07-24-dspark-mq2r-p3`). Acceptance is a property of the model and the
+draft path, not of the harness, so this result stands on its own.
+
+Therefore `registry/deepseek4-mq2r-gfx1151-v2.json`'s
 `rejected_mq2lloyd_payload_diagnostic_only` and the recipe spec's rejected
-restamp (7.92 vs 30.21 AR) are **disproven on the target hardware**: the sidecar
-was fine, the missing `MFP4G32E8SOA` match arm in
+restamp (7.92 vs 30.21 AR) are **wrong about the cause** on the target hardware:
+the sidecar was fine, the missing `MFP4G32E8SOA` match arm in
 `dspark_core::gemv_auto_batched_wmma` was the defect. Both records should be
-updated.
+updated. Whether a properly P3-calibrated sidecar beats a restamped one is now
+an open question that can finally be asked on a fair basis.
+
+### CORRECTION: the 1.72x is harness-local, not a production number
+
+`dspark_bench` is a research loop, not the production decode path. On the SAME
+GPU with the SAME model file and digest, today's product bench via the daemon
+measured **24.78 tok/s** at ctx 2048
+(`hipx:/home/kaden/ds4-gfx1151-evidence/2026-08-03-ds4-0731-scoregrid-headpair/product-bench.json`,
+`us_per_token=40356`, `kv_mode=q8`, `daemon_sha256=b82085af…`), versus
+`dspark_bench`'s AR at **8.39 tok/s**. A ~3x harness gap.
+
+Ruled out as causes: KV mode (forcing `HIPFIRE_KV_MODE=q8` changed nothing —
+8.39 both ways; at 77 tokens of context KV traffic is negligible) and JIT
+(`HIPFIRE_DEEPSEEK4_WARMUP=48` changed nothing). The remaining difference is the
+binary and the path: the daemon carries graph capture, retained replay and the
+optimised decode loop.
+
+Two consequences:
+1. **Do not quote 1.72x.** DSpark has NOT been measured on the production daemon
+   path on gfx1151. Against a 3x-faster AR baseline the ratio will compress, as
+   it did on MI300X (1.09x against a fast MQ2R trunk vs 1.53x against a slow
+   MQ2-Lloyd one). The next measurement must be daemon-side.
+2. **`dspark_bench` AR is not a valid perf baseline on gfx1151** and should not
+   be used for one. It remains fine for acceptance/tau, which is what it was
+   used for here.
+
+Also observed: `.hipfire_kernels/` in that checkout holds a **gfx1100** cache
+(261 kernels), so gfx1151 JITs cold, and the startup banner prints the
+**gfx942** lever block (`deepseek4 gfx942 A2 levers: … F2 indexer_topk_bounded=OFF
+(gfx942-v1 default ON …)`) even when the loader has selected `gfx1151 route v2`.
+That banner is misleading on RDNA and cost real debugging time here.
 
 ### The rig-fidelity prediction held quantitatively
 
