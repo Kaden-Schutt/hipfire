@@ -65,10 +65,11 @@ pub fn qwen35_tp_preflight(cfg: &Qwen35Config, tp: usize) -> Result<(), String> 
         ));
     }
 
-    // TP refusal is keyed off the first layer only: the loader does not
-    // materialize a TP manifest yet, so admission is structural policy on
-    // the packed layouts, not a per-layer check. An empty `layer_types`
-    // (n_layers == 0) still admits, as before.
+    // Every non-empty Qwen35 topology is refused for TP>1: the loader does
+    // not materialize a TP manifest yet, so admission is structural policy
+    // on the packed layouts, not a per-layer check. The first layer is
+    // inspected only to pick the diagnostic reason naming that layout. An
+    // empty `layer_types` (n_layers == 0) still admits, as before.
     let reason = match cfg.layer_types.first() {
         Some(LayerType::LinearAttention) => "DeltaNet wqkv",
         Some(LayerType::FullAttention) => "packed QGate wq",
@@ -614,6 +615,11 @@ mod tests {
             err,
             "qwen35: Tp=2 is unsupported for packed QGate wq (layer 0)"
         );
+    }
+
+    #[test]
+    fn tp_preflight_allows_empty_topology() {
+        qwen35_tp_preflight(&config(&[]), 2).unwrap();
     }
 
     #[test]
