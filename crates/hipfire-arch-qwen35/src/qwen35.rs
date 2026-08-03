@@ -87,18 +87,6 @@ fn f16_lm_head_mode_from_env() -> F16LmHeadMode {
 /// Tree mode requires the batched FA path (`fa_batched_ok`); the per-token
 /// FA fallback always uses causal attention and cannot honor a tree mask.
 /// `forward_prefill_batch` returns an error if tree mode is requested but
-/// any FA layer would take the fallback path.
-///
-/// GDN (LinearAttention) layers: if `parent_indices` is `Some`, the
-/// DeltaNet branch dispatches the tree-aware kernels
-/// (`conv1d_silu_split_tree_f32_n` + `gated_delta_net_q8_tree_batch_seq`)
-/// which walk per-token ancestor chains via `parent_indices` instead of
-/// the linear-sequence predecessor. This eliminates sibling-subtree
-/// cross-contamination of recurrent state at topk>1. If `parent_indices`
-/// is `None`, LA layers fall back to the linear path (byte-exact with
-/// DFlash at topk=1; approximation at topk>1 — used by pre-Phase-3
-/// callers that haven't been rewritten).
-
 /// Override the embedding for a single batch slot after the embedding-lookup
 /// kernel runs but before the layer loop. Used by the Qualcomm-style MTP
 /// probe (mtp_probe.rs) to inject mask-token embeddings whose values come
@@ -747,19 +735,6 @@ fn wt_ref_from_weight_tensor(wt: &WeightTensor) -> hipfire_dispatch::families::g
 }
 
 impl<'a> MoeFfnView<'a> {
-    // ── Internal dispatch helpers ─────────────────────────────────────
-
-    fn is_frozen(&self) -> bool {
-        matches!(self, MoeFfnView::Frozen(_))
-    }
-
-    fn as_legacy(&self) -> Option<&'a MoeFfnWeights> {
-        match self {
-            MoeFfnView::Legacy(ffn) => Some(ffn),
-            MoeFfnView::Frozen(_) => None,
-        }
-    }
-
     fn frozen_bindings(&self) -> &crate::store::MoeFfnBindings<'a> {
         match self {
             MoeFfnView::Legacy(_) => panic!("frozen_bindings called on Legacy variant"),
@@ -790,19 +765,12 @@ impl<'a> MoeFfnView<'a> {
         }
     }
 
-    fn router_k(&self) -> usize {
-        match self {
-            MoeFfnView::Legacy(ffn) => ffn.router.k,
-            MoeFfnView::Frozen { .. } => self.proj().map_or(0, |p| p.router.k),
-        }
-    }
-
     fn router_has_awq(&self) -> bool {
         match self {
             MoeFfnView::Legacy(ffn) => ffn.router.awq_scale.is_some(),
             MoeFfnView::Frozen { .. } => self
                 .proj()
-                .map_or(false, |p| p.router.awq_companion_key.is_some()),
+                .is_some_and(|p| p.router.awq_companion_key.is_some()),
         }
     }
 
@@ -811,7 +779,7 @@ impl<'a> MoeFfnView<'a> {
             MoeFfnView::Legacy(ffn) => ffn.shared_expert_gate.awq_scale.is_some(),
             MoeFfnView::Frozen { .. } => self
                 .proj()
-                .map_or(false, |p| p.shared_expert_gate.awq_companion_key.is_some()),
+                .is_some_and(|p| p.shared_expert_gate.awq_companion_key.is_some()),
         }
     }
 
@@ -820,7 +788,7 @@ impl<'a> MoeFfnView<'a> {
             MoeFfnView::Legacy(ffn) => ffn.shared_expert.gate.awq_scale.is_some(),
             MoeFfnView::Frozen { .. } => self
                 .proj()
-                .map_or(false, |p| p.shared_gate.awq_companion_key.is_some()),
+                .is_some_and(|p| p.shared_gate.awq_companion_key.is_some()),
         }
     }
 
@@ -829,14 +797,7 @@ impl<'a> MoeFfnView<'a> {
             MoeFfnView::Legacy(ffn) => ffn.shared_expert.up.awq_scale.is_some(),
             MoeFfnView::Frozen { .. } => self
                 .proj()
-                .map_or(false, |p| p.shared_up.awq_companion_key.is_some()),
-        }
-    }
-
-    fn router_paro_present(&self) -> bool {
-        match self {
-            MoeFfnView::Legacy(ffn) => ffn.router.paro.is_some(),
-            MoeFfnView::Frozen { .. } => false, // Frozen store has no Paro rotation
+                .is_some_and(|p| p.shared_up.awq_companion_key.is_some()),
         }
     }
 
@@ -963,16 +924,6 @@ impl<'a> MoeFfnView<'a> {
         }
     }
 
-    fn expert_gate_up_m(&self, idx: usize) -> usize {
-        match self {
-            MoeFfnView::Legacy(ffn) => ffn.experts.get(idx).map_or(0, |e| e.gate_up.m),
-            MoeFfnView::Frozen { .. } => self
-                .proj()
-                .and_then(|p| p.expert_gate_up.get(idx))
-                .map_or(0, |d| d.m),
-        }
-    }
-
     fn expert_gate_up_k(&self, idx: usize) -> usize {
         match self {
             MoeFfnView::Legacy(ffn) => ffn.experts.get(idx).map_or(0, |e| e.gate_up.k),
@@ -1087,7 +1038,7 @@ impl<'a> MoeFfnView<'a> {
     fn routed_down_awq_present(&self) -> bool {
         match self {
             MoeFfnView::Legacy(ffn) => ffn.expert_down_awq_ptrs.is_some(),
-            MoeFfnView::Frozen { .. } => self.proj().map_or(false, |p| p.expert_down_awq.is_some()),
+            MoeFfnView::Frozen { .. } => self.proj().is_some_and(|p| p.expert_down_awq.is_some()),
         }
     }
 
@@ -1126,6 +1077,7 @@ impl<'a> MoeFfnView<'a> {
     /// path ([`crate::store::MoeFfnMetaView::has_mq6`]) so the two storage
     /// kinds cannot diverge: router, shared_expert_gate, shared gate/up/
     /// down, or ANY routed expert gate_up/down (uniform or graded).
+    #[cfg(test)]
     fn has_mq6(&self) -> bool {
         match self {
             MoeFfnView::Legacy(ffn) => {
@@ -1160,13 +1112,9 @@ impl<'a> MoeFfnView<'a> {
     }
 
     /// Extract MoePrefillDtypes from this view using metadata only.
+    #[cfg(test)]
     fn prefill_dtypes(&self) -> Option<MoePrefillDtypes> {
         self.to_snapshot().prefill_dtypes()
-    }
-
-    /// Whether this FFN is admissible for batched prefill.
-    fn batched_admissible(&self, admit_mq6: bool, arch: &str) -> bool {
-        self.to_snapshot().batched_admissible(admit_mq6, arch)
     }
 
     // ── Fallible tensor accessors ─────────────────────────────────────
@@ -1440,14 +1388,6 @@ impl<'a> MoeFfnView<'a> {
             MoeFfnView::Frozen { .. } => None,
         }
     }
-
-    /// First expert's down AWQ scale (if any).
-    fn first_expert_down_awq(&self) -> Option<&'a GpuTensor> {
-        match self {
-            MoeFfnView::Legacy(ffn) => ffn.experts.first().and_then(|e| e.down.awq_scale.as_ref()),
-            MoeFfnView::Frozen { .. } => None,
-        }
-    }
 }
 
 /// Test-only routed-ref resolution instrumentation (call-count seam).
@@ -1581,6 +1521,10 @@ pub struct FullAttnMoeLayerWeights {
     pub(crate) ffn: MoeFfnStorage,
 }
 
+#[expect(
+    clippy::large_enum_variant,
+    reason = "variants carry complete per-layer weight sets assembled at load time (dense LA/FA + MoE)"
+)]
 pub enum LayerWeights {
     DeltaNet(DeltaNetLayerWeights),
     FullAttn(FullAttnLayerWeights),
@@ -3260,7 +3204,7 @@ fn load_weight_tensor_raw(
             // stale or externally-quantized file fails at load instead of panicking on
             // first dispatch.
             assert!(
-                k % 256 == 0,
+                k.is_multiple_of(256),
                 "HFP4G32 v1 lm_head has K={k} but kernel requires K%256==0"
             );
             let buf = gpu.upload_raw(data, &[data.len()])?;
@@ -3278,7 +3222,7 @@ fn load_weight_tensor_raw(
             // MFP4G32 — HFP4G32 + offline FWHT. Drop-in MQ4 replacement; same byte
             // layout as qtype 21 with format_flags=0x05 stamped in the per-row hdr.
             assert!(
-                k % 256 == 0,
+                k.is_multiple_of(256),
                 "MFP4G32 lm_head has K={k} but kernel + FWHT both require K%256==0"
             );
             let buf = gpu.upload_raw(data, &[data.len()])?;
@@ -3295,7 +3239,7 @@ fn load_weight_tensor_raw(
         32 => {
             // MFP4G32Lloyd lm_head: mfp4 rows + 32-B per-tensor fp16 codebook prefix.
             assert!(
-                k % 256 == 0,
+                k.is_multiple_of(256),
                 "MFP4G32Lloyd lm_head has K={k} but kernel + FWHT both require K%256==0"
             );
             let buf = gpu.upload_raw(data, &[data.len()])?;
@@ -3313,7 +3257,7 @@ fn load_weight_tensor_raw(
             // MFP4G32P lm_head: mfp4+P — mfp4 rows with E4M3 per-block scale. NO prefix;
             // byte-identical layout to MFP4G32 (qt 24).
             assert!(
-                k % 256 == 0,
+                k.is_multiple_of(256),
                 "MFP4G32P lm_head has K={k} but kernel + FWHT both require K%256==0"
             );
             let buf = gpu.upload_raw(data, &[data.len()])?;
@@ -3331,7 +3275,7 @@ fn load_weight_tensor_raw(
             // MFP4G32E8 lm_head: mfp4-E8 — mfp4+P container, NO prefix, same row_bytes;
             // per-32-block 16 E2M1 nibbles replaced by 4x32-bit E8-lattice codewords.
             assert!(
-                k % 256 == 0,
+                k.is_multiple_of(256),
                 "MFP4G32E8 lm_head has K={k} but kernel + FWHT both require K%256==0"
             );
             let buf = gpu.upload_raw(data, &[data.len()])?;
@@ -3349,7 +3293,7 @@ fn load_weight_tensor_raw(
             // MFP3G32E8: mfp4-E8 frame with 3-bit lattice, 13 B/blk, 3.25 bpw.
             // Drop-in cold tier for MQ3G256Lloyd (kernel tag 5).
             assert!(
-                k % 256 == 0,
+                k.is_multiple_of(256),
                 "MFP3G32E8 has K={k} but FWHT requires K%256==0"
             );
             let buf = gpu.upload_raw(data, &[data.len()])?;
@@ -3367,7 +3311,7 @@ fn load_weight_tensor_raw(
             // MFP2G32E8: mfp4-E8 frame with 2-bit lattice, 9 B/blk, 2.25 bpw.
             // Drop-in cold tier for MQ2G256Lloyd (kernel tag 6).
             assert!(
-                k % 256 == 0,
+                k.is_multiple_of(256),
                 "MFP2G32E8 has K={k} but FWHT requires K%256==0"
             );
             let buf = gpu.upload_raw(data, &[data.len()])?;
@@ -3460,7 +3404,7 @@ fn load_weight_tensor_raw(
         35 => {
             // MFP4G32E8SOA lm_head: mfp4-E8 SoA layout for coalesced GEMV.
             assert!(
-                k % 256 == 0,
+                k.is_multiple_of(256),
                 "MFP4G32E8SOA lm_head has K={k} but kernel + FWHT both require K%256==0"
             );
             let buf = gpu.upload_raw(data, &[data.len()])?;
@@ -3512,12 +3456,9 @@ fn attach_awq_scale_candidates(
         return Ok(wt);
     }
     for name in names {
-        match load_awq_scale_for(hfq, gpu, name, k)? {
-            Some(scale) => {
-                wt.awq_scale = Some(scale);
-                return Ok(wt);
-            }
-            None => {}
+        if let Some(scale) = load_awq_scale_for(hfq, gpu, name, k)? {
+            wt.awq_scale = Some(scale);
+            return Ok(wt);
         }
     }
     Ok(wt)
@@ -3554,7 +3495,7 @@ pub(crate) fn load_weight_tensor(
             .as_deref()
             .map(|matched_name| vec![matched_name, name])
             .unwrap_or_else(|| vec![name]);
-        return attach_awq_scale_candidates(wt, hfq, gpu, &names, k);
+        attach_awq_scale_candidates(wt, hfq, gpu, &names, k)
     }
     #[cfg(not(unix))]
     {
@@ -3628,1392 +3569,6 @@ fn load_weight_tensor_keep(
         .map(|mn| vec![mn, name])
         .unwrap_or_else(|| vec![name]);
     attach_awq_scale_candidates(wt, hfq, gpu, &names, k)
-}
-
-// ─── ParoQuant AWQ → HFQ4G128 repack ────────────────────────────────────────
-
-/// Repack AWQ-format INT4 weights into HFQ4G128 inline layout.
-///
-/// AWQ layout (3 separate tensors):
-///   qweight: I32 [in_dim, out_dim/8] — 8 nibbles per I32
-///   qzeros:  I32 [in_dim/group_size, out_dim/8] — 8 zero-point nibbles per I32
-///   scales:  F16 [in_dim/group_size, out_dim] — per-group scales
-///
-/// HFQ4G128 layout (per output row, one contiguous buffer):
-///   For each group of 128 input elements:
-///     [f32 scale (4B)][f32 zero (4B)][64B packed nibbles] = 72 bytes
-///
-/// Returns: Vec<u8> in HFQ4G128 format, ready for gpu.upload_raw.
-///
-/// SYNC: must match `repack_awq_to_hfq4g128` in
-/// `crates/hipfire-runtime/src/hfq.rs`. Duplicated to avoid a cross-crate
-/// dependency cycle (hipfire-arch-qwen35 -> hipfire-runtime); keep the two
-/// bodies byte-identical when editing.
-fn repack_awq_to_hfq4g128(
-    qweight: &[u8],    // I32 raw bytes
-    qzeros: &[u8],     // I32 raw bytes
-    scales: &[u8],     // F16 raw bytes
-    out_dim: usize,    // M (output features)
-    in_dim: usize,     // K (input features)
-    group_size: usize, // 128
-) -> Vec<u8> {
-    let groups_per_row = in_dim / group_size;
-    let bytes_per_row = groups_per_row * 72;
-    let mut out = vec![0u8; out_dim * bytes_per_row];
-
-    // Parse qweight as &[u32] (LE)
-    debug_assert_eq!(
-        qweight.as_ptr() as usize % 4,
-        0,
-        "AWQ qweight not 4-byte aligned"
-    );
-    let qw: &[u32] =
-        unsafe { std::slice::from_raw_parts(qweight.as_ptr() as *const u32, qweight.len() / 4) };
-    // qweight shape: [in_dim, out_dim/8] → row-major
-    let qw_cols = out_dim / 8;
-
-    // Parse qzeros as &[u32]
-    debug_assert_eq!(
-        qzeros.as_ptr() as usize % 4,
-        0,
-        "AWQ qzeros not 4-byte aligned"
-    );
-    let qz: &[u32] =
-        unsafe { std::slice::from_raw_parts(qzeros.as_ptr() as *const u32, qzeros.len() / 4) };
-    // qzeros shape: [in_dim/group_size, out_dim/8]
-    let qz_cols = out_dim / 8;
-
-    // Parse scales as &[u16] (F16)
-    debug_assert_eq!(
-        scales.as_ptr() as usize % 2,
-        0,
-        "AWQ scales not 2-byte aligned"
-    );
-    let sc: &[u16] =
-        unsafe { std::slice::from_raw_parts(scales.as_ptr() as *const u16, scales.len() / 2) };
-    // scales shape: [in_dim/group_size, out_dim]
-
-    // AWQ nibble reorder: ParoQuant packs with _AWQ_REORDER=(0,2,4,6,1,3,5,7).
-    // To extract element m, use the inverse permutation:
-    const AWQ_DEQUANT: [usize; 8] = [0, 4, 1, 5, 2, 6, 3, 7];
-
-    for m in 0..out_dim {
-        for g in 0..groups_per_row {
-            let row_off = m * bytes_per_row + g * 72;
-
-            let scale_f16 = sc[g * out_dim + m];
-            let scale_f32 = f16_to_f32(scale_f16);
-
-            let zero_i32 = qz[g * qz_cols + m / 8];
-            let zero_nibble = ((zero_i32 >> (AWQ_DEQUANT[m % 8] * 4)) & 0xF) as f32;
-            let zero_f32 = -scale_f32 * zero_nibble;
-
-            out[row_off..row_off + 4].copy_from_slice(&scale_f32.to_le_bytes());
-            out[row_off + 4..row_off + 8].copy_from_slice(&zero_f32.to_le_bytes());
-
-            let nibble_shift = AWQ_DEQUANT[m % 8] * 4;
-            let qw_col = m / 8;
-            for i in 0..64 {
-                let in_idx0 = g * group_size + i * 2;
-                let in_idx1 = in_idx0 + 1;
-
-                let nib0 = ((qw[in_idx0 * qw_cols + qw_col] >> nibble_shift) & 0xF) as u8;
-                let nib1 = ((qw[in_idx1 * qw_cols + qw_col] >> nibble_shift) & 0xF) as u8;
-
-                // HFQ4G128: lo nibble = even element, hi nibble = odd element
-                out[row_off + 8 + i] = nib0 | (nib1 << 4);
-            }
-        }
-    }
-
-    out
-}
-
-/// Load a ParoQuant-quantized weight from a SafetensorsSource.
-/// Repacks AWQ INT4 → HFQ4G128 and uploads rotation metadata.
-fn load_paroquant_weight(
-    source: &dyn ModelSource,
-    gpu: &Gpu,
-    tensor_prefix: &str, // e.g. "model.language_model.layers.0.mlp.gate_proj"
-    out_dim: usize,      // M
-    in_dim: usize,       // K
-    group_size: u32,
-    krot: u8,
-) -> HipResult<WeightTensor> {
-    let qw_name = format!("{tensor_prefix}.qweight");
-    let qz_name = format!("{tensor_prefix}.qzeros");
-    let sc_name = format!("{tensor_prefix}.scales");
-    let pairs_name = format!("{tensor_prefix}.pairs");
-    let theta_name = format!("{tensor_prefix}.theta");
-    let cs_name = format!("{tensor_prefix}.channel_scales");
-
-    let (_, qw_data) = source
-        .tensor_data(&qw_name)
-        .ok_or_else(|| HipError::new(0, &format!("ParoQuant tensor not found: {qw_name}")))?;
-    let (_, qz_data) = source
-        .tensor_data(&qz_name)
-        .ok_or_else(|| HipError::new(0, &format!("ParoQuant tensor not found: {qz_name}")))?;
-    let (_, sc_data) = source
-        .tensor_data(&sc_name)
-        .ok_or_else(|| HipError::new(0, &format!("ParoQuant tensor not found: {sc_name}")))?;
-
-    // Repack AWQ → HFQ4G128
-    let hfq_data = repack_awq_to_hfq4g128(
-        qw_data,
-        qz_data,
-        sc_data,
-        out_dim,
-        in_dim,
-        group_size as usize,
-    );
-    let buf = gpu.upload_raw(&hfq_data, &[hfq_data.len()])?;
-
-    // Load rotation metadata
-    let (_, pairs_data) = source
-        .tensor_data(&pairs_name)
-        .ok_or_else(|| HipError::new(0, &format!("ParoQuant tensor not found: {pairs_name}")))?;
-    let (_, theta_data) = source
-        .tensor_data(&theta_name)
-        .ok_or_else(|| HipError::new(0, &format!("ParoQuant tensor not found: {theta_name}")))?;
-    let (_, cs_data) = source
-        .tensor_data(&cs_name)
-        .ok_or_else(|| HipError::new(0, &format!("ParoQuant tensor not found: {cs_name}")))?;
-
-    let pairs = gpu.upload_raw(pairs_data, &[pairs_data.len()])?;
-    let theta = gpu.upload_raw(theta_data, &[theta_data.len()])?;
-    let channel_scales = gpu.upload_raw(cs_data, &[cs_data.len()])?;
-
-    Ok(WeightTensor {
-        buf,
-        gpu_dtype: DType::ParoQ4G128,
-        m: out_dim,
-        k: in_dim,
-        row_stride: 0,
-        paro: Some(ParoRotation {
-            pairs,
-            theta,
-            channel_scales,
-            krot: krot as u32,
-            group_size,
-            is_alias: false,
-        }),
-        awq_scale: None,
-    })
-}
-
-/// Load an FP16 weight and encode it into MQ4G128 byte layout at load time.
-/// Used by `paro_load_wt` for LinearAttention `in_proj_a` / `in_proj_b` weights
-/// (alpha/beta) when the PARO checkpoint doesn't include them in the calibrated
-/// set AND the per-arch/env gating chose the MQ4G128 path.
-///
-/// At decode time, the weight routes through `gemv_mq4g128_prerotated` which
-/// applies FWHT-128 to the activation (via `rotate_x_mq_128_for`) before the
-/// inner GEMV. Encoder applies FWHT-128 to weight with the same sign tables,
-/// so the two FWHTs orthogonally cancel.
-
-/// Load an FP16 weight tensor from safetensors (for excluded/unquantized layers).
-fn load_fp16_weight_from_source(
-    source: &dyn ModelSource,
-    gpu: &Gpu,
-    name: &str,
-    m: usize,
-    k: usize,
-) -> HipResult<WeightTensor> {
-    let (_, data) = source
-        .tensor_data(name)
-        .ok_or_else(|| HipError::new(0, &format!("PARO tensor not found: {name}")))?;
-    let f32_data: Vec<f32> = data
-        .chunks_exact(2)
-        .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
-        .collect();
-    let bytes: &[u8] =
-        unsafe { std::slice::from_raw_parts(f32_data.as_ptr() as *const u8, f32_data.len() * 4) };
-    let buf = gpu.upload_raw(bytes, &[m, k])?;
-    Ok(WeightTensor {
-        buf,
-        gpu_dtype: DType::F32,
-        m,
-        k,
-        row_stride: 0,
-        paro: None,
-        awq_scale: None,
-    })
-}
-
-// ─── ParoQuant MoE expert loading (Option A — per-expert qweight, shared sidecars) ──
-
-/// Repack a single per-expert AWQ projection (gate, up, or down) into HFQ4G128
-/// byte rows. Returns the row-major byte buffer (size `out_dim * groups_per_row * 72`).
-///
-/// Caller is responsible for uploading the buffer to GPU (or concatenating with
-/// another projection's rows before upload — gate||up fusion path).
-fn paro_repack_moe_projection(
-    source: &dyn ModelSource,
-    full_prefix: &str, // e.g. "model.language_model.layers.0.mlp.experts.5.gate_proj"
-    out_dim: usize,
-    in_dim: usize,
-    group_size: usize,
-) -> HipResult<Vec<u8>> {
-    let qw_name = format!("{full_prefix}.qweight");
-    let qz_name = format!("{full_prefix}.qzeros");
-    let sc_name = format!("{full_prefix}.scales");
-    let (_, qw_data) = source
-        .tensor_data(&qw_name)
-        .ok_or_else(|| HipError::new(0, &format!("ParoQuant MoE tensor not found: {qw_name}")))?;
-    let (_, qz_data) = source
-        .tensor_data(&qz_name)
-        .ok_or_else(|| HipError::new(0, &format!("ParoQuant MoE tensor not found: {qz_name}")))?;
-    let (_, sc_data) = source
-        .tensor_data(&sc_name)
-        .ok_or_else(|| HipError::new(0, &format!("ParoQuant MoE tensor not found: {sc_name}")))?;
-    Ok(repack_awq_to_hfq4g128(
-        qw_data, qz_data, sc_data, out_dim, in_dim, group_size,
-    ))
-}
-
-/// Upload the per-layer shared PARO rotation sidecars (one tuple for gate||up,
-/// one for down). All 256 experts will reference these via non-owning
-/// `ParoRotation` aliases.
-///
-/// Shisa-ai's PARO checkpoint stores these at:
-///   `model.language_model.layers.{L}.mlp.experts.{gate_up,down}_weight_{pairs,theta,channel_scales}`
-fn paro_load_moe_shared_sidecars(
-    source: &dyn ModelSource,
-    gpu: &Gpu,
-    p: &str, // e.g. "layers.0"
-) -> HipResult<MoeParoSidecars> {
-    let mp = paro_text_prefix(source)?;
-    let base = format!("{mp}.{p}.mlp.experts");
-    let load = |name: &str| -> HipResult<GpuTensor> {
-        let full = format!("{base}.{name}");
-        let (_, data) = source.tensor_data(&full).ok_or_else(|| {
-            HipError::new(
-                0,
-                &format!("ParoQuant MoE shared sidecar not found: {full}"),
-            )
-        })?;
-        gpu.upload_raw(data, &[data.len()])
-    };
-    let qc = source
-        .quant_config()
-        .ok_or_else(|| HipError::new(0, "ParoQuant: quant_config required"))?;
-    Ok(MoeParoSidecars {
-        gate_up_pairs: load("gate_up_weight_pairs")?,
-        gate_up_theta: load("gate_up_weight_theta")?,
-        gate_up_channel_scales: load("gate_up_weight_channel_scales")?,
-        down_pairs: load("down_weight_pairs")?,
-        down_theta: load("down_weight_theta")?,
-        down_channel_scales: load("down_weight_channel_scales")?,
-        krot: qc.krot as u32,
-        group_size: qc.group_size,
-    })
-}
-
-/// Build a non-owning `ParoRotation` whose tensor fields alias `src`'s
-/// underlying GPU memory. The returned rotation must NOT outlive `src`;
-/// callers store the owning `MoeParoSidecars` in `MoeFfnWeights.paro_shared`
-/// to guarantee that.
-fn alias_paro_rotation(
-    pairs_src: &GpuTensor,
-    theta_src: &GpuTensor,
-    cs_src: &GpuTensor,
-    krot: u32,
-    group_size: u32,
-) -> ParoRotation {
-    let alias = |t: &GpuTensor| -> GpuTensor {
-        GpuTensor {
-            buf: unsafe { t.buf.alias() },
-            shape: t.shape.clone(),
-            dtype: t.dtype,
-        }
-    };
-    ParoRotation {
-        pairs: alias(pairs_src),
-        theta: alias(theta_src),
-        channel_scales: alias(cs_src),
-        krot,
-        group_size,
-        is_alias: true,
-    }
-}
-
-/// Load the full ParoQuant MoE FFN block for one layer:
-///   - dense FP16 router (`mlp.gate.weight [n_exp, hidden]`)
-///   - dense FP16 shared-expert scalar gate (`mlp.shared_expert_gate.weight [1, hidden]`)
-///   - shared expert (three per-projection PARO tensors: gate, up, down)
-///   - 256 routed experts, each with a fused gate||up HFQ4G128 buffer + a down
-///     HFQ4G128 buffer, all referencing layer-shared PARO sidecars
-fn paro_load_moe_ffn(
-    source: &dyn ModelSource,
-    gpu: &mut Gpu,
-    p: &str, // e.g. "layers.0"
-    config: &Qwen35Config,
-    layer_idx: u16,
-) -> HipResult<MoeFfnWeights> {
-    let n_exp = config.num_experts;
-    let mi = config.moe_intermediate_size;
-    let smi = config.shared_expert_intermediate_size;
-    let dim = config.dim;
-    let qc = source
-        .quant_config()
-        .ok_or_else(|| HipError::new(0, "ParoQuant MoE requires quant_config"))?;
-    let gs = qc.group_size;
-    let kr = qc.krot;
-
-    let mp = paro_text_prefix(source)?;
-
-    // ── Router (FP16 dense in shisa-ai's PARO checkpoint) ──
-    // mlp.gate.weight is NOT PARO-quantized — only the expert FFN matmuls are.
-    let router = load_fp16_weight_from_source(
-        source,
-        gpu,
-        &format!("{mp}.{p}.mlp.gate.weight"),
-        n_exp,
-        dim,
-    )?;
-
-    // Scalar gate on the shared-expert add — also FP16 dense.
-    let shared_expert_gate = load_fp16_weight_from_source(
-        source,
-        gpu,
-        &format!("{mp}.{p}.mlp.shared_expert_gate.weight"),
-        1,
-        dim,
-    )?;
-
-    // ── Shared expert (its own per-projection PARO sidecars, no sharing) ──
-    let shared_expert = SharedExpertWeights {
-        gate: load_paroquant_weight(
-            source,
-            gpu,
-            &format!("{p}.mlp.shared_expert.gate_proj"),
-            smi,
-            dim,
-            gs,
-            kr,
-        )?,
-        up: load_paroquant_weight(
-            source,
-            gpu,
-            &format!("{p}.mlp.shared_expert.up_proj"),
-            smi,
-            dim,
-            gs,
-            kr,
-        )?,
-        down: load_paroquant_weight(
-            source,
-            gpu,
-            &format!("{p}.mlp.shared_expert.down_proj"),
-            dim,
-            smi,
-            gs,
-            kr,
-        )?,
-    };
-
-    // ── Routed experts ──
-    // shisa-ai stores per-expert qweight/qzeros/scales but ONE shared
-    // pairs/theta/channel_scales tuple per projection-group (gate||up vs down)
-    // for ALL experts in the layer. Upload sidecars once, alias into each
-    // expert's WeightTensor.paro.
-    let shared = paro_load_moe_shared_sidecars(source, gpu, p)?;
-
-    let groups_per_row_hidden = dim / (gs as usize); // 2048/128 = 16
-    let bytes_per_row_hidden = groups_per_row_hidden * 72; // 1152
-    let groups_per_row_mi = mi / (gs as usize); // 512/128 = 4
-    let bytes_per_row_mi = groups_per_row_mi * 72; // 288
-
-    let mut experts = Vec::with_capacity(n_exp);
-    for x in 0..n_exp {
-        // Per-expert prefixes (full dot-path is constructed inside the helper).
-        let gate_prefix = format!("{mp}.{p}.mlp.experts.{x}.gate_proj");
-        let up_prefix = format!("{mp}.{p}.mlp.experts.{x}.up_proj");
-        let down_prefix = format!("{mp}.{p}.mlp.experts.{x}.down_proj");
-
-        // Fuse gate || up at HFQ4G128 row level: each row is independent
-        // (`bytes_per_row` bytes, no cross-row state), so concat works.
-        // Final shape: [2*mi, dim], rows [0..mi] = gate, rows [mi..2*mi] = up.
-        let gate_bytes = paro_repack_moe_projection(source, &gate_prefix, mi, dim, gs as usize)?;
-        let up_bytes = paro_repack_moe_projection(source, &up_prefix, mi, dim, gs as usize)?;
-        debug_assert_eq!(gate_bytes.len(), mi * bytes_per_row_hidden);
-        debug_assert_eq!(up_bytes.len(), mi * bytes_per_row_hidden);
-        let mut gate_up_bytes = Vec::with_capacity(gate_bytes.len() + up_bytes.len());
-        gate_up_bytes.extend_from_slice(&gate_bytes);
-        gate_up_bytes.extend_from_slice(&up_bytes);
-        let gate_up_buf = gpu.upload_raw(&gate_up_bytes, &[gate_up_bytes.len()])?;
-
-        let down_bytes = paro_repack_moe_projection(source, &down_prefix, dim, mi, gs as usize)?;
-        debug_assert_eq!(down_bytes.len(), dim * bytes_per_row_mi);
-        let down_buf = gpu.upload_raw(&down_bytes, &[down_bytes.len()])?;
-
-        let gate_up = WeightTensor {
-            buf: gate_up_buf,
-            gpu_dtype: DType::ParoQ4G128,
-            m: 2 * mi,
-            k: dim,
-            row_stride: 0,
-            paro: Some(alias_paro_rotation(
-                &shared.gate_up_pairs,
-                &shared.gate_up_theta,
-                &shared.gate_up_channel_scales,
-                shared.krot,
-                shared.group_size,
-            )),
-            awq_scale: None,
-        };
-        let down = WeightTensor {
-            buf: down_buf,
-            gpu_dtype: DType::ParoQ4G128,
-            m: dim,
-            k: mi,
-            row_stride: 0,
-            paro: Some(alias_paro_rotation(
-                &shared.down_pairs,
-                &shared.down_theta,
-                &shared.down_channel_scales,
-                shared.krot,
-                shared.group_size,
-            )),
-            awq_scale: None,
-        };
-        experts.push(ExpertWeights { gate_up, down });
-    }
-
-    // ── Device-side expert pointer tables (mirrors load_moe_ffn) ──
-    let mut gu_ptrs: Vec<u64> = Vec::with_capacity(n_exp);
-    let mut dn_ptrs: Vec<u64> = Vec::with_capacity(n_exp);
-    for e in &experts {
-        gu_ptrs.push(e.gate_up.buf.buf.as_ptr() as u64);
-        dn_ptrs.push(e.down.buf.buf.as_ptr() as u64);
-    }
-    let gu_bytes: Vec<u8> = gu_ptrs.iter().flat_map(|q| q.to_ne_bytes()).collect();
-    let dn_bytes: Vec<u8> = dn_ptrs.iter().flat_map(|q| q.to_ne_bytes()).collect();
-    let expert_gate_up_ptrs = gpu.alloc_tensor(&[2 * n_exp], DType::F32)?;
-    let expert_down_ptrs = gpu.alloc_tensor(&[2 * n_exp], DType::F32)?;
-    gpu.hip.memcpy_htod(&expert_gate_up_ptrs.buf, &gu_bytes)?;
-    gpu.hip.memcpy_htod(&expert_down_ptrs.buf, &dn_bytes)?;
-
-    Ok(MoeFfnWeights {
-        router,
-        experts,
-        shared_expert,
-        shared_expert_gate,
-        expert_gate_up_ptrs,
-        expert_down_ptrs,
-        // ParoQuant routed experts use shared per-layer Givens sidecars, not
-        // per-expert MQ4 AWQ scales — no MoE-AWQ table.
-        expert_down_awq_ptrs: None,
-        // Paged/paro layers are uniform-dtype — no per-expert mixed table.
-        expert_dtype_tags: None,
-        expert_gate_up_dummy: None,
-        layer_idx,
-        expert_shape: None,
-        paro_shared: Some(shared),
-    })
-}
-
-// ─── Standard HFQ loading ───────────────────────────────────────────────────
-
-/// Load a tensor as F32 on GPU, handling any quant type by dequanting on CPU.
-fn load_any_as_f32(hfq: &HfqFile, gpu: &mut Gpu, name: &str, n: usize) -> HipResult<GpuTensor> {
-    let (info, data) =
-        qwen35_tensor_data_vec(hfq, name).unwrap_or_else(|| panic!("tensor not found: {name}"));
-
-    let f32_data: Vec<f32> = match info.quant_type {
-        1 => data
-            .chunks_exact(2)
-            .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
-            .collect(),
-        2 => data
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect(),
-        3 => hipfire_runtime::llama::dequantize_q8_0(&data, n),
-        14 => {
-            // MQ8-G256: [f16 scale][int8 × 256] = 258 bytes per 256 weights
-            let group_size: usize = 256;
-            let bytes_per_group: usize = 258;
-            let n_groups = data.len() / bytes_per_group;
-            let signs1 = hipfire_runtime::llama::KvCache::gen_fwht_signs(42, 256);
-            let signs2 = hipfire_runtime::llama::KvCache::gen_fwht_signs(1042, 256);
-            let mut out = Vec::with_capacity(n_groups * group_size);
-            for g in 0..n_groups {
-                let off = g * bytes_per_group;
-                let scale_bits = data[off] as u16 | ((data[off + 1] as u16) << 8);
-                let scale = hipfire_runtime::llama::f16_to_f32(scale_bits);
-                let start = out.len();
-                for i in 0..256 {
-                    let q = data[off + 2 + i] as i8;
-                    out.push(scale * q as f32);
-                }
-                // Inverse FWHT to recover original values
-                let group = &mut out[start..start + 256];
-                for i in 0..256 {
-                    group[i] *= signs2[i];
-                }
-                let mut stride = 1;
-                while stride < 256 {
-                    let mut j = 0;
-                    while j < 256 {
-                        for k in 0..stride {
-                            let a = group[j + k];
-                            let b = group[j + k + stride];
-                            group[j + k] = a + b;
-                            group[j + k + stride] = a - b;
-                        }
-                        j += stride * 2;
-                    }
-                    stride <<= 1;
-                }
-                let inv_s = 0.0625;
-                for i in 0..256 {
-                    group[i] *= inv_s * signs1[i];
-                }
-            }
-            out
-        }
-        6 | 7 | 13 | 15 => {
-            // HFQ4-G256 or G128 or MQ4-G256 or MQ6-G256 — CPU dequant
-            // MQ4/MQ6 store rotated weights. For small tensors loaded here,
-            // we dequant then inverse-rotate to recover the original values.
-            let is_6bit = info.quant_type == 15;
-            let group_size: usize =
-                if info.quant_type == 6 || info.quant_type == 13 || info.quant_type == 15 {
-                    256
-                } else {
-                    128
-                };
-            let bytes_per_group = if is_6bit { 200 } else { 8 + group_size / 2 };
-            let n_groups = data.len() / bytes_per_group;
-            let is_mq = info.quant_type == 13 || info.quant_type == 15;
-            let mut out = Vec::with_capacity(n_groups * group_size);
-            let (signs1, signs2) = if is_mq {
-                (
-                    Some(hipfire_runtime::llama::KvCache::gen_fwht_signs(42, 256)),
-                    Some(hipfire_runtime::llama::KvCache::gen_fwht_signs(1042, 256)),
-                )
-            } else {
-                (None, None)
-            };
-            for g in 0..n_groups {
-                let off = g * bytes_per_group;
-                let scale =
-                    f32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]);
-                let zero = f32::from_le_bytes([
-                    data[off + 4],
-                    data[off + 5],
-                    data[off + 6],
-                    data[off + 7],
-                ]);
-                let start = out.len();
-                if is_6bit {
-                    for i in (0..group_size).step_by(4) {
-                        let bo = off + 8 + (i / 4) * 3;
-                        let b0 = data[bo] as u32;
-                        let b1 = data[bo + 1] as u32;
-                        let b2 = data[bo + 2] as u32;
-                        out.push(scale * ((b0 & 0x3F) as f32) + zero);
-                        out.push(scale * ((((b0 >> 6) | (b1 << 2)) & 0x3F) as f32) + zero);
-                        out.push(scale * ((((b1 >> 4) | (b2 << 4)) & 0x3F) as f32) + zero);
-                        out.push(scale * (((b2 >> 2) & 0x3F) as f32) + zero);
-                    }
-                } else {
-                    for i in 0..group_size {
-                        let byte_idx = i / 2;
-                        let byte_val = data[off + 8 + byte_idx];
-                        let nibble = if i % 2 == 0 {
-                            byte_val & 0xF
-                        } else {
-                            byte_val >> 4
-                        };
-                        out.push(scale * nibble as f32 + zero);
-                    }
-                }
-                // Inverse FWHT for MQ4/MQ6: recover original weight values
-                if is_mq && group_size == 256 {
-                    let s1 = signs1.as_ref().unwrap();
-                    let s2 = signs2.as_ref().unwrap();
-                    let group = &mut out[start..start + 256];
-                    // Inverse FWHT: signs2 → butterfly → scale → signs1
-                    for i in 0..256 {
-                        group[i] *= s2[i];
-                    }
-                    let mut stride = 1;
-                    while stride < 256 {
-                        let mut j = 0;
-                        while j < 256 {
-                            for k in 0..stride {
-                                let a = group[j + k];
-                                let b = group[j + k + stride];
-                                group[j + k] = a + b;
-                                group[j + k + stride] = a - b;
-                            }
-                            j += stride * 2;
-                        }
-                        stride <<= 1;
-                    }
-                    let scale_inv = 0.0625; // 1/sqrt(256)
-                    for i in 0..256 {
-                        group[i] *= scale_inv * s1[i];
-                    }
-                }
-            }
-            out
-        }
-        8 => {
-            // HFQ6-G256 — CPU dequant: [f32 scale][f32 zero][192B packed 6-bit] = 200 bytes per 256 weights
-            let group_size: usize = 256;
-            let bytes_per_group: usize = 200; // 8 + 192
-            let n_groups = data.len() / bytes_per_group;
-            let mut out = Vec::with_capacity(n_groups * group_size);
-            for g in 0..n_groups {
-                let off = g * bytes_per_group;
-                let scale =
-                    f32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]);
-                let zero = f32::from_le_bytes([
-                    data[off + 4],
-                    data[off + 5],
-                    data[off + 6],
-                    data[off + 7],
-                ]);
-                // 4 values per 3 bytes: v0[5:0]|v1[1:0], v1[5:2]|v2[3:0], v2[5:4]|v3[5:0]
-                for i in (0..group_size).step_by(4) {
-                    let byte_off = 8 + (i / 4) * 3;
-                    let b0 = data[off + byte_off] as u32;
-                    let b1 = data[off + byte_off + 1] as u32;
-                    let b2 = data[off + byte_off + 2] as u32;
-                    let q0 = (b0 & 0x3F) as f32;
-                    let q1 = (((b0 >> 6) | (b1 << 2)) & 0x3F) as f32;
-                    let q2 = (((b1 >> 4) | (b2 << 4)) & 0x3F) as f32;
-                    let q3 = ((b2 >> 2) & 0x3F) as f32;
-                    out.push(scale * q0 + zero);
-                    out.push(scale * q1 + zero);
-                    out.push(scale * q2 + zero);
-                    out.push(scale * q3 + zero);
-                }
-            }
-            out
-        }
-        11 => {
-            // HFQ3-G256: [f32 scale][f32 zero][96B packed 3-bit] = 104 bytes per 256 weights
-            let group_size: usize = 256;
-            let bytes_per_group: usize = 104;
-            let n_groups = data.len() / bytes_per_group;
-            let mut out = Vec::with_capacity(n_groups * group_size);
-            for g in 0..n_groups {
-                let off = g * bytes_per_group;
-                let scale =
-                    f32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]);
-                let zero = f32::from_le_bytes([
-                    data[off + 4],
-                    data[off + 5],
-                    data[off + 6],
-                    data[off + 7],
-                ]);
-                // 8 values per 3 bytes (matching kernel unpack)
-                for chunk in 0..32 {
-                    let bo = off + 8 + chunk * 3;
-                    let b0 = data[bo] as u32;
-                    let b1 = data[bo + 1] as u32;
-                    let b2 = data[bo + 2] as u32;
-                    let q0 = (b0 & 7) as f32;
-                    let q1 = ((b0 >> 3) & 7) as f32;
-                    let q2 = (((b0 >> 6) | (b1 << 2)) & 7) as f32;
-                    let q3 = ((b1 >> 1) & 7) as f32;
-                    let q4 = ((b1 >> 4) & 7) as f32;
-                    let q5 = (((b1 >> 7) | (b2 << 1)) & 7) as f32;
-                    let q6 = ((b2 >> 2) & 7) as f32;
-                    let q7 = ((b2 >> 5) & 7) as f32;
-                    out.push(scale * q0 + zero);
-                    out.push(scale * q1 + zero);
-                    out.push(scale * q2 + zero);
-                    out.push(scale * q3 + zero);
-                    out.push(scale * q4 + zero);
-                    out.push(scale * q5 + zero);
-                    out.push(scale * q6 + zero);
-                    out.push(scale * q7 + zero);
-                }
-            }
-            out
-        }
-        12 => {
-            // HFQ3-G128: [f32 scale][f32 zero][48B packed 3-bit] = 56 bytes per 128 weights
-            let group_size: usize = 128;
-            let bytes_per_group: usize = 56;
-            let n_groups = data.len() / bytes_per_group;
-            let mut out = Vec::with_capacity(n_groups * group_size);
-            for g in 0..n_groups {
-                let off = g * bytes_per_group;
-                let scale =
-                    f32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]);
-                let zero = f32::from_le_bytes([
-                    data[off + 4],
-                    data[off + 5],
-                    data[off + 6],
-                    data[off + 7],
-                ]);
-                for chunk in 0..16 {
-                    let bo = off + 8 + chunk * 3;
-                    let b0 = data[bo] as u32;
-                    let b1 = data[bo + 1] as u32;
-                    let b2 = data[bo + 2] as u32;
-                    let q0 = (b0 & 7) as f32;
-                    let q1 = ((b0 >> 3) & 7) as f32;
-                    let q2 = (((b0 >> 6) | (b1 << 2)) & 7) as f32;
-                    let q3 = ((b1 >> 1) & 7) as f32;
-                    let q4 = ((b1 >> 4) & 7) as f32;
-                    let q5 = (((b1 >> 7) | (b2 << 1)) & 7) as f32;
-                    let q6 = ((b2 >> 2) & 7) as f32;
-                    let q7 = ((b2 >> 5) & 7) as f32;
-                    out.push(scale * q0 + zero);
-                    out.push(scale * q1 + zero);
-                    out.push(scale * q2 + zero);
-                    out.push(scale * q3 + zero);
-                    out.push(scale * q4 + zero);
-                    out.push(scale * q5 + zero);
-                    out.push(scale * q6 + zero);
-                    out.push(scale * q7 + zero);
-                }
-            }
-            out
-        }
-        20 => {
-            // MQ3-G256-Lloyd (qt 20, 112 B/group): 8 fp16 codebook entries + 3-bit
-            // indices (cross-byte, 32 chunks × 3 bytes × 8 weights). Decode is
-            // direct lookup `cb[idx]` then inverse FWHT for CPU consumers.
-            let group_size: usize = 256;
-            let bytes_per_group: usize = 112;
-            let n_groups = data.len() / bytes_per_group;
-            let mut out = Vec::with_capacity(n_groups * group_size);
-            let signs1 = hipfire_runtime::llama::KvCache::gen_fwht_signs(42, 256);
-            let signs2 = hipfire_runtime::llama::KvCache::gen_fwht_signs(1042, 256);
-            for g in 0..n_groups {
-                let off = g * bytes_per_group;
-                let mut cb = [0.0f32; 8];
-                for k in 0..8 {
-                    let bits = u16::from_le_bytes([data[off + 2 * k], data[off + 2 * k + 1]]);
-                    cb[k] = hipfire_runtime::llama::f16_to_f32(bits);
-                }
-                let start = out.len();
-                for chunk in 0..32 {
-                    let bo = off + 16 + chunk * 3;
-                    let b0 = data[bo] as u32;
-                    let b1 = data[bo + 1] as u32;
-                    let b2 = data[bo + 2] as u32;
-                    let q0 = (b0 & 7) as usize;
-                    let q1 = ((b0 >> 3) & 7) as usize;
-                    let q2 = (((b0 >> 6) | (b1 << 2)) & 7) as usize;
-                    let q3 = ((b1 >> 1) & 7) as usize;
-                    let q4 = ((b1 >> 4) & 7) as usize;
-                    let q5 = (((b1 >> 7) | (b2 << 1)) & 7) as usize;
-                    let q6 = ((b2 >> 2) & 7) as usize;
-                    let q7 = ((b2 >> 5) & 7) as usize;
-                    out.push(cb[q0]);
-                    out.push(cb[q1]);
-                    out.push(cb[q2]);
-                    out.push(cb[q3]);
-                    out.push(cb[q4]);
-                    out.push(cb[q5]);
-                    out.push(cb[q6]);
-                    out.push(cb[q7]);
-                }
-                let group = &mut out[start..start + 256];
-                for i in 0..256 {
-                    group[i] *= signs2[i];
-                }
-                let mut stride = 1;
-                while stride < 256 {
-                    let mut j = 0;
-                    while j < 256 {
-                        for k in 0..stride {
-                            let a = group[j + k];
-                            let b = group[j + k + stride];
-                            group[j + k] = a + b;
-                            group[j + k + stride] = a - b;
-                        }
-                        j += stride * 2;
-                    }
-                    stride <<= 1;
-                }
-                let scale_inv = 0.0625;
-                for i in 0..256 {
-                    group[i] *= scale_inv * signs1[i];
-                }
-            }
-            out
-        }
-        19 => {
-            // MQ2-G256-Lloyd (qt 19, 72 B/group): 4 fp16 codebook entries + 2-bit indices.
-            // Decode is direct lookup `cb[idx]`, then inverse FWHT to recover original
-            // pre-rotation values for CPU consumers (DeltaNet conv1d).
-            let group_size: usize = 256;
-            let bytes_per_group: usize = 72;
-            let n_groups = data.len() / bytes_per_group;
-            let mut out = Vec::with_capacity(n_groups * group_size);
-            let signs1 = hipfire_runtime::llama::KvCache::gen_fwht_signs(42, 256);
-            let signs2 = hipfire_runtime::llama::KvCache::gen_fwht_signs(1042, 256);
-            for g in 0..n_groups {
-                let off = g * bytes_per_group;
-                let mut cb = [0.0f32; 4];
-                for k in 0..4 {
-                    let bits = u16::from_le_bytes([data[off + 2 * k], data[off + 2 * k + 1]]);
-                    cb[k] = hipfire_runtime::llama::f16_to_f32(bits);
-                }
-                let start = out.len();
-                for i in 0..64 {
-                    let byte_val = data[off + 8 + i] as usize;
-                    out.push(cb[byte_val & 3]);
-                    out.push(cb[(byte_val >> 2) & 3]);
-                    out.push(cb[(byte_val >> 4) & 3]);
-                    out.push(cb[(byte_val >> 6) & 3]);
-                }
-                // Inverse FWHT to recover pre-rotation weights — same butterfly as the
-                // MQ3/MQ2 arm below.
-                let group = &mut out[start..start + 256];
-                for i in 0..256 {
-                    group[i] *= signs2[i];
-                }
-                let mut stride = 1;
-                while stride < 256 {
-                    let mut j = 0;
-                    while j < 256 {
-                        for k in 0..stride {
-                            let a = group[j + k];
-                            let b = group[j + k + stride];
-                            group[j + k] = a + b;
-                            group[j + k + stride] = a - b;
-                        }
-                        j += stride * 2;
-                    }
-                    stride <<= 1;
-                }
-                let scale_inv = 0.0625;
-                for i in 0..256 {
-                    group[i] *= scale_inv * signs1[i];
-                }
-            }
-            out
-        }
-        30 => {
-            // MQ4-G256-Lloyd (qt 30, 160 B/group): 16 fp16 codebook entries (bytes [0..32))
-            // + 4-bit packed indices (bytes [32..160), low nibble = idx[2i], high = idx[2i+1]).
-            // Decode is direct lookup `cb[idx]` then inverse FWHT for CPU consumers.
-            // Renumbered from qt 21 → 30 to avoid HFP4G32=21 collision.
-            let group_size: usize = 256;
-            let bytes_per_group: usize = 160;
-            let n_groups = data.len() / bytes_per_group;
-            let mut out = Vec::with_capacity(n_groups * group_size);
-            let signs1 = hipfire_runtime::llama::KvCache::gen_fwht_signs(42, 256);
-            let signs2 = hipfire_runtime::llama::KvCache::gen_fwht_signs(1042, 256);
-            for g in 0..n_groups {
-                let off = g * bytes_per_group;
-                let mut cb = [0.0f32; 16];
-                for k in 0..16 {
-                    let bits = u16::from_le_bytes([data[off + 2 * k], data[off + 2 * k + 1]]);
-                    cb[k] = hipfire_runtime::llama::f16_to_f32(bits);
-                }
-                let start = out.len();
-                for i in 0..128 {
-                    let byte_val = data[off + 32 + i] as usize;
-                    out.push(cb[byte_val & 0xF]);
-                    out.push(cb[(byte_val >> 4) & 0xF]);
-                }
-                let group = &mut out[start..start + 256];
-                for i in 0..256 {
-                    group[i] *= signs2[i];
-                }
-                let mut stride = 1;
-                while stride < 256 {
-                    let mut j = 0;
-                    while j < 256 {
-                        for k in 0..stride {
-                            let a = group[j + k];
-                            let b = group[j + k + stride];
-                            group[j + k] = a + b;
-                            group[j + k + stride] = a - b;
-                        }
-                        j += stride * 2;
-                    }
-                    stride <<= 1;
-                }
-                let scale_inv = 0.0625;
-                for i in 0..256 {
-                    group[i] *= scale_inv * signs1[i];
-                }
-            }
-            out
-        }
-        17 | 18 => {
-            // MQ3-G256 (qt 17, 104 B/group, 3-bit) or MQ2-G256 (qt 18, 72 B/group, 2-bit).
-            // Both store FWHT-rotated weights — dequant then inverse-rotate to recover
-            // original values for CPU consumers (e.g., DeltaNet conv1d).
-            let is_mq3 = info.quant_type == 17;
-            let group_size: usize = 256;
-            let bytes_per_group: usize = if is_mq3 { 104 } else { 72 };
-            let n_groups = data.len() / bytes_per_group;
-            let mut out = Vec::with_capacity(n_groups * group_size);
-            let signs1 = hipfire_runtime::llama::KvCache::gen_fwht_signs(42, 256);
-            let signs2 = hipfire_runtime::llama::KvCache::gen_fwht_signs(1042, 256);
-            for g in 0..n_groups {
-                let off = g * bytes_per_group;
-                let scale =
-                    f32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]);
-                let zero = f32::from_le_bytes([
-                    data[off + 4],
-                    data[off + 5],
-                    data[off + 6],
-                    data[off + 7],
-                ]);
-                let start = out.len();
-                if is_mq3 {
-                    // 8 values per 3 bytes (matches gemv_hfq3g256.hip unpack).
-                    for chunk in 0..32 {
-                        let bo = off + 8 + chunk * 3;
-                        let b0 = data[bo] as u32;
-                        let b1 = data[bo + 1] as u32;
-                        let b2 = data[bo + 2] as u32;
-                        let q0 = (b0 & 7) as f32;
-                        let q1 = ((b0 >> 3) & 7) as f32;
-                        let q2 = (((b0 >> 6) | (b1 << 2)) & 7) as f32;
-                        let q3 = ((b1 >> 1) & 7) as f32;
-                        let q4 = ((b1 >> 4) & 7) as f32;
-                        let q5 = (((b1 >> 7) | (b2 << 1)) & 7) as f32;
-                        let q6 = ((b2 >> 2) & 7) as f32;
-                        let q7 = ((b2 >> 5) & 7) as f32;
-                        out.push(scale * q0 + zero);
-                        out.push(scale * q1 + zero);
-                        out.push(scale * q2 + zero);
-                        out.push(scale * q3 + zero);
-                        out.push(scale * q4 + zero);
-                        out.push(scale * q5 + zero);
-                        out.push(scale * q6 + zero);
-                        out.push(scale * q7 + zero);
-                    }
-                } else {
-                    // MQ2: 4 values per byte (matches gemv_hfq2g256.hip unpack).
-                    for i in 0..64 {
-                        let byte_val = data[off + 8 + i] as u32;
-                        out.push(scale * ((byte_val & 3) as f32) + zero);
-                        out.push(scale * (((byte_val >> 2) & 3) as f32) + zero);
-                        out.push(scale * (((byte_val >> 4) & 3) as f32) + zero);
-                        out.push(scale * (((byte_val >> 6) & 3) as f32) + zero);
-                    }
-                }
-                // Inverse FWHT: recover original (pre-rotation) weight values.
-                let group = &mut out[start..start + 256];
-                for i in 0..256 {
-                    group[i] *= signs2[i];
-                }
-                let mut stride = 1;
-                while stride < 256 {
-                    let mut j = 0;
-                    while j < 256 {
-                        for k in 0..stride {
-                            let a = group[j + k];
-                            let b = group[j + k + stride];
-                            group[j + k] = a + b;
-                            group[j + k + stride] = a - b;
-                        }
-                        j += stride * 2;
-                    }
-                    stride <<= 1;
-                }
-                let scale_inv = 0.0625; // 1/sqrt(256)
-                for i in 0..256 {
-                    group[i] *= scale_inv * signs1[i];
-                }
-            }
-            out
-        }
-        32 => {
-            // MFP4G32Lloyd (qt 32): [32-B fp16 codebook prefix][M rows].
-            // Each row = 16-B header + (K/32)*17 B blocks (UE8M0 + nibbles).
-            // Recon: value = row_scale_a * 2^(block_e-127) * cb[nibble].
-            // Returns rotated-domain f32 (weights stored pre-FWHT-rotated).
-            let row_bytes = 16 + 17 * (n / 32);
-            let m_rows = if row_bytes > 0 {
-                (data.len().saturating_sub(32)) / row_bytes
-            } else {
-                0
-            };
-            let mut cb = [0.0f32; 16];
-            for i in 0..16 {
-                let bits = u16::from_le_bytes([data[2 * i], data[2 * i + 1]]);
-                cb[i] = hipfire_runtime::llama::f16_to_f32(bits);
-            }
-            let mut out = vec![0.0f32; n];
-            let k_row = if m_rows > 0 { n / m_rows } else { n };
-            let k_row = k_row.max(1);
-            let n_blocks = k_row / 32;
-            for r in 0..m_rows {
-                let base = 32 + r * (16 + n_blocks * 17);
-                let row_scale_a = hipfire_runtime::llama::f16_to_f32(u16::from_le_bytes([
-                    data[base],
-                    data[base + 1],
-                ]));
-                for b in 0..n_blocks {
-                    let po = base + 16 + b * 17;
-                    let block_e = data[po] as i32;
-                    let scale = row_scale_a * ((block_e - 127) as f32).exp2();
-                    for i in 0..16 {
-                        let byte = data[po + 1 + i];
-                        out[r * k_row + b * 32 + 2 * i] = scale * cb[(byte & 0x0F) as usize];
-                        out[r * k_row + b * 32 + 2 * i + 1] =
-                            scale * cb[((byte >> 4) & 0x0F) as usize];
-                    }
-                }
-            }
-            out
-        }
-        33 => {
-            // MFP4G32P (qt 33): mfp4 rows (NO prefix) with E4M3 (FP8) per-block scale.
-            // Recon: value = row_scale_a * e4m3_decode(scale_byte) * E2M1_LUT[nibble].
-            // Returns rotated-domain f32 (weights stored pre-FWHT-rotated).
-            const E2M1_MAG: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
-            #[inline]
-            fn e2m1(n: u8) -> f32 {
-                let m = E2M1_MAG[(n & 0x7) as usize];
-                if (n & 0x8) != 0 {
-                    -m
-                } else {
-                    m
-                }
-            }
-            // E4M3 (unsigned scale, bias 7, 3 mantissa) — bit-identical to the
-            // quantizer `e4m3_scale_decode` and the gfx942 kernel decode.
-            #[inline]
-            fn e4m3(b: u8) -> f32 {
-                let exp = ((b >> 3) & 0xf) as i32;
-                let mant = (b & 0x7) as u32;
-                if exp == 0 {
-                    return (2.0f32).powi(-6) * (mant as f32) / 8.0;
-                }
-                if exp == 0xf && mant == 7 {
-                    return 448.0;
-                }
-                (2.0f32).powi(exp - 7) * (1.0 + (mant as f32) / 8.0)
-            }
-            let row_bytes = 16 + 17 * (n / 32);
-            let m_rows = if row_bytes > 0 {
-                data.len() / row_bytes
-            } else {
-                0
-            };
-            let mut out = vec![0.0f32; n];
-            let k_row = if m_rows > 0 { n / m_rows } else { n };
-            let k_row = k_row.max(1);
-            let n_blocks = k_row / 32;
-            for r in 0..m_rows {
-                let base = r * (16 + n_blocks * 17);
-                let row_scale_a = hipfire_runtime::llama::f16_to_f32(u16::from_le_bytes([
-                    data[base],
-                    data[base + 1],
-                ]));
-                for b in 0..n_blocks {
-                    let po = base + 16 + b * 17;
-                    let scale = row_scale_a * e4m3(data[po]);
-                    for i in 0..16 {
-                        let byte = data[po + 1 + i];
-                        out[r * k_row + b * 32 + 2 * i] = scale * e2m1(byte & 0x0F);
-                        out[r * k_row + b * 32 + 2 * i + 1] = scale * e2m1((byte >> 4) & 0x0F);
-                    }
-                }
-            }
-            out
-        }
-        34 => {
-            // MFP4G32E8 (qt 34): mfp4+P container, NO prefix, with E8-lattice codewords.
-            // Identical framing to qt 33 (E4M3 block scale, row_scale f16); per block
-            // decode 4 E8 codewords instead of 32 E2M1 nibbles.
-            // E8 decode — bit-identical to e8.rs::decode_index + * QUANT_STEP.
-            #[inline]
-            fn e4m3_e8(b: u8) -> f32 {
-                let exp = ((b >> 3) & 0xf) as i32;
-                let mant = (b & 0x7) as u32;
-                if exp == 0 {
-                    return (2.0f32).powi(-6) * (mant as f32) / 8.0;
-                }
-                if exp == 0xf && mant == 7 {
-                    return 448.0;
-                }
-                (2.0f32).powi(exp - 7) * (1.0 + (mant as f32) / 8.0)
-            }
-            #[inline]
-            fn e8_decode(idx: u32, coord: usize) -> f32 {
-                // Decode a single coord of an E8 lattice point from a u32 index.
-                // Matches kernel e8_decode_index exactly.
-                let coset = (idx >> 31) & 1;
-                let e: u32;
-                if coord < 7 {
-                    e = (idx >> (4 * coord as u32)) & 0xF;
-                } else {
-                    // coord == 7: recover from parity
-                    let mut sl: u32 = 0;
-                    for i in 0..7 {
-                        sl += (idx >> (4 * i)) & 0xF;
-                    }
-                    let e7h = (idx >> 28) & 0x7;
-                    let p7 = e7h << 1;
-                    let lsb = (sl + p7) & 1;
-                    e = p7 | lsb;
-                }
-                let c = (e as i32 - 7) as f32;
-                if coset == 1 {
-                    c + 0.5
-                } else {
-                    c
-                }
-            }
-            const QUANT_STEP: f32 = 0.88;
-            let row_bytes = 16 + 17 * (n / 32);
-            let m_rows = if row_bytes > 0 {
-                data.len() / row_bytes
-            } else {
-                0
-            };
-            let mut out = vec![0.0f32; n];
-            let k_row = if m_rows > 0 { n / m_rows } else { n };
-            let k_row = k_row.max(1);
-            let n_blocks = k_row / 32;
-            for r in 0..m_rows {
-                let base = r * (16 + n_blocks * 17);
-                let row_scale_a = hipfire_runtime::llama::f16_to_f32(u16::from_le_bytes([
-                    data[base],
-                    data[base + 1],
-                ]));
-                for b in 0..n_blocks {
-                    let po = base + 16 + b * 17;
-                    let scale = row_scale_a * e4m3_e8(data[po]) * QUANT_STEP;
-                    for g in 0..4usize {
-                        let idx = u32::from_le_bytes([
-                            data[po + 1 + g * 4],
-                            data[po + 2 + g * 4],
-                            data[po + 3 + g * 4],
-                            data[po + 4 + g * 4],
-                        ]);
-                        for i in 0..8usize {
-                            out[r * k_row + b * 32 + g * 8 + i] = scale * e8_decode(idx, i);
-                        }
-                    }
-                }
-            }
-            out
-        }
-        35 => {
-            // MFP4G32E8SOA (qt 35): same E8 data as qt 34 but in SoA layout.
-            // Per-row: [16B hdr] + [n_blocks bytes E4M3 scales, pad16] + [n_blocks*16 bytes codewords].
-            #[inline]
-            fn e4m3_e8_soa(b: u8) -> f32 {
-                let exp = ((b >> 3) & 0xf) as i32;
-                let mant = (b & 0x7) as u32;
-                if exp == 0 {
-                    return (2.0f32).powi(-6) * (mant as f32) / 8.0;
-                }
-                if exp == 0xf && mant == 7 {
-                    return 448.0;
-                }
-                (2.0f32).powi(exp - 7) * (1.0 + (mant as f32) / 8.0)
-            }
-            #[inline]
-            fn e8_decode_soa(idx: u32, coord: usize) -> f32 {
-                let coset = (idx >> 31) & 1;
-                let e: u32;
-                if coord < 7 {
-                    e = (idx >> (4 * coord as u32)) & 0xF;
-                } else {
-                    let mut sl: u32 = 0;
-                    for i in 0..7 {
-                        sl += (idx >> (4 * i)) & 0xF;
-                    }
-                    let e7h = (idx >> 28) & 0x7;
-                    let p7 = e7h << 1;
-                    let lsb = (sl + p7) & 1;
-                    e = p7 | lsb;
-                }
-                let c = (e as i32 - 7) as f32;
-                if coset == 1 {
-                    c + 0.5
-                } else {
-                    c
-                }
-            }
-            const QUANT_STEP_SOA: f32 = 0.88;
-            // Decode assuming n = k_row; figure out m_rows from total bytes.
-            // n_blocks = n/32; scale_padded = ceil(n_blocks/16)*16
-            let n_blocks = n / 32;
-            let scale_padded = ((n_blocks + 15) >> 4) << 4;
-            let soa_row_bytes = 16 + scale_padded + n_blocks * 16;
-            let m_rows = if soa_row_bytes > 0 {
-                data.len() / soa_row_bytes
-            } else {
-                0
-            };
-            let mut out = vec![0.0f32; n];
-            let k_row = if m_rows > 0 { n / m_rows } else { n };
-            let k_row = k_row.max(1);
-            let n_blocks2 = k_row / 32;
-            let scale_padded2 = ((n_blocks2 + 15) >> 4) << 4;
-            let row_bytes2 = 16 + scale_padded2 + n_blocks2 * 16;
-            for r in 0..m_rows {
-                let base = r * row_bytes2;
-                let row_scale_a = hipfire_runtime::llama::f16_to_f32(u16::from_le_bytes([
-                    data[base],
-                    data[base + 1],
-                ]));
-                let scale_arr = &data[base + 16..base + 16 + n_blocks2];
-                let cw_arr =
-                    &data[base + 16 + scale_padded2..base + 16 + scale_padded2 + n_blocks2 * 16];
-                for b in 0..n_blocks2 {
-                    let scale = row_scale_a * e4m3_e8_soa(scale_arr[b]) * QUANT_STEP_SOA;
-                    for g in 0..4usize {
-                        let co = b * 16 + g * 4;
-                        let idx = u32::from_le_bytes([
-                            cw_arr[co],
-                            cw_arr[co + 1],
-                            cw_arr[co + 2],
-                            cw_arr[co + 3],
-                        ]);
-                        for i in 0..8usize {
-                            out[r * k_row + b * 32 + g * 8 + i] = scale * e8_decode_soa(idx, i);
-                        }
-                    }
-                }
-            }
-            out
-        }
-        36 => {
-            // MFP3G32E8 (qt 36): mfp4-E8 frame with 3-bit lattice, 13 B/blk, center 4.
-            // Decode mirrors kernel mfp3_decode_index: nibbles 3b, coset bit 23, e7_high 2b@21.
-            #[inline]
-            fn e4m3_mfp3(b: u8) -> f32 {
-                let exp = ((b >> 3) & 0xf) as i32;
-                let mant = (b & 0x7) as u32;
-                if exp == 0 {
-                    return (2.0f32).powi(-6) * (mant as f32) / 8.0;
-                }
-                if exp == 0xf && mant == 7 {
-                    return 448.0;
-                }
-                (2.0f32).powi(exp - 7) * (1.0 + (mant as f32) / 8.0)
-            }
-            const MFP3_BLOCK: usize = 13; // 1 + 4*3
-            const MFP3_STEP: f32 = 1.8; // MSE-tuned; matches QUANT_STEP_MFP3 in e8.rs + kernels
-            let row_bytes = 16 + MFP3_BLOCK * (n / 32);
-            let m_rows = if row_bytes > 0 {
-                data.len() / row_bytes
-            } else {
-                0
-            };
-            let mut out = vec![0.0f32; n];
-            let k_row = if m_rows > 0 { n / m_rows } else { n };
-            let k_row = k_row.max(1);
-            let n_blocks = k_row / 32;
-            for r in 0..m_rows {
-                let base = r * (16 + n_blocks * MFP3_BLOCK);
-                let row_scale_a = hipfire_runtime::llama::f16_to_f32(u16::from_le_bytes([
-                    data[base],
-                    data[base + 1],
-                ]));
-                for b in 0..n_blocks {
-                    let po = base + 16 + b * MFP3_BLOCK;
-                    let scale = row_scale_a * e4m3_mfp3(data[po]) * MFP3_STEP;
-                    for g in 0..4usize {
-                        let cw_off = po + 1 + g * 3;
-                        // 3-byte narrow read (mfp3 codeword is only 24 bits)
-                        let idx: u32 = (data[cw_off] as u32)
-                            | ((data[cw_off + 1] as u32) << 8)
-                            | ((data[cw_off + 2] as u32) << 16);
-                        // mfp3_decode_index: 3-bit nibbles, center 4, coset bit 23, e7_high @21 (2b)
-                        let coset = (idx >> 23) & 1;
-                        let mut e = [0u32; 8];
-                        let mut sl: u32 = 0;
-                        for i in 0..7 {
-                            e[i] = (idx >> (3 * i as u32)) & 0x7;
-                            sl += e[i];
-                        }
-                        let e7_high = (idx >> 21) & 0x3;
-                        let p7 = e7_high << 1;
-                        e[7] = p7 | ((sl + p7) & 1);
-                        for i in 0..8usize {
-                            let c = (e[i] as i32 - 4) as f32;
-                            let coord = if coset == 1 { c + 0.5 } else { c };
-                            out[r * k_row + b * 32 + g * 8 + i] = scale * coord;
-                        }
-                    }
-                }
-            }
-            out
-        }
-        37 => {
-            // MFP2G32E8 (qt 37): mfp4-E8 frame with 2-bit lattice, 9 B/blk, center 2.
-            // Decode mirrors kernel mfp2_decode_index: nibbles 2b, coset bit 15, e7_high 1b@14.
-            #[inline]
-            fn e4m3_mfp2(b: u8) -> f32 {
-                let exp = ((b >> 3) & 0xf) as i32;
-                let mant = (b & 0x7) as u32;
-                if exp == 0 {
-                    return (2.0f32).powi(-6) * (mant as f32) / 8.0;
-                }
-                if exp == 0xf && mant == 7 {
-                    return 448.0;
-                }
-                (2.0f32).powi(exp - 7) * (1.0 + (mant as f32) / 8.0)
-            }
-            const MFP2_BLOCK: usize = 9; // 1 + 4*2
-            const MFP2_STEP: f32 = 3.8; // MSE-tuned; matches QUANT_STEP_MFP2 in e8.rs + kernels
-            let row_bytes = 16 + MFP2_BLOCK * (n / 32);
-            let m_rows = if row_bytes > 0 {
-                data.len() / row_bytes
-            } else {
-                0
-            };
-            let mut out = vec![0.0f32; n];
-            let k_row = if m_rows > 0 { n / m_rows } else { n };
-            let k_row = k_row.max(1);
-            let n_blocks = k_row / 32;
-            for r in 0..m_rows {
-                let base = r * (16 + n_blocks * MFP2_BLOCK);
-                let row_scale_a = hipfire_runtime::llama::f16_to_f32(u16::from_le_bytes([
-                    data[base],
-                    data[base + 1],
-                ]));
-                for b in 0..n_blocks {
-                    let po = base + 16 + b * MFP2_BLOCK;
-                    let scale = row_scale_a * e4m3_mfp2(data[po]) * MFP2_STEP;
-                    for g in 0..4usize {
-                        let cw_off = po + 1 + g * 2;
-                        // 2-byte narrow read (mfp2 codeword is only 16 bits)
-                        let idx: u32 = (data[cw_off] as u32) | ((data[cw_off + 1] as u32) << 8);
-                        // mfp2_decode_index: 2-bit nibbles, center 2, coset bit 15, e7_high @14 (1b)
-                        let coset = (idx >> 15) & 1;
-                        let mut e = [0u32; 8];
-                        let mut sl: u32 = 0;
-                        for i in 0..7 {
-                            e[i] = (idx >> (2 * i as u32)) & 0x3;
-                            sl += e[i];
-                        }
-                        let e7_high = (idx >> 14) & 0x1;
-                        let p7 = e7_high << 1;
-                        e[7] = p7 | ((sl + p7) & 1);
-                        for i in 0..8usize {
-                            let c = (e[i] as i32 - 2) as f32;
-                            let coord = if coset == 1 { c + 0.5 } else { c };
-                            out[r * k_row + b * 32 + g * 8 + i] = scale * coord;
-                        }
-                    }
-                }
-            }
-            out
-        }
-        _ => panic!("unsupported quant_type {} for {name}", info.quant_type),
-    };
-    gpu.upload_f32(&f32_data[..n], &[n])
-}
-
-/// Alias for load_any_as_f32.
-fn load_raw_f32(hfq: &HfqFile, gpu: &mut Gpu, name: &str, n: usize) -> HipResult<GpuTensor> {
-    load_any_as_f32(hfq, gpu, name, n)
 }
 
 /// Loud model-load diagnostic for RDNA2 (gfx1030/1031/1032). Scans the model's
@@ -5116,7 +3671,7 @@ pub use hipfire_runtime::model_load::Layout;
 /// then assemble `Qwen35Weights`. `pager` is always `None` here; paged-experts
 /// wiring is unchanged and set by the caller post-load.
 pub fn load_weights(
-    source: &mut (impl WeightSource<Layer = LayerWeights>),
+    source: &mut impl WeightSource<Layer = LayerWeights>,
     devices: &mut [Gpu],
     layout: &Layout,
 ) -> HipResult<Qwen35Weights> {
@@ -5268,7 +3823,7 @@ impl<'a> ParoSource<'a> {
             .source
             .tensor_data(name)
             .ok_or_else(|| HipError::new(0, &format!("PARO tensor not found: {name}")))?;
-        Ok(hipfire_runtime::weight_backend::f16_bytes_to_f32(&data))
+        Ok(hipfire_runtime::weight_backend::f16_bytes_to_f32(data))
     }
 }
 impl WeightSource for ParoSource<'_> {
@@ -5329,14 +3884,14 @@ impl WeightSource for ParoSource<'_> {
                 let (_, f16) = source
                     .tensor_data("lm_head.weight")
                     .ok_or_else(|| HipError::new(0, "PARO tensor not found: lm_head.weight"))?;
-                reupload_f16_as_f32(gpu, &f16, c.vocab_size, c.dim)
+                reupload_f16_as_f32(gpu, f16, c.vocab_size, c.dim)
             },
             |gpu| {
                 let embd_name = format!("{mp}.embed_tokens.weight");
                 let (_, f16) = source.tensor_data(&embd_name).ok_or_else(|| {
                     HipError::new(0, &format!("PARO tensor not found: {embd_name}"))
                 })?;
-                reupload_f16_as_f32(gpu, &f16, c.vocab_size, c.dim)
+                reupload_f16_as_f32(gpu, f16, c.vocab_size, c.dim)
             },
         )
     }
@@ -5591,7 +4146,7 @@ pub(crate) fn load_moe_ffn(
     let owns_orig = |x: usize| {
         ep_shard
             .as_ref()
-            .map_or(true, |(sh, r)| sh.owns_expert(*r, x))
+            .is_none_or(|(sh, r)| sh.owns_expert(*r, x))
     };
 
     let mut experts = Vec::with_capacity(n_exp);
@@ -5869,26 +4424,6 @@ pub(crate) fn load_moe_ffn(
 
 // ─── MoE FFN (decode, batch=1) ──────────────────────────────────────────
 
-/// Construct a non-owning `GpuTensor` view over `[offset_elems,
-/// offset_elems + len_elems)` of `src`. Valid only for F32 (4 bytes/elem).
-
-/// One-token MoE FFN: router → top-K → shared expert + top-K routed, added
-/// into `x_residual` in place. `x_norm` is the already-RMSNormed FFN input.
-///
-/// Dense-compute decode reference implementation (Phase 1). Top-K selection
-/// runs on CPU via a single D2H sync per layer on the router logits; the
-/// shared-expert scalar gate is another D2H sync. Sparse-routing + batched
-/// grouped-GEMM variants come in later phases — this version prioritizes
-/// correctness and minimal surface area.
-///
-/// Matches HF `modeling_qwen3_5_moe.py`:
-///   router_probs  = softmax(W_router · x_norm)            // [n_exp]
-///   (idx, w)      = topk(router_probs, k)                  // [k]
-///   if norm_topk:  w /= w.sum()
-///   scalar        = sigmoid(W_shared_gate · x_norm)        // [1]
-///   y_shared      = scalar * shared_expert(x_norm)         // [hidden]
-///   y_moe         = sum_{k} w[k] * expert[idx[k]](x_norm)  // [hidden]
-///   x_residual   += y_shared + y_moe
 /// Non-owning borrow of the scratch buffers `moe_ffn_decode_impl` needs.
 /// Callers construct one of these from either a `Qwen35Scratch` (preallocated,
 /// hipGraph-capturable) or from tensors they own locally (heap path).
@@ -5940,98 +4475,10 @@ impl<'a> MoeScratchRef<'a> {
     }
 }
 
-/// Heap-allocating wrapper for callers without pre-allocated scratch (the
-/// debug `forward()` path). Allocates 11 tensors, runs moe_ffn_decode_impl,
-/// frees. NOT hipGraph-compatible. For hot-path decode, callers should go
-/// through moe_ffn_decode_with_scratch which reuses pre-allocated buffers.
-fn moe_ffn_decode(
-    gpu: &mut Gpu,
-    ffn: &MoeFfnWeights,
-    x_norm: &GpuTensor,
-    x_residual: &GpuTensor,
-    config: &Qwen35Config,
-) -> HipResult<()> {
-    let view = MoeFfnView::Legacy(ffn);
-    let hidden = config.dim;
-    let mi = config.moe_intermediate_size;
-    let smi = config.shared_expert_intermediate_size;
-    let k = config.num_experts_per_tok;
-    let n_exp = config.num_experts;
-    let max_inter = mi.max(smi);
-
-    let router_logits = gpu.alloc_tensor(&[n_exp], DType::F32)?;
-    let scalar_buf = gpu.alloc_tensor(&[1], DType::F32)?;
-    let x_rot_local = gpu.alloc_tensor(&[hidden], DType::F32)?;
-    let gate_up_buf = gpu.alloc_tensor(&[2 * max_inter], DType::F32)?;
-    let gate_buf = gpu.alloc_tensor(&[max_inter], DType::F32)?;
-    let up_buf = gpu.alloc_tensor(&[max_inter], DType::F32)?;
-    let ffn_hidden = gpu.alloc_tensor(&[max_inter], DType::F32)?;
-    let ffn_out = gpu.alloc_tensor(&[hidden], DType::F32)?;
-    let gate_batch = gpu.alloc_tensor(&[k * mi], DType::F32)?;
-    let up_batch = gpu.alloc_tensor(&[k * mi], DType::F32)?;
-    let rot_batch = gpu.alloc_tensor(&[k * mi], DType::F32)?;
-    let topk_indices = gpu.alloc_tensor(&[k], DType::F32)?;
-    let topk_weights = gpu.alloc_tensor(&[k], DType::F32)?;
-    let down_expanded = gpu.alloc_tensor(&[k * hidden], DType::F32)?;
-
-    let refs = MoeScratchRef {
-        router_logits: &router_logits,
-        scalar_buf: &scalar_buf,
-        x_rot_local: &x_rot_local,
-        gate_up_buf: &gate_up_buf,
-        gate_buf: &gate_buf,
-        up_buf: &up_buf,
-        ffn_hidden: &ffn_hidden,
-        ffn_out: &ffn_out,
-        gate_batch: &gate_batch,
-        up_batch: &up_batch,
-        rot_batch: &rot_batch,
-        topk_indices: &topk_indices,
-        topk_weights: &topk_weights,
-        down_expanded: &down_expanded,
-    };
-    let result = moe_ffn_decode_impl(
-        gpu, view, x_norm, x_residual, config, &refs, false, None, false,
-    );
-
-    for t in [
-        router_logits,
-        scalar_buf,
-        x_rot_local,
-        gate_up_buf,
-        gate_buf,
-        up_buf,
-        ffn_hidden,
-        ffn_out,
-        gate_batch,
-        up_batch,
-        rot_batch,
-        topk_indices,
-        topk_weights,
-        down_expanded,
-    ] {
-        gpu.free_tensor(t)?;
-    }
-    result
-}
-
 /// All gate-side + routed MoE weights are MQ4G256.
 /// Accepts `MoeFfnView` for both Legacy and Frozen.
 pub(crate) fn ffn_all_mq4_for_moe(view: &MoeFfnView<'_>) -> bool {
     view.all_mq4()
-}
-
-/// GATE-SIDE only MQ4 (router + shared expert), independent of the routed
-/// experts. When true, the fused rmsnorm+FWHT path + prerotated MoE decode are
-/// applicable even on a graded file: the MQ4 router routes on the rotated x via
-/// the fused gate kernel (MoeResolution::gate_fusable), and the routed experts
-/// (any FwhtG256 MQ-family) consume the same single rotated activation — saving
-/// the un-fused rmsnorm + the per-component rotates the else-branch incurs.
-/// The redline mq4r (MQ4 gate + graded experts) hits this; uniform MQ4 is a
-/// superset (ffn_all_mq4_for_moe). Q8-router files (mq4p) correctly stay false.
-/// Takes `&MoeFfnWeights` — only used in Legacy-only paths (EP, multi-device).
-pub(crate) fn ffn_gate_side_mq4_for_moe(ffn: &MoeFfnWeights) -> bool {
-    MoeFfnView::Legacy(ffn).gate_side_mq4()
 }
 
 /// Detect any MQ3G256 / MQ3G256Lloyd weight inside a MoE FFN block.
@@ -6056,24 +4503,6 @@ fn moe_ffn_has_mq3_experts_uniform(view: &MoeFfnView<'_>) -> bool {
 /// derives the fence separately.
 fn layers_have_mq6_moe(layers: &[LayerWeights]) -> bool {
     crate::store::assembled_legacy_layers_have_mq6(layers)
-}
-
-/// Zero-alloc MoE decode for the scratch path. `scratch.moe_*` fields must
-/// be populated (done automatically by `Qwen35Scratch::new` when config
-/// indicates a MoE model). Safe to call under hipGraph stream capture.
-pub(crate) fn moe_ffn_decode_with_scratch_inner(
-    gpu: &mut Gpu,
-    ffn: &MoeFfnWeights,
-    x_norm: &GpuTensor,
-    x_residual: &GpuTensor,
-    config: &Qwen35Config,
-    scratch: &Qwen35Scratch,
-) -> HipResult<()> {
-    let refs = MoeScratchRef::from_scratch(scratch);
-    let view = MoeFfnView::Legacy(ffn);
-    moe_ffn_decode_impl(
-        gpu, view, x_norm, x_residual, config, &refs, false, None, false,
-    )
 }
 
 /// Single-device MoE decode with scratch. Accepts `MoeFfnView` for both
@@ -6116,6 +4545,10 @@ pub(crate) fn moe_ffn_decode_with_scratch_prerotated(
 // contribution (gate-weighted output norm) — compared against raw frequency
 // (count) to decide whether freq agrees with contribution before committing to
 // any per-expert mixed-precision kernel. Dumped by `dump_expert_stats`.
+#[expect(
+    clippy::type_complexity,
+    reason = "thread-safe per-(layer, expert) REAP stats accumulator (count, gate sum, norm sum, contribution)"
+)]
 static EXPERT_STATS: std::sync::Mutex<
     Option<std::collections::HashMap<(u16, u16), (u64, f64, f64, f64)>>,
 > = std::sync::Mutex::new(None);
@@ -6193,6 +4626,10 @@ pub fn dump_expert_stats(path: &str) {
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors the MoE dispatch family parameter surface (view, scratch refs, EP routing flags)"
+)]
 fn moe_ffn_decode_impl(
     gpu: &mut Gpu,
     view: MoeFfnView<'_>,
@@ -6551,11 +4988,11 @@ impl ScratchStaging {
         kv_max_seq: usize,
     ) -> HipResult<()> {
         let tile_size = 128usize;
-        let max_tiles = (kv_max_seq + tile_size - 1) / tile_size;
+        let max_tiles = kv_max_seq.div_ceil(tile_size);
         let batch_mult = std::env::var("HIPFIRE_FLASH_PARTIALS_BATCH")
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
-            .filter(|&n| n >= 1 && n <= PREFILL_MAX_BATCH)
+            .filter(|&n| (1..=PREFILL_MAX_BATCH).contains(&n))
             .unwrap_or(16);
         let shape = &[batch_mult * config.n_heads * max_tiles * (2 + config.head_dim)];
         let t = gpu.alloc_tensor(shape, DType::F32)?;
@@ -6915,20 +5352,6 @@ impl Qwen35Scratch {
             .map_err(|(msg, retained)| scratch_staging_error(&msg, retained))
     }
 
-    /// Build error from staging abort.
-    fn build_error(msg: &str, retained: Vec<RetainedQwenTensor>) -> HipError {
-        if retained.is_empty() {
-            HipError::new(0, msg)
-        } else {
-            let n = retained.len();
-            eprintln!(
-                "[hipfire-arch-qwen35] ScratchStaging: {n} allocation(s) could not be freed \
-                 during partial construction rollback (remaining in VRAM)."
-            );
-            HipError::new(0, &format!("{msg} (+{n} unfreed allocations)"))
-        }
-    }
-
     /// Finish construction from staging: consume staging tensors into the struct.
     /// All tensors must have been pushed in the correct order (base 31, then MoE).
     /// Free all GPU tensors. Call before drop to return VRAM.
@@ -6975,7 +5398,7 @@ impl Qwen35Scratch {
             let _ = gpu.free_tensor(t);
         }
         // MoE scratch — only present for MoE configs.
-        for t in [
+        for buf in [
             self.moe_router_logits,
             self.moe_scalar_buf,
             self.moe_x_rot,
@@ -6990,10 +5413,11 @@ impl Qwen35Scratch {
             self.moe_topk_indices,
             self.moe_topk_weights,
             self.moe_down_expanded,
-        ] {
-            if let Some(buf) = t {
-                let _ = gpu.free_tensor(buf);
-            }
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let _ = gpu.free_tensor(buf);
         }
         if let Some(pbs) = self.prefill_batch {
             pbs.free_gpu(gpu);
@@ -7154,6 +5578,10 @@ impl Qwen35ScratchSet {
 
 /// Zero-alloc forward pass using pre-allocated scratch buffers.
 /// Logits stay on GPU in scratch.logits. Returns nothing — caller uses scratch.logits.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "zero-alloc decode entry assembling gpu, weights, config, token state, kv/dn state, and scratch"
+)]
 pub fn forward_scratch(
     gpu: &mut Gpu,
     weights: &Qwen35Weights,
@@ -7799,10 +6227,11 @@ impl PrefillBatchScratch {
             self.dn_s_tape_q8,
             self.dn_s_tape_scales,
             self.dn_s_tape_f32,
-        ] {
-            if let Some(t) = t {
-                let _ = gpu.free_tensor(t);
-            }
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let _ = gpu.free_tensor(t);
         }
     }
 }
@@ -8198,6 +6627,10 @@ pub fn forward_prefill_batch_single_chunk_captured_opts(
     )
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "batched prefill entry (tokens, scratch, hidden-ring and spec-verify hooks)"
+)]
 pub fn forward_prefill_batch(
     gpu: &mut Gpu,
     weights: &Qwen35Weights,
@@ -8271,6 +6704,10 @@ pub fn forward_prefill_batch_abortable(
     )
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "batched prefill with caller-owned prefill scratch"
+)]
 pub fn forward_prefill_batch_with_pbs(
     gpu: &mut Gpu,
     weights: &Qwen35Weights,
@@ -8368,6 +6805,10 @@ fn forward_prefill_batch_with_pbs_abortable(
 /// `per_token_hidden_out` and compute their own logits from those hidden rows.
 /// The default wrapper keeps this true to protect existing callers that rely on
 /// `scratch.logits` being populated with the last token's logits.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "batched prefill with pbs scratch plus mask/max-layer options"
+)]
 pub fn forward_prefill_batch_with_pbs_opts(
     gpu: &mut Gpu,
     weights: &Qwen35Weights,
@@ -8377,9 +6818,9 @@ pub fn forward_prefill_batch_with_pbs_opts(
     kv_cache: &mut llama::KvCache,
     dn_state: &mut DeltaNetState,
     scratch: &Qwen35Scratch,
-    mut hidden_rb: Option<&mut HiddenStateRingBuffer>,
+    hidden_rb: Option<&mut HiddenStateRingBuffer>,
     per_token_hidden_out: Option<&GpuTensor>,
-    mut gdn_tape: Option<&mut crate::speculative::GdnTape>,
+    gdn_tape: Option<&mut crate::speculative::GdnTape>,
     tree_verify: Option<TreeVerifyCtx<'_>>,
     pbs_in: Option<&PrefillBatchScratch>,
     mask_override: Option<MaskEmbedOverride<'_>>,
@@ -8705,8 +7146,7 @@ fn forward_prefill_batch_with_pbs_opts_abortable(
             let pth_slot = per_token_hidden_out.map(|t| (t, chunk_start));
             // Reborrow the tape for this chunk so we keep the outer mut
             // after the chunk returns.
-            let tape_for_chunk: Option<&mut crate::speculative::GdnTape> =
-                gdn_tape.as_mut().map(|t| &mut **t);
+            let tape_for_chunk: Option<&mut crate::speculative::GdnTape> = gdn_tape.as_deref_mut();
             // Tree-verify was asserted to fit in one chunk above, so passing
             // the whole ctx through unconditionally is safe.
             let tv_for_chunk = tree_verify.as_ref().copied();
@@ -8725,14 +7165,15 @@ fn forward_prefill_batch_with_pbs_opts_abortable(
             });
             // Sanity: if caller provided an override, it MUST land in some
             // chunk. Detect "fell off the end" at the last chunk boundary.
-            if mask_override.is_some() && chunk_end == n {
-                let landed_anywhere = mask_override.unwrap().slot < n;
-                assert!(
-                    landed_anywhere,
-                    "MaskEmbedOverride.slot ({}) is out of range for tokens.len() ({})",
-                    mask_override.unwrap().slot,
-                    n,
-                );
+            if let Some(ovr) = mask_override {
+                if chunk_end == n {
+                    assert!(
+                        ovr.slot < n,
+                        "MaskEmbedOverride.slot ({}) is out of range for tokens.len() ({})",
+                        ovr.slot,
+                        n,
+                    );
+                }
             }
             forward_prefill_chunk(
                 gpu,
@@ -9080,10 +7521,12 @@ impl MoePrefillDtypes {
         }
     }
 
+    #[cfg(test)]
     fn from_ffn(ffn: &MoeFfnWeights) -> Option<Self> {
         MoeFfnView::Legacy(ffn).prefill_dtypes()
     }
 
+    #[cfg(test)]
     fn from_view(view: &MoeFfnView<'_>) -> Option<Self> {
         view.prefill_dtypes()
     }
@@ -9515,6 +7958,10 @@ fn moe_ffn_batched_admissible(
 /// fused QKVZA / gate+up kernels are NOT plain GEMMs and are migrated in later
 /// slices (they need new table entries).
 #[inline]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors the plain batched GEMM dispatch entry (kernel key + weight metadata + shapes)"
+)]
 fn run_plain_gemm_key(
     gpu: &mut Gpu,
     key: hipfire_dispatch::types::KernelKey,
@@ -10022,7 +8469,7 @@ fn prefill_moe_ffn_body_batched(
         run_plain_gemm_key(
             gpu,
             key,
-            &view.shared_expert_gate_ref().map_err(map_bind_err)?.buf,
+            view.shared_expert_gate_ref().map_err(map_bind_err)?.buf,
             view.shared_expert_gate_dtype(),
             x_in,
             shared_scalar,
@@ -10042,8 +8489,8 @@ fn prefill_moe_ffn_body_batched(
         DType::MQ4G256 => run_fused_gate_up_key(
             gpu,
             hipfire_dispatch::types::KernelKey::FusedGateUpHfq4G256,
-            &view.shared_gate_ref().map_err(map_bind_err)?.buf,
-            &view.shared_up_ref().map_err(map_bind_err)?.buf,
+            view.shared_gate_ref().map_err(map_bind_err)?.buf,
+            view.shared_up_ref().map_err(map_bind_err)?.buf,
             &pbs.x_rot_batch,
             shared_gate,
             shared_up,
@@ -10055,8 +8502,8 @@ fn prefill_moe_ffn_body_batched(
         DType::MQ6G256 => run_fused_gate_up_key(
             gpu,
             hipfire_dispatch::types::KernelKey::FusedGateUpHfq6G256,
-            &view.shared_gate_ref().map_err(map_bind_err)?.buf,
-            &view.shared_up_ref().map_err(map_bind_err)?.buf,
+            view.shared_gate_ref().map_err(map_bind_err)?.buf,
+            view.shared_up_ref().map_err(map_bind_err)?.buf,
             &pbs.x_rot_batch,
             shared_gate,
             shared_up,
@@ -10085,17 +8532,17 @@ fn prefill_moe_ffn_body_batched(
             gpu.givens_rotate_to(
                 &pbs.x_norm_batch,
                 &pbs.x_rot_batch,
-                &paro_gate.pairs,
-                &paro_gate.theta,
-                &paro_gate.scales,
+                paro_gate.pairs,
+                paro_gate.theta,
+                paro_gate.scales,
                 n,
                 dim,
-                paro_gate.krot as usize,
+                paro_gate.krot,
             )?;
             run_plain_gemm_key(
                 gpu,
                 hipfire_dispatch::types::KernelKey::GemmHfq4G128,
-                &view.shared_gate_ref().map_err(map_bind_err)?.buf,
+                view.shared_gate_ref().map_err(map_bind_err)?.buf,
                 view.shared_gate_dtype(),
                 &pbs.x_rot_batch,
                 shared_gate,
@@ -10107,17 +8554,17 @@ fn prefill_moe_ffn_body_batched(
             gpu.givens_rotate_to(
                 &pbs.x_norm_batch,
                 &pbs.x_rot_batch,
-                &paro_up.pairs,
-                &paro_up.theta,
-                &paro_up.scales,
+                paro_up.pairs,
+                paro_up.theta,
+                paro_up.scales,
                 n,
                 dim,
-                paro_up.krot as usize,
+                paro_up.krot,
             )?;
             run_plain_gemm_key(
                 gpu,
                 hipfire_dispatch::types::KernelKey::GemmHfq4G128,
-                &view.shared_up_ref().map_err(map_bind_err)?.buf,
+                view.shared_up_ref().map_err(map_bind_err)?.buf,
                 view.shared_up_dtype(),
                 &pbs.x_rot_batch,
                 shared_up,
@@ -10134,7 +8581,7 @@ fn prefill_moe_ffn_body_batched(
             run_plain_gemm_key(
                 gpu,
                 hipfire_dispatch::types::KernelKey::GemmQ8_0BatchedChunked,
-                &view.shared_gate_ref().map_err(map_bind_err)?.buf,
+                view.shared_gate_ref().map_err(map_bind_err)?.buf,
                 view.shared_gate_dtype(),
                 &pbs.x_norm_batch,
                 shared_gate,
@@ -10145,7 +8592,7 @@ fn prefill_moe_ffn_body_batched(
             run_plain_gemm_key(
                 gpu,
                 hipfire_dispatch::types::KernelKey::GemmQ8_0BatchedChunked,
-                &view.shared_up_ref().map_err(map_bind_err)?.buf,
+                view.shared_up_ref().map_err(map_bind_err)?.buf,
                 view.shared_up_dtype(),
                 &pbs.x_norm_batch,
                 shared_up,
@@ -10255,12 +8702,12 @@ fn prefill_moe_ffn_body_batched(
             shared_gate,
             shared_up,
             shared_rot,
-            &paro_down.pairs,
-            &paro_down.theta,
-            &paro_down.scales,
+            paro_down.pairs,
+            paro_down.theta,
+            paro_down.scales,
             n,
             smi,
-            paro_down.krot as usize,
+            paro_down.krot,
         )?;
     } else if matches!(sd_dt, DType::Q8_0) {
         // Q8 shared down expects the UN-rotated SwiGLU hidden (no FWHT). Plain
@@ -10294,7 +8741,7 @@ fn prefill_moe_ffn_body_batched(
     // (shipped via feat/hfq6-sigmoid-scaled-batched).
     match sd_dt {
         DType::MQ4G256 => gpu.gemv_hfq4g256_residual_sigmoid_scaled_gpu_batched(
-            &view.shared_down_ref().map_err(map_bind_err)?.buf,
+            view.shared_down_ref().map_err(map_bind_err)?.buf,
             shared_rot,
             &pbs.x_batch,
             shared_scalar,
@@ -10303,7 +8750,7 @@ fn prefill_moe_ffn_body_batched(
             n,
         )?,
         DType::MQ6G256 => gpu.gemv_hfq6g256_residual_sigmoid_scaled_gpu_batched(
-            &view.shared_down_ref().map_err(map_bind_err)?.buf,
+            view.shared_down_ref().map_err(map_bind_err)?.buf,
             shared_rot,
             &pbs.x_batch,
             shared_scalar,
@@ -10317,7 +8764,7 @@ fn prefill_moe_ffn_body_batched(
         // against W_down, applies sigmoid(shared_scalar[token]) × output,
         // accumulates into pbs.x_batch.
         DType::ParoQ4G128 => gpu.gemv_hfq4g128_residual_sigmoid_scaled_gpu_batched(
-            &view.shared_down_ref().map_err(map_bind_err)?.buf,
+            view.shared_down_ref().map_err(map_bind_err)?.buf,
             shared_rot,
             &pbs.x_batch,
             shared_scalar,
@@ -10341,7 +8788,7 @@ fn prefill_moe_ffn_body_batched(
             run_plain_gemm_key(
                 gpu,
                 hipfire_dispatch::types::KernelKey::GemmQ8_0BatchedChunked,
-                &view.shared_down_ref().map_err(map_bind_err)?.buf,
+                view.shared_down_ref().map_err(map_bind_err)?.buf,
                 sd_dt,
                 shared_rot,
                 &down_tmp,
@@ -10469,9 +8916,9 @@ fn prefill_moe_ffn_body_batched(
 /// chunk processes the whole stack: embedding → all layers → final norm
 /// + lm_head. `Some(b)` restricts the chunk to layers `b.layer_start..
 /// b.layer_end`, skips the embedding when `!b.is_first_band` (input is
-/// already in `pbs.x_batch` from a prior peer-copy), and skips the final
-/// norm + lm_head when `!b.is_last_band` (output activation stays in
-/// `pbs.x_batch` for the next band's peer-copy).
+///   already in `pbs.x_batch` from a prior peer-copy), and skips the final
+///   norm + lm_head when `!b.is_last_band` (output activation stays in
+///   `pbs.x_batch` for the next band's peer-copy).
 ///
 /// Counter offsets seed the running per-LA / per-KV / per-FA counters so
 /// the band's first DeltaNet/FullAttn layer indexes the correct
@@ -10553,6 +9000,10 @@ fn dump_hidden_localize(
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "chunked prefill plumbing (batch inputs, scratch, spec-verify and hidden-ring hooks)"
+)]
 fn forward_prefill_chunk(
     gpu: &mut Gpu,
     weights: &Qwen35Weights,
@@ -10788,7 +9239,6 @@ fn forward_prefill_chunk(
     // each matcher). Phase 1 gfx10 MQ3 prefill (`docs/plans/gfx10_mq3_prefill.md`)
     // routes the 8 `is_mq3*` matchers below to scalar HFQ3 kernels on
     // !arch_has_wmma archs admitted by `is_batchable_la`.
-    let arch_has_wmma = q8_wmma_arch;
     let fa_batched_ok =
         (kv_cache.quant_q8 || kv_cache.quant_asym4 || kv_cache.quant_asym3 || kv_cache.quant_asym2)
             && weights.layers.iter().all(|lw| match lw {
@@ -11302,31 +9752,17 @@ fn forward_prefill_chunk(
                         n,
                     )?;
                 } else if wo_is_mq3 {
-                    if arch_has_wmma {
-                        run_residual_gemm_key(
-                            gpu,
-                            hipfire_dispatch::types::KernelKey::GemmHfq3G256Residual,
-                            &layer.wo.buf,
-                            layer.wo.gpu_dtype,
-                            wo_input,
-                            &pbs.x_batch,
-                            layer.wo.m,
-                            layer.wo.k,
-                            n,
-                        )?;
-                    } else {
-                        run_residual_gemm_key(
-                            gpu,
-                            hipfire_dispatch::types::KernelKey::GemmHfq3G256Residual,
-                            &layer.wo.buf,
-                            layer.wo.gpu_dtype,
-                            wo_input,
-                            &pbs.x_batch,
-                            layer.wo.m,
-                            layer.wo.k,
-                            n,
-                        )?;
-                    }
+                    run_residual_gemm_key(
+                        gpu,
+                        hipfire_dispatch::types::KernelKey::GemmHfq3G256Residual,
+                        &layer.wo.buf,
+                        layer.wo.gpu_dtype,
+                        wo_input,
+                        &pbs.x_batch,
+                        layer.wo.m,
+                        layer.wo.k,
+                        n,
+                    )?;
                 } else if wo_is_fp4 {
                     run_residual_gemm_key(
                         gpu,
@@ -11601,31 +10037,17 @@ fn forward_prefill_chunk(
                         n,
                     )?;
                 } else if w_down_is_mq3 {
-                    if arch_has_wmma {
-                        run_residual_gemm_key(
-                            gpu,
-                            hipfire_dispatch::types::KernelKey::GemmHfq3G256Residual,
-                            &layer.w_down.buf,
-                            layer.w_down.gpu_dtype,
-                            &pbs.ffn_hidden_batch,
-                            &pbs.x_batch,
-                            layer.w_down.m,
-                            layer.w_down.k,
-                            n,
-                        )?;
-                    } else {
-                        run_residual_gemm_key(
-                            gpu,
-                            hipfire_dispatch::types::KernelKey::GemmHfq3G256Residual,
-                            &layer.w_down.buf,
-                            layer.w_down.gpu_dtype,
-                            &pbs.ffn_hidden_batch,
-                            &pbs.x_batch,
-                            layer.w_down.m,
-                            layer.w_down.k,
-                            n,
-                        )?;
-                    }
+                    run_residual_gemm_key(
+                        gpu,
+                        hipfire_dispatch::types::KernelKey::GemmHfq3G256Residual,
+                        &layer.w_down.buf,
+                        layer.w_down.gpu_dtype,
+                        &pbs.ffn_hidden_batch,
+                        &pbs.x_batch,
+                        layer.w_down.m,
+                        layer.w_down.k,
+                        n,
+                    )?;
                 } else if w_down_is_fp4 {
                     run_residual_gemm_key(
                         gpu,
@@ -11668,7 +10090,6 @@ fn forward_prefill_chunk(
                 // forward_scratch_layers kernel-for-kernel, but every
                 // launch covers all N tokens at once.
                 let kv_dim = config.n_kv_heads * config.head_dim;
-                let q_dim = config.n_heads * config.head_dim;
                 let qkv_is_mq = matches!(
                     layer.wq.gpu_dtype,
                     DType::MQ4G256
@@ -12117,31 +10538,17 @@ fn forward_prefill_chunk(
                         n,
                     )?;
                 } else if fa_wo_is_mq3 {
-                    if arch_has_wmma {
-                        run_residual_gemm_key(
-                            gpu,
-                            hipfire_dispatch::types::KernelKey::GemmHfq3G256Residual,
-                            &layer.wo.buf,
-                            layer.wo.gpu_dtype,
-                            fa_wo_input,
-                            &pbs.x_batch,
-                            layer.wo.m,
-                            layer.wo.k,
-                            n,
-                        )?;
-                    } else {
-                        run_residual_gemm_key(
-                            gpu,
-                            hipfire_dispatch::types::KernelKey::GemmHfq3G256Residual,
-                            &layer.wo.buf,
-                            layer.wo.gpu_dtype,
-                            fa_wo_input,
-                            &pbs.x_batch,
-                            layer.wo.m,
-                            layer.wo.k,
-                            n,
-                        )?;
-                    }
+                    run_residual_gemm_key(
+                        gpu,
+                        hipfire_dispatch::types::KernelKey::GemmHfq3G256Residual,
+                        &layer.wo.buf,
+                        layer.wo.gpu_dtype,
+                        fa_wo_input,
+                        &pbs.x_batch,
+                        layer.wo.m,
+                        layer.wo.k,
+                        n,
+                    )?;
                 } else if fa_wo_is_fp4 {
                     run_residual_gemm_key(
                         gpu,
@@ -12405,31 +10812,17 @@ fn forward_prefill_chunk(
                         n,
                     )?;
                 } else if fa_w_down_is_mq3 {
-                    if arch_has_wmma {
-                        run_residual_gemm_key(
-                            gpu,
-                            hipfire_dispatch::types::KernelKey::GemmHfq3G256Residual,
-                            &layer.w_down.buf,
-                            layer.w_down.gpu_dtype,
-                            &pbs.ffn_hidden_batch,
-                            &pbs.x_batch,
-                            layer.w_down.m,
-                            layer.w_down.k,
-                            n,
-                        )?;
-                    } else {
-                        run_residual_gemm_key(
-                            gpu,
-                            hipfire_dispatch::types::KernelKey::GemmHfq3G256Residual,
-                            &layer.w_down.buf,
-                            layer.w_down.gpu_dtype,
-                            &pbs.ffn_hidden_batch,
-                            &pbs.x_batch,
-                            layer.w_down.m,
-                            layer.w_down.k,
-                            n,
-                        )?;
-                    }
+                    run_residual_gemm_key(
+                        gpu,
+                        hipfire_dispatch::types::KernelKey::GemmHfq3G256Residual,
+                        &layer.w_down.buf,
+                        layer.w_down.gpu_dtype,
+                        &pbs.ffn_hidden_batch,
+                        &pbs.x_batch,
+                        layer.w_down.m,
+                        layer.w_down.k,
+                        n,
+                    )?;
                 } else if fa_w_down_is_fp4 {
                     run_residual_gemm_key(
                         gpu,
@@ -13726,7 +12119,6 @@ fn run_fa_layer_body(
     let fused_fa3_mq4 = fa3_same_dtype && (dt == DType::MQ4G256 || dt == DType::HFQ4G256);
     let fused_fa3_lloyd_mq3 = fa3_same_dtype && dt == DType::MQ3G256Lloyd;
     let fused_fa3_lloyd_mq4 = fa3_same_dtype && dt == DType::MQ4G256Lloyd;
-    let fused_fa3_lloyd_mq4 = fa3_same_dtype && dt == DType::MQ4G256Lloyd;
     // Phase A.1c (gfx906): fused dp4a path for HFQ6/MQ6 weights.
     let fused_fa3_hfq6 = fa3_same_dtype
         && (dt == DType::MQ6G256 || dt == DType::HFQ6G256)
@@ -13824,7 +12216,6 @@ fn run_fa_layer_body(
         config.head_dim,
         config.norm_eps,
     )?;
-    let kv_dim = config.n_kv_heads * config.head_dim;
     gpu.rmsnorm_batched(
         &s.fa_k,
         &layer.k_norm,
@@ -14000,6 +12391,10 @@ fn run_fa_layer_body(
 /// configured target layers into `hidden_rb`. Used by the DFlash draft path
 /// during target verification. `hidden_rb.advance_head()` is called once
 /// automatically at the end of the forward pass.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "zero-alloc decode plus hidden-ring extraction entry"
+)]
 pub fn forward_scratch_with_hidden(
     gpu: &mut Gpu,
     weights: &Qwen35Weights,
@@ -14047,6 +12442,10 @@ pub fn forward_scratch_with_hidden(
 }
 
 /// Zero-alloc forward from pre-computed embedding in scratch.x.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "zero-alloc decode from a pre-computed embedding"
+)]
 pub fn forward_scratch_embed(
     gpu: &mut Gpu,
     weights: &Qwen35Weights,
@@ -14188,6 +12587,10 @@ fn batched_gemm_single_weight(
 
 // ── Forward scratch layers (dispatch family version) ────────────────────
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "per-layer loop plumbing (gpu, weights, config, kv/dn state, scratch, hidden ring)"
+)]
 fn forward_scratch_layers(
     gpu: &mut Gpu,
     weights: &Qwen35Weights,
@@ -14204,8 +12607,6 @@ fn forward_scratch_layers(
     let hd = config.linear_key_head_dim;
 
     let ctx = DispatchCtx::new(gpu);
-
-    let mut kv_layer_idx = 0usize;
 
     for layer_idx in 0..config.n_layers {
         match (&weights.layers[layer_idx], config.layer_types[layer_idx]) {
@@ -14388,7 +12789,7 @@ fn forward_scratch_layers(
                 )?;
 
                 if hipfire_runtime::triattn::tap_enabled() {
-                    triattn_tap(gpu, layer_idx, &s, config)?;
+                    triattn_tap(gpu, layer_idx, s, config)?;
                 }
 
                 if kv_cache.compact_offset > 0 {
@@ -14465,7 +12866,6 @@ fn forward_scratch_layers(
                     &format!("layer {layer_idx} FullAttention residual"),
                     &s.x,
                 )?;
-                kv_layer_idx += 1;
             }
 
             (LayerWeights::DeltaNetMoe(layer), LayerType::LinearAttention) => {
@@ -14701,8 +13101,6 @@ fn forward_scratch_layers(
                         rb.write_at_head(gpu, slot, &s.x)?;
                     }
                 }
-
-                kv_layer_idx += 1;
             }
 
             // Mismatched layer weight / type combinations are unreachable
@@ -15185,59 +13583,6 @@ fn moe_ffn_dispatch(
     Ok(())
 }
 
-/// EP (Ship 6 substrate-EP) variant of `moe_ffn_dispatch`: same rmsnorm/rotate +
-/// MoE decode, but the routed combine + shared-down accumulate into `routed_out`
-/// (a zeroed per-rank partial the EP executor all-reduces), and `skip_shared`
-/// gates the shared-expert down to rank 0. Calls `moe_ffn_decode_impl` directly
-/// (the `with_scratch` wrappers don't carry EP params). The residual `x` is left
-/// untouched — the executor adds the all-reduced partial into it afterward.
-fn moe_ffn_dispatch_ep(
-    gpu: &mut Gpu,
-    ffn: &MoeFfnWeights,
-    x: &GpuTensor,
-    ffn_norm: &GpuTensor,
-    config: &Qwen35Config,
-    s: &Qwen35Scratch,
-    routed_out: &GpuTensor,
-    skip_shared: bool,
-) -> HipResult<()> {
-    let refs = MoeScratchRef::from_scratch(s);
-    let view = MoeFfnView::Legacy(ffn);
-    if view.all_mq4() {
-        gpu.fused_rmsnorm_rotate_mq(
-            x,
-            ffn_norm,
-            s.moe_x_rot.as_ref().expect("MoE scratch"),
-            config.dim,
-            config.norm_eps,
-        )?;
-        moe_ffn_decode_impl(
-            gpu,
-            view,
-            x,
-            x,
-            config,
-            &refs,
-            true,
-            Some(routed_out),
-            skip_shared,
-        )
-    } else {
-        gpu.rmsnorm_f32(x, ffn_norm, &s.tmp, config.norm_eps)?;
-        moe_ffn_decode_impl(
-            gpu,
-            view,
-            &s.tmp,
-            x,
-            config,
-            &refs,
-            false,
-            Some(routed_out),
-            skip_shared,
-        )
-    }
-}
-
 /// EP (Ship 6 substrate-EP, ported from tp-mtp-prototype Stage 3e): shard a MoE
 /// layer's routed experts to `rank`. Frees the non-owned experts (the memory
 /// win), compacts owned to the front of `ffn.experts` (so `experts[0]` stays a
@@ -15555,7 +13900,6 @@ fn forward_scratch_layers_multi(
                     let fused_la4_mq4 =
                         la4_same_dtype && (dt == DType::MQ4G256 || dt == DType::HFQ4G256);
                     let fused_la4_lloyd_mq3 = la4_same_dtype && dt == DType::MQ3G256Lloyd;
-                    let fused_la4_lloyd_mq4 = la4_same_dtype && dt == DType::MQ4G256Lloyd;
                     debug_assert_eq!(
                         scalar_qkvza_key(
                             layer.wqkv.gpu_dtype,
@@ -15719,7 +14063,6 @@ fn forward_scratch_layers_multi(
                     let fused_gu_mq4 =
                         same_dtype && (dt_g == DType::MQ4G256 || dt_g == DType::HFQ4G256);
                     let fused_gu_lloyd_mq3 = same_dtype && dt_g == DType::MQ3G256Lloyd;
-                    let fused_gu_lloyd_mq4 = same_dtype && dt_g == DType::MQ4G256Lloyd;
                     if fused_gu_mq4 {
                         let eff_x = match x_rot {
                             Some(xr) => xr,
@@ -15780,7 +14123,6 @@ fn forward_scratch_layers_multi(
                     let fused_fa3_mq4 =
                         fa3_same_dtype && (dt == DType::MQ4G256 || dt == DType::HFQ4G256);
                     let fused_fa3_lloyd_mq3 = fa3_same_dtype && dt == DType::MQ3G256Lloyd;
-                    let fused_fa3_lloyd_mq4 = fa3_same_dtype && dt == DType::MQ4G256Lloyd;
                     if fused_fa3_mq4 {
                         let eff_x = match x_rot {
                             Some(xr) => xr,
@@ -16154,7 +14496,6 @@ fn forward_scratch_layers_multi(
                     let fused_gu_mq4 =
                         same_dtype && (dt_g == DType::MQ4G256 || dt_g == DType::HFQ4G256);
                     let fused_gu_lloyd_mq3 = same_dtype && dt_g == DType::MQ3G256Lloyd;
-                    let fused_gu_lloyd_mq4 = same_dtype && dt_g == DType::MQ4G256Lloyd;
                     if fused_gu_mq4 {
                         let eff_x = match x_rot {
                             Some(xr) => xr,
@@ -16217,7 +14558,6 @@ fn forward_scratch_layers_multi(
                     let fused_la4_mq4 =
                         la4_same_dtype && (dt == DType::MQ4G256 || dt == DType::HFQ4G256);
                     let fused_la4_lloyd_mq3 = la4_same_dtype && dt == DType::MQ3G256Lloyd;
-                    let fused_la4_lloyd_mq4 = la4_same_dtype && dt == DType::MQ4G256Lloyd;
                     if fused_la4_mq4 {
                         let eff_x = match x_rot {
                             Some(xr) => xr,
@@ -16384,7 +14724,6 @@ fn forward_scratch_layers_multi(
                     let fused_fa3_mq4 =
                         fa3_same_dtype && (dt == DType::MQ4G256 || dt == DType::HFQ4G256);
                     let fused_fa3_lloyd_mq3 = fa3_same_dtype && dt == DType::MQ3G256Lloyd;
-                    let fused_fa3_lloyd_mq4 = fa3_same_dtype && dt == DType::MQ4G256Lloyd;
                     if fused_fa3_mq4 {
                         let eff_x = match x_rot {
                             Some(xr) => xr,
@@ -16797,6 +15136,10 @@ fn forward_scratch_layers_multi(
 /// Embedding lookup on dev 0 (token_embd lives there per Stage 4 placement),
 /// then the layer loop via `forward_scratch_layers_multi`. `s.logits` ends
 /// up on `gpus.output_device`. hipGraph capture is bypassed for pp > 1.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "multi-GPU decode entry (gpu set, weights, config, token state, per-device scratch)"
+)]
 pub fn forward_scratch_multi(
     gpus: &mut Gpus,
     weights: &Qwen35Weights,
@@ -17211,6 +15554,10 @@ pub fn forward_with_embedding(
 /// * `has_wmma` — whether the target arch has WMMA (`arch_has_e8_wmma`).
 /// * `has_deltanet` — whether the `deltanet` cargo feature is active (shared-
 ///   down non-MQ4 path requires compiled DeltaNet).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors the Frozen MoE admission surface (config, snapshot, per-expert dtype tables, arch flags)"
+)]
 pub(crate) fn validate_frozen_moe_dispatch(
     config: &Qwen35Config,
     snapshot: &MoeDtypeSnapshot,
@@ -17338,10 +15685,10 @@ pub(crate) fn validate_frozen_moe_dispatch(
             ));
         }
         if !snapshot.expert_dtype_tags_present && pairs_vary {
-            return Err(format!(
-                "dtype_tags absent but experts have varying pairs; \
-                 tags should be present"
-            ));
+            return Err(
+                "dtype_tags absent but experts have varying pairs; tags should be present"
+                    .to_string(),
+            );
         }
 
         // When pairs vary (mixed/graded), validate each distinct pair is
@@ -17856,7 +16203,6 @@ mod tests {
 
     /// The Qwen3.5-specific copy admits more dtypes than the runtime copy
     /// (ParoQ4G128, F32, Lloyd variants).
-
     const BATCHABLE_ARCHS: &[&str] = &[
         "gfx900", "gfx906", "gfx908", "gfx940", "gfx941", "gfx942", "gfx1010", "gfx1011",
         "gfx1012", "gfx1013", "gfx1030", "gfx1031", "gfx1032", "gfx1100", "gfx1101", "gfx1102",
@@ -18986,6 +17332,10 @@ mod tests {
     }
 
     /// Build a uniform MoeDtypeSnapshot for testing.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "test fixture enumerating the uniform snapshot fields"
+    )]
     fn snapshot_uniform(
         router_dt: DType,
         scalar_gate_dt: DType,
@@ -19217,7 +17567,7 @@ mod tests {
             false,
         );
         let mut gu = vec![DType::MQ5G256; 8];
-        let mut dn = vec![DType::MQ5G256; 8];
+        let dn = vec![DType::MQ5G256; 8];
         gu[3] = DType::MQ4G256; // mixed: some MQ5, some MQ4
         let err =
             validate_frozen_moe_dispatch(&cfg, &snap, &gu, &dn, false, false, true, true, true)
@@ -19604,7 +17954,7 @@ mod tests {
         let cfg = moe_test_config(8, 8);
         // Mixed tags: experts have different pairs (e.g. MQ4/MQ4 + MQ4/MQ6).
         // Build per-expert data with mixed pairs.
-        let mut gu = vec![DType::MQ4G256; 8];
+        let gu = vec![DType::MQ4G256; 8];
         let mut dn = vec![DType::MQ4G256; 8];
         dn[4] = DType::MQ6G256; // one expert differs -> tags needed
                                 // Snapshot representative shows MQ4/MQ4 with tags_present=true.
@@ -19629,7 +17979,7 @@ mod tests {
     #[test]
     fn c2_accept_mixed_tags_wave32() {
         let cfg = moe_test_config(8, 8);
-        let mut gu = vec![DType::MQ4G256; 8];
+        let gu = vec![DType::MQ4G256; 8];
         let mut dn = vec![DType::MQ4G256; 8];
         dn[3] = DType::MQ6G256;
         dn[5] = DType::MQ6G256;
@@ -19797,7 +18147,7 @@ mod tests {
     #[test]
     fn c2_reject_unknown_router_dtype() {
         // A completely unknown dtype on the router should be rejected.
-        let cfg = moe_test_config(8, 8);
+        let _cfg = moe_test_config(8, 8);
         // Use a dtype that isn't recognized by rotation_plan or known non-rotated list.
         // MFP4G32 (non-E8) is a known FWHT type actually. Let's use something truly odd.
         // Actually ALL DType variants are known. The check catches unrecognized
@@ -20053,10 +18403,10 @@ mod tests {
         fn _sig(f: fn(DeltaNetState, &mut Gpu) -> Result<(), Vec<RetainedQwenTensor>>) {
             let _ = f;
         }
-        let _ = _sig(DeltaNetState::abort_checked);
+        _sig(DeltaNetState::abort_checked);
 
         // Empty state returns Ok.
-        let state = DeltaNetState {
+        let _state = DeltaNetState {
             s_matrices: vec![],
             s_scales: vec![],
             conv_states: vec![],
@@ -20094,7 +18444,7 @@ mod tests {
         fn _sig(f: fn(Qwen35Scratch, &mut Gpu) -> Result<(), Vec<RetainedQwenTensor>>) {
             let _ = f;
         }
-        let _ = _sig(Qwen35Scratch::abort_checked);
+        _sig(Qwen35Scratch::abort_checked);
     }
 
     #[test]
