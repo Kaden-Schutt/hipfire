@@ -2176,6 +2176,10 @@ pub fn load_qwen35_paro_weights(
 /// best-effort — any owner surfaced by the existing rollback API is
 /// retained in the returned [`Qwen35LoadError`] and enqueued by the
 /// loader; exact failed-free retention for these domains is NOT claimed.
+#[expect(
+    clippy::result_large_err,
+    reason = "Err preserves the common weights + frozen store + cleanup aggregate (all GPU owners) for the loader backlog; flattening would leak on failure"
+)]
 pub(crate) fn load_qwen35_hfq_weights_frozen_prepared(
     prepared: PreparedFrozenHfqManifest,
     hfq: &HfqFile,
@@ -2350,10 +2354,10 @@ impl Qwen35MoeLoadFlags {
 
 /// `HIPFIRE_MOE_AWQ` env resolution — the single read site.
 fn moe_awq_enabled_from_env() -> bool {
-    match std::env::var("HIPFIRE_MOE_AWQ").ok().as_deref() {
-        Some("0") | Some("off") | Some("false") | Some("disable") => false,
-        _ => true,
-    }
+    !matches!(
+        std::env::var("HIPFIRE_MOE_AWQ").ok().as_deref(),
+        Some("0" | "off" | "false" | "disable")
+    )
 }
 
 /// Authorized Frozen load plan.  Produced only by a successful
@@ -2475,6 +2479,10 @@ impl std::fmt::Debug for Qwen35FrozenIneligible {
 ///   path (manifest corruption, routed gate-up AWQ companions, partial
 ///   routed-down AWQ coverage); the load must fail.
 #[must_use]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "Eligible carries the sealed Qwen35FrozenPlan (HFQ source + prepared manifest + dispatch snapshot) whole for one-shot assembly; Ineligible/Invalid are the lightweight fallback arms"
+)]
 pub enum Qwen35FrozenPreflight {
     /// Frozen path selected; the plan authorizes the Frozen load and
     /// owns the source.
@@ -2869,6 +2877,10 @@ pub(crate) fn assemble_qwen35_frozen_common(
 /// The type is `pub(crate)` — external crates cannot construct or match
 /// it directly; they go through [`MoeFfnView`] or the well-known seam
 /// functions.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "Legacy retains the owned MoeFfnWeights while Frozen is a unit marker for externally-managed residency; boxing would complicate the ownership seam"
+)]
 pub(crate) enum MoeFfnStorage {
     Legacy(MoeFfnWeights),
     Frozen,
@@ -2876,6 +2888,13 @@ pub(crate) enum MoeFfnStorage {
 
 impl MoeFfnStorage {
     /// Returns `true` when the storage contains actual owned weights.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "compile-time ownership seam exercised by type tests"
+        )
+    )]
     pub(crate) fn is_legacy(&self) -> bool {
         matches!(self, MoeFfnStorage::Legacy(_))
     }
@@ -2911,11 +2930,11 @@ impl MoeFfnStorage {
 /// * `Legacy(&MoeFfnWeights)` — reads dtypes from the owned weight struct.
 /// * `Frozen(&Qwen35MoeLayerProjection<WeightCellId>)` — reads dtypes from
 ///   the validated projection descriptors.
-#[derive(Clone, Copy)]
-/// Metadata-only view of one MoE FFN layer, for both storage kinds.
 ///
+/// Metadata-only view of one MoE FFN layer, for both storage kinds.
 /// `K` is the projection key type (`WeightCellId` in production; tests use
 /// `&'static str` projections without needing a GPU store).
+#[derive(Clone, Copy)]
 pub(crate) enum MoeFfnMetaView<'a, K = WeightCellId> {
     Legacy(&'a MoeFfnWeights),
     Frozen(&'a Qwen35MoeLayerProjection<K>),
@@ -3010,10 +3029,6 @@ impl<'a, K> MoeFfnMetaView<'a, K> {
         (0..self.expert_count()).all(|i| self.expert_down_dtype(i) == dt)
     }
 
-    fn experts_all_gate_up_mq4(&self) -> bool {
-        self.all_experts_gate_up_dtype(DType::MQ4G256)
-    }
-
     // ── AWQ companion presence (I1) ──────────────────────────────────
 
     fn router_has_awq(&self) -> bool {
@@ -3072,18 +3087,6 @@ impl<'a, K> MoeFfnMetaView<'a, K> {
         }
     }
 
-    fn gate_side_mq4(&self) -> bool {
-        self.to_snapshot().gate_side_mq4()
-    }
-    fn all_mq4(&self) -> bool {
-        self.to_snapshot().all_mq4()
-    }
-    fn has_mq3_structural(&self) -> bool {
-        self.to_snapshot().has_mq3_structural()
-    }
-    fn has_mq3_experts_uniform(&self) -> bool {
-        self.to_snapshot().has_mq3_experts_uniform()
-    }
     /// Model-wide MQ6 fence for ONE MoE FFN layer: true when ANY MoE FFN
     /// projection carries MQ6G256 — router, shared_expert_gate, shared
     /// gate/up/down, or ANY routed expert gate_up/down (uniform or graded).
@@ -3308,14 +3311,35 @@ impl<T, F> CleanupAggregate<T, F> {
         self.frozen_owners.push(owner);
     }
 
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "compile-time ownership seam exercised by type tests"
+        )
+    )]
     pub(crate) fn tensor_count(&self) -> usize {
         self.tensor_owners.len()
     }
 
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "compile-time ownership seam exercised by type tests"
+        )
+    )]
     pub(crate) fn frozen_count(&self) -> usize {
         self.frozen_owners.len()
     }
 
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "compile-time ownership seam exercised by type tests"
+        )
+    )]
     pub(crate) fn is_empty(&self) -> bool {
         self.tensor_owners.is_empty() && self.frozen_owners.is_empty()
     }
@@ -3599,10 +3623,7 @@ impl Qwen35LoadError {
 
         // Phase D: common weights — independent of both frozen domains.
         let mut common_failure = if let Some(weights) = self.common.take() {
-            match weights.free_gpu_checked(gpu) {
-                Ok(()) => None,
-                Err(cf) => Some(cf),
-            }
+            weights.free_gpu_checked(gpu).err()
         } else {
             None
         };
@@ -3616,11 +3637,9 @@ impl Qwen35LoadError {
             // Both retry closures need `gpu`; the generic retry invokes
             // them strictly sequentially, so route through a cell.
             let gpu_cell = std::cell::RefCell::new(&mut *gpu);
-            let retry_tensor = |r: crate::qwen35::RetainedQwenTensor| {
-                r.retry(&mut **gpu_cell.borrow_mut()).map_err(|r| r)
-            };
-            let retry_frozen =
-                |f: SingleFreeFailed| f.retry(&mut **gpu_cell.borrow_mut()).map_err(|f| f);
+            let retry_tensor =
+                |r: crate::qwen35::RetainedQwenTensor| r.retry(&mut gpu_cell.borrow_mut());
+            let retry_frozen = |f: SingleFreeFailed| f.retry(&mut gpu_cell.borrow_mut());
             match agg.retry(retry_tensor, retry_frozen) {
                 Ok(()) => {}
                 Err(remaining) => {
@@ -3682,6 +3701,13 @@ pub(crate) fn is_moe_name(name: &str) -> bool {
 
 /// Returns `true` when `entry` is an MoE FFN weight (including AWQ
 /// companions).
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "compile-time ownership seam exercised by type tests"
+    )
+)]
 pub(crate) fn is_moe_entry(entry: &WeightEntry) -> bool {
     is_moe_name(&entry.name)
 }
@@ -3897,7 +3923,7 @@ fn widen_awq_to_f32(bytes: &[u8], dtype: DType) -> Result<Vec<u8>, String> {
             "cannot widen AWQ companion: unsupported source dtype {dtype:?}, expected F16"
         ));
     }
-    if bytes.len() % 2 != 0 {
+    if !bytes.len().is_multiple_of(2) {
         return Err(format!(
             "cannot widen AWQ companion: odd byte length {} (expected even for F16)",
             bytes.len()
@@ -3954,7 +3980,6 @@ struct LayerMeta {
     expert_gate_up_dtypes: Vec<DType>,
     expert_down_dtypes: Vec<DType>,
     expert_down_awq_count: usize,
-    expert_tags: Vec<u8>,
     mixed_tags: bool,
 }
 
@@ -3964,9 +3989,7 @@ fn plan_frozen_moe(
     builder: &SingleWeightStoreBuilder<'_>,
     config: &Qwen35Config,
 ) -> Result<FrozenMoePlan, String> {
-    let d = config.dim;
     let n = config.num_experts;
-    let mi = config.moe_intermediate_size;
 
     // layer_types must cover every index.
     if config.layer_types.len() != config.n_layers {
@@ -4118,7 +4141,6 @@ fn plan_frozen_moe(
         // uniform pairs like MQ5/MQ5 that are indexable without tags).
         // Mixed pairs (varying per-expert dtypes) are validated through
         // fallible_dtype_tag which enforces the supported tag table.
-        let pair_same = |a: &(DType, DType), b: &(DType, DType)| a.0 == b.0 && a.1 == b.1;
         let first_pair = (expert_gate_up_dtypes[0], expert_down_dtypes[0]);
         let uniform = n <= 1
             || expert_gate_up_dtypes[1..]
@@ -4168,7 +4190,7 @@ fn plan_frozen_moe(
 
         // Optional dtype_tags
         if mixed_tags {
-            let tags_bytes: Vec<u8> = expert_tags.iter().copied().collect();
+            let tags_bytes: Vec<u8> = expert_tags.to_vec();
             derived_payloads.push(tags_bytes);
         }
 
@@ -4194,7 +4216,6 @@ fn plan_frozen_moe(
             expert_gate_up_dtypes,
             expert_down_dtypes,
             expert_down_awq_count: down_awq_count,
-            expert_tags,
             mixed_tags,
         });
     }
@@ -4227,6 +4248,10 @@ fn plan_frozen_moe(
 /// `companion_present(name, layer)` answers whether the MoE partition /
 /// builder registry carries an AWQ companion for the named gate-side
 /// projection.  Error messages identify the failing layer.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors the C2 per-layer Frozen admission surface: config + layer meta + companion predicate + arch feature flags + dispatch context, one-shot at freeze"
+)]
 fn validate_frozen_moe_layer(
     config: &Qwen35Config,
     meta: &LayerMeta,
@@ -4477,7 +4502,6 @@ fn collect_moe_layer_meta(
             expert_gate_up_dtypes,
             expert_down_dtypes,
             expert_down_awq_count: down_awq_count,
-            expert_tags,
             mixed_tags,
         });
     }
@@ -4750,15 +4774,14 @@ pub(crate) fn build_frozen_moe_resident(
         };
 
         // Verify we consumed the right number of payloads.
-        debug_assert_eq!(payload_idx - off, {
-            let expected =
-                2 + if meta.expert_down_awq_count == n {
-                    1
-                } else {
-                    0
-                } + if meta.mixed_tags { 1 } else { 0 };
-            expected
-        });
+        debug_assert_eq!(
+            payload_idx - off,
+            2 + if meta.expert_down_awq_count == n {
+                1
+            } else {
+                0
+            } + if meta.mixed_tags { 1 } else { 0 }
+        );
 
         derived_ids.push(DerivedIds {
             gu_ptrs,
@@ -4901,7 +4924,7 @@ pub(crate) fn build_frozen_moe_resident(
             has_wmma,
             has_deltanet,
             &gemv_family,
-            &dispatch_ctx,
+            dispatch_ctx,
         ) {
             return Err(builder_fail(builder, msg));
         }
@@ -5184,6 +5207,10 @@ impl std::fmt::Display for Qwen35MoeValidationError {
 /// 8. Dtype tags have dtype Raw and shape `[num_experts]`.
 /// 9. Layer index matches (when `expected_layer` is `Some`).
 /// 10. Dummy descriptor is absent (Single-mode refusal).
+#[expect(
+    clippy::type_complexity,
+    reason = "the resolver closure keeps the validator GPU-free and CPU-testable; a type alias would hide the pure key→(dtype, shape) contract"
+)]
 struct ValidationCtx<'a, K> {
     errors: Vec<Qwen35MoeValidationError>,
     shape_cfg: &'a MoeLayerShapeConfig,
@@ -5558,6 +5585,14 @@ impl Qwen35MoeResident {
     /// On success the store and projections are published together,
     /// guaranteeing that every key in every projection is backed by a
     /// valid, semantically-checked tensor.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Err returns every staged owner (validation errors + store + projections) so the caller retries or frees without losing any"
+    )]
+    #[expect(
+        clippy::type_complexity,
+        reason = "the tuple preserves each staged owner (errors, store, projections) for exact rollback"
+    )]
     pub(crate) fn try_new(
         store: SingleFrozenWeightStore,
         layers: Vec<Qwen35MoeLayerProjection<WeightCellId>>,
@@ -5864,10 +5899,8 @@ mod tests {
     use super::*;
     use crate::arch::Qwen35;
 
-    use crate::carrier::Qwen35Bundle;
     use hipfire_hardware::DeviceMesh;
     use hipfire_runtime::arch::Architecture;
-    use hipfire_runtime::loader_api::{LoadCtx, ModelSource as LoaderModelSource};
     use hipfire_runtime::model_source::{ModelSource, QuantConfig, TensorInfo};
     use hipfire_runtime::weight_store::fulfill_manifest_gpu;
     use std::cell::RefCell;
@@ -6361,9 +6394,10 @@ mod tests {
                 let n = entry.logical_shape.iter().product::<usize>();
                 let dtype = if entry.name == "lm_head" {
                     DType::MQ4G256
-                } else if entry.name.ends_with(AWQ_SUFFIX) {
-                    DType::F16
-                } else if entry.name == "token_embd" || entry.name == "wq" {
+                } else if entry.name.ends_with(AWQ_SUFFIX)
+                    || entry.name == "token_embd"
+                    || entry.name == "wq"
+                {
                     DType::F16
                 } else if entry.name == "wk" {
                     DType::BF16
@@ -7585,7 +7619,6 @@ mod tests {
     #[test]
     fn validate_moe_pairing_kinds_non_moe_no_resident_ok() {
         // Dense model: zero MoE layers, no resident → valid.
-        type Res = Option<fn(usize) -> Option<usize>>;
         assert!(validate_moe_pairing_kinds(&[], None::<fn(usize) -> Option<usize>>).is_ok());
     }
 
@@ -7620,7 +7653,7 @@ mod tests {
             MoeStorageKind::Frozen,
             MoeStorageKind::Frozen,
         ];
-        assert!(validate_moe_pairing_kinds(&kinds, Some(|i| Some(i))).is_ok());
+        assert!(validate_moe_pairing_kinds(&kinds, Some(Some)).is_ok());
     }
 
     #[test]
@@ -7648,7 +7681,7 @@ mod tests {
     #[test]
     fn validate_moe_resident_cardinality_mismatch_rejected() {
         // 3 MoE layers but 2 resident layers → rejected.
-        let r = validate_moe_resident_pairing(3, 2, |i| Some(i));
+        let r = validate_moe_resident_pairing(3, 2, Some);
         assert!(r.is_err());
         assert!(r.unwrap_err().contains("has 2 layers but model has 3"));
     }
@@ -7672,7 +7705,7 @@ mod tests {
     #[test]
     fn validate_moe_resident_reordered_indices_rejected() {
         // Resident indices are [2,0,1] instead of [0,1,2].
-        let indices = vec![2usize, 0, 1];
+        let indices = [2usize, 0, 1];
         let r = validate_moe_resident_pairing(3, 3, |i| Some(indices[i]));
         assert!(r.is_err());
         assert!(r.unwrap_err().contains("has layer_idx"));
@@ -7680,6 +7713,10 @@ mod tests {
 
     // ── C5: Projection metadata extraction tests ──────────────────────
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "test helper mirroring the full projection descriptor surface (7 dtypes + shapes + 4 flags)"
+    )]
     fn make_key_projection(
         router_dt: DType,
         seg_dt: DType,
@@ -7983,30 +8020,6 @@ mod tests {
         // out-of-range index.  We can't construct Qwen35Weights trivially, but
         // we can test Qwen35MoeResident::bind_layer OOB directly.
         // This test validates the error is a Result, not a false/panic.
-        let shape_cfg = MoeLayerShapeConfig {
-            dim: 8,
-            num_experts: 2,
-            moe_intermediate_size: 4,
-            shared_expert_intermediate_size: 4,
-        };
-        // Construct a minimal projection with fake keys.
-        let proj = make_key_projection(
-            DType::MQ4G256,
-            DType::MQ4G256,
-            DType::MQ4G256,
-            DType::MQ4G256,
-            DType::MQ4G256,
-            DType::MQ4G256,
-            DType::MQ4G256,
-            2,
-            4,
-            4,
-            8,
-            false,
-            false,
-            false,
-            false,
-        );
         // Can't construct Qwen35MoeResident without a real store, but we can
         // verify the error type for bind_layer OOB by checking the enum.
         let err = Qwen35MoeBindError::LayerOutOfRange {
@@ -8023,6 +8036,10 @@ mod tests {
     // Since WeightCellId is GPU-private, we test through the snapshot
     // constructor directly.
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "test helper mirroring the 12-field MoeDtypeSnapshot surface (7 dtypes + 5 flags)"
+    )]
     fn snapshot_from_dtypes(
         router: DType,
         seg: DType,
@@ -8138,7 +8155,7 @@ mod tests {
             false,
         );
         assert!(!s.has_mq3_experts_uniform());
-        assert!(s.prefill_dtypes().map_or(false, |d| d.routed_mixed_merged));
+        assert!(s.prefill_dtypes().is_some_and(|d| d.routed_mixed_merged));
     }
 
     #[test]
@@ -8458,21 +8475,22 @@ mod tests {
 
     #[test]
     fn partition_hfq_manifest_rejects_routed_gate_up_awq() {
-        let mut entries = Vec::new();
-        entries.push(WeightEntry::layer(
-            "expert.0.gate_up",
-            0,
-            vec![8, 8],
-            DType::MQ4G256,
-            ShardPolicy::Replicate,
-        ));
-        entries.push(WeightEntry::layer(
-            "expert.0.gate_up.awq_scale",
-            0,
-            vec![8],
-            DType::F16,
-            ShardPolicy::Replicate,
-        ));
+        let entries = vec![
+            WeightEntry::layer(
+                "expert.0.gate_up",
+                0,
+                vec![8, 8],
+                DType::MQ4G256,
+                ShardPolicy::Replicate,
+            ),
+            WeightEntry::layer(
+                "expert.0.gate_up.awq_scale",
+                0,
+                vec![8],
+                DType::F16,
+                ShardPolicy::Replicate,
+            ),
+        ];
         let result = partition_hfq_manifest(&entries);
         assert!(result.is_err(), "routed gate-up AWQ should be rejected");
         let msg = result.unwrap_err();
@@ -8801,7 +8819,7 @@ mod tests {
             .unwrap();
         full.push(expected_companion_entry(&dn_entry));
 
-        let (common, moe) = partition_hfq_manifest(&full).unwrap();
+        let (_, moe) = partition_hfq_manifest(&full).unwrap();
 
         // Router AWQ companion should be in moe partition.
         assert!(
@@ -9290,19 +9308,9 @@ mod tests {
             .unwrap();
         moe.as_slice_mut().push(expected_companion_entry(&gu_entry));
 
-        // Counting source: MUST NOT be called.
-        let call_count = std::cell::Cell::new(0usize);
-        let source = |entry: &WeightEntry| -> Result<(Vec<u8>, DType), String> {
-            call_count.set(call_count.get() + 1);
-            Ok((vec![], DType::F32))
-        };
-
-        // We need a Gpu for the function signature, but the error should
-        // fire before any builder or source use.  Use the GPU-ignored path
-        // — the real test is compile-time + call-count check.
-        // Since we can't create a real Gpu in CPU test, verify the
-        // rejection logic is reachable by checking partition_hfq_manifest
-        // behavior (which uses the same predicate).
+        // The rejection must fire before any source use — verify the
+        // predicate reachability through partition_hfq_manifest (which
+        // uses the same predicate).
         let partition_result = partition_hfq_manifest(moe.as_slice());
         assert!(
             partition_result.is_err(),
@@ -9420,7 +9428,7 @@ mod tests {
         let manifest = Qwen35::weight_manifest(&config);
         let prepared = prepare_frozen_hfq_manifest(&config, &manifest).unwrap();
         let moe: MoeManifestEntries = prepared.into_moe();
-        assert!(moe.as_slice().len() > 0, "MoE entries must be non-empty");
+        assert!(!moe.as_slice().is_empty(), "MoE entries must be non-empty");
     }
 
     // ── Complete cleanup aggregate: generic category-preserving core ──
