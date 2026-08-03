@@ -162,6 +162,29 @@ generation — none of which is reachable until gap 4 is closed.
   bit-exact (token-identical, 3 fresh processes) but measured 16.17-16.19 vs
   16.24-16.25 tok/s — no gain, reverted. It targeted rank 5 at 4.7% of kernel
   time; the profile above is what should have been gathered first.
+- **DSpark is not bit-identical to AR at greedy, and that is very likely
+  expected.** On the MQ2-Lloyd trunk at temp 0.00 the two streams agree for 29
+  tokens, diverge at exactly one position, then **re-synchronize**:
+
+  ```
+  AR      … 34105, 16754,                       22467, 53330, 294, 2900, 14, 1277 …
+  DSpark  … 34105,   344, 1949, 850, 5379, 362, 22467, 53330, 294, 2900, 14, 1277 …
+  ```
+
+  `AR[30:36] == DSpark[34:40]` exactly. Both paths saw an **identical context**
+  through index 28, so the differing argmax at 29 means the verify forward's
+  logits differ from the B=1 AR forward's — a reduction-order effect of batch
+  shape (AR decode is batch=1 GEMV; verify is batch=n GEMM). Two facts argue
+  against an acceptance bug: accept=0.515 shows verification is actively
+  rejecting rather than rubber-stamping, and a broken verifier would drift into
+  different content instead of rejoining on an identical 6-token run.
+  The MFMA port is **exonerated** — bypassing it entirely
+  (`HIPFIRE_DEEPSEEK4_COMP_F16_WMMA=0`) yields byte-identical tokens, and the
+  pipelined kernel variant reproduced the sequence exactly.
+  Still **circumstantial**: forcing the DSpark block to 1 would settle it
+  directly, but `HIPFIRE_DEEPSEEK4_SPEC_K` only applies to the MTP branch
+  (`examples/dspark_bench.rs:208`) — DSpark takes `block` from the sidecar, so
+  that test needs a code change.
 
 ## Reproduction
 
