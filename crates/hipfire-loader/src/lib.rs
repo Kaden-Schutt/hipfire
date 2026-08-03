@@ -3765,6 +3765,10 @@ impl UnloadDevice for GpuHost<'_> {
 
 /// An entry retained in the allocation-domain backlog when Qwen35 GPU
 /// cleanup cannot complete during `unload_model`.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "variants retain concrete rollback owners until retry"
+)]
 pub(crate) enum QwenBacklogEntry {
     /// A complete `PendingQwen35Unload` whose quiescence
     /// (bind/sync/graph/cache) failed. On retry, must first re-establish
@@ -8085,7 +8089,7 @@ mod qwen35_backlog_tests {
 
         // Process callback: drains the bucket (returns empty), BUT the
         // test simulates a concurrent insert between remove and reinsert.
-        let result = super::generic_process_backlog_bucket(&backlog, &42u64, |entries| {
+        let result = super::generic_process_backlog_bucket(&backlog, &42u64, |_entries| {
             // Simulate concurrent insert by another thread.
             // Since we can't actually race, inject directly into
             // the mutex as if another thread had done this.
@@ -8105,7 +8109,7 @@ mod qwen35_backlog_tests {
         );
 
         // The concurrently inserted entry must still be in the bucket.
-        let mut guard = backlog.lock().unwrap();
+        let guard = backlog.lock().unwrap();
         let bucket = guard
             .get(&42u64)
             .expect("domain 42 should still have entries");
@@ -8143,6 +8147,10 @@ mod qwen35_backlog_tests {
         quiesce_needed: bool,
         teardown_ok: bool,
         /// None → retry reports `retry_succeeds`; Some → real bucket.
+        #[expect(
+            clippy::type_complexity,
+            reason = "mirrors the production backlog shape so the drain decision is exact"
+        )]
         backlog: Option<std::sync::Arc<std::sync::Mutex<HashMap<u64, Vec<CleanupFailureSpy>>>>>,
         retry_succeeds: bool,
         /// Simulate a same-domain concurrent insert during retry.
@@ -8237,6 +8245,10 @@ mod qwen35_backlog_tests {
         }
     }
 
+    #[expect(
+        clippy::type_complexity,
+        reason = "mirrors the production backlog shape so the drain decision is exact"
+    )]
     fn unpublished_machine(
         quiesce_needed: bool,
         teardown_ok: bool,
@@ -8481,7 +8493,7 @@ mod qwen35_backlog_tests {
 
         let enqueuer_coord = coord.clone();
         let enqueuer_backlog = backlog.clone();
-        let enqueuer = std::thread::spawn(move || {
+        let _enqueuer = std::thread::spawn(move || {
             attempting_tx.send(()).unwrap();
             // The production enqueue protocol: coordinator → map → push.
             super::coordinated_retain(

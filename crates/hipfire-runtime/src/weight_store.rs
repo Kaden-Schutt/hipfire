@@ -222,7 +222,7 @@ impl WeightStore {
                     None => name.clone(),
                 };
                 // Try to free via free_preserving (returns buffer on failure).
-                if let Err(e) = gpu.bind_thread() {
+                if let Err(_e) = gpu.bind_thread() {
                     failures.push((format!("{label} (bind_thread)"), t.buf));
                 } else {
                     match gpu.hip.free_preserving(t.buf) {
@@ -701,7 +701,7 @@ impl WeightStoreAssemblyGuard<'_> {
 
         // Phase 2: Free every untaken store entry.
         let store = std::mem::take(self.inner.store);
-        let mut store_failures: Vec<FailedWeightStoreFree> = Vec::new();
+        let store_failures: Vec<FailedWeightStoreFree> = Vec::new();
         for ((_, _, dev), handle) in store.placements {
             if let WeightHandle::Resident(t) = handle {
                 if let Some(gpu) = self.inner.target.device(dev) {
@@ -771,12 +771,6 @@ impl WeightStoreAllocation {
     /// rank, physical device, pool epoch).
     pub fn origin(&self) -> &WeightAllocationOrigin {
         &self.origin
-    }
-
-    /// Destructure into the tensor and origin (crate-visible for
-    /// builder-to-store drain).
-    pub(crate) fn into_parts(self) -> (GpuTensor, WeightAllocationOrigin) {
-        (self.tensor, self.origin)
     }
 
     /// Consume this allocation and free its GPU buffer, but only after
@@ -2189,7 +2183,7 @@ impl SingleFrozenWeightStore {
         // physical allocation.
         let resources: Vec<_> = store.inner.allocations.into_iter().map(|b| *b).collect();
         let failures = aggregate_cleanup(resources, |alloc: WeightStoreAllocation| {
-            alloc.free(&mut target).map_err(|f| f)
+            alloc.free(&mut target)
         });
         if failures.is_empty() {
             Ok(())
@@ -2238,7 +2232,7 @@ impl SingleFreeFailed {
         };
         let remaining: Vec<FailedWeightStoreFree> =
             aggregate_cleanup(self.failures, |f: FailedWeightStoreFree| {
-                f.allocation.free(&mut target).map_err(|f| f)
+                f.allocation.free(&mut target)
             });
         if remaining.is_empty() {
             Ok(())
@@ -2561,22 +2555,6 @@ impl WeightStoreBuilder {
         } else {
             Err(WeightStoreCleanupError { failures })
         }
-    }
-
-    /// Build an origin map from the builder's current cells without
-    /// consuming the builder.  Each placement key resolves to the
-    /// [`WeightAllocationOrigin`] of its ultimate resident cell.
-    /// Aliases are chased to their chain root.
-    pub(crate) fn extract_origin_map(&self) -> HashMap<WeightPlacementKey, WeightAllocationOrigin> {
-        let mut origins: HashMap<WeightPlacementKey, WeightAllocationOrigin> = HashMap::new();
-        for (key, cell_id) in &self.placement {
-            let cell = &self.inner.cells[cell_id.slot];
-            let resident = resolve_to_resident(&self.inner.cells, cell);
-            if let Cell::Resident(alloc) = resident {
-                origins.insert(key.clone(), alloc.origin);
-            }
-        }
-        origins
     }
 }
 impl FrozenWeightStore {
@@ -6412,7 +6390,7 @@ mod tests {
         // needed for empty-builder lookup) compile and return correct
         // types.  We construct a WeightStoreBuilder::new() directly
         // (test-private path) and verify the wrapper functions delegate.
-        let mut builder = WeightStoreBuilder::new();
+        let builder = WeightStoreBuilder::new();
         let key = WeightPlacementKey {
             logical_name: "router".into(),
             layer: Some(0),
@@ -6788,7 +6766,7 @@ mod tests {
     fn replace_atomic_draining_state_restored_on_failure() {
         // When free_fn fails during replace_atomic, the slot must be
         // reset to Present with a discarded marker.
-        let mut store = WeightStore::new();
+        let store = WeightStore::new();
         // We need a real resident. Use null_for_test or null handle.
         // Since we can't on CPU, this test validates the type signature.
         // GPU test variant follows.
