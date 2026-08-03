@@ -8010,17 +8010,49 @@ mod tests {
 
     #[test]
     fn moe_ffn_view_layer_out_of_range_is_result() {
-        // moe_ffn_view on Qwen35Weights with a dummy config returns Err for
-        // out-of-range index.  We can't construct Qwen35Weights trivially, but
-        // we can test Qwen35MoeResident::bind_layer OOB directly.
-        // This test validates the error is a Result, not a false/panic.
-        // Can't construct Qwen35MoeResident without a real store, but we can
-        // verify the error type for bind_layer OOB by checking the enum.
-        let err = Qwen35MoeBindError::LayerOutOfRange {
-            requested: 5,
-            count: 2,
+        // moe_ffn_view on Qwen35Weights returns Err(LayerOutOfRange) for an
+        // out-of-range layer index.  Pure CPU seam: the bounds check fires
+        // on the layers vec before any storage/resident is consulted, so the
+        // null GPU buffers are never touched.
+        //
+        // The resident-side twin (`Qwen35MoeResident::bind_layer` OOB) needs
+        // a real GPU-backed resident and is covered by the ignored
+        // `frozen_moe_resident_bind_layer_out_of_range` test below.
+        let nt = || GpuTensor::null_for_test();
+        let weights = Qwen35Weights {
+            token_embd: nt(),
+            embd_format: EmbeddingFormat::F32,
+            output_norm: nt(),
+            output: WeightTensor {
+                buf: nt(),
+                gpu_dtype: DType::F32,
+                m: 1,
+                k: 1,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            },
+            layers: vec![],
+            moe_has_mq6: false,
+            pager: None,
+            lm_head_aliases_embd: false,
+            moe_resident: None,
         };
-        assert!(matches!(err, Qwen35MoeBindError::LayerOutOfRange { .. }));
+        let err = match weights.moe_ffn_view(0) {
+            Ok(_) => panic!("layer 0 of 0 must be out of range"),
+            Err(e) => e,
+        };
+        assert!(matches!(
+            err,
+            Qwen35MoeBindError::LayerOutOfRange {
+                requested: 0,
+                count: 0
+            }
+        ));
+        assert!(
+            err.to_string().contains("out of range"),
+            "Display must describe the OOB bind: {err}"
+        );
     }
 
     // ── I1: MoeDtypeSnapshot parity tests ─────────────────────────────
@@ -8944,6 +8976,61 @@ mod tests {
         );
         let binding = resident.bind_layer(0).expect("bind_layer(0) must succeed");
         assert_eq!(binding.num_experts(), config.num_experts);
+
+        // Clean shutdown.
+        resident.free_checked(&mut gpu).expect("free must succeed");
+        gpu.drain_pool();
+    }
+
+    #[test]
+    #[ignore = "requires an AMD GPU; real frozen MoE resident bind-layer OOB"]
+    fn frozen_moe_resident_bind_layer_out_of_range() {
+        // bind_layer at exactly num_layers() must return
+        // Qwen35MoeBindError::LayerOutOfRange (not panic, not a false Ok) —
+        // the resident-side twin of the CPU moe_ffn_view OOB test above.
+        let _lock = GPU_TEST_LOCK.lock().unwrap();
+        let mut gpu = Gpu::init().expect("GPU required for frozen resident build");
+        // Two layers so the OOB count is non-trivial.
+        let config = frozen_moe_config(&["full_attention", "full_attention"]);
+        let manifest = Qwen35::weight_manifest(&config);
+        let prepared = prepare_frozen_hfq_manifest(&config, &manifest).unwrap();
+        let moe_entries = prepared.into_moe();
+
+        let source = |entry: &WeightEntry| -> Result<(Vec<u8>, DType), String> {
+            let n = entry.logical_shape.iter().product::<usize>();
+            let (bytes, dtype) = if entry.name.ends_with(AWQ_SUFFIX) {
+                // F16 scale bytes for AWQ companions
+                (vec![0u8; n * 2], DType::F16)
+            } else {
+                // MQ4 routed experts: Frozen admission requires an
+                // indexable routed dtype (F32 is refused at dispatch).
+                (vec![0u8; n * 4], DType::MQ4G256)
+            };
+            Ok((bytes, dtype))
+        };
+
+        let dispatch_ctx = hipfire_dispatch::context::DispatchCtx::new(&gpu);
+        let resident = build_frozen_moe_resident(
+            &mut gpu,
+            &config,
+            &moe_entries,
+            &source,
+            &dispatch_ctx,
+            true,
+        )
+        .expect("frozen resident build must succeed");
+
+        let n = resident.num_layers();
+        assert!(n >= 2, "expected >= 2 MoE layers, got {n}");
+        let err = match resident.bind_layer(n) {
+            Ok(_) => panic!("bind_layer at num_layers() must be out of range"),
+            Err(e) => e,
+        };
+        assert!(matches!(
+            err,
+            Qwen35MoeBindError::LayerOutOfRange { requested, count }
+                if requested == n && count == n
+        ));
 
         // Clean shutdown.
         resident.free_checked(&mut gpu).expect("free must succeed");
