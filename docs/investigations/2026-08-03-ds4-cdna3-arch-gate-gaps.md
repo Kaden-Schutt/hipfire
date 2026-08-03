@@ -213,6 +213,74 @@ generation — none of which is reachable until gap 4 is closed.
   (`examples/dspark_bench.rs:208`) — DSpark takes `block` from the sidecar, so
   that test needs a code change.
 
+## Rig fidelity: MI300X is NOT a faithful proxy for gfx1151 DSpark tuning
+
+MI300X is used as a fast prototyping rig for gfx1151 (hours per iteration instead
+of days on a Strix Halo). For that to work, conclusions must transfer. On the Q8
+path they currently do **not**, in two independent ways.
+
+Measured with `crates/rdna-compute/examples/bench_q8_0_batched.rs` (`prod` arm =
+`gemm_q8_0_batched_chunked`, the entry point production calls), M=4096 K=4096,
+identical binary blob `aecb1d7d…` on both boxes:
+
+| B | 1 | 2 | 4 | 5 | 6 | 8 | 13 |
+|---|---|---|---|---|---|---|---|
+| gfx942 (scalar) | 1589 | 1230 | 934 | **198** | 167 | 150 | **86** |
+| gfx1151 (f16 WMMA) | 202 | 368 | 352 | 352 | 349 | 358 | **364** |
+
+GiB/s over Q8 weight bytes. Both are cache-warm (17 MiB working set), so the
+ABSOLUTE numbers are not HBM-representative — the **shape** is the point.
+
+**1. Cost curves are opposite.** gfx942 degrades 18x from B=1 to B=13; gfx1151 is
+flat (0.045-0.048 ms) from B=2 to B=13, i.e. deeper drafting is nearly free on the
+target. The routing that causes this: `gemm.rs:19753` returns `gemm_q8_0_wmma`
+whenever `has_wmma() && k % 32 == 0`, and K%32==0 is guaranteed by the Q8_0 group
+size — so gfx1151 NEVER executes the scalar kernel, and gfx942 (has_wmma false)
+always does.
+
+Consequence: the DSpark block controller fits
+`t_window(n) = t_ar + (n-1)*dt` and argmaxes `tau(N)/(t_ar + N*dt)`
+(`crates/hipfire-runtime/src/dspark_block_controller.rs:160-163,210-234`). The
+`ratio = dt/t_ar = 0.356` measured on MQ2R/MI300X is a rig artifact: the Q8 draft
+contribution to `dt` is ~0 on gfx1151 out to B=13. **Block-size tuning done on
+MI300X will systematically UNDER-shoot the gfx1151 optimum.** MI300X says "keep
+blocks small"; the target says "draft as deep as acceptance allows."
+
+**2. Numerics already diverge, independent of any kernel work.**
+`gemm_q8_0_wmma` does not preserve the scalar reduction order or precision, and
+the tree's own parity test accepts that: `test_gemm_q8_0_wmma_parity.rs:23-25`
+passes at `mean_rel < 2e-3` and `max_rel < 3.5e-2`, explicitly not bitwise. The
+harness reproduces it directly — `exact = NO`, max_absdiff 1.9e-2 to 2.7e-2 on
+gfx1151, versus bit-identical on gfx942 where both arms are the same kernel.
+Since a flipped argmax at a near-tie is an exact-token-id rejection in the accept
+path, **tau and accept measured on MI300X are rig-local**. The MQ2R accept=0.582
+figure should not be quoted as a gfx1151 expectation.
+
+### What this means for using the rig
+
+- **Transfers:** correctness and structural fixes (the missing E8 arm in
+  `c420159e2` is recipe-driven and arch-independent — it should fix gfx1151's
+  historical 0-of-89 too), missing-arch-gate defects, instrumentation.
+- **Does NOT transfer:** DSpark block size, confidence-truncation threshold,
+  adaptive-B behaviour, and absolute tau/accept. These must be measured on
+  gfx1151 itself, or the rig needs Q8 cost AND numerics parity first.
+- A gfx942 Q8 kernel would fix the cost half but not the numerics half, and an
+  attempt at one measured neutral (see below), so parity is not cheap.
+
+### A rewrite that measured neutral, and was not landed
+
+An exact-B-template wave64 port (b1..b6, killing the `MAX_BATCH=64` predicated
+accumulator array, one shared `.cuh` body serving both Q8 kernels) was written,
+built and measured. It was **bit-exact on every cell** and **0.87-1.01x** — no
+gain. The hypothesis it was built on (VGPR pressure from the 64-accumulator
+array) is refuted: VGPR allocation is compile-time fixed while `batch_size` is a
+runtime argument, so the compiler could never have specialised it away, and
+removing it changed nothing. A follow-up probe also refuted X-re-read traffic: at
+B=6, M=1024 takes 0.089 ms vs M=4096 at 0.094 ms — near-identical wall time for
+4x the output rows and 4x the weight bytes, so above B=5 the cost is essentially
+M-independent. **The B=5 cliff on gfx942 remains unexplained** and is the open
+question for anyone resuming this.
+
 ## Reproduction
 
 ```bash
