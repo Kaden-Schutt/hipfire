@@ -15,7 +15,17 @@
 # Compares token IDs rather than text because BPE can mask a divergence — two
 # different token sequences can render to the same string.
 #
-# WHY THE PINNED ENV BELOW: with paging on, the prefill MoE runs over token
+# WHY GRAPHS ARE PINNED OFF: paging does a d2h of the routing, file I/O, and
+# an h2d of the pointer table inside the layer body, so it forces HIP graph
+# capture off (a captured graph would bake one token's residency and replay
+# it). A resident run on gfx11xx/gfx12xx takes the graph path by default, so
+# comparing it against a paged run compares graph replay against direct
+# dispatch — which on this box is NOT bit-identical: measured 2026-08-03 on
+# gfx1151, resident-with-graphs and resident-without-graphs diverge at token
+# 42 of 192 under greedy decode. That is a property of graph capture, not of
+# paging, so pin it off everywhere and let this gate measure one thing.
+#
+# WHY THE KERNEL GATE IS PINNED: with paging on, the prefill MoE runs over token
 # windows sized to the slot pool rather than over the whole chunk. The MoE
 # family picks grouped-GEMM vs scalar K4 on `batch_size >= GROUPED_GATE`
 # (default 128), so a paged run could take a different kernel than a resident
@@ -54,13 +64,16 @@ fi
 echo "model:   $MODEL"
 echo "logs:    $OUT_DIR"
 echo "kernel:  $([ "$PIN_KERNEL" = 1 ] && echo 'grouped pinned (GROUPED_GATE=0)' || echo 'unpinned')"
+echo "graphs:  off on all arms (paging forces it; see header)"
 echo
 
 # $1 = arm name, $2 = cache GB ("" = fully resident)
 run() {
   local name="$1" gb="$2"
   local log="$OUT_DIR/$name.jsonl"
-  local -a env_args=(HIPFIRE_EMIT_TOKEN_IDS=1)
+  # Graphs off on EVERY arm: paging forces it, so the resident reference has
+  # to match or the comparison is about graph capture (see header).
+  local -a env_args=(HIPFIRE_EMIT_TOKEN_IDS=1 HIPFIRE_DEEPSEEK4_GRAPH=0)
   [ -n "$gb" ] && env_args+=("HIPFIRE_DEEPSEEK4_EXPERT_CACHE_GB=$gb")
   [ "$PIN_KERNEL" = 1 ] && env_args+=(HIPFIRE_DEEPSEEK4_MOE_GROUPED_GATE=0)
 
