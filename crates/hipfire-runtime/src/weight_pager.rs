@@ -128,6 +128,18 @@ pub enum NormKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TransferHandle(u64);
 
+/// One range to read into a destination buffer, for
+/// [`Transport::fetch_batch_into`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FetchReq {
+    /// Byte offset in the HFQ file.
+    pub hfq_offset: usize,
+    /// Byte length.
+    pub len: usize,
+    /// Byte offset within the destination tensor.
+    pub dst_byte_offset: usize,
+}
+
 /// Bounds check for [`Transport::fetch_into`], factored out so the arithmetic
 /// is testable without a GPU.
 ///
@@ -194,6 +206,26 @@ pub trait Transport: Send {
         dst_byte_offset: usize,
         gpu: &mut Gpu,
     ) -> HipResult<TransferHandle>;
+
+    /// Read several ranges into ONE destination buffer.
+    ///
+    /// The expert pager fills up to `k_top * segments` slots per layer per
+    /// token, and issuing those one at a time leaves the storage device with a
+    /// single outstanding request — measured at 88-92% of the expert-read
+    /// cost. A batch lets an implementation overlap them; the default is the
+    /// serial loop so existing transports keep working unchanged.
+    fn fetch_batch_into(
+        &mut self,
+        reqs: &[FetchReq],
+        dst: &GpuTensor,
+        gpu: &mut Gpu,
+    ) -> HipResult<TransferHandle> {
+        let mut last = TransferHandle(0);
+        for r in reqs {
+            last = self.fetch_into(r.hfq_offset, r.len, dst, r.dst_byte_offset, gpu)?;
+        }
+        Ok(last)
+    }
 
     /// Block until every handle in `handles` has completed. v0.1 no-op
     /// because `fetch` is synchronous; defined for forward compatibility.
@@ -367,6 +399,95 @@ impl Transport for PreadH2DTransport {
         let t_copy = std::time::Instant::now();
         gpu.hip
             .memcpy_htod_offset(&dst.buf, dst_byte_offset, &self.staging[..len])?;
+        self.ns_copy += t_copy.elapsed().as_nanos() as u64;
+        Ok(self.next_handle())
+    }
+
+    /// Concurrent preads, then the host-to-device copies.
+    ///
+    /// `pread` is positional and takes `&File`, so N threads can read the same
+    /// descriptor at once with no seek state to race on. The staging buffer is
+    /// carved into one disjoint slice per request, so the threads never
+    /// overlap. Rayon's pool is process-wide and already resident, so this
+    /// spawns nothing per call.
+    ///
+    /// The copies stay serial and on the calling thread: they are only ~8% of
+    /// the cost, and HIP calls from rayon workers would need per-thread device
+    /// binding for no measurable gain.
+    fn fetch_batch_into(
+        &mut self,
+        reqs: &[FetchReq],
+        dst: &GpuTensor,
+        gpu: &mut Gpu,
+    ) -> HipResult<TransferHandle> {
+        use rayon::prelude::*;
+
+        if reqs.is_empty() {
+            return Ok(self.next_handle());
+        }
+        if reqs.len() == 1 {
+            // One request cannot overlap with itself; skip the pool.
+            let r = reqs[0];
+            return self.fetch_into(r.hfq_offset, r.len, dst, r.dst_byte_offset, gpu);
+        }
+        // Bounds-check EVERY request before any I/O — a partially applied
+        // batch would leave some slots holding the wrong expert.
+        let dst_bytes = dst.byte_size();
+        for r in reqs {
+            check_fetch_into_bounds(dst_bytes, r.dst_byte_offset, r.len)
+                .map_err(|m| hip_bridge::HipError::new(0, &m))?;
+        }
+        let total: usize = reqs.iter().map(|r| r.len).sum();
+        if self.staging.len() < total {
+            self.staging.resize(total, 0);
+        }
+
+        // Carve disjoint staging slices, one per request, in request order.
+        let mut rest: &mut [u8] = &mut self.staging[..total];
+        let mut parts: Vec<(&mut [u8], usize)> = Vec::with_capacity(reqs.len());
+        for r in reqs {
+            let (head, tail) = rest.split_at_mut(r.len);
+            parts.push((head, r.hfq_offset));
+            rest = tail;
+        }
+
+        let t_pread = std::time::Instant::now();
+        let file = &self.file;
+        let errs: Vec<String> = parts
+            .into_par_iter()
+            .filter_map(|(buf, offset)| {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::FileExt;
+                    match file.read_exact_at(buf, offset as u64) {
+                        Ok(()) => None,
+                        Err(e) => Some(format!("pread at {offset}: {e}")),
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = (buf, offset, file);
+                    Some("concurrent pread requires unix".to_string())
+                }
+            })
+            .collect();
+        self.ns_pread += t_pread.elapsed().as_nanos() as u64;
+        if let Some(e) = errs.first() {
+            return Err(hip_bridge::HipError::new(0, e));
+        }
+
+        // Copies, in request order, from each request's own staging slice.
+        gpu.bind_thread()?;
+        let t_copy = std::time::Instant::now();
+        let mut at = 0usize;
+        for r in reqs {
+            gpu.hip.memcpy_htod_offset(
+                &dst.buf,
+                r.dst_byte_offset,
+                &self.staging[at..at + r.len],
+            )?;
+            at += r.len;
+        }
         self.ns_copy += t_copy.elapsed().as_nanos() as u64;
         Ok(self.next_handle())
     }

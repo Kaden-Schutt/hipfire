@@ -695,6 +695,8 @@ pub struct Ds4ExpertPaging {
     fills: Vec<SlotFill>,
     experts: Vec<u16>,
     ptr_bytes: Vec<u8>,
+    /// Batched read requests for one dispatch. Reused, never reallocated.
+    reqs: Vec<hipfire_runtime::weight_pager::FetchReq>,
     topk_bytes: Vec<u8>,
     tile_bytes: Vec<u8>,
     tile_experts: Vec<i32>,
@@ -753,6 +755,7 @@ impl Ds4ExpertPaging {
             fills: Vec::with_capacity(max_working_set),
             experts: Vec::with_capacity(max_working_set),
             ptr_bytes: vec![0u8; n_exp * 8],
+            reqs: Vec::with_capacity(max_working_set * 2),
             topk_bytes: vec![0u8; max_working_set * 4],
             tile_bytes: Vec::new(),
             tile_experts: Vec::new(),
@@ -986,6 +989,13 @@ impl Ds4ExpertPaging {
                 return Err(e);
             }
         };
+        // Collect EVERY range this dispatch must read, then issue them as one
+        // batch. Issued one at a time, the storage device only ever has a
+        // single request outstanding, and pread is 88-92% of the expert-read
+        // cost; batching lets the transport overlap them.
+        let mut reqs = std::mem::take(&mut self.reqs);
+        reqs.clear();
+        let mut first_key = None;
         for f in &fills {
             if !f.needs_read {
                 continue;
@@ -998,6 +1008,7 @@ impl Ds4ExpertPaging {
                     Ok(s) => s,
                     Err(e) => {
                         self.fills = fills;
+                        self.reqs = reqs;
                         return Err(e);
                     }
                 };
@@ -1005,27 +1016,42 @@ impl Ds4ExpertPaging {
                 segbuf[..n].copy_from_slice(&segs[..n]);
                 n
             };
+            if first_key.is_none() {
+                first_key = Some(f.key);
+            }
             let mut dst = f.slot * stride;
             for seg in &segbuf[..n_seg] {
-                let t_read = std::time::Instant::now();
-                let fetched = self
-                    .transport
-                    .fetch_into(seg.offset, seg.len, blob, dst, gpu);
-                self.ns_read += t_read.elapsed().as_nanos() as u64;
-                if let Err(e) = fetched {
-                    let err = PagerError::Read {
-                        key: f.key,
-                        offset: seg.offset,
-                        len: seg.len,
-                        detail: format!("{e:?}"),
-                    };
-                    self.fills = fills;
-                    return Err(err);
-                }
+                reqs.push(hipfire_runtime::weight_pager::FetchReq {
+                    hfq_offset: seg.offset,
+                    len: seg.len,
+                    dst_byte_offset: dst,
+                });
                 self.bytes_read += seg.len as u64;
                 dst += seg.len;
             }
         }
+        if !reqs.is_empty() {
+            let t_read = std::time::Instant::now();
+            let fetched = self.transport.fetch_batch_into(&reqs, blob, gpu);
+            self.ns_read += t_read.elapsed().as_nanos() as u64;
+            if let Err(e) = fetched {
+                let key = first_key.unwrap_or(ExpertKey {
+                    layer,
+                    expert: 0,
+                    role,
+                });
+                let err = PagerError::Read {
+                    key,
+                    offset: reqs[0].hfq_offset,
+                    len: reqs.iter().map(|r| r.len).sum(),
+                    detail: format!("{e:?}"),
+                };
+                self.fills = fills;
+                self.reqs = reqs;
+                return Err(err);
+            }
+        }
+        self.reqs = reqs;
         self.fills = fills;
 
         // Periodic hit rate + bytes read. The budget/throughput curve should
