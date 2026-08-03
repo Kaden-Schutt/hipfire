@@ -415,6 +415,38 @@ fn gemv_auto_batched_wmma(
     x_f16_scratch: Option<&GpuTensor>,
 ) -> Result<(), String> {
     match weight.dtype {
+        // MQ2R's trunk head/dense tensors are qt=35 MFP4G32E8SOA (the loader
+        // enforces it at hipfire-arch-deepseek4 arch.rs:708-710). Without this
+        // arm they fell through to the `_` catch-all below and were decoded as
+        // HFQ4-G256 — an incompatible byte layout, so the draft lm_head produced
+        // garbage logits and EVERY speculative token lost the exact u32 token-id
+        // comparison in `accept_greedy_prefix` (spec.rs:149-178). Measured
+        // accept=0.000 (0 of 87 proposed) on MQ2R vs 0.515 on MQ2-Lloyd with the
+        // SAME sidecar bytes. This is a recipe-driven bug, not arch-driven: the
+        // trunk selector `hipfire-arch-deepseek4 forward.rs:1338-1374` has four
+        // E8 arms; this trimmed copy never received them.
+        //
+        // Mirrors the trunk's generic E8 fallback: try the batched rocBLAS path,
+        // else per-row GEMV. The arch-specialised WMMA/B2/B4 tile variants are
+        // deliberately NOT replicated here — draft windows are tiny (B<=6), so
+        // the tiled paths carry no benefit and every extra arm is another place
+        // for the two copies to drift.
+        DType::MFP4G32E8SOA => {
+            if gpu
+                .rocblas_gemm_mfp4e8_soa_prefill_auto(weight, x_rotated_batch, y, m, k, batch_size)
+                .map_err(|e| format!("rocBLAS MFP4-E8-SoA draft prefill: {e:?}"))?
+            {
+                return Ok(());
+            }
+            // E8-SoA consumes FWHT-rotated activations (gemv.rs:4089).
+            for b in 0..batch_size {
+                let x_rot = x_rotated_batch.sub_offset(b * k, k);
+                let y_row = y.sub_offset(b * m, m);
+                gpu.gemv_mfp4g32_e8_soa(weight, &x_rot, &y_row, m, k)
+                    .map_err(|e| format!("gemv MFP4-E8-SoA draft row {b}: {e:?}"))?;
+            }
+            Ok(())
+        }
         DType::F32 => gpu
             .gemm_f32_register_tiled(weight, x_plain_batch, y, m, k, batch_size)
             .map_err(|e| format!("gemm_f32_register_tiled: {e:?}")),
