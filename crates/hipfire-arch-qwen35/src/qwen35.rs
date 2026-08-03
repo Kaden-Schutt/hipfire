@@ -1124,6 +1124,13 @@ impl<'a> MoeFfnView<'a> {
     }
 
     /// Extract MoePrefillDtypes from this view using metadata only.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "dtype projection seam: retained for the legacy MoePrefillDtypes::from_ffn constructor and dtype-projection tests"
+        )
+    )]
     fn prefill_dtypes(&self) -> Option<MoePrefillDtypes> {
         self.to_snapshot().prefill_dtypes()
     }
