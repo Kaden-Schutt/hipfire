@@ -4926,8 +4926,9 @@ pub struct Qwen35Scratch {
     pub flash_mode: u8,
 
     // MoE scratch (allocated only when config.num_experts > 0). Pre-allocated
-    // so moe_ffn_decode can be captured by hipGraph — the per-layer allocs
-    // it used to do violated the "no allocator ops while capturing" rule.
+    // so moe_ffn_decode_impl can be captured by hipGraph — the per-layer
+    // allocs it used to do violated the "no allocator ops while capturing"
+    // rule.
     pub moe_router_logits: Option<GpuTensor>, // [num_experts]
     pub moe_scalar_buf: Option<GpuTensor>,    // [1] shared-expert gate scalar
     pub moe_x_rot: Option<GpuTensor>,         // [dim]
@@ -4939,8 +4940,8 @@ pub struct Qwen35Scratch {
     pub moe_gate_batch: Option<GpuTensor>,    // [k × mi]
     pub moe_up_batch: Option<GpuTensor>,      // [k × mi]
     pub moe_rot_batch: Option<GpuTensor>,     // [k × mi]
-    /// Phase 2b: GPU-side top-K outputs (kept on-device so moe_ffn_decode
-    /// can stay in a graph-capturable stream).
+    /// Phase 2b: GPU-side top-K outputs (kept on-device so
+    /// moe_ffn_decode_with_scratch can stay in a graph-capturable stream).
     pub moe_topk_indices: Option<GpuTensor>, // [k] i32 stored as f32 alias
     pub moe_topk_weights: Option<GpuTensor>,  // [k] f32
     // Atomic-free MoE down expansion buffer for decode — [k × dim] f32.
@@ -11021,7 +11022,8 @@ fn forward_prefill_chunk(
                     let paro_wqkv = layer.wqkv.paro.as_ref().unwrap_or_else(|| {
                         panic!(
                             "ParoQ4G128 wqkv missing paro metadata at LA layer {layer_idx} \
-                             — load_paroquant_weight() loader regression?"
+                             — ParoBackend -> ParoAugmentor -> load_paro_weight loader \
+                             regression?"
                         )
                     });
                     let paro_wz = layer.wz.paro.as_ref().unwrap_or_else(|| {
