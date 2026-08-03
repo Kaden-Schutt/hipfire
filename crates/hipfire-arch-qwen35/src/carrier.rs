@@ -254,11 +254,6 @@ impl BundleBuildTransaction {
         self.scratch = Some(scratch);
     }
 
-    /// Set the MTP head.
-    pub fn set_mtp_head(&mut self, mtp: crate::mtp_head::Qwen35MtpHead) {
-        self.mtp_head = Some(mtp);
-    }
-
     /// Consume the transaction into a final [`Qwen35Bundle`] on success.
     ///
     /// # Panics
@@ -312,6 +307,10 @@ impl Drop for BundleBuildTransaction {
 /// Shared by the Legacy and Frozen load paths.  On failure returns
 /// [`Qwen35BundleBuildError`] which preserves weights, every complete
 /// auxiliary owner, and any partial-construction retained owners.
+#[expect(
+    clippy::result_large_err,
+    reason = "Err transports every complete GPU owner (weights, KV cache, DN state, scratch, MTP head) for exact rollback; flattening would leak on failure"
+)]
 fn build_qwen35_bundle(
     hfq: &HfqFile,
     config: Qwen35Config,
@@ -593,6 +592,10 @@ pub struct Qwen35FrozenPlannedOutcome<V> {
 /// best-effort per the accepted STEP-002R debt (see the tracker): any
 /// owner surfaced by the existing rollback API is retained; exact
 /// failed-free retention is NOT claimed.
+#[expect(
+    clippy::result_large_err,
+    reason = "Err preserves the complete cleanup aggregate (retained tensors + frozen SingleFreeFailed owners) for the loader backlog; flattening would drop owners"
+)]
 pub fn load_bundle_frozen_planned<V>(
     plan: crate::store::Qwen35FrozenPlan,
     ctx: &mut LoadCtx,
@@ -606,7 +609,7 @@ pub fn load_bundle_frozen_planned<V>(
         .map_err(Qwen35LoadError::common_failure)?;
 
     // 2. Vision upload from the SEALED source (immutable borrow only).
-    let mut vision_owner = match vision(&plan.hfq, ctx.gpu) {
+    let vision_owner = match vision(&plan.hfq, ctx.gpu) {
         Ok(v) => v,
         Err(e) => {
             return Err(Qwen35LoadError::common_failure(format!("vision load: {e}")));
@@ -633,9 +636,9 @@ pub fn load_bundle_frozen_planned<V>(
     // closure's borrow cannot be active; `try_borrow_mut` is a
     // defensive no-double-panic fallback).
     let gpu_cell = std::cell::RefCell::new(&mut *ctx.gpu);
-    let mut guard = PlannedVisionOwnerGuard::new(vision_owner, |vision_owner| {
+    let guard = PlannedVisionOwnerGuard::new(vision_owner, |vision_owner| {
         match gpu_cell.try_borrow_mut() {
-            Ok(mut gpu) => vision_abort(vision_owner, &mut **gpu),
+            Ok(mut gpu) => vision_abort(vision_owner, &mut gpu),
             Err(_) => eprintln!(
                 "[hipfire-arch-qwen35] BUG: vision abort during an active GPU borrow;                  owner dropped unfreed"
             ),
@@ -648,7 +651,7 @@ pub fn load_bundle_frozen_planned<V>(
     // before the guard's abort runs.
     let mut gpu_ref = gpu_cell.borrow_mut();
     let mut step_ctx = hipfire_runtime::loader_api::LoadCtx {
-        gpu: &mut *gpu_ref,
+        gpu: *gpu_ref,
         path: ctx.path,
         max_seq: ctx.max_seq,
         draft_path: ctx.draft_path,
