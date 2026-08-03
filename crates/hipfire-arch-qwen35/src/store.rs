@@ -2178,7 +2178,7 @@ pub fn load_qwen35_paro_weights(
 /// loader; exact failed-free retention for these domains is NOT claimed.
 #[expect(
     clippy::result_large_err,
-    reason = "Err preserves every GPU owner for the loader backlog (common weights, frozen store, staging-retained buffers, builder-retained frozen owners); flattening would leak on failure"
+    reason = "Err preserves every owner surfaced by the existing rollback APIs for the loader backlog (common weights, frozen store, staging-retained buffers, builder-retained frozen owners); flattening would leak on failure. Exact failed-free retention is NOT claimed (STEP-002R debt)"
 )]
 pub(crate) fn load_qwen35_hfq_weights_frozen_prepared(
     prepared: PreparedFrozenHfqManifest,
@@ -9294,7 +9294,7 @@ mod tests {
     }
 
     #[test]
-    fn build_frozen_moe_resident_defense_rejects_gate_up_awq_with_zero_source_calls() {
+    fn partition_hfq_manifest_rejects_moe_gate_up_awq_with_zero_source_calls() {
         let config = test_config(&["full_attention"], true);
         let full = Qwen35::weight_manifest(&config);
         let mut moe = prepare_frozen_hfq_manifest(&config, &full)

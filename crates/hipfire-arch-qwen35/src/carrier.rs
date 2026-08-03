@@ -52,7 +52,6 @@ pub struct Qwen35Bundle {
 /// * `kv_cache`, `dn_state`, `scratch` — `Some` only if construction
 ///   completed that stage before the failure.  Each is a COMPLETE owner
 ///   that can be freed independently.
-/// * `mtp_head` — optional MTP head, if allocated.
 ///
 /// The receiver should attempt cleanup of each `Some` domain independently
 /// using the domain's checked free method (e.g. `KvCache::free_checked`,
@@ -72,8 +71,6 @@ pub(crate) struct Qwen35BundleBuildError {
     pub dn_state: Option<DeltaNetState>,
     /// Forward scratch, if allocated before the failure.
     pub scratch: Option<Qwen35Scratch>,
-    /// MTP head, if allocated.
-    pub mtp_head: Option<crate::mtp_head::Qwen35MtpHead>,
 }
 
 impl Qwen35BundleBuildError {
@@ -112,7 +109,6 @@ impl Qwen35BundleBuildError {
             kv_cache,
             dn_state,
             scratch,
-            mtp_head,
         } = self;
 
         // Phase A: KV cache — checked free, retain failures.
@@ -143,36 +139,9 @@ impl Qwen35BundleBuildError {
             None => Vec::new(),
         };
 
-        // Phase D: MTP head — checked free (via free_checked which
-        // returns retained GpuTensors as RetainedQwenTensor).
-        let mtp_failures: Vec<crate::qwen35::RetainedQwenTensor> = match mtp_head {
-            Some(mtp) => mtp.free_checked(gpu),
-            None => Vec::new(),
-        };
-
-        // Phase E: Weights — checked free via free_gpu_checked.
+        // Phase D: Weights — checked free via free_gpu_checked.
         // Done LAST so prior domain failures are already collected.
-        let weights_failure = match weights.free_gpu_checked(gpu) {
-            Ok(()) => {
-                // Weights freed successfully — still need to surface MTP failures.
-                if mtp_failures.is_empty() {
-                    None
-                } else {
-                    let mut cf = crate::qwen35::Qwen35CleanupFailure::empty();
-                    for r in mtp_failures {
-                        cf.add_retained(r);
-                    }
-                    Some(cf)
-                }
-            }
-            Err(mut cf) => {
-                // Merge MTP failures into weights failure.
-                for r in mtp_failures {
-                    cf.add_retained(r);
-                }
-                Some(cf)
-            }
-        };
+        let weights_failure = weights.free_gpu_checked(gpu).err();
 
         (
             msg,
@@ -208,7 +177,6 @@ pub(crate) struct BundleBuildTransaction {
     kv_cache: Option<KvCache>,
     dn_state: Option<DeltaNetState>,
     scratch: Option<Qwen35Scratch>,
-    mtp_head: Option<crate::mtp_head::Qwen35MtpHead>,
 }
 
 impl BundleBuildTransaction {
@@ -219,7 +187,6 @@ impl BundleBuildTransaction {
             kv_cache: None,
             dn_state: None,
             scratch: None,
-            mtp_head: None,
         }
     }
 
@@ -270,7 +237,9 @@ impl BundleBuildTransaction {
             scratch: self.scratch.take().expect("transaction: scratch missing"),
             kv_cache: self.kv_cache.take().expect("transaction: KV cache missing"),
             dn_state: self.dn_state.take().expect("transaction: DN state missing"),
-            mtp_head: self.mtp_head.take(),
+            // The build transaction never allocates an MTP head — it is
+            // folded in post-load by the loader (see Qwen35Bundle::mtp_head).
+            mtp_head: None,
             pipeline: None,
         }
     }
@@ -283,7 +252,6 @@ impl BundleBuildTransaction {
             kv_cache: self.kv_cache.take(),
             dn_state: self.dn_state.take(),
             scratch: self.scratch.take(),
-            mtp_head: self.mtp_head.take(),
         }
     }
 }
@@ -312,7 +280,7 @@ impl Drop for BundleBuildTransaction {
 /// auxiliary owner, and any partial-construction retained owners.
 #[expect(
     clippy::result_large_err,
-    reason = "Err transports every complete GPU owner (weights, KV cache, DN state, scratch, MTP head) for exact rollback; flattening would leak on failure"
+    reason = "Err transports every complete GPU owner (weights, KV cache, DN state, scratch) for exact rollback; flattening would leak on failure"
 )]
 fn build_qwen35_bundle(
     hfq: &HfqFile,
