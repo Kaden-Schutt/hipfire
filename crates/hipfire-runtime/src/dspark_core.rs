@@ -502,9 +502,13 @@ fn gemv_auto_batched_wmma(
             }
         }
         _ => {
-            let wmma_on = hipfire_config::developer_var("HIPFIRE_DSPARK_HFQ4_WMMA")
-                .map(|s| s != "0")
-                .unwrap_or(true);
+            // Gate on `has_wmma()` (false on CDNA3): `gemm_hfq4g256_wmma` is
+            // wave32-WMMA and fails to COMPILE for gfx942, so without this
+            // the DSpark path dies at JIT instead of using `gemm_hfq4g256`.
+            let wmma_on = gpu.arch_caps.has_wmma()
+                && hipfire_config::developer_var("HIPFIRE_DSPARK_HFQ4_WMMA")
+                    .map(|s| s != "0")
+                    .unwrap_or(true);
             if wmma_on {
                 if let Some(scratch) = x_f16_scratch {
                     let n = (batch_size * k) as i64;

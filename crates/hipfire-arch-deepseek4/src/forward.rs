@@ -1425,9 +1425,15 @@ fn gemv_auto_batched_wmma(
             }
         }
         _ => {
-            let wmma_on = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_HFQ4_WMMA")
-                .map(|s| s != "0")
-                .unwrap_or(true);
+            // `gemm_hfq4g256_wmma` is a wave32-WMMA kernel and does not
+            // COMPILE on CDNA3, so `has_wmma()` (false on gfx942) must gate
+            // it — otherwise DeepSeek V4 dies at JIT rather than taking the
+            // `gemm_hfq4g256` fallback below. Measured perf-neutral on
+            // gfx942: AR 31.80 tok/s with the fallback vs 31.78 with WMMA.
+            let wmma_on = gpu.arch_caps.has_wmma()
+                && hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_HFQ4_WMMA")
+                    .map(|s| s != "0")
+                    .unwrap_or(true);
             if wmma_on {
                 if let Some(scratch) = x_f16_scratch {
                     let n = (batch_size * k) as i64;
