@@ -1966,6 +1966,13 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
         "id": "run",
         "prompt": prompt,
         "max_tokens": max_tokens,
+        // `Engine::generate` rejects a request without `attempt_id`
+        // (hipfire-client lib.rs:557 -> "generate request missing attempt_id"),
+        // and `hipfire run` never set one, so EVERY `hipfire run` failed with a
+        // daemon protocol error. `run` is a one-shot, non-retrying caller, so a
+        // literal 1 is correct — same as `bench_generate_request` (main.rs:6407).
+        // The retrying serve path threads a real counter instead (main.rs:4234).
+        "attempt_id": 1,
     });
     insert_optional_f64(&mut request, "temperature", temperature);
     insert_optional_f64(&mut request, "top_p", top_p);
