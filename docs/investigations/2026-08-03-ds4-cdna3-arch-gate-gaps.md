@@ -535,6 +535,70 @@ the entire problem. It is a `forward_prefill_batch_chunked` call
 (`spec_impl.rs:253`) over only ~2-3 rows, uncaptured, versus a graph-captured
 `decode_step_with_graph` for AR.
 
+### Inside the 144 ms verify: dense E8 WMMA is 57% at 53.5 GiB/s
+
+`profile_prefill_deepseek4 --prefill 4 --pp-batch 8` on gfx1151 (the same
+`forward_prefill_batch_chunked` verify uses). Total 147 ms — matches the live
+`verify_block` mean of 144.46 ms, so the profiler reproduces the real call:
+
+```
+rnk kernel                                            calls  total_us   GiB/s     %
+1   gemm_mfp4g32_e8_soa_wmma_gfx1151                    510   83897.7    53.5  57.0
+2   deepseek4_gemv_mq2g256_lloyd_moe_gate_up_..._k4      43   25178.0   181.4  17.1
+3   gemm_mfp4g32_e8_soa_grouped_wmma_gfx1151             43   15029.6    90.5  10.2
+4   deepseek4_gemv_..._down_residual_scaled_..._k4       43   13727.1   166.9   9.3
+    TOTAL                                                    147060.7
+```
+
+The dense E8 GEMM runs at **53.5 GiB/s while the MoE GEMVs in the SAME capture
+hit 167-181 GiB/s** — a 3.4x intra-capture spread, so it is kernel shape, not
+bandwidth. It is the B1 variant at batch 4: `e8_prefill_batch_tiles`
+(`forward.rs:1266`) only selects b2 above batch 16 and b4 above batch 32, so
+every speculative verify (B<=6) structurally gets tiles=1 and wastes 15/16 of
+each 16-wide WMMA tile.
+
+### A promising lever that MADE IT WORSE — do not retry
+
+`crates/rdna-compute/examples/bench_e8_soa_correctness.rs` "Perf bench 2d"
+already A/Bs exactly this, M=4096 K=4096 DRAM-resident:
+
+```
+  B     WMMA us  batched us   speedup   WMMA GB/s  batch GB/s
+  1      177.43       48.16     3.68x        50.6       186.4
+  2      177.99       52.12     3.42x        50.4       172.3
+  4      178.03       79.14     2.25x        50.4       113.4
+  6      178.96      127.64     1.40x        50.2        70.3
+  8      179.08      156.23     1.15x        50.1        57.5
+ 16      180.70      299.81     0.60x        49.7        29.9
+```
+
+WMMA is flat at ~50 GB/s for every B (confirming the 53.5 GiB/s above), and the
+batched GEMV looks 1.4-3.7x faster across the whole verify range. That path is
+already implemented and wired — `e8_batched_gemv_applies` (`forward.rs:1292`)
+with `E8_BATCHED_GEMV_BATCHES = [1,2,3,4,5,6,7,8,16]` — but
+`e8_batched_gemv_max_batch()` defaults to **0** (`forward.rs:783`,
+`unwrap_or(0)`), so the arm never fires.
+
+Enabling it end-to-end is a REGRESSION:
+
+| `HIPFIRE_DEEPSEEK4_E8_BATCHED_GEMV` | AR tok/s | DSpark tok/s | verify_block |
+|---|---|---|---|
+| 0 (default) | 27.9 | 13.2 | 144.58 ms |
+| 8 | 27.9 | **9.8** | **201.73 ms** |
+
+Verify got **39% slower**. The default of 0 is correct and deliberate. The
+microbench mispredicted because it measures ONE shape (M=4096 K=4096) while real
+verify spans M=1024..32768, K=1024..8192 at batch 2-3 — a shape MIX. Treat
+single-shape kernel microbenches as hypothesis generators only; this is the third
+kernel-level lead this session that died end-to-end (see also the pipelined MFMA
+GEMM and the Q8 wave64 port, both bit-exact and both neutral-or-worse).
+
+So the 53.5 GiB/s dense-E8 path is real and is the dominant cost, but it is NOT
+reachable through the existing lever. A fix means either lowering the b2/b4 tile
+thresholds (`forward.rs:1266`) so verify-sized batches get tiled WMMA, or a
+verify-shaped kernel — both requiring per-shape measurement across the real mix,
+not a single-shape bench.
+
 ### Ordered plan (revised after measurement)
 
 1. **Attribute the 144 ms verify call.** Run `profile_prefill_deepseek4` (or the
