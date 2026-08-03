@@ -10920,7 +10920,22 @@ impl Gpu {
             &mut k_i as *mut _ as *mut c_void,
             &mut bs as *mut _ as *mut c_void,
         ];
-        unsafe {
+        // Untimed until now, like `gemm_q8_0_batched`: on CDNA3 the O-LoRA
+        // Q8_0 tier lands here (the WMMA variant is gfx1151-gated), so
+        // `HIPFIRE_PROFILE` was blind to one of the hottest weight paths.
+        // Q8_0 packing is 34 B per 32-element group.
+        let bytes = (g as usize).saturating_mul(m as usize).saturating_mul(k as usize) / 32 * 34
+            + (batch_size as usize)
+                .saturating_mul(g as usize)
+                .saturating_mul(k as usize)
+                * 4;
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "gemv",
+            "wo_per_group_batched_q8_0_1w",
+            bytes,
+        );
+        let result = unsafe {
             self.hip.launch_kernel(
                 func,
                 [m as u32, batch_size as u32, g as u32],
@@ -10929,7 +10944,11 @@ impl Gpu {
                 self.stream_ref(),
                 &mut params,
             )
+        };
+        if let Some(t) = timer {
+            t.finish(&self.hip);
         }
+        result
     }
     pub fn wo_per_group_batched_q8_0_multirow(
         &mut self,

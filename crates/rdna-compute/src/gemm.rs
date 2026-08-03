@@ -19601,7 +19601,13 @@ impl Gpu {
             &mut bs_val as *mut _ as *mut c_void,
         ];
 
-        self.launch_maybe_blob(
+        // Q8_0 weight bytes dominate: 34 B per 32-element group (32 int8 + f16
+        // scale). This kernel carried NO profile timer, so `HIPFIRE_PROFILE`
+        // silently under-reported the hottest weight path on CDNA3 (where the
+        // WMMA Q8 kernels are unavailable and everything lands here).
+        let bytes = m.saturating_mul(k) / 32 * 34 + batch_size.saturating_mul(k) * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_q8_0_batched", bytes);
+        let result = self.launch_maybe_blob(
             "gemm_q8_0_batched",
             [m as u32, 1, 1],
             [32, 1, 1],
@@ -19617,7 +19623,11 @@ impl Gpu {
                 b.push_i32(bs_val);
                 b
             },
-        )
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
     }
 
     /// Q8_0 batched GEMM driver that handles `n` rows by sub-batching at the
