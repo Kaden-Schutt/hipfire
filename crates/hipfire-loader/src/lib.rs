@@ -8493,7 +8493,7 @@ mod qwen35_backlog_tests {
 
         let enqueuer_coord = coord.clone();
         let enqueuer_backlog = backlog.clone();
-        let _enqueuer = std::thread::spawn(move || {
+        let enqueuer = std::thread::spawn(move || {
             attempting_tx.send(()).unwrap();
             // The production enqueue protocol: coordinator → map → push.
             super::coordinated_retain(
@@ -8551,6 +8551,10 @@ mod qwen35_backlog_tests {
         enqueue_done_rx
             .recv()
             .expect("enqueue must complete after the drain");
+        // Join AFTER the done signal: a panic in the enqueuer propagates
+        // here with its real message instead of surfacing as a bare
+        // channel-disconnect failure at the recv above.
+        enqueuer.join().expect("enqueuer must finish");
         driver.join().expect("driver must finish");
 
         // The owner is intact in the backlog — BOTH categories — and the

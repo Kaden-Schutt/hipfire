@@ -137,7 +137,10 @@ fn qwen35_paro_loader_kind(num_experts: usize) -> Qwen35ParoLoaderKind {
 /// Route decision from a [`Qwen35FrozenPreflight`] selection.
 #[expect(
     clippy::large_enum_variant,
-    reason = "variants retain concrete rollback owners until publication"
+    reason = "Legacy carries the ORIGINAL ModelSource to the Legacy loader; the route is a cold, \
+             one-shot source-owning decision built before any GPU allocation and consumed \
+             immediately by drive_route (no rollback owner, never copied or reused), so boxing \
+             would only add a heap allocation and an indirection to a move-only value"
 )]
 pub(crate) enum Qwen35FrozenRoute {
     /// Frozen allocation authorized by the preflight plan; the plan owns
