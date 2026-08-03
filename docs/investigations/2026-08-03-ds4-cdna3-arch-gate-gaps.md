@@ -281,6 +281,69 @@ B=6, M=1024 takes 0.089 ms vs M=4096 at 0.094 ms — near-identical wall time fo
 M-independent. **The B=5 cliff on gfx942 remains unexplained** and is the open
 question for anyone resuming this.
 
+## The RDNA matrix — and why the CDNA3 Q8 thread is closed
+
+`hipx` carries four RDNA generations, which makes it the real bench for "fastest
+engine on RDNA":
+
+| HIP dev | card | arch | VRAM |
+|---|---|---|---|
+| 0 | RX 7900 XTX | gfx1100 (RDNA3) | 25.8 GB |
+| 1 | Radeon 8060S | gfx1151 (RDNA3.5, Strix Halo) | 103.1 GB |
+| 2 | RX 5700 XT | gfx1010 (RDNA1) | 8.6 GB |
+| 3 | RX 6950 XT | gfx1030 (RDNA2) | 17.2 GB |
+
+(Note HIP device order != `rocm-smi` GPU[n] order.)
+
+Q8_0 `prod` path (`gemm_q8_0_batched_chunked`), M=4096 K=4096, 17 MiB weights,
+**ms per call** (lower better), same binary blob `aecb1d7d…`:
+
+| arch | path | B=1 | B=2 | B=4 | B=5 | B=6 | B=8 | B=13 |
+|---|---|---|---|---|---|---|---|---|
+| gfx1151 | WMMA | 0.045 | 0.045 | 0.045 | 0.045 | 0.045 | 0.045 | 0.045 |
+| gfx1100 | WMMA | 0.089 | 0.086 | 0.076 | 0.054 | 0.054 | 0.053 | 0.052 |
+| gfx1030 | scalar | 0.204 | 0.259 | 0.358 | 0.409 | 0.461 | 0.599 | 0.889 |
+| gfx1010 | scalar | 0.476 | 0.589 | 0.866 | 0.975 | 1.071 | 1.417 | 3.731 |
+| gfx942 | scalar | 0.010 | 0.013 | 0.018 | 0.084 | 0.099 | 0.111 | 0.194 |
+
+### 1. The gfx942 B=5 cliff is CDNA-specific — do not chase it
+
+gfx1030 runs the SAME scalar kernel on wave32 and degrades smoothly (2.0x from
+B=1 to B=5, against 5x the work — sublinear). gfx942 steps 8.4x over the same
+range. The cliff is an artifact of a wave32-shaped kernel (block [32,1,1],
+32-lane shfl tree) executing on wave64 hardware, not an algorithmic property.
+Since CDNA3 is not a product target, this closes the Q8 CDNA3 kernel effort. The
+neutral rewrite was correctly not landed.
+
+### 2. On WMMA parts, deeper speculation is free or profitable
+
+gfx1151 is perfectly flat B=1..13. gfx1100 gets FASTER with batch — 0.052 ms at
+B=13 vs 0.089 ms at B=1 — because a 16-wide WMMA tile is 1/16 utilised at B=1.
+So on RDNA3/3.5 the Q8 draft cost contributes ~0 (or negative) marginal `dt`,
+and **DSpark's optimal block is bounded by ACCEPTANCE, not by cost**. Any
+controller fitted on a scalar part, or on MI300X, will select blocks far too
+small. This is the actionable RDNA perf lever.
+
+Corollary: AR decode (B=1) is the WORST case on gfx1100 — single-token decode
+wastes 15/16 of every WMMA tile.
+
+### 3. gfx1100 is a valid numerics proxy for gfx1151
+
+Both WMMA parts report IDENTICAL deviation from the scalar reference at every
+batch (max_absdiff 1.932e-2, 1.937e-2, 2.419e-2 x3, 2.695e-2 x2). RDNA3 and
+RDNA3.5 agree with each other exactly; only RDNA-vs-scalar differs. So short-
+context correctness work can iterate on the 7900 XTX, and the 96 GiB Strix Halo
+is needed only for genuinely long context.
+
+### 4. Role of MI300X, corrected
+
+MI300X is an ORACLE and data-generation vehicle, not a performance proxy — its
+cost curve is the inverse of the targets'. Use it for PyTorch reference
+generation (`crates/hipfire-arch-deepseek4/reference_oracle/`, teacher artifacts
+at `/mnt/scratch/quantization/deepseek-v4-flash-0731-teacher/`), long-context
+ground truth, and calibration compute. Do NOT use it to tune block size,
+thresholds, or to quote tau/accept.
+
 ## Reproduction
 
 ```bash
