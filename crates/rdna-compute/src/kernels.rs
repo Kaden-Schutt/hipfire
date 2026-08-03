@@ -1332,7 +1332,6 @@ pub const GEMV_HFQ4G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_SRC: &str =
 pub const GEMV_HFQ4G256_MOE_DOWN_K8_INDEXED_FUSED_ACC_SRC: &str =
     include_str!("../../../kernels/src/gemv_hfq4g256_moe_down_k8_indexed_fused_acc.hip");
 
-
 /// HFQ4G128 (ParoQuant) variant of the atomic-free batched indexed MoE
 /// down. Same expanded-output contract as the HFQ4G256 sibling; pairs
 /// with `MOE_DOWN_COMBINE_K8_BATCHED_SRC` for the K_TOP fold. Closes the
@@ -2537,6 +2536,8 @@ pub const ADD_SRC: &str = include_str!("../../../kernels/src/add.hip");
 
 /// Element-wise in-place add: a[i] += b[i]
 pub const ADD_INPLACE_SRC: &str = include_str!("../../../kernels/src/add_inplace.hip");
+pub const ADD_ROW_INPLACE_BUF_SRC: &str =
+    include_str!("../../../kernels/src/add_row_inplace_buf.hip");
 
 /// Scaled in-place add: y[i] += c * x[i] — one kernel for both
 /// CPU-scalar (c via kernarg) and GPU-scalar (c via device buffer)
@@ -3856,6 +3857,14 @@ pub const V4F_TOPK_KV_GATHER_IDENTITY_BATCHED_SRC: &str =
 /// Block-diagonal: wo_a[G, M, K] @ x_in[B, G, K] → y_out[B, G, M].
 pub const WO_PER_GROUP_BATCHED_F32_SRC: &str =
     include_str!("../../../kernels/src/wo_per_group_batched_f32.hip");
+
+/// DeepSeek V4 per-group O-LoRA batched GEMV — F16 weights, F32 activations.
+/// Required by the `deepseek4-mtp-precise` DSpark sidecar, which keeps dense
+/// drafter weights at training precision. Without it `spec_step` fails closed
+/// with "dspark wo_a: unsupported dtype F16" and the drafter is restricted to
+/// Q8F16 — quant noise the acceptance rate is disproportionately sensitive to.
+pub const WO_PER_GROUP_BATCHED_F16_SRC: &str =
+    include_str!("../../../kernels/src/wo_per_group_batched_f16.hip");
 
 /// DeepSeek V4 per-group O-LoRA batched GEMV for HFQ4G256-packed wo_a.
 /// Single launch in place of B × G separate gemv_mq4g256_prerotated calls.

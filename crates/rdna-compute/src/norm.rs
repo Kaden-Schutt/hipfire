@@ -248,6 +248,73 @@ impl Gpu {
     }
 
     /// a += b (in-place element-wise add)
+    /// `a[i] += rows[(row_idx_buf[0] + idx_bias) * n + i]` — HIP-graphs-safe
+    /// row-indexed add.
+    ///
+    /// Use instead of [`Gpu::add_inplace_f32`] with a `sub_offset` view
+    /// whenever the row is chosen from per-step state and the call may be
+    /// captured into a graph: `sub_offset` bakes a device pointer at call
+    /// time, so a captured node keeps adding the capture-time row forever.
+    pub fn add_row_inplace_f32_buf(
+        &mut self,
+        a: &GpuTensor,
+        rows: &GpuTensor,
+        row_idx_buf: &GpuTensor,
+        idx_bias: i32,
+        num_rows: i32,
+        n: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "add_row_inplace_f32_buf",
+            kernels::ADD_ROW_INPLACE_BUF_SRC,
+            "add_row_inplace_f32_buf",
+        )?;
+
+        let a_ptr = a.buf.as_ptr();
+        let r_ptr = rows.buf.as_ptr();
+        let i_ptr = row_idx_buf.buf.as_ptr();
+        let bias_val = idx_bias;
+        let nrows_val = num_rows;
+        let n_val = n;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &a_ptr as *const _ as *mut c_void,
+            &r_ptr as *const _ as *mut c_void,
+            &i_ptr as *const _ as *mut c_void,
+            &bias_val as *const _ as *mut c_void,
+            &nrows_val as *const _ as *mut c_void,
+            &n_val as *const _ as *mut c_void,
+        ];
+
+        let block = 256u32;
+        let grid = ((n as u32) + block - 1) / block;
+        let bytes = crate::profile::elementwise_bytes(n as usize);
+        let timer =
+            crate::profile::begin_timer(&self.hip, "elementwise", "add_row_inplace_f32_buf", bytes);
+        let result = self.launch_maybe_blob(
+            "add_row_inplace_f32_buf",
+            [grid, 1, 1],
+            [block, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut bb = hip_bridge::KernargBlob::new();
+                bb.push_ptr(a_ptr);
+                bb.push_ptr(r_ptr);
+                bb.push_ptr(i_ptr);
+                bb.push_i32(bias_val);
+                bb.push_i32(nrows_val);
+                bb.push_i32(n_val);
+                bb
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
     pub fn add_inplace_f32(&mut self, a: &GpuTensor, b: &GpuTensor) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_kernel("add_inplace", kernels::ADD_INPLACE_SRC, "add_inplace_f32")?;

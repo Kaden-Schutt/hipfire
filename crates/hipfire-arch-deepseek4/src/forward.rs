@@ -620,11 +620,52 @@ fn compressor_forward_impl(
     // exists at the main proj_dim. `score_buf.numel()` therefore over-
     // states the live length; we must clamp to `proj_dim` (the GEMV
     // write length) so add_inplace_f32 doesn't run past the ape row.
-    let ape_row_idx = pos % ratio;
-    let ape_row = ape.sub_offset(ape_row_idx * proj_dim, proj_dim);
+    //
+    // HIP-GRAPHS: the row must be selected on the DEVICE in the decode path.
+    // `ape.sub_offset(pos % ratio * proj_dim, ..)` computes a device pointer on
+    // the host, and graph capture bakes that pointer into the node — so every
+    // replay re-added the CAPTURE-time position's APE row. `score_buf` is only
+    // consumed at a compress event, so the error sat latent for a couple of
+    // steps and then corrupted the compressed KV cache, which is what made
+    // graph replay diverge from direct dispatch a few tokens after capture.
+    //
+    // `fill_attn_state_host` already publishes the per-step ring slot, and the
+    // APE row is derivable from it: slot 6 holds `ratio + pos % ratio` for the
+    // overlap ratio (4), slot 8 holds `pos % 128` for the non-overlap one.
+    // Other ratios have no published slot, so they keep the host path — they
+    // are not reachable on DeepSeek V4, whose compress_ratios are 4 and 128.
     let score_view = score_buf.sub_offset(0, proj_dim);
-    gpu.add_inplace_f32(&score_view, &ape_row)
-        .map_err(|e| format!("comp ape add l{layer_idx}: {e:?}"))?;
+    let ape_slot = match ratio {
+        4 => Some((6usize, -4i32)),
+        128 => Some((8usize, 0i32)),
+        _ => None,
+    };
+    let ape_state_buf = if pre_batched.is_none() {
+        state.attn_state_buf.as_ref().map(|b| b.shallow_clone())
+    } else {
+        None
+    };
+    match (ape_slot, ape_state_buf) {
+        (Some((slot, bias)), Some(attn_buf)) => {
+            let row_idx = attn_buf.sub_offset(slot, 1);
+            gpu.add_row_inplace_f32_buf(
+                &score_view,
+                ape,
+                &row_idx,
+                bias,
+                ratio as i32,
+                proj_dim as i32,
+            )
+            .map_err(|e| format!("comp ape add (buf) l{layer_idx}: {e:?}"))?;
+        }
+        _ => {
+            // Prefill (never graph-captured) and any unpublished ratio.
+            let ape_row_idx = pos % ratio;
+            let ape_row = ape.sub_offset(ape_row_idx * proj_dim, proj_dim);
+            gpu.add_inplace_f32(&score_view, &ape_row)
+                .map_err(|e| format!("comp ape add l{layer_idx}: {e:?}"))?;
+        }
+    }
 
     // Stage-bisect dump: HIPFIRE_COMP_DUMP="<pos>,<layer>" prints each
     // pipeline stage's output fingerprint at that (position, layer) so the
@@ -1519,6 +1560,73 @@ fn trace_logits(logits: &[f32], position: u32, path: &str) {
     );
 }
 
+/// Fingerprint the layer-0 compressor buffers after a decode step.
+///
+/// Companion to [`trace_logits`] for the graph-replay bug: the logits tell you
+/// WHEN the divergence starts, these tell you WHICH buffer carries it, and
+/// therefore which kernel. Runs OUTSIDE any captured region (after the step
+/// returns), so it observes what a graph replay actually wrote — `dump_buf`
+/// cannot, being host code inside the captured layer loop.
+///
+/// Enable with `HIPFIRE_DEEPSEEK4_STATE_TRACE=<layer>`.
+fn trace_compressor_state(state: &DeepseekV4State, gpu: &Gpu, position: u32, path: &str) {
+    use std::sync::OnceLock;
+    static L: OnceLock<Option<String>> = OnceLock::new();
+    let raw = match L.get_or_init(|| std::env::var("HIPFIRE_DEEPSEEK4_STATE_TRACE").ok()) {
+        Some(v) => v.clone(),
+        None => return,
+    };
+    // "auto" picks the first layer that actually has compressor state
+    // allocated — layer 0 does not, so a fixed index silently traces nothing.
+    let layer = if raw.trim() == "auto" {
+        match state
+            ._indexer
+            .iter()
+            .position(|ix| ix.main_kv_state.is_some())
+        {
+            Some(l) => l,
+            None => return,
+        }
+    } else {
+        match raw.trim().parse::<usize>() {
+            Ok(l) => l,
+            Err(_) => return,
+        }
+    };
+    if layer >= state._indexer.len() {
+        return;
+    }
+    let fp = |t: &Option<rdna_compute::GpuTensor>| -> String {
+        match t {
+            None => "-".to_string(),
+            Some(t) => match gpu.download_f32(t) {
+                Err(_) => "ERR".to_string(),
+                Ok(v) => {
+                    let mut h: u64 = 1469598103934665603;
+                    for x in &v {
+                        h ^= x.to_bits() as u64;
+                        h = h.wrapping_mul(1099511628211);
+                    }
+                    format!("{h:016x}")
+                }
+            },
+        }
+    };
+    let ix = &state._indexer[layer];
+    eprintln!(
+        "[state-trace] pos={position} path={path} l{layer} r={} \
+         main_kv_cache={} main_kv_state={} main_score_state={} \
+         idx_kv_cache={} idx_kv_state={} idx_score_state={}",
+        ix.compress_ratio,
+        fp(&ix.main_kv_cache),
+        fp(&ix.main_kv_state),
+        fp(&ix.main_score_state),
+        fp(&ix.indexer_kv_cache),
+        fp(&ix.indexer_kv_state),
+        fp(&ix.indexer_score_state),
+    );
+}
+
 pub fn decode_step(
     cfg: &DeepseekV4Config,
     weights: &DeepseekV4Weights,
@@ -1548,6 +1656,7 @@ pub fn decode_step(
         .download_f32(logits)
         .map_err(|e| format!("download logits: {e:?}"))?;
     trace_logits(&out, position, "direct");
+    trace_compressor_state(state, gpu, position, "direct");
     Ok(out)
 }
 
@@ -1691,6 +1800,7 @@ pub fn decode_step_with_graph(
         .download_f32(logits)
         .map_err(|e| format!("download logits (graph path): {e:?}"))?;
     trace_logits(&out, position, "graph");
+    trace_compressor_state(state, gpu, position, "graph");
     Ok(out)
 }
 
