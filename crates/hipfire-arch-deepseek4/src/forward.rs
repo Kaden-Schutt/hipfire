@@ -12516,6 +12516,30 @@ fn dspark_wo_project(
                 block as i32,
             )
             .map_err(|e| format!("dspark wo_a hfq4g256[{stage}]: {e:?}"))?,
+        // MQ2R-matched sidecars carry `mtp.*.attn.wo_a` as MFP4G32E8SOA (the
+        // same tier the trunk uses), so the draft needs the trunk's own E8
+        // grouped fallback. Without this arm the draft path refused the
+        // artifact with "dspark wo_a[N]: unsupported dtype MFP4G32E8SOA".
+        // Mirrors the trunk call site above (`DType::MFP4G32E8 |
+        // MFP4G32E8SOA | MFP3G32E8` -> `wo_per_group_batched_e8_fallback`).
+        DType::MFP4G32E8 | DType::MFP4G32E8SOA | DType::MFP3G32E8 => {
+            wo_per_group_batched_e8_fallback(
+                gpu,
+                // The DSpark draft path uses the portable backend throughout
+                // (see the sibling calls in this function and in
+                // dspark_run_body_and_hc_gate), so stay consistent here.
+                Mq2rBackend::Portable,
+                wo_a,
+                &pbs.attn_out_raw_rot_batch,
+                &pbs.attn_out_raw_batch,
+                &pbs.wo_a_out_batch,
+                n_groups,
+                o_lora_rank,
+                per_group_in,
+                block,
+            )
+            .map_err(|e| format!("dspark wo_a e8[{stage}]: {e}"))?
+        }
         other => return Err(format!("dspark wo_a[{stage}]: unsupported dtype {other:?}")),
     }
 
