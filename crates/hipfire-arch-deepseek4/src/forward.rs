@@ -504,6 +504,9 @@ mod config_cache {
     /// One-shot daemon-log line for A2 gfx942 levers so ABBA runs cannot
     /// misattribute measurements.
     pub(super) fn log_gfx942_a2_levers(arch: &str, gfx942_route_v1: bool) {
+        if arch != "gfx942" {
+            return;
+        }
         static LOGGED: OnceLock<()> = OnceLock::new();
         let _ = LOGGED.get_or_init(|| {
             let l1 = gfx942_compressor_gate_on(arch, gfx942_route_v1);
@@ -1114,13 +1117,7 @@ pub fn take_layer_norm_trace() -> Option<(u32, Vec<f64>)> {
 /// Opt-in per-stage residual/activation L2 for spike-layer localization.
 /// `HIPFIRE_DEEPSEEK4_STAGE_NORM=1` plus optional
 /// `HIPFIRE_DEEPSEEK4_STAGE_LAYERS=25,26,27` (default those three).
-fn dump_stage_norm(
-    gpu: &mut Gpu,
-    tag: &str,
-    buf: &GpuTensor,
-    layer_idx: usize,
-    position: u32,
-) {
+fn dump_stage_norm(gpu: &mut Gpu, tag: &str, buf: &GpuTensor, layer_idx: usize, position: u32) {
     use std::sync::LazyLock;
     static ON: LazyLock<bool> = LazyLock::new(|| {
         hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_STAGE_NORM")
@@ -1257,10 +1254,6 @@ fn dump_indexer_state(
          main_kv_l2={main_l2:.9e} idx_kv_l2={idx_l2:.9e} {topk_head}"
     );
 }
-
-
-
-
 
 #[inline]
 fn e8_prefill_batch_tiles(batch_size: usize, b2_available: bool, b4_available: bool) -> usize {
@@ -2547,8 +2540,9 @@ fn indexer_forward(
     let two_stage_topk = (config_cache::gfx942_indexer_topk_two_stage_on(
         &gpu.arch,
         weights.mq2r_backend.is_gfx942(),
-    ) || config_cache::gfx1151_indexer_topk_two_stage_on(&gpu.arch, cfg.mq2r))
-        && max_compressed >= config_cache::indexer_topk_two_stage_min();
+    ) || config_cache::gfx1151_indexer_topk_two_stage_on(
+        &gpu.arch, cfg.mq2r,
+    )) && max_compressed >= config_cache::indexer_topk_two_stage_min();
 
     let wq_b = layer
         .indexer_wq_b
@@ -2718,7 +2712,10 @@ fn indexer_forward(
         false
     };
     let gfx942_parallel = !two_stage
-        && config_cache::gfx942_indexer_topk_parallel_on(&gpu.arch, weights.mq2r_backend.is_gfx942())
+        && config_cache::gfx942_indexer_topk_parallel_on(
+            &gpu.arch,
+            weights.mq2r_backend.is_gfx942(),
+        )
         && weights.mq2r_backend.try_indexer_top_k_buf_parallel(
             gpu,
             scores,
@@ -5440,8 +5437,7 @@ fn ffn_routed(
     let ffn_x_rot = state.ffn_x_rot.as_ref().unwrap();
     let ffn_out = state.ffn_out.as_ref().unwrap();
     // Route-scale: env override (process-cached) else cfg.routed_scaling_factor.
-    let route_scale_override: f32 =
-        config_cache::route_scale(cfg.routed_scaling_factor, cfg.mq2r);
+    let route_scale_override: f32 = config_cache::route_scale(cfg.routed_scaling_factor, cfg.mq2r);
 
     if layer.expert_gate_up_blob.is_some() {
         // Fused MoE dispatch: 2 indexed kernels (gate_up + down) plus
@@ -5616,8 +5612,7 @@ fn ffn_hash_routed(
     let im = cfg.moe_intermediate_size;
     let ffn_x_rot = state.ffn_x_rot.as_ref().unwrap();
     let ffn_out = state.ffn_out.as_ref().unwrap();
-    let route_scale_override: f32 =
-        config_cache::route_scale(cfg.routed_scaling_factor, cfg.mq2r);
+    let route_scale_override: f32 = config_cache::route_scale(cfg.routed_scaling_factor, cfg.mq2r);
     let k_top = k;
 
     // Lazy-alloc moe scratch (shared with ffn_routed via state).
@@ -13244,7 +13239,9 @@ mod tests {
         // still an opt-in experiment.
         assert!(!config_cache::gfx942_compressor_gate_on("gfx942", true));
         assert!(config_cache::gfx942_indexer_topk_bounded_on("gfx942", true));
-        assert!(config_cache::gfx942_indexer_topk_two_stage_on("gfx942", true));
+        assert!(config_cache::gfx942_indexer_topk_two_stage_on(
+            "gfx942", true
+        ));
         assert!(config_cache::gfx942_e8_wo_grouped_on("gfx942", true));
         assert!(!config_cache::gfx942_hc_finalize_fused_on("gfx942", true));
         assert!(config_cache::gfx942_indexer_topk_parallel_on(
@@ -13252,8 +13249,12 @@ mod tests {
         ));
         // Fail closed on non-mq2r and non-gfx942.
         assert!(!config_cache::gfx942_compressor_gate_on("gfx942", false));
-        assert!(!config_cache::gfx942_indexer_topk_bounded_on("gfx942", false));
-        assert!(!config_cache::gfx942_indexer_topk_two_stage_on("gfx942", false));
+        assert!(!config_cache::gfx942_indexer_topk_bounded_on(
+            "gfx942", false
+        ));
+        assert!(!config_cache::gfx942_indexer_topk_two_stage_on(
+            "gfx942", false
+        ));
         assert!(!config_cache::gfx942_e8_wo_grouped_on("gfx942", false));
         assert!(!config_cache::gfx942_hc_finalize_fused_on("gfx942", false));
         assert!(!config_cache::gfx942_indexer_topk_parallel_on(
@@ -13261,18 +13262,30 @@ mod tests {
         ));
         assert!(!config_cache::gfx942_ffn_overlap_on(false));
         assert!(!config_cache::gfx942_compressor_gate_on("gfx1100", true));
-        assert!(!config_cache::gfx942_indexer_topk_bounded_on("gfx1100", true));
-        assert!(!config_cache::gfx942_indexer_topk_two_stage_on("gfx1100", true));
+        assert!(!config_cache::gfx942_indexer_topk_bounded_on(
+            "gfx1100", true
+        ));
+        assert!(!config_cache::gfx942_indexer_topk_two_stage_on(
+            "gfx1100", true
+        ));
         assert!(!config_cache::gfx942_e8_wo_grouped_on("gfx1201", true));
         assert!(!config_cache::gfx942_hc_finalize_fused_on("gfx1201", true));
         assert!(!config_cache::gfx942_indexer_topk_parallel_on(
             "gfx1201", true
         ));
-        assert!(!config_cache::gfx942_indexer_topk_bounded_on("gfx1201", true));
-        assert!(!config_cache::gfx942_indexer_topk_two_stage_on("gfx1201", true));
+        assert!(!config_cache::gfx942_indexer_topk_bounded_on(
+            "gfx1201", true
+        ));
+        assert!(!config_cache::gfx942_indexer_topk_two_stage_on(
+            "gfx1201", true
+        ));
         assert!(!config_cache::gfx942_compressor_gate_on("gfx1151", true));
-        assert!(!config_cache::gfx942_indexer_topk_bounded_on("gfx1151", true));
-        assert!(!config_cache::gfx942_indexer_topk_two_stage_on("gfx1151", true));
+        assert!(!config_cache::gfx942_indexer_topk_bounded_on(
+            "gfx1151", true
+        ));
+        assert!(!config_cache::gfx942_indexer_topk_two_stage_on(
+            "gfx1151", true
+        ));
         assert!(!config_cache::gfx942_indexer_topk_parallel_on(
             "gfx1151", true
         ));
@@ -13280,11 +13293,21 @@ mod tests {
         assert!(!config_cache::e8_wo_grouped_on("gfx942", true));
         // G1 is the gfx1151 twin of F3 and must not bleed into gfx942 or any
         // other arch; it also fails closed on non-mq2r and defaults OFF.
-        assert!(!config_cache::gfx1151_indexer_topk_two_stage_on("gfx942", true));
-        assert!(!config_cache::gfx1151_indexer_topk_two_stage_on("gfx1100", true));
-        assert!(!config_cache::gfx1151_indexer_topk_two_stage_on("gfx1201", true));
-        assert!(!config_cache::gfx1151_indexer_topk_two_stage_on("gfx1151", false));
-        assert!(!config_cache::gfx1151_indexer_topk_two_stage_on("gfx1151", true));
+        assert!(!config_cache::gfx1151_indexer_topk_two_stage_on(
+            "gfx942", true
+        ));
+        assert!(!config_cache::gfx1151_indexer_topk_two_stage_on(
+            "gfx1100", true
+        ));
+        assert!(!config_cache::gfx1151_indexer_topk_two_stage_on(
+            "gfx1201", true
+        ));
+        assert!(!config_cache::gfx1151_indexer_topk_two_stage_on(
+            "gfx1151", false
+        ));
+        assert!(!config_cache::gfx1151_indexer_topk_two_stage_on(
+            "gfx1151", true
+        ));
     }
 
     #[test]
