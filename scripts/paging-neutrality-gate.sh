@@ -112,7 +112,7 @@ run() {
   t0=$(date +%s%3N)
   printf '%s\n%s\n%s\n' \
     "{\"type\":\"load\",\"model\":\"$MODEL\",\"params\":{\"max_seq\":4096,\"dspark_mode\":\"off\",\"mtp_mode\":\"off\"}}" \
-    "{\"type\":\"generate\",\"id\":\"g\",\"prompt\":\"$PROMPT\",\"temperature\":0.0,\"max_tokens\":$MAX_TOKENS,\"repeat_penalty\":1.0}" \
+    "{\"type\":\"generate\",\"id\":\"g\",\"attempt_id\":0,\"prompt\":\"$PROMPT\",\"temperature\":0.0,\"max_tokens\":$MAX_TOKENS,\"repeat_penalty\":1.0}" \
     '{"type":"unload"}' \
   | env "${env_args[@]}" "$EXE" >"$log" 2>"$OUT_DIR/$name.err"
   local rc=$?

@@ -1421,6 +1421,7 @@ pub const GROUPED_BLOCK_M: usize = 16;
 pub struct GroupedKnobs {
     lloyd_4w_base: Option<bool>,
     arch_4w: bool,
+    i8_moe: bool,
     n32: bool,
     cnd: bool,
     eightw: bool,
@@ -1431,28 +1432,39 @@ pub struct GroupedKnobs {
 impl GroupedKnobs {
     pub fn read(gpu: &Gpu) -> Self {
         Self {
-            lloyd_4w_base: match std::env::var("HIPFIRE_DEEPSEEK4_MOE_LLOYD_4W").as_deref() {
+            lloyd_4w_base: match hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MOE_LLOYD_4W")
+                .as_deref()
+            {
                 Ok("0") => Some(false),
                 Ok("1") => Some(true),
                 _ => None,
             },
             arch_4w: gpu.arch.starts_with("gfx11") || gpu.arch.starts_with("gfx12"),
-            n32: std::env::var("HIPFIRE_DEEPSEEK4_MOE_N32").as_deref() == Ok("1"),
-            cnd: std::env::var("HIPFIRE_DEEPSEEK4_MOE_CND").as_deref() == Ok("1"),
-            eightw: std::env::var("HIPFIRE_DEEPSEEK4_MOE_8W").as_deref() == Ok("1"),
-            mmqload: std::env::var("HIPFIRE_DEEPSEEK4_MOE_MMQLOAD").as_deref() == Ok("1"),
-            nosync: std::env::var("HIPFIRE_DEEPSEEK4_MOE_NOSYNC").as_deref() == Ok("1"),
+            i8_moe: use_gfx1151_i8_moe(&gpu.arch),
+            n32: hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MOE_N32").as_deref() == Ok("1"),
+            cnd: hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MOE_CND").as_deref() == Ok("1"),
+            eightw: hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MOE_8W").as_deref() == Ok("1"),
+            mmqload: hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MOE_MMQLOAD").as_deref()
+                == Ok("1"),
+            nosync: hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MOE_NOSYNC").as_deref()
+                == Ok("1"),
         }
     }
 
-    /// Variant for a GEMM of shape (m, k). Mirrors the full-chunk path's
-    /// `use_lloyd_4w_* && ...` gating exactly.
+    /// Variant for a GEMM of shape (m, k). Must mirror the full-chunk path's
+    /// gating EXACTLY: if the banded path picks a different kernel than the
+    /// whole-chunk path, paged prefill stops being bit-identical to resident
+    /// and the neutrality gate fails for a reason that has nothing to do with
+    /// paging. The i8 gate is looser than 4w's (`m % 16` vs `m % 64`), so it
+    /// cannot be folded into the same predicate.
     pub fn variant(&self, m: usize, k: usize) -> GroupedLloydVariant {
+        let use_i8 = self.i8_moe && m % 16 == 0 && k % 256 == 0;
         let use_4w = self.lloyd_4w_base.unwrap_or(self.arch_4w) && m % 64 == 0 && k % 256 == 0;
         let use_mmqload = use_4w && self.mmqload;
         let use_nosync = use_mmqload && self.nosync;
         select_grouped_lloyd_variant(
             use_4w,
+            use_i8,
             self.n32,
             self.cnd,
             self.eightw,
