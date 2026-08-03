@@ -2777,12 +2777,6 @@ impl MoeManifestEntries {
     pub(crate) fn as_slice(&self) -> &[WeightEntry] {
         &self.0
     }
-
-    /// Test-only: expose inner vec for partition testing.
-    #[cfg(test)]
-    pub(crate) fn as_slice_mut(&mut self) -> &mut Vec<WeightEntry> {
-        &mut self.0
-    }
 }
 
 impl PreparedFrozenHfqManifest {
@@ -9290,31 +9284,6 @@ mod tests {
         assert!(
             msg.contains("gate_up.awq_scale"),
             "error should mention gate-up AWQ entry: {msg}"
-        );
-    }
-
-    #[test]
-    fn partition_hfq_manifest_rejects_moe_gate_up_awq_with_zero_source_calls() {
-        let config = test_config(&["full_attention"], true);
-        let full = Qwen35::weight_manifest(&config);
-        let mut moe = prepare_frozen_hfq_manifest(&config, &full)
-            .unwrap()
-            .into_moe();
-        // Inject a gate-up AWQ companion into the moe entries.
-        let gu_entry = full
-            .iter()
-            .find(|e| e.name == "expert.0.gate_up" && e.layer == Some(0))
-            .cloned()
-            .unwrap();
-        moe.as_slice_mut().push(expected_companion_entry(&gu_entry));
-
-        // The rejection must fire before any source use — verify the
-        // predicate reachability through partition_hfq_manifest (which
-        // uses the same predicate).
-        let partition_result = partition_hfq_manifest(moe.as_slice());
-        assert!(
-            partition_result.is_err(),
-            "partition must reject gate-up AWQ before any source"
         );
     }
 

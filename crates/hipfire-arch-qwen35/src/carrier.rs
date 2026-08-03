@@ -237,8 +237,8 @@ impl BundleBuildTransaction {
             scratch: self.scratch.take().expect("transaction: scratch missing"),
             kv_cache: self.kv_cache.take().expect("transaction: KV cache missing"),
             dn_state: self.dn_state.take().expect("transaction: DN state missing"),
-            // The build transaction never allocates an MTP head — it is
-            // folded in post-load by the loader (see Qwen35Bundle::mtp_head).
+            // This transaction does not construct an MTP head — the
+            // bundle is built with `mtp_head = None`.
             mtp_head: None,
             pipeline: None,
         }
