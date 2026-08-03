@@ -1560,6 +1560,15 @@ pub fn decode_step_with_graph(
         let a = gpu.arch.as_str();
         a.starts_with("gfx11") || a.starts_with("gfx12")
     });
+    // Routed-expert paging is incompatible with graph capture, and not
+    // marginally so: it does a d2h of the routing, host file I/O, and an h2d
+    // of the pointer table INSIDE the layer body, every layer, every token.
+    // A captured graph would bake one token's residency and replay it for
+    // every later token, silently computing with whichever experts happened
+    // to be resident at capture. (The same hazard is why the hash-routed d2h
+    // was removed in bc6353e — see the note below.) Forcing the direct path
+    // costs replay speed and buys correctness.
+    let graph_on = graph_on && weights.expert_paging.is_none();
     // Note: prior to bc6353e the hash-routed MoE path did a d2h of
     // router scores inside the layer body — that broke HIP graph
     // capture. Replaced by `hash_router_normalize_f32_buf` which
@@ -3345,6 +3354,7 @@ pub fn mtp_forward_batched(
         /*hash_routing=*/ false,
         n,
         tokens_dummy,
+        None,
     )?;
     hc_ffn_mix_batched(cfg, pbs, gpu, n)?;
 
@@ -3533,6 +3543,72 @@ fn ffn_stub(
 ///     up_e   = w3[idx] @ x                  ← clamp to ±swiglu_limit (skipped)
 ///     e_out  = w2[idx] @ (silu(gate_e) * up_e * w)
 ///     ffn_out += e_out * routed_scaling_factor
+///
+/// Fill this layer's paged routed-expert slots before its MoE dispatch.
+///
+/// No-op — and no cost beyond an `Option` check — unless
+/// `HIPFIRE_DEEPSEEK4_EXPERT_CACHE_GB` engaged paging at load, and a no-op for
+/// layers left fully resident (the MTP head, DSpark stages).
+///
+/// `route` must leave the routed expert ids in `topk_indices`; it is called
+/// only when paging is on, because the resident path lets the MoE family do
+/// its own routing. `count` is how many ids to read: `k_top` for one token,
+/// `k_top * batch` for a prefill window.
+fn page_routed_experts<F>(
+    weights: &DeepseekV4Weights,
+    layer: &crate::deepseek4::DeepseekV4LayerWeights,
+    layer_idx: usize,
+    gpu: &mut Gpu,
+    count: usize,
+    n_exp: usize,
+    route: F,
+    topk_indices: &GpuTensor,
+) -> Result<(), String>
+where
+    F: FnOnce(&mut Gpu) -> Result<(), String>,
+{
+    let Some(paging) = weights.expert_paging.as_ref() else {
+        return Ok(());
+    };
+    let mut p = paging
+        .lock()
+        .map_err(|_| format!("ffn l{layer_idx}: expert pager mutex poisoned"))?;
+    if !p.pages_layer(layer_idx as u16) {
+        return Ok(());
+    }
+    route(gpu)?;
+    let gate_up_blob = layer
+        .expert_gate_up_blob
+        .as_ref()
+        .ok_or_else(|| format!("ffn l{layer_idx}: paged gate_up pool missing"))?;
+    let gate_up_ptrs = layer
+        .expert_gate_up_ptrs
+        .as_ref()
+        .ok_or_else(|| format!("ffn l{layer_idx}: paged gate_up ptr table missing"))?;
+    let w2_blob = layer
+        .expert_w2_blob
+        .as_ref()
+        .ok_or_else(|| format!("ffn l{layer_idx}: paged w2 pool missing"))?;
+    let w2_ptrs = layer
+        .expert_w2_ptrs
+        .as_ref()
+        .ok_or_else(|| format!("ffn l{layer_idx}: paged w2 ptr table missing"))?;
+    p.page_dispatch(
+        layer_idx as u16,
+        topk_indices,
+        count,
+        n_exp,
+        gate_up_blob,
+        gate_up_ptrs,
+        layer.expert_gate_up_stride,
+        w2_blob,
+        w2_ptrs,
+        layer.expert_w2_stride,
+        gpu,
+    )
+    .map_err(|e| format!("ffn l{layer_idx}: {e}"))
+}
+
 fn ffn_routed(
     cfg: &DeepseekV4Config,
     weights: &DeepseekV4Weights,
@@ -3639,6 +3715,34 @@ fn ffn_routed(
         let up_batch = state.moe_up_batch.as_ref().unwrap();
         let rot_batch = state.moe_rot_batch.as_ref().unwrap();
         let down_expanded = state.moe_down_expert_outputs.as_ref().unwrap();
+
+        // Routed-expert paging: the family's first step is the bias-aware
+        // top-k, but a paged blob has to be FILLED before the expert GEMVs
+        // read it, so run that top-k here to learn the routing, page the
+        // experts in, and let the family re-run it. The kernel is tiny and
+        // deterministic — same scores and bias in, same indices out — so the
+        // duplicate launch costs a little time and changes nothing.
+        page_routed_experts(
+            weights,
+            layer,
+            layer_idx,
+            gpu,
+            k_top,
+            cfg.n_routed_experts,
+            |gpu| {
+                gpu.deepseek4_moe_topk_bias_aware_f32(
+                    scores_dev,
+                    bias_dev,
+                    topk_idx_dev,
+                    topk_w_dev,
+                    cfg.n_routed_experts as i32,
+                    k_top as i32,
+                    route_scale_override,
+                )
+                .map_err(|e| format!("paged topk l{layer_idx}: {e:?}"))
+            },
+            topk_idx_dev,
+        )?;
 
         // Bias-aware top-k select + the routed MQ2-Lloyd experts now run through
         // the centralized MoE family (Ship 4.3): bias-aware top-k -> indexed
@@ -3843,6 +3947,20 @@ fn ffn_hash_routed(
         gpu.memcpy_htod_auto(&topk_w_dev.buf, &w_bytes)
             .map_err(|e| format!("htod topk_weights hash l{layer_idx}: {e:?}"))?;
     }
+
+    // Routed-expert paging. Routing already ran above and left the ids in
+    // `topk_idx_dev`, so unlike the score-routed path there is nothing to
+    // re-run here — just page what it selected.
+    page_routed_experts(
+        weights,
+        layer,
+        layer_idx,
+        gpu,
+        k_top,
+        n_exp,
+        |_gpu| Ok(()),
+        topk_idx_dev,
+    )?;
 
     let gate_up_ptrs = layer.expert_gate_up_ptrs.as_ref().unwrap();
     let w2_ptrs = layer.expert_w2_ptrs.as_ref().unwrap();
@@ -7328,6 +7446,7 @@ fn attention_block_batched_mixed(
 /// DeepSeek V4's hash routing uses static tid2eid lookup which is skipped at
 /// quant time per the load_weights logic; falls back to shared-only.
 #[allow(dead_code)]
+#[allow(clippy::too_many_arguments)]
 fn ffn_batched(
     cfg: &DeepseekV4Config,
     layer: &crate::deepseek4::DeepseekV4LayerWeights,
@@ -7337,6 +7456,9 @@ fn ffn_batched(
     hash_routing: bool,
     batch_size: usize,
     tokens: &[u32],
+    // Routed-expert pager, or `None` for a fully-resident layer. The MTP head
+    // and DSpark stages are never paged, so they pass `None` unconditionally.
+    paging: Option<&std::sync::Mutex<crate::expert_pager::Ds4ExpertPaging>>,
 ) -> Result<(), String> {
     let ffn_norm = layer.ffn_norm.as_ref().unwrap();
     let shared_w1 = layer.shared_w1.as_ref().unwrap();
@@ -7515,6 +7637,37 @@ fn ffn_batched(
         hipfire_dispatch::families::moe::MoePrefillRouting::BiasAware { gate_bias }
     };
 
+    // Routed-expert paging: a prefill chunk routes to far more experts than a
+    // bounded pool holds, so run the MoE over contiguous token windows whose
+    // expert union fits. Each window is a row range of the batch tensors, so
+    // it is a `sub_offset` view and its rows compute exactly what they would
+    // have computed inside the full batch.
+    if let Some(paging) = paging {
+        let paged = {
+            let p = paging
+                .lock()
+                .map_err(|_| format!("ffn_batched l{layer_idx}: expert pager mutex poisoned"))?;
+            p.pages_layer(layer_idx as u16)
+        };
+        if paged {
+            return ffn_batched_routed_paged(
+                paging,
+                layer,
+                pbs,
+                gpu,
+                layer_idx,
+                &routing,
+                hidden,
+                im,
+                n_exp,
+                k_top,
+                batch_size,
+                route_scale,
+                cfg.swiglu_limit,
+            );
+        }
+    }
+
     let moe_params = hipfire_dispatch::families::moe::MoeBiasAwarePrefillParams {
         hidden,
         mi: im,
@@ -7548,6 +7701,173 @@ fn ffn_batched(
         .run_bias_aware_prefill(gpu, &moe_params)
         .map_err(|e| format!("ffn_batched l{layer_idx} dispatch: {e}"))?;
 
+    Ok(())
+}
+
+/// Routed-expert MoE for one prefill chunk with paging on.
+///
+/// Routes the whole chunk once to learn the assignment, splits it into
+/// contiguous token windows whose expert union fits the slot pool, then runs
+/// the unchanged prefill MoE per window over `sub_offset` views.
+///
+/// Neutrality note: the family picks grouped-GEMM vs scalar K4 on
+/// `batch_size >= HIPFIRE_DEEPSEEK4_MOE_GROUPED_GATE` (default 128). Windows
+/// are usually smaller than a full chunk, so a paged run can land on the
+/// scalar path where a resident run took the grouped one. Those are different
+/// kernels and may differ in the low bits. Pin the threshold across both runs
+/// when comparing them — which is what `scripts/paging-neutrality-gate.sh`
+/// does.
+#[allow(clippy::too_many_arguments)]
+fn ffn_batched_routed_paged(
+    paging: &std::sync::Mutex<crate::expert_pager::Ds4ExpertPaging>,
+    layer: &crate::deepseek4::DeepseekV4LayerWeights,
+    pbs: &PrefillBatchScratch,
+    gpu: &mut Gpu,
+    layer_idx: usize,
+    routing: &hipfire_dispatch::families::moe::MoePrefillRouting,
+    hidden: usize,
+    im: usize,
+    n_exp: usize,
+    k_top: usize,
+    batch_size: usize,
+    route_scale: f32,
+    swiglu_limit: f32,
+) -> Result<(), String> {
+    use hipfire_dispatch::families::moe::MoePrefillRouting;
+
+    // 1. Route the whole chunk. The family repeats this per window from the
+    //    same scores, so the assignment it acts on is the one read here.
+    match routing {
+        MoePrefillRouting::Hash { tid2eid, tokens } => gpu
+            .hash_router_normalize_f32_batched(
+                tid2eid,
+                &pbs.moe_scores_batch,
+                tokens,
+                &pbs.moe_topk_indices_batch,
+                &pbs.moe_topk_weights_batch,
+                n_exp as i32,
+                k_top as i32,
+                route_scale,
+                batch_size as i32,
+            )
+            .map_err(|e| format!("paged prefill hash route l{layer_idx}: {e:?}"))?,
+        MoePrefillRouting::BiasAware { gate_bias } => gpu
+            .deepseek4_moe_topk_bias_aware_batched_f32(
+                &pbs.moe_scores_batch,
+                gate_bias,
+                &pbs.moe_topk_indices_batch,
+                &pbs.moe_topk_weights_batch,
+                n_exp as i32,
+                k_top as i32,
+                route_scale,
+                batch_size as i32,
+            )
+            .map_err(|e| format!("paged prefill bias-aware route l{layer_idx}: {e:?}"))?,
+    }
+
+    // 2. Read the assignment and plan windows.
+    let mut p = paging
+        .lock()
+        .map_err(|_| format!("ffn_batched l{layer_idx}: expert pager mutex poisoned"))?;
+    let topk: Vec<u16> = p
+        .read_topk(&pbs.moe_topk_indices_batch, batch_size * k_top, n_exp, gpu)
+        .map_err(|e| format!("paged prefill l{layer_idx}: {e}"))?
+        .to_vec();
+    let windows =
+        crate::expert_pager::plan_prefill_windows(&topk, batch_size, k_top, p.slots_per_blob())
+            .map_err(|e| format!("paged prefill l{layer_idx}: {e}"))?;
+
+    let gate_up_blob = layer
+        .expert_gate_up_blob
+        .as_ref()
+        .ok_or_else(|| format!("ffn_batched l{layer_idx}: paged gate_up pool missing"))?;
+    let gate_up_ptrs = layer
+        .expert_gate_up_ptrs
+        .as_ref()
+        .ok_or_else(|| format!("ffn_batched l{layer_idx}: paged gate_up ptr table missing"))?;
+    let w2_blob = layer
+        .expert_w2_blob
+        .as_ref()
+        .ok_or_else(|| format!("ffn_batched l{layer_idx}: paged w2 pool missing"))?;
+    let w2_ptrs = layer
+        .expert_w2_ptrs
+        .as_ref()
+        .ok_or_else(|| format!("ffn_batched l{layer_idx}: paged w2 ptr table missing"))?;
+
+    // 3. Page each window's union, then run the unchanged prefill MoE on it.
+    for (start, len) in windows {
+        let union = crate::expert_pager::window_expert_union(&topk, start, len, k_top);
+        p.page_experts_both(
+            layer_idx as u16,
+            &union,
+            gate_up_blob,
+            gate_up_ptrs,
+            layer.expert_gate_up_stride,
+            w2_blob,
+            w2_ptrs,
+            layer.expert_w2_stride,
+            gpu,
+        )
+        .map_err(|e| format!("ffn_batched l{layer_idx}: {e}"))?;
+
+        let scores_w = pbs.moe_scores_batch.sub_offset(start * n_exp, len * n_exp);
+        let idx_w = pbs
+            .moe_topk_indices_batch
+            .sub_offset(start * k_top, len * k_top);
+        let w_w = pbs
+            .moe_topk_weights_batch
+            .sub_offset(start * k_top, len * k_top);
+        let x_w = pbs.ffn_x_rot_batch.sub_offset(start * hidden, len * hidden);
+        let out_w = pbs.ffn_out_batch.sub_offset(start * hidden, len * hidden);
+        let tokens_w;
+        let routing_w = match routing {
+            MoePrefillRouting::Hash { tid2eid, tokens } => {
+                tokens_w = tokens.sub_offset(start, len);
+                MoePrefillRouting::Hash {
+                    tid2eid,
+                    tokens: &tokens_w,
+                }
+            }
+            MoePrefillRouting::BiasAware { gate_bias } => {
+                MoePrefillRouting::BiasAware { gate_bias }
+            }
+        };
+
+        let params = hipfire_dispatch::families::moe::MoeBiasAwarePrefillParams {
+            hidden,
+            mi: im,
+            n_exp,
+            k_top,
+            batch_size: len,
+            route_scale,
+            swiglu_limit,
+            layer_idx,
+            routing: routing_w,
+            scores: &scores_w,
+            topk_indices: &idx_w,
+            topk_weights: &w_w,
+            expert_gate_up_ptrs: gate_up_ptrs,
+            expert_down_ptrs: w2_ptrs,
+            x_rot: &x_w,
+            ffn_out: &out_w,
+            // Scratch is sized for the whole chunk and indexed from row 0
+            // within a dispatch, so a window reuses the same buffers.
+            expert_token_counts: &pbs.moe_expert_token_counts,
+            expert_offsets: &pbs.moe_expert_offsets,
+            sorted_slot_index: &pbs.moe_sorted_slot_index,
+            expert_tile_ids: &pbs.moe_expert_tile_ids,
+            inverse_perm: &pbs.moe_inverse_perm,
+            y_gate_up_grouped: &pbs.moe_y_gate_up_grouped,
+            y_down_grouped: &pbs.moe_y_down_grouped,
+            gate_batch: &pbs.moe_gate_batch,
+            up_batch: &pbs.moe_up_batch,
+            rot_batch: &pbs.moe_rot_batch,
+            down_expert_outputs: &pbs.moe_down_expert_outputs,
+        };
+        hipfire_runtime::llama::moe_family()
+            .run_bias_aware_prefill(gpu, &params)
+            .map_err(|e| format!("ffn_batched l{layer_idx} paged window dispatch: {e}"))?;
+    }
     Ok(())
 }
 
@@ -8633,7 +8953,17 @@ pub fn forward_prefill_batch_chunk(
             dump_buf(gpu, "09_l0_mhc_pre_ffn_hc_x_in", &pbs.hc_x_in_batch);
         }
         let hash_routing = layer_idx < cfg.num_hash_layers;
-        ffn_batched(cfg, layer, pbs, gpu, layer_idx, hash_routing, n, tokens)?;
+        ffn_batched(
+            cfg,
+            layer,
+            pbs,
+            gpu,
+            layer_idx,
+            hash_routing,
+            n,
+            tokens,
+            weights.expert_paging.as_ref(),
+        )?;
         if layer_idx == 0 {
             dump_buf(gpu, "10_l0_ffn_out", &pbs.ffn_out_batch);
         }
@@ -9413,6 +9743,7 @@ pub fn dspark_forward(
                 /*hash_routing=*/ false,
                 block,
                 &[],
+                None,
             )?;
             hc_ffn_mix_batched(cfg, pbs, gpu, block)?;
         }
@@ -9634,7 +9965,7 @@ pub fn dspark_run_body_and_hc_gate(
         {
             let pbs = state.dspark_pbs.as_ref().unwrap();
             mhc_pre_batched(cfg, layer, pbs, gpu, s, false, block)?;
-            ffn_batched(cfg, layer, pbs, gpu, s, false, block, &[])?;
+            ffn_batched(cfg, layer, pbs, gpu, s, false, block, &[], None)?;
             hc_ffn_mix_batched(cfg, pbs, gpu, block)?;
         }
     }

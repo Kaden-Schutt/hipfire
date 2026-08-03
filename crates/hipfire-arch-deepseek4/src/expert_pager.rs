@@ -606,6 +606,355 @@ impl Ds4PagingRuntime {
     }
 }
 
+/// The GPU-touching half of paging: owns the transport and every scratch
+/// buffer, so a cache miss on the forward path allocates nothing.
+pub struct Ds4ExpertPaging {
+    rt: Ds4PagingRuntime,
+    transport: hipfire_runtime::weight_pager::PreadH2DTransport,
+    /// Scratch, all pre-sized at construction.
+    fills: Vec<SlotFill>,
+    experts: Vec<u16>,
+    ptr_bytes: Vec<u8>,
+    topk_bytes: Vec<u8>,
+}
+
+impl Ds4ExpertPaging {
+    /// `max_working_set` is the largest number of experts a single dispatch
+    /// can ask for (`k_top` for decode, the chunk union for prefill); scratch
+    /// is sized for it once so the forward path never grows a buffer.
+    pub fn new(
+        rt: Ds4PagingRuntime,
+        mut transport: hipfire_runtime::weight_pager::PreadH2DTransport,
+        n_exp: usize,
+        max_working_set: usize,
+        max_expert_bytes: usize,
+    ) -> Self {
+        transport.reserve_staging(max_expert_bytes);
+        Self {
+            rt,
+            transport,
+            fills: Vec::with_capacity(max_working_set),
+            experts: Vec::with_capacity(max_working_set),
+            ptr_bytes: vec![0u8; n_exp * 8],
+            topk_bytes: vec![0u8; max_working_set * 4],
+        }
+    }
+
+    pub fn runtime(&self) -> &Ds4PagingRuntime {
+        &self.rt
+    }
+
+    pub fn stats(&self) -> (u64, u64) {
+        self.rt.stats()
+    }
+
+    pub fn hit_rate(&self) -> f64 {
+        self.rt.hit_rate()
+    }
+
+    pub fn slots_per_blob(&self) -> usize {
+        self.rt.slots_per_blob()
+    }
+
+    /// Read `count` i32 top-k indices from a device buffer into a host Vec of
+    /// expert ids, clamped to the routed-expert range. Reuses scratch.
+    pub fn read_topk(
+        &mut self,
+        topk_indices: &rdna_compute::GpuTensor,
+        count: usize,
+        n_exp: usize,
+        gpu: &rdna_compute::Gpu,
+    ) -> Result<&[u16], String> {
+        let need = count * 4;
+        if self.topk_bytes.len() < need {
+            // Only reachable if a caller exceeds the max_working_set it
+            // declared at construction; grow rather than read out of bounds.
+            self.topk_bytes.resize(need, 0);
+        }
+        gpu.bind_thread().map_err(|e| format!("{e:?}"))?;
+        gpu.hip
+            .memcpy_dtoh(&mut self.topk_bytes[..need], &topk_indices.buf)
+            .map_err(|e| format!("d2h topk indices: {e:?}"))?;
+        self.experts.clear();
+        for c in self.topk_bytes[..need].chunks_exact(4) {
+            let v = i32::from_ne_bytes([c[0], c[1], c[2], c[3]]);
+            // A negative or out-of-range index would index outside the
+            // pointer table. Clamp exactly as the hash-router fallback does.
+            let e = v.clamp(0, n_exp as i32 - 1) as u16;
+            self.experts.push(e);
+        }
+        Ok(&self.experts)
+    }
+
+    /// Whether this layer's experts are paged. False for layers left fully
+    /// resident (the MTP head and any DSpark sidecar), which must take the
+    /// unchanged path.
+    pub fn pages_layer(&self, layer: u16) -> bool {
+        self.rt.shadow(layer, ExpertBlobRole::GateUp).is_some()
+    }
+
+    /// Page in everything one MoE dispatch needs: read the routed expert ids
+    /// from the device top-k buffer, make them resident in BOTH blobs, and
+    /// repoint both pointer tables.
+    ///
+    /// This is the whole forward-path contract. Call it after routing and
+    /// before the expert GEMVs; on return every routed expert of this layer is
+    /// resident and its table entry aims at the slot holding it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn page_dispatch(
+        &mut self,
+        layer: u16,
+        topk_indices: &rdna_compute::GpuTensor,
+        count: usize,
+        n_exp: usize,
+        gate_up_blob: &rdna_compute::GpuTensor,
+        gate_up_ptrs: &rdna_compute::GpuTensor,
+        gate_up_stride: usize,
+        w2_blob: &rdna_compute::GpuTensor,
+        w2_ptrs: &rdna_compute::GpuTensor,
+        w2_stride: usize,
+        gpu: &mut rdna_compute::Gpu,
+    ) -> Result<(), PagerError> {
+        self.read_topk(topk_indices, count, n_exp, gpu)
+            .map_err(|detail| PagerError::Read {
+                key: ExpertKey {
+                    layer,
+                    expert: 0,
+                    role: ExpertBlobRole::GateUp,
+                },
+                offset: 0,
+                len: count * 4,
+                detail,
+            })?;
+        // Move the id list out so `self` can be borrowed mutably below; put it
+        // back on every exit so the buffer is reused, never reallocated.
+        let experts = std::mem::take(&mut self.experts);
+        let r = self.page_experts_both(
+            layer,
+            &experts,
+            gate_up_blob,
+            gate_up_ptrs,
+            gate_up_stride,
+            w2_blob,
+            w2_ptrs,
+            w2_stride,
+            gpu,
+        );
+        self.experts = experts;
+        r
+    }
+
+    /// [`Ds4ExpertPaging::page_dispatch`] over a caller-supplied expert list —
+    /// used by prefill, which computes the union across a window of tokens
+    /// rather than reading one token's top-k.
+    #[allow(clippy::too_many_arguments)]
+    pub fn page_experts_both(
+        &mut self,
+        layer: u16,
+        experts: &[u16],
+        gate_up_blob: &rdna_compute::GpuTensor,
+        gate_up_ptrs: &rdna_compute::GpuTensor,
+        gate_up_stride: usize,
+        w2_blob: &rdna_compute::GpuTensor,
+        w2_ptrs: &rdna_compute::GpuTensor,
+        w2_stride: usize,
+        gpu: &mut rdna_compute::Gpu,
+    ) -> Result<(), PagerError> {
+        self.ensure_resident(
+            layer,
+            ExpertBlobRole::GateUp,
+            experts,
+            gate_up_blob,
+            gate_up_ptrs,
+            gate_up_stride,
+            gpu,
+        )?;
+        self.ensure_resident(
+            layer,
+            ExpertBlobRole::Down,
+            experts,
+            w2_blob,
+            w2_ptrs,
+            w2_stride,
+            gpu,
+        )
+    }
+
+    /// Make every expert in `experts` resident in this (layer, role) blob and
+    /// repoint the device pointer table at their slots.
+    ///
+    /// Allocation-free: slots are reused in place and every buffer is scratch
+    /// sized at construction. Any read failure is reported with layer, expert
+    /// and file offset rather than leaving a stale or zeroed expert behind.
+    #[allow(clippy::too_many_arguments)]
+    pub fn ensure_resident(
+        &mut self,
+        layer: u16,
+        role: ExpertBlobRole,
+        experts: &[u16],
+        blob: &rdna_compute::GpuTensor,
+        ptr_table: &rdna_compute::GpuTensor,
+        stride: usize,
+        gpu: &mut rdna_compute::Gpu,
+    ) -> Result<(), PagerError> {
+        use hipfire_runtime::weight_pager::Transport;
+
+        let base = blob.buf.as_ptr() as u64;
+        // Move scratch out so `self.rt` can borrow mutably alongside it.
+        let mut fills = std::mem::take(&mut self.fills);
+        let plan = self
+            .rt
+            .plan_dispatch(layer, role, experts, stride, base, &mut fills);
+        if let Err(e) = plan {
+            self.fills = fills;
+            return Err(e);
+        }
+        for f in &fills {
+            if !f.needs_read {
+                continue;
+            }
+            // Copy the segment list out (max 2: w1 ‖ w3) so the catalog borrow
+            // ends before the transport borrow begins.
+            let mut segbuf = [ExpertSegment { offset: 0, len: 0 }; 2];
+            let n_seg = {
+                let segs = match self.rt.segments_for(f.key) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        self.fills = fills;
+                        return Err(e);
+                    }
+                };
+                let n = segs.len().min(segbuf.len());
+                segbuf[..n].copy_from_slice(&segs[..n]);
+                n
+            };
+            let mut dst = f.slot * stride;
+            for seg in &segbuf[..n_seg] {
+                if let Err(e) = self
+                    .transport
+                    .fetch_into(seg.offset, seg.len, blob, dst, gpu)
+                {
+                    let err = PagerError::Read {
+                        key: f.key,
+                        offset: seg.offset,
+                        len: seg.len,
+                        detail: format!("{e:?}"),
+                    };
+                    self.fills = fills;
+                    return Err(err);
+                }
+                dst += seg.len;
+            }
+        }
+        self.fills = fills;
+
+        // Publish the patched table. Uploaded as native u64 bytes, exactly the
+        // encoding the loader writes — the kernel reinterprets each u64 as two
+        // F32 slots (pinned by `ptr_table_u64_bytes_match_the_f32_slot_encoding`).
+        let shadow = self
+            .rt
+            .shadow(layer, role)
+            .ok_or(PagerError::NotCatalogued {
+                key: ExpertKey {
+                    layer,
+                    expert: 0,
+                    role,
+                },
+            })?;
+        self.ptr_bytes.clear();
+        for p in shadow {
+            self.ptr_bytes.extend_from_slice(&p.to_ne_bytes());
+        }
+        gpu.memcpy_htod_auto(&ptr_table.buf, &self.ptr_bytes)
+            .map_err(|e| PagerError::Read {
+                key: ExpertKey {
+                    layer,
+                    expert: 0,
+                    role,
+                },
+                offset: 0,
+                len: self.ptr_bytes.len(),
+                detail: format!("pointer-table upload: {e:?}"),
+            })?;
+        Ok(())
+    }
+}
+
+/// Split a prefill chunk into token windows whose routed-expert union fits the
+/// slot pool.
+///
+/// A prefill chunk of B tokens routes to up to `B * k_top` distinct experts,
+/// far more than a bounded pool holds, so the MoE dispatch runs one window at
+/// a time. Windows are greedy and contiguous, which keeps each one a plain
+/// row range of the batch tensors (so a window is a `sub_offset` view, not a
+/// gather) — and contiguity is what makes a window's output identical to the
+/// same rows inside the full batch.
+///
+/// Returns `(start, len)` pairs covering `0..batch`. Errors only if one single
+/// token needs more slots than exist, which `plan_slots`' floor already rules
+/// out at load.
+pub fn plan_prefill_windows(
+    topk: &[u16],
+    batch: usize,
+    k_top: usize,
+    slots: usize,
+) -> Result<Vec<(usize, usize)>, PagerError> {
+    let mut windows = Vec::new();
+    let mut start = 0usize;
+    while start < batch {
+        let mut union: Vec<u16> = Vec::with_capacity(slots);
+        let mut end = start;
+        while end < batch {
+            let row = &topk[end * k_top..(end + 1) * k_top];
+            let mut added: Vec<u16> = Vec::new();
+            for &e in row {
+                if !union.contains(&e) && !added.contains(&e) {
+                    added.push(e);
+                }
+            }
+            if union.len() + added.len() > slots {
+                break;
+            }
+            union.extend_from_slice(&added);
+            end += 1;
+        }
+        if end == start {
+            // One token alone exceeds the pool. plan_slots' floor makes this
+            // unreachable, but fail closed rather than loop forever.
+            let distinct = {
+                let row = &topk[start * k_top..(start + 1) * k_top];
+                let mut u: Vec<u16> = Vec::new();
+                for &e in row {
+                    if !u.contains(&e) {
+                        u.push(e);
+                    }
+                }
+                u.len()
+            };
+            return Err(PagerError::Sizing(PagerSizingError::BelowMinimum {
+                needed_slots: distinct,
+                got_slots: slots,
+            }));
+        }
+        windows.push((start, end - start));
+        start = end;
+    }
+    Ok(windows)
+}
+
+/// Distinct routed experts across a window of tokens, in first-seen order.
+pub fn window_expert_union(topk: &[u16], start: usize, len: usize, k_top: usize) -> Vec<u16> {
+    let mut u: Vec<u16> = Vec::new();
+    for t in start..start + len {
+        for &e in &topk[t * k_top..(t + 1) * k_top] {
+            if !u.contains(&e) {
+                u.push(e);
+            }
+        }
+    }
+    u
+}
+
 /// Environment knob that turns paging on. Unset (or unparseable, or `0`) keeps
 /// today's fully-resident behaviour.
 pub const EXPERT_CACHE_GB_ENV: &str = "HIPFIRE_DEEPSEEK4_EXPERT_CACHE_GB";
@@ -960,6 +1309,28 @@ mod tests {
     }
 
     #[test]
+    fn ptr_table_u64_bytes_match_the_f32_slot_encoding() {
+        // `ensure_resident` uploads the u64 shadow as native bytes, which is
+        // what the loader writes; the kernel reads it as two F32 slots per
+        // pointer. Those must be the same bytes, or every paged pointer is
+        // garbage. (True on little-endian, which the loader already assumes.)
+        let ptrs: [u64; 3] = [0x7f00_0000_1000, 0, u64::MAX];
+        let mut via_u64 = Vec::new();
+        for p in &ptrs {
+            via_u64.extend_from_slice(&p.to_ne_bytes());
+        }
+        let mut slots = vec![0f32; ptrs.len() * 2];
+        for (e, &p) in ptrs.iter().enumerate() {
+            encode_ptr_slots(&mut slots, e, p);
+        }
+        let mut via_f32 = Vec::new();
+        for s in &slots {
+            via_f32.extend_from_slice(&s.to_ne_bytes());
+        }
+        assert_eq!(via_u64, via_f32);
+    }
+
+    #[test]
     fn layers_do_not_share_pointer_tables() {
         let mut rt = runtime_with(8, 4, &[0, 1]);
         let mut out = Vec::new();
@@ -971,6 +1342,77 @@ mod tests {
             0,
             "layer 0 dispatch leaked into layer 1's table"
         );
+    }
+
+    #[test]
+    fn prefill_windows_cover_every_token_exactly_once() {
+        // 10 tokens, k=2, distinct experts everywhere: 20 distinct ids and a
+        // pool of 6 forces several windows. Coverage must still be exact —
+        // a dropped or repeated token is a silently wrong prefill.
+        let k = 2usize;
+        let topk: Vec<u16> = (0..20u16).collect();
+        let w = plan_prefill_windows(&topk, 10, k, 6).expect("plans");
+        assert!(w.len() > 1, "expected several windows, got {w:?}");
+        let mut next = 0usize;
+        for &(start, len) in &w {
+            assert_eq!(start, next, "windows must be contiguous: {w:?}");
+            assert!(len > 0);
+            next = start + len;
+        }
+        assert_eq!(next, 10, "windows must cover the whole batch");
+    }
+
+    #[test]
+    fn prefill_windows_never_exceed_the_pool() {
+        let k = 3usize;
+        let slots = 5usize;
+        // Deliberately churny routing so unions grow fast.
+        let topk: Vec<u16> = (0..36u16).map(|i| (i * 7) % 32).collect();
+        let batch = topk.len() / k;
+        let w = plan_prefill_windows(&topk, batch, k, slots).expect("plans");
+        for &(start, len) in &w {
+            let u = window_expert_union(&topk, start, len, k);
+            assert!(
+                u.len() <= slots,
+                "window ({start},{len}) needs {} slots, pool has {slots}",
+                u.len()
+            );
+        }
+    }
+
+    #[test]
+    fn prefill_windows_take_the_whole_batch_when_it_fits() {
+        // A generous pool must not fragment the batch — fragmenting costs
+        // grouped-GEMM efficiency for nothing.
+        let k = 2usize;
+        let topk: Vec<u16> = vec![1, 2, 1, 2, 3, 1, 2, 3];
+        let w = plan_prefill_windows(&topk, 4, k, 64).expect("plans");
+        assert_eq!(w, vec![(0, 4)]);
+    }
+
+    #[test]
+    fn prefill_windows_fail_closed_when_one_token_cannot_fit() {
+        // 4 distinct experts for one token, 3 slots: no window can be formed.
+        // Must error rather than emit a zero-length window and spin forever.
+        let topk: Vec<u16> = vec![1, 2, 3, 4];
+        let err = plan_prefill_windows(&topk, 1, 4, 3).expect_err("must fail closed");
+        assert!(
+            matches!(
+                err,
+                PagerError::Sizing(PagerSizingError::BelowMinimum {
+                    needed_slots: 4,
+                    got_slots: 3
+                })
+            ),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn window_union_is_first_seen_order_without_duplicates() {
+        let topk: Vec<u16> = vec![5, 5, 2, 2, 5, 9];
+        let u = window_expert_union(&topk, 0, 3, 2);
+        assert_eq!(u, vec![5, 2, 9]);
     }
 
     #[test]

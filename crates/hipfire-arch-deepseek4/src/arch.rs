@@ -368,6 +368,77 @@ impl DeepseekV4 {
         Ok(())
     }
 
+    /// Allocate a BOUNDED routed-expert slot pool for one layer instead of
+    /// uploading all `n_exp` experts (the paged path — see
+    /// `crates/hipfire-arch-deepseek4/src/expert_pager.rs`).
+    ///
+    /// Same blob + pointer-table layout as `upload_layer_routed_experts`, but
+    /// the blobs hold `slots` cache entries rather than `n_exp` experts, and
+    /// nothing is read from the file here: every slot is filled on demand by
+    /// the pager. Slots start zeroed and every pointer aims at slot 0, which is
+    /// a valid in-blob address; the pager repoints each routed expert before
+    /// every dispatch, so a load-time entry is never dereferenced.
+    ///
+    /// Returns `(gate_up_stride, w2_stride)` so the caller can size scratch.
+    fn alloc_paged_layer_expert_pool(
+        hfq: &HfqFile,
+        gpu: &mut Gpu,
+        prefix: &str,
+        n_exp: usize,
+        slots: usize,
+        layer: &mut DeepseekV4LayerWeights,
+        keep: Option<&[u32]>,
+    ) -> Result<(usize, usize), String> {
+        let src = |slot: usize| -> usize { keep.map(|k| k[slot] as usize).unwrap_or(slot) };
+        let stride_of = |part: &str| -> Result<usize, String> {
+            let name = format!("{prefix}.ffn.experts.{}.{part}.weight", src(0));
+            hfq.find_tensor_info(&name)
+                .map(|i| i.data_size)
+                .ok_or_else(|| format!("deepseek4: missing {name}"))
+        };
+        let w2_stride = stride_of("w2")?;
+        let stride_w1 = stride_of("w1")?;
+        let stride_w3 = stride_of("w3")?;
+        if stride_w1 != stride_w3 {
+            return Err(format!(
+                "deepseek4: {prefix} w1/w3 stride mismatch: w1={stride_w1} w3={stride_w3}"
+            ));
+        }
+        let gate_up_stride = stride_w1 + stride_w3;
+
+        let mut alloc_pool =
+            |stride: usize, what: &str| -> Result<rdna_compute::GpuTensor, String> {
+                let zeros = vec![0u8; slots * stride];
+                gpu.upload_raw(&zeros, &[slots, stride])
+                    .map_err(|e| format!("deepseek4: alloc paged {what} pool {prefix}: {e:?}"))
+            };
+        let w2_blob = alloc_pool(w2_stride, "w2")?;
+        let gate_up_blob = alloc_pool(gate_up_stride, "gate_up")?;
+
+        let mut upload_ptrs = |base: u64,
+                               what: &str,
+                               gpu: &mut Gpu|
+         -> Result<rdna_compute::GpuTensor, String> {
+            let ptr_bytes: Vec<u8> = (0..n_exp).flat_map(|_| base.to_ne_bytes()).collect();
+            let t = gpu
+                .alloc_tensor(&[2 * n_exp], rdna_compute::DType::F32)
+                .map_err(|e| format!("deepseek4: alloc paged {what} ptr table {prefix}: {e:?}"))?;
+            gpu.hip
+                .memcpy_htod(&t.buf, &ptr_bytes)
+                .map_err(|e| format!("deepseek4: copy paged {what} ptr table {prefix}: {e:?}"))?;
+            Ok(t)
+        };
+        let w2_base = w2_blob.buf.as_ptr() as u64;
+        let gate_up_base = gate_up_blob.buf.as_ptr() as u64;
+        layer.expert_w2_ptrs = Some(upload_ptrs(w2_base, "w2", gpu)?);
+        layer.expert_gate_up_ptrs = Some(upload_ptrs(gate_up_base, "gate_up", gpu)?);
+        layer.expert_w2_blob = Some(w2_blob);
+        layer.expert_w2_stride = w2_stride;
+        layer.expert_gate_up_blob = Some(gate_up_blob);
+        layer.expert_gate_up_stride = gate_up_stride;
+        Ok((gate_up_stride, w2_stride))
+    }
+
     /// Upload an F16-on-disk HFQ tensor as F32 on GPU. Used for norms
     /// where the kernel side (rmsnorm_f32) expects F32 weight, but the
     /// quantizer stored F16 bytes. The conversion cost is one host-side
@@ -625,6 +696,7 @@ impl DeepseekV4 {
             layers,
             mtp_layer: None, // skipped by quantize per `mtp.` prefix; Phase 5 work.
             dspark: None,    // DSpark sidecar discovered+loaded in load_weights_inner.
+            expert_paging: None,
             _scaffold: (),
         })
     }
@@ -1349,6 +1421,104 @@ impl DeepseekV4 {
         // pages as soon as they're consumed. Host peak per layer ≈
         // stride_w1 × n_exp + stride_w2 × n_exp ≈ 1.2 GB — bounded,
         // well below the pressure threshold.
+        // Routed-expert PAGING (default OFF). With
+        // `HIPFIRE_DEEPSEEK4_EXPERT_CACHE_GB` set, the main layers get a
+        // bounded slot pool instead of all `n_routed_experts`, and experts are
+        // read from the HFQ on demand. Sizing happens HERE, after every
+        // non-routed weight is already uploaded, so MemAvailable at this point
+        // has the rest of the model subtracted from it — the remaining
+        // reservation is just KV/scratch plus headroom.
+        //
+        // Scope: the main `weights.layers` only. The MTP head and any DSpark
+        // sidecar stay fully resident — they are a rounding error next to 43
+        // layers of experts, and the sidecar lives in a different file, which
+        // would need a second transport.
+        let paged_layers: Vec<usize> = if upload_experts {
+            (0..weights.layers.len())
+                .filter(|&l| expert_layer_end.is_none_or(|end| l < end))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let configured_cache = crate::expert_pager::expert_cache_budget_bytes(
+            std::env::var(crate::expert_pager::EXPERT_CACHE_GB_ENV)
+                .ok()
+                .as_deref(),
+        );
+        let mut paging_plan: Option<crate::expert_pager::SlotPlan> = None;
+        if let Some(configured) = configured_cache {
+            if shard.is_some() {
+                return Err("deepseek4: expert paging and EP sharding are mutually \
+                            exclusive — the shard path aims non-owned experts at a \
+                            zeroed dummy, which paging must never leave in place"
+                    .into());
+            }
+            if paged_layers.is_empty() {
+                return Err(format!(
+                    "deepseek4: {} is set but no layers upload routed experts",
+                    crate::expert_pager::EXPERT_CACHE_GB_ENV
+                ));
+            }
+            let l0 = paged_layers[0];
+            let src0 = cfg
+                .reap_keep
+                .as_ref()
+                .and_then(|r| r.expert_plan(l0).keep())
+                .map(|k| k[0] as usize)
+                .unwrap_or(0);
+            let stride_of = |part: &str| -> Result<usize, String> {
+                let name = format!("layers.{l0}.ffn.experts.{src0}.{part}.weight");
+                hfq.find_tensor_info(&name)
+                    .map(|i| i.data_size)
+                    .ok_or_else(|| format!("deepseek4: missing {name}"))
+            };
+            let gate_up_stride = stride_of("w1")? + stride_of("w3")?;
+            let w2_stride = stride_of("w2")?;
+            // Reservation the pager does NOT own: KV/SWA caches, per-step
+            // scratch, and headroom. Non-routed weights are already resident,
+            // so they are not double-counted here.
+            let reserve_gb: u64 = std::env::var("HIPFIRE_DEEPSEEK4_EXPERT_CACHE_RESERVE_GB")
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+                .unwrap_or(8);
+            let auto = crate::expert_pager::auto_budget_bytes(
+                crate::expert_pager::mem_available_bytes().unwrap_or(configured),
+                reserve_gb * 1024 * 1024 * 1024,
+            );
+            let budget = crate::expert_pager::effective_budget_bytes(Some(configured), auto);
+            let mut plan = crate::expert_pager::plan_slots(
+                budget,
+                paged_layers.len(),
+                gate_up_stride,
+                w2_stride,
+                cfg.num_experts_per_tok,
+            )
+            .map_err(|e| format!("deepseek4: {e}"))?;
+            // Clamp to actual residency: more slots than experts wastes memory
+            // and, at equality, paging is pure overhead over the resident path.
+            if plan.slots_per_blob >= cfg.n_routed_experts {
+                eprintln!(
+                    "deepseek4: expert cache budget holds all {} experts — \
+                     loading fully resident, paging disabled.",
+                    cfg.n_routed_experts
+                );
+            } else {
+                plan.bytes = plan.slots_per_blob as u64
+                    * paged_layers.len() as u64
+                    * (gate_up_stride + w2_stride) as u64;
+                eprintln!(
+                    "deepseek4: expert paging ON — {} slots/blob over {} layers \
+                     ({:.1} GiB pool, {} experts on disk), budget {:.1} GiB.",
+                    plan.slots_per_blob,
+                    paged_layers.len(),
+                    plan.bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+                    cfg.n_routed_experts,
+                    budget as f64 / (1024.0 * 1024.0 * 1024.0),
+                );
+                paging_plan = Some(plan);
+            }
+        }
+
         if upload_experts {
             for (l, layer) in weights.layers.iter_mut().enumerate() {
                 let upload_this_layer = expert_layer_end.is_none_or(|end| l < end);
@@ -1357,6 +1527,18 @@ impl DeepseekV4 {
                 }
                 let n_exp = cfg.n_routed_experts;
                 let keep = cfg.reap_keep.as_ref().and_then(|r| r.expert_plan(l).keep());
+                if let Some(plan) = paging_plan {
+                    Self::alloc_paged_layer_expert_pool(
+                        hfq,
+                        gpu,
+                        &format!("layers.{l}"),
+                        n_exp,
+                        plan.slots_per_blob,
+                        layer,
+                        keep,
+                    )?;
+                    continue;
+                }
                 Self::upload_layer_routed_experts(
                     hfq,
                     gpu,
@@ -1367,6 +1549,90 @@ impl DeepseekV4 {
                     keep,
                 )?;
             }
+        }
+
+        // Build the pager now that every slot pool exists and its device base
+        // pointer is known. Catalog construction validates that every routed
+        // expert of every paged layer resolves at a uniform stride, so a hole
+        // is a LOAD failure rather than a wrong-weights read at first use.
+        if let Some(plan) = paging_plan {
+            let layer_prefixes: Vec<(u16, String)> = paged_layers
+                .iter()
+                .map(|&l| (l as u16, format!("layers.{l}")))
+                .collect();
+            // REAP keep-maps are per-layer, but the catalog takes one mapping.
+            // Reject a per-layer-varying keep-map rather than silently reading
+            // the wrong experts for some layers.
+            let keep0 = cfg
+                .reap_keep
+                .as_ref()
+                .and_then(|r| r.expert_plan(paged_layers[0]).keep())
+                .map(|k| k.to_vec());
+            for &l in &paged_layers {
+                let k = cfg
+                    .reap_keep
+                    .as_ref()
+                    .and_then(|r| r.expert_plan(l).keep())
+                    .map(|k| k.to_vec());
+                if k != keep0 {
+                    return Err(format!(
+                        "deepseek4: expert paging needs one keep-map for all layers, \
+                         but layer {l} differs from layer {}",
+                        paged_layers[0]
+                    ));
+                }
+            }
+            let catalog = crate::expert_pager::ExpertCatalog::build(
+                hfq,
+                &layer_prefixes,
+                cfg.n_routed_experts,
+                keep0.as_deref(),
+            )
+            .map_err(|e| format!("deepseek4: {e}"))?;
+            let mut initial_ptrs = Vec::with_capacity(paged_layers.len() * 2);
+            let mut max_expert_bytes = 0usize;
+            for &l in &paged_layers {
+                let lw = &weights.layers[l];
+                let gu = lw
+                    .expert_gate_up_blob
+                    .as_ref()
+                    .ok_or_else(|| format!("deepseek4: layer {l} paged gate_up pool missing"))?;
+                let w2 = lw
+                    .expert_w2_blob
+                    .as_ref()
+                    .ok_or_else(|| format!("deepseek4: layer {l} paged w2 pool missing"))?;
+                initial_ptrs.push((
+                    (l as u16, crate::expert_pager::ExpertBlobRole::GateUp),
+                    vec![gu.buf.as_ptr() as u64; cfg.n_routed_experts],
+                ));
+                initial_ptrs.push((
+                    (l as u16, crate::expert_pager::ExpertBlobRole::Down),
+                    vec![w2.buf.as_ptr() as u64; cfg.n_routed_experts],
+                ));
+                // The staging buffer must hold the largest SINGLE read, which
+                // is one w1/w3 half or one w2 — not a whole gate_up slot.
+                max_expert_bytes = max_expert_bytes
+                    .max(lw.expert_gate_up_stride / 2)
+                    .max(lw.expert_w2_stride);
+            }
+            let rt = crate::expert_pager::Ds4PagingRuntime::new(
+                crate::expert_pager::Ds4ExpertPager::new(plan.slots_per_blob),
+                catalog,
+                cfg.n_routed_experts,
+                initial_ptrs,
+            )
+            .map_err(|e| format!("deepseek4: {e}"))?;
+            let transport = hipfire_runtime::weight_pager::PreadH2DTransport::open(hfq.path())
+                .map_err(|e| format!("deepseek4: open {} for paging: {e}", hfq.path().display()))?;
+            weights.expert_paging = Some(std::sync::Mutex::new(
+                crate::expert_pager::Ds4ExpertPaging::new(
+                    rt,
+                    transport,
+                    cfg.n_routed_experts,
+                    plan.slots_per_blob,
+                    max_expert_bytes,
+                ),
+            ));
         }
 
         // Routed experts for the MTP layer (same upload logic, gated on
@@ -2065,6 +2331,7 @@ impl DeepseekV4 {
             layers,
             mtp_layer: None,
             dspark: None,
+            expert_paging: None,
             _scaffold: (),
         };
 

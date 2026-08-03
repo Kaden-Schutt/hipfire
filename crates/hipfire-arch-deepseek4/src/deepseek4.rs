@@ -797,6 +797,15 @@ pub struct DeepseekV4Weights {
     /// `<stem>-dspark.<ext>` sidecar. Additive to `mtp_layer` — both can be
     /// present. `None` when no DSpark sidecar exists (silent no-op).
     pub dspark: Option<DsparkWeights>,
+    /// Routed-expert pager. `None` (the default) means every expert is
+    /// resident and the forward path is unchanged. `Some` means the per-layer
+    /// expert blobs are BOUNDED slot pools that the forward path must fill on
+    /// demand before each MoE dispatch — see `crate::expert_pager`.
+    ///
+    /// Behind a `Mutex` because the slot pools are shared model state while
+    /// the forward path only holds `&DeepseekV4Weights`: concurrent sequences
+    /// must not race on the same slots, and serialising is required anyway.
+    pub expert_paging: Option<std::sync::Mutex<crate::expert_pager::Ds4ExpertPaging>>,
     pub _scaffold: (),
 }
 
