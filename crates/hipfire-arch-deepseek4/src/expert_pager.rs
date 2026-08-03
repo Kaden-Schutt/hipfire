@@ -113,6 +113,232 @@ pub fn plan_slots(
     })
 }
 
+/// One contiguous run of HFQ bytes to copy into a cache slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExpertSegment {
+    /// Byte offset in the HFQ file.
+    pub offset: usize,
+    /// Byte length.
+    pub len: usize,
+}
+
+/// Anything that can go wrong building or using the catalog.
+///
+/// Every variant carries enough context to name the offending tensor. A read
+/// error must NEVER degrade to a zero, stale, or wrong expert: the shard path's
+/// zeroed dummy makes a bad pointer produce silence rather than a fault (see
+/// `tests/expert_blob_contract.rs`), so paging has to fail loudly instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PagerError {
+    /// A routed-expert tensor named by the catalog is absent from the HFQ.
+    MissingTensor { name: String },
+    /// Experts are not a uniform size, so `slot_index * stride` addressing —
+    /// which both the blob layout and the pointer table assume — is invalid.
+    StrideMismatch {
+        name: String,
+        got: usize,
+        want: usize,
+    },
+    /// An expert was requested that the catalog has no byte range for.
+    NotCatalogued { key: ExpertKey },
+    /// The slot pool could not be sized.
+    Sizing(PagerSizingError),
+    /// The on-demand read failed. Carries layer/expert/offset context.
+    Read {
+        key: ExpertKey,
+        offset: usize,
+        len: usize,
+        detail: String,
+    },
+}
+
+impl std::fmt::Display for PagerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PagerError::MissingTensor { name } => {
+                write!(f, "expert pager: missing routed-expert tensor '{name}'")
+            }
+            PagerError::StrideMismatch { name, got, want } => write!(
+                f,
+                "expert pager: '{name}' size {got} != expert stride {want}; \
+                 routed experts must be a uniform stride for slot addressing"
+            ),
+            PagerError::NotCatalogued { key } => write!(
+                f,
+                "expert pager: no byte range catalogued for layer {} expert {} {:?}",
+                key.layer, key.expert, key.role
+            ),
+            PagerError::Sizing(e) => write!(f, "{e}"),
+            PagerError::Read {
+                key,
+                offset,
+                len,
+                detail,
+            } => write!(
+                f,
+                "expert pager: read of layer {} expert {} {:?} \
+                 ({len} B at offset {offset}) failed: {detail}",
+                key.layer, key.expert, key.role
+            ),
+        }
+    }
+}
+
+impl std::error::Error for PagerError {}
+
+impl From<PagerSizingError> for PagerError {
+    fn from(e: PagerSizingError) -> Self {
+        PagerError::Sizing(e)
+    }
+}
+
+/// The HFQ byte ranges backing every pageable routed expert.
+///
+/// Built once at load from the HFQ tensor index. A missing entry is an ERROR at
+/// build time, never a silent zero at first use.
+///
+/// A key maps to a *list* of segments, not a single range: ds4 fuses w1 and w3
+/// into one `gate_up` slot, but they are two separate tensors at unrelated file
+/// offsets, so filling a GateUp slot means two reads written back-to-back.
+/// `Down` (w2) is a single segment.
+#[derive(Debug, Default)]
+pub struct ExpertCatalog {
+    ranges: HashMap<ExpertKey, Vec<ExpertSegment>>,
+    /// Bytes one slot occupies, per role. Uniform across layers and experts —
+    /// enforced at build time because slot addressing depends on it.
+    gate_up_slot_len: Option<usize>,
+    down_slot_len: Option<usize>,
+}
+
+impl ExpertCatalog {
+    pub fn empty() -> Self {
+        Self {
+            ranges: HashMap::new(),
+            gate_up_slot_len: None,
+            down_slot_len: None,
+        }
+    }
+
+    /// Record a single-segment entry. Used for `Down`, and by tests.
+    pub fn insert(&mut self, key: ExpertKey, offset: usize, len: usize) {
+        self.ranges.insert(key, vec![ExpertSegment { offset, len }]);
+    }
+
+    /// The segments to read, in blob order, to fill this expert's slot.
+    /// `None` means the expert was never catalogued — the caller must error,
+    /// not substitute anything.
+    pub fn segments(&self, key: ExpertKey) -> Option<&[ExpertSegment]> {
+        self.ranges.get(&key).map(|v| v.as_slice())
+    }
+
+    /// Convenience for single-segment entries (`Down`). Returns `None` both for
+    /// an unknown key and for a multi-segment entry such as `GateUp` — callers
+    /// that must handle both roles use [`ExpertCatalog::segments`].
+    pub fn byte_range(&self, key: ExpertKey) -> Option<(usize, usize)> {
+        match self.ranges.get(&key)?.as_slice() {
+            [seg] => Some((seg.offset, seg.len)),
+            _ => None,
+        }
+    }
+
+    /// Bytes one cache slot of this role occupies.
+    pub fn slot_len(&self, role: ExpertBlobRole) -> Option<usize> {
+        match role {
+            ExpertBlobRole::GateUp => self.gate_up_slot_len,
+            ExpertBlobRole::Down => self.down_slot_len,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.ranges.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ranges.is_empty()
+    }
+
+    /// Build from a name→(offset, len) resolver.
+    ///
+    /// `layers` pairs the layer id used in [`ExpertKey`] with its HFQ tensor
+    /// prefix (`layers.{L}`, or `mtp.0` for the MTP block). `src` maps a
+    /// compact expert slot to its ORIGINAL index, mirroring the REAP keep-map
+    /// in `upload_layer_routed_experts`; pass the identity when no keep-map is
+    /// active. Every expert of every layer must resolve at a uniform stride or
+    /// the build fails — a hole here would be a wrong-weights read later.
+    pub fn build_from<F>(
+        layers: &[(u16, String)],
+        n_experts: usize,
+        src: impl Fn(usize) -> usize,
+        lookup: F,
+    ) -> Result<Self, PagerError>
+    where
+        F: Fn(&str) -> Option<(usize, usize)>,
+    {
+        let mut cat = ExpertCatalog::empty();
+        let mut part_stride: Option<usize> = None;
+        for (layer_id, prefix) in layers {
+            for slot in 0..n_experts {
+                let orig = src(slot);
+                let mut fetch = |part: &str| -> Result<ExpertSegment, PagerError> {
+                    let name = format!("{prefix}.ffn.experts.{orig}.{part}.weight");
+                    let (offset, len) = lookup(&name)
+                        .ok_or_else(|| PagerError::MissingTensor { name: name.clone() })?;
+                    match part_stride {
+                        None => part_stride = Some(len),
+                        Some(want) if want != len => {
+                            return Err(PagerError::StrideMismatch {
+                                name,
+                                got: len,
+                                want,
+                            })
+                        }
+                        Some(_) => {}
+                    }
+                    Ok(ExpertSegment { offset, len })
+                };
+                let w1 = fetch("w1")?;
+                let w3 = fetch("w3")?;
+                let w2 = fetch("w2")?;
+                cat.ranges.insert(
+                    ExpertKey {
+                        layer: *layer_id,
+                        expert: slot as u16,
+                        role: ExpertBlobRole::GateUp,
+                    },
+                    vec![w1, w3],
+                );
+                cat.ranges.insert(
+                    ExpertKey {
+                        layer: *layer_id,
+                        expert: slot as u16,
+                        role: ExpertBlobRole::Down,
+                    },
+                    vec![w2],
+                );
+            }
+        }
+        if let Some(s) = part_stride {
+            cat.gate_up_slot_len = Some(2 * s);
+            cat.down_slot_len = Some(s);
+        }
+        Ok(cat)
+    }
+
+    /// Build from a real HFQ tensor index.
+    pub fn build(
+        hfq: &hipfire_runtime::hfq::HfqFile,
+        layers: &[(u16, String)],
+        n_experts: usize,
+        keep: Option<&[u32]>,
+    ) -> Result<Self, PagerError> {
+        let src = |slot: usize| keep.map(|k| k[slot] as usize).unwrap_or(slot);
+        Self::build_from(layers, n_experts, src, |name| {
+            hfq.find_tensor_info(name)
+                .map(|i| (i.data_offset, i.data_size))
+        })
+    }
+}
+
 /// Residency + LRU bookkeeping over a fixed slot pool.
 ///
 /// The pool itself (device blobs) is owned by the caller; this tracks which
@@ -201,6 +427,155 @@ impl Ds4ExpertPager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A fake HFQ index: `name -> (data_offset, data_size)`.
+    fn fake_index(prefixes: &[&str], n_exp: usize, stride: usize) -> Vec<(String, (usize, usize))> {
+        let mut v = Vec::new();
+        let mut off = 4096usize;
+        for p in prefixes {
+            for e in 0..n_exp {
+                for part in ["w1", "w3", "w2"] {
+                    v.push((format!("{p}.ffn.experts.{e}.{part}.weight"), (off, stride)));
+                    off += stride;
+                }
+            }
+        }
+        v
+    }
+
+    fn lookup_from(
+        idx: &[(String, (usize, usize))],
+    ) -> impl Fn(&str) -> Option<(usize, usize)> + '_ {
+        move |name: &str| idx.iter().find(|(n, _)| n == name).map(|(_, r)| *r)
+    }
+
+    #[test]
+    fn catalog_reports_missing_expert_rather_than_guessing() {
+        let mut c = ExpertCatalog::empty();
+        let k = ExpertKey {
+            layer: 3,
+            expert: 9,
+            role: ExpertBlobRole::GateUp,
+        };
+        assert!(c.byte_range(k).is_none());
+        c.insert(k, 1024, 2_359_296);
+        assert_eq!(c.byte_range(k), Some((1024, 2_359_296)));
+    }
+
+    #[test]
+    fn gate_up_holds_two_segments_because_w1_and_w3_are_separate_tensors() {
+        // The fused gate_up slot is w1 ‖ w3, and the two live at unrelated
+        // offsets in the HFQ. A single range cannot describe it, so a GateUp
+        // entry carries both segments in blob order.
+        let stride = 2_359_296usize;
+        let idx = fake_index(&["layers.0"], 2, stride);
+        let cat =
+            ExpertCatalog::build_from(&[(0u16, "layers.0".into())], 2, |s| s, lookup_from(&idx))
+                .expect("builds");
+        let gu = cat
+            .segments(ExpertKey {
+                layer: 0,
+                expert: 1,
+                role: ExpertBlobRole::GateUp,
+            })
+            .expect("gate_up present");
+        assert_eq!(gu.len(), 2, "gate_up must be w1 ‖ w3");
+        let w1 = idx
+            .iter()
+            .find(|(n, _)| n == "layers.0.ffn.experts.1.w1.weight")
+            .unwrap()
+            .1;
+        let w3 = idx
+            .iter()
+            .find(|(n, _)| n == "layers.0.ffn.experts.1.w3.weight")
+            .unwrap()
+            .1;
+        assert_eq!((gu[0].offset, gu[0].len), w1);
+        assert_eq!((gu[1].offset, gu[1].len), w3);
+        assert_eq!(cat.slot_len(ExpertBlobRole::GateUp), Some(2 * stride));
+        assert_eq!(cat.slot_len(ExpertBlobRole::Down), Some(stride));
+    }
+
+    #[test]
+    fn build_errors_on_a_missing_tensor_rather_than_skipping_it() {
+        // A hole in the catalog is a wrong-weights read at first use, so it
+        // must be a load-time error with the tensor named.
+        let stride = 2_359_296usize;
+        let mut idx = fake_index(&["layers.0"], 3, stride);
+        idx.retain(|(n, _)| n != "layers.0.ffn.experts.2.w3.weight");
+        let err =
+            ExpertCatalog::build_from(&[(0u16, "layers.0".into())], 3, |s| s, lookup_from(&idx))
+                .expect_err("must fail closed");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("experts.2.w3.weight"),
+            "error must name the missing tensor, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn build_errors_when_experts_are_not_a_uniform_stride() {
+        // Paging indexes a slot as `slot_index * stride`. A ragged expert size
+        // makes that arithmetic wrong, so reject it at load.
+        let stride = 2_359_296usize;
+        let mut idx = fake_index(&["layers.0"], 3, stride);
+        for (n, r) in idx.iter_mut() {
+            if n == "layers.0.ffn.experts.2.w2.weight" {
+                r.1 = stride - 128;
+            }
+        }
+        let err =
+            ExpertCatalog::build_from(&[(0u16, "layers.0".into())], 3, |s| s, lookup_from(&idx))
+                .expect_err("must fail closed");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("stride"),
+            "error must explain the stride mismatch, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn build_follows_the_reap_keep_map() {
+        // With a REAP keep-map, compact slot `s` must read ORIGINAL expert
+        // `keep[s]` — reading slot `s` directly would load the wrong weights.
+        let stride = 2_359_296usize;
+        let idx = fake_index(&["layers.0"], 8, stride);
+        let keep = [5usize, 2, 7];
+        let cat = ExpertCatalog::build_from(
+            &[(0u16, "layers.0".into())],
+            3,
+            |s| keep[s],
+            lookup_from(&idx),
+        )
+        .expect("builds");
+        let got = cat
+            .byte_range(ExpertKey {
+                layer: 0,
+                expert: 1,
+                role: ExpertBlobRole::Down,
+            })
+            .expect("slot 1 present");
+        let want = idx
+            .iter()
+            .find(|(n, _)| n == "layers.0.ffn.experts.2.w2.weight")
+            .unwrap()
+            .1;
+        assert_eq!(got, want, "compact slot 1 must map to original expert 2");
+    }
+
+    #[test]
+    fn catalog_covers_every_expert_of_every_layer() {
+        let stride = 2_359_296usize;
+        let idx = fake_index(&["layers.0", "layers.1", "mtp.0"], 4, stride);
+        let layers = [
+            (0u16, "layers.0".to_string()),
+            (1u16, "layers.1".to_string()),
+            (2u16, "mtp.0".to_string()),
+        ];
+        let cat = ExpertCatalog::build_from(&layers, 4, |s| s, lookup_from(&idx)).expect("builds");
+        assert_eq!(cat.len(), 3 * 4 * 2, "3 layers x 4 experts x 2 roles");
+        assert!(!cat.is_empty());
+    }
 
     #[test]
     fn plan_slots_floors_to_budget() {
