@@ -5469,6 +5469,15 @@ pub const V4F_MOE_TOPK_BIAS_AWARE_BATCHED_SRC: &str =
 pub const GEMM_F16_X_F16_WMMA_SRC: &str =
     include_str!("../../../kernels/src/gemm_f16_x_f16_wmma.hip");
 
+/// CDNA3 (gfx942) MFMA port of `GEMM_F16_X_F16_WMMA_SRC` — same math,
+/// same `(A, X, Y, M, K, B)` signature, same `[B, M]` F32 output layout.
+/// The WMMA original is wave32-only (`__builtin_amdgcn_wmma_*_w32` needs
+/// `gfx11-insts,wavefrontsize32`) and cannot compile for gfx942; this uses
+/// the wave64 `__builtin_amdgcn_mfma_f32_16x16x16f16` instead. Required by
+/// the DeepSeek V4 DSpark prefill path on MI300X.
+pub const GEMM_F16_X_F16_MFMA_GFX942_SRC: &str =
+    include_str!("../../../kernels/src/gemm_f16_x_f16_mfma.gfx942.hip");
+
 /// Bulk F32→F16 conversion for staging WMMA activations. Named
 /// `deepseek4_convert_f32_to_f16` to avoid collision with the embedded
 /// `convert_f32_to_f16` helper in `GEMM_HFQ4G256_RESIDUAL_FP16_SRC`

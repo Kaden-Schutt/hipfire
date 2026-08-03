@@ -22956,6 +22956,141 @@ impl Gpu {
         result
     }
 
+    /// CDNA3 (gfx942) MFMA counterpart of [`Self::gemm_f16_x_f16_wmma`]:
+    /// `Y[b, m] = Σ_k A[m, k] · X[b, k]` with F16 operands and an F32
+    /// accumulator, matching `kernels/src/gemm_f16_x_f16_mfma.gfx942.hip`.
+    ///
+    /// The WMMA original is wave32-only and does not compile for gfx942, so
+    /// this exists to give the DeepSeek V4 DSpark prefill path an F16 GEMM on
+    /// MI300X. Identical signature, operand layout, and `[batch, M]` F32
+    /// output layout as the WMMA version — call sites swap one for the other
+    /// on `arch_caps.is_gfx942()`.
+    ///
+    /// - `a_f16`: row-major F16 weights `[M, K]`
+    /// - `x_f16`: row-major F16 activations `[batch, K]`
+    /// - `y_f32`: row-major F32 output `[batch, M]` (overwritten)
+    ///
+    /// Launch geometry (fixed by the HIP source): block `[64,1,1]` (wave64),
+    /// grid `[(M+15)/16, (batch+15)/16, 1]`, no LDS. Fail-closed on non-gfx942,
+    /// on `K % 16 != 0` (the kernel's K loop has no tail guard), and on
+    /// undersized buffers.
+    pub fn gemm_f16_x_f16_mfma_gfx942(
+        &mut self,
+        a_f16: &GpuTensor,
+        x_f16: &GpuTensor,
+        y_f32: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if !self.arch_caps.is_gfx942() {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "gemm_f16_x_f16_mfma_gfx942 requires gfx942",
+            ));
+        }
+        if m == 0 || k == 0 || batch_size == 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "gemm_f16_x_f16_mfma_gfx942: M, K, batch must be positive (got M={m} K={k} batch={batch_size})"
+                ),
+            ));
+        }
+        if k % 16 != 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("gemm_f16_x_f16_mfma_gfx942: K must be a multiple of 16 (got K={k})"),
+            ));
+        }
+        let a_bytes = m.checked_mul(k).and_then(|e| e.checked_mul(2)).ok_or_else(|| {
+            hip_bridge::HipError::new(0, "gemm_f16_x_f16_mfma_gfx942: A size overflow")
+        })?;
+        let x_bytes = batch_size
+            .checked_mul(k)
+            .and_then(|e| e.checked_mul(2))
+            .ok_or_else(|| {
+                hip_bridge::HipError::new(0, "gemm_f16_x_f16_mfma_gfx942: X size overflow")
+            })?;
+        let y_bytes = batch_size
+            .checked_mul(m)
+            .and_then(|e| e.checked_mul(4))
+            .ok_or_else(|| {
+                hip_bridge::HipError::new(0, "gemm_f16_x_f16_mfma_gfx942: Y size overflow")
+            })?;
+        if a_f16.buf.size() < a_bytes {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "gemm_f16_x_f16_mfma_gfx942: A buffer too small (have {} need {a_bytes})",
+                    a_f16.buf.size()
+                ),
+            ));
+        }
+        if x_f16.buf.size() < x_bytes {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "gemm_f16_x_f16_mfma_gfx942: X buffer too small (have {} need {x_bytes})",
+                    x_f16.buf.size()
+                ),
+            ));
+        }
+        if y_f32.buf.size() < y_bytes {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "gemm_f16_x_f16_mfma_gfx942: Y buffer too small (have {} need {y_bytes})",
+                    y_f32.buf.size()
+                ),
+            ));
+        }
+
+        const KERNEL: &str = "gemm_f16_x_f16_mfma_gfx942";
+        self.ensure_kernel(KERNEL, kernels::GEMM_F16_X_F16_MFMA_GFX942_SRC, KERNEL)?;
+
+        let a_ptr = a_f16.buf.as_ptr();
+        let x_ptr = x_f16.buf.as_ptr();
+        let y_ptr = y_f32.buf.as_ptr();
+        let m_i32 = m as i32;
+        let k_i32 = k as i32;
+        let batch_i32 = batch_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &a_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &y_ptr as *const _ as *mut c_void,
+            &m_i32 as *const _ as *mut c_void,
+            &k_i32 as *const _ as *mut c_void,
+            &batch_i32 as *const _ as *mut c_void,
+        ];
+        let grid_m = ((m + 15) / 16) as u32;
+        let grid_b = ((batch_size + 15) / 16) as u32;
+        let bytes = a_bytes + x_bytes + y_bytes;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", KERNEL, bytes);
+        let result = self.launch_maybe_blob(
+            KERNEL,
+            [grid_m, grid_b, 1],
+            [64, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut blob = hip_bridge::KernargBlob::new();
+                blob.push_ptr(a_ptr);
+                blob.push_ptr(x_ptr);
+                blob.push_ptr(y_ptr);
+                blob.push_i32(m_i32);
+                blob.push_i32(k_i32);
+                blob.push_i32(batch_i32);
+                blob
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
     /// rocBLAS BF16×BF16→FP32 reference for the same orientation as
     /// [`Self::gemm_bf16_mfma_gfx942`]: `Y[N,M] = X[N,K] @ W[M,K]^T`.
     ///

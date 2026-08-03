@@ -488,6 +488,11 @@ fn gemv_auto_batched_wmma(
                     // ensure_fp16_x to preserve the trunk's fp16_x cache state.
                     gpu.gemm_mw16_residual_wmma_f16x(weight, scratch, y, m, k, batch_size)
                         .map_err(|e| format!("gemm_mw16_residual_wmma_f16x: {e:?}"))
+                } else if gpu.arch_caps.is_gfx942() {
+                    // CDNA3 has no wave32 WMMA — `gemm_f16_x_f16_wmma` cannot
+                    // compile for gfx942. Same math via the MFMA port.
+                    gpu.gemm_f16_x_f16_mfma_gfx942(weight, scratch, y, m, k, batch_size)
+                        .map_err(|e| format!("gemm_f16_x_f16_mfma_gfx942: {e:?}"))
                 } else {
                     gpu.gemm_f16_x_f16_wmma(weight, scratch, y, m, k, batch_size)
                         .map_err(|e| format!("gemm_f16_x_f16_wmma: {e:?}"))

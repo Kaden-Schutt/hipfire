@@ -1296,6 +1296,29 @@ fn e8_batched_gemv_applies(arch: &str, batch_size: usize, k: usize) -> bool {
         && Gpu::E8_BATCHED_GEMV_BATCHES.contains(&batch_size)
 }
 
+/// F16×F16→F32 batched GEMM, arch-routed.
+///
+/// `gemm_f16_x_f16_wmma` is built on the wave32 RDNA3 WMMA builtin and will
+/// not even COMPILE for CDNA3, so gfx942 takes the MFMA port instead. Same
+/// math, same operand/output layouts, same `[batch, M]` F32 result — this is
+/// purely an ISA-level swap. Every F16×F16 call site must go through here so
+/// the DeepSeek V4 DSpark path stays runnable on MI300X.
+fn gemm_f16_x_f16_auto(
+    gpu: &mut Gpu,
+    weight_f16: &GpuTensor,
+    x_f16: &GpuTensor,
+    y_f32: &GpuTensor,
+    m: usize,
+    k: usize,
+    batch_size: usize,
+) -> hip_bridge::HipResult<()> {
+    if gpu.arch_caps.is_gfx942() {
+        gpu.gemm_f16_x_f16_mfma_gfx942(weight_f16, x_f16, y_f32, m, k, batch_size)
+    } else {
+        gpu.gemm_f16_x_f16_wmma(weight_f16, x_f16, y_f32, m, k, batch_size)
+    }
+}
+
 fn gemv_auto_batched_wmma(
     gpu: &mut Gpu,
     mq2r_backend: Mq2rBackend,
@@ -1394,10 +1417,11 @@ fn gemv_auto_batched_wmma(
                 let n = (batch_size * k) as i64;
                 gpu.deepseek4_convert_f32_to_f16(x_plain_batch, scratch, n)
                     .map_err(|e| format!("convert_f32_to_f16 (F16 weight): {e:?}"))?;
-                gpu.gemm_f16_x_f16_wmma(weight, scratch, y, m, k, batch_size)
-                    .map_err(|e| format!("gemm_f16_x_f16_wmma: {e:?}"))
+                // gfx11 → WMMA, gfx942 → MFMA (see `gemm_f16_x_f16_auto`).
+                gemm_f16_x_f16_auto(gpu, weight, scratch, y, m, k, batch_size)
+                    .map_err(|e| format!("gemm_f16_x_f16 (F16 weight): {e:?}"))
             } else {
-                Err("F16 weight requires WMMA path with x_f16_scratch".to_string())
+                Err("F16 weight requires an F16 GEMM path with x_f16_scratch".to_string())
             }
         }
         _ => {
@@ -9029,7 +9053,8 @@ fn attention_block_batched_mixed(
             // DeepSeek V4 compressor uses FWHT-rotated input (tmp_batch) when the
             // weight is MQ4-style, and plain input (tmp_plain_batch) when
             // F16/F32. We're on the F16 path → tmp_plain_batch_f16.
-            gpu.gemm_f16_x_f16_wmma(
+            gemm_f16_x_f16_auto(
+                gpu,
                 wkv_f16.unwrap(),
                 &pbs.tmp_plain_batch_f16,
                 &pbs.comp_main_kv_batch,
@@ -9038,7 +9063,8 @@ fn attention_block_batched_mixed(
                 batch_size,
             )
             .map_err(|e| format!("gemm_f16_wmma comp_wkv l{layer_idx}: {e:?}"))?;
-            gpu.gemm_f16_x_f16_wmma(
+            gemm_f16_x_f16_auto(
+                gpu,
                 wgate_f16.unwrap(),
                 &pbs.tmp_plain_batch_f16,
                 &pbs.comp_main_score_batch,
@@ -9048,7 +9074,8 @@ fn attention_block_batched_mixed(
             )
             .map_err(|e| format!("gemm_f16_wmma comp_wgate l{layer_idx}: {e:?}"))?;
             if ratio == 4 {
-                gpu.gemm_f16_x_f16_wmma(
+                gemm_f16_x_f16_auto(
+                    gpu,
                     idx_wkv_f16.unwrap(),
                     &pbs.tmp_plain_batch_f16,
                     &pbs.comp_idx_kv_batch,
@@ -9057,7 +9084,8 @@ fn attention_block_batched_mixed(
                     batch_size,
                 )
                 .map_err(|e| format!("gemm_f16_wmma idx_wkv l{layer_idx}: {e:?}"))?;
-                gpu.gemm_f16_x_f16_wmma(
+                gemm_f16_x_f16_auto(
+                    gpu,
                     idx_wgate_f16.unwrap(),
                     &pbs.tmp_plain_batch_f16,
                     &pbs.comp_idx_score_batch,
