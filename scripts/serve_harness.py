@@ -138,6 +138,18 @@ def infer_tag(model_path):
 def build_config(args):
     tag = args.tag or infer_tag(args.model)
     samp, samp_src = resolve_sampling(args.sampling, tag, args.registry)
+    # `reasoning_effort` is a REQUEST-BODY field (SAMPLE_KEYS carries it), not a
+    # config key. `--thinking` only sets the [reasoning] budget cap; the daemon
+    # independently defaults think_mode to NonThink when reasoning_effort is
+    # absent from the body, so a run with `--thinking high` and nothing else
+    # produces a 8192-token cap over zero thinking tokens. Injecting here keeps
+    # the two knobs consistent and visible in the pre-flight.
+    effort = getattr(args, "thinking_effort", None)
+    if effort:
+        samp = dict(samp)
+        samp["reasoning_effort"] = effort
+        samp_src = dict(samp_src)
+        samp_src["reasoning_effort"] = "explicit(--thinking-effort)"
     think_cap = THINKING_BUDGET.get(args.thinking)
     if think_cap is None:
         sys.exit(f"thinking_budget {args.thinking!r} not a key of {list(THINKING_BUDGET)}")
@@ -158,6 +170,7 @@ def build_config(args):
         "mode": args.mode, "port": args.port, "seed": getattr(args, "seed", None),
         "prompts_file": getattr(args, "prompts_file", None),
         "prompt_file": getattr(args, "prompt_file", None),
+        "speculation_mode": getattr(args, "speculation", None),
         "replay_route_proof_log": bool(getattr(args, "replay_route_proof_log", False)),
     }
 
@@ -182,6 +195,9 @@ def show_config(cfg):
     print(f"  registry tag  : {cfg['tag'] or '(none — sampling cannot be registry-resolved)'}")
     print(f"  kv_mode       : {cfg['kv']}   kv_backend: {cfg.get('kv_backend', 'contiguous')}   mtp_mode: {cfg['mtp']}   mode: {cfg['mode']}")
     print(f"  dflash        : {cfg.get('dflash', 'off')}   draft: {cfg.get('draft') or '(none / filename auto-match)'}")
+    _spec = cfg.get("speculation_mode")
+    print(f"  speculation   : {_spec or '(derived from --dflash/--mtp above)'}"
+          f"{'   <-- OVERRIDES dflash/mtp' if _spec else ''}")
     prompt_source = cfg.get("prompt_file") or cfg.get("prompts_file") or "(built-in battery)"
     print(f"  seed          : {cfg.get('seed')}   prompt_source: {prompt_source}")
     _cap = cfg['thinking_cap_tokens']
@@ -320,10 +336,37 @@ def _write_native_config(cfg, home):
       --dflash auto → mode=auto, dflash=auto (mtp left as requested)
       --dflash off + --mtp off → mode=off (plain AR; no sidecar auto-discovery)
       --dflash off + other MTP setting → dflash=off (mode remains auto)
+
+    `--speculation MODE` overrides all of the above with an explicit selector,
+    mirroring the CLI's apply_speculation_selector. This is the only way to ask
+    for DSpark: the DFlash/MTP matrix above can reach it solely by accident, by
+    leaving `mode` at its schema default of `auto` so the sidecar is
+    auto-discovered. DeepSeek V4 ships its speculative module inside the
+    checkpoint (see the model card: "it comes with a speculative decoding module
+    attached"), so `--speculation dspark` is the supported way to exercise it.
     """
+    explicit = cfg.get("speculation_mode")
     dflash = cfg.get("dflash", "off") or "off"
     mtp = cfg["mtp"]
-    if dflash == "on":
+    if explicit:
+        # Mirrors apply_speculation_selector(): each named selector pins every
+        # sibling off so the arms are mutually exclusive and legible in the log.
+        pins = {
+            "off":    ('off',    'off',  'off', 'off'),
+            "dflash": ('dflash', 'on',   'off', 'off'),
+            "mtp":    ('mtp',    'off',  'on',  'off'),
+            "ngram":  ('ngram',  'off',  'off', 'on'),
+            "dspark": ('dspark', 'off',  'off', 'off'),
+            "auto":   ('auto',   'auto', mtp,   'off'),
+        }[explicit]
+        speculation = (
+            '[speculation]\n'
+            f'mode = {json.dumps(pins[0])}\n'
+            f'dflash = {json.dumps(pins[1])}\n'
+            f'mtp = {json.dumps(pins[2])}\n'
+            f'ngram = {json.dumps(pins[3])}\n'
+        )
+    elif dflash == "on":
         # Exclusive DFlash selector — mirrors apply_speculation_selector("dflash").
         speculation = (
             '[speculation]\n'
@@ -813,6 +856,19 @@ def main():
     ap.add_argument("--dflash", default="off", choices=["off", "auto", "on"],
                     help="DFlash mode written to temporary [speculation] TOML (default off). "
                          "'on' emits mode=dflash + dflash=on + mtp/ngram off.")
+    ap.add_argument("--speculation", default=None,
+                    choices=["off", "auto", "ngram", "dflash", "mtp", "dspark"],
+                    help="explicit speculation selector; overrides --dflash/--mtp and mirrors the "
+                         "CLI's apply_speculation_selector. Required to reach DSpark: the "
+                         "--dflash/--mtp matrix can only get there by accident, via the schema "
+                         "default mode=auto auto-discovering the sidecar. DeepSeek V4 ships its "
+                         "speculative module in the checkpoint, so use --speculation dspark.")
+    ap.add_argument("--thinking-effort", default=None,
+                    choices=["none", "low", "high", "max"],
+                    help="request-body reasoning_effort. NOTE this is a DIFFERENT knob from "
+                         "--thinking, which only sets the [reasoning] budget CAP. The daemon "
+                         "defaults think_mode to NonThink when reasoning_effort is absent "
+                         "(daemon.rs), so --thinking high alone yields zero thinking tokens.")
     ap.add_argument("--draft", default=None,
                     help="Optional DFlash draft path; sets HIPFIRE_DFLASH_DRAFT for the serve child. "
                          "When omitted, any caller-inherited HIPFIRE_DFLASH_DRAFT is preserved.")
