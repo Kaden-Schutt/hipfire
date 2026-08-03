@@ -405,6 +405,18 @@ impl Transport for PreadH2DTransport {
 
     /// Concurrent preads, then the host-to-device copies.
     ///
+    /// io_uring was implemented for this and REMOVED: on the full 43-layer ds4
+    /// model it measured ~1.9x SLOWER on pread and ~17% slower end-to-end,
+    /// consistently across an interleaved A/B/A/B (ring 8122/8512 ms vs pread
+    /// 4119/4656 ms; 6.5-6.6 vs 7.7-7.8 tok/s), so it was not drift.
+    ///
+    /// Hypothesis, unproven: expert fills are a handful of MULTI-MEGABYTE
+    /// buffered reads (18 per layer at 2.4-4.7 MB each) — the shape io_uring
+    /// is worst at. The kernel serves them from its worker pool with no more
+    /// parallelism than rayon already extracts, while each SQE adds submission
+    /// overhead. Where io_uring should win is registered buffers + O_DIRECT,
+    /// which is a different experiment, not a knob on this one.
+    ///
     /// `pread` is positional and takes `&File`, so N threads can read the same
     /// descriptor at once with no seek state to race on. The staging buffer is
     /// carved into one disjoint slice per request, so the threads never
