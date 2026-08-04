@@ -654,9 +654,17 @@ impl RedlineQwenSnapshot {
 }
 
 #[derive(PartialEq)]
+struct RedlineRegionHash {
+    name: String,
+    bytes: usize,
+    hash: u64,
+}
+
+#[derive(PartialEq)]
 struct RedlineDeepseek4Snapshot {
     logits: Vec<u8>,
     kv: Vec<u8>,
+    kv_regions: Vec<RedlineRegionHash>,
     recurrent: Vec<u8>,
 }
 
@@ -667,8 +675,34 @@ impl RedlineDeepseek4Snapshot {
             "logits_hash": format!("{:016x}", redline_hash(&self.logits)),
             "kv_bytes": self.kv.len(),
             "kv_hash": format!("{:016x}", redline_hash(&self.kv)),
+            "kv_regions": self.kv_regions.iter().map(|region| serde_json::json!({
+                "name": region.name,
+                "bytes": region.bytes,
+                "hash": format!("{:016x}", region.hash),
+            })).collect::<Vec<_>>(),
             "recurrent_bytes": self.recurrent.len(),
             "recurrent_hash": format!("{:016x}", redline_hash(&self.recurrent)),
+        })
+    }
+}
+
+#[derive(PartialEq)]
+struct RedlineDsparkVerifySnapshot {
+    target: RedlineDeepseek4Snapshot,
+    captures: Vec<u8>,
+    streams: Vec<u8>,
+    picks: Vec<u32>,
+}
+
+impl RedlineDsparkVerifySnapshot {
+    fn json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "target": self.target.json(),
+            "captures_bytes": self.captures.len(),
+            "captures_hash": format!("{:016x}", redline_hash(&self.captures)),
+            "streams_bytes": self.streams.len(),
+            "streams_hash": format!("{:016x}", redline_hash(&self.streams)),
+            "picks": self.picks,
         })
     }
 }
@@ -776,6 +810,27 @@ fn redline_append_tensor(
     Ok(())
 }
 
+fn redline_append_tensor_region(
+    gpu: &rdna_compute::Gpu,
+    output: &mut Vec<u8>,
+    regions: &mut Vec<RedlineRegionHash>,
+    name: String,
+    tensor: &Option<rdna_compute::GpuTensor>,
+) -> Result<(), String> {
+    let Some(tensor) = tensor else {
+        return Ok(());
+    };
+    let start = output.len();
+    redline_append_buffer(gpu, output, &tensor.buf)?;
+    let bytes = output.len() - start;
+    regions.push(RedlineRegionHash {
+        name,
+        bytes,
+        hash: redline_hash(&output[start..]),
+    });
+    Ok(())
+}
+
 fn redline_deepseek4_snapshot(
     gpu: &rdna_compute::Gpu,
     bundle: &deepseek4::Deepseek4Bundle,
@@ -784,15 +839,38 @@ fn redline_deepseek4_snapshot(
     redline_append_tensor(gpu, &mut logits, &bundle.state.logits)?;
 
     let mut kv = Vec::new();
-    for layer in &bundle.state._indexer {
-        redline_append_tensor(gpu, &mut kv, &layer.main_kv_cache)?;
-        redline_append_tensor(gpu, &mut kv, &layer.indexer_kv_cache)?;
+    let mut kv_regions = Vec::new();
+    for (layer_idx, layer) in bundle.state._indexer.iter().enumerate() {
+        redline_append_tensor_region(
+            gpu,
+            &mut kv,
+            &mut kv_regions,
+            format!("indexer.{layer_idx}.main_kv_cache"),
+            &layer.main_kv_cache,
+        )?;
+        redline_append_tensor_region(
+            gpu,
+            &mut kv,
+            &mut kv_regions,
+            format!("indexer.{layer_idx}.indexer_kv_cache"),
+            &layer.indexer_kv_cache,
+        )?;
     }
-    for layer in &bundle.state._attention {
-        redline_append_tensor(gpu, &mut kv, &layer.swa_k)?;
-        redline_append_tensor(gpu, &mut kv, &layer.swa_v)?;
-        redline_append_tensor(gpu, &mut kv, &layer.full_k_cache)?;
-        redline_append_tensor(gpu, &mut kv, &layer.full_v_cache)?;
+    for (layer_idx, layer) in bundle.state._attention.iter().enumerate() {
+        for (field, tensor) in [
+            ("swa_k", &layer.swa_k),
+            ("swa_v", &layer.swa_v),
+            ("full_k_cache", &layer.full_k_cache),
+            ("full_v_cache", &layer.full_v_cache),
+        ] {
+            redline_append_tensor_region(
+                gpu,
+                &mut kv,
+                &mut kv_regions,
+                format!("attention.{layer_idx}.{field}"),
+                tensor,
+            )?;
+        }
     }
 
     let mut recurrent = Vec::new();
@@ -809,8 +887,109 @@ fn redline_deepseek4_snapshot(
     Ok(RedlineDeepseek4Snapshot {
         logits,
         kv,
+        kv_regions,
         recurrent,
     })
+}
+
+fn redline_append_tensor_slice(
+    gpu: &rdna_compute::Gpu,
+    output: &mut Vec<u8>,
+    tensor: &rdna_compute::GpuTensor,
+    offset: usize,
+    len: usize,
+) -> Result<(), String> {
+    if offset.saturating_add(len) > tensor.numel() {
+        return Err(format!(
+            "redline tensor slice {}+{} exceeds {}",
+            offset,
+            len,
+            tensor.numel()
+        ));
+    }
+    let view = tensor.sub_offset(offset, len);
+    redline_append_buffer(gpu, output, &view.buf)
+}
+
+fn redline_dspark_verify_snapshot(
+    gpu: &rdna_compute::Gpu,
+    bundle: &deepseek4::Deepseek4Bundle,
+    batch: usize,
+    picks: Vec<u32>,
+) -> Result<RedlineDsparkVerifySnapshot, String> {
+    let target = redline_deepseek4_snapshot(gpu, bundle)?;
+    let hidden = bundle.config.hidden_size;
+    let n_targets = bundle.state.dspark_target_layers.len();
+    let mut captures = Vec::new();
+    if let Some(tensor) = bundle.state.dspark_caps.as_ref() {
+        redline_append_tensor_slice(gpu, &mut captures, tensor, 0, batch * n_targets * hidden)?;
+    }
+    let pbs = bundle
+        .state
+        .dspark_verify_pbs
+        .as_ref()
+        .ok_or_else(|| "DSpark verify snapshot: PBS missing".to_string())?;
+    let mut streams = Vec::new();
+    redline_append_tensor_slice(
+        gpu,
+        &mut streams,
+        &pbs.streams_batch,
+        0,
+        batch * bundle.config.hc_mult * hidden,
+    )?;
+    Ok(RedlineDsparkVerifySnapshot {
+        target,
+        captures,
+        streams,
+        picks,
+    })
+}
+
+/// Hash one inactive row from the highest-risk batch-shaped verify buffers.
+/// The row immediately after the active batch is a same-allocation red zone:
+/// every fixed-node B-shaped kernel must leave it byte-identical.
+fn redline_dspark_verify_guard(
+    gpu: &rdna_compute::Gpu,
+    bundle: &deepseek4::Deepseek4Bundle,
+    batch: usize,
+) -> Result<Vec<u8>, String> {
+    let pbs = bundle
+        .state
+        .dspark_verify_pbs
+        .as_ref()
+        .ok_or_else(|| "DSpark verify guard: PBS missing".to_string())?;
+    if batch >= pbs.max_batch {
+        return Err(format!(
+            "DSpark verify guard needs inactive row after B={batch}, max_batch={}",
+            pbs.max_batch
+        ));
+    }
+    let cfg = &bundle.config;
+    let hidden = cfg.hidden_size;
+    let mut guard = Vec::new();
+    for (tensor, row) in [
+        (&pbs.embed_batch, hidden),
+        (&pbs.streams_batch, cfg.hc_mult * hidden),
+        (&pbs.q_batch, cfg.num_attention_heads * cfg.head_dim),
+        (&pbs.kv_batch, cfg.num_key_value_heads * cfg.head_dim),
+        (&pbs.attn_out_batch, hidden),
+        (&pbs.ffn_out_batch, hidden),
+        (&pbs.moe_scores_batch, cfg.n_routed_experts),
+        (&pbs.moe_topk_indices_batch, cfg.num_experts_per_tok),
+        (&pbs.moe_topk_weights_batch, cfg.num_experts_per_tok),
+        (&pbs.idx_q_batch, cfg.index_n_heads * cfg.index_head_dim),
+        (&pbs.idx_topk_indices_batch, cfg.index_topk),
+    ] {
+        redline_append_tensor_slice(gpu, &mut guard, tensor, batch * row, row)?;
+    }
+    let n_targets = bundle.state.dspark_target_layers.len();
+    if n_targets > 0 {
+        if let Some(caps) = bundle.state.dspark_caps.as_ref() {
+            let row = n_targets * hidden;
+            redline_append_tensor_slice(gpu, &mut guard, caps, batch * row, row)?;
+        }
+    }
+    Ok(guard)
 }
 
 fn redline_snapshot(
@@ -1381,6 +1560,338 @@ fn redline_shadow_deepseek4(
         "hip": hip_snapshot.json(),
         "blob": blob_snapshot.json(),
     }))
+}
+
+struct RedlineDsparkArm {
+    snapshot: RedlineDsparkVerifySnapshot,
+    guard_before: Vec<u8>,
+    guard_after: Vec<u8>,
+    host_us: f64,
+}
+
+impl RedlineDsparkArm {
+    fn guard_unchanged(&self) -> bool {
+        self.guard_before == self.guard_after
+    }
+
+    fn json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "host_us": self.host_us,
+            "guard_unchanged": self.guard_unchanged(),
+            "guard_bytes": self.guard_after.len(),
+            "guard_before_hash": format!("{:016x}", redline_hash(&self.guard_before)),
+            "guard_after_hash": format!("{:016x}", redline_hash(&self.guard_after)),
+            "snapshot": self.snapshot.json(),
+        })
+    }
+}
+
+fn redline_prime_dspark_shadow_arm(
+    gpu: &mut rdna_compute::Gpu,
+    loaded: &mut LoadedModel,
+    context: usize,
+) -> Result<(), String> {
+    let pbs = loaded
+        .deepseek4_pbs
+        .as_ref()
+        .ok_or_else(|| "DSpark shadow: prefill scratch missing".to_string())?;
+    let bundle = match loaded.state.as_mut() {
+        Some(ModelState::Deepseek4(bundle)) => bundle,
+        _ => return Err("DSpark shadow requires DeepSeek4".to_string()),
+    };
+    redline_reset_deepseek4(gpu, bundle)?;
+    redline_prime_deepseek4(gpu, bundle, pbs, context)?;
+    bundle.state.n_tokens = context as u64;
+    Ok(())
+}
+
+fn redline_dspark_shadow_block(step: usize, batch: usize) -> Vec<u32> {
+    (0..batch)
+        .map(|slot| 101 + ((step * batch + slot) % 1000) as u32)
+        .collect()
+}
+
+fn redline_run_dspark_direct_arm(
+    gpu: &mut rdna_compute::Gpu,
+    loaded: &mut LoadedModel,
+    context: usize,
+    batch: usize,
+    iterations: usize,
+    capture_safe: bool,
+) -> Result<RedlineDsparkArm, String> {
+    redline_prime_dspark_shadow_arm(gpu, loaded, context)?;
+    let bundle = match loaded.state.as_mut() {
+        Some(ModelState::Deepseek4(bundle)) => bundle,
+        _ => unreachable!(),
+    };
+    let guard_before = redline_dspark_verify_guard(gpu, bundle, batch)?;
+    let started = Instant::now();
+    let mut picks = Vec::with_capacity(batch * iterations);
+    for step in 0..iterations {
+        let block = redline_dspark_shadow_block(step, batch);
+        let position = context + step * batch;
+        picks.extend(bundle.redline_dspark_verify_direct(gpu, &block, position, capture_safe)?);
+    }
+    gpu.hip
+        .device_synchronize()
+        .map_err(|error| error.to_string())?;
+    let host_us = started.elapsed().as_secs_f64() * 1_000_000.0;
+    let guard_after = redline_dspark_verify_guard(gpu, bundle, batch)?;
+    let snapshot = redline_dspark_verify_snapshot(gpu, bundle, batch, picks)?;
+    Ok(RedlineDsparkArm {
+        snapshot,
+        guard_before,
+        guard_after,
+        host_us,
+    })
+}
+
+fn redline_run_dspark_capture_arm(
+    gpu: &mut rdna_compute::Gpu,
+    loaded: &mut LoadedModel,
+    controller: &mut rdna_compute::replay::ReplayController,
+    context: usize,
+    batch: usize,
+    iterations: usize,
+) -> Result<
+    (
+        RedlineDsparkArm,
+        deepseek4::spec_impl::DsparkVerifyCaptureInfo,
+    ),
+    String,
+> {
+    redline_prime_dspark_shadow_arm(gpu, loaded, context)?;
+    let bundle = match loaded.state.as_mut() {
+        Some(ModelState::Deepseek4(bundle)) => bundle,
+        _ => unreachable!(),
+    };
+    let guard_before = redline_dspark_verify_guard(gpu, bundle, batch)?;
+    let started = Instant::now();
+    let first_block = redline_dspark_shadow_block(0, batch);
+    let (first_picks, capture) =
+        bundle.redline_dspark_verify_capture_pm4(gpu, controller, &first_block, context)?;
+    let mut picks = Vec::with_capacity(batch * iterations);
+    picks.extend(first_picks);
+    for step in 1..iterations {
+        let block = redline_dspark_shadow_block(step, batch);
+        picks.extend(bundle.redline_dspark_verify_direct(
+            gpu,
+            &block,
+            context + step * batch,
+            true,
+        )?);
+    }
+    gpu.hip
+        .device_synchronize()
+        .map_err(|error| error.to_string())?;
+    let host_us = started.elapsed().as_secs_f64() * 1_000_000.0;
+    let guard_after = redline_dspark_verify_guard(gpu, bundle, batch)?;
+    let snapshot = redline_dspark_verify_snapshot(gpu, bundle, batch, picks)?;
+    Ok((
+        RedlineDsparkArm {
+            snapshot,
+            guard_before,
+            guard_after,
+            host_us,
+        },
+        capture,
+    ))
+}
+
+#[derive(Clone, Copy)]
+enum RedlineDsparkReplayArm {
+    CapturedHip,
+    Pm4,
+}
+
+fn redline_run_dspark_replay_arm(
+    gpu: &mut rdna_compute::Gpu,
+    loaded: &mut LoadedModel,
+    controller: &mut rdna_compute::replay::ReplayController,
+    context: usize,
+    batch: usize,
+    iterations: usize,
+    route: RedlineDsparkReplayArm,
+) -> Result<RedlineDsparkArm, String> {
+    redline_prime_dspark_shadow_arm(gpu, loaded, context)?;
+    let bundle = match loaded.state.as_mut() {
+        Some(ModelState::Deepseek4(bundle)) => bundle,
+        _ => unreachable!(),
+    };
+    let guard_before = redline_dspark_verify_guard(gpu, bundle, batch)?;
+    let started = Instant::now();
+    let mut picks = Vec::with_capacity(batch * iterations);
+    for step in 0..iterations {
+        let block = redline_dspark_shadow_block(step, batch);
+        let position = context + step * batch;
+        let window = match route {
+            RedlineDsparkReplayArm::CapturedHip => {
+                bundle.redline_dspark_verify_captured_hip(gpu, controller, &block, position)?
+            }
+            RedlineDsparkReplayArm::Pm4 => {
+                bundle.redline_dspark_verify_pm4(gpu, controller, &block, position)?
+            }
+        };
+        picks.extend(window);
+    }
+    gpu.hip
+        .device_synchronize()
+        .map_err(|error| error.to_string())?;
+    let host_us = started.elapsed().as_secs_f64() * 1_000_000.0;
+    let guard_after = redline_dspark_verify_guard(gpu, bundle, batch)?;
+    let snapshot = redline_dspark_verify_snapshot(gpu, bundle, batch, picks)?;
+    Ok(RedlineDsparkArm {
+        snapshot,
+        guard_before,
+        guard_after,
+        host_us,
+    })
+}
+
+/// DSpark-specific retained-verify parity oracle.
+///
+/// Four arms start from an identical synthetic prefill state:
+/// shipping ordinary HIP, capture-safe HIP, exact captured HIP blobs, and one
+/// conservative single-queue PM4 IB. Dynamic tokens/positions/counts change at
+/// every window.  Promotion requires equality of outputs, logits, KV,
+/// compressor/recurrent state, hidden captures, active streams, and inactive
+/// same-allocation guard rows.
+fn redline_shadow_dspark_verify_pm4(
+    gpu: &mut rdna_compute::Gpu,
+    loaded: &mut LoadedModel,
+    context: usize,
+    batch: usize,
+    iterations: usize,
+) -> Result<serde_json::Value, String> {
+    if loaded.pp > 1
+        || loaded.ep.is_some()
+        || !matches!(loaded.state.as_ref(), Some(ModelState::Deepseek4(_)))
+    {
+        return Err("DSpark shadow requires a loaded single-GPU DeepSeek4 model".to_string());
+    }
+    if batch == 0 || iterations == 0 {
+        return Err("DSpark shadow batch and iterations must be non-zero".to_string());
+    }
+    if context
+        .saturating_add(batch.saturating_mul(iterations))
+        .saturating_add(32)
+        > loaded.physical_cap
+    {
+        return Err(format!(
+            "DSpark shadow context+windows exceeds physical_cap={}",
+            loaded.physical_cap
+        ));
+    }
+    {
+        let bundle = match loaded.state.as_mut() {
+            Some(ModelState::Deepseek4(bundle)) => bundle,
+            _ => unreachable!(),
+        };
+        if bundle.weights.dspark.is_none() {
+            return Err("DSpark shadow requires a loaded DSpark sidecar".to_string());
+        }
+        bundle.redline_ensure_dspark_verify_pbs(gpu, batch + 1)?;
+    }
+
+    // Materialize lazy verify allocations and code objects before any arm takes
+    // a guard snapshot or starts recording.
+    redline_prime_dspark_shadow_arm(gpu, loaded, context)?;
+    {
+        let bundle = match loaded.state.as_mut() {
+            Some(ModelState::Deepseek4(bundle)) => bundle,
+            _ => unreachable!(),
+        };
+        let warm_block = redline_dspark_shadow_block(0, batch);
+        let _ = bundle.redline_dspark_verify_direct(gpu, &warm_block, context, false)?;
+    }
+    gpu.hip
+        .device_synchronize()
+        .map_err(|error| error.to_string())?;
+
+    let direct = redline_run_dspark_direct_arm(gpu, loaded, context, batch, iterations, false)?;
+    let mut controller = rdna_compute::replay::ReplayController::new_manual_pm4();
+    let (capture_safe, capture_info) =
+        redline_run_dspark_capture_arm(gpu, loaded, &mut controller, context, batch, iterations)?;
+    let captured_hip = redline_run_dspark_replay_arm(
+        gpu,
+        loaded,
+        &mut controller,
+        context,
+        batch,
+        iterations,
+        RedlineDsparkReplayArm::CapturedHip,
+    )?;
+    controller.begin_replay_observation_window();
+    let pm4 = redline_run_dspark_replay_arm(
+        gpu,
+        loaded,
+        &mut controller,
+        context,
+        batch,
+        iterations,
+        RedlineDsparkReplayArm::Pm4,
+    )?;
+
+    let direct_capture_exact = direct.snapshot == capture_safe.snapshot;
+    let blob_bit_exact = capture_safe.snapshot == captured_hip.snapshot;
+    let pm4_bit_exact = capture_safe.snapshot == pm4.snapshot;
+    let guard_exact = direct.guard_unchanged()
+        && capture_safe.guard_unchanged()
+        && captured_hip.guard_unchanged()
+        && pm4.guard_unchanged();
+    let observation = controller.replay_observation();
+    let identity = controller
+        .prepared_route_identity()
+        .ok_or_else(|| "DSpark shadow PM4 identity missing after prepare".to_string())?;
+    let response = serde_json::json!({
+        "type": "redline_dspark_shadow_result",
+        "backend": "pm4_ib",
+        "execution_mode": "dspark_verify",
+        "context_tokens": context,
+        "verify_batch": batch,
+        "iterations": iterations,
+        "bit_exact": direct_capture_exact && blob_bit_exact && pm4_bit_exact && guard_exact,
+        "direct_capture_exact": direct_capture_exact,
+        "blob_bit_exact": blob_bit_exact,
+        "pm4_bit_exact": pm4_bit_exact,
+        "guard_exact": guard_exact,
+        "pm4_components": {
+            "picks_equal": capture_safe.snapshot.picks == pm4.snapshot.picks,
+            "logits_equal": capture_safe.snapshot.target.logits == pm4.snapshot.target.logits,
+            "kv_equal": capture_safe.snapshot.target.kv == pm4.snapshot.target.kv,
+            "recurrent_equal": capture_safe.snapshot.target.recurrent == pm4.snapshot.target.recurrent,
+            "captures_equal": capture_safe.snapshot.captures == pm4.snapshot.captures,
+            "streams_equal": capture_safe.snapshot.streams == pm4.snapshot.streams,
+        },
+        "capture": {
+            "launches": capture_info.capture.launch_count,
+            "unique_kernels": capture_info.capture.unique_kernel_count,
+            "sequence_hash": format!("{:016x}", capture_info.capture.sequence_hash),
+            "aql_contracts": capture_info.aql_contracts,
+        },
+        "prepared": {
+            "dispatches": identity.dispatch_count,
+            "packets": identity.packet_count,
+            "queue_id": identity.queue_id,
+            "command_dwords": identity.command_dwords,
+            "queue_count": identity.queue_count,
+            "phase_count": identity.phase_count,
+        },
+        "observed": {
+            "replays": observation.count,
+            "first_position": observation.first_position,
+            "last_position": observation.last_position,
+            "failed": observation.failed,
+        },
+        "direct": direct.json(),
+        "capture_safe": capture_safe.json(),
+        "captured_hip": captured_hip.json(),
+        "pm4": pm4.json(),
+    });
+    if let Some(ModelState::Deepseek4(bundle)) = loaded.state.as_mut() {
+        redline_reset_deepseek4(gpu, bundle)?;
+    }
+    Ok(response)
 }
 
 fn redline_pm4_prefix_profile_deepseek4(
@@ -7961,6 +8472,43 @@ fn main() {
                     }
                 }
                 let _ = stdout.flush();
+            }
+
+            "redline_dspark_shadow_pm4" => {
+                let context = msg
+                    .get("context_tokens")
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(128) as usize;
+                let batch = msg
+                    .get("verify_batch")
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(3) as usize;
+                let iterations = msg
+                    .get("iterations")
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(15) as usize;
+                let response = model
+                    .as_mut()
+                    .ok_or_else(|| "DSpark shadow requires a loaded model".to_string())
+                    .and_then(|loaded| {
+                        redline_shadow_dspark_verify_pm4(
+                            &mut gpu, loaded, context, batch, iterations,
+                        )
+                    });
+                match response {
+                    Ok(response) => {
+                        let _ = writeln!(stdout, "{response}");
+                    }
+                    Err(reason) => {
+                        let _ = writeln!(
+                            stdout,
+                            "{}",
+                            serde_json::json!({"type": "error", "message": reason})
+                        );
+                    }
+                }
+                let _ = stdout.flush();
+                continue;
             }
 
             "redline_shadow_aql" | "redline_shadow_pm4" => {

@@ -26,7 +26,7 @@ use crate::forward::{
     upload_prefill_batch_inputs, PrefillBatchScratch,
 };
 use hipfire_runtime::spec::{SpecAdvance, SpecScratch, SpecTarget};
-use rdna_compute::replay::ReplayState;
+use rdna_compute::replay::{ReplayCaptureSummary, ReplayController, ReplayState};
 use rdna_compute::{Gpu, GpuTensor};
 
 /// Owned deepseek4 model state — the future `ModelState::Deepseek4` payload and
@@ -44,6 +44,17 @@ pub struct Deepseek4Bundle {
 /// commit_prefix), so the scratch carries no GPU buffers — the PBS lives in
 /// `state.dspark_verify_pbs` and is reused across windows.
 pub struct Deepseek4DsparkScratch;
+
+/// Capture identity returned by the diagnostic DSpark retained-verify oracle.
+///
+/// This is deliberately separate from the production per-B controller stored
+/// in [`PrefillBatchScratch`].  A shadow run must not install, replace, or
+/// certify the route that serving may later use.
+#[derive(Clone, Copy, Debug)]
+pub struct DsparkVerifyCaptureInfo {
+    pub capture: ReplayCaptureSummary,
+    pub aql_contracts: usize,
+}
 
 impl SpecScratch for Deepseek4DsparkScratch {
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
@@ -80,6 +91,215 @@ fn dspark_verify_graph_batch() -> usize {
 }
 
 impl Deepseek4Bundle {
+    /// Materialize the DSpark verify scratch without entering speculation.
+    /// Used only by the Redline shadow adapter, which has no `SpecScratch`
+    /// object but must exercise the exact production PBS allocations.
+    pub fn redline_ensure_dspark_verify_pbs(
+        &mut self,
+        gpu: &mut Gpu,
+        min_batch: usize,
+    ) -> Result<(), String> {
+        let needs_alloc = self
+            .state
+            .dspark_verify_pbs
+            .as_ref()
+            .is_none_or(|pbs| pbs.max_batch < min_batch);
+        if needs_alloc {
+            self.state.dspark_verify_pbs = Some(
+                PrefillBatchScratch::new(
+                    gpu,
+                    &self.config,
+                    dspark_verify_pbs_max_batch().max(min_batch),
+                )
+                .map_err(|e| format!("Deepseek4Bundle: alloc redline dspark PBS: {e}"))?,
+            );
+        }
+        Ok(())
+    }
+
+    fn redline_take_dspark_verify_pbs(
+        &mut self,
+        gpu: &mut Gpu,
+        n_verify: usize,
+    ) -> Result<PrefillBatchScratch, String> {
+        self.redline_ensure_dspark_verify_pbs(gpu, n_verify)?;
+        if let Some(ref dspark) = self.weights.dspark {
+            self.state.dspark_target_layers = dspark.cfg.target_layer_ids.clone();
+        }
+        self.state.dspark_capture_active = true;
+        self.state
+            .dspark_verify_pbs
+            .take()
+            .ok_or_else(|| "Deepseek4Bundle: redline dspark PBS disappeared".to_string())
+    }
+
+    fn redline_finish_dspark_verify(
+        &mut self,
+        gpu: &mut Gpu,
+        pbs: PrefillBatchScratch,
+        n_verify: usize,
+        forward_result: Result<(), String>,
+    ) -> Result<Vec<u32>, String> {
+        self.state.dspark_verify_pbs = Some(pbs);
+        forward_result?;
+        // Materialise every head row for the oracle. Production may use the
+        // lazy prefix head, but the retained body ends before this call and the
+        // all-row result gives the shadow a stronger logits/output comparison.
+        self.dspark_verify_argmax(gpu, n_verify)
+    }
+
+    /// Run one explicit HIP verify arm for the DSpark Redline oracle.
+    ///
+    /// `capture_safe=false` is the shipping ordinary-HIP body.
+    /// `capture_safe=true` is the fixed-node body used by graph/PM4 replay.
+    pub fn redline_dspark_verify_direct(
+        &mut self,
+        gpu: &mut Gpu,
+        block: &[u32],
+        position: usize,
+        capture_safe: bool,
+    ) -> Result<Vec<u32>, String> {
+        let n_verify = block.len();
+        let pbs = self.redline_take_dspark_verify_pbs(gpu, n_verify)?;
+        let forward_result = if capture_safe {
+            upload_prefill_batch_inputs(&self.config, gpu, &pbs, block, position as u32).and_then(
+                |()| {
+                    forward_prefill_batch_chunk_preuploaded(
+                        &self.config,
+                        &self.weights,
+                        &mut self.state,
+                        gpu,
+                        &pbs,
+                        block,
+                        position as u32,
+                    )
+                },
+            )
+        } else {
+            forward_prefill_batch_chunk(
+                &self.config,
+                &self.weights,
+                &mut self.state,
+                gpu,
+                &pbs,
+                block,
+                position as u32,
+            )
+        };
+        self.redline_finish_dspark_verify(gpu, pbs, n_verify, forward_result)
+    }
+
+    /// Capture and prepare one isolated B-shaped PM4 verify route while also
+    /// executing its fixed-node HIP body for the current window.
+    pub fn redline_dspark_verify_capture_pm4(
+        &mut self,
+        gpu: &mut Gpu,
+        controller: &mut ReplayController,
+        block: &[u32],
+        position: usize,
+    ) -> Result<(Vec<u32>, DsparkVerifyCaptureInfo), String> {
+        let n_verify = block.len();
+        let pbs = self.redline_take_dspark_verify_pbs(gpu, n_verify)?;
+        let upload_result =
+            upload_prefill_batch_inputs(&self.config, gpu, &pbs, block, position as u32);
+        std::mem::swap(&mut gpu.replay, controller);
+        let capture_result = (|| -> Result<DsparkVerifyCaptureInfo, String> {
+            upload_result?;
+            gpu.replay
+                .begin_capture()
+                .map_err(|reason| format!("DSpark shadow begin capture: {reason}"))?;
+            forward_prefill_batch_chunk_preuploaded(
+                &self.config,
+                &self.weights,
+                &mut self.state,
+                gpu,
+                &pbs,
+                block,
+                position as u32,
+            )?;
+            gpu.hip
+                .device_synchronize()
+                .map_err(|e| format!("DSpark shadow capture sync: {e:?}"))?;
+            let capture = gpu
+                .replay
+                .finish_capture()
+                .map_err(|reason| format!("DSpark shadow finish capture: {reason}"))?;
+            let launches = gpu.replay.recorded_launches().len();
+            let contracts = gpu
+                .replay
+                .probe_aql_contracts(gpu.device_id as usize)
+                .map_err(|reason| format!("DSpark shadow AQL contracts: {reason}"))?;
+            gpu.replay
+                .prepare_pm4_prefix(gpu.device_id as usize, launches)
+                .map_err(|reason| format!("DSpark shadow PM4 prepare: {reason}"))?;
+            Ok(DsparkVerifyCaptureInfo {
+                capture,
+                aql_contracts: contracts.len(),
+            })
+        })();
+        std::mem::swap(&mut gpu.replay, controller);
+        let capture_info = match capture_result {
+            Ok(info) => info,
+            Err(error) => {
+                self.state.dspark_verify_pbs = Some(pbs);
+                return Err(error);
+            }
+        };
+        let picks = self.redline_finish_dspark_verify(gpu, pbs, n_verify, Ok(()))?;
+        Ok((picks, capture_info))
+    }
+
+    /// Replay the exact captured HIP blobs from a prior shadow capture.
+    pub fn redline_dspark_verify_captured_hip(
+        &mut self,
+        gpu: &mut Gpu,
+        controller: &mut ReplayController,
+        block: &[u32],
+        position: usize,
+    ) -> Result<Vec<u32>, String> {
+        let n_verify = block.len();
+        let pbs = self.redline_take_dspark_verify_pbs(gpu, n_verify)?;
+        let upload_result =
+            upload_prefill_batch_inputs(&self.config, gpu, &pbs, block, position as u32);
+        std::mem::swap(&mut gpu.replay, controller);
+        let replay_result = upload_result.and_then(|()| {
+            let launches = gpu.replay.recorded_launches().len();
+            gpu.replay_recorded_hip_prefix(launches)
+                .map_err(|e| format!("DSpark shadow captured HIP replay: {e:?}"))
+        });
+        std::mem::swap(&mut gpu.replay, controller);
+        self.redline_finish_dspark_verify(gpu, pbs, n_verify, replay_result)
+    }
+
+    /// Replay one previously prepared PM4 verify body with freshly uploaded
+    /// token/position/count inputs.
+    pub fn redline_dspark_verify_pm4(
+        &mut self,
+        gpu: &mut Gpu,
+        controller: &mut ReplayController,
+        block: &[u32],
+        position: usize,
+    ) -> Result<Vec<u32>, String> {
+        let n_verify = block.len();
+        let pbs = self.redline_take_dspark_verify_pbs(gpu, n_verify)?;
+        let upload_result =
+            upload_prefill_batch_inputs(&self.config, gpu, &pbs, block, position as u32);
+        std::mem::swap(&mut gpu.replay, controller);
+        let replay_result = upload_result.and_then(|()| {
+            if !gpu.replay.should_route_pm4() {
+                return Err(format!(
+                    "DSpark shadow PM4 controller is not ready: {:?}",
+                    gpu.replay.state()
+                ));
+            }
+            unsafe { gpu.replay.replay_pm4(position) }
+                .map(|_| ())
+                .map_err(|reason| format!("DSpark shadow PM4 replay: {reason}"))
+        });
+        std::mem::swap(&mut gpu.replay, controller);
+        self.redline_finish_dspark_verify(gpu, pbs, n_verify, replay_result)
+    }
+
     /// Shared verify forward for `verify_block` / `verify_block_capture_gpu`:
     /// arms hidden capture into `state.dspark_caps`, runs one batched trunk
     /// forward over `block` at `position`, and leaves the head unapplied. When
