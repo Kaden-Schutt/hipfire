@@ -3783,6 +3783,7 @@ where
 /// f16 halves the volume: hidden dominates at `4096 * 2 B` per position per
 /// layer, so 40 score-routed layers cost ~328 KB/position.
 fn dump_adapter_pairs(
+    layer: &crate::deepseek4::DeepseekV4LayerWeights,
     pbs: &PrefillBatchScratch,
     layer_idx: usize,
     batch_size: usize,
@@ -3837,6 +3838,19 @@ fn dump_adapter_pairs(
 
     write_f16(format!("{dir}/h_L{layer_idx}.bin"), &h, batch_size, hidden)?;
     write_f16(format!("{dir}/s_L{layer_idx}.bin"), &s, batch_size, n_exp)?;
+
+    // The live router selects bias-aware -- top-k over (scores + gate_bias) --
+    // so an offline study scoring against top-k of RAW scores measures the
+    // wrong target. gate_bias is a per-layer constant, so emit it once.
+    let bpath = format!("{dir}/b_L{layer_idx}.bin");
+    if !std::path::Path::new(&bpath).exists() {
+        if let Some(bias) = layer.gate_bias.as_ref() {
+            if let Ok(b) = gpu.download_f32(bias) {
+                let n = n_exp.min(b.len());
+                write_f16(bpath, &b, 1, n)?;
+            }
+        }
+    }
     Ok(())
 }
 
@@ -8065,7 +8079,7 @@ fn ffn_batched(
     // Pairing happens offline by shifting the layer index: layer L's hidden
     // against layer L+1's scores. Dumping BOTH at every layer means one hook
     // site supplies both sides.
-    dump_adapter_pairs(pbs, layer_idx, batch_size, hidden, n_exp, gpu)?;
+    dump_adapter_pairs(layer, pbs, layer_idx, batch_size, hidden, n_exp, gpu)?;
 
     // Routing + routed experts + combine now run through the centralized MoE
     // family (Ship 4.3 prefill). The router GEMV + sqrt_softplus (above) and the
