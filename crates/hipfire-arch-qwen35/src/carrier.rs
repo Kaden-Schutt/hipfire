@@ -211,6 +211,7 @@ fn plan_qwen35_gpu_stages(config: &Qwen35Config, ctx: &LoadCtx) -> Result<Qwen35
     } else {
         // Static path: final K mode + optional Lloyd-V known before allocation.
         let static_v = v_mode_override.unwrap_or(llama::VMode::Q8);
+        validate_cask_static_layout(ctx.cask.sidecar.is_some(), mode, static_v)?;
         if !matches!(static_v, llama::VMode::Q8) {
             let is_fwht = matches!(
                 mode,
@@ -233,6 +234,37 @@ fn plan_qwen35_gpu_stages(config: &Qwen35Config, ctx: &LoadCtx) -> Result<Qwen35
             kv_v_env,
         })
     }
+}
+
+/// CASK's score kernels currently decode Q8/Givens-asym K and its compaction
+/// path copies Q8 V rows. VMM does not change those bytes, but enabling an
+/// unsupported FWHT/Lloyd layout would defer a deterministic format mismatch
+/// until the first eviction. Reject it in the CPU plan instead.
+fn validate_cask_static_layout(
+    cask_enabled: bool,
+    mode: hipfire_runtime::kv_mode::KvMode,
+    v_mode: llama::VMode,
+) -> Result<(), String> {
+    if !cask_enabled {
+        return Ok(());
+    }
+    if !matches!(v_mode, llama::VMode::Q8) {
+        return Err(format!(
+            "CASK currently requires V=q8 (resolved V mode is {v_mode:?})"
+        ));
+    }
+    if !matches!(
+        mode,
+        hipfire_runtime::kv_mode::KvMode::Q8
+            | hipfire_runtime::kv_mode::KvMode::Asym2
+            | hipfire_runtime::kv_mode::KvMode::Asym3
+            | hipfire_runtime::kv_mode::KvMode::Asym4
+    ) {
+        return Err(format!(
+            "CASK currently supports Q8/asym2/asym3/asym4 K only (resolved mode is {mode:?})"
+        ));
+    }
+    Ok(())
 }
 
 fn construct_kv_cache(
@@ -607,5 +639,27 @@ mod tests {
         let s = append_cleanup_context("kv failed".into(), Err("pending VMM teardown".into()));
         assert!(s.starts_with("kv failed; cleanup also failed:"), "{s}");
         assert!(s.contains("pending VMM"), "{s}");
+    }
+
+    #[test]
+    fn cask_static_layout_accepts_only_current_compaction_formats() {
+        use hipfire_runtime::kv_mode::KvMode;
+
+        for mode in [KvMode::Q8, KvMode::Asym2, KvMode::Asym3, KvMode::Asym4] {
+            validate_cask_static_layout(true, mode, VMode::Q8).unwrap();
+        }
+        for mode in [KvMode::Fwht2, KvMode::Fwht3, KvMode::Fwht4] {
+            let err = validate_cask_static_layout(true, mode, VMode::Q8).unwrap_err();
+            assert!(err.contains("Q8/asym2/asym3/asym4"), "{err}");
+        }
+        let err = validate_cask_static_layout(true, KvMode::Fwht3, VMode::Lloyd3).unwrap_err();
+        assert!(err.contains("V=q8"), "{err}");
+    }
+
+    #[test]
+    fn cask_layout_guard_is_inert_when_cask_is_disabled() {
+        use hipfire_runtime::kv_mode::KvMode;
+
+        validate_cask_static_layout(false, KvMode::Fwht3, VMode::Lloyd3).unwrap();
     }
 }

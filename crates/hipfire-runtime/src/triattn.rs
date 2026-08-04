@@ -943,6 +943,10 @@ impl EvictionCtx {
         if current_physical < self.budget + self.beta {
             return Ok(None);
         }
+        // Ordinary forwards preflight this prefix before writing it. Keep the
+        // eviction operation independently safe as well: a direct caller must
+        // never launch score/gather kernels across an unmapped VMM tail.
+        kv.require_mapped_capacity(current_physical)?;
         let absolute_pos = current_physical + kv.compact_offset;
         let p_q = absolute_pos as f32;
 
