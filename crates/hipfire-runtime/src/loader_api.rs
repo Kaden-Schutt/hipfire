@@ -144,3 +144,93 @@ pub struct CaskConfig {
     pub core_frac: f32,
     pub fold_m: usize,
 }
+
+impl CaskConfig {
+    /// Resolve the bounded physical KV window used by CASK/TriAttention.
+    ///
+    /// Keep this next to the shared load contract so the architecture carrier
+    /// allocates KV with the exact same cap later used to size the eviction
+    /// context. A mismatch is especially dangerous for VMM: the virtual reserve
+    /// and mapped-prefix guards must agree with the eviction trigger before the
+    /// first device allocation.
+    pub fn physical_cap(&self, max_seq: usize) -> Result<usize, String> {
+        let override_cap = hipfire_config::developer_var("HIPFIRE_KV_PHYSICAL_CAP")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok());
+        self.physical_cap_with_override(max_seq, override_cap)
+    }
+
+    /// Pure resolution seam used by CPU tests. An explicit override is clamped
+    /// to the safe CASK window, preserving the historical environment-variable
+    /// behavior without mutating process-global state in tests.
+    pub fn physical_cap_with_override(
+        &self,
+        max_seq: usize,
+        override_cap: Option<usize>,
+    ) -> Result<usize, String> {
+        if self.sidecar.is_none() {
+            return Ok(max_seq);
+        }
+        let trigger = self
+            .budget
+            .checked_add(self.beta)
+            .ok_or_else(|| "CASK budget + beta overflowed".to_string())?;
+        let floor = trigger
+            .checked_add(4)
+            .ok_or_else(|| "CASK physical-cap safety margin overflowed".to_string())?;
+        if floor > max_seq {
+            return Err(format!(
+                "CASK requires max_seq >= budget + beta + 4 (got max_seq={max_seq}, budget={}, beta={})",
+                self.budget, self.beta
+            ));
+        }
+        let derived = trigger.saturating_add(256).min(max_seq);
+        Ok(override_cap.unwrap_or(derived).clamp(floor, max_seq))
+    }
+}
+
+#[cfg(test)]
+mod cask_config_tests {
+    use super::CaskConfig;
+
+    fn enabled() -> CaskConfig {
+        CaskConfig {
+            sidecar: Some("centers.bin".into()),
+            budget: 4096,
+            beta: 128,
+            ..CaskConfig::default()
+        }
+    }
+
+    #[test]
+    fn disabled_cask_keeps_full_physical_cap() {
+        assert_eq!(
+            CaskConfig::default()
+                .physical_cap_with_override(32_768, Some(1024))
+                .unwrap(),
+            32_768
+        );
+    }
+
+    #[test]
+    fn enabled_cask_derives_and_clamps_physical_cap() {
+        let cask = enabled();
+        assert_eq!(cask.physical_cap_with_override(32_768, None).unwrap(), 4480);
+        assert_eq!(
+            cask.physical_cap_with_override(32_768, Some(1)).unwrap(),
+            4228
+        );
+        assert_eq!(
+            cask.physical_cap_with_override(5000, Some(99_999)).unwrap(),
+            5000
+        );
+    }
+
+    #[test]
+    fn enabled_cask_rejects_an_impossible_window() {
+        let err = enabled()
+            .physical_cap_with_override(4200, None)
+            .unwrap_err();
+        assert!(err.contains("budget + beta + 4"), "{err}");
+    }
+}

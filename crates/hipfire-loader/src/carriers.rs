@@ -338,12 +338,6 @@ impl Carrier for Qwen35Carrier {
                     .into(),
             );
         }
-        if ctx.kv_backend == KvBackend::Vmm && ctx.cask.sidecar.is_some() {
-            return Err(
-                "qwen35: KV backend 'vmm' does not yet support CASK/TriAttention eviction; disable the sidecar or use 'contiguous'"
-                    .into(),
-            );
-        }
         // Dir + pp>1: early return before any diagnostics/meta resolution,
         // preserving the original error string and preventing tokenizer work.
         if ctx.pp > 1 {
@@ -363,17 +357,7 @@ impl Carrier for Qwen35Carrier {
                 }
 
                 // ── pp=1 path (single-GPU) ────────────────────
-                let physical_cap = if ctx.cask.sidecar.is_some() {
-                    let env_override = hipfire_config::developer_var("HIPFIRE_KV_PHYSICAL_CAP")
-                        .ok()
-                        .and_then(|s| s.parse::<usize>().ok());
-                    let safety = 256usize;
-                    let floor = ctx.cask.budget + ctx.cask.beta + 4;
-                    let derived = ctx.cask.budget + ctx.cask.beta + safety;
-                    env_override.unwrap_or(derived).clamp(floor, ctx.max_seq)
-                } else {
-                    ctx.max_seq
-                };
+                let physical_cap = ctx.cask.physical_cap(ctx.max_seq)?;
 
                 // VL detection — loads weights from hfq_file in-place
                 let (vision_config, vision_weights) = {

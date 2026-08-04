@@ -171,12 +171,13 @@ fn plan_qwen35_gpu_stages(config: &Qwen35Config, ctx: &LoadCtx) -> Result<Qwen35
         }
     }
 
+    let physical_cap = ctx.cask.physical_cap(ctx.max_seq)?;
     let dims = KvDims {
         layers: KvLayers::Mask(is_kv_layer.clone()),
         n_kv_heads: config.n_kv_heads,
         head_dim: config.head_dim,
         max_seq: ctx.max_seq,
-        physical_cap: Some(ctx.max_seq),
+        physical_cap: Some(physical_cap),
     };
 
     if let Some((preset, k_floor, v_floor)) = adaptive_req {
@@ -293,6 +294,10 @@ fn construct_kv_cache(
     } else {
         let static_v = plan.static_v;
         let mode = plan.mode;
+        let physical_cap = plan
+            .dims
+            .physical_cap
+            .expect("Qwen3.5 KV plan always resolves physical_cap");
         let kv = match (ctx.kv_backend, static_v) {
             (KvBackend::Vmm, vm) => {
                 // Unified VMM constructor: reserve == current; never post-alloc realloc.
@@ -302,7 +307,7 @@ fn construct_kv_cache(
                     config.n_kv_heads,
                     config.head_dim,
                     ctx.max_seq,
-                    ctx.max_seq,
+                    physical_cap,
                     mode,
                     vm,
                 )
