@@ -384,6 +384,23 @@ impl Ds4ExpertPager {
         (self.hits, self.misses)
     }
 
+    /// Forget that `key` is resident.
+    ///
+    /// Called when a slot's read FAILED: `resolve_slot` has already recorded
+    /// the expert as occupying the slot, but the bytes never arrived, so the
+    /// slot holds stale or partial data. Without this the next dispatch that
+    /// routes to `key` would see a hit, skip the read, and compute against
+    /// whatever was there — silently wrong output from a recovered I/O error.
+    ///
+    /// The slot itself stays in the LRU queue with no occupant. That is safe:
+    /// nothing claims it, so it can only be used again after a fresh read, and
+    /// it will be handed out as a victim in the normal course.
+    pub fn invalidate(&mut self, key: ExpertKey) {
+        if let Some(slot) = self.resident.remove(&key) {
+            self.occupant.remove(&(key.layer, key.role, slot));
+        }
+    }
+
     /// Resolve `key` to a slot index, evicting LRU if needed.
     ///
     /// Returns `(slot_index, was_miss)`. On a miss the CALLER must read the
@@ -623,6 +640,12 @@ impl Ds4PagingRuntime {
             });
         }
         Ok(dirty)
+    }
+
+    /// Forget a failed fill so it is re-read rather than trusted.
+    /// See [`Ds4ExpertPager::invalidate`].
+    pub fn invalidate(&mut self, key: ExpertKey) {
+        self.pager.invalidate(key);
     }
 
     /// Encode the host shadow into the two-F32-slot device representation.
@@ -1035,6 +1058,15 @@ impl Ds4ExpertPaging {
             let fetched = self.transport.fetch_batch_into(&reqs, blob, gpu);
             self.ns_read += t_read.elapsed().as_nanos() as u64;
             if let Err(e) = fetched {
+                // The batch is all-or-nothing from the pager's point of view:
+                // `plan_dispatch` already recorded every one of these experts
+                // as resident, but their bytes did not arrive. Forget them so
+                // a later dispatch re-reads instead of trusting the slot.
+                // Leaving them marked resident is how a recovered read error
+                // turns into silently wrong output.
+                for f in fills.iter().filter(|f| f.needs_read) {
+                    self.rt.invalidate(f.key);
+                }
                 let key = first_key.unwrap_or(ExpertKey {
                     layer,
                     expert: 0,
@@ -1628,6 +1660,74 @@ mod tests {
             let hi = enc[e * 2 + 1].to_bits() as u64;
             assert_eq!((hi << 32) | lo, p, "expert {e} pointer did not round-trip");
         }
+    }
+
+    #[test]
+    fn an_invalidated_expert_is_read_again_not_trusted() {
+        // THE regression test for a recovered read error. `plan_dispatch`
+        // records residency BEFORE the bytes are read, so if the read fails
+        // the slot holds stale data while the pager thinks it is populated.
+        // After invalidation the next dispatch must MISS and re-read; if it
+        // hits, the model computes against whatever was in the slot.
+        let mut rt = runtime_with(16, 8, &[0]);
+        let mut out = Vec::new();
+        let key = ExpertKey {
+            layer: 0,
+            expert: 5,
+            role: ExpertBlobRole::GateUp,
+        };
+
+        rt.plan_dispatch(0, ExpertBlobRole::GateUp, &[5], 2048, TEST_BASE, &mut out)
+            .expect("plans");
+        assert!(out[0].needs_read, "first touch must read");
+
+        // Simulate the read having failed.
+        rt.invalidate(key);
+
+        rt.plan_dispatch(0, ExpertBlobRole::GateUp, &[5], 2048, TEST_BASE, &mut out)
+            .expect("plans");
+        assert!(
+            out[0].needs_read,
+            "an expert whose read failed must be re-read, not served from its slot"
+        );
+    }
+
+    #[test]
+    fn invalidation_frees_the_slot_for_reuse() {
+        // The slot stays in the LRU with no occupant. It must not leak: a
+        // full bucket has to keep handing out slots, and the invalidated
+        // expert must not be resurrected as some other expert's occupant.
+        let mut rt = runtime_with(16, 2, &[0]);
+        let mut out = Vec::new();
+        let k = |e: u16| ExpertKey {
+            layer: 0,
+            expert: e,
+            role: ExpertBlobRole::Down,
+        };
+        rt.plan_dispatch(0, ExpertBlobRole::Down, &[1, 2], 1024, TEST_BASE, &mut out)
+            .expect("plans");
+        rt.invalidate(k(1));
+        // Pool still works and never hands out an out-of-range slot.
+        for e in 3..12u16 {
+            rt.plan_dispatch(0, ExpertBlobRole::Down, &[e], 1024, TEST_BASE, &mut out)
+                .expect("plans");
+            assert!(out[0].slot < 2, "slot {} outside pool of 2", out[0].slot);
+        }
+        // And expert 1 is still not resident.
+        rt.plan_dispatch(0, ExpertBlobRole::Down, &[1], 1024, TEST_BASE, &mut out)
+            .expect("plans");
+        assert!(out[0].needs_read, "invalidated expert must not come back");
+    }
+
+    #[test]
+    fn invalidating_an_absent_expert_is_a_no_op() {
+        let mut rt = runtime_with(8, 4, &[0]);
+        rt.invalidate(ExpertKey {
+            layer: 0,
+            expert: 3,
+            role: ExpertBlobRole::GateUp,
+        });
+        assert_eq!(rt.stats(), (0, 0));
     }
 
     #[test]
