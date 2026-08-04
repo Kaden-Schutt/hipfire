@@ -5530,6 +5530,10 @@ pub const GEMV_MQ2G256_LLOYD_MOE_GATE_UP_INDEXED_BATCHED_K4_SRC: &str =
 pub const GEMV_MQ2G256_LLOYD_MOE_DOWN_INDEXED_BATCHED_K4_SRC: &str =
     include_str!("../../../kernels/src/gemv_mq2g256_lloyd_moe_down_indexed_batched_k4.hip");
 
+/// Position-batched form of the shipping K=2048 K8-all routed-down kernel.
+pub const GEMV_MQ2G256_LLOYD_MOE_DOWN_INDEXED_BATCHED_K8ALL_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mq2g256_lloyd_moe_down_indexed_batched_k8all.hip");
+
 pub const GEMV_MQ3G256_LLOYD_MOE_DOWN_INDEXED_BATCHED_K4_SRC: &str =
     include_str!("../../../kernels/src/gemv_mq3g256_lloyd_moe_down_indexed_batched_k4.hip");
 

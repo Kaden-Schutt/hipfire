@@ -1913,19 +1913,42 @@ pub fn run_moe_prefill_bias_aware(
                 batch_size,
             ))?;
         } else {
-            hip!(
-                gpu.deepseek4_gemv_mq2g256_lloyd_moe_down_residual_scaled_indexed_batched_k4(
-                    p.expert_down_ptrs,
-                    p.topk_indices,
-                    p.topk_weights,
-                    p.rot_batch,
-                    p.ffn_out,
-                    hidden,
-                    im,
-                    k_top,
-                    batch_size,
-                )
-            )?;
+            // DeepSeek4's routed down projection has fixed K=2048. The ordinary
+            // AR route already uses the K8-all body; use its position-batched
+            // twin for gfx1151 verify as well. Keep an explicit rollback switch
+            // while this route is certified for retained replay.
+            let use_batched_k8all = gpu.arch.eq_ignore_ascii_case("gfx1151")
+                && im == 2048
+                && hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MOE_DOWN_BATCHED_K8ALL")
+                    .as_deref()
+                    != Ok("0");
+            if use_batched_k8all {
+                hip!(gpu
+                    .deepseek4_gemv_mq2g256_lloyd_moe_down_residual_scaled_indexed_batched_k8all(
+                        p.expert_down_ptrs,
+                        p.topk_indices,
+                        p.topk_weights,
+                        p.rot_batch,
+                        p.ffn_out,
+                        hidden,
+                        im,
+                        k_top,
+                        batch_size,
+                    ))?;
+            } else {
+                hip!(gpu
+                    .deepseek4_gemv_mq2g256_lloyd_moe_down_residual_scaled_indexed_batched_k4(
+                        p.expert_down_ptrs,
+                        p.topk_indices,
+                        p.topk_weights,
+                        p.rot_batch,
+                        p.ffn_out,
+                        hidden,
+                        im,
+                        k_top,
+                        batch_size,
+                    ))?;
+            }
         }
     }
 
