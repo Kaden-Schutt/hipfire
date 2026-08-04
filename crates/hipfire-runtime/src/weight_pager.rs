@@ -307,6 +307,61 @@ impl PreadH2DTransport {
         &self.path
     }
 
+    /// Read every range into the staging buffer and hand it back, WITHOUT
+    /// touching the device.
+    ///
+    /// Split out from `fetch_batch_into` because a caller may need to
+    /// transform the bytes between disk and slot. Tensor-parallel expert
+    /// slicing (PR #527) is the motivating case: each rank keeps only
+    /// `inter/tp` of every expert, so the bytes read are the FULL expert and
+    /// the bytes written are a row-gathered subset — read length and write
+    /// length differ, which the combined read-and-copy path cannot express.
+    ///
+    /// Returns the staging prefix holding the requests back to back in order.
+    pub fn read_batch(&mut self, reqs: &[FetchReq]) -> Result<&[u8], String> {
+        use rayon::prelude::*;
+
+        if reqs.is_empty() {
+            return Ok(&self.staging[..0]);
+        }
+        let total: usize = reqs.iter().map(|r| r.len).sum();
+        if self.staging.len() < total {
+            self.staging.resize(total, 0);
+        }
+        let mut rest: &mut [u8] = &mut self.staging[..total];
+        let mut parts: Vec<(&mut [u8], usize)> = Vec::with_capacity(reqs.len());
+        for r in reqs {
+            let (head, tail) = rest.split_at_mut(r.len);
+            parts.push((head, r.hfq_offset));
+            rest = tail;
+        }
+        let t = std::time::Instant::now();
+        let file = &self.file;
+        let errs: Vec<String> = parts
+            .into_par_iter()
+            .filter_map(|(buf, offset)| {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::FileExt;
+                    match file.read_exact_at(buf, offset as u64) {
+                        Ok(()) => None,
+                        Err(e) => Some(format!("pread at {offset}: {e}")),
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = (buf, offset, file);
+                    Some("concurrent pread requires unix".to_string())
+                }
+            })
+            .collect();
+        self.ns_pread += t.elapsed().as_nanos() as u64;
+        match errs.first() {
+            Some(e) => Err(e.clone()),
+            None => Ok(&self.staging[..total]),
+        }
+    }
+
     /// `(pread_ns, h2d_copy_ns)` accumulated across all `fetch_into` calls.
     pub fn io_split(&self) -> (u64, u64) {
         (self.ns_pread, self.ns_copy)

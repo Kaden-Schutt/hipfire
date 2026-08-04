@@ -406,18 +406,17 @@ impl DeepseekV4 {
         }
         let gate_up_stride = stride_w1 + stride_w3;
 
-        let alloc_pool =
-            |stride: usize, what: &str| -> Result<rdna_compute::GpuTensor, String> {
-                let zeros = vec![0u8; slots * stride];
-                gpu.upload_raw(&zeros, &[slots, stride])
-                    .map_err(|e| format!("deepseek4: alloc paged {what} pool {prefix}: {e:?}"))
-            };
+        let alloc_pool = |stride: usize, what: &str| -> Result<rdna_compute::GpuTensor, String> {
+            let zeros = vec![0u8; slots * stride];
+            gpu.upload_raw(&zeros, &[slots, stride])
+                .map_err(|e| format!("deepseek4: alloc paged {what} pool {prefix}: {e:?}"))
+        };
         let w2_blob = alloc_pool(w2_stride, "w2")?;
         let gate_up_blob = alloc_pool(gate_up_stride, "gate_up")?;
 
         let upload_ptrs = |base: u64,
-                               what: &str,
-                               gpu: &mut Gpu|
+                           what: &str,
+                           gpu: &mut Gpu|
          -> Result<rdna_compute::GpuTensor, String> {
             let ptr_bytes: Vec<u8> = (0..n_exp).flat_map(|_| base.to_ne_bytes()).collect();
             let t = gpu
@@ -1452,6 +1451,35 @@ impl DeepseekV4 {
                 return Err("deepseek4: expert paging and EP sharding are mutually \
                             exclusive — the shard path aims non-owned experts at a \
                             zeroed dummy, which paging must never leave in place"
+                    .into());
+            }
+            // TP expert slicing + paging: refused until the fill transform is
+            // wired, NOT because the two are incompatible. Under TP each rank
+            // keeps `inter/tp` of every expert, so a paged fill must read the
+            // full expert and write a row-gathered subset. Every buffer and
+            // caller on the fill path is already sized for that
+            // (`ExpertFillTransform` in expert_pager.rs, exercised by the
+            // synthetic slicing tests); the only missing piece is the concrete
+            // gather, which PR #527 ships as
+            // `hipfire_runtime::weight_store::expert_tp_row_gather`.
+            //
+            // TO ENABLE once #527 lands on this base:
+            //   1. thread #527's `tp_slice` into `alloc_paged_layer_expert_pool`
+            //      and size the pool with the PACKED stride (`stride / tp`),
+            //      matching what its loader writes to `expert_*_stride`;
+            //   2. `paging.set_fill_transform(Box::new(TpRowGather { .. }), max_full_bytes)`
+            //      wrapping `expert_tp_row_gather`;
+            //   3. delete this guard.
+            // The catalog needs no change: it records FULL HFQ ranges, and the
+            // on-disk layout is TP-independent.
+            //
+            // Detection is deliberately duck-typed on the loader's own signal
+            // rather than a new parameter, so this compiles unchanged before
+            // and after #527.
+            if crate::expert_pager::tp_expert_slicing_active() {
+                return Err("deepseek4: expert paging + TP expert slicing not yet \
+                            wired — see the TO ENABLE note at this guard \
+                            (needs expert_tp_row_gather from PR #527)"
                     .into());
             }
             if paged_layers.is_empty() {

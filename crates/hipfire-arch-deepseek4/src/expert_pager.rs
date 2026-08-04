@@ -709,6 +709,42 @@ impl ExpertTrace {
     }
 }
 
+/// How the bytes read from the HFQ become the bytes written into a slot.
+///
+/// Exists so tensor-parallel expert slicing (PR #527) is a drop-in rather than
+/// a refactor. Under TP each rank keeps only `inter/tp` of every expert, so a
+/// fill READS the full expert and WRITES a row-gathered subset — read length
+/// and write length differ. Every caller and buffer on the fill path is
+/// already sized for that here; only the concrete gather is missing, and it is
+/// a pure function 527 already ships as
+/// `hipfire_runtime::weight_store::expert_tp_row_gather`.
+///
+/// The catalog deliberately keeps recording FULL HFQ ranges either way: the
+/// on-disk layout is TP-independent, and only the in-memory slot is sliced.
+pub trait ExpertFillTransform: Send + Sync {
+    /// Bytes a slot needs, given the bytes on disk. Identity returns `full`.
+    fn packed_len(&self, full_len: usize) -> usize;
+
+    /// Transform one expert's bytes into `out` (cleared first).
+    fn apply(&self, full: &[u8], out: &mut Vec<u8>) -> Result<(), String>;
+}
+
+/// Slot bytes are exactly the disk bytes. The only mode reachable until TP
+/// expert slicing lands; the fill path skips the copy entirely for it.
+#[derive(Debug, Clone, Copy)]
+pub struct IdentityFill;
+
+impl ExpertFillTransform for IdentityFill {
+    fn packed_len(&self, full_len: usize) -> usize {
+        full_len
+    }
+    fn apply(&self, full: &[u8], out: &mut Vec<u8>) -> Result<(), String> {
+        out.clear();
+        out.extend_from_slice(full);
+        Ok(())
+    }
+}
+
 /// The GPU-touching half of paging: owns the transport and every scratch
 /// buffer, so a cache miss on the forward path allocates nothing.
 pub struct Ds4ExpertPaging {
@@ -720,6 +756,10 @@ pub struct Ds4ExpertPaging {
     ptr_bytes: Vec<u8>,
     /// Batched read requests for one dispatch. Reused, never reallocated.
     reqs: Vec<hipfire_runtime::weight_pager::FetchReq>,
+    /// Disk-bytes -> slot-bytes. `None` is identity and skips the copy.
+    fill: Option<Box<dyn ExpertFillTransform>>,
+    /// Scratch for a transformed expert. Reused, never reallocated per fill.
+    fill_buf: Vec<u8>,
     topk_bytes: Vec<u8>,
     tile_bytes: Vec<u8>,
     tile_experts: Vec<i32>,
@@ -779,6 +819,8 @@ impl Ds4ExpertPaging {
             experts: Vec::with_capacity(max_working_set),
             ptr_bytes: vec![0u8; n_exp * 8],
             reqs: Vec::with_capacity(max_working_set * 2),
+            fill: None,
+            fill_buf: Vec::new(),
             topk_bytes: vec![0u8; max_working_set * 4],
             tile_bytes: Vec::new(),
             tile_experts: Vec::new(),
@@ -877,6 +919,16 @@ impl Ds4ExpertPaging {
                 .push(i32::from_ne_bytes([c[0], c[1], c[2], c[3]]));
         }
         Ok(&self.tile_experts)
+    }
+
+    /// Install a fill transform. `None` (the default) is identity.
+    ///
+    /// Set this when the loader sliced experts, so the pager writes the same
+    /// shape the loader did. Sizing scratch here keeps the fill path free of
+    /// allocation once running.
+    pub fn set_fill_transform(&mut self, t: Box<dyn ExpertFillTransform>, max_full_bytes: usize) {
+        self.fill_buf = vec![0u8; t.packed_len(max_full_bytes)];
+        self.fill = Some(t);
     }
 
     /// Whether this layer's experts are paged. False for layers left fully
@@ -1055,7 +1107,37 @@ impl Ds4ExpertPaging {
         }
         if !reqs.is_empty() {
             let t_read = std::time::Instant::now();
-            let fetched = self.transport.fetch_batch_into(&reqs, blob, gpu);
+            let fetched: Result<(), hip_bridge::HipError> = match self.fill.as_ref() {
+                // Identity: let the transport read and copy in one step.
+                None => self
+                    .transport
+                    .fetch_batch_into(&reqs, blob, gpu)
+                    .map(|_| ()),
+                // Transformed: read to host, reshape each expert, then copy
+                // the PACKED bytes. `dst_byte_offset` is already a packed
+                // offset because the pool was sized with the packed stride.
+                Some(t) => {
+                    let mut buf = std::mem::take(&mut self.fill_buf);
+                    let r = (|| -> Result<(), hip_bridge::HipError> {
+                        let raw = self
+                            .transport
+                            .read_batch(&reqs)
+                            .map_err(|e| hip_bridge::HipError::new(0, &e))?;
+                        let mut at = 0usize;
+                        for req in reqs.iter() {
+                            t.apply(&raw[at..at + req.len], &mut buf)
+                                .map_err(|e| hip_bridge::HipError::new(0, &e))?;
+                            at += req.len;
+                            gpu.bind_thread()?;
+                            gpu.hip
+                                .memcpy_htod_offset(&blob.buf, req.dst_byte_offset, &buf)?;
+                        }
+                        Ok(())
+                    })();
+                    self.fill_buf = buf;
+                    r
+                }
+            };
             self.ns_read += t_read.elapsed().as_nanos() as u64;
             if let Err(e) = fetched {
                 // The batch is all-or-nothing from the pager's point of view:
@@ -1303,6 +1385,22 @@ pub fn prefill_work_trace() -> bool {
     use std::sync::OnceLock;
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| std::env::var("HIPFIRE_DEEPSEEK4_PREFILL_WORK_TRACE").as_deref() == Ok("1"))
+}
+
+/// Whether the loader is slicing experts tensor-parallel.
+///
+/// Detected from the env knob the TP work uses rather than from a parameter,
+/// so this file compiles identically before and after PR #527 lands. Once the
+/// fill transform is wired this becomes dead and should be deleted along with
+/// the guard in `arch.rs` that calls it.
+pub fn tp_expert_slicing_active() -> bool {
+    matches!(
+        std::env::var("HIPFIRE_TP_EXPERT_SLICE").ok().as_deref(),
+        Some(v) if v != "0" && !v.is_empty()
+    ) || matches!(
+        std::env::var("HIPFIRE_TP").ok().and_then(|v| v.parse::<usize>().ok()),
+        Some(tp) if tp > 1
+    )
 }
 
 /// Environment knob that turns paging on. Unset (or unparseable, or `0`) keeps
@@ -1660,6 +1758,88 @@ mod tests {
             let hi = enc[e * 2 + 1].to_bits() as u64;
             assert_eq!((hi << 32) | lo, p, "expert {e} pointer did not round-trip");
         }
+    }
+
+    /// Stand-in for PR #527's `expert_tp_row_gather`: keeps rank `r` of `tp`
+    /// equal row-blocks. Same SHAPE of transform (full in, 1/tp out) without
+    /// depending on 527, so the fill path's read-len != write-len handling is
+    /// exercised today rather than discovered when TP lands.
+    struct EveryNthBlock {
+        block: usize,
+        rank: usize,
+        tp: usize,
+    }
+
+    impl ExpertFillTransform for EveryNthBlock {
+        fn packed_len(&self, full_len: usize) -> usize {
+            full_len / self.tp
+        }
+        fn apply(&self, full: &[u8], out: &mut Vec<u8>) -> Result<(), String> {
+            if full.len() % (self.block * self.tp) != 0 {
+                return Err(format!(
+                    "len {} not divisible by block {} * tp {}",
+                    full.len(),
+                    self.block,
+                    self.tp
+                ));
+            }
+            out.clear();
+            let nblocks = full.len() / self.block;
+            for b in 0..nblocks {
+                if b % self.tp == self.rank {
+                    out.extend_from_slice(&full[b * self.block..(b + 1) * self.block]);
+                }
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn identity_fill_is_byte_preserving() {
+        let f = IdentityFill;
+        let src: Vec<u8> = (0..64u8).collect();
+        let mut out = Vec::new();
+        f.apply(&src, &mut out).expect("applies");
+        assert_eq!(out, src);
+        assert_eq!(f.packed_len(64), 64);
+    }
+
+    #[test]
+    fn a_slicing_transform_shrinks_the_slot_bytes() {
+        // The property TP needs and identity cannot express: fewer bytes out
+        // than in, deterministic, and rank-disjoint.
+        let src: Vec<u8> = (0..64u8).collect();
+        let mut seen: Vec<u8> = Vec::new();
+        for rank in 0..4 {
+            let f = EveryNthBlock {
+                block: 4,
+                rank,
+                tp: 4,
+            };
+            let mut out = Vec::new();
+            f.apply(&src, &mut out).expect("applies");
+            assert_eq!(out.len(), f.packed_len(src.len()), "packed_len must agree");
+            assert_eq!(out.len(), 16, "1/tp of the input");
+            seen.extend_from_slice(&out);
+        }
+        seen.sort_unstable();
+        let mut want = src.clone();
+        want.sort_unstable();
+        assert_eq!(seen, want, "ranks must partition the expert exactly once");
+    }
+
+    #[test]
+    fn a_transform_that_rejects_bad_geometry_fails_closed() {
+        let f = EveryNthBlock {
+            block: 5,
+            rank: 0,
+            tp: 3,
+        };
+        let mut out = Vec::new();
+        assert!(
+            f.apply(&[0u8; 64], &mut out).is_err(),
+            "indivisible geometry must error, not silently truncate"
+        );
     }
 
     #[test]
