@@ -371,10 +371,29 @@ has been.
 - MQ2 measures *slower* than mq4r on decode → the SKU is size-only, not a
   Redline tier, and should be named/positioned accordingly.
 
-## 5b. The "MQ2-Lloyd loses ~12% activation energy" report — NOT A BUG
+## 5b. The "MQ2-Lloyd loses ~12% activation energy" report
 
-Reproduced, explained, and closed. **Do not chase this, and do not "fix" it with
-a gain correction — that would strictly increase error.**
+**Prior art supersedes this section's first draft.** See
+`docs/plans/2026-08-02-lloyd-shrinkage-gain.md` and
+`docs/plans/2026-08-02-quant-rate-distortion-headroom.md` on branch
+`ds4-beta-staging` (2026-08-02, status: proposed/analysis, not started). Read
+those first; what follows cross-validates them and answers two of their open
+questions.
+
+**Corrected conclusion.** The shrinkage is inherent to MMSE quantization — that
+part is settled and both analyses agree. But "inherent" does **not** mean
+"harmless" or "leave it alone", which is what an MSE-only reading suggests. The
+decisive fact is in the prior-art doc and is not visible from the codec math:
+DeepSeek V4 carries `route_scale`, a routed-branch-only multiplier that has been
+**silently absorbing this since May** (shipped 1.8 on `.mq2r`, 2.2 on other DS4
+builds, against a checkpoint value of 1.5 that the PyTorch reference confirms is
+correct at PPL 4.693). **Every other model on an MQ\*-Lloyd tier has no such
+knob, so those tensors are simply short — including
+`qwen3.6-35b-a3b.mq2`.** The defect is invisible where it was found and live
+everywhere else.
+
+That makes this a live candidate contributor to the 0.2381 baseline in Phase 0,
+not a closed item.
 
 Replicated `quantize_mq2g256_lloyd` exactly (LCG sign gen seeds 42/1042,
 `cpu_fwht_256`, percentile init, 8 Lloyd iters with the early-break, centroid
@@ -397,20 +416,65 @@ processing — so scalar Lloyd on a rotated block lands exactly on the Gaussian
 rate–distortion curve. A heavy-tailed input (Gaussian × Gamma) gave 11.06%, i.e.
 the result is robust to the source distribution.
 
-**2. It is not a correctable gain error.** The least-squares optimal rescale is
-**α = ⟨x,x̂⟩/⟨x̂,x̂⟩ = 0.9999** at every bit width, and applying it changes NRMSE
-by +0.00%. This is the orthogonality principle: a conditional-mean (MMSE)
-quantizer produces error e = x − x̂ with ⟨x̂, e⟩ = 0, hence ‖x‖² = ‖x̂‖² + ‖e‖².
-The "missing" energy lives *entirely* in the component orthogonal to the
-reconstruction. Scaling x̂ by 1/√0.888 = 1.061 to restore the second moment
-would move it off the LS optimum and raise MSE. Energy-matching a VQ is a
-pessimization, not a fix.
+**2. No rescale can reduce MSE — but MSE is the wrong acceptance metric.** The
+least-squares optimal rescale is **α = ⟨x,x̂⟩/⟨x̂,x̂⟩ = 0.9999** at every bit
+width (orthogonality principle: ⟨x̂, e⟩ = 0, so ‖x‖² = ‖x̂‖² + ‖e‖² and the
+missing energy is entirely orthogonal to the reconstruction). Any gain
+correction therefore *increases* reconstruction MSE by construction. The prior-art
+doc says the same thing and draws the right conclusion from it: **do not accept
+or reject a codebook gain on reconstruction MSE — accept on end-to-end PPL/KLD
+against the torch teacher.** The hypothesis worth testing is that a *systematic*
+magnitude bias compounds across 40+ layers in a way random error does not; DS4's
+empirically-tuned `route_scale` of 1.8–2.2 against a correct 1.5 is evidence for
+it, and it is the only evidence either way right now.
 
-**Corollary — energy retention is the wrong diagnostic.** It is blind to *where*
-the error lands, which is the only thing that matters for output quality. Two
-codebooks with identical 11.2% deficit can differ enormously in KLD depending on
-whether the error falls along high- or low-curvature directions. Use the KLD
-baseline (§Phase 0, 0.2381) to judge changes; ignore energy.
+### Answering prior-art open question #2 — per-format constants
+
+The prior art measured only MQ2-Lloyd and asked for the other tiers. Full ladder,
+independent codepath (a faithful Python port of the Rust encoder, synthetic
+post-FWHT Gaussian, 4000 blocks):
+
+| fmt | levels | retained *r* | ‖x̂‖/‖x‖ | **1/√r** (energy-preserving) | **1/r** (doc's constant) |
+|---|---|---|---|---|---|
+| MQ1L | 2 | 0.6423 | 0.8014 | 1.2478 | 1.5569 |
+| **MQ2L** | **4** | **0.8881** | **0.9424** | **1.0611** | **1.1260** |
+| MQ3L | 8 | 0.9656 | 0.9826 | 1.0177 | 1.0356 |
+| MQ4L | 16 | 0.9879 | 0.9939 | 1.0061 | 1.0122 |
+
+MQ2L cross-validates the prior art to three digits (0.8881 vs 0.8877 retained;
+1.1260 vs 1.1265). Their guess that MQ4's correction "may be negligible" is
+confirmed: 1.2% energy, 0.6% amplitude.
+
+### ⚠ Flag on the proposed constant — objective/formula mismatch
+
+The prior-art doc proposes folding **`1/retained` = 1.1265** into the codebook
+*"so the reconstruction preserves energy"*. Those are two different things.
+Applying 1.1265 yields energy `(1/r)²·r = 1/r = 1.1265×` the source — it
+**overshoots energy restoration by 12.65%**. The energy-preserving constant is
+`1/√r = 1.0614`.
+
+Three defensible targets, and the choice must be explicit:
+
+| constant | value (MQ2L) | restores |
+|---|---|---|
+| `1` | 1.0000 | MSE-optimal (orthogonality); no change |
+| `1/√r` | 1.0614 | ‖x̂‖ = ‖x‖ — energy/magnitude |
+| `1/r` | 1.1265 | E[x̂·x] = E[x²] — unbiased projection onto source |
+
+The gap between the two candidates is **6.1%**, which is ~5× the per-group
+spread (1.25% sd) the doc uses to justify a global constant over a per-group
+one — so this choice matters more than the thing that was already ruled out. It
+also changes the DS4 attribution: with 1.0614 rather than 1.1265, `.mq2r`'s
+shipped 1.2000 leaves residual **1.1306** (not 1.065) and the 2.2 build's 1.4667
+leaves **1.3819** (not 1.302), which enlarges their open question #4 rather than
+shrinking it.
+
+**Corollary — energy retention is the wrong *acceptance* metric** (though it is
+a fine diagnostic for deriving the constant). It is blind to *where* the error
+lands. Two codebooks with identical 11.2% deficit can differ enormously in KLD
+depending on whether error falls along high- or low-curvature directions. Judge
+changes on KLD/PPL against a teacher — for a3b, against the Phase 0 baseline of
+0.2381.
 
 Incidentally, the 8-vs-16 Lloyd-iteration question does **not** show up here
 either (11.19% vs 11.15%). Whatever caused the 2026-05-20 DeepSeek V4 60×
