@@ -277,6 +277,12 @@ pub struct PreadH2DTransport {
     /// prefetches pays nothing (and never pins unswappable pages).
     prefetch: Option<AsyncPrefetch>,
     ns_prefetch_wait: u64,
+    /// Non-owning alias of the destination, held between issue and wait.
+    ///
+    /// An alias rather than the tensor because GpuTensor is not Clone and the
+    /// pager does not own the blob. Valid because the blob outlives the
+    /// prefetch by construction: it is a per-layer pool allocated at load.
+    pending_dst: Option<hip_bridge::DeviceBuffer>,
 }
 
 impl PreadH2DTransport {
@@ -303,6 +309,7 @@ impl PreadH2DTransport {
             ns_copy: 0,
             prefetch: None,
             ns_prefetch_wait: 0,
+            pending_dst: None,
         })
     }
 
@@ -414,6 +421,8 @@ impl PreadH2DTransport {
             stream: gpu.hip.stream_create()?,
             event: gpu.hip.event_create()?,
             in_flight: false,
+            reader: None,
+            pending: Vec::new(),
         });
         Ok(())
     }
@@ -451,40 +460,90 @@ impl PreadH2DTransport {
             unsafe { std::slice::from_raw_parts_mut(p.pinned.0 as *mut u8, total) }
         };
 
-        let t = std::time::Instant::now();
-        if let Some(e) = pread_parts_into(&self.file, pinned, reqs) {
-            return Err(hip_bridge::HipError::new(0, &e));
-        }
-        self.ns_pread += t.elapsed().as_nanos() as u64;
-
-        gpu.bind_thread()?;
+        // Hand the pread to a worker so it overlaps the caller's GPU work.
+        // This is the half that matters: pread is ~60% of expert I/O and pure
+        // host/page-cache work, whereas the H2D on unified memory has little to
+        // hide behind. Doing it inline here is what made the first version
+        // SLOWER -- it added a blocking read of the predicted experts on top of
+        // the real dispatch's own reads.
+        let file = self
+            .file
+            .try_clone()
+            .map_err(|e| hip_bridge::HipError::new(0, &format!("prefetch fd clone: {e}")))?;
+        let plan: Vec<FetchReq> = reqs.to_vec();
+        let base = {
+            let p = self.prefetch.as_ref().unwrap();
+            p.pinned.0 as usize
+        };
+        let work = plan.clone();
+        let handle = std::thread::spawn(move || {
+            // SAFETY: the pinned buffer is exclusively owned by this transport,
+            // sized >= total, and no other reader or writer touches it between
+            // issue and the join in wait_prefetch (which drains before reuse).
+            let span = unsafe { std::slice::from_raw_parts_mut(base as *mut u8, total) };
+            pread_parts_into(&file, span, &work)
+        });
         let p = self.prefetch.as_mut().unwrap();
-        let mut at = 0usize;
-        for r in reqs {
-            gpu.hip.memcpy_htod_offset_async(
-                &dst.buf,
-                r.dst_byte_offset,
-                &pinned[at..at + r.len],
-                &p.stream,
-            )?;
-            at += r.len;
-        }
-        gpu.hip.event_record(&p.event, Some(&p.stream))?;
+        p.reader = Some(handle);
+        p.pending = plan;
         p.in_flight = true;
+        // Alias the destination for the deferred copy. Safe: the blob is a
+        // per-layer pool allocated at model load and outlives every prefetch.
+        self.pending_dst = Some(unsafe { dst.buf.alias() });
         Ok(())
     }
 
-    /// Block until the outstanding prefetch has landed. No-op if none.
+    /// Join the background pread, issue the H2D, and block until it lands.
+    ///
+    /// Everything the caller did between `prefetch_batch_into` and here ran
+    /// concurrently with the read. `prefetch_wait_ns` is what the overlap
+    /// failed to hide.
     pub fn wait_prefetch(&mut self, gpu: &Gpu) -> HipResult<()> {
-        let Some(p) = self.prefetch.as_mut() else {
-            return Ok(());
-        };
-        if !p.in_flight {
+        if self.prefetch.as_ref().map(|p| !p.in_flight).unwrap_or(true) {
             return Ok(());
         }
         let t = std::time::Instant::now();
-        gpu.hip.event_synchronize(&p.event)?;
-        p.in_flight = false;
+        let (handle, plan, base) = {
+            let p = self.prefetch.as_mut().unwrap();
+            (p.reader.take(), std::mem::take(&mut p.pending), p.pinned.0 as usize)
+        };
+        if let Some(h) = handle {
+            match h.join() {
+                Ok(Some(e)) => {
+                    self.prefetch.as_mut().unwrap().in_flight = false;
+                    self.pending_dst = None;
+                    self.ns_prefetch_wait += t.elapsed().as_nanos() as u64;
+                    return Err(hip_bridge::HipError::new(0, &e));
+                }
+                Ok(None) => {}
+                Err(_) => {
+                    self.prefetch.as_mut().unwrap().in_flight = false;
+                    self.pending_dst = None;
+                    return Err(hip_bridge::HipError::new(0, "prefetch reader panicked"));
+                }
+            }
+        }
+        if let Some(dstbuf) = self.pending_dst.take() {
+            gpu.bind_thread()?;
+            let total: usize = plan.iter().map(|r| r.len).sum();
+            // SAFETY: reader has joined, so the span is fully written and no
+            // other thread references it.
+            let pinned = unsafe { std::slice::from_raw_parts(base as *const u8, total) };
+            let p = self.prefetch.as_ref().unwrap();
+            let mut at = 0usize;
+            for r in &plan {
+                gpu.hip.memcpy_htod_offset_async(
+                    &dstbuf,
+                    r.dst_byte_offset,
+                    &pinned[at..at + r.len],
+                    &p.stream,
+                )?;
+                at += r.len;
+            }
+            gpu.hip.event_record(&p.event, Some(&p.stream))?;
+            gpu.hip.event_synchronize(&p.event)?;
+        }
+        self.prefetch.as_mut().unwrap().in_flight = false;
         self.ns_prefetch_wait += t.elapsed().as_nanos() as u64;
         Ok(())
     }
@@ -563,6 +622,16 @@ struct AsyncPrefetch {
     /// still reading it would corrupt the destination silently, so `issue`
     /// drains an outstanding transfer first.
     in_flight: bool,
+    /// Background pread, if one is outstanding.
+    ///
+    /// The pread is 60% of expert I/O and is pure host/page-cache work, so it
+    /// is the half most worth moving off the critical path. Making only the
+    /// H2D async overlapped the CHEAP half -- and on unified memory the H2D has
+    /// almost nothing to hide behind, which is why the first version measured
+    /// 0.69x.
+    reader: Option<std::thread::JoinHandle<Option<String>>>,
+    /// Copy plan deferred until the pread lands.
+    pending: Vec<FetchReq>,
 }
 
 /// pread `reqs` into `span` in parallel; `span` must be exactly the
