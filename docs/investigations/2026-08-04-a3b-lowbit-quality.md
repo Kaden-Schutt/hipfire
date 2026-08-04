@@ -371,6 +371,70 @@ has been.
 - MQ2 measures *slower* than mq4r on decode → the SKU is size-only, not a
   Redline tier, and should be named/positioned accordingly.
 
+## 5b. The "MQ2-Lloyd loses ~12% activation energy" report — NOT A BUG
+
+Reproduced, explained, and closed. **Do not chase this, and do not "fix" it with
+a gain correction — that would strictly increase error.**
+
+Replicated `quantize_mq2g256_lloyd` exactly (LCG sign gen seeds 42/1042,
+`cpu_fwht_256`, percentile init, 8 Lloyd iters with the early-break, centroid
+sort + index remap, fp16 codebook rounding) and measured reconstruction energy
+against the Lloyd–Max theoretical distortion for a unit-Gaussian source:
+
+| format | levels | energy kept | measured deficit | Lloyd–Max theory | LS gain α |
+|---|---|---|---|---|---|
+| MQ1L | 2 | 0.6423 | 35.77% | 36.34% | 1.0003 |
+| **MQ2L** | **4** | **0.8881** | **11.19%** | **11.75%** | **0.9999** |
+| MQ3L | 8 | 0.9656 | 3.44% | 3.45% | 1.0000 |
+| MQ4L | 16 | 0.9879 | 1.21% | 0.95% | 0.9999 |
+
+Two conclusions, both load-bearing:
+
+**1. The ~12% *is* the price of 2 bits.** The deficit tracks D(b) for a Gaussian
+source across the whole ladder. FWHT rotation is what makes the per-block
+distribution Gaussian (CLT over 256 points) — that is the *point* of incoherence
+processing — so scalar Lloyd on a rotated block lands exactly on the Gaussian
+rate–distortion curve. A heavy-tailed input (Gaussian × Gamma) gave 11.06%, i.e.
+the result is robust to the source distribution.
+
+**2. It is not a correctable gain error.** The least-squares optimal rescale is
+**α = ⟨x,x̂⟩/⟨x̂,x̂⟩ = 0.9999** at every bit width, and applying it changes NRMSE
+by +0.00%. This is the orthogonality principle: a conditional-mean (MMSE)
+quantizer produces error e = x − x̂ with ⟨x̂, e⟩ = 0, hence ‖x‖² = ‖x̂‖² + ‖e‖².
+The "missing" energy lives *entirely* in the component orthogonal to the
+reconstruction. Scaling x̂ by 1/√0.888 = 1.061 to restore the second moment
+would move it off the LS optimum and raise MSE. Energy-matching a VQ is a
+pessimization, not a fix.
+
+**Corollary — energy retention is the wrong diagnostic.** It is blind to *where*
+the error lands, which is the only thing that matters for output quality. Two
+codebooks with identical 11.2% deficit can differ enormously in KLD depending on
+whether the error falls along high- or low-curvature directions. Use the KLD
+baseline (§Phase 0, 0.2381) to judge changes; ignore energy.
+
+Incidentally, the 8-vs-16 Lloyd-iteration question does **not** show up here
+either (11.19% vs 11.15%). Whatever caused the 2026-05-20 DeepSeek V4 60×
+wikitext2 PPL blowup at 16 iterations (758 vs 12) is not an MSE effect — most
+likely pathological blocks falling into a bad local minimum that block-mean
+distortion does not surface. That makes the iteration-count divergence below a
+genuine open defect, not a stylistic one.
+
+**Open defect (real, live, unrelated to the energy question):**
+`quantize_mq2g256_lloyd_weighted` (`main.rs:3370`) and
+`quantize_mq2g256_lloyd_gptq` (`main.rs:3550`) both run `max_iter = 16`, and the
+weighted arm's comment claims *"16-iter cap matches the plain Lloyd path."* The
+plain path (`main.rs:3709`) is `max_iter = 8`, deliberately reverted from 16 on
+2026-05-20, with an explicit *"Do NOT raise this back to 16 … without running
+wikitext2 PPL on a DeepSeek V4 build first."* The weighted arm is reachable
+(`main.rs:9458`). Either the revert should propagate to all three arms or the
+16-iter arms need the DS4 PPL run the comment demands.
+
+Reproduction script (synthetic, CPU-only, no GPU):
+`scratchpad/mq2l_energy.py` — regenerate before trusting these numbers; it is a
+faithful port of the Rust encoder but it *is* a port, not the encoder itself.
+The decisive version of this test would call `quantize_mq2g256_lloyd` directly
+from a Rust unit test over real a3b expert tensors.
+
 ## 6. Open item
 
 The contributor's HIP port is unreviewed by us and stays out of the tree (§0).
