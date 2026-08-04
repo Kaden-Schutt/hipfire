@@ -1481,8 +1481,33 @@ pub const EXPERT_CACHE_GB_ENV: &str = "HIPFIRE_DEEPSEEK4_EXPERT_CACHE_GB";
 /// Parse [`EXPERT_CACHE_GB_ENV`]. `None` = page nothing (fully resident,
 /// today's behaviour). Unparseable input yields `None` so a typo degrades to
 /// the safe path rather than to an arbitrary budget.
+///
+/// `auto` (or `max`) means "as much as actually fits": the value is clamped by
+/// [`effective_budget_bytes`] against [`auto_budget_bytes`] regardless, so
+/// asking for everything can never exceed what MemAvailable allows.
+///
+/// This exists because picking the number by hand costs real throughput and
+/// the failure is silent. Measured on ds4 MQ2 at 43 layers, 256 experts,
+/// decode:
+///
+/// | budget  | hit rate | tok/s | ms/token |
+/// |---------|----------|-------|----------|
+/// |  8 GiB  |   59.4%  |  7.06 |    141.7 |
+/// | 32 GiB  |   86.5%  |  9.09 |    110.0 |
+///
+/// — a 28.8% throughput difference between two numbers that look equally
+/// arbitrary at the call site. Expert I/O is 41.9% of decode wall time at
+/// 8 GiB and 26.5% at 32 GiB. Hit rate saturates at 91.3% (the rest is
+/// compulsory cold-miss), so past ~32 GiB the curve flattens hard: 64 GiB buys
+/// only another 4.5pp.
 pub fn expert_cache_budget_bytes(raw: Option<&str>) -> Option<u64> {
-    let v = raw?.trim().parse::<u64>().ok()?;
+    let s = raw?.trim();
+    if s.eq_ignore_ascii_case("auto") || s.eq_ignore_ascii_case("max") {
+        // Sentinel: effective_budget_bytes takes min(configured, auto), so
+        // u64::MAX resolves to exactly the auto budget.
+        return Some(u64::MAX);
+    }
+    let v = s.parse::<u64>().ok()?;
     if v == 0 {
         return None;
     }
@@ -2309,6 +2334,26 @@ mod tests {
         assert_eq!(expert_cache_budget_bytes(Some("banana")), None);
         // Zero is "off", not a zero-byte cache that could never make progress.
         assert_eq!(expert_cache_budget_bytes(Some("0")), None);
+    }
+
+    #[test]
+    fn cache_gb_env_accepts_auto_and_resolves_to_the_fitting_budget() {
+        // `auto`/`max` are a sentinel, not a literal byte count.
+        assert_eq!(expert_cache_budget_bytes(Some("auto")), Some(u64::MAX));
+        assert_eq!(expert_cache_budget_bytes(Some("MAX")), Some(u64::MAX));
+        assert_eq!(expert_cache_budget_bytes(Some("  Auto ")), Some(u64::MAX));
+
+        // The sentinel must never survive to a pool size: min() against the
+        // auto budget has to collapse it to exactly what fits.
+        let avail = auto_budget_bytes(96 * 1024 * 1024 * 1024, 8 * 1024 * 1024 * 1024);
+        assert_eq!(effective_budget_bytes(Some(u64::MAX), avail), avail);
+
+        // An explicit budget still caps below auto, so asking for less than
+        // what fits keeps giving you less.
+        assert_eq!(
+            effective_budget_bytes(Some(8 * 1024 * 1024 * 1024), avail),
+            8 * 1024 * 1024 * 1024
+        );
     }
 
     #[test]

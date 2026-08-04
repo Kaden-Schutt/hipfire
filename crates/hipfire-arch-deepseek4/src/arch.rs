@@ -1510,8 +1510,24 @@ impl DeepseekV4 {
                 .ok()
                 .and_then(|s| s.trim().parse().ok())
                 .unwrap_or(8);
+            // `auto`/`max` arrives as u64::MAX and is meaningful ONLY once
+            // clamped against real MemAvailable. If /proc/meminfo is
+            // unreadable we cannot clamp it, and falling back to `configured`
+            // would hand plan_slots a budget of ~u64::MAX — so refuse with an
+            // actionable message instead of sizing a pool from a sentinel.
+            let mem_avail = match crate::expert_pager::mem_available_bytes() {
+                Some(m) => m,
+                None if configured == u64::MAX => {
+                    return Err(format!(
+                        "deepseek4: {}=auto needs /proc/meminfo to size the pool, \
+                         and it is unreadable — set an explicit budget in GiB instead",
+                        crate::expert_pager::EXPERT_CACHE_GB_ENV
+                    ))
+                }
+                None => configured,
+            };
             let auto = crate::expert_pager::auto_budget_bytes(
-                crate::expert_pager::mem_available_bytes().unwrap_or(configured),
+                mem_avail,
                 reserve_gb * 1024 * 1024 * 1024,
             );
             let budget = crate::expert_pager::effective_budget_bytes(Some(configured), auto);
