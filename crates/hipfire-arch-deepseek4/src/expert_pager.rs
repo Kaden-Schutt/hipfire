@@ -476,6 +476,8 @@ pub struct Ds4PagingRuntime {
     /// construction. A dispatch that hands over a different blob is aiming at
     /// a pool this pager does not own — see [`Ds4PagingRuntime::plan_dispatch`].
     expected_base: HashMap<(u16, ExpertBlobRole), u64>,
+    /// Experts this rank computes. `All` on a single rank.
+    ownership: ExpertOwnership,
     n_exp: usize,
 }
 
@@ -510,6 +512,7 @@ impl Ds4PagingRuntime {
             shadow,
             encode_scratch: vec![0f32; 2 * n_exp],
             expected_base,
+            ownership: ExpertOwnership::All,
             n_exp,
         })
     }
@@ -581,7 +584,7 @@ impl Ds4PagingRuntime {
         // resident simultaneously, so the pool has to hold all of them.
         let mut distinct = 0usize;
         for (i, &e) in experts.iter().enumerate() {
-            if !experts[..i].contains(&e) {
+            if self.ownership.owns(e) && !experts[..i].contains(&e) {
                 distinct += 1;
             }
         }
@@ -594,6 +597,11 @@ impl Ds4PagingRuntime {
         // Verify catalog coverage for every expert BEFORE touching residency,
         // so a bad request cannot leave half-updated bookkeeping behind.
         for &e in experts {
+            if !self.ownership.owns(e) {
+                // Another rank computes it; we have no slot for it and must
+                // not touch its pointer.
+                continue;
+            }
             let key = ExpertKey {
                 layer,
                 expert: e,
@@ -617,6 +625,13 @@ impl Ds4PagingRuntime {
                 },
             })?;
         for &e in experts {
+            if !self.ownership.owns(e) {
+                // Leave the loader's entry alone. Under EP that is a zeroed
+                // dummy, so this rank contributes 0 and the owning rank's
+                // value survives the all-reduce unduplicated. Repointing here
+                // is the double-count bug.
+                continue;
+            }
             let key = ExpertKey {
                 layer,
                 expert: e,
@@ -640,6 +655,19 @@ impl Ds4PagingRuntime {
             });
         }
         Ok(dirty)
+    }
+
+    /// Restrict paging to this rank's experts (expert parallelism).
+    ///
+    /// Non-owned experts are then skipped entirely by `plan_dispatch`: not
+    /// resolved to a slot, not read, and — critically — not repointed, so they
+    /// keep aiming at the loader's zeroed dummy and contribute zero.
+    pub fn set_ownership(&mut self, ownership: ExpertOwnership) {
+        self.ownership = ownership;
+    }
+
+    pub fn ownership(&self) -> &ExpertOwnership {
+        &self.ownership
     }
 
     /// Forget a failed fill so it is re-read rather than trusted.
@@ -706,6 +734,45 @@ impl ExpertTrace {
             let _ = writeln!(self.out, "{},{layer},{r},{e}", self.seq);
         }
         self.seq += 1;
+    }
+}
+
+/// Which routed experts this rank is responsible for computing.
+///
+/// Under expert parallelism each rank owns a subset; a non-owned expert's
+/// `gate_up` pointer aims at a ZEROED buffer so `SwiGLU(0,0) = 0` and the rank
+/// contributes nothing for it, while the owning rank does and the all-reduce
+/// sums them.
+///
+/// Paging must therefore page ONLY what this rank owns and leave every
+/// non-owned pointer exactly as the loader left it. Repointing a non-owned
+/// expert at a real slot would make this rank contribute a value the owning
+/// rank also contributes, and the all-reduce would DOUBLE-COUNT it — a wrong
+/// answer with no error anywhere. That, not the zeroed dummy itself, is the
+/// hazard EP poses to paging.
+#[derive(Debug, Clone)]
+pub enum ExpertOwnership {
+    /// Single rank: every expert is ours. The only mode reachable today.
+    All,
+    /// EP: `owned[e]` is true when this rank computes expert `e`.
+    Subset(Vec<bool>),
+}
+
+impl ExpertOwnership {
+    #[inline]
+    pub fn owns(&self, expert: u16) -> bool {
+        match self {
+            ExpertOwnership::All => true,
+            ExpertOwnership::Subset(v) => v.get(expert as usize).copied().unwrap_or(false),
+        }
+    }
+
+    /// How many experts this rank owns — the ceiling on a useful pool.
+    pub fn count(&self, n_exp: usize) -> usize {
+        match self {
+            ExpertOwnership::All => n_exp,
+            ExpertOwnership::Subset(v) => v.iter().filter(|&&b| b).count(),
+        }
     }
 }
 
@@ -1792,6 +1859,111 @@ mod tests {
             }
             Ok(())
         }
+    }
+
+    /// Rank `r` of `ep` owns experts where `e % ep == r` — the Stride policy.
+    fn stride_ownership(n_exp: usize, rank: usize, ep: usize) -> ExpertOwnership {
+        ExpertOwnership::Subset((0..n_exp).map(|e| e % ep == rank).collect())
+    }
+
+    #[test]
+    fn a_non_owned_expert_pointer_is_never_touched() {
+        // THE expert-parallel guarantee. A non-owned expert must keep aiming
+        // at whatever the loader left (a zeroed dummy under EP) so this rank
+        // contributes 0. Repointing it makes this rank contribute a value the
+        // OWNING rank also contributes, and the all-reduce double-counts —
+        // a wrong answer with no error raised anywhere.
+        let mut rt = runtime_with(8, 4, &[0]);
+        rt.set_ownership(stride_ownership(8, 0, 2)); // owns evens
+        let mut out = Vec::new();
+        let stride = 1024usize;
+
+        rt.plan_dispatch(
+            0,
+            ExpertBlobRole::GateUp,
+            &[0, 1, 2, 3],
+            stride,
+            TEST_BASE,
+            &mut out,
+        )
+        .expect("plans");
+
+        let shadow = rt.shadow(0, ExpertBlobRole::GateUp).unwrap();
+        for e in [1usize, 3] {
+            assert_eq!(
+                shadow[e], TEST_BASE,
+                "non-owned expert {e} was repointed — this double-counts under all-reduce"
+            );
+        }
+        assert!(
+            out.iter().all(|f| f.key.expert % 2 == 0),
+            "only owned experts may be filled: {out:?}"
+        );
+        assert_eq!(out.len(), 2, "two owned experts of the four routed");
+    }
+
+    #[test]
+    fn ownership_does_not_consume_pool_capacity_for_other_ranks() {
+        // A pool sized for this rank's share must not be judged against the
+        // full routed set, or a legal dispatch would be refused as too big.
+        let mut rt = runtime_with(64, 3, &[0]);
+        rt.set_ownership(stride_ownership(64, 0, 4)); // owns 1 in 4
+        let mut out = Vec::new();
+        // 8 routed experts, only 2 of them ours — fits a 3-slot pool.
+        rt.plan_dispatch(
+            0,
+            ExpertBlobRole::Down,
+            &[0, 1, 2, 3, 4, 5, 6, 7],
+            1024,
+            TEST_BASE,
+            &mut out,
+        )
+        .expect("only the owned subset counts against the pool");
+        assert_eq!(out.len(), 2, "experts 0 and 4 are ours");
+    }
+
+    #[test]
+    fn ownership_all_is_todays_behaviour() {
+        // The default must be indistinguishable from before the seam existed.
+        let mut a = runtime_with(8, 4, &[0]);
+        let mut b = runtime_with(8, 4, &[0]);
+        b.set_ownership(ExpertOwnership::All);
+        let (mut oa, mut ob) = (Vec::new(), Vec::new());
+        for rt_out in [(&mut a, &mut oa), (&mut b, &mut ob)] {
+            let (rt, out) = rt_out;
+            rt.plan_dispatch(0, ExpertBlobRole::GateUp, &[1, 2, 3], 1024, TEST_BASE, out)
+                .expect("plans");
+        }
+        assert_eq!(oa, ob);
+        assert_eq!(
+            a.shadow(0, ExpertBlobRole::GateUp).unwrap(),
+            b.shadow(0, ExpertBlobRole::GateUp).unwrap()
+        );
+    }
+
+    #[test]
+    fn a_rank_owning_nothing_fills_nothing() {
+        let mut rt = runtime_with(8, 4, &[0]);
+        rt.set_ownership(ExpertOwnership::Subset(vec![false; 8]));
+        let mut out = Vec::new();
+        rt.plan_dispatch(
+            0,
+            ExpertBlobRole::GateUp,
+            &[1, 2, 3],
+            1024,
+            TEST_BASE,
+            &mut out,
+        )
+        .expect("degenerate but legal");
+        assert!(out.is_empty());
+        assert_eq!(rt.stats(), (0, 0), "no slot activity at all");
+    }
+
+    #[test]
+    fn ownership_count_bounds_the_pool() {
+        assert_eq!(ExpertOwnership::All.count(256), 256);
+        assert_eq!(stride_ownership(256, 0, 4).count(256), 64);
+        assert_eq!(stride_ownership(256, 3, 4).count(256), 64);
     }
 
     #[test]
