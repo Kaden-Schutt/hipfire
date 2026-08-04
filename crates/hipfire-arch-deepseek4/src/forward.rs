@@ -1462,6 +1462,44 @@ fn gemv_auto_batched_wmma(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn gemv_auto_batched_pair_b3(
+    gpu: &mut Gpu,
+    weight0: &GpuTensor,
+    weight1: &GpuTensor,
+    x_rotated_batch: &GpuTensor,
+    y0: &GpuTensor,
+    y1: &GpuTensor,
+    m: usize,
+    k: usize,
+    batch_size: usize,
+) -> Result<bool, String> {
+    let enabled = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_E8_BATCHED_PAIR_B3")
+        .ok()
+        .as_deref()
+        != Some("0");
+    if !enabled
+        || gpu.arch != "gfx1151"
+        || batch_size != 3
+        || k % 256 != 0
+        || weight0.dtype != DType::MFP4G32E8SOA
+        || weight1.dtype != DType::MFP4G32E8SOA
+    {
+        return Ok(false);
+    }
+    gpu.gemv_mfp4g32_e8_soa_batched_pair_b3_gfx1151(
+        weight0,
+        weight1,
+        x_rotated_batch,
+        y0,
+        y1,
+        m,
+        k,
+    )
+    .map_err(|e| format!("paired MFP4-E8-SoA batched B3: {e:?}"))?;
+    Ok(true)
+}
+
 /// DeepSeek V4 Compressor decode step (phase 3b scaffold — not yet wired).
 ///
 /// Implements the upstream `Compressor.forward` decode case
@@ -9220,30 +9258,43 @@ fn attention_block_batched_mixed(
                 .map_err(|e| format!("gemm_f16_wmma idx_wgate l{layer_idx}: {e:?}"))?;
             }
         } else {
-            gemv_auto_batched_wmma(
+            let paired_main = gemv_auto_batched_pair_b3(
                 gpu,
-                weights.mq2r_backend,
                 comp_wkv,
-                &pbs.tmp_batch,
-                &pbs.tmp_plain_batch,
-                &pbs.comp_main_kv_batch,
-                real_main_proj,
-                hidden,
-                batch_size,
-                Some(&pbs.wmma_x_scratch_f16),
-            )?;
-            gemv_auto_batched_wmma(
-                gpu,
-                weights.mq2r_backend,
                 comp_wgate,
                 &pbs.tmp_batch,
-                &pbs.tmp_plain_batch,
+                &pbs.comp_main_kv_batch,
                 &pbs.comp_main_score_batch,
                 real_main_proj,
                 hidden,
                 batch_size,
-                Some(&pbs.wmma_x_scratch_f16),
             )?;
+            if !paired_main {
+                gemv_auto_batched_wmma(
+                    gpu,
+                    weights.mq2r_backend,
+                    comp_wkv,
+                    &pbs.tmp_batch,
+                    &pbs.tmp_plain_batch,
+                    &pbs.comp_main_kv_batch,
+                    real_main_proj,
+                    hidden,
+                    batch_size,
+                    Some(&pbs.wmma_x_scratch_f16),
+                )?;
+                gemv_auto_batched_wmma(
+                    gpu,
+                    weights.mq2r_backend,
+                    comp_wgate,
+                    &pbs.tmp_batch,
+                    &pbs.tmp_plain_batch,
+                    &pbs.comp_main_score_batch,
+                    real_main_proj,
+                    hidden,
+                    batch_size,
+                    Some(&pbs.wmma_x_scratch_f16),
+                )?;
+            }
             if ratio == 4 {
                 let idx_wkv = layer
                     .indexer_compressor_wkv
@@ -9253,30 +9304,43 @@ fn attention_block_batched_mixed(
                     .indexer_compressor_wgate
                     .as_ref()
                     .ok_or_else(|| format!("idx_comp_wgate l{layer_idx}"))?;
-                gemv_auto_batched_wmma(
+                let paired_indexer = gemv_auto_batched_pair_b3(
                     gpu,
-                    weights.mq2r_backend,
                     idx_wkv,
-                    &pbs.tmp_batch,
-                    &pbs.tmp_plain_batch,
-                    &pbs.comp_idx_kv_batch,
-                    idx_proj_dim,
-                    hidden,
-                    batch_size,
-                    Some(&pbs.wmma_x_scratch_f16),
-                )?;
-                gemv_auto_batched_wmma(
-                    gpu,
-                    weights.mq2r_backend,
                     idx_wgate,
                     &pbs.tmp_batch,
-                    &pbs.tmp_plain_batch,
+                    &pbs.comp_idx_kv_batch,
                     &pbs.comp_idx_score_batch,
                     idx_proj_dim,
                     hidden,
                     batch_size,
-                    Some(&pbs.wmma_x_scratch_f16),
                 )?;
+                if !paired_indexer {
+                    gemv_auto_batched_wmma(
+                        gpu,
+                        weights.mq2r_backend,
+                        idx_wkv,
+                        &pbs.tmp_batch,
+                        &pbs.tmp_plain_batch,
+                        &pbs.comp_idx_kv_batch,
+                        idx_proj_dim,
+                        hidden,
+                        batch_size,
+                        Some(&pbs.wmma_x_scratch_f16),
+                    )?;
+                    gemv_auto_batched_wmma(
+                        gpu,
+                        weights.mq2r_backend,
+                        idx_wgate,
+                        &pbs.tmp_batch,
+                        &pbs.tmp_plain_batch,
+                        &pbs.comp_idx_score_batch,
+                        idx_proj_dim,
+                        hidden,
+                        batch_size,
+                        Some(&pbs.wmma_x_scratch_f16),
+                    )?;
+                }
             }
         }
     }
@@ -10098,30 +10162,43 @@ fn ffn_batched(
     }
 
     // 2-3. Shared expert gate + up GEMVs.
-    gemv_auto_batched_wmma(
+    let paired_shared = gemv_auto_batched_pair_b3(
         gpu,
-        mq2r_backend,
         shared_w1,
-        &pbs.ffn_x_rot_batch,
-        &pbs.ffn_x_plain_batch,
-        &pbs.ffn_shared_gate_batch,
-        im,
-        hidden,
-        batch_size,
-        Some(&pbs.wmma_x_scratch_f16),
-    )?;
-    gemv_auto_batched_wmma(
-        gpu,
-        mq2r_backend,
         shared_w3,
         &pbs.ffn_x_rot_batch,
-        &pbs.ffn_x_plain_batch,
+        &pbs.ffn_shared_gate_batch,
         &pbs.ffn_shared_up_batch,
         im,
         hidden,
         batch_size,
-        Some(&pbs.wmma_x_scratch_f16),
     )?;
+    if !paired_shared {
+        gemv_auto_batched_wmma(
+            gpu,
+            mq2r_backend,
+            shared_w1,
+            &pbs.ffn_x_rot_batch,
+            &pbs.ffn_x_plain_batch,
+            &pbs.ffn_shared_gate_batch,
+            im,
+            hidden,
+            batch_size,
+            Some(&pbs.wmma_x_scratch_f16),
+        )?;
+        gemv_auto_batched_wmma(
+            gpu,
+            mq2r_backend,
+            shared_w3,
+            &pbs.ffn_x_rot_batch,
+            &pbs.ffn_x_plain_batch,
+            &pbs.ffn_shared_up_batch,
+            im,
+            hidden,
+            batch_size,
+            Some(&pbs.wmma_x_scratch_f16),
+        )?;
+    }
 
     // 4. SwiGLU + clamp. The kernel batches `B` streams of length `n`.
     gpu.deepseek4_silu_mul_clamp_f32_batched(
@@ -11701,14 +11778,8 @@ fn dspark_capture_layer(
         for b in 0..n {
             let dst_off = (b * n_targets + slot) * row_bytes;
             let src_off = b * row_bytes;
-            gpu.memcpy_dtod_at_auto(
-                &caps.buf,
-                dst_off,
-                &pbs.tmp_batch.buf,
-                src_off,
-                row_bytes,
-            )
-            .map_err(|e| format!("dspark_capture scatter l{layer_idx} b{b}: {e:?}"))?;
+            gpu.memcpy_dtod_at_auto(&caps.buf, dst_off, &pbs.tmp_batch.buf, src_off, row_bytes)
+                .map_err(|e| format!("dspark_capture scatter l{layer_idx} b{b}: {e:?}"))?;
         }
     }
     Ok(())

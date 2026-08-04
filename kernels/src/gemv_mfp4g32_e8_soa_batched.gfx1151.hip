@@ -35,6 +35,9 @@
 #ifndef E8_BATCHED_KERNEL
 #define E8_BATCHED_KERNEL gemv_mfp4g32_e8_soa_batched_gfx1151
 #endif
+#ifndef E8_BATCHED_PAIR
+#define E8_BATCHED_PAIR 0
+#endif
 
 __device__ __forceinline__ float cvt_e4m3_scale_batched(unsigned char b) {
     const int exp = (b >> 3) & 0xF;
@@ -65,6 +68,21 @@ __device__ __forceinline__ void e8_decode_index_batched(unsigned int idx, float 
 
 // A: E8-SoA [M, K].  X: f32 [B, K] (row-major per token).  Y: f32 [B, M].
 __launch_bounds__(32)
+#if E8_BATCHED_PAIR
+extern "C" __global__ void E8_BATCHED_KERNEL(
+    const char* __restrict__ A0,
+    const char* __restrict__ A1,
+    const float* __restrict__ X,
+    float* __restrict__ Y0,
+    float* __restrict__ Y1,
+    int M,
+    int K
+) {
+    const int matrix = blockIdx.x >= M;
+    const int row = blockIdx.x - matrix * M;
+    const char* __restrict__ A = matrix ? A1 : A0;
+    float* __restrict__ Y = matrix ? Y1 : Y0;
+#else
 extern "C" __global__ void E8_BATCHED_KERNEL(
     const char* __restrict__ A,
     const float* __restrict__ X,
@@ -73,6 +91,7 @@ extern "C" __global__ void E8_BATCHED_KERNEL(
     int K
 ) {
     const int row = blockIdx.x;
+#endif
     if (row >= M) return;
     const int tid = threadIdx.x;
 

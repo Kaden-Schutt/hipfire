@@ -4686,6 +4686,71 @@ impl Gpu {
         })
     }
 
+    /// Two independent B=3 E8 projections with the same shape and input in a
+    /// single dispatch. The matrix selector only widens the grid; each output
+    /// row executes the exact scalar body and reduction order of the ordinary
+    /// B3 kernel.
+    pub fn gemv_mfp4g32_e8_soa_batched_pair_b3_gfx1151(
+        &mut self,
+        a0: &GpuTensor,
+        a1: &GpuTensor,
+        x: &GpuTensor,
+        y0: &GpuTensor,
+        y1: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        assert!(
+            self.arch_caps.is_gfx1151(),
+            "paired batched E8 decode GEMV is gfx1151-only"
+        );
+        assert!(
+            k % 256 == 0,
+            "paired batched E8 GEMV requires K%256==0, got K={k}"
+        );
+        let name = "gemv_mfp4g32_e8_soa_batched_pair_b3_gfx1151";
+        self.bind_thread()?;
+        self.ensure_kernel(
+            name,
+            kernels::GEMV_MFP4G32_E8_SOA_BATCHED_PAIR_B3_GFX1151_SRC,
+            name,
+        )?;
+        let a0_ptr = a0.buf.as_ptr();
+        let a1_ptr = a1.buf.as_ptr();
+        let x_ptr = x.buf.as_ptr();
+        let y0_ptr = y0.buf.as_ptr();
+        let y1_ptr = y1.buf.as_ptr();
+        let m_i32 = m as i32;
+        let k_i32 = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &a0_ptr as *const _ as *mut c_void,
+            &a1_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &y0_ptr as *const _ as *mut c_void,
+            &y1_ptr as *const _ as *mut c_void,
+            &m_i32 as *const _ as *mut c_void,
+            &k_i32 as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            name,
+            [(2 * m) as u32, 1, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut blob = hip_bridge::KernargBlob::new();
+                blob.push_ptr(a0_ptr);
+                blob.push_ptr(a1_ptr);
+                blob.push_ptr(x_ptr);
+                blob.push_ptr(y0_ptr);
+                blob.push_ptr(y1_ptr);
+                blob.push_i32(m_i32);
+                blob.push_i32(k_i32);
+                blob
+            },
+        )
+    }
+
     /// Batched grouped E8-SoA decode GEMV: `A[G,M,K] @ X[B,G,K] -> Y[B,G,M]`,
     /// one wave per (group, row) with the weight row read once for all B
     /// tokens.

@@ -1239,6 +1239,12 @@ pub const GEMV_MFP4G32_E8_SOA_BATCHED_B3_GFX1151_SRC: &str = concat!(
     "#define E8_BATCHED_KERNEL gemv_mfp4g32_e8_soa_batched_b3_gfx1151\n",
     include_str!("../../../kernels/src/gemv_mfp4g32_e8_soa_batched.gfx1151.hip")
 );
+pub const GEMV_MFP4G32_E8_SOA_BATCHED_PAIR_B3_GFX1151_SRC: &str = concat!(
+    "#define E8_BATCHED_B 3\n",
+    "#define E8_BATCHED_PAIR 1\n",
+    "#define E8_BATCHED_KERNEL gemv_mfp4g32_e8_soa_batched_pair_b3_gfx1151\n",
+    include_str!("../../../kernels/src/gemv_mfp4g32_e8_soa_batched.gfx1151.hip")
+);
 pub const GEMV_MFP4G32_E8_SOA_BATCHED_B4_GFX1151_SRC: &str = concat!(
     "#define E8_BATCHED_B 4\n",
     "#define E8_BATCHED_KERNEL gemv_mfp4g32_e8_soa_batched_b4_gfx1151\n",
