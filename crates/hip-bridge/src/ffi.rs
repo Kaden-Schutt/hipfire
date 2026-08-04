@@ -244,6 +244,16 @@ pub struct HipRuntime {
         unsafe extern "C" fn(*mut c_void, *const c_void, usize, c_uint, HipStream) -> u32,
     fn_memset: unsafe extern "C" fn(*mut c_void, c_int, usize) -> u32,
     fn_memset_async: unsafe extern "C" fn(*mut c_void, c_int, usize, HipStream) -> u32,
+    // Pinned (page-locked) host memory. Optional so a runtime without them
+    // degrades to the pageable staging path rather than failing to init.
+    //
+    // Only worth using on a DISCRETE GPU: a pageable H2D copy is staged through
+    // a driver bounce buffer (roughly half bandwidth) and cannot overlap with
+    // compute, whereas a pinned copy DMAs straight off the host buffer. On an
+    // APU (gfx1151 and friends) the GPU allocates out of system RAM, so there
+    // is no bus hop to optimise and pinning buys nothing.
+    fn_host_malloc: Option<unsafe extern "C" fn(*mut *mut c_void, usize, c_uint) -> u32>,
+    fn_host_free: Option<unsafe extern "C" fn(*mut c_void) -> u32>,
     fn_mem_address_reserve:
         Option<unsafe extern "C" fn(*mut *mut c_void, usize, usize, *mut c_void, u64) -> u32>,
     fn_mem_address_free: Option<unsafe extern "C" fn(*mut c_void, usize) -> u32>,
@@ -479,6 +489,16 @@ impl HipRuntime {
                     lib,
                     "hipMemsetAsync",
                     unsafe extern "C" fn(*mut c_void, c_int, usize, HipStream) -> u32
+                ),
+                fn_host_malloc: load_optional_fn!(
+                    lib,
+                    "hipHostMalloc",
+                    unsafe extern "C" fn(*mut *mut c_void, usize, c_uint) -> u32
+                ),
+                fn_host_free: load_optional_fn!(
+                    lib,
+                    "hipHostFree",
+                    unsafe extern "C" fn(*mut c_void) -> u32
                 ),
                 fn_mem_address_reserve: load_optional_fn!(
                     lib,
@@ -871,6 +891,54 @@ impl HipRuntime {
         }
         let code = unsafe { (self.fn_free)(buf.ptr) };
         self.check(code, "hipFree")
+    }
+
+    /// Is page-locked host allocation available on this runtime?
+    ///
+    /// Callers use this to pick a staging strategy at construction time rather
+    /// than discovering the gap on the first copy.
+    pub fn has_pinned_host_alloc(&self) -> bool {
+        self.fn_host_malloc.is_some() && self.fn_host_free.is_some()
+    }
+
+    /// Allocate `size` bytes of page-locked host memory.
+    ///
+    /// Pinned memory is what makes `hipMemcpyAsync` genuinely asynchronous: a
+    /// pageable source forces the driver to stage through an internal bounce
+    /// buffer, which both halves effective bandwidth and serialises the copy
+    /// against compute. Returns the raw host pointer; pair with
+    /// [`Self::host_free`].
+    ///
+    /// Pinned pages are unswappable, so callers are responsible for keeping the
+    /// total bounded — on a swapless box an unbounded pinned pool is an OOM.
+    ///
+    /// # Safety
+    /// The returned pointer is uninitialised. Caller owns it until `host_free`.
+    pub unsafe fn host_malloc(&self, size: usize) -> HipResult<*mut c_void> {
+        let f = self
+            .fn_host_malloc
+            .ok_or_else(|| HipError::new(0, "hipHostMalloc unavailable on this runtime"))?;
+        let mut ptr: *mut c_void = ptr::null_mut();
+        // flags=0 → hipHostMallocDefault (page-locked, mapped, not write-combined).
+        let code = unsafe { f(&mut ptr, size, 0) };
+        self.check(code, "hipHostMalloc")?;
+        if ptr.is_null() {
+            return Err(HipError::new(0, "hipHostMalloc returned a null pointer"));
+        }
+        Ok(ptr)
+    }
+
+    /// Release a pointer obtained from [`Self::host_malloc`].
+    ///
+    /// # Safety
+    /// `ptr` must have come from `host_malloc` and must not be referenced by
+    /// any in-flight async copy.
+    pub unsafe fn host_free(&self, p: *mut c_void) -> HipResult<()> {
+        let f = self
+            .fn_host_free
+            .ok_or_else(|| HipError::new(0, "hipHostFree unavailable on this runtime"))?;
+        let code = unsafe { f(p) };
+        self.check(code, "hipHostFree")
     }
 
     pub fn mem_get_allocation_granularity(
