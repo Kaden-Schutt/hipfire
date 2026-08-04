@@ -2059,6 +2059,13 @@ fn compressor_forward_impl(
             .map_err(|e| format!("comp kv-store l{layer_idx}: {e:?}"))?;
         gpu.memcpy_dtod_auto(&score_dst.buf, &score_buf.buf, proj_dim * 4)
             .map_err(|e| format!("comp score-store l{layer_idx}: {e:?}"))?;
+        comp_dbg(&*gpu, "kv_state(ring)", kv_state, state_rows * proj_dim);
+        comp_dbg(
+            &*gpu,
+            "score_state(ring)",
+            score_state,
+            state_rows * proj_dim,
+        );
 
         let should_compress = (pos + 1).is_multiple_of(ratio);
         if !should_compress {
@@ -2082,6 +2089,8 @@ fn compressor_forward_impl(
                 head_dim as i32,
             )
             .map_err(|e| format!("comp concat_score l{layer_idx}: {e:?}"))?;
+            comp_dbg(&*gpu, "concat_kv", concat_kv, 2 * ratio * head_dim);
+            comp_dbg(&*gpu, "concat_score", concat_score, 2 * ratio * head_dim);
             gpu.compressor_softmax_pool_f32(
                 concat_kv,
                 concat_score,
@@ -2100,21 +2109,35 @@ fn compressor_forward_impl(
             )
             .map_err(|e| format!("comp pool no-overlap l{layer_idx}: {e:?}"))?;
         }
+        comp_dbg(&*gpu, "kv_cache(pool)", &kv_cache_slot, head_dim);
         gpu.rmsnorm_f32(&kv_cache_slot, norm, &kv_cache_slot, cfg.rms_norm_eps)
             .map_err(|e| format!("comp rmsnorm l{layer_idx}: {e:?}"))?;
+        comp_dbg(&*gpu, "kv_cache(rmsnorm)", &kv_cache_slot, head_dim);
         if do_rope {
             if is_indexer {
-                gpu.rope_tail_interleaved(
-                    &kv_cache_slot,
-                    &kv_cache_slot,
+                // Use the same device-slot-driven symbol as capture/replay.
+                // The separate plain-RoPE symbol rounds differently on gfx1151
+                // despite equivalent algebra, poisoning future indexer state
+                // after the first compression boundary.
+                let commit_slot_buf = state
+                    .attn_state_buf
+                    .as_ref()
+                    .ok_or_else(|| format!("comp l{layer_idx}: attn_state_buf missing"))?
+                    .sub_offset(7, 1);
+                gpu.rope_tail_yarn_interleaved_at_slot_buf(
+                    kv_cache,
                     &pos_buf,
-                    1,
-                    0,
+                    &commit_slot_buf,
                     head_dim as i32,
                     cfg.qk_rope_head_dim as i32,
                     cfg.compress_rope_theta,
+                    1.0,
+                    0.0,
+                    1.0,
+                    0.0,
+                    0.0,
                 )
-                .map_err(|e| format!("comp rope l{layer_idx}: {e:?}"))?;
+                .map_err(|e| format!("comp rope slot l{layer_idx}: {e:?}"))?;
             } else {
                 gpu.rope_tail_yarn_interleaved(
                     weights.mq2r_backend.is_gfx1151(),
@@ -2136,6 +2159,7 @@ fn compressor_forward_impl(
                 .map_err(|e| format!("comp main rope l{layer_idx}: {e:?}"))?;
             }
         }
+        comp_dbg(&*gpu, "kv_cache(rope)", &kv_cache_slot, head_dim);
         if overlap {
             let shift_bytes = ratio * proj_dim * 4;
             let src_view = kv_state.sub_offset(ratio * proj_dim, ratio * proj_dim);
