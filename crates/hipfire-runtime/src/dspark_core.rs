@@ -1362,11 +1362,15 @@ impl MtpDrafter for DsparkDrafter {
             let entries = rdna_compute::profile::stop().unwrap_or_default();
             let mut by_kernel: std::collections::HashMap<&str, (f64, usize, usize)> =
                 std::collections::HashMap::new();
+            let mut by_shape = std::collections::HashMap::<(&str, usize), (f64, usize)>::new();
             for entry in &entries {
                 let aggregate = by_kernel.entry(entry.kernel).or_insert((0.0, 0, 0));
                 aggregate.0 += entry.time_us;
                 aggregate.1 += 1;
                 aggregate.2 += entry.bytes;
+                let shape = by_shape.entry((entry.kernel, entry.bytes)).or_default();
+                shape.0 += entry.time_us;
+                shape.1 += 1;
             }
             let mut kernels: Vec<_> = by_kernel.into_iter().collect();
             kernels.sort_by(|a, b| b.1 .0.partial_cmp(&a.1 .0).unwrap());
@@ -1381,6 +1385,20 @@ impl MtpDrafter for DsparkDrafter {
                 };
                 eprintln!(
                     "kernel={kernel} calls={calls} total_us={time_us:.3} bytes={bytes} gbps={gbps:.3}"
+                );
+            }
+            let mut shapes: Vec<_> = by_shape.into_iter().collect();
+            shapes.sort_by(|a, b| b.1 .0.partial_cmp(&a.1 .0).unwrap());
+            eprintln!("--- DSPARK VERIFY KERNEL PROFILE SHAPES ---");
+            for ((kernel, bytes_per_call), (time_us, calls)) in shapes {
+                let total_bytes = bytes_per_call * calls;
+                let gbps = if time_us > 0.0 {
+                    total_bytes as f64 / 1.0e3 / time_us
+                } else {
+                    0.0
+                };
+                eprintln!(
+                    "kernel={kernel} bytes_per_call={bytes_per_call} calls={calls} total_us={time_us:.3} total_bytes={total_bytes} gbps={gbps:.3}"
                 );
             }
         }
