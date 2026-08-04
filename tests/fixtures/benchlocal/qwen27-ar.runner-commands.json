@@ -1,0 +1,86 @@
+{
+  "assembled_at": "2026-07-31T11:44:46.314470+00:00",
+  "model": "/home/kaden/.hipfire/models/qwen3-27b-3.6.mq4-awq.remote-mi300x",
+  "results_root": "/home/kaden/.cache/benchlocal-full-20260731T091750Z/results/qwen27-ar",
+  "note": "Qwen27 AR direct route predates Hermes sampling proxy. Non-Hermes packs hit 12180/13180 with explicit CLI sampling flags (or CLI-40 hardcoded generation). Hermes uses proxy :12280 only.",
+  "shared_env_non_hermes": {
+    "LLAMACPP_HOST": "http://127.0.0.1:12180",
+    "LLM_MODELS": "llamacpp:/home/kaden/.hipfire/models/qwen3-27b-3.6.mq4-awq.remote-mi300x",
+    "MODEL_REQUEST_TIMEOUT_SECONDS": "300"
+  },
+  "sampling_contract": {
+    "temperature": 1.0,
+    "top_p": 0.95,
+    "top_k": 20,
+    "min_p": 0.0,
+    "repetition_penalty": 1.0,
+    "presence_penalty": null,
+    "note": "No presence_penalty for Qwen27 AR packs"
+  },
+  "packs": {
+    "structoutput-15": {
+      "cwd": "/home/kaden/.cache/benchlocal-full-20260731T091750Z/packs/StructOutput-15",
+      "env": {
+        "LLAMACPP_HOST": "http://127.0.0.1:12180",
+        "LLM_MODELS": "llamacpp:/home/kaden/.hipfire/models/qwen3-27b-3.6.mq4-awq.remote-mi300x",
+        "MODEL_REQUEST_TIMEOUT_SECONDS": "300",
+        "STRUCTOUTPUT_VALIDATOR_URL": "http://127.0.0.1:4011"
+      },
+      "argv": [
+        "node",
+        "dist-cli/cli/run.js",
+        "--model=llamacpp:/home/kaden/.hipfire/models/qwen3-27b-3.6.mq4-awq.remote-mi300x",
+        "--temperature",
+        "1.0",
+        "--top-p",
+        "0.95",
+        "--top-k",
+        "20",
+        "--min-p",
+        "0.0",
+        "--timeout",
+        "300",
+        "--validator-url",
+        "http://127.0.0.1:4011",
+        "--show-raw",
+        "--json"
+      ],
+      "command": "cd /home/kaden/.cache/benchlocal-full-20260731T091750Z/packs/StructOutput-15 && LLAMACPP_HOST=http://127.0.0.1:12180 LLM_MODELS=llamacpp:/home/kaden/.hipfire/models/qwen3-27b-3.6.mq4-awq.remote-mi300x MODEL_REQUEST_TIMEOUT_SECONDS=300 STRUCTOUTPUT_VALIDATOR_URL=http://127.0.0.1:4011 node dist-cli/cli/run.js --model llamacpp:/home/kaden/.hipfire/models/qwen3-27b-3.6.mq4-awq.remote-mi300x --temperature 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 --timeout 300 --validator-url http://127.0.0.1:4011 --show-raw --json",
+      "sampling_fields_proof": "CLI flags --temperature/--top-p/--top-k/--min-p map to GenerationParams in dist-cli; llm-client.ts forwards temperature,top_p,top_k,min_p on chat/completions body. repetition_penalty not sent by this pack CLI (daemon/model defaults)."
+    },
+    "bugfind-15": {
+      "cwd": "/home/kaden/.cache/benchlocal-full-20260731T091750Z/packs/BugFind-15",
+      "env": {
+        "LLAMACPP_HOST": "http://127.0.0.1:12180",
+        "LLM_MODELS": "llamacpp:/home/kaden/.hipfire/models/qwen3-27b-3.6.mq4-awq.remote-mi300x",
+        "MODEL_REQUEST_TIMEOUT_SECONDS": "300",
+        "BUGFIND_SANDBOX_URL": "http://127.0.0.1:4010"
+      },
+      "command": "cd /home/kaden/.cache/benchlocal-full-20260731T091750Z/packs/BugFind-15 && LLAMACPP_HOST=http://127.0.0.1:12180 LLM_MODELS=llamacpp:/home/kaden/.hipfire/models/qwen3-27b-3.6.mq4-awq.remote-mi300x MODEL_REQUEST_TIMEOUT_SECONDS=300 BUGFIND_SANDBOX_URL=http://127.0.0.1:4010 node dist-cli/cli/run.js --model llamacpp:/home/kaden/.hipfire/models/qwen3-27b-3.6.mq4-awq.remote-mi300x --temperature 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 --timeout 300 --sandbox-url http://127.0.0.1:4010 --show-raw --json",
+      "sampling_fields_proof": "Same CLI flag\u2192llm-client path as StructOutput; sandbox-url only affects verifier."
+    },
+    "cli-40": {
+      "cwd": "/home/kaden/.cache/benchlocal-full-20260731T091750Z/packs/CLI-40",
+      "command": "cd /home/kaden/.cache/benchlocal-full-20260731T091750Z/packs/CLI-40 && node dist/cli/run.js --all --model /home/kaden/.hipfire/models/qwen3-27b-3.6.mq4-awq.remote-mi300x --provider llamacpp --base-url http://127.0.0.1:12180/v1 --docker-base-url http://172.17.0.1:13180/v1 --auth-mode none --image cli40-dev --json --verbose",
+      "sampling_fields_proof": "CLI-40 dist/cli/run.js hardcodes generation: temperature 1.0, top_p 0.95, top_k 20, min_p 0.0, repetition_penalty 1.0, request_timeout_seconds 300 (patched campaign dist). No presence_penalty.",
+      "base_url": "http://127.0.0.1:12180/v1",
+      "docker_base_url": "http://172.17.0.1:13180/v1"
+    },
+    "hermesagent-20": {
+      "cwd": "/home/kaden/.cache/benchlocal-full-20260731T091750Z/packs/HermesAgent-20",
+      "command": "cd /home/kaden/.cache/benchlocal-full-20260731T091750Z/packs/HermesAgent-20 && node scripts/run-scenarios.mjs --all --model /home/kaden/.hipfire/models/qwen3-27b-3.6.mq4-awq.remote-mi300x --provider custom --base-url http://172.17.0.1:12280/v1 --auth-mode bearer --api-key benchlocal --image hermesagent20-dev --json --verbose",
+      "sampling_fields_proof": "Runner sends only temperature=1.0 top_p=0.95; proxy :12280 forces top_k=20 min_p=0 presence_penalty=0 repetition_penalty=1 and enable_thinking=false. Attestations: hermes-sampling-attestations.jsonl"
+    },
+    "wave1_already_complete": {
+      "packs": [
+        "dataextract-15",
+        "instructfollow-15",
+        "reasonmath-15",
+        "toolcall-15",
+        "promptauthority-15"
+      ],
+      "command_pattern": "cd /home/kaden/.cache/benchlocal-full-20260731T091750Z/packs/<Pack> && LLAMACPP_HOST=http://127.0.0.1:12180 LLM_MODELS=llamacpp:/home/kaden/.hipfire/models/qwen3-27b-3.6.mq4-awq.remote-mi300x MODEL_REQUEST_TIMEOUT_SECONDS=300 node dist-cli/cli/run.js --model llamacpp:/home/kaden/.hipfire/models/qwen3-27b-3.6.mq4-awq.remote-mi300x --temperature 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 --timeout 300 --show-raw --json [tool packs add --repetition-penalty 1.0 --tools-format default]",
+      "source_agent": "RunWaveQwenAr"
+    }
+  }
+}
