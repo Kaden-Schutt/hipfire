@@ -3836,6 +3836,29 @@ fn dump_adapter_pairs(
             .map_err(|e| format!("adapter dump write {path}: {e}"))
     };
 
+    // Optional: the PRE-MIX 4-stream residual [B, hc_mult, hidden]. The router
+    // (and therefore `h` above) sees only the post-mHC-mix projection, so the
+    // mixing may be discarding signal the next layer's routing depends on --
+    // which is exactly what defeated the training-free predictor. Striding
+    // layers keeps the 4x volume affordable while still fitting more rows per
+    // feature, which a 16384-wide fit needs.
+    let stride: usize = std::env::var("HIPFIRE_DEEPSEEK4_ADAPTER_STREAM_STRIDE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    if stride > 0 && layer_idx % stride == 0 {
+        let st = gpu
+            .download_f32(&pbs.streams_batch)
+            .map_err(|e| format!("adapter dump streams l{layer_idx}: {e:?}"))?;
+        let per_row = st.len() / pbs.streams_batch.shape.first().copied().unwrap_or(1).max(1);
+        write_f16(
+            format!("{dir}/x_L{layer_idx}.bin"),
+            &st,
+            batch_size,
+            per_row.min(4 * hidden),
+        )?;
+    }
+
     write_f16(format!("{dir}/h_L{layer_idx}.bin"), &h, batch_size, hidden)?;
     write_f16(format!("{dir}/s_L{layer_idx}.bin"), &s, batch_size, n_exp)?;
 
