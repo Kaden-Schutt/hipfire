@@ -1523,6 +1523,7 @@ pub fn build_dspark_speculator(
     ctx_capacity: usize,
     conf_threshold: f32,
     supports_temp: bool,
+    max_cost_ratio: f32,
 ) -> Box<dyn Speculator> {
     let block = block.clamp(1, 8);
     // Default-on; HIPFIRE_DSPARK_ADAPTIVE_BLOCK=0 opts out (fixed block == today).
@@ -1535,7 +1536,13 @@ pub fn build_dspark_speculator(
         // shrink (low-accept content) from a neutral point. min=1, max=cfg.block_size.
         // p*=0.18 prior (a later task measures it live).
         let start_block = 2.min(block).max(1);
-        crate::dspark_block_controller::BlockController::new(start_block, 1, block, 0.18)
+        crate::dspark_block_controller::BlockController::new(
+            start_block,
+            1,
+            block,
+            0.18,
+            max_cost_ratio,
+        )
     });
     Box::new(MtpSpeculator::new(DsparkDrafter {
         body,

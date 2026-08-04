@@ -850,6 +850,7 @@ fn finish_qwen35_load(
                                             physical_cap,
                                             conf_threshold,
                                             true, // sampled verify (temp>0) supported
+                                            0.5,
                                         ))
                                         }
                                         Err(e) => {

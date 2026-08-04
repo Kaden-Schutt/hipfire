@@ -5522,6 +5522,11 @@ pub const COMPRESSOR_ADD_APE_BATCHED_SRC: &str =
 pub const GEMV_MQ2G256_LLOYD_MOE_GATE_UP_INDEXED_BATCHED_K4_SRC: &str =
     include_str!("../../../kernels/src/gemv_mq2g256_lloyd_moe_gate_up_indexed_batched_k4.hip");
 
+/// Fixed-K=4096 batched gate/up with one cooperative load of all 16 codebooks.
+pub const GEMV_MQ2G256_LLOYD_MOE_GATE_UP_INDEXED_BATCHED_K4096_LDS_SRC: &str = include_str!(
+    "../../../kernels/src/gemv_mq2g256_lloyd_moe_gate_up_indexed_batched_k4096_lds.hip"
+);
+
 /// DeepSeek V4 MoE down — POSITION-BATCHED MQ2-Lloyd indexed GEMV with K4-unrolled
 /// accumulator and scaled residual atomicAdd. Sibling of qwen35's HFQ4 K4
 /// unroll. Drop-in replacement for

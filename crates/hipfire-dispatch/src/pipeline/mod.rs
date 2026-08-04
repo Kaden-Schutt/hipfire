@@ -1865,19 +1865,42 @@ pub fn run_moe_prefill_bias_aware(
         ))?;
     } else {
         // ── Scalar K4 path (batch_size < gate, or grouped opt-out) ──
-        hip!(
-            gpu.deepseek4_gemv_mq2g256_lloyd_moe_gate_up_indexed_batched_k4(
-                p.expert_gate_up_ptrs,
-                p.topk_indices,
-                p.x_rot,
-                p.gate_batch,
-                p.up_batch,
-                2 * im,
-                hidden,
-                k_top,
-                batch_size,
-            )
-        )?;
+        let use_gate_up_k4096_lds = gpu.arch.eq_ignore_ascii_case("gfx1151")
+            && 2 * im == 4096
+            && hidden == 4096
+            && hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MOE_GATE_UP_BATCHED_K4096_LDS")
+                .ok()
+                .as_deref()
+                != Some("0");
+        if use_gate_up_k4096_lds {
+            hip!(
+                gpu.deepseek4_gemv_mq2g256_lloyd_moe_gate_up_indexed_batched_k4096_lds(
+                    p.expert_gate_up_ptrs,
+                    p.topk_indices,
+                    p.x_rot,
+                    p.gate_batch,
+                    p.up_batch,
+                    2 * im,
+                    hidden,
+                    k_top,
+                    batch_size,
+                )
+            )?;
+        } else {
+            hip!(
+                gpu.deepseek4_gemv_mq2g256_lloyd_moe_gate_up_indexed_batched_k4(
+                    p.expert_gate_up_ptrs,
+                    p.topk_indices,
+                    p.x_rot,
+                    p.gate_batch,
+                    p.up_batch,
+                    2 * im,
+                    hidden,
+                    k_top,
+                    batch_size,
+                )
+            )?;
+        }
         hip!(gpu.deepseek4_silu_mul_clamp_f32_batched(
             p.gate_batch,
             p.up_batch,

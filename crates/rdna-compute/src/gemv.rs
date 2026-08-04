@@ -10846,6 +10846,75 @@ impl Gpu {
         }
         result
     }
+    pub fn deepseek4_gemv_mq2g256_lloyd_moe_gate_up_indexed_batched_k4096_lds(
+        &mut self,
+        expert_ptrs: &GpuTensor,
+        topk_indices: &GpuTensor,
+        x_rot: &GpuTensor,
+        y_gate: &GpuTensor,
+        y_up: &GpuTensor,
+        m: usize,
+        k: usize,
+        k_top: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        debug_assert_eq!(k, 4096);
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemv_mq2g256_lloyd_moe_gate_up_indexed_batched_k4096_lds",
+            kernels::GEMV_MQ2G256_LLOYD_MOE_GATE_UP_INDEXED_BATCHED_K4096_LDS_SRC,
+            "gemv_mq2g256_lloyd_moe_gate_up_k8_indexed_batched_k4096_lds",
+        )?;
+        let pp = expert_ptrs.buf.as_ptr();
+        let ip = topk_indices.buf.as_ptr();
+        let xp = x_rot.buf.as_ptr();
+        let ygp = y_gate.buf.as_ptr();
+        let yup = y_up.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let kt_val = k_top as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &pp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &ygp as *const _ as *mut c_void,
+            &yup as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+            &kt_val as *const _ as *mut c_void,
+        ];
+        let mq2_weight_bytes = m * (k / 256) * 72;
+        let bytes = batch_size * k_top * (mq2_weight_bytes + k * 4 + m * 4);
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "gemv",
+            "deepseek4_gemv_mq2g256_lloyd_moe_gate_up_indexed_batched_k4096_lds",
+            bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "gemv_mq2g256_lloyd_moe_gate_up_k8_indexed_batched_k4096_lds",
+            [m as u32, k_top as u32, batch_size as u32],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(pp);
+                b.push_ptr(ip);
+                b.push_ptr(xp);
+                b.push_ptr(ygp);
+                b.push_ptr(yup);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(kt_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
     pub fn wo_per_group_batched_f32(
         &mut self,
         wo_a: &GpuTensor,  // [G, M, K] F32

@@ -394,6 +394,7 @@ fn main() -> Result<(), String> {
             max_seq,
             conf_threshold,
             true, // llama supports sampled verify → temp>0 testable
+            0.5,
         )
     } else {
         // n-gram (or DSpark fallback when sidecar absent).

@@ -316,6 +316,7 @@ pub fn build_deepseek4_dspark_speculator(
         ctx_capacity,
         conf_threshold,
         supports_temp,
+        0.45,
     ))
 }
 
@@ -476,8 +477,17 @@ mod tests {
             d2t: None,
         };
 
-        let mut spec =
-            build_dspark_speculator(body, core_weights, stage_norm, lm_head, 2, 8, 0.3, false);
+        let mut spec = build_dspark_speculator(
+            body,
+            core_weights,
+            stage_norm,
+            lm_head,
+            2,
+            8,
+            0.3,
+            false,
+            0.45,
+        );
         // Dirtied rings are inside the body; reset must free them (no panic).
         let _ = spec.reset(&mut gpu);
         spec.free(&mut gpu);
