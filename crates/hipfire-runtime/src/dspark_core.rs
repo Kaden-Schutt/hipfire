@@ -12,6 +12,7 @@ use rdna_compute::{DType, Gpu, GpuTensor};
 #[derive(Default)]
 struct DsparkProfiler {
     enabled: bool,
+    kernel_profile_position: Option<usize>,
     windows: u64,
     bootstrap_ms: f64,
     draft_ms: f64,
@@ -25,8 +26,13 @@ impl DsparkProfiler {
         let enabled = hipfire_config::developer_var("HIPFIRE_DSPARK_PROFILE")
             .map(|s| s == "1")
             .unwrap_or(false);
+        let kernel_profile_position =
+            hipfire_config::developer_var("HIPFIRE_DSPARK_KERNEL_PROFILE_POSITION")
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok());
         Self {
             enabled,
+            kernel_profile_position,
             ..Default::default()
         }
     }
@@ -1318,6 +1324,10 @@ impl MtpDrafter for DsparkDrafter {
         let capture_buf = gpu
             .alloc_tensor(&[n_verify * expected_hidden_per_pos], DType::F32)
             .map_err(|e| format!("DsparkDrafter: alloc capture_buf: {e:?}"))?;
+        let kernel_profile_this_window = self.profiler.kernel_profile_position == Some(position);
+        if kernel_profile_this_window {
+            rdna_compute::profile::start();
+        }
         let t_verify = self.profiler.sync_start(gpu);
         // temp<=eps → greedy argmax verify (byte-identical to the pre-temp path);
         // temp>0 → distribution-preserving sampled verify (target samples the
@@ -1348,6 +1358,32 @@ impl MtpDrafter for DsparkDrafter {
         // forced GPU completion of draft + heads + verify, so this is real wall time.
         let t_window_ms = _t_win.map(|t| t.elapsed().as_secs_f32() * 1000.0);
         self.profiler.sync_end(gpu, t_verify, 3);
+        if kernel_profile_this_window {
+            let entries = rdna_compute::profile::stop().unwrap_or_default();
+            let mut by_kernel: std::collections::HashMap<&str, (f64, usize, usize)> =
+                std::collections::HashMap::new();
+            for entry in &entries {
+                let aggregate = by_kernel.entry(entry.kernel).or_insert((0.0, 0, 0));
+                aggregate.0 += entry.time_us;
+                aggregate.1 += 1;
+                aggregate.2 += entry.bytes;
+            }
+            let mut kernels: Vec<_> = by_kernel.into_iter().collect();
+            kernels.sort_by(|a, b| b.1 .0.partial_cmp(&a.1 .0).unwrap());
+            eprintln!(
+                "=== DSPARK VERIFY KERNEL PROFILE position={position} n_verify={n_verify} ==="
+            );
+            for (kernel, (time_us, calls, bytes)) in kernels {
+                let gbps = if time_us > 0.0 {
+                    bytes as f64 / 1.0e3 / time_us
+                } else {
+                    0.0
+                };
+                eprintln!(
+                    "kernel={kernel} calls={calls} total_us={time_us:.3} bytes={bytes} gbps={gbps:.3}"
+                );
+            }
+        }
 
         // ── 5. Greedy accept ─────────────────────────────────────────────────
         let t_rest = self.profiler.sync_start(gpu);

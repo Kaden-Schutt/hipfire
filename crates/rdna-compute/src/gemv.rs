@@ -4675,15 +4675,22 @@ impl Gpu {
             &m_i32 as *const _ as *mut c_void,
             &k_i32 as *const _ as *mut c_void,
         ];
-        self.launch_maybe_blob(name, [m as u32, 1, 1], [32, 1, 1], 0, &mut params, || {
-            let mut blob = hip_bridge::KernargBlob::new();
-            blob.push_ptr(a_ptr);
-            blob.push_ptr(x_ptr);
-            blob.push_ptr(y_ptr);
-            blob.push_i32(m_i32);
-            blob.push_i32(k_i32);
-            blob
-        })
+        let bytes = a.byte_size() + batch * (k * 4 + m * 4);
+        let timer = crate::profile::begin_timer(&self.hip, "gemv", name, bytes);
+        let result =
+            self.launch_maybe_blob(name, [m as u32, 1, 1], [32, 1, 1], 0, &mut params, || {
+                let mut blob = hip_bridge::KernargBlob::new();
+                blob.push_ptr(a_ptr);
+                blob.push_ptr(x_ptr);
+                blob.push_ptr(y_ptr);
+                blob.push_i32(m_i32);
+                blob.push_i32(k_i32);
+                blob
+            });
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
     }
 
     /// Two independent B=3 E8 projections with the same shape and input in a
@@ -4731,7 +4738,9 @@ impl Gpu {
             &m_i32 as *const _ as *mut c_void,
             &k_i32 as *const _ as *mut c_void,
         ];
-        self.launch_maybe_blob(
+        let bytes = a0.byte_size() + a1.byte_size() + 3 * (k * 4 + 2 * m * 4);
+        let timer = crate::profile::begin_timer(&self.hip, "gemv", name, bytes);
+        let result = self.launch_maybe_blob(
             name,
             [(2 * m) as u32, 1, 1],
             [32, 1, 1],
@@ -4748,7 +4757,11 @@ impl Gpu {
                 blob.push_i32(k_i32);
                 blob
             },
-        )
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
     }
 
     /// Up to seven independent B=3 E8 projections that share one input and K
@@ -4779,6 +4792,15 @@ impl Gpu {
             kernels::GEMV_MFP4G32_E8_SOA_BATCHED_PACK_B3_GFX1151_SRC,
             name,
         )?;
+
+        let bytes = a
+            .iter()
+            .zip(m.iter())
+            .filter(|(_, rows)| **rows > 0)
+            .map(|(weight, _)| weight.byte_size())
+            .sum::<usize>()
+            + 3 * (k * 4 + total_m * 4);
+        let timer = crate::profile::begin_timer(&self.hip, "gemv", name, bytes);
 
         let [a0, a1, a2, a3, a4, a5, a6] = a;
         let [y0, y1, y2, y3, y4, y5, y6] = y;
@@ -4824,7 +4846,7 @@ impl Gpu {
             &m6 as *const _ as *mut c_void,
             &k_i32 as *const _ as *mut c_void,
         ];
-        self.launch_maybe_blob(
+        let result = self.launch_maybe_blob(
             name,
             [total_m as u32, 1, 1],
             [32, 1, 1],
@@ -4843,7 +4865,11 @@ impl Gpu {
                 }
                 blob
             },
-        )
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
     }
 
     /// Batched grouped E8-SoA decode GEMV: `A[G,M,K] @ X[B,G,K] -> Y[B,G,M]`,
@@ -4926,7 +4952,9 @@ impl Gpu {
             &m_i32 as *const _ as *mut c_void,
             &k_i32 as *const _ as *mut c_void,
         ];
-        self.launch_maybe_blob(
+        let bytes = a.byte_size() + batch * g * (k * 4 + m * 4);
+        let timer = crate::profile::begin_timer(&self.hip, "gemv", name, bytes);
+        let result = self.launch_maybe_blob(
             name,
             [m as u32, g as u32, 1],
             [32, 1, 1],
@@ -4942,7 +4970,11 @@ impl Gpu {
                 blob.push_i32(k_i32);
                 blob
             },
-        )
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
     }
 
     /// SoA E8 GEMV, 8-way unroll (bench experiment — cache-roofline MLP sweep).

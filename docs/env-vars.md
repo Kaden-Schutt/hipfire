@@ -479,6 +479,7 @@ Copyable user, developer, and retained-PM4 TOML profiles are in
 | `HIPFIRE_DSPARK_ADAPTIVE_BLOCK` | crates/hipfire-runtime/src/dspark_core.rs |
 | `HIPFIRE_DSPARK_DEBUG` | crates/hipfire-runtime/src/dspark_core.rs |
 | `HIPFIRE_DSPARK_HFQ4_WMMA` | crates/hipfire-runtime/src/dspark_core.rs |
+| `HIPFIRE_DSPARK_KERNEL_PROFILE_POSITION` | crates/hipfire-runtime/src/dspark_core.rs |
 | `HIPFIRE_DSPARK_PROFILE` | crates/hipfire-runtime/src/dspark_core.rs |
 | `HIPFIRE_DSPARK_Q8_4W` | crates/hipfire-runtime/src/dspark_core.rs |
 | `HIPFIRE_DSPARK_Q8_WMMA` | crates/hipfire-runtime/src/dspark_core.rs |
