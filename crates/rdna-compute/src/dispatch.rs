@@ -1465,9 +1465,7 @@ impl Gpu {
         let need_bytes = rows
             .checked_mul(last_dim)
             .and_then(|e| e.checked_mul(2))
-            .ok_or_else(|| {
-                HipError::new(0, "act_quant_fp8_ue8m0_inplace_gfx942: size overflow")
-            })?;
+            .ok_or_else(|| HipError::new(0, "act_quant_fp8_ue8m0_inplace_gfx942: size overflow"))?;
         if x.size() < need_bytes {
             return Err(HipError::new(
                 0,
@@ -1596,7 +1594,6 @@ impl Gpu {
             },
         )
     }
-
 
     /// D→D copy with offsets that picks async (on the active stream) when
     /// a stream is set and sync otherwise. Captured graphs require async on
@@ -2664,6 +2661,103 @@ impl Gpu {
             .verify_graph_destroy_all(&self.hip, self.device_id);
         self.graphs
             .replay_graph_destroy_all(&self.hip, self.device_id);
+    }
+
+    /// Typed F32 device-buffer copy. Unlike hipMemcpy D2D, this launch is
+    /// visible to the retained-replay recorder and carries an explicit ABI.
+    pub fn copy_f32_buffer(&mut self, dst: &GpuTensor, src: &GpuTensor, n: usize) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "copy_f32_buffer",
+            crate::kernels::COPY_F32_BUFFER_SRC,
+            "copy_f32_buffer",
+        )?;
+        let dp = dst.buf.as_ptr();
+        let sp = src.buf.as_ptr();
+        let mut n_i32 =
+            i32::try_from(n).map_err(|_| HipError::new(0, "copy_f32_buffer length exceeds i32"))?;
+        let mut params: Vec<*mut c_void> = vec![
+            &dp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &mut n_i32 as *mut _ as *mut c_void,
+        ];
+        let blob_builder = || {
+            let mut blob = hip_bridge::KernargBlob::new();
+            blob.push_ptr(dp);
+            blob.push_ptr(sp);
+            blob.push_i32(n_i32);
+            blob
+        };
+        let grid = (n as u32).div_ceil(256) * 256;
+        self.launch_maybe_blob(
+            "copy_f32_buffer",
+            [grid, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            blob_builder,
+        )
+    }
+
+    /// Copy `rows` contiguous source rows into one slot of a strided
+    /// destination row. Used by DSpark hidden capture to replace B separate
+    /// D2D memcpy nodes with one typed dispatch.
+    #[allow(clippy::too_many_arguments)]
+    pub fn copy_f32_strided_slot_buffer(
+        &mut self,
+        dst: &GpuTensor,
+        src: &GpuTensor,
+        rows: usize,
+        row_elems: usize,
+        dst_row_stride: usize,
+        dst_slot_offset: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "copy_f32_strided_slot_buffer",
+            crate::kernels::COPY_F32_BUFFER_SRC,
+            "copy_f32_strided_slot_buffer",
+        )?;
+        let dp = dst.buf.as_ptr();
+        let sp = src.buf.as_ptr();
+        let mut rows_i32 = i32::try_from(rows)
+            .map_err(|_| HipError::new(0, "copy_f32_strided_slot_buffer rows exceed i32"))?;
+        let mut row_elems_i32 = i32::try_from(row_elems)
+            .map_err(|_| HipError::new(0, "copy_f32_strided_slot_buffer row length exceeds i32"))?;
+        let mut stride_i32 = i32::try_from(dst_row_stride)
+            .map_err(|_| HipError::new(0, "copy_f32_strided_slot_buffer stride exceeds i32"))?;
+        let mut slot_i32 = i32::try_from(dst_slot_offset)
+            .map_err(|_| HipError::new(0, "copy_f32_strided_slot_buffer slot exceeds i32"))?;
+        let mut params: Vec<*mut c_void> = vec![
+            &dp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &mut rows_i32 as *mut _ as *mut c_void,
+            &mut row_elems_i32 as *mut _ as *mut c_void,
+            &mut stride_i32 as *mut _ as *mut c_void,
+            &mut slot_i32 as *mut _ as *mut c_void,
+        ];
+        let blob_builder = || {
+            let mut blob = hip_bridge::KernargBlob::new();
+            blob.push_ptr(dp);
+            blob.push_ptr(sp);
+            blob.push_i32(rows_i32);
+            blob.push_i32(row_elems_i32);
+            blob.push_i32(stride_i32);
+            blob.push_i32(slot_i32);
+            blob
+        };
+        let total = rows
+            .checked_mul(row_elems)
+            .ok_or_else(|| HipError::new(0, "copy_f32_strided_slot_buffer size overflow"))?;
+        let grid = (total as u32).div_ceil(256) * 256;
+        self.launch_maybe_blob(
+            "copy_f32_strided_slot_buffer",
+            [grid, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            blob_builder,
+        )
     }
 
     /// Drop captured graph state and retained Redline replay after a live KV

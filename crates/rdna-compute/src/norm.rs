@@ -4118,7 +4118,6 @@ impl Gpu {
             kernels::V4F_CONVERT_F32_TO_F16_SRC,
             "deepseek4_convert_f32_to_f16",
         )?;
-        let func = &self.functions["deepseek4_convert_f32_to_f16"];
         let sp = src.buf.as_ptr();
         let dp = dst.buf.as_ptr();
         let mut nn = n;
@@ -4128,16 +4127,20 @@ impl Gpu {
             &mut nn as *mut _ as *mut c_void,
         ];
         let n_wgs = ((n + 127) / 128) as u32;
-        unsafe {
-            self.hip.launch_kernel(
-                func,
-                [n_wgs, 1, 1],
-                [128, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        }
+        self.launch_maybe_blob(
+            "deepseek4_convert_f32_to_f16",
+            [n_wgs, 1, 1],
+            [128, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(sp);
+                b.push_ptr(dp);
+                b.push_u64(nn as u64);
+                b
+            },
+        )
     }
     pub fn fused_rmsnorm_rotate_mq_plain(
         &mut self,

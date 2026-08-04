@@ -370,9 +370,12 @@ fn pm4_vmem_acquire_enabled(
     certifications: &BTreeMap<PathBuf, CodeObjectCertification>,
     launch: &RecordedHipLaunch,
 ) -> bool {
-    architecture != Pm4Architecture::Gfx12
-        && configured
+    pm4_vmem_acquire_arch_enabled(architecture, configured)
         && radiowave_vmem_only_consumer(certifications, launch)
+}
+
+fn pm4_vmem_acquire_arch_enabled(architecture: Pm4Architecture, configured: bool) -> bool {
+    architecture != Pm4Architecture::Gfx12 && configured
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1550,6 +1553,110 @@ fn pm4_ds4_ffn_branch_plan(recorded: &[RecordedHipLaunch]) -> Result<Vec<Pm4Phas
     Ok(phases)
 }
 
+fn is_ds4_batched_e8_gemv(kernel: &str) -> bool {
+    kernel.starts_with("gemv_mfp4g32_e8_soa_batched_b") && kernel.ends_with("_gfx1151")
+}
+
+/// Recover the fork/join already present in DeepSeek4's batched verify FFN:
+///
+///   shared: E8 w1 -> E8 w3 -> SwiGLU -> rotate -> E8 w2
+///   routed: E8 router -> score transform -> top-k -> MQ2 gate/up -> SwiGLU -> rotate
+///   join:   MQ2 down atomically accumulates into the completed shared output
+///
+/// The ordinary batched forward emits those branches serially. Keeping each
+/// complete producer chain on one queue preserves its cache and dependency
+/// locality while allowing the two large branches to overlap. The routed down
+/// projection stays in the following serial phase because it consumes the
+/// routed activation and updates the shared branch's output allocation.
+///
+/// Every recognized fork is re-proved resource-independent from the captured
+/// argument effects. A changed kernel sequence or unknown effect rejects the
+/// entire plan rather than partially parallelizing an unrecognized layer.
+fn pm4_ds4_batched_ffn_branch_plan(
+    recorded: &[RecordedHipLaunch],
+) -> Result<Vec<Pm4PhasePlan>, String> {
+    const ROUTED_GATE_UP: &str = "gemv_mq2g256_lloyd_moe_gate_up_k8_indexed_batched_k4";
+    const ROUTED_DOWN: &str = "gemv_mq2g256_lloyd_moe_down_residual_scaled_k8_indexed_batched_k4";
+
+    let mut phases = Vec::<Pm4PhasePlan>::new();
+    let mut cursor = 0_usize;
+    let mut search_cursor = 0_usize;
+    let mut branches = 0_usize;
+
+    while let Some(down) = recorded[search_cursor..]
+        .iter()
+        .position(|launch| launch.kernel == ROUTED_DOWN)
+        .map(|offset| search_cursor + offset)
+    {
+        // The exact captured branch has five shared launches and six routed
+        // launches before the routed-down join.
+        let shared_start = down.checked_sub(11).ok_or_else(|| {
+            format!("DeepSeek4 batched FFN routed down at {down} has no complete fork prefix")
+        })?;
+        let router = down - 6;
+        let names = |index: usize| recorded[index].kernel.as_str();
+        let recognized = is_ds4_batched_e8_gemv(names(shared_start))
+            && is_ds4_batched_e8_gemv(names(shared_start + 1))
+            && names(shared_start + 2) == "deepseek4_silu_mul_clamp_f32"
+            && names(shared_start + 3) == "mq_rotate_x"
+            && is_ds4_batched_e8_gemv(names(shared_start + 4))
+            && is_ds4_batched_e8_gemv(names(router))
+            && names(router + 1) == "sqrt_softplus_f32"
+            && matches!(
+                names(router + 2),
+                "hash_router_normalize_f32_batched" | "deepseek4_moe_topk_bias_aware_batched_f32"
+            )
+            && names(router + 3) == ROUTED_GATE_UP
+            && names(router + 4) == "deepseek4_silu_mul_clamp_f32"
+            && names(router + 5) == "mq_rotate_x";
+        if !recognized {
+            return Err(format!(
+                "DeepSeek4 batched FFN fork before routed down at {down} does not match the certified 5+6 launch sequence"
+            ));
+        }
+        if !launch_ranges_are_independent(recorded, shared_start..router, router..down) {
+            return Err(format!(
+                "DeepSeek4 batched FFN branches [{shared_start}, {router}) and [{router}, {down}) are not resource-independent"
+            ));
+        }
+
+        if cursor < shared_start {
+            phases.push(Pm4PhasePlan {
+                indices: (cursor..shared_start).collect(),
+                parallel: false,
+                lane_split: None,
+            });
+        }
+        let shared_len = router - shared_start;
+        phases.push(Pm4PhasePlan {
+            indices: (shared_start..down).collect(),
+            parallel: true,
+            lane_split: Some(shared_len),
+        });
+        branches += 1;
+        cursor = down;
+        search_cursor = down + 1;
+    }
+
+    if cursor < recorded.len() {
+        phases.push(Pm4PhasePlan {
+            indices: (cursor..recorded.len()).collect(),
+            parallel: false,
+            lane_split: None,
+        });
+    }
+    if branches == 0 {
+        return Err(
+            "DeepSeek4 batched FFN branch-chain planning requested but tape has no routed-down joins"
+                .to_owned(),
+        );
+    }
+    eprintln!(
+        "[redline] DeepSeek4 batched FFN branch-chain plan recovered {branches} shared/routed phases"
+    );
+    Ok(phases)
+}
+
 fn pm4_ds4_ffn_branch_chains_from_config() -> bool {
     hipfire_config::process_value("HIPFIRE_REPLAY_PM4_DS4_FFN_BRANCH_CHAINS")
         .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "on"))
@@ -2667,6 +2774,33 @@ impl ReplayController {
         controller
     }
 
+    /// Construct an explicitly-delimited automatic PM4 controller. Model
+    /// adapters use this for secondary retained bodies (for example a
+    /// speculative verify shape) that must not replace `Gpu::replay`, the
+    /// model's ordinary-AR controller.
+    pub fn new_manual_pm4() -> Self {
+        let mut controller = Self::new_armed(ReplayBackendRequest::Auto);
+        controller.transport = ReplayTransport::Pm4Ib;
+        controller.auto_lifecycle = false;
+        // Batched DS4 verify grows past the ordinary-AR 4,096-launch cap at
+        // B>=5 (B=4 is 3,642 dispatches). Keep this scoped to the secondary
+        // controller; the primary model controller retains its stricter cap.
+        controller.max_recorded_launches = 8_192;
+        controller
+    }
+
+    /// Construct the AQL-packet twin of [`Self::new_manual_pm4`]. This exists
+    /// as a diagnostic/control route for secondary retained bodies: it keeps
+    /// the same capture and kernarg lifetime while replacing architecture-
+    /// native PM4 boundary lowering with public-HSA dispatch headers.
+    pub fn new_manual_aql() -> Self {
+        let mut controller = Self::new_armed(ReplayBackendRequest::Auto);
+        controller.transport = ReplayTransport::AqlPackets;
+        controller.auto_lifecycle = false;
+        controller.max_recorded_launches = 8_192;
+        controller
+    }
+
     /// Apply the daemon's model-scoped replay default after a successful load.
     ///
     /// An explicit backend selection always wins. Otherwise every successful
@@ -3458,7 +3592,14 @@ impl ReplayController {
             let native_phase_sync = pm4_native_phase_sync_from_config();
             let ds4_ffn_branch_chains = pm4_ds4_ffn_branch_chains_from_config();
             let plans = if ds4_ffn_branch_chains {
-                pm4_ds4_ffn_branch_plan(&self.recorded[..prefix])?
+                if self.recorded[..prefix]
+                    .iter()
+                    .any(|launch| launch.kernel == "zero_f32")
+                {
+                    pm4_ds4_ffn_branch_plan(&self.recorded[..prefix])?
+                } else {
+                    pm4_ds4_batched_ffn_branch_plan(&self.recorded[..prefix])?
+                }
             } else {
                 pm4_phase_plan(
                     &self.recorded[..prefix],
@@ -4280,16 +4421,11 @@ mod tests {
 
     #[test]
     fn gfx12_never_reports_gfx11_vmem_acquire() {
-        let kernel = "fused_rmsnorm_mq_rotate";
-        assert!(pm4_vmem_acquire_enabled(
+        assert!(pm4_vmem_acquire_arch_enabled(Pm4Architecture::Gfx11, true));
+        assert!(!pm4_vmem_acquire_arch_enabled(Pm4Architecture::Gfx12, true));
+        assert!(!pm4_vmem_acquire_arch_enabled(
             Pm4Architecture::Gfx11,
-            true,
-            kernel
-        ));
-        assert!(!pm4_vmem_acquire_enabled(
-            Pm4Architecture::Gfx12,
-            true,
-            kernel
+            false
         ));
     }
 
@@ -5084,6 +5220,81 @@ mod tests {
                 },
                 Pm4PhasePlan {
                     indices: vec![6, 7],
+                    parallel: false,
+                    lane_split: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn pm4_ds4_batched_ffn_branch_planner_keeps_routed_down_after_fan_in() {
+        let launch = |kernel: &str, accesses: &[(u64, RecordedAccessMode)]| RecordedHipLaunch {
+            kernel: kernel.to_owned(),
+            artifact: None,
+            grid: [1; 3],
+            block: [1; 3],
+            shared_mem: 0,
+            grid_binding: None,
+            kernarg: Vec::new(),
+            accesses: Some(
+                accesses
+                    .iter()
+                    .map(|(base, mode)| RecordedResourceAccess {
+                        allocation_base: *base,
+                        allocation_bytes: 0x100,
+                        access_base: *base,
+                        mode: *mode,
+                    })
+                    .collect(),
+            ),
+        };
+        use RecordedAccessMode::{Read, Write};
+        let e8 = "gemv_mfp4g32_e8_soa_batched_b3_gfx1151";
+        let recorded = vec![
+            launch("prepare", &[(0x1000, Write)]),
+            launch(e8, &[(0x1000, Read), (0x2000, Write)]),
+            launch(e8, &[(0x1000, Read), (0x2100, Write)]),
+            launch(
+                "deepseek4_silu_mul_clamp_f32",
+                &[(0x2000, Write), (0x2100, Read)],
+            ),
+            launch("mq_rotate_x", &[(0x2000, Read), (0x2200, Write)]),
+            launch(e8, &[(0x2200, Read), (0x3000, Write)]),
+            launch(e8, &[(0x1000, Read), (0x4000, Write)]),
+            launch("sqrt_softplus_f32", &[(0x4000, Write)]),
+            launch(
+                "deepseek4_moe_topk_bias_aware_batched_f32",
+                &[(0x4000, Read), (0x4100, Write)],
+            ),
+            launch(
+                "gemv_mq2g256_lloyd_moe_gate_up_k8_indexed_batched_k4",
+                &[(0x1000, Read), (0x4100, Read), (0x4200, Write)],
+            ),
+            launch("deepseek4_silu_mul_clamp_f32", &[(0x4200, Write)]),
+            launch("mq_rotate_x", &[(0x4200, Read), (0x4300, Write)]),
+            launch(
+                "gemv_mq2g256_lloyd_moe_down_residual_scaled_k8_indexed_batched_k4",
+                &[(0x4300, Read), (0x3000, Write)],
+            ),
+            launch("tail", &[(0x3000, Read)]),
+        ];
+
+        assert_eq!(
+            pm4_ds4_batched_ffn_branch_plan(&recorded).unwrap(),
+            vec![
+                Pm4PhasePlan {
+                    indices: vec![0],
+                    parallel: false,
+                    lane_split: None,
+                },
+                Pm4PhasePlan {
+                    indices: (1..12).collect(),
+                    parallel: true,
+                    lane_split: Some(5),
+                },
+                Pm4PhasePlan {
+                    indices: vec![12, 13],
                     parallel: false,
                     lane_split: None,
                 },

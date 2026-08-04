@@ -2806,7 +2806,6 @@ pub const ACT_QUANT_FP4_UE8M0_G32_INPLACE_GFX942_SRC: &str =
 pub const GEMM_BF16_MFMA_GFX942_SRC: &str =
     include_str!("../../../kernels/src/gemm_bf16_mfma.gfx942.hip");
 
-
 pub const GEMM_GATE_UP_HFQ4G256_WMMA_SRC: &str =
     include_str!("../../../kernels/src/gemm_gate_up_hfq4g256_wmma.hip");
 // LDS-staged X variant. Opt-in via HIPFIRE_GATE_UP_VARIANT=ldsx for
@@ -5380,6 +5379,11 @@ pub const HC_SPLIT_FINALIZE_BATCHED_SRC: &str =
 /// deepseek4_attn_swa_topk_batched / deepseek4_attn_swa_batched.
 pub const SWA_VISIBILITY_STAGE_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/swa_visibility_stage_batched.hip");
+
+/// Typed device-buffer copies used inside retained replay bodies. HIP memcpy
+/// nodes are not kernel launches and therefore are not part of Redline's typed
+/// launch recorder; these kernels make the dependency explicit and auditable.
+pub const COPY_F32_BUFFER_SRC: &str = include_str!("../../../kernels/src/copy_f32_buffer.hip");
 
 /// DeepSeek V4 top-K K/V gather — BATCHED (Phase B2, 2026-05-18). Per-batch
 /// top-K gather from the shared main compressed-K cache into a

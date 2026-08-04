@@ -17884,17 +17884,38 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
     prompt_ids
 }
 
-/// Resolve whether deepseek4 spec-decode is requested for this model from the
-/// typed process policy.
-/// The dispatch uses this (plus `temp <= 1e-6` and `m.speculator.is_some()`) to
-/// route the spec path through the unified `generate_spec`; the AR path (and the
-/// no-speculator fallback) stay in `generate_deepseek4`.
-fn deepseek4_spec_requested(m: &LoadedModel) -> bool {
-    match hipfire_runtime::config::get().mtp_mode.as_str() {
+/// Resolve whether DeepSeek4 spec-decode is requested from the installed
+/// drafter and typed MTP policy.
+///
+/// DSpark is a distinct speculation selector, not an MTP mode.  The loader has
+/// already applied the typed `dspark_mode` policy before installing the
+/// speculator, so an installed DSpark drafter is authoritative here.  Falling
+/// through to `mtp_mode` for DSpark made `speculation = "dspark"` load and build
+/// the sidecar, then silently route the request through AR because that selector
+/// correctly pins MTP off.
+fn deepseek4_spec_requested_from_policy(
+    drafter_name: Option<&str>,
+    process_mtp_mode: &str,
+    model_mtp_mode: &str,
+    model_mtp_weights_present: bool,
+) -> bool {
+    if drafter_name == Some("dspark") {
+        return true;
+    }
+    match process_mtp_mode {
         "on" => true,
         "off" => false,
-        _ => m.mtp_mode == "on" || (m.mtp_mode == "auto" && m.mtp_weights_present),
+        _ => model_mtp_mode == "on" || (model_mtp_mode == "auto" && model_mtp_weights_present),
     }
+}
+
+fn deepseek4_spec_requested(m: &LoadedModel) -> bool {
+    deepseek4_spec_requested_from_policy(
+        m.speculator.as_ref().map(|s| s.name()),
+        hipfire_runtime::config::get().mtp_mode.as_str(),
+        &m.mtp_mode,
+        m.mtp_weights_present,
+    )
 }
 
 /// deepseek4 MTP spec-decode through the unified `generate_spec` (Phase 4 T4c-2).
@@ -27903,7 +27924,10 @@ mod qwen_dflash_semantic_terminal_tests {
 /// Production symbols only — no generate() side effects.
 #[cfg(test)]
 mod generation_route_matrix_tests {
-    use super::{select_generation_route, GenerationRoute, GenerationRouteInputs};
+    use super::{
+        deepseek4_spec_requested_from_policy, select_generation_route, GenerationRoute,
+        GenerationRouteInputs,
+    };
 
     /// Baseline inputs that select nothing special (unknown arch, no EP/PP/spec).
     fn base() -> GenerationRouteInputs {
@@ -27926,6 +27950,22 @@ mod generation_route_matrix_tests {
             supports_temp_swor: false,
             kv_adaptive: false,
         }
+    }
+
+    #[test]
+    fn dspark_request_is_independent_of_mtp_mode() {
+        assert!(deepseek4_spec_requested_from_policy(
+            Some("dspark"),
+            "off",
+            "off",
+            false,
+        ));
+        assert!(!deepseek4_spec_requested_from_policy(
+            None, "off", "auto", true,
+        ));
+        assert!(deepseek4_spec_requested_from_policy(
+            None, "auto", "auto", true,
+        ));
     }
 
     /// One canonical input row that selects each ALL variant (coverage guard).

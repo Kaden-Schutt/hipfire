@@ -58,3 +58,32 @@ extern "C" __global__ void swa_visibility_stage_batched(
     }
     staged[((size_t)b * head_dim + d) * swa_window + i] = val;
 }
+
+// Capture/retained-replay twin. `positions[b]` is refreshed outside the
+// recorded body, so no absolute position is baked into a graph kernarg.
+extern "C" __global__ void swa_visibility_stage_batched_pos(
+    const float* __restrict__ ring,
+    const float* __restrict__ kv_batch,
+    float*       __restrict__ staged,
+    const int*   __restrict__ positions,
+    int swa_window,
+    int head_dim,
+    int batch_size
+) {
+    const int d = blockIdx.x;
+    const int b = blockIdx.y;
+    const int i = threadIdx.x;
+    if (d >= head_dim || b >= batch_size || i >= swa_window) return;
+
+    const int p = positions[b];
+    const int start_pos = positions[0];
+    const int visible_start = max(0, p + 1 - swa_window);
+    const int n_valid = (p + 1) - visible_start;
+    if (i >= n_valid) return;
+
+    const int pos_i = visible_start + i;
+    const float val = pos_i < start_pos
+        ? ring[(size_t)d * swa_window + pos_i % swa_window]
+        : kv_batch[(size_t)(pos_i - start_pos) * head_dim + d];
+    staged[((size_t)b * head_dim + d) * swa_window + i] = val;
+}

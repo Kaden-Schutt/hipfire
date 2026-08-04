@@ -447,6 +447,12 @@ struct BenchArgs {
     kv_backend: Option<String>,
     #[arg(long)]
     redline: bool,
+    /// Speculation mode to benchmark (off, dflash, mtp, ngram, dspark, or auto).
+    #[arg(long = "spec")]
+    speculation: Option<String>,
+    /// Start generation in answer mode, matching `hipfire run` when reasoning is off.
+    #[arg(long)]
+    reasoning_off: bool,
     /// Prompt words for the standard benchmark.
     #[arg(num_args = 0..)]
     prompt: Vec<String>,
@@ -6272,13 +6278,18 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
     if args.matrix || args.redline {
         bench_matrix(&mut engine, &args, &loaded, &post_diag)
     } else {
-        let _ = bench_generate(&mut engine, "Hello", 16)?;
+        let _ = bench_generate_with_reasoning(&mut engine, "Hello", 16, args.reasoning_off)?;
         let mut decode = Vec::new();
         let mut prefill = Vec::new();
         let mut wall = Vec::new();
         let mut ttft = Vec::new();
         for _ in 0..args.runs {
-            let done = bench_generate(&mut engine, &prompt, args.max_tokens as u64)?;
+            let done = bench_generate_with_reasoning(
+                &mut engine,
+                &prompt,
+                args.max_tokens as u64,
+                args.reasoning_off,
+            )?;
             if let Some(value) = done.get("decode_tok_s").and_then(serde_json::Value::as_f64) {
                 decode.push(value);
             }
@@ -6392,6 +6403,9 @@ fn open_bench_engine(
         args.kv_mode.as_deref(),
         args.kv_backend.as_deref(),
     )?;
+    if let Some(selector) = args.speculation.as_deref() {
+        apply_speculation_selector(&mut params, selector)?;
+    }
     if args.matrix || args.redline {
         let requested = longest_prefill.max(longest_decode).saturating_add(32);
         let configured = params["max_seq"].as_u64().unwrap_or(0);
@@ -6417,6 +6431,21 @@ fn bench_generate_request(prompt: &str, max_tokens: u64) -> serde_json::Value {
 
 fn bench_generate(engine: &mut Engine, prompt: &str, max_tokens: u64) -> Result<serde_json::Value> {
     Ok(engine.generate(&bench_generate_request(prompt, max_tokens), |_| Ok(()))?)
+}
+
+fn bench_generate_with_reasoning(
+    engine: &mut Engine,
+    prompt: &str,
+    max_tokens: u64,
+    reasoning_off: bool,
+) -> Result<serde_json::Value> {
+    let mut request = bench_generate_request(prompt, max_tokens);
+    if reasoning_off {
+        request["max_think_tokens"] = serde_json::json!(1);
+        request["assistant_prefix"] = serde_json::json!("closed_think");
+        request["reasoning_effort"] = serde_json::json!("none");
+    }
+    Ok(engine.generate(&request, |_| Ok(()))?)
 }
 
 fn bench_probe(
@@ -6626,6 +6655,8 @@ fn profile_command(paths: &Paths, args: ProfileArgs) -> Result<()> {
             kv_mode: None,
             kv_backend: None,
             redline: false,
+            speculation: None,
+            reasoning_off: false,
             prompt: Vec::new(),
         };
         let (mut engine, _, _, _) = open_bench_engine(paths, &bench, None)?;

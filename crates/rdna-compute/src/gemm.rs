@@ -22167,7 +22167,6 @@ impl Gpu {
             kernels::GEMM_F16_X_F16_WMMA_SRC,
             "gemm_f16_x_f16_wmma",
         )?;
-        let func = &self.functions["gemm_f16_x_f16_wmma"];
         let ap = a_f16.buf.as_ptr();
         let xp = x_f16.buf.as_ptr();
         let yp = y_f32.buf.as_ptr();
@@ -22184,16 +22183,23 @@ impl Gpu {
         ];
         let grid_m = ((m + 15) / 16) as u32;
         let grid_b = ((batch_size + 15) / 16) as u32;
-        unsafe {
-            self.hip.launch_kernel(
-                func,
-                [grid_m, grid_b, 1],
-                [32, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        }
+        self.launch_maybe_blob(
+            "gemm_f16_x_f16_wmma",
+            [grid_m, grid_b, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ap);
+                b.push_ptr(xp);
+                b.push_ptr(yp);
+                b.push_i32(mi);
+                b.push_i32(ki);
+                b.push_i32(bi);
+                b
+            },
+        )
     }
     pub fn gemm_f32_register_tiled(
         &mut self,
@@ -22885,15 +22891,21 @@ impl Gpu {
         let a_bytes = m
             .checked_mul(k)
             .and_then(|e| e.checked_mul(2))
-            .ok_or_else(|| hip_bridge::HipError::new(0, "gemm_bf16_mfma_gfx942: A size overflow"))?;
+            .ok_or_else(|| {
+                hip_bridge::HipError::new(0, "gemm_bf16_mfma_gfx942: A size overflow")
+            })?;
         let b_bytes = batch
             .checked_mul(k)
             .and_then(|e| e.checked_mul(2))
-            .ok_or_else(|| hip_bridge::HipError::new(0, "gemm_bf16_mfma_gfx942: B size overflow"))?;
+            .ok_or_else(|| {
+                hip_bridge::HipError::new(0, "gemm_bf16_mfma_gfx942: B size overflow")
+            })?;
         let d_bytes = batch
             .checked_mul(m)
             .and_then(|e| e.checked_mul(4))
-            .ok_or_else(|| hip_bridge::HipError::new(0, "gemm_bf16_mfma_gfx942: D size overflow"))?;
+            .ok_or_else(|| {
+                hip_bridge::HipError::new(0, "gemm_bf16_mfma_gfx942: D size overflow")
+            })?;
         if a.size() < a_bytes {
             return Err(hip_bridge::HipError::new(
                 0,
@@ -23014,9 +23026,12 @@ impl Gpu {
                 &format!("gemm_f16_x_f16_mfma_gfx942: K must be a multiple of 16 (got K={k})"),
             ));
         }
-        let a_bytes = m.checked_mul(k).and_then(|e| e.checked_mul(2)).ok_or_else(|| {
-            hip_bridge::HipError::new(0, "gemm_f16_x_f16_mfma_gfx942: A size overflow")
-        })?;
+        let a_bytes = m
+            .checked_mul(k)
+            .and_then(|e| e.checked_mul(2))
+            .ok_or_else(|| {
+                hip_bridge::HipError::new(0, "gemm_f16_x_f16_mfma_gfx942: A size overflow")
+            })?;
         let x_bytes = batch_size
             .checked_mul(k)
             .and_then(|e| e.checked_mul(2))
