@@ -3800,6 +3800,8 @@ fn prefetch_hash_experts(
     let mut p = paging
         .lock()
         .map_err(|_| "prefetch_hash: expert pager mutex poisoned".to_string())?;
+    // Tag the access trace with the token being decoded (no-op unless tracing).
+    p.set_trace_token(token_ids[0]);
     let slots = p.slots_per_blob();
     let mut experts: Vec<u16> = Vec::with_capacity(token_ids.len() * k);
     for layer_idx in 0..cfg.num_hash_layers {

@@ -696,7 +696,7 @@ impl Ds4PagingRuntime {
 
 /// Optional access-trace sink for the offline policy simulator
 /// (`crate::expert_policy`). `HIPFIRE_DEEPSEEK4_EXPERT_TRACE=<path>` records
-/// one `seq,layer,role,expert` row per requested expert.
+/// one `seq,layer,role,expert,token` row per requested expert.
 ///
 /// This is the P0 instrumentation from Kaden's weight-pager spec: decide
 /// whether the eviction policy is worth changing by replaying real routing
@@ -704,6 +704,16 @@ impl Ds4PagingRuntime {
 struct ExpertTrace {
     out: std::io::BufWriter<std::fs::File>,
     seq: u64,
+    /// Token id currently being decoded, or `u32::MAX` before any is set.
+    ///
+    /// Recorded so an offline analysis can ask whether expert selection is
+    /// TOKEN-conditioned rather than merely recency-correlated. That question
+    /// decides whether prefetch is possible at all: a temporal predictor is
+    /// redundant with the LRU cache (it predicts hits, which are already
+    /// free), whereas a token-conditioned one is orthogonal to recency and,
+    /// crucially, knowable AHEAD of the forward pass — the DSpark draft hands
+    /// us the next k token ids before the verify pass runs.
+    token: u32,
 }
 
 impl ExpertTrace {
@@ -715,6 +725,7 @@ impl ExpertTrace {
                 Some(Self {
                     out: std::io::BufWriter::new(f),
                     seq: 0,
+                    token: u32::MAX,
                 })
             }
             Err(e) => {
@@ -731,7 +742,7 @@ impl ExpertTrace {
             ExpertBlobRole::Down => 'd',
         };
         for &e in experts {
-            let _ = writeln!(self.out, "{},{layer},{r},{e}", self.seq);
+            let _ = writeln!(self.out, "{},{layer},{r},{e},{}", self.seq, self.token);
         }
         self.seq += 1;
     }
@@ -996,6 +1007,21 @@ impl Ds4ExpertPaging {
     pub fn set_fill_transform(&mut self, t: Box<dyn ExpertFillTransform>, max_full_bytes: usize) {
         self.fill_buf = vec![0u8; t.packed_len(max_full_bytes)];
         self.fill = Some(t);
+    }
+
+    /// Tag subsequent trace rows with the token being decoded.
+    ///
+    /// No-op unless `HIPFIRE_DEEPSEEK4_EXPERT_TRACE` is set. This exists so an
+    /// offline analysis can answer whether expert selection is TOKEN-
+    /// conditioned, which is the question that decides whether prefetch is
+    /// viable: a temporal predictor is redundant with LRU (it predicts hits,
+    /// already free), whereas a token-conditioned one is orthogonal to recency
+    /// AND knowable ahead of the pass — DSpark hands over the next k token ids
+    /// before the verify pass runs.
+    pub fn set_trace_token(&mut self, token: u32) {
+        if let Some(t) = self.trace.as_mut() {
+            t.token = token;
+        }
     }
 
     /// Whether this layer's experts are paged. False for layers left fully
