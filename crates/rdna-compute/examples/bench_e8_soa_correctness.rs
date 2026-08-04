@@ -21,6 +21,11 @@ fn main() {
     eprintln!("  arch={arch}  vram_peak_gbps={vram_gbps}  l3_bytes={L3_BYTES}");
     eprintln!();
 
+    if std::env::var_os("HIPFIRE_E8_PACK_CORRECTNESS_ONLY").is_some() {
+        run_pack_correctness(&mut gpu);
+        return;
+    }
+
     let shapes: Vec<(usize, usize, &str)> = vec![
         // --- A3B per-expert MoE shapes (the decode hot path; hidden=2048,
         //     moe_intermediate=512 — qwen35.rs:170,204) ---
@@ -1158,6 +1163,90 @@ fn main() {
             }
         }
     }
+}
+
+fn run_pack_correctness(gpu: &mut Gpu) {
+    assert_eq!(gpu.arch, "gfx1151", "packed B3 kernel is gfx1151-only");
+    const B: usize = 3;
+    const K: usize = 4096;
+    let rows = [1024usize, 512, 256, 4096, 1024, 512, 64];
+    let x_host = make_x(B * K, 0xB3A7_7E57);
+    let x = gpu.alloc_tensor(&[B * K], DType::F32).expect("alloc x");
+    gpu.hip
+        .memcpy_htod(&x.buf, bytes_of(&x_host))
+        .expect("upload x");
+
+    let mut weights = Vec::with_capacity(rows.len());
+    let mut reference = Vec::with_capacity(rows.len());
+    let mut packed = Vec::with_capacity(rows.len());
+    for (slot, &m) in rows.iter().enumerate() {
+        let aos = synth_e8_aos(m, K, 0xE800_0000 ^ slot as u64);
+        let soa = aos_to_soa_full(&aos, m, K);
+        weights.push(gpu.upload_raw(&soa, &[soa.len()]).expect("upload weight"));
+        reference.push(
+            gpu.alloc_tensor(&[B * m], DType::F32)
+                .expect("alloc reference"),
+        );
+        packed.push(
+            gpu.alloc_tensor(&[B * m], DType::F32)
+                .expect("alloc packed"),
+        );
+    }
+
+    for slot in 0..rows.len() {
+        gpu.gemv_mfp4g32_e8_soa_batched_gfx1151(
+            &weights[slot],
+            &x,
+            &reference[slot],
+            B,
+            rows[slot],
+            K,
+        )
+        .expect("ordinary B3 launch");
+    }
+    gpu.gemv_mfp4g32_e8_soa_batched_pack_b3_gfx1151(
+        [
+            &weights[0],
+            &weights[1],
+            &weights[2],
+            &weights[3],
+            &weights[4],
+            &weights[5],
+            &weights[6],
+        ],
+        &x,
+        [
+            &packed[0], &packed[1], &packed[2], &packed[3], &packed[4], &packed[5], &packed[6],
+        ],
+        rows,
+        K,
+    )
+    .expect("packed B3 launch");
+    gpu.hip.device_synchronize().expect("synchronize");
+
+    let mut compared = 0usize;
+    for slot in 0..rows.len() {
+        let len = B * rows[slot];
+        let mut expected = vec![0.0f32; len];
+        let mut actual = vec![0.0f32; len];
+        gpu.hip
+            .memcpy_dtoh(bytes_of_mut(&mut expected), &reference[slot].buf)
+            .expect("download reference");
+        gpu.hip
+            .memcpy_dtoh(bytes_of_mut(&mut actual), &packed[slot].buf)
+            .expect("download packed");
+        for i in 0..len {
+            assert_eq!(
+                actual[i].to_bits(),
+                expected[i].to_bits(),
+                "packed B3 mismatch: slot={slot} row={} token={}",
+                i % rows[slot],
+                i / rows[slot]
+            );
+        }
+        compared += len;
+    }
+    eprintln!("PACK B3 CORRECTNESS PASS: {compared} raw-bit comparisons across rows={rows:?}");
 }
 
 /// Convert AoS mfp4-E8 buffer to SoA layout.

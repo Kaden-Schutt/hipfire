@@ -1500,6 +1500,116 @@ fn gemv_auto_batched_pair_b3(
     Ok(true)
 }
 
+/// Hoist every independent E8 projection of the attention input into one B3
+/// grid. This is deliberately DS4/gfx1151-local: later stages receive a flag
+/// proving their output was populated and otherwise retain the original calls.
+#[allow(clippy::too_many_arguments)]
+fn attention_input_e8_pack_b3(
+    cfg: &DeepseekV4Config,
+    layer: &crate::deepseek4::DeepseekV4LayerWeights,
+    pbs: &PrefillBatchScratch,
+    gpu: &mut Gpu,
+    layer_idx: usize,
+    batch_size: usize,
+) -> Result<bool, String> {
+    let enabled = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_E8_ATTN_PACK_B3")
+        .ok()
+        .as_deref()
+        != Some("0");
+    let hidden = cfg.hidden_size;
+    if !enabled
+        || gpu.arch != "gfx1151"
+        || layer_idx >= cfg.num_hidden_layers
+        || batch_size != 3
+        || hidden % 256 != 0
+    {
+        return Ok(false);
+    }
+
+    let Some(wq_a) = layer.wq_a.as_ref() else {
+        return Ok(false);
+    };
+    let Some(wkv) = layer.wkv.as_ref() else {
+        return Ok(false);
+    };
+    let mut weights = [wq_a; 7];
+    let mut outputs = [&pbs.q_lat_batch; 7];
+    let mut rows = [0usize; 7];
+    weights[0] = wq_a;
+    outputs[0] = &pbs.q_lat_batch;
+    rows[0] = cfg.q_lora_rank;
+    weights[1] = wkv;
+    outputs[1] = &pbs.kv_batch;
+    rows[1] = cfg.num_key_value_heads * cfg.head_dim;
+
+    let ratio = layer.compress_ratio as usize;
+    if ratio > 0 {
+        let Some(comp_wkv) = layer.compressor_wkv.as_ref() else {
+            return Ok(false);
+        };
+        let Some(comp_wgate) = layer.compressor_wgate.as_ref() else {
+            return Ok(false);
+        };
+        let comp_f16_wmma = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_COMP_F16_WMMA")
+            .map(|value| value != "0")
+            .unwrap_or(true);
+        let have_idx_f16 = ratio != 4
+            || (layer.indexer_compressor_wkv_f16.is_some()
+                && layer.indexer_compressor_wgate_f16.is_some());
+        let use_f16_wmma = comp_f16_wmma
+            && layer.compressor_wkv_f16.is_some()
+            && layer.compressor_wgate_f16.is_some()
+            && have_idx_f16;
+        if use_f16_wmma {
+            return Ok(false);
+        }
+
+        let main_rows = if ratio == 4 {
+            2 * cfg.head_dim
+        } else {
+            cfg.head_dim
+        };
+        weights[2] = comp_wkv;
+        outputs[2] = &pbs.comp_main_kv_batch;
+        rows[2] = main_rows;
+        weights[3] = comp_wgate;
+        outputs[3] = &pbs.comp_main_score_batch;
+        rows[3] = main_rows;
+
+        if ratio == 4 {
+            let Some(weights_proj) = layer.indexer_weights_proj.as_ref() else {
+                return Ok(false);
+            };
+            let Some(idx_wkv) = layer.indexer_compressor_wkv.as_ref() else {
+                return Ok(false);
+            };
+            let Some(idx_wgate) = layer.indexer_compressor_wgate.as_ref() else {
+                return Ok(false);
+            };
+            weights[4] = weights_proj;
+            outputs[4] = &pbs.idx_w_batch;
+            rows[4] = cfg.index_n_heads;
+            weights[5] = idx_wkv;
+            outputs[5] = &pbs.comp_idx_kv_batch;
+            rows[5] = 2 * cfg.index_head_dim;
+            weights[6] = idx_wgate;
+            outputs[6] = &pbs.comp_idx_score_batch;
+            rows[6] = 2 * cfg.index_head_dim;
+        }
+    }
+
+    if weights
+        .iter()
+        .zip(rows)
+        .any(|(weight, rows)| rows != 0 && weight.dtype != DType::MFP4G32E8SOA)
+    {
+        return Ok(false);
+    }
+    gpu.gemv_mfp4g32_e8_soa_batched_pack_b3_gfx1151(weights, &pbs.tmp_batch, outputs, rows, hidden)
+        .map_err(|error| format!("packed attention-input MFP4-E8 B3 l{layer_idx}: {error:?}"))?;
+    Ok(true)
+}
+
 /// DeepSeek V4 Compressor decode step (phase 3b scaffold — not yet wired).
 ///
 /// Implements the upstream `Compressor.forward` decode case
@@ -5183,7 +5293,7 @@ pub fn mtp_forward_batched(
         /*is_attn=*/ true,
         n,
     )?;
-    q_lora_batched(
+    let attention_input_precomputed = q_lora_batched(
         cfg,
         mtp_layer,
         weights.mq2r_backend,
@@ -5201,6 +5311,7 @@ pub fn mtp_forward_batched(
         gpu,
         mtp_layer_idx,
         n,
+        attention_input_precomputed,
     )?;
     apply_tail_rope_batched(cfg, mtp_layer, pbs, gpu, mtp_layer_idx, n)?;
     attention_block_batched_swa_only(
@@ -9057,6 +9168,7 @@ fn attention_block_batched_mixed(
     start_pos: u32,
     batch_size: usize,
     capture_safe: bool,
+    attention_input_precomputed: bool,
 ) -> Result<(), String> {
     let layer = weights.resolve_layer(layer_idx);
     let ratio = layer.compress_ratio as usize;
@@ -9183,7 +9295,7 @@ fn attention_block_batched_mixed(
     let main_proj_dim = main_coff * head_dim;
     let idx_coff = 2;
     let idx_proj_dim = idx_coff * cfg.index_head_dim;
-    {
+    if !attention_input_precomputed {
         let comp_wkv = layer
             .compressor_wkv
             .as_ref()
@@ -9546,19 +9658,22 @@ fn attention_block_batched_mixed(
             )
             .map_err(|e| format!("rope_tail_batched idx l{layer_idx}: {e:?}"))?;
 
-            // weights_proj GEMV batched: tmp_batch → idx_w_batch.
-            gemv_auto_batched_wmma(
-                gpu,
-                weights.mq2r_backend,
-                weights_proj,
-                &pbs.tmp_batch,
-                &pbs.tmp_plain_batch,
-                &pbs.idx_w_batch,
-                h_idx,
-                hidden,
-                batch_size,
-                Some(&pbs.wmma_x_scratch_f16),
-            )?;
+            // weights_proj GEMV batched: tmp_batch → idx_w_batch. The B3
+            // attention-input pack may have produced this with q/kv/compressor.
+            if !attention_input_precomputed {
+                gemv_auto_batched_wmma(
+                    gpu,
+                    weights.mq2r_backend,
+                    weights_proj,
+                    &pbs.tmp_batch,
+                    &pbs.tmp_plain_batch,
+                    &pbs.idx_w_batch,
+                    h_idx,
+                    hidden,
+                    batch_size,
+                    Some(&pbs.wmma_x_scratch_f16),
+                )?;
+            }
 
             // Batched scoring. Pass the SCORE BUFFER STRIDE (max_compressed,
             // = the allocated row stride of pbs.idx_scores_batch), not the
@@ -11116,6 +11231,7 @@ fn kv_joint_batched(
     gpu: &mut Gpu,
     layer_idx: usize,
     batch_size: usize,
+    projection_precomputed: bool,
 ) -> Result<(), String> {
     let wkv = layer
         .wkv
@@ -11127,19 +11243,22 @@ fn kv_joint_batched(
         .ok_or_else(|| format!("layer {layer_idx} kv_norm missing"))?;
     let kv_dim = cfg.num_key_value_heads * cfg.head_dim;
 
-    // wkv @ tmp → kv.
-    gemv_auto_batched_wmma(
-        gpu,
-        mq2r_backend,
-        wkv,
-        &pbs.tmp_batch,
-        &pbs.tmp_plain_batch,
-        &pbs.kv_batch,
-        kv_dim,
-        cfg.hidden_size,
-        batch_size,
-        Some(&pbs.wmma_x_scratch_f16),
-    )?;
+    // wkv @ tmp → kv. The gfx1151 B3 attention pack may have populated this
+    // alongside q_lat and the compressor/indexer projections.
+    if !projection_precomputed {
+        gemv_auto_batched_wmma(
+            gpu,
+            mq2r_backend,
+            wkv,
+            &pbs.tmp_batch,
+            &pbs.tmp_plain_batch,
+            &pbs.kv_batch,
+            kv_dim,
+            cfg.hidden_size,
+            batch_size,
+            Some(&pbs.wmma_x_scratch_f16),
+        )?;
+    }
 
     // kv_norm RMSNorm in-place: batch x [kv_dim].
     gpu.rmsnorm_batched(
@@ -11180,7 +11299,7 @@ fn q_lora_batched(
     gpu: &mut Gpu,
     layer_idx: usize,
     batch_size: usize,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let attn_norm = layer
         .attn_norm
         .as_ref()
@@ -11262,19 +11381,24 @@ fn q_lora_batched(
         dump_dense_activations_if_enabled(gpu, &names, &active, hidden)?;
     }
 
+    let attention_input_precomputed =
+        attention_input_e8_pack_b3(cfg, layer, pbs, gpu, layer_idx, batch_size)?;
+
     // 2. wq_a GEMV batched: tmp* → q_lat_batch. M = q_lora_rank, K = hidden.
-    gemv_auto_batched_wmma(
-        gpu,
-        mq2r_backend,
-        wq_a,
-        &pbs.tmp_batch,
-        &pbs.tmp_plain_batch,
-        &pbs.q_lat_batch,
-        q_rank,
-        hidden,
-        batch_size,
-        Some(&pbs.wmma_x_scratch_f16),
-    )?;
+    if !attention_input_precomputed {
+        gemv_auto_batched_wmma(
+            gpu,
+            mq2r_backend,
+            wq_a,
+            &pbs.tmp_batch,
+            &pbs.tmp_plain_batch,
+            &pbs.q_lat_batch,
+            q_rank,
+            hidden,
+            batch_size,
+            Some(&pbs.wmma_x_scratch_f16),
+        )?;
+    }
 
     // 3. q_norm RMSNorm batched (in-place): batch x [q_lora_rank].
     gpu.rmsnorm_batched(
@@ -11329,7 +11453,7 @@ fn q_lora_batched(
     )
     .map_err(|e| format!("q per-head rmsnorm_batched l{layer_idx}: {e:?}"))?;
 
-    Ok(())
+    Ok(attention_input_precomputed)
 }
 
 /// Batched-prefill entry point for DeepSeek V4.
@@ -11587,7 +11711,7 @@ fn forward_prefill_batch_chunk_impl(
         }
 
         // Q-LoRA: pbs.hc_x_in_batch → tmp/tmp_plain → q_lat → q_batch.
-        q_lora_batched(
+        let attention_input_precomputed = q_lora_batched(
             cfg,
             layer,
             weights.mq2r_backend,
@@ -11602,7 +11726,16 @@ fn forward_prefill_batch_chunk_impl(
         }
 
         // Joint KV projection: tmp/tmp_plain → kv_batch.
-        kv_joint_batched(cfg, layer, weights.mq2r_backend, pbs, gpu, layer_idx, n)?;
+        kv_joint_batched(
+            cfg,
+            layer,
+            weights.mq2r_backend,
+            pbs,
+            gpu,
+            layer_idx,
+            n,
+            attention_input_precomputed,
+        )?;
         if layer_idx == 0 {
             dump_buf(gpu, "05_l0_kv_joint_kv_batch", &pbs.kv_batch);
         }
@@ -11639,6 +11772,7 @@ fn forward_prefill_batch_chunk_impl(
                 start_pos,
                 n,
                 capture_safe,
+                attention_input_precomputed,
             )?;
         }
         if layer_idx == 0 {
@@ -12392,7 +12526,7 @@ pub fn dspark_forward(
             )?;
         }
         // 2. block q from attn_norm(hc_x_in): writes pbs.tmp/tmp_plain + q_batch.
-        {
+        let attention_input_precomputed = {
             let hc_x_in = state
                 .dspark_pbs
                 .as_ref()
@@ -12409,12 +12543,21 @@ pub fn dspark_forward(
                 gpu,
                 s,
                 block,
-            )?;
-        }
+            )?
+        };
         // 3. block kv from the same attn_norm'd input (reads pbs.tmp*).
         {
             let pbs = state.dspark_pbs.as_ref().unwrap();
-            kv_joint_batched(cfg, layer, Mq2rBackend::Portable, pbs, gpu, s, block)?;
+            kv_joint_batched(
+                cfg,
+                layer,
+                Mq2rBackend::Portable,
+                pbs,
+                gpu,
+                s,
+                block,
+                attention_input_precomputed,
+            )?;
         }
         // 4. tail RoPE on q_batch + block kv_batch at positions position+1..+block.
         {
@@ -12646,7 +12789,7 @@ pub fn dspark_run_body_and_hc_gate(
             let pbs = state.dspark_pbs.as_ref().unwrap();
             mhc_pre_batched(cfg, layer, pbs, gpu, s, true, block)?;
         }
-        {
+        let attention_input_precomputed = {
             let hc_x_in = state
                 .dspark_pbs
                 .as_ref()
@@ -12663,11 +12806,20 @@ pub fn dspark_run_body_and_hc_gate(
                 gpu,
                 s,
                 block,
-            )?;
-        }
+            )?
+        };
         {
             let pbs = state.dspark_pbs.as_ref().unwrap();
-            kv_joint_batched(cfg, layer, Mq2rBackend::Portable, pbs, gpu, s, block)?;
+            kv_joint_batched(
+                cfg,
+                layer,
+                Mq2rBackend::Portable,
+                pbs,
+                gpu,
+                s,
+                block,
+                attention_input_precomputed,
+            )?;
         }
         {
             let pbs = state.dspark_pbs.as_ref().unwrap();

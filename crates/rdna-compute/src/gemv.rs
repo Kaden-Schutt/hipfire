@@ -4751,6 +4751,101 @@ impl Gpu {
         )
     }
 
+    /// Up to seven independent B=3 E8 projections that share one input and K
+    /// dimension. Each matrix contributes its own contiguous row range to the
+    /// grid; workgroups still execute the ordinary B3 per-row arithmetic.
+    pub fn gemv_mfp4g32_e8_soa_batched_pack_b3_gfx1151(
+        &mut self,
+        a: [&GpuTensor; 7],
+        x: &GpuTensor,
+        y: [&GpuTensor; 7],
+        m: [usize; 7],
+        k: usize,
+    ) -> HipResult<()> {
+        assert!(
+            self.arch_caps.is_gfx1151(),
+            "packed batched E8 decode GEMV is gfx1151-only"
+        );
+        assert!(
+            k % 256 == 0,
+            "packed batched E8 GEMV requires K%256==0, got K={k}"
+        );
+        let total_m: usize = m.iter().sum();
+        assert!(total_m > 0, "packed batched E8 GEMV requires output rows");
+        let name = "gemv_mfp4g32_e8_soa_batched_pack_b3_gfx1151";
+        self.bind_thread()?;
+        self.ensure_kernel(
+            name,
+            kernels::GEMV_MFP4G32_E8_SOA_BATCHED_PACK_B3_GFX1151_SRC,
+            name,
+        )?;
+
+        let [a0, a1, a2, a3, a4, a5, a6] = a;
+        let [y0, y1, y2, y3, y4, y5, y6] = y;
+        let [m0, m1, m2, m3, m4, m5, m6] = m.map(|value| value as i32);
+        let a0_ptr = a0.buf.as_ptr();
+        let a1_ptr = a1.buf.as_ptr();
+        let a2_ptr = a2.buf.as_ptr();
+        let a3_ptr = a3.buf.as_ptr();
+        let a4_ptr = a4.buf.as_ptr();
+        let a5_ptr = a5.buf.as_ptr();
+        let a6_ptr = a6.buf.as_ptr();
+        let x_ptr = x.buf.as_ptr();
+        let y0_ptr = y0.buf.as_ptr();
+        let y1_ptr = y1.buf.as_ptr();
+        let y2_ptr = y2.buf.as_ptr();
+        let y3_ptr = y3.buf.as_ptr();
+        let y4_ptr = y4.buf.as_ptr();
+        let y5_ptr = y5.buf.as_ptr();
+        let y6_ptr = y6.buf.as_ptr();
+        let k_i32 = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &a0_ptr as *const _ as *mut c_void,
+            &a1_ptr as *const _ as *mut c_void,
+            &a2_ptr as *const _ as *mut c_void,
+            &a3_ptr as *const _ as *mut c_void,
+            &a4_ptr as *const _ as *mut c_void,
+            &a5_ptr as *const _ as *mut c_void,
+            &a6_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &y0_ptr as *const _ as *mut c_void,
+            &y1_ptr as *const _ as *mut c_void,
+            &y2_ptr as *const _ as *mut c_void,
+            &y3_ptr as *const _ as *mut c_void,
+            &y4_ptr as *const _ as *mut c_void,
+            &y5_ptr as *const _ as *mut c_void,
+            &y6_ptr as *const _ as *mut c_void,
+            &m0 as *const _ as *mut c_void,
+            &m1 as *const _ as *mut c_void,
+            &m2 as *const _ as *mut c_void,
+            &m3 as *const _ as *mut c_void,
+            &m4 as *const _ as *mut c_void,
+            &m5 as *const _ as *mut c_void,
+            &m6 as *const _ as *mut c_void,
+            &k_i32 as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            name,
+            [total_m as u32, 1, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut blob = hip_bridge::KernargBlob::new();
+                for ptr in [
+                    a0_ptr, a1_ptr, a2_ptr, a3_ptr, a4_ptr, a5_ptr, a6_ptr, x_ptr, y0_ptr, y1_ptr,
+                    y2_ptr, y3_ptr, y4_ptr, y5_ptr, y6_ptr,
+                ] {
+                    blob.push_ptr(ptr);
+                }
+                for rows in [m0, m1, m2, m3, m4, m5, m6, k_i32] {
+                    blob.push_i32(rows);
+                }
+                blob
+            },
+        )
+    }
+
     /// Batched grouped E8-SoA decode GEMV: `A[G,M,K] @ X[B,G,K] -> Y[B,G,M]`,
     /// one wave per (group, row) with the weight row read once for all B
     /// tokens.

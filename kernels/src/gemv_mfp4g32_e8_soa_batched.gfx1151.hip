@@ -38,6 +38,9 @@
 #ifndef E8_BATCHED_PAIR
 #define E8_BATCHED_PAIR 0
 #endif
+#ifndef E8_BATCHED_PACK
+#define E8_BATCHED_PACK 0
+#endif
 
 __device__ __forceinline__ float cvt_e4m3_scale_batched(unsigned char b) {
     const int exp = (b >> 3) & 0xF;
@@ -68,7 +71,53 @@ __device__ __forceinline__ void e8_decode_index_batched(unsigned int idx, float 
 
 // A: E8-SoA [M, K].  X: f32 [B, K] (row-major per token).  Y: f32 [B, M].
 __launch_bounds__(32)
-#if E8_BATCHED_PAIR
+#if E8_BATCHED_PACK
+extern "C" __global__ void E8_BATCHED_KERNEL(
+    const char* __restrict__ A0,
+    const char* __restrict__ A1,
+    const char* __restrict__ A2,
+    const char* __restrict__ A3,
+    const char* __restrict__ A4,
+    const char* __restrict__ A5,
+    const char* __restrict__ A6,
+    const float* __restrict__ X,
+    float* __restrict__ Y0,
+    float* __restrict__ Y1,
+    float* __restrict__ Y2,
+    float* __restrict__ Y3,
+    float* __restrict__ Y4,
+    float* __restrict__ Y5,
+    float* __restrict__ Y6,
+    int M0,
+    int M1,
+    int M2,
+    int M3,
+    int M4,
+    int M5,
+    int M6,
+    int K
+) {
+    int row = blockIdx.x;
+    const char* __restrict__ A;
+    float* __restrict__ Y;
+    int M;
+    if (row < M0) {
+        A = A0; Y = Y0; M = M0;
+    } else if ((row -= M0) < M1) {
+        A = A1; Y = Y1; M = M1;
+    } else if ((row -= M1) < M2) {
+        A = A2; Y = Y2; M = M2;
+    } else if ((row -= M2) < M3) {
+        A = A3; Y = Y3; M = M3;
+    } else if ((row -= M3) < M4) {
+        A = A4; Y = Y4; M = M4;
+    } else if ((row -= M4) < M5) {
+        A = A5; Y = Y5; M = M5;
+    } else {
+        row -= M5;
+        A = A6; Y = Y6; M = M6;
+    }
+#elif E8_BATCHED_PAIR
 extern "C" __global__ void E8_BATCHED_KERNEL(
     const char* __restrict__ A0,
     const char* __restrict__ A1,
