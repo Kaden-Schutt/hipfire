@@ -3763,6 +3763,83 @@ where
     .map_err(|e| format!("ffn l{layer_idx}: {e}"))
 }
 
+/// Harvest `(hidden, router_scores)` pairs per layer for the expert-prefetch
+/// adapter study. `HIPFIRE_DEEPSEEK4_ADAPTER_DUMP=<dir>`; default off.
+///
+/// Writes `h_L<layer>.bin` (`[rows, hidden]` f16) and `s_L<layer>.bin`
+/// (`[rows, n_exp]` f16), appended in position order. Rows across layers stay
+/// aligned because every layer sees the same positions in the same order, so
+/// the offline step pairs layer L's hidden with layer L+1's scores by row index.
+///
+/// Why this and not the training-free predictor already measured: running the
+/// real `gate_{L+1}` on `h_L` scores only 27.6% recall on ds4, because mHC
+/// replaces the residual stream with 4 Sinkhorn-mixed streams — there is no
+/// slowly-evolving residual to read through. The literature (SpecPrefetch,
+/// ProMoE, ExpertFlow) instead TRAINS a small predictor; SpecPrefetch reports
+/// ~84% ExpertRecall@6 with a rank-r adapter, though on 64-expert DeepSeek-VL2
+/// rather than ds4's 256-choose-6. This dump exists to settle whether that
+/// transfers.
+///
+/// f16 halves the volume: hidden dominates at `4096 * 2 B` per position per
+/// layer, so 40 score-routed layers cost ~328 KB/position.
+fn dump_adapter_pairs(
+    pbs: &PrefillBatchScratch,
+    layer_idx: usize,
+    batch_size: usize,
+    hidden: usize,
+    n_exp: usize,
+    gpu: &mut Gpu,
+) -> Result<(), String> {
+    use std::io::Write;
+    static DIR: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    let Some(dir) = DIR
+        .get_or_init(|| {
+            let d = std::env::var("HIPFIRE_DEEPSEEK4_ADAPTER_DUMP").ok()?;
+            let _ = std::fs::create_dir_all(&d);
+            eprintln!("deepseek4: adapter pair dump -> {d}");
+            Some(d)
+        })
+        .as_ref()
+    else {
+        return Ok(());
+    };
+    if batch_size == 0 {
+        return Ok(());
+    }
+
+    let h = gpu
+        .download_f32(&pbs.ffn_x_plain_batch)
+        .map_err(|e| format!("adapter dump hidden l{layer_idx}: {e:?}"))?;
+    let s = gpu
+        .download_f32(&pbs.moe_scores_batch)
+        .map_err(|e| format!("adapter dump scores l{layer_idx}: {e:?}"))?;
+
+    // Buffers are allocated at max_batch, so take only the live rows.
+    let write_f16 = |path: String, src: &[f32], rows: usize, cols: usize| -> Result<(), String> {
+        let mut out: Vec<u8> = Vec::with_capacity(rows * cols * 2);
+        for r in 0..rows {
+            let base = r * cols;
+            if base + cols > src.len() {
+                break;
+            }
+            for &v in &src[base..base + cols] {
+                out.extend_from_slice(&half::f16::from_f32(v).to_le_bytes());
+            }
+        }
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .map_err(|e| format!("adapter dump open {path}: {e}"))?;
+        f.write_all(&out)
+            .map_err(|e| format!("adapter dump write {path}: {e}"))
+    };
+
+    write_f16(format!("{dir}/h_L{layer_idx}.bin"), &h, batch_size, hidden)?;
+    write_f16(format!("{dir}/s_L{layer_idx}.bin"), &s, batch_size, n_exp)?;
+    Ok(())
+}
+
 /// Diagnostic: how well does layer L's hidden state predict layer L+1's routing?
 ///
 /// `HIPFIRE_DEEPSEEK4_ROUTE_LOOKAHEAD_TRACE=<path>` writes one
@@ -7979,6 +8056,16 @@ fn ffn_batched(
     // 9. sqrt_softplus over the full [B, n_exp] buffer.
     gpu.sqrt_softplus_f32(&pbs.moe_scores_batch)
         .map_err(|e| format!("sqrt_softplus_f32 moe scores l{layer_idx}: {e:?}"))?;
+
+    // Harvest (hidden, router-scores) pairs for the expert-prefetch adapter
+    // study. Default off; harvested from PREFILL because it runs ~20x faster
+    // than paged decode (~150 vs ~7 tok/s), and one batched pass yields one
+    // example per position per layer.
+    //
+    // Pairing happens offline by shifting the layer index: layer L's hidden
+    // against layer L+1's scores. Dumping BOTH at every layer means one hook
+    // site supplies both sides.
+    dump_adapter_pairs(pbs, layer_idx, batch_size, hidden, n_exp, gpu)?;
 
     // Routing + routed experts + combine now run through the centralized MoE
     // family (Ship 4.3 prefill). The router GEMV + sqrt_softplus (above) and the
