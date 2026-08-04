@@ -499,6 +499,85 @@ faithful port of the Rust encoder but it *is* a port, not the encoder itself.
 The decisive version of this test would call `quantize_mq2g256_lloyd` directly
 from a Rust unit test over real a3b expert tensors.
 
+## 5c. Their quantizer vs ours — and what our g256 codebook actually costs
+
+### Method comparison
+
+| | external W2 build | hipfire MQ*-Lloyd |
+|---|---|---|
+| rotation | **H₁₂₈**, in-register via `shfl.bfly`, never materialized | **FWHT-256**, baked into weights offline |
+| per-channel scale | **learned** diagonals `rin`/`rout`, trained, folded at export | none |
+| codebook | **global/shared** (inferred, see below) | **per-block**, 4×fp16 fitted by Lloyd |
+| grading axis | per-projection (gate_up 2b / down 3b) | per-expert (MQ6/MQ4/MQ2L tiers) |
+| metadata overhead | **≈0.03 bpw** | **0.25 bpw** |
+
+### The size arithmetic rules out small groups
+
+a3b geometry: gate_up 21.47B params, down 10.74B, experts 32.21B total;
+embed+lm_head 1.02B; attention/linear_attn ~1.35B.
+
+At gate_up=2b, down=3b, int8 dense, **zero** group-scale overhead → **~11.76 GB**.
+They ship **12.3 GB**, leaving only ~0.5 GB for all metadata. So their overhead is
+very low, which excludes small-group-with-per-group-codebook entirely:
+
+| group | 8 B codebook per group | total | overhead on payload |
+|---|---|---|---|
+| g32 | 2.000 bpw | 4.000 | 100% |
+| g64 | 1.000 bpw | 3.000 | 50% |
+| g128 | 0.500 bpw | 2.500 | 25% |
+| **g256 (ours)** | **0.250 bpw** | **2.250** | **12.5%** |
+| g512 | 0.125 bpw | 2.125 | 6.2% |
+| *per-channel fp16 scale* | *0.031 bpw* | *2.031* | *1.6%* |
+
+So the g32/g64 hypothesis is backwards — at g64 a per-group codebook alone
+would cost 1.0 bpw and blow the budget. Their card's *"trained scales already
+folded into `escha_rin`/`escha_rout` at export"* is the actual mechanism:
+**per-channel learned scales (finest granularity, ~0.031 bpw) + a shared
+codebook**, rather than per-block fitted codebooks.
+
+**The g256 choice from March is not the problem, and it is what made a per-block
+codebook affordable at all.** The problem is that the group size is doing two
+jobs — payload tiling *and* codebook amortization — and only the first needs
+g256.
+
+### Measured: what the per-block codebook buys (synthetic, CPU)
+
+| variant | bpw | energy kept | NRMSE (Gauss) | NRMSE (heavy-tail) |
+|---|---|---|---|---|
+| **A** per-block Lloyd cb — **current** | **2.250** | 0.8875 | **0.3354** | 0.3334 |
+| **B** global fitted cb + per-block fp16 scale | 2.062 | 0.8835 | 0.3415 | 0.3395 |
+| **C** *textbook* Lloyd–Max Gaussian cb + per-block scale | 2.062 | 0.8855 | 0.3416 | 0.3395 |
+| **D** global cb + one scale per 1024 weights | 2.016 | 0.8817 | 0.3423 | 0.3431 |
+
+**The per-block codebook costs 0.1875 bpw (8.3% of the format) and buys 1.8%
+NRMSE.** For scale: one extra *bit* takes NRMSE 0.335 → 0.186, so at that slope
+0.1875 bpw spent on rate would buy ~8%. The per-block codebook returns about a
+quarter of that.
+
+And variant **C uses no fitting at all** — the textbook Lloyd–Max Gaussian levels
+(±0.4528, ±1.5104) — yet matches the globally-fitted codebook exactly and lands
+within 1.8% of per-block fitting. On heavy-tailed input C retains 0.8888 vs the
+current path's 0.8889.
+
+**Why: the FWHT is doing its job too well to leave the codebook anything to
+learn.** Rotation Gaussianizes every 256-block by CLT, so the optimal *level
+shape* is the same everywhere — the per-block fit is re-deriving the same
+Gaussian-optimal shape ~4000× per tensor, differing only by scale, and a scale
+is one number instead of four. This is the same conclusion the external build
+reached by construction.
+
+Bonus: a shared codebook hoists out of the GEMV inner loop entirely. The current
+kernel header notes the codebook was moved "from per-thread registers to LDS so
+all 8 weights per group share one `ds_read_b32`" — a global codebook removes
+that per-group load.
+
+**Caveats.** Synthetic Gaussian / Gaussian×Gamma, not real expert weights, and
+my blocks are drawn i.i.d. so they understate what per-block *scale* adaptation
+is worth on a real tensor — though variants B/C/D all carry a per-block scale,
+so only per-block *shape* adaptation is being given up, and shape is exactly
+what the rotation normalizes. Confirm on real a3b expert tensors and accept on
+KLD, not NRMSE.
+
 ## 6. Open item
 
 The contributor's HIP port is unreviewed by us and stays out of the tree (§0).
