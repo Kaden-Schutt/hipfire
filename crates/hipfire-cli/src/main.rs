@@ -6176,6 +6176,7 @@ fn load_params(
         "cask": config_bool(resolved, "memory.cask.enabled")?,
         "cask_budget": config_u64(resolved, "memory.cask.budget")?,
         "cask_beta": config_u64(resolved, "memory.cask.beta")?,
+        "cask_handoff_tokens": config_u64(resolved, "memory.cask.handoff_tokens")?,
         "cask_core_frac": config_f64(resolved, "memory.cask.core_fraction")?,
         "cask_fold_m": config_u64(resolved, "memory.cask.fold")?,
         "prefill_compression": config_string(resolved, "speculation.prefill.mode")?,
@@ -8911,6 +8912,7 @@ mod tests {
         let defaults = resolve(Vec::<NamedLayer>::new()).unwrap();
         let params = load_params(&defaults, Some(entry), &model_path, 64, None, None).unwrap();
         assert_eq!(params["cask"], false);
+        assert_eq!(params["cask_handoff_tokens"], 0);
         assert_eq!(params["cask_sidecar"], "");
         assert_eq!(params["prefill_compression"], "off");
 

@@ -5883,6 +5883,73 @@ impl Gpu {
         }
     }
 
+    /// TriAttention importance scoring over an adaptive FWHT{2,3,4}
+    /// post-RoPE K cache. The kernel inverse-transforms K before evaluating
+    /// the same trigonometric score used by the Q8/Givens paths.
+    #[allow(clippy::too_many_arguments)]
+    pub fn triattn_score_fwht(
+        &mut self,
+        k_cache: &GpuTensor,
+        centers: &GpuTensor,
+        signs1: &GpuTensor,
+        signs2: &GpuTensor,
+        scores: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        n_rot: usize,
+        rope_theta: f32,
+        p_q: f32,
+        seq_len: usize,
+        bits: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_givens4_kernel(
+            "triattn_score_fwht",
+            kernels::TRIATTN_SCORE_FWHT_SRC,
+            "triattn_score_fwht",
+        )?;
+        let func = &self.functions["triattn_score_fwht"];
+        let mut k_ptr = k_cache.buf.as_ptr();
+        let mut c_ptr = centers.buf.as_ptr();
+        let mut s1_ptr = signs1.buf.as_ptr();
+        let mut s2_ptr = signs2.buf.as_ptr();
+        let mut score_ptr = scores.buf.as_ptr();
+        let mut nh = n_heads as i32;
+        let mut nkv = n_kv_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut nr = n_rot as i32;
+        let mut th = rope_theta;
+        let mut pq = p_q;
+        let mut sl = seq_len as i32;
+        let mut kb = bits as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut k_ptr as *mut _ as *mut c_void,
+            &mut c_ptr as *mut _ as *mut c_void,
+            &mut s1_ptr as *mut _ as *mut c_void,
+            &mut s2_ptr as *mut _ as *mut c_void,
+            &mut score_ptr as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut nr as *mut _ as *mut c_void,
+            &mut th as *mut _ as *mut c_void,
+            &mut pq as *mut _ as *mut c_void,
+            &mut sl as *mut _ as *mut c_void,
+            &mut kb as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [seq_len as u32, n_heads as u32, 1],
+                [32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     /// TriAttention importance scoring over an asym2 post-RoPE K cache.
     /// Same shape as `triattn_score_asym3` but reads the 2-bit packed
     /// layout (4 indices per byte) and the TURBO_C2_256 codebook.

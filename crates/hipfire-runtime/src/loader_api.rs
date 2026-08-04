@@ -139,6 +139,9 @@ pub trait Carrier {
 pub struct CaskConfig {
     pub sidecar: Option<String>,
     pub cask_m_folding: bool,
+    /// One-way adaptive-KV -> plain TriAttention handoff position. Zero keeps
+    /// the legacy mutual exclusion between adaptive KV and eviction.
+    pub handoff_tokens: usize,
     pub budget: usize,
     pub beta: usize,
     pub core_frac: f32,
@@ -169,6 +172,12 @@ impl CaskConfig {
         override_cap: Option<usize>,
     ) -> Result<usize, String> {
         if self.sidecar.is_none() {
+            return Ok(max_seq);
+        }
+        // A staged adaptive cache reserves its K/V arenas at the adaptive
+        // floor for the full advertised context. It cannot use the ordinary
+        // eviction-bounded physical cap before the handoff has completed.
+        if self.handoff_tokens != 0 {
             return Ok(max_seq);
         }
         let trigger = self
@@ -232,5 +241,16 @@ mod cask_config_tests {
             .physical_cap_with_override(4200, None)
             .unwrap_err();
         assert!(err.contains("budget + beta + 4"), "{err}");
+    }
+
+    #[test]
+    fn staged_handoff_keeps_full_adaptive_physical_cap() {
+        let mut cask = enabled();
+        cask.handoff_tokens = 8192;
+        assert_eq!(
+            cask.physical_cap_with_override(32_768, Some(1024)).unwrap(),
+            32_768,
+            "adaptive floor reservation must not be clamped to the eviction window"
+        );
     }
 }

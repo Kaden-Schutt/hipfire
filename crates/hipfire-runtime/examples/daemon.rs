@@ -13300,6 +13300,11 @@ fn main() {
                     .and_then(|p| p.get("cask_beta"))
                     .and_then(|v| v.as_u64())
                     .unwrap_or(128) as usize;
+                let cask_handoff_tokens = msg
+                    .get("params")
+                    .and_then(|p| p.get("cask_handoff_tokens"))
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as usize;
                 let cask_core_frac = msg
                     .get("params")
                     .and_then(|p| p.get("cask_core_frac"))
@@ -13328,6 +13333,7 @@ fn main() {
                 let cask = CaskConfig {
                     sidecar: cask_sidecar,
                     cask_m_folding: cask_m_folding_effective,
+                    handoff_tokens: cask_handoff_tokens,
                     budget: cask_budget,
                     beta: cask_beta,
                     core_frac: cask_core_frac,

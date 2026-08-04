@@ -42,6 +42,7 @@
 use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::sync::Mutex;
 
 use hip_bridge::HipResult;
@@ -849,6 +850,9 @@ pub struct EvictionCtx {
     pub retain_dev: GpuTensor,
     /// Running count of evictions fired (useful for bench harnesses).
     pub eviction_count: std::cell::Cell<usize>,
+    /// Optional adaptive-KV handoff gate. Closed means the cache is still in
+    /// its adaptive phase and must not be scored or compacted yet.
+    activation_gate: Option<Arc<AtomicBool>>,
 }
 
 impl EvictionCtx {
@@ -927,7 +931,18 @@ impl EvictionCtx {
             v_compact,
             retain_dev,
             eviction_count: std::cell::Cell::new(0),
+            activation_gate: None,
         })
+    }
+
+    pub fn set_activation_gate(&mut self, gate: Arc<AtomicBool>) {
+        self.activation_gate = Some(gate);
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.activation_gate
+            .as_ref()
+            .is_none_or(|gate| gate.load(Ordering::Acquire))
     }
 
     /// If the physical cache has grown to `budget + beta` (or beyond), run
@@ -940,6 +955,9 @@ impl EvictionCtx {
         kv: &mut crate::llama::KvCache,
         current_physical: usize,
     ) -> HipResult<Option<EvictionResult>> {
+        if !self.is_active() {
+            return Ok(None);
+        }
         if current_physical < self.budget + self.beta {
             return Ok(None);
         }
@@ -956,7 +974,10 @@ impl EvictionCtx {
             "TriAttention eviction only supports Q8, asym2, asym3, asym4 KV modes for now (got {tier:?})"
         );
         let k_bytes_per_pos = tier.k_bytes_per_pos(self.n_kv_heads, self.head_dim);
-        let v_bytes_per_pos = self.n_kv_heads * (self.head_dim / 32) * 34;
+        let v_bytes_per_pos = match kv.v_mode {
+            crate::llama::VMode::Q8 => self.n_kv_heads * (self.head_dim / 32) * 34,
+            mode => self.n_kv_heads * (4 + (self.head_dim * mode.bits() as usize) / 8),
+        };
 
         let mut last_retain: Vec<u32> = Vec::new();
         for (fa_i, &layer_idx) in self.fa_layer_ids.iter().enumerate() {
@@ -975,7 +996,22 @@ impl EvictionCtx {
                     p_q,
                     current_physical,
                 )?,
-                KTier::Asym3 { .. } => gpu.triattn_score_asym3(
+                KTier::Asym3 { fwht: true } => gpu.triattn_score_fwht(
+                    &kv.k_gpu[layer_idx],
+                    &centers_layer,
+                    kv.givens_cos.as_ref().expect("fwht3 KV must have signs1"),
+                    kv.givens_sin.as_ref().expect("fwht3 KV must have signs2"),
+                    &self.scores_buf,
+                    self.n_heads,
+                    self.n_kv_heads,
+                    self.head_dim,
+                    self.n_rot,
+                    self.rope_theta,
+                    p_q,
+                    current_physical,
+                    3,
+                )?,
+                KTier::Asym3 { fwht: false } => gpu.triattn_score_asym3(
                     &kv.k_gpu[layer_idx],
                     &centers_layer,
                     kv.givens_cos
@@ -993,7 +1029,22 @@ impl EvictionCtx {
                     p_q,
                     current_physical,
                 )?,
-                KTier::Asym4 { .. } => gpu.triattn_score_asym4(
+                KTier::Asym4 { fwht: true } => gpu.triattn_score_fwht(
+                    &kv.k_gpu[layer_idx],
+                    &centers_layer,
+                    kv.givens_cos.as_ref().expect("fwht4 KV must have signs1"),
+                    kv.givens_sin.as_ref().expect("fwht4 KV must have signs2"),
+                    &self.scores_buf,
+                    self.n_heads,
+                    self.n_kv_heads,
+                    self.head_dim,
+                    self.n_rot,
+                    self.rope_theta,
+                    p_q,
+                    current_physical,
+                    4,
+                )?,
+                KTier::Asym4 { fwht: false } => gpu.triattn_score_asym4(
                     &kv.k_gpu[layer_idx],
                     &centers_layer,
                     kv.givens_cos
@@ -1011,7 +1062,22 @@ impl EvictionCtx {
                     p_q,
                     current_physical,
                 )?,
-                KTier::Asym2 { .. } => gpu.triattn_score_asym2(
+                KTier::Asym2 { fwht: true } => gpu.triattn_score_fwht(
+                    &kv.k_gpu[layer_idx],
+                    &centers_layer,
+                    kv.givens_cos.as_ref().expect("fwht2 KV must have signs1"),
+                    kv.givens_sin.as_ref().expect("fwht2 KV must have signs2"),
+                    &self.scores_buf,
+                    self.n_heads,
+                    self.n_kv_heads,
+                    self.head_dim,
+                    self.n_rot,
+                    self.rope_theta,
+                    p_q,
+                    current_physical,
+                    2,
+                )?,
+                KTier::Asym2 { fwht: false } => gpu.triattn_score_asym2(
                     &kv.k_gpu[layer_idx],
                     &centers_layer,
                     kv.givens_cos
@@ -1080,7 +1146,14 @@ impl EvictionCtx {
         }
 
         kv.compact_offset += current_physical - self.budget;
-        self.eviction_count.set(self.eviction_count.get() + 1);
+        let previous_count = self.eviction_count.get();
+        self.eviction_count.set(previous_count + 1);
+        if previous_count == 0 && self.activation_gate.is_some() {
+            eprintln!(
+                "[adaptive-kv] first eviction: physical {current_physical} -> {} compact_offset={}",
+                self.budget, kv.compact_offset
+            );
+        }
         Ok(Some(EvictionResult {
             new_physical: self.budget,
             retain_mask: last_retain,
@@ -1090,6 +1163,12 @@ impl EvictionCtx {
     /// Release all GPU buffers held by the context. Consumed by value;
     /// the daemon calls this on unload to return VRAM.
     pub fn free_gpu(self, gpu: &mut Gpu) {
+        if self.activation_gate.is_some() {
+            eprintln!(
+                "[adaptive-kv] eviction summary: count={}",
+                self.eviction_count.get()
+            );
+        }
         let _ = gpu.free_tensor(self.centers_dev);
         let _ = gpu.free_tensor(self.scores_buf);
         let _ = gpu.free_tensor(self.k_compact);

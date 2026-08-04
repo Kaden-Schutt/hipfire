@@ -136,6 +136,14 @@ fn plan_qwen35_gpu_stages(config: &Qwen35Config, ctx: &LoadCtx) -> Result<Qwen35
         .map(|s| s.to_string())
         .unwrap_or_else(|| hipfire_runtime::config::get().kv_adaptive.clone());
     let adaptive_req = parse_kv_adaptive(&kv_adaptive_spec)?;
+    validate_adaptive_cask_handoff(
+        adaptive_req.is_some(),
+        ctx.cask.sidecar.is_some(),
+        ctx.cask.handoff_tokens,
+        ctx.kv_backend,
+        ctx.cask.cask_m_folding,
+        ctx.max_seq,
+    )?;
 
     // Adaptive DFlash is out of scope: refuse explicit adaptive + DFlash draft.
     if adaptive_req.is_some() {
@@ -150,12 +158,6 @@ fn plan_qwen35_gpu_stages(config: &Qwen35Config, ctx: &LoadCtx) -> Result<Qwen35
         }
         if ctx.pp > 1 {
             return Err("kv_adaptive requires single-GPU (pp=1)".into());
-        }
-        if ctx.cask.sidecar.is_some() {
-            return Err(
-                "kv_adaptive is a no-eviction capacity strategy and cannot combine with CASK"
-                    .into(),
-            );
         }
         if let Some(vm) = v_mode_override {
             return Err(format!(
@@ -182,7 +184,7 @@ fn plan_qwen35_gpu_stages(config: &Qwen35Config, ctx: &LoadCtx) -> Result<Qwen35
 
     if let Some((preset, k_floor, v_floor)) = adaptive_req {
         // Build controller first — floors and thresholds are authoritative.
-        let ad = match preset {
+        let mut ad = match preset {
             Some(p) => KvAdaptive::from_preset(p, ctx.max_seq, config.n_kv_heads, config.head_dim),
             None => KvAdaptive::new(
                 ctx.max_seq,
@@ -199,6 +201,9 @@ fn plan_qwen35_gpu_stages(config: &Qwen35Config, ctx: &LoadCtx) -> Result<Qwen35
                 ad.current_cap(),
                 hipfire_runtime::llama::PREFILL_MAX_BATCH,
             ));
+        }
+        if ctx.cask.sidecar.is_some() {
+            ad.configure_eviction_handoff(ctx.cask.handoff_tokens);
         }
         Ok(Qwen35KvPlan {
             mode,
@@ -236,10 +241,57 @@ fn plan_qwen35_gpu_stages(config: &Qwen35Config, ctx: &LoadCtx) -> Result<Qwen35
     }
 }
 
-/// CASK's score kernels currently decode Q8/Givens-asym K and its compaction
-/// path copies Q8 V rows. VMM does not change those bytes, but enabling an
-/// unsupported FWHT/Lloyd layout would defer a deterministic format mismatch
-/// until the first eviction. Reject it in the CPU plan instead.
+fn validate_adaptive_cask_handoff(
+    adaptive: bool,
+    sidecar: bool,
+    handoff_tokens: usize,
+    backend: KvBackend,
+    cask_m_folding: bool,
+    max_seq: usize,
+) -> Result<(), String> {
+    if !adaptive {
+        return if handoff_tokens == 0 {
+            Ok(())
+        } else {
+            Err("memory.cask.handoff_tokens requires memory.kv_adaptive != off".into())
+        };
+    }
+    if !sidecar {
+        return if handoff_tokens == 0 {
+            Ok(())
+        } else {
+            Err(
+                "memory.cask.handoff_tokens requires memory.cask.sidecar (or auto-attached sidecar)"
+                    .into(),
+            )
+        };
+    }
+    if handoff_tokens == 0 {
+        return Err(
+            "kv_adaptive and CASK require memory.cask.handoff_tokens > 0 for an explicit one-way handoff"
+                .into(),
+        );
+    }
+    if backend != KvBackend::Vmm {
+        return Err("kv_adaptive -> CASK handoff currently requires memory.kv_backend=vmm".into());
+    }
+    if cask_m_folding {
+        return Err(
+            "kv_adaptive -> CASK handoff supports plain TriAttention eviction only; CASK m-folding needs FWHT/Lloyd fold kernels"
+                .into(),
+        );
+    }
+    if handoff_tokens > max_seq {
+        return Err(format!(
+            "memory.cask.handoff_tokens={handoff_tokens} exceeds max_seq={max_seq} and can never activate"
+        ));
+    }
+    Ok(())
+}
+
+/// The static CASK path remains limited to Q8 V and Givens-asym K. Adaptive
+/// FWHT/Lloyd layouts use the separately validated plain-TriAttention handoff;
+/// m-folding still lacks the corresponding fold/requant kernels.
 fn validate_cask_static_layout(
     cask_enabled: bool,
     mode: hipfire_runtime::kv_mode::KvMode,
@@ -629,6 +681,35 @@ mod tests {
         assert!(
             err.contains("incomplete") || err.contains("malformed"),
             "{err}"
+        );
+    }
+
+    #[test]
+    fn adaptive_cask_handoff_compatibility_matrix_is_fail_closed() {
+        let check = |adaptive, sidecar, handoff, backend, folding| {
+            validate_adaptive_cask_handoff(adaptive, sidecar, handoff, backend, folding, 2048)
+        };
+
+        assert!(check(true, true, 128, KvBackend::Vmm, false).is_ok());
+        assert!(check(true, true, 0, KvBackend::Vmm, false)
+            .unwrap_err()
+            .contains("handoff_tokens > 0"));
+        assert!(check(true, true, 128, KvBackend::Contiguous, false)
+            .unwrap_err()
+            .contains("requires memory.kv_backend=vmm"));
+        assert!(check(true, true, 128, KvBackend::Vmm, true)
+            .unwrap_err()
+            .contains("m-folding"));
+        assert!(check(true, false, 128, KvBackend::Vmm, false)
+            .unwrap_err()
+            .contains("requires memory.cask.sidecar"));
+        assert!(check(false, false, 128, KvBackend::Vmm, false)
+            .unwrap_err()
+            .contains("requires memory.kv_adaptive"));
+        assert!(
+            validate_adaptive_cask_handoff(true, true, 2049, KvBackend::Vmm, false, 2048)
+                .unwrap_err()
+                .contains("exceeds max_seq")
         );
     }
 

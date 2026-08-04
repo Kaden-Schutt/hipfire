@@ -4359,6 +4359,9 @@ pub const TRIATTN_SCORE_ASYM4_SRC: &str =
 /// TriAttention scoring on asym2 (Givens-rotated 2-bit) K cache.
 pub const TRIATTN_SCORE_ASYM2_SRC: &str =
     include_str!("../../../kernels/src/triattn_score_asym2.hip");
+/// TriAttention scoring for adaptive signed-FWHT K caches.
+pub const TRIATTN_SCORE_FWHT_SRC: &str =
+    include_str!("../../../kernels/src/triattn_score_fwht.hip");
 
 /// Gather-based compaction for KV eviction: copy `budget` src rows to dst.
 pub const KV_COMPACT_GATHER_SRC: &str = include_str!("../../../kernels/src/kv_compact_gather.hip");
