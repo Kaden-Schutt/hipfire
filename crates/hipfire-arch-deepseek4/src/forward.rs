@@ -1617,6 +1617,11 @@ pub fn decode_step(
     // Stage current token_id to device for the GPU hash-router
     // (consumed by `hash_router_normalize_f32_buf` on hash layers).
     precompute_token_id(state, gpu, token_id)?;
+    // Hash-layer experts are a pure function of token_id, so they are knowable
+    // here — before the embedding has even run. Stage them now rather than
+    // stalling at each of layers 0-2, which are the worst-cached in the model
+    // (see `prefetch_hash_experts`). No-op when paging is off.
+    prefetch_hash_experts(cfg, weights, gpu, &[token_id])?;
 
     // 1. Token embedding → initial residual streams.
     //    DeepSeek V4 uses `hc_mult = 4` parallel streams. Init pattern is
@@ -3745,6 +3750,106 @@ where
         gpu,
     )
     .map_err(|e| format!("ffn l{layer_idx}: {e}"))
+}
+
+/// Stage the hash-routed layers' experts before the pass reaches them.
+///
+/// Hash layers (`0..num_hash_layers`) pick experts through a static
+/// `tid2eid[token_id]` table, so their access stream carries no temporal
+/// locality at all. Measured on a 300-token decode at 28 slots/blob: layers
+/// 0-2 hit 14.8-16.1% against a 59.4% model average, and account for 18.6% of
+/// every miss while being 7% of the layers.
+///
+/// No cache policy fixes that, and both obvious ones were measured and
+/// rejected: pinning the hottest experts is non-monotonic in N and worth under
+/// +2.4pp, and funding extra hash slots out of the score-routed layers is net
+/// NEGATIVE (+346 misses) because those layers outnumber these 40:3.
+///
+/// What does work is that the selection needs no hidden state — unlike the
+/// score-routed layers, whose routing depends on the activations at that layer
+/// and therefore cannot be known before the pass arrives. These misses can't be
+/// cached away, but they CAN be lifted off the critical path.
+///
+/// Best-effort and idempotent: the per-layer `page_routed_experts` still runs
+/// and simply finds the experts resident. Pools are keyed per (layer, role), so
+/// nothing dispatched between here and layer 0 can evict what we stage. A
+/// request larger than the pool is truncated rather than failed — the remainder
+/// is paged normally by the layer itself.
+fn prefetch_hash_experts(
+    cfg: &DeepseekV4Config,
+    weights: &DeepseekV4Weights,
+    gpu: &mut Gpu,
+    token_ids: &[u32],
+) -> Result<(), String> {
+    let Some(paging) = weights.expert_paging.as_ref() else {
+        return Ok(());
+    };
+    if cfg.num_hash_layers == 0 || token_ids.is_empty() {
+        return Ok(());
+    }
+    // Opt-out. Staging is advisory, so disabling it must change timing only —
+    // that equivalence is what the neutrality check asserts, by diffing decoded
+    // output with the flag on and off.
+    if hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_HASH_PREFETCH")
+        .map(|v| v == "0")
+        .unwrap_or(false)
+    {
+        return Ok(());
+    }
+    let k = cfg.num_experts_per_tok;
+    let mut p = paging
+        .lock()
+        .map_err(|_| "prefetch_hash: expert pager mutex poisoned".to_string())?;
+    let slots = p.slots_per_blob();
+    let mut experts: Vec<u16> = Vec::with_capacity(token_ids.len() * k);
+    for layer_idx in 0..cfg.num_hash_layers {
+        if !p.pages_layer(layer_idx as u16) {
+            continue;
+        }
+        let layer = weights.resolve_layer(layer_idx);
+        if layer.tid2eid_host.is_empty() {
+            continue;
+        }
+        let (Some(gate_up_blob), Some(gate_up_ptrs), Some(w2_blob), Some(w2_ptrs)) = (
+            layer.expert_gate_up_blob.as_ref(),
+            layer.expert_gate_up_ptrs.as_ref(),
+            layer.expert_w2_blob.as_ref(),
+            layer.expert_w2_ptrs.as_ref(),
+        ) else {
+            continue;
+        };
+        experts.clear();
+        for &t in token_ids {
+            let row = (t as usize) * k;
+            // Out-of-range ids are the real path's error to report, not ours —
+            // staging is advisory, so skip and let it fail there with context.
+            if row + k > layer.tid2eid_host.len() {
+                continue;
+            }
+            for &e in &layer.tid2eid_host[row..row + k] {
+                let e = e as u16;
+                if experts.len() < slots && !experts.contains(&e) {
+                    experts.push(e);
+                }
+            }
+        }
+        if experts.is_empty() {
+            continue;
+        }
+        p.page_experts_both(
+            layer_idx as u16,
+            &experts,
+            gate_up_blob,
+            gate_up_ptrs,
+            layer.expert_gate_up_stride,
+            w2_blob,
+            w2_ptrs,
+            layer.expert_w2_stride,
+            gpu,
+        )
+        .map_err(|e| format!("prefetch_hash l{layer_idx}: {e}"))?;
+    }
+    Ok(())
 }
 
 fn ffn_routed(

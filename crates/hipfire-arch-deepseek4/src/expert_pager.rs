@@ -1027,10 +1027,14 @@ impl Ds4ExpertPaging {
         w2_stride: usize,
         gpu: &mut rdna_compute::Gpu,
     ) -> Result<(), PagerError> {
-        // Use routing already resolved by `prepare_dispatch` for THIS layer if
-        // present; otherwise route now. A mismatch means someone else's
-        // prepare is outstanding, so fall back rather than page the wrong
-        // experts — correct, just without the overlap.
+        // Read this layer's routing off the device and page what it selected.
+        //
+        // Score-routed layers cannot do better than this: the top-k depends on
+        // the activations AT this layer, so the expert set is unknowable until
+        // the pass arrives here and the fetch sits on the critical path by
+        // construction. Hash-routed layers are the exception — their selection
+        // is a pure `tid2eid[token_id]` lookup, which is why they are staged up
+        // front by `prefetch_hash_experts` instead.
         self.read_topk(topk_indices, count, n_exp, gpu)
             .map_err(|detail| PagerError::Read {
                 key: ExpertKey {
