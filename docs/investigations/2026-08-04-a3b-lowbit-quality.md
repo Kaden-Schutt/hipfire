@@ -146,11 +146,38 @@ error, which means weighting each element by its diagonal Hessian entry. We
 already produce those Hessians: `bin/collect_e8_hessian.rs` + `hessian_io.rs` +
 `e8_gptq.rs`. They are simply not wired to the Lloyd path.
 
-**G3 — dense/attention floor may be set too low.**
-Escha holds *all* dense layers at int8 and calls it lossless vs fp16; the +0.7 GB
-is consistent with that. Our mq4p tier already does Q8-protected attention, so
-the mechanism exists — the MQ2 SKU's tensor recipe needs auditing to see what it
-actually drops.
+**G3 — dense/attention floor. CLOSED, was not the problem.**
+Audited via `cargo run --example hfq_dump -p hipfire-quantize` over all 21093
+tensors of `qwen3.6-35b-a3b.mq2`:
+
+| role | n | quant |
+|---|---|---|
+| experts gate_up | 10240 | MQ2G256Lloyd (qt=19) |
+| experts down | 10240 | **MQ2G256Lloyd (qt=19)** |
+| shared_expert | 40 / 120 | Q8F16 / MQ4G256 (qt=13) |
+| full_attn | 40 / 20 | Q8F16 (int8) / F16 |
+| linear_attn | 180 / 90 | Q8F16 (int8) / F16 |
+| router | 40 | Q8F16 (int8) |
+| embed + lm_head | 2 | Q8F16 (int8) |
+
+The dense/attention floor is **already int8** — this SKU is already the Escha
+recipe. It is not uniform MQ2 (qt=18); it is MQ2-Lloyd throughout.
+
+**G3′ (the actual third gap) — routed experts are ungraded.**
+`down_proj` sits at MQ2-Lloyd, identical to `gate_up`. Escha grades down to
+3-bit ("code rate K=3") and only gate_up to 2-bit. We have the graded kernel
+already: `gemv_mq3g256_lloyd_moe_down_indexed.hip` (+ `_batched_k4`,
++ `gemm_mq3g256_lloyd_moe_grouped_*` for gfx1151/gfx12). Nothing to write —
+re-encode `down_proj` as `MQ3G256Lloyd` (qt=20) and dispatch already resolves.
+
+Size cost: MQ2-Lloyd is 72 B/256 weights (2.25 bpw incl. the 4×fp16 per-block
+codebook); MQ3-Lloyd is 112 B/256 (3.5 bpw). Over 10240 down_proj tensors of
+[2048,512] that is +1.25 bpw × 10.74e9 weights ≈ **+1.68 GB → ~13.3 GB**, which
+overshoots both Escha's 12.3 GB and the ≤12.5 GB target. Two ways to pay for it,
+both worth pricing before committing: drop the per-block fp16 codebook in favour
+of a tensor-global or learned codebook (the per-block codebook is 0.25 bpw of
+pure overhead — 0.67 GB across all experts), or grade only the layers where
+`down` actually matters rather than all 40.
 
 ## 5. Spec — `qwen3.6:35b-a3b-mq2r` (MQ2-Lloyd-Redline)
 
@@ -162,13 +189,52 @@ the `mq2r` precedent (MFP4-E8 dense + MQ2-Lloyd routed experts).
 
 Phased, cheapest-first, each phase independently falsifiable:
 
-**Phase 0 — measure the actual baseline (blocking, ~half a day).**
-Nobody has a KLD number for `qwen3.6-35b-a3b.mq2`; "degraded" is prose. Run the
-llama.cpp bf16 oracle (per the established KLD methodology) against the existing
-MQ2 SKU, and against mq4r/mq4p for reference. **If MQ2 KLD is already
-competitive, Phases 1–3 are unnecessary and this becomes a labeling +
-registry-description task.** Do not skip this — it is the cheapest step and it
-can close the whole project.
+**Phase 0 — measure the actual baseline. The reference already exists.**
+`~/.hipfire/models/q36a3b-wt2-f32.kldref.bin` — valid HFKLDR v1 (size matches
+spec exactly), n_ctx=512, n_chunk=32, top_k=256, n_vocab=248320, 8160 scored
+tokens, dated 2026-06-14. Note it is a *small* reference: the 27B MASTER ref
+(`~/.hipfire/kldref/qwen3.6-27b-MASTER-small.kldref.bin`) carries 2048×97 =
+99231 scored tokens. Fine for ranking variants, noisier for tight deltas — if a
+Phase-1/2 delta lands inside the noise, regenerate a larger a3b ref before
+concluding anything.
+
+Run `crates/hipfire-runtime/examples/eval_hipfire.rs` against
+`qwen3.6-35b-a3b.mq2` with that ref, plus mq4r/mq4p for reference points.
+**If MQ2-Lloyd KLD is already competitive, Phases 1–3 collapse into a labeling
++ registry-description task.** Cheapest step, and it can close the project.
+
+### Prior art — MQ2-Lloyd is already measured on the 27B sibling
+
+`~/.hipfire/awqtest/`, 2026-05-28, gfx1100, `qwen3.6-27b.*`, prefill scoring,
+q8 KV, `HIPFIRE_NORMALIZE_PROMPT=0`:
+
+| variant | slice-mean KLD | PPL |
+|---|---|---|
+| mq3lloyd-awqU | 0.0124 | 3.591 |
+| mq3lloyd | 0.0184 | 3.610 |
+| mq3-awqU | 0.0235 | 3.633 |
+| mq3 | 0.0318 | 3.654 |
+| **mq2lloyd-awqU** | **0.0540** | 3.716 |
+| **mq2lloyd** | **0.0931** | 3.843 |
+| mq2-awqU | 0.2365 | 4.460 |
+| ternary | 0.3811 | 5.122 |
+| **mq2 (uniform)** | **1.0315** | 9.823 |
+
+Three things this settles, on our own numbers:
+
+1. **The Lloyd codebook is what makes 2-bit viable at all** — 0.093 vs 1.032 for
+   uniform MQ2, an 11× gap. Escha's "code rate K" framing is the same insight.
+2. **Calibration recovers ~42% of the remaining KLD at 2-bit** — AWQ on top of
+   mq2lloyd takes 0.0931 → 0.0540, *on this exact format*. G1/G2 are therefore
+   not speculative; the lever is already demonstrated, just never applied to the
+   a3b SKU.
+3. **Grading down_proj 2→3 bit is worth a lot** — mq3lloyd 0.0184 vs mq2lloyd
+   0.0931 is 5×. Even applying it to only one of the two expert projections
+   should move a3b materially (G3′).
+
+Caveat: these are 27B numbers on a different architecture slice, and KLD does
+not transfer across models. They establish *which levers work on this quant
+family*, not what a3b's number is. Phase 0 still has to be run.
 
 **Phase 1 — Hessian-weighted Lloyd (G2).**
 Highest value per line of code. Thread the existing per-column diagonal Hessian
