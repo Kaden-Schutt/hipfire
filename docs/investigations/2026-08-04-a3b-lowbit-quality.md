@@ -179,6 +179,40 @@ of a tensor-global or learned codebook (the per-block codebook is 0.25 bpw of
 pure overhead — 0.67 GB across all experts), or grade only the layers where
 `down` actually matters rather than all 40.
 
+## 4b. The existing a3b ladder — and the hole in it
+
+| SKU | size | experts | dense/attn |
+|---|---|---|---|
+| `mq2` | 11.6 GB | uniform MQ2-Lloyd (qt=19) × 10240 per projection | Q8F16 int8 |
+| **— nothing here —** | **12–17 GB** | | |
+| `mq3p` | 17.2 GB | MQ6 ×2040 / MQ4 ×3080 / MQ2-Lloyd ×5120, per projection | Q8F16 int8 |
+| `mq4r` | 18.7 GB | graded, uniform MQ4 attn + gate-side | — |
+| `mq4p` | 19.8 GB | graded (default SKU) | — |
+| `mfp4` | 20.2 GB | MFP4-E8 vector quant | — |
+| `mq5` / `mq6` | 23.7 / 27.7 GB | quality tiers | — |
+
+Two things fall out of the `mq3p` dump:
+
+**hipfire and Escha grade orthogonal axes.** `mq3p` tiers by *which expert*
+(hot→MQ6, mid→MQ4, cold→MQ2-Lloyd) and gives `gate_up` and `down` **identical**
+treatment — 2040/3080/5120 on both. Escha tiers by *which projection*
+(gate_up=2b, down=3b) uniformly across experts. Neither is a superset of the
+other; a real `mq2r` should apply **both**, using the per-expert importance
+machinery we already have plus the per-projection split we do not.
+
+**`mq3p` contains no MQ3-Lloyd.** No tensor in it is qt=20. The name denotes a
+size/quality tier, not the format — its cold tier is MQ2-Lloyd and its warm
+tiers are plain FWHT-rotated affine MQ4/MQ6. So `MQ3G256Lloyd`, the format that
+measured **0.0184 KLD on the 27B** — better than mq3 (0.0318) and 5× better than
+mq2lloyd (0.0931) — is used by **no a3b SKU at all**, despite having full kernel
+coverage (`gemv_mq3g256_lloyd_moe_{gate_up,down}_indexed*`,
+`gemm_mq3g256_lloyd_moe_grouped_*` on gfx1151/gfx12). That is the single most
+underused asset in the tree for this problem.
+
+**The hole is 11.6 → 17.2 GB, and Escha's 12.3 GB sits squarely in it.** That is
+the `mq2r` slot: a ~12–13.5 GB SKU with meaningfully better quality than the
+floor, which today has no entry.
+
 ## 5. Spec — `qwen3.6:35b-a3b-mq2r` (MQ2-Lloyd-Redline)
 
 Goal: promote MQ2-Lloyd from research-gated floor SKU to a shippable Redline
@@ -254,10 +288,22 @@ applied in the **unrotated** basis before FWHT bake-in, because rotation
 flattens per-channel importance. Any learned-scale work must respect that
 ordering or it will silently no-op.
 
-**Phase 3 — tensor-recipe audit (G3).**
-Enumerate what the MQ2 recipe drops below int8 on the dense/attention side and
-price restoring it. Budget: we have 0.7 GB of headroom against Escha's 12.3 GB
-and still land under a 14 GB min-VRAM target.
+**Phase 3 — two-axis expert grading (G3′). Probably do this FIRST.**
+Cheapest real quality lever and it needs no new code. Compose the two orthogonal
+axes:
+
+- *per-expert* (existing `mq3p` machinery): hot/mid/cold tiering
+- *per-projection* (new, Escha's insight): `down` one tier above `gate_up`
+
+Concretely, a candidate recipe using only formats with existing kernel coverage:
+`down` → MQ3-Lloyd (qt=20) on hot+mid experts, MQ2-Lloyd on cold; `gate_up` →
+MQ2-Lloyd throughout. That reuses `gemv_mq3g256_lloyd_moe_down_indexed.hip` and
+its batched/grouped siblings, so it is a re-encode plus a recipe entry.
+
+Budget the size against the 11.6 GB floor: full `down`→MQ3-Lloyd is +1.68 GB
+(→13.3 GB); restricting it to the 5120 hot+mid experts is roughly +0.84 GB
+(→~12.4 GB), which lands on Escha's number. Sweep the split rather than
+guessing.
 
 **Phase 4 (separate track, optional) — load-balanced expert chunking.**
 The one mechanism genuinely worth lifting, and it is a *batching* win, not a
