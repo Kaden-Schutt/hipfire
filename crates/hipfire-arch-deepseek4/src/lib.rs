@@ -55,6 +55,7 @@ pub mod arch;
 pub mod deepseek4;
 pub mod dsml;
 pub mod dspark_speculator;
+pub mod expert_adapter;
 pub mod expert_pager;
 pub mod expert_policy;
 pub mod forward;

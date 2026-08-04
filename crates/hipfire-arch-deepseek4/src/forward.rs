@@ -2429,6 +2429,9 @@ fn decode_step_body_lowered(
         // so it cannot perturb it.
         if !skip_ffn {
             trace_route_lookahead(cfg, weights, state, gpu, layer_idx, token_id)?;
+            // Speculatively stage the NEXT layer's experts so the transfer
+            // overlaps its attention block. No-op without an adapter.
+            prefetch_next_layer_experts(cfg, weights, state, gpu, layer_idx)?;
         }
     }
     final_norm_and_head(cfg, weights, state, gpu)?;
@@ -3730,6 +3733,10 @@ where
     if !p.pages_layer(layer_idx as u16) {
         return Ok(());
     }
+    // A speculative prefetch for THIS layer may still be in flight. Draining
+    // here is what converts the overlap into a win: everything between the
+    // issue and this point ran while the transfer was in progress.
+    let _ = p.wait_prefetch(gpu);
     route(gpu)?;
     let gate_up_blob = layer
         .expert_gate_up_blob
@@ -3874,6 +3881,95 @@ fn dump_adapter_pairs(
             }
         }
     }
+    Ok(())
+}
+
+/// Speculatively stage layer `L+1`'s experts using the trained adapter.
+///
+/// Runs after layer L's program, while `ffn_x_plain` still holds layer L's FFN
+/// input, and issues an ASYNC fetch so the transfer overlaps layer L+1's
+/// attention block. `page_routed_experts` waits on it before reading.
+///
+/// Why bother: expert I/O is 41.9% of decode wall time at an 8 GiB budget, and
+/// no training-free predictor can name it in advance (recency 0.1% of misses,
+/// token-conditioned 13.0%, real gate on stale hidden 4.2%). The trained
+/// rank-128 adapter reaches 75.6% recall@6.
+///
+/// Best-effort throughout: a wrong prediction wastes a slot and some bandwidth,
+/// never correctness -- the frozen native router still makes the real selection
+/// at the next layer, and `ensure_resident` fetches whatever was missed.
+fn prefetch_next_layer_experts(
+    cfg: &DeepseekV4Config,
+    weights: &DeepseekV4Weights,
+    state: &DeepseekV4State,
+    gpu: &mut Gpu,
+    layer_idx: usize,
+) -> Result<(), String> {
+    let (Some(paging), Some(adapter)) =
+        (weights.expert_paging.as_ref(), weights.expert_adapter.as_ref())
+    else {
+        return Ok(());
+    };
+    let next = layer_idx + 1;
+    if next >= cfg.num_hidden_layers || next < cfg.num_hash_layers {
+        return Ok(()); // hash layers are staged exactly from the token id
+    }
+    let Some(h) = state.ffn_x_plain.as_ref() else {
+        return Ok(());
+    };
+    // Stage top-M rather than top-k: at 75.6% recall@6 a k-sized fetch still
+    // leaves ~1.5 experts to stall on, and slots are cheap next to a stall.
+    let top_m: usize = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_PREFETCH_TOPM")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(cfg.num_experts_per_tok + 2);
+
+    let next_layer = weights.resolve_layer(next);
+    // The live router selects over (scores + gate_bias); ranking without the
+    // bias predicts a different top-k than the one actually taken.
+    let bias = next_layer.gate_bias.as_ref().and_then(|b| gpu.download_f32(b).ok());
+
+    let experts = {
+        let mut ad = adapter
+            .lock()
+            .map_err(|_| "prefetch: adapter mutex poisoned".to_string())?;
+        let Some(idx) = ad.entry_for(layer_idx) else {
+            return Ok(());
+        };
+        match ad.predict_topm(idx, h, bias.as_deref(), top_m, gpu) {
+            Ok(e) => e,
+            Err(_) => return Ok(()),
+        }
+    };
+
+    let (Some(gate_up_blob), Some(w2_blob)) = (
+        next_layer.expert_gate_up_blob.as_ref(),
+        next_layer.expert_w2_blob.as_ref(),
+    ) else {
+        return Ok(());
+    };
+    let mut p = paging
+        .lock()
+        .map_err(|_| "prefetch: pager mutex poisoned".to_string())?;
+    if !p.pages_layer(next as u16) {
+        return Ok(());
+    }
+    let _ = p.prefetch_experts(
+        next as u16,
+        crate::expert_pager::ExpertBlobRole::GateUp,
+        &experts,
+        gate_up_blob,
+        next_layer.expert_gate_up_stride,
+        gpu,
+    );
+    let _ = p.prefetch_experts(
+        next as u16,
+        crate::expert_pager::ExpertBlobRole::Down,
+        &experts,
+        w2_blob,
+        next_layer.expert_w2_stride,
+        gpu,
+    );
     Ok(())
 }
 

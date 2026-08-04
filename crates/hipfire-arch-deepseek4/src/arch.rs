@@ -696,6 +696,7 @@ impl DeepseekV4 {
             mtp_layer: None, // skipped by quantize per `mtp.` prefix; Phase 5 work.
             dspark: None,    // DSpark sidecar discovered+loaded in load_weights_inner.
             expert_paging: None,
+            expert_adapter: None,
             _scaffold: (),
         })
     }
@@ -1678,6 +1679,18 @@ impl DeepseekV4 {
                     max_expert_bytes,
                 ),
             ));
+
+            // Optional trained predictor for speculative prefetch. Only useful
+            // alongside paging — with every expert resident there is nothing to
+            // prefetch. A load failure is FATAL rather than silent: falling
+            // back to no adapter would quietly benchmark the wrong thing.
+            if let Ok(path) = std::env::var("HIPFIRE_DEEPSEEK4_EXPERT_ADAPTER") {
+                if !path.is_empty() {
+                    let ad = crate::expert_adapter::ExpertAdapter::load(&path, gpu)
+                        .map_err(|e| format!("deepseek4: expert adapter: {e}"))?;
+                    weights.expert_adapter = Some(std::sync::Mutex::new(ad));
+                }
+            }
         }
 
         // Routed experts for the MTP layer (same upload logic, gated on
@@ -2378,6 +2391,7 @@ impl DeepseekV4 {
             mtp_layer: None,
             dspark: None,
             expert_paging: None,
+            expert_adapter: None,
             _scaffold: (),
         };
 

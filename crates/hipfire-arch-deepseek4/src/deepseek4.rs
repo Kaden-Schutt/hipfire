@@ -806,6 +806,11 @@ pub struct DeepseekV4Weights {
     /// the forward path only holds `&DeepseekV4Weights`: concurrent sequences
     /// must not race on the same slots, and serialising is required anyway.
     pub expert_paging: Option<std::sync::Mutex<crate::expert_pager::Ds4ExpertPaging>>,
+    /// Trained predictor for the NEXT layer's routing, enabling speculative
+    /// expert prefetch. `None` unless HIPFIRE_DEEPSEEK4_EXPERT_ADAPTER points
+    /// at an exported adapter. Mutex for the same reason as `expert_paging`:
+    /// it owns device scratch that concurrent sequences must not race on.
+    pub expert_adapter: Option<std::sync::Mutex<crate::expert_adapter::ExpertAdapter>>,
     pub _scaffold: (),
 }
 

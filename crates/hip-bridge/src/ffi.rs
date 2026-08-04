@@ -1085,6 +1085,47 @@ impl HipRuntime {
         self.check(code, "hipMemcpy H2D offset")
     }
 
+    /// Offset H2D copy issued on `stream` instead of the null stream.
+    ///
+    /// This is the piece the expert pager needs to overlap a fetch with
+    /// compute: the pager writes into a slot at `offset` inside a pooled blob,
+    /// and it must be able to do so without blocking the caller.
+    ///
+    /// `src` MUST be page-locked (see [`Self::host_malloc`]). `hipMemcpyAsync`
+    /// from pageable memory silently degrades to a synchronous copy through a
+    /// driver bounce buffer, which would make this look like it works while
+    /// delivering none of the overlap.
+    ///
+    /// # Safety contract
+    /// `src` must stay alive and unmodified until the copy completes — record
+    /// an event on `stream` and wait on it before reusing the buffer.
+    pub fn memcpy_htod_offset_async(
+        &self,
+        dst: &DeviceBuffer,
+        offset: usize,
+        src: &[u8],
+        stream: &Stream,
+    ) -> HipResult<()> {
+        assert!(
+            offset + src.len() <= dst.size,
+            "offset ({}) + source ({}) exceeds device buffer ({})",
+            offset,
+            src.len(),
+            dst.size
+        );
+        let dst_ptr = unsafe { (dst.ptr as *mut u8).add(offset) as *mut c_void };
+        let code = unsafe {
+            (self.fn_memcpy_async)(
+                dst_ptr,
+                src.as_ptr() as *const c_void,
+                src.len(),
+                MemcpyKind::HostToDevice as c_uint,
+                stream.0,
+            )
+        };
+        self.check(code, "hipMemcpyAsync H2D offset")
+    }
+
     /// Copy bytes between GPU buffers with offsets on both sides.
     pub fn memcpy_dtod_at(
         &self,

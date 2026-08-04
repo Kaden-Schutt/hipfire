@@ -1133,6 +1133,97 @@ impl Ds4ExpertPaging {
     /// sized at construction. Any read failure is reported with layer, expert
     /// and file offset rather than leaving a stale or zeroed expert behind.
     #[allow(clippy::too_many_arguments)]
+    /// Speculatively stage `experts` for `layer` WITHOUT blocking.
+    ///
+    /// Same slot bookkeeping as [`Self::ensure_resident`], but the bytes go via
+    /// the transport's async path so the transfer overlaps whatever the caller
+    /// runs next. Call [`Self::wait_prefetch`] before the layer's GEMVs read
+    /// the blob.
+    ///
+    /// Best-effort by design: the experts come from a PREDICTION (~75.6%
+    /// recall@6), so some will be wrong. A wrong one costs a wasted slot and
+    /// wasted bandwidth, never a wrong answer — `ensure_resident` still runs at
+    /// the real dispatch and fetches anything the prediction missed. Errors are
+    /// swallowed for the same reason: a failed speculation must not fail the
+    /// forward pass.
+    ///
+    /// Skips the fill-transform path entirely (TP row-gather), which has no
+    /// async form yet.
+    pub fn prefetch_experts(
+        &mut self,
+        layer: u16,
+        role: ExpertBlobRole,
+        experts: &[u16],
+        blob: &rdna_compute::GpuTensor,
+        stride: usize,
+        gpu: &mut rdna_compute::Gpu,
+    ) -> Result<(), PagerError> {
+        if self.fill.is_some() || experts.is_empty() {
+            return Ok(());
+        }
+        let base = blob.buf.as_ptr() as u64;
+        let mut fills = std::mem::take(&mut self.fills);
+        let planned = self
+            .rt
+            .plan_dispatch(layer, role, experts, stride, base, &mut fills);
+        if planned.is_err() {
+            self.fills = fills;
+            return Ok(()); // speculation only; never propagate
+        }
+        let mut reqs = std::mem::take(&mut self.reqs);
+        reqs.clear();
+        for f in &fills {
+            if !f.needs_read {
+                continue;
+            }
+            let mut segbuf = [ExpertSegment { offset: 0, len: 0 }; 2];
+            let n_seg = match self.rt.segments_for(f.key) {
+                Ok(segs) => {
+                    let n = segs.len().min(segbuf.len());
+                    segbuf[..n].copy_from_slice(&segs[..n]);
+                    n
+                }
+                Err(_) => 0,
+            };
+            let mut dst = f.slot * stride;
+            for seg in &segbuf[..n_seg] {
+                reqs.push(hipfire_runtime::weight_pager::FetchReq {
+                    hfq_offset: seg.offset,
+                    len: seg.len,
+                    dst_byte_offset: dst,
+                });
+                self.bytes_read += seg.len as u64;
+                dst += seg.len;
+            }
+        }
+        if !reqs.is_empty() {
+            if let Err(_e) = self.transport.prefetch_batch_into(&reqs, blob, gpu) {
+                // Bytes never arrived, but plan_dispatch already marked these
+                // experts resident. Forget them so the real dispatch re-reads
+                // rather than trusting an unwritten slot — the same failure
+                // discipline ensure_resident uses.
+                for f in fills.iter().filter(|f| f.needs_read) {
+                    self.rt.invalidate(f.key);
+                }
+            }
+        }
+        self.reqs = reqs;
+        self.fills = fills;
+        Ok(())
+    }
+
+    /// Block until an outstanding [`Self::prefetch_experts`] has landed.
+    pub fn wait_prefetch(&mut self, gpu: &rdna_compute::Gpu) -> Result<(), PagerError> {
+        let _ = self.transport.wait_prefetch(gpu);
+        Ok(())
+    }
+
+    /// Nanoseconds blocked waiting on prefetches — the share of the transfer
+    /// the overlap failed to hide.
+    pub fn prefetch_wait_ns(&self) -> u64 {
+        self.transport.prefetch_wait_ns()
+    }
+
     pub fn ensure_resident(
         &mut self,
         layer: u16,
