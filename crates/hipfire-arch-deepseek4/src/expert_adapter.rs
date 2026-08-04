@@ -54,6 +54,13 @@ pub struct ExpertAdapter {
     hidden: GpuTensor,
     /// Scratch `[n_exp]` for the predicted scores.
     scores: GpuTensor,
+    /// Host-side `gate_bias` per predicted layer.
+    ///
+    /// The bias is a per-layer CONSTANT, so fetching it from the device on
+    /// every layer of every token costs one synchronous D2H per layer -- ~40
+    /// pipeline drains per token, which measured as a large part of a 27%
+    /// regression. Cache on first use.
+    bias_cache: std::collections::HashMap<usize, Vec<f32>>,
 }
 
 impl ExpertAdapter {
@@ -102,7 +109,22 @@ impl ExpertAdapter {
             layers.len(),
             raw.len() as f64 / 1e6
         );
-        Ok(Self { layers, d_model, n_exp, rank, hidden, scores })
+        Ok(Self { layers, d_model, n_exp, rank, hidden, scores,
+                  bias_cache: std::collections::HashMap::new() })
+    }
+
+    /// `gate_bias` for `layer`, downloaded once and cached thereafter.
+    pub fn cached_bias(
+        &mut self,
+        layer: usize,
+        tensor: Option<&GpuTensor>,
+        gpu: &mut Gpu,
+    ) -> Option<&[f32]> {
+        if !self.bias_cache.contains_key(&layer) {
+            let v = gpu.download_f32(tensor?).ok()?;
+            self.bias_cache.insert(layer, v);
+        }
+        self.bias_cache.get(&layer).map(|v| v.as_slice())
     }
 
     /// Index of the entry predicting from `src_layer`, if present.

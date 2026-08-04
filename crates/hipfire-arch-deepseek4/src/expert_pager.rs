@@ -1155,6 +1155,7 @@ impl Ds4ExpertPaging {
         role: ExpertBlobRole,
         experts: &[u16],
         blob: &rdna_compute::GpuTensor,
+        ptr_table: &rdna_compute::GpuTensor,
         stride: usize,
         gpu: &mut rdna_compute::Gpu,
     ) -> Result<(), PagerError> {
@@ -1166,10 +1167,13 @@ impl Ds4ExpertPaging {
         let planned = self
             .rt
             .plan_dispatch(layer, role, experts, stride, base, &mut fills);
-        if planned.is_err() {
-            self.fills = fills;
-            return Ok(()); // speculation only; never propagate
-        }
+        let dirty = match planned {
+            Ok(d) => d,
+            Err(_) => {
+                self.fills = fills;
+                return Ok(()); // speculation only; never propagate
+            }
+        };
         let mut reqs = std::mem::take(&mut self.reqs);
         reqs.clear();
         for f in &fills {
@@ -1209,6 +1213,27 @@ impl Ds4ExpertPaging {
         }
         self.reqs = reqs;
         self.fills = fills;
+
+        // CRITICAL: plan_dispatch has already moved these experts into slots in
+        // the HOST shadow. If we return without publishing the device pointer
+        // table, the real dispatch calls plan_dispatch again, sees the shadow
+        // already correct, returns dirty=false, and SKIPS the upload as pure
+        // cost -- leaving the device table pointing at the previous occupants.
+        // The GPU then reads the wrong experts' weights and the model silently
+        // produces different output. Speculation must leave the device in the
+        // same state ensure_resident would have.
+        if dirty {
+            self.table_uploads += 1;
+            if let Some(shadow) = self.rt.shadow(layer, role) {
+                self.ptr_bytes.clear();
+                for p in shadow {
+                    self.ptr_bytes.extend_from_slice(&p.to_ne_bytes());
+                }
+                let t_up = std::time::Instant::now();
+                let _ = gpu.memcpy_htod_auto(&ptr_table.buf, &self.ptr_bytes);
+                self.ns_upload += t_up.elapsed().as_nanos() as u64;
+            }
+        }
         Ok(())
     }
 

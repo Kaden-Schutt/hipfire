@@ -3925,10 +3925,6 @@ fn prefetch_next_layer_experts(
         .unwrap_or(cfg.num_experts_per_tok + 2);
 
     let next_layer = weights.resolve_layer(next);
-    // The live router selects over (scores + gate_bias); ranking without the
-    // bias predicts a different top-k than the one actually taken.
-    let bias = next_layer.gate_bias.as_ref().and_then(|b| gpu.download_f32(b).ok());
-
     let experts = {
         let mut ad = adapter
             .lock()
@@ -3936,6 +3932,13 @@ fn prefetch_next_layer_experts(
         let Some(idx) = ad.entry_for(layer_idx) else {
             return Ok(());
         };
+        // The live router selects over (scores + gate_bias); ranking without
+        // the bias predicts a different top-k than the one actually taken.
+        // Cached host-side -- it is a per-layer constant and fetching it every
+        // token would add ~40 pipeline drains.
+        let bias = ad
+            .cached_bias(next, next_layer.gate_bias.as_ref(), gpu)
+            .map(|b| b.to_vec());
         match ad.predict_topm(idx, h, bias.as_deref(), top_m, gpu) {
             Ok(e) => e,
             Err(_) => return Ok(()),
@@ -3959,6 +3962,7 @@ fn prefetch_next_layer_experts(
         crate::expert_pager::ExpertBlobRole::GateUp,
         &experts,
         gate_up_blob,
+        next_layer.expert_gate_up_ptrs.as_ref().unwrap(),
         next_layer.expert_gate_up_stride,
         gpu,
     );
@@ -3967,6 +3971,7 @@ fn prefetch_next_layer_experts(
         crate::expert_pager::ExpertBlobRole::Down,
         &experts,
         w2_blob,
+        next_layer.expert_w2_ptrs.as_ref().unwrap(),
         next_layer.expert_w2_stride,
         gpu,
     );
