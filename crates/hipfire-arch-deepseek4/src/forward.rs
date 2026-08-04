@@ -2054,6 +2054,11 @@ pub fn decode_step_body(
             } else {
                 ffn_routed(cfg, weights, state, gpu, layer_idx, None)?;
             }
+            // Diagnostic (default off): can this layer's hidden state predict
+            // the NEXT layer's routing? If so, prefetch is viable for the
+            // score-routed layers. Runs after the dispatch, so it cannot
+            // perturb it.
+            trace_route_lookahead(cfg, weights, state, gpu, layer_idx, token_id)?;
         } else {
             // Diagnostic: zero ffn_out to isolate attn contribution to growth.
             if state.ffn_out.is_none() {
@@ -2419,6 +2424,12 @@ fn decode_step_body_lowered(
         };
         superop::run_layer_program(gpu, &ctx, &program, &mut bind)
             .map_err(|e| format!("ds4 L{layer_idx}: lowered run_layer_program: {e}"))?;
+        // Diagnostic (default off): can this layer's hidden state predict the
+        // NEXT layer's routing? Runs after the layer's program has completed,
+        // so it cannot perturb it.
+        if !skip_ffn {
+            trace_route_lookahead(cfg, weights, state, gpu, layer_idx, token_id)?;
+        }
     }
     final_norm_and_head(cfg, weights, state, gpu)?;
     state.n_tokens += 1;
@@ -3750,6 +3761,102 @@ where
         gpu,
     )
     .map_err(|e| format!("ffn l{layer_idx}: {e}"))
+}
+
+/// Diagnostic: how well does layer L's hidden state predict layer L+1's routing?
+///
+/// `HIPFIRE_DEEPSEEK4_ROUTE_LOOKAHEAD_TRACE=<path>` writes one
+/// `pred,<layer>,<expert>,<token>` row per predicted expert, to be joined
+/// offline against the actual selections in the expert access trace.
+///
+/// Why this and not the predictors already rejected: those were keyed on
+/// HISTORY (previous pass, token statistics) and both failed — recency is
+/// redundant with LRU (0.1% of misses), and routing at score layers is
+/// context- not token-determined (1.1% stability). This one is STRUCTURAL: it
+/// runs the real `gate_{L+1}` weights, which are always resident and cost a
+/// 4096x256 GEMV, against the residual stream one layer early. The residual
+/// stream changes slowly between adjacent layers, so `gate(h_L)` may select
+/// most of what `gate(h_{L+1})` will.
+///
+/// If it does, prefetch becomes possible for the 40 score-routed layers:
+/// predicting at the END of layer L's FFN leaves layer L+1's whole attention
+/// block (~1.7 ms) to stage into, against 0.85 ms of pread and 0.58 ms of copy.
+/// That is the overlap window the shared expert failed to provide (it costs
+/// 0 ms).
+///
+/// Diagnostic only, default off. Runs AFTER layer L's dispatch has completed,
+/// so clobbering the shared routing scratch is harmless — layer L+1 recomputes
+/// it regardless.
+fn trace_route_lookahead(
+    cfg: &DeepseekV4Config,
+    weights: &DeepseekV4Weights,
+    state: &mut DeepseekV4State,
+    gpu: &mut Gpu,
+    layer_idx: usize,
+    token_id: u32,
+) -> Result<(), String> {
+    use std::io::Write;
+    static PATH: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    let Some(path) = PATH
+        .get_or_init(|| std::env::var("HIPFIRE_DEEPSEEK4_ROUTE_LOOKAHEAD_TRACE").ok())
+        .as_ref()
+    else {
+        return Ok(());
+    };
+    let next = layer_idx + 1;
+    // Only score-routed successors are interesting; hash layers are already
+    // exactly known from the token id.
+    if next >= cfg.num_hidden_layers || next < cfg.num_hash_layers {
+        return Ok(());
+    }
+
+    // Score layer `next` against the CURRENT layer's ffn_x_rot — that staleness
+    // is precisely the approximation under test.
+    moe_route(cfg, weights, state, gpu, next)?;
+    let k_top = cfg.num_experts_per_tok;
+    let next_layer = weights.resolve_layer(next);
+    let Some(bias_dev) = next_layer.gate_bias.as_ref() else {
+        return Ok(());
+    };
+    let scores_dev = state.router_scores.as_ref().unwrap();
+    let topk_idx_dev = state.moe_topk_indices.as_ref().unwrap();
+    let topk_w_dev = state.moe_topk_weights.as_ref().unwrap();
+    let route_scale: f32 = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_ROUTE_SCALE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2.2);
+    gpu.deepseek4_moe_topk_bias_aware_f32(
+        scores_dev,
+        bias_dev,
+        topk_idx_dev,
+        topk_w_dev,
+        cfg.n_routed_experts as i32,
+        k_top as i32,
+        route_scale,
+    )
+    .map_err(|e| format!("lookahead topk l{next}: {e:?}"))?;
+
+    // Indices are i32 on device; read them back the same way the pager does.
+    let mut raw = vec![0u8; k_top * 4];
+    gpu.bind_thread().map_err(|e| format!("{e:?}"))?;
+    gpu.hip
+        .memcpy_dtoh(&mut raw, &topk_idx_dev.buf)
+        .map_err(|e| format!("lookahead d2h l{next}: {e:?}"))?;
+    let ids: Vec<i32> = raw
+        .chunks_exact(4)
+        .map(|c| i32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    static SINK: std::sync::OnceLock<std::sync::Mutex<Option<std::fs::File>>> =
+        std::sync::OnceLock::new();
+    let sink = SINK.get_or_init(|| std::sync::Mutex::new(std::fs::File::create(path).ok()));
+    if let Ok(mut g) = sink.lock() {
+        if let Some(f) = g.as_mut() {
+            for e in ids.iter().take(k_top) {
+                let _ = writeln!(f, "pred,{next},{e},{token_id}");
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Stage the hash-routed layers' experts before the pass reaches them.
