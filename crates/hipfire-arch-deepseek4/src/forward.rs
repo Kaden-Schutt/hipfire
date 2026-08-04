@@ -8376,6 +8376,11 @@ impl PrefillBatchScratch {
 /// The mix output is written into pbs.streams_out_batch, then copied
 /// back into pbs.streams_batch (mirrors the sequential pattern of
 /// staging into state.q before the d2d memcpy).
+#[inline]
+fn dspark_requires_typed_device_copy(gpu: &Gpu) -> bool {
+    gpu.replay.is_recording() || gpu.graphs.capture_mode || gpu.flags.force_blob_path
+}
+
 #[allow(dead_code)]
 fn hc_attn_mix_batched(
     cfg: &DeepseekV4Config,
@@ -8395,8 +8400,17 @@ fn hc_attn_mix_batched(
     .map_err(|e| format!("hc_mix_4stream_batched (attn): {e:?}"))?;
 
     let elems = batch_size * cfg.hc_mult * cfg.hidden_size;
-    gpu.copy_f32_buffer(&pbs.streams_batch, &pbs.streams_out_batch, elems)
-        .map_err(|e| format!("typed copy streams_out → streams: {e:?}"))?;
+    if dspark_requires_typed_device_copy(gpu) {
+        gpu.copy_f32_buffer(&pbs.streams_batch, &pbs.streams_out_batch, elems)
+            .map_err(|e| format!("typed copy streams_out → streams: {e:?}"))?;
+    } else {
+        gpu.memcpy_dtod_auto(
+            &pbs.streams_batch.buf,
+            &pbs.streams_out_batch.buf,
+            elems * std::mem::size_of::<f32>(),
+        )
+        .map_err(|e| format!("d2d streams_out → streams: {e:?}"))?;
+    }
     Ok(())
 }
 
@@ -10856,8 +10870,17 @@ fn hc_ffn_mix_batched(
     .map_err(|e| format!("hc_mix_4stream_batched (ffn): {e:?}"))?;
 
     let elems = batch_size * cfg.hc_mult * cfg.hidden_size;
-    gpu.copy_f32_buffer(&pbs.streams_batch, &pbs.streams_out_batch, elems)
-        .map_err(|e| format!("typed copy streams_out → streams: {e:?}"))?;
+    if dspark_requires_typed_device_copy(gpu) {
+        gpu.copy_f32_buffer(&pbs.streams_batch, &pbs.streams_out_batch, elems)
+            .map_err(|e| format!("typed copy streams_out → streams: {e:?}"))?;
+    } else {
+        gpu.memcpy_dtod_auto(
+            &pbs.streams_batch.buf,
+            &pbs.streams_out_batch.buf,
+            elems * std::mem::size_of::<f32>(),
+        )
+        .map_err(|e| format!("d2d streams_out → streams: {e:?}"))?;
+    }
     Ok(())
 }
 
@@ -11663,15 +11686,31 @@ fn dspark_capture_layer(
     // 2. Scatter each batch row into its strided capture slot
     //    dspark_caps[b, slot, :] (offset (b*n_targets + slot)*hidden).
     let caps = state.dspark_caps.as_ref().unwrap();
-    gpu.copy_f32_strided_slot_buffer(
-        caps,
-        &pbs.tmp_batch,
-        n,
-        hidden,
-        n_targets * hidden,
-        slot * hidden,
-    )
-    .map_err(|e| format!("dspark_capture typed scatter l{layer_idx}: {e:?}"))?;
+    if dspark_requires_typed_device_copy(gpu) {
+        gpu.copy_f32_strided_slot_buffer(
+            caps,
+            &pbs.tmp_batch,
+            n,
+            hidden,
+            n_targets * hidden,
+            slot * hidden,
+        )
+        .map_err(|e| format!("dspark_capture typed scatter l{layer_idx}: {e:?}"))?;
+    } else {
+        let row_bytes = hidden * std::mem::size_of::<f32>();
+        for b in 0..n {
+            let dst_off = (b * n_targets + slot) * row_bytes;
+            let src_off = b * row_bytes;
+            gpu.memcpy_dtod_at_auto(
+                &caps.buf,
+                dst_off,
+                &pbs.tmp_batch.buf,
+                src_off,
+                row_bytes,
+            )
+            .map_err(|e| format!("dspark_capture scatter l{layer_idx} b{b}: {e:?}"))?;
+        }
+    }
     Ok(())
 }
 
