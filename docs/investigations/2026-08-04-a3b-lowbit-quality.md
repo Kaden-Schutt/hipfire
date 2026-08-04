@@ -232,10 +232,40 @@ tokens, dated 2026-06-14. Note it is a *small* reference: the 27B MASTER ref
 Phase-1/2 delta lands inside the noise, regenerate a larger a3b ref before
 concluding anything.
 
-Run `crates/hipfire-runtime/examples/eval_hipfire.rs` against
-`qwen3.6-35b-a3b.mq2` with that ref, plus mq4r/mq4p for reference points.
-**If MQ2-Lloyd KLD is already competitive, Phases 1–3 collapse into a labeling
-+ registry-description task.** Cheapest step, and it can close the project.
+### Phase 0 RESULT — 2026-08-04, k9lin / gfx1201
+
+```
+eval_hipfire --model qwen3.6-35b-a3b.mq2 --ref q36a3b-wt2-f32.kldref.bin \
+             --scoring-mode prefill --kv-mode q8
+→ slice-mean KLD = 0.238060   mean NLL = 1.827463   PPL = 6.2181
+  8160 tokens scored in 199.3s; HIPFIRE_LLOYD_GFX12=1 (auto-set on gfx12)
+```
+
+**The "coherent but degraded" label is accurate. Phase 0 does not close the
+project — it confirms the gap.** 0.238 is well outside the sub-0.10 bar this
+repo has used for shippable quality.
+
+Cross-model context (different arch, different model — indicative only): the
+27B measured 0.0931 at the same MQ2-Lloyd format. a3b is **~2.6× worse** at
+identical format and identical dense floor. That direction is plausible on
+first principles — A3B activates 3B of 35B with `moe_intermediate_size=512`,
+so each expert weight carries more of the signal and there is less redundancy
+for a 2-bit codebook to hide in than in a 27B dense-ish MLP. It also means the
+27B's numbers are an *optimistic* guide for what calibration can recover here.
+
+Caveats on this number, both of which matter for the *next* measurement rather
+than this one:
+- **gfx1201, not gfx1100.** Not strictly comparable to the 27B table above.
+- **Small ref** (8160 scored tokens). Adequate as a point estimate against a
+  bar that far away; **not** adequate to resolve a Phase-1/2/3 delta of a few
+  percent. Regenerate a larger a3b ref before measuring improvements.
+- No same-arch ladder reference: `mq3p`/`mq4r`/`mq4p` all exceed the 15.92 GiB
+  card and could not be run locally. Run the ladder on hipx/gfx1100 for one
+  internally consistent set.
+
+Target for `mq2r`: land meaningfully below 0.238 at ≤~12.5 GB. The 27B data
+says the levers are there — grading is worth ~5× and calibration ~42% on that
+model — but neither figure transfers numerically.
 
 ### Prior art — MQ2-Lloyd is already measured on the 27B sibling
 
