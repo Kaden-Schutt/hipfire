@@ -10118,18 +10118,38 @@ fn attention_block_batched_mixed(
                     .map(|s| s != "0")
                     .unwrap_or(true);
             if use_indexer_wmma {
-                gpu.indexer_relu_score_wmma_batched_f32(
-                    &pbs.idx_q_batch,
-                    kv_cache,
-                    &pbs.idx_w_batch,
-                    n_compressed_arr,
-                    &pbs.idx_scores_batch,
-                    h_idx as i32,
-                    d_idx as i32,
-                    max_compressed as i32,
-                    batch_size as i32,
-                )
-                .map_err(|e| format!("indexer_relu_score_wmma_batched l{layer_idx}: {e:?}"))?;
+                if gpu.arch.eq_ignore_ascii_case("gfx1151") {
+                    // All four WMMA warps consume the same 16x128 K tile.
+                    // Stage it once on gfx1151; the portable symbol retains
+                    // the established resource contract on every other arch.
+                    gpu.indexer_relu_score_wmma_batched_klds_gfx1151(
+                        &pbs.idx_q_batch,
+                        kv_cache,
+                        &pbs.idx_w_batch,
+                        n_compressed_arr,
+                        &pbs.idx_scores_batch,
+                        h_idx as i32,
+                        d_idx as i32,
+                        max_compressed as i32,
+                        batch_size as i32,
+                    )
+                    .map_err(|e| {
+                        format!("indexer_relu_score_wmma_batched_klds l{layer_idx}: {e:?}")
+                    })?;
+                } else {
+                    gpu.indexer_relu_score_wmma_batched_f32(
+                        &pbs.idx_q_batch,
+                        kv_cache,
+                        &pbs.idx_w_batch,
+                        n_compressed_arr,
+                        &pbs.idx_scores_batch,
+                        h_idx as i32,
+                        d_idx as i32,
+                        max_compressed as i32,
+                        batch_size as i32,
+                    )
+                    .map_err(|e| format!("indexer_relu_score_wmma_batched l{layer_idx}: {e:?}"))?;
+                }
             } else {
                 gpu.indexer_relu_score_batched_f32(
                     &pbs.idx_q_batch,
