@@ -455,16 +455,18 @@ mod config_cache {
     /// `HIPFIRE_DEEPSEEK4_GFX1151_INDEXER_TOPK_TWOSTAGE` — G1: the gfx1151
     /// twin of F3. gfx1151's legacy indexer top-K is the SAME O(N^2)
     /// rank-count on one workgroup that F2 removed from gfx942. The two-stage
-    /// route is now the MQ2R product default after exactness through the 1M
-    /// scale and the long-context model campaign; set `=0` only as an
-    /// emergency diagnostic fallback. This is a SEPARATE lever
+    /// route is now the DeepSeek4 gfx1151 product default after exactness
+    /// through the 1M scale and the long-context model campaign; set `=0`
+    /// only as an emergency diagnostic fallback. Indexer scores and ranks are
+    /// F32 state, so selection depends on the model architecture and device,
+    /// not whether dense weights are MQ2-Lloyd or the MQ2R E8 tier. This is a
+    /// SEPARATE lever
     /// from F3, not one shared `*_TWOSTAGE` flag: strict arch gating (no
     /// gfx942 lever ever bleeding into gfx1151 or vice versa) is enforced by
     /// the arch-gating unit tests, and the two arches promote independently.
-    pub(super) fn gfx1151_indexer_topk_two_stage_on(arch: &str, mq2r: bool) -> bool {
+    pub(super) fn gfx1151_indexer_topk_two_stage_on(arch: &str) -> bool {
         static V: OnceLock<bool> = OnceLock::new();
         arch == "gfx1151"
-            && mq2r
             && *V.get_or_init(|| {
                 hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_GFX1151_INDEXER_TOPK_TWOSTAGE")
                     .ok()
@@ -3137,9 +3139,8 @@ fn indexer_forward(
     let two_stage_topk = (config_cache::gfx942_indexer_topk_two_stage_on(
         &gpu.arch,
         weights.mq2r_backend.is_gfx942(),
-    ) || config_cache::gfx1151_indexer_topk_two_stage_on(
-        &gpu.arch, cfg.mq2r,
-    )) && two_stage_topk_capacity_eligible(&gpu.arch, max_compressed);
+    ) || config_cache::gfx1151_indexer_topk_two_stage_on(&gpu.arch))
+        && two_stage_topk_capacity_eligible(&gpu.arch, max_compressed);
 
     let wq_b = layer
         .indexer_wq_b
@@ -3328,7 +3329,7 @@ fn indexer_forward(
         )?;
     if !two_stage && !gfx942_parallel {
         gpu.indexer_top_k_buf(
-            weights.mq2r_backend.is_gfx1151(),
+            gpu.arch.eq_ignore_ascii_case("gfx1151"),
             scores,
             topk,
             &n_buf,
@@ -14267,8 +14268,9 @@ mod tests {
         assert!(!config_cache::hc_finalize_input_map_on(arch, true));
         assert!(!config_cache::qnorm_rotate_fused_on(arch, true));
         assert!(!config_cache::redline_ffn_split_on(arch, true));
-        // G1 is gfx1151's own certified two-stage route and defaults ON.
-        assert!(config_cache::gfx1151_indexer_topk_two_stage_on(arch, true));
+        // G1 is gfx1151's own certified two-stage route and defaults ON for
+        // every DeepSeek4 weight tier; indexer state is format-independent.
+        assert!(config_cache::gfx1151_indexer_topk_two_stage_on(arch));
         // gfx942 A2 levers must not bleed into gfx1151.
         assert!(!config_cache::gfx942_compressor_gate_on(arch, true));
         assert!(!config_cache::gfx942_indexer_topk_bounded_on(arch, true));
@@ -14415,23 +14417,13 @@ mod tests {
         // gfx1151 grouped flag stays gfx1151-only.
         assert!(!config_cache::e8_wo_grouped_on("gfx942", true));
         // G1 is the gfx1151 twin of F3 and must not bleed into gfx942 or any
-        // other arch; it also fails closed on non-mq2r and defaults ON only
-        // for the exact gfx1151 MQ2R route.
-        assert!(!config_cache::gfx1151_indexer_topk_two_stage_on(
-            "gfx942", true
-        ));
-        assert!(!config_cache::gfx1151_indexer_topk_two_stage_on(
-            "gfx1100", true
-        ));
-        assert!(!config_cache::gfx1151_indexer_topk_two_stage_on(
-            "gfx1201", true
-        ));
-        assert!(!config_cache::gfx1151_indexer_topk_two_stage_on(
-            "gfx1151", false
-        ));
-        assert!(config_cache::gfx1151_indexer_topk_two_stage_on(
-            "gfx1151", true
-        ));
+        // other arch. Unlike the gfx942 native backend, its inputs are
+        // format-independent DS4 F32 indexer state, so MQ2-Lloyd and MQ2R use
+        // the same exact-device route.
+        assert!(!config_cache::gfx1151_indexer_topk_two_stage_on("gfx942"));
+        assert!(!config_cache::gfx1151_indexer_topk_two_stage_on("gfx1100"));
+        assert!(!config_cache::gfx1151_indexer_topk_two_stage_on("gfx1201"));
+        assert!(config_cache::gfx1151_indexer_topk_two_stage_on("gfx1151"));
     }
 
     #[test]
