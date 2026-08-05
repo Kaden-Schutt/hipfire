@@ -29,10 +29,6 @@ fn main() {
         run_prefill_coop(&mut gpu);
         return;
     }
-    if std::env::var_os("HIPFIRE_E8_GROUPED_B4_ONLY").is_some() {
-        run_grouped_b4_screen(&mut gpu);
-        return;
-    }
 
     let shapes: Vec<(usize, usize, &str)> = vec![
         // --- A3B per-expert MoE shapes (the decode hot path; hidden=2048,
@@ -1215,89 +1211,6 @@ fn main() {
             }
         }
     }
-}
-
-fn run_grouped_b4_screen(gpu: &mut Gpu) {
-    let (groups, m, k) = (8usize, 1024usize, 4096usize);
-    let batch = std::env::var("HIPFIRE_E8_GROUPED_PREFILL_BATCH")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(1024usize);
-    let aos = synth_e8_aos(groups * m, k, 0x4752_4F55);
-    let soa = aos_to_soa_full(&aos, groups * m, k);
-    let replicas = 9usize;
-    let weights: Vec<_> = (0..replicas)
-        .map(|_| gpu.upload_raw(&soa, &[soa.len()]).unwrap())
-        .collect();
-    let x = gpu.alloc_tensor(&[batch * groups * k], DType::F32).unwrap();
-    let y_b2 = gpu.alloc_tensor(&[batch * groups * m], DType::F32).unwrap();
-    let y_b4 = gpu.alloc_tensor(&[batch * groups * m], DType::F32).unwrap();
-    let x_host = make_x(batch * groups * k, 0xB47C_4E8);
-    gpu.hip.memcpy_htod(&x.buf, bytes_of(&x_host)).unwrap();
-
-    gpu.gemm_mfp4g32_e8_soa_grouped_wmma_b2(&weights[0], &x, &y_b2, groups, m, k, batch)
-        .unwrap();
-    gpu.gemm_mfp4g32_e8_soa_grouped_wmma_b4(&weights[0], &x, &y_b4, groups, m, k, batch)
-        .unwrap();
-    gpu.hip.device_synchronize().unwrap();
-    let mut b2_host = vec![0.0f32; batch * groups * m];
-    let mut b4_host = vec![0.0f32; batch * groups * m];
-    gpu.hip
-        .memcpy_dtoh(bytes_of_mut(&mut b2_host), &y_b2.buf)
-        .unwrap();
-    gpu.hip
-        .memcpy_dtoh(bytes_of_mut(&mut b4_host), &y_b4.buf)
-        .unwrap();
-    let exact = b2_host
-        .iter()
-        .zip(&b4_host)
-        .filter(|(left, right)| left.to_bits() == right.to_bits())
-        .count();
-    assert_eq!(exact, b2_host.len(), "grouped E8 B4 changed output bits");
-
-    let time_arm = |gpu: &mut Gpu, b4: bool| {
-        let start = Instant::now();
-        for weight in &weights {
-            if b4 {
-                gpu.gemm_mfp4g32_e8_soa_grouped_wmma_b4(weight, &x, &y_b4, groups, m, k, batch)
-                    .unwrap();
-            } else {
-                gpu.gemm_mfp4g32_e8_soa_grouped_wmma_b2(weight, &x, &y_b2, groups, m, k, batch)
-                    .unwrap();
-            }
-        }
-        gpu.hip.device_synchronize().unwrap();
-        start.elapsed().as_secs_f64() * 1.0e6 / replicas as f64
-    };
-    for _ in 0..2 {
-        let _ = time_arm(gpu, false);
-        let _ = time_arm(gpu, true);
-    }
-    let mut b2_samples = Vec::new();
-    let mut b4_samples = Vec::new();
-    for _ in 0..4 {
-        b2_samples.push(time_arm(gpu, false));
-        b4_samples.push(time_arm(gpu, true));
-        b4_samples.push(time_arm(gpu, true));
-        b2_samples.push(time_arm(gpu, false));
-    }
-    b2_samples.sort_by(f64::total_cmp);
-    b4_samples.sort_by(f64::total_cmp);
-    let median = |v: &[f64]| (v[v.len() / 2 - 1] + v[v.len() / 2]) * 0.5;
-    let b2_us = median(&b2_samples);
-    let b4_us = median(&b4_samples);
-    eprintln!(
-        "GROUPED_B4_SCREEN B={batch} G={groups} M={m} K={k} replicas={replicas} working_set_mib={:.1}",
-        replicas as f64 * soa.len() as f64 / (1024.0 * 1024.0)
-    );
-    eprintln!("  B2 samples_us={b2_samples:?} median_us={b2_us:.3}");
-    eprintln!("  B4 samples_us={b4_samples:?} median_us={b4_us:.3}");
-    eprintln!(
-        "  speedup={:.4}x delta={:+.3}% raw_bit_exact={exact}/{}",
-        b2_us / b4_us,
-        (b2_us / b4_us - 1.0) * 100.0,
-        b2_host.len()
-    );
 }
 
 fn time_prefill_variant(
