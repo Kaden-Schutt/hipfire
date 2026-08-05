@@ -3904,6 +3904,75 @@ fn dequantize_mq2g256_lloyd_to_f32(
     out
 }
 
+/// MQ2-GL ("global Lloyd") round-trip: quantize → dequantize, returning weights
+/// in the ORIGINAL (unrotated) basis. Same pipeline as
+/// `quantize_mq2g256_lloyd` + `dequantize_mq2g256_lloyd_to_f32`, except the
+/// per-block 4-entry fitted codebook is replaced by ONE tensor-global codebook
+/// plus a per-block fp16 scale.
+///
+/// The codebook is the textbook Lloyd–Max optimum for a unit Gaussian. That is
+/// not an approximation of convenience: post-FWHT blocks are Gaussian by CLT,
+/// and fitting a global codebook on 28.3M real a3b expert weights reproduces
+/// these levels to three decimals (measured 2026-08-04, see
+/// docs/investigations/2026-08-04-a3b-lowbit-quality.md §5c).
+///
+/// Cost/benefit on those same real weights: +2.35% NRMSE for −0.1875 bpw
+/// (72 B/group → 64 B payload + 2 B scale).
+///
+/// Used by `--format mq4-mq2glexp`, the GL twin of `mq4-mq2lloydexp`: it injects
+/// the GL codec's noise and re-packs as HFQ4G256 so the file loads on today's
+/// runtime with no engine, loader, or kernel changes. Both probes land in the
+/// same HFQ4 container, so a KLD delta between them isolates the codec.
+fn mq2g256gl_roundtrip_f32(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<f32> {
+    /// Lloyd–Max levels for a unit Gaussian at 2 bit.
+    const CB: [f32; 4] = [-1.5104, -0.4528, 0.4528, 1.5104];
+    let group_size = 256;
+    let n = f32_data.len();
+    let mut out = vec![0.0f32; n];
+    use rayon::prelude::*;
+    out.par_chunks_mut(group_size)
+        .enumerate()
+        .for_each(|(b, out_chunk)| {
+            let start = b * group_size;
+            let end = (start + group_size).min(n);
+            let actual = end - start;
+
+            let mut group = [0.0f32; 256];
+            group[..actual].copy_from_slice(&f32_data[start..end]);
+            cpu_fwht_256(&mut group, signs1, signs2);
+
+            // Per-block scale, rounded through fp16 exactly as the on-disk
+            // format would store it.
+            let ss: f64 = group.iter().map(|v| (*v as f64) * (*v as f64)).sum();
+            let rms = (ss / 256.0).sqrt() as f32;
+            let scale = if rms > 0.0 {
+                f16_to_f32(f32_to_fp16_bits(rms))
+            } else {
+                0.0
+            };
+            let inv = if scale > 0.0 { 1.0 / scale } else { 0.0 };
+
+            for v in group.iter_mut() {
+                let z = *v * inv;
+                let mut best = 0usize;
+                let mut best_d = (z - CB[0]).abs();
+                for (k, &c) in CB.iter().enumerate().skip(1) {
+                    let d = (z - c).abs();
+                    if d < best_d {
+                        best_d = d;
+                        best = k;
+                    }
+                }
+                *v = scale * CB[best];
+            }
+
+            cpu_inv_fwht_256(&mut group, signs1, signs2);
+            let take = out_chunk.len();
+            out_chunk.copy_from_slice(&group[..take]);
+        });
+    out
+}
+
 /// Quantize F32 weights to HFQ3-G256: 3-bit with 256-weight groups.
 /// Block: [f32 scale][f32 zero][96B packed 3-bit] = 104 bytes per 256 weights (0.406 B/w).
 /// Packing: 8 weights × 3 bits = 24 bits = 3 bytes per thread-group.
@@ -6759,6 +6828,24 @@ fn main() {
     let use_mq4_mq2lloydexp = format == "mq4-mq2lloydexp"
         || format == "mq4-mq2lloydexperts"
         || format == "mq4-mq2lloyd-exp";
+    // GL twin of the probe above: identical pipeline, but routed experts go
+    // through the GLOBAL-codebook codec (one tensor-wide Lloyd–Max Gaussian
+    // codebook + per-block fp16 scale) instead of a per-block fitted codebook.
+    // Ships as HFQ4G256 exactly like `mq4-mq2lloydexp`, so both probes land in
+    // the same container and a KLD delta between them isolates the codec —
+    // no engine, loader, or kernel changes on either arm.
+    let use_mq4_mq2glexp =
+        format == "mq4-mq2glexp" || format == "mq4-mq2glexperts" || format == "mq4-mq2gl-exp";
+    if use_mq4_mq2glexp {
+        eprintln!(
+            "note: --format mq4-mq2glexp is a quality probe — routed MoE experts\n\
+             go through the GLOBAL-codebook 2-bit codec (one tensor-wide\n\
+             Lloyd–Max Gaussian codebook + per-block fp16 scale) round-trip\n\
+             (quantize → dequantize) and ship as HFQ4G256. Identical container\n\
+             to --format mq4-mq2lloydexp, so a KLD delta between the two\n\
+             isolates the codec. No engine/loader/kernel changes on either arm."
+        );
+    }
     if use_mq4_mq2lloydexp {
         eprintln!(
             "note: --format mq4-mq2lloydexp is a quality probe — routed MoE\n\
@@ -7174,6 +7261,7 @@ fn main() {
             == Some("1");
     if (use_mq2g256_lloyd
         || use_mq4_mq2lloydexp
+        || use_mq4_mq2glexp
         || use_mq4_mq2lloyd_native
         || use_mq4_mq2lloyd_kmap
         || use_mq4_mq2lloyd_imatrix
@@ -9017,6 +9105,8 @@ fn main() {
             // noise specifically on the routed-expert tensors, so even
             // K-map "Promote6" experts get the MQ2-Lloyd round-trip here.
             let expert_mq2lloyd_roundtrip = use_mq4_mq2lloydexp && supports_g256;
+            // GL twin — same "always hits routed experts" intent as above.
+            let expert_mq2gl_roundtrip = use_mq4_mq2glexp && supports_g256;
             // Native MQ2-Lloyd: ship qt=19 bytes directly, no round-trip.
             // Requires runtime support for DType::MQ2G256Lloyd on experts.
             // For -native (no kmap respect): always MQ2-Lloyd on every expert.
@@ -9424,6 +9514,15 @@ fn main() {
                         );
                         let q = quantize_hfq4g256(&dequant);
                         (q, QuantType::HFQ4G256, 256u32)
+                    } else if expert_mq2gl_roundtrip {
+                        // MQ2-GL → F32 → HFQ4 round-trip. Identical to the arm
+                        // above except the 2-bit step uses ONE tensor-global
+                        // codebook + per-block fp16 scale rather than a
+                        // per-block fitted codebook. Same HFQ4G256 output, so
+                        // the two arms differ ONLY in the injected codec noise.
+                        let dequant = mq2g256gl_roundtrip_f32(&f32_slice, &signs1, &signs2);
+                        let q = quantize_hfq4g256(&dequant);
+                        (q, QuantType::HFQ4G256, 256u32)
                     } else if expert_mq5 || down_mq5 {
                         let q = quantize_mq5g256(&f32_slice, &signs1, &signs2);
                         (q, QuantType::MQ5G256, 256u32)
@@ -9803,6 +9902,7 @@ fn main() {
                     if (use_mq4g256
                         || use_mq4_mq6exp
                         || use_mq4_mq2lloydexp
+                        || use_mq4_mq2glexp
                         || use_mq4_mq2lloyd_native
                         || use_mq4_mq2lloyd_kmap
                         || use_mq4_mq2lloyd_imatrix
@@ -10140,6 +10240,7 @@ fn main() {
                     } else if (use_mq4g256
                         || use_mq4_mq6exp
                         || use_mq4_mq2lloydexp
+                        || use_mq4_mq2glexp
                         || use_mq4_mq2lloyd_native
                         || use_mq4_mq2lloyd_kmap
                         || use_mq4_mq2lloyd_imatrix
@@ -10155,6 +10256,7 @@ fn main() {
                     } else if use_mq4g256
                         || use_mq4_mq6exp
                         || use_mq4_mq2lloydexp
+                        || use_mq4_mq2glexp
                         || use_mq4_mq2lloyd_native
                         || use_mq4_mq2lloyd_kmap
                         || use_mq4_mq2lloyd_imatrix
