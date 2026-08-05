@@ -193,7 +193,10 @@
       "file": "deepseek-v4-flash.mq2lloyd",
       "size_gb": 82,
       "min_vram_gb": 96,
-      "sampling": { "temperature": 1.0, "top_p": 1.0 },
+      "sampling": {
+        "temperature": 1.0,
+        "top_p": 1.0
+      },
       "mtp": {
         "file": "deepseek-v4-flash-mtp.mq2lloyd"
       },
@@ -246,7 +249,10 @@
         "sha256": "fedf663e1bd2c6b8b62bc4819d54398c68e137e248863ad494e66111eb294c64",
         "size_bytes": 5996334814
       },
-      "desc": "Official DeepSeek V4 Flash 0731 MQ2-Lloyd package (arch_id=9). Parent-faithful profiles use low effort with temp=1/top_p=1 by default, max effort with temp=1/top_p=0.95 for agentic coding, and no hidden thinking cap. Includes the checkpoint-aligned DSpark sidecar."
+      "expert_adapter": {
+        "file": "deepseek-v4-flash-0731-adapter-r128.bin"
+      },
+      "desc": "Official DeepSeek V4 Flash 0731 MQ2-Lloyd package (arch_id=9). Parent-faithful profiles use low effort with temp=1/top_p=1 by default, max effort with temp=1/top_p=0.95 for agentic coding, and no hidden thinking cap. Includes the checkpoint-aligned DSpark sidecar. Routed experts may be paged when resident weights do not fit; the expert_adapter sidecar is experimental and remains off by default because its measured prefetch route regressed throughput."
     },
     "deepseek-v4-flash:mq2r": {
       "repo": "hipfire-models/hipfire-deepseek-v4-flash-0731",
@@ -309,7 +315,10 @@
       "file": "north-mini-code.mq4.hfq",
       "size_gb": 16,
       "min_vram_gb": 24,
-      "sampling": { "temperature": 1.0, "top_p": 0.95 },
+      "sampling": {
+        "temperature": 1.0,
+        "top_p": 0.95
+      },
       "desc": "CohereLabs North-Mini-Code-1.0 (Cohere2-MoE, arch_id=12). MQ4 4-bit. Agentic code model: parallel block, sigmoid 128-expert MoE; <|START_THINKING|>/<|START_TEXT|>/<|START_ACTION|> tool-call format. ~880 tok/s prefill, ~37 tok/s decode on gfx1151."
     },
     "qwen3.6:35b-a3b": {
