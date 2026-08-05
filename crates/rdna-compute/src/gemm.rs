@@ -13581,6 +13581,113 @@ impl Gpu {
         result
     }
 
+    fn gemm_mfp4g32_e8_soa_wmma_wide(
+        &mut self,
+        weight: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+        batch_tiles: usize,
+        kernel: &'static str,
+        source: &'static str,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        debug_assert!(
+            self.arch_caps.is_gfx1151(),
+            "dense E8-SoA wide WMMA is gfx1151-only"
+        );
+        assert!(k % 256 == 0, "dense E8-SoA wide WMMA requires K%256==0");
+        self.ensure_kernel(kernel, source, kernel)?;
+        let x_f16 = self.ensure_fp16_x(x, batch_size * k)?;
+        let ap = weight.buf.as_ptr();
+        let xp = x_f16;
+        let yp = y.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let b_val = batch_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &ap as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+            &b_val as *const _ as *mut c_void,
+        ];
+        let row_tiles = m.div_ceil(16) as u32;
+        let batch_tiles = batch_size.div_ceil(16 * batch_tiles) as u32;
+        let bytes = weight.byte_size() + batch_size * (k * 2 + m * 4);
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel, bytes);
+        let result = self.launch_maybe_blob(
+            kernel,
+            [row_tiles, batch_tiles, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut blob = hip_bridge::KernargBlob::new();
+                blob.push_ptr(ap);
+                blob.push_ptr(xp);
+                blob.push_ptr(yp);
+                blob.push_i32(m_val);
+                blob.push_i32(k_val);
+                blob.push_i32(b_val);
+                blob
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// One-wave eight-query-tile E8-SoA WMMA candidate for gfx1151 prefill.
+    pub fn gemm_mfp4g32_e8_soa_wmma_b8(
+        &mut self,
+        weight: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.gemm_mfp4g32_e8_soa_wmma_wide(
+            weight,
+            x,
+            y,
+            m,
+            k,
+            batch_size,
+            8,
+            "gemm_mfp4g32_e8_soa_wmma_b8_gfx1151",
+            kernels::GEMM_MFP4G32_E8_SOA_WMMA_B8_GFX1151_SRC,
+        )
+    }
+
+    /// One-wave sixteen-query-tile E8-SoA WMMA candidate for gfx1151 prefill.
+    pub fn gemm_mfp4g32_e8_soa_wmma_b16(
+        &mut self,
+        weight: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.gemm_mfp4g32_e8_soa_wmma_wide(
+            weight,
+            x,
+            y,
+            m,
+            k,
+            batch_size,
+            16,
+            "gemm_mfp4g32_e8_soa_wmma_b16_gfx1151",
+            kernels::GEMM_MFP4G32_E8_SOA_WMMA_B16_GFX1151_SRC,
+        )
+    }
+
     /// Grouped block-diagonal E8-SoA WMMA GEMM for gfx1151 prefill.
     ///
     /// A is `[groups, m, k]`, X is `[batch, groups, k]`, and Y is

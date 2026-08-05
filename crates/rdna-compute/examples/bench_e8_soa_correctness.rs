@@ -1189,9 +1189,12 @@ fn time_prefill_variant(
             4 => gpu
                 .gemm_mfp4g32_e8_soa_wmma_coop4(weights, x, y, m, k, batch)
                 .expect("cooperative-4 E8 prefill"),
+            8 => gpu
+                .gemm_mfp4g32_e8_soa_wmma_b8(weights, x, y, m, k, batch)
+                .expect("B8 E8 prefill"),
             16 => gpu
-                .gemm_mfp4g32_e8_soa_wmma_coop16(weights, x, y, m, k, batch)
-                .expect("cooperative-16 E8 prefill"),
+                .gemm_mfp4g32_e8_soa_wmma_b16(weights, x, y, m, k, batch)
+                .expect("B16 E8 prefill"),
             _ => unreachable!("unknown E8 prefill variant"),
         }
     }
@@ -1215,8 +1218,8 @@ fn run_prefill_coop(gpu: &mut Gpu) {
     ];
     eprintln!("=== gfx1151 cooperative E8 prefill B={BATCH} ===");
     eprintln!(
-        "  {:<16} {:>11} {:>11} {:>11} {:>9} {:>9} {:>14}",
-        "shape", "B4 us", "coop4 us", "coop16 us", "v4", "v16/v4", "exact outputs"
+        "  {:<16} {:>11} {:>11} {:>11} {:>11} {:>9} {:>9} {:>14}",
+        "shape", "B4 us", "coop4 us", "B8 us", "B16 us", "B8/v4", "B16/v4", "exact outputs"
     );
 
     for (slot, (m, k, label)) in shapes.into_iter().enumerate() {
@@ -1230,9 +1233,12 @@ fn run_prefill_coop(gpu: &mut Gpu) {
         let y_coop = gpu
             .alloc_tensor(&[BATCH * m], DType::F32)
             .expect("alloc cooperative y");
-        let y_coop16 = gpu
+        let y_b8 = gpu
             .alloc_tensor(&[BATCH * m], DType::F32)
-            .expect("alloc cooperative-16 y");
+            .expect("alloc B8 y");
+        let y_b16 = gpu
+            .alloc_tensor(&[BATCH * m], DType::F32)
+            .expect("alloc B16 y");
         let x_host = make_x(BATCH * k, 0xE800_C001 ^ slot as u64);
         gpu.hip
             .memcpy_htod(&x.buf, bytes_of(&x_host))
@@ -1245,13 +1251,16 @@ fn run_prefill_coop(gpu: &mut Gpu) {
                 .expect("warm baseline");
             gpu.gemm_mfp4g32_e8_soa_wmma_coop4(&weights, &x, &y_coop, m, k, BATCH)
                 .expect("warm cooperative");
-            gpu.gemm_mfp4g32_e8_soa_wmma_coop16(&weights, &x, &y_coop16, m, k, BATCH)
-                .expect("warm cooperative-16");
+            gpu.gemm_mfp4g32_e8_soa_wmma_b8(&weights, &x, &y_b8, m, k, BATCH)
+                .expect("warm B8");
+            gpu.gemm_mfp4g32_e8_soa_wmma_b16(&weights, &x, &y_b16, m, k, BATCH)
+                .expect("warm B16");
         }
         gpu.hip.device_synchronize().expect("warm synchronize");
 
         let mut reference = vec![0.0f32; BATCH * m];
         let mut candidate = vec![0.0f32; BATCH * m];
+        let mut candidate8 = vec![0.0f32; BATCH * m];
         let mut candidate16 = vec![0.0f32; BATCH * m];
         gpu.hip
             .memcpy_dtoh(bytes_of_mut(&mut reference), &y_ref.buf)
@@ -1260,8 +1269,11 @@ fn run_prefill_coop(gpu: &mut Gpu) {
             .memcpy_dtoh(bytes_of_mut(&mut candidate), &y_coop.buf)
             .expect("download cooperative");
         gpu.hip
-            .memcpy_dtoh(bytes_of_mut(&mut candidate16), &y_coop16.buf)
-            .expect("download cooperative-16");
+            .memcpy_dtoh(bytes_of_mut(&mut candidate8), &y_b8.buf)
+            .expect("download B8");
+        gpu.hip
+            .memcpy_dtoh(bytes_of_mut(&mut candidate16), &y_b16.buf)
+            .expect("download B16");
         let exact = reference
             .iter()
             .zip(&candidate)
@@ -1272,6 +1284,16 @@ fn run_prefill_coop(gpu: &mut Gpu) {
             reference.len(),
             "cooperative E8 mismatch for {label} M={m} K={k}"
         );
+        let exact8 = reference
+            .iter()
+            .zip(&candidate8)
+            .filter(|(a, b)| a.to_bits() == b.to_bits())
+            .count();
+        assert_eq!(
+            exact8,
+            reference.len(),
+            "B8 E8 mismatch for {label} M={m} K={k}"
+        );
         let exact16 = reference
             .iter()
             .zip(&candidate16)
@@ -1280,25 +1302,28 @@ fn run_prefill_coop(gpu: &mut Gpu) {
         assert_eq!(
             exact16,
             reference.len(),
-            "cooperative-16 E8 mismatch for {label} M={m} K={k}"
+            "B16 E8 mismatch for {label} M={m} K={k}"
         );
 
         // ABBA timing order. Averaging the two observations per arm removes
         // the monotonic order bias without mixing kernels inside one timer.
         let a0 = time_prefill_variant(gpu, 0, &weights, &x, &y_ref, m, k, BATCH, TRIALS);
         let b0 = time_prefill_variant(gpu, 4, &weights, &x, &y_coop, m, k, BATCH, TRIALS);
-        let c0 = time_prefill_variant(gpu, 16, &weights, &x, &y_coop16, m, k, BATCH, TRIALS);
-        let c1 = time_prefill_variant(gpu, 16, &weights, &x, &y_coop16, m, k, BATCH, TRIALS);
+        let c0 = time_prefill_variant(gpu, 8, &weights, &x, &y_b8, m, k, BATCH, TRIALS);
+        let d0 = time_prefill_variant(gpu, 16, &weights, &x, &y_b16, m, k, BATCH, TRIALS);
+        let d1 = time_prefill_variant(gpu, 16, &weights, &x, &y_b16, m, k, BATCH, TRIALS);
+        let c1 = time_prefill_variant(gpu, 8, &weights, &x, &y_b8, m, k, BATCH, TRIALS);
         let b1 = time_prefill_variant(gpu, 4, &weights, &x, &y_coop, m, k, BATCH, TRIALS);
         let a1 = time_prefill_variant(gpu, 0, &weights, &x, &y_ref, m, k, BATCH, TRIALS);
         let baseline_us = 0.5 * (a0 + a1);
         let cooperative_us = 0.5 * (b0 + b1);
-        let cooperative16_us = 0.5 * (c0 + c1);
+        let b8_us = 0.5 * (c0 + c1);
+        let b16_us = 0.5 * (d0 + d1);
         eprintln!(
-            "  {label:<16} {baseline_us:>11.1} {cooperative_us:>11.1} {cooperative16_us:>11.1} {:>8.3}x {:>8.3}x {:>14}",
-            baseline_us / cooperative_us,
-            cooperative_us / cooperative16_us,
-            exact.min(exact16),
+            "  {label:<16} {baseline_us:>11.1} {cooperative_us:>11.1} {b8_us:>11.1} {b16_us:>11.1} {:>8.3}x {:>8.3}x {:>14}",
+            cooperative_us / b8_us,
+            cooperative_us / b16_us,
+            exact.min(exact8).min(exact16),
         );
     }
 }
