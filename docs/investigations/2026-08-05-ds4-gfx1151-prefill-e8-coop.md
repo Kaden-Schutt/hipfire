@@ -120,7 +120,51 @@ the `B=1024` batched prefill dispatcher and is unreachable from the retained
 decode tape. Correctness for the changed path is established by raw-bit kernel
 parity and byte-identical user-facing outputs at both long-context depths.
 
-The next experiment is a separate `coop16`/v16 symbol, analogous in reuse
-intent to Qwen's query16 work: share one decoded weight slab across all sixteen
-waves of a 1,024-row chunk. It must beat this preserved coop4 binary across the
-full shape distribution and pass Radiowave before any route change.
+## Follow-up: query-width reuse
+
+The first interpretation of `coop16` put sixteen waves in one 512-thread
+workgroup. That was the wrong analogue to Qwen's query16 kernel: Qwen uses one
+wave to retain sixteen query rows. The 512-thread candidate was raw-bit exact
+over 45,088,768 outputs and introduced no spills, but was 1.22x to 5.33x
+slower than cooperative-4. It is rejected at commit
+`58b90e699dcd231940b2290362f324943c3e4f2c` and was never routed.
+
+The faithful analogue retains eight or sixteen 16-token WMMA accumulators in
+one wave. It has no LDS and no cross-wave barrier. The full five-shape screen
+at B=1024 was raw-bit exact:
+
+| Shape | Cooperative-4 | B8 | B16 | Selected |
+|---|---:|---:|---:|---|
+| 1024x4096 | 1747.3 us | 1619.9 us | **1440.2 us** | B16 |
+| 32768x1024 | 5591.7 us | 5521.6 us | 6199.8 us | cooperative-4 |
+| 4096x8192 | 7400.4 us | **6408.1 us** | 6328.7 us | B8 |
+| 2048x4096 | 1798.9 us | 2585.1 us | 2813.6 us | cooperative-4 |
+| 4096x2048 | 1171.9 us | 1675.6 us | 1817.2 us | cooperative-4 |
+
+B16 is 21.3% faster than cooperative-4 on 1024x4096. B8 is 15.5% faster on
+4096x8192 and is within 1.3% of B16 there while using 125 rather than 213
+VGPRs. The product selector therefore routes B16 only for 1024x4096, B8 only
+for 4096x8192, and leaves every other shape on its prior route. Both generated
+code objects are `vmem_only`, use zero LDS, private scratch, or register
+spills, and are exact-gfx1151/B1024-only.
+
+The native 2K product fixture used three fresh candidate processes against the
+preserved three-process cooperative-4 baseline:
+
+| Route | Samples | Median |
+|---|---|---:|
+| cooperative-4 | 233.30 / 233.60 / 233.50 tok/s | 233.50 tok/s |
+| B16/B8 bundle | 236.80 / 236.30 / 236.40 tok/s | **236.40 tok/s** |
+
+The median gain is **+1.242%**, and all three candidate samples exceed all
+three baseline samples. Candidate spread is 0.212%. Decode remains outside
+the changed route; its emitted one-token control was not used as a prefill
+claim. This shape bundle is promoted at
+`96be792329f8909541ebbbe0829014a7bc4404f8`.
+
+Follow-up evidence is under:
+
+`/home/kaden/ds4-gfx1151-evidence/2026-08-05-ds4-prefill-e8-wide/`
+
+It contains the raw micro log, all three product logs, both Radiowave reports
+and HSACOs, and the exact candidate CLI/daemon binaries.
