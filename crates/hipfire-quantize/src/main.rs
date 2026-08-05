@@ -3973,6 +3973,130 @@ fn mq2g256gl_roundtrip_f32(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> 
     out
 }
 
+/// Lloyd–Max optimal reconstruction levels for a unit Gaussian.
+/// 2-bit MSE = 0.1175, 3-bit MSE = 0.03454 — both reproduced to 3 decimals by
+/// fitting on 28.3M real a3b post-FWHT expert weights (2026-08-04).
+pub(crate) const GL_CB2: [f32; 4] = [-1.5104, -0.4528, 0.4528, 1.5104];
+pub(crate) const GL_CB3: [f32; 8] =
+    [-2.1520, -1.3439, -0.7560, -0.2451, 0.2451, 0.7560, 1.3439, 2.1520];
+
+/// Encode one FWHT-rotated 256-block against a global codebook.
+/// Returns the fp16-rounded per-block scale and writes indices into `idx`.
+#[inline]
+fn gl_encode_block(group: &[f32; 256], cb: &[f32], idx: &mut [u8; 256]) -> u16 {
+    let ss: f64 = group.iter().map(|v| (*v as f64) * (*v as f64)).sum();
+    let rms = (ss / 256.0).sqrt() as f32;
+    let sbits = f32_to_fp16_bits(rms);
+    let scale = f16_to_f32(sbits);
+    let inv = if scale > 0.0 { 1.0 / scale } else { 0.0 };
+    for (i, v) in group.iter().enumerate() {
+        let z = *v * inv;
+        let mut best = 0usize;
+        let mut best_d = (z - cb[0]).abs();
+        for (k, &c) in cb.iter().enumerate().skip(1) {
+            let d = (z - c).abs();
+            if d < best_d {
+                best_d = d;
+                best = k;
+            }
+        }
+        idx[i] = best as u8;
+    }
+    sbits
+}
+
+/// MQ2-G256-GL: 2-bit codes vs one tensor-global codebook + per-block fp16
+/// scale, structure-of-arrays. 2.0625 bpw.
+///
+/// Layout: `[m*gpr*64 B packed indices][m*gpr*2 B fp16 scales]`, both regions
+/// row-major in (row, group). Index packing matches MQ2-Lloyd (4 codes/byte,
+/// little-endian) so the GEMV decode path is unchanged apart from where the
+/// codebook comes from. `k` must be a multiple of 256.
+pub(crate) fn quantize_mq2g256gl(
+    f32_data: &[f32],
+    m: usize,
+    k: usize,
+    signs1: &[f32],
+    signs2: &[f32],
+) -> Vec<u8> {
+    assert_eq!(k % 256, 0, "MQ2GL: K must be a multiple of 256 (got {k})");
+    let gpr = k / 256;
+    let idx_bytes = m * gpr * 64;
+    let mut out = vec![0u8; idx_bytes + m * gpr * 2];
+    let (idx_region, scale_region) = out.split_at_mut(idx_bytes);
+    use rayon::prelude::*;
+    idx_region
+        .par_chunks_mut(gpr * 64)
+        .zip(scale_region.par_chunks_mut(gpr * 2))
+        .enumerate()
+        .for_each(|(row, (row_idx, row_scale))| {
+            for g in 0..gpr {
+                let start = row * k + g * 256;
+                let mut group = [0.0f32; 256];
+                group.copy_from_slice(&f32_data[start..start + 256]);
+                cpu_fwht_256(&mut group, signs1, signs2);
+                let mut codes = [0u8; 256];
+                let sbits = gl_encode_block(&group, &GL_CB2, &mut codes);
+                let base = g * 64;
+                for b in 0..64 {
+                    row_idx[base + b] = codes[4 * b]
+                        | (codes[4 * b + 1] << 2)
+                        | (codes[4 * b + 2] << 4)
+                        | (codes[4 * b + 3] << 6);
+                }
+                row_scale[g * 2] = (sbits & 0xFF) as u8;
+                row_scale[g * 2 + 1] = (sbits >> 8) as u8;
+            }
+        });
+    out
+}
+
+/// MQ3-G256-GL: 3-bit sibling of `quantize_mq2g256gl`. 3.0625 bpw.
+/// 96 B of indices per group — 8 codes packed into every 3 bytes,
+/// little-endian bitstream (same convention as HFQ3-G256).
+pub(crate) fn quantize_mq3g256gl(
+    f32_data: &[f32],
+    m: usize,
+    k: usize,
+    signs1: &[f32],
+    signs2: &[f32],
+) -> Vec<u8> {
+    assert_eq!(k % 256, 0, "MQ3GL: K must be a multiple of 256 (got {k})");
+    let gpr = k / 256;
+    let idx_bytes = m * gpr * 96;
+    let mut out = vec![0u8; idx_bytes + m * gpr * 2];
+    let (idx_region, scale_region) = out.split_at_mut(idx_bytes);
+    use rayon::prelude::*;
+    idx_region
+        .par_chunks_mut(gpr * 96)
+        .zip(scale_region.par_chunks_mut(gpr * 2))
+        .enumerate()
+        .for_each(|(row, (row_idx, row_scale))| {
+            for g in 0..gpr {
+                let start = row * k + g * 256;
+                let mut group = [0.0f32; 256];
+                group.copy_from_slice(&f32_data[start..start + 256]);
+                cpu_fwht_256(&mut group, signs1, signs2);
+                let mut codes = [0u8; 256];
+                let sbits = gl_encode_block(&group, &GL_CB3, &mut codes);
+                let base = g * 96;
+                // 8 codes × 3 bits = 24 bits = 3 bytes.
+                for c in 0..32 {
+                    let mut acc: u32 = 0;
+                    for j in 0..8 {
+                        acc |= ((codes[8 * c + j] & 0x7) as u32) << (3 * j);
+                    }
+                    row_idx[base + 3 * c] = (acc & 0xFF) as u8;
+                    row_idx[base + 3 * c + 1] = ((acc >> 8) & 0xFF) as u8;
+                    row_idx[base + 3 * c + 2] = ((acc >> 16) & 0xFF) as u8;
+                }
+                row_scale[g * 2] = (sbits & 0xFF) as u8;
+                row_scale[g * 2 + 1] = (sbits >> 8) as u8;
+            }
+        });
+    out
+}
+
 /// Quantize F32 weights to HFQ3-G256: 3-bit with 256-weight groups.
 /// Block: [f32 scale][f32 zero][96B packed 3-bit] = 104 bytes per 256 weights (0.406 B/w).
 /// Packing: 8 weights × 3 bits = 24 bits = 3 bytes per thread-group.
@@ -4364,6 +4488,22 @@ pub(crate) enum QuantType {
     MFP4G32E8 = 34, // mfp4-E8: mfp4+P container (E4M3 block scale, NO prefix, same row_bytes)
     // with the 32 E2M1 nibbles replaced by 4x32-bit E8-lattice codewords
     // (8 weights/codeword, QUANT_STEP=0.88). 4.25 bpw, FWHT rotation.
+    // MQ*-GL ("global Lloyd"): N-bit codes against ONE tensor-global codebook
+    // plus a per-block fp16 scale, in structure-of-arrays layout:
+    //     [0 .. M*gpr*P)                  packed N-bit indices, P B/group
+    //     [M*gpr*P .. +M*gpr*2)           fp16 per-block scales
+    // vs the per-block Lloyd formats (qt 19/20), which interleave a fitted
+    // 2^N-entry fp16 codebook into every group.
+    //
+    // Rationale (measured 2026-08-04, docs/investigations/2026-08-04-a3b-lowbit-quality.md):
+    // post-FWHT blocks are Gaussian by CLT, so the optimal LEVEL SHAPE is the
+    // same in every block — a per-block fit re-derives it ~4000x per tensor and
+    // differs only by scale. Fitting a global codebook on 28.3M real a3b expert
+    // weights reproduces the textbook Lloyd-Max Gaussian levels to 3 decimals.
+    // Cost on real weights: +2.35% NRMSE / +1.16% end-to-end KLD, for -0.1875 bpw
+    // (MQ2) — and the group base becomes naturally aligned (64 B vs 72 B stride).
+    MQ2G256GL = 38, // 2-bit + global codebook: 64 B idx/group + 2 B scale = 2.0625 bpw
+    MQ3G256GL = 39, // 3-bit + global codebook: 96 B idx/group + 2 B scale = 3.0625 bpw
     MFP4G32E8SOA = 35, // mfp4-E8 SoA: same E8 data as qt=34 but in structure-of-arrays layout.
     // [16B hdr] + [n_blocks B E4M3 scales, pad 16B] + [n_blocks*16B codewords].
     MFP3G32E8 = 36, // mfp3-E8: MFP4G32E8 frame, 3-bit lattice (center 3), 13 B/blk, 3.25 bpw.
