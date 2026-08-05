@@ -750,7 +750,7 @@ fn print_run(report: &RunReport) {
         .map(|value| format!("{value:10.1}"))
         .unwrap_or_else(|| "         -".to_string());
     println!(
-        "{:<12} {:>5} {:>4} {:>11.1} {:>9.3} {:>9.3} {:>10.1} {:>10.1} {}",
+        "{:<12} {:>5} {:>4} {:>11.1} {:>9.3} {:>9.3} {:>10.1} {:>10} {}",
         report.strategy.label(),
         report.lanes,
         report.repetition,
