@@ -1325,6 +1325,24 @@ fn e8_prefill_coop4_applies(arch: &str, m: usize, k: usize, batch_size: usize) -
         )
 }
 
+/// Select the one-wave wide-query E8 kernel only for shapes that beat the
+/// promoted cooperative-4 route at the exact 1,024-row production chunk.
+///
+/// B16 pays on the small attention bottleneck despite its high VGPR count;
+/// B8 is within 1.3% of B16 on wo_b while using substantially fewer VGPRs.
+/// Every other shape retains cooperative-4 or the established B4 fallback.
+#[inline]
+fn e8_prefill_wide_tiles(arch: &str, m: usize, k: usize, batch_size: usize) -> usize {
+    if arch != "gfx1151" || batch_size != 1024 {
+        return 0;
+    }
+    match (m, k) {
+        (1024, 4096) => 16,
+        (4096, 8192) => 8,
+        _ => 0,
+    }
+}
+
 /// F16×F16→F32 batched GEMM, arch-routed.
 ///
 /// `gemm_f16_x_f16_wmma` is built on the wave32 RDNA3 WMMA builtin and will
@@ -1363,10 +1381,17 @@ fn gemv_auto_batched_wmma(
     let e8_b2 = config_cache::e8_prefill_b2_on(&gpu.arch, mq2r_backend.is_gfx1151());
     let e8_b4 = config_cache::e8_prefill_b4_on(&gpu.arch, mq2r_backend.is_gfx1151());
     let e8_tiles = e8_prefill_batch_tiles(batch_size, e8_b2, e8_b4);
+    let e8_wide_tiles = e8_prefill_wide_tiles(&gpu.arch, m, k, batch_size);
     match weight.dtype {
         DType::MFP4G32E8SOA if e8_batched_gemv_applies(&gpu.arch, batch_size, k) => gpu
             .gemv_mfp4g32_e8_soa_batched_gfx1151(weight, x_rotated_batch, y, batch_size, m, k)
             .map_err(|e| format!("gemv MFP4-E8-SoA batched B{batch_size}: {e:?}")),
+        DType::MFP4G32E8SOA if e8_tiles == 4 && e8_wide_tiles == 16 => gpu
+            .gemm_mfp4g32_e8_soa_wmma_b16(weight, x_rotated_batch, y, m, k, batch_size)
+            .map_err(|e| format!("gemm MFP4-E8-SoA WMMA B16: {e:?}")),
+        DType::MFP4G32E8SOA if e8_tiles == 4 && e8_wide_tiles == 8 => gpu
+            .gemm_mfp4g32_e8_soa_wmma_b8(weight, x_rotated_batch, y, m, k, batch_size)
+            .map_err(|e| format!("gemm MFP4-E8-SoA WMMA B8: {e:?}")),
         DType::MFP4G32E8SOA
             if e8_tiles == 4 && e8_prefill_coop4_applies(&gpu.arch, m, k, batch_size) =>
         {
