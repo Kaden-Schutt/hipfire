@@ -721,6 +721,35 @@ pub fn run_moe_decode(
                 gate_up_k,
                 p.k,
             ))?;
+        } else if p.dtypes.routed_gate_up == DType::MQ2G256GL {
+            // Uniform MQ2-GL routed gate_up: 2-bit indices against the
+            // TENSOR-GLOBAL codebook (GL_CB2, passed as scalar kernel args) plus
+            // a per-block fp16 scale, SoA. Same call shape as the MQ2-Lloyd arm
+            // above — y_gate/y_up separate, m = 2*p.mi (kernel splits at M/2),
+            // X is the FWHT-rotated xr.
+            hip!(gpu.gemv_mq2g256gl_moe_gate_up_indexed(
+                p.expert_gate_up_ptrs,
+                p.topk_indices,
+                xr,
+                p.gate_batch,
+                p.up_batch,
+                2 * p.mi,
+                gate_up_k,
+                p.k,
+            ))?;
+        } else if p.dtypes.routed_gate_up == DType::MQ3G256GL {
+            // Uniform MQ3-GL routed gate_up: same path, 8-entry global codebook
+            // (GL_CB3) and 96 B of indices per group.
+            hip!(gpu.gemv_mq3g256gl_moe_gate_up_indexed(
+                p.expert_gate_up_ptrs,
+                p.topk_indices,
+                xr,
+                p.gate_batch,
+                p.up_batch,
+                2 * p.mi,
+                gate_up_k,
+                p.k,
+            ))?;
         } else if p.dtypes.routed_gate_up == DType::MQ5G256 {
             hip!(gpu.gemv_hfq5g256_moe_gate_up_k8_indexed(
                 p.expert_gate_up_ptrs,
@@ -880,6 +909,35 @@ pub fn run_moe_decode(
                     p.k,
                 )
             )?;
+        } else if p.dtypes.routed_down == DType::MQ2G256GL {
+            // MQ2-GL down: atomic, weighted, SELF-COMBINING residual GEMV —
+            // same epilogue contract as the MQ2/MQ3-Lloyd down kernels (one
+            // launch does down -> * topk_weight[krank] -> atomicAdd into
+            // out_target). NO separate combine; `routed_down_self_combines`
+            // below MUST include this dtype or every MoE layer double-counts.
+            hip!(gpu.gemv_mq2g256gl_moe_down_residual_scaled_indexed(
+                p.expert_down_ptrs,
+                p.topk_indices,
+                p.topk_weights,
+                p.rot_batch,
+                out_target,
+                down_m,
+                down_k,
+                p.k,
+            ))?;
+        } else if p.dtypes.routed_down == DType::MQ3G256GL {
+            // MQ3-GL down: same atomic self-combining residual GEMV, 8-entry
+            // global codebook.
+            hip!(gpu.gemv_mq3g256gl_moe_down_residual_scaled_indexed(
+                p.expert_down_ptrs,
+                p.topk_indices,
+                p.topk_weights,
+                p.rot_batch,
+                out_target,
+                down_m,
+                down_k,
+                p.k,
+            ))?;
         } else if p.dtypes.routed_down == DType::MQ5G256 {
             hip!(gpu.gemv_hfq5g256_moe_down_k8_indexed_batched_expanded(
                 p.expert_down_ptrs,
@@ -946,21 +1004,31 @@ pub fn run_moe_decode(
     // `routed_out` is set, else `x_residual`). Under EP each rank's non-owned
     // experts read zeroed weights (load-time dummy-fill) → contribute 0, so the
     // all-reduced sum of partials equals the full single-GPU combine.
-    // MQ2/MQ3-Lloyd down self-combines via the atomic _residual_scaled_indexed
-    // GEMV above (weighted accumulate into out_target). Running the expanded
-    // combine here would double-count the routed contribution (atomic residual
-    // + combine of stale down_expanded), so skip it for the Lloyd down path.
+    // The four CODEBOOK down kernels — MQ2/MQ3-Lloyd and MQ2/MQ3-G256-GL —
+    // self-combine via their atomic `_residual_scaled_indexed` GEMV above
+    // (weighted accumulate straight into out_target; nothing is written to
+    // down_expanded). Running the expanded combine here would double-count the
+    // routed contribution (atomic residual + combine of stale down_expanded),
+    // so skip it for those down dtypes.
+    //
+    // This set MUST stay in lockstep with the atomic-down arms in the dispatch
+    // chain above. Miss a dtype here and it double-counts; add one whose kernel
+    // writes down_expanded instead and it zeroes out. Both are silent numerical
+    // corruption with no error, so treat this list as load-bearing.
+    //
     // Per-expert mixed mode writes the EXPANDED down buffer for BOTH dtypes
     // (incl. the MQ2-Lloyd experts), so the single shared combine MUST run.
-    // Never take the Lloyd atomic self-combine path here, or the Lloyd
+    // Never take the atomic self-combine path here, or the codebook-tier
     // experts double-count (atomic + combine) or zero out (expanded written,
     // combine skipped) — silent numerical corruption. The merged kernel's
-    // expanded write replaces the standalone Lloyd atomic GEMV.
+    // expanded write replaces the standalone Lloyd atomic GEMV. (There is no GL
+    // branch in the merged dtype-tag kernel at all — graded files carrying a GL
+    // tier are rejected at load in `hipfire-arch-qwen35::load_moe_ffn`.)
     let routed_down_self_combines = down_last_combine
         || (p.expert_dtype_tags.is_none()
             && matches!(
                 p.dtypes.routed_down,
-                DType::MQ2G256Lloyd | DType::MQ3G256Lloyd
+                DType::MQ2G256Lloyd | DType::MQ3G256Lloyd | DType::MQ2G256GL | DType::MQ3G256GL
             ));
     if !ninepath_d4 && !routed_down_self_combines && !p.defer_routed_combine {
         hip!(gpu.moe_down_combine_k8_batched(
@@ -1000,6 +1068,26 @@ fn build_contiguous_permutation(
     }
     debug_assert_eq!(perm.len(), k, "permutation must cover all k ranks");
     (perm, ranges)
+}
+
+/// Static name for a DType (for UnsupportedVariant.quant in the mixed path).
+/// Covers the tiers a routed expert can realistically carry so an
+/// unsupported-tier error names the actual offending tier (e.g. "Q8_0")
+/// instead of a useless "other".
+fn dtype_name(d: DType) -> &'static str {
+    match d {
+        DType::MQ4G256 => "MQ4G256",
+        DType::MQ6G256 => "MQ6G256",
+        DType::ParoQ4G128 => "ParoQ4G128",
+        DType::Q8_0 => "Q8_0",
+        DType::MQ3G256 => "MQ3G256",
+        DType::MQ2G256 => "MQ2G256",
+        DType::MQ2G256Lloyd => "MQ2G256Lloyd",
+        DType::MQ3G256Lloyd => "MQ3G256Lloyd",
+        DType::MQ2G256GL => "MQ2G256GL",
+        DType::MQ3G256GL => "MQ3G256GL",
+        _ => "other",
+    }
 }
 
 /// Generic CPU-top-K MoE decode fallback. Restores the per-expert loop #393

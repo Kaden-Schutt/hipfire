@@ -4845,6 +4845,35 @@ pub const GEMV_MQ3G256_LLOYD_MOE_GATE_UP_INDEXED_SRC: &str =
 pub const GEMV_MQ3G256_LLOYD_MOE_DOWN_INDEXED_SRC: &str =
     include_str!("../../../kernels/src/gemv_mq3g256_lloyd_moe_down_indexed.hip");
 
+// ─── MQ*-G256-GL ("global Lloyd") MoE indexed family ─────────────────────────
+//
+// Same call shape as the MQ2/MQ3-Lloyd MoE indexed kernels above (device-side
+// topk routing + per-expert pointer table, X must be FWHT-pre-rotated), with
+// two differences that matter to the launchers in gemv.rs:
+//
+//   1. THE CODEBOOK IS A SCALAR KERNEL ARG, not a per-group fp16 header. The
+//      MQ2-GL kernels take 4 floats (`cb0..cb3` = `GL_CB2`), the MQ3-GL kernels
+//      take 8 (`cb0..cb7` = `GL_CB3`), inserted between the pointer args and
+//      the trailing `int M, int K`.
+//   2. THE BLOB IS SoA, two regions: `[M*gpr*IDX B indices][M*gpr*2 B fp16
+//      scales]` with IDX = 64 (MQ2-GL) / 96 (MQ3-GL) — not an interleaved
+//      per-group stride.
+//
+// Both DOWN kernels are ATOMIC SELF-COMBINING (they atomicAdd
+// `topk_weights[krank] * acc` straight into `x_residual`), exactly like their
+// Lloyd siblings — the caller MUST skip `moe_down_combine_k8_batched`.
+pub const GEMV_MQ2G256GL_MOE_GATE_UP_INDEXED_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mq2g256gl_moe_gate_up_indexed.hip");
+
+pub const GEMV_MQ2G256GL_MOE_DOWN_INDEXED_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mq2g256gl_moe_down_indexed.hip");
+
+pub const GEMV_MQ3G256GL_MOE_GATE_UP_INDEXED_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mq3g256gl_moe_gate_up_indexed.hip");
+
+pub const GEMV_MQ3G256GL_MOE_DOWN_INDEXED_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mq3g256gl_moe_down_indexed.hip");
+
 /// Strict superset of fused_rmsnorm_mq_rotate that ALSO writes the
 /// plain (non-FWHT) RMSNormed output to a second buffer. Eliminates the
 /// follow-up rmsnorm_f32 / rmsnorm_batched launch in call sites that

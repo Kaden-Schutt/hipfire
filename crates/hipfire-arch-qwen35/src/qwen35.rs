@@ -1619,6 +1619,53 @@ fn load_weight_tensor_raw(
                 awq_scale: None,
             })
         }
+        38 => {
+            // MQ2-G256-GL — 2-bit codes vs the TENSOR-GLOBAL codebook GL_CB2 +
+            // per-block fp16 scale. 2.0625 bpw. SoA, TWO regions, no per-group
+            // header (this is the first format in the tree where that is true):
+            //   [0 .. m*gpr*64)                  packed 2-bit indices, 64 B/group
+            //   [m*gpr*64 .. + m*gpr*2)          fp16 per-block scales
+            // with gpr = k/256. Opaque raw upload — the indexed MoE GEMVs
+            // (gemv_mq2g256gl_moe_{gate_up,down}_indexed) decode it and receive
+            // the codebook as scalar kernel args, so nothing here needs it.
+            //
+            // K%256 is a HARD requirement: gpr = k/256 truncates otherwise and
+            // the scale-region base M*gpr*64 shifts, which decodes to plausible
+            // garbage with no error. Fail at load.
+            assert!(
+                k % 256 == 0,
+                "MQ2G256GL has K={k} but the SoA region split requires K%256==0"
+            );
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::MQ2G256GL,
+                m,
+                k,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            })
+        }
+        39 => {
+            // MQ3-G256-GL — 3-bit sibling of qt 38 (global codebook GL_CB3,
+            // 8 entries). 3.0625 bpw; 96 B of indices per group then the same
+            // trailing m*gpr*2 B fp16 scale region.
+            assert!(
+                k % 256 == 0,
+                "MQ3G256GL has K={k} but the SoA region split requires K%256==0"
+            );
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::MQ3G256GL,
+                m,
+                k,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            })
+        }
         3 => {
             let buf = gpu.upload_raw(data, &[data.len()])?;
             Ok(WeightTensor {
@@ -4192,6 +4239,25 @@ pub(crate) fn load_moe_ffn(
         let dn0 = experts[0].down.gpu_dtype;
         let mixed = experts.iter().any(|e| e.gate_up.gpu_dtype != gu0)
             || experts.iter().any(|e| e.down.gpu_dtype != dn0);
+        // The merged dtype-tag gate_up/down kernels have NO MQ2/MQ3-G256-GL
+        // branch — the GL formats are SoA with a scalar-arg codebook, which the
+        // tag-branched decoder (per-group-header strides only) cannot express.
+        // The `_ => 2u8` default below would silently tag a GL expert as MQ4 and
+        // read 136 B/group off a 64/96 B/group blob: token soup, no error. Refuse
+        // instead. Uniform GL files never reach here (mixed == false).
+        if mixed
+            && experts.iter().any(|e| {
+                matches!(e.gate_up.gpu_dtype, DType::MQ2G256GL | DType::MQ3G256GL)
+                    || matches!(e.down.gpu_dtype, DType::MQ2G256GL | DType::MQ3G256GL)
+            })
+        {
+            return Err(HipError::new(
+                0,
+                "graded (mixed-dtype) MoE with MQ2/MQ3-G256-GL experts is not supported: \
+                 the merged dtype-tag decode kernel has no GL branch. Use a UNIFORM GL \
+                 file (all routed experts the same GL dtype per projection).",
+            ));
+        }
         if mixed {
             // Map each expert to a tag based on its gate_up dtype (the tier
             // that was assigned to BOTH projections by the quantizer).  Fall
@@ -17921,6 +17987,36 @@ mod tests {
         dtypes.shared_expert_down = DType::MQ3G256;
         assert!(!moe_ffn_batched_admissible_for_dtypes(
             &dtypes, true, false, false
+        ));
+    }
+
+    /// MQ2/MQ3-G256-GL routed experts have DECODE kernels only — the four
+    /// indexed MoE GEMVs. There is no grouped-WMMA GEMM and no batched indexed
+    /// GEMV for the GL layouts, so the batched-prefill gate must reject them and
+    /// let the model prefill through the per-token path (correct, just slower).
+    ///
+    /// Admitting GL here would send a `[M*gpr*64 B idx][M*gpr*2 B scale]` SoA
+    /// blob into an HFQ4-layout (136 B/group interleaved) GEMM — out-of-bounds
+    /// reads and garbage, exactly the failure the MQ3 guard above exists for.
+    #[test]
+    fn moe_prefill_rejects_gl_routed_experts() {
+        for gl in [DType::MQ2G256GL, DType::MQ3G256GL] {
+            for admit_mq6 in [false, true] {
+                let mut dtypes = MoePrefillDtypes::uniform(DType::MQ4G256);
+                dtypes.expert_gate_up = gl;
+                dtypes.expert_down = gl;
+                assert!(
+                    !moe_ffn_batched_admissible_for_dtypes(&dtypes, admit_mq6, true, true),
+                    "{gl:?} must not be batched-prefill admissible (admit_mq6={admit_mq6})"
+                );
+            }
+        }
+        // Per-projection GL mix (the target SKU: gate_up MQ2-GL, down MQ3-GL).
+        let mut dtypes = MoePrefillDtypes::uniform(DType::MQ4G256);
+        dtypes.expert_gate_up = DType::MQ2G256GL;
+        dtypes.expert_down = DType::MQ3G256GL;
+        assert!(!moe_ffn_batched_admissible_for_dtypes(
+            &dtypes, true, true, true
         ));
     }
 

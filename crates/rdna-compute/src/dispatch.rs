@@ -38,6 +38,61 @@ pub const LLOYD_MQ3_GROUP_BYTES: usize = 112;
 /// docs/plans/mq-lloyd-batched-prefill-followup.md).
 pub const LLOYD_MQ4_GROUP_BYTES: usize = 160;
 
+// ── MQ*-G256-GL ("global Lloyd") format constants ────────────────────────────
+//
+// GL = one codebook shared by the WHOLE tensor + a per-block fp16 scale, laid
+// out as TWO SoA regions rather than the interleaved per-group header the
+// MQ2/MQ3-Lloyd formats use:
+//
+//   MQ2G256GL (qt 38): [0 .. M*gpr*64)   2-bit indices, 64 B/group
+//                      [M*gpr*64 .. +M*gpr*2)  fp16 per-block scales  → 2.0625 bpw
+//   MQ3G256GL (qt 39): [0 .. M*gpr*96)   3-bit indices, 96 B/group
+//                      [M*gpr*96 .. +M*gpr*2)  fp16 per-block scales  → 3.0625 bpw
+//
+// with gpr = K/256. There is no inline per-group header — any loader or size
+// estimator that assumes "one contiguous blob per row with a header" is wrong
+// for these two dtypes.
+
+/// Per-group INDEX bytes for MQ2-G256-GL (2 bits × 256 weights). The fp16
+/// per-block scale lives in a SEPARATE trailing region, NOT in the group.
+pub const GL_MQ2_GROUP_IDX_BYTES: usize = 64;
+
+/// Per-group INDEX bytes for MQ3-G256-GL (3 bits × 256 weights). Same SoA
+/// split as MQ2-GL — the scale is in the trailing region, not inline.
+pub const GL_MQ3_GROUP_IDX_BYTES: usize = 96;
+
+/// Bytes per group in the trailing fp16 scale region (both GL dtypes).
+pub const GL_GROUP_SCALE_BYTES: usize = 2;
+
+/// **MUST STAY BIT-IDENTICAL TO `hipfire-quantize::main::GL_CB2`.**
+///
+/// The MQ2-GL GEMV kernels take the codebook as four SCALAR FLOAT KERNEL ARGS
+/// (`cb0..cb3`) — it is *not* stored in the `.hfq` file — so the runtime must
+/// reproduce the exact levels the encoder quantized against. Encoder side:
+/// `crates/hipfire-quantize/src/main.rs` (`GL_CB2`, consumed by
+/// `gl_encode_block` from `quantize_mq2g256gl`).
+///
+/// A silent drift between the two arrays is a **silent accuracy failure**, not a
+/// crash: every weight decodes to a plausible-but-wrong level and the model
+/// degrades without any error. The coupling is machine-checked by
+/// `gl_codebooks_match_runtime` in `hipfire-quantize/src/main.rs`; if you change
+/// one array you MUST change the other and that test will tell you if you didn't.
+///
+/// Values are the textbook Lloyd–Max reconstruction levels for a unit Gaussian
+/// (2-bit, MSE 0.1175), reproduced to 3 decimals by fitting on 28.3 M real a3b
+/// post-FWHT expert weights (2026-08-04).
+pub const GL_CB2: [f32; 4] = [-1.5104, -0.4528, 0.4528, 1.5104];
+
+/// **MUST STAY BIT-IDENTICAL TO `hipfire-quantize::main::GL_CB3`.**
+///
+/// 3-bit sibling of [`GL_CB2`]; passed to the MQ3-GL GEMV kernels as eight
+/// scalar float kernel args (`cb0..cb7`, ascending). Same drift hazard, same
+/// machine check (`gl_codebooks_match_runtime`). Textbook Lloyd–Max 3-bit
+/// Gaussian levels (MSE 0.03454).
+pub const GL_CB3: [f32; 8] = [
+    -2.1520, -1.3439, -0.7560, -0.2451, 0.2451, 0.7560, 1.3439, 2.1520,
+];
+
 /// Current layer index, set by the qwen35 forward_prefill_chunk at the
 /// start of each layer iteration. Used by `hfq3_mmq_layer_gate_pass` to
 /// support per-layer MMQ-on/off experiments (see issue #302 — KLD
@@ -194,7 +249,16 @@ pub enum DType {
     MQ2G256Lloyd, // MagnumQuant 2-bit + Lloyd-Max 4-entry fp16 codebook (72 bytes/group)
     MQ3G256Lloyd, // MagnumQuant 3-bit + Lloyd-Max 8-entry fp16 codebook (112 bytes/group)
     MQ4G256Lloyd, // MagnumQuant 4-bit + Lloyd-Max 16-entry fp16 codebook (160 bytes/group)
-    HFP4G32,      // HFP4: E2M1 element + UE8M0 g32 block scale + FP16 row scale.
+    MQ2G256GL,    // MagnumQuant 2-bit + TENSOR-GLOBAL 4-entry codebook (GL_CB2), SoA:
+    // [M*gpr*64 B indices][M*gpr*2 B fp16 per-block scales] = 2.0625 bpw. NOT
+    // interleaved — no per-group header. Codebook is a compile-time constant
+    // passed as scalar kernel args, not stored in the file. MoE-routed-expert
+    // only (indexed gate_up + atomic self-combining down); there is no dense /
+    // plain / prerotated single-weight GEMV kernel for this dtype.
+    MQ3G256GL, // MagnumQuant 3-bit + TENSOR-GLOBAL 8-entry codebook (GL_CB3), SoA:
+    // [M*gpr*96 B indices][M*gpr*2 B fp16 per-block scales] = 3.0625 bpw. Same
+    // MoE-only scope + scalar-arg codebook as MQ2G256GL.
+    HFP4G32, // HFP4: E2M1 element + UE8M0 g32 block scale + FP16 row scale.
     // Per-row header 16 B; per-block payload 17 B (UE8M0 + 16 packed nibbles).
     // See docs/quant-formats/hfp4.md.
     MFP4G32, // MFP4: HFP4G32 + offline FWHT (drop-in MQ4 replacement). Same byte layout
@@ -255,6 +319,8 @@ impl DType {
             | DType::MQ2G256Lloyd
             | DType::MQ3G256Lloyd
             | DType::MQ4G256Lloyd
+            | DType::MQ2G256GL
+            | DType::MQ3G256GL
             | DType::HFP4G32
             | DType::MFP4G32
             | DType::MFP4G32Lloyd
@@ -352,8 +418,16 @@ impl DType {
     /// Whether this format's GEMV kernel requires K%256==0 (HFP4 family: the
     /// gemv_hfp4g32 kernel + FWHT both need it). Refuse at load, not first
     /// dispatch. Centralizes the guard inlined at the weight-decode qt 21/24 arms.
+    ///
+    /// MQ2/MQ3-G256-GL are included because their SoA region split is derived
+    /// from `gpr = K/256` on BOTH sides (encoder and kernel). A K that is not a
+    /// multiple of 256 truncates `gpr`, which silently shifts the scale-region
+    /// base — garbage weights with no error. Fail at load instead.
     pub fn requires_k_mod_256(self) -> bool {
-        matches!(self, DType::HFP4G32 | DType::MFP4G32)
+        matches!(
+            self,
+            DType::HFP4G32 | DType::MFP4G32 | DType::MQ2G256GL | DType::MQ3G256GL
+        )
     }
 }
 

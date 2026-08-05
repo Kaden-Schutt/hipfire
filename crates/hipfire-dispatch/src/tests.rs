@@ -956,6 +956,84 @@ fn moe_res_lloyd_gate_up_with_nonlloyd_down_not_indexable() {
     assert!(!r.use_gpu_topk);
 }
 
+/// MQ2/MQ3-G256-GL routed experts, in every per-projection combination with each
+/// other AND with the Lloyd pair (all four are FwhtG256 codebook formats whose
+/// down kernels self-combine, so any cross is executable).
+///
+/// The target SKU is gate_up = MQ2-GL + down = MQ3-GL. If the GL dtypes were
+/// missing from `routed_indexable_mixed_lloyd`, `use_gpu_topk` would be false
+/// and the layer would silently take the CPU-top-K fallback — CORRECT output,
+/// so the only symptom is lost throughput. That is exactly the failure this
+/// pins.
+#[test]
+fn moe_res_gl_routed_indexable() {
+    use DType::{MQ2G256Lloyd, MQ3G256Lloyd, MQ2G256GL, MQ3G256GL};
+    let codebook = [MQ2G256Lloyd, MQ3G256Lloyd, MQ2G256GL, MQ3G256GL];
+    for gu in codebook {
+        for dn in codebook {
+            let mut d = dtypes_all_mq4();
+            d.routed_gate_up = gu;
+            d.routed_down = dn;
+            let r = MoeResolution::resolve(&d, 8);
+            assert!(r.routed_indexable_mixed_lloyd, "{gu:?}/{dn:?}");
+            assert!(r.routed_indexable(), "{gu:?}/{dn:?}");
+            assert!(r.use_gpu_topk, "{gu:?}/{dn:?}");
+            // use_gpu_topk implies x_rot_local must exist — run_moe_decode
+            // `.expect()`s it, and every codebook gate_up kernel reads x_rot.
+            assert!(r.needs_x_rot_local, "{gu:?}/{dn:?}");
+        }
+    }
+}
+
+/// The GL dtypes must not leak into the MQ4/MQ5/MQ6 uniform arms, and a GL
+/// gate_up with a non-self-combining down must stay unindexable (same
+/// double-count / drop-out hazard as the Lloyd case above).
+#[test]
+fn moe_res_gl_gate_up_with_nonlloyd_down_not_indexable() {
+    for dn in [DType::MQ4G256, DType::MQ6G256, DType::Q8_0] {
+        let mut d = dtypes_all_mq4();
+        d.routed_gate_up = DType::MQ2G256GL;
+        d.routed_down = dn;
+        let r = MoeResolution::resolve(&d, 8);
+        assert!(!r.routed_indexable_mixed_lloyd, "{dn:?}");
+        assert!(!r.routed_indexable_mq4, "{dn:?}");
+        assert!(!r.routed_indexable_mq6, "{dn:?}");
+        assert!(!r.routed_indexable(), "{dn:?}");
+        assert!(!r.use_gpu_topk, "{dn:?}");
+    }
+}
+
+/// The GL formats are FWHT-256 rotated (the encoder runs `cpu_fwht_256` per
+/// 256-block before quantizing), so dispatch must classify them as FwhtG256 —
+/// an un-rotated activation into a rotated weight is silent garbage.
+#[test]
+fn gl_dtypes_are_fwht_g256() {
+    use crate::types::{dtype_needs_rotation, dtype_rotation_plan, RotationPlan};
+    for dt in [DType::MQ2G256GL, DType::MQ3G256GL] {
+        assert_eq!(dtype_rotation_plan(dt), RotationPlan::FwhtG256, "{dt:?}");
+        assert!(dtype_needs_rotation(dt), "{dt:?}");
+    }
+}
+
+/// GL has MoE-indexed kernels ONLY — no dense plain/prerotated GEMV exists. Both
+/// key lookups must return a clean `UnsupportedVariant` rather than resolving to
+/// some other dtype's kernel. (Note `for_gemv_prerotated`'s rotation-free
+/// fallthrough must NOT catch these: they are FwhtG256, not None.)
+#[test]
+fn gl_dtypes_have_no_dense_gemv_key() {
+    use crate::types::{GemvVariant, KernelKey};
+    for dt in [DType::MQ2G256GL, DType::MQ3G256GL] {
+        assert!(
+            KernelKey::for_gemv(dt, GemvVariant::Plain, false).is_err(),
+            "{dt:?} must not resolve a plain GEMV key"
+        );
+        assert!(
+            KernelKey::for_gemv_prerotated(dt).is_err(),
+            "{dt:?} must not resolve a prerotated GEMV key"
+        );
+    }
+}
+
 #[test]
 fn moe_res_mq6_routed_indexable() {
     let mut d = dtypes_all_mq4();

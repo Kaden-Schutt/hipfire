@@ -8375,7 +8375,8 @@ impl Gpu {
         ];
         // Fused path skips the expanded [N×K_TOP×M] write + re-read; traffic
         // is the routed-expert weight reads plus the per-token residual write.
-        let bytes = batch_size * k_top * crate::profile::gemv_hfq4g256_bytes(m, k) + batch_size * m * 4;
+        let bytes =
+            batch_size * k_top * crate::profile::gemv_hfq4g256_bytes(m, k) + batch_size * m * 4;
         let timer = crate::profile::begin_timer(
             &self.hip,
             "gemv",
@@ -8409,7 +8410,6 @@ impl Gpu {
         }
         result
     }
-
 
     /// HFQ4G128 (ParoQuant) variant of the atomic-free batched indexed
     /// MoE down. Same expanded-output contract as the HFQ4G256 sibling;
@@ -9935,6 +9935,359 @@ impl Gpu {
                 b.push_ptr(wp);
                 b.push_ptr(rbp);
                 b.push_ptr(xrp);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    // ── MQ*-G256-GL ("global Lloyd") MoE indexed launchers ────────────────
+    //
+    // Structurally identical to the four MQ2/MQ3-Lloyd launchers above except
+    // for two things, both of which are silent-corruption traps if got wrong:
+    //
+    //  1. KERNARG ORDER. The GL kernels carry the tensor-global codebook as
+    //     SCALAR FLOAT args between the pointers and the trailing `int M, int
+    //     K` — 4 floats for MQ2-GL (`GL_CB2`), 8 for MQ3-GL (`GL_CB3`). The
+    //     Lloyd siblings have no such args (their codebook is a per-group fp16
+    //     header inside the weight blob). Order below is transcribed from the
+    //     `extern "C"` signatures in
+    //     `kernels/src/gemv_mq{2,3}g256gl_moe_{gate_up,down}_indexed.hip` and
+    //     matches the on-GPU-verified blobs in
+    //     `rdna-compute/examples/bench_mq{2,3}g256gl_moe_*.rs`.
+    //
+    //  2. WEIGHT SIZE. The blob is SoA — `M*gpr*IDX` index bytes followed by
+    //     `M*gpr*2` fp16 scale bytes — not `M*gpr*STRIDE` of interleaved
+    //     groups. Only the profile-timer byte counters read this, but keeping
+    //     it honest keeps the GB/s numbers comparable to the Lloyd siblings.
+
+    /// MQ2-G256-GL routed-expert fused gate_up GEMV (2.0625 bpw, global 4-entry
+    /// codebook + per-block fp16 scale, SoA). `x_rot` must be FWHT-256
+    /// pre-rotated by the caller. Output split: row < M/2 → `y_gate`, else
+    /// `y_up`. Codebook comes from [`crate::GL_CB2`], which MUST match the
+    /// quantizer's `GL_CB2` — see that constant's doc for the drift hazard.
+    pub fn gemv_mq2g256gl_moe_gate_up_indexed(
+        &mut self,
+        expert_ptrs: &GpuTensor,  // [n_exp] u64 device pointers
+        topk_indices: &GpuTensor, // [k_top] i32
+        x_rot: &GpuTensor,        // [K] FWHT-rotated
+        y_gate: &GpuTensor,       // [k_top × M/2]
+        y_up: &GpuTensor,         // [k_top × M/2]
+        m: usize,
+        k: usize,
+        k_top: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemv_mq2g256gl_moe_gate_up_indexed",
+            kernels::GEMV_MQ2G256GL_MOE_GATE_UP_INDEXED_SRC,
+            "gemv_mq2g256gl_moe_gate_up_k8_indexed",
+        )?;
+        let pp = expert_ptrs.buf.as_ptr();
+        let ip = topk_indices.buf.as_ptr();
+        let xp = x_rot.buf.as_ptr();
+        let ygp = y_gate.buf.as_ptr();
+        let yup = y_up.buf.as_ptr();
+        let cb = crate::GL_CB2;
+        let m_val = m as i32;
+        let k_val = k as i32;
+        // extern "C": (expert_ptrs, topk_indices, x_rot, y_gate, y_up,
+        //              cb0, cb1, cb2, cb3, M, K)
+        let mut params: Vec<*mut c_void> = vec![
+            &pp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &ygp as *const _ as *mut c_void,
+            &yup as *const _ as *mut c_void,
+            &cb[0] as *const _ as *mut c_void,
+            &cb[1] as *const _ as *mut c_void,
+            &cb[2] as *const _ as *mut c_void,
+            &cb[3] as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+        ];
+        // MQ2-GL SoA: 64 B indices + 2 B fp16 scale per 256-weight group.
+        let gpr = k / 256;
+        let w_bytes = m * gpr * (crate::GL_MQ2_GROUP_IDX_BYTES + crate::GL_GROUP_SCALE_BYTES);
+        let bytes = k_top * (w_bytes + k * 4 + m * 4);
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "gemv",
+            "gemv_mq2g256gl_moe_gate_up_indexed",
+            bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "gemv_mq2g256gl_moe_gate_up_k8_indexed",
+            [m as u32, k_top as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(pp);
+                b.push_ptr(ip);
+                b.push_ptr(xp);
+                b.push_ptr(ygp);
+                b.push_ptr(yup);
+                for c in cb {
+                    b.push_f32(c);
+                }
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// MQ2-G256-GL routed-expert down GEMV — **atomic, weighted, SELF-COMBINING**.
+    ///
+    /// Lane 0 of every `(row, krank)` block does
+    /// `atomicAdd(&x_residual[row], topk_weights[krank] * acc)`, so this kernel
+    /// IS the combine: the caller MUST NOT also run `moe_down_combine_k8_batched`
+    /// (double-count) and MUST NOT expect `down_expanded` to be written
+    /// (zero-out). Same contract as the MQ2/MQ3-Lloyd down siblings.
+    /// `rot_batch[krank*K ..]` must be FWHT-256 pre-rotated per top-k slot.
+    pub fn gemv_mq2g256gl_moe_down_residual_scaled_indexed(
+        &mut self,
+        expert_ptrs: &GpuTensor,
+        topk_indices: &GpuTensor,
+        topk_weights: &GpuTensor,
+        rot_batch: &GpuTensor,  // [k_top × K]
+        x_residual: &GpuTensor, // [M]
+        m: usize,
+        k: usize,
+        k_top: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemv_mq2g256gl_moe_down_indexed",
+            kernels::GEMV_MQ2G256GL_MOE_DOWN_INDEXED_SRC,
+            "gemv_mq2g256gl_moe_down_residual_scaled_k8_indexed",
+        )?;
+        let pp = expert_ptrs.buf.as_ptr();
+        let ip = topk_indices.buf.as_ptr();
+        let wp = topk_weights.buf.as_ptr();
+        let rbp = rot_batch.buf.as_ptr();
+        let xrp = x_residual.buf.as_ptr();
+        let cb = crate::GL_CB2;
+        let m_val = m as i32;
+        let k_val = k as i32;
+        // extern "C": (expert_ptrs, topk_indices, topk_weights, rot_batch,
+        //              x_residual, cb0, cb1, cb2, cb3, M, K)
+        let mut params: Vec<*mut c_void> = vec![
+            &pp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &rbp as *const _ as *mut c_void,
+            &xrp as *const _ as *mut c_void,
+            &cb[0] as *const _ as *mut c_void,
+            &cb[1] as *const _ as *mut c_void,
+            &cb[2] as *const _ as *mut c_void,
+            &cb[3] as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+        ];
+        let gpr = k / 256;
+        let w_bytes = m * gpr * (crate::GL_MQ2_GROUP_IDX_BYTES + crate::GL_GROUP_SCALE_BYTES);
+        let bytes = k_top * (w_bytes + k * 4 + m * 4);
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "gemv",
+            "gemv_mq2g256gl_moe_down_residual_scaled_indexed",
+            bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "gemv_mq2g256gl_moe_down_residual_scaled_k8_indexed",
+            [m as u32, k_top as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(pp);
+                b.push_ptr(ip);
+                b.push_ptr(wp);
+                b.push_ptr(rbp);
+                b.push_ptr(xrp);
+                for c in cb {
+                    b.push_f32(c);
+                }
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// MQ3-G256-GL routed-expert fused gate_up GEMV (3.0625 bpw, global 8-entry
+    /// codebook + per-block fp16 scale, SoA, 96 B indices/group). Codebook is
+    /// [`crate::GL_CB3`] — 8 scalar args, ascending. `x_rot` must be FWHT-256
+    /// pre-rotated.
+    pub fn gemv_mq3g256gl_moe_gate_up_indexed(
+        &mut self,
+        expert_ptrs: &GpuTensor,
+        topk_indices: &GpuTensor,
+        x_rot: &GpuTensor,
+        y_gate: &GpuTensor,
+        y_up: &GpuTensor,
+        m: usize,
+        k: usize,
+        k_top: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemv_mq3g256gl_moe_gate_up_indexed",
+            kernels::GEMV_MQ3G256GL_MOE_GATE_UP_INDEXED_SRC,
+            "gemv_mq3g256gl_moe_gate_up_k8_indexed",
+        )?;
+        let pp = expert_ptrs.buf.as_ptr();
+        let ip = topk_indices.buf.as_ptr();
+        let xp = x_rot.buf.as_ptr();
+        let ygp = y_gate.buf.as_ptr();
+        let yup = y_up.buf.as_ptr();
+        let cb = crate::GL_CB3;
+        let m_val = m as i32;
+        let k_val = k as i32;
+        // extern "C": (expert_ptrs, topk_indices, x_rot, y_gate, y_up,
+        //              cb0..cb7, M, K)
+        let mut params: Vec<*mut c_void> = vec![
+            &pp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &ygp as *const _ as *mut c_void,
+            &yup as *const _ as *mut c_void,
+            &cb[0] as *const _ as *mut c_void,
+            &cb[1] as *const _ as *mut c_void,
+            &cb[2] as *const _ as *mut c_void,
+            &cb[3] as *const _ as *mut c_void,
+            &cb[4] as *const _ as *mut c_void,
+            &cb[5] as *const _ as *mut c_void,
+            &cb[6] as *const _ as *mut c_void,
+            &cb[7] as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+        ];
+        let gpr = k / 256;
+        let w_bytes = m * gpr * (crate::GL_MQ3_GROUP_IDX_BYTES + crate::GL_GROUP_SCALE_BYTES);
+        let bytes = k_top * (w_bytes + k * 4 + m * 4);
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "gemv",
+            "gemv_mq3g256gl_moe_gate_up_indexed",
+            bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "gemv_mq3g256gl_moe_gate_up_k8_indexed",
+            [m as u32, k_top as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(pp);
+                b.push_ptr(ip);
+                b.push_ptr(xp);
+                b.push_ptr(ygp);
+                b.push_ptr(yup);
+                for c in cb {
+                    b.push_f32(c);
+                }
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// MQ3-G256-GL routed-expert down GEMV — **atomic, weighted, SELF-COMBINING**
+    /// (identical epilogue contract to the MQ2-GL down launcher above: this IS
+    /// the combine; do not also run `moe_down_combine_k8_batched`).
+    pub fn gemv_mq3g256gl_moe_down_residual_scaled_indexed(
+        &mut self,
+        expert_ptrs: &GpuTensor,
+        topk_indices: &GpuTensor,
+        topk_weights: &GpuTensor,
+        rot_batch: &GpuTensor,
+        x_residual: &GpuTensor,
+        m: usize,
+        k: usize,
+        k_top: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemv_mq3g256gl_moe_down_indexed",
+            kernels::GEMV_MQ3G256GL_MOE_DOWN_INDEXED_SRC,
+            "gemv_mq3g256gl_moe_down_residual_scaled_k8_indexed",
+        )?;
+        let pp = expert_ptrs.buf.as_ptr();
+        let ip = topk_indices.buf.as_ptr();
+        let wp = topk_weights.buf.as_ptr();
+        let rbp = rot_batch.buf.as_ptr();
+        let xrp = x_residual.buf.as_ptr();
+        let cb = crate::GL_CB3;
+        let m_val = m as i32;
+        let k_val = k as i32;
+        // extern "C": (expert_ptrs, topk_indices, topk_weights, rot_batch,
+        //              x_residual, cb0..cb7, M, K)
+        let mut params: Vec<*mut c_void> = vec![
+            &pp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &rbp as *const _ as *mut c_void,
+            &xrp as *const _ as *mut c_void,
+            &cb[0] as *const _ as *mut c_void,
+            &cb[1] as *const _ as *mut c_void,
+            &cb[2] as *const _ as *mut c_void,
+            &cb[3] as *const _ as *mut c_void,
+            &cb[4] as *const _ as *mut c_void,
+            &cb[5] as *const _ as *mut c_void,
+            &cb[6] as *const _ as *mut c_void,
+            &cb[7] as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+        ];
+        let gpr = k / 256;
+        let w_bytes = m * gpr * (crate::GL_MQ3_GROUP_IDX_BYTES + crate::GL_GROUP_SCALE_BYTES);
+        let bytes = k_top * (w_bytes + k * 4 + m * 4);
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "gemv",
+            "gemv_mq3g256gl_moe_down_residual_scaled_indexed",
+            bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "gemv_mq3g256gl_moe_down_residual_scaled_k8_indexed",
+            [m as u32, k_top as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(pp);
+                b.push_ptr(ip);
+                b.push_ptr(wp);
+                b.push_ptr(rbp);
+                b.push_ptr(xrp);
+                for c in cb {
+                    b.push_f32(c);
+                }
                 b.push_i32(m_val);
                 b.push_i32(k_val);
                 b
