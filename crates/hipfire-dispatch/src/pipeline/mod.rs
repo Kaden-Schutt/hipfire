@@ -708,21 +708,6 @@ pub fn run_moe_decode(
                 gate_up_k,
                 p.k,
             ))?;
-        } else if p.dtypes.routed_gate_up == DType::HFP4G32 {
-            // Native-FP4 routed experts (DeepSeek V4 passthrough). NOTE the x
-            // buffer: HFP4G32 bakes in no FWHT, so this takes the PLAIN
-            // normalised activation, not the rotated `xr` every MQ arm above
-            // uses. Passing xr here is silently wrong, not an error.
-            hip!(gpu.deepseek4_gemv_hfp4g32_moe_gate_up_indexed(
-                p.expert_gate_up_ptrs,
-                p.topk_indices,
-                p.x_norm,
-                p.gate_batch,
-                p.up_batch,
-                2 * p.mi,
-                gate_up_k,
-                p.k,
-            ))?;
         } else if p.dtypes.routed_gate_up == DType::MQ3G256Lloyd {
             // Uniform MQ3-Lloyd routed experts: same indexed-Lloyd gate_up path,
             // MQ3 launcher.
@@ -882,21 +867,6 @@ pub fn run_moe_decode(
                     false,
                 )
             )?;
-        } else if p.dtypes.routed_down == DType::HFP4G32 {
-            // Native-FP4 down. Same atomic self-combining contract as the MQ
-            // arms, but reads `gate_batch` — the SwiGLU output BEFORE the MQ
-            // rotate — because HFP4G32 carries no baked FWHT. The MQ arms below
-            // consume `rot_batch`; using it here would be silently wrong.
-            hip!(gpu.deepseek4_gemv_hfp4g32_moe_down_residual_scaled_indexed(
-                p.expert_down_ptrs,
-                p.topk_indices,
-                p.topk_weights,
-                p.gate_batch,
-                out_target,
-                down_m,
-                down_k,
-                p.k,
-            ))?;
         } else if p.dtypes.routed_down == DType::MQ3G256Lloyd {
             // MQ3-Lloyd down: same atomic self-combining residual GEMV, MQ3 launcher.
             hip!(

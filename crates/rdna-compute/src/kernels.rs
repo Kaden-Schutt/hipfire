@@ -5128,14 +5128,6 @@ pub const GEMV_HFP4G32_MOE_GATE_UP_INDEXED_SRC: &str =
 pub const GEMV_HFP4G32_MOE_DOWN_INDEXED_SRC: &str =
     include_str!("../../../kernels/src/gemv_hfp4g32_moe_down_indexed.hip");
 
-/// Batched (prefill) HFP4G32 MoE GEMVs. Same "x is PLAIN, not rotated" contract
-/// as the decode pair above.
-pub const GEMV_HFP4G32_MOE_GATE_UP_INDEXED_BATCHED_SRC: &str =
-    include_str!("../../../kernels/src/gemv_hfp4g32_moe_gate_up_indexed_batched.hip");
-
-pub const GEMV_HFP4G32_MOE_DOWN_INDEXED_BATCHED_SRC: &str =
-    include_str!("../../../kernels/src/gemv_hfp4g32_moe_down_indexed_batched.hip");
-
 /// Strict superset of fused_rmsnorm_mq_rotate that ALSO writes the
 /// plain (non-FWHT) RMSNormed output to a second buffer. Eliminates the
 /// follow-up rmsnorm_f32 / rmsnorm_batched launch in call sites that
