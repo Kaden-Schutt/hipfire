@@ -5415,6 +5415,11 @@ pub const INDEXER_RELU_SCORE_BATCHED_SRC: &str =
 pub const INDEXER_RELU_SCORE_WMMA_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/indexer_relu_score_wmma_batched.hip");
 
+/// gfx1151 DeepSeek V4 indexer score with one cooperative LDS-staged K tile
+/// shared by the four WMMA warps in each block.
+pub const INDEXER_RELU_SCORE_WMMA_BATCHED_KLDS_GFX1151_SRC: &str =
+    include_str!("../../../kernels/src/indexer_relu_score_wmma_batched_klds.gfx1151.hip");
+
 /// Wider-N Q8 WMMA: 16×64 output tile instead of 16×16, 4× weight
 /// reuse per block. Same single-warp wave32 structure as
 /// `gemm_q8_0_wmma`, but each K-step issues 4 back-to-back WMMA tiles

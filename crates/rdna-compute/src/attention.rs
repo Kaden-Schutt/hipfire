@@ -9546,6 +9546,78 @@ impl Gpu {
             },
         )
     }
+    pub fn indexer_relu_score_wmma_batched_klds_gfx1151(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        weights: &GpuTensor,
+        n_per_batch: &GpuTensor,
+        scores: &GpuTensor,
+        n_idx_heads: i32,
+        idx_head_dim: i32,
+        n_max: i32,
+        batch_size: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert_eq!(
+            self.arch, "gfx1151",
+            "indexer_relu_score_wmma_batched_klds is gfx1151-only"
+        );
+        assert_eq!(
+            n_idx_heads, 64,
+            "indexer_relu_score_wmma_batched_klds: requires H=64 (got {n_idx_heads})"
+        );
+        assert_eq!(
+            idx_head_dim, 128,
+            "indexer_relu_score_wmma_batched_klds: requires D=128 (got {idx_head_dim})"
+        );
+        self.ensure_kernel(
+            "indexer_relu_score_wmma_batched_klds_gfx1151",
+            kernels::INDEXER_RELU_SCORE_WMMA_BATCHED_KLDS_GFX1151_SRC,
+            "indexer_relu_score_wmma_batched_klds_gfx1151",
+        )?;
+        let qp = q.buf.as_ptr();
+        let kp = k_cache.buf.as_ptr();
+        let wp = weights.buf.as_ptr();
+        let np = n_per_batch.buf.as_ptr();
+        let sp = scores.buf.as_ptr();
+        let mut h = n_idx_heads;
+        let mut d = idx_head_dim;
+        let mut nc = n_max;
+        let mut bs = batch_size;
+        let mut params: Vec<*mut c_void> = vec![
+            &qp as *const _ as *mut c_void,
+            &kp as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &np as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &mut h as *mut _ as *mut c_void,
+            &mut d as *mut _ as *mut c_void,
+            &mut nc as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+        ];
+        let grid_n = (n_max as u32 + 15) / 16;
+        self.launch_maybe_blob(
+            "indexer_relu_score_wmma_batched_klds_gfx1151",
+            [batch_size as u32, grid_n, 1],
+            [128, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(qp);
+                b.push_ptr(kp);
+                b.push_ptr(wp);
+                b.push_ptr(np);
+                b.push_ptr(sp);
+                b.push_i32(h);
+                b.push_i32(d);
+                b.push_i32(nc);
+                b.push_i32(bs);
+                b
+            },
+        )
+    }
     pub fn indexer_relu_score_f32_buf(
         &mut self,
         q: &GpuTensor,
