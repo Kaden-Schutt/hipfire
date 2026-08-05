@@ -105,6 +105,8 @@ RECOMMENDED_BOUNDS = {
     "presence_penalty": (0.0, 2.0, False),
     "repeat_penalty": (0.5, 2.0, False),
 }
+REASONING_EFFORTS = {"auto", "none", "low", "high", "max"}
+THINKING_BUDGETS = {"off", "low", "med", "high", "xhigh", "max", "uncapped"}
 
 
 def validate_recommended_settings(tag: str, rs: object, errors: list) -> None:
@@ -118,7 +120,11 @@ def validate_recommended_settings(tag: str, rs: object, errors: list) -> None:
     if not isinstance(rs, dict):
         errors.append(f"{tag}: recommended_settings must be an object, got {type(rs).__name__}")
         return
-    allowed = set(RECOMMENDED_BOUNDS) | {"system_prompt"}
+    allowed = set(RECOMMENDED_BOUNDS) | {
+        "system_prompt",
+        "reasoning_effort",
+        "thinking_budget",
+    }
     for key, val in rs.items():
         if key not in allowed:
             errors.append(f"{tag}: recommended_settings has unknown key {key!r} (allowed: {sorted(allowed)})")
@@ -126,6 +132,20 @@ def validate_recommended_settings(tag: str, rs: object, errors: list) -> None:
         if key == "system_prompt":
             if not isinstance(val, str):
                 errors.append(f"{tag}: recommended_settings.system_prompt must be a string")
+            continue
+        if key == "reasoning_effort":
+            if val not in REASONING_EFFORTS:
+                errors.append(
+                    f"{tag}: recommended_settings.reasoning_effort must be one of "
+                    f"{sorted(REASONING_EFFORTS)}, got {val!r}"
+                )
+            continue
+        if key == "thinking_budget":
+            if val not in THINKING_BUDGETS:
+                errors.append(
+                    f"{tag}: recommended_settings.thinking_budget must be one of "
+                    f"{sorted(THINKING_BUDGETS)}, got {val!r}"
+                )
             continue
         lo, hi, int_only = RECOMMENDED_BOUNDS[key]
         if isinstance(val, bool) or not isinstance(val, (int, float)):
@@ -169,7 +189,7 @@ def arch_id_for(tag: str, entry: dict) -> int | None:
         return 6  # Nex-N2-mini = Qwen3.5-35B-A3B MoE (a3b not in tag name)
     if family == "qwen3":
         return 1
-    if family == "deepseek-v4-flash":
+    if family in ("deepseek-v4-flash", "deepseek-v4-flash-preview"):
         return 9
     if family == "minimax" or family.startswith("minimax-"):
         return 10
