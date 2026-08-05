@@ -170,6 +170,7 @@ def build_config(args):
         "mode": args.mode, "port": args.port, "seed": getattr(args, "seed", None),
         "prompts_file": getattr(args, "prompts_file", None),
         "prompt_file": getattr(args, "prompt_file", None),
+        "niah_file": getattr(args, "niah_file", None),
         "speculation_mode": getattr(args, "speculation", None),
         "replay_route_proof_log": bool(getattr(args, "replay_route_proof_log", False)),
     }
@@ -177,16 +178,37 @@ def build_config(args):
 
 
 
-def load_prompt_battery(prompts_file, prompt_file=None):
-    """Return the requested prompt rows, or the built-in GENRE_BATTERY."""
+def load_prompt_battery(prompts_file, prompt_file=None, niah_file=None):
+    """Return ``(genre, prompt, expected_substrings)`` prompt rows.
+
+    ``--niah-file`` consumes the repository's committed long-context fixture
+    format directly.  Keeping the JSON fixture as the source of truth avoids a
+    second flattened prompt whose whitespace could silently drift.
+    """
     if prompt_file:
         text = Path(prompt_file).read_bytes().decode("utf-8")
-        return [("prose", text)]
+        return [("prose", text, [])]
+    if niah_file:
+        raw = Path(niah_file).read_text(encoding="utf-8")
+        stripped = raw.lstrip()
+        records = json.loads(raw) if stripped.startswith("[") else [json.loads(line) for line in raw.splitlines() if line.strip()]
+        rows = []
+        for index, record in enumerate(records):
+            filler = record.get("filler_text")
+            question = record.get("question")
+            if not isinstance(filler, str) or not isinstance(question, str):
+                raise ValueError(f"NIAH row {index} requires string filler_text and question")
+            expected = record.get("expected_answer_substrings")
+            if expected is None:
+                expected = [record.get("expected_answer_substring")]
+            if not isinstance(expected, list) or not expected or not all(isinstance(item, str) and item for item in expected):
+                raise ValueError(f"NIAH row {index} requires nonempty expected answer substring(s)")
+            rows.append((record.get("genre", "longctx-niah"), f"{filler}\n\n{question}", expected))
+        return rows
     if not prompts_file:
-        return list(GENRE_BATTERY)
-    import json
+        return [(genre, prompt, []) for genre, prompt in GENRE_BATTERY]
     rows = json.load(open(prompts_file))
-    return [(r.get("genre", "prose"), r["prompt"]) for r in rows]
+    return [(r.get("genre", "prose"), r["prompt"], r.get("expect", [])) for r in rows]
 
 
 def show_config(cfg):
@@ -198,7 +220,7 @@ def show_config(cfg):
     _spec = cfg.get("speculation_mode")
     print(f"  speculation   : {_spec or '(derived from --dflash/--mtp above)'}"
           f"{'   <-- OVERRIDES dflash/mtp' if _spec else ''}")
-    prompt_source = cfg.get("prompt_file") or cfg.get("prompts_file") or "(built-in battery)"
+    prompt_source = cfg.get("prompt_file") or cfg.get("prompts_file") or cfg.get("niah_file") or "(built-in battery)"
     print(f"  seed          : {cfg.get('seed')}   prompt_source: {prompt_source}")
     _cap = cfg['thinking_cap_tokens']
     _thinking_off = cfg['thinking_budget'] == 'off'
@@ -617,6 +639,23 @@ def _self_test_serve_path_proofs():
     print("serve_harness: path-proof self-test OK", flush=True)
 
 
+def _self_test_prompt_sources():
+    """Exercise NIAH lowering without touching a model or GPU."""
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as tmp:
+        json.dump({
+            "filler_text": "alpha needle omega",
+            "question": "What was in the middle?",
+            "expected_answer_substring": "needle",
+        }, tmp)
+        path = tmp.name
+    try:
+        rows = load_prompt_battery(None, niah_file=path)
+        assert rows == [("longctx-niah", "alpha needle omega\n\nWhat was in the middle?", ["needle"])]
+    finally:
+        os.unlink(path)
+    print("serve_harness: prompt-source self-test OK", flush=True)
+
+
 
 def _native_service_warm(port, expected_model=None, proc=None):
     """True only when health is ready for *this* spawn.
@@ -809,18 +848,28 @@ def run(cfg, args):
     label = f"{os.path.basename(cfg['model'])}|{cfg['mtp']}|{cfg['mode']}"
     print(f"### RUN {label}  kv={cfg['kv']} sampling={cfg['sampling']} seed={cfg.get('seed')} ###", flush=True)
     rows = []
-    battery = load_prompt_battery(cfg.get("prompts_file"), cfg.get("prompt_file"))
+    battery = load_prompt_battery(
+        cfg.get("prompts_file"), cfg.get("prompt_file"), cfg.get("niah_file")
+    )
     if cfg["mode"] == "battery":
-        for genre, prompt in battery:
+        for genre, prompt, expected in battery:
             r = send(cfg, [{"role": "user", "content": prompt}])
-            rows.append(r); print(f"  [{genre}]" + turn_line(len(rows), r)[2:], flush=True)
+            missing = [item for item in expected if item.lower() not in r["assistant_content"].lower()]
+            r["expected_substrings"] = expected
+            r["retrieval_missing"] = missing
+            recall = f" recall={len(expected) - len(missing)}/{len(expected)}" if expected else ""
+            rows.append(r); print(f"  [{genre}]" + turn_line(len(rows), r, recall)[2:], flush=True)
     elif cfg["mode"] == "chain":
         messages = []
-        for genre, prompt in battery:
+        for genre, prompt, expected in battery:
             messages.append({"role": "user", "content": prompt})
             r = send(cfg, messages)
             messages.append({"role": "assistant", "content": r["assistant_content"]})
-            rows.append(r); print(f"  [{genre}]" + turn_line(len(rows), r)[2:], flush=True)
+            missing = [item for item in expected if item.lower() not in r["assistant_content"].lower()]
+            r["expected_substrings"] = expected
+            r["retrieval_missing"] = missing
+            recall = f" recall={len(expected) - len(missing)}/{len(expected)}" if expected else ""
+            rows.append(r); print(f"  [{genre}]" + turn_line(len(rows), r, recall)[2:], flush=True)
     elif cfg["mode"] == "session":
         turns = json.load(open(args.session))
         messages = []
@@ -838,6 +887,7 @@ def run(cfg, args):
     pf = [(r["prefill_ms"] or 0)/1000 for r in g]
     print(f"[{label} DONE] turns={len(g)} runaway={sum(r['runaway'] for r in g)} "
           f"empty={sum(r['empty'] for r in g)} attractor={sum(r['attractor'] for r in g)} "
+          f"retrieval_miss={sum(bool(r.get('retrieval_missing')) for r in g)} "
           f"avg_decode={sum(dec)/len(dec):.1f}tok/s" if dec else f"[{label} DONE] turns={len(g)}", flush=True)
     if args.out:
         json.dump(rows, open(args.out, "w"), indent=0)
@@ -898,6 +948,12 @@ def main():
         default=None,
         help="UTF-8 prompt bytes lowered to one prose battery row without newline normalization.",
     )
+    prompt_source.add_argument(
+        "--niah-file",
+        default=None,
+        help="Committed NIAH JSON/JSONL fixture. Lowers filler_text + question exactly and "
+             "fails when expected_answer_substring(s) are absent.",
+    )
     ap.add_argument(
         "--replay-route-proof-log",
         action="store_true",
@@ -913,6 +969,7 @@ def main():
     args = ap.parse_args()
     if args.self_test or os.environ.get("HIPFIRE_SERVE_HARNESS_SELFTEST") == "1":
         _self_test_serve_path_proofs()
+        _self_test_prompt_sources()
         return
     if not args.model:
         ap.error("--model is required unless --self-test")
@@ -945,6 +1002,9 @@ def main():
     if not args.no_spawn:
         _assert_dflash_request_proofs(cfg, rows, args.serve_log, offset=log_offset)
         _kill_serve()
+    missing = [r.get("retrieval_missing") for r in rows if r.get("retrieval_missing")]
+    if missing:
+        sys.exit(f"serve_harness: retrieval gate failed; missing expected substrings: {missing}")
 
 
 if __name__ == "__main__":
