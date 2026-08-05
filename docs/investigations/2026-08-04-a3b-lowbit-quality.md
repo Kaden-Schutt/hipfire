@@ -637,12 +637,30 @@ total apparent traffic (68.7 MiB / 19.65 µs = 3.5 TB/s) is far above DRAM peak,
 confirming the x_rot reads are served from cache. Cutting the minority term
 gives a sub-proportional win, exactly as observed.
 
-**The kernel-level lever this exposes is x_rot reuse, not weight format.** One
-row per block means x_rot is re-read 8192×. A row-tile (2–4 output rows per
-block) amortises it proportionally. That is independently corroborated by
-`project_fused_moe_down_rowtile_win_2026_07_08`: *"WIN fused MoE down NUM_ROWS=2
-row-tile +3.5% gfx1201 a3b — X-REUSE row-tile=lever; fusion-alone no-op."*
-Same lever, same arch, already measured once.
+**~~The kernel-level lever this exposes is x_rot reuse~~ — RETRACTED, already
+falsified.** I proposed row-tiling to amortise the x_rot re-reads. That exact
+experiment was run on this kernel, this arch, and this model and it *regresses*.
+From `kernels/src/gemv_hfq4g256_moe_gate_up_indexed_rowtile.hip`:
+
+> FALSIFIED 2026-07-08: **−2.9% on gfx1201/R9700 a3b mq4r decode** (130.0 →
+> 126.2, interleaved A/B, token-id EXACT). DEFAULT OFF, **DO NOT enable**.
+> […] gate_up's x is the shared post-rmsnorm activation, **already L1-hot for
+> every block, so the row-tile's x-reuse saves nothing**. Net effect is pure
+> register cost (8 accumulators vs 4) → lower occupancy → slower. The down win
+> was situation-specific, not a general row-tile lever.
+
+So my "64 MiB of x_rot traffic" arithmetic was right but the *inference* from it
+was wrong: those reads are L1 hits, not a cost. MQ2GL would take the same
+register hit (4 → 8 accumulators) for the same non-benefit. **Do not row-tile
+gate_up.** The `project_fused_moe_down_rowtile_win_2026_07_08` +3.5% result is
+`down`-only and situation-specific — it eliminated an expanded buffer and a
+combine step, which gate_up does not have.
+
+Corrected read of the microbench: the kernel is **occupancy/issue-bound, not
+byte-bound** at this shape (223 GiB/s of ~596 peak). MQ2GL's ~3% comes from
+removing instructions — the per-quad codebook load and barrier — not from
+moving fewer bytes. Further perf headroom is an occupancy question (VGPR
+counts via the `gfx-kernel-metadata` skill), not a traffic question.
 
 **Verdict on MQ2GL:** ship-worthy but on the quality/size argument, not the
 perf one. ~3% kernel-level (less at model level, since gate_up GEMV is one of
