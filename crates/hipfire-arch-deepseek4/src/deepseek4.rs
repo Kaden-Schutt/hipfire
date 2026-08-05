@@ -25,6 +25,103 @@ use crate::backend::Mq2rBackend;
 /// different ratios still round-trip cleanly.
 pub type CompressRatio = u32;
 
+/// The historical DS4 product route was certified with 2,048 compressed
+/// rows (8,192 ratio-4 tokens). Keep that as the first capacity bucket so
+/// short-context launch geometry and scratch sizing remain unchanged, then
+/// grow geometrically up to the checkpoint's advertised context horizon.
+pub const INITIAL_COMPRESSED_ROWS: usize = 2_048;
+
+/// State-owned compressed-cache sizing. This replaces the former
+/// process-global `HIPFIRE_DEEPSEEK4_MAX_COMPRESS_POS` value: capacity is a
+/// property of the loaded checkpoint/session, not ambient process state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompressorCapacityPlan {
+    max_tokens: usize,
+    max_rows: usize,
+    active_rows: usize,
+    prepared_tokens: usize,
+}
+
+impl CompressorCapacityPlan {
+    pub fn new(max_tokens: usize) -> Result<Self, String> {
+        if max_tokens == 0 {
+            return Err("DeepSeek V4 max_position_embeddings must be > 0".to_string());
+        }
+        // Ratio 4 is the densest compressed tier and therefore owns the
+        // common score/cache stride. Round up so a non-multiple checkpoint
+        // horizon can still admit its last partial block safely.
+        let max_rows = max_tokens.div_ceil(4);
+        Ok(Self {
+            max_tokens,
+            max_rows,
+            active_rows: INITIAL_COMPRESSED_ROWS.min(max_rows).max(1),
+            prepared_tokens: 0,
+        })
+    }
+
+    pub const fn max_tokens(self) -> usize {
+        self.max_tokens
+    }
+
+    pub const fn max_rows(self) -> usize {
+        self.max_rows
+    }
+
+    pub const fn active_rows(self) -> usize {
+        self.active_rows
+    }
+
+    /// Highest request endpoint whose cache pages have been mapped. Decode
+    /// steps at or below this position need no allocation-side work.
+    pub const fn prepared_tokens(self) -> usize {
+        self.prepared_tokens
+    }
+
+    /// Capacity bucket needed for a request ending at `required_tokens`.
+    /// Buckets double only at request boundaries; no allocation or launch
+    /// geometry changes inside a decode/verify capture.
+    pub fn rows_for_tokens(self, required_tokens: usize) -> Result<usize, String> {
+        if required_tokens > self.max_tokens {
+            return Err(format!(
+                "DeepSeek V4 context requires {required_tokens} tokens but the checkpoint advertises {}",
+                self.max_tokens
+            ));
+        }
+        let required_rows = required_tokens.div_ceil(4).max(1);
+        let bucket = required_rows
+            .max(INITIAL_COMPRESSED_ROWS.min(self.max_rows))
+            .checked_next_power_of_two()
+            .ok_or_else(|| "DeepSeek V4 compressed capacity overflow".to_string())?;
+        Ok(bucket.min(self.max_rows))
+    }
+
+    /// Map at least one historical 8K-token quantum ahead so direct decode
+    /// callers do not enter the allocation path every token. Above the final
+    /// power-of-two boundary this remains incremental, allowing F32 to use
+    /// the physical horizon instead of jumping immediately to a full 1M map.
+    pub fn prepared_target_for_tokens(self, required_tokens: usize) -> Result<usize, String> {
+        let rows = self.rows_for_tokens(required_tokens)?;
+        let bucket_tokens = rows.saturating_mul(4).min(self.max_tokens);
+        Ok(required_tokens
+            .saturating_add(INITIAL_COMPRESSED_ROWS * 4 - 1)
+            .min(bucket_tokens)
+            .max(required_tokens))
+    }
+
+    pub fn activate_for_tokens(&mut self, required_tokens: usize) -> Result<bool, String> {
+        let target = self.rows_for_tokens(required_tokens)?;
+        if target <= self.active_rows {
+            return Ok(false);
+        }
+        self.active_rows = target;
+        Ok(true)
+    }
+
+    pub fn mark_prepared(&mut self, required_tokens: usize) {
+        self.prepared_tokens = self.prepared_tokens.max(required_tokens);
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeepseekV4Config {
     // ── transformer-shape basics ────────────────────────────────
@@ -1026,6 +1123,11 @@ impl HashTopkHostScratch {
 /// DeepSeek V4 per-decode state. Held on the daemon's per-session struct,
 /// reused across decode steps. Allocated once via `new_state`.
 pub struct DeepseekV4State {
+    /// Logical and currently-active compressed-cache capacity. The logical
+    /// horizon follows `max_position_embeddings`; the active launch/scratch
+    /// bucket grows automatically at request boundaries.
+    pub compressor_capacity: CompressorCapacityPlan,
+
     /// Per-layer (43 + 1 MTP = 44). Layers with `compress_ratio == 0`
     /// skip the indexer.
     pub _indexer: Vec<IndexerLayerState>,
@@ -1397,6 +1499,7 @@ impl DeepseekV4State {
             });
         }
         Ok(DeepseekV4State {
+            compressor_capacity: CompressorCapacityPlan::new(cfg.max_position_embeddings)?,
             _indexer: indexer,
             _attention: attention,
             residual_streams: None, // allocated on first `decode_step` (needs Gpu).
@@ -1551,7 +1654,11 @@ impl DeepseekV4State {
     pub fn zero_decode_caches(&mut self, gpu: &mut rdna_compute::Gpu) {
         fn z(gpu: &mut rdna_compute::Gpu, t: &Option<rdna_compute::GpuTensor>) {
             if let Some(t) = t {
-                let _ = gpu.hip.memset(&t.buf, 0, t.byte_size());
+                // VMM owners describe the full logical shape but expose only
+                // their mapped prefix through `buf.size()`. Never zero the
+                // reserved-but-unmapped tail.
+                let bytes = gpu.vmm_mapped_bytes(t).unwrap_or_else(|| t.byte_size());
+                let _ = gpu.hip.memset(&t.buf, 0, bytes.min(t.buf.size()));
             }
         }
         // The compressor `score_state` ring must reset to -inf, NOT 0 (matches
@@ -1710,6 +1817,35 @@ impl DeepseekV4State {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compressor_capacity_grows_at_request_boundaries_to_model_horizon() {
+        let plan = CompressorCapacityPlan::new(1_048_576).unwrap();
+        assert_eq!(plan.max_rows(), 262_144);
+        assert_eq!(plan.active_rows(), 2_048);
+        assert_eq!(plan.prepared_tokens(), 0);
+        assert_eq!(plan.rows_for_tokens(8_192).unwrap(), 2_048);
+        assert_eq!(plan.rows_for_tokens(8_193).unwrap(), 4_096);
+        assert_eq!(plan.prepared_target_for_tokens(1).unwrap(), 8_192);
+        assert_eq!(plan.prepared_target_for_tokens(8_193).unwrap(), 16_384);
+        assert_eq!(plan.prepared_target_for_tokens(524_289).unwrap(), 532_480);
+        assert_eq!(plan.rows_for_tokens(32_768).unwrap(), 8_192);
+        assert_eq!(plan.rows_for_tokens(1_048_576).unwrap(), 262_144);
+        assert!(plan.rows_for_tokens(1_048_577).is_err());
+    }
+
+    #[test]
+    fn compressor_capacity_handles_small_and_partial_model_horizons() {
+        let mut plan = CompressorCapacityPlan::new(101).unwrap();
+        assert_eq!(plan.max_rows(), 26);
+        assert_eq!(plan.active_rows(), 26);
+        assert_eq!(plan.rows_for_tokens(101).unwrap(), 26);
+        assert!(!plan.activate_for_tokens(101).unwrap());
+        plan.mark_prepared(73);
+        plan.mark_prepared(12);
+        assert_eq!(plan.prepared_tokens(), 73);
+        assert!(CompressorCapacityPlan::new(0).is_err());
+    }
 
     const DEEPSEEK4_CONFIG_JSON: &str = r#"{
         "vocab_size": 129280, "hidden_size": 4096, "num_hidden_layers": 43,

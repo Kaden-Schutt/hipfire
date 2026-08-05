@@ -1244,9 +1244,9 @@ pub fn load_model_with_kv_backend(
             other.name()
         ));
     }
-    if kv_backend == KvBackend::Vmm && carrier.name() != "qwen35" {
+    if kv_backend == KvBackend::Vmm && !matches!(carrier.name(), "qwen35" | "deepseek4") {
         return Err(format!(
-            "KV backend 'vmm' currently supports qwen3.5 only (selected carrier: {})",
+            "KV backend 'vmm' currently supports qwen3.5 and deepseek4 only (selected carrier: {})",
             carrier.name()
         ));
     }

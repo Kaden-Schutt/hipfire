@@ -2873,6 +2873,18 @@ impl ReplayController {
         self.unknown_effect_launches = 0;
     }
 
+    /// Drop a prepared route after a model-owned allocation/geometry bucket
+    /// changes, preserving the selected backend and transport. Unlike
+    /// [`Self::poison`], this is an expected lifecycle transition: the next
+    /// eligible forward records and prepares a fresh route for the new stable
+    /// layout.
+    pub fn rearm_after_layout_growth(&mut self) {
+        let request = self.request;
+        let transport = self.transport;
+        let auto_lifecycle = self.auto_lifecycle;
+        self.reset_for_model(request, transport, auto_lifecycle);
+    }
+
     pub fn transport_name(&self) -> &'static str {
         match self.transport {
             ReplayTransport::AqlPackets => "aql",
@@ -5333,6 +5345,21 @@ mod tests {
         assert_eq!(controller.state(), ReplayState::Hip);
         assert_eq!(controller.transport_name(), "aql");
         assert!(!controller.is_enabled());
+    }
+
+    #[test]
+    fn layout_growth_rearms_without_changing_route_selection() {
+        let mut controller = ReplayController::new_manual_pm4();
+        controller.state = ReplayState::Ready;
+        controller.fallback_reason = Some("stale prepared layout".to_owned());
+
+        controller.rearm_after_layout_growth();
+
+        assert_eq!(controller.request(), ReplayBackendRequest::Auto);
+        assert_eq!(controller.transport_name(), "pm4");
+        assert_eq!(controller.state(), ReplayState::Armed);
+        assert_eq!(controller.fallback_reason(), None);
+        assert!(!controller.auto_lifecycle);
     }
 
     #[test]

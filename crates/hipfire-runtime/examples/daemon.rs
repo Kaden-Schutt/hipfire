@@ -1183,7 +1183,7 @@ fn redline_reset_deepseek4(
 fn redline_prime_deepseek4(
     gpu: &mut rdna_compute::Gpu,
     bundle: &mut deepseek4::Deepseek4Bundle,
-    pbs: &deepseek4::forward::PrefillBatchScratch,
+    pbs: &mut deepseek4::forward::PrefillBatchScratch,
     context: usize,
 ) -> Result<(), String> {
     let synthetic = (0..context as u32)
@@ -1237,7 +1237,7 @@ fn redline_prime_retained_fixture(
         Some(ModelState::Deepseek4(bundle)) => {
             let pbs = loaded
                 .deepseek4_pbs
-                .as_ref()
+                .as_mut()
                 .ok_or_else(|| "DeepSeek4 prefill scratch missing".to_string())?;
             redline_reset_deepseek4(gpu, bundle)?;
             redline_prime_deepseek4(gpu, bundle, pbs, context)
@@ -1366,7 +1366,7 @@ fn redline_bench_decode_deepseek4(
     loaded.conversation_tokens.clear();
     let pbs = loaded
         .deepseek4_pbs
-        .as_ref()
+        .as_mut()
         .ok_or_else(|| "DeepSeek4 prefill scratch missing".to_string())?;
     let ModelState::Deepseek4(bundle) = loaded.state.as_mut().unwrap() else {
         unreachable!()
@@ -1595,7 +1595,7 @@ fn redline_prime_dspark_shadow_arm(
 ) -> Result<(), String> {
     let pbs = loaded
         .deepseek4_pbs
-        .as_ref()
+        .as_mut()
         .ok_or_else(|| "DSpark shadow: prefill scratch missing".to_string())?;
     let bundle = match loaded.state.as_mut() {
         Some(ModelState::Deepseek4(bundle)) => bundle,
@@ -18588,6 +18588,26 @@ fn generate_deepseek4_spec(
         return;
     }
 
+    let required_tokens = plan
+        .start_pos
+        .saturating_add(suffix.len())
+        .saturating_add(max_tokens);
+    if let Some(ModelState::Deepseek4(bundle)) = m.state.as_mut() {
+        if let Err(error) = deepseek4::forward::ensure_compressor_capacity(
+            &bundle.config,
+            &mut bundle.state,
+            gpu,
+            required_tokens,
+        ) {
+            emit_error_with_id(
+                stdout,
+                id,
+                format!("deepseek4 context-capacity preflight failed: {error}"),
+            );
+            return;
+        }
+    }
+
     // DSA decode-cache miss teardown (the part NOT done by the drafter's
     // cache-miss `state.reset()` or generate_spec's seq_pos/conversation clear):
     // zero the position-indexed rings + invalidate the captured decode graph so a
@@ -18855,7 +18875,7 @@ fn generate_deepseek4(
     // the bundle's `&mut state` below.
     let pbs = m
         .deepseek4_pbs
-        .as_ref()
+        .as_mut()
         .expect("deepseek4_pbs missing on arch_id=9 generate");
     // The single-GPU ds4 bundle (config/weights/state/eos) lives in
     // `ModelState::Deepseek4`. Field-borrow it disjointly so `cfg`/`weights`
@@ -19021,6 +19041,22 @@ fn generate_deepseek4(
         lcp
     };
 
+    // Select/map the complete request's compressed-cache bucket before any
+    // cache reset, prefill, HipGraph capture, or retained-PM4 replay. DS4's
+    // VMM owner addresses remain stable; crossing a geometry bucket re-arms
+    // replay automatically so the new tape is captured once at that shape.
+    let required_tokens = prompt_ids.len().saturating_add(max_tokens);
+    if let Err(error) =
+        deepseek4::forward::ensure_request_capacity(cfg, state, gpu, pbs, required_tokens)
+    {
+        emit_error_with_id(
+            stdout,
+            id,
+            format!("deepseek4 context-capacity preflight failed: {error}"),
+        );
+        return;
+    }
+
     if lcp == 0 {
         // Cache miss — start a fresh conversation in V4F's state.
         state.reset();
@@ -19067,7 +19103,7 @@ fn generate_deepseek4(
     {
         let _ = writeln!(
             stdout,
-            r#"{{"type":"error","id":"{}","message":"prompt exceeds context capacity: prompt={} + max_tokens={} > capacity={} — reload model with a larger max_seq"}}"#,
+            r#"{{"type":"error","id":"{}","message":"prompt exceeds checkpoint context capacity: prompt={} + max_tokens={} > capacity={}"}}"#,
             id,
             start_pos as usize + suffix_tokens.len(),
             max_tokens,

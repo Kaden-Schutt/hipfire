@@ -170,7 +170,7 @@ fn main() -> Result<(), String> {
     let start_pos = prefix as u32;
     if prefix > 0 {
         let chunk = prefix.min(1024);
-        let pre_pbs =
+        let mut pre_pbs =
             hipfire_arch_deepseek4::forward::PrefillBatchScratch::new(&mut gpu, &cfg, chunk)?;
         let t = Instant::now();
         let _ = forward_prefill_batch_chunked(
@@ -180,7 +180,7 @@ fn main() -> Result<(), String> {
             &mut gpu,
             &tokens[..prefix],
             0,
-            &pre_pbs,
+            &mut pre_pbs,
         )?;
         gpu.hip
             .device_synchronize()
@@ -266,7 +266,7 @@ fn main() -> Result<(), String> {
         // against one `PrefillBatchScratch`, so neither an allocation nor a
         // sweep-length thermal drift sits between them.
         for &batch in &batches {
-            let pbs =
+            let mut pbs =
                 hipfire_arch_deepseek4::forward::PrefillBatchScratch::new(&mut gpu, &cfg, batch)?;
             let n_tok = if target_tokens == 0 {
                 batch
@@ -288,7 +288,7 @@ fn main() -> Result<(), String> {
                     // start_pos+n_tok), overwriting those KV slots, so the
                     // measured shape never drifts across reps.
                     let _ = forward_prefill_batch_chunked(
-                        &cfg, &weights, &mut state, &mut gpu, toks, start_pos, &pbs,
+                        &cfg, &weights, &mut state, &mut gpu, toks, start_pos, &mut pbs,
                     )?;
                     gpu.hip
                         .device_synchronize()

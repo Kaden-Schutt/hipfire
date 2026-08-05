@@ -239,11 +239,11 @@ fn main() -> Result<(), String> {
     // trunk one token at a time (1 forward/token), the apples-to-apples
     // denominator for the MTP / DSpark tok/s wins. Same prompt, same warmup.
     if std::env::var("HIPFIRE_DEEPSEEK4_AR").ok().as_deref() == Some("1") {
-        let pbs = forward::PrefillBatchScratch::new(&mut gpu, &bundle.config, 256)?;
+        let mut pbs = forward::PrefillBatchScratch::new(&mut gpu, &bundle.config, 256)?;
         // Greedy AR decode from a fresh prefill; returns the generated tokens.
-        let run = |bundle: &mut Deepseek4Bundle,
-                   gpu: &mut Gpu,
-                   n_max: usize|
+        let mut run = |bundle: &mut Deepseek4Bundle,
+                       gpu: &mut Gpu,
+                       n_max: usize|
          -> Result<Vec<u32>, String> {
             bundle.state.reset();
             bundle.state.zero_decode_caches(gpu);
@@ -255,7 +255,7 @@ fn main() -> Result<(), String> {
                 gpu,
                 &prompt_tokens,
                 0,
-                &pbs,
+                &mut pbs,
             )?;
             let mut tok = logits_argmax(&last) as u32;
             let mut pos = prompt_tokens.len();
@@ -271,7 +271,7 @@ fn main() -> Result<(), String> {
                     gpu,
                     &[tok],
                     pos as u32,
-                    &pbs,
+                    &mut pbs,
                 )?;
                 tok = logits_argmax(&lg) as u32;
                 pos += 1;

@@ -8,7 +8,10 @@
 use crate::compiler::KernelCompiler;
 use crate::feature_flags::FeatureFlags;
 use crate::kernels;
-use hip_bridge::{DeviceBuffer, HipError, HipResult, HipRuntime, Rocblas, VmmArena};
+use hip_bridge::{
+    DeviceBuffer, HipError, HipMemAllocationProp, HipResult, HipRuntime, Rocblas, VmmArena,
+    HIP_MEM_ALLOCATION_GRANULARITY_RECOMMENDED,
+};
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::atomic::AtomicUsize;
@@ -2397,6 +2400,15 @@ impl Gpu {
             .map(VmmArena::granularity)
     }
 
+    /// Return the driver's recommended physical mapping granularity without
+    /// reserving an address range. Model-owned VMM planners use this for a
+    /// dry-run admission check before mapping any cache pages.
+    pub fn vmm_recommended_granularity(&self) -> HipResult<usize> {
+        let prop = HipMemAllocationProp::device_pinned(self.device_id);
+        self.hip
+            .mem_get_allocation_granularity(&prop, HIP_MEM_ALLOCATION_GRANULARITY_RECOMMENDED)
+    }
+
     pub fn vmm_allocation_count(&self) -> usize {
         self.vmm_arenas.len() + self.orphan_vmm_arenas.len()
     }
@@ -2772,6 +2784,14 @@ impl Gpu {
             self.replay
                 .poison("KV mode switch invalidated retained Redline replay state");
         }
+    }
+
+    /// Invalidate captured execution after a model-owned cache capacity
+    /// bucket grows. The allocation change is intentional and recoverable, so
+    /// retained replay is re-armed rather than placed in sticky fallback.
+    pub fn invalidate_for_layout_growth(&mut self) {
+        self.invalidate_graph_state();
+        self.replay.rearm_after_layout_growth();
     }
 
     // ── Kernel operations ───────────────────────────────────────

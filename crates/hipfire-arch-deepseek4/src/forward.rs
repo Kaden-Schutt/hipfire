@@ -270,16 +270,6 @@ mod config_cache {
         static V: OnceLock<bool> = OnceLock::new();
         *V.get_or_init(|| flag_one("HIPFIRE_DEEPSEEK4_SKIP_FFN"))
     }
-    /// `HIPFIRE_DEEPSEEK4_MAX_COMPRESS_POS` — cap on the compressed-KV scan length.
-    pub(super) fn max_compress_pos() -> usize {
-        static V: OnceLock<usize> = OnceLock::new();
-        *V.get_or_init(|| {
-            hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MAX_COMPRESS_POS")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(2048)
-        })
-    }
     /// `HIPFIRE_DEEPSEEK4_ATTN` — when "pos0", attn_stub uses the diagnostic
     /// pos-0 attention path instead of SWA. Default false (i.e. use SWA).
     pub(super) fn attn_pos0() -> bool {
@@ -425,7 +415,8 @@ mod config_cache {
     /// grids derive only from `max_compressed` (graph-safe). Default ON for
     /// the gfx942-v1 route after both promotion conditions passed; set `=0`
     /// to fall back to F2. Selected only when
-    /// `max_compress_pos() >= indexer_topk_two_stage_min()`.
+    /// the active compressed-cache bucket is at least
+    /// `indexer_topk_two_stage_min()`.
     ///
     /// Exactness (raw-i32 channel, `test_indexer_top_k_buf`, MI300X): 13/13
     /// PASS, all four arms (SERIAL / PARALLEL / BOUNDED / TWOSTAGE)
@@ -462,10 +453,11 @@ mod config_cache {
             })
     }
     /// `HIPFIRE_DEEPSEEK4_GFX1151_INDEXER_TOPK_TWOSTAGE` — G1: the gfx1151
-    /// twin of F3. gfx1151's default indexer top-K is the SAME O(N^2)
-    /// rank-count on one workgroup that F2 removed from gfx942, so the
-    /// two-stage merge tree is the promotion candidate there too. Default
-    /// OFF pending measurement; set `=1` to enable. This is a SEPARATE lever
+    /// twin of F3. gfx1151's legacy indexer top-K is the SAME O(N^2)
+    /// rank-count on one workgroup that F2 removed from gfx942. The two-stage
+    /// route is now the MQ2R product default after exactness through the 1M
+    /// scale and the long-context model campaign; set `=0` only as an
+    /// emergency diagnostic fallback. This is a SEPARATE lever
     /// from F3, not one shared `*_TWOSTAGE` flag: strict arch gating (no
     /// gfx942 lever ever bleeding into gfx1151 or vice versa) is enforced by
     /// the arch-gating unit tests, and the two arches promote independently.
@@ -473,10 +465,15 @@ mod config_cache {
         static V: OnceLock<bool> = OnceLock::new();
         arch == "gfx1151"
             && mq2r
-            && *V.get_or_init(|| flag_one("HIPFIRE_DEEPSEEK4_GFX1151_INDEXER_TOPK_TWOSTAGE"))
+            && *V.get_or_init(|| {
+                hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_GFX1151_INDEXER_TOPK_TWOSTAGE")
+                    .ok()
+                    .as_deref()
+                    != Some("0")
+            })
     }
     /// `HIPFIRE_DEEPSEEK4_INDEXER_TOPK_TWOSTAGE_MIN` — minimum
-    /// `max_compress_pos()` at which the two-stage path may be selected.
+    /// active compressed-cache row count at which the two-stage path may be selected.
     /// Default 1024, from the measured standalone-probe crossover against the
     /// F2 bounded kernel (ms per full sequence): the ONLY losing regime is
     /// cap 512, where the bounded kernel takes the `n_compressed <= max_k`
@@ -1638,9 +1635,365 @@ fn attention_input_e8_pack_b3(
 ///     applies tail RoPE with cfg.compress_rope_theta;
 ///     targets `state._indexer[l].indexer_*`
 ///
-/// TODO: implement (kernels ready: compressor_softmax_pool_f32 +
-/// compressor_overlap_concat_f32). See `docs/plans/deepseek4-next-
-/// session.md` for the precise step-by-step.
+fn ensure_cache_tensor_rows(
+    gpu: &mut Gpu,
+    slot: &mut Option<GpuTensor>,
+    logical_rows: usize,
+    required_rows: usize,
+    row_elems: usize,
+    label: &str,
+) -> Result<bool, String> {
+    let required_rows = required_rows.min(logical_rows).max(1);
+    let use_vmm = gpu.arch == "gfx1151";
+    let mut changed = false;
+
+    if slot.is_none() {
+        let tensor = if use_vmm {
+            // Reserve the model horizon but map nothing until the request
+            // preflight below computes the needed prefix.
+            unsafe { gpu.alloc_vmm_tensor(&[logical_rows, row_elems], DType::F32, 0, &[]) }
+                .map_err(|e| format!("reserve VMM {label}: {e:?}"))?
+        } else {
+            gpu.zeros(&[required_rows, row_elems], DType::F32)
+                .map_err(|e| format!("alloc {label}: {e:?}"))?
+        };
+        *slot = Some(tensor);
+        changed = true;
+    }
+
+    let tensor = slot.as_mut().expect("cache tensor just materialized");
+    if let Some(mapped) = gpu.vmm_mapped_bytes(tensor) {
+        let granularity = gpu
+            .vmm_granularity(tensor)
+            .ok_or_else(|| format!("{label}: VMM allocation has no granularity"))?;
+        let row_bytes = row_elems
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| format!("{label}: row-byte overflow"))?;
+        let plan = hipfire_runtime::kv_backend::KvChunkPlan::new(
+            row_bytes,
+            logical_rows,
+            crate::deepseek4::INITIAL_COMPRESSED_ROWS.min(logical_rows),
+            granularity,
+            hipfire_runtime::kv_backend::DEFAULT_VMM_PHYSICAL_CHUNK_BYTES,
+        )
+        .map_err(|e| format!("{label}: VMM growth plan: {e}"))?;
+        if let Some(growth) = plan
+            .growth(mapped, required_rows)
+            .map_err(|e| format!("{label}: VMM growth: {e}"))?
+        {
+            gpu.grow_vmm_tensor(tensor, growth.size_bytes, &[])
+                .map_err(|e| format!("map VMM {label}: {e:?}"))?;
+            changed = true;
+        }
+        return Ok(changed);
+    }
+
+    if tensor.shape.first().copied().unwrap_or(0) >= required_rows {
+        return Ok(changed);
+    }
+
+    // Non-gfx1151 fallback: preserve cache contents while growing the dense
+    // allocation. gfx1151 never takes this pointer-changing path.
+    let replacement = gpu
+        .zeros(&[required_rows, row_elems], DType::F32)
+        .map_err(|e| format!("grow {label}: {e:?}"))?;
+    let copy_bytes = tensor.byte_size();
+    gpu.hip
+        .memcpy_dtod(&replacement.buf, &tensor.buf, copy_bytes)
+        .map_err(|e| format!("copy old {label}: {e:?}"))?;
+    let old = std::mem::replace(tensor, replacement);
+    gpu.free_tensor(old)
+        .map_err(|e| format!("free old {label}: {e:?}"))?;
+    Ok(true)
+}
+
+fn ensure_indexer_scratch_rows(
+    gpu: &mut Gpu,
+    layer: &mut crate::deepseek4::IndexerLayerState,
+    required_rows: usize,
+    layer_idx: usize,
+) -> Result<bool, String> {
+    fn replace_if_short(
+        gpu: &mut Gpu,
+        slot: &mut Option<GpuTensor>,
+        required_rows: usize,
+        label: &str,
+    ) -> Result<bool, String> {
+        if slot
+            .as_ref()
+            .is_some_and(|tensor| tensor.shape.first().copied().unwrap_or(0) >= required_rows)
+        {
+            return Ok(false);
+        }
+        let replacement = gpu
+            .alloc_tensor(&[required_rows], DType::F32)
+            .map_err(|e| format!("alloc {label}: {e:?}"))?;
+        if let Some(old) = slot.replace(replacement) {
+            gpu.free_tensor(old)
+                .map_err(|e| format!("free old {label}: {e:?}"))?;
+        }
+        Ok(true)
+    }
+
+    let score_grew = replace_if_short(
+        gpu,
+        &mut layer.index_score,
+        required_rows,
+        &format!("index_score l{layer_idx}"),
+    )?;
+    // Allocate both merge-tree workspaces with the same stable stride. The
+    // product route selects them automatically on gfx1151 MQ2R, while other
+    // routes simply retain inexpensive unused scratch.
+    let scores_ws_grew = replace_if_short(
+        gpu,
+        &mut layer.topk_ws_scores,
+        required_rows,
+        &format!("topk_ws_scores l{layer_idx}"),
+    )?;
+    let indices_ws_grew = replace_if_short(
+        gpu,
+        &mut layer.topk_ws_indices,
+        required_rows,
+        &format!("topk_ws_indices l{layer_idx}"),
+    )?;
+    Ok(score_grew || scores_ws_grew || indices_ws_grew)
+}
+
+const COMPRESSOR_GROWTH_HEADROOM_BYTES: usize = 512 * 1024 * 1024;
+
+fn checked_add_growth(total: &mut usize, bytes: usize, label: &str) -> Result<(), String> {
+    *total = total
+        .checked_add(bytes)
+        .ok_or_else(|| format!("DeepSeek V4 growth-byte overflow at {label}"))?;
+    Ok(())
+}
+
+fn cache_growth_bytes(
+    gpu: &Gpu,
+    slot: &Option<GpuTensor>,
+    logical_rows: usize,
+    required_rows: usize,
+    row_elems: usize,
+    default_granularity: usize,
+    label: &str,
+) -> Result<usize, String> {
+    let row_bytes = row_elems
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| format!("{label}: row-byte overflow"))?;
+    if gpu.arch != "gfx1151" {
+        return match slot {
+            Some(tensor) if tensor.shape.first().copied().unwrap_or(0) >= required_rows => Ok(0),
+            _ => required_rows
+                .checked_mul(row_bytes)
+                .ok_or_else(|| format!("{label}: dense growth-byte overflow")),
+        };
+    }
+
+    let (mapped, granularity) = slot
+        .as_ref()
+        .and_then(|tensor| Some((gpu.vmm_mapped_bytes(tensor)?, gpu.vmm_granularity(tensor)?)))
+        .unwrap_or((0, default_granularity));
+    let plan = hipfire_runtime::kv_backend::KvChunkPlan::new(
+        row_bytes,
+        logical_rows,
+        crate::deepseek4::INITIAL_COMPRESSED_ROWS.min(logical_rows),
+        granularity,
+        hipfire_runtime::kv_backend::DEFAULT_VMM_PHYSICAL_CHUNK_BYTES,
+    )
+    .map_err(|e| format!("{label}: VMM admission plan: {e}"))?;
+    Ok(plan
+        .growth(mapped, required_rows.min(logical_rows).max(1))
+        .map_err(|e| format!("{label}: VMM admission growth: {e}"))?
+        .map_or(0, |growth| growth.size_bytes))
+}
+
+/// Refuse a growth request before mutating any cache allocation when its
+/// complete physical footprint cannot fit. This keeps the session retryable
+/// (for example with quantized KV) instead of leaving a partially mapped F32
+/// cache after a late-layer allocation failure.
+fn admit_compressor_growth(
+    cfg: &DeepseekV4Config,
+    state: &DeepseekV4State,
+    gpu: &Gpu,
+    pbs: Option<&PrefillBatchScratch>,
+    required_tokens: usize,
+) -> Result<(), String> {
+    let target_rows = state.compressor_capacity.rows_for_tokens(required_tokens)?;
+    let prepared_target = state
+        .compressor_capacity
+        .prepared_target_for_tokens(required_tokens)?;
+    let default_granularity = if gpu.arch == "gfx1151" {
+        gpu.vmm_recommended_granularity()
+            .map_err(|e| format!("query gfx1151 VMM granularity: {e:?}"))?
+    } else {
+        1
+    };
+    let mut growth_bytes = 0usize;
+
+    for (layer_idx, layer) in state._indexer.iter().enumerate() {
+        let ratio = layer.compress_ratio as usize;
+        if ratio == 0 {
+            continue;
+        }
+        let logical_rows = state.compressor_capacity.max_tokens().div_ceil(ratio);
+        let required_layer_rows = prepared_target.div_ceil(ratio).max(1);
+        checked_add_growth(
+            &mut growth_bytes,
+            cache_growth_bytes(
+                gpu,
+                &layer.main_kv_cache,
+                logical_rows,
+                required_layer_rows,
+                cfg.head_dim,
+                default_granularity,
+                &format!("main_kv_cache l{layer_idx}"),
+            )?,
+            "main_kv_cache",
+        )?;
+        if ratio == 4 {
+            checked_add_growth(
+                &mut growth_bytes,
+                cache_growth_bytes(
+                    gpu,
+                    &layer.indexer_kv_cache,
+                    logical_rows,
+                    required_layer_rows,
+                    cfg.index_head_dim,
+                    default_granularity,
+                    &format!("indexer_kv_cache l{layer_idx}"),
+                )?,
+                "indexer_kv_cache",
+            )?;
+            for (slot, label) in [
+                (&layer.index_score, "index_score"),
+                (&layer.topk_ws_scores, "topk_ws_scores"),
+                (&layer.topk_ws_indices, "topk_ws_indices"),
+            ] {
+                if !slot
+                    .as_ref()
+                    .is_some_and(|tensor| tensor.shape.first().copied().unwrap_or(0) >= target_rows)
+                {
+                    checked_add_growth(
+                        &mut growth_bytes,
+                        target_rows
+                            .checked_mul(std::mem::size_of::<f32>())
+                            .ok_or_else(|| {
+                                format!("{label} l{layer_idx}: scratch growth-byte overflow")
+                            })?,
+                        label,
+                    )?;
+                }
+            }
+        }
+    }
+
+    if let Some(pbs) = pbs.filter(|pbs| target_rows > pbs.idx_score_capacity) {
+        let bytes = pbs
+            .max_batch
+            .checked_mul(target_rows)
+            .and_then(|elements| elements.checked_mul(std::mem::size_of::<f32>()))
+            .ok_or_else(|| "idx_scores_batch growth-byte overflow".to_string())?;
+        checked_add_growth(&mut growth_bytes, bytes, "idx_scores_batch")?;
+    }
+
+    let (free_bytes, total_bytes) = gpu
+        .hip
+        .get_vram_info()
+        .map_err(|e| format!("query VRAM before DeepSeek V4 cache growth: {e:?}"))?;
+    let required_with_headroom = growth_bytes
+        .checked_add(COMPRESSOR_GROWTH_HEADROOM_BYTES)
+        .ok_or_else(|| "DeepSeek V4 admission-byte overflow".to_string())?;
+    if required_with_headroom > free_bytes {
+        return Err(format!(
+            "DeepSeek V4 F32 compressed cache cannot admit {required_tokens} tokens atomically: growth {:.2} GiB + {:.2} GiB headroom exceeds {:.2} GiB free ({:.2} GiB addressable); use quantized KV or a shorter request",
+            growth_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+            COMPRESSOR_GROWTH_HEADROOM_BYTES as f64 / (1024.0 * 1024.0 * 1024.0),
+            free_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+            total_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+        ));
+    }
+    Ok(())
+}
+
+/// Ensure every compressed cache covers a complete request before prefill or
+/// decode capture starts. Returns whether the launch/scratch bucket changed.
+pub fn ensure_compressor_capacity(
+    cfg: &DeepseekV4Config,
+    state: &mut DeepseekV4State,
+    gpu: &mut Gpu,
+    required_tokens: usize,
+) -> Result<bool, String> {
+    if required_tokens <= state.compressor_capacity.prepared_tokens() {
+        return Ok(false);
+    }
+    admit_compressor_growth(cfg, state, gpu, None, required_tokens)?;
+    let mut next_plan = state.compressor_capacity;
+    let bucket_grew = next_plan.activate_for_tokens(required_tokens)?;
+    let active_rows = next_plan.active_rows();
+    let prepared_target = next_plan.prepared_target_for_tokens(required_tokens)?;
+    let mut layout_grew = bucket_grew;
+
+    for (layer_idx, layer) in state._indexer.iter_mut().enumerate() {
+        let ratio = layer.compress_ratio as usize;
+        if ratio == 0 {
+            continue;
+        }
+        let logical_rows = next_plan.max_tokens().div_ceil(ratio);
+        let required_layer_rows = prepared_target.div_ceil(ratio).max(1);
+        layout_grew |= ensure_cache_tensor_rows(
+            gpu,
+            &mut layer.main_kv_cache,
+            logical_rows,
+            required_layer_rows,
+            cfg.head_dim,
+            &format!("main_kv_cache l{layer_idx}"),
+        )?;
+        if ratio == 4 {
+            layout_grew |= ensure_cache_tensor_rows(
+                gpu,
+                &mut layer.indexer_kv_cache,
+                logical_rows,
+                required_layer_rows,
+                cfg.index_head_dim,
+                &format!("indexer_kv_cache l{layer_idx}"),
+            )?;
+            layout_grew |= ensure_indexer_scratch_rows(gpu, layer, active_rows, layer_idx)?;
+        }
+    }
+
+    next_plan.mark_prepared(prepared_target);
+    state.compressor_capacity = next_plan;
+    if layout_grew {
+        state.ar_forward_warmed_up = false;
+        gpu.invalidate_for_layout_growth();
+        eprintln!(
+            "[DeepSeek V4] compressed capacity prepared through {prepared_target} tokens ({active_rows} active ratio-4 rows)",
+        );
+    }
+    Ok(layout_grew)
+}
+
+/// Request-boundary preflight for both persistent caches and batched score
+/// scratch. This is the canonical automatic sizing entry point.
+pub fn ensure_request_capacity(
+    cfg: &DeepseekV4Config,
+    state: &mut DeepseekV4State,
+    gpu: &mut Gpu,
+    pbs: &mut PrefillBatchScratch,
+    required_tokens: usize,
+) -> Result<bool, String> {
+    let target_rows = state.compressor_capacity.rows_for_tokens(required_tokens)?;
+    if required_tokens <= state.compressor_capacity.prepared_tokens()
+        && target_rows <= pbs.idx_score_capacity
+    {
+        return Ok(false);
+    }
+    admit_compressor_growth(cfg, state, gpu, Some(pbs), required_tokens)?;
+    let scratch_grew = pbs.ensure_idx_score_capacity(gpu, target_rows)?;
+    let cache_grew = ensure_compressor_capacity(cfg, state, gpu, required_tokens)?;
+    Ok(scratch_grew || cache_grew)
+}
+
 #[allow(dead_code, clippy::too_many_arguments)]
 fn compressor_forward(
     cfg: &DeepseekV4Config,
@@ -1770,10 +2123,7 @@ fn compressor_forward_impl(
         )
     };
 
-    let max_compressed: usize = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MAX_COMPRESS_POS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(2048);
+    let max_compressed = state.compressor_capacity.active_rows();
 
     // Lazy-allocate state buffers per (layer, compressor-type).
     {
@@ -2380,10 +2730,7 @@ fn compressor_forward_batched(
     let proj_dim = coff * head_dim;
     let state_rows = coff * ratio;
 
-    let max_compressed: usize = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MAX_COMPRESS_POS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(2048);
+    let max_compressed = state.compressor_capacity.active_rows();
 
     // Lazy-alloc state buffers (mirror compressor_forward_impl exactly).
     {
@@ -2756,7 +3103,7 @@ fn indexer_forward(
     // running the kernels means the captured graph contains them
     // whether warmup hit them or not, fixing graph replay at early
     // positions.
-    let max_compressed = config_cache::max_compress_pos();
+    let max_compressed = state.compressor_capacity.active_rows();
     let n = n_filled.min(max_compressed);
 
     // F3/G1 two-stage top-K selection, computed ONCE: gates both the lazy
@@ -2988,6 +3335,7 @@ pub fn decode_step(
     token_id: u32,
     position: u32,
 ) -> Result<Vec<f32>, String> {
+    ensure_compressor_capacity(cfg, state, gpu, (position as usize).saturating_add(1))?;
     // HIP-graphs prerequisite: lift the ~130 per-token pos_buf
     // `memcpy_htod` calls out of the per-layer code into a single
     // bulk write at decode-step entry. Per-layer kernels then read
@@ -3111,6 +3459,9 @@ pub fn decode_step_with_graph(
     position: u32,
 ) -> Result<Vec<f32>, String> {
     use std::sync::OnceLock;
+    // Mapping and any launch-geometry bucket transition must complete before
+    // HipGraph/Redline decides whether to capture or replay this step.
+    ensure_compressor_capacity(cfg, state, gpu, (position as usize).saturating_add(1))?;
     // State-dependent kernargs (SWA slot/n_valid, indexer n_compressed/k_active,
     // compressor ring/commit slots) all live in `state.attn_state_buf` and
     // `state.pos_array_device` device buffers now. The captured graph re-reads
@@ -3501,7 +3852,7 @@ fn fill_attn_state_host(cfg: &DeepseekV4Config, state: &mut DeepseekV4State, pos
     let win = cfg.sliding_window as i32;
     let topk = cfg.index_topk as i32; // DeepSeek V4: 512
     let pos = position as i32;
-    let max_compressed = config_cache::max_compress_pos() as i32;
+    let max_compressed = state.compressor_capacity.active_rows() as i32;
     let swa_slot = pos % win;
     let n_valid_swa = (pos + 1).min(win);
     let n_compressed_4 = capped_compressed_count(pos, 4, max_compressed);
@@ -7800,7 +8151,7 @@ pub(crate) fn precompute_attn_state_batched(
 
     let win = cfg.sliding_window as i32;
     let topk = cfg.index_topk as i32;
-    let max_compressed = config_cache::max_compress_pos() as i32;
+    let max_compressed = pbs.idx_score_capacity as i32;
 
     let mut host: Vec<i32> = vec![0i32; total_i32s];
     for b in 0..batch_size {
@@ -7943,6 +8294,10 @@ fn init_residual_streams(
 /// per-chunk layer iterations.
 pub struct PrefillBatchScratch {
     pub max_batch: usize,
+    /// Allocated row stride of `idx_scores_batch`. It tracks the state's
+    /// active compressed-capacity bucket and is resized only before a request,
+    /// never inside a captured verify body.
+    pub idx_score_capacity: usize,
     /// DSpark verify retained routes, keyed by the full target batch B. These
     /// controllers are separate from `Gpu::replay`, which owns the certified
     /// ordinary-AR tape.
@@ -8169,6 +8524,9 @@ impl PrefillBatchScratch {
         let n_heads = cfg.num_attention_heads;
         let head_dim = cfg.head_dim;
         let hc_mult = cfg.hc_mult;
+        let idx_score_capacity =
+            crate::deepseek4::CompressorCapacityPlan::new(cfg.max_position_embeddings)?
+                .active_rows();
 
         let alloc = |gpu: &mut Gpu, shape: &[usize], label: &str| -> Result<GpuTensor, String> {
             gpu.alloc_tensor(shape, DType::F32)
@@ -8188,6 +8546,7 @@ impl PrefillBatchScratch {
 
         Ok(Self {
             max_batch,
+            idx_score_capacity,
             dspark_verify_pm4: std::collections::BTreeMap::new(),
             embed_batch: alloc(gpu, &[max_batch, hidden], "embed_batch")?,
             streams_batch: zeros(gpu, &[max_batch, hc_mult, hidden], "streams_batch")?,
@@ -8299,14 +8658,15 @@ impl PrefillBatchScratch {
                 &[max_batch, cfg.num_experts_per_tok, hidden],
                 "moe_down_expert_outputs",
             )?,
-            // Indexer-chain scratch. max_compressed default 2048 unless overridden via env.
+            // Indexer-chain scratch. The initial 2,048-row product bucket is
+            // grown automatically at request boundaries.
             idx_q_batch: alloc(
                 gpu,
                 &[max_batch, cfg.index_n_heads, cfg.index_head_dim],
                 "idx_q_batch",
             )?,
             idx_w_batch: alloc(gpu, &[max_batch, cfg.index_n_heads], "idx_w_batch")?,
-            idx_scores_batch: alloc(gpu, &[max_batch, 2048], "idx_scores_batch")?,
+            idx_scores_batch: alloc(gpu, &[max_batch, idx_score_capacity], "idx_scores_batch")?,
             idx_topk_indices_batch: alloc(
                 gpu,
                 &[max_batch, cfg.index_topk],
@@ -8454,6 +8814,33 @@ impl PrefillBatchScratch {
                 t
             },
         })
+    }
+
+    /// Resize the batched indexer score slab to a new stable row stride.
+    /// Any retained verify route owns the old pointer and must be dropped
+    /// before that allocation is returned to the pool.
+    pub fn ensure_idx_score_capacity(
+        &mut self,
+        gpu: &mut Gpu,
+        required_rows: usize,
+    ) -> Result<bool, String> {
+        if required_rows <= self.idx_score_capacity {
+            return Ok(false);
+        }
+        let replacement = gpu
+            .alloc_tensor(&[self.max_batch, required_rows], DType::F32)
+            .map_err(|e| {
+                format!(
+                    "PrefillBatchScratch grow idx_scores_batch {} -> {required_rows}: {e:?}",
+                    self.idx_score_capacity
+                )
+            })?;
+        self.dspark_verify_pm4.clear();
+        let old = std::mem::replace(&mut self.idx_scores_batch, replacement);
+        gpu.free_tensor(old)
+            .map_err(|e| format!("PrefillBatchScratch free old idx_scores_batch: {e:?}"))?;
+        self.idx_score_capacity = required_rows;
+        Ok(true)
     }
 
     /// Release every GPU buffer this prefill-batch scratch owns back to
@@ -9625,11 +10012,7 @@ fn attention_block_batched_mixed(
 
         // Per-batch n_filled = (start_pos+b+1)/ratio, clamped.
         // n_max across batch = max value, used as kernel's per-batch cap.
-        let max_compressed: usize =
-            hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MAX_COMPRESS_POS")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(2048);
+        let max_compressed = pbs.idx_score_capacity;
         let n_per_batch_host: Vec<i32> = (0..batch_size)
             .map(|b| (((start_pos as usize) + b + 1) / ratio).min(max_compressed) as i32)
             .collect();
@@ -9818,11 +10201,7 @@ fn attention_block_batched_mixed(
         }
     } else {
         // ratio == 128: identity gather, no indexer. Per-batch n_compressed.
-        let max_compressed: usize =
-            hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MAX_COMPRESS_POS")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(2048);
+        let max_compressed = pbs.idx_score_capacity;
         let max_n_compressed = (((start_pos as usize) + batch_size) / ratio)
             .min(max_compressed)
             .min(topk_max);
@@ -11598,7 +11977,7 @@ pub(crate) fn upload_prefill_batch_inputs(
     let n_valid_host: Vec<i32> = (0..n)
         .map(|b| ((start_pos as usize + b + 1).min(win)) as i32)
         .collect();
-    let max_compressed = config_cache::max_compress_pos();
+    let max_compressed = pbs.idx_score_capacity;
     let n_compressed_4_host: Vec<i32> = (0..n)
         .map(|b| ((start_pos as usize + b + 1) / 4).min(max_compressed) as i32)
         .collect();
@@ -11638,10 +12017,17 @@ pub fn forward_prefill_batch_chunk(
     weights: &DeepseekV4Weights,
     state: &mut DeepseekV4State,
     gpu: &mut Gpu,
-    pbs: &PrefillBatchScratch,
+    pbs: &mut PrefillBatchScratch,
     tokens: &[u32],
     start_pos: u32,
 ) -> Result<(), String> {
+    ensure_request_capacity(
+        cfg,
+        state,
+        gpu,
+        pbs,
+        (start_pos as usize).saturating_add(tokens.len()),
+    )?;
     upload_prefill_batch_inputs(cfg, gpu, pbs, tokens, start_pos)?;
     forward_prefill_batch_chunk_impl(cfg, weights, state, gpu, pbs, tokens, start_pos, false)
 }
@@ -11658,6 +12044,18 @@ pub(crate) fn forward_prefill_batch_chunk_preuploaded(
     tokens: &[u32],
     start_pos: u32,
 ) -> Result<(), String> {
+    let required_tokens = (start_pos as usize).saturating_add(tokens.len());
+    let required_rows = state.compressor_capacity.rows_for_tokens(required_tokens)?;
+    if required_rows > state.compressor_capacity.active_rows()
+        || required_tokens > state.compressor_capacity.prepared_tokens()
+        || required_rows > pbs.idx_score_capacity
+    {
+        return Err(format!(
+            "capture-safe DS4 verify requires preflight: rows={required_rows}, state={}, pbs={}",
+            state.compressor_capacity.active_rows(),
+            pbs.idx_score_capacity
+        ));
+    }
     forward_prefill_batch_chunk_impl(cfg, weights, state, gpu, pbs, tokens, start_pos, true)
 }
 
@@ -12007,11 +12405,18 @@ pub fn forward_prefill_batch_chunked(
     gpu: &mut Gpu,
     tokens: &[u32],
     start_pos: u32,
-    pbs: &PrefillBatchScratch,
+    pbs: &mut PrefillBatchScratch,
 ) -> Result<Vec<f32>, String> {
     if tokens.is_empty() {
         return Err("forward_prefill_batch_chunked: empty tokens".to_string());
     }
+    ensure_request_capacity(
+        cfg,
+        state,
+        gpu,
+        pbs,
+        (start_pos as usize).saturating_add(tokens.len()),
+    )?;
 
     // Strict batched-only path. Any chunk failure surfaces immediately —
     // we do NOT silently fall back to per-token decode_step. The original
@@ -12057,7 +12462,7 @@ pub fn prefill_with_mtp_fill(
     weights: &DeepseekV4Weights,
     state: &mut DeepseekV4State,
     gpu: &mut Gpu,
-    pbs: &PrefillBatchScratch,
+    pbs: &mut PrefillBatchScratch,
     prompt_tokens: &[u32],
     start_pos: u32,
 ) -> Result<Vec<f32>, String> {
@@ -13788,8 +14193,8 @@ mod tests {
         assert!(!config_cache::hc_finalize_input_map_on(arch, true));
         assert!(!config_cache::qnorm_rotate_fused_on(arch, true));
         assert!(!config_cache::redline_ffn_split_on(arch, true));
-        // G1 is gfx1151's own two-stage lever: arch-gate passes, default OFF.
-        assert!(!config_cache::gfx1151_indexer_topk_two_stage_on(arch, true));
+        // G1 is gfx1151's own certified two-stage route and defaults ON.
+        assert!(config_cache::gfx1151_indexer_topk_two_stage_on(arch, true));
         // gfx942 A2 levers must not bleed into gfx1151.
         assert!(!config_cache::gfx942_compressor_gate_on(arch, true));
         assert!(!config_cache::gfx942_indexer_topk_bounded_on(arch, true));
@@ -13921,7 +14326,8 @@ mod tests {
         // gfx1151 grouped flag stays gfx1151-only.
         assert!(!config_cache::e8_wo_grouped_on("gfx942", true));
         // G1 is the gfx1151 twin of F3 and must not bleed into gfx942 or any
-        // other arch; it also fails closed on non-mq2r and defaults OFF.
+        // other arch; it also fails closed on non-mq2r and defaults ON only
+        // for the exact gfx1151 MQ2R route.
         assert!(!config_cache::gfx1151_indexer_topk_two_stage_on(
             "gfx942", true
         ));
@@ -13934,7 +14340,7 @@ mod tests {
         assert!(!config_cache::gfx1151_indexer_topk_two_stage_on(
             "gfx1151", false
         ));
-        assert!(!config_cache::gfx1151_indexer_topk_two_stage_on(
+        assert!(config_cache::gfx1151_indexer_topk_two_stage_on(
             "gfx1151", true
         ));
     }

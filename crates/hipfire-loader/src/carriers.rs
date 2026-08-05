@@ -1085,6 +1085,10 @@ impl Carrier for Deepseek4Carrier {
         } else {
             None
         };
+        let advertised_context = config.max_position_embeddings;
+        eprintln!(
+            "  deepseek4 compressed cache: automatic VMM growth to advertised context {advertised_context}"
+        );
         Ok(LoadedModel {
             state: Some(crate::ModelState::Deepseek4(deepseek4::Deepseek4Bundle {
                 config,
@@ -1097,8 +1101,8 @@ impl Carrier for Deepseek4Carrier {
             ..LoadedModel::skeleton(
                 meta.arch_id,
                 meta.tokenizer,
-                ctx.max_seq,
-                ctx.max_seq,
+                advertised_context,
+                advertised_context,
                 ctx.path.to_string(),
                 meta.chat_template,
             )

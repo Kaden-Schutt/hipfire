@@ -227,7 +227,7 @@ fn main() -> Result<(), String> {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(1024);
-    let pbs = PrefillBatchScratch::new(&mut gpu, &cfg, pbs_max_batch)?;
+    let mut pbs = PrefillBatchScratch::new(&mut gpu, &cfg, pbs_max_batch)?;
 
     eprintln!("DeepSeek V4 ready. Type a prompt and press enter (or pipe text). EOF to quit. /reset to clear context.");
     eprintln!(
@@ -333,7 +333,7 @@ fn main() -> Result<(), String> {
                 &weights,
                 &mut state,
                 &mut gpu,
-                &pbs,
+                &mut pbs,
                 &prompt_tokens,
                 start_pp_pos,
             )?
@@ -345,7 +345,7 @@ fn main() -> Result<(), String> {
                 &mut gpu,
                 &prompt_tokens,
                 start_pp_pos,
-                &pbs,
+                &mut pbs,
             )?
         };
         pos = start_pp_pos + prompt_tokens.len() as u32;
@@ -384,7 +384,7 @@ fn main() -> Result<(), String> {
                     &weights,
                     &mut state,
                     &mut gpu,
-                    &pbs,
+                    &mut pbs,
                     spec_last_token,
                     spec_last_position,
                     lh,

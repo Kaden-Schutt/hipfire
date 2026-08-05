@@ -21,7 +21,6 @@ use std::{collections::HashSet, path::Path, time::Instant};
 #[derive(Debug)]
 struct Args {
     model: String,
-    cap: usize,
     position: Option<usize>,
     prefill: Option<usize>,
     batch: usize,
@@ -33,12 +32,11 @@ struct Args {
 fn parse_args() -> Result<Args, String> {
     let mut it = std::env::args().skip(1);
     let model = it.next().ok_or_else(|| {
-        "usage: ds4_longctx_probe MODEL --cap N [--position N | --prefill N] \
+        "usage: ds4_longctx_probe MODEL [--position N | --prefill N] \
          [--batch N] [--decode-reps N] [--topk-sanity] [--generate N]"
     })?;
     let mut out = Args {
         model,
-        cap: 2048,
         position: None,
         prefill: None,
         batch: 1024,
@@ -48,7 +46,12 @@ fn parse_args() -> Result<Args, String> {
     };
     while let Some(flag) = it.next() {
         match flag.as_str() {
-            "--cap" => out.cap = it.next().ok_or("--cap N")?.parse().map_err(|_| "bad --cap")?,
+            "--cap" => {
+                return Err(
+                    "--cap was removed: DS4 compressor capacity now grows automatically from the request"
+                        .to_string(),
+                )
+            }
             "--position" => {
                 out.position = Some(
                     it.next()
@@ -88,8 +91,8 @@ fn parse_args() -> Result<Args, String> {
     if out.topk_sanity && out.prefill.is_none() {
         return Err("--topk-sanity requires real --prefill cache contents".to_string());
     }
-    if out.cap == 0 || out.batch == 0 {
-        return Err("--cap and --batch must be non-zero".to_string());
+    if out.batch == 0 {
+        return Err("--batch must be non-zero".to_string());
     }
     Ok(out)
 }
@@ -183,7 +186,10 @@ fn topk_snapshot(
         let raw = gpu
             .download_f32(tensor)
             .map_err(|e| format!("download top-k layer {layer}: {e:?}"))?;
-        let indices: Vec<i32> = raw.iter().map(|value| i32::from_ne_bytes(value.to_ne_bytes())).collect();
+        let indices: Vec<i32> = raw
+            .iter()
+            .map(|value| i32::from_ne_bytes(value.to_ne_bytes()))
+            .collect();
         let valid: Vec<i32> = indices
             .iter()
             .copied()
@@ -240,18 +246,15 @@ fn report_topk_change(first: &TopkSnapshot, second: &TopkSnapshot) {
     );
 }
 
-
 fn run() -> Result<(), String> {
     let args = parse_args()?;
-    std::env::set_var("HIPFIRE_DEEPSEEK4_MAX_COMPRESS_POS", args.cap.to_string());
     std::env::set_var("HIPFIRE_DEEPSEEK4_GRAPH", "0");
     std::env::set_var("HIPFIRE_FORWARD_LOWERED", "0");
 
     let wall_start = Instant::now();
     println!(
-        "PROBE model={} cap={} position={:?} prefill={:?} batch={} decode_reps={} topk_sanity={} generate={}",
+        "PROBE model={} compressor_capacity=automatic position={:?} prefill={:?} batch={} decode_reps={} topk_sanity={} generate={}",
         args.model,
-        args.cap,
         args.position,
         args.prefill,
         args.batch,
@@ -259,13 +262,22 @@ fn run() -> Result<(), String> {
         args.topk_sanity,
         args.generate
     );
-    let mut hfq = HfqFile::open(Path::new(&args.model)).map_err(|e| format!("open model: {e:?}"))?;
+    let mut hfq =
+        HfqFile::open(Path::new(&args.model)).map_err(|e| format!("open model: {e:?}"))?;
     let mut cfg = DeepseekV4::config_from_hfq(&hfq)?;
     cfg.load_dspark = false;
     let tokenizer = Tokenizer::from_hfq_metadata(&hfq.metadata_json)
         .map_err(|e| format!("tokenizer: {e:?}"))?;
-    let ratio4_layers = cfg.compress_ratios.iter().filter(|&&ratio| ratio == 4).count();
-    let ratio128_layers = cfg.compress_ratios.iter().filter(|&&ratio| ratio == 128).count();
+    let ratio4_layers = cfg
+        .compress_ratios
+        .iter()
+        .filter(|&&ratio| ratio == 4)
+        .count();
+    let ratio128_layers = cfg
+        .compress_ratios
+        .iter()
+        .filter(|&&ratio| ratio == 128)
+        .count();
     println!(
         "CONFIG layers={} ratio4_layers={} ratio128_layers={} index_topk={} max_position_embeddings={} effective_route_scale={}",
         cfg.num_hidden_layers,
@@ -282,7 +294,9 @@ fn run() -> Result<(), String> {
     let load_start = Instant::now();
     let weights = DeepseekV4::load_weights(&mut hfq, &cfg, &mut gpu)?;
     drop(hfq);
-    gpu.hip.device_synchronize().map_err(|e| format!("load sync: {e:?}"))?;
+    gpu.hip
+        .device_synchronize()
+        .map_err(|e| format!("load sync: {e:?}"))?;
     let load_s = load_start.elapsed().as_secs_f64();
     println!("LOAD wall_s={load_s:.6}");
     print_vram("weights_loaded", &gpu, &mut peak)?;
@@ -293,11 +307,13 @@ fn run() -> Result<(), String> {
     let mut prefill_s = 0.0f64;
 
     let pbs = if let Some(n) = args.prefill {
-        let scratch = PrefillBatchScratch::new(&mut gpu, &cfg, args.batch)
+        let mut scratch = PrefillBatchScratch::new(&mut gpu, &cfg, args.batch)
             .map_err(|e| format!("alloc prefill scratch batch={}: {e}", args.batch))?;
         print_vram("prefill_scratch", &gpu, &mut peak)?;
         let tokens = prompt_tokens(&tokenizer, n);
-        gpu.hip.device_synchronize().map_err(|e| format!("prefill pre-sync: {e:?}"))?;
+        gpu.hip
+            .device_synchronize()
+            .map_err(|e| format!("prefill pre-sync: {e:?}"))?;
         let start = Instant::now();
         let logits = forward_prefill_batch_chunked(
             &cfg,
@@ -306,10 +322,12 @@ fn run() -> Result<(), String> {
             &mut gpu,
             &tokens,
             0,
-            &scratch,
+            &mut scratch,
         )
         .map_err(|e| format!("prefill context={n}: {e}"))?;
-        gpu.hip.device_synchronize().map_err(|e| format!("prefill post-sync: {e:?}"))?;
+        gpu.hip
+            .device_synchronize()
+            .map_err(|e| format!("prefill post-sync: {e:?}"))?;
         prefill_s = start.elapsed().as_secs_f64();
         current_pos = n;
         state.n_tokens = n as u64;
@@ -327,18 +345,11 @@ fn run() -> Result<(), String> {
         // views are initialized by the first forward and cannot safely be
         // created for the first time at an arbitrary absolute position.
         state.n_tokens = 0;
-        let bootstrap = match decode_step(
-            &cfg,
-            &weights,
-            &mut state,
-            &mut gpu,
-            next_token,
-            0,
-        ) {
+        let bootstrap = match decode_step(&cfg, &weights, &mut state, &mut gpu, next_token, 0) {
             Ok(logits) => logits,
             Err(error) => {
                 let _ = print_vram("bootstrap_failure", &gpu, &mut peak);
-                return Err(format!("synthetic bootstrap cap={}: {error}", args.cap));
+                return Err(format!("synthetic bootstrap: {error}"));
             }
         };
         gpu.hip
@@ -352,16 +363,46 @@ fn run() -> Result<(), String> {
     };
 
     if args.topk_sanity {
-        let logits_a = decode_step(&cfg, &weights, &mut state, &mut gpu, next_token, current_pos as u32)
-            .map_err(|e| format!("top-k query A pos={current_pos}: {e}"))?;
-        gpu.hip.device_synchronize().map_err(|e| format!("top-k A sync: {e:?}"))?;
-        let first = topk_snapshot(&cfg, &state, &gpu, current_pos, args.cap)?;
+        let logits_a = decode_step(
+            &cfg,
+            &weights,
+            &mut state,
+            &mut gpu,
+            next_token,
+            current_pos as u32,
+        )
+        .map_err(|e| format!("top-k query A pos={current_pos}: {e}"))?;
+        gpu.hip
+            .device_synchronize()
+            .map_err(|e| format!("top-k A sync: {e:?}"))?;
+        let first = topk_snapshot(
+            &cfg,
+            &state,
+            &gpu,
+            current_pos,
+            state.compressor_capacity.active_rows(),
+        )?;
         current_pos += 1;
         let token_b = argmax(&logits_a);
-        let logits_b = decode_step(&cfg, &weights, &mut state, &mut gpu, token_b, current_pos as u32)
-            .map_err(|e| format!("top-k query B pos={current_pos}: {e}"))?;
-        gpu.hip.device_synchronize().map_err(|e| format!("top-k B sync: {e:?}"))?;
-        let second = topk_snapshot(&cfg, &state, &gpu, current_pos, args.cap)?;
+        let logits_b = decode_step(
+            &cfg,
+            &weights,
+            &mut state,
+            &mut gpu,
+            token_b,
+            current_pos as u32,
+        )
+        .map_err(|e| format!("top-k query B pos={current_pos}: {e}"))?;
+        gpu.hip
+            .device_synchronize()
+            .map_err(|e| format!("top-k B sync: {e:?}"))?;
+        let second = topk_snapshot(
+            &cfg,
+            &state,
+            &gpu,
+            current_pos,
+            state.compressor_capacity.active_rows(),
+        )?;
         report_topk_change(&first, &second);
         current_pos += 1;
         next_token = argmax(&logits_b);
@@ -381,13 +422,12 @@ fn run() -> Result<(), String> {
         Ok(logits) => logits,
         Err(error) => {
             let _ = print_vram("decode_failure", &gpu, &mut peak);
-            return Err(format!(
-                "decode warmup cap={} pos={current_pos}: {error}",
-                args.cap
-            ));
+            return Err(format!("decode warmup pos={current_pos}: {error}"));
         }
     };
-    gpu.hip.device_synchronize().map_err(|e| format!("warmup sync: {e:?}"))?;
+    gpu.hip
+        .device_synchronize()
+        .map_err(|e| format!("warmup sync: {e:?}"))?;
     let warm_s = warm_start.elapsed().as_secs_f64();
     if let Some(position) = args.position {
         state.n_tokens = position as u64;
@@ -406,7 +446,9 @@ fn run() -> Result<(), String> {
             state.n_tokens = position as u64;
             current_pos = position;
         }
-        gpu.hip.device_synchronize().map_err(|e| format!("decode pre-sync: {e:?}"))?;
+        gpu.hip
+            .device_synchronize()
+            .map_err(|e| format!("decode pre-sync: {e:?}"))?;
         let start = Instant::now();
         let logits = decode_step(
             &cfg,
@@ -416,10 +458,15 @@ fn run() -> Result<(), String> {
             next_token,
             current_pos as u32,
         )
-        .map_err(|e| format!("decode rep={rep} cap={} pos={current_pos}: {e}", args.cap))?;
-        gpu.hip.device_synchronize().map_err(|e| format!("decode post-sync: {e:?}"))?;
+        .map_err(|e| format!("decode rep={rep} pos={current_pos}: {e}"))?;
+        gpu.hip
+            .device_synchronize()
+            .map_err(|e| format!("decode post-sync: {e:?}"))?;
         let seconds = start.elapsed().as_secs_f64();
-        println!("DECODE_REP rep={rep} position={current_pos} wall_s={seconds:.6} tok_s={:.6}", 1.0 / seconds);
+        println!(
+            "DECODE_REP rep={rep} position={current_pos} wall_s={seconds:.6} tok_s={:.6}",
+            1.0 / seconds
+        );
         decode_times.push(seconds);
         if args.position.is_none() {
             current_pos += 1;
@@ -434,8 +481,8 @@ fn run() -> Result<(), String> {
         .copied()
         .unwrap_or(f64::NAN);
     println!(
-        "DECODE_SUMMARY cap={} effective_position={} reps={} median_s={median_s:.6} median_tok_s={:.6}",
-        args.cap,
+        "DECODE_SUMMARY compressed_rows={} effective_position={} reps={} median_s={median_s:.6} median_tok_s={:.6}",
+        state.compressor_capacity.active_rows(),
         current_pos,
         args.decode_reps,
         1.0 / median_s
@@ -446,12 +493,21 @@ fn run() -> Result<(), String> {
         let mut token = latest_logits.as_deref().map(argmax).unwrap_or(next_token);
         for _ in 0..args.generate {
             generated.push(token);
-            let logits = decode_step(&cfg, &weights, &mut state, &mut gpu, token, current_pos as u32)
-                .map_err(|e| format!("generation pos={current_pos}: {e}"))?;
+            let logits = decode_step(
+                &cfg,
+                &weights,
+                &mut state,
+                &mut gpu,
+                token,
+                current_pos as u32,
+            )
+            .map_err(|e| format!("generation pos={current_pos}: {e}"))?;
             current_pos += 1;
             token = argmax(&logits);
         }
-        gpu.hip.device_synchronize().map_err(|e| format!("generation sync: {e:?}"))?;
+        gpu.hip
+            .device_synchronize()
+            .map_err(|e| format!("generation sync: {e:?}"))?;
         println!("GENERATED_TOKEN_IDS {generated:?}");
         println!("GENERATED_TEXT_BEGIN");
         println!("{}", tokenizer.decode(&generated));
@@ -464,8 +520,8 @@ fn run() -> Result<(), String> {
     }
     let total_s = wall_start.elapsed().as_secs_f64();
     println!(
-        "RESULT status=pass cap={} prefill_context={} prefill_s={prefill_s:.6} median_decode_tok_s={:.6} peak_vram_bytes={} peak_vram_gib={:.3} total_wall_s={total_s:.6}",
-        args.cap,
+        "RESULT status=pass compressed_rows={} prefill_context={} prefill_s={prefill_s:.6} median_decode_tok_s={:.6} peak_vram_bytes={} peak_vram_gib={:.3} total_wall_s={total_s:.6}",
+        state.compressor_capacity.active_rows(),
         args.prefill.unwrap_or(0),
         1.0 / median_s,
         peak,

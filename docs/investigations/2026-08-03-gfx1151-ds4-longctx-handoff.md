@@ -1,5 +1,11 @@
 # gfx1151 DS4 long-context handoff
 
+> **Superseded runtime instructions (2026-08-04):** the historical evidence
+> below is preserved, but `ds4-beta-staging` now derives compressor capacity
+> from each request, grows stable-address VMM mappings automatically on exact
+> gfx1151, and selects the certified two-stage top-K route by default. Do not
+> restore the former `MAX_COMPRESS_POS` / `GFX1151_*_TWOSTAGE=1` launch recipe.
+
 **Scope: gfx1151 (Strix Halo) only.** MI300X data appears here as *reference
 only* — assume you have no access to it and cannot reproduce those numbers.
 

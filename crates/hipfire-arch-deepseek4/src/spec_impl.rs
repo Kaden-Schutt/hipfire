@@ -160,7 +160,7 @@ impl Deepseek4Bundle {
         capture_safe: bool,
     ) -> Result<Vec<u32>, String> {
         let n_verify = block.len();
-        let pbs = self.redline_take_dspark_verify_pbs(gpu, n_verify)?;
+        let mut pbs = self.redline_take_dspark_verify_pbs(gpu, n_verify)?;
         let forward_result = if capture_safe {
             upload_prefill_batch_inputs(&self.config, gpu, &pbs, block, position as u32).and_then(
                 |()| {
@@ -181,7 +181,7 @@ impl Deepseek4Bundle {
                 &self.weights,
                 &mut self.state,
                 gpu,
-                &pbs,
+                &mut pbs,
                 block,
                 position as u32,
             )
@@ -332,6 +332,16 @@ impl Deepseek4Bundle {
         self.state.dspark_capture_active = true;
         // Take the PBS out of state to avoid immutable + mutable borrow collision.
         let mut pbs = self.state.dspark_verify_pbs.take().unwrap();
+        if let Err(error) = forward::ensure_request_capacity(
+            &self.config,
+            &mut self.state,
+            gpu,
+            &mut pbs,
+            position.saturating_add(n_verify),
+        ) {
+            self.state.dspark_verify_pbs = Some(pbs);
+            return Err(format!("Deepseek4Bundle::verify_block capacity: {error}"));
+        }
         let graph_batch = dspark_verify_graph_batch();
         let pm4_enabled = gpu.arch == "gfx1151"
             && hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_DSPARK_VERIFY_PM4")
@@ -597,7 +607,7 @@ impl Deepseek4Bundle {
                 &self.weights,
                 &mut self.state,
                 gpu,
-                &pbs,
+                &mut pbs,
                 block,
                 position as u32,
             )
@@ -610,12 +620,12 @@ impl Deepseek4Bundle {
     /// Apply the trunk final-norm + lm_head + per-position argmax over the
     /// `n_verify` hidden rows left in the verify PBS by `dspark_verify_forward`.
     fn dspark_verify_argmax(&mut self, gpu: &mut Gpu, n_verify: usize) -> Result<Vec<u32>, String> {
-        let pbs = self.state.dspark_verify_pbs.take().unwrap();
+        let mut pbs = self.state.dspark_verify_pbs.take().unwrap();
         let argmax_result = final_norm_and_argmax_all_batched(
             &self.config,
             &self.weights,
             &mut self.state,
-            &pbs,
+            &mut pbs,
             gpu,
             n_verify,
         );
@@ -631,12 +641,12 @@ impl Deepseek4Bundle {
         gpu: &mut Gpu,
         block: &[u32],
     ) -> Result<Vec<u32>, String> {
-        let pbs = self.state.dspark_verify_pbs.take().unwrap();
+        let mut pbs = self.state.dspark_verify_pbs.take().unwrap();
         let res = final_norm_and_argmax_all_batched_lazy(
             &self.config,
             &self.weights,
             &mut self.state,
-            &pbs,
+            &mut pbs,
             gpu,
             block,
         );
@@ -664,12 +674,12 @@ impl Deepseek4Bundle {
             .alloc_tensor(&[1], rdna_compute::DType::F32)
             .map_err(|e| format!("dspark_verify_sample_lazy repeat_buf: {e:?}"))?;
         let mut rng32 = *rng_state as u32;
-        let pbs = self.state.dspark_verify_pbs.take().unwrap();
+        let mut pbs = self.state.dspark_verify_pbs.take().unwrap();
         let res = final_norm_and_sample_all_batched_lazy(
             &self.config,
             &self.weights,
             &mut self.state,
-            &pbs,
+            &mut pbs,
             gpu,
             block,
             temp,
@@ -748,7 +758,7 @@ impl SpecTarget for Deepseek4Bundle {
         // Take the PBS out of state to avoid a simultaneous immutable + mutable
         // borrow of self.state (forward_prefill_batch_chunked takes &mut state).
         // Restore it afterward (it is always Some after the lazy alloc above).
-        let pbs = self.state.dspark_verify_pbs.take().unwrap();
+        let mut pbs = self.state.dspark_verify_pbs.take().unwrap();
         let result = forward::forward_prefill_batch_chunked(
             &self.config,
             &self.weights,
@@ -756,7 +766,7 @@ impl SpecTarget for Deepseek4Bundle {
             gpu,
             tokens,
             start_pos as u32,
-            &pbs,
+            &mut pbs,
         );
         self.state.dspark_verify_pbs = Some(pbs);
         let last_logits =
@@ -967,13 +977,13 @@ impl SpecTarget for Deepseek4Bundle {
         self.state.dspark_target_layers = layers.to_vec();
         self.state.dspark_capture_active = true;
         // Take the PBS out of state to avoid immutable+mutable borrow conflict.
-        let pbs = self.state.dspark_verify_pbs.take().unwrap();
+        let mut pbs = self.state.dspark_verify_pbs.take().unwrap();
         let fwd_result = forward_prefill_batch_chunk(
             &self.config,
             &self.weights,
             &mut self.state,
             gpu,
-            &pbs,
+            &mut pbs,
             &[seed],
             position as u32,
         );
