@@ -284,6 +284,19 @@ q8 KV, `HIPFIRE_NORMALIZE_PROMPT=0`:
 | ternary | 0.3811 | 5.122 |
 | **mq2 (uniform)** | **1.0315** | 9.823 |
 
+> **⚠ These are DENSE-model numbers. `qwen3.6-27b` is dense (64 layers,
+> `LinearAttention`, no MoE); a3b is a 256-expert MoE (`LinearAttention + MoE`).
+> Do not project the AWQ row onto a3b** — a single dense AWQ scale vector cannot
+> represent 256 experts' activation statistics, which is the whole reason
+> `docs/moe-awq/MOE_AWQ_EXPERTS.md` exists (per-expert `W·s` + per-expert
+> `.awq_scale.weight` sidecar; quantizer side DONE, runtime plumbing
+> outstanding). a3b has prior AWQ scar tissue — see
+> `project_a3b_mq4_gfx11_awq_lobotomy_2026_06_13`, where `mq4-denseawq` was
+> lobotomized on gfx11, and the separate `plain mq4` runtime-rotate bug at
+> KLD 11.45. Both ultimately root-caused away from AWQ itself (bad uniform-MQ4
+> expert quantization; a missing unit sidecar), but the lesson stands: **there
+> is no measured MoE-side AWQ number for a3b, and the dense 42% is not one.**
+
 Three things this settles, on our own numbers:
 
 1. **The Lloyd codebook is what makes 2-bit viable at all** — 0.093 vs 1.032 for
