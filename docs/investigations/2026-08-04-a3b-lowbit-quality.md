@@ -139,12 +139,52 @@ i.e. learned diagonal scaling around the transform (SpinQuant/QuaRot family).
 At 4 bits the difference is small; at 2 bits it is most of the quality.
 
 **G2 — the Lloyd codebook fit is unweighted.**
-`fit_mfp4_lloyd_codebook` (`main.rs:2310`) does percentile init + 8 k-means
-iterations with `sums[best] += w; counts[best] += 1` — every element weighted
-equally. Codebook placement should minimize *output* error, not weight-space
-error, which means weighting each element by its diagonal Hessian entry. We
-already produce those Hessians: `bin/collect_e8_hessian.rs` + `hessian_io.rs` +
-`e8_gptq.rs`. They are simply not wired to the Lloyd path.
+The MQ2/MQ3 fits are inlined per-block inside `quantize_mq{2,3}g256_lloyd`; they
+do percentile init + k-means with `sums[best] += w; counts[best] += 1` — every
+element weighted equally. Codebook placement should minimize *output* error, not
+weight-space error.
+
+> **Two corrections, 2026-08-04.**
+>
+> **(a) Wrong pointer.** This paragraph originally cited
+> `fit_mfp4_lloyd_codebook` (`main.rs:2310`). That is the **mfp4** codebook fit,
+> reached only from `quantize_mfp4g32_lloyd_2d` — a dense/tensor-global format
+> that never touches the a3b routed-expert path. The unweighted claim is right;
+> the function named was not the one doing it.
+>
+> **(b) The obvious fix does not work.** Weighting by the diagonal Hessian is
+> **provably inert after the FWHT**. Every entry of
+> `R = diag(s₂)·(1/16)·H₂₅₆·diag(s₁)` satisfies `R[i][j]² = 1/256`, so for a
+> diagonal `D = diag(d)`:
+>
+> ```
+> diag(R·D·Rᵀ)[i] = Σⱼ R[i][j]²·d[j] = (1/256)·Σⱼ d[j] = mean(d)
+> ```
+>
+> — the same constant at every rotated position. A correctly-rotated diagonal
+> importance vector is **uniform**, so weighted Lloyd in the rotated domain
+> degenerates exactly to plain Lloyd. And the shipped
+> `quantize_mq2g256_lloyd_weighted` does something worse than nothing: it applies
+> *unrotated* column importance to *rotated* positions, which after the FWHT is a
+> ±1/16-weighted mixture of all 256 unrotated columns — not an approximation of
+> the right weight, an unrelated vector of the right length. `main.rs:51-58`
+> already states this in prose.
+>
+> **So the measured ~42% recovery on the 27B came from AWQ, not from weighted
+> Lloyd.** `awqU` = AWQ pre-scale in the **unrotated** basis, then plain
+> unweighted Lloyd (`main.rs:10835-10891`). That is the lever; it is currently
+> disabled for every Lloyd branch on routed experts (`main.rs:9421-9426`) and its
+> runtime `x/s` compensation for gate_up is unimplemented.
+>
+> A genuine Hessian weight is still possible, because a *captured* Hessian has
+> off-diagonals and `e8_gptq::rotate_hblock` (`e8_gptq.rs:66`) already computes
+> `H′ = R·H·Rᵀ` in f64 — `diag(H′)` is then non-constant. That needs
+> `collect_e8_hessian_native` against the F32 oracle (~25 GiB of `.hblk`), plus a
+> `quantize_mq3g256_lloyd_weighted`, which does not exist.
+>
+> Note also that `hessian_io.rs` is **dead code** — not declared in `main.rs`'s
+> `mod` list — and it stores full K×K per tensor, which for a3b gate_up would be
+> 164 GiB. The live format is the block-diagonal-256 `.hblk`.
 
 **G3 — dense/attention floor. CLOSED, was not the problem.**
 Audited via `cargo run --example hfq_dump -p hipfire-quantize` over all 21093
@@ -186,8 +226,8 @@ pure overhead — 0.67 GB across all experts), or grade only the layers where
 | `mq2` | 11.6 GB | uniform MQ2-Lloyd (qt=19) × 10240 per projection | Q8F16 int8 |
 | **— nothing here —** | **12–17 GB** | | |
 | `mq3p` | 17.2 GB | MQ6 ×2040 / MQ4 ×3080 / MQ2-Lloyd ×5120, per projection | Q8F16 int8 |
-| `mq4r` | 18.7 GB | graded, uniform MQ4 attn + gate-side | — |
-| `mq4p` | 19.8 GB | graded (default SKU) | — |
+| `mq4r` | 18.7 GB | **uniform MQ4** (NOT graded — 20841 tensors qt=13, no tier table) | uniform MQ4 |
+| `mq4p` | 19.8 GB | graded MQ6 ×2040 / MQ4 ×3080 / **MQ3-Lloyd ×5120** (default SKU) | Q8F16 int8 |
 | `mfp4` | 20.2 GB | MFP4-E8 vector quant | — |
 | `mq5` / `mq6` | 23.7 / 27.7 GB | quality tiers | — |
 
@@ -202,12 +242,21 @@ machinery we already have plus the per-projection split we do not.
 
 **`mq3p` contains no MQ3-Lloyd.** No tensor in it is qt=20. The name denotes a
 size/quality tier, not the format — its cold tier is MQ2-Lloyd and its warm
-tiers are plain FWHT-rotated affine MQ4/MQ6. So `MQ3G256Lloyd`, the format that
-measured **0.0184 KLD on the 27B** — better than mq3 (0.0318) and 5× better than
-mq2lloyd (0.0931) — is used by **no a3b SKU at all**, despite having full kernel
-coverage (`gemv_mq3g256_lloyd_moe_{gate_up,down}_indexed*`,
-`gemm_mq3g256_lloyd_moe_grouped_*` on gfx1151/gfx12). That is the single most
-underused asset in the tree for this problem.
+tiers are plain FWHT-rotated affine MQ4/MQ6.
+
+> **RETRACTED 2026-08-04.** This paragraph originally continued: *"So
+> `MQ3G256Lloyd` … is used by **no a3b SKU at all** … the single most underused
+> asset in the tree."* **That is false.** `hfq_dump` over every a3b container
+> shows `.mq4p` — the SKU the registry resolves the bare `qwen3.6:35b-a3b` tag
+> to, i.e. the **default** — ships **5120 MQ3-Lloyd tensors per projection** as
+> its cold tier, and `.mq4rug` ships the same 5120 on `down` only. MQ3-Lloyd is
+> a shipped, coherence-gated production format on this exact model, not an
+> unproven asset. Only the narrow claim survives: *`mq3p` contains no qt=20*.
+>
+> This matters twice over. It raises confidence in an MQ3-Lloyd-heavy SKU — the
+> format is already in the default model. And it means the missing weighted
+> MQ3-Lloyd variant (`quantize_mq3g256_lloyd` has no `_weighted` twin) is a gap
+> in a **shipped** format, not a research one.
 
 **The hole is 11.6 → 17.2 GB, and Escha's 12.3 GB sits squarely in it.** That is
 the `mq2r` slot: a ~12–13.5 GB SKU with meaningfully better quality than the
@@ -367,8 +416,30 @@ has been.
   lobotomy.
 - **Perf**: fresh-process protocol per CLAUDE.md — one `--max 16` warmup per
   cell, gpu-lock coordinated, fresh process per measure, byte-identical prompt
-  with md5 recorded, median of 3–5. MQ2 should be *faster* than mq4r on decode
-  (fewer bytes/weight); if it is not, that is its own finding.
+  with md5 recorded, median of 3–5.
+
+> **"MQ2 should be *faster* than mq4r on decode (fewer bytes/weight)" —
+> FALSIFIED 2026-08-04, and it was its own finding.** `.mq2` reads **45% MORE**
+> bytes per token than `.mq4r`:
+>
+> | SKU | fixed tier | fixed MB/tok | routed MB/tok | total |
+> |---|---|---|---|---|
+> | `mq4r` | MQ4 | 1030.8 | 534.8 | **1565.6** |
+> | `mq2` | **Q8** | 2061.6 | 283.1 | **2344.7** |
+>
+> `.mq2` is not a 2-bit model — only its *routed experts* are 2-bit. lm_head,
+> attention and router are Q8 (1.0625 B/w vs MQ4's 0.53125), so its routed
+> experts are just **12.4%** of the per-token read and its fixed tier is 2× the
+> cost of mq4r's. Byte accounting reproduces both file sizes exactly (constant
+> 16,166,912 B header), so this is arithmetic, not estimate.
+>
+> Corollary that reshapes the whole SKU design: the "0.96 GB fixed" in
+> `SESSION_FINDINGS_2026-06-11.md:78` is **not a constant** — it is mq4r's fixed
+> tier at 4.25 bpw and scales linearly with the fixed dtype. At mq4r the fixed
+> tier is 66% of the token: **attention 66.2%** of it (DeltaNet
+> `in_proj_qkv`+`in_proj_z`+`out_proj` alone = 51.9%), **lm_head 26.2%**, shared
+> expert 6.5%. **Cutting routed-expert bpw alone caps at ~+19% vs mq4r.** The
+> speed lever is the fixed tier, which no a3b SKU has ever run below MQ4.
 - **Size**: ≤12.5 GB.
 - **Arch coverage**: gfx1100 (hipx) + gfx1201 (hiptrx) blocking; gfx1151
   non-blocking async. MQ2-Lloyd kernels exist for gfx1030/1151/12 — confirm the
