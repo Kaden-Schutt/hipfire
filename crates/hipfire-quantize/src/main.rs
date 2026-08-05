@@ -185,6 +185,11 @@ struct QuantizeArgs {
     /// Ingest only tensors whose names start with this prefix.
     #[arg(long, value_name = "PREFIX")]
     include_prefix: Option<String>,
+
+    /// Skip tensors whose names start with this prefix (inverse of
+    /// --include-prefix; both may be given, and exclude wins on overlap).
+    #[arg(long, value_name = "PREFIX")]
+    exclude_prefix: Option<String>,
 }
 
 /// Refuse an `--arch-id` override that strips a qwen3* model (auto-detected
@@ -8002,10 +8007,8 @@ fn main() {
     // otherwise ingest them. Needed to build a trunk-only HFQ whose MTP
     // surface is quantized separately at a different precision — see
     // `passes_prefix_filter`.
-    let exclude_prefix = std::env::args()
-        .position(|a| a == "--exclude-prefix")
-        .and_then(|i| std::env::args().nth(i + 1));
-    if let Some(ref p) = exclude_prefix {
+    let exclude_prefix = args.exclude_prefix.as_deref();
+    if let Some(p) = exclude_prefix {
         eprintln!("  [filter] --exclude-prefix {p:?} — tensors with this prefix will be skipped");
     }
     let mut skipped_params = 0u64;
