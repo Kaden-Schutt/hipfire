@@ -18,6 +18,7 @@ use hipfire_dispatch::pipeline::{execute_steps, GemvInput, Step};
 use hipfire_dispatch::types::dtype_rotation_plan;
 use hipfire_dispatch::types::{DispatchError, RotationPlan};
 use hipfire_runtime::hfq::{HfqFile, HfqTensorInfo};
+use hipfire_runtime::hfq_parallel::{read_hfq_jobs_ordered, HfqReadJob};
 use hipfire_runtime::llama::{
     self, f16_to_f32, fused_rmsnorm_rotate_for_mq, fused_rmsnorm_rotate_mq_batched_for,
     fused_silu_mul_rotate_mq_batched_for, rotate_x_mq_batched_for, weight_gemv_prerotated,
@@ -3746,51 +3747,78 @@ fn try_load_packed_mq4_experts(
 
     let gate_up_stride = gate_up_stride.expect("non-empty packed MQ4 expert list");
     let down_stride = down_stride.expect("non-empty packed MQ4 expert list");
-    let mut gate_up_host = Vec::with_capacity(gate_up_stride * specs.len());
-    let mut down_host = Vec::with_capacity(down_stride * specs.len());
-    for spec in &specs {
-        {
-            let (_, bytes) = hfq.tensor_data_pread(&spec.gate_up_name).ok_or_else(|| {
-                HipError::new(
-                    0,
-                    &format!(
-                        "qwen35: packed MQ4 tensor disappeared: {}",
-                        spec.gate_up_name
-                    ),
-                )
-            })?;
-            if bytes.len() != gate_up_stride {
-                return Err(HipError::new(
-                    0,
-                    &format!(
-                        "qwen35: packed MQ4 gate_up stride changed for {}: {} != {gate_up_stride}",
-                        spec.gate_up_name,
-                        bytes.len()
-                    ),
-                ));
+    let (gate_up_host, down_host) = if hfq.has_overlay() {
+        // Overlay offsets belong to a second file; retain the overlay-aware
+        // serial path exactly rather than crossing files in reader workers.
+        let mut gate_up_host = Vec::with_capacity(gate_up_stride * specs.len());
+        let mut down_host = Vec::with_capacity(down_stride * specs.len());
+        for spec in &specs {
+            {
+                let (_, bytes) = hfq.tensor_data_pread(&spec.gate_up_name).ok_or_else(|| {
+                    HipError::new(
+                        0,
+                        &format!(
+                            "qwen35: packed MQ4 tensor disappeared: {}",
+                            spec.gate_up_name
+                        ),
+                    )
+                })?;
+                if bytes.len() != gate_up_stride {
+                    return Err(HipError::new(
+                        0,
+                        &format!(
+                            "qwen35: packed MQ4 gate_up stride changed for {}: {} != {gate_up_stride}",
+                            spec.gate_up_name,
+                            bytes.len()
+                        ),
+                    ));
+                }
+                gate_up_host.extend_from_slice(&bytes);
             }
-            gate_up_host.extend_from_slice(&bytes);
-        }
-        {
-            let (_, bytes) = hfq.tensor_data_pread(&spec.down_name).ok_or_else(|| {
-                HipError::new(
-                    0,
-                    &format!("qwen35: packed MQ4 tensor disappeared: {}", spec.down_name),
-                )
-            })?;
-            if bytes.len() != down_stride {
-                return Err(HipError::new(
-                    0,
-                    &format!(
-                        "qwen35: packed MQ4 down stride changed for {}: {} != {down_stride}",
-                        spec.down_name,
-                        bytes.len()
-                    ),
-                ));
+            {
+                let (_, bytes) = hfq.tensor_data_pread(&spec.down_name).ok_or_else(|| {
+                    HipError::new(
+                        0,
+                        &format!("qwen35: packed MQ4 tensor disappeared: {}", spec.down_name),
+                    )
+                })?;
+                if bytes.len() != down_stride {
+                    return Err(HipError::new(
+                        0,
+                        &format!(
+                            "qwen35: packed MQ4 down stride changed for {}: {} != {down_stride}",
+                            spec.down_name,
+                            bytes.len()
+                        ),
+                    ));
+                }
+                down_host.extend_from_slice(&bytes);
             }
-            down_host.extend_from_slice(&bytes);
         }
-    }
+        (gate_up_host, down_host)
+    } else {
+        let jobs = [
+            HfqReadJob::packed(
+                hfq,
+                format!("{p}.packed_mq4_gate_up"),
+                specs.iter().map(|spec| spec.gate_up_name.as_str()),
+            )
+            .map_err(|e| HipError::new(0, &format!("qwen35: plan packed gate_up: {e}")))?,
+            HfqReadJob::packed(
+                hfq,
+                format!("{p}.packed_mq4_down"),
+                specs.iter().map(|spec| spec.down_name.as_str()),
+            )
+            .map_err(|e| HipError::new(0, &format!("qwen35: plan packed down: {e}")))?,
+        ];
+        let mut results = read_hfq_jobs_ordered(hfq, &jobs)
+            .map_err(|e| HipError::new(0, &format!("qwen35: parallel packed expert read: {e}")))?
+            .into_iter();
+        (
+            results.next().expect("two packed MQ4 jobs").data,
+            results.next().expect("two packed MQ4 jobs").data,
+        )
+    };
 
     let gate_up_owner = gpu.upload_raw(&gate_up_host, &[specs.len(), gate_up_stride])?;
     drop(gate_up_host);

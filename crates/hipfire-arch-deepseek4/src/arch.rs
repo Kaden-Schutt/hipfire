@@ -23,6 +23,7 @@ use crate::deepseek4::{
 use hipfire_reap::hook::ReapArchHook;
 use hipfire_runtime::arch::Architecture;
 use hipfire_runtime::hfq::HfqFile;
+use hipfire_runtime::hfq_parallel::{read_hfq_jobs_ordered, HfqReadJob};
 use hipfire_runtime::model_source::ModelSource;
 use hipfire_runtime::safetensors_source::{bf16_bytes_to_f16, bf16_to_f32};
 use rdna_compute::{DType, Gpu};
@@ -181,6 +182,188 @@ impl DeepseekV4 {
     /// The non-owned w2 (down) ptr reuses the compact base — its rotate input
     /// is 0 regardless, so the down weights read don't matter. `shard = None`
     /// uploads all experts (single-GPU, byte-identical to the original).
+    fn upload_layer_routed_experts_parallel(
+        hfq: &HfqFile,
+        gpu: &mut Gpu,
+        prefix: &str,
+        n_exp: usize,
+        layer: &mut DeepseekV4LayerWeights,
+        shard: Option<(&hipfire_runtime::tp_shard::ShardConfig, usize)>,
+        keep: Option<&[u32]>,
+    ) -> Result<(), String> {
+        if keep.is_some() && shard.is_some() {
+            return Err("deepseek4: REAP keep-map + EP sharding are mutually exclusive".into());
+        }
+        if let Some(k) = keep {
+            if k.len() != n_exp {
+                return Err(format!(
+                    "deepseek4: {prefix} keep slice len {} != n_exp {n_exp}",
+                    k.len()
+                ));
+            }
+        }
+        let src = |slot: usize| -> usize { keep.map(|k| k[slot] as usize).unwrap_or(slot) };
+        let owns = |e: usize| {
+            shard
+                .map(|(s, rank)| s.owns_expert(rank, e))
+                .unwrap_or(true)
+        };
+        let mut local_of_global = vec![usize::MAX; n_exp];
+        let mut n_owned = 0usize;
+        for e in 0..n_exp {
+            if owns(e) {
+                local_of_global[e] = n_owned;
+                n_owned += 1;
+            }
+        }
+        if n_owned == 0 {
+            return Err(format!("deepseek4: {prefix} shard rank owns no experts"));
+        }
+
+        let w2_name0 = format!("{prefix}.ffn.experts.{}.w2.weight", src(0));
+        let w2_info0 = hfq
+            .find_tensor_info(&w2_name0)
+            .ok_or_else(|| format!("deepseek4: missing {w2_name0}"))?;
+        let w2_stride = w2_info0.data_size;
+        let w2_shape: Vec<usize> = w2_info0.shape.iter().map(|&s| s as usize).collect();
+        let mut w2_names = Vec::with_capacity(n_owned);
+        for e in 0..n_exp {
+            if !owns(e) {
+                continue;
+            }
+            let name = format!("{prefix}.ffn.experts.{}.w2.weight", src(e));
+            let info = hfq
+                .find_tensor_info(&name)
+                .ok_or_else(|| format!("deepseek4: missing {name}"))?;
+            if info.data_size != w2_stride {
+                return Err(format!(
+                    "deepseek4: {name} size {} != stride {w2_stride}",
+                    info.data_size
+                ));
+            }
+            w2_names.push(name);
+        }
+
+        let w1_name0 = format!("{prefix}.ffn.experts.{}.w1.weight", src(0));
+        let w3_name0 = format!("{prefix}.ffn.experts.{}.w3.weight", src(0));
+        let w1_stride = hfq
+            .find_tensor_info(&w1_name0)
+            .ok_or_else(|| format!("deepseek4: missing {w1_name0}"))?
+            .data_size;
+        let w3_stride = hfq
+            .find_tensor_info(&w3_name0)
+            .ok_or_else(|| format!("deepseek4: missing {w3_name0}"))?
+            .data_size;
+        if w1_stride != w3_stride {
+            return Err(format!(
+                "deepseek4: {prefix} w1/w3 stride mismatch: w1={w1_stride} w3={w3_stride}"
+            ));
+        }
+        let combined_stride = w1_stride + w3_stride;
+        let mut gate_up_names = Vec::with_capacity(n_owned * 2);
+        for e in 0..n_exp {
+            if !owns(e) {
+                continue;
+            }
+            for projection in ["w1", "w3"] {
+                let name = format!("{prefix}.ffn.experts.{}.{projection}.weight", src(e));
+                let info = hfq
+                    .find_tensor_info(&name)
+                    .ok_or_else(|| format!("deepseek4: missing {name}"))?;
+                if info.data_size != w1_stride {
+                    return Err(format!(
+                        "deepseek4: {name} size {} != stride {w1_stride}",
+                        info.data_size
+                    ));
+                }
+                gate_up_names.push(name);
+            }
+        }
+
+        let jobs = [
+            HfqReadJob::packed(hfq, format!("{prefix}.w2"), &w2_names)
+                .map_err(|e| format!("deepseek4: plan {prefix}.w2: {e}"))?,
+            HfqReadJob::packed(hfq, format!("{prefix}.gate_up"), &gate_up_names)
+                .map_err(|e| format!("deepseek4: plan {prefix}.gate_up: {e}"))?,
+        ];
+        let mut buffers = read_hfq_jobs_ordered(hfq, &jobs)
+            .map_err(|e| format!("deepseek4: parallel expert read {prefix}: {e}"))?
+            .into_iter();
+        let w2_blob = buffers.next().expect("two planned expert jobs").data;
+        let gate_up_blob = buffers.next().expect("two planned expert jobs").data;
+        debug_assert_eq!(w2_blob.len(), w2_stride * n_owned);
+        debug_assert_eq!(gate_up_blob.len(), combined_stride * n_owned);
+
+        // Preserve the historical allocation order exactly: w2 owner, w2
+        // pointer table, gate_up owner, optional dummy, gate_up pointer table.
+        let mut w2_blob_shape = vec![n_owned];
+        w2_blob_shape.extend_from_slice(&w2_shape);
+        let w2_tensor = gpu
+            .upload_raw(&w2_blob, &w2_blob_shape)
+            .map_err(|e| format!("deepseek4: upload blob {prefix}.w2: {e:?}"))?;
+        let w2_base = w2_tensor.buf.as_ptr() as u64;
+        let w2_ptrs: Vec<u64> = (0..n_exp)
+            .map(|e| {
+                if owns(e) {
+                    w2_base + (local_of_global[e] * w2_stride) as u64
+                } else {
+                    w2_base
+                }
+            })
+            .collect();
+        let w2_ptr_bytes: Vec<u8> = w2_ptrs.iter().flat_map(|p| p.to_ne_bytes()).collect();
+        let w2_ptr_tensor = gpu
+            .alloc_tensor(&[2 * n_exp], DType::F32)
+            .map_err(|e| format!("deepseek4: alloc ptr table {prefix}.w2: {e:?}"))?;
+        gpu.hip
+            .memcpy_htod(&w2_ptr_tensor.buf, &w2_ptr_bytes)
+            .map_err(|e| format!("deepseek4: copy ptr table {prefix}.w2: {e:?}"))?;
+        layer.expert_w2_blob = Some(w2_tensor);
+        layer.expert_w2_ptrs = Some(w2_ptr_tensor);
+        layer.expert_w2_stride = w2_stride;
+
+        let gate_up_tensor = gpu
+            .upload_raw(&gate_up_blob, &[n_owned, combined_stride])
+            .map_err(|e| format!("deepseek4: upload gate_up {prefix}: {e:?}"))?;
+        let gate_up_base = gate_up_tensor.buf.as_ptr() as u64;
+        let dummy_gate_up = if shard.is_some() && n_owned < n_exp {
+            Some(
+                gpu.zeros(&[combined_stride / 4], DType::F32)
+                    .map_err(|e| format!("deepseek4: {prefix} zero gate_up dummy: {e:?}"))?,
+            )
+        } else {
+            None
+        };
+        let dummy_ptr = dummy_gate_up
+            .as_ref()
+            .map(|tensor| tensor.buf.as_ptr() as u64)
+            .unwrap_or(gate_up_base);
+        let gate_up_ptrs: Vec<u64> = (0..n_exp)
+            .map(|e| {
+                if owns(e) {
+                    gate_up_base + (local_of_global[e] * combined_stride) as u64
+                } else {
+                    dummy_ptr
+                }
+            })
+            .collect();
+        let gate_up_ptr_bytes: Vec<u8> = gate_up_ptrs
+            .iter()
+            .flat_map(|pointer| pointer.to_ne_bytes())
+            .collect();
+        let gate_up_ptr_tensor = gpu
+            .alloc_tensor(&[2 * n_exp], DType::F32)
+            .map_err(|e| format!("deepseek4: alloc gate_up ptr table {prefix}: {e:?}"))?;
+        gpu.hip
+            .memcpy_htod(&gate_up_ptr_tensor.buf, &gate_up_ptr_bytes)
+            .map_err(|e| format!("deepseek4: copy gate_up ptr table {prefix}: {e:?}"))?;
+        layer.expert_gate_up_blob = Some(gate_up_tensor);
+        layer.expert_gate_up_ptrs = Some(gate_up_ptr_tensor);
+        layer.expert_gate_up_stride = combined_stride;
+        layer.expert_gate_up_dummy = dummy_gate_up;
+        Ok(())
+    }
+
     fn upload_layer_routed_experts(
         hfq: &HfqFile,
         gpu: &mut Gpu,
@@ -190,6 +373,11 @@ impl DeepseekV4 {
         shard: Option<(&hipfire_runtime::tp_shard::ShardConfig, usize)>,
         keep: Option<&[u32]>,
     ) -> Result<(), String> {
+        if !hfq.has_overlay() {
+            return Self::upload_layer_routed_experts_parallel(
+                hfq, gpu, prefix, n_exp, layer, shard, keep,
+            );
+        }
         // REAP keep-map: compact slot `e` loads ORIGINAL expert `src(e)`.
         // `keep = None` ⇒ identity (slot == original index), byte-identical
         // to the full load. `n_exp` is the COMPACT count (kept) when active.

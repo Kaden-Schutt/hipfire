@@ -16,6 +16,7 @@
 
 use crate::config::{Lfm2MoeConfig, MixerKind};
 use hipfire_runtime::hfq::HfqFile;
+use hipfire_runtime::hfq_parallel::{read_hfq_jobs_ordered, HfqReadJob};
 use hipfire_runtime::llama::{f16_to_f32, KvCache, WeightTensor};
 use hipfire_runtime::model_source::ModelSource;
 use hipfire_runtime::safetensors_source::{bf16_bytes_to_f16, source_bytes_to_f32_vec};
@@ -193,6 +194,54 @@ fn wt_from_raw(
         paro: None,
         awq_scale: None,
     })
+}
+
+fn finish_hfq_expert(
+    hfq: &HfqFile,
+    gpu: &mut Gpu,
+    layer_prefix: &str,
+    layer: usize,
+    source_expert: usize,
+    slot: usize,
+    gate_up_qt: u8,
+    gate_up_bytes: &[u8],
+    down_qt: u8,
+    down_bytes: &[u8],
+    hidden: usize,
+    moe_inter: usize,
+) -> Result<ExpertWeights, String> {
+    let mut gate_up = wt_from_raw(gpu, gate_up_qt, gate_up_bytes, 2 * moe_inter, hidden)
+        .map_err(|error| format!("lfm2moe: fuse gate_up L{layer}E{source_expert}: {error}"))?;
+    let mut down = wt_from_raw(gpu, down_qt, down_bytes, hidden, moe_inter)
+        .map_err(|error| format!("lfm2moe: down L{layer}E{source_expert}: {error}"))?;
+    // AWQ scales are layer-shared and emitted once by the quantizer. Attach
+    // them to the first compact slot, which is also what the forward reads;
+    // this remains correct when REAP prunes original expert zero.
+    if slot == 0 {
+        gate_up.awq_scale = load_lfm2_awq_scale(
+            hfq,
+            gpu,
+            &format!("{layer_prefix}.feed_forward.awq_scale_gate_up.weight"),
+            hidden,
+        );
+        if gate_up.awq_scale.is_some() {
+            eprintln!(
+                "lfm2moe: AWQ gate_up scale attached at {layer_prefix} (expert-0 representative)"
+            );
+        }
+        down.awq_scale = load_lfm2_awq_scale(
+            hfq,
+            gpu,
+            &format!("{layer_prefix}.feed_forward.awq_scale_down.weight"),
+            moe_inter,
+        );
+        if down.awq_scale.is_some() {
+            eprintln!(
+                "lfm2moe: AWQ down scale attached at {layer_prefix} (expert-0 representative)"
+            );
+        }
+    }
+    Ok(ExpertWeights { gate_up, down })
 }
 
 // ──────────────────────────── Weights ────────────────────────────
@@ -568,61 +617,103 @@ impl Lfm2MoeWeights {
                 // Iterate compact slots `0..n_exp`; `e` = the ORIGINAL expert
                 // index loaded into slot (slot==e on the no-keep identity path).
                 let mut experts = Vec::with_capacity(n_exp);
-                for slot in 0..n_exp {
-                    let e = reap_ep.as_ref().map(|ep| ep.src(slot)).unwrap_or(slot);
-                    let ep = format!("{p}.feed_forward.experts.{e}");
-                    let (qt1, w1) = read_tensor(hfq, &format!("{ep}.w1.weight"))?;
-                    let (_qt3, w3) = read_tensor(hfq, &format!("{ep}.w3.weight"))?;
-                    let mut gate_up_bytes = w1;
-                    gate_up_bytes.extend_from_slice(&w3);
-                    let mut gate_up = wt_from_raw(gpu, qt1, &gate_up_bytes, 2 * moe_inter, hidden)
-                        .map_err(|e2| format!("lfm2moe: fuse gate_up L{l}E{e}: {e2}"))?;
-                    let (qt2, w2) = read_tensor(hfq, &format!("{ep}.w2.weight"))?;
-                    let mut down = wt_from_raw(gpu, qt2, &w2, hidden, moe_inter)
-                        .map_err(|e2| format!("lfm2moe: down L{l}E{e}: {e2}"))?;
-                    // AWQ scales: LAYER-SHARED, emitted once on expert 0 by the
-                    // quantizer (full port of minimax 3c676d00 BOTH-projection AWQ).
-                    // The scale tensors are NOT expert-indexed — their names are
-                    // `{p}.feed_forward.awq_scale_{gate_up,down}.weight` and their
-                    // lengths are `hidden` / `moe_inter` (per-projection dims, NOT
-                    // per-expert), so they are INVARIANT under a REAP keep and load
-                    // UNCHANGED. We attach them to the representative FIRST COMPACT
-                    // SLOT (`slot == 0`, i.e. `experts[0]`) — the same slot the
-                    // forward reads from — regardless of which original expert it
-                    // maps to. Gate on `slot == 0` (not `e == 0`): under a keep the
-                    // original expert 0 may be pruned, so `e == 0` could never fire
-                    // (dropping the scale) or fire on a non-representative slot.
-                    // Attach the gate_up scale (len hidden) to slot 0's gate_up and
-                    // the down scale (len moe_inter) to slot 0's down; the forward
-                    // reads both from experts[0] and divides x/s in the unrotated
-                    // basis via the AWQ-aware rotate_x_mq_for (gate_up input) and
-                    // fused_silu_mul_rotate_mq_batched_for (post-SwiGLU intermediate
-                    // for down). down (w2) is the most quant-sensitive proj, so its
-                    // AWQ is the whole point. No-op on non-AWQ files.
-                    if slot == 0 {
-                        gate_up.awq_scale = load_lfm2_awq_scale(
+                if hfq.has_overlay() {
+                    // Overlay offsets belong to a second file. Preserve the
+                    // existing overlay-aware reads and allocation order.
+                    for slot in 0..n_exp {
+                        let e = reap_ep.as_ref().map(|ep| ep.src(slot)).unwrap_or(slot);
+                        let ep = format!("{p}.feed_forward.experts.{e}");
+                        let (qt1, w1) = read_tensor(hfq, &format!("{ep}.w1.weight"))?;
+                        let (_qt3, w3) = read_tensor(hfq, &format!("{ep}.w3.weight"))?;
+                        let mut gate_up_bytes = w1;
+                        gate_up_bytes.extend_from_slice(&w3);
+                        let (qt2, w2) = read_tensor(hfq, &format!("{ep}.w2.weight"))?;
+                        experts.push(finish_hfq_expert(
                             hfq,
                             gpu,
-                            &format!("{p}.feed_forward.awq_scale_gate_up.weight"),
+                            &p,
+                            l,
+                            e,
+                            slot,
+                            qt1,
+                            &gate_up_bytes,
+                            qt2,
+                            &w2,
                             hidden,
-                        );
-                        if gate_up.awq_scale.is_some() {
-                            eprintln!("lfm2moe: AWQ gate_up scale attached at {p} (expert-0 representative)");
-                        }
-                        down.awq_scale = load_lfm2_awq_scale(
-                            hfq,
-                            gpu,
-                            &format!("{p}.feed_forward.awq_scale_down.weight"),
                             moe_inter,
-                        );
-                        if down.awq_scale.is_some() {
-                            eprintln!(
-                                "lfm2moe: AWQ down scale attached at {p} (expert-0 representative)"
-                            );
-                        }
+                        )?);
                     }
-                    experts.push(ExpertWeights { gate_up, down });
+                } else {
+                    // Two experts form four jobs (gate_up + down per expert),
+                    // matching the four-lane storage optimum. All reads finish
+                    // before the original gate_up/down GPU allocation sequence.
+                    let mut chunk_start = 0usize;
+                    while chunk_start < n_exp {
+                        let chunk_end = (chunk_start + 2).min(n_exp);
+                        let mut metadata = Vec::with_capacity(chunk_end - chunk_start);
+                        let mut jobs = Vec::with_capacity((chunk_end - chunk_start) * 2);
+                        for slot in chunk_start..chunk_end {
+                            let e = reap_ep.as_ref().map(|ep| ep.src(slot)).unwrap_or(slot);
+                            let ep = format!("{p}.feed_forward.experts.{e}");
+                            let w1_name = format!("{ep}.w1.weight");
+                            let w3_name = format!("{ep}.w3.weight");
+                            let w2_name = format!("{ep}.w2.weight");
+                            let qt1 = hfq
+                                .find_tensor_info(&w1_name)
+                                .ok_or_else(|| {
+                                    format!("lfm2moe: tensor not found in HFQ: {w1_name}")
+                                })?
+                                .quant_type;
+                            let qt2 = hfq
+                                .find_tensor_info(&w2_name)
+                                .ok_or_else(|| {
+                                    format!("lfm2moe: tensor not found in HFQ: {w2_name}")
+                                })?
+                                .quant_type;
+                            jobs.push(
+                                HfqReadJob::packed(
+                                    hfq,
+                                    format!("{ep}.gate_up"),
+                                    [&w1_name, &w3_name],
+                                )
+                                .map_err(|error| {
+                                    format!("lfm2moe: plan gate_up L{l}E{e}: {error}")
+                                })?,
+                            );
+                            jobs.push(HfqReadJob::tensor(hfq, &w2_name).map_err(|error| {
+                                format!("lfm2moe: plan down L{l}E{e}: {error}")
+                            })?);
+                            metadata.push((slot, e, qt1, qt2));
+                        }
+                        let mut buffers = read_hfq_jobs_ordered(hfq, &jobs)
+                            .map_err(|error| {
+                                format!("lfm2moe: parallel expert read layer {l}: {error}")
+                            })?
+                            .into_iter();
+                        for (slot, e, qt1, qt2) in metadata {
+                            let gate_up_bytes =
+                                buffers.next().expect("two LFM read jobs per expert").data;
+                            let down_bytes =
+                                buffers.next().expect("two LFM read jobs per expert").data;
+                            experts.push(finish_hfq_expert(
+                                hfq,
+                                gpu,
+                                &p,
+                                l,
+                                e,
+                                slot,
+                                qt1,
+                                &gate_up_bytes,
+                                qt2,
+                                &down_bytes,
+                                hidden,
+                                moe_inter,
+                            )?);
+                        }
+                        chunk_start = chunk_end;
+                    }
                 }
+
                 let gu_bytes: Vec<u8> = experts
                     .iter()
                     .flat_map(|e| (e.gate_up.buf.buf.as_ptr() as u64).to_ne_bytes())
