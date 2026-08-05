@@ -25,6 +25,10 @@ fn main() {
         run_pack_correctness(&mut gpu);
         return;
     }
+    if std::env::var_os("HIPFIRE_E8_PREFILL_COOP_ONLY").is_some() {
+        run_prefill_coop(&mut gpu);
+        return;
+    }
 
     let shapes: Vec<(usize, usize, &str)> = vec![
         // --- A3B per-expert MoE shapes (the decode hot path; hidden=2048,
@@ -1162,6 +1166,112 @@ fn main() {
                 );
             }
         }
+    }
+}
+
+fn time_prefill_variant(
+    gpu: &mut Gpu,
+    cooperative: bool,
+    weights: &rdna_compute::GpuTensor,
+    x: &rdna_compute::GpuTensor,
+    y: &rdna_compute::GpuTensor,
+    m: usize,
+    k: usize,
+    batch: usize,
+    trials: usize,
+) -> f64 {
+    let start = Instant::now();
+    for _ in 0..trials {
+        if cooperative {
+            gpu.gemm_mfp4g32_e8_soa_wmma_coop4(weights, x, y, m, k, batch)
+                .expect("cooperative E8 prefill");
+        } else {
+            gpu.gemm_mfp4g32_e8_soa_wmma_b4(weights, x, y, m, k, batch)
+                .expect("baseline E8 prefill");
+        }
+    }
+    gpu.hip.device_synchronize().expect("timing synchronize");
+    start.elapsed().as_secs_f64() * 1.0e6 / trials as f64
+}
+
+fn run_prefill_coop(gpu: &mut Gpu) {
+    assert_eq!(
+        gpu.arch, "gfx1151",
+        "cooperative E8 prefill is gfx1151-only"
+    );
+    const BATCH: usize = 1024;
+    const TRIALS: usize = 5;
+    let shapes = [
+        (1024usize, 4096usize, "wq_a/wo_a"),
+        (32768usize, 1024usize, "wq_b"),
+        (4096usize, 8192usize, "wo_b"),
+        (2048usize, 4096usize, "shared_up"),
+        (4096usize, 2048usize, "shared_down"),
+    ];
+    eprintln!("=== gfx1151 cooperative E8 prefill B={BATCH} ===");
+    eprintln!(
+        "  {:<16} {:>11} {:>11} {:>9} {:>14}",
+        "shape", "B4 us", "coop us", "speedup", "exact outputs"
+    );
+
+    for (slot, (m, k, label)) in shapes.into_iter().enumerate() {
+        let aos = synth_e8_aos(m, k, 0xC001_E800 ^ slot as u64);
+        let soa = aos_to_soa_full(&aos, m, k);
+        let weights = gpu.upload_raw(&soa, &[soa.len()]).expect("upload weights");
+        let x = gpu.alloc_tensor(&[BATCH * k], DType::F32).expect("alloc x");
+        let y_ref = gpu
+            .alloc_tensor(&[BATCH * m], DType::F32)
+            .expect("alloc baseline y");
+        let y_coop = gpu
+            .alloc_tensor(&[BATCH * m], DType::F32)
+            .expect("alloc cooperative y");
+        let x_host = make_x(BATCH * k, 0xE800_C001 ^ slot as u64);
+        gpu.hip
+            .memcpy_htod(&x.buf, bytes_of(&x_host))
+            .expect("upload x");
+
+        // Warm JIT, DPM, and the pointer-keyed F16 conversion cache for both
+        // symbols before correctness or timing.
+        for _ in 0..2 {
+            gpu.gemm_mfp4g32_e8_soa_wmma_b4(&weights, &x, &y_ref, m, k, BATCH)
+                .expect("warm baseline");
+            gpu.gemm_mfp4g32_e8_soa_wmma_coop4(&weights, &x, &y_coop, m, k, BATCH)
+                .expect("warm cooperative");
+        }
+        gpu.hip.device_synchronize().expect("warm synchronize");
+
+        let mut reference = vec![0.0f32; BATCH * m];
+        let mut candidate = vec![0.0f32; BATCH * m];
+        gpu.hip
+            .memcpy_dtoh(bytes_of_mut(&mut reference), &y_ref.buf)
+            .expect("download baseline");
+        gpu.hip
+            .memcpy_dtoh(bytes_of_mut(&mut candidate), &y_coop.buf)
+            .expect("download cooperative");
+        let exact = reference
+            .iter()
+            .zip(&candidate)
+            .filter(|(a, b)| a.to_bits() == b.to_bits())
+            .count();
+        assert_eq!(
+            exact,
+            reference.len(),
+            "cooperative E8 mismatch for {label} M={m} K={k}"
+        );
+
+        // ABBA timing order. Averaging the two observations per arm removes
+        // the monotonic order bias without mixing kernels inside one timer.
+        let a0 = time_prefill_variant(gpu, false, &weights, &x, &y_ref, m, k, BATCH, TRIALS);
+        let b0 = time_prefill_variant(gpu, true, &weights, &x, &y_coop, m, k, BATCH, TRIALS);
+        let b1 = time_prefill_variant(gpu, true, &weights, &x, &y_coop, m, k, BATCH, TRIALS);
+        let a1 = time_prefill_variant(gpu, false, &weights, &x, &y_ref, m, k, BATCH, TRIALS);
+        let baseline_us = 0.5 * (a0 + a1);
+        let cooperative_us = 0.5 * (b0 + b1);
+        eprintln!(
+            "  {label:<16} {baseline_us:>11.1} {cooperative_us:>11.1} {:>8.3}x {:>14}",
+            baseline_us / cooperative_us,
+            exact,
+        );
     }
 }
 
