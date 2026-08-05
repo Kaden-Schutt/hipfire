@@ -12102,6 +12102,23 @@ fn vl_no_eviction_kv_cap(physical_cap: usize, max_seq: usize, adaptive_engaged: 
     }
 }
 
+/// Bound an eviction-enabled Qwen prefill write while an adaptive cache still
+/// owns the layout.  Before the one-way handoff, the eviction window is not a
+/// capacity limit (its gate is closed); writes must instead stop at every
+/// adaptive transition boundary.  After handoff, the normal budget window
+/// again determines how much can be appended before compaction.
+fn qwen_ar_eviction_prefill_chunk_limit(
+    seq_pos: usize,
+    eviction_window: usize,
+    adaptive_staging: bool,
+) -> usize {
+    if adaptive_staging {
+        qwen35::PREFILL_MAX_BATCH
+    } else {
+        eviction_window.saturating_sub(seq_pos).max(1)
+    }
+}
+
 /// Cold-reset VL trunk after a GPU/VMM/adaptive failure so the next request
 /// cannot inherit partial DN/KV/seq or mismatched conversation history.
 ///
@@ -12376,6 +12393,33 @@ mod mtp_host_timing_contract {
         assert_eq!(arr[0]["wall_us"], 1);
         assert_eq!(arr[1]["wall_us"], 2);
         assert_eq!(arr[2]["wall_us"], 3);
+    }
+}
+
+#[cfg(test)]
+mod adaptive_eviction_prefill_contract {
+    use super::qwen_ar_eviction_prefill_chunk_limit;
+    use hipfire_arch_qwen35::qwen35::PREFILL_MAX_BATCH;
+
+    #[test]
+    fn staging_uses_adaptive_boundaries_until_handoff() {
+        let window = 2048 + 128;
+        assert_eq!(
+            qwen_ar_eviction_prefill_chunk_limit(0, window, true),
+            PREFILL_MAX_BATCH
+        );
+        assert_eq!(
+            qwen_ar_eviction_prefill_chunk_limit(8192 - PREFILL_MAX_BATCH, window, true),
+            PREFILL_MAX_BATCH
+        );
+        assert_eq!(
+            qwen_ar_eviction_prefill_chunk_limit(2048, window, false),
+            128
+        );
+        assert_eq!(
+            qwen_ar_eviction_prefill_chunk_limit(window, window, false),
+            1
+        );
     }
 }
 
@@ -25218,8 +25262,13 @@ fn generate(
                     prefill_aborted = true;
                     break;
                 }
-                let space = window.saturating_sub(m.seq_pos).max(1);
-                let chunk_len = remaining.len().min(space);
+                let adaptive_staging = m
+                    .kv_adaptive
+                    .as_ref()
+                    .is_some_and(|ad| !ad.handoff_complete());
+                let chunk_limit =
+                    qwen_ar_eviction_prefill_chunk_limit(m.seq_pos, window, adaptive_staging);
+                let chunk_len = remaining.len().min(chunk_limit);
                 let (chunk, rest) = remaining.split_at(chunk_len);
                 if let Err(e) = qwen35::forward_prefill_batch(
                     gpu, weights, config, chunk, m.seq_pos, kv, dn, scratch, None, None, None, None,
@@ -25238,6 +25287,42 @@ fn generate(
                     return;
                 }
                 m.seq_pos += chunk_len;
+                // The eviction gate remains closed until adaptive KV reaches
+                // its explicit handoff point and finishes every transcode.
+                // Drive that transition at the same bounded committed-prefix
+                // boundaries as the ordinary adaptive prefill path, before
+                // asking eviction to observe the gate.
+                if let Some(ad) = m.kv_adaptive.as_mut() {
+                    match ad.maybe_downshift(gpu, kv, m.seq_pos) {
+                        Ok(steps) => {
+                            for step in steps {
+                                eprintln!(
+                                    "[adaptive-kv] downshift @ pos {} (eviction prefill): {:?} (K={:?} V={:?})",
+                                    m.seq_pos, step, ad.cur_k, ad.cur_v
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "[adaptive-kv] maybe_downshift error @ pos {} (eviction prefill): {:?} — poisoning model",
+                                m.seq_pos, e
+                            );
+                            reset_ar_uncommitted_state!();
+                            emit_active_attempt_error(
+                                stdout,
+                                Some(id),
+                                &format!(
+                                    "adaptive KV transition failed during eviction prefill: {e}"
+                                ),
+                                "transient",
+                                true,
+                                false,
+                            );
+                            let _ = stdout.flush();
+                            return;
+                        }
+                    }
+                }
                 if let Some(hipfire_runtime::triattn::EvictionResult {
                     new_physical: new_phys,
                     ..
