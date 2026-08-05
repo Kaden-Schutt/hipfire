@@ -4895,6 +4895,55 @@ pub const V4F_FUSED_SILU_MUL_CLAMP_MQ_ROTATE_SRC: &str =
 pub const GEMM_MQ2G256_LLOYD_MOE_GROUPED_WMMA_K2_SRC: &str =
     include_str!("../../../kernels/src/gemm_mq2g256_lloyd_moe_grouped_wmma_k2.hip");
 
+/// gfx12 (RDNA4) sister of `GEMM_MQ2G256_LLOYD_MOE_GROUPED_WMMA_K2_SRC`.
+/// Identical 9-arg kernarg contract and grid; the port deltas are the four
+/// standard gfx11->gfx12 WMMA rules (half8_t operands, K split across wave
+/// halves, `_gfx12` builtin/symbol suffix, 8-row-block accumulator). Landed
+/// unwired in be65e2c2c; wired here so a UNIFORM MQ2-Lloyd routed gate_up can
+/// take grouped-WMMA batched prefill on gfx1200/gfx1201 instead of falling back
+/// to the per-token loop. Correctness bench:
+/// `crates/rdna-compute/examples/bench_mq2g256_lloyd_grouped_gfx12.rs`.
+pub const GEMM_MQ2G256_LLOYD_MOE_GROUPED_WMMA_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mq2g256_lloyd_moe_grouped_wmma.gfx12.hip");
+
+/// `(entry_point_name, source)` for the uniform MQ2-Lloyd MoE grouped-WMMA
+/// GEMM on the current arch. Single source of truth shared by
+/// `Gpu::gemm_mq2g256_lloyd_moe_grouped_wmma` and its no-GPU resolution tests,
+/// so a test can prove the launcher names a real `extern "C"` entry point in a
+/// real registered source rather than a fallback or a typo.
+///
+/// The two module names MUST stay distinct: the JIT kernel cache is keyed by
+/// module name only, so a shared name would silently make the second arch's
+/// source dead code and run the wrong ISA.
+pub fn mq2g256_lloyd_moe_grouped_wmma_source(is_gfx12: bool) -> (&'static str, &'static str) {
+    if is_gfx12 {
+        (
+            "gemm_mq2g256_lloyd_moe_grouped_wmma_gfx12",
+            GEMM_MQ2G256_LLOYD_MOE_GROUPED_WMMA_GFX12_SRC,
+        )
+    } else {
+        (
+            "gemm_mq2g256_lloyd_moe_grouped_wmma_k2",
+            GEMM_MQ2G256_LLOYD_MOE_GROUPED_WMMA_K2_SRC,
+        )
+    }
+}
+
+/// MQ3-Lloyd twin of [`mq2g256_lloyd_moe_grouped_wmma_source`].
+pub fn mq3g256_lloyd_moe_grouped_wmma_source(is_gfx12: bool) -> (&'static str, &'static str) {
+    if is_gfx12 {
+        (
+            "gemm_mq3g256_lloyd_moe_grouped_wmma_gfx12",
+            GEMM_MQ3G256_LLOYD_MOE_GROUPED_WMMA_GFX12_SRC,
+        )
+    } else {
+        (
+            "gemm_mq3g256_lloyd_moe_grouped_wmma_k2",
+            GEMM_MQ3G256_LLOYD_MOE_GROUPED_WMMA_K2_SRC,
+        )
+    }
+}
+
 /// 4-warp MoE-grouped MQ2-Lloyd WMMA GEMM for gfx1151 (RDNA3.5). 64-row
 /// × 16-slot tile (vs 16×16 single-warp baseline), LDS-staged X shared
 /// across 4 warps for 4× less B-fragment memory traffic per FLOP. Slot

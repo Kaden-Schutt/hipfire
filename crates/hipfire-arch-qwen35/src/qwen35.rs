@@ -4536,6 +4536,76 @@ fn moe_ffn_has_mq3_experts_uniform(ffn: &MoeFfnWeights) -> bool {
             .any(|e| is_mq3_any(e.gate_up.gpu_dtype) || is_mq3_any(e.down.gpu_dtype))
 }
 
+/// Narrowed sibling of [`moe_ffn_has_mq3_experts_uniform`] for the NON-captured
+/// batched-prefill entry point only.
+///
+/// The refusal that predicate drives exists because the batched MoE bodies used
+/// to dispatch every routed weight through HFQ4-layout kernels (136 B/group), so
+/// an MQ3/Lloyd routed expert (112 B/group) was read at the wrong stride. That is
+/// no longer true for a UNIFORM-per-projection codebook pair: those now have real
+/// grouped-GEMM arms keyed on their own dtype (`dispatch_grouped_gemm` ->
+/// `gemm_mq{2,3}g256_lloyd_moe_grouped_wmma`), so the stride is correct by
+/// construction and the layer is genuinely servable batched.
+///
+/// This MUST agree with [`moe_ffn_batched_admissible_for_dtypes`]'s codebook arm
+/// in one direction: anything that arm ADMITS must return `false` here, or the
+/// forward hard-errors on a model it just declared eligible. The shared helper
+/// [`routed_codebook_pair_batched_supported`] is what keeps them in lockstep
+/// (test: `mq3_refusal_never_fires_on_an_admitted_codebook_pair`). The reverse is
+/// safe: returning `true` for a pair that is not admitted just keeps the
+/// per-token fallback, which is today's behavior.
+///
+/// DELIBERATELY NOT used by `forward_prefill_batch_single_chunk_captured_opts`.
+/// That entry point has no eligibility check and no per-token fallback: its
+/// refusal is the SOLE guard there, and narrowing it would hand these dtypes to
+/// a hipGraph-captured prefill that has never been validated (both the kernel
+/// JIT and the `ensure_fp16_x` staging inside the grouped launchers happen on
+/// the first call, i.e. mid-capture). Correct-and-slow beats fast-and-corrupt.
+fn moe_ffn_has_unsupported_mq3_experts_uniform(ffn: &MoeFfnWeights, admit_codebook: bool) -> bool {
+    unsupported_mq3_experts_uniform_from_dtypes(
+        ffn.expert_dtype_tags.is_some(),
+        ffn.experts
+            .iter()
+            .map(|e| (e.gate_up.gpu_dtype, e.down.gpu_dtype)),
+        admit_codebook,
+    )
+}
+
+/// Pure core of [`moe_ffn_has_unsupported_mq3_experts_uniform`], split out
+/// because `MoeFfnWeights` needs live GPU tensors and cannot be built in a unit
+/// test. `experts` yields `(gate_up_dtype, down_dtype)` per routed expert.
+fn unsupported_mq3_experts_uniform_from_dtypes(
+    has_tag_table: bool,
+    experts: impl IntoIterator<Item = (DType, DType)>,
+    admit_codebook: bool,
+) -> bool {
+    // A tag table means the merged grouped kernel carries the per-expert stride
+    // — the graded case, never this refusal's concern.
+    if has_tag_table {
+        return false;
+    }
+    let dtypes: Vec<(DType, DType)> = experts.into_iter().collect();
+    let is_mq3_any = |dt: DType| matches!(dt, DType::MQ3G256 | DType::MQ3G256Lloyd);
+    if !dtypes
+        .iter()
+        .any(|&(gu, dn)| is_mq3_any(gu) || is_mq3_any(dn))
+    {
+        return false;
+    }
+    if !admit_codebook {
+        return true;
+    }
+    let Some(&first) = dtypes.first() else {
+        return true;
+    };
+    // Uniformity is re-derived rather than assumed: the admission arm only
+    // reaches its codebook branch when `expert_gate_up_uniform &&
+    // expert_down_uniform`, so a mixed-without-tags file must stay refused
+    // (`dispatch_grouped_gemm` would apply experts[0]'s group stride to all).
+    let uniform = dtypes.iter().all(|&d| d == first);
+    !(uniform && routed_codebook_pair_batched_supported(first.0, first.1))
+}
+
 fn moe_ffn_has_mq6(ffn: &MoeFfnWeights) -> bool {
     let is_mq6 = |dt: DType| matches!(dt, DType::MQ6G256);
     is_mq6(ffn.router.gpu_dtype)
@@ -6683,6 +6753,14 @@ pub fn forward_prefill_batch_with_pbs_opts(
     // entry points (daemon-DFlash setup, captured prefill, non-captured
     // prefill) reject MQ3+MoE consistently.
     let is_mq3_any = |dt: DType| matches!(dt, DType::MQ3G256 | DType::MQ3G256Lloyd);
+    // Routed-expert clause uses the NARROWED predicate: a uniform-per-projection
+    // codebook pair (MQ2-Lloyd gate_up / MQ3-Lloyd down) now has its own
+    // grouped-GEMM arms, so the 112-vs-136 stride hazard the refusal exists for
+    // does not apply to it. Everything else — MQ3 in the attention projections,
+    // in the router, or in the shared expert — still refuses, because those
+    // paths really are hardcoded to the HFQ4 layout. The captured entry point
+    // keeps the unnarrowed predicate (see that predicate's doc comment).
+    let codebook_admit = codebook_batched_admit_enabled(gpu.arch.as_str());
     let mq3_in_moe = weights.layers.iter().any(|lw| match lw {
         LayerWeights::DeltaNetMoe(l) => {
             is_mq3_any(l.wqkv.gpu_dtype)
@@ -6691,7 +6769,7 @@ pub fn forward_prefill_batch_with_pbs_opts(
                 || is_mq3_any(l.w_alpha.gpu_dtype)
                 || is_mq3_any(l.wo.gpu_dtype)
                 || moe_ffn_has_mq3_structural(&l.ffn)
-                || moe_ffn_has_mq3_experts_uniform(&l.ffn)
+                || moe_ffn_has_unsupported_mq3_experts_uniform(&l.ffn, codebook_admit)
         }
         LayerWeights::FullAttnMoe(l) => {
             is_mq3_any(l.wq.gpu_dtype)
@@ -6699,7 +6777,7 @@ pub fn forward_prefill_batch_with_pbs_opts(
                 || is_mq3_any(l.wv.gpu_dtype)
                 || is_mq3_any(l.wo.gpu_dtype)
                 || moe_ffn_has_mq3_structural(&l.ffn)
-                || moe_ffn_has_mq3_experts_uniform(&l.ffn)
+                || moe_ffn_has_unsupported_mq3_experts_uniform(&l.ffn, codebook_admit)
         }
         _ => false,
     });
@@ -7320,11 +7398,102 @@ fn moe_prefill_topk_shape_supported(k_top: usize, num_experts: usize) -> bool {
     k_top == 8 && num_experts <= 1024
 }
 
+/// Routed-expert dtypes the batched-prefill grouped-GEMM path (Path 2) serves
+/// natively for a UNIFORM-per-projection file (`expert_dtype_tags == None`).
+///
+/// Each has a real `dispatch_grouped_gemm` arm whose launcher covers BOTH gfx11
+/// (`_k2`) and gfx12 (`_gfx12`):
+///   MQ4G256      -> `gemm_hfq4g256_moe_grouped_wmma_k2` / `.gfx12`
+///   MQ2G256Lloyd -> `gemm_mq2g256_lloyd_moe_grouped_wmma` (arch-selecting)
+///   MQ3G256Lloyd -> `gemm_mq3g256_lloyd_moe_grouped_wmma` (arch-selecting)
+///
+/// DELIBERATELY EXCLUDED — do not add without landing the kernels first:
+///   MQ2G256GL / MQ3G256GL — GL ships FIVE kernels total, all single-token
+///     indexed decode GEMVs (`gemv_mq{2,3}g256gl_moe_{gate_up,down}_indexed`
+///     plus the sym gate_up). There is no grouped-WMMA GEMM and no batched
+///     indexed GEMV for the SoA global-codebook layout, and the merged
+///     dtype-tag kernel has no GL branch. Admitting GL would push a
+///     `[idx][scale]` SoA blob into a per-group-header decoder: OOB reads and
+///     token soup, with no error.
+///   MQ6G256 — handled by its own `admit_mq6` arm (env/arch gated).
+fn routed_codebook_grouped_supported(dt: DType) -> bool {
+    matches!(
+        dt,
+        DType::MQ4G256 | DType::MQ2G256Lloyd | DType::MQ3G256Lloyd
+    )
+}
+
+/// True when the routed pair is a uniform codebook pair the batched grouped-GEMM
+/// path now serves AND at least one projection is a Lloyd codebook dtype (a pure
+/// MQ4/MQ4 pair is the pre-existing default arm, not this one). Used by BOTH the
+/// admission predicate and the MQ3-in-MoE refusal so the two can never disagree:
+/// an admitted-but-refused layer would hard-error a model that serves today.
+fn routed_codebook_pair_batched_supported(gate_up: DType, down: DType) -> bool {
+    routed_codebook_grouped_supported(gate_up)
+        && routed_codebook_grouped_supported(down)
+        && (matches!(gate_up, DType::MQ2G256Lloyd | DType::MQ3G256Lloyd)
+            || matches!(down, DType::MQ2G256Lloyd | DType::MQ3G256Lloyd))
+}
+
+/// Arch/env gate for the uniform codebook routed-expert batched prefill.
+///
+/// Requires (a) a WMMA arch — the grouped-GEMM kernels are gfx11 wave32-WMMA or
+/// gfx12 WMMA only — and (b) `HIPFIRE_MOE_GROUPED_GEMM` not forced off, because
+/// Path 2 is the ONLY implemented route for these dtypes: the Path 0/1
+/// indexed-GEMV arms in `run_moe_prefill` have no MQ2/MQ3-Lloyd branch and would
+/// return `UnsupportedVariant` (a hard error, not a fallback). Admitting while
+/// Path 2 is disabled would turn a working slow prefill into a failure.
+///
+/// `HIPFIRE_MOE_CODEBOOK_BATCHED=0` restores the per-token fallback (the bisect
+/// escape hatch); `=1` forces the admit on an unlisted arch for bring-up.
+fn codebook_batched_admit_enabled_from_env(
+    value: Option<&str>,
+    grouped_gemm_value: Option<&str>,
+    arch: &str,
+) -> bool {
+    // Mirrors FeatureFlags::moe_grouped_gemm (default on; "0"/"off" disables).
+    let grouped_gemm_on = !matches!(grouped_gemm_value, Some("0") | Some("off"));
+    match value {
+        Some("0") | Some("off") | Some("false") => false,
+        Some("1") | Some("on") | Some("true") => grouped_gemm_on,
+        // Same arch list as `admit_e8`: every wave32-WMMA RDNA3/3.5 part plus
+        // RDNA4. RDNA1/2 (gfx10xx) and CDNA have no grouped-WMMA sister.
+        _ => {
+            grouped_gemm_on
+                && matches!(
+                    arch,
+                    "gfx1100"
+                        | "gfx1101"
+                        | "gfx1102"
+                        | "gfx1103"
+                        | "gfx1150"
+                        | "gfx1151"
+                        | "gfx1152"
+                        | "gfx1200"
+                        | "gfx1201"
+                )
+        }
+    }
+}
+
+fn codebook_batched_admit_enabled(arch: &str) -> bool {
+    codebook_batched_admit_enabled_from_env(
+        hipfire_config::developer_var("HIPFIRE_MOE_CODEBOOK_BATCHED")
+            .ok()
+            .as_deref(),
+        hipfire_config::developer_var("HIPFIRE_MOE_GROUPED_GEMM")
+            .ok()
+            .as_deref(),
+        arch,
+    )
+}
+
 fn moe_ffn_batched_admissible_for_dtypes(
     dtypes: &MoePrefillDtypes,
     admit_mq6: bool,
     admit_paro: bool,
     admit_e8: bool,
+    admit_codebook: bool,
 ) -> bool {
     let router_ok = matches!(dtypes.router, DType::MQ4G256 | DType::Q8_0 | DType::F32);
     let shared_gate_ok = matches!(
@@ -7396,6 +7565,34 @@ fn moe_ffn_batched_admissible_for_dtypes(
         && matches!(dtypes.shared_expert_down, DType::Q8_0 | DType::MFP4G32E8 | DType::MFP3G32E8 | DType::MFP2G32E8)
     {
         return true;
+    }
+
+    // Uniform-per-projection CODEBOOK routed experts (the antirez asymmetric
+    // recipe: gate_up = MQ2-Lloyd, down = MQ3-Lloyd; also the MQ4/Lloyd mixes
+    // the per-layer tiered formats emit). `routed_ok` above already established
+    // uniformity per projection and the absence of a tag table, so
+    // `expert_gate_up` / `expert_down` describe EVERY expert. The routed block
+    // runs Path 2 grouped-WMMA (`dispatch_grouped_gemm` MQ2/MQ3-Lloyd arms), the
+    // SwiGLU+FWHT-rotate is weight-agnostic, and the shared expert + router keep
+    // their own dense batched paths — which is why the shared side is validated
+    // exactly as in the default MQ4 arm (plus MQ6 when this arch admits MQ6).
+    //
+    // Structurally distinct from `routed_mixed_merged` above: that arm covers a
+    // GRADED file served by the merged dtype-tag kernel; this one covers a
+    // UNIFORM file served by the per-dtype grouped kernels, with no tag table.
+    if admit_codebook
+        && routed_codebook_pair_batched_supported(dtypes.expert_gate_up, dtypes.expert_down)
+    {
+        let shared_gu_ok = (dtypes.shared_expert_gate == DType::MQ4G256
+            && dtypes.shared_expert_up == DType::MQ4G256)
+            || (admit_mq6
+                && matches!(dtypes.shared_expert_gate, DType::MQ4G256 | DType::MQ6G256)
+                && dtypes.shared_expert_up == dtypes.shared_expert_gate);
+        let shared_dn_ok = dtypes.shared_expert_down == DType::MQ4G256
+            || (admit_mq6 && dtypes.shared_expert_down == DType::MQ6G256);
+        if shared_gu_ok && shared_dn_ok {
+            return true;
+        }
     }
 
     if admit_paro
@@ -7686,7 +7883,27 @@ fn moe_ffn_batched_admissible(ffn: &MoeFfnWeights, admit_mq6: bool, arch: &str) 
         )
     });
 
-    moe_ffn_batched_admissible_for_dtypes(&dtypes, admit_mq6, admit_paro, admit_e8)
+    let admit_codebook = codebook_batched_admit_enabled(arch);
+    // One-time provenance line. A codebook-routed model that used to prefill
+    // per-token now takes grouped-WMMA batched prefill, so any timing captured
+    // across that flip must be attributable; print once per process which route
+    // the routed experts took and how to put it back.
+    if admit_codebook
+        && routed_codebook_pair_batched_supported(dtypes.expert_gate_up, dtypes.expert_down)
+        && dtypes.expert_gate_up_uniform
+        && dtypes.expert_down_uniform
+    {
+        static NOTED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        NOTED.get_or_init(|| {
+            eprintln!(
+                "[moe-prefill] uniform codebook routed experts (gate_up={:?} down={:?}) \
+                 admitted to grouped-WMMA batched prefill on {arch}. \
+                 HIPFIRE_MOE_CODEBOOK_BATCHED=0 restores the per-token fallback.",
+                dtypes.expert_gate_up, dtypes.expert_down
+            );
+        });
+    }
+    moe_ffn_batched_admissible_for_dtypes(&dtypes, admit_mq6, admit_paro, admit_e8, admit_codebook)
 }
 
 /// #397 Ship 5.2 slice 1: route a single PLAIN-batched prefill GEMM through
@@ -17995,7 +18212,7 @@ mod tests {
     fn moe_prefill_admits_mq4_as_known_good_control() {
         let dtypes = MoePrefillDtypes::uniform(DType::MQ4G256);
         assert!(moe_ffn_batched_admissible_for_dtypes(
-            &dtypes, false, false, false
+            &dtypes, false, false, false, false
         ));
     }
 
@@ -18012,28 +18229,57 @@ mod tests {
         dtypes.expert_down_uniform = false;
         dtypes.expert_down = DType::MQ3G256Lloyd; // representative cold-tier dtype
         assert!(moe_ffn_batched_admissible_for_dtypes(
-            &dtypes, true, false, false
+            &dtypes, true, false, false, false
         ));
         // The same mixed file WITHOUT the merged-kernel tag table is NOT admissible.
         dtypes.routed_mixed_merged = false;
         assert!(!moe_ffn_batched_admissible_for_dtypes(
-            &dtypes, true, false, false
+            &dtypes, true, false, false, false
         ));
     }
 
+    /// Plain (affine) MQ3G256 is NOT the Lloyd codebook dtype and has no
+    /// grouped-GEMM arm — it must stay rejected even with the codebook admit on.
+    /// Same for MQ3 anywhere STRUCTURAL (router / shared expert), which the
+    /// codebook arm never covers.
     #[test]
     fn moe_prefill_rejects_mq3_before_admission_work() {
-        let mut dtypes = MoePrefillDtypes::uniform(DType::MQ4G256);
-        dtypes.expert_gate_up = DType::MQ3G256;
-        assert!(!moe_ffn_batched_admissible_for_dtypes(
-            &dtypes, true, false, false
-        ));
+        for admit_codebook in [false, true] {
+            let mut dtypes = MoePrefillDtypes::uniform(DType::MQ4G256);
+            dtypes.expert_gate_up = DType::MQ3G256;
+            assert!(!moe_ffn_batched_admissible_for_dtypes(
+                &dtypes,
+                true,
+                false,
+                false,
+                admit_codebook
+            ));
 
-        let mut dtypes = MoePrefillDtypes::uniform(DType::MQ4G256);
-        dtypes.shared_expert_down = DType::MQ3G256;
-        assert!(!moe_ffn_batched_admissible_for_dtypes(
-            &dtypes, true, false, false
-        ));
+            let mut dtypes = MoePrefillDtypes::uniform(DType::MQ4G256);
+            dtypes.shared_expert_down = DType::MQ3G256;
+            assert!(!moe_ffn_batched_admissible_for_dtypes(
+                &dtypes,
+                true,
+                false,
+                false,
+                admit_codebook
+            ));
+
+            // MQ3-Lloyd routed pair with an MQ3-Lloyd SHARED expert: routed side
+            // is fine, shared side is not — the codebook arm validates the shared
+            // expert exactly like the MQ4 arm, so this must still reject.
+            let mut dtypes = MoePrefillDtypes::uniform(DType::MQ4G256);
+            dtypes.expert_gate_up = DType::MQ2G256Lloyd;
+            dtypes.expert_down = DType::MQ3G256Lloyd;
+            dtypes.shared_expert_down = DType::MQ3G256Lloyd;
+            assert!(!moe_ffn_batched_admissible_for_dtypes(
+                &dtypes,
+                true,
+                false,
+                false,
+                admit_codebook
+            ));
+        }
     }
 
     /// MQ2/MQ3-G256-GL routed experts have DECODE kernels only — the four
@@ -18052,18 +18298,47 @@ mod tests {
                 dtypes.expert_gate_up = gl;
                 dtypes.expert_down = gl;
                 assert!(
-                    !moe_ffn_batched_admissible_for_dtypes(&dtypes, admit_mq6, true, true),
+                    !moe_ffn_batched_admissible_for_dtypes(&dtypes, admit_mq6, true, true, true),
                     "{gl:?} must not be batched-prefill admissible (admit_mq6={admit_mq6})"
                 );
             }
         }
         // Per-projection GL mix (the target SKU: gate_up MQ2-GL, down MQ3-GL).
-        let mut dtypes = MoePrefillDtypes::uniform(DType::MQ4G256);
-        dtypes.expert_gate_up = DType::MQ2G256GL;
-        dtypes.expert_down = DType::MQ3G256GL;
-        assert!(!moe_ffn_batched_admissible_for_dtypes(
-            &dtypes, true, true, true
-        ));
+        // Must reject with the codebook admit BOTH off and on — GL is excluded
+        // from `routed_codebook_grouped_supported` on purpose.
+        for admit_codebook in [false, true] {
+            let mut dtypes = MoePrefillDtypes::uniform(DType::MQ4G256);
+            dtypes.expert_gate_up = DType::MQ2G256GL;
+            dtypes.expert_down = DType::MQ3G256GL;
+            assert!(!moe_ffn_batched_admissible_for_dtypes(
+                &dtypes,
+                true,
+                true,
+                true,
+                admit_codebook
+            ));
+            // Half-GL pairs must not sneak through the codebook arm either.
+            let mut dtypes = MoePrefillDtypes::uniform(DType::MQ4G256);
+            dtypes.expert_gate_up = DType::MQ2G256GL;
+            dtypes.expert_down = DType::MQ3G256Lloyd;
+            assert!(!moe_ffn_batched_admissible_for_dtypes(
+                &dtypes,
+                true,
+                true,
+                true,
+                admit_codebook
+            ));
+            let mut dtypes = MoePrefillDtypes::uniform(DType::MQ4G256);
+            dtypes.expert_gate_up = DType::MQ2G256Lloyd;
+            dtypes.expert_down = DType::MQ3G256GL;
+            assert!(!moe_ffn_batched_admissible_for_dtypes(
+                &dtypes,
+                true,
+                true,
+                true,
+                admit_codebook
+            ));
+        }
     }
 
     #[test]
@@ -18076,10 +18351,10 @@ mod tests {
         dtypes.expert_gate_up = DType::MQ6G256;
         dtypes.expert_down = DType::MQ6G256;
         assert!(!moe_ffn_batched_admissible_for_dtypes(
-            &dtypes, false, false, false
+            &dtypes, false, false, false, false
         ));
         assert!(moe_ffn_batched_admissible_for_dtypes(
-            &dtypes, true, false, false
+            &dtypes, true, false, false, false
         ));
     }
 
@@ -18088,13 +18363,13 @@ mod tests {
         let mut dtypes = MoePrefillDtypes::uniform(DType::MQ4G256);
         dtypes.expert_gate_up_uniform = false;
         assert!(!moe_ffn_batched_admissible_for_dtypes(
-            &dtypes, true, false, false
+            &dtypes, true, false, false, false
         ));
 
         let mut dtypes = MoePrefillDtypes::uniform(DType::MQ4G256);
         dtypes.expert_down_uniform = false;
         assert!(!moe_ffn_batched_admissible_for_dtypes(
-            &dtypes, true, false, false
+            &dtypes, true, false, false, false
         ));
     }
 
@@ -18103,7 +18378,7 @@ mod tests {
         let mut dtypes = MoePrefillDtypes::uniform(DType::MQ4G256);
         dtypes.shared_expert_up = DType::MQ6G256;
         assert!(!moe_ffn_batched_admissible_for_dtypes(
-            &dtypes, true, false, false
+            &dtypes, true, false, false, false
         ));
     }
 
@@ -18113,10 +18388,10 @@ mod tests {
         dtypes.router = DType::F32;
         dtypes.shared_expert_scalar_gate = DType::F32;
         assert!(!moe_ffn_batched_admissible_for_dtypes(
-            &dtypes, true, false, false
+            &dtypes, true, false, false, false
         ));
         assert!(moe_ffn_batched_admissible_for_dtypes(
-            &dtypes, true, true, false
+            &dtypes, true, true, false, false
         ));
     }
 
@@ -18128,12 +18403,218 @@ mod tests {
         dtypes.expert_down = DType::MFP4G32E8;
         // Without the arch gate (non-gfx1151), E8 is rejected.
         assert!(!moe_ffn_batched_admissible_for_dtypes(
-            &dtypes, false, false, false
+            &dtypes, false, false, false, false
         ));
         // With the gfx1151 arch gate, the Q8-shared + E8-routed layer admits.
         assert!(moe_ffn_batched_admissible_for_dtypes(
-            &dtypes, false, false, true
+            &dtypes, false, false, true, false
         ));
+    }
+
+
+    /// The antirez asymmetric routed pair (gate_up MQ2-Lloyd / down MQ3-Lloyd)
+    /// on an MQ4 shared expert + MQ4 router — the shape every current low-bit
+    /// a3b SKU ships. Rejected without the codebook admit (today's behavior:
+    /// per-token fallback), admitted with it.
+    #[test]
+    fn moe_prefill_admits_uniform_codebook_pair_only_with_gate() {
+        let mut dtypes = MoePrefillDtypes::uniform(DType::MQ4G256);
+        dtypes.expert_gate_up = DType::MQ2G256Lloyd;
+        dtypes.expert_down = DType::MQ3G256Lloyd;
+        assert!(!moe_ffn_batched_admissible_for_dtypes(
+            &dtypes, true, false, false, false
+        ));
+        assert!(moe_ffn_batched_admissible_for_dtypes(
+            &dtypes, true, false, false, true
+        ));
+        // Also with the MQ6 admit off — the codebook arm does not depend on it
+        // when the shared expert is plain MQ4.
+        assert!(moe_ffn_batched_admissible_for_dtypes(
+            &dtypes, false, false, false, true
+        ));
+    }
+
+    /// Every uniform gate_up/down permutation over the supported codebook set,
+    /// plus the negative cases. Guards `routed_codebook_grouped_supported`
+    /// against silent widening.
+    #[test]
+    fn moe_prefill_codebook_pair_permutations() {
+        use DType::{MQ2G256Lloyd, MQ3G256Lloyd, MQ4G256};
+        // (gate_up, down, admissible_with_codebook_gate)
+        let cases = [
+            (MQ2G256Lloyd, MQ3G256Lloyd, true),
+            (MQ3G256Lloyd, MQ3G256Lloyd, true),
+            (MQ2G256Lloyd, MQ2G256Lloyd, true),
+            (MQ2G256Lloyd, MQ4G256, true),
+            (MQ4G256, MQ3G256Lloyd, true),
+            // Pure MQ4/MQ4 admits via the pre-existing default arm, not this one.
+            (MQ4G256, MQ4G256, true),
+            // Not in the supported set: plain affine MQ3, MQ5, GL, E8.
+            (DType::MQ3G256, MQ3G256Lloyd, false),
+            (MQ2G256Lloyd, DType::MQ3G256, false),
+            (DType::MQ5G256, MQ3G256Lloyd, false),
+            (DType::MQ2G256GL, MQ3G256Lloyd, false),
+            (MQ2G256Lloyd, DType::MQ3G256GL, false),
+            (DType::MFP4G32E8, MQ3G256Lloyd, false),
+        ];
+        for (gu, dn, want) in cases {
+            let mut dtypes = MoePrefillDtypes::uniform(MQ4G256);
+            dtypes.expert_gate_up = gu;
+            dtypes.expert_down = dn;
+            let got = moe_ffn_batched_admissible_for_dtypes(&dtypes, false, false, false, true);
+            assert_eq!(got, want, "gate_up={gu:?} down={dn:?}");
+        }
+    }
+
+    /// Non-uniform routed experts without a tag table stay rejected even for a
+    /// supported codebook pair — `dispatch_grouped_gemm` would apply experts[0]'s
+    /// group stride to every expert.
+    #[test]
+    fn moe_prefill_codebook_pair_requires_uniform_projections() {
+        for (gu_uniform, dn_uniform) in [(false, true), (true, false), (false, false)] {
+            let mut dtypes = MoePrefillDtypes::uniform(DType::MQ4G256);
+            dtypes.expert_gate_up = DType::MQ2G256Lloyd;
+            dtypes.expert_down = DType::MQ3G256Lloyd;
+            dtypes.expert_gate_up_uniform = gu_uniform;
+            dtypes.expert_down_uniform = dn_uniform;
+            assert!(!moe_ffn_batched_admissible_for_dtypes(
+                &dtypes, true, false, false, true
+            ));
+        }
+    }
+
+    /// LOCKSTEP INVARIANT: anything the codebook admission arm accepts must NOT
+    /// trip the MQ3-in-MoE refusal, or `forward_prefill_batch_with_pbs_opts`
+    /// hard-errors on a model it just declared eligible. Walks the same routed
+    /// pairs through both predicates and asserts they never disagree that way.
+    #[test]
+    fn mq3_refusal_never_fires_on_an_admitted_codebook_pair() {
+        use DType::{MQ2G256Lloyd, MQ2G256GL, MQ3G256, MQ3G256GL, MQ3G256Lloyd, MQ4G256, MQ6G256};
+        let pairs = [
+            (MQ2G256Lloyd, MQ3G256Lloyd),
+            (MQ3G256Lloyd, MQ3G256Lloyd),
+            (MQ2G256Lloyd, MQ2G256Lloyd),
+            (MQ4G256, MQ3G256Lloyd),
+            (MQ2G256Lloyd, MQ4G256),
+            (MQ4G256, MQ4G256),
+            (MQ3G256, MQ3G256Lloyd),
+            (MQ2G256GL, MQ3G256GL),
+            (MQ2G256Lloyd, MQ3G256GL),
+            (MQ6G256, MQ3G256Lloyd),
+        ];
+        for admit_codebook in [false, true] {
+            for (gu, dn) in pairs {
+                let mut dtypes = MoePrefillDtypes::uniform(MQ4G256);
+                dtypes.expert_gate_up = gu;
+                dtypes.expert_down = dn;
+                let admitted = moe_ffn_batched_admissible_for_dtypes(
+                    &dtypes,
+                    true,
+                    false,
+                    false,
+                    admit_codebook,
+                );
+                let refused = unsupported_mq3_experts_uniform_from_dtypes(
+                    false,
+                    [(gu, dn); 4],
+                    admit_codebook,
+                );
+                assert!(
+                    !(admitted && refused),
+                    "gate_up={gu:?} down={dn:?} admit_codebook={admit_codebook}: \
+                     admitted by the batched gate but refused by the MQ3-in-MoE guard"
+                );
+            }
+        }
+    }
+
+    /// The narrowed refusal only relaxes for a UNIFORM supported pair: a graded
+    /// tag table is out of scope (merged kernel), a mixed no-tags file stays
+    /// refused, and MQ3 stays refused when the admit is off.
+    #[test]
+    fn unsupported_mq3_predicate_shape() {
+        use DType::{MQ2G256Lloyd, MQ3G256Lloyd, MQ4G256};
+        let pair = (MQ2G256Lloyd, MQ3G256Lloyd);
+        // Uniform supported pair, admit on -> no refusal.
+        assert!(!unsupported_mq3_experts_uniform_from_dtypes(
+            false,
+            [pair; 8],
+            true
+        ));
+        // Same file, admit off -> refusal stands (today's behavior).
+        assert!(unsupported_mq3_experts_uniform_from_dtypes(
+            false,
+            [pair; 8],
+            false
+        ));
+        // Mixed routed dtypes with NO tag table -> refusal stands even with the
+        // admit on; the grouped GEMM would use experts[0]'s stride for all.
+        assert!(unsupported_mq3_experts_uniform_from_dtypes(
+            false,
+            [pair, (MQ4G256, MQ3G256Lloyd)],
+            true
+        ));
+        // Graded file (tag table present) -> never this predicate's business.
+        assert!(!unsupported_mq3_experts_uniform_from_dtypes(
+            true,
+            [pair, (MQ4G256, MQ4G256)],
+            true
+        ));
+        // No MQ3 anywhere in the routed experts -> nothing to refuse.
+        assert!(!unsupported_mq3_experts_uniform_from_dtypes(
+            false,
+            [(MQ4G256, MQ4G256); 4],
+            false
+        ));
+        // Empty expert list (paged mode) -> nothing to refuse.
+        assert!(!unsupported_mq3_experts_uniform_from_dtypes(
+            false,
+            std::iter::empty(),
+            true
+        ));
+    }
+
+    /// The codebook admit is arch-gated (WMMA only) and hard-gated on Path 2
+    /// being enabled — Path 0/1 have no MQ2/MQ3-Lloyd indexed-GEMV arm, so
+    /// admitting with `HIPFIRE_MOE_GROUPED_GEMM=0` would turn a working slow
+    /// prefill into an `UnsupportedVariant` hard error.
+    #[test]
+    fn codebook_batched_admit_arch_and_flag_gates() {
+        for arch in [
+            "gfx1100", "gfx1101", "gfx1102", "gfx1103", "gfx1150", "gfx1151", "gfx1152", "gfx1200",
+            "gfx1201",
+        ] {
+            assert!(
+                codebook_batched_admit_enabled_from_env(None, None, arch),
+                "{arch} should default-admit the codebook batched prefill"
+            );
+            // Path 2 disabled => never admit, whatever the codebook var says.
+            assert!(!codebook_batched_admit_enabled_from_env(None, Some("0"), arch));
+            assert!(!codebook_batched_admit_enabled_from_env(
+                Some("1"),
+                Some("off"),
+                arch
+            ));
+            // Explicit opt-out.
+            assert!(!codebook_batched_admit_enabled_from_env(
+                Some("0"),
+                None,
+                arch
+            ));
+        }
+        // Non-WMMA archs have no grouped-WMMA sister kernel at all.
+        for arch in ["gfx1010", "gfx1030", "gfx906", "gfx942"] {
+            assert!(
+                !codebook_batched_admit_enabled_from_env(None, None, arch),
+                "{arch} has no grouped-WMMA kernel — must not default-admit"
+            );
+            // ...but an explicit =1 is still honored for research / bring-up.
+            assert!(codebook_batched_admit_enabled_from_env(
+                Some("1"),
+                None,
+                arch
+            ));
+        }
     }
 
     #[test]

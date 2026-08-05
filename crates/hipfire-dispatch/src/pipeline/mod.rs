@@ -2101,6 +2101,22 @@ fn dispatch_grouped_gemm(
                 ))
             }
         }
+        // Uniform-per-projection codebook routed experts (the antirez asymmetric
+        // recipe: gate_up = MQ2-Lloyd 72 B/group, down = MQ3-Lloyd 112 B/group).
+        // Both entries are arch-selecting (gfx11 `_k2` / gfx12 `_gfx12`) — do NOT
+        // swap either for the bare `_k2` launcher, which fails the JIT on RDNA4.
+        DType::MQ2G256Lloyd => hip!(gpu.gemm_mq2g256_lloyd_moe_grouped_wmma(
+            ptrs,
+            tile_ids,
+            sorted_slot_index,
+            x,
+            y,
+            m,
+            k,
+            x_row_div,
+            m_total,
+            rows,
+        )),
         DType::MQ3G256Lloyd => hip!(gpu.gemm_mq3g256_lloyd_moe_grouped_wmma(
             ptrs,
             tile_ids,
@@ -2382,9 +2398,19 @@ pub fn run_moe_prefill(
         match p.dtypes.routed_down {
             // MFP4G32E8 reuses the weight-agnostic silu+FWHT-rotate (E8 down expects
             // FWHT(silu(g)*u), same as MQ4 — see the decode E8 path).
+            //
+            // MQ2/MQ3-Lloyd likewise: the decode path feeds those down GEMVs
+            // `rot_batch` = FWHT(silu(g)·u) built by the same weight-agnostic
+            // kernel family, so the batched twin is the correct analogue. This
+            // was a pure MATCH gap — the kernel reads activations only, never
+            // weight bytes. The GL dtypes are deliberately absent: they are not
+            // batched-prefill admissible (no grouped GEMM, no batched GEMV), so
+            // reaching here with a GL down is a bug and must stay a loud error.
             DType::MQ4G256
             | DType::MQ5G256
             | DType::MQ6G256
+            | DType::MQ2G256Lloyd
+            | DType::MQ3G256Lloyd
             | DType::MFP4G32E8
             | DType::MFP3G32E8
             | DType::MFP2G32E8 => {

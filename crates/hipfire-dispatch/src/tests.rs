@@ -1675,3 +1675,154 @@ fn moe_prefill_resolution_mq4_gfx11_still_path2() {
     let r = MoePrefillResolution::resolve(&moe_dtypes_mq4(), &arch.arch, &arch.flags);
     assert!(r.use_path2, "MQ4 on gfx11 should still use Path 2");
 }
+
+// ── Uniform codebook routed pair (MQ2-Lloyd gate_up / MQ3-Lloyd down) ────────
+//
+// The shape every current low-bit a3b SKU ships (`--format mq4-mqlloyd-antirez`,
+// no k-map ⇒ `expert_dtype_tags == None`). Batched prefill for it is Path 2 only:
+// `run_moe_prefill`'s Path 0/1 indexed-GEMV matches have no MQ2/MQ3-Lloyd arm and
+// return `UnsupportedVariant`, so these tests pin BOTH that Path 2 is selected on
+// every WMMA arch AND that each grouped-GEMM leg names a real entry point.
+
+/// The antirez asymmetric routed pair: gate_up MQ2-Lloyd, down MQ3-Lloyd,
+/// MQ4 shared expert, no tag table.
+fn moe_dtypes_codebook_pair() -> MoeDtypes {
+    let mut d = moe_dtypes_mq4();
+    d.routed_gate_up = DType::MQ2G256Lloyd;
+    d.routed_down = DType::MQ3G256Lloyd;
+    d.experts_all_gate_up_mq4 = false;
+    d
+}
+
+#[test]
+fn moe_prefill_resolution_codebook_pair_uses_path2_on_wmma() {
+    for arch_name in [
+        "gfx1100", "gfx1101", "gfx1102", "gfx1150", "gfx1151", "gfx1200", "gfx1201",
+    ] {
+        let arch = crate::context::DispatchCtx::for_test(arch_name);
+        let r = MoePrefillResolution::resolve(&moe_dtypes_codebook_pair(), &arch.arch, &arch.flags);
+        assert!(
+            r.use_path2,
+            "{arch_name}: MQ2L/MQ3L routed pair must take Path 2 (grouped WMMA) — \
+             Path 0/1 have no Lloyd indexed-GEMV arm"
+        );
+        assert!(!r.down_path0, "{arch_name} is not a Path 0 arch");
+        assert!(!r.paro_mode);
+    }
+}
+
+/// Non-WMMA archs fall out of Path 2. There is no Lloyd Path 0/1 arm, which is
+/// exactly why `codebook_batched_admit_enabled_from_env` (hipfire-arch-qwen35)
+/// refuses to admit these layers on such archs — they must never get here.
+#[test]
+fn moe_prefill_resolution_codebook_pair_no_path2_without_wmma() {
+    for arch_name in ["gfx1010", "gfx1030", "gfx906", "gfx942"] {
+        let arch = crate::context::DispatchCtx::for_test(arch_name);
+        let r = MoePrefillResolution::resolve(&moe_dtypes_codebook_pair(), &arch.arch, &arch.flags);
+        assert!(
+            !r.use_path2,
+            "{arch_name} has no grouped-WMMA kernel — must not resolve to Path 2"
+        );
+    }
+}
+
+/// Both grouped-GEMM legs of the pair must name a REAL `extern "C" __global__`
+/// entry point that exists in the source string the launcher will hand to the
+/// JIT — on both arch legs. This is the no-GPU proof that the new dispatch arms
+/// resolve to actual kernels rather than to a fallback, a stale name, or a
+/// gfx11 kernel wrongly reused on RDNA4.
+#[test]
+fn codebook_grouped_gemm_legs_name_real_kernels() {
+    let legs = [
+        (
+            "MQ2-Lloyd",
+            false,
+            rdna_compute::mq2g256_lloyd_moe_grouped_wmma_source(false),
+        ),
+        (
+            "MQ2-Lloyd",
+            true,
+            rdna_compute::mq2g256_lloyd_moe_grouped_wmma_source(true),
+        ),
+        (
+            "MQ3-Lloyd",
+            false,
+            rdna_compute::mq3g256_lloyd_moe_grouped_wmma_source(false),
+        ),
+        (
+            "MQ3-Lloyd",
+            true,
+            rdna_compute::mq3g256_lloyd_moe_grouped_wmma_source(true),
+        ),
+    ];
+    for (label, is_gfx12, (name, src)) in legs {
+        let entry = format!("__global__ void {name}(");
+        assert!(
+            src.contains(&entry),
+            "{label} is_gfx12={is_gfx12}: source does not define `{name}`"
+        );
+        // The gfx11 leg must use the gfx11 WMMA builtin and the gfx12 leg the
+        // `_gfx12` one — swapping them fails the JIT at first launch, which on
+        // a prefill path means a serving outage, not a fallback.
+        if is_gfx12 {
+            assert!(
+                src.contains("wmma_f32_16x16x16_f16_w32_gfx12"),
+                "{label} gfx12 leg must use the _gfx12 WMMA builtin"
+            );
+        } else {
+            assert!(
+                src.contains("wmma_f32_16x16x16_f16_w32")
+                    && !src.contains("wmma_f32_16x16x16_f16_w32_gfx12"),
+                "{label} gfx11 leg must use the plain _w32 WMMA builtin"
+            );
+        }
+    }
+    // Distinct module names per arch — the JIT cache is keyed by module name
+    // only, so a collision makes one arch's source dead code.
+    assert_ne!(
+        rdna_compute::mq2g256_lloyd_moe_grouped_wmma_source(false).0,
+        rdna_compute::mq2g256_lloyd_moe_grouped_wmma_source(true).0
+    );
+    assert_ne!(
+        rdna_compute::mq3g256_lloyd_moe_grouped_wmma_source(false).0,
+        rdna_compute::mq3g256_lloyd_moe_grouped_wmma_source(true).0
+    );
+}
+
+/// The MQ2-Lloyd and MQ3-Lloyd grouped kernels must agree with the uniform
+/// grouped kernarg contract the scatter pipeline emits: 5 pointers then
+/// `M, K, x_row_div, m_total`. A tenth arg (as in the merged dtype-tag kernel,
+/// which inserts `dtype_tags` second) would shift every kernarg by 8 bytes.
+#[test]
+fn codebook_grouped_gemm_kernarg_contract_is_the_uniform_nine() {
+    for (name, src) in [
+        rdna_compute::mq2g256_lloyd_moe_grouped_wmma_source(false),
+        rdna_compute::mq2g256_lloyd_moe_grouped_wmma_source(true),
+        rdna_compute::mq3g256_lloyd_moe_grouped_wmma_source(false),
+        rdna_compute::mq3g256_lloyd_moe_grouped_wmma_source(true),
+    ] {
+        let start = src
+            .find(&format!("__global__ void {name}("))
+            .unwrap_or_else(|| panic!("{name}: entry point not found"));
+        let sig_end = src[start..].find(')').expect("unterminated signature") + start;
+        let sig = &src[start..sig_end];
+        assert!(
+            !sig.contains("dtype_tags"),
+            "{name}: uniform grouped kernels must NOT take a dtype_tags table"
+        );
+        for arg in [
+            "expert_weight_ptrs",
+            "expert_tile_ids",
+            "sorted_slot_index",
+            "X_src",
+            "Y_grouped",
+            "int M",
+            "int K",
+            "int x_row_div",
+            "int m_total",
+        ] {
+            assert!(sig.contains(arg), "{name}: signature is missing `{arg}`");
+        }
+    }
+}
+

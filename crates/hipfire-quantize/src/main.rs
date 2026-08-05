@@ -7201,14 +7201,23 @@ fn main() {
     // which the fp16 per-block scale already carries. Costs 0.1875 bpw less
     // (2.0625/3.0625 vs 2.25/3.5) for a measured +1.16% KLD and -0.08% decode.
     //
-    // DECODE-ONLY: no grouped-WMMA or batched GL kernels exist, so a GL model
-    // takes the per-token prefill path. Fine for eval; not yet a serving SKU.
+    // DECODE-ONLY: GL ships five kernels, all single-token indexed MoE GEMVs
+    // (gemv_mq{2,3}g256gl_moe_{gate_up,down}_indexed + the sym gate_up). There
+    // is no grouped-WMMA GEMM and no batched indexed GEMV for the SoA
+    // global-codebook layout, and the merged dtype-tag kernel has no GL branch,
+    // so a GL model still takes the per-token prefill path. The per-block Lloyd
+    // pair does NOT: MQ2G256Lloyd / MQ3G256Lloyd both have grouped-WMMA GEMMs on
+    // gfx11 and gfx12 and are batched-prefill admissible. Choosing GL therefore
+    // trades ~0.19 bpw against prefill throughput, not just KLD.
     let routed_gl = std::env::var("HIPFIRE_ROUTED_GL").ok().as_deref() == Some("1");
     if routed_gl {
         eprintln!(
             "note: HIPFIRE_ROUTED_GL=1 — routed experts ship the GLOBAL-codebook\n\
              variants (MQ2G256GL qt=38 / MQ3G256GL qt=39) instead of the per-block\n\
-             Lloyd ones. Decode-only: batched prefill rejects GL."
+             Lloyd ones. Decode-only: batched prefill rejects GL (no grouped-WMMA\n\
+             kernel exists for the SoA layout), so prefill runs the per-token\n\
+             fallback. The per-block Lloyd pair DOES batch — prefer it when\n\
+             prefill throughput matters."
         );
     }
     // Lever 2: same recipe as antirez but with sequential-GPTQ Lloyd

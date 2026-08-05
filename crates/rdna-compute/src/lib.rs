@@ -32,3 +32,8 @@ pub use dispatch::{
 };
 pub use feature_flags::FeatureFlags;
 pub use kernels::GEMV_SRC;
+/// `(entry_point, source)` selectors for the uniform MoE grouped-WMMA GEMMs
+/// whose gfx11 and gfx12 kernels are separate translation units. Exported so
+/// no-GPU tests can assert the launcher resolves to a real entry point on both
+/// arch legs (the `kernels` module itself stays private).
+pub use kernels::{mq2g256_lloyd_moe_grouped_wmma_source, mq3g256_lloyd_moe_grouped_wmma_source};
