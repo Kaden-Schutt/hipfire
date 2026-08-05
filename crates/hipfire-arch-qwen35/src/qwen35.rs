@@ -6703,18 +6703,10 @@ pub fn forward_prefill_batch_with_pbs_opts(
         }
         _ => false,
     });
-    if mq3_in_moe {
-        return Err(hip_bridge::HipError::new(
-            0,
-            "forward_prefill_batch: model has MQ3G256 / MQ3G256Lloyd weights \
-             inside a MoE/A3B layer (DeltaNetMoe or FullAttnMoe). The MoE \
-             batched prefill branches dispatch through HFQ4-layout kernels \
-             (QKV matcher drops MQ3; wo path is hardcoded MQ4) and would \
-             produce silent corruption from the 104/112-vs-136 byte stride \
-             mismatch. Use an MQ4 quantization for MoE/A3B targets, or wait \
-             for the MQ3 MoE branches to land (see followup issue).",
-        ));
-    }
+    // NOTE: the refusal this predicate drives is deliberately deferred until
+    // after `eligible` is computed below — see the `mq3_in_moe && (eligible ||
+    // gdn_tape.is_some())` guard. Refusing here would pre-empt the per-token
+    // fallback, which handles MQ3/Lloyd correctly.
 
     // Tree-verify mode sanity checks — the downstream path can't silently
     // fall back to per-token FA (that's always causal and would ignore the
@@ -6766,6 +6758,41 @@ pub fn forward_prefill_batch_with_pbs_opts(
     let kv_f32 = !kv_cache.quantized && !kv_cache.quant_q8 && !kv_cache.quant_hfq4;
     let kv_asym2_tree = kv_cache.quant_asym2 && tree_verify.is_some();
     let eligible = eligible && !kv_f32 && !kv_asym2_tree;
+
+    // MQ3-in-MoE refusal (predicate computed above). This protects the batched
+    // MoE LA/FA bodies: their QKV matcher drops MQ3 and the wo path is
+    // hardcoded to `gemm_hfq4g256_residual`, so an MQ3/Lloyd model would take a
+    // 104/112-vs-136 byte stride mismatch and emit fluent-looking corruption.
+    //
+    // It is gated on `eligible` because when the batched path does NOT run,
+    // those bodies never execute: the `!eligible` branch below is a per-token
+    // `forward_scratch` loop, byte-identical to decode, which dispatches every
+    // weight by its own dtype and supports MQ3/Lloyd fully. Refusing before the
+    // eligibility check pre-empted that correct path — routed codebook models
+    // (MQ2/MQ3 Lloyd/GL experts) are already inadmissible to the batched MoE
+    // bodies via `moe_ffn_batched_admissible_for_dtypes`, so the refusal was
+    // protecting nothing and only blocked a working per-token prefill.
+    //
+    // The `gdn_tape.is_some()` clause is load-bearing: the `!eligible` fallback
+    // leaves a passed GDN tape untouched/stale rather than erroring, so a
+    // spec-decode caller must still get the loud refusal instead of a silent
+    // stale-tape DeltaNet corruption.
+    //
+    // The sibling guard in `forward_prefill_batch_single_chunk_captured_opts`
+    // is intentionally NOT gated this way — that entry point has no eligibility
+    // check and no per-token fallback, so its refusal is the only protection.
+    if mq3_in_moe && (eligible || gdn_tape.is_some()) {
+        return Err(hip_bridge::HipError::new(
+            0,
+            "forward_prefill_batch: model has MQ3G256 / MQ3G256Lloyd weights \
+             inside a MoE/A3B layer (DeltaNetMoe or FullAttnMoe). The MoE \
+             batched prefill branches dispatch through HFQ4-layout kernels \
+             (QKV matcher drops MQ3; wo path is hardcoded MQ4) and would \
+             produce silent corruption from the 104/112-vs-136 byte stride \
+             mismatch. Use an MQ4 quantization for MoE/A3B targets, or wait \
+             for the MQ3 MoE branches to land (see followup issue).",
+        ));
+    }
 
     if !eligible {
         assert!(
