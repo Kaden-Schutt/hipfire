@@ -384,6 +384,16 @@ pub struct MoeBiasAwareParams<'a> {
     // activations / residual
     /// FWHT-rotated activation (model pre-rotates; this arm does not re-rotate).
     pub x_rot: &'a GpuTensor,
+    /// The SAME activation without the FWHT. The Lloyd formats bake the
+    /// rotation into their weights and so consume `x_rot`; HFP4G32 does not,
+    /// and feeding it a rotated activation is silently wrong rather than an
+    /// error. Both buffers already exist — `fused_rmsnorm_rotate_mq_plain`
+    /// writes them in one launch — so carrying both costs nothing.
+    pub x_plain: &'a GpuTensor,
+    /// Serialized HFQ quant type of the routed-expert weights (21 = HFP4G32).
+    /// This arm was hardcoded to the MQ2-Lloyd kernels, so any other storage
+    /// format was decoded through the wrong dequant with no diagnostic.
+    pub expert_quant_type: u8,
     /// Residual stream the routed-down kernel atomic-accumulates into. The
     /// model's shared-expert step must have run first to seed this buffer.
     pub ffn_out: &'a GpuTensor,
@@ -447,6 +457,13 @@ pub struct MoeBiasAwarePrefillParams<'a> {
     pub expert_down_ptrs: &'a GpuTensor,
     // activation / residual
     pub x_rot: &'a GpuTensor,   // ffn_x_rot_batch [B, hidden]
+    /// Unrotated counterpart of `x_rot`; HFP4G32 consumes this. See the same
+    /// field on [`MoeBiasAwareParams`].
+    pub x_plain: &'a GpuTensor,
+    /// Serialized HFQ quant type of the routed experts (21 = HFP4G32). FP4 also
+    /// forces the non-grouped arm: there is no grouped-GEMM HFP4G32 kernel, only
+    /// the indexed-batched GEMVs.
+    pub expert_quant_type: u8,
     pub ffn_out: &'a GpuTensor, // ffn_out_batch [B, hidden] (accumulate target)
     // grouped-path scratch
     pub expert_token_counts: &'a GpuTensor,

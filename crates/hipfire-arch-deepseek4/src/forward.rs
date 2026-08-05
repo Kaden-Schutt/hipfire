@@ -4334,6 +4334,8 @@ fn ffn_routed(
             swiglu_limit: cfg.swiglu_limit,
             batch_size: 1,
             x_rot: ffn_x_rot,
+            x_plain: state.ffn_x_plain.as_ref().unwrap(),
+            expert_quant_type: layer.expert_quant_type,
             ffn_out: out_target,
             scores: scores_dev,
             gate_bias: bias_dev,
@@ -4547,17 +4549,37 @@ fn ffn_hash_routed(
     let up_batch = state.moe_up_batch.as_ref().unwrap();
     let rot_batch = state.moe_rot_batch.as_ref().unwrap();
 
-    gpu.deepseek4_gemv_mq2g256_lloyd_moe_gate_up_indexed(
-        gate_up_ptrs,
-        topk_idx_dev,
-        ffn_x_rot,
-        gate_batch,
-        up_batch,
-        2 * im,
-        cfg.hidden_size,
-        k_top,
-    )
-    .map_err(|e| format!("fused gate_up hash l{layer_idx}: {e:?}"))?;
+    // Native-FP4 experts (qt 21) consume the PLAIN activation and a PLAIN
+    // SwiGLU output — the FWHT the Lloyd formats bake into their weights is
+    // absent here. Same hardcoding bug as the score-routed arm; see
+    // `run_moe_decode_bias_aware`.
+    let fp4 = layer.expert_quant_type == 21;
+
+    if fp4 {
+        gpu.deepseek4_gemv_hfp4g32_moe_gate_up_indexed(
+            gate_up_ptrs,
+            topk_idx_dev,
+            state.ffn_x_plain.as_ref().unwrap(),
+            gate_batch,
+            up_batch,
+            2 * im,
+            cfg.hidden_size,
+            k_top,
+        )
+        .map_err(|e| format!("fused gate_up fp4 hash l{layer_idx}: {e:?}"))?;
+    } else {
+        gpu.deepseek4_gemv_mq2g256_lloyd_moe_gate_up_indexed(
+            gate_up_ptrs,
+            topk_idx_dev,
+            ffn_x_rot,
+            gate_batch,
+            up_batch,
+            2 * im,
+            cfg.hidden_size,
+            k_top,
+        )
+        .map_err(|e| format!("fused gate_up hash l{layer_idx}: {e:?}"))?;
+    }
 
     gpu.deepseek4_silu_mul_clamp_f32_batched(
         gate_batch,
@@ -4568,25 +4590,43 @@ fn ffn_hash_routed(
         cfg.swiglu_limit,
     )
     .map_err(|e| format!("deepseek4_silu_mul_clamp batched hash l{layer_idx}: {e:?}"))?;
-    gpu.rotate_x_mq_batched(gate_batch, rot_batch, im, k_top)
-        .map_err(|e| format!("rotate batched hash l{layer_idx}: {e:?}"))?;
+    if !fp4 {
+        gpu.rotate_x_mq_batched(gate_batch, rot_batch, im, k_top)
+            .map_err(|e| format!("rotate batched hash l{layer_idx}: {e:?}"))?;
+    }
 
     // EP: redirect the route-scaled accumulation into the zeroed partial
     // (routed-only) instead of state.ffn_out (shared+routed). The down kernel
     // accumulates `out += w_k · down_k`, so a zeroed partial yields exactly
     // this rank's owned routed contribution.
     let out_target = routed_out.unwrap_or(ffn_out);
-    gpu.deepseek4_gemv_mq2g256_lloyd_moe_down_residual_scaled_indexed(
-        w2_ptrs,
-        topk_idx_dev,
-        topk_w_dev,
-        rot_batch,
-        out_target,
-        cfg.hidden_size,
-        im,
-        k_top,
-    )
-    .map_err(|e| format!("fused down hash l{layer_idx}: {e:?}"))?;
+    if fp4 {
+        // Source is `gate_batch` — the SwiGLU output, written in place above and
+        // deliberately NOT rotated for this dtype.
+        gpu.deepseek4_gemv_hfp4g32_moe_down_residual_scaled_indexed(
+            w2_ptrs,
+            topk_idx_dev,
+            topk_w_dev,
+            gate_batch,
+            out_target,
+            cfg.hidden_size,
+            im,
+            k_top,
+        )
+        .map_err(|e| format!("fused down fp4 hash l{layer_idx}: {e:?}"))?;
+    } else {
+        gpu.deepseek4_gemv_mq2g256_lloyd_moe_down_residual_scaled_indexed(
+            w2_ptrs,
+            topk_idx_dev,
+            topk_w_dev,
+            rot_batch,
+            out_target,
+            cfg.hidden_size,
+            im,
+            k_top,
+        )
+        .map_err(|e| format!("fused down hash l{layer_idx}: {e:?}"))?;
+    }
 
     Ok(())
 }
@@ -8284,6 +8324,8 @@ fn ffn_batched(
         expert_gate_up_ptrs: gate_up_ptrs,
         expert_down_ptrs: w2_ptrs,
         x_rot: &pbs.ffn_x_rot_batch,
+        x_plain: &pbs.ffn_x_plain_batch,
+        expert_quant_type: layer.expert_quant_type,
         ffn_out: &pbs.ffn_out_batch,
         expert_token_counts: &pbs.moe_expert_token_counts,
         expert_offsets: &pbs.moe_expert_offsets,
@@ -8364,6 +8406,8 @@ fn ffn_batched_routed_paged(
             .as_ref()
             .ok_or_else(|| format!("ffn_batched l{layer_idx}: paged w2 ptr table missing"))?,
         x_rot: &pbs.ffn_x_rot_batch,
+        x_plain: &pbs.ffn_x_plain_batch,
+        expert_quant_type: layer.expert_quant_type,
         ffn_out: &pbs.ffn_out_batch,
         expert_token_counts: &pbs.moe_expert_token_counts,
         expert_offsets: &pbs.moe_expert_offsets,
@@ -8405,6 +8449,117 @@ fn ffn_batched_routed_paged(
         .expert_w2_blob
         .as_ref()
         .ok_or_else(|| format!("ffn_batched l{layer_idx}: paged w2 pool missing"))?;
+
+    // Native FP4 (qt 21) cannot use the band pipeline at all: the grouped GEMM
+    // behind `prefill_gate_up_band` / `prefill_down_band` has only MQ2-Lloyd
+    // arms (`dispatch_grouped_lloyd`), so FP4 bytes get decoded through a Lloyd
+    // codebook. That produced NaN in the FIRST prefill layer, which poisoned the
+    // residual stream for every token — the decode-side FP4 arms were correct
+    // but were handed NaN before they ever ran.
+    //
+    // Route FP4 through the indexed-batched kernels instead (parity-verified to
+    // ~1e-6). Those need every expert of the tokens they process resident at
+    // once, so walk the batch in TOKEN chunks whose distinct-expert set fits the
+    // pool, rather than in expert bands over the scattered buffer. The scatter
+    // above still ran (it also computes the routing we read here); only its
+    // grouped layout goes unused.
+    if layer.expert_quant_type == 21 {
+        let slots = p.slots_per_blob();
+        let idx_host: Vec<i32> = p
+            .read_tile_experts(params.topk_indices, batch_size * k_top, gpu)
+            .map_err(|e| format!("ffn_batched l{layer_idx} fp4 topk readback: {e}"))?
+            .to_vec();
+
+        let mut t0 = 0usize;
+        while t0 < batch_size {
+            // Grow the chunk while its expert union still fits the pool.
+            let mut experts: Vec<u16> = Vec::new();
+            let mut t1 = t0;
+            while t1 < batch_size {
+                let mut cand = experts.clone();
+                for r in 0..k_top {
+                    let e = idx_host[t1 * k_top + r];
+                    if e >= 0 && (e as usize) < n_exp && !cand.contains(&(e as u16)) {
+                        cand.push(e as u16);
+                    }
+                }
+                if cand.len() > slots && t1 > t0 {
+                    break; // committing this token would overflow the pool
+                }
+                experts = cand;
+                t1 += 1;
+            }
+            let n = t1 - t0;
+
+            let x_chunk = params.x_plain.sub_offset(t0 * hidden, n * hidden);
+            let idx_chunk = params.topk_indices.sub_offset(t0 * k_top, n * k_top);
+            let w_chunk = params.topk_weights.sub_offset(t0 * k_top, n * k_top);
+            let gate_chunk = params.gate_batch.sub_offset(0, n * k_top * im);
+            let up_chunk = params.up_batch.sub_offset(0, n * k_top * im);
+            let out_chunk = params.ffn_out.sub_offset(t0 * hidden, n * hidden);
+
+            p.ensure_resident(
+                layer_idx as u16,
+                crate::expert_pager::ExpertBlobRole::GateUp,
+                &experts,
+                gate_up_blob,
+                params.expert_gate_up_ptrs,
+                layer.expert_gate_up_stride,
+                gpu,
+            )
+            .map_err(|e| format!("ffn_batched l{layer_idx} fp4 gate_up resident: {e}"))?;
+            gpu.deepseek4_gemv_hfp4g32_moe_gate_up_indexed_batched(
+                params.expert_gate_up_ptrs,
+                &idx_chunk,
+                &x_chunk,
+                &gate_chunk,
+                &up_chunk,
+                2 * im,
+                hidden,
+                k_top,
+                n,
+            )
+            .map_err(|e| format!("ffn_batched l{layer_idx} fp4 gate_up: {e:?}"))?;
+
+            // In-place clamped SwiGLU, as the Lloyd path does — but NOT followed
+            // by the FWHT rotate, because HFP4G32 bakes none in.
+            gpu.deepseek4_silu_mul_clamp_f32_batched(
+                &gate_chunk,
+                &up_chunk,
+                &gate_chunk,
+                im,
+                n * k_top,
+                params.swiglu_limit,
+            )
+            .map_err(|e| format!("ffn_batched l{layer_idx} fp4 silu: {e:?}"))?;
+
+            p.ensure_resident(
+                layer_idx as u16,
+                crate::expert_pager::ExpertBlobRole::Down,
+                &experts,
+                w2_blob,
+                params.expert_down_ptrs,
+                layer.expert_w2_stride,
+                gpu,
+            )
+            .map_err(|e| format!("ffn_batched l{layer_idx} fp4 down resident: {e}"))?;
+            gpu.deepseek4_gemv_hfp4g32_moe_down_residual_scaled_indexed_batched(
+                params.expert_down_ptrs,
+                &idx_chunk,
+                &w_chunk,
+                &gate_chunk,
+                &out_chunk,
+                hidden,
+                im,
+                k_top,
+                n,
+            )
+            .map_err(|e| format!("ffn_batched l{layer_idx} fp4 down: {e:?}"))?;
+
+            t0 = t1;
+        }
+        return Ok(());
+    }
 
     // 3. Pass A — gate_up per band.
     for b in &bands {

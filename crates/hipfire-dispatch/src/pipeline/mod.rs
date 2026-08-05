@@ -812,6 +812,18 @@ pub fn run_moe_decode(
                 p.mi,
                 p.k,
             ))?;
+        } else if p.dtypes.routed_down == DType::HFP4G32 {
+            // Native FP4 bakes in no FWHT, so the down GEMV must consume the
+            // PLAIN SwiGLU output. Every other arm here fuses silu+mul+ROTATE
+            // because their formats expect a rotated activation; doing that for
+            // HFP4G32 would rotate an activation whose weights never were.
+            //
+            // The output still lands in `rot_batch` — that buffer names what the
+            // down GEMV reads, not whether a rotation happened. Keeping the
+            // contract in one place is what stops a down arm from having to pick
+            // its own source buffer, which is precisely the mistake that made
+            // every routed expert compute silu's INPUT instead of its output.
+            hip!(gpu.silu_mul_f32(p.gate_batch, p.up_batch, p.rot_batch))?;
         } else {
             // MQ4/MQ6, no AWQ on expert down weights (the common case for A3B).
             hip!(gpu.fused_silu_mul_rotate_mq_batched(
@@ -883,15 +895,14 @@ pub fn run_moe_decode(
             )?;
         } else if p.dtypes.routed_down == DType::HFP4G32 {
             // Native-FP4 down. Same atomic self-combining contract as the MQ
-            // arms, but reads `gate_batch` — the SwiGLU output BEFORE the MQ
-            // rotate — because HFP4G32 carries no baked FWHT. The MQ arms below
-            // consume `rot_batch`; using it here would be silently wrong.
+            // arms, and the same source buffer: `rot_batch` holds the SwiGLU
+            // output, written UNROTATED for this dtype by the silu step above.
             hip!(
                 gpu.deepseek4_gemv_hfp4g32_moe_down_residual_scaled_indexed(
                     p.expert_down_ptrs,
                     p.topk_indices,
                     p.topk_weights,
-                    p.gate_batch,
+                    p.rot_batch,
                     out_target,
                     down_m,
                     down_k,
@@ -1357,20 +1368,43 @@ pub fn run_moe_decode_bias_aware(
         p.route_scale,
     ))?;
 
-    // 2. Indexed MQ2-Lloyd gate_up: all k_top experts in one launch
-    //    (M = 2*mi; the kernel splits rows r<mi → gate, r>=mi → up).
-    hip!(gpu.deepseek4_gemv_mq2g256_lloyd_moe_gate_up_indexed(
-        p.expert_gate_up_ptrs,
-        p.topk_indices,
-        p.x_rot,
-        p.gate_batch,
-        p.up_batch,
-        2 * p.mi,
-        p.hidden,
-        p.k_top,
-    ))?;
+    // DeepSeek V4's native FP4 experts (qt 21). The Lloyd formats bake an FWHT
+    // into their weights and so consume the rotated activation and a rotated
+    // SwiGLU output; HFP4G32 bakes in nothing and consumes both PLAIN. This arm
+    // was hardcoded to the Lloyd kernels, which decoded FP4 bytes through a
+    // Lloyd codebook — no error, just garbage from the first token.
+    let fp4 = p.expert_quant_type == 21;
 
-    // 3. Batched silu·mul·clamp (in-place into gate_batch) then batched FWHT rotate.
+    // 2. Indexed gate_up: all k_top experts in one launch
+    //    (M = 2*mi; the kernel splits rows r<mi → gate, r>=mi → up).
+    if fp4 {
+        hip!(gpu.deepseek4_gemv_hfp4g32_moe_gate_up_indexed(
+            p.expert_gate_up_ptrs,
+            p.topk_indices,
+            p.x_plain,
+            p.gate_batch,
+            p.up_batch,
+            2 * p.mi,
+            p.hidden,
+            p.k_top,
+        ))?;
+    } else {
+        hip!(gpu.deepseek4_gemv_mq2g256_lloyd_moe_gate_up_indexed(
+            p.expert_gate_up_ptrs,
+            p.topk_indices,
+            p.x_rot,
+            p.gate_batch,
+            p.up_batch,
+            2 * p.mi,
+            p.hidden,
+            p.k_top,
+        ))?;
+    }
+
+
+    // 3. Batched silu·mul·clamp (in-place into gate_batch) then batched FWHT
+    //    rotate. The rotate exists only to match the Lloyd weights' baked FWHT,
+    //    so FP4 skips it and its down GEMV reads gate_batch directly.
     hip!(gpu.deepseek4_silu_mul_clamp_f32_batched(
         p.gate_batch,
         p.up_batch,
@@ -1379,14 +1413,38 @@ pub fn run_moe_decode_bias_aware(
         p.k_top,
         p.swiglu_limit,
     ))?;
-    hip!(gpu.rotate_x_mq_batched(p.gate_batch, p.rot_batch, p.mi, p.k_top))?;
+    if !fp4 {
+        hip!(gpu.rotate_x_mq_batched(p.gate_batch, p.rot_batch, p.mi, p.k_top))?;
+    }
 
     // 4. Indexed MQ2-Lloyd down. Deterministic (default): expanded per-expert
     //    write + fixed-order non-atomic combine into ffn_out — bit-reproducible
     //    for greedy/spec-decode. MOE_DETERMINISTIC=0 uses the faster
     //    atomicAdd-fused path (nondeterministic; bench only).
     let deterministic = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MOE_DETERMINISTIC").as_deref() != Ok("0");
-    if deterministic {
+    if fp4 {
+        // FP4 takes the atomic self-combining down regardless of the
+        // determinism knob: there is no HFP4G32 counterpart of
+        // `moe_down_expanded_k4` yet, and silently running the Lloyd kernel
+        // here is what produced garbage in the first place. Source is
+        // `gate_batch` (the UNROTATED SwiGLU output), not `rot_batch`.
+        //
+        // Consequence to be aware of: greedy/spec-decode is not bit-reproducible
+        // for FP4 until the expanded kernel exists, because atomicAdd ordering
+        // varies run to run.
+        hip!(
+            gpu.deepseek4_gemv_hfp4g32_moe_down_residual_scaled_indexed(
+                p.expert_down_ptrs,
+                p.topk_indices,
+                p.topk_weights,
+                p.gate_batch,
+                p.ffn_out,
+                p.hidden,
+                p.mi,
+                p.k_top,
+            )
+        )?;
+    } else if deterministic {
         hip!(gpu.deepseek4_gemv_mq2g256_lloyd_moe_down_expanded_k4(
             p.expert_down_ptrs,
             p.topk_indices,
@@ -1976,7 +2034,13 @@ pub fn run_moe_prefill_bias_aware(
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(128);
-    let use_grouped = batch_size >= gate_threshold
+    // Native FP4 (qt 21). The grouped path is Lloyd-only — `dispatch_grouped_lloyd`
+    // has no HFP4G32 GEMM — so FP4 must take the indexed-batched arm below, which
+    // does have FP4 kernels. Routing it into the grouped path would decode FP4
+    // bytes through a Lloyd codebook, silently, exactly as the decode arm did.
+    let fp4 = p.expert_quant_type == 21;
+    let use_grouped = !fp4
+        && batch_size >= gate_threshold
         && hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MOE_GROUPED").as_deref() != Ok("0");
 
     // Shared research levers (read once; default 4w on gfx11+).
@@ -2120,20 +2184,34 @@ pub fn run_moe_prefill_bias_aware(
             batch_size,
         ))?;
     } else {
-        // ── Scalar K4 path (batch_size < gate, or grouped opt-out) ──
-        hip!(
-            gpu.deepseek4_gemv_mq2g256_lloyd_moe_gate_up_indexed_batched_k4(
+        // ── Scalar K4 path (batch_size < gate, grouped opt-out, or FP4) ──
+        if fp4 {
+            hip!(gpu.deepseek4_gemv_hfp4g32_moe_gate_up_indexed_batched(
                 p.expert_gate_up_ptrs,
                 p.topk_indices,
-                p.x_rot,
+                p.x_plain,
                 p.gate_batch,
                 p.up_batch,
                 2 * im,
                 hidden,
                 k_top,
                 batch_size,
-            )
-        )?;
+            ))?;
+        } else {
+            hip!(
+                gpu.deepseek4_gemv_mq2g256_lloyd_moe_gate_up_indexed_batched_k4(
+                    p.expert_gate_up_ptrs,
+                    p.topk_indices,
+                    p.x_rot,
+                    p.gate_batch,
+                    p.up_batch,
+                    2 * im,
+                    hidden,
+                    k_top,
+                    batch_size,
+                )
+            )?;
+        }
         hip!(gpu.deepseek4_silu_mul_clamp_f32_batched(
             p.gate_batch,
             p.up_batch,
@@ -2142,13 +2220,32 @@ pub fn run_moe_prefill_bias_aware(
             batch_size * k_top,
             p.swiglu_limit,
         ))?;
-        hip!(gpu.rotate_x_mq_batched(p.gate_batch, p.rot_batch, im, batch_size * k_top))?;
+        if !fp4 {
+            hip!(gpu.rotate_x_mq_batched(p.gate_batch, p.rot_batch, im, batch_size * k_top))?;
+        }
 
         // Down: deterministic expanded+combine (default; bit-reproducible for
         // spec-decode) vs non-deterministic atomic-accumulate.
         let deterministic =
             hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MOE_DETERMINISTIC").as_deref() != Ok("0");
-        if deterministic {
+        if fp4 {
+            // Atomic self-combining down; no HFP4G32 expanded kernel exists yet,
+            // so the determinism knob does not apply here. Source is gate_batch
+            // (the UNROTATED SwiGLU output).
+            hip!(
+                gpu.deepseek4_gemv_hfp4g32_moe_down_residual_scaled_indexed_batched(
+                    p.expert_down_ptrs,
+                    p.topk_indices,
+                    p.topk_weights,
+                    p.gate_batch,
+                    p.ffn_out,
+                    hidden,
+                    im,
+                    k_top,
+                    batch_size,
+                )
+            )?;
+        } else if deterministic {
             hip!(gpu.deepseek4_gemv_mq2g256_lloyd_moe_down_expanded_k4(
                 p.expert_down_ptrs,
                 p.topk_indices,
