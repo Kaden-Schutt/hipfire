@@ -747,6 +747,11 @@ def spawn_serve(cfg, home, log):
             txt = _serve_log_text(log, log_offset)
             if _native_service_warm(cfg["port"], expected_model=cfg.get("model"), proc=_serve_proc):
                 return log_offset
+            # A CLI that has already exited cannot become warm. Waiting the
+            # full 180-second startup window hid immediate config-validation
+            # failures behind four long retries.
+            if _serve_proc.poll() is not None:
+                break
             if re.search(r"out of memory|error loading|panic", txt, re.I):
                 break
             time.sleep(2)
