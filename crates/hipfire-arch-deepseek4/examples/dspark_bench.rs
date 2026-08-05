@@ -25,6 +25,8 @@
 //!   HIPFIRE_DEEPSEEK4_WARMUP  throwaway warmup tokens before the timed run (default 24)
 //!   HIPFIRE_DEEPSEEK4_DSPARK  =0 forces MTP; else DSpark
 //!   HIPFIRE_DEEPSEEK4_BENCH_RAW=1  base completion (no chat framing)
+//!   HIPFIRE_DEEPSEEK4_BENCH_EXPERTS_PER_TOK=N
+//!                              benchmark-only routed-expert override
 
 use hipfire_arch_deepseek4::dspark_speculator::build_deepseek4_dspark_speculator;
 use hipfire_arch_deepseek4::mtp_speculator::build_deepseek4_mtp_speculator;
@@ -149,10 +151,31 @@ fn main() -> Result<(), String> {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
+    let bench_experts_per_tok = std::env::var("HIPFIRE_DEEPSEEK4_BENCH_EXPERTS_PER_TOK")
+        .ok()
+        .map(|value| {
+            value.parse::<usize>().map_err(|error| {
+                format!("invalid benchmark experts-per-token override '{value}': {error}")
+            })
+        })
+        .transpose()?;
 
     eprintln!("Loading DeepSeek V4 trunk from {path}...");
     let mut hfq = HfqFile::open(Path::new(&path)).map_err(|e| format!("open: {e:?}"))?;
-    let cfg = DeepseekV4::config_from_hfq(&hfq)?;
+    let mut cfg = DeepseekV4::config_from_hfq(&hfq)?;
+    if let Some(experts_per_tok) = bench_experts_per_tok {
+        if experts_per_tok == 0 || experts_per_tok > cfg.num_experts_per_tok {
+            return Err(format!(
+                "benchmark experts-per-token override must be in 1..={}, got {experts_per_tok}",
+                cfg.num_experts_per_tok
+            ));
+        }
+        eprintln!(
+            "[benchmark override: num_experts_per_tok {} -> {}]",
+            cfg.num_experts_per_tok, experts_per_tok
+        );
+        cfg.num_experts_per_tok = experts_per_tok;
+    }
     let tokenizer = Tokenizer::from_hfq_metadata(&hfq.metadata_json)
         .map_err(|e| format!("tokenizer not found in HFQ metadata: {e:?}"))?;
 
