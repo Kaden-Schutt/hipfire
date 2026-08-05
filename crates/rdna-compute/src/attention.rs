@@ -9687,6 +9687,60 @@ impl Gpu {
             )
         }
     }
+    /// gfx1151-only exact bounded twin of `indexer_top_k_batched`.
+    ///
+    /// Kept as a separate symbol/method so the portable rank-count remains an
+    /// in-process raw-parity reference and so no gfx1100/gfx12 route changes.
+    pub fn indexer_top_k_batched_bounded_gfx1151(
+        &mut self,
+        scores: &GpuTensor,
+        top_indices: &GpuTensor,
+        n_idx_heads: i32,
+        n_stride: i32,
+        n_iter: i32,
+        k_stride: i32,
+        k_fill: i32,
+        batch_size: i32,
+    ) -> HipResult<()> {
+        debug_assert_eq!(self.arch, "gfx1151");
+        self.bind_thread()?;
+        const MODULE: &str = "indexer_top_k_batched_bounded_gfx1151";
+        const SYMBOL: &str = "indexer_top_k_batched_bounded_gfx1151";
+        self.ensure_kernel(
+            MODULE,
+            kernels::INDEXER_TOP_K_BATCHED_BOUNDED_GFX1151_SRC,
+            SYMBOL,
+        )?;
+        let func = &self.functions[SYMBOL];
+        let sp = scores.buf.as_ptr();
+        let ti = top_indices.buf.as_ptr();
+        let mut h = n_idx_heads;
+        let mut ns = n_stride;
+        let mut ni = n_iter;
+        let mut ks = k_stride;
+        let mut kf = k_fill;
+        let mut bs = batch_size;
+        let mut params: Vec<*mut c_void> = vec![
+            &sp as *const _ as *mut c_void,
+            &ti as *const _ as *mut c_void,
+            &mut h as *mut _ as *mut c_void,
+            &mut ns as *mut _ as *mut c_void,
+            &mut ni as *mut _ as *mut c_void,
+            &mut ks as *mut _ as *mut c_void,
+            &mut kf as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [n_idx_heads as u32, batch_size as u32, 1],
+                [256, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
     pub fn indexer_top_k_batched_buf(
         &mut self,
         scores: &GpuTensor,

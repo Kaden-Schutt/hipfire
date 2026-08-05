@@ -5609,6 +5609,12 @@ pub const V4F_ATTN_SWA_BATCHED_SRC: &str =
 pub const INDEXER_TOP_K_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/indexer_top_k_batched.hip");
 
+/// gfx1151 exact bounded batched indexer top-K. One workgroup per
+/// (batch, head) incrementally merges K-sized runs in static LDS, replacing
+/// the portable O(N^2) rank-count once N exceeds K during DS4 prefill.
+pub const INDEXER_TOP_K_BATCHED_BOUNDED_GFX1151_SRC: &str =
+    include_str!("../../../kernels/src/indexer_top_k_batched_bounded.gfx1151.hip");
+
 /// HC 4-stream residual mix — BATCHED (Phase A5, 2026-05-18). Twin of
 /// HC_MIX_4STREAM_SRC; batch dim parallelizes cleanly across blockIdx.z.
 pub const HC_MIX_4STREAM_BATCHED_SRC: &str =

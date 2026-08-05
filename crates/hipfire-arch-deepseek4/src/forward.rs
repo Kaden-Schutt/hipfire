@@ -10163,6 +10163,25 @@ fn attention_block_batched_mixed(
                     batch_size as i32,
                 )
                 .map_err(|e| format!("indexer_top_k_batched_buf l{layer_idx}: {e:?}"))?;
+            } else if gpu.arch.eq_ignore_ascii_case("gfx1151") {
+                // gfx1151 prefill has hundreds of independent batch rows, so
+                // one bounded exact merge per row supplies occupancy without
+                // decode's multi-launch F3 tree. The separate symbol keeps the
+                // portable kernel available for raw-order parity tests and
+                // leaves every non-gfx1151 architecture untouched.
+                gpu.indexer_top_k_batched_bounded_gfx1151(
+                    &pbs.idx_scores_batch,
+                    &pbs.idx_topk_indices_batch,
+                    /*n_idx_heads=*/ 1,
+                    max_compressed as i32,
+                    n_max_chunk as i32,
+                    topk_max as i32,
+                    k_fill as i32,
+                    batch_size as i32,
+                )
+                .map_err(|e| {
+                    format!("indexer_top_k_batched_bounded_gfx1151 l{layer_idx}: {e:?}")
+                })?;
             } else {
                 gpu.indexer_top_k_batched(
                     &pbs.idx_scores_batch,
