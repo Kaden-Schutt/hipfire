@@ -15,6 +15,33 @@ F1 added the `qt=2` / `qt=16` arms in `load_weight_tensor_raw`
 (`qwen35.rs:1555`) and the `--format f32` passthrough (`main.rs:8408`). No new
 code is required for this run.
 
+**This exact oracle has already been run at a3b scale.**
+`docs/moe-awq/SESSION_FINDINGS_2026-06-11.md:4` — *"All KLD vs an f32-native
+oracle (`q36a3b-f32-oracle.hfq`); refs `q36a3b-{wt2,agentic}-f32.kldref.bin`.
+Branch `feat/moe-awq-experts` on mi300."* The artifacts survive on the NAS:
+
+```
+/mnt/nas/kaden/hipfire/models/Qwen3.6-35b-a3b/
+    qwen3.6-35b-a3b.f32.hfq      138,658,609,664 B   (Jun 11)
+    kldref/wt2.kldref.bin         16,842,528 B  md5 456ddaef569977b372a8c32b5dacbd2f
+    kldref/agentic.kldref.bin     16,842,528 B
+```
+
+`wt2.kldref.bin` is **byte-identical** to `~/.hipfire/models/q36a3b-wt2-f32.kldref.bin`,
+so the ref behind every a3b KLD number in
+`docs/investigations/2026-08-04-a3b-lowbit-quality.md` — including the 0.238060
+`.mq2` baseline — is confirmed native, not merely inferred to be.
+
+**No new kernels.** F32 routed experts are not indexable, so `run_moe_decode`
+drops to the generic CPU-top-K fallback and issues per-expert `weight_gemv` →
+`gemv_f32`. There is no F32 MoE kernel in the tree and none is needed; the June
+findings state it directly (`:132`, *"eval via the CPU-top-K fallback (how the
+f32 oracle runs)"*). This is why oracle throughput is tens of tok/s: 8 separate
+launches per layer instead of one indexed kernel.
+
+**So this run is a re-run at larger scale, not a bring-up.** The only thing
+changing is `--n-ctx` / `--max-chunks`.
+
 ---
 
 ## Why MI300X and not the local fleet
@@ -56,6 +83,27 @@ cargo build --release --example eval_hipfire -p hipfire-runtime \
 
 `build_kld_ref_native` declares `required-features = ["arch-qwen35", "deltanet"]`
 — omitting them silently skips the example.
+
+## Steps 1–2 — get the oracle onto the box
+
+The oracle already exists (see above), so there are two routes. Pick on
+bandwidth:
+
+- **Upload the NAS copy** — 138.7 GB from home. Correct but slow on a typical
+  residential uplink (~6 h at 50 Mbps). Skips Steps 1–2 entirely.
+- **Re-encode on the box** — cloud↔HF bandwidth is usually far better than home
+  upload, so downloading 70 GB from HF and re-encoding is often *faster* than
+  pushing 138.7 GB up. Follow Steps 1–2 below.
+
+Either way, verify against the known-good artifact:
+
+```bash
+stat -c %s <oracle>.hfq        # must be 138658609664
+```
+
+A re-encode should reproduce that byte count exactly — same source, same
+`--format f32`, deterministic passthrough. A mismatch means a different
+checkpoint revision or a different format flag; stop and reconcile.
 
 ## Step 1 — fetch the checkpoint
 
@@ -121,10 +169,11 @@ rather than assume.
 
 Scored tokens per chunk = `n_ctx - 1 - n_ctx/2` → 255 at n_ctx=512, 1023 at 2048.
 
-1. **Oracle PPL.** `build_kld_ref_native` prints mean NLL / PPL over the scored
-   window. The `.mq2` candidate measures PPL 6.2181, so the F32 oracle must come
-   in **below** that. An oracle PPL above its own quantized candidate means the
-   forward is broken — stop.
+1. **Oracle PPL — known-good target.** `build_kld_ref_native` prints mean NLL /
+   PPL over the scored window. The June run measured **wt2 5.350** / agentic
+   5.902 (`SESSION_FINDINGS_2026-06-11.md:42`). Expect to land near 5.350 on the
+   wt2 slice; a longer `--n-ctx` shifts it somewhat, but not by much. Anything
+   at or above the `.mq2` candidate's 6.2181 means the forward is broken — stop.
 2. **Known-good candidate.** Score a high-precision SKU against the smoke ref:
 
    ```bash
@@ -159,6 +208,12 @@ Match the 27B MASTER's scale (2048 × 97 = 99,231 scored tokens):
 That is **12×** the current a3b ref (8160 tokens) and moves to 2048-ctx, which
 is more representative than 512. Scale `--max-chunks` to the measured rate from
 Step 3; F2's note is that a full 1175-chunk canonical run is ~8.5 h at 35 tok/s.
+
+**Regenerate the agentic slice too.** The June run produced both
+(`kldref/agentic.kldref.bin`, oracle PPL 5.902), and agentic-domain KLD is much
+closer to what an mqNr SKU is actually used for than wikitext2 is. Same command
+against the agentic slice — while the box is up and the oracle is resident, the
+marginal cost is only the second forward.
 
 F32 KV at n_ctx=2048 is negligible here (~82 MB — 10 full-attention layers of
 40, 2 KV heads × 256 head_dim).
