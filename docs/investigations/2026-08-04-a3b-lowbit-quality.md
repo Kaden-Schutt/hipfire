@@ -591,6 +591,65 @@ so only per-block *shape* adaptation is being given up, and shape is exactly
 what the rotation normalizes. Confirm on real a3b expert tensors and accept on
 KLD, not NRMSE.
 
+## 5d. MQ2GL microbench — measured, and it corrects my perf claim
+
+`kernels/src/gemv_mq2g256gl_moe_gate_up_indexed.hip` +
+`crates/rdna-compute/examples/bench_mq2gl_vs_mq2l.rs`. Both kernels JIT'd from
+source and launched via the kernarg-blob path, so the bench touches no dispatch
+plumbing. a3b routed-expert gate_up decode shape: M=1024, K=2048, k_top=8,
+32 experts resident. k9lin / gfx1201.
+
+Format: global codebook + per-block fp16 scale, SoA —
+`[M·gpr·64 B indices][M·gpr·2 B scales]` vs the per-block format's interleaved
+72 B/group. 576 → 528 KiB per expert (**8.3% fewer bytes**). Three expected
+wins: no `__syncthreads()` in the main loop (the per-block kernel reloads a
+16-slot LDS codebook and barriers *every K4 iteration*), 64 B group stride is
+64 B aligned where 72 B was only 8 B aligned, and the scale factors out of the
+8-term dot product.
+
+**Correctness:** each kernel vs a CPU reference on its own format —
+MQ2L rel err 7.48e-8, MQ2GL 4.09e-8. Both exact to fp32 accumulation noise.
+
+**Timing**, fresh process per run, median of 3 internal passes × 500 calls:
+
+| run | MQ2L µs | MQ2GL µs | Δ |
+|---|---|---|---|
+| warm | 11.53 | 11.17 | −3.18% |
+| 1 | 19.70 | 19.10 | −3.05% |
+| 2 | 19.65 | 19.21 | −2.22% |
+| 3 | 19.66 | 19.05 | −3.13% |
+
+(Absolute times differ warm vs cold — DPM state. The *relative* delta is stable.)
+**Median −3.1%, consistent sign across four independent measurements.**
+
+**This retracts my earlier "~8% decode win" estimate.** I extrapolated from the
+byte reduction; it does not hold. 8.3% fewer bytes buys ~3% because **weights
+are not the dominant memory traffic in this kernel**:
+
+- grid is `[M, k_top]` = 8192 blocks, block `[32]`, **one output row per block**
+- each block reads the *entire* `x_rot` — K=2048 floats = 8 KiB
+- so x_rot traffic is 8192 × 8 KiB = **64 MiB per call vs 4.5 MiB of weights —
+  14× more**
+
+x_rot is L2-resident (8 KiB), so this is L2/issue-bound rather than DRAM-bound
+— achieved weight bandwidth is only 223 GiB/s against a ~596 GiB/s peak, and
+total apparent traffic (68.7 MiB / 19.65 µs = 3.5 TB/s) is far above DRAM peak,
+confirming the x_rot reads are served from cache. Cutting the minority term
+gives a sub-proportional win, exactly as observed.
+
+**The kernel-level lever this exposes is x_rot reuse, not weight format.** One
+row per block means x_rot is re-read 8192×. A row-tile (2–4 output rows per
+block) amortises it proportionally. That is independently corroborated by
+`project_fused_moe_down_rowtile_win_2026_07_08`: *"WIN fused MoE down NUM_ROWS=2
+row-tile +3.5% gfx1201 a3b — X-REUSE row-tile=lever; fusion-alone no-op."*
+Same lever, same arch, already measured once.
+
+**Verdict on MQ2GL:** ship-worthy but on the quality/size argument, not the
+perf one. ~3% kernel-level (less at model level, since gate_up GEMV is one of
+several decode kernels), plus the 0.1875 bpw it frees — which is what actually
+funds `down` → MQ3GL across all 10240 experts at ~12.2 GB. The two levers
+compose: MQ2GL then row-tiling.
+
 ## 6. Open item
 
 The contributor's HIP port is unreviewed by us and stays out of the tree (§0).
