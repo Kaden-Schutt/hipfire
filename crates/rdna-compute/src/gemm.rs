@@ -12020,6 +12020,89 @@ impl Gpu {
         result
     }
 
+    /// Micro-screen-only gfx1151 MQ2-Lloyd grouped MMQ variant. The weight
+    /// group header is `[4 x int8 codebook | f32 scale]`; packed 2-bit indices
+    /// retain the production offset and 72-byte stride. This entry point is
+    /// deliberately absent from production dispatch.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_mq2g256_lloyd_moe_grouped_mmq_prequant_perm_gfx1151(
+        &mut self,
+        expert_weight_ptrs: &GpuTensor,
+        expert_tile_ids: &GpuTensor,
+        sorted_slot_index: &GpuTensor,
+        x_src: &GpuTensor,
+        y_grouped: &GpuTensor,
+        m: usize,
+        k: usize,
+        x_row_div: usize,
+        m_total: usize,
+        x_src_rows: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if self.arch != "gfx1151" {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "gemm_mq2g256_lloyd_moe_grouped_mmq_prequant_perm_gfx1151 \
+                     requires gfx1151; current arch = {}",
+                    self.arch
+                ),
+            ));
+        }
+        let kernel_name = "gemm_mq2g256_lloyd_moe_grouped_mmq_prequant_perm_gfx1151";
+        self.ensure_kernel(
+            kernel_name,
+            kernels::GEMM_MQ2G256_LLOYD_MOE_GROUPED_MMQ_PREQUANT_PERM_GFX1151_SRC,
+            kernel_name,
+        )?;
+        let x_q8_ptr = self.ensure_q8_1_mmq_x(x_src, x_src_rows, k)?;
+        let ep = expert_weight_ptrs.buf.as_ptr();
+        let tp = expert_tile_ids.buf.as_ptr();
+        let sp = sorted_slot_index.buf.as_ptr();
+        let xp = x_q8_ptr;
+        let yp = y_grouped.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let xrd_val = x_row_div as i32;
+        let mt_val = m_total as i32;
+        let xsr_val = x_src_rows as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &ep as *const _ as *mut c_void,
+            &tp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+            &xrd_val as *const _ as *mut c_void,
+            &mt_val as *const _ as *mut c_void,
+            &xsr_val as *const _ as *mut c_void,
+        ];
+        let row_tiles = m.div_ceil(16) as u32;
+        let slot_tiles = m_total.div_ceil(16) as u32;
+        self.launch_maybe_blob(
+            kernel_name,
+            [row_tiles, slot_tiles, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ep);
+                b.push_ptr(tp);
+                b.push_ptr(sp);
+                b.push_ptr(xp);
+                b.push_ptr(yp);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(xrd_val);
+                b.push_i32(mt_val);
+                b.push_i32(xsr_val);
+                b
+            },
+        )
+    }
+
     /// Exact-gfx1030 MQ2-Lloyd grouped sdot4 probe. This method is deliberately
     /// absent from the production MoE selector, so A3B MQ2 admission and beta's
     /// Redline recording surface remain unchanged.

@@ -100,6 +100,14 @@ extern "C" __global__ void MQ2_GROUPED_MMQ_KERNEL_NAME(
         // ── Quantize this lane's 4-entry Lloyd codebook to int8 + scale ──
         // Done ONCE per group (amortized over 256 weights). cb values are the
         // actual dequantized weight levels; index q∈{0,1,2,3} selects cb[q].
+#if defined(MQ2_GROUPED_MMQ_PREQUANT_CODEBOOK)
+        // Micro-screen representation only: the 8-byte group header is
+        // [4 x int8 codebook | f32 scale]. The packed 2-bit indices remain at
+        // gp+8, so traffic and group stride are unchanged. Production MQ2R
+        // dispatch never selects this symbol.
+        const unsigned int cbpack = *reinterpret_cast<const unsigned int*>(gp);
+        const float sc_self = *reinterpret_cast<const float*>(gp + 4);
+#else
         const __half* cbh = reinterpret_cast<const __half*>(gp);
         float cb0 = __half2float(cbh[0]);
         float cb1 = __half2float(cbh[1]);
@@ -116,6 +124,7 @@ extern "C" __global__ void MQ2_GROUPED_MMQ_KERNEL_NAME(
                             | ((unsigned int)(q1 & 0xFF) << 8)
                             | ((unsigned int)(q2 & 0xFF) << 16)
                             | ((unsigned int)(q3 & 0xFF) << 24);
+#endif
 
         // Broadcast each output row's group scale to the lanes that own it.
         // Output row r = row_start + 2*j + (tid>>4) ⇒ source lane = 2*j + (tid>>4).
