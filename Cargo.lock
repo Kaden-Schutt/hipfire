@@ -987,6 +987,7 @@ dependencies = [
  "libc",
  "memmap2",
  "rayon",
+ "rdna-compute",
  "safetensors",
  "serde",
  "serde_json",

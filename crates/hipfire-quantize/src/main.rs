@@ -134,6 +134,15 @@ struct QuantizeArgs {
     #[arg(long)]
     no_q8_conv1d: bool,
 
+    /// Let the FIXED tier (attention / lm_head / embed / router) follow
+    /// `--format` instead of being pinned to Q8F16. The fixed tier is ~66% of
+    /// per-token decode bytes on a3b, so pinning it at Q8 (1.0625 B/w) rather
+    /// than MQ4 (0.53125) doubles the dominant term — this is why `.mq2` reads
+    /// 45% MORE bytes/token than `.mq4r` despite being 7 GB smaller on disk.
+    /// Required to reproduce `.mq4r`.
+    #[arg(long)]
+    no_q8_router: bool,
+
     /// Disable K-map precision promotion.
     #[arg(long)]
     no_kmap: bool,
@@ -7734,7 +7743,7 @@ fn main() {
     // is why `.mq2` reads 45% MORE bytes/token than `.mq4r` despite being 7 GB
     // smaller on disk, and why `.mq4r` — which needs this flag off — is not
     // byte-reproducible from HEAD without it.
-    let no_q8_router_flag = args.iter().any(|a| a == "--no-q8-router")
+    let no_q8_router_flag = args.no_q8_router
         || std::env::var("HIPFIRE_NO_Q8_ROUTER").ok().as_deref() == Some("1");
     let q8_router = (is_moe_like || q8_router_flag) && !no_q8_router_flag;
     if no_q8_router_flag {
