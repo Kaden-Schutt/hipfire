@@ -1030,13 +1030,9 @@ fn main() {
             (serial_us / grouped_us - 1.0) * 100.0,
         );
 
-        let batch = std::env::var("HIPFIRE_E8_GROUPED_PREFILL_BATCH")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(256usize);
+        let batch = 256usize;
         let x_batch = gpu.alloc_tensor(&[batch * groups * k], DType::F32).unwrap();
         let y_batch = gpu.alloc_tensor(&[batch * groups * m], DType::F32).unwrap();
-        let y_batch_b4 = gpu.alloc_tensor(&[batch * groups * m], DType::F32).unwrap();
         let x_batch_host = make_x(batch * groups * k, 0xB47C_4E8);
         gpu.hip
             .memcpy_htod(&x_batch.buf, bytes_of(&x_batch_host))
@@ -1049,15 +1045,6 @@ fn main() {
                 ),
                 2 => gpu.gemm_mfp4g32_e8_soa_grouped_wmma_b2(
                     &weights, &x_batch, &y_batch, groups, m, k, batch,
-                ),
-                4 => gpu.gemm_mfp4g32_e8_soa_grouped_wmma_b4(
-                    &weights,
-                    &x_batch,
-                    &y_batch_b4,
-                    groups,
-                    m,
-                    k,
-                    batch,
                 ),
                 _ => unreachable!(),
             };
@@ -1072,38 +1059,7 @@ fn main() {
         };
         let b1_us = time_variant(1);
         let b2_us = time_variant(2);
-        let b4_us = time_variant(4);
-        gpu.gemm_mfp4g32_e8_soa_grouped_wmma_b2(&weights, &x_batch, &y_batch, groups, m, k, batch)
-            .unwrap();
-        gpu.gemm_mfp4g32_e8_soa_grouped_wmma_b4(
-            &weights,
-            &x_batch,
-            &y_batch_b4,
-            groups,
-            m,
-            k,
-            batch,
-        )
-        .unwrap();
-        gpu.hip.device_synchronize().unwrap();
-        let mut b2_host = vec![0.0f32; batch * groups * m];
-        let mut b4_host = vec![0.0f32; batch * groups * m];
-        gpu.hip
-            .memcpy_dtoh(bytes_of_mut(&mut b2_host), &y_batch.buf)
-            .unwrap();
-        gpu.hip
-            .memcpy_dtoh(bytes_of_mut(&mut b4_host), &y_batch_b4.buf)
-            .unwrap();
-        let b4_exact = b2_host
-            .iter()
-            .zip(&b4_host)
-            .filter(|(left, right)| left.to_bits() == right.to_bits())
-            .count();
-        eprintln!(
-            "  DS4 wo_a prefill B={batch}: B1 {b1_us:.1} us, B2 {b2_us:.1} us, B4 {b4_us:.1} us; B4 exact {b4_exact}/{}",
-            b2_host.len()
-        );
-        assert_eq!(b4_exact, b2_host.len(), "grouped E8 B4 changed output bits");
+        eprintln!("  DS4 wo_a prefill B={batch}: B1 {b1_us:.1} us, B2 {b2_us:.1} us");
 
         // --- Bench 2e: grouped batched GEMV vs grouped WMMA at verify widths.
         //

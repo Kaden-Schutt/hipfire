@@ -85,18 +85,6 @@ extern "C" __global__ void E8_GROUPED_PREFILL_KERNEL_NAME(
             ? X + ((long long)batch_row1 * G + group) * K
             : nullptr;
 #endif
-#if E8_GROUPED_PREFILL_BATCH_TILES >= 4
-    const int batch_row2 = batch_row0 + 32;
-    const int batch_row3 = batch_row0 + 48;
-    const _Float16* x_row2 =
-        batch_row2 < B
-            ? X + ((long long)batch_row2 * G + group) * K
-            : nullptr;
-    const _Float16* x_row3 =
-        batch_row3 < B
-            ? X + ((long long)batch_row3 * G + group) * K
-            : nullptr;
-#endif
 
     const int n_blocks = K / 32;
     const int scale_padded = (n_blocks + 15) & ~15;
@@ -113,10 +101,6 @@ extern "C" __global__ void E8_GROUPED_PREFILL_KERNEL_NAME(
     float8_t acc0 = {0, 0, 0, 0, 0, 0, 0, 0};
 #if E8_GROUPED_PREFILL_BATCH_TILES >= 2
     float8_t acc1 = {0, 0, 0, 0, 0, 0, 0, 0};
-#endif
-#if E8_GROUPED_PREFILL_BATCH_TILES >= 4
-    float8_t acc2 = {0, 0, 0, 0, 0, 0, 0, 0};
-    float8_t acc3 = {0, 0, 0, 0, 0, 0, 0, 0};
 #endif
     const half16_t zero_b = {
         0, 0, 0, 0, 0, 0, 0, 0,
@@ -156,18 +140,6 @@ extern "C" __global__ void E8_GROUPED_PREFILL_KERNEL_NAME(
                 : zero_b;
         acc1 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b1, acc1);
 #endif
-#if E8_GROUPED_PREFILL_BATCH_TILES >= 4
-        const half16_t b2 =
-            x_row2 != nullptr
-                ? *reinterpret_cast<const half16_t*>(x_row2 + k_off)
-                : zero_b;
-        const half16_t b3 =
-            x_row3 != nullptr
-                ? *reinterpret_cast<const half16_t*>(x_row3 + k_off)
-                : zero_b;
-        acc2 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b2, acc2);
-        acc3 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b3, acc3);
-#endif
     }
 
     const int out_col0 = batch_start + lane;
@@ -192,32 +164,6 @@ extern "C" __global__ void E8_GROUPED_PREFILL_KERNEL_NAME(
                 const long long out_idx =
                     ((long long)out_col1 * G + group) * M + out_row;
                 Y[out_idx] = acc1[j];
-            }
-        }
-    }
-#endif
-#if E8_GROUPED_PREFILL_BATCH_TILES >= 4
-    const int out_col2 = out_col0 + 32;
-    const int out_col3 = out_col0 + 48;
-    if (out_col2 < B) {
-        #pragma unroll
-        for (int j = 0; j < 8; j++) {
-            const int out_row = row_start + 2 * j + (tid >> 4);
-            if (out_row < M) {
-                const long long out_idx =
-                    ((long long)out_col2 * G + group) * M + out_row;
-                Y[out_idx] = acc2[j];
-            }
-        }
-    }
-    if (out_col3 < B) {
-        #pragma unroll
-        for (int j = 0; j < 8; j++) {
-            const int out_row = row_start + 2 * j + (tid >> 4);
-            if (out_row < M) {
-                const long long out_idx =
-                    ((long long)out_col3 * G + group) * M + out_row;
-                Y[out_idx] = acc3[j];
             }
         }
     }
