@@ -4668,6 +4668,51 @@ fn forward_think_fragments(
     Ok(())
 }
 
+fn should_prewarm_qwen_mq4r_decode(
+    path: &Path,
+    loaded: &serde_json::Value,
+    tp: Option<u64>,
+) -> bool {
+    let qwen = loaded
+        .get("arch")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|arch| arch.starts_with("qwen3_5"));
+    let mq4r = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("mq4r"));
+    qwen && mq4r && tp.unwrap_or(1) == 1
+}
+
+fn prewarm_qwen_mq4r_decode(engine: &mut Engine) -> Result<()> {
+    let response = engine.request(&serde_json::json!({
+        "type": "bench_decode",
+        "context_tokens": 64,
+        "iterations": 32,
+    }))?;
+    match response.get("type").and_then(serde_json::Value::as_str) {
+        Some("decode_result") => {
+            let tok_s = response
+                .get("tok_s")
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or(0.0);
+            eprintln!("[hipfire] pre-warmed Qwen MQ4R decode route ({tok_s:.1} tok/s)");
+            Ok(())
+        }
+        Some("error") => bail!(
+            "Qwen MQ4R decode pre-warm failed: {}",
+            response
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("daemon returned an unspecified error")
+        ),
+        other => bail!(
+            "Qwen MQ4R decode pre-warm expected decode_result, received {}",
+            other.unwrap_or("missing type")
+        ),
+    }
+}
+
 impl ServeRuntime {
     fn ensure_model(
         &mut self,
@@ -4715,6 +4760,9 @@ impl ServeRuntime {
                 eprintln!("[hipfire] bumping load max_seq to {loaded_max_seq} for request budget");
             }
             let loaded = self.engine.load(&path, params)?;
+            if should_prewarm_qwen_mq4r_decode(&path, &loaded, self.tp) {
+                prewarm_qwen_mq4r_decode(&mut self.engine)?;
+            }
             self.cache_capable = loaded
                 .get("cache_capable")
                 .and_then(serde_json::Value::as_bool)
@@ -13535,5 +13583,38 @@ for line in sys.stdin:
             Some("bench prompt")
         );
         assert_eq!(req.get("max_tokens").and_then(|v| v.as_u64()), Some(37));
+    }
+
+    #[test]
+    fn qwen_mq4r_decode_prewarm_is_fail_closed_to_the_exact_route() {
+        let qwen = serde_json::json!({ "arch": "qwen3_5_moe" });
+        let qwen_dense = serde_json::json!({ "arch": "qwen3_5" });
+        let deepseek = serde_json::json!({ "arch": "deepseek4" });
+
+        assert!(should_prewarm_qwen_mq4r_decode(
+            Path::new("qwen3.6-35b-a3b.mq4r"),
+            &qwen,
+            None,
+        ));
+        assert!(should_prewarm_qwen_mq4r_decode(
+            Path::new("QWEN3.6-9B.MQ4R"),
+            &qwen_dense,
+            Some(1),
+        ));
+        assert!(!should_prewarm_qwen_mq4r_decode(
+            Path::new("qwen3.6-35b-a3b.mq4"),
+            &qwen,
+            None,
+        ));
+        assert!(!should_prewarm_qwen_mq4r_decode(
+            Path::new("deepseek-v4-flash.mq4r"),
+            &deepseek,
+            None,
+        ));
+        assert!(!should_prewarm_qwen_mq4r_decode(
+            Path::new("qwen3.6-35b-a3b.mq4r"),
+            &qwen,
+            Some(2),
+        ));
     }
 }
