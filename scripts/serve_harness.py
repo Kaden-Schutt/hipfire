@@ -24,7 +24,7 @@ Modes:
   session — an existing N-turn session file (recall + attractor), e.g. the 8-turn
             session_coding.json the coherence gate uses.
 """
-import argparse, atexit, errno, json, os, re, shutil, signal, subprocess, sys, tempfile, time, urllib.request
+import argparse, atexit, errno, hashlib, json, os, re, shutil, signal, subprocess, sys, tempfile, time, urllib.request
 from pathlib import Path
 
 # Mirror of the Rust configuration schema's reasoning budgets (resolved here so the pre-flight shows the
@@ -859,6 +859,7 @@ def run(cfg, args):
     if cfg["mode"] == "battery":
         for genre, prompt, expected in battery:
             r = send(cfg, [{"role": "user", "content": prompt}])
+            r["prompt_md5"] = hashlib.md5(prompt.encode("utf-8")).hexdigest()
             missing = [item for item in expected if item.lower() not in r["assistant_content"].lower()]
             r["expected_substrings"] = expected
             r["retrieval_missing"] = missing
@@ -869,6 +870,7 @@ def run(cfg, args):
         for genre, prompt, expected in battery:
             messages.append({"role": "user", "content": prompt})
             r = send(cfg, messages)
+            r["prompt_md5"] = hashlib.md5(prompt.encode("utf-8")).hexdigest()
             messages.append({"role": "assistant", "content": r["assistant_content"]})
             missing = [item for item in expected if item.lower() not in r["assistant_content"].lower()]
             r["expected_substrings"] = expected
