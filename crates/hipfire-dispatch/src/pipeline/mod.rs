@@ -1786,10 +1786,20 @@ pub fn run_moe_prefill_bias_aware(
         )?;
 
         // Unscatter + SwiGLU·clamp.
-        let use_fused_unscatter_silu =
-            hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_FUSED_UNSCATTER_SILU")
-                .map(|s| s != "0")
-                .unwrap_or(false);
+        // Exact gfx1151 defaults to the raw-bit-certified fused consumer: it
+        // removes the full up_batch write/read and one launch per routed MoE
+        // layer. Other architectures retain the established two-kernel path.
+        // The developer override remains an explicit rollback/screening aid;
+        // shipping gfx1151 behavior does not depend on an environment flag.
+        let use_fused_unscatter_silu = match hipfire_config::developer_var(
+            "HIPFIRE_DEEPSEEK4_FUSED_UNSCATTER_SILU",
+        )
+        .as_deref()
+        {
+            Ok("0") => false,
+            Ok(_) => true,
+            Err(_) => gpu.arch.eq_ignore_ascii_case("gfx1151"),
+        };
         if use_fused_unscatter_silu {
             hip!(gpu.moe_unscatter_silu_clamp_k8(
                 p.y_gate_up_grouped,
