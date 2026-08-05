@@ -915,6 +915,47 @@ fn moe_res_mq5_routed_indexable() {
     assert!(r.use_gpu_topk);
 }
 
+/// Per-projection Lloyd mix (gate_up MQ2-Lloyd, down MQ3-Lloyd) must reach the
+/// GPU-top-K path. Before this arm existed the pair fell through every
+/// `routed_indexable_*` test, so `use_gpu_topk` was false and the layer silently
+/// took the CPU-top-K fallback — correct output, so the only symptom was lost
+/// throughput. Guard both directions.
+#[test]
+fn moe_res_mixed_lloyd_routed_indexable() {
+    for (gu, dn) in [
+        (DType::MQ2G256Lloyd, DType::MQ3G256Lloyd),
+        (DType::MQ3G256Lloyd, DType::MQ2G256Lloyd),
+    ] {
+        let mut d = dtypes_all_mq4();
+        d.routed_gate_up = gu;
+        d.routed_down = dn;
+        let r = MoeResolution::resolve(&d, 8);
+        assert!(r.routed_indexable_mixed_lloyd, "{gu:?}/{dn:?}");
+        assert!(r.use_gpu_topk, "{gu:?}/{dn:?}");
+        assert!(r.routed_indexable(), "{gu:?}/{dn:?}");
+        // The uniform arms must NOT claim a mixed pair.
+        assert!(!r.routed_indexable_mq2lloyd, "{gu:?}/{dn:?}");
+        assert!(!r.routed_indexable_mq3lloyd, "{gu:?}/{dn:?}");
+        // gate_up is Lloyd either way -> x must be rotated into the local buffer.
+        assert!(r.needs_x_rot_local, "{gu:?}/{dn:?}");
+    }
+}
+
+/// A Lloyd gate_up paired with a NON-Lloyd down must stay unindexable — there is
+/// no MQ4/MQ6 down kernel that self-combines, and `routed_down_self_combines`
+/// keys on `routed_down`, so admitting this would skip the shared down-combine
+/// and silently drop every expert's contribution.
+#[test]
+fn moe_res_lloyd_gate_up_with_nonlloyd_down_not_indexable() {
+    let mut d = dtypes_all_mq4();
+    d.routed_gate_up = DType::MQ2G256Lloyd;
+    d.routed_down = DType::MQ4G256;
+    let r = MoeResolution::resolve(&d, 8);
+    assert!(!r.routed_indexable_mixed_lloyd);
+    assert!(!r.routed_indexable());
+    assert!(!r.use_gpu_topk);
+}
+
 #[test]
 fn moe_res_mq6_routed_indexable() {
     let mut d = dtypes_all_mq4();

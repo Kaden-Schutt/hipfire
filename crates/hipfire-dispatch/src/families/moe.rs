@@ -123,6 +123,20 @@ pub struct MoeResolution {
     /// Uniform all-MQ3-Lloyd routed experts (gate_up == down == MQ3G256Lloyd).
     /// Same indexed-Lloyd decode path as mq2lloyd, MQ3 launchers.
     pub routed_indexable_mq3lloyd: bool,
+    /// Routed experts whose gate_up and down are each MQ2-Lloyd or MQ3-Lloyd,
+    /// INDEPENDENTLY — the per-projection allocation (gate_up 2-bit, down 3-bit)
+    /// that puts the cheap bits on the larger projection and the accurate ones on
+    /// the residual write. Indexable because `run_moe_decode` already picks the
+    /// gate_up and down GEMVs from their own dtypes rather than a coupled flag,
+    /// and because BOTH Lloyd down kernels self-combine via atomicAdd — so
+    /// `routed_down_self_combines` (keyed on `routed_down` alone) stays correct
+    /// and the shared down-combine is skipped exactly once. silu+rotate is
+    /// weight-agnostic. Subsumes the two uniform Lloyd arms above.
+    ///
+    /// Decode-only: batched prefill rejects MoE MQ3-Lloyd outright (see
+    /// `moe_ffn_has_mq3_experts_uniform` in hipfire-arch-qwen35), which already
+    /// blocks the pre-existing uniform MQ3-Lloyd path too.
+    pub routed_indexable_mixed_lloyd: bool,
     /// Per-expert N-tier graded routed experts (MQ6 hot / MQ4 mid / MQ2L or
     /// MQ3L cold, applied to BOTH gate_up and down). Indexable on the decode
     /// GPU-top-K path via the merged dtype-tag-branched gate_up AND down
@@ -174,6 +188,12 @@ impl MoeResolution {
         let routed_indexable_mixed_gu4_dn6 = routed_gate_up_mq4 && (d.routed_down == MQ6G256);
         let routed_indexable_mq2lloyd = (d.routed_down == MQ2G256Lloyd) && routed_gate_up_mq2lloyd;
         let routed_indexable_mq3lloyd = (d.routed_down == MQ3G256Lloyd) && routed_gate_up_mq3lloyd;
+        // Per-projection Lloyd mix (e.g. gate_up MQ2-Lloyd + down MQ3-Lloyd, the
+        // 2-bit-gate/3-bit-down allocation). Subsumes the two uniform arms above;
+        // the OR below makes the overlap harmless.
+        let routed_indexable_mixed_lloyd =
+            matches!(d.routed_gate_up, MQ2G256Lloyd | MQ3G256Lloyd)
+                && matches!(d.routed_down, MQ2G256Lloyd | MQ3G256Lloyd);
         let routed_indexable_paro =
             (d.routed_down == ParoQ4G128 && d.has_paro_shared) && routed_gate_up_paro;
         // Per-expert mixed: the model already verified the experts carry
@@ -198,6 +218,7 @@ impl MoeResolution {
             || routed_indexable_mixed_per_expert
             || routed_indexable_mq2lloyd
             || routed_indexable_mq3lloyd
+            || routed_indexable_mixed_lloyd
             || routed_indexable_paro
             || routed_indexable_e8;
 
@@ -233,6 +254,7 @@ impl MoeResolution {
             routed_indexable_mixed_gu4_dn6,
             routed_indexable_mq2lloyd,
             routed_indexable_mq3lloyd,
+            routed_indexable_mixed_lloyd,
             routed_indexable_mixed_per_expert,
             routed_indexable_paro,
             use_gpu_topk,
@@ -249,6 +271,7 @@ impl MoeResolution {
             || self.routed_indexable_mixed_per_expert
             || self.routed_indexable_mq2lloyd
             || self.routed_indexable_mq3lloyd
+            || self.routed_indexable_mixed_lloyd
             || self.routed_indexable_paro
     }
 }

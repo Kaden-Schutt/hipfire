@@ -2782,6 +2782,28 @@ fn f32_to_fp16_bits(v: f32) -> u16 {
     sign | ((exp as u16) << 10) | m16
 }
 
+/// Lloyd's-algorithm iteration cap, shared by EVERY per-block Lloyd codebook fit
+/// (MQ2/MQ3/MQ4, plain / weighted / GPTQ).
+///
+/// **8, not 16.** History: `f8cd234` (2026-05-19) raised 8 → 16 on the strength of
+/// the `lloyd_iteration_headroom` synthetic probe (+0.4–0.9% MSE on heavy-tailed +
+/// sparse distributions). On 2026-05-20 a DeepSeek V4 re-quant at 16 iterations
+/// measured **60× worse wikitext2 PPL (758 vs 12)** against the byte-identical
+/// 8-iter build, and the plain path was reverted. The synthetic probe never
+/// captured FWHT-rotated MoE statistics — classic synth-win → prod-falsify.
+///
+/// The revert only landed on the plain arm. `quantize_mq2g256_lloyd_weighted` and
+/// `quantize_mq2g256_lloyd_gptq` were left at 16, each carrying a comment claiming
+/// it "matches the plain Lloyd path" — which was false. Any `--imatrix` build
+/// therefore silently took the falsified iteration count, confounding every
+/// calibration A/B with a known-bad knob. Hoisted to one constant so the three
+/// arms cannot drift again.
+///
+/// Do NOT raise this without first running wikitext2 PPL on a DeepSeek V4 build.
+/// Note the 8-vs-16 difference does NOT show up in block MSE (11.19% vs 11.15%) —
+/// it is a pathological-local-minimum effect, so MSE is not a valid gate for it.
+pub(crate) const LLOYD_MAX_ITER: usize = 8;
+
 /// MagnumQuant HFQ3-G256-Lloyd: per-block 8-entry fp16 codebook fitted via
 /// Lloyd's algorithm. 16 B header (8 fp16) + 96 B packed 3-bit indices = 112 B/group
 /// (vs uniform MQ3's 104 B — only +7.7% bandwidth). Direct extension of MQ2-Lloyd
@@ -3310,10 +3332,10 @@ fn quantize_mq2g256_lloyd_weighted(
             let range = sorted[255] - sorted[0];
             let mut indices = [0u8; 256];
             if range > 0.0 {
-                // 16-iter cap matches the plain Lloyd path; per the
-                // lloyd_iteration_headroom probe, this reaches the MSE
-                // plateau on heavy-tailed + sparse distributions.
-                let max_iter = 16;
+                // Shared with the plain + GPTQ arms — see LLOYD_MAX_ITER. This
+                // arm ran 16 until 2026-08-04 while claiming to match the plain
+                // path, which had been reverted to 8 on 2026-05-20.
+                let max_iter = LLOYD_MAX_ITER;
                 let mut prev_assignments = [0u8; 256];
                 for it in 0..max_iter {
                     // Weighted centroid update: cb[k] = sum_{i in k} w_i * v_i / sum_{i in k} w_i.
@@ -3502,8 +3524,8 @@ fn quantize_mq2g256_lloyd_gptq_with_damping(
             ];
             let range = sorted[255] - sorted[0];
             if range > 0.0 {
-                // 16-iter cap matches plain Lloyd; see lloyd_iteration_headroom.
-                let max_iter = 16;
+                // Shared with the plain + weighted arms — see LLOYD_MAX_ITER.
+                let max_iter = LLOYD_MAX_ITER;
                 let mut prev_assignments = [0u8; 256];
                 for it in 0..max_iter {
                     let mut weighted_sums = [0.0f64; 4];
@@ -3661,7 +3683,10 @@ pub(crate) fn quantize_mq2g256_lloyd(f32_data: &[f32], signs1: &[f32], signs2: &
                 // a real-model coherence-gated sweep validates a different
                 // value. Do NOT raise this back to 16 (or higher) without
                 // running wikitext2 PPL on a DeepSeek V4 build first.
-                let max_iter = 8;
+                //
+                // 2026-08-04: hoisted to LLOYD_MAX_ITER (see its doc comment) so
+                // the weighted + GPTQ arms cannot silently diverge again.
+                let max_iter = LLOYD_MAX_ITER;
                 let mut prev_assignments = [0u8; 256];
                 for it in 0..max_iter {
                     let mut sums = [0.0f64; 4];
