@@ -7625,8 +7625,30 @@ fn main() {
     // the hipfire loader looks them up.
     let is_minimax = arch_id == 10;
     let is_moe_like = is_moe || is_deepseek4 || is_lfm2moe || is_minimax || is_cohere2moe;
-    // Q8 router: always on for MoE-class models.
-    let q8_router = is_moe_like || q8_router_flag;
+    // Q8 "router" — a misnomer: `is_q8_tensor` covers the whole FIXED tier
+    // (attention q/k/v/o, linear_attn projections, conv1d, lm_head, embed, and
+    // the MoE router), not just `mlp.gate.weight`. On for MoE-class models by
+    // default, since the fixed tier is quality-critical and cheap relative to
+    // the routed experts *by parameter count*.
+    //
+    // `--no-q8-router` restores the historic opt-out. It matters far more than
+    // the name suggests: the fixed tier is **66% of per-token decode bytes** on
+    // a3b (mq4r: 1030.8 MB fixed vs 534.8 MB routed), so forcing it to Q8
+    // (1.0625 B/w) instead of MQ4 (0.53125 B/w) doubles the dominant term. That
+    // is why `.mq2` reads 45% MORE bytes/token than `.mq4r` despite being 7 GB
+    // smaller on disk, and why `.mq4r` — which needs this flag off — is not
+    // byte-reproducible from HEAD without it.
+    let no_q8_router_flag = args.iter().any(|a| a == "--no-q8-router")
+        || std::env::var("HIPFIRE_NO_Q8_ROUTER").ok().as_deref() == Some("1");
+    let q8_router = (is_moe_like || q8_router_flag) && !no_q8_router_flag;
+    if no_q8_router_flag {
+        eprintln!(
+            "note: --no-q8-router — the fixed tier (attention / lm_head / router /\n\
+             embed / conv1d) follows --format instead of being forced to Q8F16.\n\
+             This is the mq4r recipe and the lever for a sub-MQ4 fixed tier;\n\
+             embed_tokens still stays Q8 via its own arm."
+        );
+    }
     if is_moe {
         eprintln!("  MoE detected — will split 3D expert tensors per-expert before quantization.");
     }
