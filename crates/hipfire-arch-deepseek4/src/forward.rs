@@ -1312,17 +1312,26 @@ fn e8_batched_gemv_applies(arch: &str, batch_size: usize, k: usize) -> bool {
 /// gfx1151 DS4 prefill shapes that cleared the bit-exact micro gate.
 ///
 /// The kernel makes four waves share one decoded 16x128 weight slab. That
-/// pays on the wide/down projections below at the production 1,024-token
-/// chunk, but not on the 1,024x4,096 attention projection. Keep tails and
+/// pays on all five production projection shapes at a 512-token chunk and on
+/// the four wide/down projections below at the default 1,024-token chunk. The
+/// 1,024x4,096 attention projection stays on B4 at B=1,024. Keep tails and
 /// every unmeasured shape on the established B4 kernel.
 #[inline]
 fn e8_prefill_coop4_applies(arch: &str, m: usize, k: usize, batch_size: usize) -> bool {
-    arch == "gfx1151"
-        && batch_size == 1024
-        && matches!(
+    if arch != "gfx1151" {
+        return false;
+    }
+    match batch_size {
+        512 => matches!(
+            (m, k),
+            (1024, 4096) | (32768, 1024) | (4096, 8192) | (2048, 4096) | (4096, 2048)
+        ),
+        1024 => matches!(
             (m, k),
             (32768, 1024) | (4096, 8192) | (2048, 4096) | (4096, 2048)
-        )
+        ),
+        _ => false,
+    }
 }
 
 /// F16×F16→F32 batched GEMM, arch-routed.
