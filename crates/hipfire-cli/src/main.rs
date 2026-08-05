@@ -1839,8 +1839,8 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
     let resolved = resolved_for_model(paths, &args.model, canonical.as_deref(), entry)?;
     let configured_max_tokens = config_u64(&resolved, "generation.max_tokens")?;
     let max_tokens = args.max_tokens.unwrap_or(configured_max_tokens);
-    if max_tokens == 0 || max_tokens > 131_072 {
-        bail!("--max-tokens must be between 1 and 131072");
+    if max_tokens == 0 || max_tokens > 393_216 {
+        bail!("--max-tokens must be between 1 and 393216");
     }
     let temperature = request_f64(&resolved, "generation.temperature", args.temp)?;
     let top_p = request_f64(&resolved, "generation.top_p", args.top_p)?;
@@ -2128,8 +2128,8 @@ fn chat_command(paths: &Paths, args: ChatArgs) -> Result<()> {
     let max_tokens = args
         .max_tokens
         .unwrap_or(config_u64(&resolved, "generation.max_tokens")?);
-    if max_tokens == 0 || max_tokens > 131_072 {
-        bail!("--max-tokens must be between 1 and 131072");
+    if max_tokens == 0 || max_tokens > 393_216 {
+        bail!("--max-tokens must be between 1 and 393216");
     }
     if let Some(value) = args.temp {
         if !(0.0..=2.0).contains(&value) {
@@ -2263,6 +2263,7 @@ struct ServeRuntime {
     paths: Paths,
     registry: RegistryV1,
     current_path: Option<PathBuf>,
+    current_arch: Option<String>,
     current_max_seq: u64,
     cache_capable: bool,
     kv_override: Option<String>,
@@ -2826,6 +2827,7 @@ fn serve_foreground(
             paths: paths.clone(),
             registry: registry.clone(),
             current_path: None,
+            current_arch: None,
             current_max_seq: 0,
             cache_capable: false,
             kv_override: args.kv_mode.clone(),
@@ -2923,6 +2925,7 @@ fn serve_foreground(
                     let result = runtime.engine.unload();
                     if result.is_ok() {
                         runtime.current_path = None;
+                        runtime.current_arch = None;
                         runtime.current_max_seq = 0;
                         runtime.cache_capable = false;
                     }
@@ -4221,6 +4224,7 @@ fn complete_request_attempt(
                 // Rollback could not be attested: model state is unknown, so
                 // the next request must full-reload rather than trust it.
                 runtime.current_path = None;
+                runtime.current_arch = None;
                 runtime.current_max_seq = 0;
                 runtime.cache_capable = false;
             }
@@ -4232,6 +4236,9 @@ fn complete_request_attempt(
         .or_else(|| body.get("max_completion_tokens"))
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(config_u64(&resolved, "generation.max_tokens")?);
+    if max_tokens == 0 || max_tokens > 393_216 {
+        bail!("max_tokens must be between 1 and 393216");
+    }
     let required_max_seq = max_tokens.saturating_add(1024);
     if runtime.current_max_seq < required_max_seq {
         runtime.ensure_model(&model, &shared.meta, Some(required_max_seq))?;
@@ -4296,7 +4303,8 @@ fn complete_request_attempt(
             );
         }
     }
-    apply_http_reasoning_request(body, &resolved, &mut generate)?;
+    let deepseek4_effort_contract = runtime.current_arch.as_deref() == Some("deepseek4");
+    apply_http_reasoning_request(body, &resolved, &mut generate, deepseek4_effort_contract)?;
     let (id, created) = identity.clone();
     generate["id"] = serde_json::Value::String(id.clone());
     generate["attempt_id"] = serde_json::json!(attempt_id);
@@ -4712,6 +4720,10 @@ impl ServeRuntime {
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false);
             self.current_path = Some(path);
+            self.current_arch = loaded
+                .get("arch")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned);
             self.current_max_seq = loaded_max_seq;
             meta.lock()
                 .unwrap_or_else(|error| error.into_inner())
@@ -5921,6 +5933,18 @@ fn apply_reasoning_request(
         }
     };
     request["max_think_tokens"] = serde_json::json!(max_think);
+    match config_string(resolved, "reasoning.effort")?.as_str() {
+        "auto" => {}
+        "none" => {
+            request["max_think_tokens"] = serde_json::json!(1);
+            request["assistant_prefix"] = serde_json::json!("closed_think");
+            request["reasoning_effort"] = serde_json::json!("none");
+        }
+        effort @ ("low" | "high" | "max") => {
+            request["reasoning_effort"] = serde_json::json!(effort);
+        }
+        effort => bail!("unknown reasoning effort '{effort}'"),
+    }
     Ok(())
 }
 
@@ -5928,6 +5952,7 @@ fn apply_http_reasoning_request(
     body: &serde_json::Value,
     resolved: &hipfire_config::ResolvedConfig,
     request: &mut serde_json::Value,
+    deepseek4_effort_contract: bool,
 ) -> Result<()> {
     let thinking_disabled = body
         .pointer("/chat_template_kwargs/enable_thinking")
@@ -5947,19 +5972,56 @@ fn apply_http_reasoning_request(
         return Ok(());
     }
     if let Some(effort) = effort {
-        let max_think = match effort {
-            "minimal" => 64,
-            "low" => 256,
-            "medium" | "med" => 1024,
-            "high" => 4096,
-            "xhigh" | "max" | "uncapped" => 0,
+        if !deepseek4_effort_contract {
+            let max_think = match effort {
+                "minimal" => 64,
+                "low" => 256,
+                "medium" | "med" => 1024,
+                "high" => 4096,
+                "xhigh" | "max" | "uncapped" => 0,
+                other => bail!("unknown reasoning effort '{other}'"),
+            };
+            request["max_think_tokens"] = serde_json::json!(max_think);
+            request["reasoning_effort"] = serde_json::json!(effort);
+            return Ok(());
+        }
+        let normalized = match effort {
+            "minimal" | "medium" | "med" | "low" => "low",
+            "high" => "high",
+            "xhigh" | "max" | "uncapped" => "max",
             other => bail!("unknown reasoning effort '{other}'"),
         };
-        request["max_think_tokens"] = serde_json::json!(max_think);
-        request["reasoning_effort"] = serde_json::json!(effort);
+        let explicit_cap = body
+            .get("max_think_tokens")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        if explicit_cap > 393_216 {
+            bail!("max_think_tokens must be between 0 and 393216");
+        }
+        // Effort selects the parent model's prompt semantics. It never invents
+        // a hipfire token cap; absent an explicit cap, 0 means uncapped.
+        request["max_think_tokens"] = serde_json::json!(explicit_cap);
+        request["reasoning_effort"] = serde_json::json!(normalized);
         return Ok(());
     }
-    apply_reasoning_request(resolved, request)
+    apply_reasoning_request(resolved, request)?;
+    if deepseek4_effort_contract
+        && request
+            .get("reasoning_effort")
+            .and_then(serde_json::Value::as_str)
+            != Some("none")
+    {
+        if let Some(explicit_cap) = body
+            .get("max_think_tokens")
+            .and_then(serde_json::Value::as_u64)
+        {
+            if explicit_cap > 393_216 {
+                bail!("max_think_tokens must be between 0 and 393216");
+            }
+            request["max_think_tokens"] = serde_json::json!(explicit_cap);
+        }
+    }
+    Ok(())
 }
 
 fn config_value<'a>(
@@ -9805,9 +9867,36 @@ mod tests {
             &serde_json::json!({ "reasoning_effort": "high" }),
             &resolved,
             &mut request,
+            false,
         )
         .unwrap();
+        assert_eq!(request["reasoning_effort"], "high");
         assert_eq!(request["max_think_tokens"], 4096);
+
+        let mut deepseek_uncapped = serde_json::json!({});
+        apply_http_reasoning_request(
+            &serde_json::json!({ "reasoning_effort": "max" }),
+            &resolved,
+            &mut deepseek_uncapped,
+            true,
+        )
+        .unwrap();
+        assert_eq!(deepseek_uncapped["reasoning_effort"], "max");
+        assert_eq!(deepseek_uncapped["max_think_tokens"], 0);
+
+        let mut deepseek_explicitly_capped = serde_json::json!({});
+        apply_http_reasoning_request(
+            &serde_json::json!({
+                "reasoning_effort": "max",
+                "max_think_tokens": 1234
+            }),
+            &resolved,
+            &mut deepseek_explicitly_capped,
+            true,
+        )
+        .unwrap();
+        assert_eq!(deepseek_explicitly_capped["reasoning_effort"], "max");
+        assert_eq!(deepseek_explicitly_capped["max_think_tokens"], 1234);
 
         let mut disabled = serde_json::json!({});
         apply_http_reasoning_request(
@@ -9816,6 +9905,7 @@ mod tests {
             }),
             &resolved,
             &mut disabled,
+            false,
         )
         .unwrap();
         assert_eq!(disabled["reasoning_effort"], "none");
@@ -12571,6 +12661,7 @@ for line in sys.stdin:
                     paths: paths.clone(),
                     registry,
                     current_path: None,
+                    current_arch: None,
                     current_max_seq: 0,
                     cache_capable: false,
                     kv_override: None,

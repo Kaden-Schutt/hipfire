@@ -11,7 +11,7 @@ to tell coherent output from runaway/empty and to read real perf:
 
 TWO-STEP DISCIPLINE: `--show-config` resolves and prints the CONCRETE config —
 every sampling value with its source ([registry]/[default]/[recipe]/[explicit]),
-`thinking_budget med -> 2048 tok`, `max_tokens`, `kv`, `mtp`, model — WITHOUT
+the resolved effort and independent thinking cap, `max_tokens`, `kv`, `mtp`, model — WITHOUT
 running, so you eyeball exactly what is and isn't set before anything fires. The
 sampling DEFAULT is production-sampled (the model's registry recommended_settings),
 never greedy or the 0.3 CLI fallback.
@@ -96,17 +96,18 @@ def resolve_sampling(spec, tag, registry_path):
             print(f"  [warn] could not read registry {registry_path}: {e}", file=sys.stderr)
         label = f"registry({tag}:{profile})" if profile else f"registry({tag})"
         vals, source = {}, {}
-        for k in ["temperature", "top_p", "top_k", "min_p", "presence_penalty", "repeat_penalty"]:
+        for k in ["temperature", "top_p", "top_k", "min_p", "presence_penalty",
+                  "repeat_penalty", "reasoning_effort", "thinking_budget"]:
             if k in rec:
                 vals[k] = rec[k]; source[k] = label
         # The instruct profile is the non-thinking mode: drive reasoning_effort=none
         # through the existing budget machinery (no daemon request-JSON change).
-        if profile == "instruct":
+        if profile == "instruct" and "reasoning_effort" not in vals:
             vals["reasoning_effort"] = "none"; source["reasoning_effort"] = label
         # Registry stays the PREFERENCE; this only covers entries that carry nothing
         # usable. Guard on the sampling keys, not on `vals` — the instruct profile has
         # already inserted reasoning_effort above, so `not vals` would never fire here.
-        if not [k for k in vals if k != "reasoning_effort"]:
+        if not [k for k in vals if k not in ("reasoning_effort", "thinking_budget")]:
             # 38/54 registry models still lack recommended_settings, and a hard exit
             # strands callers that cannot pass --sampling (tools.redline bench's
             # coherence smoke hard-codes "registry" and forwards no --tag).
@@ -129,6 +130,11 @@ def infer_tag(model_path):
     those tags, so the size group must admit a fractional part.
     """
     b = os.path.basename(model_path)
+    if b.startswith("deepseek-v4-flash-0731"):
+        if b.endswith(".mq2r"):
+            return "deepseek-v4-flash:mq2r"
+        if b.endswith(".mq2lloyd"):
+            return "deepseek-v4-flash"
     m = re.match(r"(qwen3\.\d+)-(\d+(?:\.\d+)?b(?:-a\d+b)?)", b)
     if m:
         return f"{m.group(1)}:{m.group(2)}"
@@ -138,21 +144,27 @@ def infer_tag(model_path):
 def build_config(args):
     tag = args.tag or infer_tag(args.model)
     samp, samp_src = resolve_sampling(args.sampling, tag, args.registry)
-    # `reasoning_effort` is a REQUEST-BODY field (SAMPLE_KEYS carries it), not a
-    # config key. `--thinking` only sets the [reasoning] budget cap; the daemon
-    # independently defaults think_mode to NonThink when reasoning_effort is
-    # absent from the body, so a run with `--thinking high` and nothing else
-    # produces a 8192-token cap over zero thinking tokens. Injecting here keeps
-    # the two knobs consistent and visible in the pre-flight.
+    # Effort is parent-model prompt semantics. Budget is an independent hipfire
+    # cap policy and must never be inferred from the effort level.
+    registry_budget = samp.pop("thinking_budget", None)
+    samp_src.pop("thinking_budget", None)
     effort = getattr(args, "thinking_effort", None)
     if effort:
         samp = dict(samp)
         samp["reasoning_effort"] = effort
         samp_src = dict(samp_src)
         samp_src["reasoning_effort"] = "explicit(--thinking-effort)"
-    think_cap = THINKING_BUDGET.get(args.thinking)
+    selected_budget = args.thinking
+    if selected_budget is None:
+        if registry_budget is not None:
+            selected_budget = registry_budget
+        elif samp.get("reasoning_effort") in ("low", "high", "max"):
+            selected_budget = "uncapped"
+        else:
+            selected_budget = "med"
+    think_cap = THINKING_BUDGET.get(selected_budget)
     if think_cap is None:
-        sys.exit(f"thinking_budget {args.thinking!r} not a key of {list(THINKING_BUDGET)}")
+        sys.exit(f"thinking_budget {selected_budget!r} not a key of {list(THINKING_BUDGET)}")
     draft = getattr(args, "draft", None)
     if draft:
         draft = os.path.abspath(os.path.expanduser(draft))
@@ -165,7 +177,7 @@ def build_config(args):
         "kv_backend": getattr(args, "kv_backend", "contiguous") or "contiguous",
         "dflash": getattr(args, "dflash", "off") or "off",
         "draft": draft,
-        "thinking_budget": args.thinking, "thinking_cap_tokens": think_cap,
+        "thinking_budget": selected_budget, "thinking_cap_tokens": think_cap,
         "max_tokens": args.max_tokens, "sampling": samp, "sampling_source": samp_src,
         "mode": args.mode, "port": args.port, "seed": getattr(args, "seed", None),
         "prompts_file": getattr(args, "prompts_file", None),
@@ -224,8 +236,12 @@ def show_config(cfg):
     print(f"  seed          : {cfg.get('seed')}   prompt_source: {prompt_source}")
     _cap = cfg['thinking_cap_tokens']
     _thinking_off = cfg['thinking_budget'] == 'off'
-    _resolved = 'thinking DISABLED (sentinel cap 1)' if _thinking_off else f'{_cap} tok (CONCRETE cap)'
+    _resolved = ('thinking DISABLED (sentinel cap 1)' if _thinking_off
+                 else 'uncapped' if _cap == 0
+                 else f'{_cap} tok (CONCRETE cap)')
     print(f"  thinking_budget: {cfg['thinking_budget']} -> {_resolved}")
+    print(f"  reasoning_effort: {cfg['sampling'].get('reasoning_effort', 'auto')}"
+          "  (parent prompt semantics; independent of cap)")
     _note = ('no think block emitted' if _thinking_off
              else 'uncapped think budget' if _cap == 0
              else f'> think cap {_cap} — model can answer' if cfg['max_tokens'] > _cap
@@ -427,11 +443,14 @@ kv_cache = {json.dumps(cfg["kv"])}
 
 {speculation}
 [generation]
-max_tokens = 16384
+max_tokens = {cfg.get("max_tokens", 16384)}
 
 [reasoning]
 budget = {json.dumps(cfg["thinking_budget"])}
 """
+    effort = cfg.get("sampling", {}).get("reasoning_effort")
+    if effort:
+        text += f"effort = {json.dumps(effort)}\n"
     if cfg.get("replay_route_proof_log"):
         text += """
 [diagnostic.replay]
@@ -922,15 +941,15 @@ def main():
                          "speculative module in the checkpoint, so use --speculation dspark.")
     ap.add_argument("--thinking-effort", default=None,
                     choices=["none", "low", "high", "max"],
-                    help="request-body reasoning_effort. NOTE this is a DIFFERENT knob from "
-                         "--thinking, which only sets the [reasoning] budget CAP. The daemon "
-                         "defaults think_mode to NonThink when reasoning_effort is absent "
-                         "(daemon.rs), so --thinking high alone yields zero thinking tokens.")
+                    help="parent-model reasoning_effort prompt semantics; independent of "
+                         "--thinking. With no explicit/registry budget, low/high/max is uncapped.")
     ap.add_argument("--draft", default=None,
                     help="Optional DFlash draft path; sets HIPFIRE_DFLASH_DRAFT for the serve child. "
                          "When omitted, any caller-inherited HIPFIRE_DFLASH_DRAFT is preserved.")
-    ap.add_argument("--thinking", default="med", choices=list(THINKING_BUDGET),
-                    help="reasoning budget preset; \"off\" disables thinking (cap sentinel 1)")
+    ap.add_argument("--thinking", default=None, choices=list(THINKING_BUDGET),
+                    help="explicit reasoning cap policy. Default: registry thinking_budget; "
+                         "otherwise uncapped for an explicit effort, med for legacy callers. "
+                         "\"off\" disables thinking (cap sentinel 1).")
     ap.add_argument("--max-tokens", type=int, default=2048)
     ap.add_argument("--max-seq", type=int, default=32768)
     ap.add_argument("--sampling", default="registry",

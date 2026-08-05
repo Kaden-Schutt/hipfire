@@ -9871,7 +9871,9 @@ fn ep_serve_ds4(
     m.conversation_tokens.clear();
 
     let mut parser = match think_mode {
-        ThinkMode::High | ThinkMode::Max => deepseek4::dsml::StreamParser::new_in_think(),
+        ThinkMode::Low | ThinkMode::High | ThinkMode::Max => {
+            deepseek4::dsml::StreamParser::new_in_think()
+        }
         ThinkMode::NonThink => deepseek4::dsml::StreamParser::new(),
     };
     let tool_schemas: Vec<deepseek4::grammar::ToolSchema> = tools
@@ -18187,6 +18189,56 @@ fn generate(
 /// On context overflow the DeepSeek V4 state is hard-reset — DeepSeek V4 has no
 /// eviction path of its own and the SWA cache wraps automatically below
 /// the sliding-window bound.
+// Exact DeepSeek-V4-Flash-0731 effort prefixes from the model's MIT-licensed
+// encoding/encoding_dsv4.py. Keep the trailing blank line: it is part of the
+// parent checkpoint's prompt contract.
+const DEEPSEEK4_REASONING_HIGH_PREFIX: &str = concat!(
+    "Reasoning Effort: Absolute maximum with no shortcuts permitted.\n",
+    "You MUST be very thorough in your thinking and comprehensively decompose the problem to resolve the root cause, rigorously stress-testing your logic against all potential paths, edge cases, and adversarial scenarios.\n",
+    "Explicitly write out your entire deliberation process, documenting every intermediate step, considered alternative, and rejected hypothesis to ensure absolutely no assumption is left unchecked.\n\n",
+);
+const DEEPSEEK4_REASONING_MAX_PREFIX: &str = concat!(
+    "Reasoning Effort: Beyond maximum — exhaustive, relentless, and uncompromising.\n",
+    "You MUST reason with the utmost depth and rigor, leaving absolutely nothing to chance: exhaustively decompose the problem into its most fundamental components, trace every causal chain to its root, and resolve the underlying cause rather than any surface symptom.\n",
+    "Do not stop reasoning until you have independently verified the solution from multiple angles and are certain that no assumption remains unchecked and no error remains undiscovered.\n\n",
+);
+
+fn deepseek4_reasoning_prefix(mode: ThinkMode) -> &'static str {
+    match mode {
+        ThinkMode::High => DEEPSEEK4_REASONING_HIGH_PREFIX,
+        ThinkMode::Max => DEEPSEEK4_REASONING_MAX_PREFIX,
+        ThinkMode::NonThink | ThinkMode::Low => "",
+    }
+}
+
+#[cfg(test)]
+mod deepseek4_reasoning_prefix_tests {
+    use super::{
+        deepseek4_reasoning_prefix, ThinkMode, DEEPSEEK4_REASONING_HIGH_PREFIX,
+        DEEPSEEK4_REASONING_MAX_PREFIX,
+    };
+
+    #[test]
+    fn parent_effort_prefixes_are_distinct_and_low_is_empty() {
+        assert_eq!(deepseek4_reasoning_prefix(ThinkMode::NonThink), "");
+        assert_eq!(deepseek4_reasoning_prefix(ThinkMode::Low), "");
+        assert_eq!(
+            deepseek4_reasoning_prefix(ThinkMode::High),
+            DEEPSEEK4_REASONING_HIGH_PREFIX
+        );
+        assert_eq!(
+            deepseek4_reasoning_prefix(ThinkMode::Max),
+            DEEPSEEK4_REASONING_MAX_PREFIX
+        );
+        assert_ne!(
+            DEEPSEEK4_REASONING_HIGH_PREFIX,
+            DEEPSEEK4_REASONING_MAX_PREFIX
+        );
+        assert!(DEEPSEEK4_REASONING_HIGH_PREFIX.ends_with("\n\n"));
+        assert!(DEEPSEEK4_REASONING_MAX_PREFIX.ends_with("\n\n"));
+    }
+}
+
 fn build_deepseek4_dsml_prompt(
     tokenizer: &hipfire_runtime::tokenizer::Tokenizer,
     system_prompt: Option<&str>,
@@ -18219,12 +18271,6 @@ fn build_deepseek4_dsml_prompt(
     let user_tok = lookup("<｜User｜>");
     let asst_tok = lookup("<｜Assistant｜>");
 
-    // HF "Reasoning Effort: Absolute maximum..." preamble for `Max` mode.
-    // Quoted from the model card's encoding/README.md.
-    const MAX_THINK_PREAMBLE: &str =
-        "Reasoning Effort: Absolute maximum with no shortcuts permitted. \
-You MUST be very thorough in your thinking and comprehensively decompose the problem.";
-
     // Build the effective system message: optional user-supplied system
     // text + (if request has tools) the DSML "## Tools" preamble.
     //
@@ -18255,8 +18301,9 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
     if let Some(b) = bos_tok {
         prompt_ids.push(b);
     }
-    if matches!(think_mode, ThinkMode::Max) {
-        prompt_ids.extend(tokenizer.encode(MAX_THINK_PREAMBLE));
+    let effort_prefix = deepseek4_reasoning_prefix(think_mode);
+    if !effort_prefix.is_empty() {
+        prompt_ids.extend(tokenizer.encode(effort_prefix));
     }
     if let Some(ref sys) = effective_system {
         prompt_ids.extend(tokenizer.encode(sys));
@@ -18438,10 +18485,12 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
     }
     // Thinking-mode signal token immediately after `<｜Assistant｜>`:
     //   NonThink → `</think>`   (skip reasoning, respond directly)
-    //   High|Max → `<think>`    (open a reasoning block)
+    //   Low|High|Max → `<think>` (open a reasoning block)
     match think_mode {
         ThinkMode::NonThink => prompt_ids.extend(tokenizer.encode("</think>")),
-        ThinkMode::High | ThinkMode::Max => prompt_ids.extend(tokenizer.encode("<think>")),
+        ThinkMode::Low | ThinkMode::High | ThinkMode::Max => {
+            prompt_ids.extend(tokenizer.encode("<think>"));
+        }
     }
 
     prompt_ids
@@ -19251,7 +19300,9 @@ fn generate_deepseek4(
         // `message.content`. NonThink mode appends `</think>` (closing
         // a zero-length think block) so the response starts in Normal.
         let mut parser = match think_mode {
-            ThinkMode::High | ThinkMode::Max => deepseek4::dsml::StreamParser::new_in_think(),
+            ThinkMode::Low | ThinkMode::High | ThinkMode::Max => {
+                deepseek4::dsml::StreamParser::new_in_think()
+            }
             ThinkMode::NonThink => deepseek4::dsml::StreamParser::new(),
         };
 

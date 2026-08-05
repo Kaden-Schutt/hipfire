@@ -338,6 +338,7 @@ const AUTO_ON_OFF: &[&str] = &["auto", "on", "off"];
 // `enable_thinking=false` / `reasoning_effort="none"` paths already send. It is
 // NOT 0 — 0 means `uncapped` (think until the model closes the block itself).
 const THINKING_BUDGETS: &[&str] = &["off", "low", "med", "high", "xhigh", "max", "uncapped"];
+const REASONING_EFFORTS: &[&str] = &["auto", "none", "low", "high", "max"];
 const SPECULATION_MODES: &[&str] = &["off", "auto", "ngram", "dflash", "mtp", "dspark"];
 
 macro_rules! field {
@@ -614,7 +615,7 @@ pub static FIELDS: &[ConfigField] = &[
         DefaultValue::Integer(4096),
         ValueRule::Integer {
             min: 1,
-            max: 131072
+            max: 393216
         },
         true,
         false,
@@ -629,7 +630,7 @@ pub static FIELDS: &[ConfigField] = &[
         DefaultValue::Integer(32768),
         ValueRule::Integer {
             min: 512,
-            max: 524288
+            max: 1048576
         },
         true,
         false,
@@ -649,6 +650,18 @@ pub static FIELDS: &[ConfigField] = &[
         "Visible reasoning mode."
     ),
     field!(
+        "reasoning.effort",
+        "reasoning_effort",
+        Reasoning,
+        Request,
+        DefaultValue::String("auto"),
+        ValueRule::Enum(REASONING_EFFORTS),
+        true,
+        false,
+        None,
+        "Model-specific reasoning effort; auto preserves the carrier fallback."
+    ),
+    field!(
         "reasoning.budget",
         "thinking_budget",
         Reasoning,
@@ -666,7 +679,10 @@ pub static FIELDS: &[ConfigField] = &[
         Reasoning,
         Request,
         DefaultValue::Null,
-        ValueRule::NullableInteger { min: 0, max: 32768 },
+        ValueRule::NullableInteger {
+            min: 0,
+            max: 393216
+        },
         true,
         false,
         None,
@@ -1023,7 +1039,7 @@ pub static FIELDS: &[ConfigField] = &[
         DefaultValue::Integer(32768),
         ValueRule::Integer {
             min: 0,
-            max: 524288
+            max: 1048576
         },
         true,
         true,
@@ -1070,7 +1086,7 @@ pub static FIELDS: &[ConfigField] = &[
         DefaultValue::Integer(2048),
         ValueRule::Integer {
             min: 0,
-            max: 524288
+            max: 1048576
         },
         true,
         true,
@@ -1157,7 +1173,7 @@ pub static FIELDS: &[ConfigField] = &[
         DefaultValue::Integer(32768),
         ValueRule::Integer {
             min: 0,
-            max: 524288
+            max: 1048576
         },
         true,
         true,
@@ -4158,6 +4174,33 @@ mod tests {
                 .to_value(),
             ConfigValue::String("off".into())
         );
+    }
+
+    #[test]
+    fn million_context_and_parent_output_limits_validate_without_coupling_effort() {
+        let mut layer = ConfigLayer::default();
+        layer
+            .set_cli("memory.max_seq", "1048576")
+            .expect("one-million-token context must validate");
+        layer
+            .set_cli("generation.max_tokens", "393216")
+            .expect("384-Ki-token output must validate");
+        layer
+            .set_cli("reasoning.max_tokens", "393216")
+            .expect("an explicit 384-Ki reasoning cap must validate");
+        layer
+            .set_cli("reasoning.effort", "max")
+            .expect("parent max effort must validate independently");
+        assert_eq!(
+            layer.get("reasoning.effort"),
+            Some(&ConfigValue::String("max".into()))
+        );
+        assert_eq!(
+            layer.get("reasoning.max_tokens"),
+            Some(&ConfigValue::Integer(393216))
+        );
+        assert!(layer.set_cli("memory.max_seq", "1048577").is_err());
+        assert!(layer.set_cli("generation.max_tokens", "393217").is_err());
     }
 
     #[test]
