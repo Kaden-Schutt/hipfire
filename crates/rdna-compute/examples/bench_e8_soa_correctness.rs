@@ -1207,7 +1207,11 @@ fn run_prefill_coop(gpu: &mut Gpu) {
         gpu.arch, "gfx1151",
         "cooperative E8 prefill is gfx1151-only"
     );
-    const BATCH: usize = 1024;
+    let batch = std::env::var("HIPFIRE_E8_PREFILL_COOP_BATCH")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(1024);
+    assert!(batch > 0, "cooperative E8 prefill batch must be non-zero");
     const TRIALS: usize = 5;
     let shapes = [
         (1024usize, 4096usize, "wq_a/wo_a"),
@@ -1216,7 +1220,7 @@ fn run_prefill_coop(gpu: &mut Gpu) {
         (2048usize, 4096usize, "shared_up"),
         (4096usize, 2048usize, "shared_down"),
     ];
-    eprintln!("=== gfx1151 cooperative E8 prefill B={BATCH} ===");
+    eprintln!("=== gfx1151 cooperative E8 prefill B={batch} ===");
     eprintln!(
         "  {:<16} {:>11} {:>11} {:>11} {:>11} {:>9} {:>9} {:>14}",
         "shape", "B4 us", "coop4 us", "B8 us", "B16 us", "B8/v4", "B16/v4", "exact outputs"
@@ -1226,20 +1230,20 @@ fn run_prefill_coop(gpu: &mut Gpu) {
         let aos = synth_e8_aos(m, k, 0xC001_E800 ^ slot as u64);
         let soa = aos_to_soa_full(&aos, m, k);
         let weights = gpu.upload_raw(&soa, &[soa.len()]).expect("upload weights");
-        let x = gpu.alloc_tensor(&[BATCH * k], DType::F32).expect("alloc x");
+        let x = gpu.alloc_tensor(&[batch * k], DType::F32).expect("alloc x");
         let y_ref = gpu
-            .alloc_tensor(&[BATCH * m], DType::F32)
+            .alloc_tensor(&[batch * m], DType::F32)
             .expect("alloc baseline y");
         let y_coop = gpu
-            .alloc_tensor(&[BATCH * m], DType::F32)
+            .alloc_tensor(&[batch * m], DType::F32)
             .expect("alloc cooperative y");
         let y_b8 = gpu
-            .alloc_tensor(&[BATCH * m], DType::F32)
+            .alloc_tensor(&[batch * m], DType::F32)
             .expect("alloc B8 y");
         let y_b16 = gpu
-            .alloc_tensor(&[BATCH * m], DType::F32)
+            .alloc_tensor(&[batch * m], DType::F32)
             .expect("alloc B16 y");
-        let x_host = make_x(BATCH * k, 0xE800_C001 ^ slot as u64);
+        let x_host = make_x(batch * k, 0xE800_C001 ^ slot as u64);
         gpu.hip
             .memcpy_htod(&x.buf, bytes_of(&x_host))
             .expect("upload x");
@@ -1247,21 +1251,21 @@ fn run_prefill_coop(gpu: &mut Gpu) {
         // Warm JIT, DPM, and the pointer-keyed F16 conversion cache for both
         // symbols before correctness or timing.
         for _ in 0..2 {
-            gpu.gemm_mfp4g32_e8_soa_wmma_b4(&weights, &x, &y_ref, m, k, BATCH)
+            gpu.gemm_mfp4g32_e8_soa_wmma_b4(&weights, &x, &y_ref, m, k, batch)
                 .expect("warm baseline");
-            gpu.gemm_mfp4g32_e8_soa_wmma_coop4(&weights, &x, &y_coop, m, k, BATCH)
+            gpu.gemm_mfp4g32_e8_soa_wmma_coop4(&weights, &x, &y_coop, m, k, batch)
                 .expect("warm cooperative");
-            gpu.gemm_mfp4g32_e8_soa_wmma_b8(&weights, &x, &y_b8, m, k, BATCH)
+            gpu.gemm_mfp4g32_e8_soa_wmma_b8(&weights, &x, &y_b8, m, k, batch)
                 .expect("warm B8");
-            gpu.gemm_mfp4g32_e8_soa_wmma_b16(&weights, &x, &y_b16, m, k, BATCH)
+            gpu.gemm_mfp4g32_e8_soa_wmma_b16(&weights, &x, &y_b16, m, k, batch)
                 .expect("warm B16");
         }
         gpu.hip.device_synchronize().expect("warm synchronize");
 
-        let mut reference = vec![0.0f32; BATCH * m];
-        let mut candidate = vec![0.0f32; BATCH * m];
-        let mut candidate8 = vec![0.0f32; BATCH * m];
-        let mut candidate16 = vec![0.0f32; BATCH * m];
+        let mut reference = vec![0.0f32; batch * m];
+        let mut candidate = vec![0.0f32; batch * m];
+        let mut candidate8 = vec![0.0f32; batch * m];
+        let mut candidate16 = vec![0.0f32; batch * m];
         gpu.hip
             .memcpy_dtoh(bytes_of_mut(&mut reference), &y_ref.buf)
             .expect("download baseline");
@@ -1307,14 +1311,14 @@ fn run_prefill_coop(gpu: &mut Gpu) {
 
         // ABBA timing order. Averaging the two observations per arm removes
         // the monotonic order bias without mixing kernels inside one timer.
-        let a0 = time_prefill_variant(gpu, 0, &weights, &x, &y_ref, m, k, BATCH, TRIALS);
-        let b0 = time_prefill_variant(gpu, 4, &weights, &x, &y_coop, m, k, BATCH, TRIALS);
-        let c0 = time_prefill_variant(gpu, 8, &weights, &x, &y_b8, m, k, BATCH, TRIALS);
-        let d0 = time_prefill_variant(gpu, 16, &weights, &x, &y_b16, m, k, BATCH, TRIALS);
-        let d1 = time_prefill_variant(gpu, 16, &weights, &x, &y_b16, m, k, BATCH, TRIALS);
-        let c1 = time_prefill_variant(gpu, 8, &weights, &x, &y_b8, m, k, BATCH, TRIALS);
-        let b1 = time_prefill_variant(gpu, 4, &weights, &x, &y_coop, m, k, BATCH, TRIALS);
-        let a1 = time_prefill_variant(gpu, 0, &weights, &x, &y_ref, m, k, BATCH, TRIALS);
+        let a0 = time_prefill_variant(gpu, 0, &weights, &x, &y_ref, m, k, batch, TRIALS);
+        let b0 = time_prefill_variant(gpu, 4, &weights, &x, &y_coop, m, k, batch, TRIALS);
+        let c0 = time_prefill_variant(gpu, 8, &weights, &x, &y_b8, m, k, batch, TRIALS);
+        let d0 = time_prefill_variant(gpu, 16, &weights, &x, &y_b16, m, k, batch, TRIALS);
+        let d1 = time_prefill_variant(gpu, 16, &weights, &x, &y_b16, m, k, batch, TRIALS);
+        let c1 = time_prefill_variant(gpu, 8, &weights, &x, &y_b8, m, k, batch, TRIALS);
+        let b1 = time_prefill_variant(gpu, 4, &weights, &x, &y_coop, m, k, batch, TRIALS);
+        let a1 = time_prefill_variant(gpu, 0, &weights, &x, &y_ref, m, k, batch, TRIALS);
         let baseline_us = 0.5 * (a0 + a1);
         let cooperative_us = 0.5 * (b0 + b1);
         let b8_us = 0.5 * (c0 + c1);
