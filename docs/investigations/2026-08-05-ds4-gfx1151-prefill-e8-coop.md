@@ -143,8 +143,8 @@ at B=1024 was raw-bit exact:
 
 B16 is 21.3% faster than cooperative-4 on 1024x4096. B8 is 15.5% faster on
 4096x8192 and is within 1.3% of B16 there while using 125 rather than 213
-VGPRs. The product selector therefore routes B16 only for 1024x4096, B8 only
-for 4096x8192, and leaves every other shape on its prior route. Both generated
+VGPRs. The initial product selector routed B16 only for 1024x4096, B8 only
+for 4096x8192, and left every other shape on its prior route. Both generated
 code objects are `vmem_only`, use zero LDS, private scratch, or register
 spills, and are exact-gfx1151/B1024-only.
 
@@ -159,12 +159,26 @@ preserved three-process cooperative-4 baseline:
 The median gain is **+1.242%**, and all three candidate samples exceed all
 three baseline samples. Candidate spread is 0.212%. Decode remains outside
 the changed route; its emitted one-token control was not used as a prefill
-claim. This shape bundle is promoted at
+claim. This shape bundle was initially routed at
 `96be792329f8909541ebbbe0829014a7bc4404f8`.
+
+The same committed 21,349-token NIAH transfer fixture did not retain the 2K
+gain: cooperative-4 completed prefill in 105,648 ms (202.0767 tok/s), while
+the B16/B8 route completed it in 105,824 ms (201.7406 tok/s), a -0.166%
+delta. The answer remained byte-identical, recall stayed 1/1, and the run had
+zero empty, runaway, or attractor failures. Because the common-trunk claim
+did not transfer and the B16 path carries 213 VGPRs, the B16/B8 product
+selector was removed and cooperative-4 restored as the product route. The
+wide-query kernels remain experiment infrastructure only and are unreachable
+from DS4 product dispatch.
 
 Follow-up evidence is under:
 
 `/home/kaden/ds4-gfx1151-evidence/2026-08-05-ds4-prefill-e8-wide/`
 
 It contains the raw micro log, all three product logs, both Radiowave reports
-and HSACOs, and the exact candidate CLI/daemon binaries.
+and HSACOs, the exact candidate CLI/daemon binaries, and the preserved 21K
+transfer under `model-transfer-21k/`. The rejected `--max-seq 1048576`
+startup attempt is preserved separately under
+`model-transfer-21k/failed-maxseq-1m/`; it exposed the independent current
+control-plane maximum of 524,288 and did not execute the model.
