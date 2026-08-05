@@ -11,7 +11,6 @@ description = "DeepSeek V4 Flash architecture for hipfire (Hyper-Connections + c
 # `deepseek4_chat` example binary.
 
 [dependencies]
-half.workspace = true
 hipfire-config = { path = "../hipfire-config" }
 hipfire-runtime = { path = "../hipfire-runtime" }
 hip-bridge = { path = "../hip-bridge" }

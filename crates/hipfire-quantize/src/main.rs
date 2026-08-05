@@ -185,11 +185,6 @@ struct QuantizeArgs {
     /// Ingest only tensors whose names start with this prefix.
     #[arg(long, value_name = "PREFIX")]
     include_prefix: Option<String>,
-
-    /// Skip tensors whose names start with this prefix (inverse of
-    /// --include-prefix; both may be given, and exclude wins on overlap).
-    #[arg(long, value_name = "PREFIX")]
-    exclude_prefix: Option<String>,
 }
 
 /// Refuse an `--arch-id` override that strips a qwen3* model (auto-detected
@@ -2556,103 +2551,6 @@ fn dequant_hfp4g32_row(packed: &[u8], k: usize) -> Vec<f32> {
         }
     }
     out
-}
-
-/// Name-level ingest gate shared by `--include-prefix` / `--exclude-prefix`.
-///
-/// `include` is a whitelist (when set, ONLY matching tensors are ingested);
-/// `exclude` is a blacklist applied after it. Exclusion wins on a tie, so
-/// passing both is well-defined rather than order-dependent.
-///
-/// This is the gate that lets the 0731 trunk and its 3-stage DSpark chain be
-/// quantized in two passes with DIFFERENT recipes: the trunk pass excludes
-/// `mtp.`, the sidecar pass includes it under `deepseek4-mtp-precise`. The
-/// format-level MTP skip cannot express that, because every `deepseek4-*`
-/// format sets `use_deepseek4_source_precision` and so ingests `mtp.`.
-fn passes_prefix_filter(name: &str, include: Option<&str>, exclude: Option<&str>) -> bool {
-    if let Some(p) = include {
-        if !name.starts_with(p) {
-            return false;
-        }
-    }
-    if let Some(p) = exclude {
-        if name.starts_with(p) {
-            return false;
-        }
-    }
-    true
-}
-
-#[cfg(test)]
-mod prefix_filter_tests {
-    use super::*;
-
-    #[test]
-    fn no_filters_passes_everything() {
-        assert!(passes_prefix_filter("model.layers.0.wq.weight", None, None));
-        assert!(passes_prefix_filter("mtp.0.attn_norm.weight", None, None));
-    }
-
-    #[test]
-    fn include_is_a_whitelist() {
-        assert!(passes_prefix_filter(
-            "mtp.0.attn_norm.weight",
-            Some("mtp."),
-            None
-        ));
-        assert!(passes_prefix_filter(
-            "mtp.2.hc_head.weight",
-            Some("mtp."),
-            None
-        ));
-        assert!(!passes_prefix_filter(
-            "model.layers.0.wq.weight",
-            Some("mtp."),
-            None
-        ));
-    }
-
-    /// The trunk pass: everything EXCEPT the DSpark chain.
-    #[test]
-    fn exclude_is_a_blacklist() {
-        assert!(!passes_prefix_filter(
-            "mtp.0.attn_norm.weight",
-            None,
-            Some("mtp.")
-        ));
-        assert!(!passes_prefix_filter(
-            "mtp.2.confidence_head.weight",
-            None,
-            Some("mtp.")
-        ));
-        assert!(passes_prefix_filter(
-            "model.layers.0.wq.weight",
-            None,
-            Some("mtp.")
-        ));
-        assert!(passes_prefix_filter(
-            "model.embed_tokens.weight",
-            None,
-            Some("mtp.")
-        ));
-    }
-
-    /// `mtp.` must not swallow a hypothetical sibling that merely shares a
-    /// stem — the filter is a prefix match, so `mtpx.` is unaffected.
-    #[test]
-    fn prefix_match_is_literal_not_fuzzy() {
-        assert!(passes_prefix_filter("mtpx.0.weight", None, Some("mtp.")));
-        assert!(!passes_prefix_filter("mtpx.0.weight", Some("mtp."), None));
-    }
-
-    #[test]
-    fn exclude_wins_when_both_match() {
-        assert!(!passes_prefix_filter(
-            "mtp.0.w.weight",
-            Some("mtp."),
-            Some("mtp.0.")
-        ));
-    }
 }
 
 #[cfg(test)]
@@ -6850,7 +6748,9 @@ fn build_deepseek4_dspark_e8soa_sidecar(input: &Path, output: &Path) -> Result<(
         if !convertible {
             if is_dense_target(name) {
                 n_skip += 1;
-                eprintln!("  passthrough (not convertible): {name} qt={qt} shape={shape:?}");
+                eprintln!(
+                    "  passthrough (not convertible): {name} qt={qt} shape={shape:?}"
+                );
             }
             tensors.push(HfqTensor {
                 name: name.clone(),
@@ -7377,7 +7277,6 @@ fn main() {
         || format == "deepseek4-source-precision"
         || format == "deepseek4-source"
         || format == "deepseek4-mtp-precise"
-        || format == "deepseek4-dense-precise"
         || format == "deepseek4-mq4lloyd"
         || format == "deepseek4-mq3lloyd";
     // deepseek4-mq4lloyd / deepseek4-mq3lloyd: identical recipe to deepseek4-q8
@@ -7396,19 +7295,6 @@ fn main() {
     // not 8-bit. Routed experts stay MQ2-Lloyd (no precision-upgrade option
     // available without a new MoE GEMV kernel).
     let use_mtp_precise = format == "deepseek4-mtp-precise";
-    // deepseek4-dense-precise: the TRUNK analogue of deepseek4-mtp-precise.
-    // Every non-expert 2D trunk weight (attention projections, shared experts,
-    // embed, lm_head, router gates) stays F16 instead of Q8F16; routed experts
-    // remain MQ2-Lloyd, so the MoE GEMV kernel contract is unchanged.
-    //
-    // Purpose is measurement, not shipping. A clean quant-error KLD needs a
-    // higher-precision reference of the SAME checkpoint, and for a 284B model no
-    // full-precision oracle fits on a 128 GB box (experts alone are 77.9 GB at
-    // MQ2 and ~112.6 GB at MQ3). But the dense classes are only ~8.2 GB of the
-    // 86 GB file, so upgrading JUST those costs ~7 GB (~93 GB total) and still
-    // loads. KLD(dense-F16 ‖ dense-Q8) then isolates exactly what the dense
-    // quantisation costs, with the expert quantisation held fixed.
-    let use_dense_precise = format == "deepseek4-dense-precise";
     let use_mq4g256 = format == "mq4" || format == "mq4g256" || format == "magnum";
     let use_hfq4g256 = format == "hfq4g256" || format == "hfq4" || format == "hf4";
     let use_hfq3g256 = format == "hfq3g256";
@@ -8634,15 +8520,6 @@ fn main() {
             "  [filter] --include-prefix {p:?} — only tensors with this prefix will be ingested"
         );
     }
-    // --exclude-prefix <prefix>: inverse of --include-prefix. Tensors whose
-    // name starts with this prefix are skipped even when the format would
-    // otherwise ingest them. Needed to build a trunk-only HFQ whose MTP
-    // surface is quantized separately at a different precision — see
-    // `passes_prefix_filter`.
-    let exclude_prefix = args.exclude_prefix.as_deref();
-    if let Some(p) = exclude_prefix {
-        eprintln!("  [filter] --exclude-prefix {p:?} — tensors with this prefix will be skipped");
-    }
     let mut skipped_params = 0u64;
     // MiniMax AWQ: shared-per-layer expert scales, cached + sidecars emitted once.
     let mut mm_awq_cache: std::collections::HashMap<usize, Option<(Vec<f32>, Vec<f32>)>> =
@@ -8653,13 +8530,14 @@ fn main() {
     let name_to_file: std::collections::HashMap<&str, usize> =
         all_tensors.iter().map(|(n, fi)| (*n, *fi)).collect();
     for (name, file_idx) in &all_tensors {
-        // --include-prefix / --exclude-prefix filter (highest priority — runs
-        // before the mtp/vision skips).
-        if !passes_prefix_filter(name, include_prefix.as_deref(), exclude_prefix.as_deref()) {
-            let (meta, _) = st_files[*file_idx].tensor_data(name).unwrap();
-            let n: usize = meta.shape.iter().product();
-            skipped_params += n as u64;
-            continue;
+        // --include-prefix filter (highest priority — runs before mtp/vision skips).
+        if let Some(p) = include_prefix {
+            if !name.starts_with(p) {
+                let (meta, _) = st_files[*file_idx].tensor_data(name).unwrap();
+                let n: usize = meta.shape.iter().product();
+                skipped_params += n as u64;
+                continue;
+            }
         }
         // Skip MTP head; optionally include vision encoder for VL inference.
         // Qwen3.5-VL names vision tensors `model.visual.*` / `visual.*`;
@@ -10432,16 +10310,7 @@ fn main() {
             && name.starts_with("mtp.")
             && !name.contains(".ffn.experts.")
             && should_quantize(name);
-        // deepseek4-dense-precise: same rule, applied to the TRUNK instead of the
-        // MTP block. Routed experts stay MQ2-Lloyd (kernel contract), so this
-        // isolates the dense-class quantisation error for KLD.
-        let keep_f16_dense = use_dense_precise
-            && !name.starts_with("mtp.")
-            && !name.contains(".ffn.experts.")
-            && should_quantize(name);
-        if (use_deepseek4_source_precision && is_deepseek4_keep_f16(name)
-            || keep_f16_mtp
-            || keep_f16_dense)
+        if (use_deepseek4_source_precision && is_deepseek4_keep_f16(name) || keep_f16_mtp)
             && n_elements >= 32
         {
             let shape: Vec<u32> = meta.shape.iter().map(|&s| s as u32).collect();

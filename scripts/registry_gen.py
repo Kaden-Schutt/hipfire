@@ -189,9 +189,7 @@ def arch_id_for(tag: str, entry: dict) -> int | None:
         return 6  # Nex-N2-mini = Qwen3.5-35B-A3B MoE (a3b not in tag name)
     if family == "qwen3":
         return 1
-    # Dated checkpoints (…-0731) are the same architecture, so match the prefix
-    # rather than adding a new arm per release.
-    if family == "deepseek-v4-flash" or family.startswith("deepseek-v4-flash-"):
+    if family in ("deepseek-v4-flash", "deepseek-v4-flash-preview"):
         return 9
     if family == "minimax" or family.startswith("minimax-"):
         return 10

@@ -186,20 +186,6 @@ pub struct ModelEntry {
     pub mtp: Option<Sidecar>,
     #[serde(default)]
     pub dspark: Option<Sidecar>,
-    /// Expert-prediction adapter for speculative expert paging (ds4).
-    ///
-    /// Listing one makes it fetchable alongside the model; it does NOT enable
-    /// it. The runtime loads an adapter only when
-    /// `HIPFIRE_DEEPSEEK4_EXPERT_ADAPTER` points at a file, so the default
-    /// stays off however the registry is populated.
-    ///
-    /// Deliberately opt-in: as measured this is a REGRESSION (best 0.93x at a
-    /// 8 GiB cache, 0.89x at 4 GiB, 0.86x at 32 GiB) because speculation more
-    /// than doubles bytes read — 83.1 GiB to 174.4 GiB on the same workload.
-    /// It is published for reproduction, not as a win. The lever that does
-    /// work for paged ds4 is `HIPFIRE_DEEPSEEK4_EXPERT_CACHE_GB=auto` (+28.8%).
-    #[serde(default)]
-    pub expert_adapter: Option<Sidecar>,
     #[serde(default)]
     pub default_tool_format: Option<String>,
     #[serde(default)]
