@@ -13511,6 +13511,76 @@ impl Gpu {
         result
     }
 
+    /// Sixteen-wave cooperative E8-SoA WMMA candidate for gfx1151 prefill.
+    ///
+    /// Each wave retains the B4 arithmetic schedule while the workgroup
+    /// decodes a 16-row x 128-K weight slab once for the exact B=1024 tile.
+    pub fn gemm_mfp4g32_e8_soa_wmma_coop16(
+        &mut self,
+        weight: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        debug_assert!(
+            self.arch_caps.is_gfx1151(),
+            "dense E8-SoA cooperative WMMA is gfx1151-only"
+        );
+        assert!(
+            k % 256 == 0,
+            "dense E8-SoA cooperative WMMA requires K%256==0"
+        );
+        const KERNEL: &str = "gemm_mfp4g32_e8_soa_wmma_coop16_gfx1151";
+        self.ensure_kernel(
+            KERNEL,
+            kernels::GEMM_MFP4G32_E8_SOA_WMMA_COOP16_GFX1151_SRC,
+            KERNEL,
+        )?;
+        let x_f16 = self.ensure_fp16_x(x, batch_size * k)?;
+        let ap = weight.buf.as_ptr();
+        let xp = x_f16;
+        let yp = y.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let b_val = batch_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &ap as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+            &b_val as *const _ as *mut c_void,
+        ];
+        let row_tiles = m.div_ceil(16) as u32;
+        let batch_tiles = batch_size.div_ceil(1024) as u32;
+        let bytes = weight.byte_size() + batch_size * (k * 2 + m * 4);
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", KERNEL, bytes);
+        let result = self.launch_maybe_blob(
+            KERNEL,
+            [row_tiles, batch_tiles, 1],
+            [512, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut blob = hip_bridge::KernargBlob::new();
+                blob.push_ptr(ap);
+                blob.push_ptr(xp);
+                blob.push_ptr(yp);
+                blob.push_i32(m_val);
+                blob.push_i32(k_val);
+                blob.push_i32(b_val);
+                blob
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
     /// Grouped block-diagonal E8-SoA WMMA GEMM for gfx1151 prefill.
     ///
     /// A is `[groups, m, k]`, X is `[batch, groups, k]`, and Y is
