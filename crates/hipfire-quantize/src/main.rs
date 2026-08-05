@@ -5143,7 +5143,16 @@ fn fixed_tier_dtype_for(name: &str) -> Option<&'static str> {
     let class = q8_class_of(name)?;
     let spec = std::env::var("HIPFIRE_FIXED_TIER").ok()?;
     for entry in spec.split(',') {
-        let (c, d) = entry.split_once(':')?;
+        // NOT `?` — a `?` here aborts the whole lookup on the FIRST malformed
+        // entry and silently returns None, i.e. every class quietly falls back
+        // to Q8 and the encode looks like it worked. Fail loudly instead.
+        let Some((c, d)) = entry.split_once(':') else {
+            eprintln!(
+                "error: HIPFIRE_FIXED_TIER: malformed entry '{entry}' \
+                 (expected <class>:<dtype>, e.g. attn:mfp4e8soa)"
+            );
+            std::process::exit(2);
+        };
         if c.trim() == class {
             return match d.trim() {
                 "mfp4e8soa" => Some("mfp4e8soa"),
@@ -9521,6 +9530,10 @@ fn main() {
                 && !expert_mq3lloyd_native
                 && !expert_mq2lloyd_native
                 && !expert_mq2lloyd_roundtrip
+                // GL twin of the line above. Without it, `--format mq4-mq2glexp
+                // --awq --imatrix` takes the AWQ arm and the GL codec never runs,
+                // so the probe silently measures AWQ-MQ4 instead of GL.
+                && !expert_mq2gl_roundtrip
                 && !expert_mq6
                 && !expert_hfq6
                 && !expert_hfq4;

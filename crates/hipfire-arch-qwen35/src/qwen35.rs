@@ -15069,12 +15069,31 @@ fn moe_combine_next_rms_enabled(gpu: &Gpu, weights: &Qwen35Weights, config: &Qwe
 
     let mq4 =
         |w: &WeightTensor| w.gpu_dtype == DType::MQ4G256 && w.k == 2_048 && w.awq_scale.is_none();
+    // MUST stay in lockstep with `routed_down_self_combines` in
+    // hipfire-dispatch/src/pipeline/mod.rs — this asks the same question ("does
+    // this layer's down GEMV write `down_expanded`?") and is the admission gate
+    // for `defer_routed_combine`. Every dtype whose down GEMV self-combines via
+    // atomicAdd into x_residual writes NO expanded buffer and must return false
+    // here. That is the whole codebook family: MQ2/MQ3-Lloyd AND their
+    // global-codebook siblings MQ2/MQ3-GL.
+    //
+    // Getting this wrong is SILENT. A GL layer that wrongly claims an expanded
+    // buffer lets the next layer fold stale `down_expanded` contents into the
+    // residual a second time, scaled by the wrong topk_weights — no error, no
+    // crash. Uniform-GL models are masked by the `gpu.zeros` memset on
+    // `s.moe_down_expanded` (folding 0.0 is a no-op), but a per-layer TIER_MAP
+    // mixing MQ4 and MQ2GL/MQ3GL layers is NOT masked and double-counts on every
+    // GL -> next-layer transition. This is the third copy of this invariant in
+    // the tree and the second to drift; if a fourth appears, hoist it onto DType.
     let has_expanded_down = |ffn: &MoeFfnWeights| {
         ffn.expert_dtype_tags.is_some()
             || ffn.experts.first().is_some_and(|expert| {
                 !matches!(
                     expert.down.gpu_dtype,
-                    DType::MQ2G256Lloyd | DType::MQ3G256Lloyd
+                    DType::MQ2G256Lloyd
+                        | DType::MQ3G256Lloyd
+                        | DType::MQ2G256GL
+                        | DType::MQ3G256GL
                 )
             })
     };
