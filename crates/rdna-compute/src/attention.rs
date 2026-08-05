@@ -9490,78 +9490,7 @@ impl Gpu {
         n_max: i32,
         batch_size: i32,
     ) -> HipResult<()> {
-        self.indexer_relu_score_wmma_batched_f32_grid(
-            q,
-            k_cache,
-            weights,
-            n_per_batch,
-            scores,
-            n_idx_heads,
-            idx_head_dim,
-            n_max,
-            n_max,
-            batch_size,
-        )
-    }
-
-    /// gfx1151 non-capture prefill route: retain `n_stride` for score-row
-    /// addressing but launch only the live `n_iter` history. The downstream
-    /// bounded top-K consumes exactly `[0, n_iter)`, so the untouched capacity
-    /// tail is deliberately outside the route contract.
-    pub fn indexer_relu_score_wmma_batched_bounded_gfx1151(
-        &mut self,
-        q: &GpuTensor,           // [B, H, D]
-        k_cache: &GpuTensor,     // [n_stride, D] shared
-        weights: &GpuTensor,     // [B, H]
-        n_per_batch: &GpuTensor, // [B] i32
-        scores: &GpuTensor,      // [B, n_stride] output
-        n_idx_heads: i32,
-        idx_head_dim: i32,
-        n_stride: i32,
-        n_iter: i32,
-        batch_size: i32,
-    ) -> HipResult<()> {
-        assert!(
-            self.arch.eq_ignore_ascii_case("gfx1151"),
-            "bounded indexer score is gfx1151-only (got {})",
-            self.arch
-        );
-        assert!(
-            (0..=n_stride).contains(&n_iter),
-            "bounded indexer score requires 0 <= n_iter <= n_stride ({n_iter} vs {n_stride})"
-        );
-        self.indexer_relu_score_wmma_batched_f32_grid(
-            q,
-            k_cache,
-            weights,
-            n_per_batch,
-            scores,
-            n_idx_heads,
-            idx_head_dim,
-            n_stride,
-            n_iter,
-            batch_size,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn indexer_relu_score_wmma_batched_f32_grid(
-        &mut self,
-        q: &GpuTensor,
-        k_cache: &GpuTensor,
-        weights: &GpuTensor,
-        n_per_batch: &GpuTensor,
-        scores: &GpuTensor,
-        n_idx_heads: i32,
-        idx_head_dim: i32,
-        n_stride: i32,
-        n_iter: i32,
-        batch_size: i32,
-    ) -> HipResult<()> {
         self.bind_thread()?;
-        if n_iter == 0 {
-            return Ok(());
-        }
         assert_eq!(
             n_idx_heads, 64,
             "indexer_relu_score_wmma: requires H=64 (got {n_idx_heads})"
@@ -9582,10 +9511,7 @@ impl Gpu {
         let sp = scores.buf.as_ptr();
         let mut h = n_idx_heads;
         let mut d = idx_head_dim;
-        // The kernel's N_max kernarg remains the physical row stride. Only
-        // the grid is bounded by the live history so its existing address
-        // arithmetic and WMMA accumulation are unchanged.
-        let mut nc = n_stride;
+        let mut nc = n_max;
         let mut bs = batch_size;
         let mut params: Vec<*mut c_void> = vec![
             &qp as *const _ as *mut c_void,
@@ -9598,7 +9524,7 @@ impl Gpu {
             &mut nc as *mut _ as *mut c_void,
             &mut bs as *mut _ as *mut c_void,
         ];
-        let grid_n = (n_iter as u32 + 15) / 16;
+        let grid_n = (n_max as u32 + 15) / 16;
         self.launch_maybe_blob(
             "indexer_relu_score_wmma_batched_f32",
             [batch_size as u32, grid_n, 1],
