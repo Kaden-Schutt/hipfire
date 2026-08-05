@@ -6738,12 +6738,21 @@ fn main() {
                             12 => "north_mini_code",
                             _ => "qwen3",
                         };
-                        let redline_default =
-                            hipfire_runtime::config::mq4r_redline_default(&gpu.arch, path, pp, tp);
+                        let drafter = m.speculator.as_ref().map(|speculator| speculator.name());
+                        let redline_default = hipfire_runtime::config::retained_redline_default(
+                            &gpu.arch,
+                            arch,
+                            path,
+                            pp,
+                            tp,
+                            drafter.is_some(),
+                        );
                         if gpu.replay.configure_model_default(redline_default) && redline_default {
                             eprintln!(
-                                "[redline] enabling fail-closed MQ4R default on {} (transport={})",
+                                "[redline] enabling fail-closed retained default on {} \
+                                 (model_arch={arch}, drafter={}, transport={})",
                                 gpu.arch,
+                                drafter.unwrap_or("off"),
                                 gpu.replay.transport_name()
                             );
                         }
