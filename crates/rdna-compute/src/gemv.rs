@@ -8375,8 +8375,7 @@ impl Gpu {
         ];
         // Fused path skips the expanded [N×K_TOP×M] write + re-read; traffic
         // is the routed-expert weight reads plus the per-token residual write.
-        let bytes =
-            batch_size * k_top * crate::profile::gemv_hfq4g256_bytes(m, k) + batch_size * m * 4;
+        let bytes = batch_size * k_top * crate::profile::gemv_hfq4g256_bytes(m, k) + batch_size * m * 4;
         let timer = crate::profile::begin_timer(
             &self.hip,
             "gemv",
