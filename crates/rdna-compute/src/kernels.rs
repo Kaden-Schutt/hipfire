@@ -5113,21 +5113,6 @@ pub const GEMV_MQ3G256_LLOYD_MOE_GATE_UP_INDEXED_SRC: &str =
 pub const GEMV_MQ3G256_LLOYD_MOE_DOWN_INDEXED_SRC: &str =
     include_str!("../../../kernels/src/gemv_mq3g256_lloyd_moe_down_indexed.hip");
 
-/// HFP4G32 MoE indexed GEMVs — E2M1 nibbles + UE8M0 per-32 block scale.
-///
-/// Unlike the MQ-family siblings above, X must NOT be FWHT-rotated: HFP4G32
-/// carries no baked rotation (format_flags bit 0 clear), so these read the
-/// PLAIN activation vector. Passing a rotated x is silently wrong.
-///
-/// These exist to serve DeepSeek V4's native FP4 experts without
-/// requantization (`--format deepseek4-fp4` repacks them bit-exactly into
-/// HFP4G32).
-pub const GEMV_HFP4G32_MOE_GATE_UP_INDEXED_SRC: &str =
-    include_str!("../../../kernels/src/gemv_hfp4g32_moe_gate_up_indexed.hip");
-
-pub const GEMV_HFP4G32_MOE_DOWN_INDEXED_SRC: &str =
-    include_str!("../../../kernels/src/gemv_hfp4g32_moe_down_indexed.hip");
-
 /// Strict superset of fused_rmsnorm_mq_rotate that ALSO writes the
 /// plain (non-FWHT) RMSNormed output to a second buffer. Eliminates the
 /// follow-up rmsnorm_f32 / rmsnorm_batched launch in call sites that
