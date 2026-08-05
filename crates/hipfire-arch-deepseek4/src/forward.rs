@@ -1308,6 +1308,23 @@ fn e8_batched_gemv_applies(arch: &str, batch_size: usize, k: usize) -> bool {
         && Gpu::E8_BATCHED_GEMV_BATCHES.contains(&batch_size)
 }
 
+/// Admit the cooperative E8 producer/consumer kernel only for the exact
+/// gfx1151 DS4 prefill shapes that cleared the bit-exact micro gate.
+///
+/// The kernel makes four waves share one decoded 16x128 weight slab. That
+/// pays on the wide/down projections below at the production 1,024-token
+/// chunk, but not on the 1,024x4,096 attention projection. Keep tails and
+/// every unmeasured shape on the established B4 kernel.
+#[inline]
+fn e8_prefill_coop4_applies(arch: &str, m: usize, k: usize, batch_size: usize) -> bool {
+    arch == "gfx1151"
+        && batch_size == 1024
+        && matches!(
+            (m, k),
+            (32768, 1024) | (4096, 8192) | (2048, 4096) | (4096, 2048)
+        )
+}
+
 /// F16×F16→F32 batched GEMM, arch-routed.
 ///
 /// `gemm_f16_x_f16_wmma` is built on the wave32 RDNA3 WMMA builtin and will
@@ -1350,6 +1367,12 @@ fn gemv_auto_batched_wmma(
         DType::MFP4G32E8SOA if e8_batched_gemv_applies(&gpu.arch, batch_size, k) => gpu
             .gemv_mfp4g32_e8_soa_batched_gfx1151(weight, x_rotated_batch, y, batch_size, m, k)
             .map_err(|e| format!("gemv MFP4-E8-SoA batched B{batch_size}: {e:?}")),
+        DType::MFP4G32E8SOA
+            if e8_tiles == 4 && e8_prefill_coop4_applies(&gpu.arch, m, k, batch_size) =>
+        {
+            gpu.gemm_mfp4g32_e8_soa_wmma_coop4(weight, x_rotated_batch, y, m, k, batch_size)
+                .map_err(|e| format!("gemm MFP4-E8-SoA WMMA cooperative B4: {e:?}"))
+        }
         DType::MFP4G32E8SOA if e8_tiles == 4 => gpu
             .gemm_mfp4g32_e8_soa_wmma_b4(weight, x_rotated_batch, y, m, k, batch_size)
             .map_err(|e| format!("gemm MFP4-E8-SoA WMMA B4: {e:?}")),
