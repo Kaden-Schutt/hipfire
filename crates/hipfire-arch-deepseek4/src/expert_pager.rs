@@ -275,30 +275,50 @@ impl ExpertCatalog {
         F: Fn(&str) -> Option<(usize, usize)>,
     {
         let mut cat = ExpertCatalog::empty();
-        let mut part_stride: Option<usize> = None;
+        // One stride PER POOL, not one globally. Slot addressing needs every
+        // tensor in a given pool to be the same size; it does not need the
+        // gate_up pool and the down pool to agree with each other. They do
+        // agree under MQ2/MQ3-Lloyd, which is why a single stride held until
+        // now — but HFP4G32 pays a 16-byte header PER ROW, and w2 has twice
+        // the rows of w1/w3 for the same payload (logical [4096,2048] vs
+        // [2048,4096]). That is a legitimate 32 KiB difference, not corruption,
+        // and rejecting it kept native-FP4 experts from loading at all.
+        let mut gate_up_stride: Option<usize> = None;
+        let mut down_stride: Option<usize> = None;
+        fn check(
+            stride: &mut Option<usize>,
+            name: String,
+            seg: &ExpertSegment,
+        ) -> Result<(), PagerError> {
+            match *stride {
+                None => {
+                    *stride = Some(seg.len);
+                    Ok(())
+                }
+                Some(want) if want != seg.len => Err(PagerError::StrideMismatch {
+                    name,
+                    got: seg.len,
+                    want,
+                }),
+                Some(_) => Ok(()),
+            }
+        }
         for (layer_id, prefix) in layers {
             for slot in 0..n_experts {
                 let orig = src(slot);
-                let mut fetch = |part: &str| -> Result<ExpertSegment, PagerError> {
+                let fetch = |part: &str| -> Result<(String, ExpertSegment), PagerError> {
                     let name = format!("{prefix}.ffn.experts.{orig}.{part}.weight");
                     let (offset, len) = lookup(&name)
                         .ok_or_else(|| PagerError::MissingTensor { name: name.clone() })?;
-                    match part_stride {
-                        None => part_stride = Some(len),
-                        Some(want) if want != len => {
-                            return Err(PagerError::StrideMismatch {
-                                name,
-                                got: len,
-                                want,
-                            })
-                        }
-                        Some(_) => {}
-                    }
-                    Ok(ExpertSegment { offset, len })
+                    Ok((name, ExpertSegment { offset, len }))
                 };
-                let w1 = fetch("w1")?;
-                let w3 = fetch("w3")?;
-                let w2 = fetch("w2")?;
+                let (n1, w1) = fetch("w1")?;
+                let (n3, w3) = fetch("w3")?;
+                let (n2, w2) = fetch("w2")?;
+                // w1 and w3 share a slot, so they must match each other exactly.
+                check(&mut gate_up_stride, n1, &w1)?;
+                check(&mut gate_up_stride, n3, &w3)?;
+                check(&mut down_stride, n2, &w2)?;
                 cat.ranges.insert(
                     ExpertKey {
                         layer: *layer_id,
@@ -317,8 +337,10 @@ impl ExpertCatalog {
                 );
             }
         }
-        if let Some(s) = part_stride {
+        if let Some(s) = gate_up_stride {
             cat.gate_up_slot_len = Some(2 * s);
+        }
+        if let Some(s) = down_stride {
             cat.down_slot_len = Some(s);
         }
         Ok(cat)
@@ -1772,6 +1794,63 @@ mod tests {
         assert!(
             msg.contains("experts.2.w3.weight"),
             "error must name the missing tensor, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn gate_up_and_down_pools_may_have_different_strides() {
+        // HFP4G32 pays a 16-byte header per ROW, and w2 is [4096,2048] against
+        // w1/w3's [2048,4096] — same payload, twice the rows, so w2 is 32 KiB
+        // larger. Slot addressing is per pool, so this is legal and must load.
+        // A single shared stride rejected it and kept native-FP4 experts from
+        // loading at all.
+        let gu_stride = 4_489_216usize; // 2048 rows * (16 + 128*17)
+        let down_stride = 4_521_984usize; // 4096 rows * (16 +  64*17)
+        assert_ne!(gu_stride, down_stride, "the whole point of this test");
+
+        let mut idx = Vec::new();
+        let mut off = 4096usize;
+        for e in 0..3 {
+            for part in ["w1", "w3", "w2"] {
+                let len = if part == "w2" { down_stride } else { gu_stride };
+                idx.push((format!("layers.0.ffn.experts.{e}.{part}.weight"), (off, len)));
+                off += len;
+            }
+        }
+
+        let cat =
+            ExpertCatalog::build_from(&[(0u16, "layers.0".into())], 3, |s| s, lookup_from(&idx))
+                .expect("differing pool strides must build");
+        assert_eq!(
+            cat.slot_len(ExpertBlobRole::GateUp),
+            Some(2 * gu_stride),
+            "gate_up slot is w1 ‖ w3, sized from the gate_up stride alone"
+        );
+        assert_eq!(
+            cat.slot_len(ExpertBlobRole::Down),
+            Some(down_stride),
+            "down slot must take w2's own stride, not w1's"
+        );
+    }
+
+    #[test]
+    fn build_errors_when_gate_up_parts_disagree_with_each_other() {
+        // Relaxing the cross-pool constraint must NOT relax the within-pool one:
+        // w1 and w3 share a single slot, so a mismatch between them still makes
+        // `slot_index * stride` wrong and must fail closed.
+        let stride = 2_359_296usize;
+        let mut idx = fake_index(&["layers.0"], 3, stride);
+        for (n, r) in idx.iter_mut() {
+            if n == "layers.0.ffn.experts.2.w3.weight" {
+                r.1 = stride - 128;
+            }
+        }
+        let err =
+            ExpertCatalog::build_from(&[(0u16, "layers.0".into())], 3, |s| s, lookup_from(&idx))
+                .expect_err("must fail closed");
+        assert!(
+            err.to_string().contains("stride"),
+            "error must explain the stride mismatch, got: {err}"
         );
     }
 
