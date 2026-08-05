@@ -7842,10 +7842,12 @@ fn main() {
             }
 
             "bench_prefill" => {
-                // Synthetic prefill benchmark — measures forward_prefill_batch on N
-                // deterministic tokens from a zeroed state. Used by `hipfire bench`
-                // to produce canonical pp128/pp512/pp1024 numbers that don't depend
-                // on the user's prompt tokenizing to a round number.
+                // Synthetic prefill benchmark — measures the architecture's
+                // production prefill entry on N deterministic tokens from a
+                // zeroed state. Used by `hipfire bench` to produce canonical
+                // pp128/pp512/pp1024 numbers that don't depend on a prompt
+                // tokenizing to a round number. This stays a synthetic workload;
+                // only the forward path must match production.
                 let m = match model.as_mut() {
                     Some(m) => m,
                     None => {
@@ -7918,6 +7920,11 @@ fn main() {
                 if let Some(b) = m.cohere2moe_mut() {
                     let _ = b.state.reset(&mut gpu);
                 }
+                if let Some(ModelState::Deepseek4(b)) = m.state.as_mut() {
+                    b.state.reset();
+                    b.state.zero_decode_caches(&mut gpu);
+                    gpu.invalidate_graph_state();
+                }
 
                 // Flush any residual GPU work so it doesn't bleed into the
                 // measured interval, then time forward_prefill_batch + a
@@ -7958,26 +7965,27 @@ fn main() {
                     }
                     ok
                 } else if m.arch_id == 9 {
-                    // DeepSeek V4 warm-pass: per-token decode_step. Saturates
-                    // the kernel cache (HC, indexer, compressor,
-                    // attention, MoE) on a short synthetic prompt
-                    // before any user-facing generate. Not the
-                    // production prefill path (that's
-                    // forward_prefill_batch_chunked in `generate`).
-                    let b = m.deepseek4_mut().unwrap();
+                    // DeepSeek V4: exercise the same chunked batched prefill
+                    // entry as `generate_deepseek4`, while retaining the
+                    // deterministic synthetic-token contract of bench_prefill.
+                    // Borrow the PBS and model state as disjoint LoadedModel
+                    // fields, matching the production generate path.
+                    let pbs = m
+                        .deepseek4_pbs
+                        .as_mut()
+                        .expect("deepseek4_pbs missing on arch_id=9 bench_prefill");
+                    let Some(ModelState::Deepseek4(b)) = m.state.as_mut() else {
+                        unreachable!("arch_id=9 requires deepseek4 bundle")
+                    };
                     let config = &b.config;
                     let weights = &b.weights;
                     let state = &mut b.state;
-                    let mut ok = true;
-                    for (i, &tok) in synthetic.iter().enumerate() {
-                        if deepseek4::forward::decode_step(
-                            config, weights, state, &mut gpu, tok, i as u32,
-                        )
-                        .is_err()
-                        {
-                            ok = false;
-                            break;
-                        }
+                    let ok = deepseek4::forward::forward_prefill_batch_chunked(
+                        config, weights, state, &mut gpu, &synthetic, 0, pbs,
+                    )
+                    .is_ok();
+                    if ok {
+                        state.n_tokens = n as u64;
                     }
                     ok
                 } else if m.arch_id == 11 {
@@ -8127,6 +8135,11 @@ fn main() {
                 // reset its cursor (no gpu) for a cold prefill on the next request.
                 if let Some(b) = m.minimax_mut() {
                     b.state.reset();
+                }
+                if let Some(ModelState::Deepseek4(b)) = m.state.as_mut() {
+                    b.state.reset();
+                    b.state.zero_decode_caches(&mut gpu);
+                    gpu.invalidate_graph_state();
                 }
 
                 if run_ok {
