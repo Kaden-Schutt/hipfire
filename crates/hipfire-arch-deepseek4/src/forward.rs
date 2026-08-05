@@ -3116,7 +3116,7 @@ fn indexer_forward(
         weights.mq2r_backend.is_gfx942(),
     ) || config_cache::gfx1151_indexer_topk_two_stage_on(
         &gpu.arch, cfg.mq2r,
-    )) && max_compressed >= config_cache::indexer_topk_two_stage_min();
+    )) && two_stage_topk_capacity_eligible(&gpu.arch, max_compressed);
 
     let wq_b = layer
         .indexer_wq_b
@@ -3319,6 +3319,18 @@ fn indexer_forward(
     let _ = n; // legacy host-computed; not used after migration
 
     Ok(n)
+}
+
+/// Keep gfx1151's initial 2,048-row bucket on its certified one-launch
+/// parallel top-K route. Selecting the merge tree from bucket capacity alone
+/// added three launches per ratio-4 layer even at tiny `n`, changing the
+/// short-context tape from 2,320/32 to 2,383/34 and dropping retained PM4 to
+/// linear AQL. The first automatic growth bucket (4,096 rows) is the point at
+/// which the long-context two-stage route becomes eligible; capacity growth
+/// already rearms graph/replay state before that route is captured.
+fn two_stage_topk_capacity_eligible(arch: &str, max_compressed: usize) -> bool {
+    max_compressed >= config_cache::indexer_topk_two_stage_min()
+        && (arch != "gfx1151" || max_compressed > crate::deepseek4::INITIAL_COMPRESSED_ROWS)
 }
 
 /// Single-token decode step. Takes the token id of the previous
@@ -14203,6 +14215,21 @@ mod tests {
         assert!(!config_cache::gfx942_hc_finalize_fused_on(arch, true));
         assert!(!config_cache::gfx942_indexer_topk_parallel_on(arch, true));
         assert!(!config_cache::gfx942_ffn_overlap_on(false));
+    }
+
+    #[test]
+    fn gfx1151_two_stage_starts_after_the_certified_short_bucket() {
+        assert!(!two_stage_topk_capacity_eligible(
+            "gfx1151",
+            crate::deepseek4::INITIAL_COMPRESSED_ROWS,
+        ));
+        assert!(two_stage_topk_capacity_eligible(
+            "gfx1151",
+            crate::deepseek4::INITIAL_COMPRESSED_ROWS * 2,
+        ));
+        // gfx942 keeps its independently promoted capacity threshold.
+        assert!(two_stage_topk_capacity_eligible("gfx942", 2_048));
+        assert!(!two_stage_topk_capacity_eligible("gfx942", 512));
     }
 
     #[test]
