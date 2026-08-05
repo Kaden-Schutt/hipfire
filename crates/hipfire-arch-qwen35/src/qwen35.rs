@@ -6845,6 +6845,16 @@ fn ar_graph_trace_enabled() -> bool {
     })
 }
 
+#[inline]
+fn ar_graph_eligible_for_kv(requested: bool, compact_offset: usize) -> bool {
+    // The captured single-token route is built while compact_offset is zero.
+    // After eviction, Q/K RoPE must use physical_pos + compact_offset, and the
+    // offset changes again at every later eviction. Neither hipGraph nor the
+    // retained replay route currently has a dynamic offset input, so replaying
+    // the old route silently rotates at the physical slot and corrupts decode.
+    requested && compact_offset == 0
+}
+
 /// Zero-alloc forward pass using pre-allocated scratch buffers.
 /// Logits stay on GPU in scratch.logits. Returns nothing — caller uses scratch.logits.
 pub fn forward_scratch(
@@ -6971,7 +6981,9 @@ pub fn forward_scratch(
     // right before their `forward_scratch` call so the plain-AR graph can never
     // capture or replay in a non-sequential context. An ineligible call also
     // INVALIDATES any captured graph (forces re-capture on the next plain call).
-    let graph_eligible = std::mem::replace(&mut gpu.graphs.ar_graph_eligible, true);
+    let requested_graph_eligible = std::mem::replace(&mut gpu.graphs.ar_graph_eligible, true);
+    let graph_eligible =
+        ar_graph_eligible_for_kv(requested_graph_eligible, kv_cache.compact_offset);
     // Redline's plain-AR capture/replay has the same eligibility contract as
     // the AR HipGraph. MTP/spec re-seed and verify calls must not contaminate
     // or consume the immutable single-token replay sequence.
@@ -24355,5 +24367,13 @@ mod tests {
         assert!(ep_tick_inputs_prepared(usize::MAX));
         // Saturating representative: any non-zero later band is prepared.
         assert!(ep_tick_inputs_prepared(usize::MAX.saturating_sub(1)));
+    }
+
+    #[test]
+    fn ar_graph_is_ineligible_after_kv_compaction() {
+        assert!(ar_graph_eligible_for_kv(true, 0));
+        assert!(!ar_graph_eligible_for_kv(true, 1));
+        assert!(!ar_graph_eligible_for_kv(true, 128));
+        assert!(!ar_graph_eligible_for_kv(false, 0));
     }
 }
