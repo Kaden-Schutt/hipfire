@@ -7455,24 +7455,24 @@ fn codebook_batched_admit_enabled_from_env(
     let grouped_gemm_on = !matches!(grouped_gemm_value, Some("0") | Some("off"));
     match value {
         Some("0") | Some("off") | Some("false") => false,
+        // Explicit opt-in is honored on any arch (research / bring-up), still
+        // hard-gated on Path 2 being enabled.
         Some("1") | Some("on") | Some("true") => grouped_gemm_on,
-        // Same arch list as `admit_e8`: every wave32-WMMA RDNA3/3.5 part plus
-        // RDNA4. RDNA1/2 (gfx10xx) and CDNA have no grouped-WMMA sister.
-        _ => {
-            grouped_gemm_on
-                && matches!(
-                    arch,
-                    "gfx1100"
-                        | "gfx1101"
-                        | "gfx1102"
-                        | "gfx1103"
-                        | "gfx1150"
-                        | "gfx1151"
-                        | "gfx1152"
-                        | "gfx1200"
-                        | "gfx1201"
-                )
-        }
+        // DEFAULT OFF — opt-in via HIPFIRE_MOE_CODEBOOK_BATCHED=1.
+        //
+        // Admitting the codebook pair here makes
+        // `gemm_mq2g256_lloyd_moe_grouped_wmma_gfx12` the gate_up kernel for
+        // every uniform-Lloyd a3b SKU, and promotes its MQ3 sibling from
+        // wired-but-unreachable to live. NEITHER has ever executed on
+        // hardware. Static review and a clean hipcc compile are not acceptance
+        // evidence (CLAUDE.md, "Runtime validation (mandatory)"), and the
+        // failure mode is silently-wrong prefill on exactly the SKUs this is
+        // meant to accelerate.
+        //
+        // Flip this default only after a `scripts/serve_harness.py` coherence
+        // run of the MQ2L/MQ3L pair on gfx1201 AND on a gfx11 part — the gfx11
+        // `_k2` leg is a separate translation unit and is equally unexercised.
+        _ => false,
     }
 }
 
@@ -18584,9 +18584,17 @@ mod tests {
             "gfx1100", "gfx1101", "gfx1102", "gfx1103", "gfx1150", "gfx1151", "gfx1152", "gfx1200",
             "gfx1201",
         ] {
+            // DEFAULT OFF until the grouped-WMMA codebook kernels have run on
+            // hardware — they had never executed when this landed.
             assert!(
-                codebook_batched_admit_enabled_from_env(None, None, arch),
-                "{arch} should default-admit the codebook batched prefill"
+                !codebook_batched_admit_enabled_from_env(None, None, arch),
+                "{arch} must NOT default-admit: the grouped-WMMA codebook \
+                 kernels are unvalidated (opt in with HIPFIRE_MOE_CODEBOOK_BATCHED=1)"
+            );
+            // Opt-in works on every WMMA arch.
+            assert!(
+                codebook_batched_admit_enabled_from_env(Some("1"), None, arch),
+                "{arch} should admit under an explicit opt-in"
             );
             // Path 2 disabled => never admit, whatever the codebook var says.
             assert!(!codebook_batched_admit_enabled_from_env(None, Some("0"), arch));
