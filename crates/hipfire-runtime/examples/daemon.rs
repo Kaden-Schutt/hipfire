@@ -17580,6 +17580,66 @@ fn generate_deepseek4_spec(
     }
 }
 
+/// Teacher forcing for quant-divergence work: when `HIPFIRE_DS4_FORCE_TOKENS`
+/// holds a comma-separated token id list, the generate loop commits THOSE
+/// tokens instead of its own argmax.
+///
+/// Without this a position-wise KLD is meaningless. Two quants of the same
+/// checkpoint diverge in greedy decoding almost immediately (measured: token 0
+/// on 3 of 4 prompts), after which each is conditioned on different context, so
+/// comparing position i to position i compares unrelated distributions — it
+/// yielded ~30 nats, which is "different text", not quantization error.
+/// Forcing both models along one sequence makes position i genuinely
+/// comparable.
+fn ds4_force_token(_pos: u32) -> Option<u32> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::OnceLock;
+    static FORCED: OnceLock<Vec<u32>> = OnceLock::new();
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let forced = FORCED.get_or_init(|| {
+        std::env::var("HIPFIRE_DS4_FORCE_TOKENS")
+            .ok()
+            .map(|v| {
+                v.split(',')
+                    .filter_map(|t| t.trim().parse::<u32>().ok())
+                    .collect()
+            })
+            .unwrap_or_default()
+    });
+    if forced.is_empty() {
+        return None;
+    }
+    // Keyed on a CALL COUNTER, not `pos`: the pre-loop site and the loop's first
+    // iteration share the same `pos`, so a pos-keyed lookup would hand out
+    // forced[0] twice and shift everything after it. Each site is called exactly
+    // once per committed token, so the counter tracks the emitted sequence.
+    let i = NEXT.fetch_add(1, Ordering::Relaxed);
+    forced.get(i).copied()
+}
+
+/// Append one position's full-vocab logits to `HIPFIRE_DS4_LOGIT_DUMP`, if set.
+///
+/// Format: little-endian `[u32 pos][u32 vocab][f32 * vocab]` per record, so two
+/// runs can be compared position-by-position without a manifest. Off unless the
+/// env var is set; the file is opened per call (append) because this runs at
+/// human-scale token rates and correctness matters more than syscall count.
+fn ds4_dump_logits(logits: &[f32], pos: u32) {
+    use std::io::Write;
+    let Ok(path) = std::env::var("HIPFIRE_DS4_LOGIT_DUMP") else {
+        return;
+    };
+    let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) else {
+        return;
+    };
+    let mut buf = Vec::with_capacity(8 + logits.len() * 4);
+    buf.extend_from_slice(&pos.to_le_bytes());
+    buf.extend_from_slice(&(logits.len() as u32).to_le_bytes());
+    for v in logits {
+        buf.extend_from_slice(&v.to_le_bytes());
+    }
+    let _ = f.write_all(&buf);
+}
+
 fn generate_deepseek4(
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
@@ -18051,6 +18111,13 @@ fn generate_deepseek4(
         let mut next_tok: u32 =
             deepseek4::sampling::sample_token(&first_logits, temp, top_k, top_p, &mut rng);
         let mut pos = pos_after_prefill;
+        // The FIRST generated token is sampled here, outside the decode loop.
+        // Teacher forcing has to cover it too, or the forced model commits its
+        // own opening token and then follows the reference one position late —
+        // every later context differs by that token and the comparison is void.
+        if let Some(forced) = ds4_force_token(pos) {
+            next_tok = forced;
+        }
         // Token-cache capture for the prefix-cache replay path. We
         // mirror the parser events into local accumulators so that —
         // after decode completes — we can fingerprint the just-emitted
@@ -18118,6 +18185,15 @@ fn generate_deepseek4(
                 cfg, weights, state, gpu, next_tok, pos,
             ) {
                 Ok(mut logits) => {
+                    // Full-vocab logit capture for quant-divergence work (KLD).
+                    // Taken BEFORE any grammar mask, so it is the model's own
+                    // distribution, and before sampling, so it is the true
+                    // predictive distribution at this position. ds4 has no
+                    // batched prefill — `forward_prefill_batch` is a per-token
+                    // fallback and `..._chunk` computes lm_head for the last
+                    // position only — so per-token capture here is the only
+                    // route to all-position logits for this architecture.
+                    ds4_dump_logits(&logits, pos);
                     if grammar_active && !matcher.is_free() {
                         matcher.token_mask(&decoded_vocab, &mut grammar_mask);
                         deepseek4::grammar::Matcher::apply_mask_to_logits(
@@ -18127,6 +18203,11 @@ fn generate_deepseek4(
                     }
                     next_tok =
                         deepseek4::sampling::sample_token(&logits, temp, top_k, top_p, &mut rng);
+                    // Teacher forcing overrides the argmax so both models walk
+                    // the same sequence; no-op unless the env var is set.
+                    if let Some(forced) = ds4_force_token(pos) {
+                        next_tok = forced;
+                    }
                     pos += 1;
                 }
                 Err(e) => {
