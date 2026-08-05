@@ -5066,21 +5066,92 @@ fn is_deepseek4_keep_f16(name: &str) -> bool {
 /// For mixed quant: should this tensor be Q8 (fast) or Q4 (compressed)?
 /// Q8: attention weights, embeddings, lm_head (need occupancy)
 /// Q4: FFN weights (bulk of model, benefits from compression)
-fn is_q8_tensor(name: &str) -> bool {
-    name.contains("self_attn") || name.contains("attn_q") || name.contains("attn_k")
-        || name.contains("attn_v") || name.contains("attn_output")
-        || name.contains("q_proj") || name.contains("k_proj")
-        || name.contains("v_proj") || name.contains("o_proj")
-        || name.contains("embed") || name.contains("lm_head")
+/// Which fixed-tier classes a tensor belongs to, for `HIPFIRE_Q8_CLASSES`.
+/// Ordered cheapest-to-keep first by measured per-token bytes on a3b:
+/// router+gate 11.1 MB, lm_head 270 MB, attention 682 MB (of a 1031 MB fixed
+/// tier at MQ4). Attention is 66% of the fixed tier, lm_head 26%.
+fn q8_class_of(name: &str) -> Option<&'static str> {
+    if name.contains("lm_head") {
+        Some("lm_head")
+    } else if name.contains("embed") {
+        Some("embed")
+    } else if name.ends_with("mlp.gate.weight") || name.ends_with("mlp.shared_expert_gate.weight") {
+        Some("router")
+    } else if name.contains("self_attn")
+        || name.contains("attn_q")
+        || name.contains("attn_k")
+        || name.contains("attn_v")
+        || name.contains("attn_output")
+        || name.contains("q_proj")
+        || name.contains("k_proj")
+        || name.contains("v_proj")
+        || name.contains("o_proj")
         // Qwen3.5 DeltaNet attention
         || name.contains("linear_attn")
-        // Qwen3.5-MoE: the router (`mlp.gate.weight`, hidden_size × num_experts)
-        // is small but precision-sensitive — flat-routing on a quantized router
-        // shifts which experts a token sees. Same for the per-layer scalar
-        // `mlp.shared_expert_gate.weight` that scales the shared expert. Keep
-        // both at Q8 even in Q4-bulk modes.
-        || name.ends_with("mlp.gate.weight")
-        || name.ends_with("mlp.shared_expert_gate.weight")
+    {
+        Some("attn")
+    } else {
+        None
+    }
+}
+
+/// Fixed-tier tensors held at Q8F16 regardless of `--format`.
+///
+/// `HIPFIRE_Q8_CLASSES=<comma list>` narrows this to a subset of
+/// {`lm_head`, `embed`, `router`, `attn`} — the lever for attributing which
+/// fixed class actually carries the quality. Measured 2026-08-04: dropping the
+/// WHOLE fixed tier Q8 -> MQ4 costs **+35.2% KLD** (0.1742 -> 0.2356) while
+/// buying 1.75x decode speed, so the tier is emphatically not free — but the
+/// +35% is unattributed across classes whose byte costs differ by 25x.
+/// `--no-q8-router` (all classes off) still wins if both are set.
+///
+/// Note the router (`mlp.gate.weight`) is small but precision-sensitive —
+/// flat-routing on a quantized router shifts which experts a token sees — so
+/// prefer keeping `router` in the set unless you are explicitly testing it.
+fn is_q8_tensor(name: &str) -> bool {
+    let Some(class) = q8_class_of(name) else {
+        return false;
+    };
+    // A class named in HIPFIRE_FIXED_TIER is held above --format even if it is
+    // not in HIPFIRE_Q8_CLASSES — it just lands on the named dtype instead of Q8.
+    if fixed_tier_dtype_for(name).is_some() {
+        return true;
+    }
+    match std::env::var("HIPFIRE_Q8_CLASSES") {
+        Ok(list) => list.split(',').any(|c| c.trim() == class),
+        Err(_) => true,
+    }
+}
+
+/// `HIPFIRE_FIXED_TIER=lm_head:mfp4e8soa,attn:mq4` — per-class dtype for the
+/// fixed tier. Returns the dtype token for `name`'s class, or `None` to fall
+/// back to Q8F16 (the historic behaviour).
+///
+/// Accepted dtypes: `q8`, `mq4`, `mq3l`, `mfp4e8`, `mfp4e8soa`. Accepted
+/// classes: `lm_head`, `embed`, `router`, `attn` (see `q8_class_of`).
+fn fixed_tier_dtype_for(name: &str) -> Option<&'static str> {
+    let class = q8_class_of(name)?;
+    let spec = std::env::var("HIPFIRE_FIXED_TIER").ok()?;
+    for entry in spec.split(',') {
+        let (c, d) = entry.split_once(':')?;
+        if c.trim() == class {
+            return match d.trim() {
+                "mfp4e8soa" => Some("mfp4e8soa"),
+                "mfp4e8" => Some("mfp4e8"),
+                "mq4" => Some("mq4"),
+                "mq3l" => Some("mq3l"),
+                "q8" => None, // explicit q8 == default
+                other => {
+                    eprintln!(
+                        "error: HIPFIRE_FIXED_TIER: unknown dtype '{other}' \
+                         (expected q8|mq4|mq3l|mfp4e8|mfp4e8soa)"
+                    );
+                    std::process::exit(2);
+                }
+            };
+        }
+    }
+    None
 }
 
 /// Qwen3.5 DeltaNet conv1d weight: `{prefix}.linear_attn.conv1d.weight`,
@@ -10420,10 +10491,54 @@ fn main() {
                             (q, QuantType::Q8F16, 32u32, "Q8_F16")
                         }
                     } else if q8_router && is_q8_tensor(name) {
-                        // Q8 router for MoE: keep mlp.gate.weight and
-                        // shared_expert_gate.weight at Q8 regardless of --format.
-                        let q = quantize_q8f16(&f32_data);
-                        (q, QuantType::Q8F16, 32u32, "Q8_F16")
+                        // Fixed tier (attention / lm_head / embed / router) held above
+                        // --format. Default Q8F16; `HIPFIRE_FIXED_TIER=<class>:<dtype>`
+                        // overrides per class — the bit-allocation lever.
+                        //
+                        // Why this matters: the fixed tier is 66% of per-token decode
+                        // bytes on a3b, and dropping the WHOLE tier Q8 -> MQ4 measured
+                        // +35.2% KLD (0.1742 -> 0.2356) for 1.75x speed. MFP4G32E8SOA
+                        // is the interesting middle: ~same bytes as MQ4 (4.3 vs 4.25
+                        // bpw) but E8 lattice VQ instead of scalar affine, and it is
+                        // already dispatchable for lm_head (plain GEMV, gemv_table.rs
+                        // registers it Plain + Prerotated). NOTE it is NOT a whole-tier
+                        // replacement: FusedQkvza's E8 arm is gfx1151-decode-only and
+                        // there is no E8 residual GEMV for o_proj.
+                        match fixed_tier_dtype_for(name) {
+                            Some(dt) => {
+                                // Canonical FWHT sign seeds — identical to every other
+                                // rotated encoder, so bytes match `--format <tier>`.
+                                let s1 = gen_fwht_signs(42, 256);
+                                let s2 = gen_fwht_signs(1042, 256);
+                                let m = meta.shape[0];
+                                let k = meta.shape[1];
+                                match dt {
+                                    "mfp4e8soa" => {
+                                        let q = quantize_mfp4g32_e8_soa_2d(
+                                            &f32_data, m, k, &s1, &s2,
+                                        );
+                                        (q, QuantType::MFP4G32E8SOA, 32u32, "MFP4G32E8SOA")
+                                    }
+                                    "mfp4e8" => {
+                                        let q =
+                                            quantize_mfp4g32_e8_2d(&f32_data, m, k, &s1, &s2);
+                                        (q, QuantType::MFP4G32E8, 32u32, "MFP4G32E8")
+                                    }
+                                    "mq3l" => {
+                                        let q = quantize_mq3g256_lloyd(&f32_data, &s1, &s2);
+                                        (q, QuantType::MQ3G256Lloyd, 256u32, "MQ3G256L")
+                                    }
+                                    _ => {
+                                        let q = quantize_mq4g256(&f32_data, &s1, &s2);
+                                        (q, QuantType::MQ4G256, 256u32, "MQ4G256")
+                                    }
+                                }
+                            }
+                            None => {
+                                let q = quantize_q8f16(&f32_data);
+                                (q, QuantType::Q8F16, 32u32, "Q8_F16")
+                            }
+                        }
                     } else if (use_mq4g256
                         || use_mq4_mq6exp
                         || use_mq4_mq2lloydexp
