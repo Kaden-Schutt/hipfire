@@ -67,6 +67,7 @@ struct Config {
     one_way_samples: usize,
     chain_samples: usize,
     exactness_samples: usize,
+    exactness_seed_base: u64,
     sync: SyncMode,
     layers: usize,
     batches: Vec<usize>,
@@ -81,6 +82,7 @@ impl Default for Config {
             one_way_samples: 100,
             chain_samples: 50,
             exactness_samples: 10,
+            exactness_seed_base: 0,
             sync: SyncMode::Signal,
             layers: DEFAULT_LAYERS,
             batches: DEFAULT_BATCHES.to_vec(),
@@ -109,6 +111,9 @@ impl Config {
                 "--chain-samples" => cfg.chain_samples = parse_positive(flag, value(&mut i)?)?,
                 "--exactness-samples" => {
                     cfg.exactness_samples = parse_positive(flag, value(&mut i)?)?
+                }
+                "--exactness-seed-base" => {
+                    cfg.exactness_seed_base = parse_u64(flag, value(&mut i)?)?
                 }
                 "--sync" => cfg.sync = SyncMode::parse(value(&mut i)?)?,
                 "--layers" => cfg.layers = parse_positive(flag, value(&mut i)?)?,
@@ -147,6 +152,11 @@ fn parse_positive(flag: &str, raw: &str) -> Result<usize, String> {
     Ok(value)
 }
 
+fn parse_u64(flag: &str, raw: &str) -> Result<u64, String> {
+    raw.parse::<u64>()
+        .map_err(|e| format!("invalid {flag} value {raw:?}: {e}"))
+}
+
 fn print_help() {
     println!(
         "peer_chain [options]\n\
@@ -156,6 +166,7 @@ fn print_help() {
            --one-way-samples N    samples per direction and size (default 100)\n\
            --chain-samples N      43-layer chain samples per size (default 50)\n\
            --exactness-samples N  post-timing exactness stress samples (default 10)\n\
+           --exactness-seed-base N first unique stress payload seed (default 0)\n\
            --sync MODE            signal (default), event, or host (control)\n\
            --layers N             round-trip dependency count (default 43)\n\
            --batches CSV          batch rows for [B,4096] F32 (default 1,16,128,512,1024)\n\
@@ -198,10 +209,19 @@ fn percentile(sorted: &[f64], q: f64) -> f64 {
     }
 }
 
-fn pattern(size: usize, salt: u8) -> Vec<u8> {
-    (0..size)
-        .map(|i| ((i.wrapping_mul(31).wrapping_add(salt as usize)) & 0xff) as u8)
-        .collect()
+fn pattern(size: usize, seed: u64) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(size);
+    let mut state = seed;
+    while bytes.len() < size {
+        state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut word = state;
+        word = (word ^ (word >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        word = (word ^ (word >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        word ^= word >> 31;
+        let remaining = size - bytes.len();
+        bytes.extend_from_slice(&word.to_le_bytes()[..remaining.min(8)]);
+    }
+    bytes
 }
 
 fn assert_bytes(
@@ -449,13 +469,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "identity arch0={arch0} arch1={arch1} visible_devices={device_count} \
          peer_0_to_1={can_0_to_1} peer_1_to_0={can_1_to_0} sync={} hidden={HIDDEN} \
          layers={} warmups={} one_way_samples={} chain_samples={} \
-         exactness_samples={} max_bytes={max_bytes}",
+         exactness_samples={} exactness_seed_base={} max_bytes={max_bytes}",
         cfg.sync.label(),
         cfg.layers,
         cfg.warmups,
         cfg.one_way_samples,
         cfg.chain_samples,
-        cfg.exactness_samples
+        cfg.exactness_samples,
+        cfg.exactness_seed_base
     );
 
     hip.set_device(0)?;
@@ -661,7 +682,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // This catches intermittent dependency-event failures that a stable
         // repeated payload could hide after the next successful round trip.
         for sample in 0..cfg.exactness_samples {
-            let expected = pattern(size, 31u8.wrapping_add(sample as u8));
+            let seed = cfg
+                .exactness_seed_base
+                .checked_add(sample as u64)
+                .expect("exactness payload seed overflow");
+            let expected = pattern(size, seed);
             initialize_chain_inputs(&hip, &dev0_a, &dev0_b, &dev1_a, &expected)?;
             chain_sample(&hip, &chain, size, true)?;
             let final_dev0 = if cfg.layers % 2 == 0 {
@@ -674,12 +699,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 0,
                 final_dev0,
                 &expected,
-                &format!("round-trip stress batch={batch} sample={sample}"),
+                &format!("round-trip stress batch={batch} sample={sample} seed={seed}"),
             )?;
         }
         println!(
-            "exactness batch={batch} samples={} status=PASS",
-            cfg.exactness_samples + 1
+            "exactness batch={batch} samples={} seed_base={} status=PASS",
+            cfg.exactness_samples + 1,
+            cfg.exactness_seed_base
         );
     }
 
