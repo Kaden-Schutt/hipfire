@@ -9,8 +9,9 @@
 //! one `[batch, hidden=4096]` F32 payload in each direction across a
 //! 43-layer dependency chain. Streams, timing events, and buffers are
 //! allocated once and reused for every sample. The default synchronization
-//! mode is host-side stream synchronization because cross-device HIP events
-//! and signal-memory waits did not reliably publish peer writes on this pair.
+//! mode uses GPU-visible signal memory; host stream synchronization remains a
+//! correctness control. Host/device synchronization appears only outside the
+//! timed chain to order initialization and at the terminal timing event.
 //!
 //! Example:
 //! ```text
@@ -74,7 +75,7 @@ impl Default for Config {
             one_way_samples: 100,
             chain_samples: 50,
             exactness_samples: 10,
-            sync: SyncMode::Host,
+            sync: SyncMode::Signal,
             layers: DEFAULT_LAYERS,
             batches: DEFAULT_BATCHES.to_vec(),
             expect_arch0: None,
@@ -149,7 +150,7 @@ fn print_help() {
            --one-way-samples N    samples per direction and size (default 100)\n\
            --chain-samples N      43-layer chain samples per size (default 50)\n\
            --exactness-samples N  post-timing exactness stress samples (default 10)\n\
-           --sync MODE            host (default) or signal (diagnostic)\n\
+           --sync MODE            signal (default) or host (control)\n\
            --layers N             round-trip dependency count (default 43)\n\
            --batches CSV          batch rows for [B,4096] F32 (default 1,16,128,512,1024)\n\
            --expect-arch0 ARCH    fail unless logical device 0 matches\n\
