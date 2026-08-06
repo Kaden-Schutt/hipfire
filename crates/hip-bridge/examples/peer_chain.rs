@@ -960,6 +960,7 @@ fn print_row(
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let cold_started = Instant::now();
     let cfg = Config::parse().map_err(|e| format!("peer_chain: {e}"))?;
     let hip = HipRuntime::load()?;
     let device_count = hip.device_count()?;
@@ -1132,6 +1133,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         next_epoch: Cell::new(0),
         sync: cfg.sync,
     };
+    println!(
+        "cold_init transport={} process_to_persistent_ready_us={:.3}",
+        cfg.sync.label(),
+        cold_started.elapsed().as_secs_f64() * 1_000_000.0
+    );
 
     for &batch in &cfg.batches {
         let size = batch * HIDDEN * F32_BYTES;
