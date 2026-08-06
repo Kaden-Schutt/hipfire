@@ -333,9 +333,9 @@ const PARALLEL_GFX942_BOUNDED: KernelSpec = KernelSpec {
 fn parallel_spec(arch: &str) -> &'static KernelSpec {
     match arch {
         "gfx942" => &PARALLEL_GFX942,
-        // Both are wave32 gfx11.  hipcc still emits an exact-device code
-        // object; this shares only the source-level parity reference.
-        "gfx1100" | "gfx1151" => &PARALLEL_GFX1151,
+        // These are wave32 RDNA targets. hipcc still emits an exact-device
+        // code object; this shares only the source-level parity reference.
+        "gfx1100" | "gfx1151" | "gfx1201" => &PARALLEL_GFX1151,
         _ => unreachable!("architecture checked by main"),
     }
 }
@@ -354,7 +354,7 @@ fn parallel_spec(arch: &str) -> &'static KernelSpec {
 fn bounded_spec(arch: &str) -> Option<KernelSpec> {
     match arch {
         "gfx942" => Some(PARALLEL_GFX942_BOUNDED),
-        "gfx1100" | "gfx1151" => Some(bounded_gfx1151_spec()),
+        "gfx1100" | "gfx1151" | "gfx1201" => Some(bounded_gfx1151_spec()),
         _ => None,
     }
 }
@@ -1289,13 +1289,13 @@ fn main() {
     let mut gpu = Gpu::init().expect("GPU init");
     let arch = gpu.arch.as_str();
     eprintln!("detected_arch={arch}");
-    if arch != "gfx1100" && arch != "gfx1151" && arch != "gfx942" {
+    if arch != "gfx1100" && arch != "gfx1151" && arch != "gfx1201" && arch != "gfx942" {
         panic!(
-            "unsupported arch '{arch}': this parity probe accepts only gfx1100, gfx1151, or gfx942 \
+            "unsupported arch '{arch}': this parity probe accepts only gfx1100, gfx1151, gfx1201, or gfx942 \
              (refuse, do not skip)"
         );
     }
-    eprintln!("arch_ok=true (accepted gfx1100|gfx1151|gfx942)");
+    eprintln!("arch_ok=true (accepted gfx1100|gfx1151|gfx1201|gfx942)");
 
     let parallel = parallel_spec(arch);
     let bounded = bounded_spec(arch);
