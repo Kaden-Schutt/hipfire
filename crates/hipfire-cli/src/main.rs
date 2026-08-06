@@ -2247,6 +2247,19 @@ struct ServeMeta {
     last_activity: Instant,
 }
 
+fn finish_prewarm(meta: &mut ServeMeta, succeeded: bool) {
+    meta.loading_model = None;
+    if succeeded {
+        meta.last_activity = Instant::now();
+    }
+}
+
+fn idle_model_expired(meta: &ServeMeta, idle_timeout: Duration) -> bool {
+    meta.loading_model.is_none()
+        && meta.current_model.is_some()
+        && meta.last_activity.elapsed() >= idle_timeout
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 struct ServePidRecord {
     pid: u32,
@@ -2890,11 +2903,13 @@ fn serve_foreground(
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
                 .ensure_model(&default_model, &shared.meta, None);
-            shared
-                .meta
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .loading_model = None;
+            {
+                let mut meta = shared
+                    .meta
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                finish_prewarm(&mut meta, result.is_ok());
+            }
             match result {
                 Ok(_) => eprintln!("[hipfire] pre-warmed {default_model}"),
                 Err(error) => eprintln!("[hipfire] pre-warm failed: {error:#}; serving lazily"),
@@ -2913,7 +2928,7 @@ fn serve_foreground(
                     .meta
                     .lock()
                     .unwrap_or_else(|error| error.into_inner());
-                meta.current_model.is_some() && meta.last_activity.elapsed() >= shared.idle_timeout
+                idle_model_expired(&meta, shared.idle_timeout)
             };
             if !expired {
                 continue;
@@ -8468,6 +8483,35 @@ mod tests {
             root,
             config,
         }
+    }
+
+    fn idle_test_meta() -> ServeMeta {
+        ServeMeta {
+            current_model: Some("model.hfq".to_owned()),
+            loading_model: Some("model.hfq".to_owned()),
+            instance_token: "test".to_owned(),
+            requests_served: 0,
+            retries_attempted: 0,
+            retries_succeeded: 0,
+            recent_tok_s: None,
+            started: Instant::now(),
+            last_activity: Instant::now() - Duration::from_secs(600),
+        }
+    }
+
+    #[test]
+    fn idle_timeout_does_not_evict_a_loading_model() {
+        let meta = idle_test_meta();
+        assert!(!idle_model_expired(&meta, Duration::from_secs(300)));
+    }
+
+    #[test]
+    fn successful_prewarm_starts_a_fresh_idle_window() {
+        let mut meta = idle_test_meta();
+        finish_prewarm(&mut meta, true);
+        assert!(meta.loading_model.is_none());
+        assert!(!idle_model_expired(&meta, Duration::from_secs(300)));
+        assert!(meta.last_activity.elapsed() < Duration::from_secs(1));
     }
 
     #[test]
