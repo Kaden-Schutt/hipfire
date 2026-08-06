@@ -24,6 +24,8 @@
 //!   - Embedding lookup, lm_head matmul, sampler
 
 use crate::backend::Mq2rBackend;
+use crate::deepseek4::{DeepseekV4HeterogeneousWeights, DeepseekV4RoutedWeights};
+use crate::heterogeneous::DeepseekV4HeterogeneousExecution;
 use crate::{DeepseekV4Config, DeepseekV4State, DeepseekV4Weights};
 use hipfire_dispatch::context::DispatchCtx;
 use hipfire_dispatch::pipeline::superop::{
@@ -3404,6 +3406,89 @@ pub fn decode_step(
         .map_err(|e| format!("download logits: {e:?}"))
 }
 
+/// Direct-HIP heterogeneous token step for the frozen gfx1100+gfx1151 MQ2R
+/// route. Dense state and all non-routed arithmetic remain canonical on
+/// gfx1100. The layer loop transfers only the prepared FWHT activation and
+/// the six normalized routes to gfx1151, then returns a routed-only F32
+/// partial for the original ordered add and HC mix.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn decode_step_heterogeneous(
+    cfg: &DeepseekV4Config,
+    weights: &DeepseekV4HeterogeneousWeights,
+    state: &mut DeepseekV4State,
+    dense_gpu: &mut Gpu,
+    routed_gpu: &mut Gpu,
+    execution: &mut DeepseekV4HeterogeneousExecution,
+    token_id: u32,
+    position: u32,
+) -> Result<Vec<f32>, String> {
+    if dense_gpu.arch != "gfx1100" || routed_gpu.arch != "gfx1151" {
+        return Err(format!(
+            "deepseek4 heterogeneous decode requires gfx1100+gfx1151, got {}+{}",
+            dense_gpu.arch, routed_gpu.arch
+        ));
+    }
+    if dense_gpu.replay.is_enabled()
+        || routed_gpu.replay.is_enabled()
+        || dense_gpu.graphs.capture_mode
+        || routed_gpu.graphs.capture_mode
+    {
+        return Err("deepseek4 heterogeneous G4 admits direct HIP only".into());
+    }
+    if !config_cache::moe_on() {
+        return Err("deepseek4 heterogeneous route requires routed MoE enabled".into());
+    }
+
+    let dense_weights = &weights.dense.inner;
+    ensure_compressor_capacity(cfg, state, dense_gpu, (position as usize).saturating_add(1))?;
+    precompute_positions(cfg, state, dense_gpu, position)?;
+    precompute_token_id(state, dense_gpu, token_id)?;
+    init_residual_streams(cfg, dense_weights, state, dense_gpu, token_id)?;
+    ensure_ffn_split_resource(cfg, state, dense_gpu)?;
+
+    for layer_idx in 0..cfg.num_hidden_layers {
+        ds4_attn_block(cfg, dense_weights, state, dense_gpu, layer_idx, position)?;
+        mhc_pre(
+            cfg,
+            dense_weights,
+            state,
+            dense_gpu,
+            layer_idx,
+            /*is_attn=*/ false,
+        )?;
+        ffn_prepare(cfg, dense_weights, state, dense_gpu, layer_idx)?;
+        heterogeneous_select_routes(cfg, dense_weights, state, dense_gpu, layer_idx, token_id)?;
+
+        let epoch = execution.next_epoch()?;
+        heterogeneous_publish_routes(cfg, state, dense_gpu, routed_gpu, execution, epoch)?;
+
+        // Same dense stream, immediately after publication. The routed stream
+        // wakes when the signal is visible, so this shared projection and the
+        // selected experts execute concurrently without a host wait.
+        ffn_shared_project(cfg, dense_weights, state, dense_gpu, layer_idx)?;
+
+        heterogeneous_run_selected(
+            cfg,
+            &weights.routed,
+            state.ffn_routed_overlap.as_ref().unwrap(),
+            dense_gpu.device_id,
+            routed_gpu,
+            execution,
+            layer_idx,
+            epoch,
+        )?;
+        heterogeneous_join(cfg, state, dense_gpu, execution, layer_idx, epoch)?;
+        hc_ffn_mix(cfg, dense_weights, state, dense_gpu, layer_idx)?;
+        dump_residual_layer_norm(dense_gpu, state, layer_idx, position);
+    }
+
+    final_norm_and_head(cfg, dense_weights, state, dense_gpu)?;
+    state.n_tokens += 1;
+    dense_gpu
+        .download_f32(state.logits.as_ref().unwrap())
+        .map_err(|error| format!("download heterogeneous logits: {error:?}"))
+}
+
 /// HIP-graphs-aware decode_step. Opt-in via `HIPFIRE_DEEPSEEK4_GRAPH=1`.
 ///
 /// Three-state machine driven by `state.ar_forward_warmed_up` and
@@ -6004,6 +6089,305 @@ fn ffn_shared_project(
     )?;
 
     Ok(())
+}
+
+fn heterogeneous_select_routes(
+    cfg: &DeepseekV4Config,
+    weights: &DeepseekV4Weights,
+    state: &mut DeepseekV4State,
+    gpu: &mut Gpu,
+    layer_idx: usize,
+    token_id: u32,
+) -> Result<(), String> {
+    let k = cfg.num_experts_per_tok;
+    if state.moe_topk_indices.is_none() {
+        state.moe_topk_indices = Some(
+            gpu.alloc_tensor(&[k], DType::F32)
+                .map_err(|error| format!("heterogeneous alloc route indices: {error:?}"))?,
+        );
+    }
+    if state.moe_topk_weights.is_none() {
+        state.moe_topk_weights = Some(
+            gpu.alloc_tensor(&[k], DType::F32)
+                .map_err(|error| format!("heterogeneous alloc route weights: {error:?}"))?,
+        );
+    }
+
+    moe_route(cfg, weights, state, gpu, layer_idx)?;
+    let layer = weights.resolve_layer(layer_idx);
+    let scores = state.router_scores.as_ref().unwrap();
+    let topk_indices = state.moe_topk_indices.as_ref().unwrap();
+    let topk_weights = state.moe_topk_weights.as_ref().unwrap();
+    let route_scale = config_cache::route_scale(cfg.routed_scaling_factor, cfg.mq2r);
+
+    if layer_idx < cfg.num_hash_layers {
+        let tid2eid = layer.tid2eid_dev.as_ref().ok_or_else(|| {
+            format!("heterogeneous hash route l{layer_idx}: tid2eid device table missing")
+        })?;
+        let token_id_buf = state.token_id_buf.as_ref().ok_or_else(|| {
+            format!("heterogeneous hash route l{layer_idx}: token-id buffer missing")
+        })?;
+        gpu.hash_router_normalize_f32_buf(
+            tid2eid,
+            scores,
+            token_id_buf,
+            topk_indices,
+            topk_weights,
+            cfg.n_routed_experts as i32,
+            k as i32,
+            route_scale,
+        )
+        .map_err(|error| format!("heterogeneous hash route l{layer_idx}: {error:?}"))?;
+    } else {
+        let gate_bias = layer.gate_bias.as_ref().ok_or_else(|| {
+            format!("heterogeneous bias-aware route l{layer_idx}: gate bias missing")
+        })?;
+        gpu.deepseek4_moe_topk_bias_aware_f32(
+            scores,
+            gate_bias,
+            topk_indices,
+            topk_weights,
+            cfg.n_routed_experts as i32,
+            k as i32,
+            route_scale,
+        )
+        .map_err(|error| format!("heterogeneous bias-aware route l{layer_idx}: {error:?}"))?;
+    }
+    dump_moe_route_if_enabled(gpu, layer_idx, topk_indices, topk_weights)
+}
+
+const HETEROGENEOUS_WAIT_EQ: u32 = 0x1;
+const HETEROGENEOUS_SIGNAL_FLAGS: u32 = 0;
+const HETEROGENEOUS_SIGNAL_MASK: u32 = u32::MAX;
+
+fn heterogeneous_publish_routes(
+    cfg: &DeepseekV4Config,
+    state: &DeepseekV4State,
+    dense_gpu: &mut Gpu,
+    routed_gpu: &Gpu,
+    execution: &DeepseekV4HeterogeneousExecution,
+    epoch: u32,
+) -> Result<(), String> {
+    dense_gpu
+        .bind_thread()
+        .map_err(|error| format!("heterogeneous publish bind dense: {error}"))?;
+    let stream = dense_gpu
+        .active_stream
+        .as_ref()
+        .ok_or_else(|| "heterogeneous dense stream missing".to_string())?;
+    let x_rot = state
+        .ffn_x_rot
+        .as_ref()
+        .ok_or_else(|| "heterogeneous dense x_rot missing".to_string())?;
+    let topk_indices = state
+        .moe_topk_indices
+        .as_ref()
+        .ok_or_else(|| "heterogeneous dense route indices missing".to_string())?;
+    let topk_weights = state
+        .moe_topk_weights
+        .as_ref()
+        .ok_or_else(|| "heterogeneous dense route weights missing".to_string())?;
+    let routed_x_rot = execution
+        .routed_x_rot
+        .as_ref()
+        .ok_or_else(|| "heterogeneous routed x_rot missing".to_string())?;
+    let routed_topk_indices = execution
+        .routed_topk_indices
+        .as_ref()
+        .ok_or_else(|| "heterogeneous routed route indices missing".to_string())?;
+    let routed_topk_weights = execution
+        .routed_topk_weights
+        .as_ref()
+        .ok_or_else(|| "heterogeneous routed route weights missing".to_string())?;
+
+    dense_gpu
+        .hip
+        .memcpy_peer_async(
+            &routed_x_rot.buf,
+            routed_gpu.device_id,
+            &x_rot.buf,
+            dense_gpu.device_id,
+            cfg.hidden_size * std::mem::size_of::<f32>(),
+            stream,
+        )
+        .map_err(|error| format!("heterogeneous publish x_rot: {error}"))?;
+    dense_gpu
+        .hip
+        .memcpy_peer_async(
+            &routed_topk_indices.buf,
+            routed_gpu.device_id,
+            &topk_indices.buf,
+            dense_gpu.device_id,
+            cfg.num_experts_per_tok * std::mem::size_of::<f32>(),
+            stream,
+        )
+        .map_err(|error| format!("heterogeneous publish route indices: {error}"))?;
+    dense_gpu
+        .hip
+        .memcpy_peer_async(
+            &routed_topk_weights.buf,
+            routed_gpu.device_id,
+            &topk_weights.buf,
+            dense_gpu.device_id,
+            cfg.num_experts_per_tok * std::mem::size_of::<f32>(),
+            stream,
+        )
+        .map_err(|error| format!("heterogeneous publish route weights: {error}"))?;
+    dense_gpu
+        .hip
+        .stream_write_value32(
+            stream,
+            execution
+                .signal_to_routed
+                .as_ref()
+                .ok_or_else(|| "heterogeneous routed signal missing".to_string())?,
+            epoch,
+            HETEROGENEOUS_SIGNAL_FLAGS,
+        )
+        .map_err(|error| format!("heterogeneous publish signal: {error}"))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn heterogeneous_run_selected(
+    cfg: &DeepseekV4Config,
+    weights: &DeepseekV4RoutedWeights,
+    dense_partial: &GpuTensor,
+    dense_device_id: i32,
+    routed_gpu: &mut Gpu,
+    execution: &DeepseekV4HeterogeneousExecution,
+    layer_idx: usize,
+    epoch: u32,
+) -> Result<(), String> {
+    routed_gpu
+        .bind_thread()
+        .map_err(|error| format!("heterogeneous selected bind routed: {error}"))?;
+    let stream = routed_gpu
+        .active_stream
+        .as_ref()
+        .ok_or_else(|| "heterogeneous routed stream missing".to_string())?;
+    routed_gpu
+        .hip
+        .stream_wait_value32(
+            stream,
+            execution
+                .signal_to_routed
+                .as_ref()
+                .ok_or_else(|| "heterogeneous routed signal missing".to_string())?,
+            epoch,
+            HETEROGENEOUS_WAIT_EQ,
+            HETEROGENEOUS_SIGNAL_MASK,
+        )
+        .map_err(|error| format!("heterogeneous wait for routes l{layer_idx}: {error}"))?;
+
+    let layer = weights.resolve_layer(layer_idx);
+    let expert_gate_up_ptrs = layer.expert_gate_up_ptrs.as_ref().ok_or_else(|| {
+        format!("heterogeneous routed gate/up pointer table missing l{layer_idx}")
+    })?;
+    let expert_down_ptrs = layer
+        .expert_w2_ptrs
+        .as_ref()
+        .ok_or_else(|| format!("heterogeneous routed down pointer table missing l{layer_idx}"))?;
+    let x_rot = execution.routed_x_rot.as_ref().unwrap();
+    let topk_indices = execution.routed_topk_indices.as_ref().unwrap();
+    let topk_weights = execution.routed_topk_weights.as_ref().unwrap();
+    let gate_batch = execution.routed_gate_batch.as_ref().unwrap();
+    let up_batch = execution.routed_up_batch.as_ref().unwrap();
+    let rot_batch = execution.routed_rot_batch.as_ref().unwrap();
+    let down_expanded = execution.routed_down_expanded.as_ref().unwrap();
+    let routed_partial = execution.routed_partial.as_ref().unwrap();
+    routed_gpu
+        .hip
+        .memset_async(&routed_partial.buf, 0, routed_partial.byte_size(), stream)
+        .map_err(|error| format!("heterogeneous zero routed partial l{layer_idx}: {error}"))?;
+
+    let params = hipfire_dispatch::families::moe::MoeSelectedParams {
+        hidden: cfg.hidden_size,
+        mi: cfg.moe_intermediate_size,
+        k_top: cfg.num_experts_per_tok,
+        swiglu_limit: cfg.swiglu_limit,
+        uses_atomic_moe_down: weights.mq2r_backend.uses_atomic_moe_down(),
+        native_mq2_backend: weights.mq2r_backend.bias_aware_native_backend(),
+        batch_size: 1,
+        x_rot,
+        ffn_out: routed_partial,
+        expert_gate_up_ptrs,
+        expert_down_ptrs,
+        topk_indices,
+        topk_weights,
+        gate_batch,
+        up_batch,
+        rot_batch,
+        down_expanded,
+    };
+    hipfire_runtime::llama::moe_family()
+        .run_selected(routed_gpu, &params)
+        .map_err(|error| format!("heterogeneous selected experts l{layer_idx}: {error}"))?;
+
+    let stream = routed_gpu.active_stream.as_ref().unwrap();
+    routed_gpu
+        .hip
+        .memcpy_peer_async(
+            &dense_partial.buf,
+            dense_device_id,
+            &routed_partial.buf,
+            routed_gpu.device_id,
+            cfg.hidden_size * std::mem::size_of::<f32>(),
+            stream,
+        )
+        .map_err(|error| format!("heterogeneous return partial l{layer_idx}: {error}"))?;
+    routed_gpu
+        .hip
+        .stream_write_value32(
+            stream,
+            execution
+                .signal_to_dense
+                .as_ref()
+                .ok_or_else(|| "heterogeneous dense signal missing".to_string())?,
+            epoch,
+            HETEROGENEOUS_SIGNAL_FLAGS,
+        )
+        .map_err(|error| format!("heterogeneous return signal l{layer_idx}: {error}"))
+}
+
+fn heterogeneous_join(
+    cfg: &DeepseekV4Config,
+    state: &DeepseekV4State,
+    dense_gpu: &mut Gpu,
+    execution: &DeepseekV4HeterogeneousExecution,
+    layer_idx: usize,
+    epoch: u32,
+) -> Result<(), String> {
+    dense_gpu
+        .bind_thread()
+        .map_err(|error| format!("heterogeneous join bind dense: {error}"))?;
+    let stream = dense_gpu
+        .active_stream
+        .as_ref()
+        .ok_or_else(|| "heterogeneous dense stream missing".to_string())?;
+    dense_gpu
+        .hip
+        .stream_wait_value32(
+            stream,
+            execution
+                .signal_to_dense
+                .as_ref()
+                .ok_or_else(|| "heterogeneous dense signal missing".to_string())?,
+            epoch,
+            HETEROGENEOUS_WAIT_EQ,
+            HETEROGENEOUS_SIGNAL_MASK,
+        )
+        .map_err(|error| format!("heterogeneous wait for partial l{layer_idx}: {error}"))?;
+    let ffn_out = state
+        .ffn_out
+        .as_ref()
+        .ok_or_else(|| format!("heterogeneous shared output missing l{layer_idx}"))?;
+    let routed_partial = state
+        .ffn_routed_overlap
+        .as_ref()
+        .ok_or_else(|| format!("heterogeneous dense routed partial missing l{layer_idx}"))?;
+    dense_gpu
+        .add_inplace_f32(ffn_out, &routed_partial.sub_offset(0, cfg.hidden_size))
+        .map_err(|error| format!("heterogeneous ordered join l{layer_idx}: {error:?}"))
 }
 
 fn ffn_stub(

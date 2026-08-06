@@ -16,12 +16,14 @@ fn main() -> Result<(), String> {
     let model = args
         .next()
         .ok_or(
-            "usage: ds4_heterogeneous_load MODEL [--cycles N] [--replacement-probe] [--fault-matrix] [--fault dense|layer:N|audit|state|scratch]",
+            "usage: ds4_heterogeneous_load MODEL [--cycles N] [--replacement-probe] [--fault-matrix] [--fault dense|layer:N|audit|state|scratch] [--decode-token ID] [--position N]",
         )?;
     let mut cycles = 1usize;
     let mut fault = None;
     let mut replacement_probe = false;
     let mut fault_matrix = false;
+    let mut decode_token = None;
+    let mut position = 0u32;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--cycles" => {
@@ -55,6 +57,21 @@ fn main() -> Result<(), String> {
             }
             "--replacement-probe" => replacement_probe = true,
             "--fault-matrix" => fault_matrix = true,
+            "--decode-token" => {
+                decode_token = Some(
+                    args.next()
+                        .ok_or("--decode-token requires a token id")?
+                        .parse::<u32>()
+                        .map_err(|error| format!("invalid --decode-token: {error}"))?,
+                );
+            }
+            "--position" => {
+                position = args
+                    .next()
+                    .ok_or("--position requires a value")?
+                    .parse::<u32>()
+                    .map_err(|error| format!("invalid --position: {error}"))?;
+            }
             other => return Err(format!("unknown argument '{other}'")),
         }
     }
@@ -133,7 +150,7 @@ fn main() -> Result<(), String> {
                 .map_err(|error| error.to_string())?
             );
         }
-        let loaded = loaded.expect("loaded model missing after replacement probe");
+        let mut loaded = loaded.expect("loaded model missing after replacement probe");
         let report = &loaded.report;
         println!(
             "{}",
@@ -176,6 +193,30 @@ fn main() -> Result<(), String> {
             }))
             .map_err(|error| error.to_string())?
         );
+        if let Some(token_id) = decode_token {
+            let logits = loaded.decode_step(token_id, position)?;
+            let (argmax, max_logit) = logits
+                .iter()
+                .enumerate()
+                .max_by(|left, right| left.1.total_cmp(right.1))
+                .map(|(index, value)| (index, *value))
+                .ok_or("heterogeneous decode returned no logits")?;
+            let non_finite = logits.iter().filter(|value| !value.is_finite()).count();
+            println!(
+                "{}",
+                serde_json::to_string(&json!({
+                    "cycle": cycle,
+                    "status": "decoded",
+                    "token_id": token_id,
+                    "position": position,
+                    "logits": logits.len(),
+                    "argmax": argmax,
+                    "max_logit": max_logit,
+                    "non_finite": non_finite,
+                }))
+                .map_err(|error| error.to_string())?
+            );
+        }
         loaded.unload();
     }
     Ok(())

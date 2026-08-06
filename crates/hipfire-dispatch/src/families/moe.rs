@@ -470,6 +470,58 @@ pub struct MoeBiasAwareParams<'a> {
     pub down_expanded: &'a GpuTensor,
 }
 
+impl<'a> MoeBiasAwareParams<'a> {
+    /// Borrow the routed-expert portion after route selection has already
+    /// populated `topk_indices` and `topk_weights`. Heterogeneous DS4 uses
+    /// this boundary to select routes on the dense owner and execute only the
+    /// selected experts on the routed owner.
+    pub fn selected(&self) -> MoeSelectedParams<'_> {
+        MoeSelectedParams {
+            hidden: self.hidden,
+            mi: self.mi,
+            k_top: self.k_top,
+            swiglu_limit: self.swiglu_limit,
+            uses_atomic_moe_down: self.uses_atomic_moe_down,
+            native_mq2_backend: self.native_mq2_backend,
+            batch_size: self.batch_size,
+            x_rot: self.x_rot,
+            ffn_out: self.ffn_out,
+            expert_gate_up_ptrs: self.expert_gate_up_ptrs,
+            expert_down_ptrs: self.expert_down_ptrs,
+            topk_indices: self.topk_indices,
+            topk_weights: self.topk_weights,
+            gate_batch: self.gate_batch,
+            up_batch: self.up_batch,
+            rot_batch: self.rot_batch,
+            down_expanded: self.down_expanded,
+        }
+    }
+}
+
+/// Selected routed-expert decode subgraph. Route selection is intentionally
+/// absent: callers must provide the exact normalized IDs and weights produced
+/// by the model-owned router. This is useful for split ownership where the
+/// router and expert weights cannot reside on the same device.
+pub struct MoeSelectedParams<'a> {
+    pub hidden: usize,
+    pub mi: usize,
+    pub k_top: usize,
+    pub swiglu_limit: f32,
+    pub uses_atomic_moe_down: bool,
+    pub native_mq2_backend: Option<&'a dyn MoeBiasAwareMq2Backend>,
+    pub batch_size: usize,
+    pub x_rot: &'a GpuTensor,
+    pub ffn_out: &'a GpuTensor,
+    pub expert_gate_up_ptrs: &'a GpuTensor,
+    pub expert_down_ptrs: &'a GpuTensor,
+    pub topk_indices: &'a GpuTensor,
+    pub topk_weights: &'a GpuTensor,
+    pub gate_batch: &'a GpuTensor,
+    pub up_batch: &'a GpuTensor,
+    pub rot_batch: &'a GpuTensor,
+    pub down_expanded: &'a GpuTensor,
+}
+
 // ── DeepSeek-V4 batched/prefill MoE parameters ─────────
 
 /// Router-selection mode for the batched/prefill MoE path. DeepSeek-V4 uses
@@ -791,6 +843,17 @@ impl MoeFamily {
         params: &MoeBiasAwareParams,
     ) -> Result<(), DispatchError> {
         crate::pipeline::run_moe_decode_bias_aware(gpu, params)
+    }
+
+    /// Run only the selected-expert portion of the single-token DeepSeek4
+    /// MQ2-Lloyd subgraph. The caller owns route selection and must already
+    /// have populated `topk_indices` and `topk_weights`.
+    pub fn run_selected(
+        &self,
+        gpu: &mut rdna_compute::Gpu,
+        params: &MoeSelectedParams,
+    ) -> Result<(), DispatchError> {
+        crate::pipeline::run_moe_decode_selected(gpu, params)
     }
 
     /// Run a batched/prefill deepseek4 MoE step (k=6, MQ2-Lloyd): routing

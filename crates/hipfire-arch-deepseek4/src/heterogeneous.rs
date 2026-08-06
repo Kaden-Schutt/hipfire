@@ -11,11 +11,11 @@
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use hip_bridge::HipRuntime;
+use hip_bridge::{DeviceBuffer, HipRuntime};
 use hipfire_config::{Deepseek4ComputePlacement, DeviceSelector};
 use hipfire_runtime::arch::Architecture;
 use hipfire_runtime::hfq::HfqFile;
-use rdna_compute::Gpu;
+use rdna_compute::{DType, Gpu, GpuTensor};
 
 use crate::arch::{DeepseekV4HeterogeneousFault, DeepseekV4HeterogeneousProjection};
 use crate::deepseek4::{
@@ -244,6 +244,7 @@ impl DeepseekV4HeterogeneousStaging {
             weights: self.weights.take(),
             state: self.state.take(),
             prefill: self.prefill.take(),
+            execution: None,
             report,
         }
     }
@@ -287,7 +288,204 @@ pub struct DeepseekV4HeterogeneousModel {
     pub weights: Option<DeepseekV4HeterogeneousWeights>,
     pub state: Option<DeepseekV4State>,
     pub prefill: Option<PrefillBatchScratch>,
+    execution: Option<DeepseekV4HeterogeneousExecution>,
     pub report: DeepseekV4HeterogeneousLoadReport,
+}
+
+/// Persistent direct-HIP execution resources for the split-owner route. Only
+/// routed-expert scratch lives on gfx1151; canonical model state remains on
+/// gfx1100. Cross-device epochs use the system-visible signal-memory contract
+/// certified by G0, so the layer loop never synchronizes on the host.
+pub(crate) struct DeepseekV4HeterogeneousExecution {
+    pub(crate) routed_x_rot: Option<GpuTensor>,
+    pub(crate) routed_topk_indices: Option<GpuTensor>,
+    pub(crate) routed_topk_weights: Option<GpuTensor>,
+    pub(crate) routed_gate_batch: Option<GpuTensor>,
+    pub(crate) routed_up_batch: Option<GpuTensor>,
+    pub(crate) routed_rot_batch: Option<GpuTensor>,
+    pub(crate) routed_down_expanded: Option<GpuTensor>,
+    pub(crate) routed_partial: Option<GpuTensor>,
+    pub(crate) signal_to_dense: Option<DeviceBuffer>,
+    pub(crate) signal_to_routed: Option<DeviceBuffer>,
+    epoch: u32,
+}
+
+impl DeepseekV4HeterogeneousExecution {
+    fn empty() -> Self {
+        Self {
+            routed_x_rot: None,
+            routed_topk_indices: None,
+            routed_topk_weights: None,
+            routed_gate_batch: None,
+            routed_up_batch: None,
+            routed_rot_batch: None,
+            routed_down_expanded: None,
+            routed_partial: None,
+            signal_to_dense: None,
+            signal_to_routed: None,
+            epoch: 0,
+        }
+    }
+
+    fn new(
+        dense_gpu: &mut Gpu,
+        routed_gpu: &mut Gpu,
+        cfg: &DeepseekV4Config,
+    ) -> Result<Self, String> {
+        if dense_gpu.active_stream.is_some() || routed_gpu.active_stream.is_some() {
+            return Err(
+                "deepseek4 heterogeneous direct-HIP route requires unclaimed primary streams"
+                    .into(),
+            );
+        }
+        let mut execution = Self::empty();
+        let result = (|| {
+            dense_gpu
+                .bind_thread()
+                .map_err(|error| format!("heterogeneous bind dense execution: {error}"))?;
+            dense_gpu
+                .hip
+                .enable_peer_access(routed_gpu.device_id)
+                .map_err(|error| format!("heterogeneous dense peer access: {error}"))?;
+            dense_gpu.active_stream = Some(
+                dense_gpu
+                    .hip
+                    .stream_create()
+                    .map_err(|error| format!("heterogeneous dense stream: {error}"))?,
+            );
+            let signal_to_dense = dense_gpu
+                .hip
+                .malloc_signal(std::mem::size_of::<u64>())
+                .map_err(|error| format!("heterogeneous dense signal: {error}"))?;
+            dense_gpu
+                .hip
+                .memset(&signal_to_dense, 0, signal_to_dense.size())
+                .map_err(|error| format!("heterogeneous zero dense signal: {error}"))?;
+            execution.signal_to_dense = Some(signal_to_dense);
+
+            routed_gpu
+                .bind_thread()
+                .map_err(|error| format!("heterogeneous bind routed execution: {error}"))?;
+            routed_gpu
+                .hip
+                .enable_peer_access(dense_gpu.device_id)
+                .map_err(|error| format!("heterogeneous routed peer access: {error}"))?;
+            routed_gpu.active_stream = Some(
+                routed_gpu
+                    .hip
+                    .stream_create()
+                    .map_err(|error| format!("heterogeneous routed stream: {error}"))?,
+            );
+            let signal_to_routed = routed_gpu
+                .hip
+                .malloc_signal(std::mem::size_of::<u64>())
+                .map_err(|error| format!("heterogeneous routed signal: {error}"))?;
+            routed_gpu
+                .hip
+                .memset(&signal_to_routed, 0, signal_to_routed.size())
+                .map_err(|error| format!("heterogeneous zero routed signal: {error}"))?;
+            execution.signal_to_routed = Some(signal_to_routed);
+
+            let k = cfg.num_experts_per_tok;
+            let im = cfg.moe_intermediate_size;
+            let hidden = cfg.hidden_size;
+            execution.routed_x_rot = Some(
+                routed_gpu
+                    .alloc_tensor(&[hidden], DType::F32)
+                    .map_err(|error| format!("heterogeneous routed x_rot: {error}"))?,
+            );
+            execution.routed_topk_indices = Some(
+                routed_gpu
+                    .alloc_tensor(&[k], DType::F32)
+                    .map_err(|error| format!("heterogeneous routed topk indices: {error}"))?,
+            );
+            execution.routed_topk_weights = Some(
+                routed_gpu
+                    .alloc_tensor(&[k], DType::F32)
+                    .map_err(|error| format!("heterogeneous routed topk weights: {error}"))?,
+            );
+            execution.routed_gate_batch = Some(
+                routed_gpu
+                    .alloc_tensor(&[k, im], DType::F32)
+                    .map_err(|error| format!("heterogeneous routed gate batch: {error}"))?,
+            );
+            execution.routed_up_batch = Some(
+                routed_gpu
+                    .alloc_tensor(&[k, im], DType::F32)
+                    .map_err(|error| format!("heterogeneous routed up batch: {error}"))?,
+            );
+            execution.routed_rot_batch = Some(
+                routed_gpu
+                    .alloc_tensor(&[k, im], DType::F32)
+                    .map_err(|error| format!("heterogeneous routed rot batch: {error}"))?,
+            );
+            execution.routed_down_expanded = Some(
+                routed_gpu
+                    .alloc_tensor(&[k, hidden], DType::F32)
+                    .map_err(|error| format!("heterogeneous routed down expanded: {error}"))?,
+            );
+            execution.routed_partial = Some(
+                routed_gpu
+                    .alloc_tensor(&[hidden], DType::F32)
+                    .map_err(|error| format!("heterogeneous routed partial: {error}"))?,
+            );
+            Ok(())
+        })();
+        if let Err(error) = result {
+            execution.release(dense_gpu, routed_gpu);
+            return Err(error);
+        }
+        Ok(execution)
+    }
+
+    pub(crate) fn next_epoch(&mut self) -> Result<u32, String> {
+        self.epoch = self
+            .epoch
+            .checked_add(1)
+            .ok_or_else(|| "deepseek4 heterogeneous signal epoch exhausted".to_string())?;
+        Ok(self.epoch)
+    }
+
+    fn release(&mut self, dense_gpu: &mut Gpu, routed_gpu: &mut Gpu) {
+        fn free_opt(gpu: &mut Gpu, tensor: &mut Option<GpuTensor>) {
+            if let Some(tensor) = tensor.take() {
+                let _ = gpu.free_tensor(tensor);
+            }
+        }
+
+        if let Some(stream) = dense_gpu.active_stream.as_ref() {
+            dense_gpu.bind_thread_or_warn();
+            let _ = dense_gpu.hip.stream_synchronize(stream);
+        }
+        if let Some(stream) = routed_gpu.active_stream.as_ref() {
+            routed_gpu.bind_thread_or_warn();
+            let _ = routed_gpu.hip.stream_synchronize(stream);
+        }
+        free_opt(routed_gpu, &mut self.routed_x_rot);
+        free_opt(routed_gpu, &mut self.routed_topk_indices);
+        free_opt(routed_gpu, &mut self.routed_topk_weights);
+        free_opt(routed_gpu, &mut self.routed_gate_batch);
+        free_opt(routed_gpu, &mut self.routed_up_batch);
+        free_opt(routed_gpu, &mut self.routed_rot_batch);
+        free_opt(routed_gpu, &mut self.routed_down_expanded);
+        free_opt(routed_gpu, &mut self.routed_partial);
+        if let Some(signal) = self.signal_to_routed.take() {
+            routed_gpu.bind_thread_or_warn();
+            let _ = routed_gpu.hip.free(signal);
+        }
+        if let Some(signal) = self.signal_to_dense.take() {
+            dense_gpu.bind_thread_or_warn();
+            let _ = dense_gpu.hip.free(signal);
+        }
+        if let Some(stream) = routed_gpu.active_stream.take() {
+            routed_gpu.bind_thread_or_warn();
+            let _ = routed_gpu.hip.stream_destroy(stream);
+        }
+        if let Some(stream) = dense_gpu.active_stream.take() {
+            dense_gpu.bind_thread_or_warn();
+            let _ = dense_gpu.hip.stream_destroy(stream);
+        }
+    }
 }
 
 impl DeepseekV4HeterogeneousModel {
@@ -515,6 +713,45 @@ impl DeepseekV4HeterogeneousModel {
         weights.audit_owners(&mut self.dense_gpu, &mut self.routed_gpu)
     }
 
+    fn ensure_execution(&mut self) -> Result<(), String> {
+        if self.execution.is_none() {
+            self.execution = Some(DeepseekV4HeterogeneousExecution::new(
+                &mut self.dense_gpu,
+                &mut self.routed_gpu,
+                &self.config,
+            )?);
+        }
+        Ok(())
+    }
+
+    /// One exact direct-HIP heterogeneous token step. The caller owns greedy
+    /// sampling and position advancement, matching `forward::decode_step`.
+    pub fn decode_step(&mut self, token_id: u32, position: u32) -> Result<Vec<f32>, String> {
+        self.ensure_execution()?;
+        let weights = self
+            .weights
+            .as_ref()
+            .ok_or_else(|| "deepseek4 heterogeneous decode after weight release".to_string())?;
+        let state = self
+            .state
+            .as_mut()
+            .ok_or_else(|| "deepseek4 heterogeneous decode after state release".to_string())?;
+        let execution = self
+            .execution
+            .as_mut()
+            .ok_or_else(|| "deepseek4 heterogeneous execution missing".to_string())?;
+        crate::forward::decode_step_heterogeneous(
+            &self.config,
+            weights,
+            state,
+            &mut self.dense_gpu,
+            &mut self.routed_gpu,
+            execution,
+            token_id,
+            position,
+        )
+    }
+
     /// Explicit unload used by the G2 repeatability harness. `Drop` calls the
     /// same implementation, so early returns and normal scope exit converge.
     pub fn unload(mut self) {
@@ -522,6 +759,9 @@ impl DeepseekV4HeterogeneousModel {
     }
 
     fn release(&mut self) {
+        if let Some(mut execution) = self.execution.take() {
+            execution.release(&mut self.dense_gpu, &mut self.routed_gpu);
+        }
         if let Some(prefill) = self.prefill.take() {
             prefill.free_gpu(&mut self.dense_gpu);
         }

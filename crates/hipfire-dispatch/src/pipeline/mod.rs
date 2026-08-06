@@ -1325,6 +1325,31 @@ pub fn run_moe_decode_bias_aware(
         p.route_scale,
     ))?;
 
+    run_moe_decode_selected(gpu, &p.selected())
+}
+
+/// Execute the routed-expert decode subgraph after model-owned route
+/// selection. Keeping this boundary in the shared family guarantees that the
+/// ordinary and heterogeneous DS4 paths use the same gate/up, activation,
+/// rotation, down, and combine sequence.
+pub fn run_moe_decode_selected(
+    gpu: &mut Gpu,
+    p: &crate::families::moe::MoeSelectedParams,
+) -> Result<(), DispatchError> {
+    macro_rules! hip {
+        ($e:expr) => {
+            $e.map_err(|e| DispatchError::Hip(e.to_string()))
+        };
+    }
+    if p.batch_size != 1 {
+        return Err(DispatchError::UnsupportedVariant {
+            family: "moe",
+            variant: "selected-decode-requires-batch-1",
+            arch: "",
+            quant: "",
+        });
+    }
+
     // 2. Indexed MQ2-Lloyd gate_up: all k_top experts in one launch
     //    (M = 2*mi; the kernel splits rows r<mi → gate, r>=mi → up).
     if let Some(native) = p.native_mq2_backend {
