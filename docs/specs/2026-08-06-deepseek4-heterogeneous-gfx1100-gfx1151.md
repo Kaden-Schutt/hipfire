@@ -5,7 +5,7 @@
 
 | Field | Value |
 |---|---|
-| State | **G0-G2 complete; G3 generic cross-device scheduler next** |
+| State | **G0-G3 complete; G4 DeepSeek MQ2R heterogeneous lowering next** |
 | Date | 2026-08-06 |
 | Model | DeepSeek V4 Flash 0731 MQ2R (`arch_id=9`) |
 | Artifact | `cbf2bbcfa3f47b1712a071836b2c48232dad7dfb763813a720f7d348a9318cce` |
@@ -624,8 +624,16 @@ all 43 shared/expert dispatch pairs. G2 is resolved by
 the frozen artifact loads transactionally with 1,198 dense allocations owned
 by gfx1100 and 172 packed routed allocations owned by gfx1151, all six injected
 failure points reclaim in-process, and failed replacement preserves the old
-model. Questions 2 through 6 remain model-execution unknowns for G3 and later
+model. Questions 2 through 6 remain model-execution unknowns for G4 and later
 gates.
+
+G3 is resolved by
+[`2026-08-06-ds4-heterogeneous-g3-scheduler.md`](../investigations/2026-08-06-ds4-heterogeneous-g3-scheduler.md):
+the generic exact-target scheduler is raw-bit exact, overlaps all 43
+shared/routed forks without host synchronization inside the graph, reaches
+1.851x over serialized execution at B=1024, and holds about 653 synthetic
+rows/s from 2K through 86K depth. This is scheduling evidence only; production
+DeepSeek lowering begins at G4.
 
 1. What are warmed 16 KiB one-way and 43-layer chain latencies on this exact
    two-hop PCIe topology?
