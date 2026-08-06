@@ -128,6 +128,114 @@ extern "C" __global__ void hetero_gfx11_join(
     if (i >= n) return;
     output[i] = rotl32(shared[i] + routed[i], 3u) ^ layer_key(layer);
 }
+
+// Batched prefill fixture. Each output element performs a genuine row-by-
+// matrix reduction over K; unsigned arithmetic makes the cross-architecture
+// raw-bit oracle deterministic while retaining GEMM-shaped activation/weight
+// access. The B=1 decode kernels above remain byte-for-byte independent.
+extern "C" __global__ void hetero_gfx11_prefill_producer(
+    const unsigned int* input,
+    unsigned int* packet,
+    unsigned int layer,
+    unsigned int hidden,
+    unsigned int batch
+) {
+    const unsigned int col = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned int row = blockIdx.y;
+    if (row >= batch || col >= hidden) return;
+    const unsigned int key = layer_key(layer);
+    const unsigned int input_index = row * hidden + col;
+    const unsigned int packet_stride = hidden + 16u;
+    packet[row * packet_stride + col] =
+        rotl32(input[input_index] ^ key ^ row * 0x85ebca6bu, layer % 31u + 1u)
+        + col * 0x045d9f3bu;
+    if (col < 16u) {
+        const unsigned int meta = row * packet_stride + hidden + col;
+        if (col < 6u) {
+            packet[meta] = (layer * 7u + row * 11u + col * 13u) % 256u;
+        } else if (col < 12u) {
+            const unsigned int route = col - 6u;
+            packet[meta] = rotl32(
+                key ^ row * 0x165667b1u ^ (route + 1u) * 0x27d4eb2du,
+                route + 3u
+            );
+        } else {
+            packet[meta] = key ^ row * 0xc2b2ae35u ^ col * 0x85ebca6bu;
+        }
+    }
+}
+
+extern "C" __global__ void hetero_gfx11_prefill_shared(
+    const unsigned int* packet,
+    const unsigned int* weights,
+    unsigned int* output,
+    unsigned int layer,
+    unsigned int hidden,
+    unsigned int batch,
+    unsigned int k_dim
+) {
+    const unsigned int col = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned int row = blockIdx.y;
+    if (row >= batch || col >= hidden) return;
+    const unsigned int packet_stride = hidden + 16u;
+    unsigned int acc = layer_key(layer) ^ row * 0x9e3779b9u ^ col;
+    for (unsigned int k = 0u; k < k_dim; ++k) {
+        const unsigned int activation = packet[
+            row * packet_stride + (col + k * 17u) % hidden
+        ];
+        const unsigned int weight = weights[col * k_dim + k];
+        acc = acc * 0x0019660du + activation * (weight | 1u) + k;
+    }
+    output[row * hidden + col] = rotl32(acc, 5u);
+}
+
+extern "C" __global__ void hetero_gfx11_prefill_expert(
+    const unsigned int* packet,
+    const unsigned int* weights,
+    unsigned int* output,
+    unsigned int layer,
+    unsigned int hidden,
+    unsigned int batch,
+    unsigned int k_dim
+) {
+    const unsigned int col = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned int row = blockIdx.y;
+    if (row >= batch || col >= hidden) return;
+    const unsigned int packet_stride = hidden + 16u;
+    unsigned int route_mix = 0u;
+    #pragma unroll
+    for (unsigned int route = 0u; route < 6u; ++route) {
+        route_mix ^= rotl32(
+            packet[row * packet_stride + hidden + route] * 0x9e3779b9u ^
+            packet[row * packet_stride + hidden + 6u + route],
+            route + 1u
+        );
+    }
+    unsigned int acc = layer_key(layer) ^ route_mix ^ row * 0x27d4eb2du ^ col;
+    for (unsigned int k = 0u; k < k_dim; ++k) {
+        const unsigned int activation = packet[
+            row * packet_stride + (col + k * 29u) % hidden
+        ];
+        const unsigned int weight = weights[col * k_dim + k];
+        acc = acc * 0x0019660du + activation * (weight | 1u) + k;
+    }
+    output[row * hidden + col] = rotl32(acc, 11u);
+}
+
+extern "C" __global__ void hetero_gfx11_prefill_join(
+    const unsigned int* shared,
+    const unsigned int* routed,
+    unsigned int* output,
+    unsigned int layer,
+    unsigned int hidden,
+    unsigned int batch
+) {
+    const unsigned int col = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned int row = blockIdx.y;
+    if (row >= batch || col >= hidden) return;
+    const unsigned int i = row * hidden + col;
+    output[i] = rotl32(shared[i] + routed[i], 3u) ^ layer_key(layer);
+}
 "#;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -154,6 +262,9 @@ struct Config {
     sync_samples: usize,
     shared_mib: usize,
     expert_mib: usize,
+    prefill_batch: Option<usize>,
+    prefill_shared_k: usize,
+    prefill_expert_k: usize,
     expect_arch0: String,
     expect_arch1: String,
 }
@@ -168,6 +279,9 @@ impl Default for Config {
             sync_samples: 20,
             shared_mib: DEFAULT_SHARED_MIB,
             expert_mib: DEFAULT_EXPERT_MIB,
+            prefill_batch: None,
+            prefill_shared_k: 256,
+            prefill_expert_k: 128,
             expect_arch0: "gfx1100".to_owned(),
             expect_arch1: "gfx1151".to_owned(),
         }
@@ -195,6 +309,15 @@ impl Config {
                 "--sync-samples" => config.sync_samples = parse_positive(flag, value(&mut index)?)?,
                 "--shared-mib" => config.shared_mib = parse_positive(flag, value(&mut index)?)?,
                 "--expert-mib" => config.expert_mib = parse_positive(flag, value(&mut index)?)?,
+                "--prefill-batch" => {
+                    config.prefill_batch = Some(parse_positive(flag, value(&mut index)?)?)
+                }
+                "--prefill-shared-k" => {
+                    config.prefill_shared_k = parse_positive(flag, value(&mut index)?)?
+                }
+                "--prefill-expert-k" => {
+                    config.prefill_expert_k = parse_positive(flag, value(&mut index)?)?
+                }
                 "--expect-arch0" => config.expect_arch0 = value(&mut index)?.to_owned(),
                 "--expect-arch1" => config.expect_arch1 = value(&mut index)?.to_owned(),
                 "-h" | "--help" => {
@@ -207,6 +330,9 @@ impl Config {
                          --sync-samples N   one-byte dependency-chain samples (default 20)\n\
                          --shared-mib N     gfx1100 bytes read per layer (default 84)\n\
                          --expert-mib N     gfx1151 bytes read per layer (default 42)\n\
+                         --prefill-batch N  run G3 batched fixture instead of B=1 decode\n\
+                         --prefill-shared-k N  gfx1100 matrix K (default 256)\n\
+                         --prefill-expert-k N  gfx1151 matrix K (default 128)\n\
                          --expect-arch0 A   exact dense-device arch (default gfx1100)\n\
                          --expect-arch1 A   exact expert-device arch (default gfx1151)"
                     );
@@ -221,6 +347,12 @@ impl Config {
                 "--layers must be <=60 so every persistent batch fits a 256-packet AQL queue"
                     .to_owned(),
             );
+        }
+        if config.prefill_batch.is_some_and(|batch| batch > 1024) {
+            return Err("--prefill-batch must be <=1024".to_owned());
+        }
+        if config.prefill_shared_k > 4096 || config.prefill_expert_k > 4096 {
+            return Err("prefill K dimensions must be <=4096".to_owned());
         }
         Ok(config)
     }
@@ -354,6 +486,17 @@ fn kernargs(
     pointers: &[u64],
     scalars: &[u32],
 ) -> Result<KernargBuffer, Box<dyn std::error::Error>> {
+    let geometry = LaunchGeometry::new([HIDDEN as u32, 1, 1], [BLOCK, 1, 1])?;
+    kernargs_with_geometry(pool, kernel, pointers, scalars, geometry)
+}
+
+fn kernargs_with_geometry(
+    pool: &KernargPool,
+    kernel: &Kernel,
+    pointers: &[u64],
+    scalars: &[u32],
+    geometry: LaunchGeometry,
+) -> Result<KernargBuffer, Box<dyn std::error::Error>> {
     let mut buffer = pool.allocate_for(kernel.metadata())?;
     let mut offset = 0;
     for &value in pointers {
@@ -372,12 +515,11 @@ fn kernargs(
     // explicit kernarg extent.
     let hidden = offset.next_multiple_of(8);
     let bytes = buffer.as_mut_bytes();
-    write_u32_if_present(bytes, hidden, (HIDDEN as u32).div_ceil(BLOCK as u32));
-    write_u32_if_present(bytes, hidden + 4, 1);
-    write_u32_if_present(bytes, hidden + 8, 1);
-    write_u16_if_present(bytes, hidden + 12, BLOCK);
-    write_u16_if_present(bytes, hidden + 14, 1);
-    write_u16_if_present(bytes, hidden + 16, 1);
+    for axis in 0..3 {
+        let groups = geometry.grid_workitems[axis].div_ceil(u32::from(geometry.workgroup[axis]));
+        write_u32_if_present(bytes, hidden + axis * 4, groups);
+        write_u16_if_present(bytes, hidden + 12 + axis * 2, geometry.workgroup[axis]);
+    }
     write_u16_if_present(bytes, hidden + 64, 1);
     Ok(buffer)
 }
@@ -471,11 +613,146 @@ impl Buffers {
     }
 }
 
+struct PrefillBuffers {
+    state0: [DeviceBuffer; 2],
+    packet0: [DeviceBuffer; 2],
+    shared0: [DeviceBuffer; 2],
+    routed0: [DeviceBuffer; 2],
+    packet1: [DeviceBuffer; 2],
+    expert1: [DeviceBuffer; 2],
+    shared_weights0: DeviceBuffer,
+    expert_weights0: DeviceBuffer,
+    expert_weights1: DeviceBuffer,
+    elements: usize,
+    packet_words: usize,
+}
+
+impl PrefillBuffers {
+    fn allocate(
+        hip: &HipRuntime,
+        batch: usize,
+        shared_k: usize,
+        expert_k: usize,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let elements = batch
+            .checked_mul(HIDDEN)
+            .ok_or("prefill element count overflow")?;
+        let packet_words = batch
+            .checked_mul(HIDDEN + PACKET_METADATA_WORDS)
+            .ok_or("prefill packet count overflow")?;
+        hip.set_device(0)?;
+        let state0 = [hip.malloc(elements * 4)?, hip.malloc(elements * 4)?];
+        let packet0 = [hip.malloc(packet_words * 4)?, hip.malloc(packet_words * 4)?];
+        let shared0 = [hip.malloc(elements * 4)?, hip.malloc(elements * 4)?];
+        let routed0 = [hip.malloc(elements * 4)?, hip.malloc(elements * 4)?];
+        let shared_weights0 = hip.malloc(HIDDEN * shared_k * 4)?;
+        let expert_weights0 = hip.malloc(HIDDEN * expert_k * 4)?;
+
+        hip.set_device(1)?;
+        let packet1 = [hip.malloc(packet_words * 4)?, hip.malloc(packet_words * 4)?];
+        let expert1 = [hip.malloc(elements * 4)?, hip.malloc(elements * 4)?];
+        let expert_weights1 = hip.malloc(HIDDEN * expert_k * 4)?;
+        Ok(Self {
+            state0,
+            packet0,
+            shared0,
+            routed0,
+            packet1,
+            expert1,
+            shared_weights0,
+            expert_weights0,
+            expert_weights1,
+            elements,
+            packet_words,
+        })
+    }
+
+    fn upload_weights(
+        &self,
+        hip: &HipRuntime,
+        shared: &[u32],
+        expert: &[u32],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        hip.set_device(0)?;
+        hip.memcpy_htod(&self.shared_weights0, u32_bytes(shared))?;
+        hip.memcpy_htod(&self.expert_weights0, u32_bytes(expert))?;
+        hip.device_synchronize()?;
+        hip.set_device(1)?;
+        hip.memcpy_htod(&self.expert_weights1, u32_bytes(expert))?;
+        hip.device_synchronize()?;
+        Ok(())
+    }
+
+    fn initialize(
+        &self,
+        hip: &HipRuntime,
+        initial: &[u32],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if initial.len() != self.elements {
+            return Err("prefill initial-state length mismatch".into());
+        }
+        hip.set_device(0)?;
+        hip.memcpy_htod(&self.state0[0], u32_bytes(initial))?;
+        hip.memset(&self.state0[1], 0, self.elements * 4)?;
+        for slot in 0..2 {
+            hip.memset(&self.packet0[slot], 0, self.packet_words * 4)?;
+            hip.memset(&self.shared0[slot], 0, self.elements * 4)?;
+            hip.memset(&self.routed0[slot], 0, self.elements * 4)?;
+        }
+        hip.device_synchronize()?;
+        hip.set_device(1)?;
+        for slot in 0..2 {
+            hip.memset(&self.packet1[slot], 0, self.packet_words * 4)?;
+            hip.memset(&self.expert1[slot], 0, self.elements * 4)?;
+        }
+        hip.device_synchronize()?;
+        Ok(())
+    }
+
+    fn read_output(
+        &self,
+        hip: &HipRuntime,
+        layers: usize,
+    ) -> Result<Vec<u32>, Box<dyn std::error::Error>> {
+        hip.set_device(0)?;
+        let mut output = vec![0_u32; self.elements];
+        hip.memcpy_dtoh(u32_bytes_mut(&mut output), &self.state0[layers % 2])?;
+        Ok(output)
+    }
+
+    fn assert_output(
+        &self,
+        hip: &HipRuntime,
+        layers: usize,
+        expected: &[u32],
+        label: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let actual = self.read_output(hip, layers)?;
+        if actual != expected {
+            let first = actual
+                .iter()
+                .zip(expected)
+                .position(|(a, b)| a != b)
+                .unwrap_or(0);
+            return Err(format!(
+                "{label}: raw-bit mismatch at {first}: got={:#010x}, expected={:#010x}",
+                actual[first], expected[first]
+            )
+            .into());
+        }
+        Ok(())
+    }
+}
+
 struct KernelSet {
     producer: Kernel,
     shared: Kernel,
     expert: Kernel,
     join: Kernel,
+    prefill_producer: Kernel,
+    prefill_shared: Kernel,
+    prefill_expert: Kernel,
+    prefill_join: Kernel,
 }
 
 struct Graph {
@@ -786,6 +1063,284 @@ impl Graph {
     }
 }
 
+struct PrefillGraph {
+    schedule: Schedule,
+    runtime: Runtime,
+    dev0: GpuDevice,
+    dev1: GpuDevice,
+    queues: QueueSet,
+    batches: [Vec<PacketImage>; 2],
+    producer_signals: Vec<CompletionSignal>,
+    shared_signals: Vec<CompletionSignal>,
+    activation_signals: Vec<CompletionSignal>,
+    expert_signals: Vec<CompletionSignal>,
+    result_signals: Vec<CompletionSignal>,
+    join_signals: Vec<CompletionSignal>,
+    _kernargs: Vec<KernargBuffer>,
+    layers: usize,
+    activation_bytes: usize,
+    result_bytes: usize,
+}
+
+impl PrefillGraph {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        schedule: Schedule,
+        runtime: &Runtime,
+        dev0: &GpuDevice,
+        dev1: &GpuDevice,
+        kernels: &KernelSet,
+        buffers: &PrefillBuffers,
+        layers: usize,
+        batch: usize,
+        shared_k: usize,
+        expert_k: usize,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let pool0 = KernargPool::discover(dev0)?;
+        let pool1 = KernargPool::discover(dev1)?;
+        let queues = QueueSet::create_for_devices(&[dev0.clone(), dev1.clone()], 256)?;
+        queues.set_profiling(true)?;
+        let mut batches = [
+            Vec::with_capacity(layers * 4),
+            Vec::with_capacity(layers * 2),
+        ];
+        let mut producer_signals = Vec::with_capacity(layers);
+        let mut shared_signals = Vec::with_capacity(layers);
+        let mut activation_signals = Vec::with_capacity(layers);
+        let mut expert_signals = Vec::with_capacity(layers);
+        let mut result_signals = Vec::with_capacity(layers);
+        let mut join_signals = Vec::with_capacity(layers);
+        for _ in 0..layers {
+            producer_signals.push(CompletionSignal::new(dev0)?);
+            shared_signals.push(CompletionSignal::new(dev0)?);
+            activation_signals.push(CompletionSignal::new(dev1)?);
+            expert_signals.push(CompletionSignal::new(dev1)?);
+            result_signals.push(CompletionSignal::new(dev0)?);
+            join_signals.push(CompletionSignal::new(dev0)?);
+        }
+        let batch_u32 = u32::try_from(batch)?;
+        let shared_k_u32 = u32::try_from(shared_k)?;
+        let expert_k_u32 = u32::try_from(expert_k)?;
+        let geometry = LaunchGeometry::new([HIDDEN as u32, batch_u32, 1], [BLOCK, 1, 1])?;
+        let mut all_kernargs = Vec::with_capacity(layers * 4);
+        for layer in 0..layers {
+            let slot = layer % 2;
+            let output_slot = (layer + 1) % 2;
+            let layer_u32 = layer as u32;
+            let common = [layer_u32, HIDDEN as u32, batch_u32];
+
+            let producer_args = kernargs_with_geometry(
+                &pool0,
+                &kernels.prefill_producer,
+                &[
+                    pointer(&buffers.state0[slot]),
+                    pointer(&buffers.packet0[slot]),
+                ],
+                &common,
+                geometry,
+            )?;
+            let producer_packet = KernelDispatchPacket::new(
+                kernels.prefill_producer.metadata(),
+                geometry,
+                0,
+                producer_args.address(),
+                producer_signals[layer].raw(),
+            )?;
+            batches[0].push(PacketImage::kernel(&producer_packet));
+            all_kernargs.push(producer_args);
+
+            let shared_args = kernargs_with_geometry(
+                &pool0,
+                &kernels.prefill_shared,
+                &[
+                    pointer(&buffers.packet0[slot]),
+                    pointer(&buffers.shared_weights0),
+                    pointer(&buffers.shared0[slot]),
+                ],
+                &[layer_u32, HIDDEN as u32, batch_u32, shared_k_u32],
+                geometry,
+            )?;
+            let shared_packet = KernelDispatchPacket::new(
+                kernels.prefill_shared.metadata(),
+                geometry,
+                0,
+                shared_args.address(),
+                shared_signals[layer].raw(),
+            )?;
+            batches[0].push(PacketImage::kernel(&shared_packet));
+            all_kernargs.push(shared_args);
+
+            let join_barrier = BarrierAndPacket::new(
+                &[result_signals[layer].raw()],
+                redline_rocr::abi::Signal(0),
+            )?;
+            batches[0].push(PacketImage::barrier(&join_barrier));
+            let join_args = kernargs_with_geometry(
+                &pool0,
+                &kernels.prefill_join,
+                &[
+                    pointer(&buffers.shared0[slot]),
+                    pointer(&buffers.routed0[slot]),
+                    pointer(&buffers.state0[output_slot]),
+                ],
+                &common,
+                geometry,
+            )?;
+            let join_packet = KernelDispatchPacket::new(
+                kernels.prefill_join.metadata(),
+                geometry,
+                0,
+                join_args.address(),
+                join_signals[layer].raw(),
+            )?;
+            batches[0].push(PacketImage::kernel(&join_packet));
+            all_kernargs.push(join_args);
+
+            let activation_barrier = BarrierAndPacket::new(
+                &[activation_signals[layer].raw()],
+                redline_rocr::abi::Signal(0),
+            )?;
+            batches[1].push(PacketImage::barrier(&activation_barrier));
+            let expert_args = kernargs_with_geometry(
+                &pool1,
+                &kernels.prefill_expert,
+                &[
+                    pointer(&buffers.packet1[slot]),
+                    pointer(&buffers.expert_weights1),
+                    pointer(&buffers.expert1[slot]),
+                ],
+                &[layer_u32, HIDDEN as u32, batch_u32, expert_k_u32],
+                geometry,
+            )?;
+            let expert_packet = KernelDispatchPacket::new(
+                kernels.prefill_expert.metadata(),
+                geometry,
+                0,
+                expert_args.address(),
+                expert_signals[layer].raw(),
+            )?;
+            batches[1].push(PacketImage::kernel(&expert_packet));
+            all_kernargs.push(expert_args);
+        }
+        Ok(Self {
+            schedule,
+            runtime: runtime.clone(),
+            dev0: dev0.clone(),
+            dev1: dev1.clone(),
+            queues,
+            batches,
+            producer_signals,
+            shared_signals,
+            activation_signals,
+            expert_signals,
+            result_signals,
+            join_signals,
+            _kernargs: all_kernargs,
+            layers,
+            activation_bytes: buffers.packet_words * 4,
+            result_bytes: buffers.elements * 4,
+        })
+    }
+
+    fn reset(&mut self) {
+        for layer in 0..self.layers {
+            self.producer_signals[layer].reset();
+            self.shared_signals[layer].reset();
+            self.activation_signals[layer].reset();
+            self.expert_signals[layer].reset();
+            self.result_signals[layer].reset();
+            self.join_signals[layer].reset();
+        }
+    }
+
+    fn run(&mut self, buffers: &PrefillBuffers) -> Result<RunReport, Box<dyn std::error::Error>> {
+        self.reset();
+        let started = Instant::now();
+        for layer in 0..self.layers {
+            let slot = layer % 2;
+            let activation_dependency = match self.schedule {
+                Schedule::Overlap => &self.producer_signals[layer],
+                Schedule::Serial => &self.shared_signals[layer],
+            };
+            // SAFETY: all allocations and dependency signals are persistent
+            // through terminal completion; the previous graph is quiescent
+            // before signals or parity slots are reused.
+            unsafe {
+                self.dev1.memory_async_copy(
+                    buffers.packet1[slot].as_ptr(),
+                    &self.dev0,
+                    buffers.packet0[slot].as_ptr(),
+                    self.activation_bytes,
+                    &[activation_dependency],
+                    &self.activation_signals[layer],
+                    Some(COPY_TO_EXPERT_ENGINE),
+                )?;
+                self.dev0.memory_async_copy(
+                    buffers.routed0[slot].as_ptr(),
+                    &self.dev1,
+                    buffers.expert1[slot].as_ptr(),
+                    self.result_bytes,
+                    &[&self.expert_signals[layer]],
+                    &self.result_signals[layer],
+                    Some(COPY_TO_DENSE_ENGINE),
+                )?;
+            }
+        }
+        self.queues.prepare_batches(&self.batches)?;
+        self.queues.ring_prepared()?;
+        let host_enqueue_us = started.elapsed().as_secs_f64() * 1_000_000.0;
+        self.queues.wait_signal(
+            &self.join_signals[self.layers - 1],
+            Duration::from_secs(120),
+        )?;
+        for signals in [
+            &self.producer_signals,
+            &self.shared_signals,
+            &self.activation_signals,
+            &self.expert_signals,
+            &self.result_signals,
+            &self.join_signals,
+        ] {
+            for signal in signals {
+                if signal.value_scacquire() != 0 {
+                    return Err(format!(
+                        "prefill {} completion signal ended at {}",
+                        self.schedule.label(),
+                        signal.value_scacquire()
+                    )
+                    .into());
+                }
+            }
+        }
+        Ok(RunReport {
+            wall_ms: started.elapsed().as_secs_f64() * 1000.0,
+            host_enqueue_us,
+        })
+    }
+
+    fn timeline_report(&self) -> Result<TimelineReport, Box<dyn std::error::Error>> {
+        timeline_report(
+            &self.runtime,
+            &self.dev0,
+            &self.dev1,
+            &self.producer_signals,
+            &self.shared_signals,
+            &self.activation_signals,
+            &self.expert_signals,
+            &self.result_signals,
+            &self.join_signals,
+        )
+    }
+
+    fn pcie_bytes_per_graph(&self) -> usize {
+        self.layers * (self.activation_bytes + self.result_bytes)
+    }
+
+    fn pcie_transactions_per_graph(&self) -> usize {
+        self.layers * 2
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct RunReport {
     wall_ms: f64,
@@ -813,6 +1368,93 @@ fn signed_gap(start: u64, end: u64) -> i128 {
     i128::from(start) - i128::from(end)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn timeline_report(
+    runtime: &Runtime,
+    dev0: &GpuDevice,
+    dev1: &GpuDevice,
+    producer_signals: &[CompletionSignal],
+    shared_signals: &[CompletionSignal],
+    activation_signals: &[CompletionSignal],
+    expert_signals: &[CompletionSignal],
+    result_signals: &[CompletionSignal],
+    join_signals: &[CompletionSignal],
+) -> Result<TimelineReport, Box<dyn std::error::Error>> {
+    let layers = producer_signals.len();
+    if [
+        shared_signals.len(),
+        activation_signals.len(),
+        expert_signals.len(),
+        result_signals.len(),
+        join_signals.len(),
+    ]
+    .into_iter()
+    .any(|len| len != layers)
+    {
+        return Err("heterogeneous timeline signal-count mismatch".into());
+    }
+    let frequency = dev0.timestamp_frequency_hz()?;
+    let mut shared_ticks = 0_u64;
+    let mut expert_ticks = 0_u64;
+    let mut activation_copy_ticks = 0_u64;
+    let mut result_copy_ticks = 0_u64;
+    let mut shared_expert_overlap_ticks = 0_u64;
+    let mut activation_shared_overlap_ticks = 0_u64;
+    let mut overlap_layers = 0_usize;
+    let mut producer_to_shared_gap_ticks = 0_i128;
+    let mut producer_to_activation_gap_ticks = 0_i128;
+    let mut activation_to_expert_gap_ticks = 0_i128;
+    let mut expert_to_result_gap_ticks = 0_i128;
+    let mut result_to_join_gap_ticks = 0_i128;
+    let mut shared_to_join_gap_ticks = 0_i128;
+    for layer in 0..layers {
+        let producer = dev0.dispatch_time(&producer_signals[layer])?;
+        let shared = dev0.dispatch_time(&shared_signals[layer])?;
+        let activation = runtime.async_copy_time(&activation_signals[layer])?;
+        let expert = dev1.dispatch_time(&expert_signals[layer])?;
+        let result = runtime.async_copy_time(&result_signals[layer])?;
+        let join = dev0.dispatch_time(&join_signals[layer])?;
+        shared_ticks += shared.end - shared.start;
+        expert_ticks += expert.end - expert.start;
+        activation_copy_ticks += activation.end - activation.start;
+        result_copy_ticks += result.end - result.start;
+        let shared_expert_overlap = shared
+            .end
+            .min(expert.end)
+            .saturating_sub(shared.start.max(expert.start));
+        let activation_shared_overlap = activation
+            .end
+            .min(shared.end)
+            .saturating_sub(activation.start.max(shared.start));
+        shared_expert_overlap_ticks += shared_expert_overlap;
+        activation_shared_overlap_ticks += activation_shared_overlap;
+        overlap_layers += usize::from(shared_expert_overlap != 0);
+        producer_to_shared_gap_ticks += signed_gap(shared.start, producer.end);
+        producer_to_activation_gap_ticks += signed_gap(activation.start, producer.end);
+        activation_to_expert_gap_ticks += signed_gap(expert.start, activation.end);
+        expert_to_result_gap_ticks += signed_gap(result.start, expert.end);
+        result_to_join_gap_ticks += signed_gap(join.start, result.end);
+        shared_to_join_gap_ticks += signed_gap(join.start, shared.end);
+    }
+    let to_us = |ticks: u64| ticks as f64 * 1_000_000.0 / frequency as f64;
+    let signed_to_us = |ticks: i128| ticks as f64 * 1_000_000.0 / frequency as f64;
+    Ok(TimelineReport {
+        shared_us: to_us(shared_ticks),
+        expert_us: to_us(expert_ticks),
+        activation_copy_us: to_us(activation_copy_ticks),
+        result_copy_us: to_us(result_copy_ticks),
+        shared_expert_overlap_us: to_us(shared_expert_overlap_ticks),
+        activation_shared_overlap_us: to_us(activation_shared_overlap_ticks),
+        overlap_layers,
+        producer_to_shared_gap_us: signed_to_us(producer_to_shared_gap_ticks),
+        producer_to_activation_gap_us: signed_to_us(producer_to_activation_gap_ticks),
+        activation_to_expert_gap_us: signed_to_us(activation_to_expert_gap_ticks),
+        expert_to_result_gap_us: signed_to_us(expert_to_result_gap_ticks),
+        result_to_join_gap_us: signed_to_us(result_to_join_gap_ticks),
+        shared_to_join_gap_us: signed_to_us(shared_to_join_gap_ticks),
+    })
+}
+
 struct HipFunctions {
     _module0: Module,
     _module1: Module,
@@ -820,6 +1462,10 @@ struct HipFunctions {
     shared: Function,
     expert: Function,
     join: Function,
+    prefill_producer: Function,
+    prefill_shared: Function,
+    prefill_expert0: Function,
+    prefill_join: Function,
 }
 
 impl HipFunctions {
@@ -833,6 +1479,11 @@ impl HipFunctions {
         let producer = hip.module_get_function(&module0, "hetero_gfx11_producer")?;
         let shared = hip.module_get_function(&module0, "hetero_gfx11_shared")?;
         let join = hip.module_get_function(&module0, "hetero_gfx11_join")?;
+        let prefill_producer =
+            hip.module_get_function(&module0, "hetero_gfx11_prefill_producer")?;
+        let prefill_shared = hip.module_get_function(&module0, "hetero_gfx11_prefill_shared")?;
+        let prefill_expert0 = hip.module_get_function(&module0, "hetero_gfx11_prefill_expert")?;
+        let prefill_join = hip.module_get_function(&module0, "hetero_gfx11_prefill_join")?;
         hip.set_device(1)?;
         let module1 = hip.module_load_data(image1)?;
         let expert = hip.module_get_function(&module1, "hetero_gfx11_expert")?;
@@ -843,6 +1494,10 @@ impl HipFunctions {
             shared,
             expert,
             join,
+            prefill_producer,
+            prefill_shared,
+            prefill_expert0,
+            prefill_join,
         })
     }
 }
@@ -948,6 +1603,176 @@ fn launch_join(
         )?;
     }
     Ok(())
+}
+
+fn launch_prefill_producer(
+    hip: &HipRuntime,
+    function: &Function,
+    input: &DeviceBuffer,
+    packet: &DeviceBuffer,
+    layer: u32,
+    batch: u32,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut input = input.as_ptr();
+    let mut packet = packet.as_ptr();
+    let mut layer = layer;
+    let mut hidden = HIDDEN as u32;
+    let mut batch = batch;
+    let mut params = [
+        (&mut input as *mut *mut c_void).cast(),
+        (&mut packet as *mut *mut c_void).cast(),
+        (&mut layer as *mut u32).cast(),
+        (&mut hidden as *mut u32).cast(),
+        (&mut batch as *mut u32).cast(),
+    ];
+    // SAFETY: parameters and 2-D geometry match the compiled kernel ABI.
+    unsafe {
+        hip.launch_kernel(
+            function,
+            [(HIDDEN as u32).div_ceil(BLOCK as u32), batch, 1],
+            [BLOCK as u32, 1, 1],
+            0,
+            None,
+            &mut params,
+        )?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn launch_prefill_branch(
+    hip: &HipRuntime,
+    function: &Function,
+    packet: &DeviceBuffer,
+    weights: &DeviceBuffer,
+    output: &DeviceBuffer,
+    layer: u32,
+    batch: u32,
+    k_dim: u32,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut packet = packet.as_ptr();
+    let mut weights = weights.as_ptr();
+    let mut output = output.as_ptr();
+    let mut layer = layer;
+    let mut hidden = HIDDEN as u32;
+    let mut batch = batch;
+    let mut k_dim = k_dim;
+    let mut params = [
+        (&mut packet as *mut *mut c_void).cast(),
+        (&mut weights as *mut *mut c_void).cast(),
+        (&mut output as *mut *mut c_void).cast(),
+        (&mut layer as *mut u32).cast(),
+        (&mut hidden as *mut u32).cast(),
+        (&mut batch as *mut u32).cast(),
+        (&mut k_dim as *mut u32).cast(),
+    ];
+    // SAFETY: parameters and 2-D geometry match both prefill branch ABIs.
+    unsafe {
+        hip.launch_kernel(
+            function,
+            [(HIDDEN as u32).div_ceil(BLOCK as u32), batch, 1],
+            [BLOCK as u32, 1, 1],
+            0,
+            None,
+            &mut params,
+        )?;
+    }
+    Ok(())
+}
+
+fn launch_prefill_join(
+    hip: &HipRuntime,
+    function: &Function,
+    shared: &DeviceBuffer,
+    routed: &DeviceBuffer,
+    output: &DeviceBuffer,
+    layer: u32,
+    batch: u32,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut shared = shared.as_ptr();
+    let mut routed = routed.as_ptr();
+    let mut output = output.as_ptr();
+    let mut layer = layer;
+    let mut hidden = HIDDEN as u32;
+    let mut batch = batch;
+    let mut params = [
+        (&mut shared as *mut *mut c_void).cast(),
+        (&mut routed as *mut *mut c_void).cast(),
+        (&mut output as *mut *mut c_void).cast(),
+        (&mut layer as *mut u32).cast(),
+        (&mut hidden as *mut u32).cast(),
+        (&mut batch as *mut u32).cast(),
+    ];
+    // SAFETY: parameters and 2-D geometry match the compiled join ABI.
+    unsafe {
+        hip.launch_kernel(
+            function,
+            [(HIDDEN as u32).div_ceil(BLOCK as u32), batch, 1],
+            [BLOCK as u32, 1, 1],
+            0,
+            None,
+            &mut params,
+        )?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn single_device_prefill_oracle(
+    hip: &HipRuntime,
+    functions: &HipFunctions,
+    buffers: &PrefillBuffers,
+    layers: usize,
+    batch: usize,
+    shared_k: usize,
+    expert_k: usize,
+) -> Result<Vec<u32>, Box<dyn std::error::Error>> {
+    hip.set_device(0)?;
+    let batch = u32::try_from(batch)?;
+    let shared_k = u32::try_from(shared_k)?;
+    let expert_k = u32::try_from(expert_k)?;
+    for layer in 0..layers {
+        let slot = layer % 2;
+        launch_prefill_producer(
+            hip,
+            &functions.prefill_producer,
+            &buffers.state0[slot],
+            &buffers.packet0[slot],
+            layer as u32,
+            batch,
+        )?;
+        launch_prefill_branch(
+            hip,
+            &functions.prefill_shared,
+            &buffers.packet0[slot],
+            &buffers.shared_weights0,
+            &buffers.shared0[slot],
+            layer as u32,
+            batch,
+            shared_k,
+        )?;
+        launch_prefill_branch(
+            hip,
+            &functions.prefill_expert0,
+            &buffers.packet0[slot],
+            &buffers.expert_weights0,
+            &buffers.routed0[slot],
+            layer as u32,
+            batch,
+            expert_k,
+        )?;
+        launch_prefill_join(
+            hip,
+            &functions.prefill_join,
+            &buffers.shared0[slot],
+            &buffers.routed0[slot],
+            &buffers.state0[(layer + 1) % 2],
+            layer as u32,
+            batch,
+        )?;
+    }
+    hip.device_synchronize()?;
+    buffers.read_output(hip, layers)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1105,6 +1930,150 @@ fn compile_exact(
     Ok((image, artifact.display().to_string()))
 }
 
+#[allow(clippy::too_many_arguments)]
+fn run_prefill(
+    config: &Config,
+    batch: usize,
+    hip: &HipRuntime,
+    runtime: &Runtime,
+    dev0: &GpuDevice,
+    dev1: &GpuDevice,
+    kernels: &KernelSet,
+    functions: &HipFunctions,
+    artifact0: &str,
+    artifact1: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let shared_weights = make_words(HIDDEN * config.prefill_shared_k, 0x1357_9bdf);
+    let expert_weights = make_words(HIDDEN * config.prefill_expert_k, 0x2468_ace0);
+    let initial = make_words(batch * HIDDEN, 0xa5a5_5a5a ^ batch as u32);
+    let buffers =
+        PrefillBuffers::allocate(hip, batch, config.prefill_shared_k, config.prefill_expert_k)?;
+    buffers.upload_weights(hip, &shared_weights, &expert_weights)?;
+    drop(shared_weights);
+    drop(expert_weights);
+
+    buffers.initialize(hip, &initial)?;
+    let expected = single_device_prefill_oracle(
+        hip,
+        functions,
+        &buffers,
+        config.layers,
+        batch,
+        config.prefill_shared_k,
+        config.prefill_expert_k,
+    )?;
+    println!(
+        "prefill_identity arch0={} pci0={} hsaco0={} arch1={} pci1={} hsaco1={} layers={} batch={} hidden={} shared_k={} expert_k={} activation_bytes_per_layer={} result_bytes_per_layer={} persistent_device_allocations=15 persistent_kernargs={} persistent_completion_signals={} persistent_queues=2 parity_slots=2 oracle=single_gfx1100",
+        dev0.name(),
+        dev0.pci_bus_id(),
+        artifact0,
+        dev1.name(),
+        dev1.pci_bus_id(),
+        artifact1,
+        config.layers,
+        batch,
+        HIDDEN,
+        config.prefill_shared_k,
+        config.prefill_expert_k,
+        buffers.packet_words * 4,
+        buffers.elements * 4,
+        config.layers * 4,
+        config.layers * 6,
+    );
+
+    let mut serial_p50 = None;
+    for schedule in [Schedule::Serial, Schedule::Overlap] {
+        let mut graph = PrefillGraph::new(
+            schedule,
+            runtime,
+            dev0,
+            dev1,
+            kernels,
+            &buffers,
+            config.layers,
+            batch,
+            config.prefill_shared_k,
+            config.prefill_expert_k,
+        )?;
+        for _ in 0..config.warmups {
+            buffers.initialize(hip, &initial)?;
+            graph.run(&buffers)?;
+            buffers.assert_output(hip, config.layers, &expected, schedule.label())?;
+        }
+        let mut samples = Vec::with_capacity(config.samples);
+        let mut last_timeline = None;
+        let mut enqueue_samples = Vec::with_capacity(config.samples);
+        for sample in 0..config.samples {
+            buffers.initialize(hip, &initial)?;
+            let run = graph.run(&buffers)?;
+            buffers.assert_output(hip, config.layers, &expected, schedule.label())?;
+            let timeline = graph.timeline_report()?;
+            println!(
+                "prefill_arm={} batch={} sample={} ms={:.6} host_enqueue_us={:.3} shared_us={:.3} expert_us={:.3} activation_copy_us={:.3} result_copy_us={:.3} shared_expert_overlap_us={:.3} activation_shared_overlap_us={:.3} overlap_layers={}/{} producer_shared_gap_us={:.3} producer_activation_gap_us={:.3} activation_expert_gap_us={:.3} expert_result_gap_us={:.3} result_join_gap_us={:.3} shared_join_gap_us={:.3} pcie_bytes={} pcie_transactions={} raw_bits=PASS",
+                schedule.label(),
+                batch,
+                sample + 1,
+                run.wall_ms,
+                run.host_enqueue_us,
+                timeline.shared_us,
+                timeline.expert_us,
+                timeline.activation_copy_us,
+                timeline.result_copy_us,
+                timeline.shared_expert_overlap_us,
+                timeline.activation_shared_overlap_us,
+                timeline.overlap_layers,
+                config.layers,
+                timeline.producer_to_shared_gap_us,
+                timeline.producer_to_activation_gap_us,
+                timeline.activation_to_expert_gap_us,
+                timeline.expert_to_result_gap_us,
+                timeline.result_to_join_gap_us,
+                timeline.shared_to_join_gap_us,
+                graph.pcie_bytes_per_graph(),
+                graph.pcie_transactions_per_graph(),
+            );
+            samples.push(run.wall_ms);
+            enqueue_samples.push(run.host_enqueue_us);
+            last_timeline = Some(timeline);
+        }
+        let median = p50(&samples);
+        let enqueue_p50 = p50(&enqueue_samples);
+        let tokens_per_second = batch as f64 * 1000.0 / median;
+        let timeline = last_timeline.expect("at least one prefill sample");
+        println!(
+            "prefill_arm={} batch={} samples={} p50_ms={median:.6} host_enqueue_p50_us={enqueue_p50:.3} rows_per_second={tokens_per_second:.3} overlap_us={:.3} overlap_layers={}/{}",
+            schedule.label(),
+            batch,
+            samples.len(),
+            timeline.shared_expert_overlap_us,
+            timeline.overlap_layers,
+            config.layers,
+        );
+        match schedule {
+            Schedule::Serial => serial_p50 = Some(median),
+            Schedule::Overlap => {
+                if timeline.overlap_layers == 0 {
+                    return Err("prefill overlap arm showed zero shared/expert overlap".into());
+                }
+                let serial = serial_p50.expect("prefill serial arm runs first");
+                let speedup = serial / median;
+                println!(
+                    "prefill_gate batch={} vs_serial_speedup={speedup:.6} raw_bits=PASS no_host_wait_inside_graph=true stable_allocations=true",
+                    batch
+                );
+                if speedup < 1.02 {
+                    return Err(format!(
+                        "prefill overlap does not beat serial scheduling by 2%: {speedup:.4}x"
+                    )
+                    .into());
+                }
+            }
+        }
+    }
+    println!("hetero_gfx11_prefill batch={batch}: PASS");
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::parse().map_err(|error| format!("hetero_gfx11_cooperative: {error}"))?;
     let hip = HipRuntime::load()?;
@@ -1156,8 +2125,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         shared: executable0.kernel("hetero_gfx11_shared.kd")?,
         expert: executable1.kernel("hetero_gfx11_expert.kd")?,
         join: executable0.kernel("hetero_gfx11_join.kd")?,
+        prefill_producer: executable0.kernel("hetero_gfx11_prefill_producer.kd")?,
+        prefill_shared: executable0.kernel("hetero_gfx11_prefill_shared.kd")?,
+        prefill_expert: executable1.kernel("hetero_gfx11_prefill_expert.kd")?,
+        prefill_join: executable0.kernel("hetero_gfx11_prefill_join.kd")?,
     };
     let hip_functions = HipFunctions::load(&hip, &image0, &image1)?;
+
+    if let Some(batch) = config.prefill_batch {
+        return run_prefill(
+            &config,
+            batch,
+            &hip,
+            &runtime,
+            &dev0,
+            &dev1,
+            &kernels,
+            &hip_functions,
+            &artifact0,
+            &artifact1,
+        );
+    }
 
     let shared_bytes = config.shared_mib * 1024 * 1024;
     let expert_bytes = config.expert_mib * 1024 * 1024;
