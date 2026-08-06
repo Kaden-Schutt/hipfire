@@ -1423,10 +1423,6 @@ pub struct IndexerLayerState {
     pub comp_kv_buf: Option<rdna_compute::GpuTensor>,
     /// Per-step score = wgate @ x + ape   [proj_dim] F32.
     pub comp_score_buf: Option<rdna_compute::GpuTensor>,
-    /// Dedicated ratio-4 indexer projection outputs used by the heterogeneous
-    /// gfx1100 ragged launch. The ordinary sequential route reuses comp_*.
-    pub ragged_indexer_kv_buf: Option<rdna_compute::GpuTensor>,
-    pub ragged_indexer_score_buf: Option<rdna_compute::GpuTensor>,
     /// Concat scratch for overlap-pool   [2*ratio, head_dim] F32.
     pub comp_concat_kv: Option<rdna_compute::GpuTensor>,
     pub comp_concat_score: Option<rdna_compute::GpuTensor>,
@@ -1861,8 +1857,6 @@ impl DeepseekV4State {
                 topk_ws_indices: None,
                 comp_kv_buf: None,
                 comp_score_buf: None,
-                ragged_indexer_kv_buf: None,
-                ragged_indexer_score_buf: None,
                 comp_concat_kv: None,
                 comp_concat_score: None,
             });
@@ -2057,8 +2051,6 @@ impl DeepseekV4State {
             zinf(gpu, &l.indexer_score_state);
             z(gpu, &l.comp_kv_buf);
             z(gpu, &l.comp_score_buf);
-            z(gpu, &l.ragged_indexer_kv_buf);
-            z(gpu, &l.ragged_indexer_score_buf);
             z(gpu, &l.comp_concat_kv);
             z(gpu, &l.comp_concat_score);
         }
@@ -2115,8 +2107,6 @@ impl DeepseekV4State {
             free_opt(gpu, &mut l.topk_ws_indices);
             free_opt(gpu, &mut l.comp_kv_buf);
             free_opt(gpu, &mut l.comp_score_buf);
-            free_opt(gpu, &mut l.ragged_indexer_kv_buf);
-            free_opt(gpu, &mut l.ragged_indexer_score_buf);
             free_opt(gpu, &mut l.comp_concat_kv);
             free_opt(gpu, &mut l.comp_concat_score);
         }

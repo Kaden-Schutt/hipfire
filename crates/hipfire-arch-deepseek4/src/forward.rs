@@ -4404,63 +4404,8 @@ fn ds4_attn_block_heterogeneous(
 
     std::mem::swap(&mut gpu.active_stream, &mut execution.dense_attn_stream);
     let side_result = (|| {
-        let ragged = heterogeneous_gfx1100_side_projections(cfg, weights, state, gpu, layer_idx)?;
-        if ragged {
-            kv_joint_finalize(cfg, weights, state, gpu, layer_idx)?;
-            let main_dim = if layer.compress_ratio == 4 { 2 } else { 1 } * cfg.head_dim;
-            let main_kv = state._indexer[layer_idx]
-                .comp_kv_buf
-                .as_ref()
-                .unwrap()
-                .sub_offset(0, main_dim);
-            let main_score = state._indexer[layer_idx]
-                .comp_score_buf
-                .as_ref()
-                .unwrap()
-                .sub_offset(0, main_dim);
-            compressor_forward_prebatched(
-                cfg,
-                weights,
-                state,
-                gpu,
-                layer_idx,
-                position,
-                /*is_indexer=*/ false,
-                &main_kv,
-                &main_score,
-                0,
-                /*state_buffer_driven=*/ true,
-            )?;
-            if layer.compress_ratio == 4 {
-                let indexer_dim = 2 * cfg.index_head_dim;
-                let indexer_kv = state._indexer[layer_idx]
-                    .ragged_indexer_kv_buf
-                    .as_ref()
-                    .unwrap()
-                    .sub_offset(0, indexer_dim);
-                let indexer_score = state._indexer[layer_idx]
-                    .ragged_indexer_score_buf
-                    .as_ref()
-                    .unwrap()
-                    .sub_offset(0, indexer_dim);
-                compressor_forward_prebatched(
-                    cfg,
-                    weights,
-                    state,
-                    gpu,
-                    layer_idx,
-                    position,
-                    /*is_indexer=*/ true,
-                    &indexer_kv,
-                    &indexer_score,
-                    0,
-                    /*state_buffer_driven=*/ true,
-                )?;
-            }
-        } else {
-            kv_joint(cfg, weights, state, gpu, layer_idx)?;
-        }
-        if !ragged && layer.compress_ratio > 0 {
+        kv_joint(cfg, weights, state, gpu, layer_idx)?;
+        if layer.compress_ratio > 0 {
             let tmp_view = {
                 let tmp = state.tmp.as_ref().unwrap();
                 tmp.sub_offset(0, tmp.numel())
@@ -8337,123 +8282,6 @@ fn apply_tail_rope(
     Ok(())
 }
 
-/// Collapse the independent gfx1100-owned KV and compressor projections which
-/// consume the same attention-normalized hidden vector. Returns false when the
-/// layer does not have a groupable all-E8 compressor family.
-fn heterogeneous_gfx1100_side_projections(
-    cfg: &DeepseekV4Config,
-    weights: &DeepseekV4Weights,
-    state: &mut DeepseekV4State,
-    gpu: &mut Gpu,
-    layer_idx: usize,
-) -> Result<bool, String> {
-    if gpu.arch != "gfx1100" {
-        return Ok(false);
-    }
-    let layer = weights.resolve_layer(layer_idx);
-    let ratio = layer.compress_ratio as usize;
-    if ratio == 0 {
-        return Ok(false);
-    }
-    let wkv = layer
-        .wkv
-        .as_ref()
-        .ok_or_else(|| format!("layer {layer_idx} wkv missing"))?;
-    let main_wkv = layer
-        .compressor_wkv
-        .as_ref()
-        .ok_or_else(|| format!("comp_wkv l{layer_idx}"))?;
-    let main_wgate = layer
-        .compressor_wgate
-        .as_ref()
-        .ok_or_else(|| format!("comp_wgate l{layer_idx}"))?;
-    let mut projection_weights = vec![wkv, main_wkv, main_wgate];
-    if ratio == 4 {
-        projection_weights.push(
-            layer
-                .indexer_compressor_wkv
-                .as_ref()
-                .ok_or_else(|| format!("idx_comp_wkv l{layer_idx}"))?,
-        );
-        projection_weights.push(
-            layer
-                .indexer_compressor_wgate
-                .as_ref()
-                .ok_or_else(|| format!("idx_comp_wgate l{layer_idx}"))?,
-        );
-    }
-    if projection_weights
-        .iter()
-        .any(|weight| weight.dtype != DType::MFP4G32E8SOA)
-    {
-        return Ok(false);
-    }
-
-    let kv_dim = cfg.num_key_value_heads * cfg.head_dim;
-    let main_dim = if ratio == 4 { 2 } else { 1 } * cfg.head_dim;
-    let indexer_dim = 2 * cfg.index_head_dim;
-    if state.kv.is_none() {
-        state.kv = Some(
-            gpu.alloc_tensor(&[kv_dim], DType::F32)
-                .map_err(|e| format!("alloc kv: {e:?}"))?,
-        );
-    }
-    {
-        let scratch = &mut state._indexer[layer_idx];
-        if scratch.comp_kv_buf.is_none() {
-            scratch.comp_kv_buf = Some(
-                gpu.alloc_tensor(&[main_dim], DType::F32)
-                    .map_err(|e| format!("alloc comp_kv_buf l{layer_idx}: {e:?}"))?,
-            );
-        }
-        if scratch.comp_score_buf.is_none() {
-            scratch.comp_score_buf = Some(
-                gpu.alloc_tensor(&[main_dim], DType::F32)
-                    .map_err(|e| format!("alloc comp_score_buf l{layer_idx}: {e:?}"))?,
-            );
-        }
-        if ratio == 4 && scratch.ragged_indexer_kv_buf.is_none() {
-            scratch.ragged_indexer_kv_buf = Some(
-                gpu.alloc_tensor(&[indexer_dim], DType::F32)
-                    .map_err(|e| format!("alloc ragged indexer kv l{layer_idx}: {e:?}"))?,
-            );
-        }
-        if ratio == 4 && scratch.ragged_indexer_score_buf.is_none() {
-            scratch.ragged_indexer_score_buf = Some(
-                gpu.alloc_tensor(&[indexer_dim], DType::F32)
-                    .map_err(|e| format!("alloc ragged indexer score l{layer_idx}: {e:?}"))?,
-            );
-        }
-    }
-
-    let scratch = &state._indexer[layer_idx];
-    let mut outputs = vec![
-        state.kv.as_ref().unwrap(),
-        scratch.comp_kv_buf.as_ref().unwrap(),
-        scratch.comp_score_buf.as_ref().unwrap(),
-    ];
-    let mut rows = vec![kv_dim, main_dim, main_dim];
-    if ratio == 4 {
-        outputs.push(scratch.ragged_indexer_kv_buf.as_ref().unwrap());
-        outputs.push(scratch.ragged_indexer_score_buf.as_ref().unwrap());
-        rows.push(indexer_dim);
-        rows.push(indexer_dim);
-    }
-    let x = state
-        .tmp
-        .as_ref()
-        .ok_or_else(|| format!("heterogeneous ragged input missing l{layer_idx}"))?;
-    gpu.gemv_mfp4g32_e8_soa_ragged_gfx1100(
-        &projection_weights,
-        x,
-        &outputs,
-        &rows,
-        cfg.hidden_size,
-    )
-    .map_err(|e| format!("heterogeneous ragged E8 l{layer_idx}: {e:?}"))?;
-    Ok(true)
-}
-
 /// Step 4 (attention block): Joint KV projection.
 ///
 /// DeepSeek V4 has `n_kv_heads = 1`, `head_dim = 512`, so the entire KV
@@ -8478,6 +8306,11 @@ fn kv_joint(
         .wkv
         .as_ref()
         .ok_or_else(|| format!("layer {layer_idx} wkv missing"))?;
+    let kv_norm = layer
+        .kv_norm
+        .as_ref()
+        .ok_or_else(|| format!("layer {layer_idx} kv_norm missing"))?;
+
     let kv_dim = cfg.num_key_value_heads * cfg.head_dim;
     if state.kv.is_none() {
         state.kv = Some(
@@ -8504,29 +8337,14 @@ fn kv_joint(
         cfg.hidden_size,
     )?;
 
-    kv_joint_finalize(cfg, weights, state, gpu, layer_idx)
-}
-
-fn kv_joint_finalize(
-    cfg: &DeepseekV4Config,
-    weights: &DeepseekV4Weights,
-    state: &DeepseekV4State,
-    gpu: &mut Gpu,
-    layer_idx: usize,
-) -> Result<(), String> {
-    let layer = weights.resolve_layer(layer_idx);
-    let kv_norm = layer
-        .kv_norm
-        .as_ref()
-        .ok_or_else(|| format!("layer {layer_idx} kv_norm missing"))?;
-    let kv = state
-        .kv
-        .as_ref()
-        .ok_or_else(|| format!("layer {layer_idx} kv scratch missing"))?;
-
-    // Upstream DeepSeek V4 normalizes K/V after projection and before RoPE.
+    // kv_norm RMSNorm in place (upstream DeepSeek V4: `kv = self.kv_norm(kv)`
+    // after wkv, before apply_rotary_emb). Was missing — likely
+    // contributed to the SWA attractor since Q is rmsnormed but K=V
+    // had arbitrary magnitudes.
     gpu.rmsnorm_f32(kv, kv_norm, kv, cfg.rms_norm_eps)
-        .map_err(|e| format!("kv_norm rmsnorm layer {layer_idx}: {e:?}"))
+        .map_err(|e| format!("kv_norm rmsnorm layer {layer_idx}: {e:?}"))?;
+
+    Ok(())
 }
 
 /// Step 3 (attention block): Q via Q-LoRA + tail-only RoPE.
