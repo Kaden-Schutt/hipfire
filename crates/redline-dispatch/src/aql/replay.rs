@@ -922,6 +922,10 @@ impl PhasedMultiQueuePm4Ib {
         self.logical_phase_count
     }
 
+    pub fn packet_count(&self) -> usize {
+        self.batches.iter().map(|batch| batch.len()).sum()
+    }
+
     pub fn indirect_addresses(&self) -> impl ExactSizeIterator<Item = usize> + '_ {
         self.indirects
             .iter()

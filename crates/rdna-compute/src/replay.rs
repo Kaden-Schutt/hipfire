@@ -452,6 +452,10 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             | "gemv_mq3g256_lloyd_moe_gate_up_k8_indexed"
             | "gemv_mq2g256gl_moe_gate_up_k8_indexed"
             | "gemv_mq3g256gl_moe_gate_up_k8_indexed"
+            // Batched-K4 prefill siblings: same pointer set and modes, but a
+            // K_TOP scalar makes the kernarg block 52 B, not 48 (see below).
+            | "gemv_mq2g256_lloyd_moe_gate_up_k8_indexed_batched_k4"
+            | "gemv_mq3g256_lloyd_moe_gate_up_k8_indexed_batched_k4"
     ) {
         return Some(vec![read(0), read(8), read(16), write(24), write(32)]);
     }
@@ -502,6 +506,9 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             | "gemv_mq3g256_lloyd_moe_ninepath_d4"
             | "gemv_mq2g256gl_moe_down_residual_scaled_k8_indexed"
             | "gemv_mq3g256gl_moe_down_residual_scaled_k8_indexed"
+            // Batched-K4 prefill siblings; 52 B kernarg (K_TOP scalar).
+            | "gemv_mq2g256_lloyd_moe_down_residual_scaled_k8_indexed_batched_k4"
+            | "gemv_mq3g256_lloyd_moe_down_residual_scaled_k8_indexed_batched_k4"
     ) {
         return Some(vec![read(0), read(8), read(16), read(24), write(32)]);
     }
@@ -827,6 +834,18 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
             | "gemv_mq3g256_lloyd_moe_ninepath_d4"
     ) {
         return Some(48);
+    }
+    // Batched-K4 codebook MoE: 5 pointers (40 B) + M, K, K_TOP (12 B) = 52 B.
+    // The trailing K_TOP is what makes these NOT 48 like their decode siblings;
+    // assuming 48 here would make every kernarg length check fail closed.
+    if matches!(
+        kernel,
+        "gemv_mq2g256_lloyd_moe_gate_up_k8_indexed_batched_k4"
+            | "gemv_mq3g256_lloyd_moe_gate_up_k8_indexed_batched_k4"
+            | "gemv_mq2g256_lloyd_moe_down_residual_scaled_k8_indexed_batched_k4"
+            | "gemv_mq3g256_lloyd_moe_down_residual_scaled_k8_indexed_batched_k4"
+    ) {
+        return Some(52);
     }
     if matches!(
         kernel,
@@ -1979,8 +1998,8 @@ pub struct PreparedReplayIdentity {
     pub phase_count: usize,
 }
 
-fn pm4_packet_identity(queue_count: usize, phase_count: usize) -> Option<usize> {
-    (queue_count == 1 && phase_count == 1).then_some(1)
+fn pm4_packet_identity(packet_count: usize) -> Option<usize> {
+    (packet_count > 0).then_some(packet_count)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2133,6 +2152,13 @@ impl PreparedPm4Graph {
         }
     }
 
+    fn packet_count(&self) -> usize {
+        match self {
+            Self::Single(_) => 1,
+            Self::Phased(graph) => graph.packet_count(),
+        }
+    }
+
     fn patch_dispatch_dimensions(
         &mut self,
         dispatch: usize,
@@ -2261,6 +2287,10 @@ impl PreparedPm4Replay {
 
     pub fn phase_count(&self) -> usize {
         self.graph.phase_count()
+    }
+
+    pub fn packet_count(&self) -> usize {
+        self.graph.packet_count()
     }
 }
 
@@ -2485,10 +2515,7 @@ impl ReplayController {
                     .as_ref()
                     .map(|prepared| PreparedReplayIdentity {
                         dispatch_count: prepared.dispatch_count(),
-                        packet_count: pm4_packet_identity(
-                            prepared.queue_count(),
-                            prepared.phase_count(),
-                        ),
+                        packet_count: pm4_packet_identity(prepared.packet_count()),
                         queue_id: prepared.queue_id(),
                         command_dwords: Some(prepared.command_dwords()),
                         queue_count: prepared.queue_count(),
@@ -3942,6 +3969,29 @@ mod tests {
                 80,
                 &down_effects,
             ),
+            // Batched-K4 prefill siblings. 52 B, NOT 48: the K_TOP scalar is
+            // exactly the kind of quiet ABI difference that makes a
+            // pattern-matched contract fail closed instead of loudly.
+            (
+                "gemv_mq2g256_lloyd_moe_gate_up_k8_indexed_batched_k4",
+                52,
+                &gate_up_effects,
+            ),
+            (
+                "gemv_mq3g256_lloyd_moe_gate_up_k8_indexed_batched_k4",
+                52,
+                &gate_up_effects,
+            ),
+            (
+                "gemv_mq2g256_lloyd_moe_down_residual_scaled_k8_indexed_batched_k4",
+                52,
+                &down_effects,
+            ),
+            (
+                "gemv_mq3g256_lloyd_moe_down_residual_scaled_k8_indexed_batched_k4",
+                52,
+                &down_effects,
+            ),
         ] {
             assert_eq!(expected_kernarg_bytes(symbol), Some(kernarg_bytes));
             let got = pointer_effects(symbol).expect("codebook MoE pointer contract");
@@ -4661,11 +4711,11 @@ mod tests {
     }
 
     #[test]
-    fn pm4_packet_identity_fails_closed_for_phased_or_multiqueue() {
-        assert_eq!(pm4_packet_identity(1, 1), Some(1));
-        assert_eq!(pm4_packet_identity(1, 2), None);
-        assert_eq!(pm4_packet_identity(2, 1), None);
-        assert_eq!(pm4_packet_identity(2, 2), None);
+    fn pm4_packet_identity_reports_actual_count() {
+        // Phased multi-queue graphs legitimately carry barrier + IB packets per lane.
+        assert_eq!(pm4_packet_identity(0), None);
+        assert_eq!(pm4_packet_identity(1), Some(1));
+        assert_eq!(pm4_packet_identity(260), Some(260));
     }
 
     #[test]
