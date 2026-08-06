@@ -21,8 +21,8 @@
 //! ```
 
 use hip_bridge::{
-    DeviceBuffer, Event, HipResult, HipRuntime, Stream, HIP_EVENT_DISABLE_TIMING,
-    HIP_EVENT_RELEASE_TO_SYSTEM,
+    DeviceBuffer, Event, HipError, HipResult, HipRuntime, RcclComms, RcclDataType, Stream,
+    HIP_EVENT_DISABLE_TIMING, HIP_EVENT_RELEASE_TO_SYSTEM,
 };
 use std::cell::Cell;
 use std::time::Instant;
@@ -37,6 +37,7 @@ const DEFAULT_BATCHES: &[usize] = &[1, 16, 128, 512, 1024];
 enum SyncMode {
     Event,
     Host,
+    Rccl,
     Signal,
 }
 
@@ -45,9 +46,10 @@ impl SyncMode {
         match raw {
             "event" => Ok(Self::Event),
             "host" => Ok(Self::Host),
+            "rccl" => Ok(Self::Rccl),
             "signal" => Ok(Self::Signal),
             _ => Err(format!(
-                "unsupported --sync value {raw:?}; use event, signal, or host"
+                "unsupported --sync value {raw:?}; use event, signal, rccl, or host"
             )),
         }
     }
@@ -56,6 +58,7 @@ impl SyncMode {
         match self {
             Self::Event => "system_scope_event",
             Self::Host => "host_stream_sync",
+            Self::Rccl => "rccl_grouped_p2p",
             Self::Signal => "signal_memory",
         }
     }
@@ -167,7 +170,7 @@ fn print_help() {
            --chain-samples N      43-layer chain samples per size (default 50)\n\
            --exactness-samples N  post-timing exactness stress samples (default 10)\n\
            --exactness-seed-base N first unique stress payload seed (default 0)\n\
-           --sync MODE            signal (default), event, or host (control)\n\
+           --sync MODE            signal (default), event, rccl, or host (control)\n\
            --layers N             round-trip dependency count (default 43)\n\
            --batches CSV          batch rows for [B,4096] F32 (default 1,16,128,512,1024)\n\
            --expect-arch0 ARCH    fail unless logical device 0 matches\n\
@@ -297,6 +300,7 @@ struct Chain<'a> {
     signal_to0: Option<&'a DeviceBuffer>,
     events_to1: &'a [Event],
     events_to0: &'a [Event],
+    rccl: Option<&'a RcclComms>,
     dev0_a: &'a DeviceBuffer,
     dev0_b: &'a DeviceBuffer,
     dev1: &'a DeviceBuffer,
@@ -322,6 +326,81 @@ fn chain_sample(
     hip.set_device(0)?;
     let host_start = Instant::now();
     hip.event_record(chain.start0, Some(chain.stream0))?;
+
+    if chain.sync == SyncMode::Rccl {
+        let rccl = chain.rccl.expect("RCCL mode requires communicators");
+        rccl.group_start().map_err(rccl_as_hip)?;
+        let body = (|| -> HipResult<()> {
+            for layer in 0..chain.layers {
+                let (src0, dst0) = if layer % 2 == 0 {
+                    (chain.dev0_a, chain.dev0_b)
+                } else {
+                    (chain.dev0_b, chain.dev0_a)
+                };
+                if copy_payload {
+                    let count = size / F32_BYTES;
+                    hip.set_device(0)?;
+                    unsafe {
+                        rccl.send(
+                            0,
+                            src0.as_ptr(),
+                            count,
+                            RcclDataType::Float32,
+                            1,
+                            chain.stream0.as_raw(),
+                        )
+                    }
+                    .map_err(rccl_as_hip)?;
+                    hip.set_device(1)?;
+                    unsafe {
+                        rccl.recv(
+                            1,
+                            chain.dev1.as_ptr(),
+                            count,
+                            RcclDataType::Float32,
+                            0,
+                            chain.stream1.as_raw(),
+                        )
+                    }
+                    .map_err(rccl_as_hip)?;
+                    unsafe {
+                        rccl.send(
+                            1,
+                            chain.dev1.as_ptr(),
+                            count,
+                            RcclDataType::Float32,
+                            0,
+                            chain.stream1.as_raw(),
+                        )
+                    }
+                    .map_err(rccl_as_hip)?;
+                    hip.set_device(0)?;
+                    unsafe {
+                        rccl.recv(
+                            0,
+                            dst0.as_ptr(),
+                            count,
+                            RcclDataType::Float32,
+                            1,
+                            chain.stream0.as_raw(),
+                        )
+                    }
+                    .map_err(rccl_as_hip)?;
+                }
+            }
+            Ok(())
+        })();
+        let close = rccl.group_end().map_err(rccl_as_hip);
+        body?;
+        close?;
+
+        hip.set_device(0)?;
+        hip.event_record(chain.stop0, Some(chain.stream0))?;
+        hip.event_synchronize(chain.stop0)?;
+        let host_ms = host_start.elapsed().as_secs_f64() * 1000.0;
+        let gpu_ms = hip.event_elapsed_ms(chain.start0, chain.stop0)? as f64;
+        return Ok((gpu_ms, host_ms));
+    }
 
     for layer in 0..chain.layers {
         let epoch = first_epoch + layer as u32 + 1;
@@ -364,6 +443,7 @@ fn chain_sample(
                 }
                 hip.stream_synchronize(chain.stream1)?;
             }
+            SyncMode::Rccl => unreachable!("RCCL chain is handled as one persistent group"),
             SyncMode::Signal => {
                 let signal_to1 = chain.signal_to1.expect("signal mode requires to1 memory");
                 let signal_to0 = chain.signal_to0.expect("signal mode requires to0 memory");
@@ -392,6 +472,13 @@ fn chain_sample(
     let host_ms = host_start.elapsed().as_secs_f64() * 1000.0;
     let gpu_ms = hip.event_elapsed_ms(chain.start0, chain.stop0)? as f64;
     Ok((gpu_ms, host_ms))
+}
+
+fn rccl_as_hip(error: hip_bridge::RcclError) -> HipError {
+    HipError {
+        code: error.status,
+        message: error.to_string(),
+    }
 }
 
 fn print_row(
@@ -459,6 +546,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .into());
     }
 
+    let rccl = if cfg.sync == SyncMode::Rccl {
+        Some(RcclComms::init_all(&[0, 1])?)
+    } else {
+        None
+    };
+    let rccl_version = rccl.as_ref().map(RcclComms::version).transpose()?;
+
     let max_batch = *cfg.batches.iter().max().unwrap();
     let max_bytes = max_batch
         .checked_mul(HIDDEN)
@@ -469,7 +563,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "identity arch0={arch0} arch1={arch1} visible_devices={device_count} \
          peer_0_to_1={can_0_to_1} peer_1_to_0={can_1_to_0} sync={} hidden={HIDDEN} \
          layers={} warmups={} one_way_samples={} chain_samples={} \
-         exactness_samples={} exactness_seed_base={} max_bytes={max_bytes}",
+         exactness_samples={} exactness_seed_base={} rccl_version={rccl_version:?} \
+         max_bytes={max_bytes}",
         cfg.sync.label(),
         cfg.layers,
         cfg.warmups,
@@ -567,6 +662,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         signal_to0: signal_to0.as_ref(),
         events_to1: &events_to1,
         events_to0: &events_to0,
+        rccl: rccl.as_ref(),
         dev0_a: &dev0_a,
         dev0_b: &dev0_b,
         dev1: &dev1_a,
@@ -660,6 +756,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             match cfg.sync {
                 SyncMode::Event => "event_chain",
                 SyncMode::Host => "host_sync_chain",
+                SyncMode::Rccl => "rccl_grouped_chain",
                 SyncMode::Signal => "signal_chain",
             },
             "round_trip",
