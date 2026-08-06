@@ -3461,8 +3461,8 @@ pub(crate) fn decode_step_heterogeneous(
 
     let dense_weights = &weights.dense.inner;
     ensure_compressor_capacity(cfg, state, dense_gpu, (position as usize).saturating_add(1))?;
-    precompute_positions_heterogeneous(cfg, state, dense_gpu, position)?;
-    precompute_token_id_heterogeneous(state, dense_gpu, token_id)?;
+    precompute_positions(cfg, state, dense_gpu, position)?;
+    precompute_token_id(state, dense_gpu, token_id)?;
     init_residual_streams(cfg, dense_weights, state, dense_gpu, token_id)?;
     ensure_ffn_split_resource(cfg, state, dense_gpu)?;
 
@@ -3976,11 +3976,10 @@ pub fn decode_step_with_graph(
 /// `n_valid = min(state.n_tokens + 1, sliding_window)`
 ///
 /// Layer-independent: all 43 layers read the same two values.
-fn precompute_attn_state_with_copy(
+pub(crate) fn precompute_attn_state(
     cfg: &DeepseekV4Config,
     state: &mut DeepseekV4State,
     gpu: &mut Gpu,
-    copy_mode: DecodeInputCopy,
 ) -> Result<(), String> {
     if state.attn_state_buf.is_none() {
         state.attn_state_buf = Some(
@@ -3995,7 +3994,7 @@ fn precompute_attn_state_with_copy(
     let host = state.attn_state_host.as_ref().unwrap();
     let dev = state.attn_state_buf.as_ref().unwrap();
     let bytes = unsafe { std::slice::from_raw_parts(host.as_ptr() as *const u8, 10 * 4) };
-    copy_decode_input_htod(gpu, &dev.buf, bytes, copy_mode)
+    gpu.memcpy_htod_auto(&dev.buf, bytes)
         .map_err(|e| format!("htod attn_state: {e:?}"))
 }
 
@@ -8438,31 +8437,6 @@ fn q_lora(
 /// array but doesn't strictly need the stable host source.
 pub(crate) const POS_SLOTS_PER_LAYER: usize = 3;
 
-#[derive(Clone, Copy)]
-enum DecodeInputCopy {
-    Compatible,
-    ActiveStream,
-}
-
-fn copy_decode_input_htod(
-    gpu: &Gpu,
-    dst: &hip_bridge::DeviceBuffer,
-    src: &[u8],
-    mode: DecodeInputCopy,
-) -> hip_bridge::HipResult<()> {
-    match mode {
-        DecodeInputCopy::Compatible => gpu.memcpy_htod_auto(dst, src),
-        DecodeInputCopy::ActiveStream => {
-            gpu.bind_thread()?;
-            let stream = gpu
-                .active_stream
-                .as_ref()
-                .expect("heterogeneous decode requires a persistent dense stream");
-            gpu.hip.memcpy_htod_async(dst, src, stream)
-        }
-    }
-}
-
 /// Compute per-layer derived positions and update `state.pos_array_*`.
 ///
 /// Single host-to-device copy of the entire `[(num_layers + 1) * 3]` i32
@@ -8476,25 +8450,6 @@ pub fn precompute_positions(
     state: &mut DeepseekV4State,
     gpu: &mut Gpu,
     position: u32,
-) -> Result<(), String> {
-    precompute_positions_impl(cfg, state, gpu, position, DecodeInputCopy::Compatible)
-}
-
-fn precompute_positions_heterogeneous(
-    cfg: &DeepseekV4Config,
-    state: &mut DeepseekV4State,
-    gpu: &mut Gpu,
-    position: u32,
-) -> Result<(), String> {
-    precompute_positions_impl(cfg, state, gpu, position, DecodeInputCopy::ActiveStream)
-}
-
-fn precompute_positions_impl(
-    cfg: &DeepseekV4Config,
-    state: &mut DeepseekV4State,
-    gpu: &mut Gpu,
-    position: u32,
-    copy_mode: DecodeInputCopy,
 ) -> Result<(), String> {
     let total_slots = (cfg.num_hidden_layers + 1) * POS_SLOTS_PER_LAYER;
 
@@ -8521,12 +8476,12 @@ fn precompute_positions_impl(
             pos_array_host.len() * 4,
         )
     };
-    copy_decode_input_htod(gpu, &pos_array_device.buf, bytes, copy_mode)
+    gpu.memcpy_htod_auto(&pos_array_device.buf, bytes)
         .map_err(|e| format!("htod pos_array: {e:?}"))?;
 
     // Also write SWA state (slot, n_valid) — same stable-host-source
     // pattern. The captured memcpy re-reads this on every graph_launch.
-    precompute_attn_state_with_copy(cfg, state, gpu, copy_mode)?;
+    precompute_attn_state(cfg, state, gpu)?;
     Ok(())
 }
 
@@ -8539,23 +8494,6 @@ pub(crate) fn precompute_token_id(
     state: &mut DeepseekV4State,
     gpu: &mut Gpu,
     token_id: u32,
-) -> Result<(), String> {
-    precompute_token_id_impl(state, gpu, token_id, DecodeInputCopy::Compatible)
-}
-
-fn precompute_token_id_heterogeneous(
-    state: &mut DeepseekV4State,
-    gpu: &mut Gpu,
-    token_id: u32,
-) -> Result<(), String> {
-    precompute_token_id_impl(state, gpu, token_id, DecodeInputCopy::ActiveStream)
-}
-
-fn precompute_token_id_impl(
-    state: &mut DeepseekV4State,
-    gpu: &mut Gpu,
-    token_id: u32,
-    copy_mode: DecodeInputCopy,
 ) -> Result<(), String> {
     if state.token_id_buf.is_none() {
         state.token_id_buf = Some(
@@ -8570,7 +8508,7 @@ fn precompute_token_id_impl(
     host[0] = token_id as i32;
     let dev = state.token_id_buf.as_ref().unwrap();
     let bytes = unsafe { std::slice::from_raw_parts(host.as_ptr() as *const u8, 4) };
-    copy_decode_input_htod(gpu, &dev.buf, bytes, copy_mode)
+    gpu.memcpy_htod_auto(&dev.buf, bytes)
         .map_err(|e| format!("htod token_id: {e:?}"))?;
     Ok(())
 }
