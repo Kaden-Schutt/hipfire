@@ -1,0 +1,34 @@
+[
+  {
+    "content": "We are designing a Rust file-indexing CLI called EmberIndex. Remember these initial requirements: BLAKE3 content hashes, four concurrent readers, and 1 MiB read buffers. Reply in at most 60 words with the three facts you will retain.",
+    "expect": ["EmberIndex", "BLAKE3", "four", "1 MiB"]
+  },
+  {
+    "content": "In at most 80 words, propose four Rust modules for EmberIndex and give each one responsibility.",
+    "expect": ["Rust", "EmberIndex"]
+  },
+  {
+    "content": "Update one requirement: use six concurrent readers instead of four. Confirm only the changed value in one sentence.",
+    "expect": ["six"]
+  },
+  {
+    "content": "Write a compact Rust struct named ScanConfig containing buffer_bytes and readers. Use the current remembered values and no explanation.",
+    "expect": ["ScanConfig", "1048576", "6"]
+  },
+  {
+    "content": "Switch topics briefly: write a three-line haiku about duplicate files. Nothing else.",
+    "expect": []
+  },
+  {
+    "content": "Back to EmberIndex. In one sentence, state the hashing algorithm, current reader count, and read-buffer size.",
+    "expect": ["BLAKE3", "six", "1 MiB"]
+  },
+  {
+    "content": "What was the first project name I gave you, and which requirement changed later? Answer in at most 40 words.",
+    "expect": ["EmberIndex", "four", "six"]
+  },
+  {
+    "content": "Summarize the final EmberIndex design in at most 80 words, including the project name, hash, reader count, buffer size, and ScanConfig.",
+    "expect": ["EmberIndex", "BLAKE3", "six", "1 MiB", "ScanConfig"]
+  }
+]
