@@ -480,6 +480,18 @@ pub static FIELDS: &[ConfigField] = &[
         "Runtime VRAM-fit KV precision policy."
     ),
     field!(
+        "model.deepseek4_experts_per_token",
+        "deepseek4_experts_per_token",
+        Experimental,
+        ModelLoad,
+        DefaultValue::Null,
+        ValueRule::NullableInteger { min: 1, max: 6 },
+        true,
+        false,
+        None,
+        "DeepSeek V4 routed experts per token; null preserves the checkpoint default."
+    ),
+    field!(
         "attention.flash",
         "flash_mode",
         Attention,
@@ -4174,6 +4186,15 @@ mod tests {
                 .to_value(),
             ConfigValue::String("off".into())
         );
+    }
+
+    #[test]
+    fn deepseek4_expert_fanout_is_optional_and_bounded() {
+        let field = field("model.deepseek4_experts_per_token").unwrap();
+        assert_eq!(field.default.to_value(), ConfigValue::Null);
+        assert_eq!(field.parse_cli("4").unwrap(), ConfigValue::Integer(4));
+        assert!(field.parse_cli("0").is_err());
+        assert!(field.parse_cli("7").is_err());
     }
 
     #[test]

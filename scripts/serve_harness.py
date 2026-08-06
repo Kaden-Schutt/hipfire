@@ -184,6 +184,7 @@ def build_config(args):
         "prompt_file": getattr(args, "prompt_file", None),
         "niah_file": getattr(args, "niah_file", None),
         "speculation_mode": getattr(args, "speculation", None),
+        "deepseek4_experts_per_token": getattr(args, "deepseek4_experts_per_token", None),
         "replay_route_proof_log": bool(getattr(args, "replay_route_proof_log", False)),
     }
 
@@ -232,6 +233,10 @@ def show_config(cfg):
     _spec = cfg.get("speculation_mode")
     print(f"  speculation   : {_spec or '(derived from --dflash/--mtp above)'}"
           f"{'   <-- OVERRIDES dflash/mtp' if _spec else ''}")
+    print(
+        "  ds4 experts/tok: "
+        f"{cfg.get('deepseek4_experts_per_token') or '(checkpoint default)'}"
+    )
     prompt_source = cfg.get("prompt_file") or cfg.get("prompts_file") or cfg.get("niah_file") or "(built-in battery)"
     print(f"  seed          : {cfg.get('seed')}   prompt_source: {prompt_source}")
     _cap = cfg['thinking_cap_tokens']
@@ -432,12 +437,18 @@ def _write_native_config(cfg, home):
             f'mtp = {json.dumps(mtp)}\n'
             'ngram = "off"\n'
         )
+    model = ""
+    if cfg.get("deepseek4_experts_per_token") is not None:
+        model = (
+            "[model]\n"
+            f"deepseek4_experts_per_token = {cfg['deepseek4_experts_per_token']}\n\n"
+        )
     text = f"""[serve]
 host = "127.0.0.1"
 port = {cfg["port"]}
 default_model = {json.dumps(cfg["model"])}
 
-[memory]
+{model}[memory]
 max_seq = {cfg.get("max_seq", 32768)}
 kv_cache = {json.dumps(cfg["kv"])}
 
@@ -940,6 +951,13 @@ def main():
                          "--dflash/--mtp matrix can only get there by accident, via the schema "
                          "default mode=auto auto-discovering the sidecar. DeepSeek V4 ships its "
                          "speculative module in the checkpoint, so use --speculation dspark.")
+    ap.add_argument(
+        "--deepseek4-experts-per-token",
+        type=int,
+        choices=range(1, 7),
+        default=None,
+        help="DeepSeek V4 routed experts per token for this model load; omitted preserves the checkpoint default.",
+    )
     ap.add_argument("--thinking-effort", default=None,
                     choices=["none", "low", "high", "max"],
                     help="parent-model reasoning_effort prompt semantics; independent of "

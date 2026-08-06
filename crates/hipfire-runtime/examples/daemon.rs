@@ -6660,12 +6660,31 @@ fn main() {
                     continue;
                 }
 
+                let deepseek4_experts_per_token = msg
+                    .get("params")
+                    .and_then(|p| p.get("deepseek4_experts_per_token"))
+                    .and_then(|v| v.as_u64())
+                    .map(|value| value as usize);
+
                 let loaded = if tp > 1 {
+                    if deepseek4_experts_per_token.is_some() {
+                        emit_uncorrelated_error(
+                            &mut stdout,
+                            None,
+                            "DeepSeek V4 experts-per-token override requires tp=1",
+                            "unsupported",
+                            false,
+                            false,
+                        );
+                        let _ = stdout.flush();
+                        continue;
+                    }
                     hipfire_loader::load_model_ep(path, max_seq, tp)
                 } else {
                     hipfire_loader::load_model_with_kv_backend(
                         path,
                         max_seq,
+                        deepseek4_experts_per_token,
                         draft_path.as_deref(),
                         kv_mode_override.as_deref(),
                         kv_backend_override.as_deref(),

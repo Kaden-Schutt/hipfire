@@ -1096,6 +1096,7 @@ pub fn load_model(
     load_model_with_kv_backend(
         path,
         max_seq,
+        None,
         draft_path,
         kv_mode_override,
         None,
@@ -1113,6 +1114,7 @@ pub fn load_model(
 pub fn load_model_with_kv_backend(
     path: &str,
     max_seq: usize,
+    deepseek4_experts_per_token: Option<usize>,
     draft_path: Option<&str>,
     kv_mode_override: Option<&str>,
     kv_backend_override: Option<&str>,
@@ -1218,6 +1220,7 @@ pub fn load_model_with_kv_backend(
     let mut ctx = LoadCtx {
         path,
         max_seq,
+        deepseek4_experts_per_token,
         draft_path,
         kv_mode_override,
         kv_backend,

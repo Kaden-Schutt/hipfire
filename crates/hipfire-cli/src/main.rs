@@ -5882,6 +5882,11 @@ fn load_params(
         "prefill_sparse_threshold": config_u64(resolved, "speculation.prefill.sparse_threshold")?,
         "speculation": config_string(resolved, "speculation.mode")?,
     });
+    if let Some(experts_per_token) =
+        config_optional_u64(resolved, "model.deepseek4_experts_per_token")?
+    {
+        params["deepseek4_experts_per_token"] = serde_json::json!(experts_per_token);
+    }
     let selector = config_string(resolved, "speculation.mode")?;
     apply_speculation_selector(&mut params, &selector)?;
     project_dflash_draft(&mut params, developer_dflash_draft(resolved));
@@ -6123,6 +6128,22 @@ fn config_i64(resolved: &hipfire_config::ResolvedConfig, key: &str) -> Result<i6
 fn config_u64(resolved: &hipfire_config::ResolvedConfig, key: &str) -> Result<u64> {
     let value = config_i64(resolved, key)?;
     u64::try_from(value).map_err(|_| anyhow!("{key} cannot be negative"))
+}
+
+fn config_optional_u64(
+    resolved: &hipfire_config::ResolvedConfig,
+    key: &str,
+) -> Result<Option<u64>> {
+    match config_value(resolved, key)? {
+        hipfire_config::ConfigValue::Null => Ok(None),
+        hipfire_config::ConfigValue::Integer(value) => u64::try_from(*value)
+            .map(Some)
+            .map_err(|_| anyhow!("{key} cannot be negative")),
+        value => bail!(
+            "{key} resolved as {}, expected integer or null",
+            value.kind()
+        ),
+    }
 }
 
 fn config_f64(resolved: &hipfire_config::ResolvedConfig, key: &str) -> Result<f64> {
@@ -8589,6 +8610,28 @@ mod tests {
         let params =
             load_params(&defaults, None, &model_path, 64, Some("q8"), Some("vmm")).unwrap();
         assert_eq!(params["kv_backend"], "vmm");
+    }
+
+    #[test]
+    fn load_params_only_forwards_explicit_deepseek4_expert_fanout() {
+        let model_path = PathBuf::from("/tmp/test-model.mq2r");
+        let defaults = resolve(Vec::<NamedLayer>::new()).unwrap();
+        let params = load_params(&defaults, None, &model_path, 64, Some("q8"), None).unwrap();
+        assert!(params.get("deepseek4_experts_per_token").is_none());
+
+        let mut explicit = ConfigLayer::default();
+        explicit
+            .set_cli("model.deepseek4_experts_per_token", "4")
+            .unwrap();
+        let resolved = resolve([NamedLayer {
+            source: ConfigSource::OneShot {
+                argument: "model.deepseek4_experts_per_token=4".into(),
+            },
+            layer: explicit,
+        }])
+        .unwrap();
+        let params = load_params(&resolved, None, &model_path, 64, Some("q8"), None).unwrap();
+        assert_eq!(params["deepseek4_experts_per_token"], 4);
     }
 
     #[test]

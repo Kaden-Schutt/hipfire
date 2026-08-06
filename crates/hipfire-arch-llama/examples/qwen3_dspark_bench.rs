@@ -157,6 +157,7 @@ fn main() -> Result<(), String> {
     let mut ctx = LoadCtx {
         path: &path,
         max_seq,
+        deepseek4_experts_per_token: None,
         draft_path: None,
         kv_mode_override: None,
         kv_backend: hipfire_runtime::kv_backend::KvBackend::Contiguous,

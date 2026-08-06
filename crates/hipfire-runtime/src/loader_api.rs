@@ -61,6 +61,9 @@ impl ModelSource {
 pub struct LoadCtx<'a> {
     pub path: &'a str,
     pub max_seq: usize,
+    /// DeepSeek V4-only routed-expert fanout override. `None` preserves the
+    /// checkpoint value; other carriers must ignore it.
+    pub deepseek4_experts_per_token: Option<usize>,
     pub draft_path: Option<&'a str>,
     pub kv_mode_override: Option<&'a str>,
     pub kv_backend: KvBackend,

@@ -952,6 +952,26 @@ impl Carrier for DotsOcrCarrier {
 
 // ─── Deepseek4Carrier ────────────────────────────────────────────────
 
+fn apply_deepseek4_experts_per_token(
+    config: &mut hipfire_arch_deepseek4::DeepseekV4Config,
+    requested: Option<usize>,
+) -> Result<(), String> {
+    let Some(requested) = requested else {
+        return Ok(());
+    };
+    let checkpoint = config.num_experts_per_tok;
+    if requested == 0 || requested > checkpoint {
+        return Err(format!(
+            "deepseek4: experts-per-token override must be in 1..={checkpoint}, got {requested}"
+        ));
+    }
+    if requested != checkpoint {
+        eprintln!("deepseek4: runtime experts-per-token override {checkpoint} -> {requested}");
+        config.num_experts_per_tok = requested;
+    }
+    Ok(())
+}
+
 pub struct Deepseek4Carrier;
 impl Carrier for Deepseek4Carrier {
     fn name(&self) -> &'static str {
@@ -1001,6 +1021,7 @@ impl Carrier for Deepseek4Carrier {
         let (config, weights) = match src {
             ModelSource::Hfq(mut hfq) => {
                 let mut config = <deepseek4::DeepseekV4 as Architecture>::config_from_hfq(&hfq)?;
+                apply_deepseek4_experts_per_token(&mut config, ctx.deepseek4_experts_per_token)?;
                 config.load_dspark = load_dspark;
                 let weights = <deepseek4::DeepseekV4 as Architecture>::load_weights(
                     &mut hfq, &config, ctx.gpu,
@@ -1011,6 +1032,7 @@ impl Carrier for Deepseek4Carrier {
                 let mut config = deepseek4::config_from_safetensors(&source).ok_or_else(|| {
                     "deepseek4: failed to parse config from safetensors".to_string()
                 })?;
+                apply_deepseek4_experts_per_token(&mut config, ctx.deepseek4_experts_per_token)?;
                 config.load_dspark = load_dspark;
                 let weights = deepseek4::DeepseekV4::load_weights_from_safetensors(
                     &source, &config, ctx.gpu,
