@@ -4845,6 +4845,16 @@ pub const GEMV_MQ3G256_LLOYD_MOE_GATE_UP_INDEXED_SRC: &str =
 pub const GEMV_MQ3G256_LLOYD_MOE_DOWN_INDEXED_SRC: &str =
     include_str!("../../../kernels/src/gemv_mq3g256_lloyd_moe_down_indexed.hip");
 
+/// Row-tiled (R=2 / R=4) siblings of
+/// `gemv_mq3g256_lloyd_moe_down_residual_scaled_k8_indexed`, bit-exact per row
+/// with the incumbent but launched on a `ceil(M/R)` grid so each wave carries R
+/// rows and stages the whole quad-step codebook into disjoint LDS slots behind
+/// one barrier. OPT-IN ONLY via `HIPFIRE_MQ3_DOWN_ROWS={2,4}`; unset (or 1)
+/// keeps the incumbent. See the header comment in the .hip for the static
+/// analysis that motivated it.
+pub const GEMV_MQ3G256_LLOYD_MOE_DOWN_INDEXED_R4_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mq3g256_lloyd_moe_down_indexed_r4.hip");
+
 // ─── MQ*-G256-GL ("global Lloyd") MoE indexed family ─────────────────────────
 //
 // Same call shape as the MQ2/MQ3-Lloyd MoE indexed kernels above (device-side

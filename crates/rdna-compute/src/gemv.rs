@@ -9891,11 +9891,49 @@ impl Gpu {
         k_top: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel(
-            "gemv_mq3g256_lloyd_moe_down_indexed",
-            kernels::GEMV_MQ3G256_LLOYD_MOE_DOWN_INDEXED_SRC,
-            "gemv_mq3g256_lloyd_moe_down_residual_scaled_k8_indexed",
-        )?;
+        // OPT-IN row tile. `HIPFIRE_MQ3_DOWN_ROWS={2,4}` swaps in the row-tiled
+        // sibling from kernels/src/gemv_mq3g256_lloyd_moe_down_indexed_r4.hip,
+        // which is bit-exact per (row, krank) — identical product tree,
+        // identical `(s0+s1)+(s2+s3)` fold, identical 5-step shfl reduction,
+        // identical scaled atomicAdd — but runs on a `ceil(M/R)` grid so each
+        // wave carries R rows. Unset (or any other value) keeps the incumbent
+        // single-row kernel. DEFAULT OFF: this has only been verified
+        // statically (0 spill, 0 scratch, 16 waves/SIMD on gfx1201 across all
+        // five radiowave scheduler profiles) plus a host-side bit-parity
+        // simulation; no GPU measurement backs it yet. See
+        // docs/investigations/2026-08-05-mq3-down-rowtile/.
+        use std::sync::OnceLock;
+        static MQ3_DOWN_ROWS: OnceLock<u32> = OnceLock::new();
+        let rows = *MQ3_DOWN_ROWS.get_or_init(|| {
+            match hipfire_config::developer_var("HIPFIRE_MQ3_DOWN_ROWS").as_deref() {
+                Ok("2") => 2,
+                Ok("4") => 4,
+                _ => 1,
+            }
+        });
+        let (module, func) = match rows {
+            2 => (
+                "gemv_mq3g256_lloyd_moe_down_indexed_r4",
+                "gemv_mq3g256_lloyd_moe_down_residual_scaled_k8_indexed_r2",
+            ),
+            4 => (
+                "gemv_mq3g256_lloyd_moe_down_indexed_r4",
+                "gemv_mq3g256_lloyd_moe_down_residual_scaled_k8_indexed_r4",
+            ),
+            _ => (
+                "gemv_mq3g256_lloyd_moe_down_indexed",
+                "gemv_mq3g256_lloyd_moe_down_residual_scaled_k8_indexed",
+            ),
+        };
+        let src = if rows == 1 {
+            kernels::GEMV_MQ3G256_LLOYD_MOE_DOWN_INDEXED_SRC
+        } else {
+            kernels::GEMV_MQ3G256_LLOYD_MOE_DOWN_INDEXED_R4_SRC
+        };
+        self.ensure_kernel(module, src, func)?;
+        // Each workgroup covers `rows` output rows, so the grid shrinks by that
+        // factor; the kernel masks the trailing partial tile.
+        let grid_x = (m as u32).div_ceil(rows);
         let pp = expert_ptrs.buf.as_ptr();
         let ip = topk_indices.buf.as_ptr();
         let wp = topk_weights.buf.as_ptr();
@@ -9922,8 +9960,8 @@ impl Gpu {
             bytes,
         );
         let result = self.launch_maybe_blob(
-            "gemv_mq3g256_lloyd_moe_down_residual_scaled_k8_indexed",
-            [m as u32, k_top as u32, 1],
+            func,
+            [grid_x, k_top as u32, 1],
             [32, 1, 1],
             0,
             &mut params,
