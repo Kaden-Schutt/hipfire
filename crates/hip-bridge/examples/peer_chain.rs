@@ -79,7 +79,7 @@ impl SyncMode {
     }
 
     fn supports_sync_only(self) -> bool {
-        !self.is_rocr() || self == Self::RocrAql
+        true
     }
 }
 
@@ -559,12 +559,10 @@ impl RocrChannel {
         if let Some(aql) = &self.aql {
             return self.aql_chain(aql, dev0_a, dev0_b, dev1, layers, size, copy_payload);
         }
-        if !copy_payload {
-            return Err(HipError {
-                code: 1,
-                message: "raw ROCr has no payload-free dependency chain".to_string(),
-            });
-        }
+        // hsa_amd_memory_async_copy has no payload-free signal operation. A
+        // one-byte copy is therefore the irreducible control for its fixed
+        // submission/dependency cost; the full-size row reports payload cost.
+        let copy_size = if copy_payload { size } else { 1 };
         let mut completions = self.completions.borrow_mut();
         for signal in completions.iter_mut().take(layers * 2) {
             signal.reset();
@@ -591,7 +589,7 @@ impl RocrChannel {
                         dev1.as_ptr(),
                         &self.dev0,
                         src0.as_ptr(),
-                        size,
+                        copy_size,
                         &deps,
                         completion,
                         self.engine_0_to_1,
@@ -604,7 +602,7 @@ impl RocrChannel {
                         dst0.as_ptr(),
                         &self.dev1,
                         dev1.as_ptr(),
-                        size,
+                        copy_size,
                         &deps,
                         completion,
                         self.engine_1_to_0,
@@ -1254,7 +1252,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     SyncMode::Host => "host_sync_chain",
                     SyncMode::Rccl => "rccl_grouped_chain",
                     SyncMode::RocrAql => "rocr_aql_barrier_chain",
-                    SyncMode::Rocr | SyncMode::RocrSdma => unreachable!(),
+                    SyncMode::Rocr | SyncMode::RocrSdma => "rocr_min_copy_chain",
                     SyncMode::Signal => "signal_chain",
                 },
                 "round_trip",
