@@ -9610,9 +9610,14 @@ impl Gpu {
             "deepseek4_gemv_mq2g256_lloyd_moe_down_residual_scaled_indexed",
             bytes,
         );
+        // Launch the SELECTED function and shrink the grid by the row tile.
+        // Passing the incumbent literal here while `ensure_kernel` registered
+        // the `_r2`/`_r4` symbol panics in `Gpu::launch_maybe_blob`
+        // ("no entry found for key", dispatch.rs:1430) — the function map is
+        // keyed by the ensured name.
         let result = self.launch_maybe_blob(
-            "gemv_mq2g256_lloyd_moe_down_residual_scaled_k8_indexed",
-            [m as u32, k_top as u32, 1],
+            func,
+            [(m as u32).div_ceil(rows), k_top as u32, 1],
             [32, 1, 1],
             0,
             &mut params,
