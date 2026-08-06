@@ -506,7 +506,7 @@ impl RocrChannel {
         dst: &DeviceBuffer,
         src: &DeviceBuffer,
         size: usize,
-    ) -> HipResult<f64> {
+    ) -> HipResult<(f64, f64)> {
         let mut completions = self.completions.borrow_mut();
         let completion = &mut completions[0];
         completion.reset();
@@ -540,11 +540,12 @@ impl RocrChannel {
             }
         };
         result.map_err(rocr_as_hip)?;
+        let enqueue_ms = started.elapsed().as_secs_f64() * 1000.0;
         completion
             .wait_timeout(Duration::from_secs(30))
             .map_err(rocr_as_hip)?;
         check_rocr_completion(completion)?;
-        Ok(started.elapsed().as_secs_f64() * 1000.0)
+        Ok((started.elapsed().as_secs_f64() * 1000.0, enqueue_ms))
     }
 
     fn chain(
@@ -555,7 +556,7 @@ impl RocrChannel {
         layers: usize,
         size: usize,
         copy_payload: bool,
-    ) -> HipResult<f64> {
+    ) -> HipResult<(f64, f64)> {
         if let Some(aql) = &self.aql {
             return self.aql_chain(aql, dev0_a, dev0_b, dev1, layers, size, copy_payload);
         }
@@ -611,6 +612,7 @@ impl RocrChannel {
             };
             result.map_err(rocr_as_hip)?;
         }
+        let enqueue_ms = started.elapsed().as_secs_f64() * 1000.0;
         let terminal = &completions[layers * 2 - 1];
         terminal
             .wait_timeout(Duration::from_secs(30))
@@ -618,7 +620,7 @@ impl RocrChannel {
         for completion in completions.iter().take(layers * 2) {
             check_rocr_completion(completion)?;
         }
-        Ok(started.elapsed().as_secs_f64() * 1000.0)
+        Ok((started.elapsed().as_secs_f64() * 1000.0, enqueue_ms))
     }
 
     fn aql_chain(
@@ -630,7 +632,7 @@ impl RocrChannel {
         layers: usize,
         size: usize,
         copy_payload: bool,
-    ) -> HipResult<f64> {
+    ) -> HipResult<(f64, f64)> {
         let started = Instant::now();
         if !copy_payload {
             let mut sync = aql.sync_completions.borrow_mut();
@@ -642,13 +644,14 @@ impl RocrChannel {
                 .prepare_batches(&aql.sync_batches)
                 .map_err(rocr_as_hip)?;
             queues.ring_prepared().map_err(rocr_as_hip)?;
+            let enqueue_ms = started.elapsed().as_secs_f64() * 1000.0;
             sync[layers * 2 - 1]
                 .wait_timeout(Duration::from_secs(30))
                 .map_err(rocr_as_hip)?;
             for completion in sync.iter().take(layers * 2) {
                 check_rocr_completion(completion)?;
             }
-            return Ok(started.elapsed().as_secs_f64() * 1000.0);
+            return Ok((started.elapsed().as_secs_f64() * 1000.0, enqueue_ms));
         }
 
         let mut copies = self.completions.borrow_mut();
@@ -706,6 +709,7 @@ impl RocrChannel {
             .prepare_batches(&aql.payload_batches)
             .map_err(rocr_as_hip)?;
         queues.ring_prepared().map_err(rocr_as_hip)?;
+        let enqueue_ms = started.elapsed().as_secs_f64() * 1000.0;
         barriers[layers * 2 - 1]
             .wait_timeout(Duration::from_secs(30))
             .map_err(rocr_as_hip)?;
@@ -715,7 +719,7 @@ impl RocrChannel {
         for completion in barriers.iter().take(layers * 2) {
             check_rocr_completion(completion)?;
         }
-        Ok(started.elapsed().as_secs_f64() * 1000.0)
+        Ok((started.elapsed().as_secs_f64() * 1000.0, enqueue_ms))
     }
 }
 
@@ -757,7 +761,7 @@ fn chain_sample(
 
     if chain.sync.is_rocr() {
         let rocr = chain.rocr.expect("ROCr mode requires channel");
-        let wall_ms = rocr.chain(
+        let (wall_ms, enqueue_ms) = rocr.chain(
             chain.dev0_a,
             chain.dev0_b,
             chain.dev1,
@@ -765,7 +769,7 @@ fn chain_sample(
             size,
             copy_payload,
         )?;
-        return Ok((wall_ms, wall_ms));
+        return Ok((wall_ms, enqueue_ms));
     }
     hip.event_record(chain.start0, Some(chain.stream0))?;
 
@@ -1032,6 +1036,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     if let Some(rocr) = &rocr {
         println!("{}", rocr.identity());
+        println!(
+            "rocr_timing gpu_fields=host_wall_to_terminal_signal host_fields=host_enqueue_only"
+        );
     }
 
     hip.set_device(0)?;
@@ -1153,13 +1160,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Directional correctness before warm/timed samples.
         if let Some(rocr) = &rocr {
-            rocr.one_way(true, &dev1_a, &dev0_a, size)?;
+            let _ = rocr.one_way(true, &dev1_a, &dev0_a, size)?;
         } else {
             one_way_sample(&hip, &direction_0_to_1, size)?;
         }
         assert_bytes(&hip, 1, &dev1_a, &expected_0, "0->1")?;
         if let Some(rocr) = &rocr {
-            rocr.one_way(false, &dev0_b, &dev1_b, size)?;
+            let _ = rocr.one_way(false, &dev0_b, &dev1_b, size)?;
         } else {
             one_way_sample(&hip, &direction_1_to_0, size)?;
         }
@@ -1178,8 +1185,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         for _ in 0..cfg.warmups {
             if let Some(rocr) = &rocr {
-                rocr.one_way(true, &dev1_a, &dev0_a, size)?;
-                rocr.one_way(false, &dev0_b, &dev1_b, size)?;
+                let _ = rocr.one_way(true, &dev1_a, &dev0_a, size)?;
+                let _ = rocr.one_way(false, &dev0_b, &dev1_b, size)?;
             } else {
                 one_way_sample(&hip, &direction_0_to_1, size)?;
                 one_way_sample(&hip, &direction_1_to_0, size)?;
@@ -1196,16 +1203,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut host_1_to_0 = Vec::with_capacity(cfg.one_way_samples);
         for _ in 0..cfg.one_way_samples {
             let (gpu_ms, host_ms) = if let Some(rocr) = &rocr {
-                let wall_ms = rocr.one_way(true, &dev1_a, &dev0_a, size)?;
-                (wall_ms, wall_ms)
+                rocr.one_way(true, &dev1_a, &dev0_a, size)?
             } else {
                 one_way_sample(&hip, &direction_0_to_1, size)?
             };
             gpu_0_to_1.push(gpu_ms);
             host_0_to_1.push(host_ms);
             let (gpu_ms, host_ms) = if let Some(rocr) = &rocr {
-                let wall_ms = rocr.one_way(false, &dev0_b, &dev1_b, size)?;
-                (wall_ms, wall_ms)
+                rocr.one_way(false, &dev0_b, &dev1_b, size)?
             } else {
                 one_way_sample(&hip, &direction_1_to_0, size)?
             };
