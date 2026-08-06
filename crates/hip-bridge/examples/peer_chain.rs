@@ -23,6 +23,7 @@ use std::time::Instant;
 
 const HIDDEN: usize = 4096;
 const F32_BYTES: usize = 4;
+const SIGNAL_BYTES: usize = std::mem::size_of::<u64>();
 const DEFAULT_LAYERS: usize = 43;
 const DEFAULT_BATCHES: &[usize] = &[1, 16, 128, 512, 1024];
 
@@ -358,8 +359,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     hip.set_device(0)?;
     let dev0_a = hip.malloc(max_bytes)?;
     let dev0_b = hip.malloc(max_bytes)?;
-    let signal_to0 = hip.malloc_signal(std::mem::size_of::<u32>())?;
-    hip.memset(&signal_to0, 0, std::mem::size_of::<u32>())?;
+    let signal_to0 = hip.malloc_signal(SIGNAL_BYTES)?;
+    hip.memset(&signal_to0, 0, SIGNAL_BYTES)?;
     let stream0 = hip.stream_create()?;
     hip.enable_peer_access(1)?;
     // Exercise idempotence so the product path can call this after every load.
@@ -368,8 +369,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     hip.set_device(1)?;
     let dev1_a = hip.malloc(max_bytes)?;
     let dev1_b = hip.malloc(max_bytes)?;
-    let signal_to1 = hip.malloc_signal(std::mem::size_of::<u32>())?;
-    hip.memset(&signal_to1, 0, std::mem::size_of::<u32>())?;
+    let signal_to1 = hip.malloc_signal(SIGNAL_BYTES)?;
+    hip.memset(&signal_to1, 0, SIGNAL_BYTES)?;
     let stream1 = hip.stream_create()?;
     hip.enable_peer_access(0)?;
     hip.enable_peer_access(0)?;
