@@ -2,7 +2,8 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use hip_bridge::HipRuntime;
 use hipfire_arch_deepseek4::{
@@ -11,6 +12,7 @@ use hipfire_arch_deepseek4::{
 };
 use hipfire_runtime::arch::Architecture;
 use hipfire_runtime::hfq::HfqFile;
+use hipfire_runtime::tokenizer::Tokenizer;
 use rdna_compute::Gpu;
 use serde_json::json;
 
@@ -19,7 +21,7 @@ fn main() -> Result<(), String> {
     let model = args
         .next()
         .ok_or(
-            "usage: ds4_heterogeneous_load MODEL [--cycles N] [--replacement-probe] [--fault-matrix] [--fault dense|layer:N|audit|state|scratch] [--decode-token ID] [--position N]",
+            "usage: ds4_heterogeneous_load MODEL [--cycles N] [--replacement-probe] [--fault-matrix] [--fault dense|layer:N|audit|state|scratch] [--decode-token ID] [--position N] [--prompt PATH --generate N --output PATH] [--compare-single]",
         )?;
     let mut cycles = 1usize;
     let mut fault = None;
@@ -28,6 +30,9 @@ fn main() -> Result<(), String> {
     let mut decode_token = None;
     let mut position = 0u32;
     let mut compare_single = false;
+    let mut prompt = None;
+    let mut generate = 0usize;
+    let mut output = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--cycles" => {
@@ -77,15 +82,62 @@ fn main() -> Result<(), String> {
                     .map_err(|error| format!("invalid --position: {error}"))?;
             }
             "--compare-single" => compare_single = true,
+            "--prompt" => {
+                prompt = Some(PathBuf::from(
+                    args.next().ok_or("--prompt requires a path")?,
+                ));
+            }
+            "--generate" => {
+                generate = args
+                    .next()
+                    .ok_or("--generate requires a value")?
+                    .parse::<usize>()
+                    .map_err(|error| format!("invalid --generate: {error}"))?;
+            }
+            "--output" => {
+                output = Some(PathBuf::from(
+                    args.next().ok_or("--output requires a path")?,
+                ));
+            }
             other => return Err(format!("unknown argument '{other}'")),
         }
     }
     if cycles == 0 {
         return Err("--cycles must be nonzero".into());
     }
+    if prompt.is_some() && decode_token.is_some() {
+        return Err("--prompt and --decode-token are mutually exclusive".into());
+    }
+    if prompt.is_some() != (generate != 0) {
+        return Err("--prompt and a nonzero --generate must be supplied together".into());
+    }
+    if output.is_some() && prompt.is_none() {
+        return Err("--output requires --prompt".into());
+    }
+    if prompt.is_some() && cycles != 1 {
+        return Err("canonical generation accepts exactly one load cycle".into());
+    }
 
     let plan = DeepseekV4HeterogeneousLoadPlan::default();
     let artifact = DeepseekV4VerifiedArtifact::verify(Path::new(&model))?;
+    let generation = if let Some(prompt_path) = prompt.as_deref() {
+        let hfq = HfqFile::open(artifact.path())
+            .map_err(|error| format!("generation tokenizer open: {error:?}"))?;
+        let tokenizer = Tokenizer::from_hfq_metadata(&hfq.metadata_json)
+            .map_err(|error| format!("generation tokenizer: {error:?}"))?;
+        let prompt_text = std::fs::read_to_string(prompt_path)
+            .map_err(|error| format!("read prompt {}: {error}", prompt_path.display()))?;
+        let prompt_tokens = tokenizer.encode(&prompt_text);
+        if prompt_tokens.len() != 2048 {
+            return Err(format!(
+                "canonical heterogeneous prompt must encode to 2048 tokens, got {}",
+                prompt_tokens.len()
+            ));
+        }
+        Some((tokenizer, prompt_tokens))
+    } else {
+        None
+    };
     if fault_matrix {
         if fault.is_some() || cycles != 1 {
             return Err("--fault-matrix cannot be combined with --fault or --cycles".into());
@@ -199,7 +251,33 @@ fn main() -> Result<(), String> {
             .map_err(|error| error.to_string())?
         );
         let mut heterogeneous_logits = None;
-        if let Some(token_id) = decode_token {
+        let mut heterogeneous_generation = None;
+        if let Some((tokenizer, prompt_tokens)) = generation.as_ref() {
+            let generated = generate_heterogeneous(&mut loaded, prompt_tokens, generate)?;
+            let decoded = tokenizer.decode_bytes(&generated.tokens);
+            if let Some(output_path) = output.as_deref() {
+                std::fs::write(output_path, &decoded).map_err(|error| {
+                    format!("write generated output {}: {error}", output_path.display())
+                })?;
+            }
+            println!(
+                "{}",
+                serde_json::to_string(&json!({
+                    "cycle": cycle,
+                    "status": "generated",
+                    "prompt_tokens": prompt_tokens.len(),
+                    "generated_tokens": generated.tokens.len(),
+                    "generated_bytes": decoded.len(),
+                    "prefill_seconds": generated.prefill.as_secs_f64(),
+                    "decode_seconds": generated.decode.as_secs_f64(),
+                    "prefill_tok_s": prompt_tokens.len() as f64 / generated.prefill.as_secs_f64(),
+                    "decode_tok_s": generated.tokens.len() as f64 / generated.decode.as_secs_f64(),
+                    "output_path": output,
+                }))
+                .map_err(|error| error.to_string())?
+            );
+            heterogeneous_generation = Some(generated.tokens);
+        } else if let Some(token_id) = decode_token {
             let logits = loaded.decode_step(token_id, position)?;
             let (argmax, max_logit) = logits
                 .iter()
@@ -226,12 +304,156 @@ fn main() -> Result<(), String> {
         }
         loaded.unload();
         if compare_single {
-            let token_id = decode_token.ok_or("--compare-single requires --decode-token")?;
-            let heterogeneous_logits = heterogeneous_logits
-                .as_deref()
-                .ok_or("heterogeneous logits missing for single-device comparison")?;
-            compare_single_device(artifact.path(), token_id, position, heterogeneous_logits)?;
+            if let Some((tokenizer, prompt_tokens)) = generation.as_ref() {
+                compare_single_generation(
+                    artifact.path(),
+                    tokenizer,
+                    prompt_tokens,
+                    generate,
+                    heterogeneous_generation
+                        .as_deref()
+                        .ok_or("heterogeneous generation missing for single-device comparison")?,
+                )?;
+            } else {
+                let token_id = decode_token
+                    .ok_or("--compare-single requires --decode-token or --prompt/--generate")?;
+                let heterogeneous_logits = heterogeneous_logits
+                    .as_deref()
+                    .ok_or("heterogeneous logits missing for single-device comparison")?;
+                compare_single_device(artifact.path(), token_id, position, heterogeneous_logits)?;
+            }
         }
+    }
+    Ok(())
+}
+
+struct GenerationResult {
+    tokens: Vec<u32>,
+    prefill: Duration,
+    decode: Duration,
+}
+
+fn greedy(logits: &[f32]) -> Result<u32, String> {
+    if let Some((index, _)) = logits
+        .iter()
+        .enumerate()
+        .filter(|(_, value)| value.is_finite())
+        .max_by(|left, right| left.1.total_cmp(right.1))
+    {
+        Ok(index as u32)
+    } else {
+        Err("decode returned no finite logits".into())
+    }
+}
+
+fn generate_heterogeneous(
+    model: &mut DeepseekV4HeterogeneousModel,
+    prompt: &[u32],
+    n_generate: usize,
+) -> Result<GenerationResult, String> {
+    let prefill_start = Instant::now();
+    let mut logits = Vec::new();
+    for (position, &token) in prompt.iter().enumerate() {
+        logits = model.decode_step(token, position as u32)?;
+    }
+    let prefill = prefill_start.elapsed();
+
+    let decode_start = Instant::now();
+    let mut tokens = Vec::with_capacity(n_generate);
+    tokens.push(greedy(&logits)?);
+    while tokens.len() < n_generate {
+        let position = prompt.len() + tokens.len() - 1;
+        logits = model.decode_step(tokens[tokens.len() - 1], position as u32)?;
+        tokens.push(greedy(&logits)?);
+    }
+    Ok(GenerationResult {
+        tokens,
+        prefill,
+        decode: decode_start.elapsed(),
+    })
+}
+
+fn compare_single_generation(
+    model: &Path,
+    tokenizer: &Tokenizer,
+    prompt: &[u32],
+    n_generate: usize,
+    heterogeneous: &[u32],
+) -> Result<(), String> {
+    let mut hfq = HfqFile::open(model).map_err(|error| format!("single oracle open: {error:?}"))?;
+    let mut cfg = DeepseekV4::config_from_hfq(&hfq)?;
+    cfg.load_dspark = false;
+    let mut gpu = Gpu::init_with_device(1)
+        .map_err(|error| format!("single oracle gfx1151 init: {error:?}"))?;
+    if gpu.arch != "gfx1151" {
+        return Err(format!(
+            "single oracle device 1 resolved to {}, expected gfx1151",
+            gpu.arch
+        ));
+    }
+    let weights = DeepseekV4::load_weights(&mut hfq, &cfg, &mut gpu)?;
+    let mut state = DeepseekV4State::new(&cfg)?;
+
+    let prefill_start = Instant::now();
+    let mut logits = Vec::new();
+    for (position, &token) in prompt.iter().enumerate() {
+        logits =
+            forward::decode_step(&cfg, &weights, &mut state, &mut gpu, token, position as u32)?;
+    }
+    let prefill = prefill_start.elapsed();
+    let decode_start = Instant::now();
+    let mut single = Vec::with_capacity(n_generate);
+    single.push(greedy(&logits)?);
+    while single.len() < n_generate {
+        let position = prompt.len() + single.len() - 1;
+        logits = forward::decode_step(
+            &cfg,
+            &weights,
+            &mut state,
+            &mut gpu,
+            single[single.len() - 1],
+            position as u32,
+        )?;
+        single.push(greedy(&logits)?);
+    }
+    let decode = decode_start.elapsed();
+
+    let first_mismatch = single
+        .iter()
+        .zip(heterogeneous)
+        .position(|(expected, actual)| expected != actual);
+    let single_bytes = tokenizer.decode_bytes(&single);
+    let heterogeneous_bytes = tokenizer.decode_bytes(heterogeneous);
+    println!(
+        "{}",
+        serde_json::to_string(&json!({
+            "status": "single_generation_oracle",
+            "single_device_id": gpu.device_id,
+            "single_arch": gpu.arch,
+            "prompt_tokens": prompt.len(),
+            "generated_tokens": single.len(),
+            "generated_bytes": single_bytes.len(),
+            "prefill_seconds": prefill.as_secs_f64(),
+            "decode_seconds": decode.as_secs_f64(),
+            "prefill_tok_s": prompt.len() as f64 / prefill.as_secs_f64(),
+            "decode_tok_s": single.len() as f64 / decode.as_secs_f64(),
+            "first_token_mismatch": first_mismatch,
+            "tokens_equal": single == heterogeneous,
+            "bytes_equal": single_bytes == heterogeneous_bytes,
+        }))
+        .map_err(|error| error.to_string())?
+    );
+
+    state.free_gpu(&mut gpu);
+    weights.free_gpu(&mut gpu);
+    gpu.invalidate_weight_caches();
+    gpu.invalidate_graph_state();
+    gpu.drain_pool();
+    if single != heterogeneous || single_bytes != heterogeneous_bytes {
+        return Err(format!(
+            "heterogeneous generation differs from single gfx1151 at token {:?}",
+            first_mismatch
+        ));
     }
     Ok(())
 }
@@ -243,7 +465,8 @@ fn compare_single_device(
     heterogeneous: &[f32],
 ) -> Result<(), String> {
     let mut hfq = HfqFile::open(model).map_err(|error| format!("single oracle open: {error:?}"))?;
-    let cfg = DeepseekV4::config_from_hfq(&hfq)?;
+    let mut cfg = DeepseekV4::config_from_hfq(&hfq)?;
+    cfg.load_dspark = false;
     let mut gpu = Gpu::init_with_device(1)
         .map_err(|error| format!("single oracle gfx1151 init: {error:?}"))?;
     if gpu.arch != "gfx1151" {

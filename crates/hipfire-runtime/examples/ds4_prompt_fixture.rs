@@ -79,10 +79,7 @@ fn main() {
     let out = out.unwrap_or_else(|| die("--out required"));
 
     let hfq = HfqFile::open(&model).unwrap_or_else(|e| {
-        eprintln!(
-            "ds4_prompt_fixture: open model {}: {e}",
-            model.display()
-        );
+        eprintln!("ds4_prompt_fixture: open model {}: {e}", model.display());
         std::process::exit(1);
     });
     let tokenizer = Tokenizer::from_hfq_metadata(&hfq.metadata_json).unwrap_or_else(|e| {
@@ -91,20 +88,9 @@ fn main() {
     });
 
     let source_text = std::fs::read_to_string(&source).unwrap_or_else(|e| {
-        eprintln!(
-            "ds4_prompt_fixture: read source {}: {e}",
-            source.display()
-        );
+        eprintln!("ds4_prompt_fixture: read source {}: {e}", source.display());
         std::process::exit(1);
     });
-    if !source_text.is_ascii() {
-        eprintln!(
-            "ds4_prompt_fixture: source {} is not pure ASCII",
-            source.display()
-        );
-        std::process::exit(1);
-    }
-
     eprintln!(
         "ds4_prompt_fixture: model={} source={} ({} bytes) count={count}",
         model.display(),
@@ -168,10 +154,7 @@ fn main() {
             );
             std::process::exit(1);
         });
-        let bytes: Vec<u8> = prefix_ids
-            .iter()
-            .flat_map(|id| id.to_le_bytes())
-            .collect();
+        let bytes: Vec<u8> = prefix_ids.iter().flat_map(|id| id.to_le_bytes()).collect();
         f.write_all(&bytes).unwrap_or_else(|e| {
             eprintln!(
                 "ds4_prompt_fixture: write tokens-out {}: {e}",
