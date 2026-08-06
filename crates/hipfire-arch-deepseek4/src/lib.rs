@@ -58,6 +58,7 @@ pub mod dsml;
 pub mod dspark_speculator;
 pub mod forward;
 pub mod grammar;
+pub mod heterogeneous;
 pub mod mtp_speculator;
 pub mod parent;
 pub mod sampling;
@@ -65,9 +66,14 @@ pub mod spec_decode;
 pub mod spec_emit;
 pub mod spec_impl;
 
-pub use arch::DeepseekV4;
+pub use arch::{DeepseekV4, DeepseekV4HeterogeneousFault, DeepseekV4HeterogeneousProjection};
 pub use deepseek4::{
-    config_from_safetensors, DeepseekV4Config, DeepseekV4State, DeepseekV4Weights,
-    IndexerLayerState, MainAttentionLayerState,
+    config_from_safetensors, DeepseekV4Config, DeepseekV4DenseWeights,
+    DeepseekV4HeterogeneousWeights, DeepseekV4OwnershipAudit, DeepseekV4RoutedWeights,
+    DeepseekV4State, DeepseekV4Weights, IndexerLayerState, MainAttentionLayerState,
+};
+pub use heterogeneous::{
+    DeepseekV4HeterogeneousLoadPlan, DeepseekV4HeterogeneousLoadReport,
+    DeepseekV4HeterogeneousModel,
 };
 pub use spec_impl::Deepseek4Bundle;

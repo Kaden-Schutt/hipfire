@@ -853,6 +853,11 @@ impl DeepseekV4LayerWeights {
     /// Used by `DeepseekV4Weights::free_gpu` to walk all 43 main layers
     /// plus the optional MTP layer.
     pub fn free_gpu(mut self, gpu: &mut rdna_compute::Gpu) {
+        self.free_dense_gpu(gpu);
+        self.free_routed_gpu(gpu);
+    }
+
+    fn free_dense_gpu(&mut self, gpu: &mut rdna_compute::Gpu) {
         fn free_opt(gpu: &mut rdna_compute::Gpu, t: &mut Option<rdna_compute::GpuTensor>) {
             if let Some(t) = t.take() {
                 let _ = gpu.free_tensor(t);
@@ -901,19 +906,110 @@ impl DeepseekV4LayerWeights {
         free_opt(gpu, &mut self.shared_w1);
         free_opt(gpu, &mut self.shared_w2);
         free_opt(gpu, &mut self.shared_w3);
-        free_opt(gpu, &mut self.expert_w1_blob);
-        free_opt(gpu, &mut self.expert_w2_blob);
-        free_opt(gpu, &mut self.expert_w3_blob);
+    }
+
+    fn free_routed_gpu(&mut self, gpu: &mut rdna_compute::Gpu) {
+        fn free_opt(gpu: &mut rdna_compute::Gpu, t: &mut Option<rdna_compute::GpuTensor>) {
+            if let Some(t) = t.take() {
+                let _ = gpu.free_tensor(t);
+            }
+        }
+        // Pointer tables stop being live before their backing blobs return to
+        // the pool. There are no active kernels during unload, but preserving
+        // that ownership order also makes fault-injection teardown auditable.
         free_opt(gpu, &mut self.expert_w1_ptrs);
         free_opt(gpu, &mut self.expert_w2_ptrs);
         free_opt(gpu, &mut self.expert_w3_ptrs);
-        free_opt(gpu, &mut self.expert_gate_up_blob);
         free_opt(gpu, &mut self.expert_gate_up_ptrs);
+        free_opt(gpu, &mut self.expert_w1_blob);
+        free_opt(gpu, &mut self.expert_w2_blob);
+        free_opt(gpu, &mut self.expert_w3_blob);
+        free_opt(gpu, &mut self.expert_gate_up_blob);
         // EP-shard dummy gate_up buffer (was previously mem::forget-leaked).
         // Freed last so the pointer table that baked its address is already
         // gone — no live aliasing into a returned buffer. No double-free: this
         // is the sole owner.
         free_opt(gpu, &mut self.expert_gate_up_dummy);
+    }
+
+    fn visit_dense_tensors(
+        &self,
+        prefix: &str,
+        visit: &mut impl FnMut(&str, &rdna_compute::GpuTensor),
+    ) {
+        macro_rules! visit_opt {
+            ($field:ident) => {
+                if let Some(tensor) = self.$field.as_ref() {
+                    visit(&format!("{prefix}.{}", stringify!($field)), tensor);
+                }
+            };
+        }
+        visit_opt!(attn_norm);
+        visit_opt!(ffn_norm);
+        visit_opt!(q_norm);
+        visit_opt!(kv_norm);
+        visit_opt!(attn_sink);
+        visit_opt!(wq_a);
+        visit_opt!(wq_b);
+        visit_opt!(wkv);
+        visit_opt!(wo_a);
+        visit_opt!(wo_b);
+        visit_opt!(compressor_wkv);
+        visit_opt!(compressor_wgate);
+        visit_opt!(compressor_norm);
+        visit_opt!(compressor_ape);
+        visit_opt!(compressor_wkv_f16);
+        visit_opt!(compressor_wgate_f16);
+        visit_opt!(indexer_wq_b);
+        visit_opt!(indexer_weights_proj);
+        visit_opt!(indexer_compressor_wkv);
+        visit_opt!(indexer_compressor_wgate);
+        visit_opt!(indexer_compressor_wkv_f16);
+        visit_opt!(indexer_compressor_wgate_f16);
+        visit_opt!(indexer_compressor_norm);
+        visit_opt!(indexer_compressor_ape);
+        visit_opt!(mtp_enorm);
+        visit_opt!(mtp_hnorm);
+        visit_opt!(mtp_e_proj);
+        visit_opt!(mtp_h_proj);
+        visit_opt!(mtp_final_norm);
+        visit_opt!(mtp_hc_head_fn);
+        visit_opt!(mtp_hc_head_base);
+        visit_opt!(hc_attn_base);
+        visit_opt!(hc_attn_fn);
+        visit_opt!(hc_attn_scale);
+        visit_opt!(hc_ffn_base);
+        visit_opt!(hc_ffn_fn);
+        visit_opt!(hc_ffn_scale);
+        visit_opt!(gate_weight);
+        visit_opt!(gate_bias);
+        visit_opt!(tid2eid_dev);
+        visit_opt!(shared_w1);
+        visit_opt!(shared_w2);
+        visit_opt!(shared_w3);
+    }
+
+    fn visit_routed_tensors(
+        &self,
+        prefix: &str,
+        visit: &mut impl FnMut(&str, &rdna_compute::GpuTensor),
+    ) {
+        macro_rules! visit_opt {
+            ($field:ident) => {
+                if let Some(tensor) = self.$field.as_ref() {
+                    visit(&format!("{prefix}.{}", stringify!($field)), tensor);
+                }
+            };
+        }
+        visit_opt!(expert_w1_blob);
+        visit_opt!(expert_w2_blob);
+        visit_opt!(expert_w3_blob);
+        visit_opt!(expert_w1_ptrs);
+        visit_opt!(expert_w2_ptrs);
+        visit_opt!(expert_w3_ptrs);
+        visit_opt!(expert_gate_up_blob);
+        visit_opt!(expert_gate_up_ptrs);
+        visit_opt!(expert_gate_up_dummy);
     }
 }
 
@@ -994,6 +1090,52 @@ impl DeepseekV4Weights {
         }
     }
 
+    fn visit_dense_tensors(&self, visit: &mut impl FnMut(&str, &rdna_compute::GpuTensor)) {
+        macro_rules! visit_opt {
+            ($name:expr, $tensor:expr) => {
+                if let Some(tensor) = $tensor.as_ref() {
+                    visit($name, tensor);
+                }
+            };
+        }
+        visit_opt!("embed.weight", self.token_embd);
+        visit_opt!("norm.weight", self.output_norm);
+        visit_opt!("head.weight", self.head);
+        visit_opt!("hc_head_fn", self.hc_head_fn);
+        visit_opt!("hc_head_base", self.hc_head_base);
+        for (index, layer) in self.layers.iter().enumerate() {
+            layer.visit_dense_tensors(&format!("layers.{index}"), visit);
+        }
+        if let Some(layer) = self.mtp_layer.as_ref() {
+            layer.visit_dense_tensors("mtp.0", visit);
+        }
+        if let Some(dspark) = self.dspark.as_ref() {
+            visit_opt!("dspark.main_proj", dspark.main_proj);
+            visit_opt!("dspark.main_norm", dspark.main_norm);
+            visit_opt!("dspark.markov_w1", dspark.markov_w1);
+            visit_opt!("dspark.markov_w2", dspark.markov_w2);
+            visit_opt!("dspark.confidence_proj", dspark.confidence_proj);
+            visit_opt!("dspark.draft_head", dspark.draft_head);
+            for (index, layer) in dspark.stages.iter().enumerate() {
+                layer.visit_dense_tensors(&format!("dspark.mtp.{index}"), visit);
+            }
+        }
+    }
+
+    fn visit_routed_tensors(&self, visit: &mut impl FnMut(&str, &rdna_compute::GpuTensor)) {
+        for (index, layer) in self.layers.iter().enumerate() {
+            layer.visit_routed_tensors(&format!("layers.{index}"), visit);
+        }
+        if let Some(layer) = self.mtp_layer.as_ref() {
+            layer.visit_routed_tensors("mtp.0", visit);
+        }
+        if let Some(dspark) = self.dspark.as_ref() {
+            for (index, layer) in dspark.stages.iter().enumerate() {
+                layer.visit_routed_tensors(&format!("dspark.mtp.{index}"), visit);
+            }
+        }
+    }
+
     pub fn resolve_layer(&self, idx: usize) -> &DeepseekV4LayerWeights {
         if idx < self.layers.len() {
             &self.layers[idx]
@@ -1015,6 +1157,156 @@ impl DeepseekV4Weights {
             );
         }
     }
+}
+
+/// gfx1100-owned portion of a heterogeneous DS4 load. The wrapped ordinary
+/// weight type is admitted only after proving that every routed allocation is
+/// absent, so its single-owner teardown contract remains true.
+pub struct DeepseekV4DenseWeights {
+    pub(crate) inner: DeepseekV4Weights,
+}
+
+impl DeepseekV4DenseWeights {
+    pub(crate) fn validate_loaded(inner: &DeepseekV4Weights) -> Result<(), String> {
+        let mut routed = Vec::new();
+        inner.visit_routed_tensors(&mut |name, _| routed.push(name.to_owned()));
+        if !routed.is_empty() {
+            return Err(format!(
+                "deepseek4: dense-owner weights contain routed allocations: {}",
+                routed.join(", ")
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn from_loaded(inner: DeepseekV4Weights) -> Self {
+        Self { inner }
+    }
+
+    pub fn free_gpu(self, gpu: &mut rdna_compute::Gpu) {
+        self.inner.free_gpu(gpu);
+    }
+}
+
+/// gfx1151-owned routed-expert portion of a heterogeneous DS4 load. No global,
+/// attention, shared-expert, state, or scratch allocation can enter this type.
+pub struct DeepseekV4RoutedWeights {
+    pub(crate) mq2r_backend: Mq2rBackend,
+    pub(crate) layers: Vec<DeepseekV4LayerWeights>,
+}
+
+impl DeepseekV4RoutedWeights {
+    pub(crate) fn new(cfg: &DeepseekV4Config, mq2r_backend: Mq2rBackend) -> Self {
+        let layers = (0..cfg.num_hidden_layers)
+            .map(|layer| {
+                DeepseekV4LayerWeights::new_empty(
+                    cfg.compress_ratios.get(layer).copied().unwrap_or(0),
+                )
+            })
+            .collect();
+        Self {
+            mq2r_backend,
+            layers,
+        }
+    }
+
+    pub(crate) fn layer_mut(&mut self, index: usize) -> Option<&mut DeepseekV4LayerWeights> {
+        self.layers.get_mut(index)
+    }
+
+    pub fn resolve_layer(&self, index: usize) -> &DeepseekV4LayerWeights {
+        &self.layers[index]
+    }
+
+    pub fn free_gpu(mut self, gpu: &mut rdna_compute::Gpu) {
+        for mut layer in self.layers.drain(..) {
+            layer.free_routed_gpu(gpu);
+        }
+    }
+
+    fn visit_tensors(&self, visit: &mut impl FnMut(&str, &rdna_compute::GpuTensor)) {
+        for (index, layer) in self.layers.iter().enumerate() {
+            layer.visit_routed_tensors(&format!("layers.{index}"), visit);
+        }
+    }
+}
+
+/// Split-owner weights for the heterogeneous route. The type boundary makes
+/// it impossible to call the ordinary one-GPU destructor on a mixed-owner
+/// object: each half exposes only its own owner-correct teardown.
+pub struct DeepseekV4HeterogeneousWeights {
+    pub dense: DeepseekV4DenseWeights,
+    pub routed: DeepseekV4RoutedWeights,
+}
+
+impl DeepseekV4HeterogeneousWeights {
+    pub fn free_gpu(self, dense_gpu: &mut rdna_compute::Gpu, routed_gpu: &mut rdna_compute::Gpu) {
+        self.routed.free_gpu(routed_gpu);
+        self.dense.free_gpu(dense_gpu);
+    }
+
+    /// Query HIP pointer metadata for every resident weight and prove that the
+    /// two typed owners match their exact devices. Counts include packed expert
+    /// blobs, pointer tables, and dense duplicate representations.
+    pub fn audit_owners(
+        &self,
+        dense_gpu: &mut rdna_compute::Gpu,
+        routed_gpu: &mut rdna_compute::Gpu,
+    ) -> Result<DeepseekV4OwnershipAudit, String> {
+        let mut audit = DeepseekV4OwnershipAudit::default();
+        dense_gpu
+            .bind_thread()
+            .map_err(|error| format!("deepseek4: bind dense owner for audit: {error}"))?;
+        self.dense.inner.visit_dense_tensors(&mut |name, tensor| {
+            audit.dense_tensor_count += 1;
+            audit.dense_bytes += tensor.buf.size();
+            match dense_gpu.hip.pointer_get_attributes(&tensor.buf) {
+                Ok(attr) if attr.device == dense_gpu.device_id => {}
+                Ok(attr) => audit.violations.push(format!(
+                    "{name}: dense owner device {} != expected {}",
+                    attr.device, dense_gpu.device_id
+                )),
+                Err(error) => audit
+                    .violations
+                    .push(format!("{name}: dense pointer audit failed: {error}")),
+            }
+        });
+
+        routed_gpu
+            .bind_thread()
+            .map_err(|error| format!("deepseek4: bind routed owner for audit: {error}"))?;
+        self.routed.visit_tensors(&mut |name, tensor| {
+            audit.routed_tensor_count += 1;
+            audit.routed_bytes += tensor.buf.size();
+            match routed_gpu.hip.pointer_get_attributes(&tensor.buf) {
+                Ok(attr) if attr.device == routed_gpu.device_id => {}
+                Ok(attr) => audit.violations.push(format!(
+                    "{name}: routed owner device {} != expected {}",
+                    attr.device, routed_gpu.device_id
+                )),
+                Err(error) => audit
+                    .violations
+                    .push(format!("{name}: routed pointer audit failed: {error}")),
+            }
+        });
+        if audit.violations.is_empty() {
+            Ok(audit)
+        } else {
+            Err(format!(
+                "deepseek4: heterogeneous pointer-owner audit failed: {}",
+                audit.violations.join("; ")
+            ))
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct DeepseekV4OwnershipAudit {
+    pub dense_tensor_count: usize,
+    pub dense_bytes: usize,
+    pub routed_tensor_count: usize,
+    pub routed_bytes: usize,
+    pub violations: Vec<String>,
 }
 
 /// Per-layer state for the compressed-KV indexer (Phase 2, Lever 3).

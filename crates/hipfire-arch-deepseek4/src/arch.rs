@@ -17,9 +17,131 @@
 
 use crate::backend::Mq2rBackend;
 use crate::deepseek4::{
-    DeepseekV4Config, DeepseekV4LayerWeights, DeepseekV4State, DeepseekV4Weights, DsparkConfig,
-    DsparkWeights,
+    DeepseekV4Config, DeepseekV4DenseWeights, DeepseekV4HeterogeneousWeights,
+    DeepseekV4LayerWeights, DeepseekV4RoutedWeights, DeepseekV4State, DeepseekV4Weights,
+    DsparkConfig, DsparkWeights,
 };
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct DeepseekV4HeterogeneousProjection {
+    pub dense_record_count: usize,
+    pub dense_allocation_count: usize,
+    pub dense_bytes: usize,
+    pub f16_expansion_bytes: usize,
+    pub routed_record_count: usize,
+    pub routed_allocation_count: usize,
+    pub routed_bytes: usize,
+    pub pointer_table_bytes: usize,
+    pub host_only_record_count: usize,
+}
+
+/// Deterministic G2 failure points used to certify transactional cleanup.
+/// This is a typed test seam, never an environment-controlled product mode.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeepseekV4HeterogeneousFault {
+    AfterDenseWeights,
+    AfterRoutedLayer(usize),
+    AfterOwnershipAudit,
+    AfterState,
+    AfterScratch,
+}
+
+/// Load-scoped owner for partially populated DS4 weights. `GpuTensor` is an
+/// explicit resource handle rather than a `Drop` type, so every early `?`
+/// during the 34k-record upload must walk the tensors already installed.
+///
+/// Raw device pointers avoid holding an exclusive Rust borrow for the entire
+/// upload. They are valid for this guard's strictly nested function lifetime;
+/// the heterogeneous constructor additionally proves that the two pointers
+/// refer to distinct exact devices before this guard is armed.
+struct DeepseekV4WeightStaging {
+    dense: Option<DeepseekV4Weights>,
+    routed: Option<DeepseekV4RoutedWeights>,
+    dense_gpu: *mut Gpu,
+    routed_gpu: Option<*mut Gpu>,
+}
+
+impl DeepseekV4WeightStaging {
+    fn new(
+        dense: DeepseekV4Weights,
+        routed: Option<DeepseekV4RoutedWeights>,
+        dense_gpu: &mut Gpu,
+        routed_gpu: Option<&mut Gpu>,
+    ) -> Self {
+        debug_assert_eq!(routed.is_some(), routed_gpu.is_some());
+        Self {
+            dense: Some(dense),
+            routed,
+            dense_gpu,
+            routed_gpu: routed_gpu.map(|gpu| gpu as *mut Gpu),
+        }
+    }
+
+    fn into_single(mut self) -> DeepseekV4Weights {
+        assert!(
+            self.routed.is_none(),
+            "single-owner DS4 retained routed split"
+        );
+        self.dense.take().expect("DS4 staging disarmed twice")
+    }
+
+    fn into_heterogeneous(mut self) -> Result<DeepseekV4HeterogeneousWeights, String> {
+        DeepseekV4DenseWeights::validate_loaded(
+            self.dense.as_ref().expect("DS4 staging disarmed twice"),
+        )?;
+        let dense = self.dense.take().expect("DS4 staging disarmed twice");
+        let routed = self
+            .routed
+            .take()
+            .ok_or_else(|| "deepseek4: heterogeneous staging lost routed owner".to_string())?;
+        Ok(DeepseekV4HeterogeneousWeights {
+            dense: DeepseekV4DenseWeights::from_loaded(dense),
+            routed,
+        })
+    }
+
+    fn routed_layer_mut(&mut self, index: usize) -> Option<&mut DeepseekV4LayerWeights> {
+        self.routed.as_mut()?.layer_mut(index)
+    }
+}
+
+impl std::ops::Deref for DeepseekV4WeightStaging {
+    type Target = DeepseekV4Weights;
+
+    fn deref(&self) -> &Self::Target {
+        self.dense.as_ref().expect("DS4 staging disarmed")
+    }
+}
+
+impl std::ops::DerefMut for DeepseekV4WeightStaging {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.dense.as_mut().expect("DS4 staging disarmed")
+    }
+}
+
+impl Drop for DeepseekV4WeightStaging {
+    fn drop(&mut self) {
+        let dense = self.dense.take();
+        let routed = self.routed.take();
+        if dense.is_none() && routed.is_none() {
+            return;
+        }
+        eprintln!("deepseek4: weight load failed; reclaiming partially uploaded tensors");
+        // SAFETY: both pointers originate from live `&mut Gpu` parameters of
+        // the enclosing load call. This guard is created after exact-device
+        // admission and is dropped before those parameters leave scope.
+        unsafe {
+            let dense_gpu = &mut *self.dense_gpu;
+            if let (Some(routed), Some(routed_gpu)) = (routed, self.routed_gpu) {
+                routed.free_gpu(&mut *routed_gpu);
+            }
+            if let Some(dense) = dense {
+                dense.free_gpu(dense_gpu);
+            }
+        }
+    }
+}
 use hipfire_reap::hook::ReapArchHook;
 use hipfire_runtime::arch::Architecture;
 use hipfire_runtime::hfq::HfqFile;
@@ -858,7 +980,7 @@ impl Architecture for DeepseekV4 {
         cfg: &Self::Config,
         gpu: &mut Gpu,
     ) -> Result<Self::Weights, String> {
-        Self::load_weights_inner(hfq, cfg, gpu, None)
+        Ok(Self::load_weights_inner(hfq, cfg, gpu, None, None, None)?.into_single())
     }
 
     fn new_state(_gpu: &mut Gpu, cfg: &Self::Config) -> Result<Self::State, String> {
@@ -867,6 +989,93 @@ impl Architecture for DeepseekV4 {
 }
 
 impl DeepseekV4 {
+    /// Exact byte projection for the base MQ2R split before either device is
+    /// allowed to allocate. It mirrors the upload contract: F16 norms/biases
+    /// expand to F32, the scalar head-HC scale remains host-side, routed
+    /// records pack into two blobs per layer, and two u64 pointer tables are
+    /// added per routed layer.
+    pub fn project_heterogeneous_gfx1100_gfx1151(
+        hfq: &HfqFile,
+        cfg: &DeepseekV4Config,
+    ) -> Result<DeepseekV4HeterogeneousProjection, String> {
+        Self::validate_mq2r_tensor_policy(hfq, cfg)?;
+        let mut projection = DeepseekV4HeterogeneousProjection::default();
+        for tensor in hfq.tensors() {
+            if tensor.name.contains(".ffn.experts.") {
+                projection.routed_record_count += 1;
+                projection.routed_bytes += tensor.data_size;
+                continue;
+            }
+            projection.dense_record_count += 1;
+            if tensor.name == "hc_head_scale" {
+                projection.host_only_record_count += 1;
+                continue;
+            }
+            projection.dense_allocation_count += 1;
+            projection.dense_bytes += tensor.data_size;
+            if Self::heterogeneous_f16_expands_to_f32(&tensor.name) {
+                if tensor.quant_type != 1 {
+                    return Err(format!(
+                        "deepseek4 heterogeneous preflight: '{}' expands F16->F32 but has qt={}",
+                        tensor.name, tensor.quant_type
+                    ));
+                }
+                projection.dense_bytes += tensor.data_size;
+                projection.f16_expansion_bytes += tensor.data_size;
+            }
+        }
+        let expected_routed = cfg
+            .num_hidden_layers
+            .checked_mul(cfg.n_routed_experts)
+            .and_then(|count| count.checked_mul(3))
+            .ok_or_else(|| "deepseek4 heterogeneous routed record-count overflow".to_string())?;
+        if projection.routed_record_count != expected_routed {
+            return Err(format!(
+                "deepseek4 heterogeneous preflight: {} routed records, expected {expected_routed}",
+                projection.routed_record_count
+            ));
+        }
+        // The artifact SHA is checked by the public heterogeneous loader, and
+        // this exact census makes the placement classifier fail closed if a
+        // future artifact adds, drops, or silently reclassifies a record.
+        const EXPECTED_DENSE_RECORDS: usize = 1_199;
+        const EXPECTED_HOST_ONLY_RECORDS: usize = 1;
+        if projection.dense_record_count != EXPECTED_DENSE_RECORDS
+            || projection.host_only_record_count != EXPECTED_HOST_ONLY_RECORDS
+        {
+            return Err(format!(
+                "deepseek4 heterogeneous preflight: dense/host-only census {}/{}; expected {EXPECTED_DENSE_RECORDS}/{EXPECTED_HOST_ONLY_RECORDS}",
+                projection.dense_record_count, projection.host_only_record_count
+            ));
+        }
+        // The packed implementation materializes exactly w2 + gate_up owners
+        // and one u64 pointer per global expert for each owner.
+        projection.routed_allocation_count = cfg.num_hidden_layers * 4;
+        projection.pointer_table_bytes = cfg
+            .num_hidden_layers
+            .checked_mul(cfg.n_routed_experts)
+            .and_then(|count| count.checked_mul(2))
+            .and_then(|count| count.checked_mul(std::mem::size_of::<u64>()))
+            .ok_or_else(|| "deepseek4 heterogeneous pointer-table overflow".to_string())?;
+        projection.routed_bytes = projection
+            .routed_bytes
+            .checked_add(projection.pointer_table_bytes)
+            .ok_or_else(|| "deepseek4 heterogeneous routed byte overflow".to_string())?;
+        Ok(projection)
+    }
+
+    fn heterogeneous_f16_expands_to_f32(name: &str) -> bool {
+        name == "norm.weight"
+            || name.ends_with(".attn_norm.weight")
+            || name.ends_with(".ffn_norm.weight")
+            || name.ends_with(".attn.q_norm.weight")
+            || name.ends_with(".attn.kv_norm.weight")
+            || name.ends_with(".attn.attn_sink")
+            || name.ends_with(".compressor.norm.weight")
+            || name.ends_with(".compressor.ape")
+            || name.ends_with(".ffn.gate.bias")
+    }
+
     fn validate_mq2_family_tensor_policy(
         hfq: &HfqFile,
         cfg: &DeepseekV4Config,
@@ -1163,7 +1372,64 @@ impl DeepseekV4 {
         shard: &hipfire_runtime::tp_shard::ShardConfig,
         rank: usize,
     ) -> Result<DeepseekV4Weights, String> {
-        Self::load_weights_inner(hfq, cfg, gpu, Some((shard, rank)))
+        Ok(Self::load_weights_inner(hfq, cfg, gpu, Some((shard, rank)), None, None)?.into_single())
+    }
+
+    /// Load the fixed MQ2R artifact directly onto its two exact device owners:
+    /// every non-routed tensor on gfx1100 and only packed routed-expert blobs
+    /// plus pointer tables on gfx1151. The file is opened once by the caller;
+    /// no full-model staging or post-load migration is performed.
+    pub fn load_weights_heterogeneous_gfx1100_gfx1151(
+        hfq: &mut HfqFile,
+        cfg: &DeepseekV4Config,
+        dense_gpu: &mut Gpu,
+        routed_gpu: &mut Gpu,
+    ) -> Result<DeepseekV4HeterogeneousWeights, String> {
+        if dense_gpu.device_id == routed_gpu.device_id {
+            return Err("deepseek4 heterogeneous load requires two distinct devices".into());
+        }
+        if dense_gpu.arch != "gfx1100" || routed_gpu.arch != "gfx1151" {
+            return Err(format!(
+                "deepseek4 heterogeneous exact admission requires dense=gfx1100 and routed=gfx1151; got dense={} (dev {}) routed={} (dev {})",
+                dense_gpu.arch, dense_gpu.device_id, routed_gpu.arch, routed_gpu.device_id
+            ));
+        }
+        if !cfg.mq2r || cfg.mq2rxt {
+            return Err(
+                "deepseek4 heterogeneous route admits only the frozen MQ2R P3 artifact".into(),
+            );
+        }
+        if cfg.load_dspark {
+            return Err(
+                "deepseek4 heterogeneous G2 load excludes DSpark; enable it only after the base dual-device route is certified"
+                    .into(),
+            );
+        }
+        Self::load_weights_inner(hfq, cfg, dense_gpu, None, Some(routed_gpu), None)?
+            .into_heterogeneous()
+    }
+
+    #[doc(hidden)]
+    pub fn load_weights_heterogeneous_gfx1100_gfx1151_with_fault(
+        hfq: &mut HfqFile,
+        cfg: &DeepseekV4Config,
+        dense_gpu: &mut Gpu,
+        routed_gpu: &mut Gpu,
+        fault: DeepseekV4HeterogeneousFault,
+    ) -> Result<DeepseekV4HeterogeneousWeights, String> {
+        if dense_gpu.device_id == routed_gpu.device_id
+            || dense_gpu.arch != "gfx1100"
+            || routed_gpu.arch != "gfx1151"
+            || !cfg.mq2r
+            || cfg.mq2rxt
+            || cfg.load_dspark
+        {
+            return Err(
+                "deepseek4 heterogeneous fault harness requires the exact admitted G2 route".into(),
+            );
+        }
+        Self::load_weights_inner(hfq, cfg, dense_gpu, None, Some(routed_gpu), Some(fault))?
+            .into_heterogeneous()
     }
 
     fn load_weights_inner(
@@ -1171,7 +1437,9 @@ impl DeepseekV4 {
         cfg: &DeepseekV4Config,
         gpu: &mut Gpu,
         shard: Option<(&hipfire_runtime::tp_shard::ShardConfig, usize)>,
-    ) -> Result<DeepseekV4Weights, String> {
+        mut routed_gpu: Option<&mut Gpu>,
+        heterogeneous_fault: Option<DeepseekV4HeterogeneousFault>,
+    ) -> Result<DeepseekV4WeightStaging, String> {
         // Model identity and route identity are intentionally separate.
         // `.mq2r` fixes the exact P3 tensor recipe on every architecture.
         // Native eligibility is installed on the returned DS4 weights after
@@ -1220,7 +1488,11 @@ impl DeepseekV4 {
         // addon instead of the base. The MTP layer is present iff the addon
         // (or, for one-shot quants that put MTP in-band, the base) contains
         // `mtp.0.norm.weight`.
-        let mut mtp_addon: Option<HfqFile> = {
+        let mut mtp_addon: Option<HfqFile> = if routed_gpu.is_some() {
+            // G2 owns only the frozen trunk. Auxiliary/speculative weights are
+            // admitted after the base split route has passed full correctness.
+            None
+        } else {
             let env_path = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MTP_ADDON").ok();
             let resolved: Option<std::path::PathBuf> = if let Some(p) = env_path {
                 Some(std::path::PathBuf::from(p))
@@ -1264,9 +1536,23 @@ impl DeepseekV4 {
             }
         };
 
-        let mut weights = Self::load_weights_host_only_walk(hfq, cfg)?;
+        let initial_weights = Self::load_weights_host_only_walk(hfq, cfg)?;
+        let routed_weights = routed_gpu
+            .as_ref()
+            .map(|_| DeepseekV4RoutedWeights::new(cfg, Mq2rBackend::Portable));
+        let mut weights = DeepseekV4WeightStaging::new(
+            initial_weights,
+            routed_weights,
+            gpu,
+            routed_gpu.as_deref_mut(),
+        );
         if cfg.mq2r {
             weights.mq2r_backend = Mq2rBackend::for_verified_mq2r(gpu);
+            if let (Some(routed), Some(expert_gpu)) =
+                (weights.routed.as_mut(), routed_gpu.as_deref_mut())
+            {
+                routed.mq2r_backend = Mq2rBackend::for_verified_mq2r(expert_gpu);
+            }
             let sku = if cfg.mq2rxt { "MQ2RXT" } else { "MQ2R" };
             let dense = if cfg.mq2rxt {
                 "554 MQ4 tensors"
@@ -1884,6 +2170,16 @@ impl DeepseekV4 {
             addon.shrink_pread_buf();
         }
 
+        if routed_gpu.is_some() && weights.mtp_layer.is_some() {
+            return Err(
+                "deepseek4: heterogeneous G2 admits the frozen trunk only; in-band MTP is not allowed"
+                    .into(),
+            );
+        }
+        if heterogeneous_fault == Some(DeepseekV4HeterogeneousFault::AfterDenseWeights) {
+            return Err("deepseek4: injected heterogeneous failure after dense weights".into());
+        }
+
         // Routed experts: 256 × 3 = 768 tensors per layer ×
         // 43 layers = 33,024 total. Per-expert hipMalloc takes ~10ms
         // (driver overhead) → 5+ min naive. Batch as ONE upload per
@@ -1901,22 +2197,43 @@ impl DeepseekV4 {
         // stride_w1 × n_exp + stride_w2 × n_exp ≈ 1.2 GB — bounded,
         // well below the pressure threshold.
         if upload_experts {
-            for (l, layer) in weights.layers.iter_mut().enumerate() {
+            for l in 0..weights.layers.len() {
                 let upload_this_layer = expert_layer_end.is_none_or(|end| l < end);
                 if !upload_this_layer {
                     continue;
                 }
                 let n_exp = cfg.n_routed_experts;
                 let keep = cfg.reap_keep.as_ref().and_then(|r| r.expert_plan(l).keep());
-                Self::upload_layer_routed_experts(
-                    hfq,
-                    gpu,
-                    &format!("layers.{l}"),
-                    n_exp,
-                    layer,
-                    shard,
-                    keep,
-                )?;
+                if let Some(expert_gpu) = routed_gpu.as_deref_mut() {
+                    let layer = weights
+                        .routed_layer_mut(l)
+                        .ok_or_else(|| format!("deepseek4: routed owner missing layer {l}"))?;
+                    Self::upload_layer_routed_experts(
+                        hfq,
+                        expert_gpu,
+                        &format!("layers.{l}"),
+                        n_exp,
+                        layer,
+                        shard,
+                        keep,
+                    )?;
+                } else {
+                    let layer = &mut weights.layers[l];
+                    Self::upload_layer_routed_experts(
+                        hfq,
+                        gpu,
+                        &format!("layers.{l}"),
+                        n_exp,
+                        layer,
+                        shard,
+                        keep,
+                    )?;
+                }
+                if heterogeneous_fault == Some(DeepseekV4HeterogeneousFault::AfterRoutedLayer(l)) {
+                    return Err(format!(
+                        "deepseek4: injected heterogeneous failure after routed layer {l}"
+                    ));
+                }
             }
         }
 
@@ -1934,15 +2251,27 @@ impl DeepseekV4 {
                         "base HFQ"
                     }
                 );
-                Self::upload_layer_routed_experts(
-                    mtp_expert_source,
-                    gpu,
-                    "mtp.0",
-                    cfg.n_routed_experts,
-                    mtp,
-                    shard,
-                    None, // MTP not loaded under REAP keep-map (see load_mtp guard)
-                )?;
+                if let Some(expert_gpu) = routed_gpu.as_deref_mut() {
+                    Self::upload_layer_routed_experts(
+                        mtp_expert_source,
+                        expert_gpu,
+                        "mtp.0",
+                        cfg.n_routed_experts,
+                        mtp,
+                        shard,
+                        None, // MTP not loaded under REAP keep-map (see load_mtp guard)
+                    )?;
+                } else {
+                    Self::upload_layer_routed_experts(
+                        mtp_expert_source,
+                        gpu,
+                        "mtp.0",
+                        cfg.n_routed_experts,
+                        mtp,
+                        shard,
+                        None, // MTP not loaded under REAP keep-map (see load_mtp guard)
+                    )?;
+                }
             }
         }
 
@@ -1955,6 +2284,12 @@ impl DeepseekV4 {
         // into VRAM when DSpark won't run. A missing sidecar is a silent no-op
         // (`weights.dspark` stays None).
         if cfg.load_dspark {
+            if routed_gpu.is_some() {
+                return Err(
+                    "deepseek4: DSpark sidecar is not admitted on the G2 heterogeneous base-load route"
+                        .into(),
+                );
+            }
             let base = hfq.path();
             let dspark_path: Option<std::path::PathBuf> =
                 match (base.parent(), base.file_stem(), base.extension()) {

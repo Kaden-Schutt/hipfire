@@ -8577,7 +8577,149 @@ pub struct PrefillBatchScratch {
     pub mtp_x_e_batch: GpuTensor,
 }
 
+/// Constructor-local owner for one PBS allocation. `GpuTensor` deliberately
+/// has no `Drop`, so a struct literal with dozens of fallible allocations leaks
+/// every earlier tensor if a later allocation fails. Each staged tensor returns
+/// itself to the exact owning GPU unless `into_tensor` publishes it into the
+/// completed `PrefillBatchScratch`.
+struct StagedPrefillTensor {
+    gpu: *mut Gpu,
+    tensor: Option<GpuTensor>,
+}
+
+impl StagedPrefillTensor {
+    fn new(gpu: &mut Gpu, tensor: GpuTensor) -> Self {
+        Self {
+            gpu,
+            tensor: Some(tensor),
+        }
+    }
+
+    fn into_tensor(mut self) -> GpuTensor {
+        self.tensor
+            .take()
+            .expect("PBS staged tensor disarmed twice")
+    }
+}
+
+impl Drop for StagedPrefillTensor {
+    fn drop(&mut self) {
+        let Some(tensor) = self.tensor.take() else {
+            return;
+        };
+        // SAFETY: every staging value is created and destroyed inside
+        // `PrefillBatchScratch::new`, before its caller's `&mut Gpu` can leave
+        // scope. Staged values are not returned or stored anywhere.
+        unsafe {
+            let _ = (&mut *self.gpu).free_tensor(tensor);
+        }
+    }
+}
+
 impl PrefillBatchScratch {
+    /// Exact requested allocation bytes for [`Self::new`]. This mirrors the
+    /// constructor's complete tensor inventory and exists so a transactional
+    /// multi-device loader can fail before allocating either owner. Values are
+    /// HIP allocation requests (all are >= the pool's 256-byte minimum for the
+    /// DS4 product shape); driver-internal page rounding is recorded separately
+    /// from post-load `hipMemGetInfo` deltas.
+    pub fn projected_allocation_bytes(
+        cfg: &DeepseekV4Config,
+        max_batch: usize,
+    ) -> Result<usize, String> {
+        let b = max_batch as u128;
+        let hidden = cfg.hidden_size as u128;
+        let q_rank = cfg.q_lora_rank as u128;
+        let n_heads = cfg.num_attention_heads as u128;
+        let head_dim = cfg.head_dim as u128;
+        let hc = cfg.hc_mult as u128;
+        let n_exp = cfg.n_routed_experts as u128;
+        let topk = cfg.num_experts_per_tok as u128;
+        let moe = cfg.moe_intermediate_size as u128;
+        let idx_heads = cfg.index_n_heads as u128;
+        let idx_dim = cfg.index_head_dim as u128;
+        let idx_topk = cfg.index_topk as u128;
+        let kv_dim = (cfg.num_key_value_heads * cfg.head_dim) as u128;
+        let idx_score_capacity =
+            crate::deepseek4::CompressorCapacityPlan::new(cfg.max_position_embeddings)?
+                .active_rows() as u128;
+        let block_m = 16u128;
+        let m_total = b * topk + n_exp * block_m;
+        let mut f32_elements = 0u128;
+        let mut raw_bytes = 0u128;
+        let mut add = |elements: u128| -> Result<(), String> {
+            f32_elements = f32_elements
+                .checked_add(elements)
+                .ok_or_else(|| "PrefillBatchScratch projection overflow".to_string())?;
+            Ok(())
+        };
+
+        add(head_dim)?; // q_head_ones
+        add(b * hidden)?; // embed
+        add(b * hc * hidden)?; // streams
+        add(b)?; // tokens
+        add(2 * b * hidden)?; // tmp + tmp_plain
+        add(2 * b * q_rank)?; // q_lat + q_lat_rot
+        add(b * n_heads * head_dim)?; // q
+        add(b * kv_dim)?;
+        add(b)?; // positions
+        add(b * 24)?;
+        add(2 * b * hc)?; // hc pre/post
+        add(b * hc * hc)?;
+        add(2 * b * hidden)?; // hc_x + attn_out
+        add(b * hidden)?; // ffn_out
+        add(b * hc * hidden)?; // streams_out
+        add(b * head_dim * cfg.sliding_window as u128)?;
+        add(b * head_dim * idx_topk)?;
+        add(5 * b)?; // per-row attention/indexer counts
+        add(2 * b * n_heads * head_dim)?; // raw attn + rotated
+        add(2 * b * cfg.o_groups as u128 * cfg.o_lora_rank as u128)?;
+        add(2 * b * hidden)?; // FFN x rotated/plain
+        add(3 * b * moe)?; // shared gate/up/rotated
+        add(b * n_exp)?;
+        add(2 * b * topk)?; // top-k indices + weights
+        add(3 * b * topk * moe)?; // routed gate/up/rotated
+        add(b * topk * hidden)?; // routed down outputs
+        add(b * idx_heads * idx_dim)?;
+        add(b * idx_heads)?;
+        add(b * idx_score_capacity)?;
+        add(b * idx_topk)?;
+        add(4 * b * head_dim)?; // main compressor kv + score
+        add(4 * b * idx_dim)?; // indexer compressor kv + score
+        add(3 * b * topk)?; // sorted b/krank/expert
+        add(n_exp + 1)?; // expert starts
+        raw_bytes += n_exp * 4; // expert token counts
+        raw_bytes += (n_exp + 1) * 4; // expert offsets
+        raw_bytes += m_total * 4; // sorted slot index
+        raw_bytes += (m_total / block_m) * 4; // expert tile ids
+        raw_bytes += b * topk * 4; // inverse permutation
+        add(m_total * 2 * moe)?; // grouped gate/up
+        add(m_total * moe)?; // grouped activation
+        add(m_total * hidden)?; // grouped down
+        raw_bytes += 2 * b * hidden * 2; // two F16 activation staging slabs
+        add(b)?; // compressor positions
+        add(b * (cfg.num_hidden_layers as u128 + 1) * POS_SLOTS_PER_LAYER as u128)?;
+        add(b * 10)?;
+        add(b)?; // MTP tokens
+        add(b * hidden)?; // MTP embed
+        add(b * hidden)?; // MTP e norm
+        add(b * hc * hidden)?; // MTP h norm
+        add(b * hidden)?; // MTP projected embed
+        let per_group_in = (cfg.num_attention_heads / cfg.o_groups) * cfg.head_dim;
+        let max_dim = (cfg.o_groups * cfg.o_lora_rank)
+            .max(cfg.hidden_size)
+            .max(cfg.q_lora_rank)
+            .max(cfg.o_groups * per_group_in) as u128;
+        raw_bytes += b * max_dim * 2; // WMMA F16 staging
+
+        let bytes = f32_elements
+            .checked_mul(4)
+            .and_then(|bytes| bytes.checked_add(raw_bytes))
+            .ok_or_else(|| "PrefillBatchScratch byte projection overflow".to_string())?;
+        usize::try_from(bytes)
+            .map_err(|_| "PrefillBatchScratch projection exceeds usize".to_string())
+    }
+
     /// Allocate scratch for prefill chunks of up to `max_batch` tokens.
     /// Sizes track the DeepSeek V4 config's hidden_size / q_lora_rank /
     /// num_attention_heads × head_dim.
@@ -8591,291 +8733,289 @@ impl PrefillBatchScratch {
             crate::deepseek4::CompressorCapacityPlan::new(cfg.max_position_embeddings)?
                 .active_rows();
 
-        let alloc = |gpu: &mut Gpu, shape: &[usize], label: &str| -> Result<GpuTensor, String> {
-            gpu.alloc_tensor(shape, DType::F32)
-                .map_err(|e| format!("PrefillBatchScratch alloc {label}: {e:?}"))
-        };
-        let zeros = |gpu: &mut Gpu, shape: &[usize], label: &str| -> Result<GpuTensor, String> {
-            gpu.zeros(shape, DType::F32)
-                .map_err(|e| format!("PrefillBatchScratch zeros {label}: {e:?}"))
+        let alloc =
+            |gpu: &mut Gpu, shape: &[usize], label: &str| -> Result<StagedPrefillTensor, String> {
+                let tensor = gpu
+                    .alloc_tensor(shape, DType::F32)
+                    .map_err(|e| format!("PrefillBatchScratch alloc {label}: {e:?}"))?;
+                Ok(StagedPrefillTensor::new(gpu, tensor))
+            };
+        let zeros = |gpu: &mut Gpu,
+                     shape: &[usize],
+                     dtype: DType,
+                     label: &str|
+         -> Result<StagedPrefillTensor, String> {
+            let tensor = gpu
+                .zeros(shape, dtype)
+                .map_err(|e| format!("PrefillBatchScratch zeros {label}: {e:?}"))?;
+            Ok(StagedPrefillTensor::new(gpu, tensor))
         };
 
         let ones_host = vec![1.0f32; head_dim];
-        let q_head_ones = gpu
-            .upload_f32(&ones_host, &[head_dim])
-            .map_err(|e| format!("PrefillBatchScratch upload q_head_ones: {e:?}"))?;
-
+        let q_head_ones = {
+            let tensor = gpu
+                .upload_f32(&ones_host, &[head_dim])
+                .map_err(|e| format!("PrefillBatchScratch upload q_head_ones: {e:?}"))?;
+            StagedPrefillTensor::new(gpu, tensor)
+        };
         let kv_dim = cfg.num_key_value_heads * head_dim;
+        let block_m = 16;
+        let m_total_max = max_batch * cfg.num_experts_per_tok + cfg.n_routed_experts * block_m;
+        let per_group_in = (n_heads / cfg.o_groups) * head_dim;
+        let wmma_max_dim = (cfg.o_groups * cfg.o_lora_rank)
+            .max(hidden)
+            .max(cfg.q_lora_rank)
+            .max(cfg.o_groups * per_group_in);
+
+        macro_rules! alloc_f32 {
+            ($shape:expr, $label:literal) => {
+                alloc(gpu, $shape, $label)?
+            };
+        }
+        macro_rules! zero_f32 {
+            ($shape:expr, $label:literal) => {
+                zeros(gpu, $shape, DType::F32, $label)?
+            };
+        }
+        macro_rules! zero_raw {
+            ($shape:expr, $label:literal) => {
+                zeros(gpu, $shape, DType::Raw, $label)?
+            };
+        }
+
+        // Allocate every tensor while each previous allocation remains armed.
+        // Only the infallible publication block below disarms them.
+        let embed_batch = alloc_f32!(&[max_batch, hidden], "embed_batch");
+        let streams_batch = zero_f32!(&[max_batch, hc_mult, hidden], "streams_batch");
+        let tokens = alloc_f32!(&[max_batch], "tokens");
+        let tmp_batch = alloc_f32!(&[max_batch, hidden], "tmp_batch");
+        let tmp_plain_batch = alloc_f32!(&[max_batch, hidden], "tmp_plain_batch");
+        let q_lat_batch = alloc_f32!(&[max_batch, q_rank], "q_lat_batch");
+        let q_lat_rot_batch = alloc_f32!(&[max_batch, q_rank], "q_lat_rot_batch");
+        let q_batch = alloc_f32!(&[max_batch, n_heads, head_dim], "q_batch");
+        let kv_batch = alloc_f32!(&[max_batch, kv_dim], "kv_batch");
+        let positions = alloc_f32!(&[max_batch], "positions");
+        let hc_c_batch = alloc_f32!(&[max_batch, 24], "hc_c_batch");
+        let hc_pre_batch = alloc_f32!(&[max_batch, hc_mult], "hc_pre_batch");
+        let hc_post_batch = alloc_f32!(&[max_batch, hc_mult], "hc_post_batch");
+        let hc_comb_batch = alloc_f32!(&[max_batch, hc_mult, hc_mult], "hc_comb_batch");
+        let hc_x_in_batch = alloc_f32!(&[max_batch, hidden], "hc_x_in_batch");
+        let attn_out_batch = alloc_f32!(&[max_batch, hidden], "attn_out_batch");
+        let ffn_out_batch = alloc_f32!(&[max_batch, hidden], "ffn_out_batch");
+        let streams_out_batch = alloc_f32!(&[max_batch, hc_mult, hidden], "streams_out_batch");
+        let swa_staged_batch = alloc_f32!(
+            &[max_batch, head_dim, cfg.sliding_window],
+            "swa_staged_batch"
+        );
+        let topk_staged_batch =
+            alloc_f32!(&[max_batch, head_dim, cfg.index_topk], "topk_staged_batch");
+        let n_valid_swa_arr = alloc_f32!(&[max_batch], "n_valid_swa_arr");
+        let n_active_topk_arr = alloc_f32!(&[max_batch], "n_active_topk_arr");
+        let n_compressed_4_arr = alloc_f32!(&[max_batch], "n_compressed_4_arr");
+        let n_active_topk_4_arr = alloc_f32!(&[max_batch], "n_active_topk_4_arr");
+        let n_active_topk_128_arr = alloc_f32!(&[max_batch], "n_active_topk_128_arr");
+        let attn_out_raw_batch = alloc_f32!(&[max_batch, n_heads, head_dim], "attn_out_raw_batch");
+        let attn_out_raw_rot_batch =
+            alloc_f32!(&[max_batch, n_heads * head_dim], "attn_out_raw_rot_batch");
+        let wo_a_out_batch = alloc_f32!(
+            &[max_batch, cfg.o_groups, cfg.o_lora_rank],
+            "wo_a_out_batch"
+        );
+        let wo_a_out_rot_batch = alloc_f32!(
+            &[max_batch, cfg.o_groups * cfg.o_lora_rank],
+            "wo_a_out_rot_batch"
+        );
+        let ffn_x_rot_batch = alloc_f32!(&[max_batch, hidden], "ffn_x_rot_batch");
+        let ffn_x_plain_batch = alloc_f32!(&[max_batch, hidden], "ffn_x_plain_batch");
+        let ffn_shared_gate_batch = alloc_f32!(
+            &[max_batch, cfg.moe_intermediate_size],
+            "ffn_shared_gate_batch"
+        );
+        let ffn_shared_up_batch = alloc_f32!(
+            &[max_batch, cfg.moe_intermediate_size],
+            "ffn_shared_up_batch"
+        );
+        let ffn_shared_rot_batch = alloc_f32!(
+            &[max_batch, cfg.moe_intermediate_size],
+            "ffn_shared_rot_batch"
+        );
+        let moe_scores_batch = alloc_f32!(&[max_batch, cfg.n_routed_experts], "moe_scores_batch");
+        let moe_topk_indices_batch = alloc_f32!(
+            &[max_batch, cfg.num_experts_per_tok],
+            "moe_topk_indices_batch"
+        );
+        let moe_topk_weights_batch = alloc_f32!(
+            &[max_batch, cfg.num_experts_per_tok],
+            "moe_topk_weights_batch"
+        );
+        let moe_gate_batch = alloc_f32!(
+            &[
+                max_batch,
+                cfg.num_experts_per_tok,
+                cfg.moe_intermediate_size
+            ],
+            "moe_gate_batch"
+        );
+        let moe_up_batch = alloc_f32!(
+            &[
+                max_batch,
+                cfg.num_experts_per_tok,
+                cfg.moe_intermediate_size
+            ],
+            "moe_up_batch"
+        );
+        let moe_rot_batch = alloc_f32!(
+            &[
+                max_batch,
+                cfg.num_experts_per_tok,
+                cfg.moe_intermediate_size
+            ],
+            "moe_rot_batch"
+        );
+        let moe_down_expert_outputs = alloc_f32!(
+            &[max_batch, cfg.num_experts_per_tok, hidden],
+            "moe_down_expert_outputs"
+        );
+        let idx_q_batch = alloc_f32!(
+            &[max_batch, cfg.index_n_heads, cfg.index_head_dim],
+            "idx_q_batch"
+        );
+        let idx_w_batch = alloc_f32!(&[max_batch, cfg.index_n_heads], "idx_w_batch");
+        let idx_scores_batch = alloc_f32!(&[max_batch, idx_score_capacity], "idx_scores_batch");
+        let idx_topk_indices_batch =
+            alloc_f32!(&[max_batch, cfg.index_topk], "idx_topk_indices_batch");
+        let comp_main_kv_batch = alloc_f32!(&[max_batch, 2 * head_dim], "comp_main_kv_batch");
+        let comp_main_score_batch = alloc_f32!(&[max_batch, 2 * head_dim], "comp_main_score_batch");
+        let comp_idx_kv_batch =
+            alloc_f32!(&[max_batch, 2 * cfg.index_head_dim], "comp_idx_kv_batch");
+        let comp_idx_score_batch =
+            alloc_f32!(&[max_batch, 2 * cfg.index_head_dim], "comp_idx_score_batch");
+        let moe_sorted_b = alloc_f32!(&[max_batch * cfg.num_experts_per_tok], "moe_sorted_b");
+        let moe_sorted_krank =
+            alloc_f32!(&[max_batch * cfg.num_experts_per_tok], "moe_sorted_krank");
+        let moe_sorted_expert =
+            alloc_f32!(&[max_batch * cfg.num_experts_per_tok], "moe_sorted_expert");
+        let moe_expert_starts = alloc_f32!(&[cfg.n_routed_experts + 1], "moe_expert_starts");
+        let moe_expert_token_counts =
+            zero_raw!(&[cfg.n_routed_experts * 4], "moe_expert_token_counts");
+        let moe_expert_offsets = zero_raw!(&[(cfg.n_routed_experts + 1) * 4], "moe_expert_offsets");
+        let moe_sorted_slot_index = zero_raw!(&[m_total_max * 4], "moe_sorted_slot_index");
+        let moe_expert_tile_ids = zero_raw!(&[(m_total_max / block_m) * 4], "moe_expert_tile_ids");
+        let moe_inverse_perm = zero_raw!(
+            &[max_batch * cfg.num_experts_per_tok * 4],
+            "moe_inverse_perm"
+        );
+        let moe_y_gate_up_grouped = alloc_f32!(
+            &[m_total_max, 2 * cfg.moe_intermediate_size],
+            "moe_y_gate_up_grouped"
+        );
+        let moe_x_grouped = alloc_f32!(&[m_total_max, cfg.moe_intermediate_size], "moe_x_grouped");
+        let moe_y_down_grouped = alloc_f32!(&[m_total_max, hidden], "moe_y_down_grouped");
+        let mut tmp_batch_f16 = zero_raw!(&[max_batch * hidden * 2], "tmp_batch_f16");
+        if let Some(tensor) = tmp_batch_f16.tensor.as_mut() {
+            tensor.dtype = DType::F16;
+            tensor.shape = vec![max_batch, hidden];
+        }
+        let mut tmp_plain_batch_f16 = zero_raw!(&[max_batch * hidden * 2], "tmp_plain_batch_f16");
+        if let Some(tensor) = tmp_plain_batch_f16.tensor.as_mut() {
+            tensor.dtype = DType::F16;
+            tensor.shape = vec![max_batch, hidden];
+        }
+        let comp_positions = alloc_f32!(&[max_batch], "comp_positions");
+        let pos_array_device_batch = alloc_f32!(
+            &[max_batch * (cfg.num_hidden_layers + 1) * POS_SLOTS_PER_LAYER],
+            "pos_array_device_batch"
+        );
+        let attn_state_buf_batch = alloc_f32!(&[max_batch * 10], "attn_state_buf_batch");
+        let mtp_tokens_batch = alloc_f32!(&[max_batch], "mtp_tokens_batch");
+        let mtp_embed_batch = alloc_f32!(&[max_batch, hidden], "mtp_embed_batch");
+        let mtp_e_norm_batch = alloc_f32!(&[max_batch, hidden], "mtp_e_norm_batch");
+        let mtp_h_norm_batch = alloc_f32!(&[max_batch, hc_mult, hidden], "mtp_h_norm_batch");
+        let mtp_x_e_batch = alloc_f32!(&[max_batch, hidden], "mtp_x_e_batch");
+        let mut wmma_x_scratch_f16 =
+            zero_raw!(&[max_batch * wmma_max_dim * 2], "wmma_x_scratch_f16");
+        if let Some(tensor) = wmma_x_scratch_f16.tensor.as_mut() {
+            tensor.dtype = DType::F16;
+            tensor.shape = vec![max_batch, wmma_max_dim];
+        }
 
         Ok(Self {
             max_batch,
             idx_score_capacity,
             dspark_verify_pm4: std::collections::BTreeMap::new(),
-            embed_batch: alloc(gpu, &[max_batch, hidden], "embed_batch")?,
-            streams_batch: zeros(gpu, &[max_batch, hc_mult, hidden], "streams_batch")?,
-            tokens: alloc(gpu, &[max_batch], "tokens")?,
-            tmp_batch: alloc(gpu, &[max_batch, hidden], "tmp_batch")?,
-            tmp_plain_batch: alloc(gpu, &[max_batch, hidden], "tmp_plain_batch")?,
-            q_lat_batch: alloc(gpu, &[max_batch, q_rank], "q_lat_batch")?,
-            q_lat_rot_batch: alloc(gpu, &[max_batch, q_rank], "q_lat_rot_batch")?,
-            q_batch: alloc(gpu, &[max_batch, n_heads, head_dim], "q_batch")?,
-            q_head_ones,
-            kv_batch: alloc(gpu, &[max_batch, kv_dim], "kv_batch")?,
-            positions: alloc(gpu, &[max_batch], "positions")?,
-            hc_c_batch: alloc(gpu, &[max_batch, 24], "hc_c_batch")?,
-            hc_pre_batch: alloc(gpu, &[max_batch, hc_mult], "hc_pre_batch")?,
-            hc_post_batch: alloc(gpu, &[max_batch, hc_mult], "hc_post_batch")?,
-            hc_comb_batch: alloc(gpu, &[max_batch, hc_mult, hc_mult], "hc_comb_batch")?,
-            hc_x_in_batch: alloc(gpu, &[max_batch, hidden], "hc_x_in_batch")?,
-            attn_out_batch: alloc(gpu, &[max_batch, hidden], "attn_out_batch")?,
-            ffn_out_batch: alloc(gpu, &[max_batch, hidden], "ffn_out_batch")?,
-            streams_out_batch: alloc(gpu, &[max_batch, hc_mult, hidden], "streams_out_batch")?,
-            swa_staged_batch: alloc(
-                gpu,
-                &[max_batch, head_dim, cfg.sliding_window],
-                "swa_staged_batch",
-            )?,
-            topk_staged_batch: alloc(
-                gpu,
-                &[max_batch, head_dim, cfg.index_topk],
-                "topk_staged_batch",
-            )?,
-            n_valid_swa_arr: alloc(gpu, &[max_batch], "n_valid_swa_arr")?,
-            n_active_topk_arr: alloc(gpu, &[max_batch], "n_active_topk_arr")?,
-            n_compressed_4_arr: alloc(gpu, &[max_batch], "n_compressed_4_arr")?,
-            n_active_topk_4_arr: alloc(gpu, &[max_batch], "n_active_topk_4_arr")?,
-            n_active_topk_128_arr: alloc(gpu, &[max_batch], "n_active_topk_128_arr")?,
-            attn_out_raw_batch: alloc(gpu, &[max_batch, n_heads, head_dim], "attn_out_raw_batch")?,
-            attn_out_raw_rot_batch: alloc(
-                gpu,
-                &[max_batch, n_heads * head_dim],
-                "attn_out_raw_rot_batch",
-            )?,
-            wo_a_out_batch: alloc(
-                gpu,
-                &[max_batch, cfg.o_groups, cfg.o_lora_rank],
-                "wo_a_out_batch",
-            )?,
-            wo_a_out_rot_batch: alloc(
-                gpu,
-                &[max_batch, cfg.o_groups * cfg.o_lora_rank],
-                "wo_a_out_rot_batch",
-            )?,
-            ffn_x_rot_batch: alloc(gpu, &[max_batch, hidden], "ffn_x_rot_batch")?,
-            ffn_x_plain_batch: alloc(gpu, &[max_batch, hidden], "ffn_x_plain_batch")?,
-            ffn_shared_gate_batch: alloc(
-                gpu,
-                &[max_batch, cfg.moe_intermediate_size],
-                "ffn_shared_gate_batch",
-            )?,
-            ffn_shared_up_batch: alloc(
-                gpu,
-                &[max_batch, cfg.moe_intermediate_size],
-                "ffn_shared_up_batch",
-            )?,
-            ffn_shared_rot_batch: alloc(
-                gpu,
-                &[max_batch, cfg.moe_intermediate_size],
-                "ffn_shared_rot_batch",
-            )?,
-            moe_scores_batch: alloc(gpu, &[max_batch, cfg.n_routed_experts], "moe_scores_batch")?,
-            moe_topk_indices_batch: alloc(
-                gpu,
-                &[max_batch, cfg.num_experts_per_tok],
-                "moe_topk_indices_batch",
-            )?,
-            moe_topk_weights_batch: alloc(
-                gpu,
-                &[max_batch, cfg.num_experts_per_tok],
-                "moe_topk_weights_batch",
-            )?,
-            moe_gate_batch: alloc(
-                gpu,
-                &[
-                    max_batch,
-                    cfg.num_experts_per_tok,
-                    cfg.moe_intermediate_size,
-                ],
-                "moe_gate_batch",
-            )?,
-            moe_up_batch: alloc(
-                gpu,
-                &[
-                    max_batch,
-                    cfg.num_experts_per_tok,
-                    cfg.moe_intermediate_size,
-                ],
-                "moe_up_batch",
-            )?,
-            moe_rot_batch: alloc(
-                gpu,
-                &[
-                    max_batch,
-                    cfg.num_experts_per_tok,
-                    cfg.moe_intermediate_size,
-                ],
-                "moe_rot_batch",
-            )?,
-            moe_down_expert_outputs: alloc(
-                gpu,
-                &[max_batch, cfg.num_experts_per_tok, hidden],
-                "moe_down_expert_outputs",
-            )?,
-            // Indexer-chain scratch. The initial 2,048-row product bucket is
-            // grown automatically at request boundaries.
-            idx_q_batch: alloc(
-                gpu,
-                &[max_batch, cfg.index_n_heads, cfg.index_head_dim],
-                "idx_q_batch",
-            )?,
-            idx_w_batch: alloc(gpu, &[max_batch, cfg.index_n_heads], "idx_w_batch")?,
-            idx_scores_batch: alloc(gpu, &[max_batch, idx_score_capacity], "idx_scores_batch")?,
-            idx_topk_indices_batch: alloc(
-                gpu,
-                &[max_batch, cfg.index_topk],
-                "idx_topk_indices_batch",
-            )?,
-            // Compressor batched-GEMV scratch — main coff=2, idx coff=2.
-            comp_main_kv_batch: alloc(gpu, &[max_batch, 2 * head_dim], "comp_main_kv_batch")?,
-            comp_main_score_batch: alloc(gpu, &[max_batch, 2 * head_dim], "comp_main_score_batch")?,
-            comp_idx_kv_batch: alloc(
-                gpu,
-                &[max_batch, 2 * cfg.index_head_dim],
-                "comp_idx_kv_batch",
-            )?,
-            comp_idx_score_batch: alloc(
-                gpu,
-                &[max_batch, 2 * cfg.index_head_dim],
-                "comp_idx_score_batch",
-            )?,
-            // Scatter-by-expert MoE sort scratch.
-            moe_sorted_b: alloc(gpu, &[max_batch * cfg.num_experts_per_tok], "moe_sorted_b")?,
-            moe_sorted_krank: alloc(
-                gpu,
-                &[max_batch * cfg.num_experts_per_tok],
-                "moe_sorted_krank",
-            )?,
-            moe_sorted_expert: alloc(
-                gpu,
-                &[max_batch * cfg.num_experts_per_tok],
-                "moe_sorted_expert",
-            )?,
-            moe_expert_starts: alloc(gpu, &[cfg.n_routed_experts + 1], "moe_expert_starts")?,
-            // SGLang-style scatter-grouped MoE pipeline (chunk_size ≥ 256 only).
-            // Sized for the worst-case `m_total_max = B*K_TOP + n_exp*BLOCK_M`
-            // padded layout. All i32 buffers stored as Raw so byte-counts
-            // match the kernels (which read int32 indices).
-            moe_expert_token_counts: {
-                let n = cfg.n_routed_experts;
-                gpu.zeros(&[n * 4], DType::Raw)
-                    .map_err(|e| format!("alloc moe_expert_token_counts: {e:?}"))?
-            },
-            moe_expert_offsets: {
-                let n = cfg.n_routed_experts + 1;
-                gpu.zeros(&[n * 4], DType::Raw)
-                    .map_err(|e| format!("alloc moe_expert_offsets: {e:?}"))?
-            },
-            moe_sorted_slot_index: {
-                let block_m = 16;
-                let m_total_max =
-                    max_batch * cfg.num_experts_per_tok + cfg.n_routed_experts * block_m;
-                gpu.zeros(&[m_total_max * 4], DType::Raw)
-                    .map_err(|e| format!("alloc moe_sorted_slot_index: {e:?}"))?
-            },
-            moe_expert_tile_ids: {
-                let block_m = 16;
-                let m_total_max =
-                    max_batch * cfg.num_experts_per_tok + cfg.n_routed_experts * block_m;
-                let n_tiles = m_total_max / block_m;
-                gpu.zeros(&[n_tiles * 4], DType::Raw)
-                    .map_err(|e| format!("alloc moe_expert_tile_ids: {e:?}"))?
-            },
-            moe_inverse_perm: {
-                let n = max_batch * cfg.num_experts_per_tok;
-                gpu.zeros(&[n * 4], DType::Raw)
-                    .map_err(|e| format!("alloc moe_inverse_perm: {e:?}"))?
-            },
-            moe_y_gate_up_grouped: {
-                let block_m = 16;
-                let m_total_max =
-                    max_batch * cfg.num_experts_per_tok + cfg.n_routed_experts * block_m;
-                alloc(
-                    gpu,
-                    &[m_total_max, 2 * cfg.moe_intermediate_size],
-                    "moe_y_gate_up_grouped",
-                )?
-            },
-            moe_x_grouped: {
-                let block_m = 16;
-                let m_total_max =
-                    max_batch * cfg.num_experts_per_tok + cfg.n_routed_experts * block_m;
-                alloc(
-                    gpu,
-                    &[m_total_max, cfg.moe_intermediate_size],
-                    "moe_x_grouped",
-                )?
-            },
-            moe_y_down_grouped: {
-                let block_m = 16;
-                let m_total_max =
-                    max_batch * cfg.num_experts_per_tok + cfg.n_routed_experts * block_m;
-                alloc(gpu, &[m_total_max, hidden], "moe_y_down_grouped")?
-            },
-            // F16 staging buffers: 2 bytes per element. Allocate as Raw
-            // with byte-count shape so DType::size() == 1 stays consistent.
-            tmp_batch_f16: {
-                let nbytes = max_batch * hidden * 2;
-                let mut t = gpu
-                    .zeros(&[nbytes], DType::Raw)
-                    .map_err(|e| format!("PBS alloc tmp_batch_f16: {e:?}"))?;
-                t.dtype = DType::F16;
-                t.shape = vec![max_batch, hidden];
-                t
-            },
-            tmp_plain_batch_f16: {
-                let nbytes = max_batch * hidden * 2;
-                let mut t = gpu
-                    .zeros(&[nbytes], DType::Raw)
-                    .map_err(|e| format!("PBS alloc tmp_plain_batch_f16: {e:?}"))?;
-                t.dtype = DType::F16;
-                t.shape = vec![max_batch, hidden];
-                t
-            },
-            comp_positions: alloc(gpu, &[max_batch], "comp_positions")?,
-            // Per-batch device-side state mirrors of state.pos_array_device
-            // and state.attn_state_buf. Sized to cover B = max_batch rows.
-            // POS_SLOTS_PER_LAYER = 3 per layer, ATTN_STATE_SLOTS = 10 total.
-            pos_array_device_batch: alloc(
-                gpu,
-                &[max_batch * (cfg.num_hidden_layers + 1) * POS_SLOTS_PER_LAYER],
-                "pos_array_device_batch",
-            )?,
-            attn_state_buf_batch: alloc(gpu, &[max_batch * 10], "attn_state_buf_batch")?,
-            mtp_tokens_batch: alloc(gpu, &[max_batch], "mtp_tokens_batch")?,
-            mtp_embed_batch: alloc(gpu, &[max_batch, hidden], "mtp_embed_batch")?,
-            mtp_e_norm_batch: alloc(gpu, &[max_batch, hidden], "mtp_e_norm_batch")?,
-            mtp_h_norm_batch: alloc(gpu, &[max_batch, hc_mult, hidden], "mtp_h_norm_batch")?,
-            mtp_x_e_batch: alloc(gpu, &[max_batch, hidden], "mtp_x_e_batch")?,
-            wmma_x_scratch_f16: {
-                // Cover the largest x-tensor size across all batched
-                // WMMA call sites. wo_a's input is [B, G, per_group_in]
-                // where per_group_in = (n_heads/n_groups) * head_dim —
-                // can exceed `hidden` for DeepSeek V4 (G=8, per_group_in=4096
-                // ⇒ G*per_group_in = 32768).
-                let per_group_in = (n_heads / cfg.o_groups) * head_dim;
-                let max_dim = cfg.o_groups * cfg.o_lora_rank;
-                let max_dim = max_dim
-                    .max(hidden)
-                    .max(cfg.q_lora_rank)
-                    .max(cfg.o_groups * per_group_in);
-                let nbytes = max_batch * max_dim * 2;
-                let mut t = gpu
-                    .zeros(&[nbytes], DType::Raw)
-                    .map_err(|e| format!("PBS alloc wmma_x_scratch_f16: {e:?}"))?;
-                t.dtype = DType::F16;
-                t.shape = vec![max_batch, max_dim];
-                t
-            },
+            embed_batch: embed_batch.into_tensor(),
+            streams_batch: streams_batch.into_tensor(),
+            tokens: tokens.into_tensor(),
+            tmp_batch: tmp_batch.into_tensor(),
+            tmp_plain_batch: tmp_plain_batch.into_tensor(),
+            q_lat_batch: q_lat_batch.into_tensor(),
+            q_lat_rot_batch: q_lat_rot_batch.into_tensor(),
+            q_batch: q_batch.into_tensor(),
+            q_head_ones: q_head_ones.into_tensor(),
+            kv_batch: kv_batch.into_tensor(),
+            positions: positions.into_tensor(),
+            hc_c_batch: hc_c_batch.into_tensor(),
+            hc_pre_batch: hc_pre_batch.into_tensor(),
+            hc_post_batch: hc_post_batch.into_tensor(),
+            hc_comb_batch: hc_comb_batch.into_tensor(),
+            hc_x_in_batch: hc_x_in_batch.into_tensor(),
+            attn_out_batch: attn_out_batch.into_tensor(),
+            ffn_out_batch: ffn_out_batch.into_tensor(),
+            streams_out_batch: streams_out_batch.into_tensor(),
+            swa_staged_batch: swa_staged_batch.into_tensor(),
+            topk_staged_batch: topk_staged_batch.into_tensor(),
+            n_valid_swa_arr: n_valid_swa_arr.into_tensor(),
+            n_active_topk_arr: n_active_topk_arr.into_tensor(),
+            n_compressed_4_arr: n_compressed_4_arr.into_tensor(),
+            n_active_topk_4_arr: n_active_topk_4_arr.into_tensor(),
+            n_active_topk_128_arr: n_active_topk_128_arr.into_tensor(),
+            attn_out_raw_batch: attn_out_raw_batch.into_tensor(),
+            attn_out_raw_rot_batch: attn_out_raw_rot_batch.into_tensor(),
+            wo_a_out_batch: wo_a_out_batch.into_tensor(),
+            wo_a_out_rot_batch: wo_a_out_rot_batch.into_tensor(),
+            ffn_x_rot_batch: ffn_x_rot_batch.into_tensor(),
+            ffn_x_plain_batch: ffn_x_plain_batch.into_tensor(),
+            ffn_shared_gate_batch: ffn_shared_gate_batch.into_tensor(),
+            ffn_shared_up_batch: ffn_shared_up_batch.into_tensor(),
+            ffn_shared_rot_batch: ffn_shared_rot_batch.into_tensor(),
+            moe_scores_batch: moe_scores_batch.into_tensor(),
+            moe_topk_indices_batch: moe_topk_indices_batch.into_tensor(),
+            moe_topk_weights_batch: moe_topk_weights_batch.into_tensor(),
+            moe_gate_batch: moe_gate_batch.into_tensor(),
+            moe_up_batch: moe_up_batch.into_tensor(),
+            moe_rot_batch: moe_rot_batch.into_tensor(),
+            moe_down_expert_outputs: moe_down_expert_outputs.into_tensor(),
+            idx_q_batch: idx_q_batch.into_tensor(),
+            idx_w_batch: idx_w_batch.into_tensor(),
+            idx_scores_batch: idx_scores_batch.into_tensor(),
+            idx_topk_indices_batch: idx_topk_indices_batch.into_tensor(),
+            comp_main_kv_batch: comp_main_kv_batch.into_tensor(),
+            comp_main_score_batch: comp_main_score_batch.into_tensor(),
+            comp_idx_kv_batch: comp_idx_kv_batch.into_tensor(),
+            comp_idx_score_batch: comp_idx_score_batch.into_tensor(),
+            moe_sorted_b: moe_sorted_b.into_tensor(),
+            moe_sorted_krank: moe_sorted_krank.into_tensor(),
+            moe_sorted_expert: moe_sorted_expert.into_tensor(),
+            moe_expert_starts: moe_expert_starts.into_tensor(),
+            moe_expert_token_counts: moe_expert_token_counts.into_tensor(),
+            moe_expert_offsets: moe_expert_offsets.into_tensor(),
+            moe_sorted_slot_index: moe_sorted_slot_index.into_tensor(),
+            moe_expert_tile_ids: moe_expert_tile_ids.into_tensor(),
+            moe_inverse_perm: moe_inverse_perm.into_tensor(),
+            moe_y_gate_up_grouped: moe_y_gate_up_grouped.into_tensor(),
+            moe_x_grouped: moe_x_grouped.into_tensor(),
+            moe_y_down_grouped: moe_y_down_grouped.into_tensor(),
+            tmp_batch_f16: tmp_batch_f16.into_tensor(),
+            tmp_plain_batch_f16: tmp_plain_batch_f16.into_tensor(),
+            comp_positions: comp_positions.into_tensor(),
+            pos_array_device_batch: pos_array_device_batch.into_tensor(),
+            attn_state_buf_batch: attn_state_buf_batch.into_tensor(),
+            mtp_tokens_batch: mtp_tokens_batch.into_tensor(),
+            mtp_embed_batch: mtp_embed_batch.into_tensor(),
+            mtp_e_norm_batch: mtp_e_norm_batch.into_tensor(),
+            mtp_h_norm_batch: mtp_h_norm_batch.into_tensor(),
+            mtp_x_e_batch: mtp_x_e_batch.into_tensor(),
+            wmma_x_scratch_f16: wmma_x_scratch_f16.into_tensor(),
         })
     }
 
