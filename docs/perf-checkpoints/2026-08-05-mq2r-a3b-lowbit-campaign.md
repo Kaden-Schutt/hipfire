@@ -15,17 +15,21 @@ assumes that one for Phases 2–4.
 
 ## Result
 
-`mq2r` — **12.325 GB** — reaches **200.6 tok/s PM4 decode**, against `mq4r`'s
+`mq2r` — **12.325 GB** — reaches **204.3 tok/s PM4 decode**, against `mq4r`'s
 **201.9 tok/s at 18.65 GB**. Decode parity at **66% of the size**, with better
 KLD than the shipping `.mq2` on both eval slices.
 
 | SKU | size | wt2 KLD | agentic KLD | PM4 decode |
 |---|---|---|---|---:|
 | `.mq2` (ships today) | 11.61 GB | 0.2384 | 0.4692 | 135.9 |
-| **`mq2r`** (this work) | **12.325 GB** | **0.2356** | **0.4631** | **200.6** |
+| **`mq2r`** (this work) | **12.325 GB** | **0.2356** | **0.4631** | **204.3** |
 | `mq4r` | 18.65 GB | — | — | 201.9 |
 | `mq2p` (= P3) | 13.02 GB | **0.1841** | **0.4164** | 124.5 |
 | mq2r-GL | 11.53 GB | 0.2099 | 0.4448 | 129.2 |
+
+mq2r's 200.6 → **204.3** came from `75fe90fbb` (codebook resource contracts, § "Live
+defects" item 2): +1.78% order-balanced over 12 runs, bit-exact, and it now *beats*
+mq4r rather than tying it. Earlier rows in this table predate that fix.
 
 `mq2r` composition: **all-MQ4 fixed tier** (attn + lm_head + embed + router) +
 **routed gate_up MQ2G256Lloyd / down MQ3G256Lloyd**, `--no-kmap`.
@@ -218,11 +222,18 @@ Other traps, all cost real time here:
    (`rdna-compute/src/kernels.rs:4411`, selected at `norm.rs:2400`).
 
 2. **`replay.rs` keys PM4 resource tracking on literal kernel-name strings** —
-   `pointer_effects()` (:577) and `expected_kernarg_bytes()` (:878). A renamed
-   kernel falls out of both, `ResourceFrontier::independent()` goes false at
-   every boundary, and `wait_compute_idle()` is forced (~30/token) **with no
-   error**. Any new kernel variant must be registered there before a PM4 A/B
-   means anything.
+   `pointer_effects()` and `expected_kernarg_bytes()`. A renamed or new kernel
+   falls out of both, `ResourceFrontier::independent()` goes false at every
+   boundary, and `wait_compute_idle()` is forced **with no error**.
+   **FIXED for the codebook family in `75fe90fbb`** — the MQ2/MQ3 G256-Lloyd
+   routed-MoE kernels had *no* entries at all, which is why mq2r proved only
+   90 of 692 boundaries independent against mq4r's 130 of 692. Registering the
+   13 symbols took coverage 532 → **692/692** and independence 90 → **130**,
+   worth **+1.78%** PM4 decode (200.67 → 204.27, order-balanced, 12 runs).
+   `codebook_moe_symbols_have_resource_contracts` now fails if a codebook
+   variant lands unregistered. **The general hazard remains** for every family
+   without such a guard: any new kernel variant must be registered before a PM4
+   A/B means anything, and mq4r itself still sits at `covered=612/692`.
 
 3. **`HIPFIRE_FIXED_TIER` is silently ignored under `--no-q8-router`** —
    `main.rs:10537` gates the whole fixed-tier override behind
@@ -257,13 +268,23 @@ Beyond ~231 on pure AR requires cutting the **fixed tier** (1030 MB = 75% of
 per-token traffic, identical in both SKUs) or batching tokens.
 
 **Candidate fifth phase — concurrency.** The PM4 wait audit already computes
-independence (`mq4r: 250 of 762 boundaries; mq2r: 170 of 692`) and uses it only
-to *delete waits*; the tape still executes strictly in order, single-stream. The
-July 2026 launch-set experiment measured RADV overlapping independent dispatches
-(1.29× real, 3.6× on independent sets) where ROCm hipGraph does not (0.77×). The
-shared-expert and routed-expert paths are already *proven* disjoint — the wait
-was removed, but they still run sequentially. Two-queue was tried on 2026-07-11
-and lost, but that predates dependency-derived waits.
+independence and uses it only to *delete waits*; the tape still executes
+strictly in order, single-stream. The July 2026 launch-set experiment measured
+RADV overlapping independent dispatches (1.29× real, 3.6× on independent sets)
+where ROCm hipGraph does not (0.77×). Two-queue was tried on 2026-07-11 and
+lost, but that predates dependency-derived waits.
+
+**Precondition now met (`75fe90fbb`).** The shared-expert vs routed-gate_up pair
+the audit calls disjoint was *never actually proven* on mq2r — the codebook side
+was unregistered, so 40 boundaries per token (one per layer) fail-closed. mq2r
+now reports `covered=692/692, resource_independent=130`, so `pm4_phase_plan()`
+has real antichain width for the first time; before, 160 unmodelled boundaries
+capped it. `HIPFIRE_REPLAY_PM4_QUEUES=2` is therefore worth its first honest
+attempt on **mq2r specifically** — note `CERTIFIED_PM4_POLICY`
+(`tools/redline/product_bench.py:75`) hardcodes `QUEUES=1` for both SKUs with no
+CLI override, so per-SKU routing wants the registry entry mq2r needs anyway.
+Measure with **both arm orders**: a systematic slot bias of ±0.71% was measured
+on mq4r, large enough to invert a sub-1% verdict on its own.
 
 ---
 
@@ -281,6 +302,7 @@ pass, pushed to `hiptrx`:**
 | `68a70a175` | MQ3-down R2/R4 row tile (opt-in) |
 | `9bd03ac38` + `44739d429` | same for MQ2-down (opt-in) |
 | `468954433` | MQ3-down ninepath port (opt-in) |
+| `75fe90fbb` | codebook MoE resource contracts — **default-on, bit-exact, +1.78%** |
 
 **Open:**
 
