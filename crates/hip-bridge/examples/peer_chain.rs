@@ -221,6 +221,24 @@ fn assert_bytes(
     Ok(())
 }
 
+fn initialize_chain_inputs(
+    hip: &HipRuntime,
+    dev0_a: &DeviceBuffer,
+    dev0_b: &DeviceBuffer,
+    dev1: &DeviceBuffer,
+    expected: &[u8],
+) -> HipResult<()> {
+    hip.set_device(0)?;
+    hip.memcpy_htod(dev0_a, expected)?;
+    hip.memset(dev0_b, 0, expected.len())?;
+    hip.device_synchronize()?;
+
+    hip.set_device(1)?;
+    hip.memset(dev1, 0, expected.len())?;
+    hip.device_synchronize()?;
+    Ok(())
+}
+
 struct Direction<'a> {
     src_device: i32,
     dst_device: i32,
@@ -492,9 +510,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         hip.set_device(0)?;
         hip.memcpy_htod(&dev0_a, &expected_0)?;
         hip.memset(&dev0_b, 0, size)?;
+        hip.device_synchronize()?;
         hip.set_device(1)?;
         hip.memset(&dev1_a, 0, size)?;
         hip.memcpy_htod(&dev1_b, &expected_1)?;
+        hip.device_synchronize()?;
 
         // Directional correctness before warm/timed samples.
         one_way_sample(&hip, &direction_0_to_1, size)?;
@@ -504,11 +524,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Chain correctness starts with one patterned and two zeroed buffers;
         // a silently skipped copy therefore cannot pass by stale equality.
-        hip.set_device(0)?;
-        hip.memcpy_htod(&dev0_a, &expected_0)?;
-        hip.memset(&dev0_b, 0, size)?;
-        hip.set_device(1)?;
-        hip.memset(&dev1_a, 0, size)?;
+        initialize_chain_inputs(&hip, &dev0_a, &dev0_b, &dev1_a, &expected_0)?;
         chain_sample(&hip, &chain, size, true)?;
         let final_dev0 = if cfg.layers % 2 == 0 {
             &dev0_a
@@ -593,11 +609,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // repeated payload could hide after the next successful round trip.
         for sample in 0..cfg.exactness_samples {
             let expected = pattern(size, 31u8.wrapping_add(sample as u8));
-            hip.set_device(0)?;
-            hip.memcpy_htod(&dev0_a, &expected)?;
-            hip.memset(&dev0_b, 0, size)?;
-            hip.set_device(1)?;
-            hip.memset(&dev1_a, 0, size)?;
+            initialize_chain_inputs(&hip, &dev0_a, &dev0_b, &dev1_a, &expected)?;
             chain_sample(&hip, &chain, size, true)?;
             let final_dev0 = if cfg.layers % 2 == 0 {
                 &dev0_a
