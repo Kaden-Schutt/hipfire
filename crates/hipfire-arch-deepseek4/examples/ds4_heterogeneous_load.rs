@@ -61,14 +61,14 @@ fn main() -> Result<(), String> {
     let plan = DeepseekV4HeterogeneousLoadPlan::default();
     for cycle in 0..cycles {
         if let Some(fault) = fault {
-            let error =
-                match DeepseekV4HeterogeneousModel::load_with_fault(Path::new(&model), plan, fault)
-                {
-                    Ok(_) => {
-                        return Err(format!("fault injection {fault:?} unexpectedly succeeded"))
-                    }
-                    Err(error) => error,
-                };
+            let error = match DeepseekV4HeterogeneousModel::load_with_fault(
+                Path::new(&model),
+                plan.clone(),
+                fault,
+            ) {
+                Ok(_) => return Err(format!("fault injection {fault:?} unexpectedly succeeded")),
+                Err(error) => error,
+            };
             println!(
                 "{}",
                 serde_json::to_string(&json!({
@@ -82,7 +82,10 @@ fn main() -> Result<(), String> {
             continue;
         }
 
-        let mut loaded = Some(DeepseekV4HeterogeneousModel::load(Path::new(&model), plan)?);
+        let mut loaded = Some(DeepseekV4HeterogeneousModel::load(
+            Path::new(&model),
+            plan.clone(),
+        )?);
         if replacement_probe {
             let before_sha = loaded
                 .as_ref()
@@ -93,7 +96,7 @@ fn main() -> Result<(), String> {
             let replacement_error = DeepseekV4HeterogeneousModel::replace_transactionally(
                 &mut loaded,
                 Path::new(&model),
-                plan,
+                plan.clone(),
             )
             .expect_err("replacement unexpectedly fit beside the resident 73 GiB expert tier");
             let after = loaded

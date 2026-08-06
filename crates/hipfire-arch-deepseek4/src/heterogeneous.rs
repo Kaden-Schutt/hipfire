@@ -10,6 +10,8 @@
 
 use std::path::Path;
 
+use hip_bridge::HipRuntime;
+use hipfire_config::{Deepseek4ComputePlacement, DeviceSelector};
 use hipfire_runtime::arch::Architecture;
 use hipfire_runtime::hfq::HfqFile;
 use rdna_compute::Gpu;
@@ -25,10 +27,9 @@ pub const MQ2R_0731_SHA256: &str =
     "cbf2bbcfa3f47b1712a071836b2c48232dad7dfb763813a720f7d348a9318cce";
 pub const DEFAULT_SAFETY_MARGIN_BYTES: usize = 2 * 1024 * 1024 * 1024;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeepseekV4HeterogeneousLoadPlan {
-    pub dense_device_id: i32,
-    pub routed_device_id: i32,
+    pub placement: Deepseek4ComputePlacement,
     pub prefill_max_batch: usize,
     pub safety_margin_bytes: usize,
 }
@@ -36,11 +37,65 @@ pub struct DeepseekV4HeterogeneousLoadPlan {
 impl Default for DeepseekV4HeterogeneousLoadPlan {
     fn default() -> Self {
         Self {
-            dense_device_id: 0,
-            routed_device_id: 1,
+            placement: Deepseek4ComputePlacement::DenseExpertSplit {
+                dense: DeviceSelector::ExactArch("gfx1100".into()),
+                experts: DeviceSelector::ExactArch("gfx1151".into()),
+            },
             prefill_max_batch: 1024,
             safety_margin_bytes: DEFAULT_SAFETY_MARGIN_BYTES,
         }
+    }
+}
+
+impl DeepseekV4HeterogeneousLoadPlan {
+    fn resolve_device_ids(&self) -> Result<(i32, i32), String> {
+        let Deepseek4ComputePlacement::DenseExpertSplit { dense, experts } = &self.placement else {
+            return Err(
+                "deepseek4 heterogeneous load requires dense-expert-split placement".into(),
+            );
+        };
+        let hip = HipRuntime::load()
+            .map_err(|error| format!("deepseek4 heterogeneous HIP discovery: {error}"))?;
+        let dense_id = resolve_device_selector(&hip, dense)?;
+        let routed_id = resolve_device_selector(&hip, experts)?;
+        if dense_id == routed_id {
+            return Err(
+                "deepseek4 heterogeneous placement resolves both roles to one device".into(),
+            );
+        }
+        Ok((dense_id, routed_id))
+    }
+}
+
+fn resolve_device_selector(hip: &HipRuntime, selector: &DeviceSelector) -> Result<i32, String> {
+    match selector {
+        DeviceSelector::ExactArch(expected) => {
+            let count = hip
+                .device_count()
+                .map_err(|error| format!("deepseek4 heterogeneous device count: {error}"))?;
+            let mut matches = Vec::new();
+            for device_id in 0..count {
+                let arch = hip.get_arch(device_id).map_err(|error| {
+                    format!("deepseek4 heterogeneous device {device_id} architecture: {error}")
+                })?;
+                if arch.eq_ignore_ascii_case(expected) {
+                    matches.push(device_id);
+                }
+            }
+            match matches.as_slice() {
+                [device_id] => Ok(*device_id),
+                [] => Err(format!(
+                    "deepseek4 heterogeneous selector {selector} matched no visible device"
+                )),
+                _ => Err(format!(
+                    "deepseek4 heterogeneous selector {selector} matched {} visible devices; use PCI BDF or UUID",
+                    matches.len()
+                )),
+            }
+        }
+        DeviceSelector::PciBdf(_) | DeviceSelector::Uuid(_) => Err(format!(
+            "deepseek4 heterogeneous selector {selector} is typed but this HIP discovery layer cannot resolve it yet"
+        )),
     }
 }
 
@@ -202,9 +257,6 @@ impl DeepseekV4HeterogeneousModel {
         plan: DeepseekV4HeterogeneousLoadPlan,
         fault: Option<DeepseekV4HeterogeneousFault>,
     ) -> Result<Self, String> {
-        if plan.dense_device_id == plan.routed_device_id {
-            return Err("deepseek4 heterogeneous plan assigns both roles to one device".into());
-        }
         if plan.prefill_max_batch == 0 {
             return Err("deepseek4 heterogeneous prefill_max_batch must be nonzero".into());
         }
@@ -234,9 +286,10 @@ impl DeepseekV4HeterogeneousModel {
         let dense_state_scratch_projected_bytes =
             PrefillBatchScratch::projected_allocation_bytes(&config, plan.prefill_max_batch)?;
 
-        let dense_gpu = Gpu::init_with_device(plan.dense_device_id)
+        let (dense_device_id, routed_device_id) = plan.resolve_device_ids()?;
+        let dense_gpu = Gpu::init_with_device(dense_device_id)
             .map_err(|error| format!("deepseek4 heterogeneous init dense device: {error}"))?;
-        let routed_gpu = Gpu::init_with_device(plan.routed_device_id)
+        let routed_gpu = Gpu::init_with_device(routed_device_id)
             .map_err(|error| format!("deepseek4 heterogeneous init routed device: {error}"))?;
         if dense_gpu.arch != "gfx1100" || routed_gpu.arch != "gfx1151" {
             return Err(format!(

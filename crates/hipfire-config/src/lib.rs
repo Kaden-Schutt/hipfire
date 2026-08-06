@@ -56,6 +56,119 @@ pub enum ConfigValue {
     Null,
 }
 
+/// Stable device identity used by model-specific placement policies. Logical
+/// HIP ordinals are deliberately absent: they are re-numbered by visibility
+/// masks and across reboot/hotplug.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "kebab-case")]
+pub enum DeviceSelector {
+    PciBdf(String),
+    Uuid(String),
+    /// Permitted only when exactly one visible device matches at resolution.
+    ExactArch(String),
+}
+
+impl fmt::Display for DeviceSelector {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PciBdf(value) => write!(f, "pci:{value}"),
+            Self::Uuid(value) => write!(f, "uuid:{value}"),
+            Self::ExactArch(value) => write!(f, "arch:{value}"),
+        }
+    }
+}
+
+impl std::str::FromStr for DeviceSelector {
+    type Err = String;
+
+    fn from_str(raw: &str) -> std::result::Result<Self, Self::Err> {
+        let (kind, value) = raw.split_once(':').ok_or_else(|| {
+            format!("device selector '{raw}' must start with pci:, uuid:, or arch:")
+        })?;
+        if value.is_empty() || value.chars().any(char::is_whitespace) {
+            return Err(format!(
+                "device selector '{raw}' has an empty or whitespace value"
+            ));
+        }
+        match kind {
+            "pci" if valid_pci_bdf(value) => Ok(Self::PciBdf(value.to_ascii_lowercase())),
+            "pci" => Err(format!(
+                "PCI selector '{raw}' must use domain:bus:device.function (for example 0000:03:00.0)"
+            )),
+            "uuid" => Ok(Self::Uuid(value.to_owned())),
+            "arch" if value.starts_with("gfx") => Ok(Self::ExactArch(value.to_ascii_lowercase())),
+            "arch" => Err(format!("architecture selector '{raw}' must name an exact gfx target")),
+            _ => Err(format!("unknown device selector kind '{kind}'")),
+        }
+    }
+}
+
+fn valid_pci_bdf(value: &str) -> bool {
+    let Some((domain, rest)) = value.split_once(':') else {
+        return false;
+    };
+    let Some((bus, rest)) = rest.split_once(':') else {
+        return false;
+    };
+    let Some((device, function)) = rest.split_once('.') else {
+        return false;
+    };
+    let hex = |part: &str, width: usize| {
+        part.len() == width && part.bytes().all(|byte| byte.is_ascii_hexdigit())
+    };
+    hex(domain, 4) && hex(bus, 2) && hex(device, 2) && hex(function, 1)
+}
+
+/// User-facing DeepSeek placement. This is intentionally model-specific so a
+/// DS4 split can never alter Qwen or the process-wide mixed-arch policy.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "kebab-case")]
+pub enum Deepseek4ComputePlacement {
+    #[default]
+    Single,
+    DenseExpertSplit {
+        dense: DeviceSelector,
+        experts: DeviceSelector,
+    },
+}
+
+impl fmt::Display for Deepseek4ComputePlacement {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Single => f.write_str("single"),
+            Self::DenseExpertSplit { dense, experts } => {
+                write!(f, "dense-expert-split(dense={dense},experts={experts})")
+            }
+        }
+    }
+}
+
+impl std::str::FromStr for Deepseek4ComputePlacement {
+    type Err = String;
+
+    fn from_str(raw: &str) -> std::result::Result<Self, Self::Err> {
+        if raw == "single" {
+            return Ok(Self::Single);
+        }
+        let body = raw
+            .strip_prefix("dense-expert-split(dense=")
+            .and_then(|value| value.strip_suffix(')'))
+            .ok_or_else(|| {
+                "expected single or dense-expert-split(dense=<selector>,experts=<selector>)"
+                    .to_string()
+            })?;
+        let (dense, experts) = body
+            .split_once(",experts=")
+            .ok_or_else(|| "dense-expert-split requires dense and experts selectors".to_string())?;
+        let dense = dense.parse()?;
+        let experts = experts.parse()?;
+        if dense == experts {
+            return Err("dense and experts selectors must identify distinct devices".into());
+        }
+        Ok(Self::DenseExpertSplit { dense, experts })
+    }
+}
+
 impl ConfigValue {
     pub fn kind(&self) -> &'static str {
         match self {
@@ -186,6 +299,7 @@ pub enum ValueRule {
         max: f64,
     },
     KvAdaptive,
+    Deepseek4Placement,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -256,6 +370,8 @@ impl ConfigField {
                 matches!(v.as_str(), "off" | "conservative" | "balanced" | "aggressive")
                     || valid_advanced_kv(v)
             }),
+            ValueRule::Deepseek4Placement => matches!(value, ConfigValue::String(v)
+                if v.parse::<Deepseek4ComputePlacement>().is_ok()),
         };
 
         if valid {
@@ -490,6 +606,18 @@ pub static FIELDS: &[ConfigField] = &[
         false,
         None,
         "DeepSeek V4 routed experts per token; null preserves the checkpoint default."
+    ),
+    field!(
+        "hardware.deepseek4_compute_placement",
+        "deepseek4_compute_placement",
+        Hardware,
+        ModelLoad,
+        DefaultValue::String("single"),
+        ValueRule::Deepseek4Placement,
+        false,
+        false,
+        None,
+        "DeepSeek V4 compute placement; single or a typed dense/expert device split."
     ),
     field!(
         "attention.flash",
@@ -4758,5 +4886,41 @@ mod tests {
             );
         }
         let _ = fs::remove_dir_all(paths.root);
+    }
+
+    #[test]
+    fn deepseek4_placement_round_trips_typed_exact_arch_selectors() {
+        let raw = "dense-expert-split(dense=arch:gfx1100,experts=arch:gfx1151)";
+        let placement: Deepseek4ComputePlacement = raw.parse().unwrap();
+        assert_eq!(placement.to_string(), raw);
+        assert_eq!(
+            placement,
+            Deepseek4ComputePlacement::DenseExpertSplit {
+                dense: DeviceSelector::ExactArch("gfx1100".into()),
+                experts: DeviceSelector::ExactArch("gfx1151".into()),
+            }
+        );
+        let mut layer = ConfigLayer::default();
+        layer
+            .set_cli("hardware.deepseek4_compute_placement", raw)
+            .unwrap();
+        assert_eq!(
+            layer.get("hardware.deepseek4_compute_placement"),
+            Some(&ConfigValue::String(raw.into()))
+        );
+    }
+
+    #[test]
+    fn deepseek4_placement_rejects_logical_ordinals_and_aliasing() {
+        for raw in [
+            "dense-expert-split(dense=device:0,experts=arch:gfx1151)",
+            "dense-expert-split(dense=arch:gfx1151,experts=arch:gfx1151)",
+            "dense-expert-split(dense=pci:03:00.0,experts=arch:gfx1151)",
+        ] {
+            assert!(
+                raw.parse::<Deepseek4ComputePlacement>().is_err(),
+                "expected rejection for {raw}"
+            );
+        }
     }
 }

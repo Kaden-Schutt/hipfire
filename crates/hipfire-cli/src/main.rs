@@ -8435,6 +8435,10 @@ fn config_rule_json(rule: ValueRule) -> serde_json::Value {
             "type": "string",
             "format": "kv-adaptive-policy",
         }),
+        ValueRule::Deepseek4Placement => serde_json::json!({
+            "type": "string",
+            "format": "deepseek4-compute-placement",
+        }),
     }
 }
 
@@ -8454,6 +8458,7 @@ fn config_rule_label(rule: ValueRule) -> &'static str {
         ValueRule::NullableInteger { .. } => "integer|null",
         ValueRule::NullableFloat { .. } => "number|null",
         ValueRule::KvAdaptive => "kv-adaptive",
+        ValueRule::Deepseek4Placement => "deepseek4-placement",
     }
 }
 
