@@ -4504,7 +4504,7 @@ impl Gpu {
         )
     }
 
-    /// Exact-gfx1100 micro-screen surface for collapsing up to five
+    /// Exact-gfx1100 launch surface for collapsing up to five
     /// differently-sized E8 projections which consume the same K-vector.
     pub fn gemv_mfp4g32_e8_soa_ragged_gfx1100(
         &mut self,
