@@ -19711,6 +19711,36 @@ fn generate_deepseek4(
     }
 }
 
+fn ds4_heterogeneous_client_abort(
+    model: &mut hipfire_arch_deepseek4::heterogeneous::DeepseekV4HeterogeneousModel,
+    seq_pos: &mut usize,
+    conversation_tokens: &mut Vec<u32>,
+    stdout: &mut impl std::io::Write,
+    id: &str,
+    completion_tokens: usize,
+) {
+    *seq_pos = 0;
+    conversation_tokens.clear();
+    let reset = model.reset_for_request_attested();
+    match reset {
+        Ok(()) => {
+            let (aborted, done) =
+                ds4_ep_abort_wire_events(id, completion_tokens, active_attempt_id());
+            let _ = writeln!(stdout, "{aborted}");
+            let _ = writeln!(stdout, "{done}");
+            let _ = stdout.flush();
+        }
+        Err(error) => emit_active_attempt_error(
+            stdout,
+            Some(id),
+            &format!("client cancelled; heterogeneous rollback failed: {error}"),
+            "runtime",
+            false,
+            false,
+        ),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn generate_deepseek4_heterogeneous(
     m: &mut LoadedModel,
@@ -19793,8 +19823,22 @@ fn generate_deepseek4_heterogeneous(
         }
         let mut logits = Vec::new();
         for (position, &token) in prompt_ids.iter().enumerate() {
-            match bundle.model.decode_step(token, position as u32) {
-                Ok(next) => logits = next,
+            match bundle
+                .model
+                .decode_step_with_abort(token, position as u32, &|| check_abort(id))
+            {
+                Ok(Some(next)) => logits = next,
+                Ok(None) => {
+                    ds4_heterogeneous_client_abort(
+                        &mut bundle.model,
+                        &mut m.seq_pos,
+                        &mut m.conversation_tokens,
+                        stdout,
+                        id,
+                        0,
+                    );
+                    return;
+                }
                 Err(error) => {
                     emit_error_with_id(
                         stdout,
@@ -19866,8 +19910,22 @@ fn generate_deepseek4_heterogeneous(
             emit_error_with_id(stdout, id, "deepseek4 heterogeneous state disappeared");
             return;
         };
-        match bundle.model.decode_step(next_tok, pos) {
-            Ok(next) => logits = next,
+        match bundle
+            .model
+            .decode_step_with_abort(next_tok, pos, &|| check_abort(id))
+        {
+            Ok(Some(next)) => logits = next,
+            Ok(None) => {
+                ds4_heterogeneous_client_abort(
+                    &mut bundle.model,
+                    &mut m.seq_pos,
+                    &mut m.conversation_tokens,
+                    stdout,
+                    id,
+                    generated,
+                );
+                return;
+            }
             Err(error) => {
                 emit_error_with_id(
                     stdout,
@@ -19925,6 +19983,22 @@ fn generate_deepseek4_heterogeneous(
     let decision = await_client_terminal_commit(stdout, id, &pending_done);
     let effects = ds4_client_commit_effects(decision, !wire_tool_calls.is_empty(), true);
     if !effects.emit_done {
+        let Some(ModelState::Deepseek4Heterogeneous(bundle)) = m.state.as_mut() else {
+            emit_error_with_id(
+                stdout,
+                id,
+                "deepseek4 heterogeneous state disappeared on abort",
+            );
+            return;
+        };
+        ds4_heterogeneous_client_abort(
+            &mut bundle.model,
+            &mut m.seq_pos,
+            &mut m.conversation_tokens,
+            stdout,
+            id,
+            generated,
+        );
         return;
     }
     m.seq_pos = pos as usize;

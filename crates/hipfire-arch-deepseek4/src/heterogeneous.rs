@@ -727,6 +727,22 @@ impl DeepseekV4HeterogeneousModel {
     /// One exact direct-HIP heterogeneous token step. The caller owns greedy
     /// sampling and position advancement, matching `forward::decode_step`.
     pub fn decode_step(&mut self, token_id: u32, position: u32) -> Result<Vec<f32>, String> {
+        self.decode_step_with_abort(token_id, position, &|| false)?
+            .ok_or_else(|| "deepseek4 heterogeneous decode aborted without an abort source".into())
+    }
+
+    /// Cancellation-aware token step for the user-facing serve route.
+    ///
+    /// The callback is observed only before a layer starts or after the
+    /// shared/routed fork has rejoined. An abort that arrives while either
+    /// device is executing therefore drains to a safe cross-device boundary;
+    /// it never abandons a peer signal or frees branch-owned storage in flight.
+    pub fn decode_step_with_abort(
+        &mut self,
+        token_id: u32,
+        position: u32,
+        abort_requested: &dyn Fn() -> bool,
+    ) -> Result<Option<Vec<f32>>, String> {
         self.ensure_execution()?;
         let weights = self
             .weights
@@ -749,6 +765,7 @@ impl DeepseekV4HeterogeneousModel {
             execution,
             token_id,
             position,
+            abort_requested,
         )
     }
 
@@ -764,6 +781,29 @@ impl DeepseekV4HeterogeneousModel {
         state.zero_decode_caches(&mut self.dense_gpu);
         self.dense_gpu.invalidate_graph_state();
         self.routed_gpu.invalidate_graph_state();
+        Ok(())
+    }
+
+    /// Fail-closed reset used after cancellation or an injected route error.
+    /// Both owners are synchronized before the caller emits a terminal event,
+    /// proving that no branch kernel, peer packet, or cache clear remains in
+    /// flight when the request transaction is released.
+    pub fn reset_for_request_attested(&mut self) -> Result<(), String> {
+        self.reset_for_request()?;
+        self.dense_gpu
+            .bind_thread()
+            .map_err(|error| format!("heterogeneous abort bind dense: {error}"))?;
+        self.dense_gpu
+            .hip
+            .device_synchronize()
+            .map_err(|error| format!("heterogeneous abort sync dense: {error:?}"))?;
+        self.routed_gpu
+            .bind_thread()
+            .map_err(|error| format!("heterogeneous abort bind routed: {error}"))?;
+        self.routed_gpu
+            .hip
+            .device_synchronize()
+            .map_err(|error| format!("heterogeneous abort sync routed: {error:?}"))?;
         Ok(())
     }
 

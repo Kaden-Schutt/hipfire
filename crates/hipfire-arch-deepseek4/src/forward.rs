@@ -3421,7 +3421,8 @@ pub(crate) fn decode_step_heterogeneous(
     execution: &mut DeepseekV4HeterogeneousExecution,
     token_id: u32,
     position: u32,
-) -> Result<Vec<f32>, String> {
+    abort_requested: &dyn Fn() -> bool,
+) -> Result<Option<Vec<f32>>, String> {
     if dense_gpu.arch != "gfx1100" || routed_gpu.arch != "gfx1151" {
         return Err(format!(
             "deepseek4 heterogeneous decode requires gfx1100+gfx1151, got {}+{}",
@@ -3447,6 +3448,9 @@ pub(crate) fn decode_step_heterogeneous(
     ensure_ffn_split_resource(cfg, state, dense_gpu)?;
 
     for layer_idx in 0..cfg.num_hidden_layers {
+        if abort_requested() {
+            return Ok(None);
+        }
         ds4_attn_block(cfg, dense_weights, state, dense_gpu, layer_idx, position)?;
         mhc_pre(
             cfg,
@@ -3478,6 +3482,12 @@ pub(crate) fn decode_step_heterogeneous(
             epoch,
         )?;
         heterogeneous_join(cfg, state, dense_gpu, execution, layer_idx, epoch)?;
+        // The callback may have latched while either branch was in flight.
+        // Observe it only after the join so no cross-device signal or packet
+        // remains outstanding when the serving layer resets request state.
+        if abort_requested() {
+            return Ok(None);
+        }
         hc_ffn_mix(cfg, dense_weights, state, dense_gpu, layer_idx)?;
         dump_residual_layer_norm(dense_gpu, state, layer_idx, position);
     }
@@ -3486,6 +3496,7 @@ pub(crate) fn decode_step_heterogeneous(
     state.n_tokens += 1;
     dense_gpu
         .download_f32(state.logits.as_ref().unwrap())
+        .map(Some)
         .map_err(|error| format!("download heterogeneous logits: {error:?}"))
 }
 
