@@ -9544,11 +9544,47 @@ impl Gpu {
         k_top: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel(
-            "gemv_mq2g256_lloyd_moe_down_indexed",
-            kernels::GEMV_MQ2G256_LLOYD_MOE_DOWN_INDEXED_SRC,
-            "gemv_mq2g256_lloyd_moe_down_residual_scaled_k8_indexed",
-        )?;
+        // OPT-IN row tile, mirroring HIPFIRE_MQ3_DOWN_ROWS. The MQ2-Lloyd down
+        // GEMV carries the same two defects its MQ3 sibling did at the a3b
+        // decode shape (M=2048, K=moe_intermediate=512, k_top=8):
+        //   1. grid [M, k_top] = 16384 single-wave workgroups = EIGHT fills of
+        //      a 2048-slot part, each moving 2 groups x 72 B = 144 B.
+        //   2. `quads = groups_per_row >> 2` is ZERO at K=512, so the
+        //      K4-unrolled body never runs; both groups take
+        //      TAIL_LOAD_AND_DOT, which restages the codebook with `tid < 4`
+        //      (4 of 32 lanes) behind its OWN __syncthreads, once PER GROUP.
+        // The MQ3 row tile measured +3.8% end-to-end on PM4 for +0.40% wt2 KLD.
+        // NOT bit-exact (4R accumulators change FP accumulation order), so this
+        // stays DEFAULT OFF. `HIPFIRE_MQ2_DOWN_ROWS={2,4}`.
+        use std::sync::OnceLock;
+        static MQ2_DOWN_ROWS: OnceLock<u32> = OnceLock::new();
+        let rows = *MQ2_DOWN_ROWS.get_or_init(|| {
+            match hipfire_config::developer_var("HIPFIRE_MQ2_DOWN_ROWS").as_deref() {
+                Ok("2") => 2,
+                Ok("4") => 4,
+                _ => 1,
+            }
+        });
+        let (module, func) = match rows {
+            2 => (
+                "gemv_mq2g256_lloyd_moe_down_indexed_r4",
+                "gemv_mq2g256_lloyd_moe_down_residual_scaled_k8_indexed_r2",
+            ),
+            4 => (
+                "gemv_mq2g256_lloyd_moe_down_indexed_r4",
+                "gemv_mq2g256_lloyd_moe_down_residual_scaled_k8_indexed_r4",
+            ),
+            _ => (
+                "gemv_mq2g256_lloyd_moe_down_indexed",
+                "gemv_mq2g256_lloyd_moe_down_residual_scaled_k8_indexed",
+            ),
+        };
+        let src = if rows == 1 {
+            kernels::GEMV_MQ2G256_LLOYD_MOE_DOWN_INDEXED_SRC
+        } else {
+            kernels::GEMV_MQ2G256_LLOYD_MOE_DOWN_INDEXED_R4_SRC
+        };
+        self.ensure_kernel(module, src, func)?;
         let pp = expert_ptrs.buf.as_ptr();
         let ip = topk_indices.buf.as_ptr();
         let wp = topk_weights.buf.as_ptr();

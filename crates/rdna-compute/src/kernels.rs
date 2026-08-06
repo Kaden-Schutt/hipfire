@@ -4855,6 +4855,12 @@ pub const GEMV_MQ3G256_LLOYD_MOE_DOWN_INDEXED_SRC: &str =
 pub const GEMV_MQ3G256_LLOYD_MOE_DOWN_INDEXED_R4_SRC: &str =
     include_str!("../../../kernels/src/gemv_mq3g256_lloyd_moe_down_indexed_r4.hip");
 
+/// Row-tiled MQ2-Lloyd MoE-down GEMV (R=2 / R=4). Same defect pair as the MQ3
+/// sibling at the a3b decode shape: 16384 single-wave workgroups, and a K4 main
+/// loop that is dead at K=moe_intermediate=512. OPT-IN, default OFF.
+pub const GEMV_MQ2G256_LLOYD_MOE_DOWN_INDEXED_R4_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mq2g256_lloyd_moe_down_indexed_r4.hip");
+
 // ─── MQ*-G256-GL ("global Lloyd") MoE indexed family ─────────────────────────
 //
 // Same call shape as the MQ2/MQ3-Lloyd MoE indexed kernels above (device-side
