@@ -236,6 +236,7 @@ pub struct HipRuntime {
 
     // Memory
     fn_malloc: unsafe extern "C" fn(*mut *mut c_void, usize) -> u32,
+    fn_ext_malloc_with_flags: Option<unsafe extern "C" fn(*mut *mut c_void, usize, c_uint) -> u32>,
     fn_free: unsafe extern "C" fn(*mut c_void) -> u32,
     fn_mem_get_address_range:
         unsafe extern "C" fn(*mut *mut c_void, *mut usize, *mut c_void) -> u32,
@@ -310,6 +311,8 @@ pub struct HipRuntime {
     fn_graph_destroy: unsafe extern "C" fn(HipGraph) -> u32,
     // Stream memory ops (HIP 7.2+)
     fn_stream_write_value32: unsafe extern "C" fn(HipStream, *mut c_void, u32, c_uint) -> u32,
+    fn_stream_wait_value32:
+        Option<unsafe extern "C" fn(HipStream, *mut c_void, u32, c_uint, u32) -> u32>,
     fn_device_synchronize: unsafe extern "C" fn() -> u32,
     fn_get_device_properties: unsafe extern "C" fn(*mut u8, c_int) -> u32,
     fn_get_device_attribute: unsafe extern "C" fn(*mut c_int, c_int, c_int) -> u32,
@@ -447,6 +450,11 @@ impl HipRuntime {
                     lib,
                     "hipMalloc",
                     unsafe extern "C" fn(*mut *mut c_void, usize) -> u32
+                ),
+                fn_ext_malloc_with_flags: load_optional_fn!(
+                    lib,
+                    "hipExtMallocWithFlags",
+                    unsafe extern "C" fn(*mut *mut c_void, usize, c_uint) -> u32
                 ),
                 fn_free: load_fn!(lib, "hipFree", unsafe extern "C" fn(*mut c_void) -> u32),
                 fn_mem_get_address_range: load_fn!(
@@ -655,6 +663,11 @@ impl HipRuntime {
                     "hipStreamWriteValue32",
                     unsafe extern "C" fn(HipStream, *mut c_void, u32, c_uint) -> u32
                 ),
+                fn_stream_wait_value32: load_optional_fn!(
+                    lib,
+                    "hipStreamWaitValue32",
+                    unsafe extern "C" fn(HipStream, *mut c_void, u32, c_uint, u32) -> u32
+                ),
                 fn_device_synchronize: load_fn!(
                     lib,
                     "hipDeviceSynchronize",
@@ -853,6 +866,29 @@ impl HipRuntime {
         let mut ptr: *mut c_void = ptr::null_mut();
         let code = unsafe { (self.fn_malloc)(&mut ptr, size) };
         self.check(code, "hipMalloc")?;
+        Ok(DeviceBuffer {
+            ptr,
+            size,
+            ownership: crate::DeviceBufferOwnership::HipMalloc,
+        })
+    }
+
+    /// Allocate system-visible signal memory for stream wait/write operations.
+    ///
+    /// This is an optional ROCm capability. Loading `HipRuntime` remains
+    /// compatible with runtimes that do not export `hipExtMallocWithFlags`;
+    /// callers receive a scoped error only when they request signal memory.
+    pub fn malloc_signal(&self, size: usize) -> HipResult<DeviceBuffer> {
+        const HIP_MALLOC_SIGNAL_MEMORY: c_uint = 0x2;
+        let Some(ext_malloc) = self.fn_ext_malloc_with_flags else {
+            return Err(HipError::new(
+                0,
+                "hipExtMallocWithFlags unavailable; signal memory is unsupported",
+            ));
+        };
+        let mut ptr: *mut c_void = ptr::null_mut();
+        let code = unsafe { ext_malloc(&mut ptr, size, HIP_MALLOC_SIGNAL_MEMORY) };
+        self.check(code, "hipExtMallocWithFlags(hipMallocSignalMemory)")?;
         Ok(DeviceBuffer {
             ptr,
             size,
@@ -1567,6 +1603,26 @@ impl HipRuntime {
     ) -> HipResult<()> {
         let code = unsafe { (self.fn_stream_write_value32)(stream.0, ptr.as_ptr(), value, flags) };
         self.check(code, "hipStreamWriteValue32")
+    }
+
+    /// Wait until a 32-bit signal-memory value satisfies the requested condition.
+    /// Operations submitted later to `stream` remain blocked until it does.
+    pub fn stream_wait_value32(
+        &self,
+        stream: &Stream,
+        ptr: &DeviceBuffer,
+        value: u32,
+        flags: u32,
+        mask: u32,
+    ) -> HipResult<()> {
+        let Some(wait_value32) = self.fn_stream_wait_value32 else {
+            return Err(HipError::new(
+                0,
+                "hipStreamWaitValue32 unavailable; stream signal waits are unsupported",
+            ));
+        };
+        let code = unsafe { wait_value32(stream.0, ptr.as_ptr(), value, flags, mask) };
+        self.check(code, "hipStreamWaitValue32")
     }
 
     pub fn device_synchronize(&self) -> HipResult<()> {

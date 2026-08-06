@@ -18,6 +18,7 @@
 //! ```
 
 use hip_bridge::{DeviceBuffer, Event, HipResult, HipRuntime, Stream};
+use std::cell::Cell;
 use std::time::Instant;
 
 const HIDDEN: usize = 4096;
@@ -215,11 +216,13 @@ struct Chain<'a> {
     stream1: &'a Stream,
     start0: &'a Event,
     stop0: &'a Event,
-    to1_ready: &'a [Event],
-    to0_ready: &'a [Event],
+    signal_to1: &'a DeviceBuffer,
+    signal_to0: &'a DeviceBuffer,
     dev0_a: &'a DeviceBuffer,
     dev0_b: &'a DeviceBuffer,
     dev1: &'a DeviceBuffer,
+    layers: usize,
+    next_epoch: Cell<u32>,
 }
 
 fn chain_sample(
@@ -228,12 +231,20 @@ fn chain_sample(
     size: usize,
     copy_payload: bool,
 ) -> HipResult<(f64, f64)> {
-    debug_assert_eq!(chain.to1_ready.len(), chain.to0_ready.len());
+    const WAIT_EQ: u32 = 0x1;
+    const SIGNAL_FLAGS: u32 = 0;
+    const SIGNAL_MASK: u32 = u32::MAX;
+
+    let first_epoch = chain.next_epoch.get();
+    let final_epoch = first_epoch
+        .checked_add(chain.layers as u32)
+        .expect("peer-chain signal epoch overflow");
     hip.set_device(0)?;
     let host_start = Instant::now();
     hip.event_record(chain.start0, Some(chain.stream0))?;
 
-    for layer in 0..chain.to1_ready.len() {
+    for layer in 0..chain.layers {
+        let epoch = first_epoch + layer as u32 + 1;
         let (src0, dst0) = if layer % 2 == 0 {
             (chain.dev0_a, chain.dev0_b)
         } else {
@@ -244,29 +255,25 @@ fn chain_sample(
         if copy_payload {
             hip.memcpy_peer_async(chain.dev1, 1, src0, 0, size, chain.stream0)?;
         }
-        hip.event_record(&chain.to1_ready[layer], Some(chain.stream0))?;
+        hip.stream_write_value32(chain.stream0, chain.signal_to1, epoch, SIGNAL_FLAGS)?;
 
         hip.set_device(1)?;
-        hip.stream_wait_event(chain.stream1, &chain.to1_ready[layer])?;
+        hip.stream_wait_value32(chain.stream1, chain.signal_to1, epoch, WAIT_EQ, SIGNAL_MASK)?;
         if copy_payload {
             hip.memcpy_peer_async(dst0, 0, chain.dev1, 1, size, chain.stream1)?;
         }
-        hip.event_record(&chain.to0_ready[layer], Some(chain.stream1))?;
+        hip.stream_write_value32(chain.stream1, chain.signal_to0, epoch, SIGNAL_FLAGS)?;
 
         hip.set_device(0)?;
-        hip.stream_wait_event(chain.stream0, &chain.to0_ready[layer])?;
+        hip.stream_wait_value32(chain.stream0, chain.signal_to0, epoch, WAIT_EQ, SIGNAL_MASK)?;
     }
 
     hip.event_record(chain.stop0, Some(chain.stream0))?;
     hip.event_synchronize(chain.stop0)?;
+    chain.next_epoch.set(final_epoch);
     let host_ms = host_start.elapsed().as_secs_f64() * 1000.0;
     let gpu_ms = hip.event_elapsed_ms(chain.start0, chain.stop0)? as f64;
     Ok((gpu_ms, host_ms))
-}
-
-fn create_events(hip: &HipRuntime, device: i32, n: usize) -> HipResult<Vec<Event>> {
-    hip.set_device(device)?;
-    (0..n).map(|_| hip.event_create()).collect()
 }
 
 fn print_row(
@@ -342,7 +349,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!(
         "identity arch0={arch0} arch1={arch1} visible_devices={device_count} \
-         peer_0_to_1={can_0_to_1} peer_1_to_0={can_1_to_0} hidden={HIDDEN} \
+         peer_0_to_1={can_0_to_1} peer_1_to_0={can_1_to_0} sync=signal_memory hidden={HIDDEN} \
          layers={} warmups={} one_way_samples={} chain_samples={} \
          exactness_samples={} max_bytes={max_bytes}",
         cfg.layers, cfg.warmups, cfg.one_way_samples, cfg.chain_samples, cfg.exactness_samples
@@ -351,6 +358,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     hip.set_device(0)?;
     let dev0_a = hip.malloc(max_bytes)?;
     let dev0_b = hip.malloc(max_bytes)?;
+    let signal_to0 = hip.malloc_signal(std::mem::size_of::<u32>())?;
+    hip.memset(&signal_to0, 0, std::mem::size_of::<u32>())?;
     let stream0 = hip.stream_create()?;
     hip.enable_peer_access(1)?;
     // Exercise idempotence so the product path can call this after every load.
@@ -359,6 +368,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     hip.set_device(1)?;
     let dev1_a = hip.malloc(max_bytes)?;
     let dev1_b = hip.malloc(max_bytes)?;
+    let signal_to1 = hip.malloc_signal(std::mem::size_of::<u32>())?;
+    hip.memset(&signal_to1, 0, std::mem::size_of::<u32>())?;
     let stream1 = hip.stream_create()?;
     hip.enable_peer_access(0)?;
     hip.enable_peer_access(0)?;
@@ -368,12 +379,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let one_stop0 = hip.event_create()?;
     let chain_start0 = hip.event_create()?;
     let chain_stop0 = hip.event_create()?;
-    let to1_ready = create_events(&hip, 0, cfg.layers)?;
 
     hip.set_device(1)?;
     let one_start1 = hip.event_create()?;
     let one_stop1 = hip.event_create()?;
-    let to0_ready = create_events(&hip, 1, cfg.layers)?;
 
     let direction_0_to_1 = Direction {
         src_device: 0,
@@ -398,11 +407,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         stream1: &stream1,
         start0: &chain_start0,
         stop0: &chain_stop0,
-        to1_ready: &to1_ready,
-        to0_ready: &to0_ready,
+        signal_to1: &signal_to1,
+        signal_to0: &signal_to0,
         dev0_a: &dev0_a,
         dev0_b: &dev0_b,
         dev1: &dev1_a,
+        layers: cfg.layers,
+        next_epoch: Cell::new(0),
     };
 
     for &batch in &cfg.batches {
@@ -489,7 +500,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             chain_host.push(host_ms);
         }
         print_row(
-            "event_chain",
+            "signal_chain",
             "round_trip",
             batch,
             0,
@@ -537,9 +548,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     hip.set_device(0)?;
-    for event in to1_ready {
-        hip.event_destroy(event)?;
-    }
     hip.event_destroy(chain_start0)?;
     hip.event_destroy(chain_stop0)?;
     hip.event_destroy(one_start0)?;
@@ -547,16 +555,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     hip.stream_destroy(stream0)?;
     hip.free(dev0_a)?;
     hip.free(dev0_b)?;
+    hip.free(signal_to0)?;
 
     hip.set_device(1)?;
-    for event in to0_ready {
-        hip.event_destroy(event)?;
-    }
     hip.event_destroy(one_start1)?;
     hip.event_destroy(one_stop1)?;
     hip.stream_destroy(stream1)?;
     hip.free(dev1_a)?;
     hip.free(dev1_b)?;
+    hip.free(signal_to1)?;
 
     println!("peer_chain: PASS");
     Ok(())
