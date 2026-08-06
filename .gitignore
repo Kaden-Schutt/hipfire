@@ -145,3 +145,6 @@ docs/investigations/*/sources/
 
 # Local research scratch (agent surveys, microbenches)
 .research/
+
+# Code-intelligence index (per-checkout, machine-local)
+.codegraph/
