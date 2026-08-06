@@ -87,6 +87,8 @@ struct Config {
     batches: Vec<usize>,
     expect_arch0: Option<String>,
     expect_arch1: Option<String>,
+    rocr_engine_0_to_1: Option<u32>,
+    rocr_engine_1_to_0: Option<u32>,
 }
 
 impl Default for Config {
@@ -102,6 +104,8 @@ impl Default for Config {
             batches: DEFAULT_BATCHES.to_vec(),
             expect_arch0: None,
             expect_arch1: None,
+            rocr_engine_0_to_1: None,
+            rocr_engine_1_to_0: None,
         }
     }
 }
@@ -141,6 +145,12 @@ impl Config {
                 }
                 "--expect-arch0" => cfg.expect_arch0 = Some(value(&mut i)?.to_string()),
                 "--expect-arch1" => cfg.expect_arch1 = Some(value(&mut i)?.to_string()),
+                "--rocr-engine-0-to-1" => {
+                    cfg.rocr_engine_0_to_1 = Some(parse_u32_auto(flag, value(&mut i)?)?)
+                }
+                "--rocr-engine-1-to-0" => {
+                    cfg.rocr_engine_1_to_0 = Some(parse_u32_auto(flag, value(&mut i)?)?)
+                }
                 "-h" | "--help" => {
                     print_help();
                     std::process::exit(0);
@@ -151,6 +161,11 @@ impl Config {
         }
         if cfg.batches.is_empty() {
             return Err("--batches must contain at least one positive value".to_string());
+        }
+        if (cfg.rocr_engine_0_to_1.is_some() || cfg.rocr_engine_1_to_0.is_some())
+            && cfg.sync != SyncMode::RocrSdma
+        {
+            return Err("ROCr engine overrides require --sync rocr-sdma".to_string());
         }
         Ok(cfg)
     }
@@ -171,6 +186,17 @@ fn parse_u64(flag: &str, raw: &str) -> Result<u64, String> {
         .map_err(|e| format!("invalid {flag} value {raw:?}: {e}"))
 }
 
+fn parse_u32_auto(flag: &str, raw: &str) -> Result<u32, String> {
+    let parsed = raw
+        .strip_prefix("0x")
+        .map_or_else(|| raw.parse::<u32>(), |hex| u32::from_str_radix(hex, 16))
+        .map_err(|e| format!("invalid {flag} value {raw:?}: {e}"))?;
+    if parsed == 0 || !parsed.is_power_of_two() {
+        return Err(format!("{flag} must be one nonzero SDMA-engine bit"));
+    }
+    Ok(parsed)
+}
+
 fn print_help() {
     println!(
         "peer_chain [options]\n\
@@ -185,7 +211,9 @@ fn print_help() {
            --layers N             round-trip dependency count (default 43)\n\
            --batches CSV          batch rows for [B,4096] F32 (default 1,16,128,512,1024)\n\
            --expect-arch0 ARCH    fail unless logical device 0 matches\n\
-           --expect-arch1 ARCH    fail unless logical device 1 matches"
+           --expect-arch1 ARCH    fail unless logical device 1 matches\n\
+           --rocr-engine-0-to-1 N explicit SDMA engine bit (rocr-sdma only)\n\
+           --rocr-engine-1-to-0 N explicit SDMA engine bit (rocr-sdma only)"
     );
 }
 
@@ -334,7 +362,12 @@ struct RocrChannel {
 }
 
 impl RocrChannel {
-    fn new(layers: usize, explicit_sdma: bool) -> Result<Self, Box<dyn std::error::Error>> {
+    fn new(
+        layers: usize,
+        explicit_sdma: bool,
+        override_0_to_1: Option<u32>,
+        override_1_to_0: Option<u32>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let runtime = Runtime::initialize(redline_rocr::load_symbols()?)?;
         let dev0 = runtime.select_gpu(GpuSelector::NameContains("gfx1100"))?;
         let dev1 = runtime.select_gpu(GpuSelector::NameContains("gfx1151"))?;
@@ -355,12 +388,23 @@ impl RocrChannel {
                 Ok(1_u32 << candidates.trailing_zeros())
             }
         };
-        let engine_0_to_1 = explicit_sdma
-            .then(|| choose(mask_0_to_1, preferred_0_to_1))
-            .transpose()?;
-        let engine_1_to_0 = explicit_sdma
-            .then(|| choose(mask_1_to_0, preferred_1_to_0))
-            .transpose()?;
+        let validate_override = |requested: Option<u32>, available: u32, label: &str| {
+            if requested.is_some_and(|engine| available & engine == 0) {
+                Err(format!(
+                    "requested {label} engine {requested:?} is outside available mask {available:#x}"
+                ))
+            } else {
+                Ok(requested)
+            }
+        };
+        let engine_0_to_1 =
+            validate_override(override_0_to_1, mask_0_to_1, "0->1")?.or(explicit_sdma
+                .then(|| choose(mask_0_to_1, preferred_0_to_1))
+                .transpose()?);
+        let engine_1_to_0 =
+            validate_override(override_1_to_0, mask_1_to_0, "1->0")?.or(explicit_sdma
+                .then(|| choose(mask_1_to_0, preferred_1_to_0))
+                .transpose()?);
         let mut completions = Vec::with_capacity(layers * 2);
         for index in 0..layers * 2 {
             let owner = if index % 2 == 0 { &dev1 } else { &dev0 };
@@ -793,6 +837,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(RocrChannel::new(
             cfg.layers,
             cfg.sync == SyncMode::RocrSdma,
+            cfg.rocr_engine_0_to_1,
+            cfg.rocr_engine_1_to_0,
         )?)
     } else {
         None
