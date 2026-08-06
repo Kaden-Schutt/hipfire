@@ -21,7 +21,7 @@ fn main() -> Result<(), String> {
     let model = args
         .next()
         .ok_or(
-            "usage: ds4_heterogeneous_load MODEL [--cycles N] [--replacement-probe] [--fault-matrix] [--fault dense|layer:N|audit|state|scratch] [--decode-token ID] [--position N] [--prompt PATH --generate N --output PATH] [--compare-single] [--performance]",
+            "usage: ds4_heterogeneous_load MODEL [--cycles N] [--replacement-probe] [--fault-matrix] [--fault dense|layer:N|audit|state|scratch] [--decode-token ID] [--position N] [--prompt PATH --generate N --output PATH] [--compare-single] [--performance] [--decode-attach-pause-ms N]",
         )?;
     let mut cycles = 1usize;
     let mut fault = None;
@@ -34,6 +34,7 @@ fn main() -> Result<(), String> {
     let mut generate = 0usize;
     let mut output = None;
     let mut performance = false;
+    let mut decode_attach_pause = Duration::ZERO;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--cycles" => {
@@ -101,6 +102,14 @@ fn main() -> Result<(), String> {
                 ));
             }
             "--performance" => performance = true,
+            "--decode-attach-pause-ms" => {
+                decode_attach_pause = Duration::from_millis(
+                    args.next()
+                        .ok_or("--decode-attach-pause-ms requires a value")?
+                        .parse::<u64>()
+                        .map_err(|error| format!("invalid --decode-attach-pause-ms: {error}"))?,
+                );
+            }
             other => return Err(format!("unknown argument '{other}'")),
         }
     }
@@ -258,8 +267,13 @@ fn main() -> Result<(), String> {
         let mut heterogeneous_logits = None;
         let mut heterogeneous_generation = None;
         if let Some((tokenizer, prompt_tokens)) = generation.as_ref() {
-            let generated =
-                generate_heterogeneous(&mut loaded, prompt_tokens, generate, !performance)?;
+            let generated = generate_heterogeneous(
+                &mut loaded,
+                prompt_tokens,
+                generate,
+                !performance,
+                decode_attach_pause,
+            )?;
             let decoded = tokenizer.decode_bytes(&generated.tokens);
             if let Some(output_path) = output.as_deref() {
                 std::fs::write(output_path, &decoded).map_err(|error| {
@@ -377,6 +391,7 @@ fn generate_heterogeneous(
     prompt: &[u32],
     n_generate: usize,
     certification_snapshots: bool,
+    decode_attach_pause: Duration,
 ) -> Result<GenerationResult, String> {
     let prefill_start = Instant::now();
     let mut logits = Vec::new();
@@ -388,6 +403,15 @@ fn generate_heterogeneous(
         }
     }
     let prefill = prefill_start.elapsed();
+
+    if !decode_attach_pause.is_zero() {
+        eprintln!(
+            "decode_attach_ready pid={} pause_ms={}",
+            std::process::id(),
+            decode_attach_pause.as_millis()
+        );
+        std::thread::sleep(decode_attach_pause);
+    }
 
     let decode_start = Instant::now();
     let mut tokens = Vec::with_capacity(n_generate);
