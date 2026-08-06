@@ -19724,6 +19724,9 @@ fn ds4_heterogeneous_client_abort(
     let reset = model.reset_for_request_attested();
     match reset {
         Ok(()) => {
+            eprintln!(
+                "[req {id}] drafter=ar-heterogeneous abort=client rollback=attested post_join=true completion_tokens={completion_tokens}"
+            );
             let (aborted, done) =
                 ds4_ep_abort_wire_events(id, completion_tokens, active_attempt_id());
             let _ = writeln!(stdout, "{aborted}");
