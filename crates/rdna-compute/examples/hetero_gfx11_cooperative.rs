@@ -1,0 +1,1235 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
+//! Exact-target gfx1100/gfx1151 cooperative-layer fixture.
+//!
+//! This is G1 of the DeepSeek V4 heterogeneous-compute campaign. It proves the
+//! complete device-resident ownership chain before model lowering:
+//!
+//! ```text
+//! gfx1100 producer -> ROCr SDMA activation -> gfx1151 routed expert
+//!                  \-> concurrent gfx1100 shared branch
+//! gfx1151 result   -> ROCr SDMA result     -> gfx1100 ordered join
+//! ```
+//!
+//! The two code objects are compiled separately for their exact targets. AQL
+//! completion signals feed public ROCr asynchronous copies directly, so the
+//! cooperative path has no host wait in the layer loop. Two packet/result/state
+//! slots are reused by parity across all 43 layers. The serial AQL arm moves the
+//! activation-copy dependency from producer completion to shared-branch
+//! completion; the host-sync arm launches the same exact-target kernels but
+//! waits after every phase. All three arms are checked against one CPU oracle.
+
+use hip_bridge::{DeviceBuffer, Function, HipRuntime, Module};
+use rdna_compute::KernelCompiler;
+use redline_rocr::packet::{BarrierAndPacket, KernelDispatchPacket, LaunchGeometry, PacketImage};
+use redline_rocr::{
+    CompletionSignal, Executable, GpuDevice, GpuSelector, KernargBuffer, KernargPool, Kernel,
+    QueueSet, Runtime,
+};
+use std::ffi::c_void;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+const HIDDEN: usize = 4096;
+const ROUTES: usize = 6;
+const PACKET_METADATA_WORDS: usize = 16;
+const PACKET_WORDS: usize = HIDDEN + PACKET_METADATA_WORDS;
+const DEFAULT_LAYERS: usize = 43;
+const DEFAULT_SHARED_MIB: usize = 84;
+const DEFAULT_EXPERT_MIB: usize = 42;
+const BLOCK: u16 = 256;
+const COPY_TO_EXPERT_ENGINE: u32 = 0x2;
+const COPY_TO_DENSE_ENGINE: u32 = 0x1;
+
+const SOURCE: &str = r#"
+#include <hip/hip_runtime.h>
+
+static __device__ __forceinline__ unsigned int rotl32(unsigned int x, unsigned int n) {
+    return (x << n) | (x >> (32u - n));
+}
+
+static __device__ __forceinline__ unsigned int layer_key(unsigned int layer) {
+    return (layer + 1u) * 0x9e3779b9u + 0x7f4a7c15u;
+}
+
+extern "C" __global__ void hetero_gfx11_producer(
+    const unsigned int* input,
+    unsigned int* packet,
+    unsigned int layer,
+    unsigned int n
+) {
+    const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned int key = layer_key(layer);
+    if (i < n) {
+        const unsigned int shift = layer % 31u + 1u;
+        packet[i] = rotl32(input[i] ^ key, shift) + i * 0x045d9f3bu;
+    }
+    if (i < 16u) {
+        if (i < 6u) {
+            packet[n + i] = (layer * 7u + i * 13u) % 256u;
+        } else if (i < 12u) {
+            const unsigned int route = i - 6u;
+            packet[n + i] = rotl32(key ^ (route + 1u) * 0x27d4eb2du, route + 3u);
+        } else {
+            packet[n + i] = key ^ i * 0x85ebca6bu;
+        }
+    }
+}
+
+extern "C" __global__ void hetero_gfx11_shared(
+    const unsigned int* packet,
+    const unsigned int* weights,
+    unsigned int* output,
+    unsigned int layer,
+    unsigned int n,
+    unsigned int weight_words
+) {
+    const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    unsigned int checksum = 0u;
+    for (unsigned int j = i; j < weight_words; j += n) {
+        checksum ^= weights[j];
+    }
+    output[i] = rotl32(packet[i] ^ checksum ^ layer_key(layer), 5u);
+}
+
+extern "C" __global__ void hetero_gfx11_expert(
+    const unsigned int* packet,
+    const unsigned int* weights,
+    unsigned int* output,
+    unsigned int layer,
+    unsigned int n,
+    unsigned int weight_words
+) {
+    const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    unsigned int checksum = 0u;
+    for (unsigned int j = i; j < weight_words; j += n) {
+        checksum ^= weights[j];
+    }
+    unsigned int route_mix = 0u;
+    #pragma unroll
+    for (unsigned int route = 0u; route < 6u; ++route) {
+        route_mix ^= rotl32(packet[n + route] * 0x9e3779b9u ^ packet[n + 6u + route], route + 1u);
+    }
+    output[i] = rotl32(packet[i] ^ checksum ^ route_mix ^ layer_key(layer), 11u);
+}
+
+extern "C" __global__ void hetero_gfx11_join(
+    const unsigned int* shared,
+    const unsigned int* routed,
+    unsigned int* output,
+    unsigned int layer,
+    unsigned int n
+) {
+    const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    output[i] = rotl32(shared[i] + routed[i], 3u) ^ layer_key(layer);
+}
+"#;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Schedule {
+    Overlap,
+    Serial,
+}
+
+impl Schedule {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Overlap => "device_overlap",
+            Self::Serial => "device_serial",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct Config {
+    layers: usize,
+    warmups: usize,
+    samples: usize,
+    host_samples: usize,
+    sync_samples: usize,
+    shared_mib: usize,
+    expert_mib: usize,
+    expect_arch0: String,
+    expect_arch1: String,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            layers: DEFAULT_LAYERS,
+            warmups: 2,
+            samples: 7,
+            host_samples: 3,
+            sync_samples: 20,
+            shared_mib: DEFAULT_SHARED_MIB,
+            expert_mib: DEFAULT_EXPERT_MIB,
+            expect_arch0: "gfx1100".to_owned(),
+            expect_arch1: "gfx1151".to_owned(),
+        }
+    }
+}
+
+impl Config {
+    fn parse() -> Result<Self, String> {
+        let mut config = Self::default();
+        let args = std::env::args().skip(1).collect::<Vec<_>>();
+        let mut index = 0;
+        while index < args.len() {
+            let flag = &args[index];
+            let value = |index: &mut usize| -> Result<&str, String> {
+                *index += 1;
+                args.get(*index)
+                    .map(String::as_str)
+                    .ok_or_else(|| format!("{flag} requires a value"))
+            };
+            match flag.as_str() {
+                "--layers" => config.layers = parse_positive(flag, value(&mut index)?)?,
+                "--warmups" => config.warmups = parse_usize(flag, value(&mut index)?)?,
+                "--samples" => config.samples = parse_positive(flag, value(&mut index)?)?,
+                "--host-samples" => config.host_samples = parse_positive(flag, value(&mut index)?)?,
+                "--sync-samples" => config.sync_samples = parse_positive(flag, value(&mut index)?)?,
+                "--shared-mib" => config.shared_mib = parse_positive(flag, value(&mut index)?)?,
+                "--expert-mib" => config.expert_mib = parse_positive(flag, value(&mut index)?)?,
+                "--expect-arch0" => config.expect_arch0 = value(&mut index)?.to_owned(),
+                "--expect-arch1" => config.expect_arch1 = value(&mut index)?.to_owned(),
+                "-h" | "--help" => {
+                    println!(
+                        "hetero_gfx11_cooperative [options]\n\
+                         --layers N         cooperative layers (default 43)\n\
+                         --warmups N        untimed cooperative runs (default 2)\n\
+                         --samples N        samples per AQL arm (default 7)\n\
+                         --host-samples N   host-sync control samples (default 3)\n\
+                         --sync-samples N   one-byte dependency-chain samples (default 20)\n\
+                         --shared-mib N     gfx1100 bytes read per layer (default 84)\n\
+                         --expert-mib N     gfx1151 bytes read per layer (default 42)\n\
+                         --expect-arch0 A   exact dense-device arch (default gfx1100)\n\
+                         --expect-arch1 A   exact expert-device arch (default gfx1151)"
+                    );
+                    std::process::exit(0);
+                }
+                _ => return Err(format!("unknown argument {flag:?}; use --help")),
+            }
+            index += 1;
+        }
+        if config.layers > 60 {
+            return Err(
+                "--layers must be <=60 so every persistent batch fits a 256-packet AQL queue"
+                    .to_owned(),
+            );
+        }
+        Ok(config)
+    }
+}
+
+fn parse_positive(flag: &str, raw: &str) -> Result<usize, String> {
+    let parsed = parse_usize(flag, raw)?;
+    if parsed == 0 {
+        Err(format!("{flag} must be positive"))
+    } else {
+        Ok(parsed)
+    }
+}
+
+fn parse_usize(flag: &str, raw: &str) -> Result<usize, String> {
+    raw.parse::<usize>()
+        .map_err(|error| format!("invalid {flag} value {raw:?}: {error}"))
+}
+
+fn layer_key(layer: u32) -> u32 {
+    layer
+        .wrapping_add(1)
+        .wrapping_mul(0x9e37_79b9)
+        .wrapping_add(0x7f4a_7c15)
+}
+
+fn make_words(words: usize, salt: u32) -> Vec<u32> {
+    (0..words)
+        .map(|index| {
+            let mut value = (index as u32).wrapping_mul(0x27d4_eb2d).wrapping_add(salt);
+            value ^= value >> 16;
+            value = value.wrapping_mul(0x85eb_ca6b);
+            value ^ (value >> 13)
+        })
+        .collect()
+}
+
+fn xor_by_hidden(weights: &[u32]) -> Vec<u32> {
+    let mut checksums = vec![0_u32; HIDDEN];
+    for (index, &weight) in weights.iter().enumerate() {
+        checksums[index % HIDDEN] ^= weight;
+    }
+    checksums
+}
+
+fn oracle(
+    initial: &[u32],
+    shared_checksums: &[u32],
+    expert_checksums: &[u32],
+    layers: usize,
+) -> Vec<u32> {
+    let mut state = initial.to_vec();
+    let mut packet = vec![0_u32; PACKET_WORDS];
+    for layer in 0..layers {
+        let layer = layer as u32;
+        let key = layer_key(layer);
+        let shift = layer % 31 + 1;
+        for index in 0..HIDDEN {
+            packet[index] = (state[index] ^ key)
+                .rotate_left(shift)
+                .wrapping_add((index as u32).wrapping_mul(0x045d_9f3b));
+        }
+        for route in 0..ROUTES {
+            packet[HIDDEN + route] = (layer * 7 + route as u32 * 13) % 256;
+            packet[HIDDEN + ROUTES + route] =
+                (key ^ (route as u32 + 1).wrapping_mul(0x27d4_eb2d)).rotate_left(route as u32 + 3);
+        }
+        for index in 12..PACKET_METADATA_WORDS {
+            packet[HIDDEN + index] = key ^ (index as u32).wrapping_mul(0x85eb_ca6b);
+        }
+        let mut route_mix = 0_u32;
+        for route in 0..ROUTES {
+            route_mix ^= (packet[HIDDEN + route].wrapping_mul(0x9e37_79b9)
+                ^ packet[HIDDEN + ROUTES + route])
+                .rotate_left(route as u32 + 1);
+        }
+        for index in 0..HIDDEN {
+            let shared = (packet[index] ^ shared_checksums[index] ^ key).rotate_left(5);
+            let expert =
+                (packet[index] ^ expert_checksums[index] ^ route_mix ^ key).rotate_left(11);
+            state[index] = shared.wrapping_add(expert).rotate_left(3) ^ key;
+        }
+    }
+    state
+}
+
+fn u32_bytes(values: &[u32]) -> &[u8] {
+    // SAFETY: all u32 bit patterns are valid bytes and the extent is exact.
+    unsafe {
+        std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), std::mem::size_of_val(values))
+    }
+}
+
+fn u32_bytes_mut(values: &mut [u32]) -> &mut [u8] {
+    // SAFETY: same representation argument as `u32_bytes`, with unique access.
+    unsafe {
+        std::slice::from_raw_parts_mut(
+            values.as_mut_ptr().cast::<u8>(),
+            std::mem::size_of_val(values),
+        )
+    }
+}
+
+fn pointer(buffer: &DeviceBuffer) -> u64 {
+    buffer.as_ptr() as usize as u64
+}
+
+fn write_u64(bytes: &mut [u8], offset: usize, value: u64) {
+    bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+}
+
+fn write_u32(bytes: &mut [u8], offset: usize, value: u32) {
+    bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+}
+
+fn kernargs(
+    pool: &KernargPool,
+    kernel: &Kernel,
+    pointers: &[u64],
+    scalars: &[u32],
+) -> Result<KernargBuffer, Box<dyn std::error::Error>> {
+    let mut buffer = pool.allocate_for(kernel.metadata())?;
+    let mut offset = 0;
+    for &value in pointers {
+        write_u64(buffer.as_mut_bytes(), offset, value);
+        offset += 8;
+    }
+    for &value in scalars {
+        write_u32(buffer.as_mut_bytes(), offset, value);
+        offset += 4;
+    }
+    Ok(buffer)
+}
+
+struct Buffers {
+    state0: [DeviceBuffer; 2],
+    packet0: [DeviceBuffer; 2],
+    shared0: [DeviceBuffer; 2],
+    routed0: [DeviceBuffer; 2],
+    packet1: [DeviceBuffer; 2],
+    expert1: [DeviceBuffer; 2],
+    shared_weights0: DeviceBuffer,
+    expert_weights1: DeviceBuffer,
+}
+
+impl Buffers {
+    fn allocate(
+        hip: &HipRuntime,
+        shared_bytes: usize,
+        expert_bytes: usize,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        hip.set_device(0)?;
+        let state0 = [hip.malloc(HIDDEN * 4)?, hip.malloc(HIDDEN * 4)?];
+        let packet0 = [hip.malloc(PACKET_WORDS * 4)?, hip.malloc(PACKET_WORDS * 4)?];
+        let shared0 = [hip.malloc(HIDDEN * 4)?, hip.malloc(HIDDEN * 4)?];
+        let routed0 = [hip.malloc(HIDDEN * 4)?, hip.malloc(HIDDEN * 4)?];
+        let shared_weights0 = hip.malloc(shared_bytes)?;
+
+        hip.set_device(1)?;
+        let packet1 = [hip.malloc(PACKET_WORDS * 4)?, hip.malloc(PACKET_WORDS * 4)?];
+        let expert1 = [hip.malloc(HIDDEN * 4)?, hip.malloc(HIDDEN * 4)?];
+        let expert_weights1 = hip.malloc(expert_bytes)?;
+        Ok(Self {
+            state0,
+            packet0,
+            shared0,
+            routed0,
+            packet1,
+            expert1,
+            shared_weights0,
+            expert_weights1,
+        })
+    }
+
+    fn initialize(
+        &self,
+        hip: &HipRuntime,
+        initial: &[u32],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        hip.set_device(0)?;
+        hip.memcpy_htod(&self.state0[0], u32_bytes(initial))?;
+        hip.memset(&self.state0[1], 0, HIDDEN * 4)?;
+        for slot in 0..2 {
+            hip.memset(&self.packet0[slot], 0, PACKET_WORDS * 4)?;
+            hip.memset(&self.shared0[slot], 0, HIDDEN * 4)?;
+            hip.memset(&self.routed0[slot], 0, HIDDEN * 4)?;
+        }
+        hip.device_synchronize()?;
+        hip.set_device(1)?;
+        for slot in 0..2 {
+            hip.memset(&self.packet1[slot], 0, PACKET_WORDS * 4)?;
+            hip.memset(&self.expert1[slot], 0, HIDDEN * 4)?;
+        }
+        hip.device_synchronize()?;
+        Ok(())
+    }
+
+    fn assert_output(
+        &self,
+        hip: &HipRuntime,
+        layers: usize,
+        expected: &[u32],
+        label: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        hip.set_device(0)?;
+        let mut actual = vec![0_u32; HIDDEN];
+        hip.memcpy_dtoh(u32_bytes_mut(&mut actual), &self.state0[layers % 2])?;
+        if actual != expected {
+            let first = actual
+                .iter()
+                .zip(expected)
+                .position(|(a, b)| a != b)
+                .unwrap_or(0);
+            return Err(format!(
+                "{label}: raw-bit mismatch at {first}: got={:#010x}, expected={:#010x}",
+                actual[first], expected[first]
+            )
+            .into());
+        }
+        Ok(())
+    }
+}
+
+struct KernelSet {
+    producer: Kernel,
+    shared: Kernel,
+    expert: Kernel,
+    join: Kernel,
+}
+
+struct Graph {
+    schedule: Schedule,
+    dev0: GpuDevice,
+    dev1: GpuDevice,
+    queues: QueueSet,
+    batches: [Vec<PacketImage>; 2],
+    producer_signals: Vec<CompletionSignal>,
+    shared_signals: Vec<CompletionSignal>,
+    activation_signals: Vec<CompletionSignal>,
+    expert_signals: Vec<CompletionSignal>,
+    result_signals: Vec<CompletionSignal>,
+    join_signals: Vec<CompletionSignal>,
+    _kernargs: Vec<KernargBuffer>,
+    layers: usize,
+}
+
+impl Graph {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        schedule: Schedule,
+        dev0: &GpuDevice,
+        dev1: &GpuDevice,
+        kernels: &KernelSet,
+        buffers: &Buffers,
+        layers: usize,
+        shared_words: u32,
+        expert_words: u32,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let pool0 = KernargPool::discover(dev0)?;
+        let pool1 = KernargPool::discover(dev1)?;
+        let queues = QueueSet::create_for_devices(&[dev0.clone(), dev1.clone()], 256)?;
+        queues.set_profiling(true)?;
+        let mut batches = [
+            Vec::with_capacity(layers * 4),
+            Vec::with_capacity(layers * 2),
+        ];
+        let mut producer_signals = Vec::with_capacity(layers);
+        let mut shared_signals = Vec::with_capacity(layers);
+        let mut activation_signals = Vec::with_capacity(layers);
+        let mut expert_signals = Vec::with_capacity(layers);
+        let mut result_signals = Vec::with_capacity(layers);
+        let mut join_signals = Vec::with_capacity(layers);
+        for _ in 0..layers {
+            producer_signals.push(CompletionSignal::new(dev0)?);
+            shared_signals.push(CompletionSignal::new(dev0)?);
+            activation_signals.push(CompletionSignal::new(dev1)?);
+            expert_signals.push(CompletionSignal::new(dev1)?);
+            result_signals.push(CompletionSignal::new(dev0)?);
+            join_signals.push(CompletionSignal::new(dev0)?);
+        }
+
+        let geometry = LaunchGeometry::new([HIDDEN as u32, 1, 1], [BLOCK, 1, 1])?;
+        let mut all_kernargs = Vec::with_capacity(layers * 4);
+        for layer in 0..layers {
+            let slot = layer % 2;
+            let input_slot = layer % 2;
+            let output_slot = (layer + 1) % 2;
+            let layer_u32 = layer as u32;
+
+            let producer_args = kernargs(
+                &pool0,
+                &kernels.producer,
+                &[
+                    pointer(&buffers.state0[input_slot]),
+                    pointer(&buffers.packet0[slot]),
+                ],
+                &[layer_u32, HIDDEN as u32],
+            )?;
+            let producer_packet = KernelDispatchPacket::new(
+                kernels.producer.metadata(),
+                geometry,
+                0,
+                producer_args.address(),
+                producer_signals[layer].raw(),
+            )?;
+            batches[0].push(PacketImage::kernel(&producer_packet));
+            all_kernargs.push(producer_args);
+
+            let shared_args = kernargs(
+                &pool0,
+                &kernels.shared,
+                &[
+                    pointer(&buffers.packet0[slot]),
+                    pointer(&buffers.shared_weights0),
+                    pointer(&buffers.shared0[slot]),
+                ],
+                &[layer_u32, HIDDEN as u32, shared_words],
+            )?;
+            let shared_packet = KernelDispatchPacket::new(
+                kernels.shared.metadata(),
+                geometry,
+                0,
+                shared_args.address(),
+                shared_signals[layer].raw(),
+            )?;
+            batches[0].push(PacketImage::kernel(&shared_packet));
+            all_kernargs.push(shared_args);
+
+            let join_barrier = BarrierAndPacket::new(
+                &[result_signals[layer].raw()],
+                redline_rocr::abi::Signal(0),
+            )?;
+            batches[0].push(PacketImage::barrier(&join_barrier));
+            let join_args = kernargs(
+                &pool0,
+                &kernels.join,
+                &[
+                    pointer(&buffers.shared0[slot]),
+                    pointer(&buffers.routed0[slot]),
+                    pointer(&buffers.state0[output_slot]),
+                ],
+                &[layer_u32, HIDDEN as u32],
+            )?;
+            let join_packet = KernelDispatchPacket::new(
+                kernels.join.metadata(),
+                geometry,
+                0,
+                join_args.address(),
+                join_signals[layer].raw(),
+            )?;
+            batches[0].push(PacketImage::kernel(&join_packet));
+            all_kernargs.push(join_args);
+
+            let activation_barrier = BarrierAndPacket::new(
+                &[activation_signals[layer].raw()],
+                redline_rocr::abi::Signal(0),
+            )?;
+            batches[1].push(PacketImage::barrier(&activation_barrier));
+            let expert_args = kernargs(
+                &pool1,
+                &kernels.expert,
+                &[
+                    pointer(&buffers.packet1[slot]),
+                    pointer(&buffers.expert_weights1),
+                    pointer(&buffers.expert1[slot]),
+                ],
+                &[layer_u32, HIDDEN as u32, expert_words],
+            )?;
+            let expert_packet = KernelDispatchPacket::new(
+                kernels.expert.metadata(),
+                geometry,
+                0,
+                expert_args.address(),
+                expert_signals[layer].raw(),
+            )?;
+            batches[1].push(PacketImage::kernel(&expert_packet));
+            all_kernargs.push(expert_args);
+        }
+        Ok(Self {
+            schedule,
+            dev0: dev0.clone(),
+            dev1: dev1.clone(),
+            queues,
+            batches,
+            producer_signals,
+            shared_signals,
+            activation_signals,
+            expert_signals,
+            result_signals,
+            join_signals,
+            _kernargs: all_kernargs,
+            layers,
+        })
+    }
+
+    fn reset(&mut self) {
+        for layer in 0..self.layers {
+            self.producer_signals[layer].reset();
+            self.shared_signals[layer].reset();
+            self.activation_signals[layer].reset();
+            self.expert_signals[layer].reset();
+            self.result_signals[layer].reset();
+            self.join_signals[layer].reset();
+        }
+    }
+
+    fn run(&mut self, buffers: &Buffers) -> Result<f64, Box<dyn std::error::Error>> {
+        self.reset();
+        let started = Instant::now();
+        for layer in 0..self.layers {
+            let slot = layer % 2;
+            let activation_dependency = match self.schedule {
+                Schedule::Overlap => &self.producer_signals[layer],
+                Schedule::Serial => &self.shared_signals[layer],
+            };
+            // SAFETY: every HIP allocation remains live and peer-accessible;
+            // persistent dependency/completion signals are reset only after
+            // the preceding graph has completed.
+            unsafe {
+                self.dev1.memory_async_copy(
+                    buffers.packet1[slot].as_ptr(),
+                    &self.dev0,
+                    buffers.packet0[slot].as_ptr(),
+                    PACKET_WORDS * 4,
+                    &[activation_dependency],
+                    &self.activation_signals[layer],
+                    Some(COPY_TO_EXPERT_ENGINE),
+                )?;
+                self.dev0.memory_async_copy(
+                    buffers.routed0[slot].as_ptr(),
+                    &self.dev1,
+                    buffers.expert1[slot].as_ptr(),
+                    HIDDEN * 4,
+                    &[&self.expert_signals[layer]],
+                    &self.result_signals[layer],
+                    Some(COPY_TO_DENSE_ENGINE),
+                )?;
+            }
+        }
+        self.queues.prepare_batches(&self.batches)?;
+        self.queues.ring_prepared()?;
+        self.queues
+            .wait_signal(&self.join_signals[self.layers - 1], Duration::from_secs(30))?;
+        for signals in [
+            &self.producer_signals,
+            &self.shared_signals,
+            &self.activation_signals,
+            &self.expert_signals,
+            &self.result_signals,
+            &self.join_signals,
+        ] {
+            for signal in signals {
+                if signal.value_scacquire() != 0 {
+                    return Err(format!(
+                        "{} completion signal ended at {}",
+                        self.schedule.label(),
+                        signal.value_scacquire()
+                    )
+                    .into());
+                }
+            }
+        }
+        Ok(started.elapsed().as_secs_f64() * 1000.0)
+    }
+
+    fn overlap_report(&self) -> Result<OverlapReport, Box<dyn std::error::Error>> {
+        let frequency = self.dev0.timestamp_frequency_hz()?;
+        let mut shared_ticks = 0_u64;
+        let mut expert_ticks = 0_u64;
+        let mut overlap_ticks = 0_u64;
+        let mut overlap_layers = 0_usize;
+        for layer in 0..self.layers {
+            let shared = self.dev0.dispatch_time(&self.shared_signals[layer])?;
+            let expert = self.dev1.dispatch_time(&self.expert_signals[layer])?;
+            shared_ticks += shared.end - shared.start;
+            expert_ticks += expert.end - expert.start;
+            let overlap = shared
+                .end
+                .min(expert.end)
+                .saturating_sub(shared.start.max(expert.start));
+            overlap_ticks += overlap;
+            overlap_layers += usize::from(overlap != 0);
+        }
+        let to_us = |ticks: u64| ticks as f64 * 1_000_000.0 / frequency as f64;
+        Ok(OverlapReport {
+            shared_us: to_us(shared_ticks),
+            expert_us: to_us(expert_ticks),
+            overlap_us: to_us(overlap_ticks),
+            overlap_layers,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct OverlapReport {
+    shared_us: f64,
+    expert_us: f64,
+    overlap_us: f64,
+    overlap_layers: usize,
+}
+
+struct HipFunctions {
+    _module0: Module,
+    _module1: Module,
+    producer: Function,
+    shared: Function,
+    expert: Function,
+    join: Function,
+}
+
+impl HipFunctions {
+    fn load(
+        hip: &HipRuntime,
+        image0: &[u8],
+        image1: &[u8],
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        hip.set_device(0)?;
+        let module0 = hip.module_load_data(image0)?;
+        let producer = hip.module_get_function(&module0, "hetero_gfx11_producer")?;
+        let shared = hip.module_get_function(&module0, "hetero_gfx11_shared")?;
+        let join = hip.module_get_function(&module0, "hetero_gfx11_join")?;
+        hip.set_device(1)?;
+        let module1 = hip.module_load_data(image1)?;
+        let expert = hip.module_get_function(&module1, "hetero_gfx11_expert")?;
+        Ok(Self {
+            _module0: module0,
+            _module1: module1,
+            producer,
+            shared,
+            expert,
+            join,
+        })
+    }
+}
+
+fn launch_producer(
+    hip: &HipRuntime,
+    function: &Function,
+    input: &DeviceBuffer,
+    packet: &DeviceBuffer,
+    layer: u32,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut input = input.as_ptr();
+    let mut packet = packet.as_ptr();
+    let mut layer = layer;
+    let mut n = HIDDEN as u32;
+    let mut params = [
+        (&mut input as *mut *mut c_void).cast(),
+        (&mut packet as *mut *mut c_void).cast(),
+        (&mut layer as *mut u32).cast(),
+        (&mut n as *mut u32).cast(),
+    ];
+    // SAFETY: parameters and extents exactly match the compiled kernel ABI.
+    unsafe {
+        hip.launch_kernel(
+            function,
+            [(HIDDEN as u32).div_ceil(BLOCK as u32), 1, 1],
+            [BLOCK as u32, 1, 1],
+            0,
+            None,
+            &mut params,
+        )?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn launch_branch(
+    hip: &HipRuntime,
+    function: &Function,
+    packet: &DeviceBuffer,
+    weights: &DeviceBuffer,
+    output: &DeviceBuffer,
+    layer: u32,
+    weight_words: u32,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut packet = packet.as_ptr();
+    let mut weights = weights.as_ptr();
+    let mut output = output.as_ptr();
+    let mut layer = layer;
+    let mut n = HIDDEN as u32;
+    let mut weight_words = weight_words;
+    let mut params = [
+        (&mut packet as *mut *mut c_void).cast(),
+        (&mut weights as *mut *mut c_void).cast(),
+        (&mut output as *mut *mut c_void).cast(),
+        (&mut layer as *mut u32).cast(),
+        (&mut n as *mut u32).cast(),
+        (&mut weight_words as *mut u32).cast(),
+    ];
+    // SAFETY: parameters and extents exactly match both branch kernel ABIs.
+    unsafe {
+        hip.launch_kernel(
+            function,
+            [(HIDDEN as u32).div_ceil(BLOCK as u32), 1, 1],
+            [BLOCK as u32, 1, 1],
+            0,
+            None,
+            &mut params,
+        )?;
+    }
+    Ok(())
+}
+
+fn launch_join(
+    hip: &HipRuntime,
+    function: &Function,
+    shared: &DeviceBuffer,
+    routed: &DeviceBuffer,
+    output: &DeviceBuffer,
+    layer: u32,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut shared = shared.as_ptr();
+    let mut routed = routed.as_ptr();
+    let mut output = output.as_ptr();
+    let mut layer = layer;
+    let mut n = HIDDEN as u32;
+    let mut params = [
+        (&mut shared as *mut *mut c_void).cast(),
+        (&mut routed as *mut *mut c_void).cast(),
+        (&mut output as *mut *mut c_void).cast(),
+        (&mut layer as *mut u32).cast(),
+        (&mut n as *mut u32).cast(),
+    ];
+    // SAFETY: parameters and extents exactly match the join kernel ABI.
+    unsafe {
+        hip.launch_kernel(
+            function,
+            [(HIDDEN as u32).div_ceil(BLOCK as u32), 1, 1],
+            [BLOCK as u32, 1, 1],
+            0,
+            None,
+            &mut params,
+        )?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn host_sync_sample(
+    hip: &HipRuntime,
+    functions: &HipFunctions,
+    dev0: &GpuDevice,
+    dev1: &GpuDevice,
+    buffers: &Buffers,
+    layers: usize,
+    shared_words: u32,
+    expert_words: u32,
+) -> Result<f64, Box<dyn std::error::Error>> {
+    let mut activation = CompletionSignal::new(dev1)?;
+    let mut result = CompletionSignal::new(dev0)?;
+    let started = Instant::now();
+    for layer in 0..layers {
+        let slot = layer % 2;
+        hip.set_device(0)?;
+        launch_producer(
+            hip,
+            &functions.producer,
+            &buffers.state0[slot],
+            &buffers.packet0[slot],
+            layer as u32,
+        )?;
+        hip.device_synchronize()?;
+        launch_branch(
+            hip,
+            &functions.shared,
+            &buffers.packet0[slot],
+            &buffers.shared_weights0,
+            &buffers.shared0[slot],
+            layer as u32,
+            shared_words,
+        )?;
+        hip.device_synchronize()?;
+        activation.reset();
+        // SAFETY: producer/shared have completed, allocations remain live.
+        unsafe {
+            dev1.memory_async_copy(
+                buffers.packet1[slot].as_ptr(),
+                dev0,
+                buffers.packet0[slot].as_ptr(),
+                PACKET_WORDS * 4,
+                &[],
+                &activation,
+                Some(COPY_TO_EXPERT_ENGINE),
+            )?;
+        }
+        activation.wait_timeout(Duration::from_secs(30))?;
+
+        hip.set_device(1)?;
+        launch_branch(
+            hip,
+            &functions.expert,
+            &buffers.packet1[slot],
+            &buffers.expert_weights1,
+            &buffers.expert1[slot],
+            layer as u32,
+            expert_words,
+        )?;
+        hip.device_synchronize()?;
+        result.reset();
+        // SAFETY: expert has completed and both allocations remain live.
+        unsafe {
+            dev0.memory_async_copy(
+                buffers.routed0[slot].as_ptr(),
+                dev1,
+                buffers.expert1[slot].as_ptr(),
+                HIDDEN * 4,
+                &[],
+                &result,
+                Some(COPY_TO_DENSE_ENGINE),
+            )?;
+        }
+        result.wait_timeout(Duration::from_secs(30))?;
+
+        hip.set_device(0)?;
+        launch_join(
+            hip,
+            &functions.join,
+            &buffers.shared0[slot],
+            &buffers.routed0[slot],
+            &buffers.state0[(layer + 1) % 2],
+            layer as u32,
+        )?;
+        hip.device_synchronize()?;
+    }
+    Ok(started.elapsed().as_secs_f64() * 1000.0)
+}
+
+fn sync_only_sample(
+    dev0: &GpuDevice,
+    dev1: &GpuDevice,
+    buffers: &Buffers,
+    signals: &mut [CompletionSignal],
+) -> Result<f64, Box<dyn std::error::Error>> {
+    for signal in signals.iter_mut() {
+        signal.reset();
+    }
+    let started = Instant::now();
+    for copy in 0..signals.len() {
+        let dependency = if copy == 0 {
+            Vec::new()
+        } else {
+            vec![&signals[copy - 1]]
+        };
+        if copy % 2 == 0 {
+            // SAFETY: one live byte is copied in each direction; signals are
+            // persistent for the entire chain.
+            unsafe {
+                dev1.memory_async_copy(
+                    buffers.packet1[0].as_ptr(),
+                    dev0,
+                    buffers.packet0[0].as_ptr(),
+                    1,
+                    &dependency,
+                    &signals[copy],
+                    Some(COPY_TO_EXPERT_ENGINE),
+                )?;
+            }
+        } else {
+            // SAFETY: same contract in the reverse direction.
+            unsafe {
+                dev0.memory_async_copy(
+                    buffers.packet0[1].as_ptr(),
+                    dev1,
+                    buffers.packet1[0].as_ptr(),
+                    1,
+                    &dependency,
+                    &signals[copy],
+                    Some(COPY_TO_DENSE_ENGINE),
+                )?;
+            }
+        }
+    }
+    signals[signals.len() - 1].wait_timeout(Duration::from_secs(30))?;
+    Ok(started.elapsed().as_secs_f64() * 1000.0)
+}
+
+fn p50(values: &[f64]) -> f64 {
+    let mut sorted = values.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    sorted[sorted.len() / 2]
+}
+
+fn compile_exact(
+    arch: &str,
+    module: &str,
+) -> Result<(Arc<[u8]>, String), Box<dyn std::error::Error>> {
+    let mut compiler = KernelCompiler::new(arch, "-mcode-object-version=6".to_owned())?;
+    let artifact = compiler.compile(module, SOURCE)?.to_owned();
+    let image: Arc<[u8]> = Arc::from(std::fs::read(&artifact)?);
+    Ok((image, artifact.display().to_string()))
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let config = Config::parse().map_err(|error| format!("hetero_gfx11_cooperative: {error}"))?;
+    let hip = HipRuntime::load()?;
+    if hip.device_count()? < 2 {
+        return Err("two visible GPUs are required".into());
+    }
+    let arch0 = hip.get_arch(0)?;
+    let arch1 = hip.get_arch(1)?;
+    if arch0 != config.expect_arch0 || arch1 != config.expect_arch1 {
+        return Err(format!(
+            "logical GPU identity mismatch: device0={arch0} expected {}, device1={arch1} expected {}",
+            config.expect_arch0, config.expect_arch1
+        )
+        .into());
+    }
+    hip.set_device(0)?;
+    if !hip.can_access_peer(0, 1)? {
+        return Err("gfx1100 cannot access gfx1151 peer allocations".into());
+    }
+    hip.enable_peer_access(1)?;
+    hip.set_device(1)?;
+    if !hip.can_access_peer(1, 0)? {
+        return Err("gfx1151 cannot access gfx1100 peer allocations".into());
+    }
+    hip.enable_peer_access(0)?;
+
+    let runtime = Runtime::initialize(redline_rocr::load_symbols()?)?;
+    let dev0 = runtime.select_gpu(GpuSelector::NameContains(&config.expect_arch0))?;
+    let dev1 = runtime.select_gpu(GpuSelector::NameContains(&config.expect_arch1))?;
+    let mask01 = dev1.copy_engine_mask(&dev0)?;
+    let mask10 = dev0.copy_engine_mask(&dev1)?;
+    if mask01 & COPY_TO_EXPERT_ENGINE == 0 || mask10 & COPY_TO_DENSE_ENGINE == 0 {
+        return Err(format!(
+            "selected G0 SDMA engines unavailable: 0->1 mask={mask01:#x}, 1->0 mask={mask10:#x}"
+        )
+        .into());
+    }
+
+    let (image0, artifact0) = compile_exact(&config.expect_arch0, "hetero_g1_gfx1100")?;
+    let (image1, artifact1) = compile_exact(&config.expect_arch1, "hetero_g1_gfx1151")?;
+    if Arc::ptr_eq(&image0, &image1) || artifact0 == artifact1 {
+        return Err("exact-target code objects unexpectedly alias".into());
+    }
+    let executable0 = Executable::load(&dev0, image0.clone())?;
+    let executable1 = Executable::load(&dev1, image1.clone())?;
+    let kernels = KernelSet {
+        producer: executable0.kernel("hetero_gfx11_producer.kd")?,
+        shared: executable0.kernel("hetero_gfx11_shared.kd")?,
+        expert: executable1.kernel("hetero_gfx11_expert.kd")?,
+        join: executable0.kernel("hetero_gfx11_join.kd")?,
+    };
+    let hip_functions = HipFunctions::load(&hip, &image0, &image1)?;
+
+    let shared_bytes = config.shared_mib * 1024 * 1024;
+    let expert_bytes = config.expert_mib * 1024 * 1024;
+    if !shared_bytes.is_multiple_of(4) || !expert_bytes.is_multiple_of(4) {
+        return Err("weight byte counts must be divisible by four".into());
+    }
+    let shared_words = u32::try_from(shared_bytes / 4)?;
+    let expert_words = u32::try_from(expert_bytes / 4)?;
+    let shared_weights = make_words(shared_words as usize, 0x1357_9bdf);
+    let expert_weights = make_words(expert_words as usize, 0x2468_ace0);
+    let initial = make_words(HIDDEN, 0xa5a5_5a5a);
+    let expected = oracle(
+        &initial,
+        &xor_by_hidden(&shared_weights),
+        &xor_by_hidden(&expert_weights),
+        config.layers,
+    );
+    let buffers = Buffers::allocate(&hip, shared_bytes, expert_bytes)?;
+    hip.set_device(0)?;
+    hip.memcpy_htod(&buffers.shared_weights0, u32_bytes(&shared_weights))?;
+    hip.device_synchronize()?;
+    hip.set_device(1)?;
+    hip.memcpy_htod(&buffers.expert_weights1, u32_bytes(&expert_weights))?;
+    hip.device_synchronize()?;
+    drop(shared_weights);
+    drop(expert_weights);
+
+    println!(
+        "identity arch0={} pci0={} hsaco0={} arch1={} pci1={} hsaco1={} layers={} hidden={} routes={} shared_mib={} expert_mib={} engine01={:#x} engine10={:#x}",
+        arch0,
+        dev0.pci_bus_id(),
+        artifact0,
+        arch1,
+        dev1.pci_bus_id(),
+        artifact1,
+        config.layers,
+        HIDDEN,
+        ROUTES,
+        config.shared_mib,
+        config.expert_mib,
+        COPY_TO_EXPERT_ENGINE,
+        COPY_TO_DENSE_ENGINE,
+    );
+
+    let mut sync_signals = Vec::with_capacity(config.layers * 2);
+    for copy in 0..config.layers * 2 {
+        sync_signals.push(CompletionSignal::new(if copy % 2 == 0 {
+            &dev1
+        } else {
+            &dev0
+        })?);
+    }
+    let mut sync_samples = Vec::with_capacity(config.sync_samples);
+    for _ in 0..config.sync_samples {
+        sync_samples.push(sync_only_sample(&dev0, &dev1, &buffers, &mut sync_signals)?);
+    }
+    println!(
+        "arm=sync_only_one_byte samples={} p50_ms={:.6}",
+        sync_samples.len(),
+        p50(&sync_samples)
+    );
+
+    let mut host_samples = Vec::with_capacity(config.host_samples);
+    for sample in 0..config.host_samples {
+        buffers.initialize(&hip, &initial)?;
+        let elapsed = host_sync_sample(
+            &hip,
+            &hip_functions,
+            &dev0,
+            &dev1,
+            &buffers,
+            config.layers,
+            shared_words,
+            expert_words,
+        )?;
+        buffers.assert_output(&hip, config.layers, &expected, "host_sync")?;
+        println!(
+            "arm=host_sync sample={} ms={elapsed:.6} raw_bits=PASS",
+            sample + 1
+        );
+        host_samples.push(elapsed);
+    }
+    let host_p50 = p50(&host_samples);
+    println!(
+        "arm=host_sync samples={} p50_ms={host_p50:.6}",
+        host_samples.len()
+    );
+
+    let mut serial_p50 = None;
+    for schedule in [Schedule::Serial, Schedule::Overlap] {
+        let mut graph = Graph::new(
+            schedule,
+            &dev0,
+            &dev1,
+            &kernels,
+            &buffers,
+            config.layers,
+            shared_words,
+            expert_words,
+        )?;
+        for _ in 0..config.warmups {
+            buffers.initialize(&hip, &initial)?;
+            graph.run(&buffers)?;
+            buffers.assert_output(&hip, config.layers, &expected, schedule.label())?;
+        }
+        let mut samples = Vec::with_capacity(config.samples);
+        let mut last_overlap = None;
+        for sample in 0..config.samples {
+            buffers.initialize(&hip, &initial)?;
+            let elapsed = graph.run(&buffers)?;
+            buffers.assert_output(&hip, config.layers, &expected, schedule.label())?;
+            let overlap = graph.overlap_report()?;
+            println!(
+                "arm={} sample={} ms={:.6} shared_us={:.3} expert_us={:.3} overlap_us={:.3} overlap_layers={}/{} raw_bits=PASS",
+                schedule.label(),
+                sample + 1,
+                elapsed,
+                overlap.shared_us,
+                overlap.expert_us,
+                overlap.overlap_us,
+                overlap.overlap_layers,
+                config.layers,
+            );
+            samples.push(elapsed);
+            last_overlap = Some(overlap);
+        }
+        let median = p50(&samples);
+        let speedup = host_p50 / median;
+        let overlap = last_overlap.expect("at least one sample");
+        println!(
+            "arm={} samples={} p50_ms={median:.6} vs_host_speedup={speedup:.6} overlap_us={:.3} overlap_layers={}/{}",
+            schedule.label(),
+            samples.len(),
+            overlap.overlap_us,
+            overlap.overlap_layers,
+            config.layers,
+        );
+        if schedule == Schedule::Overlap && overlap.overlap_layers == 0 {
+            return Err("device-overlap arm showed zero shared/expert dispatch overlap".into());
+        }
+        match schedule {
+            Schedule::Serial => serial_p50 = Some(median),
+            Schedule::Overlap => {
+                let serial = serial_p50.expect("serial arm runs first");
+                let vs_serial = serial / median;
+                println!(
+                    "gate=device_overlap vs_serial_speedup={vs_serial:.6} vs_host_speedup={speedup:.6}"
+                );
+                if speedup < 1.05 {
+                    return Err(format!(
+                        "cooperative path is not materially faster than host-sync control: {speedup:.4}x"
+                    )
+                    .into());
+                }
+                if vs_serial < 1.02 {
+                    return Err(format!(
+                        "overlap does not beat device-serial scheduling by 2%: {vs_serial:.4}x"
+                    )
+                    .into());
+                }
+            }
+        }
+    }
+
+    println!("hetero_gfx11_cooperative: PASS");
+    Ok(())
+}
