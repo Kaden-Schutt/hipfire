@@ -1432,7 +1432,7 @@ fn moe_dtypes_paro() -> MoeDtypes {
 }
 
 fn flags_default() -> rdna_compute::feature_flags::FeatureFlags {
-    rdna_compute::feature_flags::FeatureFlags::from_env_for_test("gfx1100")
+    rdna_compute::feature_flags::FeatureFlags::for_test("gfx1100")
 }
 
 #[test]

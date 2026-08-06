@@ -30,9 +30,11 @@
 use crate::minimax::{
     minimax_single_moe_authority, MiniMaxConfig, MiniMaxLayerWeights, MiniMaxState, MiniMaxWeights,
 };
+use hipfire_dispatch::context::DispatchCtx;
+use hipfire_dispatch::pipeline::{execute_steps, GemvInput, Step};
+use hipfire_dispatch::types::dtype_rotation_plan;
 use hipfire_runtime::llama::{
     fused_silu_mul_rotate_mq_batched_for, rotate_x_mq_batched_for, rotate_x_mq_for, weight_gemv,
-    weight_gemv_residual,
 };
 use hipfire_runtime::moe_plan::{
     execute_lowered_moe, lower_moe_steps, MoEExecutionKind, MoEExecutionPolicy, MoeExecutionTarget,
@@ -109,14 +111,16 @@ pub fn decode_step_with_graph(
 ) -> Result<Vec<f32>, String> {
     use std::sync::OnceLock;
     static GRAPH_ENV: OnceLock<Option<bool>> = OnceLock::new();
-    let env_override =
-        *GRAPH_ENV.get_or_init(
-            || match std::env::var("HIPFIRE_MINIMAX_GRAPH").ok().as_deref() {
-                Some("1") => Some(true),
-                Some("0") => Some(false),
-                _ => None,
-            },
-        );
+    let env_override = *GRAPH_ENV.get_or_init(|| {
+        match hipfire_config::developer_var("HIPFIRE_MINIMAX_GRAPH")
+            .ok()
+            .as_deref()
+        {
+            Some("1") => Some(true),
+            Some("0") => Some(false),
+            _ => None,
+        }
+    });
     // Default OFF — measured only +1.0% on gfx1151 (the sole arch MiniMax fits);
     // the decode gap is GPU-CP dispatch latency, not host-launch overhead, so
     // hipGraph recovers ~nothing here. Opt in with HIPFIRE_MINIMAX_GRAPH=1.
@@ -213,7 +217,8 @@ fn decode_step_body(
     let k_top = cfg.num_experts_per_tok;
     let eps = cfg.rms_norm_eps;
     let seq_len = position as usize + 1;
-    let capture_postattn = std::env::var_os("HIPFIRE_MINIMAX_CAPTURE_POSTATTN").is_some();
+    let capture_postattn =
+        hipfire_config::developer_var_os("HIPFIRE_MINIMAX_CAPTURE_POSTATTN").is_some();
 
     // Device position scalar (i32) for rope / kv-write / attention. Staged from
     // the heap-stable `state.pos_host` so the captured memcpy re-reads it on
@@ -239,15 +244,11 @@ fn decode_step_body(
     let authority = minimax_single_moe_authority(weights, cfg)?;
 
     for (l, layer) in weights.layers.iter().enumerate() {
+        let ctx = DispatchCtx::new(gpu);
         // ── Attention block (Q8 projections → plain input) ──────────────────
-        gpu.rmsnorm_f32(&state.h, &layer.attn_norm, &state.tmp, eps)
-            .map_err(|e| format!("minimax L{l}: attn rmsnorm: {e:?}"))?;
-        weight_gemv(gpu, &layer.wq, &state.tmp, &state.fa_q)
-            .map_err(|e| format!("minimax L{l}: q_proj: {e}"))?;
-        weight_gemv(gpu, &layer.wk, &state.tmp, &state.fa_k)
-            .map_err(|e| format!("minimax L{l}: k_proj: {e}"))?;
-        weight_gemv(gpu, &layer.wv, &state.tmp, &state.fa_v)
-            .map_err(|e| format!("minimax L{l}: v_proj: {e}"))?;
+        // QKV (attn-norm + q/k/v) via execute_steps → FusedQkvQ8_0.
+        qkv_via_execute_steps(gpu, &ctx, layer, state, eps)
+            .map_err(|e| format!("minimax L{l}: {e}"))?;
 
         // Per-LAYER QK-norm: RMSNorm over the whole flat q[q_dim]/k[kv_dim]
         // vector (batch=1), BEFORE head reshape.
@@ -305,9 +306,19 @@ fn decode_step_body(
         )
         .map_err(|e| format!("minimax L{l}: attention: {e:?}"))?;
 
-        // o_proj + residual: h += W_o · attn_out.
-        weight_gemv_residual(gpu, &layer.wo, &state.fa_attn_out, &state.h)
-            .map_err(|e| format!("minimax L{l}: o_proj: {e}"))?;
+        // o_proj + residual: h += W_o · attn_out (via execute_steps).
+        let wro = layer.wo.dispatch_ref();
+        execute_steps(
+            gpu,
+            &ctx,
+            &[Step::GemvResidual {
+                w: &wro,
+                input: GemvInput::Raw(&state.fa_attn_out),
+                residual: &state.h,
+                out: &state.h,
+            }],
+        )
+        .map_err(|e| format!("minimax L{l}: o_proj: {e:?}"))?;
 
         if capture_postattn {
             if let Some(cap) = capture.as_deref_mut() {
@@ -431,6 +442,53 @@ fn decode_step_body(
 // applies no routed-scaling factor) is captured inside the MoeRoute step.
 // ─────────────────────────────────────────────────────────────────────────
 
+/// QKV projection (attn-norm folded in) via the canonical `execute_steps`
+/// interpreter. minimax's q/k/v are Q8_0 (no Givens/AWQ), so the `QKV3` pattern
+/// fuses into the single `FusedQkvQ8_0` kernel; otherwise it falls through to
+/// per-op GEMV. Reads `h`, writes `fa_q/fa_k/fa_v`; uses `tmp` (x_plain) +
+/// `x_rot` (rmsnorm output) as scratch. Mirrors qwen35's `qkv_via_execute_steps`
+/// non-Givens arm — the existing Q8 fused-QKV consumer.
+fn qkv_via_execute_steps(
+    gpu: &mut Gpu,
+    ctx: &DispatchCtx,
+    layer: &MiniMaxLayerWeights,
+    state: &MiniMaxState,
+    eps: f32,
+) -> Result<(), String> {
+    let rotation = dtype_rotation_plan(layer.wq.gpu_dtype);
+    let wrq = layer.wq.dispatch_ref();
+    let wrk = layer.wk.dispatch_ref();
+    let wrv = layer.wv.dispatch_ref();
+    let steps = [
+        Step::RmsnormAutomatic {
+            x: &state.h,
+            norm_weight: &layer.attn_norm,
+            x_plain: &state.tmp,
+            out: &state.x_rot,
+            awq_scale: layer.wq.awq_scale.as_ref(),
+            k: layer.wq.k,
+            eps,
+            rotation,
+        },
+        Step::Gemv {
+            w: &wrq,
+            input: GemvInput::Prerotated(&state.x_rot),
+            out: &state.fa_q,
+        },
+        Step::Gemv {
+            w: &wrk,
+            input: GemvInput::Prerotated(&state.x_rot),
+            out: &state.fa_k,
+        },
+        Step::Gemv {
+            w: &wrv,
+            input: GemvInput::Prerotated(&state.x_rot),
+            out: &state.fa_v,
+        },
+    ];
+    execute_steps(gpu, ctx, &steps).map_err(|e| format!("minimax qkv: {e:?}"))
+}
+
 /// Attention block (attn-norm folded in). Mirrors the hand-loop attention arm.
 fn minimax_attn_block(
     gpu: &mut Gpu,
@@ -442,14 +500,10 @@ fn minimax_attn_block(
     let q_dim = cfg.q_dim();
     let kv_dim = cfg.kv_dim();
     let eps = cfg.rms_norm_eps;
-    gpu.rmsnorm_f32(&state.h, &layer.attn_norm, &state.tmp, eps)
-        .map_err(|e| format!("minimax L{l}: attn rmsnorm: {e:?}"))?;
-    weight_gemv(gpu, &layer.wq, &state.tmp, &state.fa_q)
-        .map_err(|e| format!("minimax L{l}: q_proj: {e}"))?;
-    weight_gemv(gpu, &layer.wk, &state.tmp, &state.fa_k)
-        .map_err(|e| format!("minimax L{l}: k_proj: {e}"))?;
-    weight_gemv(gpu, &layer.wv, &state.tmp, &state.fa_v)
-        .map_err(|e| format!("minimax L{l}: v_proj: {e}"))?;
+    let ctx = DispatchCtx::new(gpu);
+    // QKV (attn-norm + q/k/v) via execute_steps → FusedQkvQ8_0.
+    qkv_via_execute_steps(gpu, &ctx, layer, state, eps)
+        .map_err(|e| format!("minimax L{l}: {e}"))?;
     if cfg.use_qk_norm {
         gpu.rmsnorm_batched(&state.fa_q, &layer.q_norm, &state.fa_q, 1, q_dim, eps)
             .map_err(|e| format!("minimax L{l}: q_norm: {e:?}"))?;
@@ -477,7 +531,6 @@ fn minimax_attn_block(
     // the dispatch arm passes pos+1. The attended-position count comes from
     // pos_buf either way, so output is unchanged — VALIDATED by hand≡lowered A/B.
     let pos = state.pos_host[0] as usize;
-    let ctx = hipfire_dispatch::context::DispatchCtx::new(gpu);
     let plan = hipfire_dispatch::families::kv_tier::KvTierPlan::derive(
         hipfire_dispatch::families::kv_tier::KvTierInputs {
             pos,
@@ -508,6 +561,7 @@ fn minimax_attn_block(
         tree_bias: None,
         block_start: 0,
         block_cols: 0,
+        output_gate: None,
         output: &state.fa_attn_out,
     };
     hipfire_dispatch::pipeline::execute_steps(
@@ -516,8 +570,19 @@ fn minimax_attn_block(
         &[hipfire_dispatch::pipeline::Step::Attend { plan, io }],
     )
     .map_err(|e| format!("minimax L{l}: attention: {e:?}"))?;
-    weight_gemv_residual(gpu, &layer.wo, &state.fa_attn_out, &state.h)
-        .map_err(|e| format!("minimax L{l}: o_proj: {e}"))
+    // o_proj + residual: h += W_o · attn_out (via execute_steps).
+    let wro = layer.wo.dispatch_ref();
+    execute_steps(
+        gpu,
+        &ctx,
+        &[Step::GemvResidual {
+            w: &wro,
+            input: GemvInput::Raw(&state.fa_attn_out),
+            residual: &state.h,
+            out: &state.h,
+        }],
+    )
+    .map_err(|e| format!("minimax L{l}: o_proj: {e:?}"))
 }
 
 /// Borrowed per-rank inputs of one layer's routed MoE program. Production
@@ -743,6 +808,7 @@ pub(crate) fn minimax_moe_program<'a>(
     }
 }
 
+
 /// True iff every layer's expert gate_up + down dtypes have batched kernels, so
 /// `forward_batch` won't `Err` partway through a pass. Pre-check this before
 /// enabling batched prefill: unsupported tiers (MQ3-Lloyd, HFQ6-gate_up) then
@@ -761,9 +827,29 @@ pub fn forward_batch_supported(weights: &MiniMaxWeights) -> bool {
                 | DType::MQ6G256
                 | DType::HFQ6G256
                 | DType::MQ2G256Lloyd
+                | DType::MQ3G256Lloyd
         );
         gate_up_ok && down_ok
     })
+}
+
+fn grouped_moe_dtypes_supported(gate_up: DType, down: DType) -> bool {
+    matches!(gate_up, DType::MQ2G256Lloyd)
+        && matches!(down, DType::MQ2G256Lloyd | DType::MQ3G256Lloyd)
+}
+
+fn grouped_moe_topology_supported(n_experts: usize, experts_per_token: usize) -> bool {
+    n_experts == 256 && experts_per_token == 8
+}
+
+fn large_batch_topology_supported(cfg: &MiniMaxConfig) -> bool {
+    cfg.hidden_size == 3072
+        && cfg.intermediate_size == 1536
+        && cfg.num_attention_heads == 48
+        && cfg.num_key_value_heads == 8
+        && cfg.head_dim == 128
+        && cfg.rotary_dim == 64
+        && grouped_moe_topology_supported(cfg.num_local_experts, cfg.num_experts_per_tok)
 }
 
 /// Batched forward over `B` tokens in ONE pass — the spec-decode VERIFY forward
@@ -798,9 +884,21 @@ pub fn forward_batch(
     if b == 0 {
         return Err("minimax forward_batch: empty token slice".to_string());
     }
-    if b > 64 {
+    // The attention/MoE batched kernels take B as a grid dimension and scale
+    // freely; the dense projections go through `gemm_q8_0_batched_chunked`
+    // (which internally tiles to the GEMM kernel's MAX_BATCH=64). So large
+    // prefill chunks are supported — the only ceiling is the grid-Z limit
+    // (65535) and the non-flash attention LDS ctx bound (~12k). Bigger chunks
+    // amortize the 79 GB expert-weight read across more tokens (the dominant
+    // prefill cost at 256 experts / top-8).
+    if b > 4096 {
         return Err(format!(
-            "minimax forward_batch: B={b} exceeds kernel cap 64"
+            "minimax forward_batch: B={b} exceeds supported prefill chunk 4096"
+        ));
+    }
+    if b > 64 && !large_batch_topology_supported(cfg) {
+        return Err(format!(
+            "minimax forward_batch: B={b} requires the validated MiniMax-M2 production topology"
         ));
     }
 
@@ -868,6 +966,56 @@ pub fn forward_batch(
         gpu.free_tensor(x_single).ok();
     }
 
+    // ── Grouped-MoE prefill decision + scratch ─────────────────────────────
+    // The indexed-batched GEMV re-reads each expert weight ONCE PER ROUTED
+    // TOKEN — at 256 experts/top-8 that dominates prefill (rocprofv3: 93%).
+    // The scatter-grouped path reads each expert weight ONCE PER CHUNK and
+    // runs WMMA, but needs enough rows/expert to be worth the BLOCK_M padding.
+    // Gate on chunk size: below MOE_GROUPED_GATE rows the 256 experts get too
+    // few rows each to fill a BLOCK_M tile, so the per-token indexed path wins;
+    // at/above it the grouped path is faster + coherent for the dtype pairs
+    // with grouped kernels (validated by coherence-gate-minimax.sh). Require
+    // every layer to be eligible before allocating grouped scratch: MiniMax
+    // k-maps can use MQ4 for down even when gate_up is MQ2-Lloyd, and that
+    // combination must retain the indexed path rather than failing mid-pass.
+    const MOE_BLOCK_M: usize = 16;
+    const MOE_GROUPED_GATE: usize = 256;
+    let moe_grouped = b >= MOE_GROUPED_GATE
+        && gpu.arch_caps.has_wmma()
+        && grouped_moe_topology_supported(n_exp, k_top)
+        && weights.layers.iter().all(|layer| {
+            grouped_moe_dtypes_supported(
+                layer.experts[0].gate_up.gpu_dtype,
+                layer.experts[0].down.gpu_dtype,
+            )
+        });
+    // Round the padded-scatter bound UP to a whole number of BLOCK_M tiles.
+    // The grouped kernels' grid is ceil(m_total/16) tiles and each tile reads
+    // expert_tile_ids[tile_y]; sizing that buffer at `m_total_max / 16`
+    // (integer-div) must therefore not truncate. b*k_top is only 16-aligned
+    // when b is even (k_top=8), so an odd-length last prefill chunk left the
+    // grid one tile longer than the buffer → OOB read → GPU page fault. Caught
+    // by the coherence battery's odd-b prompts; would also hit a production
+    // prompt whose final 512-chunk has odd length.
+    let m_total_max = (b * k_top + n_exp * MOE_BLOCK_M).next_multiple_of(MOE_BLOCK_M);
+    // i32 scratch lives in F32-sized buffers (kernels read raw bytes as i32,
+    // same convention as topk_idx above). `None` when the indexed path is used.
+    let alloc_opt =
+        |g: &mut Gpu, want: bool, n: usize, label: &str| -> Result<Option<GpuTensor>, String> {
+            if want {
+                Ok(Some(alloc(g, n, label)?))
+            } else {
+                Ok(None)
+            }
+        };
+    let g_counts = alloc_opt(gpu, moe_grouped, n_exp, "moe_g_counts")?;
+    let g_offsets = alloc_opt(gpu, moe_grouped, n_exp + 1, "moe_g_offsets")?;
+    let g_sorted = alloc_opt(gpu, moe_grouped, m_total_max, "moe_g_sorted")?;
+    let g_tiles = alloc_opt(gpu, moe_grouped, m_total_max / MOE_BLOCK_M, "moe_g_tiles")?;
+    let g_inv = alloc_opt(gpu, moe_grouped, b * k_top, "moe_g_inv")?;
+    let g_y_gu = alloc_opt(gpu, moe_grouped, m_total_max * 2 * inter, "moe_g_y_gu")?;
+    let g_y_dn = alloc_opt(gpu, moe_grouped, m_total_max * hidden, "moe_g_y_dn")?;
+
     for (l, layer) in weights.layers.iter().enumerate() {
         // Admission pin (shared with `decode_step_body`): the layer-`l` plan
         // must exist, be layer-scoped, and be Single-admitted before any
@@ -878,11 +1026,11 @@ pub fn forward_batch(
         // ── Attention (batched, per-row causal via positions) ──────────────
         gpu.rmsnorm_batched(&x, &layer.attn_norm, &tmp, b, hidden, eps)
             .map_err(|e| format!("minimax L{l} batch attn rmsnorm: {e:?}"))?;
-        gpu.gemm_q8_0_batched(&layer.wq.buf, &tmp, &fq, q_dim, hidden, b)
+        gpu.gemm_q8_0_batched_chunked(&layer.wq.buf, &tmp, &fq, q_dim, hidden, b)
             .map_err(|e| format!("minimax L{l} batch q_proj: {e:?}"))?;
-        gpu.gemm_q8_0_batched(&layer.wk.buf, &tmp, &fk, kv_dim, hidden, b)
+        gpu.gemm_q8_0_batched_chunked(&layer.wk.buf, &tmp, &fk, kv_dim, hidden, b)
             .map_err(|e| format!("minimax L{l} batch k_proj: {e:?}"))?;
-        gpu.gemm_q8_0_batched(&layer.wv.buf, &tmp, &fv, kv_dim, hidden, b)
+        gpu.gemm_q8_0_batched_chunked(&layer.wv.buf, &tmp, &fv, kv_dim, hidden, b)
             .map_err(|e| format!("minimax L{l} batch v_proj: {e:?}"))?;
         if cfg.use_qk_norm {
             // Per-row RMSNorm over the full flat q/k vector (MiniMax convention).
@@ -939,7 +1087,7 @@ pub fn forward_batch(
             b,
         )
         .map_err(|e| format!("minimax L{l} batch attention: {e:?}"))?;
-        gpu.gemm_q8_0_batched(&layer.wo.buf, &attn_out, &o, hidden, q_dim, b)
+        gpu.gemm_q8_0_batched_chunked(&layer.wo.buf, &attn_out, &o, hidden, q_dim, b)
             .map_err(|e| format!("minimax L{l} batch o_proj: {e:?}"))?;
         gpu.add_inplace_f32(&x, &o)
             .map_err(|e| format!("minimax L{l} batch o residual: {e:?}"))?;
@@ -958,7 +1106,7 @@ pub fn forward_batch(
             b,
         )
         .map_err(|e| format!("minimax L{l} batch ffn rotate: {e}"))?;
-        gpu.gemm_q8_0_batched(
+        gpu.gemm_q8_0_batched_chunked(
             &layer.router.buf,
             &ffn_tmp,
             &router_logits,
@@ -980,6 +1128,112 @@ pub fn forward_batch(
             b as i32,
         )
         .map_err(|e| format!("minimax L{l} batch topk: {e:?}"))?;
+
+        if moe_grouped {
+            // ── Scatter-grouped MoE (large chunks): read each expert weight
+            //    ONCE per chunk via WMMA grouped GEMM, vs once-per-routed-token
+            //    in the indexed path. Mirrors the deepseek4 SGLang-style
+            //    pipeline (scatter → grouped gate_up → unscatter → AWQ
+            //    silu·mul·rotate → grouped down → weighted combine into x). ──
+            let g_counts = g_counts.as_ref().unwrap();
+            let g_offsets = g_offsets.as_ref().unwrap();
+            let g_sorted = g_sorted.as_ref().unwrap();
+            let g_tiles = g_tiles.as_ref().unwrap();
+            let g_inv = g_inv.as_ref().unwrap();
+            let g_y_gu = g_y_gu.as_ref().unwrap();
+            let g_y_dn = g_y_dn.as_ref().unwrap();
+
+            gpu.moe_scatter_fused_k8(
+                &topk_idx,
+                g_counts,
+                g_offsets,
+                g_sorted,
+                g_tiles,
+                g_inv,
+                b * k_top,
+                n_exp,
+                m_total_max,
+                MOE_BLOCK_M,
+            )
+            .map_err(|e| format!("minimax L{l} grouped scatter: {e:?}"))?;
+
+            // Grouped gate_up GEMM (MQ2-Lloyd): gathers ffn_x_rot rows by token
+            // (x_row_div=k_top) → y_gate_up_grouped [m_total, 2*inter]. The
+            // dispatcher picks i8 MMQ (gfx1151) vs FP16 WMMA by arch.
+            gpu.gemm_mq2g256_lloyd_moe_grouped(
+                &layer.expert_gate_up_ptrs,
+                g_tiles,
+                g_sorted,
+                &ffn_x_rot,
+                g_y_gu,
+                2 * inter,
+                hidden,
+                k_top,
+                m_total_max,
+                b,
+            )
+            .map_err(|e| format!("minimax L{l} grouped gate_up: {e:?}"))?;
+
+            // Unscatter grouped → natural [B*k_top, inter] gate/up.
+            gpu.moe_gate_up_unscatter_k8(g_y_gu, g_sorted, &gate, &up, inter, k_top, m_total_max)
+                .map_err(|e| format!("minimax L{l} grouped unscatter: {e:?}"))?;
+
+            // AWQ-aware silu·mul·rotate (down weight) → rot [B*k_top, inter].
+            fused_silu_mul_rotate_mq_batched_for(
+                gpu,
+                &layer.experts[0].down,
+                &gate,
+                &up,
+                &rot,
+                inter,
+                b * k_top,
+            )
+            .map_err(|e| format!("minimax L{l} grouped silu_mul_rotate: {e}"))?;
+
+            // Grouped down GEMM: gathers rot rows (x_row_div=1) → y_down_grouped.
+            // The per-dtype dispatcher picks i8 MMQ (gfx1151) vs FP16 WMMA.
+            let ddt = layer.experts[0].down.gpu_dtype;
+            match ddt {
+                DType::MQ3G256Lloyd => gpu
+                    .gemm_mq3g256_lloyd_moe_grouped(
+                        &layer.expert_down_ptrs,
+                        g_tiles,
+                        g_sorted,
+                        &rot,
+                        g_y_dn,
+                        hidden,
+                        inter,
+                        1,
+                        m_total_max,
+                        b * k_top,
+                    )
+                    .map_err(|e| format!("minimax L{l} grouped down mq3l: {e:?}"))?,
+                DType::MQ2G256Lloyd => gpu
+                    .gemm_mq2g256_lloyd_moe_grouped(
+                        &layer.expert_down_ptrs,
+                        g_tiles,
+                        g_sorted,
+                        &rot,
+                        g_y_dn,
+                        hidden,
+                        inter,
+                        1,
+                        m_total_max,
+                        b * k_top,
+                    )
+                    .map_err(|e| format!("minimax L{l} grouped down mq2l: {e:?}"))?,
+                other => {
+                    return Err(format!(
+                        "minimax L{l} grouped down dtype {other:?} unsupported"
+                    ));
+                }
+            }
+
+            // Weighted combine (inverse_perm + topk_w) → x in-place (residual).
+            gpu.moe_down_combine_grouped_k8(g_y_dn, g_inv, &topk_w, &x, hidden, k_top, b)
+                .map_err(|e| format!("minimax L{l} grouped combine: {e:?}"))?;
+            continue;
+        }
 
         let edt = layer.experts[0].gate_up.gpu_dtype;
         match edt {
@@ -1012,7 +1266,7 @@ pub fn forward_batch(
             other => {
                 return Err(format!(
                     "minimax L{l} forward_batch: gate_up dtype {other:?} has no batched kernel yet"
-                ))
+                ));
             }
         }
 
@@ -1073,10 +1327,23 @@ pub fn forward_batch(
                     b,
                 )
                 .map_err(|e| format!("minimax L{l} batch down mq2l: {e:?}"))?,
+            DType::MQ3G256Lloyd => gpu
+                .deepseek4_gemv_mq3g256_lloyd_moe_down_residual_scaled_indexed_batched_k4(
+                    &layer.expert_down_ptrs,
+                    &topk_idx,
+                    &topk_w,
+                    &rot,
+                    &x,
+                    hidden,
+                    inter,
+                    k_top,
+                    b,
+                )
+                .map_err(|e| format!("minimax L{l} batch down mq3l: {e:?}"))?,
             other => {
                 return Err(format!(
                     "minimax L{l} forward_batch: down dtype {other:?} has no batched kernel yet"
-                ))
+                ));
             }
         }
     }
@@ -1116,6 +1383,16 @@ pub fn forward_batch(
         pos_array,
         x_last,
     ] {
+        gpu.free_tensor(t).ok();
+    }
+    // Grouped-MoE scratch (only allocated when the grouped path ran). GpuTensor
+    // has no Drop, so free explicitly.
+    for t in [
+        g_counts, g_offsets, g_sorted, g_tiles, g_inv, g_y_gu, g_y_dn,
+    ]
+    .into_iter()
+    .flatten()
+    {
         gpu.free_tensor(t).ok();
     }
     Ok(logits)
@@ -1459,7 +1736,7 @@ pub fn forward_ep(
     }
 
     // 2. Per-layer EP program (Attend replicated; Moe all-reduce-EP'd).
-    let timing = std::env::var("HIPFIRE_EP_DECODE_TIMING").is_ok();
+    let timing = hipfire_config::developer_var("HIPFIRE_EP_DECODE_TIMING").is_ok();
     let t_layers = std::time::Instant::now();
     // Caller-owned policy: the EP mesh IS policy.mesh() — no local rect
     // reconstruction. Per-layer plans are borrowed by layer from the
@@ -2836,5 +3113,59 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{kind:?}=1 rank-one named mesh must pass: {e}"));
             assert_eq!(calls.get(), 1, "{kind:?}=1 must acquire exactly once");
         }
+    }
+
+    #[test]
+    fn grouped_moe_accepts_only_implemented_lloyd_pairs() {
+        assert!(grouped_moe_dtypes_supported(
+            DType::MQ2G256Lloyd,
+            DType::MQ2G256Lloyd
+        ));
+        assert!(grouped_moe_dtypes_supported(
+            DType::MQ2G256Lloyd,
+            DType::MQ3G256Lloyd
+        ));
+        assert!(!grouped_moe_dtypes_supported(
+            DType::MQ2G256Lloyd,
+            DType::MQ4G256
+        ));
+        assert!(!grouped_moe_dtypes_supported(
+            DType::MQ4G256,
+            DType::MQ3G256Lloyd
+        ));
+    }
+
+    #[test]
+    fn grouped_moe_accepts_only_minimax_m2_topology() {
+        assert!(grouped_moe_topology_supported(256, 8));
+        assert!(!grouped_moe_topology_supported(16, 8));
+        assert!(!grouped_moe_topology_supported(256, 4));
+    }
+
+    #[test]
+    fn large_batch_accepts_only_minimax_m2_production_topology() {
+        let mut cfg = MiniMaxConfig {
+            vocab_size: 200064,
+            hidden_size: 3072,
+            num_hidden_layers: 62,
+            num_attention_heads: 48,
+            num_key_value_heads: 8,
+            head_dim: 128,
+            intermediate_size: 1536,
+            num_local_experts: 256,
+            num_experts_per_tok: 8,
+            rotary_dim: 64,
+            rope_theta: 5_000_000.0,
+            rms_norm_eps: 1e-6,
+            max_position_embeddings: 204800,
+            use_qk_norm: true,
+            use_routing_bias: true,
+            scoring_func: "sigmoid".to_string(),
+            num_mtp_modules: 3,
+            reap_keep: None,
+        };
+        assert!(large_batch_topology_supported(&cfg));
+        cfg.num_local_experts = 16;
+        assert!(!large_batch_topology_supported(&cfg));
     }
 }

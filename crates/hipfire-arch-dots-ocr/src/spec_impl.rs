@@ -89,6 +89,14 @@ impl SpecTarget for DotsOcrBundle {
         self
     }
 
+    fn reset_recurrent(&mut self, _gpu: &mut Gpu) -> Result<(), String> {
+        // Pure attention: no recurrent state to zero. Rewind the KV
+        // position cursor so the next prefill writes from slot 0.
+        // Mirrors the Qwen2 reset path (qwen2 spec_impl.rs).
+        self.state.reset();
+        Ok(())
+    }
+
     fn new_spec_scratch(
         &mut self,
         _gpu: &mut Gpu,
@@ -102,9 +110,14 @@ impl SpecTarget for DotsOcrBundle {
         gpu: &mut Gpu,
         tokens: &[u32],
         start_pos: usize,
+        reset: bool,
         abort: &dyn Fn() -> bool,
         _hidden_out: Option<&mut Vec<f32>>,
     ) -> Result<SpecAdvance, String> {
+        if reset {
+            self.reset_recurrent(gpu)
+                .map_err(|e| format!("dots-ocr spec_advance reset: {e}"))?;
+        }
         self.state.next_pos = start_pos;
         for &tok in tokens {
             if abort() {
@@ -122,7 +135,10 @@ impl SpecTarget for DotsOcrBundle {
         let last_argmax = gpu
             .argmax_f32(&self.state.logits, self.config.text.vocab_size)
             .map_err(|e| format!("{e:?}"))?;
-        Ok(SpecAdvance::Ready { last_argmax })
+        Ok(SpecAdvance::Ready {
+            last_argmax,
+            last_logits: None,
+        })
     }
 
     fn verify_block(

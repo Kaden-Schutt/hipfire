@@ -1,7 +1,7 @@
 {
   "name": "hipfire-kernel-tuning",
-  "version": "0.1.0",
-  "description": "Optimize hipfire HIP/compute kernels — pick a tuning lever (multi-row, K-tile depth, prefetch, wave-size port, WMMA/MFMA, fused projections, ISA flags) and validate the win across the supported RDNA arch matrix. Codifies the empirical methodology from this repo's actual perf history: wave64 CDNA3 port (4105035, +2× decode), nontemporal-load fake-win revert (34eb024, −13% caught only by clean-baseline bisect), gfx12 WMMA contributor-port (PR #56), gfx11 WMMA silent-corruption fix (b7ac66a). Use when you have a hot kernel identified by the profiler and need to pick the right lever + validate the win without regressing other archs.",
+  "version": "0.2.0",
+  "description": "Optimize hipfire HIP/compute kernels already on the supported RDNA/CDNA matrix: pick one lever (multi-row, K-tile, prefetch, wave-size port, WMMA/MFMA sibling, fused projection, ISA flags, perf-variant allowlist), validate with the narrow VALIDATION.md route, and keep unmeasured arches on portable fallbacks. Case studies are dated evidence (wins, reverts, nulls)—not live floors. Use when a profiler-hot kernel needs a real win without cross-arch regressions or capability-predicate perf selection.",
   "triggers": [
     "tune kernel",
     "optimize gemv",
@@ -15,7 +15,13 @@
     "K-tile depth",
     "wave64 port",
     "wmma performance",
-    "rdna kernel tuning"
+    "rdna kernel tuning",
+    "fake win bisect",
+    "perf variant allowlist",
+    "cross-arch kernel regression",
+    "nontemporal load kernel",
+    "LDS staged X share",
+    "speed-gate kernel change"
   ],
   "entry": "./playbook.md",
   "interpret": "./playbook.md",
@@ -26,13 +32,14 @@
     "case-studies": "./case-studies.md"
   },
   "requires": {
-    "rocm": "6.0+",
-    "hipfire-tree": "checkout of https://github.com/Kaden-Schutt/hipfire",
-    "hardware": "the target GPU arch (perf claims must be validated on the same arch as the speed-baseline)"
+    "rocm": "checkout- and target-arch-supported ROCm/HIP toolchain (no universal version floor; e.g. gfx1151-class and gfx12 paths need the toolchain the tree documents for that arch)",
+    "hipfire-tree": "checkout of https://github.com/warpfront/hipfire",
+    "hardware": "target GPU arch for any perf claim; unmeasured arches stay on portable/opt-in paths"
   },
   "related": [
     "hipfire-arch-port",
     "hipfire-tester",
+    "hipfire-kernel-atlas",
     "hipfire-autoheal"
   ]
 }

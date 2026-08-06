@@ -39,6 +39,7 @@ fn main() {
         max_seq: 2048,
         draft_path: None,
         kv_mode_override: None,
+        kv_backend: hipfire_runtime::kv_backend::KvBackend::Contiguous,
         kv_adaptive_override: None,
         state_quant_override: None,
         cask: &cask,
@@ -81,10 +82,10 @@ fn main() {
             let mut hidden_out: Vec<f32> = Vec::new();
             let no_abort = || false;
             let adv = bundle
-                .spec_advance(gpu, &prompt, 0, &no_abort, Some(&mut hidden_out))
+                .spec_advance(gpu, &prompt, 0, true, &no_abort, Some(&mut hidden_out))
                 .expect("spec_advance");
             match adv {
-                SpecAdvance::Ready { last_argmax } => {
+                SpecAdvance::Ready { last_argmax, .. } => {
                     eprintln!("[task2]   spec_advance Ready, last_argmax={last_argmax}");
                 }
                 other => panic!("expected SpecAdvance::Ready, got {other:?}"),

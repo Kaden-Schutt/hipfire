@@ -1,6 +1,6 @@
 # Ship 6 — qwen2 + dots-ocr forward-as-pipeline lowering
 
-> **Context:** [#397 comment 4650169388](https://github.com/Kaden-Schutt/hipfire/issues/397#issuecomment-4650169388) — Kaden's handoff of the two remaining dense arches to the lowered `run_layer_program` substrate. Four complex arches (qwen35, minimax, deepseek4, lfm2moe) are already live + default-on. **qwen2 (arch 7)** and **dots-ocr (arch 8)** are the stragglers; both still run on `execute_steps`.
+> **Context:** [#397 comment 4650169388](https://github.com/warpfront/hipfire/issues/397#issuecomment-4650169388) — Kaden's handoff of the two remaining dense arches to the lowered `run_layer_program` substrate. Four complex arches (qwen35, minimax, deepseek4, lfm2moe) are already live + default-on. **qwen2 (arch 7)** and **dots-ocr (arch 8)** are the stragglers; both still run on `execute_steps`.
 >
 > **Review history:** adjudicated against Gemini 3.5 Flash + Claude Opus reviews (`findings/qwen2-lowering-plan-rev-{gemini,claude}.md`). See `findings/qwen2-lowering-plan-adjudication.md` for per-claim verdicts.
 

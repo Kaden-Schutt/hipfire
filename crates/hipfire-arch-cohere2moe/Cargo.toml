@@ -15,6 +15,7 @@ default = ["deltanet"]
 deltanet = ["hipfire-runtime/deltanet", "rdna-compute/deltanet"]
 
 [dependencies]
+hipfire-config = { path = "../hipfire-config" }
 hipfire-runtime = { path = "../hipfire-runtime" }
 hipfire-dispatch = { path = "../hipfire-dispatch", features = ["from-hip-error"] }
 hipfire-hardware = { path = "../hipfire-hardware" }

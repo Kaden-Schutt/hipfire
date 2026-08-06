@@ -1,55 +1,63 @@
 # Quantize
 
-`hipfire quantize` is a CPU-only tool that converts model weights into
-hipfire's native quantized formats. Three input shapes are supported.
-Output is a single file the daemon mmaps directly.
+`hipfire quantize` is the user-facing wrapper around the CPU-only
+`hipfire-quantize` binary. It converts HuggingFace safetensors, a local
+model directory, or a GGUF file into hipfire’s HFQM container (extensions
+`.mq4`, `.hf4`, `.mq6`, …). The daemon mmaps the result directly.
+
+Design / math: [QUANTIZATION.md](QUANTIZATION.md).
+HFP4 family detail: [quant-formats/hfp4.md](quant-formats/hfp4.md).
 
 ## Pick a format
 
-| Format | Bitwidth | Rotation | When to use |
+| Format | Bitwidth | Rotation | Typical use |
 |---|---|---|---|
-| `mq4` | 4-bit | FWHT (rotated) | Qwen 3.5+ targets — calibrated for the DeltaNet hybrid attention path. Default for safetensors input. |
-| `mq6` | 6-bit | FWHT (rotated) | Qwen 3.5+ when you can spare +47% file size for quality. |
-| `hf4` | 4-bit | none | Dense models (Llama, Mistral, Gemma, older Qwen). Default for GGUF input. |
-| `hf6` | 6-bit | none | Dense, higher quality. |
+| `mq4` | 4 | FWHT | Qwen 3.5+ (DeltaNet hybrid). **Default for safetensors / HF input.** |
+| `mq6` | 6 | FWHT | Qwen 3.5+ when you can spare ~+47% size for quality |
+| `hf4` (`hfq4`, `hfq4g256`) | 4 | none | Dense Llama / Mistral / Gemma / older Qwen. **Default for GGUF.** |
+| `hf6` (`hfq6`, `hfq6g256`) | 6 | none | Dense, higher quality |
+| `q8` / `q8f16` | 8 | none | Reference / debug (safetensors path) |
+| `mq3` | 3 | FWHT | Sub-4-bit — **`hipfire-quantize` direct only** (thin `hipfire quantize` rejects it); quality-sensitive — see QUANTIZATION.md |
+| `hfp4` / `mfp4` / E8 / Lloyd | varies | see docs | Advanced; usually via `hipfire-quantize` directly |
 
-The FWHT rotation in MQ4/MQ6 redistributes weight outliers across each
-group before quantization. The Qwen 3.5 hot path applies the inverse
-rotation in its kernels at inference; the Llama path can also undo it
-via `gemv_mq4g256_with_rotate`, but adds runtime overhead with no
-quality benefit on a model that wasn't trained against that weight
-space. **MQ4 on a Llama-style dense model is correct math but slower
-inference and no better quality** — pick HF4.
+FWHT (the “M” in MQ) applies the two-sign rotation
+`R = D2 · H · D1 / 16` (seeds 42 / 1042) before quantization. Qwen 3.5+ kernels
+apply the **same** `R` to activations (`rotate_x_mq`), not an inverse. On
+Llama-style dense models MQ is correct math but adds rotate cost with little
+quality benefit — prefer HFQ.
+
+**Thin CLI allowlist** (`hipfire quantize`): `mq4`, `mq6`, `q8`, `q8f16`, and
+`hf4`/`hf6` aliases only. **GGUF input** further narrows to `hf4`, `hf6`,
+`mq4`, `mq6`. Formats such as `mq3`, HFP/MFP, Lloyd, and graded MoE need
+`hipfire-quantize` directly.
+
+**Not produced by the thin CLI path:** graded per-expert MoE recipes
+(`mq4p`, tiered Lloyd, imatrix/Hessian GPTQ-E8, REAP overlays). Those need
+extra flags (`--imatrix`, `--hessian-dir`, `--allow-mq*-lloyd`, …) on
+`hipfire-quantize` directly. See the binary’s `--help` and QUANTIZATION.md.
+
+Research / reserved formats require explicit opt-in on the binary:
+
+| Flag / env | Opens |
+|---|---|
+| `--allow-mq2` / `HIPFIRE_ALLOW_MQ2=1` | uniform `mq2` (reserved — collapses) |
+| `--allow-mq2-lloyd` | `mq2-lloyd` |
+| `--allow-mq3-lloyd` | `mq3-lloyd` |
+| `--allow-mq4-lloyd` | `mq4-lloyd` |
 
 ## From HuggingFace
 
 ```bash
 hipfire quantize Jackrong/Qwopus3.5-4B-v3 \
-    --both                                     # mq4 + mq6 in one shot
+    --both \
     --upload schuttdev/hipfire-qwopus-4b \
     --create-repo \
     --install \
     --register qwopus:4b
 ```
 
-Auto-downloads the safetensors into `~/.hipfire/hf-cache/`, quantizes
-once per `--format`, optionally uploads each output as its own file in
-the target HF repo, copies into `~/.hipfire/models/`, and registers a
-local alias.
-
-Useful flags:
-
-| Flag | Purpose |
-|---|---|
-| `--format <fmt>` | Repeatable. Defaults: `mq4` (safetensors), `hf4` (GGUF). |
-| `--both` | Shorthand for `--format mq4 --format mq6`. |
-| `-o, --output <path>` | Single-format output path. |
-| `--output-dir <dir>` | Multi-format output directory. |
-| `--stem <name>` | Override the output basename. |
-| `--upload <owner/repo>` | Push outputs to HuggingFace. |
-| `--create-repo` | Create the HF repo if missing. |
-| `--install` | Copy outputs into `~/.hipfire/models/`. |
-| `--register <tag>` | Add a local alias so `hipfire run <tag>` works. |
+Downloads into `~/.hipfire/hf-cache/`, quantizes once per `--format`, optionally
+uploads, copies into `~/.hipfire/models/`, and registers a local alias.
 
 ## From a local safetensors directory
 
@@ -57,118 +65,123 @@ Useful flags:
 hipfire quantize ./my-finetune/ --format mq4 -o my-finetune.mq4
 ```
 
-Directory must contain `config.json` plus one or more `.safetensors`
-files. Architectures the engine actually loads at inference: `llama`,
-`qwen3`, `qwen3_5`, `qwen3_5_moe`. The quantizer accepts any
-architecture — the file just won't run if the engine has no matching
-loader.
+Directory needs `config.json` plus one or more `.safetensors` files. The
+quantizer accepts many architectures; inference only runs if a carrier/loader
+exists for that `arch_id` (see [architecture-ids.md](architecture-ids.md)).
 
 ## From GGUF
 
 ```bash
 hipfire quantize ./tinyllama.Q4_K_M.gguf \
     --install --register tinyllama:1b-gguf
+# default --format hf4 → …hf4
+
+hipfire quantize ./qwen3.5.Q4_K_M.gguf --format mq4 \
+    --install --register q35:9b-gguf
 ```
 
-Default `--format` for GGUF is `hf4`. Override with `--format mq4` (or
-`mq6`) only when the source is a Qwen 3.5+ family GGUF.
+GGUF tensor names are rewritten to HuggingFace-style names so
+`load_weights_hfq` works. Tokenizer fields (`tokenizer.ggml.tokens` / merges /
+bos/eos / model) are preserved under `gguf_meta` in the metadata blob;
+`Tokenizer::from_hfq_metadata` reads them — the original GGUF need not stay on
+disk.
 
-GGUF tensor names get translated to HuggingFace safetensors style at
-write time so the engine's standard `load_weights_hfq` consumes the
-output:
+Per-tensor selection in the GGUF pipeline:
 
-```
-token_embd.weight       → model.embed_tokens.weight
-output.weight           → lm_head.weight
-output_norm.weight      → model.norm.weight
-blk.{i}.attn_q.weight   → model.layers.{i}.self_attn.q_proj.weight
-blk.{i}.ffn_gate.weight → model.layers.{i}.mlp.gate_proj.weight
-...
-```
-
-The GGUF tokenizer (`tokenizer.ggml.tokens` / `merges` /
-`bos_token_id` / `eos_token_id` / `model`) is preserved verbatim under
-`gguf_meta` in the `.hf4` / `.mq4` metadata blob. The engine's
-`Tokenizer::from_hfq_metadata` reads it directly — no need to keep the
-original GGUF on disk.
-
-Per-tensor format selection in the GGUF pipeline:
-
-| Tensor shape | Format |
+| Tensor | Format |
 |---|---|
-| 1D norm / scale (`*_norm.weight`) | F16 (precision-sensitive, small) |
-| `token_embd.weight` (the embedding) | Q8F16 (Q4-grade is too lossy) |
-| 2D weight, `K % 256 == 0` | per `--format` (mq4 / mq6 / hf4 / hf6) |
-| 2D weight, K not divisible by 256 | HFQ4-G128 (no rotation fallback) |
+| 1D norm / scale | F16 |
+| embedding (`token_embd`) | Q8F16 |
+| 2D weight, `K % 256 == 0` | chosen `--format` |
+| 2D weight, K not multiple of 256 | HFQ4-G128 fallback (no rotation) |
 
-Source GGUF dequant types supported:
+Supported source GGUF dequant types: `Q4_0`, `Q8_0`, `Q4_K`, `Q5_K`, `Q6_K`,
+`F16`, `BF16`, `F32`. Unsupported (quantizer errors on encounter): `Q5_0`,
+`Q5_1`, and IQ* families.
 
+### Quality caveat (GGUF)
+
+GGUF is **double quantization**: dequant already-lossy weights, then requantize.
+Expect worse quality than full-precision safetensors of the same model. Prefer
+HF6/MQ6 if disk allows, or quantize from original safetensors.
+
+## CLI flags (`hipfire quantize`)
+
+| Flag | Purpose |
+|---|---|
+| `--format <fmt>` | Repeatable. Default: `mq4` (safetensors); `hf4` (GGUF). |
+| `--both` | Shorthand for `--format mq4 --format mq6` |
+| `-o, --output <path>` | Single-format output path |
+| `--output-dir <dir>` | Multi-format output directory |
+| `--stem <name>` | Override output basename |
+| `--upload <owner/repo>` | Push outputs to HuggingFace |
+| `--create-repo` | Create HF repo if missing |
+| `--install` | Copy into `~/.hipfire/models/` |
+| `--register <tag>` | Local alias for `hipfire run <tag>` |
+
+Build the binary if missing:
+
+```bash
+cargo build --release -p hipfire-quantize
 ```
-Q4_0  Q8_0  Q4_K  Q6_K  F16  BF16  F32
-```
 
-Q5_K, Q5_0, Q5_1, IQ2_*, IQ3_*, IQ4_* are not implemented. The
-quantizer panics on encounter. Adding one is a ~150-line port from
-llama.cpp's `ggml-quants.c` to `crates/hipfire-quantize/src/gguf_input.rs`.
+The CLI searches `target/release/hipfire-quantize` and
+`~/.hipfire/bin/hipfire-quantize`.
 
-## Quality caveat for GGUF
+## Direct `hipfire-quantize` (advanced)
 
-GGUF input is double-quantization: the source weights are already
-quantized once (typically Q4_K_M), and you're requantizing the
-dequantized values. Each step accumulates error. Expect lower output
-quality than quantizing from full-precision safetensors of the same
-model. Mitigations:
+Same formats plus MoE/REAP/AWQ/GPTQ controls. Common extras:
 
-- Pick HF6 / MQ6 if you have the disk space — the extra two bits
-  absorb most of the double-quant noise.
-- If you have access to the original safetensors, prefer that
-  pipeline.
+| Flag | Role |
+|---|---|
+| `--input` / `--output` | Paths |
+| `--format` | Full alias set (`mq3`, `hfp4`, `mfp4`, `mfp4e8`, `mq3lloyd`, …) |
+| `--imatrix <gguf>` | llama.cpp imatrix for activation-aware recipes |
+| `--hessian-dir <dir>` | GPTQ-E8 Hessians |
+| `--awq` / `--awq-alpha` | AWQ pre-scale (default alpha 0.55) |
+| `--kmap-dense` / `--kmap-mode` / `--no-kmap` / `--uniform` | K-map promotion policy |
+| `--q8-router` / `--no-q8-conv1d` | Protect routers / conv1d |
+| `--reap-overlay` / `--reap-bake` / `--reap-out` / `--reap-arch` | REAP plan paths |
+| `--arch-id` / `--force-arch-id` | Override written arch_id (qwen3* pillar guarded) |
+| `--threads` / `HIPFIRE_QUANT_THREADS` | CPU thread cap (default ~80% cores) |
+| `--include-vision` / `--vision-quant` | Vision tensors |
+| `--allow-mq2` / `--allow-mq*-lloyd` | Research gates |
 
-## Runtime
+Graded MoE and E8 recipes are intentionally outside the thin `hipfire quantize`
+help surface so accidental low-quality artifacts are harder to produce.
 
-Quantization is CPU-bound and memory-bandwidth limited. Approximate
-wall times on a modern desktop CPU:
+## Runtime cost
+
+CPU- and memory-bandwidth bound. Rough desktop wall times (order-of-magnitude,
+not a guarantee):
 
 | Model size | Wall time |
 |---|---|
-| 1B | 5–10 s |
-| 4B | 30–60 s |
-| 9B | 1–2 min |
-| 27B | 4–8 min |
+| ~1B | tens of seconds |
+| ~4B | ~1 min |
+| ~9B | a few minutes |
+| ~27B | several–tens of minutes |
 
-`hipfire-quantize` defaults to 80% of available cores; cap with
-`--threads N` or `HIPFIRE_QUANT_THREADS=N`. Memory peak is roughly
-`max(weight tensor size) × 4` (a single tensor dequantized to f32).
+Peak RAM is roughly `max(tensor elements) × 4` (one tensor dequantized to f32).
 
-## After quantizing: generating a sidecar for CASK eviction
+## After quantizing: CASK sidecar
 
-After you've quantized your own model, generate the KV cache calibration
-sidecar so that CASK can perform intelligent key-value retention on long
-context prompts. Without it, all positions are treated equally and early
-tokens (which often carry critical instructions) may be evicted.
+For long-context CASK eviction calibration:
 
 ```bash
 hipfire sidecar-gen my-finetune.mq4 --corpus /path/to/corpus.txt
+# or via registered tag:
+hipfire sidecar-gen finetune:1b --corpus /path/to/corpus.txt
 ```
 
-The sidecar is written as `my-finetune.mq4.triattn.bin` next to your
-model file by default. The daemon auto-discovers it when you enable a
-CASK profile with `hipfire config cask-profile balanced`. See
-[CLI.md](CLI.md) for full flag details.
+Writes `my-finetune.mq4.triattn.bin` beside the model by default. The daemon
+does not attach it by default. Set `cask_sidecar` to the exact path, or opt into
+sibling discovery with `cask_auto_attach=true`. Set `cask=true` separately only
+when core-aware m-folding is intended. See [CONFIG.md](CONFIG.md).
 
-> **Tip:** If you're quantizing from a HuggingFace safetensors source,
-> use `--install` to copy your model into the models directory, then
-> generate the sidecar using either the file path or the registered tag:
->
-> ```bash
-> hipfire quantize ./my-finetune/ --format mq4 -o my-finetune.mq4 \\
->     --install --register finetune:1b
-> # Then generate the sidecar (either works):
-> hipfire sidecar-gen my-finetune.mq4 --corpus /path/to/corpus.txt
-> # or, if you prefer using the alias:
-> hipfire sidecar-gen finetune:1b --corpus /path/to/corpus.txt
-> ```
->
-> The tag-based form works because `sidecar-gen` resolves local model
-> aliases (registered via `--register`). For HuggingFace models not yet
-> installed locally, use the file path instead.
+## Related
+
+- Formats and KV: [QUANTIZATION.md](QUANTIZATION.md)
+- Models / aliases: [MODELS.md](MODELS.md)
+- CLI surface: [CLI.md](CLI.md)
+- Sources: `crates/hipfire-cli/src/main.rs`, `crates/hipfire-quantize`

@@ -16,6 +16,7 @@
 # Dev / dist
 /dev/
 /dist/
+cli/node_modules/
 
 # Models (large binaries)
 /models/
@@ -71,6 +72,10 @@ CLAUDE.local.md
 # Training artifacts (draft ckpts, converted hfq, prompt files, logs)
 .dflash-runs/
 artifacts/
+!crates/radiowave/tests/artifacts/
+!crates/radiowave/tests/artifacts/*.json
+!crates/radiowave/tests/artifacts/recipes/
+!crates/radiowave/tests/artifacts/recipes/*.json
 .codeinsight
 .codeinsight+research/
 .local-bench-scratch/
@@ -138,3 +143,7 @@ docs/investigations/*/sources/
 *_results.csv
 *.rocpd
 *.pftrace
+
+# Local research scratch (agent surveys, microbenches)
+.research/
+.slim/deepwork/

@@ -240,7 +240,7 @@ impl DeepseekV4Config {
         // New generic env HIPFIRE_REAP_PLAN=<dir> (reap_plan.json); legacy
         // HIPFIRE_DEEPSEEK4_REAP_KEEPMAP=<dir> (keep_by_layer.json) is still
         // honored as a keep-only alias via ReapPlan::load_any.
-        if let Some(plan) = hipfire_reap::plan::ReapPlan::from_env(
+        if let Some(plan) = hipfire_reap::plan::ReapPlan::from_config(
             "deepseek4",
             Some("HIPFIRE_DEEPSEEK4_REAP_KEEPMAP"),
             config.num_hidden_layers,
@@ -968,6 +968,39 @@ pub struct MainAttentionLayerState {
     pub gathered_v: Option<rdna_compute::GpuTensor>,
 }
 
+/// Reusable host buffers for the hash-router FALLBACK path in
+/// `ffn_hash_routed` (when `layer.tid2eid_dev` is missing). Clear+reuse
+/// across hash-routed layers; capacity sized to `num_experts_per_tok`.
+#[derive(Debug, Default)]
+pub struct HashTopkHostScratch {
+    pub topk_ids: Vec<u32>,
+    pub idx_i32: Vec<i32>,
+    pub idx_bytes: Vec<u8>,
+    pub w_scaled: Vec<f32>,
+    pub w_bytes: Vec<u8>,
+}
+
+impl HashTopkHostScratch {
+    pub fn with_capacity(k: usize) -> Self {
+        Self {
+            topk_ids: Vec::with_capacity(k),
+            idx_i32: Vec::with_capacity(k),
+            idx_bytes: Vec::with_capacity(k * 4),
+            w_scaled: Vec::with_capacity(k),
+            w_bytes: Vec::with_capacity(k * 4),
+        }
+    }
+
+    /// Drop lengths to 0 while keeping capacity for the next layer.
+    pub fn clear(&mut self) {
+        self.topk_ids.clear();
+        self.idx_i32.clear();
+        self.idx_bytes.clear();
+        self.w_scaled.clear();
+        self.w_bytes.clear();
+    }
+}
+
 /// DeepSeek V4 per-decode state. Held on the daemon's per-session struct,
 /// reused across decode steps. Allocated once via `new_state`.
 pub struct DeepseekV4State {
@@ -1271,6 +1304,12 @@ pub struct DeepseekV4State {
     /// Lazily allocated by `capture_seed_main_hidden` / `new_spec_scratch`.
     pub dspark_verify_pbs: Option<crate::forward::PrefillBatchScratch>,
 
+    /// Host-side top-K scratch for the hash-router FALLBACK arm in
+    /// `ffn_hash_routed` (when `layer.tid2eid_dev` is missing). Sized to
+    /// `num_experts_per_tok` and reused across hash-routed layers so the
+    /// d2h/host-gather/h2d path does not allocate per layer.
+    pub hash_topk_host: HashTopkHostScratch,
+
     /// Monotonic position counter — how many tokens this session has
     /// processed. Used to compute the SWA cache slot (`pos % window`)
     /// and number of valid cached positions.
@@ -1376,6 +1415,7 @@ impl DeepseekV4State {
             dspark_cap_ones: None,
             dspark_main_hidden: None,
             dspark_verify_pbs: None,
+            hash_topk_host: HashTopkHostScratch::with_capacity(cfg.num_experts_per_tok),
             n_tokens: 0,
             _scaffold: (),
         })

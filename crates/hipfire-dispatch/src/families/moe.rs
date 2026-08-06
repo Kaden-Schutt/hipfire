@@ -30,9 +30,10 @@ use crate::types::*;
 
 // ── MoE eligibility lattice ────────────────────────────
 
-/// Routed-expert tiers the mixed-tier bucketed decode path can execute: the
-/// tiers for which per-tier indexed gate_up/down GEMV kernels exist (see
-/// `run_moe_decode_mixed`). A per-expert tier table containing any other DType
+/// Routed-expert tiers the mixed-tier graded decode path can execute: the
+/// tiers for which per-tier indexed gate_up/down GEMV kernels exist (served
+/// on-device via `run_moe_decode`'s `expert_dtype_tags` branch). A per-expert
+/// tier table containing any other DType
 /// cannot be served by the mixed path and is rejected up front with a clear
 /// error rather than failing deep in the per-bucket dispatch.
 pub const MIXED_SUPPORTED_TIERS: [DType; 3] = [DType::MQ4G256, DType::MQ6G256, DType::ParoQ4G128];
@@ -408,6 +409,10 @@ pub struct MoeParams<'a> {
     pub n_exp: usize,
     pub norm_topk_prob: bool,
     pub x_rot_prerotated: bool,
+    /// Single-GPU lowered-decode experiment: leave the atomic-free routed
+    /// output expanded so the architecture layer can combine it into the
+    /// residual while producing the next layer's normalized activation.
+    pub defer_routed_combine: bool,
     /// Safetensors layer index (== `MoeFfnWeights.layer_idx`). Only used
     /// by native GPTQ-on-E8 Hessian capture in the CPU-top-K fallback to
     /// build the per-(tensor,expert) key; ignored on the hot path.
@@ -850,7 +855,7 @@ impl MoeFamily {
     ///
     /// Takes no `DispatchCtx`: the bias-aware path dispatches fixed MQ2-Lloyd
     /// kernels with no arch-gated sub-dispatch, so building a `DispatchCtx`
-    /// per layer per token (an uncached `FeatureFlags::from_env` parse) would
+    /// per layer per token (an uncached generic policy parse) would
     /// be pure waste on the decode hot path.
     pub fn run_bias_aware(
         &self,
@@ -3322,6 +3327,7 @@ mod tests {
             x_residual: f.t(1),
             routed_out: None,
             skip_shared: false,
+            defer_routed_combine: false,
             router: f.w(2, DType::MQ4G256, 8, 512),
             shared_expert_gate: f.w(3, DType::MQ4G256, 1, 512),
             shared_gate_w: f.w(4, DType::MQ4G256, 128, 512),
@@ -4637,6 +4643,7 @@ mod tests {
                 x_residual: &self.x_residual,
                 routed_out: None,
                 skip_shared: false,
+                defer_routed_combine: false,
                 router: self.weight(&self.router_buf, DType::MQ4G256, PH_N_EXP, PH_HIDDEN),
                 shared_expert_gate: self.weight(
                     &self.shared_expert_gate_buf,
@@ -5411,7 +5418,7 @@ mod tests {
         d: &MoeDtypes,
         grouped: bool,
     ) -> MoePrefillResolution {
-        let mut flags = rdna_compute::feature_flags::FeatureFlags::from_env_for_test("gfx1151");
+        let mut flags = rdna_compute::feature_flags::FeatureFlags::for_test("gfx1151");
         flags.moe_grouped_gemm = grouped;
         let arch =
             rdna_compute::arch_caps::ArchCaps::new("gfx1151", std::sync::Arc::new(flags.clone()));

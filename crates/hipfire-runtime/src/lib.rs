@@ -31,10 +31,12 @@ pub mod dflash;
 pub mod dflash_generic;
 pub mod dspark_block_controller;
 pub mod dspark_core;
+pub mod ep;
 pub mod eval_common;
 pub mod gguf;
 pub mod hfq;
 pub mod kv_adaptive;
+pub mod kv_backend;
 pub mod kv_mode;
 pub mod llama;
 pub mod llama_spec;
@@ -46,9 +48,11 @@ pub mod moe_plan;
 pub mod multi_gpu;
 pub mod paro;
 pub mod pp_serve;
+pub mod reset_core;
 pub mod safetensors_source;
 pub mod sampler;
 pub mod spec;
+
 pub mod spec_ngram;
 pub mod spec_transcript;
 mod stop_quarantine;
@@ -66,6 +70,10 @@ pub mod emit_text;
 pub mod eos_filter;
 pub mod prompt_frame;
 pub mod stream_parser;
+pub mod semantic;
 pub mod tokenizer;
+
 pub mod tool_call;
 pub mod weight_backend;
+
+pub use crate::arch::{maybe_screen_mmq, screen_weight_tensor, MmqScreenable};

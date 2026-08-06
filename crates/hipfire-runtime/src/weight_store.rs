@@ -475,9 +475,9 @@ impl WeightStoreAssemblyGuard<'_> {
 
     /// Atomic checked replacement: marks the slot before physically freeing
     /// the old buffer, then installs the new handle.  On free failure the
-    /// slot is reset to a marker that owns no buffer (preventing double-free
-    /// on Drop).  On installation failure the new handle is returned with the
-    /// error.
+    /// OLD resident is restored in the slot (it still owns its buffer) and
+    /// the new handle is returned with the error — the new handle was never
+    /// installed, so the caller must release or restore it.
     ///
     /// Unlike [`replace`](Self::replace) and
     /// [`replace_after_free`](Self::replace_after_free), this method:
@@ -485,8 +485,9 @@ impl WeightStoreAssemblyGuard<'_> {
     /// 1. Validates the slot is resident before any free operation.
     /// 2. Sets the slot to `Draining` state.
     /// 3. Frees the old buffer via the provided `free_fn`.
-    /// 4. On free failure, resets the slot to `Present` with a discarded
-    ///    alias marker (no owned buffer).
+    /// 4. On free failure, restores the slot to `Present` with the OLD
+    ///    resident (the buffer was never freed, so the resident remains the
+    ///    single owner and the guard's rollback Drop can free it later).
     /// 5. Installs the new handle on success.
     ///
     /// `free_fn` receives the old [`GpuTensor`] and must attempt to free
@@ -544,34 +545,20 @@ impl WeightStoreAssemblyGuard<'_> {
                 Ok(())
             }
             Err((returned_tensor, msg)) => {
-                // Free failed. Reset slot to a discarded marker so Drop
-                // does not double-free.
-                self.inner.taken[slot].handle =
-                    WeightHandle::Alias("__discarded_after_failed_free__".into());
+                // Free failed. RESTORE the old resident in the slot so the
+                // guard's rollback Drop (or a later abort_checked) can retry
+                // or free it — the buffer was never freed, so the resident
+                // remains the single owner. The new handle was never
+                // installed: return the ACTUAL handle (never an alias marker)
+                // so the caller can release or restore it.
+                self.inner.taken[slot].handle = WeightHandle::Resident(returned_tensor);
                 self.slot_states[slot] = AssemblySlotState::Present;
-
-                // If the slot had a registered origin, preserve it for retry.
-                // Otherwise, the old buffer survives but cannot be retried
-                // (this is only reachable on the legacy non-Frozen path).
-                let origin_opt = self.origins.get(slot).copied().flatten();
-                let mut taken_failures = Vec::new();
-                if let Some(origin) = origin_opt {
-                    taken_failures.push((
-                        slot,
-                        FailedWeightStoreFree {
-                            error: WeightStoreFreeError::DriverError(msg),
-                            allocation: WeightStoreAllocation {
-                                tensor: returned_tensor,
-                                origin,
-                            },
-                        },
-                    ));
-                }
+                let _ = msg;
                 Err((
-                    WeightHandle::Alias("__new_handle_uninstalled__".into()),
+                    new_handle,
                     WeightStoreAssemblyError {
                         store_failures: Vec::new(),
-                        taken_failures,
+                        taken_failures: Vec::new(),
                     },
                 ))
             }
@@ -597,33 +584,51 @@ impl WeightStoreAssemblyGuard<'_> {
         Ok(())
     }
 
-    /// Free an unused resident while rollback ownership is still active. The
-    /// raw non-owning wrapper means a failed `hipFree` leaves the original
-    /// `GpuTensor` in the guard; successful free replaces it with a marker
-    /// alias that owns no buffer. This must happen before `finalize`.
+    /// Free an unused resident while rollback ownership is still active.
+    /// The old handle is consumed out of the slot, its ACTUAL buffer is
+    /// freed, and on failure the handle is restored so the caller can retry.
+    /// A successful free replaces it with a marker alias that owns no buffer.
+    /// This must happen before `finalize`.
     pub fn discard_resident(&mut self, slot: usize) -> Result<(), String> {
-        let (device, ptr, size) = {
+        let (device, old_handle) = {
             let taken = self
                 .inner
                 .taken
-                .get(slot)
+                .get_mut(slot)
                 .ok_or_else(|| format!("assembly slot {slot} is missing"))?;
-            let WeightHandle::Resident(tensor) = &taken.handle else {
+            if !matches!(&taken.handle, WeightHandle::Resident(_)) {
                 return Ok(());
-            };
-            (taken.device, tensor.buf.as_ptr(), tensor.buf.size())
+            }
+            let device = taken.device;
+            let old = std::mem::replace(
+                &mut taken.handle,
+                WeightHandle::Alias("__discarding__".into()),
+            );
+            (device, old)
+        };
+        let WeightHandle::Resident(tensor) = old_handle else {
+            unreachable!("checked resident above");
         };
         let gpu = self
             .inner
             .target
             .device(device)
             .ok_or_else(|| format!("assembly slot {slot} targets missing device {device}"))?;
-        let raw = unsafe { hip_bridge::DeviceBuffer::from_raw(ptr, size) };
-        gpu.hip
-            .free(raw)
-            .map_err(|e| format!("discarding assembly slot {slot} failed: {e:?}"))?;
-        self.inner.taken[slot].handle = WeightHandle::Alias("__discarded__".into());
-        Ok(())
+        match gpu.hip.free_preserving(tensor.buf) {
+            Ok(()) => {
+                self.inner.taken[slot].handle = WeightHandle::Alias("__discarded__".into());
+                Ok(())
+            }
+            Err((buf, e)) => {
+                // Restore the original resident so a later retry can free it.
+                self.inner.taken[slot].handle = WeightHandle::Resident(GpuTensor {
+                    buf,
+                    shape: tensor.shape,
+                    dtype: tensor.dtype,
+                });
+                Err(format!("discarding assembly slot {slot} failed: {e:?}"))
+            }
+        }
     }
 
     /// Consuming abort that tries to free every reserved handle and every
@@ -655,11 +660,10 @@ impl WeightStoreAssemblyGuard<'_> {
 
             if let Some(gpu) = self.inner.target.device(taken.device) {
                 let free_result = if origin.is_some() {
-                    // Tracked slot: use free_preserving for retry.
-                    let raw = unsafe {
-                        hip_bridge::DeviceBuffer::from_raw(tensor.buf.as_ptr(), tensor.buf.size())
-                    };
-                    match gpu.hip.free_preserving(raw) {
+                    // Tracked slot: use free_preserving for retry. The tensor
+                    // is consumed; on failure it is reconstructed from the
+                    // returned buffer so the retry owner stays valid.
+                    match gpu.hip.free_preserving(tensor.buf) {
                         Ok(()) => Ok(()),
                         Err((returned_buf, e)) => Err((
                             GpuTensor {
@@ -671,11 +675,19 @@ impl WeightStoreAssemblyGuard<'_> {
                         )),
                     }
                 } else {
-                    // Legacy untracked slot: regular free.
-                    let raw = unsafe {
-                        hip_bridge::DeviceBuffer::from_raw(tensor.buf.as_ptr(), tensor.buf.size())
-                    };
-                    gpu.hip.free(raw).map_err(|e| (tensor, format!("{e:?}")))
+                    // Legacy untracked slot: free the actual buffer.
+                    gpu.hip
+                        .free_preserving(tensor.buf)
+                        .map_err(|(returned_buf, e)| {
+                            (
+                                GpuTensor {
+                                    buf: returned_buf,
+                                    shape: tensor.shape,
+                                    dtype: tensor.dtype,
+                                },
+                                format!("{e:?}"),
+                            )
+                        })
                 };
 
                 if let Err((returned_tensor, msg)) = free_result {
@@ -705,9 +717,7 @@ impl WeightStoreAssemblyGuard<'_> {
         for ((_, _, dev), handle) in store.placements {
             if let WeightHandle::Resident(t) = handle {
                 if let Some(gpu) = self.inner.target.device(dev) {
-                    let raw =
-                        unsafe { hip_bridge::DeviceBuffer::from_raw(t.buf.as_ptr(), t.buf.size()) };
-                    if let Err(e) = gpu.hip.free(raw) {
+                    if let Err(e) = gpu.hip.free_preserving(t.buf) {
                         // Legacy store entries have no origin tracking —
                         // cannot construct a proper retry owner.
                         // (Only reached on non-Frozen path.)

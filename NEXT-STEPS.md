@@ -11,9 +11,11 @@ gfx1201. This file lists the deliberate follow-ups.
    path (design §2 non-goal: DFlash a fast-follow). Add `maybe_downshift` at the
    `generate_dflash` committed-position site (near the `ev.maybe_evict` calls,
    `daemon.rs:3375`/`3558`), handling spec-decode position semantics (commit
-   only on accepted positions, not tree branches). Must pass
-   `scripts/coherence-gate-dflash.sh` (3-tier attractor thresholds). DFlash perf
-   gates use q8 or FWHT KV — never asym.
+   only on accepted positions, not tree branches). Validate via
+   `scripts/serve_harness.py` (`battery` + `chain`) per
+   [docs/VALIDATION.md](docs/VALIDATION.md) and eyeball the decoded output for
+   attractors — the old `scripts/coherence-gate-dflash.sh` is retired and absent.
+   DFlash perf gates use q8 or FWHT KV — never asym.
 
 2. **Default-on decision.** Adaptive is opt-in (`HIPFIRE_KV_ADAPTIVE=off`
    default). Because it runs the fast high-precision tiers until the cap,

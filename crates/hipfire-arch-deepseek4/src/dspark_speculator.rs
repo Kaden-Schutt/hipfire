@@ -154,6 +154,29 @@ impl DsparkBody for Deepseek4DsparkBody {
         5
     }
 
+    fn reset_for_retry(&mut self, gpu: &mut Gpu) {
+        // Persistently allocated per-stage SWA rings survive free-on-unload
+        // only; cold retry must zero them or the next draft_block reads prior
+        // window main_kv history. Dropping the Option forces lazy re-alloc on
+        // the next draft (identical clean slate to a fresh body).
+        for ring in self.draft_state.dspark_swa_k.drain(..) {
+            if let Some(t) = ring {
+                let _ = gpu.free_tensor(t);
+            }
+        }
+        // Working scratch is fully overwritten each draft_block; still drop
+        // so a retry cannot observe a stale main_x / staged buffer if a later
+        // path short-circuits before rewrite.
+        if let Some(t) = self.draft_state.dspark_main_x.take() {
+            let _ = gpu.free_tensor(t);
+        }
+        if let Some(t) = self.draft_state.dspark_staged.take() {
+            let _ = gpu.free_tensor(t);
+        }
+        // Keep dspark_pbs (pure scratch, sized to block) — next draft overwrites.
+        self.draft_state.n_tokens = 0;
+    }
+
     fn free(self: Box<Self>, gpu: &mut Gpu) {
         // Free draft-local state buffers only (NOT the shallow-cloned weights).
         let mut state = self.draft_state;
@@ -166,6 +189,7 @@ impl DsparkBody for Deepseek4DsparkBody {
             let _ = gpu.free_tensor(t);
         }
         free_opt(gpu, &mut state.dspark_main_x);
+        free_opt(gpu, &mut state.dspark_staged);
         if let Some(pbs) = state.dspark_pbs.take() {
             pbs.free_gpu(gpu);
         }
@@ -248,7 +272,7 @@ pub fn build_deepseek4_dspark_speculator(
         .as_ref()
         .ok_or("build_deepseek4_dspark_speculator: mtp_final_norm missing on last stage")?;
 
-    let conf_threshold = std::env::var("HIPFIRE_DEEPSEEK4_DSPARK_CONF_THRESHOLD")
+    let conf_threshold = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_DSPARK_CONF_THRESHOLD")
         .ok()
         .and_then(|s| s.parse().ok())
         .or(conf_threshold)
@@ -302,5 +326,170 @@ mod send_assertions {
     #[test]
     fn deepseek4_dspark_body_is_send() {
         _assert_send::<super::Deepseek4DsparkBody>();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Minimal config — only fields `DeepseekV4State::new` / body reset need.
+    fn tiny_cfg() -> DeepseekV4Config {
+        DeepseekV4Config {
+            vocab_size: 32,
+            hidden_size: 16,
+            num_hidden_layers: 1,
+            num_attention_heads: 1,
+            num_key_value_heads: 1,
+            head_dim: 8,
+            max_position_embeddings: 64,
+            rms_norm_eps: 1e-6,
+            q_lora_rank: 8,
+            o_lora_rank: 8,
+            qk_rope_head_dim: 4,
+            o_groups: 1,
+            n_routed_experts: 1,
+            n_shared_experts: 0,
+            num_experts_per_tok: 1,
+            moe_intermediate_size: 16,
+            routed_scaling_factor: 1.0,
+            topk_method: "noaux_tc".into(),
+            scoring_func: "sqrtsoftplus".into(),
+            norm_topk_prob: true,
+            swiglu_limit: 10.0,
+            hc_mult: 4,
+            hc_sinkhorn_iters: 1,
+            hc_eps: 1e-6,
+            index_n_heads: 1,
+            index_head_dim: 8,
+            index_topk: 1,
+            compress_ratios: vec![0],
+            compress_rope_theta: 160000.0,
+            rope_theta: 10000.0,
+            rope_scaling_factor: 1.0,
+            rope_scaling_original_max_position_embeddings: 64,
+            rope_scaling_beta_fast: 32,
+            rope_scaling_beta_slow: 1,
+            sliding_window: 8,
+            num_nextn_predict_layers: 0,
+            num_hash_layers: 0,
+            reap_keep: None,
+            load_dspark: true,
+        }
+    }
+
+    fn try_gpu() -> Option<Gpu> {
+        Gpu::init().ok()
+    }
+
+    /// Production behavior: a dirtied `dspark_swa_k` ring must not survive
+    /// `DsparkBody::reset_for_retry` (the path `DsparkDrafter::mtp_reset` uses).
+    #[test]
+    fn dspark_body_reset_for_retry_drains_swa_rings() {
+        let Some(mut gpu) = try_gpu() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        let cfg = tiny_cfg();
+        let draft_state = DeepseekV4State::new(&cfg).expect("DeepseekV4State::new");
+        let emb = gpu
+            .zeros(&[cfg.vocab_size * cfg.hidden_size], DType::F32)
+            .expect("emb");
+        let mut body = Deepseek4DsparkBody {
+            config: cfg,
+            stages_shallow: Vec::new(),
+            token_embd: emb,
+            draft_state,
+        };
+
+        // Simulate a prior draft_block that allocated a per-stage SWA ring
+        // and wrote non-zero main_kv history into it.
+        let ring = gpu
+            .upload_f32(&[1.25f32, -0.5, 3.0, 0.25, 9.0, -2.0, 0.125, 4.0], &[8])
+            .expect("ring");
+        body.draft_state.dspark_swa_k.push(Some(ring));
+        body.draft_state.dspark_main_x =
+            Some(gpu.upload_f32(&[7.0f32; 16], &[16]).expect("main_x"));
+        body.draft_state.dspark_staged = Some(gpu.upload_f32(&[2.0f32; 8], &[8]).expect("staged"));
+        body.draft_state.n_tokens = 42;
+
+        assert_eq!(body.draft_state.dspark_swa_k.len(), 1);
+        assert!(body.draft_state.dspark_swa_k[0].is_some());
+
+        body.reset_for_retry(&mut gpu);
+
+        assert!(
+            body.draft_state.dspark_swa_k.is_empty(),
+            "dspark_swa_k must drain on reset_for_retry"
+        );
+        assert!(
+            body.draft_state.dspark_main_x.is_none(),
+            "dspark_main_x must drop on reset_for_retry"
+        );
+        assert!(
+            body.draft_state.dspark_staged.is_none(),
+            "dspark_staged must drop on reset_for_retry"
+        );
+        assert_eq!(body.draft_state.n_tokens, 0);
+
+        let _ = gpu.free_tensor(body.token_embd);
+    }
+
+    /// Wire check: `build_dspark_speculator` → `Speculator::reset` reaches the
+    /// body and frees dirtied rings without panic (same path as cold retry).
+    #[test]
+    fn dspark_speculator_reset_clears_body_swa_rings() {
+        let Some(mut gpu) = try_gpu() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        let cfg = tiny_cfg();
+        let mut draft_state = DeepseekV4State::new(&cfg).expect("DeepseekV4State::new");
+        draft_state
+            .dspark_swa_k
+            .push(Some(gpu.upload_f32(&[1.0f32; 4], &[4]).expect("ring")));
+        draft_state.n_tokens = 7;
+        let emb = gpu
+            .zeros(&[cfg.vocab_size * cfg.hidden_size], DType::F32)
+            .expect("emb");
+        let body = Box::new(Deepseek4DsparkBody {
+            config: cfg.clone(),
+            stages_shallow: Vec::new(),
+            token_embd: emb.shallow_clone(),
+            draft_state,
+        });
+
+        let stage_norm = gpu.zeros(&[cfg.hidden_size], DType::F32).expect("sn");
+        let lm_head = gpu
+            .zeros(&[cfg.vocab_size * cfg.hidden_size], DType::F32)
+            .expect("lm");
+        let core_weights = CoreDsparkWeights {
+            cfg: CoreDsparkConfig {
+                block_size: 2,
+                target_layer_ids: vec![0],
+                markov_rank: 0,
+                noise_token_id: 0,
+                enable_confidence: false,
+                confidence_uses_normed: false,
+                rms_norm_eps: cfg.rms_norm_eps,
+                draft_vocab_size: 0,
+                partial_rotary_factor: 1.0,
+                rope_theta: 1_000_000.0,
+            },
+            main_proj: None,
+            main_norm: None,
+            markov_w1: None,
+            markov_w2: None,
+            confidence_proj: None,
+            confidence_bias: None,
+            d2t: None,
+        };
+
+        let mut spec =
+            build_dspark_speculator(body, core_weights, stage_norm, lm_head, 2, 8, 0.3, false);
+        // Dirtied rings are inside the body; reset must free them (no panic).
+        let _ = spec.reset(&mut gpu);
+        spec.free(&mut gpu);
+        let _ = gpu.free_tensor(emb);
     }
 }

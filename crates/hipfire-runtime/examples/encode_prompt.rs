@@ -21,10 +21,7 @@ fn main() {
 
     let raw = std::fs::read_to_string(prompt_path).expect("read prompt");
     let text = if normalize {
-        if std::env::var("HIPFIRE_NORMALIZE_PROMPT").ok().as_deref() != Some("1") {
-            std::env::set_var("HIPFIRE_NORMALIZE_PROMPT", "1");
-        }
-        hipfire_runtime::tokenizer::maybe_normalize_prompt(&raw).into_owned()
+        hipfire_runtime::tokenizer::normalize_prompt_with(&raw, true).into_owned()
     } else {
         raw
     };

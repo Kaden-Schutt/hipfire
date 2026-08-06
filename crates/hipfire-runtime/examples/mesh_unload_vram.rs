@@ -72,7 +72,9 @@ fn main() {
     // Warmup cycle: pay all one-time fixed costs (JIT kernels, sign tables) so
     // they are not misread as a per-cycle leak below.
     match load(axis, model, &mesh) {
-        Ok(m) => hipfire_loader::unload_model(m, &mut gpu),
+        Ok(m) => {
+            let _ = hipfire_loader::unload_model(m, &mut gpu);
+        }
         Err(e) => {
             eprintln!("axis={axis} model={model}\nwarmup load failed: {e}");
             std::process::exit(2);

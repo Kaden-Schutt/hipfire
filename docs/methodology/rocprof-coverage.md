@@ -42,15 +42,21 @@ Each blindspot needs a `profile::begin_timer` wrapper at its dispatch site.
 
 ## When to Escalate
 
-| Coverage | Action |
-|----------|--------|
-| >= 90% | Internal profile is reliable. No action needed. |
-| 75-90% | At least one significant kernel is un-tracked. Investigate blindspots. |
-| < 75% | Almost certainly a new kernel was added without a timer. Fix immediately. |
+This audit is for **profiling / attribution** claims that rely on internal
+timers (`HIPFIRE_PROFILE`, Atlas profile sections). It is **not** a universal
+validation gate and does not replace routes in
+[`docs/VALIDATION.md`](../VALIDATION.md).
 
-After any kernel dispatch addition (new kernel launch site, new quant format,
-new architecture port), run a quick coverage audit to confirm the timer
-wrapper was included.
+| Coverage | Action for attribution claims |
+|----------|--------|
+| >= 90% | High observed coverage for the **named** trace — internal timers account for most rocprof GPU time on that run. Not correctness proof, not route proof, and not unconditional reliability of every unmatched kernel. |
+| 75-90% | At least one significant kernel is un-tracked on this trace. Investigate blindspots before trusting internal attribution. |
+| < 75% | Large blindspot risk on this trace (often a new launch without a timer). Fix attribution before relying on internal profile numbers. |
+
+When a change adds a kernel launch site, quant format, or architecture port
+**and** you will cite internal profile timers for Amdahl or hot-path claims,
+run a coverage audit on a representative trace. Defer acceptance/route
+requirements to [`VALIDATION.md`](../VALIDATION.md).
 
 ## Implementation References
 

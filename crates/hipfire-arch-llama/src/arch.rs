@@ -379,36 +379,28 @@ impl Llama {
             )?;
 
             // ── KV cache write + attention (dispatched) ────────
-            // Derive tier plan from KV cache state. Q4 is inferred as
-            // "quantized but not any specific format".
-            let quant_q4 = kv_cache.quantized
-                && !kv_cache.quant_hfq4
-                && !kv_cache.quant_q8
-                && !kv_cache.quant_int8
-                && kv_cache.k_scales.is_empty();
             {
                 let ctx = DispatchCtx::new(gpu);
                 let family = attention_family();
+                let ti = kv_cache.tier_inputs();
+                let (k_scales, v_scales) = if ti.quant_hfq8 {
+                    (
+                        Some(&kv_cache.k_scales[layer_idx]),
+                        Some(&kv_cache.v_scales[layer_idx]),
+                    )
+                } else {
+                    (None, None)
+                };
                 let plan = KvTierPlan::derive(KvTierInputs {
-                    quant_asym4: false,
-                    quant_asym3: false,
-                    quant_asym2: false,
-                    quant_q8: kv_cache.quant_q8,
-                    quant_fwht: false,
-                    quant_hfq4: kv_cache.quant_hfq4,
-                    quant_q4,
-                    quant_int8: false,
-                    quant_hfq8: false,
-                    f32_policy: hipfire_dispatch::families::kv_tier::F32AttnPolicy::Simple,
-                    v_mode_bits: 8,
                     pos,
                     flash_mode: 0,
-                    capture_mode: false,
+                    capture_mode: gpu.graphs.capture_mode,
                     batch_size: 1,
                     is_tree: false,
                     is_boundary: false,
                     q8_windowed: false,
                     window: 0,
+                    ..ti
                 })
                 .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
                 let io = AttnParams {
@@ -417,8 +409,8 @@ impl Llama {
                     v: &scratch.v,
                     k_cache: &kv_cache.k_gpu[layer_idx],
                     v_cache: &kv_cache.v_gpu[layer_idx],
-                    k_scales: None,
-                    v_scales: None,
+                    k_scales,
+                    v_scales,
                     pos_buf: &scratch.pos_buf,
                     pos,
                     positions: None,
@@ -428,12 +420,13 @@ impl Llama {
                     physical_cap: kv_cache.physical_cap,
                     batch_size: 1,
                     max_ctx_len: 0,
-                    flash_partials: None,
-                    givens_cos: None,
-                    givens_sin: None,
+                    flash_partials: Some(&scratch.attn_partials),
+                    givens_cos: kv_cache.givens_cos.as_ref(),
+                    givens_sin: kv_cache.givens_sin.as_ref(),
                     tree_bias: None,
                     block_start: 0,
                     block_cols: 0,
+                    output_gate: None,
                     output: &scratch.attn_out,
                 };
                 family

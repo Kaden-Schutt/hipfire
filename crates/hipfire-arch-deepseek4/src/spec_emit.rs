@@ -10,7 +10,7 @@
 //! which builds the in-step tool-call grammar from the request's raw tool JSON
 //! plus the pre-decoded vocab the daemon supplies on the neutral `SpecEmitCtx`.
 
-use crate::dsml::{self, StreamEvent};
+use crate::dsml::{self, DsmlDeferredCalls, DsmlDeferredOutcome, StreamEvent};
 use crate::grammar::ToolSchema;
 use crate::mtp_speculator::Deepseek4SpecGrammar;
 use hipfire_runtime::prompt_frame::{ThinkMode, ToolCall};
@@ -22,18 +22,33 @@ use hipfire_runtime::tokenizer::Tokenizer;
 pub struct Deepseek4Emit<'a> {
     tokenizer: &'a Tokenizer,
     parser: dsml::StreamParser,
-    /// Parsed tool calls accumulated across the turn (the old `emit_tool_calls_buf`).
-    tool_calls_buf: Vec<ToolCall>,
+    /// Production turn-wide call buffer. Structured calls stay here until the
+    /// daemon wrapper classifies the terminal cause (length vs stop vs
+    /// malformed) — never released from [`SpecEmit::finish`] alone.
+    deferred: DsmlDeferredCalls,
     eos_token: u32,
-    /// Count of tokens actually emitted (committed) so far, kept in lockstep with
-    /// the daemon's `generated_count` so each `Committed { idx }` equals the
-    /// inline `emit_committed_event`'s `pos` argument.
-    emitted_count: usize,
+    /// Every committed (non-EOS) token in order for DSML asst-turn cache replay.
+    /// Exposed via [`SpecEmit::streamed_tokens`]; must match the raw sequence
+    /// `build_deepseek4_dsml_prompt` replays on a cache hit.
+    streamed_tokens: Vec<u32>,
+    /// Visible Token-channel prose accumulated this turn (think/Reasoning
+    /// excluded). Fingerprint text for the asst-turn cache store.
+    visible_acc: String,
     /// In-step tool-call grammar, threaded into the fused spec step via
     /// `grammar()`. `None` ⇒ no tools (or the bespoke loop, which owns its own
-    /// matcher and never calls `grammar()`). The matcher advances inside the spec
-    /// step ONLY — `observe` must NOT touch it (single-advance invariant).
+    /// matcher and never calls `grammar()`). The matcher advances inside the
+    /// spec step ONLY — `observe` must NOT touch it (single-advance invariant).
     grammar: Option<Deepseek4SpecGrammar>,
+}
+
+/// Map a visible DSML channel event into a client event. ToolCalls/Malformed
+/// never reach here — they are absorbed by [`DsmlDeferredCalls`].
+fn visible_client_event(ev: StreamEvent) -> Option<ClientEvent> {
+    match ev {
+        StreamEvent::Token(text) => Some(ClientEvent::Token(text)),
+        StreamEvent::Reasoning(text) => Some(ClientEvent::Reasoning(text)),
+        StreamEvent::ToolCalls(_) | StreamEvent::Malformed { .. } => None,
+    }
 }
 
 /// Build the in-step tool-call grammar from the request's raw tool JSON and the
@@ -100,43 +115,35 @@ impl<'a> Deepseek4Emit<'a> {
         Box::new(Self {
             tokenizer: ctx.tokenizer,
             parser,
-            tool_calls_buf: Vec::new(),
+            deferred: DsmlDeferredCalls::new(),
             eos_token: ctx.eos,
-            emitted_count: 0,
+            streamed_tokens: Vec::new(),
+            visible_acc: String::new(),
             grammar,
         })
     }
 
     /// Feed one committed token's decoded text through the DSML parser, mapping
-    /// each `StreamEvent` to its `ClientEvent` (and absorbing tool calls), then
-    /// append the `Committed` event LAST — matching the inline `parser.feed` →
-    /// `emit_stream_event` → `emit_committed_event` ordering. Shared by `begin`'s
-    /// first-token emit and `observe`'s per-token emit.
+    /// visible channels to `ClientEvent` and absorbing tool calls turn-wide via
+    /// the production [`DsmlDeferredCalls`] component. Structured calls are
+    /// **never** released here or from [`SpecEmit::finish`] — only after the
+    /// daemon wrapper classifies a tool-safe terminal.
     fn feed_and_emit(&mut self, token: u32) -> Vec<ClientEvent> {
         let mut events = Vec::new();
+        self.streamed_tokens.push(token);
         let frag = self.tokenizer.decode(&[token]);
-        for ev in self.parser.feed(&frag) {
-            match ev {
-                StreamEvent::Token(text) => events.push(ClientEvent::Token(text)),
-                StreamEvent::Reasoning(text) => events.push(ClientEvent::Reasoning(text)),
-                StreamEvent::ToolCalls(calls) => {
-                    let converted: Vec<ToolCall> = calls
-                        .iter()
-                        .map(|c| ToolCall {
-                            name: c.name.clone(),
-                            arguments: c.arguments.clone(),
-                        })
-                        .collect();
-                    self.tool_calls_buf.extend(converted.iter().cloned());
-                    events.push(ClientEvent::ToolCalls(converted));
+        for ev in self.deferred.absorb_all(self.parser.feed(&frag)) {
+            if let Some(ce) = visible_client_event(ev) {
+                if let ClientEvent::Token(ref t) = ce {
+                    self.visible_acc.push_str(t);
                 }
+                events.push(ce);
             }
         }
         events.push(ClientEvent::Committed {
             id: token,
-            idx: self.emitted_count,
+            idx: self.streamed_tokens.len() - 1,
         });
-        self.emitted_count += 1;
         events
     }
 }
@@ -148,6 +155,10 @@ impl<'a> SpecEmit for Deepseek4Emit<'a> {
     /// it — and ds4's `observe` only feeds the DSML parser, so the invariant holds.
     fn grammar(&mut self) -> Option<&mut dyn SpecGrammar> {
         self.grammar.as_mut().map(|g| g as &mut dyn SpecGrammar)
+    }
+
+    fn streamed_tokens(&self) -> &[u32] {
+        &self.streamed_tokens
     }
 
     fn begin(&mut self, first_token: u32) -> EmitOutcome {
@@ -188,37 +199,78 @@ impl<'a> SpecEmit for Deepseek4Emit<'a> {
     }
 
     fn finish(mut self: Box<Self>) -> FinishSummary {
-        // Post-loop flush. Mirrors generate_deepseek4 9632-9638: `parser.finish()`
-        // → absorb + emit, then `tool_calls_parsed_count = emit_tool_calls_buf.len()`.
-        // The ds4 `done` envelope drives `finish_reason` off `tool_calls_parsed_count`
-        // (length-cap override is the caller's call).
+        // Post-loop flush into the production deferred buffer. Visible
+        // Token/Reasoning may flush here. Structured ToolCalls are attached as
+        // held finish events for the wrapper — the generic generate_spec core
+        // must NOT render them before length/malformed is known.
         let mut events = Vec::new();
-        // `finish` consumes the parser by value; move it out of `self`.
         let parser = std::mem::replace(&mut self.parser, dsml::StreamParser::new());
-        for ev in parser.finish() {
-            match ev {
-                StreamEvent::Token(text) => events.push(ClientEvent::Token(text)),
-                StreamEvent::Reasoning(text) => events.push(ClientEvent::Reasoning(text)),
-                StreamEvent::ToolCalls(calls) => {
-                    let converted: Vec<ToolCall> = calls
-                        .iter()
-                        .map(|c| ToolCall {
-                            name: c.name.clone(),
-                            arguments: c.arguments.clone(),
-                        })
-                        .collect();
-                    self.tool_calls_buf.extend(converted.iter().cloned());
-                    events.push(ClientEvent::ToolCalls(converted));
+        for ev in self.deferred.absorb_all(parser.finish()) {
+            if let Some(ce) = visible_client_event(ev) {
+                if let ClientEvent::Token(ref t) = ce {
+                    self.visible_acc.push_str(t);
                 }
+                events.push(ce);
             }
         }
-        let tool_calls = self.tool_calls_buf.len();
-        let finish_reason = if tool_calls > 0 { "tool_calls" } else { "stop" };
-        FinishSummary {
-            events,
-            finish_reason,
-            tool_calls,
-            finalized: None,
+        let visible_text = std::mem::take(&mut self.visible_acc);
+        let deferred = std::mem::take(&mut self.deferred);
+        if deferred.is_malformed() {
+            // Fail closed: discard every buffered call; magic finish_reason for
+            // the ds4 wrapper (typed FinishSummary field still deferred Minor).
+            let _ = deferred.finalize(false);
+            return FinishSummary {
+                events,
+                finish_reason: "malformed_protocol",
+                tool_calls: 0,
+                finalized: None,
+                visible_text: String::new(),
+                decoded_eot: false,
+                open_think: false,
+            };
+        }
+        // Provisional finalize without length: length is applied by the wrapper
+        // after generate_spec returns (generated >= max_tokens). Held ToolCalls
+        // stay on FinishSummary.events for a tool-safe release only.
+        let buffered = deferred.buffered_len();
+        match deferred.finalize(false) {
+            DsmlDeferredOutcome::ToolCalls(calls) => {
+                let held: Vec<ToolCall> = calls
+                    .into_iter()
+                    .map(|c| ToolCall {
+                        name: c.name,
+                        arguments: c.arguments,
+                    })
+                    .collect();
+                events.push(ClientEvent::ToolCalls(held));
+                FinishSummary {
+                    events,
+                    finish_reason: "tool_calls",
+                    tool_calls: buffered,
+                    finalized: None,
+                    visible_text,
+                    decoded_eot: false,
+                    open_think: false,
+                }
+            }
+            DsmlDeferredOutcome::Stop | DsmlDeferredOutcome::Length => FinishSummary {
+                events,
+                finish_reason: "stop",
+                tool_calls: 0,
+                finalized: None,
+                visible_text,
+                decoded_eot: false,
+                open_think: false,
+            },
+            DsmlDeferredOutcome::Malformed { .. } => FinishSummary {
+                events,
+                finish_reason: "malformed_protocol",
+                tool_calls: 0,
+                finalized: None,
+                visible_text: String::new(),
+                decoded_eot: false,
+                open_think: false,
+            },
         }
     }
 }

@@ -64,8 +64,53 @@ __global__ void attention_flash_fwht3_tile(
 
     fwht_shfl_forward_256(mq0, mq1, mq2, mq3, mq4, mq5, mq6, mq7, signs1, signs2, tid);
 
-    // Phase A: Q·K (3-bit K)
-    for (int t_local = 0; t_local < tile_len; t_local++) {
+    // Phase A: Q·K (3-bit K). Keep four token dots independent so global-load
+    // latency and the five shuffle-reduction steps can overlap, matching the
+    // scheduling shape of the tuned Q8 flash tile.
+    int t_local = 0;
+    for (; t_local + 3 < tile_len; t_local += 4) {
+        const unsigned char* kb0 = k_cache + (size_t)(tile_start + t_local + 0) * k_bytes_per_pos + k_head_off;
+        const unsigned char* kb1 = k_cache + (size_t)(tile_start + t_local + 1) * k_bytes_per_pos + k_head_off;
+        const unsigned char* kb2 = k_cache + (size_t)(tile_start + t_local + 2) * k_bytes_per_pos + k_head_off;
+        const unsigned char* kb3 = k_cache + (size_t)(tile_start + t_local + 3) * k_bytes_per_pos + k_head_off;
+        float cn0 = *(const float*)kb0, cn1 = *(const float*)kb1;
+        float cn2 = *(const float*)kb2, cn3 = *(const float*)kb3;
+        const unsigned char* b0 = kb0 + 4 + tid * 3;
+        const unsigned char* b1 = kb1 + 4 + tid * 3;
+        const unsigned char* b2 = kb2 + 4 + tid * 3;
+        const unsigned char* b3 = kb3 + 4 + tid * 3;
+        unsigned int pk0 = (unsigned int)b0[0] | ((unsigned int)b0[1] << 8) | ((unsigned int)b0[2] << 16);
+        unsigned int pk1 = (unsigned int)b1[0] | ((unsigned int)b1[1] << 8) | ((unsigned int)b1[2] << 16);
+        unsigned int pk2 = (unsigned int)b2[0] | ((unsigned int)b2[1] << 8) | ((unsigned int)b2[2] << 16);
+        unsigned int pk3 = (unsigned int)b3[0] | ((unsigned int)b3[1] << 8) | ((unsigned int)b3[2] << 16);
+        #define DOT3(CN, PK) ( \
+            mq0 * ((CN) * TURBO_C3_256[(PK)        & 7]) \
+          + mq1 * ((CN) * TURBO_C3_256[((PK) >> 3)  & 7]) \
+          + mq2 * ((CN) * TURBO_C3_256[((PK) >> 6)  & 7]) \
+          + mq3 * ((CN) * TURBO_C3_256[((PK) >> 9)  & 7]) \
+          + mq4 * ((CN) * TURBO_C3_256[((PK) >> 12) & 7]) \
+          + mq5 * ((CN) * TURBO_C3_256[((PK) >> 15) & 7]) \
+          + mq6 * ((CN) * TURBO_C3_256[((PK) >> 18) & 7]) \
+          + mq7 * ((CN) * TURBO_C3_256[((PK) >> 21) & 7]))
+        float partial0 = DOT3(cn0, pk0);
+        float partial1 = DOT3(cn1, pk1);
+        float partial2 = DOT3(cn2, pk2);
+        float partial3 = DOT3(cn3, pk3);
+        for (int off = 16; off > 0; off >>= 1) {
+            partial0 += __shfl_xor(partial0, off);
+            partial1 += __shfl_xor(partial1, off);
+            partial2 += __shfl_xor(partial2, off);
+            partial3 += __shfl_xor(partial3, off);
+        }
+        if (tid == 0) {
+            scores[t_local + 0] = partial0 * scale_attn;
+            scores[t_local + 1] = partial1 * scale_attn;
+            scores[t_local + 2] = partial2 * scale_attn;
+            scores[t_local + 3] = partial3 * scale_attn;
+        }
+        #undef DOT3
+    }
+    for (; t_local < tile_len; t_local++) {
         int t = tile_start + t_local;
         const unsigned char* kb = k_cache + (size_t)t * k_bytes_per_pos + k_head_off;
         float cnorm = *(const float*)kb;
@@ -116,17 +161,43 @@ __global__ void attention_flash_fwht3_tile(
         const int v_total_blocks    = n_kv_heads * v_blocks_per_head;
         const int v_kv_head_blk     = kv_h * v_blocks_per_head;
         const int v_row_stride      = v_total_blocks * 34;
-        for (int t_local = 0; t_local < tile_len; t_local++) {
-            float w = scores[t_local];
-            int t = tile_start + t_local;
-            const unsigned char* vb = v_cache + (size_t)t * v_row_stride;
+        int tv = 0;
+        for (; tv + 3 < tile_len; tv += 4) {
+            float w0 = scores[tv + 0], w1 = scores[tv + 1];
+            float w2 = scores[tv + 2], w3 = scores[tv + 3];
+            const unsigned char* vb0 = v_cache + (size_t)(tile_start + tv + 0) * v_row_stride;
+            const unsigned char* vb1 = v_cache + (size_t)(tile_start + tv + 1) * v_row_stride;
+            const unsigned char* vb2 = v_cache + (size_t)(tile_start + tv + 2) * v_row_stride;
+            const unsigned char* vb3 = v_cache + (size_t)(tile_start + tv + 3) * v_row_stride;
             #pragma unroll
             for (int i = 0; i < 8; i++) {
                 const int d = d0 + i;
                 const int bi = d / 32;
                 const int bj = d % 32;
                 const int v_blk_off = (v_kv_head_blk + bi) * 34;
-                const unsigned char* vbh = vb + v_blk_off;
+                const unsigned char* v0 = vb0 + v_blk_off;
+                const unsigned char* v1 = vb1 + v_blk_off;
+                const unsigned char* v2 = vb2 + v_blk_off;
+                const unsigned char* v3 = vb3 + v_blk_off;
+                float vs0 = (float)*((const _Float16*)v0);
+                float vs1 = (float)*((const _Float16*)v1);
+                float vs2 = (float)*((const _Float16*)v2);
+                float vs3 = (float)*((const _Float16*)v3);
+                out_vec[i] += w0 * (vs0 * (float)((signed char)v0[2 + bj]));
+                out_vec[i] += w1 * (vs1 * (float)((signed char)v1[2 + bj]));
+                out_vec[i] += w2 * (vs2 * (float)((signed char)v2[2 + bj]));
+                out_vec[i] += w3 * (vs3 * (float)((signed char)v3[2 + bj]));
+            }
+        }
+        for (; tv < tile_len; tv++) {
+            float w = scores[tv];
+            const unsigned char* vb = v_cache + (size_t)(tile_start + tv) * v_row_stride;
+            #pragma unroll
+            for (int i = 0; i < 8; i++) {
+                const int d = d0 + i;
+                const int bi = d / 32;
+                const int bj = d % 32;
+                const unsigned char* vbh = vb + (v_kv_head_blk + bi) * 34;
                 float vs = (float)*((const _Float16*)vbh);
                 out_vec[i] += w * (vs * (float)((signed char)vbh[2 + bj]));
             }

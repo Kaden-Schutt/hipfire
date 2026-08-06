@@ -57,7 +57,9 @@ fn graph_enabled() -> bool {
     static ENV: OnceLock<bool> = OnceLock::new();
     *ENV.get_or_init(|| {
         matches!(
-            std::env::var("HIPFIRE_LFM2_GRAPH").ok().as_deref(),
+            hipfire_config::developer_var("HIPFIRE_LFM2_GRAPH")
+                .ok()
+                .as_deref(),
             Some("1")
         )
     })
@@ -132,7 +134,8 @@ fn decode_step_layers_and_head(
     let k_top = cfg.num_experts_per_tok;
     let eps = cfg.rms_norm_eps;
     let seq_len = position as usize + 1;
-    let capture_postmixer = std::env::var_os("HIPFIRE_LFM2_CAPTURE_POSTMIXER").is_some();
+    let capture_postmixer =
+        hipfire_config::developer_var_os("HIPFIRE_LFM2_CAPTURE_POSTMIXER").is_some();
 
     for (l, layer) in weights.layers.iter().enumerate() {
         // ── Mixer block (pre-norm) ──────────────────────────────────────────
@@ -486,6 +489,7 @@ fn attn_mixer_block(
         tree_bias: None,
         block_start: 0,
         block_cols: 0,
+        output_gate: None,
         output: &state.fa_attn_out,
     };
     hipfire_dispatch::pipeline::execute_steps(
@@ -638,6 +642,7 @@ fn moe_ffn_block(
     )
     .map_err(|e| format!("lfm2moe L{l}: combine: {e:?}"))
 }
+
 
 /// hipGraph-amortized decode_step. Opt-in via `HIPFIRE_LFM2_GRAPH=1`
 /// (default OFF → exact `decode_step_inner` behavior). Mirrors the working

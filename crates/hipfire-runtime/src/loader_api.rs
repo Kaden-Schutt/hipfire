@@ -6,6 +6,7 @@
 //! holds only what the arch crates need to implement a carrier.
 
 use crate::hfq::HfqFile;
+use crate::kv_backend::KvBackend;
 use crate::safetensors_source::SafetensorsSource;
 use rdna_compute::Gpu;
 use std::path::Path;
@@ -62,6 +63,7 @@ pub struct LoadCtx<'a> {
     pub max_seq: usize,
     pub draft_path: Option<&'a str>,
     pub kv_mode_override: Option<&'a str>,
+    pub kv_backend: KvBackend,
     pub kv_adaptive_override: Option<&'a str>,
     pub state_quant_override: Option<&'a str>,
     pub cask: &'a CaskConfig,

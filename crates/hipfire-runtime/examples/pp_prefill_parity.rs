@@ -96,10 +96,9 @@ fn main() {
                 return;
             }
         };
-    let mut model = match loaded.parallel {
-        ModelParallel::Pp(PipelineImpl::Dense(pp)) => pp,
-        _ => panic!("expected PP dense model"),
-    };
+        let mut model = loaded
+        .pp_model
+        .expect("expected dense PP model (pp_model carrier)");
     model.prefill(&toks).expect("pp prefill");
     let pp_logits = model.logits().expect("pp logits");
 

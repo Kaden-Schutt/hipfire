@@ -15,7 +15,8 @@
 
 use crate::mtp_head::{MtpKvMode, Qwen35MtpHead};
 use crate::mtp_spec::{
-    prefill_trunk_and_mtp_cache_abortable, spec_step_mtp_compressed_serial, MtpSamplingConfig,
+    prefill_trunk_and_mtp_cache, prefill_trunk_and_mtp_cache_abortable,
+    spec_step_mtp_compressed_serial, spec_step_mtp_compressed_serial_with_k, MtpSamplingConfig,
     MtpSpecState,
 };
 use crate::speculative::ModelSlot;
@@ -83,6 +84,11 @@ impl MtpDrafter for Qwen35MtpDrafter {
         start_pos: usize,
         cache_hit: bool,
     ) -> Result<u32, String> {
+        // Cold start: reset the trunk recurrent state (target owns it) BEFORE
+        // borrowing the concrete slot, so positions start at 0.
+        if !cache_hit {
+            target.reset_recurrent(gpu)?;
+        }
         fn never() -> bool {
             false
         }
@@ -117,16 +123,23 @@ impl MtpDrafter for Qwen35MtpDrafter {
         _grammar: Option<&mut dyn SpecGrammar>,
     ) -> Result<MtpWindow, String> {
         // qwen35 enforces tool-call grammar post-hoc in the emission layer; the
-        // in-step grammar handle is unused here. `k` is fixed at build time
-        // (== state.max_n), so the step reads it from the state.
-        debug_assert_eq!(k, self.max_n, "qwen35 MTP k must match build-time max_n");
+        // in-step grammar handle is unused here. `k` is the per-call budget from
+        // MtpSpeculator (already clamped by remaining max_emit); the fixed-window
+        // compressed-serial core must honor it — never draft state.max_n blindly.
+        let k = k.min(self.max_n);
         let slot = Self::slot(target)?;
         let state = self
             .state
             .as_mut()
             .ok_or("Qwen35MtpDrafter: mtp_step before mtp_prefill")?;
-        let r = spec_step_mtp_compressed_serial(gpu, slot, &self.head, state, position, seed, eos)
-            .map_err(|e| e.to_string())?;
+        let r = spec_step_mtp_compressed_serial_with_k(
+            gpu, slot, &self.head, state, position, seed, eos, k,
+        )
+        .map_err(|e| e.to_string())?;
+        debug_assert!(
+            r.committed.len() <= k + 1,
+            "qwen35 MTP committed past k budget"
+        );
         Ok(MtpWindow {
             committed: r.committed,
             accepted: r.accept_count,
@@ -134,8 +147,38 @@ impl MtpDrafter for Qwen35MtpDrafter {
         })
     }
 
-    fn mtp_reset(&mut self, gpu: &mut Gpu) {
-        let _ = self.mtp_reset_checked(gpu);
+    fn mtp_forced_advance(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+        tokens: &[u32],
+        start_pos: usize,
+        abort: &dyn Fn() -> bool,
+    ) -> Result<bool, String> {
+        // Forced tokens must land in BOTH the trunk and the MTP head KV /
+        // prev_hidden. Plain spec_advance only moves trunk state, leaving an
+        // unwritten hole in the head that poisons later draft steps.
+        if tokens.is_empty() {
+            return Ok(true);
+        }
+        if abort() {
+            return Ok(true);
+        }
+        let slot = Self::slot(target)?;
+        self.ensure_state(gpu, slot)?;
+        let state = self.state.as_mut().expect("ensure_state set it");
+        prefill_trunk_and_mtp_cache(gpu, slot, &self.head, state, tokens, start_pos)
+            .map_err(|e| format!("qwen35 MTP forced advance: {e}"))?;
+        Ok(true)
+    }
+
+    fn mtp_reset(&mut self, gpu: &mut Gpu) -> Result<(), String> {
+        if let Some(state) = self.state.as_mut() {
+            state
+                .reset(gpu)
+                .map_err(|e| format!("qwen35-mtp drafter reset: {e}"))?;
+        }
+        Ok(())
     }
 
     fn mtp_reset_checked(&mut self, gpu: &mut Gpu) -> Result<(), String> {

@@ -125,7 +125,7 @@ fn run_single_gpu(path: &str, prompt_tokens: &[u32]) -> (Vec<u32>, Vec<Vec<f32>>
     }
     scratch.free_gpu(&mut gpu);
     dn.free_gpu(&mut gpu);
-    kv.free_gpu(&mut gpu);
+    let _ = kv.free_gpu(&mut gpu);
     weights.free_gpu(&mut gpu);
     gpu.drain_pool();
     (tokens, all_logits)

@@ -41,6 +41,18 @@ impl SpecTarget for LlamaBundle {
         self
     }
 
+    fn reset_recurrent(&mut self, _gpu: &mut Gpu) -> Result<(), String> {
+        // Pure attention: no recurrent state to zero. Drop the KV eviction offset
+        // so the next conversation rotates from absolute 0.
+        self.kv.compact_offset = 0;
+        Ok(())
+    }
+
+    fn retry_reset_eligible(&self) -> bool {
+        // Pure attention: compact_offset rewind is the full residual surface.
+        true
+    }
+
     fn new_spec_scratch(
         &mut self,
         gpu: &mut Gpu,
@@ -64,9 +76,14 @@ impl SpecTarget for LlamaBundle {
         gpu: &mut Gpu,
         tokens: &[u32],
         start_pos: usize,
+        reset: bool,
         abort: &dyn Fn() -> bool,
         mut hidden_out: Option<&mut Vec<f32>>,
     ) -> Result<SpecAdvance, String> {
+        if reset {
+            self.reset_recurrent(gpu)
+                .map_err(|e| format!("llama spec_advance reset: {e}"))?;
+        }
         // DFlash hidden capture: only when the drafter configured extract layers
         // AND the caller passed a sink. The two together form the gate; either
         // missing → no capture (the `_hidden_out` ignored default of Task 1).
@@ -108,12 +125,15 @@ impl SpecTarget for LlamaBundle {
             .map_err(|e| format!("{e:?}"))?;
         }
         // The last per-token forward_scratch_compute leaves the final token's
-        // logits in scratch.logits.
+        // logits in scratch.logits. Hand the host row through so Generic DFlash
+        // prefill can sample at temp>0 without a second D2H.
         let logits = gpu
             .download_f32(&self.scratch.logits)
             .map_err(|e| format!("{e:?}"))?;
+        let last_argmax = llama::argmax(&logits);
         Ok(SpecAdvance::Ready {
-            last_argmax: llama::argmax(&logits),
+            last_argmax,
+            last_logits: Some(logits),
         })
     }
 

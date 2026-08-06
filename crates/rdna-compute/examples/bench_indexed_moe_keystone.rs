@@ -147,8 +147,8 @@ fn main() {
     eprintln!(
         "arch={arch}  shape M={M} K={K} (mi={MI})  n_exp={N_EXP} k_top={K_TOP}  layers={N_MOE_LAYERS}"
     );
-    if !gpu.arch_caps.has_wmma_w32() {
-        eprintln!("SKIP — needs RDNA3 wave32 (gfx1100/1151); this is a gfx11 probe.");
+    if !gpu.arch_caps.is_wave32() {
+        eprintln!("SKIP — indexed decode probe requires an RDNA wave32 device.");
         return;
     }
 
@@ -184,8 +184,8 @@ fn main() {
     let topk_hot = &topk_sets[0]; // fixed [0..7]
 
     let xr = upload_f32(&mut gpu, &make_x(K, 0xABCD));
-    let gate_batch = alloc_f32_zeros(&mut gpu, MI);
-    let up_batch = alloc_f32_zeros(&mut gpu, MI);
+    let gate_batch = alloc_f32_zeros(&mut gpu, K_TOP * MI);
+    let up_batch = alloc_f32_zeros(&mut gpu, K_TOP * MI);
 
     // weight bytes read per launch = k_top × per-expert bytes (gate_up)
     let mq4_bytes_launch = (K_TOP * rdna_compute::profile::gemv_hfq4g256_bytes(M, K)) as f64;
@@ -366,17 +366,23 @@ fn main() {
         "is a proxy — WS2 'capture the 150' would then be a kernel/launch problem, not format."
     );
 
-    // non-NaN sanity (gross-setup guard)
-    let g = {
-        let mut v = vec![0f32; MI];
-        let bytes: &mut [u8] =
-            unsafe { std::slice::from_raw_parts_mut(v.as_mut_ptr() as *mut u8, MI * 4) };
-        gpu.hip.memcpy_dtoh(bytes, &gate_batch.buf).expect("dtoh");
-        v[0]
-    };
+    // Deterministic output-bit hash: the global and buffer-addressing arms use
+    // separate processes/JIT caches but must produce identical gate/up bits.
+    launch_mq4!(topk_hot);
+    gpu.hip.device_synchronize().expect("hash sync");
+    let gate = gpu.download_f32(&gate_batch).expect("download gate");
+    let up = gpu.download_f32(&up_batch).expect("download up");
+    let mut output_hash = 0xcbf29ce484222325u64;
+    for value in gate.iter().chain(up.iter()) {
+        for byte in value.to_bits().to_le_bytes() {
+            output_hash ^= byte as u64;
+            output_hash = output_hash.wrapping_mul(0x100000001b3);
+        }
+    }
     eprintln!(
-        "\nsanity: gate_batch[0] = {g:.5} (finite={})",
-        g.is_finite()
+        "\nsanity: gate_batch[0] = {:.5} (finite={}) output_fnv64={output_hash:016x}",
+        gate[0],
+        gate.iter().chain(up.iter()).all(|value| value.is_finite())
     );
     drop(keep);
 }

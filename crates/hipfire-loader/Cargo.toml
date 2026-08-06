@@ -28,6 +28,7 @@ dflash-fault-inject = [
 
 [dependencies]
 rdna-compute = { path = "../rdna-compute" }
+hipfire-config = { path = "../hipfire-config" }
 hipfire-runtime = { path = "../hipfire-runtime", features = ["loader-internal"] }
 hip-bridge = { path = "../hip-bridge" }
 # Optional arch crate deps — feature-gated.

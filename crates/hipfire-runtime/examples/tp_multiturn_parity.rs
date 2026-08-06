@@ -57,10 +57,9 @@ fn main() {
                     return;
                 }
             };
-        let mut m = match loaded.parallel {
-            ModelParallel::Tp(tp) => tp,
-            _ => panic!("expected TP model"),
-        };
+        let mut m = loaded
+            .tp_model
+            .expect("expected TP model (tp_model carrier)");
         m.prefill(&full).expect("cold prefill");
         m.logits().expect("cold logits")
     };
@@ -70,10 +69,9 @@ fn main() {
     let reuse_logits: Vec<f32> = {
         let loaded = hipfire_loader::load_model_tp(&model_path, MAX_SEQ, &mesh, Default::default())
             .expect("load reuse");
-        let mut m = match loaded.parallel {
-            ModelParallel::Tp(tp) => tp,
-            _ => panic!("expected TP model"),
-        };
+        let mut m = loaded
+            .tp_model
+            .expect("expected TP model (tp_model carrier)");
         m.prefill(PREFIX).expect("prefix prefill");
         for (i, &t) in SUFFIX.iter().enumerate() {
             m.forward_token(t, PREFIX.len() + i)

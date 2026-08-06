@@ -99,15 +99,25 @@ pub struct HfqFile {
 
 impl HfqFile {
     pub fn open(path: &Path) -> std::io::Result<Self> {
+        let reap_plan = hipfire_config::developer_var("HIPFIRE_REAP_PLAN")
+            // TOML policy first; raw env as the final fallback (test seams +
+            // bare-env invocations).
+            .or_else(|_| std::env::var("HIPFIRE_REAP_PLAN"))
+            .ok()
+            .map(std::path::PathBuf::from);
+        Self::open_with_reap_plan(path, reap_plan.as_deref())
+    }
+
+    fn open_with_reap_plan(path: &Path, reap_plan: Option<&Path>) -> std::io::Result<Self> {
         let mut f = Self::open_at_offset(path, 0)?;
-        // REAP load-time overlay splice (SP3): when HIPFIRE_REAP_PLAN points
+        // REAP load-time overlay splice (SP3): when the process policy points
         // at a dir containing `overlay.hfq`, attach it so its re-quantized
         // tensors shadow the base by name. Opened via `open_at_offset` (NOT
-        // `open`) so the overlay does NOT recursively env-attach. A mismatched
+        // `open`) so the overlay does NOT recursively auto-attach. A mismatched
         // arch_id is logged and we proceed base-only — the safe default for
-        // unrelated model opens that happen to share the env var.
-        if let Ok(dir) = std::env::var("HIPFIRE_REAP_PLAN") {
-            let ov_path = std::path::Path::new(&dir).join("overlay.hfq");
+        // unrelated model opens that happen to share the process policy.
+        if let Some(dir) = reap_plan {
+            let ov_path = dir.join("overlay.hfq");
             if ov_path.exists() {
                 // NOTE: a failure to attach (unreadable overlay, arch mismatch,
                 // missing tensor, or shape mismatch) is logged and we proceed
@@ -1897,7 +1907,6 @@ mod overlay_tests {
     use super::*;
     use crate::model_source::ModelSource; // for `tensor_names`
     use std::io::Write;
-    use std::sync::Mutex;
 
     /// Minimal HFQ writer mirroring `hipfire-quantize`'s `write_hfq`
     /// (`crates/hipfire-quantize/src/main.rs:3398`) byte-for-byte for the
@@ -1952,17 +1961,8 @@ mod overlay_tests {
         f.flush().unwrap();
     }
 
-    // Env vars are process-global. `HfqFile::open` READS `HIPFIRE_REAP_PLAN`
-    // on every call, so EVERY test here that calls `open` must serialize on
-    // this mutex — otherwise the env-attach test's `set_var` leaks into a
-    // concurrent `open` in another test and attaches the wrong overlay.
-    // Hold the lock for the whole test body so env stays consistent across
-    // every `open` within it.
-    static ENV_MUTEX: Mutex<()> = Mutex::new(());
-
     #[test]
     fn overlay_tensor_shadows_base() {
-        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path().join("base.hfq");
         let ov = dir.path().join("overlay.hfq");
@@ -1994,7 +1994,6 @@ mod overlay_tests {
 
     #[test]
     fn overlay_arch_mismatch_rejected() {
-        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path().join("b.hfq");
         let ov = dir.path().join("o.hfq");
@@ -2006,10 +2005,7 @@ mod overlay_tests {
     }
 
     #[test]
-    fn open_auto_attaches_overlay_from_env() {
-        // Env mutation is process-global; lock so this serializes with any
-        // other env-mutating test in this module.
-        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    fn open_auto_attaches_overlay_from_process_policy() {
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path().join("base.hfq");
         write_min_hfq(&base, 9, &[("A", 3, &[1, 4], &vec![1u8; 4])]);
@@ -2020,17 +2016,13 @@ mod overlay_tests {
             9,
             &[("A", 8, &[1, 4], &vec![7u8; 4])],
         );
-        std::env::set_var("HIPFIRE_REAP_PLAN", plan.path());
-        let f = HfqFile::open(&base).unwrap();
-        std::env::remove_var("HIPFIRE_REAP_PLAN");
+        let f = HfqFile::open_with_reap_plan(&base, Some(plan.path())).unwrap();
         assert!(f.has_overlay());
         assert_eq!(f.find_tensor_info("A").unwrap().quant_type, 8); // overlay won
     }
 
     #[test]
     fn overlay_with_foreign_tensor_rejected() {
-        let _g = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::remove_var("HIPFIRE_REAP_PLAN");
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path().join("b.hfq");
         let ov = dir.path().join("o.hfq");

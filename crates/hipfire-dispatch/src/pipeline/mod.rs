@@ -12,6 +12,7 @@ use rdna_compute::{DType, Gpu, GpuTensor};
 use std::sync::OnceLock;
 
 pub(crate) mod steps;
+pub mod superop;
 #[cfg(feature = "deltanet")]
 pub use steps::{
     build_delta_net_batch_steps, build_delta_net_decode_steps, build_delta_net_tree_steps,
@@ -243,7 +244,7 @@ pub fn run_moe_decode(
     gpu: &mut Gpu,
     p: &crate::families::moe::MoeParams,
 ) -> Result<(), DispatchError> {
-    use crate::families::moe::{build_moe_decode_steps, decode_expert_refs, MoeResolution};
+    use crate::families::moe::MoeResolution;
     macro_rules! hip {
         ($e:expr) => {
             $e.map_err(|e| DispatchError::Hip(e.to_string()))
@@ -275,67 +276,713 @@ pub fn run_moe_decode(
     // [1, n_exp] (MQ4 k=4, F32 k=2, …).
     check_moe_decode_supported(res.use_gpu_topk, p.k, p.n_exp, !p.routed_experts.is_empty())?;
 
-    // ── Build selection (binding contract) ─────────────────────────────────
-    // The builder returns the discriminated build: `CpuFallback` exactly when
-    // `!use_gpu_topk` (k != 8 OR routed dtype not indexable), `Gpu` exactly
-    // when the GPU top-K path is admissible. The gate-side projection runs
-    // BEFORE the branch on both paths (the fallback consumes the shared
-    // gate/up outputs); on the fallback path it runs directly through the
-    // extracted helpers — never as a Step program.
-    let (gu_experts, dn_experts) = decode_expert_refs(p);
-    match build_moe_decode_steps(p, &res, &gu_experts, &dn_experts)? {
-        crate::families::moe::MoeStepBuild::CpuFallback => {
-            let x_rot_local = launch_decode_rotate(gpu, p, &res)?;
-            launch_gate_side(ctx, gpu, p, &res, x_rot_local)?;
-            return run_moe_decode_cpu_fallback(ctx, gpu, p);
+    // EP (Ship 6 substrate-EP): when `routed_out` is set, the shared-down and
+    // routed-combine accumulate into that zeroed partial (all-reduced by the EP
+    // executor and added into x_residual once). `None` → x_residual directly
+    // (single-GPU, byte-identical).
+    let out_target: &GpuTensor = p.routed_out.unwrap_or(p.x_residual);
+    // gfx1100 experiment: retain one independently schedulable workgroup per
+    // expert rank, but let the last rank for each four-row tile perform the
+    // deterministic expanded-output fold. This is deliberately narrower than
+    // the dtype resolver: mixed/Paro/E8/Lloyd paths keep their existing
+    // kernels and combine semantics.
+    static DOWN_LAST_COMBINE: OnceLock<bool> = OnceLock::new();
+    let down_last_combine = ctx.arch.is_gfx1100()
+        && p.batch_size == 1
+        && p.k == 8
+        && p.expert_dtype_tags.is_none()
+        && p.dtypes.routed_down == DType::MQ4G256
+        && *DOWN_LAST_COMBINE.get_or_init(|| {
+            hipfire_config::developer_var("HIPFIRE_MOE_DOWN_LAST_COMBINE").as_deref() == Ok("1")
+        });
+
+    // ── Activation rotation (mirrors qwen35.rs x_rot_local block) ──────────
+    let x_rot_local: Option<&GpuTensor> = if res.needs_x_rot_local {
+        if !res.routed_indexable_paro {
+            hip!(gpu.ensure_mq_signs())?;
         }
-        crate::families::moe::MoeStepBuild::Gpu(phases) => {
-            // Step-native GPU top-K path: one Step program per layer, in the
-            // exact legacy launch order (rotate → gate side → softmax+top-K →
-            // shared down → routed block). `routed_out`/`skip_shared`
-            // semantics are preserved: the program accumulates the routed
-            // (and, unless skipped, shared) contributions into the EP
-            // partial, and `ep_partial` marks the reduce target for the mesh
-            // executor. The HIPFIRE_DUMP_HIDDEN diagnostic reads router
-            // logits after the gate-side and before softmax, so the program
-            // runs in two segments.
-            let split = usize::from(phases.rotate.is_some()) + phases.gate_side.len();
-            let build = phases.into_build();
-
-            // Signs back the FWHT used by every MQ4/MQ6 gate_up rotation +
-            // silu-rotate (idempotent/cached). Only the paro path is
-            // sign-free. Position mirrors the legacy executor's first explicit
-            // ensure_mq_signs (before the rotate); the MQ4 shared-down step
-            // re-ensures at its legacy position.
-            if !res.routed_indexable_paro {
-                hip!(gpu.ensure_mq_signs())?;
+        if !p.x_rot_prerotated {
+            if res.routed_indexable_paro {
+                let paro = p
+                    .routed_gate_up_paro
+                    .as_ref()
+                    .expect("routed_indexable_paro implies gate_up paro sidecar");
+                hip!(gpu.givens_rotate_to(
+                    p.x_norm,
+                    p.x_rot_local,
+                    &paro.pairs,
+                    &paro.theta,
+                    &paro.scales,
+                    1,
+                    p.hidden,
+                    paro.krot,
+                ))?;
+            } else if res.gate_side_mq4 {
+                if let Some(awq) = p.router.awq_scale {
+                    hip!(gpu.rotate_x_mq_awq(p.x_norm, awq, p.x_rot_local, p.hidden))?;
+                } else {
+                    hip!(gpu.rotate_x_mq(p.x_norm, p.x_rot_local, p.hidden))?;
+                }
+            } else {
+                // !gate_side_mq4 but routed MQ4/MQ6: no AWQ on MoE expert weights
+                // in Phase 1 targets (A3B). Byte-identical for models without AWQ.
+                hip!(gpu.rotate_x_mq(p.x_norm, p.x_rot_local, p.hidden))?;
             }
-            let mesh = &hipfire_hardware::DeviceMesh::single();
-            execute_steps_mesh(mesh, gpu, ctx, &build.steps[..split])?;
+        }
+        Some(p.x_rot_local)
+    } else {
+        None
+    };
 
-            // DIAG: dump router logits before softmax (mirrors qwen35
-            // HIPFIRE_DUMP_HIDDEN)
-            if let Ok(dump_path) = std::env::var("HIPFIRE_DUMP_HIDDEN") {
-                if gpu.hip.device_synchronize().is_ok() {
-                    if let Ok(all) = gpu.download_f32(p.router_logits) {
-                        use std::io::Write;
-                        let path = format!("{dump_path}.router_raw_p");
-                        if let Ok(mut f) = std::fs::OpenOptions::new()
-                            .create(true)
-                            .append(true)
-                            .open(&path)
-                        {
-                            let _ = f.write_all(&(0u32).to_le_bytes());
-                            for v in &all[..all.len().min(p.n_exp * 4 / 4)] {
-                                let _ = f.write_all(&v.to_le_bytes());
-                            }
-                        }
+    // ── Gate-side GEMV ───────────────────────────────────────────────────────
+    // SAFETY: all slice views alias device memory owned by MoEParams' scratch tensors.
+    let shared_gate = unsafe { slice_moe_f32_view(p.gate_buf, 0, p.smi) };
+    let shared_up = unsafe { slice_moe_f32_view(p.up_buf, 0, p.smi) };
+    if res.gate_fusable {
+        let xr = x_rot_local.expect("gate_fusable implies x_rot_local (needs_x_rot_local)");
+        hip!(gpu.fused_qkvza_hfq4g256(
+            &p.router.buf,
+            &p.shared_expert_gate.buf,
+            &p.shared_gate_w.buf,
+            &p.shared_up_w.buf,
+            xr,
+            p.router_logits,
+            p.scalar_buf,
+            &shared_gate,
+            &shared_up,
+            p.router.m,
+            p.shared_expert_gate.m,
+            p.shared_gate_w.m,
+            p.shared_up_w.m,
+            p.router.k,
+        ))?;
+    } else {
+        static GEMV_GATE: OnceLock<GemvFamily> = OnceLock::new();
+        let gemv = GEMV_GATE.get_or_init(GemvFamily::new);
+        gemv.run_auto(ctx, gpu, &p.router, p.x_norm, p.router_logits)
+            .map_err(|e| DispatchError::Hip(e.to_string()))?;
+        gemv.run_auto(ctx, gpu, &p.shared_expert_gate, p.x_norm, p.scalar_buf)
+            .map_err(|e| DispatchError::Hip(e.to_string()))?;
+        // Shared-expert gate/up: on a graded file the all-MQ4 fused gate path
+        // (fused_qkvza_hfq4g256 on the single rotated `xr`) doesn't apply because
+        // the router is Q8. But the dense shared gate/up are still MQ-family, and
+        // `x_rot_local` has ALREADY been FWHT-rotated once for the routed experts.
+        // `run_auto` here would re-rotate x_norm per call (+2 mq_rotate_x/layer);
+        // instead reuse the existing rotation via the Prerotated path. Numerically
+        // identical (same rotated activation). Q8/HFQ shared weights (no rotation)
+        // or AWQ-scaled shared weights fall through to run_auto unchanged.
+        let shared_prerot = x_rot_local.is_some()
+            && p.shared_gate_w.awq_scale.is_none()
+            && p.shared_up_w.awq_scale.is_none()
+            && matches!(crate::types::dtype_post_rotation_variant(p.shared_gate_w.dtype), crate::types::GemvVariant::Prerotated)
+            && matches!(crate::types::dtype_post_rotation_variant(p.shared_up_w.dtype), crate::types::GemvVariant::Prerotated)
+            // The prerotated MQ GEMV must actually exist for this arch. MQ6/HFQ6
+            // prerotated is HasMmq (gfx906/RDNA3/RDNA4) → ABSENT on gfx942/CDNA, so
+            // taking this shortcut there hits MissingImpl. When unavailable, fall
+            // through to run_auto (the pre-2f38a16e gfx942 path that worked).
+            && crate::types::KernelKey::dtype_arch_predicate(p.shared_gate_w.dtype).eval_arch(ctx)
+            && crate::types::KernelKey::dtype_arch_predicate(p.shared_up_w.dtype).eval_arch(ctx);
+        if shared_prerot {
+            let xr = x_rot_local.expect("shared_prerot implies x_rot_local");
+            gemv.run(
+                ctx,
+                gpu,
+                &crate::families::gemv::GemvParams {
+                    w: &p.shared_gate_w,
+                    x: xr,
+                    y: &shared_gate,
+                    variant: crate::types::GemvVariant::Prerotated,
+                    residual: None,
+                    gate: None,
+                    up: None,
+                },
+            )
+            .map_err(|e| DispatchError::Hip(e.to_string()))?;
+            gemv.run(
+                ctx,
+                gpu,
+                &crate::families::gemv::GemvParams {
+                    w: &p.shared_up_w,
+                    x: xr,
+                    y: &shared_up,
+                    variant: crate::types::GemvVariant::Prerotated,
+                    residual: None,
+                    gate: None,
+                    up: None,
+                },
+            )
+            .map_err(|e| DispatchError::Hip(e.to_string()))?;
+        } else {
+            gemv.run_auto(ctx, gpu, &p.shared_gate_w, p.x_norm, &shared_gate)
+                .map_err(|e| DispatchError::Hip(e.to_string()))?;
+            gemv.run_auto(ctx, gpu, &p.shared_up_w, p.x_norm, &shared_up)
+                .map_err(|e| DispatchError::Hip(e.to_string()))?;
+        }
+    }
+
+    // ── Top-K + routed experts: CPU-top-K generic fallback ───────────────────
+    // Fires when `!use_gpu_topk` (k != 8 OR routed dtype not indexable). This
+    // ports master's `moe_ffn_decode_impl` CPU-fallback per-expert loop
+    // (origin/master qwen35.rs, the `else` arm of `if use_gpu_topk`) so MoE
+    // layers outside the {k=8, MQ4G256|MQ5G256|MQ6G256|ParoQ4G128-routed} fast path
+    // run instead of hard-panicking. #393 deleted this; restoring it keeps the
+    // dispatch migration behavior-preserving.
+    //
+    // The fallback is self-contained: it does softmax → CPU top-K + renorm →
+    // shared-expert down → generic per-expert routed loop, then returns. It
+    // does NOT fall through to the indexed GPU-top-K path below (which assumes
+    // k=8 + an indexable routed dtype).
+    if !res.use_gpu_topk {
+        return run_moe_decode_cpu_fallback(ctx, gpu, p);
+    }
+    // DIAG: dump router logits before softmax (mirrors qwen35 HIPFIRE_DUMP_HIDDEN)
+    if let Ok(dump_path) = hipfire_config::developer_var("HIPFIRE_DUMP_HIDDEN") {
+        if gpu.hip.device_synchronize().is_ok() {
+            if let Ok(all) = gpu.download_f32(p.router_logits) {
+                use std::io::Write;
+                let path = format!("{dump_path}.router_raw_p");
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&path)
+                {
+                    let _ = f.write_all(&(0u32).to_le_bytes());
+                    for v in &all[..all.len().min(p.n_exp * 4 / 4)] {
+                        let _ = f.write_all(&v.to_le_bytes());
                     }
                 }
             }
-            execute_steps_mesh(mesh, gpu, ctx, &build.steps[split..])?;
         }
     }
+    let gfx1100_router_mode = hipfire_config::developer_var("HIPFIRE_GFX1100_ROUTER_W64").ok();
+    let gfx1151_radiowave_fusions = ctx.arch.is_gfx1151();
+    let exact_wave64_router = p.n_exp == 256
+        && ((ctx.arch.is_gfx1100()
+            // The exact fused router is the production gfx1100 path. `0` retains
+            // the two-launch reference path for A/B diagnosis; `approx` retains
+            // the old non-bit-exact research kernel without exposing it by
+            // accident through the former `1` opt-in.
+            && !matches!(gfx1100_router_mode.as_deref(), Some("0" | "approx")))
+            || gfx1151_radiowave_fusions);
+    static ROUTER_SHARED_FUSE: OnceLock<bool> = OnceLock::new();
+    let router_shared_fuse = exact_wave64_router
+        && p.batch_size == 1
+        && !p.skip_shared
+        && p.smi == 512
+        && p.shared_down_w.dtype == DType::MQ4G256
+        && p.shared_down_w.awq_scale.is_none()
+        && *ROUTER_SHARED_FUSE
+            .get_or_init(|| hipfire_config::developer_var("HIPFIRE_MOE_ROUTER_SHARED_FUSE").as_deref() == Ok("1"));
+    let wave64_router = (ctx.arch.is_gfx1201()
+        && hipfire_config::developer_var("HIPFIRE_GFX1201_ROUTER_W64").as_deref() != Ok("0"))
+        || (ctx.arch.is_gfx1100()
+            && p.n_exp == 256
+            // Research-only: faster on gfx1100, but its routing drift can
+            // change greedy trajectories and trigger an attractor.
+            && gfx1100_router_mode.as_deref() == Some("approx"));
+    if router_shared_fuse {
+        let shared_x_rot = unsafe {
+            GpuTensor {
+                buf: gpu.scratch.mq_x_rot.as_ref().unwrap().buf.alias(),
+                shape: vec![gpu.scratch.mq_x_rot.as_ref().unwrap().buf.size() / 4],
+                dtype: DType::F32,
+            }
+        };
+        hip!(
+            gpu.moe_router_softmax_topk_k8_wave64_exact_shared_silu_mq_rotate(
+                p.router_logits,
+                p.topk_indices,
+                p.topk_weights,
+                p.n_exp,
+                p.norm_topk_prob,
+                &shared_gate,
+                &shared_up,
+                &shared_x_rot,
+                p.smi,
+            )
+        )?;
+    } else if exact_wave64_router {
+        hip!(gpu.moe_router_softmax_topk_k8_wave64_exact(
+            p.router_logits,
+            p.topk_indices,
+            p.topk_weights,
+            p.n_exp,
+            p.norm_topk_prob
+        ))?;
+    } else if wave64_router {
+        hip!(gpu.moe_router_softmax_topk_k8_wave64(
+            p.router_logits,
+            p.topk_indices,
+            p.topk_weights,
+            p.n_exp,
+            p.norm_topk_prob
+        ))?;
+    } else {
+        hip!(gpu.softmax_f32(p.router_logits))?;
+        hip!(gpu.moe_topk_renorm_k8(
+            p.router_logits,
+            p.topk_indices,
+            p.topk_weights,
+            p.n_exp,
+            p.norm_topk_prob
+        ))?;
+    }
+
+    // ── Shared expert down ───────────────────────────────────────────────────
+    // EP: on rank>0 `skip_shared` is set so the replicated shared expert is
+    // summed exactly once (computed on rank 0 only). Router + shared gate/up
+    // still ran above (fused with the router GEMV) — only the down/accumulate
+    // is skipped here. Accumulates into `out_target` (= the EP partial when
+    // `routed_out` is set, else `x_residual`).
+    if !p.skip_shared {
+        if p.shared_down_w.dtype == DType::MQ4G256 {
+            hip!(gpu.ensure_mq_signs())?;
+            let x_rot_alias = unsafe {
+                GpuTensor {
+                    buf: gpu.scratch.mq_x_rot.as_ref().unwrap().buf.alias(),
+                    shape: vec![gpu.scratch.mq_x_rot.as_ref().unwrap().buf.size() / 4],
+                    dtype: DType::F32,
+                }
+            };
+            if let Some(awq) = p.shared_down_w.awq_scale {
+                hip!(gpu.fused_silu_mul_rotate_mq_awq(
+                    &shared_gate,
+                    &shared_up,
+                    awq,
+                    &x_rot_alias,
+                    p.smi
+                ))?;
+            } else if !router_shared_fuse {
+                hip!(gpu.fused_silu_mul_rotate_mq(&shared_gate, &shared_up, &x_rot_alias, p.smi))?;
+            }
+            hip!(gpu.gemv_hfq4g256_residual_sigmoid_scaled_gpu(
+                &p.shared_down_w.buf,
+                &x_rot_alias,
+                out_target,
+                p.scalar_buf,
+                p.shared_down_w.m,
+                p.shared_down_w.k,
+            ))?;
+        } else {
+            // Non-MQ4 shared expert down: only reached when A3B shared expert
+            // uses a non-MQ4 dtype. Requires deltanet feature for sigmoid_f32.
+            // Returns UnsupportedVariant for builds without the feature to keep
+            // hipfire-dispatch compilable without deltanet.
+            #[cfg(feature = "deltanet")]
+            {
+                hip!(gpu.sigmoid_f32(p.scalar_buf))?;
+                let shared_hid = unsafe { slice_moe_f32_view(p.ffn_hidden, 0, p.smi) };
+                hip!(gpu.silu_mul_f32(&shared_gate, &shared_up, &shared_hid))?;
+                static GEMV_DOWN: OnceLock<GemvFamily> = OnceLock::new();
+                let gemv = GEMV_DOWN.get_or_init(GemvFamily::new);
+                gemv.run_auto(ctx, gpu, &p.shared_down_w, &shared_hid, p.ffn_out)
+                    .map_err(|e| DispatchError::Hip(e.to_string()))?;
+                hip!(gpu.scaled_add_inplace_gpu_scalar_f32(out_target, p.ffn_out, p.scalar_buf))?;
+            }
+            #[cfg(not(feature = "deltanet"))]
+            return Err(DispatchError::UnsupportedVariant {
+                family: "moe",
+                variant: "shared-down-non-mq4-requires-deltanet",
+                arch: "",
+                quant: "",
+            });
+        }
+    }
+
+    // ── Indexed routed experts ────────────────────────────────────────────────
+    // Signs back the FWHT used by every MQ4/MQ6 gate_up rotation + silu-rotate
+    // (idempotent/cached). Only the paro path is sign-free.
+    if !res.routed_indexable_paro {
+        hip!(gpu.ensure_mq_signs())?;
+    }
+    let xr = x_rot_local.expect("use_gpu_topk implies x_rot_local is Some");
+    let gate_up_k = p.routed_gate_up_k;
+    let down_m = p.routed_down_m;
+    let down_k = p.routed_down_k;
+
+    // Nine-path fused MoE (NInfer D3+D4 graft, microbenched 1.40× at A3B dims):
+    // one x-staged CTA per row tile with 8 routed-expert warps replaces the
+    // per-(row,krank) indexed gate_up GEMV, and the down+weighted-combine fold
+    // replaces the expanded down GEMV + combine kernel — 3 launches total
+    // (D3, silu_rotate, D4) vs 4 with 64× less x restaging. Byte-exact with
+    // the replaced kernels by construction (same per-row accumulate order,
+    // same fold order). Gated to the measured shape: k=8, uniform MQ4G256,
+    // no graded tags, no AWQ, mi=512 (down_k), hidden ≤ 2048 (x LDS stage).
+    // Shape rule from .research/microbench/FINDINGS-moe.md: fused wins only
+    // for k≥8 with small per-expert intermediate; LFM-class (k=4, I=1792)
+    // stays on the chain. HIPFIRE_MOE_NINEPATH=0 opts out.
+    static MOE_NINEPATH: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        hipfire_config::developer_var("HIPFIRE_MOE_NINEPATH").unwrap_or_default()
+    });
+    let ninepath_mode = MOE_NINEPATH.as_str();
+    let ninepath_eligible = p.k == 8
+        && p.batch_size == 1
+        && p.hidden <= 2048
+        && p.mi == 512
+        && p.dtypes.routed_gate_up == DType::MQ4G256
+        && p.dtypes.routed_down == DType::MQ4G256
+        && p.expert_dtype_tags.is_none()
+        && p.expert_down_awq_ptrs.is_none()
+        && !p.defer_routed_combine;
+    // Modes: "0"/off = chain; "d3" = D3 only (RESEARCH: 1-ULP codegen
+    // divergence from the baseline gate_up — not byte-exact, and slower);
+    // "1"/"on" = D3+D4 (research); anything else incl. unset = D4 only
+    // (production default: byte-exact with the chain, +0.8% on the A3B
+    // serve battery — .research/microbench/FINDINGS-moe.md).
+    let ninepath_d3 = ninepath_eligible && matches!(ninepath_mode, "1" | "d3" | "on");
+    let ninepath_d4 =
+        ninepath_eligible && !matches!(ninepath_mode, "0" | "off" | "d3");
+
+    {
+        // ── Routed-expert dispatch via device-indexed merged kernels ──────────
+        //
+        // Mixed-tier graded quants (mq4p/mq3p/mq4r/mq4rug) carry a per-expert
+        // `expert_dtype_tags` table.  The merged kernels
+        // (`gemv_mixed_moe_gate_up_k8_indexed_batched` and
+        // `gemv_mixed_moe_down_k8_indexed_batched_expanded`) read that table
+        // on-device — no D2H, fully hipGraph-capturable — and branch the dequant
+        // per-block.  Uniform quants simply have `expert_dtype_tags = None` and
+        // fall through to the single-dtype arms below, which is byte-identical to
+        // the old pre-SP2 behaviour.
+        // Select gate_up + down GEMVs by their INDIVIDUAL dtypes, not a coupled
+        // routed_indexable_mqN flag — so the mixed "mq6-down" file (gate_up MQ4,
+        // down MQ6) dispatches the MQ4 gate_up GEMV and the MQ6 down GEMV. The
+        // all-MQ4 and all-MQ6 files select the same kernels as before (byte-identical).
+        if ninepath_d3 {
+            hip!(gpu.gemv_hfq4g256_moe_ninepath_d3(
+                p.expert_gate_up_ptrs,
+                p.topk_indices,
+                xr,
+                p.gate_batch,
+                p.up_batch,
+                p.mi,
+                gate_up_k,
+            ))?;
+        } else if res.routed_indexable_paro {
+            hip!(gpu.gemv_paro_q4g128_moe_gate_up_k8_indexed(
+                p.expert_gate_up_ptrs,
+                p.topk_indices,
+                xr,
+                p.gate_batch,
+                p.up_batch,
+                2 * p.mi,
+                gate_up_k,
+                p.k,
+            ))?;
+        } else if p.expert_dtype_tags.is_some() && p.dtypes.experts_all_gate_up_mq4 {
+            // Graded DOWN but UNIFORM MQ4 gate_up (down-only-graded redline): the
+            // tag table is needed only for the down step, so run the fast uniform
+            // MQ4 gate_up GEMV here instead of the merged dtype-tag kernel (which is
+            // ~5us/layer slower). The merged kernel still serves the graded down via
+            // the down dispatch below (it reads the same tag table). Byte-identical
+            // gate_up to the all-MQ4 arm.
+            hip!(gpu.gemv_hfq4g256_moe_gate_up_k8_indexed(
+                p.expert_gate_up_ptrs,
+                p.topk_indices,
+                xr,
+                p.gate_batch,
+                p.up_batch,
+                2 * p.mi,
+                gate_up_k,
+                p.k,
+            ))?;
+        } else if let Some(tags) = p.expert_dtype_tags {
+            // Per-expert mixed gate_up (N-tier graded: MQ6 hot / MQ4 mid / MQ2-Lloyd
+            // or MQ3-Lloyd cold). One merged kernel; block-per-(row,krank,token)
+            // reads tags[expert_id] (0=MQ6, 1=MQ2L, 2=MQ4, 3=MQ3L) and branches
+            // the dequant. m = 2*p.mi (kernel splits gate vs up at M/2 internally).
+            // X is the FWHT-rotated xr (same as the uniform MQ4/MQ6 arms above).
+            hip!(gpu.gemv_mixed_moe_gate_up_k8_indexed_batched(
+                p.expert_gate_up_ptrs,
+                tags,
+                p.topk_indices,
+                xr,
+                p.gate_batch,
+                p.up_batch,
+                2 * p.mi,
+                gate_up_k,
+                p.k,
+                1,
+            ))?;
+        } else if p.dtypes.routed_gate_up == DType::MQ2G256Lloyd {
+            // Uniform MQ2-Lloyd routed experts: ds4/minimax indexed Lloyd gate_up
+            // GEMV. y_gate/y_up are separate buffers; m = 2*p.mi (kernel splits at
+            // M/2 internally); trailing k_top = p.k. X is the FWHT-rotated xr.
+            hip!(gpu.deepseek4_gemv_mq2g256_lloyd_moe_gate_up_indexed(
+                p.expert_gate_up_ptrs,
+                p.topk_indices,
+                xr,
+                p.gate_batch,
+                p.up_batch,
+                2 * p.mi,
+                gate_up_k,
+                p.k,
+            ))?;
+        } else if p.dtypes.routed_gate_up == DType::MQ3G256Lloyd {
+            // Uniform MQ3-Lloyd routed experts: same indexed-Lloyd gate_up path,
+            // MQ3 launcher.
+            hip!(gpu.deepseek4_gemv_mq3g256_lloyd_moe_gate_up_indexed(
+                p.expert_gate_up_ptrs,
+                p.topk_indices,
+                xr,
+                p.gate_batch,
+                p.up_batch,
+                2 * p.mi,
+                gate_up_k,
+                p.k,
+            ))?;
+        } else if p.dtypes.routed_gate_up == DType::MQ5G256 {
+            hip!(gpu.gemv_hfq5g256_moe_gate_up_k8_indexed(
+                p.expert_gate_up_ptrs,
+                p.topk_indices,
+                xr,
+                p.gate_batch,
+                p.up_batch,
+                2 * p.mi,
+                gate_up_k,
+            ))?;
+        } else if p.dtypes.routed_gate_up == DType::MQ6G256 {
+            hip!(gpu.gemv_hfq6g256_moe_gate_up_k8_indexed(
+                p.expert_gate_up_ptrs,
+                p.topk_indices,
+                xr,
+                p.gate_batch,
+                p.up_batch,
+                2 * p.mi,
+                gate_up_k,
+                p.k,
+            ))?;
+        } else if p.dtypes.routed_gate_up == DType::MFP4G32E8 {
+            // mfp4-E8 grouped experts (gfx1151-only; gated in MoeResolution).
+            hip!(gpu.gemv_mfp4g32_e8_moe_gate_up_k8_indexed(
+                p.expert_gate_up_ptrs,
+                p.topk_indices,
+                xr,
+                p.gate_batch,
+                p.up_batch,
+                2 * p.mi,
+                gate_up_k,
+            ))?;
+        } else {
+            hip!(gpu.gemv_hfq4g256_moe_gate_up_k8_indexed(
+                p.expert_gate_up_ptrs,
+                p.topk_indices,
+                xr,
+                p.gate_batch,
+                p.up_batch,
+                2 * p.mi,
+                gate_up_k,
+                p.k,
+            ))?;
+        }
+
+        // Gate→down: fused silu+mul+rotate
+        if res.routed_indexable_paro {
+            let paro_down = p
+                .routed_down_paro
+                .as_ref()
+                .expect("routed_indexable_paro implies down paro sidecar");
+            hip!(gpu.fused_silu_mul_givens_rotate_f32(
+                p.gate_batch,
+                p.up_batch,
+                p.rot_batch,
+                &paro_down.pairs,
+                &paro_down.theta,
+                &paro_down.scales,
+                p.k,
+                p.mi,
+                paro_down.krot,
+            ))?;
+        } else if let Some(awq_ptrs) = p.expert_down_awq_ptrs {
+            // Route A MoE-AWQ: per-routed-expert down.awq_scale selected by
+            // topk_indices[krank]. Divides silu(g)*u by the expert's scale before
+            // the FWHT (AWQ math (W·s)·(x/s)=W·x). Only reached on .hfq files
+            // carrying per-expert down sidecars — byte-identical otherwise.
+            hip!(gpu.fused_silu_mul_rotate_mq_awq_indexed_batched(
+                p.gate_batch,
+                p.up_batch,
+                awq_ptrs,
+                p.topk_indices,
+                p.rot_batch,
+                p.mi,
+                p.k,
+            ))?;
+        } else {
+            // MQ4/MQ6, no AWQ on expert down weights (the common case for A3B).
+            hip!(gpu.fused_silu_mul_rotate_mq_batched(
+                p.gate_batch,
+                p.up_batch,
+                p.rot_batch,
+                p.mi,
+                p.k
+            ))?;
+        }
+
+        // Expanded write — down GEMV by the DOWN dtype (mixed mq6-down lands here).
+        // FIXME(Step 8): replace hardcoded 1 with p.batch_size when grouped prefill lands
+        if ninepath_d4 {
+            hip!(gpu.gemv_hfq4g256_moe_ninepath_d4(
+                p.expert_down_ptrs,
+                p.topk_indices,
+                p.topk_weights,
+                p.rot_batch,
+                out_target,
+                down_m,
+                down_k,
+            ))?;
+        } else if let Some(tags) = p.expert_dtype_tags {
+            // Per-expert mixed down (graded MQ6 hot / MQ2-Lloyd cold). One
+            // merged kernel; block-per-(row,krank,token) reads tags[expert_id]
+            // (block-uniform → no warp divergence) and branches the dequant.
+            // Writes the EXPANDED buffer for BOTH dtypes → the single shared
+            // moe_down_combine_k8_batched runs below (self-combine forced off).
+            hip!(gpu.gemv_mixed_moe_down_k8_indexed_batched_expanded(
+                p.expert_down_ptrs,
+                tags,
+                p.topk_indices,
+                p.rot_batch,
+                p.down_expanded,
+                down_m,
+                down_k,
+                p.k,
+                1,
+            ))?;
+        } else if res.routed_indexable_paro {
+            hip!(gpu.gemv_paro_q4g128_moe_down_k8_indexed_batched(
+                p.expert_down_ptrs,
+                p.topk_indices,
+                p.rot_batch,
+                p.down_expanded,
+                down_m,
+                down_k,
+                p.k,
+                1,
+            ))?;
+        } else if p.dtypes.routed_down == DType::MQ2G256Lloyd {
+            // MQ2-Lloyd down: atomic, weighted, SELF-COMBINING residual GEMV.
+            // silu-output rotate (rot_batch) -> down -> * topk_weight[krank] ->
+            // atomicAdd into out_target, all in one launch. NO separate combine
+            // (skipped below). out_target = routed_out (EP zeroed partial) or
+            // x_residual; the atomic accumulate is EP-correct unchanged.
+            hip!(
+                gpu.deepseek4_gemv_mq2g256_lloyd_moe_down_residual_scaled_indexed(
+                    p.expert_down_ptrs,
+                    p.topk_indices,
+                    p.topk_weights,
+                    p.rot_batch,
+                    out_target,
+                    down_m,
+                    down_k,
+                    p.k,
+                )
+            )?;
+        } else if p.dtypes.routed_down == DType::MQ3G256Lloyd {
+            // MQ3-Lloyd down: same atomic self-combining residual GEMV, MQ3 launcher.
+            hip!(
+                gpu.deepseek4_gemv_mq3g256_lloyd_moe_down_residual_scaled_indexed(
+                    p.expert_down_ptrs,
+                    p.topk_indices,
+                    p.topk_weights,
+                    p.rot_batch,
+                    out_target,
+                    down_m,
+                    down_k,
+                    p.k,
+                )
+            )?;
+        } else if p.dtypes.routed_down == DType::MQ5G256 {
+            hip!(gpu.gemv_hfq5g256_moe_down_k8_indexed_batched_expanded(
+                p.expert_down_ptrs,
+                p.topk_indices,
+                p.rot_batch,
+                p.down_expanded,
+                down_m,
+                down_k,
+                p.k,
+                1,
+            ))?;
+        } else if p.dtypes.routed_down == DType::MQ6G256 {
+            hip!(gpu.gemv_hfq6g256_moe_down_k8_indexed_batched_expanded(
+                p.expert_down_ptrs,
+                p.topk_indices,
+                p.rot_batch,
+                p.down_expanded,
+                down_m,
+                down_k,
+                p.k,
+                1,
+            ))?;
+        } else if p.dtypes.routed_down == DType::MFP4G32E8 {
+            // mfp4-E8 grouped expert down (atomic-free expanded; combine below).
+            hip!(gpu.gemv_mfp4g32_e8_moe_down_k8_indexed_batched_expanded(
+                p.expert_down_ptrs,
+                p.topk_indices,
+                p.rot_batch,
+                p.down_expanded,
+                down_m,
+                down_k,
+                p.k,
+                1,
+            ))?;
+        } else if down_last_combine {
+            hip!(gpu.gemv_hfq4g256_moe_down_k8_indexed_last_combine(
+                p.expert_down_ptrs,
+                p.topk_indices,
+                p.rot_batch,
+                p.down_expanded,
+                p.topk_weights,
+                out_target,
+                down_m,
+                down_k,
+                p.k,
+                1,
+            ))?;
+        } else {
+            hip!(gpu.gemv_hfq4g256_moe_down_k8_indexed_batched_expanded(
+                p.expert_down_ptrs,
+                p.topk_indices,
+                p.rot_batch,
+                p.down_expanded,
+                down_m,
+                down_k,
+                p.k,
+                1,
+            ))?;
+        }
+    } // end routed-expert dispatch block
+
+    // FIXME(Step 8): replace hardcoded 1 with p.batch_size when grouped prefill lands
+    // EP: routed combine accumulates into `out_target` (the zeroed partial when
+    // `routed_out` is set, else `x_residual`). Under EP each rank's non-owned
+    // experts read zeroed weights (load-time dummy-fill) → contribute 0, so the
+    // all-reduced sum of partials equals the full single-GPU combine.
+    // MQ2/MQ3-Lloyd down self-combines via the atomic _residual_scaled_indexed
+    // GEMV above (weighted accumulate into out_target). Running the expanded
+    // combine here would double-count the routed contribution (atomic residual
+    // + combine of stale down_expanded), so skip it for the Lloyd down path.
+    // Per-expert mixed mode writes the EXPANDED down buffer for BOTH dtypes
+    // (incl. the MQ2-Lloyd experts), so the single shared combine MUST run.
+    // Never take the Lloyd atomic self-combine path here, or the Lloyd
+    // experts double-count (atomic + combine) or zero out (expanded written,
+    // combine skipped) — silent numerical corruption. The merged kernel's
+    // expanded write replaces the standalone Lloyd atomic GEMV.
+    let routed_down_self_combines = down_last_combine
+        || (p.expert_dtype_tags.is_none()
+            && matches!(
+                p.dtypes.routed_down,
+                DType::MQ2G256Lloyd | DType::MQ3G256Lloyd
+            ));
+    if !ninepath_d4 && !routed_down_self_combines && !p.defer_routed_combine {
+        hip!(gpu.moe_down_combine_k8_batched(
+            p.down_expanded,
+            p.topk_weights,
+            out_target,
+            down_m,
+            p.k,
+            1
+        ))?;
+    }
+
     Ok(())
 }
 
@@ -343,6 +990,7 @@ pub fn run_moe_decode(
 /// CPU-top-K fallback is not a Step program). Mirrors the legacy
 /// `x_rot_local` block; returns the rotated activation (or `None` when the
 /// routed block does not need one).
+#[allow(dead_code)]
 fn launch_decode_rotate<'a>(
     gpu: &mut Gpu,
     p: &'a crate::families::moe::MoeParams<'a>,
@@ -391,6 +1039,7 @@ fn launch_decode_rotate<'a>(
 /// fallback is not a Step program). Uses the SAME extracted helpers as the
 /// Step program's gate-side steps, so the kernels can never drift. The
 /// shared gate/up slice views are created inside the helpers.
+#[allow(dead_code)]
 fn launch_gate_side(
     ctx: &DispatchCtx,
     gpu: &mut Gpu,
@@ -1107,7 +1756,7 @@ pub fn run_moe_decode_bias_aware(
     //    write + fixed-order non-atomic combine into ffn_out — bit-reproducible
     //    for greedy/spec-decode. MOE_DETERMINISTIC=0 uses the faster
     //    atomicAdd-fused path (nondeterministic; bench only).
-    let deterministic = std::env::var("HIPFIRE_DEEPSEEK4_MOE_DETERMINISTIC").as_deref() != Ok("0");
+    let deterministic = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MOE_DETERMINISTIC").as_deref() != Ok("0");
     if deterministic {
         hip!(gpu.deepseek4_gemv_mq2g256_lloyd_moe_down_expanded_k4(
             p.expert_down_ptrs,
@@ -1149,6 +1798,10 @@ pub fn run_moe_decode_bias_aware(
 /// `Lloyd4w` on gfx11+, `Base` otherwise). Selected once per gate_up/down call.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum GroupedLloydVariant {
+    /// i8 WMMA MMQ path (gfx1151): decodes the 2-bit Lloyd index via an int8
+    /// codebook LUT and runs i8 WMMA at ~2x the FP16 rate. Top priority when
+    /// enabled — ~1.7x the FP16 grouped GEMM on the DeepSeek-V4 prefill shape.
+    I8,
     N32,
     Cnd,
     EightW,
@@ -1163,13 +1816,16 @@ pub(crate) enum GroupedLloydVariant {
 /// only on the 4w path; `use_nosync` ⊂ `use_mmqload` ⊂ `use_lloyd_4w`.
 pub(crate) fn select_grouped_lloyd_variant(
     use_lloyd_4w: bool,
+    i8: bool,
     n32: bool,
     cnd: bool,
     eightw: bool,
     use_mmqload: bool,
     use_nosync: bool,
 ) -> GroupedLloydVariant {
-    if use_lloyd_4w && n32 {
+    if i8 {
+        GroupedLloydVariant::I8
+    } else if use_lloyd_4w && n32 {
         GroupedLloydVariant::N32
     } else if use_lloyd_4w && cnd {
         GroupedLloydVariant::Cnd
@@ -1184,6 +1840,10 @@ pub(crate) fn select_grouped_lloyd_variant(
     } else {
         GroupedLloydVariant::Base
     }
+}
+
+fn use_gfx1151_i8_moe(arch: &str) -> bool {
+    arch == "gfx1151"
 }
 
 /// Dispatch one MQ2-Lloyd grouped GEMM. All seven variants share the signature
@@ -1207,6 +1867,18 @@ pub(crate) fn dispatch_grouped_lloyd(
 ) -> Result<(), DispatchError> {
     use GroupedLloydVariant as V;
     let r = match variant {
+        V::I8 => gpu.gemm_mq2g256_lloyd_moe_grouped_mmq_gfx1151(
+            ptrs,
+            tile_ids,
+            slot_index,
+            x,
+            y,
+            m,
+            k,
+            x_row_div,
+            m_total_max,
+            rows,
+        ),
         V::N32 => gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_n32(
             ptrs,
             tile_ids,
@@ -1342,7 +2014,7 @@ pub fn run_moe_prefill_bias_aware(
     }
 
     // DIAG: dump per-layer topk indices ([B, k_top] i32) — off by default.
-    if let Ok(path) = std::env::var("HIPFIRE_DEEPSEEK4_DUMP_TOPK") {
+    if let Ok(path) = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_DUMP_TOPK") {
         use std::io::Write;
         let raw = hip!(gpu.download_f32(p.topk_indices))?;
         let n = batch_size * k_top;
@@ -1367,25 +2039,27 @@ pub fn run_moe_prefill_bias_aware(
     }
 
     // ── Grouped vs scalar gate ────────────────────────────────────────────────
-    let gate_threshold: usize = std::env::var("HIPFIRE_DEEPSEEK4_MOE_GROUPED_GATE")
+    let gate_threshold: usize = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MOE_GROUPED_GATE")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(128);
     let use_grouped = batch_size >= gate_threshold
-        && std::env::var("HIPFIRE_DEEPSEEK4_MOE_GROUPED").as_deref() != Ok("0");
+        && hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MOE_GROUPED").as_deref() != Ok("0");
 
     // Shared research levers (read once; default 4w on gfx11+).
-    let lloyd_4w_base = match std::env::var("HIPFIRE_DEEPSEEK4_MOE_LLOYD_4W").as_deref() {
+    let lloyd_4w_base = match hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MOE_LLOYD_4W").as_deref() {
         Ok("0") => Some(false),
         Ok("1") => Some(true),
         _ => None,
     };
     let arch_4w = gpu.arch.starts_with("gfx11") || gpu.arch.starts_with("gfx12");
-    let n32 = std::env::var("HIPFIRE_DEEPSEEK4_MOE_N32").as_deref() == Ok("1");
-    let cnd = std::env::var("HIPFIRE_DEEPSEEK4_MOE_CND").as_deref() == Ok("1");
-    let eightw = std::env::var("HIPFIRE_DEEPSEEK4_MOE_8W").as_deref() == Ok("1");
-    let mmqload_env = std::env::var("HIPFIRE_DEEPSEEK4_MOE_MMQLOAD").as_deref() == Ok("1");
-    let nosync_env = std::env::var("HIPFIRE_DEEPSEEK4_MOE_NOSYNC").as_deref() == Ok("1");
+    let n32 = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MOE_N32").as_deref() == Ok("1");
+    let cnd = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MOE_CND").as_deref() == Ok("1");
+    let eightw = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MOE_8W").as_deref() == Ok("1");
+    let mmqload_env = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MOE_MMQLOAD").as_deref() == Ok("1");
+    let nosync_env = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MOE_NOSYNC").as_deref() == Ok("1");
+    // i8 MMQ path (gfx1151 only): 2-bit Lloyd → int8 codebook LUT + i8 WMMA.
+    let i8_moe = use_gfx1151_i8_moe(&gpu.arch);
 
     if use_grouped {
         // Checked aligned bound: total_slots = batch*k, m_total_max aligned
@@ -1413,8 +2087,11 @@ pub fn run_moe_prefill_bias_aware(
             lloyd_4w_base.unwrap_or(arch_4w) && (2 * im) % 64 == 0 && hidden % 256 == 0;
         let use_mmqload_gu = use_lloyd_4w_gu && mmqload_env;
         let use_nosync_gu = use_mmqload_gu && nosync_env;
+        // i8 path requires (2*im)%16==0 && hidden%256==0 (looser than 4w's %64).
+        let use_i8_gu = i8_moe && (2 * im) % 16 == 0 && hidden % 256 == 0;
         let v_gu = select_grouped_lloyd_variant(
             use_lloyd_4w_gu,
+            use_i8_gu,
             n32,
             cnd,
             eightw,
@@ -1437,7 +2114,7 @@ pub fn run_moe_prefill_bias_aware(
         )?;
 
         // Unscatter + SwiGLU·clamp.
-        let use_fused_unscatter_silu = std::env::var("HIPFIRE_DEEPSEEK4_FUSED_UNSCATTER_SILU")
+        let use_fused_unscatter_silu = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_FUSED_UNSCATTER_SILU")
             .map(|s| s != "0")
             .unwrap_or(false);
         if use_fused_unscatter_silu {
@@ -1477,8 +2154,10 @@ pub fn run_moe_prefill_bias_aware(
         let use_lloyd_4w_dn = lloyd_4w_base.unwrap_or(arch_4w) && hidden % 64 == 0 && im % 256 == 0;
         let use_mmqload_dn = use_lloyd_4w_dn && mmqload_env;
         let use_nosync_dn = use_mmqload_dn && nosync_env;
+        let use_i8_dn = i8_moe && hidden % 16 == 0 && im % 256 == 0;
         let v_dn = select_grouped_lloyd_variant(
             use_lloyd_4w_dn,
+            use_i8_dn,
             n32,
             cnd,
             eightw,
@@ -1538,7 +2217,7 @@ pub fn run_moe_prefill_bias_aware(
         // Down: deterministic expanded+combine (default; bit-reproducible for
         // spec-decode) vs non-deterministic atomic-accumulate.
         let deterministic =
-            std::env::var("HIPFIRE_DEEPSEEK4_MOE_DETERMINISTIC").as_deref() != Ok("0");
+            hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MOE_DETERMINISTIC").as_deref() != Ok("0");
         if deterministic {
             hip!(gpu.deepseek4_gemv_mq2g256_lloyd_moe_down_expanded_k4(
                 p.expert_down_ptrs,
@@ -1778,7 +2457,7 @@ pub fn run_moe_prefill(
 
     let res = MoePrefillResolution::resolve(&p.dtypes, &ctx.arch, &ctx.flags);
     let force_mq4_grouped_fp16 = res.force_mq4_grouped_fp16 || p.force_mq4_grouped_fp16;
-    if std::env::var("HIPFIRE_MOE_PREFILL_TRACE").ok().as_deref() == Some("1") {
+    if hipfire_config::developer_var("HIPFIRE_MOE_PREFILL_TRACE").ok().as_deref() == Some("1") {
         eprintln!(
             "[moe-prefill] arch={} shared=({:?},{:?},{:?},{:?}) routed=({:?},{:?}) \
              path2={} force_mq4_fp16={} grouped_i8={:?}",
@@ -1852,9 +2531,17 @@ pub fn dispatch_fused(
 
 #[cfg(test)]
 mod mixed_dispatch_tests {
-    use super::build_contiguous_permutation;
+    use super::{build_contiguous_permutation, use_gfx1151_i8_moe};
     use crate::families::moe_buckets::bucket_topk_by_tier;
     use rdna_compute::DType::*;
+
+    #[test]
+    fn deepseek4_i8_moe_is_exact_gfx1151_only() {
+        assert!(use_gfx1151_i8_moe("gfx1151"));
+        for arch in ["gfx1100", "gfx1150", "gfx1152", "gfx1200", "gfx1201"] {
+            assert!(!use_gfx1151_i8_moe(arch), "unexpected i8 route on {arch}");
+        }
+    }
 
     /// EQUIVALENCE INVARIANT (host half): an all-ONE-tier table yields the
     /// IDENTITY permutation and a single full-width range. This is the

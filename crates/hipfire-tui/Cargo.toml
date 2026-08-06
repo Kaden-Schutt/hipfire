@@ -6,8 +6,11 @@ license.workspace = true
 
 [dependencies]
 anyhow = "1"
-crossterm = "0.28"
-ratatui = "0.29"
+crossterm = "0.29"
+hipfire-config = { path = "../hipfire-config" }
+hipfire-client = { path = "../hipfire-client" }
+hipfire-registry = { path = "../hipfire-registry" }
+ratatui = "0.30"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-ureq = { version = "2", default-features = false }
+ureq = { version = "3", default-features = false }

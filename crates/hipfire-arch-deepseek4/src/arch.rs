@@ -1101,13 +1101,14 @@ impl DeepseekV4 {
         // N). Layers >= N fall back to shared-only FFN. Each layer's
         // expert blob is ~1.84 GB on the FP4-fixed HFQ (post-unpack
         // logical shape), so 22 layers ≈ 40 GB.
-        let upload_experts = std::env::var("HIPFIRE_DEEPSEEK4_UPLOAD_EXPERTS")
+        let upload_experts = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_UPLOAD_EXPERTS")
             .ok()
             .as_deref()
             != Some("0");
-        let expert_layer_end: Option<usize> = std::env::var("HIPFIRE_DEEPSEEK4_EXPERT_LAYER_END")
-            .ok()
-            .and_then(|s| s.parse().ok());
+        let expert_layer_end: Option<usize> =
+            hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_EXPERT_LAYER_END")
+                .ok()
+                .and_then(|s| s.parse().ok());
 
         // ── MTP addon HFQ discovery ──────────────────────────────────────
         // Resolves an optional second HFQ holding only `mtp.0.*` tensors so
@@ -1125,7 +1126,7 @@ impl DeepseekV4 {
         // (or, for one-shot quants that put MTP in-band, the base) contains
         // `mtp.0.norm.weight`.
         let mut mtp_addon: Option<HfqFile> = {
-            let env_path = std::env::var("HIPFIRE_DEEPSEEK4_MTP_ADDON").ok();
+            let env_path = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MTP_ADDON").ok();
             let resolved: Option<std::path::PathBuf> = if let Some(p) = env_path {
                 Some(std::path::PathBuf::from(p))
             } else {
@@ -1287,7 +1288,7 @@ impl DeepseekV4 {
             // projections for the WMMA GEMM path. Doubles compressor
             // VRAM footprint but unlocks the 26× speedup measured in
             // microbench (gemm_f16_x_f16_wmma vs gemm_f32_register_tiled).
-            let comp_f16_wmma = std::env::var("HIPFIRE_DEEPSEEK4_COMP_F16_WMMA")
+            let comp_f16_wmma = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_COMP_F16_WMMA")
                 .map(|s| s != "0")
                 .unwrap_or(true);
             if layer.compress_ratio > 0 {
@@ -1521,7 +1522,7 @@ impl DeepseekV4 {
         let mtp_source: &HfqFile = mtp_addon.as_ref().unwrap_or(&*hfq);
         let mtp_present = mtp_source.find_tensor_info("mtp.0.norm.weight").is_some();
         if mtp_present {
-            let load_mtp = std::env::var("HIPFIRE_DEEPSEEK4_LOAD_MTP")
+            let load_mtp = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_LOAD_MTP")
                 .map(|s| s != "0")
                 .unwrap_or(true)
                 && cfg.reap_keep.is_none();
@@ -2449,14 +2450,15 @@ impl DeepseekV4 {
         cfg: &DeepseekV4Config,
         gpu: &mut Gpu,
     ) -> Result<DeepseekV4Weights, String> {
-        let upload_experts = std::env::var("HIPFIRE_DEEPSEEK4_UPLOAD_EXPERTS")
+        let upload_experts = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_UPLOAD_EXPERTS")
             .ok()
             .as_deref()
             != Some("0");
-        let expert_layer_end: Option<usize> = std::env::var("HIPFIRE_DEEPSEEK4_EXPERT_LAYER_END")
-            .ok()
-            .and_then(|s| s.parse().ok());
-        let comp_f16_wmma = std::env::var("HIPFIRE_DEEPSEEK4_COMP_F16_WMMA")
+        let expert_layer_end: Option<usize> =
+            hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_EXPERT_LAYER_END")
+                .ok()
+                .and_then(|s| s.parse().ok());
+        let comp_f16_wmma = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_COMP_F16_WMMA")
             .map(|s| s != "0")
             .unwrap_or(true);
 
@@ -2769,7 +2771,7 @@ impl DeepseekV4 {
         // `mtp.0.norm.weight` as the canary).
         let mtp_present = source.tensor_info("mtp.0.norm.weight").is_some();
         if mtp_present {
-            let load_mtp = std::env::var("HIPFIRE_DEEPSEEK4_LOAD_MTP")
+            let load_mtp = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_LOAD_MTP")
                 .map(|s| s != "0")
                 .unwrap_or(true);
             if !load_mtp {

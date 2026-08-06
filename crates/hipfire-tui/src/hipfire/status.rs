@@ -35,10 +35,16 @@ impl StatusState {
         let paths_ok = vec![
             ("~/.hipfire".into(), paths.root.exists()),
             ("models".into(), paths.models.exists()),
-            ("config.json".into(), paths.config.exists()),
+            ("config.toml".into(), paths.config.exists()),
+            ("legacy config.json".into(), paths.legacy_config.exists()),
+            ("models.toml".into(), paths.models_catalog.exists()),
             (
-                "per_model_config.json".into(),
-                paths.per_model_config.exists(),
+                "legacy models.json".into(),
+                paths.legacy_models_catalog.exists(),
+            ),
+            (
+                "legacy per_model_config.json".into(),
+                paths.legacy_per_model_config.exists(),
             ),
             ("serve.log".into(), paths.serve_log.exists()),
         ];
@@ -81,8 +87,8 @@ impl StatusState {
 }
 
 pub fn start_background_serve() -> Result<()> {
-    let mut cmd = super::cli_command().ok_or_else(|| {
-        anyhow!("cli/index.ts not found (set HIPFIRE_CLI_SCRIPT or run hipfire from the repo root)")
+    let mut cmd = super::native_cli_command().ok_or_else(|| {
+        anyhow!("native hipfire binary not found (set HIPFIRE_CLI_BIN or install hipfire)")
     })?;
     cmd.arg("serve")
         .arg("-d")

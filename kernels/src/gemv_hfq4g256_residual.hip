@@ -4,6 +4,10 @@
 
 #include <hip/hip_runtime.h>
 
+#ifndef HIPFIRE_RESIDUAL_KERNEL
+#define HIPFIRE_RESIDUAL_KERNEL gemv_hfq4g256_residual
+#endif
+
 // HFQ4-G256 GEMV with fused residual add: y[row] += A[row] · x.
 //
 // VARIANT R36c1 res_w_preload:
@@ -28,7 +32,7 @@ __launch_bounds__(32, 32)
 #else
 __launch_bounds__(32, 16)
 #endif
-extern "C" __global__ void gemv_hfq4g256_residual(
+extern "C" __global__ void HIPFIRE_RESIDUAL_KERNEL(
     const char* __restrict__ A,
     const float* __restrict__ x,
     float* __restrict__ y,
@@ -40,11 +44,25 @@ extern "C" __global__ void gemv_hfq4g256_residual(
     const bool have_row1 = row1 < M;
     const int tid = threadIdx.x;
 
+#if defined(HIPFIRE_GFX1151_RESIDUAL_K4096)
+    // Exact Qwen3.6 A3B decode contract. Making both quads static lets LLVM
+    // schedule the two independent row chains across the full K extent and
+    // removes the dead generic tail machinery on gfx1151.
+    const int groups_per_row = 16;
+#else
     const int groups_per_row = K / 256;
+#endif
     const long long row_stride = (long long)groups_per_row * 136;
     const char* row_ptr0 = A + (long long)row0 * row_stride;
     const char* row_ptr1 = A + (long long)(have_row1 ? row1 : row0) * row_stride;
     const int boff = tid * 4;
+    const unsigned int row_weight_offset0 = (unsigned int)((long long)row0 * row_stride);
+    const unsigned int row_weight_offset1 =
+        (unsigned int)((long long)(have_row1 ? row1 : row0) * row_stride);
+#if HIPFIRE_GFX12_WEIGHT_BUFFER_LOADS
+    // One matrix-wide SRD keeps the dual-row kernel at 94 VGPR / zero scratch.
+    const auto weight_rsrc = HIPFIRE_WEIGHT_RSRC(A);
+#endif
 
     float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
     float bcc0 = 0.0f, bcc1 = 0.0f, bcc2 = 0.0f, bcc3 = 0.0f;
@@ -62,12 +80,26 @@ extern "C" __global__ void gemv_hfq4g256_residual(
              + ((sc) * (float)(((pk) >> 28) & 0xFu) + (zp)) * (x7); \
     } while (0)
 
-    #define LOAD_W(gp, sc, zp, pk) do { \
-        (sc) = __builtin_bit_cast(float, *(const unsigned int*)(gp)); \
-        (zp) = __builtin_bit_cast(float, *(const unsigned int*)((gp) + 4)); \
-        (pk) = *(const unsigned int*)((gp) + 8 + boff); \
+    #if HIPFIRE_GFX1151_RESIDUAL_HYBRID_BUFFER
+    #define HIPFIRE_RESIDUAL_LOAD_SC(weight_rsrc, gp, weight_offset) (*(const unsigned int*)(gp))
+    #define HIPFIRE_RESIDUAL_LOAD_ZP(weight_rsrc, gp, weight_offset) (*(const unsigned int*)((gp) + 4))
+    #else
+    #define HIPFIRE_RESIDUAL_LOAD_SC(weight_rsrc, gp, weight_offset) HIPFIRE_WEIGHT_LOAD_PTR_U32(weight_rsrc, gp, weight_offset)
+    #define HIPFIRE_RESIDUAL_LOAD_ZP(weight_rsrc, gp, weight_offset) HIPFIRE_WEIGHT_LOAD_PTR_U32(weight_rsrc, (gp) + 4, (weight_offset) + 4)
+    #endif
+
+    #define LOAD_W(gp, weight_offset, sc, zp, pk) do { \
+        (sc) = __builtin_bit_cast(float, HIPFIRE_RESIDUAL_LOAD_SC(weight_rsrc, gp, weight_offset)); \
+        (zp) = __builtin_bit_cast(float, HIPFIRE_RESIDUAL_LOAD_ZP(weight_rsrc, gp, weight_offset)); \
+        (pk) = HIPFIRE_WEIGHT_LOAD_PTR_U32(weight_rsrc, (gp) + 8 + boff, (weight_offset) + 8 + boff); \
     } while (0)
 
+#if defined(HIPFIRE_GFX1151_RESIDUAL_K4096)
+    // Keep the fixed four-quad bound without expanding the body. Full unroll
+    // doubles the instruction footprint; factor-two unroll spills private=16
+    // and is not admissible for direct gfx1151 PM4 replay.
+    #pragma unroll 1
+#endif
     for (int q = 0; q < quads; q++) {
         const int g = q << 2;
         const int base0 = g * 256 + tid * 8;
@@ -86,14 +118,14 @@ extern "C" __global__ void gemv_hfq4g256_residual(
         float sc0a, zp0a, sc1a, zp1a, sc2a, zp2a, sc3a, zp3a;
         float sc0b, zp0b, sc1b, zp1b, sc2b, zp2b, sc3b, zp3b;
         unsigned int pk0a, pk1a, pk2a, pk3a, pk0b, pk1b, pk2b, pk3b;
-        LOAD_W(row_ptr0 + g * 136, sc0a, zp0a, pk0a);
-        LOAD_W(row_ptr0 + (g + 1) * 136, sc1a, zp1a, pk1a);
-        LOAD_W(row_ptr0 + (g + 2) * 136, sc2a, zp2a, pk2a);
-        LOAD_W(row_ptr0 + (g + 3) * 136, sc3a, zp3a, pk3a);
-        LOAD_W(row_ptr1 + g * 136, sc0b, zp0b, pk0b);
-        LOAD_W(row_ptr1 + (g + 1) * 136, sc1b, zp1b, pk1b);
-        LOAD_W(row_ptr1 + (g + 2) * 136, sc2b, zp2b, pk2b);
-        LOAD_W(row_ptr1 + (g + 3) * 136, sc3b, zp3b, pk3b);
+        LOAD_W(row_ptr0 + g * 136, row_weight_offset0 + g * 136, sc0a, zp0a, pk0a);
+        LOAD_W(row_ptr0 + (g + 1) * 136, row_weight_offset0 + (g + 1) * 136, sc1a, zp1a, pk1a);
+        LOAD_W(row_ptr0 + (g + 2) * 136, row_weight_offset0 + (g + 2) * 136, sc2a, zp2a, pk2a);
+        LOAD_W(row_ptr0 + (g + 3) * 136, row_weight_offset0 + (g + 3) * 136, sc3a, zp3a, pk3a);
+        LOAD_W(row_ptr1 + g * 136, row_weight_offset1 + g * 136, sc0b, zp0b, pk0b);
+        LOAD_W(row_ptr1 + (g + 1) * 136, row_weight_offset1 + (g + 1) * 136, sc1b, zp1b, pk1b);
+        LOAD_W(row_ptr1 + (g + 2) * 136, row_weight_offset1 + (g + 2) * 136, sc2b, zp2b, pk2b);
+        LOAD_W(row_ptr1 + (g + 3) * 136, row_weight_offset1 + (g + 3) * 136, sc3b, zp3b, pk3b);
 
         // Pure FMA phase: same dual-row DOG order and acc slots as baseline.
         DOG_X8(sc0a, zp0a, pk0a, acc0,
@@ -124,8 +156,8 @@ extern "C" __global__ void gemv_hfq4g256_residual(
         const float4 xb = *reinterpret_cast<const float4*>(x + base + 4);
         float sc0, zp0, sc1, zp1;
         unsigned int pk0, pk1;
-        LOAD_W(row_ptr0 + g * 136, sc0, zp0, pk0);
-        LOAD_W(row_ptr1 + g * 136, sc1, zp1, pk1);
+        LOAD_W(row_ptr0 + g * 136, row_weight_offset0 + g * 136, sc0, zp0, pk0);
+        LOAD_W(row_ptr1 + g * 136, row_weight_offset1 + g * 136, sc1, zp1, pk1);
         DOG_X8(sc0, zp0, pk0, acc0,
                xa.x, xa.y, xa.z, xa.w, xb.x, xb.y, xb.z, xb.w);
         DOG_X8(sc1, zp1, pk1, bcc0,
@@ -138,8 +170,8 @@ extern "C" __global__ void gemv_hfq4g256_residual(
         const float4 xb = *reinterpret_cast<const float4*>(x + base + 4);
         float sc0, zp0, sc1, zp1;
         unsigned int pk0, pk1;
-        LOAD_W(row_ptr0 + g * 136, sc0, zp0, pk0);
-        LOAD_W(row_ptr1 + g * 136, sc1, zp1, pk1);
+        LOAD_W(row_ptr0 + g * 136, row_weight_offset0 + g * 136, sc0, zp0, pk0);
+        LOAD_W(row_ptr1 + g * 136, row_weight_offset1 + g * 136, sc1, zp1, pk1);
         DOG_X8(sc0, zp0, pk0, acc1,
                xa.x, xa.y, xa.z, xa.w, xb.x, xb.y, xb.z, xb.w);
         DOG_X8(sc1, zp1, pk1, bcc1,
@@ -152,14 +184,16 @@ extern "C" __global__ void gemv_hfq4g256_residual(
         const float4 xb = *reinterpret_cast<const float4*>(x + base + 4);
         float sc0, zp0, sc1, zp1;
         unsigned int pk0, pk1;
-        LOAD_W(row_ptr0 + g * 136, sc0, zp0, pk0);
-        LOAD_W(row_ptr1 + g * 136, sc1, zp1, pk1);
+        LOAD_W(row_ptr0 + g * 136, row_weight_offset0 + g * 136, sc0, zp0, pk0);
+        LOAD_W(row_ptr1 + g * 136, row_weight_offset1 + g * 136, sc1, zp1, pk1);
         DOG_X8(sc0, zp0, pk0, acc2,
                xa.x, xa.y, xa.z, xa.w, xb.x, xb.y, xb.z, xb.w);
         DOG_X8(sc1, zp1, pk1, bcc2,
                xa.x, xa.y, xa.z, xa.w, xb.x, xb.y, xb.z, xb.w);
     }
     #undef LOAD_W
+    #undef HIPFIRE_RESIDUAL_LOAD_SC
+    #undef HIPFIRE_RESIDUAL_LOAD_ZP
     #undef DOG_X8
 
     float acc = (acc0 + acc1) + (acc2 + acc3);

@@ -4,6 +4,16 @@
 
 #include <hip/hip_runtime.h>
 
+#ifndef HIPFIRE_RESIDUAL_MULTIROW_R2_KERNEL
+#define HIPFIRE_RESIDUAL_MULTIROW_R2_KERNEL gemv_hfq4g256_residual_multirow_r2
+#endif
+#ifndef HIPFIRE_RESIDUAL_MULTIROW_R4_KERNEL
+#define HIPFIRE_RESIDUAL_MULTIROW_R4_KERNEL gemv_hfq4g256_residual_multirow_r4
+#endif
+#ifndef HIPFIRE_RESIDUAL_MULTIROW_R8_KERNEL
+#define HIPFIRE_RESIDUAL_MULTIROW_R8_KERNEL gemv_hfq4g256_residual_multirow_r8
+#endif
+
 // gfx1100 (RDNA3) HFQ4-G256 multi-row GEMV with fused residual add:
 // y[row_base + r] += A[row_base + r] · x  for r in [0, R).
 //
@@ -197,7 +207,7 @@ __device__ __forceinline__ void gemv_hfq4g256_residual_multirow_body(
 }
 
 __launch_bounds__(32, 16)
-extern "C" __global__ void gemv_hfq4g256_residual_multirow_r2(
+extern "C" __global__ void HIPFIRE_RESIDUAL_MULTIROW_R2_KERNEL(
     const char* __restrict__ A,
     const float* __restrict__ x,
     float* __restrict__ y,
@@ -207,7 +217,7 @@ extern "C" __global__ void gemv_hfq4g256_residual_multirow_r2(
 }
 
 __launch_bounds__(32, 16)
-extern "C" __global__ void gemv_hfq4g256_residual_multirow_r4(
+extern "C" __global__ void HIPFIRE_RESIDUAL_MULTIROW_R4_KERNEL(
     const char* __restrict__ A,
     const float* __restrict__ x,
     float* __restrict__ y,
@@ -217,7 +227,7 @@ extern "C" __global__ void gemv_hfq4g256_residual_multirow_r4(
 }
 
 __launch_bounds__(32, 8)
-extern "C" __global__ void gemv_hfq4g256_residual_multirow_r8(
+extern "C" __global__ void HIPFIRE_RESIDUAL_MULTIROW_R8_KERNEL(
     const char* __restrict__ A,
     const float* __restrict__ x,
     float* __restrict__ y,

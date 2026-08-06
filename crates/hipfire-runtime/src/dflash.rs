@@ -142,6 +142,18 @@ pub struct DflashConfig {
     pub mask_token_id: u32,
     pub target_layer_ids: Vec<usize>,
     pub num_target_layers: usize,
+    /// The SWA window the draft artifact declares it was TRAINED with
+    /// (`config.sliding_window`). `Some` only when the artifact sets
+    /// `use_sliding_window: true` AND its `layer_types` match the split the
+    /// windowed path implements — every layer `sliding_attention` except a
+    /// final `full_attention`. `None` when the artifact is silent or declares
+    /// a split we do not implement, in which case windowed mode stays off
+    /// unless `HIPFIRE_DFLASH_WINDOW` forces it.
+    ///
+    /// This is the only width that is correct by construction: running an
+    /// SWA-trained layer over a different span is a train/inference mask
+    /// mismatch, which degrades acceptance silently (verify stays exact).
+    pub declared_window: Option<usize>,
 }
 
 impl DflashConfig {
@@ -191,6 +203,50 @@ impl DflashConfig {
             .filter_map(|v| v.as_u64().map(|x| x as usize))
             .collect();
         let num_target_layers = df.get("num_target_layers").and_then(|v| v.as_u64())? as usize;
+        // The window fields live in the sibling `config` object (HF-style),
+        // not in the `dflash` block, so they are read separately.
+        let declared_window = meta.get("config").and_then(|cfg| {
+            if !cfg
+                .get("use_sliding_window")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+            {
+                return None;
+            }
+            let w = cfg.get("sliding_window").and_then(|v| v.as_u64())? as usize;
+            if w == 0 {
+                return None;
+            }
+            // Honour the declaration only when the per-layer classes match the
+            // split `DflashScratch::new_windowed` implements (layers 0..n-2
+            // sliding, last layer long-reach). A future draft with a different
+            // split must NOT be silently mis-executed.
+            match cfg.get("layer_types").and_then(|v| v.as_array()) {
+                Some(types) => {
+                    let matches_split = types.len() == n_layers
+                        && types.iter().enumerate().all(|(i, t)| {
+                            let s = t.as_str().unwrap_or("");
+                            if i + 1 == n_layers {
+                                s == "full_attention"
+                            } else {
+                                s == "sliding_attention"
+                            }
+                        });
+                    if matches_split {
+                        Some(w)
+                    } else {
+                        eprintln!(
+                            "  DFlash draft declares sliding_window={w} but layer_types do not \
+                             match the implemented split (layers 0..n-2 sliding, last full) — \
+                             not auto-enabling windowed mode"
+                        );
+                        None
+                    }
+                }
+                // No layer_types: trust use_sliding_window + sliding_window.
+                None => Some(w),
+            }
+        });
 
         Some(DflashConfig {
             n_layers,
@@ -206,6 +262,7 @@ impl DflashConfig {
             mask_token_id,
             target_layer_ids,
             num_target_layers,
+            declared_window,
         })
     }
 }
@@ -923,6 +980,12 @@ mod target_hidden_log {
         uploaded_rows: usize,
         abs_positions: Vec<i32>,
         proj_cached_rows: usize,
+        /// Separate K/V-fill watermark for the windowed mode's last
+        /// (full-attention) layer. Rows older than `l − swa_w` are not
+        /// resident in the proj ring, so the last layer's fill for them runs
+        /// in the post-seed backfill (host shadow), tracked here. Always
+        /// `== proj_cached_rows` in Legacy mode.
+        full_cached_rows: usize,
     }
 
     impl TargetHiddenLog {
@@ -944,6 +1007,11 @@ mod target_hidden_log {
         pub fn proj_cached_rows(&self) -> usize {
             self.proj_cached_rows
         }
+        /// Rows whose LAST-layer (full-attention) K/V projection is cached
+        /// (windowed mode; mirrors `proj_cached_rows` in Legacy).
+        pub fn full_cached_rows(&self) -> usize {
+            self.full_cached_rows
+        }
 
         // ── invariant-preserving mutations ────────────────────────────────
         /// New-prompt / session boundary: forget all GPU-resident rows.
@@ -951,6 +1019,7 @@ mod target_hidden_log {
             self.uploaded_rows = 0;
             self.abs_positions.clear();
             self.proj_cached_rows = 0;
+            self.full_cached_rows = 0;
         }
 
         /// Prompt-prefill seed: `rows` contiguous rows `[0..rows)` are live on
@@ -962,8 +1031,13 @@ mod target_hidden_log {
 
         /// Divergent-render resume: drop the projection cache back to a
         /// checkpoint position so the next `draft_forward` re-projects from it.
+        /// The last-layer (windowed full) watermark clamps down too — rows at
+        /// >= ckpt in its ring are stale (pre-divergence); they re-fill from
+        /// the live window as new rows stream (out-of-window stale rows are a
+        /// τ-only degradation; verify stays exact).
         pub fn set_resume_checkpoint(&mut self, ckpt: usize) {
             self.proj_cached_rows = ckpt;
+            self.full_cached_rows = self.full_cached_rows.min(ckpt);
         }
 
         /// Post-commit append: `n` newly committed rows starting at logical
@@ -976,6 +1050,31 @@ mod target_hidden_log {
                 base_pos,
                 "append_committed: abs_positions out of sync with base_pos"
             );
+            // Release-visible companion to the assert above. A `base_pos` ahead
+            // of the row count means positions advanced WITHOUT committing their
+            // target_hidden rows, so the buffer keeps an unwritten hole —
+            // uninitialized VRAM, i.e. NaN — which poisons every later draft
+            // forward, collapses acceptance to zero for the rest of the session,
+            // and survives a prompt-cache HIT (whose `seed_prompt` rebuilds
+            // `abs_positions` contiguously, hiding the skew but not the hole).
+            // The `debug_assert` is compiled out in release, which is exactly how
+            // the think-budget force-close path went unnoticed; warn loudly once
+            // instead of silently poisoning the drafter.
+            if self.abs_positions.len() != base_pos {
+                static GAP_WARNED: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if !GAP_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    eprintln!(
+                        "[dflash] WARNING target-hidden row gap: have {} rows but committing at \
+                         position {} ({} row(s) never written) — acceptance will degrade until \
+                         the drafter is reseeded. This is a bug in whichever path advanced the \
+                         target without committing its hidden rows.",
+                        self.abs_positions.len(),
+                        base_pos,
+                        base_pos.saturating_sub(self.abs_positions.len())
+                    );
+                }
+            }
             self.uploaded_rows = base_pos + n;
             for p in 0..n {
                 self.abs_positions
@@ -990,12 +1089,14 @@ mod target_hidden_log {
             self.uploaded_rows = new_abs.len();
             self.abs_positions = new_abs;
             self.proj_cached_rows = 0;
+            self.full_cached_rows = 0;
         }
 
         /// Invalidate only the per-layer projection cache (eviction mirror that
         /// keeps the uploaded rows but shifts their indices).
         pub fn invalidate_proj_cache(&mut self) {
             self.proj_cached_rows = 0;
+            self.full_cached_rows = 0;
         }
 
         /// `draft_forward`-owned: record that `l` rows are now uploaded H2D.
@@ -1004,14 +1105,67 @@ mod target_hidden_log {
         }
 
         /// `draft_forward`-owned: record that `l` rows are now projection-cached.
+        /// Also advances the last-layer watermark: a completed forward filled
+        /// every layer's K/V through `l` (windowed mode relies on the
+        /// post-seed backfill for the out-of-window prefix).
         pub fn mark_proj_cached(&mut self, l: usize) {
             self.proj_cached_rows = l;
+            self.full_cached_rows = self.full_cached_rows.max(l);
+        }
+        /// Windowed backfill-owned: record that the last (full-attention)
+        /// layer's K/V cache is valid through row `l`.
+        pub fn mark_full_cached(&mut self, l: usize) {
+            self.full_cached_rows = l;
         }
     }
 }
 pub use target_hidden_log::TargetHiddenLog;
 
 // ─── Scratch ───────────────────────────────────────────────────────────────
+
+/// Draft context mode (HIPFIRE_DFLASH_WINDOW).
+///
+/// `Legacy` (default): every draft layer attends over the full context; all
+/// context-indexed buffers are sized to the (capped) ctx capacity and a
+/// request past the cap falls back to AR in the daemon.
+///
+/// `Windowed { w, w_full }`: layers `0..n-2` attend over the last `w` rows
+/// (SWA), layer `n-1` over the last `w_full` rows — the NInfer companion-
+/// drafter pattern (W=4096 SWA + one full layer) ported inference-side.
+/// Every per-layer K/V cache is a ring (`slot = abs_row % window`), so the
+/// layout at `l <= w` is byte-identical to Legacy and all fills stay
+/// row-local-exact; past `w` acceptance (τ) degrades gracefully instead of
+/// the AR cliff. Draft quality never affects emitted tokens (verify-gated).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DraftCtxMode {
+    Legacy,
+    Windowed { w: usize, w_full: usize },
+}
+
+/// Iterate the contiguous ring segments covering rows `[start, end)` in a
+/// ring of `modulus` slots (slot = row % modulus). Yields
+/// `(row_start, slot_start, len)` per segment — at most two for any range
+/// smaller than `modulus`. `modulus == usize::MAX` degenerates to a single
+/// identity segment (Legacy layout), keeping the windowed code path
+/// byte-exact with the legacy one when no wrap is possible.
+pub fn ring_segments(start: usize, end: usize, modulus: usize) -> Vec<(usize, usize, usize)> {
+    debug_assert!(end >= start);
+    if start == end {
+        return Vec::new();
+    }
+    if modulus == usize::MAX {
+        return vec![(start, start, end - start)];
+    }
+    let mut out = Vec::with_capacity(2);
+    let mut row = start;
+    while row < end {
+        let slot = row % modulus;
+        let len = (modulus - slot).min(end - row);
+        out.push((row, slot, len));
+        row += len;
+    }
+    out
+}
 
 /// Activation buffers for one forward pass. Sized for up to
 /// `max_block_size` query positions and up to `max_ctx_len` context
@@ -1083,6 +1237,17 @@ pub struct DflashScratch {
     pub k_ctx_cached: Vec<GpuTensor>,
     pub v_ctx_cached: Vec<GpuTensor>,
 
+    /// Context mode this scratch was sized for (see [`DraftCtxMode`]).
+    pub ctx_mode: DraftCtxMode,
+    /// Windowed-mode last-layer (full-attention) K/V rings, `[w_full × kvd]`.
+    /// The last layer keeps a 4× longer reach than the SWA layers — the only
+    /// unbounded-context structure in windowed mode. `None` in Legacy.
+    pub k_full_cached: Option<GpuTensor>,
+    pub v_full_cached: Option<GpuTensor>,
+    /// Windowed-mode last-layer concat assembly, `[(w_full + B) × kvd]`.
+    pub k_cat_full: Option<GpuTensor>,
+    pub v_cat_full: Option<GpuTensor>,
+
     /// Per-layer, per-B graph cache for the fixed-shape FFN tail inside
     /// `draft_forward_opts`. The attention/context part depends on `ctx_len`;
     /// this FFN subgraph does not, so it can replay across DFlash cycles.
@@ -1123,6 +1288,54 @@ impl DflashScratch {
         max_ctx_len: usize,
     ) -> HipResult<Self> {
         Self::new_with_mq(gpu, cfg, max_block_size, max_ctx_len, false)
+    }
+
+    /// Windowed-mode constructor (HIPFIRE_DFLASH_WINDOW). SWA layers
+    /// `0..n-2` get `w`-row K/V rings and `(w + B)` concat buffers; the last
+    /// layer gets `w_full`-row rings and its own concat pair. All other
+    /// buffers are sized exactly as `new_with_mq(gpu, cfg, b, w, ..)` — so
+    /// windowed-mode VRAM is the Legacy-at-ctx=w footprint plus one
+    /// `w_full`-sized layer (≈270 MB at w_full=32K, kvd=1024, f32).
+    /// `max_ctx` is the target's physical context capacity: the rings wrap
+    /// forever, so `l` may grow past `w_full` (spans stay suffixes).
+    pub fn new_windowed(
+        gpu: &mut Gpu,
+        cfg: &DflashConfig,
+        max_block_size: usize,
+        w: usize,
+        w_full: usize,
+        max_ctx: usize,
+        with_mq: bool,
+    ) -> HipResult<Self> {
+        let kvd = cfg.kv_dim();
+        let b = max_block_size;
+        // The long-reach layer never has a SHORTER window than the SWA layers
+        // (possible when physical_cap < w): its span must contain theirs.
+        let w_full = w_full.max(w);
+        // Base at ctx=w: SWA rings, (w+B) concat buffers, w-row target_hidden
+        // ring — the entire draft footprint except the one long-reach layer.
+        let mut s = Self::new_with_mq(gpu, cfg, b, w, with_mq)?;
+        // The last (full-attention) layer gets w_full-row rings + its own
+        // concat pair; its w-sized base caches are freed.
+        if let Some(k) = s.k_ctx_cached.pop() {
+            let _ = gpu.free_tensor(k);
+        }
+        if let Some(v) = s.v_ctx_cached.pop() {
+            let _ = gpu.free_tensor(v);
+        }
+        s.k_full_cached = Some(gpu.alloc_tensor(&[w_full * kvd], DType::F32)?);
+        s.v_full_cached = Some(gpu.alloc_tensor(&[w_full * kvd], DType::F32)?);
+        s.k_cat_full = Some(gpu.alloc_tensor(&[(w_full + b) * kvd], DType::F32)?);
+        s.v_cat_full = Some(gpu.alloc_tensor(&[(w_full + b) * kvd], DType::F32)?);
+        // positions_k holds the last w_full context rows + the B noise rows
+        // (the forward uploads only that suffix; every layer's span is one).
+        let new_positions_k = gpu.alloc_tensor(&[w_full + b], DType::F32)?;
+        let _ = gpu.free_tensor(std::mem::replace(&mut s.positions_k, new_positions_k));
+        // The ctx bound is the target's physical capacity, not the window —
+        // l may cross w_full (the last layer's span just slides).
+        s.max_ctx_len = max_ctx;
+        s.ctx_mode = DraftCtxMode::Windowed { w, w_full };
+        Ok(s)
     }
 
     /// `with_mq` allocates the FWHT rotation scratch needed when at least
@@ -1248,6 +1461,11 @@ impl DflashScratch {
             thlog: TargetHiddenLog::new(),
             k_ctx_cached,
             v_ctx_cached,
+            ctx_mode: DraftCtxMode::Legacy,
+            k_full_cached: None,
+            v_full_cached: None,
+            k_cat_full: None,
+            v_cat_full: None,
             draft_ffn_graphs,
             draft_ffn_warmed_up,
         })
@@ -1260,6 +1478,16 @@ impl DflashScratch {
     /// the first draft_forward after reset does a full rebuild.
     pub fn reset_upload_tracking(&mut self) {
         self.thlog.reset();
+    }
+
+    /// The dst ring modulus for absolute-row scatters into
+    /// `target_hidden` — `usize::MAX` (identity) in Legacy, `w` in
+    /// Windowed mode.
+    pub fn ctx_modulus(&self) -> usize {
+        match self.ctx_mode {
+            DraftCtxMode::Legacy => usize::MAX,
+            DraftCtxMode::Windowed { w, .. } => w,
+        }
     }
 
     /// Invalidate the per-layer k_ctx/v_ctx projection cache. Called from
@@ -1305,6 +1533,17 @@ impl DflashScratch {
             let _ = gpu.free_tensor(t);
         }
         for t in self.v_ctx_cached {
+            let _ = gpu.free_tensor(t);
+        }
+        for t in [
+            self.k_full_cached,
+            self.v_full_cached,
+            self.k_cat_full,
+            self.v_cat_full,
+        ]
+        .into_iter()
+        .flatten()
+        {
             let _ = gpu.free_tensor(t);
         }
         if let Some(t) = self.mq_x_rot {
@@ -1637,6 +1876,124 @@ fn upload_slice_i32(gpu: &Gpu, dst: &GpuTensor, data: &[i32]) -> HipResult<()> {
     gpu.hip.memcpy_htod(&dst.buf, bytes)
 }
 
+/// Rows per chunk for the windowed-mode post-seed backfill.
+pub const SEED_BACKFILL_CHUNK: usize = 512;
+
+/// Windowed-mode post-seed backfill: after a cold prefill longer than the
+/// SWA window, the last (full-attention) layer still needs K/V for EVERY
+/// context row — but `hidden_rb` / the draft ring only retain the last
+/// `swa_w`. The host shadow (`target_hidden_host`, cumulative on the cold
+/// path) has the full prompt, so stream it through the ring in chunks:
+/// upload → fc → hidden_norm → last-layer wk/wv + k_norm into its
+/// `full_w`-row ring. SWA layers are deliberately skipped — the first
+/// `draft_forward` lazy fill covers their in-window rows bit-identically.
+///
+/// No-op in Legacy mode or when `prompt_len <= swa_w`. Sets the thlog
+/// full-layer watermark to `prompt_len` so the forward's lazy fill resumes
+/// from the window edge. All GEMMs/norms are row-local: chunked ==
+/// monolithic bit-exactly.
+pub fn draft_seed_backfill(
+    gpu: &mut Gpu,
+    weights: &DflashWeights,
+    cfg: &DflashConfig,
+    scratch: &mut DflashScratch,
+    host_hidden: &[f32],
+    prompt_len: usize,
+) -> HipResult<()> {
+    let (swa_w, full_w) = match scratch.ctx_mode {
+        DraftCtxMode::Legacy => return Ok(()),
+        DraftCtxMode::Windowed { w, w_full } => (w, w_full),
+    };
+    if prompt_len <= swa_w {
+        return Ok(());
+    }
+    let h = cfg.hidden;
+    let ne = cfg.num_extract();
+    let kvd = cfg.kv_dim();
+    let hd = cfg.head_dim;
+    let eps = cfg.norm_eps;
+    let row_f32 = ne * h;
+    assert_eq!(
+        host_hidden.len(),
+        prompt_len * row_f32,
+        "backfill: host shadow must hold the full prompt"
+    );
+    let last_layer = weights.layers.last().expect("draft has no layers");
+    let k_full = scratch.k_full_cached.as_ref().expect("windowed k_full");
+    let v_full = scratch.v_full_cached.as_ref().expect("windowed v_full");
+
+    let mut row = 0usize;
+    while row < prompt_len {
+        let len = SEED_BACKFILL_CHUNK.min(prompt_len - row);
+        for (row0, slot0, seg_len) in ring_segments(row, row + len, swa_w) {
+            // H2D this host segment into the draft ring.
+            let seg = &host_hidden[row0 * row_f32..(row0 + seg_len) * row_f32];
+            let src_bytes: &[u8] =
+                unsafe { std::slice::from_raw_parts(seg.as_ptr() as *const u8, seg.len() * 4) };
+            gpu.hip.memcpy_htod_offset(
+                &scratch.target_hidden.buf,
+                slot0 * row_f32 * 4,
+                src_bytes,
+            )?;
+            // fc + hidden_norm into the proj ring (same slots).
+            let th = scratch
+                .target_hidden
+                .sub_offset(slot0 * row_f32, seg_len * row_f32);
+            let thp = scratch
+                .target_hidden_proj
+                .sub_offset(slot0 * h, seg_len * h);
+            gemm_dispatch(
+                gpu,
+                &th,
+                &weights.fc,
+                &thp,
+                seg_len,
+                scratch.mq_x_rot.as_ref(),
+            )?;
+            gpu.rmsnorm_batched(&thp, &weights.hidden_norm, &thp, seg_len, h, eps)?;
+            // Last-layer wk/wv into the full_w ring (its own modulus).
+            let mut r2 = row0;
+            while r2 < row0 + seg_len {
+                let step = (full_w - r2 % full_w).min(row0 + seg_len - r2);
+                let thp2 = scratch
+                    .target_hidden_proj
+                    .sub_offset((slot0 + (r2 - row0)) * h, step * h);
+                let c_slot = r2 % full_w;
+                let k_slot = k_full.sub_offset(c_slot * kvd, step * kvd);
+                let v_slot = v_full.sub_offset(c_slot * kvd, step * kvd);
+                gemm_dispatch(
+                    gpu,
+                    &thp2,
+                    &last_layer.wk,
+                    &k_slot,
+                    step,
+                    scratch.mq_x_rot.as_ref(),
+                )?;
+                gemm_dispatch(
+                    gpu,
+                    &thp2,
+                    &last_layer.wv,
+                    &v_slot,
+                    step,
+                    scratch.mq_x_rot.as_ref(),
+                )?;
+                gpu.rmsnorm_batched(
+                    &k_slot,
+                    &last_layer.k_norm,
+                    &k_slot,
+                    step * cfg.n_kv_heads,
+                    hd,
+                    eps,
+                )?;
+                r2 += step;
+            }
+        }
+        row += len;
+    }
+    scratch.thlog.mark_full_cached(prompt_len);
+    Ok(())
+}
+
 /// Run one draft forward. Inputs:
 /// - `noise_embedding`: `[block_size × hidden]` f32, row-major. Comes from
 ///   `target.embed_tokens(block_output_ids)` on the caller side.
@@ -1729,6 +2086,44 @@ pub fn draft_forward_opts(
     assert_eq!(positions_q.len(), b, "positions_q size");
     assert_eq!(positions_k.len(), tot, "positions_k size");
 
+    // Draft context windowing (DraftCtxMode::Windowed). `swa_w`/`full_w` are
+    // the per-layer ring moduli (usize::MAX in Legacy ⇒ identity ring math,
+    // single segment, byte-identical offsets). The last (full-attention)
+    // layer uses `full_w`; all others `swa_w`. At l <= swa_w every span is
+    // [0..l) and every slot == row: the windowed code path degenerates to
+    // Legacy exactly.
+    let (swa_w, full_w) = match scratch.ctx_mode {
+        DraftCtxMode::Legacy => (usize::MAX, usize::MAX),
+        DraftCtxMode::Windowed { w, w_full } => (w, w_full),
+    };
+    let windowed = !matches!(scratch.ctx_mode, DraftCtxMode::Legacy);
+    // Windowed positions base: the device positions_k buffer holds only the
+    // suffix [pos_base..tot) (last full_w context rows + B noise) — every
+    // layer's attention span lives inside it. Device index of row r is
+    // r − pos_base. Legacy: pos_base = 0, the full upload as before.
+    let pos_base = if windowed {
+        l.saturating_sub(full_w)
+    } else {
+        0
+    };
+    // Backfill-invariant probe: past the SWA window the last layer's
+    // out-of-window K/V must come from the post-seed backfill. If a driver
+    // skipped it (research demos on non-speculator paths), its ring holds
+    // stale rows — τ-only damage (verify is exact), but name it once.
+    if windowed && l > swa_w && scratch.thlog.full_cached_rows() < l.saturating_sub(swa_w) {
+        static BACKFILL_WARNED: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        if !BACKFILL_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            eprintln!(
+                "[dflash] windowed: last-layer backfill watermark {} < l−W {} — stale \
+                 out-of-window K/V (acceptance degraded; output still verify-exact). \
+                 Call draft_seed_backfill after cold seeds.",
+                scratch.thlog.full_cached_rows(),
+                l.saturating_sub(swa_w)
+            );
+        }
+    }
+
     // ── 0. Uploads ────────────────────────────────────────────────────────
     if let Some(ne_slice) = noise_embedding {
         upload_slice_f32(gpu, &scratch.x, ne_slice)?;
@@ -1746,30 +2141,72 @@ pub fn draft_forward_opts(
         // and it matches what the caller told us (matches a non-sliced
         // cumulative buffer). ctx_slice callers pass a DIFFERENT slice
         // every cycle (last N rows shift) — for them, force full upload.
+        //
+        // Windowed mode: the GPU buffer is an `swa_w`-row ring (slot = row %
+        // swa_w); only rows [max(prev, l−swa_w)..l) are uploaded, wrap-split
+        // at the ring boundary. Out-of-window rows are never read (fc is the
+        // only consumer and its fill is span-limited too).
         let row_f32 = ne * h;
         let expected_full_len = l * row_f32;
         let prev = scratch.thlog.uploaded_rows();
         // Full-upload conditions: first call, reset flagged, caller shrank
         // the context, or the slice length suggests ctx_slice (unusual l).
         if prev == 0 || prev > l || th_slice.len() != expected_full_len {
-            upload_slice_f32(gpu, &scratch.target_hidden, th_slice)?;
+            if windowed {
+                let up_start = l.saturating_sub(swa_w);
+                for (row0, slot0, len) in ring_segments(up_start, l, swa_w) {
+                    let seg = &th_slice[row0 * row_f32..(row0 + len) * row_f32];
+                    let dst_byte_off = slot0 * row_f32 * 4;
+                    let src_bytes: &[u8] = unsafe {
+                        std::slice::from_raw_parts(seg.as_ptr() as *const u8, seg.len() * 4)
+                    };
+                    gpu.hip.memcpy_htod_offset(
+                        &scratch.target_hidden.buf,
+                        dst_byte_off,
+                        src_bytes,
+                    )?;
+                }
+            } else {
+                upload_slice_f32(gpu, &scratch.target_hidden, th_slice)?;
+            }
             scratch.thlog.mark_uploaded(l);
         } else if prev < l {
             // Delta-upload: rows [prev..l) need to land at byte offset
             // prev * row_f32 * 4 of scratch.target_hidden.
-            let tail = &th_slice[prev * row_f32..];
-            let dst_byte_off = prev * row_f32 * 4;
-            let src_bytes: &[u8] =
-                unsafe { std::slice::from_raw_parts(tail.as_ptr() as *const u8, tail.len() * 4) };
-            gpu.hip
-                .memcpy_htod_offset(&scratch.target_hidden.buf, dst_byte_off, src_bytes)?;
+            if windowed {
+                let up_start = prev.max(l.saturating_sub(swa_w));
+                for (row0, slot0, len) in ring_segments(up_start, l, swa_w) {
+                    let seg = &th_slice[row0 * row_f32..(row0 + len) * row_f32];
+                    let dst_byte_off = slot0 * row_f32 * 4;
+                    let src_bytes: &[u8] = unsafe {
+                        std::slice::from_raw_parts(seg.as_ptr() as *const u8, seg.len() * 4)
+                    };
+                    gpu.hip.memcpy_htod_offset(
+                        &scratch.target_hidden.buf,
+                        dst_byte_off,
+                        src_bytes,
+                    )?;
+                }
+            } else {
+                let tail = &th_slice[prev * row_f32..];
+                let dst_byte_off = prev * row_f32 * 4;
+                let src_bytes: &[u8] = unsafe {
+                    std::slice::from_raw_parts(tail.as_ptr() as *const u8, tail.len() * 4)
+                };
+                gpu.hip
+                    .memcpy_htod_offset(&scratch.target_hidden.buf, dst_byte_off, src_bytes)?;
+            }
             scratch.thlog.mark_uploaded(l);
         }
         // prev == l: nothing new to upload (wouldn't happen in practice
         // since caller always appends, but harmless).
     }
     upload_slice_i32(gpu, &scratch.positions_q, positions_q)?;
-    upload_slice_i32(gpu, &scratch.positions_k, positions_k)?;
+    if windowed {
+        upload_slice_i32(gpu, &scratch.positions_k, &positions_k[pos_base..])?;
+    } else {
+        upload_slice_i32(gpu, &scratch.positions_k, positions_k)?;
+    }
 
     // ── 1. target_hidden_proj = hidden_norm(fc @ target_hidden) ──────────
     // Incremental-projection fast path (2026-04-20): only compute the
@@ -1790,26 +2227,32 @@ pub fn draft_forward_opts(
     //
     // Dispatch on fc weight dtype: F32 → gemm_f32_batched (legacy),
     // MQ4 → FWHT-rotate target_hidden then gemm_hfq4g256.
+    //
+    // Windowed: the proj ring only needs the rows any layer can still read —
+    // clamp the fill to [max(cached, l−swa_w)..l) (out-of-window rows were
+    // covered by the post-seed backfill for the last layer, and SWA layers
+    // never read them). Ring-slot writes are wrap-split; every GEMM/norm is
+    // row-local, so segments compose bit-exactly. Legacy: swa_w=MAX ⇒ one
+    // identity segment, offsets identical to the pre-windowing code.
     let cached_rows = scratch.thlog.proj_cached_rows();
-    let delta = l.saturating_sub(cached_rows);
+    let fc_start = cached_rows.max(l.saturating_sub(swa_w));
+    let delta = l.saturating_sub(fc_start);
     if delta > 0 {
-        let src_offset_elems = cached_rows * ne * h;
-        let dst_offset_elems = cached_rows * h;
-        let th_slice = scratch
-            .target_hidden
-            .sub_offset(src_offset_elems, delta * ne * h);
-        let thp_slice = scratch
-            .target_hidden_proj
-            .sub_offset(dst_offset_elems, delta * h);
-        gemm_dispatch(
-            gpu,
-            &th_slice,
-            &weights.fc,
-            &thp_slice,
-            delta,
-            scratch.mq_x_rot.as_ref(),
-        )?;
-        gpu.rmsnorm_batched(&thp_slice, &weights.hidden_norm, &thp_slice, delta, h, eps)?;
+        for (row0, slot0, len) in ring_segments(fc_start, l, swa_w) {
+            let th_slice = scratch
+                .target_hidden
+                .sub_offset(slot0 * ne * h, len * ne * h);
+            let thp_slice = scratch.target_hidden_proj.sub_offset(slot0 * h, len * h);
+            gemm_dispatch(
+                gpu,
+                &th_slice,
+                &weights.fc,
+                &thp_slice,
+                len,
+                scratch.mq_x_rot.as_ref(),
+            )?;
+            gpu.rmsnorm_batched(&thp_slice, &weights.hidden_norm, &thp_slice, len, h, eps)?;
+        }
     }
 
     // HIPFIRE_DRAFT_SUBPHASE=1: per-layer-section timing inside draft_forward.
@@ -1886,54 +2329,105 @@ pub fn draft_forward_opts(
 
         // K_ctx / V_ctx — same wk/wv weights but projected over the L
         // accepted-context rows of target_hidden_proj. INCREMENTAL PATH:
-        // only rows [cached_rows..L) need projection; rows [0..cached_rows)
-        // were projected in a prior call and stored in the per-layer
+        // only rows past the layer's fill watermark need projection; earlier
+        // rows were projected in a prior call and stored in the per-layer
         // k_ctx_cached / v_ctx_cached buffers (post-k_norm for K).
         //
-        // If delta > 0, run wk/wv on the delta slice of target_hidden_proj
-        // and write into the tail of the per-layer cache. Then run k_norm
-        // on those same delta rows (per-head) in-place on the cache.
+        // Windowed spans: SWA layers read the last `swa_w` context rows, the
+        // last (full-attention) layer the last `full_w`. Each cache is a ring
+        // (slot = row % layer_w); fills clamp to rows still readable
+        // ([max(watermark, span_start)..l)) and source the proj ring, whose
+        // modulus is `swa_w` — the last layer's (watermark, l−swa_w) band is
+        // the post-seed backfill's responsibility. Segments split at BOTH
+        // ring boundaries (proj + cache) so every GEMM sees contiguous src
+        // and dst. Legacy: moduli are MAX — one identity segment, offsets
+        // identical to the pre-windowing incremental path.
         //
         // For correctness note: the per-head K RMSNorm is row-local
         // (normalizes each kv_head row of size hd independently), so
         // applying it to delta rows of the cache is exactly equivalent
         // to applying it to the full k_cat post-concat. V has no
         // draft-level norm so v_ctx_cached stores raw GEMM output.
-        let k_cache_layer = &scratch.k_ctx_cached[li];
-        let v_cache_layer = &scratch.v_ctx_cached[li];
-        if delta > 0 {
-            let src_offset_elems = cached_rows * h;
-            let dst_offset_elems = cached_rows * kvd;
-            let thp_slice = scratch
-                .target_hidden_proj
-                .sub_offset(src_offset_elems, delta * h);
-            let k_slot = k_cache_layer.sub_offset(dst_offset_elems, delta * kvd);
-            let v_slot = v_cache_layer.sub_offset(dst_offset_elems, delta * kvd);
-            gemm_dispatch(
-                gpu,
-                &thp_slice,
-                &layer.wk,
-                &k_slot,
-                delta,
-                scratch.mq_x_rot.as_ref(),
-            )?;
-            gemm_dispatch(
-                gpu,
-                &thp_slice,
-                &layer.wv,
-                &v_slot,
-                delta,
-                scratch.mq_x_rot.as_ref(),
-            )?;
-            // Per-head RMSNorm on K delta rows only. batch = delta × n_kv_heads.
-            gpu.rmsnorm_batched(
-                &k_slot,
-                &layer.k_norm,
-                &k_slot,
-                delta * cfg.n_kv_heads,
-                hd,
-                eps,
-            )?;
+        let last_layer = li + 1 == cfg.n_layers;
+        let layer_w = if last_layer { full_w } else { swa_w };
+        let (k_cache_layer, v_cache_layer) = if last_layer && windowed {
+            (
+                scratch.k_full_cached.as_ref().expect("windowed k_full"),
+                scratch.v_full_cached.as_ref().expect("windowed v_full"),
+            )
+        } else {
+            (&scratch.k_ctx_cached[li], &scratch.v_ctx_cached[li])
+        };
+        let (k_cat_l, v_cat_l) = if last_layer && windowed {
+            (
+                scratch.k_cat_full.as_ref().expect("windowed k_cat_full"),
+                scratch.v_cat_full.as_ref().expect("windowed v_cat_full"),
+            )
+        } else {
+            (&scratch.k_cat, &scratch.v_cat)
+        };
+        let span_start = l.saturating_sub(layer_w);
+        let span = l - span_start;
+        let wm = if last_layer {
+            scratch.thlog.full_cached_rows()
+        } else {
+            cached_rows
+        };
+        // Rows older than the proj ring's live window cannot be (re)filled
+        // here — the post-seed backfill owns that band for the last layer.
+        let fill_start = wm.max(span_start).max(l.saturating_sub(swa_w));
+        if fill_start < l {
+            let mut row = fill_start;
+            while row < l {
+                // Next row where the proj ring or the cache ring wraps.
+                let step =
+                    (swa_w.saturating_sub(if swa_w == usize::MAX { 0 } else { row % swa_w }))
+                        .min(layer_w.saturating_sub(if layer_w == usize::MAX {
+                            0
+                        } else {
+                            row % layer_w
+                        }))
+                        .min(l - row);
+                let p_slot = if swa_w == usize::MAX {
+                    row
+                } else {
+                    row % swa_w
+                };
+                let c_slot = if layer_w == usize::MAX {
+                    row
+                } else {
+                    row % layer_w
+                };
+                let thp_slice = scratch.target_hidden_proj.sub_offset(p_slot * h, step * h);
+                let k_slot = k_cache_layer.sub_offset(c_slot * kvd, step * kvd);
+                let v_slot = v_cache_layer.sub_offset(c_slot * kvd, step * kvd);
+                gemm_dispatch(
+                    gpu,
+                    &thp_slice,
+                    &layer.wk,
+                    &k_slot,
+                    step,
+                    scratch.mq_x_rot.as_ref(),
+                )?;
+                gemm_dispatch(
+                    gpu,
+                    &thp_slice,
+                    &layer.wv,
+                    &v_slot,
+                    step,
+                    scratch.mq_x_rot.as_ref(),
+                )?;
+                // Per-head RMSNorm on K delta rows only. batch = step × n_kv_heads.
+                gpu.rmsnorm_batched(
+                    &k_slot,
+                    &layer.k_norm,
+                    &k_slot,
+                    step * cfg.n_kv_heads,
+                    hd,
+                    eps,
+                )?;
+                row += step;
+            }
         }
 
         if let Some(t) = t0 {
@@ -1946,29 +2440,34 @@ pub fn draft_forward_opts(
             None
         };
 
-        // Concat K = [K_ctx_cached | K_noise] → k_cat [L + B, kv_dim].
+        // Concat K = [K_ctx ring span | K_noise] → k_cat [span + B, kv_dim].
         // The cached K prefix is already post-k_norm (applied incrementally
-        // above); the noise tail still needs k_norm applied below.
-        let ctx_bytes = (l * kvd) * 4;
+        // above); the noise tail still needs k_norm applied below. Ring
+        // segments assemble in absolute-row order; Legacy = one segment.
         let noise_bytes = (b * kvd) * 4;
+        let mut cat_off = 0usize;
+        for (_row0, slot0, len) in ring_segments(span_start, l, layer_w) {
+            let seg_bytes = len * kvd * 4;
+            gpu.hip.memcpy_dtod_at(
+                &k_cat_l.buf,
+                cat_off,
+                &k_cache_layer.buf,
+                slot0 * kvd * 4,
+                seg_bytes,
+            )?;
+            gpu.hip.memcpy_dtod_at(
+                &v_cat_l.buf,
+                cat_off,
+                &v_cache_layer.buf,
+                slot0 * kvd * 4,
+                seg_bytes,
+            )?;
+            cat_off += seg_bytes;
+        }
         gpu.hip
-            .memcpy_dtod_at(&scratch.k_cat.buf, 0, &k_cache_layer.buf, 0, ctx_bytes)?;
-        gpu.hip.memcpy_dtod_at(
-            &scratch.k_cat.buf,
-            ctx_bytes,
-            &scratch.k_noise.buf,
-            0,
-            noise_bytes,
-        )?;
+            .memcpy_dtod_at(&k_cat_l.buf, cat_off, &scratch.k_noise.buf, 0, noise_bytes)?;
         gpu.hip
-            .memcpy_dtod_at(&scratch.v_cat.buf, 0, &v_cache_layer.buf, 0, ctx_bytes)?;
-        gpu.hip.memcpy_dtod_at(
-            &scratch.v_cat.buf,
-            ctx_bytes,
-            &scratch.v_noise.buf,
-            0,
-            noise_bytes,
-        )?;
+            .memcpy_dtod_at(&v_cat_l.buf, cat_off, &scratch.v_noise.buf, 0, noise_bytes)?;
 
         // Per-head RMSNorm on Q: each of B*n_heads rows, size head_dim,
         // weight [head_dim].
@@ -1985,7 +2484,7 @@ pub fn draft_forward_opts(
         // k_ctx_cached. batch = B × n_kv_heads, applied to the last B rows
         // of k_cat.
         {
-            let noise_slot = scratch.k_cat.sub_offset(l * kvd, b * kvd);
+            let noise_slot = k_cat_l.sub_offset(span * kvd, b * kvd);
             gpu.rmsnorm_batched(
                 &noise_slot,
                 &layer.k_norm,
@@ -2012,15 +2511,22 @@ pub fn draft_forward_opts(
             b,
         )?;
         // Call 2: rotate K_cat with positions_k. n_heads_q = 0 skips Q.
+        // Windowed: the layer's context rows are the suffix [span_start..l),
+        // so its positions slice is the device buffer's contiguous
+        // sub-range [span_start−pos_base..tot−pos_base) — zero extra upload,
+        // absolute RoPE phases preserved. Legacy: both bases 0 ⇒ full buffer.
+        let positions_k_span = scratch
+            .positions_k
+            .sub_offset(span_start - pos_base, span + b);
         gpu.rope_batched_f32(
             &scratch.q, // ignored because n_heads_q = 0
-            &scratch.k_cat,
-            &scratch.positions_k, // [L + B]
+            k_cat_l,
+            &positions_k_span,
             0,
             cfg.n_kv_heads,
             hd,
             theta,
-            tot,
+            span + b,
         )?;
 
         if let Some(t) = t1 {
@@ -2033,7 +2539,7 @@ pub fn draft_forward_opts(
             None
         };
 
-        // Attention: Q [B, n_heads, hd] × K [tot, n_kv_heads, hd]^T → scores
+        // Attention: Q [B, n_heads, hd] × K [span+B, n_kv_heads, hd]^T → scores
         // (with GQA expansion) → softmax → @V.
         // Dispatched via unified full-attention path (AttnFullF32 → DflashScalar).
         // NOTE: adding a WMMA rung here changes spec-decode numerics → draft logits
@@ -2050,11 +2556,11 @@ pub fn draft_forward_opts(
                     &FullAttnParams {
                         key: KernelKey::AttnFullF32,
                         q: &scratch.q,
-                        k: &scratch.k_cat,
-                        v: &scratch.v_cat,
+                        k: k_cat_l,
+                        v: v_cat_l,
                         out: &scratch.attn_out,
                         n: b,
-                        seq_len: tot,
+                        seq_len: span + b,
                         n_heads: cfg.n_heads,
                         n_kv_heads: cfg.n_kv_heads,
                         head_dim: hd,
@@ -2223,6 +2729,7 @@ mod tests {
             mask_token_id: 0,
             target_layer_ids: vec![0],
             num_target_layers: 1,
+            declared_window: None,
         }
     }
 
@@ -2321,5 +2828,47 @@ mod tests {
             .expect("measure after malformed draft")
             .0;
         assert_eq!(after, before, "malformed draft changed free VRAM");
+    }
+}
+
+mod ring_tests {
+    use super::ring_segments;
+
+    #[test]
+    fn identity_modulus_is_single_segment() {
+        assert_eq!(ring_segments(3, 10, usize::MAX), vec![(3, 3, 7)]);
+        assert!(ring_segments(5, 5, usize::MAX).is_empty());
+    }
+
+    #[test]
+    fn no_wrap_within_ring() {
+        // rows < modulus: slot == row, single segment
+        assert_eq!(ring_segments(2, 7, 16), vec![(2, 2, 5)]);
+    }
+
+    #[test]
+    fn wrap_splits_at_boundary() {
+        // rows 14..18 in a 16-ring: [14..16) at slots 14.., [16..18) at slots 0..
+        assert_eq!(ring_segments(14, 18, 16), vec![(14, 14, 2), (16, 0, 2)]);
+    }
+
+    #[test]
+    fn span_never_exceeds_ring() {
+        // windowed fill spans are <= modulus, so at most two segments
+        for start in [0usize, 1, 7, 15, 16, 17, 31, 32] {
+            for len in [1usize, 3, 8, 16] {
+                let segs = ring_segments(start, start + len, 16);
+                assert!(segs.len() <= 2, "{start}+{len}: {segs:?}");
+                let covered: usize = segs.iter().map(|s| s.2).sum();
+                assert_eq!(covered, len);
+                // slots contiguous per segment, rows contiguous across
+                let mut row = start;
+                for (r0, s0, l) in &segs {
+                    assert_eq!(*r0, row);
+                    assert_eq!(*s0, row % 16);
+                    row += l;
+                }
+            }
+        }
     }
 }

@@ -71,10 +71,9 @@ fn main() {
             return;
         }
     };
-    let mut model = match loaded.parallel {
-        ModelParallel::Pp(PipelineImpl::Dense(pp)) => pp,
-        _ => panic!("expected PP dense model"),
-    };
+        let mut model = loaded
+        .pp_model
+        .expect("expected dense PP model (pp_model carrier)");
     model.forward_token(token, 0).expect("pp forward");
     let logits_pp = model.logits().expect("pp logits");
     let argmax_pp = llama::argmax(&logits_pp);
