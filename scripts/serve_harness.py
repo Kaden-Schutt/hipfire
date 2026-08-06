@@ -186,6 +186,7 @@ def build_config(args):
         "speculation_mode": getattr(args, "speculation", None),
         "deepseek4_experts_per_token": getattr(args, "deepseek4_experts_per_token", None),
         "deepseek4_compute_placement": getattr(args, "deepseek4_compute_placement", "single"),
+        "devices": getattr(args, "devices", None),
         "replay_route_proof_log": bool(getattr(args, "replay_route_proof_log", False)),
     }
 
@@ -239,6 +240,7 @@ def show_config(cfg):
         f"{cfg.get('deepseek4_experts_per_token') or '(checkpoint default)'}"
     )
     print(f"  ds4 placement : {cfg.get('deepseek4_compute_placement', 'single')}")
+    print(f"  devices       : {cfg.get('devices') or '(runtime default)'}")
     prompt_source = cfg.get("prompt_file") or cfg.get("prompts_file") or cfg.get("niah_file") or "(built-in battery)"
     print(f"  seed          : {cfg.get('seed')}   prompt_source: {prompt_source}")
     _cap = cfg['thinking_cap_tokens']
@@ -446,8 +448,10 @@ def _write_native_config(cfg, home):
             f"deepseek4_experts_per_token = {cfg['deepseek4_experts_per_token']}\n\n"
         )
     placement = cfg.get("deepseek4_compute_placement", "single")
+    devices = cfg.get("devices")
+    devices_line = f"devices = {json.dumps(devices)}\n" if devices else ""
     hardware = f"""[hardware]
-deepseek4_compute_placement = {json.dumps(placement)}
+{devices_line}deepseek4_compute_placement = {json.dumps(placement)}
 
 """
     text = f"""[serve]
@@ -691,6 +695,27 @@ def _self_test_prompt_sources():
     finally:
         os.unlink(path)
     print("serve_harness: prompt-source self-test OK", flush=True)
+
+
+def _self_test_device_config():
+    """Prove multi-device visibility is explicit in the isolated TOML."""
+    with tempfile.TemporaryDirectory() as home:
+        Path(home, ".hipfire").mkdir()
+        cfg = {
+            "port": 11520,
+            "model": "/models/deepseek4.mq2r",
+            "kv": "q8",
+            "mtp": "off",
+            "dflash": "off",
+            "thinking_budget": "off",
+            "deepseek4_compute_placement":
+                "dense-expert-split(dense=arch:gfx1100,experts=arch:gfx1151)",
+            "devices": "0,1",
+        }
+        _write_native_config(cfg, home)
+        config = Path(home, ".hipfire", "config.toml").read_text(encoding="utf-8")
+        assert '[hardware]\ndevices = "0,1"\n' in config
+    print("serve_harness: device-config self-test OK", flush=True)
 
 
 
@@ -954,6 +979,11 @@ def main():
         default="single",
         help="typed DS4 placement, for example dense-expert-split(dense=arch:gfx1100,experts=arch:gfx1151)",
     )
+    ap.add_argument(
+        "--devices",
+        default=None,
+        help="physical GPU selectors written to [hardware].devices, for example 0,1",
+    )
     ap.add_argument("--tag", default=None, help="registry tag for recommended_settings (else inferred)")
     ap.add_argument("--registry", default=os.path.join(REPO, "registry/v1.json"))
     ap.add_argument("--kv", default="fwht3")
@@ -1040,6 +1070,7 @@ def main():
     if args.self_test or os.environ.get("HIPFIRE_SERVE_HARNESS_SELFTEST") == "1":
         _self_test_serve_path_proofs()
         _self_test_prompt_sources()
+        _self_test_device_config()
         return
     if not args.model:
         ap.error("--model is required unless --self-test")
