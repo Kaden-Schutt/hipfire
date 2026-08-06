@@ -923,9 +923,16 @@ def run(cfg, args):
             r = send(cfg, messages)
             messages.append({"role": "assistant", "content": r["assistant_content"]})
             recall = ""
-            if t.get("expect"):
-                hit = sum(1 for e in t["expect"] if e.lower() in r["assistant_content"].lower())
-                recall = f" recall={hit}/{len(t['expect'])}"
+            expected = t.get("expect", [])
+            missing = [
+                item
+                for item in expected
+                if item.lower() not in r["assistant_content"].lower()
+            ]
+            r["expected_substrings"] = expected
+            r["retrieval_missing"] = missing
+            if expected:
+                recall = f" recall={len(expected) - len(missing)}/{len(expected)}"
             rows.append(r); print(turn_line(i+1, r, recall), flush=True)
     g = rows
     dec = [r["decode_tok_s"] for r in g if isinstance(r["decode_tok_s"], (int, float))]
