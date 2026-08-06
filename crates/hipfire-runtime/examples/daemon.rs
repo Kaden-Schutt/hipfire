@@ -3716,6 +3716,19 @@ fn ds4_gen_start_contract_version() -> Option<u32> {
     gen_start_contract_version_for_arch(9)
 }
 
+/// Open the DS4 EP wire contract before prefill can eventually emit tokens.
+///
+/// EP owns its generation loop instead of routing through the single-device
+/// AR/spec emitters, so it must establish the same contract latch explicitly.
+fn emit_ds4_ep_gen_start(stdout: &mut impl std::io::Write, id: &str, think_mode: ThinkMode) {
+    emit_gen_start(
+        stdout,
+        id,
+        !matches!(think_mode, ThinkMode::NonThink),
+        ds4_gen_start_contract_version(),
+    );
+}
+
 /// Pure `gen_start.contract_version` selection used by the live generate path.
 /// Qwen AR (5/6) advertises v2; DS4 (9) and every other arch stay unset.
 fn gen_start_contract_version_for_arch(arch_id: u32) -> Option<u32> {
@@ -9992,6 +10005,12 @@ fn ep_serve_ds4(
             &mut dsml_malformed,
         );
     };
+
+    // The HTTP stream contract rejects any token before `gen_start`.  EP has
+    // a bespoke decode loop, so unlike the single-device AR/spec paths it does
+    // not inherit their emitter-side latch.  Open it after all early request
+    // validation but before prefill/decode can produce a client event.
+    emit_ds4_ep_gen_start(stdout, id, think_mode);
 
     let t_prefill = Instant::now();
     // FIX #1 (ep-prefill-abort): set when check_abort fires inside the prefill
@@ -24958,10 +24977,11 @@ mod ds4_malformed_terminal_tests {
         ds4_ar_ep_finish_route, ds4_cache_action, ds4_client_commit_effects,
         ds4_ep_abort_wire_events, ds4_gen_start_contract_version, ds4_malformed_terminal_action,
         ds4_spec_finish_route, ds4_spec_wire_terminal, ds4_stream_event_wireable,
-        emit_ds4_malformed_action, emit_ds4_malformed_terminal,
-        gen_start_contract_version_for_arch, normalize_asst_turn_for_fingerprint,
-        set_active_attempt_id, spec_outcome_seed_committable, spec_should_flush_pending_seed,
-        ClientTerminalDecision, Ds4ArEpRouteTerminal, Ds4ClientCommitEffects, Ds4SpecWireTerminal,
+        emit_ds4_ep_gen_start, emit_ds4_malformed_action, emit_ds4_malformed_terminal,
+        emit_visible_token, gen_start_contract_version_for_arch,
+        normalize_asst_turn_for_fingerprint, set_active_attempt_id, spec_outcome_seed_committable,
+        spec_should_flush_pending_seed, ClientTerminalDecision, Ds4ArEpRouteTerminal,
+        Ds4ClientCommitEffects, Ds4SpecWireTerminal,
     };
     use hipfire_arch_deepseek4::dsml::{
         DsmlDeferredCalls, DsmlDeferredOutcome, StreamEvent, StreamParser, TOOL_CALLS_CLOSE,
@@ -25291,6 +25311,31 @@ mod ds4_malformed_terminal_tests {
         assert_eq!(gen_start_contract_version_for_arch(5), Some(2));
         assert_eq!(gen_start_contract_version_for_arch(6), Some(2));
         assert_eq!(super::QWEN_AR_SEMANTIC_CONTRACT_VERSION, 2);
+    }
+
+    #[test]
+    fn ds4_ep_opens_wire_contract_before_first_token() {
+        use hipfire_runtime::prompt_frame::ThinkMode;
+
+        set_active_attempt_id(31);
+        let mut sink = Vec::new();
+        emit_ds4_ep_gen_start(&mut sink, "req-ep", ThinkMode::NonThink);
+        emit_visible_token(&mut sink, "req-ep", "hello");
+
+        let events: Vec<serde_json::Value> = String::from_utf8(sink)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0]["type"], "gen_start");
+        assert_eq!(events[0]["id"], "req-ep");
+        assert_eq!(events[0]["started_in_think"], false);
+        assert_eq!(events[0]["attempt_id"], 31);
+        assert_eq!(events[1]["type"], "token");
+        assert_eq!(events[1]["text"], "hello");
+        assert_eq!(events[1]["attempt_id"], 31);
+        set_active_attempt_id(0);
     }
 
     // ── Task 4 definitive terminal-edge blockers (DS4 cache + empty EOS) ──
