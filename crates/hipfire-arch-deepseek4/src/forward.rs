@@ -476,6 +476,24 @@ mod config_cache {
                     != Some("0")
             })
     }
+    /// gfx1100 heterogeneous twin of the portable F3/G1 two-stage indexer.
+    ///
+    /// The kernel body is already shared across wave32 gfx1151 and wave64
+    /// gfx942, while `Gpu::ensure_kernel` still emits an exact-device code
+    /// object for this `Gpu`.  Keep admission separate from G1 so enabling the
+    /// dense half of the heterogeneous route cannot change gfx1151's certified
+    /// tape or any Qwen-owned path.  Default ON; `=0` is an emergency
+    /// diagnostic fallback to the legacy O(N^2) rank-count kernel.
+    pub(super) fn gfx1100_indexer_topk_two_stage_on(arch: &str) -> bool {
+        static V: OnceLock<bool> = OnceLock::new();
+        arch == "gfx1100"
+            && *V.get_or_init(|| {
+                hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_GFX1100_INDEXER_TOPK_TWOSTAGE")
+                    .ok()
+                    .as_deref()
+                    != Some("0")
+            })
+    }
     /// `HIPFIRE_DEEPSEEK4_INDEXER_TOPK_TWOSTAGE_MIN` — minimum
     /// active compressed-cache row count at which the two-stage path may be selected.
     /// Default 1024, from the measured standalone-probe crossover against the
@@ -3152,7 +3170,8 @@ fn indexer_forward(
     let two_stage_topk = (config_cache::gfx942_indexer_topk_two_stage_on(
         &gpu.arch,
         weights.mq2r_backend.is_gfx942(),
-    ) || config_cache::gfx1151_indexer_topk_two_stage_on(&gpu.arch))
+    ) || config_cache::gfx1151_indexer_topk_two_stage_on(&gpu.arch)
+        || config_cache::gfx1100_indexer_topk_two_stage_on(&gpu.arch))
         && two_stage_topk_capacity_eligible(&gpu.arch, max_compressed);
 
     let wq_b = layer
@@ -14986,6 +15005,12 @@ mod tests {
         assert!(!config_cache::gfx1151_indexer_topk_two_stage_on("gfx1100"));
         assert!(!config_cache::gfx1151_indexer_topk_two_stage_on("gfx1201"));
         assert!(config_cache::gfx1151_indexer_topk_two_stage_on("gfx1151"));
+        // The heterogeneous dense device gets an independently admitted
+        // exact-gfx1100 code object.  It must not widen either G1 or F3.
+        assert!(config_cache::gfx1100_indexer_topk_two_stage_on("gfx1100"));
+        assert!(!config_cache::gfx1100_indexer_topk_two_stage_on("gfx942"));
+        assert!(!config_cache::gfx1100_indexer_topk_two_stage_on("gfx1151"));
+        assert!(!config_cache::gfx1100_indexer_topk_two_stage_on("gfx1201"));
     }
 
     #[test]
