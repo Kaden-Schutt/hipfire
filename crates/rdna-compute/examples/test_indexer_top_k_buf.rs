@@ -78,7 +78,7 @@
 //! 1+R+1 launch sequence per iteration, which is what the model pays — plus
 //! the BOUNDED-vs-reference and TWOSTAGE-vs-BOUNDED speedup ratios.
 //!
-//! Run on the target GPU (MI300X / gfx942 or gfx1151):
+//! Run on the target GPU (gfx1100, gfx1151, or gfx942):
 //!   cargo run --release -p rdna-compute --example test_indexer_top_k_buf
 //!
 //! Compile-check only (no GPU):
@@ -333,7 +333,9 @@ const PARALLEL_GFX942_BOUNDED: KernelSpec = KernelSpec {
 fn parallel_spec(arch: &str) -> &'static KernelSpec {
     match arch {
         "gfx942" => &PARALLEL_GFX942,
-        "gfx1151" => &PARALLEL_GFX1151,
+        // Both are wave32 gfx11.  hipcc still emits an exact-device code
+        // object; this shares only the source-level parity reference.
+        "gfx1100" | "gfx1151" => &PARALLEL_GFX1151,
         _ => unreachable!("architecture checked by main"),
     }
 }
@@ -352,7 +354,7 @@ fn parallel_spec(arch: &str) -> &'static KernelSpec {
 fn bounded_spec(arch: &str) -> Option<KernelSpec> {
     match arch {
         "gfx942" => Some(PARALLEL_GFX942_BOUNDED),
-        "gfx1151" => Some(bounded_gfx1151_spec()),
+        "gfx1100" | "gfx1151" => Some(bounded_gfx1151_spec()),
         _ => None,
     }
 }
@@ -564,8 +566,14 @@ fn twostage_finalize(gpu: &Gpu, ctx: &LaunchCtx, out: &GpuTensor, log: bool) {
     kb.push_ptr(ctx.k_buf.buf.as_ptr() as *const c_void);
     kb.push_i32(ctx.max_k);
     kb.pad_to(16);
-    gpu.launch_kernel_blob(TWOSTAGE_FINALIZE, [1, 1, 1], PARALLEL_BLOCK, 0, kb.as_mut_slice())
-        .expect("launch TWOSTAGE finalize failed");
+    gpu.launch_kernel_blob(
+        TWOSTAGE_FINALIZE,
+        [1, 1, 1],
+        PARALLEL_BLOCK,
+        0,
+        kb.as_mut_slice(),
+    )
+    .expect("launch TWOSTAGE finalize failed");
 }
 
 /// The full two-stage sequence: chunk-sort, ceil(log2(n_runs)) merge rounds
@@ -603,7 +611,9 @@ fn launch_twostage_timed(gpu: &Gpu, ctx: &LaunchCtx, out: &GpuTensor) -> (f64, f
         twostage_merge_round(gpu, ctx, n_runs, run_step, n_pairs, false);
         run_step *= 2;
     }
-    gpu.hip.device_synchronize().expect("sync after merge rounds");
+    gpu.hip
+        .device_synchronize()
+        .expect("sync after merge rounds");
     let merge_ms = t.elapsed().as_secs_f64() * 1e3;
 
     let t = std::time::Instant::now();
@@ -1020,12 +1030,17 @@ fn run_case(
         for _ in 0..iters {
             launch_arm(gpu, *arm, &ctx, &out_bufs[i], false);
         }
-        gpu.hip.device_synchronize().expect("sync after timed batch");
+        gpu.hip
+            .device_synchronize()
+            .expect("sync after timed batch");
         let ms = t.elapsed().as_secs_f64() * 1e3 / iters as f64;
         ms_per_launch.push(ms);
         eprintln!(
             "  timing arm={} warmup={} iters={} ms_per_launch={:.3}",
-            arm.label(), warmup, iters, ms
+            arm.label(),
+            warmup,
+            iters,
+            ms
         );
     }
 
@@ -1160,7 +1175,11 @@ fn run_case(
         eprintln!("  {label}_vs_ref={vs_ref} {label}_vs_oracle={vs_oracle}");
         let verdict_ok = st.poison == 0
             && st.duplicates == 0
-            && if finite { *out == oracle } else { out == reference };
+            && if finite {
+                *out == oracle
+            } else {
+                out == reference
+            };
         arm_summaries.push(ArmSummary {
             label: arm.label(),
             vs_ref,
@@ -1179,7 +1198,10 @@ fn run_case(
             let st = stats[i];
             eprintln!(
                 "  nonfinite_detail: {}(-1={}, real={}, poison={})",
-                arm.label(), st.pad_neg1, st.real, st.poison
+                arm.label(),
+                st.pad_neg1,
+                st.real,
+                st.poison
             );
         }
     }
@@ -1267,13 +1289,13 @@ fn main() {
     let mut gpu = Gpu::init().expect("GPU init");
     let arch = gpu.arch.as_str();
     eprintln!("detected_arch={arch}");
-    if arch != "gfx1151" && arch != "gfx942" {
+    if arch != "gfx1100" && arch != "gfx1151" && arch != "gfx942" {
         panic!(
-            "unsupported arch '{arch}': this parity probe accepts only gfx1151 or gfx942 \
+            "unsupported arch '{arch}': this parity probe accepts only gfx1100, gfx1151, or gfx942 \
              (refuse, do not skip)"
         );
     }
-    eprintln!("arch_ok=true (accepted gfx1151|gfx942)");
+    eprintln!("arch_ok=true (accepted gfx1100|gfx1151|gfx942)");
 
     let parallel = parallel_spec(arch);
     let bounded = bounded_spec(arch);
