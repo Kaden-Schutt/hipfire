@@ -762,7 +762,8 @@ def spawn_serve(cfg, home, log):
         # Leader PID == PGID under start_new_session; retain it for dead-leader cleanup.
         _serve_pgid = _serve_proc.pid
         _write_pid_file(_serve_pgid)
-        for _ in range(90):
+        warm_timeout_secs = max(1, int(cfg.get("serve_warm_timeout_secs", 180)))
+        for _ in range((warm_timeout_secs + 1) // 2):
             txt = _serve_log_text(log, log_offset)
             if _native_service_warm(cfg["port"], expected_model=cfg.get("model"), proc=_serve_proc):
                 return log_offset
@@ -959,6 +960,12 @@ def main():
     ap.add_argument("--port", type=int, default=11520)
     ap.add_argument("--home", default=os.path.expanduser("~/.cache/serve_harness_home"))
     ap.add_argument("--serve-log", default="/tmp/serve_harness.serve.log")
+    ap.add_argument(
+        "--serve-warm-timeout-secs",
+        type=int,
+        default=180,
+        help="seconds to wait for a spawned serve to finish loading (default 180)",
+    )
     ap.add_argument("--out", default=None, help="write per-turn json")
     ap.add_argument("--show-config", action="store_true", help="resolve+print config, do NOT run")
     ap.add_argument("--no-spawn", action="store_true", help="connect to an already-running serve")
@@ -1000,6 +1007,7 @@ def main():
     if not args.model:
         ap.error("--model is required unless --self-test")
     cfg = build_config(args); cfg["max_seq"] = args.max_seq
+    cfg["serve_warm_timeout_secs"] = args.serve_warm_timeout_secs
     show_config(cfg)
     if args.show_config:
         return
