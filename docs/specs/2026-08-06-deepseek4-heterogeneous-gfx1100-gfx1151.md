@@ -5,7 +5,7 @@
 
 | Field | Value |
 |---|---|
-| State | **G0 transport complete; G1 cooperative fixture next; no model lowering yet** |
+| State | **G0 transport and G1 cooperative fixture complete; G2 transactional asymmetric load next** |
 | Date | 2026-08-06 |
 | Model | DeepSeek V4 Flash 0731 MQ2R (`arch_id=9`) |
 | Artifact | `cbf2bbcfa3f47b1712a071836b2c48232dad7dfb763813a720f7d348a9318cce` |
@@ -616,7 +616,11 @@ Transport question 1 is now resolved by
 [`2026-08-06-ds4-heterogeneous-g0-transport.md`](../investigations/2026-08-06-ds4-heterogeneous-g0-transport.md):
 explicit public-ROCr SDMA is selected at 588.737 us p50 / 603.854 us p95
 for the complete 86-copy B=1 chain, with zero corruption in the required
-10,000-chain stress. Questions 2 through 6 remain open for G1 and later gates.
+10,000-chain stress. G1 is resolved by
+[`2026-08-06-ds4-heterogeneous-g1-cooperative.md`](../investigations/2026-08-06-ds4-heterogeneous-g1-cooperative.md):
+the exact-target, double-buffered 43-layer DAG is raw-bit exact and overlaps
+all 43 shared/expert dispatch pairs. Questions 2 through 6 remain model-level
+unknowns for G2 and later gates.
 
 1. What are warmed 16 KiB one-way and 43-layer chain latencies on this exact
    two-hop PCIe topology?
