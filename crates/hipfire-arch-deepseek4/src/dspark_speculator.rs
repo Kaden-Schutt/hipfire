@@ -155,6 +155,10 @@ impl DsparkBody for Deepseek4DsparkBody {
         5
     }
 
+    fn persistent_verify_context_scratch(&self) -> bool {
+        true
+    }
+
     fn reset_for_retry(&mut self, gpu: &mut Gpu) {
         // Persistently allocated per-stage SWA rings survive free-on-unload
         // only; cold retry must zero them or the next draft_block reads prior

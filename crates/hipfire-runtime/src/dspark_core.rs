@@ -3,7 +3,8 @@
 //! [`DsparkBody`]. Everything else (main_proj ingest, markov head, confidence
 //! head, window orchestration) lives here.
 use crate::spec::{
-    accept_greedy_prefix, MtpDrafter, MtpSpeculator, MtpWindow, SpecGrammar, SpecTarget, Speculator,
+    accept_greedy_prefix, MtpDrafter, MtpSpeculator, MtpWindow, SpecGrammar, SpecScratch,
+    SpecTarget, Speculator,
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
 
@@ -258,6 +259,14 @@ pub trait DsparkBody {
     ) -> Result<(), String>;
     fn block_size(&self) -> usize;
     fn free(self: Box<Self>, gpu: &mut Gpu);
+
+    /// Whether the generic DSpark driver should retain verifier/context GPU
+    /// buffers across windows. DeepSeek enables this because its target verify
+    /// is being prepared for fixed-pointer graph capture; other architectures
+    /// keep their established allocation lifetime unless they opt in.
+    fn persistent_verify_context_scratch(&self) -> bool {
+        false
+    }
 
     /// Clear body-local conversation/draft residuals so a cold retry cannot
     /// bleed prior-window rings (DeepSeek `dspark_swa_k`, etc.).
@@ -1088,9 +1097,19 @@ pub struct DsparkDrafter {
     /// (mirrors the DFlash speculator) so a warm run is reproducible.
     rng_state: u64,
     /// GPU tensor holding the multi-slot context main_hidden for `ctx_positions`.
-    /// `[ctx_len * n_targets * dim]` F32 (flat).  `None` ⇒ must bootstrap on
-    /// next `mtp_step` (initial window or after reset/prefill).
+    /// `[ctx_len * n_targets * dim]` F32 (flat). `ctx_positions.is_empty()` is
+    /// the validity bit; an opted-in body may retain this allocation while the
+    /// logical context is invalid and overwrite it on the next bootstrap.
     main_hidden_dev: Option<GpuTensor>,
+    /// Fixed-address target capture buffer, sized for the largest verify
+    /// window. Opt-in is body-specific so this cannot change Qwen behavior.
+    verify_capture_dev: Option<GpuTensor>,
+    /// Target-owned erased verify scratch retained across windows. DeepSeek's
+    /// current scratch is thin, but retaining the box gives the future full
+    /// verify graph a stable lifetime without widening the target interface.
+    verify_scratch: Option<Box<dyn SpecScratch>>,
+    /// Body-selected policy captured once at construction.
+    persistent_verify_context_scratch: bool,
     /// Absolute positions whose main_hidden is cached in `main_hidden_dev`.
     /// Empty ⇒ cache invalid (same condition as `main_hidden_dev.is_none()`).
     ctx_positions: Vec<usize>,
@@ -1126,8 +1145,10 @@ impl MtpDrafter for DsparkDrafter {
         // unconditionally because the generic body may not preserve a valid
         // cached hidden across a cache-hit prefill. This is behaviourally
         // identical today; the unconditional clear is the safe default.
-        if let Some(dev) = self.main_hidden_dev.take() {
-            let _ = gpu.free_tensor(dev);
+        if !self.persistent_verify_context_scratch {
+            if let Some(dev) = self.main_hidden_dev.take() {
+                let _ = gpu.free_tensor(dev);
+            }
         }
         self.ctx_positions.clear();
         if let Some(c) = self.block_controller.as_mut() {
@@ -1205,11 +1226,38 @@ impl MtpDrafter for DsparkDrafter {
                     &hidden_host[..n.min(4)]
                 );
             }
-            let dev = upload_f32(gpu, &hidden_host)?;
-            if let Some(old) = self.main_hidden_dev.take() {
-                let _ = gpu.free_tensor(old);
+            if self.persistent_verify_context_scratch {
+                let max_context_floats = (self.block + 1) * layers.len() * hidden;
+                let needs_alloc = self
+                    .main_hidden_dev
+                    .as_ref()
+                    .is_none_or(|dev| dev.numel() < max_context_floats);
+                if needs_alloc {
+                    if let Some(old) = self.main_hidden_dev.take() {
+                        let _ = gpu.free_tensor(old);
+                    }
+                    self.main_hidden_dev = Some(
+                        gpu.alloc_tensor(&[max_context_floats], DType::F32)
+                            .map_err(|e| {
+                                format!("DsparkDrafter: alloc persistent main_hidden: {e:?}")
+                            })?,
+                    );
+                }
+                let bytes = unsafe {
+                    std::slice::from_raw_parts(
+                        hidden_host.as_ptr() as *const u8,
+                        hidden_host.len() * std::mem::size_of::<f32>(),
+                    )
+                };
+                gpu.memcpy_htod_auto(&self.main_hidden_dev.as_ref().unwrap().buf, bytes)
+                    .map_err(|e| format!("DsparkDrafter: upload persistent main_hidden: {e:?}"))?;
+            } else {
+                let dev = upload_f32(gpu, &hidden_host)?;
+                if let Some(old) = self.main_hidden_dev.take() {
+                    let _ = gpu.free_tensor(old);
+                }
+                self.main_hidden_dev = Some(dev);
             }
-            self.main_hidden_dev = Some(dev);
             self.ctx_positions = vec![position];
         }
         // Steady-state: main_hidden_dev and ctx_positions are already set from
@@ -1311,7 +1359,14 @@ impl MtpDrafter for DsparkDrafter {
             .collect();
         let n_verify = verify_tokens.len(); // seed + n_proposed drafts
 
-        let mut scratch = target.new_spec_scratch(gpu, n_verify)?;
+        let mut scratch = if self.persistent_verify_context_scratch {
+            self.verify_scratch
+                .take()
+                .map(Ok)
+                .unwrap_or_else(|| target.new_spec_scratch(gpu, self.block + 1))?
+        } else {
+            target.new_spec_scratch(gpu, n_verify)?
+        };
         // Capture the accepted-prefix hidden GPU-resident: verify writes the
         // per-position extract-layer hidden straight into `capture_buf`, and the
         // context update below slices the accepted prefix out of it GPU→GPU — so
@@ -1321,9 +1376,35 @@ impl MtpDrafter for DsparkDrafter {
         // (llama with n_verify < 4); the update then re-bootstraps, matching the
         // old host path's empty-capture branch. deepseek4 captures every size.
         let expected_hidden_per_pos = n_targets * hidden;
-        let capture_buf = gpu
-            .alloc_tensor(&[n_verify * expected_hidden_per_pos], DType::F32)
-            .map_err(|e| format!("DsparkDrafter: alloc capture_buf: {e:?}"))?;
+        let mut transient_capture = None;
+        if self.persistent_verify_context_scratch {
+            let max_capture_floats = (self.block + 1) * expected_hidden_per_pos;
+            let needs_alloc = self
+                .verify_capture_dev
+                .as_ref()
+                .is_none_or(|dev| dev.numel() < max_capture_floats);
+            if needs_alloc {
+                if let Some(old) = self.verify_capture_dev.take() {
+                    let _ = gpu.free_tensor(old);
+                }
+                self.verify_capture_dev = Some(
+                    gpu.alloc_tensor(&[max_capture_floats], DType::F32)
+                        .map_err(|e| {
+                            format!("DsparkDrafter: alloc persistent capture_buf: {e:?}")
+                        })?,
+                );
+            }
+        } else {
+            transient_capture = Some(
+                gpu.alloc_tensor(&[n_verify * expected_hidden_per_pos], DType::F32)
+                    .map_err(|e| format!("DsparkDrafter: alloc capture_buf: {e:?}"))?,
+            );
+        }
+        let capture_buf = if self.persistent_verify_context_scratch {
+            self.verify_capture_dev.as_ref().unwrap()
+        } else {
+            transient_capture.as_ref().unwrap()
+        };
         let kernel_profile_this_window = self.profiler.kernel_profile_position == Some(position);
         if kernel_profile_this_window {
             rdna_compute::profile::start();
@@ -1424,7 +1505,11 @@ impl MtpDrafter for DsparkDrafter {
         // recurrent arches).
         let accept_len = n_accepted; // accepted drafts; bonus is at accept_len
         target.commit_prefix(gpu, &verify_tokens, accept_len, position, scratch.as_mut())?;
-        scratch.free(gpu);
+        if self.persistent_verify_context_scratch {
+            self.verify_scratch = Some(scratch);
+        } else {
+            scratch.free(gpu);
+        }
 
         // ── 7. Update multi-slot context for the NEXT window ─────────────────
         // Reference `_update`: next ctx = verify hidden at accepted prefix
@@ -1437,22 +1522,56 @@ impl MtpDrafter for DsparkDrafter {
         let new_ctx_len = new_ctx_len_raw.min(block.max(1) + 1);
         if captured {
             // Slice the accepted prefix (new_ctx_len slots) out of the GPU capture
-            // buffer into a fresh drafter-owned buffer — all on-device, no D2H+H2D.
+            // buffer into the drafter-owned context buffer — all on-device, no
+            // D2H+H2D. Opted-in bodies retain that destination across windows.
             // We take the LAST new_ctx_len slots of the accepted prefix when the
             // full ctx_len_raw > block+1 (cap); in practice block+1 is usually
             // ≥ accepted+1, so start_slot is 0.
             let start_slot = new_ctx_len_raw - new_ctx_len; // 0 in normal case
             let n_floats = new_ctx_len * expected_hidden_per_pos;
             let src_offset = start_slot * expected_hidden_per_pos;
-            let dev = gpu
-                .alloc_tensor(&[n_floats], DType::F32)
-                .map_err(|e| format!("DsparkDrafter: alloc ctx hidden: {e:?}"))?;
-            gpu.memcpy_dtod_at_auto(&dev.buf, 0, &capture_buf.buf, src_offset * 4, n_floats * 4)
+            if self.persistent_verify_context_scratch {
+                let max_context_floats = (self.block + 1) * expected_hidden_per_pos;
+                let needs_alloc = self
+                    .main_hidden_dev
+                    .as_ref()
+                    .is_none_or(|dev| dev.numel() < max_context_floats);
+                if needs_alloc {
+                    if let Some(old) = self.main_hidden_dev.take() {
+                        let _ = gpu.free_tensor(old);
+                    }
+                    self.main_hidden_dev = Some(
+                        gpu.alloc_tensor(&[max_context_floats], DType::F32)
+                            .map_err(|e| {
+                                format!("DsparkDrafter: alloc persistent ctx hidden: {e:?}")
+                            })?,
+                    );
+                }
+                gpu.memcpy_dtod_at_auto(
+                    &self.main_hidden_dev.as_ref().unwrap().buf,
+                    0,
+                    &capture_buf.buf,
+                    src_offset * 4,
+                    n_floats * 4,
+                )
+                .map_err(|e| format!("DsparkDrafter: d2d persistent ctx hidden: {e:?}"))?;
+            } else {
+                let dev = gpu
+                    .alloc_tensor(&[n_floats], DType::F32)
+                    .map_err(|e| format!("DsparkDrafter: alloc ctx hidden: {e:?}"))?;
+                gpu.memcpy_dtod_at_auto(
+                    &dev.buf,
+                    0,
+                    &capture_buf.buf,
+                    src_offset * 4,
+                    n_floats * 4,
+                )
                 .map_err(|e| format!("DsparkDrafter: d2d ctx hidden: {e:?}"))?;
-            if let Some(old) = self.main_hidden_dev.take() {
-                let _ = gpu.free_tensor(old);
+                if let Some(old) = self.main_hidden_dev.take() {
+                    let _ = gpu.free_tensor(old);
+                }
+                self.main_hidden_dev = Some(dev);
             }
-            self.main_hidden_dev = Some(dev);
             // ctx positions: position + start_slot .. position + start_slot + new_ctx_len
             self.ctx_positions = (start_slot..start_slot + new_ctx_len)
                 .map(|s| position + s)
@@ -1466,12 +1585,16 @@ impl MtpDrafter for DsparkDrafter {
             // `capture_seed_main_hidden` advances the KV by exactly 1 for the
             // bonus, which is the right thing).  This is the Stage 1 behaviour
             // and is correct — just forfeits the multi-slot ctx for one window.
-            if let Some(old) = self.main_hidden_dev.take() {
-                let _ = gpu.free_tensor(old);
+            if !self.persistent_verify_context_scratch {
+                if let Some(old) = self.main_hidden_dev.take() {
+                    let _ = gpu.free_tensor(old);
+                }
             }
             self.ctx_positions.clear();
         }
-        let _ = gpu.free_tensor(capture_buf);
+        if let Some(capture_buf) = transient_capture {
+            let _ = gpu.free_tensor(capture_buf);
+        }
         self.profiler.sync_end(gpu, t_rest, 4);
         if let Some(c) = self.block_controller.as_mut() {
             if let Some(tw) = t_window_ms {
@@ -1502,8 +1625,10 @@ impl MtpDrafter for DsparkDrafter {
         if tokens.is_empty() {
             return Ok(true);
         }
-        if let Some(dev) = self.main_hidden_dev.take() {
-            let _ = gpu.free_tensor(dev);
+        if !self.persistent_verify_context_scratch {
+            if let Some(dev) = self.main_hidden_dev.take() {
+                let _ = gpu.free_tensor(dev);
+            }
         }
         self.ctx_positions.clear();
         match target.spec_advance(gpu, tokens, start_pos, false, abort, None)? {
@@ -1514,8 +1639,10 @@ impl MtpDrafter for DsparkDrafter {
 
     fn mtp_reset(&mut self, gpu: &mut Gpu) -> Result<(), String> {
         // Clear multi-slot context so the next prefill re-bootstraps.
-        if let Some(dev) = self.main_hidden_dev.take() {
-            let _ = gpu.free_tensor(dev);
+        if !self.persistent_verify_context_scratch {
+            if let Some(dev) = self.main_hidden_dev.take() {
+                let _ = gpu.free_tensor(dev);
+            }
         }
         self.ctx_positions.clear();
         // Body-owned draft rings / scratch (e.g. DeepSeek dspark_swa_k) must
@@ -1528,6 +1655,12 @@ impl MtpDrafter for DsparkDrafter {
         self.profiler.print_summary();
         if let Some(dev) = self.main_hidden_dev {
             let _ = gpu.free_tensor(dev);
+        }
+        if let Some(dev) = self.verify_capture_dev {
+            let _ = gpu.free_tensor(dev);
+        }
+        if let Some(scratch) = self.verify_scratch {
+            scratch.free(gpu);
         }
         self.body.free(gpu);
     }
@@ -1580,6 +1713,7 @@ pub fn build_dspark_speculator(
     max_cost_ratio: f32,
 ) -> Box<dyn Speculator> {
     let block = block.clamp(1, 8);
+    let persistent_verify_context_scratch = body.persistent_verify_context_scratch();
     // Default-on; HIPFIRE_DSPARK_ADAPTIVE_BLOCK=0 opts out (fixed block == today).
     let adaptive = hipfire_config::developer_var("HIPFIRE_DSPARK_ADAPTIVE_BLOCK")
         .ok()
@@ -1613,6 +1747,9 @@ pub fn build_dspark_speculator(
         block,
         ctx_capacity,
         main_hidden_dev: None,
+        verify_capture_dev: None,
+        verify_scratch: None,
+        persistent_verify_context_scratch,
         ctx_positions: Vec::new(),
         profiler: DsparkProfiler::new(),
         block_controller,
