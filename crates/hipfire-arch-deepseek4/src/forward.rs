@@ -494,6 +494,23 @@ mod config_cache {
                     != Some("0")
             })
     }
+    /// gfx1201 expert-parallel admission for the portable two-stage indexer.
+    ///
+    /// The initial 2,048-row capacity bucket uses the faster one-launch bounded
+    /// network; after capacity growth this admits the portable merge tree. Both
+    /// replace the legacy single-workgroup O(N^2) rank count and compile into
+    /// exact-gfx1201 code objects. Keep admission separate from every other
+    /// architecture.
+    pub(super) fn gfx1201_indexer_topk_two_stage_on(arch: &str) -> bool {
+        static V: OnceLock<bool> = OnceLock::new();
+        arch == "gfx1201"
+            && *V.get_or_init(|| {
+                hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_GFX1201_INDEXER_TOPK_TWOSTAGE")
+                    .ok()
+                    .as_deref()
+                    != Some("0")
+            })
+    }
     /// `HIPFIRE_DEEPSEEK4_INDEXER_TOPK_TWOSTAGE_MIN` — minimum
     /// active compressed-cache row count at which the two-stage path may be selected.
     /// Default 1024, from the measured standalone-probe crossover against the
@@ -3171,7 +3188,8 @@ fn indexer_forward(
         &gpu.arch,
         weights.mq2r_backend.is_gfx942(),
     ) || config_cache::gfx1151_indexer_topk_two_stage_on(&gpu.arch)
-        || config_cache::gfx1100_indexer_topk_two_stage_on(&gpu.arch))
+        || config_cache::gfx1100_indexer_topk_two_stage_on(&gpu.arch)
+        || config_cache::gfx1201_indexer_topk_two_stage_on(&gpu.arch))
         && two_stage_topk_capacity_eligible(&gpu.arch, max_compressed);
 
     let wq_b = layer
@@ -3361,7 +3379,7 @@ fn indexer_forward(
         )?;
     if !two_stage && !gfx942_parallel {
         gpu.indexer_top_k_buf(
-            gpu.arch.eq_ignore_ascii_case("gfx1151"),
+            gpu.arch.eq_ignore_ascii_case("gfx1151") || gpu.arch.eq_ignore_ascii_case("gfx1201"),
             scores,
             topk,
             &n_buf,
@@ -3386,7 +3404,8 @@ fn indexer_forward(
 /// already rearms graph/replay state before that route is captured.
 fn two_stage_topk_capacity_eligible(arch: &str, max_compressed: usize) -> bool {
     max_compressed >= config_cache::indexer_topk_two_stage_min()
-        && (arch != "gfx1151" || max_compressed > crate::deepseek4::INITIAL_COMPRESSED_ROWS)
+        && (!matches!(arch, "gfx1151" | "gfx1201")
+            || max_compressed > crate::deepseek4::INITIAL_COMPRESSED_ROWS)
 }
 
 /// Single-token decode step. Takes the token id of the previous
@@ -15034,7 +15053,7 @@ mod tests {
     }
 
     #[test]
-    fn gfx1151_two_stage_starts_after_the_certified_short_bucket() {
+    fn wave32_two_stage_starts_after_the_short_bucket() {
         assert!(!two_stage_topk_capacity_eligible(
             "gfx1151",
             crate::deepseek4::INITIAL_COMPRESSED_ROWS,
@@ -15046,6 +15065,14 @@ mod tests {
         // gfx942 keeps its independently promoted capacity threshold.
         assert!(two_stage_topk_capacity_eligible("gfx942", 2_048));
         assert!(!two_stage_topk_capacity_eligible("gfx942", 512));
+        assert!(!two_stage_topk_capacity_eligible(
+            "gfx1201",
+            crate::deepseek4::INITIAL_COMPRESSED_ROWS
+        ));
+        assert!(two_stage_topk_capacity_eligible(
+            "gfx1201",
+            crate::deepseek4::INITIAL_COMPRESSED_ROWS * 2
+        ));
     }
 
     #[test]
@@ -15182,6 +15209,10 @@ mod tests {
         assert!(!config_cache::gfx1100_indexer_topk_two_stage_on("gfx942"));
         assert!(!config_cache::gfx1100_indexer_topk_two_stage_on("gfx1151"));
         assert!(!config_cache::gfx1100_indexer_topk_two_stage_on("gfx1201"));
+        assert!(config_cache::gfx1201_indexer_topk_two_stage_on("gfx1201"));
+        assert!(!config_cache::gfx1201_indexer_topk_two_stage_on("gfx942"));
+        assert!(!config_cache::gfx1201_indexer_topk_two_stage_on("gfx1151"));
+        assert!(!config_cache::gfx1201_indexer_topk_two_stage_on("gfx1100"));
     }
 
     #[test]

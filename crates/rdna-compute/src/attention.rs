@@ -9867,7 +9867,7 @@ impl Gpu {
     }
     pub fn indexer_top_k_buf(
         &mut self,
-        deepseek4_gfx1151_route: bool,
+        deepseek4_fast_route: bool,
         scores: &GpuTensor,
         top_indices: &GpuTensor,
         n_compressed_buf: &GpuTensor,
@@ -9905,10 +9905,11 @@ impl Gpu {
                 .as_deref()
                 == Some("1")
         });
-        // gfx1151 and gfx942 own distinct code objects and route identities.
-        // The gfx942 filtered sibling cleared the raw-i32 channel and is pinned
-        // by gfx942-v1; =0 remains an emergency kill switch.
-        let gfx1151_parallel = self.arch == "gfx1151" && deepseek4_gfx1151_route && !force_serial;
+        // gfx1151 keeps its certified route selection. gfx1201 reuses the
+        // wave-size-independent bounded source, compiled into its own exact
+        // device code object after the raw-i32 parity channel passed.
+        let gfx1151_parallel = self.arch == "gfx1151" && deepseek4_fast_route && !force_serial;
+        let gfx1201_bounded = self.arch == "gfx1201" && deepseek4_fast_route && !force_serial;
         let (logical_name, source, symbol, block, smem) = if gfx1151_parallel {
             if force_unrolled {
                 (
@@ -9935,6 +9936,14 @@ impl Gpu {
                     0,
                 )
             }
+        } else if gfx1201_bounded {
+            (
+                "indexer_top_k_buf_bounded_gfx1201",
+                kernels::INDEXER_TOP_K_BUF_BOUNDED_GFX1151_SRC,
+                "indexer_top_k_buf_parallel",
+                [256, 1, 1],
+                0,
+            )
         } else {
             (
                 "indexer_top_k_buf",
