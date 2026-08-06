@@ -955,18 +955,6 @@ fn mfp_e8_row_bytes(dtype: DType, k: usize) -> usize {
     }
 }
 
-/// gfx1201 decode shapes where the 8-way E8 lattice schedule wins over the
-/// portable two-accumulator kernel. Keep this list exact: the 32768x1024
-/// Q-LoRA projection regresses with U8, and no adjacent architecture inherits
-/// this route.
-#[inline]
-fn gfx1201_e8_u8_shape(m: usize, k: usize) -> bool {
-    matches!(
-        (m, k),
-        (1024, 4096) | (2048, 4096) | (4096, 2048) | (4096, 8192)
-    )
-}
-
 fn gemv_auto(
     gpu: &mut Gpu,
     mq2r_backend: Mq2rBackend,
@@ -1016,9 +1004,6 @@ fn gemv_auto(
             DType::MFP4G32E8 => gpu
                 .gemv_mfp4g32_e8_prerotated(weight, x_rotated, y, m, k)
                 .map_err(|e| format!("gemv MFP4-E8: {e:?}")),
-            DType::MFP4G32E8SOA if gpu.arch_caps.is_gfx1201() && gfx1201_e8_u8_shape(m, k) => gpu
-                .gemv_mfp4g32_e8_soa_u8(weight, x_rotated, y, m, k)
-                .map_err(|e| format!("gemv MFP4-E8-SoA-U8 gfx1201: {e:?}")),
             DType::MFP4G32E8SOA if config_cache::e8_u4_on(&gpu.arch, mq2r_backend.is_gfx1151()) => {
                 if mq2r_backend.is_gfx1151() {
                     gpu.gemv_mfp4g32_e8_soa_u4_buffer_cpol_gfx1151(0, weight, x_rotated, y, m, k)
