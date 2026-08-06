@@ -5,7 +5,7 @@
 
 | Field | Value |
 |---|---|
-| State | **G0-G3 complete; G4 DeepSeek MQ2R heterogeneous lowering next** |
+| State | **G0-G4 complete; G5 direct-HIP heterogeneous optimization next** |
 | Date | 2026-08-06 |
 | Model | DeepSeek V4 Flash 0731 MQ2R (`arch_id=9`) |
 | Artifact | `cbf2bbcfa3f47b1712a071836b2c48232dad7dfb763813a720f7d348a9318cce` |
