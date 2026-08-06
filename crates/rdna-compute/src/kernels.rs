@@ -10,6 +10,12 @@ use crate::arch_caps::ArchCaps;
 /// Uses shared memory reduction across wavefronts.
 pub const GEMV_SRC: &str = include_str!("../../../kernels/src/gemv.hip");
 
+/// gfx1201-only four-rank EP reduction fused with the destination add.
+/// Remote partial pointers are read through HIP peer access after the runtime
+/// has established a cross-rank stream-event barrier.
+pub const EP_PEER_REDUCE_ADD4_F32_GFX1201_SRC: &str =
+    include_str!("../../../kernels/src/ep_peer_reduce_add4_f32.gfx1201.hip");
+
 /// GEMV Q4_K: matrix-vector multiply with on-the-fly Q4_K dequantization.
 /// A is stored as Q4_K blocks (144 bytes per 256 elements).
 /// x is F32, y is F32. y = A_dequant * x.

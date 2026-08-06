@@ -314,6 +314,75 @@ impl Gpu {
         result
     }
 
+    /// Add the fixed-order sum of four peer-visible f32 partials into `dst`.
+    ///
+    /// This is deliberately exact-gated to gfx1201. The caller must have
+    /// enabled peer access for every device pair and must order this launch
+    /// after all four producer streams. The pointers may belong to different
+    /// devices in the same HIP process.
+    pub fn ep_peer_reduce_add4_f32_gfx1201(
+        &mut self,
+        dst: &GpuTensor,
+        partials: [&GpuTensor; 4],
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if !self.arch_caps.is_gfx1201() {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "ep_peer_reduce_add4_f32_gfx1201 requires gfx1201, got {}",
+                    self.arch
+                ),
+            ));
+        }
+        let n = dst.numel();
+        if partials.iter().any(|partial| partial.numel() != n) {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "ep_peer_reduce_add4_f32_gfx1201: partial shape mismatch",
+            ));
+        }
+        self.ensure_kernel(
+            "ep_peer_reduce_add4_f32_gfx1201",
+            kernels::EP_PEER_REDUCE_ADD4_F32_GFX1201_SRC,
+            "ep_peer_reduce_add4_f32_gfx1201",
+        )?;
+
+        let dst_ptr = dst.buf.as_ptr();
+        let p0_ptr = partials[0].buf.as_ptr();
+        let p1_ptr = partials[1].buf.as_ptr();
+        let p2_ptr = partials[2].buf.as_ptr();
+        let p3_ptr = partials[3].buf.as_ptr();
+        let n_val = n as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &dst_ptr as *const _ as *mut c_void,
+            &p0_ptr as *const _ as *mut c_void,
+            &p1_ptr as *const _ as *mut c_void,
+            &p2_ptr as *const _ as *mut c_void,
+            &p3_ptr as *const _ as *mut c_void,
+            &n_val as *const _ as *mut c_void,
+        ];
+        let block = 256u32;
+        let grid = (n as u32).div_ceil(block);
+        self.launch_maybe_blob(
+            "ep_peer_reduce_add4_f32_gfx1201",
+            [grid, 1, 1],
+            [block, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(dst_ptr);
+                b.push_ptr(p0_ptr);
+                b.push_ptr(p1_ptr);
+                b.push_ptr(p2_ptr);
+                b.push_ptr(p3_ptr);
+                b.push_i32(n_val);
+                b
+            },
+        )
+    }
+
     pub fn zero_f32(&mut self, x: &GpuTensor) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_kernel("zero_f32", kernels::ZERO_F32_SRC, "zero_f32")?;

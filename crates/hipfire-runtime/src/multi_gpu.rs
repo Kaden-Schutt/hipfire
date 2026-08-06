@@ -398,6 +398,66 @@ impl Gpus {
         wait_result.and(destroy_result)
     }
 
+    /// Enqueue an all-rank producer barrier without blocking the host.
+    ///
+    /// One event is recorded on each rank's active stream, then every other
+    /// rank's stream waits on it. This is the ordering seam required before a
+    /// peer-read kernel consumes buffers produced independently on all ranks.
+    /// The events are destroyed only after every wait has been enqueued; HIP
+    /// retains their backing state until the queued waits complete.
+    pub fn barrier_rank_streams(&self) -> HipResult<()> {
+        let n = self.devices.len();
+        let mut events: Vec<(usize, Event)> = Vec::with_capacity(n);
+
+        for r in 0..n {
+            let gpu = &self.devices[r];
+            gpu.bind_thread()?;
+            let stream = gpu.active_stream.as_ref().ok_or_else(|| {
+                HipError::new(
+                    0,
+                    &format!("barrier_rank_streams: device {r} has no active_stream"),
+                )
+            })?;
+            let event = gpu.hip.event_create()?;
+            if let Err(error) = gpu.hip.event_record(&event, Some(stream)) {
+                let _ = gpu.hip.event_destroy(event);
+                for (src, recorded) in events.drain(..) {
+                    let _ = self.devices[src].hip.event_destroy(recorded);
+                }
+                return Err(error);
+            }
+            events.push((r, event));
+        }
+
+        for dst in 0..n {
+            let gpu = &self.devices[dst];
+            gpu.bind_thread()?;
+            let stream = gpu.active_stream.as_ref().expect("validated above");
+            for (src, event) in &events {
+                if *src == dst {
+                    continue;
+                }
+                if let Err(error) = gpu.hip.stream_wait_event(stream, event) {
+                    for (owner, recorded) in events.drain(..) {
+                        let _ = self.devices[owner].hip.event_destroy(recorded);
+                    }
+                    return Err(error);
+                }
+            }
+        }
+
+        let mut destroy_error = None;
+        for (src, event) in events {
+            if let Err(error) = self.devices[src].hip.event_destroy(event) {
+                destroy_error.get_or_insert(error);
+            }
+        }
+        match destroy_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
     fn from_parts(devices: Vec<Gpu>, per_device: Vec<usize>, n_layers: usize) -> HipResult<Self> {
         debug_assert_eq!(per_device.iter().sum::<usize>(), n_layers);
         debug_assert_eq!(per_device.len(), devices.len());

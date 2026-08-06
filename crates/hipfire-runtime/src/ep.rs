@@ -12,9 +12,10 @@
 //! 2. each rank computes ONLY its owned experts (+ the shared expert on rank 0)
 //!    into its partial via [`ForwardBindings::run_moe_ep`] (non-owned experts
 //!    read load-time zero-dummy weights → contribute 0),
-//! 3. `all_reduce_sum_f32` the partials across ranks (RCCL),
-//! 4. each rank adds the reduced partial into its residual stream via
-//!    [`ForwardBindings::ep_add_into_residual`].
+//! 3. reduce the partials across ranks (RCCL by default; four peer-connected
+//!    gfx1201 DS4 ranks use a fused peer-read reduction),
+//! 4. each rank adds/folds the reduced partial into its residual stream via
+//!    the architecture binding.
 //!
 //! All other super-ops (Attend / Norm / Proj / ResidualGemv / Recurrent / Conv
 //! / Escape) run **replicated** and unchanged — every rank holds the full
@@ -120,7 +121,10 @@ pub fn run_layer_program_ep<B: ForwardBindings>(
                 )?;
             }
 
-            // 3. All-reduce-sum the partials across ranks (in-place, RCCL).
+            // 3. Reduce the partials across ranks. Four peer-connected gfx1201
+            //    DS4 ranks use one peer-read reduction+destination-add kernel
+            //    per rank. Every other model, rank count, architecture, or
+            //    topology retains the established RCCL path.
             //    Decode stays on RCCL: its tiny per-token reduce is already fast
             //    (NOT the bottleneck — measured 51.4 RCCL vs 48.0 peer-direct on
             //    MiniMax 62-layer decode), peer-direct's per-layer wait_boundary
@@ -129,24 +133,44 @@ pub fn run_layer_program_ep<B: ForwardBindings>(
             //    PREFILL (large batched reduce), where RCCL is ~40 ms/call —
             //    that path uses all_reduce_sum_f32_peer directly. Opt decode into
             //    peer-direct with HIPFIRE_EP_PEER_ALLREDUCE_DECODE=1 if needed.
-            let refs: Vec<&DeviceBuffer> = partials.iter().map(|p| &p.buf).collect();
-            static PEER_DECODE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-            let use_peer = *PEER_DECODE.get_or_init(|| {
-                hipfire_config::developer_var("HIPFIRE_EP_PEER_ALLREDUCE_DECODE").as_deref()
-                    == Ok("1")
-            });
-            if use_peer {
-                gpus.all_reduce_sum_f32_peer(&refs, residual_dim)
-                    .map_err(hip_err)?;
+            let use_peer_reduce_add4 = n == 4
+                && gpus.peer_access_enabled
+                && gpus
+                    .devices
+                    .iter()
+                    .all(|device| device.arch_caps.is_gfx1201())
+                && bindings
+                    .iter()
+                    .all(ForwardBindings::supports_ep_peer_reduce_add4);
+            if use_peer_reduce_add4 {
+                // Every producer stream must become visible to every consumer
+                // stream before the kernels dereference remote device pointers.
+                gpus.barrier_rank_streams().map_err(hip_err)?;
+                let peers = [&partials[0], &partials[1], &partials[2], &partials[3]];
+                for r in 0..n {
+                    gpus.devices[r].bind_thread().map_err(hip_err)?;
+                    bindings[r].ep_peer_reduce_add4_into_residual(&mut gpus.devices[r], peers)?;
+                }
             } else {
-                gpus.all_reduce_sum_f32(&refs, residual_dim)
-                    .map_err(hip_err)?;
-            }
+                let refs: Vec<&DeviceBuffer> = partials.iter().map(|p| &p.buf).collect();
+                static PEER_DECODE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                let use_peer = *PEER_DECODE.get_or_init(|| {
+                    hipfire_config::developer_var("HIPFIRE_EP_PEER_ALLREDUCE_DECODE").as_deref()
+                        == Ok("1")
+                });
+                if use_peer {
+                    gpus.all_reduce_sum_f32_peer(&refs, residual_dim)
+                        .map_err(hip_err)?;
+                } else {
+                    gpus.all_reduce_sum_f32(&refs, residual_dim)
+                        .map_err(hip_err)?;
+                }
 
-            // 4. Each rank adds the reduced partial into its residual stream.
-            for r in 0..n {
-                gpus.devices[r].bind_thread().map_err(hip_err)?;
-                bindings[r].ep_add_into_residual(&mut gpus.devices[r], &partials[r])?;
+                // 4. Each rank adds the reduced partial into its residual stream.
+                for r in 0..n {
+                    gpus.devices[r].bind_thread().map_err(hip_err)?;
+                    bindings[r].ep_add_into_residual(&mut gpus.devices[r], &partials[r])?;
+                }
             }
         } else {
             // Replicated op — every rank runs it unchanged on full weights.
