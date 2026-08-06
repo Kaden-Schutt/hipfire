@@ -187,6 +187,7 @@ def build_config(args):
         "deepseek4_experts_per_token": getattr(args, "deepseek4_experts_per_token", None),
         "deepseek4_compute_placement": getattr(args, "deepseek4_compute_placement", "single"),
         "devices": getattr(args, "devices", None),
+        "tp": getattr(args, "tp", None),
         "replay_route_proof_log": bool(getattr(args, "replay_route_proof_log", False)),
     }
 
@@ -241,6 +242,7 @@ def show_config(cfg):
     )
     print(f"  ds4 placement : {cfg.get('deepseek4_compute_placement', 'single')}")
     print(f"  devices       : {cfg.get('devices') or '(runtime default)'}")
+    print(f"  expert parallel: tp={cfg.get('tp') or 1}")
     prompt_source = cfg.get("prompt_file") or cfg.get("prompts_file") or cfg.get("niah_file") or "(built-in battery)"
     print(f"  seed          : {cfg.get('seed')}   prompt_source: {prompt_source}")
     _cap = cfg['thinking_cap_tokens']
@@ -788,6 +790,8 @@ def spawn_serve(cfg, home, log):
     cli = _native_cli()
     serve_cmd = [cli, "serve", "127.0.0.1", str(cfg["port"]),
                  "--kv-backend", cfg.get("kv_backend", "contiguous")]
+    if cfg.get("tp"):
+        serve_cmd.extend(["--tp", str(cfg["tp"])])
     atexit.register(_kill_serve)
     # Append-only log: prior attempts remain for debugging; proofs use per-attempt offsets.
     os.makedirs(os.path.dirname(os.path.abspath(log)) or ".", exist_ok=True)
@@ -983,6 +987,13 @@ def main():
         "--devices",
         default=None,
         help="physical GPU selectors written to [hardware].devices, for example 0,1",
+    )
+    ap.add_argument(
+        "--tp",
+        type=int,
+        choices=range(1, 65),
+        default=None,
+        help="expert-parallel degree forwarded to native hipfire serve",
     )
     ap.add_argument("--tag", default=None, help="registry tag for recommended_settings (else inferred)")
     ap.add_argument("--registry", default=os.path.join(REPO, "registry/v1.json"))
