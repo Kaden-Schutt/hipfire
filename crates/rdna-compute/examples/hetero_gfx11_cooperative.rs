@@ -2095,6 +2095,19 @@ fn run_prefill(
             config.prefill_expert_k,
         )?;
         buffers.initialize(hip, &initial)?;
+        let mut depth_expected = Vec::new();
+        for _ in 0..chunks {
+            depth_expected = single_device_prefill_oracle(
+                hip,
+                functions,
+                &buffers,
+                config.layers,
+                batch,
+                config.prefill_shared_k,
+                config.prefill_expert_k,
+            )?;
+        }
+        buffers.initialize(hip, &initial)?;
         graph.run(&buffers)?;
         buffers.assert_output(hip, config.layers, &expected, "prefill_depth_warmup")?;
         buffers.initialize(hip, &initial)?;
@@ -2104,7 +2117,7 @@ fn run_prefill(
             host_enqueue_us += graph.run(&buffers)?.host_enqueue_us;
         }
         let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
-        buffers.assert_output(hip, config.layers, &expected, "prefill_depth")?;
+        buffers.assert_output(hip, config.layers, &depth_expected, "prefill_depth")?;
         let timeline = graph.timeline_report()?;
         let rows_per_second = depth as f64 * 1000.0 / elapsed_ms;
         println!(
