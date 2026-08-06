@@ -21,7 +21,7 @@ fn main() -> Result<(), String> {
     let model = args
         .next()
         .ok_or(
-            "usage: ds4_heterogeneous_load MODEL [--cycles N] [--replacement-probe] [--fault-matrix] [--fault dense|layer:N|audit|state|scratch] [--decode-token ID] [--position N] [--prompt PATH --generate N --output PATH] [--compare-single]",
+            "usage: ds4_heterogeneous_load MODEL [--cycles N] [--replacement-probe] [--fault-matrix] [--fault dense|layer:N|audit|state|scratch] [--decode-token ID] [--position N] [--prompt PATH --generate N --output PATH] [--compare-single] [--performance]",
         )?;
     let mut cycles = 1usize;
     let mut fault = None;
@@ -33,6 +33,7 @@ fn main() -> Result<(), String> {
     let mut prompt = None;
     let mut generate = 0usize;
     let mut output = None;
+    let mut performance = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--cycles" => {
@@ -99,6 +100,7 @@ fn main() -> Result<(), String> {
                     args.next().ok_or("--output requires a path")?,
                 ));
             }
+            "--performance" => performance = true,
             other => return Err(format!("unknown argument '{other}'")),
         }
     }
@@ -116,6 +118,9 @@ fn main() -> Result<(), String> {
     }
     if prompt.is_some() && cycles != 1 {
         return Err("canonical generation accepts exactly one load cycle".into());
+    }
+    if performance && compare_single {
+        return Err("--performance cannot be combined with --compare-single".into());
     }
 
     let plan = DeepseekV4HeterogeneousLoadPlan::default();
@@ -253,7 +258,8 @@ fn main() -> Result<(), String> {
         let mut heterogeneous_logits = None;
         let mut heterogeneous_generation = None;
         if let Some((tokenizer, prompt_tokens)) = generation.as_ref() {
-            let generated = generate_heterogeneous(&mut loaded, prompt_tokens, generate)?;
+            let generated =
+                generate_heterogeneous(&mut loaded, prompt_tokens, generate, !performance)?;
             let decoded = tokenizer.decode_bytes(&generated.tokens);
             if let Some(output_path) = output.as_deref() {
                 std::fs::write(output_path, &decoded).map_err(|error| {
@@ -272,6 +278,7 @@ fn main() -> Result<(), String> {
                     "decode_seconds": generated.decode.as_secs_f64(),
                     "prefill_tok_s": prompt_tokens.len() as f64 / generated.prefill.as_secs_f64(),
                     "decode_tok_s": generated.tokens.len() as f64 / generated.decode.as_secs_f64(),
+                    "certification_snapshots": !performance,
                     "output_path": output,
                 }))
                 .map_err(|error| error.to_string())?
@@ -369,13 +376,16 @@ fn generate_heterogeneous(
     model: &mut DeepseekV4HeterogeneousModel,
     prompt: &[u32],
     n_generate: usize,
+    certification_snapshots: bool,
 ) -> Result<GenerationResult, String> {
     let prefill_start = Instant::now();
     let mut logits = Vec::new();
     let mut snapshots = Vec::with_capacity(CERTIFICATION_POSITIONS.len());
     for (position, &token) in prompt.iter().enumerate() {
         logits = model.decode_step(token, position as u32)?;
-        capture_heterogeneous_if_selected(model, position, &mut snapshots)?;
+        if certification_snapshots {
+            capture_heterogeneous_if_selected(model, position, &mut snapshots)?;
+        }
     }
     let prefill = prefill_start.elapsed();
 
@@ -385,7 +395,9 @@ fn generate_heterogeneous(
     while tokens.len() < n_generate {
         let position = prompt.len() + tokens.len() - 1;
         logits = model.decode_step(tokens[tokens.len() - 1], position as u32)?;
-        capture_heterogeneous_if_selected(model, position, &mut snapshots)?;
+        if certification_snapshots {
+            capture_heterogeneous_if_selected(model, position, &mut snapshots)?;
+        }
         tokens.push(greedy(&logits)?);
     }
     Ok(GenerationResult {
