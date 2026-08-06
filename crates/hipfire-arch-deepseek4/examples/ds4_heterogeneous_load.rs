@@ -16,12 +16,64 @@ use hipfire_runtime::tokenizer::Tokenizer;
 use rdna_compute::{Gpu, GpuTensor};
 use serde_json::json;
 
+type RocprofControlFn = unsafe extern "C" fn(u64) -> i32;
+
+struct RocprofSelectedRegion {
+    _library: libloading::Library,
+    resume: RocprofControlFn,
+    pause: RocprofControlFn,
+}
+
+impl RocprofSelectedRegion {
+    fn load() -> Result<Self, String> {
+        let library = unsafe { libloading::Library::new("librocprofiler-sdk-roctx.so") }
+            .map_err(|error| format!("load librocprofiler-sdk-roctx.so: {error}"))?;
+        let resume = unsafe {
+            *library
+                .get::<RocprofControlFn>(b"roctxProfilerResume\0")
+                .map_err(|error| format!("resolve roctxProfilerResume: {error}"))?
+        };
+        let pause = unsafe {
+            *library
+                .get::<RocprofControlFn>(b"roctxProfilerPause\0")
+                .map_err(|error| format!("resolve roctxProfilerPause: {error}"))?
+        };
+        Ok(Self {
+            _library: library,
+            resume,
+            pause,
+        })
+    }
+
+    fn set(&self, active: bool) -> Result<(), String> {
+        let status = unsafe {
+            if active {
+                (self.resume)(0)
+            } else {
+                (self.pause)(0)
+            }
+        };
+        if status == 0 {
+            Ok(())
+        } else {
+            Err(format!(
+                "{} returned {status}",
+                if active {
+                    "roctxProfilerResume"
+                } else {
+                    "roctxProfilerPause"
+                }
+            ))
+        }
+    }
+}
+
 fn main() -> Result<(), String> {
     let mut args = std::env::args().skip(1);
     let model = args
         .next()
         .ok_or(
-            "usage: ds4_heterogeneous_load MODEL [--cycles N] [--replacement-probe] [--fault-matrix] [--fault dense|layer:N|audit|state|scratch] [--decode-token ID] [--position N] [--prompt PATH --generate N --output PATH] [--compare-single] [--performance] [--decode-attach-pause-ms N]",
+            "usage: ds4_heterogeneous_load MODEL [--cycles N] [--replacement-probe] [--fault-matrix] [--fault dense|layer:N|audit|state|scratch] [--decode-token ID] [--position N] [--prompt PATH --generate N --output PATH] [--compare-single] [--performance] [--decode-attach-pause-ms N] [--rocprof-selected-decode]",
         )?;
     let mut cycles = 1usize;
     let mut fault = None;
@@ -35,6 +87,7 @@ fn main() -> Result<(), String> {
     let mut output = None;
     let mut performance = false;
     let mut decode_attach_pause = Duration::ZERO;
+    let mut rocprof_selected_decode = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--cycles" => {
@@ -110,6 +163,7 @@ fn main() -> Result<(), String> {
                         .map_err(|error| format!("invalid --decode-attach-pause-ms: {error}"))?,
                 );
             }
+            "--rocprof-selected-decode" => rocprof_selected_decode = true,
             other => return Err(format!("unknown argument '{other}'")),
         }
     }
@@ -131,6 +185,17 @@ fn main() -> Result<(), String> {
     if performance && compare_single {
         return Err("--performance cannot be combined with --compare-single".into());
     }
+    if rocprof_selected_decode && !performance {
+        return Err("--rocprof-selected-decode requires --performance".into());
+    }
+
+    let rocprof_region = if rocprof_selected_decode {
+        let region = RocprofSelectedRegion::load()?;
+        region.set(false)?;
+        Some(region)
+    } else {
+        None
+    };
 
     let plan = DeepseekV4HeterogeneousLoadPlan::default();
     let artifact = DeepseekV4VerifiedArtifact::verify(Path::new(&model))?;
@@ -273,6 +338,7 @@ fn main() -> Result<(), String> {
                 generate,
                 !performance,
                 decode_attach_pause,
+                rocprof_region.as_ref(),
             )?;
             let decoded = tokenizer.decode_bytes(&generated.tokens);
             if let Some(output_path) = output.as_deref() {
@@ -392,6 +458,7 @@ fn generate_heterogeneous(
     n_generate: usize,
     certification_snapshots: bool,
     decode_attach_pause: Duration,
+    rocprof_region: Option<&RocprofSelectedRegion>,
 ) -> Result<GenerationResult, String> {
     let prefill_start = Instant::now();
     let mut logits = Vec::new();
@@ -413,6 +480,9 @@ fn generate_heterogeneous(
         std::thread::sleep(decode_attach_pause);
     }
 
+    if let Some(region) = rocprof_region {
+        region.set(true)?;
+    }
     let decode_start = Instant::now();
     let mut tokens = Vec::with_capacity(n_generate);
     tokens.push(greedy(&logits)?);
@@ -424,10 +494,14 @@ fn generate_heterogeneous(
         }
         tokens.push(greedy(&logits)?);
     }
+    let decode = decode_start.elapsed();
+    if let Some(region) = rocprof_region {
+        region.set(false)?;
+    }
     Ok(GenerationResult {
         tokens,
         prefill,
-        decode: decode_start.elapsed(),
+        decode,
         snapshots,
     })
 }

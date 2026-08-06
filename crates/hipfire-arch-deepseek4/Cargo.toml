@@ -21,5 +21,7 @@ hipfire-dispatch = { path = "../hipfire-dispatch", features = ["from-hip-error"]
 hipfire-reap = { path = "../hipfire-reap" }
 memmap2 = "0.9"
 
+[dev-dependencies]
+libloading.workspace = true
 
 [features]
