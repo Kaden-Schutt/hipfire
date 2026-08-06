@@ -8177,6 +8177,77 @@ impl Gpu {
     /// `gemv_hfq4g256_moe_down_k8_indexed_batched_expanded` +
     /// `moe_down_combine_k8_batched` — byte-exact at down_k=512.
     /// Grid: (down_m/16, 1, 1); block 256 (8 warps × 32).
+    /// MQ3-Lloyd codebook port of `gemv_hfq4g256_moe_ninepath_d4`.
+    ///
+    /// Same contract and kernargs as the HFQ4 parent. RPB=4 (not the parent's
+    /// 16) because the codebook staging costs LDS: at RPB=4 this holds the
+    /// parent's 14 waves/SIMD occupancy tier (18560 B LDS); RPB=8 drops to 12,
+    /// RPB=16 to 10. Grid is therefore `down_m / 4`.
+    ///
+    /// Requires down_k == 512 and down_m % 4 == 0 — the caller gates on the
+    /// same `ninepath_eligible` predicate as the parent.
+    pub fn gemv_mq3g256_lloyd_moe_ninepath_d4(
+        &mut self,
+        expert_ptrs: &GpuTensor,
+        topk_indices: &GpuTensor,
+        topk_weights: &GpuTensor,
+        rot_batch: &GpuTensor,
+        out: &GpuTensor,
+        down_m: usize,
+        down_k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemv_mq3g256_lloyd_moe_ninepath_d4",
+            kernels::GEMV_MQ3G256_LLOYD_MOE_NINEPATH_D4_SRC,
+            "gemv_mq3g256_lloyd_moe_ninepath_d4",
+        )?;
+        let pp = expert_ptrs.buf.as_ptr();
+        let ip = topk_indices.buf.as_ptr();
+        let wp = topk_weights.buf.as_ptr();
+        let xp = rot_batch.buf.as_ptr();
+        let op = out.buf.as_ptr();
+        let dm_val = down_m as i32;
+        let dk_val = down_k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &pp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &dm_val as *const _ as *mut c_void,
+            &dk_val as *const _ as *mut c_void,
+        ];
+        // MQ3-Lloyd: 112 bytes / 256-weight group.
+        let bytes = 8 * (down_m * (down_k / 256) * 112) + 8 * down_k * 4 + down_m * 4;
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "gemv",
+            "gemv_mq3g256_lloyd_moe_ninepath_d4",
+            bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "gemv_mq3g256_lloyd_moe_ninepath_d4",
+            [(down_m as u32) / 4, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(pp);
+                b.push_ptr(ip);
+                b.push_ptr(wp);
+                b.push_ptr(xp);
+                b.push_ptr(op);
+                b.push_i32(dm_val);
+                b.push_i32(dk_val);
+                b
+            },
+        );
+        crate::profile::end_timer(&self.hip, timer);
+        result
+    }
+
     pub fn gemv_hfq4g256_moe_ninepath_d4(
         &mut self,
         expert_ptrs: &GpuTensor,

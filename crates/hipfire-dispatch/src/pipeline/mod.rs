@@ -605,15 +605,29 @@ pub fn run_moe_decode(
         hipfire_config::developer_var("HIPFIRE_MOE_NINEPATH").unwrap_or_default()
     });
     let ninepath_mode = MOE_NINEPATH.as_str();
-    let ninepath_eligible = p.k == 8
+    // The ninepath down kernel is dtype-specific but shape-generic: it requires
+    // k==8, down_k==512 (2 groups), and down_m % RPB == 0. HFQ4 and MQ3-Lloyd
+    // each have their own port; the gate_up dtype is irrelevant to it (only the
+    // DOWN weights are read here), but it is pinned per-family below so an
+    // untested pairing cannot silently select a kernel.
+    let ninepath_shape_ok = p.k == 8
         && p.batch_size == 1
         && p.hidden <= 2048
         && p.mi == 512
-        && p.dtypes.routed_gate_up == DType::MQ4G256
-        && p.dtypes.routed_down == DType::MQ4G256
         && p.expert_dtype_tags.is_none()
         && p.expert_down_awq_ptrs.is_none()
         && !p.defer_routed_combine;
+    let ninepath_hfq4 = ninepath_shape_ok
+        && p.dtypes.routed_gate_up == DType::MQ4G256
+        && p.dtypes.routed_down == DType::MQ4G256;
+    // mq2r: routed gate_up MQ2G256Lloyd / down MQ3G256Lloyd. The incumbent down
+    // kernel is 16,384 single-wave workgroups at 166 GB/s against gate_up's 543
+    // (measured PM4 attribution), because every block re-reads the same rotated
+    // activation. This routes it through the same stage-once structure HFQ4 has.
+    let ninepath_mq3l = ninepath_shape_ok
+        && p.dtypes.routed_gate_up == DType::MQ2G256Lloyd
+        && p.dtypes.routed_down == DType::MQ3G256Lloyd;
+    let ninepath_eligible = ninepath_hfq4 || ninepath_mq3l;
     // Modes: "0"/off = chain; "d3" = D3 only (RESEARCH: 1-ULP codegen
     // divergence from the baseline gate_up — not byte-exact, and slower);
     // "1"/"on" = D3+D4 (research); anything else incl. unset = D4 only
@@ -839,7 +853,20 @@ pub fn run_moe_decode(
 
         // Expanded write — down GEMV by the DOWN dtype (mixed mq6-down lands here).
         // FIXME(Step 8): replace hardcoded 1 with p.batch_size when grouped prefill lands
-        if ninepath_d4 {
+        if ninepath_d4 && ninepath_mq3l {
+            // MQ3-Lloyd codebook port. Folds the 8 partials in LDS in ascending
+            // krank order (single owner per row, no atomics), so the shared
+            // combine below is skipped exactly as it is for the HFQ4 arm.
+            hip!(gpu.gemv_mq3g256_lloyd_moe_ninepath_d4(
+                p.expert_down_ptrs,
+                p.topk_indices,
+                p.topk_weights,
+                p.rot_batch,
+                out_target,
+                down_m,
+                down_k,
+            ))?;
+        } else if ninepath_d4 {
             hip!(gpu.gemv_hfq4g256_moe_ninepath_d4(
                 p.expert_down_ptrs,
                 p.topk_indices,

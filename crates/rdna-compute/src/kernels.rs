@@ -1911,6 +1911,13 @@ pub const GEMV_HFQ4G256_MOE_NINEPATH_D3_SRC: &str =
 /// Byte-exact with that pair at down_k=512. See kernel header.
 pub const GEMV_HFQ4G256_MOE_NINEPATH_D4_SRC: &str =
     include_str!("../../../kernels/src/gemv_hfq4g256_moe_ninepath_d4.hip");
+
+/// MQ3-Lloyd codebook port of the nine-path fused MoE down + weighted combine.
+/// Stages the rotated activation ONCE for all 8 routed experts (the incumbent
+/// re-reads it in each of 16,384 single-wave workgroups) and folds the 8
+/// partials in LDS in ascending krank order — single owner per row, no atomics.
+pub const GEMV_MQ3G256_LLOYD_MOE_NINEPATH_D4_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mq3g256_lloyd_moe_ninepath_d4.hip");
 /// Exact gfx1151 temporal-buffer candidate for the K=512 routed down stream.
 /// The kernel ABI, four-row mapping, reduction tree, and launch geometry stay
 /// unchanged; only weight addressing is lowered differently.
