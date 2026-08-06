@@ -1,8 +1,13 @@
 # DeepSeek V4 Flash 0731 MQ2RXT recipe
 
-Status: frozen product recipe, version 1.
+Status: frozen experimental recipe, version 1; parked on 2026-08-05.
 
 Recipe identity: `deepseek4-mq2rxt-mq4-p3-v1`.
+
+The recipe, builder, artifact identities, and runtime validators are preserved
+for reproducibility. MQ2RXT is not a selected/default DeepSeek4 SKU, is not
+automatically admitted to retained PM4, and its DSpark sidecar is rejected.
+The released MQ2R recipe remains the product-performance route.
 
 ## Intent
 
@@ -86,3 +91,20 @@ is profile-gated after a coherent artifact exists.
 MQ2RXT is not automatically admitted to the MQ2R retained-PM4 tape. It must
 produce and certify its own route because the symbol sequence and dispatch
 geometry can differ when 554 trunk and 24 DSpark tensors change dtype.
+
+## Parked disposition
+
+The target-depth screen and occurrence-weighted retained-PM4 profile are
+recorded in
+[`docs/investigations/2026-08-05-ds4-mq2rxt-v1-pm4.md`](../investigations/2026-08-05-ds4-mq2rxt-v1-pm4.md).
+At 2,048 prompt tokens and 512 generated tokens, MQ2RXT measured 27.2818 tok/s
+under retained PM4, below the preserved 27.7206 tok/s MQ2R two-stage result.
+Its dense MQ4 families already moved their 3.581 GB/token payload at an
+effective 228 GB/s in the attribution profile. That closed the immediate
+kernel-tuning line: reaching 30 tok/s would require a roughly 10% end-to-end
+gain without a profile-supported projection of that size.
+
+This is a throughput disposition, not a quality comparison. No new KLD or PPL
+claim was made for the trunk. The coherent artifact remains reproducible and
+may be reconsidered if a new graph-level lever or separately measured quality
+advantage justifies reopening it.
