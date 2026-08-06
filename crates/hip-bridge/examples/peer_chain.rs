@@ -24,7 +24,8 @@ use hip_bridge::{
     DeviceBuffer, Event, HipError, HipResult, HipRuntime, RcclComms, RcclDataType, Stream,
     HIP_EVENT_DISABLE_TIMING, HIP_EVENT_RELEASE_TO_SYSTEM,
 };
-use redline_rocr::{CompletionSignal, GpuDevice, GpuSelector, Runtime};
+use redline_rocr::packet::{BarrierAndPacket, PacketImage};
+use redline_rocr::{CompletionSignal, GpuDevice, GpuSelector, QueueSet, Runtime};
 use std::cell::{Cell, RefCell};
 use std::time::{Duration, Instant};
 
@@ -40,6 +41,7 @@ enum SyncMode {
     Host,
     Rccl,
     Rocr,
+    RocrAql,
     RocrSdma,
     Signal,
 }
@@ -51,10 +53,11 @@ impl SyncMode {
             "host" => Ok(Self::Host),
             "rccl" => Ok(Self::Rccl),
             "rocr" => Ok(Self::Rocr),
+            "rocr-aql" => Ok(Self::RocrAql),
             "rocr-sdma" => Ok(Self::RocrSdma),
             "signal" => Ok(Self::Signal),
             _ => Err(format!(
-                "unsupported --sync value {raw:?}; use event, signal, rccl, rocr, rocr-sdma, or host"
+                "unsupported --sync value {raw:?}; use event, signal, rccl, rocr, rocr-aql, rocr-sdma, or host"
             )),
         }
     }
@@ -65,13 +68,18 @@ impl SyncMode {
             Self::Host => "host_stream_sync",
             Self::Rccl => "rccl_grouped_p2p",
             Self::Rocr => "rocr_async_copy_auto",
+            Self::RocrAql => "rocr_sdma_dual_aql",
             Self::RocrSdma => "rocr_async_copy_sdma",
             Self::Signal => "signal_memory",
         }
     }
 
     fn is_rocr(self) -> bool {
-        matches!(self, Self::Rocr | Self::RocrSdma)
+        matches!(self, Self::Rocr | Self::RocrAql | Self::RocrSdma)
+    }
+
+    fn supports_sync_only(self) -> bool {
+        !self.is_rocr() || self == Self::RocrAql
     }
 }
 
@@ -163,7 +171,7 @@ impl Config {
             return Err("--batches must contain at least one positive value".to_string());
         }
         if (cfg.rocr_engine_0_to_1.is_some() || cfg.rocr_engine_1_to_0.is_some())
-            && cfg.sync != SyncMode::RocrSdma
+            && !matches!(cfg.sync, SyncMode::RocrSdma | SyncMode::RocrAql)
         {
             return Err("ROCr engine overrides require --sync rocr-sdma".to_string());
         }
@@ -207,7 +215,7 @@ fn print_help() {
            --chain-samples N      43-layer chain samples per size (default 50)\n\
            --exactness-samples N  post-timing exactness stress samples (default 10)\n\
            --exactness-seed-base N first unique stress payload seed (default 0)\n\
-           --sync MODE            signal (default), event, rccl, rocr, rocr-sdma, or host\n\
+           --sync MODE            signal, event, rccl, rocr, rocr-aql, rocr-sdma, or host\n\
            --layers N             round-trip dependency count (default 43)\n\
            --batches CSV          batch rows for [B,4096] F32 (default 1,16,128,512,1024)\n\
            --expect-arch0 ARCH    fail unless logical device 0 matches\n\
@@ -359,12 +367,22 @@ struct RocrChannel {
     mask_1_to_0: u32,
     preferred_0_to_1: u32,
     preferred_1_to_0: u32,
+    aql: Option<RocrAqlState>,
+}
+
+struct RocrAqlState {
+    queues: RefCell<QueueSet>,
+    barrier_completions: RefCell<Vec<CompletionSignal>>,
+    sync_completions: RefCell<Vec<CompletionSignal>>,
+    payload_batches: [Vec<PacketImage>; 2],
+    sync_batches: [Vec<PacketImage>; 2],
 }
 
 impl RocrChannel {
     fn new(
         layers: usize,
         explicit_sdma: bool,
+        dual_aql: bool,
         override_0_to_1: Option<u32>,
         override_1_to_0: Option<u32>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
@@ -410,6 +428,45 @@ impl RocrChannel {
             let owner = if index % 2 == 0 { &dev1 } else { &dev0 };
             completions.push(CompletionSignal::new(owner)?);
         }
+        let aql = if dual_aql {
+            let mut barrier_completions = Vec::with_capacity(layers * 2);
+            let mut sync_completions = Vec::with_capacity(layers * 2);
+            for index in 0..layers * 2 {
+                let owner = if index % 2 == 0 { &dev1 } else { &dev0 };
+                barrier_completions.push(CompletionSignal::new(owner)?);
+                sync_completions.push(CompletionSignal::new(owner)?);
+            }
+            let mut payload_batches = [Vec::with_capacity(layers), Vec::with_capacity(layers)];
+            let mut sync_batches = [Vec::with_capacity(layers), Vec::with_capacity(layers)];
+            for copy in 0..layers * 2 {
+                let lane = if copy % 2 == 0 { 1 } else { 0 };
+                let payload_packet = BarrierAndPacket::new(
+                    &[completions[copy].raw()],
+                    barrier_completions[copy].raw(),
+                )?;
+                payload_batches[lane].push(PacketImage::barrier(&payload_packet));
+                let sync_dependencies = if copy == 0 {
+                    Vec::new()
+                } else {
+                    vec![sync_completions[copy - 1].raw()]
+                };
+                let sync_packet =
+                    BarrierAndPacket::new(&sync_dependencies, sync_completions[copy].raw())?;
+                sync_batches[lane].push(PacketImage::barrier(&sync_packet));
+            }
+            Some(RocrAqlState {
+                queues: RefCell::new(QueueSet::create_for_devices(
+                    &[dev0.clone(), dev1.clone()],
+                    256,
+                )?),
+                barrier_completions: RefCell::new(barrier_completions),
+                sync_completions: RefCell::new(sync_completions),
+                payload_batches,
+                sync_batches,
+            })
+        } else {
+            None
+        };
         Ok(Self {
             dev0,
             dev1,
@@ -420,6 +477,7 @@ impl RocrChannel {
             mask_1_to_0,
             preferred_0_to_1,
             preferred_1_to_0,
+            aql,
         })
     }
 
@@ -496,7 +554,17 @@ impl RocrChannel {
         dev1: &DeviceBuffer,
         layers: usize,
         size: usize,
+        copy_payload: bool,
     ) -> HipResult<f64> {
+        if let Some(aql) = &self.aql {
+            return self.aql_chain(aql, dev0_a, dev0_b, dev1, layers, size, copy_payload);
+        }
+        if !copy_payload {
+            return Err(HipError {
+                code: 1,
+                message: "raw ROCr has no payload-free dependency chain".to_string(),
+            });
+        }
         let mut completions = self.completions.borrow_mut();
         for signal in completions.iter_mut().take(layers * 2) {
             signal.reset();
@@ -554,6 +622,103 @@ impl RocrChannel {
         }
         Ok(started.elapsed().as_secs_f64() * 1000.0)
     }
+
+    fn aql_chain(
+        &self,
+        aql: &RocrAqlState,
+        dev0_a: &DeviceBuffer,
+        dev0_b: &DeviceBuffer,
+        dev1: &DeviceBuffer,
+        layers: usize,
+        size: usize,
+        copy_payload: bool,
+    ) -> HipResult<f64> {
+        let started = Instant::now();
+        if !copy_payload {
+            let mut sync = aql.sync_completions.borrow_mut();
+            for signal in sync.iter_mut().take(layers * 2) {
+                signal.reset();
+            }
+            let mut queues = aql.queues.borrow_mut();
+            queues
+                .prepare_batches(&aql.sync_batches)
+                .map_err(rocr_as_hip)?;
+            queues.ring_prepared().map_err(rocr_as_hip)?;
+            sync[layers * 2 - 1]
+                .wait_timeout(Duration::from_secs(30))
+                .map_err(rocr_as_hip)?;
+            for completion in sync.iter().take(layers * 2) {
+                check_rocr_completion(completion)?;
+            }
+            return Ok(started.elapsed().as_secs_f64() * 1000.0);
+        }
+
+        let mut copies = self.completions.borrow_mut();
+        let mut barriers = aql.barrier_completions.borrow_mut();
+        for signal in copies.iter_mut().take(layers * 2) {
+            signal.reset();
+        }
+        for signal in barriers.iter_mut().take(layers * 2) {
+            signal.reset();
+        }
+        for copy in 0..layers * 2 {
+            let layer = copy / 2;
+            let (src0, dst0) = if layer % 2 == 0 {
+                (dev0_a, dev0_b)
+            } else {
+                (dev0_b, dev0_a)
+            };
+            let dependencies: Vec<&CompletionSignal> = if copy == 0 {
+                Vec::new()
+            } else {
+                vec![&barriers[copy - 1]]
+            };
+            let result = if copy % 2 == 0 {
+                // SAFETY: the AQL barrier on the destination agent performs a
+                // System acquire before publishing the next dependency.
+                unsafe {
+                    self.dev1.memory_async_copy(
+                        dev1.as_ptr(),
+                        &self.dev0,
+                        src0.as_ptr(),
+                        size,
+                        &dependencies,
+                        &copies[copy],
+                        self.engine_0_to_1,
+                    )
+                }
+            } else {
+                // SAFETY: same ownership and system-scope contract reversed.
+                unsafe {
+                    self.dev0.memory_async_copy(
+                        dst0.as_ptr(),
+                        &self.dev1,
+                        dev1.as_ptr(),
+                        size,
+                        &dependencies,
+                        &copies[copy],
+                        self.engine_1_to_0,
+                    )
+                }
+            };
+            result.map_err(rocr_as_hip)?;
+        }
+        let mut queues = aql.queues.borrow_mut();
+        queues
+            .prepare_batches(&aql.payload_batches)
+            .map_err(rocr_as_hip)?;
+        queues.ring_prepared().map_err(rocr_as_hip)?;
+        barriers[layers * 2 - 1]
+            .wait_timeout(Duration::from_secs(30))
+            .map_err(rocr_as_hip)?;
+        for completion in copies.iter().take(layers * 2) {
+            check_rocr_completion(completion)?;
+        }
+        for completion in barriers.iter().take(layers * 2) {
+            check_rocr_completion(completion)?;
+        }
+        Ok(started.elapsed().as_secs_f64() * 1000.0)
+    }
 }
 
 fn check_rocr_completion(signal: &CompletionSignal) -> HipResult<()> {
@@ -593,14 +758,15 @@ fn chain_sample(
     let host_start = Instant::now();
 
     if chain.sync.is_rocr() {
-        if !copy_payload {
-            return Err(HipError {
-                code: 1,
-                message: "ROCr has no payload-free async-copy chain control".to_string(),
-            });
-        }
         let rocr = chain.rocr.expect("ROCr mode requires channel");
-        let wall_ms = rocr.chain(chain.dev0_a, chain.dev0_b, chain.dev1, chain.layers, size)?;
+        let wall_ms = rocr.chain(
+            chain.dev0_a,
+            chain.dev0_b,
+            chain.dev1,
+            chain.layers,
+            size,
+            copy_payload,
+        )?;
         return Ok((wall_ms, wall_ms));
     }
     hip.event_record(chain.start0, Some(chain.stream0))?;
@@ -722,7 +888,7 @@ fn chain_sample(
                 hip.stream_synchronize(chain.stream1)?;
             }
             SyncMode::Rccl => unreachable!("RCCL chain is handled as one persistent group"),
-            SyncMode::Rocr | SyncMode::RocrSdma => {
+            SyncMode::Rocr | SyncMode::RocrAql | SyncMode::RocrSdma => {
                 unreachable!("ROCr chain is handled before HIP stream setup")
             }
             SyncMode::Signal => {
@@ -836,7 +1002,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let rocr = if cfg.sync.is_rocr() {
         Some(RocrChannel::new(
             cfg.layers,
-            cfg.sync == SyncMode::RocrSdma,
+            matches!(cfg.sync, SyncMode::RocrSdma | SyncMode::RocrAql),
+            cfg.sync == SyncMode::RocrAql,
             cfg.rocr_engine_0_to_1,
             cfg.rocr_engine_1_to_0,
         )?)
@@ -1012,7 +1179,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 one_way_sample(&hip, &direction_0_to_1, size)?;
                 one_way_sample(&hip, &direction_1_to_0, size)?;
-                chain_sample(&hip, &chain, size, false)?;
+                if cfg.sync.supports_sync_only() {
+                    chain_sample(&hip, &chain, size, false)?;
+                }
             }
             chain_sample(&hip, &chain, size, true)?;
         }
@@ -1063,7 +1232,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut chain_gpu = Vec::with_capacity(cfg.chain_samples);
         let mut chain_host = Vec::with_capacity(cfg.chain_samples);
         for _ in 0..cfg.chain_samples {
-            if !cfg.sync.is_rocr() {
+            if cfg.sync.supports_sync_only() {
                 let (gpu_ms, host_ms) = chain_sample(&hip, &chain, size, false)?;
                 event_gpu.push(gpu_ms);
                 event_host.push(host_ms);
@@ -1072,12 +1241,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             chain_gpu.push(gpu_ms);
             chain_host.push(host_ms);
         }
-        if !cfg.sync.is_rocr() {
+        if cfg.sync.supports_sync_only() {
             print_row(
                 match cfg.sync {
                     SyncMode::Event => "event_chain",
                     SyncMode::Host => "host_sync_chain",
                     SyncMode::Rccl => "rccl_grouped_chain",
+                    SyncMode::RocrAql => "rocr_aql_barrier_chain",
                     SyncMode::Rocr | SyncMode::RocrSdma => unreachable!(),
                     SyncMode::Signal => "signal_chain",
                 },

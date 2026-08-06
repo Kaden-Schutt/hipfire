@@ -1377,6 +1377,34 @@ impl QueueSet {
         })
     }
 
+    /// Create one queue for each explicitly supplied GPU agent.
+    ///
+    /// This is the mixed-agent counterpart to [`Self::create`]. All devices
+    /// must belong to one initialized ROCr runtime; queue order follows device
+    /// order so packet batches remain lane-stable across replays.
+    pub fn create_for_devices(
+        devices: &[GpuDevice],
+        queue_size: u32,
+    ) -> Result<Self, RuntimeError> {
+        let Some(first) = devices.first() else {
+            return Err(RuntimeError::ZeroQueues);
+        };
+        let mut queues = Vec::with_capacity(devices.len());
+        for device in devices {
+            first.require_same_runtime(device)?;
+            queues.push(AqlQueue::create(device, queue_size)?);
+        }
+        let mut ids = queues.iter().map(AqlQueue::id).collect::<Vec<_>>();
+        ids.sort_unstable();
+        if ids.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(RuntimeError::DuplicateQueueId);
+        }
+        Ok(Self {
+            prepared_doorbells: vec![None; queues.len()],
+            queues,
+        })
+    }
+
     pub fn len(&self) -> usize {
         self.queues.len()
     }
