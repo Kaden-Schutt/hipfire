@@ -576,7 +576,9 @@ impl Matcher {
     ///      enforce the per-token check.
     pub fn is_free(&self) -> bool {
         match self.state {
-            State::Out => !Self::has_open_prefix(&self.partial_buf),
+            // Masking on a partial `<tool_call>` prefix strands free text: a
+            // bare `<` (`<ip>`, `<p>`, `2 < 3`) leaves only `t`/`to`… legal.
+            State::Out => true,
             State::AfterOpen => false,
             State::InArgs => {
                 if self.attractor_detected {
@@ -598,18 +600,6 @@ impl Matcher {
                 !Self::has_close_prefix(&self.partial_buf)
             }
         }
-    }
-
-    /// Does the buffer end with a strict prefix of `<tool_call>` (so a
-    /// follow-up token could complete the open)?
-    fn has_open_prefix(s: &str) -> bool {
-        const OPEN: &str = "<tool_call>";
-        for n in 1..=OPEN.len() {
-            if s.ends_with(&OPEN[..n]) {
-                return true;
-            }
-        }
-        false
     }
 
     /// Does the buffer end with a strict prefix of `</tool_call>`?
@@ -1503,7 +1493,7 @@ mod tests {
         assert!(m.is_token_allowed("<tool"));
         m.advance("<tool");
         assert!(matches!(m.state(), State::Out));
-        assert!(!m.is_free(), "matcher must be constraining mid-marker");
+        assert!(m.is_free(), "a partial marker must not constrain free text");
         assert!(m.is_token_allowed("_call>"));
         m.advance("_call>");
         assert!(matches!(m.state(), State::AfterOpen));
@@ -1695,6 +1685,24 @@ mod tests {
         }
         assert!(matches!(m.state(), State::Out));
         assert!(m.is_free());
+    }
+
+    #[test]
+    fn free_text_angle_bracket_does_not_arm_the_mask() {
+        let mut m = Matcher::new(schemas(&["bash"]));
+        m.advance("HTML: ");
+        assert!(m.is_free());
+
+        m.advance("<");
+        assert!(m.is_free(), "a bare '<' must not constrain the sampler");
+        m.advance("p>hi</p>");
+        assert!(m.is_free());
+
+        m.advance(" and 2 < 3, table: <t");
+        assert!(m.is_free(), "'<t' must not constrain the sampler");
+        m.advance("able><tr></tr></table>");
+        assert!(m.is_free());
+        assert!(matches!(m.state(), State::Out));
     }
 
     #[test]
