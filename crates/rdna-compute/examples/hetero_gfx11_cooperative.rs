@@ -336,6 +336,18 @@ fn write_u32(bytes: &mut [u8], offset: usize, value: u32) {
     bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
 }
 
+fn write_u32_if_present(bytes: &mut [u8], offset: usize, value: u32) {
+    if let Some(destination) = bytes.get_mut(offset..offset + 4) {
+        destination.copy_from_slice(&value.to_le_bytes());
+    }
+}
+
+fn write_u16_if_present(bytes: &mut [u8], offset: usize, value: u16) {
+    if let Some(destination) = bytes.get_mut(offset..offset + 2) {
+        destination.copy_from_slice(&value.to_le_bytes());
+    }
+}
+
 fn kernargs(
     pool: &KernargPool,
     kernel: &Kernel,
@@ -352,6 +364,21 @@ fn kernargs(
         write_u32(buffer.as_mut_bytes(), offset, value);
         offset += 4;
     }
+    // Clang Code Object V5/V6 appends hidden launch geometry after the
+    // explicit parameters. HIP fills these fields before module launch; raw
+    // AQL must do the same or blockIdx.x remains zero and only the first
+    // workgroup's output survives. Keep every store length-guarded because a
+    // kernel which does not consume a hidden suffix may report only its
+    // explicit kernarg extent.
+    let hidden = offset.next_multiple_of(8);
+    let bytes = buffer.as_mut_bytes();
+    write_u32_if_present(bytes, hidden, (HIDDEN as u32).div_ceil(BLOCK as u32));
+    write_u32_if_present(bytes, hidden + 4, 1);
+    write_u32_if_present(bytes, hidden + 8, 1);
+    write_u16_if_present(bytes, hidden + 12, BLOCK);
+    write_u16_if_present(bytes, hidden + 14, 1);
+    write_u16_if_present(bytes, hidden + 16, 1);
+    write_u16_if_present(bytes, hidden + 64, 1);
     Ok(buffer)
 }
 
