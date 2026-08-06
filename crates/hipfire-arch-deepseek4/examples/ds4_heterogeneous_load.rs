@@ -4,8 +4,10 @@
 
 use std::path::Path;
 
+use hip_bridge::HipRuntime;
 use hipfire_arch_deepseek4::{
     DeepseekV4HeterogeneousFault, DeepseekV4HeterogeneousLoadPlan, DeepseekV4HeterogeneousModel,
+    DeepseekV4VerifiedArtifact,
 };
 use serde_json::json;
 
@@ -14,11 +16,12 @@ fn main() -> Result<(), String> {
     let model = args
         .next()
         .ok_or(
-            "usage: ds4_heterogeneous_load MODEL [--cycles N] [--replacement-probe] [--fault dense|layer:N|audit|state|scratch]",
+            "usage: ds4_heterogeneous_load MODEL [--cycles N] [--replacement-probe] [--fault-matrix] [--fault dense|layer:N|audit|state|scratch]",
         )?;
     let mut cycles = 1usize;
     let mut fault = None;
     let mut replacement_probe = false;
+    let mut fault_matrix = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--cycles" => {
@@ -51,6 +54,7 @@ fn main() -> Result<(), String> {
                 });
             }
             "--replacement-probe" => replacement_probe = true,
+            "--fault-matrix" => fault_matrix = true,
             other => return Err(format!("unknown argument '{other}'")),
         }
     }
@@ -59,31 +63,42 @@ fn main() -> Result<(), String> {
     }
 
     let plan = DeepseekV4HeterogeneousLoadPlan::default();
-    for cycle in 0..cycles {
-        if let Some(fault) = fault {
-            let error = match DeepseekV4HeterogeneousModel::load_with_fault(
-                Path::new(&model),
-                plan.clone(),
-                fault,
-            ) {
-                Ok(_) => return Err(format!("fault injection {fault:?} unexpectedly succeeded")),
-                Err(error) => error,
-            };
+    let artifact = DeepseekV4VerifiedArtifact::verify(Path::new(&model))?;
+    if fault_matrix {
+        if fault.is_some() || cycles != 1 {
+            return Err("--fault-matrix cannot be combined with --fault or --cycles".into());
+        }
+        let faults = [
+            DeepseekV4HeterogeneousFault::AfterDenseWeights,
+            DeepseekV4HeterogeneousFault::AfterRoutedLayer(0),
+            DeepseekV4HeterogeneousFault::AfterRoutedLayer(42),
+            DeepseekV4HeterogeneousFault::AfterOwnershipAudit,
+            DeepseekV4HeterogeneousFault::AfterState,
+            DeepseekV4HeterogeneousFault::AfterScratch,
+        ];
+        for (index, fault) in faults.into_iter().enumerate() {
+            run_expected_failure(&artifact, &plan, index, fault)?;
             println!(
                 "{}",
                 serde_json::to_string(&json!({
-                    "cycle": cycle,
-                    "status": "expected_failure",
+                    "cycle": index,
+                    "status": "post_failure_vram",
                     "fault": format!("{fault:?}"),
-                    "error": error,
+                    "devices": vram_snapshot()?,
                 }))
                 .map_err(|error| error.to_string())?
             );
+        }
+        replacement_probe = true;
+    }
+    for cycle in 0..cycles {
+        if let Some(fault) = fault {
+            run_expected_failure(&artifact, &plan, cycle, fault)?;
             continue;
         }
 
-        let mut loaded = Some(DeepseekV4HeterogeneousModel::load(
-            Path::new(&model),
+        let mut loaded = Some(DeepseekV4HeterogeneousModel::load_verified(
+            &artifact,
             plan.clone(),
         )?);
         if replacement_probe {
@@ -93,9 +108,9 @@ fn main() -> Result<(), String> {
                 .report
                 .model_sha256
                 .clone();
-            let replacement_error = DeepseekV4HeterogeneousModel::replace_transactionally(
+            let replacement_error = DeepseekV4HeterogeneousModel::replace_transactionally_verified(
                 &mut loaded,
-                Path::new(&model),
+                &artifact,
                 plan.clone(),
             )
             .expect_err("replacement unexpectedly fit beside the resident 73 GiB expert tier");
@@ -164,4 +179,55 @@ fn main() -> Result<(), String> {
         loaded.unload();
     }
     Ok(())
+}
+
+fn run_expected_failure(
+    artifact: &DeepseekV4VerifiedArtifact,
+    plan: &DeepseekV4HeterogeneousLoadPlan,
+    cycle: usize,
+    fault: DeepseekV4HeterogeneousFault,
+) -> Result<(), String> {
+    let error =
+        match DeepseekV4HeterogeneousModel::load_verified_with_fault(artifact, plan.clone(), fault)
+        {
+            Ok(_) => return Err(format!("fault injection {fault:?} unexpectedly succeeded")),
+            Err(error) => error,
+        };
+    println!(
+        "{}",
+        serde_json::to_string(&json!({
+            "cycle": cycle,
+            "status": "expected_failure",
+            "fault": format!("{fault:?}"),
+            "error": error,
+        }))
+        .map_err(|error| error.to_string())?
+    );
+    Ok(())
+}
+
+fn vram_snapshot() -> Result<Vec<serde_json::Value>, String> {
+    let hip = HipRuntime::load().map_err(|error| format!("load HIP for VRAM snapshot: {error}"))?;
+    let count = hip
+        .device_count()
+        .map_err(|error| format!("device count for VRAM snapshot: {error}"))?;
+    let mut rows = Vec::new();
+    for device_id in 0..count {
+        hip.set_device(device_id)
+            .map_err(|error| format!("bind device {device_id} for VRAM snapshot: {error}"))?;
+        let arch = hip
+            .get_arch(device_id)
+            .map_err(|error| format!("device {device_id} architecture: {error}"))?;
+        let (free, total) = hip
+            .get_vram_info()
+            .map_err(|error| format!("device {device_id} VRAM snapshot: {error}"))?;
+        rows.push(json!({
+            "device_id": device_id,
+            "arch": arch,
+            "used_bytes": total.saturating_sub(free),
+            "free_bytes": free,
+            "total_bytes": total,
+        }));
+    }
+    Ok(rows)
 }

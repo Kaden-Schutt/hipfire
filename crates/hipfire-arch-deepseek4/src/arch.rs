@@ -134,7 +134,14 @@ impl Drop for DeepseekV4WeightStaging {
         unsafe {
             let dense_gpu = &mut *self.dense_gpu;
             if let (Some(routed), Some(routed_gpu)) = (routed, self.routed_gpu) {
-                routed.free_gpu(&mut *routed_gpu);
+                let errors = routed.free_gpu_now(&mut *routed_gpu);
+                if !errors.is_empty() {
+                    eprintln!(
+                        "deepseek4: routed failure cleanup reported {} error(s): {}",
+                        errors.len(),
+                        errors.join("; ")
+                    );
+                }
             }
             if let Some(dense) = dense {
                 dense.free_gpu(dense_gpu);

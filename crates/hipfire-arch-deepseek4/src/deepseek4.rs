@@ -932,6 +932,55 @@ impl DeepseekV4LayerWeights {
         free_opt(gpu, &mut self.expert_gate_up_dummy);
     }
 
+    /// Failure-path teardown for large split-owner expert blobs. Bypass the
+    /// reuse pool so a partially loaded 73 GiB tier is returned to HIP before
+    /// the transactional constructor reports failure. Normal model unload
+    /// keeps the pooled path above and drains it once at the end.
+    fn free_routed_gpu_now(&mut self, gpu: &mut rdna_compute::Gpu, errors: &mut Vec<String>) {
+        if let Err(error) = gpu.bind_thread() {
+            errors.push(format!("bind routed failure cleanup: {error}"));
+            self.free_routed_gpu(gpu);
+            return;
+        }
+        fn free_opt(
+            gpu: &mut rdna_compute::Gpu,
+            label: &str,
+            tensor: &mut Option<rdna_compute::GpuTensor>,
+            errors: &mut Vec<String>,
+        ) {
+            let Some(tensor) = tensor.take() else {
+                return;
+            };
+            if let Err(error) = gpu.hip.free(tensor.buf) {
+                errors.push(format!("free {label}: {error}"));
+            }
+        }
+        free_opt(gpu, "expert_w1_ptrs", &mut self.expert_w1_ptrs, errors);
+        free_opt(gpu, "expert_w2_ptrs", &mut self.expert_w2_ptrs, errors);
+        free_opt(gpu, "expert_w3_ptrs", &mut self.expert_w3_ptrs, errors);
+        free_opt(
+            gpu,
+            "expert_gate_up_ptrs",
+            &mut self.expert_gate_up_ptrs,
+            errors,
+        );
+        free_opt(gpu, "expert_w1_blob", &mut self.expert_w1_blob, errors);
+        free_opt(gpu, "expert_w2_blob", &mut self.expert_w2_blob, errors);
+        free_opt(gpu, "expert_w3_blob", &mut self.expert_w3_blob, errors);
+        free_opt(
+            gpu,
+            "expert_gate_up_blob",
+            &mut self.expert_gate_up_blob,
+            errors,
+        );
+        free_opt(
+            gpu,
+            "expert_gate_up_dummy",
+            &mut self.expert_gate_up_dummy,
+            errors,
+        );
+    }
+
     fn visit_dense_tensors(
         &self,
         prefix: &str,
@@ -1222,6 +1271,14 @@ impl DeepseekV4RoutedWeights {
         for mut layer in self.layers.drain(..) {
             layer.free_routed_gpu(gpu);
         }
+    }
+
+    pub(crate) fn free_gpu_now(mut self, gpu: &mut rdna_compute::Gpu) -> Vec<String> {
+        let mut errors = Vec::new();
+        for mut layer in self.layers.drain(..) {
+            layer.free_routed_gpu_now(gpu, &mut errors);
+        }
+        errors
     }
 
     fn visit_tensors(&self, visit: &mut impl FnMut(&str, &rdna_compute::GpuTensor)) {

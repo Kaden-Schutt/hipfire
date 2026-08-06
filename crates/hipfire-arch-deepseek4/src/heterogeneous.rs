@@ -8,7 +8,8 @@
 //! process-wide mixed-architecture escape hatch and cannot affect Qwen's
 //! single-device or homogeneous multi-GPU loaders.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use hip_bridge::HipRuntime;
 use hipfire_config::{Deepseek4ComputePlacement, DeviceSelector};
@@ -26,6 +27,71 @@ use crate::DeepseekV4;
 pub const MQ2R_0731_SHA256: &str =
     "cbf2bbcfa3f47b1712a071836b2c48232dad7dfb763813a720f7d348a9318cce";
 pub const DEFAULT_SAFETY_MARGIN_BYTES: usize = 2 * 1024 * 1024 * 1024;
+
+/// Content identity receipt for repeated transactional tests or reloads in one
+/// process. The expensive 82 GiB SHA scan happens once; every reuse proves the
+/// canonical path, length, and modification time are unchanged before opening
+/// the artifact again.
+#[derive(Debug, Clone)]
+pub struct DeepseekV4VerifiedArtifact {
+    path: PathBuf,
+    len: u64,
+    modified: SystemTime,
+    pub sha256: String,
+}
+
+impl DeepseekV4VerifiedArtifact {
+    pub fn verify(path: &Path) -> Result<Self, String> {
+        let path = path
+            .canonicalize()
+            .map_err(|error| format!("deepseek4 canonicalize {}: {error}", path.display()))?;
+        let metadata = path
+            .metadata()
+            .map_err(|error| format!("deepseek4 metadata {}: {error}", path.display()))?;
+        let modified = metadata
+            .modified()
+            .map_err(|error| format!("deepseek4 mtime {}: {error}", path.display()))?;
+        let sha256 = crate::parent::manifest::sha256_file(&path)?;
+        if sha256 != MQ2R_0731_SHA256 {
+            return Err(format!(
+                "deepseek4 heterogeneous artifact SHA mismatch: got {sha256}, expected {MQ2R_0731_SHA256}"
+            ));
+        }
+        Ok(Self {
+            path,
+            len: metadata.len(),
+            modified,
+            sha256,
+        })
+    }
+
+    fn validate(&self, path: &Path) -> Result<String, String> {
+        let canonical = path
+            .canonicalize()
+            .map_err(|error| format!("deepseek4 canonicalize {}: {error}", path.display()))?;
+        if canonical != self.path {
+            return Err(format!(
+                "deepseek4 verified artifact path changed: {} != {}",
+                canonical.display(),
+                self.path.display()
+            ));
+        }
+        let metadata = canonical
+            .metadata()
+            .map_err(|error| format!("deepseek4 metadata {}: {error}", canonical.display()))?;
+        let modified = metadata
+            .modified()
+            .map_err(|error| format!("deepseek4 mtime {}: {error}", canonical.display()))?;
+        if metadata.len() != self.len || modified != self.modified {
+            return Err("deepseek4 verified artifact changed after identity scan".into());
+        }
+        Ok(self.sha256.clone())
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeepseekV4HeterogeneousLoadPlan {
@@ -226,7 +292,14 @@ pub struct DeepseekV4HeterogeneousModel {
 
 impl DeepseekV4HeterogeneousModel {
     pub fn load(path: &Path, plan: DeepseekV4HeterogeneousLoadPlan) -> Result<Self, String> {
-        Self::load_inner(path, plan, None)
+        Self::load_inner(path, plan, None, None)
+    }
+
+    pub fn load_verified(
+        artifact: &DeepseekV4VerifiedArtifact,
+        plan: DeepseekV4HeterogeneousLoadPlan,
+    ) -> Result<Self, String> {
+        Self::load_inner(artifact.path(), plan, None, Some(artifact))
     }
 
     /// Publish a replacement only after its entire two-device transaction has
@@ -243,19 +316,40 @@ impl DeepseekV4HeterogeneousModel {
         Ok(())
     }
 
+    pub fn replace_transactionally_verified(
+        current: &mut Option<Self>,
+        artifact: &DeepseekV4VerifiedArtifact,
+        plan: DeepseekV4HeterogeneousLoadPlan,
+    ) -> Result<(), String> {
+        let staged = Self::load_verified(artifact, plan)?;
+        let previous = current.replace(staged);
+        drop(previous);
+        Ok(())
+    }
+
     #[doc(hidden)]
     pub fn load_with_fault(
         path: &Path,
         plan: DeepseekV4HeterogeneousLoadPlan,
         fault: DeepseekV4HeterogeneousFault,
     ) -> Result<Self, String> {
-        Self::load_inner(path, plan, Some(fault))
+        Self::load_inner(path, plan, Some(fault), None)
+    }
+
+    #[doc(hidden)]
+    pub fn load_verified_with_fault(
+        artifact: &DeepseekV4VerifiedArtifact,
+        plan: DeepseekV4HeterogeneousLoadPlan,
+        fault: DeepseekV4HeterogeneousFault,
+    ) -> Result<Self, String> {
+        Self::load_inner(artifact.path(), plan, Some(fault), Some(artifact))
     }
 
     fn load_inner(
         path: &Path,
         plan: DeepseekV4HeterogeneousLoadPlan,
         fault: Option<DeepseekV4HeterogeneousFault>,
+        verified: Option<&DeepseekV4VerifiedArtifact>,
     ) -> Result<Self, String> {
         if plan.prefill_max_batch == 0 {
             return Err("deepseek4 heterogeneous prefill_max_batch must be nonzero".into());
@@ -267,12 +361,17 @@ impl DeepseekV4HeterogeneousModel {
             ));
         }
 
-        let model_sha256 = crate::parent::manifest::sha256_file(path)?;
-        if model_sha256 != MQ2R_0731_SHA256 {
-            return Err(format!(
-                "deepseek4 heterogeneous artifact SHA mismatch: got {model_sha256}, expected {MQ2R_0731_SHA256}"
-            ));
-        }
+        let model_sha256 = if let Some(verified) = verified {
+            verified.validate(path)?
+        } else {
+            let sha256 = crate::parent::manifest::sha256_file(path)?;
+            if sha256 != MQ2R_0731_SHA256 {
+                return Err(format!(
+                    "deepseek4 heterogeneous artifact SHA mismatch: got {sha256}, expected {MQ2R_0731_SHA256}"
+                ));
+            }
+            sha256
+        };
 
         // Open the artifact exactly once. Both upload phases consume this one
         // index/file handle directly; no full-model owner or migration exists.

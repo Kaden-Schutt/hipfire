@@ -74,6 +74,6 @@ pub use deepseek4::{
 };
 pub use heterogeneous::{
     DeepseekV4HeterogeneousLoadPlan, DeepseekV4HeterogeneousLoadReport,
-    DeepseekV4HeterogeneousModel,
+    DeepseekV4HeterogeneousModel, DeepseekV4VerifiedArtifact,
 };
 pub use spec_impl::Deepseek4Bundle;
