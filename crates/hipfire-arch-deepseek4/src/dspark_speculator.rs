@@ -367,6 +367,7 @@ mod tests {
             reap_keep: None,
             load_dspark: true,
             mq2r: false,
+            mq2rxt: false,
         }
     }
 

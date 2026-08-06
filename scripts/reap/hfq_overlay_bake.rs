@@ -3,10 +3,12 @@
 //
 // Bake one HFQ overlay into a standalone HFQ without re-quantizing anything.
 // Every replacement tensor is copied byte-for-byte from the overlay; every
-// other tensor and the metadata JSON are copied byte-for-byte from the base.
+// other tensor is copied byte-for-byte from the base. Metadata defaults to the
+// base, but a recipe overlay may explicitly supply the output metadata.
 //
 // Usage:
 //   hfq_overlay_bake <output.hfq> <base.hfq> <overlay.hfq> [expected-overrides]
+//     [--metadata-from-overlay]
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::convert::TryInto;
@@ -46,9 +48,10 @@ struct OutputTensor {
 
 fn main() -> io::Result<()> {
     let args: Vec<String> = env::args().collect();
-    if !(args.len() == 4 || args.len() == 5) {
+    if args.len() < 4 {
         eprintln!(
-            "usage: {} <output.hfq> <base.hfq> <overlay.hfq> [expected-overrides]",
+            "usage: {} <output.hfq> <base.hfq> <overlay.hfq> [expected-overrides] \
+             [--metadata-from-overlay]",
             args[0]
         );
         std::process::exit(2);
@@ -57,14 +60,28 @@ fn main() -> io::Result<()> {
     let output = Path::new(&args[1]);
     let base = parse_hfq(Path::new(&args[2]))?;
     let overlay = parse_hfq(Path::new(&args[3]))?;
-    let expected_overrides = args
-        .get(4)
-        .map(|value| {
+    let mut expected_overrides = None;
+    let mut metadata_from_overlay = false;
+    let mut index = 4usize;
+    if args
+        .get(index)
+        .is_some_and(|value| !value.starts_with("--"))
+    {
+        let value = &args[index];
+        expected_overrides = Some(
             value
                 .parse::<usize>()
-                .map_err(|_| invalid(format!("invalid expected-overrides '{value}'")))
-        })
-        .transpose()?;
+                .map_err(|_| invalid(format!("invalid expected-overrides '{value}'")))?,
+        );
+        index += 1;
+    }
+    while index < args.len() {
+        match args[index].as_str() {
+            "--metadata-from-overlay" => metadata_from_overlay = true,
+            other => return Err(invalid(format!("unknown option '{other}'"))),
+        }
+        index += 1;
+    }
 
     if output == base.path || output == overlay.path {
         return Err(invalid("output must differ from base and overlay"));
@@ -125,9 +142,15 @@ fn main() -> io::Result<()> {
         }
     }
 
+    let metadata = if metadata_from_overlay {
+        overlay.metadata.clone()
+    } else {
+        base.metadata.clone()
+    };
+
     let index = encode_index(&tensors)?;
     let metadata_offset = 32_u64;
-    let unaligned_data_offset = metadata_offset + base.metadata.len() as u64 + index.len() as u64;
+    let unaligned_data_offset = metadata_offset + metadata.len() as u64 + index.len() as u64;
     let data_offset = (unaligned_data_offset + 4095) & !4095;
 
     let mut output_file = OpenOptions::new()
@@ -140,7 +163,7 @@ fn main() -> io::Result<()> {
     output_file.write_all(&(tensors.len() as u32).to_le_bytes())?;
     output_file.write_all(&metadata_offset.to_le_bytes())?;
     output_file.write_all(&data_offset.to_le_bytes())?;
-    output_file.write_all(&base.metadata)?;
+    output_file.write_all(&metadata)?;
     output_file.write_all(&index)?;
     let padding = (data_offset - unaligned_data_offset) as usize;
     output_file.write_all(&vec![0_u8; padding])?;

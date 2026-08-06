@@ -623,11 +623,11 @@ mod config_cache {
     /// wants is different. The table in the git history recording 2.2 as the
     /// winner is a Lloyd-era measurement and must not be applied to MQ2R.
     ///
-    /// This is gated on `cfg.mq2r`, which comes from the `.mq2r` artifact
-    /// suffix or frozen recipe metadata and is never inferred from the
-    /// presence of an E8 tensor — so **MQ2-Lloyd and every other DeepSeek V4
-    /// artifact keep their header value untouched**, and a future re-quant
-    /// inherits 1.5 from its own header rather than this compensation.
+    /// This is gated on `cfg.mq2r`, which comes from the exact MQ2R-family
+    /// artifact identity and is never inferred from tensor dtype. MQ2RXT keeps
+    /// the same routed MQ2-Lloyd payload and initially inherits this measured
+    /// compensation; its quality certification must re-check the optimum.
+    /// MQ2-Lloyd and every other DeepSeek V4 artifact keep their header value.
     ///
     /// It remains a compensation, not a model property: MQ2 expert
     /// quantization loses routed-expert magnitude and an inflated route scale
@@ -1461,6 +1461,9 @@ fn gemv_auto_batched_wmma(
                 Err("F16 weight requires an F16 GEMM path with x_f16_scratch".to_string())
             }
         }
+        DType::MQ4G256 if gpu.arch == "gfx1151" && batch_size <= 8 => gpu
+            .gemm_hfq4g256(weight, x_rotated_batch, y, m, k, batch_size)
+            .map_err(|e| format!("gemm_hfq4g256 small-B: {e:?}")),
         _ => {
             // `gemm_hfq4g256_wmma` is a wave32-WMMA kernel and does not
             // COMPILE on CDNA3, so `has_wmma()` (false on gfx942) must gate
@@ -7096,7 +7099,23 @@ fn attn_stub(
             .map_err(|e| format!("rotate attn_out batched l{layer_idx}: {e:?}"))?;
     }
 
-    if wo_a.dtype == DType::MFP4G32E8SOA && config_cache::e8_wo_grouped_on(&gpu.arch, cfg.mq2r) {
+    if wo_a.dtype == DType::MQ4G256 {
+        // MQ2RXT keeps the same one-launch grouped O-LoRA topology as MQ2R.
+        // The existing HFQ4/MQ4 batched kernel treats B=1 as a contiguous
+        // [groups, K] input and reuses the already-rotated activation.
+        gpu.wo_per_group_batched_hfq4g256(
+            wo_a,
+            attn_out_raw_rot,
+            wo_a_out,
+            n_groups as i32,
+            o_lora_rank as i32,
+            per_group_in as i32,
+            1,
+        )
+        .map_err(|e| format!("grouped MQ4 wo_a l{layer_idx}: {e:?}"))?;
+    } else if wo_a.dtype == DType::MFP4G32E8SOA
+        && config_cache::e8_wo_grouped_on(&gpu.arch, cfg.mq2r)
+    {
         gpu.gemv_mfp4g32_e8_soa_grouped_gfx1151(
             wo_a,
             attn_out_raw_rot,
@@ -9443,7 +9462,7 @@ fn attention_block_batched_swa_only(
                 .map_err(|e| format!("wo_per_group_batched_q8_0_multirow l{layer_idx}: {e:?}"))?;
             }
         }
-        DType::Raw => {
+        DType::Raw | DType::MQ4G256 => {
             // MQ4G256 (HFQ4-packed weights, FWHT-rotated input).
             gpu.wo_per_group_batched_hfq4g256(
                 wo_a,
@@ -10548,7 +10567,7 @@ fn attention_block_batched_mixed(
                 .map_err(|e| format!("wo_per_group_batched_q8_0_multirow l{layer_idx}: {e:?}"))?;
             }
         }
-        DType::Raw => {
+        DType::Raw | DType::MQ4G256 => {
             gpu.wo_per_group_batched_hfq4g256(
                 wo_a,
                 &pbs.attn_out_raw_rot_batch,
@@ -13530,7 +13549,7 @@ fn dspark_wo_project(
                 block as i32,
             )
             .map_err(|e| format!("dspark wo_a q8[{stage}]: {e:?}"))?,
-        DType::Raw => gpu
+        DType::Raw | DType::MQ4G256 => gpu
             .wo_per_group_batched_hfq4g256(
                 wo_a,
                 &pbs.attn_out_raw_rot_batch,

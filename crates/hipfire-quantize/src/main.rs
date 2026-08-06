@@ -5141,6 +5141,127 @@ fn is_deepseek4_keep_f16(name: &str) -> bool {
         || name.ends_with(".indexer.weights_proj.weight")
 }
 
+/// Frozen MQ2RXT P3 replacement map.
+///
+/// This selects only tensors that are MFP4G32E8SOA in the released 0731
+/// MQ2R artifact (554 trunk tensors, 24 DSpark tensors). The overlay builder
+/// reads the original 0731 checkpoint and encodes these directly as MQ4G256;
+/// it never dequantizes the E8 artifact. Routed experts and protected Q8/F16
+/// tensors are deliberately absent from the overlay and remain byte-identical
+/// to the 0731 MQ2R bases when baked.
+fn is_deepseek4_mq2rxt_dense(name: &str) -> bool {
+    if name == "head.weight" {
+        return true;
+    }
+    let trunk = name.starts_with("layers.");
+    let dspark = name.starts_with("mtp.");
+    if !trunk && !dspark {
+        return false;
+    }
+    if [
+        ".attn.wq_a.weight",
+        ".attn.wq_b.weight",
+        ".attn.wkv.weight",
+        ".attn.wo_a.weight",
+        ".attn.wo_b.weight",
+        ".ffn.shared_experts.w1.weight",
+        ".ffn.shared_experts.w2.weight",
+        ".ffn.shared_experts.w3.weight",
+    ]
+    .iter()
+    .any(|suffix| name.ends_with(suffix))
+    {
+        return true;
+    }
+    trunk
+        && [
+            ".attn.compressor.wkv.weight",
+            ".attn.compressor.wgate.weight",
+            ".attn.indexer.wq_b.weight",
+            ".attn.indexer.weights_proj.weight",
+            ".attn.indexer.compressor.wkv.weight",
+            ".attn.indexer.compressor.wgate.weight",
+            ".ffn.gate.weight",
+        ]
+        .iter()
+        .any(|suffix| name.ends_with(suffix))
+}
+
+fn stamp_deepseek4_mq2rxt_metadata(metadata_json: &str, sidecar: bool) -> Result<String, String> {
+    let mut metadata: serde_json::Value = serde_json::from_str(metadata_json)
+        .map_err(|error| format!("MQ2RXT metadata is not valid JSON: {error}"))?;
+    let object = metadata
+        .as_object_mut()
+        .ok_or_else(|| "MQ2RXT metadata must be a top-level object".to_owned())?;
+    if object.contains_key("hipfire_quant_recipe") || object.contains_key("mq2rxt_sidecar") {
+        return Err("MQ2RXT source metadata already carries a product recipe identity".to_owned());
+    }
+    object.insert(
+        "hipfire_quant_recipe".to_owned(),
+        serde_json::json!("deepseek4-mq2rxt-mq4-p3-v1"),
+    );
+    if sidecar {
+        object.insert(
+            "mq2rxt_sidecar".to_owned(),
+            serde_json::json!({
+                "target_recipe": "deepseek4-mq2rxt-mq4-p3-v1",
+                "draft_head": "trunk_mq4g256_b4",
+                "dense_tier": "MQ4G256",
+                "built_by": "deepseek4-mq2rxt-v1",
+            }),
+        );
+    }
+    serde_json::to_string(&metadata).map_err(|error| format!("serialize MQ2RXT metadata: {error}"))
+}
+
+#[cfg(test)]
+mod mq2rxt_recipe_tests {
+    use super::{is_deepseek4_mq2rxt_dense, stamp_deepseek4_mq2rxt_metadata};
+
+    #[test]
+    fn selector_is_exactly_dense_p3_classes() {
+        for name in [
+            "head.weight",
+            "layers.0.attn.wq_a.weight",
+            "layers.42.attn.wo_b.weight",
+            "layers.17.ffn.shared_experts.w3.weight",
+            "layers.3.attn.compressor.wgate.weight",
+            "layers.22.attn.indexer.weights_proj.weight",
+            "layers.22.attn.indexer.compressor.wkv.weight",
+            "layers.8.ffn.gate.weight",
+            "mtp.0.attn.wkv.weight",
+            "mtp.2.ffn.shared_experts.w2.weight",
+        ] {
+            assert!(is_deepseek4_mq2rxt_dense(name), "expected {name}");
+        }
+        for name in [
+            "embed.weight",
+            "layers.0.ffn.experts.0.w1.weight",
+            "layers.0.attn.q_a_layernorm.weight",
+            "mtp.0.ffn.gate.weight",
+            "mtp.0.main_proj.weight",
+            "mtp.2.confidence_head.proj.weight",
+            "mtp.2.markov_head.markov_w1.weight",
+        ] {
+            assert!(!is_deepseek4_mq2rxt_dense(name), "rejected {name}");
+        }
+    }
+
+    #[test]
+    fn metadata_identity_is_distinct_and_sidecar_is_explicit() {
+        let trunk =
+            stamp_deepseek4_mq2rxt_metadata(r#"{"architecture":"deepseek4"}"#, false).unwrap();
+        assert!(trunk.contains("deepseek4-mq2rxt-mq4-p3-v1"));
+        assert!(!trunk.contains("mq2rxt_sidecar"));
+
+        let sidecar =
+            stamp_deepseek4_mq2rxt_metadata(r#"{"architecture":"deepseek4"}"#, true).unwrap();
+        assert!(sidecar.contains("mq2rxt_sidecar"));
+        assert!(sidecar.contains("trunk_mq4g256_b4"));
+        assert!(stamp_deepseek4_mq2rxt_metadata(&sidecar, true).is_err());
+    }
+}
+
 /// For mixed quant: should this tensor be Q8 (fast) or Q4 (compressed)?
 /// Q8: attention weights, embeddings, lm_head (need occupancy)
 /// Q4: FFN weights (bulk of model, benefits from compression)
@@ -6748,9 +6869,7 @@ fn build_deepseek4_dspark_e8soa_sidecar(input: &Path, output: &Path) -> Result<(
         if !convertible {
             if is_dense_target(name) {
                 n_skip += 1;
-                eprintln!(
-                    "  passthrough (not convertible): {name} qt={qt} shape={shape:?}"
-                );
+                eprintln!("  passthrough (not convertible): {name} qt={qt} shape={shape:?}");
             }
             tensors.push(HfqTensor {
                 name: name.clone(),
@@ -7279,6 +7398,7 @@ fn main() {
         || format == "deepseek4-mtp-precise"
         || format == "deepseek4-mq4lloyd"
         || format == "deepseek4-mq3lloyd";
+    let use_deepseek4_mq2rxt_overlay = format == "deepseek4-mq2rxt-overlay";
     // deepseek4-mq4lloyd / deepseek4-mq3lloyd: identical recipe to deepseek4-q8
     // (non-expert 2D → Q8F16, norms/HC → F16) EXCEPT routed experts ship as
     // MQ4G256Lloyd (qt=30, 160 B/group) resp. MQ3G256Lloyd (qt=20, 112 B/group)
@@ -8521,6 +8641,7 @@ fn main() {
         );
     }
     let mut skipped_params = 0u64;
+    let mut mq2rxt_overlay_count = 0usize;
     // MiniMax AWQ: shared-per-layer expert scales, cached + sidecars emitted once.
     let mut mm_awq_cache: std::collections::HashMap<usize, Option<(Vec<f32>, Vec<f32>)>> =
         std::collections::HashMap::new();
@@ -8557,7 +8678,10 @@ fn main() {
         // because no forward path consumed them. deepseek4-q8-mtp is the first format
         // that ingests the MTP layer; v3 spec-decode requires it. For other
         // formats we still skip to avoid bloating the HFQ with unused tensors.
-        if name.starts_with("mtp.") && !use_deepseek4_source_precision {
+        if name.starts_with("mtp.")
+            && !use_deepseek4_source_precision
+            && !use_deepseek4_mq2rxt_overlay
+        {
             let (meta, _) = st_files[*file_idx].tensor_data(name).unwrap();
             let n: usize = meta.shape.iter().product();
             skipped_params += n as u64;
@@ -8567,6 +8691,56 @@ fn main() {
         let (meta, raw_data) = st_files[*file_idx].tensor_data(name).unwrap();
         let mut n_elements: usize = meta.shape.iter().product();
         total_params += n_elements as u64;
+
+        if use_deepseek4_mq2rxt_overlay {
+            let sidecar = include_prefix.is_some_and(|prefix| prefix == "mtp.");
+            let in_requested_artifact = if sidecar {
+                name.starts_with("mtp.")
+            } else {
+                !name.starts_with("mtp.")
+            };
+            if !in_requested_artifact || !is_deepseek4_mq2rxt_dense(name) {
+                skipped_params += n_elements as u64;
+                st_files[*file_idx].drop_tensor_pages(name);
+                continue;
+            }
+            if meta.shape.len() != 2 || meta.shape[1] % 256 != 0 {
+                eprintln!(
+                    "MQ2RXT overlay: '{name}' must be rank-2 with K divisible by 256, got {:?}",
+                    meta.shape
+                );
+                std::process::exit(2);
+            }
+            let f32_data = tensor_to_f32_with_optional_fp8_scale(
+                name,
+                raw_data,
+                meta,
+                &fp8_scale_for,
+                &st_files,
+            );
+            let signs1 = gen_fwht_signs(42, 256);
+            let signs2 = gen_fwht_signs(1042, 256);
+            let data = quantize_mq4g256(&f32_data, &signs1, &signs2);
+            hfq_tensors.push(HfqTensor {
+                name: name.to_string(),
+                quant_type: QuantType::MQ4G256,
+                shape: meta
+                    .shape
+                    .iter()
+                    .map(|&dimension| dimension as u32)
+                    .collect(),
+                group_size: 256,
+                data,
+                spilled_len: 0,
+            });
+            mq2rxt_overlay_count += 1;
+            quantized_params += n_elements as u64;
+            st_files[*file_idx].drop_tensor_pages(name);
+            if let Some(ref mut spill) = spill {
+                maybe_spill(&mut hfq_tensors, spill, 2 * 1024 * 1024 * 1024);
+            }
+            continue;
+        }
 
         // ── SP4b: bake prune hook ──────────────────────────────────────────────
         // BEFORE the override hook. When `--reap-bake`'s plan carries a keep-map,
@@ -11683,6 +11857,31 @@ fn main() {
     }
 
     // Summary
+    if use_deepseek4_mq2rxt_overlay {
+        if arch_id != 9 {
+            eprintln!("MQ2RXT overlay requires DeepSeek V4 arch_id=9, got {arch_id}");
+            std::process::exit(2);
+        }
+        let sidecar = include_prefix.is_some_and(|prefix| prefix == "mtp.");
+        let expected = if sidecar { 24 } else { 554 };
+        if mq2rxt_overlay_count != expected {
+            eprintln!(
+                "MQ2RXT {} overlay selected {} tensors, expected {expected}; refusing partial recipe",
+                if sidecar { "DSpark" } else { "trunk" },
+                mq2rxt_overlay_count
+            );
+            std::process::exit(2);
+        }
+        eprintln!(
+            "MQ2RXT {} overlay: exact {expected}-tensor P3 map encoded directly from the parent",
+            if sidecar { "DSpark" } else { "trunk" }
+        );
+        metadata_json =
+            stamp_deepseek4_mq2rxt_metadata(&metadata_json, sidecar).unwrap_or_else(|error| {
+                eprintln!("MQ2RXT metadata: {error}");
+                std::process::exit(2);
+            });
+    }
     let total_bytes: usize = hfq_tensors
         .iter()
         .map(|t| {

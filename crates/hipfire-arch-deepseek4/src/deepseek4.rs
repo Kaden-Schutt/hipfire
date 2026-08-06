@@ -216,12 +216,22 @@ pub struct DeepseekV4Config {
     #[serde(skip)]
     pub load_dspark: bool,
 
-    /// Exact DeepSeek V4 MQ2R SKU selector. This is derived from the `.mq2r`
-    /// artifact suffix (or frozen recipe metadata) and is never inferred from
-    /// the presence of an E8 tensor alone, so MQ2-Lloyd keeps its established
-    /// runtime defaults. Not serialized as part of the upstream config.
+    /// DeepSeek V4 routed-MQ2 product-family selector. This is derived from an
+    /// exact `.mq2r`/`.mq2rxt` artifact identity and is never inferred from a
+    /// tensor dtype, so MQ2-Lloyd keeps its established runtime defaults. The
+    /// family shares routed-expert, route-scale, HC, and indexer policy; dense
+    /// dtype validation remains SKU-specific. Not serialized upstream.
     #[serde(skip)]
     pub mq2r: bool,
+
+    /// Exact DeepSeek V4 MQ2RXT SKU selector. MQ2RXT preserves MQ2R's routed
+    /// MQ2-Lloyd tier and replaces only the frozen P3 dense tensor map with
+    /// MQ4G256. It deliberately remains a distinct artifact identity so the
+    /// established MQ2R validator, DSpark sidecar, and retained tape cannot be
+    /// reused accidentally. `mq2r` is also true for this SKU because the
+    /// shared route-scale and MQ2 expert policy still apply.
+    #[serde(skip)]
+    pub mq2rxt: bool,
 }
 
 /// Raw upstream JSON shape — only the fields we read. Used to drive
@@ -296,11 +306,21 @@ impl DeepseekV4Config {
             .ok_or_else(|| "deepseek4: metadata_json missing `config` wrapper".to_string())?;
         let raw: RawDeepseekV4Config = serde_json::from_value(inner.clone())
             .map_err(|e| format!("deepseek4: parsing inner config failed: {e}"))?;
-        let mq2r = hfq
+        let mq2rxt = hfq
             .path()
             .extension()
             .and_then(|extension| extension.to_str())
-            .is_some_and(|extension| extension.eq_ignore_ascii_case("mq2r"))
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("mq2rxt"))
+            || wrapper
+                .get("hipfire_quant_recipe")
+                .and_then(|value| value.as_str())
+                .is_some_and(|recipe| recipe == "deepseek4-mq2rxt-mq4-p3-v1");
+        let mq2r = mq2rxt
+            || hfq
+                .path()
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("mq2r"))
             || wrapper
                 .get("hipfire_quant_recipe")
                 .and_then(|value| value.as_str())
@@ -348,6 +368,7 @@ impl DeepseekV4Config {
             reap_keep: None,
             load_dspark: true,
             mq2r,
+            mq2rxt,
         };
         // Optional REAP plan: emulate a pruned expert pool (e.g. 162B
         // 256→144) by partial-loading this full quant. Read BEFORE the
@@ -527,6 +548,7 @@ pub fn config_from_safetensors(source: &dyn ModelSource) -> Option<DeepseekV4Con
         reap_keep: None,
         load_dspark: true,
         mq2r: false,
+        mq2rxt: false,
     })
 }
 

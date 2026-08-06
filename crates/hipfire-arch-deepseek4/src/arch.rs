@@ -867,26 +867,29 @@ impl Architecture for DeepseekV4 {
 }
 
 impl DeepseekV4 {
-    fn validate_mq2r_tensor_policy(hfq: &HfqFile, cfg: &DeepseekV4Config) -> Result<(), String> {
+    fn validate_mq2_family_tensor_policy(
+        hfq: &HfqFile,
+        cfg: &DeepseekV4Config,
+        dense_qt: u8,
+        sku: &str,
+    ) -> Result<(), String> {
         const QT_Q8F16: u8 = 3;
         const QT_MQ2_LLOYD: u8 = 19;
-        const QT_MFP4_E8_SOA: u8 = 35;
-        const EXPECTED_E8_TENSORS: usize = 554;
+        const EXPECTED_DENSE_TENSORS: usize = 554;
 
         if hfq.has_overlay() {
-            return Err(
-                "deepseek4 MQ2R: standalone product artifact refuses runtime REAP overlays"
-                    .to_owned(),
-            );
+            return Err(format!(
+                "deepseek4 {sku}: standalone product artifact refuses runtime REAP overlays"
+            ));
         }
 
         let require_qt = |name: &str, expected: u8| -> Result<(), String> {
             let info = hfq
                 .find_tensor_info(name)
-                .ok_or_else(|| format!("deepseek4 MQ2R: missing tensor '{name}'"))?;
+                .ok_or_else(|| format!("deepseek4 {sku}: missing tensor '{name}'"))?;
             if info.quant_type != expected {
                 return Err(format!(
-                    "deepseek4 MQ2R: '{name}' has qt={}, expected qt={expected}",
+                    "deepseek4 {sku}: '{name}' has qt={}, expected qt={expected}",
                     info.quant_type
                 ));
             }
@@ -894,8 +897,8 @@ impl DeepseekV4 {
         };
 
         require_qt("embed.weight", QT_Q8F16)?;
-        require_qt("head.weight", QT_MFP4_E8_SOA)?;
-        let mut expected_e8 = 1usize; // head
+        require_qt("head.weight", dense_qt)?;
+        let mut expected_dense = 1usize; // head
 
         for layer in 0..cfg.num_hidden_layers {
             for suffix in [
@@ -908,15 +911,15 @@ impl DeepseekV4 {
                 "ffn.shared_experts.w2.weight",
                 "ffn.shared_experts.w3.weight",
             ] {
-                require_qt(&format!("layers.{layer}.{suffix}"), QT_MFP4_E8_SOA)?;
-                expected_e8 += 1;
+                require_qt(&format!("layers.{layer}.{suffix}"), dense_qt)?;
+                expected_dense += 1;
             }
 
             let ratio = cfg.compress_ratios.get(layer).copied().unwrap_or(0);
             if ratio > 0 {
                 for suffix in ["attn.compressor.wkv.weight", "attn.compressor.wgate.weight"] {
-                    require_qt(&format!("layers.{layer}.{suffix}"), QT_MFP4_E8_SOA)?;
-                    expected_e8 += 1;
+                    require_qt(&format!("layers.{layer}.{suffix}"), dense_qt)?;
+                    expected_dense += 1;
                 }
             }
             if ratio == 4 {
@@ -926,13 +929,13 @@ impl DeepseekV4 {
                     "attn.indexer.compressor.wkv.weight",
                     "attn.indexer.compressor.wgate.weight",
                 ] {
-                    require_qt(&format!("layers.{layer}.{suffix}"), QT_MFP4_E8_SOA)?;
-                    expected_e8 += 1;
+                    require_qt(&format!("layers.{layer}.{suffix}"), dense_qt)?;
+                    expected_dense += 1;
                 }
             }
 
-            require_qt(&format!("layers.{layer}.ffn.gate.weight"), QT_MFP4_E8_SOA)?;
-            expected_e8 += 1;
+            require_qt(&format!("layers.{layer}.ffn.gate.weight"), dense_qt)?;
+            expected_dense += 1;
 
             for expert in 0..cfg.n_routed_experts {
                 for projection in ["w1", "w2", "w3"] {
@@ -944,19 +947,47 @@ impl DeepseekV4 {
             }
         }
 
-        if expected_e8 != EXPECTED_E8_TENSORS {
+        if expected_dense != EXPECTED_DENSE_TENSORS {
             return Err(format!(
-                "deepseek4 MQ2R: recipe resolved {expected_e8} E8 tensors, expected {EXPECTED_E8_TENSORS}"
+                "deepseek4 {sku}: recipe resolved {expected_dense} dense tensors, expected {EXPECTED_DENSE_TENSORS}"
             ));
         }
-        let actual_e8 = hfq
+        let actual_dense = hfq
             .tensors()
             .iter()
-            .filter(|tensor| tensor.quant_type == QT_MFP4_E8_SOA)
+            .filter(|tensor| tensor.quant_type == dense_qt)
             .count();
-        if actual_e8 != EXPECTED_E8_TENSORS {
+        if actual_dense != EXPECTED_DENSE_TENSORS {
             return Err(format!(
-                "deepseek4 MQ2R: artifact carries {actual_e8} E8 tensors, expected {EXPECTED_E8_TENSORS}"
+                "deepseek4 {sku}: artifact carries {actual_dense} dense-tier tensors, expected {EXPECTED_DENSE_TENSORS}"
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_mq2r_tensor_policy(hfq: &HfqFile, cfg: &DeepseekV4Config) -> Result<(), String> {
+        Self::validate_mq2_family_tensor_policy(hfq, cfg, 35, "MQ2R")
+    }
+
+    fn validate_mq2rxt_tensor_policy(hfq: &HfqFile, cfg: &DeepseekV4Config) -> Result<(), String> {
+        let metadata: serde_json::Value = serde_json::from_str(&hfq.metadata_json)
+            .map_err(|error| format!("deepseek4 MQ2RXT: invalid metadata JSON: {error}"))?;
+        if metadata
+            .get("hipfire_quant_recipe")
+            .and_then(serde_json::Value::as_str)
+            != Some("deepseek4-mq2rxt-mq4-p3-v1")
+        {
+            return Err("deepseek4 MQ2RXT: missing exact product recipe identity".to_owned());
+        }
+        Self::validate_mq2_family_tensor_policy(hfq, cfg, 13, "MQ2RXT")?;
+        let stale_e8 = hfq
+            .tensors()
+            .iter()
+            .filter(|tensor| tensor.quant_type == 35)
+            .count();
+        if stale_e8 != 0 {
+            return Err(format!(
+                "deepseek4 MQ2RXT: artifact carries {stale_e8} stale E8 tensors; expected 0"
             ));
         }
         Ok(())
@@ -995,6 +1026,130 @@ impl DeepseekV4 {
         Ok(())
     }
 
+    fn validate_mq2rxt_dspark_sidecar(sidecar: &HfqFile) -> Result<(), String> {
+        const QT_Q8F16: u8 = 3;
+        const QT_MQ4: u8 = 13;
+        const QT_MQ2_LLOYD: u8 = 19;
+        const EXPECTED_MQ4: usize = 24;
+        const EXPECTED_MQ2: usize = 2_304;
+        const EXPECTED_Q8: usize = 7;
+        const EXPECTED_F16: usize = 41;
+        const EXPECTED_TOTAL: usize = 2_376;
+
+        let metadata: serde_json::Value = serde_json::from_str(&sidecar.metadata_json)
+            .map_err(|error| format!("deepseek4 MQ2RXT DSpark: invalid metadata JSON: {error}"))?;
+        let identity = metadata
+            .get("mq2rxt_sidecar")
+            .ok_or("deepseek4 MQ2RXT DSpark: missing mq2rxt_sidecar metadata identity")?;
+        if metadata
+            .get("hipfire_quant_recipe")
+            .and_then(serde_json::Value::as_str)
+            != Some("deepseek4-mq2rxt-mq4-p3-v1")
+        {
+            return Err(
+                "deepseek4 MQ2RXT DSpark: missing exact product recipe identity".to_owned(),
+            );
+        }
+        if identity
+            .get("target_recipe")
+            .and_then(serde_json::Value::as_str)
+            != Some("deepseek4-mq2rxt-mq4-p3-v1")
+        {
+            return Err("deepseek4 MQ2RXT DSpark: wrong target_recipe identity".to_owned());
+        }
+        if identity
+            .get("draft_head")
+            .and_then(serde_json::Value::as_str)
+            != Some("trunk_mq4g256_b4")
+        {
+            return Err("deepseek4 MQ2RXT DSpark: wrong draft_head identity".to_owned());
+        }
+        if sidecar.find_tensor_info("draft_head.weight").is_some() {
+            return Err("deepseek4 MQ2RXT DSpark: sidecar must reuse the trunk head".to_owned());
+        }
+
+        let require_qt = |name: &str, expected: u8| -> Result<(), String> {
+            let info = sidecar
+                .find_tensor_info(name)
+                .ok_or_else(|| format!("deepseek4 MQ2RXT DSpark: missing tensor '{name}'"))?;
+            if info.quant_type != expected {
+                return Err(format!(
+                    "deepseek4 MQ2RXT DSpark: '{name}' has qt={}, expected qt={expected}",
+                    info.quant_type
+                ));
+            }
+            Ok(())
+        };
+
+        for stage in 0..3 {
+            for suffix in [
+                "attn.wq_a.weight",
+                "attn.wq_b.weight",
+                "attn.wkv.weight",
+                "attn.wo_a.weight",
+                "attn.wo_b.weight",
+                "ffn.shared_experts.w1.weight",
+                "ffn.shared_experts.w2.weight",
+                "ffn.shared_experts.w3.weight",
+            ] {
+                require_qt(&format!("mtp.{stage}.{suffix}"), QT_MQ4)?;
+            }
+            for expert in 0..256 {
+                for projection in ["w1", "w2", "w3"] {
+                    require_qt(
+                        &format!("mtp.{stage}.ffn.experts.{expert}.{projection}.weight"),
+                        QT_MQ2_LLOYD,
+                    )?;
+                }
+            }
+            require_qt(&format!("mtp.{stage}.ffn.gate.weight"), QT_Q8F16)?;
+        }
+        for name in [
+            "mtp.0.main_proj.weight",
+            "mtp.2.confidence_head.proj.weight",
+            "mtp.2.markov_head.markov_w1.weight",
+            "mtp.2.markov_head.markov_w2.weight",
+        ] {
+            require_qt(name, QT_Q8F16)?;
+        }
+
+        let count = |qt: u8| {
+            sidecar
+                .tensors()
+                .iter()
+                .filter(|tensor| tensor.quant_type == qt)
+                .count()
+        };
+        for (qt, expected, label) in [
+            (QT_MQ4, EXPECTED_MQ4, "MQ4"),
+            (QT_MQ2_LLOYD, EXPECTED_MQ2, "MQ2-Lloyd"),
+            (QT_Q8F16, EXPECTED_Q8, "Q8"),
+        ] {
+            let actual = count(qt);
+            if actual != expected {
+                return Err(format!(
+                    "deepseek4 MQ2RXT DSpark: {actual} {label} tensors, expected {expected}"
+                ));
+            }
+        }
+        if count(35) != 0 {
+            return Err("deepseek4 MQ2RXT DSpark: stale E8 payload present".to_owned());
+        }
+        if count(1) != EXPECTED_F16 {
+            return Err(format!(
+                "deepseek4 MQ2RXT DSpark: {} F16 tensors, expected {EXPECTED_F16}",
+                count(1)
+            ));
+        }
+        if sidecar.tensors().len() != EXPECTED_TOTAL {
+            return Err(format!(
+                "deepseek4 MQ2RXT DSpark: {} total tensors, expected {EXPECTED_TOTAL}",
+                sidecar.tensors().len()
+            ));
+        }
+        Ok(())
+    }
+
     /// EP shard-aware load entry (mirrors `MiniMaxWeights::load`).
     ///
     /// Loads the full model but uploads only `rank`'s owned routed experts
@@ -1022,7 +1177,9 @@ impl DeepseekV4 {
         // Native eligibility is installed on the returned DS4 weights after
         // verification; it is never written into the process-wide GPU.
         // This is not automatic Redline admission.
-        if cfg.mq2r {
+        if cfg.mq2rxt {
+            Self::validate_mq2rxt_tensor_policy(hfq, cfg)?;
+        } else if cfg.mq2r {
             Self::validate_mq2r_tensor_policy(hfq, cfg)?;
         }
 
@@ -1110,17 +1267,23 @@ impl DeepseekV4 {
         let mut weights = Self::load_weights_host_only_walk(hfq, cfg)?;
         if cfg.mq2r {
             weights.mq2r_backend = Mq2rBackend::for_verified_mq2r(gpu);
+            let sku = if cfg.mq2rxt { "MQ2RXT" } else { "MQ2R" };
+            let dense = if cfg.mq2rxt {
+                "554 MQ4 tensors"
+            } else {
+                "554 E8 tensors"
+            };
             match weights.mq2r_backend {
                 Mq2rBackend::Gfx1151 => eprintln!(
-                    "deepseek4: MQ2R P3 tensor recipe verified; selected \
-                     gfx1151 route v2 (554 E8 tensors; routed experts qt=19)"
+                    "deepseek4: {sku} P3 tensor recipe verified; selected \
+                     gfx1151 backend ({dense}; routed experts qt=19)"
                 ),
                 Mq2rBackend::Gfx942(_) => eprintln!(
-                    "deepseek4: MQ2R P3 tensor recipe verified; selected exact \
-                     gfx942 backend (554 E8 tensors; routed experts qt=19)"
+                    "deepseek4: {sku} P3 tensor recipe verified; selected exact \
+                     gfx942 backend ({dense}; routed experts qt=19)"
                 ),
                 Mq2rBackend::Portable => eprintln!(
-                    "deepseek4: MQ2R P3 tensor recipe verified; no native backend \
+                    "deepseek4: {sku} P3 tensor recipe verified; no native backend \
                      for {}, using portable dispatch",
                     gpu.arch
                 ),
@@ -1807,7 +1970,13 @@ impl DeepseekV4 {
                 let mut dspark_hfq = HfqFile::open(&p).map_err(|e| {
                     format!("deepseek4: failed to open DSpark sidecar {p:?}: {e:?}")
                 })?;
-                if cfg.mq2r {
+                if cfg.mq2rxt {
+                    Self::validate_mq2rxt_dspark_sidecar(&dspark_hfq)?;
+                    eprintln!(
+                        "deepseek4: MQ2RXT DSpark sidecar identity verified \
+                         (24 MQ4 dense tensors; routed experts qt=19)"
+                    );
+                } else if cfg.mq2r {
                     Self::validate_mq2r_dspark_sidecar(&dspark_hfq)?;
                     eprintln!(
                         "deepseek4: MQ2R DSpark v1 sidecar identity verified \
