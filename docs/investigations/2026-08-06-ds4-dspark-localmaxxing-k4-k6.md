@@ -35,10 +35,10 @@ to the shipping default.
 
 | Routed experts/token | Samples (tok/s) | Median | Range / median | Tau | Acceptance | Windows |
 |---:|---|---:|---:|---:|---:|---:|
-| 6 (shipping) | 37.2664 / 37.3238 / 37.3181 | **37.3181** | 0.154% | 2.02381 | 67% | 42 |
+| 6 (shipping) | 37.3010 / 37.3214 / 37.3165 | **37.3165** | 0.055% | 2.02381 | 67% | 42 |
 | 4 (matched config) | 39.1688 / 39.1808 / 39.1907 | **39.1808** | 0.056% | 1.64583 | 55% | 48 |
 
-The k4 median is +1.8627 tok/s, or +4.99%, over the reproduced shipping k6
+The k4 median is +1.8643 tok/s, or +4.996%, over the reproduced shipping k6
 median. The throughput gain survives a lower proposal-acceptance rate because
 the target moves two fewer routed experts per token.
 
@@ -70,7 +70,7 @@ The k4 logs prove the selected route for every process:
 - `deepseek4 DSpark speculator enabled (sidecar, block=5)`
 - request-level `drafter=dspark`
 
-The exact k4 binaries were:
+Both accepted arms used these exact binaries:
 
 - CLI SHA-256:
   `abc1489026b449ed052954f32b9bed09a2ef896df27acf4b64784c86ded683ab`
@@ -90,6 +90,10 @@ Validation before the GPU runs:
 - The earlier `dspark_bench` k4 smoke and interrupted repetitions are not
   product-serving evidence because that benchmark reported a 24-token prompt
   and bypassed production serve/load behavior.
+- The first valid production k6 trio at the immediate parent commit remains a
+  historical recovery (37.3181 tok/s median), but the primary table uses the
+  subsequent `k6-matched-run1..3` trio on the exact k4 binary hashes. This
+  removes the otherwise inert optional-selector source delta from the A/B.
 - `k4-production-run1.*` is excluded because singular `--prompt-file` treated
   the JSON fixture itself as a 44-token prose prompt. It measured 32.2269 tok/s
   and is retained solely as an audit of the fixture error.
@@ -102,9 +106,9 @@ Validation before the GPU runs:
 
 Accepted result JSON SHA-256 values:
 
-- k6: `7b6bd43ff26e438d3ab13e517e9e99acaea7a3d23b4a9a894fda14b2d46d0743`,
-  `4bbf8bc23233b2eeae0935cb6bb65fc0075f30db845c62bf10aee6cd05e9557d`,
-  `1103eb4e7a78f2741dddbd1737b29e38d6ad9e5243b201222a87a3eb207d47cf`
+- k6: `fb5d9a4b474dbadb5d7496caf19c00bda51297f9f8dc4f4a13150fdc1d8bfc9e`,
+  `6a0a96a62fe32ce20d27f8e8e4b138d04582c092ba40dbf47d5bfac6290985a6`,
+  `d91af249916c841ce02a5821721bf1e6649b777a291af32433d661b41e1c3c36`
 - k4: `5f8f8d9460bfc00b03ceac97cab598bd176ea1ef88f63d9f03089136596b01f8`,
   `ab7f3a13305878051a1fc6ee057b28f47c5da7aac1a5e12e3217b849610c2325`,
   `28ec3391cabc1e0e1893e0ad498b8374e9ca0418fcf3fc87eee95557c6bc8682`
@@ -113,7 +117,7 @@ Skipped: no AR arm in this comparison; no quality promotion of k4; no weight,
 kernel, PM4, KV, sampling, or shipping-default change; no 2,048/512 or
 long-context run.
 
-Verdict: the production shipping k6 DSpark golden is recovered at 37.3181 tok/s
+Verdict: the production shipping k6 DSpark golden is recovered at 37.3165 tok/s
 median, while the same production fixture at user-selectable k4 reaches 39.1808
 tok/s median. Keep k6 as the quality/default row and report k4 separately as the
 matched-config performance row.
