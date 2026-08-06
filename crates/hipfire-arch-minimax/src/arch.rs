@@ -12,9 +12,11 @@
 use crate::minimax::{MiniMaxConfig, MiniMaxState, MiniMaxWeights};
 use hipfire_runtime::arch::Architecture;
 use hipfire_runtime::hfq::HfqFile;
+use hipfire_runtime::moe_plan::{MoEExecutionKind, MoEExecutionPolicy};
 use hipfire_runtime::tp_shard::ExpertAssign;
 use hipfire_runtime::weight_manifest::{
-    FusedQkvLayout, PinTarget, ShardPolicy, StateEntry, StateKind, WeightEntry,
+    ExpertExecutionIdentity, ExpertGroupSpec, ExpertParallelism, ExpertResourceRequirements,
+    ExpertSourceLayout, FusedQkvLayout, PinTarget, ShardPolicy, StateEntry, StateKind, WeightEntry,
 };
 use rdna_compute::DType;
 use rdna_compute::Gpu;
@@ -181,6 +183,59 @@ impl Architecture for MiniMaxM2 {
                     },
                     l,
                 )
+            })
+            .collect()
+    }
+
+    /// Policy-aware MoE expert-group manifest (Phase 3, Task 7) — one
+    /// layer-local group per MoE layer. Parallelism and assignment derive
+    /// EXCLUSIVELY from the caller-supplied policy and the arch's stride-
+    /// assignment loader convention — never from a locally reconstructed mesh:
+    ///   - `Single` → `ExpertParallelism::Single` (one rank owns the group)
+    ///   - `Tp`     → `ExpertParallelism::TensorParallel`
+    ///   - `Ep`     → `ExpertParallelism::ExpertParallel`
+    /// Router identity is `sigmoid_topk` (MiniMax scores are sigmoid-activated;
+    /// the bias-aware top-k selection runs inside the routed program's
+    /// `MoeRoute` step), and the execution identity `indexed_quantized` matches
+    /// the typed `ExpertExecutionPlan` the forward's `IndexedMoeGemv` program
+    /// lowers with. Sources reference the weight-manifest expert entries
+    /// (`experts_gate` / `experts_up` / `experts_down`) and the replicated
+    /// router (`router`).
+    fn expert_group_manifest(
+        cfg: &Self::Config,
+        policy: &MoEExecutionPolicy,
+    ) -> Vec<ExpertGroupSpec> {
+        let parallelism = match policy.kind() {
+            MoEExecutionKind::Single => ExpertParallelism::Single,
+            MoEExecutionKind::Tp => ExpertParallelism::TensorParallel,
+            MoEExecutionKind::Ep => ExpertParallelism::ExpertParallel,
+        };
+        (0..cfg.num_hidden_layers)
+            .map(|l| ExpertGroupSpec {
+                group: "moe".into(),
+                layer: Some(l),
+                n_experts: cfg.num_local_experts,
+                parallelism,
+                assignment: ExpertAssign::Stride,
+                source_layout: ExpertSourceLayout::PackedSeparate {
+                    gate: "experts_gate".into(),
+                    up: "experts_up".into(),
+                    down: "experts_down".into(),
+                    sidecars: Vec::new(),
+                },
+                resources: ExpertResourceRequirements {
+                    // Truthful declared F16 footprint of one expert: three
+                    // projections (gate w1, up w3, down w2), each
+                    // hidden x intermediate elements x 2 bytes F16. (The
+                    // lowerer never reads this field — it is manifest
+                    // metadata; plain arithmetic matches the loader's
+                    // usize shapes.)
+                    bytes_per_expert: 3 * cfg.hidden_size * cfg.intermediate_size * 2,
+                    alignment: 256,
+                },
+                router: "router".into(),
+                router_identity: "sigmoid_topk".into(),
+                allowed_executions: vec![ExpertExecutionIdentity::IndexedQuantized],
             })
             .collect()
     }

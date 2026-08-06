@@ -67,6 +67,13 @@ pub mod store;
 #[cfg(feature = "test-utils")]
 pub mod test_utils;
 
+/// Emulated EP2 harness (STEP-002 Task 8, Phase 2B): high-level
+/// Single-vs-EP2 parity driver over the one-owner Frozen path.  Test-only,
+/// non-default feature; exposes only `Ep2HarnessOptions`, `Ep2HarnessReport`,
+/// and `run` — no store/tensor/raw-ownership types.
+#[cfg(feature = "emulated-ep2-harness")]
+pub mod ep2_harness;
+
 /// Grammar-guided decoding for qwen35 tool-call format. Independent of
 /// the deltanet feature gate — pure data-structure work, no GPU
 /// dependencies. See module docs for design and the Pi turn-12

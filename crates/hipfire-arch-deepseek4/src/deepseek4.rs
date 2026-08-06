@@ -10,6 +10,7 @@
 
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::model_source::ModelSource;
+use hipfire_runtime::moe_plan::MoEExecutionPolicy;
 use serde::{Deserialize, Serialize};
 
 /// Per-layer compression mode for the indexer / KV path.
@@ -768,9 +769,8 @@ impl DeepseekV4LayerWeights {
 /// Hyper-Connections gates, routed-expert blobs, and the optional MTP
 /// addon layer (`mtp.0.*`).
 ///
-/// `mtp_layer` is `Some` after Phase 5 lands (when the
-/// `mtp.` prefix-skip in `hipfire-quantize` is lifted and MTP
-/// tensors are quantized alongside main layers).
+/// `mtp_layer` is `Some` once the MTP addon (or an in-band `mtp.0.*`
+/// quant) is loaded — env-gated, see arch.rs MTP addon discovery.
 pub struct DeepseekV4Weights {
     /// Token embedding table. Stored as raw Q8F16 bytes on GPU
     /// (matches the `embed.weight` quant_type from Phase 1 ingest).
@@ -791,12 +791,35 @@ pub struct DeepseekV4Weights {
     pub layers: Vec<DeepseekV4LayerWeights>,
     /// MTP head — structurally identical to a main layer, plus an
     /// `input_proj` conditioning on the base model's hidden state.
-    /// `None` at scaffold stage; populated when Phase 5 ships.
+    /// `None` at scaffold stage; loaded from the MTP addon / in-band
+    /// `mtp.0.*` tensors (env-gated, see arch.rs MTP addon discovery).
     pub mtp_layer: Option<DeepseekV4LayerWeights>,
     /// Optional DSpark 3-stage draft module, loaded from the
     /// `<stem>-dspark.<ext>` sidecar. Additive to `mtp_layer` — both can be
     /// present. `None` when no DSpark sidecar exists (silent no-op).
     pub dspark: Option<DsparkWeights>,
+    /// Canonical single-rank execution policy of this model: ONE stable
+    /// object for the model's lifetime. `DeviceMesh::single()` issues a fresh
+    /// mesh epoch per call, so a per-call `MoEExecutionPolicy::single()`
+    /// would be a DIFFERENT exact policy every call and the exact-key plan
+    /// cache would reject every call after the first. The single forward
+    /// path passes this object on every call — never a per-call
+    /// reconstruction (mirrors MiniMax's stable single policy). Parallel
+    /// policies are constructed once by the mesh owner and threaded the same
+    /// way. Initialized in every constructor; CPU-only.
+    pub(crate) moe_policy: MoEExecutionPolicy,
+    /// Lane-A model-owned MoE manifest/cache: resolves the static expert
+    /// manifest AT MOST ONCE (`OnceLock::get_or_init`) under the exact
+    /// execution policy + manifest config identity + complete per-rank
+    /// resident router-profile matrix (main layers then the optional MTP
+    /// slot), and caches success OR failure. The same key borrows the entry
+    /// forever; a different key is refused with an explicit mismatch (no
+    /// retry/replacement/global cache). Only the canonical aggregate
+    /// accessor (`crate::moe_lower::ds4_cached_moe_plans`) touches this cell:
+    /// it always serves from the rank-0 weights instance on a parallel mesh;
+    /// `Single` is the sole owner on the single-GPU path. Nonzero-rank cells
+    /// stay empty forever. CPU-only (contains no GPU handles).
+    pub(crate) moe_plan_cache: std::sync::OnceLock<crate::moe_lower::Ds4PlanCacheEntry>,
     pub _scaffold: (),
 }
 

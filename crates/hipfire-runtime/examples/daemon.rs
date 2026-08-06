@@ -2193,6 +2193,7 @@ impl hipfire_runtime::arch_dispatch::ArchDispatch for Deepseek4EpDispatch<'_> {
             state,
             partials,
             partials_i64,
+            policy,
         } = inner
         else {
             return Err("prefill_forward: EP arch mismatch (expected ds4)".into());
@@ -2208,6 +2209,7 @@ impl hipfire_runtime::arch_dispatch::ArchDispatch for Deepseek4EpDispatch<'_> {
                 state,
                 partials,
                 partials_i64,
+                policy,
                 t,
                 (seq_pos + i) as u32,
             )
@@ -2234,6 +2236,7 @@ impl hipfire_runtime::arch_dispatch::ArchDispatch for Deepseek4EpDispatch<'_> {
             state,
             partials,
             partials_i64,
+            policy,
         } = inner
         else {
             return Err("decode_step_forward: EP arch mismatch (expected ds4)".into());
@@ -2245,6 +2248,7 @@ impl hipfire_runtime::arch_dispatch::ArchDispatch for Deepseek4EpDispatch<'_> {
             state,
             partials,
             partials_i64,
+            policy,
             token,
             seq_pos as u32,
         )
@@ -2620,6 +2624,7 @@ impl hipfire_runtime::arch_dispatch::ArchDispatch for MinimaxEpDispatch<'_> {
             state,
             partials,
             partials_i64,
+            policy,
         } = inner
         else {
             return Err("prefill_forward: EP arch mismatch (expected minimax)".into());
@@ -2632,6 +2637,10 @@ impl hipfire_runtime::arch_dispatch::ArchDispatch for MinimaxEpDispatch<'_> {
                 state,
                 partials,
                 partials_i64,
+                // The loader-owned exact EP policy (built once from the
+                // admitted mesh the Gpus are bound to) — never reconstructed
+                // per token.
+                policy,
                 t,
                 (seq_pos + i) as u32,
             )
@@ -2658,6 +2667,7 @@ impl hipfire_runtime::arch_dispatch::ArchDispatch for MinimaxEpDispatch<'_> {
             state,
             partials,
             partials_i64,
+            policy,
         } = inner
         else {
             return Err("decode_step_forward: EP arch mismatch (expected minimax)".into());
@@ -2669,6 +2679,8 @@ impl hipfire_runtime::arch_dispatch::ArchDispatch for MinimaxEpDispatch<'_> {
             state,
             partials,
             partials_i64,
+            // The loader-owned exact EP policy — same object every token.
+            policy,
             token,
             seq_pos as u32,
         )

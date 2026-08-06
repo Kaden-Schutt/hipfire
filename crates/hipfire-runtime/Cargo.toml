@@ -65,6 +65,12 @@ dflash-fault-inject = []
 # Not in default — only hipfire-loader activates it.  External consumers
 # should use `hipfire_loader::admit_path` + `load_admitted` instead.
 loader-internal = []
+# emulated-ep2-harness: forwards the test-only Qwen35 emulated-EP2 parity
+# harness feature (STEP-002 Task 8) from the arch crate so the
+# `ep_decode_parity` example can build. Never enabled by default; the
+# harness is one GPU-bearing invocation per process and never constructs
+# `EpArch::Qwen35` or adds daemon Qwen EP admission.
+emulated-ep2-harness = ["hipfire-arch-qwen35/emulated-ep2-harness"]
 [dependencies]
 hip-bridge = { path = "../hip-bridge" }
 rdna-compute = { path = "../rdna-compute" }
@@ -153,6 +159,10 @@ required-features = []
 [[example]]
 name = "coherence_probe"
 required-features = []
+
+[[example]]
+name = "ep_decode_parity"
+required-features = ["emulated-ep2-harness"]
 
 [[example]]
 name = "gpus_smoke"

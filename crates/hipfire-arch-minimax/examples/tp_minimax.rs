@@ -2,15 +2,21 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! MiniMax-M2 TP-of-experts parity harness — Task 3.
+//! MiniMax-M2 TP-of-experts parity harness — Phase 3, Task 7 (remediated).
 //!
-//! Runs the same prompt twice:
-//!   1. tp=1 (whole experts, single logical rank) — reference output.
+//! Runs the same prompt twice, BOTH through `forward_tp` with the I64-down
+//! path and explicit named mesh-bound Tp policies:
+//!   1. tp=1 (whole experts, single logical Tp rank) — `DeviceMesh::rect(&[
+//!      (DimKind::Tp, 1)])` + `Gpus::from_mesh` (rank-one binding, Lane H),
+//!      weights loaded with `TpExpertSlice { tp: 1, rank: 0 }`.
 //!   2. tp=2 (every rank holds all experts, column/row-split by inter/tp) —
-//!      via `MiniMaxWeights::load(.., tp_slice=Some(..))`  + `forward_tp`.
+//!      via `MiniMaxWeights::load(.., tp_slice=Some(..))` + `forward_tp`
+//!      with a caller-owned Tp `MoEExecutionPolicy` and a mesh-bound `Gpus`.
 //!
-//! Asserts argmax-exact across all generated tokens AND logit max|Δ| < 1e-2.
-//! Prints prompt md5, per-token argmax comparison, and load time.
+//! The int64 down accumulator + exact i64 Tp all-reduce are partition-
+//! invariant: tp=1 and tp=2 must produce **bitwise-identical** f32 logits.
+//! The gate asserts token-sequence equality AND every logit element equal by
+//! `to_bits()` — no tolerance, no argmax-only comparison, no F32 baseline.
 //!
 //! Run:
 //!   HIPFIRE_DETERMINISTIC=1 HIPFIRE_EMULATE_GPUS=2 \
@@ -51,7 +57,8 @@ fn main() {
     use hipfire_arch_minimax::forward;
     use hipfire_arch_minimax::minimax::{MiniMaxConfig, MiniMaxState, MiniMaxWeights};
     use hipfire_runtime::hfq::HfqFile;
-    use hipfire_runtime::multi_gpu::Gpus;
+    use hipfire_runtime::moe_plan::{MoEExecutionKind, MoEExecutionPolicy};
+    use hipfire_runtime::multi_gpu::{DeviceMesh, DimKind, Gpus};
     use hipfire_runtime::tokenizer::Tokenizer;
     use hipfire_runtime::tp_shard::TpExpertSlice;
     use rdna_compute::{DType, GpuTensor};
@@ -61,7 +68,6 @@ fn main() {
     let mut model: Option<PathBuf> = None;
     let mut prompt = "The capital of France is".to_string();
     let mut max: usize = 32;
-    let mut selfcheck_tp1 = false;
     let mut i = 1;
     while i < argv.len() {
         match argv[i].as_str() {
@@ -76,11 +82,6 @@ fn main() {
             "--max" => {
                 max = argv[i + 1].parse().expect("--max");
                 i += 2;
-            }
-            // THROWAWAY diagnostic: run tp=1 twice to measure atomic-add nondeterminism floor.
-            "--selfcheck-tp1" => {
-                selfcheck_tp1 = true;
-                i += 1;
             }
             other => {
                 eprintln!("unknown arg {other}");
@@ -113,59 +114,113 @@ fn main() {
     let max_seq = prompt_ids.len() + max + 16;
     eprintln!("prompt {:?} → {} tokens", prompt, prompt_ids.len());
 
-    // ── tp=1 reference run — forward_tp with n_ranks=1 and the int64 down path ──
-    // Uses forward_tp (not decode_step) so both tp=1 and tp=2 share the same
-    // int64 kernel path. The i64 kernel is partition-invariant, so tp=1 (K=inter)
-    // and tp=2 (K=inter/2 each, i64 all-reduce) produce BIT-IDENTICAL f32 logits.
-    eprintln!("\n=== tp=1 reference run (forward_tp, i64 down) ===");
-    let tp1_tokens;
-    let tp1_logits_all;
-    {
-        let tp1 = 1usize;
-        let mut gpus1 = Gpus::init_tp(tp1, cfg.num_hidden_layers).expect("init_tp(1)");
-        gpus1.ensure_rank_streams().expect("rank_streams tp1");
-        let _ = gpus1.enable_peer_all().expect("peer_all tp1");
+    /// Load one Tp rank's weights/state/partials and run one `forward_tp`
+    /// token (embed + body + final norm). `partials`/`partials_i64` are the
+    /// per-rank routed partials the caller owns (zeroed for the first step).
+    struct TpRun {
+        gpus: Gpus,
+        weights_per_rank: Vec<MiniMaxWeights>,
+        state_per_rank: Vec<MiniMaxState>,
+        partials: Vec<GpuTensor>,
+        partials_i64: Vec<GpuTensor>,
+        policy: MoEExecutionPolicy,
+    }
 
+    fn load_tp_run(cfg: &MiniMaxConfig, model: &PathBuf, max_seq: usize, tp: usize) -> TpRun {
+        // Caller-owned MoE execution policy: the Tp mesh IS policy.mesh(), and
+        // the `Gpus` is bound to that same mesh (`Gpus::from_mesh` — the sealed
+        // executor's mesh-identity check requires it). Named rank-one Tp axes
+        // bind through `Gpus::from_mesh` (Lane H); axis-less `DeviceMesh::single()`
+        // remains rejected.
+        let mesh = DeviceMesh::rect(&[(DimKind::Tp, tp)]);
+        let policy =
+            MoEExecutionPolicy::new(MoEExecutionKind::Tp, mesh.clone()).expect("Tp policy");
+        let mut gpus = Gpus::from_mesh(&mesh, cfg.num_hidden_layers).expect("from_mesh");
+        gpus.ensure_rank_streams().expect("rank_streams");
+        let _ = gpus.enable_peer_all().expect("peer_all");
+        assert_eq!(
+            gpus.devices.len(),
+            tp,
+            "from_mesh gave the wrong device count"
+        );
+
+        let mut weights_per_rank: Vec<MiniMaxWeights> = Vec::with_capacity(tp);
         let t_load = std::time::Instant::now();
-        let mut hfq = HfqFile::open(&model).expect("open model tp1");
-        let ts = TpExpertSlice { tp: tp1, rank: 0 };
-        let w = MiniMaxWeights::load(&mut hfq, &cfg, &mut gpus1.devices[0], None, Some(ts))
-            .expect("load tp1");
-        eprintln!("  tp=1 loaded in {:.1}s", t_load.elapsed().as_secs_f64());
-
-        let mut state_per_rank: Vec<MiniMaxState> =
-            vec![
-                MiniMaxState::new_with_max_seq(&mut gpus1.devices[0], &cfg, max_seq)
-                    .expect("state tp1"),
-            ];
-        let mut partials: Vec<GpuTensor> = vec![gpus1.devices[0]
-            .zeros(&[cfg.hidden_size], DType::F32)
-            .expect("partial tp1")];
-        // int64 scratch: hidden * 8 bytes per element (raw bytes, no DType::I64).
-        let mut partials_i64: Vec<GpuTensor> = vec![gpus1.devices[0]
-            .zeros(&[cfg.hidden_size * 8], DType::Raw)
-            .expect("partial_i64 tp1")];
-        let weights_per_rank: Vec<MiniMaxWeights> = vec![w];
-
-        // Prefill via forward_tp (i64 down path).
-        for (pos, &t) in prompt_ids.iter().enumerate() {
-            forward::forward_tp(
-                &mut gpus1,
-                &weights_per_rank,
-                &cfg,
-                &mut state_per_rank,
-                &partials,
-                &partials_i64,
-                t,
-                pos as u32,
-            )
-            .expect("forward_tp prefill tp1");
+        for r in 0..tp {
+            gpus.devices[r].bind_thread().expect("bind");
+            let mut hfq = HfqFile::open(model).expect("open model");
+            let ts = TpExpertSlice { tp, rank: r };
+            let w = MiniMaxWeights::load(&mut hfq, cfg, &mut gpus.devices[r], None, Some(ts))
+                .expect("load");
+            weights_per_rank.push(w);
         }
-        gpus1.devices[0].bind_thread().expect("bind0 tp1");
-        let mut logits = gpus1.devices[0]
-            .download_f32(&state_per_rank[0].logits)
-            .expect("dl tp1");
+        eprintln!(
+            "  tp={tp} all ranks loaded in {:.1}s (down row-gather included)",
+            t_load.elapsed().as_secs_f64()
+        );
 
+        let mut state_per_rank: Vec<MiniMaxState> = Vec::with_capacity(tp);
+        let mut partials: Vec<GpuTensor> = Vec::with_capacity(tp);
+        let mut partials_i64: Vec<GpuTensor> = Vec::with_capacity(tp);
+        for r in 0..tp {
+            gpus.devices[r].bind_thread().expect("bind");
+            state_per_rank.push(
+                MiniMaxState::new_with_max_seq(&mut gpus.devices[r], cfg, max_seq).expect("state"),
+            );
+            partials.push(
+                gpus.devices[r]
+                    .zeros(&[cfg.hidden_size], DType::F32)
+                    .expect("partial"),
+            );
+            // int64 scratch: shape [hidden] with hidden*8 bytes of capacity
+            // (the runtime lowerer validates the logical shape product against
+            // the i64 conversion's n and the byte capacity against n*8).
+            partials_i64.push(
+                gpus.devices[r]
+                    .upload_raw(&vec![0u8; cfg.hidden_size * 8], &[cfg.hidden_size])
+                    .expect("partial_i64"),
+            );
+        }
+        TpRun {
+            gpus,
+            weights_per_rank,
+            state_per_rank,
+            partials,
+            partials_i64,
+            policy,
+        }
+    }
+
+    fn tp_step(run: &mut TpRun, cfg: &MiniMaxConfig, token: u32, pos: u32) {
+        forward::forward_tp(
+            &mut run.gpus,
+            &run.weights_per_rank,
+            cfg,
+            &mut run.state_per_rank,
+            &run.partials,
+            &run.partials_i64,
+            &run.policy,
+            token,
+            pos,
+        )
+        .expect("forward_tp");
+    }
+
+    /// Greedy-generate `max` tokens from the prompt; returns the token ids and
+    /// every logits vector (logits[0] = pre-first-decode output).
+    fn run_greedy(
+        run: &mut TpRun,
+        cfg: &MiniMaxConfig,
+        prompt_ids: &[u32],
+        max: usize,
+    ) -> (Vec<u32>, Vec<Vec<f32>>) {
+        for (pos, &t) in prompt_ids.iter().enumerate() {
+            tp_step(run, cfg, t, pos as u32);
+        }
+        run.gpus.devices[0].bind_thread().expect("bind0");
+        let mut logits = run.gpus.devices[0]
+            .download_f32(&run.state_per_rank[0].logits)
+            .expect("dl");
         let mut tokens = Vec::new();
         let mut all_logits: Vec<Vec<f32>> = Vec::new();
         let mut pos = prompt_ids.len();
@@ -176,297 +231,125 @@ fn main() {
             if matches!(next, 200020 | 151643 | 151645 | 2) {
                 break;
             }
-            forward::forward_tp(
-                &mut gpus1,
-                &weights_per_rank,
-                &cfg,
-                &mut state_per_rank,
-                &partials,
-                &partials_i64,
-                next,
-                pos as u32,
-            )
-            .expect("forward_tp tp1");
-            gpus1.devices[0].bind_thread().expect("bind0 tp1");
-            logits = gpus1.devices[0]
-                .download_f32(&state_per_rank[0].logits)
-                .expect("dl tp1");
+            tp_step(run, cfg, next, pos as u32);
+            run.gpus.devices[0].bind_thread().expect("bind0");
+            logits = run.gpus.devices[0]
+                .download_f32(&run.state_per_rank[0].logits)
+                .expect("dl");
             all_logits.push(logits.clone());
             pos += 1;
         }
-        eprintln!("  tp=1 generated {} tokens", tokens.len());
-        tp1_tokens = tokens;
-        tp1_logits_all = all_logits;
-
-        if selfcheck_tp1 {
-            eprintln!("\n=== selfcheck-tp1: second tp=1 pass (nondeterminism floor) ===");
-            let mut state2 =
-                vec![
-                    MiniMaxState::new_with_max_seq(&mut gpus1.devices[0], &cfg, max_seq)
-                        .expect("state tp1 second pass"),
-                ];
-            let mut logits2 = Vec::new();
-            for (pos, &t) in prompt_ids.iter().enumerate() {
-                forward::forward_tp(
-                    &mut gpus1,
-                    &weights_per_rank,
-                    &cfg,
-                    &mut state2,
-                    &partials,
-                    &partials_i64,
-                    t,
-                    pos as u32,
-                )
-                .expect("forward_tp prefill tp1 second pass");
-                gpus1.devices[0].bind_thread().expect("bind0");
-                logits2 = gpus1.devices[0]
-                    .download_f32(&state2[0].logits)
-                    .expect("dl tp1 second pass");
-            }
-            let mut tokens2 = Vec::new();
-            let mut all_logits2: Vec<Vec<f32>> = Vec::new();
-            let mut pos2 = prompt_ids.len();
-            all_logits2.push(logits2.clone());
-            for _step in 0..max {
-                let next2 = argmax(&logits2);
-                tokens2.push(next2);
-                if matches!(next2, 200020 | 151643 | 151645 | 2) {
-                    break;
-                }
-                forward::forward_tp(
-                    &mut gpus1,
-                    &weights_per_rank,
-                    &cfg,
-                    &mut state2,
-                    &partials,
-                    &partials_i64,
-                    next2,
-                    pos2 as u32,
-                )
-                .expect("forward_tp tp1 second pass");
-                gpus1.devices[0].bind_thread().expect("bind0");
-                logits2 = gpus1.devices[0]
-                    .download_f32(&state2[0].logits)
-                    .expect("dl tp1 second pass");
-                all_logits2.push(logits2.clone());
-                pos2 += 1;
-            }
-            eprintln!("  tp1-pass2 generated {} tokens", tokens2.len());
-
-            let n_steps2 = tp1_tokens.len().min(tokens2.len());
-            let mut argmax_ok2 = true;
-            let mut max_logit_delta_tp1: f32 = 0.0;
-            for step in 0..n_steps2 {
-                if tp1_tokens[step] != tokens2[step] {
-                    eprintln!(
-                        "  ARGMAX MISMATCH (tp1 vs tp1) step {step}: pass1={} pass2={}",
-                        tp1_tokens[step], tokens2[step]
-                    );
-                    argmax_ok2 = false;
-                }
-                if step < tp1_logits_all.len() && step < all_logits2.len() {
-                    let l1 = &tp1_logits_all[step];
-                    let l2 = &all_logits2[step];
-                    let delta = l1
-                        .iter()
-                        .zip(l2.iter())
-                        .map(|(a, b)| (a - b).abs())
-                        .fold(0.0f32, f32::max);
-                    if delta > max_logit_delta_tp1 {
-                        max_logit_delta_tp1 = delta;
-                    }
-                }
-            }
-            if let Some(l0) = tp1_logits_all.first() {
-                let mut top5: Vec<f32> = l0.iter().map(|x| x.abs()).collect();
-                top5.sort_by(|a, b| b.partial_cmp(a).unwrap());
-                let top5: Vec<f32> = top5.into_iter().take(5).collect();
-                eprintln!("  logit magnitude scale (step 0 top-5 |logit|): {top5:.2?}");
-                let argmax_logit = l0[argmax(l0) as usize];
-                eprintln!("  argmax logit value at step 0: {argmax_logit:.4}");
-            }
-            eprintln!("  tp1-vs-tp1 argmax-exact: {argmax_ok2}");
-            eprintln!("  tp1-vs-tp1 logit max|Δ|: {max_logit_delta_tp1:.4e}");
-            eprintln!("\nSELFCHECK-TP1 DONE");
-            return;
-        }
-
-        // Free GPU memory before tp=2 load (so the same physical device can
-        // hold the tp=2 weights under HIPFIRE_EMULATE_GPUS=2).
-        let mut gpu0 = &mut gpus1.devices[0];
-        for s in state_per_rank {
-            s.free_gpu(gpu0);
-        }
-        for w in weights_per_rank {
-            w.free_gpu(gpu0);
-        }
-        // partials and partials_i64 are plain GpuTensors; return them to the pool.
-        gpu0.bind_thread().expect("bind0 tp1 free");
-        gpu0.drain_pool();
+        (tokens, all_logits)
     }
+
+    // ── tp=1 reference run — `forward_tp` under the explicit named Tp(1)
+    //    mesh-bound policy, I64-down path (the historical bitwise partition-
+    //    invariance gate; no F32 baseline, no tolerance). ───────────────────
+    eprintln!("\n=== tp=1 run (forward_tp, Tp(1) mesh, i64 down) ===");
+    let (tp1_tokens, tp1_logits_all) = {
+        let mut run = load_tp_run(&cfg, &model, max_seq, 1);
+        let out = run_greedy(&mut run, &cfg, &prompt_ids, max);
+        // Free GPU memory before the tp=2 load (so the same physical device
+        // can hold the tp=2 weights under HIPFIRE_EMULATE_GPUS=2).
+        let TpRun {
+            gpus,
+            weights_per_rank,
+            state_per_rank,
+            ..
+        } = run;
+        let mut gpus = gpus;
+        for ((state, weights), gpu0) in state_per_rank
+            .into_iter()
+            .zip(weights_per_rank.into_iter())
+            .zip(gpus.devices.iter_mut())
+        {
+            state.free_gpu(gpu0);
+            weights.free_gpu(gpu0);
+            gpu0.bind_thread().expect("bind free");
+            gpu0.drain_pool();
+        }
+        eprintln!("  tp=1 generated {} tokens", out.0.len());
+        out
+    };
 
     // ── tp=2 run (TP-of-experts: every rank owns all experts, inter/2 each) ───
-    let tp = 2usize;
-    eprintln!("\n=== tp={tp} TP-of-experts run ===");
-    let tp2_tokens;
-    let tp2_logits_all;
-    {
-        let mut gpus2 = Gpus::init_tp(tp, cfg.num_hidden_layers).expect("init_tp(2)");
-        gpus2.ensure_rank_streams().expect("rank_streams");
-        let _ = gpus2.enable_peer_all().expect("peer_all");
+    eprintln!("\n=== tp=2 run (forward_tp, Tp(2) mesh, i64 down) ===");
+    let (tp2_tokens, tp2_logits_all) = {
+        let mut run = load_tp_run(&cfg, &model, max_seq, 2);
+        let out = run_greedy(&mut run, &cfg, &prompt_ids, max);
+        eprintln!("  tp=2 generated {} tokens", out.0.len());
+        out
+    };
 
-        let mut weights_per_rank: Vec<MiniMaxWeights> = Vec::with_capacity(tp);
-        let t_load = std::time::Instant::now();
-        for r in 0..tp {
-            gpus2.devices[r].bind_thread().expect("bind");
-            let mut hfq = HfqFile::open(&model).expect("open model tp2");
-            let ts = TpExpertSlice { tp, rank: r };
-            let w = MiniMaxWeights::load(&mut hfq, &cfg, &mut gpus2.devices[r], None, Some(ts))
-                .expect("load tp2");
-            weights_per_rank.push(w);
-        }
-        let load_elapsed = t_load.elapsed().as_secs_f64();
-        eprintln!("  tp=2 all ranks loaded in {load_elapsed:.1}s (down row-gather included)");
-
-        let mut state_per_rank: Vec<MiniMaxState> = Vec::with_capacity(tp);
-        let mut partials: Vec<GpuTensor> = Vec::with_capacity(tp);
-        let mut partials_i64: Vec<GpuTensor> = Vec::with_capacity(tp);
-        for r in 0..tp {
-            gpus2.devices[r].bind_thread().expect("bind");
-            state_per_rank.push(
-                MiniMaxState::new_with_max_seq(&mut gpus2.devices[r], &cfg, max_seq)
-                    .expect("state tp2"),
-            );
-            partials.push(
-                gpus2.devices[r]
-                    .zeros(&[cfg.hidden_size], DType::F32)
-                    .expect("partial tp2"),
-            );
-            // int64 scratch: hidden * 8 bytes (DType::Raw, element = 1 byte).
-            partials_i64.push(
-                gpus2.devices[r]
-                    .zeros(&[cfg.hidden_size * 8], DType::Raw)
-                    .expect("partial_i64 tp2"),
-            );
-        }
-
-        // Prefill.
-        for (pos, &t) in prompt_ids.iter().enumerate() {
-            forward::forward_tp(
-                &mut gpus2,
-                &weights_per_rank,
-                &cfg,
-                &mut state_per_rank,
-                &partials,
-                &partials_i64,
-                t,
-                pos as u32,
-            )
-            .expect("forward_tp prefill");
-        }
-        gpus2.devices[0].bind_thread().expect("bind0");
-        let mut logits = gpus2.devices[0]
-            .download_f32(&state_per_rank[0].logits)
-            .expect("dl tp2");
-
-        let mut tokens = Vec::new();
-        let mut all_logits: Vec<Vec<f32>> = Vec::new();
-        let mut pos = prompt_ids.len();
-        all_logits.push(logits.clone());
-        for step in 0..max {
-            let next = argmax(&logits);
-            tokens.push(next);
-            if matches!(next, 200020 | 151643 | 151645 | 2) {
-                break;
-            }
-            let _ = step;
-            forward::forward_tp(
-                &mut gpus2,
-                &weights_per_rank,
-                &cfg,
-                &mut state_per_rank,
-                &partials,
-                &partials_i64,
-                next,
-                pos as u32,
-            )
-            .expect("forward_tp decode");
-            gpus2.devices[0].bind_thread().expect("bind0");
-            logits = gpus2.devices[0]
-                .download_f32(&state_per_rank[0].logits)
-                .expect("dl tp2");
-            all_logits.push(logits.clone());
-            pos += 1;
-        }
-        eprintln!("  tp=2 generated {} tokens", tokens.len());
-        tp2_tokens = tokens;
-        tp2_logits_all = all_logits;
-    }
-
-    // ── Parity check ──────────────────────────────────────────────────────────
-    eprintln!("\n=== Parity check tp1 vs tp2 ===");
-    let n_steps = tp1_tokens.len().min(tp2_tokens.len());
-    let mut argmax_ok = true;
-    let mut max_logit_delta: f32 = 0.0;
-
-    for step in 0..n_steps {
-        let t1 = tp1_tokens[step];
-        let t2 = tp2_tokens[step];
-        if t1 != t2 {
-            eprintln!("  ARGMAX MISMATCH at step {step}: tp1={t1} tp2={t2}");
-            argmax_ok = false;
-        }
-        // Compare logits at this step (logits_all[step] = logits BEFORE token step is decoded).
-        if step < tp1_logits_all.len() && step < tp2_logits_all.len() {
-            let l1 = &tp1_logits_all[step];
-            let l2 = &tp2_logits_all[step];
-            let delta = l1
-                .iter()
-                .zip(l2.iter())
-                .map(|(a, b)| (a - b).abs())
-                .fold(0.0f32, f32::max);
-            if delta > max_logit_delta {
-                max_logit_delta = delta;
+    // ── Bitwise parity check (token sequence + every logit by to_bits) ──────
+    eprintln!("\n=== Parity check tp1 vs tp2 (bitwise) ===");
+    let mut token_ok = tp1_tokens.len() == tp2_tokens.len();
+    if token_ok {
+        for (step, (t1, t2)) in tp1_tokens.iter().zip(tp2_tokens.iter()).enumerate() {
+            if t1 != t2 {
+                eprintln!("  TOKEN MISMATCH at step {step}: tp1={t1} tp2={t2}");
+                token_ok = false;
             }
         }
-    }
-    if tp1_tokens.len() != tp2_tokens.len() {
+    } else {
         eprintln!(
             "  token count mismatch: tp1={} tp2={}",
             tp1_tokens.len(),
             tp2_tokens.len()
         );
-        argmax_ok = false;
     }
 
-    eprintln!("  argmax-exact: {argmax_ok}");
-    eprintln!("  logit max|Δ|: {max_logit_delta:.2e}");
-    // Report logit magnitude scale at step 0 for context.
-    if let Some(l0) = tp1_logits_all.first() {
-        let mut top5: Vec<f32> = l0.iter().map(|x| x.abs()).collect();
-        top5.sort_by(|a, b| b.partial_cmp(a).unwrap());
-        let top5: Vec<f32> = top5.into_iter().take(5).collect();
-        eprintln!("  logit magnitude scale (step 0 top-5 |logit|): {top5:.2?}");
+    let n_steps = tp1_logits_all.len().min(tp2_logits_all.len());
+    let mut first_mismatch: Option<(usize, usize)> = None;
+    for step in 0..n_steps {
+        let l1 = &tp1_logits_all[step];
+        let l2 = &tp2_logits_all[step];
+        if l1.len() != l2.len() {
+            eprintln!(
+                "  LOGIT LENGTH MISMATCH at step {step}: {} vs {}",
+                l1.len(),
+                l2.len()
+            );
+            first_mismatch = first_mismatch.or(Some((step, 0)));
+            continue;
+        }
+        for (i, (a, b)) in l1.iter().zip(l2.iter()).enumerate() {
+            if a.to_bits() != b.to_bits() {
+                if first_mismatch.is_none() {
+                    eprintln!(
+                        "  LOGIT BIT MISMATCH at step {step} elem {i}: tp1={a:.9} (0x{:08x}) tp2={b:.9} (0x{:08x})",
+                        a.to_bits(),
+                        b.to_bits()
+                    );
+                    first_mismatch = Some((step, i));
+                }
+            }
+        }
+    }
+    if tp1_logits_all.len() != tp2_logits_all.len() {
         eprintln!(
-            "  argmax logit value at step 0: {:.4}",
-            l0[argmax(l0) as usize]
+            "  logit step count mismatch: tp1={} tp2={}",
+            tp1_logits_all.len(),
+            tp2_logits_all.len()
         );
     }
+
+    eprintln!("  token sequence bitwise-exact: {token_ok}");
+    eprintln!(
+        "  every logit to_bits() equal: {}",
+        first_mismatch.is_none()
+    );
     eprintln!("  tp=1 generation:\n{}", tok.decode(&tp1_tokens));
     eprintln!("  tp=2 generation:\n{}", tok.decode(&tp2_tokens));
 
     assert!(
-        argmax_ok,
-        "PARITY FAIL: argmax mismatch between tp=1 and tp=2 (int64 path has a leak?)"
+        token_ok,
+        "PARITY FAIL: tp=1 and tp=2 token sequences differ (I64 TP partition invariance broken?)"
     );
-    // Both tp=1 and tp=2 use forward_tp with the int64 down path
-    // (DownResidualI64 → AllReduceI64Tp → ConvertI64ToF32). The i64 kernel is
-    // partition-invariant: sum(i64_rank0 + i64_rank1) == i64_full, so tp=1 and tp=2
-    // produce bit-identical int64 accumulators → identical f32 after convert.
     assert!(
-        max_logit_delta == 0.0,
-        "PARITY FAIL: logit max|Δ|={max_logit_delta:.2e} != 0.0 (FP leak in int64 TP path)"
+        first_mismatch.is_none(),
+        "PARITY FAIL: tp=1 and tp=2 logits differ bitwise (I64 TP partition invariance broken?)"
     );
 
-    eprintln!("\nPARITY PASS: tp=1 == tp=2 (argmax-exact, logit max|Δ|={max_logit_delta:.2e})");
+    eprintln!("\nPARITY PASS: tp=1 == tp=2 bitwise (token sequence + every logit to_bits())");
 }

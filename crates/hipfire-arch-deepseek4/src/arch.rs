@@ -23,6 +23,7 @@ use hipfire_reap::hook::ReapArchHook;
 use hipfire_runtime::arch::Architecture;
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::model_source::ModelSource;
+use hipfire_runtime::moe_plan::MoEExecutionPolicy;
 use hipfire_runtime::safetensors_source::{bf16_bytes_to_f16, bf16_to_f32};
 use hipfire_runtime::tp_shard::ExpertAssign;
 use hipfire_runtime::weight_manifest::{
@@ -721,8 +722,10 @@ impl DeepseekV4 {
             hc_head_base: None,
             hc_head_scale: 1.0, // overwritten at load time
             layers,
-            mtp_layer: None, // skipped by quantize per `mtp.` prefix; Phase 5 work.
+            mtp_layer: None, // MTP layer bundle loaded separately (env-gated addon / in-band `mtp.0.*`).
             dspark: None,    // DSpark sidecar discovered+loaded in load_weights_inner.
+            moe_policy: MoEExecutionPolicy::single(), // canonical stable single policy.
+            moe_plan_cache: std::sync::OnceLock::new(),
             _scaffold: (),
         })
     }
@@ -776,8 +779,12 @@ impl Architecture for DeepseekV4 {
     /// shapes):
     /// - the per-layer **Hyper-Connections** tensors (`hc_attn_*`/`hc_ffn_*`);
     /// - the conditional **compressor** (`compress_ratio > 0`) and **indexer**
-    ///   (`compress_ratio == 4`) sub-modules;
-    /// - the **MTP** head layer (optional, env-gated).
+    ///   (`compress_ratio == 4`) sub-modules.
+    ///
+    /// (The optional **MTP** head is NOT omitted: when
+    /// `num_nextn_predict_layers == 1` it is declared below as one addon
+    /// layer at `num_hidden_layers` with the same routed-expert surface as a
+    /// main layer.)
     ///
     /// These are a follow-up once the store feeds the forward (Phase 3); the
     /// sharding-relevant structure — every `ExpertSharded` weight and every pin
@@ -940,6 +947,50 @@ impl Architecture for DeepseekV4 {
                 expert(),
             ));
         }
+        // MTP head (optional): one addon layer at `num_hidden_layers` with the
+        // same routed-expert surface as a main layer — truthful logical
+        // Replicate router/bias entries plus ExpertSharded PackedSeparate
+        // gate/up/down projections. Declared ONLY when
+        // `num_nextn_predict_layers == 1`; counts > 1 are refused at plan
+        // resolution (`ds4_resolve_expert_plans`), never declared here.
+        if cfg.num_nextn_predict_layers == 1 {
+            let l = cfg.num_hidden_layers;
+            m.push(WeightEntry::layer(
+                "router_gate",
+                l,
+                vec![ne, d],
+                DType::F32,
+                Replicate,
+            ));
+            m.push(WeightEntry::layer(
+                "router_gate_bias",
+                l,
+                vec![ne],
+                DType::F32,
+                Replicate,
+            ));
+            m.push(WeightEntry::layer(
+                "experts_gate",
+                l,
+                vec![ne, moe, d],
+                DType::F16,
+                expert(),
+            ));
+            m.push(WeightEntry::layer(
+                "experts_up",
+                l,
+                vec![ne, moe, d],
+                DType::F16,
+                expert(),
+            ));
+            m.push(WeightEntry::layer(
+                "experts_down",
+                l,
+                vec![ne, d, moe],
+                DType::F16,
+                expert(),
+            ));
+        }
         m.push(WeightEntry::model(
             "output_norm",
             vec![d],
@@ -959,8 +1010,9 @@ impl Architecture for DeepseekV4 {
     /// state is a KV-family cache — one [`StateKind::Kv`] per layer, keyed by
     /// global layer index. No DeltaNet recurrent / conv state. (The SWA-ring +
     /// compressed-indexer machinery is an internal shape detail of the KV state,
-    /// not a distinct `StateKind`.) MTP-layer state is scoped out with its
-    /// weights.
+    /// not a distinct `StateKind`.) The MTP head carries no KV state (it is a
+    /// prediction head); its manifest weights are declared at layer
+    /// `num_hidden_layers` when `num_nextn_predict_layers == 1`.
     fn state_manifest(cfg: &Self::Config) -> Vec<StateEntry> {
         (0..cfg.num_hidden_layers)
             .map(|l| {
@@ -972,6 +1024,22 @@ impl Architecture for DeepseekV4 {
                 )
             })
             .collect()
+    }
+
+    /// Policy-aware MoE expert-group manifest (STEP-002 Task 8): one
+    /// layer-local group per MoE layer with the canonical router identities
+    /// `hash` (layers `< num_hash_layers`) and `bias_aware_topk` (score
+    /// layers), the `indexed_quantized` execution identity, and parallelism
+    /// derived from the caller's execution policy. The host-completed hash
+    /// fallback selects the `precomputed` identity during the model-owned
+    /// cache's cold effective-spec resolution (see
+    /// `crate::moe_lower::ds4_effective_expert_group_manifest`) — never a
+    /// `hash` alias, and never at lowering time.
+    fn expert_group_manifest(
+        cfg: &Self::Config,
+        policy: &hipfire_runtime::moe_plan::MoEExecutionPolicy,
+    ) -> Vec<hipfire_runtime::weight_manifest::ExpertGroupSpec> {
+        crate::moe_lower::ds4_expert_group_manifest(cfg, policy)
     }
 }
 
@@ -2409,6 +2477,8 @@ impl DeepseekV4 {
             layers,
             mtp_layer: None,
             dspark: None,
+            moe_policy: MoEExecutionPolicy::single(), // canonical stable single policy.
+            moe_plan_cache: std::sync::OnceLock::new(),
             _scaffold: (),
         };
 
@@ -2957,14 +3027,15 @@ mod tests {
     #[test]
     fn deepseek4_weight_manifest_shards_only_experts() {
         use hipfire_runtime::weight_manifest::{PinTarget, ShardPolicy};
-        let cfg = tiny_cfg();
+        let cfg = tiny_cfg(); // num_nextn_predict_layers == 1 → MTP slot declared
         let m = DeepseekV4::weight_manifest(&cfg);
-        // Only routed experts are ExpertSharded — 3 (gate/up/down) × 4 layers.
+        // Only routed experts are ExpertSharded — 3 (gate/up/down) × 4 layers
+        // + 3 for the MTP slot at layer num_hidden_layers.
         let experts: Vec<_> = m
             .iter()
             .filter(|e| matches!(e.policy, ShardPolicy::ExpertSharded { .. }))
             .collect();
-        assert_eq!(experts.len(), 12);
+        assert_eq!(experts.len(), 15);
         assert!(experts
             .iter()
             .all(|e| matches!(e.policy, ShardPolicy::ExpertSharded { n_experts: 8, .. })));
@@ -2985,15 +3056,16 @@ mod tests {
         assert!(m
             .iter()
             .any(|e| e.name == "head" && matches!(e.policy, ShardPolicy::Pin(PinTarget::Output))));
-        // gate_bias only on score-routed layers (l >= num_hash_layers = 2).
+        // gate_bias only on score-routed layers (l >= num_hash_layers = 2),
+        // including the MTP slot at layer 4.
         let bias_layers: Vec<_> = m
             .iter()
             .filter(|e| e.name == "router_gate_bias")
             .filter_map(|e| e.layer)
             .collect();
-        assert_eq!(bias_layers, vec![2, 3]);
-        // router_gate on every layer.
-        assert_eq!(m.iter().filter(|e| e.name == "router_gate").count(), 4);
+        assert_eq!(bias_layers, vec![2, 3, 4]);
+        // router_gate on every main layer plus the MTP slot.
+        assert_eq!(m.iter().filter(|e| e.name == "router_gate").count(), 5);
     }
 
     #[test]
@@ -3005,6 +3077,95 @@ mod tests {
         assert_eq!(
             s.iter().map(|e| e.layer).collect::<Vec<_>>(),
             vec![0, 1, 2, 3]
+        );
+    }
+
+    // ── Lane A (final cutover): MTP static manifest declaration ─────────
+    #[test]
+    fn deepseek4_weight_manifest_mtp_count0_no_entries() {
+        let mut cfg = tiny_cfg();
+        cfg.num_nextn_predict_layers = 0;
+        let m = DeepseekV4::weight_manifest(&cfg);
+        assert!(
+            m.iter().all(|e| e.layer != Some(cfg.num_hidden_layers)),
+            "count0 must declare no MTP manifest entries at layer {}",
+            cfg.num_hidden_layers
+        );
+    }
+
+    #[test]
+    fn deepseek4_weight_manifest_mtp_count1_exact_entries() {
+        use hipfire_runtime::tp_shard::ExpertAssign;
+        use hipfire_runtime::weight_manifest::ShardPolicy;
+        let cfg = tiny_cfg(); // num_nextn_predict_layers == 1
+        let l = cfg.num_hidden_layers;
+        let m = DeepseekV4::weight_manifest(&cfg);
+        let entries: Vec<_> = m.iter().filter(|e| e.layer == Some(l)).collect();
+        assert_eq!(
+            entries.len(),
+            5,
+            "MTP layer must declare router_gate, router_gate_bias, experts_gate, experts_up, experts_down"
+        );
+        let by_name = |n: &str| {
+            entries
+                .iter()
+                .find(|e| e.name == n)
+                .unwrap_or_else(|| panic!("missing MTP entry {n}"))
+        };
+        let rg = by_name("router_gate");
+        assert_eq!(
+            rg.logical_shape,
+            vec![cfg.n_routed_experts, cfg.hidden_size]
+        );
+        assert_eq!(rg.dtype, DType::F32);
+        assert!(matches!(rg.policy, ShardPolicy::Replicate));
+        let rgb = by_name("router_gate_bias");
+        assert_eq!(rgb.logical_shape, vec![cfg.n_routed_experts]);
+        assert_eq!(rgb.dtype, DType::F32);
+        assert!(matches!(rgb.policy, ShardPolicy::Replicate));
+        for n in ["experts_gate", "experts_up"] {
+            let e = by_name(n);
+            assert_eq!(
+                e.logical_shape,
+                vec![
+                    cfg.n_routed_experts,
+                    cfg.moe_intermediate_size,
+                    cfg.hidden_size
+                ]
+            );
+            assert_eq!(e.dtype, DType::F16);
+            assert!(
+                matches!(
+                    e.policy,
+                    ShardPolicy::ExpertSharded {
+                        n_experts,
+                        assign: ExpertAssign::Stride
+                    } if n_experts == cfg.n_routed_experts
+                ),
+                "MTP {n} policy: {:?}",
+                e.policy
+            );
+        }
+        let d = by_name("experts_down");
+        assert_eq!(
+            d.logical_shape,
+            vec![
+                cfg.n_routed_experts,
+                cfg.hidden_size,
+                cfg.moe_intermediate_size
+            ]
+        );
+        assert_eq!(d.dtype, DType::F16);
+        assert!(
+            matches!(
+                d.policy,
+                ShardPolicy::ExpertSharded {
+                    n_experts,
+                    assign: ExpertAssign::Stride
+                } if n_experts == cfg.n_routed_experts
+            ),
+            "MTP experts_down policy: {:?}",
+            d.policy
         );
     }
 }

@@ -120,12 +120,28 @@ fn run_tp_n(
     tp: usize,
     prefill_batch: bool,
 ) -> (Vec<u32>, Vec<Vec<f32>>, Option<u32>, Option<Vec<f32>>) {
-    let mut gpus = Gpus::init_tp(tp, cfg.num_hidden_layers).expect("init_tp");
+    // The mesh is built once and shared by the GPU construction (binding the
+    // weight-origin epoch the sealed executor validates) and the MoE policy.
+    let mesh = hipfire_runtime::multi_gpu::DeviceMesh::rect(&[(
+        hipfire_runtime::multi_gpu::DimKind::Tp,
+        tp,
+    )]);
+    // from_mesh delegates to init_uniform for a Tp axis — used for ALL rank
+    // counts including named Tp=1: the bound mesh epoch is what the sealed
+    // executor validates, and rank-one Tp runs the sealed program (no
+    // manual/rank-one schedule exists). Every rank still runs every layer in
+    // the DS4 TP forward, so the band layout is vestigial.
+    let mut gpus = Gpus::from_mesh(&mesh, cfg.num_hidden_layers).expect("from_mesh");
     let n = gpus.devices.len();
     assert_eq!(
         n, tp,
-        "init_tp gave {n} devices (check HIPFIRE_EMULATE_GPUS)"
+        "from_mesh gave {n} devices (check HIPFIRE_EMULATE_GPUS)"
     );
+    let policy = hipfire_runtime::moe_plan::MoEExecutionPolicy::new(
+        hipfire_runtime::moe_plan::MoEExecutionKind::Tp,
+        mesh,
+    )
+    .expect("tp policy");
     gpus.ensure_rank_streams().expect("ensure_rank_streams");
     let _ = gpus.enable_peer_all().expect("enable_peer_all");
 
@@ -202,6 +218,7 @@ fn run_tp_n(
             &mut pbs_per_rank,
             &pb_partials_i64,
             &pb_partials,
+            &policy,
             prompt_ids,
             0,
         )
@@ -228,6 +245,7 @@ fn run_tp_n(
                 &mut state_per_rank,
                 &partials,
                 &partials_i64,
+                &policy,
                 t,
                 pos as u32,
             )
@@ -258,22 +276,27 @@ fn run_tp_n(
         );
     }
 
-    // MTP draft (optional): capture h_n per rank, draft next-next via mtp_forward_tp.
+    // MTP draft (optional): capture h_n per rank, draft next-next via
+    // mtp_forward_tp. The MTP chaining hidden is the DURABLE
+    // `state.mtp_last_hidden` — BOTH the scalar prefill (`final_norm_and_head`
+    // → `mtp_capture_hidden`) and the batched TP prefill (final-chunk
+    // per-rank capture from `pbs.streams_batch`) publish it. The scalar
+    // `state.residual_streams` is only populated on the scalar path, so it
+    // must not be read here.
     let mut mtp_draft: Option<u32> = None;
     if do_mtp {
         let t0 = argmax(&logits);
         let mut h_n_per_rank: Vec<GpuTensor> = Vec::with_capacity(n);
         for r in 0..n {
             gpus.devices[r].bind_thread().expect("bind");
-            let streams = state_per_rank[r]
-                .residual_streams
-                .as_ref()
-                .expect("residual_streams");
+            let last = state_per_rank[r].mtp_last_hidden.as_ref().expect(
+                "mtp_last_hidden (batched and scalar prefill both publish the durable MTP hidden)",
+            );
             let h = gpus.devices[r]
                 .alloc_tensor(&[cfg.hc_mult, cfg.hidden_size], DType::F32)
                 .expect("alloc h_n");
             gpus.devices[r]
-                .memcpy_dtod_auto(&h.buf, &streams.buf, cfg.hc_mult * cfg.hidden_size * 4)
+                .memcpy_dtod_auto(&h.buf, &last.buf, cfg.hc_mult * cfg.hidden_size * 4)
                 .expect("copy h_n");
             h_n_per_rank.push(h);
         }
@@ -285,13 +308,15 @@ fn run_tp_n(
             &partials,
             &partials_i64,
             &h_n_per_rank,
+            &policy,
             t0,
             prompt_ids.len() as u32,
         )
         .expect("mtp_forward_tp");
         mtp_draft = Some(argmax(&mtp_logits));
-        for h in h_n_per_rank {
-            gpus.devices[0].free_tensor(h).ok();
+        for (r, h) in h_n_per_rank.into_iter().enumerate() {
+            gpus.devices[r].bind_thread().expect("bind h_n free");
+            gpus.devices[r].free_tensor(h).expect("free h_n");
         }
     }
 
@@ -313,6 +338,7 @@ fn run_tp_n(
             &mut state_per_rank,
             &partials,
             &partials_i64,
+            &policy,
             next,
             pos as u32,
         )

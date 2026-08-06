@@ -428,6 +428,28 @@ impl Architecture for Qwen35 {
         m
     }
 
+    /// MoE expert-group manifest (STEP-002 Task 9): one layer-local Single
+    /// group per MoE layer with stable semantic identities matching the
+    /// actual dispatch builder plans — router identity `softmax_topk` (the
+    /// builders' softmax routing) and exact allowed execution membership
+    /// `[indexed_quantized, grouped_quantized]`: indexed decode and prefill
+    /// Path 0/1 build indexed steps, grouped prefill Path 2 builds the
+    /// grouped scatter → gate-up → gate-up deinterleave → activation → down →
+    /// inverse-permuting combine program. Both declared identities are
+    /// admitted; the shared lowerer's concrete-steps guard refuses any
+    /// program whose typed label mismatches its concrete protocol (a grouped
+    /// chain claimed as indexed is an `ExecutionIdentityMismatch` even with
+    /// both declared). Qwen35 has NO parallel expert-group admission: a
+    /// TP/EP policy resolves zero groups here (the runtime then refuses any
+    /// parallel MoE program construction), and the production decode entry
+    /// refuses before constructing program parts.
+    fn expert_group_manifest(
+        cfg: &Self::Config,
+        policy: &hipfire_runtime::moe_plan::MoEExecutionPolicy,
+    ) -> Vec<hipfire_runtime::weight_manifest::ExpertGroupSpec> {
+        crate::qwen35::qwen35_moe_expert_group_specs(cfg, policy)
+    }
+
     // Optional overrides default to the trait scaffold's Qwen3.5-flavored
     // baseline. Qwen3.5 IS the canonical arch the trait was designed
     // around, so no overrides needed here. Future arches (gemma4, llama)
@@ -1071,5 +1093,142 @@ mod tests {
         );
         assert_eq!(state[4], StateEntry::new(StateKind::Recurrent, 3));
         assert_eq!(state[5], StateEntry::new(StateKind::Conv, 3));
+    }
+
+    // ── STEP-002 Task 9: Single expert-group manifest ─────────────────────
+
+    fn single_policy() -> hipfire_runtime::moe_plan::MoEExecutionPolicy {
+        hipfire_runtime::moe_plan::MoEExecutionPolicy::single()
+    }
+
+    fn tp_policy(ranks: usize) -> hipfire_runtime::moe_plan::MoEExecutionPolicy {
+        hipfire_runtime::moe_plan::MoEExecutionPolicy::new(
+            hipfire_runtime::moe_plan::MoEExecutionKind::Tp,
+            hipfire_hardware::DeviceMesh::rect(&[(hipfire_hardware::DimKind::Tp, ranks)]),
+        )
+        .unwrap()
+    }
+
+    fn ep_policy(ranks: usize) -> hipfire_runtime::moe_plan::MoEExecutionPolicy {
+        hipfire_runtime::moe_plan::MoEExecutionPolicy::new(
+            hipfire_runtime::moe_plan::MoEExecutionKind::Ep,
+            hipfire_hardware::DeviceMesh::rect(&[(hipfire_hardware::DimKind::Ep, ranks)]),
+        )
+        .unwrap()
+    }
+
+    /// The production Qwen manifest resolves exactly one Single group per MoE
+    /// layer, and only under the Single policy.
+    #[test]
+    fn qwen35_expert_group_manifest_resolves_only_with_single_policy() {
+        let cfg = moe_config(&["linear_attention", "full_attention"]);
+        let specs = <Qwen35 as Architecture>::expert_group_manifest(&cfg, &single_policy());
+        assert_eq!(specs.len(), 2, "one group per MoE layer");
+        for (layer, spec) in specs.iter().enumerate() {
+            assert_eq!(spec.layer, Some(layer));
+            assert_eq!(spec.n_experts, cfg.num_experts);
+            assert_eq!(
+                spec.parallelism,
+                hipfire_runtime::weight_manifest::ExpertParallelism::Single
+            );
+            assert_eq!(spec.group, format!("qwen35_moe_layer_{layer}"));
+        }
+    }
+
+    /// TP/EP policies must resolve no Qwen expert groups at all — the refusal
+    /// happens before any program construction.
+    #[test]
+    fn qwen35_expert_group_manifest_refuses_tp_ep_before_program_construction() {
+        let cfg = moe_config(&["full_attention"]);
+        assert!(
+            <Qwen35 as Architecture>::expert_group_manifest(&cfg, &tp_policy(2)).is_empty(),
+            "TP policy must resolve no Qwen expert groups"
+        );
+        assert!(
+            <Qwen35 as Architecture>::expert_group_manifest(&cfg, &ep_policy(2)).is_empty(),
+            "EP policy must resolve no Qwen expert groups"
+        );
+    }
+
+    /// The manifest identities must exactly match the plans the dispatch
+    /// decode builder actually builds: softmax top-K routing + indexed
+    /// quantized execution, with the per-expert manifest sources claimed by
+    /// each group.
+    #[test]
+    fn qwen35_expert_group_manifest_identities_match_dispatch_builder_plans() {
+        let cfg = moe_config(&["full_attention"]);
+        let specs = <Qwen35 as Architecture>::expert_group_manifest(&cfg, &single_policy());
+        assert_eq!(specs.len(), 1);
+        let spec = &specs[0];
+        assert_eq!(spec.router, "router");
+        assert_eq!(spec.router_identity, "softmax_topk");
+        // Qwen declares exactly indexed+grouped execution membership (the
+        // CPU fallback is never declared — it lives outside lowering).
+        assert_eq!(
+            spec.allowed_executions,
+            vec![
+                hipfire_runtime::weight_manifest::ExpertExecutionIdentity::IndexedQuantized,
+                hipfire_runtime::weight_manifest::ExpertExecutionIdentity::GroupedQuantized,
+            ]
+        );
+        assert_eq!(
+            spec.source_layout,
+            hipfire_runtime::weight_manifest::ExpertSourceLayout::PerExpertFused {
+                gate_up: (0..cfg.num_experts)
+                    .map(|e| format!("expert.{e}.gate_up"))
+                    .collect(),
+                down: (0..cfg.num_experts)
+                    .map(|e| format!("expert.{e}.down"))
+                    .collect(),
+                sidecars: Vec::new(),
+            }
+        );
+    }
+
+    /// Router-contract pin (re-opened by Lane R): the runtime's expert-group
+    /// reference validation now requires the router entry's FIRST dimension
+    /// to equal n_experts, and the Qwen35 router is physically
+    /// `[n_experts, dim]` (declared in the weight manifest) — so resolution
+    /// succeeds. A transposed `[dim, n_experts]` router stays refused by the
+    /// read-only contract; this test pins both directions so the lane cannot
+    /// drift silently.
+    #[test]
+    fn qwen35_expert_group_manifest_resolves_with_experts_first_router() {
+        let cfg = moe_config(&["full_attention"]);
+        let specs = <Qwen35 as Architecture>::expert_group_manifest(&cfg, &single_policy());
+        assert_eq!(specs.len(), 1);
+        let manifest = <Qwen35 as Architecture>::weight_manifest(&cfg);
+        let plan =
+            hipfire_runtime::weight_manifest::resolve_expert_group_plan(&specs[0], &manifest, 1)
+                .expect("experts-first router must resolve");
+        assert_eq!(plan.n_experts, cfg.num_experts);
+        assert_eq!(plan.group_size, 1);
+
+        // Transposed `[dim, n_experts]` must be refused by the first-axis
+        // contract with a deterministic router-shape error.
+        let mut transposed = manifest;
+        transposed
+            .iter_mut()
+            .find(|entry| entry.name == "router")
+            .unwrap()
+            .logical_shape = vec![cfg.dim, cfg.num_experts];
+        let err =
+            hipfire_runtime::weight_manifest::resolve_expert_group_plan(&specs[0], &transposed, 1)
+                .unwrap_err();
+        assert!(
+            err.contains("router reference 'router'"),
+            "refusal must name the router reference, got: {err}"
+        );
+        assert!(
+            err.contains("first dimension must equal n_experts"),
+            "refusal must be the router-shape contract, got: {err}"
+        );
+    }
+
+    /// Dense (non-MoE) Qwen configs declare no expert groups at all.
+    #[test]
+    fn qwen35_dense_config_declares_no_expert_groups() {
+        let cfg = config(&["full_attention"]);
+        assert!(<Qwen35 as Architecture>::expert_group_manifest(&cfg, &single_policy()).is_empty());
     }
 }
