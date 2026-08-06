@@ -7,8 +7,10 @@
 //! This is the H0 transport gate for the DeepSeek V4 heterogeneous
 //! gfx1100/gfx1151 route. It measures the actual decode boundary shape:
 //! one `[batch, hidden=4096]` F32 payload in each direction across a
-//! 43-layer dependency chain. Streams, timing events, dependency events,
-//! and buffers are allocated once and reused for every sample.
+//! 43-layer dependency chain. Streams, timing events, and buffers are
+//! allocated once and reused for every sample. The default synchronization
+//! mode is host-side stream synchronization because cross-device HIP events
+//! and signal-memory waits did not reliably publish peer writes on this pair.
 //!
 //! Example:
 //! ```text
@@ -27,12 +29,38 @@ const SIGNAL_BYTES: usize = std::mem::size_of::<u64>();
 const DEFAULT_LAYERS: usize = 43;
 const DEFAULT_BATCHES: &[usize] = &[1, 16, 128, 512, 1024];
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SyncMode {
+    Host,
+    Signal,
+}
+
+impl SyncMode {
+    fn parse(raw: &str) -> Result<Self, String> {
+        match raw {
+            "host" => Ok(Self::Host),
+            "signal" => Ok(Self::Signal),
+            _ => Err(format!(
+                "unsupported --sync value {raw:?}; use host or signal"
+            )),
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Host => "host_stream_sync",
+            Self::Signal => "signal_memory",
+        }
+    }
+}
+
 #[derive(Debug)]
 struct Config {
     warmups: usize,
     one_way_samples: usize,
     chain_samples: usize,
     exactness_samples: usize,
+    sync: SyncMode,
     layers: usize,
     batches: Vec<usize>,
     expect_arch0: Option<String>,
@@ -46,6 +74,7 @@ impl Default for Config {
             one_way_samples: 100,
             chain_samples: 50,
             exactness_samples: 10,
+            sync: SyncMode::Host,
             layers: DEFAULT_LAYERS,
             batches: DEFAULT_BATCHES.to_vec(),
             expect_arch0: None,
@@ -74,6 +103,7 @@ impl Config {
                 "--exactness-samples" => {
                     cfg.exactness_samples = parse_positive(flag, value(&mut i)?)?
                 }
+                "--sync" => cfg.sync = SyncMode::parse(value(&mut i)?)?,
                 "--layers" => cfg.layers = parse_positive(flag, value(&mut i)?)?,
                 "--batches" => {
                     cfg.batches = value(&mut i)?
@@ -119,6 +149,7 @@ fn print_help() {
            --one-way-samples N    samples per direction and size (default 100)\n\
            --chain-samples N      43-layer chain samples per size (default 50)\n\
            --exactness-samples N  post-timing exactness stress samples (default 10)\n\
+           --sync MODE            host (default) or signal (diagnostic)\n\
            --layers N             round-trip dependency count (default 43)\n\
            --batches CSV          batch rows for [B,4096] F32 (default 1,16,128,512,1024)\n\
            --expect-arch0 ARCH    fail unless logical device 0 matches\n\
@@ -217,13 +248,14 @@ struct Chain<'a> {
     stream1: &'a Stream,
     start0: &'a Event,
     stop0: &'a Event,
-    signal_to1: &'a DeviceBuffer,
-    signal_to0: &'a DeviceBuffer,
+    signal_to1: Option<&'a DeviceBuffer>,
+    signal_to0: Option<&'a DeviceBuffer>,
     dev0_a: &'a DeviceBuffer,
     dev0_b: &'a DeviceBuffer,
     dev1: &'a DeviceBuffer,
     layers: usize,
     next_epoch: Cell<u32>,
+    sync: SyncMode,
 }
 
 fn chain_sample(
@@ -252,21 +284,40 @@ fn chain_sample(
             (chain.dev0_b, chain.dev0_a)
         };
 
-        hip.set_device(0)?;
-        if copy_payload {
-            hip.memcpy_peer_async(chain.dev1, 1, src0, 0, size, chain.stream0)?;
-        }
-        hip.stream_write_value32(chain.stream0, chain.signal_to1, epoch, SIGNAL_FLAGS)?;
+        match chain.sync {
+            SyncMode::Host => {
+                hip.set_device(0)?;
+                if copy_payload {
+                    hip.memcpy_peer_async(chain.dev1, 1, src0, 0, size, chain.stream0)?;
+                }
+                hip.stream_synchronize(chain.stream0)?;
 
-        hip.set_device(1)?;
-        hip.stream_wait_value32(chain.stream1, chain.signal_to1, epoch, WAIT_EQ, SIGNAL_MASK)?;
-        if copy_payload {
-            hip.memcpy_peer_async(dst0, 0, chain.dev1, 1, size, chain.stream1)?;
-        }
-        hip.stream_write_value32(chain.stream1, chain.signal_to0, epoch, SIGNAL_FLAGS)?;
+                hip.set_device(1)?;
+                if copy_payload {
+                    hip.memcpy_peer_async(dst0, 0, chain.dev1, 1, size, chain.stream1)?;
+                }
+                hip.stream_synchronize(chain.stream1)?;
+            }
+            SyncMode::Signal => {
+                let signal_to1 = chain.signal_to1.expect("signal mode requires to1 memory");
+                let signal_to0 = chain.signal_to0.expect("signal mode requires to0 memory");
+                hip.set_device(0)?;
+                if copy_payload {
+                    hip.memcpy_peer_async(chain.dev1, 1, src0, 0, size, chain.stream0)?;
+                }
+                hip.stream_write_value32(chain.stream0, signal_to1, epoch, SIGNAL_FLAGS)?;
 
-        hip.set_device(0)?;
-        hip.stream_wait_value32(chain.stream0, chain.signal_to0, epoch, WAIT_EQ, SIGNAL_MASK)?;
+                hip.set_device(1)?;
+                hip.stream_wait_value32(chain.stream1, signal_to1, epoch, WAIT_EQ, SIGNAL_MASK)?;
+                if copy_payload {
+                    hip.memcpy_peer_async(dst0, 0, chain.dev1, 1, size, chain.stream1)?;
+                }
+                hip.stream_write_value32(chain.stream1, signal_to0, epoch, SIGNAL_FLAGS)?;
+
+                hip.set_device(0)?;
+                hip.stream_wait_value32(chain.stream0, signal_to0, epoch, WAIT_EQ, SIGNAL_MASK)?;
+            }
+        }
     }
 
     hip.event_record(chain.stop0, Some(chain.stream0))?;
@@ -350,17 +401,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!(
         "identity arch0={arch0} arch1={arch1} visible_devices={device_count} \
-         peer_0_to_1={can_0_to_1} peer_1_to_0={can_1_to_0} sync=signal_memory hidden={HIDDEN} \
+         peer_0_to_1={can_0_to_1} peer_1_to_0={can_1_to_0} sync={} hidden={HIDDEN} \
          layers={} warmups={} one_way_samples={} chain_samples={} \
          exactness_samples={} max_bytes={max_bytes}",
-        cfg.layers, cfg.warmups, cfg.one_way_samples, cfg.chain_samples, cfg.exactness_samples
+        cfg.sync.label(),
+        cfg.layers,
+        cfg.warmups,
+        cfg.one_way_samples,
+        cfg.chain_samples,
+        cfg.exactness_samples
     );
 
     hip.set_device(0)?;
     let dev0_a = hip.malloc(max_bytes)?;
     let dev0_b = hip.malloc(max_bytes)?;
-    let signal_to0 = hip.malloc_signal(SIGNAL_BYTES)?;
-    hip.memset(&signal_to0, 0, SIGNAL_BYTES)?;
+    let signal_to0 = if cfg.sync == SyncMode::Signal {
+        let signal = hip.malloc_signal(SIGNAL_BYTES)?;
+        hip.memset(&signal, 0, SIGNAL_BYTES)?;
+        Some(signal)
+    } else {
+        None
+    };
     let stream0 = hip.stream_create()?;
     hip.enable_peer_access(1)?;
     // Exercise idempotence so the product path can call this after every load.
@@ -369,8 +430,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     hip.set_device(1)?;
     let dev1_a = hip.malloc(max_bytes)?;
     let dev1_b = hip.malloc(max_bytes)?;
-    let signal_to1 = hip.malloc_signal(SIGNAL_BYTES)?;
-    hip.memset(&signal_to1, 0, SIGNAL_BYTES)?;
+    let signal_to1 = if cfg.sync == SyncMode::Signal {
+        let signal = hip.malloc_signal(SIGNAL_BYTES)?;
+        hip.memset(&signal, 0, SIGNAL_BYTES)?;
+        Some(signal)
+    } else {
+        None
+    };
     let stream1 = hip.stream_create()?;
     hip.enable_peer_access(0)?;
     hip.enable_peer_access(0)?;
@@ -408,13 +474,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         stream1: &stream1,
         start0: &chain_start0,
         stop0: &chain_stop0,
-        signal_to1: &signal_to1,
-        signal_to0: &signal_to0,
+        signal_to1: signal_to1.as_ref(),
+        signal_to0: signal_to0.as_ref(),
         dev0_a: &dev0_a,
         dev0_b: &dev0_b,
         dev1: &dev1_a,
         layers: cfg.layers,
         next_epoch: Cell::new(0),
+        sync: cfg.sync,
     };
 
     for &batch in &cfg.batches {
@@ -501,7 +568,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             chain_host.push(host_ms);
         }
         print_row(
-            "signal_chain",
+            match cfg.sync {
+                SyncMode::Host => "host_sync_chain",
+                SyncMode::Signal => "signal_chain",
+            },
             "round_trip",
             batch,
             0,
@@ -556,7 +626,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     hip.stream_destroy(stream0)?;
     hip.free(dev0_a)?;
     hip.free(dev0_b)?;
-    hip.free(signal_to0)?;
+    if let Some(signal) = signal_to0 {
+        hip.free(signal)?;
+    }
 
     hip.set_device(1)?;
     hip.event_destroy(one_start1)?;
@@ -564,7 +636,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     hip.stream_destroy(stream1)?;
     hip.free(dev1_a)?;
     hip.free(dev1_b)?;
-    hip.free(signal_to1)?;
+    if let Some(signal) = signal_to1 {
+        hip.free(signal)?;
+    }
 
     println!("peer_chain: PASS");
     Ok(())
