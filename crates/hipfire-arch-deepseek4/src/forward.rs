@@ -948,9 +948,17 @@ fn gemv_auto(
         awq_scale: None,
     };
     // DeepSeek prepares and reuses the FWHT input in architecture-owned
-    // scratch. `run_auto` treats its input as plain and would rotate a typed
-    // E8 weight a second time. Dispatch the prepared E8 activation explicitly;
-    // legacy Q8/F16/Raw behavior remains unchanged.
+    // scratch. `run_auto` treats its input as plain and rotates every typed MQ
+    // weight itself. Passing `x_rotated` through it therefore double-rotates
+    // MQ2RXT's typed MQ4 activation. The historical DS4 MQ4 path did not expose
+    // this because its weight dtype was `Raw`. Dispatch every typed format that
+    // consumes the architecture-prepared activation explicitly; legacy
+    // Q8/F16/Raw behavior remains unchanged.
+    if weight.dtype == DType::MQ4G256 {
+        return gpu
+            .gemv_mq4g256_prerotated(weight, x_rotated, y, m, k)
+            .map_err(|e| format!("gemv MQ4 prerotated: {e:?}"));
+    }
     if matches!(
         weight.dtype,
         DType::MFP4G32E8 | DType::MFP4G32E8SOA | DType::MFP3G32E8
