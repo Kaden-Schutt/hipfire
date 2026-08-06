@@ -116,13 +116,32 @@ fn print_stats(label: &str, stats: &Stats) {
 
 fn main() -> Result<(), String> {
     let mut args = std::env::args_os().skip(1);
-    let base_path = args.next().ok_or("usage: route_compare BASE CANDIDATE")?;
-    let candidate_path = args.next().ok_or("usage: route_compare BASE CANDIDATE")?;
-    if args.next().is_some() {
-        return Err("usage: route_compare BASE CANDIDATE".to_string());
-    }
-    let base = read(Path::new(&base_path))?;
-    let candidate = read(Path::new(&candidate_path))?;
+    let first = args
+        .next()
+        .ok_or("usage: route_compare BASE CANDIDATE | --halves COMBINED")?;
+    let (base, candidate) = if first == "--halves" {
+        let combined_path = args
+            .next()
+            .ok_or("usage: route_compare --halves COMBINED")?;
+        if args.next().is_some() {
+            return Err("usage: route_compare --halves COMBINED".to_string());
+        }
+        let combined = read(Path::new(&combined_path))?;
+        if !combined.len().is_multiple_of(2) {
+            return Err(format!(
+                "combined route record count {} is not even",
+                combined.len()
+            ));
+        }
+        let half = combined.len() / 2;
+        (combined[..half].to_vec(), combined[half..].to_vec())
+    } else {
+        let candidate_path = args.next().ok_or("usage: route_compare BASE CANDIDATE")?;
+        if args.next().is_some() {
+            return Err("usage: route_compare BASE CANDIDATE".to_string());
+        }
+        (read(Path::new(&first))?, read(Path::new(&candidate_path))?)
+    };
     if base.len() != candidate.len() {
         return Err(format!(
             "record count mismatch: base {} candidate {}",

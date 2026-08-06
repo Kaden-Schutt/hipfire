@@ -13,7 +13,7 @@ use hipfire_arch_deepseek4::{
 use hipfire_runtime::arch::Architecture;
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::tokenizer::Tokenizer;
-use rdna_compute::Gpu;
+use rdna_compute::{Gpu, GpuTensor};
 use serde_json::json;
 
 fn main() -> Result<(), String> {
@@ -276,7 +276,7 @@ fn main() -> Result<(), String> {
                 }))
                 .map_err(|error| error.to_string())?
             );
-            heterogeneous_generation = Some(generated.tokens);
+            heterogeneous_generation = Some(generated);
         } else if let Some(token_id) = decode_token {
             let logits = loaded.decode_step(token_id, position)?;
             let (argmax, max_logit) = logits
@@ -310,9 +310,14 @@ fn main() -> Result<(), String> {
                     tokenizer,
                     prompt_tokens,
                     generate,
-                    heterogeneous_generation
-                        .as_deref()
-                        .ok_or("heterogeneous generation missing for single-device comparison")?,
+                    &heterogeneous_generation
+                        .as_ref()
+                        .ok_or("heterogeneous generation missing for single-device comparison")?
+                        .tokens,
+                    &heterogeneous_generation
+                        .as_ref()
+                        .ok_or("heterogeneous generation missing for single-device comparison")?
+                        .snapshots,
                 )?;
             } else {
                 let token_id = decode_token
@@ -331,7 +336,21 @@ struct GenerationResult {
     tokens: Vec<u32>,
     prefill: Duration,
     decode: Duration,
+    snapshots: Vec<StateSnapshot>,
 }
+
+struct StateSnapshot {
+    position: usize,
+    tensors: Vec<SnapshotTensor>,
+}
+
+struct SnapshotTensor {
+    name: String,
+    exact_bits: bool,
+    values: Vec<f32>,
+}
+
+const CERTIFICATION_POSITIONS: [usize; 7] = [127, 511, 1023, 2047, 2175, 2303, 2555];
 
 fn greedy(logits: &[f32]) -> Result<u32, String> {
     if let Some((index, _)) = logits
@@ -353,8 +372,10 @@ fn generate_heterogeneous(
 ) -> Result<GenerationResult, String> {
     let prefill_start = Instant::now();
     let mut logits = Vec::new();
+    let mut snapshots = Vec::with_capacity(CERTIFICATION_POSITIONS.len());
     for (position, &token) in prompt.iter().enumerate() {
         logits = model.decode_step(token, position as u32)?;
+        capture_heterogeneous_if_selected(model, position, &mut snapshots)?;
     }
     let prefill = prefill_start.elapsed();
 
@@ -364,13 +385,282 @@ fn generate_heterogeneous(
     while tokens.len() < n_generate {
         let position = prompt.len() + tokens.len() - 1;
         logits = model.decode_step(tokens[tokens.len() - 1], position as u32)?;
+        capture_heterogeneous_if_selected(model, position, &mut snapshots)?;
         tokens.push(greedy(&logits)?);
     }
     Ok(GenerationResult {
         tokens,
         prefill,
         decode: decode_start.elapsed(),
+        snapshots,
     })
+}
+
+fn capture_heterogeneous_if_selected(
+    model: &DeepseekV4HeterogeneousModel,
+    position: usize,
+    snapshots: &mut Vec<StateSnapshot>,
+) -> Result<(), String> {
+    if CERTIFICATION_POSITIONS.contains(&position) {
+        snapshots.push(capture_state(
+            &model.dense_gpu,
+            model
+                .state
+                .as_ref()
+                .ok_or("heterogeneous state missing during certification")?,
+            position,
+        )?);
+    }
+    Ok(())
+}
+
+fn capture_single_if_selected(
+    gpu: &Gpu,
+    state: &DeepseekV4State,
+    position: usize,
+    snapshots: &mut Vec<StateSnapshot>,
+) -> Result<(), String> {
+    if CERTIFICATION_POSITIONS.contains(&position) {
+        snapshots.push(capture_state(gpu, state, position)?);
+    }
+    Ok(())
+}
+
+fn download_snapshot(
+    gpu: &Gpu,
+    tensors: &mut Vec<SnapshotTensor>,
+    name: impl Into<String>,
+    tensor: &GpuTensor,
+    exact_bits: bool,
+) -> Result<(), String> {
+    let name = name.into();
+    let values = gpu
+        .download_f32(tensor)
+        .map_err(|error| format!("certification download {name}: {error:?}"))?;
+    tensors.push(SnapshotTensor {
+        name,
+        exact_bits,
+        values,
+    });
+    Ok(())
+}
+
+fn capture_state(
+    gpu: &Gpu,
+    state: &DeepseekV4State,
+    position: usize,
+) -> Result<StateSnapshot, String> {
+    let mut tensors = Vec::new();
+    download_snapshot(
+        gpu,
+        &mut tensors,
+        "residual_streams",
+        state
+            .residual_streams
+            .as_ref()
+            .ok_or("certification residual_streams missing")?,
+        false,
+    )?;
+    download_snapshot(
+        gpu,
+        &mut tensors,
+        "kv",
+        state.kv.as_ref().ok_or("certification kv missing")?,
+        false,
+    )?;
+    download_snapshot(
+        gpu,
+        &mut tensors,
+        "final_norm",
+        state
+            .final_norm
+            .as_ref()
+            .ok_or("certification final_norm missing")?,
+        false,
+    )?;
+    download_snapshot(
+        gpu,
+        &mut tensors,
+        "attn_state_buf",
+        state
+            .attn_state_buf
+            .as_ref()
+            .ok_or("certification attn_state_buf missing")?,
+        true,
+    )?;
+    download_snapshot(
+        gpu,
+        &mut tensors,
+        "last_layer_route_ids",
+        state
+            .moe_topk_indices
+            .as_ref()
+            .ok_or("certification route ids missing")?,
+        true,
+    )?;
+    download_snapshot(
+        gpu,
+        &mut tensors,
+        "last_layer_route_weights",
+        state
+            .moe_topk_weights
+            .as_ref()
+            .ok_or("certification route weights missing")?,
+        false,
+    )?;
+
+    for layer in [0usize, 21, 42] {
+        let attention = state
+            ._attention
+            .get(layer)
+            .ok_or_else(|| format!("certification attention layer {layer} missing"))?;
+        download_snapshot(
+            gpu,
+            &mut tensors,
+            format!("layer_{layer}.swa_k"),
+            attention
+                .swa_k
+                .as_ref()
+                .ok_or_else(|| format!("certification layer {layer} swa_k missing"))?,
+            false,
+        )?;
+
+        let indexer = state
+            ._indexer
+            .get(layer)
+            .ok_or_else(|| format!("certification indexer layer {layer} missing"))?;
+        if indexer.compress_ratio > 0 {
+            let slot = position / indexer.compress_ratio as usize;
+            if let Some(cache) = indexer.main_kv_cache.as_ref() {
+                let width = *cache
+                    .shape
+                    .last()
+                    .ok_or("certification main cache has no shape")?;
+                let row = cache.sub_offset(slot * width, width);
+                download_snapshot(
+                    gpu,
+                    &mut tensors,
+                    format!("layer_{layer}.main_kv_cache[{slot}]"),
+                    &row,
+                    false,
+                )?;
+            }
+            if let Some(cache) = indexer.indexer_kv_cache.as_ref() {
+                let width = *cache
+                    .shape
+                    .last()
+                    .ok_or("certification indexer cache has no shape")?;
+                let row = cache.sub_offset(slot * width, width);
+                download_snapshot(
+                    gpu,
+                    &mut tensors,
+                    format!("layer_{layer}.indexer_kv_cache[{slot}]"),
+                    &row,
+                    false,
+                )?;
+            }
+        }
+    }
+    Ok(StateSnapshot { position, tensors })
+}
+
+fn compare_state_snapshots(
+    single: &[StateSnapshot],
+    heterogeneous: &[StateSnapshot],
+) -> Result<(), String> {
+    if single.len() != heterogeneous.len() {
+        return Err(format!(
+            "state snapshot count mismatch: single {} heterogeneous {}",
+            single.len(),
+            heterogeneous.len()
+        ));
+    }
+    for (single, heterogeneous) in single.iter().zip(heterogeneous) {
+        if single.position != heterogeneous.position
+            || single.tensors.len() != heterogeneous.tensors.len()
+        {
+            return Err(format!(
+                "state snapshot structure mismatch at {} vs {}",
+                single.position, heterogeneous.position
+            ));
+        }
+        let mut compared_values = 0usize;
+        let mut bit_mismatches = 0usize;
+        let mut max_abs = 0.0f32;
+        let mut max_rel = 0.0f32;
+        let mut worst_tensor = None;
+        let mut exact_bits_equal = true;
+        for (single_tensor, heterogeneous_tensor) in
+            single.tensors.iter().zip(&heterogeneous.tensors)
+        {
+            if single_tensor.name != heterogeneous_tensor.name
+                || single_tensor.values.len() != heterogeneous_tensor.values.len()
+                || single_tensor.exact_bits != heterogeneous_tensor.exact_bits
+            {
+                return Err(format!(
+                    "state tensor structure mismatch at position {}: {} vs {}",
+                    single.position, single_tensor.name, heterogeneous_tensor.name
+                ));
+            }
+            for (&expected, &actual) in single_tensor
+                .values
+                .iter()
+                .zip(&heterogeneous_tensor.values)
+            {
+                compared_values += 1;
+                if expected.to_bits() != actual.to_bits() {
+                    bit_mismatches += 1;
+                    if single_tensor.exact_bits {
+                        exact_bits_equal = false;
+                    }
+                }
+                if !expected.is_finite() || !actual.is_finite() {
+                    if expected.to_bits() != actual.to_bits() {
+                        return Err(format!(
+                            "non-finite state mismatch at position {} tensor {}",
+                            single.position, single_tensor.name
+                        ));
+                    }
+                    continue;
+                }
+                let abs = (expected - actual).abs();
+                let rel = abs / expected.abs().max(1.0e-12);
+                if abs > max_abs {
+                    max_abs = abs;
+                    worst_tensor = Some(single_tensor.name.as_str());
+                }
+                max_rel = max_rel.max(rel);
+            }
+        }
+        println!(
+            "{}",
+            serde_json::to_string(&json!({
+                "status": "state_oracle",
+                "position": single.position,
+                "tensors": single.tensors.len(),
+                "values": compared_values,
+                "bit_mismatches": bit_mismatches,
+                "exact_bits_equal": exact_bits_equal,
+                "max_abs": max_abs,
+                "max_rel": max_rel,
+                "worst_tensor": worst_tensor,
+            }))
+            .map_err(|error| error.to_string())?
+        );
+        if !exact_bits_equal {
+            return Err(format!(
+                "exact state/routing bits differ at position {}",
+                single.position
+            ));
+        }
+        if max_abs > 1.0e-3 {
+            return Err(format!(
+                "state numerical delta {} exceeds 1e-3 at position {} ({:?})",
+                max_abs, single.position, worst_tensor
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn compare_single_generation(
@@ -379,6 +669,7 @@ fn compare_single_generation(
     prompt: &[u32],
     n_generate: usize,
     heterogeneous: &[u32],
+    heterogeneous_snapshots: &[StateSnapshot],
 ) -> Result<(), String> {
     let mut hfq = HfqFile::open(model).map_err(|error| format!("single oracle open: {error:?}"))?;
     let mut cfg = DeepseekV4::config_from_hfq(&hfq)?;
@@ -396,9 +687,11 @@ fn compare_single_generation(
 
     let prefill_start = Instant::now();
     let mut logits = Vec::new();
+    let mut single_snapshots = Vec::with_capacity(CERTIFICATION_POSITIONS.len());
     for (position, &token) in prompt.iter().enumerate() {
         logits =
             forward::decode_step(&cfg, &weights, &mut state, &mut gpu, token, position as u32)?;
+        capture_single_if_selected(&gpu, &state, position, &mut single_snapshots)?;
     }
     let prefill = prefill_start.elapsed();
     let decode_start = Instant::now();
@@ -414,6 +707,7 @@ fn compare_single_generation(
             single[single.len() - 1],
             position as u32,
         )?;
+        capture_single_if_selected(&gpu, &state, position, &mut single_snapshots)?;
         single.push(greedy(&logits)?);
     }
     let decode = decode_start.elapsed();
@@ -443,6 +737,7 @@ fn compare_single_generation(
         }))
         .map_err(|error| error.to_string())?
     );
+    compare_state_snapshots(&single_snapshots, heterogeneous_snapshots)?;
 
     state.free_gpu(&mut gpu);
     weights.free_gpu(&mut gpu);
