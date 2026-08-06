@@ -6,9 +6,12 @@ use std::path::Path;
 
 use hip_bridge::HipRuntime;
 use hipfire_arch_deepseek4::{
-    DeepseekV4HeterogeneousFault, DeepseekV4HeterogeneousLoadPlan, DeepseekV4HeterogeneousModel,
-    DeepseekV4VerifiedArtifact,
+    forward, DeepseekV4, DeepseekV4HeterogeneousFault, DeepseekV4HeterogeneousLoadPlan,
+    DeepseekV4HeterogeneousModel, DeepseekV4State, DeepseekV4VerifiedArtifact,
 };
+use hipfire_runtime::arch::Architecture;
+use hipfire_runtime::hfq::HfqFile;
+use rdna_compute::Gpu;
 use serde_json::json;
 
 fn main() -> Result<(), String> {
@@ -24,6 +27,7 @@ fn main() -> Result<(), String> {
     let mut fault_matrix = false;
     let mut decode_token = None;
     let mut position = 0u32;
+    let mut compare_single = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--cycles" => {
@@ -72,6 +76,7 @@ fn main() -> Result<(), String> {
                     .parse::<u32>()
                     .map_err(|error| format!("invalid --position: {error}"))?;
             }
+            "--compare-single" => compare_single = true,
             other => return Err(format!("unknown argument '{other}'")),
         }
     }
@@ -193,6 +198,7 @@ fn main() -> Result<(), String> {
             }))
             .map_err(|error| error.to_string())?
         );
+        let mut heterogeneous_logits = None;
         if let Some(token_id) = decode_token {
             let logits = loaded.decode_step(token_id, position)?;
             let (argmax, max_logit) = logits
@@ -216,8 +222,99 @@ fn main() -> Result<(), String> {
                 }))
                 .map_err(|error| error.to_string())?
             );
+            heterogeneous_logits = Some(logits);
         }
         loaded.unload();
+        if compare_single {
+            let token_id = decode_token.ok_or("--compare-single requires --decode-token")?;
+            let heterogeneous_logits = heterogeneous_logits
+                .as_deref()
+                .ok_or("heterogeneous logits missing for single-device comparison")?;
+            compare_single_device(artifact.path(), token_id, position, heterogeneous_logits)?;
+        }
+    }
+    Ok(())
+}
+
+fn compare_single_device(
+    model: &Path,
+    token_id: u32,
+    position: u32,
+    heterogeneous: &[f32],
+) -> Result<(), String> {
+    let mut hfq = HfqFile::open(model).map_err(|error| format!("single oracle open: {error:?}"))?;
+    let cfg = DeepseekV4::config_from_hfq(&hfq)?;
+    let mut gpu = Gpu::init_with_device(1)
+        .map_err(|error| format!("single oracle gfx1151 init: {error:?}"))?;
+    if gpu.arch != "gfx1151" {
+        return Err(format!(
+            "single oracle device 1 resolved to {}, expected gfx1151",
+            gpu.arch
+        ));
+    }
+    let weights = DeepseekV4::load_weights(&mut hfq, &cfg, &mut gpu)?;
+    let mut state = DeepseekV4State::new(&cfg)?;
+    let single = forward::decode_step(&cfg, &weights, &mut state, &mut gpu, token_id, position)?;
+
+    if single.len() != heterogeneous.len() {
+        return Err(format!(
+            "single oracle logits length {} != heterogeneous {}",
+            single.len(),
+            heterogeneous.len()
+        ));
+    }
+    let mut bit_mismatches = 0usize;
+    let mut first_mismatch = None;
+    let mut max_abs = 0.0f32;
+    let mut max_rel = 0.0f32;
+    for (index, (&expected, &actual)) in single.iter().zip(heterogeneous).enumerate() {
+        if expected.to_bits() != actual.to_bits() {
+            bit_mismatches += 1;
+            first_mismatch.get_or_insert(index);
+        }
+        let abs = (expected - actual).abs();
+        max_abs = max_abs.max(abs);
+        max_rel = max_rel.max(abs / expected.abs().max(1.0e-12));
+    }
+    let single_argmax = single
+        .iter()
+        .enumerate()
+        .max_by(|left, right| left.1.total_cmp(right.1))
+        .map(|(index, _)| index)
+        .ok_or("single oracle returned no logits")?;
+    let heterogeneous_argmax = heterogeneous
+        .iter()
+        .enumerate()
+        .max_by(|left, right| left.1.total_cmp(right.1))
+        .map(|(index, _)| index)
+        .ok_or("heterogeneous route returned no logits")?;
+    println!(
+        "{}",
+        serde_json::to_string(&json!({
+            "status": "single_oracle",
+            "token_id": token_id,
+            "position": position,
+            "single_device_id": gpu.device_id,
+            "single_arch": gpu.arch,
+            "logits": single.len(),
+            "bit_mismatches": bit_mismatches,
+            "first_mismatch": first_mismatch,
+            "max_abs": max_abs,
+            "max_rel": max_rel,
+            "single_argmax": single_argmax,
+            "heterogeneous_argmax": heterogeneous_argmax,
+            "argmax_equal": single_argmax == heterogeneous_argmax,
+        }))
+        .map_err(|error| error.to_string())?
+    );
+
+    state.free_gpu(&mut gpu);
+    weights.free_gpu(&mut gpu);
+    gpu.invalidate_weight_caches();
+    gpu.invalidate_graph_state();
+    gpu.drain_pool();
+    if single_argmax != heterogeneous_argmax {
+        return Err("heterogeneous route argmax differs from the single-gfx1151 oracle".into());
     }
     Ok(())
 }
