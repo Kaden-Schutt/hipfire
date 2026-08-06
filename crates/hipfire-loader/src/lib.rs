@@ -31,6 +31,7 @@ use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama;
 use hipfire_runtime::llama::KvCache;
 use hipfire_runtime::loader_api::{CaskConfig, LoadCtx, ModelSource, SpecLoadCfg};
+use hipfire_runtime::moe_plan::{MoEExecutionKind, MoEExecutionPolicy};
 use hipfire_runtime::multi_gpu::{DeviceMesh, DimKind, Gpus};
 use hipfire_runtime::spec::{SpecEmit, SpecEmitCtx, SpecTargetGuard, Speculator};
 use hipfire_runtime::triattn::{EvictionCtx, TriAttnCenters};
@@ -1581,6 +1582,11 @@ pub enum EpArch {
         /// Per-rank int64 scratch for the reproducible EP i64 down path.
         /// Each buffer holds `hidden_size * 8` raw bytes; pre-zeroed per step.
         partials_i64: Vec<rdna_compute::GpuTensor>,
+        /// The exact EP execution policy of this model, built ONCE from the
+        /// same admitted mesh the `Gpus` are bound to (same mesh epoch). The
+        /// daemon threads `&policy` into every `forward_ep` call — never
+        /// reconstructed per token.
+        policy: MoEExecutionPolicy,
     },
     Minimax {
         config: minimax::MiniMaxConfig,
@@ -1590,6 +1596,11 @@ pub enum EpArch {
         /// Per-rank int64 scratch for the reproducible EP i64 down path.
         /// Each buffer holds `hidden_size * 8` raw bytes; pre-zeroed per step.
         partials_i64: Vec<rdna_compute::GpuTensor>,
+        /// The exact EP execution policy of this model, built ONCE from the
+        /// same admitted mesh the `Gpus` are bound to (same mesh epoch). The
+        /// daemon threads `&policy` into every `forward_ep` call — never
+        /// reconstructed per token.
+        policy: MoEExecutionPolicy,
     },
 }
 
@@ -3115,6 +3126,14 @@ fn load_model_ep_ds4(
     let rec = hfq.recommended_sampling();
 
     let ep = mesh.size_of(DimKind::Ep);
+    // The exact EP execution policy of this model, built ONCE from the SAME
+    // admitted mesh the `Gpus` below are bound to — the policy's mesh is a
+    // clone of `mesh`, so it carries the exact same mesh epoch (the sealed
+    // executor's mesh-identity check compares `policy.mesh()` against the
+    // Gpus-bound epoch). The daemon threads `&policy` into every
+    // `forward_ep` call; nothing reconstructs mesh/policy per token.
+    let policy = MoEExecutionPolicy::new(MoEExecutionKind::Ep, mesh.clone())
+        .map_err(|e| format!("ds4 EP policy from admitted mesh: {e:?}"))?;
     let gpus =
         Gpus::from_mesh(mesh, config.num_hidden_layers).map_err(|e| format!("from_mesh: {e:?}"))?;
     let n = gpus.devices.len();
@@ -3199,6 +3218,7 @@ fn load_model_ep_ds4(
                 state,
                 partials,
                 partials_i64,
+                policy,
             },
         }),
         meta: ModelMeta {
@@ -3262,6 +3282,14 @@ fn load_model_ep_minimax(
     let rec = hfq.recommended_sampling();
 
     let ep = mesh.size_of(DimKind::Ep);
+    // The exact EP execution policy of this model, built ONCE from the SAME
+    // admitted mesh the `Gpus` below are bound to — the policy's mesh is a
+    // clone of `mesh`, so it carries the exact same mesh epoch (the sealed
+    // executor's mesh-identity check compares `policy.mesh()` against the
+    // Gpus-bound epoch). The daemon threads `&model.policy` into every
+    // `forward_ep` call; nothing reconstructs mesh/policy per token.
+    let policy = MoEExecutionPolicy::new(MoEExecutionKind::Ep, mesh.clone())
+        .map_err(|e| format!("minimax EP policy from admitted mesh: {e:?}"))?;
     let gpus =
         Gpus::from_mesh(mesh, config.num_hidden_layers).map_err(|e| format!("from_mesh: {e:?}"))?;
     let n = gpus.devices.len();
@@ -3350,6 +3378,7 @@ fn load_model_ep_minimax(
                 state,
                 partials,
                 partials_i64,
+                policy,
             },
         }),
         meta: ModelMeta {

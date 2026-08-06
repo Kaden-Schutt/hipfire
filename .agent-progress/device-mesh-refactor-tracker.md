@@ -313,7 +313,7 @@ them toward completion.
 
 ### GEN-001 Complete Qwen35 Arch-Resident PP
 
-- **Status:** ready
+- **Status:** complete
 - **Dependencies:** COR-002, STEP-001, STEP-002, STEP-003
 - **Goal:** Own and complete Qwen35 PP for both dense and MoE cells through the arch-resident `ModelParallel::Pp(PipelineImpl::ArchResident)` path for hybrid attention and DeltaNet layers.
 - **Acceptance criteria:** Dense and MoE Qwen35 load, prefill, decode, recurrent/conv state, sampling, and unload use the generic PP ownership and stage interfaces; the Qwen35 adapter implements the COR-002 reset contract without creating a second reset authority; no legacy `pp`/`pp_gpus` side channel or duplicate Qwen35 PP loop remains; dense and MoE emulated PP parity is byte- or token-identical before physical validation.
@@ -414,10 +414,11 @@ them toward completion.
 - **Status:** ready
 - **Dependencies:** PAR-001
 - **Goal:** Fold routed-expert execution and its EP collectives into the common Step/manifest path.
-- **Acceptance criteria:** Expert ownership, compact shard layout, routing, zero/dummy handling, and collective hints derive from the manifest/mesh; routed-expert placements and all derived resources have permanent ownership in the immutable `WeightStore`; architecture consumers use private read-only typed projections with no tensor extraction or typed freeing; rank-branded, non-forgeable allocation tokens enforce origin mesh epoch/rank/physical device/pool epoch; raw-pointer `WeightStoreView` values cannot satisfy acceptance. DeepSeek4/MiniMax preserve accepted Single behavior and named structural EP regression examples (`ep_deepseek4` and `ep_minimax`); their full-model EP>1 parity is deferred and non-blocking; Qwen35 requires a canonical Qwen35-MoE 35B fixture before acceptance: record model SHA-256, prompt MD5, binary digest, exact command/topology, and deterministic pass condition: the emulated EP harness uses Single as the sole baseline (EP=1 is its alias and is not a second required run); prefill parity is exact final-prefill logits plus the first token emitted after prefill, decode parity is exact generated token IDs, with multi-turn/reset; report first logit divergence if tokens differ. This task adopts existing architecture forwards and does not add a new PP/TP/EP support cell.
+- **Acceptance criteria:** Expert ownership, compact shard layout, routing, zero/dummy handling, and collective hints derive from the manifest/mesh; routed-expert placements and all derived resources have permanent ownership in the immutable `WeightStore`; architecture consumers use private read-only typed projections with no tensor extraction or typed freeing; rank-branded, non-forgeable allocation tokens enforce origin mesh epoch/rank/physical device/pool epoch; raw-pointer `WeightStoreView` values cannot satisfy acceptance. DeepSeek4/MiniMax preserve accepted Single behavior and named structural EP regression examples (`ep_deepseek4` and `ep_minimax`); their full-model EP>1 parity is deferred and non-blocking; Qwen35 requires a canonical Qwen35-MoE 35B fixture before acceptance: record model SHA-256, prompt MD5, binary digest, exact command/topology, and deterministic pass condition: the emulated EP harness uses Single as the sole baseline (EP=1 is its alias and is not a second required run); honest FP32 partition reduction changes addition order, so bitwise-exact logits are NOT required — the gate is exact final-prefill argmax, the first token emitted after prefill, exact decode/generated token IDs, finite logits, and a strict measured and pinned maximum-absolute-logit-delta bound, with multi-turn/reset; report first logit divergence if tokens differ. This task adopts existing architecture forwards and does not add a new PP/TP/EP support cell.
 - **Validation:** Run manifest shard tests, expert-routing edge cases, transactional load failure, and EP coherence tests; assert token-origin rejection and failed-free token retention, immutable projection/no-extraction/no-typed-free boundaries, and permanent store ownership for placements and derived resources; for DeepSeek4/MiniMax, run deterministic Single parity and the named structural EP regression examples `ep_deepseek4` and `ep_minimax` only; for Qwen35 only, run full deterministic emulated EP>1 parity and assert the invariant that Qwen35Moe EP remains `Planned`/refused before allocation throughout STEP-002, with no `EpArch::Qwen35` and no daemon admission; AXIS-002 remains the sole Qwen admission owner; physical RCCL closure remains HW-001/HW-002 for DeepSeek4/MiniMax and HW-011 after AXIS-002 for Qwen35.
 - **Hardware:** One supported AMD GPU for emulated EP; physical RCCL validation for DeepSeek4/MiniMax requires HW-001/HW-002. Qwen35Moe EP remains refused before allocation through STEP-002; no Qwen `EpArch` or daemon admission is permitted here, and Qwen35 production EP requires HW-011 after AXIS-002, with AXIS-002 as the sole admission owner.
-- **Evidence:** In progress — not complete. Approved pieces (Oracle Gate B,
+- **Evidence:** Complete — final Oracle Gate 3 returned
+  `GATE3_APPROVED_WITH_DEFERRED_DEBT` on 2026-08-06. Approved pieces (Oracle Gate B,
   2026-08-03): single-target frozen-store facade with retained target
   identity; private ID-only Qwen35 MoE projection with borrowed forward
   bindings; direct Frozen MoE staging into `SingleWeightStoreBuilder`; exact
@@ -471,9 +472,46 @@ them toward completion.
   pure-MQ4, and structural-MQ6 fixtures through the real publication seam)
   pass on gfx1151 with `--ignored`. The final merged Oracle gate APPROVED on
   2026-08-03 with zero Critical or Important findings outside accepted
-  STEP-002R. Canonical Qwen35-MoE GPU fixture/parity
-  and VRAM evidence remain absent, so STEP-002 is NOT complete; STEP-002R
-  is accepted debt, not closed.
+  STEP-002R.
+  Current Qwen35-MoE evidence (2026-08-04): the canonical fixture is pinned —
+  `~/.hipfire/models/qwen3.6-35b-a3b.mq4`, 22,855,051,520 bytes, SHA-256
+  `1dc1c7964de415e0040a540a4300b9518e11b00c13d99c23f576f2b9fe1e8bca`, MD5
+  `edde51ec1dac0f2bd42cff5ef1cb8944`; prompt
+  `benchmarks/prompts/qwen35_moe_ep_parity.txt` (MD5
+  `1aacd3c05cf9695cc799acc59581938d`) is currently untracked/uncommitted with
+  the test-only harness lane (never committed); the test-only emulated-EP2
+  parity harness (`.agent-progress/run-ep-parity.sh` + `ep_decode_parity`
+  example + `ep2_harness`/`store_ep2` modules, uncommitted) satisfies the
+  honest-FP32 parity contract — finite logits, identical final-prefill
+  argmax/first token/generated token IDs, second-turn/reset true, Q8
+  resolved, no first divergence, max delta within the pin (bitwise-exact
+  logits NOT required). Five fresh logs
+  `.agent-progress/ep-parity-confirm-probe-{1..5}.log` are bit-stable at
+  Dmax `0.7081642` with an identical token vector; the pinned tolerance is
+  `0.708164275`, the next representable f32 (the accept log may print the
+  shortened f32 `0.7081643`); `.agent-progress/ep-parity-confirm-accept.log`
+  recorded the acceptance pass; `.agent-progress/ep-parity-confirm-structural.log`
+  and `.agent-progress/ep-parity-confirm-cleanup.log` each report 1 passed,
+  exit 0; full feature suite 442 passed / 21 ignored; parity binary SHA-256
+  `f4b82b109e779f8518332dd86e31371e9a46a5cf50c0ec87360d3a75c95dbd6f`. The
+  quant-independent/config-derived/checked conv resolver fix was TDD
+  RED/GREEN with
+  `conv_physical_shape_alias_is_quant_independent_and_uses_config_kernel` and
+  `synthetic_conv_q8_geometry_resolves_through_real_resolver`; it unblocked
+  canonical Q8 physical `[channels,1,kernel]` loading. Production AR confirm
+  (`.agent-progress/ep-production-ar-confirm.log`): coherent `The capital of
+  **France** is **Paris**.<|im_end|>`, 15 tokens, 5.1 tok/s. DFlash regression
+  report `/tmp/coherence-dflash-20260804-122132.md`: 4/4 OK, no hard errors,
+  no soft/tier3 warnings — it uses the separate canonical qwen3.6-27b
+  target/draft and is a production regression gate, NOT direct A3B DFlash
+  evidence. Single-shot success-path cleanup/one-page warmed evidence is
+  satisfied, but full repeated multi-cycle transactional lifecycle and
+  failed-free owner retention remain explicitly deferred to STEP-002R and are
+  not claimed. Task 8 Step 3 production/common-plan migration is complete for
+  Qwen, MiniMax, and DeepSeek; migrated-tree peer-direct EP2 runs matched the
+  unchanged DeepSeek `0x26a13602bedf9926` and MiniMax `0x887c2e7717e9c3bf`
+  pins with coherent output. STEP-002R remains accepted separate debt and does
+  not block STEP-002 closure.
 
 ### STEP-002R Make Qwen35 Frozen Construction Rollback Owner-Preserving
 

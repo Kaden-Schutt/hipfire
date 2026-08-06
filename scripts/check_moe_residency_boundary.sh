@@ -85,7 +85,8 @@ case "$mode" in
         # Populate a controlled violation fixture: every assertion group is
         # violated so the self-test proves the checks are not vacuous.  Each
         # expected category is asserted independently afterwards.
-        mkdir -p "$ROOT/crates/hipfire-arch-qwen35/src" "$ROOT/crates/hipfire-loader/src"
+        mkdir -p "$ROOT/crates/hipfire-arch-qwen35/src" "$ROOT/crates/hipfire-loader/src" \
+            "$ROOT/crates/hipfire-arch-qwen35/src/store"
         cat > "$ROOT/crates/hipfire-arch-qwen35/src/store.rs" <<'FIXTURE_EOF'
 // deliberate boundary-violation fixture for --self-test
 pub struct Qwen35MoeResident {
@@ -94,6 +95,13 @@ pub struct Qwen35MoeResident {
 }
 
 pub(crate) fn build_frozen_moe_resident() -> Result<(), ()> {
+    let raw = unsafe { DeviceBuffer::from_raw(ptr, size) };
+    let view = GpuTensor { buf: unsafe { t.buf.alias() }, shape: vec![], dtype: DType::F32 };
+    let _ = (raw, view);
+    Ok(())
+}
+
+fn build_frozen_moe_resident_inner() -> Result<(), ()> {
     let raw = unsafe { DeviceBuffer::from_raw(ptr, size) };
     let view = GpuTensor { buf: unsafe { t.buf.alias() }, shape: vec![], dtype: DType::F32 };
     let _ = (raw, view);
@@ -122,6 +130,69 @@ pub fn adopt(t: WeightStoreAllocation) {
 
 pub fn leak(x: WeightStoreAllocation) {
     let _ = x;
+}
+FIXTURE_EOF
+        cat > "$ROOT/crates/hipfire-arch-qwen35/src/store/store_ep2.rs" <<'FIXTURE_EOF'
+// deliberate boundary-violation fixture for --self-test: EP2 submodule
+// must not adopt raw buffers, alias tensors, hold tensor-owning fields,
+// expose public ownership surfaces, or import rejected vocabulary.
+pub(crate) struct Ep2DummyDescriptor {
+    t: GpuTensor,
+    w: WeightTensor,
+}
+
+pub(crate) struct EmulatedExpertPartitionPlan {
+    t: GpuTensor,
+}
+
+pub(super) struct Ep2LayerStaged {
+    t: GpuTensor,
+}
+
+pub(super) fn stage_ep2_layer() -> Result<(), ()> {
+    let raw = unsafe { DeviceBuffer::from_raw(ptr, size) };
+    let view = GpuTensor { buf: unsafe { t.buf.alias() }, shape: vec![], dtype: DType::F32 };
+    let _ = (raw, view);
+    Ok(())
+}
+
+impl Qwen35MoeResident {
+    fn bad(&self) -> () {
+        let raw = unsafe { DeviceBuffer::from_raw(ptr, size) };
+        let view = GpuTensor { buf: unsafe { t.buf.alias() }, shape: vec![], dtype: DType::F32 };
+        let _ = (raw, view);
+        let _ = WeightStoreView { ptr: std::ptr::null_mut() };
+    }
+}
+
+// Deliberate violations in a PRIVATE HELPER outside the named lexical
+// regions (stage_ep2_layer / impl Qwen35MoeResident): only the GLOBAL
+// file-wide from_raw/.alias rejection can catch these.
+fn private_helper() -> Result<(), ()> {
+    let raw = unsafe { DeviceBuffer::from_raw(ptr, size) };
+    let view = GpuTensor { buf: unsafe { t.buf.alias() }, shape: vec![], dtype: DType::F32 };
+    let _ = (raw, view);
+    Ok(())
+}
+
+pub fn leak(x: SingleFrozenWeightStore) {
+    let _ = x;
+}
+FIXTURE_EOF
+        cat > "$ROOT/crates/hipfire-arch-qwen35/src/ep2_harness.rs" <<'FIXTURE_EOF'
+// deliberate boundary-violation fixture for --self-test: the EP2 harness
+// driver must not adopt raw buffers, alias tensors, import rejected
+// vocabulary, or expose public ownership surfaces, and its single-shot
+// claim must PRECEDE Gpu::init (violated here on purpose).
+pub fn run() -> Result<(), ()> {
+    let _gpu = Gpu::init(); // deliberate ordering violation: init before the claim
+    let _ = try_claim_single_shot(&SINGLE_SHOT_CLAIM);
+    let raw = unsafe { DeviceBuffer::from_raw(ptr, size) };
+    let view = GpuTensor { buf: unsafe { t.buf.alias() }, shape: vec![], dtype: DType::F32 };
+    let _ = (raw, view);
+    let _ = WeightCellId::for_test(0);
+    let _ = EpArch::Qwen35;
+    Ok(())
 }
 FIXTURE_EOF
         cat > "$ROOT/crates/hipfire-arch-qwen35/src/vocab_fixture.rs" <<'FIXTURE_EOF'
@@ -388,6 +459,12 @@ run_checks() {
         '^pub\(crate\) fn build_frozen_moe_resident\(' "Frozen staging (build_frozen_moe_resident)"
     check_region_absent "$qwen_store" ".alias(" \
         '^pub\(crate\) fn build_frozen_moe_resident\(' "Frozen staging (build_frozen_moe_resident)"
+    # The production wrapper is a thin delegation shim; the real staging
+    # lives in the shared inner builder, which must be scanned too.
+    check_region_absent "$qwen_store" "DeviceBuffer::from_raw" \
+        '^fn build_frozen_moe_resident_inner\(' "Frozen staging (build_frozen_moe_resident_inner)"
+    check_region_absent "$qwen_store" ".alias(" \
+        '^fn build_frozen_moe_resident_inner\(' "Frozen staging (build_frozen_moe_resident_inner)"
     check_region_absent "$qwen_store" "DeviceBuffer::from_raw" \
         '^impl Qwen35MoeResident \{' "Frozen resident impl"
     check_region_absent "$qwen_store" ".alias(" \
@@ -396,6 +473,163 @@ run_checks() {
         '^impl(<[^>]*>)? MoeFfnBindings' "MoeFfnBindings impls"
     check_region_absent "$qwen_store" ".alias(" \
         '^impl(<[^>]*>)? MoeFfnBindings' "MoeFfnBindings impls"
+
+    # ── Check 3b: EP2 harness submodule purity ────────────────────────────
+    # The feature-gated `store/store_ep2.rs` stages rank tables and zero
+    # dummies into the SAME single-owner builder.  It must not adopt raw
+    # buffers, alias tensors, or give any struct a tensor-owning field, and
+    # its public surface must stay clean.  Guarded on file existence so a
+    # checkout without the harness feature is not penalized.
+    local ep2_module="$qwen_crate/store/store_ep2.rs"
+    if [[ -f "$ep2_module" ]]; then
+        check_region_absent "$ep2_module" "DeviceBuffer::from_raw" \
+            '^pub\(super\) fn stage_ep2_layer\(' "EP2 staging (stage_ep2_layer)"
+        check_region_absent "$ep2_module" ".alias(" \
+            '^pub\(super\) fn stage_ep2_layer\(' "EP2 staging (stage_ep2_layer)"
+        check_region_absent "$ep2_module" "DeviceBuffer::from_raw" \
+            '^impl Qwen35MoeResident \{' "EP2 resident impl"
+        check_region_absent "$ep2_module" ".alias(" \
+            '^impl Qwen35MoeResident \{' "EP2 resident impl"
+        check_region_absent "$ep2_module" "GpuTensor" \
+            '^pub\(crate\) struct Ep2DummyDescriptor' "Ep2DummyDescriptor struct (ID-only)"
+        check_region_absent "$ep2_module" "WeightTensor" \
+            '^pub\(crate\) struct Ep2DummyDescriptor' "Ep2DummyDescriptor struct (ID-only)"
+        check_region_absent "$ep2_module" "GpuTensor" \
+            '^pub\(crate\) struct EmulatedExpertPartitionPlan' "EmulatedExpertPartitionPlan struct (ID-only)"
+        check_region_absent "$ep2_module" "WeightTensor" \
+            '^pub\(crate\) struct EmulatedExpertPartitionPlan' "EmulatedExpertPartitionPlan struct (ID-only)"
+        check_region_absent "$ep2_module" "GpuTensor" \
+            '^pub\(super\) struct Ep2LayerStaged' "Ep2LayerStaged struct (ID-only)"
+        check_region_absent "$ep2_module" "WeightTensor" \
+            '^pub\(super\) struct Ep2LayerStaged' "Ep2LayerStaged struct (ID-only)"
+        # GLOBAL file-wide rejection (not region-scoped): from_raw and .alias(
+        # are forbidden ANYWHERE in the EP2 submodule — a private helper or
+        # any other out-of-region function must be caught too.  Doc-comment
+        # lines are skipped exactly like the from_raw whitelist skips `///`.
+        for symbol in "DeviceBuffer::from_raw" ".alias("; do
+            status=0
+            hits=$(rg -n -F "$symbol" "$ep2_module" 2>/dev/null) || status=$?
+            if [[ $status -eq 0 ]]; then
+                matches=$(grep -vE '^[0-9]+:[[:space:]]*//' <<<"$hits" || true)
+                if [[ -n "$matches" ]]; then
+                    fail "$symbol appears in the EP2 submodule outside a doc comment:\n$matches"
+                fi
+            elif [[ $status -ne 1 ]]; then
+                fail "rg exited with status $status while scanning the EP2 submodule for $symbol"
+            fi
+        done
+        # Rejected ownership vocabulary must not sneak in through the
+        # untracked feature-gated module (git grep only sees tracked files).
+        # Doc comments (line 9's `never constructs EpArch::Qwen35`) are
+        # legitimate refusal documentation and are skipped, exactly like the
+        # from_raw whitelist skips `///` lines.
+        for symbol in \
+            ExpertShardResident \
+            ExpertShardAssembly \
+            ExpertShardResourceKind \
+            ExpertShardResource \
+            ExpertShardTarget \
+            ExpertShardSlot \
+            WeightStoreView \
+            store_owned \
+            EpArch::Qwen35 \
+            WeightCellId::for_test; do
+            status=0
+            hits=$(rg -n -F "$symbol" "$ep2_module" 2>/dev/null) || status=$?
+            if [[ $status -eq 0 ]]; then
+                matches=$(grep -vE '^[0-9]+:[[:space:]]*//' <<<"$hits" || true)
+                if [[ -n "$matches" ]]; then
+                    fail "$symbol remains in Rust sources under crates/:\n$matches"
+                fi
+            elif [[ $status -ne 1 ]]; then
+                fail "rg exited with status $status while checking $symbol in the EP2 submodule"
+            fi
+        done
+        status=0
+        matches=$(rg -n -e 'pub fn [^(]*\b(SingleFrozenWeightStore|SingleWeightStoreBuilder|WeightStoreAllocation)\b' \
+            -e 'pub fn (adopt|alloc_raw|into_raw|take_raw|leak)\b' "$ep2_module" 2>/dev/null) || status=$?
+        if [[ $status -eq 0 ]]; then
+            fail "public raw ownership surface in the qwen35 EP2 submodule:\n$matches"
+        elif [[ $status -ne 1 ]]; then
+            fail "rg exited with status $status while checking the qwen35 EP2 submodule public ownership surface"
+        fi
+    fi
+
+    # ── Check 3c: EP2 harness driver module purity ────────────────────────
+    # `ep2_harness.rs` (Phase 2B) is the high-level driver.  It must not
+    # adopt raw buffers, alias tensors, import rejected ownership
+    # vocabulary (outside doc comments), or expose a public raw ownership
+    # surface.  `HarnessState` may OWN state objects (scratch/KV/DeltaNet —
+    # the harness's explicit two-independent-states contract) but never raw
+    # `DeviceBuffer`s or per-resident tensor fields.
+    local ep2_harness="$qwen_crate/ep2_harness.rs"
+    if [[ -f "$ep2_harness" ]]; then
+        for symbol in "DeviceBuffer::from_raw" ".alias("; do
+            status=0
+            hits=$(rg -n -F "$symbol" "$ep2_harness" 2>/dev/null) || status=$?
+            if [[ $status -eq 0 ]]; then
+                matches=$(grep -vE '^[0-9]+:[[:space:]]*//' <<<"$hits" || true)
+                if [[ -n "$matches" ]]; then
+                    fail "$symbol appears in the EP2 harness module outside a doc comment:\n$matches"
+                fi
+            elif [[ $status -ne 1 ]]; then
+                fail "rg exited with status $status while scanning the EP2 harness module for $symbol"
+            fi
+        done
+        for symbol in \
+            ExpertShardResident \
+            ExpertShardAssembly \
+            ExpertShardResourceKind \
+            ExpertShardResource \
+            ExpertShardTarget \
+            ExpertShardSlot \
+            WeightStoreView \
+            store_owned \
+            EpArch::Qwen35 \
+            WeightCellId::for_test; do
+            status=0
+            hits=$(rg -n -F "$symbol" "$ep2_harness" 2>/dev/null) || status=$?
+            if [[ $status -eq 0 ]]; then
+                matches=$(grep -vE '^[0-9]+:[[:space:]]*//' <<<"$hits" || true)
+                if [[ -n "$matches" ]]; then
+                    fail "$symbol remains in Rust sources under crates/:\n$matches"
+                fi
+            elif [[ $status -ne 1 ]]; then
+                fail "rg exited with status $status while checking $symbol in the EP2 harness module"
+            fi
+        done
+        status=0
+        matches=$(rg -n -e 'pub fn [^(]*\b(SingleFrozenWeightStore|SingleWeightStoreBuilder|WeightStoreAllocation)\b' \
+            -e 'pub fn (adopt|alloc_raw|into_raw|take_raw|leak)\b' "$ep2_harness" 2>/dev/null) || status=$?
+        if [[ $status -eq 0 ]]; then
+            fail "public raw ownership surface in the qwen35 EP2 harness module:\n$matches"
+        elif [[ $status -ne 1 ]]; then
+            fail "rg exited with status $status while checking the qwen35 EP2 harness module public ownership surface"
+        fi
+        # ── Single-shot claim ordering ────────────────────────────────────
+        # The harness is single-shot per process (STEP-002R debt): `run`
+        # must claim the AtomicBool permit BEFORE `Gpu::init` so a second
+        # GPU-bearing invocation in the same process is refused before any
+        # GPU work.  The claim call must lexically precede the GPU init in
+        # the `fn run(` region.  Comment lines are skipped (the docs may
+        # legitimately mention `Gpu::init`).
+        run_start=$(region_lines "$ep2_harness" '^pub fn run\(' | head -1 || true)
+        if [[ -n "$run_start" ]]; then
+            claim_line=$(sed -n "${run_start},\$p" "$ep2_harness" \
+                | grep -vE '^[[:space:]]*//' \
+                | grep -n -m1 -F "try_claim_single_shot" | cut -d: -f1 || true)
+            init_line=$(sed -n "${run_start},\$p" "$ep2_harness" \
+                | grep -vE '^[[:space:]]*//' \
+                | grep -n -m1 -F "Gpu::init" | cut -d: -f1 || true)
+            if [[ -z "$claim_line" ]]; then
+                fail "single-shot claim (try_claim_single_shot) missing from fn run in the EP2 harness module"
+            elif [[ -z "$init_line" ]]; then
+                fail "Gpu::init missing from fn run in the EP2 harness module"
+            elif ((claim_line >= init_line)); then
+                fail "single-shot claim must precede Gpu::init in fn run (claim at relative $claim_line, init at $init_line)"
+            fi
+        fi
+    fi
 
     # Every remaining DeviceBuffer::from_raw in the qwen35 crate must be
     # inside a whitelisted legacy-domain region.
@@ -490,6 +724,22 @@ expected_categories=(
     "id-only-projection|GpuTensor appears inside Qwen35MoeResident struct"
     "frozen-from-raw|DeviceBuffer::from_raw appears inside Frozen staging"
     "frozen-alias|\.alias\( appears inside Frozen staging"
+    "inner-from-raw|DeviceBuffer::from_raw appears inside Frozen staging \(build_frozen_moe_resident_inner\)"
+    "inner-alias|\.alias\( appears inside Frozen staging \(build_frozen_moe_resident_inner\)"
+    "ep2-staging-from-raw|DeviceBuffer::from_raw appears inside EP2 staging \(stage_ep2_layer\)"
+    "ep2-staging-alias|\.alias\( appears inside EP2 staging \(stage_ep2_layer\)"
+    "ep2-resident-from-raw|DeviceBuffer::from_raw appears inside EP2 resident impl"
+    "ep2-resident-alias|\.alias\( appears inside EP2 resident impl"
+    "ep2-global-from-raw|DeviceBuffer::from_raw appears in the EP2 submodule outside a doc comment"
+    "ep2-global-alias|\.alias\( appears in the EP2 submodule outside a doc comment"
+    "ep2-dummy-desc-fields|GpuTensor appears inside Ep2DummyDescriptor struct"
+    "ep2-plan-fields|GpuTensor appears inside EmulatedExpertPartitionPlan struct"
+    "ep2-staged-fields|GpuTensor appears inside Ep2LayerStaged struct"
+    "ep2-submodule-vocab|WeightStoreView remains in Rust sources under crates/"
+    "ep2-surface|public raw ownership surface in the qwen35 EP2 submodule"
+    "harness-from-raw|DeviceBuffer::from_raw appears in the EP2 harness module outside a doc comment"
+    "harness-alias|\.alias\( appears in the EP2 harness module outside a doc comment"
+    "single-shot-claim|single-shot claim must precede Gpu::init"
     "from-raw-whitelist|outside the whitelisted legacy regions"
     "check4-token|typed free authority WeightStoreAllocation appears in the qwen35 crate"
     "check4-surface|public raw ownership surface in the qwen35 crate"

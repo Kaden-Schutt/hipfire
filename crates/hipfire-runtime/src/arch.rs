@@ -174,7 +174,10 @@ pub trait Architecture: Send + 'static {
     /// Declarative MoE expert-group manifest. The runtime resolves global
     /// expert ids to owners and compact local slots; non-MoE architectures
     /// retain their existing behavior through the empty default.
-    fn expert_group_manifest(_cfg: &Self::Config) -> Vec<crate::weight_manifest::ExpertGroupSpec> {
+    fn expert_group_manifest(
+        _cfg: &Self::Config,
+        _policy: &crate::moe_plan::MoEExecutionPolicy,
+    ) -> Vec<crate::weight_manifest::ExpertGroupSpec> {
         Vec::new()
     }
 

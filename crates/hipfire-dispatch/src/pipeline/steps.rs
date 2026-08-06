@@ -12,10 +12,15 @@ use crate::context::DispatchCtx;
 use crate::families::fused_qkv::{FusedQkvFamily, FusedQkvParams};
 use crate::families::gemv::{GemvFamily, GemvParams, RotateInputs, WeightRef};
 use crate::families::moe::{
+    deepseek_f32_down_indexed_form, deepseek_gate_up_indexed_form, deepseek_i64_down_indexed_form,
+    grouped_down_projection, indexed_moe_batch_guard, launch_fused_shared_gate,
     launch_grouped_down, launch_grouped_gate_up, launch_indexed_down, launch_indexed_down_residual,
-    launch_indexed_down_residual_i64, launch_indexed_gate_up, launch_moe_activation,
-    launch_moe_combine, launch_moe_combine_grouped, launch_moe_route, launch_moe_scatter,
-    launch_moe_unscatter, launch_score_activation, MoeExpertRef,
+    launch_indexed_down_residual_i64, launch_indexed_down_residual_i64_batched,
+    launch_indexed_gate_up, launch_indexed_gate_up_batched, launch_moe_activation,
+    launch_moe_combine, launch_moe_combine_grouped, launch_moe_gate_up_unscatter, launch_moe_route,
+    launch_moe_scatter, launch_moe_softmax_topk, launch_qwen_down_indexed,
+    launch_qwen_gate_up_indexed, launch_scaled_add_gpu_scalar, launch_score_activation,
+    launch_shared_expert_down_body, launch_shared_gate_side, DeepSeekIndexedForm, MoeExpertRef,
 };
 use crate::families::rotation::{RotationFamily, RotationParams};
 use crate::types::GemvVariant;
@@ -64,6 +69,22 @@ pub enum MoeActivationVariant<'a> {
     MinimaxFused { awq_scale: Option<&'a GpuTensor> },
     /// ds4: silu·mul·CLAMP (in-place into `gate`) then a SEPARATE FWHT rotate. Two kernels.
     Ds4ClampRotate { swiglu_limit: f32 },
+    /// qwen: fused silu·mul + FWHT rotate with PER-EXPERT AWQ scales selected
+    /// by the top-K slot (`fused_silu_mul_rotate_mq_awq_indexed_batched`).
+    /// Used when the routed experts carry per-expert down `awq_scale` sidecars.
+    QwenAwqIndexed {
+        awq_ptrs: &'a GpuTensor,
+        topk_indices: &'a GpuTensor,
+    },
+    /// qwen Paro: fused silu·mul + Givens rotate
+    /// (`fused_silu_mul_givens_rotate_f32`). `k_top` carries the row count
+    /// (k_top for decode, batch·k_top for prefill).
+    QwenParo {
+        pairs: &'a GpuTensor,
+        theta: &'a GpuTensor,
+        scales: &'a GpuTensor,
+        krot: usize,
+    },
 }
 
 pub enum MoeProj<'a> {
@@ -83,6 +104,21 @@ pub enum MoeProj<'a> {
     /// [`Step::ConvertI64ToF32`] converts the summed int64 into the FP partial.
     /// EP path stays on `DownResidual` (FP). Only used when `tp > 1`.
     DownResidualI64 { topk_weights: &'a GpuTensor },
+}
+
+/// Down-projection shape discriminant for [`Step::MoeDownIndexed`] (qwen).
+///
+/// - **Expanded**: writes per-expert outputs to `out` (= `down_expanded`); a
+///   separate [`Step::MoeCombine`] folds them with `topk_weights` into the EP
+///   partial. Serves the decode down (all indexable dtypes) and prefill
+///   Path 1 (batched).
+/// - **ResidualScaled**: the kernel folds the weighted combine into the
+///   atomic accumulation itself and writes directly into `out` — the EP
+///   partial or `x_batch` (prefill Path 0, MQ4). No [`Step::MoeCombine`]
+///   follows — that would double-accumulate.
+pub enum QwenDownMode<'a> {
+    Expanded,
+    ResidualScaled { topk_weights: &'a GpuTensor },
 }
 
 /// Borrowed execution shape for the DeltaNet recurrence. The six semantic
@@ -595,7 +631,7 @@ pub enum Step<'a> {
         n_experts: usize,
         route_scale: f32,
     },
-    /// Indexed per-expert GEMV for the top-K selected experts (decode, B=1).
+    /// Indexed per-expert GEMV for the top-K selected experts.
     ///
     /// Three shapes via `which` (see [`MoeProj`]):
     /// - `GateUp`: gate+up → `out` = gate_batch, `which.up_out` = up_batch.
@@ -605,6 +641,15 @@ pub enum Step<'a> {
     ///   `batch_size` is consumed; MQ3L is unsupported (use `DownResidual`).
     /// - `DownResidual`: down + weighted-combine fused (MQ2L/MQ3L) → `out` = EP partial.
     ///   `which.topk_weights` carries weights. No [`Step::MoeCombine`] follows.
+    /// - `DownResidualI64`: reproducible S-scaled int64 accumulator (MQ2L/MQ3L
+    ///   scalar, MQ2L batched) → `out` = i64 partial. A later
+    ///   [`Step::ConvertI64ToF32`] converts it.
+    ///
+    /// `batch_size` is the authoritative routed batch: `1` keeps the scalar
+    /// launchers byte-identically, `> 1` selects the DeepSeek batched
+    /// MQ2-Lloyd kernels for `GateUp` / `DownResidualI64` (never a scalar
+    /// fallback), `0` is rejected before dispatch, and `DownResidual` (FP32)
+    /// rejects `> 1` explicitly. `DownExpanded` consumes it as before.
     ///
     /// `tp_step_out_buf` returns `Some(&out.buf)` only for `DownResidual`
     /// (the partial that the EP all-reduce reduces over).
@@ -617,7 +662,9 @@ pub enum Step<'a> {
         /// gate_batch for GateUp, down_expanded for DownExpanded, EP partial for DownResidual.
         out: &'a GpuTensor,
         k_top: usize,
-        /// Used by DownExpanded; ignored by GateUp and DownResidual.
+        /// Routed batch (authoritative): 1 = scalar launchers, > 1 = DeepSeek
+        /// batched MQ2-Lloyd kernels (GateUp / DownResidualI64), 0 = rejected
+        /// before dispatch. DownExpanded consumes it as before.
         batch_size: usize,
     },
     /// Weighted combine of per-expert expanded down outputs into the EP partial.
@@ -668,6 +715,12 @@ pub enum Step<'a> {
     ///   `up_out` in `MoeProj::GateUp` is unused by the grouped kernel (output is `y`).
     /// - `DownExpanded`: `m = expert_k`, `x_row_div = 1`, `rows = batch*k_top`.
     ///   Writes down output to `y` (y_down_grouped) for [`Step::MoeCombine`].
+    ///   The residual projections are structurally rejected (no grouped
+    ///   residual-fused down kernel exists).
+    ///
+    /// `dtype_tags` selects the merged per-expert grouped kernel (graded
+    /// files); `force_mq4_fp16`, `paro_i8`, `paro_i8_k8` carry the grouped
+    /// controls from [`crate::families::moe::MoePrefillResolution`].
     ///
     /// `tp_step_out_buf` returns `None` — `y` is an intermediate, not an EP partial.
     GroupedMoeGemm {
@@ -682,16 +735,25 @@ pub enum Step<'a> {
         m_total: usize,
         batch_size: usize,
         k_top: usize,
+        /// Per-expert mixed dtype-tag table (graded files). `None` = uniform.
+        dtype_tags: Option<&'a GpuTensor>,
+        /// MQ4 grouped prefill uses FP16 WMMA for mixed MQ6-promoted checkpoints.
+        force_mq4_fp16: bool,
+        /// gfx1151 Paro i8 MMQ grouped GEMM levers.
+        paro_i8: bool,
+        paro_i8_k8: bool,
     },
-    /// Unscatter grouped gate_up result: `y_grouped → gate_batch + up_batch`.
-    /// Delegates to [`launch_moe_unscatter`]. Call after [`Step::GroupedMoeGemm`]
-    /// with `which = GateUp`. `tp_step_out_buf` returns `None`.
-    MoeUnscatter {
+    /// Deinterleave the grouped gate_up result: `y_grouped → gate_batch +
+    /// up_batch`. Delegates to [`launch_moe_gate_up_unscatter`]. Call after
+    /// [`Step::GroupedMoeGemm`] with `which = GateUp`, before activation —
+    /// there is no post-down unscatter Step or kernel. `tp_step_out_buf`
+    /// returns `None`.
+    MoeGateUpUnscatter {
         y_grouped: &'a GpuTensor,
         sorted_slot_index: &'a GpuTensor,
         gate_batch: &'a GpuTensor,
         up_batch: &'a GpuTensor,
-        mi: usize,
+        inter: usize,
         k_top: usize,
         m_total: usize,
     },
@@ -703,9 +765,13 @@ pub enum Step<'a> {
         kind: ScoreActKind,
     },
     /// SwiGLU activation + FWHT re-rotate of the gate/up intermediate, per-arch.
-    /// Reads `gate`, `up` `[k_top × inter]`; writes `rot_out` `[k_top × inter]`
+    /// Reads `gate`, `up` `[rows × inter]`; writes `rot_out` `[rows × inter]`
     /// consumed by the down Step. `tp_step_out_buf` returns `None` (intermediate,
     /// not an EP partial). Block-diagonal per-256 → shards trivially under D2b.
+    ///
+    /// `k_top` is the routed row count at launch: `k_top` for decode,
+    /// `batch_size·k_top` for batched prefill (DeepSeek supplies the checked
+    /// product). The executor binds it as local `rows`.
     MoeActivation {
         variant: MoeActivationVariant<'a>,
         gate: &'a GpuTensor,
@@ -723,6 +789,122 @@ pub enum Step<'a> {
         src: &'a GpuTensor,
         dst: &'a GpuTensor,
         n: usize,
+    },
+    // ── Qwen MoE Step-native ops (STEP-002 Phase 1) ───────────────────────
+    // Semantic operations the pre-existing Step surface could not express.
+    // All launch exactly the kernels the legacy `run_moe_decode` /
+    // `run_moe_prefill` executors dispatched; the legacy executors now build
+    // these programs and execute them (single production path). The CPU-top-K
+    // fallback stays an explicit non-Step leaf.
+    /// Softmax + renormalized top-K routing (qwen decode GPU path). Two
+    /// launches in one step — `softmax_f32(logits)` then
+    /// `moe_topk_renorm_k8(logits, topk_indices, topk_weights, n_exp,
+    /// norm_topk_prob)` — preserving the legacy launch order. Prefill routing
+    /// stays model-owned (no step).
+    MoeSoftmaxTopK {
+        logits: &'a GpuTensor,
+        topk_indices: &'a GpuTensor,
+        topk_weights: &'a GpuTensor,
+        n_exp: usize,
+        norm_topk_prob: bool,
+    },
+    /// Fused gate-side projection (qwen decode, MQ4 gate side): one launch of
+    /// `fused_qkvza_hfq4g256` over the single FWHT-rotated `x_rot` writing
+    /// router logits, the shared-expert scalar, shared gate, and shared up.
+    /// The shared gate/up outputs are the `[0, smi)` slice views of
+    /// `gate_buf`/`up_buf` (created by the launcher — the views are ephemeral).
+    /// The non-fusable gate side is `MoeSharedGateSide` instead.
+    MoeFusedSharedGate {
+        router: &'a WeightRef<'a>,
+        shared_expert_gate: &'a WeightRef<'a>,
+        shared_gate_w: &'a WeightRef<'a>,
+        shared_up_w: &'a WeightRef<'a>,
+        x_rot: &'a GpuTensor,
+        router_logits: &'a GpuTensor,
+        scalar_buf: &'a GpuTensor,
+        gate_buf: &'a GpuTensor,
+        up_buf: &'a GpuTensor,
+        smi: usize,
+    },
+    /// Per-weight gate-side projection (qwen decode, non-fusable gate side):
+    /// the router and shared-expert gate GEMVs always re-rotate from `x_norm`;
+    /// the shared gate/up GEMVs reuse the pre-rotated `x_rot_local` only when
+    /// the shared-prerotation decision applies (extracted helper), else they
+    /// re-rotate too. Mirrors the legacy four-GEMV gate side exactly.
+    MoeSharedGateSide {
+        router: &'a WeightRef<'a>,
+        shared_expert_gate: &'a WeightRef<'a>,
+        shared_gate_w: &'a WeightRef<'a>,
+        shared_up_w: &'a WeightRef<'a>,
+        x_norm: &'a GpuTensor,
+        x_rot_local: Option<&'a GpuTensor>,
+        router_logits: &'a GpuTensor,
+        scalar_buf: &'a GpuTensor,
+        gate_buf: &'a GpuTensor,
+        up_buf: &'a GpuTensor,
+        smi: usize,
+    },
+    /// Shared-expert down body (qwen decode). One step for both body forms:
+    /// MQ4 (fused silu·mul·rotate + `gemv_hfq4g256_residual_sigmoid_scaled_gpu`)
+    /// and non-MQ4 (sigmoid → silu·mul → GEMV). The non-MQ4 builder appends a
+    /// standalone [`Step::ScaledAdd`]. `out_target` is
+    /// the EP partial when `routed_out` is set, else `x_residual`.
+    /// `tp_step_out_buf` returns `None` — the shared accumulation is not a
+    /// collective partial (EP drives it via the routed partial step).
+    MoeSharedDown {
+        w: &'a WeightRef<'a>,
+        gate_buf: &'a GpuTensor,
+        up_buf: &'a GpuTensor,
+        scalar_buf: &'a GpuTensor,
+        ffn_hidden: &'a GpuTensor,
+        ffn_out: &'a GpuTensor,
+        out_target: &'a GpuTensor,
+        smi: usize,
+    },
+    /// In-place scaled add `x += y * scale` with a device-side `scale`
+    /// (`scaled_add_inplace_gpu_scalar_f32`). The non-MQ4 shared-down builder
+    /// emits this immediately after [`Step::MoeSharedDown`]; the CPU fallback
+    /// wrapper reuses the same launch function.
+    ScaledAdd {
+        x: &'a GpuTensor,
+        y: &'a GpuTensor,
+        scale: &'a GpuTensor,
+    },
+    /// Qwen routed gate_up indexed GEMV for the forms [`Step::IndexedMoeGemv`]
+    /// cannot express: Paro (Givens), MFP4-E8, MQ5, per-expert mixed dtype
+    /// tags, and the batched prefill forms. `batch_size == 1` selects the
+    /// decode kernels; `> 1` the batched kernels (prefill Path 1).
+    /// `dtype_tags = Some` selects the merged per-expert mixed kernel
+    /// (decode only; graded prefill runs the grouped path). The fused
+    /// gate||up output writes `gate_batch`/`up_batch` (m = 2·expert_m rows).
+    /// `tp_step_out_buf` returns `None` — gate_batch is an intermediate.
+    MoeGateUpIndexed {
+        experts: &'a MoeExpertRef<'a>,
+        topk_indices: &'a GpuTensor,
+        x_rot: &'a GpuTensor,
+        gate_batch: &'a GpuTensor,
+        up_batch: &'a GpuTensor,
+        k_top: usize,
+        batch_size: usize,
+        dtype_tags: Option<&'a GpuTensor>,
+    },
+    /// Qwen routed down indexed GEMV: the expanded per-expert write (decode +
+    /// prefill Path 1, `mode = Expanded`) or the atomic residual-scaled
+    /// accumulation (prefill Path 0, `mode = ResidualScaled`). Covers the
+    /// dtypes [`Step::IndexedMoeGemv`] cannot express (Paro, E8, MQ5, mixed
+    /// tags) plus the batched prefill forms; m = expert_k, k = expert_m.
+    /// `tp_step_out_buf` returns `Some(out.buf)` only for `ResidualScaled`
+    /// (the atomic down IS the EP partial); `Expanded` writes `down_expanded`,
+    /// an intermediate.
+    MoeDownIndexed {
+        experts: &'a MoeExpertRef<'a>,
+        topk_indices: &'a GpuTensor,
+        rot_batch: &'a GpuTensor,
+        out: &'a GpuTensor,
+        k_top: usize,
+        batch_size: usize,
+        mode: QwenDownMode<'a>,
+        dtype_tags: Option<&'a GpuTensor>,
     },
     // ── Note (Task 6): ds4 `hc_ffn_mix` is intentionally NOT a Step variant ──
     // The ds4 MoE tail mixes the EP all-reduced `ffn_out` partial into
@@ -776,13 +958,24 @@ fn op_kind(step: &Step) -> PipelineOp {
         // MoE prefill grouped ops (Task 5). Not fusible.
         Step::MoeScatter { .. } => PipelineOp::MoeScatter,
         Step::GroupedMoeGemm { .. } => PipelineOp::GroupedMoeGemm,
-        Step::MoeUnscatter { .. } => PipelineOp::MoeUnscatter,
+        Step::MoeGateUpUnscatter { .. } => PipelineOp::MoeGateUpUnscatter,
         // Elementwise pre-op before MoeRoute; tag is irrelevant to fusion.
         Step::ScoreActivation { .. } => PipelineOp::RmsnormAutomatic,
         // SwiGLU + FWHT rotate intermediate; not fusible.
         Step::MoeActivation { .. } => PipelineOp::RmsnormAutomatic,
         // Post-reduce int64→f32 convert; not fusible.
         Step::ConvertI64ToF32 { .. } => PipelineOp::RmsnormAutomatic,
+        // ── Qwen MoE Step-native ops (STEP-002 Phase 1). Not fusible — no
+        // entry in FUSED_TABLE. Elementwise/pre-routing ops reuse the
+        // RmsnormAutomatic tag (mirrors ScoreActivation/MoeActivation); the
+        // indexed routed projections reuse the IndexedMoeGemv tag.
+        Step::MoeSoftmaxTopK { .. } => PipelineOp::RmsnormAutomatic,
+        Step::MoeFusedSharedGate { .. } => PipelineOp::RmsnormAutomatic,
+        Step::MoeSharedGateSide { .. } => PipelineOp::RmsnormAutomatic,
+        Step::MoeSharedDown { .. } => PipelineOp::RmsnormAutomatic,
+        Step::ScaledAdd { .. } => PipelineOp::RmsnormAutomatic,
+        Step::MoeGateUpIndexed { .. } => PipelineOp::IndexedMoeGemv,
+        Step::MoeDownIndexed { .. } => PipelineOp::IndexedMoeGemv,
     }
 }
 
@@ -1496,7 +1689,9 @@ fn tp_step_out_buf<'a>(step: &'a Step) -> Option<&'a hip_bridge::DeviceBuffer> {
             ..
         } => Some(&out.buf),
         // Prefill grouped ops: intermediates, never EP partials.
-        Step::MoeScatter { .. } | Step::GroupedMoeGemm { .. } | Step::MoeUnscatter { .. } => None,
+        Step::MoeScatter { .. } | Step::GroupedMoeGemm { .. } | Step::MoeGateUpUnscatter { .. } => {
+            None
+        }
         // Score activation is a pre-routing elementwise op; no EP partial.
         Step::ScoreActivation { .. } => None,
         // MoeActivation is an intermediate (not an EP partial).
@@ -1504,6 +1699,27 @@ fn tp_step_out_buf<'a>(step: &'a Step) -> Option<&'a hip_bridge::DeviceBuffer> {
         // ConvertI64ToF32: on the EP i64 path (ZeroI64Only→DownResidualI64→ConvertI64ToF32→AllReduce{Ep}),
         // the f32 `dst` IS the EP partial that the AllReduce{Ep} collective must target.
         Step::ConvertI64ToF32 { dst, .. } => Some(&dst.buf),
+        // ── Qwen MoE Step-native ops (STEP-002 Phase 1) ──
+        // MoeSoftmaxTopK / gate-side / shared-down / scaled-add: pre-route or
+        // accumulate into the residual (never a collective partial).
+        Step::MoeSoftmaxTopK { .. }
+        | Step::MoeFusedSharedGate { .. }
+        | Step::MoeSharedGateSide { .. }
+        | Step::MoeSharedDown { .. }
+        | Step::ScaledAdd { .. } => None,
+        // MoeGateUpIndexed: intermediate, never an EP partial.
+        Step::MoeGateUpIndexed { .. } => None,
+        // MoeDownIndexed: Expanded writes down_expanded (intermediate);
+        // ResidualScaled IS the EP partial (atomic accumulation).
+        Step::MoeDownIndexed {
+            mode: QwenDownMode::ResidualScaled { .. },
+            out,
+            ..
+        } => Some(&out.buf),
+        Step::MoeDownIndexed {
+            mode: QwenDownMode::Expanded,
+            ..
+        } => None,
         #[cfg(feature = "deltanet")]
         Step::DeltaGatePrep { .. }
         | Step::DeltaConvSplit { .. }
@@ -2409,6 +2625,9 @@ fn launch_op(gpu: &mut Gpu, ctx: &DispatchCtx, step: &Step) -> Result<(), Dispat
             k_top,
             batch_size,
         } => {
+            // The step's batch_size is authoritative: a zero routed batch is
+            // rejected before any launcher dispatch.
+            indexed_moe_batch_guard(*batch_size)?;
             // Extract the inner tensor — the helpers take a plain &GpuTensor.
             // Both Raw and Prerotated are accepted; callers should pass Prerotated
             // (the activation is always FWHT-rotated before building the step).
@@ -2417,29 +2636,93 @@ fn launch_op(gpu: &mut Gpu, ctx: &DispatchCtx, step: &Step) -> Result<(), Dispat
             };
             match which {
                 MoeProj::GateUp { up_out } => {
-                    launch_indexed_gate_up(gpu, experts, topk_indices, x, out, up_out, *k_top)
+                    // Batch one keeps the scalar launcher byte-identically;
+                    // batch > 1 is the DeepSeek MQ2-Lloyd batched kernel with
+                    // NO scalar fallback for any other dtype.
+                    match deepseek_gate_up_indexed_form(experts.dtype, *batch_size) {
+                        DeepSeekIndexedForm::Scalar => launch_indexed_gate_up(
+                            gpu,
+                            experts,
+                            topk_indices,
+                            x,
+                            out,
+                            up_out,
+                            *k_top,
+                        ),
+                        DeepSeekIndexedForm::Batched => launch_indexed_gate_up_batched(
+                            gpu,
+                            experts,
+                            topk_indices,
+                            x,
+                            out,
+                            up_out,
+                            *k_top,
+                            *batch_size,
+                        ),
+                        DeepSeekIndexedForm::Unsupported => Err(DispatchError::Hip(format!(
+                            "IndexedMoeGemv::GateUp: batched (batch_size={}) unsupported for \
+                             dtype {:?}; no scalar fallback",
+                            *batch_size, experts.dtype
+                        ))),
+                    }
                 }
                 MoeProj::DownExpanded => {
                     launch_indexed_down(gpu, experts, topk_indices, x, out, *k_top, *batch_size)
                 }
-                MoeProj::DownResidual { topk_weights } => launch_indexed_down_residual(
-                    gpu,
-                    experts,
-                    topk_indices,
-                    topk_weights,
-                    x,
-                    out,
-                    *k_top,
-                ),
-                MoeProj::DownResidualI64 { topk_weights } => launch_indexed_down_residual_i64(
-                    gpu,
-                    experts,
-                    topk_indices,
-                    topk_weights,
-                    x,
-                    out,
-                    *k_top,
-                ),
+                MoeProj::DownResidual { topk_weights } => {
+                    // FP32 residual-fused down has no batched kernel; batch > 1
+                    // rejects explicitly, never a scalar fallback.
+                    match deepseek_f32_down_indexed_form(*batch_size) {
+                        DeepSeekIndexedForm::Scalar => launch_indexed_down_residual(
+                            gpu,
+                            experts,
+                            topk_indices,
+                            topk_weights,
+                            x,
+                            out,
+                            *k_top,
+                        ),
+                        DeepSeekIndexedForm::Unsupported => Err(DispatchError::Hip(format!(
+                            "IndexedMoeGemv::DownResidual: batched (batch_size={}) FP32 \
+                             residual is unsupported; no scalar fallback",
+                            *batch_size
+                        ))),
+                        DeepSeekIndexedForm::Batched => {
+                            unreachable!("the FP32 residual form has no batched variant")
+                        }
+                    }
+                }
+                MoeProj::DownResidualI64 { topk_weights } => {
+                    // Batch one keeps the scalar MQ2/MQ3-Lloyd launcher; batch
+                    // > 1 is the existing MQ2-Lloyd batched launcher with NO
+                    // scalar fallback for any other dtype.
+                    match deepseek_i64_down_indexed_form(experts.dtype, *batch_size) {
+                        DeepSeekIndexedForm::Scalar => launch_indexed_down_residual_i64(
+                            gpu,
+                            experts,
+                            topk_indices,
+                            topk_weights,
+                            x,
+                            out,
+                            *k_top,
+                        ),
+                        DeepSeekIndexedForm::Batched => launch_indexed_down_residual_i64_batched(
+                            gpu,
+                            experts,
+                            topk_indices,
+                            topk_weights,
+                            x,
+                            out,
+                            *k_top,
+                            *batch_size,
+                        ),
+                        DeepSeekIndexedForm::Unsupported => Err(DispatchError::Hip(format!(
+                            "IndexedMoeGemv::DownResidualI64: batched (batch_size={}) \
+                             unsupported for dtype {:?}; no scalar fallback",
+                            *batch_size, experts.dtype
+                        ))),
+                    }
+                }
             }
         }
         Step::ConvertI64ToF32 { src, dst, n } => gpu
@@ -2507,6 +2790,10 @@ fn launch_op(gpu: &mut Gpu, ctx: &DispatchCtx, step: &Step) -> Result<(), Dispat
             m_total,
             batch_size,
             k_top,
+            dtype_tags,
+            force_mq4_fp16,
+            paro_i8,
+            paro_i8_k8,
         } => match which {
             MoeProj::GateUp { .. } => launch_grouped_gate_up(
                 gpu,
@@ -2518,18 +2805,32 @@ fn launch_op(gpu: &mut Gpu, ctx: &DispatchCtx, step: &Step) -> Result<(), Dispat
                 *m_total,
                 *k_top,
                 *batch_size,
+                *dtype_tags,
+                *force_mq4_fp16,
+                *paro_i8,
+                *paro_i8_k8,
             ),
-            MoeProj::DownExpanded => launch_grouped_down(
-                gpu,
-                experts,
-                sorted_slot_index,
-                expert_tile_ids,
-                x,
-                y,
-                *m_total,
-                *k_top,
-                *batch_size,
-            ),
+            MoeProj::DownExpanded => {
+                // Structural rejection: the grouped kernel family has no
+                // residual-fused down — only the expanded write + separate
+                // grouped combine exists.
+                grouped_down_projection(which)?;
+                launch_grouped_down(
+                    gpu,
+                    experts,
+                    sorted_slot_index,
+                    expert_tile_ids,
+                    x,
+                    y,
+                    *m_total,
+                    *k_top,
+                    *batch_size,
+                    *dtype_tags,
+                    *force_mq4_fp16,
+                    *paro_i8,
+                    *paro_i8_k8,
+                )
+            }
             MoeProj::DownResidual { .. } | MoeProj::DownResidualI64 { .. } => {
                 Err(DispatchError::Hip(
                     "GroupedMoeGemm: DownResidual/DownResidualI64 is not a valid grouped \
@@ -2538,21 +2839,21 @@ fn launch_op(gpu: &mut Gpu, ctx: &DispatchCtx, step: &Step) -> Result<(), Dispat
                 ))
             }
         },
-        Step::MoeUnscatter {
+        Step::MoeGateUpUnscatter {
             y_grouped,
             sorted_slot_index,
             gate_batch,
             up_batch,
-            mi,
+            inter,
             k_top,
             m_total,
-        } => launch_moe_unscatter(
+        } => launch_moe_gate_up_unscatter(
             gpu,
             y_grouped,
             sorted_slot_index,
             gate_batch,
             up_batch,
-            *mi,
+            *inter,
             *k_top,
             *m_total,
         ),
@@ -2564,7 +2865,131 @@ fn launch_op(gpu: &mut Gpu, ctx: &DispatchCtx, step: &Step) -> Result<(), Dispat
             rot_out,
             inter,
             k_top,
-        } => launch_moe_activation(gpu, variant, gate, up, rot_out, *inter, *k_top),
+        } => {
+            // k_top is the routed row count at launch (k_top for decode,
+            // batch_size·k_top for batched prefill).
+            let rows = *k_top;
+            launch_moe_activation(gpu, variant, gate, up, rot_out, *inter, rows)
+        }
+        // ── Qwen MoE Step-native ops (STEP-002 Phase 1) ──────────────────
+        Step::MoeSoftmaxTopK {
+            logits,
+            topk_indices,
+            topk_weights,
+            n_exp,
+            norm_topk_prob,
+        } => launch_moe_softmax_topk(
+            gpu,
+            logits,
+            topk_indices,
+            topk_weights,
+            *n_exp,
+            *norm_topk_prob,
+        ),
+        Step::MoeFusedSharedGate {
+            router,
+            shared_expert_gate,
+            shared_gate_w,
+            shared_up_w,
+            x_rot,
+            router_logits,
+            scalar_buf,
+            gate_buf,
+            up_buf,
+            smi,
+        } => launch_fused_shared_gate(
+            gpu,
+            router,
+            shared_expert_gate,
+            shared_gate_w,
+            shared_up_w,
+            x_rot,
+            router_logits,
+            scalar_buf,
+            gate_buf,
+            up_buf,
+            *smi,
+        ),
+        Step::MoeSharedGateSide {
+            router,
+            shared_expert_gate,
+            shared_gate_w,
+            shared_up_w,
+            x_norm,
+            x_rot_local,
+            router_logits,
+            scalar_buf,
+            gate_buf,
+            up_buf,
+            smi,
+        } => launch_shared_gate_side(
+            ctx,
+            gpu,
+            router,
+            shared_expert_gate,
+            shared_gate_w,
+            shared_up_w,
+            x_norm,
+            *x_rot_local,
+            router_logits,
+            scalar_buf,
+            gate_buf,
+            up_buf,
+            *smi,
+        ),
+        Step::MoeSharedDown {
+            w,
+            gate_buf,
+            up_buf,
+            scalar_buf,
+            ffn_hidden,
+            ffn_out,
+            out_target,
+            smi,
+        } => launch_shared_expert_down_body(
+            ctx, gpu, w, gate_buf, up_buf, scalar_buf, ffn_hidden, ffn_out, out_target, *smi,
+        ),
+        Step::ScaledAdd { x, y, scale } => launch_scaled_add_gpu_scalar(gpu, x, y, scale),
+        Step::MoeGateUpIndexed {
+            experts,
+            topk_indices,
+            x_rot,
+            gate_batch,
+            up_batch,
+            k_top,
+            batch_size,
+            dtype_tags,
+        } => launch_qwen_gate_up_indexed(
+            gpu,
+            experts,
+            topk_indices,
+            x_rot,
+            gate_batch,
+            up_batch,
+            *k_top,
+            *batch_size,
+            *dtype_tags,
+        ),
+        Step::MoeDownIndexed {
+            experts,
+            topk_indices,
+            rot_batch,
+            out,
+            k_top,
+            batch_size,
+            mode,
+            dtype_tags,
+        } => launch_qwen_down_indexed(
+            gpu,
+            experts,
+            topk_indices,
+            rot_batch,
+            out,
+            *k_top,
+            *batch_size,
+            mode,
+            *dtype_tags,
+        ),
     }
 }
 

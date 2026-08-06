@@ -41,9 +41,10 @@ pub enum PipelineOp {
     /// Covers both gate_up and down projections (distinguished by `which: MoeProj`).
     /// Not fusible.
     GroupedMoeGemm,
-    /// Unscatter grouped gate_up result into gate_batch + up_batch
-    /// (Step-IR [`crate::pipeline::steps::Step::MoeUnscatter`]). Not fusible.
-    MoeUnscatter,
+    /// Deinterleave the grouped gate_up result into gate_batch + up_batch
+    /// (Step-IR [`crate::pipeline::steps::Step::MoeGateUpUnscatter`]).
+    /// Not fusible.
+    MoeGateUpUnscatter,
     /// Fused rmsnorm + optional rotation (MQ-weight producer step).
     /// rotation=FwhtG256 → rmsnorm + FWHT. rotation=None → rmsnorm only.
     RmsnormAutomatic,

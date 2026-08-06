@@ -43,6 +43,30 @@ use std::collections::HashMap;
 const AWQ_SUFFIX: &str = ".awq_scale";
 const PARO_SUFFIXES: [&str; 3] = [".paro_pairs", ".paro_theta", ".paro_channel_scales"];
 
+// Test-only emulated EP2 harness (STEP-002 Task 8): partition plan, rank
+// table staging, and the EP2 resident bind surface.  Compiled only under
+// the non-default `emulated-ep2-harness` feature; production Qwen35 EP
+// stays `Planned { owner: "AXIS-002" }`.
+#[cfg(feature = "emulated-ep2-harness")]
+mod store_ep2;
+
+#[cfg(feature = "emulated-ep2-harness")]
+pub(crate) use store_ep2::EmulatedExpertPartitionPlan;
+#[cfg(feature = "emulated-ep2-harness")]
+use store_ep2::{Ep2DummyDescriptor, Ep2Staging};
+
+/// Test-only EP2 staging switch shared by the production and harness Frozen
+/// builders.  Without the harness feature this is a zero-sized marker so the
+/// production wrapper's signature and behavior are unchanged.
+#[cfg(not(feature = "emulated-ep2-harness"))]
+#[derive(Clone, Copy)]
+struct Ep2Staging<'a>(std::marker::PhantomData<&'a ()>);
+
+#[cfg(not(feature = "emulated-ep2-harness"))]
+impl<'a> Ep2Staging<'a> {
+    const NONE: Ep2Staging<'a> = Ep2Staging(std::marker::PhantomData);
+}
+
 /// Crate-wide serialization lock for process-env mutation in
 /// config-sensitive tests.  Every test that mutates an env var read by
 /// config parsing (`HIPFIRE_REAP_PLAN`, `HIPFIRE_MOE_AWQ`, dispatch
@@ -542,7 +566,7 @@ impl<'a> Qwen35SourceResolver<'a> {
             })?;
 
         let shape: Vec<usize> = info.shape.iter().map(|&d| d as usize).collect();
-        if !source_shape_matches(entry, &shape, info.quant_type) {
+        if !source_shape_matches(self.config, entry, &shape) {
             return Err(format!(
                 "qwen35 source: '{}' resolved to '{}' with shape {:?}, expected {:?}",
                 entry.name, physical_name, shape, entry.logical_shape
@@ -880,21 +904,21 @@ fn awq_companion_physical(name: &str) -> String {
     }
 }
 
-fn source_shape_matches(entry: &WeightEntry, shape: &[usize], quant_type: u8) -> bool {
+fn source_shape_matches(config: &Qwen35Config, entry: &WeightEntry, shape: &[usize]) -> bool {
     if shape == entry.logical_shape {
         return true;
     }
     // HFQ preserves Conv1d's physical [channels, 1, kernel] shape while the
-    // Qwen35 manifest exposes the legacy raw_f32 flattened element count.
-    // qt=13 is still decoded by the legacy dequant_f32 path; only the metadata
-    // representation differs.
+    // Qwen35 manifest exposes the legacy flattened element count. The physical
+    // geometry is independent of source quantization; only the metadata shape
+    // differs.
     entry.name == "conv"
         && entry.layer.is_some()
-        && quant_type == 13
+        && entry.logical_shape.len() == 1
         && shape.len() == 3
         && shape[1] == 1
-        && shape[2] == 4
-        && shape.iter().product::<usize>() == entry.logical_shape.iter().product::<usize>()
+        && shape[2] == config.conv_kernel_dim
+        && shape[0].checked_mul(shape[2]) == entry.logical_shape.first().copied()
 }
 
 fn is_canonical_norm(entry: &WeightEntry) -> bool {
@@ -1349,7 +1373,6 @@ fn typed_moe_ffn(
         expert_down_ptrs: down_ptrs,
         expert_down_awq_ptrs: down_awq_ptrs,
         expert_dtype_tags: dtype_tags,
-        expert_gate_up_dummy: None,
         layer_idx: layer as u16,
         expert_shape: None,
         paro_shared: None,
@@ -2110,6 +2133,7 @@ pub(crate) fn assemble_qwen35_weights_inner_with_mode(
         pager: None,
         lm_head_aliases_embd,
         moe_resident: None,
+        moe_group_plans: std::sync::OnceLock::new(),
     })
 }
 
@@ -2188,6 +2212,65 @@ pub(crate) fn load_qwen35_hfq_weights_frozen_prepared(
     moe_awq_enabled: bool,
     gpu: &mut Gpu,
 ) -> Result<Qwen35Weights, Qwen35LoadError> {
+    load_qwen35_hfq_weights_frozen_prepared_inner(
+        prepared,
+        hfq,
+        config,
+        dispatch_ctx,
+        moe_awq_enabled,
+        gpu,
+        #[cfg(feature = "emulated-ep2-harness")]
+        None,
+    )
+}
+
+/// Emulated-EP2 harness loader (test-only, feature `emulated-ep2-harness`):
+/// like [`load_qwen35_hfq_weights_frozen_prepared`] but Phase 4 stages the
+/// two rank-masked gate-up pointer tables and the dtype-matched zero dummies
+/// into the SAME single-owner builder before the SAME freeze.  The published
+/// [`Qwen35MoeResident`] then serves both the canonical Single path and the
+/// `bind_layer_ep2(rank)` overrides.
+#[cfg(feature = "emulated-ep2-harness")]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "harness loader consumed by ep2_harness::run (Phase 2B driver)"
+    )
+)]
+pub(crate) fn load_qwen35_hfq_weights_frozen_prepared_ep2(
+    prepared: PreparedFrozenHfqManifest,
+    hfq: &HfqFile,
+    config: &Qwen35Config,
+    dispatch_ctx: &hipfire_dispatch::context::DispatchCtx,
+    moe_awq_enabled: bool,
+    gpu: &mut Gpu,
+    plan: &EmulatedExpertPartitionPlan,
+) -> Result<Qwen35Weights, Qwen35LoadError> {
+    load_qwen35_hfq_weights_frozen_prepared_inner(
+        prepared,
+        hfq,
+        config,
+        dispatch_ctx,
+        moe_awq_enabled,
+        gpu,
+        Some(plan),
+    )
+}
+
+#[expect(
+    clippy::result_large_err,
+    reason = "Err preserves every owner surfaced by the existing rollback APIs for the loader backlog (common weights, frozen store, staging-retained buffers, builder-retained frozen owners); flattening would leak on failure. Exact failed-free retention is NOT claimed (STEP-002R debt)"
+)]
+fn load_qwen35_hfq_weights_frozen_prepared_inner(
+    prepared: PreparedFrozenHfqManifest,
+    hfq: &HfqFile,
+    config: &Qwen35Config,
+    dispatch_ctx: &hipfire_dispatch::context::DispatchCtx,
+    moe_awq_enabled: bool,
+    gpu: &mut Gpu,
+    #[cfg(feature = "emulated-ep2-harness")] ep2: Option<&EmulatedExpertPartitionPlan>,
+) -> Result<Qwen35Weights, Qwen35LoadError> {
     let resolver = Qwen35SourceResolver::new(hfq, config);
 
     // Phase 2: Fulfill only the common partition entries.
@@ -2247,6 +2330,51 @@ pub(crate) fn load_qwen35_hfq_weights_frozen_prepared(
         let resolved = resolver.resolve(entry)?;
         Ok((resolved.bytes, resolved.dtype))
     };
+    // Production wrapper: `build_frozen_moe_resident` (no EP2 staging,
+    // byte-identical).  Harness loader: the shared inner builder stages the
+    // rank-masked gate-up pointer tables + dtype-matched zero dummies into
+    // the SAME single-owner builder before the SAME freeze.
+    #[cfg(feature = "emulated-ep2-harness")]
+    let resident = match ep2 {
+        Some(plan) => match build_frozen_moe_resident_inner(
+            gpu,
+            config,
+            &moe_entries,
+            &source,
+            dispatch_ctx,
+            moe_awq_enabled,
+            store_ep2::Ep2Staging::with_plan(plan),
+        ) {
+            Ok(r) => r,
+            Err(build_err) => {
+                let msg = format!("frozen resident build (emulated EP2): {build_err}");
+                // build_err.retained contains SingleFreeFailed owners from
+                // the builder's abort/rollback.  Carry every one through
+                // Qwen35LoadError — NEVER retry-and-drop.
+                let retained = build_err.retained;
+                return Err(Qwen35LoadError::frozen_failure(msg, weights, retained));
+            }
+        },
+        None => match build_frozen_moe_resident(
+            gpu,
+            config,
+            &moe_entries,
+            &source,
+            dispatch_ctx,
+            moe_awq_enabled,
+        ) {
+            Ok(r) => r,
+            Err(build_err) => {
+                let msg = format!("frozen resident build: {build_err}");
+                // build_err.retained contains SingleFreeFailed owners from
+                // the builder's abort/rollback.  Carry every one through
+                // Qwen35LoadError — NEVER retry-and-drop.
+                let retained = build_err.retained;
+                return Err(Qwen35LoadError::frozen_failure(msg, weights, retained));
+            }
+        },
+    };
+    #[cfg(not(feature = "emulated-ep2-harness"))]
     let resident = match build_frozen_moe_resident(
         gpu,
         config,
@@ -4527,6 +4655,12 @@ fn collect_moe_layer_meta(
 /// Every error path calls `builder.abort()` and preserves any
 /// [`SingleFreeFailed`] owners in the returned
 /// [`FrozenMoeBuildError`].  No post-fulfill `unwrap` / `expect`.
+///
+/// The production wrapper stays byte-identical: it delegates to the shared
+/// inner builder with no EP2 staging.  The harness wrapper
+/// (`build_frozen_moe_resident_ep2`, feature `emulated-ep2-harness`) stages
+/// both rank-masked gate-up pointer tables and one zero gate-up dummy per
+/// distinct routed dtype into the SAME builder before the SAME freeze.
 pub(crate) fn build_frozen_moe_resident(
     gpu: &mut Gpu,
     config: &Qwen35Config,
@@ -4534,6 +4668,60 @@ pub(crate) fn build_frozen_moe_resident(
     source: &impl Fn(&WeightEntry) -> Result<(Vec<u8>, DType), String>,
     dispatch_ctx: &hipfire_dispatch::context::DispatchCtx,
     moe_awq_enabled: bool,
+) -> Result<Qwen35MoeResident, FrozenMoeBuildError> {
+    build_frozen_moe_resident_inner(
+        gpu,
+        config,
+        moe_entries,
+        source,
+        dispatch_ctx,
+        moe_awq_enabled,
+        Ep2Staging::NONE,
+    )
+}
+
+/// Emulated EP2 harness entry point (test-only): like
+/// [`build_frozen_moe_resident`] but stages the deterministic two-rank
+/// partition's masked gate-up pointer tables and dtype-matched zero dummies
+/// inside the single store owner.
+#[cfg(feature = "emulated-ep2-harness")]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "harness entry exercised by the emulated EP2 GPU-ignored test; the Phase 2B driver consumes it"
+    )
+)]
+pub(crate) fn build_frozen_moe_resident_ep2(
+    gpu: &mut Gpu,
+    config: &Qwen35Config,
+    moe_entries: &MoeManifestEntries,
+    source: &impl Fn(&WeightEntry) -> Result<(Vec<u8>, DType), String>,
+    dispatch_ctx: &hipfire_dispatch::context::DispatchCtx,
+    moe_awq_enabled: bool,
+    plan: &store_ep2::EmulatedExpertPartitionPlan,
+) -> Result<Qwen35MoeResident, FrozenMoeBuildError> {
+    build_frozen_moe_resident_inner(
+        gpu,
+        config,
+        moe_entries,
+        source,
+        dispatch_ctx,
+        moe_awq_enabled,
+        store_ep2::Ep2Staging::with_plan(plan),
+    )
+}
+
+// The `ep2` staging switch is consumed only under the harness feature.
+#[cfg_attr(not(feature = "emulated-ep2-harness"), allow(unused_variables))]
+fn build_frozen_moe_resident_inner(
+    gpu: &mut Gpu,
+    config: &Qwen35Config,
+    moe_entries: &MoeManifestEntries,
+    source: &impl Fn(&WeightEntry) -> Result<(Vec<u8>, DType), String>,
+    dispatch_ctx: &hipfire_dispatch::context::DispatchCtx,
+    moe_awq_enabled: bool,
+    ep2: Ep2Staging<'_>,
 ) -> Result<Qwen35MoeResident, FrozenMoeBuildError> {
     let moe_slice: &[WeightEntry] = moe_entries.as_slice();
     // Defense-in-depth: reject any routed gate-up AWQ companion before ANY
@@ -4785,6 +4973,36 @@ pub(crate) fn build_frozen_moe_resident(
         });
     }
 
+    // ── Phase C2 (harness only): stage emulated EP2 rank tables + dummies ──
+    // One zero gate-up dummy per distinct routed gate-up dtype (sized
+    // exactly like the canonical same-dtype representative), then both
+    // rank-masked gate-up pointer tables, into the SAME builder so a single
+    // freeze owns everything.  The production wrapper passes `Ep2Staging::NONE`
+    // and never reaches this block.
+    #[cfg(feature = "emulated-ep2-harness")]
+    let ep2_staged: Option<Vec<store_ep2::Ep2LayerStaged>> = match ep2.0 {
+        Some(ep2_plan) => {
+            if ep2_plan.num_experts() != n {
+                return Err(builder_fail(
+                    builder,
+                    format!(
+                        "EP2 partition plan covers {} experts but config has {n}",
+                        ep2_plan.num_experts()
+                    ),
+                ));
+            }
+            let mut staged = Vec::with_capacity(plan.layer_cells.len());
+            for cells in &plan.layer_cells {
+                match store_ep2::stage_ep2_layer(&mut builder, cells, ep2_plan, n) {
+                    Ok(s) => staged.push(s),
+                    Err(msg) => return Err(builder_fail(builder, msg)),
+                }
+            }
+            Some(staged)
+        }
+        None => None,
+    };
+
     // ── Phase D: Build projections, validate, freeze ───────────────
     // Helper: look up companion cell ID (borrows builder shared).
     let companion_key = |name: &str, layer: Option<usize>| -> Option<WeightCellId> {
@@ -4890,6 +5108,23 @@ pub(crate) fn build_frozen_moe_resident(
             down_awq_ptrs: ids.dn_awq_ptrs.clone(),
             dtype_tags: ids.tags.clone(),
             dummy: None,
+            #[cfg(feature = "emulated-ep2-harness")]
+            ep2_gate_up_ptrs: match &ep2_staged {
+                Some(staged) => [
+                    Some(MoeDerivedDescriptor {
+                        key: staged[cix].rank_gate_up_ptrs[0],
+                    }),
+                    Some(MoeDerivedDescriptor {
+                        key: staged[cix].rank_gate_up_ptrs[1],
+                    }),
+                ],
+                None => [None, None],
+            },
+            #[cfg(feature = "emulated-ep2-harness")]
+            ep2_dummies: match &ep2_staged {
+                Some(staged) => staged[cix].dummies.clone(),
+                None => Vec::new(),
+            },
             layer_idx: cells.model_layer,
         });
     }
@@ -4959,7 +5194,21 @@ pub(crate) fn build_frozen_moe_resident(
     };
 
     // Construct resident.
-    match Qwen35MoeResident::try_new(store, projections, &shape_cfg) {
+    let resident_result = {
+        #[cfg(feature = "emulated-ep2-harness")]
+        {
+            if ep2.0.is_some() {
+                Qwen35MoeResident::try_new_with_ep2(store, projections, &shape_cfg)
+            } else {
+                Qwen35MoeResident::try_new(store, projections, &shape_cfg)
+            }
+        }
+        #[cfg(not(feature = "emulated-ep2-harness"))]
+        {
+            Qwen35MoeResident::try_new(store, projections, &shape_cfg)
+        }
+    };
+    match resident_result {
         Ok(resident) => Ok(resident),
         Err((errors, store, _layers)) => {
             let mut retained = Vec::new();
@@ -5076,6 +5325,18 @@ pub(crate) struct Qwen35MoeLayerProjection<K> {
     /// Dummy zero buffer for non-owned expert gate-up targets (EP shard).
     /// Refused by the Single-mode validator.
     pub(crate) dummy: Option<MoeDerivedDescriptor<K>>,
+    /// Emulated EP2 harness (test-only): per-rank gate-up pointer-table cell
+    /// IDs (rank-masked; non-owned slots point at zero dummies).  `None` for
+    /// both ranks on a production Single build.  Never populated by the
+    /// production builder; validated by `try_new_with_ep2`.
+    #[cfg(feature = "emulated-ep2-harness")]
+    pub(crate) ep2_gate_up_ptrs: [Option<MoeDerivedDescriptor<K>>; 2],
+    /// Emulated EP2 harness (test-only): one ID-only dummy descriptor per
+    /// distinct canonical gate-up dtype (cell ID + dtype + the exact
+    /// representative shape/byte length needed for validation).  Empty on a
+    /// production Single build; validated by `try_new_with_ep2`.
+    #[cfg(feature = "emulated-ep2-harness")]
+    pub(crate) ep2_dummies: Vec<Ep2DummyDescriptor<K>>,
     /// Stable layer index (0-based).
     pub(crate) layer_idx: usize,
 }
@@ -5126,6 +5387,33 @@ pub(crate) enum Qwen35MoeValidationError {
     /// A `MoeWeightDescriptor`'s (m, k) metadata does not match the
     /// semantic role's expected dimensions from the layer shape config.
     DescriptorMetadataMismatch(String),
+    /// Emulated EP2 harness: a distinct canonical gate-up dtype has no
+    /// staged zero-dummy descriptor.
+    Ep2DummyMissing(String),
+    /// Emulated EP2 harness: staged dummy descriptors do not cover the
+    /// distinct canonical gate-up dtypes exactly once (duplicate dtype
+    /// or a stray dummy for a dtype with no canonical representative).
+    Ep2DummyDuplicate(String),
+    /// Emulated EP2 harness: a staged dummy descriptor's cell ID does not
+    /// resolve to a store tensor (invalid/foreign ID).
+    Ep2DummyInvalidId(String),
+    /// Emulated EP2 harness: a staged dummy tensor's dtype differs from
+    /// its canonical same-dtype representative.
+    Ep2DummyDtype(String),
+    /// Emulated EP2 harness: a staged dummy tensor's shape differs from
+    /// its canonical same-dtype representative, or same-dtype canonical
+    /// gate-up tensors disagree on shape.
+    Ep2DummyShape(String),
+    /// Emulated EP2 harness: a staged dummy tensor's allocation byte
+    /// length differs from its canonical same-dtype representative, or
+    /// same-dtype canonical gate-up tensors disagree on byte length.
+    Ep2DummyByteLen(String),
+    /// Emulated EP2 harness: a rank gate-up pointer table's live allocation
+    /// byte length differs from exactly `num_experts * 8`.
+    Ep2RankTableByteLen(String),
+    /// Emulated EP2 harness: a rank gate-up pointer-table cell ID aliases
+    /// the other rank's table or the canonical gate-up pointer table.
+    Ep2RankTableAlias(String),
 }
 
 impl std::fmt::Display for Qwen35MoeValidationError {
@@ -5172,6 +5460,30 @@ impl std::fmt::Display for Qwen35MoeValidationError {
             }
             Qwen35MoeValidationError::DescriptorMetadataMismatch(d) => {
                 write!(f, "descriptor metadata mismatch: {d}")
+            }
+            Qwen35MoeValidationError::Ep2DummyMissing(d) => {
+                write!(f, "EP2 dummy missing: {d}")
+            }
+            Qwen35MoeValidationError::Ep2DummyDuplicate(d) => {
+                write!(f, "EP2 dummy dtype duplicate/stray: {d}")
+            }
+            Qwen35MoeValidationError::Ep2DummyInvalidId(d) => {
+                write!(f, "EP2 dummy invalid/foreign cell ID: {d}")
+            }
+            Qwen35MoeValidationError::Ep2DummyDtype(d) => {
+                write!(f, "EP2 dummy dtype mismatch: {d}")
+            }
+            Qwen35MoeValidationError::Ep2DummyShape(d) => {
+                write!(f, "EP2 dummy shape mismatch: {d}")
+            }
+            Qwen35MoeValidationError::Ep2DummyByteLen(d) => {
+                write!(f, "EP2 dummy allocation byte-length mismatch: {d}")
+            }
+            Qwen35MoeValidationError::Ep2RankTableByteLen(d) => {
+                write!(f, "EP2 rank table allocation byte-length mismatch: {d}")
+            }
+            Qwen35MoeValidationError::Ep2RankTableAlias(d) => {
+                write!(f, "EP2 rank table alias: {d}")
             }
         }
     }
@@ -5549,6 +5861,14 @@ pub enum Qwen35MoeBindError {
     /// A GPU tensor lookup failed for a key that was validated at
     /// construction time.
     TensorLookup(String, WeightCellLookupError),
+    /// The EP2 rank index is out of range (emulated EP2 has exactly two
+    /// logical ranks).  Test-only harness surface.
+    #[cfg(feature = "emulated-ep2-harness")]
+    Ep2RankOutOfRange { requested: usize, count: usize },
+    /// An EP2 bind was requested on Legacy (owned) MoE storage, which has no
+    /// rank-masked pointer tables.  Test-only harness surface.
+    #[cfg(feature = "emulated-ep2-harness")]
+    Ep2RequiresFrozenStorage,
 }
 
 impl std::fmt::Display for Qwen35MoeBindError {
@@ -5559,6 +5879,14 @@ impl std::fmt::Display for Qwen35MoeBindError {
             }
             Qwen35MoeBindError::TensorLookup(label, err) => {
                 write!(f, "tensor lookup failed for {label}: {err}")
+            }
+            #[cfg(feature = "emulated-ep2-harness")]
+            Qwen35MoeBindError::Ep2RankOutOfRange { requested, count } => {
+                write!(f, "EP2 rank {requested} out of range (have {count} ranks)")
+            }
+            #[cfg(feature = "emulated-ep2-harness")]
+            Qwen35MoeBindError::Ep2RequiresFrozenStorage => {
+                write!(f, "emulated EP2 binding requires Frozen MoE storage")
             }
         }
     }
@@ -5681,6 +6009,8 @@ impl Qwen35MoeResident {
         Ok(MoeFfnBindings {
             store: &self.store,
             proj,
+            #[cfg(feature = "emulated-ep2-harness")]
+            ep2_gate_up_ptrs: None,
         })
     }
 
@@ -5709,6 +6039,10 @@ impl Qwen35MoeResident {
 pub struct MoeFfnBindings<'a> {
     store: &'a SingleFrozenWeightStore,
     proj: &'a Qwen35MoeLayerProjection<WeightCellId>,
+    /// Emulated EP2 harness (test-only): when `Some`, `gate_up_ptrs()`
+    /// resolves this rank-masked table instead of the canonical one.
+    #[cfg(feature = "emulated-ep2-harness")]
+    ep2_gate_up_ptrs: Option<WeightCellId>,
 }
 
 // ── Internal lookup helper ─────────────────────────────────────────
@@ -5761,6 +6095,10 @@ impl MoeFfnBindings<'_> {
 
     /// Per-expert gate-up pointer table.
     pub fn gate_up_ptrs(&self) -> Result<&GpuTensor, Qwen35MoeBindError> {
+        #[cfg(feature = "emulated-ep2-harness")]
+        if let Some(key) = self.ep2_gate_up_ptrs {
+            return self.tensor(key);
+        }
         self.tensor(self.proj.gate_up_ptrs.key)
     }
 
@@ -6298,11 +6636,29 @@ mod tests {
     }
 
     #[test]
-    fn canonical_conv_accepts_flattened_mq4_physical_shape() {
+    fn conv_physical_shape_alias_is_quant_independent_and_uses_config_kernel() {
+        let mut config = test_config(&["linear_attention"], false);
         let entry = WeightEntry::layer("conv", 0, vec![24], DType::F32, ShardPolicy::Replicate);
-        assert!(source_shape_matches(&entry, &[6, 1, 4], 13));
-        assert!(!source_shape_matches(&entry, &[6, 4, 1], 13));
-        assert!(!source_shape_matches(&entry, &[6, 1, 4], 1));
+        assert!(source_shape_matches(&config, &entry, &[6, 1, 4]));
+        assert!(!source_shape_matches(&config, &entry, &[6, 4, 1]));
+
+        config.conv_kernel_dim = 3;
+        let entry = WeightEntry::layer("conv", 0, vec![18], DType::F32, ShardPolicy::Replicate);
+        assert!(source_shape_matches(&config, &entry, &[6, 1, 3]));
+        assert!(!source_shape_matches(&config, &entry, &[6, 1, 4]));
+
+        let overflowing = WeightEntry::layer(
+            "conv",
+            0,
+            vec![usize::MAX],
+            DType::F32,
+            ShardPolicy::Replicate,
+        );
+        assert!(!source_shape_matches(
+            &config,
+            &overflowing,
+            &[usize::MAX, 1, 3]
+        ));
     }
 
     #[test]
@@ -6910,6 +7266,10 @@ mod tests {
             down_awq_ptrs: None,
             dtype_tags: None,
             dummy: None,
+            #[cfg(feature = "emulated-ep2-harness")]
+            ep2_gate_up_ptrs: [None, None],
+            #[cfg(feature = "emulated-ep2-harness")]
+            ep2_dummies: Vec::new(),
             layer_idx,
         }
     }
@@ -7578,6 +7938,10 @@ mod tests {
             down_awq_ptrs: None,
             dtype_tags: None,
             dummy: None,
+            #[cfg(feature = "emulated-ep2-harness")]
+            ep2_gate_up_ptrs: [None, None],
+            #[cfg(feature = "emulated-ep2-harness")]
+            ep2_dummies: Vec::new(),
             layer_idx: 0,
         };
         let cfg = a3b_shape_cfg();
@@ -7774,6 +8138,10 @@ mod tests {
             } else {
                 None
             },
+            #[cfg(feature = "emulated-ep2-harness")]
+            ep2_gate_up_ptrs: [None, None],
+            #[cfg(feature = "emulated-ep2-harness")]
+            ep2_dummies: Vec::new(),
             layer_idx: 0,
         }
     }
@@ -8037,6 +8405,7 @@ mod tests {
             pager: None,
             lm_head_aliases_embd: false,
             moe_resident: None,
+            moe_group_plans: std::sync::OnceLock::new(),
         };
         let err = match weights.moe_ffn_view(0) {
             Ok(_) => panic!("layer 0 of 0 must be out of range"),
@@ -9037,6 +9406,872 @@ mod tests {
         gpu.drain_pool();
     }
 
+    // ═════════════════════════════════════════════════════════════════
+    // Emulated EP2 harness (STEP-002 Task 8) — test-only
+    // ═════════════════════════════════════════════════════════════════
+    // Two logical expert-ownership partitions over ONE GPU.  Production
+    // Qwen35 EP stays `Planned { owner: "AXIS-002" }`; everything here is
+    // gated behind the non-default `emulated-ep2-harness` feature.
+
+    #[cfg(feature = "emulated-ep2-harness")]
+    mod ep2_tests {
+        use super::*;
+        use crate::store::store_ep2::{
+            ep2_masked_gate_up_table_bytes, ep2_rank_gate_up_ptrs_key, ep2_representative_layouts,
+            validate_ep2_projection, EmulatedExpertPartitionPlan, Ep2DummyDescriptor,
+        };
+
+        #[test]
+        fn ep2_partition_stride2_deterministic_ownership_and_slots() {
+            // Stride-2 ownership: expert i → rank i%2, compact local slot i/2.
+            let plan = EmulatedExpertPartitionPlan::stride2(8).expect("stride2(8) must be valid");
+            assert_eq!(plan.num_experts(), 8);
+            for i in 0..8 {
+                assert_eq!(plan.owner_of(i), Some((i % 2) as u8));
+                assert_eq!(plan.local_slot_of(i), Some(i / 2));
+            }
+            assert_eq!(plan.rank_experts(0), vec![0, 2, 4, 6]);
+            assert_eq!(plan.rank_experts(1), vec![1, 3, 5, 7]);
+            assert_eq!(plan.rank_local_count(0), 4);
+            assert_eq!(plan.rank_local_count(1), 4);
+        }
+
+        #[test]
+        fn ep2_partition_rejects_less_than_two_ranks() {
+            assert!(
+                EmulatedExpertPartitionPlan::stride2(0).is_err(),
+                "zero experts cannot form two ranks"
+            );
+            assert!(
+                EmulatedExpertPartitionPlan::stride2(1).is_err(),
+                "one expert cannot form two ranks"
+            );
+        }
+
+        #[test]
+        fn ep2_partition_from_assignment_validates_disjoint_complete_two_ranks() {
+            // Valid: disjoint (one owner per expert), complete (all experts
+            // owned), exactly two non-empty ranks, dense per-rank slots.
+            let plan =
+                EmulatedExpertPartitionPlan::from_assignment(vec![0, 1, 0, 1]).expect("valid plan");
+            assert_eq!(plan.owner_of(2), Some(0));
+            assert_eq!(plan.local_slot_of(2), Some(1));
+            assert_eq!(plan.local_slot_of(3), Some(1));
+            assert_eq!(plan.rank_experts(0), vec![0, 2]);
+            assert_eq!(plan.rank_experts(1), vec![1, 3]);
+
+            // Single rank: rank 1 owns nothing → invalid.
+            assert!(EmulatedExpertPartitionPlan::from_assignment(vec![0, 0, 0]).is_err());
+            // Unknown rank id → invalid.
+            assert!(EmulatedExpertPartitionPlan::from_assignment(vec![0, 1, 2]).is_err());
+            // Empty assignment → invalid (incomplete).
+            assert!(EmulatedExpertPartitionPlan::from_assignment(vec![]).is_err());
+        }
+
+        #[test]
+        fn ep2_partition_odd_count_keeps_dense_local_slots() {
+            let plan = EmulatedExpertPartitionPlan::stride2(3).expect("valid plan");
+            assert_eq!(plan.rank_experts(0), vec![0, 2]);
+            assert_eq!(plan.rank_experts(1), vec![1]);
+            assert_eq!(plan.rank_local_count(0), 2);
+            assert_eq!(plan.rank_local_count(1), 1);
+            assert_eq!(plan.local_slot_of(2), Some(1));
+        }
+
+        #[test]
+        fn ep2_masked_gate_up_table_uses_canonical_for_owned_and_dtype_dummy_for_other() {
+            // 4 experts, stride-2: rank 0 owns {0, 2}, rank 1 owns {1, 3}.
+            // Expert 2 is MQ6 — its masked slot must use the MQ6 dummy, the
+            // rest use the MQ4 dummy.
+            let addrs = [0x1000u64, 0x2000, 0x3000, 0x4000];
+            let dtypes = [
+                DType::MQ4G256,
+                DType::MQ4G256,
+                DType::MQ6G256,
+                DType::MQ4G256,
+            ];
+            let plan = EmulatedExpertPartitionPlan::stride2(4).unwrap();
+            let dummy = |dt: DType| match dt {
+                DType::MQ4G256 => Some(0xA000u64),
+                DType::MQ6G256 => Some(0xB000u64),
+                _ => None,
+            };
+            let [rank0, rank1] =
+                ep2_masked_gate_up_table_bytes(&addrs, &dtypes, &plan, dummy).unwrap();
+            let read = |bytes: &[u8]| -> Vec<u64> {
+                bytes
+                    .chunks_exact(8)
+                    .map(|c| u64::from_ne_bytes(c.try_into().unwrap()))
+                    .collect()
+            };
+            assert_eq!(
+                read(&rank0),
+                vec![0x1000, 0xA000, 0x3000, 0xA000],
+                "rank 0: owned experts keep canonical pointers, others get the MQ4 dummy"
+            );
+            assert_eq!(
+                read(&rank1),
+                vec![0xA000, 0x2000, 0xB000, 0x4000],
+                "rank 1: expert 2 (MQ6) must be masked with the MQ6 dummy"
+            );
+        }
+
+        #[test]
+        fn ep2_masked_gate_up_table_rejects_missing_dummy() {
+            // A masked expert whose gate-up dtype has no staged dummy must
+            // fail loudly instead of fabricating a pointer.
+            let addrs = [0x1000u64, 0x2000];
+            let dtypes = [DType::MQ4G256, DType::MQ6G256];
+            let plan = EmulatedExpertPartitionPlan::stride2(2).unwrap();
+            let dummy = |dt: DType| {
+                if dt == DType::MQ4G256 {
+                    Some(0xA000u64)
+                } else {
+                    None
+                }
+            };
+            let err = ep2_masked_gate_up_table_bytes(&addrs, &dtypes, &plan, dummy).unwrap_err();
+            assert!(
+                err.contains("dummy"),
+                "error must name the missing dummy: {err}"
+            );
+        }
+
+        #[test]
+        fn ep2_rank_gate_up_ptrs_key_selects_rank_table_or_none() {
+            let mut proj = valid_projection(0);
+            proj.ep2_gate_up_ptrs = [
+                Some(MoeDerivedDescriptor {
+                    key: "ep2_gu_rank0",
+                }),
+                Some(MoeDerivedDescriptor {
+                    key: "ep2_gu_rank1",
+                }),
+            ];
+            assert_eq!(ep2_rank_gate_up_ptrs_key(&proj, 0), Some("ep2_gu_rank0"));
+            assert_eq!(ep2_rank_gate_up_ptrs_key(&proj, 1), Some("ep2_gu_rank1"));
+            assert_eq!(ep2_rank_gate_up_ptrs_key(&proj, 2), None);
+
+            // A layer staged without EP2 tables has no rank override.
+            let mut proj2 = valid_projection(0);
+            proj2.ep2_gate_up_ptrs = [
+                None,
+                Some(MoeDerivedDescriptor {
+                    key: "ep2_gu_rank1",
+                }),
+            ];
+            assert_eq!(ep2_rank_gate_up_ptrs_key(&proj2, 0), None);
+        }
+
+        #[test]
+        fn ep2_bind_error_rank_out_of_range_displays_rank() {
+            let err = Qwen35MoeBindError::Ep2RankOutOfRange {
+                requested: 2,
+                count: 2,
+            };
+            assert!(err.to_string().contains("rank 2"));
+        }
+
+        // ── Representative selection + same-dtype layout consistency ──────
+
+        /// Canonical gate-up layout used by every pure EP2 validator test:
+        /// a3b shape config, 4 experts, all MQ4G256, `m=1024, k=256` →
+        /// 1024 rows × (256/256) groups × 136 B/group = 139264 bytes.
+        const MQ4_GU_BYTES: usize = 1024 * 136;
+        const MQ6_GU_BYTES: usize = 1024 * 200;
+
+        #[test]
+        fn ep2_representative_layouts_picks_first_same_dtype_tensor_exact() {
+            // Distinct dtypes in first-seen order; the representative's
+            // EXACT (shape, byte length) is taken from the first tensor of
+            // each dtype — never inferred from shape×dtype arithmetic.
+            let layouts = ep2_representative_layouts(&[
+                (vec![1024, 256], MQ4_GU_BYTES, DType::MQ4G256),
+                (vec![1024, 256], MQ6_GU_BYTES, DType::MQ6G256),
+                (vec![1024, 256], MQ4_GU_BYTES, DType::MQ4G256),
+                (vec![1024, 256], MQ4_GU_BYTES, DType::MQ4G256),
+            ])
+            .expect("valid mixed layout");
+            assert_eq!(
+                layouts,
+                vec![
+                    (DType::MQ4G256, vec![1024, 256], MQ4_GU_BYTES),
+                    (DType::MQ6G256, vec![1024, 256], MQ6_GU_BYTES),
+                ]
+            );
+        }
+
+        #[test]
+        fn ep2_representative_layouts_rejects_same_dtype_shape_mismatch() {
+            // Same dtype, different shape → the dummy must NOT be shared
+            // across two different encodings of one dtype.
+            let err = ep2_representative_layouts(&[
+                (vec![1024, 256], MQ4_GU_BYTES, DType::MQ4G256),
+                (vec![512, 256], MQ4_GU_BYTES, DType::MQ4G256),
+            ])
+            .unwrap_err();
+            assert!(
+                err.contains("MQ4G256") && err.contains("shape"),
+                "error must name the dtype and the shape mismatch: {err}"
+            );
+        }
+
+        #[test]
+        fn ep2_representative_layouts_rejects_same_dtype_byte_len_mismatch() {
+            // Same dtype, same shape, DIFFERENT allocation byte length →
+            // refused: a dummy sized for one encoding would be the wrong
+            // size for the other.
+            let err = ep2_representative_layouts(&[
+                (vec![1024, 256], MQ4_GU_BYTES, DType::MQ4G256),
+                (vec![1024, 256], MQ4_GU_BYTES * 2, DType::MQ4G256),
+            ])
+            .unwrap_err();
+            assert!(
+                err.contains("byte"),
+                "error must name the byte-length mismatch: {err}"
+            );
+        }
+
+        // ── Pure EP2 projection validation (malformed dummy descriptors) ──
+
+        /// Resolver covering the canonical projection + both rank tables +
+        /// one MQ4 dummy, keyed like `make_resolver`/`valid_projection`.
+        fn ep2_resolver() -> std::collections::HashMap<&'static str, (DType, Vec<usize>, usize)> {
+            let mut r = std::collections::HashMap::new();
+            r.insert("router", (DType::F32, vec![4, 256], 4 * 256 * 4));
+            r.insert("shared_expert_gate", (DType::F32, vec![1, 256], 256 * 4));
+            r.insert("shared_gate", (DType::MQ4G256, vec![512, 256], 512 * 136));
+            r.insert("shared_up", (DType::MQ4G256, vec![512, 256], 512 * 136));
+            r.insert(
+                "shared_down",
+                (DType::MQ4G256, vec![256, 512], 256 * 2 * 136),
+            );
+            for i in 0..4 {
+                r.insert(
+                    Box::leak(format!("expert.{i}.gate_up").into_boxed_str()),
+                    (DType::MQ4G256, vec![1024, 256], MQ4_GU_BYTES),
+                );
+                r.insert(
+                    Box::leak(format!("expert.{i}.down").into_boxed_str()),
+                    (DType::MQ4G256, vec![256, 512], 256 * 2 * 136),
+                );
+            }
+            r.insert("gate_up_ptrs", (DType::Raw, vec![32], 32));
+            r.insert("down_ptrs", (DType::Raw, vec![32], 32));
+            r.insert("ep2_gu_rank0", (DType::Raw, vec![32], 32));
+            r.insert("ep2_gu_rank1", (DType::Raw, vec![32], 32));
+            r.insert(
+                "ep2_dummy_mq4",
+                (DType::MQ4G256, vec![1024, 256], MQ4_GU_BYTES),
+            );
+            r
+        }
+
+        fn mq4_dummy() -> Ep2DummyDescriptor<&'static str> {
+            Ep2DummyDescriptor {
+                key: "ep2_dummy_mq4",
+                dtype: DType::MQ4G256,
+                shape: vec![1024, 256],
+                byte_len: MQ4_GU_BYTES,
+            }
+        }
+
+        fn mq6_dummy() -> Ep2DummyDescriptor<&'static str> {
+            Ep2DummyDescriptor {
+                key: "ep2_dummy_mq6",
+                dtype: DType::MQ6G256,
+                shape: vec![1024, 256],
+                byte_len: MQ6_GU_BYTES,
+            }
+        }
+
+        /// `valid_projection(0)` + both rank tables + the given dummies.
+        fn ep2_projection_with(
+            dummies: Vec<Ep2DummyDescriptor<&'static str>>,
+        ) -> Qwen35MoeLayerProjection<&'static str> {
+            let mut proj = valid_projection(0);
+            proj.ep2_gate_up_ptrs = [
+                Some(MoeDerivedDescriptor {
+                    key: "ep2_gu_rank0",
+                }),
+                Some(MoeDerivedDescriptor {
+                    key: "ep2_gu_rank1",
+                }),
+            ];
+            proj.ep2_dummies = dummies;
+            proj
+        }
+
+        fn ep2_validate(
+            proj: &Qwen35MoeLayerProjection<&'static str>,
+            resolver: &std::collections::HashMap<&'static str, (DType, Vec<usize>, usize)>,
+        ) -> Result<(), Vec<Qwen35MoeValidationError>> {
+            validate_ep2_projection(proj, &a3b_shape_cfg(), &|key| {
+                resolver
+                    .get(key)
+                    .map(|(dt, sh, blen)| (*dt, sh.clone(), *blen))
+            })
+        }
+
+        #[test]
+        fn ep2_validate_accepts_one_dummy_per_distinct_dtype() {
+            let r = ep2_resolver();
+            let proj = ep2_projection_with(vec![mq4_dummy()]);
+            let result = ep2_validate(&proj, &r);
+            assert!(
+                result.is_ok(),
+                "one MQ4 dummy for the one distinct MQ4 dtype must validate: {result:?}"
+            );
+        }
+
+        #[test]
+        fn ep2_validate_rejects_missing_dummy_for_distinct_dtype() {
+            // Distinct canonical dtype MQ4 with NO staged dummy.
+            let r = ep2_resolver();
+            let proj = ep2_projection_with(vec![]);
+            let errs = ep2_validate(&proj, &r).unwrap_err();
+            assert!(
+                errs.iter()
+                    .any(|e| matches!(e, Qwen35MoeValidationError::Ep2DummyMissing(_))),
+                "expected Ep2DummyMissing, got {errs:?}"
+            );
+        }
+
+        #[test]
+        fn ep2_validate_rejects_duplicate_dummy_dtype() {
+            // Two dummy descriptors claiming the same MQ4 dtype.
+            let mut r = ep2_resolver();
+            r.insert(
+                "ep2_dummy_mq4_dup",
+                (DType::MQ4G256, vec![1024, 256], MQ4_GU_BYTES),
+            );
+            let mut dup = mq4_dummy();
+            dup.key = "ep2_dummy_mq4_dup";
+            let proj = ep2_projection_with(vec![mq4_dummy(), dup]);
+            let errs = ep2_validate(&proj, &r).unwrap_err();
+            assert!(
+                errs.iter()
+                    .any(|e| matches!(e, Qwen35MoeValidationError::Ep2DummyDuplicate(_))),
+                "expected Ep2DummyDuplicate, got {errs:?}"
+            );
+        }
+
+        #[test]
+        fn ep2_validate_rejects_stray_dummy_for_non_canonical_dtype() {
+            // A dummy whose dtype has no canonical gate-up representative
+            // must be rejected (not silently ignored).
+            let r = ep2_resolver();
+            let proj = ep2_projection_with(vec![mq4_dummy(), mq6_dummy()]);
+            let errs = ep2_validate(&proj, &r).unwrap_err();
+            assert!(
+                errs.iter()
+                    .any(|e| matches!(e, Qwen35MoeValidationError::Ep2DummyDuplicate(_))),
+                "expected Ep2DummyDuplicate for the stray MQ6 dummy, got {errs:?}"
+            );
+        }
+
+        #[test]
+        fn ep2_validate_rejects_foreign_dummy_cell_id() {
+            // Descriptor's cell ID does not resolve in the store.
+            let mut foreign = mq4_dummy();
+            foreign.key = "ep2_dummy_foreign";
+            let r = ep2_resolver();
+            let proj = ep2_projection_with(vec![foreign]);
+            let errs = ep2_validate(&proj, &r).unwrap_err();
+            assert!(
+                errs.iter()
+                    .any(|e| matches!(e, Qwen35MoeValidationError::Ep2DummyInvalidId(_))),
+                "expected Ep2DummyInvalidId, got {errs:?}"
+            );
+        }
+
+        #[test]
+        fn ep2_validate_rejects_wrong_dummy_store_dtype() {
+            // The store tensor behind the dummy key has a different dtype
+            // than the descriptor (and the canonical representative).
+            let mut r = ep2_resolver();
+            r.insert(
+                "ep2_dummy_mq4",
+                (DType::MQ6G256, vec![1024, 256], MQ6_GU_BYTES),
+            );
+            let proj = ep2_projection_with(vec![mq4_dummy()]);
+            let errs = ep2_validate(&proj, &r).unwrap_err();
+            assert!(
+                errs.iter()
+                    .any(|e| matches!(e, Qwen35MoeValidationError::Ep2DummyDtype(_))),
+                "expected Ep2DummyDtype, got {errs:?}"
+            );
+        }
+
+        #[test]
+        fn ep2_validate_rejects_wrong_dummy_store_shape() {
+            let mut r = ep2_resolver();
+            r.insert("ep2_dummy_mq4", (DType::MQ4G256, vec![512, 256], 512 * 136));
+            let proj = ep2_projection_with(vec![mq4_dummy()]);
+            let errs = ep2_validate(&proj, &r).unwrap_err();
+            assert!(
+                errs.iter()
+                    .any(|e| matches!(e, Qwen35MoeValidationError::Ep2DummyShape(_))),
+                "expected Ep2DummyShape, got {errs:?}"
+            );
+        }
+
+        #[test]
+        fn ep2_validate_rejects_wrong_dummy_store_byte_len() {
+            // Descriptor says MQ4_GU_BYTES but the store allocation has a
+            // different byte length.
+            let mut r = ep2_resolver();
+            r.insert(
+                "ep2_dummy_mq4",
+                (DType::MQ4G256, vec![1024, 256], MQ4_GU_BYTES + 16),
+            );
+            let proj = ep2_projection_with(vec![mq4_dummy()]);
+            let errs = ep2_validate(&proj, &r).unwrap_err();
+            assert!(
+                errs.iter()
+                    .any(|e| matches!(e, Qwen35MoeValidationError::Ep2DummyByteLen(_))),
+                "expected Ep2DummyByteLen, got {errs:?}"
+            );
+        }
+
+        #[test]
+        fn ep2_validate_rejects_wrong_dummy_descriptor_shape_and_byte_len() {
+            // The descriptor metadata itself disagrees with the canonical
+            // representative (store tensor still matches the descriptor).
+            let mut r = ep2_resolver();
+            r.insert("ep2_dummy_mq4", (DType::MQ4G256, vec![512, 256], 512 * 136));
+            let proj = ep2_projection_with(vec![Ep2DummyDescriptor {
+                key: "ep2_dummy_mq4",
+                dtype: DType::MQ4G256,
+                shape: vec![512, 256],
+                byte_len: 512 * 136,
+            }]);
+            let errs = ep2_validate(&proj, &r).unwrap_err();
+            assert!(
+                errs.iter()
+                    .any(|e| matches!(e, Qwen35MoeValidationError::Ep2DummyShape(_)))
+                    && errs
+                        .iter()
+                        .any(|e| matches!(e, Qwen35MoeValidationError::Ep2DummyByteLen(_))),
+                "expected descriptor-vs-representative shape AND byte-length \
+                 mismatches, got {errs:?}"
+            );
+        }
+
+        #[test]
+        fn ep2_validate_rejects_same_dtype_canonical_layout_mismatch() {
+            // Defense in depth: two canonical MQ4 gate-up tensors with
+            // different allocated byte lengths must be refused.
+            let mut r = ep2_resolver();
+            r.insert(
+                "expert.1.gate_up",
+                (DType::MQ4G256, vec![1024, 256], MQ4_GU_BYTES * 2),
+            );
+            let proj = ep2_projection_with(vec![mq4_dummy()]);
+            let errs = ep2_validate(&proj, &r).unwrap_err();
+            assert!(
+                errs.iter()
+                    .any(|e| matches!(e, Qwen35MoeValidationError::Ep2DummyByteLen(_))),
+                "expected Ep2DummyByteLen for the canonical layout mismatch, got {errs:?}"
+            );
+        }
+
+        #[test]
+        fn ep2_validate_requires_both_rank_pointer_tables() {
+            // A projection missing one rank table must be rejected.
+            let r = ep2_resolver();
+            let mut proj = ep2_projection_with(vec![mq4_dummy()]);
+            proj.ep2_gate_up_ptrs = [
+                None,
+                Some(MoeDerivedDescriptor {
+                    key: "ep2_gu_rank1",
+                }),
+            ];
+            let errs = ep2_validate(&proj, &r).unwrap_err();
+            assert!(
+                errs.iter()
+                    .any(|e| matches!(e, Qwen35MoeValidationError::MissingCell(_))),
+                "expected MissingCell for the missing rank 0 table, got {errs:?}"
+            );
+            assert_eq!(
+                errs.iter()
+                    .filter(|e| matches!(e, Qwen35MoeValidationError::MissingCell(_)))
+                    .count(),
+                1
+            );
+        }
+
+        #[test]
+        fn ep2_validate_rejects_rank_table_wrong_shape_and_dtype() {
+            // Both rank tables present but rank 0 has the wrong shape and
+            // rank 1 the wrong dtype.
+            let mut r = ep2_resolver();
+            r.insert("ep2_gu_rank0", (DType::Raw, vec![16], 16));
+            r.insert("ep2_gu_rank1", (DType::F32, vec![32], 128));
+            let proj = ep2_projection_with(vec![mq4_dummy()]);
+            let errs = ep2_validate(&proj, &r).unwrap_err();
+            assert!(
+                errs.iter()
+                    .any(|e| matches!(e, Qwen35MoeValidationError::PointerTableShape(_))),
+                "expected PointerTableShape for rank 0, got {errs:?}"
+            );
+            assert!(
+                errs.iter()
+                    .any(|e| matches!(e, Qwen35MoeValidationError::PointerTableDtype(_))),
+                "expected PointerTableDtype for rank 1, got {errs:?}"
+            );
+        }
+
+        #[test]
+        fn ep2_validate_rejects_rank_table_short_byte_len() {
+            // Correct dtype (Raw) and correct shape ([num_experts * 8]) but
+            // a SHORT live allocation (16 bytes instead of 32) must be
+            // refused: a truncated pointer table would let the indexed
+            // kernel read past the allocation.
+            let mut r = ep2_resolver();
+            r.insert("ep2_gu_rank0", (DType::Raw, vec![32], 16));
+            let proj = ep2_projection_with(vec![mq4_dummy()]);
+            let errs = ep2_validate(&proj, &r).unwrap_err();
+            assert!(
+                errs.iter()
+                    .any(|e| matches!(e, Qwen35MoeValidationError::Ep2RankTableByteLen(_))),
+                "expected Ep2RankTableByteLen for the short rank-0 allocation, got {errs:?}"
+            );
+        }
+
+        #[test]
+        fn ep2_validate_rejects_duplicate_rank_table_ids() {
+            // Rank 0 and rank 1 must not share one pointer-table cell ID:
+            // both partitions would silently read the same mask.
+            let r = ep2_resolver();
+            let mut proj = ep2_projection_with(vec![mq4_dummy()]);
+            proj.ep2_gate_up_ptrs = [
+                Some(MoeDerivedDescriptor {
+                    key: "ep2_gu_rank0",
+                }),
+                Some(MoeDerivedDescriptor {
+                    key: "ep2_gu_rank0",
+                }),
+            ];
+            let errs = ep2_validate(&proj, &r).unwrap_err();
+            assert!(
+                errs.iter()
+                    .any(|e| matches!(e, Qwen35MoeValidationError::Ep2RankTableAlias(_))),
+                "expected Ep2RankTableAlias for the shared rank cell ID, got {errs:?}"
+            );
+        }
+
+        #[test]
+        fn ep2_validate_rejects_rank_table_aliasing_canonical() {
+            // A rank table must not alias the CANONICAL gate-up pointer
+            // table: the EP2 bind would silently fall back to the unmasked
+            // mask and fake the partition evidence.
+            let r = ep2_resolver();
+            let mut proj = ep2_projection_with(vec![mq4_dummy()]);
+            proj.ep2_gate_up_ptrs = [
+                Some(MoeDerivedDescriptor {
+                    key: "gate_up_ptrs",
+                }),
+                Some(MoeDerivedDescriptor {
+                    key: "ep2_gu_rank1",
+                }),
+            ];
+            let errs = ep2_validate(&proj, &r).unwrap_err();
+            assert!(
+                errs.iter()
+                    .any(|e| matches!(e, Qwen35MoeValidationError::Ep2RankTableAlias(_))),
+                "expected Ep2RankTableAlias for the canonical alias, got {errs:?}"
+            );
+        }
+
+        #[test]
+        fn ep2_validate_mixed_admitted_dtypes_requires_and_accepts_two_dummies() {
+            // Mixed routed gate-up dtypes (MQ4 + MQ6, both admitted) need
+            // exactly two dummies: one per distinct dtype, each matched to
+            // its own representative layout.
+            let mut r = ep2_resolver();
+            r.insert(
+                "expert.2.gate_up",
+                (DType::MQ6G256, vec![1024, 256], MQ6_GU_BYTES),
+            );
+            r.insert(
+                "expert.3.gate_up",
+                (DType::MQ6G256, vec![1024, 256], MQ6_GU_BYTES),
+            );
+            r.insert(
+                "ep2_dummy_mq6",
+                (DType::MQ6G256, vec![1024, 256], MQ6_GU_BYTES),
+            );
+
+            // MQ6 dummy missing → rejected.
+            let proj_missing = ep2_projection_with(vec![mq4_dummy()]);
+            let errs = ep2_validate(&proj_missing, &r).unwrap_err();
+            assert!(
+                errs.iter()
+                    .any(|e| matches!(e, Qwen35MoeValidationError::Ep2DummyMissing(_))),
+                "expected Ep2DummyMissing for MQ6, got {errs:?}"
+            );
+
+            // Both dummies present → accepted.
+            let proj = ep2_projection_with(vec![mq4_dummy(), mq6_dummy()]);
+            let result = ep2_validate(&proj, &r);
+            assert!(
+                result.is_ok(),
+                "one MQ4 dummy + one MQ6 dummy must validate: {result:?}"
+            );
+        }
+
+        #[test]
+        #[ignore = "requires an AMD GPU; emulated EP2 resident build and rank-masked binding"]
+        fn frozen_moe_resident_ep2_build_bind_rank_tables_and_canonical_unaffected() {
+            // Full one-owner staging: the canonical table, both rank tables,
+            // and the zero dummies all freeze inside ONE store.  The canonical
+            // bind must be unaffected; the EP2 bind must select the rank
+            // table with dtype-matched masking for non-owned experts.
+            let _lock = GPU_TEST_LOCK.lock().unwrap();
+            let mut gpu = Gpu::init().expect("GPU required for EP2 resident build");
+            let config = frozen_moe_config(&["full_attention"]);
+            let manifest = Qwen35::weight_manifest(&config);
+            let prepared = prepare_frozen_hfq_manifest(&config, &manifest).unwrap();
+            let moe_entries = prepared.into_moe();
+
+            let source = |entry: &WeightEntry| -> Result<(Vec<u8>, DType), String> {
+                let n = entry.logical_shape.iter().product::<usize>();
+                let (bytes, dtype) = if entry.name.ends_with(AWQ_SUFFIX) {
+                    // F16 scale bytes for AWQ companions
+                    (vec![0u8; n * 2], DType::F16)
+                } else {
+                    // MQ4 routed experts: Frozen admission requires an
+                    // indexable routed dtype (F32 is refused at dispatch).
+                    // Use VALID packed serialization, not fake `n * 4`
+                    // element-sized bytes: MQ4-G256 packs 136 bytes per
+                    // 256-weight group, `m * (k/256) * 136` bytes total.
+                    let shape = &entry.logical_shape;
+                    let m = shape.first().copied().unwrap_or(0);
+                    let k: usize = shape.iter().skip(1).product();
+                    let packed = m * (k / 256).max(1) * 136;
+                    (vec![0u8; packed], DType::MQ4G256)
+                };
+                Ok((bytes, dtype))
+            };
+
+            let dispatch_ctx = hipfire_dispatch::context::DispatchCtx::new(&gpu);
+            let plan =
+                EmulatedExpertPartitionPlan::stride2(config.num_experts).expect("valid EP2 plan");
+            let resident = build_frozen_moe_resident_ep2(
+                &mut gpu,
+                &config,
+                &moe_entries,
+                &source,
+                &dispatch_ctx,
+                true,
+                &plan,
+            )
+            .expect("EP2 resident build must succeed");
+
+            let n = config.num_experts;
+            let canonical = resident.bind_layer(0).expect("canonical bind must succeed");
+            assert_eq!(canonical.num_experts(), n);
+            let canonical_ptrs = canonical.gate_up_ptrs().expect("canonical table");
+
+            let rank0 = resident
+                .bind_layer_ep2(0, 0)
+                .expect("rank0 bind must succeed");
+            let rank1 = resident
+                .bind_layer_ep2(0, 1)
+                .expect("rank1 bind must succeed");
+            let r0 = rank0.gate_up_ptrs().expect("rank0 table");
+            let r1 = rank1.gate_up_ptrs().expect("rank1 table");
+
+            let canonical_addr = canonical_ptrs.buf.as_ptr() as u64;
+            let r0_addr = r0.buf.as_ptr() as u64;
+            let r1_addr = r1.buf.as_ptr() as u64;
+            assert_ne!(
+                r0_addr, canonical_addr,
+                "rank 0 table must be a distinct store cell"
+            );
+            assert_ne!(
+                r1_addr, canonical_addr,
+                "rank 1 table must be a distinct store cell"
+            );
+            assert_ne!(r0_addr, r1_addr, "rank tables must be distinct cells");
+            assert_eq!(
+                r0.buf.size(),
+                n * 8,
+                "rank 0 gate-up pointer table allocation must be exactly n*8 bytes"
+            );
+            assert_eq!(
+                r1.buf.size(),
+                n * 8,
+                "rank 1 gate-up pointer table allocation must be exactly n*8 bytes"
+            );
+
+            // Mask content (read back): owned experts keep their canonical
+            // gate-up pointer; non-owned experts point at a zero dummy that
+            // is SHARED across same-dtype masked slots.
+            let canonical_gu: Vec<u64> = (0..n)
+                .map(|i| canonical.expert_gate_up(i).unwrap().buf.as_ptr() as u64)
+                .collect();
+            let dtypes: Vec<DType> = (0..n)
+                .map(|i| canonical.expert_gate_up(i).unwrap().dtype)
+                .collect();
+            let mut table_bytes = vec![0u8; n * 8];
+            gpu.hip
+                .memcpy_dtoh(&mut table_bytes, &r0.buf)
+                .expect("rank0 table readback");
+            let table: Vec<u64> = table_bytes
+                .chunks_exact(8)
+                .map(|c| u64::from_ne_bytes(c.try_into().unwrap()))
+                .collect();
+            let mut dummies: Vec<Option<u64>> = vec![None; n];
+            for i in 0..n {
+                if plan.owner_of(i) == Some(0) {
+                    assert_eq!(
+                        table[i], canonical_gu[i],
+                        "owned expert {i} must keep its canonical gate-up pointer"
+                    );
+                } else {
+                    assert_ne!(
+                        table[i], canonical_gu[i],
+                        "masked expert {i} must not alias a canonical gate-up buffer"
+                    );
+                    assert_ne!(
+                        table[i], canonical_addr,
+                        "masked expert {i} must not alias the pointer table itself"
+                    );
+                    dummies[i] = Some(table[i]);
+                }
+            }
+            for i in 0..n {
+                let Some(di) = dummies[i] else { continue };
+                for j in (i + 1)..n {
+                    let Some(dj) = dummies[j] else { continue };
+                    assert_eq!(
+                        di, dj,
+                        "masked experts {i} and {j} share gate-up dtype {:?} so must share one zero dummy",
+                        dtypes[i]
+                    );
+                }
+            }
+
+            // The dummy is an EXACT zero clone of its canonical
+            // representative: same shape, same dtype, same allocation byte
+            // length, all-zero bytes.
+            let rep = canonical.expert_gate_up(0).expect("representative gate-up");
+            let dummy = resident
+                .ep2_dummy_tensor(0, DType::MQ4G256)
+                .expect("one MQ4 dummy must be staged");
+            assert_eq!(
+                dummy.shape, rep.shape,
+                "dummy shape must equal the representative's exact shape"
+            );
+            assert_eq!(
+                dummy.dtype, rep.dtype,
+                "dummy dtype must equal the representative's dtype"
+            );
+            assert_eq!(
+                dummy.buf.size(),
+                rep.buf.size(),
+                "dummy allocation byte length must equal the representative's exact byte length"
+            );
+            assert_eq!(
+                table[1],
+                dummy.buf.as_ptr() as u64,
+                "the masked rank table must point at the staged zero dummy"
+            );
+            let mut zero_bytes = vec![0xFFu8; rep.buf.size()];
+            gpu.hip
+                .memcpy_dtoh(&mut zero_bytes, &dummy.buf)
+                .expect("dummy readback");
+            assert!(
+                zero_bytes.iter().all(|&b| b == 0),
+                "dummy buffer must be exactly all-zero bytes"
+            );
+
+            // Canonical bind is UNAFFECTED by the EP2 staging: it resolves
+            // the canonical pointer table and the exact same borrowed
+            // resources as the rank-0 EP2 bind — only the gate-up pointer
+            // table cell changes.
+            assert_eq!(
+                canonical_ptrs.buf.as_ptr() as u64,
+                canonical.gate_up_ptrs().unwrap().buf.as_ptr() as u64,
+                "canonical bind_layer must keep resolving the canonical gate-up pointer table"
+            );
+            assert_eq!(
+                canonical.router().unwrap().buf.as_ptr(),
+                rank0.router().unwrap().buf.as_ptr(),
+                "router must stay borrowed and identical"
+            );
+            assert_eq!(
+                canonical.shared_expert_gate().unwrap().buf.as_ptr(),
+                rank0.shared_expert_gate().unwrap().buf.as_ptr(),
+                "shared_expert_gate must stay borrowed and identical"
+            );
+            assert_eq!(
+                canonical.shared_gate().unwrap().buf.as_ptr(),
+                rank0.shared_gate().unwrap().buf.as_ptr(),
+                "shared_gate must stay borrowed and identical"
+            );
+            assert_eq!(
+                canonical.shared_up().unwrap().buf.as_ptr(),
+                rank0.shared_up().unwrap().buf.as_ptr(),
+                "shared_up must stay borrowed and identical"
+            );
+            assert_eq!(
+                canonical.shared_down().unwrap().buf.as_ptr(),
+                rank0.shared_down().unwrap().buf.as_ptr(),
+                "shared_down must stay borrowed and identical"
+            );
+            assert_eq!(
+                canonical.down_ptrs().unwrap().buf.as_ptr(),
+                rank0.down_ptrs().unwrap().buf.as_ptr(),
+                "down pointer table must stay borrowed and identical"
+            );
+            assert_eq!(
+                canonical.down_awq_ptrs().unwrap().map(|t| t.buf.as_ptr()),
+                rank0.down_awq_ptrs().unwrap().map(|t| t.buf.as_ptr()),
+                "down AWQ pointer table must stay borrowed and identical"
+            );
+            assert_eq!(
+                canonical.dtype_tags().unwrap().map(|t| t.buf.as_ptr()),
+                rank0.dtype_tags().unwrap().map(|t| t.buf.as_ptr()),
+                "dtype tags must stay borrowed and identical"
+            );
+            for i in 0..n {
+                assert_eq!(
+                    canonical.expert_gate_up(i).unwrap().buf.as_ptr(),
+                    rank0.expert_gate_up(i).unwrap().buf.as_ptr(),
+                    "expert {i} gate-up tensor must stay borrowed and identical"
+                );
+                assert_eq!(
+                    canonical.expert_down(i).unwrap().buf.as_ptr(),
+                    rank0.expert_down(i).unwrap().buf.as_ptr(),
+                    "expert {i} down tensor must stay borrowed and identical"
+                );
+            }
+            assert_ne!(
+                canonical.gate_up_ptrs().unwrap().buf.as_ptr(),
+                rank0.gate_up_ptrs().unwrap().buf.as_ptr(),
+                "ONLY the gate-up pointer table may change on the EP2 bind"
+            );
+
+            // Rank out of range.
+            assert!(matches!(
+                resident.bind_layer_ep2(0, 2),
+                Err(Qwen35MoeBindError::Ep2RankOutOfRange { .. })
+            ));
+            // Layer out of range on the EP2 bind path.
+            assert!(matches!(
+                resident.bind_layer_ep2(1, 0),
+                Err(Qwen35MoeBindError::LayerOutOfRange { .. })
+            ));
+
+            // Clean shutdown.
+            resident.free_checked(&mut gpu).expect("free must succeed");
+            gpu.drain_pool();
+        }
+    }
+
     #[test]
     #[ignore = "requires an AMD GPU; frozen O(1) routed-ref resolution seam"]
     fn frozen_routed_expert_refs_seam_resolves_zero() {
@@ -9753,6 +10988,46 @@ mod frozen_preflight_tests {
 
     fn eligible_quant(_name: &str, _layer: Option<usize>) -> u8 {
         13 // MQ4G256 — the canonical indexed routed dtype
+    }
+
+    #[test]
+    fn synthetic_conv_q8_geometry_resolves_through_real_resolver() {
+        let config_json = dense_config_json();
+        let config = crate::qwen35::config_from_metadata_json(
+            &serde_json::json!({ "config": config_json }).to_string(),
+        )
+        .expect("fixture config must parse");
+        let entry = Qwen35::weight_manifest(&config)
+            .into_iter()
+            .find(|entry| entry.name == "conv" && entry.layer == Some(0))
+            .expect("linear-attention layer must declare conv");
+        let physical = physical_candidates(&config, &entry.name, entry.layer)
+            .into_iter()
+            .next()
+            .expect("conv physical candidate");
+        let channels = entry.logical_shape[0] / config.conv_kernel_dim;
+        let fixture = HfqFixture {
+            path: std::env::temp_dir()
+                .join(format!("hipfire-qwen35-conv-q8-{}.hfq", std::process::id())),
+        };
+        write_hfq_index(
+            &fixture.path,
+            6,
+            &config_json,
+            &[(
+                physical,
+                3,
+                vec![channels as u32, 1, config.conv_kernel_dim as u32],
+            )],
+        );
+
+        let hfq = HfqFile::open(&fixture.path).expect("fixture HFQ must open");
+        let resolved = Qwen35SourceResolver::new(&hfq, &config)
+            .resolve_metadata(&entry)
+            .expect("Q8 physical conv geometry must resolve");
+        assert_eq!(resolved.dtype, DType::Q8_0);
+        assert_eq!(resolved.shape, vec![channels, 1, config.conv_kernel_dim]);
+        let _ = std::fs::remove_file(&fixture.path);
     }
 
     /// AWQ companion tensors for every routed expert's down projection,

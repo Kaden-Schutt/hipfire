@@ -14,7 +14,44 @@
 //! `Architecture::weight_manifest` can be implemented and unit-tested for an
 //! arch (transcribing its existing imperative loader) *before* the fulfillment
 //! loop exists. See docs/superpowers/plans/2026-07-05-device-mesh-transparent-parallelism.md §4.
+//!
+//! ## Static expert policy vs effective projection
+//!
+//! A static manifest entry's [`ShardPolicy`] is authored once and describes
+//! the *logical source layout* — MoE projections are typically declared as
+//! [`ShardPolicy::ExpertSharded`] packed surrogates — which cannot
+//! simultaneously describe Single, TP, and EP materialization.
+//! [`resolve_expert_manifest_for_policy`] projects only the projection sources
+//! explicitly claimed by an [`ExpertSourceLayout`] to the effective resident
+//! placement for one exact execution policy, on a **clone** of the full static
+//! manifest: the clone is strictly validated and resolved, its residual
+//! per-weight collectives derived, and then it is dropped. The original
+//! manifest and specs are never mutated. Projection-path TP eligibility
+//! additionally enforces role-dimension divisibility by the exact TP rank
+//! count and local slice width `% 256 == 0` for every rank count including
+//! Tp=1 (where the frozen strict validator's `tp > 1` gate does not apply);
+//! the strict validator and resolver semantics are unchanged.
+//!
+//! ## Logical source ownership vs loader fusion
+//!
+//! [`ExpertSourceLayout`] claims are *logical* source ownership: every
+//! projection source (gate/up/down, per expert or packed) the group needs.
+//! Loader fusion is *materialization* — a loader may fuse gate+up into one
+//! runtime blob, but the manifest must still claim every logical source (a
+//! fused runtime blob is declared `PackedFused`, separate logical gate/up/down
+//! sources declare `PackedSeparate`). No source may be hidden: unclaimed
+//! entries keep their static policy and remain visible in the residual
+//! per-weight collective schedule.
+//!
+//! ## Collective authority
+//!
+//! A declared group's single post-combine collective derives solely from its
+//! [`ExpertParallelism`]; projected source policies are placement evidence and
+//! never become per-weight collective authority. The undeclared-family legacy
+//! schedule ([`layer_collectives`]) remains policy-derived for manifests
+//! without expert groups.
 
+use crate::moe_plan::{MoEExecutionKind, MoEExecutionPolicy};
 use crate::tp_shard::ExpertAssign;
 use hipfire_hardware::{CollectiveHint, DeviceMesh, DimKind};
 use rdna_compute::DType;
@@ -25,6 +62,11 @@ use rdna_compute::DType;
 /// manifest AND a hand-written hint at lowering (which risks a silent
 /// forgotten-reduce). Row-parallel dense → all-reduce over `Tp`; expert-sharded
 /// MoE → all-reduce over `Ep`. Column/replicate/pin/etc. need no output reduce.
+/// This is the **undeclared-family** schedule: it maps every collective-bearing
+/// policy, so [`layer_collectives`] stays complete for manifests that do not
+/// declare expert groups. Declared expert groups instead use
+/// [`layer_collectives_for_declared_groups`], which excludes their claimed
+/// projections from this map.
 /// (PP `BandXfer` is a per-layer-boundary concern, not per-op — handled by the
 /// pipeline driver, not this map.)
 pub fn collective_for_policy(policy: &ShardPolicy) -> Option<CollectiveHint> {
@@ -79,13 +121,49 @@ pub fn placement_devices(entry: &WeightEntry, mesh: &DeviceMesh, n_layers: usize
 /// the manifest's sharded weights (single source of truth — see
 /// [`collective_for_policy`]). Each `(layer, hint)` is a reduce a row-sharded or
 /// expert-sharded weight in that layer implies; the executor applies it over the
-/// mesh group at run time. PP `BandXfer` (inter-layer) comes from
-/// [`hipfire_hardware::DeviceMesh::band_xfer_after`], not this per-op map.
+/// mesh group at run time. This legacy schedule covers every collective-bearing
+/// entry; manifests that declare expert groups should use
+/// [`layer_collectives_for_declared_groups`] instead. PP `BandXfer`
+/// (inter-layer) comes from [`hipfire_hardware::DeviceMesh::band_xfer_after`],
+/// not this per-op map.
 pub fn layer_collectives(manifest: &[WeightEntry]) -> Vec<(usize, CollectiveHint)> {
     manifest
         .iter()
         .filter_map(|e| Some((e.layer?, collective_for_policy(&e.policy)?)))
         .collect()
+}
+
+/// The per-layer all-reduce schedule for a manifest whose expert groups are
+/// **declared** via [`ExpertGroupSpec`]s. Validates the declarations (shape,
+/// group/layer identity, declared-source ownership, manifest references),
+/// then retains the policy-derived schedule for every entry
+/// except the expert projection sources claimed by the declared groups —
+/// those are owned by the group plan's single post-combine collective, so they
+/// must not schedule per-weight reduces here. Unclaimed entries keep their
+/// [`collective_for_policy`] scheduling unchanged.
+pub fn layer_collectives_for_declared_groups(
+    manifest: &[WeightEntry],
+    specs: &[ExpertGroupSpec],
+    group_size: usize,
+) -> Result<Vec<(usize, CollectiveHint)>, String> {
+    validate_expert_group_specs(specs, manifest, group_size)?;
+    let mut claimed: std::collections::HashSet<(&str, Option<usize>)> =
+        std::collections::HashSet::new();
+    for spec in specs {
+        for name in expert_projection_sources(spec) {
+            claimed.insert((name, spec.layer));
+        }
+    }
+    Ok(manifest
+        .iter()
+        .filter_map(|e| {
+            let layer = e.layer?;
+            if claimed.contains(&(e.name.as_str(), e.layer)) {
+                return None;
+            }
+            Some((layer, collective_for_policy(&e.policy)?))
+        })
+        .collect())
 }
 
 /// A fully-resolved placement for one weight: the device ids it occupies.
@@ -199,7 +277,7 @@ pub fn validate_manifest(manifest: &[WeightEntry], mesh: &DeviceMesh) -> Result<
                 }
             }
             ShardPolicy::ExpertTensorSharded { n_experts, inner } => {
-                if e.logical_shape.len() != 3 || e.logical_shape.iter().any(|&dim| dim == 0) {
+                if e.logical_shape.len() != 3 || e.logical_shape.contains(&0) {
                     return Err(format!(
                         "{}: ExpertTensorSharded logical_shape {:?} must be 3D with no zero dimensions",
                         ctx(),
@@ -237,7 +315,7 @@ pub fn validate_manifest(manifest: &[WeightEntry], mesh: &DeviceMesh) -> Result<
                     }
                 };
                 let d = e.logical_shape.get(axis).copied().unwrap_or(0);
-                if tp > 1 && !(d % tp == 0 && (d / tp) % 256 == 0) {
+                if tp > 1 && !(d % tp == 0 && (d / tp).is_multiple_of(256)) {
                     return Err(format!(
                         "{}: ExpertTensorSharded {} dim {d} (axis {}) \
                          not divisible by Tp={tp} \
@@ -552,7 +630,7 @@ pub struct ExpertResourceRequirements {
 }
 
 /// The only collectives admitted by an expert-group plan. The variant encodes
-/// both post-combine ordering and the policy-derived collective axis.
+/// both post-combine ordering and the parallelism-derived collective axis.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ExpertPostCombineAllReduce {
     TensorParallel,
@@ -578,12 +656,43 @@ fn post_combine_for_parallelism(
     }
 }
 
+/// Manifest-owned canonical execution identity of an expert group. The typed
+/// dispatch `ExpertExecutionPlan` maps onto this enum exhaustively at lowering
+/// (moe_plan's `From` impl); the manifest declares which members its group
+/// admits. Canonical labels (`indexed_quantized`, `grouped_quantized`,
+/// `per_expert_fallback`) are stable contract labels used by every diagnostic
+/// and display path — never re-derived by string parsing.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum ExpertExecutionIdentity {
+    IndexedQuantized,
+    GroupedQuantized,
+    PerExpertFallback,
+}
+
+impl ExpertExecutionIdentity {
+    /// The stable canonical contract label of this identity.
+    pub const fn canonical_label(self) -> &'static str {
+        match self {
+            Self::IndexedQuantized => "indexed_quantized",
+            Self::GroupedQuantized => "grouped_quantized",
+            Self::PerExpertFallback => "per_expert_fallback",
+        }
+    }
+}
+
+impl std::fmt::Display for ExpertExecutionIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.canonical_label())
+    }
+}
+
 /// Architecture-declared description of one logical expert group.
 ///
-/// The strings are stable manifest references: `router` names the router
-/// weight/plan consumed by the existing router machinery and `execution` names
-/// the arch execution plan. Keeping these references symbolic avoids coupling
-/// this CPU-only manifest to feature-gated GPU or pager types.
+/// `router` is a stable manifest weight reference consumed by the existing
+/// router machinery; `router_identity` and `allowed_executions` are canonical
+/// semantic identities (not manifest references) naming the routing algorithm
+/// and the execution plans the group admits. Keeping these symbolic avoids
+/// coupling this CPU-only manifest to feature-gated GPU or pager types.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct ExpertGroupSpec {
     /// Stable architecture identity for this logical MoE block.
@@ -596,8 +705,15 @@ pub struct ExpertGroupSpec {
     pub assignment: ExpertAssign,
     pub source_layout: ExpertSourceLayout,
     pub resources: ExpertResourceRequirements,
+    /// Manifest weight reference consumed by the router machinery (e.g. `mlp.gate`).
     pub router: String,
-    pub execution: String,
+    /// Canonical routing algorithm identity: `softmax_topk`, `sigmoid_topk`,
+    /// `bias_aware_topk`, `hash`, or `precomputed`.
+    pub router_identity: String,
+    /// Non-empty, duplicate-free set of execution identities this group
+    /// admits. Lowering accepts exact typed membership only; the CPU
+    /// fallback is never declared here (it lives outside lowering).
+    pub allowed_executions: Vec<ExpertExecutionIdentity>,
 }
 
 /// One resolved global expert id and its compact local slot on the owning
@@ -616,13 +732,20 @@ pub struct ExpertGroupPlan {
     pub group: String,
     pub layer: Option<usize>,
     pub n_experts: usize,
+    pub group_size: usize,
     pub parallelism: ExpertParallelism,
     pub assignment: ExpertAssign,
     pub experts: Vec<ExpertPlacement>,
     pub source_layout: ExpertSourceLayout,
     pub resources: ExpertResourceRequirements,
+    /// Manifest weight reference consumed by the router machinery (e.g. `mlp.gate`).
     pub router: String,
-    pub execution: String,
+    /// Canonical routing algorithm identity: `softmax_topk`, `sigmoid_topk`,
+    /// `bias_aware_topk`, `hash`, or `precomputed`.
+    pub router_identity: String,
+    /// The execution identities the group admits (mirrors the spec's
+    /// declaration; membership is checked at lowering, never by label parsing).
+    pub allowed_executions: Vec<ExpertExecutionIdentity>,
     pub collective: Option<ExpertPostCombineAllReduce>,
 }
 
@@ -630,7 +753,40 @@ fn expert_context(spec: &ExpertGroupSpec) -> String {
     format!("expert group '{}' layer {:?}", spec.group, spec.layer)
 }
 
-fn validate_expert_group_shape(spec: &ExpertGroupSpec, group_size: usize) -> Result<(), String> {
+/// The gate/up/down expert projection references claimed by a declared group
+/// across every [`ExpertSourceLayout`] variant — deliberately **not** the
+/// router or sidecars. Used for declared-source ownership (each `(source,
+/// layer)` may be claimed once) and for contextual schedule exclusion (the
+/// declared-group collective schedule drops exactly these projections).
+fn expert_projection_sources(spec: &ExpertGroupSpec) -> Vec<&str> {
+    match &spec.source_layout {
+        ExpertSourceLayout::PackedFused { gate_up, down, .. } => {
+            vec![gate_up.as_str(), down.as_str()]
+        }
+        ExpertSourceLayout::PackedSeparate { gate, up, down, .. } => {
+            vec![gate.as_str(), up.as_str(), down.as_str()]
+        }
+        ExpertSourceLayout::PerExpertFused { gate_up, down, .. } => gate_up
+            .iter()
+            .chain(down.iter())
+            .map(String::as_str)
+            .collect(),
+        ExpertSourceLayout::PerExpertSeparate { gate, up, down, .. } => gate
+            .iter()
+            .chain(up.iter())
+            .chain(down.iter())
+            .map(String::as_str)
+            .collect(),
+    }
+}
+
+/// Validate one expert group's structural metadata and non-empty semantic
+/// identities (group size, expert count, resources, group/router_identity
+/// labels, and the non-empty duplicate-free allowed-execution admission set)
+/// without resolving manifest references. Typed semantic identity matching
+/// against the actual `RouterSelection` / `ExpertExecutionPlan` is moe_plan's
+/// concern (Task 3), not manifest resolution.
+fn validate_expert_group_metadata(spec: &ExpertGroupSpec, group_size: usize) -> Result<(), String> {
     let context = expert_context(spec);
     if group_size == 0 {
         return Err(format!("{context}: group_size=0 is invalid"));
@@ -649,7 +805,7 @@ fn validate_expert_group_shape(spec: &ExpertGroupSpec, group_size: usize) -> Res
         }
         ExpertParallelism::TensorParallel | ExpertParallelism::ExpertParallel => {
             if spec.parallelism == ExpertParallelism::ExpertParallel
-                && spec.n_experts % group_size != 0
+                && !spec.n_experts.is_multiple_of(group_size)
             {
                 return Err(format!(
                     "{context}: n_experts={} must divide evenly across group_size={group_size}",
@@ -668,17 +824,33 @@ fn validate_expert_group_shape(spec: &ExpertGroupSpec, group_size: usize) -> Res
         ));
     }
     if spec.group.is_empty() {
-        return Err(format!("{context}: group reference '' is invalid"));
+        return Err(format!("{context}: group identity '' is invalid"));
     }
-    if spec.execution.is_empty() {
-        return Err(format!("{context}: execution reference '' is invalid"));
+    if spec.router_identity.is_empty() {
+        return Err(format!("{context}: router identity '' is invalid"));
+    }
+    // The allowed-execution admission set must be non-empty and
+    // duplicate-free; the duplicate is reported deterministically with its
+    // canonical label. Allocation-free declaration-order scan: each identity
+    // is checked against every preceding one, so the FIRST duplicate in
+    // declaration order is always the one reported.
+    if spec.allowed_executions.is_empty() {
+        return Err(format!("{context}: allowed execution identities is empty"));
+    }
+    for (idx, identity) in spec.allowed_executions.iter().enumerate() {
+        if spec.allowed_executions[..idx].contains(identity) {
+            return Err(format!(
+                "{context}: allowed execution identities contains duplicate '{}'",
+                identity.canonical_label()
+            ));
+        }
     }
     Ok(())
 }
 
 /// Validate one expert group without checking manifest references.
 pub fn validate_expert_group_spec(spec: &ExpertGroupSpec, group_size: usize) -> Result<(), String> {
-    validate_expert_group_shape(spec, group_size)
+    validate_expert_group_metadata(spec, group_size)
 }
 
 fn validate_manifest_reference<'a>(
@@ -707,6 +879,19 @@ fn validate_manifest_reference<'a>(
         .ok_or_else(|| format!("{context}: {label} reference '{name}' not found in manifest scope"))
 }
 
+/// A *direct* collective-bearing placement policy on a claimed expert
+/// projection competes with the group's single post-combine collective and
+/// must be rejected before any generic incompatible-policy error. Top-level
+/// `ExpertSharded` / `ExpertTensorSharded` placement policies are **not**
+/// competing: they describe placement (and their inner/assigned collectives
+/// are exactly what the group plan schedules once).
+fn is_competing_per_weight_collective(policy: &ShardPolicy) -> bool {
+    match policy {
+        ShardPolicy::ExpertSharded { .. } | ShardPolicy::ExpertTensorSharded { .. } => false,
+        policy => collective_for_policy(policy).is_some(),
+    }
+}
+
 fn validate_source_policy(
     spec: &ExpertGroupSpec,
     entry: &WeightEntry,
@@ -714,6 +899,12 @@ fn validate_source_policy(
     role: ProjectionRole,
 ) -> Result<(), String> {
     let context = expert_context(spec);
+    if is_competing_per_weight_collective(&entry.policy) {
+        return Err(format!(
+            "{context}: {label} reference '{}' has a competing per-weight collective (policy {:?}); expert-group collectives are group-level",
+            entry.name, entry.policy
+        ));
+    }
     match spec.parallelism {
         ExpertParallelism::Single => {
             if !matches!(
@@ -778,25 +969,6 @@ fn validate_source_policy(
     Ok(())
 }
 
-fn validate_unique_per_expert_sources(
-    spec: &ExpertGroupSpec,
-    groups: &[(&str, &[String])],
-) -> Result<(), String> {
-    let mut names = std::collections::HashSet::new();
-    for (label, refs) in groups {
-        for (idx, name) in refs.iter().enumerate() {
-            if !names.insert(name.as_str()) {
-                return Err(format!(
-                    "{}: duplicate per-expert source '{}' at {label}[{idx}]",
-                    expert_context(spec),
-                    name
-                ));
-            }
-        }
-    }
-    Ok(())
-}
-
 #[derive(Clone, Copy)]
 enum ProjectionRole {
     GateUp,
@@ -850,7 +1022,7 @@ fn validate_packed_projection(
     role: ProjectionRole,
 ) -> Result<(), String> {
     let entry = validate_manifest_reference(spec, manifest, label, name)?;
-    if entry.logical_shape.len() != 3 || entry.logical_shape.iter().any(|&dim| dim == 0) {
+    if entry.logical_shape.len() != 3 || entry.logical_shape.contains(&0) {
         return Err(format!(
             "{}: {label} reference '{}' logical_shape {:?} must be 3D with no zero dimensions",
             expert_context(spec),
@@ -947,9 +1119,22 @@ fn validate_expert_group_references(
             router.logical_shape
         ));
     }
-    if router.logical_shape.last().copied() != Some(spec.n_experts) {
+    // Zero dimensions are invalid at any rank (most importantly rank-two
+    // `[n_experts, 0]`) and are rejected before the experts-first check.
+    if router.logical_shape.contains(&0) {
         return Err(format!(
-            "{}: router reference '{}' has logical_shape {:?}; last dimension must equal n_experts={}",
+            "{}: router reference '{}' has logical_shape {:?}; router dimensions must be nonzero",
+            expert_context(spec),
+            router.name,
+            router.logical_shape
+        ));
+    }
+    // Routers are experts-first: rank one `[n_experts]`, rank two
+    // `[n_experts, input_dim]`. Validation checks the FIRST dimension exactly
+    // and rejects the transposed `[input_dim, n_experts]` form.
+    if router.logical_shape.first().copied() != Some(spec.n_experts) {
+        return Err(format!(
+            "{}: router reference '{}' has logical_shape {:?}; first dimension must equal n_experts={}",
             expert_context(spec), router.name, router.logical_shape, spec.n_experts
         ));
     }
@@ -1012,10 +1197,6 @@ fn validate_expert_group_references(
             down,
             sidecars,
         } => {
-            validate_unique_per_expert_sources(
-                spec,
-                &[("source gate_up", gate_up), ("source down", down)],
-            )?;
             validate_per_expert_projection(
                 spec,
                 manifest,
@@ -1038,14 +1219,6 @@ fn validate_expert_group_references(
             down,
             sidecars,
         } => {
-            validate_unique_per_expert_sources(
-                spec,
-                &[
-                    ("source gate", gate),
-                    ("source up", up),
-                    ("source down", down),
-                ],
-            )?;
             validate_per_expert_projection(
                 spec,
                 manifest,
@@ -1073,9 +1246,157 @@ fn validate_expert_group_references(
     Ok(())
 }
 
-/// Validate all architecture-declared expert groups against the weight
-/// manifest, including stable group/layer identity and manifest scope.
-pub fn validate_expert_group_specs(
+/// Deterministic declared-source ownership: every `(source, layer)` pair may
+/// be claimed by exactly one declared group — and by at most one projection
+/// within a single group (a group repeating a source is malformed on its own).
+/// Specs are traversed in declaration order so the first claimant is stable,
+/// and a cross-group conflict error names the source plus the first and
+/// second groups. Routers and sidecars remain excluded: they are not expert
+/// projections.
+fn validate_declared_source_ownership(specs: &[ExpertGroupSpec]) -> Result<(), String> {
+    let mut owners: std::collections::HashMap<(&str, Option<usize>), &str> =
+        std::collections::HashMap::new();
+    for spec in specs {
+        for name in expert_projection_sources(spec) {
+            let key = (name, spec.layer);
+            match owners.get(&key) {
+                None => {
+                    owners.insert(key, spec.group.as_str());
+                }
+                Some(first) if *first == spec.group => {
+                    return Err(format!(
+                        "{}: repeats projection source '{}' within the same group",
+                        expert_context(spec),
+                        name
+                    ));
+                }
+                Some(first) => {
+                    return Err(format!(
+                        "expert group '{}' layer {:?}: projection source '{}' at layer {:?} is already claimed by expert group '{}' (declared first)",
+                        spec.group, spec.layer, name, spec.layer, first
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The projection source claims of one group with their diagnostic role
+/// labels, in declaration order. Mirrors [`expert_projection_sources`] but
+/// carries the role (e.g. `source gate_up`, `source down[2]`) so ownership
+/// diagnostics can name exactly which claim conflicts. Empty names are
+/// skipped: they are refused by the reference validators with their own
+/// 'reference is invalid' diagnostic.
+fn projection_claims_with_roles(spec: &ExpertGroupSpec) -> Vec<(&str, String)> {
+    let mut claims = Vec::new();
+    match &spec.source_layout {
+        ExpertSourceLayout::PackedFused { gate_up, down, .. } => {
+            claims.push((gate_up.as_str(), "source gate_up".to_owned()));
+            claims.push((down.as_str(), "source down".to_owned()));
+        }
+        ExpertSourceLayout::PackedSeparate { gate, up, down, .. } => {
+            claims.push((gate.as_str(), "source gate".to_owned()));
+            claims.push((up.as_str(), "source up".to_owned()));
+            claims.push((down.as_str(), "source down".to_owned()));
+        }
+        ExpertSourceLayout::PerExpertFused { gate_up, down, .. } => {
+            for (idx, name) in gate_up.iter().enumerate() {
+                claims.push((name.as_str(), format!("source gate_up[{idx}]")));
+            }
+            for (idx, name) in down.iter().enumerate() {
+                claims.push((name.as_str(), format!("source down[{idx}]")));
+            }
+        }
+        ExpertSourceLayout::PerExpertSeparate { gate, up, down, .. } => {
+            for (idx, name) in gate.iter().enumerate() {
+                claims.push((name.as_str(), format!("source gate[{idx}]")));
+            }
+            for (idx, name) in up.iter().enumerate() {
+                claims.push((name.as_str(), format!("source up[{idx}]")));
+            }
+            for (idx, name) in down.iter().enumerate() {
+                claims.push((name.as_str(), format!("source down[{idx}]")));
+            }
+        }
+    }
+    claims.retain(|(name, _)| !name.is_empty());
+    claims
+}
+
+/// A `(name, layer)`-keyed router/sidecar reference with its diagnostic role
+/// label (`router`, `sidecar[i]`) and owning group.
+type ReferenceClaim<'a> = ((&'a str, Option<usize>), String, &'a str);
+
+/// Every router and sidecar reference of every declared group, keyed by
+/// `(name, layer)` with its diagnostic role label (`router`, `sidecar[i]`) and
+/// owning group, in declaration order. Repeated references (two groups sharing
+/// one router entry) are legal and simply appear twice; the disjointness check
+/// below only reports a conflict when a projection claim matches ANY of them.
+fn router_and_sidecar_references(specs: &[ExpertGroupSpec]) -> Vec<ReferenceClaim<'_>> {
+    let mut references = Vec::new();
+    for spec in specs {
+        references.push((
+            (spec.router.as_str(), spec.layer),
+            "router".to_owned(),
+            spec.group.as_str(),
+        ));
+        let sidecars = match &spec.source_layout {
+            ExpertSourceLayout::PackedFused { sidecars, .. }
+            | ExpertSourceLayout::PackedSeparate { sidecars, .. }
+            | ExpertSourceLayout::PerExpertFused { sidecars, .. }
+            | ExpertSourceLayout::PerExpertSeparate { sidecars, .. } => sidecars.as_slice(),
+        };
+        for (idx, name) in sidecars.iter().enumerate() {
+            references.push((
+                (name.as_str(), spec.layer),
+                format!("sidecar[{idx}]"),
+                spec.group.as_str(),
+            ));
+        }
+    }
+    references
+}
+
+/// Projection ownership extends to router and sidecar references: an entry
+/// claimed as an expert projection source by any group must never also be a
+/// router or sidecar reference of ANY group (same-group or cross-group). The
+/// check is projection-path-only — the strict validator does not run it, so
+/// [`validate_expert_group_specs`] behavior stays equivalent. Traversal is in
+/// declaration order (groups, then claims, then references) so the reported
+/// conflict is deterministic; the diagnostic names the projection role/group
+/// and the router/sidecar role/group. Router and sidecar entries are never
+/// rewritten: the projection pass only touches claimed sources, and this
+/// check guarantees no claimed source is also a router/sidecar entry.
+fn validate_projection_sources_disjoint_from_references(
+    specs: &[ExpertGroupSpec],
+) -> Result<(), String> {
+    let references = router_and_sidecar_references(specs);
+    for spec in specs {
+        for (name, role) in projection_claims_with_roles(spec) {
+            if let Some((_, ref_role, ref_group)) = references
+                .iter()
+                .find(|((ref_name, ref_layer), _, _)| *ref_name == name && *ref_layer == spec.layer)
+            {
+                return Err(format!(
+                    "expert group '{}' layer {:?}: {role} projection source '{name}' at layer {:?} is also referenced as {ref_role} by expert group '{ref_group}'",
+                    spec.group, spec.layer, spec.layer
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Static-policy-neutral prefix of the strict expert-group validation path:
+/// the duplicate manifest `(name, layer)` identity check, per-group structural
+/// metadata / non-empty semantic identities, and unique group/layer identity.
+/// This prefix inspects no [`ShardPolicy`], so the policy-aware projection
+/// entry point can run it on the static manifest BEFORE projection ownership
+/// and rewriting — reporting the same diagnostics in the same order as the
+/// strict path. The strict validator ([`validate_expert_group_specs`]) reuses
+/// it verbatim so the two paths never diverge.
+fn validate_expert_group_specs_prefix(
     specs: &[ExpertGroupSpec],
     manifest: &[WeightEntry],
     group_size: usize,
@@ -1089,13 +1410,45 @@ pub fn validate_expert_group_specs(
             ));
         }
     }
+    // Stage 1: structural metadata, non-empty identities, unique group/layer.
     let mut identities = std::collections::HashSet::new();
     for spec in specs {
-        validate_expert_group_shape(spec, group_size)?;
+        validate_expert_group_metadata(spec, group_size)?;
         let context = expert_context(spec);
         if !identities.insert((&spec.group, spec.layer)) {
             return Err(format!("{context}: duplicate group/layer identity"));
         }
+    }
+    Ok(())
+}
+
+/// Validate all architecture-declared expert groups against the weight
+/// manifest. Validation runs in three stages:
+/// 1. the static-policy-neutral prefix
+///    ([`validate_expert_group_specs_prefix`]): duplicate manifest identity,
+///    per-group structural metadata and non-empty semantic identities, and
+///    unique group/layer identity;
+/// 2. declared-source ownership (each `(source, layer)` claimed once);
+/// 3. manifest references, policies, router tensor, and sidecars
+///    ([`validate_expert_group_references`]).
+///
+/// The duplicate `(source, layer)` claim is reported deterministically because
+/// ownership runs before manifest-reference validation, which would otherwise error
+/// first. Typed semantic identity matching against the actual
+/// `RouterSelection` / `ExpertExecutionPlan` is moe_plan's concern (Task 3),
+/// not manifest resolution.
+pub fn validate_expert_group_specs(
+    specs: &[ExpertGroupSpec],
+    manifest: &[WeightEntry],
+    group_size: usize,
+) -> Result<(), String> {
+    // Stage 1: static-policy-neutral prefix (duplicate manifest identity,
+    // group metadata, unique group/layer identity).
+    validate_expert_group_specs_prefix(specs, manifest, group_size)?;
+    // Stage 2: declared-source ownership — each `(source, layer)` claimed once.
+    validate_declared_source_ownership(specs)?;
+    // Stage 3: manifest references, policies, router tensor, and sidecars.
+    for spec in specs {
         validate_expert_group_references(spec, manifest)?;
     }
     Ok(())
@@ -1140,9 +1493,9 @@ fn resolve_expert_group_plan_unchecked(
                 local_slot: global_id,
             }),
             ExpertParallelism::TensorParallel => {
-                for owner in 0..group_size {
-                    let local_slot = next_slot[owner];
-                    next_slot[owner] += 1;
+                for (owner, slot) in next_slot.iter_mut().enumerate() {
+                    let local_slot = *slot;
+                    *slot += 1;
                     experts.push(ExpertPlacement {
                         global_id,
                         owner,
@@ -1169,20 +1522,401 @@ fn resolve_expert_group_plan_unchecked(
         group: spec.group.clone(),
         layer: spec.layer,
         n_experts: spec.n_experts,
+        group_size,
         parallelism: spec.parallelism,
         assignment: spec.assignment,
         experts,
         source_layout: spec.source_layout.clone(),
         resources: spec.resources,
         router: spec.router.clone(),
-        execution: spec.execution.clone(),
+        router_identity: spec.router_identity.clone(),
+        allowed_executions: spec.allowed_executions.clone(),
         collective: post_combine_for_parallelism(spec.parallelism),
+    })
+}
+
+/// The complete policy-aware resolution of a static expert manifest for one
+/// exact execution policy.
+///
+/// `plans` are the resolved expert-group plans (one per declared spec); each
+/// group's single post-combine collective derives solely from its
+/// [`ExpertParallelism`] (see [`ExpertGroupPlan::collective`]). The projected
+/// source policies are placement evidence, never extra per-weight collective
+/// authority.
+///
+/// `layer_collectives` is the residual per-weight per-layer schedule derived
+/// from the *projected* full manifest with every claimed projection source
+/// excluded exactly once. Unclaimed entries (dense weights, routers, sidecars,
+/// unclaimed expert sources) keep their static policy and remain visible here.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct ExpertManifestResolution {
+    /// Resolved expert-group plans, one per declared spec, in declaration order.
+    pub plans: Vec<ExpertGroupPlan>,
+    /// Residual per-weight per-layer collectives from the projected full
+    /// manifest, excluding claimed expert projection sources exactly once.
+    pub layer_collectives: Vec<(usize, CollectiveHint)>,
+}
+
+/// Map an execution-policy kind to the manifest's group parallelism.
+fn parallelism_for_kind(kind: MoEExecutionKind) -> ExpertParallelism {
+    match kind {
+        MoEExecutionKind::Single => ExpertParallelism::Single,
+        MoEExecutionKind::Tp => ExpertParallelism::TensorParallel,
+        MoEExecutionKind::Ep => ExpertParallelism::ExpertParallel,
+    }
+}
+
+/// The effective resident placement one claimed packed expert projection must
+/// carry under an exact execution policy, by logical role: gate/up projections
+/// are column-sharded (axis 1) and down projections row-sharded (axis 2) under
+/// TP; every packed projection replicates under Single and keeps the group's
+/// exact `ExpertSharded` declaration under EP.
+fn effective_projection_policy(
+    spec: &ExpertGroupSpec,
+    role: ProjectionRole,
+    kind: MoEExecutionKind,
+) -> ShardPolicy {
+    match kind {
+        MoEExecutionKind::Single => ShardPolicy::Replicate,
+        MoEExecutionKind::Tp => ShardPolicy::ExpertTensorSharded {
+            n_experts: spec.n_experts,
+            inner: Box::new(match role {
+                ProjectionRole::GateUp => ShardPolicy::ColumnShard { axis: 1 },
+                ProjectionRole::Down => ShardPolicy::RowShard { axis: 2 },
+            }),
+        },
+        MoEExecutionKind::Ep => ShardPolicy::ExpertSharded {
+            n_experts: spec.n_experts,
+            assign: spec.assignment,
+        },
+    }
+}
+
+/// Find the single manifest entry a claimed projection source resolves to in
+/// the projection clone, mirroring [`validate_manifest_reference`]'s missing /
+/// ambiguous / scope diagnostics so the projected clone is never silently
+/// patched at the wrong (name, layer).
+fn find_projection_entry_mut<'a>(
+    spec: &ExpertGroupSpec,
+    manifest: &'a mut [WeightEntry],
+    label: &str,
+    name: &str,
+) -> Result<&'a mut WeightEntry, String> {
+    let context = expert_context(spec);
+    if name.is_empty() {
+        return Err(format!("{context}: {label} reference '' is invalid"));
+    }
+    let matches: Vec<usize> = manifest
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| entry.name == name && entry.layer == spec.layer)
+        .map(|(idx, _)| idx)
+        .collect();
+    match matches.as_slice() {
+        [] => Err(format!(
+            "{context}: {label} reference '{name}' not found in manifest scope"
+        )),
+        [idx] => Ok(&mut manifest[*idx]),
+        _ => Err(format!(
+            "{context}: {label} reference '{name}' is ambiguous in manifest scope"
+        )),
+    }
+}
+
+/// Project one explicitly claimed packed expert projection source to its
+/// effective resident placement. Only a static [`ShardPolicy::ExpertSharded`]
+/// surrogate with the group's exact `n_experts` + assignment, or an
+/// already-correct effective policy, is eligible. Wrong counts, assignments,
+/// axes, nested policies, plain competing shards (including a direct
+/// `RowShard`), and unsupported static `Pin`/`Tied` declarations are refused
+/// here — before any strict validation or collective scheduling runs.
+fn project_claimed_packed_source(
+    spec: &ExpertGroupSpec,
+    manifest: &mut [WeightEntry],
+    label: &str,
+    name: &str,
+    role: ProjectionRole,
+    kind: MoEExecutionKind,
+) -> Result<(), String> {
+    let context = expert_context(spec);
+    let effective = effective_projection_policy(spec, role, kind);
+    let entry = find_projection_entry_mut(spec, manifest, label, name)?;
+    match &entry.policy {
+        // Static `ExpertSharded` packed surrogate: projectable only with the
+        // declaring group's exact expert count and assignment.
+        ShardPolicy::ExpertSharded { n_experts, assign } => {
+            if *n_experts != spec.n_experts {
+                return Err(format!(
+                    "{context}: {label} reference '{}' static ExpertSharded n_experts={n_experts} does not match spec n_experts={}",
+                    entry.name, spec.n_experts
+                ));
+            }
+            if *assign != spec.assignment {
+                return Err(format!(
+                    "{context}: {label} reference '{}' static ExpertSharded assignment {assign:?} does not match spec assignment {:?}",
+                    entry.name, spec.assignment
+                ));
+            }
+        }
+        // Already-correct effective policies remain untouched; the strict
+        // per-group validation below re-checks them unchanged.
+        _ if entry.policy == effective => {}
+        // Everything else is not projectable for this policy kind: wrong
+        // axes/counts/assign, nested policies, plain competing shards, and
+        // unsupported static Pin/Tied declarations all fail closed here.
+        _ => {
+            return Err(format!(
+                "{context}: {label} reference '{}' static policy {:?} is not projectable to effective {:?}",
+                entry.name, entry.policy, effective
+            ));
+        }
+    }
+    entry.policy = effective;
+    Ok(())
+}
+
+/// Projection-path TP eligibility: every claimed packed projection source of
+/// a TP policy must have its role dimension divisible by the exact TP rank
+/// count AND a local slice width `% 256 == 0` — for EVERY rank count,
+/// including Tp=1, where the frozen strict [`validate_manifest`] gate
+/// (`tp > 1`) does not apply. Gate/up role dimension is axis 1 (the
+/// projection width: `2*inter` for a fused gate_up, `inter` for separate
+/// gate/up), down is axis 2 (`inter`). The check runs on the projected clone
+/// after shape safety is established and before resolution; diagnostics name
+/// the role, source, and group deterministically in declaration order.
+/// Single/EP policies never reach this check (their effective placements do
+/// not slice), and the frozen strict resolver / `validate_manifest` semantics
+/// are unchanged.
+fn validate_projected_tp_role_dimensions(
+    specs: &[ExpertGroupSpec],
+    manifest: &[WeightEntry],
+    tp_ranks: usize,
+) -> Result<(), String> {
+    for spec in specs {
+        // Only packed layouts project under TP; PerExpert layouts are refused
+        // before this check, so they contribute no claims here.
+        let claims: Vec<(&str, &str, usize)> = match &spec.source_layout {
+            ExpertSourceLayout::PackedFused { gate_up, down, .. } => vec![
+                (gate_up.as_str(), "source gate_up", 1),
+                (down.as_str(), "source down", 2),
+            ],
+            ExpertSourceLayout::PackedSeparate { gate, up, down, .. } => vec![
+                (gate.as_str(), "source gate", 1),
+                (up.as_str(), "source up", 1),
+                (down.as_str(), "source down", 2),
+            ],
+            ExpertSourceLayout::PerExpertFused { .. }
+            | ExpertSourceLayout::PerExpertSeparate { .. } => Vec::new(),
+        };
+        for (name, label, axis) in claims {
+            if name.is_empty() {
+                continue;
+            }
+            let context = expert_context(spec);
+            // Projection ownership already resolved the claim; the projected
+            // clone carries the entry with the effective TP policy.
+            let Some(entry) = manifest
+                .iter()
+                .find(|entry| entry.name == name && entry.layer == spec.layer)
+            else {
+                return Err(format!(
+                    "{context}: {label} reference '{name}' not found in manifest scope"
+                ));
+            };
+            let dim = entry.logical_shape.get(axis).copied().unwrap_or(0);
+            if dim % tp_ranks != 0 || !(dim / tp_ranks).is_multiple_of(256) {
+                return Err(format!(
+                    "{context}: {label} reference '{}' projected TP role dim {dim} (axis {axis}) not divisible by Tp={tp_ranks} or local slice {} not a multiple of 256",
+                    entry.name, dim / tp_ranks
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Resolve a static expert manifest for one exact execution policy.
+///
+/// Static expert `ShardPolicy`s describe the logical source layout and cannot
+/// describe Single, TP, and EP materialization simultaneously (see the module
+/// docs). This entry point clones the FULL static manifest, rewrites only the
+/// explicitly claimed expert projection sources to their effective resident
+/// placement for `policy`, runs the strict existing full-manifest and
+/// group/reference/source/policy validation against the exact policy mesh,
+/// resolves the group plans, derives the residual per-weight layer collectives
+/// with claimed sources excluded exactly once, and drops the clone. The
+/// original manifest and specs remain equality-identical.
+///
+/// Fail-closed: every spec's [`ExpertParallelism`] must agree exactly with
+/// `policy.kind()`; missing / ambiguous / wrong-layer / repeated / colliding
+/// sources, wrong expert counts or assignments, malformed shapes, wrong
+/// axes/ranks, TP divisibility and local-256 failures, direct competing
+/// `RowShard`s, unsupported static `Pin`/`Tied`, PerExpert layouts under
+/// TP/EP, and unrelated invalid manifest entries are all refused. Under TP,
+/// every claimed packed source's role dimension (gate/up axis 1, down axis 2)
+/// must divide by the exact TP rank count with a local slice width `% 256 ==
+/// 0` for EVERY rank count, including Tp=1 — projection-path eligibility that
+/// does not change the frozen strict validator. A claimed projection source
+/// may never also be any group's router or sidecar reference (same-group or
+/// cross-group): the diagnostic names the projection role/group and the
+/// router/sidecar role/group. Router, sidecar, and unrelated entries are never
+/// projected.
+///
+/// Diagnostic precedence matches the strict path: the static-policy-neutral
+/// prefix (duplicate manifest identity, group metadata, unique group/layer
+/// identity) runs before projection ownership, which runs before projection
+/// eligibility, full-manifest validation, the exact-TP role-dimension
+/// eligibility, and the unchanged complete group validator on the clone.
+/// Existing strict resolution ([`resolve_expert_group_plans`]) remains
+/// unchanged for Qwen-like control callers.
+pub fn resolve_expert_manifest_for_policy(
+    specs: &[ExpertGroupSpec],
+    static_manifest: &[WeightEntry],
+    policy: &MoEExecutionPolicy,
+) -> Result<ExpertManifestResolution, String> {
+    let kind = policy.kind();
+    // 1. Every declared group's parallelism must agree exactly with the
+    //    execution policy kind; a spec/kind mismatch is refused before any
+    //    projection or validation runs.
+    for spec in specs {
+        if spec.parallelism != parallelism_for_kind(kind) {
+            return Err(format!(
+                "{}: parallelism {:?} does not match execution policy kind {kind:?}",
+                expert_context(spec),
+                spec.parallelism
+            ));
+        }
+    }
+    // 2. Static-policy-neutral prefix, shared verbatim with the strict path:
+    //    duplicate manifest identity, group metadata, and unique group/layer
+    //    identity all report before projection ownership or rewriting can
+    //    mask them.
+    let group_size = policy.rank_count();
+    validate_expert_group_specs_prefix(specs, static_manifest, group_size)?;
+    // 3. Projection ownership stays the deterministic authority: each
+    //    `(source, layer)` may be claimed by exactly one group (and once
+    //    within a group), and no claimed source may also be any group's
+    //    router or sidecar reference (same-group or cross-group). Router and
+    //    sidecar entries are never rewritten.
+    validate_declared_source_ownership(specs)?;
+    validate_projection_sources_disjoint_from_references(specs)?;
+    // 4. Clone the FULL static manifest. The input manifest and specs are
+    //    never mutated; the clone is dropped before return.
+    let mut projected = static_manifest.to_vec();
+    // 5. Project only the projection sources explicitly claimed by each
+    //    ExpertSourceLayout, by logical role. PerExpert layouts are Single-only
+    //    and preserved exactly; router, sidecars, and unrelated entries are
+    //    never projected.
+    for spec in specs {
+        match &spec.source_layout {
+            ExpertSourceLayout::PackedFused { gate_up, down, .. } => {
+                project_claimed_packed_source(
+                    spec,
+                    &mut projected,
+                    "source gate_up",
+                    gate_up,
+                    ProjectionRole::GateUp,
+                    kind,
+                )?;
+                project_claimed_packed_source(
+                    spec,
+                    &mut projected,
+                    "source down",
+                    down,
+                    ProjectionRole::Down,
+                    kind,
+                )?;
+            }
+            ExpertSourceLayout::PackedSeparate { gate, up, down, .. } => {
+                project_claimed_packed_source(
+                    spec,
+                    &mut projected,
+                    "source gate",
+                    gate,
+                    ProjectionRole::GateUp,
+                    kind,
+                )?;
+                project_claimed_packed_source(
+                    spec,
+                    &mut projected,
+                    "source up",
+                    up,
+                    ProjectionRole::GateUp,
+                    kind,
+                )?;
+                project_claimed_packed_source(
+                    spec,
+                    &mut projected,
+                    "source down",
+                    down,
+                    ProjectionRole::Down,
+                    kind,
+                )?;
+            }
+            ExpertSourceLayout::PerExpertFused { .. }
+            | ExpertSourceLayout::PerExpertSeparate { .. } => {
+                // PerExpert layouts are Single-only: their Replicate/Pin/Tied
+                // sources are preserved exactly and never projected. Under
+                // TP/EP the whole layout is refused.
+                if kind != MoEExecutionKind::Single {
+                    return Err(format!(
+                        "{}: PerExpert source layout is unsupported for execution policy kind {kind:?}; global expert source placement is defined only for Single",
+                        expert_context(spec)
+                    ));
+                }
+            }
+        }
+    }
+    // 6. Strict existing full-manifest validation on the projected clone
+    //    against the exact policy mesh (TP divisibility + local-256
+    //    alignment), then every existing group/reference/layer/source/policy/
+    //    collective check.
+    validate_manifest(&projected, policy.mesh())?;
+    // 7. Projection-path TP eligibility after shape safety is established:
+    //    every claimed packed source's role dimension must divide by the
+    //    exact TP rank count with a local slice width % 256 == 0 — for EVERY
+    //    rank count including Tp=1, where the strict validate_manifest gate
+    //    (tp > 1) does not apply. Single/EP never reach this check.
+    if kind == MoEExecutionKind::Tp {
+        validate_projected_tp_role_dimensions(specs, &projected, group_size)?;
+    }
+    validate_expert_group_specs(specs, &projected, group_size)?;
+    // 8. Private resolution. The group collective derives solely from
+    //    ExpertParallelism (post_combine_for_parallelism); the projected
+    //    source policies are placement evidence, never extra authority.
+    let plans = specs
+        .iter()
+        .map(|spec| resolve_expert_group_plan_unchecked(spec, group_size))
+        .collect::<Result<Vec<_>, _>>()?;
+    // 9. Residual per-weight layer collectives from the projected full
+    //    manifest, excluding the claimed projection sources exactly once.
+    let mut claimed: std::collections::HashSet<(&str, Option<usize>)> =
+        std::collections::HashSet::new();
+    for spec in specs {
+        for name in expert_projection_sources(spec) {
+            claimed.insert((name, spec.layer));
+        }
+    }
+    let layer_collectives = projected
+        .iter()
+        .filter_map(|entry| {
+            let layer = entry.layer?;
+            if claimed.contains(&(entry.name.as_str(), entry.layer)) {
+                return None;
+            }
+            Some((layer, collective_for_policy(&entry.policy)?))
+        })
+        .collect();
+    Ok(ExpertManifestResolution {
+        plans,
+        layer_collectives,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::moe_plan::{MoEExecutionKind, MoEExecutionPolicy};
 
     #[test]
     fn entry_constructors_set_layer_scope() {
@@ -1410,6 +2144,14 @@ mod tests {
             }),
             Some(CollectiveHint::AllReduce { kind: DimKind::Ep })
         );
+        // ExpertTensorSharded recurses into its inner policy.
+        assert_eq!(
+            collective_for_policy(&ShardPolicy::ExpertTensorSharded {
+                n_experts: 8,
+                inner: Box::new(ShardPolicy::RowShard { axis: 2 }),
+            }),
+            Some(CollectiveHint::AllReduce { kind: DimKind::Tp })
+        );
         // Column-parallel / replicate / pin produce no output reduce.
         assert_eq!(
             collective_for_policy(&ShardPolicy::ColumnShard { axis: 0 }),
@@ -1598,7 +2340,8 @@ mod tests {
             WeightEntry {
                 name: "mlp.gate".into(),
                 layer,
-                logical_shape: vec![4, n_experts],
+                // Routers are experts-first: `[n_experts, input_dim]`.
+                logical_shape: vec![n_experts, 4],
                 dtype: DType::F16,
                 dtype_constraint: DTypeConstraint::any_source(),
                 placement: PlacementHint::Policy,
@@ -1642,7 +2385,8 @@ mod tests {
                 alignment: 256,
             },
             router: "mlp.gate".into(),
-            execution: "moe.feed_forward".into(),
+            router_identity: "softmax_topk".into(),
+            allowed_executions: vec![ExpertExecutionIdentity::IndexedQuantized],
         }
     }
 
@@ -1677,6 +2421,7 @@ mod tests {
             plan.collective,
             Some(ExpertPostCombineAllReduce::TensorParallel)
         );
+        assert_eq!(plan.group_size, 2);
     }
 
     #[test]
@@ -1708,6 +2453,123 @@ mod tests {
         )
         .unwrap();
         assert_eq!(plan.collective.unwrap().axis(), DimKind::Ep);
+    }
+
+    #[test]
+    fn expert_group_rejects_per_weight_collectives() {
+        // A TP group whose down projection carries a direct RowShard schedules
+        // a per-weight Tp all-reduce that competes with the group's
+        // post-combine collective; resolving the declared group must reject it
+        // contextually instead of silently double-scheduling.
+        let mut manifest = expert_manifest(Some(0), 4, ExpertParallelism::TensorParallel);
+        manifest[2].policy = ShardPolicy::RowShard { axis: 2 };
+        let err = resolve_expert_group_plan(
+            &expert_spec(ExpertParallelism::TensorParallel),
+            &manifest,
+            2,
+        )
+        .unwrap_err();
+        assert!(err.contains("block-0"));
+        assert!(err.contains("layer Some(0)"));
+        assert!(err.contains("experts.down"));
+        assert!(err.contains("competing per-weight collective"));
+    }
+
+    #[test]
+    fn expert_group_reports_source_conflict_before_reference_error() {
+        let manifest = expert_manifest(Some(0), 4, ExpertParallelism::ExpertParallel);
+        let mut first = expert_spec(ExpertParallelism::ExpertParallel);
+        first.group = "block-0".into();
+        let mut second = expert_spec(ExpertParallelism::ExpertParallel);
+        second.group = "block-1".into();
+        second.router = "missing.router".into();
+
+        // The two specs claim the same expert projections at layer Some(0);
+        // declared-source ownership must report the deterministic conflict
+        // before the second spec's dangling router reference is ever resolved.
+        let err = resolve_expert_group_plans(&[first, second], &manifest, 2).unwrap_err();
+        assert!(err.contains("experts.gate_up"));
+        assert!(err.contains("block-0"));
+        assert!(err.contains("block-1"));
+        assert!(err.contains("declared first"));
+        assert!(!err.contains("missing.router"));
+    }
+
+    #[test]
+    fn expert_group_rejects_repeated_source_within_one_group() {
+        let manifest = expert_manifest(Some(0), 4, ExpertParallelism::ExpertParallel);
+        let mut spec = expert_spec(ExpertParallelism::ExpertParallel);
+        spec.source_layout = ExpertSourceLayout::PackedSeparate {
+            gate: "experts.gate_up".into(),
+            up: "experts.gate_up".into(),
+            down: "experts.down".into(),
+            sidecars: Vec::new(),
+        };
+
+        let err = validate_expert_group_specs(&[spec], &manifest, 2).unwrap_err();
+        assert!(err.contains("block-0"));
+        assert!(err.contains("layer Some(0)"));
+        assert!(err.contains("experts.gate_up"));
+        assert!(err.contains("repeats projection source"));
+    }
+
+    #[test]
+    fn expert_group_reports_deterministic_source_conflict() {
+        let manifest = expert_manifest(Some(0), 4, ExpertParallelism::ExpertParallel);
+        let mut first = expert_spec(ExpertParallelism::ExpertParallel);
+        first.group = "block-0".into();
+        let mut second = expert_spec(ExpertParallelism::ExpertParallel);
+        second.group = "block-1".into();
+
+        // Both specs claim the same expert projections at layer Some(0);
+        // declaration order decides who is reported as the first owner.
+        let err = validate_expert_group_specs(&[first, second], &manifest, 2).unwrap_err();
+        assert!(err.contains("experts.gate_up"));
+        assert!(err.contains("layer Some(0)"));
+        assert!(err.contains("block-0"));
+        assert!(err.contains("block-1"));
+        assert!(err.contains("already claimed by expert group 'block-0' (declared first)"));
+
+        // Reversing declaration order must name the new first owner.
+        let mut a = expert_spec(ExpertParallelism::ExpertParallel);
+        a.group = "block-0".into();
+        let mut b = expert_spec(ExpertParallelism::ExpertParallel);
+        b.group = "block-1".into();
+        let err = validate_expert_group_specs(&[b, a], &manifest, 2).unwrap_err();
+        assert!(err.contains("experts.gate_up"));
+        assert!(err.contains("layer Some(0)"));
+        assert!(err.contains("block-0"));
+        assert!(err.contains("block-1"));
+        assert!(err.contains("already claimed by expert group 'block-1' (declared first)"));
+    }
+
+    #[test]
+    fn declared_group_schedule_excludes_only_claimed_expert_sources() {
+        let mut manifest = expert_manifest(Some(0), 4, ExpertParallelism::ExpertParallel);
+        manifest.push(WeightEntry::layer(
+            "wo",
+            0,
+            vec![8, 8],
+            DType::F16,
+            ShardPolicy::RowShard { axis: 1 },
+        ));
+        let spec = expert_spec(ExpertParallelism::ExpertParallel);
+
+        // Legacy schedule: expert policies still schedule their Ep reduces, so
+        // the expert manifest keeps its collectives alongside the dense wo.
+        let legacy = layer_collectives(&manifest);
+        assert!(!legacy.is_empty());
+        assert!(legacy
+            .iter()
+            .any(|(_, h)| matches!(h, CollectiveHint::AllReduce { kind: DimKind::Ep })));
+
+        // The contextual declared-group schedule excludes only the claimed
+        // expert projections and retains the unclaimed wo reduce.
+        let declared = layer_collectives_for_declared_groups(&manifest, &[spec], 2).unwrap();
+        assert_eq!(
+            declared,
+            vec![(0, CollectiveHint::AllReduce { kind: DimKind::Tp })]
+        );
     }
 
     #[test]
@@ -1975,6 +2837,16 @@ mod tests {
     }
 
     #[test]
+    fn expert_group_rejects_empty_router_identity() {
+        let manifest = expert_manifest(Some(0), 4, ExpertParallelism::Single);
+        let mut spec = expert_spec(ExpertParallelism::Single);
+        spec.router_identity.clear();
+        let err = validate_expert_group_specs(&[spec], &manifest, 1).unwrap_err();
+        assert!(err.contains("block-0"));
+        assert!(err.contains("router identity"));
+    }
+
+    #[test]
     fn expert_group_collective_is_derived_from_parallelism() {
         for (parallelism, expected) in [
             (ExpertParallelism::Single, None),
@@ -2039,27 +2911,105 @@ mod tests {
     }
 
     #[test]
-    fn expert_group_router_accepts_one_or_two_dimensions_and_rejects_wrong_last_dim() {
-        let mut one_d = expert_manifest(Some(0), 4, ExpertParallelism::Single);
-        one_d[0].logical_shape = vec![4];
-        assert!(
-            validate_expert_group_specs(&[expert_spec(ExpertParallelism::Single)], &one_d, 1)
-                .is_ok()
-        );
+    fn expert_group_router_invariants_are_experts_first_and_nonzero() {
+        let spec = || expert_spec(ExpertParallelism::Single);
+        let mut manifest = expert_manifest(Some(0), 4, ExpertParallelism::Single);
 
-        let two_d = expert_manifest(Some(0), 4, ExpertParallelism::Single);
-        assert!(
-            validate_expert_group_specs(&[expert_spec(ExpertParallelism::Single)], &two_d, 1)
-                .is_ok()
-        );
+        // Rank-one `[n_experts]` is accepted.
+        manifest[0].logical_shape = vec![4];
+        assert!(validate_expert_group_specs(&[spec()], &manifest, 1).is_ok());
 
-        let mut wrong = two_d;
-        wrong[0].logical_shape = vec![4, 5];
-        let err = validate_expert_group_specs(&[expert_spec(ExpertParallelism::Single)], &wrong, 1)
-            .unwrap_err();
-        assert!(err.contains("router"));
-        assert!(err.contains("logical_shape"));
-        assert!(err.contains("n_experts=4"));
+        // Rank-two `[n_experts, input_dim]` is accepted, including non-square
+        // input dims (the second axis is an unvalidated input dim).
+        manifest[0].logical_shape = vec![4, 5];
+        assert!(validate_expert_group_specs(&[spec()], &manifest, 1).is_ok());
+        manifest[0].logical_shape = vec![4, 7];
+        assert!(validate_expert_group_specs(&[spec()], &manifest, 1).is_ok());
+
+        // The transposed `[input_dim, n_experts]` form is rejected by the
+        // first-axis contract.
+        manifest[0].logical_shape = vec![7, 4];
+        let err = validate_expert_group_specs(&[spec()], &manifest, 1).unwrap_err();
+        assert!(err.contains("router"), "got: {err}");
+        assert!(err.contains("logical_shape"), "got: {err}");
+        assert!(err.contains("n_experts=4"), "got: {err}");
+        assert!(err.contains("first dimension"), "got: {err}");
+
+        // Rank three is not a router (rank must be 1 or 2).
+        manifest[0].logical_shape = vec![4, 4, 4];
+        let err = validate_expert_group_specs(&[spec()], &manifest, 1).unwrap_err();
+        assert!(err.contains("router rank must be 1 or 2"), "got: {err}");
+
+        // Zero dimensions are rejected before the experts-first check —
+        // most importantly rank-two `[n_experts, 0]` must not resolve.
+        manifest[0].logical_shape = vec![4, 0];
+        let err = validate_expert_group_specs(&[spec()], &manifest, 1).unwrap_err();
+        assert!(err.contains("router"), "got: {err}");
+        assert!(err.contains("zero"), "got: {err}");
+    }
+
+    #[test]
+    fn expert_group_rejects_empty_allowed_executions() {
+        let manifest = expert_manifest(Some(0), 4, ExpertParallelism::Single);
+        let mut spec = expert_spec(ExpertParallelism::Single);
+        spec.allowed_executions.clear();
+        let err = validate_expert_group_specs(&[spec], &manifest, 1).unwrap_err();
+        assert!(err.contains("block-0"));
+        assert!(err.contains("execution identities"));
+    }
+
+    #[test]
+    fn expert_group_rejects_duplicate_allowed_executions() {
+        let manifest = expert_manifest(Some(0), 4, ExpertParallelism::Single);
+        let mut spec = expert_spec(ExpertParallelism::Single);
+        spec.allowed_executions = vec![
+            ExpertExecutionIdentity::IndexedQuantized,
+            ExpertExecutionIdentity::IndexedQuantized,
+        ];
+        let err = validate_expert_group_specs(&[spec], &manifest, 1).unwrap_err();
+        assert!(err.contains("block-0"));
+        assert!(err.contains("duplicate"));
+        assert!(err.contains("indexed_quantized"));
+
+        // Deterministic ordering: the FIRST duplicate in declaration order is
+        // reported, not a later one.
+        spec = expert_spec(ExpertParallelism::Single);
+        spec.allowed_executions = vec![
+            ExpertExecutionIdentity::GroupedQuantized,
+            ExpertExecutionIdentity::IndexedQuantized,
+            ExpertExecutionIdentity::GroupedQuantized,
+        ];
+        let err = validate_expert_group_specs(&[spec], &manifest, 1).unwrap_err();
+        assert!(err.contains("duplicate 'grouped_quantized'"), "got: {err}");
+    }
+
+    #[test]
+    fn expert_execution_identity_canonical_labels_are_deterministic() {
+        for (identity, expected) in [
+            (
+                ExpertExecutionIdentity::IndexedQuantized,
+                "indexed_quantized",
+            ),
+            (
+                ExpertExecutionIdentity::GroupedQuantized,
+                "grouped_quantized",
+            ),
+            (
+                ExpertExecutionIdentity::PerExpertFallback,
+                "per_expert_fallback",
+            ),
+        ] {
+            assert_eq!(identity.canonical_label(), expected);
+            assert_eq!(identity.to_string(), expected);
+        }
+        assert_eq!(
+            ExpertExecutionIdentity::IndexedQuantized,
+            ExpertExecutionIdentity::IndexedQuantized
+        );
+        assert_ne!(
+            ExpertExecutionIdentity::GroupedQuantized,
+            ExpertExecutionIdentity::PerExpertFallback
+        );
     }
 
     #[test]
@@ -2128,7 +3078,10 @@ mod tests {
             ));
         }
         let err = validate_expert_group_specs(&[per], &per_manifest, 1).unwrap_err();
-        assert!(err.contains("duplicate per-expert source"));
+        // A repeated per-expert source is a same-group duplicate `(source,
+        // layer)` claim, so declared-source ownership reports it before the
+        // per-expert reference pass runs.
+        assert!(err.contains("repeats projection source"));
         assert!(err.contains("experts.gate_up.0"));
     }
 
@@ -2369,5 +3322,1341 @@ mod tests {
             },
         )];
         assert!(validate_manifest(&invalid_inner, &tp).is_err());
+    }
+
+    // ------------------------------------------------------------------
+    // Policy-aware effective projection
+    // ------------------------------------------------------------------
+
+    /// Static manifest in the packed-surrogate fixture pattern: every expert
+    /// projection is declared `ExpertSharded` with the group's exact count and
+    /// assignment, the router replicated. Shapes are truthful and non-square:
+    /// gate_up is `[n_experts, 2*inter, hidden]`, down is
+    /// `[n_experts, hidden, inter]`.
+    fn projection_manifest(
+        layer: Option<usize>,
+        n_experts: usize,
+        inter: usize,
+        hidden: usize,
+        assign: ExpertAssign,
+    ) -> Vec<WeightEntry> {
+        vec![
+            WeightEntry {
+                name: "mlp.gate".into(),
+                layer,
+                logical_shape: vec![n_experts, hidden],
+                dtype: DType::F16,
+                dtype_constraint: DTypeConstraint::any_source(),
+                placement: PlacementHint::Policy,
+                policy: ShardPolicy::Replicate,
+            },
+            WeightEntry {
+                name: "experts.gate_up".into(),
+                layer,
+                logical_shape: vec![n_experts, 2 * inter, hidden],
+                dtype: DType::F16,
+                dtype_constraint: DTypeConstraint::any_source(),
+                placement: PlacementHint::Policy,
+                policy: ShardPolicy::ExpertSharded { n_experts, assign },
+            },
+            WeightEntry {
+                name: "experts.down".into(),
+                layer,
+                logical_shape: vec![n_experts, hidden, inter],
+                dtype: DType::F16,
+                dtype_constraint: DTypeConstraint::any_source(),
+                placement: PlacementHint::Policy,
+                policy: ShardPolicy::ExpertSharded { n_experts, assign },
+            },
+        ]
+    }
+
+    fn projection_spec(parallelism: ExpertParallelism) -> ExpertGroupSpec {
+        ExpertGroupSpec {
+            group: "block-0".into(),
+            layer: Some(0),
+            n_experts: 4,
+            parallelism,
+            assignment: ExpertAssign::Stride,
+            source_layout: ExpertSourceLayout::PackedFused {
+                gate_up: "experts.gate_up".into(),
+                down: "experts.down".into(),
+                sidecars: Vec::new(),
+            },
+            resources: ExpertResourceRequirements {
+                bytes_per_expert: 1024,
+                alignment: 256,
+            },
+            router: "mlp.gate".into(),
+            router_identity: "softmax_topk".into(),
+            allowed_executions: vec![ExpertExecutionIdentity::IndexedQuantized],
+        }
+    }
+
+    fn projection_policy(kind: MoEExecutionKind, ranks: usize) -> MoEExecutionPolicy {
+        let mesh = match kind {
+            MoEExecutionKind::Single => DeviceMesh::single(),
+            MoEExecutionKind::Tp => DeviceMesh::rect(&[(DimKind::Tp, ranks)]),
+            MoEExecutionKind::Ep => DeviceMesh::rect(&[(DimKind::Ep, ranks)]),
+        };
+        MoEExecutionPolicy::new(kind, mesh).unwrap()
+    }
+
+    fn kind_parallelism(kind: MoEExecutionKind) -> ExpertParallelism {
+        match kind {
+            MoEExecutionKind::Single => ExpertParallelism::Single,
+            MoEExecutionKind::Tp => ExpertParallelism::TensorParallel,
+            MoEExecutionKind::Ep => ExpertParallelism::ExpertParallel,
+        }
+    }
+
+    #[test]
+    fn projection_resolves_packed_surrogate_across_single_tp_ep() {
+        let static_manifest = projection_manifest(Some(0), 4, 512, 64, ExpertAssign::Stride);
+        for (kind, parallelism, ranks, collective) in [
+            (MoEExecutionKind::Single, ExpertParallelism::Single, 1, None),
+            (
+                MoEExecutionKind::Tp,
+                ExpertParallelism::TensorParallel,
+                2,
+                Some(ExpertPostCombineAllReduce::TensorParallel),
+            ),
+            (
+                MoEExecutionKind::Ep,
+                ExpertParallelism::ExpertParallel,
+                2,
+                Some(ExpertPostCombineAllReduce::ExpertParallel),
+            ),
+        ] {
+            let spec = projection_spec(parallelism);
+            let resolution = resolve_expert_manifest_for_policy(
+                &[spec.clone()],
+                &static_manifest,
+                &projection_policy(kind, ranks),
+            )
+            .unwrap_or_else(|err| panic!("kind {kind:?}: {err}"));
+            assert_eq!(resolution.plans.len(), 1);
+            let plan = &resolution.plans[0];
+            assert_eq!(plan.parallelism, parallelism);
+            assert_eq!(plan.group_size, ranks);
+            // The sole group collective derives from ExpertParallelism; the
+            // projected source policies are placement evidence and contribute
+            // no per-weight collectives to the residual schedule.
+            assert_eq!(plan.collective, collective);
+            assert!(
+                resolution.layer_collectives.is_empty(),
+                "kind {kind:?}: {:?}",
+                resolution.layer_collectives
+            );
+            // Exact effective placements.
+            match parallelism {
+                ExpertParallelism::Single => {
+                    assert!(plan
+                        .experts
+                        .iter()
+                        .all(|expert| expert.owner == 0 && expert.local_slot == expert.global_id));
+                }
+                ExpertParallelism::TensorParallel => {
+                    assert_eq!(plan.experts.len(), 8);
+                    for global_id in 0..4 {
+                        let slots: Vec<_> = plan
+                            .experts
+                            .iter()
+                            .filter(|expert| expert.global_id == global_id)
+                            .map(|expert| (expert.owner, expert.local_slot))
+                            .collect();
+                        assert_eq!(slots, vec![(0, global_id), (1, global_id)]);
+                    }
+                }
+                ExpertParallelism::ExpertParallel => {
+                    assert_eq!(plan.experts.len(), 4);
+                    assert_eq!(plan.experts[0].owner, 0);
+                    assert_eq!(plan.experts[1].owner, 1);
+                    assert_eq!(plan.experts[2].owner, 0);
+                    assert_eq!(plan.experts[3].owner, 1);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn projection_role_matrix_accepts_fused_and_separate_packed_layouts() {
+        for (kind, ranks) in [
+            (MoEExecutionKind::Single, 1),
+            (MoEExecutionKind::Tp, 2),
+            (MoEExecutionKind::Ep, 2),
+        ] {
+            let manifest = projection_manifest(Some(0), 4, 512, 64, ExpertAssign::Stride);
+            let fused = projection_spec(kind_parallelism(kind));
+            let resolution = resolve_expert_manifest_for_policy(
+                &[fused.clone()],
+                &manifest,
+                &projection_policy(kind, ranks),
+            )
+            .unwrap_or_else(|err| panic!("fused under {kind:?}: {err}"));
+            assert_eq!(resolution.plans.len(), 1);
+
+            // PackedSeparate: gate and up carry the column role, down the row
+            // role — the same effective mapping as the fused layout.
+            let mut separate = fused;
+            separate.source_layout = ExpertSourceLayout::PackedSeparate {
+                gate: "experts.gate".into(),
+                up: "experts.up".into(),
+                down: "experts.down".into(),
+                sidecars: Vec::new(),
+            };
+            let mut separate_manifest =
+                projection_manifest(Some(0), 4, 512, 64, ExpertAssign::Stride);
+            // PackedSeparate claims gate/up/down as separate logical sources.
+            // Each separate gate/up projection is its own width-inter tensor
+            // (512), not the fused 2*inter (1024) gate_up blob; down is
+            // [n_experts, hidden, inter].
+            separate_manifest.retain(|entry| entry.name != "experts.gate_up");
+            separate_manifest.push(WeightEntry::layer(
+                "experts.gate",
+                0,
+                vec![4, 512, 64],
+                DType::F16,
+                ShardPolicy::ExpertSharded {
+                    n_experts: 4,
+                    assign: ExpertAssign::Stride,
+                },
+            ));
+            separate_manifest.push(WeightEntry::layer(
+                "experts.up",
+                0,
+                vec![4, 512, 64],
+                DType::F16,
+                ShardPolicy::ExpertSharded {
+                    n_experts: 4,
+                    assign: ExpertAssign::Stride,
+                },
+            ));
+            let resolution = resolve_expert_manifest_for_policy(
+                &[separate],
+                &separate_manifest,
+                &projection_policy(kind, ranks),
+            )
+            .unwrap_or_else(|err| panic!("separate under {kind:?}: {err}"));
+            assert_eq!(resolution.plans.len(), 1);
+        }
+
+        // Already-correct effective policies remain: a static Replicate packed
+        // projection resolves under Single, and a static role-correct
+        // ExpertTensorSharded resolves under TP without rewriting.
+        let mut replicate = projection_manifest(Some(0), 4, 512, 64, ExpertAssign::Stride);
+        replicate[1].policy = ShardPolicy::Replicate;
+        replicate[2].policy = ShardPolicy::Replicate;
+        assert!(resolve_expert_manifest_for_policy(
+            &[projection_spec(ExpertParallelism::Single)],
+            &replicate,
+            &projection_policy(MoEExecutionKind::Single, 1),
+        )
+        .is_ok());
+
+        let mut already_tp = projection_manifest(Some(0), 4, 512, 64, ExpertAssign::Stride);
+        already_tp[1].policy = ShardPolicy::ExpertTensorSharded {
+            n_experts: 4,
+            inner: Box::new(ShardPolicy::ColumnShard { axis: 1 }),
+        };
+        already_tp[2].policy = ShardPolicy::ExpertTensorSharded {
+            n_experts: 4,
+            inner: Box::new(ShardPolicy::RowShard { axis: 2 }),
+        };
+        assert!(resolve_expert_manifest_for_policy(
+            &[projection_spec(ExpertParallelism::TensorParallel)],
+            &already_tp,
+            &projection_policy(MoEExecutionKind::Tp, 2),
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn projection_single_per_expert_preserves_policies_and_matches_strict_resolver() {
+        // Qwen-like control: per-expert sources under Single are never
+        // projected; Replicate/Pin/Tied static policies are preserved exactly,
+        // and the result equals the existing strict resolver on the same
+        // static manifest.
+        let mut manifest = projection_manifest(Some(0), 4, 512, 64, ExpertAssign::Stride);
+        manifest.retain(|entry| entry.name == "mlp.gate");
+        for expert in 0..4 {
+            manifest.push(WeightEntry::layer(
+                format!("experts.gate.{expert}"),
+                0,
+                vec![64, 512],
+                DType::F16,
+                ShardPolicy::Replicate,
+            ));
+            manifest.push(WeightEntry::layer(
+                format!("experts.up.{expert}"),
+                0,
+                vec![64, 512],
+                DType::F16,
+                ShardPolicy::Replicate,
+            ));
+            manifest.push(WeightEntry::layer(
+                format!("experts.down.{expert}"),
+                0,
+                vec![512, 64],
+                DType::F16,
+                ShardPolicy::Replicate,
+            ));
+        }
+        // Pin and Tied policies are preserved (never projected, never rejected).
+        if let Some(entry) = manifest
+            .iter_mut()
+            .find(|entry| entry.name == "experts.gate.0")
+        {
+            entry.policy = ShardPolicy::Pin(PinTarget::Embed);
+        }
+        if let Some(entry) = manifest
+            .iter_mut()
+            .find(|entry| entry.name == "experts.up.2")
+        {
+            entry.policy = ShardPolicy::Tied {
+                source: "experts.up.0".into(),
+            };
+        }
+        let mut spec = projection_spec(ExpertParallelism::Single);
+        spec.source_layout = ExpertSourceLayout::PerExpertSeparate {
+            gate: (0..4)
+                .map(|expert| format!("experts.gate.{expert}"))
+                .collect(),
+            up: (0..4)
+                .map(|expert| format!("experts.up.{expert}"))
+                .collect(),
+            down: (0..4)
+                .map(|expert| format!("experts.down.{expert}"))
+                .collect(),
+            sidecars: Vec::new(),
+        };
+        let resolution = resolve_expert_manifest_for_policy(
+            &[spec.clone()],
+            &manifest,
+            &projection_policy(MoEExecutionKind::Single, 1),
+        )
+        .unwrap();
+        let control = resolve_expert_group_plans(&[spec], &manifest, 1).unwrap();
+        assert_eq!(resolution.plans, control);
+        assert_eq!(resolution.plans[0].collective, None);
+        assert!(resolution.layer_collectives.is_empty());
+    }
+
+    #[test]
+    fn projection_rejects_per_expert_under_tp_and_ep() {
+        let mut manifest = projection_manifest(Some(0), 4, 512, 64, ExpertAssign::Stride);
+        manifest.retain(|entry| entry.name == "mlp.gate");
+        for expert in 0..4 {
+            manifest.push(WeightEntry::layer(
+                format!("experts.gate_up.{expert}"),
+                0,
+                vec![64, 512],
+                DType::F16,
+                ShardPolicy::Replicate,
+            ));
+            manifest.push(WeightEntry::layer(
+                format!("experts.down.{expert}"),
+                0,
+                vec![512, 64],
+                DType::F16,
+                ShardPolicy::Replicate,
+            ));
+        }
+        for (kind, parallelism) in [
+            (MoEExecutionKind::Tp, ExpertParallelism::TensorParallel),
+            (MoEExecutionKind::Ep, ExpertParallelism::ExpertParallel),
+        ] {
+            let mut spec = projection_spec(parallelism);
+            spec.source_layout = ExpertSourceLayout::PerExpertFused {
+                gate_up: (0..4)
+                    .map(|expert| format!("experts.gate_up.{expert}"))
+                    .collect(),
+                down: (0..4)
+                    .map(|expert| format!("experts.down.{expert}"))
+                    .collect(),
+                sidecars: Vec::new(),
+            };
+            let err =
+                resolve_expert_manifest_for_policy(&[spec], &manifest, &projection_policy(kind, 2))
+                    .unwrap_err();
+            assert!(err.contains("PerExpert"), "kind {kind:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn projection_never_mutates_original_manifest_or_specs() {
+        let manifest = projection_manifest(Some(0), 4, 512, 64, ExpertAssign::Stride);
+        let specs = vec![projection_spec(ExpertParallelism::TensorParallel)];
+        let manifest_before = manifest.clone();
+        let specs_before = specs.clone();
+
+        resolve_expert_manifest_for_policy(
+            &specs,
+            &manifest,
+            &projection_policy(MoEExecutionKind::Tp, 2),
+        )
+        .unwrap();
+        // A failing resolution must leave both inputs untouched as well.
+        let err = resolve_expert_manifest_for_policy(
+            &specs,
+            &manifest,
+            &projection_policy(MoEExecutionKind::Single, 1),
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("does not match execution policy kind"),
+            "got: {err}"
+        );
+        assert_eq!(manifest, manifest_before);
+        assert_eq!(specs, specs_before);
+    }
+
+    #[test]
+    fn projection_exact_tp_mesh_drives_divisibility_and_256_alignment() {
+        let spec = projection_spec(ExpertParallelism::TensorParallel);
+        // Truthful shapes: inter=512 gives gate_up axis-1 slice 1024/2=512 and
+        // down axis-2 slice 512/2=256, both 256-aligned under Tp=2.
+        let ok = projection_manifest(Some(0), 4, 512, 64, ExpertAssign::Stride);
+        assert!(resolve_expert_manifest_for_policy(
+            &[spec.clone()],
+            &ok,
+            &projection_policy(MoEExecutionKind::Tp, 2),
+        )
+        .is_ok());
+
+        // The exact Tp mesh drives divisibility: 2*inter=1024 is not divisible
+        // by Tp=3 even though the static surrogate itself is policy-agnostic.
+        let err = resolve_expert_manifest_for_policy(
+            &[spec.clone()],
+            &ok,
+            &projection_policy(MoEExecutionKind::Tp, 3),
+        )
+        .unwrap_err();
+        assert!(err.contains("not divisible by Tp=3"), "got: {err}");
+
+        // And local-256 alignment: inter=256 yields a down slice 256/2=128
+        // under Tp=2, which is not a multiple of 256.
+        let small = projection_manifest(Some(0), 4, 256, 64, ExpertAssign::Stride);
+        let err = resolve_expert_manifest_for_policy(
+            &[spec.clone()],
+            &small,
+            &projection_policy(MoEExecutionKind::Tp, 2),
+        )
+        .unwrap_err();
+        assert!(err.contains("multiple of 256"), "got: {err}");
+
+        // Malformed claimed-source shapes are refused by strict full-manifest
+        // validation on the projected clone.
+        let mut malformed = projection_manifest(Some(0), 4, 512, 64, ExpertAssign::Stride);
+        malformed[1].logical_shape = vec![4, 0, 64];
+        let err = resolve_expert_manifest_for_policy(
+            &[spec],
+            &malformed,
+            &projection_policy(MoEExecutionKind::Tp, 2),
+        )
+        .unwrap_err();
+        assert!(err.contains("zero") || err.contains("3D"), "got: {err}");
+    }
+
+    #[test]
+    fn projection_rejects_wrong_static_count_assign_axes_nested_plain_shards_and_pin_tied() {
+        let single_policy = projection_policy(MoEExecutionKind::Single, 1);
+        let single_spec = projection_spec(ExpertParallelism::Single);
+
+        // Static surrogate with the wrong expert count is not projectable.
+        let mut count = projection_manifest(Some(0), 4, 512, 64, ExpertAssign::Stride);
+        count[1].policy = ShardPolicy::ExpertSharded {
+            n_experts: 3,
+            assign: ExpertAssign::Stride,
+        };
+        let err =
+            resolve_expert_manifest_for_policy(&[single_spec.clone()], &count, &single_policy)
+                .unwrap_err();
+        assert!(err.contains("experts.gate_up"), "got: {err}");
+        assert!(err.contains("n_experts=3"), "got: {err}");
+
+        // Static surrogate with the wrong assignment is not projectable.
+        let mut assign = projection_manifest(Some(0), 4, 512, 64, ExpertAssign::Stride);
+        assign[1].policy = ShardPolicy::ExpertSharded {
+            n_experts: 4,
+            assign: ExpertAssign::Contiguous,
+        };
+        let err =
+            resolve_expert_manifest_for_policy(&[single_spec.clone()], &assign, &single_policy)
+                .unwrap_err();
+        assert!(err.contains("Contiguous"), "got: {err}");
+
+        let tp_policy = projection_policy(MoEExecutionKind::Tp, 2);
+        let tp_spec = projection_spec(ExpertParallelism::TensorParallel);
+
+        // Plain shards on a claimed projection are refused — a direct
+        // competing RowShard is reported by projection eligibility, not left
+        // to the collective scheduler.
+        let mut plain = projection_manifest(Some(0), 4, 512, 64, ExpertAssign::Stride);
+        plain[2].policy = ShardPolicy::RowShard { axis: 2 };
+        let err =
+            resolve_expert_manifest_for_policy(&[tp_spec.clone()], &plain, &tp_policy).unwrap_err();
+        assert!(err.contains("not projectable"), "got: {err}");
+        assert!(
+            !err.contains("competing per-weight collective"),
+            "got: {err}"
+        );
+
+        // A static Replicate on a packed projection is not projectable under TP.
+        let mut replicate = projection_manifest(Some(0), 4, 512, 64, ExpertAssign::Stride);
+        replicate[1].policy = ShardPolicy::Replicate;
+        let err = resolve_expert_manifest_for_policy(&[tp_spec.clone()], &replicate, &tp_policy)
+            .unwrap_err();
+        assert!(err.contains("not projectable"), "got: {err}");
+
+        // Wrong inner axis on an already-ExpertTensorSharded source is refused.
+        let mut axis = projection_manifest(Some(0), 4, 512, 64, ExpertAssign::Stride);
+        axis[1].policy = ShardPolicy::ExpertTensorSharded {
+            n_experts: 4,
+            inner: Box::new(ShardPolicy::ColumnShard { axis: 0 }),
+        };
+        let err =
+            resolve_expert_manifest_for_policy(&[tp_spec.clone()], &axis, &tp_policy).unwrap_err();
+        assert!(err.contains("not projectable"), "got: {err}");
+
+        // Nested ExpertTensorSharded inners are refused.
+        let mut nested = projection_manifest(Some(0), 4, 512, 64, ExpertAssign::Stride);
+        nested[1].policy = ShardPolicy::ExpertTensorSharded {
+            n_experts: 4,
+            inner: Box::new(ShardPolicy::ExpertTensorSharded {
+                n_experts: 4,
+                inner: Box::new(ShardPolicy::Replicate),
+            }),
+        };
+        let err = resolve_expert_manifest_for_policy(&[tp_spec.clone()], &nested, &tp_policy)
+            .unwrap_err();
+        assert!(err.contains("not projectable"), "got: {err}");
+
+        // Unsupported Pin/Tied static policies on packed projections are refused.
+        let mut pin = projection_manifest(Some(0), 4, 512, 64, ExpertAssign::Stride);
+        pin[1].policy = ShardPolicy::Pin(PinTarget::Embed);
+        let err = resolve_expert_manifest_for_policy(&[single_spec.clone()], &pin, &single_policy)
+            .unwrap_err();
+        assert!(err.contains("not projectable"), "got: {err}");
+
+        let mut tied = projection_manifest(Some(0), 4, 512, 64, ExpertAssign::Stride);
+        tied[1].policy = ShardPolicy::Tied {
+            source: "mlp.gate".into(),
+        };
+        let err =
+            resolve_expert_manifest_for_policy(&[single_spec], &tied, &single_policy).unwrap_err();
+        assert!(err.contains("not projectable"), "got: {err}");
+    }
+
+    #[test]
+    fn projection_rejects_spec_policy_kind_mismatch() {
+        let manifest = projection_manifest(Some(0), 4, 512, 64, ExpertAssign::Stride);
+        let err = resolve_expert_manifest_for_policy(
+            &[projection_spec(ExpertParallelism::Single)],
+            &manifest,
+            &projection_policy(MoEExecutionKind::Tp, 2),
+        )
+        .unwrap_err();
+        assert!(err.contains("block-0"), "got: {err}");
+        assert!(
+            err.contains("does not match execution policy kind"),
+            "got: {err}"
+        );
+
+        let err = resolve_expert_manifest_for_policy(
+            &[projection_spec(ExpertParallelism::TensorParallel)],
+            &manifest,
+            &projection_policy(MoEExecutionKind::Single, 1),
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("does not match execution policy kind"),
+            "got: {err}"
+        );
+
+        let err = resolve_expert_manifest_for_policy(
+            &[projection_spec(ExpertParallelism::ExpertParallel)],
+            &manifest,
+            &projection_policy(MoEExecutionKind::Tp, 2),
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("does not match execution policy kind"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn projection_rejects_missing_ambiguous_repeated_cross_group_and_wrong_layer_sources() {
+        let manifest = projection_manifest(Some(0), 4, 512, 64, ExpertAssign::Stride);
+        let single_policy = projection_policy(MoEExecutionKind::Single, 1);
+
+        // Missing claimed source.
+        let mut missing = projection_spec(ExpertParallelism::Single);
+        missing.source_layout = ExpertSourceLayout::PackedFused {
+            gate_up: "experts.missing".into(),
+            down: "experts.down".into(),
+            sidecars: Vec::new(),
+        };
+        let err =
+            resolve_expert_manifest_for_policy(&[missing], &manifest, &single_policy).unwrap_err();
+        assert!(err.contains("experts.missing"), "got: {err}");
+        assert!(err.contains("not found in manifest scope"), "got: {err}");
+
+        // Ambiguous claimed source (duplicate (name, layer) manifest entries):
+        // the static-policy-neutral prefix reports the duplicate manifest
+        // identity before projection can reach the source finder.
+        let mut ambiguous = projection_manifest(Some(0), 4, 512, 64, ExpertAssign::Stride);
+        ambiguous.push(ambiguous[1].clone());
+        let err = resolve_expert_manifest_for_policy(
+            &[projection_spec(ExpertParallelism::Single)],
+            &ambiguous,
+            &single_policy,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("duplicate manifest (name, layer)"),
+            "got: {err}"
+        );
+
+        // Repeated source within one group.
+        let mut repeated = projection_spec(ExpertParallelism::Single);
+        repeated.source_layout = ExpertSourceLayout::PackedSeparate {
+            gate: "experts.gate_up".into(),
+            up: "experts.gate_up".into(),
+            down: "experts.down".into(),
+            sidecars: Vec::new(),
+        };
+        let err =
+            resolve_expert_manifest_for_policy(&[repeated], &manifest, &single_policy).unwrap_err();
+        assert!(err.contains("repeats projection source"), "got: {err}");
+
+        // Cross-group collision: the first declared group is the deterministic owner.
+        let first = projection_spec(ExpertParallelism::Single);
+        let mut second = projection_spec(ExpertParallelism::Single);
+        second.group = "block-1".into();
+        let err = resolve_expert_manifest_for_policy(&[first, second], &manifest, &single_policy)
+            .unwrap_err();
+        assert!(
+            err.contains("already claimed by expert group 'block-0' (declared first)"),
+            "got: {err}"
+        );
+
+        // Wrong layer: the claimed name exists only at another layer scope.
+        let other_layer = projection_manifest(Some(1), 4, 512, 64, ExpertAssign::Stride);
+        let err = resolve_expert_manifest_for_policy(
+            &[projection_spec(ExpertParallelism::Single)],
+            &other_layer,
+            &single_policy,
+        )
+        .unwrap_err();
+        assert!(err.contains("not found in manifest scope"), "got: {err}");
+    }
+
+    #[test]
+    fn projection_residual_keeps_unrelated_dense_row_shard() {
+        let mut manifest = projection_manifest(Some(0), 4, 512, 64, ExpertAssign::Stride);
+        manifest.push(WeightEntry::layer(
+            "wo",
+            0,
+            vec![8, 8],
+            DType::F16,
+            ShardPolicy::RowShard { axis: 1 },
+        ));
+        let resolution = resolve_expert_manifest_for_policy(
+            &[projection_spec(ExpertParallelism::ExpertParallel)],
+            &manifest,
+            &projection_policy(MoEExecutionKind::Ep, 2),
+        )
+        .unwrap();
+        // The unclaimed dense row shard keeps its Tp all-reduce; the claimed
+        // expert projections contribute none.
+        assert_eq!(
+            resolution.layer_collectives,
+            vec![(0, CollectiveHint::AllReduce { kind: DimKind::Tp })]
+        );
+    }
+
+    #[test]
+    fn projection_packed_separate_claims_gate_up_down_and_fused_does_not_hide_unclaimed_up() {
+        let mut separate_manifest = projection_manifest(Some(0), 4, 512, 64, ExpertAssign::Stride);
+        // PackedSeparate claims gate/up/down as separate logical sources. Each
+        // separate gate/up projection is its own width-inter tensor (512), not
+        // the fused 2*inter (1024) gate_up blob; down is
+        // [n_experts, hidden, inter].
+        separate_manifest.retain(|entry| entry.name != "experts.gate_up");
+        separate_manifest.push(WeightEntry::layer(
+            "experts.gate",
+            0,
+            vec![4, 512, 64],
+            DType::F16,
+            ShardPolicy::ExpertSharded {
+                n_experts: 4,
+                assign: ExpertAssign::Stride,
+            },
+        ));
+        separate_manifest.push(WeightEntry::layer(
+            "experts.up",
+            0,
+            vec![4, 512, 64],
+            DType::F16,
+            ShardPolicy::ExpertSharded {
+                n_experts: 4,
+                assign: ExpertAssign::Stride,
+            },
+        ));
+        let mut separate = projection_spec(ExpertParallelism::ExpertParallel);
+        separate.source_layout = ExpertSourceLayout::PackedSeparate {
+            gate: "experts.gate".into(),
+            up: "experts.up".into(),
+            down: "experts.down".into(),
+            sidecars: Vec::new(),
+        };
+        let resolution = resolve_expert_manifest_for_policy(
+            &[separate],
+            &separate_manifest,
+            &projection_policy(MoEExecutionKind::Ep, 2),
+        )
+        .unwrap();
+        // Gate, up, and down are all claimed and excluded exactly once: no
+        // stray per-weight Ep collective remains.
+        assert!(
+            resolution.layer_collectives.is_empty(),
+            "got: {:?}",
+            resolution.layer_collectives
+        );
+
+        // A fused layout claims only gate_up + down. The separate experts.up
+        // source is unclaimed and must remain visible in the residual schedule
+        // — the projection never hides a source. Its standalone shape is the
+        // truthful separate up width (inter = 512), not the fused 2*inter
+        // (1024) gate_up width.
+        let mut fused_manifest = projection_manifest(Some(0), 4, 512, 64, ExpertAssign::Stride);
+        fused_manifest.push(WeightEntry::layer(
+            "experts.up",
+            0,
+            vec![4, 512, 64],
+            DType::F16,
+            ShardPolicy::ExpertSharded {
+                n_experts: 4,
+                assign: ExpertAssign::Stride,
+            },
+        ));
+        let fused = projection_spec(ExpertParallelism::ExpertParallel);
+        let resolution = resolve_expert_manifest_for_policy(
+            &[fused],
+            &fused_manifest,
+            &projection_policy(MoEExecutionKind::Ep, 2),
+        )
+        .unwrap();
+        assert_eq!(
+            resolution.layer_collectives,
+            vec![(0, CollectiveHint::AllReduce { kind: DimKind::Ep })]
+        );
+
+        // Under Single and TP the same unclaimed source still keeps its static
+        // Ep collective visible as the intentional family-completeness signal:
+        // policy projection does not erase it, and no active-policy residual
+        // rejection is applied.
+        for kind in [MoEExecutionKind::Single, MoEExecutionKind::Tp] {
+            let ranks = if kind == MoEExecutionKind::Tp { 2 } else { 1 };
+            let spec = projection_spec(kind_parallelism(kind));
+            let resolution = resolve_expert_manifest_for_policy(
+                &[spec],
+                &fused_manifest,
+                &projection_policy(kind, ranks),
+            )
+            .unwrap_or_else(|err| panic!("kind {kind:?}: {err}"));
+            assert_eq!(
+                resolution.layer_collectives,
+                vec![(0, CollectiveHint::AllReduce { kind: DimKind::Ep })],
+                "kind {kind:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn projection_rejects_unrelated_invalid_entries() {
+        let mut manifest = projection_manifest(Some(0), 4, 512, 64, ExpertAssign::Stride);
+        manifest.push(WeightEntry::layer(
+            "wo",
+            0,
+            vec![8, 7],
+            DType::F16,
+            ShardPolicy::RowShard { axis: 1 },
+        ));
+        let err = resolve_expert_manifest_for_policy(
+            &[projection_spec(ExpertParallelism::TensorParallel)],
+            &manifest,
+            &projection_policy(MoEExecutionKind::Tp, 2),
+        )
+        .unwrap_err();
+        assert!(err.contains("wo"), "got: {err}");
+        assert!(err.contains("not divisible by Tp=2"), "got: {err}");
+    }
+
+    // ------------------------------------------------------------------
+    // Projection ownership: router/sidecar disjointness and precedence
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn projection_rejects_same_group_router_alias() {
+        // A projection source claimed by a group is never also that group's
+        // router reference. Projection ownership reports the alias with both
+        // roles and both groups named (the strict path would only reject the
+        // 3D router shape later, so this must be refused before projection).
+        let manifest = projection_manifest(Some(0), 4, 512, 64, ExpertAssign::Stride);
+        let mut spec = projection_spec(ExpertParallelism::Single);
+        spec.router = "experts.gate_up".into();
+        let err = resolve_expert_manifest_for_policy(
+            &[spec],
+            &manifest,
+            &projection_policy(MoEExecutionKind::Single, 1),
+        )
+        .unwrap_err();
+        assert!(err.contains("source gate_up"), "got: {err}");
+        assert!(err.contains("router"), "got: {err}");
+        assert!(err.contains("block-0"), "got: {err}");
+        assert!(err.contains("also referenced as"), "got: {err}");
+    }
+
+    #[test]
+    fn projection_rejects_same_group_sidecar_alias_under_single_and_ep() {
+        // A projection source claimed by a group is never also that group's
+        // sidecar reference. The strict path would ACCEPT the aliased sidecar
+        // (the projected Replicate/ExpertSharded policy satisfies the sidecar
+        // policy and shape checks), so projection ownership is the only
+        // authority that refuses it.
+        for (kind, ranks) in [(MoEExecutionKind::Single, 1), (MoEExecutionKind::Ep, 2)] {
+            let manifest = projection_manifest(Some(0), 4, 512, 64, ExpertAssign::Stride);
+            let mut spec = projection_spec(kind_parallelism(kind));
+            spec.source_layout = ExpertSourceLayout::PackedFused {
+                gate_up: "experts.gate_up".into(),
+                down: "experts.down".into(),
+                sidecars: vec!["experts.gate_up".into()],
+            };
+            let err = resolve_expert_manifest_for_policy(
+                &[spec],
+                &manifest,
+                &projection_policy(kind, ranks),
+            )
+            .unwrap_err();
+            assert!(err.contains("source gate_up"), "kind {kind:?}: {err}");
+            assert!(err.contains("sidecar[0]"), "kind {kind:?}: {err}");
+            assert!(err.contains("block-0"), "kind {kind:?}: {err}");
+            assert!(err.contains("also referenced as"), "kind {kind:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn projection_rejects_cross_group_router_alias() {
+        // Group A's claimed projection must not be group B's router reference.
+        let mut manifest = projection_manifest(Some(0), 4, 512, 64, ExpertAssign::Stride);
+        manifest.push(WeightEntry::layer(
+            "experts.b_gate_up",
+            0,
+            vec![4, 1024, 64],
+            DType::F16,
+            ShardPolicy::ExpertSharded {
+                n_experts: 4,
+                assign: ExpertAssign::Stride,
+            },
+        ));
+        manifest.push(WeightEntry::layer(
+            "experts.b_down",
+            0,
+            vec![4, 64, 512],
+            DType::F16,
+            ShardPolicy::ExpertSharded {
+                n_experts: 4,
+                assign: ExpertAssign::Stride,
+            },
+        ));
+        let mut first = projection_spec(ExpertParallelism::Single);
+        first.group = "block-0".into();
+        let mut second = projection_spec(ExpertParallelism::Single);
+        second.group = "block-1".into();
+        second.source_layout = ExpertSourceLayout::PackedFused {
+            gate_up: "experts.b_gate_up".into(),
+            down: "experts.b_down".into(),
+            sidecars: Vec::new(),
+        };
+        second.router = "experts.gate_up".into();
+        let err = resolve_expert_manifest_for_policy(
+            &[first, second],
+            &manifest,
+            &projection_policy(MoEExecutionKind::Single, 1),
+        )
+        .unwrap_err();
+        assert!(err.contains("source gate_up"), "got: {err}");
+        assert!(err.contains("router"), "got: {err}");
+        assert!(err.contains("block-0"), "got: {err}");
+        assert!(err.contains("block-1"), "got: {err}");
+        assert!(err.contains("also referenced as"), "got: {err}");
+    }
+
+    #[test]
+    fn projection_rejects_cross_group_sidecar_alias() {
+        // Group A's claimed projection must not be group B's sidecar reference.
+        let mut manifest = projection_manifest(Some(0), 4, 512, 64, ExpertAssign::Stride);
+        manifest.push(WeightEntry::layer(
+            "experts.b_gate_up",
+            0,
+            vec![4, 1024, 64],
+            DType::F16,
+            ShardPolicy::ExpertSharded {
+                n_experts: 4,
+                assign: ExpertAssign::Stride,
+            },
+        ));
+        manifest.push(WeightEntry::layer(
+            "experts.b_down",
+            0,
+            vec![4, 64, 512],
+            DType::F16,
+            ShardPolicy::ExpertSharded {
+                n_experts: 4,
+                assign: ExpertAssign::Stride,
+            },
+        ));
+        let mut first = projection_spec(ExpertParallelism::ExpertParallel);
+        first.group = "block-0".into();
+        let mut second = projection_spec(ExpertParallelism::ExpertParallel);
+        second.group = "block-1".into();
+        second.source_layout = ExpertSourceLayout::PackedFused {
+            gate_up: "experts.b_gate_up".into(),
+            down: "experts.b_down".into(),
+            sidecars: vec!["experts.down".into()],
+        };
+        let err = resolve_expert_manifest_for_policy(
+            &[first, second],
+            &manifest,
+            &projection_policy(MoEExecutionKind::Ep, 2),
+        )
+        .unwrap_err();
+        assert!(err.contains("source down"), "got: {err}");
+        assert!(err.contains("sidecar[0]"), "got: {err}");
+        assert!(err.contains("block-0"), "got: {err}");
+        assert!(err.contains("block-1"), "got: {err}");
+        assert!(err.contains("also referenced as"), "got: {err}");
+    }
+
+    #[test]
+    fn projection_accepts_distinct_router_and_sidecars_and_keeps_inputs_unchanged() {
+        // Ordinary distinct router and sidecar references are not conflicts:
+        // resolution succeeds and neither the manifest nor the specs change.
+        let mut manifest = projection_manifest(Some(0), 4, 512, 64, ExpertAssign::Stride);
+        manifest.push(WeightEntry::layer(
+            "experts.scale",
+            0,
+            vec![4, 4],
+            DType::F16,
+            ShardPolicy::Replicate,
+        ));
+        let mut spec = projection_spec(ExpertParallelism::Single);
+        spec.source_layout = ExpertSourceLayout::PackedFused {
+            gate_up: "experts.gate_up".into(),
+            down: "experts.down".into(),
+            sidecars: vec!["experts.scale".into()],
+        };
+        let manifest_before = manifest.clone();
+        let spec_before = spec.clone();
+        let resolution = resolve_expert_manifest_for_policy(
+            &[spec.clone()],
+            &manifest,
+            &projection_policy(MoEExecutionKind::Single, 1),
+        )
+        .unwrap();
+        assert_eq!(resolution.plans.len(), 1);
+        assert_eq!(manifest, manifest_before);
+        assert_eq!(spec, spec_before);
+    }
+
+    #[test]
+    fn projection_two_groups_legally_share_a_router() {
+        // Repeated router references across groups are legal: the disjointness
+        // check keys by (name, layer) and only reports a projection claim that
+        // intersects ANY router/sidecar reference — a shared router entry is
+        // not a conflict and never triggers the alias diagnostic.
+        let mut manifest = projection_manifest(Some(0), 4, 512, 64, ExpertAssign::Stride);
+        manifest.push(WeightEntry::layer(
+            "experts.b_gate_up",
+            0,
+            vec![4, 1024, 64],
+            DType::F16,
+            ShardPolicy::ExpertSharded {
+                n_experts: 4,
+                assign: ExpertAssign::Stride,
+            },
+        ));
+        manifest.push(WeightEntry::layer(
+            "experts.b_down",
+            0,
+            vec![4, 64, 512],
+            DType::F16,
+            ShardPolicy::ExpertSharded {
+                n_experts: 4,
+                assign: ExpertAssign::Stride,
+            },
+        ));
+        let mut first = projection_spec(ExpertParallelism::Single);
+        first.group = "block-0".into();
+        let mut second = projection_spec(ExpertParallelism::Single);
+        second.group = "block-1".into();
+        second.source_layout = ExpertSourceLayout::PackedFused {
+            gate_up: "experts.b_gate_up".into(),
+            down: "experts.b_down".into(),
+            sidecars: Vec::new(),
+        };
+        let resolution = resolve_expert_manifest_for_policy(
+            &[first, second],
+            &manifest,
+            &projection_policy(MoEExecutionKind::Single, 1),
+        )
+        .unwrap();
+        assert_eq!(resolution.plans.len(), 2);
+        assert!(resolution
+            .plans
+            .iter()
+            .all(|plan| plan.router == "mlp.gate"));
+    }
+
+    #[test]
+    fn projection_two_groups_legally_share_a_sidecar() {
+        // Two groups referencing the same sidecar entry is legal: only a
+        // projection claim intersecting a router/sidecar reference conflicts.
+        let mut manifest = projection_manifest(Some(0), 4, 512, 64, ExpertAssign::Stride);
+        manifest.push(WeightEntry::layer(
+            "experts.scale",
+            0,
+            vec![4, 4],
+            DType::F16,
+            ShardPolicy::Replicate,
+        ));
+        manifest.push(WeightEntry::layer(
+            "experts.b_gate_up",
+            0,
+            vec![4, 1024, 64],
+            DType::F16,
+            ShardPolicy::ExpertSharded {
+                n_experts: 4,
+                assign: ExpertAssign::Stride,
+            },
+        ));
+        manifest.push(WeightEntry::layer(
+            "experts.b_down",
+            0,
+            vec![4, 64, 512],
+            DType::F16,
+            ShardPolicy::ExpertSharded {
+                n_experts: 4,
+                assign: ExpertAssign::Stride,
+            },
+        ));
+        let mut first = projection_spec(ExpertParallelism::Single);
+        first.group = "block-0".into();
+        first.source_layout = ExpertSourceLayout::PackedFused {
+            gate_up: "experts.gate_up".into(),
+            down: "experts.down".into(),
+            sidecars: vec!["experts.scale".into()],
+        };
+        let mut second = projection_spec(ExpertParallelism::Single);
+        second.group = "block-1".into();
+        second.source_layout = ExpertSourceLayout::PackedFused {
+            gate_up: "experts.b_gate_up".into(),
+            down: "experts.b_down".into(),
+            sidecars: vec!["experts.scale".into()],
+        };
+        let resolution = resolve_expert_manifest_for_policy(
+            &[first, second],
+            &manifest,
+            &projection_policy(MoEExecutionKind::Single, 1),
+        )
+        .unwrap();
+        assert_eq!(resolution.plans.len(), 2);
+    }
+
+    #[test]
+    fn projection_same_source_name_at_different_layer_is_not_an_alias() {
+        // Ownership and the router/sidecar disjointness are keyed by
+        // (name, layer): the same source name at a different layer scope is a
+        // distinct entry and never triggers alias rejection.
+        let mut manifest = projection_manifest(Some(0), 4, 512, 64, ExpertAssign::Stride);
+        manifest.extend(projection_manifest(
+            Some(1),
+            4,
+            512,
+            64,
+            ExpertAssign::Stride,
+        ));
+        let mut first = projection_spec(ExpertParallelism::Single);
+        first.layer = Some(0);
+        let mut second = projection_spec(ExpertParallelism::Single);
+        second.layer = Some(1);
+        let resolution = resolve_expert_manifest_for_policy(
+            &[first, second],
+            &manifest,
+            &projection_policy(MoEExecutionKind::Single, 1),
+        )
+        .unwrap();
+        assert_eq!(resolution.plans.len(), 2);
+    }
+
+    #[test]
+    fn projection_precedence_prefix_before_ownership_and_projection() {
+        let manifest = projection_manifest(Some(0), 4, 512, 64, ExpertAssign::Stride);
+        let single_policy = projection_policy(MoEExecutionKind::Single, 1);
+
+        // Duplicate group identity + repeated source: the static-policy-neutral
+        // prefix reports the duplicate group/layer identity before ownership
+        // reports the repeated projection source.
+        let mut first = projection_spec(ExpertParallelism::Single);
+        first.group = "block-0".into();
+        let mut second = projection_spec(ExpertParallelism::Single);
+        second.group = "block-0".into();
+        second.source_layout = ExpertSourceLayout::PackedSeparate {
+            gate: "experts.gate_up".into(),
+            up: "experts.gate_up".into(),
+            down: "experts.down".into(),
+            sidecars: Vec::new(),
+        };
+        let err = resolve_expert_manifest_for_policy(&[first, second], &manifest, &single_policy)
+            .unwrap_err();
+        assert!(err.contains("duplicate group/layer identity"), "got: {err}");
+
+        // Invalid metadata + cross-group claim: the prefix reports the invalid
+        // metadata before ownership reports the conflict.
+        let mut invalid = projection_spec(ExpertParallelism::Single);
+        invalid.group = "block-0".into();
+        invalid.n_experts = 0;
+        let mut claimant = projection_spec(ExpertParallelism::Single);
+        claimant.group = "block-1".into();
+        let err =
+            resolve_expert_manifest_for_policy(&[invalid, claimant], &manifest, &single_policy)
+                .unwrap_err();
+        assert!(err.contains("n_experts=0"), "got: {err}");
+        assert!(!err.contains("already claimed"), "got: {err}");
+
+        // Duplicate manifest identity + claimed source: the prefix reports the
+        // duplicate (name, layer) before projection reaches the source finder.
+        let mut duplicated = projection_manifest(Some(0), 4, 512, 64, ExpertAssign::Stride);
+        duplicated.push(duplicated[1].clone());
+        let err = resolve_expert_manifest_for_policy(
+            &[projection_spec(ExpertParallelism::Single)],
+            &duplicated,
+            &single_policy,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("duplicate manifest (name, layer)"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn projection_tp1_enforces_local_256_and_tp2_adds_divisibility() {
+        // The exact TP mesh drives the local-256 contract for EVERY rank
+        // count: under Tp=1 the aligned inter=256 fixture (gate_up axis-1
+        // slice 512, down axis-2 slice 256) resolves, while Tp=2 rejects the
+        // same fixture because the down slice 256/2=128 is not a multiple of
+        // 256 — divisibility by the exact rank count is additionally enforced
+        // under Tp>1.
+        let spec = projection_spec(ExpertParallelism::TensorParallel);
+        let small = projection_manifest(Some(0), 4, 256, 64, ExpertAssign::Stride);
+        let resolution = resolve_expert_manifest_for_policy(
+            &[spec.clone()],
+            &small,
+            &projection_policy(MoEExecutionKind::Tp, 1),
+        )
+        .unwrap();
+        assert_eq!(resolution.plans[0].group_size, 1);
+        assert_eq!(
+            resolution.plans[0].collective,
+            Some(ExpertPostCombineAllReduce::TensorParallel)
+        );
+
+        let err = resolve_expert_manifest_for_policy(
+            &[spec],
+            &small,
+            &projection_policy(MoEExecutionKind::Tp, 2),
+        )
+        .unwrap_err();
+        assert!(err.contains("multiple of 256"), "got: {err}");
+    }
+
+    #[test]
+    fn projection_tp1_rejects_non_256_local_slices() {
+        // Tp=1 performs no slicing, but the local slice width must still be a
+        // multiple of 256: the effective resident tensor would carry a slice
+        // the quant group size cannot represent. This is projection-path
+        // eligibility only — the strict validator's tp > 1 gate is unchanged.
+        let spec = projection_spec(ExpertParallelism::TensorParallel);
+        let policy = projection_policy(MoEExecutionKind::Tp, 1);
+
+        // inter=128: the gate_up axis-1 slice 256 is aligned, but the down
+        // axis-2 slice 128 is not — the down role diagnostic fires.
+        let width128 = projection_manifest(Some(0), 4, 128, 64, ExpertAssign::Stride);
+        let err =
+            resolve_expert_manifest_for_policy(&[spec.clone()], &width128, &policy).unwrap_err();
+        assert!(err.contains("source down"), "got: {err}");
+        assert!(err.contains("experts.down"), "got: {err}");
+        assert!(err.contains("block-0"), "got: {err}");
+        assert!(err.contains("multiple of 256"), "got: {err}");
+
+        // inter=192: the gate_up axis-1 slice 384 is not aligned — the
+        // gate/up role (axis 1) diagnostic fires before the down role.
+        let width192 = projection_manifest(Some(0), 4, 192, 64, ExpertAssign::Stride);
+        let err = resolve_expert_manifest_for_policy(&[spec], &width192, &policy).unwrap_err();
+        assert!(err.contains("source gate_up"), "got: {err}");
+        assert!(err.contains("experts.gate_up"), "got: {err}");
+        assert!(err.contains("multiple of 256"), "got: {err}");
+    }
+
+    #[test]
+    fn projection_tp_role_dim_check_leaves_single_and_ep_unaffected() {
+        // The exact-TP role-dimension eligibility is projection-path and
+        // TP-only: the same non-aligned-width fixture resolves under Single
+        // (Replicate) and EP (ExpertSharded), where no slicing occurs.
+        let manifest = projection_manifest(Some(0), 4, 128, 64, ExpertAssign::Stride);
+        for (kind, ranks) in [(MoEExecutionKind::Single, 1), (MoEExecutionKind::Ep, 2)] {
+            let spec = projection_spec(kind_parallelism(kind));
+            let resolution = resolve_expert_manifest_for_policy(
+                &[spec],
+                &manifest,
+                &projection_policy(kind, ranks),
+            )
+            .unwrap_or_else(|err| panic!("kind {kind:?}: {err}"));
+            assert_eq!(resolution.plans.len(), 1);
+        }
+    }
+
+    #[test]
+    fn projection_rejects_plain_column_shard_projection_source() {
+        // A bare ColumnShard on a claimed projection is a plain competing
+        // shard: not a static surrogate, not the effective policy — refused.
+        let mut tp_manifest = projection_manifest(Some(0), 4, 512, 64, ExpertAssign::Stride);
+        tp_manifest[1].policy = ShardPolicy::ColumnShard { axis: 1 };
+        let err = resolve_expert_manifest_for_policy(
+            &[projection_spec(ExpertParallelism::TensorParallel)],
+            &tp_manifest,
+            &projection_policy(MoEExecutionKind::Tp, 2),
+        )
+        .unwrap_err();
+        assert!(err.contains("not projectable"), "got: {err}");
+
+        let mut single_manifest = projection_manifest(Some(0), 4, 512, 64, ExpertAssign::Stride);
+        single_manifest[1].policy = ShardPolicy::ColumnShard { axis: 0 };
+        let err = resolve_expert_manifest_for_policy(
+            &[projection_spec(ExpertParallelism::Single)],
+            &single_manifest,
+            &projection_policy(MoEExecutionKind::Single, 1),
+        )
+        .unwrap_err();
+        assert!(err.contains("not projectable"), "got: {err}");
+    }
+
+    #[test]
+    fn projection_rejects_already_effective_tp_policy_outside_tp_and_replicate_under_ep() {
+        // An already-TP-effective ExpertTensorSharded projection is effective
+        // only under TP; under Single and EP it is refused rather than
+        // reinterpreted.
+        let mut manifest = projection_manifest(Some(0), 4, 512, 64, ExpertAssign::Stride);
+        manifest[1].policy = ShardPolicy::ExpertTensorSharded {
+            n_experts: 4,
+            inner: Box::new(ShardPolicy::ColumnShard { axis: 1 }),
+        };
+        manifest[2].policy = ShardPolicy::ExpertTensorSharded {
+            n_experts: 4,
+            inner: Box::new(ShardPolicy::RowShard { axis: 2 }),
+        };
+        let err = resolve_expert_manifest_for_policy(
+            &[projection_spec(ExpertParallelism::Single)],
+            &manifest,
+            &projection_policy(MoEExecutionKind::Single, 1),
+        )
+        .unwrap_err();
+        assert!(err.contains("not projectable"), "got: {err}");
+
+        let err = resolve_expert_manifest_for_policy(
+            &[projection_spec(ExpertParallelism::ExpertParallel)],
+            &manifest,
+            &projection_policy(MoEExecutionKind::Ep, 2),
+        )
+        .unwrap_err();
+        assert!(err.contains("not projectable"), "got: {err}");
+
+        // Replicate is the Single-effective placement; under EP it is refused.
+        let mut replicate = projection_manifest(Some(0), 4, 512, 64, ExpertAssign::Stride);
+        replicate[1].policy = ShardPolicy::Replicate;
+        replicate[2].policy = ShardPolicy::Replicate;
+        let err = resolve_expert_manifest_for_policy(
+            &[projection_spec(ExpertParallelism::ExpertParallel)],
+            &replicate,
+            &projection_policy(MoEExecutionKind::Ep, 2),
+        )
+        .unwrap_err();
+        assert!(err.contains("not projectable"), "got: {err}");
+    }
+
+    #[test]
+    fn projection_immutability_with_unrelated_tied_and_sidecar_entries() {
+        // Richer immutability fixture: unrelated dense entry, a Tied model
+        // entry, and a declared sidecar all survive both successful and
+        // failing resolutions equality-identically.
+        let mut manifest = projection_manifest(Some(0), 4, 512, 64, ExpertAssign::Stride);
+        manifest.push(WeightEntry::layer(
+            "wo",
+            0,
+            vec![8, 8],
+            DType::F16,
+            ShardPolicy::RowShard { axis: 1 },
+        ));
+        manifest.push(WeightEntry::model(
+            "token_embd",
+            vec![8, 8],
+            DType::F16,
+            ShardPolicy::Replicate,
+        ));
+        manifest.push(WeightEntry::model(
+            "lm_head",
+            vec![8, 8],
+            DType::F16,
+            ShardPolicy::Tied {
+                source: "token_embd".into(),
+            },
+        ));
+        manifest.push(WeightEntry::layer(
+            "experts.scale",
+            0,
+            vec![4, 4],
+            DType::F16,
+            ShardPolicy::Replicate,
+        ));
+        let mut spec = projection_spec(ExpertParallelism::Single);
+        spec.source_layout = ExpertSourceLayout::PackedFused {
+            gate_up: "experts.gate_up".into(),
+            down: "experts.down".into(),
+            sidecars: vec!["experts.scale".into()],
+        };
+        let manifest_before = manifest.clone();
+        let spec_before = spec.clone();
+        resolve_expert_manifest_for_policy(
+            &[spec.clone()],
+            &manifest,
+            &projection_policy(MoEExecutionKind::Single, 1),
+        )
+        .unwrap();
+        let err = resolve_expert_manifest_for_policy(
+            &[spec.clone()],
+            &manifest,
+            &projection_policy(MoEExecutionKind::Tp, 2),
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("does not match execution policy kind"),
+            "got: {err}"
+        );
+        assert_eq!(manifest, manifest_before);
+        assert_eq!(spec, spec_before);
     }
 }

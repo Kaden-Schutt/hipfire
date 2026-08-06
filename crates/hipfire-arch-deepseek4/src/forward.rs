@@ -24,6 +24,7 @@
 //!   - Embedding lookup, lm_head matmul, sampler
 
 use crate::{DeepseekV4Config, DeepseekV4State, DeepseekV4Weights};
+use hipfire_dispatch::families::moe::DeepSeekGroupedBounds;
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 /// OnceLock-cached env-var lookups for the DeepSeek V4 decode hot path. Each
@@ -1487,6 +1488,26 @@ pub fn decode_step(
     token_id: u32,
     position: u32,
 ) -> Result<Vec<f32>, String> {
+    // Authority: acquire the model-owned MoE plan entry EXACTLY ONCE for
+    // this forward (full rank×layer certification + complete-key check),
+    // under the SINGLE MoE enable snapshot taken here.
+    let moe_on = env_cache::moe_on();
+    let authority = acquire_moe_authority_single(cfg, weights, moe_on)?;
+    decode_step_internal(cfg, weights, state, gpu, token_id, position, authority)
+}
+
+/// PRIVATE internal decode: the layer loop + head with an ALREADY-ACQUIRED
+/// authority (the public entries own acquisition; the graph wrapper reuses
+/// one acquisition for warmup AND capture). Never re-acquires.
+fn decode_step_internal(
+    cfg: &DeepseekV4Config,
+    weights: &DeepseekV4Weights,
+    state: &mut DeepseekV4State,
+    gpu: &mut Gpu,
+    token_id: u32,
+    position: u32,
+    authority: MoeAuthority<'_>,
+) -> Result<Vec<f32>, String> {
     // HIP-graphs prerequisite: lift the ~130 per-token pos_buf
     // `memcpy_htod` calls out of the per-layer code into a single
     // bulk write at decode-step entry. Per-layer kernels then read
@@ -1502,10 +1523,315 @@ pub fn decode_step(
     //    reference code before optimising).
     init_residual_streams(cfg, weights, state, gpu, token_id)?;
 
-    let _ = decode_step_body(cfg, weights, state, gpu, token_id, position)?;
+    let _ = decode_step_body(cfg, authority, weights, state, gpu, token_id, position)?;
     let logits = state.logits.as_ref().unwrap();
     gpu.download_f32(logits)
         .map_err(|e| format!("download logits: {e:?}"))
+}
+
+/// Pure mesh-entry policy validation (CPU-testable seam; the mesh entries
+/// call it through [`validate_mesh_entry_policy`] BEFORE any GPU work):
+/// the policy kind must be the entry's required kind (EP vs TP), the policy
+/// mesh must be the EXACT mesh the `Gpus` are bound to (epoch identity),
+/// and the policy rank count must equal the device count. Executes even
+/// when MoE is disabled/shared-only — wrong policies refuse regardless.
+pub(crate) fn validate_mesh_policy_binding(
+    policy: &hipfire_runtime::moe_plan::MoEExecutionPolicy,
+    required_kind: hipfire_runtime::moe_plan::MoEExecutionKind,
+    bound_epoch: Option<hipfire_runtime::multi_gpu::MeshEpoch>,
+    device_count: usize,
+) -> Result<(), String> {
+    if policy.kind() != required_kind {
+        return Err(format!(
+            "expected a {required_kind:?} execution policy, got {:?}",
+            policy.kind()
+        ));
+    }
+    let epoch = bound_epoch
+        .ok_or_else(|| "the Gpus are not bound to a DeviceMesh (from_mesh required)".to_string())?;
+    if epoch != policy.mesh().epoch() {
+        return Err(
+            "policy mesh epoch differs from the Gpus-bound mesh epoch (stale or different mesh)"
+                .to_string(),
+        );
+    }
+    if policy.rank_count() != device_count {
+        return Err(format!(
+            "policy rank count {} != device count {device_count}",
+            policy.rank_count()
+        ));
+    }
+    Ok(())
+}
+
+/// Mesh-entry policy validation wrapper (CALLED by the five public mesh
+/// entries at their very start, before any GPU work): kind check + exact
+/// mesh/epoch binding via the approved [`Gpus::weight_origin_in`] API
+/// (UnboundMesh / MeshEpochMismatch), then the pure binding seam.
+fn validate_mesh_entry_policy(
+    gpus: &hipfire_runtime::multi_gpu::Gpus,
+    policy: &hipfire_runtime::moe_plan::MoEExecutionPolicy,
+    required_kind: hipfire_runtime::moe_plan::MoEExecutionKind,
+) -> Result<(), String> {
+    // 1. Kind FIRST: a wrong-kind policy is refused deterministically,
+    //    before any mesh/epoch binding check (a wrong-kind policy must never
+    //    be masked by a stale-mesh binding error).
+    if policy.kind() != required_kind {
+        return Err(format!(
+            "deepseek4 {required_kind:?} entry policy: expected a {required_kind:?} execution \
+             policy, got {:?}",
+            policy.kind()
+        ));
+    }
+    // 2. Exact mesh/epoch binding via the approved API, then rank/device
+    //    agreement through the pure seam.
+    let origin = gpus
+        .weight_origin_in(policy.mesh(), 0)
+        .map_err(|e| format!("deepseek4 {required_kind:?} entry policy mesh binding: {e}"))?;
+    validate_mesh_policy_binding(
+        policy,
+        required_kind,
+        Some(origin.mesh_epoch()),
+        gpus.devices.len(),
+    )
+    .map_err(|e| format!("deepseek4 {required_kind:?} entry policy: {e}"))
+}
+
+/// Acquire the model-owned MoE plan authority for the SINGLE path: one
+/// aggregate call with the canonical stable `weights.moe_policy`, exactly
+/// once per forward. The caller passes the SINGLE MoE enable snapshot taken
+/// at the public entry (`Ok(Disabled)` when false — routed lookup bypassed);
+/// every refusal (config/policy/resource/cardinality/mismatch) propagates as
+/// a typed error before any layer work.
+fn acquire_moe_authority_single<'a>(
+    cfg: &DeepseekV4Config,
+    weights: &'a DeepseekV4Weights,
+    moe_on: bool,
+) -> Result<MoeAuthority<'a>, String> {
+    if !moe_on {
+        return Ok(MoeAuthority::disabled());
+    }
+    crate::moe_lower::ds4_cached_moe_plans(std::slice::from_ref(weights), cfg, &weights.moe_policy)
+        .map(MoeAuthority::enabled)
+        .map_err(|e| format!("deepseek4 MoE plan authority (single): {e:?}"))
+}
+
+/// Acquire the model-owned MoE plan authority for the MESH (TP/EP) path: one
+/// aggregate call with the EXACT caller/loader-owned policy, exactly once
+/// per forward, under the single enable snapshot taken at the public entry;
+/// every refusal propagates as a typed error before any layer work.
+fn acquire_moe_authority_mesh<'a>(
+    weights_per_rank: &'a [DeepseekV4Weights],
+    cfg: &DeepseekV4Config,
+    policy: &hipfire_runtime::moe_plan::MoEExecutionPolicy,
+    moe_on: bool,
+) -> Result<MoeAuthority<'a>, String> {
+    if !moe_on {
+        return Ok(MoeAuthority::disabled());
+    }
+    crate::moe_lower::ds4_cached_moe_plans(weights_per_rank, cfg, policy)
+        .map(MoeAuthority::enabled)
+        .map_err(|e| format!("deepseek4 MoE plan authority (mesh): {e:?}"))
+}
+
+/// Opaque one-forward MoE authority — NON-FORGEABLE: the state
+/// (Enabled/Disabled) is a PRIVATE field, and the constructors are private
+/// to this module. Only the acquisition helpers below can produce an
+/// authority; no other crate module (including sibling tests) can construct
+/// a Disabled or Enabled state. Consumers read the state through the
+/// read-only [`MoeAuthority::entry`] inspection.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct MoeAuthority<'a> {
+    state: MoeAuthorityState<'a>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum MoeAuthorityState<'a> {
+    /// MoE enabled: the acquired rank-zero cache entry (plan borrowing is
+    /// zero-allocation per layer).
+    Enabled(&'a crate::moe_lower::Ds4PlanCacheEntry),
+    /// Runtime MoE disabled: routed lookup is bypassed; shared expert + HC
+    /// tail still run.
+    Disabled,
+}
+
+impl<'a> MoeAuthority<'a> {
+    /// Construct an ENABLED authority — private: acquisition helpers only.
+    fn enabled(entry: &'a crate::moe_lower::Ds4PlanCacheEntry) -> Self {
+        MoeAuthority {
+            state: MoeAuthorityState::Enabled(entry),
+        }
+    }
+
+    /// Construct a DISABLED authority — private: acquisition helpers only.
+    fn disabled() -> Self {
+        MoeAuthority {
+            state: MoeAuthorityState::Disabled,
+        }
+    }
+
+    /// Read-only state inspection: `Some(entry)` when enabled, `None` when
+    /// disabled. Cannot forge either state.
+    pub(crate) fn entry(&self) -> Option<&'a crate::moe_lower::Ds4PlanCacheEntry> {
+        match self.state {
+            MoeAuthorityState::Enabled(entry) => Some(entry),
+            MoeAuthorityState::Disabled => None,
+        }
+    }
+}
+
+/// Complete graph-forward action, encoded by [`graph_forward_action`] and
+/// branched on by `decode_step_with_graph` — the single production decision
+/// point for the graph wrapper.
+#[derive(Debug)]
+pub(crate) enum GraphAction<'a> {
+    /// Graph OFF: delegate to the normal public `decode_step` (which performs
+    /// its own single acquisition). No graph-only authority/gate ran.
+    EagerDelegate,
+    /// Graph ON but the forward cannot run under capture: the authority or
+    /// the host-fallback gate refused BEFORE any warmup/capture callback.
+    /// Carries the refusal reason.
+    GraphRefuse(String),
+    /// Graph ON: the authority was acquired EXACTLY ONCE and passed the
+    /// host-fallback gate; the SAME authority feeds the warmup AND the
+    /// capture/replay runs.
+    GraphRun(MoeAuthority<'a>),
+}
+
+/// The complete graph-forward decision seam (CPU-testable; CALLED by
+/// `decode_step_with_graph` and branched on): evaluates the graph mode,
+/// acquires the authority AT MOST ONCE — only for the GraphRefuse/GraphRun
+/// paths — and applies the host-fallback gate. Eager never acquires.
+pub(crate) fn graph_forward_action<'a>(
+    cfg: &DeepseekV4Config,
+    weights: &'a DeepseekV4Weights,
+    gpu_arch: &str,
+    env_override: Option<bool>,
+    moe_on: bool,
+) -> GraphAction<'a> {
+    if !graph_mode_enabled(gpu_arch, env_override) {
+        return GraphAction::EagerDelegate;
+    }
+    match acquire_moe_authority_single(cfg, weights, moe_on) {
+        Err(e) => GraphAction::GraphRefuse(e),
+        Ok(authority) => match authority.entry() {
+            None => GraphAction::GraphRun(authority),
+            Some(entry) => {
+                // Typed: the single aggregate always carries one rank
+                // profile (rank-count validated) — an empty matrix is an
+                // explicit refusal, never an expect.
+                let profiles = match entry.key().router_profiles.first() {
+                    Some(profiles) => profiles,
+                    None => {
+                        return GraphAction::GraphRefuse(
+                            "single aggregate carries no rank profile".to_string(),
+                        )
+                    }
+                };
+                match crate::moe_lower::ds4_graph_refuse_host_fallback(profiles) {
+                    Ok(()) => GraphAction::GraphRun(authority),
+                    Err(e) => GraphAction::GraphRefuse(e),
+                }
+            }
+        },
+    }
+}
+
+/// Graph-mode decision (CPU-testable seam CALLED by `decode_step_with_graph`
+/// before any graph-only authority acquisition or gate): the graph path is
+/// enabled when the env override says so, or by default on gfx11/gfx12.
+pub(crate) fn graph_mode_enabled(gpu_arch: &str, env_override: Option<bool>) -> bool {
+    env_override.unwrap_or_else(|| gpu_arch.starts_with("gfx11") || gpu_arch.starts_with("gfx12"))
+}
+
+/// Release-safe MTP selection state for the public entries' initial action
+/// sequence. `Unselected` means `SelectAuthority` has not run — `PreFfn`
+/// refuses with a typed error (never a debug-assert-only check).
+/// `Selected(None)` means MoE is disabled: shared/pre-FFN work runs safely
+/// with NO routed execution. `Selected(Some(plan))` means enabled with the
+/// typed MTP plan (the ONLY state that may reach the routed MTP helper).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Ds4MtpSelection<'a> {
+    Unselected,
+    Selected(Option<&'a hipfire_runtime::weight_manifest::ExpertGroupPlan>),
+}
+
+impl<'a> Ds4MtpSelection<'a> {
+    /// Typed transition: `Unselected` → Err (SelectAuthority must run
+    /// first); `Selected` → the routed plan Option (`None` = disabled: the
+    /// shared/pre-FFN path runs, routed execution never).
+    pub(crate) fn plan_or_err(
+        &self,
+        ctx: &str,
+    ) -> Result<Option<&'a hipfire_runtime::weight_manifest::ExpertGroupPlan>, String> {
+        match self {
+            Ds4MtpSelection::Unselected => Err(format!(
+                "{ctx}: MTP SelectAuthority must run before PreFfn (selection is Unselected)"
+            )),
+            Ds4MtpSelection::Selected(plan) => Ok(*plan),
+        }
+    }
+}
+
+/// MTP authority selection for the SINGLE entry (CPU-testable seam CALLED by
+/// `mtp_forward`'s `SelectAuthority` action, BEFORE any GPU work): the count
+/// guard first returns `Unconfigured` for zero and `Unsupported` above one.
+/// For count one, the authority is acquired once under the entry's enable
+/// snapshot and an enabled entry selects its typed plan via `entry.mtp_plan()`;
+/// a disabled entry returns `Selected(None)`.
+/// MTP count-state check shared by both selectors: `num_nextn_predict_layers`
+/// is matched BEFORE any moe_on bypass — count0 refuses with the typed
+/// `Unconfigured` semantic (even when MoE is disabled, so a disabled count0
+/// never reaches PreFfn/weight validation); count1 proceeds; count>1 refuses
+/// with the Unsupported semantic (also before the disable bypass).
+fn mtp_count_guard(ctx: &str, count: usize) -> Result<(), String> {
+    match count {
+        0 => Err(format!(
+            "deepseek4 MTP authority ({ctx}): {:?}",
+            crate::moe_lower::Ds4MtpPlanError::Unconfigured
+        )),
+        1 => Ok(()),
+        n => Err(format!(
+            "deepseek4 MTP authority ({ctx}): num_nextn_predict_layers={n} is unsupported \
+             (refused before the MoE-disable bypass)"
+        )),
+    }
+}
+
+pub(crate) fn select_mtp_authority_single<'a>(
+    cfg: &DeepseekV4Config,
+    weights: &'a DeepseekV4Weights,
+    moe_on: bool,
+) -> Result<Ds4MtpSelection<'a>, String> {
+    mtp_count_guard("single", cfg.num_nextn_predict_layers)?;
+    match acquire_moe_authority_single(cfg, weights, moe_on)?.entry() {
+        None => Ok(Ds4MtpSelection::Selected(None)),
+        Some(entry) => entry
+            .mtp_plan()
+            .map(|plan| Ds4MtpSelection::Selected(Some(plan)))
+            .map_err(|e| format!("deepseek4 MTP authority (single): {e:?}")),
+    }
+}
+
+/// MTP authority selection for the MESH entries (CPU-testable seam CALLED by
+/// `mtp_forward_ep` / `mtp_forward_tp`'s `SelectAuthority` action, before
+/// any per-rank GPU work): same contract as
+/// [`select_mtp_authority_single`], under the exact caller policy and the
+/// entry's enable snapshot.
+pub(crate) fn select_mtp_authority_mesh<'a>(
+    weights_per_rank: &'a [DeepseekV4Weights],
+    cfg: &DeepseekV4Config,
+    policy: &hipfire_runtime::moe_plan::MoEExecutionPolicy,
+    moe_on: bool,
+) -> Result<Ds4MtpSelection<'a>, String> {
+    mtp_count_guard("mesh", cfg.num_nextn_predict_layers)?;
+    match acquire_moe_authority_mesh(weights_per_rank, cfg, policy, moe_on)?.entry() {
+        None => Ok(Ds4MtpSelection::Selected(None)),
+        Some(entry) => entry
+            .mtp_plan()
+            .map(|plan| Ds4MtpSelection::Selected(Some(plan)))
+            .map_err(|e| format!("deepseek4 MTP authority (mesh): {e:?}")),
+    }
 }
 
 /// HIP-graphs-aware decode_step. Opt-in via `HIPFIRE_DEEPSEEK4_GRAPH=1`.
@@ -1551,92 +1877,106 @@ pub fn decode_step_with_graph(
             _ => None,
         }
     });
-    let graph_on = env_override.unwrap_or_else(|| {
-        let a = gpu.arch.as_str();
-        a.starts_with("gfx11") || a.starts_with("gfx12")
-    });
-    // Note: prior to bc6353e the hash-routed MoE path did a d2h of
-    // router scores inside the layer body — that broke HIP graph
-    // capture. Replaced by `hash_router_normalize_f32_buf` which
-    // reads token_id from a device buffer (staged by
-    // `precompute_token_id` at decode entry), so MoE+hash layers
-    // are now graph-safe and no guard is needed.
-    if !graph_on {
-        return decode_step(cfg, weights, state, gpu, token_id, position);
+    // 0. The COMPLETE graph action decision (mode evaluation + at-most-once
+    //    acquisition + host-fallback gate): production branches on the
+    //    returned action — eager delegates to the normal `decode_step`
+    //    (its own single acquisition, no graph refusal); GraphRefuse returns
+    //    before any warmup/capture callback; GraphRun carries the ONE
+    //    acquired authority that feeds both warmup and capture/replay.
+    let moe_on = env_cache::moe_on();
+    match graph_forward_action(cfg, weights, gpu.arch.as_str(), env_override, moe_on) {
+        GraphAction::EagerDelegate => {
+            return decode_step(cfg, weights, state, gpu, token_id, position);
+        }
+        GraphAction::GraphRefuse(reason) => return Err(reason),
+        GraphAction::GraphRun(authority) => {
+            // Note: prior to bc6353e the hash-routed MoE path did a d2h of
+            // router scores inside the layer body — that broke HIP graph
+            // capture. Replaced by `hash_router_normalize_f32_buf` which
+            // reads token_id from a device buffer (staged by
+            // `precompute_token_id` at decode entry), so MoE+hash layers
+            // are now graph-safe and no guard is needed.
+
+            // ── Warmup phase: direct dispatch, no capture ──────────
+            if !state.ar_forward_warmed_up {
+                state.ar_forward_warmed_up = true;
+                return decode_step_internal(
+                    cfg, weights, state, gpu, token_id, position, authority,
+                );
+            }
+
+            // From here on we need an explicit stream for capture/replay.
+            if gpu.active_stream.is_none() {
+                let s = gpu
+                    .hip
+                    .stream_create()
+                    .map_err(|e| format!("decode_step_with_graph: stream_create: {e:?}"))?;
+                gpu.active_stream = Some(s);
+            }
+
+            // Embedding lookup and pos-array host write run OUTSIDE the captured
+            // region. token_id is baked into the embedding kernel arg, so capture
+            // would lock the graph to a single token. Pos-array host source must
+            // be a stable `Box<[i32]>` — the captured memcpy re-reads it on each
+            // replay. We update those host bytes BEFORE launching the graph.
+            init_residual_streams(cfg, weights, state, gpu, token_id)?;
+
+            if gpu.graphs.graph_exec.is_none() {
+                // ── Capture phase ──────────────────────────────────────────
+                // precompute_positions + precompute_token_id are called INSIDE
+                // the capture so the captured memcpy nodes re-read their stable
+                // host sources on each replay.
+                gpu.graphs
+                    .begin_graph_capture(
+                        &gpu.hip,
+                        gpu.device_id,
+                        gpu.active_stream.as_ref().unwrap(),
+                    )
+                    .map_err(|e| format!("begin_graph_capture: {e:?}"))?;
+                precompute_positions(cfg, state, gpu, position)?;
+                precompute_token_id(state, gpu, token_id)?;
+                let _ = decode_step_body(cfg, authority, weights, state, gpu, token_id, position)?;
+                gpu.graphs
+                    .end_graph_capture(&gpu.hip, gpu.device_id, gpu.active_stream.as_ref().unwrap())
+                    .map_err(|e| format!("end_graph_capture: {e:?}"))?;
+                // Captured kernels were RECORDED, not executed. Launch the
+                // freshly-instantiated graph once so this position's forward
+                // actually runs and `state.logits` gets fresh values.
+                gpu.graphs
+                    .graph_launch(&gpu.hip, gpu.device_id, gpu.active_stream.as_ref().unwrap())
+                    .map_err(|e| format!("graph_launch (capture-end): {e:?}"))?;
+                eprintln!(
+                    "[DeepSeek V4 hipGraph] captured forward — {} kernarg blobs retained",
+                    gpu.graphs.capture_blobs.len()
+                );
+            } else {
+                // ── Replay phase ───────────────────────────────────────────
+                // Host-only update of the stable pos_array_host[], attn_state
+                // _host[], and token_id_host[]. The captured memcpy nodes
+                // re-read these bytes on graph_launch and propagate them to
+                // the device-side pos_array_device / attn_state_buf /
+                // token_id_buf which all per-layer kernels read.
+                update_pos_array_host(cfg, state, position);
+                // attn_state depends on state.n_tokens BEFORE increment (the
+                // current position being processed). decode_step normally
+                // increments state.n_tokens at the END of the body, so replay
+                // sees the right pre-increment value.
+                update_attn_state_host(cfg, state, state.n_tokens as u32);
+                update_token_id_host(state, token_id);
+                gpu.graphs
+                    .graph_launch(&gpu.hip, gpu.device_id, gpu.active_stream.as_ref().unwrap())
+                    .map_err(|e| format!("graph_launch (replay): {e:?}"))?;
+                state.n_tokens += 1;
+            }
+
+            // Logits download is outside the captured region (sync memcpy_dtoh
+            // on the null stream — completes after the captured kernels finish
+            // because the captured stream is observed by the device).
+            let logits = state.logits.as_ref().unwrap();
+            gpu.download_f32(logits)
+                .map_err(|e| format!("download logits (graph path): {e:?}"))
+        }
     }
-
-    // ── Warmup phase: direct dispatch, no capture ──────────────────
-    if !state.ar_forward_warmed_up {
-        state.ar_forward_warmed_up = true;
-        return decode_step(cfg, weights, state, gpu, token_id, position);
-    }
-
-    // From here on we need an explicit stream for capture/replay.
-    if gpu.active_stream.is_none() {
-        let s = gpu
-            .hip
-            .stream_create()
-            .map_err(|e| format!("decode_step_with_graph: stream_create: {e:?}"))?;
-        gpu.active_stream = Some(s);
-    }
-
-    // Embedding lookup and pos-array host write run OUTSIDE the captured
-    // region. token_id is baked into the embedding kernel arg, so capture
-    // would lock the graph to a single token. Pos-array host source must
-    // be a stable `Box<[i32]>` — the captured memcpy re-reads it on each
-    // replay. We update those host bytes BEFORE launching the graph.
-    init_residual_streams(cfg, weights, state, gpu, token_id)?;
-
-    if gpu.graphs.graph_exec.is_none() {
-        // ── Capture phase ──────────────────────────────────────────
-        // precompute_positions + precompute_token_id are called INSIDE
-        // the capture so the captured memcpy nodes re-read their stable
-        // host sources on each replay.
-        gpu.graphs
-            .begin_graph_capture(&gpu.hip, gpu.device_id, gpu.active_stream.as_ref().unwrap())
-            .map_err(|e| format!("begin_graph_capture: {e:?}"))?;
-        precompute_positions(cfg, state, gpu, position)?;
-        precompute_token_id(state, gpu, token_id)?;
-        let _ = decode_step_body(cfg, weights, state, gpu, token_id, position)?;
-        gpu.graphs
-            .end_graph_capture(&gpu.hip, gpu.device_id, gpu.active_stream.as_ref().unwrap())
-            .map_err(|e| format!("end_graph_capture: {e:?}"))?;
-        // Captured kernels were RECORDED, not executed. Launch the
-        // freshly-instantiated graph once so this position's forward
-        // actually runs and `state.logits` gets fresh values.
-        gpu.graphs
-            .graph_launch(&gpu.hip, gpu.device_id, gpu.active_stream.as_ref().unwrap())
-            .map_err(|e| format!("graph_launch (capture-end): {e:?}"))?;
-        eprintln!(
-            "[DeepSeek V4 hipGraph] captured forward — {} kernarg blobs retained",
-            gpu.graphs.capture_blobs.len()
-        );
-    } else {
-        // ── Replay phase ───────────────────────────────────────────
-        // Host-only update of the stable pos_array_host[], attn_state
-        // _host[], and token_id_host[]. The captured memcpy nodes
-        // re-read these bytes on graph_launch and propagate them to
-        // the device-side pos_array_device / attn_state_buf /
-        // token_id_buf which all per-layer kernels read.
-        update_pos_array_host(cfg, state, position);
-        // attn_state depends on state.n_tokens BEFORE increment (the
-        // current position being processed). decode_step normally
-        // increments state.n_tokens at the END of the body, so replay
-        // sees the right pre-increment value.
-        update_attn_state_host(cfg, state, state.n_tokens as u32);
-        update_token_id_host(state, token_id);
-        gpu.graphs
-            .graph_launch(&gpu.hip, gpu.device_id, gpu.active_stream.as_ref().unwrap())
-            .map_err(|e| format!("graph_launch (replay): {e:?}"))?;
-        state.n_tokens += 1;
-    }
-
-    // Logits download is outside the captured region (sync memcpy_dtoh
-    // on the null stream — completes after the captured kernels finish
-    // because the captured stream is observed by the device).
-    let logits = state.logits.as_ref().unwrap();
-    gpu.download_f32(logits)
-        .map_err(|e| format!("download logits (graph path): {e:?}"))
 }
 
 /// Update `state.attn_state_host = [slot, n_valid]` and copy to the
@@ -1809,8 +2149,9 @@ fn fill_pos_array_host(cfg: &DeepseekV4Config, pos_array_host: &mut [i32], posit
 /// the captured kernel to read, not kernarg-side position writes.
 ///
 /// Public so the HIP-graphs capture/replay wrapper can call it directly.
-pub fn decode_step_body(
+fn decode_step_body(
     cfg: &DeepseekV4Config,
+    authority: MoeAuthority<'_>,
     weights: &DeepseekV4Weights,
     state: &mut DeepseekV4State,
     gpu: &mut Gpu,
@@ -1894,10 +2235,21 @@ pub fn decode_step_body(
         mhc_pre(cfg, weights, state, gpu, layer_idx, /*is_attn=*/ false)?;
         if !skip_ffn {
             ffn_stub(cfg, weights, state, gpu, layer_idx)?;
-            if layer_idx < cfg.num_hash_layers {
-                ffn_hash_routed(cfg, weights, state, gpu, layer_idx, token_id, None)?;
-            } else {
-                ffn_routed(cfg, weights, state, gpu, layer_idx, None)?;
+            // Routed MoE (hash layers < num_hash_layers, bias-aware score
+            // layers otherwise) through the sealed lowered program; shared-
+            // only layers are a no-op here (ffn_stub already seeded ffn_out).
+            // The authority was acquired ONCE at the entry point; a
+            // Disabled state (runtime MoE off) skips routed lookup entirely,
+            // while an Enabled state with a missing plan is an explicit
+            // error (cached resolution failure) — never a silent skip.
+            match authority.entry() {
+                Some(entry) => {
+                    let plan = entry.plan(layer_idx).ok_or_else(|| {
+                        format!("moe l{layer_idx}: no plan in the authority entry")
+                    })?;
+                    ds4_moe_decode_single(cfg, plan, weights, state, gpu, layer_idx, token_id)?;
+                }
+                None => {}
             }
         } else {
             // Diagnostic: zero ffn_out to isolate attn contribution to growth.
@@ -1986,74 +2338,7 @@ fn ds4_attn_block(
     hc_attn_mix(cfg, weights, state, gpu, layer_idx)
 }
 
-/// FFN block (replays decode_step_body's FFN arm verbatim).
-fn ds4_moe_block(
-    cfg: &DeepseekV4Config,
-    weights: &DeepseekV4Weights,
-    state: &mut DeepseekV4State,
-    gpu: &mut Gpu,
-    layer_idx: usize,
-    token_id: u32,
-    skip_ffn: bool,
-) -> Result<(), String> {
-    // Non-EP: routed experts combine into `state.ffn_out` (alongside the
-    // shared expert seeded by `ffn_stub`), and the HC mix folds ffn_out into
-    // `residual_streams` in the same call.
-    ds4_moe_block_core(
-        cfg, weights, state, gpu, layer_idx, token_id, skip_ffn, None, /*do_mix=*/ true,
-    )
-}
-
-/// MoE block core, parameterized for expert-parallel (EP).
-///
-/// - `routed_out = Some(partial)` redirects the routed-expert combine into a
-///   zeroed per-rank partial (`partial = Σ_owned w_k · expert_k`), while the
-///   SHARED expert (`ffn_stub`) still writes `state.ffn_out` replicated on
-///   every rank. The cross-rank all-reduce of `partial` (in the EP executor)
-///   then sums the routed contributions; `ds4_ep_add_into_residual` does
-///   `ffn_out += all_reduced_partial` so each rank ends with `shared + routed`.
-/// - `do_mix = false` defers `hc_ffn_mix` to AFTER the all-reduce (the mix
-///   can't run until the full FFN output is assembled).
-///
-/// `routed_out = None, do_mix = true` is the byte-identical single-GPU path.
-fn ds4_moe_block_core(
-    cfg: &DeepseekV4Config,
-    weights: &DeepseekV4Weights,
-    state: &mut DeepseekV4State,
-    gpu: &mut Gpu,
-    layer_idx: usize,
-    token_id: u32,
-    skip_ffn: bool,
-    routed_out: Option<&GpuTensor>,
-    do_mix: bool,
-) -> Result<(), String> {
-    mhc_pre(cfg, weights, state, gpu, layer_idx, /*is_attn=*/ false)?;
-    if !skip_ffn {
-        ffn_stub(cfg, weights, state, gpu, layer_idx)?;
-        if layer_idx < cfg.num_hash_layers {
-            ffn_hash_routed(cfg, weights, state, gpu, layer_idx, token_id, routed_out)?;
-        } else {
-            ffn_routed(cfg, weights, state, gpu, layer_idx, routed_out)?;
-        }
-    } else {
-        if state.ffn_out.is_none() {
-            state.ffn_out = Some(
-                gpu.alloc_tensor(&[cfg.hidden_size], DType::F32)
-                    .map_err(|e| format!("alloc ffn_out: {e:?}"))?,
-            );
-        }
-        let ffn_out = state.ffn_out.as_ref().unwrap();
-        gpu.hip
-            .memset(&ffn_out.buf, 0, ffn_out.byte_size())
-            .map_err(|e| format!("memset ffn_out: {e:?}"))?;
-    }
-    if do_mix {
-        hc_ffn_mix(cfg, weights, state, gpu, layer_idx)?;
-    }
-    Ok(())
-}
-
-/// `HIPFIRE_DEEPSEEK4_ROUTE_SCALE` (default 2.2) — same read `ffn_routed` uses.
+/// `HIPFIRE_DEEPSEEK4_ROUTE_SCALE` (default 2.2) — same read `ffn_routed` used.
 fn ds4_route_scale() -> f32 {
     use std::sync::OnceLock;
     static ROUTE_SCALE: OnceLock<f32> = OnceLock::new();
@@ -2113,145 +2398,250 @@ fn ds4_alloc_moe_scratch(
     Ok(())
 }
 
-/// Bias-aware routed pre-down (non-hash layers): mirrors `ffn_routed` up to but
-/// NOT including the down+combine. Returns `true` if routed experts dispatched,
-/// `false` if the layer is shared-only (MoE off or expert blobs absent).
-fn ds4_bias_pre_down(
-    cfg: &DeepseekV4Config,
-    weights: &DeepseekV4Weights,
-    state: &mut DeepseekV4State,
-    gpu: &mut Gpu,
-    layer_idx: usize,
-) -> Result<bool, String> {
-    if !env_cache::moe_on() {
-        return Ok(false);
-    }
-    let layer = weights.resolve_layer(layer_idx);
-    if layer.expert_gate_up_blob.is_none() || layer.expert_w2_blob.is_none() {
-        return Ok(false);
-    }
-    // Router: unbiased scores on-device (bias-aware top-K folds bias + route_scale).
-    moe_route(cfg, weights, state, gpu, layer_idx)?;
-    ds4_alloc_moe_scratch(cfg, state, gpu)?;
-    let route_scale = ds4_route_scale();
-    {
-        let layer = weights.resolve_layer(layer_idx);
-        let scores = state.router_scores.as_ref().unwrap();
-        let bias = layer
-            .gate_bias
-            .as_ref()
-            .ok_or_else(|| format!("moe-step l{layer_idx}: gate_bias missing"))?;
-        let topk_idx = state.moe_topk_indices.as_ref().unwrap();
-        let topk_w = state.moe_topk_weights.as_ref().unwrap();
-        gpu.deepseek4_moe_topk_bias_aware_f32(
-            scores,
-            bias,
-            topk_idx,
-            topk_w,
-            cfg.n_routed_experts as i32,
-            cfg.num_experts_per_tok as i32,
-            route_scale,
-        )
-        .map_err(|e| format!("moe-step l{layer_idx}: topk: {e:?}"))?;
-    }
-    Ok(true)
-}
-
-/// Hash-routed pre-down (layers < `num_hash_layers`): mirrors `ffn_hash_routed`
-/// up to but NOT including the down. Returns `true` if routed experts
-/// dispatched, `false` if shared-only (MoE off / no blobs / no tid2eid).
-fn ds4_hash_pre_down(
+/// Unified routed-MoE pre-down for ONE DS4 layer (single-GPU or per-rank):
+/// transcribes the pre-change `ds4_bias_pre_down` / `ds4_hash_pre_down`
+/// bodies verbatim — MoE-disabled / blob-absent / hash-table-absent layers
+/// are shared-only, the router GEMV + sqrt_softplus runs, and the top-K
+/// kernel (bias-aware, hash-on-device, or host-completed hash) writes
+/// `state.moe_topk_indices` / `state.moe_topk_weights`. Returns the typed
+/// routing outcome; the routed down (+ gate‖up + activation) runs through the
+/// sealed lowered program built by `ds4_moe_decode_single` / `ds4_ep_moe_step`.
+fn ds4_route_layer(
     cfg: &DeepseekV4Config,
     weights: &DeepseekV4Weights,
     state: &mut DeepseekV4State,
     gpu: &mut Gpu,
     layer_idx: usize,
     token_id: u32,
-) -> Result<bool, String> {
-    if !env_cache::moe_on() {
-        return Ok(false);
-    }
+) -> Result<crate::moe_lower::Ds4RouteSelection, String> {
+    use crate::moe_lower::{ds4_route_kind, Ds4RouteSelection};
     let layer = weights.resolve_layer(layer_idx);
-    if layer.expert_gate_up_blob.is_none() || layer.expert_w2_blob.is_none() {
-        return Ok(false);
-    }
-    if layer.tid2eid_host.is_empty() {
-        return Ok(false);
-    }
-    moe_route(cfg, weights, state, gpu, layer_idx)?;
-    let k = cfg.num_experts_per_tok;
-    let n_exp = cfg.n_routed_experts;
-    let layer = weights.resolve_layer(layer_idx);
-    let row = (token_id as usize) * k;
-    if row + k > layer.tid2eid_host.len() {
-        return Err(format!(
-            "moe-step hash l{layer_idx}: token_id {token_id} out of tid2eid range ({} entries)",
-            layer.tid2eid_host.len()
-        ));
-    }
-    ds4_alloc_moe_scratch(cfg, state, gpu)?;
-    let route_scale = ds4_route_scale();
-    let layer = weights.resolve_layer(layer_idx);
-    {
-        let topk_idx = state.moe_topk_indices.as_ref().unwrap();
-        let topk_w = state.moe_topk_weights.as_ref().unwrap();
-        let scores = state.router_scores.as_ref().unwrap();
-        if let Some(tid2eid_dev) = layer.tid2eid_dev.as_ref() {
-            if let Some(token_id_buf) = state.token_id_buf.as_ref() {
-                gpu.hash_router_normalize_f32_buf(
-                    tid2eid_dev,
-                    scores,
-                    token_id_buf,
-                    topk_idx,
-                    topk_w,
-                    n_exp as i32,
-                    k as i32,
-                    route_scale,
-                )
-                .map_err(|e| format!("moe-step hash l{layer_idx}: router_buf: {e:?}"))?;
-            } else {
-                gpu.hash_router_normalize_f32(
-                    tid2eid_dev,
-                    scores,
-                    topk_idx,
-                    topk_w,
-                    token_id as i32,
-                    n_exp as i32,
-                    k as i32,
-                    route_scale,
-                )
-                .map_err(|e| format!("moe-step hash l{layer_idx}: router: {e:?}"))?;
+    let kind = ds4_route_kind(
+        cfg,
+        layer_idx,
+        env_cache::moe_on(),
+        layer.expert_gate_up_blob.is_some() && layer.expert_w2_blob.is_some(),
+        !layer.tid2eid_host.is_empty(),
+        layer.tid2eid_dev.is_some(),
+    );
+    match kind {
+        Ds4RouteSelection::SharedOnly => return Ok(kind),
+        Ds4RouteSelection::BiasAware => {
+            // Unbiased scores on-device; bias-aware top-K folds bias + scale.
+            moe_route(cfg, weights, state, gpu, layer_idx)?;
+            ds4_alloc_moe_scratch(cfg, state, gpu)?;
+            let route_scale = ds4_route_scale();
+            let layer = weights.resolve_layer(layer_idx);
+            let scores = state.router_scores.as_ref().unwrap();
+            let bias = layer
+                .gate_bias
+                .as_ref()
+                .ok_or_else(|| format!("moe-step l{layer_idx}: gate_bias missing"))?;
+            let topk_idx = state.moe_topk_indices.as_ref().unwrap();
+            let topk_w = state.moe_topk_weights.as_ref().unwrap();
+            gpu.deepseek4_moe_topk_bias_aware_f32(
+                scores,
+                bias,
+                topk_idx,
+                topk_w,
+                cfg.n_routed_experts as i32,
+                cfg.num_experts_per_tok as i32,
+                route_scale,
+            )
+            .map_err(|e| format!("moe-step l{layer_idx}: topk: {e:?}"))?;
+        }
+        Ds4RouteSelection::Hash | Ds4RouteSelection::PrecomputedHost => {
+            // Hash routing: scores needed for the per-token expert weights.
+            moe_route(cfg, weights, state, gpu, layer_idx)?;
+            let k = cfg.num_experts_per_tok;
+            let n_exp = cfg.n_routed_experts;
+            let layer = weights.resolve_layer(layer_idx);
+            let row = (token_id as usize) * k;
+            if row + k > layer.tid2eid_host.len() {
+                return Err(format!(
+                    "moe-step hash l{layer_idx}: token_id {token_id} out of tid2eid range ({} entries)",
+                    layer.tid2eid_host.len()
+                ));
             }
-        } else {
-            // Fallback: d2h + host gather + h2d (mirrors ffn_hash_routed).
-            let scores_host = gpu
-                .download_f32(scores)
-                .map_err(|e| format!("moe-step hash l{layer_idx}: d2h scores: {e:?}"))?;
-            let topk_ids: Vec<u32> = layer.tid2eid_host[row..row + k]
-                .iter()
-                .map(|&i| i.min((n_exp - 1) as u32))
-                .collect();
-            let wts = match gather_normalized_weights(&scores_host, &topk_ids) {
-                Some(w) => w,
-                None => return Ok(false),
-            };
-            let idx_i32: Vec<i32> = topk_ids.iter().map(|&x| x as i32).collect();
-            let idx_bytes: Vec<u8> = idx_i32.iter().flat_map(|i| i.to_le_bytes()).collect();
-            gpu.memcpy_htod_auto(&topk_idx.buf, &idx_bytes)
-                .map_err(|e| format!("moe-step hash l{layer_idx}: htod idx: {e:?}"))?;
-            let w_scaled: Vec<f32> = wts.iter().map(|&w| w * route_scale).collect();
-            let w_bytes: Vec<u8> = w_scaled.iter().flat_map(|w| w.to_le_bytes()).collect();
-            gpu.memcpy_htod_auto(&topk_w.buf, &w_bytes)
-                .map_err(|e| format!("moe-step hash l{layer_idx}: htod w: {e:?}"))?;
+            ds4_alloc_moe_scratch(cfg, state, gpu)?;
+            let route_scale = ds4_route_scale();
+            let layer = weights.resolve_layer(layer_idx);
+            {
+                let topk_idx = state.moe_topk_indices.as_ref().unwrap();
+                let topk_w = state.moe_topk_weights.as_ref().unwrap();
+                let scores = state.router_scores.as_ref().unwrap();
+                if let Some(tid2eid_dev) = layer.tid2eid_dev.as_ref() {
+                    if let Some(token_id_buf) = state.token_id_buf.as_ref() {
+                        gpu.hash_router_normalize_f32_buf(
+                            tid2eid_dev,
+                            scores,
+                            token_id_buf,
+                            topk_idx,
+                            topk_w,
+                            n_exp as i32,
+                            k as i32,
+                            route_scale,
+                        )
+                        .map_err(|e| format!("moe-step hash l{layer_idx}: router_buf: {e:?}"))?;
+                    } else {
+                        gpu.hash_router_normalize_f32(
+                            tid2eid_dev,
+                            scores,
+                            topk_idx,
+                            topk_w,
+                            token_id as i32,
+                            n_exp as i32,
+                            k as i32,
+                            route_scale,
+                        )
+                        .map_err(|e| format!("moe-step hash l{layer_idx}: router: {e:?}"))?;
+                    }
+                } else {
+                    // Host-completed fallback: d2h + host gather + h2d
+                    // (mirrors ffn_hash_routed). A zero weight-sum means no
+                    // routed contribution — the layer degrades to shared-only.
+                    let scores_host = gpu
+                        .download_f32(scores)
+                        .map_err(|e| format!("moe-step hash l{layer_idx}: d2h scores: {e:?}"))?;
+                    let topk_ids: Vec<u32> = layer.tid2eid_host[row..row + k]
+                        .iter()
+                        .map(|&i| i.min((n_exp - 1) as u32))
+                        .collect();
+                    let wts = match gather_normalized_weights(&scores_host, &topk_ids) {
+                        Some(w) => w,
+                        None => return Ok(Ds4RouteSelection::SharedOnly),
+                    };
+                    let idx_i32: Vec<i32> = topk_ids.iter().map(|&x| x as i32).collect();
+                    let idx_bytes: Vec<u8> = idx_i32.iter().flat_map(|i| i.to_le_bytes()).collect();
+                    gpu.memcpy_htod_auto(&topk_idx.buf, &idx_bytes)
+                        .map_err(|e| format!("moe-step hash l{layer_idx}: htod idx: {e:?}"))?;
+                    let w_scaled: Vec<f32> = wts.iter().map(|&w| w * route_scale).collect();
+                    let w_bytes: Vec<u8> = w_scaled.iter().flat_map(|w| w.to_le_bytes()).collect();
+                    gpu.memcpy_htod_auto(&topk_w.buf, &w_bytes)
+                        .map_err(|e| format!("moe-step hash l{layer_idx}: htod w: {e:?}"))?;
+                }
+            }
         }
     }
-    Ok(true)
+    Ok(kind)
+}
+
+/// Single-GPU routed MoE for ONE layer (decode + MTP): `ds4_route_layer`
+/// (shared-expert-seeded `ffn_out` must already exist from `ffn_stub`), then
+/// the routed down through the sealed lowered program executed on the single
+/// mesh. Shared-only layers return without launching anything.
+///
+/// The consumed plan is the AUTHORITATIVE borrowed plan for `layer_idx`
+/// (main layers: `authority.plan(l)`; the MTP layer: `entry.mtp_plan()` at
+/// layer N) — acquired ONCE per forward by the entry point, never a
+/// per-layer acquisition, never a local fabricator. The Single policy is
+/// the model-owned canonical `weights.moe_policy` (stable mesh epoch).
+///
+/// Preserves the pre-change kernel order byte-for-byte:
+/// - bias layers: [topk_bias_aware, GateUp, silu·clamp, rotate,
+///   down_expanded, combine] (deterministic default) or the
+///   `HIPFIRE_DEEPSEEK4_MOE_DETERMINISTIC=0` atomic self-combining down;
+/// - hash layers: [hash_router, GateUp, silu·clamp, rotate,
+///   down_residual_scaled] — device table (Hash) or host-completed
+///   (Precomputed) routing.
+fn ds4_moe_decode_single(
+    cfg: &DeepseekV4Config,
+    plan: &hipfire_runtime::weight_manifest::ExpertGroupPlan,
+    weights: &DeepseekV4Weights,
+    state: &mut DeepseekV4State,
+    gpu: &mut Gpu,
+    layer_idx: usize,
+    token_id: u32,
+) -> Result<(), String> {
+    use crate::moe_lower::{
+        ds4_decode_phases, ds4_lower_borrowed_plan, ds4_router_plan, Ds4DownTarget,
+        Ds4ProgramTensors, Ds4RouteSelection,
+    };
+    use hipfire_dispatch::families::moe::MoeExpertRef;
+    use hipfire_runtime::moe_plan::{execute_lowered_moe, MoeExecutionTarget};
+
+    let outcome = ds4_route_layer(cfg, weights, state, gpu, layer_idx, token_id)?;
+    if outcome == Ds4RouteSelection::SharedOnly {
+        // Shared-only layer: ffn_stub already wrote the shared expert into
+        // ffn_out; the old pre-downs returned without dispatching routed ops.
+        return Ok(());
+    }
+    let layer = weights.resolve_layer(layer_idx);
+    let hidden = cfg.hidden_size;
+    let im = cfg.moe_intermediate_size;
+    let k_top = cfg.num_experts_per_tok;
+    let ffn_out = state
+        .ffn_out
+        .as_ref()
+        .ok_or_else(|| format!("moe l{layer_idx}: ffn_out unset (ffn_stub must run first)"))?;
+    let tensors = Ds4ProgramTensors {
+        topk_indices: state.moe_topk_indices.as_ref().unwrap(),
+        topk_weights: state.moe_topk_weights.as_ref().unwrap(),
+        ffn_x_rot: state.ffn_x_rot.as_ref().unwrap(),
+        gate_batch: state.moe_gate_batch.as_ref().unwrap(),
+        up_batch: state.moe_up_batch.as_ref().unwrap(),
+        rot_batch: state.moe_rot_batch.as_ref().unwrap(),
+    };
+    let experts = MoeExpertRef {
+        gate_up_ptrs: layer.expert_gate_up_ptrs.as_ref().unwrap(),
+        down_ptrs: layer.expert_w2_ptrs.as_ref().unwrap(),
+        dummy_gate_up: None,
+        dtype: DType::MQ2G256Lloyd,
+        n_experts: cfg.n_routed_experts,
+        expert_m: im,
+        expert_k: hidden,
+        owned: &[],
+    };
+    // Bias layers: deterministic expanded+combine by default; the
+    // HIPFIRE_DEEPSEEK4_MOE_DETERMINISTIC=0 fallback and hash layers use the
+    // self-combining f32 residual (both accumulate into ffn_out).
+    let deterministic = std::env::var("HIPFIRE_DEEPSEEK4_MOE_DETERMINISTIC").as_deref() != Ok("0");
+    let down = match outcome {
+        Ds4RouteSelection::BiasAware if deterministic => Ds4DownTarget::ExpandedF32 {
+            down_expanded: state.moe_down_expert_outputs.as_ref().unwrap(),
+            out: ffn_out,
+        },
+        Ds4RouteSelection::BiasAware
+        | Ds4RouteSelection::Hash
+        | Ds4RouteSelection::PrecomputedHost => Ds4DownTarget::ResidualF32 { out: ffn_out },
+        Ds4RouteSelection::SharedOnly => unreachable!("shared-only returned above"),
+    };
+    let phases = ds4_decode_phases(
+        &tensors,
+        &experts,
+        down,
+        k_top,
+        im,
+        hidden,
+        cfg.swiglu_limit,
+        1,
+    )
+    .map_err(|e| format!("moe l{layer_idx}: {e}"))?;
+    let router = ds4_router_plan(
+        outcome,
+        state.router_scores.as_ref().unwrap(),
+        layer.gate_bias.as_ref(),
+        layer.tid2eid_dev.as_ref(),
+        state.token_id_buf.as_ref(),
+        state.moe_topk_indices.as_ref().unwrap(),
+        state.moe_topk_weights.as_ref().unwrap(),
+        k_top,
+        ds4_route_scale(),
+    )
+    .map_err(|e| format!("moe l{layer_idx}: router plan: {e}"))?;
+    // The authoritative borrowed plan for this layer + the model-owned
+    // canonical Single policy — no per-layer spec fabrication.
+    let program = ds4_lower_borrowed_plan(plan, &weights.moe_policy, router, vec![phases])
+        .map_err(|e| format!("moe l{layer_idx}: lowering: {e}"))?;
+    let ctx = hipfire_dispatch::context::DispatchCtx::new(gpu);
+    execute_lowered_moe(&program, MoeExecutionTarget::Single { gpu, ctx: &ctx })
+        .map_err(|e| format!("moe l{layer_idx}: execute: {e:?}"))
 }
 
 /// Per-rank ds4 pre-down (shared expert + routed pre-down): mirrors
-/// `ds4_moe_block_core(.., Some(partial), do_mix=false)` MINUS the routed
-/// down+combine (deferred to the executor). Returns `true` if routed experts
-/// will contribute a partial for this layer.
+/// `ds4_moe_decode_single` MINUS the routed down (deferred to the executor).
+/// Returns the typed routing outcome; `SharedOnly` when no routed program may
+/// be built for this layer.
 fn ds4_ep_pre_down(
     cfg: &DeepseekV4Config,
     weights: &DeepseekV4Weights,
@@ -2260,7 +2650,7 @@ fn ds4_ep_pre_down(
     layer_idx: usize,
     token_id: u32,
     skip_ffn: bool,
-) -> Result<bool, String> {
+) -> Result<crate::moe_lower::Ds4RouteSelection, String> {
     mhc_pre(cfg, weights, state, gpu, layer_idx, /*is_attn=*/ false)?;
     if skip_ffn {
         if state.ffn_out.is_none() {
@@ -2273,64 +2663,160 @@ fn ds4_ep_pre_down(
         gpu.hip
             .memset(&ffn_out.buf, 0, ffn_out.byte_size())
             .map_err(|e| format!("memset ffn_out: {e:?}"))?;
-        return Ok(false);
+        return Ok(crate::moe_lower::Ds4RouteSelection::SharedOnly);
     }
     // Shared expert (replicated on every rank) → state.ffn_out; also produces
     // ffn_x_rot for the routed pre-down and moe_route.
     ffn_stub(cfg, weights, state, gpu, layer_idx)?;
-    if layer_idx < cfg.num_hash_layers {
-        ds4_hash_pre_down(cfg, weights, state, gpu, layer_idx, token_id)
-    } else {
-        ds4_bias_pre_down(cfg, weights, state, gpu, layer_idx)
+    ds4_route_layer(cfg, weights, state, gpu, layer_idx, token_id)
+}
+
+/// Narrow production seam: the sealed parallel-program construction consumed
+/// by the mesh MoE step (`ds4_ep_moe_step` Phase 2) AND the batched TP
+/// prefill step (`ds4_prefill_moe_step_tp` Phase 2) — the borrowed
+/// authoritative plan + typed router + per-rank phases through the runtime
+/// lowerer's full typed validation. Tests feed the same builder with the
+/// same plan/router/phase sources the production steps use; no production
+/// logic is duplicated.
+pub(crate) fn build_ds4_parallel_program<'mesh, 'step>(
+    plan: &hipfire_runtime::weight_manifest::ExpertGroupPlan,
+    policy: &'mesh hipfire_runtime::moe_plan::MoEExecutionPolicy,
+    router: hipfire_dispatch::families::moe::RouterPlan<'step>,
+    ranks: Vec<hipfire_runtime::moe_plan::RoutedMoeStepPhases<'step>>,
+) -> Result<
+    hipfire_runtime::moe_plan::LoweredMoeProgram<'mesh, 'step>,
+    hipfire_runtime::moe_plan::MoeLowerError,
+> {
+    crate::moe_lower::ds4_lower_borrowed_plan(plan, policy, router, ranks)
+}
+
+/// One step of the production tail dispatch. The mesh MoE step's Phase 3
+/// iterates EXACTLY the sequence [`ds4_tail_actions`] yields per rank —
+/// moving the HC mix before the routed add would change both the sequence
+/// and the production tail behavior (the dispatch below is the only
+/// fold/mix site).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Ds4TailAction {
+    /// Fold the all-reduced routed partial into `ffn_out` (shared + routed).
+    AddRouted,
+    /// Launch the HC FFN mix folding `ffn_out` into the residual streams.
+    HcMix,
+}
+
+/// Production tail-action sequence (CPU-testable seam CALLED by the mesh MoE
+/// step's Phase 3): `[AddRouted, HcMix]` when a routed contribution was
+/// assembled, `[HcMix]` otherwise (shared-only layers have nothing to fold).
+pub(crate) fn ds4_tail_actions(
+    routed: &crate::moe_lower::Ds4RouteSelection,
+) -> &'static [Ds4TailAction] {
+    match routed {
+        crate::moe_lower::Ds4RouteSelection::SharedOnly => &[Ds4TailAction::HcMix],
+        _ => &[Ds4TailAction::AddRouted, Ds4TailAction::HcMix],
     }
 }
 
-/// Decomposed EP MoE for ONE layer — the sole EP path in `forward_ep` and
-/// `mtp_forward_ep`.
+/// Initial action sequence of the MTP PUBLIC entries (typed): each entry
+/// dispatches exactly `[SelectAuthority, PreFfn]` — `SelectAuthority`
+/// acquires the authority, matches the MTP count state FIRST (count0 /
+/// count>1 refuse even when MoE is disabled), and selects the typed MTP plan
+/// via `entry.mtp_plan()` EXACTLY ONCE; `PreFfn` (the pre-FFN GPU work)
+/// cannot run until the selection exists. Reordering the dispatch would
+/// change the sequence AND the production refusal ordering (authority errors
+/// surface before any GPU work).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Ds4MtpEntryAction {
+    /// Acquire the authority, match the MTP count state, and select the
+    /// typed MTP plan (or `Selected(None)` when MoE is disabled).
+    SelectAuthority,
+    /// Run the pre-FFN GPU work after the selection: `Selected(None)`
+    /// (MoE disabled) is ALLOWED — the shared/pre-FFN path runs safely with
+    /// no routed execution; `Unselected` refuses with a typed error.
+    PreFfn,
+}
+
+/// The production MTP initial action sequence (CPU-testable seam; every MTP
+/// public entry iterates it).
+pub(crate) fn ds4_mtp_entry_actions() -> &'static [Ds4MtpEntryAction] {
+    &[
+        Ds4MtpEntryAction::SelectAuthority,
+        Ds4MtpEntryAction::PreFfn,
+    ]
+}
+
+/// Non-owning logical view of a Raw byte-shaped tensor (shallow alias:
+/// same device buffer / pointer identity / full byte capacity, new logical
+/// shape). Exposes byte-shaped i64 partial owners to the sealed lowering as
+/// their logical ELEMENT shapes — scalar `[hidden]`, batched `[batch,
+/// hidden]` — without touching the owner allocation or capacity.
+pub(crate) fn raw_view(t: &GpuTensor, shape: Vec<usize>) -> GpuTensor {
+    let mut view = t.shallow_clone();
+    view.shape = shape;
+    view
+}
+
+/// Decomposed EP/TP MoE for ONE layer — the sole parallel path in
+/// `forward_ep`, `forward_tp`, `mtp_forward_ep` and `mtp_forward_tp`.
 ///
 /// - **Phase 1** (per rank, direct arch kernels): `mhc_pre` → shared expert
-///   (`ffn_stub`, replicated into `state.ffn_out`) → routed pre-down (route →
-///   bias-aware/hash select → indexed gate_up → batched silu·mul·clamp → FWHT
-///   rotate). No bit-identical Step twin exists for the fused HC / silu-rotate
-///   kernels, so they stay as direct arch kernel calls.
-/// - **Phase 2** (routed down + EP all-reduce via `execute_steps_parallel`):
-///   non-hash layers use the EXPANDED path (`IndexedMoeGemv{DownExpanded}` →
-///   `MoeCombine`, `zero_before` the EP partial), hash layers use the
-///   residual-fused path (`IndexedMoeGemv{DownResidual}`, `zero_before`), then a
-///   single `AllReduce{Ep}` over the routed partial.
-/// - **Phase 3** (tail): `ffn_out += all_reduced_partial` (→ shared + routed),
-///   then `launch_hc_ffn_mix` folds `ffn_out` into `residual_streams`.
+///   (`ffn_stub`, replicated into `state.ffn_out`) → routed pre-down
+///   (`ds4_route_layer`: router GEMV + sqrt_softplus + bias-aware/hash
+///   top-K). The fused HC / router kernels have no Step twin, so they stay
+///   direct arch kernel calls.
+/// - **Phase 2** (sealed lowered program): per-rank `MoeProgramParts`
+///   ([GateUp, MoeActivation, DownResidualI64, ConvertI64ToF32]) lowered from
+///   the AUTHORITATIVE borrowed plan (`plan` — the caller borrows it once
+///   per forward: `authority.plan(l)` for main layers, `entry.mtp_plan()` at
+///   layer N for the MTP entries) and executed by the sealed executor. The
+///   schedule is derived from the concrete Steps: `TpI64` (AllReduceI64Tp on
+///   the down, partition-invariant) under a Tp policy, `EpLocalI64`
+///   (ZeroI64Only then AllReduce{Ep} on the convert) under an Ep policy —
+///   byte-identical to the pre-change explicit collectives/zeroing. All rank
+///   counts — including named rank-one Tp/Ep meshes (from_mesh-bound
+///   epochs) — take the sealed path; there is NO manual/rank-one explicit
+///   scheduling.
+/// - **Phase 3** (tail): the production tail-action dispatch
+///   ([`ds4_tail_actions`]) folds the all-reduced routed partial into
+///   `ffn_out`, then `launch_hc_ffn_mix` folds `ffn_out` into
+///   `residual_streams` — the routed add always precedes the HC mix
+///   (`[AddRouted, HcMix]`, or `[HcMix]` alone for shared-only layers).
+///
+/// `plan == None` only when runtime MoE is disabled (the entry point
+/// bypasses plan lookup); routing then reports SharedOnly, so Phase 2 is
+/// skipped and the shared expert + HC tail still run.
 #[allow(clippy::too_many_arguments)]
 fn ds4_ep_moe_step(
     gpus: &mut hipfire_runtime::multi_gpu::Gpus,
+    plan: Option<&hipfire_runtime::weight_manifest::ExpertGroupPlan>,
     weights_per_rank: &[DeepseekV4Weights],
     cfg: &DeepseekV4Config,
     state_per_rank: &mut [DeepseekV4State],
     partials: &[GpuTensor],
     partials_i64: &[GpuTensor],
-    mesh: &hipfire_runtime::multi_gpu::DeviceMesh,
+    policy: &hipfire_runtime::moe_plan::MoEExecutionPolicy,
     l: usize,
     token: u32,
     skip_ffn: bool,
 ) -> Result<(), String> {
-    use hipfire_dispatch::families::moe::{launch_hc_ffn_mix, MoeExpertRef};
-    use hipfire_dispatch::pipeline::{
-        execute_steps_parallel, GemvInput, MoeActivationVariant, MoeProj, Step, StepCollective,
+    use crate::moe_lower::{
+        ds4_decode_phases, ds4_router_plan, Ds4DownTarget, Ds4ProgramTensors, Ds4RouteSelection,
     };
+    use hipfire_dispatch::families::moe::{launch_hc_ffn_mix, MoeExpertRef};
+    use hipfire_runtime::moe_plan::{execute_lowered_moe, MoeExecutionTarget};
+    let mesh = policy.mesh();
     let n = gpus.devices.len();
     let hidden = cfg.hidden_size;
     let inter = cfg.moe_intermediate_size;
     let n_exp = cfg.n_routed_experts;
     let k_top = cfg.num_experts_per_tok;
     // TP-of-experts: inter_local = inter / tp. When there is no Tp axis (EP or
-    // single-GPU), size_of returns 0, max(1) gives tp=1, inter_local == inter →
-    // byte-identical to today (the D1/D2a EP path must stay bit-exact). Under TP
-    // every rank owns ALL experts but each expert's gate‖up is column-split and
-    // its down is row-gathered to inter/tp (loaded via `load_weights_tp`).
+    // single-GPU), size_of returns 1, inter_local == inter → byte-identical to
+    // today (the D1/D2a EP path must stay bit-exact). Under TP every rank owns
+    // ALL experts but each expert's gate‖up is column-split and its down is
+    // row-gathered to inter/tp (loaded via `load_weights_tp`).
     let tp = mesh.size_of(hipfire_runtime::multi_gpu::DimKind::Tp).max(1);
     let inter_local = inter / tp;
     // ── Phase 1: per-rank shared expert + routed pre-down (direct kernels) ──
-    let mut routed = false;
+    let mut routed = Ds4RouteSelection::SharedOnly;
     for r in 0..n {
         gpus.devices[r]
             .bind_thread()
@@ -2349,130 +2835,115 @@ fn ds4_ep_moe_step(
         .map_err(|e| format!("moe-step pre-down L{l} r{r}: {e}"))?;
     }
 
-    // ── Phase 2: routed down (int64) + EP all-reduce (FP32) ─────────────────
+    // ── Phase 2: routed down (int64) + all-reduce ───────────────────────────
     // When the layer is shared-only (no routed experts), the primitive would
     // all-reduce a zeroed partial and add zero — a no-op — so we skip the
     // executor entirely and go straight to the tail (byte-identical: x+0==x).
+    // `plan == None` only when runtime MoE is disabled (the entry point
+    // bypasses plan lookup); routing then reports SharedOnly, so Phase 2 is
+    // skipped and the shared expert + HC tail still run.
     //
     // Unified int64 path (both hash and non-hash): DownResidualI64 accumulates
-    // the weighted-combine into per-rank i64 scratch (ZeroI64Only pre-zeros it),
-    // ConvertI64ToF32 converts to the f32 partial, AllReduce{Ep} sums across ranks.
-    // ds4 routed experts are MQ2-Lloyd → `launch_indexed_down_residual_i64` covers both.
-    if routed {
-        // ds4 routed experts use MQ2-Lloyd for both gate_up and down; the same
-        // MoeExpertRef covers the GateUp prefix Steps and the Down Step.
-        // Built once so refs outlive execute_steps_parallel.
-        let expert_refs: Vec<MoeExpertRef> = (0..n)
-            .map(|r| {
-                let layer = weights_per_rank[r].resolve_layer(l);
-                MoeExpertRef {
-                    gate_up_ptrs: layer.expert_gate_up_ptrs.as_ref().unwrap(),
-                    down_ptrs: layer.expert_w2_ptrs.as_ref().unwrap(),
-                    dummy_gate_up: None,
-                    // ds4 routed experts are MQ2-Lloyd; DownResidualI64 supports MQ2L.
-                    dtype: DType::MQ2G256Lloyd,
-                    n_experts: n_exp,
-                    // inter_local: per-rank intermediate dim (inter/tp under TP,
-                    // inter otherwise). Covers both the GateUp output (2*inter_local)
-                    // and the Down contraction (inter_local); the kernel derives 2*
-                    // internally for gate‖up.
-                    expert_m: inter_local,
-                    expert_k: hidden,
-                    owned: &[],
-                }
-            })
-            .collect();
-        // Unified int64 path for both hash and non-hash layers:
-        // [GateUp, MoeActivation, DownResidualI64, ConvertI64ToF32]
-        // Collectives: [None, None, ZeroI64Only{hidden}, AllReduce{Ep,hidden}]
-        // zero_before: [false, false, true, false]
-        let per_rank_steps: Vec<Vec<Step>> = (0..n)
-            .map(|r| {
+    // the weighted-combine into per-rank i64 scratch (pre-zeroed), then
+    // ConvertI64ToF32 emits the f32 partial. ds4 routed experts are MQ2-Lloyd.
+    if let Some(plan) = plan {
+        if routed != Ds4RouteSelection::SharedOnly {
+            // The authoritative borrowed plan for this layer (borrowed once
+            // per forward by the entry point; never reacquired here).
+            // ds4 routed experts use MQ2-Lloyd for both gate_up and down; the same
+            // MoeExpertRef covers the GateUp prefix Steps and the Down Step.
+            // Built once so refs outlive the lowered program.
+            let expert_refs: Vec<MoeExpertRef> = (0..n)
+                .map(|r| {
+                    let layer = weights_per_rank[r].resolve_layer(l);
+                    MoeExpertRef {
+                        gate_up_ptrs: layer.expert_gate_up_ptrs.as_ref().unwrap(),
+                        down_ptrs: layer.expert_w2_ptrs.as_ref().unwrap(),
+                        dummy_gate_up: None,
+                        // ds4 routed experts are MQ2-Lloyd; DownResidualI64 supports MQ2L.
+                        dtype: DType::MQ2G256Lloyd,
+                        n_experts: n_exp,
+                        // inter_local: per-rank intermediate dim (inter/tp under TP,
+                        // inter otherwise). Covers both the GateUp output (2*inter_local)
+                        // and the Down contraction (inter_local); the kernel derives 2*
+                        // internally for gate‖up.
+                        expert_m: inter_local,
+                        expert_k: hidden,
+                        owned: &[],
+                    }
+                })
+                .collect();
+            let mut ranks: Vec<hipfire_runtime::moe_plan::RoutedMoeStepPhases> =
+                Vec::with_capacity(n);
+            // Non-owning logical `[hidden]` views of the raw i64 partials:
+            // the owner buffers are byte-shaped (`[hidden*8]` Raw); the
+            // sealed lowering requires the logical i64 ELEMENT shape
+            // `[hidden]`. The views share the owner buffers (same pointer,
+            // full byte capacity — allocation and capacity are unchanged)
+            // and outlive the phases (owned by this scope).
+            let partial_i64_views: Vec<GpuTensor> = (0..n)
+                .map(|r| raw_view(&partials_i64[r], vec![hidden]))
+                .collect();
+            for r in 0..n {
                 let s = &state_per_rank[r];
-                vec![
-                    Step::IndexedMoeGemv {
-                        experts: &expert_refs[r],
-                        which: MoeProj::GateUp {
-                            up_out: s.moe_up_batch.as_ref().unwrap(),
+                let tensors = Ds4ProgramTensors {
+                    topk_indices: s.moe_topk_indices.as_ref().unwrap(),
+                    topk_weights: s.moe_topk_weights.as_ref().unwrap(),
+                    ffn_x_rot: s.ffn_x_rot.as_ref().unwrap(),
+                    gate_batch: s.moe_gate_batch.as_ref().unwrap(),
+                    up_batch: s.moe_up_batch.as_ref().unwrap(),
+                    rot_batch: s.moe_rot_batch.as_ref().unwrap(),
+                };
+                // DownResidualI64: accumulates S-scaled int64 into
+                // partials_i64[r]; ConvertI64ToF32 converts the local i64
+                // accumulator to the f32 partial. The activation keeps the
+                // pre-change full `inter` width.
+                ranks.push(
+                    ds4_decode_phases(
+                        &tensors,
+                        &expert_refs[r],
+                        Ds4DownTarget::I64 {
+                            partial_i64: &partial_i64_views[r],
+                            partial: &partials[r],
                         },
-                        topk_indices: s.moe_topk_indices.as_ref().unwrap(),
-                        input: GemvInput::Prerotated(s.ffn_x_rot.as_ref().unwrap()),
-                        out: s.moe_gate_batch.as_ref().unwrap(),
                         k_top,
-                        batch_size: 1,
-                    },
-                    Step::MoeActivation {
-                        variant: MoeActivationVariant::Ds4ClampRotate {
-                            swiglu_limit: cfg.swiglu_limit,
-                        },
-                        gate: s.moe_gate_batch.as_ref().unwrap(),
-                        up: s.moe_up_batch.as_ref().unwrap(),
-                        rot_out: s.moe_rot_batch.as_ref().unwrap(),
                         inter,
-                        k_top,
-                    },
-                    // DownResidualI64: accumulates S-scaled int64 into partials_i64[r].
-                    // ZeroI64Only pre-zeros the i64 buffer (8 bytes/elem) before launch.
-                    Step::IndexedMoeGemv {
-                        experts: &expert_refs[r],
-                        which: MoeProj::DownResidualI64 {
-                            topk_weights: s.moe_topk_weights.as_ref().unwrap(),
-                        },
-                        topk_indices: s.moe_topk_indices.as_ref().unwrap(),
-                        input: GemvInput::Prerotated(s.moe_rot_batch.as_ref().unwrap()),
-                        out: &partials_i64[r],
-                        k_top,
-                        batch_size: 1,
-                    },
-                    // ConvertI64ToF32: converts the local i64 accumulator to the f32 partial.
-                    // AllReduce{Ep} on ConvertI64ToF32's dst (partials[r]) sums across ranks.
-                    Step::ConvertI64ToF32 {
-                        src: &partials_i64[r],
-                        dst: &partials[r],
-                        n: hidden,
-                    },
-                ]
-            })
-            .collect();
-        // Down-i64 reduction, two sub-paths keyed on the mesh axis:
-        // - TP (tp>1): AllReduceI64Tp sums the per-rank int64 accumulators BEFORE
-        //   ConvertI64ToF32. Fixed-point accumulation is partition-invariant
-        //   (sum of per-rank i64 == full-inter i64), so tp=1 and tp=2 yield
-        //   bit-identical f32 → argmax-exact AND logit max|Δ|==0. zero_before[2]
-        //   zeros each rank's i64 buffer before DownResidualI64 writes it.
-        // - EP (tp==1, current path): each rank owns a DIFFERENT expert subset,
-        //   so ZeroI64Only pre-zeros the local i64, ConvertI64ToF32 emits the f32
-        //   partial, then AllReduce{Ep} sums the distinct partials in FP32.
-        let (collectives, zero_before): (Vec<StepCollective>, Vec<bool>) = if tp > 1 {
-            (
-                vec![
-                    StepCollective::None,
-                    StepCollective::None,
-                    StepCollective::AllReduceI64Tp { dim: hidden },
-                    StepCollective::None,
-                ],
-                vec![false, false, true, false],
+                        hidden,
+                        cfg.swiglu_limit,
+                        1,
+                    )
+                    .map_err(|e| format!("moe-step L{l} r{r}: {e}"))?,
+                );
+            }
+            let router = ds4_router_plan(
+                routed,
+                state_per_rank[0].router_scores.as_ref().unwrap(),
+                weights_per_rank[0].resolve_layer(l).gate_bias.as_ref(),
+                weights_per_rank[0].resolve_layer(l).tid2eid_dev.as_ref(),
+                state_per_rank[0].token_id_buf.as_ref(),
+                state_per_rank[0].moe_topk_indices.as_ref().unwrap(),
+                state_per_rank[0].moe_topk_weights.as_ref().unwrap(),
+                k_top,
+                ds4_route_scale(),
             )
-        } else {
-            (
-                vec![
-                    StepCollective::None,
-                    StepCollective::None,
-                    StepCollective::ZeroI64Only { dim: hidden },
-                    StepCollective::AllReduce {
-                        kind: hipfire_runtime::multi_gpu::DimKind::Ep,
-                        dim: hidden,
-                    },
-                ],
-                vec![false, false, true, false],
-            )
-        };
-        execute_steps_parallel(mesh, gpus, &per_rank_steps, &collectives, &zero_before)
-            .map_err(|e| format!("moe-step L{l}: execute_steps_parallel: {e:?}"))?;
+            .map_err(|e| format!("moe-step L{l}: router plan: {e}"))?;
+            // Sealed execution for EVERY rank count — including named rank-one
+            // Tp/Ep meshes (from_mesh binds the mesh epoch; a 1-device group's
+            // all-reduces are identity). The pre-change explicit schedule
+            // (execute_steps_parallel) is deleted — no parallel double path.
+            let program = build_ds4_parallel_program(plan, policy, router, ranks)
+                .map_err(|e| format!("moe-step L{l}: lowering: {e}"))?;
+            execute_lowered_moe(&program, MoeExecutionTarget::Parallel { gpus })
+                .map_err(|e| format!("moe-step L{l}: execute_lowered_moe: {e:?}"))?;
+        }
     }
 
-    // ── Phase 3: ffn_out += routed partial, then hc_ffn_mix tail ──
+    // ── Phase 3: production tail-action dispatch ──
+    // The routed add ALWAYS precedes the HC mix: Phase 3 iterates exactly
+    // the sequence `ds4_tail_actions(&routed)` yields per rank — moving the
+    // mix before the add would change the tested sequence AND this behavior.
     let hc_bytes = cfg.hc_mult * cfg.hidden_size * 4;
+    let tail_actions = ds4_tail_actions(&routed);
     for r in 0..n {
         gpus.devices[r]
             .bind_thread()
@@ -2483,15 +2954,21 @@ fn ds4_ep_moe_step(
             .ffn_out
             .as_ref()
             .ok_or_else(|| format!("moe-step L{l} r{r}: ffn_out unset"))?;
-        if routed {
-            gpu.add_inplace_f32(ffn_out, &partials[r])
-                .map_err(|e| format!("moe-step L{l} r{r}: add residual: {e:?}"))?;
+        for action in tail_actions {
+            match action {
+                Ds4TailAction::AddRouted => {
+                    gpu.add_inplace_f32(ffn_out, &partials[r])
+                        .map_err(|e| format!("moe-step L{l} r{r}: add residual: {e:?}"))?;
+                }
+                Ds4TailAction::HcMix => {
+                    let streams = s.residual_streams.as_ref().unwrap();
+                    let hc_c = s.hc_c.as_ref().unwrap();
+                    let streams_out = s.q.as_ref().unwrap();
+                    launch_hc_ffn_mix(gpu, streams, hc_c, ffn_out, streams_out, hidden, hc_bytes)
+                        .map_err(|e| format!("moe-step L{l} r{r}: hc_ffn_mix: {e:?}"))?;
+                }
+            }
         }
-        let streams = s.residual_streams.as_ref().unwrap();
-        let hc_c = s.hc_c.as_ref().unwrap();
-        let streams_out = s.q.as_ref().unwrap();
-        launch_hc_ffn_mix(gpu, streams, hc_c, ffn_out, streams_out, hidden, hc_bytes)
-            .map_err(|e| format!("moe-step L{l} r{r}: hc_ffn_mix: {e:?}"))?;
     }
     Ok(())
 }
@@ -2511,17 +2988,20 @@ fn ds4_ep_moe_step(
 // `ffn_batched` or `run_moe_prefill_bias_aware` to share code would risk the
 // single-GPU prefill path being non-byte-identical. The helper is private.
 
-/// Pre-down portion of the batched MoE: routing + gate‖up + activation.
+/// Pre-down portion of the batched MoE: routing + SHARED expert only.
 ///
 /// Writes into `pbs`:
 /// - `pbs.moe_topk_indices_batch` `[n, k_top]` — selected expert indices
 /// - `pbs.moe_topk_weights_batch` `[n, k_top]` — normalised routing weights
-/// - `pbs.moe_rot_batch` `[n*k_top, inter_local]` — FWHT-rotated gate output
-///   (input to per-token i64 down). Sized for `inter_local` elements per slot;
-///   the underlying buffer holds `[n, k_top, IM]` (IM ≥ inter_local) so no OOB.
 /// - `pbs.ffn_out_batch` `[n, hidden]` — shared expert contribution (shared gate+up
-///   → activation → down), fully computed. Caller accumulates the routed
+///   → activation → down), fully computed. The caller accumulates the routed
 ///   partial into this after Phase 2.
+///
+/// Returns the typed route selection (`SharedOnly` when no routed program may
+/// be built for this layer). The ROUTED gate-up / activation are NOT run
+/// here — they are the sealed batched program's GateUp / Activation Steps
+/// (Phase 2 of `ds4_prefill_moe_step_tp`), which consume the same scratch
+/// buffers (`moe_gate_batch` / `moe_up_batch` / `moe_rot_batch`).
 ///
 /// `inter_local = moe_intermediate_size / tp`. When `tp==1` this equals the
 /// full `moe_intermediate_size` and the kernel calls are byte-identical to the
@@ -2538,8 +3018,8 @@ fn ffn_batched_pre_down(
     hash_routing: bool,
     n: usize,
     tokens: &[u32],
-    inter_local: usize,
-) -> Result<bool, String> {
+    moe_on: bool,
+) -> Result<crate::moe_lower::Ds4RouteSelection, String> {
     let hidden = cfg.hidden_size;
     let im = cfg.moe_intermediate_size;
     let k_top = cfg.num_experts_per_tok;
@@ -2553,9 +3033,7 @@ fn ffn_batched_pre_down(
     let shared_w2 = layer.shared_w2.as_ref().unwrap();
     let shared_w3 = layer.shared_w3.as_ref().unwrap();
 
-    let moe_will_run = env_cache::moe_on();
-    let gate_up_need_fwht =
-        moe_will_run || weight_needs_fwht(shared_w1) || weight_needs_fwht(shared_w3);
+    let gate_up_need_fwht = moe_on || weight_needs_fwht(shared_w1) || weight_needs_fwht(shared_w3);
     let down_needs_fwht = weight_needs_fwht(shared_w2);
 
     if gate_up_need_fwht {
@@ -2629,14 +3107,15 @@ fn ffn_batched_pre_down(
     )?;
 
     // ── Routed expert routing ─────────────────────────────────────────────────
-    let do_routed = std::env::var("HIPFIRE_DEEPSEEK4_MOE").ok().as_deref() != Some("0")
-        && layer.expert_gate_up_blob.is_some()
-        && layer.expert_w2_blob.is_some();
+    // The routed decision uses the SAME enable snapshot the authority was
+    // constructed from (threaded from the public entry) — never rereads
+    // `HIPFIRE_DEEPSEEK4_MOE`.
+    let do_routed = moe_on && layer.expert_gate_up_blob.is_some() && layer.expert_w2_blob.is_some();
     if !do_routed {
-        return Ok(false);
+        return Ok(crate::moe_lower::Ds4RouteSelection::SharedOnly);
     }
     if hash_routing && layer.tid2eid_host.is_empty() {
-        return Ok(false);
+        return Ok(crate::moe_lower::Ds4RouteSelection::SharedOnly);
     }
 
     let gate_w = layer
@@ -2706,84 +3185,66 @@ fn ffn_batched_pre_down(
         .map_err(|e| format!("pre_down bias_aware_topk l{layer_idx}: {e:?}"))?;
     }
 
-    // Gate‖up GEMV with inter_local (TP-sharded intermediate dim).
-    // Kernel writes [n*k_top, 2*inter_local] into gate_batch / up_batch.
-    let gate_up_ptrs = layer.expert_gate_up_ptrs.as_ref().unwrap();
-    gpu.deepseek4_gemv_mq2g256_lloyd_moe_gate_up_indexed_batched_k4(
-        gate_up_ptrs,
-        &pbs.moe_topk_indices_batch,
-        &pbs.ffn_x_rot_batch,
-        &pbs.moe_gate_batch,
-        &pbs.moe_up_batch,
-        2 * inter_local,
-        hidden,
-        k_top,
-        n,
-    )
-    .map_err(|e| format!("pre_down gate_up l{layer_idx}: {e:?}"))?;
-
-    // SwiGLU·clamp + FWHT rotate → moe_rot_batch [n*k_top, inter_local].
-    gpu.deepseek4_silu_mul_clamp_f32_batched(
-        &pbs.moe_gate_batch,
-        &pbs.moe_up_batch,
-        &pbs.moe_gate_batch,
-        inter_local,
-        n * k_top,
-        cfg.swiglu_limit,
-    )
-    .map_err(|e| format!("pre_down silu routed l{layer_idx}: {e:?}"))?;
-    gpu.rotate_x_mq_batched(
-        &pbs.moe_gate_batch,
-        &pbs.moe_rot_batch,
-        inter_local,
-        n * k_top,
-    )
-    .map_err(|e| format!("pre_down rotate routed l{layer_idx}: {e:?}"))?;
-
-    Ok(true) // routed experts ran
+    // Routed gate-up / activation are NOT run here — they are the sealed
+    // batched program's GateUp / Activation Steps (Phase 2), which consume
+    // the same scratch buffers (moe_gate_batch / moe_up_batch / moe_rot_batch)
+    // at `batch·k_top` rows.
+    Ok(if hash_routing {
+        crate::moe_lower::Ds4RouteSelection::Hash
+    } else {
+        crate::moe_lower::Ds4RouteSelection::BiasAware
+    })
 }
 
 /// Batched TP MoE step for one prefill layer — the `batch_size=n` analog of
 /// [`ds4_ep_moe_step`].
 ///
-/// **Phase 1** (per rank): replicated routing + shared expert + gate‖up +
-/// activation via [`ffn_batched_pre_down`]. `inter_local = inter / tp` is
-/// the TP column-shard width; when `tp==1`, `inter_local == inter` and the
-/// result is byte-identical to a single-GPU batched run.
+/// **Phase 1** (per rank): replicated routing + SHARED expert via
+/// [`ffn_batched_pre_down`]. `inter_local = inter / tp` is the TP
+/// column-shard width; when `tp==1`, `inter_local == inter` and the result
+/// is byte-identical to a single-GPU batched run.
 ///
-/// **Phase 2** (per-token i64 down + TP all-reduce):
-/// For each token `b ∈ 0..n`, per rank, calls
-/// `launch_indexed_down_residual_i64` with sliced views into the contiguous
-/// `[n*k_top, inter_local]` rot_batch and `[n, k_top]` topk_* buffers,
-/// accumulating into `partials_i64_per_rank[r]` row `b` (`[n, hidden]`
-/// i64). After all tokens, one `AllReduceI64Tp` over `n*hidden` i64
-/// elements, then `ConvertI64ToF32` per rank.
+/// **Phase 2** (sealed batched TpI64 program): per-rank batched phases
+/// [BatchedIndexedMoeGemv GateUp (rows `n·k_top`), MoeActivation (rows
+/// `n·k_top`), DownResidualI64 (out `[n, hidden]` raw i64), ConvertI64ToF32]
+/// lowered from the AUTHORITATIVE borrowed plan (`entry.plan(layer_idx)`,
+/// acquired ONCE per forward by the entry point) and executed by the sealed
+/// executor: the schedule pre-zeros the i64 accumulator, runs ONE batched
+/// down per rank, one `AllReduceI64Tp` over `n·hidden` i64 elements, and one
+/// convert — the bespoke zero/down/all-reduce/convert sequencing is deleted;
+/// there is no parallel double execution.
 ///
 /// **Phase 3** (fold): `ffn_out_batch[r] += partials_per_rank[r]` per rank.
 /// Shared expert is already in `ffn_out_batch` from Phase 1. Caller must
-/// run `hc_ffn_mix_batched` afterwards.
+/// run `hc_ffn_mix_batched` afterwards (routed add precedes the HC mix).
 ///
 /// **Constraints**:
 /// - `n ≤ pbs.max_batch` (checked implicitly: buffers are sized for max_batch).
-/// - `partials_i64_per_rank[r]` is `[n*hidden*8]` raw bytes (DType::Raw).
+/// - `partials_i64_per_rank[r]` is a raw i64 buffer of `n·hidden` elements
+///   (shallow-aliased as `[n, hidden]` for the sealed protocol).
 /// - `partials_per_rank[r]` is `[n*hidden]` F32.
-/// - All devices must have `active_stream` set (required by `zero_before`
-///   in the AllReduceI64Tp path and by `stream_synchronize` before the reduce).
+/// - All devices must have `active_stream` set (the sealed executor's
+///   zeroing/reduce path requires it).
 #[allow(clippy::too_many_arguments)]
-pub fn ds4_prefill_moe_step_tp(
+fn ds4_prefill_moe_step_tp(
     gpus: &mut hipfire_runtime::multi_gpu::Gpus,
+    authority: MoeAuthority<'_>,
     weights_per_rank: &[DeepseekV4Weights],
     cfg: &DeepseekV4Config,
     pbs_per_rank: &mut [PrefillBatchScratch],
     partials_i64_per_rank: &[GpuTensor],
     partials_per_rank: &[GpuTensor],
-    mesh: &hipfire_runtime::multi_gpu::DeviceMesh,
+    policy: &hipfire_runtime::moe_plan::MoEExecutionPolicy,
     layer_idx: usize,
     hash_routing: bool,
     n: usize,
     tokens: &[u32],
 ) -> Result<(), String> {
-    use hipfire_dispatch::families::moe::{launch_indexed_down_residual_i64_batched, MoeExpertRef};
+    use crate::moe_lower::{
+        ds4_decode_phases, ds4_router_plan, Ds4DownTarget, Ds4ProgramTensors, Ds4RouteSelection,
+    };
+    use hipfire_dispatch::families::moe::MoeExpertRef;
+    use hipfire_runtime::moe_plan::{execute_lowered_moe, MoeExecutionTarget};
     use hipfire_runtime::multi_gpu::DimKind;
 
     let num_ranks = gpus.devices.len();
@@ -2791,6 +3252,7 @@ pub fn ds4_prefill_moe_step_tp(
     let inter = cfg.moe_intermediate_size;
     let n_exp = cfg.n_routed_experts;
     let k_top = cfg.num_experts_per_tok;
+    let mesh = policy.mesh();
     let tp = mesh.size_of(DimKind::Tp).max(1);
     let inter_local = inter / tp;
 
@@ -2804,8 +3266,15 @@ pub fn ds4_prefill_moe_step_tp(
         "ds4_prefill_moe_step_tp: pure-Tp mesh required (num_ranks must equal the Tp-axis group size)"
     );
 
-    // ── Phase 1: per-rank replicated routing + shared expert + gate‖up + activation ──
-    let mut routed = false;
+    // ── Phase 1: per-rank replicated routing + SHARED expert (direct kernels).
+    //    The routed gate-up/activation are NOT run here — they are Phase 2's
+    //    sealed GateUp / Activation Steps at `batch·k_top` rows.
+    // The SINGLE MoE enable decision for this prefill: derived from the
+    // authority state (constructed from the entry's snapshot) — the same
+    // value decides the routed work in every layer's pre-down; never
+    // rereads `HIPFIRE_DEEPSEEK4_MOE`.
+    let moe_on = authority.entry().is_some();
+    let mut routed = Ds4RouteSelection::SharedOnly;
     for r in 0..num_ranks {
         gpus.devices[r]
             .bind_thread()
@@ -2820,18 +3289,34 @@ pub fn ds4_prefill_moe_step_tp(
             hash_routing,
             n,
             tokens,
-            inter_local,
+            moe_on,
         )
         .map_err(|e| format!("prefill_moe_tp pre_down L{layer_idx} r{r}: {e}"))?;
     }
-
-    if !routed {
-        // Shared-only layer: partials_i64_per_rank / partials_per_rank are left untouched — their contents are only valid after a routed==true exit (Phase 2/3 skipped).
+    // `Disabled` only when runtime MoE is off (the entry point bypasses
+    // plan lookup); routing then reports SharedOnly. An Enabled state with
+    // a missing plan is an explicit error (cached resolution failure) —
+    // never a silent skip.
+    let plan = match authority.entry() {
+        Some(entry) => Some(entry.plan(layer_idx).ok_or_else(|| {
+            format!("prefill_moe_tp L{layer_idx}: no plan in the authority entry")
+        })?),
+        None => None,
+    };
+    if routed == Ds4RouteSelection::SharedOnly {
+        // Shared-only layer: partials_i64_per_rank / partials_per_rank are
+        // left untouched — their contents are only valid after a routed exit
+        // (Phase 2/3 skipped).
         return Ok(());
     }
 
-    // ── Phase 2: per-token i64 down loop + AllReduceI64Tp + ConvertI64ToF32 ──
-    //
+    // ── Phase 2: sealed batched TpI64 program (gate-up, activation, i64
+    // down, AllReduceI64Tp, convert) from the AUTHORITATIVE plan ──────────
+    // TYPED: a routed layer with a missing plan is an explicit error
+    // (cached resolution failure) — never an expect, never a silent skip.
+    let plan = plan.ok_or_else(|| {
+        format!("prefill_moe_tp L{layer_idx}: routed layer without a plan in the authority entry")
+    })?;
     // Build expert_refs once per layer (owns no data, just borrows weight ptrs).
     // inter_local is the per-rank intermediate dim under TP; expert_k = hidden.
     let expert_refs: Vec<MoeExpertRef> = (0..num_ranks)
@@ -2849,81 +3334,63 @@ pub fn ds4_prefill_moe_step_tp(
             }
         })
         .collect();
-
-    // Zero every rank's i64 partial buffer (n*hidden i64 = n*hidden*8 bytes).
+    // Non-owning logical `[n, hidden]` views of every rank's raw i64
+    // partial (shared [`raw_view`] helper) — the sealed batched protocol
+    // requires the 2-D element shape. The views share the owner buffers
+    // (same pointer, full byte capacity) and outlive the phases (owned by
+    // this scope).
+    let partial_i64_aliases: Vec<GpuTensor> = (0..num_ranks)
+        .map(|r| raw_view(&partials_i64_per_rank[r], vec![n, hidden]))
+        .collect();
+    let mut ranks: Vec<hipfire_runtime::moe_plan::RoutedMoeStepPhases> =
+        Vec::with_capacity(num_ranks);
     for r in 0..num_ranks {
-        gpus.devices[r]
-            .bind_thread()
-            .map_err(|e| format!("prefill_moe_tp zero-i64 bind {r} L{layer_idx}: {e:?}"))?;
-        let stream = gpus.devices[r].active_stream.as_ref().ok_or_else(|| {
-            format!("prefill_moe_tp L{layer_idx} r{r}: no active_stream for i64 zero")
-        })?;
-        gpus.devices[r]
-            .hip
-            .memset_async(&partials_i64_per_rank[r].buf, 0, n * hidden * 8, stream)
-            .map_err(|e| format!("prefill_moe_tp zero i64 L{layer_idx} r{r}: {e:?}"))?;
+        let pbs = &pbs_per_rank[r];
+        let tensors = Ds4ProgramTensors {
+            topk_indices: &pbs.moe_topk_indices_batch,
+            topk_weights: &pbs.moe_topk_weights_batch,
+            ffn_x_rot: &pbs.ffn_x_rot_batch,
+            gate_batch: &pbs.moe_gate_batch,
+            up_batch: &pbs.moe_up_batch,
+            rot_batch: &pbs.moe_rot_batch,
+        };
+        ranks.push(
+            ds4_decode_phases(
+                &tensors,
+                &expert_refs[r],
+                Ds4DownTarget::I64 {
+                    partial_i64: &partial_i64_aliases[r],
+                    partial: &partials_per_rank[r],
+                },
+                k_top,
+                inter_local,
+                hidden,
+                cfg.swiglu_limit,
+                n,
+            )
+            .map_err(|e| format!("prefill_moe_tp L{layer_idx} r{r}: {e}"))?,
+        );
     }
-
-    // Batched i64 down: accumulate all n tokens' k_top selected experts into
-    // partials_i64[r] [n × hidden] in ONE launch per rank (grid z = token). The
-    // batched kernel indexes the whole per-rank buffers by token row:
-    //   rot_batch    [n × k_top × inter_local]  (stride k_top*inter_local)
-    //   topk_indices [n × k_top]                (stride k_top)
-    //   topk_weights [n × k_top]                (stride k_top)
-    //   partials_i64 [n × hidden]               (stride hidden, raw i64)
-    // Because i64 integer add is associative, this is BIT-IDENTICAL to the prior
-    // per-token loop over launch_indexed_down_residual_i64 — same partition
-    // invariance under the Tp inter-split — with n× fewer launches.
-    for r in 0..num_ranks {
-        gpus.devices[r]
-            .bind_thread()
-            .map_err(|e| format!("prefill_moe_tp down bind {r} L{layer_idx}: {e:?}"))?;
-        launch_indexed_down_residual_i64_batched(
-            &mut gpus.devices[r],
-            &expert_refs[r],
-            &pbs_per_rank[r].moe_topk_indices_batch,
-            &pbs_per_rank[r].moe_topk_weights_batch,
-            &pbs_per_rank[r].moe_rot_batch,
-            &partials_i64_per_rank[r],
-            k_top,
-            n,
-        )
-        .map_err(|e| format!("prefill_moe_tp down L{layer_idx} r{r}: {e:?}"))?;
-    }
-
-    // AllReduceI64Tp: sync streams, then peer-reduce the contiguous [n*hidden] i64
-    // partials across the Tp group. Mirrors execute_steps_parallel's AllReduceI64Tp
-    // branch (steps.rs:1200-1222) called directly to avoid per-step overhead.
-    for &dev in &tp_group {
-        gpus.devices[dev]
-            .bind_thread()
-            .map_err(|e| format!("prefill_moe_tp sync bind {dev} L{layer_idx}: {e:?}"))?;
-        let stream = gpus.devices[dev].active_stream.as_ref().ok_or_else(|| {
-            format!("prefill_moe_tp L{layer_idx} dev{dev}: no active_stream for i64 sync")
-        })?;
-        gpus.devices[dev]
-            .hip
-            .stream_synchronize(stream)
-            .map_err(|e| format!("prefill_moe_tp stream_sync L{layer_idx} dev{dev}: {e:?}"))?;
-    }
-    {
-        let refs: Vec<&hip_bridge::DeviceBuffer> = tp_group
-            .iter()
-            .map(|&dev| &partials_i64_per_rank[dev].buf)
-            .collect();
-        gpus.all_reduce_sum_i64_peer(&tp_group, &refs, n * hidden)
-            .map_err(|e| format!("prefill_moe_tp allreduce_i64 L{layer_idx}: {e:?}"))?;
-    }
-
-    // ConvertI64ToF32 per rank: n*hidden i64 → n*hidden f32.
-    for r in 0..num_ranks {
-        gpus.devices[r]
-            .bind_thread()
-            .map_err(|e| format!("prefill_moe_tp convert bind {r} L{layer_idx}: {e:?}"))?;
-        gpus.devices[r]
-            .moe_i64_residual_to_f32(&partials_i64_per_rank[r], &partials_per_rank[r], n * hidden)
-            .map_err(|e| format!("prefill_moe_tp convert L{layer_idx} r{r}: {e:?}"))?;
-    }
+    let layer0 = weights_per_rank[0].resolve_layer(layer_idx);
+    let router = ds4_router_plan(
+        routed,
+        &pbs_per_rank[0].moe_scores_batch,
+        layer0.gate_bias.as_ref(),
+        layer0.tid2eid_dev.as_ref(),
+        Some(&pbs_per_rank[0].tokens),
+        &pbs_per_rank[0].moe_topk_indices_batch,
+        &pbs_per_rank[0].moe_topk_weights_batch,
+        k_top,
+        ds4_route_scale(),
+    )
+    .map_err(|e| format!("prefill_moe_tp L{layer_idx}: router plan: {e}"))?;
+    // One sealed zero/reduce/convert sequence — the bespoke
+    // zero/down/all-reduce/convert path is deleted; no parallel double
+    // execution.
+    let program = build_ds4_parallel_program(plan, policy, router, ranks)
+        .map_err(|e| format!("prefill_moe_tp L{layer_idx}: lowering: {e}"))?;
+    execute_lowered_moe(&program, MoeExecutionTarget::Parallel { gpus })
+        .map_err(|e| format!("prefill_moe_tp L{layer_idx}: execute_lowered_moe: {e:?}"))?;
 
     // ── Phase 3: ffn_out_batch += routed partial (per rank) ──────────────────
     // Shared expert is already in ffn_out_batch from Phase 1.
@@ -2950,9 +3417,8 @@ pub fn ds4_prefill_moe_step_tp(
 //   - the shared expert stays replicated in `state.ffn_out` (every rank),
 //   - only the ROUTED combine crosses ranks (redirected into the per-rank
 //     partial, all-reduced), and
-//   - `hc_ffn_mix` is DEFERRED to `ep_add_into_residual` (runs after the
-//     all-reduce assembles `ffn_out = shared + routed`).
-// See `Deepseek4Bindings::run_moe_ep` / `ep_add_into_residual` + `ds4_moe_block_core`.
+//   - `hc_ffn_mix` runs only after the sealed routed all-reduce assembles
+//     `ffn_out = shared + routed` (see `ds4_ep_moe_step`).
 // MLA attention (latent KV) is replicated per rank → no attention-sharding seam.
 
 /// EP (Ship 6 substrate-EP) replicated N-rank decode forward for ONE token.
@@ -2973,10 +3439,19 @@ pub fn forward_ep(
     state_per_rank: &mut [DeepseekV4State],
     partials: &[GpuTensor],
     partials_i64: &[GpuTensor],
+    policy: &hipfire_runtime::moe_plan::MoEExecutionPolicy,
     token: u32,
     position: u32,
 ) -> Result<(), String> {
     let n = gpus.devices.len();
+    // Policy validation BEFORE any GPU work: the caller policy must be the
+    // exact Ep kind + mesh/epoch binding of these Gpus — enforced even when
+    // MoE is disabled/shared-only (no local alternate mesh model).
+    validate_mesh_entry_policy(
+        gpus,
+        policy,
+        hipfire_runtime::moe_plan::MoEExecutionKind::Ep,
+    )?;
     assert_eq!(
         weights_per_rank.len(),
         n,
@@ -2989,7 +3464,6 @@ pub fn forward_ep(
     );
     assert_eq!(partials.len(), n, "ds4 forward_ep: partials len");
     assert_eq!(partials_i64.len(), n, "ds4 forward_ep: partials_i64 len");
-    let hidden = cfg.hidden_size;
     let skip_ffn = env_cache::skip_ffn();
 
     // 1. Per-rank embed + position + token-id staging + residual-stream init
@@ -3013,6 +3487,13 @@ pub fn forward_ep(
     // 2. Per-layer EP program (Attend replicated; Moe all-reduce-EP'd). Rebuild
     //    the N per-rank bindings each layer (disjoint `iter_mut` mutable state
     //    borrows), exactly like the single-GPU lowered loop advances per layer.
+    //
+    //    MoE authority: acquired EXACTLY ONCE for this forward, before any
+    //    layer work, under the exact caller/loader-owned policy. Per-layer
+    //    plan borrowing is zero-allocation — the aggregate is never called
+    //    per layer or per token substep.
+    let moe_on = env_cache::moe_on();
+    let authority = acquire_moe_authority_mesh(weights_per_rank, cfg, policy, moe_on)?;
     let timing = std::env::var("HIPFIRE_EP_DECODE_TIMING").is_ok();
     // Divergence-localization dump: HIPFIRE_EP_DUMP_POS="0,64,...,302" prints a
     // per-(position, layer, rank) fingerprint of the residual streams so EP
@@ -3025,12 +3506,6 @@ pub fn forward_ep(
         })
         .unwrap_or(false);
     let t_layers = std::time::Instant::now();
-    // Topological EP mesh: a single Ep axis of `n` ranks → `group_along(Ep)` ==
-    // all ranks. Bands/ragged layout stay off the mesh (mesh is topological).
-    let ep_mesh = hipfire_runtime::multi_gpu::DeviceMesh::rect(&[(
-        hipfire_runtime::multi_gpu::DimKind::Ep,
-        n,
-    )]);
     for l in 0..cfg.num_hidden_layers {
         // Attend replicated: every rank holds full MLA weights + full KV, so the
         // per-rank attention is a deterministic function of replicated inputs
@@ -3052,14 +3527,24 @@ pub fn forward_ep(
         // Moe all-reduce EP: each rank runs its owned routed experts (+ the
         // replicated shared expert) into a partial, the partials all-reduce over
         // the Ep group, and each rank folds the reduced routed sum into residual.
+        // The authoritative borrowed plan for this layer (borrowed once per
+        // forward; an Enabled state with a missing plan is an explicit
+        // error — cached resolution failure, never a silent skip).
+        let plan = match authority.entry() {
+            Some(entry) => Some(entry.plan(l).ok_or_else(|| {
+                format!("ds4 forward_ep moe-step L{l}: no plan in the authority entry")
+            })?),
+            None => None,
+        };
         ds4_ep_moe_step(
             gpus,
+            plan,
             weights_per_rank,
             cfg,
             state_per_rank,
             partials,
             partials_i64,
-            &ep_mesh,
+            policy,
             l,
             token,
             skip_ffn,
@@ -3206,10 +3691,18 @@ pub fn forward_tp(
     state_per_rank: &mut [DeepseekV4State],
     partials: &[GpuTensor],
     partials_i64: &[GpuTensor],
+    policy: &hipfire_runtime::moe_plan::MoEExecutionPolicy,
     token: u32,
     position: u32,
 ) -> Result<(), String> {
     let n = gpus.devices.len();
+    // Policy validation BEFORE any GPU work: exact Tp kind + mesh/epoch
+    // binding of these Gpus — enforced even when MoE is disabled.
+    validate_mesh_entry_policy(
+        gpus,
+        policy,
+        hipfire_runtime::moe_plan::MoEExecutionKind::Tp,
+    )?;
     assert_eq!(
         weights_per_rank.len(),
         n,
@@ -3242,13 +3735,15 @@ pub fn forward_tp(
     }
 
     // 2. Per-layer TP program (Attend replicated; Moe all-reduce-Tp'd via the
-    //    int64 partition-invariant down path). Topological Tp mesh: a single Tp
-    //    axis of `n` ranks → `ds4_ep_moe_step` sees DimKind::Tp → tp=n,
+    //    int64 partition-invariant down path). The caller's policy owns the
+    //    topological Tp mesh → `ds4_ep_moe_step` sees DimKind::Tp → tp=n,
     //    inter_local=inter/n, AllReduceI64Tp.
-    let tp_mesh = hipfire_runtime::multi_gpu::DeviceMesh::rect(&[(
-        hipfire_runtime::multi_gpu::DimKind::Tp,
-        n,
-    )]);
+    //
+    //    MoE authority: acquired EXACTLY ONCE for this forward, before any
+    //    layer work, under the exact caller/loader-owned policy and the
+    //    SINGLE enable snapshot.
+    let moe_on = env_cache::moe_on();
+    let authority = acquire_moe_authority_mesh(weights_per_rank, cfg, policy, moe_on)?;
     for l in 0..cfg.num_hidden_layers {
         // Attend replicated (identical to forward_ep).
         for r in 0..n {
@@ -3265,14 +3760,21 @@ pub fn forward_tp(
             )
             .map_err(|e| format!("ds4 forward_tp attn L{l} r{r}: {e}"))?;
         }
+        let plan = match authority.entry() {
+            Some(entry) => Some(entry.plan(l).ok_or_else(|| {
+                format!("ds4 forward_tp moe-step L{l}: no plan in the authority entry")
+            })?),
+            None => None,
+        };
         ds4_ep_moe_step(
             gpus,
+            plan,
             weights_per_rank,
             cfg,
             state_per_rank,
             partials,
             partials_i64,
-            &tp_mesh,
+            policy,
             l,
             token,
             skip_ffn,
@@ -3335,17 +3837,13 @@ pub fn forward_tp(
 /// attention block is the SWA-only path (same as a hash-routed main
 /// layer's attention).
 ///
-/// **Status**: M1+M2 (weights ingest) are landed; the standard layer
-/// block (attn + FFN with MTP weights) is still pending — the existing
-/// per-layer helpers (`q_lora`, `kv_joint`, `attn_stub`, ...) all read
-/// `weights.layers[layer_idx]` and need refactoring to accept a
-/// `&DeepseekV4LayerWeights` parameter so they can run against
-/// `weights.mtp_layer`. Filling in that refactor is M3-complete; it
-/// will land alongside validation against the new HFQ that contains
-/// the MTP layer.
-///
-/// Until then this function returns a clear error so callers can stub
-/// out the spec-decode path without false-positive bring-up.
+/// The MTP layer runs the standard per-layer block (`mtp_pre_ffn` attention +
+/// the shared/routed FFN through the model-owned MoE authority) against the
+/// MTP head weights; the authority and the typed MTP plan are selected
+/// BEFORE any GPU work (`[SelectAuthority, PreFfn]`). The pre-FFN and FFN
+/// helpers operate on the MTP layer bundle; the routed plan is borrowed from
+/// the authority (`Selected(None)` under MoE disable runs the shared path
+/// with no routed execution).
 pub fn mtp_forward(
     cfg: &DeepseekV4Config,
     weights: &DeepseekV4Weights,
@@ -3356,11 +3854,37 @@ pub fn mtp_forward(
     position: u32,
 ) -> Result<Vec<f32>, String> {
     let mtp_layer_idx = cfg.num_hidden_layers;
-    // Steps 0–6: validate MTP weights + embed/norm/HC plumbing + attention.
-    mtp_pre_ffn(cfg, weights, state, gpu, h_n, next_token, position)?;
-    // FFN block (== ds4_moe_block_core at the MTP layer: mhc_pre(ffn) + shared
-    // ffn_stub + routed ffn_routed + hc_ffn_mix). Single-GPU: routed combines
-    // into ffn_out alongside the shared expert; the mix folds it.
+    // MTP initial action sequence: [SelectAuthority, PreFfn]. The count guard
+    // rejects zero/unsupported counts first; enabled count one acquires
+    // authority and selects `entry.mtp_plan()` exactly once, while disabled
+    // count one selects no routed plan. Only then does pre-FFN GPU work run.
+    // The borrowed plan is never reacquired.
+    let moe_on = env_cache::moe_on();
+    let mut selection = Ds4MtpSelection::Unselected;
+    for action in ds4_mtp_entry_actions() {
+        match action {
+            Ds4MtpEntryAction::SelectAuthority => {
+                selection = select_mtp_authority_single(cfg, weights, moe_on)?;
+            }
+            Ds4MtpEntryAction::PreFfn => {
+                // Steps 0–6: validate MTP weights + embed/norm/HC plumbing +
+                // attention. TYPED state check: Unselected refuses here;
+                // Selected(None) (MoE disabled) runs shared/pre-FFN safely
+                // with no routed execution.
+                let _plan = selection.plan_or_err("mtp_forward")?;
+                mtp_pre_ffn(cfg, weights, state, gpu, h_n, next_token, position)?;
+            }
+        }
+    }
+    let mtp_plan = match selection {
+        Ds4MtpSelection::Selected(plan) => plan,
+        Ds4MtpSelection::Unselected => {
+            return Err("mtp_forward: MTP SelectAuthority never ran".to_string());
+        }
+    };
+    // FFN block (== the single-GPU lowered MoE at the MTP layer: mhc_pre(ffn)
+    // + shared ffn_stub + routed program + hc_ffn_mix). Single-GPU: routed
+    // combines into ffn_out alongside the shared expert; the mix folds it.
     mhc_pre(
         cfg,
         weights,
@@ -3370,7 +3894,11 @@ pub fn mtp_forward(
         /*is_attn=*/ false,
     )?;
     ffn_stub(cfg, weights, state, gpu, mtp_layer_idx)?;
-    ffn_routed(cfg, weights, state, gpu, mtp_layer_idx, None)?;
+    // MTP reuses the main layers' single-GPU lowered MoE program with the
+    // pre-borrowed MTP plan (layer N) — no local overlay/fabrication.
+    if let Some(plan) = mtp_plan {
+        ds4_moe_decode_single(cfg, plan, weights, state, gpu, mtp_layer_idx, next_token)?;
+    }
     hc_ffn_mix(cfg, weights, state, gpu, mtp_layer_idx)?;
     // Step 7: capture full HC residual → mtp_last_hidden (chaining input).
     mtp_capture_hidden(cfg, state, gpu)?;
@@ -3460,6 +3988,14 @@ fn mtp_pre_ffn(
     if cfg.num_nextn_predict_layers == 0 {
         return Err("mtp_forward: cfg.num_nextn_predict_layers == 0; MTP not enabled".to_string());
     }
+
+    // Every public MTP entry owns preparation of the requested position.
+    // Scalar decode leaves these durable buffers populated, but batched
+    // prefill uses PBS-owned position/attention stripes and may leave the
+    // state buffers absent. Refreshing here also prevents stale RoPE/SWA
+    // state when chaining multiple MTP positions.
+    state.n_tokens = position as u64;
+    precompute_positions(cfg, state, gpu, position)?;
 
     let hidden = cfg.hidden_size;
     let hc_mult = cfg.hc_mult;
@@ -3602,7 +4138,7 @@ fn mtp_pre_ffn(
     // internally, which routes to `weights.mtp_layer`. The MTP layer has
     // NO compressor/indexer (compress_ratio = 0 by construction), and is
     // NOT a hash layer (mtp_layer_idx >= num_hash_layers), so we use the
-    // standard MoE router (`ffn_routed`) rather than `ffn_hash_routed`.
+    // standard bias-aware router (never the hash path).
     mhc_pre(
         cfg,
         weights,
@@ -3786,8 +4322,8 @@ fn mtp_head(
 /// pre-FFN (embed / norm / HC plumbing + attention) runs replicated per rank,
 /// the MTP-layer FFN runs through the SAME EP executor as the main layers
 /// (shared `ffn_stub` replicated in `state.ffn_out`; the 256 routed experts
-/// sharded → all-reduced partial; `hc_ffn_mix` deferred to
-/// `ep_add_into_residual`), the residual capture runs per rank, and the head
+/// sharded → sealed all-reduced partial; `hc_ffn_mix` runs after routed
+/// assembly), the residual capture runs per rank, and the head
 /// runs on rank 0. Returns rank 0's downloaded logits (over the next-next
 /// vocab). `mtp_last_hidden` is updated per rank (replicated) for chaining.
 ///
@@ -3806,6 +4342,7 @@ pub fn mtp_forward_ep(
     partials: &[GpuTensor],
     partials_i64: &[GpuTensor],
     h_n_per_rank: &[GpuTensor],
+    policy: &hipfire_runtime::moe_plan::MoEExecutionPolicy,
     next_token: u32,
     position: u32,
 ) -> Result<Vec<f32>, String> {
@@ -3823,50 +4360,82 @@ pub fn mtp_forward_ep(
     assert_eq!(partials.len(), n, "mtp_forward_ep: partials len");
     assert_eq!(partials_i64.len(), n, "mtp_forward_ep: partials_i64 len");
     assert_eq!(h_n_per_rank.len(), n, "mtp_forward_ep: h_n_per_rank len");
-    let hidden = cfg.hidden_size;
     let mtp_layer_idx = cfg.num_hidden_layers;
 
-    // 1. Per-rank pre-FFN (embed/norm/HC + attention), replicated. attn_stub
-    //    reads state.n_tokens for the MTP-layer SWA ring slot → set it to
-    //    `position` per rank (matches spec_decode's bookkeeping).
-    for r in 0..n {
-        gpus.devices[r]
-            .bind_thread()
-            .map_err(|e| format!("mtp_forward_ep bind {r}: {e:?}"))?;
-        state_per_rank[r].n_tokens = position as u64;
-        mtp_pre_ffn(
-            cfg,
-            &weights_per_rank[r],
-            &mut state_per_rank[r],
-            &mut gpus.devices[r],
-            &h_n_per_rank[r],
-            next_token,
-            position,
-        )?;
+    // 0. Policy validation + MTP authority BEFORE any GPU work: the caller
+    //    policy must be the exact Ep kind + mesh/epoch binding of these Gpus
+    //    (even when MoE is disabled). The count guard rejects zero/unsupported
+    //    counts first; count one selects `entry.mtp_plan()` when enabled or
+    //    `Selected(None)` when disabled. Cached failures refuse before
+    //    `mtp_pre_ffn` or any allocation/launch/mutation.
+    validate_mesh_entry_policy(
+        gpus,
+        policy,
+        hipfire_runtime::moe_plan::MoEExecutionKind::Ep,
+    )?;
+    // MTP initial action sequence: [SelectAuthority, PreFfn]. Selection
+    // completes before per-rank pre-FFN work: enabled count one carries a plan,
+    // disabled count one carries `Selected(None)`, and only `Unselected` is an
+    // invalid PreFfn state.
+    let moe_on = env_cache::moe_on();
+    let mut selection = Ds4MtpSelection::Unselected;
+    for action in ds4_mtp_entry_actions() {
+        match action {
+            Ds4MtpEntryAction::SelectAuthority => {
+                selection = select_mtp_authority_mesh(weights_per_rank, cfg, policy, moe_on)?;
+            }
+            Ds4MtpEntryAction::PreFfn => {
+                // TYPED state check: Unselected refuses; Selected(None)
+                // (disabled) runs the shared/pre-FFN work safely.
+                let _plan = selection.plan_or_err("mtp_forward_ep")?;
+                // 1. Per-rank pre-FFN (embed/norm/HC + attention),
+                //    replicated. attn_stub reads state.n_tokens for the
+                //    MTP-layer SWA ring slot → set it to `position` per
+                //    rank (matches spec_decode's bookkeeping).
+                for r in 0..n {
+                    gpus.devices[r]
+                        .bind_thread()
+                        .map_err(|e| format!("mtp_forward_ep bind {r}: {e:?}"))?;
+                    state_per_rank[r].n_tokens = position as u64;
+                    mtp_pre_ffn(
+                        cfg,
+                        &weights_per_rank[r],
+                        &mut state_per_rank[r],
+                        &mut gpus.devices[r],
+                        &h_n_per_rank[r],
+                        next_token,
+                        position,
+                    )?;
+                }
+            }
+        }
     }
+    let mtp_plan = match selection {
+        Ds4MtpSelection::Selected(plan) => plan,
+        Ds4MtpSelection::Unselected => {
+            return Err("mtp_forward_ep: MTP SelectAuthority never ran".to_string());
+        }
+    };
 
-    // 2. MTP-layer FFN via the decomposed EP executor: mhc_pre(ffn) + shared
-    //    ffn_stub + routed experts → partial → all-reduce → ffn_out += partial
-    //    → hc_ffn_mix (all inside ds4_ep_moe_step).
-    {
-        let ep_mesh = hipfire_runtime::multi_gpu::DeviceMesh::rect(&[(
-            hipfire_runtime::multi_gpu::DimKind::Ep,
-            n,
-        )]);
-        ds4_ep_moe_step(
-            gpus,
-            weights_per_rank,
-            cfg,
-            state_per_rank,
-            partials,
-            partials_i64,
-            &ep_mesh,
-            mtp_layer_idx,
-            next_token,
-            /*skip_ffn=*/ false,
-        )
-        .map_err(|e| format!("mtp_forward_ep moe-step: {e}"))?;
-    }
+    // 2. MTP-layer FFN via the same sealed-lowered EP executor as the main
+    //    layers: mhc_pre(ffn) + shared ffn_stub + routed experts → partial →
+    //    all-reduce → ffn_out += partial → hc_ffn_mix (all inside
+    //    ds4_ep_moe_step), consuming the pre-borrowed MTP plan — no local
+    //    overlay, no reacquisition.
+    ds4_ep_moe_step(
+        gpus,
+        mtp_plan,
+        weights_per_rank,
+        cfg,
+        state_per_rank,
+        partials,
+        partials_i64,
+        policy,
+        mtp_layer_idx,
+        next_token,
+        /*skip_ffn=*/ false,
+    )
+    .map_err(|e| format!("mtp_forward_ep moe-step: {e}"))?;
 
     // 3. Per-rank capture (residual_streams → mtp_last_hidden), replicated.
     for r in 0..n {
@@ -3924,6 +4493,7 @@ pub fn mtp_forward_tp(
     partials: &[GpuTensor],
     partials_i64: &[GpuTensor],
     h_n_per_rank: &[GpuTensor],
+    policy: &hipfire_runtime::moe_plan::MoEExecutionPolicy,
     next_token: u32,
     position: u32,
 ) -> Result<Vec<f32>, String> {
@@ -3943,43 +4513,74 @@ pub fn mtp_forward_tp(
     assert_eq!(h_n_per_rank.len(), n, "mtp_forward_tp: h_n_per_rank len");
     let mtp_layer_idx = cfg.num_hidden_layers;
 
-    // 1. Per-rank pre-FFN (embed/norm/HC + attention), replicated.
-    for r in 0..n {
-        gpus.devices[r]
-            .bind_thread()
-            .map_err(|e| format!("mtp_forward_tp bind {r}: {e:?}"))?;
-        state_per_rank[r].n_tokens = position as u64;
-        mtp_pre_ffn(
-            cfg,
-            &weights_per_rank[r],
-            &mut state_per_rank[r],
-            &mut gpus.devices[r],
-            &h_n_per_rank[r],
-            next_token,
-            position,
-        )?;
+    // 0. Policy validation + MTP authority BEFORE any GPU work: exact Tp
+    //    kind + mesh/epoch binding (even when MoE is disabled). The count guard
+    //    rejects zero/unsupported counts first; count one selects
+    //    `entry.mtp_plan()` when enabled or `Selected(None)` when disabled.
+    //    Cached failures refuse before `mtp_pre_ffn`. Never reacquired.
+    validate_mesh_entry_policy(
+        gpus,
+        policy,
+        hipfire_runtime::moe_plan::MoEExecutionKind::Tp,
+    )?;
+    // MTP initial action sequence: [SelectAuthority, PreFfn]. Selection
+    // completes before per-rank pre-FFN work: enabled count one carries a plan,
+    // disabled count one carries `Selected(None)`, and only `Unselected` is an
+    // invalid PreFfn state.
+    let moe_on = env_cache::moe_on();
+    let mut selection = Ds4MtpSelection::Unselected;
+    for action in ds4_mtp_entry_actions() {
+        match action {
+            Ds4MtpEntryAction::SelectAuthority => {
+                selection = select_mtp_authority_mesh(weights_per_rank, cfg, policy, moe_on)?;
+            }
+            Ds4MtpEntryAction::PreFfn => {
+                // TYPED state check: Unselected refuses; Selected(None)
+                // (disabled) runs the shared/pre-FFN work safely.
+                let _plan = selection.plan_or_err("mtp_forward_tp")?;
+                // 1. Per-rank pre-FFN (embed/norm/HC + attention), replicated.
+                for r in 0..n {
+                    gpus.devices[r]
+                        .bind_thread()
+                        .map_err(|e| format!("mtp_forward_tp bind {r}: {e:?}"))?;
+                    state_per_rank[r].n_tokens = position as u64;
+                    mtp_pre_ffn(
+                        cfg,
+                        &weights_per_rank[r],
+                        &mut state_per_rank[r],
+                        &mut gpus.devices[r],
+                        &h_n_per_rank[r],
+                        next_token,
+                        position,
+                    )?;
+                }
+            }
+        }
     }
+    let mtp_plan = match selection {
+        Ds4MtpSelection::Selected(plan) => plan,
+        Ds4MtpSelection::Unselected => {
+            return Err("mtp_forward_tp: MTP SelectAuthority never ran".to_string());
+        }
+    };
 
-    // 2. MTP-layer FFN via the decomposed executor on a Tp mesh.
-    {
-        let tp_mesh = hipfire_runtime::multi_gpu::DeviceMesh::rect(&[(
-            hipfire_runtime::multi_gpu::DimKind::Tp,
-            n,
-        )]);
-        ds4_ep_moe_step(
-            gpus,
-            weights_per_rank,
-            cfg,
-            state_per_rank,
-            partials,
-            partials_i64,
-            &tp_mesh,
-            mtp_layer_idx,
-            next_token,
-            /*skip_ffn=*/ false,
-        )
-        .map_err(|e| format!("mtp_forward_tp moe-step: {e}"))?;
-    }
+    // 2. MTP-layer FFN via the same sealed-lowered executor on the caller's
+    //    Tp policy (mtp reuses the main layers' lowered program), consuming
+    //    the pre-borrowed MTP plan — no local overlay, no reacquisition.
+    ds4_ep_moe_step(
+        gpus,
+        mtp_plan,
+        weights_per_rank,
+        cfg,
+        state_per_rank,
+        partials,
+        partials_i64,
+        policy,
+        mtp_layer_idx,
+        next_token,
+        /*skip_ffn=*/ false,
+    )
+    .map_err(|e| format!("mtp_forward_tp moe-step: {e}"))?;
 
     // 3. Per-rank capture (residual_streams → mtp_last_hidden), replicated.
     for r in 0..n {
@@ -4350,14 +4951,13 @@ fn ffn_stub(
     // them (Q8/F16/F32 paths read x_plain). For deepseek4-q8-mtp this skips
     // ~2-3 rotation kernels per layer per token.
     //
-    // CORRECTNESS: the routed-MoE path (ffn_routed) ALSO reads
-    // ffn_x_rot — routed experts at MQ2-Lloyd consume FWHT-rotated
+    // CORRECTNESS: the routed-MoE path ALSO reads ffn_x_rot — routed
+    // experts at MQ2-Lloyd consume FWHT-rotated
     // input. So we must keep the gate/up rotation alive when MoE is
     // on (default; opt out with HIPFIRE_DEEPSEEK4_MOE=0), regardless of shared
     // weight dtype.
-    let moe_will_run = env_cache::moe_on();
     let gate_up_need_fwht =
-        moe_will_run || weight_needs_fwht(shared_w1) || weight_needs_fwht(shared_w3);
+        env_cache::moe_on() || weight_needs_fwht(shared_w1) || weight_needs_fwht(shared_w3);
     let down_needs_fwht = weight_needs_fwht(shared_w2);
 
     // 1. RMSNorm (+ optional FWHT). When BOTH rot and plain outputs are
@@ -4422,388 +5022,6 @@ fn ffn_stub(
     // shared_w2: rotated path uses silu_rot (FWHT'd), plain path uses
     // `gate` itself (post-silu_mul, no FWHT).
     gemv_auto(gpu, shared_w2, silu_rot, gate, ffn_out, cfg.hidden_size, im)?;
-
-    Ok(())
-}
-
-/// Routed-expert dispatch (DeepSeek V4 top-6 MoE). Accumulates `routed_scaling
-/// _factor · Σ_k w_k · expert_{idx_k}(ffn_x_rot)` into `ffn_out`
-/// (which already holds the shared-expert output from `ffn_stub`).
-///
-/// Gated on HIPFIRE_DEEPSEEK4_MOE != "0" (default ON) AND expert blobs present
-/// (uploaded by default; opt out with HIPFIRE_DEEPSEEK4_UPLOAD_EXPERTS=0) AND
-/// layer is score-routed
-/// (layer_idx >= num_hash_layers). Hash-routed layers 0..3 fall back
-/// to shared-only (tid2eid lookup table is skipped at quant time).
-///
-/// Math (per upstream `inference/model.py:Gate.forward` and `Expert.
-/// forward`):
-///   scores = sqrt(softplus(gate.weight @ x))             [n_exp]
-///   indices = topk(scores + bias, k=6)[1]                [k]   ← +bias for selection
-///   weights = scores[indices]                            [k]   ← unbiased scores for weights
-///   weights /= weights.sum(); weights *= route_scale     [k]
-///   for each (idx, w) in (indices, weights):
-///     gate_e = w1[idx] @ x                  ← clamp to swiglu_limit (skipped)
-///     up_e   = w3[idx] @ x                  ← clamp to ±swiglu_limit (skipped)
-///     e_out  = w2[idx] @ (silu(gate_e) * up_e * w)
-///     ffn_out += e_out * routed_scaling_factor
-fn ffn_routed(
-    cfg: &DeepseekV4Config,
-    weights: &DeepseekV4Weights,
-    state: &mut DeepseekV4State,
-    gpu: &mut Gpu,
-    layer_idx: usize,
-    routed_out: Option<&GpuTensor>,
-) -> Result<(), String> {
-    if !env_cache::moe_on() {
-        return Ok(());
-    }
-    if layer_idx < cfg.num_hash_layers {
-        // Hash routing — tid2eid table skipped at quant time, no expert
-        // selection possible. Shared expert alone for these layers.
-        return Ok(());
-    }
-    let layer = weights.resolve_layer(layer_idx);
-    if layer.expert_gate_up_blob.is_none() || layer.expert_w2_blob.is_none() {
-        return Ok(()); // experts not uploaded; nothing to dispatch
-    }
-
-    // 1. Run router: compute unbiased scores on-device. DeepSeek V4's selection
-    //    uses BIASED scores while the routing weights use UNBIASED scores
-    //    (per upstream model.py: Gate.forward). The GPU top-K kernel
-    //    `deepseek4_moe_topk_bias_aware_f32` handles this two-score semantic in
-    //    one launch, eliminating the per-layer D2H/CPU/H2D round-trip.
-    moe_route(cfg, weights, state, gpu, layer_idx)?;
-
-    let k = cfg.num_experts_per_tok;
-    let n_exp = cfg.n_routed_experts;
-    let _ = n_exp;
-    let im = cfg.moe_intermediate_size;
-    let ffn_x_rot = state.ffn_x_rot.as_ref().unwrap();
-    let ffn_out = state.ffn_out.as_ref().unwrap();
-    // Route-scale: rarely-overridden; one-shot env read at first call.
-    use std::sync::OnceLock;
-    static ROUTE_SCALE: OnceLock<f32> = OnceLock::new();
-    let route_scale_override: f32 = *ROUTE_SCALE.get_or_init(|| {
-        std::env::var("HIPFIRE_DEEPSEEK4_ROUTE_SCALE")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(2.2)
-    });
-
-    if layer.expert_gate_up_blob.is_some() {
-        // Fused MoE dispatch: 2 indexed kernels (gate_up + down) plus
-        // k_top per-expert silu_clamp+rotate. Replaces the per-expert
-        // k=0..6 × 3 GEMV loop (18 launches → 14 launches per layer).
-        // The bigger win is GPU utilisation: grid Y dim spans all k_top
-        // experts so the GEMVs run in parallel rather than serially.
-        let k_top = k;
-        // Lazy-alloc scratch.
-        if state.moe_topk_indices.is_none() {
-            state.moe_topk_indices = Some(
-                gpu.alloc_tensor(&[k_top], DType::F32)
-                    .map_err(|e| format!("alloc moe_topk_indices: {e:?}"))?,
-            );
-        }
-        if state.moe_topk_weights.is_none() {
-            state.moe_topk_weights = Some(
-                gpu.alloc_tensor(&[k_top], DType::F32)
-                    .map_err(|e| format!("alloc moe_topk_weights: {e:?}"))?,
-            );
-        }
-        if state.moe_gate_batch.is_none() {
-            state.moe_gate_batch = Some(
-                gpu.alloc_tensor(&[k_top, im], DType::F32)
-                    .map_err(|e| format!("alloc moe_gate_batch: {e:?}"))?,
-            );
-        }
-        if state.moe_up_batch.is_none() {
-            state.moe_up_batch = Some(
-                gpu.alloc_tensor(&[k_top, im], DType::F32)
-                    .map_err(|e| format!("alloc moe_up_batch: {e:?}"))?,
-            );
-        }
-        if state.moe_rot_batch.is_none() {
-            state.moe_rot_batch = Some(
-                gpu.alloc_tensor(&[k_top, im], DType::F32)
-                    .map_err(|e| format!("alloc moe_rot_batch: {e:?}"))?,
-            );
-        }
-        // [k_top × hidden] per-expert down outputs for the deterministic
-        // (atomic-free) combine in run_moe_decode_bias_aware (default on;
-        // HIPFIRE_DEEPSEEK4_MOE_DETERMINISTIC=0 uses the atomic path).
-        if state.moe_down_expert_outputs.is_none() {
-            state.moe_down_expert_outputs = Some(
-                gpu.alloc_tensor(&[k_top, cfg.hidden_size], DType::F32)
-                    .map_err(|e| format!("alloc moe_down_expert_outputs: {e:?}"))?,
-            );
-        }
-        let topk_idx_dev = state.moe_topk_indices.as_ref().unwrap();
-        let topk_w_dev = state.moe_topk_weights.as_ref().unwrap();
-        // GPU top-K: bias-aware select + normalize + route_scale in one
-        // launch, outputs straight into topk_idx_dev / topk_w_dev.
-        let scores_dev = state.router_scores.as_ref().unwrap();
-        let bias_dev = layer
-            .gate_bias
-            .as_ref()
-            .ok_or_else(|| format!("ffn_routed l{layer_idx}: gate_bias missing"))?;
-        let gate_up_ptrs = layer.expert_gate_up_ptrs.as_ref().unwrap();
-        let w2_ptrs = layer.expert_w2_ptrs.as_ref().unwrap();
-        let gate_batch = state.moe_gate_batch.as_ref().unwrap();
-        let up_batch = state.moe_up_batch.as_ref().unwrap();
-        let rot_batch = state.moe_rot_batch.as_ref().unwrap();
-        let down_expanded = state.moe_down_expert_outputs.as_ref().unwrap();
-
-        // Bias-aware top-k select + the routed MQ2-Lloyd experts now run through
-        // the centralized MoE family (Ship 4.3): bias-aware top-k -> indexed
-        // gate_up -> batched silu*mul*clamp -> batched FWHT rotate -> indexed
-        // down with route-scaled residual accumulation into ffn_out. The router
-        // GEMV + sqrt_softplus (moe_route, above) and the shared expert
-        // (ffn_stub) stay model-owned; ffn_stub must have seeded ffn_out before
-        // this accumulates into it.
-        //
-        // EP: `routed_out = Some(partial)` redirects the route-scaled
-        // accumulation into a zeroed per-rank partial (so partial holds ONLY
-        // this rank's owned-expert routed contribution); the shared expert
-        // stays in `state.ffn_out` (replicated). The accumulation kernel does
-        // `out += ...`, so a zeroed partial yields exactly the routed sum.
-        let out_target = routed_out.unwrap_or(ffn_out);
-        let moe_params = hipfire_dispatch::families::moe::MoeBiasAwareParams {
-            hidden: cfg.hidden_size,
-            mi: im,
-            k_top,
-            n_exp: cfg.n_routed_experts,
-            route_scale: route_scale_override,
-            swiglu_limit: cfg.swiglu_limit,
-            batch_size: 1,
-            x_rot: ffn_x_rot,
-            ffn_out: out_target,
-            scores: scores_dev,
-            gate_bias: bias_dev,
-            expert_gate_up_ptrs: gate_up_ptrs,
-            expert_down_ptrs: w2_ptrs,
-            topk_indices: topk_idx_dev,
-            topk_weights: topk_w_dev,
-            gate_batch,
-            up_batch,
-            rot_batch,
-            down_expanded,
-        };
-        hipfire_runtime::llama::moe_family()
-            .run_bias_aware(gpu, &moe_params)
-            .map_err(|e| format!("ffn_routed l{layer_idx} dispatch: {e}"))?;
-
-        return Ok(());
-    }
-
-    // Per-expert fallback path is no longer reachable: separate w1/w3
-    // blobs are no longer uploaded (only the combined gate_up blob).
-    let _ = route_scale_override;
-    Err(format!(
-        "deepseek4: layer {layer_idx} has no separate w1/w3 blobs (only \
-         combined gate_up). Rebuild the loader with separate-blob uploads."
-    ))
-}
-
-/// Hash-routed FFN dispatch (DeepSeek V4 layers 0..num_hash_layers = 0..3).
-///
-/// Per upstream DeepSeek V4 (model.py:Gate.forward, model.py:587-606):
-///   if self.hash:
-///     indices = self.tid2eid[input_ids]          [k]   ← static lookup
-///   else:
-///     indices = scores.topk(k)[1]
-///   weights = original_scores.gather(1, indices) [k]   ← from unbiased scores
-///   weights /= weights.sum();  weights *= route_scale
-///
-/// So we still need the gate.weight GEMV to get scores for the weight
-/// values — only the SELECTION is static. The dispatch loop is otherwise
-/// identical to `ffn_routed`.
-///
-/// Same env gate (`HIPFIRE_DEEPSEEK4_MOE != "0"`, default ON) and blob-presence guard.
-fn ffn_hash_routed(
-    cfg: &DeepseekV4Config,
-    weights: &DeepseekV4Weights,
-    state: &mut DeepseekV4State,
-    gpu: &mut Gpu,
-    layer_idx: usize,
-    token_id: u32,
-    routed_out: Option<&GpuTensor>,
-) -> Result<(), String> {
-    if !env_cache::moe_on() {
-        return Ok(());
-    }
-    let layer = weights.resolve_layer(layer_idx);
-    if layer.expert_gate_up_blob.is_none() || layer.expert_w2_blob.is_none() {
-        return Ok(());
-    }
-    if layer.tid2eid_host.is_empty() {
-        // tid2eid not in the HFQ (pre-FP4-fix quant skipped it). Fall back
-        // to shared-only on this layer.
-        return Ok(());
-    }
-
-    // Compute scores (unbiased) on-device for the weight values.
-    moe_route(cfg, weights, state, gpu, layer_idx)?;
-
-    let k = cfg.num_experts_per_tok;
-    let n_exp = cfg.n_routed_experts;
-
-    // Bounds check on token_id (host-side; tid2eid_dev shape == tid2eid_host).
-    let row = (token_id as usize) * k;
-    if row + k > layer.tid2eid_host.len() {
-        return Err(format!(
-            "hash l{layer_idx}: token_id {token_id} out of tid2eid range \
-             ({} entries)",
-            layer.tid2eid_host.len()
-        ));
-    }
-
-    let im = cfg.moe_intermediate_size;
-    let ffn_x_rot = state.ffn_x_rot.as_ref().unwrap();
-    let ffn_out = state.ffn_out.as_ref().unwrap();
-    let route_scale_override: f32 = std::env::var("HIPFIRE_DEEPSEEK4_ROUTE_SCALE")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(2.2);
-    let k_top = k;
-
-    // Lazy-alloc moe scratch (shared with ffn_routed via state).
-    if state.moe_topk_indices.is_none() {
-        state.moe_topk_indices = Some(
-            gpu.alloc_tensor(&[k_top], DType::F32)
-                .map_err(|e| format!("alloc moe_topk_indices hash: {e:?}"))?,
-        );
-    }
-    if state.moe_topk_weights.is_none() {
-        state.moe_topk_weights = Some(
-            gpu.alloc_tensor(&[k_top], DType::F32)
-                .map_err(|e| format!("alloc moe_topk_weights hash: {e:?}"))?,
-        );
-    }
-    if state.moe_gate_batch.is_none() {
-        state.moe_gate_batch = Some(
-            gpu.alloc_tensor(&[k_top, im], DType::F32)
-                .map_err(|e| format!("alloc moe_gate_batch hash: {e:?}"))?,
-        );
-    }
-    if state.moe_up_batch.is_none() {
-        state.moe_up_batch = Some(
-            gpu.alloc_tensor(&[k_top, im], DType::F32)
-                .map_err(|e| format!("alloc moe_up_batch hash: {e:?}"))?,
-        );
-    }
-    if state.moe_rot_batch.is_none() {
-        state.moe_rot_batch = Some(
-            gpu.alloc_tensor(&[k_top, im], DType::F32)
-                .map_err(|e| format!("alloc moe_rot_batch hash: {e:?}"))?,
-        );
-    }
-
-    let topk_idx_dev = state.moe_topk_indices.as_ref().unwrap();
-    let topk_w_dev = state.moe_topk_weights.as_ref().unwrap();
-    let scores = state.router_scores.as_ref().unwrap();
-
-    // GPU-side hash-router lookup + normalize + scale. Replaces the
-    // d2h(scores) + host gather + h2d(topk_idx, topk_w) round-trip.
-    // Prefer the `_buf` variant (reads token_id from device) so the
-    // captured HIP graph re-reads token_id on every replay. Falls
-    // back to the kernarg variant or host gather if prerequisites
-    // (tid2eid_dev, token_id_buf) are missing.
-    if let Some(tid2eid_dev) = layer.tid2eid_dev.as_ref() {
-        if let Some(token_id_buf) = state.token_id_buf.as_ref() {
-            gpu.hash_router_normalize_f32_buf(
-                tid2eid_dev,
-                scores,
-                token_id_buf,
-                topk_idx_dev,
-                topk_w_dev,
-                n_exp as i32,
-                k as i32,
-                route_scale_override,
-            )
-            .map_err(|e| format!("hash_router_normalize_buf hash l{layer_idx}: {e:?}"))?;
-        } else {
-            gpu.hash_router_normalize_f32(
-                tid2eid_dev,
-                scores,
-                topk_idx_dev,
-                topk_w_dev,
-                token_id as i32,
-                n_exp as i32,
-                k as i32,
-                route_scale_override,
-            )
-            .map_err(|e| format!("hash_router_normalize hash l{layer_idx}: {e:?}"))?;
-        }
-    } else {
-        // Fallback: d2h + host gather + h2d.
-        let scores_host = gpu
-            .download_f32(scores)
-            .map_err(|e| format!("d2h scores hash l{layer_idx}: {e:?}"))?;
-        let topk_ids: Vec<u32> = layer.tid2eid_host[row..row + k]
-            .iter()
-            .map(|&i| i.min((n_exp - 1) as u32))
-            .collect();
-        let wts = match gather_normalized_weights(&scores_host, &topk_ids) {
-            Some(w) => w,
-            None => return Ok(()),
-        };
-        let idx_i32: Vec<i32> = topk_ids.iter().map(|&x| x as i32).collect();
-        let idx_bytes: Vec<u8> = idx_i32.iter().flat_map(|i| i.to_le_bytes()).collect();
-        gpu.memcpy_htod_auto(&topk_idx_dev.buf, &idx_bytes)
-            .map_err(|e| format!("htod topk_indices hash l{layer_idx}: {e:?}"))?;
-        let w_scaled: Vec<f32> = wts.iter().map(|&w| w * route_scale_override).collect();
-        let w_bytes: Vec<u8> = w_scaled.iter().flat_map(|w| w.to_le_bytes()).collect();
-        gpu.memcpy_htod_auto(&topk_w_dev.buf, &w_bytes)
-            .map_err(|e| format!("htod topk_weights hash l{layer_idx}: {e:?}"))?;
-    }
-
-    let gate_up_ptrs = layer.expert_gate_up_ptrs.as_ref().unwrap();
-    let w2_ptrs = layer.expert_w2_ptrs.as_ref().unwrap();
-    let gate_batch = state.moe_gate_batch.as_ref().unwrap();
-    let up_batch = state.moe_up_batch.as_ref().unwrap();
-    let rot_batch = state.moe_rot_batch.as_ref().unwrap();
-
-    gpu.deepseek4_gemv_mq2g256_lloyd_moe_gate_up_indexed(
-        gate_up_ptrs,
-        topk_idx_dev,
-        ffn_x_rot,
-        gate_batch,
-        up_batch,
-        2 * im,
-        cfg.hidden_size,
-        k_top,
-    )
-    .map_err(|e| format!("fused gate_up hash l{layer_idx}: {e:?}"))?;
-
-    gpu.deepseek4_silu_mul_clamp_f32_batched(
-        gate_batch,
-        up_batch,
-        gate_batch,
-        im,
-        k_top,
-        cfg.swiglu_limit,
-    )
-    .map_err(|e| format!("deepseek4_silu_mul_clamp batched hash l{layer_idx}: {e:?}"))?;
-    gpu.rotate_x_mq_batched(gate_batch, rot_batch, im, k_top)
-        .map_err(|e| format!("rotate batched hash l{layer_idx}: {e:?}"))?;
-
-    // EP: redirect the route-scaled accumulation into the zeroed partial
-    // (routed-only) instead of state.ffn_out (shared+routed). The down kernel
-    // accumulates `out += w_k · down_k`, so a zeroed partial yields exactly
-    // this rank's owned routed contribution.
-    let out_target = routed_out.unwrap_or(ffn_out);
-    gpu.deepseek4_gemv_mq2g256_lloyd_moe_down_residual_scaled_indexed(
-        w2_ptrs,
-        topk_idx_dev,
-        topk_w_dev,
-        rot_batch,
-        out_target,
-        cfg.hidden_size,
-        im,
-        k_top,
-    )
-    .map_err(|e| format!("fused down hash l{layer_idx}: {e:?}"))?;
 
     Ok(())
 }
@@ -6465,12 +6683,13 @@ pub struct PrefillBatchScratch {
     // ── SGLang-style scatter-grouped MoE pipeline (chunk_size ≥ 256) ──
     // Outputs of moe_scatter_fused_k8 feed gemm_mq2g256_lloyd_moe_grouped
     // _wmma_k2 and the unscatter/down-combine kernels. Sized for the
-    // worst-case `m_total_max = max_batch * K_TOP + n_exp * BLOCK_M(=16)`
-    // padded scatter layout.
+    // shared aligned worst-case `m_total_max = align16(max_batch * K_TOP
+    // + n_exp * MOE_GROUPED_BLOCK_M)` padded scatter layout (computed
+    // once via `prefill_grouped_bounds`).
     pub moe_expert_token_counts: GpuTensor, // [n_exp]      i32 (Raw)
     pub moe_expert_offsets: GpuTensor,      // [n_exp + 1]  i32 (Raw)
     pub moe_sorted_slot_index: GpuTensor,   // [m_total_max] i32 (Raw)
-    pub moe_expert_tile_ids: GpuTensor,     // [m_total_max / 16] i32 (Raw)
+    pub moe_expert_tile_ids: GpuTensor,     // [tile_count] i32 (Raw)
     pub moe_inverse_perm: GpuTensor,        // [B * K_TOP]  i32 (Raw)
     /// Output of grouped gate_up GEMM. [m_total_max × 2*mi] f32.
     pub moe_y_gate_up_grouped: GpuTensor,
@@ -6536,6 +6755,148 @@ pub struct PrefillBatchScratch {
     pub mtp_x_e_batch: GpuTensor,
 }
 
+/// Pure grouped-scratch layout for `PrefillBatchScratch`'s
+/// scatter-grouped MoE buffers (`moe_sorted_slot_index`,
+/// `moe_expert_tile_ids`, `moe_y_gate_up_grouped`, `moe_x_grouped`,
+/// `moe_y_down_grouped`). Lives here so the allocation math is
+/// verifiable without a GPU; the shared dispatch-side formula is the
+/// single source of truth and must not be re-implemented in this crate.
+///
+/// Dispatch launches the scatter/grouped kernels with this aligned
+/// `m_total_max` (see `checked_deepseek_grouped_bounds`), so the scratch
+/// must be sized from the aligned bound — the old inline raw
+/// `batch*k + n_exp*16` formula undersized it for non-aligned batches
+/// (e.g. batch 129, k 6, n_exp 8: raw 902 → aligned 912).
+fn prefill_grouped_bounds(
+    max_batch: usize,
+    k_top: usize,
+    n_experts: usize,
+) -> Result<DeepSeekGroupedBounds, String> {
+    hipfire_dispatch::families::moe::checked_deepseek_grouped_bounds(max_batch, k_top, n_experts)
+        .map_err(|e| format!("PrefillBatchScratch grouped bounds: {e}"))
+}
+
+/// Checked, pure layout for every scatter-grouped MoE owner in
+/// `PrefillBatchScratch::new`, built from the shared dispatch-side
+/// [`DeepSeekGroupedBounds`] plus the config-derived intermediate and
+/// hidden widths. The constructor derives all affected allocation shapes
+/// from this object instead of re-multiplying the grouped formula; every
+/// downstream Raw-byte / F32 element / F32 byte product is checked here so
+/// overflow surfaces as a contextual constructor error before the
+/// lower-level allocator is ever called.
+///
+/// Field naming follows the allocation sites:
+/// - Raw owners are byte-shaped (`* 4` baked in);
+/// - F32 owners keep the `[rows, cols]` shape the constructor passes to
+///   `alloc_tensor`, alongside checked element and byte counts.
+///
+/// `*_elements` / `*_bytes` are not read by the constructor (the
+/// allocator derives bytes from the `[rows, cols]` shape) — they are the
+/// checked overflow surface for the F32 owners and are asserted exactly
+/// by the colocated layout tests, so the non-test lib build sees them as
+/// dead (narrow per-field suppression below).
+#[derive(Debug)]
+struct PrefillGroupedScratchLayout {
+    /// `total_slots = batch*k_top` — element count for the F32
+    /// `moe_sorted_b` / `moe_sorted_krank` / `moe_sorted_expert` owners.
+    total_slots: usize,
+    /// Raw bytes for `moe_sorted_slot_index` (`m_total_max * 4`).
+    sorted_slot_index_bytes: usize,
+    /// Raw bytes for `moe_expert_tile_ids` (`tile_count * 4`).
+    tile_ids_bytes: usize,
+    /// Raw bytes for `moe_inverse_perm` (`total_slots * 4`).
+    inverse_perm_bytes: usize,
+    /// F32 `moe_y_gate_up_grouped` shape `[m_total_max, 2*inter]`.
+    y_gate_up_rows: usize,
+    y_gate_up_cols: usize,
+    /// Proof fields (asserted exactly by the colocated layout tests; not
+    /// read by the constructor/allocator).
+    #[cfg_attr(not(test), allow(dead_code))]
+    y_gate_up_elements: usize,
+    #[cfg_attr(not(test), allow(dead_code))]
+    y_gate_up_bytes: usize,
+    /// F32 `moe_x_grouped` shape `[m_total_max, inter]`.
+    x_grouped_rows: usize,
+    x_grouped_cols: usize,
+    #[cfg_attr(not(test), allow(dead_code))]
+    x_grouped_elements: usize,
+    #[cfg_attr(not(test), allow(dead_code))]
+    x_grouped_bytes: usize,
+    /// F32 `moe_y_down_grouped` shape `[m_total_max, hidden]`.
+    y_down_rows: usize,
+    y_down_cols: usize,
+    #[cfg_attr(not(test), allow(dead_code))]
+    y_down_elements: usize,
+    #[cfg_attr(not(test), allow(dead_code))]
+    y_down_bytes: usize,
+}
+
+impl PrefillGroupedScratchLayout {
+    /// Build the layout from the shared checked bounds plus the
+    /// config-derived `inter` (`moe_intermediate_size`) and `hidden`
+    /// (`hidden_size`) widths. Every per-owner product (Raw bytes, F32
+    /// `2*inter`, rows*cols, and `*4` bytes) is checked; the first
+    /// overflow surfaces as a contextual constructor error before the
+    /// lower-level allocator is ever called.
+    fn new(bounds: DeepSeekGroupedBounds, inter: usize, hidden: usize) -> Result<Self, String> {
+        fn ctx(product: &'static str) -> impl Fn() -> String {
+            move || format!("PrefillBatchScratch grouped layout: {product} overflow")
+        }
+        let sorted_slot_index_bytes = bounds
+            .m_total_max
+            .checked_mul(4)
+            .ok_or_else(ctx("sorted_slot_index bytes"))?;
+        let tile_ids_bytes = bounds
+            .tile_count
+            .checked_mul(4)
+            .ok_or_else(ctx("expert_tile_ids bytes"))?;
+        let inverse_perm_bytes = bounds
+            .total_slots
+            .checked_mul(4)
+            .ok_or_else(ctx("inverse_perm bytes"))?;
+        let y_gate_up_cols = inter.checked_mul(2).ok_or_else(ctx("y_gate_up 2*inter"))?;
+        let y_gate_up_elements = bounds
+            .m_total_max
+            .checked_mul(y_gate_up_cols)
+            .ok_or_else(ctx("y_gate_up elements"))?;
+        let y_gate_up_bytes = y_gate_up_elements
+            .checked_mul(4)
+            .ok_or_else(ctx("y_gate_up bytes"))?;
+        let x_grouped_elements = bounds
+            .m_total_max
+            .checked_mul(inter)
+            .ok_or_else(ctx("x_grouped elements"))?;
+        let x_grouped_bytes = x_grouped_elements
+            .checked_mul(4)
+            .ok_or_else(ctx("x_grouped bytes"))?;
+        let y_down_elements = bounds
+            .m_total_max
+            .checked_mul(hidden)
+            .ok_or_else(ctx("y_down elements"))?;
+        let y_down_bytes = y_down_elements
+            .checked_mul(4)
+            .ok_or_else(ctx("y_down bytes"))?;
+        Ok(Self {
+            total_slots: bounds.total_slots,
+            sorted_slot_index_bytes,
+            tile_ids_bytes,
+            inverse_perm_bytes,
+            y_gate_up_rows: bounds.m_total_max,
+            y_gate_up_cols,
+            y_gate_up_elements,
+            y_gate_up_bytes,
+            x_grouped_rows: bounds.m_total_max,
+            x_grouped_cols: inter,
+            x_grouped_elements,
+            x_grouped_bytes,
+            y_down_rows: bounds.m_total_max,
+            y_down_cols: hidden,
+            y_down_elements,
+            y_down_bytes,
+        })
+    }
+}
+
 impl PrefillBatchScratch {
     /// Allocate scratch for prefill chunks of up to `max_batch` tokens.
     /// Sizes track the DeepSeek V4 config's hidden_size / q_lora_rank /
@@ -6555,6 +6916,16 @@ impl PrefillBatchScratch {
             gpu.zeros(shape, DType::F32)
                 .map_err(|e| format!("PrefillBatchScratch zeros {label}: {e:?}"))
         };
+
+        // Shared aligned grouped bound, computed exactly once: every
+        // scatter-grouped MoE owner below derives from it (m_total_max /
+        // tile_count), matching the dispatch-side launch geometry. The
+        // typed layout validates every per-owner byte/shape product BEFORE
+        // any allocation starts — including the q_head_ones upload below
+        // (a misshapen layout must fail before any GPU work).
+        let bounds =
+            prefill_grouped_bounds(max_batch, cfg.num_experts_per_tok, cfg.n_routed_experts)?;
+        let layout = PrefillGroupedScratchLayout::new(bounds, cfg.moe_intermediate_size, hidden)?;
 
         let ones_host = vec![1.0f32; head_dim];
         let q_head_ones = gpu
@@ -6698,23 +7069,20 @@ impl PrefillBatchScratch {
                 &[max_batch, 2 * cfg.index_head_dim],
                 "comp_idx_score_batch",
             )?,
-            // Scatter-by-expert MoE sort scratch.
-            moe_sorted_b: alloc(gpu, &[max_batch * cfg.num_experts_per_tok], "moe_sorted_b")?,
-            moe_sorted_krank: alloc(
-                gpu,
-                &[max_batch * cfg.num_experts_per_tok],
-                "moe_sorted_krank",
-            )?,
-            moe_sorted_expert: alloc(
-                gpu,
-                &[max_batch * cfg.num_experts_per_tok],
-                "moe_sorted_expert",
-            )?,
+            // Scatter-by-expert MoE sort scratch. The three sorted arrays
+            // hold one entry per routed (token, krank) pair — exactly the
+            // checked `total_slots` from the shared grouped bound.
+            moe_sorted_b: alloc(gpu, &[layout.total_slots], "moe_sorted_b")?,
+            moe_sorted_krank: alloc(gpu, &[layout.total_slots], "moe_sorted_krank")?,
+            moe_sorted_expert: alloc(gpu, &[layout.total_slots], "moe_sorted_expert")?,
             moe_expert_starts: alloc(gpu, &[cfg.n_routed_experts + 1], "moe_expert_starts")?,
             // SGLang-style scatter-grouped MoE pipeline (chunk_size ≥ 256 only).
-            // Sized for the worst-case `m_total_max = B*K_TOP + n_exp*BLOCK_M`
-            // padded layout. All i32 buffers stored as Raw so byte-counts
-            // match the kernels (which read int32 indices).
+            // Sized for the shared aligned bound `m_total_max = align16(
+            // batch*k_top + n_exp*16)` — dispatch launches the scatter and
+            // grouped GEMMs with this aligned m_total_max, so the scratch must
+            // match (the old inline raw formula undersized non-aligned batches
+            // by up to 15 rows / 1 tile). All i32 buffers stored as Raw so
+            // byte-counts match the kernels (which read int32 indices).
             moe_expert_token_counts: {
                 let n = cfg.n_routed_experts;
                 gpu.zeros(&[n * 4], DType::Raw)
@@ -6726,51 +7094,32 @@ impl PrefillBatchScratch {
                     .map_err(|e| format!("alloc moe_expert_offsets: {e:?}"))?
             },
             moe_sorted_slot_index: {
-                let block_m = 16;
-                let m_total_max =
-                    max_batch * cfg.num_experts_per_tok + cfg.n_routed_experts * block_m;
-                gpu.zeros(&[m_total_max * 4], DType::Raw)
+                gpu.zeros(&[layout.sorted_slot_index_bytes], DType::Raw)
                     .map_err(|e| format!("alloc moe_sorted_slot_index: {e:?}"))?
             },
             moe_expert_tile_ids: {
-                let block_m = 16;
-                let m_total_max =
-                    max_batch * cfg.num_experts_per_tok + cfg.n_routed_experts * block_m;
-                let n_tiles = m_total_max / block_m;
-                gpu.zeros(&[n_tiles * 4], DType::Raw)
+                gpu.zeros(&[layout.tile_ids_bytes], DType::Raw)
                     .map_err(|e| format!("alloc moe_expert_tile_ids: {e:?}"))?
             },
             moe_inverse_perm: {
-                let n = max_batch * cfg.num_experts_per_tok;
-                gpu.zeros(&[n * 4], DType::Raw)
+                gpu.zeros(&[layout.inverse_perm_bytes], DType::Raw)
                     .map_err(|e| format!("alloc moe_inverse_perm: {e:?}"))?
             },
-            moe_y_gate_up_grouped: {
-                let block_m = 16;
-                let m_total_max =
-                    max_batch * cfg.num_experts_per_tok + cfg.n_routed_experts * block_m;
-                alloc(
-                    gpu,
-                    &[m_total_max, 2 * cfg.moe_intermediate_size],
-                    "moe_y_gate_up_grouped",
-                )?
-            },
-            moe_x_grouped: {
-                let block_m = 16;
-                let m_total_max =
-                    max_batch * cfg.num_experts_per_tok + cfg.n_routed_experts * block_m;
-                alloc(
-                    gpu,
-                    &[m_total_max, cfg.moe_intermediate_size],
-                    "moe_x_grouped",
-                )?
-            },
-            moe_y_down_grouped: {
-                let block_m = 16;
-                let m_total_max =
-                    max_batch * cfg.num_experts_per_tok + cfg.n_routed_experts * block_m;
-                alloc(gpu, &[m_total_max, hidden], "moe_y_down_grouped")?
-            },
+            moe_y_gate_up_grouped: alloc(
+                gpu,
+                &[layout.y_gate_up_rows, layout.y_gate_up_cols],
+                "moe_y_gate_up_grouped",
+            )?,
+            moe_x_grouped: alloc(
+                gpu,
+                &[layout.x_grouped_rows, layout.x_grouped_cols],
+                "moe_x_grouped",
+            )?,
+            moe_y_down_grouped: alloc(
+                gpu,
+                &[layout.y_down_rows, layout.y_down_cols],
+                "moe_y_down_grouped",
+            )?,
             // F16 staging buffers: 2 bytes per element. Allocate as Raw
             // with byte-count shape so DType::size() == 1 stays consistent.
             tmp_batch_f16: {
@@ -8264,9 +8613,8 @@ fn ffn_batched(
     // Routed MoE consumes ffn_x_rot_batch (MQ2-Lloyd → needs FWHT), so keep
     // the gate/up rotation alive when MoE is on. Down rotation only feeds
     // shared_w2 — gate purely on shared_w2 dtype.
-    let moe_will_run = env_cache::moe_on();
     let gate_up_need_fwht =
-        moe_will_run || weight_needs_fwht(shared_w1) || weight_needs_fwht(shared_w3);
+        env_cache::moe_on() || weight_needs_fwht(shared_w1) || weight_needs_fwht(shared_w3);
     let down_needs_fwht = weight_needs_fwht(shared_w2);
 
     // 1. RMSNorm (+ optional FWHT). Fused variant writes BOTH rot and
@@ -8477,6 +8825,18 @@ fn ffn_batched(
 /// Returns the logits at the last position. Caller is responsible for
 /// any sampler integration.
 #[allow(dead_code)]
+/// Last-batch-position HC stream slice of the batched scratch (CPU-testable
+/// seam consumed by the batched-TP final-chunk MTP capture and mirroring the
+/// scalar `final_norm_and_head_last_batched` offset math): returns the flat
+/// element offset of the last position's `[hc_mult, hidden]` stream block
+/// and the full stream length (`hc_mult·hidden`). Precondition: `take >= 1`
+/// (the caller rejects empty token slices before the chunk loop).
+fn ds4_last_batch_stream_slice(take: usize, hc_mult: usize, hidden: usize) -> (usize, usize) {
+    let stream_len = hc_mult * hidden;
+    let offset = (take - 1) * stream_len;
+    (offset, stream_len)
+}
+
 pub fn final_norm_and_head_last_batched(
     cfg: &DeepseekV4Config,
     weights: &DeepseekV4Weights,
@@ -9759,17 +10119,21 @@ pub fn forward_prefill_batch_chunked(
 /// attention block — mirrors `forward_prefill_batch_chunk`'s `state` arg.
 ///
 /// The caller builds the `mesh` (a pure Tp axis of `n_ranks` ranks) once
-/// before the chunk loop and passes it here.
+/// before the chunk loop and passes it here. `authority` is the MoE
+/// authority state acquired ONCE by `forward_prefill_batch_tp` for the whole
+/// prefill (the batched routed decision derives from it — never rereads the
+/// enable switch).
 #[allow(clippy::too_many_arguments)]
 fn forward_prefill_batch_chunk_tp(
     gpus: &mut hipfire_runtime::multi_gpu::Gpus,
+    authority: MoeAuthority<'_>,
     weights_per_rank: &[DeepseekV4Weights],
     cfg: &DeepseekV4Config,
     state_per_rank: &mut [DeepseekV4State],
     pbs_per_rank: &mut [PrefillBatchScratch],
     partials_i64_per_rank: &[GpuTensor],
     partials_per_rank: &[GpuTensor],
-    mesh: &hipfire_runtime::multi_gpu::DeviceMesh,
+    policy: &hipfire_runtime::moe_plan::MoEExecutionPolicy,
     tokens: &[u32],
     start_pos: u32,
 ) -> Result<(), String> {
@@ -9933,12 +10297,13 @@ fn forward_prefill_batch_chunk_tp(
         // Called ONCE across all ranks (multi-rank function).
         ds4_prefill_moe_step_tp(
             gpus,
+            authority,
             weights_per_rank,
             cfg,
             pbs_per_rank,
             partials_i64_per_rank,
             partials_per_rank,
-            mesh,
+            policy,
             layer_idx,
             hash_routing,
             n,
@@ -9977,16 +10342,22 @@ pub fn forward_prefill_batch_tp(
     pbs_per_rank: &mut [PrefillBatchScratch],
     partials_i64_per_rank: &[GpuTensor],
     partials_per_rank: &[GpuTensor],
+    policy: &hipfire_runtime::moe_plan::MoEExecutionPolicy,
     tokens: &[u32],
     start_pos: u32,
 ) -> Result<Vec<f32>, String> {
-    use hipfire_runtime::multi_gpu::{DeviceMesh, DimKind};
-
     if tokens.is_empty() {
         return Err("forward_prefill_batch_tp: empty tokens".to_string());
     }
 
     let n_ranks = gpus.devices.len();
+    // Policy validation BEFORE any GPU work: exact Tp kind + mesh/epoch
+    // binding of these Gpus — enforced even when MoE is disabled.
+    validate_mesh_entry_policy(
+        gpus,
+        policy,
+        hipfire_runtime::moe_plan::MoEExecutionKind::Tp,
+    )?;
     assert_eq!(
         weights_per_rank.len(),
         n_ranks,
@@ -10013,9 +10384,16 @@ pub fn forward_prefill_batch_tp(
         "forward_prefill_batch_tp: partials_i64_per_rank len"
     );
 
-    // Build Tp mesh once — pure Tp axis of n_ranks ranks. Reused across chunks.
-    let tp_mesh = DeviceMesh::rect(&[(DimKind::Tp, n_ranks)]);
-
+    // The caller's policy owns the mesh (a pure Tp axis of n_ranks ranks);
+    // the same mesh is reused across chunks.
+    //
+    // MoE authority: acquired EXACTLY ONCE for this whole prefill forward,
+    // before any chunk/layer work, under the exact caller/loader-owned
+    // policy and the SINGLE enable snapshot (the same value decides the
+    // routed work in the chunk/step — never reread). Per-layer plan
+    // borrowing in the chunk step is zero-allocation.
+    let moe_on = env_cache::moe_on();
+    let authority = acquire_moe_authority_mesh(weights_per_rank, cfg, policy, moe_on)?;
     let max_batch = pbs_per_rank[0].max_batch;
     let mut pos_cursor = start_pos as usize;
     let mut remaining = tokens;
@@ -10028,13 +10406,14 @@ pub fn forward_prefill_batch_tp(
 
         forward_prefill_batch_chunk_tp(
             gpus,
+            authority,
             weights_per_rank,
             cfg,
             state_per_rank,
             pbs_per_rank,
             partials_i64_per_rank,
             partials_per_rank,
-            &tp_mesh,
+            policy,
             chunk,
             pos_cursor as u32,
         )?;
@@ -10053,6 +10432,41 @@ pub fn forward_prefill_batch_tp(
                 &mut gpus.devices[0],
                 take,
             )?;
+            // MTP chaining contract (matches the scalar forward's durable
+            // side effect): every rank publishes the LAST batch position's
+            // full `[hc_mult, hidden]` HC hidden into
+            // `state.mtp_last_hidden`, regardless of whether the caller
+            // immediately requests MTP. Rank 0 was already captured by
+            // `final_norm_and_head_last_batched` (it aliases rank0 scratch
+            // into the scalar capture path); nonzero ranks capture directly
+            // from `pbs.streams_batch` — the batched scratch outlives this
+            // point, so the copies are safe before it is freed/returned.
+            let (last_offset, stream_len) =
+                ds4_last_batch_stream_slice(take, cfg.hc_mult, cfg.hidden_size);
+            for r in 1..n_ranks {
+                gpus.devices[r]
+                    .bind_thread()
+                    .map_err(|e| format!("prefill_tp mtp_capture bind r{r}: {e:?}"))?;
+                let pbs = &pbs_per_rank[r];
+                let s = &mut state_per_rank[r];
+                let need_realloc = s
+                    .mtp_last_hidden
+                    .as_ref()
+                    .map(|t| t.numel() != stream_len)
+                    .unwrap_or(true);
+                if need_realloc {
+                    s.mtp_last_hidden = Some(
+                        gpus.devices[r]
+                            .alloc_tensor(&[cfg.hc_mult, cfg.hidden_size], DType::F32)
+                            .map_err(|e| format!("alloc mtp_last_hidden r{r}: {e:?}"))?,
+                    );
+                }
+                let src = pbs.streams_batch.sub_offset(last_offset, stream_len);
+                let dst = s.mtp_last_hidden.as_ref().unwrap();
+                gpus.devices[r]
+                    .memcpy_dtod_auto(&dst.buf, &src.buf, stream_len * 4)
+                    .map_err(|e| format!("capture full HC → mtp_last_hidden r{r}: {e:?}"))?;
+            }
         }
 
         pos_cursor += take;
@@ -10247,8 +10661,8 @@ pub fn prefill_with_mtp_fill_abortable(
                 final_norm_and_head_last_batched(cfg, weights, state, pbs, gpu, chunk_size)?;
             if abort() {
                 return Ok(None);
+            }
         }
-    }
     }
     if abort() {
         Ok(None)
@@ -11700,6 +12114,117 @@ fn bias_aware_topk_weights(scores: &[f32], bias: &[f32], k: usize) -> Option<(Ve
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hipfire_dispatch::families::moe::MOE_GROUPED_BLOCK_M;
+
+    #[test]
+    fn grouped_bounds_batch129_k6_n_exp8_requires_alignment() {
+        // Current (pre-alignment) layout: raw = 129*6 + 8*16 = 902, not
+        // 16-aligned; tiles = 902/16 = 56 (floor). The shared dispatch-side
+        // bound aligns up to 912 / 57 tiles — the raw layout undersizes the
+        // scatter outputs and grouped GEMM rows for non-aligned batches.
+        let old_raw = 129 * 6 + 8 * 16;
+        let old_tiles = old_raw / 16;
+        assert_eq!((old_raw, old_tiles), (902, 56));
+        assert_ne!(old_raw % MOE_GROUPED_BLOCK_M, 0);
+
+        let bounds = prefill_grouped_bounds(129, 6, 8).unwrap();
+        assert_eq!(bounds.total_slots, 774);
+        assert_eq!(
+            bounds.m_total_max, 912,
+            "aligned m_total_max must exceed raw 902"
+        );
+        assert_eq!(
+            bounds.tile_count, 57,
+            "aligned tile count must exceed floor 56"
+        );
+        assert_eq!(bounds.m_total_max % MOE_GROUPED_BLOCK_M, 0);
+        assert!(bounds.m_total_max > old_raw);
+        assert!(bounds.tile_count > old_tiles);
+    }
+
+    #[test]
+    fn grouped_layout_batch129_k6_n_exp8_exact_fields() {
+        // Exact byte/shape fields of the production layout seam for the
+        // canonical non-aligned geometry (inter/hidden mirror the config
+        // widths the constructor passes in). All values are literals —
+        // no expected formulas are reconstructed here.
+        let layout =
+            PrefillGroupedScratchLayout::new(prefill_grouped_bounds(129, 6, 8).unwrap(), 512, 4096)
+                .unwrap();
+        // Raw owners (byte-shaped): 912 aligned rows / 57 tiles / 774 slots.
+        assert_eq!(layout.total_slots, 774);
+        assert_eq!(layout.sorted_slot_index_bytes, 3648); // 912 * 4
+        assert_eq!(layout.tile_ids_bytes, 228); // 57 * 4
+        assert_eq!(layout.inverse_perm_bytes, 3096); // 774 * 4
+        assert_eq!(layout.y_gate_up_rows, 912); // y_gate_up: [912, 2*512] (F32)
+        assert_eq!(layout.y_gate_up_cols, 1024);
+        assert_eq!(layout.y_gate_up_elements, 933_888); // 912 * 1024
+        assert_eq!(layout.y_gate_up_bytes, 3_735_552); // 933888 * 4
+        assert_eq!(layout.x_grouped_rows, 912); // x_grouped: [912, 512] (F32)
+        assert_eq!(layout.x_grouped_cols, 512);
+        assert_eq!(layout.x_grouped_elements, 466_944); // 912 * 512
+        assert_eq!(layout.x_grouped_bytes, 1_867_776); // 466944 * 4
+        assert_eq!(layout.y_down_rows, 912); // y_down: [912, 4096] (F32)
+        assert_eq!(layout.y_down_cols, 4096);
+        assert_eq!(layout.y_down_elements, 3_735_552); // 912 * 4096
+        assert_eq!(layout.y_down_bytes, 14_942_208); // 3735552 * 4
+    }
+
+    #[test]
+    fn grouped_layout_already_aligned_batch128_exact_fields() {
+        // batch 128, k 6, n_exp 8: raw = 768 + 128 = 896, already
+        // 16-aligned (896/16 = 56 tiles). Pins that the shared bound is a
+        // no-op for aligned geometries — old and new layouts agree here.
+        let layout =
+            PrefillGroupedScratchLayout::new(prefill_grouped_bounds(128, 6, 8).unwrap(), 512, 4096)
+                .unwrap();
+        assert_eq!(layout.total_slots, 768);
+        assert_eq!(layout.sorted_slot_index_bytes, 3584); // 896 * 4
+        assert_eq!(layout.tile_ids_bytes, 224); // 56 * 4
+        assert_eq!(layout.inverse_perm_bytes, 3072); // 768 * 4
+        assert_eq!(layout.y_gate_up_rows, 896);
+        assert_eq!(layout.y_gate_up_cols, 1024);
+        assert_eq!(layout.y_gate_up_elements, 917_504); // 896 * 1024
+        assert_eq!(layout.y_gate_up_bytes, 3_670_016);
+        assert_eq!(layout.x_grouped_rows, 896);
+        assert_eq!(layout.x_grouped_elements, 458_752); // 896 * 512
+        assert_eq!(layout.x_grouped_bytes, 1_835_008);
+        assert_eq!(layout.y_down_rows, 896);
+        assert_eq!(layout.y_down_elements, 3_670_016); // 896 * 4096
+        assert_eq!(layout.y_down_bytes, 14_680_064);
+    }
+
+    #[test]
+    fn grouped_layout_rejects_byte_product_overflow_after_successful_bounds() {
+        // Geometry where the shared bounds helper SUCCEEDS (batch*k = MAX/4,
+        // pad 16, align up to MAX/4 + 17 — all checked, no overflow) but the
+        // per-owner Raw byte product m_total_max*4 (sorted_slot_index)
+        // overflows usize. The typed layout must reject this with a
+        // contextual constructor error instead of the old unchecked
+        // products' debug panic / release wrap.
+        let batch = usize::MAX / 4;
+        let bounds = prefill_grouped_bounds(batch, 1, 1).unwrap();
+        assert_eq!(bounds.total_slots, usize::MAX / 4);
+        assert!(
+            bounds.m_total_max.checked_mul(4).is_none(),
+            "precondition: m_total_max*4 must overflow"
+        );
+        let err = PrefillGroupedScratchLayout::new(bounds, 512, 4096).unwrap_err();
+        assert!(
+            err.contains("PrefillBatchScratch grouped layout: sorted_slot_index bytes overflow"),
+            "exact contextual overflow error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn grouped_bounds_propagates_shared_overflow() {
+        // Overflow in any product/add/align-up fails closed through the
+        // seam instead of wrapping (as `PrefillBatchScratch::new` would see
+        // it via `?`).
+        assert!(prefill_grouped_bounds(usize::MAX, 2, 8).is_err()); // batch*k overflows
+        assert!(prefill_grouped_bounds(usize::MAX - 8, 1, 8).is_err()); // slots+pad overflows
+        assert!(prefill_grouped_bounds(4, 1, usize::MAX).is_err()); // n_exp*16 overflows
+    }
 
     #[test]
     fn bias_aware_topk_picks_biased_indices() {
@@ -11784,5 +12309,24 @@ mod tests {
         // sum = 2 + 0 = 2 → normalized [1.0, 0.0]
         assert!((wts[0] - 1.0).abs() < 1e-6);
         assert!((wts[1] - 0.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn ds4_last_batch_stream_slice_offsets() {
+        // The batched-TP final-chunk MTP capture slices the LAST batch
+        // position's `[hc_mult, hidden]` stream block out of
+        // `pbs.streams_batch`: flat offset `(take-1)·hc_mult·hidden`, full
+        // stream length `hc_mult·hidden` (mirrors the scalar
+        // `final_norm_and_head_last_batched` math).
+        assert_eq!(super::ds4_last_batch_stream_slice(3, 4, 64), (512, 256));
+        assert_eq!(super::ds4_last_batch_stream_slice(1, 4, 64), (0, 256));
+        assert_eq!(super::ds4_last_batch_stream_slice(2, 1, 128), (128, 128));
+        // hc_mult·hidden arithmetic matches the scalar head-input slice used
+        // by the rank-0 capture path.
+        for (take, hc_mult, hidden) in [(5usize, 4usize, 4096usize), (1, 1, 1), (8, 2, 512)] {
+            let (off, len) = super::ds4_last_batch_stream_slice(take, hc_mult, hidden);
+            assert_eq!(len, hc_mult * hidden);
+            assert_eq!(off, (take - 1) * hc_mult * hidden);
+        }
     }
 }

@@ -351,37 +351,62 @@ impl Gpus {
         })
     }
 
-    /// Build a `Gpus` from a resolved single-axis [`DeviceMesh`], delegating to
-    /// the existing per-axis primitive so the resulting layer layout is
+    /// Build a `Gpus` from a resolved [`DeviceMesh`], delegating to the
+    /// existing per-axis primitive so the resulting layer layout is
     /// byte-identical to the pre-mesh loader paths:
     /// - `Ep` axis → [`init_tp`] (every device runs every layer, MoE experts sharded)
     /// - `Tp` axis → [`init_uniform`] (matches today's `TpModel::load`; TP bands are
     ///   vestigial but preserved)
     /// - `Pp` axis → [`init_uniform`] (uniform layer bands across stages)
     ///
-    /// Only invoked for multi-device meshes on the loader path. A single-device
-    /// (1×1) mesh never reaches here — the daemon's single-GPU branch keeps its
-    /// bare `Gpu` + `load_model`. Precedence `Ep > Tp > Pp` matches the daemon
-    /// routing chain; the daemon guarantees at most one axis is >1, so the order
-    /// only fixes a convention.
+    /// The axis is selected by **explicit presence** (the mesh declares the
+    /// axis, any size ≥ 1), not by [`DeviceMesh::has_axis`] (which means
+    /// size > 1): explicit named rank-one meshes for `Tp=1`, `Ep=1`, and
+    /// `Pp=1` bind as single-device `Gpus`. Axis-less
+    /// [`DeviceMesh::single()`](DeviceMesh::single) remains rejected — the
+    /// daemon's single-GPU branch keeps its bare `Gpu` + `load_model`, so a
+    /// 1×1 mesh never reaches here. Precedence `Ep > Tp > Pp` matches the
+    /// daemon routing chain; the daemon guarantees at most one axis is >1,
+    /// so the order only fixes a convention.
+    ///
+    /// The presence-selected degree is validated against
+    /// [`mesh.n_devices()`](DeviceMesh::n_devices) BEFORE any device
+    /// construction: a topology mismatch fails closed with the
+    /// mesh-count error without touching HIP/VRAM (`init_tp` /
+    /// `init_uniform` run only after the validation passes).
     ///
     /// Binds [`mesh.epoch()`](DeviceMesh::epoch) and issues a distinct
     /// [`WeightPoolEpoch`] for each logical rank.
     pub fn from_mesh(mesh: &DeviceMesh, n_layers: usize) -> HipResult<Self> {
-        let mut gpus = if mesh.has_axis(DimKind::Ep) {
-            Self::init_tp(mesh.size_of(DimKind::Ep), n_layers)?
-        } else if mesh.has_axis(DimKind::Tp) {
-            Self::init_uniform(mesh.size_of(DimKind::Tp), n_layers)?
-        } else if mesh.has_axis(DimKind::Pp) {
-            Self::init_uniform(mesh.size_of(DimKind::Pp), n_layers)?
+        // Presence-selected degree (precedence Ep > Tp > Pp). Pure — no
+        // HIP/device/VRAM work happens before the validation below.
+        let ep = mesh.axes().iter().any(|a| a.kind == DimKind::Ep);
+        let degree = if ep {
+            mesh.size_of(DimKind::Ep)
+        } else if mesh.axes().iter().any(|a| a.kind == DimKind::Tp) {
+            mesh.size_of(DimKind::Tp)
+        } else if mesh.axes().iter().any(|a| a.kind == DimKind::Pp) {
+            mesh.size_of(DimKind::Pp)
         } else {
             return Err(HipError::new(
                 0,
-                "from_mesh: single-device (1×1) mesh has no multi-device axis; \
+                "from_mesh: axis-less (1×1) mesh has no named Tp/Ep/Pp axis; \
                  use Gpus::single / load_model for the single-GPU path",
             ));
         };
-        Self::validate_mesh_device_count(mesh, gpus.devices.len())?;
+
+        // Fail closed before device construction: a mesh whose declared
+        // device count does not match the presence-selected degree is
+        // rejected here, before any `init_tp` / `init_uniform` runs.
+        Self::validate_mesh_device_count(mesh, degree)?;
+
+        let mut gpus = if ep {
+            Self::init_tp(degree, n_layers)?
+        } else {
+            // Tp and Pp both delegate to init_uniform; an axis-less mesh
+            // was already rejected above.
+            Self::init_uniform(degree, n_layers)?
+        };
         gpus.mesh_epoch = Some(mesh.epoch());
         Ok(gpus)
     }
@@ -972,18 +997,20 @@ impl Gpus {
         }
     }
 
-    /// Validate that `mesh.n_devices()` matches the number of constructed
-    /// GPU devices (`devices_len`).  Must be called after the per-axis
-    /// primitive has been dispatched but before binding mesh/pool identities.
-    fn validate_mesh_device_count(mesh: &DeviceMesh, devices_len: usize) -> HipResult<()> {
+    /// Validate that `mesh.n_devices()` matches the presence-selected
+    /// degree (`selected_degree`) computed by [`Gpus::from_mesh`] BEFORE
+    /// any device construction: `init_tp` / `init_uniform` run only after
+    /// this passes, so a topology mismatch fails closed without touching
+    /// HIP/VRAM. The mesh epoch is bound only after construction.
+    fn validate_mesh_device_count(mesh: &DeviceMesh, selected_degree: usize) -> HipResult<()> {
         let mesh_n = mesh.n_devices();
-        if mesh_n != devices_len {
+        if mesh_n != selected_degree {
             return Err(HipError::new(
                 0,
                 &format!(
-                    "from_mesh: mesh has {mesh_n} device{} but Gpus has {devices_len} device{}",
+                    "from_mesh: mesh has {mesh_n} device{} but Gpus has {selected_degree} device{}",
                     if mesh_n == 1 { "" } else { "s" },
-                    if devices_len == 1 { "" } else { "s" },
+                    if selected_degree == 1 { "" } else { "s" },
                 ),
             ));
         }
@@ -1274,6 +1301,269 @@ mod tests {
             msg.contains("mesh has 4 devices but Gpus has 2 devices"),
             "error message: {msg}",
         );
+    }
+
+    // ── Gpus::from_mesh — explicit rank-one axis binding (Lane H) ──────
+    //
+    // `from_mesh` selects the Tp/Ep/Pp axis by explicit axis presence, so
+    // explicit named rank-one meshes (`Tp=1`, `Ep=1`, `Pp=1`) bind, while
+    // the axis-less `DeviceMesh::single()` stays rejected. The binding is
+    // observable via `weight_origin`: the returned `WeightAllocationOrigin`
+    // carries the bound mesh epoch and the logical rank ordering.
+    //
+    // The rank-one cases construct exactly one real GPU and therefore follow
+    // the crate's `#[ignore = "requires ROCm GPU"]` convention. The axis-less
+    // rejection happens before any HIP device construction and is pure.
+
+    /// Axis-less `DeviceMesh::single()` remains rejected — pure, no GPU.
+    #[test]
+    fn from_mesh_rejects_axis_less_single_mesh() {
+        let mesh = DeviceMesh::single();
+        let err = match Gpus::from_mesh(&mesh, 24) {
+            Err(e) => e,
+            Ok(_) => panic!("axis-less single mesh must be rejected"),
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("axis") && msg.contains("single"),
+            "expected axis-less single rejection, got: {msg}",
+        );
+    }
+
+    /// Serializes tests that mutate `HIPFIRE_EMULATE_GPUS` /
+    /// `HIPFIRE_DEVICES` (same pattern as
+    /// `hipfire_runtime::config::tests::ENV_LOCK`).
+    static EMULATE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// RAII guard for an env var: captures `var_os` before setting,
+    /// restores that exact prior value on drop, and removes the var only
+    /// when it was initially absent — even when an assertion panics.
+    struct EnvVarGuard {
+        key: &'static str,
+        prior: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let prior = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, prior }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.prior {
+                Some(prior) => std::env::set_var(self.key, prior),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
+    /// Shared assertion: the mesh epoch is bound, the logical rank ordering
+    /// is preserved, and the physical device id comes from the live Gpu.
+    fn assert_bound_origin(gpus: &Gpus, mesh: &DeviceMesh, rank: usize) {
+        let origin = gpus.weight_origin(rank).expect("bound mesh + valid rank");
+        assert_eq!(origin.mesh_epoch(), mesh.epoch());
+        assert_eq!(origin.logical_rank(), rank);
+        assert_eq!(origin.physical_device(), gpus.devices[rank].device_id);
+    }
+
+    /// Explicit named rank-one `Tp=1` mesh binds (axis presence, not
+    /// `has_axis()` size>1) with the mesh epoch attached.
+    #[test]
+    #[ignore = "requires ROCm GPU"]
+    fn from_mesh_binds_explicit_rank_one_tp_mesh() {
+        let mesh = DeviceMesh::rect(&[(DimKind::Tp, 1)]);
+        let gpus = Gpus::from_mesh(&mesh, 24).expect("Tp=1 mesh must bind");
+        assert_eq!(gpus.devices.len(), 1);
+        assert_eq!(gpus.layer_to_device, vec![0u8; 24]);
+        assert_bound_origin(&gpus, &mesh, 0);
+    }
+
+    /// Explicit named rank-one `Ep=1` mesh binds with the mesh epoch
+    /// attached.
+    #[test]
+    #[ignore = "requires ROCm GPU"]
+    fn from_mesh_binds_explicit_rank_one_ep_mesh() {
+        let mesh = DeviceMesh::rect(&[(DimKind::Ep, 1)]);
+        let gpus = Gpus::from_mesh(&mesh, 24).expect("Ep=1 mesh must bind");
+        assert_eq!(gpus.devices.len(), 1);
+        assert_eq!(gpus.layer_to_device, vec![0u8; 24]);
+        assert_bound_origin(&gpus, &mesh, 0);
+    }
+
+    /// Explicit named rank-one `Pp=1` mesh binds with the mesh epoch
+    /// attached.
+    #[test]
+    #[ignore = "requires ROCm GPU"]
+    fn from_mesh_binds_explicit_rank_one_pp_mesh() {
+        let mesh = DeviceMesh::rect(&[(DimKind::Pp, 1)]);
+        let gpus = Gpus::from_mesh(&mesh, 24).expect("Pp=1 mesh must bind");
+        assert_eq!(gpus.devices.len(), 1);
+        assert_eq!(gpus.layer_to_device, vec![0u8; 24]);
+        assert_bound_origin(&gpus, &mesh, 0);
+    }
+
+    /// Rank>1 behavior is unchanged: a `Tp=2` mesh still binds via
+    /// `init_uniform` (uniform layer bands), with the mesh epoch attached
+    /// and logical ranks 0/1 preserved. Emulated onto one physical GPU.
+    #[test]
+    #[ignore = "requires ROCm GPU"]
+    fn from_mesh_rank_two_tp_binds_epoch_and_uniform_layout() {
+        let _lock = EMULATE_ENV_LOCK.lock().unwrap();
+        let _guard = EnvVarGuard::set("HIPFIRE_EMULATE_GPUS", "2");
+        let mesh = DeviceMesh::rect(&[(DimKind::Tp, 2)]);
+        let gpus = Gpus::from_mesh(&mesh, 24).expect("Tp=2 mesh must bind");
+        assert_eq!(gpus.devices.len(), 2);
+        // init_uniform split: 12 layers per band.
+        assert_eq!(gpus.band_starts, vec![0, 12]);
+        let mut expected = vec![0u8; 12];
+        expected.extend(vec![1u8; 12]);
+        assert_eq!(gpus.layer_to_device, expected);
+        assert_bound_origin(&gpus, &mesh, 0);
+        assert_bound_origin(&gpus, &mesh, 1);
+    }
+
+    /// Rank>1 behavior is unchanged: an `Ep=2` mesh still delegates to
+    /// `init_tp` (every device runs every layer). Emulated onto one
+    /// physical GPU.
+    #[test]
+    #[ignore = "requires ROCm GPU"]
+    fn from_mesh_rank_two_ep_delegates_to_init_tp_layout() {
+        let _lock = EMULATE_ENV_LOCK.lock().unwrap();
+        let _guard = EnvVarGuard::set("HIPFIRE_EMULATE_GPUS", "2");
+        let mesh = DeviceMesh::rect(&[(DimKind::Ep, 2)]);
+        let gpus = Gpus::from_mesh(&mesh, 24).expect("Ep=2 mesh must bind");
+        assert_eq!(gpus.devices.len(), 2);
+        // init_tp: every device owns every layer; bands ≥1 are empty.
+        assert_eq!(gpus.band_starts, vec![0, 24]);
+        assert_eq!(gpus.layer_to_device, vec![0u8; 24]);
+        assert_bound_origin(&gpus, &mesh, 0);
+        assert_bound_origin(&gpus, &mesh, 1);
+    }
+
+    /// Presence precedence is fail-closed through the public entry point:
+    /// a composed `Ep=1, Tp=2` mesh selects the **Ep** axis (Ep wins over
+    /// Tp) with degree 1, and the device-count check rejects the 2-device
+    /// mesh — before any HIP/device/VRAM initialization. If Tp had won the
+    /// selection, two devices would be constructed and the mesh would bind
+    /// instead — this pins both presence selection and the `Ep > Tp`
+    /// precedence via `Gpus::from_mesh` itself (no direct
+    /// `validate_mesh_device_count` call).
+    ///
+    /// Runs in the pure (non-ignored) suite: the validation precedes device
+    /// construction, so no hardware is touched. Ordering proof:
+    /// `HIPFIRE_DEVICES` is pinned to an unparseable value, so any
+    /// pre-validation device step (`init_tp`/`init_uniform`'s
+    /// resolve/construct/VRAM path) would fail loudly with the resolve
+    /// parse error on every machine; the deterministic mesh-count error
+    /// can only be produced by the pre-construction
+    /// `validate_mesh_device_count` check. (Before this fix, with the pin
+    /// set to a non-existent id, the test failed with
+    /// `device id 7 out of range (count=1)` — a live `Gpu::init` for the
+    /// bad id, i.e. construction ran before the count check.)
+    #[test]
+    fn from_mesh_ep1_tp2_rejects_device_count_mismatch() {
+        let _lock = EMULATE_ENV_LOCK.lock().unwrap();
+        let _dev_guard = EnvVarGuard::set("HIPFIRE_DEVICES", "x");
+        let mesh = DeviceMesh::rect(&[(DimKind::Ep, 1), (DimKind::Tp, 2)]);
+        let err = match Gpus::from_mesh(&mesh, 24) {
+            Err(e) => e,
+            Ok(_) => panic!("Ep=1,Tp=2 mesh must fail closed, not bind"),
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("mesh has 2 devices but Gpus has 1 device"),
+            "expected device-count rejection, got: {msg}",
+        );
+    }
+
+    /// `EnvVarGuard` must restore a pre-existing nontrivial value on drop.
+    /// The `"abc"` fixture is owned by an OUTER `EnvVarGuard` so the true
+    /// process-entry state is restored on success or panic; the final
+    /// assertion proves no leak under either entry condition (variable
+    /// initially absent or pre-set externally).
+    #[test]
+    fn emulate_gpus_guard_restores_pre_existing_value() {
+        let _lock = EMULATE_ENV_LOCK.lock().unwrap();
+        let entry_state = std::env::var_os("HIPFIRE_EMULATE_GPUS");
+        // Outer guard: captures the true entry state and applies the
+        // fixture; its Drop restores the original on success or panic.
+        let _outer = EnvVarGuard::set("HIPFIRE_EMULATE_GPUS", "abc");
+        {
+            let _inner = EnvVarGuard::set("HIPFIRE_EMULATE_GPUS", "2");
+            assert_eq!(
+                std::env::var_os("HIPFIRE_EMULATE_GPUS"),
+                Some(std::ffi::OsString::from("2")),
+                "guard must apply the new value for its scope",
+            );
+        }
+        assert_eq!(
+            std::env::var_os("HIPFIRE_EMULATE_GPUS"),
+            Some(std::ffi::OsString::from("abc")),
+            "guard must restore the exact pre-existing value on drop",
+        );
+        drop(_outer);
+        assert_eq!(
+            std::env::var_os("HIPFIRE_EMULATE_GPUS"),
+            entry_state,
+            "no leak: true process-entry state must be restored",
+        );
+    }
+
+    /// `EnvVarGuard` must remove the var when it was initially absent. An
+    /// outer restoring guard owns the true process-entry state while the
+    /// initially-absent fixture is created by removing the variable; the
+    /// final assertion proves no leak under either entry condition
+    /// (variable initially absent or pre-set externally).
+    #[test]
+    fn emulate_gpus_guard_removes_initially_absent_value() {
+        let _lock = EMULATE_ENV_LOCK.lock().unwrap();
+        let entry_state = std::env::var_os("HIPFIRE_EMULATE_GPUS");
+        // Outer guard: captures the true entry state; the variable is then
+        // removed to create the initially-absent fixture. The outer Drop
+        // restores the original on success or panic.
+        let _outer = EnvVarGuard::set("HIPFIRE_EMULATE_GPUS", "fixture");
+        std::env::remove_var("HIPFIRE_EMULATE_GPUS");
+        {
+            let _inner = EnvVarGuard::set("HIPFIRE_EMULATE_GPUS", "2");
+            assert_eq!(
+                std::env::var_os("HIPFIRE_EMULATE_GPUS"),
+                Some(std::ffi::OsString::from("2")),
+                "guard must apply the new value for its scope",
+            );
+        }
+        assert_eq!(
+            std::env::var_os("HIPFIRE_EMULATE_GPUS"),
+            None,
+            "guard must remove the var when it was initially absent",
+        );
+        drop(_outer);
+        assert_eq!(
+            std::env::var_os("HIPFIRE_EMULATE_GPUS"),
+            entry_state,
+            "no leak: true process-entry state must be restored",
+        );
+    }
+
+    /// All-ones named mesh `Pp=1, Tp=1, Ep=1` binds as a one-GPU `Gpus`
+    /// with the original mesh epoch/identity attached. This is the
+    /// presence rule: every axis is declared (unlike the axis-less
+    /// `DeviceMesh::single()`), so the mesh is no longer rejected. For
+    /// size-1 axes the Ep-branch delegation (`init_tp`) is not
+    /// output-distinguishable from the Tp/Pp branches at one device; the
+    /// `Ep > Tp` precedence itself is pinned by
+    /// [`from_mesh_ep1_tp2_rejects_device_count_mismatch`].
+    #[test]
+    #[ignore = "requires ROCm GPU"]
+    fn from_mesh_pp1_tp1_ep1_binds_with_epoch() {
+        let mesh = DeviceMesh::rect(&[(DimKind::Pp, 1), (DimKind::Tp, 1), (DimKind::Ep, 1)]);
+        assert_eq!(mesh.axes().len(), 3, "all-ones named mesh keeps its axes");
+        let gpus = Gpus::from_mesh(&mesh, 24).expect("all-ones named mesh must bind");
+        assert_eq!(gpus.devices.len(), 1);
+        assert_eq!(gpus.layer_to_device, vec![0u8; 24]);
+        assert_bound_origin(&gpus, &mesh, 0);
     }
 
     // ── pre-existing pure CPU tests ────────────────────────────────────

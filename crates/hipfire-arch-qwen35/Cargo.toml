@@ -13,6 +13,13 @@ deltanet = ["hipfire-runtime/deltanet", "rdna-compute/deltanet"]
 # Expose the unchanged legacy forward sequence to focused Qwen3.5 tests only.
 # This is intentionally not part of the default feature set.
 test-utils = ["deltanet"]
+# Test-only emulated EP2 harness (STEP-002 Task 8): two logical expert
+# ownership partitions over ONE GPU, staged as rank-masked gate-up pointer
+# tables inside the existing single-owner Frozen resident.  Never enabled by
+# default; production Qwen35 EP remains Planned { owner: "AXIS-002" }.
+# Implies `deltanet`: the harness runs the Qwen35 hybrid forward path, and
+# the production wrapper must never compile it by accident.
+emulated-ep2-harness = ["deltanet"]
 # Propagates hipfire-runtime's test-only DFlash allocation fault injector.
 dflash-fault-inject = ["hipfire-runtime/dflash-fault-inject"]
 

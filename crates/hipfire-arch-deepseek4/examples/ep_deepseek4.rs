@@ -128,12 +128,27 @@ fn main() {
     drop(hfq0);
 
     // ── bring up N ranks ────────────────────────────────────────────────────
-    let mut gpus = Gpus::init_tp(tp, cfg.num_hidden_layers).expect("init_tp");
+    // The mesh is built once and shared by the GPU construction (binding the
+    // weight-origin epoch the sealed executor validates) and the MoE policy.
+    let mesh = hipfire_runtime::multi_gpu::DeviceMesh::rect(&[(
+        hipfire_runtime::multi_gpu::DimKind::Ep,
+        tp,
+    )]);
+    // from_mesh delegates to init_tp for an Ep axis — used for ALL rank
+    // counts including named Ep=1: the bound mesh epoch is what the sealed
+    // executor validates, and rank-one Ep runs the sealed program (no
+    // manual/rank-one schedule exists).
+    let mut gpus = Gpus::from_mesh(&mesh, cfg.num_hidden_layers).expect("from_mesh");
     let n = gpus.devices.len();
     assert_eq!(
         n, tp,
-        "init_tp gave {n} devices (check HIP_VISIBLE_DEVICES)"
+        "from_mesh gave {n} devices (check HIP_VISIBLE_DEVICES)"
     );
+    let policy = hipfire_runtime::moe_plan::MoEExecutionPolicy::new(
+        hipfire_runtime::moe_plan::MoEExecutionKind::Ep,
+        mesh,
+    )
+    .expect("ep policy");
     for (r, d) in gpus.devices.iter().enumerate() {
         eprintln!("  rank {r}: device_id={} arch={}", d.device_id, d.arch);
     }
@@ -243,6 +258,7 @@ fn main() {
             &mut state_per_rank,
             &partials,
             &partials_i64,
+            &policy,
             t,
             pos as u32,
         )
@@ -296,6 +312,7 @@ fn main() {
             &partials,
             &partials_i64,
             &h_n_per_rank,
+            &policy,
             t0,
             prompt_ids.len() as u32,
         )
@@ -331,6 +348,7 @@ fn main() {
             &mut state_per_rank,
             &partials,
             &partials_i64,
+            &policy,
             next,
             pos as u32,
         )

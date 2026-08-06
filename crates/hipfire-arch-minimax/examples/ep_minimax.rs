@@ -46,7 +46,8 @@ fn main() {
     use hipfire_arch_minimax::forward;
     use hipfire_arch_minimax::minimax::{MiniMaxConfig, MiniMaxState, MiniMaxWeights};
     use hipfire_runtime::hfq::HfqFile;
-    use hipfire_runtime::multi_gpu::Gpus;
+    use hipfire_runtime::moe_plan::{MoEExecutionKind, MoEExecutionPolicy};
+    use hipfire_runtime::multi_gpu::{DeviceMesh, DimKind, Gpus};
     use hipfire_runtime::tokenizer::Tokenizer;
     use hipfire_runtime::tp_shard::{ExpertAssign, ShardConfig};
     use rdna_compute::{DType, GpuTensor};
@@ -96,11 +97,16 @@ fn main() {
     drop(hfq0);
 
     // ── bring up N ranks ────────────────────────────────────────────────────
-    let mut gpus = Gpus::init_tp(tp, cfg.num_hidden_layers).expect("init_tp");
+    // Caller-owned MoE execution policy: the EP mesh IS policy.mesh(), and the
+    // `Gpus` is bound to that same mesh (the sealed executor's identity check
+    // requires it — `Gpus::from_mesh` binds the mesh epoch).
+    let mesh = DeviceMesh::rect(&[(DimKind::Ep, tp)]);
+    let policy = MoEExecutionPolicy::new(MoEExecutionKind::Ep, mesh.clone()).expect("Ep policy");
+    let mut gpus = Gpus::from_mesh(&mesh, cfg.num_hidden_layers).expect("from_mesh");
     let n = gpus.devices.len();
     assert_eq!(
         n, tp,
-        "init_tp gave {n} devices (check HIP_VISIBLE_DEVICES)"
+        "from_mesh gave {n} devices (check HIP_VISIBLE_DEVICES)"
     );
     for (r, d) in gpus.devices.iter().enumerate() {
         eprintln!("  rank {r}: device_id={} arch={}", d.device_id, d.arch);
@@ -140,8 +146,9 @@ fn main() {
     let max_seq = prompt_ids.len() + max + 16;
     let mut state_per_rank: Vec<MiniMaxState> = Vec::with_capacity(n);
     let mut partials: Vec<GpuTensor> = Vec::with_capacity(n);
-    // int64 scratch: hidden * 8 bytes per element (raw bytes, DType::Raw).
-    // Used by DownResidualI64 on the EP i64 path; pre-zeroed per step by the executor.
+    // int64 scratch: shape [hidden] with hidden*8 bytes of capacity (raw
+    // bytes — the runtime lowerer validates the LOGICAL shape product against
+    // the i64 conversion's n and the byte capacity against n*8).
     let mut partials_i64: Vec<GpuTensor> = Vec::with_capacity(n);
     for r in 0..n {
         gpus.devices[r].bind_thread().expect("bind");
@@ -155,7 +162,7 @@ fn main() {
         );
         partials_i64.push(
             gpus.devices[r]
-                .zeros(&[cfg.hidden_size * 8], DType::Raw)
+                .upload_raw(&vec![0u8; cfg.hidden_size * 8], &[cfg.hidden_size])
                 .expect("partial_i64"),
         );
     }
@@ -189,6 +196,7 @@ fn main() {
             &mut state_per_rank,
             &partials,
             &partials_i64,
+            &policy,
             t,
             pos as u32,
         )
@@ -226,6 +234,7 @@ fn main() {
             &mut state_per_rank,
             &partials,
             &partials_i64,
+            &policy,
             next,
             pos as u32,
         )

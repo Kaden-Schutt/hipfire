@@ -12,6 +12,9 @@ use hipfire_dispatch::context::DispatchCtx;
 use hipfire_dispatch::families::attention::AttnParams;
 use hipfire_dispatch::families::gemv::{GivensRef, WeightRef};
 use hipfire_dispatch::families::kv_tier::{KvTierInputs, KvTierPlan};
+use hipfire_dispatch::families::moe::{
+    decode_expert_refs, ExpertExecutionPlan, MoeStepPhases, RouterPlan,
+};
 use hipfire_dispatch::ops::delta_net::StateQuant as DispatchStateQuant;
 use hipfire_dispatch::pipeline::{
     build_delta_net_batch_steps, build_delta_net_decode_steps, build_delta_net_tree_steps,
@@ -28,9 +31,13 @@ use hipfire_runtime::llama::{
 };
 use hipfire_runtime::model_load::{load_weights as rt_load_weights, LoadedWeights, WeightSource};
 use hipfire_runtime::model_source::ModelSource;
+use hipfire_runtime::moe_plan::{
+    execute_lowered_moe, lower_moe_steps, MoEExecutionPolicy, MoeExecutionTarget, MoeProgramParts,
+    RoutedMoeStepPhases,
+};
 use hipfire_runtime::multi_gpu::Gpus;
 use hipfire_runtime::paro::{paro_load_norm, paro_text_prefix};
-use hipfire_runtime::tp_shard::ShardConfig;
+use hipfire_runtime::tp_shard::ExpertAssign;
 use hipfire_runtime::weight_backend::{
     dequant_norm, dequant_weight_raw, load_awq_scale_for, load_embedding, resolve_lm_head,
     reupload_f16_as_f32, HfqBackend, ParoBackend,
@@ -624,10 +631,6 @@ pub struct MoeFfnWeights {
     /// Owned device buffer (no aliasing) — freed as a buffer in free_moe_ffn.
     pub expert_dtype_tags: Option<GpuTensor>,
 
-    /// EP-shard zero gate-up target for non-owned expert slots. The pointer
-    /// tables reference this buffer, so it is owned alongside the tables.
-    pub expert_gate_up_dummy: Option<GpuTensor>,
-
     /// Layer index. Stable identity used to key
     /// [`hipfire_runtime::weight_pager::WeightId::Expert`] entries.
     pub layer_idx: u16,
@@ -676,6 +679,10 @@ fn map_bind_err(e: Qwen35MoeBindError) -> HipError {
     HipError::new(0, &e.to_string())
 }
 
+fn map_bucket_err(e: Qwen35StepBucketError) -> HipError {
+    HipError::new(0, &e.to_string())
+}
+
 /// Borrowed execution view into MoE FFN weights for the single-device path.
 ///
 /// `Legacy(&MoeFfnWeights)` wraps the existing per-layer weight struct.
@@ -698,6 +705,39 @@ fn map_bind_err(e: Qwen35MoeBindError) -> HipError {
 pub(crate) enum MoeFfnView<'a> {
     Legacy(&'a MoeFfnWeights),
     Frozen(crate::store::MoeFfnBindings<'a>),
+}
+
+/// Private MoE execution selector (STEP-002 Task 8, Phase 2B).
+///
+/// `Single` is the production selection — every production forward wrapper
+/// passes it and the byte behavior is unchanged.  `EmulatedEp2` (harness
+/// feature only) runs the two logical expert-ownership ranks sequentially
+/// into reusable partial buffers with only the gate-up pointer tables
+/// overridden via [`Qwen35Weights::moe_ffn_view_ep2`]; down/AWQ/tags/router/
+/// shared/Paro stay canonical and borrowed from the single Frozen owner.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MoeExecution {
+    Single,
+    #[cfg(feature = "emulated-ep2-harness")]
+    EmulatedEp2,
+}
+
+/// Emulated-EP2 prefill marker threaded through the batched-prefill chain
+/// (harness feature only).  Carries no data: the per-layer rank views come
+/// from [`Qwen35Weights::moe_ffn_view_ep2`] inside the MoE body and the
+/// partial buffers live on the caller-owned [`PrefillBatchScratch`].  The
+/// production and legacy-EP drivers always pass `None`.
+#[cfg(feature = "emulated-ep2-harness")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Ep2PrefillCtx;
+
+/// Emulated-EP2 decode execution contract (pure policy, pinned by CPU
+/// tests): rank 0 runs the shared-expert down contribution, rank 1 skips
+/// it, so the shared expert is counted exactly once after the partial
+/// combine.  `true` = pass `skip_shared` to the MoE decode family.
+#[cfg(feature = "emulated-ep2-harness")]
+pub(crate) fn ep2_rank_skip_shared(rank: u8) -> bool {
+    rank != 0
 }
 
 // ── Helper: build a WeightRef from a GpuTensor + metadata ────────────────
@@ -1593,6 +1633,20 @@ pub struct Qwen35Weights {
     /// `is_some()` ⇔ every MoE layer's `ffn` is `MoeFfnStorage::Frozen`.
     /// Enforced by [`validate_moe_pairing`] called at publication seams.
     pub(crate) moe_resident: Option<crate::store::Qwen35MoeResident>,
+
+    /// STEP-002 Task 9: model-owned, immutable per-layer expert-group plans,
+    /// resolved ONCE through the validated manifest authority
+    /// ([`Qwen35MoeGroupPlans::resolve`]) and borrowed by layer during
+    /// decode/prefill — never reconstructed per token. The cell is a
+    /// write-once `OnceLock` because the config-less `load_weights`
+    /// orchestrator path cannot resolve at construction; every construction
+    /// site initializes the cell empty and the first forward resolves
+    /// through the authority (see [`Qwen35Weights::moe_group_plans`]). The
+    /// entry is KEYED by the config identity consumed by resolution
+    /// ([`Qwen35MoeGroupPlanKey`]): the same identity borrows the cached
+    /// success/failure; a different identity is refused explicitly — never
+    /// silent stale reuse.
+    pub(crate) moe_group_plans: std::sync::OnceLock<Qwen35MoeGroupPlansCacheEntry>,
 }
 
 /// Returns `true` when the config is eligible for Frozen MoE loading.
@@ -1951,9 +2005,6 @@ pub(crate) fn free_moe_ffn_checked(
     if let Some(t) = ffn.expert_dtype_tags {
         free_tensor_retained(format!("{label}.expert_dtype_tags"), t, gpu, failures);
     }
-    if let Some(t) = ffn.expert_gate_up_dummy {
-        free_tensor_retained(format!("{label}.expert_gate_up_dummy"), t, gpu, failures);
-    }
 
     for (i, e) in ffn.experts.into_iter().enumerate() {
         free_weight_all_checked(
@@ -2016,6 +2067,71 @@ fn free_moe_storage(gpu: &mut Gpu, storage: MoeFfnStorage) {
 }
 
 impl Qwen35Weights {
+    /// STEP-002 Task 9: the model-owned resolved expert-group plans.
+    ///
+    /// Resolution runs exactly once per model through the validated manifest
+    /// authority ([`Qwen35MoeGroupPlans::resolve`]); every decode/prefill
+    /// call after that borrows the same immutable state — there is no
+    /// per-token plan construction or allocation on the hot path. The entry
+    /// caches the `Result` (success AND failure) under the config identity
+    /// it was resolved for ([`Qwen35MoeGroupPlanKey`]):
+    /// - the same config identity borrows the cached result (failure is
+    ///   replayed verbatim, never re-resolved or fabricated);
+    /// - a different config identity returns an explicit mismatch error and
+    ///   does NOT replace or recompute the cached entry — never silent stale
+    ///   reuse;
+    /// - the cell is `get_or_init`-seeded: the FIRST INITIALIZER RUN wins
+    ///   (exactly one resolution per model — losing callers' initializers
+    ///   never run, so no discarded second resolution); the stored entry
+    ///   stays keyed and every later access re-checks the identity.
+    pub(crate) fn moe_group_plans(
+        &self,
+        config: &Qwen35Config,
+    ) -> Result<&Qwen35MoeGroupPlans, String> {
+        Self::moe_group_plans_with(&self.moe_group_plans, config, Qwen35MoeGroupPlans::resolve)
+    }
+
+    /// The cache protocol behind [`Qwen35Weights::moe_group_plans`], generic
+    /// over the resolver so the exactly-once contract is testable with a
+    /// counting resolver through a private seam (no globals, no timing).
+    /// The returned borrow is tied to the CELL ('a), never to the config.
+    fn moe_group_plans_with<'a, 'b>(
+        cell: &'a std::sync::OnceLock<Qwen35MoeGroupPlansCacheEntry>,
+        config: &'b Qwen35Config,
+        resolve: impl FnOnce(&'b Qwen35Config) -> Result<Qwen35MoeGroupPlans, String>,
+    ) -> Result<&'a Qwen35MoeGroupPlans, String> {
+        // Zero-alloc hot-path request identity: borrows the config's
+        // layer_types slice — the OWNED key (which clones the Vec) is built
+        // only inside the initializer below (and on the cold mismatch path).
+        let request = Qwen35MoeGroupPlanKeyRef::from_config(config);
+        // Resolve AT MOST ONCE per model: `get_or_init` runs the initializer
+        // exactly once — the winning caller's config identity is resolved
+        // and stored; every other caller (concurrent or later) blocks or
+        // returns and receives the SAME stored entry, so there is no stale
+        // result, retry, replacement, or discarded second resolution. The
+        // complete five-field key is compared with the request below before
+        // any result is returned.
+        let entry = cell.get_or_init(|| Qwen35MoeGroupPlansCacheEntry {
+            key: Qwen35MoeGroupPlanKey::from_config(config),
+            result: resolve(config),
+        });
+        if entry.key == request {
+            entry.result.as_ref().map_err(|error| error.clone())
+        } else {
+            // Cold path: constructing the owned key here is acceptable — the
+            // mismatch is a programmer error, never the hot path.
+            let requested = Qwen35MoeGroupPlanKey::from_config(config);
+            Err(format!(
+                "qwen35 plan cache: config identity mismatch — cached {entry_key} but requested \
+                 {requested_key}; refusing silent stale reuse",
+                entry_key = entry.key,
+                requested_key = requested,
+            ))
+        }
+    }
+}
+
+impl Qwen35Weights {
     /// Central view constructor: select MoE FFN storage for a global model
     /// layer index and pair it with the optional resident (Frozen path).
     ///
@@ -2058,6 +2174,56 @@ impl Qwen35Weights {
                     )
                 })?;
                 let bindings = resident.bind_layer(layer_idx)?;
+                Ok(MoeFfnView::Frozen(bindings))
+            }
+        }
+    }
+
+    /// Emulated EP2 view seam (test-only harness, feature
+    /// `emulated-ep2-harness`): like [`Self::moe_ffn_view`] but the Frozen
+    /// bindings carry the rank-masked gate-up pointer-table override.
+    ///
+    /// * Out-of-range layer index → [`Qwen35MoeBindError::LayerOutOfRange`].
+    /// * Legacy (owned) storage → refused — EP2 rank masking exists only for
+    ///   Frozen storage, and silently returning an unmasked view would fake
+    ///   the partition evidence.
+    /// * Frozen storage without a resident → `TensorLookup`.
+    ///
+    /// There is NO sequential GPU execution here — this is the binding
+    /// surface only (Phase 2A); the harness driver consumes it in Phase 2B.
+    #[cfg(feature = "emulated-ep2-harness")]
+    pub(crate) fn moe_ffn_view_ep2(
+        &self,
+        layer_idx: usize,
+        rank: usize,
+    ) -> Result<MoeFfnView<'_>, Qwen35MoeBindError> {
+        let layer = self
+            .layers
+            .get(layer_idx)
+            .ok_or(Qwen35MoeBindError::LayerOutOfRange {
+                requested: layer_idx,
+                count: self.layers.len(),
+            })?;
+        let storage = match layer {
+            LayerWeights::DeltaNetMoe(l) => &l.ffn,
+            LayerWeights::FullAttnMoe(l) => &l.ffn,
+            _ => {
+                return Err(Qwen35MoeBindError::LayerOutOfRange {
+                    requested: layer_idx,
+                    count: self.layers.len(),
+                });
+            }
+        };
+        match storage {
+            MoeFfnStorage::Legacy(_) => Err(Qwen35MoeBindError::Ep2RequiresFrozenStorage),
+            MoeFfnStorage::Frozen => {
+                let resident = self.moe_resident.as_ref().ok_or_else(|| {
+                    Qwen35MoeBindError::TensorLookup(
+                        "moe_resident".into(),
+                        hipfire_runtime::weight_store::WeightCellLookupError::InvalidSlot,
+                    )
+                })?;
+                let bindings = resident.bind_layer_ep2(layer_idx, rank)?;
                 Ok(MoeFfnView::Frozen(bindings))
             }
         }
@@ -2478,9 +2644,6 @@ fn free_moe_ffn(gpu: &mut Gpu, ffn: MoeFfnWeights) {
     }
     // Owned device buffer (built from per-expert gpu_dtype). Free it.
     if let Some(t) = ffn.expert_dtype_tags {
-        let _ = gpu.free_tensor(t);
-    }
-    if let Some(t) = ffn.expert_gate_up_dummy {
         let _ = gpu.free_tensor(t);
     }
     for e in ffn.experts {
@@ -3711,6 +3874,7 @@ pub fn load_weights(
         pager: None,
         lm_head_aliases_embd,
         moe_resident: None,
+        moe_group_plans: std::sync::OnceLock::new(),
     })
 }
 
@@ -3983,32 +4147,6 @@ fn load_layer_into(
     crate::layer_driver::load_layer(&mut b, config, layer_idx, moe)
 }
 
-thread_local! {
-    /// Per-thread EP expert-shard context. When `Some((shard, rank))`,
-    /// [`load_moe_ffn`] loads ONLY this rank's owned experts (streaming
-    /// owned-only) and builds the `[n_exp]` global pointer tables with dummy
-    /// pointers for non-owned slots — the SAME structure post-load
-    /// [`shard_moe_experts`] produces, but WITHOUT the full-model load peak that
-    /// OOMs a model larger than one card's VRAM. Set by the EP load driver
-    /// around `load_weights`, cleared (`None`) after. `None` = full replicated
-    /// load (the default for every non-EP caller).
-    static EP_EXPERT_SHARD: std::cell::RefCell<Option<(ShardConfig, usize)>> =
-        const { std::cell::RefCell::new(None) };
-}
-
-/// Set the per-thread EP expert-shard context consumed by `load_weights` →
-/// [`load_moe_ffn`]. The EP load driver calls this with `Some((shard, rank))`
-/// immediately before `load_weights` on each rank, then `None` immediately
-/// after. Mirrors DeepSeek-V4's `load_weights_sharded` but threaded via TLS so
-/// the 87 existing `load_weights` callers need no signature change.
-pub fn set_ep_expert_shard(ctx: Option<(ShardConfig, usize)>) {
-    EP_EXPERT_SHARD.with(|c| *c.borrow_mut() = ctx);
-}
-
-fn current_ep_expert_shard() -> Option<(ShardConfig, usize)> {
-    EP_EXPERT_SHARD.with(|c| c.borrow().clone())
-}
-
 /// Load one layer's full MoE FFN block: router, all routed experts, shared expert,
 /// and the per-layer scalar shared-expert gate. Tensor naming follows what the
 /// quantizer emits for qwen3_5_moe (commit 4860575): the 3D stacked-expert source
@@ -4054,11 +4192,10 @@ fn e8_aos_to_soa(aos: &[u8], m: usize, k: usize) -> Vec<u8> {
     out
 }
 
-/// EP streaming-shard mode: when [`current_ep_expert_shard`] is `Some`, only the
-/// rank's owned experts are read/allocated; the pointer tables are built global
-/// `[n_exp]` with dummy pointers for non-owned slots (which contribute 0 to the
-/// all-reduce because their gate_up is a zeroed buffer). Uniform files only —
-/// graded/AWQ EP would need the full per-expert dtype map and is rejected here.
+/// Load one layer's full MoE FFN block (router, routed experts, shared
+/// expert, scalar shared-expert gate) as a replicated full load. The legacy
+/// EP streaming-shard load mode and the post-load shard helpers were deleted
+/// in STEP-002 Task 9 — Qwen35 has no EP load admission.
 pub(crate) fn load_moe_ffn(
     hfq: &HfqFile,
     gpu: &mut Gpu,
@@ -4150,29 +4287,11 @@ pub(crate) fn load_moe_ffn(
     // also equals the kept count — so `n_exp` is the slot count on both the
     // keep and no-keep paths. Iterate compact slots `0..n_exp` (matching ds4's
     // `0..n_routed_experts`) and load only the kept original experts under
-    // their remapped names via `ep.src(slot)`. EP streaming-shard composes by
-    // applying ownership to that ORIGINAL expert id, while pointer tables keep
-    // compact slot indexing. No keep ⇒ identity (slot == original index) — the
-    // literal original loop.
-    let ep_shard = current_ep_expert_shard();
-    if ep.is_some() && ep_shard.is_some() {
-        return Err(HipError::new(
-            0,
-            "qwen35: REAP keep-map + EP sharding are mutually exclusive",
-        ));
-    }
-    let owns_orig = |x: usize| {
-        ep_shard
-            .as_ref()
-            .is_none_or(|(sh, r)| sh.owns_expert(*r, x))
-    };
-
+    // their remapped names via `ep.src(slot)`. No keep ⇒ identity
+    // (slot == original index) — the literal original loop.
     let mut experts = Vec::with_capacity(n_exp);
     for slot in 0..n_exp {
         let x = ep.as_ref().map(|e| e.src(slot)).unwrap_or(slot);
-        if !owns_orig(x) {
-            continue; // non-owned on this rank: dummy pointer assigned below
-        }
         let gate_up = load_weight_tensor(
             hfq,
             gpu,
@@ -4195,8 +4314,8 @@ pub(crate) fn load_moe_ffn(
     // gfx11 E8 SoA experts: transpose routed gate_up E8 weights AoS->SoA at load so the
     // SoA-coalesced indexed kernel reads coalesced; the ptr table below picks up the new
     // SoA bufs. Down experts stay AoS (down SoA = increment 2). RDNA3 dGPU +
-    // HIPFIRE_E8_SOA_EXPERTS=1, full-load only (EP shard builds its table separately).
-    if e8_soa_experts() && gpu.arch_caps.is_rdna3_dgpu() && ep_shard.is_none() {
+    // HIPFIRE_E8_SOA_EXPERTS=1, full-load only.
+    if e8_soa_experts() && gpu.arch_caps.is_rdna3_dgpu() {
         let mut converted = 0usize;
         for ew in experts.iter_mut() {
             if ew.gate_up.gpu_dtype == DType::MFP4G32E8 {
@@ -4229,49 +4348,12 @@ pub(crate) fn load_moe_ffn(
     // address of an expert's `gate_up.buf` / `down.buf`). Stored as an
     // F32 tensor of length 2 * num_experts because each pointer occupies
     // 8 bytes = 2 F32 slots; the kernel reads them via a u64 cast.
-    // GLOBAL [n_exp] device pointer tables (8 B/ptr = 2 F32 slots). Full load:
-    // gu_ptrs[e] = experts[e]. EP shard: non-owned slots get a dummy pointer
-    // (zeroed gate_up ⇒ silu output 0 ⇒ 0 contribution to the EP all-reduce;
-    // the down dummy is a real owned buffer so its uniform-dtype dequant stays
-    // in-bounds) — exactly what `shard_moe_experts` builds post-load.
+    // Full-load [n_exp] device pointer tables (8 B/ptr = 2 F32 slots).
     let mut gu_ptrs = vec![0u64; n_exp];
     let mut dn_ptrs = vec![0u64; n_exp];
-    let dummy_slot = if ep_shard.is_some() && experts.len() < n_exp {
-        Some(
-            gpu.zeros(&[experts[0].gate_up.buf.buf.size() / 4], DType::F32)
-                .map_err(|e| HipError::new(0, &format!("qwen35: zero EP gate-up dummy: {e:?}")))?,
-        )
-    } else {
-        None
-    };
-    if ep_shard.is_some() {
-        assert!(
-            !experts.is_empty(),
-            "EP shard: rank owns no experts in layer {layer_idx}"
-        );
-        // Shared zeroed gate_up dummy (same byte size as a real expert gate_up).
-        let dummy_gu = dummy_slot
-            .as_ref()
-            .map(|tensor| tensor.buf.as_ptr() as u64)
-            .unwrap_or_else(|| experts[0].gate_up.buf.buf.as_ptr() as u64);
-        let dummy_dn = experts[0].down.buf.buf.as_ptr() as u64;
-        let mut li = 0usize;
-        for slot in 0..n_exp {
-            let orig = ep.as_ref().map(|e| e.src(slot)).unwrap_or(slot);
-            if owns_orig(orig) {
-                gu_ptrs[slot] = experts[li].gate_up.buf.buf.as_ptr() as u64;
-                dn_ptrs[slot] = experts[li].down.buf.buf.as_ptr() as u64;
-                li += 1;
-            } else {
-                gu_ptrs[slot] = dummy_gu;
-                dn_ptrs[slot] = dummy_dn;
-            }
-        }
-    } else {
-        for (e, ew) in experts.iter().enumerate() {
-            gu_ptrs[e] = ew.gate_up.buf.buf.as_ptr() as u64;
-            dn_ptrs[e] = ew.down.buf.buf.as_ptr() as u64;
-        }
+    for (e, ew) in experts.iter().enumerate() {
+        gu_ptrs[e] = ew.gate_up.buf.buf.as_ptr() as u64;
+        dn_ptrs[e] = ew.down.buf.buf.as_ptr() as u64;
     }
     let gu_bytes: Vec<u8> = gu_ptrs.iter().flat_map(|p| p.to_ne_bytes()).collect();
     let dn_bytes: Vec<u8> = dn_ptrs.iter().flat_map(|p| p.to_ne_bytes()).collect();
@@ -4279,7 +4361,6 @@ pub(crate) fn load_moe_ffn(
     let expert_down_ptrs = gpu.alloc_tensor(&[2 * n_exp], DType::F32)?;
     gpu.hip.memcpy_htod(&expert_gate_up_ptrs.buf, &gu_bytes)?;
     gpu.hip.memcpy_htod(&expert_down_ptrs.buf, &dn_bytes)?;
-    let dummy_gate_up_slot = dummy_slot;
 
     // Route A MoE-AWQ: when every expert carries a down.awq_scale sidecar
     // (auto-loaded by load_weight_tensor for MQ4G256, which supports_awq_sidecar),
@@ -4298,18 +4379,7 @@ pub(crate) fn load_moe_ffn(
         .iter()
         .filter(|e| e.down.awq_scale.is_some())
         .count();
-    let expert_down_awq_ptrs = if ep_shard.is_some() {
-        // EP shard: AWQ-EP needs a sharded scale pointer table (dummies for
-        // non-owned slots). Not yet supported — guard rather than silently
-        // disable. Uniform-no-AWQ files (e.g. .mq6) hit `awq_present == 0` → None.
-        if awq_present != 0 {
-            return Err(HipError::new(
-                0,
-                "AWQ MoE EP not yet supported (quantize experts without AWQ for EP serving)",
-            ));
-        }
-        None
-    } else if moe_awq_enabled && n_exp > 0 && awq_present == n_exp {
+    let expert_down_awq_ptrs = if moe_awq_enabled && n_exp > 0 && awq_present == n_exp {
         let aw_ptrs: Vec<u64> = experts
             .iter()
             .map(|e| e.down.awq_scale.as_ref().unwrap().buf.as_ptr() as u64)
@@ -4346,26 +4416,7 @@ pub(crate) fn load_moe_ffn(
     // Priority: gate_up dtype drives the tag (gate_up is the dominant quality
     // lever); for the existing down-only graded binary the gate_up types are
     // uniform MQ4G256 → tag2, which is the correct MQ4 branch.
-    let expert_dtype_tags = if ep_shard.is_some() {
-        // EP shard: a graded (mixed-dtype) file needs the FULL [n_exp] global tag
-        // map, but only this rank's owned experts are loaded, so non-owned dtypes
-        // aren't visible. Uniform files (all owned experts same dtype, e.g. .mq6)
-        // → None; graded EP is not yet supported.
-        let mixed = !experts.is_empty()
-            && (experts
-                .iter()
-                .any(|e| e.gate_up.gpu_dtype != experts[0].gate_up.gpu_dtype)
-                || experts
-                    .iter()
-                    .any(|e| e.down.gpu_dtype != experts[0].down.gpu_dtype));
-        if mixed {
-            return Err(HipError::new(
-                0,
-                "graded (mixed-dtype) MoE EP not yet supported",
-            ));
-        }
-        None
-    } else if n_exp > 0 {
+    let expert_dtype_tags = if n_exp > 0 {
         let gu0 = experts[0].gate_up.gpu_dtype;
         let dn0 = experts[0].down.gpu_dtype;
         let mixed = experts.iter().any(|e| e.gate_up.gpu_dtype != gu0)
@@ -4420,7 +4471,6 @@ pub(crate) fn load_moe_ffn(
         None
     };
 
-    let dummy_gate_up = dummy_gate_up_slot;
     Ok(MoeFfnWeights {
         router,
         experts,
@@ -4430,7 +4480,6 @@ pub(crate) fn load_moe_ffn(
         expert_down_ptrs,
         expert_down_awq_ptrs,
         expert_dtype_tags,
-        expert_gate_up_dummy: dummy_gate_up,
         // MAD-93 v0.1: non-paged loader path. Layer identity for pager-keyed
         // future work, expert_shape None (callers read shapes off `experts`
         // directly when paged_experts==false).
@@ -4531,11 +4580,12 @@ pub(crate) fn moe_ffn_decode_with_scratch(
     x_norm: &GpuTensor,
     x_residual: &GpuTensor,
     config: &Qwen35Config,
+    plans: &Qwen35MoeGroupPlans,
     scratch: &Qwen35Scratch,
 ) -> HipResult<()> {
     let refs = MoeScratchRef::from_scratch(scratch);
     moe_ffn_decode_impl(
-        gpu, view, x_norm, x_residual, config, &refs, false, None, false,
+        gpu, view, x_norm, x_residual, config, plans, &refs, false, None, false,
     )
 }
 
@@ -4547,16 +4597,15 @@ pub(crate) fn moe_ffn_decode_with_scratch_prerotated(
     x_norm: &GpuTensor,
     x_residual: &GpuTensor,
     config: &Qwen35Config,
+    plans: &Qwen35MoeGroupPlans,
     scratch: &Qwen35Scratch,
 ) -> HipResult<()> {
     let refs = MoeScratchRef::from_scratch(scratch);
     moe_ffn_decode_impl(
-        gpu, view, x_norm, x_residual, config, &refs, true, None, false,
+        gpu, view, x_norm, x_residual, config, plans, &refs, true, None, false,
     )
 }
 
-/// The actual MoE FFN implementation. Uses the caller-provided scratch
-/// buffers, never allocates.
 // ── REAP expert-importance capture (HIPFIRE_MOE_EXPERT_STATS=1) ────────────
 // Per-(layer, expert) accumulators: routing count, Σ gate_weight,
 // Σ ‖expert_output‖, Σ (gate × ‖output‖). The last is the true REAP
@@ -4644,6 +4693,718 @@ pub fn dump_expert_stats(path: &str) {
     }
 }
 
+// ── STEP-002 Task 9: Qwen35 Single expert-group manifest + decode lowering ─
+
+/// Config identity of the model-owned expert-group plan cache entry: every
+/// authority input that can change the resolved plans. Verified against the
+/// resolution path (`qwen35_moe_expert_group_specs` +
+/// [`Qwen35::weight_manifest`] + `resolve_expert_group_plans`):
+/// - the spec consumes `num_experts`, `n_layers`, `moe_intermediate_size`,
+///   `dim` (group count, per-expert source names, resource bytes);
+/// - the MoE manifest entries the plan validator reads (`router`,
+///   `expert.{e}.gate_up` / `expert.{e}.down`) are shaped by `num_experts`,
+///   `dim`, `moe_intermediate_size` and exist for every layer of the
+///   complete `layer_types` sequence;
+/// - no other config field reaches the resolved plans (attention / dense /
+///   shared-expert / embedding entries are unclaimed by the group specs).
+#[derive(Clone, PartialEq, Debug)]
+pub(crate) struct Qwen35MoeGroupPlanKey {
+    n_layers: usize,
+    layer_types: Vec<LayerType>,
+    num_experts: usize,
+    dim: usize,
+    moe_intermediate_size: usize,
+}
+
+impl Qwen35MoeGroupPlanKey {
+    fn from_config(cfg: &Qwen35Config) -> Self {
+        #[cfg(test)]
+        if plan_key_seam::INSTRUMENT.load(std::sync::atomic::Ordering::Relaxed) {
+            plan_key_seam::CONSTRUCTIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        Self {
+            n_layers: cfg.n_layers,
+            layer_types: cfg.layer_types.clone(),
+            num_experts: cfg.num_experts,
+            dim: cfg.dim,
+            moe_intermediate_size: cfg.moe_intermediate_size,
+        }
+    }
+}
+
+impl std::fmt::Display for Qwen35MoeGroupPlanKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "n_layers={}, layer_types={:?}, num_experts={}, dim={}, moe_intermediate_size={}",
+            self.n_layers, self.layer_types, self.num_experts, self.dim, self.moe_intermediate_size
+        )
+    }
+}
+
+/// Borrowed view of the config identity consumed by plan resolution — the
+/// hot-path comparison side. Constructing this performs ZERO heap
+/// allocation (the `layer_types` slice is borrowed, never cloned); the
+/// owned [`Qwen35MoeGroupPlanKey`] is built only inside the `get_or_init`
+/// initializer and on the cold mismatch-formatting path.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Qwen35MoeGroupPlanKeyRef<'a> {
+    n_layers: usize,
+    layer_types: &'a [LayerType],
+    num_experts: usize,
+    dim: usize,
+    moe_intermediate_size: usize,
+}
+
+impl<'a> Qwen35MoeGroupPlanKeyRef<'a> {
+    fn from_config(cfg: &'a Qwen35Config) -> Self {
+        Self {
+            n_layers: cfg.n_layers,
+            layer_types: &cfg.layer_types,
+            num_experts: cfg.num_experts,
+            dim: cfg.dim,
+            moe_intermediate_size: cfg.moe_intermediate_size,
+        }
+    }
+}
+
+impl PartialEq<Qwen35MoeGroupPlanKeyRef<'_>> for Qwen35MoeGroupPlanKey {
+    /// Complete five-field identity comparison against a borrowed request.
+    /// The `layer_types` comparison is a slice comparison over the ORIGINAL
+    /// sequence — O(n_layers), no allocation.
+    fn eq(&self, other: &Qwen35MoeGroupPlanKeyRef<'_>) -> bool {
+        self.n_layers == other.n_layers
+            && self.layer_types.as_slice() == other.layer_types
+            && self.num_experts == other.num_experts
+            && self.dim == other.dim
+            && self.moe_intermediate_size == other.moe_intermediate_size
+    }
+}
+
+/// Test-only instrumentation for the plan-key construction seam: proves the
+/// initialized same-key lookup never constructs the OWNED key again (which
+/// would clone `layer_types`). Gated so unrelated tests never observe it;
+/// zero production overhead (`cfg(test)` only).
+#[cfg(test)]
+pub(crate) mod plan_key_seam {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Mutex, MutexGuard};
+
+    /// Serializes seam tests so their delta assertions cannot observe each
+    /// other's increments.
+    pub static LOCK: Mutex<()> = Mutex::new(());
+    /// When set, every [`super::Qwen35MoeGroupPlanKey::from_config`] call
+    /// increments [`CONSTRUCTIONS`].
+    pub static INSTRUMENT: AtomicBool = AtomicBool::new(false);
+    /// Number of owned-key constructions performed while instrumented.
+    pub static CONSTRUCTIONS: AtomicUsize = AtomicUsize::new(0);
+
+    /// Reset the instrumentation state (call while holding [`LOCK`]).
+    pub fn reset() {
+        INSTRUMENT.store(false, Ordering::Relaxed);
+        CONSTRUCTIONS.store(0, Ordering::Relaxed);
+    }
+
+    /// RAII guard: enables the counter for its lifetime (holding [`LOCK`]
+    /// so delta assertions are race-free) and restores it on drop.
+    pub struct SeamGuard {
+        _lock: MutexGuard<'static, ()>,
+    }
+
+    impl SeamGuard {
+        pub fn on() -> Self {
+            let _lock = LOCK.lock().unwrap();
+            reset();
+            INSTRUMENT.store(true, Ordering::Relaxed);
+            SeamGuard { _lock }
+        }
+    }
+
+    impl Drop for SeamGuard {
+        fn drop(&mut self) {
+            reset();
+        }
+    }
+}
+
+/// One model-owned plan-cache entry: the config identity the plans were
+/// resolved under plus the cached success/failure result. The cell is
+/// write-once (thread-safe first-wins); a later access with a DIFFERENT
+/// config identity returns an explicit mismatch WITHOUT replacing or
+/// recomputing — never silent stale reuse. Failures are cached too
+/// (reported once, replayed verbatim for the same identity).
+pub(crate) struct Qwen35MoeGroupPlansCacheEntry {
+    key: Qwen35MoeGroupPlanKey,
+    result: Result<Qwen35MoeGroupPlans, String>,
+}
+
+/// Model-owned, immutable per-layer expert-group plans (STEP-002 Task 9,
+/// Phase 3 remediation).
+///
+/// Resolved EXACTLY ONCE through the validated manifest authority
+/// ([`hipfire_runtime::weight_manifest::resolve_expert_group_plans`] over
+/// [`crate::arch::Qwen35::weight_manifest`] + the Single-policy declaration)
+/// and borrowed by layer during decode/prefill — never reconstructed per
+/// token. The decode/prefill hot paths resolve through
+/// [`Qwen35Weights::moe_group_plans`] once per forward, then borrow
+/// [`by_layer`](Self::by_layer).
+///
+/// The cache is keyed by the config identity consumed by the resolution
+/// authority ([`Qwen35MoeGroupPlanKey`]): the same identity borrows the
+/// cached success or failure; a different identity is refused explicitly.
+/// The cell is a `OnceLock` because the config-less `load_weights`
+/// orchestrator path cannot resolve at construction; every construction
+/// site initializes the cell empty and the first forward resolves through
+/// the validated authority (never a fabricated plan). The state is
+/// per-model (not a global cache) and immutable after resolution.
+#[derive(Clone, Debug)]
+pub(crate) struct Qwen35MoeGroupPlans {
+    plans: Vec<hipfire_runtime::weight_manifest::ExpertGroupPlan>,
+}
+
+impl Qwen35MoeGroupPlans {
+    /// Resolve one validated plan per MoE layer through the manifest
+    /// authority. Dense (non-MoE) configs resolve an empty set.
+    pub(crate) fn resolve(config: &Qwen35Config) -> Result<Self, String> {
+        if config.num_experts == 0 {
+            return Ok(Self { plans: Vec::new() });
+        }
+        let policy = MoEExecutionPolicy::single();
+        let specs = qwen35_moe_expert_group_specs(config, &policy);
+        let manifest =
+            <crate::arch::Qwen35 as hipfire_runtime::arch::Architecture>::weight_manifest(config);
+        let plans =
+            hipfire_runtime::weight_manifest::resolve_expert_group_plans(&specs, &manifest, 1)?;
+        Ok(Self { plans })
+    }
+
+    /// Borrow the immutable plan for one MoE layer (plans are indexed by
+    /// global layer — every layer is MoE when `num_experts > 0`).
+    pub(crate) fn by_layer(
+        &self,
+        layer: usize,
+    ) -> &hipfire_runtime::weight_manifest::ExpertGroupPlan {
+        &self.plans[layer]
+    }
+
+    /// Number of resolved plans (== number of MoE layers; 0 for dense).
+    pub(crate) fn len(&self) -> usize {
+        self.plans.len()
+    }
+}
+
+/// The Qwen35 Single expert-group manifest declaration (STEP-002 Task 9).
+///
+/// One layer-local group per MoE layer (every layer is MoE when
+/// `num_experts > 0`) with stable semantic identities matching the actual
+/// dispatch builder plans:
+/// - `router_identity = "softmax_topk"` — the decode builder's
+///   [`Step::MoeSoftmaxTopK`] routing;
+/// - `allowed_executions = [indexed_quantized, grouped_quantized]` — decode
+///   and prefill Path 0/1 build indexed steps; grouped prefill Path 2 builds
+///   a grouped program. Both are declared; the CPU fallback is not declared
+///   (it lives outside lowering).
+///
+/// TP/EP policies resolve ZERO groups: Qwen35 has no parallel expert-group
+/// admission, and refusing here happens before any program construction.
+pub(crate) fn qwen35_moe_expert_group_specs(
+    cfg: &Qwen35Config,
+    policy: &hipfire_runtime::moe_plan::MoEExecutionPolicy,
+) -> Vec<hipfire_runtime::weight_manifest::ExpertGroupSpec> {
+    use hipfire_runtime::moe_plan::MoEExecutionKind;
+    use hipfire_runtime::weight_manifest::{
+        ExpertExecutionIdentity, ExpertGroupSpec, ExpertParallelism, ExpertResourceRequirements,
+        ExpertSourceLayout,
+    };
+    if cfg.num_experts == 0 || policy.kind() != MoEExecutionKind::Single {
+        return Vec::new();
+    }
+    (0..cfg.n_layers)
+        .map(|layer| ExpertGroupSpec {
+            group: format!("qwen35_moe_layer_{layer}"),
+            layer: Some(layer),
+            n_experts: cfg.num_experts,
+            parallelism: ExpertParallelism::Single,
+            assignment: ExpertAssign::Stride,
+            source_layout: ExpertSourceLayout::PerExpertFused {
+                gate_up: (0..cfg.num_experts)
+                    .map(|e| format!("expert.{e}.gate_up"))
+                    .collect(),
+                down: (0..cfg.num_experts)
+                    .map(|e| format!("expert.{e}.down"))
+                    .collect(),
+                sidecars: Vec::new(),
+            },
+            // Full f16 sizes of gate_up + down, the admission requirement.
+            resources: ExpertResourceRequirements {
+                bytes_per_expert: 3 * cfg.moe_intermediate_size * cfg.dim * 2,
+                alignment: 64,
+            },
+            router: "router".to_owned(),
+            router_identity: "softmax_topk".to_owned(),
+            allowed_executions: vec![
+                ExpertExecutionIdentity::IndexedQuantized,
+                ExpertExecutionIdentity::GroupedQuantized,
+            ],
+        })
+        .collect()
+}
+
+/// Stable, allocation-free step-kind label for bucketer diagnostics.
+/// COMPILER-EXHAUSTIVE over every current `hipfire_dispatch::pipeline::Step`
+/// variant (mirroring the authoritative enum's `deltanet` cfg gating): a new
+/// Step variant fails to compile until it gets a label here — no wildcard
+/// can silently hide future Step growth. Parameterized family labels carry
+/// the `MoeProj` discriminant where stable (`IndexedMoeGemv(GateUp)`,
+/// `GroupedMoeGemm(DownExpanded)`, ...); every `MoeProj` value is covered
+/// per family, so `MoeProj` growth also fails closed. Labels are `&'static
+/// str` constants — never derived from Debug formatting, which carries
+/// unstable payloads/pointers.
+fn step_kind_label(step: &Step<'_>) -> &'static str {
+    use hipfire_dispatch::pipeline::MoeProj;
+    match step {
+        Step::Gemv { .. } => "Gemv",
+        Step::GemvResidual { .. } => "GemvResidual",
+        Step::Gemm { .. } => "Gemm",
+        Step::GemmKeyedBatched { .. } => "GemmKeyedBatched",
+        Step::RmsnormBatched { .. } => "RmsnormBatched",
+        Step::GivensRotateBatched { .. } => "GivensRotateBatched",
+        Step::RotateFwhtBatched { .. } => "RotateFwhtBatched",
+        #[cfg(feature = "deltanet")]
+        Step::FusedQkvzaBatched { .. } => "FusedQkvzaBatched",
+        Step::GemmResidualBatched { .. } => "GemmResidualBatched",
+        Step::RmsnormAutomatic { .. } => "RmsnormAutomatic",
+        Step::Attend { .. } => "Attend",
+        Step::Rope { .. } => "Rope",
+        Step::QkNorm { .. } => "QkNorm",
+        Step::BiasAdd { .. } => "BiasAdd",
+        #[cfg(feature = "deltanet")]
+        Step::DeltaGatePrep { .. } => "DeltaGatePrep",
+        #[cfg(feature = "deltanet")]
+        Step::DeltaConvSplit { .. } => "DeltaConvSplit",
+        #[cfg(feature = "deltanet")]
+        Step::DeltaQkL2Norm { .. } => "DeltaQkL2Norm",
+        #[cfg(feature = "deltanet")]
+        Step::DeltaRepeatHeads { .. } => "DeltaRepeatHeads",
+        #[cfg(feature = "deltanet")]
+        Step::DeltaRecurrence { .. } => "DeltaRecurrence",
+        #[cfg(feature = "deltanet")]
+        Step::DeltaGatedNorm { .. } => "DeltaGatedNorm",
+        Step::SiluMul { .. } => "SiluMul",
+        Step::ResidualAdd { .. } => "ResidualAdd",
+        Step::MoeRoute { .. } => "MoeRoute",
+        Step::IndexedMoeGemv {
+            which: MoeProj::GateUp { .. },
+            ..
+        } => "IndexedMoeGemv(GateUp)",
+        Step::IndexedMoeGemv {
+            which: MoeProj::DownResidual { .. } | MoeProj::DownResidualI64 { .. },
+            ..
+        } => "IndexedMoeGemv(DownResidual)",
+        Step::IndexedMoeGemv {
+            which: MoeProj::DownExpanded,
+            ..
+        } => "IndexedMoeGemv(DownExpanded)",
+        Step::MoeCombine { .. } => "MoeCombine",
+        Step::MoeScatter { .. } => "MoeScatter",
+        Step::GroupedMoeGemm {
+            which: MoeProj::GateUp { .. },
+            ..
+        } => "GroupedMoeGemm(GateUp)",
+        Step::GroupedMoeGemm {
+            which: MoeProj::DownExpanded,
+            ..
+        } => "GroupedMoeGemm(DownExpanded)",
+        Step::GroupedMoeGemm {
+            which: MoeProj::DownResidual { .. } | MoeProj::DownResidualI64 { .. },
+            ..
+        } => "GroupedMoeGemm(DownResidual)",
+        Step::MoeGateUpUnscatter { .. } => "MoeGateUpUnscatter",
+        Step::ScoreActivation { .. } => "ScoreActivation",
+        Step::MoeActivation { .. } => "MoeActivation",
+        Step::ConvertI64ToF32 { .. } => "ConvertI64ToF32",
+        Step::MoeSoftmaxTopK { .. } => "MoeSoftmaxTopK",
+        Step::MoeFusedSharedGate { .. } => "MoeFusedSharedGate",
+        Step::MoeSharedGateSide { .. } => "MoeSharedGateSide",
+        Step::MoeSharedDown { .. } => "MoeSharedDown",
+        Step::ScaledAdd { .. } => "ScaledAdd",
+        Step::MoeGateUpIndexed { .. } => "MoeGateUpIndexed",
+        Step::MoeDownIndexed { .. } => "MoeDownIndexed",
+    }
+}
+
+/// Fail-closed phase-bucketing error: a Step variant the Qwen adapter does
+/// not support for the given lane reached a bucketer, or a supported
+/// variant arrived OUT OF CANONICAL LAUNCH ORDER. The step is NEVER placed
+/// into any bucket (in particular never into the router ordering bucket)
+/// and never reordered; the caller fails with context naming the lane, the
+/// stable step-kind label, and the semantic phase it arrived in.
+#[derive(Debug)]
+pub(crate) enum Qwen35StepBucketError {
+    UnsupportedStep {
+        lane: &'static str,
+        phase: &'static str,
+        kind: &'static str,
+    },
+    ReorderedStep {
+        lane: &'static str,
+        phase: &'static str,
+        kind: &'static str,
+        ordinal: usize,
+        previous_ordinal: usize,
+    },
+}
+
+impl std::fmt::Display for Qwen35StepBucketError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Qwen35StepBucketError::UnsupportedStep { lane, phase, kind } => write!(
+                f,
+                "qwen35 {lane} phase bucketing: unsupported Step {kind} in phase {phase} \
+                 (fail-closed: never placed in the router bucket)"
+            ),
+            Qwen35StepBucketError::ReorderedStep {
+                lane,
+                phase,
+                kind,
+                ordinal,
+                previous_ordinal,
+            } => write!(
+                f,
+                "qwen35 {lane} phase bucketing: Step {kind} in phase {phase} violates canonical \
+                 launch order (ordinal {ordinal} after {previous_ordinal}); fail-closed: never \
+                 reordered into canonical buckets"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for Qwen35StepBucketError {}
+
+/// Map the dispatch prefill builder's semantic phases into the runtime
+/// lowerer's one-rank phase buckets. Fail-closed: every Step variant the
+/// builder can emit is classified explicitly; any other variant is refused
+/// with a contextual error and is NEVER placed in the router bucket.
+///
+/// Prefill routing (softmax+top-K), the shared expert, and the gate-side
+/// GEMMs are model-owned; the builder emits only the routed block:
+/// - Path 0/1 (indexed): [gate_up, activation, down, (combine)]
+/// - Path 2 (grouped): [scatter, (givens), grouped gate_up,
+///   gate-up deinterleave (MoeGateUpUnscatter), activation, grouped down,
+///   grouped combine]
+/// The scatter must flatten before the grouped gate-up (the lowerer's
+/// grouped chain order `scatter < gate_up < gate-up deinterleave < down`),
+/// so it rides in the router bucket; the deinterleave follows its grouped
+/// gate-up in the gate_up bucket. Flattening the buckets reproduces the
+/// builder's exact launch order.
+pub(crate) fn qwen35_prefill_phase_buckets(
+    phases: MoeStepPhases<'_>,
+) -> Result<RoutedMoeStepPhases<'_>, Qwen35StepBucketError> {
+    use hipfire_dispatch::pipeline::{MoeProj, Step};
+    use hipfire_runtime::moe_plan::RoutedMoePhases;
+    let mut buckets = RoutedMoePhases {
+        router: Vec::new(),
+        gate_up: Vec::new(),
+        activation: Vec::new(),
+        down: Vec::new(),
+        combine: Vec::new(),
+        finish: Vec::new(),
+    };
+    // The prefill builder never emits pre-routed layer steps (rotate /
+    // gate_side / route / shared_down are model-owned); any step found in
+    // those phases is unsupported and refused — never carried in the
+    // router bucket.
+    if let Some(step) = phases.rotate {
+        return Err(Qwen35StepBucketError::UnsupportedStep {
+            lane: "prefill",
+            phase: "rotate",
+            kind: step_kind_label(&step),
+        });
+    }
+    for step in phases.gate_side {
+        return Err(Qwen35StepBucketError::UnsupportedStep {
+            lane: "prefill",
+            phase: "gate_side",
+            kind: step_kind_label(&step),
+        });
+    }
+    if let Some(step) = phases.route {
+        return Err(Qwen35StepBucketError::UnsupportedStep {
+            lane: "prefill",
+            phase: "route",
+            kind: step_kind_label(&step),
+        });
+    }
+    for step in phases.shared_down {
+        return Err(Qwen35StepBucketError::UnsupportedStep {
+            lane: "prefill",
+            phase: "shared_down",
+            kind: step_kind_label(&step),
+        });
+    }
+    // Fail-closed launch-order tracking: consume the ORIGINAL routed
+    // sequence and track the stable phase ordinal (scatter 0, gate-up
+    // family 1, activation 2, down 3, combine 4). A backward transition
+    // (any supported variant arriving after a LATER phase) is refused
+    // BEFORE canonical buckets can silently repair the order. Equal
+    // ordinals (valid repeats) stay admitted.
+    let mut last_ordinal = 0usize;
+    for step in phases.routed {
+        let ordinal = match &step {
+            Step::MoeScatter { .. } => 0,
+            Step::GivensRotateBatched { .. }
+            | Step::MoeGateUpIndexed { .. }
+            | Step::GroupedMoeGemm {
+                which: MoeProj::GateUp { .. },
+                ..
+            }
+            | Step::MoeGateUpUnscatter { .. } => 1,
+            Step::MoeActivation { .. } => 2,
+            Step::GroupedMoeGemm {
+                which: MoeProj::DownExpanded,
+                ..
+            }
+            | Step::MoeDownIndexed { .. } => 3,
+            Step::MoeCombine { .. } => 4,
+            // Prefill never emits other routed variants: refuse with
+            // context instead of silently carrying the step in the router
+            // bucket.
+            _other => {
+                return Err(Qwen35StepBucketError::UnsupportedStep {
+                    lane: "prefill",
+                    phase: "routed",
+                    kind: step_kind_label(&step),
+                })
+            }
+        };
+        if ordinal < last_ordinal {
+            return Err(Qwen35StepBucketError::ReorderedStep {
+                lane: "prefill",
+                phase: "routed",
+                kind: step_kind_label(&step),
+                ordinal,
+                previous_ordinal: last_ordinal,
+            });
+        }
+        last_ordinal = ordinal;
+        match step {
+            Step::MoeScatter { .. } => buckets.router.push(step),
+            Step::GivensRotateBatched { .. }
+            | Step::MoeGateUpIndexed { .. }
+            | Step::GroupedMoeGemm {
+                which: MoeProj::GateUp { .. },
+                ..
+            }
+            | Step::MoeGateUpUnscatter { .. } => buckets.gate_up.push(step),
+            Step::MoeActivation { .. } => buckets.activation.push(step),
+            Step::GroupedMoeGemm {
+                which: MoeProj::DownExpanded,
+                ..
+            }
+            | Step::MoeDownIndexed { .. } => buckets.down.push(step),
+            Step::MoeCombine { .. } => buckets.combine.push(step),
+            _other => unreachable!("ordinal classification above is total over supported variants"),
+        }
+    }
+    Ok(buckets)
+}
+
+/// Map the dispatch decode builder's semantic phases into the runtime
+/// lowerer's one-rank phase buckets. Fail-closed: every Step variant the
+/// builder can emit is classified explicitly; any other variant is refused
+/// with a contextual error and is NEVER placed in the router bucket.
+///
+/// The pre-routed layer steps — activation rotation, gate side,
+/// softmax+top-K, shared down — keep their exact launch order at the head of
+/// the program (the router bucket); the routed block is classified by step
+/// variant into gate_up / activation / down / combine. Flattening the buckets
+/// reproduces the builder's exact launch order
+/// (`rotate → gate_side → route → shared_down → gate_up → activation →
+/// down → combine`), so the lowered program is launch-order-identical to the
+/// preserved family executor's Step program.
+pub(crate) fn qwen35_decode_phase_buckets(
+    phases: MoeStepPhases<'_>,
+) -> Result<RoutedMoeStepPhases<'_>, Qwen35StepBucketError> {
+    use hipfire_dispatch::pipeline::{MoeProj, Step};
+    use hipfire_runtime::moe_plan::RoutedMoePhases;
+    let mut buckets = RoutedMoePhases {
+        router: Vec::new(),
+        gate_up: Vec::new(),
+        activation: Vec::new(),
+        down: Vec::new(),
+        combine: Vec::new(),
+        finish: Vec::new(),
+    };
+    // Pre-routed layer steps: exact launch order preserved at the program
+    // head. The lowerer's protocol scan treats none of them as
+    // protocol-bearing, so the router bucket is a pure ordering carrier.
+    // Each phase is classified against the decode builder's emitted
+    // variants; anything else is refused, never carried.
+    match phases.rotate {
+        None => {}
+        Some(step @ (Step::RotateFwhtBatched { .. } | Step::GivensRotateBatched { .. })) => {
+            buckets.router.push(step)
+        }
+        Some(_other) => {
+            return Err(Qwen35StepBucketError::UnsupportedStep {
+                lane: "decode",
+                phase: "rotate",
+                kind: step_kind_label(&_other),
+            })
+        }
+    }
+    for step in phases.gate_side {
+        match step {
+            Step::MoeFusedSharedGate { .. } | Step::MoeSharedGateSide { .. } => {
+                buckets.router.push(step)
+            }
+            _other => {
+                return Err(Qwen35StepBucketError::UnsupportedStep {
+                    lane: "decode",
+                    phase: "gate_side",
+                    kind: step_kind_label(&_other),
+                })
+            }
+        }
+    }
+    match phases.route {
+        None => {}
+        Some(step @ Step::MoeSoftmaxTopK { .. }) => buckets.router.push(step),
+        Some(_other) => {
+            return Err(Qwen35StepBucketError::UnsupportedStep {
+                lane: "decode",
+                phase: "route",
+                kind: step_kind_label(&_other),
+            })
+        }
+    }
+    for step in phases.shared_down {
+        match step {
+            Step::MoeSharedDown { .. } | Step::ScaledAdd { .. } => buckets.router.push(step),
+            _other => {
+                return Err(Qwen35StepBucketError::UnsupportedStep {
+                    lane: "decode",
+                    phase: "shared_down",
+                    kind: step_kind_label(&_other),
+                })
+            }
+        }
+    }
+    // Fail-closed launch-order tracking: consume the ORIGINAL routed
+    // sequence and track the stable phase ordinal (gate-up 1, activation 2,
+    // down 3, combine 4). A backward transition (any supported variant
+    // arriving after a LATER phase) is refused BEFORE canonical buckets can
+    // silently repair the order. Equal ordinals (valid repeats) stay
+    // admitted.
+    let mut last_ordinal = 0usize;
+    for step in phases.routed {
+        let ordinal = match &step {
+            Step::MoeGateUpIndexed { .. }
+            | Step::IndexedMoeGemv {
+                which: MoeProj::GateUp { .. },
+                ..
+            } => 1,
+            Step::MoeActivation { .. } => 2,
+            Step::IndexedMoeGemv {
+                which: MoeProj::DownResidual { .. } | MoeProj::DownResidualI64 { .. },
+                ..
+            }
+            | Step::MoeDownIndexed { .. } => 3,
+            Step::MoeCombine { .. } => 4,
+            // Decode never emits other routed variants: refuse with context
+            // instead of silently carrying the step in the router bucket.
+            _other => {
+                return Err(Qwen35StepBucketError::UnsupportedStep {
+                    lane: "decode",
+                    phase: "routed",
+                    kind: step_kind_label(&step),
+                })
+            }
+        };
+        if ordinal < last_ordinal {
+            return Err(Qwen35StepBucketError::ReorderedStep {
+                lane: "decode",
+                phase: "routed",
+                kind: step_kind_label(&step),
+                ordinal,
+                previous_ordinal: last_ordinal,
+            });
+        }
+        last_ordinal = ordinal;
+        match step {
+            Step::MoeGateUpIndexed { .. }
+            | Step::IndexedMoeGemv {
+                which: MoeProj::GateUp { .. },
+                ..
+            } => buckets.gate_up.push(step),
+            Step::MoeActivation { .. } => buckets.activation.push(step),
+            Step::IndexedMoeGemv {
+                which: MoeProj::DownResidual { .. } | MoeProj::DownResidualI64 { .. },
+                ..
+            }
+            | Step::MoeDownIndexed { .. } => buckets.down.push(step),
+            Step::MoeCombine { .. } => buckets.combine.push(step),
+            _other => unreachable!("ordinal classification above is total over supported variants"),
+        }
+    }
+    Ok(buckets)
+}
+
+/// Decode lane selected by the pure classification seam.
+pub(crate) enum QwenDecodeLane<'a> {
+    /// The GPU-top-K indexed Step program (bucketed and lowered by the
+    /// caller). The routed-expert refs were NEVER materialized for this
+    /// lane — the params bound an empty slice.
+    Gpu(MoeStepPhases<'a>),
+    /// The CPU-top-K fallback leaf: the caller materializes the O(n_exp)
+    /// Legacy (gate_up, down) ref Vec lazily — exactly once — immediately
+    /// before invoking the preserved family executor.
+    CpuFallback,
+}
+
+/// Pure decode-lane classification for the adapter (CPU-testable deferral
+/// seam): resolves the route, guards k/dtype support, builds the Step
+/// program, and reports which lane the builder selected. The params are
+/// bound with an EMPTY routed-expert slice — classification never
+/// materializes the O(n_exp) Legacy refs; the caller supplies the
+/// storage-derived residency predicate instead. The O(1) gate-up/down
+/// expert refs (pointer-table views, no per-expert work) are constructed
+/// by the caller and passed in so the returned Step program can borrow
+/// them. Returns the lane plus the resolved route (the GPU lane's
+/// FWHT/Paro controls).
+pub(crate) fn classify_decode_lane<'a>(
+    params: &'a hipfire_dispatch::families::moe::MoeParams<'a>,
+    gu_experts: &'a hipfire_dispatch::families::moe::MoeExpertRef<'a>,
+    dn_experts: &'a hipfire_dispatch::families::moe::MoeExpertRef<'a>,
+    k: usize,
+    n_exp: usize,
+    routed_experts_resident: bool,
+    arch_has_wmma: bool,
+) -> Result<
+    (
+        QwenDecodeLane<'a>,
+        hipfire_dispatch::families::moe::MoeResolution,
+    ),
+    hipfire_dispatch::types::DispatchError,
+> {
+    use hipfire_dispatch::families::moe::{build_moe_decode_steps, MoeResolution, MoeStepBuild};
+    use hipfire_dispatch::pipeline::{check_moe_decode_batch_size, check_moe_decode_supported};
+    let res = MoeResolution::resolve_arch(&params.dtypes, k, arch_has_wmma);
+    check_moe_decode_batch_size(params.batch_size)?;
+    check_moe_decode_supported(res.use_gpu_topk, k, n_exp, routed_experts_resident)?;
+    let lane = match build_moe_decode_steps(params, &res, gu_experts, dn_experts)? {
+        MoeStepBuild::CpuFallback => QwenDecodeLane::CpuFallback,
+        MoeStepBuild::Gpu(phases) => QwenDecodeLane::Gpu(phases),
+    };
+    Ok((lane, res))
+}
+
+/// The actual MoE FFN implementation. Every GPU intermediate tensor comes
+/// from the CALLER-PROVIDED [`MoeScratchRef`] — the impl performs no GPU
+/// allocation of its own. Host-side allocation is limited to the deferred
+/// O(n_exp) Legacy (gate_up, down) ref Vec, materialized lazily inside the
+/// CPU-top-K fallback leaf (once per fallback call); the GPU-top-K indexed
+/// lane allocates nothing.
 #[expect(
     clippy::too_many_arguments,
     reason = "mirrors the MoE dispatch family parameter surface (view, scratch refs, EP routing flags)"
@@ -4654,6 +5415,7 @@ fn moe_ffn_decode_impl(
     x_norm: &GpuTensor,
     x_residual: &GpuTensor,
     config: &Qwen35Config,
+    plans: &Qwen35MoeGroupPlans,
     s: &MoeScratchRef<'_>,
     x_rot_prerotated: bool,
     ep_routed_out: Option<&GpuTensor>,
@@ -4684,13 +5446,14 @@ fn moe_ffn_decode_impl(
     let expert_down_ptrs = view.expert_down_ptrs_tensor().map_err(map_bind_err)?;
     let expert_down_awq_ptrs = view.expert_down_awq_ptrs_tensor().map_err(map_bind_err)?;
     let expert_dtype_tags = view.expert_dtype_tags_tensor().map_err(map_bind_err)?;
-    // O(1) Frozen binding: routed-expert refs are materialized ONLY for the
-    // Legacy CPU-top-K fallback.  Frozen layers are C2-admitted to the
-    // indexed GPU route (the pointer tables + dtype tags above), so
-    // resolving a per-expert Vec here would be O(n_exp) dead work per
-    // decode token — the seam passes an empty slice instead (dispatch
-    // rejects empty refs on the CPU fallback; no fake refs/aliases).
-    let routed_experts = routed_expert_refs_for_params(&view).map_err(map_bind_err)?;
+    // Deferral seam: the O(n_exp) Legacy (gate_up, down) ref Vec is NEVER
+    // materialized for classification or the GPU-top-K indexed lane. The
+    // storage-derived predicate (Legacy layers materialize per-expert refs;
+    // Frozen layers pass an EMPTY slice — the C2 indexed GPU route is
+    // guaranteed) is exactly equivalent to `!routed_experts.is_empty()`
+    // without the O(n_exp) work; the CPU-top-K fallback leaf materializes
+    // the Legacy refs lazily, immediately before the preserved executor.
+    let routed_experts_resident = matches!(view, MoeFfnView::Legacy(_));
 
     let moe_params = hipfire_dispatch::families::moe::MoeParams {
         dtypes: moe_dtypes,
@@ -4719,7 +5482,10 @@ fn moe_ffn_decode_impl(
         routed_gate_up_k,
         routed_down_m,
         routed_down_k,
-        routed_experts: &routed_experts,
+        // The GPU-top-K indexed lane and classification bind an EMPTY
+        // routed-expert slice; the CPU-top-K fallback leaf rebuilds this
+        // one field with the lazily materialized Legacy refs.
+        routed_experts: &[],
         routed_gate_up_paro,
         routed_down_paro,
         router_logits: s.router_logits,
@@ -4738,9 +5504,76 @@ fn moe_ffn_decode_impl(
         down_expanded: s.down_expanded,
     };
     let ctx = hipfire_dispatch::context::DispatchCtx::new(gpu);
-    hipfire_runtime::llama::moe_family()
-        .run(&ctx, gpu, &moe_params)
-        .map_err(HipError::from)?;
+
+    // STEP-002 Task 9: the production GPU decode path builds the dispatch
+    // builder's Step program and routes it through the runtime lowerer under
+    // the Single policy + manifest group. The CPU-top-K fallback (k != 8 or a
+    // non-indexable routed dtype) stays an explicit non-Step leaf: it is
+    // matched to the preserved family decode executor, which runs the gate
+    // side directly and then the CPU-top-K fallback (Hessian capture and all
+    // existing guards unchanged). Classification runs through the pure seam
+    // with empty routed refs; the Legacy refs are materialized only inside
+    // the fallback leaf.
+    // O(1) gate-up/down expert views (pointer tables + dims — no per-expert
+    // materialization); the O(n_exp) Legacy refs stay deferred to the
+    // fallback leaf below.
+    let (gu_experts, dn_experts) = decode_expert_refs(&moe_params);
+    let (lane, res) = classify_decode_lane(
+        &moe_params,
+        &gu_experts,
+        &dn_experts,
+        k,
+        n_exp,
+        routed_experts_resident,
+        ctx.arch.has_wmma(),
+    )
+    .map_err(HipError::from)?;
+    match lane {
+        QwenDecodeLane::CpuFallback => {
+            // Deferred leaf: materialize the O(n_exp) Legacy (gate_up, down)
+            // ref Vec exactly once — the only call site in the decode path —
+            // then run the preserved family executor unchanged.
+            let routed_experts = routed_expert_refs_for_params(&view).map_err(map_bind_err)?;
+            let fallback_params = hipfire_dispatch::families::moe::MoeParams {
+                routed_experts: &routed_experts,
+                ..moe_params
+            };
+            hipfire_dispatch::pipeline::run_moe_decode(&ctx, gpu, &fallback_params)
+                .map_err(HipError::from)?;
+        }
+        QwenDecodeLane::Gpu(phases) => {
+            // Zero Legacy materialization on this lane: `moe_params` bound an
+            // empty routed-expert slice; the indexed GPU route uses the
+            // pointer tables + dtype tags.
+            // Signs back the FWHT used by every MQ4/MQ6 gate_up rotation +
+            // silu-rotate (idempotent/cached; mirrors the preserved executor's
+            // position before the rotate). Only the paro path is sign-free.
+            if !res.routed_indexable_paro {
+                gpu.ensure_mq_signs()
+                    .map_err(|e| HipError::new(0, &e.to_string()))?;
+            }
+            let policy = MoEExecutionPolicy::single();
+            // Model-owned immutable plan: resolved once through the manifest
+            // authority; borrow by layer — never a per-token construction.
+            let group = plans.by_layer(layer_idx as usize);
+            let parts = MoeProgramParts {
+                router: RouterPlan::SoftmaxTopK {
+                    scores: moe_params.router_logits,
+                    topk_indices: moe_params.topk_indices,
+                    topk_weights: moe_params.topk_weights,
+                    k_top: k,
+                    normalize: config.norm_topk_prob,
+                    route_scale: 1.0,
+                },
+                execution: ExpertExecutionPlan::IndexedQuantized,
+                ranks: vec![qwen35_decode_phase_buckets(phases).map_err(map_bucket_err)?],
+            };
+            let program = lower_moe_steps(&group, &policy, parts)
+                .map_err(|e| HipError::new(0, &format!("qwen35 decode lowering: {e}")))?;
+            execute_lowered_moe(&program, MoeExecutionTarget::Single { gpu, ctx: &ctx })
+                .map_err(HipError::from)?;
+        }
+    }
     if expert_stats_enabled() {
         capture_expert_stats(
             gpu,
@@ -4959,6 +5792,17 @@ pub struct Qwen35Scratch {
     // replay (task #100).
     pub moe_down_expanded: Option<GpuTensor>,
 
+    // ── Emulated EP2 harness (test-only, feature `emulated-ep2-harness`) ──
+    // Reusable [dim] F32 partial buffers for the sequential two-rank MoE
+    // decode.  Zeroed at the start of every MoE layer/forward; rank 0's
+    // routed (+ shared-down) tail accumulates into partial0, rank 1's
+    // routed-only tail into partial1, then both are added into the
+    // residual exactly once.
+    #[cfg(feature = "emulated-ep2-harness")]
+    pub ep2_gu_partial0: Option<GpuTensor>, // [dim]
+    #[cfg(feature = "emulated-ep2-harness")]
+    pub ep2_gu_partial1: Option<GpuTensor>, // [dim]
+
     // Optional long-prefill scratch. Default is None to preserve VRAM
     // footprint; set HIPFIRE_PREFILL_REUSE_PBS=1 to allocate and reuse it.
     pub prefill_batch: Option<PrefillBatchScratch>,
@@ -5117,6 +5961,10 @@ impl ScratchStaging {
             moe_topk_indices: xt_opt(tensors),
             moe_topk_weights: xt_opt(tensors),
             moe_down_expanded: xt_opt(tensors),
+            #[cfg(feature = "emulated-ep2-harness")]
+            ep2_gu_partial0: xt_opt(tensors),
+            #[cfg(feature = "emulated-ep2-harness")]
+            ep2_gu_partial1: xt_opt(tensors),
             prefill_batch: None,
         }
     }
@@ -5175,6 +6023,12 @@ fn append_moe_staging(
     moe_alloc!("moe_topk_indices", &[k], DType::F32);
     moe_alloc!("moe_topk_weights", &[k], DType::F32);
     moe_alloc!("moe_down_expanded", &[k * hidden], DType::F32);
+    #[cfg(feature = "emulated-ep2-harness")]
+    {
+        // Emulated-EP2 decode partial buffers (one per logical rank).
+        moe_alloc!("ep2_gu_partial0", &[hidden], DType::F32);
+        moe_alloc!("ep2_gu_partial1", &[hidden], DType::F32);
+    }
 
     // Pre-warm MQ FWHT sign tables.
     if let Err(e) = gpu.ensure_mq_signs() {
@@ -5432,6 +6286,10 @@ impl Qwen35Scratch {
             self.moe_topk_indices,
             self.moe_topk_weights,
             self.moe_down_expanded,
+            #[cfg(feature = "emulated-ep2-harness")]
+            self.ep2_gu_partial0,
+            #[cfg(feature = "emulated-ep2-harness")]
+            self.ep2_gu_partial1,
         ]
         .into_iter()
         .flatten()
@@ -5942,6 +6800,16 @@ pub struct PrefillBatchScratch {
     // `new`); currently always allocated when LA layers exist, like the Q8
     // tape. s_tape_f32: [max_batch × n_v_heads × head_dim × head_dim] f32.
     pub dn_s_tape_f32: Option<GpuTensor>,
+
+    // ── Emulated EP2 harness (test-only, feature `emulated-ep2-harness`) ──
+    // Reusable [max_batch × dim] F32 partial buffers for the sequential
+    // two-rank MoE prefill tail.  Zeroed at the start of every MoE
+    // layer/forward; the routed combine of each rank accumulates here and
+    // both partials are added into `x_batch` exactly once.
+    #[cfg(feature = "emulated-ep2-harness")]
+    pub ep2_partial0: Option<GpuTensor>,
+    #[cfg(feature = "emulated-ep2-harness")]
+    pub ep2_partial1: Option<GpuTensor>,
 }
 
 impl PrefillBatchScratch {
@@ -6183,6 +7051,22 @@ impl PrefillBatchScratch {
                     * config.linear_value_head_dim],
                 DType::F32
             ),
+            // Emulated-EP2 prefill partials (harness feature): [max_batch × dim]
+            // F32 per logical rank; the two routed tails accumulate here and
+            // the combined partial is added into x_batch exactly once per MoE
+            // layer.
+            #[cfg(feature = "emulated-ep2-harness")]
+            ep2_partial0: alloc_opt!(
+                config.num_experts > 0,
+                &[max_batch * config.dim],
+                DType::F32
+            ),
+            #[cfg(feature = "emulated-ep2-harness")]
+            ep2_partial1: alloc_opt!(
+                config.num_experts > 0,
+                &[max_batch * config.dim],
+                DType::F32
+            ),
         })
     }
 
@@ -6246,6 +7130,10 @@ impl PrefillBatchScratch {
             self.dn_s_tape_q8,
             self.dn_s_tape_scales,
             self.dn_s_tape_f32,
+            #[cfg(feature = "emulated-ep2-harness")]
+            self.ep2_partial0,
+            #[cfg(feature = "emulated-ep2-harness")]
+            self.ep2_partial1,
         ]
         .into_iter()
         .flatten()
@@ -6643,6 +7531,8 @@ pub fn forward_prefill_batch_single_chunk_captured_opts(
         needs_last_token_logits,
         None, // max_layer: single-chunk captured path always runs the full stack
         None, // routed_out: non-EP single-GPU path
+        #[cfg(feature = "emulated-ep2-harness")]
+        None, // ep2: non-EP single-GPU path
     )
 }
 
@@ -6807,6 +7697,8 @@ fn forward_prefill_batch_with_pbs_abortable(
         max_layer,
         needs_last_token_logits,
         abort,
+        #[cfg(feature = "emulated-ep2-harness")]
+        None, // ep2: production wrapper
     )
 }
 
@@ -6860,6 +7752,78 @@ pub fn forward_prefill_batch_with_pbs_opts(
         max_layer,
         needs_last_token_logits,
         &|| false,
+        #[cfg(feature = "emulated-ep2-harness")]
+        None, // ep2: production wrapper
+    )
+    .map(|_| ())
+}
+
+/// Emulated-EP2 batched prefill entry (harness feature only): like
+/// [`forward_prefill_batch_with_pbs`] but every MoE layer's routed tail runs
+/// twice (rank 0 / rank 1 views) into the pbs partial buffers, combined once.
+/// The caller-owned `pbs` must carry the EP2 partials (allocated by
+/// [`PrefillBatchScratch::new`] under the harness feature).
+///
+/// Requires the batched path — the per-token fallback refuses EP2 (the
+/// two-rank split lives in the batched MoE body).
+#[cfg(feature = "emulated-ep2-harness")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors forward_prefill_batch_with_pbs (tokens, scratch, hidden-ring and spec-verify hooks)"
+)]
+pub(crate) fn forward_prefill_batch_with_pbs_ep2(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    tokens: &[u32],
+    start_pos: usize,
+    kv_cache: &mut llama::KvCache,
+    dn_state: &mut DeltaNetState,
+    scratch: &Qwen35Scratch,
+    hidden_rb: Option<&mut HiddenStateRingBuffer>,
+    per_token_hidden_out: Option<&GpuTensor>,
+    gdn_tape: Option<&mut crate::speculative::GdnTape>,
+    tree_verify: Option<TreeVerifyCtx<'_>>,
+    pbs: &PrefillBatchScratch,
+    needs_last_token_logits: bool,
+) -> HipResult<()> {
+    // The EP2 split lives in the batched MoE body; the per-token fallback
+    // cannot express it.  Refuse clearly if this configuration is not
+    // batched-prefill-eligible.
+    let eligible = prefill_batch_pbs_eligible(
+        weights,
+        config,
+        dn_state,
+        tokens.len(),
+        gpu.arch.as_str(),
+        pbs.moe_router_logits_batch.is_some(),
+    );
+    if !eligible {
+        return Err(hip_bridge::HipError::new(
+            0,
+            "forward_prefill_batch_with_pbs_ep2: model is not batched-prefill-eligible; \
+             the emulated-EP2 harness requires the batched path",
+        ));
+    }
+    forward_prefill_batch_with_pbs_opts_abortable(
+        gpu,
+        weights,
+        config,
+        tokens,
+        start_pos,
+        kv_cache,
+        dn_state,
+        scratch,
+        hidden_rb,
+        per_token_hidden_out,
+        gdn_tape,
+        tree_verify,
+        Some(pbs),
+        None,
+        None,
+        needs_last_token_logits,
+        &|| false,
+        Some(Ep2PrefillCtx),
     )
     .map(|_| ())
 }
@@ -6883,6 +7847,7 @@ fn forward_prefill_batch_with_pbs_opts_abortable(
     max_layer: Option<usize>,
     needs_last_token_logits: bool,
     abort: &dyn Fn() -> bool,
+    #[cfg(feature = "emulated-ep2-harness")] ep2: Option<Ep2PrefillCtx>,
 ) -> HipResult<bool> {
     // Plain single-token AR decode? Only then is the per-token `forward_scratch`
     // call below eligible for the AR-forward hipGraph (capture/replay). Any spec
@@ -7066,6 +8031,18 @@ fn forward_prefill_batch_with_pbs_opts_abortable(
              model fell through to the per-token fallback (likely non-MQ4 \
              weights, dn_state quant != Q8, or HIPFIRE_PREFILL_BATCHED=0).",
         );
+        // The emulated-EP2 harness requires the batched path: the two-rank
+        // split lives inside the batched MoE body.  The EP2 entry pre-checks
+        // eligibility, so reaching here is a harness/config bug — refuse
+        // loudly instead of silently comparing single-rank decode.
+        #[cfg(feature = "emulated-ep2-harness")]
+        if ep2.is_some() {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "forward_prefill_batch: emulated-EP2 harness requires the batched \
+                 prefill path (model fell through to the per-token fallback)",
+            ));
+        }
         // Fallback: per-token loop, byte-identical to decode. If hidden
         // extraction is requested, use the with_hidden variant so the ring
         // buffer still gets populated correctly (each call advances head by 1).
@@ -7211,6 +8188,8 @@ fn forward_prefill_batch_with_pbs_opts_abortable(
                 needs_last_token_logits,
                 max_layer,
                 None, // routed_out: non-EP single-GPU path
+                #[cfg(feature = "emulated-ep2-harness")]
+                ep2,
             )?;
             // The chunk contains the bounded unit of trunk work. Check before
             // committing any staging/ring writes and again after that GPU work;
@@ -7693,7 +8672,8 @@ pub(crate) fn moe_ffn_batched_admissible_for_dtypes(
     // router/scalar-gate are Q8 (validated by router_ok/shared_gate_ok above).
     // The batched body runs a dedicated Q8 shared-expert path (two plain Q8
     // GEMMs + silu_mul + sigmoid-scaled residual add) and routes the E8
-    // experts through `run_moe_prefill` Path 1 (indexed batched GEMV).
+    // experts through the lowered prefill tail Path 1 (indexed batched
+    // GEMV).
     // E8-family match helper: MFP4, MFP3, MFP2 lattice types.
     let is_e8_family =
         |dt: DType| matches!(dt, DType::MFP4G32E8 | DType::MFP3G32E8 | DType::MFP2G32E8);
@@ -8330,28 +9310,106 @@ fn prefill_moe_ffn_body_batched(
     // expert (step 5) stays in `pbs.x_batch` — replicated per rank, not
     // redirected. `None` = byte-identical single-GPU behavior.
     routed_out: Option<&GpuTensor>,
+    plans: &Qwen35MoeGroupPlans,
+) -> HipResult<()> {
+    prefill_moe_ffn_body_batched_inner(
+        gpu,
+        view,
+        ffn_norm,
+        config,
+        pbs,
+        n,
+        ctx,
+        model_has_mq6_moe,
+        routed_out,
+        plans,
+        #[cfg(feature = "emulated-ep2-harness")]
+        None,
+    )
+}
+
+/// Emulated-EP2 prefill body (harness feature only): preparation and the
+/// shared-expert contribution run ONCE with the canonical view, then the
+/// routed tail runs twice — rank 0's view into `partial0`, rank 1's view
+/// into `partial1` — and both partials are added into `pbs.x_batch` exactly
+/// once.  The shared expert is never duplicated.
+#[cfg(feature = "emulated-ep2-harness")]
+fn prefill_moe_ffn_body_batched_ep2(
+    gpu: &mut Gpu,
+    view0: MoeFfnView<'_>,
+    view1: MoeFfnView<'_>,
+    ffn_norm: &GpuTensor,
+    config: &Qwen35Config,
+    pbs: &PrefillBatchScratch,
+    n: usize,
+    ctx: &DispatchCtx,
+    model_has_mq6_moe: bool,
+    plans: &Qwen35MoeGroupPlans,
+) -> HipResult<()> {
+    let partial0 = pbs
+        .ep2_partial0
+        .as_ref()
+        .expect("EP2 prefill partial0 (harness feature)");
+    let partial1 = pbs
+        .ep2_partial1
+        .as_ref()
+        .expect("EP2 prefill partial1 (harness feature)");
+    prefill_moe_ffn_body_batched_inner(
+        gpu,
+        view0,
+        ffn_norm,
+        config,
+        pbs,
+        n,
+        ctx,
+        model_has_mq6_moe,
+        None,
+        plans,
+        Some(Ep2PrefillBody {
+            view1,
+            partial0,
+            partial1,
+        }),
+    )
+}
+
+/// Per-layer EP2 prefill context: the rank-1 view plus the two reusable
+/// partial buffers.  The rank-0 view is the canonical body view (its
+/// shared/router resources are identical to the canonical ones).
+#[cfg(feature = "emulated-ep2-harness")]
+struct Ep2PrefillBody<'a> {
+    view1: MoeFfnView<'a>,
+    partial0: &'a GpuTensor,
+    partial1: &'a GpuTensor,
+}
+
+fn prefill_moe_ffn_body_batched_inner(
+    gpu: &mut Gpu,
+    view: MoeFfnView<'_>,
+    ffn_norm: &GpuTensor,
+    config: &Qwen35Config,
+    pbs: &PrefillBatchScratch,
+    n: usize,
+    ctx: &DispatchCtx,
+    model_has_mq6_moe: bool,
+    routed_out: Option<&GpuTensor>,
+    plans: &Qwen35MoeGroupPlans,
+    #[cfg(feature = "emulated-ep2-harness")] ep2: Option<Ep2PrefillBody<'_>>,
 ) -> HipResult<()> {
     // Fallible extraction for both Legacy and Frozen.  The router /
     // shared-expert-gate tensors and per-expert metadata are read inline
     // via view accessors at their use sites (migration leftovers removed).
+    // The routed pointer tables / dtypes / scratch are consumed by the
+    // extracted routed tail (step 6) and not bound here.
     let shared_gu_w = view.shared_gate_ref().map_err(map_bind_err)?;
     let shared_up_w = view.shared_up_ref().map_err(map_bind_err)?;
     let shared_dn_w = view.shared_down_ref().map_err(map_bind_err)?;
-    let egu_ptrs = view.expert_gate_up_ptrs_tensor().map_err(map_bind_err)?;
-    let edn_ptrs = view.expert_down_ptrs_tensor().map_err(map_bind_err)?;
-    let edn_awq = view.expert_down_awq_ptrs_tensor().map_err(map_bind_err)?;
-    let edtags = view.expert_dtype_tags_tensor().map_err(map_bind_err)?;
 
     // Metadata (infallible)
     let sd_dt = view.shared_down_dtype();
-    let gu0_k = view.first_expert_gate_up_k();
-    let dn0_m = view.first_expert_down_m();
-    let dn0_k = view.first_expert_down_k();
 
     let dim = config.dim;
-    let mi = config.moe_intermediate_size;
     let smi = config.shared_expert_intermediate_size;
-    let k_top = config.num_experts_per_tok;
     let n_exp = config.num_experts;
 
     let router_logits = pbs.moe_router_logits_batch.as_ref().expect("moe scratch");
@@ -8361,9 +9419,9 @@ fn prefill_moe_ffn_body_batched(
     let shared_rot = pbs.moe_shared_rot_batch.as_ref().expect("moe scratch");
     let topk_indices = pbs.moe_topk_indices_batch.as_ref().expect("moe scratch");
     let topk_weights = pbs.moe_topk_weights_batch.as_ref().expect("moe scratch");
-    let gate_batch = pbs.moe_gate_batch.as_ref().expect("moe scratch");
-    let up_batch = pbs.moe_up_batch.as_ref().expect("moe scratch");
-    let rot_batch = pbs.moe_rot_batch.as_ref().expect("moe scratch");
+    // Shared-expert down scratch for the Q8 / E8 arms (aliases the routed
+    // down-expanded buffer, which is free here — the routed tail (step 6)
+    // overwrites it only after this completes).
     let down_expanded = pbs.moe_down_expanded_batch.as_ref().expect("moe scratch");
 
     // ── 1. Split rmsnorm vs FWHT rotate ──
@@ -8861,7 +9919,126 @@ fn prefill_moe_ffn_body_batched(
         ),
     }
 
-    // ── 6. Routed experts: delegated to MoeFamily::run_prefill (Ship 4.2) ──
+    // ── 6. Routed experts: lowered prefill tail (STEP-002 Task 9) ──
+    // Single (production): the routed tail runs once with the canonical view
+    // and accumulates into `x_batch` (or the legacy-EP `routed_out` partial).
+    // Emulated EP2 (harness): preparation/shared already ran once above; the
+    // routed tail runs TWICE — rank 0 into `partial0`, rank 1 into `partial1`
+    // — and the partials are combined into `x_batch` exactly once.  The
+    // partials are zeroed at the start of every layer/forward.
+    #[cfg(feature = "emulated-ep2-harness")]
+    if let Some(ep2) = ep2 {
+        gpu.hip
+            .memset(&ep2.partial0.buf, 0, ep2.partial0.buf.size())?;
+        gpu.hip
+            .memset(&ep2.partial1.buf, 0, ep2.partial1.buf.size())?;
+        prefill_moe_ffn_routed_tail(
+            gpu,
+            view,
+            config,
+            pbs,
+            n,
+            ctx,
+            model_has_mq6_moe,
+            Some(ep2.partial0),
+            router_logits,
+            plans,
+        )?;
+        prefill_moe_ffn_routed_tail(
+            gpu,
+            ep2.view1,
+            config,
+            pbs,
+            n,
+            ctx,
+            model_has_mq6_moe,
+            Some(ep2.partial1),
+            router_logits,
+            plans,
+        )?;
+        gpu.add_inplace_f32(&pbs.x_batch, ep2.partial0)?;
+        gpu.add_inplace_f32(&pbs.x_batch, ep2.partial1)?;
+        return Ok(());
+    }
+    prefill_moe_ffn_routed_tail(
+        gpu,
+        view,
+        config,
+        pbs,
+        n,
+        ctx,
+        model_has_mq6_moe,
+        routed_out,
+        router_logits,
+        plans,
+    )
+}
+
+/// Non-owning logical view of a batched scratch owner narrowed to ONE active
+/// chunk: `GpuTensor::shallow_clone()` preserves the device pointer, dtype,
+/// and full buffer capacity; only the logical shape becomes `[n, dim]` so
+/// the sealed lowering sees the ACTIVE batch (never the max-batch capacity).
+/// Qwen-local logical-view repair — no shared abstraction; the shared
+/// lowerer's exact-shape check is unchanged.
+fn prefill_batch_view(t: &GpuTensor, n: usize, dim: usize) -> GpuTensor {
+    let mut view = t.shallow_clone();
+    view.shape = vec![n, dim];
+    view
+}
+
+/// The qwen35 batched MoE routed tail: scatter → gate_up →
+/// gate-up deinterleave (MoeGateUpUnscatter) → SwiGLU+rotate → down →
+/// combine, accumulating into `pbs.x_batch` (or the supplied `routed_out`
+/// partial).  Extracted from
+/// [`prefill_moe_ffn_body_batched_inner`] step 6 so the emulated-EP2 path
+/// can run it twice (once per rank view) without duplicating the
+/// preparation/shared steps.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors the batched MoE routed-tail parameter surface (view, pbs, chunk width, dispatch ctx, MQ6 fence, routed-out partial)"
+)]
+fn prefill_moe_ffn_routed_tail(
+    gpu: &mut Gpu,
+    view: MoeFfnView<'_>,
+    config: &Qwen35Config,
+    pbs: &PrefillBatchScratch,
+    n: usize,
+    ctx: &DispatchCtx,
+    model_has_mq6_moe: bool,
+    routed_out: Option<&GpuTensor>,
+    router_logits: &GpuTensor,
+    plans: &Qwen35MoeGroupPlans,
+) -> HipResult<()> {
+    let dim = config.dim;
+    let mi = config.moe_intermediate_size;
+    let k_top = config.num_experts_per_tok;
+    let n_exp = config.num_experts;
+
+    // Qwen-local logical-view repair: the PBS batch
+    // buffers are capacity-owned (`max_batch`, e.g. `[16, hidden]`), but the
+    // sealed lowering requires the x_batch input and the routed combine
+    // output to carry the ACTIVE batch logical shape `[n, dim]`.
+    // `shallow_clone()` keeps the device pointer, dtype, and full buffer
+    // capacity — only the logical shape is narrowed. The views outlive the
+    // builder/lowering/execution below. The shared lowerer's exact-shape
+    // check is unchanged.
+    let x_batch_view = prefill_batch_view(&pbs.x_batch, n, dim);
+    let routed_out_view = routed_out.map(|t| prefill_batch_view(t, n, dim));
+
+    let egu_ptrs = view.expert_gate_up_ptrs_tensor().map_err(map_bind_err)?;
+    let edn_ptrs = view.expert_down_ptrs_tensor().map_err(map_bind_err)?;
+    let edn_awq = view.expert_down_awq_ptrs_tensor().map_err(map_bind_err)?;
+    let edtags = view.expert_dtype_tags_tensor().map_err(map_bind_err)?;
+    let gu0_k = view.first_expert_gate_up_k();
+    let dn0_m = view.first_expert_down_m();
+    let dn0_k = view.first_expert_down_k();
+    let topk_indices = pbs.moe_topk_indices_batch.as_ref().expect("moe scratch");
+    let topk_weights = pbs.moe_topk_weights_batch.as_ref().expect("moe scratch");
+    let gate_batch = pbs.moe_gate_batch.as_ref().expect("moe scratch");
+    let up_batch = pbs.moe_up_batch.as_ref().expect("moe scratch");
+    let rot_batch = pbs.moe_rot_batch.as_ref().expect("moe scratch");
+    let down_expanded = pbs.moe_down_expanded_batch.as_ref().expect("moe scratch");
+
     let total_slots = n * k_top;
     let m_total_max = moe_grouped_m_total_bound(total_slots, n_exp);
 
@@ -8874,7 +10051,8 @@ fn prefill_moe_ffn_body_batched(
     // the Ship 4.2 single-scale `down_awq_scale` stub for routed experts — that
     // stub applied experts[0]'s scale to every routed slot, which is wrong once
     // experts actually carry per-expert AWQ. Pass `None` for the single scale;
-    // `expert_down_awq_ptrs` drives the correct per-slot path in run_moe_prefill.
+    // `expert_down_awq_ptrs` drives the correct per-slot path in the lowered
+    // prefill tail.
     let down_awq_scale: Option<&GpuTensor> = None;
 
     let moe_prefill_params = hipfire_dispatch::families::moe::MoePrefillParams {
@@ -8892,7 +10070,7 @@ fn prefill_moe_ffn_body_batched(
             && gpu.flags.moe_grouped_i8.is_none(),
         topk_indices,
         topk_weights,
-        x_batch: &pbs.x_batch,
+        x_batch: &x_batch_view,
         x_norm_batch: &pbs.x_norm_batch,
         x_rot_batch: &pbs.x_rot_batch,
         expert_gate_up_ptrs: egu_ptrs,
@@ -8913,10 +10091,55 @@ fn prefill_moe_ffn_body_batched(
         paro_gate_up,
         paro_down,
         down_awq_scale,
-        routed_out,
+        routed_out: routed_out_view.as_ref(),
     };
-    hipfire_runtime::llama::moe_family()
-        .run_prefill(ctx, gpu, &moe_prefill_params)
+    // STEP-002 Task 9: the production batched routed tail builds the dispatch
+    // builder's Step program and routes it through the runtime lowerer under
+    // the Single policy + the MODEL-OWNED manifest group. Path 0/1 (indexed)
+    // and Path 2 (grouped) both lower here with exact typed membership; the
+    // sealed executor is the only prefill backend (no direct
+    // `execute_steps_mesh` call remains for the migrated MoE prefill). The
+    // model owns RMSNorm, routing, and the shared expert — this tail is the
+    // routed block only.
+    let res = hipfire_dispatch::families::moe::MoePrefillResolution::resolve(
+        &moe_prefill_params.dtypes,
+        &ctx.arch,
+        &ctx.flags,
+    );
+    let (gu_experts, dn_experts) =
+        hipfire_dispatch::families::moe::prefill_expert_refs(&moe_prefill_params);
+    let phases = hipfire_dispatch::families::moe::build_moe_prefill_steps(
+        &moe_prefill_params,
+        &res,
+        &gu_experts,
+        &dn_experts,
+    )
+    .map_err(HipError::from)?;
+    let buckets = qwen35_prefill_phase_buckets(phases).map_err(map_bucket_err)?;
+    // Model-owned immutable plan: resolved once through the manifest
+    // authority; borrow by layer — never a per-token construction.
+    let group = plans.by_layer(view.layer_idx() as usize);
+    let execution = if res.use_path2 {
+        ExpertExecutionPlan::GroupedQuantized
+    } else {
+        ExpertExecutionPlan::IndexedQuantized
+    };
+    let policy = MoEExecutionPolicy::single();
+    let parts = MoeProgramParts {
+        router: RouterPlan::SoftmaxTopK {
+            scores: router_logits,
+            topk_indices,
+            topk_weights,
+            k_top,
+            normalize: config.norm_topk_prob,
+            route_scale: 1.0,
+        },
+        execution,
+        ranks: vec![buckets],
+    };
+    let program = lower_moe_steps(group, &policy, parts)
+        .map_err(|e| HipError::new(0, &format!("qwen35 prefill lowering: {e}")))?;
+    execute_lowered_moe(&program, MoeExecutionTarget::Single { gpu, ctx })
         .map_err(HipError::from)?;
 
     Ok(())
@@ -9036,6 +10259,11 @@ fn forward_prefill_chunk(
     // the driver after the call). Always `None` for multi-layer bands (PP /
     // single-GPU full stack) — a shared partial across >1 MoE layer would be wrong.
     routed_out: Option<&GpuTensor>,
+    // Emulated EP2 harness (feature only): when `Some`, every MoE layer's
+    // routed tail runs twice (rank 0 / rank 1 views) into the pbs partial
+    // buffers and is combined once; preparation/shared run once.  The
+    // production and legacy-EP drivers pass `None`.
+    #[cfg(feature = "emulated-ep2-harness")] ep2: Option<Ep2PrefillCtx>,
 ) -> HipResult<()> {
     let n = tokens.len();
     debug_assert!(n > 0);
@@ -9047,6 +10275,12 @@ fn forward_prefill_chunk(
                 .unwrap_or(false),
         "forward_prefill_chunk: routed_out requires a single-layer band (EP driver invariant)",
     );
+
+    // STEP-002 Task 9: model-owned expert-group plans — resolved once through
+    // the validated manifest authority, borrowed by layer per chunk.
+    let moe_plans = weights
+        .moe_group_plans(config)
+        .map_err(|e| HipError::new(0, &e))?;
 
     let dim = config.dim;
     let hidden_dim = config.hidden_dim;
@@ -11528,18 +12762,57 @@ fn forward_prefill_chunk(
 
                 // Batched MoE FFN via central view. Takes pbs.x_batch as input
                 // and accumulates the FFN output residual back into it.
-                let v = weights.moe_ffn_view(layer_idx).map_err(map_bind_err)?;
-                prefill_moe_ffn_body_batched(
-                    gpu,
-                    v,
-                    &layer.ffn_norm,
-                    config,
-                    pbs,
-                    n,
-                    &ctx,
-                    weights.moe_has_mq6,
-                    routed_out,
-                )?;
+                #[cfg(feature = "emulated-ep2-harness")]
+                if ep2.is_some() {
+                    let v0 = weights
+                        .moe_ffn_view_ep2(layer_idx, 0)
+                        .map_err(map_bind_err)?;
+                    let v1 = weights
+                        .moe_ffn_view_ep2(layer_idx, 1)
+                        .map_err(map_bind_err)?;
+                    prefill_moe_ffn_body_batched_ep2(
+                        gpu,
+                        v0,
+                        v1,
+                        &layer.ffn_norm,
+                        config,
+                        pbs,
+                        n,
+                        &ctx,
+                        weights.moe_has_mq6,
+                        moe_plans,
+                    )?;
+                } else {
+                    let v = weights.moe_ffn_view(layer_idx).map_err(map_bind_err)?;
+                    prefill_moe_ffn_body_batched(
+                        gpu,
+                        v,
+                        &layer.ffn_norm,
+                        config,
+                        pbs,
+                        n,
+                        &ctx,
+                        weights.moe_has_mq6,
+                        routed_out,
+                        moe_plans,
+                    )?;
+                }
+                #[cfg(not(feature = "emulated-ep2-harness"))]
+                {
+                    let v = weights.moe_ffn_view(layer_idx).map_err(map_bind_err)?;
+                    prefill_moe_ffn_body_batched(
+                        gpu,
+                        v,
+                        &layer.ffn_norm,
+                        config,
+                        pbs,
+                        n,
+                        &ctx,
+                        weights.moe_has_mq6,
+                        routed_out,
+                        moe_plans,
+                    )?;
+                }
 
                 // Post-layer hidden extract for the DFlash draft path.
                 if let Some(rb) = hidden_rb {
@@ -12054,18 +13327,57 @@ fn forward_prefill_chunk(
                 }
 
                 // Batched MoE FFN via central view.
-                let v = weights.moe_ffn_view(layer_idx).map_err(map_bind_err)?;
-                prefill_moe_ffn_body_batched(
-                    gpu,
-                    v,
-                    &layer.ffn_norm,
-                    config,
-                    pbs,
-                    n,
-                    &ctx,
-                    weights.moe_has_mq6,
-                    routed_out,
-                )?;
+                #[cfg(feature = "emulated-ep2-harness")]
+                if ep2.is_some() {
+                    let v0 = weights
+                        .moe_ffn_view_ep2(layer_idx, 0)
+                        .map_err(map_bind_err)?;
+                    let v1 = weights
+                        .moe_ffn_view_ep2(layer_idx, 1)
+                        .map_err(map_bind_err)?;
+                    prefill_moe_ffn_body_batched_ep2(
+                        gpu,
+                        v0,
+                        v1,
+                        &layer.ffn_norm,
+                        config,
+                        pbs,
+                        n,
+                        &ctx,
+                        weights.moe_has_mq6,
+                        moe_plans,
+                    )?;
+                } else {
+                    let v = weights.moe_ffn_view(layer_idx).map_err(map_bind_err)?;
+                    prefill_moe_ffn_body_batched(
+                        gpu,
+                        v,
+                        &layer.ffn_norm,
+                        config,
+                        pbs,
+                        n,
+                        &ctx,
+                        weights.moe_has_mq6,
+                        routed_out,
+                        moe_plans,
+                    )?;
+                }
+                #[cfg(not(feature = "emulated-ep2-harness"))]
+                {
+                    let v = weights.moe_ffn_view(layer_idx).map_err(map_bind_err)?;
+                    prefill_moe_ffn_body_batched(
+                        gpu,
+                        v,
+                        &layer.ffn_norm,
+                        config,
+                        pbs,
+                        n,
+                        &ctx,
+                        weights.moe_has_mq6,
+                        routed_out,
+                        moe_plans,
+                    )?;
+                }
 
                 // Post-layer hidden extract for the DFlash draft path.
                 if let Some(rb) = hidden_rb {
@@ -12646,7 +13958,11 @@ fn batched_gemm_single_weight(
 
 // ── Forward scratch layers (dispatch family version) ────────────────────
 
-fn forward_scratch_layers(
+/// Production single-device layer walk (Frozen or Legacy MoE), unchanged
+/// byte behavior: the shared inner builder runs with
+/// [`MoeExecution::Single`].  `pub(crate)` so the emulated-EP2 harness can
+/// drive the baseline decode through the exact production path.
+pub(crate) fn forward_scratch_layers(
     gpu: &mut Gpu,
     weights: &Qwen35Weights,
     config: &Qwen35Config,
@@ -12656,12 +13972,77 @@ fn forward_scratch_layers(
     s: &Qwen35Scratch,
     hidden_rb: Option<&mut HiddenStateRingBuffer>,
 ) -> HipResult<()> {
+    forward_scratch_layers_inner(
+        gpu,
+        weights,
+        config,
+        pos,
+        kv_cache,
+        dn_state,
+        s,
+        hidden_rb,
+        MoeExecution::Single,
+    )
+}
+
+/// Emulated-EP2 layer walk (harness feature only): identical to
+/// [`forward_scratch_layers`] except every MoE layer's routed tail runs
+/// twice (rank 0 with the shared-expert contribution, rank 1 without) into
+/// reusable zeroed partial buffers combined once into the residual.
+#[cfg(feature = "emulated-ep2-harness")]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "harness execution seam consumed by ep2_harness::run (Phase 2B driver)"
+    )
+)]
+pub(crate) fn forward_scratch_layers_ep2(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    pos: usize,
+    kv_cache: &mut llama::KvCache,
+    dn_state: &mut DeltaNetState,
+    s: &Qwen35Scratch,
+    hidden_rb: Option<&mut HiddenStateRingBuffer>,
+) -> HipResult<()> {
+    forward_scratch_layers_inner(
+        gpu,
+        weights,
+        config,
+        pos,
+        kv_cache,
+        dn_state,
+        s,
+        hidden_rb,
+        MoeExecution::EmulatedEp2,
+    )
+}
+
+fn forward_scratch_layers_inner(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    pos: usize,
+    kv_cache: &mut llama::KvCache,
+    dn_state: &mut DeltaNetState,
+    s: &Qwen35Scratch,
+    hidden_rb: Option<&mut HiddenStateRingBuffer>,
+    execution: MoeExecution,
+) -> HipResult<()> {
     let k_dim = config.linear_num_key_heads * config.linear_key_head_dim;
     let v_dim = config.linear_num_value_heads * config.linear_value_head_dim;
     let n_v_heads = config.linear_num_value_heads;
     let hd = config.linear_key_head_dim;
 
     let ctx = DispatchCtx::new(gpu);
+
+    // STEP-002 Task 9: model-owned expert-group plans — resolved once through
+    // the validated manifest authority, borrowed by layer per forward.
+    let moe_plans = weights
+        .moe_group_plans(config)
+        .map_err(|e| HipError::new(0, &e))?;
 
     let mut kv_layer_idx = 0usize;
 
@@ -13050,8 +14431,31 @@ fn forward_scratch_layers(
                 }
 
                 // ── MoE FFN (single-device via central view) ──
-                let v = weights.moe_ffn_view(layer_idx).map_err(map_bind_err)?;
-                moe_ffn_dispatch(gpu, v, &s.x, &layer.ffn_norm, config, s)?;
+                match execution {
+                    MoeExecution::Single => {
+                        let v = weights.moe_ffn_view(layer_idx).map_err(map_bind_err)?;
+                        moe_ffn_dispatch(gpu, v, &s.x, &layer.ffn_norm, config, moe_plans, s)?;
+                    }
+                    #[cfg(feature = "emulated-ep2-harness")]
+                    MoeExecution::EmulatedEp2 => {
+                        let v0 = weights
+                            .moe_ffn_view_ep2(layer_idx, 0)
+                            .map_err(map_bind_err)?;
+                        let v1 = weights
+                            .moe_ffn_view_ep2(layer_idx, 1)
+                            .map_err(map_bind_err)?;
+                        moe_ffn_dispatch_ep2(
+                            gpu,
+                            v0,
+                            v1,
+                            &s.x,
+                            &layer.ffn_norm,
+                            config,
+                            moe_plans,
+                            s,
+                        )?;
+                    }
+                }
                 // DIAG: dump MoE router logits (per-token)
                 if layer_idx == 0 {
                     if let Some(ref rl) = s.moe_router_logits {
@@ -13151,8 +14555,31 @@ fn forward_scratch_layers(
                 }
 
                 // ── MoE FFN (single-device via central view) ──
-                let v = weights.moe_ffn_view(layer_idx).map_err(map_bind_err)?;
-                moe_ffn_dispatch(gpu, v, &s.x, &layer.ffn_norm, config, s)?;
+                match execution {
+                    MoeExecution::Single => {
+                        let v = weights.moe_ffn_view(layer_idx).map_err(map_bind_err)?;
+                        moe_ffn_dispatch(gpu, v, &s.x, &layer.ffn_norm, config, moe_plans, s)?;
+                    }
+                    #[cfg(feature = "emulated-ep2-harness")]
+                    MoeExecution::EmulatedEp2 => {
+                        let v0 = weights
+                            .moe_ffn_view_ep2(layer_idx, 0)
+                            .map_err(map_bind_err)?;
+                        let v1 = weights
+                            .moe_ffn_view_ep2(layer_idx, 1)
+                            .map_err(map_bind_err)?;
+                        moe_ffn_dispatch_ep2(
+                            gpu,
+                            v0,
+                            v1,
+                            &s.x,
+                            &layer.ffn_norm,
+                            config,
+                            moe_plans,
+                            s,
+                        )?;
+                    }
+                }
 
                 if let Some(ref rb) = hidden_rb {
                     if let Some(slot) = rb.extract_slot(layer_idx) {
@@ -13623,6 +15050,7 @@ fn moe_ffn_dispatch(
     x: &GpuTensor,
     ffn_norm: &GpuTensor,
     config: &Qwen35Config,
+    plans: &Qwen35MoeGroupPlans,
     s: &Qwen35Scratch,
 ) -> HipResult<()> {
     let r = if view.gate_side_mq4() {
@@ -13633,35 +15061,55 @@ fn moe_ffn_dispatch(
             config.dim,
             config.norm_eps,
         )?;
-        moe_ffn_decode_with_scratch_prerotated(gpu, view, x, x, config, s)
+        moe_ffn_decode_with_scratch_prerotated(gpu, view, x, x, config, plans, s)
     } else {
         gpu.rmsnorm_f32(x, ffn_norm, &s.tmp, config.norm_eps)?;
-        moe_ffn_decode_with_scratch(gpu, view, &s.tmp, x, config, s)
+        moe_ffn_decode_with_scratch(gpu, view, &s.tmp, x, config, plans, s)
     };
     r?;
     trace_finite_if_enabled(gpu, "moe_ffn", x)?;
     Ok(())
 }
 
-/// EP (Ship 6 substrate-EP) variant of `moe_ffn_dispatch`: same rmsnorm/rotate +
-/// MoE decode, but the routed combine + shared-down accumulate into `routed_out`
-/// (a zeroed per-rank partial the EP executor all-reduces), and `skip_shared`
-/// gates the shared-expert down to rank 0. Calls `moe_ffn_decode_impl` directly
-/// (the `with_scratch` wrappers don't carry EP params). The residual `x` is left
-/// untouched — the executor adds the all-reduced partial into it afterward.
-fn moe_ffn_dispatch_ep(
+/// Emulated-EP2 variant of `moe_ffn_dispatch` (harness feature only):
+/// RMSNorm/rotation runs ONCE; then rank 0's routed tail (with the
+/// shared-expert down contribution) accumulates into partial0 and rank 1's
+/// routed tail (shared skipped) into partial1; the two partials are added
+/// into the residual exactly once.  The partials are zeroed at the start
+/// of every layer/forward.  All weights stay borrowed from the single
+/// Frozen owner; only the gate-up pointer tables differ between the rank
+/// views.
+#[cfg(feature = "emulated-ep2-harness")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors moe_ffn_dispatch's parameter surface plus the rank-1 view and the two partial buffers"
+)]
+fn moe_ffn_dispatch_ep2(
     gpu: &mut Gpu,
-    ffn: &MoeFfnWeights,
+    view0: MoeFfnView<'_>,
+    view1: MoeFfnView<'_>,
     x: &GpuTensor,
     ffn_norm: &GpuTensor,
     config: &Qwen35Config,
+    plans: &Qwen35MoeGroupPlans,
     s: &Qwen35Scratch,
-    routed_out: &GpuTensor,
-    skip_shared: bool,
 ) -> HipResult<()> {
     let refs = MoeScratchRef::from_scratch(s);
-    let view = MoeFfnView::Legacy(ffn);
-    if view.all_mq4() {
+    let partial0 = s
+        .ep2_gu_partial0
+        .as_ref()
+        .expect("EP2 decode partial0 scratch (harness feature)");
+    let partial1 = s
+        .ep2_gu_partial1
+        .as_ref()
+        .expect("EP2 decode partial1 scratch (harness feature)");
+
+    // Re-zero the partials every layer/forward.
+    gpu.hip.memset(&partial0.buf, 0, partial0.buf.size())?;
+    gpu.hip.memset(&partial1.buf, 0, partial1.buf.size())?;
+
+    // RMSNorm + FWHT rotation ONCE (shared by both rank runs).
+    let (x_norm, prerotated) = if view0.gate_side_mq4() {
         gpu.fused_rmsnorm_rotate_mq(
             x,
             ffn_norm,
@@ -13669,184 +15117,43 @@ fn moe_ffn_dispatch_ep(
             config.dim,
             config.norm_eps,
         )?;
-        moe_ffn_decode_impl(
-            gpu,
-            view,
-            x,
-            x,
-            config,
-            &refs,
-            true,
-            Some(routed_out),
-            skip_shared,
-        )
+        (x, true)
     } else {
         gpu.rmsnorm_f32(x, ffn_norm, &s.tmp, config.norm_eps)?;
-        moe_ffn_decode_impl(
-            gpu,
-            view,
-            &s.tmp,
-            x,
-            config,
-            &refs,
-            false,
-            Some(routed_out),
-            skip_shared,
-        )
-    }
-}
+        (&s.tmp, false)
+    };
 
-/// EP (Ship 6 substrate-EP, ported from tp-mtp-prototype Stage 3e): shard a MoE
-/// layer's routed experts to `rank`. Frees the non-owned experts (the memory
-/// win), compacts owned to the front of `ffn.experts` (so `experts[0]` stays a
-/// valid shared-AWQ representative for the batched silu/rotate helpers), and
-/// rebuilds the `[2·n_exp]` device pointer tables: owned global id → its
-/// (compacted) buffer ptr; **non-owned → a shared ZEROED gate_up buffer**.
-/// Zeroed quant bytes dequant to +0.0 → the non-owned expert's gate_up output
-/// is 0 → silu·mul = 0 → rot = 0 → down output 0, so it contributes nothing
-/// through `moe_down_combine` WITHOUT any masking kernel. (The non-owned down
-/// ptr is irrelevant — its input rot is already 0 — so it reuses
-/// `experts[0].down`.) Router / shared expert / attention stay full (replicated
-/// in EP v1). The zero buffer is owned by the per-layer FFN and freed during
-/// teardown.
-pub fn shard_moe_experts(
-    gpu: &mut Gpu,
-    ffn: &mut MoeFfnWeights,
-    shard: &ShardConfig,
-    rank: usize,
-    n_exp: usize,
-) -> HipResult<()> {
-    debug_assert_eq!(
-        ffn.experts.len(),
-        n_exp,
-        "shard_moe_experts expects a full-loaded expert Vec (paged EP is unsupported in v1)",
-    );
-    // Free non-owned experts; compact owned to the front, recording global→local.
-    let old = std::mem::take(&mut ffn.experts);
-    let mut compacted: Vec<ExpertWeights> = Vec::with_capacity(shard.experts_per_rank(n_exp));
-    let mut local_of_global = vec![usize::MAX; n_exp];
-    for (e, ew) in old.into_iter().enumerate() {
-        if shard.owns_expert(rank, e) {
-            local_of_global[e] = compacted.len();
-            compacted.push(ew);
-        } else {
-            let _ = gpu.free_tensor(ew.gate_up.buf);
-            if let Some(s) = ew.gate_up.awq_scale {
-                let _ = gpu.free_tensor(s);
-            }
-            let _ = gpu.free_tensor(ew.down.buf);
-            if let Some(s) = ew.down.awq_scale {
-                let _ = gpu.free_tensor(s);
-            }
-        }
-    }
-    assert!(
-        !compacted.is_empty(),
-        "shard_moe_experts: rank {rank} owns no experts (n_exp={n_exp}, tp={})",
-        shard.tp_size,
-    );
+    // Rank 0: routed + shared-expert down into partial0.
+    moe_ffn_decode_impl(
+        gpu,
+        view0,
+        x_norm,
+        x,
+        config,
+        plans,
+        &refs,
+        prerotated,
+        Some(partial0),
+        ep2_rank_skip_shared(0),
+    )?;
+    // Rank 1: routed only (shared skipped) into partial1.
+    moe_ffn_decode_impl(
+        gpu,
+        view1,
+        x_norm,
+        x,
+        config,
+        plans,
+        &refs,
+        prerotated,
+        Some(partial1),
+        ep2_rank_skip_shared(1),
+    )?;
 
-    // Shared zeroed gate_up buffer for non-owned slots (same byte size as a real
-    // expert's gate_up). Keep it in the per-layer owner because the pointer table
-    // below bakes its address.
-    let gu_bytes = compacted[0].gate_up.buf.buf.size();
-    let dummy_slot = gpu.zeros(&[gu_bytes / 4], DType::F32)?;
-    let dummy_gu = dummy_slot.buf.as_ptr() as u64;
-    let dummy_dn = compacted[0].down.buf.buf.as_ptr() as u64; // rot=0 ⇒ output 0 regardless
-
-    // Rebuild the [2·n_exp] u64 pointer tables (8 B/ptr = 2 F32 slots).
-    let mut gu = vec![0u64; n_exp];
-    let mut dn = vec![0u64; n_exp];
-    for e in 0..n_exp {
-        if shard.owns_expert(rank, e) {
-            let li = local_of_global[e];
-            gu[e] = compacted[li].gate_up.buf.buf.as_ptr() as u64;
-            dn[e] = compacted[li].down.buf.buf.as_ptr() as u64;
-        } else {
-            gu[e] = dummy_gu;
-            dn[e] = dummy_dn;
-        }
-    }
-    let gu_b: Vec<u8> = gu.iter().flat_map(|p| p.to_ne_bytes()).collect();
-    let dn_b: Vec<u8> = dn.iter().flat_map(|p| p.to_ne_bytes()).collect();
-    gpu.hip.memcpy_htod(&ffn.expert_gate_up_ptrs.buf, &gu_b)?;
-    gpu.hip.memcpy_htod(&ffn.expert_down_ptrs.buf, &dn_b)?;
-
-    // Route A MoE-AWQ under EP: rebuild the per-expert down.awq_scale pointer
-    // table over the compacted set. Non-owned slots get a valid dummy pointer
-    // (compacted[0]'s scale) — they read zeroed gate_up ⇒ silu output 0 ⇒
-    // 0/scale = 0 regardless, so the all-reduced sum is unaffected.
-    if let Some(awq_tbl) = ffn.expert_down_awq_ptrs.as_ref() {
-        let dummy_aw = compacted[0]
-            .down
-            .awq_scale
-            .as_ref()
-            .map(|s| s.buf.as_ptr() as u64)
-            .unwrap_or(0);
-        let mut aw = vec![dummy_aw; n_exp];
-        for (e, slot) in aw.iter_mut().enumerate() {
-            if shard.owns_expert(rank, e) {
-                let li = local_of_global[e];
-                if let Some(s) = compacted[li].down.awq_scale.as_ref() {
-                    *slot = s.buf.as_ptr() as u64;
-                }
-            }
-        }
-        let aw_b: Vec<u8> = aw.iter().flat_map(|p| p.to_ne_bytes()).collect();
-        gpu.hip.memcpy_htod(&awq_tbl.buf, &aw_b)?;
-    }
-
-    ffn.expert_gate_up_dummy = Some(dummy_slot);
-    ffn.experts = compacted;
-    Ok(())
-}
-
-/// Shard every MoE layer of a replicated `Qwen35Weights` to `rank`, calling
-/// [`shard_moe_experts`] on each `DeltaNetMoe` / `FullAttnMoe` layer's FFN.
-/// Dense / attention-only layers are untouched. Convenience wrapper for the EP
-/// load path so callers (the `forward_ep` driver / examples) never reach into
-/// `LayerWeights` internals. `n_exp` is the model's routed expert count
-/// (`config.num_experts`).
-///
-/// `reap_active` MUST be `config.reap_keep.is_some()`. REAP expert-pruning and
-/// EP sharding are mutually exclusive (ds4/minimax enforce the same at expert-
-/// load time): under REAP `config.num_experts` is already overridden to the
-/// KEPT count, so `shard_moe_experts`' `experts.len() == n_exp` precondition
-/// would pass on a pruned model and the per-rank ownership math would re-remap
-/// already-compacted expert ids → silent weight corruption. Refuse up front.
-pub fn shard_all_moe_layers(
-    gpu: &mut Gpu,
-    weights: &mut Qwen35Weights,
-    shard: &ShardConfig,
-    rank: usize,
-    n_exp: usize,
-    reap_active: bool,
-) -> HipResult<()> {
-    if reap_active {
-        return Err(HipError::new(
-            0,
-            "qwen35: REAP keep-map + EP sharding are mutually exclusive",
-        ));
-    }
-    for layer in weights.layers.iter_mut() {
-        match layer {
-            LayerWeights::DeltaNetMoe(l) => {
-                let ffn = l
-                    .ffn
-                    .as_legacy_mut()
-                    .ok_or_else(|| HipError::new(0, "shard_moe_experts: Frozen storage refused"))?;
-                shard_moe_experts(gpu, ffn, shard, rank, n_exp)?;
-            }
-            LayerWeights::FullAttnMoe(l) => {
-                let ffn = l
-                    .ffn
-                    .as_legacy_mut()
-                    .ok_or_else(|| HipError::new(0, "shard_moe_experts: Frozen storage refused"))?;
-                shard_moe_experts(gpu, ffn, shard, rank, n_exp)?;
-            }
-            _ => {}
-        }
-    }
+    // Combine the routed partials and add to the residual exactly once.
+    gpu.add_inplace_f32(x, partial0)?;
+    gpu.add_inplace_f32(x, partial1)?;
+    trace_finite_if_enabled(gpu, "moe_ffn_ep2", x)?;
     Ok(())
 }
 
@@ -13951,6 +15258,11 @@ fn forward_scratch_layers_multi(
     scratch_set: &Qwen35ScratchSet,
 ) -> HipResult<()> {
     reject_frozen_multi("forward_scratch_layers_multi", weights)?;
+    // STEP-002 Task 9: model-owned expert-group plans — resolved once through
+    // the validated manifest authority, borrowed by layer per forward.
+    let moe_plans = weights
+        .moe_group_plans(config)
+        .map_err(|e| HipError::new(0, &e))?;
     let dim = config.dim;
     let k_dim = config.linear_num_key_heads * config.linear_key_head_dim;
     let v_dim = config.linear_num_value_heads * config.linear_value_head_dim;
@@ -14820,10 +16132,12 @@ fn forward_scratch_layers_multi(
                             config.dim,
                             config.norm_eps,
                         )?;
-                        moe_ffn_decode_with_scratch_prerotated(gpu, v, &s.x, &s.x, config, s)?;
+                        moe_ffn_decode_with_scratch_prerotated(
+                            gpu, v, &s.x, &s.x, config, moe_plans, s,
+                        )?;
                     } else {
                         gpu.rmsnorm_f32(&s.x, &layer.ffn_norm, &s.tmp, config.norm_eps)?;
-                        moe_ffn_decode_with_scratch(gpu, v, &s.tmp, &s.x, config, s)?;
+                        moe_ffn_decode_with_scratch(gpu, v, &s.tmp, &s.x, config, moe_plans, s)?;
                     }
                 }
 
@@ -15213,10 +16527,12 @@ fn forward_scratch_layers_multi(
                             config.dim,
                             config.norm_eps,
                         )?;
-                        moe_ffn_decode_with_scratch_prerotated(gpu, v, &s.x, &s.x, config, s)?;
+                        moe_ffn_decode_with_scratch_prerotated(
+                            gpu, v, &s.x, &s.x, config, moe_plans, s,
+                        )?;
                     } else {
                         gpu.rmsnorm_f32(&s.x, &layer.ffn_norm, &s.tmp, config.norm_eps)?;
-                        moe_ffn_decode_with_scratch(gpu, v, &s.tmp, &s.x, config, s)?;
+                        moe_ffn_decode_with_scratch(gpu, v, &s.tmp, &s.x, config, moe_plans, s)?;
                     }
                 }
 
@@ -15560,6 +16876,8 @@ pub fn forward_prefill_batch_multi(
                         true, // needs_last_token_logits: preserve multi-GPU post-condition
                         None, // max_layer: multi-GPU PP path runs full stack
                         None, // routed_out: PP bands are multi-layer, not EP
+                        #[cfg(feature = "emulated-ep2-harness")]
+                        None, // ep2: PP bands are multi-layer, not EP
                     )?;
                 }
 
@@ -16763,7 +18081,6 @@ mod tests {
             },
             expert_down_awq_ptrs: None,
             expert_dtype_tags: dtype_tags,
-            expert_gate_up_dummy: None,
             layer_idx: 0,
             expert_shape: None,
             paro_shared: None,
@@ -18297,6 +19614,81 @@ mod tests {
         );
     }
 
+    // ── Emulated EP2 view seam (STEP-002 Task 8, test-only) ─────────
+    // The harness feature adds `moe_ffn_view_ep2`; these CPU tests pin the
+    // refusal surface (Legacy storage and out-of-range layers) without a
+    // GPU.  The Frozen rank-table path itself is exercised by the
+    // GPU-ignored `frozen_moe_resident_ep2_build_bind_rank_tables_*` test
+    // in store.rs.
+
+    #[cfg(feature = "emulated-ep2-harness")]
+    #[test]
+    fn ep2_moe_ffn_view_requires_frozen_storage() {
+        // EP2 rank binding exists only for Frozen storage.  A Legacy layer
+        // must be refused loudly rather than silently returning an unmasked
+        // view (which would fake the partition evidence).
+        let nt = || GpuTensor::null_for_test();
+        let weights = Qwen35Weights {
+            token_embd: nt(),
+            embd_format: EmbeddingFormat::F32,
+            output_norm: nt(),
+            output: dummy_wt(DType::F32),
+            layers: vec![dummy_full_attn_moe_layer(MoeFfnStorage::Legacy(
+                dummy_moe_ffn(
+                    DType::MQ4G256,
+                    DType::MQ4G256,
+                    dummy_shared(DType::MQ4G256),
+                    vec![],
+                    None,
+                ),
+            ))],
+            moe_has_mq6: false,
+            pager: None,
+            lm_head_aliases_embd: false,
+            moe_resident: None,
+            moe_group_plans: std::sync::OnceLock::new(),
+        };
+        let err = match weights.moe_ffn_view_ep2(0, 0) {
+            Ok(_) => panic!("EP2 view on Legacy storage must be refused"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err, Qwen35MoeBindError::Ep2RequiresFrozenStorage),
+            "expected Ep2RequiresFrozenStorage, got {err:?}"
+        );
+    }
+
+    #[cfg(feature = "emulated-ep2-harness")]
+    #[test]
+    fn ep2_moe_ffn_view_layer_out_of_range_is_result() {
+        // Mirror of the canonical view seam: an out-of-range layer index
+        // fails on the layers vec before any storage is consulted (pure CPU).
+        let nt = || GpuTensor::null_for_test();
+        let weights = Qwen35Weights {
+            token_embd: nt(),
+            embd_format: EmbeddingFormat::F32,
+            output_norm: nt(),
+            output: dummy_wt(DType::F32),
+            layers: vec![],
+            moe_has_mq6: false,
+            pager: None,
+            lm_head_aliases_embd: false,
+            moe_resident: None,
+            moe_group_plans: std::sync::OnceLock::new(),
+        };
+        let err = match weights.moe_ffn_view_ep2(0, 0) {
+            Ok(_) => panic!("layer 0 of 0 must be out of range"),
+            Err(e) => e,
+        };
+        assert!(matches!(
+            err,
+            Qwen35MoeBindError::LayerOutOfRange {
+                requested: 0,
+                count: 0
+            }
+        ));
+    }
+
     // ── Checked GPU cleanup (CPU tests) ─────────────────────────────
     //
     // These tests exercise RetainedQwenTensor and Qwen35CleanupFailure
@@ -18642,6 +20034,10 @@ mod tests {
             moe_topk_indices: None,
             moe_topk_weights: None,
             moe_down_expanded: None,
+            #[cfg(feature = "emulated-ep2-harness")]
+            ep2_gu_partial0: None,
+            #[cfg(feature = "emulated-ep2-harness")]
+            ep2_gu_partial1: None,
             prefill_batch: None,
         };
         // Verify the struct was constructed correctly.
@@ -18678,5 +20074,1533 @@ mod tests {
         for label in &labels {
             assert!(label.starts_with("Qwen35Scratch."));
         }
+    }
+
+    // ── STEP-002 Task 9: Single decode/prefill adapters through the runtime
+    // lowerer with model-owned resolved plans ─
+
+    use hipfire_dispatch::families::moe::{
+        build_moe_decode_steps, build_moe_prefill_steps, decode_expert_refs, prefill_expert_refs,
+        ExpertExecutionPlan, MoePrefillResolution, MoeResolution, MoeStepBuild,
+    };
+    use hipfire_dispatch::pipeline::MoeProj;
+    use hipfire_runtime::moe_plan::{
+        lower_moe_steps, MoEExecutionPolicy, MoeLowerError, MoeProgramParts,
+    };
+
+    /// Synthetic tensor with a real leaked buffer (never touched by HIP) so
+    /// the lowerer's capacity checks see honest byte sizes. Mirrors the
+    /// runtime moe_plan test fixtures.
+    fn synth_tensor(dtype: DType, numel: usize) -> &'static GpuTensor {
+        let bytes = numel * dtype.size();
+        let buffer = Box::leak(vec![0u8; bytes].into_boxed_slice());
+        Box::leak(Box::new(GpuTensor {
+            buf: unsafe { hip_bridge::DeviceBuffer::from_raw(buffer.as_mut_ptr().cast(), bytes) },
+            shape: vec![numel],
+            dtype,
+        }))
+    }
+
+    fn synth_f32(numel: usize) -> &'static GpuTensor {
+        synth_tensor(DType::F32, numel)
+    }
+
+    fn synth_i32_raw(numel: usize) -> &'static GpuTensor {
+        // Integer slot-array tensor: top-k indices, expert counts/offsets,
+        // sorted-slot / tile-id / inverse-permutation metadata. The shared
+        // grouped contract measures these operands at the i32 slot layout
+        // ([slots]i32, [E]i32, [E+1]i32, [m_total]i32 — see the moe_plan G1
+        // capacity gates), so the synthetic buffer carries 4 bytes per
+        // element (shape stays honest at `numel`) like the runtime's own
+        // grouped fixtures.
+        let bytes = numel * 4;
+        let buffer = Box::leak(vec![0u8; bytes].into_boxed_slice());
+        Box::leak(Box::new(GpuTensor {
+            buf: unsafe { hip_bridge::DeviceBuffer::from_raw(buffer.as_mut_ptr().cast(), bytes) },
+            shape: vec![numel],
+            dtype: DType::Raw,
+        }))
+    }
+
+    fn weight_ref(dtype: DType, m: usize, k: usize) -> WeightRef<'static> {
+        WeightRef {
+            buf: synth_f32(m * k),
+            dtype,
+            m,
+            k,
+            row_stride: 0,
+            rotation: None,
+            awq_scale: None,
+        }
+    }
+
+    fn mq4_dtypes() -> hipfire_dispatch::families::moe::MoeDtypes {
+        use hipfire_dispatch::families::moe::MoeDtypes;
+        MoeDtypes {
+            router: DType::MQ4G256,
+            shared_gate: DType::MQ4G256,
+            shared_expert_gate: DType::MQ4G256,
+            shared_expert_up: DType::MQ4G256,
+            shared_expert_down: DType::MQ4G256,
+            experts_all_gate_up_mq4: true,
+            routed_gate_up: DType::MQ4G256,
+            routed_down: DType::MQ4G256,
+            routed_has_mixed_experts: false,
+            has_paro_shared: false,
+            gate_side_has_awq: false,
+            routed_down_has_awq: false,
+            per_expert_gate_up: None,
+            per_expert_down: None,
+        }
+    }
+
+    /// Uniform-MQ4 decode parameters (dim=64, mi=128, smi=96, n_exp=8) with
+    /// honest synthetic capacities for every buffer the lowerer measures.
+    fn decode_params(k: usize) -> hipfire_dispatch::families::moe::MoeParams<'static> {
+        use hipfire_dispatch::families::moe::MoeParams;
+        MoeParams {
+            dtypes: mq4_dtypes(),
+            batch_size: 1,
+            hidden: 64,
+            mi: 128,
+            smi: 96,
+            k,
+            n_exp: 8,
+            norm_topk_prob: true,
+            x_rot_prerotated: false,
+            layer_idx: 0,
+            x_norm: synth_f32(64),
+            x_residual: synth_f32(64),
+            routed_out: None,
+            skip_shared: false,
+            router: weight_ref(DType::MQ4G256, 8, 64),
+            shared_expert_gate: weight_ref(DType::MQ4G256, 1, 64),
+            shared_gate_w: weight_ref(DType::MQ4G256, 96, 64),
+            shared_up_w: weight_ref(DType::MQ4G256, 96, 64),
+            shared_down_w: weight_ref(DType::MQ4G256, 64, 96),
+            expert_gate_up_ptrs: synth_f32(16),
+            expert_down_ptrs: synth_f32(16),
+            expert_down_awq_ptrs: None,
+            expert_dtype_tags: None,
+            routed_gate_up_k: 64,
+            routed_down_m: 64,
+            routed_down_k: 128,
+            routed_experts: &[],
+            routed_gate_up_paro: None,
+            routed_down_paro: None,
+            router_logits: synth_f32(8),
+            scalar_buf: synth_f32(1),
+            x_rot_local: synth_f32(64),
+            gate_up_buf: synth_f32(192),
+            gate_buf: synth_f32(8 * 128),
+            up_buf: synth_f32(8 * 128),
+            ffn_hidden: synth_f32(96),
+            ffn_out: synth_f32(64),
+            gate_batch: synth_f32(8 * 128),
+            up_batch: synth_f32(8 * 128),
+            rot_batch: synth_f32(8 * 128),
+            topk_indices: synth_i32_raw(8),
+            topk_weights: synth_f32(8),
+            down_expanded: synth_f32(8 * 64),
+        }
+    }
+
+    /// A minimal MoE Qwen35Config with dims matching [`decode_params`].
+    fn task9_moe_config() -> Qwen35Config {
+        let inner = serde_json::json!({
+            "hidden_size": 64,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 4,
+            "vocab_size": 1000,
+            "layer_types": ["full_attention"],
+            "num_experts": 8,
+            "num_experts_per_tok": 8,
+            "moe_intermediate_size": 128,
+            "shared_expert_intermediate_size": 96,
+        });
+        config_from_metadata_json(&serde_json::json!({"config": inner}).to_string()).unwrap()
+    }
+
+    /// A minimal dense (non-MoE) Qwen35Config for the no-group resolution
+    /// case.
+    fn task9_dense_config() -> Qwen35Config {
+        let inner = serde_json::json!({
+            "hidden_size": 64,
+            "intermediate_size": 256,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 4,
+            "vocab_size": 1000,
+            "layer_types": ["full_attention"],
+        });
+        config_from_metadata_json(&serde_json::json!({"config": inner}).to_string()).unwrap()
+    }
+
+    /// Minimal uniform-MQ4 batched prefill parameters (n=4 tokens, dim=64,
+    /// mi=128, n_exp=8) with honest synthetic capacities for every buffer the
+    /// lowerer measures, mirroring `decode_params` for the routed tail.
+    fn prefill_params(k_top: usize) -> hipfire_dispatch::families::moe::MoePrefillParams<'static> {
+        use hipfire_dispatch::families::moe::MoePrefillParams;
+        let n = 4usize;
+        let dim = 64usize;
+        let mi = 128usize;
+        let n_exp = 8usize;
+        let total_slots = n * k_top;
+        let m_total_max = moe_grouped_m_total_bound(total_slots, n_exp);
+        MoePrefillParams {
+            dtypes: mq4_dtypes(),
+            batch_size: n,
+            mi,
+            down_m: dim,
+            down_k: mi,
+            gate_up_k: dim,
+            k_top,
+            n_exp,
+            m_total_max,
+            force_mq4_grouped_fp16: false,
+            topk_indices: synth_i32_raw(total_slots),
+            topk_weights: synth_f32(total_slots),
+            x_batch: synth_f32(n * dim),
+            x_norm_batch: synth_f32(n * dim),
+            x_rot_batch: synth_f32(n * dim),
+            expert_gate_up_ptrs: synth_f32(2 * n_exp),
+            expert_down_ptrs: synth_f32(2 * n_exp),
+            expert_down_awq_ptrs: None,
+            expert_dtype_tags: None,
+            gate_batch: synth_f32(total_slots * mi),
+            up_batch: synth_f32(total_slots * mi),
+            rot_batch: synth_f32(total_slots * mi),
+            down_expanded: synth_f32(total_slots * dim),
+            // Exact grouped slot arrays: [E]i32 counts, [E+1]i32 offsets,
+            // [m_total]i32 sorted slots, [m_total/block]i32 tile ids (m_total
+            // is block-aligned by `moe_grouped_m_total_bound`), [slots]i32
+            // inverse permutation.
+            expert_token_counts: synth_i32_raw(n_exp),
+            expert_offsets: synth_i32_raw(n_exp + 1),
+            sorted_slot_index: synth_i32_raw(m_total_max),
+            expert_tile_ids: synth_i32_raw(m_total_max / MOE_GROUPED_BLOCK_M),
+            inverse_perm: synth_i32_raw(total_slots),
+            y_gate_up_grouped: synth_f32(m_total_max * 2 * mi),
+            y_down_grouped: synth_f32(m_total_max * dim),
+            paro_gate_up: None,
+            paro_down: None,
+            down_awq_scale: None,
+            routed_out: None,
+        }
+    }
+
+    /// The production model-owned plan state resolves through the validated
+    /// manifest authority exactly once and equals the independently
+    /// manifest-resolved plan on every field the lowerer consumes.
+    #[test]
+    fn qwen35_model_owned_plans_resolve_through_manifest_authority() {
+        let cfg = task9_moe_config();
+        let plans = Qwen35MoeGroupPlans::resolve(&cfg).unwrap();
+        assert_eq!(plans.len(), 1, "one plan per MoE layer");
+        // Independent resolution through the manifest authority — the same
+        // `resolve_expert_group_plans` the production assembly uses — must
+        // agree field-for-field with the model-owned plan.
+        let policy = MoEExecutionPolicy::single();
+        let specs = qwen35_moe_expert_group_specs(&cfg, &policy);
+        let manifest =
+            <crate::arch::Qwen35 as hipfire_runtime::arch::Architecture>::weight_manifest(&cfg);
+        let resolved =
+            hipfire_runtime::weight_manifest::resolve_expert_group_plans(&specs, &manifest, 1)
+                .unwrap();
+        let owned = plans.by_layer(0);
+        assert_eq!(owned.group, resolved[0].group);
+        assert_eq!(owned.layer, resolved[0].layer);
+        assert_eq!(owned.n_experts, resolved[0].n_experts);
+        assert_eq!(owned.group_size, resolved[0].group_size);
+        assert_eq!(owned.parallelism, resolved[0].parallelism);
+        assert_eq!(owned.assignment, resolved[0].assignment);
+        assert_eq!(owned.experts, resolved[0].experts);
+        assert_eq!(owned.source_layout, resolved[0].source_layout);
+        assert_eq!(owned.resources, resolved[0].resources);
+        assert_eq!(owned.router, resolved[0].router);
+        assert_eq!(owned.router_identity, resolved[0].router_identity);
+        assert_eq!(owned.allowed_executions, resolved[0].allowed_executions);
+        assert_eq!(owned.collective, resolved[0].collective);
+        // Dense configs resolve no groups at all.
+        let dense = task9_dense_config();
+        assert_eq!(Qwen35MoeGroupPlans::resolve(&dense).unwrap().len(), 0);
+    }
+
+    /// The model-owned plans are immutable state: borrowing the same layer
+    /// twice yields the SAME plan object (no per-token construction), and the
+    /// `Qwen35Weights` accessor resolves once and reuses the identical
+    /// immutable state on every forward call.
+    #[test]
+    fn qwen35_model_owned_plans_are_reused_not_rebuilt() {
+        let cfg = task9_moe_config();
+        let plans = Qwen35MoeGroupPlans::resolve(&cfg).unwrap();
+        let a = plans.by_layer(0) as *const hipfire_runtime::weight_manifest::ExpertGroupPlan;
+        let b = plans.by_layer(0) as *const hipfire_runtime::weight_manifest::ExpertGroupPlan;
+        assert!(
+            std::ptr::eq(a, b),
+            "by_layer must borrow the same immutable plan, never rebuild it"
+        );
+        // Model-owned accessor through Qwen35Weights: resolution runs once
+        // through the manifest authority and every later forward borrows the
+        // same state.
+        let nt = || GpuTensor::null_for_test();
+        let weights = Qwen35Weights {
+            token_embd: nt(),
+            embd_format: EmbeddingFormat::F32,
+            output_norm: nt(),
+            output: dummy_wt(DType::F32),
+            layers: vec![],
+            moe_has_mq6: false,
+            pager: None,
+            lm_head_aliases_embd: false,
+            moe_resident: None,
+            moe_group_plans: std::sync::OnceLock::new(),
+        };
+        let p1 = weights.moe_group_plans(&cfg).unwrap();
+        let p2 = weights.moe_group_plans(&cfg).unwrap();
+        assert!(
+            std::ptr::eq(
+                p1 as *const Qwen35MoeGroupPlans,
+                p2 as *const Qwen35MoeGroupPlans
+            ),
+            "weights.moe_group_plans must resolve once and reuse the same state"
+        );
+        assert_eq!(p1.len(), 1);
+        assert_eq!(p1.by_layer(0).group, "qwen35_moe_layer_0");
+    }
+
+    // ── Config-identified plan cache (pre-fix RED: silent reuse) ──────────
+
+    /// A test weights object with an empty plan cache cell.
+    fn plan_cache_weights() -> Qwen35Weights {
+        let nt = || GpuTensor::null_for_test();
+        Qwen35Weights {
+            token_embd: nt(),
+            embd_format: EmbeddingFormat::F32,
+            output_norm: nt(),
+            output: dummy_wt(DType::F32),
+            layers: vec![],
+            moe_has_mq6: false,
+            pager: None,
+            lm_head_aliases_embd: false,
+            moe_resident: None,
+            moe_group_plans: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// A task-9-shaped MoE config differing from [`task9_moe_config`] in
+    /// exactly one key dimension (the named field), valid in isolation.
+    fn key_variant_config(field: &str) -> Qwen35Config {
+        let inner = match field {
+            // n_layers: 2 layers instead of 1.
+            "n_layers" => serde_json::json!({
+                "hidden_size": 64, "num_hidden_layers": 2, "num_attention_heads": 4,
+                "vocab_size": 1000, "layer_types": ["full_attention", "full_attention"],
+                "num_experts": 8, "num_experts_per_tok": 8,
+                "moe_intermediate_size": 128, "shared_expert_intermediate_size": 96,
+            }),
+            // layer_types sequence: LinearAttention instead of FullAttention.
+            "layer_types" => serde_json::json!({
+                "hidden_size": 64, "num_hidden_layers": 1, "num_attention_heads": 4,
+                "vocab_size": 1000, "layer_types": ["linear_attention"],
+                "num_experts": 8, "num_experts_per_tok": 8,
+                "moe_intermediate_size": 128, "shared_expert_intermediate_size": 96,
+            }),
+            // num_experts: 16 instead of 8.
+            "num_experts" => serde_json::json!({
+                "hidden_size": 64, "num_hidden_layers": 1, "num_attention_heads": 4,
+                "vocab_size": 1000, "layer_types": ["full_attention"],
+                "num_experts": 16, "num_experts_per_tok": 8,
+                "moe_intermediate_size": 128, "shared_expert_intermediate_size": 96,
+            }),
+            // dim: 32 instead of 64.
+            "dim" => serde_json::json!({
+                "hidden_size": 32, "num_hidden_layers": 1, "num_attention_heads": 4,
+                "vocab_size": 1000, "layer_types": ["full_attention"],
+                "num_experts": 8, "num_experts_per_tok": 8,
+                "moe_intermediate_size": 128, "shared_expert_intermediate_size": 96,
+            }),
+            // moe_intermediate_size: 256 instead of 128.
+            "moe_intermediate_size" => serde_json::json!({
+                "hidden_size": 64, "num_hidden_layers": 1, "num_attention_heads": 4,
+                "vocab_size": 1000, "layer_types": ["full_attention"],
+                "num_experts": 8, "num_experts_per_tok": 8,
+                "moe_intermediate_size": 256, "shared_expert_intermediate_size": 96,
+            }),
+            // Resolution FAILURE fixture: dim=0 makes the manifest router
+            // entry zero-dimensional; the plan validator refuses it.
+            "dim_zero" => serde_json::json!({
+                "hidden_size": 0, "num_hidden_layers": 1, "num_attention_heads": 4,
+                "vocab_size": 1000, "layer_types": ["full_attention"],
+                "num_experts": 8, "num_experts_per_tok": 8,
+                "moe_intermediate_size": 128, "shared_expert_intermediate_size": 96,
+            }),
+            other => panic!("unknown key variant: {other}"),
+        };
+        config_from_metadata_json(&serde_json::json!({"config": inner}).to_string()).unwrap()
+    }
+
+    #[test]
+    fn qwen35_plan_cache_refuses_config_identity_mismatch() {
+        // Pre-fix RED history: the unkeyed cache cell stored the FIRST
+        // config's plans and silently served them for ANY later config (the
+        // config was not part of the cache identity). The keyed cache
+        // refuses every different identity. Each variant differs in exactly
+        // ONE key dimension; before each refusal assertion it is resolved
+        // INDEPENDENTLY through the authority to prove it is valid in
+        // isolation — only the cache identity check can refuse it.
+        let weights = plan_cache_weights();
+        let base = task9_moe_config();
+        let p0 = weights
+            .moe_group_plans(&base)
+            .expect("the base config resolves through the authority");
+        for field in [
+            "n_layers",
+            "layer_types",
+            "num_experts",
+            "dim",
+            "moe_intermediate_size",
+        ] {
+            let variant = key_variant_config(field);
+            // Independent resolution: the variant is valid on its own, so a
+            // refusal from the populated cache is the identity mismatch, not
+            // a resolution failure of the variant.
+            let independent = Qwen35MoeGroupPlans::resolve(&variant)
+                .expect("variant resolves in isolation through the authority");
+            assert!(
+                independent.len() >= 1,
+                "variant {field} must resolve a non-empty plan set in isolation"
+            );
+            let err = weights.moe_group_plans(&variant).expect_err(
+                "a different config identity must be refused, never served stale plans",
+            );
+            assert!(
+                err.contains("config identity mismatch"),
+                "variant {field}: expected the cache identity mismatch, got: {err}"
+            );
+        }
+        // The cached entry is untouched: the base config still borrows the
+        // SAME plans object.
+        assert!(
+            std::ptr::eq(
+                p0 as *const Qwen35MoeGroupPlans,
+                weights.moe_group_plans(&base).unwrap() as *const Qwen35MoeGroupPlans
+            ),
+            "the refused mismatch must not replace or invalidate the cached entry"
+        );
+    }
+
+    #[test]
+    fn qwen35_plan_cache_replays_cached_failure_for_same_key() {
+        // A resolution failure is cached like a success: the same failing
+        // config identity replays the SAME error (never re-resolved or
+        // fabricated) from the SAME cache entry, and a different identity
+        // afterwards is refused with the mismatch error — never served the
+        // replayed failure as its own.
+        let weights = plan_cache_weights();
+        // dim=0: the manifest router entry carries a zero dimension, which
+        // the plan validator refuses ("router dimensions must be nonzero").
+        let failing = key_variant_config("dim_zero");
+        let e1 = weights
+            .moe_group_plans(&failing)
+            .expect_err("dim=0 must fail plan resolution");
+        let entry_a =
+            weights.moe_group_plans.get().unwrap() as *const Qwen35MoeGroupPlansCacheEntry;
+        let e2 = weights
+            .moe_group_plans(&failing)
+            .expect_err("the cached failure must replay, not re-resolve");
+        assert_eq!(e1, e2, "the cached failure is replayed verbatim");
+        // The SAME cache-entry address serves both repeated same-key calls —
+        // no replacement, no second entry, no re-resolution.
+        let entry_b =
+            weights.moe_group_plans.get().unwrap() as *const Qwen35MoeGroupPlansCacheEntry;
+        assert!(
+            std::ptr::eq(entry_a, entry_b),
+            "repeated same-key failure calls must reuse the same cache-entry address"
+        );
+        let base = task9_moe_config();
+        let err = weights
+            .moe_group_plans(&base)
+            .expect_err("a different identity after a cached failure must be refused");
+        assert!(
+            err.contains("config identity mismatch"),
+            "expected the cache identity mismatch, got: {err}"
+        );
+    }
+
+    #[test]
+    fn qwen35_plan_cache_same_key_lookup_constructs_no_owned_key() {
+        // Hot-path allocation proof: after the cache is initialized, a
+        // same-key lookup performs ZERO owned-key constructions (the
+        // borrowed five-field `Qwen35MoeGroupPlanKeyRef` comparison
+        // replaces the per-call `layer_types` clone).
+        let _seam = plan_key_seam::SeamGuard::on();
+        let weights = plan_cache_weights();
+        let cfg = task9_moe_config();
+        let _ = weights
+            .moe_group_plans(&cfg)
+            .expect("the base config resolves through the authority");
+        // The initializer ran once (one owned-key construction, already
+        // counted). Reset and prove the initialized lookup never constructs
+        // the owned key again.
+        plan_key_seam::reset();
+        plan_key_seam::INSTRUMENT.store(true, std::sync::atomic::Ordering::Relaxed);
+        for _ in 0..4 {
+            let plans = weights
+                .moe_group_plans(&cfg)
+                .expect("same-key lookup borrows the cached entry");
+            assert_eq!(plans.len(), 1);
+        }
+        let constructions = plan_key_seam::CONSTRUCTIONS.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            constructions, 0,
+            "initialized same-key lookups must not construct the owned key (no layer_types clone)"
+        );
+    }
+
+    #[test]
+    fn qwen35_plan_cache_resolves_exactly_once_under_contention() {
+        // Exactly-once resolution under concurrent first calls: the
+        // `get_or_init` protocol runs the resolver at most once — the
+        // winning thread's initializer resolves; losing threads receive the
+        // same stored entry and their resolvers never run. Deterministic
+        // (guaranteed by OnceLock write-once semantics), synchronized with
+        // a Barrier, counted with an Atomic, through the private
+        // resolver-injecting seam — no globals, no timing, no flake.
+        let weights = plan_cache_weights();
+        let cfg = task9_moe_config();
+        // Capture the Sync cell + config directly (Qwen35Weights itself is
+        // not Sync — RefCell pager / raw pointers); the cell reference is
+        // what the protocol operates on.
+        let cell_ref: &std::sync::OnceLock<Qwen35MoeGroupPlansCacheEntry> =
+            &weights.moe_group_plans;
+        let cfg_ref = &cfg;
+        let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let count = std::sync::Arc::clone(&count);
+                let barrier = std::sync::Arc::clone(&barrier);
+                scope.spawn(move || {
+                    barrier.wait();
+                    let _ = Qwen35Weights::moe_group_plans_with(cell_ref, cfg_ref, |cfg| {
+                        count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        Qwen35MoeGroupPlans::resolve(cfg)
+                    });
+                });
+            }
+        });
+        assert_eq!(
+            count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "exactly one resolution under concurrent first calls"
+        );
+        // The keyed winner contract holds afterwards: the stored entry
+        // serves the winning config identity.
+        let plans = weights
+            .moe_group_plans(&cfg)
+            .expect("the winning config identity still borrows the entry");
+        assert_eq!(plans.len(), 1);
+    }
+
+    /// The GPU decode builder (uniform MQ4, k=8) reaches the runtime lowerer
+    /// through the MODEL-OWNED plan: build → semantic phase buckets →
+    /// one-rank `MoeProgramParts` → `lower_moe_steps` succeeds under the
+    /// Single policy, preserving the exact builder launch order in the
+    /// buckets.
+    #[test]
+    fn qwen35_decode_builder_reaches_runtime_lowering() {
+        let cfg = task9_moe_config();
+        let params = decode_params(8);
+        let res = MoeResolution::resolve_arch(&params.dtypes, 8, false);
+        assert!(
+            res.use_gpu_topk,
+            "uniform MQ4 k=8 must be GPU-top-K admissible"
+        );
+        let (gu, dn) = decode_expert_refs(&params);
+        let build = build_moe_decode_steps(&params, &res, &gu, &dn).unwrap();
+        let phases = match build {
+            MoeStepBuild::Gpu(phases) => phases,
+            MoeStepBuild::CpuFallback => {
+                panic!("uniform MQ4 k=8 must build a Step program, not the fallback")
+            }
+        };
+        let buckets = qwen35_decode_phase_buckets(phases).unwrap();
+        // Bucket classification preserves the builder's launch order:
+        // rotation → gate side → route → shared down live at the program
+        // head (router bucket), then the routed block splits by variant.
+        assert_eq!(buckets.gate_up.len(), 1);
+        assert_eq!(buckets.activation.len(), 1);
+        assert_eq!(buckets.down.len(), 1);
+        assert_eq!(buckets.combine.len(), 1);
+        assert!(matches!(
+            buckets.gate_up[0],
+            Step::IndexedMoeGemv {
+                which: MoeProj::GateUp { .. },
+                ..
+            }
+        ));
+        assert!(matches!(buckets.activation[0], Step::MoeActivation { .. }));
+        assert!(matches!(buckets.down[0], Step::MoeDownIndexed { .. }));
+        // Indexed decode combine: no grouped inverse permutation, and the
+        // bucket program carries no grouped permutation ops at all.
+        assert!(matches!(
+            buckets.combine[0],
+            Step::MoeCombine {
+                inverse_perm: None,
+                ..
+            }
+        ));
+        assert!(
+            !buckets
+                .gate_up
+                .iter()
+                .any(|s| matches!(s, Step::MoeGateUpUnscatter { .. })),
+            "indexed decode must contain no gate-up deinterleave"
+        );
+
+        let plans = Qwen35MoeGroupPlans::resolve(&cfg).unwrap();
+        let group = plans.by_layer(0);
+        let policy = MoEExecutionPolicy::single();
+        let parts = MoeProgramParts {
+            router: hipfire_dispatch::families::moe::RouterPlan::SoftmaxTopK {
+                scores: params.router_logits,
+                topk_indices: params.topk_indices,
+                topk_weights: params.topk_weights,
+                k_top: 8,
+                normalize: true,
+                route_scale: 1.0,
+            },
+            execution: ExpertExecutionPlan::IndexedQuantized,
+            ranks: vec![buckets],
+        };
+        lower_moe_steps(group, &policy, parts).expect("decode program must lower");
+    }
+
+    /// Prefill Path 1 (indexed expanded down + combine, uniform MQ4) builds
+    /// through the dispatch builder and lowers through the model-owned plan
+    /// with exactly IndexedQuantized membership.
+    #[test]
+    fn qwen35_prefill_path1_indexed_reaches_runtime_lowering() {
+        let cfg = task9_moe_config();
+        let params = prefill_params(8);
+        let res = MoePrefillResolution {
+            use_path2: false,
+            down_path0: false,
+            use_paro_i8: false,
+            use_paro_i8_k8: false,
+            paro_mode: false,
+            force_mq4_grouped_fp16: false,
+        };
+        let (gu, dn) = prefill_expert_refs(&params);
+        let phases = build_moe_prefill_steps(&params, &res, &gu, &dn).unwrap();
+        let buckets = qwen35_prefill_phase_buckets(phases).unwrap();
+        // Path 1 routed block: gate_up → activation → down → combine.
+        assert_eq!(buckets.router.len(), 0);
+        assert_eq!(buckets.gate_up.len(), 1);
+        assert_eq!(buckets.activation.len(), 1);
+        assert_eq!(buckets.down.len(), 1);
+        assert_eq!(buckets.combine.len(), 1);
+        assert!(matches!(buckets.gate_up[0], Step::MoeGateUpIndexed { .. }));
+        assert!(matches!(buckets.down[0], Step::MoeDownIndexed { .. }));
+        // Indexed Path 1 combine: no grouped inverse permutation — the
+        // indexed paths contain no grouped permutation ops.
+        assert!(matches!(
+            buckets.combine[0],
+            Step::MoeCombine {
+                inverse_perm: None,
+                ..
+            }
+        ));
+
+        let plans = Qwen35MoeGroupPlans::resolve(&cfg).unwrap();
+        let group = plans.by_layer(0);
+        let policy = MoEExecutionPolicy::single();
+        let parts = MoeProgramParts {
+            router: hipfire_dispatch::families::moe::RouterPlan::SoftmaxTopK {
+                scores: params.x_norm_batch,
+                topk_indices: params.topk_indices,
+                topk_weights: params.topk_weights,
+                k_top: 8,
+                normalize: true,
+                route_scale: 1.0,
+            },
+            execution: ExpertExecutionPlan::IndexedQuantized,
+            ranks: vec![buckets],
+        };
+        lower_moe_steps(group, &policy, parts).expect("indexed prefill must lower");
+    }
+
+    /// Prefill Path 2 (grouped scatter → grouped gate_up →
+    /// gate-up deinterleave (MoeGateUpUnscatter) → activation → grouped down
+    /// → grouped combine) builds through the dispatch builder and lowers
+    /// through the model-owned plan with exactly GroupedQuantized
+    /// membership. The scatter rides the router bucket so it flattens before
+    /// the grouped gate-up (the lowerer's grouped chain order
+    /// scatter < gate_up < gate-up deinterleave < down).
+    #[test]
+    fn qwen35_prefill_path2_grouped_reaches_runtime_lowering() {
+        let cfg = task9_moe_config();
+        let params = prefill_params(8);
+        let res = MoePrefillResolution {
+            use_path2: true,
+            down_path0: false,
+            use_paro_i8: false,
+            use_paro_i8_k8: false,
+            paro_mode: false,
+            force_mq4_grouped_fp16: false,
+        };
+        let (gu, dn) = prefill_expert_refs(&params);
+        let phases = build_moe_prefill_steps(&params, &res, &gu, &dn).unwrap();
+        let buckets = qwen35_prefill_phase_buckets(phases).unwrap();
+        // Path 2 routed block: [scatter] → [grouped gate_up,
+        // gate-up deinterleave] → activation → grouped down → grouped
+        // inverse-permuting combine.
+        assert_eq!(buckets.router.len(), 1);
+        assert!(matches!(buckets.router[0], Step::MoeScatter { .. }));
+        assert_eq!(buckets.gate_up.len(), 2);
+        assert!(matches!(
+            buckets.gate_up[0],
+            Step::GroupedMoeGemm {
+                which: MoeProj::GateUp { .. },
+                ..
+            }
+        ));
+        assert!(matches!(
+            buckets.gate_up[1],
+            Step::MoeGateUpUnscatter { .. }
+        ));
+        assert_eq!(buckets.activation.len(), 1);
+        assert_eq!(buckets.down.len(), 1);
+        assert!(matches!(
+            buckets.down[0],
+            Step::GroupedMoeGemm {
+                which: MoeProj::DownExpanded,
+                ..
+            }
+        ));
+        assert_eq!(buckets.combine.len(), 1);
+        assert!(matches!(
+            buckets.combine[0],
+            Step::MoeCombine {
+                inverse_perm: Some(_),
+                ..
+            }
+        ));
+
+        let plans = Qwen35MoeGroupPlans::resolve(&cfg).unwrap();
+        let group = plans.by_layer(0);
+        let policy = MoEExecutionPolicy::single();
+        let parts = MoeProgramParts {
+            router: hipfire_dispatch::families::moe::RouterPlan::SoftmaxTopK {
+                scores: params.x_norm_batch,
+                topk_indices: params.topk_indices,
+                topk_weights: params.topk_weights,
+                k_top: 8,
+                normalize: true,
+                route_scale: 1.0,
+            },
+            execution: ExpertExecutionPlan::GroupedQuantized,
+            ranks: vec![buckets],
+        };
+        lower_moe_steps(group, &policy, parts).expect("grouped prefill must lower");
+    }
+
+    /// Params mirroring [`prefill_params`] but with CAPACITY-owned batch
+    /// buffers: `x_batch` and `routed_out` are sized for `capacity` tokens
+    /// (the max-batch owner, e.g. `[16, dim]`) while the active chunk is
+    /// `n_active`. Every other buffer is sized for `n_active` exactly (the
+    /// production PBS allocates slot buffers per max-batch, so this is the
+    /// honest capacity-vs-active split the fix targets).
+    fn capacity_owner_params(
+        k_top: usize,
+        n_active: usize,
+        capacity: usize,
+    ) -> hipfire_dispatch::families::moe::MoePrefillParams<'static> {
+        use hipfire_dispatch::families::moe::MoePrefillParams;
+        let dim = 64usize;
+        let mi = 128usize;
+        let n_exp = 8usize;
+        let total_slots = n_active * k_top;
+        let m_total_max = moe_grouped_m_total_bound(total_slots, n_exp);
+        MoePrefillParams {
+            dtypes: mq4_dtypes(),
+            batch_size: n_active,
+            mi,
+            down_m: dim,
+            down_k: mi,
+            gate_up_k: dim,
+            k_top,
+            n_exp,
+            m_total_max,
+            force_mq4_grouped_fp16: false,
+            topk_indices: synth_i32_raw(total_slots),
+            topk_weights: synth_f32(total_slots),
+            // The capacity owners the logical-view fix targets.
+            x_batch: synth_f32(capacity * dim),
+            x_norm_batch: synth_f32(n_active * dim),
+            x_rot_batch: synth_f32(n_active * dim),
+            expert_gate_up_ptrs: synth_f32(2 * n_exp),
+            expert_down_ptrs: synth_f32(2 * n_exp),
+            expert_down_awq_ptrs: None,
+            expert_dtype_tags: None,
+            gate_batch: synth_f32(total_slots * mi),
+            up_batch: synth_f32(total_slots * mi),
+            rot_batch: synth_f32(total_slots * mi),
+            down_expanded: synth_f32(total_slots * dim),
+            expert_token_counts: synth_i32_raw(n_exp),
+            expert_offsets: synth_i32_raw(n_exp + 1),
+            sorted_slot_index: synth_i32_raw(m_total_max),
+            expert_tile_ids: synth_i32_raw(m_total_max / MOE_GROUPED_BLOCK_M),
+            inverse_perm: synth_i32_raw(total_slots),
+            y_gate_up_grouped: synth_f32(m_total_max * 2 * mi),
+            y_down_grouped: synth_f32(m_total_max * dim),
+            paro_gate_up: None,
+            paro_down: None,
+            down_awq_scale: None,
+            routed_out: Some(synth_f32(capacity * dim)),
+        }
+    }
+
+    /// The production prefill lowering seam (the same builder + model-owned
+    /// plan + bucket path `prefill_moe_ffn_routed_tail` consumes): build the
+    /// steps for `params`, bucket them, and lower through the single-policy
+    /// model-owned group. Returns the lowerer's typed error on failure.
+    fn lower_prefill_params(
+        params: &hipfire_dispatch::families::moe::MoePrefillParams<'_>,
+        use_path2: bool,
+        down_path0: bool,
+    ) -> Result<(), hipfire_runtime::moe_plan::MoeLowerError> {
+        let cfg = task9_moe_config();
+        let res = MoePrefillResolution {
+            use_path2,
+            down_path0,
+            use_paro_i8: false,
+            use_paro_i8_k8: false,
+            paro_mode: false,
+            force_mq4_grouped_fp16: false,
+        };
+        let (gu, dn) = prefill_expert_refs(params);
+        let phases =
+            build_moe_prefill_steps(params, &res, &gu, &dn).expect("builder accepts the params");
+        let buckets = qwen35_prefill_phase_buckets(phases).expect("buckets");
+        let plans = Qwen35MoeGroupPlans::resolve(&cfg).expect("plans");
+        let group = plans.by_layer(0);
+        let policy = MoEExecutionPolicy::single();
+        let parts = MoeProgramParts {
+            router: hipfire_dispatch::families::moe::RouterPlan::SoftmaxTopK {
+                scores: params.x_norm_batch,
+                topk_indices: params.topk_indices,
+                topk_weights: params.topk_weights,
+                k_top: params.k_top,
+                normalize: true,
+                route_scale: 1.0,
+            },
+            execution: if use_path2 {
+                ExpertExecutionPlan::GroupedQuantized
+            } else {
+                ExpertExecutionPlan::IndexedQuantized
+            },
+            ranks: vec![buckets],
+        };
+        lower_moe_steps(group, &policy, parts).map(|_| ())
+    }
+
+    /// Qwen-local logical-view regression: a CAPACITY-owned
+    /// x_batch/routed_out (max-batch `[16, dim]` owners, active batch 5) must
+    /// be exposed to the sealed lowering as non-owning `[5, dim]` views —
+    /// pointer identity, dtype, and full byte capacity retained. Without the
+    /// view the lowerer REFUSES with the reproduced `CombineOutputShapeMismatch`;
+    /// with the view, Path 1 (indexed) AND Path 2 (grouped) lower successfully
+    /// through the production seam.
+    #[test]
+    fn qwen35_prefill_capacity_owner_view_repairs_combine_shape() {
+        let k_top = 8usize;
+        let n_active = 5usize;
+        let capacity = 16usize;
+        let dim = 64usize;
+        let params = capacity_owner_params(k_top, n_active, capacity);
+        assert_eq!(params.batch_size, n_active);
+        let expected_dim = n_active * dim; // 320
+                                           // The capacity owner's logical product (16·64 = 1024) does NOT match.
+        let owner_product: usize = params.routed_out.unwrap().shape.iter().product();
+        assert_eq!(owner_product, capacity * dim);
+
+        // 1. The unviewed capacity owner still REFUSES (protocol strict) on
+        //    both paths, with the exact reproduced error.
+        for (path2, label) in [(false, "Path 1 indexed"), (true, "Path 2 grouped")] {
+            let err = lower_prefill_params(&params, path2, false).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    hipfire_runtime::moe_plan::MoeLowerError::CombineOutputShapeMismatch {
+                        expected: e,
+                        actual: a,
+                        ..
+                    } if e == expected_dim && a == capacity * dim
+                ),
+                "{label}: {err:?}"
+            );
+        }
+
+        // 2. The production view (same helper `prefill_moe_ffn_routed_tail`
+        //    consumes): pointer identity, dtype, full byte capacity, exact
+        //    `[n, dim]` shape.
+        let x_view = prefill_batch_view(params.x_batch, n_active, dim);
+        assert!(std::ptr::eq(
+            x_view.buf.as_ptr(),
+            params.x_batch.buf.as_ptr()
+        ));
+        assert_eq!(x_view.buf.size(), params.x_batch.buf.size());
+        assert_eq!(x_view.dtype, params.x_batch.dtype);
+        assert_eq!(x_view.shape, vec![n_active, dim]);
+        let r_view = prefill_batch_view(params.routed_out.unwrap(), n_active, dim);
+        assert!(std::ptr::eq(
+            r_view.buf.as_ptr(),
+            params.routed_out.unwrap().buf.as_ptr()
+        ));
+        assert_eq!(r_view.buf.size(), params.routed_out.unwrap().buf.size());
+        assert_eq!(r_view.dtype, params.routed_out.unwrap().dtype);
+        assert_eq!(r_view.shape, vec![n_active, dim]);
+
+        // 3. With the views bound exactly as the production tail binds them,
+        //    Path 1 AND Path 2 lower successfully.
+        let viewed = hipfire_dispatch::families::moe::MoePrefillParams {
+            x_batch: &x_view,
+            routed_out: Some(&r_view),
+            ..params
+        };
+        lower_prefill_params(&viewed, false, false)
+            .expect("Path 1 indexed must lower with the view");
+        lower_prefill_params(&viewed, true, false)
+            .expect("Path 2 grouped must lower with the view");
+        // Path 0 (atomic down, no combine) also consumes the same views.
+        lower_prefill_params(&viewed, false, true).expect("Path 0 must lower with the views");
+    }
+
+    /// `batch == max_batch` needs no view: when the capacity owner already
+    /// carries the active shape (product == expected), the unviewed params
+    /// lower exactly as before — the fix is a no-op at full capacity.
+    #[test]
+    fn qwen35_prefill_capacity_owner_full_batch_lowers_unviewed() {
+        let params = capacity_owner_params(8, 5, 5); // capacity == active
+        lower_prefill_params(&params, false, false).expect("full-batch Path 1 lowers unviewed");
+        lower_prefill_params(&params, true, false).expect("full-batch Path 2 lowers unviewed");
+        lower_prefill_params(&params, false, true).expect("full-batch Path 0 lowers unviewed");
+    }
+
+    /// The shared execution-identity guard derives the schedule from the
+    /// concrete steps, not the caller's label: a grouped Path-2 program
+    /// claimed as IndexedQuantized is REFUSED with the shared
+    /// `ExecutionIdentityMismatch` — even though Qwen35 declares BOTH
+    /// identities on the group. Membership alone must never admit a
+    /// mislabeled grouped schedule; the typed plan must match the concrete
+    /// protocol (`moe_plan` `lower_moe_steps` grouped-vs-indexed check).
+    #[test]
+    fn qwen35_prefill_grouped_steps_rejected_under_indexed_claim() {
+        let cfg = task9_moe_config();
+        let params = prefill_params(8);
+        let res = MoePrefillResolution {
+            use_path2: true,
+            down_path0: false,
+            use_paro_i8: false,
+            use_paro_i8_k8: false,
+            paro_mode: false,
+            force_mq4_grouped_fp16: false,
+        };
+        let (gu, dn) = prefill_expert_refs(&params);
+        let phases = build_moe_prefill_steps(&params, &res, &gu, &dn).unwrap();
+        let buckets = qwen35_prefill_phase_buckets(phases).unwrap();
+        // The exact grouped chain, typed and in launch order: router
+        // scatter; gate_up [GroupedMoeGemm(GateUp), MoeGateUpUnscatter];
+        // activation; grouped down; inverse-permuting grouped combine.
+        assert_eq!(buckets.router.len(), 1);
+        assert!(matches!(buckets.router[0], Step::MoeScatter { .. }));
+        assert_eq!(buckets.gate_up.len(), 2);
+        assert!(matches!(
+            buckets.gate_up[0],
+            Step::GroupedMoeGemm {
+                which: MoeProj::GateUp { .. },
+                ..
+            }
+        ));
+        assert!(matches!(
+            buckets.gate_up[1],
+            Step::MoeGateUpUnscatter { .. }
+        ));
+        assert_eq!(buckets.activation.len(), 1);
+        assert!(matches!(buckets.activation[0], Step::MoeActivation { .. }));
+        assert_eq!(buckets.down.len(), 1);
+        assert!(matches!(
+            buckets.down[0],
+            Step::GroupedMoeGemm {
+                which: MoeProj::DownExpanded,
+                ..
+            }
+        ));
+        assert_eq!(buckets.combine.len(), 1);
+        assert!(matches!(
+            buckets.combine[0],
+            Step::MoeCombine {
+                inverse_perm: Some(_),
+                ..
+            }
+        ));
+
+        let plans = Qwen35MoeGroupPlans::resolve(&cfg).unwrap();
+        let group = plans.by_layer(0);
+        // Both identities are declared, so membership alone cannot reject
+        // the mislabeled claim — the concrete-steps guard must.
+        use hipfire_runtime::weight_manifest::ExpertExecutionIdentity;
+        assert!(
+            group
+                .allowed_executions
+                .contains(&ExpertExecutionIdentity::IndexedQuantized)
+                && group
+                    .allowed_executions
+                    .contains(&ExpertExecutionIdentity::GroupedQuantized),
+            "the Qwen35 group declares indexed+grouped"
+        );
+        let policy = MoEExecutionPolicy::single();
+        let parts = MoeProgramParts {
+            router: hipfire_dispatch::families::moe::RouterPlan::SoftmaxTopK {
+                scores: params.x_norm_batch,
+                topk_indices: params.topk_indices,
+                topk_weights: params.topk_weights,
+                k_top: 8,
+                normalize: true,
+                route_scale: 1.0,
+            },
+            execution: ExpertExecutionPlan::IndexedQuantized,
+            ranks: vec![buckets],
+        };
+        let err = lower_moe_steps(group, &policy, parts)
+            .expect_err("a grouped concrete chain claimed as indexed must be refused");
+        // The shared guard reports the exact typed mismatch fields: the
+        // group/layer context, the concrete protocol's required identity
+        // (grouped_quantized), and the mislabeled plan actually supplied
+        // (indexed_quantized).
+        match err {
+            MoeLowerError::ExecutionIdentityMismatch {
+                group,
+                layer,
+                expected,
+                actual,
+            } => {
+                assert_eq!(group, "qwen35_moe_layer_0");
+                assert_eq!(layer, Some(0));
+                assert_eq!(expected, "grouped_quantized");
+                assert_eq!(actual, "indexed_quantized");
+            }
+            other => {
+                panic!("expected ExecutionIdentityMismatch with the typed labels, got: {other:?}")
+            }
+        }
+    }
+
+    /// Prefill Path 0 (gfx9 atomic residual-scaled down, self-combining, no
+    /// combine) builds through the dispatch builder and lowers through the
+    /// model-owned plan with exactly IndexedQuantized membership.
+    #[test]
+    fn qwen35_prefill_path0_atomic_reaches_runtime_lowering() {
+        let cfg = task9_moe_config();
+        let params = prefill_params(8);
+        let res = MoePrefillResolution {
+            use_path2: false,
+            down_path0: true,
+            use_paro_i8: false,
+            use_paro_i8_k8: false,
+            paro_mode: false,
+            force_mq4_grouped_fp16: false,
+        };
+        let (gu, dn) = prefill_expert_refs(&params);
+        let phases = build_moe_prefill_steps(&params, &res, &gu, &dn).unwrap();
+        let buckets = qwen35_prefill_phase_buckets(phases).unwrap();
+        // Path 0 routed block: gate_up → activation → self-combining down.
+        assert_eq!(buckets.router.len(), 0);
+        assert_eq!(buckets.gate_up.len(), 1);
+        assert_eq!(buckets.activation.len(), 1);
+        assert_eq!(buckets.down.len(), 1);
+        assert_eq!(buckets.combine.len(), 0);
+        assert!(matches!(buckets.gate_up[0], Step::MoeGateUpIndexed { .. }));
+        assert!(matches!(buckets.down[0], Step::MoeDownIndexed { .. }));
+
+        let plans = Qwen35MoeGroupPlans::resolve(&cfg).unwrap();
+        let group = plans.by_layer(0);
+        let policy = MoEExecutionPolicy::single();
+        let parts = MoeProgramParts {
+            router: hipfire_dispatch::families::moe::RouterPlan::SoftmaxTopK {
+                scores: params.x_norm_batch,
+                topk_indices: params.topk_indices,
+                topk_weights: params.topk_weights,
+                k_top: 8,
+                normalize: true,
+                route_scale: 1.0,
+            },
+            execution: ExpertExecutionPlan::IndexedQuantized,
+            ranks: vec![buckets],
+        };
+        lower_moe_steps(group, &policy, parts).expect("path-0 prefill must lower");
+    }
+
+    /// The CPU-top-K fallback (k != 8) remains an explicit non-Step leaf: the
+    /// builder selects it, no program parts are constructed, and the adapter
+    /// preserves the existing leaf executor call.
+    #[test]
+    fn qwen35_cpu_fallback_remains_explicit_leaf() {
+        let params = decode_params(4);
+        let res = MoeResolution::resolve_arch(&params.dtypes, 4, false);
+        assert!(!res.use_gpu_topk, "k=4 must select the CPU-top-K fallback");
+        let (gu, dn) = decode_expert_refs(&params);
+        let build = build_moe_decode_steps(&params, &res, &gu, &dn).unwrap();
+        assert!(
+            build.is_cpu_fallback(),
+            "k != 8 must select MoeStepBuild::CpuFallback, never a Step program"
+        );
+        assert!(
+            build.into_gpu().is_none(),
+            "the fallback leaf must never be wrapped as a program"
+        );
+    }
+
+    // ── Fail-closed phase bucketing ──────────────────────────────────────
+    //
+    // The bucketers reject unknown/unsupported Step variants with a
+    // contextual error — NEVER silently carrying them in the router bucket
+    // (which would reorder or mis-lower them). Pre-fix, these tests
+    // demonstrated the fail-open router placement; the fix flips them to
+    // refusal.
+
+    #[test]
+    fn qwen35_decode_buckets_refuse_unsupported_routed_step() {
+        // An unsupported routed Step (a prefill-only grouped gate-up
+        // deinterleave injected into a decode program) is refused with the
+        // fail-closed bucketing error — never placed in the router bucket.
+        let params = decode_params(8);
+        let res = MoeResolution::resolve_arch(&params.dtypes, 8, false);
+        let (gu, dn) = decode_expert_refs(&params);
+        let build = build_moe_decode_steps(&params, &res, &gu, &dn).unwrap();
+        let mut phases = match build {
+            MoeStepBuild::Gpu(phases) => phases,
+            MoeStepBuild::CpuFallback => {
+                panic!("k=8 uniform MQ4 must build a Step program")
+            }
+        };
+        // The prefill Path-2 builder emits the deinterleave; pop it and
+        // inject it into the decode program's routed phase.
+        let pre_params = prefill_params(8);
+        let pre_res = MoePrefillResolution {
+            use_path2: true,
+            down_path0: false,
+            use_paro_i8: false,
+            use_paro_i8_k8: false,
+            paro_mode: false,
+            force_mq4_grouped_fp16: false,
+        };
+        let (pgu, pdn) = prefill_expert_refs(&pre_params);
+        // The prefill builder returns `MoeStepPhases` directly (no
+        // `MoeStepBuild` discrimination — prefill has no CPU fallback).
+        let pre_phases = build_moe_prefill_steps(&pre_params, &pre_res, &pgu, &pdn).unwrap();
+        let unsupported = pre_phases
+            .routed
+            .into_iter()
+            .find(|s| matches!(s, Step::MoeGateUpUnscatter { .. }))
+            .expect("Path 2 emits the gate-up deinterleave");
+        phases.routed.push(unsupported);
+        let err = match qwen35_decode_phase_buckets(phases) {
+            Err(err) => err,
+            Ok(_) => panic!("an unsupported decode routed step must be refused"),
+        };
+        match err {
+            Qwen35StepBucketError::UnsupportedStep { lane, phase, kind } => {
+                assert_eq!(lane, "decode");
+                assert_eq!(phase, "routed");
+                assert_eq!(
+                    kind, "MoeGateUpUnscatter",
+                    "the diagnostic carries the stable step-kind label"
+                );
+            }
+            other => panic!("expected UnsupportedStep, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn qwen35_decode_buckets_refuse_unsupported_pre_routed_step() {
+        // A grouped scatter injected into the decode ROTATE phase is
+        // refused — pre-routed phases are classified per lane too, so an
+        // unexpected step can never ride the router bucket silently.
+        let params = decode_params(8);
+        let res = MoeResolution::resolve_arch(&params.dtypes, 8, false);
+        let (gu, dn) = decode_expert_refs(&params);
+        let build = build_moe_decode_steps(&params, &res, &gu, &dn).unwrap();
+        let mut phases = match build {
+            MoeStepBuild::Gpu(phases) => phases,
+            MoeStepBuild::CpuFallback => {
+                panic!("k=8 uniform MQ4 must build a Step program")
+            }
+        };
+        let pre_params = prefill_params(8);
+        let pre_res = MoePrefillResolution {
+            use_path2: true,
+            down_path0: false,
+            use_paro_i8: false,
+            use_paro_i8_k8: false,
+            paro_mode: false,
+            force_mq4_grouped_fp16: false,
+        };
+        let (pgu, pdn) = prefill_expert_refs(&pre_params);
+        let pre_phases = build_moe_prefill_steps(&pre_params, &pre_res, &pgu, &pdn).unwrap();
+        let unsupported = pre_phases
+            .routed
+            .into_iter()
+            .find(|s| matches!(s, Step::MoeScatter { .. }))
+            .expect("Path 2 emits the scatter");
+        phases.rotate = Some(unsupported);
+        let err = match qwen35_decode_phase_buckets(phases) {
+            Err(err) => err,
+            Ok(_) => panic!("an unsupported decode pre-routed step must be refused"),
+        };
+        match err {
+            Qwen35StepBucketError::UnsupportedStep { lane, phase, kind } => {
+                assert_eq!(lane, "decode");
+                assert_eq!(phase, "rotate");
+                assert_eq!(
+                    kind, "MoeScatter",
+                    "the diagnostic carries the stable step-kind label"
+                );
+            }
+            other => panic!("expected UnsupportedStep, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn qwen35_prefill_buckets_refuse_unsupported_routed_step() {
+        // An unsupported routed Step (a decode-only indexed gate-up GEMV
+        // injected into a prefill program) is refused with the fail-closed
+        // bucketing error — never placed in the router bucket.
+        let params = decode_params(8);
+        let res = MoeResolution::resolve_arch(&params.dtypes, 8, false);
+        let (gu, dn) = decode_expert_refs(&params);
+        let dec_build = build_moe_decode_steps(&params, &res, &gu, &dn).unwrap();
+        let dec_phases = match dec_build {
+            MoeStepBuild::Gpu(phases) => phases,
+            MoeStepBuild::CpuFallback => {
+                panic!("k=8 uniform MQ4 must build a Step program")
+            }
+        };
+        let unsupported = dec_phases
+            .routed
+            .into_iter()
+            .find(|s| {
+                matches!(
+                    s,
+                    Step::IndexedMoeGemv {
+                        which: MoeProj::GateUp { .. },
+                        ..
+                    }
+                )
+            })
+            .expect("decode emits the indexed gate-up GEMV");
+        let pre_params = prefill_params(8);
+        let pre_res = MoePrefillResolution {
+            use_path2: true,
+            down_path0: false,
+            use_paro_i8: false,
+            use_paro_i8_k8: false,
+            paro_mode: false,
+            force_mq4_grouped_fp16: false,
+        };
+        let (pgu, pdn) = prefill_expert_refs(&pre_params);
+        // The prefill builder returns `MoeStepPhases` directly (no
+        // `MoeStepBuild` discrimination — prefill has no CPU fallback).
+        let mut pre_phases = build_moe_prefill_steps(&pre_params, &pre_res, &pgu, &pdn).unwrap();
+        pre_phases.routed.push(unsupported);
+        let err = match qwen35_prefill_phase_buckets(pre_phases) {
+            Err(err) => err,
+            Ok(_) => panic!("an unsupported prefill routed step must be refused"),
+        };
+        match err {
+            Qwen35StepBucketError::UnsupportedStep { lane, phase, kind } => {
+                assert_eq!(lane, "prefill");
+                assert_eq!(phase, "routed");
+                assert_eq!(
+                    kind, "IndexedMoeGemv(GateUp)",
+                    "the diagnostic carries the stable step-kind label"
+                );
+            }
+            other => panic!("expected UnsupportedStep, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn qwen35_prefill_buckets_refuse_unsupported_pre_routed_step() {
+        // The prefill lane owns NO pre-routed steps: a rotate injected into
+        // a prefill program is refused (the prefill builder never emits
+        // pre-routed phases; any step found there is unsupported).
+        let pre_params = prefill_params(8);
+        let pre_res = MoePrefillResolution {
+            use_path2: true,
+            down_path0: false,
+            use_paro_i8: false,
+            use_paro_i8_k8: false,
+            paro_mode: false,
+            force_mq4_grouped_fp16: false,
+        };
+        let (pgu, pdn) = prefill_expert_refs(&pre_params);
+        let mut pre_phases = build_moe_prefill_steps(&pre_params, &pre_res, &pgu, &pdn).unwrap();
+        let params = decode_params(8);
+        let res = MoeResolution::resolve_arch(&params.dtypes, 8, false);
+        let (gu, dn) = decode_expert_refs(&params);
+        let dec_build = build_moe_decode_steps(&params, &res, &gu, &dn).unwrap();
+        let dec_phases = match dec_build {
+            MoeStepBuild::Gpu(phases) => phases,
+            MoeStepBuild::CpuFallback => {
+                panic!("k=8 uniform MQ4 must build a Step program")
+            }
+        };
+        let rotate = dec_phases
+            .rotate
+            .expect("uniform MQ4 decode emits the FWHT rotate");
+        pre_phases.rotate = Some(rotate);
+        let err = match qwen35_prefill_phase_buckets(pre_phases) {
+            Err(err) => err,
+            Ok(_) => panic!("an unsupported prefill pre-routed step must be refused"),
+        };
+        match err {
+            Qwen35StepBucketError::UnsupportedStep { lane, phase, kind } => {
+                assert_eq!(lane, "prefill");
+                assert_eq!(phase, "rotate");
+                assert_eq!(
+                    kind, "RotateFwhtBatched",
+                    "the diagnostic carries the stable step-kind label"
+                );
+            }
+            other => panic!("expected UnsupportedStep, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn qwen35_bucketers_label_exhaustive_unsupported_variants() {
+        // The step-kind mapping is COMPILER-EXHAUSTIVE over every current
+        // `Step` variant — no wildcard fallback. A previously unlabeled
+        // unsupported variant (the dense residual-add, cited by review)
+        // injected into the decode routed phase must be refused with its
+        // exact stable label in the diagnostic.
+        let params = decode_params(8);
+        let res = MoeResolution::resolve_arch(&params.dtypes, 8, false);
+        let (gu, dn) = decode_expert_refs(&params);
+        let build = build_moe_decode_steps(&params, &res, &gu, &dn).unwrap();
+        let mut phases = match build {
+            MoeStepBuild::Gpu(phases) => phases,
+            MoeStepBuild::CpuFallback => {
+                panic!("k=8 uniform MQ4 must build a Step program")
+            }
+        };
+        phases.routed.push(Step::ResidualAdd {
+            x: synth_f32(64),
+            y: synth_f32(64),
+            dim: 64,
+        });
+        let err = match qwen35_decode_phase_buckets(phases) {
+            Err(err) => err,
+            Ok(_) => panic!("an unsupported decode routed step must be refused"),
+        };
+        match err {
+            Qwen35StepBucketError::UnsupportedStep { lane, phase, kind } => {
+                assert_eq!(lane, "decode");
+                assert_eq!(phase, "routed");
+                assert_eq!(
+                    kind, "ResidualAdd",
+                    "the diagnostic carries the exact stable label for an exhaustive-mapped variant"
+                );
+            }
+            other => panic!("expected UnsupportedStep, got: {other:?}"),
+        }
+    }
+
+    // ── Legacy routed-ref deferral seam contract ─────────────────────────
+    //
+    // Pre-fix, `moe_ffn_decode_impl` materialized the O(n_exp) Legacy ref
+    // Vec before classifying the lane (a test demonstrated the eager
+    // baseline: one resolution even for the GPU-top-K lane). The fix
+    // defers materialization to the CPU-top-K fallback leaf; these tests
+    // pin the new contract through the pure classification seam, with NO
+    // global counters.
+
+    // ── Fail-closed launch-order tracking (RED: silent bucket repair) ────
+
+    #[test]
+    fn qwen35_decode_buckets_refuse_backward_permuted_routed_steps() {
+        // RED: a SUPPORTED decode program whose routed sequence is permuted
+        // backward (activation after down) is currently SILENTLY REPAIRED
+        // into the canonical bucket order. It must be refused: the bucketer
+        // tracks the stable phase ordinal and rejects any backward
+        // transition before canonical buckets can repair it.
+        let params = decode_params(8);
+        let res = MoeResolution::resolve_arch(&params.dtypes, 8, false);
+        let (gu, dn) = decode_expert_refs(&params);
+        let build = build_moe_decode_steps(&params, &res, &gu, &dn).unwrap();
+        let mut phases = match build {
+            MoeStepBuild::Gpu(phases) => phases,
+            MoeStepBuild::CpuFallback => {
+                panic!("k=8 uniform MQ4 must build a Step program")
+            }
+        };
+        // Canonical decode routed: [gate_up, activation, down, combine].
+        // Swap activation and down → [gate_up, down, activation, combine]:
+        // every variant is SUPPORTED; only the order is wrong. The current
+        // bucketer silently repairs this into canonical buckets.
+        assert_eq!(
+            phases.routed.len(),
+            4,
+            "uniform MQ4 decode emits the canonical routed chain"
+        );
+        phases.routed.swap(1, 2);
+        let err = match qwen35_decode_phase_buckets(phases) {
+            Err(err) => err,
+            Ok(_) => panic!(
+                "backward-permuted supported decode steps must be refused, not silently repaired"
+            ),
+        };
+        match err {
+            Qwen35StepBucketError::ReorderedStep {
+                lane,
+                phase,
+                kind,
+                ordinal,
+                previous_ordinal,
+            } => {
+                assert_eq!(lane, "decode");
+                assert_eq!(phase, "routed");
+                // The backward transition is detected at the activation
+                // (ordinal 2) arriving after the down (ordinal 3).
+                assert_eq!(
+                    kind, "MoeActivation",
+                    "the diagnostic names the reordered step"
+                );
+                assert_eq!(ordinal, 2);
+                assert_eq!(previous_ordinal, 3);
+            }
+            other => panic!("expected ReorderedStep, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn qwen35_prefill_buckets_refuse_backward_permuted_routed_steps() {
+        // RED: a SUPPORTED Path-2 program whose routed sequence is permuted
+        // backward (activation before the gate-up block) is currently
+        // SILENTLY REPAIRED into canonical buckets. It must be refused.
+        let pre_params = prefill_params(8);
+        let pre_res = MoePrefillResolution {
+            use_path2: true,
+            down_path0: false,
+            use_paro_i8: false,
+            use_paro_i8_k8: false,
+            paro_mode: false,
+            force_mq4_grouped_fp16: false,
+        };
+        let (pgu, pdn) = prefill_expert_refs(&pre_params);
+        let mut pre_phases = build_moe_prefill_steps(&pre_params, &pre_res, &pgu, &pdn).unwrap();
+        // Canonical Path-2 routed: [scatter, grouped gate_up, deinterleave,
+        // activation, grouped down, combine]. Swap the gate-up and
+        // activation positions → [scatter, activation, gate_up,
+        // deinterleave, down, combine]: every variant is SUPPORTED; only
+        // the order is wrong.
+        assert_eq!(
+            pre_phases.routed.len(),
+            6,
+            "non-paro Path 2 emits the canonical routed chain"
+        );
+        pre_phases.routed.swap(1, 3);
+        let err = match qwen35_prefill_phase_buckets(pre_phases) {
+            Err(err) => err,
+            Ok(_) => panic!(
+                "backward-permuted supported prefill steps must be refused, not silently repaired"
+            ),
+        };
+        match err {
+            Qwen35StepBucketError::ReorderedStep {
+                lane,
+                phase,
+                kind,
+                ordinal,
+                previous_ordinal,
+            } => {
+                assert_eq!(lane, "prefill");
+                assert_eq!(phase, "routed");
+                // The backward transition is detected at the first gate-up
+                // family member (the deinterleave, ordinal 1) arriving
+                // after the activation (ordinal 2).
+                assert_eq!(
+                    kind, "MoeGateUpUnscatter",
+                    "the diagnostic names the reordered step"
+                );
+                assert_eq!(ordinal, 1);
+                assert_eq!(previous_ordinal, 2);
+            }
+            other => panic!("expected ReorderedStep, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn qwen35_decode_gpu_lane_classification_requires_no_routed_refs() {
+        // The pure lane-classification seam must classify a k=8 uniform-MQ4
+        // decode with an EMPTY routed-expert slice (exactly what the
+        // production GPU lane binds) — zero Legacy materialization by
+        // construction.
+        let params = decode_params(8);
+        assert!(
+            params.routed_experts.is_empty(),
+            "the seam contract binds empty routed refs on the GPU lane"
+        );
+        let (gu, dn) = decode_expert_refs(&params);
+        let (lane, res) = classify_decode_lane(&params, &gu, &dn, 8, 8, true, false)
+            .expect("k=8 uniform MQ4 with resident experts must classify");
+        assert!(res.use_gpu_topk, "k=8 uniform MQ4 is the GPU-top-K route");
+        assert!(
+            matches!(lane, QwenDecodeLane::Gpu(_)),
+            "the GPU-top-K indexed lane must classify without materializing refs"
+        );
+    }
+
+    #[test]
+    fn qwen35_decode_cpu_fallback_lane_defers_refs_to_leaf() {
+        // k=4 selects the CPU-top-K fallback lane; the production leaf
+        // materializes the O(n_exp) Legacy refs exactly once (single call
+        // site) immediately before `run_moe_decode`. The seam classifies
+        // with empty refs; materialization happens in the leaf only.
+        let params = decode_params(4);
+        let (gu, dn) = decode_expert_refs(&params);
+        let (lane, res) = classify_decode_lane(&params, &gu, &dn, 4, 8, true, false)
+            .expect("k=4 with resident experts must classify to the fallback");
+        assert!(!res.use_gpu_topk, "k=4 is the CPU-top-K route");
+        assert!(
+            matches!(lane, QwenDecodeLane::CpuFallback),
+            "k != 8 must classify to the CPU-top-K fallback lane"
+        );
+        let experts = vec![
+            ExpertWeights {
+                gate_up: dummy_wt(DType::MQ4G256),
+                down: dummy_wt(DType::MQ4G256),
+            },
+            ExpertWeights {
+                gate_up: dummy_wt(DType::MQ4G256),
+                down: dummy_wt(DType::MQ4G256),
+            },
+        ];
+        let ffn = dummy_moe_ffn(
+            DType::MQ4G256,
+            DType::MQ4G256,
+            dummy_shared(DType::MQ4G256),
+            experts,
+            None,
+        );
+        let view = MoeFfnView::Legacy(&ffn);
+        // The leaf's single materialization, immediately before the executor.
+        let refs = routed_expert_refs_for_params(&view).unwrap();
+        assert_eq!(
+            refs.len(),
+            2,
+            "the CPU-top-K fallback leaf materializes one ref pair per expert"
+        );
     }
 }
