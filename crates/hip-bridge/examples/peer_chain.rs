@@ -30,6 +30,7 @@ struct Config {
     warmups: usize,
     one_way_samples: usize,
     chain_samples: usize,
+    exactness_samples: usize,
     layers: usize,
     batches: Vec<usize>,
     expect_arch0: Option<String>,
@@ -42,6 +43,7 @@ impl Default for Config {
             warmups: 10,
             one_way_samples: 100,
             chain_samples: 50,
+            exactness_samples: 10,
             layers: DEFAULT_LAYERS,
             batches: DEFAULT_BATCHES.to_vec(),
             expect_arch0: None,
@@ -67,6 +69,9 @@ impl Config {
                 "--warmups" => cfg.warmups = parse_positive(flag, value(&mut i)?)?,
                 "--one-way-samples" => cfg.one_way_samples = parse_positive(flag, value(&mut i)?)?,
                 "--chain-samples" => cfg.chain_samples = parse_positive(flag, value(&mut i)?)?,
+                "--exactness-samples" => {
+                    cfg.exactness_samples = parse_positive(flag, value(&mut i)?)?
+                }
                 "--layers" => cfg.layers = parse_positive(flag, value(&mut i)?)?,
                 "--batches" => {
                     cfg.batches = value(&mut i)?
@@ -111,6 +116,7 @@ fn print_help() {
            --warmups N            warm chain/one-way iterations (default 10)\n\
            --one-way-samples N    samples per direction and size (default 100)\n\
            --chain-samples N      43-layer chain samples per size (default 50)\n\
+           --exactness-samples N  post-timing exactness stress samples (default 10)\n\
            --layers N             round-trip dependency count (default 43)\n\
            --batches CSV          batch rows for [B,4096] F32 (default 1,16,128,512,1024)\n\
            --expect-arch0 ARCH    fail unless logical device 0 matches\n\
@@ -337,8 +343,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "identity arch0={arch0} arch1={arch1} visible_devices={device_count} \
          peer_0_to_1={can_0_to_1} peer_1_to_0={can_1_to_0} hidden={HIDDEN} \
-         layers={} warmups={} one_way_samples={} chain_samples={} max_bytes={max_bytes}",
-        cfg.layers, cfg.warmups, cfg.one_way_samples, cfg.chain_samples
+         layers={} warmups={} one_way_samples={} chain_samples={} \
+         exactness_samples={} max_bytes={max_bytes}",
+        cfg.layers, cfg.warmups, cfg.one_way_samples, cfg.chain_samples, cfg.exactness_samples
     );
 
     hip.set_device(0)?;
@@ -499,7 +506,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Distribution::from_ms(&chain_gpu),
             Distribution::from_ms(&chain_host),
         );
-        println!("exactness batch={batch} status=PASS");
+        // Reinitialize with a distinct payload before every post-timing chain.
+        // This catches intermittent dependency-event failures that a stable
+        // repeated payload could hide after the next successful round trip.
+        for sample in 0..cfg.exactness_samples {
+            let expected = pattern(size, 31u8.wrapping_add(sample as u8));
+            hip.set_device(0)?;
+            hip.memcpy_htod(&dev0_a, &expected)?;
+            hip.memset(&dev0_b, 0, size)?;
+            hip.set_device(1)?;
+            hip.memset(&dev1_a, 0, size)?;
+            chain_sample(&hip, &chain, size, true)?;
+            let final_dev0 = if cfg.layers % 2 == 0 {
+                &dev0_a
+            } else {
+                &dev0_b
+            };
+            assert_bytes(
+                &hip,
+                0,
+                final_dev0,
+                &expected,
+                &format!("round-trip stress batch={batch} sample={sample}"),
+            )?;
+        }
+        println!(
+            "exactness batch={batch} samples={} status=PASS",
+            cfg.exactness_samples + 1
+        );
     }
 
     hip.set_device(0)?;
