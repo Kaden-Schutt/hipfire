@@ -263,6 +263,7 @@ struct Config {
     shared_mib: usize,
     expert_mib: usize,
     prefill_batch: Option<usize>,
+    prefill_depth: Option<usize>,
     prefill_shared_k: usize,
     prefill_expert_k: usize,
     expect_arch0: String,
@@ -280,6 +281,7 @@ impl Default for Config {
             shared_mib: DEFAULT_SHARED_MIB,
             expert_mib: DEFAULT_EXPERT_MIB,
             prefill_batch: None,
+            prefill_depth: None,
             prefill_shared_k: 256,
             prefill_expert_k: 128,
             expect_arch0: "gfx1100".to_owned(),
@@ -312,6 +314,9 @@ impl Config {
                 "--prefill-batch" => {
                     config.prefill_batch = Some(parse_positive(flag, value(&mut index)?)?)
                 }
+                "--prefill-depth" => {
+                    config.prefill_depth = Some(parse_positive(flag, value(&mut index)?)?)
+                }
                 "--prefill-shared-k" => {
                     config.prefill_shared_k = parse_positive(flag, value(&mut index)?)?
                 }
@@ -331,6 +336,7 @@ impl Config {
                          --shared-mib N     gfx1100 bytes read per layer (default 84)\n\
                          --expert-mib N     gfx1151 bytes read per layer (default 42)\n\
                          --prefill-batch N  run G3 batched fixture instead of B=1 decode\n\
+                         --prefill-depth N  repeat batched graphs to this prompt depth\n\
                          --prefill-shared-k N  gfx1100 matrix K (default 256)\n\
                          --prefill-expert-k N  gfx1151 matrix K (default 128)\n\
                          --expect-arch0 A   exact dense-device arch (default gfx1100)\n\
@@ -350,6 +356,9 @@ impl Config {
         }
         if config.prefill_batch.is_some_and(|batch| batch > 1024) {
             return Err("--prefill-batch must be <=1024".to_owned());
+        }
+        if config.prefill_depth.is_some() && config.prefill_batch.is_none() {
+            return Err("--prefill-depth requires --prefill-batch".to_owned());
         }
         if config.prefill_shared_k > 4096 || config.prefill_expert_k > 4096 {
             return Err("prefill K dimensions must be <=4096".to_owned());
@@ -2069,6 +2078,48 @@ fn run_prefill(
                 }
             }
         }
+    }
+    if let Some(depth) = config.prefill_depth {
+        let chunks = depth.div_ceil(batch);
+        let processed_rows = chunks * batch;
+        let mut graph = PrefillGraph::new(
+            Schedule::Overlap,
+            runtime,
+            dev0,
+            dev1,
+            kernels,
+            &buffers,
+            config.layers,
+            batch,
+            config.prefill_shared_k,
+            config.prefill_expert_k,
+        )?;
+        buffers.initialize(hip, &initial)?;
+        graph.run(&buffers)?;
+        buffers.assert_output(hip, config.layers, &expected, "prefill_depth_warmup")?;
+        buffers.initialize(hip, &initial)?;
+        let started = Instant::now();
+        let mut host_enqueue_us = 0.0;
+        for _ in 0..chunks {
+            host_enqueue_us += graph.run(&buffers)?.host_enqueue_us;
+        }
+        let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+        buffers.assert_output(hip, config.layers, &expected, "prefill_depth")?;
+        let timeline = graph.timeline_report()?;
+        let rows_per_second = depth as f64 * 1000.0 / elapsed_ms;
+        println!(
+            "prefill_depth batch={} requested_rows={} processed_rows={} chunks={} elapsed_ms={elapsed_ms:.6} requested_rows_per_second={rows_per_second:.3} host_enqueue_us={host_enqueue_us:.3} pcie_bytes={} pcie_transactions={} last_chunk_overlap_us={:.3} last_chunk_overlap_layers={}/{} terminal_chunk_waits={} host_wait_inside_graph=false raw_bits=PASS stable_allocations=true",
+            batch,
+            depth,
+            processed_rows,
+            chunks,
+            graph.pcie_bytes_per_graph() * chunks,
+            graph.pcie_transactions_per_graph() * chunks,
+            timeline.shared_expert_overlap_us,
+            timeline.overlap_layers,
+            config.layers,
+            chunks,
+        );
     }
     println!("hetero_gfx11_prefill batch={batch}: PASS");
     Ok(())
