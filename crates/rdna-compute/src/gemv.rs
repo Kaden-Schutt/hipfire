@@ -4504,6 +4504,75 @@ impl Gpu {
         )
     }
 
+    /// Exact-gfx1100 screen for two or three same-shaped E8 projections which
+    /// consume one shared activation vector.
+    pub fn gemv_mfp4g32_e8_soa_shared_jobs_gfx1100(
+        &mut self,
+        weights: &[&GpuTensor],
+        x: &GpuTensor,
+        outputs: &[&GpuTensor],
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert!(
+            self.arch_caps.is_gfx1100(),
+            "shared E8 jobs require gfx1100"
+        );
+        assert!((2..=3).contains(&weights.len()));
+        assert_eq!(weights.len(), outputs.len());
+        assert!(k % 256 == 0);
+        const KERNEL: &str = "gemv_mfp4g32_e8_soa_shared_jobs_gfx1100";
+        self.ensure_kernel(
+            KERNEL,
+            kernels::GEMV_MFP4G32_E8_SOA_SHARED_JOBS_GFX1100_SRC,
+            KERNEL,
+        )?;
+        let mut a = [weights[0].buf.as_ptr(); 3];
+        let mut y = [outputs[0].buf.as_ptr(); 3];
+        for index in 0..weights.len() {
+            a[index] = weights[index].buf.as_ptr();
+            y[index] = outputs[index].buf.as_ptr();
+        }
+        let x_ptr = x.buf.as_ptr();
+        let jobs = weights.len() as i32;
+        let m_i32 = m as i32;
+        let k_i32 = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &a[0] as *const _ as *mut c_void,
+            &a[1] as *const _ as *mut c_void,
+            &a[2] as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &y[0] as *const _ as *mut c_void,
+            &y[1] as *const _ as *mut c_void,
+            &y[2] as *const _ as *mut c_void,
+            &jobs as *const _ as *mut c_void,
+            &m_i32 as *const _ as *mut c_void,
+            &k_i32 as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            KERNEL,
+            [m as u32, weights.len() as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut blob = hip_bridge::KernargBlob::new();
+                for ptr in a {
+                    blob.push_ptr(ptr);
+                }
+                blob.push_ptr(x_ptr);
+                for ptr in y {
+                    blob.push_ptr(ptr);
+                }
+                blob.push_i32(jobs);
+                blob.push_i32(m_i32);
+                blob.push_i32(k_i32);
+                blob
+            },
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn gemv_mfp4g32_e8_soa_grouped_impl(
         &mut self,
