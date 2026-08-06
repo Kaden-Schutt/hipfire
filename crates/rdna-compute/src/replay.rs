@@ -448,6 +448,16 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
     }
     if matches!(
         kernel,
+        "gemv_mq2g256_lloyd_moe_gate_up_k8_indexed"
+            | "gemv_mq3g256_lloyd_moe_gate_up_k8_indexed"
+            | "gemv_mq2g256gl_moe_gate_up_k8_indexed"
+            | "gemv_mq3g256gl_moe_gate_up_k8_indexed"
+    ) {
+        return Some(vec![read(0), read(8), read(16), write(24), write(32)]);
+    }
+
+    if matches!(
+        kernel,
         "fused_qkvza_hfq4g256_k2048_all_buffer_dlc_gfx1151"
             | "fused_qkvza_hfq4g256_k2048_all_buffer_gfx1151"
             | "fused_qkvza_hfq4g256_k2048_all_buffer_glc_gfx1151"
@@ -481,6 +491,21 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
     ) {
         return Some(vec![read(0), read(8), read(16), write(24)]);
     }
+    if matches!(
+        kernel,
+        "gemv_mq2g256_lloyd_moe_down_residual_scaled_k8_indexed"
+            | "gemv_mq2g256_lloyd_moe_down_residual_scaled_k8_indexed_r2"
+            | "gemv_mq2g256_lloyd_moe_down_residual_scaled_k8_indexed_r4"
+            | "gemv_mq3g256_lloyd_moe_down_residual_scaled_k8_indexed"
+            | "gemv_mq3g256_lloyd_moe_down_residual_scaled_k8_indexed_r2"
+            | "gemv_mq3g256_lloyd_moe_down_residual_scaled_k8_indexed_r4"
+            | "gemv_mq3g256_lloyd_moe_ninepath_d4"
+            | "gemv_mq2g256gl_moe_down_residual_scaled_k8_indexed"
+            | "gemv_mq3g256gl_moe_down_residual_scaled_k8_indexed"
+    ) {
+        return Some(vec![read(0), read(8), read(16), read(24), write(32)]);
+    }
+
     if kernel == "moe_router_softmax_topk_k8_wave64_exact_shared_silu_mq_rotate" {
         return Some(vec![
             read(0),
@@ -789,6 +814,35 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
     ) {
         return Some(48);
     }
+    if matches!(
+        kernel,
+        "gemv_mq2g256_lloyd_moe_gate_up_k8_indexed"
+            | "gemv_mq3g256_lloyd_moe_gate_up_k8_indexed"
+            | "gemv_mq2g256_lloyd_moe_down_residual_scaled_k8_indexed"
+            | "gemv_mq2g256_lloyd_moe_down_residual_scaled_k8_indexed_r2"
+            | "gemv_mq2g256_lloyd_moe_down_residual_scaled_k8_indexed_r4"
+            | "gemv_mq3g256_lloyd_moe_down_residual_scaled_k8_indexed"
+            | "gemv_mq3g256_lloyd_moe_down_residual_scaled_k8_indexed_r2"
+            | "gemv_mq3g256_lloyd_moe_down_residual_scaled_k8_indexed_r4"
+            | "gemv_mq3g256_lloyd_moe_ninepath_d4"
+    ) {
+        return Some(48);
+    }
+    if matches!(
+        kernel,
+        "gemv_mq2g256gl_moe_gate_up_k8_indexed"
+            | "gemv_mq2g256gl_moe_down_residual_scaled_k8_indexed"
+    ) {
+        return Some(64);
+    }
+    if matches!(
+        kernel,
+        "gemv_mq3g256gl_moe_gate_up_k8_indexed"
+            | "gemv_mq3g256gl_moe_down_residual_scaled_k8_indexed"
+    ) {
+        return Some(80);
+    }
+
     if kernel.starts_with("gated_delta_net_q8_compact2_") {
         return Some(96);
     }
@@ -3808,6 +3862,104 @@ mod tests {
             Some(3)
         );
     }
+
+    // Fail if a codebook MoE kernel variant is added without resource-contract registration.
+    #[test]
+    fn codebook_moe_symbols_have_resource_contracts() {
+        let gate_up_effects = vec![
+            read(0),
+            read(8),
+            read(16),
+            write(24),
+            write(32),
+        ];
+        let down_effects = vec![
+            read(0),
+            read(8),
+            read(16),
+            read(24),
+            write(32),
+        ];
+        for (symbol, kernarg_bytes, effects) in [
+            (
+                "gemv_mq2g256_lloyd_moe_gate_up_k8_indexed",
+                48usize,
+                &gate_up_effects,
+            ),
+            (
+                "gemv_mq3g256_lloyd_moe_gate_up_k8_indexed",
+                48,
+                &gate_up_effects,
+            ),
+            (
+                "gemv_mq2g256gl_moe_gate_up_k8_indexed",
+                64,
+                &gate_up_effects,
+            ),
+            (
+                "gemv_mq3g256gl_moe_gate_up_k8_indexed",
+                80,
+                &gate_up_effects,
+            ),
+            (
+                "gemv_mq2g256_lloyd_moe_down_residual_scaled_k8_indexed",
+                48,
+                &down_effects,
+            ),
+            (
+                "gemv_mq2g256_lloyd_moe_down_residual_scaled_k8_indexed_r2",
+                48,
+                &down_effects,
+            ),
+            (
+                "gemv_mq2g256_lloyd_moe_down_residual_scaled_k8_indexed_r4",
+                48,
+                &down_effects,
+            ),
+            (
+                "gemv_mq3g256_lloyd_moe_down_residual_scaled_k8_indexed",
+                48,
+                &down_effects,
+            ),
+            (
+                "gemv_mq3g256_lloyd_moe_down_residual_scaled_k8_indexed_r2",
+                48,
+                &down_effects,
+            ),
+            (
+                "gemv_mq3g256_lloyd_moe_down_residual_scaled_k8_indexed_r4",
+                48,
+                &down_effects,
+            ),
+            ("gemv_mq3g256_lloyd_moe_ninepath_d4", 48, &down_effects),
+            (
+                "gemv_mq2g256gl_moe_down_residual_scaled_k8_indexed",
+                64,
+                &down_effects,
+            ),
+            (
+                "gemv_mq3g256gl_moe_down_residual_scaled_k8_indexed",
+                80,
+                &down_effects,
+            ),
+        ] {
+            assert_eq!(expected_kernarg_bytes(symbol), Some(kernarg_bytes));
+            let got = pointer_effects(symbol).expect("codebook MoE pointer contract");
+            assert_eq!(got.len(), effects.len());
+            for (got_effect, want) in got.iter().zip(effects.iter()) {
+                assert_eq!(got_effect.offset, want.offset);
+                assert_eq!(got_effect.mode, want.mode);
+            }
+            // Offset 24 is Write for gate_up and Read for down/ninepath.
+            assert_eq!(got[3].offset, 24);
+            if symbol.contains("gate_up") {
+                assert_eq!(got[3].mode, RecordedAccessMode::Write);
+            } else {
+                assert_eq!(got[3].mode, RecordedAccessMode::Read);
+            }
+        }
+    }
+
 
     #[test]
     fn moe_shared_down_and_routed_gate_up_are_independent_siblings() {
