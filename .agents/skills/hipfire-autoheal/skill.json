@@ -1,30 +1,39 @@
 {
   "name": "hipfire-autoheal",
   "version": "0.1.9",
-  "description": "Triage and fix hipfire runtime issues: daemon hangs, kernel JIT failures, port conflicts, multi-turn recall breaks, VRAM OOM. Walks the standard fix catalog in order of likelihood, gathers diagnostics, and ships targeted repairs. Framework-agnostic — works with any AI agent that can read, run shell commands, and edit config.",
+  "description": "Triage and repair hipfire runtime failures such as daemon hangs, stale serve.pid, port 11435 conflicts, ROCm include-path problems, missing precompiled kernels, VRAM OOM, kernel JIT failures, and multi-turn recall regressions. Use after diagnostics identify a likely runtime issue or when the user asks to fix a broken hipfire serve/run flow.",
   "triggers": [
     "hipfire won't start",
     "hipfire hangs",
     "hipfire is broken",
     "hipfire daemon not responding",
     "fix hipfire",
-    "diagnose hipfire",
-    "what's wrong with hipfire",
-    "multi-turn broken",
-    "kernel compile failed",
+    "stale serve.pid",
     "port 11435",
-    "kendall instead of kaden"
+    "multi-turn broken",
+    "multi-turn recall",
+    "kernel compile failed",
+    "kernel JIT",
+    "VRAM OOM",
+    "serve stuck",
+    "hipfire restart"
   ],
   "entry": "./triage.sh",
   "interpret": "./playbook.md",
   "references": {
     "fix-catalog": "./playbook.md",
     "hang-bisection": "./bisection.md",
-    "known-issues": "./known-issues.md"
+    "known-issues": "./known-issues.md",
+    "validation-routes": "../../../docs/VALIDATION.md",
+    "serve": "../../../docs/SERVE.md",
+    "cli": "../../../docs/CLI.md"
   },
   "requires": {
     "gpu": "AMD RDNA/CDNA supported by the current checkout",
-    "runtime": "ROCm 6+, amdgpu kernel driver",
-    "hipfire": "0.1.5+"
-  }
+    "runtime": "ROCm + amdgpu kernel driver",
+    "hipfire": "installed or source-built daemon/CLI"
+  },
+  "related": [
+    "hipfire-diag"
+  ]
 }

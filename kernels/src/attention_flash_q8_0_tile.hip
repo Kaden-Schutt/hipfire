@@ -26,6 +26,63 @@
 // Works on RDNA1 (gfx1010), RDNA2 (gfx1030), RDNA3 (gfx1100), RDNA4 (gfx1200+).
 #include <hip/hip_runtime.h>
 
+#if defined(HIPFIRE_GFX1151_ATTENTION_TILE_DPP_REDUCE)
+// Preserve the portable kernel's descending XOR tree (16,8,4,2,1) while
+// avoiding generic ds_bpermute for the three intra-row exchanges. The first
+// two stages use exact XOR ds_swizzles; DPP8/quad-perm handle the remaining
+// stages entirely in VALU. This keeps the floating-point association intact.
+__device__ __forceinline__ int hipfire_attention_xor16(int bits) {
+    return __builtin_amdgcn_ds_swizzle(bits, 0x401f);
+}
+
+__device__ __forceinline__ int hipfire_attention_xor8(int bits) {
+    return __builtin_amdgcn_ds_swizzle(bits, 0x201f);
+}
+
+__device__ __forceinline__ int hipfire_attention_xor4_dpp8(int bits) {
+    // dpp8:[4,5,6,7,0,1,2,3]
+    return __builtin_amdgcn_mov_dpp8(bits, 0x688fac);
+}
+
+__device__ __forceinline__ int hipfire_attention_xor2_dpp(int bits) {
+    // quad_perm:[2,3,0,1]
+    return __builtin_amdgcn_mov_dpp(bits, 0x4e, 0xf, 0xf, false);
+}
+
+__device__ __forceinline__ int hipfire_attention_xor1_dpp(int bits) {
+    // quad_perm:[1,0,3,2]
+    return __builtin_amdgcn_mov_dpp(bits, 0xb1, 0xf, 0xf, false);
+}
+
+__device__ __forceinline__ float hipfire_attention_reduce_sum_xor(float value) {
+    value += __builtin_bit_cast(float,
+        hipfire_attention_xor16(__builtin_bit_cast(int, value)));
+    value += __builtin_bit_cast(float,
+        hipfire_attention_xor8(__builtin_bit_cast(int, value)));
+    value += __builtin_bit_cast(float,
+        hipfire_attention_xor4_dpp8(__builtin_bit_cast(int, value)));
+    value += __builtin_bit_cast(float,
+        hipfire_attention_xor2_dpp(__builtin_bit_cast(int, value)));
+    value += __builtin_bit_cast(float,
+        hipfire_attention_xor1_dpp(__builtin_bit_cast(int, value)));
+    return value;
+}
+
+__device__ __forceinline__ float hipfire_attention_reduce_max_xor(float value) {
+    value = fmaxf(value, __builtin_bit_cast(float,
+        hipfire_attention_xor16(__builtin_bit_cast(int, value))));
+    value = fmaxf(value, __builtin_bit_cast(float,
+        hipfire_attention_xor8(__builtin_bit_cast(int, value))));
+    value = fmaxf(value, __builtin_bit_cast(float,
+        hipfire_attention_xor4_dpp8(__builtin_bit_cast(int, value))));
+    value = fmaxf(value, __builtin_bit_cast(float,
+        hipfire_attention_xor2_dpp(__builtin_bit_cast(int, value))));
+    value = fmaxf(value, __builtin_bit_cast(float,
+        hipfire_attention_xor1_dpp(__builtin_bit_cast(int, value))));
+    return value;
+}
+#endif
+
 extern "C" __launch_bounds__(32, 16)
 __global__ void attention_flash_q8_0_tile(
     const float* __restrict__ q,         // [n_heads, head_dim]
@@ -152,12 +209,19 @@ __global__ void attention_flash_q8_0_tile(
                       + qb_thread[2] * (ks3 * (float)k32)
                       + qb_thread[3] * (ks3 * (float)k33);
         }
+#if defined(HIPFIRE_GFX1151_ATTENTION_TILE_DPP_REDUCE)
+        partial0 = hipfire_attention_reduce_sum_xor(partial0);
+        partial1 = hipfire_attention_reduce_sum_xor(partial1);
+        partial2 = hipfire_attention_reduce_sum_xor(partial2);
+        partial3 = hipfire_attention_reduce_sum_xor(partial3);
+#else
         for (int off = 16; off > 0; off >>= 1) {
             partial0 += __shfl_xor(partial0, off);
             partial1 += __shfl_xor(partial1, off);
             partial2 += __shfl_xor(partial2, off);
             partial3 += __shfl_xor(partial3, off);
         }
+#endif
         if (tid == 0) {
             scores[t_local + 0] = partial0 * scale_attn;
             scores[t_local + 1] = partial1 * scale_attn;
@@ -179,8 +243,12 @@ __global__ void attention_flash_q8_0_tile(
                      + qb_thread[2] * (ks * (float)((signed char)kb[2 + k_off + 2]))
                      + qb_thread[3] * (ks * (float)((signed char)kb[2 + k_off + 3]));
         }
+#if defined(HIPFIRE_GFX1151_ATTENTION_TILE_DPP_REDUCE)
+        partial = hipfire_attention_reduce_sum_xor(partial);
+#else
         for (int off = 16; off > 0; off >>= 1)
             partial += __shfl_xor(partial, off);
+#endif
         if (tid == 0)
             scores[t_local] = partial * scale_attn;
     }
@@ -190,8 +258,12 @@ __global__ void attention_flash_q8_0_tile(
     float local_max = -1e30f;
     for (int i = tid; i < tile_len; i += 32)
         local_max = fmaxf(local_max, scores[i]);
+#if defined(HIPFIRE_GFX1151_ATTENTION_TILE_DPP_REDUCE)
+    local_max = hipfire_attention_reduce_max_xor(local_max);
+#else
     for (int off = 16; off > 0; off >>= 1)
         local_max = fmaxf(local_max, __shfl_xor(local_max, off));
+#endif
     float tile_max = local_max;
 
     // ═══ Phase C: exp + sum ═══
@@ -201,8 +273,12 @@ __global__ void attention_flash_q8_0_tile(
         scores[i] = e;
         local_sum += e;
     }
+#if defined(HIPFIRE_GFX1151_ATTENTION_TILE_DPP_REDUCE)
+    local_sum = hipfire_attention_reduce_sum_xor(local_sum);
+#else
     for (int off = 16; off > 0; off >>= 1)
         local_sum += __shfl_xor(local_sum, off);
+#endif
     float tile_sum = local_sum;
     __syncthreads();
 

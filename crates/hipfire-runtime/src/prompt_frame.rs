@@ -360,6 +360,89 @@ impl<'a> ChatScaffold<'a> {
     }
 }
 
+/// How a historical assistant turn's `tool_calls` are re-rendered on a
+/// cache MISS in [`build_cached_history`] — the hand-rolled ChatScaffold
+/// path used only when `HIPFIRE_JINJA_CHAT=0`. (The default jinja path
+/// renders history through the model's trained chat_template instead, via
+/// `build_cached_history_jinja`, and is unaffected by this enum.)
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ToolCallRender {
+    /// Legacy Hermes JSON: `\n<tool_call>\n{"name":..,"arguments":..}\n</tool_call>`.
+    /// Correct for Hermes-native models (carnice) and grammar-forced JSON.
+    HermesJson,
+    /// Qwen native XML: `\n<tool_call>\n<function=NAME>\n<parameter=ARG>\nVALUE\n</parameter>\n…\n</function>\n</tool_call>`.
+    /// Matches what grammar-off Qwen3.5/3.6 actually emit (and their
+    /// upstream chat_template), so a cache-miss history replay shows the
+    /// model its own format instead of fighting it with JSON.
+    QwenXml,
+}
+
+/// Render one tool call in Qwen3.5/3.6 native XML, matching the shape the
+/// model emits and its upstream chat_template produces. A string argument
+/// is emitted verbatim; any other JSON value is compact-serialized
+/// (mirrors the template's `value | string if string else value | tojson`).
+fn render_tool_call_qwen_xml(tc: &ToolCall) -> String {
+    // Invariant: tool-call arguments are a JSON object (per the tool schema).
+    // A non-object degrades to an empty `<function=…></function>` below; assert
+    // in debug so a violation surfaces in tests, degrade gracefully in release.
+    // NOTE: parameter values are NOT XML-escaped — a value literally containing
+    // `</parameter>`/`</function>` would desync the replayed token stream, but
+    // that only turns a cache-hit into a cache-miss (LCP divergence forces a
+    // re-prefill), and mirrors the model's own upstream chat_template.
+    debug_assert!(
+        tc.arguments.is_object(),
+        "tool-call arguments should be a JSON object, got {:?}",
+        tc.arguments
+    );
+    let mut s = String::from("\n<tool_call>\n<function=");
+    s.push_str(&tc.name);
+    s.push_str(">\n");
+    if let Some(obj) = tc.arguments.as_object() {
+        for (k, v) in obj {
+            s.push_str("<parameter=");
+            s.push_str(k);
+            s.push_str(">\n");
+            match v {
+                serde_json::Value::String(sv) => s.push_str(sv),
+                other => s.push_str(&serde_json::to_string(other).unwrap_or_default()),
+            }
+            s.push_str("\n</parameter>\n");
+        }
+    }
+    s.push_str("</function>\n</tool_call>");
+    s
+}
+
+/// Whether the Hermes-JSON tool-call grammar (and history render) should be ON
+/// for a Qwen3.5/3.6-family model, given the `HIPFIRE_QWEN35_GRAMMAR` env value
+/// (`None` if unset) and the loaded model path. Lives in the lib — not only in
+/// the CLI's `resolveToolGrammar` — so the DAEMON defaults correctly when
+/// launched DIRECTLY: the GPU behavior gate and `coherence-gate.sh` /
+/// `agentic-gate.sh` spawn `examples/daemon` without the CLI's `applyConfigEnv`,
+/// so without this they fall back to Hermes and never exercise the native-XML
+/// path. Precedence: explicit env wins (`"0"` = off kill-switch, any other set
+/// value = on); otherwise carnice (Hermes-native) => ON, plain Qwen3.5/3.6
+/// (XML-native) => OFF. Keyed on `carnice` in the model file name (all carnice
+/// cards ship as `carnice-*.mq{4,6}`), the only Hermes family in this arch.
+pub fn qwen35_grammar_on(env: Option<&str>, model_path: &str) -> bool {
+    match env {
+        Some("0") => false,
+        Some(_) => true,
+        None => model_path.to_ascii_lowercase().contains("carnice"),
+    }
+}
+
+/// Cache-miss history re-render format (non-jinja `HIPFIRE_JINJA_CHAT=0` path)
+/// for the same inputs as [`qwen35_grammar_on`]: grammar ON => Hermes JSON,
+/// grammar OFF => Qwen native XML.
+pub fn qwen35_history_render(env: Option<&str>, model_path: &str) -> ToolCallRender {
+    if qwen35_grammar_on(env, model_path) {
+        ToolCallRender::HermesJson
+    } else {
+        ToolCallRender::QwenXml
+    }
+}
+
 /// Build a multi-turn token stream from structured history, splicing
 /// cached verbatim token sequences for any historical assistant turn
 /// that `cache_lookup` returns `Some` for. Used by the daemon's Qwen
@@ -387,6 +470,7 @@ pub fn build_cached_history(
     history: &[Message],
     live_user_tokens: &[u32],
     assistant_prefix: AssistantPrefix,
+    tool_render: ToolCallRender,
     mut cache_lookup: impl FnMut(&Message) -> Option<Vec<u32>>,
 ) -> Vec<u32> {
     let scaffold = ChatScaffold::for_tokenizer(tokenizer);
@@ -444,14 +528,19 @@ pub fn build_cached_history(
                         out.extend(tokenizer.encode(&msg.content));
                     }
                     for tc in &msg.tool_calls {
-                        let payload = serde_json::json!({
-                            "name": tc.name,
-                            "arguments": tc.arguments,
-                        });
-                        let rendered = format!(
-                            "\n<tool_call>\n{}\n</tool_call>",
-                            serde_json::to_string(&payload).unwrap_or_default(),
-                        );
+                        let rendered = match tool_render {
+                            ToolCallRender::HermesJson => {
+                                let payload = serde_json::json!({
+                                    "name": tc.name,
+                                    "arguments": tc.arguments,
+                                });
+                                format!(
+                                    "\n<tool_call>\n{}\n</tool_call>",
+                                    serde_json::to_string(&payload).unwrap_or_default(),
+                                )
+                            }
+                            ToolCallRender::QwenXml => render_tool_call_qwen_xml(tc),
+                        };
                         out.extend(tokenizer.encode(&rendered));
                     }
                 }
@@ -652,7 +741,7 @@ pub fn hf_tojson(value: minijinja::Value) -> Result<String, minijinja::Error> {
 /// `HIPFIRE_CHAT_CURRENT_DATE` env var; otherwise we derive it from
 /// `SystemTime::now()` (NOT a determinism-forbidden argless engine `Date::now`).
 pub fn render_time_date() -> String {
-    if let Ok(pinned) = std::env::var("HIPFIRE_CHAT_CURRENT_DATE") {
+    if let Ok(pinned) = hipfire_config::developer_var("HIPFIRE_CHAT_CURRENT_DATE") {
         if !pinned.trim().is_empty() {
             return pinned;
         }
@@ -1651,6 +1740,143 @@ mod tests {
     }
 
     #[test]
+    fn cache_miss_history_tool_call_renders_native_xml_for_qwen() {
+        // Non-jinja ChatScaffold replay: on a cache MISS the historical
+        // assistant tool_call must re-render in the model's OWN format.
+        // For grammar-off Qwen3.5/3.6 that is native XML
+        // (`<function=NAME><parameter=ARG>`), NOT Hermes JSON — otherwise a
+        // post-eviction replay shows the model JSON and nudges it off its
+        // trained tool-call distribution.
+        let t = make_tokenizer();
+        let history = vec![
+            Message {
+                role: Role::User,
+                content: "weather?".to_string(),
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                tool_plan: String::new(),
+            },
+            Message {
+                role: Role::Assistant,
+                content: String::new(),
+                tool_calls: vec![ToolCall {
+                    name: "get_weather".to_string(),
+                    arguments: serde_json::json!({"city": "SF"}),
+                }],
+                tool_call_id: None,
+                tool_plan: String::new(),
+            },
+        ];
+        // cache_lookup returns None => MISS => the miss-branch render runs.
+        let toks = build_cached_history(
+            &t,
+            None,
+            &history,
+            &[],
+            AssistantPrefix::Plain,
+            ToolCallRender::QwenXml,
+            |_| None,
+        );
+        let text = t.decode(&toks);
+        assert!(
+            text.contains("<function=get_weather>"),
+            "expected native XML function tag, got: {text:?}"
+        );
+        assert!(
+            text.contains("<parameter=city>"),
+            "expected native XML parameter tag, got: {text:?}"
+        );
+        assert!(
+            !text.contains("{\"name\""),
+            "must NOT emit Hermes JSON payload, got: {text:?}"
+        );
+    }
+
+    #[test]
+    fn cache_miss_history_tool_call_renders_hermes_json_when_selected() {
+        // Hermes-native models (carnice / grammar-forced JSON) must keep
+        // the legacy `{"name":..,"arguments":..}` payload on replay.
+        let t = make_tokenizer();
+        let history = vec![Message {
+            role: Role::Assistant,
+            content: String::new(),
+            tool_calls: vec![ToolCall {
+                name: "get_weather".to_string(),
+                arguments: serde_json::json!({"city": "SF"}),
+            }],
+            tool_call_id: None,
+            tool_plan: String::new(),
+        }];
+        let toks = build_cached_history(
+            &t,
+            None,
+            &history,
+            &[],
+            AssistantPrefix::Plain,
+            ToolCallRender::HermesJson,
+            |_| None,
+        );
+        let text = t.decode(&toks);
+        assert!(
+            text.contains("{\"name\":\"get_weather\""),
+            "expected Hermes JSON payload, got: {text:?}"
+        );
+        assert!(
+            !text.contains("<function="),
+            "must NOT emit XML function tag, got: {text:?}"
+        );
+    }
+
+    // ── Model-aware tool-call format default ────────────────────────────
+    // The DAEMON (not just the CLI) must default the tool-call format by
+    // model, so a daemon-direct launch (GPU behavior gate, coherence-gate.sh,
+    // agentic-gate.sh) gets native XML for plain Qwen3.5/3.6 — not Hermes.
+
+    #[test]
+    fn grammar_default_off_for_plain_qwen() {
+        // No env => plain (non-carnice) Qwen3.5/3.6 defaults grammar OFF (XML).
+        assert!(!qwen35_grammar_on(None, "/models/qwen3.6-27b.mq4"));
+        assert!(!qwen35_grammar_on(None, "/models/qwen3.5-4b.mq4"));
+    }
+
+    #[test]
+    fn grammar_default_on_for_carnice() {
+        // No env => carnice (Hermes-native) defaults grammar ON (JSON).
+        assert!(qwen35_grammar_on(None, "/models/carnice-27b.mq4"));
+        assert!(qwen35_grammar_on(None, "/MODELS/Carnice-9b.mq6")); // case-insensitive
+    }
+
+    #[test]
+    fn grammar_env_zero_is_killswitch_even_for_carnice() {
+        assert!(!qwen35_grammar_on(Some("0"), "/models/carnice-27b.mq4"));
+    }
+
+    #[test]
+    fn grammar_env_set_forces_on_even_for_plain_qwen() {
+        assert!(qwen35_grammar_on(Some("1"), "/models/qwen3.6-27b.mq4"));
+    }
+
+    #[test]
+    fn history_render_follows_model_default_and_env() {
+        assert_eq!(
+            qwen35_history_render(None, "/m/qwen3.6-27b.mq4"),
+            ToolCallRender::QwenXml
+        );
+        assert_eq!(
+            qwen35_history_render(None, "/m/carnice-27b.mq4"),
+            ToolCallRender::HermesJson
+        );
+        assert_eq!(
+            qwen35_history_render(Some("1"), "/m/qwen3.6-27b.mq4"),
+            ToolCallRender::HermesJson
+        );
+        assert_eq!(
+            qwen35_history_render(Some("0"), "/m/carnice-27b.mq4"),
+            ToolCallRender::QwenXml
+        );
+    }
+
+    #[test]
     fn system_message_precedes_first_user_turn() {
         let t = make_tokenizer();
         let with_sys = ChatFrame {
@@ -1731,7 +1957,6 @@ SYS:{{ build_system_message(system_message) }}:END
         // render path injects `current_date` onto the leading system message
         // so the gated access resolves to a populated string instead of
         // raising. GPU-free, no model load — uses the embedded template excerpt.
-        std::env::set_var("HIPFIRE_CHAT_CURRENT_DATE", "2026-06-18");
         let t = make_tokenizer();
         let frame = JinjaChatFrame {
             tokenizer: &t,
@@ -1769,7 +1994,7 @@ SYS:{{ build_system_message(system_message) }}:END
             "explicit system content must be present: {out:?}"
         );
         assert!(
-            out.contains("Current date: 2026-06-18"),
+            out.contains("Current date:"),
             "current_date must be injected + rendered: {out:?}"
         );
         assert!(
@@ -1783,7 +2008,6 @@ SYS:{{ build_system_message(system_message) }}:END
             !out.contains("Current location:"),
             "current_location must not appear when unset: {out:?}"
         );
-        std::env::remove_var("HIPFIRE_CHAT_CURRENT_DATE");
     }
 
     #[test]

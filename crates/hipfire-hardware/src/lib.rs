@@ -1091,10 +1091,11 @@ impl Gpus {
 
 /// `HIPFIRE_EP_PEER_ALLREDUCE_DECODE=1` selects the RCCL-free peer-direct
 /// all-reduce for the EP MoE collective (no librccl dependency). Cached for
-/// process lifetime.
+/// process lifetime. Reads through `hipfire_config::developer_var` so the
+/// TOML policy layer can override the env read (beta merge port).
 pub fn ep_peer_allreduce_decode() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *F.get_or_init(|| std::env::var("HIPFIRE_EP_PEER_ALLREDUCE_DECODE").as_deref() == Ok("1"))
+    *F.get_or_init(|| hipfire_config::developer_var("HIPFIRE_EP_PEER_ALLREDUCE_DECODE").as_deref() == Ok("1"))
 }
 
 fn uniform_split_counts(n_devices: usize, n_layers: usize) -> Vec<usize> {

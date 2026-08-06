@@ -1,5 +1,5 @@
 //! Byte-equivalent CPU/GPU correctness check for
-//! `gemm_mq3g256_lloyd_moe_grouped_wmma` (MQ3-Lloyd grouped WMMA).
+//! `gemm_mq3g256_lloyd_moe_grouped` (arch-resolved MQ3-Lloyd grouped GEMM).
 //!
 //! Weight layout: 112 B/group = 16 B (8 × fp16 codebook entries) +
 //! 96 B (256 × 3-bit indices, packed 8-per-3-bytes LSB-first).
@@ -11,9 +11,9 @@
 //!   3. a_reg[i] = cb[idx_i]   (codebook lookup, already in fp16).
 //!   4. Accumulate Y[slot, m] = sum_k a[m,k] * x_f16[xrow, k] in fp32.
 //!
-//! The kernel uses LDS codebook broadcast and WMMA accumulation in FP32.
-//! CPU mirrors FP16 operands + FP32 accumulation → tight tolerance
-//! (1e-4 abs / 5e-3 rel; codebook lookup is exact, only WMMA order differs).
+//! The arch-resolved dispatcher uses i8 MMQ with Q8_1 activations on gfx1151
+//! and FP16 WMMA elsewhere. CPU mirrors FP16 operands + FP32 accumulation;
+//! gfx1151 is therefore checked with the repository-standard Q8_1 NRMSE gate.
 //!
 //! Runs on gfx11 (gfx1100/gfx1151, _k2 path) and gfx12 (gfx1201, .gfx12 path).
 //! Skips on archs without WMMA.
@@ -410,7 +410,7 @@ fn run_case(
 
     let y_gpu = alloc_f32_zeros(&mut gpu, m_total * m);
 
-    gpu.gemm_mq3g256_lloyd_moe_grouped_wmma(
+    gpu.gemm_mq3g256_lloyd_moe_grouped(
         &expert_weight_ptrs,
         &expert_tile_ids,
         &sorted_slot_index,
@@ -443,12 +443,16 @@ fn run_case(
     let mut max_rel_large = 0f32; // max rel error only for |ref| > max_abs_y * 0.1
     let mut argmax_abs = 0usize;
     let mut argmax_rel_large = 0usize;
+    let mut sum_sq_err = 0f64;
+    let mut sum_sq_ref = 0f64;
     // Dynamic range of the reference output.
     let max_abs_y: f32 = y_ref.iter().map(|v| v.abs()).fold(0f32, f32::max);
     let large_thresh = max_abs_y * 0.1_f32; // 10% of max output magnitude
 
     for (i, (a, b)) in y_ref.iter().zip(y_gpu_v.iter()).enumerate() {
         let d = (a - b).abs();
+        sum_sq_err += (d as f64) * (d as f64);
+        sum_sq_ref += (*a as f64) * (*a as f64);
         if d > max_abs {
             max_abs = d;
             argmax_abs = i;
@@ -474,6 +478,12 @@ fn run_case(
         "  max_rel_large = {:.6e} (at {}: ref={:.6e}, gpu={:.6e}, threshold={:.6e})",
         max_rel_large, argmax_rel_large, ref_rl, gpu_rl, large_thresh
     );
+    let nrmse = if sum_sq_ref > 0.0 {
+        (sum_sq_err / sum_sq_ref).sqrt() as f32
+    } else {
+        0.0
+    };
+    println!("  NRMSE = {:.6e}", nrmse);
     // MQ3-Lloyd bilinear dequant tolerance:
     //   abs: 0.1 — the 3D bilinear decomposition introduces FP16 rounding in
     //        7 FMA operations per weight element. For K=7168, the accumulated
@@ -486,11 +496,16 @@ fn run_case(
     //   The original 1e-4 abs / 5e-3 rel was written for the buggy LDS approach
     //   (which mixed codebooks across lanes — a correctness bug). The bilinear
     //   form is the correct per-lane approach.
-    if max_abs > 0.1 || max_rel_large > 2e-2 {
+    // gfx1151 dispatches through i8 MMQ and deliberately quantizes X to Q8_1.
+    // Match the established MMQ oracle used by test_moe_grouped_mmq_gfx12:
+    // aggregate NRMSE <= 3%, rather than FP16 elementwise tolerances.
+    if arch == "gfx1151" && nrmse <= 3e-2 {
+        println!("  PASS (gfx1151 Q8_1 NRMSE gate)");
+    } else if arch != "gfx1151" && max_abs <= 0.1 && max_rel_large <= 2e-2 {
+        println!("  PASS (FP16 WMMA gate)");
+    } else {
         println!("  FAIL — exceeds tolerance (0.1 abs; 2e-2 rel for |ref|>10%% of max)");
         std::process::exit(1);
-    } else {
-        println!("  PASS");
     }
 }
 

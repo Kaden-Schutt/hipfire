@@ -1,236 +1,351 @@
 # Architecture
 
-A 10,000-foot view of how a `hipfire run` becomes tokens. Read this
-before contributing kernels or dispatch changes.
+How a `hipfire run` becomes tokens on the current modular tree. Runtime source
+wins on conflict. Mutable command surfaces, model catalogs, and env inventories
+live in their own owners ([`CLI.md`](CLI.md), [`MODELS.md`](MODELS.md),
+[`env-vars.md`](env-vars.md)); this page maps crates, loaders, and data flow.
 
-## Crates
+Truth-state labels follow [`INDEX.md`](INDEX.md). Implementation capability is
+not product admission: a compiled path or runtime gate is not certification.
 
-```
+## Workspace map
+
+Workspace members (`Cargo.toml`):
+
+```text
 crates/
-├── hipfire-runtime/    inference orchestrator, KV cache, sampler, loaders
-├── hipfire-arch-*/     per-family forward pass (qwen35, llama, qwen35-vl, etc.)
-├── rdna-compute/       kernel dispatch, hipGraph capture, JIT loader
-├── hip-bridge/         safe Rust FFI over libamdhip64.so
-├── hipfire-quantize/   CPU-side safetensors / GGUF → .mq4 / .hf4 encoder
-└── redline/            direct-KMD dispatch research (future, skips HIP)
+├── hip-bridge/              # dlopen HIP FFI (libamdhip64)
+├── hsa-bridge/              # thin public HSA queue/AQL helpers
+├── rdna-compute/            # Gpu, kernel compile/cache, HIP launch families
+├── hipfire-runtime/         # arch-agnostic infra + Architecture trait; LLaMA forward still lives here
+├── hipfire-loader/          # Carrier registry, load_model, LoadedModel
+├── hipfire-dispatch/        # dtype/arch family tables + MoE/attn pipelines
+├── hipfire-dispatch-tests/  # dispatch coverage tests
+├── hipfire-arch-*/          # per-family config/weights/state/forward
+├── hipfire-quantize/        # CPU encoder (safetensors/GGUF → .mq* / .hfq*)
+├── hipfire-detect/          # observational JSONL behavior detectors
+├── hipfire-atlas/           # Kernel Atlas schema + emit helpers
+├── hipfire-config/          # typed TOML config + migration
+├── hipfire-registry/        # strict bundled/dynamic model registry
+├── hipfire-client/          # daemon JSONL + OpenAI HTTP/SSE client
+├── hipfire-cli/             # native operator and HTTP service
+├── hipfire-tui/             # terminal UI
+├── hipfire-reap/            # utility crate
+├── redline/                 # experimental direct-KMD / bare-libdrm research
+├── redline-dispatch/        # retained-tape record/replay + plan selection
+└── redline-rocr/            # public ROCr/HSA ABI + PM4 packet builders
 ```
 
-`hipfire-runtime` depends on `rdna-compute` and the arch crates.
-`rdna-compute` depends on `hip-bridge`. `hipfire-quantize` is standalone (no GPU deps) so a CI
-node without ROCm can still build the quantizer.
+HIP sources live under `kernels/src/`; there is no JavaScript/TypeScript
+operator runtime.
+
+### Layering
+
+| Layer | Crates | Role |
+|---|---|---|
+| Operator | `hipfire-cli`, `hipfire-config`, `hipfire-registry`, `hipfire-client`, `hipfire-tui` | Tag resolve, typed config, pull, HTTP service/client, one-shot daemon spawn |
+| Composition root | `hipfire-loader`, `hipfire-runtime/examples/daemon.rs` | Single load dispatch; HTTP/JSONL serve; generate ladders |
+| Arch forward | `hipfire-arch-*` | Config / weights / state / static-dispatch forward (LLaMA exception: canonical forward remains in runtime) |
+| Shared infra | `hipfire-runtime` | HFQ/safetensors, tokenizer, sampler, framing, KV policy, spec primitives, `Architecture` trait |
+| Kernel select | `hipfire-dispatch`, `rdna-compute` | Family tables + `Gpu` methods that pick WMMA/dot/baseline |
+| Device FFI | `hip-bridge`, `hsa-bridge` | HIP runtime; optional HSA AQL helpers |
+| Encode | `hipfire-quantize` | No GPU deps; CI-safe quantizer |
+| Observability | `hipfire-detect`, `hipfire-atlas` | Detectors; bench corpus schema |
+| Retained replay | `redline-dispatch`, `redline-rocr`, `rdna-compute::replay` | Product-integrated Redline path (see below) |
+| Direct-KMD research | `redline` | Not the serving transport |
+
+`hipfire-loader` depends on arch crates and is the **only** top-of-DAG
+`load_model` entry the daemon uses. Forward stays **statically dispatched** on
+concrete arch types after load (`Architecture` docs in
+`crates/hipfire-runtime/src/arch.rs`): the trait is bring-up scaffolding, not a
+hot-path `dyn` forward. **LLaMA exception:** `hipfire-arch-llama` is a facade —
+canonical dense LLaMA/Mistral/plain-Qwen3 forward and shared transformer types
+still live in `hipfire_runtime::llama`; the arch crate re-exports them.
 
 ## Request lifecycle
 
+```text
+hipfire run <tag-or-path> "…"
+        │
+        ▼
+Native CLI (`crates/hipfire-cli`)
+  resolve registry tag → model path under ~/.hipfire/models/ (or local path)
+  if serve up AND not forced local → HTTP POST /v1/chat/completions
+    forced local when HIPFIRE_LOCAL=1, --kv-mode, --json, or --no-stream
+    if HTTP fails while serve still live → abort (no local spawn; would collide)
+  else → spawn one-shot daemon binary
+        │
+        ▼
+Daemon (crates/hipfire-runtime/examples/daemon.rs)
+  hipfire_loader::load_model(path, …, &mut Gpu)
+        │
+        ▼
+hipfire-loader
+  ModelSource::from_path  →  HfqFile  |  SafetensorsSource dir
+  Carrier registry probe on arch_id (+ is_dir namespace)
+  carrier.load → LoadedModel { arch_id, state: ModelState::…, tokenizer, … }
+  optional: draft/speculator, VL weights, EP/PP scaffolding
+        │
+        ▼
+generate(…) ladder (daemon.rs)
+  EP? → generate_ep
+  else arch short-circuits (7/8/9/10/11/12) or qwen35/llama body
+  (DFlash/spec, PP generate_multi, VL, …)
+        │
+        ▼
+Arch forward (hipfire-arch-*/src)
+  prefill (eager per-token and/or batched where implemented)
+  decode_step / verify block
+  final norm + lm_head when logits needed
+        │
+        ▼
+rdna-compute Gpu methods  ↔  hipfire-dispatch family tables
+  kernels/src/*.hip  →  precompiled hsaco or hipcc JIT cache
+  ordinary HIP (hip-bridge)  |  retained replay fork (ReplayController → ROCr)
 ```
-hipfire run qwen3.5:9b "..."
 
-  CLI (cli/index.ts, Bun/TS)
-    ├── resolve tag → ~/.hipfire/models/<file>
-    ├── if running daemon detected → POST /v1/chat/completions
-    └── else → spawn one-shot daemon binary
+Serve long-running path: same daemon binary, HTTP surface documented in
+[`SERVE.md`](SERVE.md); chat attach in [`CHAT.md`](CHAT.md).
 
-  Daemon (crates/hipfire-runtime/examples/daemon.rs)
-    ├── HfqFile::open(path)               # mmap, read header + tensor index
-    ├── config_from_hfq                   # rebuild LlamaConfig / Qwen35Config
-    ├── Tokenizer::from_hfq_metadata      # vocab, merges, BOS/EOS
-    ├── load_weights / load_weights_hfq   # tensor → GPU upload
-    └── for each token: prompt + sample loop
+## Model sources (not “two model paths”)
 
-  Forward pass (crates/hipfire-arch-*/src/*.rs)
-    ├── per layer:
-    │   ├── rmsnorm
-    │   ├── (rotate_x_for_mq if MQ-quantized)
-    │   ├── QKV / attention / O proj
-    │   │   └── DeltaNet linear-attn for Qwen3.5 LA layers
-    │   ├── residual
-    │   ├── ffn_norm
-    │   └── gate / up / down (SwiGLU)
-    ├── final norm + lm_head
-    └── sample (greedy / top-p / repeat-penalty)
+Load is **source × carrier**, not a two-file hard split.
 
-  Kernels (kernels/src/*.hip)
-    ├── compiled at runtime via hipcc, cached at ~/.hipfire/bin/kernels/<arch>/
-    └── invoked by rdna-compute::dispatch
-```
+### Sources
 
-## Two model paths
-
-hipfire has two largely-independent model loaders:
-
-| Path | Files | Targets |
+| Source | Type | Arch id origin |
 |---|---|---|
-| `llama.rs` | `crates/hipfire-runtime/src/llama.rs` | Llama / Qwen3 / Mistral / generic dense |
-| `qwen35.rs` | `crates/hipfire-arch-qwen35/src/qwen35.rs` | Qwen 3.5 / 3.6 hybrid (DeltaNet + FullAttention) |
+| HFQ / MQ* artifact | `ModelSource::Hfq(HfqFile)` | Header `HfqFile::arch_id` |
+| Safetensors / Paro directory | `ModelSource::Dir(SafetensorsSource)` | `derive_arch_id` from `config.json` (`architectures` / `model_type`) |
 
-`config_from_hfq` (in `hfq.rs`) sniffs `architecture` in the model's
-metadata blob and dispatches to the right loader. The qwen35 path adds
-DeltaNet linear-attention layers, MoE expert routing (qwen3.5_moe), and
-DFlash speculative decode hooks.
+Defined in `crates/hipfire-runtime/src/loader_api.rs` and
+`safetensors_source.rs`. Unrecognized dir `model_type` yields sentinel
+`UNCLAIMED_ARCH_ID` (`u32::MAX`) so routing fails closed instead of defaulting
+to Qwen3.5.
 
-Tensor naming uses the HuggingFace safetensors convention:
-`model.layers.{i}.self_attn.q_proj.weight`, etc. The GGUF input path
-in `hipfire-quantize` translates llama.cpp's `blk.{i}.attn_q.weight`
-naming to this convention at write time so both paths read the same
-tensor names.
+Tensor names follow family-dependent HuggingFace conventions (e.g. dense LLaMA
+`model.layers.{i}.…`; Qwen3.5 nested `model.language_model.layers.…`). GGUF
+inputs map only **recognized** llama.cpp names via `gguf_to_safetensors_name`
+at quantize time; unknown GGUF names are retained unchanged.
 
-## Dispatch layering
+### Carriers
 
-`rdna-compute::dispatch` is the kernel-selection hot path. Every GEMM /
-GEMV / norm / fused op routes through here:
+Object-safe `Carrier` trait + static `REGISTRY` in
+`crates/hipfire-loader/src/{lib,carriers}.rs`. `load_model` requires **exactly
+one** matching carrier (zero → error; two → ambiguous error).
 
-```rust
-pub fn gemm_qkv_hfq4g256(&self, ...) -> HipResult<()> {
-    if has_wmma_f16(&self.arch) {
-        return self.gemm_qkv_hfq4g256_wmma(...);
-    }
-    if has_dot2_f32_f16(&self.arch) {
-        return self.gemm_qkv_hfq4g256_dot2(...);
-    }
-    self.gemm_qkv_hfq4g256_baseline(...)
-}
-```
-
-Two principles:
-
-1. Fast paths first; baseline last. Predicates are arch-feature checks
-   (`has_wmma_f16`, `has_dot2_f32_f16`) defined at the top of
-   `dispatch.rs`, not inline `arch.starts_with(...)` chains.
-2. **No unreachable branches.** When a new arch absorbs a check that
-   was matched by an older `|| starts_with("gfxN")` clause, drop the
-   redundant clause in the same diff.
-
-## Kernel build paths
-
-```
-kernels/src/<name>.hip                    # source
-~/.hipfire/bin/kernels/<arch>/<name>.hsaco  # pre-compiled blob, hash-verified
-~/.hipcc-cache/<hash>.hsaco                  # JIT fallback
-```
-
-On startup the runtime checks for a pre-compiled blob matching the
-source hash. If present, mmap-load. If absent, JIT through hipcc and
-cache. `hipfire diag` prints which kernels came from which path.
-
-Per-arch variants follow the dot convention:
-
-```
-gemv_hfq4g256.hip                         # default
-gemv_hfq4g256.gfx1100.hip                 # chip-specific override
-gemv_hfq4g256.gfx1030.v4.hip              # chip-specific versioned
-gemm_qkv_hfq4g256_wmma.gfx12.hip          # family-wide override
-```
-
-`scripts/compile-kernels.sh` resolves chip → family → default in that
-order. Family tags (`.gfx12.hip`) cover gfx1200 + gfx1201 with a
-single file.
-
-## KV cache
-
-Stored as `[seq_len][n_kv_heads][head_dim]` per layer. Layout depends
-on `kv_cache` config:
-
-| Mode | K format | V format |
+| Carrier | Claims `arch_id` | Arch crate / notes |
 |---|---|---|
-| `q8` | Q8_0 | Q8_0 |
-| `asym3` | Lloyd-Max rotated 3-bit | Q8_0 |
-| `asym4` | Lloyd-Max rotated 4-bit | Q8_0 |
-| `asym2` | rotated 2-bit | Q8_0 |
+| `LlamaCarrier` | 0, 1 | `hipfire-arch-llama` (dense LLaMA/Mistral/plain Qwen3) |
+| `Qwen2Carrier` | 7 | `hipfire-arch-qwen2` (Q/K/V attention bias path) |
+| `Qwen35Carrier` | 5, 6 | `hipfire-arch-qwen35` (+ optional `hipfire-arch-qwen35-vl`) |
+| `DotsOcrCarrier` | 8 | `hipfire-arch-dots-ocr` (vision + Qwen2 text decoder fields) |
+| `Deepseek4Carrier` | 9 | `hipfire-arch-deepseek4` |
+| `MinimaxCarrier` | 10 | `hipfire-arch-minimax` |
+| `Lfm2MoeCarrier` | 11 | `hipfire-arch-lfm2moe` |
+| `Cohere2MoeCarrier` | 12 | `hipfire-arch-cohere2moe` |
 
-The "asym" name is because K and V get different bitwidths: K is the
-multi-turn recall bottleneck (small bitwidth shifts → "Kendall"
-instead of "Kaden") so it gets the rotation + careful quant; V is less
-sensitive and stays Q8 for speed. See [QUANTIZATION.md](QUANTIZATION.md)
-for the math.
+Canonical numeric registry: [`architecture-ids.md`](architecture-ids.md).
 
-## DeltaNet (Qwen 3.5 hybrid)
+`LoadedModel.state` is a closed `ModelState` enum
+(`Qwen2 | Qwen35 | Llama | Lfm2Moe | Minimax | Cohere2Moe | Deepseek4`).
+dots.ocr keeps config/weights on dedicated `LoadedModel` fields and reuses
+`qwen2_state`. EP (expert-parallel) for DeepSeek4 / MiniMax stores rank state
+in `LoadedModel.ep`, not `state`.
 
-Qwen 3.5+ alternates FullAttention with DeltaNet linear-attention
-layers. DeltaNet replaces softmax attention with a recurrent gated
-linear update — O(1) per-token compute, fixed-size state, no KV cache
-for those layers (the state IS the cache).
+### Multi-device load variants
 
-The Qwen 3.5 config carries a `layer_types` array that decides which
-layers are linear vs full. A 1D causal conv across the time axis runs
-before the linear-attention update for local mixing. Per-head
-learnable decay + per-head per-token gate parameterize the state
-update; see `crates/hipfire-arch-qwen35/src/qwen35.rs` for the exact form.
+| API | Scope |
+|---|---|
+| `load_model` | Single GPU (and Qwen3.5 PP when `pp > 1` inside the carrier) |
+| `load_model_ep` | Expert-parallel: arch_id 9 and 10 only; staging reclaims completed/pushed ranks on failure (constructor-mid-failure can still leak that rank’s partial allocs) |
 
-## Speculative decode
+## Architecture crates
 
-The decode loop drives a `&mut dyn Speculator`
-(`crates/hipfire-runtime/src/spec.rs`) and never names an arch. The seam
-splits into *policy* (the `Speculator` — what to draft + the accept rule) and
-*mechanics* (the `SpecTarget`, impl'd on each model bundle — how to run that
-arch's verify forward + snapshot/rewind its state). Drafter kinds:
+Each `hipfire-arch-*` crate owns family-specific config, weight load, GPU
+state, and forward — **except LLaMA**: canonical dense forward and shared
+transformer types remain in `hipfire_runtime::llama`; `hipfire-arch-llama` is
+the facade/re-export plus bring-up/carrier surface. Other runtime-owned pieces
+(sampler, prompt frame, EOS filter, loop guard, generic spec traits) stay in
+`hipfire-runtime`.
 
-- **n-gram** (model-free, opt-in `HIPFIRE_NGRAM_DRAFT=1`) — proposes tokens from
-  the prompt/output suffix; verify always falls back to the target's greedy
-  argmax, so output is **byte-identical to AR**. Any arch earns it by
-  implementing `SpecTarget` + two registry lines — no kernels, no draft model.
-- **DFlash** (below), **MTP** (multi-token-prediction head), **EAGLE** (upstream
-  heads) — *learned* drafters with trained weights + per-arch kernels.
+| Crate | Family summary |
+|---|---|
+| `hipfire-arch-llama` | Facade for dense FA ids 0/1; forward body is `hipfire_runtime::llama` |
+| `hipfire-arch-qwen2` | Standalone Qwen2 text |
+| `hipfire-arch-qwen35` | Hybrid DeltaNet + full attention; dense (5) and MoE/A3B (6); DFlash/MTP hooks |
+| `hipfire-arch-qwen35-vl` | Vision tower attached to Qwen3.5 ids 5/6 |
+| `hipfire-arch-dots-ocr` | dots.ocr / Qwen2-VL-class OCR |
+| `hipfire-arch-deepseek4` | DeepSeek V4 Flash (HC, compressed-KV indexer, optional MTP/DSpark) |
+| `hipfire-arch-minimax` | MiniMax-M2 MoE |
+| `hipfire-arch-lfm2moe` | LFM2.5 dense + LFM2.5-MoE hybrid short-conv / GQA |
+| `hipfire-arch-cohere2moe` | Cohere2-MoE / North-Mini-Code |
+| `hipfire-arch-toy` | Template only (`arch_id = 0xFF`); daemon must not dispatch |
 
-Per-arch support status + measured acceptance (τ) per workload lives in
-`docs/speculation-support-inventory.md`. **Adding speculative decode to a new
-arch** is documented as step 7 of the arch-port skill:
-`.agents/skills/hipfire-arch-port/speculation.md`.
+Bring-up contract: implement `hipfire_runtime::arch::Architecture` (see
+`hipfire-arch-toy` and production `hipfire-arch-qwen35/src/arch.rs`).
 
-### DFlash
+### Forward shape (typical dense/hybrid layer)
 
-`crates/hipfire-arch-qwen35/src/dflash.rs`. Target model + small same-family draft
-model run in parallel; the draft proposes K tokens, the target
-verifies in one batched forward pass and accepts the longest
-correctly-predicted prefix. Average accepted-tokens-per-cycle (τ)
-drives the speedup.
+Per layer (names vary by family): pre-norm → mixer (attention and/or short-conv
+/ DeltaNet) → residual → FFN norm → gate/up/down or MoE → residual. Final
+embedding norm + tied or untied `lm_head` when logits are required. Hybrid
+families carry extra recurrent state (DeltaNet, LFM conv tails) alongside KV.
 
-Draft resolution (in `cli/index.ts`, in priority order):
+## Dispatch and kernels
 
-1. `HIPFIRE_DFLASH_DRAFT=<path>` env override — highest priority. Pass
-   an empty string to opt out even when a draft would otherwise match.
-2. **Filename auto-match**: when the target path matches the regex
-   `qwen3?.?(5|6)[-_]?<size>\.(mq4|mq6|hfq4|hfq6|q8)`, the CLI looks
-   for a sibling file named `qwen3{ver}-{size}-dflash-{quant}.hfq`
-   in `./models/`, `../../models/`, or `~/.hipfire/models/`. First
-   hit wins. Logs `[hipfire] DFlash draft detected: <path>` to stderr.
-3. Registry tags `:<size>-draft` (e.g. `qwen3.5:27b-draft`) point at
-   exactly those filenames, so `hipfire pull qwen3.5:27b-draft` puts
-   the file where the auto-match looks. The tags are a convenience
-   for `pull`, not a separate code path.
+### Two related dispatch surfaces
 
-The CLI passes the resolved path to the daemon as a `draft` param;
-the daemon loads it. No filename logic on the daemon side — it
-trusts the CLI's resolution.
+1. **`rdna-compute`** — `Gpu` methods (`gemm_*`, `gemv_*`, attention, norm, MoE,
+   sampling, …) used directly by arch forwards. Arch capability predicates live
+   in `arch_caps` / feature flags; implementations pick WMMA → specialized →
+   baseline. Source modules: `dispatch.rs`, `gemm.rs`, `gemv.rs`,
+   `attention.rs`, `moe.rs`, `norm.rs`, `kernels.rs`, `compiler.rs`, `replay.rs`.
+2. **`hipfire-dispatch`** — unified family tables and pipelines so callers avoid
+   matching on `DType` by hand (`families/`, `tables/`, `pipeline/`, `ops/`).
 
-Toggle with `hipfire config set dflash_mode {auto,on,off}` — default
-is `off` as of v0.1.8 (opt-in until the speedup is more universally a
-win). `auto` gates A3B (MoE) targets off because their drafts reject
-most tokens on non-math prompts; an A3B target with a TriAttention
-sidecar configured stays DFlash-on because long-ctx A3B on 24 GB
-needs the eviction policy.
+Principle (both layers): fast paths first; baseline last; drop redundant arch
+clauses when a newer predicate subsumes them.
 
-## Observability
+### Kernel build
 
-```
-HIPFIRE_PROMPT_TOKEN_HEAT=1   # per-position BPE merge-rank heat
-HIPFIRE_GRAPH=1               # enable hipGraph capture (debug; AR-only)
-HIPFIRE_MEMSET_DUMP=1         # log every gpu memset call:line
+```text
+kernels/src/<name>.hip
+kernels/src/<name>.gfx1201.hip          # chip override
+kernels/src/<name>.gfx12.hip            # family override (e.g. gfx1200+gfx1201)
+        │  scripts/compile-kernels.sh  (chip → family → base)
+        ▼
+kernels/compiled/<arch>/…               # packaged / tree prebuild output
+./.hipfire_kernels/<arch>/…             # default JIT cache (or HIPFIRE_KERNEL_CACHE)
 ```
 
-Daemon log (`~/.hipfire/serve.log`) contains layer-load progress,
-kernel JIT activity, and dispatch decisions. Tail it during first-load
-and any first-time arch transition.
+On startup the runtime prefers a hash-matching precompiled blob. Missing or
+mismatched hash → hipcc JIT into the cache when hipcc is available; if hipcc is
+unavailable, an explicitly warned **unvalidated** precompiled blob may still be
+used. `hipfire diag` reports compiled blob/hash counts per arch, not which path
+supplied each kernel.
 
-## Where to start contributing
+Some arch crates also ship crate-local HIP (registered through their own
+`kernels.rs`) for family-specific ops.
 
-- **A new arch port**: read `.agents/skills/hipfire-arch-port/` first — it
-  has the WMMA matrix, dispatch routing rules, validation gates, and
-  the contributor onboarding workflow.
-- **A new kernel variant**: `kernels/src/<existing>.<chip>.hip` and
-  wire it in `kernels.rs` + `dispatch.rs`. Run the speed-gate
-  (`scripts/speed-gate.sh --fast`) before committing.
-- **A new GGUF dequant type** (Q5_K / IQ4_XS / etc.): port from
-  llama.cpp's `ggml-quants.c` into
-  `crates/hipfire-quantize/src/gguf_input.rs`.
-- **A new model architecture** (Gemma, Mistral-NeMo, etc.): start
-  with `crates/hipfire-runtime/src/llama.rs` as the template; add the architecture string to
-  `from_gguf` / `from_hfq` and any tensor-shape divergences.
+## Serve / generate path
+
+Composition root: `crates/hipfire-runtime/examples/daemon.rs`.
+
+After `load_model`, request handling builds sampling defaults
+(request → HFQ `generation_config` recommendations → arch ladder) and enters
+`generate`:
+
+1. **EP** (`m.ep.is_some()`) → `generate_ep` (ds4 / MiniMax ranks).
+2. **Arch short-circuits** with optional n-gram/spec when a `Speculator` is
+   loaded and temp policy allows: ids 7, 9, 11, 12, 10, 8.
+3. **Qwen3.5 / LLaMA body**: PP (`generate_multi`), DFlash/spec
+   (`generate_dflash` / `generate_spec` / MTP), VL (`generate_vl`), else dense
+   AR loops.
+
+Capability examples that are **implemented** but not automatically
+“product-certified”:
+
+- LFM2.5 gfx1201 batched prefill is **branch-implemented**, not shipped/admitted:
+  only the frozen **350M dense MQ4** fixture under `arch_id == 11 && is_gfx1201()`
+  with explicit `HIPFIRE_LFM2_PREFILL_BATCH=1`; every other LFM cohort/dtype fails
+  closed after that gate. Default remains eager/decode-shaped prefill.
+- N-gram draft is model-free opt-in (`HIPFIRE_NGRAM_DRAFT`); many arches
+  implement `SpecTarget`, but acceptance and product defaults are separate.
+- DFlash draft resolution is CLI-side path/auto-match; daemon loads the path it
+  is given. Mode toggles and MoE caveats: config/env owners, not this page.
+
+Speculation inventory snapshot: [`speculation-support-inventory.md`](speculation-support-inventory.md)
+(historical — verify in source before claims).
+
+## Redline roles (capability vs certification)
+
+Three crates + one integration controller. Normative contributor procedure:
+[`REDLINE.md`](REDLINE.md) (**branch-implemented** vs `origin/beta` at the
+comparison base in [`INDEX.md`](INDEX.md)).
+
+| Piece | Owns | Does **not** own |
+|---|---|---|
+| `redline` | Experimental direct-KMD via libdrm_amdgpu (device, BO, PM4 CS, fences) | Product serve transport |
+| `redline-dispatch` | Dispatch-DAG record/validate, artifact/kernarg identity, plan compile/selection, retained AQL/PM4 graph construction; HIP and AQL backends | ROCr ABI lifetimes; model admission policy |
+| `redline-rocr` | Dynamically loaded public ROCr/HSA ABI; queues, signals, AQL packets, arch PM4-IB builders | Model scheduling / backend admission |
+| `rdna-compute::replay::ReplayController` | Product integration on `Gpu`: record, prepare, route, poison, reset | A fourth transport crate |
+
+Active retained-PM4 mental model (ordinary HIP launches remain the default path):
+
+```text
+recorder-aware launch site
+  ├─ ordinary HIP → hip-bridge
+  └─ retained replay (ReplayController fork when armed/ready)
+       → retained tape (opcodes, kernargs, geometry, deps, bindings)
+       → arch-specific PM4 lowering
+       → public-HSA command memory
+       → one PM4-IB AQL packet by default (PreparedPm4Graph::Single)
+         or multiple queue/phase packets when explicitly enabled phased
+         multi-queue replay is used (PreparedPm4Graph::Phased)
+       → ROCr queue / doorbell / completion
+```
+
+**Runtime routing/default ≠ admission or certification.** Example runtime
+automatic default (source capability/default fact only, `REDLINE.md`; not an
+admission or certification record): `mq4r_redline_default` — exact GPU arch
+`gfx1100`/`gfx1151`/`gfx1201` + PP=1 + TP=1 + case-insensitive `.mq4r`
+extension configures model default replay backend (model-family agnostic; no
+`arch_id` gate); `gfx1200` and all other arches remain opt-in. Built-in `hip`
+config profile, explicit `HIPFIRE_REPLAY_BACKEND`, or manual capture disables
+the automatic default / opts into broader capability.
+Promotion and performance claims require the certification ladder in
+`REDLINE.md` (parity, timed-arm route proof, matched stationary conditions).
+`ReplayState::Ready` alone is not repository certification. Stitching manual
+capture to product timed-arm proof without that ladder is **blocked**
+([`INDEX.md`](INDEX.md)).
+
+Do not describe Redline as “future only”: retained record/replay and ROCr PM4-IB
+paths are **implemented**; what remains gated is **route certification and
+default product claims**.
+
+## KV cache (shared policy)
+
+Resolved by `hipfire_runtime::kv_mode` per load-site policy (aliases and
+accepted sets differ by carrier). Concrete modes include:
+
+| Mode | Role (summary) |
+|---|---|
+| `q8` | Q8_0 K and V |
+| `asym2` / `asym3` / `asym4` | Lower-bit rotated/Lloyd K; V typically wider |
+| `fwht2` / `fwht3` / `fwht4` | FWHT-rotated K tiers |
+
+Exact layouts and math: [`QUANTIZATION.md`](QUANTIZATION.md). Hybrid linear
+layers (DeltaNet) use fixed recurrent state instead of FA KV for those layers.
+
+## Observability hooks
+
+Examples (full list: [`env-vars.md`](env-vars.md)):
+
+- `HIPFIRE_GRAPH` — hipGraph capture (debug; AR-oriented)
+- `HIPFIRE_PROFILE` / rocprof integration — internal vs external timing
+- Daemon log under the serve data dir — load progress, JIT, dispatch decisions
+- `hipfire-detect` — post-hoc JSONL detectors (non-blocking)
+- `hipfire-atlas` — structured bench rows (`--emit-atlas`)
+
+## Where to contribute
+
+| Task | Start here |
+|---|---|
+| New model family | `.agents/skills/hipfire-arch-port/` + `hipfire-arch-toy`; register carrier + id |
+| New GPU arch / WMMA port | arch-port skill; `rdna-compute` + kernel variants |
+| Kernel micro-opt | `kernels/src/<name>.<chip>.hip`; dispatch/family wiring; methodology under `docs/methodology/` |
+| Quant format / encoder | `hipfire-quantize`; [`QUANTIZATION.md`](QUANTIZATION.md) / [`QUANTIZE.md`](QUANTIZE.md) |
+| Retained replay / PM4 | [`REDLINE.md`](REDLINE.md); do not treat `crates/redline` KMD as serve |
+| Validation route | [`VALIDATION.md`](VALIDATION.md) only — no universal GPU gate |
+
+## Related owners
+
+| Concern | Owner |
+|---|---|
+| Arch id table | [`architecture-ids.md`](architecture-ids.md) |
+| Docs lifecycle / truth states | [`INDEX.md`](INDEX.md) |
+| Redline certification | [`REDLINE.md`](REDLINE.md) |
+| Models / VRAM / sidecars | [`MODELS.md`](MODELS.md) |
+| Multi-GPU ops | [`multi-gpu.md`](multi-gpu.md) |
+| Perf claim protocol | [`methodology/perf-benchmarking.md`](methodology/perf-benchmarking.md) |

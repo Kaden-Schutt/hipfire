@@ -525,6 +525,7 @@ fn build_layer_steps(r: LayerRefs<'_>) -> Vec<Step<'_>> {
             tree_bias: None,
             block_start: 0,
             block_cols: 0,
+            output_gate: None,
             output: r.attn,
         },
     });

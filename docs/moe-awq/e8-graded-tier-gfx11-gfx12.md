@@ -188,7 +188,7 @@ HIPFIRE_E8_GFX12=1 [HIPFIRE_MOE_MQ6_ADMIT=1 on gfx11 if pre-widen] \
 ```
 Perf (daemon): `bench_prefill.py <model> 4096 512,1024,2048 64` with
 `DAEMON_BIN=…/examples/daemon HIPFIRE_E8_GFX12=1`. (No `bun` on hiptrx → use the
-Python driver, not `cli/bench_sweep.ts`.) Pitfall: `pkill -f examples/daemon`
+Python driver, not the production `scripts/serve_harness.py` route.) Pitfall: `pkill -f examples/daemon`
 self-kills any shell whose cmdline contains `DAEMON_BIN=…examples/daemon`.
 
 Build pitfall: editing a `.hip` needs `touch crates/rdna-compute/src/kernels.rs`

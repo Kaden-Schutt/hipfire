@@ -19,6 +19,7 @@ use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama::{f16_to_f32, KvCache, WeightTensor};
 use hipfire_runtime::model_source::ModelSource;
 use hipfire_runtime::safetensors_source::{bf16_bytes_to_f16, source_bytes_to_f32_vec};
+use hipfire_runtime::{screen_weight_tensor, MmqScreenable};
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 // ───────────────────────── HFQ load helpers ─────────────────────────
@@ -265,6 +266,37 @@ pub struct Lfm2MoeWeights {
     pub embedding_norm: GpuTensor, // model.embedding_norm.weight (final norm)
     pub lm_head: WeightTensor, // tied = embed_tokens (loaded as Q8 weight)
     pub layers: Vec<Lfm2MoeLayerWeights>,
+}
+
+impl MmqScreenable for Lfm2MoeWeights {
+    fn screen_mmq_weights(&self, gpu: &mut Gpu) -> (usize, usize) {
+        let (mut safe, mut unsafe_count) = (0usize, 0usize);
+        screen_weight_tensor(&self.lm_head, gpu, &mut safe, &mut unsafe_count);
+        for layer in &self.layers {
+            match &layer.mixer {
+                Mixer::Conv(weights) => {
+                    screen_weight_tensor(&weights.in_proj, gpu, &mut safe, &mut unsafe_count);
+                    screen_weight_tensor(&weights.out_proj, gpu, &mut safe, &mut unsafe_count);
+                }
+                Mixer::Attention(weights) => {
+                    for weight in [&weights.wq, &weights.wk, &weights.wv, &weights.wo] {
+                        screen_weight_tensor(weight, gpu, &mut safe, &mut unsafe_count);
+                    }
+                }
+            }
+            match &layer.ffn {
+                Ffn::Dense(weights) => {
+                    for weight in [&weights.w1, &weights.w3, &weights.w2] {
+                        screen_weight_tensor(weight, gpu, &mut safe, &mut unsafe_count);
+                    }
+                }
+                Ffn::Moe(weights) => {
+                    screen_weight_tensor(&weights.router, gpu, &mut safe, &mut unsafe_count);
+                }
+            }
+        }
+        (safe, unsafe_count)
+    }
 }
 
 impl ExpertWeights {
@@ -1269,7 +1301,7 @@ impl Lfm2MoeState {
     }
 
     pub fn free_gpu(self, gpu: &mut Gpu) {
-        self.kv.free_gpu(gpu);
+        let _ = self.kv.free_gpu(gpu);
         for t in self.conv_states {
             let _ = gpu.free_tensor(t);
         }

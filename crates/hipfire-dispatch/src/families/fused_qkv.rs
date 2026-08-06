@@ -31,6 +31,19 @@ pub struct FusedQkvParams<'a> {
     pub batch_size: Option<usize>,
 }
 
+/// Qwen2-only decode parameters for the Q/K/V-bias fold. This is deliberately
+/// separate from [`FusedQkvParams`]: Qwen3+ and Redline retain their original
+/// dispatch shape and kernel ABI.
+pub struct FusedQkvBiasParams<'a> {
+    pub kind: KernelKey,
+    pub weights: [&'a GpuTensor; 3],
+    pub x: &'a GpuTensor,
+    pub outputs: [&'a GpuTensor; 3],
+    pub m: [usize; 3],
+    pub k: usize,
+    pub bias: [&'a GpuTensor; 3],
+}
+
 pub struct FusedQkvFamily {
     registry: KernelRegistry,
 }
@@ -66,6 +79,16 @@ impl FusedQkvFamily {
     ) -> Result<(), DispatchError> {
         self.resolve(params.kind, ctx, None)?;
         dispatch_fused_qkv(gpu, params)
+    }
+
+    pub fn run_with_qwen2_bias(
+        &self,
+        ctx: &DispatchCtx,
+        gpu: &mut Gpu,
+        params: &FusedQkvBiasParams,
+    ) -> Result<(), DispatchError> {
+        self.resolve(params.kind, ctx, None)?;
+        dispatch_fused_qkv_with_qwen2_bias(gpu, params)
     }
 }
 
@@ -651,6 +674,123 @@ fn dispatch_fused_qkv(gpu: &mut Gpu, params: &FusedQkvParams) -> Result<(), Disp
         _ => Err(DispatchError::UnsupportedVariant {
             family: "fused_qkv",
             variant: "",
+            arch: "",
+            quant: "",
+        }),
+    }
+}
+
+fn dispatch_fused_qkv_with_qwen2_bias(
+    gpu: &mut Gpu,
+    params: &FusedQkvBiasParams,
+) -> Result<(), DispatchError> {
+    let [wq, wk, wv] = params.weights;
+    let [q, kout, v] = params.outputs;
+    let [mq, mk, mv] = params.m;
+    let [bq, bk, bv] = params.bias;
+    let k = params.k;
+    let x = params.x;
+
+    match params.kind {
+        KernelKey::FusedQkvHfq4G256 => hip!(gpu.fused_qkv_hfq4g256_with_bias(
+            wq,
+            wk,
+            wv,
+            x,
+            q,
+            kout,
+            v,
+            mq,
+            mk,
+            mv,
+            k,
+            bq.buf.as_ptr(),
+            bk.buf.as_ptr(),
+            bv.buf.as_ptr()
+        )),
+        KernelKey::FusedQkvMq3G256Lloyd => hip!(gpu.fused_qkv_mq3g256_lloyd_with_bias(
+            wq,
+            wk,
+            wv,
+            x,
+            q,
+            kout,
+            v,
+            mq,
+            mk,
+            mv,
+            k,
+            bq.buf.as_ptr(),
+            bk.buf.as_ptr(),
+            bv.buf.as_ptr()
+        )),
+        KernelKey::FusedQkvMq4G256Lloyd => hip!(gpu.fused_qkv_mq4g256_lloyd_with_bias(
+            wq,
+            wk,
+            wv,
+            x,
+            q,
+            kout,
+            v,
+            mq,
+            mk,
+            mv,
+            k,
+            bq.buf.as_ptr(),
+            bk.buf.as_ptr(),
+            bv.buf.as_ptr()
+        )),
+        KernelKey::FusedQkvHfq6G256 => hip!(gpu.fused_qkv_hfq6g256_with_bias(
+            wq,
+            wk,
+            wv,
+            x,
+            q,
+            kout,
+            v,
+            mq,
+            mk,
+            mv,
+            k,
+            bq.buf.as_ptr(),
+            bk.buf.as_ptr(),
+            bv.buf.as_ptr()
+        )),
+        KernelKey::FusedQkvQ4K => hip!(gpu.fused_qkv_q4k_with_bias(
+            wq,
+            wk,
+            wv,
+            x,
+            q,
+            kout,
+            v,
+            mq,
+            mk,
+            mv,
+            k,
+            bq.buf.as_ptr(),
+            bk.buf.as_ptr(),
+            bv.buf.as_ptr()
+        )),
+        KernelKey::FusedQkvQ8_0 => hip!(gpu.fused_qkv_q8_0_with_bias(
+            wq,
+            wk,
+            wv,
+            x,
+            q,
+            kout,
+            v,
+            mq,
+            mk,
+            mv,
+            k,
+            bq.buf.as_ptr(),
+            bk.buf.as_ptr(),
+            bv.buf.as_ptr()
+        )),
+        _ => Err(DispatchError::UnsupportedVariant {
+            family: "fused_qkv",
+            variant: "qwen2_bias",
             arch: "",
             quant: "",
         }),

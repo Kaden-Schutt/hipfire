@@ -112,10 +112,9 @@ fn main() {
                 return;
             }
         };
-    let mut model = match loaded.parallel {
-        ModelParallel::Tp(tp) => tp,
-        _ => panic!("expected TP model"),
-    };
+        let mut model = loaded
+        .tp_model
+        .expect("expected TP model (tp_model carrier)");
     model.prefill(&toks).expect("tp prefill");
     let tp_logits = model.logits().expect("tp logits");
 

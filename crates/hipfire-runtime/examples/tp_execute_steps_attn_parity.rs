@@ -245,6 +245,7 @@ fn main() {
             tree_bias: None,
             block_start: 0,
             block_cols: 0,
+            output_gate: None,
             output: &attn,
         };
         attn_fam.run_attention(&ctx, g, &plan, &io).unwrap();
@@ -430,6 +431,7 @@ fn main() {
                         tree_bias: None,
                         block_start: 0,
                         block_cols: 0,
+                        output_gate: None,
                         output: &bufs[r].attn,
                     },
                 },

@@ -286,11 +286,61 @@ including:
 Redline is a research/insurance-policy crate: if the userspace HIP
 runtime regresses, breaks on an arch, or vanishes on a future ROCm
 release, hipfire retains a route to the metal. It is not on the
-default execution path. It is published under the dual MIT/Apache-2.0
-license like the rest of hipfire and exists explicitly to be a
+default execution path. It is published under Apache-2.0 like the
+rest of hipfire and exists explicitly to be a
 reference implementation for anyone needing the bare-KMD pattern.
 
 ---
+
+## 10. Recurrent-state prompt cache — LCP forward-extension for hybrid models
+
+| | |
+|---|---|
+| Cumulative KV + DeltaNet recurrent state across turns | `afbaa8c5d` (2026-04-04) |
+| Prefix-cache via LCP detection + `cached_tokens` usage | `ee3d02a41` (2026-05-24) |
+| Per-turn token cache (kills BPE re-encode drift)      | `7d3643539` (2026-05-24) |
+| Cache-under-jinja via verbatim splice                 | `2c0784bc3` (2026-06-09) |
+| Originator   | Kaden Schutt |
+| Canonical files | `crates/hipfire-runtime/examples/daemon.rs` (`cache_eligible` / `plan_from_rendered` / `plan_cache`), `crates/hipfire-runtime/src/cache_plan.rs` (`CachePlan` / `CachePolicy`, `5510a1600`) |
+
+Cross-request prompt-cache reuse keyed on the **longest common token
+prefix** rather than on whole-prompt equality, for models whose
+resumable state is *not* just attention KV. On Qwen3.5/3.6 the
+snapshot that has to survive a turn boundary includes the DeltaNet
+**recurrent state** and convolution state alongside KV; restoring KV
+alone silently corrupts generation. `afbaa8c5d` (2026-04-04) is the
+first commit carrying recurrent state through a multi-turn boundary;
+`ee3d02a41` (2026-05-24) is the first LCP-keyed cross-request prefix
+cache with `cached_tokens` reported back in the usage block.
+
+Two supporting details that are easy to miss and load-bearing in
+practice:
+
+- **BPE re-encode drift** (`7d3643539`) — re-tokenizing turn N+1's
+  rendered prompt does not necessarily reproduce turn N's token ids at
+  the shared prefix, so an LCP computed over freshly-encoded tokens
+  can under-match or, worse, mis-match. hipfire caches the per-turn
+  token ids instead of re-encoding.
+- **Jinja verbatim splice** (`2c0784bc3`) — a chat template that
+  re-renders the whole conversation will perturb bytes inside the
+  supposedly-stable region. The cache render path splices verbatim
+  rather than re-rendering, which is what keeps the prefix
+  byte-identical turn over turn.
+
+**Scope of the claim.** What is claimed here is LCP-keyed
+cross-request reuse *including recurrent/conv state* for hybrid
+attention+SSM models, dated above. What is **not** claimed: the
+general idea of prefix caching (long prior art — vLLM automatic
+prefix caching, SGLang RadixAttention, and others predate this
+repository), nor a multi-slot cross-conversation snapshot store.
+hipfire's cache is a **live-session forward extension**: it does not
+retain N independent conversation snapshots, so interleaving two
+conversations evicts rather than hits. Engines that ship a slot pool
+(e.g. Lucebox `--prefix-cache-slots`, merged `c3b71e4b`,
+2026-07-27) cover a case hipfire currently does not.
+
+---
+
 
 ## Provenance verification
 
@@ -303,7 +353,8 @@ git log -1 --format='%an %ai' <hash>   # see author + date
 
 The `v-mit-final` tag marks the final commit (`d46f81b6`) before the
 dual-license transition; everything in this PRIOR-ART.md is in the
-pre-tag history and was published under MIT first, then under the
-current MIT/Apache-2.0 dual license. The prior-art claims here do
+pre-tag history and was published under MIT first, then dual
+MIT/Apache-2.0, and is Apache-2.0 as of v0.3.0. The prior-art claims
+here do
 not depend on which license applies — they depend on this being the
 canonical repository where the innovations first shipped.

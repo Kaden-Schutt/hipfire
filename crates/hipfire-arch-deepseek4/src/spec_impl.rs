@@ -58,7 +58,7 @@ impl SpecScratch for Deepseek4DsparkScratch {
 /// Max batch for the trunk-side verify PBS (bootstrap 1-token + verify up to
 /// block+1 tokens). Mirror of `Deepseek4DsparkDrafter::pbs_max_batch`.
 fn dspark_verify_pbs_max_batch() -> usize {
-    std::env::var("HIPFIRE_DEEPSEEK4_PP_BATCH")
+    hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_PP_BATCH")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(1024)
@@ -197,6 +197,20 @@ impl SpecTarget for Deepseek4Bundle {
         self
     }
 
+    fn reset_recurrent(&mut self, gpu: &mut Gpu) -> Result<(), String> {
+        // Host counters + MTP residual + graph-warmup flag, then zero every
+        // position-indexed SWA/full/compressed/indexer cache so a fresh
+        // conversation cannot bleed prior-turn residue (pairs with the
+        // daemon's `gpu.invalidate_graph_state()` after this hook).
+        self.state.reset();
+        self.state.zero_decode_caches(gpu);
+        Ok(())
+    }
+
+    fn retry_reset_eligible(&self) -> bool {
+        // reset() + zero_decode_caches; daemon pairs invalidate_graph_state.
+        true
+    }
     fn eos_token(&self) -> u32 {
         self.eos_tok
     }
@@ -222,9 +236,14 @@ impl SpecTarget for Deepseek4Bundle {
         gpu: &mut Gpu,
         tokens: &[u32],
         start_pos: usize,
+        reset: bool,
         abort: &dyn Fn() -> bool,
         _hidden_out: Option<&mut Vec<f32>>,
     ) -> Result<SpecAdvance, String> {
+        if reset {
+            self.reset_recurrent(gpu)
+                .map_err(|e| format!("deepseek4 spec_advance reset: {e}"))?;
+        }
         // Lazily allocate the trunk-sized PBS.
         if self.state.dspark_verify_pbs.is_none() {
             self.state.dspark_verify_pbs = Some(
@@ -289,7 +308,10 @@ impl SpecTarget for Deepseek4Bundle {
         };
         let last_argmax = crate::spec_decode::logits_argmax(&last_logits) as u32;
         self.state.dspark_verify_pbs = Some(pbs);
-        Ok(SpecAdvance::Ready { last_argmax })
+        Ok(SpecAdvance::Ready {
+            last_argmax,
+            last_logits: Some(last_logits),
+        })
     }
 
     // ── DSpark verify primitives ──────────────────────────────────────────

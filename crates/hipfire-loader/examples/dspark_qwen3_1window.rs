@@ -78,11 +78,11 @@ fn main() -> Result<(), String> {
     let prefill_start = 0usize;
 
     // Acquire spec target via carrier dispatch.
-    let arch_id = m.meta.arch_id;
+    let arch_id = m.arch_id;
     let carrier = hipfire_loader::carrier_for(arch_id)
         .ok_or_else(|| format!("no carrier for arch_id {arch_id}"))?;
     let mut guard = carrier
-        .spec_target_guard(&mut m.state, &m.meta.model_path)
+        .spec_target_guard(&mut m.state, &m.model_path)
         .map_err(|e| format!("spec_target_guard: {e}"))?;
     let target = guard.slot().map_err(|e| format!("guard.slot: {e}"))?;
 
@@ -116,9 +116,10 @@ fn main() -> Result<(), String> {
             target,
             position,
             seed,
-            &[],  // emitted (empty: no prior context for repeat-penalty)
-            None, // grammar
-            0.0,  // temp: greedy
+            &[],        // emitted (empty: no prior context for repeat-penalty)
+            None,       // grammar
+            0.0,        // temp: greedy
+            usize::MAX, // uncapped bench window
         )
         .map_err(|e| format!("step: {e}"))?;
 

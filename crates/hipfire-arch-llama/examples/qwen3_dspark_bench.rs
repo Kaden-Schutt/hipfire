@@ -75,7 +75,16 @@ fn decode_loop(
     generated.push(first_token);
 
     while generated.len() < max {
-        let step = spec.step(gpu, bundle, position, seed, &generated, None, temp)?;
+        let step = spec.step(
+            gpu,
+            bundle,
+            position,
+            seed,
+            &generated,
+            None,
+            temp,
+            max.saturating_sub(generated.len()).max(1),
+        )?;
         windows += 1;
         proposed += step.proposed as u64;
         accepted += step.accepted as u64;
@@ -150,6 +159,7 @@ fn main() -> Result<(), String> {
         max_seq,
         draft_path: None,
         kv_mode_override: None,
+        kv_backend: hipfire_runtime::kv_backend::KvBackend::Contiguous,
         kv_adaptive_override: None,
         state_quant_override: None,
         cask: &cask,
@@ -450,7 +460,7 @@ fn main() -> Result<(), String> {
     // ── TIMED RUN: fresh prefill, then timed decode ────────────────────────────
     // Mirror the daemon's reset contract: spec.reset + kv.compact_offset=0 +
     // gpu.invalidate_graph_state() so the warmup-shaped HIP graph doesn't replay.
-    spec.reset(ctx.gpu);
+    let _ = spec.reset(ctx.gpu);
     bundle.kv.compact_offset = 0;
     ctx.gpu.invalidate_graph_state();
 

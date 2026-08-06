@@ -812,7 +812,7 @@ impl Qwen35MtpHeadKvCache {
         // leaks the k_gpu/v_gpu buffers. Free them explicitly. (The old
         // "they free on Drop" comment was false; see mtp_spec/mtp_compose
         // which already bypass this wrapper for the same reason.)
-        self.inner.free_gpu(gpu);
+        let _ = self.inner.free_gpu(gpu);
     }
 }
 
@@ -1692,6 +1692,7 @@ pub fn mtp_head_forward_block_only_with_pos_buf(
         tree_bias: None,
         block_start: 0,
         block_cols: 0,
+        output_gate: None,
         output: &scratch.attn_out,
     };
     hipfire_dispatch::pipeline::execute_steps(
@@ -1948,7 +1949,7 @@ pub fn mtp_head_apply_lm_head_batched(
             // the head lm_head is ALSO scalar today — gets the fix too. WMMA
             // needs wave32 (gfx11+) and K%32==0; else fall back to scalar.
             // Opt out with HIPFIRE_MTP_HEAD_LMHEAD_WMMA=0.
-            let use_wmma = std::env::var("HIPFIRE_MTP_HEAD_LMHEAD_WMMA")
+            let use_wmma = hipfire_config::developer_var("HIPFIRE_MTP_HEAD_LMHEAD_WMMA")
                 .ok()
                 .as_deref()
                 != Some("0")

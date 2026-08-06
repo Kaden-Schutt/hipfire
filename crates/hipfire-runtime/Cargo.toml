@@ -71,12 +71,21 @@ loader-internal = []
 # harness is one GPU-bearing invocation per process and never constructs
 # `EpArch::Qwen35` or adds daemon Qwen EP admission.
 emulated-ep2-harness = ["hipfire-arch-qwen35/emulated-ep2-harness"]
+# serve-fault-inject: test-only GPU fault injection + test_state_snapshot for
+# serve-hardening retry parity. NOT in the default set: production builds
+# compile the generate field, one-shot after-prefill hooks, and snapshot
+# command OUT. Build the GPU parity harness daemon with
+# `--features deltanet,serve-fault-inject`.
+serve-fault-inject = []
 [dependencies]
 hip-bridge = { path = "../hip-bridge" }
+hipfire-config = { path = "../hipfire-config" }
 rdna-compute = { path = "../rdna-compute" }
 hipfire-hardware = { path = "../hipfire-hardware" }
 hipfire-dispatch = { path = "../hipfire-dispatch" }
 memmap2 = "0.9"
+safetensors.workspace = true
+half.workspace = true
 byteorder = "1"
 serde = { version = "1", features = ["derive"] }
 # preserve_order: keep JSON object key insertion-order (IndexMap) instead of the
@@ -114,6 +123,7 @@ minijinja = { version = "2", features = ["loop_controls", "json", "preserve_orde
 # work on plain Jinja values — required by the Qwen3 family
 # template which uses these throughout.
 minijinja-contrib = { version = "2", features = ["pycompat"] }
+tracing = "0.1"
 
 # Examples in this crate (daemon, infer_qwen35, infer_qwen3, infer_vl, etc.)
 # consume the arch crates. These are dev-dependencies — cargo refuses
@@ -138,6 +148,7 @@ hipfire-detect = { path = "../hipfire-detect" }
 hipfire-atlas = { path = "../hipfire-atlas" }
 # In-test minimal HFQ writer (overlay resolution tests in src/hfq.rs).
 tempfile = "3"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 
 # Each example below carries `required-features` listing the cargo
 # features its `use hipfire_arch_*` imports depend on. This documents

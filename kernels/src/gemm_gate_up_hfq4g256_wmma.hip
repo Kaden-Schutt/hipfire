@@ -143,3 +143,179 @@ extern "C" __global__ void gemm_gate_up_hfq4g256_wmma(
         }
     }
 }
+
+// Experimental cold-weight LDS staging variant for fused gate+up on gfx11
+// (RDNA3/3.5). Sister of gemm_gate_up_hfq4g256_wmma_gfx12_ldsstage: same
+// slab/wave structure and gate/up row routing; gfx11 half16_t operands +
+// interleaved C-map + _w32 builtin. Opt-in via HIPFIRE_HFQ4G256_LDSSTAGE=1;
+// K%512==0. OVERWRITE semantics (y = sum, not +=).
+typedef unsigned int __attribute__((ext_vector_type(4))) uint4v_t;
+
+__launch_bounds__(256, 4)
+extern "C" __global__ void gemm_gate_up_hfq4g256_wmma_ldsstage(
+    const char* __restrict__ A_gate,
+    const char* __restrict__ A_up,
+    const _Float16* __restrict__ X,
+    float* __restrict__ Y_gate,
+    float* __restrict__ Y_up,
+    int gate_m, int up_m,
+    int K, int N
+) {
+    const int tid = threadIdx.x;
+    const int wave = tid >> 5;
+    const int lane = tid & 31;
+    const int total_m = gate_m + up_m;
+    const int row_start = blockIdx.x * 16;
+    const int batch_start = blockIdx.y * 16;
+
+    if (row_start >= total_m || batch_start >= N) return;
+
+    const int m_lane = lane & 15;
+    const int k_grp = lane >> 4;
+    const int safe_batch = (batch_start + m_lane < N)
+        ? (batch_start + m_lane) : 0;
+    const _Float16* x_base = X + (long long)safe_batch * K;
+    const int groups_per_row = K / 256;
+    const long long row_stride = (long long)groups_per_row * 136;
+    const int slabs = K / 512;
+
+    __shared__ __align__(16) unsigned char staged_weights[16][272];
+    __shared__ float partials[8 * 32 * 8];
+
+    const int load_row = tid / 17;
+    const int load_vec = tid - load_row * 17;
+    const int safe_load_row = (row_start + load_row < total_m)
+        ? (row_start + load_row) : (total_m - 1);
+    const char* A_load;
+    int local_load_row;
+    if (safe_load_row < gate_m) {
+        A_load = A_gate;  local_load_row = safe_load_row;
+    } else {
+        A_load = A_up;    local_load_row = safe_load_row - gate_m;
+    }
+
+    float8_t acc = {0, 0, 0, 0, 0, 0, 0, 0};
+
+    for (int slab = 0; slab < slabs; ++slab) {
+        const char* src0 = A_load + (long long)local_load_row * row_stride
+            + slab * 272 + load_vec * 16;
+        unsigned char* dst0 = staged_weights[load_row] + load_vec * 16;
+        *(uint4v_t*)dst0 = *(const uint4v_t*)src0;
+
+        if (tid < 16) {
+            const int vec = tid + 1;
+            const int safe_row15 = (row_start + 15 < total_m)
+                ? (row_start + 15) : (total_m - 1);
+            const char* A15;
+            int local_row15;
+            if (safe_row15 < gate_m) {
+                A15 = A_gate;  local_row15 = safe_row15;
+            } else {
+                A15 = A_up;    local_row15 = safe_row15 - gate_m;
+            }
+            const char* src1 = A15 + (long long)local_row15 * row_stride
+                + slab * 272 + vec * 16;
+            unsigned char* dst1 = staged_weights[15] + vec * 16;
+            *(uint4v_t*)dst1 = *(const uint4v_t*)src1;
+        }
+        __syncthreads();
+
+        const int group_in_slab = wave >> 2;
+        const int quarter_in_group = wave & 3;
+        const unsigned char* gp = staged_weights[m_lane] + group_in_slab * 136;
+        _Float16 sc_h = (_Float16)__builtin_bit_cast(float, *(const unsigned int*)(gp));
+        _Float16 zp_h = (_Float16)__builtin_bit_cast(float, *(const unsigned int*)(gp + 4));
+        const _Float16* xg = x_base + slab * 512 + wave * 64;
+        const int packed_base = quarter_in_group * 32;
+
+        // gfx11 WMMA: half16_t A/B (full 16-K per lane). Four 16-K tiles
+        // cover the wave's 64-wide K slice of the 512-wide slab.
+        #define DQ16_LDS(pk0, pk1) \
+            a_reg[0]  = sc_h * (_Float16)(float)(((pk0) >>  0) & 0xFu) + zp_h; \
+            a_reg[1]  = sc_h * (_Float16)(float)(((pk0) >>  4) & 0xFu) + zp_h; \
+            a_reg[2]  = sc_h * (_Float16)(float)(((pk0) >>  8) & 0xFu) + zp_h; \
+            a_reg[3]  = sc_h * (_Float16)(float)(((pk0) >> 12) & 0xFu) + zp_h; \
+            a_reg[4]  = sc_h * (_Float16)(float)(((pk0) >> 16) & 0xFu) + zp_h; \
+            a_reg[5]  = sc_h * (_Float16)(float)(((pk0) >> 20) & 0xFu) + zp_h; \
+            a_reg[6]  = sc_h * (_Float16)(float)(((pk0) >> 24) & 0xFu) + zp_h; \
+            a_reg[7]  = sc_h * (_Float16)(float)(((pk0) >> 28) & 0xFu) + zp_h; \
+            a_reg[8]  = sc_h * (_Float16)(float)(((pk1) >>  0) & 0xFu) + zp_h; \
+            a_reg[9]  = sc_h * (_Float16)(float)(((pk1) >>  4) & 0xFu) + zp_h; \
+            a_reg[10] = sc_h * (_Float16)(float)(((pk1) >>  8) & 0xFu) + zp_h; \
+            a_reg[11] = sc_h * (_Float16)(float)(((pk1) >> 12) & 0xFu) + zp_h; \
+            a_reg[12] = sc_h * (_Float16)(float)(((pk1) >> 16) & 0xFu) + zp_h; \
+            a_reg[13] = sc_h * (_Float16)(float)(((pk1) >> 20) & 0xFu) + zp_h; \
+            a_reg[14] = sc_h * (_Float16)(float)(((pk1) >> 24) & 0xFu) + zp_h; \
+            a_reg[15] = sc_h * (_Float16)(float)(((pk1) >> 28) & 0xFu) + zp_h
+
+        {
+            const unsigned int pk0 = *(const unsigned int*)(gp + 8 + packed_base + 0);
+            const unsigned int pk1 = *(const unsigned int*)(gp + 8 + packed_base + 4);
+            const half16_t b_reg = *(const half16_t*)(xg + 0);
+            half16_t a_reg;
+            DQ16_LDS(pk0, pk1);
+            acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a_reg, b_reg, acc);
+        }
+        {
+            const unsigned int pk0 = *(const unsigned int*)(gp + 8 + packed_base + 8);
+            const unsigned int pk1 = *(const unsigned int*)(gp + 8 + packed_base + 12);
+            const half16_t b_reg = *(const half16_t*)(xg + 16);
+            half16_t a_reg;
+            DQ16_LDS(pk0, pk1);
+            acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a_reg, b_reg, acc);
+        }
+        {
+            const unsigned int pk0 = *(const unsigned int*)(gp + 8 + packed_base + 16);
+            const unsigned int pk1 = *(const unsigned int*)(gp + 8 + packed_base + 20);
+            const half16_t b_reg = *(const half16_t*)(xg + 32);
+            half16_t a_reg;
+            DQ16_LDS(pk0, pk1);
+            acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a_reg, b_reg, acc);
+        }
+        {
+            const unsigned int pk0 = *(const unsigned int*)(gp + 8 + packed_base + 24);
+            const unsigned int pk1 = *(const unsigned int*)(gp + 8 + packed_base + 28);
+            const half16_t b_reg = *(const half16_t*)(xg + 48);
+            half16_t a_reg;
+            DQ16_LDS(pk0, pk1);
+            acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a_reg, b_reg, acc);
+        }
+        #undef DQ16_LDS
+
+        __syncthreads();
+    }
+
+    #pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        partials[(wave * 32 + lane) * 8 + j] = acc[j];
+    }
+    __syncthreads();
+
+    // Wave 0 reduction with gate_up OVERWRITE semantics (y = sum, not +=).
+    // gfx11 C-map: acc[j] = C[2*j + (lane>>4)][lane & 15].
+    if (wave == 0) {
+        const int out_col = batch_start + m_lane;
+        if (out_col < N) {
+            #pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                float sum = partials[(0 * 32 + lane) * 8 + j];
+                #pragma unroll
+                for (int w = 1; w < 8; ++w) {
+                    sum += partials[(w * 32 + lane) * 8 + j];
+                }
+                const int out_row = row_start + 2 * j + k_grp;
+                if (out_row < total_m) {
+                    float* Y;
+                    int proj_row;
+                    int out_stride;
+                    if (out_row < gate_m) {
+                        Y = Y_gate;  proj_row = out_row;           out_stride = gate_m;
+                    } else {
+                        Y = Y_up;    proj_row = out_row - gate_m;  out_stride = up_m;
+                    }
+                    Y[(long long)out_col * out_stride + proj_row] = sum;
+                }
+            }
+        }
+    }
+}

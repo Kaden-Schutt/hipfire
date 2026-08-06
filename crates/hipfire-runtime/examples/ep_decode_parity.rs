@@ -193,6 +193,7 @@ fn main() -> ExitCode {
             eprintln!("ep2 parity harness error: {e}");
             ExitCode::from(2)
         }
+
     }
 }
 

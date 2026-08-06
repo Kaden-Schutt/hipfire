@@ -1,88 +1,111 @@
 ---
 name: hipfire-kernel-tuning
-description: Optimize hipfire HIP/compute kernels — pick a tuning lever (multi-row, K-tile depth, prefetch, wave-size port, WMMA/MFMA, fused projections, ISA flags) and validate the win across the supported RDNA arch matrix. Use when you've identified a hot kernel, want to land a real perf win, and need to NOT regress on archs you don't have hardware for. Codifies the methodology from this repo's actual perf history — wave64 CDNA3 port (commit 4105035, 2× decode), nontemporal-load revert (34eb024, -13% caught only by clean-baseline bisect), gfx12 WMMA port (PR #56). Triggers on phrases like "tune kernel X", "optimize gemv on RDNA*", "make kernel Y faster on gfx*", "perf regression on <arch>", "should I add a multi-row variant", "kernel runs slow at low batch sizes".
+description: Optimize hipfire HIP/compute kernels — pick one tuning lever (multi-row, K-tile depth, prefetch, wave-size port, WMMA/MFMA, fused projections, ISA flags) and validate it with profile → ISA → fresh-process measurement. Use when a hot kernel is identified, you want a real perf win, and you must not regress adjacent archs or promote unverified deltas. Codifies the methodology from this repo's perf history (wave64 CDNA3 port 4105035, nontemporal-load revert 34eb024, gfx12 WMMA PR #56, barrier-free nosync wins). Triggers on "tune kernel", "optimize gemv/gemm", "make kernel faster", "perf regression on <arch>", "multi-row variant", "wave64 port", "WMMA performance".
 ---
 
 # hipfire-kernel-tuning
 
-Skill for landing real kernel perf wins in hipfire without breaking
-cross-arch portability or shipping a regression that the speed-gate
-catches but you talked yourself past. Codifies the empirical
-methodology that's actually worked across the gfx1010 → gfx1201 +
-gfx94x matrix.
+Land real kernel perf wins without inventing a universal gate, shipping
+measurement noise, or silently regressing an adjacent arch.
+
+This skill is **workflow only**. Mutable numbers, noise bands, admission
+policy, and claim→route maps live in canonical owners under `docs/`. Do not
+copy those tables into commits or skill prose.
 
 ## When to use
 
-- A profiler / `crate::profile` timer flagged a hot kernel as the
-  bottleneck and you want to pick the right lever.
-- You have a candidate optimization (multi-row variant, deeper K
-  unroll, wave64 port, ISA flag) and need to validate it doesn't
-  regress on the cross-arch matrix.
-- The speed-gate flagged a regression on a "should-be-no-op"
-  refactor and you need the bisect / fresh-process recipe.
-- You have R9700 (or any new arch hardware) and want to write
-  arch-specific fast paths beyond the canonical port.
+- A profile (`HIPFIRE_PROFILE`, Kernel Atlas, or rocprof) names a hot kernel
+  and you need the right lever.
+- You have one candidate change (multi-row, deeper K-tile, wave64, chip
+  override, barrier-free path, hipcc flag) and must prove it on the target
+  arch without breaking others.
+- A "should-be-no-op" dispatch refactor needs clean-baseline bisect after a
+  speed-floor warning.
+- You have hardware for a chip (e.g. gfx1201) and want an arch-specific
+  fast path beyond a family port.
 
-## Read these in order
+## Read order
 
-1. **`playbook.md`** — measure → root-cause → pick lever → validate
-   → ship. The 6-step workflow with the gates each step has to clear.
-   Start here.
-2. **`levers.md`** — catalog of optimization patterns hipfire actually
-   uses (wave64 port, multi-row GEMV, K-tile depth, `s_prefetch_data`,
-   WMMA/MFMA, fused projections, per-kernel hipcc flags). Each lever
-   names the commits where it landed (or was reverted) so you can
-   read the diff.
-3. **`cross-arch.md`** — dispatch routing rules. How to add a new
-   fast path that wins on gfx1100 without regressing gfx1010
-   /gfx1030 /gfx1200 /gfx94x. The "no unreachable branches" rule and
-   why predicate helpers (`has_wmma_f16`, `has_dot2_f32_f16`) exist.
-4. **`case-studies.md`** — five worked examples from the git log:
-   wave64 CDNA3 port (+2× decode), nontemporal-load fake-win revert
-   (−13% caught), prompt-shape recovery (+24% τ), k2x32 null result,
-   WMMA C-mapping silent-corruption fix. Read these to calibrate
-   what a real win looks like vs a measurement artifact.
+1. **`playbook.md`** — profile → root-cause → one lever → source/ISA inspect
+   → adjacent-arch boundaries → correctness route → fresh-process measure →
+   reject/log. Start here.
+2. **`levers.md`** — catalog of patterns that shipped or failed in this tree,
+   with kernel paths under `kernels/src/` and commits to read.
+3. **`cross-arch.md`** — file tags, dispatch fall-through, "no unreachable
+   branches", and when **not** to flip public dispatch without hardware.
+4. **`case-studies.md`** — worked wins, fake wins, null results, and silent
+   corruption. Calibrate what "real" looks like before claiming.
 
-## Key rules
+## Non-negotiable rules
 
-- **Trust the speed-gate, not your gut.** Within-session A/B noise
-  on gfx1100 is ±10–15%. A "+8% win" measured by editing code +
-  re-running in the same shell is inside the noise band. Use
-  `scripts/probe_commits.sh <baseline> <candidate>` for cross-process
-  measurement.
-- **Bisect against the committed baseline, not against your last
-  bench run.** This is how the nontemporal-load fake +2% got caught
-  as an actual −13%. See `case-studies.md` §2.
-- **Negative results ship too** — if a lever LOOKS like it should
-  win and doesn't, document it in the commit message with the
-  hypothesis why. Future contributors save the same hours.
-- **Cross-arch verify before merging.** The speed-gate runs on the
-  baseline arch (gfx1100 typically); your change still needs to
-  not regress gfx1010/gfx1030 if the relevant codepath touches them.
-  See `cross-arch.md`.
+1. **One hypothesis, one lever, one commit.** Bundle three speculative
+   changes and you cannot bisect a fake win.
+2. **Profile before editing.** No "this feels slow" optimizations.
+3. **Inspect source + ISA before claiming the bottleneck class.** Occupancy,
+   spills, BW%, launch count, and matrix-op mix decide the lever family.
+4. **Capability predicates gate ISA correctness; they never select a perf
+   sub-variant.** Perf picks are measured arch allowlists with a conservative
+   default — see [`docs/methodology/perf-arch-discipline.md`](../../../docs/methodology/perf-arch-discipline.md).
+5. **Correctness route is claim-scoped.** Pick the narrowest row in
+   [`docs/VALIDATION.md`](../../../docs/VALIDATION.md). There is **no**
+   universal GPU gate. Retired `coherence-gate-*.sh` batteries are not
+   acceptance.
+6. **Perf claims need the protocol**, not a one-shell A/B:
+   [`docs/methodology/perf-benchmarking.md`](../../../docs/methodology/perf-benchmarking.md).
+   Fresh process, warmup, binary/prompt md5, repeated/raw samples, and a
+   surface-matched harness — not bare `probe_commits.sh` / `gates.sh --perf`
+   alone (see Supporting tools).
+7. **Negative results ship.** Log the rejection (commit message and/or
+   Atlas task ledger) so the next pass does not re-burn the same hours.
+8. **No unverified promotion.** A local delta is **measured**, not product
+   default, floor, or admission. Admissions stay in
+   [`docs/admissions.yml`](../../../docs/admissions.yml) (fail closed when empty).
 
 ## What's not in this skill
 
-- **New arch ports** — see `.agents/skills/hipfire-arch-port/` instead. That
-  skill covers porting an EXISTING kernel to a new GPU family. This
-  skill covers MAKING an existing kernel faster on the archs it
-  already runs on.
-- **DFlash spec-decode tuning** — those wins come from algorithm
-  changes (n-gram cache, prompt shape, draft retraining), not kernel
-  ISA work. See `crates/hipfire-runtime/src/dflash.rs` and the
-  `coherence-gate-dflash.sh` battery.
+| Concern | Go here instead |
+|---|---|
+| New arch / new WMMA builtin port | `.agents/skills/hipfire-arch-port/` |
+| ISA Fit View / Atlas collect-eval loop | `.agents/skills/hipfire-kernel-atlas/` + [`docs/methodology/kernel-atlas.md`](../../../docs/methodology/kernel-atlas.md) |
+| Bring-up / smoke matrix | `.agents/skills/hipfire-tester/` |
+| Runtime hang / missing kernel triage | `.agents/skills/hipfire-autoheal/` / `.agents/skills/hipfire-diag/` |
+| Spec-decode *algorithm* tuning (n-gram, draft, prompt shape) | runtime DFlash sources — not ISA levers |
+| Redline / retained-replay certification | [`docs/REDLINE.md`](../../../docs/REDLINE.md) |
 
-## Cross-references
+## Canonical owners (link; do not duplicate)
 
-- [`docs/methodology/perf-benchmarking.md`](../../docs/methodology/perf-benchmarking.md) — the
-  bench protocol (within-session noise band, stale-binary trap,
-  prompt-md5 discipline).
-- [`docs/QUANTIZATION.md`](../../docs/QUANTIZATION.md) — MQ4/HF4 design
-  + asym KV math; required reading before touching quant kernels.
-  If this doc conflicts with `AGENTS.md` on MQ3/DFlash release status, treat
-  `AGENTS.md` and current code as the fresher source.
-- [`docs/ARCHITECTURE.md`](../../docs/ARCHITECTURE.md) — the dispatch
-  layering + two-model-paths surface that constrains where new
-  variants can plug in.
-- `tests/speed-baselines/<arch>.txt` — the committed perf floor per
-  arch. The speed-gate compares against these.
+| Concern | Owner |
+|---|---|
+| Claim → validation route | [`docs/VALIDATION.md`](../../../docs/VALIDATION.md) |
+| Warmup, fresh-process, prompt md5, speed-floor use | [`docs/methodology/perf-benchmarking.md`](../../../docs/methodology/perf-benchmarking.md) |
+| Capability vs perf-variant selection | [`docs/methodology/perf-arch-discipline.md`](../../../docs/methodology/perf-arch-discipline.md) |
+| Channel + speed for *arch ports* | [`docs/methodology/arch-port-validation.md`](../../../docs/methodology/arch-port-validation.md) |
+| Atlas rows, ISA manifests, suggest/task/eval | [`docs/methodology/kernel-atlas.md`](../../../docs/methodology/kernel-atlas.md) |
+| Quant math before touching quant kernels | [`docs/QUANTIZATION.md`](../../../docs/QUANTIZATION.md) |
+| Crate / dispatch overview | [`docs/ARCHITECTURE.md`](../../../docs/ARCHITECTURE.md) |
+| Docs lifecycle / ownership map | [`docs/INDEX.md`](../../../docs/INDEX.md) |
+
+## Supporting tools (claim-scoped)
+
+Use only when the claim class needs them — full roles in `VALIDATION.md`:
+
+- Profile: `HIPFIRE_PROFILE=1`, optional rocprof kernel-trace, Atlas
+  `collect-ar` / `collect-dflash` with `--profile-*` and `--isa-*`.
+- Compile matrix: `scripts/compile-kernels.sh` for touched chip/family tags.
+- Numeric kernel check: `target/release/examples/test_kernels` (build via
+  `hipfire-runtime` `test_kernels` example).
+- Speed floor (when policy applies): `scripts/speed-gate.sh` vs
+  `tests/speed-baselines/<arch>.txt`.
+- Fresh-process A/B: prefer surface-matched harness with repeated refs and
+  raw samples. `scripts/probe_commits.sh` is Qwen3.5/in-process only (one
+  sample per ref) — not protocol-complete alone. Do not treat
+  `scripts/gates.sh --perf` as complete evidence (single baseline/HEAD sample
+  plus unrelated Redline/serve arms).
+- Path-specific parity oracles: arch-owned `dump_*_hidden_states` /
+  graph-parity examples when the change can break state — **blocked** if no
+  oracle exists for that surface.
+- Serve semantics only: `scripts/serve_harness.py` / LFM
+  `scripts/serve_harness.py` — never numerical parity substitutes.
+
+`.agents/skills/hipfire-kernel-tuning/` is the sole executable root for this
+skill.

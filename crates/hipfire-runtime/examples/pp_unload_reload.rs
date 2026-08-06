@@ -47,11 +47,8 @@ fn main() {
         )
         .unwrap_or_else(|e| panic!("cycle {cycle}: load_model_pp failed: {e}"));
         assert!(
-            matches!(
-                m.parallel.kind(),
-                hipfire_loader::ModelParallelKind::PpDense
-            ),
-            "cycle {cycle}: dense PP model is not ModelParallel::Pp(Dense)"
+            m.pp_model.is_some(),
+            "cycle {cycle}: dense PP model did not load its pp_model carrier"
         );
         // Pre-fix: panics here at unload_model falling into the qwen35-PP arm.
         hipfire_loader::unload_model(m, &mut gpu);

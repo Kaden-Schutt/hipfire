@@ -238,7 +238,7 @@ impl StreamParser for DefaultStreamParser {
                 });
             }
         }
-            FilterAction::Stop { emit } => {
+            FilterAction::EmitAndStop(emit) => {
                 if let Ok(text) = std::str::from_utf8(&emit) {
                     if !text.is_empty() {
                         acts.push(StreamAction::Emit {
@@ -247,6 +247,11 @@ impl StreamParser for DefaultStreamParser {
                         });
                     }
                 }
+                self.generated += 1;
+                acts.push(StreamAction::Stop);
+                return acts;
+            }
+            FilterAction::Stop => {
                 self.generated += 1;
                 acts.push(StreamAction::Stop);
                 return acts;
@@ -376,7 +381,7 @@ impl StreamParser for DefaultStreamParser {
                 });
             }
         }
-            FilterAction::Stop { emit } => {
+            FilterAction::EmitAndStop(emit) => {
                 if let Ok(text) = std::str::from_utf8(&emit) {
                     if !text.is_empty() {
                         acts.push(StreamAction::Emit {
@@ -385,6 +390,9 @@ impl StreamParser for DefaultStreamParser {
                         });
                     }
                 }
+                acts.push(StreamAction::Stop);
+            }
+            FilterAction::Stop => {
                 acts.push(StreamAction::Stop);
             }
             FilterAction::Hold => {}
@@ -437,6 +445,7 @@ mod tests {
         let mut cfg = plain_cfg();
         cfg.eos_filter = EosFilterConfig {
             strip_think: false,
+            started_in_think: false,
             stop_at: vec![b"<stop>".to_vec()],
             holdback_prefixes: Vec::new(),
         };
@@ -458,6 +467,7 @@ mod tests {
         let mut cfg = plain_cfg();
         cfg.eos_filter = EosFilterConfig {
             strip_think: false,
+            started_in_think: false,
             stop_at: vec![b"<stop>".to_vec()],
             holdback_prefixes: Vec::new(),
         };
@@ -481,6 +491,7 @@ mod tests {
         let mut cfg = plain_cfg();
         cfg.eos_filter = EosFilterConfig {
             strip_think: false,
+            started_in_think: false,
             stop_at: vec![b"<stop>".to_vec()],
             holdback_prefixes: Vec::new(),
         };
@@ -515,18 +526,21 @@ mod tests {
         let mut cfg = plain_cfg();
         cfg.eos_filter = EosFilterConfig {
             strip_think: true,
+            started_in_think: false,
             stop_at: Vec::new(),
             holdback_prefixes: vec![b"<partial>".to_vec()],
         };
         let mut p = DefaultStreamParser::new(cfg);
-        assert!(p.feed(1, b"visible<think>reason").is_empty());
+        // Merged (beta) filter semantics: prose before the think marker is
+        // emitted eagerly; the open `<think>` span and its content are stripped.
         assert_eq!(
-            p.finish(),
+            p.feed(1, b"visible<think>reason"),
             vec![StreamAction::Emit {
                 text: "visible".into(),
                 reasoning: false,
             }]
         );
+        assert_eq!(p.finish(), Vec::new());
         assert_eq!(p.finish(), Vec::new());
     }
 
@@ -535,6 +549,7 @@ mod tests {
         let mut cfg = plain_cfg();
         cfg.eos_filter = EosFilterConfig {
             strip_think: true,
+            started_in_think: false,
             stop_at: Vec::new(),
             holdback_prefixes: Vec::new(),
         };

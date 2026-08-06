@@ -6,7 +6,7 @@
 
 # Regression test for `hipfire update` dirty-working-tree bug.
 #
-# Before the fix, cli/index.ts ran `git pull origin master` which aborts with
+# Before the fix, the legacy updater ran `git pull origin master` which aborts with
 #   "Your local changes to the following files would be overwritten by merge"
 # whenever a tracked file (notably Cargo.lock, which cargo build can rewrite
 # across cargo versions) is modified in the working tree.
@@ -95,34 +95,43 @@ grep -q "local changes to the following files would be overwritten" "$TMPDIR/pul
     || fail "baseline reproduction didn't hit the reported error; saw: $(cat "$TMPDIR/pull.err")"
 
 # ── 5. Exercise the FIXED update sequence ───────────────────────────────
-# This mirrors the post-fix logic in cli/index.ts. If cli/index.ts diverges
+# This mirrors the native updater. If the Rust updater diverges
 # from this sequence, this test will need to be updated in lockstep.
 # Return codes:
 #   0  = updated
-#   10 = refused (not master)
-#   11 = refused (local commits ahead)
+#   11 = refused (local commits ahead of the resolved tracking tip)
 #   20 = git operation failed
 update_flow() {
     local repo="$1"
-    local branch
+    local target="${2:-}"
+    local branch tracking ahead
     branch="$(git -C "$repo" rev-parse --abbrev-ref HEAD)"
-    if [ "$branch" != "master" ] && [ "$branch" != "HEAD" ]; then
-        echo "refusing: branch is $branch, not master" >&2
-        return 10
+    if [ -z "$target" ]; then
+        target="$branch"
     fi
-    git -C "$repo" fetch origin master --quiet || return 20
-    local ahead
-    ahead="$(git -C "$repo" rev-list --count origin/master..HEAD 2>/dev/null || echo 0)"
-    if [ "${ahead:-0}" -gt 0 ]; then
-        echo "refusing: local master has $ahead unpushed commit(s)" >&2
-        return 11
+    if [ "$target" = "HEAD" ]; then
+        echo "refusing: detached HEAD has no branch tip to reset" >&2
+        return 20
+    fi
+    git -C "$repo" fetch origin "refs/heads/${target}:refs/remotes/origin/${target}" --quiet || return 20
+    tracking="origin/${target}"
+    # Refuse only when the *target* branch tip is ahead of its tracking ref.
+    if git -C "$repo" rev-parse --verify "refs/heads/${target}" >/dev/null 2>&1; then
+        ahead="$(git -C "$repo" rev-list --count "${tracking}..refs/heads/${target}" 2>/dev/null || echo 0)"
+        if [ "${ahead:-0}" -gt 0 ]; then
+            # Allow pure behind/ff when local tip is an ancestor of tracking.
+            if ! git -C "$repo" merge-base --is-ancestor "refs/heads/${target}" "$tracking" 2>/dev/null; then
+                echo "refusing: local ${target} has $ahead unpushed commit(s)" >&2
+                return 11
+            fi
+        fi
     fi
     if [ -n "$(git -C "$repo" status --porcelain)" ]; then
         local ts
         ts="$(date -u +%Y-%m-%dT%H-%M-%SZ)"
         git -C "$repo" stash push --include-untracked -m "hipfire-update-$ts" --quiet || return 20
     fi
-    git -C "$repo" reset --hard origin/master --quiet || return 20
+    git -C "$repo" checkout -B "$target" "$tracking" --quiet || return 20
 }
 
 update_flow "$LOCAL" || fail "fixed update_flow exited non-zero ($?)"
@@ -164,17 +173,22 @@ grep -q 'second update' "$LOCAL_CLEAN/main.rs" \
 [ "$(git -C "$LOCAL_CLEAN" stash list | wc -l)" -eq 0 ] \
     || fail "clean-tree update created a stash when it shouldn't have"
 
-# 7b. Feature branch guard: should refuse with code 10
-LOCAL_DEV="$TMPDIR/local-dev"
-git clone --quiet "$UPSTREAM" "$LOCAL_DEV"
-git -C "$LOCAL_DEV" config user.email test@example.com
-git -C "$LOCAL_DEV" config user.name  "Test"
-git -C "$LOCAL_DEV" checkout --quiet -b my-feature
-set +e
-update_flow "$LOCAL_DEV"
-dev_rc=$?
-set -e
-[ "$dev_rc" -eq 10 ] || fail "feature-branch guard returned $dev_rc, expected 10"
+# 7b. Clean channel switch master → beta: should succeed
+LOCAL_SWITCH="$TMPDIR/local-switch"
+git clone --quiet "$UPSTREAM" "$LOCAL_SWITCH"
+git -C "$LOCAL_SWITCH" config user.email test@example.com
+git -C "$LOCAL_SWITCH" config user.name  "Test"
+# Publish a beta tip on the fake upstream
+git -C "$SEED" checkout --quiet -b beta
+echo "beta channel" > "$SEED/beta.txt"
+git -C "$SEED" add beta.txt
+git -C "$SEED" commit --quiet -m "beta tip"
+git -C "$SEED" push --quiet origin beta
+update_flow "$LOCAL_SWITCH" beta || fail "channel-switch update_flow exited non-zero ($?)"
+[ "$(git -C "$LOCAL_SWITCH" rev-parse --abbrev-ref HEAD)" = "beta" ] \
+    || fail "channel-switch did not land on beta"
+grep -q 'beta channel' "$LOCAL_SWITCH/beta.txt" \
+    || fail "channel-switch did not check out beta content"
 
 # 7c. Unpushed-commits guard: should refuse with code 11
 LOCAL_AHEAD="$TMPDIR/local-ahead"
@@ -185,7 +199,7 @@ echo "local-only change" > "$LOCAL_AHEAD/local_only.txt"
 git -C "$LOCAL_AHEAD" add local_only.txt
 git -C "$LOCAL_AHEAD" commit --quiet -m "local-only commit"
 set +e
-update_flow "$LOCAL_AHEAD"
+update_flow "$LOCAL_AHEAD" master
 ahead_rc=$?
 set -e
 [ "$ahead_rc" -eq 11 ] || fail "ahead-commits guard returned $ahead_rc, expected 11"
@@ -194,32 +208,38 @@ grep -q 'local-only change' "$LOCAL_AHEAD/local_only.txt" \
     || fail "ahead-commits guard clobbered the local commit"
 
 # ── 8. Divergence guard ────────────────────────────────────────────────
-# The update_flow() above mirrors the logic in cli/index.ts. If someone
-# reverts cli/index.ts back to a plain `git pull`, this test still passes
+# The update_flow() above mirrors the native Rust logic. If someone
+# reverts the implementation back to a plain `git pull`, this test still passes
 # (because update_flow is independent). Catch that by asserting the key
-# pieces of the fix are still present in cli/index.ts itself.
+# pieces of the fix are still present in the native CLI itself.
 REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || echo "")"
 if [ -z "$REPO_ROOT" ]; then
     # Running from an extracted tarball or CI without a checkout; skip.
     echo "  (divergence guard skipped: not in a git checkout)"
 else
-    CLI="$REPO_ROOT/cli/index.ts"
-    [ -f "$CLI" ] || fail "cli/index.ts not found at $CLI"
+    CLI="$REPO_ROOT/crates/hipfire-cli/src/main.rs"
+    [ -f "$CLI" ] || fail "native CLI source not found at $CLI"
 
     # Required: the fix must be present. Each marker is checked
     # independently so multi-line formatting doesn't break us.
-    grep -q '"stash", "push", "--include-untracked"' "$CLI" \
-        || fail "cli/index.ts is missing the 'git stash push --include-untracked' call"
+    grep -q '"stash"' "$CLI" && grep -q '"--include-untracked"' "$CLI" \
+        || fail "native updater is missing the 'git stash push --include-untracked' call"
     grep -q 'hipfire-update-' "$CLI" \
-        || fail "cli/index.ts is missing the 'hipfire-update-' stash marker"
-    grep -q '"reset", "--hard", "origin/master"' "$CLI" \
-        || fail "cli/index.ts is missing the 'git reset --hard origin/master' step"
-    grep -q 'rev-list.*--count.*origin/master\.\.HEAD' "$CLI" \
-        || fail "cli/index.ts is missing the unpushed-commits guard"
+        || fail "native updater is missing the 'hipfire-update-' stash marker"
+    grep -q 'refuse_unpushed_branch_commits' "$CLI" \
+        || fail "native updater is missing refuse_unpushed_branch_commits"
+    grep -q 'rev-list' "$CLI" && grep -q 'ahead of' "$CLI" \
+        || fail "native updater is missing the unpushed-commits guard"
+    grep -q 'restore_update_checkpoint' "$CLI" \
+        || fail "native updater is missing restore_update_checkpoint"
+    grep -q 'recorded_install_rocm_root' "$CLI" && grep -q '"--rocm-root"' "$CLI" \
+        || fail "native updater is missing recorded ROCm root handoff"
+    grep -q 'checkout' "$CLI" && grep -q '"-B"' "$CLI" \
+        || fail "native updater is missing branch reset checkout"
 
     # Forbidden: the old buggy call must not be back.
     if grep -E '"pull", *"origin", *"master"' "$CLI" >/dev/null; then
-        fail "cli/index.ts still contains the buggy 'git pull origin master' call"
+        fail "native updater still contains the buggy 'git pull origin master' call"
     fi
 fi
 

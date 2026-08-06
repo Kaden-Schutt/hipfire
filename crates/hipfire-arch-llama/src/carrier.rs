@@ -75,6 +75,7 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<LlamaBundle, S
         Ok(weights) => weights,
         Err(error) => return Err(error),
     };
+    hipfire_runtime::maybe_screen_mmq(&weights, ctx.gpu);
     staged.weights = Some(weights);
     #[cfg(feature = "dflash-fault-inject")]
     if let Err(error) = hipfire_runtime::dflash_generic::generic_dflash_construction_boundary(
@@ -105,7 +106,7 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<LlamaBundle, S
     };
     let kv = match KvCache::from_mode(
         hipfire_runtime::kv_mode::resolve(
-            "",
+            ctx.kv_mode_override.unwrap_or(""),
             &hipfire_runtime::kv_mode::LLAMA_HFQ_POLICY,
             staged.config.head_dim,
         )

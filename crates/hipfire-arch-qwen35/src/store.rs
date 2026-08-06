@@ -1081,13 +1081,6 @@ fn convert_handle_forward_ready(
     Ok(Some(WeightHandle::Resident(converted)))
 }
 
-fn free_resident_buffer_retaining_owner(gpu: &Gpu, tensor: &GpuTensor) -> Result<(), String> {
-    let raw = unsafe { hip_bridge::DeviceBuffer::from_raw(tensor.buf.as_ptr(), tensor.buf.size()) };
-    gpu.hip
-        .free(raw)
-        .map_err(|e| format!("source buffer free failed: {e:?}"))
-}
-
 struct ReplacementGuard {
     tensor: Option<GpuTensor>,
     free: Box<dyn FnMut(GpuTensor)>,
@@ -1376,6 +1369,7 @@ fn typed_moe_ffn(
         layer_idx: layer as u16,
         expert_shape: None,
         paro_shared: None,
+        packed_expert_owners: None,
     }
 }
 
@@ -1623,32 +1617,38 @@ pub(crate) fn assemble_qwen35_weights_inner_with_mode(
                     entry.name
                 ));
             };
-            let mut replacement = ReplacementGuard::new(converted, move |tensor| {
-                let raw = unsafe {
-                    hip_bridge::DeviceBuffer::from_raw(tensor.buf.as_ptr(), tensor.buf.size())
-                };
-                let _ = unsafe { (&*gpu_ptr).hip.free(raw) };
-            });
-            if let Some(WeightHandle::Resident(old)) = guard.get(slot) {
-                if let Err(error) = free_resident_buffer_retaining_owner(unsafe { &*gpu_ptr }, old)
-                {
-                    return Err(error);
+            // Free the old resident's ACTUAL buffer (consume the tensor) and
+            // install the converted handle atomically. On free failure the
+            // old tensor is returned for retry and the new handle comes back
+            // with the error.
+            let replacement_handle = WeightHandle::Resident(converted);
+            let free_fn = &|tensor: rdna_compute::GpuTensor| {
+                // Shared ref only: the assembly guard already borrows the GPU
+                // immutably (WeightStoreTarget::Gpu(&*gpu)); free_preserving
+                // takes &self, so &mut here would be aliased-mutable UB.
+                let gpu = unsafe { &*gpu_ptr };
+                match gpu.hip.free_preserving(tensor.buf) {
+                    Ok(()) => Ok(()),
+                    Err((returned_buf, e)) => Err((
+                        rdna_compute::GpuTensor {
+                            buf: returned_buf,
+                            shape: tensor.shape,
+                            dtype: tensor.dtype,
+                        },
+                        format!("{e:?}"),
+                    )),
                 }
-            }
-            let replacement_handle = WeightHandle::Resident(replacement.take());
-            if let Err((handle, error)) = guard.replace_after_free(slot, replacement_handle) {
+            };
+            if let Err((handle, error)) = guard.replace_atomic(slot, replacement_handle, free_fn) {
+                // The new handle was never installed — release its buffer so
+                // the failed replacement cannot leak it.
                 if let WeightHandle::Resident(tensor) = handle {
-                    let _ = ReplacementGuard::new(tensor, move |tensor| {
-                        let raw = unsafe {
-                            hip_bridge::DeviceBuffer::from_raw(
-                                tensor.buf.as_ptr(),
-                                tensor.buf.size(),
-                            )
-                        };
-                        let _ = unsafe { (&*gpu_ptr).hip.free(raw) };
-                    });
+                    let _ = unsafe { (&*gpu_ptr).hip.free_preserving(tensor.buf) };
                 }
-                return Err(error);
+                return Err(format!(
+                    "forward-ready replacement for '{}' failed: {error:?}",
+                    entry.name
+                ));
             }
         }
     }

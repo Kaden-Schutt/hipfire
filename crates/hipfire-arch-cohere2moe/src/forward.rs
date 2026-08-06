@@ -72,7 +72,9 @@ fn moe_grouped_m_total_bound(total_slots: usize, n_exp: usize) -> usize {
 /// validation prompt and ~9× faster prefill.
 fn q8_wmma_enabled() -> bool {
     static EN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *EN.get_or_init(|| std::env::var("HIPFIRE_COHERE2MOE_Q8_SCALAR").as_deref() != Ok("1"))
+    *EN.get_or_init(|| {
+        hipfire_config::developer_var("HIPFIRE_COHERE2MOE_Q8_SCALAR").as_deref() != Ok("1")
+    })
 }
 
 #[inline]
@@ -268,6 +270,7 @@ fn decode_step_body(
             tree_bias: None,
             block_start: 0,
             block_cols: 0,
+            output_gate: None,
             output: &state.fa_attn_out,
         };
         hipfire_dispatch::pipeline::execute_steps_mesh(
@@ -412,7 +415,7 @@ fn decode_step_body(
                 }
             }
         }
-        if std::env::var_os("HIPFIRE_COHERE_DEBUG").is_some() {
+        if hipfire_config::developer_var_os("HIPFIRE_COHERE_DEBUG").is_some() {
             if let Ok(hv) = gpu.download_f32(&state.h) {
                 let l2 = hv.iter().map(|v| v * v).sum::<f32>().sqrt();
                 let mx = hv.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
@@ -524,7 +527,7 @@ pub fn forward_batch_supported(weights: &Cohere2MoeWeights) -> bool {
 /// long-context collapse can be pinned to the exact layer + op (post-attn vs
 /// post-ffn) where the residual blows up or flattens. Off by default.
 fn c2m_normdump_step() -> Option<usize> {
-    std::env::var("HIPFIRE_C2M_NORMDUMP")
+    hipfire_config::developer_var("HIPFIRE_C2M_NORMDUMP")
         .ok()
         .map(|s| s.trim().parse().unwrap_or(4096))
 }
@@ -753,6 +756,7 @@ pub fn forward_batch(
             tree_bias: None,
             block_start: 0,
             block_cols: 0,
+            output_gate: None,
             output: &attn_out,
         };
         hipfire_dispatch::pipeline::execute_steps_mesh(

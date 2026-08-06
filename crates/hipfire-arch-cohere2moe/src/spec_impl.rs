@@ -102,7 +102,10 @@ impl Cohere2MoeBundle {
                 .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
                 .map(|(idx, _)| idx as u32)
                 .unwrap_or(0);
-            return Ok(SpecAdvance::Ready { last_argmax });
+            return Ok(SpecAdvance::Ready {
+                last_argmax,
+                last_logits: Some(last_logits),
+            });
         }
         for &tok in tokens {
             if abort() {
@@ -115,7 +118,10 @@ impl Cohere2MoeBundle {
         let last_argmax = gpu
             .argmax_f32(&self.state.logits, self.config.vocab_size)
             .map_err(|e| format!("{e:?}"))?;
-        Ok(SpecAdvance::Ready { last_argmax })
+        Ok(SpecAdvance::Ready {
+            last_argmax,
+            last_logits: None,
+        })
     }
 }
 
@@ -137,6 +143,15 @@ impl SpecTarget for Cohere2MoeBundle {
         self
     }
 
+    fn reset_recurrent(&mut self, gpu: &mut Gpu) -> Result<(), String> {
+        // Pure attention: no recurrent state to zero. Clear the KV cache and
+        // rewind the position cursor so the next prefill writes from slot 0.
+        // Mirrors the daemon's arch_id=12 reset handler.
+        self.state
+            .reset(gpu)
+            .map_err(|e| format!("cohere2moe reset_recurrent: {e}"))
+    }
+
     fn new_spec_scratch(
         &mut self,
         _gpu: &mut Gpu,
@@ -150,9 +165,14 @@ impl SpecTarget for Cohere2MoeBundle {
         gpu: &mut Gpu,
         tokens: &[u32],
         start_pos: usize,
+        reset: bool,
         abort: &dyn Fn() -> bool,
         _hidden_out: Option<&mut Vec<f32>>,
     ) -> Result<SpecAdvance, String> {
+        if reset {
+            self.reset_recurrent(gpu)
+                .map_err(|e| format!("cohere2moe spec_advance reset: {e}"))?;
+        }
         self.advance(gpu, tokens, start_pos, false, abort)
     }
 
