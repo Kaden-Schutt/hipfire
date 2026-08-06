@@ -29,6 +29,6 @@
   },
   {
     "content": "Return exactly five short lines labeled Project, Hash, Readers, Buffer, and Config. Fill them with the final remembered EmberIndex values; do not add prose.",
-    "expect": ["EmberIndex", "BLAKE3", "six", "1 MiB", "ScanConfig"]
+    "expect": ["EmberIndex", "BLAKE3", "Readers: 6", "1 MiB", "buffer_bytes"]
   }
 ]
