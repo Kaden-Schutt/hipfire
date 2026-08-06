@@ -11,7 +11,7 @@
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use hip_bridge::{DeviceBuffer, HipRuntime};
+use hip_bridge::{DeviceBuffer, Event, HipRuntime, Stream};
 use hipfire_config::{Deepseek4ComputePlacement, DeviceSelector};
 use hipfire_runtime::arch::Architecture;
 use hipfire_runtime::hfq::HfqFile;
@@ -297,6 +297,12 @@ pub struct DeepseekV4HeterogeneousModel {
 /// gfx1100. Cross-device epochs use the system-visible signal-memory contract
 /// certified by G0, so the layer loop never synchronizes on the host.
 pub(crate) struct DeepseekV4HeterogeneousExecution {
+    /// Exact-gfx1100 side queue for the independent KV/compressor half of the
+    /// attention projection DAG. The primary dense queue keeps Q-LoRA; one
+    /// reusable event pair brackets the fork/join on every layer.
+    pub(crate) dense_attn_stream: Option<Stream>,
+    pub(crate) dense_attn_fork_event: Option<Event>,
+    pub(crate) dense_attn_join_event: Option<Event>,
     pub(crate) routed_x_rot: Option<GpuTensor>,
     pub(crate) routed_topk_indices: Option<GpuTensor>,
     pub(crate) routed_topk_weights: Option<GpuTensor>,
@@ -313,6 +319,9 @@ pub(crate) struct DeepseekV4HeterogeneousExecution {
 impl DeepseekV4HeterogeneousExecution {
     fn empty() -> Self {
         Self {
+            dense_attn_stream: None,
+            dense_attn_fork_event: None,
+            dense_attn_join_event: None,
             routed_x_rot: None,
             routed_topk_indices: None,
             routed_topk_weights: None,
@@ -339,98 +348,115 @@ impl DeepseekV4HeterogeneousExecution {
             );
         }
         let mut execution = Self::empty();
-        let result = (|| {
-            dense_gpu
-                .bind_thread()
-                .map_err(|error| format!("heterogeneous bind dense execution: {error}"))?;
-            dense_gpu
-                .hip
-                .enable_peer_access(routed_gpu.device_id)
-                .map_err(|error| format!("heterogeneous dense peer access: {error}"))?;
-            dense_gpu.active_stream = Some(
+        let result =
+            (|| {
+                dense_gpu
+                    .bind_thread()
+                    .map_err(|error| format!("heterogeneous bind dense execution: {error}"))?;
                 dense_gpu
                     .hip
-                    .stream_create()
-                    .map_err(|error| format!("heterogeneous dense stream: {error}"))?,
-            );
-            let signal_to_dense = dense_gpu
-                .hip
-                .malloc_signal(std::mem::size_of::<u64>())
-                .map_err(|error| format!("heterogeneous dense signal: {error}"))?;
-            dense_gpu
-                .hip
-                .memset(&signal_to_dense, 0, signal_to_dense.size())
-                .map_err(|error| format!("heterogeneous zero dense signal: {error}"))?;
-            execution.signal_to_dense = Some(signal_to_dense);
+                    .enable_peer_access(routed_gpu.device_id)
+                    .map_err(|error| format!("heterogeneous dense peer access: {error}"))?;
+                dense_gpu.active_stream = Some(
+                    dense_gpu
+                        .hip
+                        .stream_create()
+                        .map_err(|error| format!("heterogeneous dense stream: {error}"))?,
+                );
+                execution.dense_attn_stream =
+                    Some(dense_gpu.hip.stream_create().map_err(|error| {
+                        format!("heterogeneous dense attention stream: {error}")
+                    })?);
+                execution.dense_attn_fork_event = Some(
+                    dense_gpu
+                        .hip
+                        .event_create()
+                        .map_err(|error| format!("heterogeneous dense attention fork: {error}"))?,
+                );
+                execution.dense_attn_join_event = Some(
+                    dense_gpu
+                        .hip
+                        .event_create()
+                        .map_err(|error| format!("heterogeneous dense attention join: {error}"))?,
+                );
+                let signal_to_dense = dense_gpu
+                    .hip
+                    .malloc_signal(std::mem::size_of::<u64>())
+                    .map_err(|error| format!("heterogeneous dense signal: {error}"))?;
+                dense_gpu
+                    .hip
+                    .memset(&signal_to_dense, 0, signal_to_dense.size())
+                    .map_err(|error| format!("heterogeneous zero dense signal: {error}"))?;
+                execution.signal_to_dense = Some(signal_to_dense);
 
-            routed_gpu
-                .bind_thread()
-                .map_err(|error| format!("heterogeneous bind routed execution: {error}"))?;
-            routed_gpu
-                .hip
-                .enable_peer_access(dense_gpu.device_id)
-                .map_err(|error| format!("heterogeneous routed peer access: {error}"))?;
-            routed_gpu.active_stream = Some(
+                routed_gpu
+                    .bind_thread()
+                    .map_err(|error| format!("heterogeneous bind routed execution: {error}"))?;
                 routed_gpu
                     .hip
-                    .stream_create()
-                    .map_err(|error| format!("heterogeneous routed stream: {error}"))?,
-            );
-            let signal_to_routed = routed_gpu
-                .hip
-                .malloc_signal(std::mem::size_of::<u64>())
-                .map_err(|error| format!("heterogeneous routed signal: {error}"))?;
-            routed_gpu
-                .hip
-                .memset(&signal_to_routed, 0, signal_to_routed.size())
-                .map_err(|error| format!("heterogeneous zero routed signal: {error}"))?;
-            execution.signal_to_routed = Some(signal_to_routed);
+                    .enable_peer_access(dense_gpu.device_id)
+                    .map_err(|error| format!("heterogeneous routed peer access: {error}"))?;
+                routed_gpu.active_stream = Some(
+                    routed_gpu
+                        .hip
+                        .stream_create()
+                        .map_err(|error| format!("heterogeneous routed stream: {error}"))?,
+                );
+                let signal_to_routed = routed_gpu
+                    .hip
+                    .malloc_signal(std::mem::size_of::<u64>())
+                    .map_err(|error| format!("heterogeneous routed signal: {error}"))?;
+                routed_gpu
+                    .hip
+                    .memset(&signal_to_routed, 0, signal_to_routed.size())
+                    .map_err(|error| format!("heterogeneous zero routed signal: {error}"))?;
+                execution.signal_to_routed = Some(signal_to_routed);
 
-            let k = cfg.num_experts_per_tok;
-            let im = cfg.moe_intermediate_size;
-            let hidden = cfg.hidden_size;
-            execution.routed_x_rot = Some(
-                routed_gpu
-                    .alloc_tensor(&[hidden], DType::F32)
-                    .map_err(|error| format!("heterogeneous routed x_rot: {error}"))?,
-            );
-            execution.routed_topk_indices = Some(
-                routed_gpu
-                    .alloc_tensor(&[k], DType::F32)
-                    .map_err(|error| format!("heterogeneous routed topk indices: {error}"))?,
-            );
-            execution.routed_topk_weights = Some(
-                routed_gpu
-                    .alloc_tensor(&[k], DType::F32)
-                    .map_err(|error| format!("heterogeneous routed topk weights: {error}"))?,
-            );
-            execution.routed_gate_batch = Some(
-                routed_gpu
-                    .alloc_tensor(&[k, im], DType::F32)
-                    .map_err(|error| format!("heterogeneous routed gate batch: {error}"))?,
-            );
-            execution.routed_up_batch = Some(
-                routed_gpu
-                    .alloc_tensor(&[k, im], DType::F32)
-                    .map_err(|error| format!("heterogeneous routed up batch: {error}"))?,
-            );
-            execution.routed_rot_batch = Some(
-                routed_gpu
-                    .alloc_tensor(&[k, im], DType::F32)
-                    .map_err(|error| format!("heterogeneous routed rot batch: {error}"))?,
-            );
-            execution.routed_down_expanded = Some(
-                routed_gpu
-                    .alloc_tensor(&[k, hidden], DType::F32)
-                    .map_err(|error| format!("heterogeneous routed down expanded: {error}"))?,
-            );
-            execution.routed_partial = Some(
-                routed_gpu
-                    .alloc_tensor(&[hidden], DType::F32)
-                    .map_err(|error| format!("heterogeneous routed partial: {error}"))?,
-            );
-            Ok(())
-        })();
+                let k = cfg.num_experts_per_tok;
+                let im = cfg.moe_intermediate_size;
+                let hidden = cfg.hidden_size;
+                execution.routed_x_rot = Some(
+                    routed_gpu
+                        .alloc_tensor(&[hidden], DType::F32)
+                        .map_err(|error| format!("heterogeneous routed x_rot: {error}"))?,
+                );
+                execution.routed_topk_indices = Some(
+                    routed_gpu
+                        .alloc_tensor(&[k], DType::F32)
+                        .map_err(|error| format!("heterogeneous routed topk indices: {error}"))?,
+                );
+                execution.routed_topk_weights = Some(
+                    routed_gpu
+                        .alloc_tensor(&[k], DType::F32)
+                        .map_err(|error| format!("heterogeneous routed topk weights: {error}"))?,
+                );
+                execution.routed_gate_batch = Some(
+                    routed_gpu
+                        .alloc_tensor(&[k, im], DType::F32)
+                        .map_err(|error| format!("heterogeneous routed gate batch: {error}"))?,
+                );
+                execution.routed_up_batch = Some(
+                    routed_gpu
+                        .alloc_tensor(&[k, im], DType::F32)
+                        .map_err(|error| format!("heterogeneous routed up batch: {error}"))?,
+                );
+                execution.routed_rot_batch = Some(
+                    routed_gpu
+                        .alloc_tensor(&[k, im], DType::F32)
+                        .map_err(|error| format!("heterogeneous routed rot batch: {error}"))?,
+                );
+                execution.routed_down_expanded = Some(
+                    routed_gpu
+                        .alloc_tensor(&[k, hidden], DType::F32)
+                        .map_err(|error| format!("heterogeneous routed down expanded: {error}"))?,
+                );
+                execution.routed_partial = Some(
+                    routed_gpu
+                        .alloc_tensor(&[hidden], DType::F32)
+                        .map_err(|error| format!("heterogeneous routed partial: {error}"))?,
+                );
+                Ok(())
+            })();
         if let Err(error) = result {
             execution.release(dense_gpu, routed_gpu);
             return Err(error);
@@ -457,6 +483,10 @@ impl DeepseekV4HeterogeneousExecution {
             dense_gpu.bind_thread_or_warn();
             let _ = dense_gpu.hip.stream_synchronize(stream);
         }
+        if let Some(stream) = self.dense_attn_stream.as_ref() {
+            dense_gpu.bind_thread_or_warn();
+            let _ = dense_gpu.hip.stream_synchronize(stream);
+        }
         if let Some(stream) = routed_gpu.active_stream.as_ref() {
             routed_gpu.bind_thread_or_warn();
             let _ = routed_gpu.hip.stream_synchronize(stream);
@@ -476,6 +506,18 @@ impl DeepseekV4HeterogeneousExecution {
         if let Some(signal) = self.signal_to_dense.take() {
             dense_gpu.bind_thread_or_warn();
             let _ = dense_gpu.hip.free(signal);
+        }
+        if let Some(event) = self.dense_attn_fork_event.take() {
+            dense_gpu.bind_thread_or_warn();
+            let _ = dense_gpu.hip.event_destroy(event);
+        }
+        if let Some(event) = self.dense_attn_join_event.take() {
+            dense_gpu.bind_thread_or_warn();
+            let _ = dense_gpu.hip.event_destroy(event);
+        }
+        if let Some(stream) = self.dense_attn_stream.take() {
+            dense_gpu.bind_thread_or_warn();
+            let _ = dense_gpu.hip.stream_destroy(stream);
         }
         if let Some(stream) = routed_gpu.active_stream.take() {
             routed_gpu.bind_thread_or_warn();

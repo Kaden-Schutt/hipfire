@@ -3470,7 +3470,15 @@ pub(crate) fn decode_step_heterogeneous(
         if abort_requested() {
             return Ok(None);
         }
-        ds4_attn_block(cfg, dense_weights, state, dense_gpu, layer_idx, position)?;
+        ds4_attn_block_heterogeneous(
+            cfg,
+            dense_weights,
+            state,
+            dense_gpu,
+            execution,
+            layer_idx,
+            position,
+        )?;
         mhc_pre(
             cfg,
             dense_weights,
@@ -4350,6 +4358,106 @@ fn ds4_attn_block(
     attn_stub(cfg, weights, state, gpu, layer_idx)?;
     hc_attn_mix(cfg, weights, state, gpu, layer_idx)?;
     Ok(())
+}
+
+/// Exact-gfx1100 attention schedule for the heterogeneous route.
+///
+/// Q-LoRA and the KV/compressor projections consume the same normalized input
+/// but do not depend on each other. The ordinary single-queue path serializes
+/// them. Here the primary queue retains Q-LoRA while a persistent side queue
+/// evaluates KV plus both compressor branches; the queues rejoin before RoPE,
+/// indexer scoring, attention, or any state consumer. Arithmetic within every
+/// kernel is unchanged.
+fn ds4_attn_block_heterogeneous(
+    cfg: &DeepseekV4Config,
+    weights: &DeepseekV4Weights,
+    state: &mut DeepseekV4State,
+    gpu: &mut Gpu,
+    execution: &mut DeepseekV4HeterogeneousExecution,
+    layer_idx: usize,
+    position: u32,
+) -> Result<(), String> {
+    let layer = weights.resolve_layer(layer_idx);
+    mhc_pre(cfg, weights, state, gpu, layer_idx, /*is_attn=*/ true)?;
+    q_lora_prepare(cfg, weights, state, gpu, layer_idx)?;
+
+    {
+        let primary = gpu
+            .active_stream
+            .as_ref()
+            .ok_or_else(|| "heterogeneous dense primary stream missing".to_string())?;
+        let fork = execution
+            .dense_attn_fork_event
+            .as_ref()
+            .ok_or_else(|| "heterogeneous dense attention fork missing".to_string())?;
+        gpu.hip
+            .event_record(fork, Some(primary))
+            .map_err(|error| format!("heterogeneous attention fork l{layer_idx}: {error:?}"))?;
+        let side = execution
+            .dense_attn_stream
+            .as_ref()
+            .ok_or_else(|| "heterogeneous dense attention stream missing".to_string())?;
+        gpu.hip.stream_wait_event(side, fork).map_err(|error| {
+            format!("heterogeneous attention side wait l{layer_idx}: {error:?}")
+        })?;
+    }
+
+    std::mem::swap(&mut gpu.active_stream, &mut execution.dense_attn_stream);
+    let side_result = (|| {
+        kv_joint(cfg, weights, state, gpu, layer_idx)?;
+        if layer.compress_ratio > 0 {
+            let tmp_view = {
+                let tmp = state.tmp.as_ref().unwrap();
+                tmp.sub_offset(0, tmp.numel())
+            };
+            compressor_forward(
+                cfg, weights, state, gpu, layer_idx, &tmp_view, position,
+                /*is_indexer=*/ false,
+            )?;
+            if layer.compress_ratio == 4 {
+                compressor_forward(
+                    cfg, weights, state, gpu, layer_idx, &tmp_view, position,
+                    /*is_indexer=*/ true,
+                )?;
+            }
+        }
+        let side = gpu
+            .active_stream
+            .as_ref()
+            .ok_or_else(|| "heterogeneous dense attention side stream missing".to_string())?;
+        let join = execution
+            .dense_attn_join_event
+            .as_ref()
+            .ok_or_else(|| "heterogeneous dense attention join missing".to_string())?;
+        gpu.hip
+            .event_record(join, Some(side))
+            .map_err(|error| format!("heterogeneous attention join l{layer_idx}: {error:?}"))
+    })();
+    std::mem::swap(&mut gpu.active_stream, &mut execution.dense_attn_stream);
+    side_result?;
+
+    q_lora_project(cfg, weights, state, gpu, layer_idx)?;
+    {
+        let primary = gpu
+            .active_stream
+            .as_ref()
+            .ok_or_else(|| "heterogeneous dense primary stream missing after Q-LoRA".to_string())?;
+        let join = execution
+            .dense_attn_join_event
+            .as_ref()
+            .ok_or_else(|| "heterogeneous dense attention join missing".to_string())?;
+        gpu.hip.stream_wait_event(primary, join).map_err(|error| {
+            format!("heterogeneous attention primary wait l{layer_idx}: {error:?}")
+        })?;
+    }
+
+    apply_tail_rope(cfg, weights, state, gpu, position, layer_idx)?;
+    if layer.compress_ratio == 4 {
+        let n = indexer_forward(cfg, weights, state, gpu, layer_idx, position)?;
+        dump_indexer_state(gpu, state, layer_idx, position, n);
+    }
+    attn_stub(cfg, weights, state, gpu, layer_idx)?;
+    hc_attn_mix(cfg, weights, state, gpu, layer_idx)
 }
 
 /// FFN block (replays decode_step_body's FFN arm verbatim).
@@ -8226,7 +8334,7 @@ fn kv_joint(
 ///
 /// Reuses `state.tmp` as the rotated post-RMSNorm input. Reuses
 /// `state.q_lat`, `state.q_lat_rot`, `state.q`.
-fn q_lora(
+fn q_lora_prepare(
     cfg: &DeepseekV4Config,
     weights: &DeepseekV4Weights,
     state: &mut DeepseekV4State,
@@ -8238,19 +8346,10 @@ fn q_lora(
         .attn_norm
         .as_ref()
         .ok_or_else(|| format!("layer {layer_idx} attn_norm missing"))?;
-    let q_norm = layer
-        .q_norm
-        .as_ref()
-        .ok_or_else(|| format!("layer {layer_idx} q_norm missing"))?;
     let wq_a = layer
         .wq_a
         .as_ref()
         .ok_or_else(|| format!("layer {layer_idx} wq_a missing"))?;
-    let wq_b = layer
-        .wq_b
-        .as_ref()
-        .ok_or_else(|| format!("layer {layer_idx} wq_b missing"))?;
-    let streams = state.residual_streams.as_ref().unwrap();
 
     // Allocate Q-LoRA state slots once.
     if state.q_lat.is_none() {
@@ -8290,17 +8389,10 @@ fn q_lora(
     let hc_x_in = state.hc_x_in.as_ref().unwrap();
     let tmp = state.tmp.as_ref().unwrap();
     let tmp_plain = state.tmp_plain.as_ref().unwrap();
-    let q_lat = state.q_lat.as_ref().unwrap();
-    let q_lat_rot = state.q_lat_rot.as_ref().unwrap();
-    let q = state.q.as_ref().unwrap();
-    let q_head_ones = state.q_head_ones.as_ref().unwrap();
-    let _ = streams; // streams not used directly anymore; transform reads hc_x_in
 
-    // Skip dead FWHT rotations when consuming weights are Q8/F16 (the
-    // DeepSeek V4-q8 case for both wq_a and wq_b). The gemv_auto dispatch reads
-    // x_plain on those paths; x_rotated is unused.
+    // Skip dead FWHT rotations when wq_a is Q8/F16. The projection helper
+    // independently handles the second Q-LoRA projection's rotation contract.
     let wq_a_needs_fwht = weight_needs_fwht(wq_a);
-    let wq_b_needs_fwht = weight_needs_fwht(wq_b);
 
     // 1. RMSNorm (+ optional FWHT) hc_x_in → tmp / tmp_plain. When both
     //    outputs are needed (the common DeepSeek V4 case), use the fused variant
@@ -8346,6 +8438,41 @@ fn q_lora(
         }
         dump_dense_activations_if_enabled(gpu, &names, tmp_plain, cfg.hidden_size)?;
     }
+
+    Ok(())
+}
+
+/// Finish Q-LoRA after [`q_lora_prepare`] has materialized the shared
+/// attention-normalized input. Keeping this boundary explicit lets the exact
+/// heterogeneous gfx1100 route overlap the independent KV/compressor branch
+/// without changing any projection arithmetic or reduction order.
+fn q_lora_project(
+    cfg: &DeepseekV4Config,
+    weights: &DeepseekV4Weights,
+    state: &mut DeepseekV4State,
+    gpu: &mut Gpu,
+    layer_idx: usize,
+) -> Result<(), String> {
+    let layer = weights.resolve_layer(layer_idx);
+    let q_norm = layer
+        .q_norm
+        .as_ref()
+        .ok_or_else(|| format!("layer {layer_idx} q_norm missing"))?;
+    let wq_a = layer
+        .wq_a
+        .as_ref()
+        .ok_or_else(|| format!("layer {layer_idx} wq_a missing"))?;
+    let wq_b = layer
+        .wq_b
+        .as_ref()
+        .ok_or_else(|| format!("layer {layer_idx} wq_b missing"))?;
+    let tmp = state.tmp.as_ref().unwrap();
+    let tmp_plain = state.tmp_plain.as_ref().unwrap();
+    let q_lat = state.q_lat.as_ref().unwrap();
+    let q_lat_rot = state.q_lat_rot.as_ref().unwrap();
+    let q = state.q.as_ref().unwrap();
+    let q_head_ones = state.q_head_ones.as_ref().unwrap();
+    let wq_b_needs_fwht = weight_needs_fwht(wq_b);
 
     // 2. wq_a @ tmp → q_lat. M = q_lora_rank, K = hidden.
     gemv_auto(
@@ -8418,6 +8545,17 @@ fn q_lora(
         .map_err(|e| format!("q per-head rmsnorm layer {layer_idx}: {e:?}"))?;
 
     Ok(())
+}
+
+fn q_lora(
+    cfg: &DeepseekV4Config,
+    weights: &DeepseekV4Weights,
+    state: &mut DeepseekV4State,
+    gpu: &mut Gpu,
+    layer_idx: usize,
+) -> Result<(), String> {
+    q_lora_prepare(cfg, weights, state, gpu, layer_idx)?;
+    q_lora_project(cfg, weights, state, gpu, layer_idx)
 }
 
 /// Step 1 of forward: embedding lookup + 4-stream residual init.
