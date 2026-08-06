@@ -113,7 +113,7 @@ fn sequential(gpu: &mut Gpu, weight: &GpuTensor, x: &GpuTensor, y: &GpuTensor) {
 }
 
 fn grouped(gpu: &mut Gpu, weight: &GpuTensor, x: &GpuTensor, y: &GpuTensor) {
-    gpu.gemv_mfp4g32_e8_soa_grouped_gfx1100_candidate(weight, x, y, GROUPS, M, K)
+    gpu.gemv_mfp4g32_e8_soa_grouped_gfx1100(weight, x, y, GROUPS, M, K)
         .expect("grouped E8 launch");
 }
 

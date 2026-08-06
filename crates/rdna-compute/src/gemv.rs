@@ -4447,10 +4447,10 @@ impl Gpu {
         )
     }
 
-    /// Exact-gfx1100 micro-screen for collapsing the eight O-LoRA E8 GEMVs
-    /// into one 2-D launch. The included kernel preserves the incumbent
-    /// width-32 per-row arithmetic and is unreachable from product dispatch.
-    pub fn gemv_mfp4g32_e8_soa_grouped_gfx1100_candidate(
+    /// Exact-gfx1100 path for collapsing the eight O-LoRA E8 GEMVs into one
+    /// 2-D launch. The included kernel preserves the incumbent width-32
+    /// per-row arithmetic.
+    pub fn gemv_mfp4g32_e8_soa_grouped_gfx1100(
         &mut self,
         a: &GpuTensor,
         x: &GpuTensor,
@@ -4462,13 +4462,13 @@ impl Gpu {
         self.bind_thread()?;
         assert!(
             self.arch_caps.is_gfx1100(),
-            "grouped E8 gfx1100 candidate requires exact gfx1100"
+            "grouped E8 gfx1100 requires exact gfx1100"
         );
-        assert!(k % 256 == 0, "grouped E8 candidate requires K%256=0");
-        const KERNEL: &str = "gemv_mfp4g32_e8_soa_grouped_gfx1100_candidate";
+        assert!(k % 256 == 0, "grouped E8 gfx1100 requires K%256=0");
+        const KERNEL: &str = "gemv_mfp4g32_e8_soa_grouped_gfx1100";
         self.ensure_kernel(
             KERNEL,
-            kernels::GEMV_MFP4G32_E8_SOA_GROUPED_GFX1100_CANDIDATE_SRC,
+            kernels::GEMV_MFP4G32_E8_SOA_GROUPED_GFX1100_SRC,
             KERNEL,
         )?;
         let a_ptr = a.buf.as_ptr();

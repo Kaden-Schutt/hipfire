@@ -4242,7 +4242,7 @@ pub fn decode_step_body(
         }
 
         // v + vi. Main attention + O-LoRA — STUB.
-        attn_stub(cfg, weights, state, gpu, layer_idx)?;
+        attn_stub(cfg, weights, state, gpu, layer_idx, OloraSchedule::Default)?;
         if let Some(t) = state.attn_out.as_ref() {
             dump_stage_norm(gpu, "attn_out", t, layer_idx, position);
         }
@@ -4355,7 +4355,7 @@ fn ds4_attn_block(
             dump_indexer_state(gpu, state, layer_idx, position, _n);
         }
     }
-    attn_stub(cfg, weights, state, gpu, layer_idx)?;
+    attn_stub(cfg, weights, state, gpu, layer_idx, OloraSchedule::Default)?;
     hc_attn_mix(cfg, weights, state, gpu, layer_idx)?;
     Ok(())
 }
@@ -4456,7 +4456,14 @@ fn ds4_attn_block_heterogeneous(
         let n = indexer_forward(cfg, weights, state, gpu, layer_idx, position)?;
         dump_indexer_state(gpu, state, layer_idx, position, n);
     }
-    attn_stub(cfg, weights, state, gpu, layer_idx)?;
+    attn_stub(
+        cfg,
+        weights,
+        state,
+        gpu,
+        layer_idx,
+        OloraSchedule::HeterogeneousGfx1100,
+    )?;
     hc_attn_mix(cfg, weights, state, gpu, layer_idx)
 }
 
@@ -5440,7 +5447,14 @@ fn mtp_pre_ffn(
     kv_joint(cfg, weights, state, gpu, mtp_layer_idx)?;
     apply_tail_rope(cfg, weights, state, gpu, position, mtp_layer_idx)?;
     // (No compressor / indexer for MTP — compress_ratio == 0.)
-    attn_stub(cfg, weights, state, gpu, mtp_layer_idx)?;
+    attn_stub(
+        cfg,
+        weights,
+        state,
+        gpu,
+        mtp_layer_idx,
+        OloraSchedule::Default,
+    )?;
     hc_attn_mix(cfg, weights, state, gpu, mtp_layer_idx)?;
     Ok(())
 }
@@ -7276,12 +7290,19 @@ fn final_norm_and_head(
 ///
 /// This handles position 0. For position > 0 we need SWA cache +
 /// real Q·K·V over history — pending.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OloraSchedule {
+    Default,
+    HeterogeneousGfx1100,
+}
+
 fn attn_stub(
     cfg: &DeepseekV4Config,
     weights: &DeepseekV4Weights,
     state: &mut DeepseekV4State,
     gpu: &mut Gpu,
     layer_idx: usize,
+    olora_schedule: OloraSchedule,
 ) -> Result<(), String> {
     // Final attention contribution: shape [hidden]. Consumed by hc_attn_mix.
     if state.attn_out.is_none() {
@@ -7655,6 +7676,18 @@ fn attn_stub(
             per_group_in,
         )
         .map_err(|e| format!("grouped E8 wo_a l{layer_idx}: {e:?}"))?;
+    } else if wo_a.dtype == DType::MFP4G32E8SOA
+        && olora_schedule == OloraSchedule::HeterogeneousGfx1100
+    {
+        gpu.gemv_mfp4g32_e8_soa_grouped_gfx1100(
+            wo_a,
+            attn_out_raw_rot,
+            wo_a_out,
+            n_groups,
+            o_lora_rank,
+            per_group_in,
+        )
+        .map_err(|e| format!("grouped gfx1100 E8 wo_a l{layer_idx}: {e:?}"))?;
     } else if wo_a.dtype == DType::MFP4G32E8SOA
         && config_cache::gfx942_e8_wo_grouped_on(&gpu.arch, weights.mq2r_backend.is_gfx942())
         && per_group_in % 256 == 0
