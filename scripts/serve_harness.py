@@ -185,6 +185,7 @@ def build_config(args):
         "niah_file": getattr(args, "niah_file", None),
         "speculation_mode": getattr(args, "speculation", None),
         "deepseek4_experts_per_token": getattr(args, "deepseek4_experts_per_token", None),
+        "deepseek4_compute_placement": getattr(args, "deepseek4_compute_placement", "single"),
         "replay_route_proof_log": bool(getattr(args, "replay_route_proof_log", False)),
     }
 
@@ -237,6 +238,7 @@ def show_config(cfg):
         "  ds4 experts/tok: "
         f"{cfg.get('deepseek4_experts_per_token') or '(checkpoint default)'}"
     )
+    print(f"  ds4 placement : {cfg.get('deepseek4_compute_placement', 'single')}")
     prompt_source = cfg.get("prompt_file") or cfg.get("prompts_file") or cfg.get("niah_file") or "(built-in battery)"
     print(f"  seed          : {cfg.get('seed')}   prompt_source: {prompt_source}")
     _cap = cfg['thinking_cap_tokens']
@@ -443,12 +445,17 @@ def _write_native_config(cfg, home):
             "[model]\n"
             f"deepseek4_experts_per_token = {cfg['deepseek4_experts_per_token']}\n\n"
         )
+    placement = cfg.get("deepseek4_compute_placement", "single")
+    hardware = f"""[hardware]
+deepseek4_compute_placement = {json.dumps(placement)}
+
+"""
     text = f"""[serve]
 host = "127.0.0.1"
 port = {cfg["port"]}
 default_model = {json.dumps(cfg["model"])}
 
-{model}[memory]
+{model}{hardware}[memory]
 max_seq = {cfg.get("max_seq", 32768)}
 kv_cache = {json.dumps(cfg["kv"])}
 
@@ -935,6 +942,11 @@ def run(cfg, args):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default=None, help="model file path to serve")
+    ap.add_argument(
+        "--deepseek4-compute-placement",
+        default="single",
+        help="typed DS4 placement, for example dense-expert-split(dense=arch:gfx1100,experts=arch:gfx1151)",
+    )
     ap.add_argument("--tag", default=None, help="registry tag for recommended_settings (else inferred)")
     ap.add_argument("--registry", default=os.path.join(REPO, "registry/v1.json"))
     ap.add_argument("--kv", default="fwht3")

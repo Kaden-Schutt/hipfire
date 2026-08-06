@@ -752,6 +752,21 @@ impl DeepseekV4HeterogeneousModel {
         )
     }
 
+    /// Rewind the self-owned direct-HIP route for a fresh serving request.
+    /// The split path does not yet expose prefix-cache reuse, so every request
+    /// starts from the same zeroed recurrent/KV state as a fresh process.
+    pub fn reset_for_request(&mut self) -> Result<(), String> {
+        let state = self
+            .state
+            .as_mut()
+            .ok_or_else(|| "deepseek4 heterogeneous reset after state release".to_string())?;
+        state.reset();
+        state.zero_decode_caches(&mut self.dense_gpu);
+        self.dense_gpu.invalidate_graph_state();
+        self.routed_gpu.invalidate_graph_state();
+        Ok(())
+    }
+
     /// Explicit unload used by the G2 repeatability harness. `Drop` calls the
     /// same implementation, so early returns and normal scope exit converge.
     pub fn unload(mut self) {

@@ -5851,6 +5851,10 @@ fn load_params(
     }
     let mut params = serde_json::json!({
         "max_seq": max_seq,
+        "deepseek4_compute_placement": config_string(
+            resolved,
+            "hardware.deepseek4_compute_placement",
+        )?,
         "kv_mode": kv_mode,
         "kv_backend": kv_backend,
         "kv_adaptive": config_string(resolved, "memory.kv_adaptive")?,
@@ -8622,6 +8626,7 @@ mod tests {
         let model_path = PathBuf::from("/tmp/test-model.mq2r");
         let defaults = resolve(Vec::<NamedLayer>::new()).unwrap();
         let params = load_params(&defaults, None, &model_path, 64, Some("q8"), None).unwrap();
+        assert_eq!(params["deepseek4_compute_placement"], "single");
         assert!(params.get("deepseek4_experts_per_token").is_none());
 
         let mut explicit = ConfigLayer::default();
@@ -8637,6 +8642,32 @@ mod tests {
         .unwrap();
         let params = load_params(&resolved, None, &model_path, 64, Some("q8"), None).unwrap();
         assert_eq!(params["deepseek4_experts_per_token"], 4);
+    }
+
+    #[test]
+    fn load_params_forwards_typed_deepseek4_compute_placement() {
+        let raw = "dense-expert-split(dense=arch:gfx1100,experts=arch:gfx1151)";
+        let mut explicit = ConfigLayer::default();
+        explicit
+            .set_cli("hardware.deepseek4_compute_placement", raw)
+            .unwrap();
+        let resolved = resolve([NamedLayer {
+            source: ConfigSource::OneShot {
+                argument: format!("hardware.deepseek4_compute_placement={raw}"),
+            },
+            layer: explicit,
+        }])
+        .unwrap();
+        let params = load_params(
+            &resolved,
+            None,
+            Path::new("/tmp/test-model.mq2r"),
+            64,
+            Some("q8"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(params["deepseek4_compute_placement"], raw);
     }
 
     #[test]

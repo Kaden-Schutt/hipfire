@@ -260,6 +260,15 @@ pub enum ModelState {
     Minimax(MiniMaxBundle),
     Cohere2Moe(Cohere2MoeBundle),
     Deepseek4(hipfire_arch_deepseek4::Deepseek4Bundle),
+    Deepseek4Heterogeneous(Deepseek4HeterogeneousBundle),
+}
+
+/// Self-owned gfx1100+dense / gfx1151+routed DeepSeek V4 state. The model
+/// owns both HIP devices and tears them down in its `Drop` implementation;
+/// the daemon's ordinary single-device `Gpu` must never free these buffers.
+pub struct Deepseek4HeterogeneousBundle {
+    pub model: hipfire_arch_deepseek4::DeepseekV4HeterogeneousModel,
+    pub eos_tok: u32,
 }
 
 /// LFM2.5-MoE (arch_id=11) GPU bundle. Re-exported from the arch crate, which
@@ -1097,6 +1106,7 @@ pub fn load_model(
         path,
         max_seq,
         None,
+        hipfire_config::Deepseek4ComputePlacement::Single,
         draft_path,
         kv_mode_override,
         None,
@@ -1115,6 +1125,7 @@ pub fn load_model_with_kv_backend(
     path: &str,
     max_seq: usize,
     deepseek4_experts_per_token: Option<usize>,
+    deepseek4_compute_placement: hipfire_config::Deepseek4ComputePlacement,
     draft_path: Option<&str>,
     kv_mode_override: Option<&str>,
     kv_backend_override: Option<&str>,
@@ -1220,6 +1231,7 @@ pub fn load_model_with_kv_backend(
     let mut ctx = LoadCtx {
         path,
         max_seq,
+        deepseek4_compute_placement,
         deepseek4_experts_per_token,
         draft_path,
         kv_mode_override,
@@ -1860,6 +1872,7 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(
             | Some(ModelState::Minimax(_))
             | Some(ModelState::Cohere2Moe(_))
             | Some(ModelState::Deepseek4(_))
+            | Some(ModelState::Deepseek4Heterogeneous(_))
             | None => {}
         }
         for g in gpus.devices.iter_mut() {
@@ -1936,6 +1949,11 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(
             ModelState::Deepseek4(b) => {
                 b.state.free_gpu(gpu);
                 b.weights.free_gpu(gpu);
+            }
+            ModelState::Deepseek4Heterogeneous(b) => {
+                // Self-owned two-device transaction. Dropping `model` frees
+                // each resource on its exact owner and drains both pools.
+                drop(b);
             }
         }
     }

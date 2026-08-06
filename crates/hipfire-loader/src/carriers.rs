@@ -984,6 +984,9 @@ impl Carrier for Deepseek4Carrier {
     ) -> Result<Box<dyn SpecTargetGuard + 'm>, String> {
         match state.as_mut() {
             Some(ModelState::Deepseek4(bundle)) => Ok(Box::new(InPlaceGuard { bundle })),
+            Some(ModelState::Deepseek4Heterogeneous(_)) => {
+                Err("deepseek4 heterogeneous route is direct-AR only until G6".into())
+            }
             _ => Err("deepseek4: spec target state mismatch".into()),
         }
     }
@@ -1008,6 +1011,54 @@ impl Carrier for Deepseek4Carrier {
         }
         dir_diag(&src);
         let meta = resolve_source_meta(&src, ctx.path)?;
+
+        if !matches!(
+            ctx.deepseek4_compute_placement,
+            hipfire_config::Deepseek4ComputePlacement::Single
+        ) {
+            if !matches!(&src, ModelSource::Hfq(_)) {
+                return Err(
+                    "deepseek4 heterogeneous placement requires the frozen MQ2R HFQ artifact"
+                        .into(),
+                );
+            }
+            if ctx
+                .deepseek4_experts_per_token
+                .is_some_and(|value| value != 6)
+            {
+                return Err("deepseek4 heterogeneous placement requires checkpoint top-k 6".into());
+            }
+            if ctx.draft_path.is_some() || ctx.spec.dspark == Some(true) {
+                return Err(
+                    "deepseek4 heterogeneous placement is direct-AR only until G6/G7".into(),
+                );
+            }
+            let artifact =
+                hipfire_arch_deepseek4::DeepseekV4VerifiedArtifact::verify(ctx.path.as_ref())?;
+            let plan = hipfire_arch_deepseek4::DeepseekV4HeterogeneousLoadPlan {
+                placement: ctx.deepseek4_compute_placement.clone(),
+                prefill_max_batch: 1024,
+                ..Default::default()
+            };
+            let model = hipfire_arch_deepseek4::DeepseekV4HeterogeneousModel::load_verified(
+                &artifact, plan,
+            )?;
+            let eos_tok = resolve_eos_tok(&meta.tokenizer, &["<｜end▁of▁sentence｜>"]);
+            let advertised_context = model.config.max_position_embeddings;
+            return Ok(LoadedModel {
+                state: Some(crate::ModelState::Deepseek4Heterogeneous(
+                    crate::Deepseek4HeterogeneousBundle { model, eos_tok },
+                )),
+                ..LoadedModel::skeleton(
+                    meta.arch_id,
+                    meta.tokenizer,
+                    advertised_context,
+                    advertised_context,
+                    ctx.path.to_string(),
+                    meta.chat_template,
+                )
+            });
+        }
 
         use hipfire_arch_deepseek4 as deepseek4;
         use hipfire_runtime::arch::Architecture;

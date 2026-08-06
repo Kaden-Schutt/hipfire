@@ -6665,6 +6665,27 @@ fn main() {
                     .and_then(|p| p.get("deepseek4_experts_per_token"))
                     .and_then(|v| v.as_u64())
                     .map(|value| value as usize);
+                let deepseek4_compute_placement = match msg
+                    .get("params")
+                    .and_then(|p| p.get("deepseek4_compute_placement"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("single")
+                    .parse::<hipfire_config::Deepseek4ComputePlacement>()
+                {
+                    Ok(placement) => placement,
+                    Err(error) => {
+                        emit_uncorrelated_error(
+                            &mut stdout,
+                            None,
+                            &format!("invalid DeepSeek V4 compute placement: {error}"),
+                            "validation",
+                            false,
+                            false,
+                        );
+                        let _ = stdout.flush();
+                        continue;
+                    }
+                };
 
                 let loaded = if tp > 1 {
                     if deepseek4_experts_per_token.is_some() {
@@ -6685,6 +6706,7 @@ fn main() {
                         path,
                         max_seq,
                         deepseek4_experts_per_token,
+                        deepseek4_compute_placement,
                         draft_path.as_deref(),
                         kv_mode_override.as_deref(),
                         kv_backend_override.as_deref(),
@@ -18949,6 +18971,25 @@ fn generate_deepseek4(
     tools: Option<&[serde_json::Value]>,
     messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
 ) {
+    if matches!(
+        m.state.as_ref(),
+        Some(ModelState::Deepseek4Heterogeneous(_))
+    ) {
+        generate_deepseek4_heterogeneous(
+            m,
+            stdout,
+            id,
+            prompt,
+            system_prompt,
+            temp,
+            top_p,
+            max_tokens,
+            think_mode,
+            tools,
+            messages_history,
+        );
+        return;
+    }
     let tokenizer = match m.tokenizer.as_ref() {
         Some(t) => t,
         None => {
@@ -19668,6 +19709,232 @@ fn generate_deepseek4(
         let _ = tool_calls_parsed_count;
         eprintln!("[req {id}] drafter=ar tau=1.00 tok/s={tok_s:.1} decode ({generated_count} tok, autoregressive)");
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn generate_deepseek4_heterogeneous(
+    m: &mut LoadedModel,
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    prompt: &str,
+    system_prompt: Option<&str>,
+    temp: f32,
+    top_p: f32,
+    max_tokens: usize,
+    think_mode: ThinkMode,
+    tools: Option<&[serde_json::Value]>,
+    messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
+) {
+    if tools.is_some_and(|items| !items.is_empty()) {
+        emit_active_attempt_error(
+            stdout,
+            Some(id),
+            "tools are not yet admitted on the DeepSeek V4 heterogeneous G4 route",
+            "unsupported",
+            false,
+            false,
+        );
+        let _ = stdout.flush();
+        return;
+    }
+    let Some(tokenizer) = m.tokenizer.as_ref() else {
+        emit_error_with_id(stdout, id, "tokenizer not loaded");
+        return;
+    };
+    let eos_tok = match m.state.as_ref() {
+        Some(ModelState::Deepseek4Heterogeneous(bundle)) => bundle.eos_tok,
+        _ => {
+            emit_error_with_id(stdout, id, "deepseek4 heterogeneous state missing");
+            return;
+        }
+    };
+    let prompt_ids = build_deepseek4_dsml_prompt(
+        tokenizer,
+        system_prompt,
+        None,
+        messages_history,
+        prompt,
+        think_mode,
+        eos_tok,
+        &mut m.asst_turn_cache,
+    );
+    if prompt_ids.is_empty() {
+        emit_error_with_id(stdout, id, "empty prompt after tokenize");
+        return;
+    }
+    if prompt_ids.len().saturating_add(max_tokens) > m.physical_cap {
+        emit_error_with_id(
+            stdout,
+            id,
+            format!(
+                "prompt exceeds checkpoint context capacity: prompt={} + max_tokens={} > capacity={}",
+                prompt_ids.len(),
+                max_tokens,
+                m.physical_cap
+            ),
+        );
+        return;
+    }
+
+    let total_t0 = Instant::now();
+    let prefill_t0 = Instant::now();
+    let (mut logits, prefill_ms) = {
+        let Some(ModelState::Deepseek4Heterogeneous(bundle)) = m.state.as_mut() else {
+            emit_error_with_id(stdout, id, "deepseek4 heterogeneous state missing");
+            return;
+        };
+        if let Err(error) = bundle.model.reset_for_request() {
+            emit_error_with_id(
+                stdout,
+                id,
+                format!("deepseek4 heterogeneous reset failed: {error}"),
+            );
+            return;
+        }
+        let mut logits = Vec::new();
+        for (position, &token) in prompt_ids.iter().enumerate() {
+            match bundle.model.decode_step(token, position as u32) {
+                Ok(next) => logits = next,
+                Err(error) => {
+                    emit_error_with_id(
+                        stdout,
+                        id,
+                        format!("deepseek4 heterogeneous prefill failed: {error}"),
+                    );
+                    return;
+                }
+            }
+        }
+        if let Some(state) = bundle.model.state.as_mut() {
+            state.n_tokens = prompt_ids.len() as u64;
+        }
+        let _ = bundle.model.dense_gpu.hip.device_synchronize();
+        (logits, prefill_t0.elapsed().as_millis())
+    };
+
+    emit_gen_start(
+        stdout,
+        id,
+        !matches!(think_mode, ThinkMode::NonThink),
+        ds4_gen_start_contract_version(),
+    );
+    let top_k = std::env::var("HIPFIRE_DEEPSEEK4_TOP_K")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0);
+    let mut rng = deepseek4::sampling::Xorshift::new(0x1357_9bdf);
+    let mut parser = match think_mode {
+        ThinkMode::Low | ThinkMode::High | ThinkMode::Max => {
+            deepseek4::dsml::StreamParser::new_in_think()
+        }
+        ThinkMode::NonThink => deepseek4::dsml::StreamParser::new(),
+    };
+    let mut next_tok = deepseek4::sampling::sample_token(&logits, temp, top_k, top_p, &mut rng);
+    let decode_t0 = Instant::now();
+    let mut generated = 0usize;
+    let mut pos = prompt_ids.len() as u32;
+    let mut emitted_tokens = Vec::with_capacity(max_tokens);
+    let mut emit_text_buf = String::new();
+    let mut emit_tool_calls_buf = Vec::new();
+    let mut dsml_malformed = None;
+
+    while generated < max_tokens && next_tok != eos_tok {
+        let fragment = tokenizer.decode(&[next_tok]);
+        for event in parser.feed(&fragment) {
+            ds4_absorb_stream_event(
+                &event,
+                &mut emit_text_buf,
+                &mut emit_tool_calls_buf,
+                &mut dsml_malformed,
+            );
+            emit_stream_event(stdout, id, event);
+        }
+        emit_committed_event(
+            stdout,
+            id,
+            next_tok,
+            generated,
+            decode_t0.elapsed().as_millis() as u64,
+        );
+        let _ = stdout.flush();
+        emitted_tokens.push(next_tok);
+        generated += 1;
+        if generated >= max_tokens {
+            break;
+        }
+        let Some(ModelState::Deepseek4Heterogeneous(bundle)) = m.state.as_mut() else {
+            emit_error_with_id(stdout, id, "deepseek4 heterogeneous state disappeared");
+            return;
+        };
+        match bundle.model.decode_step(next_tok, pos) {
+            Ok(next) => logits = next,
+            Err(error) => {
+                emit_error_with_id(
+                    stdout,
+                    id,
+                    format!("deepseek4 heterogeneous decode failed: {error}"),
+                );
+                return;
+            }
+        }
+        pos = pos.saturating_add(1);
+        if let Some(state) = bundle.model.state.as_mut() {
+            state.n_tokens = pos as u64;
+        }
+        next_tok = deepseek4::sampling::sample_token(&logits, temp, top_k, top_p, &mut rng);
+    }
+    for event in parser.finish() {
+        ds4_absorb_stream_event(
+            &event,
+            &mut emit_text_buf,
+            &mut emit_tool_calls_buf,
+            &mut dsml_malformed,
+        );
+        emit_stream_event(stdout, id, event);
+    }
+    let terminal =
+        ds4_ar_ep_finish_route(dsml_malformed, emit_tool_calls_buf, generated >= max_tokens);
+    let (finish_reason, wire_tool_calls) = match terminal {
+        Ds4ArEpRouteTerminal::Malformed(action) => {
+            emit_ds4_malformed_action(stdout, id, &action);
+            return;
+        }
+        Ds4ArEpRouteTerminal::Safe {
+            finish_reason,
+            wire_tool_calls,
+            ..
+        } => (finish_reason, wire_tool_calls),
+    };
+    let decode_ms = decode_t0.elapsed().as_millis().max(1);
+    let tok_s = generated as f64 * 1000.0 / decode_ms as f64;
+    let mut pending_done = serde_json::json!({
+        "type": "done",
+        "id": id,
+        "tokens": generated,
+        "tok_s": tok_s,
+        "prompt_tokens": prompt_ids.len(),
+        "prefill_tokens": prompt_ids.len(),
+        "cached_tokens": 0,
+        "prefill_ms": prefill_ms,
+        "total_ms": total_t0.elapsed().as_millis().max(1),
+        "finish_reason": finish_reason,
+        "drafter": "ar-heterogeneous",
+        "attempt_id": active_attempt_id(),
+    });
+    stage_terminal_tool_calls(&mut pending_done, finish_reason, &wire_tool_calls);
+    let decision = await_client_terminal_commit(stdout, id, &pending_done);
+    let effects = ds4_client_commit_effects(decision, !wire_tool_calls.is_empty(), true);
+    if !effects.emit_done {
+        return;
+    }
+    m.seq_pos = pos as usize;
+    m.conversation_tokens.clear();
+    m.conversation_tokens.extend_from_slice(&prompt_ids);
+    m.conversation_tokens.extend_from_slice(&emitted_tokens);
+    emit_staged_terminal_done(stdout, &pending_done);
+    eprintln!(
+        "[req {id}] drafter=ar-heterogeneous tau=1.00 tok/s={tok_s:.1} decode ({generated} tok)"
+    );
 }
 
 fn generate_lfm2moe(
