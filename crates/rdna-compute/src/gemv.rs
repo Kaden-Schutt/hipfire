@@ -11167,7 +11167,6 @@ impl Gpu {
             kernels::WO_PER_GROUP_BATCHED_HFQ4G256_SRC,
             "wo_per_group_batched_hfq4g256",
         )?;
-        let func = &self.functions["wo_per_group_batched_hfq4g256"];
         let wp = wo_a.buf.as_ptr();
         let xp = x_in.buf.as_ptr();
         let yp = y_out.buf.as_ptr();
@@ -11184,16 +11183,24 @@ impl Gpu {
             &mut k_i as *mut _ as *mut c_void,
             &mut bs as *mut _ as *mut c_void,
         ];
-        unsafe {
-            self.hip.launch_kernel(
-                func,
-                [m as u32, batch_size as u32, g as u32],
-                [32, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        }
+        self.launch_maybe_blob(
+            "wo_per_group_batched_hfq4g256",
+            [m as u32, batch_size as u32, g as u32],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut blob = hip_bridge::KernargBlob::new();
+                blob.push_ptr(wp);
+                blob.push_ptr(xp);
+                blob.push_ptr(yp);
+                blob.push_i32(g_i);
+                blob.push_i32(m_i);
+                blob.push_i32(k_i);
+                blob.push_i32(bs);
+                blob
+            },
+        )
     }
     pub fn wo_per_group_batched_q8_0(
         &mut self,
