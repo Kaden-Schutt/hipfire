@@ -1135,10 +1135,6 @@ pub const GEMV_MFP4G32_E8_SOA_SRC: &str =
 /// ONLY dispatched on gfx1151 (Strix Halo); other archs use GEMV_MFP4G32_E8_SOA_SRC.
 pub const GEMV_MFP4G32_E8_SOA_GFX1151_SRC: &str =
     include_str!("../../../kernels/src/gemv_mfp4g32_e8_soa.gfx1151.hip");
-/// Experimental gfx1100 four-wave workgroup packing for the E8-SoA GEMV.
-/// Micro-screen only until the occurrence-weighted product gate passes.
-pub const GEMV_MFP4G32_E8_SOA_PACK4_GFX1100_SRC: &str =
-    include_str!("../../../kernels/src/gemv_mfp4g32_e8_soa_pack4.gfx1100.hip");
 /// gfx942 wave64 mfp4-E8 SoA GEMV. One wave computes two rows as isolated
 /// 32-lane segments; dispatch is chip-strict so no RDNA/Qwen route sees it.
 pub const GEMV_MFP4G32_E8_SOA_GFX942_SRC: &str =
