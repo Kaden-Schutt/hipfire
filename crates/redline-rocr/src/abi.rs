@@ -134,6 +134,14 @@ pub struct ProfilingDispatchTime {
     pub end: u64,
 }
 
+/// Public `hsa_amd_profiling_async_copy_time_t` layout.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProfilingAsyncCopyTime {
+    pub start: u64,
+    pub end: u64,
+}
+
 pub type AgentCallback = unsafe extern "C" fn(Agent, *mut c_void) -> Status;
 pub type MemoryPoolCallback = unsafe extern "C" fn(MemoryPool, *mut c_void) -> Status;
 pub type QueueErrorCallback = unsafe extern "C" fn(Status, *mut Queue, *mut c_void);
@@ -172,6 +180,9 @@ pub type QueueCuSetMaskFn = unsafe extern "C" fn(*const Queue, u32, *const u32) 
 pub type ProfilingSetProfilerEnabledFn = unsafe extern "C" fn(*mut Queue, i32) -> Status;
 pub type ProfilingGetDispatchTimeFn =
     unsafe extern "C" fn(Agent, Signal, *mut ProfilingDispatchTime) -> Status;
+pub type ProfilingAsyncCopyEnableFn = unsafe extern "C" fn(bool) -> Status;
+pub type ProfilingGetAsyncCopyTimeFn =
+    unsafe extern "C" fn(Signal, *mut ProfilingAsyncCopyTime) -> Status;
 
 pub type AgentIterateMemoryPoolsFn =
     unsafe extern "C" fn(Agent, Option<MemoryPoolCallback>, *mut c_void) -> Status;
@@ -253,6 +264,8 @@ pub struct Symbols {
     pub queue_cu_set_mask: QueueCuSetMaskFn,
     pub profiling_set_profiler_enabled: ProfilingSetProfilerEnabledFn,
     pub profiling_get_dispatch_time: ProfilingGetDispatchTimeFn,
+    pub profiling_async_copy_enable: Option<ProfilingAsyncCopyEnableFn>,
+    pub profiling_get_async_copy_time: Option<ProfilingGetAsyncCopyTimeFn>,
     pub agent_iterate_memory_pools: AgentIterateMemoryPoolsFn,
     pub memory_pool_get_info: MemoryPoolGetInfoFn,
     pub memory_pool_allocate: MemoryPoolAllocateFn,
@@ -305,6 +318,21 @@ impl Symbols {
                 unsafe { std::mem::transmute::<*const c_void, $ty>(pointer) }
             }};
         }
+        macro_rules! optional_symbol {
+            ($name:literal, $ty:ty) => {{
+                let name = CStr::from_bytes_with_nul(concat!($name, "\0").as_bytes())
+                    .expect("symbol name has one trailing NUL");
+                let pointer = resolve(name);
+                if pointer.is_null() {
+                    None
+                } else {
+                    // SAFETY: same contract as `symbol!`; absence remains a
+                    // runtime capability error instead of breaking all ROCr
+                    // users on older libraries.
+                    Some(unsafe { std::mem::transmute::<*const c_void, $ty>(pointer) })
+                }
+            }};
+        }
 
         Ok(Arc::new(Self {
             _keepalive: keepalive,
@@ -346,6 +374,14 @@ impl Symbols {
             profiling_get_dispatch_time: symbol!(
                 "hsa_amd_profiling_get_dispatch_time",
                 ProfilingGetDispatchTimeFn
+            ),
+            profiling_async_copy_enable: optional_symbol!(
+                "hsa_amd_profiling_async_copy_enable",
+                ProfilingAsyncCopyEnableFn
+            ),
+            profiling_get_async_copy_time: optional_symbol!(
+                "hsa_amd_profiling_get_async_copy_time",
+                ProfilingGetAsyncCopyTimeFn
             ),
             agent_iterate_memory_pools: symbol!(
                 "hsa_amd_agent_iterate_memory_pools",
@@ -414,4 +450,5 @@ const _: () = {
     assert!(std::mem::size_of::<Queue>() == 40);
     assert!(std::mem::align_of::<Queue>() == 8);
     assert!(std::mem::size_of::<ProfilingDispatchTime>() == 16);
+    assert!(std::mem::size_of::<ProfilingAsyncCopyTime>() == 16);
 };

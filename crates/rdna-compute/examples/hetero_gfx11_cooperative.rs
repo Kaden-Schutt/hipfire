@@ -480,6 +480,7 @@ struct KernelSet {
 
 struct Graph {
     schedule: Schedule,
+    runtime: Runtime,
     dev0: GpuDevice,
     dev1: GpuDevice,
     queues: QueueSet,
@@ -498,6 +499,7 @@ impl Graph {
     #[allow(clippy::too_many_arguments)]
     fn new(
         schedule: Schedule,
+        runtime: &Runtime,
         dev0: &GpuDevice,
         dev1: &GpuDevice,
         kernels: &KernelSet,
@@ -628,6 +630,7 @@ impl Graph {
         }
         Ok(Self {
             schedule,
+            runtime: runtime.clone(),
             dev0: dev0.clone(),
             dev1: dev1.clone(),
             queues,
@@ -654,7 +657,7 @@ impl Graph {
         }
     }
 
-    fn run(&mut self, buffers: &Buffers) -> Result<f64, Box<dyn std::error::Error>> {
+    fn run(&mut self, buffers: &Buffers) -> Result<RunReport, Box<dyn std::error::Error>> {
         self.reset();
         let started = Instant::now();
         for layer in 0..self.layers {
@@ -689,6 +692,7 @@ impl Graph {
         }
         self.queues.prepare_batches(&self.batches)?;
         self.queues.ring_prepared()?;
+        let host_enqueue_us = started.elapsed().as_secs_f64() * 1_000_000.0;
         self.queues
             .wait_signal(&self.join_signals[self.layers - 1], Duration::from_secs(30))?;
         for signals in [
@@ -710,43 +714,103 @@ impl Graph {
                 }
             }
         }
-        Ok(started.elapsed().as_secs_f64() * 1000.0)
+        Ok(RunReport {
+            wall_ms: started.elapsed().as_secs_f64() * 1000.0,
+            host_enqueue_us,
+        })
     }
 
-    fn overlap_report(&self) -> Result<OverlapReport, Box<dyn std::error::Error>> {
+    fn timeline_report(&self) -> Result<TimelineReport, Box<dyn std::error::Error>> {
         let frequency = self.dev0.timestamp_frequency_hz()?;
         let mut shared_ticks = 0_u64;
         let mut expert_ticks = 0_u64;
-        let mut overlap_ticks = 0_u64;
+        let mut activation_copy_ticks = 0_u64;
+        let mut result_copy_ticks = 0_u64;
+        let mut shared_expert_overlap_ticks = 0_u64;
+        let mut activation_shared_overlap_ticks = 0_u64;
         let mut overlap_layers = 0_usize;
+        let mut producer_to_shared_gap_ticks = 0_i128;
+        let mut producer_to_activation_gap_ticks = 0_i128;
+        let mut activation_to_expert_gap_ticks = 0_i128;
+        let mut expert_to_result_gap_ticks = 0_i128;
+        let mut result_to_join_gap_ticks = 0_i128;
+        let mut shared_to_join_gap_ticks = 0_i128;
         for layer in 0..self.layers {
+            let producer = self.dev0.dispatch_time(&self.producer_signals[layer])?;
             let shared = self.dev0.dispatch_time(&self.shared_signals[layer])?;
+            let activation = self
+                .runtime
+                .async_copy_time(&self.activation_signals[layer])?;
             let expert = self.dev1.dispatch_time(&self.expert_signals[layer])?;
+            let result = self.runtime.async_copy_time(&self.result_signals[layer])?;
+            let join = self.dev0.dispatch_time(&self.join_signals[layer])?;
             shared_ticks += shared.end - shared.start;
             expert_ticks += expert.end - expert.start;
-            let overlap = shared
+            activation_copy_ticks += activation.end - activation.start;
+            result_copy_ticks += result.end - result.start;
+            let shared_expert_overlap = shared
                 .end
                 .min(expert.end)
                 .saturating_sub(shared.start.max(expert.start));
-            overlap_ticks += overlap;
-            overlap_layers += usize::from(overlap != 0);
+            let activation_shared_overlap = activation
+                .end
+                .min(shared.end)
+                .saturating_sub(activation.start.max(shared.start));
+            shared_expert_overlap_ticks += shared_expert_overlap;
+            activation_shared_overlap_ticks += activation_shared_overlap;
+            overlap_layers += usize::from(shared_expert_overlap != 0);
+            producer_to_shared_gap_ticks += signed_gap(shared.start, producer.end);
+            producer_to_activation_gap_ticks += signed_gap(activation.start, producer.end);
+            activation_to_expert_gap_ticks += signed_gap(expert.start, activation.end);
+            expert_to_result_gap_ticks += signed_gap(result.start, expert.end);
+            result_to_join_gap_ticks += signed_gap(join.start, result.end);
+            shared_to_join_gap_ticks += signed_gap(join.start, shared.end);
         }
         let to_us = |ticks: u64| ticks as f64 * 1_000_000.0 / frequency as f64;
-        Ok(OverlapReport {
+        let signed_to_us = |ticks: i128| ticks as f64 * 1_000_000.0 / frequency as f64;
+        Ok(TimelineReport {
             shared_us: to_us(shared_ticks),
             expert_us: to_us(expert_ticks),
-            overlap_us: to_us(overlap_ticks),
+            activation_copy_us: to_us(activation_copy_ticks),
+            result_copy_us: to_us(result_copy_ticks),
+            shared_expert_overlap_us: to_us(shared_expert_overlap_ticks),
+            activation_shared_overlap_us: to_us(activation_shared_overlap_ticks),
             overlap_layers,
+            producer_to_shared_gap_us: signed_to_us(producer_to_shared_gap_ticks),
+            producer_to_activation_gap_us: signed_to_us(producer_to_activation_gap_ticks),
+            activation_to_expert_gap_us: signed_to_us(activation_to_expert_gap_ticks),
+            expert_to_result_gap_us: signed_to_us(expert_to_result_gap_ticks),
+            result_to_join_gap_us: signed_to_us(result_to_join_gap_ticks),
+            shared_to_join_gap_us: signed_to_us(shared_to_join_gap_ticks),
         })
     }
 }
 
 #[derive(Clone, Copy, Debug)]
-struct OverlapReport {
+struct RunReport {
+    wall_ms: f64,
+    host_enqueue_us: f64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TimelineReport {
     shared_us: f64,
     expert_us: f64,
-    overlap_us: f64,
+    activation_copy_us: f64,
+    result_copy_us: f64,
+    shared_expert_overlap_us: f64,
+    activation_shared_overlap_us: f64,
     overlap_layers: usize,
+    producer_to_shared_gap_us: f64,
+    producer_to_activation_gap_us: f64,
+    activation_to_expert_gap_us: f64,
+    expert_to_result_gap_us: f64,
+    result_to_join_gap_us: f64,
+    shared_to_join_gap_us: f64,
+}
+
+fn signed_gap(start: u64, end: u64) -> i128 {
+    i128::from(start) - i128::from(end)
 }
 
 struct HipFunctions {
@@ -1068,6 +1132,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     hip.enable_peer_access(0)?;
 
     let runtime = Runtime::initialize(redline_rocr::load_symbols()?)?;
+    runtime.set_async_copy_profiling(true)?;
     let dev0 = runtime.select_gpu(GpuSelector::NameContains(&config.expect_arch0))?;
     let dev1 = runtime.select_gpu(GpuSelector::NameContains(&config.expect_arch1))?;
     let mask01 = dev1.copy_engine_mask(&dev0)?;
@@ -1185,6 +1250,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for schedule in [Schedule::Serial, Schedule::Overlap] {
         let mut graph = Graph::new(
             schedule,
+            &runtime,
             &dev0,
             &dev1,
             &kernels,
@@ -1202,22 +1268,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut last_overlap = None;
         for sample in 0..config.samples {
             buffers.initialize(&hip, &initial)?;
-            let elapsed = graph.run(&buffers)?;
+            let run = graph.run(&buffers)?;
             buffers.assert_output(&hip, config.layers, &expected, schedule.label())?;
-            let overlap = graph.overlap_report()?;
+            let timeline = graph.timeline_report()?;
             println!(
-                "arm={} sample={} ms={:.6} shared_us={:.3} expert_us={:.3} overlap_us={:.3} overlap_layers={}/{} raw_bits=PASS",
+                "arm={} sample={} ms={:.6} host_enqueue_us={:.3} shared_us={:.3} expert_us={:.3} activation_copy_us={:.3} result_copy_us={:.3} shared_expert_overlap_us={:.3} activation_shared_overlap_us={:.3} overlap_layers={}/{} producer_shared_gap_us={:.3} producer_activation_gap_us={:.3} activation_expert_gap_us={:.3} expert_result_gap_us={:.3} result_join_gap_us={:.3} shared_join_gap_us={:.3} raw_bits=PASS",
                 schedule.label(),
                 sample + 1,
-                elapsed,
-                overlap.shared_us,
-                overlap.expert_us,
-                overlap.overlap_us,
-                overlap.overlap_layers,
+                run.wall_ms,
+                run.host_enqueue_us,
+                timeline.shared_us,
+                timeline.expert_us,
+                timeline.activation_copy_us,
+                timeline.result_copy_us,
+                timeline.shared_expert_overlap_us,
+                timeline.activation_shared_overlap_us,
+                timeline.overlap_layers,
                 config.layers,
+                timeline.producer_to_shared_gap_us,
+                timeline.producer_to_activation_gap_us,
+                timeline.activation_to_expert_gap_us,
+                timeline.expert_to_result_gap_us,
+                timeline.result_to_join_gap_us,
+                timeline.shared_to_join_gap_us,
             );
-            samples.push(elapsed);
-            last_overlap = Some(overlap);
+            samples.push(run.wall_ms);
+            last_overlap = Some(timeline);
         }
         let median = p50(&samples);
         let speedup = host_p50 / median;
@@ -1226,7 +1302,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "arm={} samples={} p50_ms={median:.6} vs_host_speedup={speedup:.6} overlap_us={:.3} overlap_layers={}/{}",
             schedule.label(),
             samples.len(),
-            overlap.overlap_us,
+            overlap.shared_expert_overlap_us,
             overlap.overlap_layers,
             config.layers,
         );

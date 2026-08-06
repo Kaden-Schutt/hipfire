@@ -141,6 +141,55 @@ impl Runtime {
         Ok(frequency)
     }
 
+    /// Enable or disable public ROCr asynchronous-copy profiling globally.
+    ///
+    /// ROCr stores the most recent copy's system-clock timestamps on its
+    /// completion signal. Optional symbol resolution keeps ordinary replay
+    /// usable on runtimes which do not expose this profiling extension.
+    pub fn set_async_copy_profiling(&self, enable: bool) -> Result<(), RuntimeError> {
+        let function = self.inner.symbols.profiling_async_copy_enable.ok_or(
+            RuntimeError::ProfilingUnavailable("hsa_amd_profiling_async_copy_enable"),
+        )?;
+        // SAFETY: `Symbols::load` established the optional function ABI.
+        let status = unsafe { function(enable) };
+        check_status(
+            &self.inner.symbols,
+            "hsa_amd_profiling_async_copy_enable",
+            status,
+        )
+    }
+
+    /// Retrieve the system-clock interval recorded for one completed async
+    /// copy. Profiling must have been enabled before submitting that copy.
+    pub fn async_copy_time(
+        &self,
+        signal: &CompletionSignal,
+    ) -> Result<abi::ProfilingAsyncCopyTime, RuntimeError> {
+        if !Arc::ptr_eq(&self.inner, &signal.runtime) {
+            return Err(RuntimeError::InvalidRuntimeObject(
+                "profiling signal belongs to another HSA runtime",
+            ));
+        }
+        let function = self.inner.symbols.profiling_get_async_copy_time.ok_or(
+            RuntimeError::ProfilingUnavailable("hsa_amd_profiling_get_async_copy_time"),
+        )?;
+        let mut time = abi::ProfilingAsyncCopyTime { start: 0, end: 0 };
+        // SAFETY: the owned completion signal remains live and has completed;
+        // `time` is valid output for the public ROCr call.
+        let status = unsafe { function(signal.raw(), &mut time) };
+        check_status(
+            &self.inner.symbols,
+            "hsa_amd_profiling_get_async_copy_time",
+            status,
+        )?;
+        if time.end < time.start {
+            return Err(RuntimeError::InvalidRuntimeObject(
+                "HSA async-copy profiling timestamp runs backward",
+            ));
+        }
+        Ok(time)
+    }
+
     fn agents(&self) -> Result<Vec<AgentInfo>, RuntimeError> {
         unsafe extern "C" fn collect(agent: abi::Agent, data: *mut c_void) -> abi::Status {
             // SAFETY: `data` points at the live vector below for the synchronous
@@ -2550,6 +2599,7 @@ pub enum RuntimeError {
     ZeroQueues,
     DuplicateQueueId,
     InvalidCuMask(&'static str),
+    ProfilingUnavailable(&'static str),
     InvalidRuntimeObject(&'static str),
     NoKernargPool,
     InvalidKernargAlignment(usize),
@@ -2643,6 +2693,9 @@ impl fmt::Display for RuntimeError {
             Self::ZeroQueues => write!(f, "at least one HSA queue is required"),
             Self::DuplicateQueueId => write!(f, "ROCr returned duplicate IDs for distinct queues"),
             Self::InvalidCuMask(message) => write!(f, "invalid HSA CU mask: {message}"),
+            Self::ProfilingUnavailable(symbol) => {
+                write!(f, "ROCr profiling capability is unavailable: {symbol}")
+            }
             Self::InvalidRuntimeObject(message) => write!(f, "invalid ROCr object: {message}"),
             Self::NoKernargPool => write!(
                 f,
