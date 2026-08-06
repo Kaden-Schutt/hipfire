@@ -538,6 +538,139 @@ impl GpuDevice {
         self.gpu.handle
     }
 
+    /// Return the available SDMA-engine bit mask for copies from `source` to
+    /// this destination agent.
+    pub fn copy_engine_mask(&self, source: &GpuDevice) -> Result<u32, RuntimeError> {
+        self.require_same_runtime(source)?;
+        let mut mask = 0_u32;
+        // SAFETY: both agents belong to this live runtime and `mask` is valid
+        // output for the public ROCr ABI.
+        let status = unsafe {
+            (self.runtime.symbols.memory_copy_engine_status)(
+                self.gpu_agent(),
+                source.gpu_agent(),
+                &mut mask,
+            )
+        };
+        check_status(
+            &self.runtime.symbols,
+            "hsa_amd_memory_copy_engine_status",
+            status,
+        )?;
+        Ok(mask)
+    }
+
+    /// Return ROCr's preferred SDMA-engine mask for copies from `source`.
+    pub fn preferred_copy_engine_mask(&self, source: &GpuDevice) -> Result<u32, RuntimeError> {
+        self.require_same_runtime(source)?;
+        let mut mask = 0_u32;
+        // SAFETY: both agents belong to this live runtime and `mask` is valid
+        // output for the public ROCr ABI.
+        let status = unsafe {
+            (self.runtime.symbols.memory_get_preferred_copy_engine)(
+                self.gpu_agent(),
+                source.gpu_agent(),
+                &mut mask,
+            )
+        };
+        check_status(
+            &self.runtime.symbols,
+            "hsa_amd_memory_get_preferred_copy_engine",
+            status,
+        )?;
+        Ok(mask)
+    }
+
+    /// Submit one public-ROCr asynchronous peer copy.
+    ///
+    /// `engine` is one single-bit engine ID returned by [`Self::copy_engine_mask`].
+    /// `None` leaves engine selection to ROCr. Dependencies and completion are
+    /// persistent HSA signals; the caller must not reset or destroy them while
+    /// the copy is in flight.
+    ///
+    /// # Safety
+    ///
+    /// `dst` and `src` must each name at least `size` accessible bytes owned by
+    /// their corresponding agents, and must remain live until completion.
+    pub unsafe fn memory_async_copy(
+        &self,
+        dst: *mut c_void,
+        source: &GpuDevice,
+        src: *const c_void,
+        size: usize,
+        dependencies: &[&CompletionSignal],
+        completion: &CompletionSignal,
+        engine: Option<u32>,
+    ) -> Result<(), RuntimeError> {
+        self.require_same_runtime(source)?;
+        if !Arc::ptr_eq(&self.runtime, &completion.runtime)
+            || dependencies
+                .iter()
+                .any(|signal| !Arc::ptr_eq(&self.runtime, &signal.runtime))
+        {
+            return Err(RuntimeError::InvalidRuntimeObject(
+                "async-copy signal belongs to another HSA runtime",
+            ));
+        }
+        if dst.is_null() || src.is_null() || size == 0 {
+            return Err(RuntimeError::InvalidRuntimeObject(
+                "async-copy pointers must be non-null and size must be nonzero",
+            ));
+        }
+        let dep_signals = dependencies
+            .iter()
+            .map(|signal| signal.raw())
+            .collect::<Vec<_>>();
+        let dep_count = u32::try_from(dep_signals.len()).map_err(|_| {
+            RuntimeError::InvalidRuntimeObject("async-copy dependency count exceeds u32")
+        })?;
+        let dep_pointer = if dep_signals.is_empty() {
+            ptr::null()
+        } else {
+            dep_signals.as_ptr()
+        };
+        // SAFETY: upheld by this method's contract; all handles are owned by
+        // this runtime and the dependency array lives through the synchronous
+        // submission call.
+        let status = unsafe {
+            match engine {
+                Some(engine) => (self.runtime.symbols.memory_async_copy_on_engine)(
+                    dst,
+                    self.gpu_agent(),
+                    src,
+                    source.gpu_agent(),
+                    size,
+                    dep_count,
+                    dep_pointer,
+                    completion.raw(),
+                    engine,
+                    true,
+                ),
+                None => (self.runtime.symbols.memory_async_copy)(
+                    dst,
+                    self.gpu_agent(),
+                    src,
+                    source.gpu_agent(),
+                    size,
+                    dep_count,
+                    dep_pointer,
+                    completion.raw(),
+                ),
+            }
+        };
+        check_status(&self.runtime.symbols, "hsa_amd_memory_async_copy", status)
+    }
+
+    fn require_same_runtime(&self, other: &GpuDevice) -> Result<(), RuntimeError> {
+        if Arc::ptr_eq(&self.runtime, &other.runtime) {
+            Ok(())
+        } else {
+            Err(RuntimeError::InvalidRuntimeObject(
+                "GPU agents belong to different HSA runtimes",
+            ))
+        }
+    }
+
     pub fn validate_geometry(&self, geometry: LaunchGeometry) -> Result<(), RuntimeError> {
         for axis in 0..3 {
             if geometry.workgroup[axis] > self.gpu.workgroup_max_dim[axis] {
@@ -640,6 +773,14 @@ impl CompletionSignal {
     pub fn is_complete(&self) -> bool {
         // SAFETY: the owned signal remains valid for this load.
         unsafe { (self.runtime.symbols.signal_load_scacquire)(self.raw) < 1 }
+    }
+
+    /// System-scope acquire load of the current signal value. Async-copy
+    /// callers use this to distinguish success (`0`) from a negative ROCr
+    /// asynchronous error indication.
+    pub fn value_scacquire(&self) -> i64 {
+        // SAFETY: the owned signal remains valid for this load.
+        unsafe { (self.runtime.symbols.signal_load_scacquire)(self.raw) }
     }
 
     /// Wait for completion using the default finite host-side bound.

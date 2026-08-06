@@ -181,6 +181,30 @@ pub type MemoryPoolAllocateFn =
 pub type MemoryPoolFreeFn = unsafe extern "C" fn(*mut c_void) -> Status;
 pub type AgentsAllowAccessFn =
     unsafe extern "C" fn(u32, *const Agent, *const u32, *const c_void) -> Status;
+pub type MemoryAsyncCopyFn = unsafe extern "C" fn(
+    *mut c_void,
+    Agent,
+    *const c_void,
+    Agent,
+    usize,
+    u32,
+    *const Signal,
+    Signal,
+) -> Status;
+pub type MemoryAsyncCopyOnEngineFn = unsafe extern "C" fn(
+    *mut c_void,
+    Agent,
+    *const c_void,
+    Agent,
+    usize,
+    u32,
+    *const Signal,
+    Signal,
+    u32,
+    bool,
+) -> Status;
+pub type MemoryCopyEngineStatusFn = unsafe extern "C" fn(Agent, Agent, *mut u32) -> Status;
+pub type MemoryGetPreferredCopyEngineFn = unsafe extern "C" fn(Agent, Agent, *mut u32) -> Status;
 
 pub type CodeObjectReaderCreateFromMemoryFn =
     unsafe extern "C" fn(*const c_void, usize, *mut CodeObjectReader) -> Status;
@@ -234,6 +258,10 @@ pub struct Symbols {
     pub memory_pool_allocate: MemoryPoolAllocateFn,
     pub memory_pool_free: MemoryPoolFreeFn,
     pub agents_allow_access: AgentsAllowAccessFn,
+    pub memory_async_copy: MemoryAsyncCopyFn,
+    pub memory_async_copy_on_engine: MemoryAsyncCopyOnEngineFn,
+    pub memory_copy_engine_status: MemoryCopyEngineStatusFn,
+    pub memory_get_preferred_copy_engine: MemoryGetPreferredCopyEngineFn,
     pub code_object_reader_create_from_memory: CodeObjectReaderCreateFromMemoryFn,
     pub code_object_reader_destroy: CodeObjectReaderDestroyFn,
     pub executable_create_alt: ExecutableCreateAltFn,
@@ -327,6 +355,19 @@ impl Symbols {
             memory_pool_allocate: symbol!("hsa_amd_memory_pool_allocate", MemoryPoolAllocateFn),
             memory_pool_free: symbol!("hsa_amd_memory_pool_free", MemoryPoolFreeFn),
             agents_allow_access: symbol!("hsa_amd_agents_allow_access", AgentsAllowAccessFn),
+            memory_async_copy: symbol!("hsa_amd_memory_async_copy", MemoryAsyncCopyFn),
+            memory_async_copy_on_engine: symbol!(
+                "hsa_amd_memory_async_copy_on_engine",
+                MemoryAsyncCopyOnEngineFn
+            ),
+            memory_copy_engine_status: symbol!(
+                "hsa_amd_memory_copy_engine_status",
+                MemoryCopyEngineStatusFn
+            ),
+            memory_get_preferred_copy_engine: symbol!(
+                "hsa_amd_memory_get_preferred_copy_engine",
+                MemoryGetPreferredCopyEngineFn
+            ),
             code_object_reader_create_from_memory: symbol!(
                 "hsa_code_object_reader_create_from_memory",
                 CodeObjectReaderCreateFromMemoryFn

@@ -9,3 +9,6 @@ description = "Safe Rust FFI to AMD HIP/HSA runtime via dlopen"
 hipfire-config = { path = "../hipfire-config" }
 libloading.workspace = true
 thiserror = "2"
+
+[dev-dependencies]
+redline-rocr = { path = "../redline-rocr" }

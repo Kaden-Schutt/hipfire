@@ -24,8 +24,9 @@ use hip_bridge::{
     DeviceBuffer, Event, HipError, HipResult, HipRuntime, RcclComms, RcclDataType, Stream,
     HIP_EVENT_DISABLE_TIMING, HIP_EVENT_RELEASE_TO_SYSTEM,
 };
-use std::cell::Cell;
-use std::time::Instant;
+use redline_rocr::{CompletionSignal, GpuDevice, GpuSelector, Runtime};
+use std::cell::{Cell, RefCell};
+use std::time::{Duration, Instant};
 
 const HIDDEN: usize = 4096;
 const F32_BYTES: usize = 4;
@@ -38,6 +39,8 @@ enum SyncMode {
     Event,
     Host,
     Rccl,
+    Rocr,
+    RocrSdma,
     Signal,
 }
 
@@ -47,9 +50,11 @@ impl SyncMode {
             "event" => Ok(Self::Event),
             "host" => Ok(Self::Host),
             "rccl" => Ok(Self::Rccl),
+            "rocr" => Ok(Self::Rocr),
+            "rocr-sdma" => Ok(Self::RocrSdma),
             "signal" => Ok(Self::Signal),
             _ => Err(format!(
-                "unsupported --sync value {raw:?}; use event, signal, rccl, or host"
+                "unsupported --sync value {raw:?}; use event, signal, rccl, rocr, rocr-sdma, or host"
             )),
         }
     }
@@ -59,8 +64,14 @@ impl SyncMode {
             Self::Event => "system_scope_event",
             Self::Host => "host_stream_sync",
             Self::Rccl => "rccl_grouped_p2p",
+            Self::Rocr => "rocr_async_copy_auto",
+            Self::RocrSdma => "rocr_async_copy_sdma",
             Self::Signal => "signal_memory",
         }
+    }
+
+    fn is_rocr(self) -> bool {
+        matches!(self, Self::Rocr | Self::RocrSdma)
     }
 }
 
@@ -170,7 +181,7 @@ fn print_help() {
            --chain-samples N      43-layer chain samples per size (default 50)\n\
            --exactness-samples N  post-timing exactness stress samples (default 10)\n\
            --exactness-seed-base N first unique stress payload seed (default 0)\n\
-           --sync MODE            signal (default), event, rccl, or host (control)\n\
+           --sync MODE            signal (default), event, rccl, rocr, rocr-sdma, or host\n\
            --layers N             round-trip dependency count (default 43)\n\
            --batches CSV          batch rows for [B,4096] F32 (default 1,16,128,512,1024)\n\
            --expect-arch0 ARCH    fail unless logical device 0 matches\n\
@@ -301,12 +312,223 @@ struct Chain<'a> {
     events_to1: &'a [Event],
     events_to0: &'a [Event],
     rccl: Option<&'a RcclComms>,
+    rocr: Option<&'a RocrChannel>,
     dev0_a: &'a DeviceBuffer,
     dev0_b: &'a DeviceBuffer,
     dev1: &'a DeviceBuffer,
     layers: usize,
     next_epoch: Cell<u32>,
     sync: SyncMode,
+}
+
+struct RocrChannel {
+    dev0: GpuDevice,
+    dev1: GpuDevice,
+    completions: RefCell<Vec<CompletionSignal>>,
+    engine_0_to_1: Option<u32>,
+    engine_1_to_0: Option<u32>,
+    mask_0_to_1: u32,
+    mask_1_to_0: u32,
+    preferred_0_to_1: u32,
+    preferred_1_to_0: u32,
+}
+
+impl RocrChannel {
+    fn new(layers: usize, explicit_sdma: bool) -> Result<Self, Box<dyn std::error::Error>> {
+        let runtime = Runtime::initialize(redline_rocr::load_symbols()?)?;
+        let dev0 = runtime.select_gpu(GpuSelector::NameContains("gfx1100"))?;
+        let dev1 = runtime.select_gpu(GpuSelector::NameContains("gfx1151"))?;
+        let mask_0_to_1 = dev1.copy_engine_mask(&dev0)?;
+        let mask_1_to_0 = dev0.copy_engine_mask(&dev1)?;
+        let preferred_0_to_1 = dev1.preferred_copy_engine_mask(&dev0)?;
+        let preferred_1_to_0 = dev0.preferred_copy_engine_mask(&dev1)?;
+        let choose = |available: u32, preferred: u32| -> Result<u32, String> {
+            let candidates = available & preferred;
+            let candidates = if candidates != 0 {
+                candidates
+            } else {
+                available
+            };
+            if candidates == 0 {
+                Err("ROCr reported no available SDMA copy engine".to_string())
+            } else {
+                Ok(1_u32 << candidates.trailing_zeros())
+            }
+        };
+        let engine_0_to_1 = explicit_sdma
+            .then(|| choose(mask_0_to_1, preferred_0_to_1))
+            .transpose()?;
+        let engine_1_to_0 = explicit_sdma
+            .then(|| choose(mask_1_to_0, preferred_1_to_0))
+            .transpose()?;
+        let mut completions = Vec::with_capacity(layers * 2);
+        for index in 0..layers * 2 {
+            let owner = if index % 2 == 0 { &dev1 } else { &dev0 };
+            completions.push(CompletionSignal::new(owner)?);
+        }
+        Ok(Self {
+            dev0,
+            dev1,
+            completions: RefCell::new(completions),
+            engine_0_to_1,
+            engine_1_to_0,
+            mask_0_to_1,
+            mask_1_to_0,
+            preferred_0_to_1,
+            preferred_1_to_0,
+        })
+    }
+
+    fn identity(&self) -> String {
+        format!(
+            "rocr_dev0={} rocr_pci0={} rocr_dev1={} rocr_pci1={} \
+             engine_mask_0_to_1={:#x} engine_mask_1_to_0={:#x} \
+             preferred_0_to_1={:#x} preferred_1_to_0={:#x} \
+             selected_0_to_1={:?} selected_1_to_0={:?}",
+            self.dev0.name(),
+            self.dev0.pci_bus_id(),
+            self.dev1.name(),
+            self.dev1.pci_bus_id(),
+            self.mask_0_to_1,
+            self.mask_1_to_0,
+            self.preferred_0_to_1,
+            self.preferred_1_to_0,
+            self.engine_0_to_1,
+            self.engine_1_to_0,
+        )
+    }
+
+    fn one_way(
+        &self,
+        direction_0_to_1: bool,
+        dst: &DeviceBuffer,
+        src: &DeviceBuffer,
+        size: usize,
+    ) -> HipResult<f64> {
+        let mut completions = self.completions.borrow_mut();
+        let completion = &mut completions[0];
+        completion.reset();
+        let started = Instant::now();
+        let result = if direction_0_to_1 {
+            // SAFETY: HIP buffers are live peer-accessible allocations owned
+            // by the matching HSA agents for the duration of this call.
+            unsafe {
+                self.dev1.memory_async_copy(
+                    dst.as_ptr(),
+                    &self.dev0,
+                    src.as_ptr(),
+                    size,
+                    &[],
+                    completion,
+                    self.engine_0_to_1,
+                )
+            }
+        } else {
+            // SAFETY: same invariant, reversed direction.
+            unsafe {
+                self.dev0.memory_async_copy(
+                    dst.as_ptr(),
+                    &self.dev1,
+                    src.as_ptr(),
+                    size,
+                    &[],
+                    completion,
+                    self.engine_1_to_0,
+                )
+            }
+        };
+        result.map_err(rocr_as_hip)?;
+        completion
+            .wait_timeout(Duration::from_secs(30))
+            .map_err(rocr_as_hip)?;
+        check_rocr_completion(completion)?;
+        Ok(started.elapsed().as_secs_f64() * 1000.0)
+    }
+
+    fn chain(
+        &self,
+        dev0_a: &DeviceBuffer,
+        dev0_b: &DeviceBuffer,
+        dev1: &DeviceBuffer,
+        layers: usize,
+        size: usize,
+    ) -> HipResult<f64> {
+        let mut completions = self.completions.borrow_mut();
+        for signal in completions.iter_mut().take(layers * 2) {
+            signal.reset();
+        }
+        let started = Instant::now();
+        for copy in 0..layers * 2 {
+            let layer = copy / 2;
+            let (src0, dst0) = if layer % 2 == 0 {
+                (dev0_a, dev0_b)
+            } else {
+                (dev0_b, dev0_a)
+            };
+            let deps: Vec<&CompletionSignal> = if copy == 0 {
+                Vec::new()
+            } else {
+                vec![&completions[copy - 1]]
+            };
+            let completion = &completions[copy];
+            let result = if copy % 2 == 0 {
+                // SAFETY: live peer-accessible HIP allocations are associated
+                // with the matching agents; dependency signals remain live.
+                unsafe {
+                    self.dev1.memory_async_copy(
+                        dev1.as_ptr(),
+                        &self.dev0,
+                        src0.as_ptr(),
+                        size,
+                        &deps,
+                        completion,
+                        self.engine_0_to_1,
+                    )
+                }
+            } else {
+                // SAFETY: same invariant, reversed direction.
+                unsafe {
+                    self.dev0.memory_async_copy(
+                        dst0.as_ptr(),
+                        &self.dev1,
+                        dev1.as_ptr(),
+                        size,
+                        &deps,
+                        completion,
+                        self.engine_1_to_0,
+                    )
+                }
+            };
+            result.map_err(rocr_as_hip)?;
+        }
+        let terminal = &completions[layers * 2 - 1];
+        terminal
+            .wait_timeout(Duration::from_secs(30))
+            .map_err(rocr_as_hip)?;
+        for completion in completions.iter().take(layers * 2) {
+            check_rocr_completion(completion)?;
+        }
+        Ok(started.elapsed().as_secs_f64() * 1000.0)
+    }
+}
+
+fn check_rocr_completion(signal: &CompletionSignal) -> HipResult<()> {
+    let value = signal.value_scacquire();
+    if value == 0 {
+        Ok(())
+    } else {
+        Err(HipError {
+            code: 1,
+            message: format!("ROCr async-copy completion signal ended at {value}, expected 0"),
+        })
+    }
+}
+
+fn rocr_as_hip(error: redline_rocr::RuntimeError) -> HipError {
+    HipError {
+        code: 1,
+        message: error.to_string(),
+    }
 }
 
 fn chain_sample(
@@ -325,6 +547,18 @@ fn chain_sample(
         .expect("peer-chain signal epoch overflow");
     hip.set_device(0)?;
     let host_start = Instant::now();
+
+    if chain.sync.is_rocr() {
+        if !copy_payload {
+            return Err(HipError {
+                code: 1,
+                message: "ROCr has no payload-free async-copy chain control".to_string(),
+            });
+        }
+        let rocr = chain.rocr.expect("ROCr mode requires channel");
+        let wall_ms = rocr.chain(chain.dev0_a, chain.dev0_b, chain.dev1, chain.layers, size)?;
+        return Ok((wall_ms, wall_ms));
+    }
     hip.event_record(chain.start0, Some(chain.stream0))?;
 
     if chain.sync == SyncMode::Rccl {
@@ -444,6 +678,9 @@ fn chain_sample(
                 hip.stream_synchronize(chain.stream1)?;
             }
             SyncMode::Rccl => unreachable!("RCCL chain is handled as one persistent group"),
+            SyncMode::Rocr | SyncMode::RocrSdma => {
+                unreachable!("ROCr chain is handled before HIP stream setup")
+            }
             SyncMode::Signal => {
                 let signal_to1 = chain.signal_to1.expect("signal mode requires to1 memory");
                 let signal_to0 = chain.signal_to0.expect("signal mode requires to0 memory");
@@ -552,6 +789,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
     let rccl_version = rccl.as_ref().map(RcclComms::version).transpose()?;
+    let rocr = if cfg.sync.is_rocr() {
+        Some(RocrChannel::new(
+            cfg.layers,
+            cfg.sync == SyncMode::RocrSdma,
+        )?)
+    } else {
+        None
+    };
 
     let max_batch = *cfg.batches.iter().max().unwrap();
     let max_bytes = max_batch
@@ -573,6 +818,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         cfg.exactness_samples,
         cfg.exactness_seed_base
     );
+    if let Some(rocr) = &rocr {
+        println!("{}", rocr.identity());
+    }
 
     hip.set_device(0)?;
     let dev0_a = hip.malloc(max_bytes)?;
@@ -663,6 +911,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         events_to1: &events_to1,
         events_to0: &events_to0,
         rccl: rccl.as_ref(),
+        rocr: rocr.as_ref(),
         dev0_a: &dev0_a,
         dev0_b: &dev0_b,
         dev1: &dev1_a,
@@ -686,9 +935,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         hip.device_synchronize()?;
 
         // Directional correctness before warm/timed samples.
-        one_way_sample(&hip, &direction_0_to_1, size)?;
+        if let Some(rocr) = &rocr {
+            rocr.one_way(true, &dev1_a, &dev0_a, size)?;
+        } else {
+            one_way_sample(&hip, &direction_0_to_1, size)?;
+        }
         assert_bytes(&hip, 1, &dev1_a, &expected_0, "0->1")?;
-        one_way_sample(&hip, &direction_1_to_0, size)?;
+        if let Some(rocr) = &rocr {
+            rocr.one_way(false, &dev0_b, &dev1_b, size)?;
+        } else {
+            one_way_sample(&hip, &direction_1_to_0, size)?;
+        }
         assert_bytes(&hip, 0, &dev0_b, &expected_1, "1->0")?;
 
         // Chain correctness starts with one patterned and two zeroed buffers;
@@ -703,9 +960,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         assert_bytes(&hip, 0, final_dev0, &expected_0, "round-trip chain")?;
 
         for _ in 0..cfg.warmups {
-            one_way_sample(&hip, &direction_0_to_1, size)?;
-            one_way_sample(&hip, &direction_1_to_0, size)?;
-            chain_sample(&hip, &chain, size, false)?;
+            if let Some(rocr) = &rocr {
+                rocr.one_way(true, &dev1_a, &dev0_a, size)?;
+                rocr.one_way(false, &dev0_b, &dev1_b, size)?;
+            } else {
+                one_way_sample(&hip, &direction_0_to_1, size)?;
+                one_way_sample(&hip, &direction_1_to_0, size)?;
+                chain_sample(&hip, &chain, size, false)?;
+            }
             chain_sample(&hip, &chain, size, true)?;
         }
 
@@ -714,10 +976,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut gpu_1_to_0 = Vec::with_capacity(cfg.one_way_samples);
         let mut host_1_to_0 = Vec::with_capacity(cfg.one_way_samples);
         for _ in 0..cfg.one_way_samples {
-            let (gpu_ms, host_ms) = one_way_sample(&hip, &direction_0_to_1, size)?;
+            let (gpu_ms, host_ms) = if let Some(rocr) = &rocr {
+                let wall_ms = rocr.one_way(true, &dev1_a, &dev0_a, size)?;
+                (wall_ms, wall_ms)
+            } else {
+                one_way_sample(&hip, &direction_0_to_1, size)?
+            };
             gpu_0_to_1.push(gpu_ms);
             host_0_to_1.push(host_ms);
-            let (gpu_ms, host_ms) = one_way_sample(&hip, &direction_1_to_0, size)?;
+            let (gpu_ms, host_ms) = if let Some(rocr) = &rocr {
+                let wall_ms = rocr.one_way(false, &dev0_b, &dev1_b, size)?;
+                (wall_ms, wall_ms)
+            } else {
+                one_way_sample(&hip, &direction_1_to_0, size)?
+            };
             gpu_1_to_0.push(gpu_ms);
             host_1_to_0.push(host_ms);
         }
@@ -745,27 +1017,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut chain_gpu = Vec::with_capacity(cfg.chain_samples);
         let mut chain_host = Vec::with_capacity(cfg.chain_samples);
         for _ in 0..cfg.chain_samples {
-            let (gpu_ms, host_ms) = chain_sample(&hip, &chain, size, false)?;
-            event_gpu.push(gpu_ms);
-            event_host.push(host_ms);
+            if !cfg.sync.is_rocr() {
+                let (gpu_ms, host_ms) = chain_sample(&hip, &chain, size, false)?;
+                event_gpu.push(gpu_ms);
+                event_host.push(host_ms);
+            }
             let (gpu_ms, host_ms) = chain_sample(&hip, &chain, size, true)?;
             chain_gpu.push(gpu_ms);
             chain_host.push(host_ms);
         }
-        print_row(
-            match cfg.sync {
-                SyncMode::Event => "event_chain",
-                SyncMode::Host => "host_sync_chain",
-                SyncMode::Rccl => "rccl_grouped_chain",
-                SyncMode::Signal => "signal_chain",
-            },
-            "round_trip",
-            batch,
-            0,
-            cfg.layers * 2,
-            Distribution::from_ms(&event_gpu),
-            Distribution::from_ms(&event_host),
-        );
+        if !cfg.sync.is_rocr() {
+            print_row(
+                match cfg.sync {
+                    SyncMode::Event => "event_chain",
+                    SyncMode::Host => "host_sync_chain",
+                    SyncMode::Rccl => "rccl_grouped_chain",
+                    SyncMode::Rocr | SyncMode::RocrSdma => unreachable!(),
+                    SyncMode::Signal => "signal_chain",
+                },
+                "round_trip",
+                batch,
+                0,
+                cfg.layers * 2,
+                Distribution::from_ms(&event_gpu),
+                Distribution::from_ms(&event_host),
+            );
+        }
         print_row(
             "copy_chain",
             "round_trip",

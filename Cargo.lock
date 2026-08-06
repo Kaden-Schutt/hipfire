@@ -748,6 +748,7 @@ version = "0.3.0"
 dependencies = [
  "hipfire-config",
  "libloading",
+ "redline-rocr",
  "thiserror 2.0.18",
 ]
 
