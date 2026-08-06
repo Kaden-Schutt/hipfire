@@ -118,6 +118,10 @@ pub const HIP_MEM_ALLOCATION_TYPE_PINNED: u32 = 1;
 pub const HIP_MEM_ACCESS_FLAGS_PROT_READ_WRITE: u32 = 3;
 pub const HIP_MEM_ALLOCATION_GRANULARITY_MINIMUM: u32 = 0;
 pub const HIP_MEM_ALLOCATION_GRANULARITY_RECOMMENDED: u32 = 1;
+/// Dependency event: omit profiling state and retain the default system fence.
+pub const HIP_EVENT_DISABLE_TIMING: u32 = 0x2;
+/// Request an explicit system-scope release when recording an event.
+pub const HIP_EVENT_RELEASE_TO_SYSTEM: u32 = 0x8000_0000;
 
 /// `hipPointerAttribute_t` per ROCm 6.4.3 layout. ROCm 5.x not supported.
 #[repr(C)]
@@ -291,6 +295,7 @@ pub struct HipRuntime {
 
     // Events
     fn_event_create: unsafe extern "C" fn(*mut HipEvent) -> u32,
+    fn_event_create_with_flags: unsafe extern "C" fn(*mut HipEvent, c_uint) -> u32,
     fn_event_record: unsafe extern "C" fn(HipEvent, HipStream) -> u32,
     fn_event_synchronize: unsafe extern "C" fn(HipEvent) -> u32,
     fn_event_elapsed_time: unsafe extern "C" fn(*mut f32, HipEvent, HipEvent) -> u32,
@@ -590,6 +595,11 @@ impl HipRuntime {
                     lib,
                     "hipEventCreate",
                     unsafe extern "C" fn(*mut HipEvent) -> u32
+                ),
+                fn_event_create_with_flags: load_fn!(
+                    lib,
+                    "hipEventCreateWithFlags",
+                    unsafe extern "C" fn(*mut HipEvent, c_uint) -> u32
                 ),
                 fn_event_record: load_fn!(
                     lib,
@@ -1437,6 +1447,18 @@ impl HipRuntime {
         let mut event: HipEvent = ptr::null_mut();
         let code = unsafe { (self.fn_event_create)(&mut event) };
         self.check(code, "hipEventCreate")?;
+        Ok(Event(event))
+    }
+
+    /// Create an event with HIP runtime flags.
+    ///
+    /// Dependency events should normally use [`HIP_EVENT_DISABLE_TIMING`]
+    /// without `hipEventDisableSystemFence`. Cross-device producers may add
+    /// [`HIP_EVENT_RELEASE_TO_SYSTEM`] to make the release scope explicit.
+    pub fn event_create_with_flags(&self, flags: u32) -> HipResult<Event> {
+        let mut event: HipEvent = ptr::null_mut();
+        let code = unsafe { (self.fn_event_create_with_flags)(&mut event, flags) };
+        self.check(code, "hipEventCreateWithFlags")?;
         Ok(Event(event))
     }
 

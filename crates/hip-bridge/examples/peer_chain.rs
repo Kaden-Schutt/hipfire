@@ -20,7 +20,10 @@
 //!   --expect-arch0 gfx1100 --expect-arch1 gfx1151
 //! ```
 
-use hip_bridge::{DeviceBuffer, Event, HipResult, HipRuntime, Stream};
+use hip_bridge::{
+    DeviceBuffer, Event, HipResult, HipRuntime, Stream, HIP_EVENT_DISABLE_TIMING,
+    HIP_EVENT_RELEASE_TO_SYSTEM,
+};
 use std::cell::Cell;
 use std::time::Instant;
 
@@ -32,6 +35,7 @@ const DEFAULT_BATCHES: &[usize] = &[1, 16, 128, 512, 1024];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SyncMode {
+    Event,
     Host,
     Signal,
 }
@@ -39,16 +43,18 @@ enum SyncMode {
 impl SyncMode {
     fn parse(raw: &str) -> Result<Self, String> {
         match raw {
+            "event" => Ok(Self::Event),
             "host" => Ok(Self::Host),
             "signal" => Ok(Self::Signal),
             _ => Err(format!(
-                "unsupported --sync value {raw:?}; use host or signal"
+                "unsupported --sync value {raw:?}; use event, signal, or host"
             )),
         }
     }
 
     fn label(self) -> &'static str {
         match self {
+            Self::Event => "system_scope_event",
             Self::Host => "host_stream_sync",
             Self::Signal => "signal_memory",
         }
@@ -150,7 +156,7 @@ fn print_help() {
            --one-way-samples N    samples per direction and size (default 100)\n\
            --chain-samples N      43-layer chain samples per size (default 50)\n\
            --exactness-samples N  post-timing exactness stress samples (default 10)\n\
-           --sync MODE            signal (default) or host (control)\n\
+           --sync MODE            signal (default), event, or host (control)\n\
            --layers N             round-trip dependency count (default 43)\n\
            --batches CSV          batch rows for [B,4096] F32 (default 1,16,128,512,1024)\n\
            --expect-arch0 ARCH    fail unless logical device 0 matches\n\
@@ -269,6 +275,8 @@ struct Chain<'a> {
     stop0: &'a Event,
     signal_to1: Option<&'a DeviceBuffer>,
     signal_to0: Option<&'a DeviceBuffer>,
+    events_to1: &'a [Event],
+    events_to0: &'a [Event],
     dev0_a: &'a DeviceBuffer,
     dev0_b: &'a DeviceBuffer,
     dev1: &'a DeviceBuffer,
@@ -304,6 +312,25 @@ fn chain_sample(
         };
 
         match chain.sync {
+            SyncMode::Event => {
+                let to1 = &chain.events_to1[layer];
+                let to0 = &chain.events_to0[layer];
+                hip.set_device(0)?;
+                if copy_payload {
+                    hip.memcpy_peer_async(chain.dev1, 1, src0, 0, size, chain.stream0)?;
+                }
+                hip.event_record(to1, Some(chain.stream0))?;
+
+                hip.set_device(1)?;
+                hip.stream_wait_event(chain.stream1, to1)?;
+                if copy_payload {
+                    hip.memcpy_peer_async(dst0, 0, chain.dev1, 1, size, chain.stream1)?;
+                }
+                hip.event_record(to0, Some(chain.stream1))?;
+
+                hip.set_device(0)?;
+                hip.stream_wait_event(chain.stream0, to0)?;
+            }
             SyncMode::Host => {
                 hip.set_device(0)?;
                 if copy_payload {
@@ -465,10 +492,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let one_stop0 = hip.event_create()?;
     let chain_start0 = hip.event_create()?;
     let chain_stop0 = hip.event_create()?;
+    let mut events_to1 = Vec::new();
+    if cfg.sync == SyncMode::Event {
+        events_to1.reserve(cfg.layers);
+        for _ in 0..cfg.layers {
+            events_to1.push(
+                hip.event_create_with_flags(
+                    HIP_EVENT_DISABLE_TIMING | HIP_EVENT_RELEASE_TO_SYSTEM,
+                )?,
+            );
+        }
+    }
 
     hip.set_device(1)?;
     let one_start1 = hip.event_create()?;
     let one_stop1 = hip.event_create()?;
+    let mut events_to0 = Vec::new();
+    if cfg.sync == SyncMode::Event {
+        events_to0.reserve(cfg.layers);
+        for _ in 0..cfg.layers {
+            events_to0.push(
+                hip.event_create_with_flags(
+                    HIP_EVENT_DISABLE_TIMING | HIP_EVENT_RELEASE_TO_SYSTEM,
+                )?,
+            );
+        }
+    }
 
     let direction_0_to_1 = Direction {
         src_device: 0,
@@ -495,6 +544,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         stop0: &chain_stop0,
         signal_to1: signal_to1.as_ref(),
         signal_to0: signal_to0.as_ref(),
+        events_to1: &events_to1,
+        events_to0: &events_to0,
         dev0_a: &dev0_a,
         dev0_b: &dev0_b,
         dev1: &dev1_a,
@@ -586,6 +637,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         print_row(
             match cfg.sync {
+                SyncMode::Event => "event_chain",
                 SyncMode::Host => "host_sync_chain",
                 SyncMode::Signal => "signal_chain",
             },
@@ -636,6 +688,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     hip.event_destroy(chain_stop0)?;
     hip.event_destroy(one_start0)?;
     hip.event_destroy(one_stop0)?;
+    for event in events_to1 {
+        hip.event_destroy(event)?;
+    }
     hip.stream_destroy(stream0)?;
     hip.free(dev0_a)?;
     hip.free(dev0_b)?;
@@ -646,6 +701,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     hip.set_device(1)?;
     hip.event_destroy(one_start1)?;
     hip.event_destroy(one_stop1)?;
+    for event in events_to0 {
+        hip.event_destroy(event)?;
+    }
     hip.stream_destroy(stream1)?;
     hip.free(dev1_a)?;
     hip.free(dev1_b)?;
