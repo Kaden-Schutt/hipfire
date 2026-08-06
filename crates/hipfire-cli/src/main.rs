@@ -53,6 +53,8 @@ const MODEL_SUFFIXES: &[&str] = &[
     ".hfq",
     ".mq2",
     ".mq2lloyd",
+    ".mq2r",
+    ".mq2rxt",
     ".mq3",
     ".mq3p",
     ".mq4",
@@ -8472,6 +8474,8 @@ mod tests {
     fn model_suffix_filter_covers_current_formats() {
         assert!(is_model_file("qwen3.6-35b-a3b.mq4r"));
         assert!(is_model_file("deepseek.mq2lloyd"));
+        assert!(is_model_file("deepseek-v4-flash-0731.mq2r"));
+        assert!(is_model_file("deepseek-v4-flash-0731.mq2rxt"));
         assert!(is_model_file("draft.hfq"));
         assert!(!is_model_file("model.triattn.bin"));
         assert!(!is_model_file("README.md"));
