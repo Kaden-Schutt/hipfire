@@ -160,6 +160,14 @@ unaffected**, so `mq2rxt` does not inherit it.
   *attention* (−4.6% KLD for −7.5% speed), ~10× more valuable there.
 - **Byte/traffic models as speed predictors.** Mispredicted in *both*
   directions across the session.
+- **Two-queue phased PM4 with AQL cross-queue barriers (gfx1201).** Now tested
+  *fairly* — full 692/692 coverage, 130 provable independent boundaries, 260
+  parallel launches available — and it loses at **every** width: −0.5% at one
+  parallel phase, −2.3% at 8, −9.4% at 40, **−25.8% unfiltered**. Cost is linear
+  at ≈0.40 tok/s per cross-queue barrier and already net-negative at a single
+  phase, so no filter setting rescues it. Size-based selection is worse than
+  count-based at equal phase count. See § "The ceiling" for the full curve.
+  Barrier-free independent-IB overlap is a different lever and is untested here.
 
 ---
 
@@ -274,17 +282,54 @@ RADV overlapping independent dispatches (1.29× real, 3.6× on independent sets)
 where ROCm hipGraph does not (0.77×). Two-queue was tried on 2026-07-11 and
 lost, but that predates dependency-derived waits.
 
-**Precondition now met (`75fe90fbb`).** The shared-expert vs routed-gate_up pair
-the audit calls disjoint was *never actually proven* on mq2r — the codebook side
-was unregistered, so 40 boundaries per token (one per layer) fail-closed. mq2r
-now reports `covered=692/692, resource_independent=130`, so `pm4_phase_plan()`
-has real antichain width for the first time; before, 160 unmodelled boundaries
-capped it. `HIPFIRE_REPLAY_PM4_QUEUES=2` is therefore worth its first honest
-attempt on **mq2r specifically** — note `CERTIFIED_PM4_POLICY`
-(`tools/redline/product_bench.py:75`) hardcodes `QUEUES=1` for both SKUs with no
-CLI override, so per-SKU routing wants the registry entry mq2r needs anyway.
-Measure with **both arm orders**: a systematic slot bias of ±0.71% was measured
-on mq4r, large enough to invert a sub-1% verdict on its own.
+**Precondition met, then SETTLED NEGATIVE (`75fe90fbb`, `ed1f74ccf`).** The
+shared-expert vs routed-gate_up pair the audit calls disjoint was *never actually
+proven* on mq2r — the codebook side was unregistered, so 40 boundaries per token
+(one per layer) fail-closed. After registration mq2r reports
+`covered=692/692, resource_independent=130`, and `pm4_phase_plan()` finds
+**221 phases, 130 parallel phases, 260 parallel launches, max_width=7** where
+before it had 160 unmodelled boundaries capping it. So two-queue finally got a
+fair test — the first one ever, since 2026-07-11 predates dependency-derived waits.
+
+It was measurable only after `ed1f74ccf`: `pm4_packet_identity()` returned `Some(1)`
+solely for `queue_count==1 && phase_count==1`, so every phased row serialized
+`packets: null` and the product route proof rejected it with `row 0: packet
+identity unavailable`. That was pure observability — queue count, phase count and
+command dwords were already correct.
+
+**Result: no configuration beats single-queue.** Same binary, mq2r, gfx1201:
+
+| parallel phases | config | PM4 tok/s | vs Q1 |
+|---:|---|---:|---:|
+| 0 | Q1 control | **205.0** | — |
+| 1 | `MAX_PARALLEL_PHASES=1` | 203.9 | −0.5% |
+| 4 | `MAX_PARALLEL_PHASES=4` | 202.9 | −1.0% |
+| 8 | `MAX_PARALLEL_PHASES=8` | 199.5 | −2.3% |
+| 24 | `MAX_PARALLEL_PHASES=24` | 193.2 | −5.8% |
+| 40 | `MAX_PARALLEL_PHASES=40` | 185.7 | −9.4% |
+| 40 | `MIN_PARALLEL_WORKGROUPS=64/256/1024` | 180.6 / 181.5 / 180.6 | −11.9% |
+| 130 | unfiltered | 152.1 | −25.8% |
+
+**Cost is linear in cross-queue barrier count at ≈0.40 tok/s per parallel phase**
+((203.9−152.1)/129), and it is **already net-negative at a single parallel phase**.
+One AQL cross-queue barrier costs more than the overlap of the best available pair.
+Selecting phases by *size* (`MIN_PARALLEL_WORKGROUPS`) is worse than by *count* at
+equal phase count (180.6 vs 185.7 at 40) — the fat phases are the big GEMVs, whose
+barrier stalls deepest. `sync=aql` is forced here: gfx12 rejects native PM4
+semaphores, which exist only for legacy gfx10/11.
+
+**What would still be on the table:** barrier-*free* overlap. Upstream
+`warpfront/redline` measured Q2 at 82.5% of Vulkan on gfx1201 for
+**independent_throughput** using `MultiQueuePm4Ib` (independent IBs, no cross-lane
+barriers), and q4 negative. Our AR tape needs fan-in at every phase boundary, so it
+cannot use that model without a dependency structure that does not exist per-token.
+Do not re-run the AQL-barrier variant expecting a different answer; it now has a
+cost curve, not just a verdict.
+
+Note `CERTIFIED_PM4_POLICY` (`tools/redline/product_bench.py:75`) hardcodes
+`QUEUES=1` for both SKUs with no CLI override, so any future per-SKU routing wants
+the registry entry mq2r needs anyway. Measure with **both arm orders**: a systematic
+slot bias of ±0.71% was measured on mq4r, large enough to invert a sub-1% verdict.
 
 ---
 
