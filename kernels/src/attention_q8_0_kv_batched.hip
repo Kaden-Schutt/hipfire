@@ -3,6 +3,7 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 #include <hip/hip_runtime.h>
+#include <assert.h>
 #include "kv_slot_desc.h"
 
 // Batched causal attention with Q8_0 quantized KV cache. Counterpart of
@@ -83,9 +84,26 @@ extern "C" __global__ void attention_q8_0_kv_batched(
         ? slot_descs[slot]
         : kv_slot_legacy(seq_len, max_seq);
     const int per_pos_bytes = n_kv_heads * (head_dim / 32) * 34;
-    // The slot's own length is authoritative for loop bounds when a
-    // descriptor is present; legacy mode keeps the original seq_len.
-    const int eff_seq_len = (slot_descs != nullptr) ? desc.seq_len : seq_len;
+    // `positions[row] + 1` (== `seq_len` above) is the PER-ROW CAUSAL BOUND;
+    // `desc.seq_len` is the SLOT's logical KV length (allocation/capacity
+    // metadata). They coincide only when a slot has exactly one query row —
+    // a slot verifying M>1 draft tokens has rows at different positions that
+    // must not all share one bound. `desc` supplies the K/V slab BASE
+    // ADDRESS (via kv_offset_for_k/v below); it must never override the
+    // row's own causal bound. See kv_slot_desc.h and
+    // attention_flash_q8_0_tile_batched.hip for the full analysis (this
+    // kernel has no separate reduce pass, so a wrong eff_seq_len here would
+    // read live neighbor-slot KV bytes into softmax rather than fold in an
+    // unwritten partial — a different corruption mode, same root cause).
+    const int eff_seq_len = seq_len;
+
+    // Sanity invariant, not a correctness mechanism: a row may never attend
+    // past its own slot's logical KV length.
+#ifdef NDEBUG
+    if (slot_descs != nullptr) __builtin_assume(seq_len <= desc.seq_len);
+#else
+    if (slot_descs != nullptr) assert(seq_len <= desc.seq_len);
+#endif
 
     extern __shared__ float sdata[];
 

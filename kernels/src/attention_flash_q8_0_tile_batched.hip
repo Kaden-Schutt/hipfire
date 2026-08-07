@@ -19,6 +19,7 @@
 //
 // Grid: [n_heads, max_tiles, sub_batch_size]. Block: [32, 1, 1].
 #include <hip/hip_runtime.h>
+#include <assert.h>
 #include "kv_slot_desc.h"
 
 static __device__ __forceinline__ unsigned int q8_tile_load_u32(
@@ -93,23 +94,32 @@ __global__ void attention_flash_q8_0_tile_batched(
         ? slot_descs[slot]
         : kv_slot_legacy(seq_len, max_seq);
     const int per_pos_bytes = n_kv_heads * (head_dim / 32) * 34;
-    // The slot's own length is authoritative for loop/tile bounds when a
-    // descriptor is present; legacy mode keeps the original seq_len (and is
-    // therefore numerically identical to the pre-SP1 kernel). Unlike the LDS
-    // kernel (Task 4), this kernel's `scores[]` LDS is sized tile_size (a
-    // compile-time-fixed 128 floats) and `partials` addressing is driven by
-    // tile_id/max_tiles (grid shape), not by seq_len — so an oversized
-    // eff_seq_len cannot overrun scratch. The failure mode instead is
-    // truncation: grid.y is fixed at max_tiles = ceil(max_ctx_len/TILE_SIZE)
-    // by the launcher, so if a descriptor ever reported eff_seq_len >
-    // max_ctx_len, positions beyond max_ctx_len would simply never get a
-    // tile block launched — wrong (short) attention for that slot, but no
-    // OOB write. This mirrors the pre-existing (unenforced) contract that
-    // positions[row]+1 <= max_ctx_len already had to hold for every legacy
-    // caller; slot descriptors only generalise the length source, they don't
-    // introduce a new memory-safety requirement. See docs/plans/2026-08-07-
-    // batched-attention-slots.md Task 5 note for the full analysis.
-    const int eff_seq_len = (slot_descs != nullptr) ? desc.seq_len : seq_len;
+    // `positions[row] + 1` (== `seq_len` above) is the PER-ROW CAUSAL BOUND:
+    // how far this specific query row is allowed to attend. `desc.seq_len` is
+    // the SLOT's logical KV length — allocation/capacity metadata, not a
+    // per-row quantity. The two coincide only when a slot has exactly one
+    // query row (M=1 decode); a slot verifying M>1 draft tokens has rows at
+    // positions p, p+1, ..., p+M-1 that legitimately differ, and row 0 must
+    // NOT see row 2's key. `desc` supplies the K/V slab BASE ADDRESS (via
+    // kv_offset_for_k/v below) — it must never override the row's own
+    // causal bound. This also keeps tile-count agreement with
+    // attention_flash_asym_reduce_batched, which independently derives its
+    // n_tiles from positions[global_bid]+1 and has no way to learn a
+    // different eff_seq_len computed here; disagreement would make the
+    // reduce iterate tiles this kernel early-returned from without writing a
+    // partial, folding stale (possibly another slot's) memory into the
+    // output.
+    const int eff_seq_len = seq_len;
+
+    // Sanity invariant, not a correctness mechanism: a row may never attend
+    // past its own slot's logical KV length. Descriptor construction must
+    // keep desc.seq_len in sync with (max positions[row]+1 over that slot's
+    // rows); this simply catches a violation early in debug builds.
+#ifdef NDEBUG
+    if (slot_descs != nullptr) __builtin_assume(seq_len <= desc.seq_len);
+#else
+    if (slot_descs != nullptr) assert(seq_len <= desc.seq_len);
+#endif
 
     // Sliding-window lower bound: a query at position eff_seq_len-1 attends
     // only to keys in [eff_seq_len-window, eff_seq_len); keys at t < win_lo

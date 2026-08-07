@@ -1714,12 +1714,20 @@ impl Gpu {
     /// block_cols`. Caller must pass `max_ctx_len` ≥ that value so the
     /// scores[] LDS slice is sized correctly.
     ///
-    /// `slot_descs` / `row_slot`: when both `Some`, `row_slot[b]` selects the
-    /// `KvSlotDesc` used to translate KV addresses and to bound the causal
-    /// window for batch row `b`, letting one launch serve several
-    /// independent sequences with disjoint KV slabs. When either is `None`
-    /// the kernel falls back to legacy single-arena addressing derived from
+    /// `slot_descs` / `row_slot`: MUST be both `Some` or both `None` (see the
+    /// assertion at the top of this function). When both `Some`,
+    /// `row_slot[b]` selects the `KvSlotDesc` used to translate KV addresses
+    /// for batch row `b`, letting one launch serve several independent
+    /// sequences with disjoint KV slabs — the row's own causal bound still
+    /// comes from `positions[b]`, never from `desc.seq_len` (they are
+    /// different quantities: a per-row causal bound vs. a slot's logical KV
+    /// length; see the kernel source). When both `None` the kernel falls
+    /// back to legacy single-arena addressing derived from
     /// `positions`/`max_seq`, byte-identical to the pre-slot kernel.
+    /// `slot_descs: Some, row_slot: None` is NOT a supported "partial" mode
+    /// — the kernel keys `slot` off `row_slot` (defaulting to 0) but `desc`
+    /// off `slot_descs`, so it would silently pin every row to slot 0's
+    /// descriptor while still running descriptor addressing.
     #[allow(clippy::too_many_arguments)]
     pub fn attention_q8_0_kv_batched_masked_slots(
         &mut self,
@@ -1740,6 +1748,18 @@ impl Gpu {
         slot_descs: Option<&GpuTensor>,
         row_slot: Option<&GpuTensor>,
     ) -> HipResult<()> {
+        assert_eq!(
+            slot_descs.is_some(),
+            row_slot.is_some(),
+            "slot_descs and row_slot must be both Some or both None (see \
+             doc comment above)"
+        );
+        assert!(
+            !(slot_descs.is_some() && tree_bias.is_some()),
+            "tree_bias combined with multi-slot descriptors has no defined \
+             contract and no coverage; tree-verify + multi-slot is \
+             deliberately out of SP1 scope"
+        );
         self.bind_thread()?;
         // The kernel source `#include`s kv_slot_desc.h, but the runtime hipcc
         // compile happens in a cache dir with no -I to kernels/src. Strip the
@@ -3612,27 +3632,59 @@ impl Gpu {
         // wrappers that already know their kernel is WMMA. Scalar callers
         // pass `false` (original behavior).
         force_wmma_grid: bool,
-        // `slot_descs`/`row_slot`: when both `Some`, `row_slot[row]` (GLOBAL
-        // row, i.e. batch_offset + blockIdx.z) selects the `KvSlotDesc` used
-        // to translate KV addresses and bound the causal window for that
+        // `slot_descs`/`row_slot`: MUST be both `Some` or both `None` — see
+        // the assertion just below `use_wmma_grid`. When both `Some`,
+        // `row_slot[row]` (GLOBAL row, i.e. batch_offset + blockIdx.z)
+        // selects the `KvSlotDesc` used to translate KV addresses for that
         // row, letting one launch serve several independent sequences with
-        // disjoint KV slabs. When either is `None` the tile kernel falls
-        // back to legacy single-arena addressing derived from
-        // `positions`/`max_seq`, byte-identical to the pre-SP1 kernel. Only
-        // the non-WMMA q8 tile kernel reads these today (see the assertion
-        // below); the asym/fwht/lloyd tile kernels declare fewer kernel args
-        // and never receive them.
+        // disjoint KV slabs; the row's own causal bound still comes from
+        // `positions[row]`, never from `desc.seq_len` (see the kernel source
+        // for why those two must not be conflated). When both `None` the
+        // tile kernel falls back to legacy single-arena addressing derived
+        // from `positions`/`max_seq`, byte-identical to the pre-SP1 kernel.
+        // `slot_descs: Some, row_slot: None` is NOT a supported "partial"
+        // mode — the kernel keys `slot` off `row_slot` (defaulting to 0) but
+        // `desc` off `slot_descs`, so that combination would silently pin
+        // every row to slot 0's descriptor while still running the
+        // descriptor addressing path. Only the non-WMMA q8 tile kernel reads
+        // these today (see the assertion below); the asym/fwht/lloyd tile
+        // kernels declare fewer kernel args and never receive them.
         slot_descs: Option<&GpuTensor>,
         row_slot: Option<&GpuTensor>,
     ) -> HipResult<()> {
+        assert_eq!(
+            slot_descs.is_some(),
+            row_slot.is_some(),
+            "slot_descs and row_slot must be both Some or both None: \
+             slot_descs=Some,row_slot=None would silently pin every row to \
+             slot 0 (the kernel keys `slot` off row_slot, defaulting to 0, \
+             but keys `desc` off slot_descs, so the half-configured \
+             combination runs the descriptor addressing path anyway)"
+        );
+        assert!(
+            !(slot_descs.is_some() && tree_bias.is_some()),
+            "tree_bias combined with multi-slot descriptors has no defined \
+             contract and no coverage: tree-verify batches are single-slot \
+             (block_start/block_cols index one shared linearized tree), and \
+             row_slot-per-row addressing for a tree-verify batch has not \
+             been designed. Tree-verify + multi-slot is deliberately out of \
+             SP1 scope."
+        );
         const TILE_SIZE: usize = 128;
         const WMMA_BLOCK_M: usize = 16;
         let max_tiles = (max_ctx_len + TILE_SIZE - 1) / TILE_SIZE;
         let stride = 2 + head_dim;
-        let per_pos_bytes = n_heads * max_tiles * stride * 4;
+        // Bytes of `partials` consumed per query row (n_heads * max_tiles *
+        // (2+head_dim) floats) — drives how many rows fit in one sub-batch
+        // chunk. Distinct from the `.hip`-side `per_pos_bytes`, which means
+        // KV bytes per cached position (n_kv_heads * head_dim/32 * 34); the
+        // two are unrelated quantities that happened to share a name.
+        let partials_bytes_per_row = n_heads * max_tiles * stride * 4;
         let partials_capacity = partials.numel() * 4;
-        let sub_batch = if per_pos_bytes > 0 {
-            (partials_capacity / per_pos_bytes).max(1).min(batch_size)
+        let sub_batch = if partials_bytes_per_row > 0 {
+            (partials_capacity / partials_bytes_per_row)
+                .max(1)
+                .min(batch_size)
         } else {
             batch_size
         };
@@ -3666,10 +3718,10 @@ impl Gpu {
         // upgrade) OR the dispatch path explicitly routes to a WMMA variant.
         let use_wmma_grid = wmma_ok || force_wmma_grid;
         assert!(
-            !(use_wmma_grid && slot_descs.is_some()),
+            !(use_wmma_grid && (slot_descs.is_some() || row_slot.is_some())),
             "multi-slot descriptors are not supported on the WMMA tile grid; \
-             the WMMA kernarg layout differs (omits v_mode_bits) and asym4-WMMA \
-             is out of SP1 scope"
+             the WMMA kernarg layout differs (omits v_mode_bits, slot_descs, \
+             and row_slot entirely) and asym4-WMMA is out of SP1 scope"
         );
         let (eff_tile_key, eff_tile_src, eff_tile_func): (
             &'static str,
