@@ -3,6 +3,14 @@
 
 # DeepSeek V4 heterogeneous dense/expert compute on gfx1100 + gfx1151
 
+> [!CAUTION]
+> This document is retained as the historical G0-G5 record. Its direct-HIP
+> product transport is quarantined: reciprocal cross-device
+> `hipStreamWriteValue32` / `hipStreamWaitValue32` dependencies and blocking
+> teardown can strand both devices when either queue faults. Do not execute
+> that product route. Forward work is governed by
+> [`2026-08-06-deepseek4-harmonic-gfx1100-gfx1151.md`](2026-08-06-deepseek4-harmonic-gfx1100-gfx1151.md).
+
 | Field | Value |
 |---|---|
 | State | **G0-G4 complete; G5 direct-HIP heterogeneous optimization next** |
