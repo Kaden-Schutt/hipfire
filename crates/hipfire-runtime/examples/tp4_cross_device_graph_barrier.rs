@@ -87,6 +87,46 @@ fn main() {
         .alloc_tensor(&[ELEMS], DType::F32)
         .expect("sum result");
 
+    // Graph capture may not perform module load/JIT. Warm the exact peer-load
+    // kernels outside capture and prove the direct peer pointers first.
+    let warm_values: Vec<Vec<f32>> = (0..RANKS)
+        .map(|rank| vec![(rank + 1) as f32; ELEMS])
+        .collect();
+    for rank in 0..RANKS {
+        let gpu = &gpus.devices[rank];
+        gpu.bind_thread().expect("bind warm source");
+        let host = &warm_values[rank];
+        let bytes =
+            unsafe { std::slice::from_raw_parts(host.as_ptr().cast::<u8>(), host.len() * 4) };
+        gpu.hip
+            .memcpy_htod(&sources[rank].buf, bytes)
+            .expect("warm source upload");
+    }
+    gpus.devices[0].bind_thread().expect("bind warm peer sum");
+    gpus.devices[0]
+        .add_f32_graph_safe(&sources[1], &sources[2], &tmp)
+        .expect("warm first peer sum");
+    gpus.devices[0]
+        .add_f32_graph_safe(&tmp, &sources[3], &result)
+        .expect("warm second peer sum");
+    gpus.devices[0]
+        .hip
+        .stream_synchronize(
+            gpus.devices[0]
+                .active_stream
+                .as_ref()
+                .expect("active stream"),
+        )
+        .expect("sync warm peer sum");
+    let warm_result = gpus.devices[0]
+        .download_f32(&result)
+        .expect("download warm peer sum");
+    assert!(
+        warm_result.iter().all(|&value| value == 9.0),
+        "direct peer sum failed before graph capture: head {:?}",
+        &warm_result[..16]
+    );
+
     // Begin every device capture before adding any cross-device dependency.
     for rank in 0..RANKS {
         let gpu = &mut gpus.devices[rank];
