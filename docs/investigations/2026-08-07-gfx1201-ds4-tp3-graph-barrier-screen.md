@@ -55,11 +55,33 @@ Evidence:
 `hiptrx:/home/kaden/ds4-hiptrx-evidence/2026-08-07-gfx1201-tp3-hc-graph-sync/`.
 The bundle contains the complete micro log and both Radiowave reports.
 
+## Follow-up block-count sweep
+
+Checkpoint `ca097e2ec` screened a grid-stride consumer with 1, 2, 4, 8, and 16
+blocks per HC stream. That reduced peer-spinning blocks per rank from the first
+candidate's 64 to 4/8/16/32/64 while retaining raw-bit identity in 49,152
+comparisons per arm.
+
+| Blocks/stream | Spinning blocks/rank | Baseline | Candidate | Projected product delta |
+|---:|---:|---:|---:|---:|
+| 1 | 4 | 1.007947 ms | 2.605110 ms | -8.769% |
+| 2 | 8 | 1.000207 ms | 1.575266 ms | -3.157% |
+| 4 | 16 | 0.996798 ms | 1.501595 ms | -2.772% |
+| 8 | 32 | 0.992141 ms | 2.312929 ms | -7.252% |
+| 16 | 64 | 0.994548 ms | 3.902856 ms | -15.968% |
+
+The 16-block/rank midpoint is the best balance, but it remains 0.504797 ms
+slower per 86-boundary replay. Its kernel uses 19 VGPR, 27 SGPR, wave32, and no
+spills or private segment, so resource pressure again does not explain the
+failure. The graph-fusion family is closed: reducing the number of handshakes
+serializes HC work, while increasing it recreates the system-atomic spin cost.
+
+Follow-up evidence:
+`hiptrx:/home/kaden/ds4-hiptrx-evidence/2026-08-07-gfx1201-tp3-hc-gridstride/`.
+
 ## Next gate
 
-Screen a single-workgroup, grid-stride HC consumer on the same 86-boundary
-fixture before attempting any further barrier fusion. If its compute cost is
-competitive, it provides a legal place for one peer acquire per rank and may
-remove both graph nodes without a grid-wide synchronization primitive. If it
-cannot project at least 2% end-to-end, close this graph-fusion family and move
-to the next occurrence-weighted decode hotspot.
+Return to the occurrence-weighted device hotspots. The parked raw-bit-exact E8
+shared-activation pair remains a roughly 1% bundle ingredient, but it is not a
+standalone promotion. The next decode candidate must independently project at
+least 2% before that ingredient is composed and measured as a bundle.
