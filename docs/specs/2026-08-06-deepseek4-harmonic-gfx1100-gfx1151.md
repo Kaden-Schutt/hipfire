@@ -3,7 +3,7 @@
 
 # DeepSeek V4 harmonic execution on gfx1100 + gfx1151
 
-Status: H0 complete; H1 critical-path accounting next; GPU product execution
+Status: H0-H1 complete; H2 fault-contained transport next; GPU product execution
 prohibited until H2 exits.
 
 Branch: `ds4-beta-staging`
@@ -223,7 +223,7 @@ destroyed.
 Exit: source and tests make accidental execution of the unsafe product path
 impossible. No GPU execution is required or permitted.
 
-### H1 - Critical-path bill and native ownership map
+### H1 - Critical-path bill and native ownership map - COMPLETE
 
 - Use the preserved canonical 2,048/512 trace; do not rerun merely to rebuild
   already durable data.
@@ -389,7 +389,9 @@ immediately on any runtime or hardware fault.
 
 ## 10. Immediate action
 
-H0 is complete and recorded in
-[`2026-08-06-ds4-harmonic-h0-quarantine.md`](../investigations/2026-08-06-ds4-harmonic-h0-quarantine.md).
-H1 is the first unmet gate. It prices the preserved canonical trace without
-running either GPU before any new hardware execution is proposed.
+H0 and H1 are complete and recorded in
+[`2026-08-06-ds4-harmonic-h0-quarantine.md`](../investigations/2026-08-06-ds4-harmonic-h0-quarantine.md)
+and
+[`2026-08-06-ds4-harmonic-h1-critical-path.md`](../investigations/2026-08-06-ds4-harmonic-h1-critical-path.md).
+H2 is the first unmet gate. Its transport and fault injection are developed
+CPU-first; its first GPU execution still requires explicit user authorization.
