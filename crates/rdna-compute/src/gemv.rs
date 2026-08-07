@@ -4191,6 +4191,53 @@ impl Gpu {
         }
     }
 
+    /// Exact-gfx1100 scale-broadcast screen for the generic E8-SoA GEMV.
+    ///
+    /// Kept as an explicit method until the occurrence-weighted micro screen
+    /// demonstrates enough model-level value to replace the generic dispatch.
+    pub fn gemv_mfp4g32_e8_soa_scale_broadcast_gfx1100(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert!(
+            self.arch_caps.is_gfx1100(),
+            "scale-broadcast E8 GEMV requires exact gfx1100"
+        );
+        assert!(k % 256 == 0);
+        const KERNEL: &str = "gemv_mfp4g32_e8_soa_scale_broadcast_gfx1100";
+        self.ensure_kernel(
+            KERNEL,
+            kernels::GEMV_MFP4G32_E8_SOA_SCALE_BROADCAST_GFX1100_SRC,
+            KERNEL,
+        )?;
+        let a_ptr = a_raw.buf.as_ptr();
+        let x_ptr = x.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let m_i32 = m as i32;
+        let k_i32 = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &a_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &y_ptr as *const _ as *mut c_void,
+            &m_i32 as *const _ as *mut c_void,
+            &k_i32 as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(KERNEL, [m as u32, 1, 1], [32, 1, 1], 0, &mut params, || {
+            let mut blob = hip_bridge::KernargBlob::new();
+            blob.push_ptr(a_ptr);
+            blob.push_ptr(x_ptr);
+            blob.push_ptr(y_ptr);
+            blob.push_i32(m_i32);
+            blob.push_i32(k_i32);
+            blob
+        })
+    }
+
     /// Experimental gfx942 two-wave workgroup E8-SoA GEMV.
     ///
     /// This is an explicit micro-screen surface. Product dispatch continues
