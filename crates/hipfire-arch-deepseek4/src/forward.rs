@@ -11336,6 +11336,8 @@ fn attention_block_batched_mixed(
     capture_safe: bool,
     attention_input_precomputed: bool,
 ) -> Result<(), String> {
+    let stage_timing = hipfire_config::developer_var("HIPFIRE_EP_PREFILL_STAGE_TIMING").is_ok();
+    let stage_start = std::time::Instant::now();
     let layer = weights.resolve_layer(layer_idx);
     let ratio = layer.compress_ratio as usize;
     assert!(
@@ -11745,6 +11747,14 @@ fn attention_block_batched_mixed(
     if let Some(e) = loop_err {
         return Err(e);
     }
+    let compressor_ms = if stage_timing {
+        gpu.hip
+            .device_synchronize()
+            .map_err(|e| format!("prefill timing sync compressor l{layer_idx}: {e:?}"))?;
+        stage_start.elapsed().as_secs_f64() * 1000.0
+    } else {
+        0.0
+    };
 
     // 2b. Batched indexer chain (ratio == 4 only) OR batched identity gather
     //     (ratio == 128). Replaces the per-batch indexer_forward + gather
@@ -12044,6 +12054,14 @@ fn attention_block_batched_mixed(
     } else {
         &pbs.n_active_topk_arr
     };
+    let indexer_ms = if stage_timing {
+        gpu.hip
+            .device_synchronize()
+            .map_err(|e| format!("prefill timing sync indexer l{layer_idx}: {e:?}"))?;
+        stage_start.elapsed().as_secs_f64() * 1000.0 - compressor_ms
+    } else {
+        0.0
+    };
 
     // 4. Batched joint-softmax attention over SWA + topK + sink.
     if use_topk_direct {
@@ -12168,6 +12186,14 @@ fn attention_block_batched_mixed(
             .map_err(|e| format!("deepseek4_attn_swa_topk_batched l{layer_idx}: {e:?}"))?;
         }
     }
+    let attend_ms = if stage_timing {
+        gpu.hip
+            .device_synchronize()
+            .map_err(|e| format!("prefill timing sync attend l{layer_idx}: {e:?}"))?;
+        stage_start.elapsed().as_secs_f64() * 1000.0 - compressor_ms - indexer_ms
+    } else {
+        0.0
+    };
 
     // 5. Inverse RoPE.
     {
@@ -12379,6 +12405,25 @@ fn attention_block_batched_mixed(
             )
             .map_err(|e| format!("swa_ring_write_batched (v) l{layer_idx}: {e:?}"))?;
         }
+    }
+
+    if stage_timing {
+        gpu.hip
+            .device_synchronize()
+            .map_err(|e| format!("prefill timing sync projection l{layer_idx}: {e:?}"))?;
+        let total_ms = stage_start.elapsed().as_secs_f64() * 1000.0;
+        eprintln!(
+            "EP-PREFILL-ATTN dev={} l={} ratio={} B={} compressor_ms={:.3} indexer_ms={:.3} attend_ms={:.3} project_ring_ms={:.3} total_ms={:.3}",
+            gpu.device_id,
+            layer_idx,
+            ratio,
+            batch_size,
+            compressor_ms,
+            indexer_ms,
+            attend_ms,
+            total_ms - compressor_ms - indexer_ms - attend_ms,
+            total_ms,
+        );
     }
 
     Ok(())
