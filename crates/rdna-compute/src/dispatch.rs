@@ -2328,16 +2328,36 @@ impl Gpu {
         // runtime dispatch path (see ensure_givens4_kernel) prepends the
         // header bodies and strips the #includes. We mirror that exactly so
         // the hash matches and the runtime re-uses our cached .hsaco.
+        //
+        // asym3 (SP1) additionally #includes "kv_slot_desc.h" — mirror
+        // ensure_givens4_kernel's conditional handling (only sources that
+        // actually contain the directive get it stripped/prepended) so the
+        // other assemble_asym callers (asym2/asym4/fwht2/fwht3/fwht4), which
+        // don't include it, keep producing byte-identical source to what the
+        // runtime compiles for them, and only asym3's precompiled hash grows
+        // to include the header.
         let assemble_asym = |body: &str| -> String {
+            let needs_kv_slot_desc = body.contains("#include \"kv_slot_desc.h\"");
             let stripped = body
                 .replace("#include \"turbo_common.h\"", "")
-                .replace("#include \"givens_common.h\"", "");
-            format!(
-                "{}\n{}\n{}",
-                kernels::TURBO_COMMON_H,
-                kernels::GIVENS_COMMON_SRC,
-                stripped
-            )
+                .replace("#include \"givens_common.h\"", "")
+                .replace("#include \"kv_slot_desc.h\"", "");
+            if needs_kv_slot_desc {
+                format!(
+                    "{}\n{}\n{}\n{}",
+                    kernels::TURBO_COMMON_H,
+                    kernels::GIVENS_COMMON_SRC,
+                    kernels::KV_SLOT_DESC_H,
+                    stripped
+                )
+            } else {
+                format!(
+                    "{}\n{}\n{}",
+                    kernels::TURBO_COMMON_H,
+                    kernels::GIVENS_COMMON_SRC,
+                    stripped
+                )
+            }
         };
 
         // Common kernels for all Qwen3.5 models (DeltaNet + FullAttn shared ops)
@@ -2838,7 +2858,18 @@ impl Gpu {
                 ));
                 specs.push((
                     "attention_q8_0_flash_prefill",
-                    kernels::ATTENTION_Q8_0_FLASH_PREFILL_SRC.to_string(),
+                    {
+                        // Same header-stripping treatment as
+                        // attention_q8_0_kv_batched above: the kernel now
+                        // #includes kv_slot_desc.h (Task 6), but this
+                        // precompile path (like the runtime hipcc compile in
+                        // attention_q8_0_flash_prefill_slots) has no -I to
+                        // kernels/src, so the directive must be stripped and
+                        // the header body prepended instead.
+                        let stripped = kernels::ATTENTION_Q8_0_FLASH_PREFILL_SRC
+                            .replace("#include \"kv_slot_desc.h\"", "");
+                        format!("{}\n{}", kernels::KV_SLOT_DESC_H, stripped)
+                    },
                 ));
                 specs.push((
                     "kv_cache_write_q8_0_batched",

@@ -9,8 +9,10 @@
 // Grid: [n_heads, max_tiles, sub_batch_size]. Block: [32, 1, 1].
 // LDS: tile_size * 4 bytes.
 #include <hip/hip_runtime.h>
+#include <assert.h>
 #include "turbo_common.h"
 #include "givens_common.h"
+#include "kv_slot_desc.h"
 
 // ─── Tree-attention mode (DDTree batched verify) ──────────────────────────
 // When `tree_bias != nullptr`:
@@ -42,7 +44,18 @@ __global__ void attention_flash_asym3_tile_batched(
     int batch_offset,
     int block_start,                           // ignored when tree_bias == nullptr
     int block_cols,                            // ignored when tree_bias == nullptr
-    int v_mode                                 // 8 = Q8_0 V (only mode for asym3)
+    int v_mode,                                // 8 = Q8_0 V (only mode for asym3)
+    int /*window*/,                            // consumed-but-unused: the shared
+                                               // launcher pushes window here for
+                                               // the q8 tile kernel; asym3 has no
+                                               // sliding-window support and keeps
+                                               // this only to stay positionally
+                                               // aligned with slot_descs/row_slot
+                                               // below (see attention_flash_
+                                               // q8_0_tile_batched.hip for the
+                                               // param that IS real here).
+    const KvSlotDesc* __restrict__ slot_descs, // [n_slots] or nullptr = legacy
+    const int* __restrict__ row_slot           // [total_batch] or nullptr = legacy
 ) {
     const int h = blockIdx.x;
     const int tile_id = blockIdx.y;
@@ -60,21 +73,65 @@ __global__ void attention_flash_asym3_tile_batched(
     // Eager (non-capture) value is identical, so this is a no-op off-graph.
     const int eff_block_start = tree_mode ? positions[0] : block_start;
     const int seq_len = tree_mode ? (eff_block_start + block_cols) : (positions[global_bid] + 1);
+
+    // One code path for both modes: in legacy mode we synthesise a descriptor
+    // with zero bases, so the address arithmetic below is unchanged and the
+    // output is bitwise identical to the pre-SP1 kernel. row_slot is indexed
+    // by GLOBAL row (batch_offset + blockIdx.z, i.e. global_bid above) — using
+    // the local blockIdx.z alone would silently read the wrong slot once the
+    // partials buffer forces the launcher into sub-batching.
+    const int slot = (row_slot != nullptr) ? row_slot[global_bid] : 0;
+    const KvSlotDesc desc = (slot_descs != nullptr)
+        ? slot_descs[slot]
+        : kv_slot_legacy(seq_len, max_seq);
+
+    // `positions[row] + 1` (== `seq_len` above) is the PER-ROW CAUSAL BOUND:
+    // how far this specific query row is allowed to attend. `desc.seq_len` is
+    // the SLOT's logical KV length — allocation/capacity metadata, not a
+    // per-row quantity. The two coincide only when a slot has exactly one
+    // query row (M=1 decode); a slot verifying M>1 draft tokens has rows at
+    // positions p, p+1, ..., p+M-1 that legitimately differ, and row 0 must
+    // NOT see row 2's key. `desc` supplies the K/V slab BASE ADDRESS (via
+    // kv_offset_for_k/v below) — it must never override the row's own
+    // causal bound. This also keeps tile-count agreement with
+    // attention_flash_asym_reduce_batched, which independently derives its
+    // n_tiles from positions[global_bid]+1 and has no way to learn a
+    // different eff_seq_len computed here; disagreement would make the
+    // reduce iterate tiles this kernel early-returned from without writing a
+    // partial, folding stale (possibly another slot's) memory into the
+    // output. See attention_flash_q8_0_tile_batched.hip for the fuller
+    // writeup (566ce7d1 fixed this exact class of bug there).
+    const int eff_seq_len = seq_len;
+
+    // Sanity invariant, not a correctness mechanism: a row may never attend
+    // past its own slot's logical KV length. Descriptor construction must
+    // keep desc.seq_len in sync with (max positions[row]+1 over that slot's
+    // rows); this simply catches a violation early in debug builds.
+#ifdef NDEBUG
+    if (slot_descs != nullptr) __builtin_assume(seq_len <= desc.seq_len);
+#else
+    if (slot_descs != nullptr) assert(seq_len <= desc.seq_len);
+#endif
+
     const int tile_start = tile_id * tile_size;
-    if (tile_start >= seq_len) return;
-    const int tile_end = min(tile_start + tile_size, seq_len);
+    if (tile_start >= eff_seq_len) return;
+    const int tile_end = min(tile_start + tile_size, eff_seq_len);
     const int tile_len = tile_end - tile_start;
 
     const int kv_group = n_heads / n_kv_heads;
     const int kv_h = h / kv_group;
     const int q_dim = n_heads * head_dim;
 
-    // K (3-bit rotated)
+    // K (3-bit rotated). k_bytes_per_pos is the per-position stride, now
+    // routed through kv_offset_for_k so a real descriptor's slot-local base
+    // is honored. NOT the Q8 stride (n_kv_heads * head_dim/32 * 34) — that
+    // value is ~2.7x too large for 3-bit-rotated K and would read past the
+    // arena.
     const int k_bytes_per_head = 4 + (head_dim * 3) / 8;
     const int k_bytes_per_pos  = n_kv_heads * k_bytes_per_head;
     const int k_head_off       = kv_h * k_bytes_per_head;
 
-    // V (Q8_0)
+    // V (Q8_0) — its own per-position stride, distinct from K's.
     const int v_blocks_per_head = head_dim / 32;
     const int v_total_blocks    = n_kv_heads * v_blocks_per_head;
     const int v_kv_head_blk     = kv_h * v_blocks_per_head;
@@ -111,7 +168,7 @@ __global__ void attention_flash_asym3_tile_batched(
     // Phase A: Q·K
     for (int t_local = 0; t_local < tile_len; t_local++) {
         int t = tile_start + t_local;
-        const unsigned char* kb = k_cache + (size_t)t * k_bytes_per_pos + k_head_off;
+        const unsigned char* kb = k_cache + kv_offset_for_k(desc, t, k_bytes_per_pos) + k_head_off;
         float cnorm = *(const float*)kb;
         const unsigned char* base = kb + 4 + tid * 3;
         unsigned int packed = (unsigned int)base[0]
@@ -165,7 +222,7 @@ __global__ void attention_flash_asym3_tile_batched(
     for (int t_local = 0; t_local < tile_len; t_local++) {
         float w = scores[t_local];
         int t = tile_start + t_local;
-        const unsigned char* vb = v_cache + (size_t)t * v_row_stride;
+        const unsigned char* vb = v_cache + kv_offset_for_v(desc, t, v_row_stride);
         #pragma unroll
         for (int i = 0; i < 8; i++) {
             const int d = d0 + i;
