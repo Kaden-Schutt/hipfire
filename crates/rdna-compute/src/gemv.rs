@@ -4618,6 +4618,74 @@ impl Gpu {
         )
     }
 
+    /// Experimental exact-gfx1201 two-projection screen. Both matrices share
+    /// one activation and K; row counts may differ. No product route selects
+    /// this method until its occurrence-weighted channel screen clears.
+    pub fn gemv_mfp4g32_e8_soa_shared_pair_gfx1201(
+        &mut self,
+        weight0: &GpuTensor,
+        weight1: &GpuTensor,
+        x: &GpuTensor,
+        output0: &GpuTensor,
+        output1: &GpuTensor,
+        m0: usize,
+        m1: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert_eq!(
+            self.arch_caps.arch(),
+            "gfx1201",
+            "shared-pair E8 requires exact gfx1201"
+        );
+        assert!(k % 256 == 0);
+        assert_eq!(weight0.dtype, DType::MFP4G32E8SOA);
+        assert_eq!(weight1.dtype, DType::MFP4G32E8SOA);
+        const KERNEL: &str = "gemv_mfp4g32_e8_soa_shared_pair_gfx1201";
+        self.ensure_kernel(
+            KERNEL,
+            kernels::GEMV_MFP4G32_E8_SOA_SHARED_PAIR_GFX1201_SRC,
+            KERNEL,
+        )?;
+        let a0 = weight0.buf.as_ptr();
+        let a1 = weight1.buf.as_ptr();
+        let x_ptr = x.buf.as_ptr();
+        let y0 = output0.buf.as_ptr();
+        let y1 = output1.buf.as_ptr();
+        let m0_i32 = m0 as i32;
+        let m1_i32 = m1 as i32;
+        let k_i32 = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &a0 as *const _ as *mut c_void,
+            &a1 as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &y0 as *const _ as *mut c_void,
+            &y1 as *const _ as *mut c_void,
+            &m0_i32 as *const _ as *mut c_void,
+            &m1_i32 as *const _ as *mut c_void,
+            &k_i32 as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            KERNEL,
+            [m0.max(m1) as u32, 1, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut blob = hip_bridge::KernargBlob::new();
+                blob.push_ptr(a0);
+                blob.push_ptr(a1);
+                blob.push_ptr(x_ptr);
+                blob.push_ptr(y0);
+                blob.push_ptr(y1);
+                blob.push_i32(m0_i32);
+                blob.push_i32(m1_i32);
+                blob.push_i32(k_i32);
+                blob
+            },
+        )
+    }
+
     /// Exact-gfx1100 path for collapsing the eight O-LoRA E8 GEMVs into one
     /// 2-D launch. The included kernel preserves the incumbent width-32
     /// per-row arithmetic.
