@@ -1148,10 +1148,10 @@ pub const GEMV_MFP4G32_E8_SOA_BUFFER_GFX1100_SRC: &str = concat!(
     include_str!("../../../kernels/src/gemv_mfp4g32_e8_soa_buffer.gfx1100.hip")
 );
 pub const GEMV_MFP4G32_E8_SOA_PREFETCH4_BUFFER_GFX1100_SRC: &str = concat!(
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    "#define HIPFIRE_WEIGHT_BUFFER_LOADS_OPT_IN 1\n",
+    "#define HIPFIRE_WEIGHT_CPOL_AUX 0\n",
     include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
-    "\n#define HIPFIRE_WEIGHT_CACHE_POLICY 0\n",
-    "#define HIPFIRE_WEIGHT_RSRC HIPFIRE_GFX11_WEIGHT_RSRC\n",
-    "#define HIPFIRE_WEIGHT_LOAD_U32 HIPFIRE_GFX11_WEIGHT_LOAD_U32\n",
     include_str!("../../../kernels/src/gemv_mfp4g32_e8_soa_prefetch4_buffer.gfx1100.hip")
 );
 /// gfx1151-specific mfp4-E8 SoA GEMV — fully-coalesced 128B codeword reads.
