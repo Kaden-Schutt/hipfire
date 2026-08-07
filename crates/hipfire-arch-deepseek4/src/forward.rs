@@ -881,6 +881,16 @@ mod config_cache {
                     != Some("0")
             })
     }
+    /// `HIPFIRE_DEEPSEEK4_GFX1201_TP3_FFN_OVERLAP` — overlap each rank's
+    /// shared E8 shard with its owned routed-MQ2 experts inside the exact
+    /// gfx1201 TP3 graph. Developer-only until the canonical 2052+512 gate.
+    pub(super) fn gfx1201_tp3_ffn_overlap_on(arch: &str, mq2r: bool, tp_size: usize) -> bool {
+        static V: OnceLock<bool> = OnceLock::new();
+        arch == "gfx1201"
+            && mq2r
+            && tp_size == 3
+            && *V.get_or_init(|| flag_one("HIPFIRE_DEEPSEEK4_GFX1201_TP3_FFN_OVERLAP"))
+    }
     /// `HIPFIRE_DEEPSEEK4_HC_PINGPONG` — write each HC mix into a dedicated
     /// alternate residual buffer and swap handles instead of issuing 86 D2D
     /// copies per token. Opt-in until exact-model parity/perf admission.
@@ -4711,6 +4721,16 @@ fn ds4_moe_block_core(
         let layer = weights.resolve_layer(layer_idx);
         let gfx942_overlap = config_cache::gfx942_ffn_overlap_on(weights.mq2r_backend.is_gfx942())
             && !gpu.graphs.capture_mode;
+        let ep_overlap = routed_out.is_some()
+            && !do_mix
+            && config_cache::moe_on()
+            && config_cache::gfx1201_tp3_ffn_overlap_on(&gpu.arch, cfg.mq2r, layer.shared_tp_size)
+            && gpu.active_stream.is_some()
+            && state.ffn_overlap_stream.is_some()
+            && state.ffn_overlap_fork_event.is_some()
+            && state.ffn_overlap_join_event.is_some()
+            && layer.expert_gate_up_blob.is_some()
+            && layer.expert_w2_blob.is_some();
         let overlap = routed_out.is_none()
             && do_mix
             && config_cache::moe_on()
@@ -4730,7 +4750,17 @@ fn ds4_moe_block_core(
             && config_cache::moe_on()
             && layer.expert_gate_up_blob.is_some()
             && layer.expert_w2_blob.is_some();
-        if overlap {
+        if ep_overlap {
+            ffn_shared_routed_overlap_ep(
+                cfg,
+                weights,
+                state,
+                gpu,
+                layer_idx,
+                token_id,
+                routed_out.unwrap(),
+            )?;
+        } else if overlap {
             ffn_shared_routed_overlap(cfg, weights, state, gpu, layer_idx, token_id)?;
         } else if retained_split {
             ffn_shared_routed_split_tape(cfg, weights, state, gpu, layer_idx, token_id)?;
@@ -4877,6 +4907,69 @@ fn ffn_shared_routed_overlap(
     let ffn_out = state.ffn_out.as_ref().unwrap();
     gpu.add_inplace_f32(ffn_out, &routed_partial)
         .map_err(|e| format!("combine FFN overlap partial l{layer_idx}: {e:?}"))
+}
+
+/// gfx1201 TP3 variant of [`ffn_shared_routed_overlap`]. The EP executor has
+/// already zeroed `routed_out`; this function evaluates the shared E8
+/// input-column shard on the side stream while the primary stream evaluates
+/// this rank's owned routed experts into that partial. The caller preserves
+/// the existing `routed_out += ffn_out; zero(ffn_out); peer-HC3` contract.
+fn ffn_shared_routed_overlap_ep(
+    cfg: &DeepseekV4Config,
+    weights: &DeepseekV4Weights,
+    state: &mut DeepseekV4State,
+    gpu: &mut Gpu,
+    layer_idx: usize,
+    token_id: u32,
+    routed_out: &GpuTensor,
+) -> Result<(), String> {
+    ffn_prepare(cfg, weights, state, gpu, layer_idx)?;
+
+    {
+        let primary = gpu.active_stream.as_ref().unwrap();
+        let fork = state.ffn_overlap_fork_event.as_ref().unwrap();
+        gpu.hip
+            .event_record(fork, Some(primary))
+            .map_err(|error| format!("record TP3 FFN overlap fork l{layer_idx}: {error:?}"))?;
+        let side = state.ffn_overlap_stream.as_ref().unwrap();
+        gpu.hip
+            .stream_wait_event(side, fork)
+            .map_err(|error| format!("wait TP3 FFN overlap fork l{layer_idx}: {error:?}"))?;
+    }
+
+    std::mem::swap(&mut gpu.active_stream, &mut state.ffn_overlap_stream);
+    let shared_result = ffn_shared_project(cfg, weights, state, gpu, layer_idx).and_then(|_| {
+        let side = gpu.active_stream.as_ref().unwrap();
+        let join = state.ffn_overlap_join_event.as_ref().unwrap();
+        gpu.hip
+            .event_record(join, Some(side))
+            .map_err(|error| format!("record TP3 FFN overlap join l{layer_idx}: {error:?}"))
+    });
+    std::mem::swap(&mut gpu.active_stream, &mut state.ffn_overlap_stream);
+    shared_result?;
+
+    let routed_result = if layer_idx < cfg.num_hash_layers {
+        ffn_hash_routed(
+            cfg,
+            weights,
+            state,
+            gpu,
+            layer_idx,
+            token_id,
+            Some(routed_out),
+        )
+    } else {
+        ffn_routed(cfg, weights, state, gpu, layer_idx, Some(routed_out))
+    };
+    let join_result = {
+        let primary = gpu.active_stream.as_ref().unwrap();
+        let join = state.ffn_overlap_join_event.as_ref().unwrap();
+        gpu.hip
+            .stream_wait_event(primary, join)
+            .map_err(|error| format!("wait TP3 FFN overlap join l{layer_idx}: {error:?}"))
+    };
+    routed_result?;
+    join_result
 }
 
 /// Per-layer execution context for the lowered decode path (rebuilt each layer).
@@ -5360,6 +5453,18 @@ fn forward_ep_tp_graph(
             &mut gpus.devices[rank],
             (position as usize).saturating_add(1),
         )?;
+    }
+    if n == 3
+        && gpus
+            .devices
+            .iter()
+            .all(|device| config_cache::gfx1201_tp3_ffn_overlap_on(&device.arch, cfg.mq2r, n))
+    {
+        // Streams, events, and scratch allocation are illegal inside capture.
+        // Materialize them before the ordinary warmup pass on every rank.
+        for rank in 0..n {
+            ensure_ffn_overlap_resources(cfg, &mut state_per_rank[rank], &mut gpus.devices[rank])?;
+        }
     }
 
     // One ordinary pass admits every lazy allocation and JIT module before
