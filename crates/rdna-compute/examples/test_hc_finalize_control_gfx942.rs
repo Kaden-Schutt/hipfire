@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Kaden Schutt
-// hipfire — raw-state admission gate for the gfx942 DS4 mHC finalizer.
+// hipfire — raw-state admission gate for the gfx942/gfx1201 DS4 mHC finalizer.
 
 use rdna_compute::{DType, Gpu, GpuTensor};
 
@@ -63,9 +63,7 @@ fn make_c(case: usize) -> Vec<f32> {
             if case == 0 {
                 (i as f32 - 11.5) * 0.1875
             } else {
-                [
-                    -32.0, -16.0, -1.0, -0.0, 0.0, 1.0, 16.0, 32.0,
-                ][i & 7]
+                [-32.0, -16.0, -1.0, -0.0, 0.0, 1.0, 16.0, 32.0][i & 7]
             }
         })
         .collect()
@@ -76,7 +74,9 @@ fn assert_f32_bits(label: &str, incumbent: &[f32], candidate: &[f32]) {
         .iter()
         .zip(candidate)
         .enumerate()
-        .find_map(|(i, (a, b))| (a.to_bits() != b.to_bits()).then_some((i, a.to_bits(), b.to_bits())));
+        .find_map(|(i, (a, b))| {
+            (a.to_bits() != b.to_bits()).then_some((i, a.to_bits(), b.to_bits()))
+        });
     assert!(
         mismatch.is_none(),
         "{label} raw-bit mismatch (index, incumbent, candidate): {mismatch:?}"
@@ -143,12 +143,8 @@ fn run_case(gpu: &mut Gpu, case: usize) {
         .expect("incumbent alpha");
     gpu.hc_pre_post_sigmoid_scale_f32(&incumbent_c, EPS, POST_SCALE)
         .expect("incumbent sigmoid");
-    gpu.hc_sinkhorn_4x4(
-        &incumbent_c.sub_offset(8, 16),
-        EPS,
-        SINKHORN_ITERS,
-    )
-    .expect("incumbent sinkhorn");
+    gpu.hc_sinkhorn_4x4(&incumbent_c.sub_offset(8, 16), EPS, SINKHORN_ITERS)
+        .expect("incumbent sinkhorn");
     gpu.hc_input_map_4stream(
         &incumbent_c.sub_offset(0, 4),
         &streams,
@@ -157,15 +153,8 @@ fn run_case(gpu: &mut Gpu, case: usize) {
     )
     .expect("incumbent input map");
 
-    gpu.hc_finalize_control(
-        &candidate_c,
-        &alpha,
-        &base,
-        EPS,
-        POST_SCALE,
-        SINKHORN_ITERS,
-    )
-    .expect("candidate finalizer");
+    gpu.hc_finalize_control(&candidate_c, &alpha, &base, EPS, POST_SCALE, SINKHORN_ITERS)
+        .expect("candidate finalizer");
     gpu.hc_input_map_4stream(
         &candidate_c.sub_offset(0, 4),
         &streams,
@@ -175,8 +164,12 @@ fn run_case(gpu: &mut Gpu, case: usize) {
     .expect("candidate input map");
     gpu.hip.device_synchronize().expect("parity sync");
 
-    let incumbent_c_host = gpu.download_f32(&incumbent_c).expect("download incumbent c");
-    let candidate_c_host = gpu.download_f32(&candidate_c).expect("download candidate c");
+    let incumbent_c_host = gpu
+        .download_f32(&incumbent_c)
+        .expect("download incumbent c");
+    let candidate_c_host = gpu
+        .download_f32(&candidate_c)
+        .expect("download candidate c");
     assert_f32_bits("hc_c", &incumbent_c_host, &candidate_c_host);
     let incumbent_out_host = gpu
         .download_f32(&incumbent_out)
@@ -203,8 +196,16 @@ fn run_case(gpu: &mut Gpu, case: usize) {
     assert_f32_guards("incumbent output", &incumbent_out_all, HIDDEN);
     assert_f32_guards("candidate output", &candidate_out_all, HIDDEN);
 
-    assert_eq!(download_bytes(gpu, &alpha_backing), alpha_before, "alpha mutated");
-    assert_eq!(download_bytes(gpu, &base_backing), base_before, "base mutated");
+    assert_eq!(
+        download_bytes(gpu, &alpha_backing),
+        alpha_before,
+        "alpha mutated"
+    );
+    assert_eq!(
+        download_bytes(gpu, &base_backing),
+        base_before,
+        "base mutated"
+    );
     assert_f32_bits(
         "streams input",
         &streams_host,
@@ -235,7 +236,11 @@ where
 
 fn main() {
     let mut gpu = Gpu::init().expect("Gpu::init");
-    assert_eq!(gpu.arch, "gfx942", "this admission gate requires gfx942");
+    assert!(
+        matches!(gpu.arch.as_str(), "gfx942" | "gfx1201"),
+        "this admission gate requires gfx942 or gfx1201, got {}",
+        gpu.arch
+    );
     run_case(&mut gpu, 0);
     run_case(&mut gpu, 1);
 
@@ -257,15 +262,8 @@ fn main() {
             .unwrap();
     });
     let candidate_ms = elapsed_ms(&mut gpu, REPEATS, |gpu| {
-        gpu.hc_finalize_control(
-            &candidate,
-            &alpha,
-            &base,
-            EPS,
-            POST_SCALE,
-            SINKHORN_ITERS,
-        )
-        .unwrap();
+        gpu.hc_finalize_control(&candidate, &alpha, &base, EPS, POST_SCALE, SINKHORN_ITERS)
+            .unwrap();
     });
     println!(
         "MICRO incumbent_3_launch_ms={incumbent_ms:.6} fused_1_launch_ms={candidate_ms:.6} speedup={:.3}x launches_saved=2",

@@ -871,8 +871,9 @@ mod config_cache {
     }
     pub(super) fn hc_finalize_fused_on(arch: &str, mq2r: bool) -> bool {
         static V: OnceLock<bool> = OnceLock::new();
-        arch == "gfx1151"
-            && (mq2r || *V.get_or_init(|| flag_one("HIPFIRE_DEEPSEEK4_HC_FINALIZE_FUSED")))
+        (arch == "gfx1151"
+            && (mq2r || *V.get_or_init(|| flag_one("HIPFIRE_DEEPSEEK4_HC_FINALIZE_FUSED"))))
+            || (arch == "gfx1201" && mq2r)
     }
     pub(super) fn hc_control_finalize_fused_on(arch: &str, mq2r: bool) -> bool {
         static V: OnceLock<bool> = OnceLock::new();
@@ -15630,6 +15631,15 @@ mod tests {
         assert!(!config_cache::gfx942_hc_finalize_fused_on(arch, true));
         assert!(!config_cache::gfx942_indexer_topk_parallel_on(arch, true));
         assert!(!config_cache::gfx942_ffn_overlap_on(false));
+    }
+
+    #[test]
+    fn mq2r_pins_only_the_admitted_gfx1201_hc_finalizer() {
+        assert!(config_cache::hc_finalize_fused_on("gfx1201", true));
+        assert!(!config_cache::hc_finalize_fused_on("gfx1201", false));
+        assert!(!config_cache::hc_control_finalize_fused_on("gfx1201", true));
+        assert!(!config_cache::hc_finalize_fused_on("gfx1100", true));
+        assert!(!config_cache::hc_finalize_fused_on("gfx942", true));
     }
 
     #[test]
