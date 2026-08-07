@@ -55,6 +55,17 @@
     `journalctl -k | grep -E 'page allocation failure|Out of memory|oom-kill'`.
     The symptom the user actually notices is desktop stutter and applications
     silently disappearing.
+- **NEVER MUTATE THE USER'S GLOBAL CONFIG.** `~/.hipfire/config.json` is the
+  user's live working configuration, not a test fixture. On 2026-08-07 a Task 9
+  agent edited it to run its arms, then died mid-way through restoring it,
+  leaving `max_seq` at 16384 instead of 131072 — which would have silently
+  truncated the user's own long-context runs. Everything these tasks need is
+  already exposed as an environment variable (`HIPFIRE_KV_MODE`,
+  `HIPFIRE_LOCAL`, `HIPFIRE_MEM_CAP`, `HIPFIRE_ATTN_TILE_SIZE`,
+  `HIPFIRE_VRAM_BUDGET_BYTES`, …). **Pass env vars per invocation. Do not write
+  to any file under `~/.hipfire/`.** If something genuinely cannot be set by
+  env, stop and report it rather than editing the file — a config edit that
+  survives a crashed agent is worse than a missing measurement.
 - **Commit after every task.** No task may be left half-committed.
 
 ## File Structure
