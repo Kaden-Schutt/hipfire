@@ -113,6 +113,10 @@ change). Deferred. Documented inline at the constructor call sites and on the
 
 ## STEP-002R — Qwen35 Frozen construction rollback + BundleTeardown pivot (DONE)
 
+Shipped as **PR #18** (fivetide/hipfire): `feat(loader): owner-preserving
+teardown for every arch bundle` + `fix(loader): retained-owner backlog closes
+the String-error teardown gap`. Commits `c7f142af8` (amended) and parent.
+
 Owner-preserving teardown for the Qwen35 Frozen construction path (STEP-002R)
 and its generalization: `hipfire_runtime::gpu_cleanup` (`RetainedGpuTensor`,
 `GpuCleanupFailure` with a `RetryableOwner` category, `BundleTeardown`,
