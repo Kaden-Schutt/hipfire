@@ -5695,6 +5695,12 @@ pub const V4F_ATTN_SWA_TOPK_DIRECT_WMMA_SRC: &str =
 pub const V4F_ATTN_SWA_TOPK_BATCHED_WMMA_SRC: &str =
     include_str!("../../../kernels/src/deepseek4_attn_swa_topk_batched_wmma.hip");
 
+/// gfx1201-native sister of the gathered DSA WMMA kernel. Uses RDNA4's
+/// half8 lane split and accepts a masked final head group for TP3's 24-head
+/// ranks without changing the gfx11 symbol or route.
+pub const V4F_ATTN_SWA_TOPK_BATCHED_WMMA_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/deepseek4_attn_swa_topk_batched_wmma.gfx12.hip");
+
 /// DeepSeek V4 batched pure-SWA attention (Phase A2, 2026-05-18). Twin of
 /// `V4F_ATTN_SWA_TOPK_BATCHED_SRC` for layers without an indexer top-K
 /// path. Same launch shape and byte-equality contract at batch=1.

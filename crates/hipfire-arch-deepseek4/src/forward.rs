@@ -12123,8 +12123,7 @@ fn attention_block_batched_mixed(
         let use_dsa_wmma = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_DSA_WMMA").as_deref()
             != Ok("0")
             && gpu.arch_caps.has_wmma()
-            && !gpu.arch_caps.is_gfx1201()
-            && n_heads % 16 == 0
+            && (gpu.arch_caps.is_gfx1201() || n_heads % 16 == 0)
             && head_dim % 16 == 0;
         let max_n_total = if capture_safe {
             (win + topk_max) as i32
@@ -12133,8 +12132,8 @@ fn attention_block_batched_mixed(
         };
         let mut done = false;
         if use_dsa_wmma {
-            if gpu
-                .deepseek4_attn_swa_topk_batched_wmma(
+            let result = if gpu.arch_caps.is_gfx1201() {
+                gpu.deepseek4_attn_swa_topk_batched_wmma_gfx12(
                     &pbs.q_batch,
                     &pbs.swa_staged_batch,  // K=V tied
                     &pbs.topk_staged_batch, // K=V tied
@@ -12149,8 +12148,24 @@ fn attention_block_batched_mixed(
                     batch_size as i32,
                     max_n_total,
                 )
-                .is_ok()
-            {
+            } else {
+                gpu.deepseek4_attn_swa_topk_batched_wmma(
+                    &pbs.q_batch,
+                    &pbs.swa_staged_batch,
+                    &pbs.topk_staged_batch,
+                    attn_sink,
+                    &pbs.n_valid_swa_arr,
+                    n_active_topk_arr,
+                    &pbs.attn_out_raw_batch,
+                    n_heads as i32,
+                    head_dim as i32,
+                    win as i32,
+                    topk_max as i32,
+                    batch_size as i32,
+                    max_n_total,
+                )
+            };
+            if result.is_ok() {
                 done = true;
             }
         }
