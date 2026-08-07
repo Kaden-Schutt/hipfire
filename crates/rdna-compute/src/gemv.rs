@@ -4494,6 +4494,35 @@ impl Gpu {
         )
     }
 
+    /// Exact-gfx1100 raw-buffer addressing screen for the generic E8-SoA
+    /// kernel. The kernel preserves the incumbent two-accumulator arithmetic
+    /// and wave reduction order; only the weight fetch address space changes.
+    pub fn gemv_mfp4g32_e8_soa_buffer_gfx1100(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert!(
+            self.arch_caps.is_gfx1100(),
+            "buffer E8 GEMV requires exact gfx1100"
+        );
+        assert!(k % 256 == 0);
+        const KERNEL: &str = "gemv_mfp4g32_e8_soa_buffer_gfx1100";
+        self.gemv_mfp4g32_e8_soa_variant(
+            KERNEL,
+            kernels::GEMV_MFP4G32_E8_SOA_BUFFER_GFX1100_SRC,
+            a_raw,
+            x,
+            y,
+            m,
+            k,
+        )
+    }
+
     /// Exact-gfx1100 path for collapsing the eight O-LoRA E8 GEMVs into one
     /// 2-D launch. The included kernel preserves the incumbent width-32
     /// per-row arithmetic.

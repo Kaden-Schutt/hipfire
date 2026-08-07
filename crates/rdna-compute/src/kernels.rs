@@ -1136,6 +1136,17 @@ pub const GEMV_MFP4G32_E8_SOA_SRC: &str =
 /// quad. Product dispatch does not select this source until it clears screen.
 pub const GEMV_MFP4G32_E8_SOA_SCALE_BROADCAST_GFX1100_SRC: &str =
     include_str!("../../../kernels/src/gemv_mfp4g32_e8_soa_scale_broadcast.gfx1100.hip");
+/// Exact-gfx1100 E8-SoA screen with the incumbent two-accumulator arithmetic
+/// and reduction order, changing only weight addressing from global to a
+/// temporal raw-buffer resource. Product dispatch remains unwired until the
+/// complete 511-call shape census clears the micro gate.
+pub const GEMV_MFP4G32_E8_SOA_BUFFER_GFX1100_SRC: &str = concat!(
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    "#define HIPFIRE_WEIGHT_BUFFER_LOADS_OPT_IN 1\n",
+    "#define HIPFIRE_WEIGHT_CPOL_AUX 0\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/gemv_mfp4g32_e8_soa_buffer.gfx1100.hip")
+);
 /// gfx1151-specific mfp4-E8 SoA GEMV — fully-coalesced 128B codeword reads.
 /// ONLY dispatched on gfx1151 (Strix Halo); other archs use GEMV_MFP4G32_E8_SOA_SRC.
 pub const GEMV_MFP4G32_E8_SOA_GFX1151_SRC: &str =
