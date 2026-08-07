@@ -1195,6 +1195,17 @@ fn run_prefill_gfx1201(gpu: &mut Gpu) {
         (4096usize, 8192usize, "wo_b"),
         (2048usize, 4096usize, "shared_up"),
         (4096usize, 2048usize, "shared_down"),
+        // Exact rank-local shapes loaded by the gfx1201 TP3 route. The
+        // balanced 8-way O-LoRA split is 3/3/2 groups and the 2,048-wide
+        // shared intermediate is split into 768/768/512 columns.
+        (12288usize, 1024usize, "tp3_wq_b_24h"),
+        (8192usize, 1024usize, "tp3_wq_b_16h"),
+        (4096usize, 3072usize, "tp3_wo_b_g3"),
+        (4096usize, 2048usize, "tp3_wo_b_g2"),
+        (768usize, 4096usize, "tp3_shared_up3"),
+        (512usize, 4096usize, "tp3_shared_up2"),
+        (4096usize, 768usize, "tp3_shared_dn3"),
+        (4096usize, 512usize, "tp3_shared_dn2"),
     ];
 
     eprintln!("=== gfx1201 MFP4G32E8SOA WMMA prefill B={batch} ===");
