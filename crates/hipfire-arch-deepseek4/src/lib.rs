@@ -87,6 +87,7 @@ pub use harmonic::{
     pack_harmonic_activation_payload, unpack_harmonic_x_rot, HarmonicCompletion, HarmonicContract,
     HarmonicOwner, HarmonicProtocolError, HarmonicRoutePacket, HarmonicSlotState,
     HarmonicSupervisor, HARMONIC_ACTIVATION_EXTENT, HARMONIC_RESULT_EXTENT,
+    HARMONIC_SPLIT_RESULT_EXTENT,
 };
 pub use harmonic_ipc::{
     harmonic_monotonic_tick, harmonic_payload_fingerprint, HarmonicExpertMappedPoll,

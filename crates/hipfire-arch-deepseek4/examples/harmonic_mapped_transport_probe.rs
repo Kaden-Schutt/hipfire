@@ -9,7 +9,9 @@ use hip_bridge::HipRuntime;
 use hipfire_arch_deepseek4::{
     harmonic_monotonic_tick, HarmonicCompletion, HarmonicContract, HarmonicExpertMappedPoll,
     HarmonicGpuMapping, HarmonicSharedRing, HARMONIC_ACTIVATION_EXTENT, HARMONIC_RESULT_EXTENT,
+    HARMONIC_SPLIT_RESULT_EXTENT,
 };
+use memmap2::MmapOptions;
 use rdna_compute::Gpu;
 
 const SOURCE_GENERATION: u64 = 1;
@@ -222,6 +224,107 @@ fn main() {
     ) * 1_000.0
         / COPY_ROUNDS as f64;
 
+    // Size the DS4HARM3 six-row result without changing the shipping DS4HARM2
+    // ring layout. This anonymous mapping has the same page-backed,
+    // process-local HIP registration contract as the ring. gfx1151's write and
+    // gfx1100's read are measured in separate exact-device invocations.
+    let mut split_mapping = MmapOptions::new()
+        .len(HARMONIC_SPLIT_RESULT_EXTENT)
+        .map_anon()
+        .expect("allocate split-result mapping");
+    let split_host = split_mapping.as_mut_ptr().cast();
+    unsafe {
+        gpu.hip
+            .host_register_mapped(split_host, split_mapping.len())
+            .expect("register split-result mapping");
+    }
+    let split_device = unsafe {
+        gpu.hip
+            .host_get_device_buffer(split_host, split_mapping.len())
+            .expect("resolve split-result device alias")
+    };
+    let split_payload = payload(HARMONIC_SPLIT_RESULT_EXTENT, 0x6d);
+    let split_source = gpu
+        .hip
+        .malloc(HARMONIC_SPLIT_RESULT_EXTENT)
+        .expect("allocate split-result source");
+    let split_destination = gpu
+        .hip
+        .malloc(HARMONIC_SPLIT_RESULT_EXTENT)
+        .expect("allocate split-result destination");
+    gpu.hip
+        .memcpy_htod(&split_source, &split_payload)
+        .expect("upload split-result source");
+
+    gpu.hip
+        .event_record(&start, Some(&stream))
+        .expect("record split write start");
+    for _ in 0..COPY_ROUNDS {
+        gpu.hip
+            .memcpy_dtod_async_at(
+                &split_device,
+                0,
+                &split_source,
+                0,
+                HARMONIC_SPLIT_RESULT_EXTENT,
+                &stream,
+            )
+            .expect("timed split device-to-mapped copy");
+    }
+    gpu.hip
+        .event_record(&stop, Some(&stream))
+        .expect("record split write stop");
+    gpu.hip.event_synchronize(&stop).expect("wait split writes");
+    let split_write_us = f64::from(
+        gpu.hip
+            .event_elapsed_ms(&start, &stop)
+            .expect("time split mapped writes"),
+    ) * 1_000.0
+        / COPY_ROUNDS as f64;
+
+    gpu.hip
+        .event_record(&start, Some(&stream))
+        .expect("record split read start");
+    for _ in 0..COPY_ROUNDS {
+        gpu.hip
+            .memcpy_dtod_async_at(
+                &split_destination,
+                0,
+                &split_device,
+                0,
+                HARMONIC_SPLIT_RESULT_EXTENT,
+                &stream,
+            )
+            .expect("timed split mapped-to-device copy");
+    }
+    gpu.hip
+        .event_record(&stop, Some(&stream))
+        .expect("record split read stop");
+    gpu.hip.event_synchronize(&stop).expect("wait split reads");
+    let split_read_us = f64::from(
+        gpu.hip
+            .event_elapsed_ms(&start, &stop)
+            .expect("time split mapped reads"),
+    ) * 1_000.0
+        / COPY_ROUNDS as f64;
+    let mut observed_split = vec![0_u8; HARMONIC_SPLIT_RESULT_EXTENT];
+    gpu.hip
+        .memcpy_dtoh(&mut observed_split, &split_destination)
+        .expect("download split result");
+    assert_eq!(
+        observed_split, split_payload,
+        "split-result payload mismatch"
+    );
+    gpu.hip.free(split_source).expect("free split source");
+    gpu.hip
+        .free(split_destination)
+        .expect("free split destination");
+    unsafe {
+        gpu.hip
+            .host_unregister(split_host)
+            .expect("unregister split-result mapping");
+    }
+
     gpu.hip.event_destroy(start).expect("destroy start event");
     gpu.hip.event_destroy(stop).expect("destroy stop event");
     gpu.hip.stream_destroy(stream).expect("destroy copy stream");
@@ -239,5 +342,10 @@ fn main() {
         activation.len(),
         result.len(),
         (write_us + read_us) * 43.0 / 1_000.0,
+    );
+    println!(
+        "PASS split_result_bytes={} split_write_us={split_write_us:.3} split_read_us={split_read_us:.3} projected_43_layer_roundtrip_ms={:.3}",
+        HARMONIC_SPLIT_RESULT_EXTENT,
+        (split_write_us + split_read_us) * 43.0 / 1_000.0,
     );
 }
