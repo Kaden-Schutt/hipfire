@@ -22,12 +22,12 @@ use std::sync::Arc;
 use hip_bridge::HipRuntime;
 use radiowave::{CodeObjectCertification, KernelArgumentAccess, MutableReadCache};
 use redline_dispatch::aql::{
-    load_symbols, BatchFencePolicy, Executable, Gfx10DispatchInitiatorPolicy,
+    load_symbols, BatchFencePolicy, Executable, FenceScope, Gfx10DispatchInitiatorPolicy,
     Gfx10Pm4CommandBuffer, Gfx11ComputeResourceLimitsPolicy, Gfx11DispatchInterleave,
     Gfx12Pm4CommandBuffer, GpuBatchTiming, GpuDevice, GpuMultiQueueTiming, GpuSelector,
     HeaderPolicy, KernargBuffer, KernargPool, Kernel, LaunchGeometry, PciBusId,
     PhasedMultiQueuePm4Ib, QueuePolicy, RecordedDispatch, Runtime, SingleQueueBatchGraph,
-    SingleQueuePm4Ib,
+    SingleQueueBatchSubmission, SingleQueuePm4Ib,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2398,19 +2398,40 @@ pub struct PreparedLinearAqlReplay {
 }
 
 impl PreparedLinearAqlReplay {
-    /// # Safety
-    ///
-    /// Every pointer captured in the immutable explicit kernarg prefixes must
-    /// still refer to the same live Hipfire allocation and model instance.
-    pub unsafe fn replay_and_wait(&mut self) -> Result<GpuBatchTiming, String> {
+    fn patch_dynamic_bindings(&mut self) -> Result<(), String> {
         for dispatch in &self.dynamic_gdn_frames {
             let frame = crate::norm::reserve_gdn_requant_frames(1);
             self.graph
                 .patch_kernarg_u32(*dispatch, 76, frame)
                 .map_err(|error| error.to_string())?;
         }
+        Ok(())
+    }
+
+    /// # Safety
+    ///
+    /// Every pointer captured in the immutable explicit kernarg prefixes must
+    /// still refer to the same live Hipfire allocation and model instance.
+    pub unsafe fn replay_and_wait(&mut self) -> Result<GpuBatchTiming, String> {
+        self.patch_dynamic_bindings()?;
         // SAFETY: forwarded from the caller that owns the model allocations.
         unsafe { self.graph.replay_and_wait() }.map_err(|error| error.to_string())
+    }
+
+    /// Submit one checkpointed batch without waiting for its terminal signal.
+    ///
+    /// # Safety
+    ///
+    /// The pointer contract is identical to [`Self::replay_and_wait`]. Every
+    /// pointee must remain live until the returned ticket proves completion or
+    /// cancellation.
+    unsafe fn submit_checkpointed(&mut self) -> Result<SingleQueueBatchSubmission<'_>, String> {
+        if !self.graph.has_checkpoint() {
+            return Err("prepared AQL replay has no checkpoint".to_owned());
+        }
+        self.patch_dynamic_bindings()?;
+        // SAFETY: forwarded from the caller that owns the model allocations.
+        unsafe { self.graph.submit() }.map_err(|error| error.to_string())
     }
 
     pub fn dispatch_count(&self) -> usize {
@@ -2423,6 +2444,60 @@ impl PreparedLinearAqlReplay {
 
     pub fn queue_id(&self) -> u64 {
         self.graph.queue_id()
+    }
+}
+
+/// One observed owner-local retained batch. The checkpoint may be consumed
+/// while later packets remain in flight; dropping before terminal completion
+/// cancels the queue and invalidates the request-local route proof.
+#[must_use = "wait for the checkpoint and terminal completion"]
+pub struct CheckpointedLinearAqlSubmission<'a> {
+    submission: Option<SingleQueueBatchSubmission<'a>>,
+    observation: &'a mut ReplayObservation,
+    position: usize,
+}
+
+impl CheckpointedLinearAqlSubmission<'_> {
+    pub fn wait_checkpoint(&mut self, timeout: std::time::Duration) -> Result<(), String> {
+        let result = self
+            .submission
+            .as_mut()
+            .expect("checkpointed AQL submission was already completed")
+            .wait_checkpoint_timeout(timeout)
+            .map_err(|error| error.to_string());
+        if result.is_err() {
+            self.observation.failed = true;
+        }
+        result
+    }
+
+    pub fn wait(mut self, timeout: std::time::Duration) -> Result<GpuBatchTiming, String> {
+        let result = self
+            .submission
+            .take()
+            .expect("checkpointed AQL submission was already completed")
+            .wait_timeout(timeout)
+            .map_err(|error| error.to_string());
+        match result {
+            Ok(timing) => {
+                self.observation.count = self.observation.count.saturating_add(1);
+                self.observation.first_position.get_or_insert(self.position);
+                self.observation.last_position = Some(self.position);
+                Ok(timing)
+            }
+            Err(error) => {
+                self.observation.failed = true;
+                Err(error)
+            }
+        }
+    }
+}
+
+impl Drop for CheckpointedLinearAqlSubmission<'_> {
+    fn drop(&mut self) {
+        if self.submission.is_some() {
+            self.observation.failed = true;
+        }
     }
 }
 
@@ -3187,6 +3262,34 @@ impl ReplayController {
         device_ordinal: usize,
         prefix: usize,
     ) -> Result<(usize, usize, u64), String> {
+        self.prepare_linear_aql_prefix_inner(GpuSelector::Ordinal(device_ordinal), prefix, None)
+    }
+
+    /// Lower one exact-BDF owner-local batch with a host-observable checkpoint
+    /// after `checkpoint_dispatch`. Later packets remain in the same prepared
+    /// queue batch and may continue while the host handles the checkpoint.
+    pub fn prepare_checkpointed_linear_aql_prefix_for_pci_bus_id(
+        &mut self,
+        pci_bus_id: &str,
+        prefix: usize,
+        checkpoint_dispatch: usize,
+    ) -> Result<(usize, usize, u64), String> {
+        let pci_bus_id = pci_bus_id
+            .parse::<PciBusId>()
+            .map_err(|error| error.to_string())?;
+        self.prepare_linear_aql_prefix_inner(
+            GpuSelector::PciBusId(pci_bus_id),
+            prefix,
+            Some(checkpoint_dispatch),
+        )
+    }
+
+    fn prepare_linear_aql_prefix_inner(
+        &mut self,
+        selector: GpuSelector,
+        prefix: usize,
+        checkpoint_dispatch: Option<usize>,
+    ) -> Result<(usize, usize, u64), String> {
         if self.recorded.is_empty() {
             return Err("no captured launch sequence".to_owned());
         }
@@ -3199,7 +3302,7 @@ impl ReplayController {
         let runtime = Runtime::initialize(load_symbols().map_err(|error| error.to_string())?)
             .map_err(|error| error.to_string())?;
         let device = runtime
-            .select_gpu(GpuSelector::Ordinal(device_ordinal))
+            .select_gpu(selector)
             .map_err(|error| error.to_string())?;
         let pool = KernargPool::discover(&device).map_err(|error| error.to_string())?;
         let mut executables = BTreeMap::<PathBuf, Executable>::new();
@@ -3315,7 +3418,26 @@ impl ReplayController {
                 _ => {}
             }
         }
-        let graph = if self.request == ReplayBackendRequest::Auto {
+        if let Some(checkpoint) = checkpoint_dispatch {
+            let dispatch_count = headers.len();
+            let header = headers.get_mut(checkpoint).ok_or_else(|| {
+                format!(
+                    "AQL checkpoint dispatch {checkpoint} exceeds {} dispatches",
+                    dispatch_count
+                )
+            })?;
+            header.release = FenceScope::System;
+        }
+        let graph = if checkpoint_dispatch.is_some() {
+            SingleQueueBatchGraph::create_checkpointed_unprofiled_with_dispatch_headers(
+                &device,
+                queue_size,
+                dispatches,
+                BatchFencePolicy::BoundarySerialized,
+                headers,
+                checkpoint_dispatch.unwrap(),
+            )
+        } else if self.request == ReplayBackendRequest::Auto {
             SingleQueueBatchGraph::create_unprofiled_with_dispatch_headers(
                 &device,
                 queue_size,
@@ -3986,6 +4108,32 @@ impl ReplayController {
             unsafe { prepared.replay_and_wait() }
         };
         self.observe_replay_result(position, result)
+    }
+
+    /// Submit one owner-local retained AQL batch and return after queue
+    /// publication, leaving its checkpoint and terminal completion to the
+    /// caller. This is the segmented-tape primitive for finite CPU-mediated
+    /// cross-device handoff; the GPU queue never waits on peer-owned progress.
+    ///
+    /// # Safety
+    ///
+    /// The captured model allocations and all pointed-to buffers must remain
+    /// live until the returned ticket completes or cancels the submission.
+    pub unsafe fn submit_checkpointed_linear_aql(
+        &mut self,
+        position: usize,
+    ) -> Result<CheckpointedLinearAqlSubmission<'_>, String> {
+        let (prepared, observation) = (&mut self.prepared, &mut self.replay_observation);
+        let prepared = prepared
+            .as_mut()
+            .ok_or_else(|| "no prepared AQL replay".to_owned())?;
+        // SAFETY: forwarded from the model owner.
+        let submission = unsafe { prepared.submit_checkpointed()? };
+        Ok(CheckpointedLinearAqlSubmission {
+            submission: Some(submission),
+            observation,
+            position,
+        })
     }
 
     /// # Safety

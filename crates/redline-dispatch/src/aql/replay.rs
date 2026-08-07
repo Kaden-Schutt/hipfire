@@ -10,9 +10,9 @@ use redline_rocr::packet::{
     PacketError, PacketImage,
 };
 use redline_rocr::{
-    CompletionSignal, DEFAULT_WAIT_TIMEOUT, Gfx10Pm4CommandBuffer, Gfx12Pm4CommandBuffer,
-    GpuDevice, HeaderPolicy, KernargBuffer, KernargPool, Kernel, Pm4BuildError, QueueDepthReport,
-    QueueSet, RuntimeError,
+    CompletionSignal, DEFAULT_WAIT_TIMEOUT, FenceScope, Gfx10Pm4CommandBuffer,
+    Gfx12Pm4CommandBuffer, GpuDevice, HeaderPolicy, KernargBuffer, KernargPool, Kernel,
+    Pm4BuildError, QueueDepthReport, QueueSet, RuntimeError,
 };
 
 fn retained_queue_size(
@@ -1463,6 +1463,7 @@ pub struct SingleQueueBatchGraph {
     dispatches: Vec<RecordedDispatch>,
     first_signal: CompletionSignal,
     last_signal: CompletionSignal,
+    checkpoint_signal: Option<CompletionSignal>,
     final_signal: CompletionSignal,
     batch: Vec<PacketImage>,
     policy: BatchFencePolicy,
@@ -1505,7 +1506,7 @@ impl SingleQueueBatchGraph {
         headers: Vec<redline_rocr::HeaderPolicy>,
     ) -> Result<Self, ReplayError> {
         Self::create_with_dispatch_headers_mode(
-            device, queue_size, dispatches, policy, headers, true,
+            device, queue_size, dispatches, policy, headers, true, None,
         )
     }
 
@@ -1517,7 +1518,33 @@ impl SingleQueueBatchGraph {
         headers: Vec<redline_rocr::HeaderPolicy>,
     ) -> Result<Self, ReplayError> {
         Self::create_with_dispatch_headers_mode(
-            device, queue_size, dispatches, policy, headers, false,
+            device, queue_size, dispatches, policy, headers, false, None,
+        )
+    }
+
+    /// Build one retained owner-local batch with a host-observable completion
+    /// checkpoint after `checkpoint_dispatch`. The queue continues consuming
+    /// later packets while the host handles the checkpoint; submission still
+    /// uses one batch publication and one doorbell write.
+    ///
+    /// The checkpoint dispatch must carry a System release because the host
+    /// consumes data it published before observing the completion signal.
+    pub fn create_checkpointed_unprofiled_with_dispatch_headers(
+        device: &GpuDevice,
+        queue_size: u32,
+        dispatches: Vec<RecordedDispatch>,
+        policy: BatchFencePolicy,
+        headers: Vec<redline_rocr::HeaderPolicy>,
+        checkpoint_dispatch: usize,
+    ) -> Result<Self, ReplayError> {
+        Self::create_with_dispatch_headers_mode(
+            device,
+            queue_size,
+            dispatches,
+            policy,
+            headers,
+            false,
+            Some(checkpoint_dispatch),
         )
     }
 
@@ -1528,6 +1555,7 @@ impl SingleQueueBatchGraph {
         policy: BatchFencePolicy,
         headers: Vec<redline_rocr::HeaderPolicy>,
         profiling: bool,
+        checkpoint_dispatch: Option<usize>,
     ) -> Result<Self, ReplayError> {
         if dispatches.len() < 2 {
             return Err(ReplayError::InvalidBatchShape(
@@ -1542,6 +1570,23 @@ impl SingleQueueBatchGraph {
                     headers.len()
                 ),
             });
+        }
+        if let Some(checkpoint) = checkpoint_dispatch {
+            let Some(header) = headers.get(checkpoint) else {
+                return Err(ReplayError::PolicyShapeMismatch {
+                    detail: format!(
+                        "checkpoint dispatch {checkpoint} exceeds {} dispatches",
+                        dispatches.len()
+                    ),
+                });
+            };
+            if header.release != FenceScope::System {
+                return Err(ReplayError::PolicyShapeMismatch {
+                    detail: format!(
+                        "checkpoint dispatch {checkpoint} requires a System release header"
+                    ),
+                });
+            }
         }
         validate_nodes(device, 1, &dispatches)?;
         for dispatch in &dispatches {
@@ -1562,10 +1607,18 @@ impl SingleQueueBatchGraph {
         }
         let first_signal = CompletionSignal::new(device)?;
         let last_signal = CompletionSignal::new(device)?;
+        let checkpoint_signal = checkpoint_dispatch
+            .map(|_| CompletionSignal::new(device))
+            .transpose()?;
         let final_signal = CompletionSignal::new(device)?;
         let mut batch = Vec::with_capacity(dispatches.len() + 1);
         for (index, (dispatch, header)) in dispatches.iter().zip(&headers).enumerate() {
-            let completion = if profiling && index == 0 {
+            let completion = if checkpoint_dispatch == Some(index) {
+                checkpoint_signal
+                    .as_ref()
+                    .expect("checkpoint dispatch owns a signal")
+                    .raw()
+            } else if profiling && index == 0 {
                 first_signal.raw()
             } else if profiling && index + 1 == dispatches.len() {
                 last_signal.raw()
@@ -1613,6 +1666,7 @@ impl SingleQueueBatchGraph {
             dispatches,
             first_signal,
             last_signal,
+            checkpoint_signal,
             final_signal,
             batch,
             policy,
@@ -1637,6 +1691,10 @@ impl SingleQueueBatchGraph {
 
     pub fn queue_id(&self) -> u64 {
         self.queues.queue_ids().next().expect("one queue exists")
+    }
+
+    pub fn has_checkpoint(&self) -> bool {
+        self.checkpoint_signal.is_some()
     }
 
     /// Patch one dynamic scalar in retained kernarg storage between replays.
@@ -1692,6 +1750,9 @@ impl SingleQueueBatchGraph {
         }
         self.first_signal.reset();
         self.last_signal.reset();
+        if let Some(signal) = &mut self.checkpoint_signal {
+            signal.reset();
+        }
         self.final_signal.reset();
         if let Err(error) = self
             .queues
@@ -1779,6 +1840,45 @@ impl SingleQueueBatchGraph {
         }
     }
 
+    fn wait_checkpoint_internal(&mut self, timeout: Duration) -> Result<(), ReplayError> {
+        if !self.in_flight {
+            return Err(ReplayError::InvalidBatchShape(
+                "single-queue batch has no active submission",
+            ));
+        }
+        let signal = self
+            .checkpoint_signal
+            .as_ref()
+            .ok_or(ReplayError::InvalidBatchShape(
+                "single-queue batch has no checkpoint",
+            ))?;
+        match self.queues.wait_signal(signal, timeout) {
+            Ok(()) => Ok(()),
+            Err(wait_error) => match self.queues.inactivate_all() {
+                Ok(()) => {
+                    apply_quiescence_transition(
+                        &mut self.in_flight,
+                        &mut self.usable,
+                        QuiescenceTransition::Cancelled,
+                    );
+                    Err(wait_error.into())
+                }
+                Err(teardown_error) => {
+                    apply_quiescence_transition(
+                        &mut self.in_flight,
+                        &mut self.usable,
+                        QuiescenceTransition::Failed,
+                    );
+                    Err(RuntimeError::OperationAndTeardown {
+                        operation: Box::new(wait_error),
+                        teardown: Box::new(teardown_error),
+                    }
+                    .into())
+                }
+            },
+        }
+    }
+
     fn cancel_internal(&mut self) -> Result<(), ReplayError> {
         if !self.in_flight {
             return Ok(());
@@ -1817,6 +1917,16 @@ pub struct SingleQueueBatchSubmission<'a> {
 }
 
 impl SingleQueueBatchSubmission<'_> {
+    /// Wait until the retained batch's owner-local checkpoint completes while
+    /// leaving later packets in flight on the same queue.
+    pub fn wait_checkpoint(&mut self) -> Result<(), ReplayError> {
+        self.wait_checkpoint_timeout(DEFAULT_WAIT_TIMEOUT)
+    }
+
+    pub fn wait_checkpoint_timeout(&mut self, timeout: Duration) -> Result<(), ReplayError> {
+        self.graph.wait_checkpoint_internal(timeout)
+    }
+
     pub fn wait(self) -> Result<GpuBatchTiming, ReplayError> {
         self.wait_timeout(DEFAULT_WAIT_TIMEOUT)
     }
