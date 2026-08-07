@@ -24,9 +24,8 @@ use memmap2::{MmapMut, MmapOptions};
 use crate::harmonic::{
     HarmonicCompletion, HarmonicContract, HarmonicOwner, HarmonicProtocolError,
     HarmonicRoutePacket, HarmonicSlotState, DS4_MQ2R_0731_IDENTITY, HARMONIC_ACTIVATION_EXTENT,
-    HARMONIC_ACTIVATION_RESERVED_OFFSET, HARMONIC_EXPERT_IDS_OFFSET,
-    HARMONIC_RESULT_EXTENT, HARMONIC_ROUTE_IDENTITY, HARMONIC_ROUTE_WEIGHTS_OFFSET,
-    HARMONIC_SLOT_COUNT, HARMONIC_TOP_K,
+    HARMONIC_ACTIVATION_RESERVED_OFFSET, HARMONIC_EXPERT_IDS_OFFSET, HARMONIC_RESULT_EXTENT,
+    HARMONIC_ROUTE_IDENTITY, HARMONIC_ROUTE_WEIGHTS_OFFSET, HARMONIC_SLOT_COUNT, HARMONIC_TOP_K,
 };
 
 const HARMONIC_WIRE_MAGIC: u64 = 0x4453_3448_4950_4331; // DS4HIPC1
@@ -788,7 +787,12 @@ impl HarmonicSharedRing {
             HarmonicWireState::Publishing,
         )?;
         slot.flags.store(0, Ordering::Relaxed);
-        slot.epoch.store(packet.epoch, Ordering::Relaxed);
+        // The expert polls epoch before state. Publishing the epoch with
+        // release ordering guarantees that a peer which acquires the new
+        // epoch cannot subsequently observe the terminal state left by the
+        // prior occupant of this physical slot. The later Published release
+        // remains the packet/payload visibility gate.
+        slot.epoch.store(packet.epoch, Ordering::Release);
         slot.route_identity
             .store(packet.route_identity, Ordering::Relaxed);
         for (wire, value) in slot
@@ -912,8 +916,12 @@ impl HarmonicSharedRing {
     ) -> HarmonicIpcResult<HarmonicExpertPoll> {
         self.check_endpoint(HarmonicOwner::ExpertGfx1151, endpoint_generation)?;
         let slot = self.slot(epoch);
-        let state = slot.state()?;
         let observed_epoch = slot.epoch.load(Ordering::Acquire);
+        // Epoch must be sampled before state. A state-first poll can read the
+        // old occupant's Completed state, race a recycle+republish, then read
+        // the requested epoch and misclassify the new Published packet as an
+        // old terminal packet.
+        let state = slot.state()?;
         if observed_epoch != epoch {
             // The persistent worker is allowed to advance to the next logical
             // epoch before the source has resolved and recycled the older
@@ -954,8 +962,10 @@ impl HarmonicSharedRing {
         self.require_release_acquire_data_plane()?;
         self.check_endpoint(HarmonicOwner::ExpertGfx1151, endpoint_generation)?;
         let slot = self.slot(epoch);
-        let state = slot.state()?;
         let observed_epoch = slot.epoch.load(Ordering::Acquire);
+        // Keep this paired with expert_poll above; mapped and copied payload
+        // modes share the same double-buffer publication protocol.
+        let state = slot.state()?;
         if observed_epoch != epoch {
             if state == HarmonicWireState::Vacant || observed_epoch < epoch {
                 return Ok(HarmonicExpertMappedPoll::Pending);
@@ -1616,11 +1626,7 @@ mod tests {
 
         owner
             .ring
-            .write_mapped_activation_metadata(
-                1,
-                request.expert_ids,
-                request.route_weight_bits,
-            )
+            .write_mapped_activation_metadata(1, request.expert_ids, request.route_weight_bits)
             .unwrap();
         owner.ring.publish_mapped(request, 7, 0).unwrap();
         let mirrored = read_payload(&owner.ring.slot(1).activation_payload);
@@ -1707,6 +1713,45 @@ mod tests {
             owner.ring.expert_poll(3, 11).unwrap(),
             HarmonicExpertPoll::Pending
         );
+    }
+
+    #[test]
+    fn mapped_poll_acquires_republished_epoch_instead_of_old_terminal_state() {
+        let owner = TestRing::new_data_plane(7, 11);
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&owner.path)
+            .unwrap();
+        let peer = HarmonicSharedRing::open(&file).unwrap();
+
+        let (first, _) = request(owner.ring.contract(), 1, u64::MAX);
+        owner.ring.publish_mapped(first, 7, 0).unwrap();
+        assert!(matches!(
+            peer.expert_poll_mapped(1, 11).unwrap(),
+            HarmonicExpertMappedPoll::Work(_)
+        ));
+        peer.expert_complete_mapped(
+            1,
+            11,
+            HarmonicCompletion {
+                result_extent: HARMONIC_RESULT_EXTENT,
+                result_fingerprint: 0,
+            },
+        )
+        .unwrap();
+        owner.ring.source_resolve_mapped(1, 7).unwrap();
+        owner.ring.recycle(1).unwrap();
+
+        // Epoch 3 reuses epoch 1's physical slot. Once its release-publish is
+        // visible, the peer must acquire Work for epoch 3 and must never
+        // report epoch 1's terminal state under epoch 3's identity.
+        let (next, _) = request(owner.ring.contract(), 3, u64::MAX);
+        owner.ring.publish_mapped(next, 7, 0).unwrap();
+        match peer.expert_poll_mapped(3, 11).unwrap() {
+            HarmonicExpertMappedPoll::Work(packet) => assert_eq!(packet, next),
+            state => panic!("expected republished work, got {state:?}"),
+        }
     }
 
     #[test]
