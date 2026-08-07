@@ -32,6 +32,8 @@ SP1 is done when all of the following hold:
 3. The split-K occupancy default is chosen from a measured sweep, not guessed.
 4. Task 0's measured batching ceiling is recorded, and the §8 roofline estimates
    are either confirmed or replaced by the measurement.
+5. The asym3 quality gate (§13) has run on both models and its result is
+   recorded. asym3 does not become any model's batched default until it passes.
 
 ## 3. Decomposition and non-goals
 
@@ -52,15 +54,67 @@ The other three quarters are DeltaNet linear attention with recurrent state, and
 batching *those* is SP2. SP1 therefore cannot on its own produce an end-to-end
 throughput number — Task 0 exists to bound what it will be worth.
 
-## 4. Scope decision: Q8_0 only
+## 4. Scope decision: Q8_0 and asym3
 
-Both models declare `default_kv_mode: "q8"` in `registry/v1.json`. The
-asym{2,3,4} / fwht{2,3,4} / lloyd KV families are opt-in quality experiments;
-covering them would roughly triple the kernel surface for no benefit to the
-stated goal. They keep working unchanged on the single-sequence path.
+SP1 covers **two** KV modes: `Q8_0` and `asym3` (3-bit Givens-rotated Lloyd-Max
+K, Q8_0 V). The remaining modes — asym2, asym4, fwht{2,3,4}, lloyd — stay on the
+single-sequence path.
 
-If a rotated-K mode later becomes default, it gets its own spec. The descriptor
-ABI in §6 is dtype-agnostic, so that port is mechanical.
+### 4.1 Why both
+
+**Q8_0 is what these two models ship with today.** `registry/v1.json` sets
+`default_kv_mode: "q8"` for `qwen3.6:27b` and `qwen3.6:35b-a3b`, and
+`hipfire-cli/src/main.rs:5731` passes that registry value down as the KV-mode
+override. Leaving it on the single-sequence path would strand the production
+default.
+
+**asym3 is what `auto` means, and it is the capacity lever.** hipfire's own
+resolution logic is explicit:
+
+- `normalize_full()` maps `"auto"` / `"turbo"` / `"turbo3"` → `Asym3`
+  (`crates/hipfire-runtime/src/kv_mode.rs:62`)
+- `QWEN35_HFQ_POLICY.default = Asym3` — the qwen35 carrier's own default
+- the `Asym3Auto` sentinel collapses to `Asym3` **iff `head_dim == 256`**, and
+  both target models are 256
+- there is a test named `qwen35_default_kv_mode_is_asym3`
+- `PRIOR-ART.md` §6 describes it as the best-quality rotated K per RotorQuant
+
+An earlier draft of this spec called the asym family "opt-in quality
+experiments" on the strength of the registry value alone. That was wrong: it is
+true of production today, but the library default and everything `auto` resolves
+to is asym3.
+
+### 4.2 What asym3 buys
+
+Nominal K 3-bit + V 8-bit against 8+8 gives 0.6875× the KV bytes (block scales
+and rotation tables are secondary and ignored here). At 4 agents × 128K context:
+
+| | Q8_0 | asym3 |
+|---|---|---|
+| 27B KV | 17.2 GB → **32.2 GB total, does not fit** | 11.8 GB → **26.8 GB total, fits** |
+| 35B-A3B KV | 5.4 GB → 25.5 GB, fits | 3.7 GB → 23.8 GB, fits |
+
+Capacity is the lesser half. KV traffic is the term that **never amortises
+across slots** (§8), so cutting it by 31% raises the batching ceiling itself,
+not merely the memory headroom.
+
+### 4.3 Why this is cheap
+
+asym{2,3,4} and fwht{2,3,4} all route through a single shared
+`launch_asym_flash_batched` helper whose `positions[]` / `k_cache` / `max_seq` /
+`batch_size` structure matches the Q8 path, and the asym family shares
+`attention_flash_asym_reduce_batched`. So asym3 costs roughly two more `.hip`
+files plus one shared-launcher edit — and doing the descriptor work *in that
+shared helper* puts asym2/asym4/fwht* within trivial reach later without
+widening SP1 now.
+
+### 4.4 Trap to remember
+
+`QWEN35_PARO_POLICY` deliberately omits `Asym3` from its `accepted` set, so
+`HIPFIRE_KV_MODE=asym3` **silently yields q8** on that loader path
+(`kv_mode.rs:84`). That is easy to misread as a broken kernel or a no-op
+optimisation. Any asym3 measurement must first confirm the resolved mode from
+the carrier's own `KV cache:` log line.
 
 ## 5. Prior art
 
@@ -74,6 +128,8 @@ Everything below is present on `origin/beta`.
 | `attention_flash_q8_0_tile_batched` + `attention_flash_q8_0_reduce` | Tile + reduce two-kernel split with partial `(m, l, acc)` combining. LDS is `O(tile)`, not `O(ctx)`. |
 | `attention_q8_0_flash_prefill` (+ `_wmma`) (`attention.rs:1822`) | FlashAttention-2 shaped; launches `grid = [batch.div_ceil(br), n_heads]` — i.e. **already tiled into BR-sized row tiles**. |
 | `attention_decode_batched_history` | Same "one workgroup per (head, query row)" idiom in F32. |
+| `launch_asym_flash_batched` (`attention.rs:3443`) | **One shared launcher** behind asym{2,3,4} and fwht{2,3,4}, same `positions[]` / `k_cache` / `max_seq` / `batch_size` structure as the Q8 path. Adding the descriptor here covers asym3 now and the rest almost free later. |
+| `attention_flash_asym_reduce_batched` | Shared partial-combiner for the whole asym family — the asym counterpart of `attention_flash_q8_0_reduce`. |
 | DDTree tree-attention bias (`PRIOR-ART.md` §7) | Per-row masking already overlays a verify mask onto these kernels. |
 | ds4 expert paging (`8d002eec`, `ca31ebcf`) | Precedent for device-side pointer tables, including "skip the upload when nothing moved". |
 
@@ -164,6 +220,22 @@ Per layer, one K arena and one V arena. A slot occupies a contiguous slab of
 them. `seq_len <= cap` always; the kernel reads `[0, seq_len)` and never touches
 bytes beyond it, which is what makes the isolation test in §9 meaningful.
 
+### 6.5 Kernels in scope
+
+| Kernel | Mode | Role |
+|---|---|---|
+| `attention_q8_0_kv_batched` | Q8_0 | LDS `scores[ctx]`, short context |
+| `attention_flash_q8_0_tile_batched` + `attention_flash_q8_0_reduce` | Q8_0 | tile + reduce, long context |
+| `attention_q8_0_flash_prefill` (+ `_wmma`) | Q8_0 | FA-2 prefill, large M |
+| `attention_flash_asym3_tile_batched` + `attention_flash_asym_reduce_batched`, via `launch_asym_flash_batched` | asym3 | tile + reduce, long context |
+
+Routing between the LDS and tile paths stays on the existing
+`Q8_BATCHED_LDS_CROSSOVER` logic; SP1 does not change the crossover value.
+
+The prefill kernel is in scope so a batch can mix chunked prefill with decode
+from the start — agents arrive with long prompts mid-flight, and deferring this
+would force SP3 to re-cut the tile list.
+
 ## 7. Occupancy and split-K
 
 At `N = 4`, `M = 1`, `n_heads = 16` the decode grid is 64 workgroups. The R9700
@@ -197,7 +269,8 @@ ignore embedding-table gathers and assume ~0.55 B/param at mq4.
 |---|---|---|
 | Layers / full-attention | 64 / 16 | 40 / 10 |
 | Heads (q/kv), head_dim | 24 / 4, 256 | 16 / 2, 256 |
-| KV per token | **32 KB** | **10 KB** |
+| KV per token, Q8_0 | **32 KB** | **10 KB** |
+| KV per token, asym3 | **22 KB** | **6.9 KB** |
 | Weights per step, batched | ~15 GB (all amortise) | ~1.2 GB dense + ~2.2 GB experts |
 | KV per step, 4 slots @32K | 4.3 GB | 1.3 GB |
 | Batched total | 19.3 GB | 4.7 GB |
@@ -208,6 +281,9 @@ Two structural facts drive this:
 
 - **Attention KV reads never amortise across slots.** Unlike weights, they scale
   linearly with batch. The longer the agents' contexts, the less batching buys.
+  This is why asym3 matters for throughput and not only for capacity: at 0.6875×
+  the KV bytes it shrinks the one term that batching cannot help with. The table
+  above is the Q8_0 case; asym3 raises both aggregate speedups.
 - **MoE expert reads barely amortise at small batch.** Four sequences drawing
   top-8 of 256 experts collide rarely, so expert traffic scales ~4×. Only the
   dense half of the 35B amortises.
@@ -239,15 +315,20 @@ Three layers, each cheap to run.
    size; non-multiples of BR/BC; GQA groups 6:1 (27B) and 8:1 (35B); a mixed
    batch of one prefill tile plus three decode tiles.
 
+All three run for **both** KV modes. The asym3 arm must assert its resolved mode
+first — see the §4.4 trap, where a silent fall back to q8 would make an untouched
+asym3 path look correct.
+
 Harness: extend `crates/rdna-compute/examples/test_q8_flash_prefill.rs`, which
 already avoids the ~10 s model load.
 
 ## 10. Benchmark
 
-Extend `q8_batched_attn_microbench.rs` to sweep `(n_slots, M_s, ctx_s)` and
-report attention-kernel milliseconds plus aggregate effective tok/s against the
-`n_slots ×` sequential baseline. Sweep `target_wgs` and `MIN_CHUNK` to pick the
-split-K defaults.
+Extend `q8_batched_attn_microbench.rs` to sweep `(kv_mode, n_slots, M_s, ctx_s)`
+and report attention-kernel milliseconds plus aggregate effective tok/s against
+the `n_slots ×` sequential baseline. Sweep `target_wgs` and `MIN_CHUNK` to pick
+the split-K defaults; asym3 and Q8_0 may want different ones, since asym3 moves
+fewer bytes per KV element and so shifts the compute/bandwidth balance.
 
 **A 32 GB budget assertion in the harness is mandatory.** This box has ~125 GiB
 of shared memory; an over-budget design would otherwise pass here and OOM on the
@@ -268,6 +349,13 @@ target.
 - **Split-K changes accumulation order**, so golden tests are tolerance-based;
   a regression that shifts numerics slightly could hide inside tolerance. The
   isolation test is the sharper instrument and should gate merges.
+- **asym3 could silently resolve to q8** on the PaRo loader path (§4.4), making
+  a completely unimplemented asym3 arm pass every test and show no speedup. Every
+  asym3 result must carry the resolved-mode log line as evidence.
+- **asym3 is not the shipped default for these models**, so widening scope to it
+  imports a quality question SP1 would not otherwise have. §13 contains it, but
+  if the gate fails, the capacity argument in §4.2 fails with it and the 27B's
+  4-agent × 128K configuration goes back to not fitting.
 
 ## 12. Task 0 — empirical batching-ceiling probe
 
@@ -291,3 +379,67 @@ are decoded, rather than assuming disjointness. That number is what turns the
 
 Deliverable: a short results note under `docs/perf-checkpoints/`, and either
 confirmation of the §8 table or a corrected one.
+
+## 13. asym3 quality gate
+
+asym3 is **not** what `qwen3.6:27b` and `qwen3.6:35b-a3b` ship with — they ship
+q8 (§4.1). SP1 makes asym3 *available* batched; this gate decides whether it may
+become the batched default for either model.
+
+Measure asym3 against a q8 reference on **both** models:
+
+- **KLD of next-token distributions** over a fixed prompt set, using the existing
+  KLD tooling (`benchmarks/quality-baselines/harness/kld_reduce.py`,
+  `scripts/reap/kld_compare.py`). Report mean *and* median — the two diverge
+  sharply on long-tail distributions and the mean alone has misled before.
+- **KV-mode identicality** via `scripts/kv_quality_dashboard.py`, which already
+  exists for exactly this comparison.
+- **Coherence** via the `coherence-gate-qwen35-*` scripts on real prose and code
+  prompts at the long contexts agents actually run at — not short prompts, since
+  rotated-K error accumulates with context.
+
+**Method constraint:** score on the model's *own* generated output, not on a
+reference completion. Scoring against reference output flatters the quantised
+model and understates divergence.
+
+**Do not use synthetic filler prompts.** Long prompts built from a small random
+vocabulary are pathologically out-of-distribution and degenerate into gibberish
+on *both* arms, which reads as a quantisation failure and is not one.
+
+Outcome is one of: asym3 becomes the batched default for a model; asym3 stays
+opt-in via `HIPFIRE_KV_MODE`; or asym3 is rejected for a model with the numbers
+recorded. Any of the three is an acceptable result for SP1 — the gate exists so
+the choice is made on measurement.
+
+## 14. Considered and rejected: spilling experts to host RAM
+
+Spilling the 35B's MoE experts to host memory to free VRAM was considered. The
+machinery exists — `hipfire_runtime::weight_pager::WeightPager` and
+`Qwen35Config::paged_experts`, with device-side expert pointer tables — so it
+would be cheap to attempt. It is rejected for this program on four grounds:
+
+1. **The prior art already reached this verdict.** The ds4 expert-streaming
+   design states it as a non-goal: *"Non-goal: interactive serving speed.
+   Streaming trades throughput hard."* That work was NVMe-backed (3.13 GB/s
+   measured, ~1.8 tok/s floor at total miss), so host RAM is a materially better
+   regime — but its other warning transfers intact: **expert routing skew is
+   uncharacterised**, so hit rate at a given resident budget is unknown.
+2. **Bandwidth.** The R9700 is roughly 645 GB/s local against ~50 GB/s practical
+   for PCIe 5.0 x16 — about 13× slower. Expert traffic is ~0.53 GB per decode
+   step at batch 1; resident that is ~0.8 ms, spilled ~10.6 ms, which exceeds the
+   entire rest of the step.
+3. **Spill and batching are antagonistic.** Four sequences drawing top-8 from 256
+   experts collide rarely, so the expert working set grows nearly linearly with
+   batch. The PCIe term therefore scales with `N` — and it is precisely the term
+   batching is meant to amortise. At batch 4 that is ~2.1 GB/step over PCIe,
+   ~42 ms.
+4. **The 35B is not the model with the fit problem.** Per §8, 4 agents at 128K is
+   25.5 GB for the 35B (fits, with headroom) and 32.2 GB for the 27B (does not).
+   The 27B is dense — it has no experts to spill. asym3 (§4.2) solves the actual
+   binding constraint, and reduces bandwidth rather than relocating it to a
+   13×-slower bus.
+
+**Hazard if this is ever revisited:** the Strix Halo development box has unified
+memory, so a spilled-expert design would show **no** penalty in testing here and
+fall off a cliff on the R9700. Any such experiment needs R9700 access to mean
+anything. This is the same class of hazard as the 32 GB budget assertion in §10.
