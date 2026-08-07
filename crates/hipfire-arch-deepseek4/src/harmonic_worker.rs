@@ -320,6 +320,16 @@ impl DeepseekV4HarmonicExpertService {
                 .as_ref()
                 .ok_or_else(|| "harmonic mapped expert local stream missing".to_owned())?;
             gpu.hip
+                .memcpy_dtod_async_at(
+                    &self.x_rot.as_ref().unwrap().buf,
+                    0,
+                    activation_payload,
+                    0,
+                    HARMONIC_X_ROT_BYTES,
+                    stream,
+                )
+                .map_err(|error| format!("harmonic mapped expert stage local x_rot: {error}"))?;
+            gpu.hip
                 .memcpy_htod_async(
                     &self.topk_indices.as_ref().unwrap().buf,
                     &self.topk_index_bytes,
@@ -339,16 +349,6 @@ impl DeepseekV4HarmonicExpertService {
                 .map_err(|error| format!("harmonic mapped expert zero result: {error}"))?;
         }
 
-        let x_rot = GpuTensor {
-            // SAFETY: the process-local `HarmonicGpuMapping` owns this live HIP
-            // registration across the synchronous call. The payload begins
-            // with exactly one 4096-element F32 activation.
-            buf: unsafe {
-                DeviceBuffer::from_raw(activation_payload.as_ptr(), HARMONIC_X_ROT_BYTES)
-            },
-            shape: vec![HARMONIC_HIDDEN_SIZE],
-            dtype: DType::F32,
-        };
         let layer_index = packet.layer as usize;
         let layer = weights.resolve_layer(layer_index);
         let expert_gate_up_ptrs = layer.expert_gate_up_ptrs.as_ref().ok_or_else(|| {
@@ -365,7 +365,7 @@ impl DeepseekV4HarmonicExpertService {
             uses_atomic_moe_down: weights.mq2r_backend.uses_atomic_moe_down(),
             native_mq2_backend: weights.mq2r_backend.bias_aware_native_backend(),
             batch_size: 1,
-            x_rot: &x_rot,
+            x_rot: self.x_rot.as_ref().unwrap(),
             ffn_out: self.routed_partial.as_ref().unwrap(),
             expert_gate_up_ptrs,
             expert_down_ptrs,
