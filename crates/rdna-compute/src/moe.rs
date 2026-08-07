@@ -8,9 +8,141 @@ use std::ffi::c_void;
 
 use crate::dispatch::{Gpu, GpuTensor};
 use crate::kernels;
-use hip_bridge::HipResult;
+use hip_bridge::{DeviceBuffer, HipResult};
 
 impl Gpu {
+    /// Release-publish one epoch-typed DS4 harmonic route from exact gfx1100.
+    ///
+    /// The registered host mapping remains process-local. Only its six local
+    /// aliases are passed here; no HIP pointer crosses to the gfx1151 process.
+    #[allow(clippy::too_many_arguments)]
+    pub fn deepseek4_harmonic_publish_gfx1100(
+        &mut self,
+        header: &DeviceBuffer,
+        slot0: &DeviceBuffer,
+        slot1: &DeviceBuffer,
+        activation0: &DeviceBuffer,
+        activation1: &DeviceBuffer,
+        x_rot: &GpuTensor,
+        topk_indices: &GpuTensor,
+        topk_weights: &GpuTensor,
+        token_control: &GpuTensor,
+        layer: usize,
+        status: &GpuTensor,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert!(
+            self.arch_caps.is_gfx1100(),
+            "harmonic GPU publication requires exact gfx1100"
+        );
+        const KERNEL: &str = "deepseek4_harmonic_publish_gfx1100";
+        self.ensure_kernel(
+            KERNEL,
+            kernels::DEEPSEEK4_HARMONIC_MAILBOX_GFX1100_SRC,
+            KERNEL,
+        )?;
+        let header_ptr = header.as_ptr();
+        let slot0_ptr = slot0.as_ptr();
+        let slot1_ptr = slot1.as_ptr();
+        let activation0_ptr = activation0.as_ptr();
+        let activation1_ptr = activation1.as_ptr();
+        let x_ptr = x_rot.buf.as_ptr();
+        let indices_ptr = topk_indices.buf.as_ptr();
+        let weights_ptr = topk_weights.buf.as_ptr();
+        let control_ptr = token_control.buf.as_ptr();
+        let layer_i32 = layer as i32;
+        let status_ptr = status.buf.as_ptr();
+        let mut params: Vec<*mut c_void> = vec![
+            &header_ptr as *const _ as *mut c_void,
+            &slot0_ptr as *const _ as *mut c_void,
+            &slot1_ptr as *const _ as *mut c_void,
+            &activation0_ptr as *const _ as *mut c_void,
+            &activation1_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &indices_ptr as *const _ as *mut c_void,
+            &weights_ptr as *const _ as *mut c_void,
+            &control_ptr as *const _ as *mut c_void,
+            &layer_i32 as *const _ as *mut c_void,
+            &status_ptr as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(KERNEL, [256, 1, 1], [256, 1, 1], 0, &mut params, || {
+            let mut blob = hip_bridge::KernargBlob::new();
+            blob.push_ptr(header_ptr);
+            blob.push_ptr(slot0_ptr);
+            blob.push_ptr(slot1_ptr);
+            blob.push_ptr(activation0_ptr);
+            blob.push_ptr(activation1_ptr);
+            blob.push_ptr(x_ptr);
+            blob.push_ptr(indices_ptr);
+            blob.push_ptr(weights_ptr);
+            blob.push_ptr(control_ptr);
+            blob.push_i32(layer_i32);
+            blob.push_ptr(status_ptr);
+            blob
+        })
+    }
+
+    /// Wait for and copy one gfx1151 expert result on exact gfx1100.
+    /// `max_wait_clocks` is a hard device-side bound. The first error latches
+    /// `status`, causing later layers to fail fast rather than stack waits.
+    #[allow(clippy::too_many_arguments)]
+    pub fn deepseek4_harmonic_wait_copy_gfx1100(
+        &mut self,
+        slot0: &DeviceBuffer,
+        slot1: &DeviceBuffer,
+        result0: &DeviceBuffer,
+        result1: &DeviceBuffer,
+        routed_partial: &GpuTensor,
+        token_control: &GpuTensor,
+        layer: usize,
+        max_wait_clocks: u64,
+        status: &GpuTensor,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert!(
+            self.arch_caps.is_gfx1100(),
+            "harmonic GPU result wait requires exact gfx1100"
+        );
+        const KERNEL: &str = "deepseek4_harmonic_wait_copy_gfx1100";
+        self.ensure_kernel(
+            KERNEL,
+            kernels::DEEPSEEK4_HARMONIC_MAILBOX_GFX1100_SRC,
+            KERNEL,
+        )?;
+        let slot0_ptr = slot0.as_ptr();
+        let slot1_ptr = slot1.as_ptr();
+        let result0_ptr = result0.as_ptr();
+        let result1_ptr = result1.as_ptr();
+        let routed_ptr = routed_partial.buf.as_ptr();
+        let control_ptr = token_control.buf.as_ptr();
+        let layer_i32 = layer as i32;
+        let status_ptr = status.buf.as_ptr();
+        let mut params: Vec<*mut c_void> = vec![
+            &slot0_ptr as *const _ as *mut c_void,
+            &slot1_ptr as *const _ as *mut c_void,
+            &result0_ptr as *const _ as *mut c_void,
+            &result1_ptr as *const _ as *mut c_void,
+            &routed_ptr as *const _ as *mut c_void,
+            &control_ptr as *const _ as *mut c_void,
+            &layer_i32 as *const _ as *mut c_void,
+            &max_wait_clocks as *const _ as *mut c_void,
+            &status_ptr as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(KERNEL, [256, 1, 1], [256, 1, 1], 0, &mut params, || {
+            let mut blob = hip_bridge::KernargBlob::new();
+            blob.push_ptr(slot0_ptr);
+            blob.push_ptr(slot1_ptr);
+            blob.push_ptr(result0_ptr);
+            blob.push_ptr(result1_ptr);
+            blob.push_ptr(routed_ptr);
+            blob.push_ptr(control_ptr);
+            blob.push_i32(layer_i32);
+            blob.push_u64(max_wait_clocks);
+            blob.push_ptr(status_ptr);
+            blob
+        })
+    }
+
     /// Combine pass for the atomic-free MoE down path. Sums K_TOP expert
     /// outputs per (token, m) weighted by topk_weights, accumulates into
     /// the residual stream. No cross-token contention — each token writes

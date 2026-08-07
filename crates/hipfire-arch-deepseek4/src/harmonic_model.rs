@@ -15,7 +15,7 @@ use hip_bridge::{Event, Stream};
 use hipfire_config::{Deepseek4ComputePlacement, DeviceSelector};
 use hipfire_runtime::arch::Architecture;
 use hipfire_runtime::hfq::HfqFile;
-use rdna_compute::Gpu;
+use rdna_compute::{DType, Gpu, GpuTensor};
 
 use crate::arch::DeepseekV4HeterogeneousProjection;
 use crate::deepseek4::{DeepseekV4Config, DeepseekV4DenseWeights, DeepseekV4State};
@@ -133,6 +133,8 @@ pub(crate) struct DeepseekV4HarmonicExecution {
     pub(crate) route_ready_event: Option<Event>,
     pub(crate) ring: HarmonicSharedRing,
     pub(crate) mapping: Option<HarmonicGpuMapping>,
+    pub(crate) mailbox_token_control: Option<GpuTensor>,
+    pub(crate) mailbox_status: Option<GpuTensor>,
     pub(crate) worker: Option<HarmonicExpertWorkerProcess>,
     pub(crate) contract: HarmonicContract,
     pub(crate) source_generation: u64,
@@ -161,6 +163,18 @@ impl DeepseekV4HarmonicExecution {
         }
         gpu.bind_thread()
             .map_err(|error| format!("deepseek4 harmonic bind gfx1100 execution: {error}"))?;
+        let mailbox_token_control = gpu
+            .alloc_tensor(&[4], DType::F32)
+            .map_err(|error| format!("deepseek4 harmonic mailbox token control: {error:?}"))?;
+        let mailbox_status = match gpu.alloc_tensor(&[1], DType::F32) {
+            Ok(status) => status,
+            Err(error) => {
+                let _ = gpu.free_tensor(mailbox_token_control);
+                return Err(format!(
+                    "deepseek4 harmonic mailbox status allocation: {error:?}"
+                ));
+            }
+        };
         let mut execution = Self {
             dense_attn_stream: None,
             dense_attn_fork_event: None,
@@ -169,6 +183,8 @@ impl DeepseekV4HarmonicExecution {
             route_ready_event: None,
             ring,
             mapping: Some(mapping),
+            mailbox_token_control: Some(mailbox_token_control),
+            mailbox_status: Some(mailbox_status),
             worker: Some(worker),
             contract,
             source_generation: contract.source_allocation_generation,
@@ -254,6 +270,83 @@ impl DeepseekV4HarmonicExecution {
         Ok(self.epoch)
     }
 
+    pub(crate) fn prepare_gpu_mailbox_token(
+        &mut self,
+        gpu: &mut Gpu,
+        layers: usize,
+    ) -> Result<u64, String> {
+        let base_epoch = self
+            .epoch
+            .checked_add(1)
+            .ok_or_else(|| "deepseek4 harmonic epoch exhausted".to_owned())?;
+        self.epoch = self
+            .epoch
+            .checked_add(layers as u64)
+            .ok_or_else(|| "deepseek4 harmonic epoch batch exhausted".to_owned())?;
+        let now = harmonic_monotonic_tick()
+            .map_err(|error| format!("harmonic mailbox token clock: {error}"))?;
+        let deadline = now.saturating_add(
+            self.layer_timeout
+                .as_nanos()
+                .saturating_mul(layers as u128)
+                .min(u64::MAX as u128) as u64,
+        );
+        let mut control = [0_u8; 16];
+        control[..8].copy_from_slice(&base_epoch.to_ne_bytes());
+        control[8..].copy_from_slice(&deadline.to_ne_bytes());
+        gpu.memcpy_htod_auto(
+            &self
+                .mailbox_token_control
+                .as_ref()
+                .ok_or_else(|| "harmonic mailbox token control released".to_owned())?
+                .buf,
+            &control,
+        )
+        .map_err(|error| format!("harmonic mailbox token control upload: {error}"))?;
+        gpu.memcpy_htod_auto(
+            &self
+                .mailbox_status
+                .as_ref()
+                .ok_or_else(|| "harmonic mailbox status released".to_owned())?
+                .buf,
+            &[0_u8; 4],
+        )
+        .map_err(|error| format!("harmonic mailbox status reset: {error}"))?;
+        Ok(base_epoch)
+    }
+
+    pub(crate) fn finish_gpu_mailbox_token(&mut self, gpu: &mut Gpu) -> Result<(), String> {
+        let mut bytes = [0_u8; 4];
+        gpu.bind_thread()
+            .map_err(|error| format!("harmonic mailbox status bind: {error}"))?;
+        gpu.hip
+            .memcpy_dtoh(
+                &mut bytes,
+                &self
+                    .mailbox_status
+                    .as_ref()
+                    .ok_or_else(|| "harmonic mailbox status released".to_owned())?
+                    .buf,
+            )
+            .map_err(|error| format!("harmonic mailbox status download: {error}"))?;
+        let status = u32::from_ne_bytes(bytes);
+        if status == 0 {
+            return Ok(());
+        }
+        let reason = match status {
+            1 => "expert endpoint isolated before publication",
+            2 => "mailbox slot was not quiescent at publication",
+            3 => "bounded expert result wait expired",
+            4 => "expert returned a non-completed terminal state",
+            5 => "expert result extent violated the frozen contract",
+            _ => "unknown GPU mailbox status",
+        };
+        let cause = self.isolate_worker(format!(
+            "deepseek4 harmonic GPU mailbox failure status={status}: {reason}"
+        ));
+        Err(cause)
+    }
+
     pub(crate) fn isolate_worker(&mut self, cause: String) -> String {
         let Some(mut worker) = self.worker.take() else {
             return format!("{cause}; harmonic expert worker already isolated");
@@ -293,6 +386,17 @@ impl DeepseekV4HarmonicExecution {
             }
         }
         self.mapping.take();
+        for tensor in [
+            self.mailbox_status.take(),
+            self.mailbox_token_control.take(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if let Err(error) = gpu.free_tensor(tensor) {
+                errors.push(format!("free gfx1100 harmonic mailbox tensor: {error:?}"));
+            }
+        }
         for event in [
             self.route_ready_event.take(),
             self.dense_attn_fork_event.take(),
