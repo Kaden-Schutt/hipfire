@@ -48,7 +48,11 @@ def merge_intervals(intervals):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("kernel_trace")
-    parser.add_argument("rccl_trace")
+    parser.add_argument(
+        "rccl_trace",
+        nargs="?",
+        help="optional RCCL API trace; omit when the route issued no RCCL calls",
+    )
     parser.add_argument("--steps", type=int, default=32)
     args = parser.parse_args()
     if args.steps <= 0:
@@ -102,14 +106,15 @@ def main():
         all_intervals.append(interval)
 
     rccl = defaultdict(lambda: [0, 0])
-    for row, columns in rows(args.rccl_trace):
-        start = int(row[columns["Start_Timestamp"]])
-        end = int(row[columns["End_Timestamp"]])
-        if end <= window_start or start > window_end:
-            continue
-        name = row[columns["Function"]]
-        rccl[name][0] += 1
-        rccl[name][1] += min(end, window_end) - max(start, window_start)
+    if args.rccl_trace:
+        for row, columns in rows(args.rccl_trace):
+            start = int(row[columns["Start_Timestamp"]])
+            end = int(row[columns["End_Timestamp"]])
+            if end <= window_start or start > window_end:
+                continue
+            name = row[columns["Function"]]
+            rccl[name][0] += 1
+            rccl[name][1] += min(end, window_end) - max(start, window_start)
 
     kernel_rows = []
     for name, (calls, total_ns) in kernels.items():
