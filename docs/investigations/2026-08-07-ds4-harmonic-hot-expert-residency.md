@@ -144,9 +144,10 @@ requires:
 4. Each slot uses the original raw-bit route weight at the same multiplication
    point as the single-device kernel.
 5. The result payload grows from one 16 KiB aggregate to at most six 16 KiB
-   slot results per layer. This remains small compared with the approximately
-   4.2 MiB/token activation/result traffic and avoids transferring 7.1 MB
-   expert payloads per selection.
+   slot results per layer. A fixed six-row result plus the activation is at
+   most about 4.70 MiB/token across 43 layers, and avoids transferring 7.1 MB
+   expert payloads per selection. A later compaction may transmit only the
+   remote-owned rows after it proves that the packing cost pays.
 
 The typed `HarmonicExpertResidencyPlan` stores a canonical bitmap and stable
 identity, rejects duplicate/out-of-range slots and insufficient capacity, and
@@ -154,6 +155,13 @@ partitions each route slot to an explicit owner. The CPU-only artifact
 projection rejects any selected w1/w2/w3 tensor that is absent, is not
 `MQ2G256Lloyd` (`qt=19`), has a different exact slot extent, or exceeds the
 declared budget.
+
+The follow-on DS4HARM3 result contract is now versioned separately from the
+existing aggregate-result DS4HARM2 route. It assigns every slot to exactly one
+owner, rejects overlap/gaps/unknown mask bits, ignores stale unowned rows, and
+folds the six selected rows with the same ordered fused multiply-add sequence
+as `moe_down_combine_k8_batched`. The CPU split-vs-monolithic oracle is raw-bit
+identical across all 4,096 output columns.
 
 ## 6. Preceding experiments closed at this checkpoint
 

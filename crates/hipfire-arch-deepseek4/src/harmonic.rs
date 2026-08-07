@@ -26,6 +26,9 @@ pub const HARMONIC_ACTIVATION_RESERVED_OFFSET: usize =
     HARMONIC_ROUTE_WEIGHTS_OFFSET + HARMONIC_TOP_K * std::mem::size_of::<u32>();
 pub const HARMONIC_ACTIVATION_EXTENT: u32 = (HARMONIC_ACTIVATION_RESERVED_OFFSET + 16) as u32;
 pub const HARMONIC_RESULT_EXTENT: u32 = HARMONIC_X_ROT_BYTES as u32;
+pub const HARMONIC_HOTSET_ROUTE_IDENTITY: u64 = 0x4453_3448_4152_4d33; // DS4HARM3
+pub const HARMONIC_ROUTE_SLOT_RESULT_BYTES: usize = HARMONIC_X_ROT_BYTES;
+pub const HARMONIC_SPLIT_RESULT_EXTENT: usize = HARMONIC_TOP_K * HARMONIC_ROUTE_SLOT_RESULT_BYTES;
 pub const DS4_MQ2R_0731_IDENTITY: [u8; 32] = [
     0xcb, 0xf2, 0xbb, 0xcf, 0xa3, 0xf4, 0x7b, 0x17, 0x12, 0xa0, 0x71, 0x83, 0x6b, 0x2c, 0x48, 0x23,
     0x2d, 0xad, 0x7d, 0xfb, 0x76, 0x38, 0x13, 0xa7, 0x20, 0xf7, 0xd3, 0x48, 0xa9, 0x31, 0x8c, 0xce,
@@ -100,6 +103,151 @@ impl HarmonicExpertSlot {
 pub enum HarmonicExpertExecutionOwner {
     DenseGfx1100,
     ExpertGfx1151,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum HarmonicSplitResultError {
+    InvalidMaskBits(u8),
+    OverlappingOwners(u8),
+    MissingOwners(u8),
+    InvalidOutputExtent {
+        owner: HarmonicExpertExecutionOwner,
+        got: usize,
+        expected: usize,
+    },
+    InvalidResidualExtent {
+        got: usize,
+        expected: usize,
+    },
+    InvalidRouteWeight(usize),
+}
+
+impl fmt::Display for HarmonicSplitResultError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "deepseek4 harmonic split result: {self:?}")
+    }
+}
+
+impl std::error::Error for HarmonicSplitResultError {}
+
+/// Canonical top-k slot ownership for the versioned DS4HARM3 result layout.
+/// Each owner exposes a full six-row view so buffer addresses stay persistent;
+/// the masks decide which rows are live and stale rows are never consumed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HarmonicSplitResultLayout {
+    local_mask: u8,
+    remote_mask: u8,
+}
+
+impl HarmonicSplitResultLayout {
+    const VALID_MASK: u8 = (1_u8 << HARMONIC_TOP_K) - 1;
+
+    pub fn checked(local_mask: u8, remote_mask: u8) -> Result<Self, HarmonicSplitResultError> {
+        let unknown = (local_mask | remote_mask) & !Self::VALID_MASK;
+        if unknown != 0 {
+            return Err(HarmonicSplitResultError::InvalidMaskBits(unknown));
+        }
+        let overlap = local_mask & remote_mask;
+        if overlap != 0 {
+            return Err(HarmonicSplitResultError::OverlappingOwners(overlap));
+        }
+        let missing = Self::VALID_MASK & !(local_mask | remote_mask);
+        if missing != 0 {
+            return Err(HarmonicSplitResultError::MissingOwners(missing));
+        }
+        Ok(Self {
+            local_mask,
+            remote_mask,
+        })
+    }
+
+    pub fn from_owners(
+        owners: [HarmonicExpertExecutionOwner; HARMONIC_TOP_K],
+    ) -> Result<Self, HarmonicSplitResultError> {
+        let mut local_mask = 0_u8;
+        let mut remote_mask = 0_u8;
+        for (slot, owner) in owners.into_iter().enumerate() {
+            let bit = 1_u8 << slot;
+            match owner {
+                HarmonicExpertExecutionOwner::DenseGfx1100 => local_mask |= bit,
+                HarmonicExpertExecutionOwner::ExpertGfx1151 => remote_mask |= bit,
+            }
+        }
+        Self::checked(local_mask, remote_mask)
+    }
+
+    pub const fn local_mask(self) -> u8 {
+        self.local_mask
+    }
+
+    pub const fn remote_mask(self) -> u8 {
+        self.remote_mask
+    }
+
+    pub const fn owner(self, slot: usize) -> Option<HarmonicExpertExecutionOwner> {
+        if slot >= HARMONIC_TOP_K {
+            return None;
+        }
+        if self.local_mask & (1_u8 << slot) != 0 {
+            Some(HarmonicExpertExecutionOwner::DenseGfx1100)
+        } else {
+            Some(HarmonicExpertExecutionOwner::ExpertGfx1151)
+        }
+    }
+}
+
+/// CPU oracle for the existing deterministic `moe_down_combine_k8_batched`
+/// arithmetic. The two owner buffers retain canonical route-slot positions;
+/// this function chooses exactly one owner per slot and folds slots 0..5 with
+/// fused multiply-add before performing the existing residual addition.
+///
+/// Product execution must prove its GPU join raw-bit identical to this oracle
+/// and the unsplit kernel before DS4HARM3 admission.
+pub fn combine_harmonic_split_route_results(
+    layout: HarmonicSplitResultLayout,
+    route_weight_bits: [u32; HARMONIC_TOP_K],
+    local_outputs: &[f32],
+    remote_outputs: &[f32],
+    residual: &mut [f32],
+) -> Result<(), HarmonicSplitResultError> {
+    for (owner, outputs) in [
+        (HarmonicExpertExecutionOwner::DenseGfx1100, local_outputs),
+        (HarmonicExpertExecutionOwner::ExpertGfx1151, remote_outputs),
+    ] {
+        if outputs.len() != HARMONIC_TOP_K * HARMONIC_HIDDEN_SIZE {
+            return Err(HarmonicSplitResultError::InvalidOutputExtent {
+                owner,
+                got: outputs.len(),
+                expected: HARMONIC_TOP_K * HARMONIC_HIDDEN_SIZE,
+            });
+        }
+    }
+    if residual.len() != HARMONIC_HIDDEN_SIZE {
+        return Err(HarmonicSplitResultError::InvalidResidualExtent {
+            got: residual.len(),
+            expected: HARMONIC_HIDDEN_SIZE,
+        });
+    }
+    let weights = route_weight_bits.map(f32::from_bits);
+    for (slot, weight) in weights.iter().copied().enumerate() {
+        if !weight.is_finite() || weight < 0.0 {
+            return Err(HarmonicSplitResultError::InvalidRouteWeight(slot));
+        }
+    }
+
+    for (column, destination) in residual.iter_mut().enumerate() {
+        let mut accumulator = 0.0_f32;
+        for (slot, weight) in weights.iter().copied().enumerate() {
+            let outputs = match layout.owner(slot).expect("validated split-result slot") {
+                HarmonicExpertExecutionOwner::DenseGfx1100 => local_outputs,
+                HarmonicExpertExecutionOwner::ExpertGfx1151 => remote_outputs,
+            };
+            accumulator =
+                weight.mul_add(outputs[slot * HARMONIC_HIDDEN_SIZE + column], accumulator);
+        }
+        *destination += accumulator;
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -205,9 +353,10 @@ impl HarmonicExpertResidencyPlan {
         by_layer: &[[u64; HARMONIC_EXPERT_BITMAP_WORDS]; HARMONIC_LAYER_COUNT as usize],
     ) -> u64 {
         let mut hash = 0xcbf2_9ce4_8422_2325_u64;
-        for byte in HARMONIC_ROUTE_IDENTITY
+        for byte in HARMONIC_HOTSET_ROUTE_IDENTITY
             .to_le_bytes()
             .into_iter()
+            .chain(DS4_MQ2R_0731_IDENTITY)
             .chain(slot_bytes.to_le_bytes())
             .chain(
                 by_layer
@@ -242,6 +391,15 @@ impl HarmonicExpertResidencyPlan {
                 HarmonicExpertExecutionOwner::ExpertGfx1151
             }
         })
+    }
+
+    pub fn split_result_layout(
+        &self,
+        layer: usize,
+        expert_ids: [u32; HARMONIC_TOP_K],
+    ) -> HarmonicSplitResultLayout {
+        HarmonicSplitResultLayout::from_owners(self.partition_route(layer, expert_ids))
+            .expect("a residency plan assigns exactly one owner to every route slot")
     }
 
     pub fn slots(&self) -> &[HarmonicExpertSlot] {
@@ -1172,6 +1330,84 @@ mod tests {
             HarmonicExpertResidencyPlan::from_ranked(10, 20, [slot, slot]),
             Err(HarmonicResidencyError::DuplicateSlot(duplicate)) if duplicate == slot
         ));
+    }
+
+    #[test]
+    fn split_result_layout_rejects_overlap_gap_and_unknown_bits() {
+        assert!(matches!(
+            HarmonicSplitResultLayout::checked(0b00_0011, 0b00_0010),
+            Err(HarmonicSplitResultError::OverlappingOwners(0b00_0010))
+        ));
+        assert!(matches!(
+            HarmonicSplitResultLayout::checked(0b00_0011, 0b11_0000),
+            Err(HarmonicSplitResultError::MissingOwners(0b00_1100))
+        ));
+        assert!(matches!(
+            HarmonicSplitResultLayout::checked(0b100_0000, 0b11_1111),
+            Err(HarmonicSplitResultError::InvalidMaskBits(0b100_0000))
+        ));
+    }
+
+    #[test]
+    fn split_result_oracle_preserves_monolithic_slot_order_raw_bits() {
+        let layout = HarmonicSplitResultLayout::checked(0b01_0101, 0b10_1010).unwrap();
+        let weights = [0.37_f32, 0.23, 0.19, 0.11, 0.07, 0.03];
+        let weight_bits = weights.map(f32::to_bits);
+        let mut all = vec![0.0_f32; HARMONIC_TOP_K * HARMONIC_HIDDEN_SIZE];
+        let mut local = vec![f32::NAN; all.len()];
+        let mut remote = vec![f32::NAN; all.len()];
+        for slot in 0..HARMONIC_TOP_K {
+            for column in 0..HARMONIC_HIDDEN_SIZE {
+                let index = slot * HARMONIC_HIDDEN_SIZE + column;
+                let value = ((slot * 17 + column * 13) as f32 - 4096.0) * 0.000_031_25;
+                all[index] = value;
+                match layout.owner(slot).unwrap() {
+                    HarmonicExpertExecutionOwner::DenseGfx1100 => local[index] = value,
+                    HarmonicExpertExecutionOwner::ExpertGfx1151 => remote[index] = value,
+                }
+            }
+        }
+        let initial = (0..HARMONIC_HIDDEN_SIZE)
+            .map(|column| (column as f32 - 2048.0) * 0.000_122_070_31)
+            .collect::<Vec<_>>();
+        let mut expected = initial.clone();
+        for (column, destination) in expected.iter_mut().enumerate() {
+            let mut accumulator = 0.0_f32;
+            for (slot, weight) in weights.iter().copied().enumerate() {
+                accumulator =
+                    weight.mul_add(all[slot * HARMONIC_HIDDEN_SIZE + column], accumulator);
+            }
+            *destination += accumulator;
+        }
+        let mut observed = initial;
+        combine_harmonic_split_route_results(layout, weight_bits, &local, &remote, &mut observed)
+            .unwrap();
+        assert_eq!(
+            observed
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            expected
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn residency_plan_emits_a_complete_split_result_layout() {
+        let plan = HarmonicExpertResidencyPlan::from_ranked(
+            10,
+            20,
+            [
+                HarmonicExpertSlot::checked(5, 225).unwrap(),
+                HarmonicExpertSlot::checked(5, 23).unwrap(),
+            ],
+        )
+        .unwrap();
+        let layout = plan.split_result_layout(5, [225, 11, 23, 12, 13, 14]);
+        assert_eq!(layout.local_mask(), 0b00_0101);
+        assert_eq!(layout.remote_mask(), 0b11_1010);
     }
 
     #[test]
