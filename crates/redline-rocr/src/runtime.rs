@@ -114,6 +114,10 @@ impl Runtime {
                         needle: needle.to_owned(),
                     })
             }
+            GpuSelector::PciBusId(pci_bus_id) => devices
+                .into_iter()
+                .find(|device| device.pci_bus_id() == pci_bus_id)
+                .ok_or(RuntimeError::GpuPciBusIdNotFound { pci_bus_id }),
         }
     }
 
@@ -481,6 +485,9 @@ impl std::str::FromStr for PciBusId {
 pub enum GpuSelector<'a> {
     Ordinal(usize),
     NameContains(&'a str),
+    /// Stable physical identity. Prefer this over ordinals on multi-GPU
+    /// systems because ROCr visibility filters may reorder ordinal space.
+    PciBusId(PciBusId),
 }
 
 #[derive(Clone)]
@@ -2569,6 +2576,9 @@ pub enum RuntimeError {
     GpuNameNotFound {
         needle: String,
     },
+    GpuPciBusIdNotFound {
+        pci_bus_id: PciBusId,
+    },
     InvalidQueueSize {
         requested: u32,
         min: u32,
@@ -2643,6 +2653,9 @@ impl fmt::Display for RuntimeError {
             }
             Self::GpuNameNotFound { needle } => {
                 write!(f, "no HSA GPU name contains {needle:?}")
+            }
+            Self::GpuPciBusIdNotFound { pci_bus_id } => {
+                write!(f, "no HSA GPU has PCI bus ID {pci_bus_id}")
             }
             Self::InvalidQueueSize {
                 requested,
