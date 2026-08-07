@@ -22,7 +22,7 @@
 
 use hip_bridge::{
     DeviceBuffer, Event, HipError, HipResult, RcclComms, HIP_ERROR_PEER_ACCESS_ALREADY_ENABLED,
-    HIP_ERROR_PEER_ACCESS_UNSUPPORTED,
+    HIP_ERROR_PEER_ACCESS_UNSUPPORTED, HIP_EVENT_DISABLE_TIMING, HIP_EVENT_RELEASE_TO_SYSTEM,
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
 
@@ -82,6 +82,9 @@ pub struct Gpus {
     /// `count` seen. Leaked on teardown (raw `DeviceBuffer`, no Drop-free).
     peer_ar_tmp: Vec<Vec<DeviceBuffer>>,
     peer_ar_tmp_bytes: usize,
+    /// One process-lifetime dependency event per rank for peer-consumer
+    /// collectives. Re-recording avoids 86 create/destroy pairs per DS4 token.
+    rank_barrier_events: Vec<Event>,
 }
 
 const DEFAULT_VRAM_TOLERANCE_GB: f64 = 2.0;
@@ -166,6 +169,7 @@ impl Gpus {
             givens_sin_per_dev: Vec::new(),
             peer_ar_tmp: Vec::new(),
             peer_ar_tmp_bytes: 0,
+            rank_barrier_events: Vec::new(),
         }
     }
 
@@ -215,6 +219,7 @@ impl Gpus {
             givens_sin_per_dev: Vec::new(),
             peer_ar_tmp: Vec::new(),
             peer_ar_tmp_bytes: 0,
+            rank_barrier_events: Vec::new(),
         })
     }
 
@@ -398,6 +403,71 @@ impl Gpus {
         wait_result.and(destroy_result)
     }
 
+    /// Enqueue an all-rank producer barrier using process-lifetime events.
+    ///
+    /// Each rank records its event after producing a peer-visible tensor, then
+    /// every other rank waits before launching its fused peer consumer. Events
+    /// are deliberately reused: HIP wait semantics bind to the most recent
+    /// record visible when the wait is enqueued, and each next record follows
+    /// the prior consumer on the same FIFO stream.
+    pub fn barrier_rank_streams_reuse(&mut self) -> HipResult<()> {
+        let n = self.devices.len();
+        if self.rank_barrier_events.is_empty() {
+            let mut events = Vec::with_capacity(n);
+            for rank in 0..n {
+                let gpu = &self.devices[rank];
+                gpu.bind_thread()?;
+                match gpu
+                    .hip
+                    .event_create_with_flags(HIP_EVENT_DISABLE_TIMING | HIP_EVENT_RELEASE_TO_SYSTEM)
+                {
+                    Ok(event) => events.push(event),
+                    Err(error) => {
+                        for (owner, event) in events.drain(..).enumerate() {
+                            let _ = self.devices[owner].hip.event_destroy(event);
+                        }
+                        return Err(error);
+                    }
+                }
+            }
+            self.rank_barrier_events = events;
+        } else if self.rank_barrier_events.len() != n {
+            return Err(HipError::new(
+                0,
+                &format!(
+                    "barrier_rank_streams_reuse: event count {} != device count {n}",
+                    self.rank_barrier_events.len()
+                ),
+            ));
+        }
+
+        for rank in 0..n {
+            let gpu = &self.devices[rank];
+            gpu.bind_thread()?;
+            let stream = gpu.active_stream.as_ref().ok_or_else(|| {
+                HipError::new(
+                    0,
+                    &format!("barrier_rank_streams_reuse: device {rank} has no active_stream"),
+                )
+            })?;
+            gpu.hip
+                .event_record(&self.rank_barrier_events[rank], Some(stream))?;
+        }
+
+        for destination in 0..n {
+            let gpu = &self.devices[destination];
+            gpu.bind_thread()?;
+            let stream = gpu.active_stream.as_ref().expect("validated above");
+            for source in 0..n {
+                if source != destination {
+                    gpu.hip
+                        .stream_wait_event(stream, &self.rank_barrier_events[source])?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn from_parts(devices: Vec<Gpu>, per_device: Vec<usize>, n_layers: usize) -> HipResult<Self> {
         debug_assert_eq!(per_device.iter().sum::<usize>(), n_layers);
         debug_assert_eq!(per_device.len(), devices.len());
@@ -423,6 +493,7 @@ impl Gpus {
             givens_sin_per_dev: Vec::new(),
             peer_ar_tmp: Vec::new(),
             peer_ar_tmp_bytes: 0,
+            rank_barrier_events: Vec::new(),
         })
     }
 

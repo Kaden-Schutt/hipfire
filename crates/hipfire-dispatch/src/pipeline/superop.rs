@@ -419,6 +419,41 @@ pub trait ForwardBindings {
             quant: "",
         })
     }
+
+    /// Whether this binding can fuse a fixed four-rank peer reduction into
+    /// both post-attention and post-MoE Hyper-Connection consumers.
+    ///
+    /// False by default: the runtime also requires four peer-connected
+    /// gfx1201 devices before invoking either hook.
+    fn supports_tp_peer_hc4(&self) -> bool {
+        false
+    }
+
+    fn ep_finish_attend_peer_hc4(
+        &mut self,
+        _gpu: &mut Gpu,
+        _partials: [&GpuTensor; 4],
+    ) -> Result<(), DispatchError> {
+        Err(DispatchError::UnsupportedVariant {
+            family: "ep",
+            variant: "ep_finish_attend_peer_hc4-not-implemented-for-arch",
+            arch: "",
+            quant: "",
+        })
+    }
+
+    fn ep_finish_moe_peer_hc4(
+        &mut self,
+        _gpu: &mut Gpu,
+        _partials: [&GpuTensor; 4],
+    ) -> Result<(), DispatchError> {
+        Err(DispatchError::UnsupportedVariant {
+            family: "ep",
+            variant: "ep_finish_moe_peer_hc4-not-implemented-for-arch",
+            arch: "",
+            quant: "",
+        })
+    }
 }
 
 /// Dispatch a SINGLE super-op to its [`ForwardBindings`] method. Extracted from

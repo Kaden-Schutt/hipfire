@@ -74,6 +74,16 @@ fn all_reduce_sum_f32_decode(
     }
 }
 
+fn tp_peer_hc4_admitted<B: ForwardBindings>(gpus: &Gpus, bindings: &[B]) -> bool {
+    gpus.devices.len() == 4
+        && gpus.peer_access_enabled
+        && gpus
+            .devices
+            .iter()
+            .all(|device| device.arch_caps.is_gfx1201())
+        && bindings.iter().all(ForwardBindings::supports_tp_peer_hc4)
+}
+
 /// Execute one lowered layer program across `gpus.devices.len()` EP ranks.
 ///
 /// - `bindings[r]` drives rank `r`'s forward (it holds that rank's state /
@@ -125,9 +135,39 @@ pub fn run_layer_program_ep<B: ForwardBindings>(
                 bindings[r].run_attend_ep(&mut gpus.devices[r], &ctx, &op.binding)?;
             }
 
-            // Sum the input-column-sharded output projection directly in its
-            // destination tensor. No staging copy or extra scratch launch.
-            {
+            if tp_peer_hc4_admitted(gpus, bindings) {
+                // Borrow-independent aliases let the architecture hooks
+                // consume all four peer pointers while each binding is
+                // mutably advanced through its own HC residual mix.
+                let peer_partials = bindings
+                    .iter()
+                    .map(|binding| {
+                        let partial = binding.ep_attention_partial().ok_or_else(|| {
+                            DispatchError::Hip(
+                                "run_layer_program_ep: attention TP partial missing".into(),
+                            )
+                        })?;
+                        Ok(GpuTensor {
+                            buf: unsafe { partial.buf.alias() },
+                            shape: partial.shape.clone(),
+                            dtype: partial.dtype,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, DispatchError>>()?;
+                let peers = [
+                    &peer_partials[0],
+                    &peer_partials[1],
+                    &peer_partials[2],
+                    &peer_partials[3],
+                ];
+                gpus.barrier_rank_streams_reuse().map_err(hip_err)?;
+                for r in 0..n {
+                    gpus.devices[r].bind_thread().map_err(hip_err)?;
+                    bindings[r].ep_finish_attend_peer_hc4(&mut gpus.devices[r], peers)?;
+                }
+            } else {
+                // Sum the input-column-sharded output projection directly in
+                // its destination tensor. No staging copy or extra scratch.
                 let refs: Vec<&DeviceBuffer> = bindings
                     .iter()
                     .map(|binding| {
@@ -142,11 +182,10 @@ pub fn run_layer_program_ep<B: ForwardBindings>(
                     })
                     .collect::<Result<_, _>>()?;
                 all_reduce_sum_f32_decode(gpus, &refs, residual_dim)?;
-            }
-
-            for r in 0..n {
-                gpus.devices[r].bind_thread().map_err(hip_err)?;
-                bindings[r].ep_finish_attend(&mut gpus.devices[r])?;
+                for r in 0..n {
+                    gpus.devices[r].bind_thread().map_err(hip_err)?;
+                    bindings[r].ep_finish_attend(&mut gpus.devices[r])?;
+                }
             }
         } else if matches!(op.kind, SuperOpKind::Moe) {
             // 1. Zero each rank's routed partial on its own stream.
@@ -178,14 +217,23 @@ pub fn run_layer_program_ep<B: ForwardBindings>(
                 )?;
             }
 
-            // 3. All-reduce-sum the partials across ranks (in-place, RCCL).
-            let refs: Vec<&DeviceBuffer> = partials.iter().map(|p| &p.buf).collect();
-            all_reduce_sum_f32_decode(gpus, &refs, residual_dim)?;
+            if tp_peer_hc4_admitted(gpus, bindings) {
+                let peers = [&partials[0], &partials[1], &partials[2], &partials[3]];
+                gpus.barrier_rank_streams_reuse().map_err(hip_err)?;
+                for r in 0..n {
+                    gpus.devices[r].bind_thread().map_err(hip_err)?;
+                    bindings[r].ep_finish_moe_peer_hc4(&mut gpus.devices[r], peers)?;
+                }
+            } else {
+                // 3. All-reduce-sum the partials across ranks (in-place, RCCL).
+                let refs: Vec<&DeviceBuffer> = partials.iter().map(|p| &p.buf).collect();
+                all_reduce_sum_f32_decode(gpus, &refs, residual_dim)?;
 
-            // 4. Each rank adds the reduced partial into its residual stream.
-            for r in 0..n {
-                gpus.devices[r].bind_thread().map_err(hip_err)?;
-                bindings[r].ep_add_into_residual(&mut gpus.devices[r], &partials[r])?;
+                // 4. Fold the reduced partial into each residual stream.
+                for r in 0..n {
+                    gpus.devices[r].bind_thread().map_err(hip_err)?;
+                    bindings[r].ep_add_into_residual(&mut gpus.devices[r], &partials[r])?;
+                }
             }
         } else {
             // Replicated op — every rank runs it unchanged on full weights.

@@ -8976,6 +8976,90 @@ impl Gpu {
             },
         )
     }
+
+    /// gfx1201 TP4 Hyper-Connection mix that consumes four peer-visible
+    /// rank-local transform outputs in fixed rank order.
+    ///
+    /// The caller must enable all-to-all peer access and order this launch
+    /// after all four producer streams. This exact-gated primitive is not a
+    /// generic collective; it exists to remove DS4's per-block RCCL
+    /// materialization and subsequent HC launch boundary.
+    pub fn hc_mix_4stream_peer4_gfx1201(
+        &mut self,
+        x_in: &GpuTensor,
+        a_matrix: &GpuTensor,
+        scale: &GpuTensor,
+        transforms: [&GpuTensor; 4],
+        x_out: &GpuTensor,
+        hidden: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if !self.arch_caps.is_gfx1201() {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "hc_mix_4stream_peer4_gfx1201 requires gfx1201, got {}",
+                    self.arch
+                ),
+            ));
+        }
+        let hidden_usize = hidden as usize;
+        if transforms
+            .iter()
+            .any(|transform| transform.numel() != hidden_usize)
+        {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "hc_mix_4stream_peer4_gfx1201: transform shape mismatch",
+            ));
+        }
+        self.ensure_kernel(
+            "hc_mix_4stream_peer4_gfx1201",
+            kernels::HC_MIX_4STREAM_PEER4_GFX1201_SRC,
+            "hc_mix_4stream_peer4_gfx1201",
+        )?;
+
+        let xi = x_in.buf.as_ptr();
+        let am = a_matrix.buf.as_ptr();
+        let sc = scale.buf.as_ptr();
+        let t0 = transforms[0].buf.as_ptr();
+        let t1 = transforms[1].buf.as_ptr();
+        let t2 = transforms[2].buf.as_ptr();
+        let t3 = transforms[3].buf.as_ptr();
+        let xo = x_out.buf.as_ptr();
+        let mut h = hidden;
+        let mut params: Vec<*mut c_void> = vec![
+            &xi as *const _ as *mut c_void,
+            &am as *const _ as *mut c_void,
+            &sc as *const _ as *mut c_void,
+            &t0 as *const _ as *mut c_void,
+            &t1 as *const _ as *mut c_void,
+            &t2 as *const _ as *mut c_void,
+            &t3 as *const _ as *mut c_void,
+            &xo as *const _ as *mut c_void,
+            &mut h as *mut _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            "hc_mix_4stream_peer4_gfx1201",
+            [((hidden + 255) / 256) as u32, 4, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(xi);
+                b.push_ptr(am);
+                b.push_ptr(sc);
+                b.push_ptr(t0);
+                b.push_ptr(t1);
+                b.push_ptr(t2);
+                b.push_ptr(t3);
+                b.push_ptr(xo);
+                b.push_i32(h);
+                b
+            },
+        )
+    }
     pub fn hc_mix_4stream_batched(
         &mut self,
         x_in: &GpuTensor,          // [batch, 4, hidden]
