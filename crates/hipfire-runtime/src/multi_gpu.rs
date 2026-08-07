@@ -583,6 +583,44 @@ impl Gpus {
             && self.tp_graph_barrier_count == barriers
     }
 
+    /// Consume one captured TP3 barrier epoch without emitting standalone
+    /// store/wait nodes. The returned buffers are non-owning aliases whose
+    /// pointers are baked into the fused HC consumer's stable kernargs.
+    pub fn take_tp3_graph_fused_barrier(&mut self) -> HipResult<(u32, [DeviceBuffer; 3])> {
+        if self.devices.len() != 3
+            || self.tp_graph_signals.len() != 3
+            || self.tp_graph_barrier_count == 0
+            || !self
+                .devices
+                .iter()
+                .all(|device| device.arch_caps.is_gfx1201() && device.graphs.capture_mode)
+        {
+            return Err(HipError::new(
+                0,
+                "take_tp3_graph_fused_barrier requires active TP3 gfx1201 graph capture",
+            ));
+        }
+        let epoch_index = self.tp_graph_capture_epoch;
+        if epoch_index >= self.tp_graph_barrier_count {
+            return Err(HipError::new(
+                0,
+                &format!(
+                    "TP3 fused graph barrier epoch {epoch_index} exceeds prepared capacity {}",
+                    self.tp_graph_barrier_count
+                ),
+            ));
+        }
+        let epoch = u32::try_from(epoch_index + 1)
+            .map_err(|_| HipError::new(0, "TP3 fused graph barrier epoch exceeds u32"))?;
+        let signals = [
+            unsafe { self.tp_graph_signals[0].alias() },
+            unsafe { self.tp_graph_signals[1].alias() },
+            unsafe { self.tp_graph_signals[2].alias() },
+        ];
+        self.tp_graph_capture_epoch += 1;
+        Ok((epoch, signals))
+    }
+
     /// Free the exact-gated TP4 signal tape after every captured rank graph has
     /// been invalidated. Idempotent so failed-load and ordinary unload paths can
     /// share it.
