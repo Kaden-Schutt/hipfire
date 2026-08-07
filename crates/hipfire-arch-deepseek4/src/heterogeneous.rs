@@ -158,7 +158,28 @@ fn resolve_device_selector(hip: &HipRuntime, selector: &DeviceSelector) -> Resul
                 }
             }
             match matches.as_slice() {
-                [device_id] => Ok(*device_id),
+                [device_id] => {
+                    // Architecture names are the portable role selector. Pin
+                    // the unique match to HIP's current physical identity for
+                    // this process so hotplug/reboot ordinal order can never
+                    // change which device owns the role after discovery.
+                    let pci_bus_id = hip.device_pci_bus_id(*device_id).map_err(|error| {
+                        format!(
+                            "deepseek4 heterogeneous selector {selector} PCI identity: {error}"
+                        )
+                    })?;
+                    let pinned = hip.device_by_pci_bus_id(&pci_bus_id).map_err(|error| {
+                        format!(
+                            "deepseek4 heterogeneous selector {selector} pin {pci_bus_id}: {error}"
+                        )
+                    })?;
+                    if pinned != *device_id {
+                        return Err(format!(
+                            "deepseek4 heterogeneous selector {selector} changed ordinal during PCI pin: discovered {device_id}, resolved {pinned} at {pci_bus_id}"
+                        ));
+                    }
+                    Ok(pinned)
+                }
                 [] => Err(format!(
                     "deepseek4 heterogeneous selector {selector} matched no visible device"
                 )),
