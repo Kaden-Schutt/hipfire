@@ -4036,6 +4036,11 @@ fn harmonic_replay_token_program(
                 ));
             }
             harmonic_publish_ready_route(execution, epoch, layer_idx)?;
+            dump_moe_route_bits_if_enabled(
+                layer_idx,
+                &execution.route_ids,
+                &execution.route_weight_bits,
+            )?;
             harmonic_wait_remote_result(execution, epoch, layer_idx)?;
             submission.resume_host_gate(gate)?;
             execution.record_layer(layer_started.elapsed());
@@ -8212,17 +8217,12 @@ fn ffn_hash_routed(
 /// Format:
 /// `DS4RTR01 | repeated { layer:u32, k:u32, ids:[i32;k], weights:[f32;k] }`.
 /// Records are naturally ordered token-major, layer-minor by the decode loop.
-fn dump_moe_route_if_enabled(
-    gpu: &Gpu,
-    layer_idx: usize,
-    topk_indices: &GpuTensor,
-    topk_weights: &GpuTensor,
-) -> Result<(), String> {
+fn moe_route_dump_writer() -> &'static Option<std::sync::Mutex<std::io::BufWriter<std::fs::File>>> {
     use std::io::Write;
     use std::sync::{Mutex, OnceLock};
 
     static DUMP: OnceLock<Option<Mutex<std::io::BufWriter<std::fs::File>>>> = OnceLock::new();
-    let dump = DUMP.get_or_init(|| {
+    DUMP.get_or_init(|| {
         let path = std::env::var("HIPFIRE_DS4_ROUTE_DUMP").ok()?;
         let file = std::fs::File::create(&path)
             .unwrap_or_else(|e| panic!("create HIPFIRE_DS4_ROUTE_DUMP {path}: {e}"));
@@ -8231,22 +8231,23 @@ fn dump_moe_route_if_enabled(
             .write_all(b"DS4RTR01")
             .expect("write DS4 route dump header");
         Some(Mutex::new(writer))
-    });
-    let Some(dump) = dump else {
+    })
+}
+
+fn dump_moe_route_bits_if_enabled(
+    layer_idx: usize,
+    route_ids: &[u32],
+    route_weight_bits: &[u32],
+) -> Result<(), String> {
+    use std::io::Write;
+    let Some(dump) = moe_route_dump_writer() else {
         return Ok(());
     };
-
-    let ids_bits = gpu
-        .download_f32(topk_indices)
-        .map_err(|e| format!("route dump indices l{layer_idx}: {e:?}"))?;
-    let weights = gpu
-        .download_f32(topk_weights)
-        .map_err(|e| format!("route dump weights l{layer_idx}: {e:?}"))?;
-    if ids_bits.len() != weights.len() {
+    if route_ids.len() != route_weight_bits.len() {
         return Err(format!(
             "route dump l{layer_idx}: index/weight length mismatch {} != {}",
-            ids_bits.len(),
-            weights.len()
+            route_ids.len(),
+            route_weight_bits.len()
         ));
     }
 
@@ -8257,19 +8258,41 @@ fn dump_moe_route_if_enabled(
         .write_all(&(layer_idx as u32).to_le_bytes())
         .map_err(|e| format!("route dump layer: {e}"))?;
     writer
-        .write_all(&(ids_bits.len() as u32).to_le_bytes())
+        .write_all(&(route_ids.len() as u32).to_le_bytes())
         .map_err(|e| format!("route dump k: {e}"))?;
-    for bits in ids_bits {
+    for id in route_ids {
         writer
-            .write_all(&(bits.to_bits() as i32).to_le_bytes())
+            .write_all(&(*id as i32).to_le_bytes())
             .map_err(|e| format!("route dump id: {e}"))?;
     }
-    for weight in weights {
+    for weight_bits in route_weight_bits {
         writer
-            .write_all(&weight.to_le_bytes())
+            .write_all(&weight_bits.to_le_bytes())
             .map_err(|e| format!("route dump weight: {e}"))?;
     }
     writer.flush().map_err(|e| format!("route dump flush: {e}"))
+}
+
+fn dump_moe_route_if_enabled(
+    gpu: &Gpu,
+    layer_idx: usize,
+    topk_indices: &GpuTensor,
+    topk_weights: &GpuTensor,
+) -> Result<(), String> {
+    if moe_route_dump_writer().is_none() {
+        return Ok(());
+    }
+    let ids_bits = gpu
+        .download_f32(topk_indices)
+        .map_err(|e| format!("route dump indices l{layer_idx}: {e:?}"))?;
+    let weights = gpu
+        .download_f32(topk_weights)
+        .map_err(|e| format!("route dump weights l{layer_idx}: {e:?}"))?;
+    dump_moe_route_bits_if_enabled(
+        layer_idx,
+        &ids_bits.into_iter().map(f32::to_bits).collect::<Vec<_>>(),
+        &weights.into_iter().map(f32::to_bits).collect::<Vec<_>>(),
+    )
 }
 
 /// HC FFN mix — same pattern as `hc_attn_mix` but with `hc_ffn_*`
