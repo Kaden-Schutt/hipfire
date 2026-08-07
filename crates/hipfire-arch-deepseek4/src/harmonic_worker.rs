@@ -636,6 +636,19 @@ impl DeepseekV4HarmonicExpertService {
             .expert_w2_ptrs
             .as_ref()
             .ok_or_else(|| format!("harmonic split down pointer table missing l{layer_index}"))?;
+        #[cfg(feature = "harmonic-stage-profile")]
+        {
+            let profile = self
+                .stage_profile
+                .as_ref()
+                .ok_or_else(|| "harmonic split expert stage profile missing".to_owned())?;
+            let stream = gpu.active_stream.as_ref().ok_or_else(|| {
+                "harmonic split expert local stream missing before profile".to_owned()
+            })?;
+            gpu.hip
+                .event_record(&profile.start, Some(stream))
+                .map_err(|error| format!("harmonic split stage start: {error}"))?;
+        }
         gpu.deepseek4_gemv_mq2g256_lloyd_moe_gate_up_indexed(
             expert_gate_up_ptrs,
             self.topk_indices.as_ref().unwrap(),
@@ -647,6 +660,13 @@ impl DeepseekV4HarmonicExpertService {
             k_top,
         )
         .map_err(|error| format!("harmonic split gate/up l{layer_index}: {error}"))?;
+        #[cfg(feature = "harmonic-stage-profile")]
+        gpu.hip
+            .event_record(
+                &self.stage_profile.as_ref().unwrap().gate_up,
+                gpu.active_stream.as_ref(),
+            )
+            .map_err(|error| format!("harmonic split gate/up boundary: {error}"))?;
         gpu.deepseek4_silu_mul_clamp_f32_batched(
             self.gate_batch.as_ref().unwrap(),
             self.up_batch.as_ref().unwrap(),
@@ -656,6 +676,13 @@ impl DeepseekV4HarmonicExpertService {
             cfg.swiglu_limit,
         )
         .map_err(|error| format!("harmonic split activation l{layer_index}: {error}"))?;
+        #[cfg(feature = "harmonic-stage-profile")]
+        gpu.hip
+            .event_record(
+                &self.stage_profile.as_ref().unwrap().activation,
+                gpu.active_stream.as_ref(),
+            )
+            .map_err(|error| format!("harmonic split activation boundary: {error}"))?;
         gpu.rotate_x_mq_batched(
             self.gate_batch.as_ref().unwrap(),
             self.rot_batch.as_ref().unwrap(),
@@ -663,6 +690,13 @@ impl DeepseekV4HarmonicExpertService {
             k_top,
         )
         .map_err(|error| format!("harmonic split rotation l{layer_index}: {error}"))?;
+        #[cfg(feature = "harmonic-stage-profile")]
+        gpu.hip
+            .event_record(
+                &self.stage_profile.as_ref().unwrap().rotation,
+                gpu.active_stream.as_ref(),
+            )
+            .map_err(|error| format!("harmonic split rotation boundary: {error}"))?;
         gpu.deepseek4_gemv_mq2g256_lloyd_moe_down_expanded_k4(
             expert_down_ptrs,
             self.topk_indices.as_ref().unwrap(),
@@ -674,6 +708,13 @@ impl DeepseekV4HarmonicExpertService {
             1,
         )
         .map_err(|error| format!("harmonic split down l{layer_index}: {error}"))?;
+        #[cfg(feature = "harmonic-stage-profile")]
+        gpu.hip
+            .event_record(
+                &self.stage_profile.as_ref().unwrap().down,
+                gpu.active_stream.as_ref(),
+            )
+            .map_err(|error| format!("harmonic split down boundary: {error}"))?;
         {
             let stream = gpu.active_stream.as_ref().ok_or_else(|| {
                 "harmonic split expert local stream missing after dispatch".to_owned()
@@ -688,9 +729,30 @@ impl DeepseekV4HarmonicExpertService {
                     stream,
                 )
                 .map_err(|error| format!("harmonic split publish result: {error}"))?;
+            #[cfg(feature = "harmonic-stage-profile")]
+            gpu.hip
+                .event_record(&self.stage_profile.as_ref().unwrap().publish, Some(stream))
+                .map_err(|error| format!("harmonic split publish boundary: {error}"))?;
             gpu.hip
                 .stream_synchronize(stream)
                 .map_err(|error| format!("harmonic split local completion: {error}"))?;
+        }
+        #[cfg(feature = "harmonic-stage-profile")]
+        {
+            let profile = self.stage_profile.as_ref().unwrap();
+            let elapsed = |start, stop| {
+                gpu.hip
+                    .event_elapsed_ms(start, stop)
+                    .map_err(|error| error.to_string())
+            };
+            let stage_ms = [
+                elapsed(&profile.start, &profile.gate_up)?,
+                elapsed(&profile.gate_up, &profile.activation)?,
+                elapsed(&profile.activation, &profile.rotation)?,
+                elapsed(&profile.rotation, &profile.down)?,
+                elapsed(&profile.down, &profile.publish)?,
+            ];
+            self.stage_profile.as_mut().unwrap().record(stage_ms);
         }
         Ok(HarmonicCompletion {
             result_extent: packet.result_extent,
