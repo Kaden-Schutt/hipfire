@@ -11773,7 +11773,7 @@ impl Gpu {
 
     pub fn deepseek4_attn_swa_topk_f32_buf(
         &mut self,
-        deepseek4_gfx1151_route: bool,
+        deepseek4_scoregrid_route: bool,
         q: &GpuTensor,
         swa_k: &GpuTensor,
         swa_v: &GpuTensor,
@@ -11794,7 +11794,8 @@ impl Gpu {
         static SCOREGRID_XLANE_GFX1151: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         static SCOREGRID_LARGE_SERIAL_GFX1151: std::sync::OnceLock<bool> =
             std::sync::OnceLock::new();
-        let scoregrid = self.arch == "gfx1151" && head_dim == 512 && deepseek4_gfx1151_route;
+        let scoregrid_arch = self.arch == "gfx1151" || self.arch == "gfx1201";
+        let scoregrid = scoregrid_arch && head_dim == 512 && deepseek4_scoregrid_route;
         let ilp4 = self.arch == "gfx1151"
             && head_dim == 512
             && *ILP4_GFX1151.get_or_init(|| {
