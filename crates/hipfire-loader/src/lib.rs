@@ -1627,9 +1627,12 @@ fn load_model_ep_ds4(path: &str, max_seq: usize, tp: usize) -> Result<LoadedMode
             .iter()
             .all(|device| device.arch_caps.is_gfx1201());
     if gfx1201_mq2r_tp {
-        // B=128 crosses the grouped-MoE threshold and amortizes the model's
-        // routed expert weights. gfx12 uses its native half8 WMMA lowering.
-        const EP_PREFILL_MAX_BATCH: usize = 128;
+        // B=512 fills the grouped-MoE expert tiles substantially better than
+        // B=128: top-k 6 supplies 3,072 routed rows (12/expert on average)
+        // instead of 768 (3/expert), while also quartering the number of
+        // full-model prompt chunks. The projected-allocation guard below keeps
+        // this exact gfx1201 TP3/TP4 route fail-closed on insufficient VRAM.
+        const EP_PREFILL_MAX_BATCH: usize = 512;
         let projected = deepseek4::forward::PrefillBatchScratch::projected_allocation_bytes(
             &config,
             EP_PREFILL_MAX_BATCH,
