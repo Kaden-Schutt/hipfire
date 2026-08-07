@@ -1211,7 +1211,7 @@ fn run_prefill_gfx1201(gpu: &mut Gpu) {
     eprintln!("=== gfx1201 MFP4G32E8SOA WMMA prefill B={batch} ===");
     eprintln!(
         "  {:<12} {:>7} {:>7} {:>10} {:>10} {:>10} {:>10} {:>9}",
-        "shape", "M", "K", "row us", "B1 us", "B2 us", "B4 us", "B4 speed"
+        "shape", "M", "K", "row us", "B1 us", "B2 us", "B4 us", "B16 speed"
     );
 
     for (slot, (m, k, label)) in shapes.into_iter().enumerate() {
@@ -1235,6 +1235,12 @@ fn run_prefill_gfx1201(gpu: &mut Gpu) {
         let y_b4 = gpu
             .alloc_tensor(&[batch * m], DType::F32)
             .expect("alloc B4 output");
+        let y_b8 = gpu
+            .alloc_tensor(&[batch * m], DType::F32)
+            .expect("alloc B8 output");
+        let y_b16 = gpu
+            .alloc_tensor(&[batch * m], DType::F32)
+            .expect("alloc B16 output");
         let x_host = make_x(batch * k, 0xE812_0100 ^ slot as u64);
         gpu.hip
             .memcpy_htod(&x.buf, bytes_of(&x_host))
@@ -1261,6 +1267,10 @@ fn run_prefill_gfx1201(gpu: &mut Gpu) {
             .expect("gfx1201 B2");
         gpu.gemm_mfp4g32_e8_soa_wmma_b4_gfx1201_f16(&weights, &x_f16, &y_b4, m, k, batch)
             .expect("gfx1201 B4");
+        gpu.gemm_mfp4g32_e8_soa_wmma_b8_gfx1201_f16(&weights, &x_f16, &y_b8, m, k, batch)
+            .expect("gfx1201 B8");
+        gpu.gemm_mfp4g32_e8_soa_wmma_b16_gfx1201_f16(&weights, &x_f16, &y_b16, m, k, batch)
+            .expect("gfx1201 B16");
         gpu.hip
             .device_synchronize()
             .expect("correctness synchronize");
@@ -1269,7 +1279,13 @@ fn run_prefill_gfx1201(gpu: &mut Gpu) {
         gpu.hip
             .memcpy_dtoh(bytes_of_mut(&mut reference), &y_ref.buf)
             .expect("download reference");
-        for (name, candidate_tensor) in [("B1", &y_b1), ("B2", &y_b2), ("B4", &y_b4)] {
+        for (name, candidate_tensor) in [
+            ("B1", &y_b1),
+            ("B2", &y_b2),
+            ("B4", &y_b4),
+            ("B8", &y_b8),
+            ("B16", &y_b16),
+        ] {
             let mut candidate = vec![0.0f32; batch * m];
             gpu.hip
                 .memcpy_dtoh(bytes_of_mut(&mut candidate), &candidate_tensor.buf)
@@ -1316,9 +1332,17 @@ fn run_prefill_gfx1201(gpu: &mut Gpu) {
             gpu.gemm_mfp4g32_e8_soa_wmma_b4_gfx1201_f16(&weights, &x_f16, &y_b4, m, k, batch)
                 .expect("time B4");
         });
+        let b8_us = time(&mut |gpu| {
+            gpu.gemm_mfp4g32_e8_soa_wmma_b8_gfx1201_f16(&weights, &x_f16, &y_b8, m, k, batch)
+                .expect("time B8");
+        });
+        let b16_us = time(&mut |gpu| {
+            gpu.gemm_mfp4g32_e8_soa_wmma_b16_gfx1201_f16(&weights, &x_f16, &y_b16, m, k, batch)
+                .expect("time B16");
+        });
         eprintln!(
-            "  {label:<12} {m:>7} {k:>7} {row_us:>10.2} {b1_us:>10.2} {b2_us:>10.2} {b4_us:>10.2} {:>8.2}x",
-            row_us / b4_us
+            "  {label:<12} {m:>7} {k:>7} row={row_us:.2} B1={b1_us:.2} B2={b2_us:.2} B4={b4_us:.2} B8={b8_us:.2} B16={b16_us:.2} best={:.2}x",
+            row_us / b1_us.min(b2_us).min(b4_us).min(b8_us).min(b16_us)
         );
     }
 

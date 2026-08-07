@@ -13658,6 +13658,52 @@ impl Gpu {
         )
     }
 
+    /// Exact-gfx1201 dense E8-SoA WMMA prefill kernel, eight token tiles.
+    pub fn gemm_mfp4g32_e8_soa_wmma_b8_gfx1201_f16(
+        &mut self,
+        weight: &GpuTensor,
+        x_f16: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.gemm_mfp4g32_e8_soa_wmma_gfx1201_f16_impl(
+            weight,
+            x_f16,
+            y,
+            m,
+            k,
+            batch_size,
+            128,
+            "gemm_mfp4g32_e8_soa_wmma_b8_gfx1201",
+            kernels::GEMM_MFP4G32_E8_SOA_WMMA_B8_GFX1201_SRC,
+        )
+    }
+
+    /// Exact-gfx1201 dense E8-SoA WMMA prefill kernel, sixteen token tiles.
+    pub fn gemm_mfp4g32_e8_soa_wmma_b16_gfx1201_f16(
+        &mut self,
+        weight: &GpuTensor,
+        x_f16: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.gemm_mfp4g32_e8_soa_wmma_gfx1201_f16_impl(
+            weight,
+            x_f16,
+            y,
+            m,
+            k,
+            batch_size,
+            256,
+            "gemm_mfp4g32_e8_soa_wmma_b16_gfx1201",
+            kernels::GEMM_MFP4G32_E8_SOA_WMMA_B16_GFX1201_SRC,
+        )
+    }
+
     /// Four-wave cooperative E8-SoA WMMA candidate for gfx1151 prefill.
     ///
     /// Each wave retains the B4 arithmetic schedule while the workgroup
