@@ -2223,6 +2223,9 @@ fn fail_closed_reset_target_and_spec(
         if let Some(b) = m.qwen2_mut() {
             b.state.reset();
         }
+        if let Some(b) = m.dots_ocr_mut() {
+            b.state.reset();
+        }
         if let Some(b) = m.deepseek4_mut() {
             // Mirror generate_deepseek4 cache-miss teardown: cursor reset alone
             // leaves position-indexed SWA/full/compressed/indexer residue.
@@ -5836,7 +5839,7 @@ fn main() {
                                 gpu.replay.transport_name()
                             );
                         }
-                        let vl = m.vision_config.is_some() || m.dots_ocr_config.is_some();
+                        let vl = m.vision_config.is_some() || m.dots_ocr().is_some();
                         let (dim, layers, vocab) = match m.state.as_ref() {
                             Some(ModelState::Qwen35(b)) => {
                                 (b.config.dim, b.config.n_layers, b.config.vocab_size)
@@ -5854,12 +5857,22 @@ fn main() {
                                 b.config.num_hidden_layers,
                                 b.config.vocab_size,
                             ),
+                            Some(ModelState::Deepseek4(b)) => (
+                                b.config.hidden_size,
+                                b.config.num_hidden_layers,
+                                b.config.vocab_size,
+                            ),
+                            Some(ModelState::Minimax(b)) => (
+                                b.config.hidden_size,
+                                b.config.num_hidden_layers,
+                                b.config.vocab_size,
+                            ),
                             _ => {
-                                if let Some(ref c) = m.dots_ocr_config {
+                                if let Some(b) = m.dots_ocr() {
                                     (
-                                        c.text.hidden_size,
-                                        c.text.num_hidden_layers,
-                                        c.text.vocab_size,
+                                        b.config.text.hidden_size,
+                                        b.config.text.num_hidden_layers,
+                                        b.config.text.vocab_size,
                                     )
                                 } else {
                                     (0, 0, 0)
@@ -6535,6 +6548,9 @@ fn main() {
                         if let Some(b) = m.qwen2_mut() {
                             b.state.reset();
                         }
+                        if let Some(b) = m.dots_ocr_mut() {
+                            b.state.reset();
+                        }
                         if let Some(b) = m.deepseek4_mut() {
                             b.state.reset();
                         }
@@ -7003,6 +7019,9 @@ fn main() {
                 if let Some(b) = m.qwen2_mut() {
                     b.state.reset();
                 }
+                if let Some(b) = m.dots_ocr_mut() {
+                    b.state.reset();
+                }
                 if let Some(b) = m.cohere2moe_mut() {
                     let _ = b.state.reset(&mut gpu);
                 }
@@ -7161,10 +7180,12 @@ fn main() {
                     }
                     ok
                 } else if m.arch_id == 8 {
-                    // dots.ocr: Qwen2 text decoder via qwen2_state + dots_ocr fields.
-                    let state = m.qwen2_state.as_mut().unwrap();
-                    let config = m.dots_ocr_config.as_ref().unwrap();
-                    let weights = m.dots_ocr_weights.as_ref().unwrap();
+                    // dots.ocr: Qwen2 text decoder via the ModelState::DotsOcr
+                    // bundle (the loader no longer populates the flat fields).
+                    let bundle = m.dots_ocr_mut().unwrap();
+                    let state = &mut bundle.state;
+                    let config = &bundle.config;
+                    let weights = &bundle.weights;
                     let mut ok = true;
                     for &tok in &synthetic {
                         if qwen2::forward_step(&mut gpu, &weights.text, &config.text, state, tok)
@@ -18132,16 +18153,10 @@ fn generate_deepseek4(
             return;
         }
     };
-    // `pbs` is a disjoint field from `m.state`, so it borrows independently of
-    // the bundle's `&mut state` below.
-    let pbs = m
-        .deepseek4_pbs
-        .as_ref()
-        .expect("deepseek4_pbs missing on arch_id=9 generate");
-    // The single-GPU ds4 bundle (config/weights/state/eos) lives in
-    // `ModelState::Deepseek4`. Field-borrow it disjointly so `cfg`/`weights`
-    // (shared) and `state` (`&mut`) are live simultaneously, exactly as the
-    // forward path needs.
+    // The single-GPU ds4 bundle (config/weights/state/eos/pbs) lives in
+    // `ModelState::Deepseek4`. Field-borrow it disjointly so `cfg`/`weights`/
+    // `pbs` (shared) and `state` (`&mut`) are live simultaneously, exactly as
+    // the forward path needs.
     let Some(ModelState::Deepseek4(b)) = m.state.as_mut() else {
         let _ = writeln!(
             stdout,
@@ -18155,6 +18170,7 @@ fn generate_deepseek4(
     let weights = &b.weights;
     let state = &mut b.state;
     let eos_tok = b.eos_tok;
+    let pbs = &b.pbs;
 
     let prompt_ids = build_deepseek4_dsml_prompt(
         tokenizer,
@@ -21494,9 +21510,13 @@ fn generate_vl_dots_ocr(
 
     // 2. Model state (disjoint field borrows of `m`).
     let tokenizer = m.tokenizer.as_ref().unwrap();
-    let config = m.dots_ocr_config.as_ref().unwrap();
-    let weights = m.dots_ocr_weights.as_ref().unwrap();
-    let state = m.qwen2_state.as_mut().unwrap();
+    let bundle = match &mut m.state {
+        Some(ModelState::DotsOcr(b)) => b,
+        _ => panic!("dots_ocr bundle required on arch_id=8"),
+    };
+    let config = &bundle.config;
+    let weights = &bundle.weights;
+    let state = &mut bundle.state;
     let text_cfg = &config.text;
     let dim = text_cfg.hidden_size;
 
@@ -21643,8 +21663,8 @@ fn generate_vl_dots_ocr(
     // 6. Decode. Opt-in n-gram speculative decode when a speculator was built at
     // load (HIPFIRE_NGRAM_DRAFT=1, arch_id=8 gate in `spec_build`); else the
     // bespoke greedy AR loop below. The vision prefill above already advanced the
-    // shared Qwen2 KV (`m.qwen2_state`), so both paths decode from the same warm
-    // state — only the drafting differs. The n-gram verify always falls back to
+    // shared Qwen2 KV (in the `ModelState::DotsOcr` bundle), so both paths decode
+    // from the same warm state — only the drafting differs. The n-gram verify always falls back to
     // the target's greedy argmax, so spec output is byte-identical to AR; only τ
     // (speed) changes. The prefill bindings above (`tokenizer`/`config`/`state`/…)
     // are released here so the speculative branch can take `&mut m`; the AR path
@@ -21664,10 +21684,14 @@ fn generate_vl_dots_ocr(
         return;
     }
     let tokenizer = m.tokenizer.as_ref().unwrap();
-    let config = m.dots_ocr_config.as_ref().unwrap();
+    let bundle = match &mut m.state {
+        Some(ModelState::DotsOcr(b)) => b,
+        _ => panic!("dots_ocr bundle required on arch_id=8"),
+    };
+    let config = &bundle.config;
     let text_cfg = &config.text;
-    let weights = m.dots_ocr_weights.as_ref().unwrap();
-    let state = m.qwen2_state.as_mut().unwrap();
+    let weights = &bundle.weights;
+    let state = &mut bundle.state;
 
     // Greedy decode, streaming in the daemon JSONL protocol.
     let eos_set: Vec<u32> = if text_cfg.eos_token_ids.is_empty() {
@@ -21770,13 +21794,12 @@ fn generate_vl_dots_ocr(
 /// when a model-free n-gram speculator was built at load (HIPFIRE_NGRAM_DRAFT=1).
 /// dots.ocr's text decoder IS Qwen2, so the speculator drives it through the
 /// `DotsOcrBundle: SpecTarget` impl. The vision prefill already advanced the
-/// shared `m.qwen2_state` KV, so this only replaces the *decode* phase.
+/// shared Qwen2 KV (in the `ModelState::DotsOcr` bundle), so this only replaces
+/// the *decode* phase.
 ///
-/// The flat decoder fields (`dots_ocr_config`/`dots_ocr_weights`/`qwen2_state`)
-/// are moved into a `DotsOcrBundle` for the `&mut dyn SpecTarget` borrow and
-/// restored on return — dots.ocr stores its state as flat `LoadedModel` fields,
-/// not a `ModelState` bundle, so the `Carrier::spec_target_guard` path (used by
-/// the text arches) does not apply here.
+/// The bundle lives in `m.state` (`ModelState::DotsOcr`); the speculator and
+/// tokenizer are disjoint `m` fields, so the loop borrows all three in place —
+/// no move-out/restore round-trip needed.
 #[allow(clippy::too_many_arguments)]
 fn decode_vl_dots_ocr_ngram(
     m: &mut LoadedModel,
@@ -21789,19 +21812,18 @@ fn decode_vl_dots_ocr_ngram(
     prefill_tokens: usize,
     prefill_s: f64,
 ) {
-    use hipfire_arch_dots_ocr::DotsOcrBundle;
-    // Move the live decoder state into a SpecTarget bundle; restored on return.
-    let mut bundle = DotsOcrBundle {
-        config: m.dots_ocr_config.take().unwrap(),
-        weights: m.dots_ocr_weights.take().unwrap(),
-        state: m.qwen2_state.take().unwrap(),
-    };
-    let mut spec = m.speculator.take().unwrap();
-    // `m.tokenizer` is a disjoint field → coexists with the takes above and the
-    // restore below; the loop never touches `m`.
+    // The live decoder state lives in the `ModelState::DotsOcr` bundle; the
+    // speculator and tokenizer are disjoint `m` fields. Borrow all three
+    // concurrently (direct field access) so the loop advances the bundle's
+    // Qwen2 state in place — nothing to take or restore.
     let tokenizer = m.tokenizer.as_ref().unwrap();
+    let bundle = match &mut m.state {
+        Some(ModelState::DotsOcr(b)) => b,
+        _ => panic!("dots_ocr bundle required on arch_id=8"),
+    };
+    let spec = m.speculator.as_mut().unwrap();
     run_dots_ocr_ngram_loop(
-        &mut bundle,
+        bundle,
         spec.as_mut(),
         tokenizer,
         gpu,
@@ -21813,10 +21835,6 @@ fn decode_vl_dots_ocr_ngram(
         prefill_tokens,
         prefill_s,
     );
-    m.dots_ocr_config = Some(bundle.config);
-    m.dots_ocr_weights = Some(bundle.weights);
-    m.qwen2_state = Some(bundle.state);
-    m.speculator = Some(spec);
 }
 
 /// The dots.ocr n-gram decode loop proper, factored out of
@@ -22021,9 +22039,13 @@ fn generate_dots_ocr_text(
 
     // Model state (disjoint field borrows of `m`).
     let tokenizer = m.tokenizer.as_ref().unwrap();
-    let config = m.dots_ocr_config.as_ref().unwrap();
-    let weights = m.dots_ocr_weights.as_ref().unwrap();
-    let state = m.qwen2_state.as_mut().unwrap();
+    let bundle = match &mut m.state {
+        Some(ModelState::DotsOcr(b)) => b,
+        _ => panic!("dots_ocr bundle required on arch_id=8"),
+    };
+    let config = &bundle.config;
+    let weights = &bundle.weights;
+    let state = &mut bundle.state;
     let text_cfg = &config.text;
     let dim = text_cfg.hidden_size;
 
