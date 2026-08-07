@@ -30,8 +30,14 @@ SP1 is done when all of the following hold:
    microbenchmark. (The size of the win is an output of the work, not a
    precondition; regression against the sequential baseline is a failure.)
 3. The `TILE_SIZE` default is confirmed or replaced by a measured sweep, and the LDS-vs-tile crossover behaviour for multi-slot batches is recorded.
-4. Task 0's measured batching ceiling is recorded, and the §8 roofline estimates
-   are either confirmed or replaced by the measurement.
+4. Task 1's measured batching ceiling is recorded. **AMENDED 2026-08-07:** an
+   attention-only probe cannot measure the weights term, so §8's *aggregate*
+   3.3× / 1.8× figures are explicitly out of SP1's reach and are deferred to
+   SP2/SP3, when a full batched forward exists. What SP1 must record instead is
+   the measured attention-term behaviour: the KV slope per shape and the
+   achieved-bandwidth headroom (done — see
+   `docs/perf-checkpoints/2026-08-07-batching-ceiling-probe.md`), plus the
+   batched-vs-sequential attention numbers from §10.
 5. The asym3 quality gate (§13) has run on both models and its result is
    recorded. asym3 does not become any model's batched default until it passes.
 
