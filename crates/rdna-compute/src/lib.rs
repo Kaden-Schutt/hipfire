@@ -21,6 +21,7 @@ pub mod pool;
 pub mod profile;
 pub mod profile_rocprof;
 pub mod profiler;
+pub mod rdna3;
 pub mod replay;
 pub mod sampling;
 pub mod scratch;
