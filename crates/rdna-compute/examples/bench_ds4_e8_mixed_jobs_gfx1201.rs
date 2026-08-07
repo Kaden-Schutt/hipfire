@@ -65,15 +65,10 @@ fn sequential(
     x: &GpuTensor,
     outputs: &[GpuTensor],
     rows: &[usize],
-    sqrt_softplus_job: Option<usize>,
 ) {
     for index in 0..weights.len() {
         gpu.gemv_mfp4g32_e8_soa(&weights[index], x, &outputs[index], rows[index], K)
             .expect("sequential E8");
-        if sqrt_softplus_job == Some(index) {
-            gpu.sqrt_softplus_f32(&outputs[index])
-                .expect("sequential sqrt_softplus");
-        }
     }
 }
 
@@ -83,24 +78,11 @@ fn packed(
     x: &GpuTensor,
     outputs: &[GpuTensor],
     rows: &[usize],
-    sqrt_softplus_job: Option<usize>,
 ) {
     let weight_refs: Vec<&GpuTensor> = weights.iter().collect();
     let output_refs: Vec<&GpuTensor> = outputs.iter().collect();
-    if let Some(job) = sqrt_softplus_job {
-        gpu.gemv_mfp4g32_e8_soa_mixed_jobs_sqrt_softplus_gfx1201(
-            &weight_refs,
-            x,
-            &output_refs,
-            rows,
-            K,
-            job,
-        )
-        .expect("packed E8 post-op");
-    } else {
-        gpu.gemv_mfp4g32_e8_soa_mixed_jobs_gfx1201(&weight_refs, x, &output_refs, rows, K)
-            .expect("packed E8");
-    }
+    gpu.gemv_mfp4g32_e8_soa_mixed_jobs_gfx1201(&weight_refs, x, &output_refs, rows, K)
+        .expect("packed E8");
 }
 
 fn event_us<F>(gpu: &mut Gpu, repeats: usize, mut launch: F) -> f64
@@ -127,14 +109,7 @@ fn median(values: &mut [f64]) -> f64 {
     values[values.len() / 2]
 }
 
-fn run_case(
-    gpu: &mut Gpu,
-    label: &str,
-    rows: &[usize],
-    layers: usize,
-    seed: u64,
-    sqrt_softplus_job: Option<usize>,
-) {
+fn run_case(gpu: &mut Gpu, label: &str, rows: &[usize], layers: usize, seed: u64) {
     let bytes_per_pack = rows.iter().sum::<usize>() * row_bytes();
     let replicas = ((L3_BYTES * 3 / 2) / bytes_per_pack).max(2) + 1;
     let mut weight_sets = Vec::with_capacity(replicas);
@@ -172,22 +147,8 @@ fn run_case(
         })
         .collect::<Vec<_>>();
 
-    sequential(
-        gpu,
-        &weight_sets[0],
-        &x,
-        &reference,
-        rows,
-        sqrt_softplus_job,
-    );
-    packed(
-        gpu,
-        &weight_sets[0],
-        &x,
-        &candidate,
-        rows,
-        sqrt_softplus_job,
-    );
+    sequential(gpu, &weight_sets[0], &x, &reference, rows);
+    packed(gpu, &weight_sets[0], &x, &candidate, rows);
     gpu.hip.device_synchronize().expect("correctness sync");
     let mut comparisons = 0usize;
     for job in 0..rows.len() {
@@ -208,8 +169,8 @@ fn run_case(
     }
 
     for weights in &weight_sets {
-        sequential(gpu, weights, &x, &reference, rows, sqrt_softplus_job);
-        packed(gpu, weights, &x, &candidate, rows, sqrt_softplus_job);
+        sequential(gpu, weights, &x, &reference, rows);
+        packed(gpu, weights, &x, &candidate, rows);
     }
     gpu.hip.device_synchronize().expect("warm sync");
     let mut sequential_us = Vec::with_capacity(TRIALS);
@@ -222,7 +183,6 @@ fn run_case(
                 &x,
                 &reference,
                 rows,
-                sqrt_softplus_job,
             )
         };
         let pack = |gpu: &mut Gpu, repeat: usize| {
@@ -232,7 +192,6 @@ fn run_case(
                 &x,
                 &candidate,
                 rows,
-                sqrt_softplus_job,
             )
         };
         if trial & 1 == 0 {
@@ -266,7 +225,6 @@ fn main() {
         &[1024, 512, 1024, 1024, 64, 256, 256],
         21,
         0x1201_4000,
-        None,
     );
     // Ratio-128: q_a, joint KV, and the two main-compressor projections.
     run_case(
@@ -275,25 +233,5 @@ fn main() {
         &[1024, 512, 512, 512],
         21,
         0x1201_8000,
-        None,
-    );
-    // TP3 rank 0/1 own 768 shared-expert rows, rank 2 owns 512. The third
-    // 256-row job is the replicated router projection and receives the exact
-    // sqrt(softplus) post-op.
-    run_case(
-        &mut gpu,
-        "tp3-ffn-rank01",
-        &[768, 768, 256],
-        43,
-        0x1201_f301,
-        Some(2),
-    );
-    run_case(
-        &mut gpu,
-        "tp3-ffn-rank2",
-        &[512, 512, 256],
-        43,
-        0x1201_f302,
-        Some(2),
     );
 }

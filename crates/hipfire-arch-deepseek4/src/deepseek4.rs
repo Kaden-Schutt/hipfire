@@ -1753,10 +1753,6 @@ pub struct DeepseekV4State {
     /// MoE router scores `[n_routed_experts = 256]` F32, set by the
     /// router step (gate.weight @ ffn_input + bias → sqrt_softplus).
     pub router_scores: Option<rdna_compute::GpuTensor>,
-    /// Exact-gfx1201 TP3 FFN packing marker. `Some(layer)` means the shared
-    /// gate/up launch also produced fully activated router scores for that
-    /// layer, so `moe_route` must not launch the projection or post-op again.
-    pub router_scores_ready_layer: Option<usize>,
     /// Top-K expert indices, allocated as F32 view but interpreted
     /// as i32. Shape `[num_experts_per_tok = 6]`.
     pub topk_indices: Option<rdna_compute::GpuTensor>,
@@ -1950,7 +1946,6 @@ impl DeepseekV4State {
             hc_x_in: None,
             hc_c: None,
             router_scores: None,
-            router_scores_ready_layer: None,
             topk_indices: None,
             routed_expert_out: None,
             moe_topk_indices: None,

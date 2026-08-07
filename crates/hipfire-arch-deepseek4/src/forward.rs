@@ -6650,7 +6650,6 @@ fn ffn_shared_project(
     gpu: &mut Gpu,
     layer_idx: usize,
 ) -> Result<(), String> {
-    state.router_scores_ready_layer = None;
     let layer = weights.resolve_layer(layer_idx);
     let shared_w1 = layer.shared_w1.as_ref().unwrap();
     let shared_w2 = layer.shared_w2.as_ref().unwrap();
@@ -6683,65 +6682,29 @@ fn ffn_shared_project(
         dump_dense_activations_if_enabled(gpu, &names, ffn_x_plain, cfg.hidden_size)?;
     }
 
-    // Exact-gfx1201 TP3: shared gate, shared up, and router gate all consume
-    // the same rotated activation. One mixed-row launch preserves each E8 row
-    // reduction and applies the router's existing sqrt(softplus) at its store.
-    // The EP3 route is serial at this boundary, so the marker is consumed by
-    // moe_route on the same stream before the next layer begins.
-    let router_weight = layer.gate_weight.as_ref();
-    let packed_router = weights.mq2r_backend.is_gfx1201()
-        && gpu.arch_caps.is_gfx1201()
-        && cfg.mq2r
-        && layer.shared_tp_size == 3
-        && config_cache::moe_on()
-        && shared_w1.dtype == DType::MFP4G32E8SOA
-        && shared_w3.dtype == DType::MFP4G32E8SOA
-        && router_weight
-            .map(|weight| weight.dtype == DType::MFP4G32E8SOA)
-            .unwrap_or(false);
-    if packed_router {
-        if state.router_scores.is_none() {
-            state.router_scores = Some(
-                gpu.alloc_tensor(&[cfg.n_routed_experts], DType::F32)
-                    .map_err(|e| format!("alloc packed router_scores: {e:?}"))?,
-            );
-        }
-        let scores = state.router_scores.as_ref().unwrap();
-        gpu.gemv_mfp4g32_e8_soa_mixed_jobs_sqrt_softplus_gfx1201(
-            &[shared_w1, shared_w3, router_weight.unwrap()],
-            ffn_x_rot,
-            &[&gate, &up, scores],
-            &[local_im, local_im, cfg.n_routed_experts],
-            cfg.hidden_size,
-            2,
-        )
-        .map_err(|error| format!("packed TP3 FFN E8 l{layer_idx}: {error:?}"))?;
-        state.router_scores_ready_layer = Some(layer_idx);
-    } else {
-        // 2. gate = x @ shared_w1
-        gemv_auto(
-            gpu,
-            weights.mq2r_backend,
-            shared_w1,
-            ffn_x_rot,
-            ffn_x_plain,
-            &gate,
-            local_im,
-            cfg.hidden_size,
-        )?;
+    // 2. gate = x @ shared_w1
+    gemv_auto(
+        gpu,
+        weights.mq2r_backend,
+        shared_w1,
+        ffn_x_rot,
+        ffn_x_plain,
+        &gate,
+        local_im,
+        cfg.hidden_size,
+    )?;
 
-        // 3. up = x @ shared_w3
-        gemv_auto(
-            gpu,
-            weights.mq2r_backend,
-            shared_w3,
-            ffn_x_rot,
-            ffn_x_plain,
-            &up,
-            local_im,
-            cfg.hidden_size,
-        )?;
-    }
+    // 3. up = x @ shared_w3
+    gemv_auto(
+        gpu,
+        weights.mq2r_backend,
+        shared_w3,
+        ffn_x_rot,
+        ffn_x_plain,
+        &up,
+        local_im,
+        cfg.hidden_size,
+    )?;
 
     // 4-5. DeepSeek V4 SwiGLU with swiglu_limit clamp, optionally fused with
     //      the FWHT rotation when shared_w2 is MQ4. The fused kernel
@@ -8486,7 +8449,6 @@ fn moe_route(
                 .map_err(|e| format!("alloc router_scores: {e:?}"))?,
         );
     }
-    let scores_precomputed = state.router_scores_ready_layer.take() == Some(layer_idx);
     let scores = state.router_scores.as_ref().unwrap();
     // Note: this function used to also write `state.topk_indices` via a
     // single-threaded selection-sort kernel. That output was never read
@@ -8527,28 +8489,26 @@ fn moe_route(
         && gpu.arch_caps.is_gfx1151()
         && gate_w.dtype == DType::MFP4G32E8SOA
         && config_cache::e8_u4_on(&gpu.arch, weights.mq2r_backend.is_gfx1151());
-    if !scores_precomputed {
-        if fused_activation {
-            gpu.gemv_mfp4g32_e8_soa_u4_buffer_sqrt_softplus_gfx1151(
-                gate_w,
-                ffn_x_rot,
-                scores,
-                n_exp,
-                cfg.hidden_size,
-            )
-            .map_err(|e| format!("fused gate gemv + sqrt_softplus layer {layer_idx}: {e:?}"))?;
-        } else {
-            gemv_auto(
-                gpu,
-                weights.mq2r_backend,
-                gate_w,
-                ffn_x_rot,
-                ffn_x_plain,
-                scores,
-                n_exp,
-                cfg.hidden_size,
-            )?;
-        }
+    if fused_activation {
+        gpu.gemv_mfp4g32_e8_soa_u4_buffer_sqrt_softplus_gfx1151(
+            gate_w,
+            ffn_x_rot,
+            scores,
+            n_exp,
+            cfg.hidden_size,
+        )
+        .map_err(|e| format!("fused gate gemv + sqrt_softplus layer {layer_idx}: {e:?}"))?;
+    } else {
+        gemv_auto(
+            gpu,
+            weights.mq2r_backend,
+            gate_w,
+            ffn_x_rot,
+            ffn_x_plain,
+            scores,
+            n_exp,
+            cfg.hidden_size,
+        )?;
     }
 
     // logits += gate.bias (bias is F16, scores is F32 — need a kernel
@@ -8557,7 +8517,7 @@ fn moe_route(
 
     // scores = sqrt(softplus(logits)) — already applied at the GEMV store when
     // the fused route ran.
-    if !scores_precomputed && !fused_activation {
+    if !fused_activation {
         gpu.sqrt_softplus_f32(scores)
             .map_err(|e| format!("sqrt_softplus layer {layer_idx}: {e:?}"))?;
     }
