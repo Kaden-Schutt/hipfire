@@ -1180,6 +1180,13 @@ pub const GEMV_MFP4G32_E8_SOA_PREFETCH4_GFX1201_SRC: &str = concat!(
     "\n",
     include_str!("../../../kernels/src/gemv_mfp4g32_e8_soa_prefetch4.gfx1201.hip")
 );
+/// Experimental exact-gfx1201 late-scale E8 variant. Mathematically
+/// equivalent, but changes FP32 grouping and therefore owes product parity.
+pub const GEMV_MFP4G32_E8_SOA_LATE_SCALE_GFX1201_SRC: &str = concat!(
+    include_str!("../../../kernels/src/gemv_mfp4g32_e8_soa.gfx1201.hip"),
+    "\n",
+    include_str!("../../../kernels/src/gemv_mfp4g32_e8_soa_late_scale.gfx1201.hip")
+);
 /// Exact-gfx1100 build of the arithmetic-identical grouped E8 O-LoRA kernel.
 pub const GEMV_MFP4G32_E8_SOA_GROUPED_GFX1100_SRC: &str = concat!(
     "#define gemv_mfp4g32_e8_soa_grouped_gfx1151 gemv_mfp4g32_e8_soa_grouped_gfx1100\n",
