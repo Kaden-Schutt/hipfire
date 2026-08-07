@@ -5867,6 +5867,11 @@ fn main() {
                                 b.config.num_hidden_layers,
                                 b.config.vocab_size,
                             ),
+                            Some(ModelState::Lfm2Moe(b)) => (
+                                b.config.hidden_size,
+                                b.config.num_hidden_layers,
+                                b.config.vocab_size,
+                            ),
                             _ => {
                                 if let Some(b) = m.dots_ocr() {
                                     (
