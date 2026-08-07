@@ -3,7 +3,7 @@
 
 # DS4 harmonic hot-expert residency sizing
 
-Status: **packed split micro accepted; split product execution not wired**
+Status: **exact HARM3 product checkpoint; historical performance gate open**
 
 Branch: `ds4-beta-staging`
 
@@ -25,9 +25,12 @@ It also is not ordinary expert parallelism: gfx1151 remains a complete fallback
 owner, while the replicated set is selected to minimize the maximum concurrent
 branch time rather than maximize byte occupancy.
 
-The implementation in this checkpoint is deliberately CPU-only. It adds a
-capacity-bounded typed residency plan and an artifact projection receipt, but
-does not upload replicas, change dispatch, or admit a product route.
+The implementation now carries that plan through a typed DS4HARM3 product
+route. It uploads the exact selected replicas, executes the split owners, and
+joins the six route slots in canonical order. The resulting route is an exact
+functional checkpoint; its measured speed only recovers the regression of the
+fault-contained HARM2 path and does not beat the historical pre-safety
+approximately 32 tok/s waterline.
 
 ## 2. Inputs and durable evidence
 
@@ -311,11 +314,14 @@ byte. The 128-token gate matched all 592 decoded bytes of the canonical
 |---|---:|---:|---:|---:|---:|---|
 | 2,048 prompt / 512 generated, greedy | 6 | 1 fresh process | **31.5721 tok/s** | 30.9810 ms/token | 7.7294 ms/token | 2,491 bytes, MD5 `ee05ab4f07393fb7d624d966a7dde4af`, byte-identical |
 
-This is **+13.94%** over the accepted DS4HARM2 harmonic product at 27.7100
-tok/s. It is an accepted intermediate product win, not completion of the
-50 tok/s goal and not a repeated publication sample. Device identities were
-resolved at runtime to exact gfx1100 and gfx1151 owners; no PCI address is
-encoded in the route.
+This is **+13.94%** over the fault-contained DS4HARM2 implementation at
+27.7100 tok/s, but that is only a local diagnostic comparison. The campaign's
+real pre-safety waterline was approximately **32 tok/s**. At 31.5721 tok/s,
+DS4HARM3 recovers the safety-path regression while remaining slightly below
+that historical baseline. It is therefore an exact functional checkpoint,
+**not a campaign performance win**, not completion of the 50 tok/s goal, and
+not a repeated publication sample. Device identities were resolved at runtime
+to exact gfx1100 and gfx1151 owners; no PCI address is encoded in the route.
 
 The micro projection did not fully translate. Measured layer wall is 30.9810
 ms/token versus the 19.8086 ms/token device-useful projection, leaving an
@@ -386,14 +392,16 @@ publication remains the admitted control structure.
 
 ## 7. Next gates
 
-1. Collect or recover multi-genre 2,048+decode route dumps and cross-validate a
-   static or prefill-derived plan. No GPU is needed if dumps already exist.
-2. Stage-profile the accepted DS4HARM3 product path and classify the 11.1724
-   ms/token gap between occurrence-weighted device work and layer wall.
+1. Replace the per-layer gfx1151 HIP expert chord with an owner-local retained
+   submission. The paired-stage accounting places about 3.25 ms/token between
+   the measured remote HIP path and its occurrence-weighted device work.
+2. Retain the gfx1100 dense-owner composition after the remote chord is exact;
+   the current path still issues about 2,676 dense launches per token.
 3. Revisit the banked E8 prefetch only after the new branch balance predicts it
    can reduce the maximum branch or serial path.
 4. Admit only a candidate that projects at least another 2% end to end; repeat
    the two-token, 128-token, and canonical 2,048/512 exactness sequence.
 
-The one-sample 31.5721 tok/s result is a measured intermediate, not a repeated
-promotion or publication number. T1 remains open.
+The one-sample 31.5721 tok/s result is an exact baseline-recovery checkpoint,
+not a performance promotion or publication number. It does not exceed the
+historical approximately 32 tok/s line. T1 remains open at 50 tok/s.
