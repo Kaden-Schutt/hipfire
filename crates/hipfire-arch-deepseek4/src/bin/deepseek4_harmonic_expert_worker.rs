@@ -195,6 +195,12 @@ fn run_loaded_worker(
             &cfg,
             args.allocation_generation,
         )?);
+        service.as_mut().unwrap().prepare_retained_split(
+            &mut gpu,
+            &cfg,
+            weights.as_ref().unwrap(),
+            &receipt.pci_bus_id,
+        )?;
         mapping = Some(
             HarmonicGpuMapping::register(ring, &gpu.hip)
                 .map_err(|error| format!("register harmonic expert payloads: {error}"))?,
@@ -229,6 +235,15 @@ fn run_loaded_worker(
         let stage_timing = service.as_ref().unwrap().stage_timing();
         #[allow(unused_mut)]
         let mut report = serde_json::json!({
+            "harmonic_expert_retained_split": service
+                .as_ref()
+                .unwrap()
+                .retained_split_identity()
+                .map(|(dispatch_count, command_dwords, queue_id)| serde_json::json!({
+                    "dispatch_count": dispatch_count,
+                    "command_dwords": command_dwords,
+                    "queue_id": queue_id,
+                })),
             "harmonic_expert_owner_hip_calls": {
                 "launch_count": hip_bridge::launch_counters::launch_kernel::count(),
                 "launch_time_ns": hip_bridge::launch_counters::launch_kernel::time_ns(),

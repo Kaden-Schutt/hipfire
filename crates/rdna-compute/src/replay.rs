@@ -25,8 +25,9 @@ use redline_dispatch::aql::{
     load_symbols, BatchFencePolicy, Executable, Gfx10DispatchInitiatorPolicy,
     Gfx10Pm4CommandBuffer, Gfx11ComputeResourceLimitsPolicy, Gfx11DispatchInterleave,
     Gfx12Pm4CommandBuffer, GpuBatchTiming, GpuDevice, GpuMultiQueueTiming, GpuSelector,
-    HeaderPolicy, KernargBuffer, KernargPool, Kernel, LaunchGeometry, PhasedMultiQueuePm4Ib,
-    QueuePolicy, RecordedDispatch, Runtime, SingleQueueBatchGraph, SingleQueuePm4Ib,
+    HeaderPolicy, KernargBuffer, KernargPool, Kernel, LaunchGeometry, PciBusId,
+    PhasedMultiQueuePm4Ib, QueuePolicy, RecordedDispatch, Runtime, SingleQueueBatchGraph,
+    SingleQueuePm4Ib,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2563,6 +2564,26 @@ pub struct Pm4DispatchProfile {
     pub spans_nanoseconds: Vec<u64>,
 }
 
+/// One bounded replay-time update to an already-owned kernarg allocation.
+///
+/// The prepared tape still owns the kernarg and every external pointee. A
+/// caller may only patch a field before submission or after the prior replay
+/// completed; [`ReplayController::replay_pm4_patched`] enforces that sequencing.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Pm4KernargPatch<'a> {
+    pub dispatch: usize,
+    pub offset: usize,
+    pub bytes: &'a [u8],
+}
+
+/// One bounded replay-time workgroup update. Every axis must remain nonzero
+/// and no larger than the captured maximum.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Pm4GridPatch {
+    pub dispatch: usize,
+    pub workgroups: [u32; 3],
+}
+
 pub struct PreparedPm4Replay {
     graph: PreparedPm4Graph,
     // Kernels retain their HSA executables and kernargs retain every pointer
@@ -2571,6 +2592,8 @@ pub struct PreparedPm4Replay {
     kernargs: Vec<KernargBuffer>,
     dynamic_gdn_frames: Vec<usize>,
     dynamic_grids: Vec<(usize, ReplayGridBinding, [u32; 3], [u32; 3])>,
+    recorded_grids: Vec<[u32; 3]>,
+    recorded_blocks: Vec<[u32; 3]>,
     pm4_architecture: Pm4Architecture,
     dispatch_count: usize,
     command_dwords: u32,
@@ -2578,6 +2601,82 @@ pub struct PreparedPm4Replay {
 }
 
 impl PreparedPm4Replay {
+    fn apply_kernarg_patches(&mut self, patches: &[Pm4KernargPatch<'_>]) -> Result<(), String> {
+        for patch in patches {
+            let dispatch_count = self.kernargs.len();
+            let kernarg = self.kernargs.get_mut(patch.dispatch).ok_or_else(|| {
+                format!(
+                    "PM4 kernarg patch dispatch {} exceeds {} dispatches",
+                    patch.dispatch, dispatch_count
+                )
+            })?;
+            let end = patch
+                .offset
+                .checked_add(patch.bytes.len())
+                .ok_or_else(|| "PM4 kernarg patch range overflow".to_owned())?;
+            let kernarg_len = kernarg.len();
+            let target = kernarg
+                .as_mut_bytes()
+                .get_mut(patch.offset..end)
+                .ok_or_else(|| {
+                    format!(
+                        "PM4 kernarg patch dispatch {} range {}..{} exceeds {} bytes",
+                        patch.dispatch, patch.offset, end, kernarg_len
+                    )
+                })?;
+            target.copy_from_slice(patch.bytes);
+        }
+        Ok(())
+    }
+
+    fn apply_grid_patches(&mut self, patches: &[Pm4GridPatch]) -> Result<(), String> {
+        if self.graph.queue_count() != 1 {
+            return Err("PM4 replay-time grid patch requires one retained queue".to_owned());
+        }
+        for patch in patches {
+            let recorded = *self.recorded_grids.get(patch.dispatch).ok_or_else(|| {
+                format!(
+                    "PM4 grid patch dispatch {} exceeds {} dispatches",
+                    patch.dispatch,
+                    self.recorded_grids.len()
+                )
+            })?;
+            if patch.workgroups.into_iter().any(|value| value == 0)
+                || patch
+                    .workgroups
+                    .into_iter()
+                    .zip(recorded)
+                    .any(|(value, maximum)| value > maximum)
+            {
+                return Err(format!(
+                    "PM4 grid patch dispatch {} workgroups {:?} must be nonzero and no larger than recorded {:?}",
+                    patch.dispatch, patch.workgroups, recorded
+                ));
+            }
+            let dimensions = if self.pm4_architecture == Pm4Architecture::Gfx12 {
+                let block = self.recorded_blocks[patch.dispatch];
+                let mut workitems = [0_u32; 3];
+                for axis in 0..3 {
+                    workitems[axis] =
+                        patch.workgroups[axis]
+                            .checked_mul(block[axis])
+                            .ok_or_else(|| {
+                                format!(
+                                    "PM4 grid patch dispatch {} axis {} overflows",
+                                    patch.dispatch, axis
+                                )
+                            })?;
+                }
+                workitems
+            } else {
+                patch.workgroups
+            };
+            self.graph
+                .patch_dispatch_dimensions(patch.dispatch, dimensions)?;
+        }
+        Ok(())
+    }
+
     /// # Safety
     ///
     /// Every pointer captured in the immutable explicit kernarg prefixes must
@@ -2786,6 +2885,16 @@ impl ReplayController {
         // B>=5 (B=4 is 3,642 dispatches). Keep this scoped to the secondary
         // controller; the primary model controller retains its stricter cap.
         controller.max_recorded_launches = 8_192;
+        controller
+    }
+
+    /// Construct a secondary PM4 controller whose command image is guaranteed
+    /// to remain one patchable IB regardless of the process-wide queue policy.
+    /// This is for owner-local variable-shape chords, not independent-lane
+    /// scheduling.
+    pub fn new_manual_pm4_single_queue() -> Self {
+        let mut controller = Self::new_manual_pm4();
+        controller.pm4_queue_policy = QueuePolicy::One;
         controller
     }
 
@@ -3245,7 +3354,20 @@ impl ReplayController {
         device_ordinal: usize,
         prefix: usize,
     ) -> Result<(usize, u32, u64), String> {
-        self.prepare_pm4_prefix_inner(device_ordinal, prefix, false)
+        self.prepare_pm4_prefix_inner(GpuSelector::Ordinal(device_ordinal), prefix, false)
+    }
+
+    /// Lower a captured prefix on the exact physical device already admitted
+    /// by the model owner. This avoids ordinal drift on heterogeneous hosts.
+    pub fn prepare_pm4_prefix_for_pci_bus_id(
+        &mut self,
+        pci_bus_id: &str,
+        prefix: usize,
+    ) -> Result<(usize, u32, u64), String> {
+        let pci_bus_id = pci_bus_id
+            .parse::<PciBusId>()
+            .map_err(|error| format!("invalid PM4 PCI identity {pci_bus_id:?}: {error}"))?;
+        self.prepare_pm4_prefix_inner(GpuSelector::PciBusId(pci_bus_id), prefix, false)
     }
 
     /// Lower a captured prefix to a single GFX12 IB with per-dispatch timestamps.
@@ -3254,12 +3376,12 @@ impl ReplayController {
         device_ordinal: usize,
         prefix: usize,
     ) -> Result<(usize, u32, u64), String> {
-        self.prepare_pm4_prefix_inner(device_ordinal, prefix, true)
+        self.prepare_pm4_prefix_inner(GpuSelector::Ordinal(device_ordinal), prefix, true)
     }
 
     fn prepare_pm4_prefix_inner(
         &mut self,
-        device_ordinal: usize,
+        device_selector: GpuSelector<'_>,
         prefix: usize,
         dispatch_profile: bool,
     ) -> Result<(usize, u32, u64), String> {
@@ -3275,7 +3397,7 @@ impl ReplayController {
         let runtime = Runtime::initialize(load_symbols().map_err(|error| error.to_string())?)
             .map_err(|error| error.to_string())?;
         let device = runtime
-            .select_gpu(GpuSelector::Ordinal(device_ordinal))
+            .select_gpu(device_selector)
             .map_err(|error| error.to_string())?;
         let pm4_architecture = Pm4Architecture::from_device(&device)?;
         if dispatch_profile && pm4_architecture != Pm4Architecture::Gfx12 {
@@ -3821,12 +3943,26 @@ impl ReplayController {
             (PreparedPm4Graph::Phased(graph), command_dwords)
         };
         let queue_id = graph.queue_id();
+        let recorded_grids = self
+            .recorded
+            .iter()
+            .take(prefix)
+            .map(|launch| launch.grid)
+            .collect();
+        let recorded_blocks = self
+            .recorded
+            .iter()
+            .take(prefix)
+            .map(|launch| launch.block)
+            .collect();
         self.prepared_pm4 = Some(PreparedPm4Replay {
             graph,
             _kernels: kernels,
             kernargs,
             dynamic_gdn_frames,
             dynamic_grids,
+            recorded_grids,
+            recorded_blocks,
             pm4_architecture,
             dispatch_count: prefix,
             command_dwords,
@@ -3864,6 +4000,45 @@ impl ReplayController {
                 .ok_or_else(|| "no prepared PM4 replay".to_owned())?;
             // SAFETY: forwarded from the model owner.
             unsafe { prepared.replay_and_wait(position) }
+        };
+        self.observe_replay_result(position, result)
+    }
+
+    /// Patch an explicitly bounded set of kernarg fields and workgroup counts,
+    /// then submit one already-prepared PM4 tape. The prior replay has completed
+    /// before this method returns, so the next call may safely mutate the same
+    /// owner-local kernarg allocations.
+    ///
+    /// # Safety
+    ///
+    /// Patched pointer bytes must name live allocations owned by the same exact
+    /// GPU and remain live through completion. All unpatched captured pointers
+    /// retain the contract of [`Self::replay_pm4`].
+    pub unsafe fn replay_pm4_patched(
+        &mut self,
+        position: usize,
+        kernarg_patches: &[Pm4KernargPatch<'_>],
+        grid_patches: &[Pm4GridPatch],
+    ) -> Result<GpuMultiQueueTiming, String> {
+        let result = {
+            let prepared = self
+                .prepared_pm4
+                .as_mut()
+                .ok_or_else(|| "no prepared PM4 replay".to_owned());
+            match prepared {
+                Ok(prepared) => {
+                    if let Err(error) = prepared.apply_kernarg_patches(kernarg_patches) {
+                        Err(error)
+                    } else if let Err(error) = prepared.apply_grid_patches(grid_patches) {
+                        Err(error)
+                    } else {
+                        // SAFETY: forwarded from the model owner after applying
+                        // only the bounded patches above.
+                        unsafe { prepared.replay_and_wait(position) }
+                    }
+                }
+                Err(error) => Err(error),
+            }
         };
         self.observe_replay_result(position, result)
     }
@@ -5359,6 +5534,16 @@ mod tests {
         assert_eq!(controller.transport_name(), "pm4");
         assert_eq!(controller.state(), ReplayState::Armed);
         assert_eq!(controller.fallback_reason(), None);
+        assert!(!controller.auto_lifecycle);
+    }
+
+    #[test]
+    fn manual_patchable_pm4_ignores_process_multi_queue_policy() {
+        let controller = ReplayController::new_manual_pm4_single_queue();
+
+        assert_eq!(controller.request(), ReplayBackendRequest::Auto);
+        assert_eq!(controller.transport_name(), "pm4");
+        assert_eq!(controller.pm4_queue_policy, QueuePolicy::One);
         assert!(!controller.auto_lifecycle);
     }
 

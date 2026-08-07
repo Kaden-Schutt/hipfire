@@ -13,6 +13,9 @@
 use hip_bridge::DeviceBuffer;
 #[cfg(feature = "harmonic-stage-profile")]
 use hip_bridge::{Event, HipRuntime};
+use rdna_compute::replay::ReplayController;
+#[cfg(not(feature = "harmonic-stage-profile"))]
+use rdna_compute::replay::{Pm4GridPatch, Pm4KernargPatch};
 use rdna_compute::{DType, Gpu, GpuTensor};
 #[cfg(feature = "harmonic-stage-profile")]
 use serde::Serialize;
@@ -47,6 +50,13 @@ struct HarmonicExpertStageProfile {
     down: Event,
     publish: Event,
     timing: HarmonicExpertStageTiming,
+}
+
+struct HarmonicExpertRetainedSplit {
+    replay: ReplayController,
+    dispatch_count: usize,
+    command_dwords: u32,
+    queue_id: u64,
 }
 
 #[cfg(feature = "harmonic-stage-profile")]
@@ -118,6 +128,7 @@ pub struct DeepseekV4HarmonicExpertService {
     topk_index_bytes: [u8; HARMONIC_TOP_K * std::mem::size_of::<u32>()],
     topk_weight_bytes: [u8; HARMONIC_TOP_K * std::mem::size_of::<u32>()],
     result_payload: Vec<u8>,
+    retained_split: Option<HarmonicExpertRetainedSplit>,
     #[cfg(feature = "harmonic-stage-profile")]
     stage_profile: Option<HarmonicExpertStageProfile>,
 }
@@ -147,6 +158,7 @@ impl DeepseekV4HarmonicExpertService {
             topk_index_bytes: [0; HARMONIC_TOP_K * std::mem::size_of::<u32>()],
             topk_weight_bytes: [0; HARMONIC_TOP_K * std::mem::size_of::<u32>()],
             result_payload: vec![0; HARMONIC_RESULT_EXTENT as usize],
+            retained_split: None,
             #[cfg(feature = "harmonic-stage-profile")]
             stage_profile: None,
         };
@@ -220,12 +232,161 @@ impl DeepseekV4HarmonicExpertService {
         &self.result_payload
     }
 
+    pub fn retained_split_identity(&self) -> Option<(usize, u32, u64)> {
+        self.retained_split.as_ref().map(|retained| {
+            (
+                retained.dispatch_count,
+                retained.command_dwords,
+                retained.queue_id,
+            )
+        })
+    }
+
     #[cfg(feature = "harmonic-stage-profile")]
     pub fn stage_timing(&self) -> HarmonicExpertStageTiming {
         self.stage_profile
             .as_ref()
             .map(|profile| profile.timing)
             .unwrap_or_default()
+    }
+
+    fn dispatch_split_kernels(
+        &self,
+        gpu: &mut Gpu,
+        cfg: &DeepseekV4Config,
+        expert_gate_up_ptrs: &GpuTensor,
+        expert_down_ptrs: &GpuTensor,
+        x_rot: &GpuTensor,
+        k_top: usize,
+    ) -> Result<(), String> {
+        gpu.deepseek4_gemv_mq2g256_lloyd_moe_gate_up_indexed(
+            expert_gate_up_ptrs,
+            self.topk_indices.as_ref().unwrap(),
+            x_rot,
+            self.gate_batch.as_ref().unwrap(),
+            self.up_batch.as_ref().unwrap(),
+            2 * HARMONIC_MOE_INTERMEDIATE_SIZE,
+            HARMONIC_HIDDEN_SIZE,
+            k_top,
+        )
+        .map_err(|error| format!("harmonic split gate/up: {error}"))?;
+        gpu.deepseek4_silu_mul_clamp_f32_batched(
+            self.gate_batch.as_ref().unwrap(),
+            self.up_batch.as_ref().unwrap(),
+            self.gate_batch.as_ref().unwrap(),
+            HARMONIC_MOE_INTERMEDIATE_SIZE,
+            k_top,
+            cfg.swiglu_limit,
+        )
+        .map_err(|error| format!("harmonic split activation: {error}"))?;
+        gpu.rotate_x_mq_batched(
+            self.gate_batch.as_ref().unwrap(),
+            self.rot_batch.as_ref().unwrap(),
+            HARMONIC_MOE_INTERMEDIATE_SIZE,
+            k_top,
+        )
+        .map_err(|error| format!("harmonic split rotation: {error}"))?;
+        gpu.deepseek4_gemv_mq2g256_lloyd_moe_down_expanded_k4(
+            expert_down_ptrs,
+            self.topk_indices.as_ref().unwrap(),
+            self.rot_batch.as_ref().unwrap(),
+            self.down_expanded.as_ref().unwrap(),
+            HARMONIC_HIDDEN_SIZE,
+            HARMONIC_MOE_INTERMEDIATE_SIZE,
+            k_top,
+            1,
+        )
+        .map_err(|error| format!("harmonic split down: {error}"))
+    }
+
+    /// Capture the maximal four-dispatch expert chord once, lower it on the
+    /// exact BDF already admitted by the worker, and retain its owner-local
+    /// queue. Replay-time patches may only narrow k_top and replace the two
+    /// layer pointer tables plus the registered activation alias.
+    pub fn prepare_retained_split(
+        &mut self,
+        gpu: &mut Gpu,
+        cfg: &DeepseekV4Config,
+        weights: &DeepseekV4RoutedWeights,
+        pci_bus_id: &str,
+    ) -> Result<(), String> {
+        validate_worker_config(gpu, cfg, self.allocation_generation)?;
+        if self.retained_split.is_some() {
+            return Err("harmonic retained split was already prepared".to_owned());
+        }
+        let layer = weights.resolve_layer(0);
+        let expert_gate_up_ptrs = layer
+            .expert_gate_up_ptrs
+            .as_ref()
+            .ok_or_else(|| "harmonic retained gate/up pointer table missing l0".to_owned())?;
+        let expert_down_ptrs = layer
+            .expert_w2_ptrs
+            .as_ref()
+            .ok_or_else(|| "harmonic retained down pointer table missing l0".to_owned())?;
+        let capture_ids: [u32; HARMONIC_TOP_K] = std::array::from_fn(|index| index as u32);
+        encode_words(&capture_ids, &mut self.topk_index_bytes);
+        let stream = gpu
+            .active_stream
+            .as_ref()
+            .ok_or_else(|| "harmonic retained preparation stream missing".to_owned())?;
+        gpu.hip
+            .memcpy_htod_async(
+                &self.topk_indices.as_ref().unwrap().buf,
+                &self.topk_index_bytes,
+                stream,
+            )
+            .map_err(|error| format!("harmonic retained upload capture indices: {error}"))?;
+        gpu.hip
+            .memset_async(
+                &self.x_rot.as_ref().unwrap().buf,
+                0,
+                self.x_rot.as_ref().unwrap().byte_size(),
+                stream,
+            )
+            .map_err(|error| format!("harmonic retained zero capture activation: {error}"))?;
+        gpu.hip
+            .stream_synchronize(stream)
+            .map_err(|error| format!("harmonic retained capture inputs: {error}"))?;
+
+        let original_replay = std::mem::replace(
+            &mut gpu.replay,
+            ReplayController::new_manual_pm4_single_queue(),
+        );
+        let capture = (|| -> Result<(usize, u32, u64), String> {
+            gpu.replay.begin_capture().map_err(str::to_owned)?;
+            self.dispatch_split_kernels(
+                gpu,
+                cfg,
+                expert_gate_up_ptrs,
+                expert_down_ptrs,
+                self.x_rot.as_ref().unwrap(),
+                HARMONIC_TOP_K,
+            )?;
+            gpu.hip
+                .stream_synchronize(gpu.active_stream.as_ref().unwrap())
+                .map_err(|error| format!("harmonic retained capture completion: {error}"))?;
+            let summary = gpu.replay.finish_capture().map_err(str::to_owned)?;
+            if summary.launch_count != 4 || summary.unique_kernel_count != 4 {
+                return Err(format!(
+                    "harmonic retained chord captured {} launches / {} symbols, expected 4 / 4",
+                    summary.launch_count, summary.unique_kernel_count
+                ));
+            }
+            gpu.replay
+                .prepare_pm4_prefix_for_pci_bus_id(pci_bus_id, summary.launch_count)
+        })();
+        let retained_replay = std::mem::replace(&mut gpu.replay, original_replay);
+        let (dispatch_count, command_dwords, queue_id) = capture?;
+        self.retained_split = Some(HarmonicExpertRetainedSplit {
+            replay: retained_replay,
+            dispatch_count,
+            command_dwords,
+            queue_id,
+        });
+        eprintln!(
+            "[harmonic] prepared gfx1151 expert chord: dispatches={dispatch_count} command_dwords={command_dwords} queue_id={queue_id} pci={pci_bus_id}"
+        );
+        Ok(())
     }
 
     /// Execute one already-routed expert request entirely on the local gfx1151
@@ -649,72 +810,144 @@ impl DeepseekV4HarmonicExpertService {
                 .event_record(&profile.start, Some(stream))
                 .map_err(|error| format!("harmonic split stage start: {error}"))?;
         }
-        gpu.deepseek4_gemv_mq2g256_lloyd_moe_gate_up_indexed(
-            expert_gate_up_ptrs,
-            self.topk_indices.as_ref().unwrap(),
-            &x_rot,
-            self.gate_batch.as_ref().unwrap(),
-            self.up_batch.as_ref().unwrap(),
-            2 * HARMONIC_MOE_INTERMEDIATE_SIZE,
-            HARMONIC_HIDDEN_SIZE,
-            k_top,
-        )
-        .map_err(|error| format!("harmonic split gate/up l{layer_index}: {error}"))?;
         #[cfg(feature = "harmonic-stage-profile")]
-        gpu.hip
-            .event_record(
-                &self.stage_profile.as_ref().unwrap().gate_up,
-                gpu.active_stream.as_ref(),
+        {
+            gpu.deepseek4_gemv_mq2g256_lloyd_moe_gate_up_indexed(
+                expert_gate_up_ptrs,
+                self.topk_indices.as_ref().unwrap(),
+                &x_rot,
+                self.gate_batch.as_ref().unwrap(),
+                self.up_batch.as_ref().unwrap(),
+                2 * HARMONIC_MOE_INTERMEDIATE_SIZE,
+                HARMONIC_HIDDEN_SIZE,
+                k_top,
             )
-            .map_err(|error| format!("harmonic split gate/up boundary: {error}"))?;
-        gpu.deepseek4_silu_mul_clamp_f32_batched(
-            self.gate_batch.as_ref().unwrap(),
-            self.up_batch.as_ref().unwrap(),
-            self.gate_batch.as_ref().unwrap(),
-            HARMONIC_MOE_INTERMEDIATE_SIZE,
-            k_top,
-            cfg.swiglu_limit,
-        )
-        .map_err(|error| format!("harmonic split activation l{layer_index}: {error}"))?;
-        #[cfg(feature = "harmonic-stage-profile")]
-        gpu.hip
-            .event_record(
-                &self.stage_profile.as_ref().unwrap().activation,
-                gpu.active_stream.as_ref(),
+            .map_err(|error| format!("harmonic split gate/up l{layer_index}: {error}"))?;
+            gpu.hip
+                .event_record(
+                    &self.stage_profile.as_ref().unwrap().gate_up,
+                    gpu.active_stream.as_ref(),
+                )
+                .map_err(|error| format!("harmonic split gate/up boundary: {error}"))?;
+            gpu.deepseek4_silu_mul_clamp_f32_batched(
+                self.gate_batch.as_ref().unwrap(),
+                self.up_batch.as_ref().unwrap(),
+                self.gate_batch.as_ref().unwrap(),
+                HARMONIC_MOE_INTERMEDIATE_SIZE,
+                k_top,
+                cfg.swiglu_limit,
             )
-            .map_err(|error| format!("harmonic split activation boundary: {error}"))?;
-        gpu.rotate_x_mq_batched(
-            self.gate_batch.as_ref().unwrap(),
-            self.rot_batch.as_ref().unwrap(),
-            HARMONIC_MOE_INTERMEDIATE_SIZE,
-            k_top,
-        )
-        .map_err(|error| format!("harmonic split rotation l{layer_index}: {error}"))?;
-        #[cfg(feature = "harmonic-stage-profile")]
-        gpu.hip
-            .event_record(
-                &self.stage_profile.as_ref().unwrap().rotation,
-                gpu.active_stream.as_ref(),
+            .map_err(|error| format!("harmonic split activation l{layer_index}: {error}"))?;
+            gpu.hip
+                .event_record(
+                    &self.stage_profile.as_ref().unwrap().activation,
+                    gpu.active_stream.as_ref(),
+                )
+                .map_err(|error| format!("harmonic split activation boundary: {error}"))?;
+            gpu.rotate_x_mq_batched(
+                self.gate_batch.as_ref().unwrap(),
+                self.rot_batch.as_ref().unwrap(),
+                HARMONIC_MOE_INTERMEDIATE_SIZE,
+                k_top,
             )
-            .map_err(|error| format!("harmonic split rotation boundary: {error}"))?;
-        gpu.deepseek4_gemv_mq2g256_lloyd_moe_down_expanded_k4(
-            expert_down_ptrs,
-            self.topk_indices.as_ref().unwrap(),
-            self.rot_batch.as_ref().unwrap(),
-            self.down_expanded.as_ref().unwrap(),
-            HARMONIC_HIDDEN_SIZE,
-            HARMONIC_MOE_INTERMEDIATE_SIZE,
-            k_top,
-            1,
-        )
-        .map_err(|error| format!("harmonic split down l{layer_index}: {error}"))?;
-        #[cfg(feature = "harmonic-stage-profile")]
-        gpu.hip
-            .event_record(
-                &self.stage_profile.as_ref().unwrap().down,
-                gpu.active_stream.as_ref(),
+            .map_err(|error| format!("harmonic split rotation l{layer_index}: {error}"))?;
+            gpu.hip
+                .event_record(
+                    &self.stage_profile.as_ref().unwrap().rotation,
+                    gpu.active_stream.as_ref(),
+                )
+                .map_err(|error| format!("harmonic split rotation boundary: {error}"))?;
+            gpu.deepseek4_gemv_mq2g256_lloyd_moe_down_expanded_k4(
+                expert_down_ptrs,
+                self.topk_indices.as_ref().unwrap(),
+                self.rot_batch.as_ref().unwrap(),
+                self.down_expanded.as_ref().unwrap(),
+                HARMONIC_HIDDEN_SIZE,
+                HARMONIC_MOE_INTERMEDIATE_SIZE,
+                k_top,
+                1,
             )
-            .map_err(|error| format!("harmonic split down boundary: {error}"))?;
+            .map_err(|error| format!("harmonic split down l{layer_index}: {error}"))?;
+            gpu.hip
+                .event_record(
+                    &self.stage_profile.as_ref().unwrap().down,
+                    gpu.active_stream.as_ref(),
+                )
+                .map_err(|error| format!("harmonic split down boundary: {error}"))?;
+        }
+        #[cfg(not(feature = "harmonic-stage-profile"))]
+        if self.retained_split.is_some() {
+            // The HIP stream owns the tiny top-k upload. Complete it before the
+            // owner-local PM4 queue consumes the stable top-k allocation.
+            gpu.hip
+                .stream_synchronize(gpu.active_stream.as_ref().unwrap())
+                .map_err(|error| format!("harmonic retained top-k visibility: {error}"))?;
+            let gate_ptr = (expert_gate_up_ptrs.buf.as_ptr() as usize).to_ne_bytes();
+            let activation_ptr = (x_rot.buf.as_ptr() as usize).to_ne_bytes();
+            let down_ptr = (expert_down_ptrs.buf.as_ptr() as usize).to_ne_bytes();
+            let k_top_i32 = (k_top as i32).to_ne_bytes();
+            let kernarg_patches = [
+                Pm4KernargPatch {
+                    dispatch: 0,
+                    offset: 0,
+                    bytes: &gate_ptr,
+                },
+                Pm4KernargPatch {
+                    dispatch: 0,
+                    offset: 16,
+                    bytes: &activation_ptr,
+                },
+                Pm4KernargPatch {
+                    dispatch: 3,
+                    offset: 0,
+                    bytes: &down_ptr,
+                },
+                Pm4KernargPatch {
+                    dispatch: 3,
+                    offset: 40,
+                    bytes: &k_top_i32,
+                },
+            ];
+            let mi_groups = (HARMONIC_MOE_INTERMEDIATE_SIZE / 256) as u32;
+            let grid_patches = [
+                Pm4GridPatch {
+                    dispatch: 0,
+                    workgroups: [(2 * HARMONIC_MOE_INTERMEDIATE_SIZE) as u32, k_top as u32, 1],
+                },
+                Pm4GridPatch {
+                    dispatch: 1,
+                    workgroups: [mi_groups, k_top as u32, 1],
+                },
+                Pm4GridPatch {
+                    dispatch: 2,
+                    workgroups: [mi_groups * k_top as u32, 1, 1],
+                },
+                Pm4GridPatch {
+                    dispatch: 3,
+                    workgroups: [HARMONIC_HIDDEN_SIZE as u32, k_top as u32, 1],
+                },
+            ];
+            // SAFETY: every patched pointer belongs to this exact gfx1151
+            // process and remains live through the synchronous replay.
+            unsafe {
+                self.retained_split
+                    .as_mut()
+                    .unwrap()
+                    .replay
+                    .replay_pm4_patched(packet.epoch as usize, &kernarg_patches, &grid_patches)
+            }
+            .map_err(|error| format!("harmonic retained expert chord l{layer_index}: {error}"))?;
+        } else {
+            self.dispatch_split_kernels(
+                gpu,
+                cfg,
+                expert_gate_up_ptrs,
+                expert_down_ptrs,
+                &x_rot,
+                k_top,
+            )
+            .map_err(|error| format!("harmonic split HIP chord l{layer_index}: {error}"))?;
+        }
         {
             let stream = gpu.active_stream.as_ref().ok_or_else(|| {
                 "harmonic split expert local stream missing after dispatch".to_owned()
@@ -774,6 +1007,9 @@ impl DeepseekV4HarmonicExpertService {
             }
         }
         gpu.bind_thread_or_warn();
+        // Drop the owner-local queue and its kernargs before any pointee it
+        // captured can be returned to the GPU pool.
+        self.retained_split.take();
         free(gpu, &mut self.x_rot);
         free(gpu, &mut self.topk_indices);
         free(gpu, &mut self.topk_weights);
