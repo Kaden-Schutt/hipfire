@@ -21,6 +21,11 @@ const MQ2_LLOYD_DOWN_EXPANDED_EP_SRC: &str =
     include_str!("../../../../kernels/src/gemv_mq2g256_lloyd_moe_down_expanded_k4_ep.gfx1201.hip");
 const MQ2_LLOYD_DOWN_EXPANDED_EP_KERNEL: &str =
     "gemv_mq2g256_lloyd_moe_down_expanded_k4_gfx1201_ep";
+const MQ2_LLOYD_DOWN_EXPANDED_LDS_EP_SRC: &str = include_str!(
+    "../../../../kernels/src/gemv_mq2g256_lloyd_moe_down_expanded_k4_lds_ep.gfx1201.hip"
+);
+const MQ2_LLOYD_DOWN_EXPANDED_LDS_EP_KERNEL: &str =
+    "gemv_mq2g256_lloyd_moe_down_expanded_k4_lds_gfx1201_ep";
 
 /// A mutable GPU borrow proven to target exact gfx1201.
 ///
@@ -165,6 +170,82 @@ impl Gfx1201Device<'_> {
         );
         let result = self.gpu.launch_maybe_blob(
             MQ2_LLOYD_DOWN_EXPANDED_EP_KERNEL,
+            [m as u32, k_top as u32, batch_size as u32],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut blob = KernargBlob::new();
+                blob.push_ptr(expert_ptrs_ptr);
+                blob.push_ptr(ownership_ptrs_ptr);
+                blob.push_ptr(dummy_ptr);
+                blob.push_ptr(topk_indices_ptr);
+                blob.push_ptr(rot_ptr);
+                blob.push_ptr(output_ptr);
+                blob.push_i32(m_i32);
+                blob.push_i32(k_i32);
+                blob.push_i32(k_top_i32);
+                blob
+            },
+        );
+        if let Some(timer) = timer {
+            timer.finish(&self.gpu.hip);
+        }
+        result
+    }
+
+    /// Micro-screen sister of [`Self::mq2_lloyd_moe_down_expanded_ep`] which
+    /// cooperatively stages each four-entry MQ2 codebook in LDS.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mq2_lloyd_moe_down_expanded_lds_ep(
+        &mut self,
+        expert_ptrs: &GpuTensor,
+        ownership_ptrs: &GpuTensor,
+        nonowned_dummy: &GpuTensor,
+        topk_indices: &GpuTensor,
+        rot_batch: &GpuTensor,
+        expert_outputs: &GpuTensor,
+        m: usize,
+        k: usize,
+        k_top: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.gpu.bind_thread()?;
+        assert!(k.is_multiple_of(256), "gfx1201 MQ2 down requires K%256=0");
+        self.gpu.ensure_kernel(
+            MQ2_LLOYD_DOWN_EXPANDED_LDS_EP_KERNEL,
+            MQ2_LLOYD_DOWN_EXPANDED_LDS_EP_SRC,
+            MQ2_LLOYD_DOWN_EXPANDED_LDS_EP_KERNEL,
+        )?;
+        let expert_ptrs_ptr = expert_ptrs.buf.as_ptr();
+        let ownership_ptrs_ptr = ownership_ptrs.buf.as_ptr();
+        let dummy_ptr = nonowned_dummy.buf.as_ptr();
+        let topk_indices_ptr = topk_indices.buf.as_ptr();
+        let rot_ptr = rot_batch.buf.as_ptr();
+        let output_ptr = expert_outputs.buf.as_ptr();
+        let m_i32 = m as i32;
+        let k_i32 = k as i32;
+        let k_top_i32 = k_top as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &expert_ptrs_ptr as *const _ as *mut c_void,
+            &ownership_ptrs_ptr as *const _ as *mut c_void,
+            &dummy_ptr as *const _ as *mut c_void,
+            &topk_indices_ptr as *const _ as *mut c_void,
+            &rot_ptr as *const _ as *mut c_void,
+            &output_ptr as *const _ as *mut c_void,
+            &m_i32 as *const _ as *mut c_void,
+            &k_i32 as *const _ as *mut c_void,
+            &k_top_i32 as *const _ as *mut c_void,
+        ];
+        let bytes = batch_size * k_top * (m * (k / 256) * 72 + k * 4 + m * 4);
+        let timer = crate::profile::begin_timer(
+            &self.gpu.hip,
+            "gemv",
+            MQ2_LLOYD_DOWN_EXPANDED_LDS_EP_KERNEL,
+            bytes,
+        );
+        let result = self.gpu.launch_maybe_blob(
+            MQ2_LLOYD_DOWN_EXPANDED_LDS_EP_KERNEL,
             [m as u32, k_top as u32, batch_size as u32],
             [32, 1, 1],
             0,

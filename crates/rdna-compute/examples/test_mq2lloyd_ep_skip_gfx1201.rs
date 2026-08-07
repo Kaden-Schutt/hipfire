@@ -213,6 +213,9 @@ fn main() {
     let candidate_down = gpu
         .alloc_tensor(&[TOP_K, DOWN_M], rdna_compute::DType::F32)
         .expect("candidate down");
+    let lds_down = gpu
+        .alloc_tensor(&[TOP_K, DOWN_M], rdna_compute::DType::F32)
+        .expect("LDS down");
     gpu.deepseek4_gemv_mq2g256_lloyd_moe_down_expanded_k4(
         &down_ptrs, &topk, &rot, &base_down, DOWN_M, DOWN_K, TOP_K, 1,
     )
@@ -232,6 +235,12 @@ fn main() {
             1,
         )
         .expect("down candidate");
+    gpu.try_gfx1201()
+        .expect("exact gfx1201")
+        .mq2_lloyd_moe_down_expanded_lds_ep(
+            &down_ptrs, &gate_ptrs, &dummy, &topk, &rot, &lds_down, DOWN_M, DOWN_K, TOP_K, 1,
+        )
+        .expect("down LDS candidate");
     gpu.hip.device_synchronize().expect("channel sync");
 
     let base_gate_host = gpu.download_f32(&base_gate).expect("download base gate");
@@ -246,12 +255,15 @@ fn main() {
     let candidate_down_host = gpu
         .download_f32(&candidate_down)
         .expect("download candidate down");
+    let lds_down_host = gpu.download_f32(&lds_down).expect("download LDS down");
     assert_raw_equal("gate", &base_gate_host, &candidate_gate_host);
     assert_raw_equal("up", &base_up_host, &candidate_up_host);
     assert_raw_equal("down", &base_down_host, &candidate_down_host);
+    assert_raw_equal("down-lds", &candidate_down_host, &lds_down_host);
     assert_nonowned_positive_zero("gate", &candidate_gate_host, GATE_M / 2);
     assert_nonowned_positive_zero("up", &candidate_up_host, GATE_M / 2);
     assert_nonowned_positive_zero("down", &candidate_down_host, DOWN_M);
+    assert_nonowned_positive_zero("down-lds", &lds_down_host, DOWN_M);
 
     for _ in 0..3 {
         gpu.deepseek4_gemv_mq2g256_lloyd_moe_gate_up_indexed(
@@ -321,11 +333,26 @@ fn main() {
             )
             .expect("timed down candidate");
     });
+    let down_lds_ms = elapsed_ms(&mut gpu, REPEATS, |gpu| {
+        gpu.try_gfx1201()
+            .expect("exact gfx1201")
+            .mq2_lloyd_moe_down_expanded_lds_ep(
+                &down_ptrs, &gate_ptrs, &dummy, &topk, &rot, &lds_down, DOWN_M, DOWN_K, TOP_K, 1,
+            )
+            .expect("timed down LDS candidate");
+    });
+    const LAYERS: f32 = 43.0;
+    const PRODUCT_TOK_S: f32 = 54.903_755;
+    let product_ms = 1000.0 / PRODUCT_TOK_S;
+    let saved_per_token_ms = (down_candidate_ms - down_lds_ms) * LAYERS;
+    let projected_product_pct = saved_per_token_ms / product_ms * 100.0;
     println!(
         "MICRO owned=2/6 repeats={REPEATS} gate_ms={gate_base_ms:.6}->{gate_candidate_ms:.6} \
          gate_speedup={:.3}x down_ms={down_base_ms:.6}->{down_candidate_ms:.6} \
-         down_speedup={:.3}x",
+         down_speedup={:.3}x down_lds_ms={down_lds_ms:.6} down_lds_speedup={:.3}x \
+         saved_43_layers_ms={saved_per_token_ms:.6} projected_product_pct={projected_product_pct:.3}",
         gate_base_ms / gate_candidate_ms,
         down_base_ms / down_candidate_ms,
+        down_candidate_ms / down_lds_ms,
     );
 }
