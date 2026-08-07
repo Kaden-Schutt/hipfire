@@ -895,6 +895,78 @@ impl Gpus {
         }
         Ok(())
     }
+
+    /// Deterministic rooted peer all-reduce for batched TP activations.
+    ///
+    /// Every rank observes the exact same left-associated sum
+    /// `rank0 + rank1 + ... + rankN`: peer inputs are first copied into
+    /// rank 0 scratch, rank 0 accumulates them in rank order, and the result
+    /// is broadcast back to every peer. This both avoids rank-dependent
+    /// floating-point order and cuts peer traffic from `N * (N - 1)` copies
+    /// to `2 * (N - 1)` copies. Buffers are updated in place.
+    pub fn all_reduce_sum_f32_peer_rooted(
+        &mut self,
+        buffers: &[&DeviceBuffer],
+        count: usize,
+    ) -> HipResult<()> {
+        let n = self.devices.len();
+        if buffers.len() != n {
+            return Err(HipError::new(
+                0,
+                &format!(
+                    "all_reduce_sum_f32_peer_rooted: buffers.len()={} != n_devices={n}",
+                    buffers.len()
+                ),
+            ));
+        }
+        if n == 1 {
+            return Ok(());
+        }
+        let bytes = count * 4;
+        self.ensure_peer_ar_tmp(bytes)?;
+
+        // Preserve every non-root input before rank 0 starts writing its sum.
+        let mut gather_events = Vec::with_capacity(n - 1);
+        for rank in 1..n {
+            gather_events.push(self.boundary_copy(
+                rank,
+                0,
+                buffers[rank],
+                &self.peer_ar_tmp[0][rank - 1],
+                bytes,
+            )?);
+        }
+        for event in gather_events {
+            self.wait_boundary(event)?;
+        }
+
+        let root = GpuTensor {
+            buf: unsafe { buffers[0].alias() },
+            shape: vec![count],
+            dtype: DType::F32,
+        };
+        self.devices[0].bind_thread()?;
+        for slot in 0..n - 1 {
+            let peer = GpuTensor {
+                buf: unsafe { self.peer_ar_tmp[0][slot].alias() },
+                shape: vec![count],
+                dtype: DType::F32,
+            };
+            self.devices[0].add_inplace_f32(&root, &peer)?;
+        }
+
+        // boundary_copy is enqueued on rank 0's active stream, after the
+        // ordered add kernels above. Waiting makes the result visible before
+        // any peer starts its HC mix.
+        let mut broadcast_events = Vec::with_capacity(n - 1);
+        for rank in 1..n {
+            broadcast_events.push(self.boundary_copy(0, rank, buffers[0], buffers[rank], bytes)?);
+        }
+        for event in broadcast_events {
+            self.wait_boundary(event)?;
+        }
+        Ok(())
+    }
 }
 
 fn uniform_split_counts(n_devices: usize, n_layers: usize) -> Vec<usize> {

@@ -10024,6 +10024,7 @@ fn ep_serve_ds4(
             weights,
             state,
             partials,
+            prefill,
         } = inner
         else {
             emit_active_attempt_error(
@@ -10037,36 +10038,64 @@ fn ep_serve_ds4(
             let _ = stdout.flush();
             return;
         };
-        for (pos, &t) in prompt_ids.iter().enumerate() {
-            // FIX #1 (ep-prefill-abort): check the cancel signal at the TOP of
-            // every prefill iteration, not just after the loop. A long prompt
-            // (thousands of tokens) means the post-loop check below would still
-            // run the entire multi-GPU prefill before honoring a cancel. Mirror
-            // the decode loop: on abort, emit aborted+done, reset KV cursors,
-            // and stop. We must drop the `gpus`/`state` borrow before calling
-            // `ep_emit_abort` (which re-borrows `m.ep`), so break out and let
-            // the post-loop guard fire — but set the abort flag is consumed by
-            // check_abort, so call it here and short-circuit via a flag.
+        if !prefill.is_empty() {
             if check_abort(id) {
-                // Drop the EpState borrow by breaking; the post-loop guard
-                // re-checks via a sentinel. Simpler: emit + return is blocked
-                // by the borrow, so we set `aborted` and break.
                 aborted_in_prefill = true;
-                break;
-            }
-            if let Err(e) = deepseek4::forward::forward_ep(
-                gpus, weights, config, state, partials, t, pos as u32,
+            } else if let Err(e) = deepseek4::forward::forward_ep_prefill_batch_chunked(
+                gpus,
+                weights,
+                config,
+                state,
+                prefill,
+                &prompt_ids,
+                0,
             ) {
                 emit_active_attempt_error(
                     stdout,
                     Some(id),
-                    &format!("forward_ep prefill: {}", format!("{e}").replace('"', "'")),
+                    &format!(
+                        "forward_ep batched prefill: {}",
+                        format!("{e}").replace('"', "'")
+                    ),
                     "validation",
                     false,
                     false,
                 );
                 let _ = stdout.flush();
                 return;
+            }
+        } else {
+            for (pos, &t) in prompt_ids.iter().enumerate() {
+                // FIX #1 (ep-prefill-abort): check the cancel signal at the TOP of
+                // every prefill iteration, not just after the loop. A long prompt
+                // (thousands of tokens) means the post-loop check below would still
+                // run the entire multi-GPU prefill before honoring a cancel. Mirror
+                // the decode loop: on abort, emit aborted+done, reset KV cursors,
+                // and stop. We must drop the `gpus`/`state` borrow before calling
+                // `ep_emit_abort` (which re-borrows `m.ep`), so break out and let
+                // the post-loop guard fire — but set the abort flag is consumed by
+                // check_abort, so call it here and short-circuit via a flag.
+                if check_abort(id) {
+                    // Drop the EpState borrow by breaking; the post-loop guard
+                    // re-checks via a sentinel. Simpler: emit + return is blocked
+                    // by the borrow, so we set `aborted` and break.
+                    aborted_in_prefill = true;
+                    break;
+                }
+                if let Err(e) = deepseek4::forward::forward_ep(
+                    gpus, weights, config, state, partials, t, pos as u32,
+                ) {
+                    emit_active_attempt_error(
+                        stdout,
+                        Some(id),
+                        &format!("forward_ep prefill: {}", format!("{e}").replace('"', "'")),
+                        "validation",
+                        false,
+                        false,
+                    );
+                    let _ = stdout.flush();
+                    return;
+                }
             }
         }
     }
@@ -10192,6 +10221,7 @@ fn ep_serve_ds4(
             weights,
             state,
             partials,
+            ..
         } = inner
         else {
             break;

@@ -544,6 +544,9 @@ pub enum EpArch {
         weights: Vec<hipfire_arch_deepseek4::DeepseekV4Weights>,
         state: Vec<hipfire_arch_deepseek4::DeepseekV4State>,
         partials: Vec<rdna_compute::GpuTensor>,
+        /// Exact gfx1201 MQ2R TP3/TP4 batched-prefill scratch, one per rank.
+        /// Empty for every other EP route.
+        prefill: Vec<hipfire_arch_deepseek4::forward::PrefillBatchScratch>,
     },
     Minimax {
         config: minimax::MiniMaxConfig,
@@ -1362,6 +1365,7 @@ struct Ds4EpStaging {
     weights: Vec<deepseek4::DeepseekV4Weights>,
     state: Vec<deepseek4::DeepseekV4State>,
     partials: Vec<rdna_compute::GpuTensor>,
+    prefill: Vec<deepseek4::forward::PrefillBatchScratch>,
 }
 
 impl Ds4EpStaging {
@@ -1371,6 +1375,7 @@ impl Ds4EpStaging {
             weights: Vec::new(),
             state: Vec::new(),
             partials: Vec::new(),
+            prefill: Vec::new(),
         }
     }
     fn gpus_mut(&mut self) -> &mut Gpus {
@@ -1384,12 +1389,14 @@ impl Ds4EpStaging {
         Vec<deepseek4::DeepseekV4Weights>,
         Vec<deepseek4::DeepseekV4State>,
         Vec<rdna_compute::GpuTensor>,
+        Vec<deepseek4::forward::PrefillBatchScratch>,
     ) {
         let gpus = self.gpus.take().expect("into_parts called twice");
         let weights = std::mem::take(&mut self.weights);
         let state = std::mem::take(&mut self.state);
         let partials = std::mem::take(&mut self.partials);
-        (gpus, weights, state, partials)
+        let prefill = std::mem::take(&mut self.prefill);
+        (gpus, weights, state, partials, prefill)
     }
 }
 
@@ -1418,6 +1425,12 @@ impl Drop for Ds4EpStaging {
             if let Some(dev) = gpus.devices.get_mut(r) {
                 let _ = dev.bind_thread();
                 let _ = dev.free_tensor(p);
+            }
+        }
+        for (r, pbs) in self.prefill.drain(..).enumerate() {
+            if let Some(dev) = gpus.devices.get_mut(r) {
+                let _ = dev.bind_thread();
+                pbs.free_gpu(dev);
             }
         }
         for dev in gpus.devices.iter_mut() {
@@ -1602,18 +1615,48 @@ fn load_model_ep_ds4(path: &str, max_seq: usize, tp: usize) -> Result<LoadedMode
             .map_err(|e| format!("partial {r}: {e:?}"))?;
         staging.partials.push(p);
     }
-    // Exact-gated gfx1201 MQ2R TP3/TP4 graph substrate. Allocate one fixed
-    // system-visible epoch per rank before enabling peer access so every
-    // pointer is final when peer mappings are established.
-    if matches!(tp, 3 | 4)
+    // Exact-gated gfx1201 MQ2R TP3/TP4 graph + batched-prefill substrate.
+    // Allocate every long-lived pointer before enabling peer access so peer
+    // mappings and later graph capture observe the final allocation layout.
+    let gfx1201_mq2r_tp = matches!(tp, 3 | 4)
         && config.mq2r
         && !config.mq2rxt
         && staging
             .gpus_mut()
             .devices
             .iter()
-            .all(|device| device.arch_caps.is_gfx1201())
-    {
+            .all(|device| device.arch_caps.is_gfx1201());
+    if gfx1201_mq2r_tp {
+        const EP_PREFILL_MAX_BATCH: usize = 128;
+        let projected = deepseek4::forward::PrefillBatchScratch::projected_allocation_bytes(
+            &config,
+            EP_PREFILL_MAX_BATCH,
+        )?;
+        for rank in 0..n {
+            let dev = &mut staging.gpus_mut().devices[rank];
+            dev.bind_thread()
+                .map_err(|e| format!("bind gfx1201 TP prefill rank {rank}: {e:?}"))?;
+            let (free, _total) = dev
+                .hip
+                .get_vram_info()
+                .map_err(|e| format!("query gfx1201 TP prefill VRAM rank {rank}: {e:?}"))?;
+            if free < projected {
+                return Err(format!(
+                    "gfx1201 TP prefill rank {rank}: need {:.2} GiB scratch, only {:.2} GiB free",
+                    projected as f64 / (1u64 << 30) as f64,
+                    free as f64 / (1u64 << 30) as f64,
+                ));
+            }
+            let pbs =
+                deepseek4::forward::PrefillBatchScratch::new(dev, &config, EP_PREFILL_MAX_BATCH)
+                    .map_err(|e| format!("allocate gfx1201 TP prefill rank {rank}: {e}"))?;
+            staging.prefill.push(pbs);
+        }
+        eprintln!(
+            "[loader] gfx1201 TP{tp} batched prefill: B={} scratch={:.2} GiB/rank",
+            EP_PREFILL_MAX_BATCH,
+            projected as f64 / (1u64 << 30) as f64,
+        );
         staging
             .gpus_mut()
             .prepare_tp_graph_signals(config.num_hidden_layers * 2)
@@ -1626,7 +1669,7 @@ fn load_model_ep_ds4(path: &str, max_seq: usize, tp: usize) -> Result<LoadedMode
     hipfire_runtime::ep::ensure_rank_streams(staging.gpus_mut())
         .map_err(|e| format!("ensure_rank_streams: {e:?}"))?;
     eprintln!("[loader] EP load complete: {n} ranks, peer_access={peer}");
-    let (gpus, weights, state, partials) = staging.into_parts();
+    let (gpus, weights, state, partials, prefill) = staging.into_parts();
 
     let eos_tok: u32 = {
         let ids = tokenizer.encode("<｜end▁of▁sentence｜>");
@@ -1645,6 +1688,7 @@ fn load_model_ep_ds4(path: &str, max_seq: usize, tp: usize) -> Result<LoadedMode
                 weights,
                 state,
                 partials,
+                prefill,
             },
         }),
         deepseek4_eos_tok: eos_tok,
@@ -1810,6 +1854,7 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(
                 weights,
                 state,
                 partials,
+                prefill,
                 ..
             } => {
                 for (r, w) in weights.into_iter().enumerate() {
@@ -1828,6 +1873,12 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(
                     if let Some(dev) = gpus.devices.get_mut(r) {
                         let _ = dev.bind_thread();
                         let _ = dev.free_tensor(p);
+                    }
+                }
+                for (r, pbs) in prefill.into_iter().enumerate() {
+                    if let Some(dev) = gpus.devices.get_mut(r) {
+                        let _ = dev.bind_thread();
+                        pbs.free_gpu(dev);
                     }
                 }
             }

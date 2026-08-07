@@ -12361,6 +12361,17 @@ fn ffn_batched(
 
     let hidden = cfg.hidden_size;
     let im = cfg.moe_intermediate_size;
+    let shared_im = if layer.shared_tp_size > 1 {
+        layer.shared_intermediate_count
+    } else {
+        im
+    };
+    if shared_im == 0 || shared_im > im {
+        return Err(format!(
+            "ffn_batched l{layer_idx}: invalid shared TP width {shared_im} (global {im}, tp={})",
+            layer.shared_tp_size
+        ));
+    }
 
     // Skip dead FWHT rotations on prefill (mirror decode-path FWHT skip).
     // Routed MoE consumes ffn_x_rot_batch (MQ2-Lloyd → needs FWHT), so keep
@@ -12415,7 +12426,7 @@ fn ffn_batched(
         &pbs.ffn_x_rot_batch,
         &pbs.ffn_shared_gate_batch,
         &pbs.ffn_shared_up_batch,
-        im,
+        shared_im,
         hidden,
         batch_size,
     )?;
@@ -12427,7 +12438,7 @@ fn ffn_batched(
             &pbs.ffn_x_rot_batch,
             &pbs.ffn_x_plain_batch,
             &pbs.ffn_shared_gate_batch,
-            im,
+            shared_im,
             hidden,
             batch_size,
             Some(&pbs.wmma_x_scratch_f16),
@@ -12439,7 +12450,7 @@ fn ffn_batched(
             &pbs.ffn_x_rot_batch,
             &pbs.ffn_x_plain_batch,
             &pbs.ffn_shared_up_batch,
-            im,
+            shared_im,
             hidden,
             batch_size,
             Some(&pbs.wmma_x_scratch_f16),
@@ -12451,19 +12462,21 @@ fn ffn_batched(
         &pbs.ffn_shared_gate_batch,
         &pbs.ffn_shared_up_batch,
         &pbs.ffn_shared_gate_batch,
-        im,
+        shared_im,
         batch_size,
         cfg.swiglu_limit,
     )
     .map_err(|e| format!("deepseek4_silu_mul_clamp_f32_batched shared l{layer_idx}: {e:?}"))?;
 
     if dense_activation_dump_enabled()? {
-        let active = pbs.ffn_shared_gate_batch.sub_offset(0, batch_size * im);
+        let active = pbs
+            .ffn_shared_gate_batch
+            .sub_offset(0, batch_size * shared_im);
         dump_dense_activation_if_enabled(
             gpu,
             &format!("layers.{layer_idx}.ffn.shared_experts.w2.weight"),
             &active,
-            im,
+            shared_im,
         )?;
     }
 
@@ -12472,7 +12485,7 @@ fn ffn_batched(
         gpu.rotate_x_mq_batched(
             &pbs.ffn_shared_gate_batch,
             &pbs.ffn_shared_rot_batch,
-            im,
+            shared_im,
             batch_size,
         )
         .map_err(|e| format!("rotate_x_mq_batched shared silu l{layer_idx}: {e:?}"))?;
@@ -12487,7 +12500,7 @@ fn ffn_batched(
         &pbs.ffn_shared_gate_batch,
         &pbs.ffn_out_batch,
         hidden,
-        im,
+        shared_im,
         batch_size,
         Some(&pbs.wmma_x_scratch_f16),
     )?;
@@ -14163,6 +14176,266 @@ pub fn forward_prefill_batch_chunked(
         remaining = &remaining[take..];
     }
     Err("forward_prefill_batch_chunked: chunk loop completed without producing logits".to_string())
+}
+
+/// Exact gfx1201 TP3/TP4 batched prefill for the sharded DeepSeek V4 route.
+///
+/// Attention heads/O-LoRA groups and the shared expert are evaluated at each
+/// rank's local width. Routed experts remain expert-parallel. The two hidden
+/// contributions are reduced with a deterministic rank-ordered rooted peer
+/// sum after attention and FFN, then broadcast before the HC mix so every
+/// rank enters the next stage with bit-identical residual streams.
+#[allow(clippy::too_many_arguments)]
+pub fn forward_ep_prefill_batch_chunked(
+    gpus: &mut hipfire_runtime::multi_gpu::Gpus,
+    weights_per_rank: &[DeepseekV4Weights],
+    cfg: &DeepseekV4Config,
+    state_per_rank: &mut [DeepseekV4State],
+    pbs_per_rank: &mut [PrefillBatchScratch],
+    tokens: &[u32],
+    start_pos: u32,
+) -> Result<(), String> {
+    let n_ranks = gpus.devices.len();
+    if !matches!(n_ranks, 3 | 4)
+        || weights_per_rank.len() != n_ranks
+        || state_per_rank.len() != n_ranks
+        || pbs_per_rank.len() != n_ranks
+        || !cfg.mq2r
+        || cfg.mq2rxt
+        || !gpus.peer_access_enabled
+        || !gpus
+            .devices
+            .iter()
+            .all(|device| device.arch_caps.is_gfx1201())
+    {
+        return Err(format!(
+            "forward_ep_prefill_batch_chunked requires exact gfx1201 MQ2R TP3/TP4 (ranks={n_ranks}, weights={}, state={}, pbs={}, mq2r={}, mq2rxt={}, peer={})",
+            weights_per_rank.len(),
+            state_per_rank.len(),
+            pbs_per_rank.len(),
+            cfg.mq2r,
+            cfg.mq2rxt,
+            gpus.peer_access_enabled,
+        ));
+    }
+    if tokens.is_empty() {
+        return Err("forward_ep_prefill_batch_chunked: empty tokens".to_string());
+    }
+    let max_batch = pbs_per_rank[0].max_batch;
+    if max_batch == 0 || pbs_per_rank.iter().any(|pbs| pbs.max_batch != max_batch) {
+        return Err("forward_ep_prefill_batch_chunked: inconsistent rank PBS capacity".to_string());
+    }
+
+    let required_tokens = (start_pos as usize).saturating_add(tokens.len());
+    for rank in 0..n_ranks {
+        gpus.devices[rank]
+            .bind_thread()
+            .map_err(|error| format!("TP{n_ranks} prefill bind rank {rank}: {error:?}"))?;
+        ensure_request_capacity(
+            cfg,
+            &mut state_per_rank[rank],
+            &mut gpus.devices[rank],
+            &mut pbs_per_rank[rank],
+            required_tokens,
+        )?;
+    }
+
+    let mut consumed = 0usize;
+    let mut last_batch = 0usize;
+    while consumed < tokens.len() {
+        let batch_size = (tokens.len() - consumed).min(max_batch);
+        let chunk = &tokens[consumed..consumed + batch_size];
+        let chunk_start = start_pos + consumed as u32;
+        last_batch = batch_size;
+
+        // Dynamic request inputs and replicated embedding/HC initialization.
+        for rank in 0..n_ranks {
+            let gpu = &mut gpus.devices[rank];
+            let pbs = &pbs_per_rank[rank];
+            upload_prefill_batch_inputs(cfg, gpu, pbs, chunk, chunk_start)?;
+            let token_embd = weights_per_rank[rank]
+                .token_embd
+                .as_ref()
+                .ok_or_else(|| format!("TP{n_ranks} rank {rank}: token_embd missing"))?;
+            gpu.embedding_lookup_q8_batched(
+                token_embd,
+                &pbs.embed_batch,
+                &pbs.tokens,
+                batch_size,
+                cfg.hidden_size,
+            )
+            .map_err(|error| {
+                format!("TP{n_ranks} rank {rank}: embedding_lookup_q8_batched: {error:?}")
+            })?;
+            gpu.hc_streams_init_from_embed_batched(
+                &pbs.embed_batch,
+                &pbs.streams_batch,
+                cfg.hidden_size as i32,
+                cfg.hc_mult as i32,
+                batch_size as i32,
+            )
+            .map_err(|error| {
+                format!("TP{n_ranks} rank {rank}: hc_streams_init_from_embed_batched: {error:?}")
+            })?;
+        }
+
+        for layer_idx in 0..cfg.num_hidden_layers {
+            // Rank-local attention projection and attention body.
+            for rank in 0..n_ranks {
+                let weights = &weights_per_rank[rank];
+                let layer = weights.resolve_layer(layer_idx);
+                if layer.attn_tp_size != n_ranks
+                    || layer.attn_tp_rank != rank
+                    || layer.attn_head_count == 0
+                    || layer.attn_group_count == 0
+                    || layer.attn_head_count * cfg.o_groups
+                        != layer.attn_group_count * cfg.num_attention_heads
+                    || layer.shared_tp_size != n_ranks
+                    || layer.shared_tp_rank != rank
+                    || layer.shared_intermediate_count == 0
+                {
+                    return Err(format!(
+                        "TP{n_ranks} prefill invalid shard l{layer_idx} r{rank}: heads={} groups={} shared={} attn_tp={}/{} shared_tp={}/{}",
+                        layer.attn_head_count,
+                        layer.attn_group_count,
+                        layer.shared_intermediate_count,
+                        layer.attn_tp_rank,
+                        layer.attn_tp_size,
+                        layer.shared_tp_rank,
+                        layer.shared_tp_size,
+                    ));
+                }
+                let mut local_cfg = cfg.clone();
+                local_cfg.num_attention_heads = layer.attn_head_count;
+                local_cfg.o_groups = layer.attn_group_count;
+                let pbs = &pbs_per_rank[rank];
+                let state = &mut state_per_rank[rank];
+                let gpu = &mut gpus.devices[rank];
+
+                mhc_pre_batched(cfg, layer, pbs, gpu, layer_idx, true, batch_size)?;
+                let attention_input_precomputed = q_lora_batched(
+                    &local_cfg,
+                    layer,
+                    weights.mq2r_backend,
+                    pbs,
+                    &pbs.hc_x_in_batch,
+                    gpu,
+                    layer_idx,
+                    batch_size,
+                )?;
+                kv_joint_batched(
+                    &local_cfg,
+                    layer,
+                    weights.mq2r_backend,
+                    pbs,
+                    gpu,
+                    layer_idx,
+                    batch_size,
+                    attention_input_precomputed,
+                )?;
+                apply_tail_rope_batched(&local_cfg, layer, pbs, gpu, layer_idx, batch_size)?;
+                if layer.compress_ratio == 0 {
+                    attention_block_batched_swa_only(
+                        &local_cfg,
+                        weights,
+                        state,
+                        pbs,
+                        gpu,
+                        layer_idx,
+                        chunk_start,
+                        batch_size,
+                        false,
+                    )?;
+                } else {
+                    attention_block_batched_mixed(
+                        &local_cfg,
+                        weights,
+                        state,
+                        pbs,
+                        gpu,
+                        layer_idx,
+                        chunk_start,
+                        batch_size,
+                        false,
+                        attention_input_precomputed,
+                    )?;
+                }
+            }
+
+            let attn_buffers: Vec<_> = pbs_per_rank
+                .iter()
+                .map(|pbs| &pbs.attn_out_batch.buf)
+                .collect();
+            gpus.all_reduce_sum_f32_peer_rooted(&attn_buffers, batch_size * cfg.hidden_size)
+                .map_err(|error| {
+                    format!("TP{n_ranks} prefill attention reduce l{layer_idx}: {error:?}")
+                })?;
+            for rank in 0..n_ranks {
+                hc_attn_mix_batched(
+                    cfg,
+                    &pbs_per_rank[rank],
+                    &mut gpus.devices[rank],
+                    batch_size,
+                )?;
+            }
+
+            // Shared-intermediate TP plus routed-expert EP. ffn_batched uses
+            // the layer's local shared width and global routed-expert shape.
+            for rank in 0..n_ranks {
+                let weights = &weights_per_rank[rank];
+                let layer = weights.resolve_layer(layer_idx);
+                let pbs = &pbs_per_rank[rank];
+                let gpu = &mut gpus.devices[rank];
+                mhc_pre_batched(cfg, layer, pbs, gpu, layer_idx, false, batch_size)?;
+                ffn_batched(
+                    cfg,
+                    layer,
+                    weights.mq2r_backend,
+                    pbs,
+                    gpu,
+                    layer_idx,
+                    layer_idx < cfg.num_hash_layers,
+                    batch_size,
+                    chunk,
+                )?;
+            }
+            let ffn_buffers: Vec<_> = pbs_per_rank
+                .iter()
+                .map(|pbs| &pbs.ffn_out_batch.buf)
+                .collect();
+            gpus.all_reduce_sum_f32_peer_rooted(&ffn_buffers, batch_size * cfg.hidden_size)
+                .map_err(|error| {
+                    format!("TP{n_ranks} prefill FFN reduce l{layer_idx}: {error:?}")
+                })?;
+            for rank in 0..n_ranks {
+                hc_ffn_mix_batched(
+                    cfg,
+                    &pbs_per_rank[rank],
+                    &mut gpus.devices[rank],
+                    batch_size,
+                )?;
+            }
+        }
+
+        consumed += batch_size;
+        let resident = (start_pos as usize).saturating_add(consumed) as u64;
+        for state in state_per_rank.iter_mut() {
+            state.n_tokens = resident;
+        }
+    }
+
+    gpus.devices[0]
+        .bind_thread()
+        .map_err(|error| format!("TP{n_ranks} prefill final bind: {error:?}"))?;
+    final_norm_and_head_last_batched(
+        cfg,
+        &weights_per_rank[0],
+        &mut state_per_rank[0],
+        &pbs_per_rank[0],
+        &mut gpus.devices[0],
+        last_batch,
+    )?;
+    Ok(())
 }
 
 /// Manual-chunk prefill with per-position MTP fill interleaved.
