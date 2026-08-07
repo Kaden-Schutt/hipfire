@@ -12427,8 +12427,6 @@ fn ffn_batched(
     batch_size: usize,
     tokens: &[u32],
 ) -> Result<(), String> {
-    let stage_timing = hipfire_config::developer_var("HIPFIRE_EP_PREFILL_STAGE_TIMING").is_ok();
-    let stage_start = std::time::Instant::now();
     let ffn_norm = layer.ffn_norm.as_ref().unwrap();
     let shared_w1 = layer.shared_w1.as_ref().unwrap();
     let shared_w2 = layer.shared_w2.as_ref().unwrap();
@@ -12580,15 +12578,6 @@ fn ffn_batched(
         Some(&pbs.wmma_x_scratch_f16),
     )?;
 
-    let shared_ms = if stage_timing {
-        gpu.hip
-            .device_synchronize()
-            .map_err(|e| format!("prefill timing sync shared l{layer_idx}: {e:?}"))?;
-        stage_start.elapsed().as_secs_f64() * 1000.0
-    } else {
-        0.0
-    };
-
     // ── Routed-expert MoE ───────────────────────────────────────────
     let do_routed = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MOE")
         .ok()
@@ -12632,15 +12621,6 @@ fn ffn_batched(
     // 9. sqrt_softplus over the full [B, n_exp] buffer.
     gpu.sqrt_softplus_f32(&pbs.moe_scores_batch)
         .map_err(|e| format!("sqrt_softplus_f32 moe scores l{layer_idx}: {e:?}"))?;
-
-    let router_ms = if stage_timing {
-        gpu.hip
-            .device_synchronize()
-            .map_err(|e| format!("prefill timing sync router l{layer_idx}: {e:?}"))?;
-        stage_start.elapsed().as_secs_f64() * 1000.0 - shared_ms
-    } else {
-        0.0
-    };
 
     // Routing + routed experts + combine now run through the centralized MoE
     // family (Ship 4.3 prefill). The router GEMV + sqrt_softplus (above) and the
@@ -12707,23 +12687,6 @@ fn ffn_batched(
     hipfire_runtime::llama::moe_family()
         .run_bias_aware_prefill(gpu, &moe_params)
         .map_err(|e| format!("ffn_batched l{layer_idx} dispatch: {e}"))?;
-
-    if stage_timing {
-        gpu.hip
-            .device_synchronize()
-            .map_err(|e| format!("prefill timing sync routed l{layer_idx}: {e:?}"))?;
-        let total_ms = stage_start.elapsed().as_secs_f64() * 1000.0;
-        eprintln!(
-            "EP-PREFILL-FFN dev={} l={} B={} shared_ms={:.3} router_ms={:.3} routed_ms={:.3} total_ms={:.3}",
-            gpu.device_id,
-            layer_idx,
-            batch_size,
-            shared_ms,
-            router_ms,
-            total_ms - shared_ms - router_ms,
-            total_ms,
-        );
-    }
 
     Ok(())
 }
@@ -14305,11 +14268,6 @@ pub fn forward_ep_prefill_batch_chunked(
     tokens: &[u32],
     start_pos: u32,
 ) -> Result<(), String> {
-    let stage_timing = hipfire_config::developer_var("HIPFIRE_EP_PREFILL_STAGE_TIMING").is_ok();
-    let mut attn_local_ms = 0.0f64;
-    let mut attn_reduce_ms = 0.0f64;
-    let mut ffn_local_ms = 0.0f64;
-    let mut ffn_reduce_ms = 0.0f64;
     let n_ranks = gpus.devices.len();
     if !matches!(n_ranks, 3 | 4)
         || weights_per_rank.len() != n_ranks
@@ -14396,7 +14354,6 @@ pub fn forward_ep_prefill_batch_chunked(
 
         for layer_idx in 0..cfg.num_hidden_layers {
             // Rank-local attention projection and attention body.
-            let stage_start = std::time::Instant::now();
             for rank in 0..n_ranks {
                 let weights = &weights_per_rank[rank];
                 let layer = weights.resolve_layer(layer_idx);
@@ -14477,22 +14434,7 @@ pub fn forward_ep_prefill_batch_chunked(
                     )?;
                 }
             }
-            if stage_timing {
-                for rank in 0..n_ranks {
-                    gpus.devices[rank].bind_thread().map_err(|error| {
-                        format!("TP{n_ranks} timing bind rank {rank}: {error:?}")
-                    })?;
-                    gpus.devices[rank]
-                        .hip
-                        .device_synchronize()
-                        .map_err(|error| {
-                            format!("TP{n_ranks} timing attn sync rank {rank}: {error:?}")
-                        })?;
-                }
-                attn_local_ms += stage_start.elapsed().as_secs_f64() * 1000.0;
-            }
 
-            let stage_start = std::time::Instant::now();
             let attn_buffers: Vec<_> = pbs_per_rank
                 .iter()
                 .map(|pbs| &pbs.attn_out_batch.buf)
@@ -14509,24 +14451,9 @@ pub fn forward_ep_prefill_batch_chunked(
                     batch_size,
                 )?;
             }
-            if stage_timing {
-                for rank in 0..n_ranks {
-                    gpus.devices[rank].bind_thread().map_err(|error| {
-                        format!("TP{n_ranks} timing bind rank {rank}: {error:?}")
-                    })?;
-                    gpus.devices[rank]
-                        .hip
-                        .device_synchronize()
-                        .map_err(|error| {
-                            format!("TP{n_ranks} timing attn-reduce sync rank {rank}: {error:?}")
-                        })?;
-                }
-                attn_reduce_ms += stage_start.elapsed().as_secs_f64() * 1000.0;
-            }
 
             // Shared-intermediate TP plus routed-expert EP. ffn_batched uses
             // the layer's local shared width and global routed-expert shape.
-            let stage_start = std::time::Instant::now();
             for rank in 0..n_ranks {
                 let weights = &weights_per_rank[rank];
                 let layer = weights.resolve_layer(layer_idx);
@@ -14545,21 +14472,6 @@ pub fn forward_ep_prefill_batch_chunked(
                     chunk,
                 )?;
             }
-            if stage_timing {
-                for rank in 0..n_ranks {
-                    gpus.devices[rank].bind_thread().map_err(|error| {
-                        format!("TP{n_ranks} timing bind rank {rank}: {error:?}")
-                    })?;
-                    gpus.devices[rank]
-                        .hip
-                        .device_synchronize()
-                        .map_err(|error| {
-                            format!("TP{n_ranks} timing ffn sync rank {rank}: {error:?}")
-                        })?;
-                }
-                ffn_local_ms += stage_start.elapsed().as_secs_f64() * 1000.0;
-            }
-            let stage_start = std::time::Instant::now();
             let ffn_buffers: Vec<_> = pbs_per_rank
                 .iter()
                 .map(|pbs| &pbs.ffn_out_batch.buf)
@@ -14575,20 +14487,6 @@ pub fn forward_ep_prefill_batch_chunked(
                     &mut gpus.devices[rank],
                     batch_size,
                 )?;
-            }
-            if stage_timing {
-                for rank in 0..n_ranks {
-                    gpus.devices[rank].bind_thread().map_err(|error| {
-                        format!("TP{n_ranks} timing bind rank {rank}: {error:?}")
-                    })?;
-                    gpus.devices[rank]
-                        .hip
-                        .device_synchronize()
-                        .map_err(|error| {
-                            format!("TP{n_ranks} timing ffn-reduce sync rank {rank}: {error:?}")
-                        })?;
-                }
-                ffn_reduce_ms += stage_start.elapsed().as_secs_f64() * 1000.0;
             }
         }
 
@@ -14610,19 +14508,6 @@ pub fn forward_ep_prefill_batch_chunked(
         &mut gpus.devices[0],
         last_batch,
     )?;
-    if stage_timing {
-        eprintln!(
-            "EP-PREFILL-STAGES tp={} tokens={} B={} attn_local_ms={:.3} attn_reduce_mix_ms={:.3} ffn_local_ms={:.3} ffn_reduce_mix_ms={:.3} total_layers_ms={:.3}",
-            n_ranks,
-            tokens.len(),
-            max_batch,
-            attn_local_ms,
-            attn_reduce_ms,
-            ffn_local_ms,
-            ffn_reduce_ms,
-            attn_local_ms + attn_reduce_ms + ffn_local_ms + ffn_reduce_ms,
-        );
-    }
     Ok(())
 }
 
