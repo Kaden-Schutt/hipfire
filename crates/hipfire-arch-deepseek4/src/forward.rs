@@ -4543,17 +4543,6 @@ fn ds4_moe_block_core(
             && state.ffn_routed_overlap.is_some()
             && layer.expert_gate_up_blob.is_some()
             && layer.expert_w2_blob.is_some();
-        let ep_overlap = routed_out.is_some()
-            && !do_mix
-            && cfg.mq2r
-            && gpu.arch.eq_ignore_ascii_case("gfx1201")
-            && config_cache::moe_on()
-            && gpu.active_stream.is_some()
-            && state.ffn_overlap_stream.is_some()
-            && state.ffn_overlap_fork_event.is_some()
-            && state.ffn_overlap_join_event.is_some()
-            && layer.expert_gate_up_blob.is_some()
-            && layer.expert_w2_blob.is_some();
         let retained_split = routed_out.is_none()
             && do_mix
             && gpu.replay.is_enabled()
@@ -4562,17 +4551,7 @@ fn ds4_moe_block_core(
             && config_cache::moe_on()
             && layer.expert_gate_up_blob.is_some()
             && layer.expert_w2_blob.is_some();
-        if ep_overlap {
-            ffn_shared_routed_overlap_ep(
-                cfg,
-                weights,
-                state,
-                gpu,
-                layer_idx,
-                token_id,
-                routed_out.unwrap(),
-            )?;
-        } else if overlap {
+        if overlap {
             ffn_shared_routed_overlap(cfg, weights, state, gpu, layer_idx, token_id)?;
         } else if retained_split {
             ffn_shared_routed_split_tape(cfg, weights, state, gpu, layer_idx, token_id)?;
@@ -4719,71 +4698,6 @@ fn ffn_shared_routed_overlap(
     let ffn_out = state.ffn_out.as_ref().unwrap();
     gpu.add_inplace_f32(ffn_out, &routed_partial)
         .map_err(|e| format!("combine FFN overlap partial l{layer_idx}: {e:?}"))
-}
-
-/// Exact-gfx1201 EP twin of [`ffn_shared_routed_overlap`].
-///
-/// The EP executor already zeroes `routed_partial` and all-reduces it after
-/// this call. Keep the replicated shared E8 expert on a side stream while the
-/// primary stream evaluates this rank's routed MQ2 shard, then join before the
-/// collective. The ordinary EP tail still performs `ffn_out += routed_partial`
-/// after all-reduce, preserving the established arithmetic order exactly.
-fn ffn_shared_routed_overlap_ep(
-    cfg: &DeepseekV4Config,
-    weights: &DeepseekV4Weights,
-    state: &mut DeepseekV4State,
-    gpu: &mut Gpu,
-    layer_idx: usize,
-    token_id: u32,
-    routed_partial: &GpuTensor,
-) -> Result<(), String> {
-    ffn_prepare(cfg, weights, state, gpu, layer_idx)?;
-
-    {
-        let primary = gpu.active_stream.as_ref().unwrap();
-        let fork = state.ffn_overlap_fork_event.as_ref().unwrap();
-        gpu.hip
-            .event_record(fork, Some(primary))
-            .map_err(|error| format!("record gfx1201 EP FFN fork l{layer_idx}: {error:?}"))?;
-        let side = state.ffn_overlap_stream.as_ref().unwrap();
-        gpu.hip
-            .stream_wait_event(side, fork)
-            .map_err(|error| format!("wait gfx1201 EP FFN fork l{layer_idx}: {error:?}"))?;
-    }
-
-    std::mem::swap(&mut gpu.active_stream, &mut state.ffn_overlap_stream);
-    let shared_result = ffn_shared_project(cfg, weights, state, gpu, layer_idx).and_then(|_| {
-        let side = gpu.active_stream.as_ref().unwrap();
-        let join = state.ffn_overlap_join_event.as_ref().unwrap();
-        gpu.hip
-            .event_record(join, Some(side))
-            .map_err(|error| format!("record gfx1201 EP FFN join l{layer_idx}: {error:?}"))
-    });
-    std::mem::swap(&mut gpu.active_stream, &mut state.ffn_overlap_stream);
-    shared_result?;
-
-    let routed_result = if layer_idx < cfg.num_hash_layers {
-        ffn_hash_routed(
-            cfg,
-            weights,
-            state,
-            gpu,
-            layer_idx,
-            token_id,
-            Some(routed_partial),
-        )
-    } else {
-        ffn_routed(cfg, weights, state, gpu, layer_idx, Some(routed_partial))
-    };
-    let join_result = {
-        let primary = gpu.active_stream.as_ref().unwrap();
-        let join = state.ffn_overlap_join_event.as_ref().unwrap();
-        gpu.hip
-            .stream_wait_event(primary, join)
-            .map_err(|error| format!("wait gfx1201 EP FFN join l{layer_idx}: {error:?}"))
-    };
-    routed_result?;
-    join_result
 }
 
 /// Per-layer execution context for the lowered decode path (rebuilt each layer).
@@ -5053,12 +4967,6 @@ pub fn forward_ep(
     assert_eq!(partials.len(), n, "ds4 forward_ep: partials len");
     let hidden = cfg.hidden_size;
     let skip_ffn = config_cache::skip_ffn();
-    let ep_ffn_overlap = cfg.mq2r
-        && n == 4
-        && gpus
-            .devices
-            .iter()
-            .all(|gpu| gpu.arch.eq_ignore_ascii_case("gfx1201"));
 
     // 1. Per-rank embed + position + token-id staging + residual-stream init
     //    (replicated, deterministic functions of the token → bit-identical
@@ -5076,9 +4984,6 @@ pub fn forward_ep(
             &mut gpus.devices[r],
             token,
         )?;
-        if ep_ffn_overlap {
-            ensure_ffn_overlap_resources(cfg, &mut state_per_rank[r], &mut gpus.devices[r])?;
-        }
     }
 
     // 2. Per-layer EP program (Attend replicated; Moe all-reduce-EP'd). Rebuild
