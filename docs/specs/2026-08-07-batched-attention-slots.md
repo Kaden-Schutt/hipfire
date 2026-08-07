@@ -306,12 +306,15 @@ Two structural facts drive this:
 
   **CORRECTION from Task 1, measured 2026-08-07.** True in bytes, **false in
   time** — the original framing here was pessimistic. The batch-1 attention
-  kernel sustains only **~20-24%** (35B shape) and **~28-34%** (27B shape) of
-  the 256 GB/s bus, and the figure is *flat* across a 16× context range, so it
-  is a sustained efficiency ceiling rather than launch overhead. Four slots must
-  read 4× the KV bytes but need not spend 4× the time: there is 3-5× of
-  headroom, and batching supplies exactly what closes it — more independent
-  requests in flight. The question is therefore **how much of that headroom
+  kernel sustains only **~22-28%** (35B shape) and **~33-38%** (27B shape) of
+  achievable bandwidth, and the figure is *flat* across a 16× context range, so
+  it is a sustained efficiency ceiling rather than launch overhead. The
+  denominator is measured, not theoretical: BabelStream on this device gives
+  **223.9 GB/s Triad / 239.3 Copy** (87-93% of the 256 GB/s LPDDR5X figure).
+  Four slots must read 4× the KV bytes but need not spend 4× the time: there is
+  **~2.6-3.1× headroom on the 27B shape and ~3.6-4.6× on the 35B-A3B shape**,
+  and batching supplies exactly what closes it — more independent requests in
+  flight. The question is therefore **how much of that headroom
   batching recovers**, which §10's batched-vs-sequential sweep measures
   directly. See `docs/perf-checkpoints/2026-08-07-batching-ceiling-probe.md`.
 - **MoE expert reads barely amortise at small batch.** Four sequences drawing
