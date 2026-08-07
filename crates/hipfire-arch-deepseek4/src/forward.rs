@@ -3607,43 +3607,6 @@ fn ensure_ffn_overlap_resources(
     Ok(())
 }
 
-/// Materialize the side queue used only by the exact-gfx1201 four-rank MQ2R
-/// EP attention schedule. The primary queue is owned by the EP executor.
-fn ensure_ep_attn_overlap_resources(
-    state: &mut DeepseekV4State,
-    gpu: &mut Gpu,
-) -> Result<(), String> {
-    let mut created = false;
-    if state.ep_attn_overlap_stream.is_none() {
-        state.ep_attn_overlap_stream = Some(
-            gpu.hip
-                .stream_create()
-                .map_err(|error| format!("create gfx1201 EP attention side stream: {error:?}"))?,
-        );
-        created = true;
-    }
-    if state.ep_attn_overlap_fork_event.is_none() {
-        state.ep_attn_overlap_fork_event = Some(
-            gpu.hip
-                .event_create()
-                .map_err(|error| format!("create gfx1201 EP attention fork event: {error:?}"))?,
-        );
-        created = true;
-    }
-    if state.ep_attn_overlap_join_event.is_none() {
-        state.ep_attn_overlap_join_event = Some(
-            gpu.hip
-                .event_create()
-                .map_err(|error| format!("create gfx1201 EP attention join event: {error:?}"))?,
-        );
-        created = true;
-    }
-    if created {
-        eprintln!("[DeepSeek V4] gfx1201 EP attention overlap resources ready");
-    }
-    Ok(())
-}
-
 /// Materialize the primary and side streams before ordinary gfx942 decode.
 /// The gfx1151 graph path creates its primary capture stream separately, so
 /// this wrapper does not alter that route's launch ordering.
@@ -4523,103 +4486,6 @@ fn ds4_attn_block_heterogeneous(
     hc_attn_mix(cfg, weights, state, gpu, layer_idx)
 }
 
-/// Exact-gfx1201 four-rank EP attention schedule.
-///
-/// Every EP rank owns a complete dense attention copy. After the shared
-/// preparation, Q-LoRA and KV/compressor projections are independent, so run
-/// the latter on a persistent side stream and rejoin before RoPE/indexer state
-/// consumers. This preserves every kernel and arithmetic order within each
-/// branch and does not alter the single-GPU, gfx11, or non-MQ2R routes.
-fn ds4_attn_block_ep_overlap(
-    cfg: &DeepseekV4Config,
-    weights: &DeepseekV4Weights,
-    state: &mut DeepseekV4State,
-    gpu: &mut Gpu,
-    layer_idx: usize,
-    position: u32,
-) -> Result<(), String> {
-    let layer = weights.resolve_layer(layer_idx);
-    mhc_pre(cfg, weights, state, gpu, layer_idx, /*is_attn=*/ true)?;
-    q_lora_prepare(cfg, weights, state, gpu, layer_idx)?;
-
-    {
-        let primary = gpu
-            .active_stream
-            .as_ref()
-            .ok_or_else(|| "gfx1201 EP attention primary stream missing".to_string())?;
-        let fork = state
-            .ep_attn_overlap_fork_event
-            .as_ref()
-            .ok_or_else(|| "gfx1201 EP attention fork event missing".to_string())?;
-        gpu.hip
-            .event_record(fork, Some(primary))
-            .map_err(|error| format!("gfx1201 EP attention fork l{layer_idx}: {error:?}"))?;
-        let side = state
-            .ep_attn_overlap_stream
-            .as_ref()
-            .ok_or_else(|| "gfx1201 EP attention side stream missing".to_string())?;
-        gpu.hip
-            .stream_wait_event(side, fork)
-            .map_err(|error| format!("gfx1201 EP attention side wait l{layer_idx}: {error:?}"))?;
-    }
-
-    std::mem::swap(&mut gpu.active_stream, &mut state.ep_attn_overlap_stream);
-    let side_result = (|| {
-        kv_joint(cfg, weights, state, gpu, layer_idx)?;
-        if layer.compress_ratio > 0 {
-            let tmp_view = {
-                let tmp = state.tmp.as_ref().unwrap();
-                tmp.sub_offset(0, tmp.numel())
-            };
-            compressor_forward(
-                cfg, weights, state, gpu, layer_idx, &tmp_view, position,
-                /*is_indexer=*/ false,
-            )?;
-            if layer.compress_ratio == 4 {
-                compressor_forward(
-                    cfg, weights, state, gpu, layer_idx, &tmp_view, position,
-                    /*is_indexer=*/ true,
-                )?;
-            }
-        }
-        let side = gpu
-            .active_stream
-            .as_ref()
-            .ok_or_else(|| "gfx1201 EP attention side stream missing after work".to_string())?;
-        let join = state
-            .ep_attn_overlap_join_event
-            .as_ref()
-            .ok_or_else(|| "gfx1201 EP attention join event missing".to_string())?;
-        gpu.hip
-            .event_record(join, Some(side))
-            .map_err(|error| format!("gfx1201 EP attention join l{layer_idx}: {error:?}"))
-    })();
-    std::mem::swap(&mut gpu.active_stream, &mut state.ep_attn_overlap_stream);
-    side_result?;
-
-    q_lora_project(cfg, weights, state, gpu, layer_idx)?;
-    {
-        let primary = gpu.active_stream.as_ref().ok_or_else(|| {
-            "gfx1201 EP attention primary stream missing after Q-LoRA".to_string()
-        })?;
-        let join = state
-            .ep_attn_overlap_join_event
-            .as_ref()
-            .ok_or_else(|| "gfx1201 EP attention join event missing after Q-LoRA".to_string())?;
-        gpu.hip.stream_wait_event(primary, join).map_err(|error| {
-            format!("gfx1201 EP attention primary wait l{layer_idx}: {error:?}")
-        })?;
-    }
-
-    apply_tail_rope(cfg, weights, state, gpu, position, layer_idx)?;
-    if layer.compress_ratio == 4 {
-        let n = indexer_forward(cfg, weights, state, gpu, layer_idx, position)?;
-        dump_indexer_state(gpu, state, layer_idx, position, n);
-    }
-    attn_stub(cfg, weights, state, gpu, layer_idx, OloraSchedule::Default)?;
-    hc_attn_mix(cfg, weights, state, gpu, layer_idx)
-}
-
 /// FFN block (replays decode_step_body's FFN arm verbatim).
 fn ds4_moe_block(
     cfg: &DeepseekV4Config,
@@ -4843,7 +4709,6 @@ struct Deepseek4Bindings<'a> {
     position: u32,
     token_id: u32,
     skip_ffn: bool,
-    ep_attn_overlap: bool,
 }
 
 impl<'a> ForwardBindings for Deepseek4Bindings<'a> {
@@ -4853,27 +4718,15 @@ impl<'a> ForwardBindings for Deepseek4Bindings<'a> {
         _ctx: &DispatchCtx,
         _op: &OpBinding,
     ) -> Result<(), DispatchError> {
-        if self.ep_attn_overlap {
-            ds4_attn_block_ep_overlap(
-                self.cfg,
-                self.weights,
-                self.state,
-                gpu,
-                self.layer_idx,
-                self.position,
-            )
-            .map_err(DispatchError::Hip)
-        } else {
-            ds4_attn_block(
-                self.cfg,
-                self.weights,
-                self.state,
-                gpu,
-                self.layer_idx,
-                self.position,
-            )
-            .map_err(DispatchError::Hip)
-        }
+        ds4_attn_block(
+            self.cfg,
+            self.weights,
+            self.state,
+            gpu,
+            self.layer_idx,
+            self.position,
+        )
+        .map_err(DispatchError::Hip)
     }
     fn run_moe(
         &mut self,
@@ -5055,7 +4908,6 @@ fn decode_step_body_lowered(
             position,
             token_id,
             skip_ffn,
-            ep_attn_overlap: false,
         };
         superop::run_layer_program(gpu, &ctx, &program, &mut bind)
             .map_err(|e| format!("ds4 L{layer_idx}: lowered run_layer_program: {e}"))?;
@@ -5115,12 +4967,6 @@ pub fn forward_ep(
     assert_eq!(partials.len(), n, "ds4 forward_ep: partials len");
     let hidden = cfg.hidden_size;
     let skip_ffn = config_cache::skip_ffn();
-    let ep_attn_overlap = cfg.mq2r
-        && n == 4
-        && gpus
-            .devices
-            .iter()
-            .all(|gpu| gpu.arch.eq_ignore_ascii_case("gfx1201"));
 
     // 1. Per-rank embed + position + token-id staging + residual-stream init
     //    (replicated, deterministic functions of the token → bit-identical
@@ -5138,9 +4984,6 @@ pub fn forward_ep(
             &mut gpus.devices[r],
             token,
         )?;
-        if ep_attn_overlap {
-            ensure_ep_attn_overlap_resources(&mut state_per_rank[r], &mut gpus.devices[r])?;
-        }
     }
 
     // 2. Per-layer EP program (Attend replicated; Moe all-reduce-EP'd). Rebuild
@@ -5171,7 +5014,6 @@ pub fn forward_ep(
                     position,
                     token_id: token,
                     skip_ffn,
-                    ep_attn_overlap,
                 });
             }
             hipfire_runtime::ep::run_layer_program_ep(
@@ -5876,7 +5718,6 @@ pub fn mtp_forward_ep(
                 position,
                 token_id: next_token,
                 skip_ffn: false,
-                ep_attn_overlap: false,
             });
         }
         hipfire_runtime::ep::run_layer_program_ep(

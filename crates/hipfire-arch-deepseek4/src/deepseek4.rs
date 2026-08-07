@@ -1680,14 +1680,6 @@ pub struct DeepseekV4State {
     pub ffn_overlap_fork_event: Option<hip_bridge::Event>,
     pub ffn_overlap_join_event: Option<hip_bridge::Event>,
 
-    /// Exact-gfx1201 EP side-stream resources for overlapping Q-LoRA with the
-    /// independent KV/compressor projection branch. These are separate from
-    /// the FFN overlap resources because EP defers the routed FFN collective,
-    /// while attention overlap must remain live on every replicated rank.
-    pub ep_attn_overlap_stream: Option<hip_bridge::Stream>,
-    pub ep_attn_overlap_fork_event: Option<hip_bridge::Event>,
-    pub ep_attn_overlap_join_event: Option<hip_bridge::Event>,
-
     /// FFN normalised input `[hidden]` F32. RMSNorm(stream0, ffn_norm)
     /// then FWHT-rotated for the shared-expert MQ4 GEMVs.
     pub ffn_x_rot: Option<rdna_compute::GpuTensor>,
@@ -1908,9 +1900,6 @@ impl DeepseekV4State {
             ffn_overlap_stream: None,
             ffn_overlap_fork_event: None,
             ffn_overlap_join_event: None,
-            ep_attn_overlap_stream: None,
-            ep_attn_overlap_fork_event: None,
-            ep_attn_overlap_join_event: None,
             ffn_x_rot: None,
             ffn_x_plain: None,
             ffn_gate: None,
@@ -2100,18 +2089,6 @@ impl DeepseekV4State {
             let _ = gpu.hip.event_destroy(event);
         }
         if let Some(stream) = self.ffn_overlap_stream.take() {
-            let _ = gpu.hip.stream_destroy(stream);
-        }
-        if let Some(stream) = self.ep_attn_overlap_stream.as_ref() {
-            let _ = gpu.hip.stream_synchronize(stream);
-        }
-        if let Some(event) = self.ep_attn_overlap_fork_event.take() {
-            let _ = gpu.hip.event_destroy(event);
-        }
-        if let Some(event) = self.ep_attn_overlap_join_event.take() {
-            let _ = gpu.hip.event_destroy(event);
-        }
-        if let Some(stream) = self.ep_attn_overlap_stream.take() {
             let _ = gpu.hip.stream_destroy(stream);
         }
         // Per-layer indexer + main-attention caches.
