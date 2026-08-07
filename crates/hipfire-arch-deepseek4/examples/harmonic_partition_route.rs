@@ -4,11 +4,13 @@
 //! Raw-bit oracle for the exact-gfx1100 harmonic route partition kernel.
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use hip_bridge::HipRuntime;
 use hipfire_arch_deepseek4::harmonic::{
     HarmonicExpertResidencyPlan, HARMONIC_EXPERT_COUNT, HARMONIC_LAYER_COUNT, HARMONIC_TOP_K,
 };
+use rdna_compute::replay::ReplayController;
 use rdna_compute::{DType, Gpu};
 
 const ROUTES_PER_LAYER: usize = 256;
@@ -17,10 +19,7 @@ fn as_bytes(values: &[u32]) -> &[u8] {
     // SAFETY: every u32 bit pattern is valid and the returned slice cannot
     // outlive the borrowed input.
     unsafe {
-        std::slice::from_raw_parts(
-            values.as_ptr().cast::<u8>(),
-            std::mem::size_of_val(values),
-        )
+        std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), std::mem::size_of_val(values))
     }
 }
 
@@ -33,6 +32,24 @@ fn as_bytes_mut(values: &mut [u32]) -> &mut [u8] {
             std::mem::size_of_val(values),
         )
     }
+}
+
+fn expected_partition(
+    plan: &HarmonicExpertResidencyPlan,
+    layer: usize,
+    ids: [u32; HARMONIC_TOP_K],
+) -> ([u32; HARMONIC_TOP_K], [u32; HARMONIC_TOP_K], u32) {
+    let mut expected = plan.split_result_layout(layer, ids).pack_route(ids);
+    for index in 0..expected.local_count as usize {
+        expected.local_expert_ids[index] = plan
+            .compact_expert_index(layer, expected.local_expert_ids[index])
+            .expect("local expert must have a compact index");
+    }
+    (
+        expected.local_expert_ids,
+        expected.slot_sources,
+        u32::from(expected.local_count),
+    )
 }
 
 fn resolve_device(selector: &str) -> Result<(i32, String, String, String), String> {
@@ -90,7 +107,9 @@ fn main() -> Result<(), String> {
         match flag.as_str() {
             "--device" => device = Some(args.next().ok_or("--device needs a selector")?),
             "--hotset-plan" => {
-                hotset = Some(PathBuf::from(args.next().ok_or("--hotset-plan needs a path")?))
+                hotset = Some(PathBuf::from(
+                    args.next().ok_or("--hotset-plan needs a path")?,
+                ))
             }
             other => return Err(format!("unknown argument {other:?}")),
         }
@@ -174,38 +193,167 @@ fn main() -> Result<(), String> {
                 .memcpy_dtoh(as_bytes_mut(&mut count), &count_gpu.buf)
                 .map_err(|error| format!("download local count: {error}"))?;
 
-            let mut expected = plan.split_result_layout(layer, ids).pack_route(ids);
-            for index in 0..expected.local_count as usize {
-                expected.local_expert_ids[index] = plan
-                    .compact_expert_index(layer, expected.local_expert_ids[index])
-                    .expect("local expert must have a compact index");
-            }
-            if count[0] != u32::from(expected.local_count)
-                || local[..count[0] as usize]
-                    != expected.local_expert_ids[..expected.local_count as usize]
-                || sources != expected.slot_sources
+            let (expected_local, expected_sources, expected_count) =
+                expected_partition(&plan, layer, ids);
+            if count[0] != expected_count
+                || local[..count[0] as usize] != expected_local[..expected_count as usize]
+                || sources != expected_sources
             {
                 return Err(format!(
-                    "partition mismatch l{layer} r{route_index}: ids={ids:?} count={count:?}/{:?} local={local:?}/{:?} sources={sources:?}/{:?}",
-                    expected.local_count,
-                    expected.local_expert_ids,
-                    expected.slot_sources
+                    "partition mismatch l{layer} r{route_index}: ids={ids:?} count={count:?}/{expected_count:?} local={local:?}/{expected_local:?} sources={sources:?}/{expected_sources:?}",
                 ));
             }
             comparisons += 1 + count[0] as u64 + HARMONIC_TOP_K as u64;
         }
     }
 
+    // Exercise the product execution primitive without involving a model or
+    // another GPU: two recorded owner-local dispatches are published with one
+    // doorbell, the first carries the host checkpoint, and the second remains
+    // queued behind it. Both results must reproduce the CPU oracle exactly.
+    let local_tail_gpu = gpu
+        .alloc_tensor(&[HARMONIC_TOP_K], DType::F32)
+        .map_err(|error| format!("allocate checkpoint tail local IDs: {error}"))?;
+    let sources_tail_gpu = gpu
+        .alloc_tensor(&[HARMONIC_TOP_K], DType::F32)
+        .map_err(|error| format!("allocate checkpoint tail sources: {error}"))?;
+    let count_tail_gpu = gpu
+        .alloc_tensor(&[1], DType::F32)
+        .map_err(|error| format!("allocate checkpoint tail count: {error}"))?;
+    let checkpoint_ids = std::array::from_fn(|slot| ((slot * 37 + 19) % 256) as u32);
+    gpu.hip
+        .memcpy_htod(&ids_gpu.buf, as_bytes(&checkpoint_ids))
+        .map_err(|error| format!("upload checkpoint route: {error}"))?;
+    let original_replay = std::mem::replace(&mut gpu.replay, ReplayController::new_manual_aql());
+    gpu.replay
+        .begin_capture()
+        .map_err(|error| format!("begin checkpoint capture: {error}"))?;
+    for (local, sources, count) in [
+        (&local_gpu, &sources_gpu, &count_gpu),
+        (&local_tail_gpu, &sources_tail_gpu, &count_tail_gpu),
+    ] {
+        let mut gfx1100 = gpu
+            .try_gfx1100()
+            .ok_or_else(|| "exact gfx1100 checkpoint proof disappeared".to_owned())?;
+        gfx1100
+            .harmonic_partition_route(
+                &ids_gpu,
+                &compact_gpu,
+                local,
+                sources,
+                count,
+                0,
+                HARMONIC_EXPERT_COUNT as usize,
+                HARMONIC_TOP_K,
+            )
+            .map_err(|error| format!("checkpoint capture partition: {error}"))?;
+    }
+    let capture = gpu
+        .replay
+        .finish_capture()
+        .map_err(|error| format!("finish checkpoint capture: {error}"))?;
+    if capture.launch_count != 2 {
+        return Err(format!(
+            "checkpoint capture recorded {} launches, expected 2",
+            capture.launch_count
+        ));
+    }
+    let prepared = gpu
+        .replay
+        .prepare_checkpointed_linear_aql_prefix_for_pci_bus_id(&pci, 2, 0)
+        .map_err(|error| format!("prepare checkpoint AQL: {error}"))?;
+    let sentinel = [u32::MAX; HARMONIC_TOP_K];
+    let sentinel_count = [u32::MAX; 1];
+    for tensor in [&local_gpu, &sources_gpu, &local_tail_gpu, &sources_tail_gpu] {
+        gpu.hip
+            .memcpy_htod(&tensor.buf, as_bytes(&sentinel))
+            .map_err(|error| format!("clear checkpoint output: {error}"))?;
+    }
+    for tensor in [&count_gpu, &count_tail_gpu] {
+        gpu.hip
+            .memcpy_htod(&tensor.buf, as_bytes(&sentinel_count))
+            .map_err(|error| format!("clear checkpoint count: {error}"))?;
+    }
+    let mut submission = unsafe {
+        gpu.replay
+            .submit_checkpointed_linear_aql(0)
+            .map_err(|error| format!("submit checkpoint AQL: {error}"))?
+    };
+    submission
+        .wait_checkpoint(Duration::from_secs(2))
+        .map_err(|error| format!("wait checkpoint AQL: {error}"))?;
+    let mut checkpoint_local = [0_u32; HARMONIC_TOP_K];
+    let mut checkpoint_sources = [0_u32; HARMONIC_TOP_K];
+    let mut checkpoint_count = [0_u32; 1];
+    gpu.hip
+        .memcpy_dtoh(as_bytes_mut(&mut checkpoint_local), &local_gpu.buf)
+        .map_err(|error| format!("download checkpoint local IDs: {error}"))?;
+    gpu.hip
+        .memcpy_dtoh(as_bytes_mut(&mut checkpoint_sources), &sources_gpu.buf)
+        .map_err(|error| format!("download checkpoint sources: {error}"))?;
+    gpu.hip
+        .memcpy_dtoh(as_bytes_mut(&mut checkpoint_count), &count_gpu.buf)
+        .map_err(|error| format!("download checkpoint count: {error}"))?;
+    submission
+        .wait(Duration::from_secs(2))
+        .map_err(|error| format!("wait checkpoint terminal: {error}"))?;
+    let mut tail_local = [0_u32; HARMONIC_TOP_K];
+    let mut tail_sources = [0_u32; HARMONIC_TOP_K];
+    let mut tail_count = [0_u32; 1];
+    gpu.hip
+        .memcpy_dtoh(as_bytes_mut(&mut tail_local), &local_tail_gpu.buf)
+        .map_err(|error| format!("download checkpoint tail local IDs: {error}"))?;
+    gpu.hip
+        .memcpy_dtoh(as_bytes_mut(&mut tail_sources), &sources_tail_gpu.buf)
+        .map_err(|error| format!("download checkpoint tail sources: {error}"))?;
+    gpu.hip
+        .memcpy_dtoh(as_bytes_mut(&mut tail_count), &count_tail_gpu.buf)
+        .map_err(|error| format!("download checkpoint tail count: {error}"))?;
+    let (expected_local, expected_sources, expected_count) =
+        expected_partition(&plan, 0, checkpoint_ids);
+    for (label, local, sources, count) in [
+        (
+            "checkpoint",
+            checkpoint_local,
+            checkpoint_sources,
+            checkpoint_count,
+        ),
+        ("tail", tail_local, tail_sources, tail_count),
+    ] {
+        if count[0] != expected_count
+            || local[..expected_count as usize] != expected_local[..expected_count as usize]
+            || sources != expected_sources
+        {
+            return Err(format!(
+                "{label} retained partition mismatch: count={count:?}/{expected_count} local={local:?}/{expected_local:?} sources={sources:?}/{expected_sources:?}"
+            ));
+        }
+    }
+    let retained_replay = std::mem::replace(&mut gpu.replay, original_replay);
+    drop(retained_replay);
+
     println!(
-        "harmonic partition exact: selector={} pci={} arch={} name={:?} routes={} raw_bit_comparisons={}",
+        "harmonic partition exact: selector={} pci={} arch={} name={:?} routes={} raw_bit_comparisons={} checkpoint_dispatches={} checkpoint_packets={} checkpoint_queue={}",
         selector,
         pci,
         arch,
         name,
         HARMONIC_LAYER_COUNT as usize * ROUTES_PER_LAYER,
-        comparisons
+        comparisons,
+        prepared.0,
+        prepared.1,
+        prepared.2,
     );
-    for tensor in [compact_gpu, ids_gpu, local_gpu, sources_gpu, count_gpu] {
+    for tensor in [
+        compact_gpu,
+        ids_gpu,
+        local_gpu,
+        sources_gpu,
+        count_gpu,
+        local_tail_gpu,
+        sources_tail_gpu,
+        count_tail_gpu,
+    ] {
         gpu.free_tensor(tensor)
             .map_err(|error| format!("free oracle tensor: {error}"))?;
     }
