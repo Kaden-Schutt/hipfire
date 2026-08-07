@@ -1627,11 +1627,9 @@ fn load_model_ep_ds4(path: &str, max_seq: usize, tp: usize) -> Result<LoadedMode
             .iter()
             .all(|device| device.arch_caps.is_gfx1201());
     if gfx1201_mq2r_tp {
-        // B=128 enters the generic grouped MQ2-Lloyd prefill kernel, whose
-        // gfx11 WMMA builtin is not valid on gfx1201.  Keep the exact-gated
-        // gfx1201 route on the scalar-batched path until that kernel has a
-        // native gfx12 lowering; B=64 still exercises real batched prefill.
-        const EP_PREFILL_MAX_BATCH: usize = 64;
+        // B=128 crosses the grouped-MoE threshold and amortizes the model's
+        // routed expert weights. gfx12 uses its native half8 WMMA lowering.
+        const EP_PREFILL_MAX_BATCH: usize = 128;
         let projected = deepseek4::forward::PrefillBatchScratch::projected_allocation_bytes(
             &config,
             EP_PREFILL_MAX_BATCH,
