@@ -40,12 +40,8 @@ extern "C" __global__ void gemv_mq2g256_lloyd_moe_down_residual_scaled_k8_indexe
 
     const int routing_base = bid * K_TOP;
     const int expert_id = topk_indices[routing_base + krank];
-    const unsigned long long expert_addr = expert_ptrs[expert_id];
-    // A null pointer marks a non-owned gfx1201 EP expert. Its historical
-    // contribution was exactly zero, so no residual atomic is required.
-    if (expert_addr == 0) return;
     const char* __restrict__ A =
-        reinterpret_cast<const char*>(expert_addr);
+        reinterpret_cast<const char*>(expert_ptrs[expert_id]);
     const float* __restrict__ x =
         rot_batch + ((long long)bid * K_TOP + krank) * K;
 

@@ -47,18 +47,8 @@ extern "C" __global__ void gemv_mq2g256_lloyd_moe_down_expanded_k4(
 
     const int routing_base = bid * K_TOP;
     const int expert_id = topk_indices[routing_base + krank];
-    const unsigned long long expert_addr = expert_ptrs[expert_id];
-    // Non-owned gfx1201 EP slots are exact zeros. Write the expanded row so
-    // the deterministic combine sees the same value without reading weights.
-    if (expert_addr == 0) {
-        if (tid == 0) {
-            expert_outputs[(long long)bid * K_TOP * M +
-                           (long long)krank * M + row] = 0.0f;
-        }
-        return;
-    }
     const char* __restrict__ A =
-        reinterpret_cast<const char*>(expert_addr);
+        reinterpret_cast<const char*>(expert_ptrs[expert_id]);
     const float* __restrict__ x =
         rot_batch + ((long long)bid * K_TOP + krank) * K;
 

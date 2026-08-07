@@ -39,23 +39,8 @@ extern "C" __global__ void gemv_mq2g256_lloyd_moe_gate_up_k8_indexed(
     const int tid = threadIdx.x;
 
     const int expert_id = topk_indices[krank];
-    const unsigned long long expert_addr = expert_ptrs[expert_id];
-    // Exact gfx1201 EP encodes a non-owned expert as null. Every thread in
-    // this workgroup observes the same route slot, so the uniform early exit
-    // is barrier-safe and bit-equivalent to the historical all-zero dummy.
-    if (expert_addr == 0) {
-        if (tid == 0) {
-            const int mi = M >> 1;
-            if (row < mi) {
-                y_gate[krank * mi + row] = 0.0f;
-            } else {
-                y_up[krank * mi + (row - mi)] = 0.0f;
-            }
-        }
-        return;
-    }
     const char* __restrict__ A =
-        reinterpret_cast<const char*>(expert_addr);
+        reinterpret_cast<const char*>(expert_ptrs[expert_id]);
 
     const int groups_per_row = K / 256;
     const int row_bytes = groups_per_row * 72;

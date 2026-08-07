@@ -337,11 +337,6 @@ impl DeepseekV4 {
                 .map(|(s, rank)| s.owns_expert(rank, e))
                 .unwrap_or(true)
         };
-        // Four-way gfx1201 EP must not execute the three non-owned routed
-        // quarters. Its indexed MQ2 decode kernels recognize a null pointer as
-        // an exact zero contribution. Other architectures retain the historical
-        // zero-dummy/base-pointer contract until their kernels are certified.
-        let null_non_owned = shard.is_some() && gpu.arch == "gfx1201";
         let mut local_of_global = vec![usize::MAX; n_exp];
         let mut n_owned = 0usize;
         for e in 0..n_exp {
@@ -440,8 +435,6 @@ impl DeepseekV4 {
             .map(|e| {
                 if owns(e) {
                     w2_base + (local_of_global[e] * w2_stride) as u64
-                } else if null_non_owned {
-                    0
                 } else {
                     w2_base
                 }
@@ -462,7 +455,7 @@ impl DeepseekV4 {
             .upload_raw(&gate_up_blob, &[n_owned, combined_stride])
             .map_err(|e| format!("deepseek4: upload gate_up {prefix}: {e:?}"))?;
         let gate_up_base = gate_up_tensor.buf.as_ptr() as u64;
-        let dummy_gate_up = if shard.is_some() && n_owned < n_exp && !null_non_owned {
+        let dummy_gate_up = if shard.is_some() && n_owned < n_exp {
             Some(
                 gpu.zeros(&[combined_stride / 4], DType::F32)
                     .map_err(|e| format!("deepseek4: {prefix} zero gate_up dummy: {e:?}"))?,
@@ -478,8 +471,6 @@ impl DeepseekV4 {
             .map(|e| {
                 if owns(e) {
                     gate_up_base + (local_of_global[e] * combined_stride) as u64
-                } else if null_non_owned {
-                    0
                 } else {
                     dummy_ptr
                 }
@@ -539,11 +530,6 @@ impl DeepseekV4 {
                 .map(|(s, rank)| s.owns_expert(rank, e))
                 .unwrap_or(true)
         };
-        // Exact gfx1201 EP uses null entries as a dispatch-time ownership
-        // predicate. The matching MQ2 indexed kernels produce an exact zero
-        // contribution without streaming a non-owned expert. Keep the legacy
-        // dummy/base entries on every adjacent architecture.
-        let null_non_owned = shard.is_some() && gpu.arch == "gfx1201";
         let mut local_of_global = vec![usize::MAX; n_exp];
         let mut n_owned = 0usize;
         for e in 0..n_exp {
@@ -602,8 +588,6 @@ impl DeepseekV4 {
                 .map(|e| {
                     if owns(e) {
                         base_ptr + (local_of_global[e] * stride) as u64
-                    } else if null_non_owned {
-                        0
                     } else {
                         base_ptr
                     }
@@ -680,7 +664,7 @@ impl DeepseekV4 {
             // stack here would leak its buffer. Must outlive the device pointer
             // table built just below that bakes its address. Mirrors the
             // minimax `dummy_gate_up` fix.
-            let dummy_gate_up = if shard.is_some() && n_owned < n_exp && !null_non_owned {
+            let dummy_gate_up = if shard.is_some() && n_owned < n_exp {
                 let z = gpu
                     .zeros(&[combined_stride / 4], rdna_compute::DType::F32)
                     .map_err(|e| format!("deepseek4: {prefix} zero gate_up dummy: {e:?}"))?;
@@ -696,8 +680,6 @@ impl DeepseekV4 {
                 .map(|e| {
                     if owns(e) {
                         base_ptr + (local_of_global[e] * combined_stride) as u64
-                    } else if null_non_owned {
-                        0
                     } else {
                         dummy_gu
                     }
