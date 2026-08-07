@@ -693,6 +693,19 @@ Null descriptor = legacy mode, verified bitwise identical."
 
 ### Task 5: Port `attention_flash_q8_0_tile_batched` and the shared launcher
 
+> **Header inclusion — read before editing any `.hip` file.** Kernels are
+> compiled at **runtime** by `hipcc` in a cache directory with **no `-I` to
+> `kernels/src`**, so a literal `#include "kv_slot_desc.h"` does not resolve.
+> Task 4 established the pattern, matching what the codebase already does for
+> `turbo_common.h` / `givens_common.h`: keep the `#include` line in the `.hip`
+> source for readability, then in Rust **strip that directive and prepend the
+> header body** before compiling, via `kernels::KV_SLOT_DESC_H`
+> (`format!("{}\n{}", kernels::KV_SLOT_DESC_H, stripped)`). There are **two**
+> independent compile sites that must both be updated or the second breaks
+> silently at first real precompile: the lazy `ensure_kernel` path, and the
+> `precompile_qwen35` spec list in `crates/rdna-compute/src/dispatch.rs`.
+> See commit `a01838e9` for the worked example.
+
 This is the long-context path — the one that actually runs at agent context lengths, since `LDS_CTX_LIMIT = 15000`.
 
 **Files:**
@@ -824,6 +837,19 @@ WMMA grid asserted out of scope — different kernarg layout."
 ---
 
 ### Task 6: Port `attention_flash_asym3_tile_batched` and `attention_q8_0_flash_prefill`
+
+> **Header inclusion — read before editing any `.hip` file.** Kernels are
+> compiled at **runtime** by `hipcc` in a cache directory with **no `-I` to
+> `kernels/src`**, so a literal `#include "kv_slot_desc.h"` does not resolve.
+> Task 4 established the pattern, matching what the codebase already does for
+> `turbo_common.h` / `givens_common.h`: keep the `#include` line in the `.hip`
+> source for readability, then in Rust **strip that directive and prepend the
+> header body** before compiling, via `kernels::KV_SLOT_DESC_H`
+> (`format!("{}\n{}", kernels::KV_SLOT_DESC_H, stripped)`). There are **two**
+> independent compile sites that must both be updated or the second breaks
+> silently at first real precompile: the lazy `ensure_kernel` path, and the
+> `precompile_qwen35` spec list in `crates/rdna-compute/src/dispatch.rs`.
+> See commit `a01838e9` for the worked example.
 
 Two kernels, one task: asym3 rides the launcher already modified in Task 5, so its change is confined to the `.hip` file, and the prefill kernel is the same mechanical edit against a different grid.
 
