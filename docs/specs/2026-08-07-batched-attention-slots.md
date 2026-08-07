@@ -29,7 +29,7 @@ SP1 is done when all of the following hold:
    is faster than `N` sequential single-slot launches, measured by the §10
    microbenchmark. (The size of the win is an output of the work, not a
    precondition; regression against the sequential baseline is a failure.)
-3. The split-K occupancy default is chosen from a measured sweep, not guessed.
+3. The `TILE_SIZE` default is confirmed or replaced by a measured sweep, and the LDS-vs-tile crossover behaviour for multi-slot batches is recorded.
 4. Task 0's measured batching ceiling is recorded, and the §8 roofline estimates
    are either confirmed or replaced by the measurement.
 5. The asym3 quality gate (§13) has run on both models and its result is
@@ -140,8 +140,10 @@ than a rewrite.
 
 Related prior work that informs the tuning, not the structure:
 `docs/perf-checkpoints/2026-07-29-*` (flash prefill, BR=8/BC=16 winner, tile
-choice non-monotonic in LDS) and the `Q8_BATCHED_LDS_CROSSOVER` finding (the
-real LDS bound is ~16000, not the shipped 8192).
+choice non-monotonic in LDS). The LDS-crossover investigation that found the
+real bound to be ~16000 rather than 8192 has already landed on beta —
+`LDS_CTX_LIMIT` is `15000` — so SP1 inherits the raised value and must not
+re-litigate it.
 
 ### 5.2 External
 
@@ -229,35 +231,47 @@ bytes beyond it, which is what makes the isolation test in §9 meaningful.
 | `attention_q8_0_flash_prefill` (+ `_wmma`) | Q8_0 | FA-2 prefill, large M |
 | `attention_flash_asym3_tile_batched` + `attention_flash_asym_reduce_batched`, via `launch_asym_flash_batched` | asym3 | tile + reduce, long context |
 
-Routing between the LDS and tile paths stays on the existing
-`Q8_BATCHED_LDS_CROSSOVER` logic; SP1 does not change the crossover value.
+Routing between the LDS and tile paths stays on the existing `LDS_CTX_LIMIT`
+logic (`crates/hipfire-runtime/src/llama.rs:2637`, currently `15000`, inside
+`forward_prefill_chunk`). SP1 does not change that value.
 
 The prefill kernel is in scope so a batch can mix chunked prefill with decode
 from the start — agents arrive with long prompts mid-flight, and deferring this
 would force SP3 to re-cut the tile list.
 
-## 7. Occupancy and split-K
+## 7. Occupancy
 
-At `N = 4`, `M = 1`, `n_heads = 16` the decode grid is 64 workgroups. The R9700
-has 64 CUs: exactly one workgroup per CU, no oversubscription, no latency
-hiding, each workgroup serially streaming a long KV. Batching already beats four
-sequential launches of 16 workgroups each, but it leaves throughput on the floor.
+**Split-K already exists and the long-context path is not occupancy-starved.**
+An earlier draft of this spec claimed the decode grid was 64 workgroups and
+proposed adding a split-K axis. That was wrong, and the correction matters
+because it removes what looked like the main kernel work.
 
-The fix is split-K (flash-decoding): partition each tile's KV range into `S`
-chunks, extend the grid by an `S` axis, and combine partial `(m, l, acc)`
-triples.
+The tile path launches `grid = [n_heads, max_tiles, chunk]` with 32-thread
+blocks, where `max_tiles = ceil(max_ctx_len / TILE_SIZE)` and
+`TILE_SIZE = 128` (`attention.rs:3473`). The KV-split axis is already there. At
+`n_heads = 16`, 32K context and 4 slots that is `16 × 256 × 4 ≈ 16k`
+workgroups — ample. And because routing crosses to this path above
+`LDS_CTX_LIMIT = 15000`, the contexts agents actually run at are served by the
+path that is already parallel.
 
-**We do not build that machinery.** `attention_flash_q8_0_tile_batched` +
-`attention_flash_q8_0_reduce` already are it. Today `S` is chosen to keep LDS
-under 64 KB. SP1 reframes it as an *occupancy* decision:
+So SP1 does **not** add a split-K axis. It does two smaller things:
 
-```
-S = clamp(target_wgs / (n_heads * n_tiles), 1, seq_len / MIN_CHUNK)
-```
+1. **Make `TILE_SIZE` overridable** rather than a hard `const`, so the split
+   count is a tunable if the sweep in §10 shows a better value on gfx1201. This
+   is a one-line change plus plumbing, not a redesign.
+2. **Check the LDS path's occupancy**, which is the one that genuinely is thin:
+   `grid = [n_heads, batch_size]` gives 64 workgroups at `n_heads = 16`,
+   `N = 4`, `M = 1`. That path only runs below `LDS_CTX_LIMIT`, so it matters for
+   short-context agents and for the low end of the bench sweep. If the sweep
+   shows it losing to the tile path at small `N`, the fix is to lower the
+   crossover for multi-slot batches — a routing change, not a kernel change.
 
-floored by `MIN_CHUNK` so the reduce pass does not dominate at short context.
-`target_wgs` and `MIN_CHUNK` are env-overridable and defaulted from the measured
-sweep in §10. This is a launcher change to an existing two-kernel path.
+**Ragged cost note.** `max_tiles` is derived from the batch's *maximum*
+`max_ctx_len`, so a batch mixing a 1K slot with a 100K slot launches ~780 tiles
+for every slot, and the short slot's tiles early-exit on `positions[b]`. Those
+are cheap but not free. Whether ragged batches should be split by context
+magnitude is a scheduler question for SP3; SP1 only needs to *measure* the waste
+and record it, which §10's unequal-`seq_len` sweep does.
 
 ## 8. Roofline estimates (to be validated by Task 0)
 
@@ -326,9 +340,11 @@ already avoids the ~10 s model load.
 
 Extend `q8_batched_attn_microbench.rs` to sweep `(kv_mode, n_slots, M_s, ctx_s)`
 and report attention-kernel milliseconds plus aggregate effective tok/s against
-the `n_slots ×` sequential baseline. Sweep `target_wgs` and `MIN_CHUNK` to pick
-the split-K defaults; asym3 and Q8_0 may want different ones, since asym3 moves
-fewer bytes per KV element and so shifts the compute/bandwidth balance.
+the `n_slots ×` sequential baseline. Sweep `TILE_SIZE` to confirm or replace the
+current `128`; asym3 and Q8_0 may want different values, since asym3 moves fewer
+bytes per KV element and so shifts the compute/bandwidth balance. Include at
+least one batch with strongly unequal `seq_len` so the ragged-tile waste noted
+in §7 is measured rather than assumed.
 
 **A 32 GB budget assertion in the harness is mandatory.** This box has ~125 GiB
 of shared memory; an over-budget design would otherwise pass here and OOM on the
@@ -336,10 +352,10 @@ target.
 
 ## 11. Risks
 
-- **We cannot validate RDNA4 perf on gfx1151.** Tile, BR/BC, and split-K
-  constants tuned here may not transfer to gfx1201. Every one of them must be
-  env-overridable, as `HIPFIRE_FLASH_PREFILL_BR/_BC` already are, and the spec
-  should not bake a tuned constant into a `const`.
+- **We cannot validate RDNA4 perf on gfx1151.** `TILE_SIZE` and BR/BC values
+  tuned here may not transfer to gfx1201. Every one of them must be
+  env-overridable, as `HIPFIRE_FLASH_PREFILL_BR/_BC` already are, and none should
+  be baked into a `const`.
 - **The 35B's ~1.8× may not justify batching it at all** versus keeping spec
   decode at batch 1. Task 0 settles this before the kernel work is finished.
 - **Attention is only part of a decode step.** SP1 alone cannot move end-to-end
