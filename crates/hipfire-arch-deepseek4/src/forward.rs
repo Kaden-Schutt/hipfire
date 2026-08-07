@@ -4772,7 +4772,24 @@ impl<'a> ForwardBindings for Deepseek4Bindings<'a> {
             Some(routed_out),
             /*do_mix=*/ false,
         )
-        .map_err(DispatchError::Hip)
+        .map_err(DispatchError::Hip)?;
+
+        // Exact gfx1201 dense TP: the shared down projection is a local
+        // input-column partial. Fold it into the already-zeroed routed partial
+        // before the existing EP all-reduce, then clear ffn_out so the normal
+        // post-reduce add installs the full shared+routed result exactly once.
+        let layer = self.weights.resolve_layer(self.layer_idx);
+        if layer.shared_tp_size > 1 {
+            let ffn_out =
+                self.state.ffn_out.as_ref().ok_or_else(|| {
+                    DispatchError::Hip("run_moe_ep dense TP: ffn_out unset".into())
+                })?;
+            gpu.add_inplace_f32(routed_out, ffn_out)
+                .map_err(|error| DispatchError::Hip(error.to_string()))?;
+            gpu.zero_f32(ffn_out)
+                .map_err(|error| DispatchError::Hip(error.to_string()))?;
+        }
+        Ok(())
     }
     fn ep_add_into_residual(
         &mut self,
@@ -6164,11 +6181,16 @@ fn ffn_shared_project(
     let shared_w2 = layer.shared_w2.as_ref().unwrap();
     let shared_w3 = layer.shared_w3.as_ref().unwrap();
     let im = cfg.moe_intermediate_size;
+    let local_im = im / layer.shared_tp_size;
+    debug_assert_eq!(im % layer.shared_tp_size, 0);
     let ffn_x_rot = state.ffn_x_rot.as_ref().unwrap();
     let ffn_x_plain = state.ffn_x_plain.as_ref().unwrap();
-    let gate = state.ffn_gate.as_ref().unwrap();
-    let up = state.ffn_up.as_ref().unwrap();
-    let silu_rot = state.ffn_silu_rot.as_ref().unwrap();
+    let gate_full = state.ffn_gate.as_ref().unwrap();
+    let up_full = state.ffn_up.as_ref().unwrap();
+    let silu_rot_full = state.ffn_silu_rot.as_ref().unwrap();
+    let gate = gate_full.sub_offset(0, local_im);
+    let up = up_full.sub_offset(0, local_im);
+    let silu_rot = silu_rot_full.sub_offset(0, local_im);
     let ffn_out = state.ffn_out.as_ref().unwrap();
     let down_needs_fwht = weight_needs_fwht(shared_w2);
     if dense_activation_dump_enabled()? {
@@ -6189,8 +6211,8 @@ fn ffn_shared_project(
         shared_w1,
         ffn_x_rot,
         ffn_x_plain,
-        gate,
-        im,
+        &gate,
+        local_im,
         cfg.hidden_size,
     )?;
 
@@ -6201,8 +6223,8 @@ fn ffn_shared_project(
         shared_w3,
         ffn_x_rot,
         ffn_x_plain,
-        up,
-        im,
+        &up,
+        local_im,
         cfg.hidden_size,
     )?;
 
@@ -6212,10 +6234,16 @@ fn ffn_shared_project(
     //      `gate`. cfg.swiglu_limit = 10.0 on DeepSeek V4. Same Expert class
     //      used for shared and routed in upstream model.py.
     if down_needs_fwht {
-        gpu.deepseek4_fused_silu_mul_clamp_mq_rotate(gate, up, silu_rot, im, cfg.swiglu_limit)
-            .map_err(|e| {
-                format!("deepseek4_fused_silu_mul_clamp_mq_rotate layer {layer_idx}: {e:?}")
-            })?;
+        gpu.deepseek4_fused_silu_mul_clamp_mq_rotate(
+            &gate,
+            &up,
+            &silu_rot,
+            local_im,
+            cfg.swiglu_limit,
+        )
+        .map_err(|e| {
+            format!("deepseek4_fused_silu_mul_clamp_mq_rotate layer {layer_idx}: {e:?}")
+        })?;
         if dense_activation_dump_enabled()? {
             // As with fused q_norm above, materialize the logical pre-FWHT
             // input only for calibration; the shipping down GEMV continues to
@@ -6224,24 +6252,24 @@ fn ffn_shared_project(
                 .embed_scratch
                 .as_ref()
                 .ok_or_else(|| "dense capture: embed_scratch missing".to_string())?
-                .sub_offset(0, im);
-            gpu.deepseek4_silu_mul_clamp_f32(gate, up, &scratch, cfg.swiglu_limit)
+                .sub_offset(0, local_im);
+            gpu.deepseek4_silu_mul_clamp_f32(&gate, &up, &scratch, cfg.swiglu_limit)
                 .map_err(|e| format!("dense capture shared silu layer {layer_idx}: {e:?}"))?;
             dump_dense_activation_if_enabled(
                 gpu,
                 &format!("layers.{layer_idx}.ffn.shared_experts.w2.weight"),
                 &scratch,
-                im,
+                local_im,
             )?;
         }
     } else {
-        gpu.deepseek4_silu_mul_clamp_f32(gate, up, gate, cfg.swiglu_limit)
+        gpu.deepseek4_silu_mul_clamp_f32(&gate, &up, &gate, cfg.swiglu_limit)
             .map_err(|e| format!("deepseek4_silu_mul_clamp layer {layer_idx}: {e:?}"))?;
         dump_dense_activation_if_enabled(
             gpu,
             &format!("layers.{layer_idx}.ffn.shared_experts.w2.weight"),
-            gate,
-            im,
+            &gate,
+            local_im,
         )?;
     }
 
@@ -6252,11 +6280,11 @@ fn ffn_shared_project(
         gpu,
         weights.mq2r_backend,
         shared_w2,
-        silu_rot,
-        gate,
+        &silu_rot,
+        &gate,
         ffn_out,
         cfg.hidden_size,
-        im,
+        local_im,
     )?;
 
     Ok(())

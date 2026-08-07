@@ -262,6 +262,98 @@ impl DeepseekV4 {
         Ok(t)
     }
 
+    /// Slice an encoded qt35 MFP4G32E8SOA matrix for exact four-rank dense TP.
+    ///
+    /// Output-row slicing is a contiguous row range. Input-column slicing
+    /// rebuilds each row's SoA scale/codeword planes for a whole-number range
+    /// of 256-wide MagnumQuant FWHT groups. No dequantization or requantization
+    /// occurs; every retained header, scale, and codeword byte is copied from
+    /// the parent artifact.
+    fn upload_mfp4e8_soa_tp_shard(
+        hfq: &HfqFile,
+        gpu: &mut Gpu,
+        name: &str,
+        rank: usize,
+        tp_size: usize,
+        rows: bool,
+    ) -> Result<rdna_compute::GpuTensor, String> {
+        let (info, bytes) = hfq
+            .tensor_data_pread(name)
+            .ok_or_else(|| format!("deepseek4: tensor '{name}' missing in HFQ"))?;
+        if info.quant_type != 35 || info.shape.len() != 2 {
+            return Err(format!(
+                "deepseek4: dense TP requires qt35 rank-2 '{name}', got qt={} shape={:?}",
+                info.quant_type, info.shape
+            ));
+        }
+        if rank >= tp_size || tp_size == 0 {
+            return Err(format!(
+                "deepseek4: invalid dense TP rank {rank}/{tp_size} for '{name}'"
+            ));
+        }
+        let m = info.shape[0] as usize;
+        let k = info.shape[1] as usize;
+        if m == 0 || bytes.len() % m != 0 {
+            return Err(format!(
+                "deepseek4: qt35 '{name}' bytes={} do not form {m} encoded rows",
+                bytes.len()
+            ));
+        }
+        let row_bytes = bytes.len() / m;
+        let blocks = k / 32;
+        let scale_padded = blocks.div_ceil(16) * 16;
+        let expected_row_bytes = 16 + scale_padded + blocks * 16;
+        if k % 256 != 0 || row_bytes != expected_row_bytes {
+            return Err(format!(
+                "deepseek4: qt35 '{name}' unsupported TP layout K={k} row_bytes={row_bytes} expected={expected_row_bytes}"
+            ));
+        }
+
+        let (shape, shard_bytes) = if rows {
+            if m % tp_size != 0 {
+                return Err(format!(
+                    "deepseek4: qt35 '{name}' rows {m} not divisible by TP={tp_size}"
+                ));
+            }
+            let local_m = m / tp_size;
+            let start = rank * local_m * row_bytes;
+            let end = start + local_m * row_bytes;
+            (vec![local_m, k], bytes[start..end].to_vec())
+        } else {
+            if k % tp_size != 0 || (k / tp_size) % 256 != 0 {
+                return Err(format!(
+                    "deepseek4: qt35 '{name}' K={k} does not split into whole 256-wide FWHT groups at TP={tp_size}"
+                ));
+            }
+            let local_k = k / tp_size;
+            let local_blocks = local_k / 32;
+            let local_scale_padded = local_blocks.div_ceil(16) * 16;
+            let local_row_bytes = 16 + local_scale_padded + local_blocks * 16;
+            let first_block = rank * local_blocks;
+            let source_codewords = 16 + scale_padded;
+            let local_codewords = 16 + local_scale_padded;
+            let mut out = vec![0u8; m * local_row_bytes];
+            for row in 0..m {
+                let source = &bytes[row * row_bytes..(row + 1) * row_bytes];
+                let dest = &mut out[row * local_row_bytes..(row + 1) * local_row_bytes];
+                dest[..16].copy_from_slice(&source[..16]);
+                dest[4..6].copy_from_slice(&(local_blocks as u16).to_le_bytes());
+                dest[16..16 + local_blocks]
+                    .copy_from_slice(&source[16 + first_block..16 + first_block + local_blocks]);
+                let source_codes = source_codewords + first_block * 16;
+                dest[local_codewords..local_codewords + local_blocks * 16]
+                    .copy_from_slice(&source[source_codes..source_codes + local_blocks * 16]);
+            }
+            (vec![m, local_k], out)
+        };
+
+        let mut tensor = gpu.upload_raw(&shard_bytes, &shape).map_err(|error| {
+            format!("deepseek4: upload dense-TP shard '{name}' failed: {error:?}")
+        })?;
+        tensor.dtype = DType::MFP4G32E8SOA;
+        Ok(tensor)
+    }
+
     /// Upload an F16-on-disk HFQ tensor as F16 bytes on GPU (no
     /// conversion). Marks `dtype = F16`. Used for the WMMA GEMM path
     /// that consumes F16 weights directly. Errors if the source isn't
@@ -1930,23 +2022,55 @@ impl DeepseekV4 {
                 }
             }
 
-            // Shared expert.
-            // Shared experts — antirez Q8_0 path (same dispatch logic).
-            layer.shared_w1 = Some(Self::upload_quant_or_f16(
-                hfq,
-                gpu,
-                &format!("layers.{l}.ffn.shared_experts.w1.weight"),
-            )?);
-            layer.shared_w2 = Some(Self::upload_quant_or_f16(
-                hfq,
-                gpu,
-                &format!("layers.{l}.ffn.shared_experts.w2.weight"),
-            )?);
-            layer.shared_w3 = Some(Self::upload_quant_or_f16(
-                hfq,
-                gpu,
-                &format!("layers.{l}.ffn.shared_experts.w3.weight"),
-            )?);
+            // Shared expert. Exact gfx1201 EP4 additionally shards the dense
+            // qt35 matrices: w1/w3 by output rows, w2 by whole FWHT-group
+            // input columns. Other arches, rank counts, formats, and model
+            // recipes retain the established replicated upload.
+            let shared_tp = shard.filter(|(plan, _)| {
+                gpu.arch_caps.is_gfx1201() && cfg.mq2r && !cfg.mq2rxt && plan.tp_size == 4
+            });
+            let w1_name = format!("layers.{l}.ffn.shared_experts.w1.weight");
+            let w2_name = format!("layers.{l}.ffn.shared_experts.w2.weight");
+            let w3_name = format!("layers.{l}.ffn.shared_experts.w3.weight");
+            if let Some((plan, rank)) = shared_tp {
+                layer.shared_tp_size = plan.tp_size;
+                layer.shared_tp_rank = rank;
+                if l == 0 {
+                    eprintln!(
+                        "deepseek4: exact gfx1201 shared-expert dense TP active \
+                         (rank {rank}/{}, w1+w3 output rows, w2 whole-FWHT-group columns)",
+                        plan.tp_size
+                    );
+                }
+                layer.shared_w1 = Some(Self::upload_mfp4e8_soa_tp_shard(
+                    hfq,
+                    gpu,
+                    &w1_name,
+                    rank,
+                    plan.tp_size,
+                    true,
+                )?);
+                layer.shared_w2 = Some(Self::upload_mfp4e8_soa_tp_shard(
+                    hfq,
+                    gpu,
+                    &w2_name,
+                    rank,
+                    plan.tp_size,
+                    false,
+                )?);
+                layer.shared_w3 = Some(Self::upload_mfp4e8_soa_tp_shard(
+                    hfq,
+                    gpu,
+                    &w3_name,
+                    rank,
+                    plan.tp_size,
+                    true,
+                )?);
+            } else {
+                layer.shared_w1 = Some(Self::upload_quant_or_f16(hfq, gpu, &w1_name)?);
+                layer.shared_w2 = Some(Self::upload_quant_or_f16(hfq, gpu, &w2_name)?);
+                layer.shared_w3 = Some(Self::upload_quant_or_f16(hfq, gpu, &w3_name)?);
+            }
         }
 
         // ── MTP layer (Multi-Token Prediction head, DeepSeek V3 style) ─

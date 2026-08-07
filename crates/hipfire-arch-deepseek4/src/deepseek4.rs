@@ -664,6 +664,12 @@ pub struct DeepseekV4LayerWeights {
     pub tid2eid_dev: Option<rdna_compute::GpuTensor>,
 
     // Shared expert (one per layer, w1/w2/w3, MQ-family quantized).
+    /// Exact gfx1201 four-rank dense-TP contract for the shared expert.
+    /// `1/0` is the ordinary replicated route. Main-layer EP weights may set
+    /// this to `4/rank`; MTP and DSpark layer bundles remain replicated until
+    /// they receive their own separately certified TP path.
+    pub shared_tp_size: usize,
+    pub shared_tp_rank: usize,
     pub shared_w1: Option<rdna_compute::GpuTensor>,
     pub shared_w2: Option<rdna_compute::GpuTensor>,
     pub shared_w3: Option<rdna_compute::GpuTensor>,
@@ -765,6 +771,8 @@ impl DeepseekV4LayerWeights {
             gate_bias_host: self.gate_bias_host.clone(),
             tid2eid_host: self.tid2eid_host.clone(),
             tid2eid_dev: sc(&self.tid2eid_dev),
+            shared_tp_size: self.shared_tp_size,
+            shared_tp_rank: self.shared_tp_rank,
             shared_w1: sc(&self.shared_w1),
             shared_w2: sc(&self.shared_w2),
             shared_w3: sc(&self.shared_w3),
@@ -830,6 +838,8 @@ impl DeepseekV4LayerWeights {
             gate_bias_host: Vec::new(),
             tid2eid_host: Vec::new(),
             tid2eid_dev: None,
+            shared_tp_size: 1,
+            shared_tp_rank: 0,
             shared_w1: None,
             shared_w2: None,
             shared_w3: None,
