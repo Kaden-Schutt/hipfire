@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Kaden Schutt
-// hipfire — occurrence-weighted gfx1201 E8 LDS-X screen.
+// hipfire — occurrence-weighted gfx1201 E8 late-scale screen.
 
 use rdna_compute::{DType, Gpu, GpuTensor};
 
@@ -100,7 +100,7 @@ fn run_case(gpu: &mut Gpu, label: &str, m: usize, k: usize, occurrences: usize, 
 
     gpu.gemv_mfp4g32_e8_soa(&weights[0], &x, &reference, m, k)
         .expect("reference launch");
-    gpu.gemv_mfp4g32_e8_soa_ldsx4_gfx1201(&weights[0], &x, &candidate, m, k)
+    gpu.gemv_mfp4g32_e8_soa_late_scale_gfx1201(&weights[0], &x, &candidate, m, k)
         .expect("candidate launch");
     gpu.hip.device_synchronize().expect("correctness sync");
     let expected = gpu.download_f32(&reference).expect("reference download");
@@ -124,7 +124,7 @@ fn run_case(gpu: &mut Gpu, label: &str, m: usize, k: usize, occurrences: usize, 
     for weight in &weights {
         gpu.gemv_mfp4g32_e8_soa(weight, &x, &reference, m, k)
             .expect("reference warm");
-        gpu.gemv_mfp4g32_e8_soa_ldsx4_gfx1201(weight, &x, &candidate, m, k)
+        gpu.gemv_mfp4g32_e8_soa_late_scale_gfx1201(weight, &x, &candidate, m, k)
             .expect("candidate warm");
     }
     gpu.hip.device_synchronize().expect("warm sync");
@@ -136,8 +136,8 @@ fn run_case(gpu: &mut Gpu, label: &str, m: usize, k: usize, occurrences: usize, 
             gpu.gemv_mfp4g32_e8_soa(&weights[repeat % replicas], &x, &reference, m, k)
                 .expect("reference timed");
         };
-        let ldsx4 = |gpu: &mut Gpu, repeat: usize| {
-            gpu.gemv_mfp4g32_e8_soa_ldsx4_gfx1201(
+        let late_scale = |gpu: &mut Gpu, repeat: usize| {
+            gpu.gemv_mfp4g32_e8_soa_late_scale_gfx1201(
                 &weights[repeat % replicas],
                 &x,
                 &candidate,
@@ -148,16 +148,16 @@ fn run_case(gpu: &mut Gpu, label: &str, m: usize, k: usize, occurrences: usize, 
         };
         if trial & 1 == 0 {
             reference_us.push(event_us(gpu, replicas, incumbent));
-            candidate_us.push(event_us(gpu, replicas, ldsx4));
+            candidate_us.push(event_us(gpu, replicas, late_scale));
         } else {
-            candidate_us.push(event_us(gpu, replicas, ldsx4));
+            candidate_us.push(event_us(gpu, replicas, late_scale));
             reference_us.push(event_us(gpu, replicas, incumbent));
         }
     }
     let reference_us = median(&mut reference_us);
     let candidate_us = median(&mut candidate_us);
     println!(
-        "CASE label={label} M={m} K={k} occurrences={occurrences} replicas={replicas} working_set_bytes={} raw_equal={raw_equal}/{m} nonfinite={nonfinite} max_abs={max_abs:.9e} max_rel={max_rel:.9e} mean_rel={mean_rel:.9e} incumbent_us={reference_us:.6} ldsx4_us={candidate_us:.6} speedup_x={:.4} saved_us_per_call={:.6} saved_ms_per_rank_token={:.6}",
+        "CASE label={label} M={m} K={k} occurrences={occurrences} replicas={replicas} working_set_bytes={} raw_equal={raw_equal}/{m} nonfinite={nonfinite} max_abs={max_abs:.9e} max_rel={max_rel:.9e} mean_rel={mean_rel:.9e} incumbent_us={reference_us:.6} late_scale_us={candidate_us:.6} speedup_x={:.4} saved_us_per_call={:.6} saved_ms_per_rank_token={:.6}",
         weight_bytes * replicas,
         reference_us / candidate_us,
         reference_us - candidate_us,
