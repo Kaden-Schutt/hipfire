@@ -4480,6 +4480,64 @@ impl Gpu {
         )
     }
 
+    /// Exact-gfx1201 one-launch block-diagonal E8 GEMV:
+    /// `A[G,M,K] @ x[G,K] -> y[G,M]`.
+    /// The kernel preserves the accepted gfx1201 per-row arithmetic exactly.
+    pub fn gemv_mfp4g32_e8_soa_grouped_gfx1201(
+        &mut self,
+        a: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        groups: usize,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert_eq!(
+            self.arch_caps.arch(),
+            "gfx1201",
+            "grouped E8 gfx1201 requires exact gfx1201"
+        );
+        assert!(k % 256 == 0, "grouped E8 gfx1201 requires K%256=0");
+        const KERNEL: &str = "gemv_mfp4g32_e8_soa_grouped_gfx1201";
+        self.ensure_kernel(
+            KERNEL,
+            kernels::GEMV_MFP4G32_E8_SOA_GROUPED_GFX1201_SRC,
+            KERNEL,
+        )?;
+        let a_ptr = a.buf.as_ptr();
+        let x_ptr = x.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let groups_i32 = groups as i32;
+        let m_i32 = m as i32;
+        let k_i32 = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &a_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &y_ptr as *const _ as *mut c_void,
+            &groups_i32 as *const _ as *mut c_void,
+            &m_i32 as *const _ as *mut c_void,
+            &k_i32 as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            KERNEL,
+            [m as u32, groups as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut blob = hip_bridge::KernargBlob::new();
+                blob.push_ptr(a_ptr);
+                blob.push_ptr(x_ptr);
+                blob.push_ptr(y_ptr);
+                blob.push_i32(groups_i32);
+                blob.push_i32(m_i32);
+                blob.push_i32(k_i32);
+                blob
+            },
+        )
+    }
+
     /// Exact-gfx1100 path for collapsing the eight O-LoRA E8 GEMVs into one
     /// 2-D launch. The included kernel preserves the incumbent width-32
     /// per-row arithmetic.

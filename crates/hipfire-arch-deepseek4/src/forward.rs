@@ -313,6 +313,11 @@ mod config_cache {
                         != Some("0")
                 }))
     }
+    /// Exact-gfx1201 MQ2R route for collapsing the eight O-LoRA E8 GEMVs.
+    /// This is a shipped architecture default, not an environment experiment.
+    pub(super) fn gfx1201_e8_wo_grouped_on(arch: &str, mq2r: bool) -> bool {
+        arch == "gfx1201" && mq2r
+    }
     /// `HIPFIRE_DEEPSEEK4_GFX942_COMPRESSOR_GATE` — host-gate non-commit
     /// compressor commit-stage launches on exact `gfx942` MQ2R ordinary HIP.
     /// Default OFF; set `=1` to enable. Forced off during hipGraph capture
@@ -8186,6 +8191,19 @@ fn attn_stub(
         )
         .map_err(|e| format!("grouped E8 wo_a l{layer_idx}: {e:?}"))?;
     } else if wo_a.dtype == DType::MFP4G32E8SOA
+        && config_cache::gfx1201_e8_wo_grouped_on(&gpu.arch, cfg.mq2r)
+        && per_group_in % 256 == 0
+    {
+        gpu.gemv_mfp4g32_e8_soa_grouped_gfx1201(
+            wo_a,
+            attn_out_raw_rot,
+            wo_a_out,
+            n_groups,
+            o_lora_rank,
+            per_group_in,
+        )
+        .map_err(|e| format!("grouped gfx1201 E8 wo_a l{layer_idx}: {e:?}"))?;
+    } else if wo_a.dtype == DType::MFP4G32E8SOA
         && olora_schedule == OloraSchedule::HeterogeneousGfx1100
     {
         gpu.gemv_mfp4g32_e8_soa_grouped_gfx1100(
@@ -15644,6 +15662,10 @@ mod tests {
         ));
         assert!(!config_cache::hc_finalize_fused_on("gfx1100", true));
         assert!(!config_cache::hc_finalize_fused_on("gfx942", true));
+        assert!(config_cache::gfx1201_e8_wo_grouped_on("gfx1201", true));
+        assert!(!config_cache::gfx1201_e8_wo_grouped_on("gfx1201", false));
+        assert!(!config_cache::gfx1201_e8_wo_grouped_on("gfx1151", true));
+        assert!(!config_cache::gfx1201_e8_wo_grouped_on("gfx942", true));
     }
 
     #[test]

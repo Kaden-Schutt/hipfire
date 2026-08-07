@@ -29,6 +29,10 @@ fn main() {
         run_prefill_coop(&mut gpu);
         return;
     }
+    if std::env::var_os("HIPFIRE_E8_GROUPED_GFX1201_ONLY").is_some() {
+        run_grouped_gfx1201(&mut gpu);
+        return;
+    }
 
     let shapes: Vec<(usize, usize, &str)> = vec![
         // --- A3B per-expert MoE shapes (the decode hot path; hidden=2048,
@@ -1330,6 +1334,100 @@ fn run_prefill_coop(gpu: &mut Gpu) {
             exact.min(exact8).min(exact16),
         );
     }
+}
+
+fn run_grouped_gfx1201(gpu: &mut Gpu) {
+    assert_eq!(gpu.arch, "gfx1201", "grouped channel requires gfx1201");
+    const GROUPS: usize = 8;
+    const M: usize = 1024;
+    const K: usize = 4096;
+    const CASES: usize = 4;
+    const WARMUPS: usize = 20;
+    const TRIALS: usize = 200;
+
+    let mut total_exact = 0usize;
+    let total = CASES * GROUPS * M;
+    let mut timing = None;
+    for case in 0..CASES {
+        let aos = synth_e8_aos(GROUPS * M, K, 0x1201_4752 ^ case as u64);
+        let soa = aos_to_soa_full(&aos, GROUPS * M, K);
+        let row_bytes = soa.len() / (GROUPS * M);
+        let group_bytes = row_bytes * M;
+        let weights = gpu.upload_raw(&soa, &[soa.len()]).expect("upload weights");
+        let x = gpu
+            .alloc_tensor(&[GROUPS * K], DType::F32)
+            .expect("alloc x");
+        let serial = gpu
+            .alloc_tensor(&[GROUPS * M], DType::F32)
+            .expect("alloc serial");
+        let grouped = gpu
+            .alloc_tensor(&[GROUPS * M], DType::F32)
+            .expect("alloc grouped");
+        let x_host = make_x(GROUPS * K, 0xE800_1201 ^ case as u64);
+        gpu.hip
+            .memcpy_htod(&x.buf, bytes_of(&x_host))
+            .expect("upload x");
+
+        let run_serial = |gpu: &mut Gpu| {
+            for group in 0..GROUPS {
+                let weight = weights.sub_offset(group * group_bytes, group_bytes);
+                let x_group = x.sub_offset(group * K, K);
+                let y_group = serial.sub_offset(group * M, M);
+                gpu.gemv_mfp4g32_e8_soa(&weight, &x_group, &y_group, M, K)
+                    .expect("single gfx1201 E8");
+            }
+        };
+
+        run_serial(gpu);
+        gpu.gemv_mfp4g32_e8_soa_grouped_gfx1201(&weights, &x, &grouped, GROUPS, M, K)
+            .expect("grouped gfx1201 E8");
+        gpu.hip.device_synchronize().expect("parity synchronize");
+
+        let mut reference = vec![0.0f32; GROUPS * M];
+        let mut candidate = vec![0.0f32; GROUPS * M];
+        gpu.hip
+            .memcpy_dtoh(bytes_of_mut(&mut reference), &serial.buf)
+            .expect("download serial");
+        gpu.hip
+            .memcpy_dtoh(bytes_of_mut(&mut candidate), &grouped.buf)
+            .expect("download grouped");
+        let exact = reference
+            .iter()
+            .zip(&candidate)
+            .filter(|(left, right)| left.to_bits() == right.to_bits())
+            .count();
+        assert_eq!(exact, GROUPS * M, "grouped mismatch in case {case}");
+        total_exact += exact;
+
+        if case == 0 {
+            for _ in 0..WARMUPS {
+                run_serial(gpu);
+                gpu.gemv_mfp4g32_e8_soa_grouped_gfx1201(&weights, &x, &grouped, GROUPS, M, K)
+                    .expect("warm grouped");
+            }
+            gpu.hip.device_synchronize().expect("warm synchronize");
+            let start = Instant::now();
+            for _ in 0..TRIALS {
+                run_serial(gpu);
+            }
+            gpu.hip.device_synchronize().expect("serial synchronize");
+            let serial_us = start.elapsed().as_secs_f64() * 1.0e6 / TRIALS as f64;
+            let start = Instant::now();
+            for _ in 0..TRIALS {
+                gpu.gemv_mfp4g32_e8_soa_grouped_gfx1201(&weights, &x, &grouped, GROUPS, M, K)
+                    .expect("timed grouped");
+            }
+            gpu.hip.device_synchronize().expect("grouped synchronize");
+            let grouped_us = start.elapsed().as_secs_f64() * 1.0e6 / TRIALS as f64;
+            timing = Some((serial_us, grouped_us));
+        }
+    }
+
+    let (serial_us, grouped_us) = timing.expect("timing case");
+    eprintln!(
+        "gfx1201 grouped O-LoRA: {total_exact}/{total} raw-bit exact; 8 launches {serial_us:.3} us; grouped {grouped_us:.3} us; speedup {:.3}x",
+        serial_us / grouped_us,
+    );
 }
 
 fn run_pack_correctness(gpu: &mut Gpu) {
