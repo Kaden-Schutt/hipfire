@@ -50,6 +50,10 @@ impl Mq2rBackend {
         matches!(self, Self::Gfx1151)
     }
 
+    pub(crate) const fn is_gfx1201(self) -> bool {
+        matches!(self, Self::Gfx1201(_))
+    }
+
     /// The certified gfx1151 route uses the fused atomic MoE down projection.
     /// Other backends stay on expanded output plus a fixed-order combine until
     /// their own arithmetic route is certified.
