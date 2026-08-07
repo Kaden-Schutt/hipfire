@@ -145,3 +145,6 @@ docs/investigations/*/sources/
 
 # Local research scratch (agent surveys, microbenches)
 .research/
+
+# superpowers subagent-driven-development scratch (ledger, briefs, review packages)
+.superpowers/
