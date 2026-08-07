@@ -27,6 +27,12 @@ const HARMONIC_PARTITION_ROUTE_SRC: &str =
     include_str!("../../../../kernels/src/harmonic_partition_route.gfx1100.hip");
 const HARMONIC_PARTITION_ROUTE_KERNEL: &str = "harmonic_partition_route_gfx1100";
 const HARMONIC_STAGE_ROUTE_KERNEL: &str = "harmonic_stage_route_gfx1100";
+const HARMONIC_LOCAL_TAIL_SRC: &str =
+    include_str!("../../../../kernels/src/harmonic_mq2_lloyd_local_tail.gfx1100.hip");
+const HARMONIC_LOCAL_GATE_UP_KERNEL: &str = "harmonic_mq2_lloyd_gate_up_gfx1100";
+const HARMONIC_LOCAL_ACTIVATION_KERNEL: &str = "harmonic_silu_mul_clamp_gfx1100";
+const HARMONIC_LOCAL_ROTATE_KERNEL: &str = "harmonic_mq_rotate_x_gfx1100";
+const HARMONIC_LOCAL_DOWN_KERNEL: &str = "harmonic_mq2_lloyd_down_gfx1100";
 
 /// A mutable GPU borrow proven to target exact gfx1100.
 ///
@@ -321,6 +327,177 @@ impl Gfx1100Device<'_> {
             timer.finish(&self.gpu.hip);
         }
         result
+    }
+
+    /// Capture-safe local replica tail for the DS4HARM3 route.
+    ///
+    /// All four dispatches use the fixed top-k=6 geometry required by a
+    /// pre-built retained batch. Each exact-gfx1100 kernel reads the route
+    /// stage's device-resident `local_count` and returns inactive workgroups
+    /// before any expert pointer or activation access.
+    #[allow(clippy::too_many_arguments)]
+    pub fn harmonic_mq2_lloyd_local_tail(
+        &mut self,
+        gate_up_ptrs: &GpuTensor,
+        down_ptrs: &GpuTensor,
+        local_expert_ids: &GpuTensor,
+        local_count: &GpuTensor,
+        x_rot: &GpuTensor,
+        gate_batch: &GpuTensor,
+        up_batch: &GpuTensor,
+        rot_batch: &GpuTensor,
+        expert_outputs: &GpuTensor,
+        hidden_size: usize,
+        intermediate_size: usize,
+        swiglu_limit: f32,
+    ) -> HipResult<()> {
+        assert_eq!(
+            hidden_size, 4096,
+            "gfx1100 harmonic local tail requires hidden=4096"
+        );
+        assert_eq!(
+            intermediate_size, 2048,
+            "gfx1100 harmonic local tail requires intermediate=2048"
+        );
+        self.gpu.bind_thread()?;
+        for kernel in [
+            HARMONIC_LOCAL_GATE_UP_KERNEL,
+            HARMONIC_LOCAL_ACTIVATION_KERNEL,
+            HARMONIC_LOCAL_ROTATE_KERNEL,
+            HARMONIC_LOCAL_DOWN_KERNEL,
+        ] {
+            self.gpu
+                .ensure_kernel(kernel, HARMONIC_LOCAL_TAIL_SRC, kernel)?;
+        }
+        self.gpu.ensure_mq_signs()?;
+
+        let gate_up_ptrs_ptr = gate_up_ptrs.buf.as_ptr();
+        let down_ptrs_ptr = down_ptrs.buf.as_ptr();
+        let ids_ptr = local_expert_ids.buf.as_ptr();
+        let count_ptr = local_count.buf.as_ptr();
+        let x_rot_ptr = x_rot.buf.as_ptr();
+        let gate_ptr = gate_batch.buf.as_ptr();
+        let up_ptr = up_batch.buf.as_ptr();
+        let rot_ptr = rot_batch.buf.as_ptr();
+        let outputs_ptr = expert_outputs.buf.as_ptr();
+        let signs1_ptr = self.gpu.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
+        let signs2_ptr = self.gpu.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
+        let gate_m = (2 * intermediate_size) as i32;
+        let hidden = hidden_size as i32;
+        let intermediate = intermediate_size as i32;
+        let top_k = 6_u32;
+
+        let mut gate_params: Vec<*mut c_void> = vec![
+            &gate_up_ptrs_ptr as *const _ as *mut c_void,
+            &ids_ptr as *const _ as *mut c_void,
+            &x_rot_ptr as *const _ as *mut c_void,
+            &gate_ptr as *const _ as *mut c_void,
+            &up_ptr as *const _ as *mut c_void,
+            &count_ptr as *const _ as *mut c_void,
+            &gate_m as *const _ as *mut c_void,
+            &hidden as *const _ as *mut c_void,
+        ];
+        self.gpu.launch_maybe_blob(
+            HARMONIC_LOCAL_GATE_UP_KERNEL,
+            [gate_m as u32, top_k, 1],
+            [32, 1, 1],
+            0,
+            &mut gate_params,
+            || {
+                let mut blob = KernargBlob::new();
+                blob.push_ptr(gate_up_ptrs_ptr);
+                blob.push_ptr(ids_ptr);
+                blob.push_ptr(x_rot_ptr);
+                blob.push_ptr(gate_ptr);
+                blob.push_ptr(up_ptr);
+                blob.push_ptr(count_ptr);
+                blob.push_i32(gate_m);
+                blob.push_i32(hidden);
+                blob
+            },
+        )?;
+
+        let mut activation_params: Vec<*mut c_void> = vec![
+            &gate_ptr as *const _ as *mut c_void,
+            &up_ptr as *const _ as *mut c_void,
+            &gate_ptr as *const _ as *mut c_void,
+            &count_ptr as *const _ as *mut c_void,
+            &intermediate as *const _ as *mut c_void,
+            &swiglu_limit as *const _ as *mut c_void,
+        ];
+        self.gpu.launch_maybe_blob(
+            HARMONIC_LOCAL_ACTIVATION_KERNEL,
+            [(intermediate as u32).div_ceil(256), top_k, 1],
+            [256, 1, 1],
+            0,
+            &mut activation_params,
+            || {
+                let mut blob = KernargBlob::new();
+                blob.push_ptr(gate_ptr);
+                blob.push_ptr(up_ptr);
+                blob.push_ptr(gate_ptr);
+                blob.push_ptr(count_ptr);
+                blob.push_i32(intermediate);
+                blob.push_f32(swiglu_limit);
+                blob
+            },
+        )?;
+
+        let mut rotate_params: Vec<*mut c_void> = vec![
+            &gate_ptr as *const _ as *mut c_void,
+            &rot_ptr as *const _ as *mut c_void,
+            &signs1_ptr as *const _ as *mut c_void,
+            &signs2_ptr as *const _ as *mut c_void,
+            &count_ptr as *const _ as *mut c_void,
+            &intermediate as *const _ as *mut c_void,
+        ];
+        self.gpu.launch_maybe_blob(
+            HARMONIC_LOCAL_ROTATE_KERNEL,
+            [((intermediate_size / 256) as u32) * top_k, 1, 1],
+            [32, 1, 1],
+            0,
+            &mut rotate_params,
+            || {
+                let mut blob = KernargBlob::new();
+                blob.push_ptr(gate_ptr);
+                blob.push_ptr(rot_ptr);
+                blob.push_ptr(signs1_ptr);
+                blob.push_ptr(signs2_ptr);
+                blob.push_ptr(count_ptr);
+                blob.push_i32(intermediate);
+                blob
+            },
+        )?;
+
+        let mut down_params: Vec<*mut c_void> = vec![
+            &down_ptrs_ptr as *const _ as *mut c_void,
+            &ids_ptr as *const _ as *mut c_void,
+            &rot_ptr as *const _ as *mut c_void,
+            &outputs_ptr as *const _ as *mut c_void,
+            &count_ptr as *const _ as *mut c_void,
+            &hidden as *const _ as *mut c_void,
+            &intermediate as *const _ as *mut c_void,
+        ];
+        self.gpu.launch_maybe_blob(
+            HARMONIC_LOCAL_DOWN_KERNEL,
+            [hidden as u32, top_k, 1],
+            [32, 1, 1],
+            0,
+            &mut down_params,
+            || {
+                let mut blob = KernargBlob::new();
+                blob.push_ptr(down_ptrs_ptr);
+                blob.push_ptr(ids_ptr);
+                blob.push_ptr(rot_ptr);
+                blob.push_ptr(outputs_ptr);
+                blob.push_ptr(count_ptr);
+                blob.push_i32(hidden);
+                blob.push_i32(intermediate);
+                blob
+            },
+        )?;
+        self.gpu.invalidate_x_caches_for(rot_ptr);
+        Ok(())
     }
 
     /// Candidate exact-order combine for owner-packed harmonic expert rows.
