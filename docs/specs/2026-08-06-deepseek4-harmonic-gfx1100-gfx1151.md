@@ -10,8 +10,8 @@ service, the exact-BDF worker, bounded exact-PID teardown, and the direct-ring
 steady-state seam are source-complete. Per the 2026-08-07 optimization
 directive, repeated safety review is no longer an optimization gate; the exact
 gfx1100/gfx1151 fault repetition moves to final H8 certification. H3 hot-path
-optimization is active. Only the quarantined reciprocal-device route remains
-prohibited.
+optimization and the H4 rate-matched expert-residency revision are active.
+Only the quarantined reciprocal-device route remains prohibited.
 
 Branch: `ds4-beta-staging`
 
@@ -309,12 +309,22 @@ resource contract, and measured in-regime cost.
 ### H4 - Resident expert service
 
 - Keep the entire routed payload resident on gfx1151.
+- Permit exact artifact-local replicas of a rate-matched `(layer, expert)`
+  hotset on gfx1100. This is not runtime weight forwarding: the complete
+  gfx1151 payload remains resident and every replica must be projected from the
+  same frozen P3 bytes before allocation.
+- Select replica count by the measured maximum of the two concurrent branches,
+  not by available capacity. Reject a larger hotset when it makes the gfx1100
+  branch critical.
 - Deliver route metadata as soon as gfx1100 top-K completes.
 - Start useful gate/up work as early as dependencies allow; prefer useful
   computation over a duplicate-read prefetch kernel.
 - Evaluate cache-conscious selected-expert ordering within unchanged
   arithmetic and expert order constraints.
 - Return only the routed F32 partial.
+- When hot and cold slots have different owners, return per-route-slot results
+  and combine slots 0 through 5 in canonical order. Never combine one local
+  aggregate with one remote aggregate.
 - Keep routing, RMSNorm, FWHT, and canonical state on gfx1100.
 
 Exit: the service is byte-identical, persistent, bounded, and its isolated
@@ -429,7 +439,8 @@ H0 and H1 are complete and recorded in
 [`2026-08-06-ds4-harmonic-h0-quarantine.md`](../investigations/2026-08-06-ds4-harmonic-h0-quarantine.md)
 and
 [`2026-08-06-ds4-harmonic-h1-critical-path.md`](../investigations/2026-08-06-ds4-harmonic-h1-critical-path.md).
-H0-H2 are complete. H3 is the active performance gate. The release/acquire
+H0-H2 are complete. H3 and the H4 ownership revision are the active
+performance gates. The release/acquire
 bulk-copy ring completed 10/10 release probes at a 4.626 us median per full
 32,832-byte layer chain, or 0.199 ms projected across 43 routed layers. Stable
 HIP PCI binding is recorded in
@@ -440,3 +451,13 @@ The exact gfx1100/gfx1151 fault battery remains the final H8 promotion gate,
 not a blocker on H3-H7 optimization. The source-only H4 expert-service seam is
 recorded in
 [`2026-08-07-ds4-harmonic-h4-expert-service-source.md`](../investigations/2026-08-07-ds4-harmonic-h4-expert-service-source.md).
+The occurrence-ranked hot-expert sizing and its typed, CPU-only artifact
+projection are recorded in
+[`2026-08-07-ds4-harmonic-hot-expert-residency.md`](../investigations/2026-08-07-ds4-harmonic-hot-expert-residency.md).
+The 15 GB prefill-trained plan covers 64.831081% of the following 511 decode
+routes on the canonical prompt. At the unverified 2.184x architecture-ratio
+hypothesis this is near the calculated 63.585% branch balance and yields a
+50.41 tok/s device-useful ceiling. The exact gfx1100 DS4 MQ2-Lloyd ratio and
+the approximately 6 ms product residual remain explicitly unpriced. A fresh
+GPU session must measure that ratio before subset upload or product routing is
+enabled.

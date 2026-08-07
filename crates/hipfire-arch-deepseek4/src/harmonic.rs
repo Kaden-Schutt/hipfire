@@ -15,6 +15,7 @@ pub const HARMONIC_SLOT_COUNT: usize = 2;
 pub const HARMONIC_LAYER_COUNT: u16 = 43;
 pub const HARMONIC_EXPERT_COUNT: u32 = 256;
 pub const HARMONIC_TOP_K: usize = 6;
+pub const HARMONIC_EXPERT_BITMAP_WORDS: usize = HARMONIC_EXPERT_COUNT as usize / u64::BITS as usize;
 pub const HARMONIC_HIDDEN_SIZE: usize = 4_096;
 pub const HARMONIC_MOE_INTERMEDIATE_SIZE: usize = 2_048;
 pub const HARMONIC_X_ROT_BYTES: usize = HARMONIC_HIDDEN_SIZE * std::mem::size_of::<f32>();
@@ -64,6 +65,203 @@ impl HarmonicOwner {
                 actual: actual.to_owned(),
             })
         }
+    }
+}
+
+/// One exact routed-expert payload in the frozen DeepSeek4 artifact.
+///
+/// A slot includes that expert's w1, w2, and w3 payloads. It is deliberately
+/// layer-qualified: expert 17 in layer 4 and expert 17 in layer 5 are distinct
+/// allocations and may have different residency decisions.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct HarmonicExpertSlot {
+    pub layer: u16,
+    pub expert: u16,
+}
+
+impl HarmonicExpertSlot {
+    pub fn checked(layer: usize, expert: usize) -> Result<Self, HarmonicResidencyError> {
+        if layer >= HARMONIC_LAYER_COUNT as usize || expert >= HARMONIC_EXPERT_COUNT as usize {
+            return Err(HarmonicResidencyError::SlotOutOfRange { layer, expert });
+        }
+        Ok(Self {
+            layer: layer as u16,
+            expert: expert as u16,
+        })
+    }
+}
+
+/// Owner selected for one canonical top-k route slot.
+///
+/// The full routed model always remains resident on gfx1151. `DenseGfx1100`
+/// means an exact byte-for-byte replica is also resident on gfx1100 and may be
+/// executed there; it never transfers expert weights in the token loop.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HarmonicExpertExecutionOwner {
+    DenseGfx1100,
+    ExpertGfx1151,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum HarmonicResidencyError {
+    ZeroSlotBytes,
+    EmptyRanking,
+    BudgetTooSmall { budget_bytes: u64, slot_bytes: u64 },
+    SlotOutOfRange { layer: usize, expert: usize },
+    DuplicateSlot(HarmonicExpertSlot),
+    RequiredBytesOverflow,
+}
+
+impl fmt::Display for HarmonicResidencyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "deepseek4 harmonic residency: {self:?}")
+    }
+}
+
+impl std::error::Error for HarmonicResidencyError {}
+
+/// Frozen-model capacity plan for exact expert replicas on gfx1100.
+///
+/// The input is occurrence-ranked, but the selected slots are stored in
+/// canonical `(layer, expert)` order and the identity is derived from the
+/// bitmap. Therefore equal residency sets have equal identities even if a
+/// profiler reports ties in a different order.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HarmonicExpertResidencyPlan {
+    slot_bytes: u64,
+    budget_bytes: u64,
+    required_bytes: u64,
+    identity: u64,
+    slots: Vec<HarmonicExpertSlot>,
+    by_layer: [[u64; HARMONIC_EXPERT_BITMAP_WORDS]; HARMONIC_LAYER_COUNT as usize],
+}
+
+impl HarmonicExpertResidencyPlan {
+    pub fn from_ranked<I>(
+        slot_bytes: u64,
+        budget_bytes: u64,
+        ranked: I,
+    ) -> Result<Self, HarmonicResidencyError>
+    where
+        I: IntoIterator<Item = HarmonicExpertSlot>,
+    {
+        if slot_bytes == 0 {
+            return Err(HarmonicResidencyError::ZeroSlotBytes);
+        }
+        let capacity = usize::try_from(budget_bytes / slot_bytes)
+            .unwrap_or(usize::MAX)
+            .min(HARMONIC_LAYER_COUNT as usize * HARMONIC_EXPERT_COUNT as usize);
+        if capacity == 0 {
+            return Err(HarmonicResidencyError::BudgetTooSmall {
+                budget_bytes,
+                slot_bytes,
+            });
+        }
+
+        let mut seen = [[0_u64; HARMONIC_EXPERT_BITMAP_WORDS]; HARMONIC_LAYER_COUNT as usize];
+        let mut selected = Vec::with_capacity(capacity);
+        let mut saw_any = false;
+        for slot in ranked {
+            saw_any = true;
+            let checked = HarmonicExpertSlot::checked(slot.layer as usize, slot.expert as usize)?;
+            let word = checked.expert as usize / u64::BITS as usize;
+            let bit = 1_u64 << (checked.expert as usize % u64::BITS as usize);
+            let entry = &mut seen[checked.layer as usize][word];
+            if *entry & bit != 0 {
+                return Err(HarmonicResidencyError::DuplicateSlot(checked));
+            }
+            *entry |= bit;
+            if selected.len() < capacity {
+                selected.push(checked);
+            }
+        }
+        if !saw_any {
+            return Err(HarmonicResidencyError::EmptyRanking);
+        }
+
+        selected.sort_unstable();
+        let mut by_layer = [[0_u64; HARMONIC_EXPERT_BITMAP_WORDS]; HARMONIC_LAYER_COUNT as usize];
+        for slot in &selected {
+            let word = slot.expert as usize / u64::BITS as usize;
+            by_layer[slot.layer as usize][word] |=
+                1_u64 << (slot.expert as usize % u64::BITS as usize);
+        }
+        let required_bytes = slot_bytes
+            .checked_mul(selected.len() as u64)
+            .ok_or(HarmonicResidencyError::RequiredBytesOverflow)?;
+        let identity = Self::fingerprint(slot_bytes, &by_layer);
+        Ok(Self {
+            slot_bytes,
+            budget_bytes,
+            required_bytes,
+            identity,
+            slots: selected,
+            by_layer,
+        })
+    }
+
+    fn fingerprint(
+        slot_bytes: u64,
+        by_layer: &[[u64; HARMONIC_EXPERT_BITMAP_WORDS]; HARMONIC_LAYER_COUNT as usize],
+    ) -> u64 {
+        let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+        for byte in HARMONIC_ROUTE_IDENTITY
+            .to_le_bytes()
+            .into_iter()
+            .chain(slot_bytes.to_le_bytes())
+            .chain(
+                by_layer
+                    .iter()
+                    .flatten()
+                    .flat_map(|word| word.to_le_bytes()),
+            )
+        {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        hash
+    }
+
+    pub fn contains(&self, layer: usize, expert: usize) -> bool {
+        if layer >= HARMONIC_LAYER_COUNT as usize || expert >= HARMONIC_EXPERT_COUNT as usize {
+            return false;
+        }
+        let word = expert / u64::BITS as usize;
+        self.by_layer[layer][word] & (1_u64 << (expert % u64::BITS as usize)) != 0
+    }
+
+    pub fn partition_route(
+        &self,
+        layer: usize,
+        expert_ids: [u32; HARMONIC_TOP_K],
+    ) -> [HarmonicExpertExecutionOwner; HARMONIC_TOP_K] {
+        expert_ids.map(|expert| {
+            if self.contains(layer, expert as usize) {
+                HarmonicExpertExecutionOwner::DenseGfx1100
+            } else {
+                HarmonicExpertExecutionOwner::ExpertGfx1151
+            }
+        })
+    }
+
+    pub fn slots(&self) -> &[HarmonicExpertSlot] {
+        &self.slots
+    }
+
+    pub const fn slot_bytes(&self) -> u64 {
+        self.slot_bytes
+    }
+
+    pub const fn budget_bytes(&self) -> u64 {
+        self.budget_bytes
+    }
+
+    pub const fn required_bytes(&self) -> u64 {
+        self.required_bytes
+    }
+
+    pub const fn identity(&self) -> u64 {
+        self.identity
     }
 }
 
@@ -914,6 +1112,66 @@ mod tests {
         assert!(HarmonicOwner::ExpertGfx1151
             .validate_arch("gfx1101")
             .is_err());
+    }
+
+    #[test]
+    fn residency_plan_is_capacity_bounded_canonical_and_route_typed() {
+        let ranked = [
+            HarmonicExpertSlot::checked(29, 70).unwrap(),
+            HarmonicExpertSlot::checked(5, 225).unwrap(),
+            HarmonicExpertSlot::checked(13, 23).unwrap(),
+            HarmonicExpertSlot::checked(32, 72).unwrap(),
+        ];
+        let plan = HarmonicExpertResidencyPlan::from_ranked(100, 250, ranked).unwrap();
+        assert_eq!(plan.required_bytes(), 200);
+        assert_eq!(plan.budget_bytes(), 250);
+        assert_eq!(
+            plan.slots(),
+            &[
+                HarmonicExpertSlot::checked(5, 225).unwrap(),
+                HarmonicExpertSlot::checked(29, 70).unwrap(),
+            ]
+        );
+        assert!(plan.contains(5, 225));
+        assert!(!plan.contains(13, 23));
+        assert_eq!(
+            plan.partition_route(5, [225, 23, 1, 2, 3, 4]),
+            [
+                HarmonicExpertExecutionOwner::DenseGfx1100,
+                HarmonicExpertExecutionOwner::ExpertGfx1151,
+                HarmonicExpertExecutionOwner::ExpertGfx1151,
+                HarmonicExpertExecutionOwner::ExpertGfx1151,
+                HarmonicExpertExecutionOwner::ExpertGfx1151,
+                HarmonicExpertExecutionOwner::ExpertGfx1151,
+            ]
+        );
+    }
+
+    #[test]
+    fn residency_identity_depends_on_the_selected_set_not_tie_order() {
+        let a = HarmonicExpertSlot::checked(2, 9).unwrap();
+        let b = HarmonicExpertSlot::checked(7, 11).unwrap();
+        let first = HarmonicExpertResidencyPlan::from_ranked(10, 20, [a, b]).unwrap();
+        let second = HarmonicExpertResidencyPlan::from_ranked(10, 20, [b, a]).unwrap();
+        assert_eq!(first.identity(), second.identity());
+        assert_eq!(first.slots(), second.slots());
+    }
+
+    #[test]
+    fn residency_plan_rejects_undersized_empty_and_duplicate_inputs() {
+        let slot = HarmonicExpertSlot::checked(0, 0).unwrap();
+        assert!(matches!(
+            HarmonicExpertResidencyPlan::from_ranked(10, 9, [slot]),
+            Err(HarmonicResidencyError::BudgetTooSmall { .. })
+        ));
+        assert!(matches!(
+            HarmonicExpertResidencyPlan::from_ranked(10, 10, []),
+            Err(HarmonicResidencyError::EmptyRanking)
+        ));
+        assert!(matches!(
+            HarmonicExpertResidencyPlan::from_ranked(10, 20, [slot, slot]),
+            Err(HarmonicResidencyError::DuplicateSlot(duplicate)) if duplicate == slot
+        ));
     }
 
     #[test]

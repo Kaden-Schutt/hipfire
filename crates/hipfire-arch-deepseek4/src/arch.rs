@@ -21,7 +21,7 @@ use crate::deepseek4::{
     DeepseekV4LayerWeights, DeepseekV4RoutedWeights, DeepseekV4State, DeepseekV4Weights,
     DsparkConfig, DsparkWeights,
 };
-use crate::harmonic::HarmonicOwner;
+use crate::harmonic::{HarmonicExpertResidencyPlan, HarmonicOwner, HARMONIC_LAYER_COUNT};
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct DeepseekV4HeterogeneousProjection {
@@ -34,6 +34,19 @@ pub struct DeepseekV4HeterogeneousProjection {
     pub routed_bytes: usize,
     pub pointer_table_bytes: usize,
     pub host_only_record_count: usize,
+}
+
+/// CPU-only proof that a harmonic gfx1100 expert-residency plan names exact
+/// MQ2-Lloyd payloads from the frozen artifact and fits its declared budget.
+/// This receipt performs no allocation and does not enable hybrid execution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeepseekV4HarmonicResidencyProjection {
+    pub plan_identity: u64,
+    pub slot_count: usize,
+    pub exact_bytes: u64,
+    pub budget_bytes: u64,
+    pub headroom_bytes: u64,
+    pub layer_slot_counts: [u16; HARMONIC_LAYER_COUNT as usize],
 }
 
 /// Deterministic G2 failure points used to certify transactional cleanup.
@@ -1554,6 +1567,88 @@ impl DeepseekV4 {
     ) -> Result<DeepseekV4DenseWeights, String> {
         Self::validate_harmonic_worker_role(cfg, gpu, HarmonicOwner::DenseGfx1100)?;
         Self::load_weights_inner(hfq, cfg, gpu, None, None, None, true)?.into_dense()
+    }
+
+    /// Validate a proposed exact-expert replica set against the loaded frozen
+    /// artifact without allocating VRAM or changing dispatch. The full routed
+    /// payload remains resident on gfx1151; this only proves which byte-identical
+    /// slots may later be additionally loaded on gfx1100.
+    pub fn project_harmonic_hot_experts_gfx1100(
+        hfq: &HfqFile,
+        cfg: &DeepseekV4Config,
+        gpu: &Gpu,
+        plan: &HarmonicExpertResidencyPlan,
+    ) -> Result<DeepseekV4HarmonicResidencyProjection, String> {
+        Self::validate_harmonic_worker_role(cfg, gpu, HarmonicOwner::DenseGfx1100)?;
+        Self::validate_mq2r_tensor_policy(hfq, cfg)?;
+
+        let mut exact_bytes = 0_u64;
+        let mut layer_slot_counts = [0_u16; HARMONIC_LAYER_COUNT as usize];
+        for slot in plan.slots() {
+            let mut slot_bytes = 0_u64;
+            for projection in ["w1", "w2", "w3"] {
+                let name = format!(
+                    "layers.{}.ffn.experts.{}.{projection}.weight",
+                    slot.layer, slot.expert
+                );
+                let info = hfq
+                    .find_tensor_info(&name)
+                    .ok_or_else(|| format!("deepseek4 harmonic residency missing {name}"))?;
+                if info.quant_type != 19 {
+                    return Err(format!(
+                        "deepseek4 harmonic residency {name} has quant_type {}, expected frozen MQ2G256Lloyd qt=19",
+                        info.quant_type
+                    ));
+                }
+                slot_bytes = slot_bytes
+                    .checked_add(info.data_size as u64)
+                    .ok_or_else(|| {
+                        format!("deepseek4 harmonic residency byte overflow at {name}")
+                    })?;
+            }
+            if slot_bytes != plan.slot_bytes() {
+                return Err(format!(
+                    "deepseek4 harmonic residency layer {} expert {} is {slot_bytes} bytes, plan requires {}",
+                    slot.layer,
+                    slot.expert,
+                    plan.slot_bytes()
+                ));
+            }
+            exact_bytes = exact_bytes
+                .checked_add(slot_bytes)
+                .ok_or_else(|| "deepseek4 harmonic residency total byte overflow".to_owned())?;
+            layer_slot_counts[slot.layer as usize] = layer_slot_counts[slot.layer as usize]
+                .checked_add(1)
+                .ok_or_else(|| {
+                    format!(
+                        "deepseek4 harmonic residency layer {} slot-count overflow",
+                        slot.layer
+                    )
+                })?;
+        }
+        if exact_bytes != plan.required_bytes() {
+            return Err(format!(
+                "deepseek4 harmonic residency exact bytes {exact_bytes} != planned {}",
+                plan.required_bytes()
+            ));
+        }
+        let headroom_bytes = plan
+            .budget_bytes()
+            .checked_sub(exact_bytes)
+            .ok_or_else(|| {
+                format!(
+                    "deepseek4 harmonic residency exceeds budget: {exact_bytes} > {}",
+                    plan.budget_bytes()
+                )
+            })?;
+        Ok(DeepseekV4HarmonicResidencyProjection {
+            plan_identity: plan.identity(),
+            slot_count: plan.slots().len(),
+            exact_bytes,
+            budget_bytes: plan.budget_bytes(),
+            headroom_bytes,
+            layer_slot_counts,
+        })
     }
 
     /// Load only the packed routed experts into an independently owned
