@@ -6877,6 +6877,7 @@ fn heterogeneous_run_selected(
         swiglu_limit: cfg.swiglu_limit,
         uses_atomic_moe_down: weights.mq2r_backend.uses_atomic_moe_down(),
         native_mq2_backend: weights.mq2r_backend.bias_aware_native_backend(),
+        nonowned_gate_up_dummy: layer.expert_gate_up_dummy.as_ref(),
         batch_size: 1,
         x_rot,
         ffn_out: routed_partial,
@@ -7115,6 +7116,7 @@ fn ffn_routed(
             swiglu_limit: cfg.swiglu_limit,
             uses_atomic_moe_down: weights.mq2r_backend.uses_atomic_moe_down(),
             native_mq2_backend: weights.mq2r_backend.bias_aware_native_backend(),
+            nonowned_gate_up_dummy: layer.expert_gate_up_dummy.as_ref(),
             batch_size: 1,
             x_rot: ffn_x_rot,
             ffn_out: out_target,
@@ -7320,6 +7322,7 @@ fn ffn_hash_routed(
             .gate_up(
                 gpu,
                 gate_up_ptrs,
+                layer.expert_gate_up_dummy.as_ref(),
                 topk_idx_dev,
                 ffn_x_rot,
                 gate_batch,

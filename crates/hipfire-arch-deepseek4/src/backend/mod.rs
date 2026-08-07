@@ -8,11 +8,13 @@
 //! GPU context. This prevents a model swap or a Qwen load from inheriting DS4
 //! architecture policy.
 
+mod gfx1201;
 mod gfx942;
 
 use hipfire_dispatch::families::moe::MoeBiasAwareMq2Backend;
 use rdna_compute::{Gpu, GpuTensor};
 
+use gfx1201::Gfx1201Backend;
 use gfx942::Gfx942Backend;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -20,6 +22,7 @@ pub(crate) enum Mq2rBackend {
     #[default]
     Portable,
     Gfx1151,
+    Gfx1201(Gfx1201Backend),
     Gfx942(Gfx942Backend),
 }
 
@@ -30,6 +33,8 @@ impl Mq2rBackend {
     pub(crate) fn for_verified_mq2r(gpu: &mut Gpu) -> Self {
         if gpu.arch_caps.is_gfx1151() {
             Self::Gfx1151
+        } else if let Some(gfx1201) = Gfx1201Backend::try_new(gpu) {
+            Self::Gfx1201(gfx1201)
         } else if let Some(gfx942) = Gfx942Backend::try_new(gpu) {
             Self::Gfx942(gfx942)
         } else {
@@ -57,6 +62,7 @@ impl Mq2rBackend {
     /// the shared MoE executor.
     pub(crate) fn bias_aware_native_backend(&self) -> Option<&dyn MoeBiasAwareMq2Backend> {
         match self {
+            Self::Gfx1201(backend) => Some(backend),
             Self::Gfx942(backend) => Some(backend),
             Self::Portable | Self::Gfx1151 => None,
         }
@@ -74,7 +80,7 @@ impl Mq2rBackend {
     ) -> Result<(), String> {
         match self {
             Self::Gfx942(backend) => backend.grouped_olora_e8(gpu, a, x, y, groups, m, k),
-            Self::Portable | Self::Gfx1151 => {
+            Self::Portable | Self::Gfx1151 | Self::Gfx1201(_) => {
                 Err("deepseek4: gfx942 grouped O-LoRA requested by a non-gfx942 backend".to_owned())
             }
         }
@@ -110,7 +116,7 @@ impl Mq2rBackend {
                 )?;
                 Ok(true)
             }
-            Self::Portable | Self::Gfx1151 => Ok(false),
+            Self::Portable | Self::Gfx1151 | Self::Gfx1201(_) => Ok(false),
         }
     }
 }

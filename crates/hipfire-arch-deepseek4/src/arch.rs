@@ -1661,6 +1661,10 @@ impl DeepseekV4 {
                     "deepseek4: {sku} P3 tensor recipe verified; selected \
                      gfx1151 backend ({dense}; routed experts qt=19)"
                 ),
+                Mq2rBackend::Gfx1201(_) => eprintln!(
+                    "deepseek4: {sku} P3 tensor recipe verified; selected exact \
+                     gfx1201 backend ({dense}; routed experts qt=19)"
+                ),
                 Mq2rBackend::Gfx942(_) => eprintln!(
                     "deepseek4: {sku} P3 tensor recipe verified; selected exact \
                      gfx942 backend ({dense}; routed experts qt=19)"

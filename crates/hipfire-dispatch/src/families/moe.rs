@@ -372,6 +372,7 @@ pub trait MoeBiasAwareMq2Backend {
         &self,
         gpu: &mut Gpu,
         expert_ptrs: &GpuTensor,
+        nonowned_gate_up_dummy: Option<&GpuTensor>,
         topk_indices: &GpuTensor,
         x_rot: &GpuTensor,
         y_gate: &GpuTensor,
@@ -395,6 +396,8 @@ pub trait MoeBiasAwareMq2Backend {
         &self,
         gpu: &mut Gpu,
         expert_ptrs: &GpuTensor,
+        ownership_ptrs: &GpuTensor,
+        nonowned_gate_up_dummy: Option<&GpuTensor>,
         topk_indices: &GpuTensor,
         rot_batch: &GpuTensor,
         expert_outputs: &GpuTensor,
@@ -445,6 +448,10 @@ pub struct MoeBiasAwareParams<'a> {
     /// model. `None` retains the portable dispatcher for every other model and
     /// architecture.
     pub native_mq2_backend: Option<&'a dyn MoeBiasAwareMq2Backend>,
+    /// EP-shard-only zero weight buffer. Exact-device backends may compare
+    /// selected gate/up pointers against it to skip non-owned expert work
+    /// while retaining the fixed graph shape. `None` on unsharded models.
+    pub nonowned_gate_up_dummy: Option<&'a GpuTensor>,
     /// Token-batch width. Decode = 1. A value > 1 must route to the grouped
     /// prefill executor (Step 8), never this decode arm — guarded in the executor.
     pub batch_size: usize,
@@ -483,6 +490,7 @@ impl<'a> MoeBiasAwareParams<'a> {
             swiglu_limit: self.swiglu_limit,
             uses_atomic_moe_down: self.uses_atomic_moe_down,
             native_mq2_backend: self.native_mq2_backend,
+            nonowned_gate_up_dummy: self.nonowned_gate_up_dummy,
             batch_size: self.batch_size,
             x_rot: self.x_rot,
             ffn_out: self.ffn_out,
@@ -509,6 +517,7 @@ pub struct MoeSelectedParams<'a> {
     pub swiglu_limit: f32,
     pub uses_atomic_moe_down: bool,
     pub native_mq2_backend: Option<&'a dyn MoeBiasAwareMq2Backend>,
+    pub nonowned_gate_up_dummy: Option<&'a GpuTensor>,
     pub batch_size: usize,
     pub x_rot: &'a GpuTensor,
     pub ffn_out: &'a GpuTensor,

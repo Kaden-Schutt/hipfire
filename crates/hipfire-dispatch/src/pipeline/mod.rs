@@ -1356,6 +1356,7 @@ pub fn run_moe_decode_selected(
         hip!(native.gate_up(
             gpu,
             p.expert_gate_up_ptrs,
+            p.nonowned_gate_up_dummy,
             p.topk_indices,
             p.x_rot,
             p.gate_batch,
@@ -1404,6 +1405,8 @@ pub fn run_moe_decode_selected(
             hip!(native.down_expanded(
                 gpu,
                 p.expert_down_ptrs,
+                p.expert_gate_up_ptrs,
+                p.nonowned_gate_up_dummy,
                 p.topk_indices,
                 p.rot_batch,
                 p.down_expanded,
