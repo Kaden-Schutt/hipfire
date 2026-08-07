@@ -9800,11 +9800,20 @@ impl Gpu {
             idx_head_dim, 128,
             "indexer_relu_score_wmma: requires idx_head_dim=128 (got {idx_head_dim})"
         );
-        self.ensure_kernel(
-            "indexer_relu_score_wmma_batched",
-            kernels::INDEXER_RELU_SCORE_WMMA_BATCHED_SRC,
-            "indexer_relu_score_wmma_batched_f32",
-        )?;
+        let (kernel_name, kernel_src, symbol) = if self.arch_caps.has_wmma_w32_gfx12() {
+            (
+                "indexer_relu_score_wmma_batched_gfx12",
+                kernels::INDEXER_RELU_SCORE_WMMA_BATCHED_GFX12_SRC,
+                "indexer_relu_score_wmma_batched_f32_gfx12",
+            )
+        } else {
+            (
+                "indexer_relu_score_wmma_batched",
+                kernels::INDEXER_RELU_SCORE_WMMA_BATCHED_SRC,
+                "indexer_relu_score_wmma_batched_f32",
+            )
+        };
+        self.ensure_kernel(kernel_name, kernel_src, symbol)?;
         let qp = q.buf.as_ptr();
         let kp = k_cache.buf.as_ptr();
         let wp = weights.buf.as_ptr();
@@ -9827,7 +9836,7 @@ impl Gpu {
         ];
         let grid_n = (n_max as u32 + 15) / 16;
         self.launch_maybe_blob(
-            "indexer_relu_score_wmma_batched_f32",
+            symbol,
             [batch_size as u32, grid_n, 1],
             [128, 1, 1],
             0,

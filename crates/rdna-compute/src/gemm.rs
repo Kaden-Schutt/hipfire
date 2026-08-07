@@ -22848,8 +22848,17 @@ impl Gpu {
             0,
             "gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2: K must be a multiple of 256 (got {k})"
         );
-        let kernel_name = "gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2";
-        let kernel_src = kernels::GEMM_MQ2G256_LLOYD_MOE_GROUPED_WMMA_4W_K2_SRC;
+        let (kernel_name, kernel_src) = if self.arch_caps.has_wmma_w32_gfx12() {
+            (
+                "gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_gfx12",
+                kernels::GEMM_MQ2G256_LLOYD_MOE_GROUPED_WMMA_4W_K2_GFX12_SRC,
+            )
+        } else {
+            (
+                "gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2",
+                kernels::GEMM_MQ2G256_LLOYD_MOE_GROUPED_WMMA_4W_K2_SRC,
+            )
+        };
         self.ensure_kernel(kernel_name, kernel_src, kernel_name)?;
         let x_f16_ptr = self.ensure_fp16_x(x_src, x_src_rows * k)?;
 

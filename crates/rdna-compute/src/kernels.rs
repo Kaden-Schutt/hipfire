@@ -5192,6 +5192,8 @@ pub const GEMM_MQ2G256_LLOYD_MOE_GROUPED_WMMA_K2_SRC: &str =
 /// dim stays at 16 due to expert-spanning constraint.
 pub const GEMM_MQ2G256_LLOYD_MOE_GROUPED_WMMA_4W_K2_SRC: &str =
     include_str!("../../../kernels/src/gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2.hip");
+pub const GEMM_MQ2G256_LLOYD_MOE_GROUPED_WMMA_4W_K2_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2.gfx12.hip");
 
 /// Native gfx942 wave64 MFMA grouped-GEMM for DeepSeek4 MQ2-Lloyd prefill.
 /// Chip-strict dispatch keeps CDNA operand/layout semantics out of RDNA paths.
@@ -5502,6 +5504,8 @@ pub const INDEXER_RELU_SCORE_BATCHED_SRC: &str =
 /// 64-head reduction in LDS.
 pub const INDEXER_RELU_SCORE_WMMA_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/indexer_relu_score_wmma_batched.hip");
+pub const INDEXER_RELU_SCORE_WMMA_BATCHED_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/indexer_relu_score_wmma_batched.gfx12.hip");
 
 /// gfx1151 DeepSeek V4 indexer score with one cooperative LDS-staged K tile
 /// shared by the four WMMA warps in each block.

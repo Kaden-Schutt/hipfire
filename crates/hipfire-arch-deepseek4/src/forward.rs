@@ -11781,14 +11781,13 @@ fn attention_block_batched_mixed(
                 .indexer_kv_cache
                 .as_ref()
                 .ok_or_else(|| "indexer_kv_cache missing".to_string())?;
-            // WMMA fast path: the current kernel uses the gfx11 half16
-            // fragment ABI and builtin, so keep it on RDNA3 until a native
-            // gfx12 half8 lowering is available. 8-9% of prefill
+            // WMMA fast path: gfx11 and gfx12 use separate fragment ABIs and
+            // accumulator layouts selected by the dispatch wrapper. 8-9% of prefill
             // PMC vs the F32 scalar baseline — Phase C1 of the prefill
             // catch-up plan. Opt out via HIPFIRE_DEEPSEEK4_INDEXER_WMMA=0.
             let use_indexer_wmma = h_idx == 64
                 && d_idx == 128
-                && gpu.arch.starts_with("gfx11")
+                && (gpu.arch.starts_with("gfx11") || gpu.arch.starts_with("gfx12"))
                 && hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_INDEXER_WMMA")
                     .map(|s| s != "0")
                     .unwrap_or(true);
