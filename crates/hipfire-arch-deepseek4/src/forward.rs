@@ -8033,7 +8033,7 @@ fn attn_stub(
             // we pass gathered_k as V too). n_valid_swa + n_active_topk
             // come from the device-side attn_state_buf.
             gpu.deepseek4_attn_swa_topk_f32_buf(
-                weights.mq2r_backend.is_gfx1151(),
+                weights.mq2r_backend.is_gfx1151() || weights.mq2r_backend.is_gfx1201(),
                 q,
                 swa_k,
                 swa_v,
