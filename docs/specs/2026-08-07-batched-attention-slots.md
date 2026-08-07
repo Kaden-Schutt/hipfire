@@ -293,11 +293,21 @@ ignore embedding-table gathers and assume ~0.55 B/param at mq4.
 
 Two structural facts drive this:
 
-- **Attention KV reads never amortise across slots.** Unlike weights, they scale
-  linearly with batch. The longer the agents' contexts, the less batching buys.
-  This is why asym3 matters for throughput and not only for capacity: at 0.6875×
-  the KV bytes it shrinks the one term that batching cannot help with. The table
-  above is the Q8_0 case; asym3 raises both aggregate speedups.
+- **Attention KV reads never amortise across slots — in bytes.** The bytes scale
+  linearly with batch. This is why asym3 matters for throughput and not only for
+  capacity: at 0.6875× the KV bytes it shrinks the term batching cannot remove.
+  The table above is the Q8_0 case; asym3 raises both aggregate speedups.
+
+  **CORRECTION from Task 1, measured 2026-08-07.** True in bytes, **false in
+  time** — the original framing here was pessimistic. The batch-1 attention
+  kernel sustains only **~20-24%** (35B shape) and **~28-34%** (27B shape) of
+  the 256 GB/s bus, and the figure is *flat* across a 16× context range, so it
+  is a sustained efficiency ceiling rather than launch overhead. Four slots must
+  read 4× the KV bytes but need not spend 4× the time: there is 3-5× of
+  headroom, and batching supplies exactly what closes it — more independent
+  requests in flight. The question is therefore **how much of that headroom
+  batching recovers**, which §10's batched-vs-sequential sweep measures
+  directly. See `docs/perf-checkpoints/2026-08-07-batching-ceiling-probe.md`.
 - **MoE expert reads barely amortise at small batch.** Four sequences drawing
   top-8 of 256 experts collide rarely, so expert traffic scales ~4×. Only the
   dense half of the 35B amortises.
