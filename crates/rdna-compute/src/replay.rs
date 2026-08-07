@@ -3486,11 +3486,19 @@ impl ReplayController {
                 };
             }
         }
-        for index in 1..headers.len() {
-            let previous = self.recorded[index - 1].kernel.as_str();
-            let current = self.recorded[index].kernel.as_str();
-            if independent_sibling(previous, current) {
-                headers[index] = HeaderPolicy::BATCH_BOUNDARY_INTERNAL_INDEPENDENT;
+        // A host-gated graph is a continuation program, not an ordinary
+        // fire-and-forget batch. Keep its owner queue stream-ordered until the
+        // full token route has an exact shadow proof; the name-only sibling
+        // exemption has no resource ranges with which to prove safety across
+        // a continuation cut. Ordinary linear AQL retains the established
+        // independent-sibling policy unchanged.
+        if host_gates.is_empty() {
+            for index in 1..headers.len() {
+                let previous = self.recorded[index - 1].kernel.as_str();
+                let current = self.recorded[index].kernel.as_str();
+                if independent_sibling(previous, current) {
+                    headers[index] = HeaderPolicy::BATCH_BOUNDARY_INTERNAL_INDEPENDENT;
+                }
             }
         }
         // HC ping-pong publishes the next residual allocation from
