@@ -74,7 +74,7 @@ impl DeepseekV4VerifiedArtifact {
         })
     }
 
-    fn validate(&self, path: &Path) -> Result<String, String> {
+    pub(crate) fn validate(&self, path: &Path) -> Result<String, String> {
         let canonical = path
             .canonicalize()
             .map_err(|error| format!("deepseek4 canonicalize {}: {error}", path.display()))?;
@@ -123,7 +123,7 @@ impl Default for DeepseekV4HeterogeneousLoadPlan {
 }
 
 impl DeepseekV4HeterogeneousLoadPlan {
-    fn resolve_device_ids(&self) -> Result<(i32, i32), String> {
+    pub(crate) fn resolve_device_ids(&self) -> Result<(i32, i32), String> {
         let Deepseek4ComputePlacement::DenseExpertSplit { dense, experts } = &self.placement else {
             return Err(
                 "deepseek4 heterogeneous load requires dense-expert-split placement".into(),

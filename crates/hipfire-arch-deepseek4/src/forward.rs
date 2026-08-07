@@ -25,6 +25,15 @@
 
 use crate::backend::Mq2rBackend;
 use crate::deepseek4::{DeepseekV4HeterogeneousWeights, DeepseekV4RoutedWeights};
+#[cfg(feature = "harmonic-worker")]
+use crate::harmonic::{
+    HarmonicProtocolError, HarmonicSlotState, HARMONIC_RESULT_EXTENT, HARMONIC_TOP_K,
+    HARMONIC_X_ROT_BYTES,
+};
+#[cfg(feature = "harmonic-worker")]
+use crate::harmonic_ipc::{harmonic_monotonic_tick, HarmonicIpcError};
+#[cfg(feature = "harmonic-worker")]
+use crate::harmonic_model::DeepseekV4HarmonicExecution;
 use crate::heterogeneous::DeepseekV4HeterogeneousExecution;
 use crate::{DeepseekV4Config, DeepseekV4State, DeepseekV4Weights};
 use hipfire_dispatch::context::DispatchCtx;
@@ -3546,6 +3555,63 @@ pub(crate) fn decode_step_heterogeneous(
         .map_err(|error| format!("download heterogeneous logits: {error:?}"))
 }
 
+/// One fault-contained harmonic AR step. The current process owns exact-gfx1100
+/// dense/shared work and canonical state; a persistent exact-gfx1151 process
+/// consumes the mapped route epochs and returns only the routed F32 partial.
+#[cfg(feature = "harmonic-worker")]
+pub(crate) fn decode_step_harmonic(
+    cfg: &DeepseekV4Config,
+    weights: &DeepseekV4Weights,
+    state: &mut DeepseekV4State,
+    gpu: &mut Gpu,
+    execution: &mut DeepseekV4HarmonicExecution,
+    token_id: u32,
+    position: u32,
+) -> Result<Vec<f32>, String> {
+    if !gpu.arch.eq_ignore_ascii_case("gfx1100") {
+        return Err(format!(
+            "deepseek4 harmonic dense owner requires gfx1100, got {}",
+            gpu.arch
+        ));
+    }
+    if gpu.replay.is_enabled() || gpu.graphs.capture_mode {
+        return Err("deepseek4 harmonic H5 composition admits direct HIP only".to_owned());
+    }
+    if !config_cache::moe_on() {
+        return Err("deepseek4 harmonic route requires routed MoE enabled".to_owned());
+    }
+
+    ensure_compressor_capacity(cfg, state, gpu, (position as usize).saturating_add(1))?;
+    precompute_positions(cfg, state, gpu, position)?;
+    precompute_token_id(state, gpu, token_id)?;
+    init_residual_streams(cfg, weights, state, gpu, token_id)?;
+    ensure_ffn_split_resource(cfg, state, gpu)?;
+
+    for layer_idx in 0..cfg.num_hidden_layers {
+        ds4_attn_block_harmonic(cfg, weights, state, gpu, execution, layer_idx, position)?;
+        mhc_pre(cfg, weights, state, gpu, layer_idx, /*is_attn=*/ false)?;
+        ffn_prepare(cfg, weights, state, gpu, layer_idx)?;
+        heterogeneous_select_routes(cfg, weights, state, gpu, layer_idx, token_id)?;
+
+        let epoch = execution.next_epoch()?;
+        harmonic_stage_route_payload(cfg, state, gpu, execution, epoch, layer_idx)?;
+
+        // The side transfer stream is now waiting on route-ready. Queue the
+        // independent shared branch immediately on the primary gfx1100 stream.
+        ffn_shared_project(cfg, weights, state, gpu, layer_idx)?;
+
+        harmonic_publish_staged_route(gpu, execution, epoch, layer_idx)?;
+        harmonic_join_result(state, gpu, execution, epoch, layer_idx)?;
+        hc_ffn_mix(cfg, weights, state, gpu, layer_idx)?;
+        dump_residual_layer_norm(gpu, state, layer_idx, position);
+    }
+
+    final_norm_and_head(cfg, weights, state, gpu)?;
+    state.n_tokens += 1;
+    gpu.download_f32(state.logits.as_ref().unwrap())
+        .map_err(|error| format!("download harmonic logits: {error:?}"))
+}
+
 /// HIP-graphs-aware decode_step. Opt-in via `HIPFIRE_DEEPSEEK4_GRAPH=1`.
 ///
 /// Three-state machine driven by `state.ar_forward_warmed_up` and
@@ -4468,6 +4534,120 @@ fn ds4_attn_block_heterogeneous(
         gpu.hip.stream_wait_event(primary, join).map_err(|error| {
             format!("heterogeneous attention primary wait l{layer_idx}: {error:?}")
         })?;
+    }
+
+    apply_tail_rope(cfg, weights, state, gpu, position, layer_idx)?;
+    if layer.compress_ratio == 4 {
+        let n = indexer_forward(cfg, weights, state, gpu, layer_idx, position)?;
+        dump_indexer_state(gpu, state, layer_idx, position, n);
+    }
+    attn_stub(
+        cfg,
+        weights,
+        state,
+        gpu,
+        layer_idx,
+        OloraSchedule::HeterogeneousGfx1100,
+    )?;
+    hc_attn_mix(cfg, weights, state, gpu, layer_idx)
+}
+
+/// Same accepted gfx1100 Q/KV+compressor overlap schedule as the historical
+/// split route, owned by the fault-contained harmonic parent process.
+#[cfg(feature = "harmonic-worker")]
+fn ds4_attn_block_harmonic(
+    cfg: &DeepseekV4Config,
+    weights: &DeepseekV4Weights,
+    state: &mut DeepseekV4State,
+    gpu: &mut Gpu,
+    execution: &mut DeepseekV4HarmonicExecution,
+    layer_idx: usize,
+    position: u32,
+) -> Result<(), String> {
+    let layer = weights.resolve_layer(layer_idx);
+    mhc_pre(cfg, weights, state, gpu, layer_idx, /*is_attn=*/ true)?;
+    q_lora_prepare(cfg, weights, state, gpu, layer_idx)?;
+
+    {
+        let primary = gpu
+            .active_stream
+            .as_ref()
+            .ok_or_else(|| "harmonic dense primary stream missing".to_owned())?;
+        let fork = execution
+            .dense_attn_fork_event
+            .as_ref()
+            .ok_or_else(|| "harmonic dense attention fork missing".to_owned())?;
+        gpu.hip
+            .event_record(fork, Some(primary))
+            .map_err(|error| format!("harmonic attention fork l{layer_idx}: {error:?}"))?;
+        let side = execution
+            .dense_attn_stream
+            .as_ref()
+            .ok_or_else(|| "harmonic dense attention stream missing".to_owned())?;
+        gpu.hip
+            .stream_wait_event(side, fork)
+            .map_err(|error| format!("harmonic attention side wait l{layer_idx}: {error:?}"))?;
+    }
+
+    std::mem::swap(&mut gpu.active_stream, &mut execution.dense_attn_stream);
+    let side_result = (|| {
+        kv_joint(cfg, weights, state, gpu, layer_idx)?;
+        if layer.compress_ratio > 0 {
+            let tmp_view = {
+                let tmp = state.tmp.as_ref().unwrap();
+                tmp.sub_offset(0, tmp.numel())
+            };
+            compressor_forward(
+                cfg,
+                weights,
+                state,
+                gpu,
+                layer_idx,
+                &tmp_view,
+                position,
+                /*is_indexer=*/ false,
+            )?;
+            if layer.compress_ratio == 4 {
+                compressor_forward(
+                    cfg,
+                    weights,
+                    state,
+                    gpu,
+                    layer_idx,
+                    &tmp_view,
+                    position,
+                    /*is_indexer=*/ true,
+                )?;
+            }
+        }
+        let side = gpu
+            .active_stream
+            .as_ref()
+            .ok_or_else(|| "harmonic dense attention side stream missing".to_owned())?;
+        let join = execution
+            .dense_attn_join_event
+            .as_ref()
+            .ok_or_else(|| "harmonic dense attention join missing".to_owned())?;
+        gpu.hip
+            .event_record(join, Some(side))
+            .map_err(|error| format!("harmonic attention join l{layer_idx}: {error:?}"))
+    })();
+    std::mem::swap(&mut gpu.active_stream, &mut execution.dense_attn_stream);
+    side_result?;
+
+    q_lora_project(cfg, weights, state, gpu, layer_idx)?;
+    {
+        let primary = gpu
+            .active_stream
+            .as_ref()
+            .ok_or_else(|| "harmonic dense primary missing after Q-LoRA".to_owned())?;
+        let join = execution
+            .dense_attn_join_event
+            .as_ref()
+            .ok_or_else(|| "harmonic dense attention join missing".to_owned())?;
+        gpu.hip
+            .stream_wait_event(primary, join)
+            .map_err(|error| format!("harmonic attention primary wait l{layer_idx}: {error:?}"))?;
     }
 
     apply_tail_rope(cfg, weights, state, gpu, position, layer_idx)?;
@@ -6325,6 +6505,242 @@ fn heterogeneous_select_routes(
         .map_err(|error| format!("heterogeneous bias-aware route l{layer_idx}: {error:?}"))?;
     }
     dump_moe_route_if_enabled(gpu, layer_idx, topk_indices, topk_weights)
+}
+
+#[cfg(feature = "harmonic-worker")]
+fn harmonic_stage_route_payload(
+    cfg: &DeepseekV4Config,
+    state: &DeepseekV4State,
+    gpu: &mut Gpu,
+    execution: &mut DeepseekV4HarmonicExecution,
+    epoch: u64,
+    layer_idx: usize,
+) -> Result<(), String> {
+    if cfg.num_experts_per_tok != HARMONIC_TOP_K {
+        return Err(format!(
+            "harmonic route requires top-k {HARMONIC_TOP_K}, got {}",
+            cfg.num_experts_per_tok
+        ));
+    }
+    gpu.bind_thread()
+        .map_err(|error| format!("harmonic stage bind dense l{layer_idx}: {error}"))?;
+    let primary = gpu
+        .active_stream
+        .as_ref()
+        .ok_or_else(|| "harmonic stage primary stream missing".to_owned())?;
+    let route_ready = execution
+        .route_ready_event
+        .as_ref()
+        .ok_or_else(|| "harmonic route-ready event missing".to_owned())?;
+    gpu.hip
+        .event_record(route_ready, Some(primary))
+        .map_err(|error| format!("harmonic route-ready record l{layer_idx}: {error}"))?;
+    let transfer = execution
+        .transfer_stream
+        .as_ref()
+        .ok_or_else(|| "harmonic transfer stream missing".to_owned())?;
+    gpu.hip
+        .stream_wait_event(transfer, route_ready)
+        .map_err(|error| format!("harmonic transfer route wait l{layer_idx}: {error}"))?;
+
+    let x_rot = state
+        .ffn_x_rot
+        .as_ref()
+        .ok_or_else(|| "harmonic x_rot missing".to_owned())?;
+    let topk_indices = state
+        .moe_topk_indices
+        .as_ref()
+        .ok_or_else(|| "harmonic route indices missing".to_owned())?;
+    let topk_weights = state
+        .moe_topk_weights
+        .as_ref()
+        .ok_or_else(|| "harmonic route weights missing".to_owned())?;
+    let activation = execution
+        .mapping
+        .as_ref()
+        .ok_or_else(|| "harmonic gfx1100 mapping unavailable".to_owned())?
+        .activation_buffer(epoch);
+    gpu.hip
+        .memcpy_dtod_async_at(
+            &activation,
+            0,
+            &x_rot.buf,
+            0,
+            HARMONIC_X_ROT_BYTES,
+            transfer,
+        )
+        .map_err(|error| format!("harmonic stage x_rot l{layer_idx}: {error}"))?;
+    let ids_bytes = unsafe {
+        std::slice::from_raw_parts_mut(
+            execution.route_ids.as_mut_ptr().cast::<u8>(),
+            HARMONIC_TOP_K * std::mem::size_of::<u32>(),
+        )
+    };
+    gpu.hip
+        .memcpy_dtoh_async(ids_bytes, &topk_indices.buf, transfer)
+        .map_err(|error| format!("harmonic stage route ids l{layer_idx}: {error}"))?;
+    let weights_bytes = unsafe {
+        std::slice::from_raw_parts_mut(
+            execution.route_weight_bits.as_mut_ptr().cast::<u8>(),
+            HARMONIC_TOP_K * std::mem::size_of::<u32>(),
+        )
+    };
+    gpu.hip
+        .memcpy_dtoh_async(weights_bytes, &topk_weights.buf, transfer)
+        .map_err(|error| format!("harmonic stage route weights l{layer_idx}: {error}"))
+}
+
+#[cfg(feature = "harmonic-worker")]
+fn harmonic_publish_staged_route(
+    gpu: &mut Gpu,
+    execution: &mut DeepseekV4HarmonicExecution,
+    epoch: u64,
+    layer_idx: usize,
+) -> Result<(), String> {
+    let transfer = execution
+        .transfer_stream
+        .as_ref()
+        .ok_or_else(|| "harmonic transfer stream missing at publish".to_owned())?;
+    // This synchronization is source-local. While it waits for the 16 KiB +
+    // 48-byte route transfer, gfx1100's primary stream is already evaluating
+    // the shared branch. No GPU queue waits on progress owned by the peer.
+    // The transfer micro is sub-12 us on both product devices.
+    gpu.bind_thread()
+        .map_err(|error| format!("harmonic publish bind dense l{layer_idx}: {error}"))?;
+    gpu.hip
+        .stream_synchronize(transfer)
+        .map_err(|error| format!("harmonic route transfer completion l{layer_idx}: {error}"))?;
+    execution
+        .ring
+        .write_mapped_activation_metadata(
+            epoch,
+            execution.route_ids,
+            execution.route_weight_bits,
+        )
+        .map_err(|error| format!("harmonic route mirror l{layer_idx}: {error}"))?;
+    let now = harmonic_monotonic_tick()
+        .map_err(|error| format!("harmonic route clock l{layer_idx}: {error}"))?;
+    let deadline = now.saturating_add(
+        execution
+            .layer_timeout
+            .as_nanos()
+            .min(u64::MAX as u128) as u64,
+    );
+    let packet = execution.contract.packet(
+        epoch,
+        layer_idx as u16,
+        execution.route_ids,
+        execution.route_weight_bits,
+        deadline,
+        0,
+    );
+    execution
+        .ring
+        .publish_mapped(packet, execution.source_generation, now)
+        .map_err(|error| format!("harmonic publish l{layer_idx}: {error}"))
+}
+
+#[cfg(feature = "harmonic-worker")]
+fn harmonic_join_result(
+    state: &DeepseekV4State,
+    gpu: &mut Gpu,
+    execution: &mut DeepseekV4HarmonicExecution,
+    epoch: u64,
+    layer_idx: usize,
+) -> Result<(), String> {
+    let deadline = harmonic_monotonic_tick()
+        .map_err(|error| format!("harmonic join clock l{layer_idx}: {error}"))?
+        .saturating_add(
+            execution
+                .layer_timeout
+                .as_nanos()
+                .min(u64::MAX as u128) as u64,
+        );
+    let mut polls = 0_u32;
+    let resolved = loop {
+        match execution
+            .ring
+            .source_resolve_mapped(epoch, execution.source_generation)
+        {
+            Ok(resolved) => break resolved,
+            Err(HarmonicIpcError::Protocol(HarmonicProtocolError::SlotNotTerminal {
+                ..
+            })) => {}
+            Err(error) => {
+                let cause = execution
+                    .isolate_worker(format!("harmonic resolve l{layer_idx}: {error}"));
+                return Err(cause);
+            }
+        }
+        polls = polls.wrapping_add(1);
+        if polls.is_multiple_of(256) {
+            if let Some(status) = execution
+                .worker
+                .as_mut()
+                .ok_or_else(|| "harmonic expert worker unavailable while polling".to_owned())?
+                .try_wait()?
+            {
+                let cause = execution.isolate_worker(format!(
+                    "harmonic expert worker exited during l{layer_idx}: {status}"
+                ));
+                return Err(cause);
+            }
+            let now = harmonic_monotonic_tick()
+                .map_err(|error| format!("harmonic poll clock l{layer_idx}: {error}"))?;
+            if now >= deadline {
+                let _ = execution.ring.expire(epoch, now);
+                let cause = execution
+                    .isolate_worker(format!("harmonic expert deadline exceeded l{layer_idx}"));
+                return Err(cause);
+            }
+            std::thread::yield_now();
+        } else {
+            std::hint::spin_loop();
+        }
+    };
+    if resolved.state != HarmonicSlotState::Completed
+        || resolved
+            .completion
+            .is_none_or(|completion| completion.result_extent != HARMONIC_RESULT_EXTENT)
+    {
+        let cause = execution.isolate_worker(format!(
+            "harmonic expert terminal state {:?} l{layer_idx}",
+            resolved.state
+        ));
+        return Err(cause);
+    }
+
+    gpu.bind_thread()
+        .map_err(|error| format!("harmonic join bind dense l{layer_idx}: {error}"))?;
+    let stream = gpu
+        .active_stream
+        .as_ref()
+        .ok_or_else(|| "harmonic join primary stream missing".to_owned())?;
+    let mapped_result = execution
+        .mapping
+        .as_ref()
+        .ok_or_else(|| "harmonic result mapping unavailable".to_owned())?
+        .result_buffer(epoch);
+    let routed_partial = state
+        .ffn_routed_overlap
+        .as_ref()
+        .ok_or_else(|| format!("harmonic routed partial missing l{layer_idx}"))?;
+    gpu.hip
+        .memcpy_dtod_async_at(
+            &routed_partial.buf,
+            0,
+            &mapped_result,
+            0,
+            HARMONIC_RESULT_EXTENT as usize,
+            stream,
+        )
+        .map_err(|error| format!("harmonic return partial l{layer_idx}: {error}"))?;
+    let ffn_out = state
+        .ffn_out
+        .as_ref()
+        .ok_or_else(|| format!("harmonic shared output missing l{layer_idx}"))?;
+    gpu.add_inplace_f32(ffn_out, routed_partial)
+        .map_err(|error| format!("harmonic ordered join l{layer_idx}: {error:?}"))
 }
 
 const HETEROGENEOUS_WAIT_EQ: u32 = 0x1;

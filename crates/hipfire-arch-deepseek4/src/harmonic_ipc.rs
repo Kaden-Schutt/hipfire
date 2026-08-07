@@ -24,7 +24,9 @@ use memmap2::{MmapMut, MmapOptions};
 use crate::harmonic::{
     HarmonicCompletion, HarmonicContract, HarmonicOwner, HarmonicProtocolError,
     HarmonicRoutePacket, HarmonicSlotState, DS4_MQ2R_0731_IDENTITY, HARMONIC_ACTIVATION_EXTENT,
-    HARMONIC_RESULT_EXTENT, HARMONIC_ROUTE_IDENTITY, HARMONIC_SLOT_COUNT, HARMONIC_TOP_K,
+    HARMONIC_ACTIVATION_RESERVED_OFFSET, HARMONIC_EXPERT_IDS_OFFSET,
+    HARMONIC_RESULT_EXTENT, HARMONIC_ROUTE_IDENTITY, HARMONIC_ROUTE_WEIGHTS_OFFSET,
+    HARMONIC_SLOT_COUNT, HARMONIC_TOP_K,
 };
 
 const HARMONIC_WIRE_MAGIC: u64 = 0x4453_3448_4950_4331; // DS4HIPC1
@@ -692,6 +694,49 @@ impl HarmonicSharedRing {
         let slot = self.prepare_publish(packet, endpoint_generation, now)?;
         slot.state
             .store(HarmonicWireState::Published as u32, Ordering::Release);
+        Ok(())
+    }
+
+    /// Mirror the route metadata into the mapped activation payload after the
+    /// source GPU has finished writing `x_rot`, but before release-publication.
+    ///
+    /// The packet atomics remain authoritative. These bytes preserve the fixed
+    /// wire layout for exactness/debug tooling without making the gfx1151 hot
+    /// path copy the 16 KiB activation through the CPU.
+    pub fn write_mapped_activation_metadata(
+        &self,
+        epoch: u64,
+        expert_ids: [u32; HARMONIC_TOP_K],
+        route_weight_bits: [u32; HARMONIC_TOP_K],
+    ) -> HarmonicIpcResult<()> {
+        self.require_release_acquire_data_plane()?;
+        let slot = self.slot(epoch);
+        let base = slot.activation_payload.bytes.get().cast::<u8>();
+        // SAFETY: only the dense source writes the activation payload. The
+        // caller invokes this before `publish_mapped`, so the expert cannot
+        // have acquired this epoch. All ranges are fixed constants within the
+        // payload extent and do not overlap the GPU-written x_rot prefix.
+        unsafe {
+            for (index, value) in expert_ids.into_iter().enumerate() {
+                ptr::copy_nonoverlapping(
+                    value.to_le_bytes().as_ptr(),
+                    base.add(HARMONIC_EXPERT_IDS_OFFSET + index * mem::size_of::<u32>()),
+                    mem::size_of::<u32>(),
+                );
+            }
+            for (index, value) in route_weight_bits.into_iter().enumerate() {
+                ptr::copy_nonoverlapping(
+                    value.to_le_bytes().as_ptr(),
+                    base.add(HARMONIC_ROUTE_WEIGHTS_OFFSET + index * mem::size_of::<u32>()),
+                    mem::size_of::<u32>(),
+                );
+            }
+            ptr::write_bytes(
+                base.add(HARMONIC_ACTIVATION_RESERVED_OFFSET),
+                0,
+                HARMONIC_ACTIVATION_EXTENT as usize - HARMONIC_ACTIVATION_RESERVED_OFFSET,
+            );
+        }
         Ok(())
     }
 
@@ -1569,7 +1614,30 @@ mod tests {
         let peer = HarmonicSharedRing::open(&file).unwrap();
         let (request, _) = request(owner.ring.contract(), 1, u64::MAX);
 
+        owner
+            .ring
+            .write_mapped_activation_metadata(
+                1,
+                request.expert_ids,
+                request.route_weight_bits,
+            )
+            .unwrap();
         owner.ring.publish_mapped(request, 7, 0).unwrap();
+        let mirrored = read_payload(&owner.ring.slot(1).activation_payload);
+        for (index, expected) in request.expert_ids.into_iter().enumerate() {
+            let offset = HARMONIC_EXPERT_IDS_OFFSET + index * mem::size_of::<u32>();
+            assert_eq!(
+                u32::from_le_bytes(mirrored[offset..offset + 4].try_into().unwrap()),
+                expected
+            );
+        }
+        for (index, expected) in request.route_weight_bits.into_iter().enumerate() {
+            let offset = HARMONIC_ROUTE_WEIGHTS_OFFSET + index * mem::size_of::<u32>();
+            assert_eq!(
+                u32::from_le_bytes(mirrored[offset..offset + 4].try_into().unwrap()),
+                expected
+            );
+        }
         let observed = match peer.expert_poll_mapped(1, 11).unwrap() {
             HarmonicExpertMappedPoll::Work(packet) => packet,
             state => panic!("expected mapped work, got {state:?}"),

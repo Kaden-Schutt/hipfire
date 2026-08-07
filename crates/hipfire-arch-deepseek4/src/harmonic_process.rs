@@ -351,6 +351,20 @@ impl HarmonicExpertWorkerProcess {
         self.child.as_ref().map(Child::id)
     }
 
+    /// Nonblocking liveness observation for the steady-state ring poller.
+    /// Returning an exit status does not discard the exact child handle;
+    /// `terminate_and_isolate` still owns the required reap/isolation step.
+    pub fn try_wait(&mut self) -> Result<Option<String>, String> {
+        let child = self
+            .child
+            .as_mut()
+            .ok_or_else(|| "harmonic expert child already reaped".to_owned())?;
+        child
+            .try_wait()
+            .map(|status| status.map(|status| status.to_string()))
+            .map_err(|error| format!("poll harmonic expert child: {error}"))
+    }
+
     pub fn shutdown_and_isolate(mut self) -> Result<HarmonicWorkerIsolationReceipt, String> {
         self.reader
             .get_ref()

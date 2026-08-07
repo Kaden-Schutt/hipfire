@@ -41,3 +41,7 @@ required-features = ["harmonic-fault-injection"]
 
 [[example]]
 name = "harmonic_ring_probe"
+
+[[example]]
+name = "ds4_harmonic_ar"
+required-features = ["harmonic-worker"]

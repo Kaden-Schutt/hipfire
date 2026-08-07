@@ -61,6 +61,8 @@ pub mod grammar;
 pub mod harmonic;
 pub mod harmonic_ipc;
 #[cfg(feature = "harmonic-worker")]
+pub mod harmonic_model;
+#[cfg(feature = "harmonic-worker")]
 pub mod harmonic_process;
 pub mod harmonic_worker;
 pub mod heterogeneous;
@@ -88,6 +90,10 @@ pub use harmonic_ipc::{
     HarmonicExpertPoll, HarmonicGpuMapping, HarmonicIntegrityMode, HarmonicIpcError,
     HarmonicMappedResolved, HarmonicResolved, HarmonicSharedRing, HarmonicWireState,
     HarmonicWorkItem,
+};
+#[cfg(feature = "harmonic-worker")]
+pub use harmonic_model::{
+    DeepseekV4HarmonicLoadPlan, DeepseekV4HarmonicLoadReport, DeepseekV4HarmonicModel,
 };
 #[cfg(feature = "harmonic-worker")]
 pub use harmonic_process::{
