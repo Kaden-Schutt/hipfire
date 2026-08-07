@@ -480,11 +480,7 @@ impl DeepseekV4HarmonicModel {
             .transpose()?;
         let replica_bytes = hotset_projection
             .as_ref()
-            .map(|projection| {
-                projection
-                    .exact_bytes
-                    .saturating_add((projection.slot_count * 2 * std::mem::size_of::<u64>()) as u64)
-            })
+            .map(|projection| projection.exact_bytes)
             .unwrap_or(0);
         let split_scratch_bytes = if hotset_projection.is_some() {
             (HARMONIC_TOP_K

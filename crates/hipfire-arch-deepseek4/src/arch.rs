@@ -1582,6 +1582,7 @@ impl DeepseekV4 {
         Self::validate_harmonic_worker_role(cfg, gpu, HarmonicOwner::DenseGfx1100)?;
         Self::validate_mq2r_tensor_policy(hfq, cfg)?;
 
+        const POINTER_BYTES_PER_SLOT: u64 = (2 * std::mem::size_of::<u64>()) as u64;
         let mut exact_bytes = 0_u64;
         let mut layer_slot_counts = [0_u16; HARMONIC_LAYER_COUNT as usize];
         for slot in plan.slots() {
@@ -1606,16 +1607,25 @@ impl DeepseekV4 {
                         format!("deepseek4 harmonic residency byte overflow at {name}")
                     })?;
             }
-            if slot_bytes != plan.slot_bytes() {
+            let resident_slot_bytes =
+                slot_bytes
+                    .checked_add(POINTER_BYTES_PER_SLOT)
+                    .ok_or_else(|| {
+                        format!(
+                        "deepseek4 harmonic residency pointer-table overflow at layer {} expert {}",
+                        slot.layer, slot.expert
+                    )
+                    })?;
+            if resident_slot_bytes != plan.slot_bytes() {
                 return Err(format!(
-                    "deepseek4 harmonic residency layer {} expert {} is {slot_bytes} bytes, plan requires {}",
+                    "deepseek4 harmonic residency layer {} expert {} is {resident_slot_bytes} resident bytes ({slot_bytes} payload + {POINTER_BYTES_PER_SLOT} pointer-table), plan requires {}",
                     slot.layer,
                     slot.expert,
                     plan.slot_bytes()
                 ));
             }
             exact_bytes = exact_bytes
-                .checked_add(slot_bytes)
+                .checked_add(resident_slot_bytes)
                 .ok_or_else(|| "deepseek4 harmonic residency total byte overflow".to_owned())?;
             layer_slot_counts[slot.layer as usize] = layer_slot_counts[slot.layer as usize]
                 .checked_add(1)
