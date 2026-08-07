@@ -5,6 +5,7 @@
 // Correctness gate for attention_q8_0_flash_prefill vs attention_q8_0_kv_batched.
 // Env: NH, NKV, HD, N (query rows), CTX (max_ctx_len), BR, BC, POS.
 
+use rdna_compute::kv_slots::half_from_f32;
 use rdna_compute::{DType, Gpu};
 
 fn env_usize(k: &str, d: usize) -> usize {
@@ -212,22 +213,6 @@ fn main() {
         assert!(min_cos >= 1.0 - 1e-6, "min cosine {min_cos:.9} < 1-1e-6");
     }
     println!("PASS");
-}
-
-/// Minimal f32 -> IEEE binary16 bit pattern (round-toward-zero mantissa).
-/// Only needs to cover the small positive scales used above.
-fn half_from_f32(x: f32) -> u16 {
-    let bits = x.to_bits();
-    let sign = ((bits >> 16) & 0x8000) as u16;
-    let exp = ((bits >> 23) & 0xFF) as i32 - 127 + 15;
-    let mant = (bits & 0x007F_FFFF) >> 13;
-    if exp <= 0 {
-        return sign;
-    }
-    if exp >= 31 {
-        return sign | 0x7C00;
-    }
-    sign | ((exp as u16) << 10) | (mant as u16)
 }
 
 /// Round an f32 through IEEE binary16 and back, returning the f32 bit pattern.
