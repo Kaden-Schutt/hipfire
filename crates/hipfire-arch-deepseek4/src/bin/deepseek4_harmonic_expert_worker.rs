@@ -225,21 +225,27 @@ fn run_loaded_worker(
             service.as_mut().unwrap(),
             mapping.as_ref().unwrap(),
         )?;
-        eprintln!(
-            "{}",
-            serde_json::json!({
-                "harmonic_expert_owner_hip_calls": {
-                    "launch_count": hip_bridge::launch_counters::launch_kernel::count(),
-                    "launch_time_ns": hip_bridge::launch_counters::launch_kernel::time_ns(),
-                    "stream_sync_count": hip_bridge::launch_counters::stream_sync::count(),
-                    "stream_sync_time_ns": hip_bridge::launch_counters::stream_sync::time_ns(),
-                    "event_sync_count": hip_bridge::launch_counters::event_sync::count(),
-                    "event_sync_time_ns": hip_bridge::launch_counters::event_sync::time_ns(),
-                    "dtoh_count": hip_bridge::launch_counters::memcpy_dtoh::count(),
-                    "dtoh_time_ns": hip_bridge::launch_counters::memcpy_dtoh::time_ns(),
-                }
-            })
-        );
+        #[cfg(feature = "harmonic-stage-profile")]
+        let stage_timing = service.as_ref().unwrap().stage_timing();
+        #[allow(unused_mut)]
+        let mut report = serde_json::json!({
+            "harmonic_expert_owner_hip_calls": {
+                "launch_count": hip_bridge::launch_counters::launch_kernel::count(),
+                "launch_time_ns": hip_bridge::launch_counters::launch_kernel::time_ns(),
+                "stream_sync_count": hip_bridge::launch_counters::stream_sync::count(),
+                "stream_sync_time_ns": hip_bridge::launch_counters::stream_sync::time_ns(),
+                "event_sync_count": hip_bridge::launch_counters::event_sync::count(),
+                "event_sync_time_ns": hip_bridge::launch_counters::event_sync::time_ns(),
+                "dtoh_count": hip_bridge::launch_counters::memcpy_dtoh::count(),
+                "dtoh_time_ns": hip_bridge::launch_counters::memcpy_dtoh::time_ns(),
+            },
+        });
+        #[cfg(feature = "harmonic-stage-profile")]
+        {
+            report["harmonic_expert_stage_device"] = serde_json::to_value(stage_timing)
+                .map_err(|error| format!("serialize harmonic expert stage timing: {error}"))?;
+        }
+        eprintln!("{report}");
         Ok(exit)
     })();
     if let Some(service) = service.take() {

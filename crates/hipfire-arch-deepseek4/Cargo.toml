@@ -29,6 +29,7 @@ libloading.workspace = true
 [features]
 harmonic-fault-injection = []
 harmonic-worker = ["dep:redline-rocr"]
+harmonic-stage-profile = []
 
 [[bin]]
 name = "deepseek4-harmonic-expert-worker"

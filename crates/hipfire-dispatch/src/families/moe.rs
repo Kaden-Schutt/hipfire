@@ -27,6 +27,19 @@ use crate::tables::KernelRegistry;
 use crate::traits::KernelFamily;
 use crate::types::*;
 
+/// Stable semantic boundaries inside the selected-expert decode sequence.
+///
+/// These are observation points only: callers may enqueue same-stream timing
+/// events after an existing launch without changing the arithmetic or adding
+/// an intermediate synchronization.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MoeSelectedStage {
+    GateUp,
+    Activation,
+    Rotation,
+    Down,
+}
+
 // ── MoE eligibility lattice ────────────────────────────
 
 /// Routed-expert tiers the mixed-tier graded decode path can execute: the
@@ -854,6 +867,22 @@ impl MoeFamily {
         params: &MoeSelectedParams,
     ) -> Result<(), DispatchError> {
         crate::pipeline::run_moe_decode_selected(gpu, params)
+    }
+
+    /// Run selected experts while exposing the four existing launch
+    /// boundaries to a diagnostic observer. The observer must not synchronize
+    /// the stream; production callers use [`Self::run_selected`] and compile
+    /// to the unchanged boundary-free route.
+    pub fn run_selected_with_boundaries<F>(
+        &self,
+        gpu: &mut rdna_compute::Gpu,
+        params: &MoeSelectedParams,
+        boundary: F,
+    ) -> Result<(), DispatchError>
+    where
+        F: FnMut(&mut rdna_compute::Gpu, MoeSelectedStage) -> Result<(), DispatchError>,
+    {
+        crate::pipeline::run_moe_decode_selected_with_boundaries(gpu, params, boundary)
     }
 
     /// Run a batched/prefill deepseek4 MoE step (k=6, MQ2-Lloyd): routing

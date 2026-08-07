@@ -11,7 +11,11 @@
 //! on it.
 
 use hip_bridge::DeviceBuffer;
+#[cfg(feature = "harmonic-stage-profile")]
+use hip_bridge::{Event, HipRuntime};
 use rdna_compute::{DType, Gpu, GpuTensor};
+#[cfg(feature = "harmonic-stage-profile")]
+use serde::Serialize;
 
 use crate::deepseek4::{DeepseekV4Config, DeepseekV4RoutedWeights};
 use crate::harmonic::{
@@ -21,6 +25,81 @@ use crate::harmonic::{
 };
 use crate::harmonic_ipc::{harmonic_payload_fingerprint, HarmonicIntegrityMode, HarmonicWorkItem};
 use crate::HarmonicRoutePacket;
+
+#[cfg(feature = "harmonic-stage-profile")]
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+pub struct HarmonicExpertStageTiming {
+    pub layers: u64,
+    pub gate_up_ms: f64,
+    pub activation_ms: f64,
+    pub rotation_ms: f64,
+    pub down_ms: f64,
+    pub publish_ms: f64,
+}
+
+#[cfg(feature = "harmonic-stage-profile")]
+struct HarmonicExpertStageProfile {
+    start: Event,
+    gate_up: Event,
+    activation: Event,
+    rotation: Event,
+    down: Event,
+    publish: Event,
+    timing: HarmonicExpertStageTiming,
+}
+
+#[cfg(feature = "harmonic-stage-profile")]
+impl HarmonicExpertStageProfile {
+    fn new(hip: &HipRuntime) -> Result<Self, String> {
+        let mut events = Vec::with_capacity(6);
+        for _ in 0..6 {
+            match hip.event_create() {
+                Ok(event) => events.push(event),
+                Err(error) => {
+                    for event in events {
+                        let _ = hip.event_destroy(event);
+                    }
+                    return Err(format!("harmonic expert stage event: {error}"));
+                }
+            }
+        }
+        let [start, gate_up, activation, rotation, down, publish]: [Event; 6] =
+            events
+                .try_into()
+                .map_err(|_| "harmonic expert stage event count".to_owned())?;
+        Ok(Self {
+            start,
+            gate_up,
+            activation,
+            rotation,
+            down,
+            publish,
+            timing: HarmonicExpertStageTiming::default(),
+        })
+    }
+
+    fn record(&mut self, stage_ms: [f32; 5]) {
+        self.timing.layers += 1;
+        self.timing.gate_up_ms += stage_ms[0] as f64;
+        self.timing.activation_ms += stage_ms[1] as f64;
+        self.timing.rotation_ms += stage_ms[2] as f64;
+        self.timing.down_ms += stage_ms[3] as f64;
+        self.timing.publish_ms += stage_ms[4] as f64;
+    }
+
+    fn destroy(self, hip: &HipRuntime) {
+        for event in [
+            self.start,
+            self.gate_up,
+            self.activation,
+            self.rotation,
+            self.down,
+            self.publish,
+        ] {
+            let _ = hip.event_destroy(event);
+        }
+    }
+}
 
 /// All scratch and the one execution stream are owned by the gfx1151 worker
 /// process. `Option` fields make partial construction transactionally
@@ -38,6 +117,8 @@ pub struct DeepseekV4HarmonicExpertService {
     topk_index_bytes: [u8; HARMONIC_TOP_K * std::mem::size_of::<u32>()],
     topk_weight_bytes: [u8; HARMONIC_TOP_K * std::mem::size_of::<u32>()],
     result_payload: Vec<u8>,
+    #[cfg(feature = "harmonic-stage-profile")]
+    stage_profile: Option<HarmonicExpertStageProfile>,
 }
 
 impl DeepseekV4HarmonicExpertService {
@@ -65,6 +146,8 @@ impl DeepseekV4HarmonicExpertService {
             topk_index_bytes: [0; HARMONIC_TOP_K * std::mem::size_of::<u32>()],
             topk_weight_bytes: [0; HARMONIC_TOP_K * std::mem::size_of::<u32>()],
             result_payload: vec![0; HARMONIC_RESULT_EXTENT as usize],
+            #[cfg(feature = "harmonic-stage-profile")]
+            stage_profile: None,
         };
         let result = (|| {
             gpu.bind_thread()
@@ -115,6 +198,10 @@ impl DeepseekV4HarmonicExpertService {
                 gpu.alloc_tensor(&[HARMONIC_HIDDEN_SIZE], DType::F32)
                     .map_err(|error| format!("harmonic expert result: {error}"))?,
             );
+            #[cfg(feature = "harmonic-stage-profile")]
+            {
+                service.stage_profile = Some(HarmonicExpertStageProfile::new(&gpu.hip)?);
+            }
             Ok(())
         })();
         if let Err(error) = result {
@@ -130,6 +217,14 @@ impl DeepseekV4HarmonicExpertService {
 
     pub fn result_payload(&self) -> &[u8] {
         &self.result_payload
+    }
+
+    #[cfg(feature = "harmonic-stage-profile")]
+    pub fn stage_timing(&self) -> HarmonicExpertStageTiming {
+        self.stage_profile
+            .as_ref()
+            .map(|profile| profile.timing)
+            .unwrap_or_default()
     }
 
     /// Execute one already-routed expert request entirely on the local gfx1151
@@ -376,6 +471,51 @@ impl DeepseekV4HarmonicExpertService {
             rot_batch: self.rot_batch.as_ref().unwrap(),
             down_expanded: self.down_expanded.as_ref().unwrap(),
         };
+        #[cfg(feature = "harmonic-stage-profile")]
+        {
+            let profile = self
+                .stage_profile
+                .as_ref()
+                .ok_or_else(|| "harmonic mapped expert stage profile missing".to_owned())?;
+            let stream = gpu.active_stream.as_ref().ok_or_else(|| {
+                "harmonic mapped expert local stream missing before profile".to_owned()
+            })?;
+            gpu.hip
+                .event_record(&profile.start, Some(stream))
+                .map_err(|error| format!("harmonic expert stage start: {error}"))?;
+            hipfire_runtime::llama::moe_family()
+                .run_selected_with_boundaries(gpu, &params, |gpu, stage| {
+                    let profile = self.stage_profile.as_ref().ok_or_else(|| {
+                        hipfire_dispatch::types::DispatchError::Hip(
+                            "harmonic expert stage profile missing".to_owned(),
+                        )
+                    })?;
+                    let event = match stage {
+                        hipfire_dispatch::families::moe::MoeSelectedStage::GateUp => {
+                            &profile.gate_up
+                        }
+                        hipfire_dispatch::families::moe::MoeSelectedStage::Activation => {
+                            &profile.activation
+                        }
+                        hipfire_dispatch::families::moe::MoeSelectedStage::Rotation => {
+                            &profile.rotation
+                        }
+                        hipfire_dispatch::families::moe::MoeSelectedStage::Down => &profile.down,
+                    };
+                    let stream = gpu.active_stream.as_ref().ok_or_else(|| {
+                        hipfire_dispatch::types::DispatchError::Hip(
+                            "harmonic expert local stream missing at stage boundary".to_owned(),
+                        )
+                    })?;
+                    gpu.hip.event_record(event, Some(stream)).map_err(|error| {
+                        hipfire_dispatch::types::DispatchError::Hip(error.to_string())
+                    })
+                })
+                .map_err(|error| {
+                    format!("harmonic mapped selected experts l{layer_index}: {error}")
+                })?;
+        }
+        #[cfg(not(feature = "harmonic-stage-profile"))]
         hipfire_runtime::llama::moe_family()
             .run_selected(gpu, &params)
             .map_err(|error| format!("harmonic mapped selected experts l{layer_index}: {error}"))?;
@@ -394,9 +534,30 @@ impl DeepseekV4HarmonicExpertService {
                     stream,
                 )
                 .map_err(|error| format!("harmonic mapped expert publish result: {error}"))?;
+            #[cfg(feature = "harmonic-stage-profile")]
+            gpu.hip
+                .event_record(&self.stage_profile.as_ref().unwrap().publish, Some(stream))
+                .map_err(|error| format!("harmonic expert stage publish: {error}"))?;
             gpu.hip
                 .stream_synchronize(stream)
                 .map_err(|error| format!("harmonic mapped expert local completion: {error}"))?;
+        }
+        #[cfg(feature = "harmonic-stage-profile")]
+        {
+            let profile = self.stage_profile.as_ref().unwrap();
+            let elapsed = |start, stop| {
+                gpu.hip
+                    .event_elapsed_ms(start, stop)
+                    .map_err(|error| error.to_string())
+            };
+            let stage_ms = [
+                elapsed(&profile.start, &profile.gate_up)?,
+                elapsed(&profile.gate_up, &profile.activation)?,
+                elapsed(&profile.activation, &profile.rotation)?,
+                elapsed(&profile.rotation, &profile.down)?,
+                elapsed(&profile.down, &profile.publish)?,
+            ];
+            self.stage_profile.as_mut().unwrap().record(stage_ms);
         }
         Ok(HarmonicCompletion {
             result_extent: HARMONIC_RESULT_EXTENT,
@@ -426,6 +587,10 @@ impl DeepseekV4HarmonicExpertService {
         free(gpu, &mut self.rot_batch);
         free(gpu, &mut self.down_expanded);
         free(gpu, &mut self.routed_partial);
+        #[cfg(feature = "harmonic-stage-profile")]
+        if let Some(profile) = self.stage_profile.take() {
+            profile.destroy(&gpu.hip);
+        }
         if let Some(stream) = gpu.active_stream.take() {
             let _ = gpu.hip.stream_destroy(stream);
         }

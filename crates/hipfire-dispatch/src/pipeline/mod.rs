@@ -1336,6 +1336,20 @@ pub fn run_moe_decode_selected(
     gpu: &mut Gpu,
     p: &crate::families::moe::MoeSelectedParams,
 ) -> Result<(), DispatchError> {
+    run_moe_decode_selected_with_boundaries(gpu, p, |_, _| Ok(()))
+}
+
+/// Selected-expert decode with diagnostic callbacks at the existing launch
+/// boundaries. The callback may enqueue same-stream observations but must not
+/// alter buffers or synchronize the stream.
+pub fn run_moe_decode_selected_with_boundaries<F>(
+    gpu: &mut Gpu,
+    p: &crate::families::moe::MoeSelectedParams,
+    mut boundary: F,
+) -> Result<(), DispatchError>
+where
+    F: FnMut(&mut Gpu, crate::families::moe::MoeSelectedStage) -> Result<(), DispatchError>,
+{
     macro_rules! hip {
         ($e:expr) => {
             $e.map_err(|e| DispatchError::Hip(e.to_string()))
@@ -1376,6 +1390,7 @@ pub fn run_moe_decode_selected(
             p.k_top,
         ))?;
     }
+    boundary(gpu, crate::families::moe::MoeSelectedStage::GateUp)?;
 
     // 3. Batched silu·mul·clamp (in-place into gate_batch) then batched FWHT rotate.
     hip!(gpu.deepseek4_silu_mul_clamp_f32_batched(
@@ -1386,11 +1401,13 @@ pub fn run_moe_decode_selected(
         p.k_top,
         p.swiglu_limit,
     ))?;
+    boundary(gpu, crate::families::moe::MoeSelectedStage::Activation)?;
     if let Some(native) = p.native_mq2_backend {
         hip!(native.rotate_x_batched(gpu, p.gate_batch, p.rot_batch, p.mi, p.k_top,))?;
     } else {
         hip!(gpu.rotate_x_mq_batched(p.gate_batch, p.rot_batch, p.mi, p.k_top,))?;
     }
+    boundary(gpu, crate::families::moe::MoeSelectedStage::Rotation)?;
 
     // 4. Indexed MQ2-Lloyd down. Deterministic (default): expanded per-expert
     //    write + fixed-order non-atomic combine into ffn_out — bit-reproducible
@@ -1447,6 +1464,7 @@ pub fn run_moe_decode_selected(
             )
         )?;
     }
+    boundary(gpu, crate::families::moe::MoeSelectedStage::Down)?;
 
     Ok(())
 }
