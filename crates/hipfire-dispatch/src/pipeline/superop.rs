@@ -461,41 +461,6 @@ pub trait ForwardBindings {
         })
     }
 
-    /// Captured-graph TP3 variant whose HC consumer performs the producer
-    /// release and peer acquire itself. Exact gfx1201 DS4 is the only current
-    /// implementation; all other bindings fail closed.
-    fn ep_finish_attend_peer_hc3_graph_sync(
-        &mut self,
-        _gpu: &mut Gpu,
-        _partials: [&GpuTensor; 3],
-        _own_signal: &hip_bridge::DeviceBuffer,
-        _peer_signals: [&hip_bridge::DeviceBuffer; 2],
-        _epoch: u32,
-    ) -> Result<(), DispatchError> {
-        Err(DispatchError::UnsupportedVariant {
-            family: "ep",
-            variant: "ep_finish_attend_peer_hc3_graph_sync-not-implemented-for-arch",
-            arch: "",
-            quant: "",
-        })
-    }
-
-    fn ep_finish_moe_peer_hc3_graph_sync(
-        &mut self,
-        _gpu: &mut Gpu,
-        _partials: [&GpuTensor; 3],
-        _own_signal: &hip_bridge::DeviceBuffer,
-        _peer_signals: [&hip_bridge::DeviceBuffer; 2],
-        _epoch: u32,
-    ) -> Result<(), DispatchError> {
-        Err(DispatchError::UnsupportedVariant {
-            family: "ep",
-            variant: "ep_finish_moe_peer_hc3_graph_sync-not-implemented-for-arch",
-            arch: "",
-            quant: "",
-        })
-    }
-
     fn ep_finish_attend_peer_hc4(
         &mut self,
         _gpu: &mut Gpu,

@@ -27,7 +27,6 @@ use crate::backend::Mq2rBackend;
 use crate::deepseek4::{DeepseekV4HeterogeneousWeights, DeepseekV4RoutedWeights};
 use crate::heterogeneous::DeepseekV4HeterogeneousExecution;
 use crate::{DeepseekV4Config, DeepseekV4State, DeepseekV4Weights};
-use hip_bridge::DeviceBuffer;
 use hipfire_dispatch::context::DispatchCtx;
 use hipfire_dispatch::pipeline::superop::{
     self, ForwardBindings, OpBinding, OpFlavor, SuperOp, SuperOpKind,
@@ -4917,25 +4916,6 @@ impl<'a> ForwardBindings for Deepseek4Bindings<'a> {
     ) -> Result<(), DispatchError> {
         hc_attn_mix_peer_hc3(self.cfg, self.state, gpu, partials).map_err(DispatchError::Hip)
     }
-    fn ep_finish_attend_peer_hc3_graph_sync(
-        &mut self,
-        gpu: &mut Gpu,
-        partials: [&GpuTensor; 3],
-        own_signal: &DeviceBuffer,
-        peer_signals: [&DeviceBuffer; 2],
-        epoch: u32,
-    ) -> Result<(), DispatchError> {
-        hc_attn_mix_peer_hc3_graph_sync(
-            self.cfg,
-            self.state,
-            gpu,
-            partials,
-            own_signal,
-            peer_signals,
-            epoch,
-        )
-        .map_err(DispatchError::Hip)
-    }
     fn ep_finish_attend_peer_hc4(
         &mut self,
         gpu: &mut Gpu,
@@ -5037,25 +5017,6 @@ impl<'a> ForwardBindings for Deepseek4Bindings<'a> {
         partials: [&GpuTensor; 3],
     ) -> Result<(), DispatchError> {
         hc_ffn_mix_peer_hc3(self.cfg, self.state, gpu, partials).map_err(DispatchError::Hip)
-    }
-    fn ep_finish_moe_peer_hc3_graph_sync(
-        &mut self,
-        gpu: &mut Gpu,
-        partials: [&GpuTensor; 3],
-        own_signal: &DeviceBuffer,
-        peer_signals: [&DeviceBuffer; 2],
-        epoch: u32,
-    ) -> Result<(), DispatchError> {
-        hc_ffn_mix_peer_hc3_graph_sync(
-            self.cfg,
-            self.state,
-            gpu,
-            partials,
-            own_signal,
-            peer_signals,
-            epoch,
-        )
-        .map_err(DispatchError::Hip)
     }
     fn run_proj(
         &mut self,
@@ -7709,56 +7670,6 @@ fn hc_ffn_mix_peer_hc3(
     Ok(())
 }
 
-/// Captured-graph TP3 FFN consumer with the producer epoch handshake folded
-/// into the unchanged fixed-rank HC arithmetic.
-#[allow(clippy::too_many_arguments)]
-fn hc_ffn_mix_peer_hc3_graph_sync(
-    cfg: &DeepseekV4Config,
-    state: &mut DeepseekV4State,
-    gpu: &mut Gpu,
-    partials: [&GpuTensor; 3],
-    own_signal: &DeviceBuffer,
-    peer_signals: [&DeviceBuffer; 2],
-    epoch: u32,
-) -> Result<(), String> {
-    let pingpong = config_cache::hc_pingpong_on(&gpu.arch, cfg.mq2r);
-    {
-        let streams = state.residual_streams.as_ref().unwrap();
-        let post_view = state.hc_c.as_ref().unwrap().sub_offset(4, 4);
-        let comb_view = state.hc_c.as_ref().unwrap().sub_offset(8, 16);
-        let streams_out = if pingpong {
-            state.residual_streams_next.as_ref().unwrap()
-        } else {
-            state.q.as_ref().unwrap()
-        };
-        gpu.hc_mix_4stream_peer3_sync_gfx1201(
-            streams,
-            &comb_view,
-            &post_view,
-            partials,
-            own_signal,
-            peer_signals,
-            epoch,
-            streams_out,
-            cfg.hidden_size as i32,
-        )
-        .map_err(|error| format!("hc_mix_4stream_peer3_sync_gfx1201 ffn: {error:?}"))?;
-    }
-    if pingpong {
-        std::mem::swap(
-            &mut state.residual_streams,
-            &mut state.residual_streams_next,
-        );
-    } else {
-        let streams = state.residual_streams.as_ref().unwrap();
-        let streams_out = state.q.as_ref().unwrap();
-        let bytes = cfg.hc_mult * cfg.hidden_size * 4;
-        gpu.memcpy_dtod_auto(&streams.buf, &streams_out.buf, bytes)
-            .map_err(|error| format!("d2d synced peer HC3 FFN mix to streams: {error:?}"))?;
-    }
-    Ok(())
-}
-
 /// gfx1201 TP4 twin of [`hc_ffn_mix`] that reduces four rank-local FFN
 /// partials inside the HC consumer instead of materializing an RCCL result.
 fn hc_ffn_mix_peer_hc4(
@@ -8913,56 +8824,6 @@ fn hc_attn_mix_peer_hc3(
         let bytes = cfg.hc_mult * cfg.hidden_size * 4;
         gpu.memcpy_dtod_auto(&streams.buf, &streams_out.buf, bytes)
             .map_err(|error| format!("d2d peer HC3 attention mix to streams: {error:?}"))?;
-    }
-    Ok(())
-}
-
-/// Captured-graph TP3 attention consumer with the producer epoch handshake
-/// folded into the unchanged fixed-rank HC arithmetic.
-#[allow(clippy::too_many_arguments)]
-fn hc_attn_mix_peer_hc3_graph_sync(
-    cfg: &DeepseekV4Config,
-    state: &mut DeepseekV4State,
-    gpu: &mut Gpu,
-    partials: [&GpuTensor; 3],
-    own_signal: &DeviceBuffer,
-    peer_signals: [&DeviceBuffer; 2],
-    epoch: u32,
-) -> Result<(), String> {
-    let pingpong = config_cache::hc_pingpong_on(&gpu.arch, cfg.mq2r);
-    {
-        let streams = state.residual_streams.as_ref().unwrap();
-        let post_view = state.hc_c.as_ref().unwrap().sub_offset(4, 4);
-        let comb_view = state.hc_c.as_ref().unwrap().sub_offset(8, 16);
-        let streams_out = if pingpong {
-            state.residual_streams_next.as_ref().unwrap()
-        } else {
-            state.q.as_ref().unwrap()
-        };
-        gpu.hc_mix_4stream_peer3_sync_gfx1201(
-            streams,
-            &comb_view,
-            &post_view,
-            partials,
-            own_signal,
-            peer_signals,
-            epoch,
-            streams_out,
-            cfg.hidden_size as i32,
-        )
-        .map_err(|error| format!("hc_mix_4stream_peer3_sync_gfx1201 attention: {error:?}"))?;
-    }
-    if pingpong {
-        std::mem::swap(
-            &mut state.residual_streams,
-            &mut state.residual_streams_next,
-        );
-    } else {
-        let streams = state.residual_streams.as_ref().unwrap();
-        let streams_out = state.q.as_ref().unwrap();
-        let bytes = cfg.hc_mult * cfg.hidden_size * 4;
-        gpu.memcpy_dtod_auto(&streams.buf, &streams_out.buf, bytes)
-            .map_err(|error| format!("d2d synced peer HC3 attention mix to streams: {error:?}"))?;
     }
     Ok(())
 }

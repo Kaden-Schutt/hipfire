@@ -94,26 +94,6 @@ fn tp_peer_hc3_admitted<B: ForwardBindings>(gpus: &Gpus, bindings: &[B]) -> bool
         && bindings.iter().all(ForwardBindings::supports_tp_peer_hc3)
 }
 
-fn tp_peer_hc3_graph_sync_enabled(gpus: &Gpus) -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        hipfire_config::developer_var("HIPFIRE_TP3_HC_GRAPH_SYNC").as_deref() == Ok("1")
-    }) && gpus.devices.len() == 3
-        && gpus
-            .devices
-            .iter()
-            .all(|device| device.arch_caps.is_gfx1201() && device.graphs.capture_mode)
-}
-
-fn tp3_peer_signals(signals: &[DeviceBuffer; 3], rank: usize) -> [&DeviceBuffer; 2] {
-    match rank {
-        0 => [&signals[1], &signals[2]],
-        1 => [&signals[0], &signals[2]],
-        2 => [&signals[0], &signals[1]],
-        _ => unreachable!("TP3 rank must be 0..3"),
-    }
-}
-
 /// Execute one lowered layer program across `gpus.devices.len()` EP ranks.
 ///
 /// - `bindings[r]` drives rank `r`'s forward (it holds that rank's state /
@@ -182,24 +162,10 @@ pub fn run_layer_program_ep<B: ForwardBindings>(
                     })
                     .collect::<Result<Vec<_>, DispatchError>>()?;
                 let peers = [&peer_partials[0], &peer_partials[1], &peer_partials[2]];
-                if tp_peer_hc3_graph_sync_enabled(gpus) {
-                    let (epoch, signals) = gpus.take_tp3_graph_fused_barrier().map_err(hip_err)?;
-                    for r in 0..n {
-                        gpus.devices[r].bind_thread().map_err(hip_err)?;
-                        bindings[r].ep_finish_attend_peer_hc3_graph_sync(
-                            &mut gpus.devices[r],
-                            peers,
-                            &signals[r],
-                            tp3_peer_signals(&signals, r),
-                            epoch,
-                        )?;
-                    }
-                } else {
-                    gpus.barrier_rank_streams_reuse().map_err(hip_err)?;
-                    for r in 0..n {
-                        gpus.devices[r].bind_thread().map_err(hip_err)?;
-                        bindings[r].ep_finish_attend_peer_hc3(&mut gpus.devices[r], peers)?;
-                    }
+                gpus.barrier_rank_streams_reuse().map_err(hip_err)?;
+                for r in 0..n {
+                    gpus.devices[r].bind_thread().map_err(hip_err)?;
+                    bindings[r].ep_finish_attend_peer_hc3(&mut gpus.devices[r], peers)?;
                 }
             } else if tp_peer_hc4_admitted(gpus, bindings) {
                 // Borrow-independent aliases let the architecture hooks
@@ -285,24 +251,10 @@ pub fn run_layer_program_ep<B: ForwardBindings>(
 
             if tp_peer_hc3_admitted(gpus, bindings) {
                 let peers = [&partials[0], &partials[1], &partials[2]];
-                if tp_peer_hc3_graph_sync_enabled(gpus) {
-                    let (epoch, signals) = gpus.take_tp3_graph_fused_barrier().map_err(hip_err)?;
-                    for r in 0..n {
-                        gpus.devices[r].bind_thread().map_err(hip_err)?;
-                        bindings[r].ep_finish_moe_peer_hc3_graph_sync(
-                            &mut gpus.devices[r],
-                            peers,
-                            &signals[r],
-                            tp3_peer_signals(&signals, r),
-                            epoch,
-                        )?;
-                    }
-                } else {
-                    gpus.barrier_rank_streams_reuse().map_err(hip_err)?;
-                    for r in 0..n {
-                        gpus.devices[r].bind_thread().map_err(hip_err)?;
-                        bindings[r].ep_finish_moe_peer_hc3(&mut gpus.devices[r], peers)?;
-                    }
+                gpus.barrier_rank_streams_reuse().map_err(hip_err)?;
+                for r in 0..n {
+                    gpus.devices[r].bind_thread().map_err(hip_err)?;
+                    bindings[r].ep_finish_moe_peer_hc3(&mut gpus.devices[r], peers)?;
                 }
             } else if tp_peer_hc4_admitted(gpus, bindings) {
                 let peers = [&partials[0], &partials[1], &partials[2], &partials[3]];
