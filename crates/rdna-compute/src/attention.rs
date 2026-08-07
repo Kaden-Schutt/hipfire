@@ -8790,6 +8790,112 @@ impl Gpu {
             },
         )
     }
+
+    /// Native gfx1201 HC control projection: one RMS reduction per token,
+    /// followed by a 24-row F16×F32 WMMA GEMM with fused RMS/base epilogue.
+    #[allow(clippy::too_many_arguments)]
+    pub fn hc_compute_control_wmma_batched_gfx1201(
+        &mut self,
+        x_flat: &GpuTensor,
+        w_fn: &GpuTensor,
+        base: &GpuTensor,
+        inv_rms: &GpuTensor,
+        c_out: &GpuTensor,
+        n_ctrl: i32,
+        x_dim: i32,
+        batch_size: i32,
+        batch_tiles: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        debug_assert!(self.arch_caps.is_gfx1201());
+        debug_assert_eq!(n_ctrl, 24);
+        debug_assert_eq!(x_dim % 16, 0);
+        self.ensure_kernel(
+            "hc_inv_rms_batched_gfx1201",
+            kernels::HC_INV_RMS_BATCHED_GFX1201_SRC,
+            "hc_inv_rms_batched_gfx1201",
+        )?;
+        let (kernel, source) = match batch_tiles {
+            1 => (
+                "hc_compute_control_wmma_b1_gfx1201",
+                kernels::HC_COMPUTE_CONTROL_WMMA_B1_GFX1201_SRC,
+            ),
+            2 => (
+                "hc_compute_control_wmma_b2_gfx1201",
+                kernels::HC_COMPUTE_CONTROL_WMMA_B2_GFX1201_SRC,
+            ),
+            4 => (
+                "hc_compute_control_wmma_b4_gfx1201",
+                kernels::HC_COMPUTE_CONTROL_WMMA_B4_GFX1201_SRC,
+            ),
+            _ => panic!("unsupported gfx1201 HC WMMA batch tile {batch_tiles}"),
+        };
+        self.ensure_kernel(kernel, source, kernel)?;
+
+        let xp = x_flat.buf.as_ptr();
+        let ip = inv_rms.buf.as_ptr();
+        let mut xd = x_dim;
+        let mut bs = batch_size;
+        let mut norm_params: Vec<*mut c_void> = vec![
+            &xp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &mut xd as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            "hc_inv_rms_batched_gfx1201",
+            [batch_size as u32, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut norm_params,
+            || {
+                let mut blob = hip_bridge::KernargBlob::new();
+                blob.push_ptr(xp);
+                blob.push_ptr(ip);
+                blob.push_i32(xd);
+                blob.push_i32(bs);
+                blob
+            },
+        )?;
+
+        let wp = w_fn.buf.as_ptr();
+        let bp = base.buf.as_ptr();
+        let cp = c_out.buf.as_ptr();
+        let mut nc = n_ctrl;
+        let mut params: Vec<*mut c_void> = vec![
+            &wp as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &bp as *const _ as *mut c_void,
+            &cp as *const _ as *mut c_void,
+            &mut nc as *mut _ as *mut c_void,
+            &mut xd as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            kernel,
+            [
+                ((n_ctrl + 15) / 16) as u32,
+                ((batch_size + (16 * batch_tiles) as i32 - 1) / (16 * batch_tiles) as i32) as u32,
+                1,
+            ],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut blob = hip_bridge::KernargBlob::new();
+                blob.push_ptr(wp);
+                blob.push_ptr(xp);
+                blob.push_ptr(ip);
+                blob.push_ptr(bp);
+                blob.push_ptr(cp);
+                blob.push_i32(nc);
+                blob.push_i32(xd);
+                blob.push_i32(bs);
+                blob
+            },
+        )
+    }
     pub fn hc_head_compute_pre(
         &mut self,
         x_flat: &GpuTensor,  // [hc_mult * hidden] F32

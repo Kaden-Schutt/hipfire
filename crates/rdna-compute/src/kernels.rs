@@ -5472,6 +5472,23 @@ pub const ROPE_TAIL_YARN_INTERLEAVED_BATCHED_SRC: &str =
 /// of streams[b] against the shared `hc_fn` weight + rsqrt mean + base.
 pub const HC_COMPUTE_CONTROL_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/hc_compute_control_batched.hip");
+pub const HC_INV_RMS_BATCHED_GFX1201_SRC: &str =
+    include_str!("../../../kernels/src/hc_inv_rms_batched.gfx1201.hip");
+pub const HC_COMPUTE_CONTROL_WMMA_B1_GFX1201_SRC: &str = concat!(
+    "#define HC_WMMA_BATCH_TILES 1\n",
+    "#define HC_WMMA_KERNEL_NAME hc_compute_control_wmma_b1_gfx1201\n",
+    include_str!("../../../kernels/src/hc_compute_control_wmma.gfx1201.hip")
+);
+pub const HC_COMPUTE_CONTROL_WMMA_B2_GFX1201_SRC: &str = concat!(
+    "#define HC_WMMA_BATCH_TILES 2\n",
+    "#define HC_WMMA_KERNEL_NAME hc_compute_control_wmma_b2_gfx1201\n",
+    include_str!("../../../kernels/src/hc_compute_control_wmma.gfx1201.hip")
+);
+pub const HC_COMPUTE_CONTROL_WMMA_B4_GFX1201_SRC: &str = concat!(
+    "#define HC_WMMA_BATCH_TILES 4\n",
+    "#define HC_WMMA_KERNEL_NAME hc_compute_control_wmma_b4_gfx1201\n",
+    include_str!("../../../kernels/src/hc_compute_control_wmma.gfx1201.hip")
+);
 
 /// HC α-scaling post-step — BATCHED (Phase B2, 2026-05-18). Per-batch
 /// in-place rescale of c[b, 0..24] using the shared 3-segment α + base.
