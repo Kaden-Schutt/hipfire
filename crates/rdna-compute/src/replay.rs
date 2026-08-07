@@ -3518,6 +3518,13 @@ impl ReplayController {
                 _ => {}
             }
         }
+        // Correctness localization for continuation tapes: a full System
+        // fence at every dispatch distinguishes a missing gfx1100 visibility
+        // edge from dynamic-kernarg drift. Ordinary linear AQL keeps the
+        // narrower production policy above.
+        if !host_gates.is_empty() {
+            headers.fill(HeaderPolicy::RECORDED_DISPATCH);
+        }
         let checkpoint_dispatches = checkpoint_dispatch
             .into_iter()
             .chain(host_gates.iter().map(|gate| gate.checkpoint_dispatch))
