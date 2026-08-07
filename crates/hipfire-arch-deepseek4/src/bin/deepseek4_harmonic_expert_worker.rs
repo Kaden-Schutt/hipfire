@@ -19,8 +19,8 @@ use std::time::{Duration, Instant};
 
 use hipfire_arch_deepseek4::{
     harmonic_monotonic_tick, DeepseekV4, DeepseekV4HarmonicExpertService,
-    DeepseekV4VerifiedArtifact, HarmonicExpertPoll, HarmonicExpertWorkerCommand,
-    HarmonicExpertWorkerEvent, HarmonicOwner, HarmonicSharedRing,
+    DeepseekV4VerifiedArtifact, HarmonicExpertMappedPoll, HarmonicExpertWorkerCommand,
+    HarmonicExpertWorkerEvent, HarmonicGpuMapping, HarmonicOwner, HarmonicSharedRing,
 };
 use hipfire_runtime::arch::Architecture;
 use hipfire_runtime::hfq::HfqFile;
@@ -127,7 +127,7 @@ fn open_ring(path: &Path) -> Result<HarmonicSharedRing, String> {
 fn run_loaded_worker(
     args: &Args,
     control: &mut UnixStream,
-    ring: &HarmonicSharedRing,
+    ring: &mut HarmonicSharedRing,
     mut gpu: Gpu,
     mut hfq: HfqFile,
     model_sha256: &str,
@@ -145,6 +145,7 @@ fn run_loaded_worker(
         &mut hfq, &cfg, &mut gpu,
     )?);
     let mut service = None;
+    let mut mapping = None;
     let result = (|| -> Result<WorkerLoopExit, String> {
         let receipt = weights.as_ref().unwrap().audit_local_owner(&mut gpu)?;
         if !receipt.pci_bus_id.eq_ignore_ascii_case(&args.pci_bus_id) {
@@ -158,6 +159,10 @@ fn run_loaded_worker(
             &cfg,
             args.allocation_generation,
         )?);
+        mapping = Some(
+            HarmonicGpuMapping::register(ring, &gpu.hip)
+                .map_err(|error| format!("register harmonic expert payloads: {error}"))?,
+        );
         send_event(
             control,
             &HarmonicExpertWorkerEvent::Ready {
@@ -181,18 +186,32 @@ fn run_loaded_worker(
             &cfg,
             weights.as_ref().unwrap(),
             service.as_mut().unwrap(),
+            mapping.as_ref().unwrap(),
         )
     })();
     if let Some(service) = service.take() {
         service.release_quiesced(&mut gpu);
     }
+    let mapping_cleanup = if let Some(mut mapping) = mapping.take() {
+        mapping
+            .unregister(&gpu.hip)
+            .map_err(|error| format!("unregister harmonic expert payloads: {error}"))
+    } else {
+        Ok(())
+    };
     if let Some(weights) = weights.take() {
         weights.free_gpu(&mut gpu);
     }
     gpu.invalidate_weight_caches();
     gpu.invalidate_graph_state();
     gpu.drain_pool();
-    match result? {
+    let result = match (result, mapping_cleanup) {
+        (Ok(exit), Ok(())) => Ok(exit),
+        (Err(run_error), Ok(())) => Err(run_error),
+        (Ok(_), Err(cleanup_error)) => Err(cleanup_error),
+        (Err(run_error), Err(cleanup_error)) => Err(format!("{run_error}; {cleanup_error}")),
+    }?;
+    match result {
         WorkerLoopExit::ControlClosed => Ok(()),
         WorkerLoopExit::ShutdownRequested => {
             send_event(control, &HarmonicExpertWorkerEvent::Shutdown)
@@ -209,6 +228,7 @@ fn worker_loop(
     cfg: &hipfire_arch_deepseek4::DeepseekV4Config,
     weights: &hipfire_arch_deepseek4::DeepseekV4RoutedWeights,
     service: &mut DeepseekV4HarmonicExpertService,
+    mapping: &HarmonicGpuMapping,
 ) -> Result<WorkerLoopExit, String> {
     let reader_stream = control
         .try_clone()
@@ -221,28 +241,33 @@ fn worker_loop(
     let mut idle_since = Instant::now();
     loop {
         match ring
-            .expert_poll(epoch, allocation_generation)
+            .expert_poll_mapped(epoch, allocation_generation)
             .map_err(|error| format!("poll epoch {epoch}: {error}"))?
         {
-            HarmonicExpertPoll::Work(work) => {
+            HarmonicExpertMappedPoll::Work(packet) => {
                 let now_tick = harmonic_monotonic_tick()
                     .map_err(|error| format!("clock epoch {epoch}: {error}"))?;
+                let activation_payload = mapping.activation_buffer(epoch);
+                let result_payload = mapping.result_buffer(epoch);
                 let completion = service
-                    .execute_work_item(gpu, cfg, weights, &work, now_tick)
+                    .execute_mapped_packet(
+                        gpu,
+                        cfg,
+                        weights,
+                        &packet,
+                        &activation_payload,
+                        &result_payload,
+                        now_tick,
+                    )
                     .map_err(|error| format!("execute epoch {epoch}: {error}"))?;
-                ring.expert_complete(
-                    epoch,
-                    allocation_generation,
-                    completion,
-                    service.result_payload(),
-                )
-                .map_err(|error| format!("complete epoch {epoch}: {error}"))?;
+                ring.expert_complete_mapped(epoch, allocation_generation, completion)
+                    .map_err(|error| format!("complete epoch {epoch}: {error}"))?;
                 epoch = epoch
                     .checked_add(1)
                     .ok_or_else(|| "harmonic expert epoch exhausted".to_owned())?;
                 idle_since = Instant::now();
             }
-            HarmonicExpertPoll::Terminal(_) => {
+            HarmonicExpertMappedPoll::Terminal(_) => {
                 ring.expert_acknowledge_terminal(epoch, allocation_generation)
                     .map_err(|error| format!("acknowledge epoch {epoch}: {error}"))?;
                 epoch = epoch
@@ -250,7 +275,7 @@ fn worker_loop(
                     .ok_or_else(|| "harmonic expert epoch exhausted".to_owned())?;
                 idle_since = Instant::now();
             }
-            HarmonicExpertPoll::Pending => {
+            HarmonicExpertMappedPoll::Pending => {
                 let idle = idle_since.elapsed();
                 if idle < Duration::from_millis(2) {
                     std::hint::spin_loop();
@@ -308,7 +333,7 @@ fn run(args: &Args, control: &mut UnixStream) -> Result<(), String> {
     )?;
     let artifact = DeepseekV4VerifiedArtifact::verify(&args.model)?;
 
-    let ring = open_ring(&args.ring)?;
+    let mut ring = open_ring(&args.ring)?;
     let contract = ring.contract();
     if contract.destination_allocation_generation != args.allocation_generation {
         return Err(format!(
@@ -355,7 +380,7 @@ fn run(args: &Args, control: &mut UnixStream) -> Result<(), String> {
     run_loaded_worker(
         args,
         control,
-        &ring,
+        &mut ring,
         gpu,
         hfq,
         &artifact.sha256,

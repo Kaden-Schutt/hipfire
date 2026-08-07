@@ -4,20 +4,23 @@
 //! Process-local gfx1151 routed-expert service for harmonic DS4 execution.
 //!
 //! This module has no peer pointer, foreign device ID, cross-device signal, or
-//! GPU wait primitive. A supervisor moves typed CPU payloads through
-//! `harmonic_ipc`; this worker owns one exact gfx1151 HIP context and returns a
-//! CPU result payload. Any local HIP stall is bounded by terminating this
-//! process, not by asking the peer GPU to wait on it.
+//! GPU wait primitive. A supervisor publishes typed packets through
+//! `harmonic_ipc`; this worker owns one exact gfx1151 HIP context and consumes
+//! process-local aliases of HIP-registered payload pages. Any local HIP stall
+//! is bounded by terminating this process, not by asking the peer GPU to wait
+//! on it.
 
+use hip_bridge::DeviceBuffer;
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 use crate::deepseek4::{DeepseekV4Config, DeepseekV4RoutedWeights};
 use crate::harmonic::{
     unpack_harmonic_x_rot, HarmonicCompletion, HarmonicContract, HarmonicOwner,
     HARMONIC_EXPERT_COUNT, HARMONIC_HIDDEN_SIZE, HARMONIC_LAYER_COUNT,
-    HARMONIC_MOE_INTERMEDIATE_SIZE, HARMONIC_RESULT_EXTENT, HARMONIC_TOP_K,
+    HARMONIC_MOE_INTERMEDIATE_SIZE, HARMONIC_RESULT_EXTENT, HARMONIC_TOP_K, HARMONIC_X_ROT_BYTES,
 };
 use crate::harmonic_ipc::{harmonic_payload_fingerprint, HarmonicIntegrityMode, HarmonicWorkItem};
+use crate::HarmonicRoutePacket;
 
 /// All scratch and the one execution stream are owned by the gfx1151 worker
 /// process. `Option` fields make partial construction transactionally
@@ -258,6 +261,146 @@ impl DeepseekV4HarmonicExpertService {
             } else {
                 0
             },
+        })
+    }
+
+    /// Execute one release/acquire packet directly from this process's mapped
+    /// ring alias. The selected-expert kernels are identical to
+    /// [`Self::execute_work_item`]; only the 16 KiB activation/result transport
+    /// changes. The one local stream synchronization publishes completion only
+    /// after the result copy reached the shared result slot.
+    pub fn execute_mapped_packet(
+        &mut self,
+        gpu: &mut Gpu,
+        cfg: &DeepseekV4Config,
+        weights: &DeepseekV4RoutedWeights,
+        packet: &HarmonicRoutePacket,
+        activation_payload: &DeviceBuffer,
+        result_payload: &DeviceBuffer,
+        now_tick: u64,
+    ) -> Result<HarmonicCompletion, String> {
+        validate_worker_config(gpu, cfg, self.allocation_generation)?;
+        if !weights.mq2r_backend.is_gfx1151() {
+            return Err("harmonic expert weights do not use the exact gfx1151 backend".to_owned());
+        }
+        if weights.layers.len() != HARMONIC_LAYER_COUNT as usize {
+            return Err(format!(
+                "harmonic expert layer residency is {}, expected {}",
+                weights.layers.len(),
+                HARMONIC_LAYER_COUNT
+            ));
+        }
+        let contract = HarmonicContract::frozen(
+            packet.source_allocation_generation,
+            self.allocation_generation,
+        );
+        contract
+            .validate(packet, now_tick)
+            .map_err(|error| format!("harmonic expert mapped route contract: {error}"))?;
+        if activation_payload.size() < HARMONIC_X_ROT_BYTES {
+            return Err(format!(
+                "harmonic mapped activation has {} bytes, expected at least {HARMONIC_X_ROT_BYTES}",
+                activation_payload.size()
+            ));
+        }
+        if result_payload.size() < HARMONIC_RESULT_EXTENT as usize {
+            return Err(format!(
+                "harmonic mapped result has {} bytes, expected at least {HARMONIC_RESULT_EXTENT}",
+                result_payload.size()
+            ));
+        }
+        encode_words(&packet.expert_ids, &mut self.topk_index_bytes);
+        encode_words(&packet.route_weight_bits, &mut self.topk_weight_bytes);
+
+        gpu.bind_thread()
+            .map_err(|error| format!("harmonic mapped expert bind execute: {error}"))?;
+        {
+            let stream = gpu
+                .active_stream
+                .as_ref()
+                .ok_or_else(|| "harmonic mapped expert local stream missing".to_owned())?;
+            gpu.hip
+                .memcpy_htod_async(
+                    &self.topk_indices.as_ref().unwrap().buf,
+                    &self.topk_index_bytes,
+                    stream,
+                )
+                .map_err(|error| format!("harmonic mapped expert upload top-k indices: {error}"))?;
+            gpu.hip
+                .memcpy_htod_async(
+                    &self.topk_weights.as_ref().unwrap().buf,
+                    &self.topk_weight_bytes,
+                    stream,
+                )
+                .map_err(|error| format!("harmonic mapped expert upload top-k weights: {error}"))?;
+            let routed_partial = self.routed_partial.as_ref().unwrap();
+            gpu.hip
+                .memset_async(&routed_partial.buf, 0, routed_partial.byte_size(), stream)
+                .map_err(|error| format!("harmonic mapped expert zero result: {error}"))?;
+        }
+
+        let x_rot = GpuTensor {
+            // SAFETY: the process-local `HarmonicGpuMapping` owns this live HIP
+            // registration across the synchronous call. The payload begins
+            // with exactly one 4096-element F32 activation.
+            buf: unsafe {
+                DeviceBuffer::from_raw(activation_payload.as_ptr(), HARMONIC_X_ROT_BYTES)
+            },
+            shape: vec![HARMONIC_HIDDEN_SIZE],
+            dtype: DType::F32,
+        };
+        let layer_index = packet.layer as usize;
+        let layer = weights.resolve_layer(layer_index);
+        let expert_gate_up_ptrs = layer.expert_gate_up_ptrs.as_ref().ok_or_else(|| {
+            format!("harmonic mapped expert gate/up pointer table missing l{layer_index}")
+        })?;
+        let expert_down_ptrs = layer.expert_w2_ptrs.as_ref().ok_or_else(|| {
+            format!("harmonic mapped expert down pointer table missing l{layer_index}")
+        })?;
+        let params = hipfire_dispatch::families::moe::MoeSelectedParams {
+            hidden: HARMONIC_HIDDEN_SIZE,
+            mi: HARMONIC_MOE_INTERMEDIATE_SIZE,
+            k_top: HARMONIC_TOP_K,
+            swiglu_limit: cfg.swiglu_limit,
+            uses_atomic_moe_down: weights.mq2r_backend.uses_atomic_moe_down(),
+            native_mq2_backend: weights.mq2r_backend.bias_aware_native_backend(),
+            batch_size: 1,
+            x_rot: &x_rot,
+            ffn_out: self.routed_partial.as_ref().unwrap(),
+            expert_gate_up_ptrs,
+            expert_down_ptrs,
+            topk_indices: self.topk_indices.as_ref().unwrap(),
+            topk_weights: self.topk_weights.as_ref().unwrap(),
+            gate_batch: self.gate_batch.as_ref().unwrap(),
+            up_batch: self.up_batch.as_ref().unwrap(),
+            rot_batch: self.rot_batch.as_ref().unwrap(),
+            down_expanded: self.down_expanded.as_ref().unwrap(),
+        };
+        hipfire_runtime::llama::moe_family()
+            .run_selected(gpu, &params)
+            .map_err(|error| format!("harmonic mapped selected experts l{layer_index}: {error}"))?;
+
+        {
+            let stream = gpu.active_stream.as_ref().ok_or_else(|| {
+                "harmonic mapped expert local stream missing after dispatch".to_owned()
+            })?;
+            gpu.hip
+                .memcpy_dtod_async_at(
+                    result_payload,
+                    0,
+                    &self.routed_partial.as_ref().unwrap().buf,
+                    0,
+                    HARMONIC_RESULT_EXTENT as usize,
+                    stream,
+                )
+                .map_err(|error| format!("harmonic mapped expert publish result: {error}"))?;
+            gpu.hip
+                .stream_synchronize(stream)
+                .map_err(|error| format!("harmonic mapped expert local completion: {error}"))?;
+        }
+        Ok(HarmonicCompletion {
+            result_extent: HARMONIC_RESULT_EXTENT,
+            result_fingerprint: 0,
         })
     }
 
