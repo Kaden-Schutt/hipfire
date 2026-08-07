@@ -110,6 +110,7 @@ type HipFunction = *mut c_void;
 type HipEvent = *mut c_void;
 type HipGraph = *mut c_void;
 type HipGraphExec = *mut c_void;
+pub type HipHostFn = unsafe extern "C" fn(*mut c_void);
 pub type HipMemGenericAllocationHandle = *mut c_void;
 
 const HIP_SUCCESS: u32 = 0;
@@ -313,6 +314,7 @@ pub struct HipRuntime {
 
     // Graph capture & replay
     fn_stream_begin_capture: unsafe extern "C" fn(HipStream, c_uint) -> u32,
+    fn_launch_host_func: unsafe extern "C" fn(HipStream, HipHostFn, *mut c_void) -> u32,
     fn_stream_end_capture: unsafe extern "C" fn(HipStream, *mut HipGraph) -> u32,
     fn_graph_instantiate:
         unsafe extern "C" fn(*mut HipGraphExec, HipGraph, *mut HipGraph, *mut c_void, usize) -> u32,
@@ -666,6 +668,11 @@ impl HipRuntime {
                     lib,
                     "hipStreamBeginCapture",
                     unsafe extern "C" fn(HipStream, c_uint) -> u32
+                ),
+                fn_launch_host_func: load_fn!(
+                    lib,
+                    "hipLaunchHostFunc",
+                    unsafe extern "C" fn(HipStream, HipHostFn, *mut c_void) -> u32
                 ),
                 fn_stream_end_capture: load_fn!(
                     lib,
@@ -1711,6 +1718,26 @@ impl HipRuntime {
     pub fn stream_begin_capture(&self, stream: &Stream, mode: u32) -> HipResult<()> {
         let code = unsafe { (self.fn_stream_begin_capture)(stream.0, mode as c_uint) };
         self.check(code, "hipStreamBeginCapture")
+    }
+
+    /// Enqueue a non-reentrant host callback after preceding stream work.
+    ///
+    /// HIP forbids callbacks from calling any HIP API. The callback blocks
+    /// later stream work until it returns and may be captured as a graph host
+    /// node. `user_data` must remain valid until the stream has completed.
+    ///
+    /// # Safety
+    /// `callback` must obey HIP's host-function contract, and `user_data` must
+    /// point to callback-compatible storage that outlives every direct or graph
+    /// execution that references it.
+    pub unsafe fn launch_host_func(
+        &self,
+        stream: &Stream,
+        callback: HipHostFn,
+        user_data: *mut c_void,
+    ) -> HipResult<()> {
+        let code = unsafe { (self.fn_launch_host_func)(stream.0, callback, user_data) };
+        self.check(code, "hipLaunchHostFunc")
     }
 
     /// End capture on `stream`, returning the captured graph.
