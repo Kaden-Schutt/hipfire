@@ -323,6 +323,15 @@ mod config_cache {
     pub(super) fn gfx1201_rmsnorm_rotate_nox_on(arch: &str, mq2r: bool) -> bool {
         arch == "gfx1201" && mq2r
     }
+    /// Candidate-only exact-gfx1201 head-strided indexer-Q RoPE. Default OFF
+    /// until the composed product route clears its performance and decoded-byte
+    /// gates; the promoted form becomes an architecture default.
+    pub(super) fn gfx1201_indexer_rope_heads_on(arch: &str, mq2r: bool) -> bool {
+        static V: OnceLock<bool> = OnceLock::new();
+        arch == "gfx1201"
+            && mq2r
+            && *V.get_or_init(|| flag_one("HIPFIRE_DEEPSEEK4_GFX1201_INDEXER_ROPE_HEADS"))
+    }
     /// `HIPFIRE_DEEPSEEK4_GFX942_COMPRESSOR_GATE` — host-gate non-commit
     /// compressor commit-stage launches on exact `gfx942` MQ2R ordinary HIP.
     /// Default OFF; set `=1` to enable. Forced off during hipGraph capture
@@ -3337,17 +3346,27 @@ fn indexer_forward(
         .pos_buf
         .as_ref()
         .ok_or_else(|| "indexer: pos_buf missing".to_string())?;
-    gpu.rope_tail_interleaved(
-        q_idx,
-        q_idx,
-        pos_buf,
-        h as i32,
-        0,
-        d as i32,
-        cfg.qk_rope_head_dim as i32,
-        cfg.compress_rope_theta,
-    )
-    .map_err(|e| format!("idx rope l{layer_idx}: {e:?}"))?;
+    let head_parallel_rope = config_cache::gfx1201_indexer_rope_heads_on(&gpu.arch, cfg.mq2r)
+        && weights.mq2r_backend.is_gfx1201()
+        && h == 64
+        && d == 128
+        && cfg.qk_rope_head_dim == 64;
+    if head_parallel_rope {
+        gpu.rope_tail_interleaved_h64d128r64_gfx1201(q_idx, pos_buf, cfg.compress_rope_theta, 32)
+            .map_err(|e| format!("idx rope gfx1201 l{layer_idx}: {e:?}"))?;
+    } else {
+        gpu.rope_tail_interleaved(
+            q_idx,
+            q_idx,
+            pos_buf,
+            h as i32,
+            0,
+            d as i32,
+            cfg.qk_rope_head_dim as i32,
+            cfg.compress_rope_theta,
+        )
+        .map_err(|e| format!("idx rope l{layer_idx}: {e:?}"))?;
+    }
 
     // 3. idx_w = weights_proj @ state.tmp  → [H]
     let tmp = state
