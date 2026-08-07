@@ -11689,16 +11689,11 @@ impl Gpu {
         let gfx1201_src;
         let (kernel_name, kernel_src, kernel_symbol) = if self.arch.eq_ignore_ascii_case("gfx1201")
         {
-            gfx1201_src = kernels::V4F_ATTN_SWA_TOPK_DIRECT_WMMA_SRC
-                .replace(
-                    "__builtin_amdgcn_wmma_f32_16x16x16_f16_w32(",
-                    "__builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(",
-                )
-                .replacen(
-                    "void deepseek4_attn_swa_topk_direct_wmma(",
-                    "void deepseek4_attn_swa_topk_direct_wmma_gfx1201(",
-                    1,
-                );
+            gfx1201_src = kernels::V4F_ATTN_SWA_TOPK_DIRECT_WMMA_SRC.replacen(
+                "void deepseek4_attn_swa_topk_direct_wmma(",
+                "void deepseek4_attn_swa_topk_direct_wmma_gfx1201(",
+                1,
+            );
             (
                 "deepseek4_attn_swa_topk_direct_wmma_gfx1201",
                 gfx1201_src.as_str(),
