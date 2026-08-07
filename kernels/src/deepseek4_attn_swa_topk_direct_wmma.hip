@@ -32,7 +32,6 @@
 #include <math.h>
 
 typedef _Float16 __attribute__((ext_vector_type(16))) half16_t;
-typedef _Float16 __attribute__((ext_vector_type(8)))  half8_t;
 typedef float    __attribute__((ext_vector_type(8)))  float8_t;
 
 #define HG 16
@@ -56,7 +55,6 @@ void deepseek4_attn_swa_topk_direct_wmma(
     const int n_warps = blockDim.x >> 5;
     const int lane    = tid & 31;     // within-warp 0..31
     const int l16     = lane & 15;
-    const int k_grp   = lane >> 4;
     if (hg * HG >= H || b >= B) return;
 
     const int n_valid  = n_valid_swa_arr[b];
@@ -93,63 +91,27 @@ void deepseek4_attn_swa_topk_direct_wmma(
         }
         float8_t acc = {0,0,0,0,0,0,0,0};
         for (int kt = 0; kt < D / 16; ++kt) {
-            #if defined(__gfx1200__) || defined(__gfx1201__)
-            half8_t a, bb;
-            #else
             half16_t a, bb;
-            #endif
-            #if defined(__gfx1200__) || defined(__gfx1201__)
-            #pragma unroll
-            for (int i = 0; i < 8; ++i)
-                a[i] = q_lds[l16 * D + kt * 16 + k_grp * 8 + i];
-            #else
             #pragma unroll
             for (int i = 0; i < 16; ++i) a[i] = q_lds[l16 * D + kt * 16 + i];
-            #endif
             if (ktype == 0) {            // SWA: swa_kv[b, kt*16+i, key] (stride window)
-                #if defined(__gfx1200__) || defined(__gfx1201__)
-                #pragma unroll
-                for (int i = 0; i < 8; ++i)
-                    bb[i] = (_Float16)swa_kv[swa_base + (size_t)(kt * 16 + k_grp * 8 + i) * swa_window + key];
-                #else
                 #pragma unroll
                 for (int i = 0; i < 16; ++i)
                     bb[i] = (_Float16)swa_kv[swa_base + (size_t)(kt * 16 + i) * swa_window + key];
-                #endif
             } else if (ktype == 1) {     // topK: kv_cache[idx, kt*16+i] (contiguous)
-                #if defined(__gfx1200__) || defined(__gfx1201__)
-                #pragma unroll
-                for (int i = 0; i < 8; ++i)
-                    bb[i] = (_Float16)kv_cache[(size_t)tk_idx * D + kt * 16 + k_grp * 8 + i];
-                #else
                 #pragma unroll
                 for (int i = 0; i < 16; ++i)
                     bb[i] = (_Float16)kv_cache[(size_t)tk_idx * D + kt * 16 + i];
-                #endif
             } else {
-                #if defined(__gfx1200__) || defined(__gfx1201__)
-                #pragma unroll
-                for (int i = 0; i < 8; ++i) bb[i] = (_Float16)0.0f;
-                #else
                 #pragma unroll
                 for (int i = 0; i < 16; ++i) bb[i] = (_Float16)0.0f;
-                #endif
             }
-            #if defined(__gfx1200__) || defined(__gfx1201__)
-            acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, bb, acc);
-            #else
             acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, bb, acc);
-            #endif
         }
-        // gfx11: acc[j] = S[head 2j+k_grp][key l16]
-        // gfx12: acc[j] = S[head 8*k_grp+j][key l16]
+        // acc[j] = S[head 2j+(lane>>4)][key l16]
         #pragma unroll
         for (int j = 0; j < 8; ++j) {
-            #if defined(__gfx1200__) || defined(__gfx1201__)
-            const int head = 8 * k_grp + j;
-            #else
             const int head = 2 * j + (lane >> 4);
-            #endif
             s_lds[head * n_pad + key] = (ktype != 2) ? acc[j] * inv_scale : -1e30f;
         }
     }
@@ -177,35 +139,10 @@ void deepseek4_attn_swa_topk_direct_wmma(
         const float invs = inv_sum_lds[l16];
         float8_t acc = {0,0,0,0,0,0,0,0};
         for (int kt = 0; kt < n_pad / 16; ++kt) {
-            #if defined(__gfx1200__) || defined(__gfx1201__)
-            half8_t a, bb;
-            #else
             half16_t a, bb;
-            #endif
-            #if defined(__gfx1200__) || defined(__gfx1201__)
-            #pragma unroll
-            for (int i = 0; i < 8; ++i)
-                a[i] = (_Float16)(s_lds[l16 * n_pad + kt * 16 + k_grp * 8 + i] * invs);
-            #else
             #pragma unroll
             for (int i = 0; i < 16; ++i)
                 a[i] = (_Float16)(s_lds[l16 * n_pad + kt * 16 + i] * invs);
-            #endif
-            #if defined(__gfx1200__) || defined(__gfx1201__)
-            #pragma unroll
-            for (int i = 0; i < 8; ++i) {
-                const int key = kt * 16 + k_grp * 8 + i;
-                float vv = 0.0f;
-                if (key < n_valid) {
-                    vv = swa_kv[swa_base + (size_t)(dt * 16 + l16) * swa_window + key];
-                } else if (key < n_total) {
-                    const int idx = topk_row[key - n_valid];
-                    if (idx >= 0 && idx < n_compressed)
-                        vv = kv_cache[(size_t)idx * D + dt * 16 + l16];
-                }
-                bb[i] = (_Float16)vv;
-            }
-            #else
             #pragma unroll
             for (int i = 0; i < 16; ++i) {
                 const int key = kt * 16 + i;
@@ -219,22 +156,12 @@ void deepseek4_attn_swa_topk_direct_wmma(
                 }
                 bb[i] = (_Float16)vv;
             }
-            #endif
-            #if defined(__gfx1200__) || defined(__gfx1201__)
-            acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, bb, acc);
-            #else
             acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, bb, acc);
-            #endif
         }
-        // gfx11: acc[j] = O[head 2j+k_grp][d dt*16+l16]
-        // gfx12: acc[j] = O[head 8*k_grp+j][d dt*16+l16]
+        // acc[j] = O[head 2j+(lane>>4)][d dt*16+l16]
         #pragma unroll
         for (int j = 0; j < 8; ++j) {
-            #if defined(__gfx1200__) || defined(__gfx1201__)
-            const int head = 8 * k_grp + j;
-            #else
             const int head = 2 * j + (lane >> 4);
-            #endif
             const int d = dt * 16 + l16;
             attn_out[(size_t)(b * H + hg * HG + head) * D + d] = acc[j];
         }
