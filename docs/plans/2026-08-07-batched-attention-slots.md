@@ -12,7 +12,8 @@
 
 ## Global Constraints
 
-- **Base branch:** `feat/batched-attention-slots`, cut from `origin/beta` @ `e2f7dd1a`. Worktree `~/repos/hipfire-batchattn`.
+- **Implementation branch:** `feat/batched-attn-impl`, worktree `~/repos/hipfire-batchattn-impl`. **All code work happens here.** It was cut from `feat/batched-attention-slots` (worktree `~/repos/hipfire-batchattn`), which carries the spec and this plan and is kept pristine as the reference — do not commit code to it. Both descend from `origin/beta` @ `e2f7dd1a`.
+- **Toolchain:** ROCm 7.2.2, `hipcc` at `/opt/rocm-7.2.2/bin/hipcc` (already on PATH). Target arch for local builds is `gfx1151`.
 - **Dev hardware is gfx1151 (Strix Halo); target is gfx1201 (R9700).** No tuned constant may be baked into a Rust `const`. Every tuning value must be env-overridable.
 - **KV modes in scope: Q8_0 and asym3 only.** Do not touch asym2, asym4, fwht{2,3,4}, or lloyd kernels.
 - **Backward compatibility is mandatory.** When the descriptor pointer is null, every kernel must behave *bitwise identically* to its current single-sequence behaviour. All existing call sites pass null initially.
