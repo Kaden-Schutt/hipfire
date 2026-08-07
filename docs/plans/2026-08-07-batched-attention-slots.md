@@ -662,10 +662,20 @@ Run: `cargo run --release -p rdna-compute --features deltanet --example test_q8_
 Expected: same pass output as on a clean `origin/beta` checkout. Capture both and compare:
 
 ```bash
-git stash && cargo run --release -p rdna-compute --features deltanet --example test_q8_flash_prefill > /tmp/before.txt 2>&1; git stash pop
-cargo run --release -p rdna-compute --features deltanet --example test_q8_flash_prefill > /tmp/after.txt 2>&1
-diff /tmp/before.txt /tmp/after.txt && echo BITWISE_IDENTICAL
+./scripts/attn_legacy_baseline.sh > /tmp/after.txt 2>&1
+diff scripts/attn_legacy_baseline.beta.txt /tmp/after.txt && echo LEGACY_BITWISE_IDENTICAL
 ```
+
+`scripts/attn_legacy_baseline.beta.txt` is a **committed fingerprint captured
+from pristine `origin/beta` code** across 11 shapes covering both models'
+head configurations (GQA 8:1 and 6:1) plus awkward context/row counts. It is
+verified deterministic across runs.
+
+Do **NOT** try to regenerate the "before" side with `git stash` — the SP1
+changes are committed, not staged, so stashing would not revert them, and
+stashing inside a working worktree risks losing work. The committed fingerprint
+is the reference; if you believe it is wrong, stop and escalate rather than
+regenerating it from modified code.
 Expected: `BITWISE_IDENTICAL`.
 
 If they differ, stop. A legacy-mode change means the descriptor path leaked into the null case, and every later task builds on this being clean.
@@ -901,8 +911,8 @@ Expected: PASS, 7 tests (unchanged from Task 3 — this task adds no new host-si
 Run:
 ```bash
 cargo build --release -p rdna-compute --features deltanet
-cargo run --release -p rdna-compute --features deltanet --example test_q8_flash_prefill > /tmp/after6.txt 2>&1
-diff /tmp/before.txt /tmp/after6.txt && echo LEGACY_UNCHANGED
+./scripts/attn_legacy_baseline.sh > /tmp/after6.txt 2>&1
+diff scripts/attn_legacy_baseline.beta.txt /tmp/after6.txt && echo LEGACY_UNCHANGED
 ```
 Expected: `LEGACY_UNCHANGED` against the Task 4 Step 5 baseline.
 
