@@ -30,6 +30,7 @@ const HARMONIC_STAGE_ROUTE_KERNEL: &str = "harmonic_stage_route_gfx1100";
 /// Eighth pointer in `harmonic_stage_route_gfx1100`'s explicit kernarg ABI.
 /// Retained AQL patches only this owner-local mapped-ring alias.
 pub const HARMONIC_STAGE_PACKET_POINTER_KERNARG_OFFSET: usize = 7 * std::mem::size_of::<u64>();
+pub const HARMONIC_SPLIT_COMBINE_REMOTE_POINTER_KERNARG_OFFSET: usize = std::mem::size_of::<u64>();
 const HARMONIC_LOCAL_TAIL_SRC: &str =
     include_str!("../../../../kernels/src/harmonic_mq2_lloyd_local_tail.gfx1100.hip");
 const HARMONIC_LOCAL_GATE_UP_KERNEL: &str = "harmonic_mq2_lloyd_gate_up_gfx1100";

@@ -166,17 +166,19 @@ pub(crate) struct DeepseekV4HarmonicExecution {
     pub(crate) local_down_expanded: Option<GpuTensor>,
     pub(crate) slot_sources: Option<GpuTensor>,
     pub(crate) packed_route: Option<HarmonicPackedExpertRoute>,
-    /// One exact-owner retained gfx1100 FFN segment per model layer. The stage
-    /// packet's alternating ring pointer is the sole bounded kernarg patch.
-    pub(crate) dense_ffn_replays: Vec<Option<HarmonicDenseRetainedFfn>>,
+    /// One coarse owner-local token program. Its 43 route checkpoints and
+    /// continuation barriers share one queue publication and one doorbell.
+    pub(crate) token_replay: Option<HarmonicTokenRetained>,
     ring_path: PathBuf,
     control_socket: PathBuf,
 }
 
-pub(crate) struct HarmonicDenseRetainedFfn {
+pub(crate) struct HarmonicTokenRetained {
     pub(crate) replay: ReplayController,
+    pub(crate) stage_dispatches: Vec<usize>,
+    pub(crate) combine_dispatches: Vec<usize>,
     pub(crate) dispatch_count: usize,
-    pub(crate) checkpoint_dispatch: usize,
+    pub(crate) packet_count: usize,
     pub(crate) queue_id: u64,
     pub(crate) replays: u64,
 }
@@ -224,7 +226,7 @@ impl DeepseekV4HarmonicExecution {
             local_down_expanded: None,
             slot_sources: None,
             packed_route: None,
-            dense_ffn_replays: (0..HARMONIC_LAYER_COUNT).map(|_| None).collect(),
+            token_replay: None,
             ring_path,
             control_socket,
         };
@@ -397,7 +399,7 @@ impl DeepseekV4HarmonicExecution {
         // Every retained ticket is terminal before it is returned to this
         // table. Drop owner-local HSA queues while all captured allocations
         // and mapped-ring aliases are still live.
-        self.dense_ffn_replays.clear();
+        self.token_replay.take();
         if let Some(worker) = self.worker.take() {
             if let Err(error) = worker.shutdown_and_isolate() {
                 errors.push(error);
