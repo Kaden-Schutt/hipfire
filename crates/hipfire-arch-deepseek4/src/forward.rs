@@ -1017,8 +1017,8 @@ fn gemv_auto(
                 .gemv_mfp4g32_e8_prerotated(weight, x_rotated, y, m, k)
                 .map_err(|e| format!("gemv MFP4-E8: {e:?}")),
             DType::MFP4G32E8SOA if gpu.arch_caps.is_gfx1100() => gpu
-                .gemv_mfp4g32_e8_soa_prefetch4_buffer_gfx1100(weight, x_rotated, y, m, k)
-                .map_err(|e| format!("gemv MFP4-E8-SoA gfx1100 prefetch4 buffer: {e:?}")),
+                .gemv_mfp4g32_e8_soa_buffer_gfx1100(weight, x_rotated, y, m, k)
+                .map_err(|e| format!("gemv MFP4-E8-SoA gfx1100 buffer: {e:?}")),
             DType::MFP4G32E8SOA if config_cache::e8_u4_on(&gpu.arch, mq2r_backend.is_gfx1151()) => {
                 if mq2r_backend.is_gfx1151() {
                     gpu.gemv_mfp4g32_e8_soa_u4_buffer_cpol_gfx1151(0, weight, x_rotated, y, m, k)
