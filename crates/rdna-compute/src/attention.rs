@@ -10518,15 +10518,15 @@ impl Gpu {
 
     /// Exact-gfx1201 DS4 indexer-Q RoPE at H64/D128/R64.
     ///
-    /// `block_threads` selects 2, 4, or 8 head-waves per workgroup.  Keeping
-    /// this explicit lets the channel micro screen the occupancy/SFU balance;
+    /// `head_waves` selects 8, 16, or 32 independent head-strided waves.
+    /// Keeping this explicit lets the channel micro screen the occupancy/SFU balance;
     /// the product route passes the certified fixed geometry.
     pub fn rope_tail_interleaved_h64d128r64_gfx1201(
         &mut self,
         q: &GpuTensor,
         pos_buf: &GpuTensor,
         freq_base: f32,
-        block_threads: u32,
+        head_waves: u32,
     ) -> HipResult<()> {
         self.bind_thread()?;
         if !self.arch_caps.is_gfx1201() {
@@ -10538,10 +10538,10 @@ impl Gpu {
                 ),
             ));
         }
-        if !matches!(block_threads, 64 | 128 | 256) {
+        if !matches!(head_waves, 8 | 16 | 32) {
             return Err(hip_bridge::HipError::new(
                 0,
-                "rope_tail_interleaved_h64d128r64_gfx1201 requires 64, 128, or 256 threads",
+                "rope_tail_interleaved_h64d128r64_gfx1201 requires 8, 16, or 32 head waves",
             ));
         }
         if q.numel() != 64 * 128 || pos_buf.numel() != 1 {
@@ -10567,11 +10567,10 @@ impl Gpu {
             &mut nr as *mut _ as *mut c_void,
             &mut fb as *mut _ as *mut c_void,
         ];
-        let heads_per_block = block_threads / 32;
         self.launch_maybe_blob(
             "rope_tail_interleaved_h64d128r64_gfx1201",
-            [64_u32.div_ceil(heads_per_block), 1, 1],
-            [block_threads, 1, 1],
+            [1, head_waves, 1],
+            [32, 1, 1],
             0,
             &mut params,
             || {

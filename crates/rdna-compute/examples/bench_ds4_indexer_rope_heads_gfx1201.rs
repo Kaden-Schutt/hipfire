@@ -39,8 +39,8 @@ fn launch_reference(gpu: &mut Gpu, q: &GpuTensor, pos: &GpuTensor) {
         .expect("reference RoPE");
 }
 
-fn launch_candidate(gpu: &mut Gpu, q: &GpuTensor, pos: &GpuTensor, block_threads: u32) {
-    gpu.rope_tail_interleaved_h64d128r64_gfx1201(q, pos, FREQ_BASE, block_threads)
+fn launch_candidate(gpu: &mut Gpu, q: &GpuTensor, pos: &GpuTensor, head_waves: u32) {
+    gpu.rope_tail_interleaved_h64d128r64_gfx1201(q, pos, FREQ_BASE, head_waves)
         .expect("candidate RoPE");
 }
 
@@ -68,7 +68,7 @@ fn median(values: &mut [f64]) -> f64 {
     values[values.len() / 2]
 }
 
-fn parity(gpu: &mut Gpu, position: i32, block_threads: u32) -> usize {
+fn parity(gpu: &mut Gpu, position: i32, head_waves: u32) -> usize {
     let host = input(position);
     let reference = gpu
         .upload_f32(&host, &[HEADS, HEAD_DIM])
@@ -78,7 +78,7 @@ fn parity(gpu: &mut Gpu, position: i32, block_threads: u32) -> usize {
         .expect("upload candidate");
     let pos = upload_i32(gpu, position);
     launch_reference(gpu, &reference, &pos);
-    launch_candidate(gpu, &candidate, &pos, block_threads);
+    launch_candidate(gpu, &candidate, &pos, head_waves);
     gpu.hip.device_synchronize().expect("parity synchronize");
     let expected = gpu.download_f32(&reference).expect("download reference");
     let actual = gpu.download_f32(&candidate).expect("download candidate");
@@ -86,13 +86,13 @@ fn parity(gpu: &mut Gpu, position: i32, block_threads: u32) -> usize {
         assert_eq!(
             expected.to_bits(),
             actual.to_bits(),
-            "raw-bit mismatch position={position} block_threads={block_threads} index={index}"
+            "raw-bit mismatch position={position} head_waves={head_waves} index={index}"
         );
     }
     expected.len()
 }
 
-fn screen(gpu: &mut Gpu, block_threads: u32) {
+fn screen(gpu: &mut Gpu, head_waves: u32) {
     let host = input(2052);
     let reference = gpu
         .upload_f32(&host, &[HEADS, HEAD_DIM])
@@ -103,7 +103,7 @@ fn screen(gpu: &mut Gpu, block_threads: u32) {
     let pos = upload_i32(gpu, 2052);
     for _ in 0..20 {
         launch_reference(gpu, &reference, &pos);
-        launch_candidate(gpu, &candidate, &pos, block_threads);
+        launch_candidate(gpu, &candidate, &pos, head_waves);
     }
     gpu.hip.device_synchronize().expect("warmup synchronize");
 
@@ -113,11 +113,11 @@ fn screen(gpu: &mut Gpu, block_threads: u32) {
         if trial & 1 == 0 {
             reference_us.push(event_us(gpu, |gpu| launch_reference(gpu, &reference, &pos)));
             candidate_us.push(event_us(gpu, |gpu| {
-                launch_candidate(gpu, &candidate, &pos, block_threads)
+                launch_candidate(gpu, &candidate, &pos, head_waves)
             }));
         } else {
             candidate_us.push(event_us(gpu, |gpu| {
-                launch_candidate(gpu, &candidate, &pos, block_threads)
+                launch_candidate(gpu, &candidate, &pos, head_waves)
             }));
             reference_us.push(event_us(gpu, |gpu| launch_reference(gpu, &reference, &pos)));
         }
@@ -125,7 +125,7 @@ fn screen(gpu: &mut Gpu, block_threads: u32) {
     let reference_us = median(&mut reference_us);
     let candidate_us = median(&mut candidate_us);
     println!(
-        "block_threads={block_threads} reference_us={reference_us:.6} candidate_us={candidate_us:.6} speedup_x={:.4} saved_us_per_call={:.6} saved_ms_per_rank_token={:.6}",
+        "head_waves={head_waves} reference_us={reference_us:.6} candidate_us={candidate_us:.6} speedup_x={:.4} saved_us_per_call={:.6} saved_ms_per_rank_token={:.6}",
         reference_us / candidate_us,
         reference_us - candidate_us,
         (reference_us - candidate_us) * 21.0 / 1_000.0,
@@ -136,13 +136,13 @@ fn main() {
     let mut gpu = Gpu::init().expect("Gpu::init");
     assert_eq!(gpu.arch, "gfx1201", "exact gfx1201 required");
     let positions = [0, 1, 2052, 131_071];
-    let blocks = [64, 128, 256];
+    let head_waves = [8, 16, 32];
     let mut comparisons = 0usize;
-    for block_threads in blocks {
+    for head_waves in head_waves {
         for position in positions {
-            comparisons += parity(&mut gpu, position, block_threads);
+            comparisons += parity(&mut gpu, position, head_waves);
         }
-        screen(&mut gpu, block_threads);
+        screen(&mut gpu, head_waves);
     }
     println!("raw_bit_comparisons={comparisons}");
 }
