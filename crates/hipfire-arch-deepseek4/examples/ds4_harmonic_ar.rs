@@ -9,7 +9,8 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use hipfire_arch_deepseek4::{
-    DeepseekV4HarmonicLoadPlan, DeepseekV4HarmonicModel, DeepseekV4VerifiedArtifact,
+    DeepseekV4ArtifactReceipt, DeepseekV4HarmonicLoadPlan, DeepseekV4HarmonicModel,
+    DeepseekV4VerifiedArtifact,
 };
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::tokenizer::Tokenizer;
@@ -18,13 +19,17 @@ use serde_json::json;
 fn main() -> Result<(), String> {
     let mut args = std::env::args().skip(1);
     let model = PathBuf::from(args.next().ok_or(
-        "usage: ds4_harmonic_ar MODEL --worker PATH --prompt PATH --generate N --runtime-dir PATH [--output PATH]",
+        "usage: ds4_harmonic_ar MODEL --worker PATH --prompt PATH --generate N --runtime-dir PATH [--output PATH] [--model-sha256 HEX --model-len N --model-mtime-secs N --model-mtime-nanos N]",
     )?);
     let mut worker = None;
     let mut prompt = None;
     let mut generate = None;
     let mut runtime_dir = None;
     let mut output = None;
+    let mut model_sha256 = None;
+    let mut model_len = None;
+    let mut model_mtime_secs = None;
+    let mut model_mtime_nanos = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--worker" => worker = Some(PathBuf::from(args.next().ok_or("--worker needs PATH")?)),
@@ -43,6 +48,31 @@ fn main() -> Result<(), String> {
                 ))
             }
             "--output" => output = Some(PathBuf::from(args.next().ok_or("--output needs PATH")?)),
+            "--model-sha256" => model_sha256 = Some(args.next().ok_or("--model-sha256 needs HEX")?),
+            "--model-len" => {
+                model_len = Some(
+                    args.next()
+                        .ok_or("--model-len needs N")?
+                        .parse::<u64>()
+                        .map_err(|error| format!("invalid --model-len: {error}"))?,
+                )
+            }
+            "--model-mtime-secs" => {
+                model_mtime_secs = Some(
+                    args.next()
+                        .ok_or("--model-mtime-secs needs N")?
+                        .parse::<u64>()
+                        .map_err(|error| format!("invalid --model-mtime-secs: {error}"))?,
+                )
+            }
+            "--model-mtime-nanos" => {
+                model_mtime_nanos = Some(
+                    args.next()
+                        .ok_or("--model-mtime-nanos needs N")?
+                        .parse::<u32>()
+                        .map_err(|error| format!("invalid --model-mtime-nanos: {error}"))?,
+                )
+            }
             other => return Err(format!("unknown argument '{other}'")),
         }
     }
@@ -54,7 +84,36 @@ fn main() -> Result<(), String> {
         return Err("--generate must be nonzero".to_owned());
     }
 
-    let artifact = DeepseekV4VerifiedArtifact::verify(&model)?;
+    let inherited_receipt = match (
+        model_sha256,
+        model_len,
+        model_mtime_secs,
+        model_mtime_nanos,
+    ) {
+        (None, None, None, None) => None,
+        (Some(sha256), Some(len), Some(modified_unix_secs), Some(modified_subsec_nanos)) => {
+            Some(DeepseekV4ArtifactReceipt {
+                canonical_path: model
+                    .canonicalize()
+                    .map_err(|error| format!("canonicalize model {}: {error}", model.display()))?,
+                len,
+                modified_unix_secs,
+                modified_subsec_nanos,
+                sha256,
+            })
+        }
+        _ => {
+            return Err(
+                "inherited artifact receipt requires --model-sha256, --model-len, --model-mtime-secs, and --model-mtime-nanos together"
+                    .to_owned(),
+            )
+        }
+    };
+    let artifact = if let Some(receipt) = inherited_receipt.as_ref() {
+        DeepseekV4VerifiedArtifact::accept_parent_receipt(receipt)?
+    } else {
+        DeepseekV4VerifiedArtifact::verify(&model)?
+    };
     let hfq = HfqFile::open(artifact.path())
         .map_err(|error| format!("open tokenizer metadata: {error}"))?;
     let tokenizer = Tokenizer::from_hfq_metadata(&hfq.metadata_json)
