@@ -75,6 +75,11 @@ extern "C" __global__ void HIPFIRE_MOE_DOWN_KERNEL(
 
     // K=512 → 2 groups; row stride matches baseline (groups*136).
     const int groups_per_row = K / 256;
+    // The R17c1 fast path below is specialized to EXACTLY two 256-groups
+    // (K=512, the qwen35-A3B routed-down shape). Any other K must take the
+    // generic quads+tail loop in the else branch — silently dropping groups
+    // 2+ produced wrong down projections for K=1792 (lfm2moe) etc.
+    if (groups_per_row == 2) {
     const long long row_stride = (long long)groups_per_row * 136;
     // Clamp OOB rows to row0 for weight reads (safe in-bounds); store still masked.
     const char* row_ptr0 = A + (long long)row0 * row_stride;
@@ -184,6 +189,126 @@ extern "C" __global__ void HIPFIRE_MOE_DOWN_KERNEL(
         if (have_row1) expert_outputs[out_base + row1] = bcc;
         if (have_row2) expert_outputs[out_base + row2] = ccc;
         if (have_row3) expert_outputs[out_base + row3] = dcc;
+    }
+    } else {
+        // ── Generic group count (groups_per_row != 2) ─────────────────────
+        // Restored from the pre-July-2026 baseline (before the R17c1 K=512
+        // specialization): quads+tail loop over ALL 256-groups. Four rows
+        // per block share the activation x; each row accumulates its own
+        // four pairwise slots. Correct for any K % 256 == 0 (e.g. lfm2moe
+        // down K=1792 → 7 groups) — the fast path above would silently
+        // drop groups 2+.
+        const long long row_stride = (long long)groups_per_row * 136;
+        const char* row_ptr0 = A + (long long)row0 * row_stride;
+        const char* row_ptr1 = A + (long long)(have_row1 ? row1 : row0) * row_stride;
+        const char* row_ptr2 = A + (long long)(have_row2 ? row2 : row0) * row_stride;
+        const char* row_ptr3 = A + (long long)(have_row3 ? row3 : row0) * row_stride;
+        const int boff = tid * 4;
+        const int quads = groups_per_row >> 2;
+        const int tail = groups_per_row & 3;
+
+        float racc[4][4] = {{0.0f, 0.0f, 0.0f, 0.0f},
+                            {0.0f, 0.0f, 0.0f, 0.0f},
+                            {0.0f, 0.0f, 0.0f, 0.0f},
+                            {0.0f, 0.0f, 0.0f, 0.0f}};
+        const char* row_ptrs[4] = {row_ptr0, row_ptr1, row_ptr2, row_ptr3};
+
+        #define DOG(pk, sc, zp, b, a) \
+            (a) += (sc * (float)((pk) & 0xFu)        + zp) * x[(b)]     \
+                 + (sc * (float)(((pk) >> 4) & 0xFu)  + zp) * x[(b) + 1] \
+                 + (sc * (float)(((pk) >> 8) & 0xFu)  + zp) * x[(b) + 2] \
+                 + (sc * (float)(((pk) >> 12) & 0xFu) + zp) * x[(b) + 3] \
+                 + (sc * (float)(((pk) >> 16) & 0xFu) + zp) * x[(b) + 4] \
+                 + (sc * (float)(((pk) >> 20) & 0xFu) + zp) * x[(b) + 5] \
+                 + (sc * (float)(((pk) >> 24) & 0xFu) + zp) * x[(b) + 6] \
+                 + (sc * (float)(((pk) >> 28) & 0xFu) + zp) * x[(b) + 7]
+
+        for (int r = 0; r < 4; r++) {
+            const char* rp = row_ptrs[r];
+            for (int q = 0; q < quads; q++) {
+                const int g = q << 2;
+                const char* gp0 = rp + g * 136;
+                const char* gp1 = gp0 + 136;
+                const char* gp2 = gp1 + 136;
+                const char* gp3 = gp2 + 136;
+
+                float sc0 = __builtin_bit_cast(float, *(const unsigned int*)(gp0));
+                float zp0 = __builtin_bit_cast(float, *(const unsigned int*)(gp0 + 4));
+                float sc1 = __builtin_bit_cast(float, *(const unsigned int*)(gp1));
+                float zp1 = __builtin_bit_cast(float, *(const unsigned int*)(gp1 + 4));
+                float sc2 = __builtin_bit_cast(float, *(const unsigned int*)(gp2));
+                float zp2 = __builtin_bit_cast(float, *(const unsigned int*)(gp2 + 4));
+                float sc3 = __builtin_bit_cast(float, *(const unsigned int*)(gp3));
+                float zp3 = __builtin_bit_cast(float, *(const unsigned int*)(gp3 + 4));
+
+                unsigned int pk0 = *(const unsigned int*)(gp0 + 8 + boff);
+                unsigned int pk1 = *(const unsigned int*)(gp1 + 8 + boff);
+                unsigned int pk2 = *(const unsigned int*)(gp2 + 8 + boff);
+                unsigned int pk3 = *(const unsigned int*)(gp3 + 8 + boff);
+
+                int base = g * 256 + tid * 8;
+
+                DOG(pk0, sc0, zp0, base, racc[r][0]);
+                DOG(pk1, sc1, zp1, base + 256, racc[r][1]);
+                DOG(pk2, sc2, zp2, base + 512, racc[r][2]);
+                DOG(pk3, sc3, zp3, base + 768, racc[r][3]);
+            }
+            const int tg = quads << 2;
+            #define TAIL_DOG(pk, sc, zp, b, a) \
+                (a) += (sc * (float)((pk) & 0xFu)        + zp) * x[(b)]     \
+                     + (sc * (float)(((pk) >> 4) & 0xFu)  + zp) * x[(b) + 1] \
+                     + (sc * (float)(((pk) >> 8) & 0xFu)  + zp) * x[(b) + 2] \
+                     + (sc * (float)(((pk) >> 12) & 0xFu) + zp) * x[(b) + 3] \
+                     + (sc * (float)(((pk) >> 16) & 0xFu) + zp) * x[(b) + 4] \
+                     + (sc * (float)(((pk) >> 20) & 0xFu) + zp) * x[(b) + 5] \
+                     + (sc * (float)(((pk) >> 24) & 0xFu) + zp) * x[(b) + 6] \
+                     + (sc * (float)(((pk) >> 28) & 0xFu) + zp) * x[(b) + 7]
+            if (tail >= 1) {
+                const char* gp = rp + tg * 136;
+                float sc = __builtin_bit_cast(float, *(const unsigned int*)(gp));
+                float zp = __builtin_bit_cast(float, *(const unsigned int*)(gp + 4));
+                unsigned int pk = *(const unsigned int*)(gp + 8 + boff);
+                TAIL_DOG(pk, sc, zp, tg * 256 + tid * 8, racc[r][0]);
+            }
+            if (tail >= 2) {
+                const char* gp = rp + (tg + 1) * 136;
+                float sc = __builtin_bit_cast(float, *(const unsigned int*)(gp));
+                float zp = __builtin_bit_cast(float, *(const unsigned int*)(gp + 4));
+                unsigned int pk = *(const unsigned int*)(gp + 8 + boff);
+                TAIL_DOG(pk, sc, zp, (tg + 1) * 256 + tid * 8, racc[r][1]);
+            }
+            if (tail >= 3) {
+                const char* gp = rp + (tg + 2) * 136;
+                float sc = __builtin_bit_cast(float, *(const unsigned int*)(gp));
+                float zp = __builtin_bit_cast(float, *(const unsigned int*)(gp + 4));
+                unsigned int pk = *(const unsigned int*)(gp + 8 + boff);
+                TAIL_DOG(pk, sc, zp, (tg + 2) * 256 + tid * 8, racc[r][2]);
+            }
+            #undef TAIL_DOG
+        }
+        #undef DOG
+
+        float acc = (racc[0][0] + racc[0][1]) + (racc[0][2] + racc[0][3]);
+        float bcc = (racc[1][0] + racc[1][1]) + (racc[1][2] + racc[1][3]);
+        float ccc = (racc[2][0] + racc[2][1]) + (racc[2][2] + racc[2][3]);
+        float dcc = (racc[3][0] + racc[3][1]) + (racc[3][2] + racc[3][3]);
+        for (int offset = 16; offset > 0; offset >>= 1)
+            acc += __shfl_down(acc, offset);
+        for (int offset = 16; offset > 0; offset >>= 1)
+            bcc += __shfl_down(bcc, offset);
+        for (int offset = 16; offset > 0; offset >>= 1)
+            ccc += __shfl_down(ccc, offset);
+        for (int offset = 16; offset > 0; offset >>= 1)
+            dcc += __shfl_down(dcc, offset);
+
+        if (tid == 0) {
+            const long long out_base =
+                ((long long)bid * K_TOP + krank) * (long long)M;
+            expert_outputs[out_base + row0] = acc;
+            if (have_row1) expert_outputs[out_base + row1] = bcc;
+            if (have_row2) expert_outputs[out_base + row2] = ccc;
+            if (have_row3) expert_outputs[out_base + row3] = dcc;
+        }
     }
 
 #if HIPFIRE_MOE_DOWN_LAST_COMBINE
