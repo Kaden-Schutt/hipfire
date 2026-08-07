@@ -9440,61 +9440,6 @@ impl Gpu {
         )
     }
 
-    /// Publish this rank's TP4 epoch, then wait for the other three ranks in
-    /// one graph node. Exact gfx1201 only; TP3 retains separate store/wait2
-    /// nodes so its accepted route is unchanged.
-    pub fn tp_graph_signal_barrier3_gfx1201(
-        &mut self,
-        signal: &DeviceBuffer,
-        peers: [&DeviceBuffer; 3],
-        epoch: u32,
-    ) -> HipResult<()> {
-        self.bind_thread()?;
-        if !self.arch_caps.is_gfx1201() {
-            return Err(hip_bridge::HipError::new(
-                0,
-                &format!(
-                    "tp_graph_signal_barrier3_gfx1201 requires gfx1201, got {}",
-                    self.arch
-                ),
-            ));
-        }
-        self.ensure_kernel(
-            "tp_graph_signal_barrier3_gfx1201",
-            kernels::TP_GRAPH_SIGNAL_GFX1201_SRC,
-            "tp_graph_signal_barrier3_gfx1201",
-        )?;
-
-        let signal_ptr = signal.as_ptr();
-        let signal0 = peers[0].as_ptr();
-        let signal1 = peers[1].as_ptr();
-        let signal2 = peers[2].as_ptr();
-        let mut epoch_arg = epoch;
-        let mut params: Vec<*mut c_void> = vec![
-            &signal_ptr as *const _ as *mut c_void,
-            &signal0 as *const _ as *mut c_void,
-            &signal1 as *const _ as *mut c_void,
-            &signal2 as *const _ as *mut c_void,
-            &mut epoch_arg as *mut _ as *mut c_void,
-        ];
-        self.launch_maybe_blob(
-            "tp_graph_signal_barrier3_gfx1201",
-            [1, 1, 1],
-            [64, 1, 1],
-            0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(signal_ptr);
-                b.push_ptr(signal0);
-                b.push_ptr(signal1);
-                b.push_ptr(signal2);
-                b.push_u32(epoch);
-                b
-            },
-        )
-    }
-
     pub fn hc_mix_4stream_batched(
         &mut self,
         x_in: &GpuTensor,          // [batch, 4, hidden]
