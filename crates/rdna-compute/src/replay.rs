@@ -30,6 +30,8 @@ use redline_dispatch::aql::{
     SingleQueueBatchSubmission, SingleQueuePm4Ib,
 };
 
+pub use redline_dispatch::aql::HostGate as AqlHostGate;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReplayBackendRequest {
     Hip,
@@ -2489,6 +2491,32 @@ impl CheckpointedLinearAqlSubmission<'_> {
         result
     }
 
+    pub fn wait_next_host_gate(&mut self, timeout: std::time::Duration) -> Result<usize, String> {
+        let result = self
+            .submission
+            .as_mut()
+            .expect("checkpointed AQL submission was already completed")
+            .wait_next_host_gate(timeout)
+            .map_err(|error| error.to_string());
+        if result.is_err() {
+            self.observation.failed = true;
+        }
+        result
+    }
+
+    pub fn resume_host_gate(&mut self, gate_index: usize) -> Result<(), String> {
+        let result = self
+            .submission
+            .as_mut()
+            .expect("checkpointed AQL submission was already completed")
+            .resume_host_gate(gate_index)
+            .map_err(|error| error.to_string());
+        if result.is_err() {
+            self.observation.failed = true;
+        }
+        result
+    }
+
     pub fn wait(mut self, timeout: std::time::Duration) -> Result<GpuBatchTiming, String> {
         let result = self
             .submission
@@ -2508,6 +2536,20 @@ impl CheckpointedLinearAqlSubmission<'_> {
                 Err(error)
             }
         }
+    }
+
+    /// Inactivate the owner queue without waiting for a gate that the host has
+    /// intentionally left closed. This is the finite teardown path used by
+    /// timeout and survivability probes.
+    pub fn cancel(mut self) -> Result<(), String> {
+        let result = self
+            .submission
+            .take()
+            .expect("checkpointed AQL submission was already completed")
+            .cancel()
+            .map_err(|error| error.to_string());
+        self.observation.failed = true;
+        result
     }
 }
 
@@ -3280,7 +3322,12 @@ impl ReplayController {
         device_ordinal: usize,
         prefix: usize,
     ) -> Result<(usize, usize, u64), String> {
-        self.prepare_linear_aql_prefix_inner(GpuSelector::Ordinal(device_ordinal), prefix, None)
+        self.prepare_linear_aql_prefix_inner(
+            GpuSelector::Ordinal(device_ordinal),
+            prefix,
+            None,
+            Vec::new(),
+        )
     }
 
     /// Lower one exact-BDF owner-local batch with a host-observable checkpoint
@@ -3299,6 +3346,31 @@ impl ReplayController {
             GpuSelector::PciBusId(pci_bus_id),
             prefix,
             Some(checkpoint_dispatch),
+            Vec::new(),
+        )
+    }
+
+    /// Lower one captured owner-local batch with multiple ordered host gates.
+    /// The complete packet batch is published to one exact-BDF queue with one
+    /// doorbell. Every gate uses an owner-local HSA signal and must be resumed
+    /// in capture order before terminal completion can be observed.
+    pub fn prepare_host_gated_linear_aql_prefix_for_pci_bus_id(
+        &mut self,
+        pci_bus_id: &str,
+        prefix: usize,
+        host_gates: &[AqlHostGate],
+    ) -> Result<(usize, usize, u64), String> {
+        if host_gates.is_empty() {
+            return Err("host-gated AQL requires at least one gate".to_owned());
+        }
+        let pci_bus_id = pci_bus_id
+            .parse::<PciBusId>()
+            .map_err(|error| error.to_string())?;
+        self.prepare_linear_aql_prefix_inner(
+            GpuSelector::PciBusId(pci_bus_id),
+            prefix,
+            None,
+            host_gates.to_vec(),
         )
     }
 
@@ -3307,6 +3379,7 @@ impl ReplayController {
         selector: GpuSelector,
         prefix: usize,
         checkpoint_dispatch: Option<usize>,
+        host_gates: Vec<AqlHostGate>,
     ) -> Result<(usize, usize, u64), String> {
         if self.recorded.is_empty() {
             return Err("no captured launch sequence".to_owned());
@@ -3380,7 +3453,8 @@ impl ReplayController {
 
         let required = dispatches
             .len()
-            .checked_add(1)
+            .checked_add(host_gates.len())
+            .and_then(|packets| packets.checked_add(1))
             .ok_or_else(|| "AQL packet count overflow".to_owned())?;
         let queue_size = required
             .next_power_of_two()
@@ -3436,7 +3510,11 @@ impl ReplayController {
                 _ => {}
             }
         }
-        if let Some(checkpoint) = checkpoint_dispatch {
+        let checkpoint_dispatches = checkpoint_dispatch
+            .into_iter()
+            .chain(host_gates.iter().map(|gate| gate.checkpoint_dispatch))
+            .collect::<Vec<_>>();
+        for checkpoint in checkpoint_dispatches {
             let dispatch_count = headers.len();
             let header = headers.get_mut(checkpoint).ok_or_else(|| {
                 format!(
@@ -3446,7 +3524,16 @@ impl ReplayController {
             })?;
             header.release = FenceScope::System;
         }
-        let graph = if checkpoint_dispatch.is_some() {
+        let graph = if !host_gates.is_empty() {
+            SingleQueueBatchGraph::create_host_gated_unprofiled_with_dispatch_headers(
+                &device,
+                queue_size,
+                dispatches,
+                BatchFencePolicy::BoundarySerialized,
+                headers,
+                host_gates,
+            )
+        } else if checkpoint_dispatch.is_some() {
             SingleQueueBatchGraph::create_checkpointed_unprofiled_with_dispatch_headers(
                 &device,
                 queue_size,

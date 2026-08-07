@@ -15,14 +15,14 @@ pub use redline_rocr::{
     AqlQueue, BARRIER_DEPENDENCY_CAPACITY, CompletionSignal, Executable, FenceScope,
     Gfx10DispatchInitiatorPolicy, Gfx10KernelImage, Gfx10Pm4BuildError, Gfx10Pm4CommandBuffer,
     Gfx11ComputeResourceLimitsPolicy, Gfx11DispatchInterleave, Gfx11Pm4CommandBuffer,
-    Gfx12Pm4CommandBuffer, GpuDevice, GpuSelector, HeaderPolicy, KernargBuffer, KernargPool, Kernel,
-    KernelMetadata, KernelPm4Metadata, LaunchGeometry, LoadError, MissingSymbol, PacketError,
-    PciBusId, PciBusIdParseError, Pm4BuildError, QueueDepthReport, QueueDepthSample,
+    Gfx12Pm4CommandBuffer, GpuDevice, GpuSelector, HeaderPolicy, KernargBuffer, KernargPool,
+    Kernel, KernelMetadata, KernelPm4Metadata, LaunchGeometry, LoadError, MissingSymbol,
+    PacketError, PciBusId, PciBusIdParseError, Pm4BuildError, QueueDepthReport, QueueDepthSample,
     QueueDepthStats, QueueSet, Runtime, RuntimeError, Symbols, load_symbols,
 };
 pub use replay::{
-    BatchFencePolicy, GpuBatchTiming, GpuMultiQueueTiming, PhasedMultiQueuePm4Ib, RecordedDispatch,
-    RecordedGraph, ReplayError, ReplaySubmission, SingleQueueBatchGraph,
+    BatchFencePolicy, GpuBatchTiming, GpuMultiQueueTiming, HostGate, PhasedMultiQueuePm4Ib,
+    RecordedDispatch, RecordedGraph, ReplayError, ReplaySubmission, SingleQueueBatchGraph,
     SingleQueueBatchSubmission, SingleQueuePm4Ib, TwoQueueBatchSubmission, TwoQueuePhase,
     TwoQueuePhasedGraph, TwoQueueSerializedBatchGraph, TwoQueueSubmission,
 };

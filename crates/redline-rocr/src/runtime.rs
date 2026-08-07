@@ -821,9 +821,22 @@ impl CompletionSignal {
     /// Reset a signal after its previous use has completed.
     pub fn reset(&mut self) {
         // SAFETY: `&mut self` prevents concurrent safe reset/wait through this
-        // owner. This operation is crate-private so only the replay state
-        // machine can reset after observing completion.
+        // owner. Replay state machines call this only after observing prior
+        // completion or cancellation.
         unsafe { (self.runtime.symbols.signal_store_screlease)(self.raw, 1) };
+    }
+
+    /// Publish completion from the host to an owner-local AQL barrier.
+    ///
+    /// The signal must have been reset to one before queue publication, and
+    /// the referencing queue must be quiescent before it is reset again. A
+    /// system-release store pairs with a system-acquire barrier packet so
+    /// owner-local GPU work can safely consume host-published payload bytes.
+    /// `&mut self` prevents two safe host publishers from racing the release.
+    pub fn complete_from_host(&mut self) {
+        // SAFETY: this signal remains owned and live. HSA signals explicitly
+        // permit host stores while an agent waits on the same signal.
+        unsafe { (self.runtime.symbols.signal_store_screlease)(self.raw, 0) };
     }
 
     pub fn is_complete(&self) -> bool {

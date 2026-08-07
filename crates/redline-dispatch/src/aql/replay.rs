@@ -1457,13 +1457,59 @@ impl GpuBatchTiming {
 /// Exactly the first and last dispatch carry profiling signals; the terminal
 /// barrier carries the host completion signal. This avoids attaching a signal
 /// to every dispatch and perturbing the policy under test.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HostGate {
+    /// Dispatch whose System-release completion publishes route data to the
+    /// host. Dispatches after this point may continue until `resume_before`.
+    pub checkpoint_dispatch: usize,
+    /// Insert an owner-local barrier immediately before this dispatch. The
+    /// barrier resumes only after the host publishes the corresponding result.
+    pub resume_before: usize,
+}
+
+fn validate_host_gates(dispatch_count: usize, gates: &[HostGate]) -> Result<(), ReplayError> {
+    let mut previous: Option<HostGate> = None;
+    for (index, gate) in gates.iter().enumerate() {
+        if gate.checkpoint_dispatch >= dispatch_count || gate.resume_before >= dispatch_count {
+            return Err(ReplayError::PolicyShapeMismatch {
+                detail: format!(
+                    "host gate {index} ({}, {}) exceeds {dispatch_count} dispatches",
+                    gate.checkpoint_dispatch, gate.resume_before
+                ),
+            });
+        }
+        if gate.checkpoint_dispatch >= gate.resume_before {
+            return Err(ReplayError::PolicyShapeMismatch {
+                detail: format!(
+                    "host gate {index} checkpoint {} must precede resume dispatch {}",
+                    gate.checkpoint_dispatch, gate.resume_before
+                ),
+            });
+        }
+        if let Some(previous) = previous {
+            if previous.resume_before > gate.checkpoint_dispatch {
+                return Err(ReplayError::PolicyShapeMismatch {
+                    detail: format!(
+                        "host gate {index} checkpoint {} overlaps prior resume dispatch {}",
+                        gate.checkpoint_dispatch, previous.resume_before
+                    ),
+                });
+            }
+        }
+        previous = Some(*gate);
+    }
+    Ok(())
+}
+
 pub struct SingleQueueBatchGraph {
     device: GpuDevice,
     queues: QueueSet,
     dispatches: Vec<RecordedDispatch>,
     first_signal: CompletionSignal,
     last_signal: CompletionSignal,
-    checkpoint_signal: Option<CompletionSignal>,
+    checkpoint_signals: Vec<CompletionSignal>,
+    resume_signals: Vec<CompletionSignal>,
+    host_gates: Vec<HostGate>,
     final_signal: CompletionSignal,
     batch: Vec<PacketImage>,
     policy: BatchFencePolicy,
@@ -1506,7 +1552,14 @@ impl SingleQueueBatchGraph {
         headers: Vec<redline_rocr::HeaderPolicy>,
     ) -> Result<Self, ReplayError> {
         Self::create_with_dispatch_headers_mode(
-            device, queue_size, dispatches, policy, headers, true, None,
+            device,
+            queue_size,
+            dispatches,
+            policy,
+            headers,
+            true,
+            None,
+            Vec::new(),
         )
     }
 
@@ -1518,7 +1571,14 @@ impl SingleQueueBatchGraph {
         headers: Vec<redline_rocr::HeaderPolicy>,
     ) -> Result<Self, ReplayError> {
         Self::create_with_dispatch_headers_mode(
-            device, queue_size, dispatches, policy, headers, false, None,
+            device,
+            queue_size,
+            dispatches,
+            policy,
+            headers,
+            false,
+            None,
+            Vec::new(),
         )
     }
 
@@ -1545,6 +1605,27 @@ impl SingleQueueBatchGraph {
             headers,
             false,
             Some(checkpoint_dispatch),
+            Vec::new(),
+        )
+    }
+
+    /// Build one retained owner-local queue containing multiple finite
+    /// host-supervised checkpoints. Each checkpoint publishes preceding route
+    /// data, permits owner-local tail work to continue, and then stops at a
+    /// barrier until the host releases the corresponding owner-local signal.
+    ///
+    /// Queue publication and the doorbell happen once for the complete batch.
+    /// No signal in this graph is owned by another GPU agent.
+    pub fn create_host_gated_unprofiled_with_dispatch_headers(
+        device: &GpuDevice,
+        queue_size: u32,
+        dispatches: Vec<RecordedDispatch>,
+        policy: BatchFencePolicy,
+        headers: Vec<redline_rocr::HeaderPolicy>,
+        host_gates: Vec<HostGate>,
+    ) -> Result<Self, ReplayError> {
+        Self::create_with_dispatch_headers_mode(
+            device, queue_size, dispatches, policy, headers, false, None, host_gates,
         )
     }
 
@@ -1556,6 +1637,7 @@ impl SingleQueueBatchGraph {
         headers: Vec<redline_rocr::HeaderPolicy>,
         profiling: bool,
         checkpoint_dispatch: Option<usize>,
+        host_gates: Vec<HostGate>,
     ) -> Result<Self, ReplayError> {
         if dispatches.len() < 2 {
             return Err(ReplayError::InvalidBatchShape(
@@ -1571,8 +1653,18 @@ impl SingleQueueBatchGraph {
                 ),
             });
         }
-        if let Some(checkpoint) = checkpoint_dispatch {
-            let Some(header) = headers.get(checkpoint) else {
+        if checkpoint_dispatch.is_some() && !host_gates.is_empty() {
+            return Err(ReplayError::PolicyShapeMismatch {
+                detail: "single checkpoint and host gates are mutually exclusive".to_owned(),
+            });
+        }
+        validate_host_gates(dispatches.len(), &host_gates)?;
+        let checkpoint_dispatches = checkpoint_dispatch
+            .into_iter()
+            .chain(host_gates.iter().map(|gate| gate.checkpoint_dispatch))
+            .collect::<Vec<_>>();
+        for checkpoint in &checkpoint_dispatches {
+            let Some(header) = headers.get(*checkpoint) else {
                 return Err(ReplayError::PolicyShapeMismatch {
                     detail: format!(
                         "checkpoint dispatch {checkpoint} exceeds {} dispatches",
@@ -1607,17 +1699,34 @@ impl SingleQueueBatchGraph {
         }
         let first_signal = CompletionSignal::new(device)?;
         let last_signal = CompletionSignal::new(device)?;
-        let checkpoint_signal = checkpoint_dispatch
-            .map(|_| CompletionSignal::new(device))
-            .transpose()?;
+        let mut checkpoint_signals = Vec::with_capacity(checkpoint_dispatches.len());
+        for _ in &checkpoint_dispatches {
+            checkpoint_signals.push(CompletionSignal::new(device)?);
+        }
+        let mut resume_signals = Vec::with_capacity(host_gates.len());
+        for _ in &host_gates {
+            resume_signals.push(CompletionSignal::new(device)?);
+        }
         let final_signal = CompletionSignal::new(device)?;
-        let mut batch = Vec::with_capacity(dispatches.len() + 1);
+        let mut batch = Vec::with_capacity(dispatches.len() + host_gates.len() + 1);
         for (index, (dispatch, header)) in dispatches.iter().zip(&headers).enumerate() {
-            let completion = if checkpoint_dispatch == Some(index) {
-                checkpoint_signal
-                    .as_ref()
-                    .expect("checkpoint dispatch owns a signal")
-                    .raw()
+            if let Some((gate_index, _)) = host_gates
+                .iter()
+                .enumerate()
+                .find(|(_, gate)| gate.resume_before == index)
+            {
+                let barrier = BarrierAndPacket::new_with_policy(
+                    &[resume_signals[gate_index].raw()],
+                    abi::Signal(0),
+                    HeaderPolicy::BATCH_INTERNAL_ACQUIRE_SYSTEM,
+                )?;
+                batch.push(PacketImage::barrier(&barrier));
+            }
+            let completion = if let Some(checkpoint_index) = checkpoint_dispatches
+                .iter()
+                .position(|checkpoint| *checkpoint == index)
+            {
+                checkpoint_signals[checkpoint_index].raw()
             } else if profiling && index == 0 {
                 first_signal.raw()
             } else if profiling && index + 1 == dispatches.len() {
@@ -1666,7 +1775,9 @@ impl SingleQueueBatchGraph {
             dispatches,
             first_signal,
             last_signal,
-            checkpoint_signal,
+            checkpoint_signals,
+            resume_signals,
+            host_gates,
             final_signal,
             batch,
             policy,
@@ -1694,7 +1805,11 @@ impl SingleQueueBatchGraph {
     }
 
     pub fn has_checkpoint(&self) -> bool {
-        self.checkpoint_signal.is_some()
+        !self.checkpoint_signals.is_empty()
+    }
+
+    pub fn host_gate_count(&self) -> usize {
+        self.host_gates.len()
     }
 
     /// Patch one explicitly bounded field in retained kernarg storage between
@@ -1762,7 +1877,10 @@ impl SingleQueueBatchGraph {
         }
         self.first_signal.reset();
         self.last_signal.reset();
-        if let Some(signal) = &mut self.checkpoint_signal {
+        for signal in &mut self.checkpoint_signals {
+            signal.reset();
+        }
+        for signal in &mut self.resume_signals {
             signal.reset();
         }
         self.final_signal.reset();
@@ -1782,6 +1900,8 @@ impl SingleQueueBatchGraph {
         Ok(SingleQueueBatchSubmission {
             graph: self,
             completed: false,
+            next_host_gate: 0,
+            ready_host_gate: None,
         })
     }
 
@@ -1852,18 +1972,22 @@ impl SingleQueueBatchGraph {
         }
     }
 
-    fn wait_checkpoint_internal(&mut self, timeout: Duration) -> Result<(), ReplayError> {
+    fn wait_checkpoint_internal(
+        &mut self,
+        checkpoint_index: usize,
+        timeout: Duration,
+    ) -> Result<(), ReplayError> {
         if !self.in_flight {
             return Err(ReplayError::InvalidBatchShape(
                 "single-queue batch has no active submission",
             ));
         }
-        let signal = self
-            .checkpoint_signal
-            .as_ref()
-            .ok_or(ReplayError::InvalidBatchShape(
-                "single-queue batch has no checkpoint",
-            ))?;
+        let signal =
+            self.checkpoint_signals
+                .get(checkpoint_index)
+                .ok_or(ReplayError::InvalidBatchShape(
+                    "checkpoint index is invalid",
+                ))?;
         match self.queues.wait_signal(signal, timeout) {
             Ok(()) => Ok(()),
             Err(wait_error) => match self.queues.inactivate_all() {
@@ -1889,6 +2013,20 @@ impl SingleQueueBatchGraph {
                 }
             },
         }
+    }
+
+    fn release_host_gate_internal(&mut self, gate_index: usize) -> Result<(), ReplayError> {
+        if !self.in_flight {
+            return Err(ReplayError::InvalidBatchShape(
+                "single-queue batch has no active submission",
+            ));
+        }
+        let signal = self
+            .resume_signals
+            .get_mut(gate_index)
+            .ok_or(ReplayError::InvalidBatchShape("host gate index is invalid"))?;
+        signal.complete_from_host();
+        Ok(())
     }
 
     fn cancel_internal(&mut self) -> Result<(), ReplayError> {
@@ -1926,6 +2064,8 @@ impl Drop for SingleQueueBatchGraph {
 pub struct SingleQueueBatchSubmission<'a> {
     graph: &'a mut SingleQueueBatchGraph,
     completed: bool,
+    next_host_gate: usize,
+    ready_host_gate: Option<usize>,
 }
 
 impl SingleQueueBatchSubmission<'_> {
@@ -1936,7 +2076,50 @@ impl SingleQueueBatchSubmission<'_> {
     }
 
     pub fn wait_checkpoint_timeout(&mut self, timeout: Duration) -> Result<(), ReplayError> {
-        self.graph.wait_checkpoint_internal(timeout)
+        if self.graph.host_gate_count() != 0 {
+            return Err(ReplayError::InvalidBatchShape(
+                "host-gated batches must use wait_next_host_gate",
+            ));
+        }
+        self.graph.wait_checkpoint_internal(0, timeout)
+    }
+
+    /// Wait for the next host gate's route checkpoint. Checkpoints and resumes
+    /// must be consumed in capture order so a stale host response cannot open a
+    /// later layer gate.
+    pub fn wait_next_host_gate(&mut self, timeout: Duration) -> Result<usize, ReplayError> {
+        if self.graph.host_gate_count() == 0 {
+            return Err(ReplayError::InvalidBatchShape(
+                "single-queue batch has no host gates",
+            ));
+        }
+        if self.ready_host_gate.is_some() {
+            return Err(ReplayError::InvalidBatchShape(
+                "the current host gate must resume before waiting for another checkpoint",
+            ));
+        }
+        if self.next_host_gate >= self.graph.host_gate_count() {
+            return Err(ReplayError::InvalidBatchShape(
+                "all host gates have already resumed",
+            ));
+        }
+        self.graph
+            .wait_checkpoint_internal(self.next_host_gate, timeout)?;
+        self.ready_host_gate = Some(self.next_host_gate);
+        Ok(self.next_host_gate)
+    }
+
+    /// Publish the current owner-local result and release its queue barrier.
+    pub fn resume_host_gate(&mut self, gate_index: usize) -> Result<(), ReplayError> {
+        if self.ready_host_gate != Some(gate_index) {
+            return Err(ReplayError::InvalidBatchShape(
+                "host gates must resume in checkpoint order",
+            ));
+        }
+        self.graph.release_host_gate_internal(gate_index)?;
+        self.ready_host_gate = None;
+        self.next_host_gate += 1;
+        Ok(())
     }
 
     pub fn wait(self) -> Result<GpuBatchTiming, ReplayError> {
@@ -1944,6 +2127,16 @@ impl SingleQueueBatchSubmission<'_> {
     }
 
     pub fn wait_timeout(mut self, timeout: Duration) -> Result<GpuBatchTiming, ReplayError> {
+        if self.ready_host_gate.is_some() || self.next_host_gate < self.graph.host_gate_count() {
+            let cancel = self.graph.cancel_internal();
+            self.completed = true;
+            if let Err(error) = cancel {
+                return Err(error);
+            }
+            return Err(ReplayError::InvalidBatchShape(
+                "cannot wait for terminal completion before every host gate resumes",
+            ));
+        }
         let result = self.graph.wait_internal(timeout);
         self.completed = true;
         result
@@ -3497,5 +3690,44 @@ mod tests {
         apply_quiescence_transition(&mut in_flight, &mut usable, QuiescenceTransition::Cancelled);
         assert!(!in_flight);
         assert!(!usable);
+    }
+
+    #[test]
+    fn host_gates_require_ordered_nonoverlapping_dispatch_cuts() {
+        let valid = [
+            HostGate {
+                checkpoint_dispatch: 1,
+                resume_before: 3,
+            },
+            HostGate {
+                checkpoint_dispatch: 4,
+                resume_before: 6,
+            },
+        ];
+        validate_host_gates(8, &valid).unwrap();
+
+        let reversed = [HostGate {
+            checkpoint_dispatch: 3,
+            resume_before: 3,
+        }];
+        assert!(matches!(
+            validate_host_gates(8, &reversed),
+            Err(ReplayError::PolicyShapeMismatch { .. })
+        ));
+
+        let overlapping = [
+            HostGate {
+                checkpoint_dispatch: 1,
+                resume_before: 5,
+            },
+            HostGate {
+                checkpoint_dispatch: 4,
+                resume_before: 6,
+            },
+        ];
+        assert!(matches!(
+            validate_host_gates(8, &overlapping),
+            Err(ReplayError::PolicyShapeMismatch { .. })
+        ));
     }
 }
