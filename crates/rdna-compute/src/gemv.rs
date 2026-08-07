@@ -4523,10 +4523,9 @@ impl Gpu {
         )
     }
 
-    /// Exact-gfx1100 two-pair VMEM-window screen for the accepted raw-buffer
-    /// E8 kernel. Arithmetic and reduction order remain bit-identical; this is
-    /// an explicit micro surface until the occurrence-weighted route clears the
-    /// product admission floor.
+    /// Exact-gfx1100 two-pair VMEM window for the accepted raw-buffer E8
+    /// kernel. Arithmetic and reduction order remain bit-identical. DeepSeek4
+    /// selects this only when its compute owner is exact gfx1100.
     pub fn gemv_mfp4g32_e8_soa_prefetch4_buffer_gfx1100(
         &mut self,
         a_raw: &GpuTensor,
