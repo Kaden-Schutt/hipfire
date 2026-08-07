@@ -21,6 +21,8 @@ use rdna_compute::{DType, Gpu, GpuTensor};
 use serde::Serialize;
 
 use crate::deepseek4::{DeepseekV4Config, DeepseekV4RoutedWeights};
+#[cfg(not(feature = "harmonic-stage-profile"))]
+use crate::harmonic::HARMONIC_EXPERT_IDS_OFFSET;
 use crate::harmonic::{
     unpack_harmonic_x_rot, HarmonicCompletion, HarmonicContract, HarmonicOwner,
     HARMONIC_EXPERT_COUNT, HARMONIC_HIDDEN_SIZE, HARMONIC_HOTSET_ROUTE_IDENTITY,
@@ -762,10 +764,14 @@ impl DeepseekV4HarmonicExpertService {
                 result_fingerprint: 0,
             });
         }
-        encode_words(&packet.expert_ids, &mut self.topk_index_bytes);
         gpu.bind_thread()
             .map_err(|error| format!("harmonic split expert bind execute: {error}"))?;
-        {
+        #[cfg(feature = "harmonic-stage-profile")]
+        let upload_topk = true;
+        #[cfg(not(feature = "harmonic-stage-profile"))]
+        let upload_topk = self.retained_split.is_none();
+        if upload_topk {
+            encode_words(&packet.expert_ids, &mut self.topk_index_bytes);
             let stream = gpu
                 .active_stream
                 .as_ref()
@@ -788,6 +794,25 @@ impl DeepseekV4HarmonicExpertService {
             shape: vec![HARMONIC_HIDDEN_SIZE],
             dtype: DType::F32,
         };
+        #[cfg(not(feature = "harmonic-stage-profile"))]
+        let mapped_topk = self.retained_split.as_ref().map(|_| GpuTensor {
+            // SAFETY: the source mirrors the packed expert IDs into this
+            // registered activation slot before release-publishing the epoch.
+            // The worker acquires Published before reaching this call, and the
+            // mapping remains live until the synchronous retained replay ends.
+            buf: unsafe {
+                DeviceBuffer::from_raw(
+                    activation_payload
+                        .as_ptr()
+                        .cast::<u8>()
+                        .add(HARMONIC_EXPERT_IDS_OFFSET)
+                        .cast(),
+                    HARMONIC_TOP_K * std::mem::size_of::<u32>(),
+                )
+            },
+            shape: vec![HARMONIC_TOP_K],
+            dtype: DType::F32,
+        });
         let layer_index = packet.layer as usize;
         let layer = weights.resolve_layer(layer_index);
         let expert_gate_up_ptrs = layer.expert_gate_up_ptrs.as_ref().ok_or_else(|| {
@@ -877,12 +902,8 @@ impl DeepseekV4HarmonicExpertService {
         }
         #[cfg(not(feature = "harmonic-stage-profile"))]
         if self.retained_split.is_some() {
-            // The HIP stream owns the tiny top-k upload. Complete it before the
-            // owner-local PM4 queue consumes the stable top-k allocation.
-            gpu.hip
-                .stream_synchronize(gpu.active_stream.as_ref().unwrap())
-                .map_err(|error| format!("harmonic retained top-k visibility: {error}"))?;
             let gate_ptr = (expert_gate_up_ptrs.buf.as_ptr() as usize).to_ne_bytes();
+            let topk_ptr = (mapped_topk.as_ref().unwrap().buf.as_ptr() as usize).to_ne_bytes();
             let activation_ptr = (x_rot.buf.as_ptr() as usize).to_ne_bytes();
             let down_ptr = (expert_down_ptrs.buf.as_ptr() as usize).to_ne_bytes();
             let k_top_i32 = (k_top as i32).to_ne_bytes();
@@ -894,6 +915,11 @@ impl DeepseekV4HarmonicExpertService {
                 },
                 Pm4KernargPatch {
                     dispatch: 0,
+                    offset: 8,
+                    bytes: &topk_ptr,
+                },
+                Pm4KernargPatch {
+                    dispatch: 0,
                     offset: 16,
                     bytes: &activation_ptr,
                 },
@@ -901,6 +927,11 @@ impl DeepseekV4HarmonicExpertService {
                     dispatch: 3,
                     offset: 0,
                     bytes: &down_ptr,
+                },
+                Pm4KernargPatch {
+                    dispatch: 3,
+                    offset: 8,
+                    bytes: &topk_ptr,
                 },
                 Pm4KernargPatch {
                     dispatch: 3,
