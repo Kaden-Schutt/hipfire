@@ -3,8 +3,8 @@
 
 # DeepSeek V4 harmonic execution on gfx1100 + gfx1151
 
-Status: H0-H1 complete; H2 fault-contained transport next; GPU product execution
-prohibited until H2 exits.
+Status: H0-H1 complete; H2 CPU protocol in progress; GPU product execution
+prohibited until H2 exits and the user explicitly authorizes its first GPU run.
 
 Branch: `ds4-beta-staging`
 

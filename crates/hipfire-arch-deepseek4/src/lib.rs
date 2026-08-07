@@ -58,6 +58,7 @@ pub mod dsml;
 pub mod dspark_speculator;
 pub mod forward;
 pub mod grammar;
+pub mod harmonic;
 pub mod heterogeneous;
 pub mod mtp_speculator;
 pub mod parent;
@@ -71,6 +72,10 @@ pub use deepseek4::{
     config_from_safetensors, DeepseekV4Config, DeepseekV4DenseWeights,
     DeepseekV4HeterogeneousWeights, DeepseekV4OwnershipAudit, DeepseekV4RoutedWeights,
     DeepseekV4State, DeepseekV4Weights, IndexerLayerState, MainAttentionLayerState,
+};
+pub use harmonic::{
+    HarmonicCompletion, HarmonicContract, HarmonicOwner, HarmonicProtocolError,
+    HarmonicRoutePacket, HarmonicSlotState, HarmonicSupervisor,
 };
 pub use heterogeneous::{
     ensure_harmonic_execution_admitted, DeepseekV4HeterogeneousLoadPlan,
