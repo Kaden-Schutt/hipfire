@@ -3,7 +3,7 @@
 
 # DS4 harmonic hot-expert residency sizing
 
-Status: **exact-device micro accepted; split product execution not wired**
+Status: **packed split micro accepted; split product execution not wired**
 
 Branch: `ds4-beta-staging`
 
@@ -254,6 +254,45 @@ Transport evidence in the same durable directory:
 | `gfx1151-split-transport.txt` | `5d290af5ab67de7324a1e80b397f2beb79d110c8e5f918ac1ad6738380901a10` |
 | `gfx1100-split-transport.txt` | `f07e169994e665f1662aefda3054c253bd8b546d271a6657801bb8d9bba20a79` |
 
+### 4.5 Packed transport, exact GPU join, and final replica count
+
+The follow-up micro at commit `67f110cc5` measured every packed remote result
+extent from one through six 16 KiB rows. It also introduced a gfx1100-only
+split-combine candidate that consumes local rows from device memory and remote
+rows directly from the registered mapped result allocation. The kernel keeps
+canonical route-slot order and the original six FMA sequence.
+
+The exactness gate covered every one of the 64 possible six-slot ownership
+masks and all 4,096 output columns: **zero raw-bit mismatches** against
+`moe_down_combine_k8_batched`. Direct mapped combine measured 8.252, 10.314,
+12.431, 14.494, 16.611, and 18.743 us/layer for one through six remote rows.
+At three remote rows it replaces a separate 14.005 us mapped read plus about
+5.16 us combine with one 12.431 us kernel.
+
+The occurrence-weighted capacity sweep selects **1,400 resident slots** rather
+than the provisional 2,025-slot maximum:
+
+| Resident slots | Bytes | Eval local-count histogram | Mean local experts | Projected tok/s |
+|---:|---:|---|---:|---:|
+| 1,300 | 9,201,275,200 | `[1342,1789,3931,5646,5311,3108,846]` | 3.115 | 50.180 |
+| 1,350 | 9,555,170,400 | `[1263,1705,3776,5595,5448,3286,900]` | 3.170 | 50.359 |
+| 1,375 | 9,732,118,000 | `[1228,1682,3679,5480,5512,3427,965]` | 3.206 | 50.473 |
+| **1,400** | **9,909,065,600** | **`[1190,1581,3625,5491,5578,3508,1000]`** | **3.238** | **50.483** |
+| 1,425 | 10,086,013,200 | `[1181,1544,3525,5438,5660,3559,1066]` | 3.265 | 50.480 |
+| 1,450 | 10,262,960,800 | `[1154,1506,3461,5426,5701,3620,1105]` | 3.288 | 50.474 |
+
+For 1,400 slots the folded accounting is 3.9319 ms/token on the local expert
+branch, 3.8933 ms/token on the remote branch including its packed publication,
+and 0.5110 ms/token for direct mapped canonical join. Added to the previously
+measured 15.3657 ms/token serial prefix, that is 19.8086 ms/token or 50.483
+tok/s. This remains a **device-useful projection, not a product claim**; it
+admits product integration because it clears the 2% campaign floor and crosses
+T1 without assuming the old host/queue residual disappears for free.
+
+Evidence is under:
+
+`hipx:/home/kaden/ds4-gfx1151-evidence/2026-08-07-harmonic-h4-packed-transport/`
+
 ## 5. Exactness contract
 
 Splitting the six selected experts into two owner-local aggregates would change
@@ -314,18 +353,16 @@ publication remains the admitted control structure.
 
 1. Collect or recover multi-genre 2,048+decode route dumps and cross-validate a
    static or prefill-derived plan. No GPU is needed if dumps already exist.
-2. Select the branch-balanced hot fraction from the measured complete-branch
-   histograms; do not fill VRAM by default.
-3. Micro-screen packed 1..6-row mapped transport and a raw-bit-exact GPU
-   split-combine. Reject a fixed six-row transfer as the product default.
-4. Implement artifact-local subset upload behind the typed plan. Preserve the
+2. Implement the selected 1,400-slot artifact-local subset upload behind the
+   typed plan. Preserve the
    complete gfx1151 residency and fail before allocation on any projection
    mismatch.
-5. Implement per-route-slot result packets and a CPU exact-order oracle before
+3. Implement packed per-route-slot result packets and use the accepted exact
+   GPU split-combine before
    any two-device product run.
-6. Revisit the banked E8 prefetch only after the new branch balance predicts it
+4. Revisit the banked E8 prefetch only after the new branch balance predicts it
    can reduce the maximum branch or serial path.
-7. Run the two-token, 128-token, then canonical 2,048/512 correctness and
+5. Run the two-token, 128-token, then canonical 2,048/512 correctness and
    product gates only after the combined projection exceeds 2%.
 
 No GPU product number, promotion sample, or T1 claim was produced in this
