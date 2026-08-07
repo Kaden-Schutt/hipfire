@@ -158,6 +158,12 @@ fn main() {
     let candidate_up = gpu
         .alloc_tensor(&[TOP_K, GATE_M / 2], rdna_compute::DType::F32)
         .expect("candidate up");
+    let compact_gate = gpu
+        .alloc_tensor(&[TOP_K, GATE_M / 2], rdna_compute::DType::F32)
+        .expect("compact gate");
+    let compact_up = gpu
+        .alloc_tensor(&[TOP_K, GATE_M / 2], rdna_compute::DType::F32)
+        .expect("compact up");
 
     gpu.deepseek4_gemv_mq2g256_lloyd_moe_gate_up_indexed(
         &gate_ptrs, &topk, &x, &base_gate, &base_up, GATE_M, GATE_K, TOP_K,
@@ -177,6 +183,20 @@ fn main() {
             TOP_K,
         )
         .expect("gate candidate");
+    gpu.try_gfx1201()
+        .expect("exact gfx1201")
+        .mq2_lloyd_moe_gate_up_compact_ep(
+            &gate_ptrs,
+            &dummy,
+            &topk,
+            &x,
+            &compact_gate,
+            &compact_up,
+            GATE_M,
+            GATE_K,
+            TOP_K,
+        )
+        .expect("gate compact candidate");
 
     let down_owned0 = gpu
         .upload_raw(
@@ -213,6 +233,9 @@ fn main() {
     let candidate_down = gpu
         .alloc_tensor(&[TOP_K, DOWN_M], rdna_compute::DType::F32)
         .expect("candidate down");
+    let compact_down = gpu
+        .alloc_tensor(&[TOP_K, DOWN_M], rdna_compute::DType::F32)
+        .expect("compact down");
     let lds_down = gpu
         .alloc_tensor(&[TOP_K, DOWN_M], rdna_compute::DType::F32)
         .expect("LDS down");
@@ -237,6 +260,21 @@ fn main() {
         .expect("down candidate");
     gpu.try_gfx1201()
         .expect("exact gfx1201")
+        .mq2_lloyd_moe_down_expanded_compact_ep(
+            &down_ptrs,
+            &gate_ptrs,
+            &dummy,
+            &topk,
+            &rot,
+            &compact_down,
+            DOWN_M,
+            DOWN_K,
+            TOP_K,
+            1,
+        )
+        .expect("down compact candidate");
+    gpu.try_gfx1201()
+        .expect("exact gfx1201")
         .mq2_lloyd_moe_down_expanded_lds_ep(
             &down_ptrs, &gate_ptrs, &dummy, &topk, &rot, &lds_down, DOWN_M, DOWN_K, TOP_K, 1,
         )
@@ -247,22 +285,35 @@ fn main() {
     let candidate_gate_host = gpu
         .download_f32(&candidate_gate)
         .expect("download candidate gate");
+    let compact_gate_host = gpu
+        .download_f32(&compact_gate)
+        .expect("download compact gate");
     let base_up_host = gpu.download_f32(&base_up).expect("download base up");
     let candidate_up_host = gpu
         .download_f32(&candidate_up)
         .expect("download candidate up");
+    let compact_up_host = gpu.download_f32(&compact_up).expect("download compact up");
     let base_down_host = gpu.download_f32(&base_down).expect("download base down");
     let candidate_down_host = gpu
         .download_f32(&candidate_down)
         .expect("download candidate down");
+    let compact_down_host = gpu
+        .download_f32(&compact_down)
+        .expect("download compact down");
     let lds_down_host = gpu.download_f32(&lds_down).expect("download LDS down");
     assert_raw_equal("gate", &base_gate_host, &candidate_gate_host);
     assert_raw_equal("up", &base_up_host, &candidate_up_host);
     assert_raw_equal("down", &base_down_host, &candidate_down_host);
+    assert_raw_equal("gate-compact", &candidate_gate_host, &compact_gate_host);
+    assert_raw_equal("up-compact", &candidate_up_host, &compact_up_host);
+    assert_raw_equal("down-compact", &candidate_down_host, &compact_down_host);
     assert_raw_equal("down-lds", &candidate_down_host, &lds_down_host);
     assert_nonowned_positive_zero("gate", &candidate_gate_host, GATE_M / 2);
     assert_nonowned_positive_zero("up", &candidate_up_host, GATE_M / 2);
     assert_nonowned_positive_zero("down", &candidate_down_host, DOWN_M);
+    assert_nonowned_positive_zero("gate-compact", &compact_gate_host, GATE_M / 2);
+    assert_nonowned_positive_zero("up-compact", &compact_up_host, GATE_M / 2);
+    assert_nonowned_positive_zero("down-compact", &compact_down_host, DOWN_M);
     assert_nonowned_positive_zero("down-lds", &lds_down_host, DOWN_M);
 
     for _ in 0..3 {
@@ -284,6 +335,20 @@ fn main() {
                 TOP_K,
             )
             .expect("warm gate candidate");
+        gpu.try_gfx1201()
+            .expect("exact gfx1201")
+            .mq2_lloyd_moe_gate_up_compact_ep(
+                &gate_ptrs,
+                &dummy,
+                &topk,
+                &x,
+                &compact_gate,
+                &compact_up,
+                GATE_M,
+                GATE_K,
+                TOP_K,
+            )
+            .expect("warm gate compact candidate");
     }
     gpu.hip.device_synchronize().expect("warmup sync");
 
@@ -309,6 +374,22 @@ fn main() {
                 TOP_K,
             )
             .expect("timed gate candidate");
+    });
+    let gate_compact_ms = elapsed_ms(&mut gpu, REPEATS, |gpu| {
+        gpu.try_gfx1201()
+            .expect("exact gfx1201")
+            .mq2_lloyd_moe_gate_up_compact_ep(
+                &gate_ptrs,
+                &dummy,
+                &topk,
+                &x,
+                &compact_gate,
+                &compact_up,
+                GATE_M,
+                GATE_K,
+                TOP_K,
+            )
+            .expect("timed gate compact candidate");
     });
     let down_base_ms = elapsed_ms(&mut gpu, REPEATS, |gpu| {
         gpu.deepseek4_gemv_mq2g256_lloyd_moe_down_expanded_k4(
@@ -341,18 +422,40 @@ fn main() {
             )
             .expect("timed down LDS candidate");
     });
+    let down_compact_ms = elapsed_ms(&mut gpu, REPEATS, |gpu| {
+        gpu.try_gfx1201()
+            .expect("exact gfx1201")
+            .mq2_lloyd_moe_down_expanded_compact_ep(
+                &down_ptrs,
+                &gate_ptrs,
+                &dummy,
+                &topk,
+                &rot,
+                &compact_down,
+                DOWN_M,
+                DOWN_K,
+                TOP_K,
+                1,
+            )
+            .expect("timed down compact candidate");
+    });
     const LAYERS: f32 = 43.0;
     const PRODUCT_TOK_S: f32 = 54.903_755;
     let product_ms = 1000.0 / PRODUCT_TOK_S;
-    let saved_per_token_ms = (down_candidate_ms - down_lds_ms) * LAYERS;
+    let saved_per_token_ms =
+        ((gate_candidate_ms - gate_compact_ms) + (down_candidate_ms - down_compact_ms)) * LAYERS;
     let projected_product_pct = saved_per_token_ms / product_ms * 100.0;
     println!(
         "MICRO owned=2/6 repeats={REPEATS} gate_ms={gate_base_ms:.6}->{gate_candidate_ms:.6} \
-         gate_speedup={:.3}x down_ms={down_base_ms:.6}->{down_candidate_ms:.6} \
+         gate_speedup={:.3}x gate_compact_ms={gate_compact_ms:.6} gate_compact_speedup={:.3}x \
+         down_ms={down_base_ms:.6}->{down_candidate_ms:.6} \
          down_speedup={:.3}x down_lds_ms={down_lds_ms:.6} down_lds_speedup={:.3}x \
+         down_compact_ms={down_compact_ms:.6} down_compact_speedup={:.3}x \
          saved_43_layers_ms={saved_per_token_ms:.6} projected_product_pct={projected_product_pct:.3}",
         gate_base_ms / gate_candidate_ms,
+        gate_candidate_ms / gate_compact_ms,
         down_base_ms / down_candidate_ms,
         down_candidate_ms / down_lds_ms,
+        down_candidate_ms / down_compact_ms,
     );
 }
