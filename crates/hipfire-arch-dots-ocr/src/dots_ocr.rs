@@ -40,7 +40,7 @@
 
 use hip_bridge::HipResult;
 use hipfire_arch_qwen2::qwen2::{Qwen2Config, Qwen2Weights};
-use hipfire_runtime::gpu_cleanup::{free_tensor_retained, GpuCleanupFailure, RetainedGpuTensor};
+use hipfire_runtime::gpu_cleanup::GpuCleanupFailure;
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama::{
     attention_family, f16_to_f32, f32_to_f16, DispatchCtx, FullAttnParams, KernelKey, ShapeInfo,

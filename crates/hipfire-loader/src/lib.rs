@@ -20,7 +20,7 @@ use hipfire_arch_deepseek4 as deepseek4;
 use hipfire_arch_lfm2moe as lfm2moe;
 use hipfire_arch_minimax as minimax;
 use hipfire_arch_qwen35::mtp_head::Qwen35MtpHead;
-use hipfire_arch_qwen35::qwen35::{DeltaNetState, Qwen35Scratch, Qwen35ScratchSet, Qwen35Weights};
+use hipfire_arch_qwen35::qwen35::{DeltaNetState, Qwen35ScratchSet};
 use hipfire_arch_qwen35::speculative::DeltaNetSnapshot;
 use hipfire_arch_qwen35::Qwen35Bundle;
 use hipfire_arch_qwen35_vl::qwen35_vl;
@@ -1583,8 +1583,15 @@ fn log_mtp_load_failure(
     let hipfire_arch_qwen35::mtp_head::MtpHeadLoadError { message, retained } = e;
     let mut still_failed = Vec::new();
     for r in retained {
-        if let Err(r) = r.retry(gpu) {
-            still_failed.push(r.label().to_string());
+        match r.retry(gpu) {
+            Ok(()) => {}
+            // The retry failed at a String-returning boundary: enqueue the
+            // owner (exact-retention) instead of dropping it while allocated.
+            Err(r) => {
+                let label = r.label().to_string();
+                hipfire_runtime::gpu_cleanup::enqueue_retained(r);
+                still_failed.push(format!("{label} (enqueued to retained-owner backlog)"));
+            }
         }
     }
     let mut note = format!("  MTP head ({kind}) load failed: {message} — MTP serving disabled");
@@ -1600,13 +1607,16 @@ fn log_mtp_load_failure(
 
 /// Hard-error free for unfinished qwen35 finish path: bundle + optional VL.
 /// The bundle free is checked (exact-retention): if any owner survives the
-/// first attempt, a single retry runs; whatever still fails is logged.
+/// first attempt, a single retry runs; whatever still fails is enqueued to
+/// the retained-owner backlog (never dropped while allocated) and logged.
 fn rollback_unfinished_qwen35(
     err: String,
     bundle: Qwen35Bundle,
     vision_weights: Option<qwen35_vl::VisionWeights>,
     gpu: &mut Gpu,
 ) -> String {
+    use hipfire_runtime::gpu_cleanup::enqueue_cleanup_failure;
+
     let mut notes = Vec::new();
     if let Err(cf) = hipfire_arch_qwen35::free_qwen35_bundle(bundle, gpu) {
         let summaries = cf.error_summaries();
@@ -1615,10 +1625,14 @@ fn rollback_unfinished_qwen35(
                 "first cleanup attempt failed ({} owner(s)) but retry succeeded",
                 summaries.len()
             )),
-            Err(remaining) => notes.push(format!(
-                "cleanup failed: {}",
-                remaining.error_summaries().join("; ")
-            )),
+            Err(remaining) => {
+                let pending = remaining.num_failed();
+                enqueue_cleanup_failure(remaining);
+                notes.push(format!(
+                    "cleanup failed: {pending} owner(s) enqueued to the retained-owner backlog: {}",
+                    summaries.join("; ")
+                ));
+            }
         }
     }
     if let Some(vw) = vision_weights {
@@ -2614,6 +2628,13 @@ pub fn load_model(
     spec: SpecLoadCfg,
     gpu: &mut rdna_compute::Gpu,
 ) -> Result<LoadedModel, String> {
+    // Retry any owners enqueued by earlier String-returning teardowns.
+    let pending = hipfire_runtime::gpu_cleanup::retry_backlog(gpu);
+    if pending > 0 {
+        eprintln!(
+            "  retained-owner backlog: {pending} allocation(s) still pending retry after this attempt"
+        );
+    }
     let raw = raw_request(mesh);
     let admitted = route_generic_single(admit_path(path, raw)?)?;
     let load_mesh = select_load_mesh(&admitted, mesh);
@@ -3098,6 +3119,13 @@ pub fn load_model_with_kv_backend(
     spec: SpecLoadCfg,
     gpu: &mut rdna_compute::Gpu,
 ) -> Result<LoadedModel, String> {
+    // Retry any owners enqueued by earlier String-returning teardowns.
+    let pending = hipfire_runtime::gpu_cleanup::retry_backlog(gpu);
+    if pending > 0 {
+        eprintln!(
+            "  retained-owner backlog: {pending} allocation(s) still pending retry after this attempt"
+        );
+    }
     // Retry any arenas left by a prior failed teardown; refuse the load if
     // ownership is still live so a new model cannot stack on pending VMM state.
     ensure_vmm_ready_for_load(gpu)?;
@@ -3617,16 +3645,18 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(
     // Free arch-specific GPU state from the carrier bundle — every arch
     // teardown is checked and owner-preserving via `BundleTeardown`
     // (single-device path; the PP/EP multi-device paths above keep their
-    // own multi-GPU teardown). Retry once before logging: whatever still
-    // fails is a bounded leak the operator must know about.
+    // own multi-GPU teardown). Retry once; whatever still fails is
+    // ENQUEUED to the retained-owner backlog (exact-retention). The error
+    // note is deferred to the trailing `retry_backlog` below — a transient
+    // failure this call can already reclaim must not report unload as
+    // failed with a stale message.
     if let Some(state) = m.state {
         if let Err(cf) = state.free_checked(gpu) {
             match cf.retry(gpu) {
                 Ok(()) => {} // first attempt partially failed; retry cleaned up
-                Err(remaining) => note(Err(format!(
-                    "state teardown: {}",
-                    remaining.error_summaries().join("; ")
-                ))),
+                Err(remaining) => {
+                    hipfire_runtime::gpu_cleanup::enqueue_cleanup_failure(remaining);
+                }
             }
         }
     }
@@ -3649,6 +3679,16 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(
     }
     if let Some(pp) = m.pp_model.take() {
         pp.free();
+    }
+    // Retry whatever earlier operations could not free — the most VRAM is
+    // available now that this model is down. Only a failure that survives
+    // THIS drain is reported (the enqueue above is silent by design: a
+    // transient failure this call reclaims must not fail the unload).
+    let pending = hipfire_runtime::gpu_cleanup::retry_backlog(gpu);
+    if pending > 0 {
+        note(Err(format!(
+            "{pending} retained owner(s) still pending in the retained-owner backlog"
+        )));
     }
     match first_err {
         Some(err) => Err(err),
@@ -4087,6 +4127,97 @@ mod registry_tests {
             "VMM unload did not reclaim VRAM: baseline={baseline} after={after}"
         );
         eprintln!("[teardown] qwen35-vmm: OK (baseline={baseline} after={after})");
+    }
+
+    /// The retained-owner backlog closes the String-returning teardown gap:
+    /// when unload's free AND its retry both fail, the owners are enqueued
+    /// (never dropped while allocated) and the NEXT load drains them.
+    /// Uses HIPFIRE_FROZEN_FAIL_FREE=2 (fail the initial free AND the retry).
+    #[test]
+    #[ignore = "requires an AMD GPU plus a qwen35 fixture"]
+    fn retained_backlog_enqueues_after_double_failure_and_recovers_on_next_load() {
+        use std::path::Path;
+        use std::sync::Mutex;
+
+        static GPU_LOCK: Mutex<()> = Mutex::new(());
+        let _lock = GPU_LOCK.lock().unwrap();
+        rdna_compute::frozen_fault_inject::reset();
+        // No backlog clearing here by design: any leftover from a failed
+        // prior run is a REAL owner the warm-up load below drains — dropping
+        // it would violate exact-retention.
+
+        let home = std::env::var("HOME").expect("HOME required for default model paths");
+        let path = std::env::var("HIPFIRE_QWEN35_BACKLOG_FIXTURE")
+            .unwrap_or_else(|_| format!("{home}/.hipfire/models/qwen3.5-9b.mq4"));
+        assert!(
+            Path::new(&path).is_file(),
+            "fixture not found: {path} (set HIPFIRE_QWEN35_BACKLOG_FIXTURE)"
+        );
+
+        let mut gpu = rdna_compute::Gpu::init().expect("Gpu::init");
+        let cask = super::CaskConfig::default();
+        let mesh = super::DeviceMesh::single();
+        let spec = super::SpecLoadCfg::default();
+
+        // Warm-up (no injection): absorbs kernel/module residency.
+        let warm = super::load_model(
+            &path, 64, None, None, None, None, &cask, &mesh, None, spec, &mut gpu,
+        )
+        .expect("warm-up load must succeed");
+        super::unload_model(warm, &mut gpu).expect("warm-up unload must succeed");
+        gpu.drain_pool();
+        let baseline = gpu
+            .hip
+            .get_vram_info()
+            .map(|(free, _)| free)
+            .expect("baseline");
+
+        // Inject two free failures: the first unload free fails, the retry
+        // fails too — the owners must be ENQUEUED, not dropped.
+        std::env::set_var("HIPFIRE_FROZEN_FAIL_FREE", "2");
+        rdna_compute::frozen_fault_inject::reset();
+        let model = super::load_model(
+            &path, 64, None, None, None, None, &cask, &mesh, None, spec, &mut gpu,
+        )
+        .expect("measured load must succeed");
+        let unload_err = super::unload_model(model, &mut gpu)
+            .expect_err("unload must report the double failure");
+        assert!(
+            unload_err.contains("retained-owner backlog"),
+            "unload error must mention the backlog enqueue: {unload_err}"
+        );
+        gpu.drain_pool();
+        let pending = hipfire_runtime::gpu_cleanup::backlog_pending();
+        assert!(
+            pending > 0,
+            "double-failed owners must be enqueued to the backlog (pending={pending})"
+        );
+
+        // Clear the injection: the next load drains the backlog and reclaims
+        // the VRAM.
+        std::env::remove_var("HIPFIRE_FROZEN_FAIL_FREE");
+        rdna_compute::frozen_fault_inject::reset();
+        let model2 = super::load_model(
+            &path, 64, None, None, None, None, &cask, &mesh, None, spec, &mut gpu,
+        )
+        .expect("recovery load must succeed");
+        assert_eq!(
+            hipfire_runtime::gpu_cleanup::backlog_pending(),
+            0,
+            "the recovery load must drain the backlog"
+        );
+        super::unload_model(model2, &mut gpu).expect("recovery unload must succeed");
+        gpu.drain_pool();
+        let after = gpu
+            .hip
+            .get_vram_info()
+            .map(|(free, _)| free)
+            .expect("after");
+        assert!(
+            baseline.abs_diff(after) < 64 * 1024 * 1024,
+            "backlog recovery did not reclaim VRAM: baseline={baseline} after={after}"
+        );
+        eprintln!("[backlog] OK: enqueued {pending} owner(s), drained by recovery load");
     }
 
     /// `finish_qwen35_load` receives a fully GPU-backed bundle before opening a
