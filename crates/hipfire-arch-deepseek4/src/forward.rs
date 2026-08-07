@@ -27,8 +27,8 @@ use crate::backend::Mq2rBackend;
 use crate::deepseek4::{DeepseekV4HeterogeneousWeights, DeepseekV4RoutedWeights};
 #[cfg(feature = "harmonic-worker")]
 use crate::harmonic::{
-    HarmonicProtocolError, HarmonicSlotState, HARMONIC_RESULT_EXTENT, HARMONIC_TOP_K,
-    HARMONIC_X_ROT_BYTES,
+    HarmonicProtocolError, HarmonicSlotState, HARMONIC_RESULT_EXTENT, HARMONIC_SLOT_COUNT,
+    HARMONIC_TOP_K, HARMONIC_X_ROT_BYTES,
 };
 #[cfg(feature = "harmonic-worker")]
 use crate::harmonic_ipc::{harmonic_monotonic_tick, HarmonicIpcError};
@@ -6610,6 +6610,18 @@ fn harmonic_publish_staged_route(
     gpu.hip
         .stream_synchronize(transfer)
         .map_err(|error| format!("harmonic route transfer completion l{layer_idx}: {error}"))?;
+    if epoch > HARMONIC_SLOT_COUNT as u64 {
+        // Reusing slot N%2 is legal only after the source's GPU has consumed
+        // the mapped result from N-2. The current route-ready event was
+        // recorded on the same primary stream after that result copy, ordered
+        // add, HC mix, and the intervening layer work. Waiting for the current
+        // transfer therefore proves both the protocol terminal flags and the
+        // owner-local GPU read are quiescent before recycling the old epoch.
+        execution
+            .ring
+            .recycle(epoch - HARMONIC_SLOT_COUNT as u64)
+            .map_err(|error| format!("harmonic recycle before l{layer_idx}: {error}"))?;
+    }
     execution
         .ring
         .write_mapped_activation_metadata(
