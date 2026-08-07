@@ -255,7 +255,7 @@ The paged seam. Every KV address in every ported kernel goes through this one he
 
 **Interfaces:**
 - Consumes: nothing.
-- Produces: `struct KvSlotDesc { unsigned long long k_base; unsigned long long v_base; int seq_len; int cap; }` and `__device__ unsigned long long kv_offset_for(const KvSlotDesc&, int pos, int per_pos_bytes)`. Tasks 4–7 include this header. Task 3 mirrors the struct layout in Rust.
+- Produces: `struct KvSlotDesc { unsigned long long k_base; unsigned long long v_base; int seq_len; int cap; }` and `__device__ unsigned long long kv_offset_for_k(const KvSlotDesc&, int pos, int per_pos_bytes)` and the matching `kv_offset_for_v`. Tasks 4–7 include this header. Task 3 mirrors the struct layout in Rust.
 
 - [ ] **Step 1: Write the header**
 
