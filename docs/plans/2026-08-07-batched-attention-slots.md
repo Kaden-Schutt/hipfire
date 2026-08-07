@@ -1255,19 +1255,31 @@ fn bench_slots(gpu: &mut Gpu, seq_lens: &[usize], m_per_slot: &[usize]) -> (f64,
     });
 
     // Sequential arm: one legacy launch per slot, against that slot's slab.
-    // Sub-slicing the arena per slot is what the descriptor does on the GPU;
-    // here we re-upload each slab so the legacy kernel sees a base of 0.
-    let sequential = time(gpu, &|g: &mut Gpu| {
-        for (slot, &sl) in seq_lens.iter().enumerate() {
+    //
+    // The per-slot slabs and positions are uploaded BEFORE the timed region.
+    // Uploading inside the closure would charge the sequential arm a host->device
+    // cost the batched arm never pays, flattering the batched path and making the
+    // spec §2 criterion-2 assertion meaningless.
+    let slabs: Vec<_> = seq_lens
+        .iter()
+        .enumerate()
+        .map(|(slot, &sl)| {
             let off = descs[slot].k_base as usize;
             let len = descs[slot].cap as usize * per_pos_bytes;
-            let slab = g.upload_raw(&arena[off..off + len], &[len]).expect("slab");
-            let p = g.upload_raw(
-                unsafe { std::slice::from_raw_parts(&(sl as i32 - 1) as *const i32 as *const u8, 4) },
-                &[1],
-            ).expect("pos");
+            let slab = gpu.upload_raw(&arena[off..off + len], &[len]).expect("slab");
+            let pos = sl as i32 - 1;
+            let pb = unsafe {
+                std::slice::from_raw_parts(&pos as *const i32 as *const u8, 4)
+            };
+            let p = gpu.upload_raw(pb, &[1]).expect("slab pos");
+            (slab, p, sl)
+        })
+        .collect();
+
+    let sequential = time(gpu, &|g: &mut Gpu| {
+        for (slab, p, sl) in &slabs {
             g.attention_flash_q8_0_batched_masked(
-                &q, &slab, &slab, &out, &p, nh, nkv, hd, sl, sl, 1, &partials, None, 0, 0,
+                &q, slab, slab, &out, p, nh, nkv, hd, *sl, *sl, 1, &partials, None, 0, 0,
             )
             .expect("sequential");
         }
@@ -1277,7 +1289,7 @@ fn bench_slots(gpu: &mut Gpu, seq_lens: &[usize], m_per_slot: &[usize]) -> (f64,
 }
 ```
 
-Note the sequential arm re-uploads each slab inside the timed region, which charges it an upload cost the batched arm does not pay. Hoist those uploads out of the closure before timing — otherwise the comparison flatters the batched path and the spec §2 criterion-2 assertion becomes meaningless.
+Both arms now time kernel launches only. If you need to restructure this for borrow-checker reasons, preserve that property — it is the whole basis of the criterion-2 comparison.
 
 - [ ] **Step 2b: Record the LDS-vs-tile crossover for multi-slot batches**
 
