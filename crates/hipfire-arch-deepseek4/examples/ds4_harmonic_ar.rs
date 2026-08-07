@@ -92,6 +92,7 @@ fn main() -> Result<(), String> {
     let prefill_secs = prefill_start.elapsed().as_secs_f64();
 
     loaded.reset_timing()?;
+    hip_bridge::launch_counters::reset();
     let decode_start = Instant::now();
     let mut generated = Vec::with_capacity(generate);
     generated.push(greedy(&logits)?);
@@ -102,6 +103,14 @@ fn main() -> Result<(), String> {
     }
     let decode_secs = decode_start.elapsed().as_secs_f64();
     let timing = loaded.timing()?;
+    let host_launch_calls = hip_bridge::launch_counters::launch_kernel::count();
+    let host_launch_ns = hip_bridge::launch_counters::launch_kernel::time_ns();
+    let host_stream_sync_calls = hip_bridge::launch_counters::stream_sync::count();
+    let host_stream_sync_ns = hip_bridge::launch_counters::stream_sync::time_ns();
+    let host_event_sync_calls = hip_bridge::launch_counters::event_sync::count();
+    let host_event_sync_ns = hip_bridge::launch_counters::event_sync::time_ns();
+    let host_dtoh_calls = hip_bridge::launch_counters::memcpy_dtoh::count();
+    let host_dtoh_ns = hip_bridge::launch_counters::memcpy_dtoh::time_ns();
     let timed_tokens = timing.tokens.max(1) as f64;
     let ms_per_token = |nanos: u64| nanos as f64 / 1_000_000.0 / timed_tokens;
     let decoded = tokenizer.decode_bytes(&generated);
@@ -131,6 +140,16 @@ fn main() -> Result<(), String> {
             "expert_wait_max_us": timing.expert_wait_max_ns as f64 / 1_000.0,
             "publish_cpu_ms_per_token": ms_per_token(timing.publish_cpu_ns),
             "join_enqueue_cpu_ms_per_token": ms_per_token(timing.join_enqueue_cpu_ns),
+        },
+        "dense_owner_hip_calls": {
+            "launch_count": host_launch_calls,
+            "launch_ms_per_token": ms_per_token(host_launch_ns),
+            "stream_sync_count": host_stream_sync_calls,
+            "stream_sync_ms_per_token": ms_per_token(host_stream_sync_ns),
+            "event_sync_count": host_event_sync_calls,
+            "event_sync_ms_per_token": ms_per_token(host_event_sync_ns),
+            "dtoh_count": host_dtoh_calls,
+            "dtoh_ms_per_token": ms_per_token(host_dtoh_ns),
         },
     });
     println!(

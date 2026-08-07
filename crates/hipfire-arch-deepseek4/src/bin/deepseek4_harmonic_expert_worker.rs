@@ -213,7 +213,8 @@ fn run_loaded_worker(
             },
         )?;
 
-        worker_loop(
+        hip_bridge::launch_counters::reset();
+        let exit = worker_loop(
             control,
             ring,
             args.allocation_generation,
@@ -223,7 +224,23 @@ fn run_loaded_worker(
             weights.as_ref().unwrap(),
             service.as_mut().unwrap(),
             mapping.as_ref().unwrap(),
-        )
+        )?;
+        eprintln!(
+            "{}",
+            serde_json::json!({
+                "harmonic_expert_owner_hip_calls": {
+                    "launch_count": hip_bridge::launch_counters::launch_kernel::count(),
+                    "launch_time_ns": hip_bridge::launch_counters::launch_kernel::time_ns(),
+                    "stream_sync_count": hip_bridge::launch_counters::stream_sync::count(),
+                    "stream_sync_time_ns": hip_bridge::launch_counters::stream_sync::time_ns(),
+                    "event_sync_count": hip_bridge::launch_counters::event_sync::count(),
+                    "event_sync_time_ns": hip_bridge::launch_counters::event_sync::time_ns(),
+                    "dtoh_count": hip_bridge::launch_counters::memcpy_dtoh::count(),
+                    "dtoh_time_ns": hip_bridge::launch_counters::memcpy_dtoh::time_ns(),
+                }
+            })
+        );
+        Ok(exit)
     })();
     if let Some(service) = service.take() {
         service.release_quiesced(&mut gpu);
