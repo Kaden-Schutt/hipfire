@@ -27,6 +27,15 @@ use crate::DeepseekV4;
 pub const MQ2R_0731_SHA256: &str =
     "cbf2bbcfa3f47b1712a071836b2c48232dad7dfb763813a720f7d348a9318cce";
 pub const DEFAULT_SAFETY_MARGIN_BYTES: usize = 2 * 1024 * 1024 * 1024;
+pub const HARMONIC_EXECUTION_QUARANTINE: &str =
+    "deepseek4 harmonic execution is quarantined: the former split-owner route used reciprocal indefinite cross-device HIP waits; use single placement until H2 fault-containment certification removes this guard";
+
+/// Fail closed before artifact hashing, HIP discovery, allocation, or queue
+/// creation. H0 deliberately preserves the accepted ownership and kernel work
+/// while making the unsafe product transport unreachable.
+pub fn ensure_harmonic_execution_admitted() -> Result<(), String> {
+    Err(HARMONIC_EXECUTION_QUARANTINE.into())
+}
 
 /// Content identity receipt for repeated transactional tests or reloads in one
 /// process. The expensive 82 GiB SHA scan happens once; every reuse proves the
@@ -591,6 +600,7 @@ impl DeepseekV4HeterogeneousModel {
         fault: Option<DeepseekV4HeterogeneousFault>,
         verified: Option<&DeepseekV4VerifiedArtifact>,
     ) -> Result<Self, String> {
+        ensure_harmonic_execution_admitted()?;
         if plan.prefill_max_batch == 0 {
             return Err("deepseek4 heterogeneous prefill_max_batch must be nonzero".into());
         }
@@ -756,6 +766,7 @@ impl DeepseekV4HeterogeneousModel {
     }
 
     fn ensure_execution(&mut self) -> Result<(), String> {
+        ensure_harmonic_execution_admitted()?;
         if self.execution.is_none() {
             self.execution = Some(DeepseekV4HeterogeneousExecution::new(
                 &mut self.dense_gpu,
@@ -880,5 +891,31 @@ impl DeepseekV4HeterogeneousModel {
 impl Drop for DeepseekV4HeterogeneousModel {
     fn drop(&mut self) {
         self.release();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn harmonic_quarantine_is_stable_and_actionable() {
+        let error = ensure_harmonic_execution_admitted().unwrap_err();
+        assert_eq!(error, HARMONIC_EXECUTION_QUARANTINE);
+        assert!(error.contains("reciprocal indefinite cross-device HIP waits"));
+        assert!(error.contains("H2 fault-containment certification"));
+    }
+
+    #[test]
+    fn harmonic_quarantine_precedes_path_and_gpu_access() {
+        let missing = Path::new("/hipfire-h0-must-not-open-this-model");
+        let error = match DeepseekV4HeterogeneousModel::load(
+            missing,
+            DeepseekV4HeterogeneousLoadPlan::default(),
+        ) {
+            Ok(_) => panic!("quarantined harmonic route unexpectedly loaded"),
+            Err(error) => error,
+        };
+        assert_eq!(error, HARMONIC_EXECUTION_QUARANTINE);
     }
 }

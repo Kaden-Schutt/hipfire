@@ -1016,6 +1016,10 @@ impl Carrier for Deepseek4Carrier {
             ctx.deepseek4_compute_placement,
             hipfire_config::Deepseek4ComputePlacement::Single
         ) {
+            // H0 fail-closed guard: refuse before hashing the 82 GiB artifact,
+            // HIP discovery, allocation, or queue creation. There is no
+            // environment-variable bypass for the quarantined transport.
+            hipfire_arch_deepseek4::ensure_harmonic_execution_admitted()?;
             if !matches!(&src, ModelSource::Hfq(_)) {
                 return Err(
                     "deepseek4 heterogeneous placement requires the frozen MQ2R HFQ artifact"

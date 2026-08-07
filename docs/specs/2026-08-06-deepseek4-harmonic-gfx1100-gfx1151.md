@@ -3,7 +3,7 @@
 
 # DeepSeek V4 harmonic execution on gfx1100 + gfx1151
 
-Status: roadmap and replacement goal; H0 in progress; GPU product execution
+Status: H0 complete; H1 critical-path accounting next; GPU product execution
 prohibited until H2 exits.
 
 Branch: `ds4-beta-staging`
@@ -209,7 +209,7 @@ destroyed.
 
 ## 7. Roadmap and gates
 
-### H0 - Preserve and quarantine
+### H0 - Preserve and quarantine - COMPLETE
 
 - Preserve every accepted and rejected G0-G5 artifact and ledger row.
 - Keep the accepted exact-gfx1100 attention-overlap and grouped O-LoRA commits
@@ -389,7 +389,7 @@ immediately on any runtime or hardware fault.
 
 ## 10. Immediate action
 
-H0 is the first unmet gate. Do not run either GPU. The first implementation
-change is a fail-closed quarantine of the reciprocal HIP product route plus
-static tests and a durable fault chronology. H1 then prices the preserved
-canonical trace before any new hardware execution is proposed.
+H0 is complete and recorded in
+[`2026-08-06-ds4-harmonic-h0-quarantine.md`](../investigations/2026-08-06-ds4-harmonic-h0-quarantine.md).
+H1 is the first unmet gate. It prices the preserved canonical trace without
+running either GPU before any new hardware execution is proposed.

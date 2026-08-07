@@ -73,7 +73,8 @@ pub use deepseek4::{
     DeepseekV4State, DeepseekV4Weights, IndexerLayerState, MainAttentionLayerState,
 };
 pub use heterogeneous::{
-    DeepseekV4HeterogeneousLoadPlan, DeepseekV4HeterogeneousLoadReport,
-    DeepseekV4HeterogeneousModel, DeepseekV4VerifiedArtifact,
+    ensure_harmonic_execution_admitted, DeepseekV4HeterogeneousLoadPlan,
+    DeepseekV4HeterogeneousLoadReport, DeepseekV4HeterogeneousModel, DeepseekV4VerifiedArtifact,
+    HARMONIC_EXECUTION_QUARANTINE,
 };
 pub use spec_impl::Deepseek4Bundle;
