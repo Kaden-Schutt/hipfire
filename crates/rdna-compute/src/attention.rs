@@ -8977,6 +8977,82 @@ impl Gpu {
         )
     }
 
+    /// gfx1201 TP3 Hyper-Connection mix that consumes three peer-visible
+    /// rank-local transform outputs in fixed rank order.
+    pub fn hc_mix_4stream_peer3_gfx1201(
+        &mut self,
+        x_in: &GpuTensor,
+        a_matrix: &GpuTensor,
+        scale: &GpuTensor,
+        transforms: [&GpuTensor; 3],
+        x_out: &GpuTensor,
+        hidden: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if !self.arch_caps.is_gfx1201() {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "hc_mix_4stream_peer3_gfx1201 requires gfx1201, got {}",
+                    self.arch
+                ),
+            ));
+        }
+        let hidden_usize = hidden as usize;
+        if transforms
+            .iter()
+            .any(|transform| transform.numel() != hidden_usize)
+        {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "hc_mix_4stream_peer3_gfx1201: transform shape mismatch",
+            ));
+        }
+        self.ensure_kernel(
+            "hc_mix_4stream_peer3_gfx1201",
+            kernels::HC_MIX_4STREAM_PEER4_GFX1201_SRC,
+            "hc_mix_4stream_peer3_gfx1201",
+        )?;
+
+        let xi = x_in.buf.as_ptr();
+        let am = a_matrix.buf.as_ptr();
+        let sc = scale.buf.as_ptr();
+        let t0 = transforms[0].buf.as_ptr();
+        let t1 = transforms[1].buf.as_ptr();
+        let t2 = transforms[2].buf.as_ptr();
+        let xo = x_out.buf.as_ptr();
+        let mut h = hidden;
+        let mut params: Vec<*mut c_void> = vec![
+            &xi as *const _ as *mut c_void,
+            &am as *const _ as *mut c_void,
+            &sc as *const _ as *mut c_void,
+            &t0 as *const _ as *mut c_void,
+            &t1 as *const _ as *mut c_void,
+            &t2 as *const _ as *mut c_void,
+            &xo as *const _ as *mut c_void,
+            &mut h as *mut _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            "hc_mix_4stream_peer3_gfx1201",
+            [((hidden + 255) / 256) as u32, 4, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(xi);
+                b.push_ptr(am);
+                b.push_ptr(sc);
+                b.push_ptr(t0);
+                b.push_ptr(t1);
+                b.push_ptr(t2);
+                b.push_ptr(xo);
+                b.push_i32(h);
+                b
+            },
+        )
+    }
+
     /// gfx1201 TP4 Hyper-Connection mix that consumes four peer-visible
     /// rank-local transform outputs in fixed rank order.
     ///
@@ -9061,36 +9137,36 @@ impl Gpu {
         )
     }
 
-    /// Publish one TP4 graph barrier slot with system-scope release semantics.
-    pub fn tp4_graph_signal_store_gfx1201(
+    /// Publish one TP graph barrier epoch with system-scope release semantics.
+    pub fn tp_graph_signal_store_gfx1201(
         &mut self,
         signal: &DeviceBuffer,
-        slot: i32,
+        epoch: u32,
     ) -> HipResult<()> {
         self.bind_thread()?;
         if !self.arch_caps.is_gfx1201() {
             return Err(hip_bridge::HipError::new(
                 0,
                 &format!(
-                    "tp4_graph_signal_store_gfx1201 requires gfx1201, got {}",
+                    "tp_graph_signal_store_gfx1201 requires gfx1201, got {}",
                     self.arch
                 ),
             ));
         }
         self.ensure_kernel(
-            "tp4_graph_signal_store_gfx1201",
-            kernels::TP4_GRAPH_SIGNAL_GFX1201_SRC,
-            "tp4_graph_signal_store_gfx1201",
+            "tp_graph_signal_store_gfx1201",
+            kernels::TP_GRAPH_SIGNAL_GFX1201_SRC,
+            "tp_graph_signal_store_gfx1201",
         )?;
 
         let ptr = signal.as_ptr();
-        let mut slot_arg = slot;
+        let mut epoch_arg = epoch;
         let mut params: Vec<*mut c_void> = vec![
             &ptr as *const _ as *mut c_void,
-            &mut slot_arg as *mut _ as *mut c_void,
+            &mut epoch_arg as *mut _ as *mut c_void,
         ];
         self.launch_maybe_blob(
-            "tp4_graph_signal_store_gfx1201",
+            "tp_graph_signal_store_gfx1201",
             [1, 1, 1],
             [64, 1, 1],
             0,
@@ -9098,46 +9174,92 @@ impl Gpu {
             || {
                 let mut b = hip_bridge::KernargBlob::new();
                 b.push_ptr(ptr);
-                b.push_i32(slot);
+                b.push_u32(epoch);
                 b
             },
         )
     }
 
-    /// Wait for the other three TP4 ranks with system-scope acquire semantics.
-    pub fn tp4_graph_signal_wait3_gfx1201(
+    /// Wait for the other two TP3 ranks with system-scope acquire semantics.
+    pub fn tp_graph_signal_wait2_gfx1201(
         &mut self,
-        signals: [&DeviceBuffer; 3],
-        slot: i32,
+        signals: [&DeviceBuffer; 2],
+        epoch: u32,
     ) -> HipResult<()> {
         self.bind_thread()?;
         if !self.arch_caps.is_gfx1201() {
             return Err(hip_bridge::HipError::new(
                 0,
                 &format!(
-                    "tp4_graph_signal_wait3_gfx1201 requires gfx1201, got {}",
+                    "tp_graph_signal_wait2_gfx1201 requires gfx1201, got {}",
                     self.arch
                 ),
             ));
         }
         self.ensure_kernel(
-            "tp4_graph_signal_wait3_gfx1201",
-            kernels::TP4_GRAPH_SIGNAL_GFX1201_SRC,
-            "tp4_graph_signal_wait3_gfx1201",
+            "tp_graph_signal_wait2_gfx1201",
+            kernels::TP_GRAPH_SIGNAL_GFX1201_SRC,
+            "tp_graph_signal_wait2_gfx1201",
+        )?;
+
+        let signal0 = signals[0].as_ptr();
+        let signal1 = signals[1].as_ptr();
+        let mut epoch_arg = epoch;
+        let mut params: Vec<*mut c_void> = vec![
+            &signal0 as *const _ as *mut c_void,
+            &signal1 as *const _ as *mut c_void,
+            &mut epoch_arg as *mut _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            "tp_graph_signal_wait2_gfx1201",
+            [1, 1, 1],
+            [64, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(signal0);
+                b.push_ptr(signal1);
+                b.push_u32(epoch);
+                b
+            },
+        )
+    }
+
+    /// Wait for the other three TP4 ranks with system-scope acquire semantics.
+    pub fn tp_graph_signal_wait3_gfx1201(
+        &mut self,
+        signals: [&DeviceBuffer; 3],
+        epoch: u32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if !self.arch_caps.is_gfx1201() {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "tp_graph_signal_wait3_gfx1201 requires gfx1201, got {}",
+                    self.arch
+                ),
+            ));
+        }
+        self.ensure_kernel(
+            "tp_graph_signal_wait3_gfx1201",
+            kernels::TP_GRAPH_SIGNAL_GFX1201_SRC,
+            "tp_graph_signal_wait3_gfx1201",
         )?;
 
         let signal0 = signals[0].as_ptr();
         let signal1 = signals[1].as_ptr();
         let signal2 = signals[2].as_ptr();
-        let mut slot_arg = slot;
+        let mut epoch_arg = epoch;
         let mut params: Vec<*mut c_void> = vec![
             &signal0 as *const _ as *mut c_void,
             &signal1 as *const _ as *mut c_void,
             &signal2 as *const _ as *mut c_void,
-            &mut slot_arg as *mut _ as *mut c_void,
+            &mut epoch_arg as *mut _ as *mut c_void,
         ];
         self.launch_maybe_blob(
-            "tp4_graph_signal_wait3_gfx1201",
+            "tp_graph_signal_wait3_gfx1201",
             [1, 1, 1],
             [64, 1, 1],
             0,
@@ -9147,7 +9269,7 @@ impl Gpu {
                 b.push_ptr(signal0);
                 b.push_ptr(signal1);
                 b.push_ptr(signal2);
-                b.push_i32(slot);
+                b.push_u32(epoch);
                 b
             },
         )

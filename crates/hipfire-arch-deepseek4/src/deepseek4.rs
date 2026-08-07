@@ -580,12 +580,14 @@ pub struct DeepseekV4LayerWeights {
     pub wkv: Option<rdna_compute::GpuTensor>,
     pub wo_a: Option<rdna_compute::GpuTensor>,
     pub wo_b: Option<rdna_compute::GpuTensor>,
-    /// Exact gfx1201 four-rank dense-TP contract for the main attention
-    /// projections. `1/0` is the ordinary replicated route. The rank owns a
-    /// contiguous set of query heads / O-LoRA groups and produces one
-    /// hidden-width `wo_b` partial for the EP executor to all-reduce.
+    /// Exact gfx1201 three/four-rank dense-TP contract for main attention.
+    /// The explicit local ranges permit uneven whole-O-group TP3 sharding.
     pub attn_tp_size: usize,
     pub attn_tp_rank: usize,
+    pub attn_head_start: usize,
+    pub attn_head_count: usize,
+    pub attn_group_start: usize,
+    pub attn_group_count: usize,
 
     // Main-attention compressor (compress_ratio > 0). Stores compressed
     // KV at slot pos//ratio for later main-attention gather. Distinct
@@ -670,12 +672,13 @@ pub struct DeepseekV4LayerWeights {
     pub tid2eid_dev: Option<rdna_compute::GpuTensor>,
 
     // Shared expert (one per layer, w1/w2/w3, MQ-family quantized).
-    /// Exact gfx1201 four-rank dense-TP contract for the shared expert.
-    /// `1/0` is the ordinary replicated route. Main-layer EP weights may set
-    /// this to `4/rank`; MTP and DSpark layer bundles remain replicated until
-    /// they receive their own separately certified TP path.
+    /// Exact gfx1201 three/four-rank dense-TP contract for the shared expert.
+    /// The local interval is expressed in channels and always aligns to a
+    /// whole 256-wide FWHT group.
     pub shared_tp_size: usize,
     pub shared_tp_rank: usize,
+    pub shared_intermediate_start: usize,
+    pub shared_intermediate_count: usize,
     pub shared_w1: Option<rdna_compute::GpuTensor>,
     pub shared_w2: Option<rdna_compute::GpuTensor>,
     pub shared_w3: Option<rdna_compute::GpuTensor>,
@@ -746,6 +749,10 @@ impl DeepseekV4LayerWeights {
             wo_b: sc(&self.wo_b),
             attn_tp_size: self.attn_tp_size,
             attn_tp_rank: self.attn_tp_rank,
+            attn_head_start: self.attn_head_start,
+            attn_head_count: self.attn_head_count,
+            attn_group_start: self.attn_group_start,
+            attn_group_count: self.attn_group_count,
             compressor_wkv: sc(&self.compressor_wkv),
             compressor_wgate: sc(&self.compressor_wgate),
             compressor_norm: sc(&self.compressor_norm),
@@ -781,6 +788,8 @@ impl DeepseekV4LayerWeights {
             tid2eid_dev: sc(&self.tid2eid_dev),
             shared_tp_size: self.shared_tp_size,
             shared_tp_rank: self.shared_tp_rank,
+            shared_intermediate_start: self.shared_intermediate_start,
+            shared_intermediate_count: self.shared_intermediate_count,
             shared_w1: sc(&self.shared_w1),
             shared_w2: sc(&self.shared_w2),
             shared_w3: sc(&self.shared_w3),
@@ -815,6 +824,10 @@ impl DeepseekV4LayerWeights {
             wo_b: None,
             attn_tp_size: 1,
             attn_tp_rank: 0,
+            attn_head_start: 0,
+            attn_head_count: 0,
+            attn_group_start: 0,
+            attn_group_count: 0,
             compressor_wkv: None,
             compressor_wgate: None,
             compressor_norm: None,
@@ -850,6 +863,8 @@ impl DeepseekV4LayerWeights {
             tid2eid_dev: None,
             shared_tp_size: 1,
             shared_tp_rank: 0,
+            shared_intermediate_start: 0,
+            shared_intermediate_count: 0,
             shared_w1: None,
             shared_w2: None,
             shared_w3: None,

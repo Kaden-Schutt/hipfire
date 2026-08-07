@@ -429,6 +429,38 @@ pub trait ForwardBindings {
         false
     }
 
+    /// Whether this binding can fuse a fixed three-rank peer reduction into
+    /// both post-attention and post-MoE Hyper-Connection consumers.
+    fn supports_tp_peer_hc3(&self) -> bool {
+        false
+    }
+
+    fn ep_finish_attend_peer_hc3(
+        &mut self,
+        _gpu: &mut Gpu,
+        _partials: [&GpuTensor; 3],
+    ) -> Result<(), DispatchError> {
+        Err(DispatchError::UnsupportedVariant {
+            family: "ep",
+            variant: "ep_finish_attend_peer_hc3-not-implemented-for-arch",
+            arch: "",
+            quant: "",
+        })
+    }
+
+    fn ep_finish_moe_peer_hc3(
+        &mut self,
+        _gpu: &mut Gpu,
+        _partials: [&GpuTensor; 3],
+    ) -> Result<(), DispatchError> {
+        Err(DispatchError::UnsupportedVariant {
+            family: "ep",
+            variant: "ep_finish_moe_peer_hc3-not-implemented-for-arch",
+            arch: "",
+            quant: "",
+        })
+    }
+
     fn ep_finish_attend_peer_hc4(
         &mut self,
         _gpu: &mut Gpu,

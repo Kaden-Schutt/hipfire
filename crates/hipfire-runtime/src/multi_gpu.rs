@@ -85,11 +85,11 @@ pub struct Gpus {
     /// One process-lifetime dependency event per rank for peer-consumer
     /// collectives. Re-recording avoids 86 create/destroy pairs per DS4 token.
     rank_barrier_events: Vec<Event>,
-    /// One contiguous system-visible signal array per rank for the exact-gated
-    /// gfx1201 TP4 graph route. Each layer consumes two slots (attention + FFN).
-    tp4_graph_signals: Vec<DeviceBuffer>,
-    tp4_graph_signal_slots: usize,
-    tp4_graph_capture_slot: usize,
+    /// One 8-byte system-visible epoch per rank for the exact-gated gfx1201
+    /// TP3/TP4 graph route. Each captured barrier advances the epoch.
+    tp_graph_signals: Vec<DeviceBuffer>,
+    tp_graph_barrier_count: usize,
+    tp_graph_capture_epoch: usize,
 }
 
 const DEFAULT_VRAM_TOLERANCE_GB: f64 = 2.0;
@@ -175,9 +175,9 @@ impl Gpus {
             peer_ar_tmp: Vec::new(),
             peer_ar_tmp_bytes: 0,
             rank_barrier_events: Vec::new(),
-            tp4_graph_signals: Vec::new(),
-            tp4_graph_signal_slots: 0,
-            tp4_graph_capture_slot: 0,
+            tp_graph_signals: Vec::new(),
+            tp_graph_barrier_count: 0,
+            tp_graph_capture_epoch: 0,
         }
     }
 
@@ -228,9 +228,9 @@ impl Gpus {
             peer_ar_tmp: Vec::new(),
             peer_ar_tmp_bytes: 0,
             rank_barrier_events: Vec::new(),
-            tp4_graph_signals: Vec::new(),
-            tp4_graph_signal_slots: 0,
-            tp4_graph_capture_slot: 0,
+            tp_graph_signals: Vec::new(),
+            tp_graph_barrier_count: 0,
+            tp_graph_capture_epoch: 0,
         })
     }
 
@@ -422,11 +422,11 @@ impl Gpus {
     /// record visible when the wait is enqueued, and each next record follows
     /// the prior consumer on the same FIFO stream.
     pub fn barrier_rank_streams_reuse(&mut self) -> HipResult<()> {
-        if self.tp4_graph_signals.len() == 4
-            && self.devices.len() == 4
+        if self.tp_graph_signals.len() == self.devices.len()
+            && matches!(self.devices.len(), 3 | 4)
             && self.devices.iter().all(|device| device.graphs.capture_mode)
         {
-            return self.capture_tp4_graph_barrier();
+            return self.capture_tp_graph_barrier();
         }
 
         let n = self.devices.len();
@@ -486,11 +486,11 @@ impl Gpus {
         Ok(())
     }
 
-    /// Allocate the fixed gfx1201 TP4 graph barrier tape before peer access is
-    /// enabled. Signal memory is system-visible, and one contiguous allocation
-    /// per rank lets replay clear all layer epochs with four host calls.
-    pub fn prepare_tp4_graph_signals(&mut self, slots: usize) -> HipResult<()> {
-        if self.devices.len() != 4
+    /// Allocate one fixed gfx1201 TP3/TP4 graph epoch before peer access is
+    /// enabled. ROCm signal memory accepts the proven 8-byte allocation; a
+    /// monotonically increasing epoch reuses it for every layer boundary.
+    pub fn prepare_tp_graph_signals(&mut self, barriers: usize) -> HipResult<()> {
+        if !matches!(self.devices.len(), 3 | 4)
             || !self
                 .devices
                 .iter()
@@ -498,31 +498,30 @@ impl Gpus {
         {
             return Err(HipError::new(
                 0,
-                "prepare_tp4_graph_signals requires exactly four gfx1201 devices",
+                "prepare_tp_graph_signals requires three or four gfx1201 devices",
             ));
         }
-        if slots == 0 {
+        if barriers == 0 {
             return Err(HipError::new(
                 0,
-                "prepare_tp4_graph_signals requires at least one slot",
+                "prepare_tp_graph_signals requires at least one barrier",
             ));
         }
-        if !self.tp4_graph_signals.is_empty() {
-            return if self.tp4_graph_signal_slots == slots {
+        if !self.tp_graph_signals.is_empty() {
+            return if self.tp_graph_barrier_count == barriers {
                 Ok(())
             } else {
                 Err(HipError::new(
                     0,
-                    "prepare_tp4_graph_signals cannot resize a live signal tape",
+                    "prepare_tp_graph_signals cannot resize a live signal tape",
                 ))
             };
         }
 
-        let bytes = slots
-            .checked_mul(std::mem::size_of::<u32>())
-            .ok_or_else(|| HipError::new(0, "TP4 graph signal byte size overflow"))?;
-        let mut signals = Vec::with_capacity(4);
-        for rank in 0..4 {
+        let bytes = std::mem::size_of::<u64>();
+        let n = self.devices.len();
+        let mut signals = Vec::with_capacity(n);
+        for rank in 0..n {
             let gpu = &self.devices[rank];
             gpu.bind_thread()?;
             match gpu.hip.malloc_signal(bytes) {
@@ -544,49 +543,51 @@ impl Gpus {
                 }
             }
         }
-        self.tp4_graph_signals = signals;
-        self.tp4_graph_signal_slots = slots;
-        self.tp4_graph_capture_slot = 0;
+        self.tp_graph_signals = signals;
+        self.tp_graph_barrier_count = barriers;
+        self.tp_graph_capture_epoch = 0;
         Ok(())
     }
 
     /// Reset every captured producer epoch before launching any rank graph.
-    pub fn reset_tp4_graph_signals(&mut self) -> HipResult<()> {
-        if self.tp4_graph_signals.len() != 4 || self.tp4_graph_signal_slots == 0 {
-            return Err(HipError::new(0, "TP4 graph signal tape is not prepared"));
+    pub fn reset_tp_graph_signals(&mut self) -> HipResult<()> {
+        if self.tp_graph_signals.len() != self.devices.len() || self.tp_graph_barrier_count == 0 {
+            return Err(HipError::new(0, "TP graph signal tape is not prepared"));
         }
-        let bytes = self.tp4_graph_signal_slots * std::mem::size_of::<u32>();
-        for rank in 0..4 {
+        let bytes = std::mem::size_of::<u64>();
+        for rank in 0..self.devices.len() {
             let gpu = &self.devices[rank];
             gpu.bind_thread()?;
-            gpu.hip.memset(&self.tp4_graph_signals[rank], 0, bytes)?;
+            gpu.hip.memset(&self.tp_graph_signals[rank], 0, bytes)?;
         }
         Ok(())
     }
 
     /// Rewind the capture-time barrier cursor. The next 86 DS4 boundaries map
     /// deterministically to signal slots 0..85 in every rank graph.
-    pub fn begin_tp4_graph_signal_capture(&mut self) -> HipResult<()> {
-        if self.tp4_graph_signals.len() != 4 || self.tp4_graph_signal_slots == 0 {
-            return Err(HipError::new(0, "TP4 graph signal tape is not prepared"));
+    pub fn begin_tp_graph_signal_capture(&mut self) -> HipResult<()> {
+        if self.tp_graph_signals.len() != self.devices.len() || self.tp_graph_barrier_count == 0 {
+            return Err(HipError::new(0, "TP graph signal tape is not prepared"));
         }
-        self.tp4_graph_capture_slot = 0;
+        self.tp_graph_capture_epoch = 0;
         Ok(())
     }
 
-    pub fn tp4_graph_captured_signal_count(&self) -> usize {
-        self.tp4_graph_capture_slot
+    pub fn tp_graph_captured_signal_count(&self) -> usize {
+        self.tp_graph_capture_epoch
     }
 
-    pub fn tp4_graph_signals_ready(&self, slots: usize) -> bool {
-        self.tp4_graph_signals.len() == 4 && self.tp4_graph_signal_slots == slots
+    pub fn tp_graph_signals_ready(&self, barriers: usize) -> bool {
+        self.tp_graph_signals.len() == self.devices.len()
+            && matches!(self.devices.len(), 3 | 4)
+            && self.tp_graph_barrier_count == barriers
     }
 
     /// Free the exact-gated TP4 signal tape after every captured rank graph has
     /// been invalidated. Idempotent so failed-load and ordinary unload paths can
     /// share it.
-    pub fn free_tp4_graph_signals(&mut self) -> HipResult<()> {
-        let signals = std::mem::take(&mut self.tp4_graph_signals);
+    pub fn free_tp_graph_signals(&mut self) -> HipResult<()> {
+        let signals = std::mem::take(&mut self.tp_graph_signals);
         let mut first_error = None;
         for (rank, signal) in signals.into_iter().enumerate() {
             if let Err(error) = self.devices[rank]
@@ -596,41 +597,46 @@ impl Gpus {
                 first_error.get_or_insert(error);
             }
         }
-        self.tp4_graph_signal_slots = 0;
-        self.tp4_graph_capture_slot = 0;
+        self.tp_graph_barrier_count = 0;
+        self.tp_graph_capture_epoch = 0;
         match first_error {
             Some(error) => Err(error),
             None => Ok(()),
         }
     }
 
-    fn capture_tp4_graph_barrier(&mut self) -> HipResult<()> {
-        let slot = self.tp4_graph_capture_slot;
-        if slot >= self.tp4_graph_signal_slots {
+    fn capture_tp_graph_barrier(&mut self) -> HipResult<()> {
+        let epoch_index = self.tp_graph_capture_epoch;
+        if epoch_index >= self.tp_graph_barrier_count {
             return Err(HipError::new(
                 0,
                 &format!(
-                    "TP4 graph barrier slot {slot} exceeds prepared capacity {}",
-                    self.tp4_graph_signal_slots
+                    "TP graph barrier epoch {epoch_index} exceeds prepared capacity {}",
+                    self.tp_graph_barrier_count
                 ),
             ));
         }
-        let slot_i32 = i32::try_from(slot)
-            .map_err(|_| HipError::new(0, "TP4 graph barrier slot exceeds i32"))?;
-        let signals = &self.tp4_graph_signals;
+        let epoch = u32::try_from(epoch_index + 1)
+            .map_err(|_| HipError::new(0, "TP graph barrier epoch exceeds u32"))?;
+        let signals = &self.tp_graph_signals;
         let devices = &mut self.devices;
-        for rank in 0..4 {
-            devices[rank].tp4_graph_signal_store_gfx1201(&signals[rank], slot_i32)?;
+        let n = devices.len();
+        for rank in 0..n {
+            devices[rank].tp_graph_signal_store_gfx1201(&signals[rank], epoch)?;
         }
-        for destination in 0..4 {
-            let peers: Vec<&DeviceBuffer> = (0..4)
+        for destination in 0..n {
+            let peers: Vec<&DeviceBuffer> = (0..n)
                 .filter(|&source| source != destination)
                 .map(|source| &signals[source])
                 .collect();
-            devices[destination]
-                .tp4_graph_signal_wait3_gfx1201([peers[0], peers[1], peers[2]], slot_i32)?;
+            if n == 3 {
+                devices[destination].tp_graph_signal_wait2_gfx1201([peers[0], peers[1]], epoch)?;
+            } else {
+                devices[destination]
+                    .tp_graph_signal_wait3_gfx1201([peers[0], peers[1], peers[2]], epoch)?;
+            }
         }
-        self.tp4_graph_capture_slot += 1;
+        self.tp_graph_capture_epoch += 1;
         Ok(())
     }
 
@@ -660,9 +666,9 @@ impl Gpus {
             peer_ar_tmp: Vec::new(),
             peer_ar_tmp_bytes: 0,
             rank_barrier_events: Vec::new(),
-            tp4_graph_signals: Vec::new(),
-            tp4_graph_signal_slots: 0,
-            tp4_graph_capture_slot: 0,
+            tp_graph_signals: Vec::new(),
+            tp_graph_barrier_count: 0,
+            tp_graph_capture_epoch: 0,
         })
     }
 

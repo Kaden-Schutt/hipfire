@@ -4756,12 +4756,18 @@ impl<'a> ForwardBindings for Deepseek4Bindings<'a> {
         let layer = self.weights.resolve_layer(self.layer_idx);
         let tp_size = layer.attn_tp_size;
         if tp_size <= 1
-            || self.cfg.num_attention_heads % tp_size != 0
-            || self.cfg.o_groups % tp_size != 0
+            || layer.attn_head_count == 0
+            || layer.attn_group_count == 0
+            || layer.attn_head_count * self.cfg.o_groups
+                != layer.attn_group_count * self.cfg.num_attention_heads
         {
             return Err(DispatchError::Hip(format!(
-                "deepseek4 attention TP invalid at layer {}: heads={} groups={} tp={tp_size}",
-                self.layer_idx, self.cfg.num_attention_heads, self.cfg.o_groups
+                "deepseek4 attention TP invalid at layer {}: local_heads={} local_groups={} global_heads={} global_groups={} tp={tp_size}",
+                self.layer_idx,
+                layer.attn_head_count,
+                layer.attn_group_count,
+                self.cfg.num_attention_heads,
+                self.cfg.o_groups
             )));
         }
 
@@ -4769,8 +4775,8 @@ impl<'a> ForwardBindings for Deepseek4Bindings<'a> {
         // contiguous O-LoRA groups. Head-local attention arithmetic is
         // unchanged; only the explicit shape view becomes rank-local.
         let mut local_cfg = self.cfg.clone();
-        local_cfg.num_attention_heads /= tp_size;
-        local_cfg.o_groups /= tp_size;
+        local_cfg.num_attention_heads = layer.attn_head_count;
+        local_cfg.o_groups = layer.attn_group_count;
         ds4_attn_block_core(
             &local_cfg,
             self.weights,
@@ -4792,6 +4798,17 @@ impl<'a> ForwardBindings for Deepseek4Bindings<'a> {
     fn supports_tp_peer_hc4(&self) -> bool {
         let layer = self.weights.resolve_layer(self.layer_idx);
         self.cfg.mq2r && layer.attn_tp_size == 4 && layer.shared_tp_size == 4
+    }
+    fn supports_tp_peer_hc3(&self) -> bool {
+        let layer = self.weights.resolve_layer(self.layer_idx);
+        self.cfg.mq2r && layer.attn_tp_size == 3 && layer.shared_tp_size == 3
+    }
+    fn ep_finish_attend_peer_hc3(
+        &mut self,
+        gpu: &mut Gpu,
+        partials: [&GpuTensor; 3],
+    ) -> Result<(), DispatchError> {
+        hc_attn_mix_peer_hc3(self.cfg, self.state, gpu, partials).map_err(DispatchError::Hip)
     }
     fn ep_finish_attend_peer_hc4(
         &mut self,
@@ -4887,6 +4904,13 @@ impl<'a> ForwardBindings for Deepseek4Bindings<'a> {
         partials: [&GpuTensor; 4],
     ) -> Result<(), DispatchError> {
         hc_ffn_mix_peer_hc4(self.cfg, self.state, gpu, partials).map_err(DispatchError::Hip)
+    }
+    fn ep_finish_moe_peer_hc3(
+        &mut self,
+        gpu: &mut Gpu,
+        partials: [&GpuTensor; 3],
+    ) -> Result<(), DispatchError> {
+        hc_ffn_mix_peer_hc3(self.cfg, self.state, gpu, partials).map_err(DispatchError::Hip)
     }
     fn run_proj(
         &mut self,
@@ -5049,30 +5073,31 @@ pub fn forward_ep(
     token: u32,
     position: u32,
 ) -> Result<(), String> {
+    let n = gpus.devices.len();
     let graph_slots = cfg.num_hidden_layers * 2;
-    let tp4_graph_admitted = gpus.devices.len() == 4
-        && weights_per_rank.len() == 4
-        && state_per_rank.len() == 4
-        && partials.len() == 4
+    let tp_graph_admitted = matches!(n, 3 | 4)
+        && weights_per_rank.len() == n
+        && state_per_rank.len() == n
+        && partials.len() == n
         && cfg.num_hidden_layers > 0
         && cfg.mq2r
         && !cfg.mq2rxt
         && gpus.peer_access_enabled
-        && gpus.tp4_graph_signals_ready(graph_slots)
+        && gpus.tp_graph_signals_ready(graph_slots)
         && gpus
             .devices
             .iter()
             .all(|device| device.arch_caps.is_gfx1201())
         && weights_per_rank.iter().all(|weights| {
             let layer = weights.resolve_layer(0);
-            layer.attn_tp_size == 4 && layer.shared_tp_size == 4
+            layer.attn_tp_size == n && layer.shared_tp_size == n
         })
         // The dump synchronizes and downloads inside the layer loop; it is a
         // deliberately direct diagnostic route, never a captured product path.
         && hipfire_config::developer_var("HIPFIRE_EP_DUMP_POS").is_err();
 
-    if tp4_graph_admitted {
-        forward_ep_tp4_graph(
+    if tp_graph_admitted {
+        forward_ep_tp_graph(
             gpus,
             weights_per_rank,
             cfg,
@@ -5095,7 +5120,7 @@ pub fn forward_ep(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn forward_ep_tp4_graph_body(
+fn forward_ep_tp_graph_body(
     gpus: &mut hipfire_runtime::multi_gpu::Gpus,
     weights_per_rank: &[DeepseekV4Weights],
     cfg: &DeepseekV4Config,
@@ -5127,12 +5152,12 @@ fn forward_ep_tp4_graph_body(
             &program,
             cfg.hidden_size,
         )
-        .map_err(|error| format!("ds4 TP4 graph run_layer_program_ep L{layer_idx}: {error}"))?;
+        .map_err(|error| format!("ds4 TP{n} graph run_layer_program_ep L{layer_idx}: {error}"))?;
     }
 
     gpus.devices[0]
         .bind_thread()
-        .map_err(|error| format!("ds4 TP4 graph final bind: {error:?}"))?;
+        .map_err(|error| format!("ds4 TP{n} graph final bind: {error:?}"))?;
     final_norm_and_head(
         cfg,
         &weights_per_rank[0],
@@ -5155,7 +5180,7 @@ fn sync_ep_ranks(gpus: &mut hipfire_runtime::multi_gpu::Gpus, label: &str) -> Re
 }
 
 #[allow(clippy::too_many_arguments)]
-fn forward_ep_tp4_graph(
+fn forward_ep_tp_graph(
     gpus: &mut hipfire_runtime::multi_gpu::Gpus,
     weights_per_rank: &[DeepseekV4Weights],
     cfg: &DeepseekV4Config,
@@ -5200,7 +5225,7 @@ fn forward_ep_tp4_graph(
     for rank in 0..n {
         gpus.devices[rank]
             .bind_thread()
-            .map_err(|error| format!("ds4 TP4 graph stage bind {rank}: {error:?}"))?;
+            .map_err(|error| format!("ds4 TP{n} graph stage bind {rank}: {error:?}"))?;
         init_residual_streams(
             cfg,
             &weights_per_rank[rank],
@@ -5217,24 +5242,24 @@ fn forward_ep_tp4_graph(
         .count();
     if captured != 0 && captured != n {
         return Err(format!(
-            "ds4 TP4 graph state is partial: {captured}/{n} rank graphs exist"
+            "ds4 TP{n} graph state is partial: {captured}/{n} rank graphs exist"
         ));
     }
 
     if captured == 0 {
-        gpus.begin_tp4_graph_signal_capture()
-            .map_err(|error| format!("ds4 TP4 graph signal capture: {error:?}"))?;
+        gpus.begin_tp_graph_signal_capture()
+            .map_err(|error| format!("ds4 TP{n} graph signal capture: {error:?}"))?;
         for rank in 0..n {
             let gpu = &mut gpus.devices[rank];
             gpu.graphs
                 .begin_graph_capture_relaxed(
                     &gpu.hip,
                     gpu.device_id,
-                    gpu.active_stream
-                        .as_ref()
-                        .ok_or_else(|| format!("ds4 TP4 graph rank {rank} has no active stream"))?,
+                    gpu.active_stream.as_ref().ok_or_else(|| {
+                        format!("ds4 TP{n} graph rank {rank} has no active stream")
+                    })?,
                 )
-                .map_err(|error| format!("ds4 TP4 graph begin rank {rank}: {error:?}"))?;
+                .map_err(|error| format!("ds4 TP{n} graph begin rank {rank}: {error:?}"))?;
         }
         for rank in 0..n {
             precompute_positions(
@@ -5245,7 +5270,7 @@ fn forward_ep_tp4_graph(
             )?;
             precompute_token_id(&mut state_per_rank[rank], &mut gpus.devices[rank], token)?;
         }
-        forward_ep_tp4_graph_body(
+        forward_ep_tp_graph_body(
             gpus,
             weights_per_rank,
             cfg,
@@ -5255,18 +5280,18 @@ fn forward_ep_tp4_graph(
             position,
         )?;
 
-        let captured_signals = gpus.tp4_graph_captured_signal_count();
+        let captured_signals = gpus.tp_graph_captured_signal_count();
         let expected_signals = cfg.num_hidden_layers * 2;
         if captured_signals != expected_signals {
             return Err(format!(
-                "ds4 TP4 graph captured {captured_signals} barriers, expected {expected_signals}"
+                "ds4 TP{n} graph captured {captured_signals} barriers, expected {expected_signals}"
             ));
         }
         for rank in 0..n {
             let gpu = &mut gpus.devices[rank];
             gpu.graphs
                 .end_graph_capture(&gpu.hip, gpu.device_id, gpu.active_stream.as_ref().unwrap())
-                .map_err(|error| format!("ds4 TP4 graph end rank {rank}: {error:?}"))?;
+                .map_err(|error| format!("ds4 TP{n} graph end rank {rank}: {error:?}"))?;
         }
         let blobs: usize = gpus
             .devices
@@ -5274,7 +5299,7 @@ fn forward_ep_tp4_graph(
             .map(|device| device.graphs.ar_forward_blobs.len())
             .sum();
         eprintln!(
-            "[DeepSeek V4 gfx1201 TP4 hipGraph] captured 4 ranks, {captured_signals} barriers, {blobs} kernarg blobs"
+            "[DeepSeek V4 gfx1201 TP{n} hipGraph] captured {n} ranks, {captured_signals} barriers, {blobs} kernarg blobs"
         );
     } else {
         for state in state_per_rank.iter_mut() {
@@ -5287,15 +5312,15 @@ fn forward_ep_tp4_graph(
     // Clear all 86 epochs on every rank before any graph launch. Synchronous
     // signal-memory resets are intentional: async per-rank resets race a fast
     // peer store against another rank still holding the prior epoch's value.
-    gpus.reset_tp4_graph_signals()
-        .map_err(|error| format!("ds4 TP4 graph reset signals: {error:?}"))?;
+    gpus.reset_tp_graph_signals()
+        .map_err(|error| format!("ds4 TP{n} graph reset signals: {error:?}"))?;
     for rank in 0..n {
         let gpu = &gpus.devices[rank];
         gpu.graphs
             .graph_launch(&gpu.hip, gpu.device_id, gpu.active_stream.as_ref().unwrap())
-            .map_err(|error| format!("ds4 TP4 graph launch rank {rank}: {error:?}"))?;
+            .map_err(|error| format!("ds4 TP{n} graph launch rank {rank}: {error:?}"))?;
     }
-    sync_ep_ranks(gpus, "ds4 TP4 graph")?;
+    sync_ep_ranks(gpus, &format!("ds4 TP{n} graph"))?;
     for state in state_per_rank.iter_mut() {
         state.n_tokens += 1;
     }
@@ -6523,8 +6548,12 @@ fn ffn_shared_project(
     let shared_w2 = layer.shared_w2.as_ref().unwrap();
     let shared_w3 = layer.shared_w3.as_ref().unwrap();
     let im = cfg.moe_intermediate_size;
-    let local_im = im / layer.shared_tp_size;
-    debug_assert_eq!(im % layer.shared_tp_size, 0);
+    let local_im = if layer.shared_tp_size > 1 {
+        layer.shared_intermediate_count
+    } else {
+        im
+    };
+    debug_assert!(local_im > 0 && local_im <= im);
     let ffn_x_rot = state.ffn_x_rot.as_ref().unwrap();
     let ffn_x_plain = state.ffn_x_plain.as_ref().unwrap();
     let gate_full = state.ffn_gate.as_ref().unwrap();
@@ -7483,6 +7512,49 @@ fn hc_ffn_mix(
         let bytes = cfg.hc_mult * cfg.hidden_size * 4;
         gpu.memcpy_dtod_auto(&streams.buf, &streams_out.buf, bytes)
             .map_err(|e| format!("d2d hc_ffn_mix → streams: {e:?}"))?;
+    }
+    Ok(())
+}
+
+/// gfx1201 TP3 twin of [`hc_ffn_mix`] that reduces three rank-local FFN
+/// partials inside the HC consumer instead of materializing an RCCL result.
+fn hc_ffn_mix_peer_hc3(
+    cfg: &DeepseekV4Config,
+    state: &mut DeepseekV4State,
+    gpu: &mut Gpu,
+    partials: [&GpuTensor; 3],
+) -> Result<(), String> {
+    let pingpong = config_cache::hc_pingpong_on(&gpu.arch, cfg.mq2r);
+    {
+        let streams = state.residual_streams.as_ref().unwrap();
+        let post_view = state.hc_c.as_ref().unwrap().sub_offset(4, 4);
+        let comb_view = state.hc_c.as_ref().unwrap().sub_offset(8, 16);
+        let streams_out = if pingpong {
+            state.residual_streams_next.as_ref().unwrap()
+        } else {
+            state.q.as_ref().unwrap()
+        };
+        gpu.hc_mix_4stream_peer3_gfx1201(
+            streams,
+            &comb_view,
+            &post_view,
+            partials,
+            streams_out,
+            cfg.hidden_size as i32,
+        )
+        .map_err(|error| format!("hc_mix_4stream_peer3_gfx1201 ffn: {error:?}"))?;
+    }
+    if pingpong {
+        std::mem::swap(
+            &mut state.residual_streams,
+            &mut state.residual_streams_next,
+        );
+    } else {
+        let streams = state.residual_streams.as_ref().unwrap();
+        let streams_out = state.q.as_ref().unwrap();
+        let bytes = cfg.hc_mult * cfg.hidden_size * 4;
+        gpu.memcpy_dtod_auto(&streams.buf, &streams_out.buf, bytes)
+            .map_err(|error| format!("d2d peer HC3 FFN mix to streams: {error:?}"))?;
     }
     Ok(())
 }
@@ -8584,6 +8656,49 @@ fn hc_attn_mix(
         let bytes = cfg.hc_mult * cfg.hidden_size * 4;
         gpu.memcpy_dtod_auto(&streams.buf, &streams_out.buf, bytes)
             .map_err(|e| format!("d2d hc_mix → streams: {e:?}"))?;
+    }
+    Ok(())
+}
+
+/// gfx1201 TP3 twin of [`hc_attn_mix`] that consumes three peer-visible
+/// O-projection partials directly inside the HC residual update.
+fn hc_attn_mix_peer_hc3(
+    cfg: &DeepseekV4Config,
+    state: &mut DeepseekV4State,
+    gpu: &mut Gpu,
+    partials: [&GpuTensor; 3],
+) -> Result<(), String> {
+    let pingpong = config_cache::hc_pingpong_on(&gpu.arch, cfg.mq2r);
+    {
+        let streams = state.residual_streams.as_ref().unwrap();
+        let post_view = state.hc_c.as_ref().unwrap().sub_offset(4, 4);
+        let comb_view = state.hc_c.as_ref().unwrap().sub_offset(8, 16);
+        let streams_out = if pingpong {
+            state.residual_streams_next.as_ref().unwrap()
+        } else {
+            state.q.as_ref().unwrap()
+        };
+        gpu.hc_mix_4stream_peer3_gfx1201(
+            streams,
+            &comb_view,
+            &post_view,
+            partials,
+            streams_out,
+            cfg.hidden_size as i32,
+        )
+        .map_err(|error| format!("hc_mix_4stream_peer3_gfx1201 attention: {error:?}"))?;
+    }
+    if pingpong {
+        std::mem::swap(
+            &mut state.residual_streams,
+            &mut state.residual_streams_next,
+        );
+    } else {
+        let streams = state.residual_streams.as_ref().unwrap();
+        let streams_out = state.q.as_ref().unwrap();
+        let bytes = cfg.hc_mult * cfg.hidden_size * 4;
+        gpu.memcpy_dtod_auto(&streams.buf, &streams_out.buf, bytes)
+            .map_err(|error| format!("d2d peer HC3 attention mix to streams: {error:?}"))?;
     }
     Ok(())
 }

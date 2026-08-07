@@ -2,7 +2,8 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Admission screen for cross-device HIP-event dependencies captured into four
+//! Admission screen for cross-device signal dependencies captured into three
+//! or four independently instantiated graphs.
 //! independently instantiated graphs.
 //!
 //! Each replay delays and then writes fresh F32 values on every rank. The
@@ -15,7 +16,6 @@ use hip_bridge::{DeviceBuffer, Graph, GraphExec};
 use hipfire_runtime::multi_gpu::Gpus;
 use rdna_compute::{DType, GpuTensor};
 
-const RANKS: usize = 4;
 const ELEMS: usize = 4_096;
 const DELAY_BYTES: usize = 256 * 1024 * 1024;
 const CAPTURE_MODE_RELAXED: u32 = 2;
@@ -26,6 +26,11 @@ struct CapturedRank {
 }
 
 fn main() {
+    let ranks = std::env::var("HIPFIRE_TP_GRAPH_RANKS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(4);
+    assert!(matches!(ranks, 3 | 4), "screen requires TP3 or TP4");
     let replays = std::env::var("HIPFIRE_TP4_GRAPH_REPLAYS")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
@@ -35,12 +40,12 @@ fn main() {
         "stale-event screen requires at least two replays"
     );
 
-    let mut gpus = Gpus::init_uniform(RANKS, RANKS).expect("init four GPUs");
-    assert_eq!(gpus.devices.len(), RANKS, "requires exactly four GPUs");
+    let mut gpus = Gpus::init_uniform(ranks, ranks).expect("init TP GPUs");
+    assert_eq!(gpus.devices.len(), ranks, "wrong GPU count");
     for (rank, gpu) in gpus.devices.iter().enumerate() {
         assert_eq!(
             gpu.arch, "gfx1201",
-            "rank {rank} is {}; this screen requires four gfx1201 devices",
+            "rank {rank} is {}; this screen requires gfx1201 devices",
             gpu.arch
         );
     }
@@ -54,10 +59,10 @@ fn main() {
         gpu.active_stream = Some(gpu.hip.stream_create().expect("create stream"));
     }
 
-    let mut sources: Vec<GpuTensor> = Vec::with_capacity(RANKS);
-    let mut delays = Vec::with_capacity(RANKS);
-    let mut signals: Vec<DeviceBuffer> = Vec::with_capacity(RANKS);
-    for rank in 0..RANKS {
+    let mut sources: Vec<GpuTensor> = Vec::with_capacity(ranks);
+    let mut delays = Vec::with_capacity(ranks);
+    let mut signals: Vec<DeviceBuffer> = Vec::with_capacity(ranks);
+    for rank in 0..ranks {
         let gpu = &mut gpus.devices[rank];
         gpu.bind_thread().expect("bind source alloc");
         sources.push(
@@ -85,10 +90,10 @@ fn main() {
 
     // Graph capture may not perform module load/JIT. Warm the exact peer-load
     // kernels outside capture and prove the direct peer pointers first.
-    let warm_values: Vec<Vec<f32>> = (0..RANKS)
+    let warm_values: Vec<Vec<f32>> = (0..ranks)
         .map(|rank| vec![(rank + 1) as f32; ELEMS])
         .collect();
-    for rank in 0..RANKS {
+    for rank in 0..ranks {
         let gpu = &gpus.devices[rank];
         gpu.bind_thread().expect("bind warm source");
         let host = &warm_values[rank];
@@ -99,12 +104,18 @@ fn main() {
             .expect("warm source upload");
     }
     gpus.devices[0].bind_thread().expect("bind warm peer sum");
-    gpus.devices[0]
-        .add_f32_graph_safe(&sources[1], &sources[2], &tmp)
-        .expect("warm first peer sum");
-    gpus.devices[0]
-        .add_f32_graph_safe(&tmp, &sources[3], &result)
-        .expect("warm second peer sum");
+    if ranks == 3 {
+        gpus.devices[0]
+            .add_f32_graph_safe(&sources[1], &sources[2], &result)
+            .expect("warm peer sum");
+    } else {
+        gpus.devices[0]
+            .add_f32_graph_safe(&sources[1], &sources[2], &tmp)
+            .expect("warm first peer sum");
+        gpus.devices[0]
+            .add_f32_graph_safe(&tmp, &sources[3], &result)
+            .expect("warm second peer sum");
+    }
     gpus.devices[0]
         .hip
         .stream_synchronize(
@@ -118,28 +129,39 @@ fn main() {
         .download_f32(&result)
         .expect("download warm peer sum");
     assert!(
-        warm_result.iter().all(|&value| value == 9.0),
+        warm_result
+            .iter()
+            .all(|&value| value == (2..=ranks).sum::<usize>() as f32),
         "direct peer sum failed before graph capture: head {:?}",
         &warm_result[..16]
     );
 
     // JIT both graph-resident barrier symbols outside capture. Enqueue all
     // stores before any waits so this warmup cannot deadlock.
-    for rank in 0..RANKS {
+    for rank in 0..ranks {
         gpus.devices[rank]
-            .tp4_graph_signal_store_gfx1201(&signals[rank], 0)
+            .tp_graph_signal_store_gfx1201(&signals[rank], 1)
             .expect("warm graph signal store");
     }
-    for destination in 0..RANKS {
-        let peer_signals: Vec<&DeviceBuffer> = (0..RANKS)
+    for destination in 0..ranks {
+        let peer_signals: Vec<&DeviceBuffer> = (0..ranks)
             .filter(|&source| source != destination)
             .map(|source| &signals[source])
             .collect();
-        gpus.devices[destination]
-            .tp4_graph_signal_wait3_gfx1201([peer_signals[0], peer_signals[1], peer_signals[2]], 0)
-            .expect("warm graph signal wait");
+        if ranks == 3 {
+            gpus.devices[destination]
+                .tp_graph_signal_wait2_gfx1201([peer_signals[0], peer_signals[1]], 1)
+                .expect("warm graph signal wait2");
+        } else {
+            gpus.devices[destination]
+                .tp_graph_signal_wait3_gfx1201(
+                    [peer_signals[0], peer_signals[1], peer_signals[2]],
+                    1,
+                )
+                .expect("warm graph signal wait3");
+        }
     }
-    for rank in 0..RANKS {
+    for rank in 0..ranks {
         let gpu = &gpus.devices[rank];
         gpu.bind_thread().expect("bind barrier warm sync");
         gpu.hip
@@ -151,7 +173,7 @@ fn main() {
     }
 
     // Begin every device capture before adding any cross-device dependency.
-    for rank in 0..RANKS {
+    for rank in 0..ranks {
         let gpu = &mut gpus.devices[rank];
         gpu.bind_thread().expect("bind capture begin");
         gpu.graphs.capture_blobs.clear();
@@ -163,34 +185,49 @@ fn main() {
             )
             .expect("begin rank capture");
     }
-    for rank in 0..RANKS {
+    for rank in 0..ranks {
         gpus.devices[rank]
-            .tp4_graph_signal_store_gfx1201(&signals[rank], 0)
+            .tp_graph_signal_store_gfx1201(&signals[rank], 1)
             .expect("capture producer signal");
     }
-    for destination in 0..RANKS {
-        let peer_signals: Vec<&DeviceBuffer> = (0..RANKS)
+    for destination in 0..ranks {
+        let peer_signals: Vec<&DeviceBuffer> = (0..ranks)
             .filter(|&source| source != destination)
             .map(|source| &signals[source])
             .collect();
-        gpus.devices[destination]
-            .tp4_graph_signal_wait3_gfx1201([peer_signals[0], peer_signals[1], peer_signals[2]], 0)
-            .expect("capture peer signal wait");
+        if ranks == 3 {
+            gpus.devices[destination]
+                .tp_graph_signal_wait2_gfx1201([peer_signals[0], peer_signals[1]], 1)
+                .expect("capture peer signal wait2");
+        } else {
+            gpus.devices[destination]
+                .tp_graph_signal_wait3_gfx1201(
+                    [peer_signals[0], peer_signals[1], peer_signals[2]],
+                    1,
+                )
+                .expect("capture peer signal wait3");
+        }
     }
 
     // Use the same graph-safe peer-pointer load shape as the promoted TP4 HC
     // consumer. Captured hipMemcpyPeerAsync is deliberately not used: on the
     // current ROCm stack it instantiates but replays as a no-op.
     gpus.devices[0].bind_thread().expect("bind peer sum");
-    gpus.devices[0]
-        .add_f32_graph_safe(&sources[1], &sources[2], &tmp)
-        .expect("capture first peer sum");
-    gpus.devices[0]
-        .add_f32_graph_safe(&tmp, &sources[3], &result)
-        .expect("capture second peer sum");
+    if ranks == 3 {
+        gpus.devices[0]
+            .add_f32_graph_safe(&sources[1], &sources[2], &result)
+            .expect("capture peer sum");
+    } else {
+        gpus.devices[0]
+            .add_f32_graph_safe(&sources[1], &sources[2], &tmp)
+            .expect("capture first peer sum");
+        gpus.devices[0]
+            .add_f32_graph_safe(&tmp, &sources[3], &result)
+            .expect("capture second peer sum");
+    }
 
-    let mut captures = Vec::with_capacity(RANKS);
-    for rank in 0..RANKS {
+    let mut captures = Vec::with_capacity(ranks);
+    for rank in 0..ranks {
         let gpu = &mut gpus.devices[rank];
         gpu.bind_thread().expect("bind capture end");
         let graph = gpu
@@ -211,13 +248,13 @@ fn main() {
     }
 
     for replay in 0..replays {
-        let host_values: Vec<Vec<f32>> = (0..RANKS)
-            .map(|rank| vec![(replay * RANKS + rank + 1) as f32; ELEMS])
+        let host_values: Vec<Vec<f32>> = (0..ranks)
+            .map(|rank| vec![(replay * ranks + rank + 1) as f32; ELEMS])
             .collect();
 
         // Reset every per-rank barrier slot before any graph is launched. The
         // production route can do this with one small async memset per rank.
-        for rank in 0..RANKS {
+        for rank in 0..ranks {
             let gpu = &gpus.devices[rank];
             gpu.bind_thread().expect("bind signal reset");
             gpu.hip
@@ -228,7 +265,7 @@ fn main() {
         // Enqueue every producer update before launching any graph. The large
         // prior write makes a stale event record observable rather than a race
         // that usually happens to finish before rank zero reads the peer.
-        for rank in 0..RANKS {
+        for rank in 0..ranks {
             let gpu = &gpus.devices[rank];
             gpu.bind_thread().expect("bind producer update");
             gpu.hip
@@ -250,7 +287,7 @@ fn main() {
                 )
                 .expect("enqueue producer update");
         }
-        for rank in 0..RANKS {
+        for rank in 0..ranks {
             let gpu = &gpus.devices[rank];
             gpu.bind_thread().expect("bind graph launch");
             gpu.hip
@@ -260,7 +297,7 @@ fn main() {
                 )
                 .expect("launch rank graph");
         }
-        for rank in 0..RANKS {
+        for rank in 0..ranks {
             let gpu = &gpus.devices[rank];
             gpu.bind_thread().expect("bind replay sync");
             gpu.hip
@@ -272,8 +309,8 @@ fn main() {
         let host = gpus.devices[0]
             .download_f32(&result)
             .expect("download peer sum");
-        let expected = (1..RANKS)
-            .map(|rank| (replay * RANKS + rank + 1) as f32)
+        let expected = (1..ranks)
+            .map(|rank| (replay * ranks + rank + 1) as f32)
             .sum::<f32>();
         assert!(
             host.iter().all(|&value| value == expected),
@@ -282,7 +319,7 @@ fn main() {
         );
     }
 
-    for rank in 0..RANKS {
+    for rank in 0..ranks {
         let gpu = &gpus.devices[rank];
         gpu.bind_thread().expect("bind graph destroy");
         let capture = captures.remove(0);
@@ -292,5 +329,5 @@ fn main() {
         gpu.hip.graph_destroy(capture.graph).expect("destroy graph");
     }
 
-    println!("PASS tp4 cross-device graph barrier: {replays} exact replays");
+    println!("PASS tp{ranks} cross-device graph barrier: {replays} exact replays");
 }

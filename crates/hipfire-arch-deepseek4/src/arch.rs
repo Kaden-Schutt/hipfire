@@ -262,7 +262,7 @@ impl DeepseekV4 {
         Ok(t)
     }
 
-    /// Slice an encoded qt35 MFP4G32E8SOA matrix for exact four-rank dense TP.
+    /// Slice an encoded qt35 MFP4G32E8SOA matrix for exact dense TP.
     ///
     /// Output-row slicing is a contiguous row range. Input-column slicing
     /// rebuilds each row's SoA scale/codeword planes for a whole-number range
@@ -273,8 +273,7 @@ impl DeepseekV4 {
         hfq: &HfqFile,
         gpu: &mut Gpu,
         name: &str,
-        rank: usize,
-        tp_size: usize,
+        range: std::ops::Range<usize>,
         rows: bool,
     ) -> Result<rdna_compute::GpuTensor, String> {
         let (info, bytes) = hfq
@@ -284,11 +283,6 @@ impl DeepseekV4 {
             return Err(format!(
                 "deepseek4: dense TP requires qt35 rank-2 '{name}', got qt={} shape={:?}",
                 info.quant_type, info.shape
-            ));
-        }
-        if rank >= tp_size || tp_size == 0 {
-            return Err(format!(
-                "deepseek4: invalid dense TP rank {rank}/{tp_size} for '{name}'"
             ));
         }
         let m = info.shape[0] as usize;
@@ -310,26 +304,30 @@ impl DeepseekV4 {
         }
 
         let (shape, shard_bytes) = if rows {
-            if m % tp_size != 0 {
+            if range.start >= range.end || range.end > m {
                 return Err(format!(
-                    "deepseek4: qt35 '{name}' rows {m} not divisible by TP={tp_size}"
+                    "deepseek4: qt35 '{name}' invalid row range {range:?} for M={m}"
                 ));
             }
-            let local_m = m / tp_size;
-            let start = rank * local_m * row_bytes;
-            let end = start + local_m * row_bytes;
+            let local_m = range.len();
+            let start = range.start * row_bytes;
+            let end = range.end * row_bytes;
             (vec![local_m, k], bytes[start..end].to_vec())
         } else {
-            if k % tp_size != 0 || (k / tp_size) % 256 != 0 {
+            if range.start >= range.end
+                || range.end > k
+                || range.start % 256 != 0
+                || range.len() % 256 != 0
+            {
                 return Err(format!(
-                    "deepseek4: qt35 '{name}' K={k} does not split into whole 256-wide FWHT groups at TP={tp_size}"
+                    "deepseek4: qt35 '{name}' invalid whole-FWHT-group column range {range:?} for K={k}"
                 ));
             }
-            let local_k = k / tp_size;
+            let local_k = range.len();
             let local_blocks = local_k / 32;
             let local_scale_padded = local_blocks.div_ceil(16) * 16;
             let local_row_bytes = 16 + local_scale_padded + local_blocks * 16;
-            let first_block = rank * local_blocks;
+            let first_block = range.start / 32;
             let source_codewords = 16 + scale_padded;
             let local_codewords = 16 + local_scale_padded;
             let mut out = vec![0u8; m * local_row_bytes];
@@ -1730,14 +1728,17 @@ impl DeepseekV4 {
         // Per-layer.
         for (l, layer) in weights.layers.iter_mut().enumerate() {
             // Dense TP is deliberately narrower than EP: exact gfx1201,
-            // four ranks, frozen MQ2R P3. `load_dspark` is deliberately not an
+            // three or four ranks, frozen MQ2R P3. `load_dspark` is deliberately not an
             // admission predicate: it records sidecar availability, not
             // whether this request selected speculation. DSpark stage bundles
             // are loaded separately and remain replicated.
             // Other models, formats, rank counts, and architectures keep the
             // replicated route.
             let dense_tp = shard.filter(|(plan, _)| {
-                gpu.arch_caps.is_gfx1201() && cfg.mq2r && !cfg.mq2rxt && plan.tp_size == 4
+                gpu.arch_caps.is_gfx1201()
+                    && cfg.mq2r
+                    && !cfg.mq2rxt
+                    && matches!(plan.tp_size, 3 | 4)
             });
 
             // Norms (F16 on disk → F32 on GPU).
@@ -1763,17 +1764,21 @@ impl DeepseekV4 {
             )?);
             let attn_sink_name = format!("layers.{l}.attn.attn_sink");
             layer.attn_sink = Some(if let Some((plan, rank)) = dense_tp {
-                if cfg.num_attention_heads % plan.tp_size != 0 {
+                if cfg.o_groups == 0 || cfg.num_attention_heads % cfg.o_groups != 0 {
                     return Err(format!(
-                        "deepseek4: attention heads {} not divisible by TP={} ",
-                        cfg.num_attention_heads, plan.tp_size
+                        "deepseek4: attention heads {} do not form {} whole O-LoRA groups",
+                        cfg.num_attention_heads, cfg.o_groups
                     ));
                 }
-                let local_heads = cfg.num_attention_heads / plan.tp_size;
-                let first = rank * local_heads;
-                let keep: Vec<u32> = (first..first + local_heads)
-                    .map(|head| head as u32)
-                    .collect();
+                let group_range = hipfire_runtime::tp_shard::ShardConfig::balanced_range(
+                    rank,
+                    plan.tp_size,
+                    cfg.o_groups,
+                );
+                let heads_per_group = cfg.num_attention_heads / cfg.o_groups;
+                let head_range =
+                    (group_range.start * heads_per_group)..(group_range.end * heads_per_group);
+                let keep: Vec<u32> = head_range.map(|head| head as u32).collect();
                 Self::upload_global_f16_as_f32_keep(hfq, gpu, &attn_sink_name, &keep)?
             } else {
                 Self::upload_global_f16_as_f32(hfq, gpu, &attn_sink_name)?
@@ -1798,43 +1803,46 @@ impl DeepseekV4 {
             let wo_a_name = format!("layers.{l}.attn.wo_a.weight");
             let wo_b_name = format!("layers.{l}.attn.wo_b.weight");
             if let Some((plan, rank)) = dense_tp {
-                if cfg.o_groups % plan.tp_size != 0 {
-                    return Err(format!(
-                        "deepseek4: O-LoRA groups {} not divisible by TP={}",
-                        cfg.o_groups, plan.tp_size
-                    ));
-                }
+                let group_range = hipfire_runtime::tp_shard::ShardConfig::balanced_range(
+                    rank,
+                    plan.tp_size,
+                    cfg.o_groups,
+                );
+                let heads_per_group = cfg.num_attention_heads / cfg.o_groups;
+                let head_range =
+                    (group_range.start * heads_per_group)..(group_range.end * heads_per_group);
                 layer.attn_tp_size = plan.tp_size;
                 layer.attn_tp_rank = rank;
+                layer.attn_head_start = head_range.start;
+                layer.attn_head_count = head_range.len();
+                layer.attn_group_start = group_range.start;
+                layer.attn_group_count = group_range.len();
                 if l == 0 {
                     eprintln!(
                         "deepseek4: exact gfx1201 attention dense TP active \
-                         (rank {rank}/{}, wq_b+wo_a output rows, wo_b whole-FWHT-group columns)",
-                        plan.tp_size
+                         (rank {rank}/{}, heads={:?}, O-groups={:?})",
+                        plan.tp_size, head_range, group_range
                     );
                 }
                 layer.wq_b = Some(Self::upload_mfp4e8_soa_tp_shard(
                     hfq,
                     gpu,
                     &wq_b_name,
-                    rank,
-                    plan.tp_size,
+                    (head_range.start * cfg.head_dim)..(head_range.end * cfg.head_dim),
                     true,
                 )?);
                 layer.wo_a = Some(Self::upload_mfp4e8_soa_tp_shard(
                     hfq,
                     gpu,
                     &wo_a_name,
-                    rank,
-                    plan.tp_size,
+                    (group_range.start * cfg.o_lora_rank)..(group_range.end * cfg.o_lora_rank),
                     true,
                 )?);
                 layer.wo_b = Some(Self::upload_mfp4e8_soa_tp_shard(
                     hfq,
                     gpu,
                     &wo_b_name,
-                    rank,
-                    plan.tp_size,
+                    (group_range.start * cfg.o_lora_rank)..(group_range.end * cfg.o_lora_rank),
                     false,
                 )?);
             } else {
@@ -2087,37 +2095,48 @@ impl DeepseekV4 {
             let w2_name = format!("layers.{l}.ffn.shared_experts.w2.weight");
             let w3_name = format!("layers.{l}.ffn.shared_experts.w3.weight");
             if let Some((plan, rank)) = shared_tp {
+                if cfg.moe_intermediate_size % 256 != 0 {
+                    return Err(format!(
+                        "deepseek4: shared intermediate {} is not a whole number of 256-wide FWHT groups",
+                        cfg.moe_intermediate_size
+                    ));
+                }
+                let unit_range = hipfire_runtime::tp_shard::ShardConfig::balanced_range(
+                    rank,
+                    plan.tp_size,
+                    cfg.moe_intermediate_size / 256,
+                );
+                let intermediate_range = (unit_range.start * 256)..(unit_range.end * 256);
                 layer.shared_tp_size = plan.tp_size;
                 layer.shared_tp_rank = rank;
+                layer.shared_intermediate_start = intermediate_range.start;
+                layer.shared_intermediate_count = intermediate_range.len();
                 if l == 0 {
                     eprintln!(
                         "deepseek4: exact gfx1201 shared-expert dense TP active \
-                         (rank {rank}/{}, w1+w3 output rows, w2 whole-FWHT-group columns)",
-                        plan.tp_size
+                         (rank {rank}/{}, intermediate={:?})",
+                        plan.tp_size, intermediate_range
                     );
                 }
                 layer.shared_w1 = Some(Self::upload_mfp4e8_soa_tp_shard(
                     hfq,
                     gpu,
                     &w1_name,
-                    rank,
-                    plan.tp_size,
+                    intermediate_range.clone(),
                     true,
                 )?);
                 layer.shared_w2 = Some(Self::upload_mfp4e8_soa_tp_shard(
                     hfq,
                     gpu,
                     &w2_name,
-                    rank,
-                    plan.tp_size,
+                    intermediate_range.clone(),
                     false,
                 )?);
                 layer.shared_w3 = Some(Self::upload_mfp4e8_soa_tp_shard(
                     hfq,
                     gpu,
                     &w3_name,
-                    rank,
-                    plan.tp_size,
+                    intermediate_range,
                     true,
                 )?);
             } else {
