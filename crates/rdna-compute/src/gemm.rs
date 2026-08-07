@@ -14166,77 +14166,6 @@ impl Gpu {
         result
     }
 
-    /// Exact-gfx1201 grouped E8-SoA WMMA with two B16 query tiles per wave.
-    /// The E8 weight fragment is decoded once and reused for both query tiles.
-    #[allow(clippy::too_many_arguments)]
-    pub fn gemm_mfp4g32_e8_soa_grouped_wmma_b32_gfx1201_f16(
-        &mut self,
-        weight: &GpuTensor,
-        x_f16: &GpuTensor,
-        y: &GpuTensor,
-        groups: usize,
-        m: usize,
-        k: usize,
-        batch_size: usize,
-    ) -> HipResult<()> {
-        self.bind_thread()?;
-        debug_assert_eq!(
-            self.arch, "gfx1201",
-            "grouped E8-SoA B32 WMMA is admitted only on gfx1201"
-        );
-        debug_assert_eq!(weight.dtype, DType::MFP4G32E8SOA);
-        debug_assert_eq!(x_f16.dtype, DType::F16);
-        assert!(k % 256 == 0, "grouped E8-SoA B32 requires K%256==0");
-        const KERNEL: &str = "gemm_mfp4g32_e8_soa_grouped_wmma_b32_gfx1201";
-        self.ensure_kernel(
-            KERNEL,
-            kernels::GEMM_MFP4G32_E8_SOA_GROUPED_WMMA_B32_GFX1201_SRC,
-            KERNEL,
-        )?;
-        let ap = weight.buf.as_ptr();
-        let xp = x_f16.buf.as_ptr();
-        let yp = y.buf.as_ptr();
-        let g_val = groups as i32;
-        let m_val = m as i32;
-        let k_val = k as i32;
-        let b_val = batch_size as i32;
-        let mut params: Vec<*mut c_void> = vec![
-            &ap as *const _ as *mut c_void,
-            &xp as *const _ as *mut c_void,
-            &yp as *const _ as *mut c_void,
-            &g_val as *const _ as *mut c_void,
-            &m_val as *const _ as *mut c_void,
-            &k_val as *const _ as *mut c_void,
-            &b_val as *const _ as *mut c_void,
-        ];
-        let row_tiles = m.div_ceil(16) as u32;
-        let batch_tiles = batch_size.div_ceil(32) as u32;
-        let bytes = weight.byte_size() + batch_size * groups * (k * 2 + m * 4);
-        let timer = crate::profile::begin_timer(&self.hip, "gemm", KERNEL, bytes);
-        let result = self.launch_maybe_blob(
-            KERNEL,
-            [row_tiles, batch_tiles, groups as u32],
-            [32, 1, 1],
-            0,
-            &mut params,
-            || {
-                let mut blob = hip_bridge::KernargBlob::new();
-                blob.push_ptr(ap);
-                blob.push_ptr(xp);
-                blob.push_ptr(yp);
-                blob.push_i32(g_val);
-                blob.push_i32(m_val);
-                blob.push_i32(k_val);
-                blob.push_i32(b_val);
-                blob
-            },
-        );
-        if let Some(t) = timer {
-            t.finish(&self.hip);
-        }
-        result
-    }
-
     /// HFQ3/MQ3 sister of `gemm_hfq4g256_moe_grouped_wmma_k2` for the
     /// MoE Path-2 grouped-WMMA-GEMM. Same contract: each WMMA tile picks
     /// its expert via `expert_tile_ids[tile_y]` (-1 sentinel = early
@@ -23465,17 +23394,8 @@ impl Gpu {
             0,
             "gemm_mq2g256_lloyd_moe_grouped_wmma_8w_k2: K must be a multiple of 256 (got {k})"
         );
-        let (kernel_name, kernel_src) = if self.arch_caps.has_wmma_w32_gfx12() {
-            (
-                "gemm_mq2g256_lloyd_moe_grouped_wmma_8w_k2_gfx12",
-                kernels::GEMM_MQ2G256_LLOYD_MOE_GROUPED_WMMA_8W_K2_GFX12_SRC,
-            )
-        } else {
-            (
-                "gemm_mq2g256_lloyd_moe_grouped_wmma_8w_k2",
-                kernels::GEMM_MQ2G256_LLOYD_MOE_GROUPED_WMMA_8W_K2_SRC,
-            )
-        };
+        let kernel_name = "gemm_mq2g256_lloyd_moe_grouped_wmma_8w_k2";
+        let kernel_src = kernels::GEMM_MQ2G256_LLOYD_MOE_GROUPED_WMMA_8W_K2_SRC;
         self.ensure_kernel(kernel_name, kernel_src, kernel_name)?;
         let x_f16_ptr = self.ensure_fp16_x(x_src, x_src_rows * k)?;
 

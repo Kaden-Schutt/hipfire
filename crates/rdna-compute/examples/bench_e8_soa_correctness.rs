@@ -1368,9 +1368,6 @@ fn run_prefill_gfx1201(gpu: &mut Gpu) {
         let y_gfx12 = gpu
             .alloc_tensor(&[batch * groups * m], DType::F32)
             .expect("alloc grouped candidate");
-        let y_b32 = gpu
-            .alloc_tensor(&[batch * groups * m], DType::F32)
-            .expect("alloc grouped B32 candidate");
         let x_host = make_x(batch * groups * k, 0x1201_0A13);
         gpu.hip
             .memcpy_htod(&x.buf, bytes_of(&x_host))
@@ -1395,24 +1392,16 @@ fn run_prefill_gfx1201(gpu: &mut Gpu) {
             &weights, &x_f16, &y_gfx12, groups, m, k, batch,
         )
         .expect("grouped gfx1201 WMMA");
-        gpu.gemm_mfp4g32_e8_soa_grouped_wmma_b32_gfx1201_f16(
-            &weights, &x_f16, &y_b32, groups, m, k, batch,
-        )
-        .expect("grouped gfx1201 B32 WMMA");
         gpu.hip.device_synchronize().expect("grouped parity sync");
 
         let mut reference = vec![0.0f32; batch * groups * m];
         let mut candidate = vec![0.0f32; batch * groups * m];
-        let mut candidate_b32 = vec![0.0f32; batch * groups * m];
         gpu.hip
             .memcpy_dtoh(bytes_of_mut(&mut reference), &y_ref.buf)
             .expect("download grouped reference");
         gpu.hip
             .memcpy_dtoh(bytes_of_mut(&mut candidate), &y_gfx12.buf)
             .expect("download grouped candidate");
-        gpu.hip
-            .memcpy_dtoh(bytes_of_mut(&mut candidate_b32), &y_b32.buf)
-            .expect("download grouped B32 candidate");
         let mut err2 = 0.0f64;
         let mut ref2 = 0.0f64;
         let mut max_abs = 0.0f32;
@@ -1426,15 +1415,6 @@ fn run_prefill_gfx1201(gpu: &mut Gpu) {
         assert!(
             candidate.iter().all(|value| value.is_finite()) && rel_rmse < 0.01,
             "gfx1201 grouped O-LoRA parity failed: rel_rmse={rel_rmse} max_abs={max_abs}"
-        );
-        let raw_mismatches = candidate
-            .iter()
-            .zip(&candidate_b32)
-            .filter(|(a, b)| a.to_bits() != b.to_bits())
-            .count();
-        assert_eq!(
-            raw_mismatches, 0,
-            "gfx1201 grouped O-LoRA B32 must be raw-bit exact"
         );
 
         let row_start = Instant::now();
@@ -1459,27 +1439,9 @@ fn run_prefill_gfx1201(gpu: &mut Gpu) {
         }
         gpu.hip.device_synchronize().expect("grouped timing sync");
         let grouped_us = start.elapsed().as_secs_f64() * 1.0e6 / trials as f64;
-        for _ in 0..2 {
-            gpu.gemm_mfp4g32_e8_soa_grouped_wmma_b32_gfx1201_f16(
-                &weights, &x_f16, &y_b32, groups, m, k, batch,
-            )
-            .expect("warm grouped gfx1201 B32 WMMA");
-        }
-        gpu.hip.device_synchronize().expect("grouped B32 warm sync");
-        let start = Instant::now();
-        for _ in 0..trials {
-            gpu.gemm_mfp4g32_e8_soa_grouped_wmma_b32_gfx1201_f16(
-                &weights, &x_f16, &y_b32, groups, m, k, batch,
-            )
-            .expect("time grouped gfx1201 B32 WMMA");
-        }
-        gpu.hip
-            .device_synchronize()
-            .expect("grouped B32 timing sync");
-        let grouped_b32_us = start.elapsed().as_secs_f64() * 1.0e6 / trials as f64;
         eprintln!(
-            "  tp3_wo_a_g3 B={batch}: rowwise={row_us:.2}us grouped={grouped_us:.2}us B32={grouped_b32_us:.2}us b32_speedup={:.3}x raw_mismatches={raw_mismatches} rel_rmse={rel_rmse:.7} max_abs={max_abs:.6}",
-            grouped_us / grouped_b32_us,
+            "  tp3_wo_a_g3 B={batch}: rowwise={row_us:.2}us grouped={grouped_us:.2}us speedup={:.2}x rel_rmse={rel_rmse:.7} max_abs={max_abs:.6}",
+            row_us / grouped_us,
         );
     }
 }
