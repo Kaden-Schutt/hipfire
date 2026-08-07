@@ -37,7 +37,7 @@ use crate::harmonic::{
 #[cfg(feature = "harmonic-worker")]
 use crate::harmonic_ipc::{harmonic_monotonic_tick, HarmonicIpcError};
 #[cfg(feature = "harmonic-worker")]
-use crate::harmonic_model::DeepseekV4HarmonicExecution;
+use crate::harmonic_model::{DeepseekV4HarmonicExecution, HarmonicDenseRetainedFfn};
 use crate::heterogeneous::DeepseekV4HeterogeneousExecution;
 use crate::{DeepseekV4Config, DeepseekV4State, DeepseekV4Weights};
 use hipfire_dispatch::context::DispatchCtx;
@@ -3523,7 +3523,7 @@ pub(crate) fn decode_step_heterogeneous(
             /*is_attn=*/ false,
         )?;
         ffn_prepare(cfg, dense_weights, state, dense_gpu, layer_idx)?;
-        heterogeneous_select_routes(cfg, dense_weights, state, dense_gpu, layer_idx, token_id)?;
+        heterogeneous_select_routes(cfg, dense_weights, state, dense_gpu, layer_idx)?;
 
         let epoch = execution.next_epoch()?;
         heterogeneous_publish_routes(cfg, state, dense_gpu, routed_gpu, execution, epoch)?;
@@ -3598,19 +3598,22 @@ pub(crate) fn decode_step_harmonic(
     for layer_idx in 0..cfg.num_hidden_layers {
         let layer_start = std::time::Instant::now();
         ds4_attn_block_harmonic(cfg, weights, state, gpu, execution, layer_idx, position)?;
-        mhc_pre(cfg, weights, state, gpu, layer_idx, /*is_attn=*/ false)?;
-        ffn_prepare(cfg, weights, state, gpu, layer_idx)?;
-        heterogeneous_select_routes(cfg, weights, state, gpu, layer_idx, token_id)?;
-
         let epoch = execution.next_epoch()?;
-        harmonic_stage_route_payload(cfg, state, gpu, execution, epoch, layer_idx)?;
-
-        // The side transfer stream is now waiting on route-ready. Queue the
-        // independent shared branch immediately on the primary gfx1100 stream.
-        ffn_shared_project(cfg, weights, state, gpu, layer_idx)?;
-
-        harmonic_publish_staged_route(gpu, execution, epoch, layer_idx)?;
-        harmonic_run_local_replicas(cfg, replicas, state, gpu, execution, layer_idx)?;
+        if execution.residency_plan.is_some() {
+            harmonic_run_retained_dense_ffn(
+                cfg, weights, replicas, state, gpu, execution, epoch, layer_idx, position,
+            )?;
+        } else {
+            // DS4HARM2 remains a direct-HIP compatibility route. The product
+            // DS4HARM3 path below owns its FFN segment through retained AQL.
+            mhc_pre(cfg, weights, state, gpu, layer_idx, /*is_attn=*/ false)?;
+            ffn_prepare(cfg, weights, state, gpu, layer_idx)?;
+            heterogeneous_select_routes(cfg, weights, state, gpu, layer_idx)?;
+            harmonic_stage_route_payload(cfg, state, gpu, execution, epoch, layer_idx)?;
+            ffn_shared_project(cfg, weights, state, gpu, layer_idx)?;
+            harmonic_publish_staged_route(gpu, execution, epoch, layer_idx)?;
+            harmonic_run_local_replicas(cfg, replicas, state, gpu, execution, layer_idx)?;
+        }
         harmonic_join_result(state, gpu, execution, epoch, layer_idx)?;
         hc_ffn_mix(cfg, weights, state, gpu, layer_idx)?;
         dump_residual_layer_norm(gpu, state, layer_idx, position);
@@ -6450,7 +6453,6 @@ fn heterogeneous_select_routes(
     state: &mut DeepseekV4State,
     gpu: &mut Gpu,
     layer_idx: usize,
-    token_id: u32,
 ) -> Result<(), String> {
     let k = cfg.num_experts_per_tok;
     if state.moe_topk_indices.is_none() {
@@ -6509,6 +6511,154 @@ fn heterogeneous_select_routes(
     dump_moe_route_if_enabled(gpu, layer_idx, topk_indices, topk_weights)
 }
 
+/// Run the gfx1100-owned FFN segment as one retained AQL publication with a
+/// host-visible checkpoint immediately after route staging. The host publishes
+/// that route to the gfx1151 worker while the same gfx1100 queue continues the
+/// shared projection and guarded local-expert tail.
+///
+/// Attention remains on the established HIP streams. One primary-stream
+/// completion before AQL submission is the owner-local handoff between those
+/// dispatch domains; no GPU packet waits on CPU or peer progress.
+#[cfg(feature = "harmonic-worker")]
+#[allow(clippy::too_many_arguments)]
+fn harmonic_run_retained_dense_ffn(
+    cfg: &DeepseekV4Config,
+    weights: &DeepseekV4Weights,
+    replicas: Option<&DeepseekV4HarmonicReplicaWeights>,
+    state: &mut DeepseekV4State,
+    gpu: &mut Gpu,
+    execution: &mut DeepseekV4HarmonicExecution,
+    epoch: u64,
+    layer_idx: usize,
+    position: u32,
+) -> Result<(), String> {
+    let primary = gpu
+        .active_stream
+        .as_ref()
+        .ok_or_else(|| "harmonic retained primary stream missing".to_owned())?;
+    let route_wait_start = std::time::Instant::now();
+    gpu.hip
+        .stream_synchronize(primary)
+        .map_err(|error| format!("harmonic attention handoff l{layer_idx}: {error}"))?;
+
+    if let Some(mut retained) = execution
+        .dense_ffn_replays
+        .get_mut(layer_idx)
+        .and_then(Option::take)
+    {
+        if retained.replays == 0 {
+            eprintln!(
+                "[harmonic] first gfx1100 FFN replay l{layer_idx}: dispatches={} checkpoint={} queue={}",
+                retained.dispatch_count, retained.checkpoint_dispatch, retained.queue_id
+            );
+        }
+        let activation = execution
+            .mapping
+            .as_ref()
+            .ok_or_else(|| "harmonic gfx1100 mapping unavailable".to_owned())?
+            .activation_buffer(epoch);
+        let packet_address = (activation.as_ptr() as usize as u64).to_le_bytes();
+        let patch = rdna_compute::replay::AqlKernargPatch {
+            dispatch: retained.checkpoint_dispatch,
+            offset: rdna_compute::rdna3::gfx1100::HARMONIC_STAGE_PACKET_POINTER_KERNARG_OFFSET,
+            bytes: &packet_address,
+        };
+        let replay_result = (|| -> Result<(), String> {
+            // SAFETY: all captured allocations are model-owned and stable; the
+            // only patch selects one of the two still-live owner-local mapped
+            // activation slots before queue publication.
+            let mut ticket = unsafe {
+                retained
+                    .replay
+                    .submit_checkpointed_linear_aql_patched(position as usize, &[patch])
+            }
+            .map_err(|error| format!("harmonic retained submit l{layer_idx}: {error}"))?;
+            ticket
+                .wait_checkpoint(execution.layer_timeout)
+                .map_err(|error| format!("harmonic retained checkpoint l{layer_idx}: {error}"))?;
+            execution.record_route_sync(route_wait_start.elapsed());
+            harmonic_publish_ready_route(execution, epoch, layer_idx)?;
+            ticket
+                .wait(execution.layer_timeout)
+                .map_err(|error| format!("harmonic retained terminal l{layer_idx}: {error}"))?;
+            retained.replays = retained.replays.saturating_add(1);
+            Ok(())
+        })();
+        execution.dense_ffn_replays[layer_idx] = Some(retained);
+        return replay_result;
+    }
+
+    // Capture each layer once after lazy allocations/JIT from earlier model
+    // setup have stabilized. The direct launch both records and executes the
+    // current token; subsequent tokens use the prepared owner-local queue.
+    let mut controller = rdna_compute::replay::ReplayController::new_manual_aql();
+    std::mem::swap(&mut gpu.replay, &mut controller);
+    let capture_result = (|| -> Result<(_, usize), String> {
+        gpu.replay
+            .begin_capture()
+            .map_err(|error| format!("harmonic retained begin l{layer_idx}: {error}"))?;
+        mhc_pre(cfg, weights, state, gpu, layer_idx, /*is_attn=*/ false)?;
+        ffn_prepare(cfg, weights, state, gpu, layer_idx)?;
+        heterogeneous_select_routes(cfg, weights, state, gpu, layer_idx)?;
+        let checkpoint_dispatch = gpu.replay.recorded_launches().len();
+        harmonic_stage_route_payload(cfg, state, gpu, execution, epoch, layer_idx)?;
+        ffn_shared_project(cfg, weights, state, gpu, layer_idx)?;
+        harmonic_run_local_replicas(cfg, replicas, state, gpu, execution, layer_idx)?;
+        gpu.hip
+            .stream_synchronize(gpu.active_stream.as_ref().unwrap())
+            .map_err(|error| {
+                format!("harmonic retained capture completion l{layer_idx}: {error}")
+            })?;
+        let summary = gpu
+            .replay
+            .finish_capture()
+            .map_err(|error| format!("harmonic retained finish l{layer_idx}: {error}"))?;
+        let checkpoint = gpu
+            .replay
+            .recorded_launches()
+            .get(checkpoint_dispatch)
+            .ok_or_else(|| format!("harmonic retained checkpoint missing l{layer_idx}"))?;
+        if checkpoint.kernel != "harmonic_stage_route_gfx1100" {
+            return Err(format!(
+                "harmonic retained checkpoint l{layer_idx} captured {:?}",
+                checkpoint.kernel
+            ));
+        }
+        Ok((summary, checkpoint_dispatch))
+    })();
+    std::mem::swap(&mut gpu.replay, &mut controller);
+    let (summary, checkpoint_dispatch) = capture_result?;
+    let pci_bus_id = gpu
+        .pci_bus_id()
+        .map_err(|error| format!("harmonic retained dense PCI identity: {error}"))?;
+    let (dispatch_count, packet_count, queue_id) = controller
+        .prepare_checkpointed_linear_aql_prefix_for_pci_bus_id(
+            &pci_bus_id,
+            summary.launch_count,
+            checkpoint_dispatch,
+        )
+        .map_err(|error| format!("harmonic retained prepare l{layer_idx}: {error}"))?;
+    if dispatch_count != summary.launch_count {
+        return Err(format!(
+            "harmonic retained l{layer_idx} prepared {dispatch_count} of {} dispatches",
+            summary.launch_count
+        ));
+    }
+    harmonic_publish_ready_route(execution, epoch, layer_idx)?;
+    execution.dense_ffn_replays[layer_idx] = Some(HarmonicDenseRetainedFfn {
+        replay: controller,
+        dispatch_count,
+        checkpoint_dispatch,
+        queue_id,
+        replays: 0,
+    });
+    eprintln!(
+        "[harmonic] prepared gfx1100 FFN l{layer_idx}: dispatches={dispatch_count} packets={packet_count} checkpoint={checkpoint_dispatch} queue={queue_id} sequence_hash={:016x}",
+        summary.sequence_hash
+    );
+    Ok(())
+}
+
 #[cfg(feature = "harmonic-worker")]
 fn harmonic_stage_route_payload(
     cfg: &DeepseekV4Config,
@@ -6527,26 +6677,44 @@ fn harmonic_stage_route_payload(
     gpu.bind_thread()
         .map_err(|error| format!("harmonic stage bind dense l{layer_idx}: {error}"))?;
     if execution.residency_plan.is_some() {
+        let x_rot = state
+            .ffn_x_rot
+            .as_ref()
+            .ok_or_else(|| "harmonic x_rot missing".to_owned())?;
         let topk_indices = state
             .moe_topk_indices
             .as_ref()
             .ok_or_else(|| "harmonic route indices missing".to_owned())?;
+        let topk_weights = state
+            .moe_topk_weights
+            .as_ref()
+            .ok_or_else(|| "harmonic route weights missing".to_owned())?;
+        let activation = execution
+            .mapping
+            .as_ref()
+            .ok_or_else(|| "harmonic gfx1100 mapping unavailable".to_owned())?
+            .activation_buffer(epoch);
         let arch = gpu.arch.clone();
-        let mut device = gpu.try_gfx1100().ok_or_else(|| {
-            format!("harmonic route partition requires exact gfx1100, got {arch}")
-        })?;
+        let mut device = gpu
+            .try_gfx1100()
+            .ok_or_else(|| format!("harmonic route stage requires exact gfx1100, got {arch}"))?;
         device
-            .harmonic_partition_route(
+            .harmonic_stage_route(
+                x_rot,
                 topk_indices,
+                topk_weights,
                 execution.compact_index_map.as_ref().unwrap(),
                 execution.local_topk_indices.as_ref().unwrap(),
                 execution.slot_sources.as_ref().unwrap(),
                 execution.local_topk_count.as_ref().unwrap(),
+                &activation,
                 layer_idx,
                 HARMONIC_EXPERT_COUNT as usize,
+                cfg.hidden_size,
                 HARMONIC_TOP_K,
             )
-            .map_err(|error| format!("harmonic route partition l{layer_idx}: {error}"))?;
+            .map_err(|error| format!("harmonic route stage l{layer_idx}: {error}"))?;
+        return Ok(());
     }
     let primary = gpu
         .active_stream
@@ -6623,7 +6791,6 @@ fn harmonic_publish_staged_route(
     epoch: u64,
     layer_idx: usize,
 ) -> Result<(), String> {
-    let publish_start = std::time::Instant::now();
     let transfer = execution
         .transfer_stream
         .as_ref()
@@ -6640,6 +6807,20 @@ fn harmonic_publish_staged_route(
         .map_err(|error| format!("harmonic route transfer completion l{layer_idx}: {error}"))?;
     let route_sync_elapsed = route_sync_start.elapsed();
     execution.record_route_sync(route_sync_elapsed);
+    harmonic_publish_ready_route(execution, epoch, layer_idx)
+}
+
+/// Publish an activation packet after its owner-local completion proof has
+/// already been observed. The retained-AQL path calls this after the stage
+/// checkpoint while later gfx1100 packets continue; it deliberately takes no
+/// `Gpu` borrow and therefore cannot introduce a cross-device GPU wait.
+#[cfg(feature = "harmonic-worker")]
+fn harmonic_publish_ready_route(
+    execution: &mut DeepseekV4HarmonicExecution,
+    epoch: u64,
+    layer_idx: usize,
+) -> Result<(), String> {
+    let publish_start = std::time::Instant::now();
     let (route_ids, route_weight_bits) = execution
         .ring
         .read_mapped_activation_metadata(epoch)
@@ -6714,7 +6895,7 @@ fn harmonic_publish_staged_route(
         .ring
         .publish_mapped(packet, execution.source_generation, now)
         .map_err(|error| format!("harmonic publish l{layer_idx}: {error}"));
-    execution.record_publish_cpu(publish_start.elapsed().saturating_sub(route_sync_elapsed));
+    execution.record_publish_cpu(publish_start.elapsed());
     result
 }
 
@@ -6727,20 +6908,16 @@ fn harmonic_run_local_replicas(
     execution: &DeepseekV4HarmonicExecution,
     layer_idx: usize,
 ) -> Result<(), String> {
-    let Some(packed) = execution.packed_route else {
+    if execution.residency_plan.is_none() {
         if replicas.is_some() {
             return Err("harmonic replicas present on a DS4HARM2 route".to_owned());
         }
         return Ok(());
-    };
+    }
     let replicas = replicas
         .ok_or_else(|| "harmonic DS4HARM3 route is missing gfx1100 replica weights".to_owned())?;
     if replicas.plan_identity() != execution.contract.residency_identity {
         return Err("harmonic replica/contract identity mismatch".to_owned());
-    }
-    let k_top = packed.local_count as usize;
-    if k_top == 0 {
-        return Ok(());
     }
     let layer = replicas.resolve_layer(layer_idx);
     let gate_up_ptrs = layer
@@ -6755,59 +6932,26 @@ fn harmonic_run_local_replicas(
         .ffn_x_rot
         .as_ref()
         .ok_or_else(|| format!("harmonic local x_rot missing l{layer_idx}"))?;
-    {
-        let arch = gpu.arch.clone();
-        let mut device = gpu
-            .try_gfx1100()
-            .ok_or_else(|| format!("harmonic local expert requires exact gfx1100, got {arch}"))?;
-        device
-            .mq2_lloyd_moe_gate_up_k4_lds(
-                gate_up_ptrs,
-                execution.local_topk_indices.as_ref().unwrap(),
-                x_rot,
-                execution.local_gate_batch.as_ref().unwrap(),
-                execution.local_up_batch.as_ref().unwrap(),
-                2 * cfg.moe_intermediate_size,
-                cfg.hidden_size,
-                k_top,
-            )
-            .map_err(|error| format!("harmonic local gate/up l{layer_idx}: {error}"))?;
-    }
-    gpu.deepseek4_silu_mul_clamp_f32_batched(
-        execution.local_gate_batch.as_ref().unwrap(),
-        execution.local_up_batch.as_ref().unwrap(),
-        execution.local_gate_batch.as_ref().unwrap(),
-        cfg.moe_intermediate_size,
-        k_top,
-        cfg.swiglu_limit,
-    )
-    .map_err(|error| format!("harmonic local activation l{layer_idx}: {error}"))?;
-    gpu.rotate_x_mq_batched(
-        execution.local_gate_batch.as_ref().unwrap(),
-        execution.local_rot_batch.as_ref().unwrap(),
-        cfg.moe_intermediate_size,
-        k_top,
-    )
-    .map_err(|error| format!("harmonic local rotation l{layer_idx}: {error}"))?;
-    {
-        let arch = gpu.arch.clone();
-        let mut device = gpu
-            .try_gfx1100()
-            .ok_or_else(|| format!("harmonic local expert requires exact gfx1100, got {arch}"))?;
-        device
-            .mq2_lloyd_moe_down_expanded_lds_candidate(
-                down_ptrs,
-                execution.local_topk_indices.as_ref().unwrap(),
-                execution.local_rot_batch.as_ref().unwrap(),
-                execution.local_down_expanded.as_ref().unwrap(),
-                cfg.hidden_size,
-                cfg.moe_intermediate_size,
-                k_top,
-                1,
-            )
-            .map_err(|error| format!("harmonic local down l{layer_idx}: {error}"))?;
-    }
-    Ok(())
+    let arch = gpu.arch.clone();
+    let mut device = gpu
+        .try_gfx1100()
+        .ok_or_else(|| format!("harmonic local expert requires exact gfx1100, got {arch}"))?;
+    device
+        .harmonic_mq2_lloyd_local_tail(
+            gate_up_ptrs,
+            down_ptrs,
+            execution.local_topk_indices.as_ref().unwrap(),
+            execution.local_topk_count.as_ref().unwrap(),
+            x_rot,
+            execution.local_gate_batch.as_ref().unwrap(),
+            execution.local_up_batch.as_ref().unwrap(),
+            execution.local_rot_batch.as_ref().unwrap(),
+            execution.local_down_expanded.as_ref().unwrap(),
+            cfg.hidden_size,
+            cfg.moe_intermediate_size,
+            cfg.swiglu_limit,
+        )
+        .map_err(|error| format!("harmonic local retained tail l{layer_idx}: {error}"))
 }
 
 #[cfg(feature = "harmonic-worker")]
