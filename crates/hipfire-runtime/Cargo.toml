@@ -237,6 +237,10 @@ name = "greedy_dump_top5"
 required-features = ["arch-qwen35"]
 
 [[example]]
+name = "kv_mode_kld"
+required-features = ["arch-qwen35"]
+
+[[example]]
 name = "logit_dump"
 required-features = ["arch-qwen35"]
 
