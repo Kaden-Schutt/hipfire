@@ -195,12 +195,6 @@ fn run_loaded_worker(
             &cfg,
             args.allocation_generation,
         )?);
-        service.as_mut().unwrap().prepare_retained_split(
-            &mut gpu,
-            &cfg,
-            weights.as_ref().unwrap(),
-            &receipt.pci_bus_id,
-        )?;
         mapping = Some(
             HarmonicGpuMapping::register(ring, &gpu.hip)
                 .map_err(|error| format!("register harmonic expert payloads: {error}"))?,
