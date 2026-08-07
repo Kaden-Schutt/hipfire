@@ -11681,11 +11681,37 @@ impl Gpu {
                 &format!("direct_wmma: LDS {lds_bytes} > 64KB (max_n_total={max_n_total})"),
             ));
         }
-        self.ensure_kernel(
-            "deepseek4_attn_swa_topk_direct_wmma",
-            kernels::V4F_ATTN_SWA_TOPK_DIRECT_WMMA_SRC,
-            "deepseek4_attn_swa_topk_direct_wmma",
-        )?;
+        // The gfx12 WMMA instruction has a distinct Clang builtin. Keep the
+        // gfx11 source and code object untouched while giving the screening
+        // harness a separately named gfx1201 module/symbol. If this wins at
+        // the real decode shape it can graduate to a dedicated source file;
+        // until then it is deliberately not wired into product dispatch.
+        let gfx1201_src;
+        let (kernel_name, kernel_src, kernel_symbol) = if self.arch.eq_ignore_ascii_case("gfx1201")
+        {
+            gfx1201_src = kernels::V4F_ATTN_SWA_TOPK_DIRECT_WMMA_SRC
+                .replace(
+                    "__builtin_amdgcn_wmma_f32_16x16x16_f16_w32(",
+                    "__builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(",
+                )
+                .replacen(
+                    "void deepseek4_attn_swa_topk_direct_wmma(",
+                    "void deepseek4_attn_swa_topk_direct_wmma_gfx1201(",
+                    1,
+                );
+            (
+                "deepseek4_attn_swa_topk_direct_wmma_gfx1201",
+                gfx1201_src.as_str(),
+                "deepseek4_attn_swa_topk_direct_wmma_gfx1201",
+            )
+        } else {
+            (
+                "deepseek4_attn_swa_topk_direct_wmma",
+                kernels::V4F_ATTN_SWA_TOPK_DIRECT_WMMA_SRC,
+                "deepseek4_attn_swa_topk_direct_wmma",
+            )
+        };
+        self.ensure_kernel(kernel_name, kernel_src, kernel_symbol)?;
         let qp = q.buf.as_ptr();
         let kp = swa_kv.buf.as_ptr();
         let cp = kv_cache.buf.as_ptr();
@@ -11718,7 +11744,7 @@ impl Gpu {
         ];
         // Capture-safe launch (blob path under the new base's prefill capture).
         self.launch_maybe_blob(
-            "deepseek4_attn_swa_topk_direct_wmma",
+            kernel_name,
             [(n_heads / 16) as u32, batch_size as u32, 1],
             [256, 1, 1], // 8 warps split the score n-tiles / output d-tiles
             lds_bytes as u32,
