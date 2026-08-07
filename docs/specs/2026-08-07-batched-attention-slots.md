@@ -314,33 +314,37 @@ Two structural facts drive this:
   Four slots must read 4× the KV bytes but need not spend 4× the time: there is
   **~2.6-3.1× headroom on the 27B shape and ~3.6-4.6× on the 35B-A3B shape**.
 
-  **SECOND CORRECTION, from Task 8's measurement (2026-08-07).** The sentence
-  that used to end this paragraph — "batching supplies exactly what closes it" —
-  was wrong, and in the opposite direction to the original error. Measured, at
-  8 slots:
+  **SECOND CORRECTION — RETRACTED 2026-08-07, DO NOT USE.** A correction was
+  committed here claiming batching yields only ~1.2-1.26x and recovers <10% of
+  the headroom, concluding that "the largest single win in attention is kernel
+  efficiency, not batching". **That conclusion was drawn from an unfair
+  measurement and is withdrawn.**
 
-  | shape | batch-1 | batch-8 | utilisation | headroom recovered |
-  |---|---|---|---|---|
-  | 35B-A3B | 50.4 GB/s | 63.2 GB/s (1.25×) | 22.5% → 28.2% | **7.4%** |
-  | 27B | 73.1 GB/s | 88.4 GB/s (1.21×) | 32.6% → 39.5% | **10.1%** |
+  Task 8's benchmark passed the *same* device buffer as both K and V in the
+  sequential arm while the batched arm used two distinct buffers. The sequential
+  arm therefore touched half the distinct bytes, fitted in cache, and ran
+  artificially fast — biasing the comparison *against* batching, in exactly the
+  direction of the conclusion that was drawn. The review re-measured with
+  distinct K/V buffers:
 
-  Batching gives a **real but modest** win — 1.06× at 2 slots rising to 1.26× at
-  8 — and it recovers **under a tenth** of the available headroom. Eight times the
-  independent work improved bandwidth by only ~25%, which means the kernel is
-  **not** starved of in-flight requests. Something else caps it: most likely the
-  32-thread workgroup, the unaligned 34-byte Q8_0 block reads, or the scalar
-  dequant loop.
+  | shape | n=2 | n=4 | n=8 |
+  |---|---|---|---|
+  | as published (K aliased to V) | 1.06x | 1.15x | 1.26x |
+  | re-measured (distinct K, V) | ~1.12-1.16x | ~1.26-1.34x | **~1.36-1.47x** |
 
-  **The consequence for the programme is important: the largest single win
-  available in attention is not batching, it is kernel efficiency.** Roughly 3-4×
-  is sitting unclaimed behind the memory-access pattern, and it would benefit
-  batch-1 decode and every slot count equally. That is a separate piece of work
-  from SP1-SP4 and should be specced on its own.
+  Also overturned: the n=1 "descriptor-indirection regression" (0.85x) vanishes
+  at 0.99-1.05x, so descriptor indirection costs approximately nothing; and
+  `TILE_SIZE=256` **passes** the batched-beats-sequential criterion once the arm
+  is fair, and is the fastest setting tested.
 
-  So the honest arc across three revisions: the original framing was too
-  pessimistic about *whether* batching helps, the first correction was too
-  optimistic about *how much*, and the measured answer is a dependable ~1.2-1.26×
-  on the attention term at 4-8 slots. The question is therefore **how much of that headroom
+  A further correction is pending: the GB/s figures count KV traffic only and
+  omit `partials` round-trip, which is ~24% of real DRAM traffic at n=8 — so the
+  utilisation and "headroom unclaimed" numbers are also overstated.
+
+  **The honest state of this question is: unresolved pending a re-run.** What is
+  established is that batching is a real win that grows with slot count; its
+  size, and whether kernel efficiency is the larger prize, both await corrected
+  measurement. The question is therefore **how much of that headroom
   batching recovers**, which §10's batched-vs-sequential sweep measures
   directly. See `docs/perf-checkpoints/2026-08-07-batching-ceiling-probe.md`.
 - **MoE expert reads barely amortise at small batch.** Four sequences drawing
