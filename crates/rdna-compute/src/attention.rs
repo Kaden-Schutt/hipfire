@@ -3815,12 +3815,12 @@ impl Gpu {
              SP1 scope."
         );
         // gfx1151 is the dev box; gfx1201 is the target. Never bake a tuned
-        // constant into a `const` — see spec §11.
-        let tile_size: usize = std::env::var("HIPFIRE_ATTN_TILE_SIZE")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .filter(|&t: &usize| t > 0 && t % 32 == 0)
-            .unwrap_or(128);
+        // constant into a `const` — see spec §11. Resolution lives in
+        // `kv_slots::attn_tile_size` — the single source of truth every
+        // caller of this value must share (see that function's doc comment
+        // for the corruption bug three independent copies of this exact
+        // logic caused).
+        let tile_size: usize = crate::kv_slots::attn_tile_size();
         const WMMA_BLOCK_M: usize = 16;
         let max_tiles = (max_ctx_len + tile_size - 1) / tile_size;
         let stride = 2 + head_dim;

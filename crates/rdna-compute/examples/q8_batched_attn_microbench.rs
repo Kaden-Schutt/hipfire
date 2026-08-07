@@ -91,19 +91,19 @@ fn main() {
     let bytes_per_pos = nkv * blocks_per_head * 34;
     let cache_bytes = ctx * bytes_per_pos;
 
-    // MUST mirror launch_asym_flash_batched's own tile_size resolution
-    // (attention.rs) exactly: HIPFIRE_ATTN_TILE_SIZE is a process-global env
-    // var read inside the kernel launcher itself, so it silently changes
-    // every call through this file, not just the multi-slot sweep appended
-    // below. A hardcoded `128` here diverges from the launcher's actual
-    // max_tiles once that env var is set, undersizing `partials` and
-    // corrupting device memory (found empirically: TILE_SIZE=64 crashed with
-    // "illegal memory access" downstream, in the unrelated multi-slot
-    // section, because this buffer was already too small upstream). Resolved
-    // up front so both the preflight estimate below and the actual `partials`
-    // allocation further down use the identical value.
-    let tile = env_usize("HIPFIRE_ATTN_TILE_SIZE", 128);
-    let tile = if tile > 0 && tile % 32 == 0 { tile } else { 128 };
+    // Resolved via kv_slots::attn_tile_size — the single source of truth
+    // shared with launch_asym_flash_batched's own tile_size resolution
+    // (attention.rs) and bench_slots below. HIPFIRE_ATTN_TILE_SIZE is a
+    // process-global env var read inside the kernel launcher itself, so it
+    // silently changes every call through this file, not just the
+    // multi-slot sweep appended below. A value here that diverges from the
+    // launcher's actual max_tiles undersizes `partials` and corrupts device
+    // memory (found empirically before this was unified: TILE_SIZE=64
+    // crashed with "illegal memory access" downstream, in the unrelated
+    // multi-slot section, because this buffer was already too small
+    // upstream). Resolved up front so both the preflight estimate below and
+    // the actual `partials` allocation further down use the identical value.
+    let tile = rdna_compute::kv_slots::attn_tile_size();
     let max_tiles = ctx.div_ceil(tile);
 
     // This section's own allocations, checked against the same gate the new
@@ -255,9 +255,23 @@ fn main() {
     // "layer" (this microbench times a single kernel launch, not a full
     // multi-layer forward pass) — bytes = ctx * n_kv_heads * (head_dim/32) *
     // 34 * 2 (K and V), summed over every slot in the batch.
+    //
+    // Also counted: `partials` traffic. The tile kernel writes `rows *
+    // n_heads * max_tiles * (2+head_dim)` f32s of partials and the reduce
+    // kernel reads every one of them back (see launch_asym_flash_batched's
+    // unconditional reduce-kernel launch in attention.rs) — that round trip
+    // is real DRAM traffic this benchmark's own kernels perform, not an
+    // artefact of measurement. Omitting it understated real traffic by
+    // ~24% at n_slots=8/ctx=32768/TILE=128 (review finding I1). Since this
+    // sweep uses one ctx per shape (`per_slot_ctx` for every slot), total
+    // partials bytes are identical whether that ctx's rows arrive as one
+    // batched launch or as `n_slots` sequential 1-row launches — same rows,
+    // same max_tiles, same reduce cost — so one formula covers both arms.
     let bw_nkv = env_usize("NKV", 2);
     let bw_hd = env_usize("HD", 256);
+    let bw_nh = env_usize("NH", 16); // MUST mirror bench_slots' own NH resolution
     let bw_per_pos_bytes = (bw_nkv * (bw_hd / 32) * 34) as f64;
+    let bw_tile = rdna_compute::kv_slots::attn_tile_size();
     for &n_slots in &[1usize, 2, 4, 8] {
         let per_slot_ctx = env_usize("SLOT_CTX", 32768);
         let shape = vec![per_slot_ctx; n_slots];
@@ -267,12 +281,19 @@ fn main() {
             continue;
         };
         let total_kv_bytes = n_slots as f64 * per_slot_ctx as f64 * bw_per_pos_bytes * 2.0;
-        let batched_gbs = total_kv_bytes / (batched_ms * 1e6);
-        let seq_gbs = total_kv_bytes / (seq_ms * 1e6);
+        let max_tiles = per_slot_ctx.div_ceil(bw_tile);
+        let partials_bytes = n_slots as f64 * bw_nh as f64 * max_tiles as f64
+            * (2.0 + bw_hd as f64) * 4.0 * 2.0; // write + read
+        let total_bytes = total_kv_bytes + partials_bytes;
+        let batched_gbs = total_bytes / (batched_ms * 1e6);
+        let seq_gbs = total_bytes / (seq_ms * 1e6);
         println!(
             "n_slots={n_slots:2} ctx={per_slot_ctx:6} : batched {batched_ms:8.3} ms ({batched_gbs:6.1} GB/s)  \
-             sequential {seq_ms:8.3} ms ({seq_gbs:6.1} GB/s)  speedup {:.2}x",
-            seq_ms / batched_ms
+             sequential {seq_ms:8.3} ms ({seq_gbs:6.1} GB/s)  speedup {:.2}x  \
+             [KV {:.1} MB + partials {:.1} MB]",
+            seq_ms / batched_ms,
+            total_kv_bytes / 1e6,
+            partials_bytes / 1e6,
         );
         if n_slots >= 2 {
             assert!(
@@ -295,13 +316,36 @@ fn main() {
             (Some((ragged_ms, _)), Some((uniform_ms, _))) => {
                 let useful: usize = ragged.iter().sum();
                 let launched = 100_000 * 4;
-                let useful_gbs = (useful as f64 * bw_per_pos_bytes * 2.0) / (ragged_ms * 1e6);
-                let uniform_gbs = (launched as f64 * bw_per_pos_bytes * 2.0) / (uniform_ms * 1e6);
+                // Partials round-trip: both shapes share max_ctx=100_000 and
+                // 4 rows (m_per_slot is [1,1,1,1] for both), so max_tiles and
+                // total partials bytes are IDENTICAL for ragged and
+                // uniform-max — the waste being measured here is entirely in
+                // KV tile launches that early-exit, not in partials traffic.
+                // Included anyway for GB/s consistency with the n_slots
+                // sweep above (review finding I1).
+                let max_tiles = 100_000usize.div_ceil(bw_tile);
+                let partials_bytes = 4.0 * bw_nh as f64 * max_tiles as f64
+                    * (2.0 + bw_hd as f64) * 4.0 * 2.0;
+                let useful_gbs =
+                    (useful as f64 * bw_per_pos_bytes * 2.0 + partials_bytes) / (ragged_ms * 1e6);
+                let uniform_gbs =
+                    (launched as f64 * bw_per_pos_bytes * 2.0 + partials_bytes) / (uniform_ms * 1e6);
+                // Time cost per 1000 USEFUL positions — the number that
+                // actually answers "how much does raggedness cost", as
+                // distinct from "what fraction of the launched grid
+                // early-exits" (review finding I3: the 65.5% waste figure
+                // below is real but is 6x the actual time cost).
+                let ragged_us_per_1k = ragged_ms * 1000.0 / (useful as f64 / 1000.0);
+                let uniform_us_per_1k = uniform_ms * 1000.0 / (launched as f64 / 1000.0);
                 println!(
-                    "ragged {ragged_ms:8.3} ms ({useful_gbs:6.1} GB/s useful-KV basis) vs \
+                    "ragged {ragged_ms:8.3} ms ({useful_gbs:6.1} GB/s useful-KV+partials basis) vs \
                      uniform-max {uniform_ms:8.3} ms ({uniform_gbs:6.1} GB/s)  (useful KV \
-                     {useful}, tiles sized for {launched}, waste {:.1}%)",
-                    100.0 * (1.0 - useful as f64 / launched as f64)
+                     {useful}, tiles sized for {launched}, waste {:.1}%)  \
+                     [time cost: {ragged_us_per_1k:.2} us/1000-useful-positions ragged vs \
+                     {uniform_us_per_1k:.2} us/1000-useful-positions uniform, \
+                     {:.1}% slower]",
+                    100.0 * (1.0 - useful as f64 / launched as f64),
+                    100.0 * (ragged_us_per_1k / uniform_us_per_1k - 1.0),
                 );
             }
             _ => println!("ragged/uniform-max: SKIPPED (preflight refused, see stderr)"),
@@ -355,19 +399,13 @@ fn bench_slots(gpu: &mut Gpu, seq_lens: &[usize], m_per_slot: &[usize]) -> Optio
     let rows: usize = m_per_slot.iter().sum();
     let (tile_slot, _, _) = build_tiles(m_per_slot, 1);
     let max_ctx = *seq_lens.iter().max().unwrap();
-    // MUST mirror launch_asym_flash_batched's tile_size resolution exactly —
-    // see the comment on the equivalent computation in main() above. A
-    // hardcoded 128 here undersizes `partials` under HIPFIRE_ATTN_TILE_SIZE
-    // < 128, corrupting device memory (empirically: illegal memory access at
-    // TILE_SIZE=64 before this fix).
-    let tile_size_for_partials = env_usize("HIPFIRE_ATTN_TILE_SIZE", 128);
-    let tile_size_for_partials =
-        if tile_size_for_partials > 0 && tile_size_for_partials % 32 == 0 {
-            tile_size_for_partials
-        } else {
-            128
-        };
-    let max_tiles = max_ctx.div_ceil(tile_size_for_partials);
+    // Resolved via kv_slots::attn_tile_size — the single source of truth
+    // shared with launch_asym_flash_batched's own resolution (attention.rs)
+    // and main()'s single-shape section above. A value that diverges from
+    // the launcher's own resolution undersizes `partials` and corrupts
+    // device memory (empirically: illegal memory access at TILE_SIZE=64
+    // before this was unified).
+    let max_tiles = max_ctx.div_ceil(rdna_compute::kv_slots::attn_tile_size());
 
     // Preflight (host RAM + 32 GiB target budget), computed analytically
     // from host-side sizes BEFORE any upload — see module doc.
@@ -378,7 +416,10 @@ fn bench_slots(gpu: &mut Gpu, seq_lens: &[usize], m_per_slot: &[usize]) -> Optio
         + (rows * 4) as u64 // positions
         + (rows * nh * hd * 4) as u64 * 2 // q + out (f32)
         + (rows * nh * max_tiles * (2 + hd) * 4) as u64 // partials
-        + slabs_bytes // sequential-arm slabs (K==V shared buffer per slot)
+        + 2 * slabs_bytes // sequential-arm slabs: DISTINCT K and V buffers per
+                           // slot, matching the batched arm's k_cache/v_cache
+                           // — see the comment on `slabs` below for why K==V
+                           // aliasing here would understate the batching win
         + (seq_lens.len() * 4) as u64; // sequential-arm per-slot positions
     if !preflight_or_skip(total_alloc_bytes, "bench_slots") {
         return None;
@@ -429,6 +470,17 @@ fn bench_slots(gpu: &mut Gpu, seq_lens: &[usize], m_per_slot: &[usize]) -> Optio
 
     // Sequential arm: one legacy launch per slot, against that slot's slab.
     //
+    // K and V are uploaded as two DISTINCT buffers per slot (same source
+    // bytes, two separate device allocations) — mirroring exactly how the
+    // batched arm above builds k_cache/v_cache as two distinct uploads of
+    // `arena`. Passing one shared buffer as both K and V here would make
+    // each sequential launch touch only HALF the distinct bytes the batched
+    // arm touches (at ctx=32768 that's 17.8 MB vs 35.6 MB per slot): the
+    // aliased half fits this box's MALL cache while the batched arm's full
+    // working set does not, so the sequential arm would come out
+    // artificially fast and the batching win would be understated. See
+    // review finding C1.
+    //
     // The per-slot slabs and positions are uploaded BEFORE the timed region.
     // Uploading inside the closure would charge the sequential arm a host->device
     // cost the batched arm never pays, flattering the batched path and making the
@@ -439,20 +491,21 @@ fn bench_slots(gpu: &mut Gpu, seq_lens: &[usize], m_per_slot: &[usize]) -> Optio
         .map(|(slot, &sl)| {
             let off = descs[slot].k_base as usize;
             let len = descs[slot].cap as usize * per_pos_bytes;
-            let slab = gpu.upload_raw(&arena[off..off + len], &[len]).expect("slab");
+            let slab_k = gpu.upload_raw(&arena[off..off + len], &[len]).expect("slab k");
+            let slab_v = gpu.upload_raw(&arena[off..off + len], &[len]).expect("slab v");
             let pos = sl as i32 - 1;
             let pb = unsafe {
                 std::slice::from_raw_parts(&pos as *const i32 as *const u8, 4)
             };
             let p = gpu.upload_raw(pb, &[1]).expect("slab pos");
-            (slab, p, sl)
+            (slab_k, slab_v, p, sl)
         })
         .collect();
 
     let sequential = time_ms(gpu, warmups, iters, &|g: &mut Gpu| {
-        for (slab, p, sl) in &slabs {
+        for (slab_k, slab_v, p, sl) in &slabs {
             g.attention_flash_q8_0_batched_masked(
-                &q, slab, slab, &out, p, nh, nkv, hd, *sl, *sl, 1, &partials, None, 0, 0,
+                &q, slab_k, slab_v, &out, p, nh, nkv, hd, *sl, *sl, 1, &partials, None, 0, 0,
             )
             .expect("sequential");
         }
@@ -466,8 +519,9 @@ fn bench_slots(gpu: &mut Gpu, seq_lens: &[usize], m_per_slot: &[usize]) -> Optio
     gpu.free_tensor(q).expect("free q");
     gpu.free_tensor(out).expect("free out");
     gpu.free_tensor(partials).expect("free partials");
-    for (slab, p, _) in slabs {
-        gpu.free_tensor(slab).expect("free slab");
+    for (slab_k, slab_v, p, _) in slabs {
+        gpu.free_tensor(slab_k).expect("free slab k");
+        gpu.free_tensor(slab_v).expect("free slab v");
         gpu.free_tensor(p).expect("free slab pos");
     }
 

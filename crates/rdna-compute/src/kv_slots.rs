@@ -214,6 +214,31 @@ pub fn build_tiles(
 }
 
 
+// ── Attention tile size ─────────────────────────────────────────────────────
+//
+// Single source of truth for resolving `HIPFIRE_ATTN_TILE_SIZE`. Before this
+// function existed, three call sites (the `launch_asym_flash_batched` kernel
+// launcher in `attention.rs`, and two spots in the multi-slot microbench)
+// each hand-copied the identical parse-and-validate logic, with comments
+// saying "MUST mirror ... exactly". That duplication is what let a
+// hardcoded `128` divisor silently drift out of sync with the launcher's own
+// resolution and undersize the `partials` buffer, corrupting device memory
+// (see `.superpowers/sdd/task-8-report.md`'s "Defect found and fixed"
+// section for the illegal-memory-access this caused). Every caller that
+// needs this value MUST go through this function instead of re-deriving it.
+
+/// Resolve the batched-attention tile size from `HIPFIRE_ATTN_TILE_SIZE`,
+/// falling back to 128 when unset, non-numeric, zero, or not a multiple of
+/// 32. gfx1151 is the dev box; gfx1201 is the deployment target — never bake
+/// a tuned constant into a `const` (spec §11).
+pub fn attn_tile_size() -> usize {
+    std::env::var("HIPFIRE_ATTN_TILE_SIZE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&t: &usize| t > 0 && t % 32 == 0)
+        .unwrap_or(128)
+}
+
 // ── Memory preflight ────────────────────────────────────────────────────────
 //
 // On 2026-08-07 the SP1 harnesses drove nine GLOBAL OOM kills on the dev box,
