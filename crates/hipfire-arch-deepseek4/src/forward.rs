@@ -12075,6 +12075,11 @@ fn attention_block_batched_mixed(
         let use_dsa_wmma = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_DSA_WMMA").as_deref()
             != Ok("0")
             && gpu.arch_caps.has_wmma()
+            // The portable WMMA symbol is not a viable gfx1201 lowering: the
+            // exact TP3 rank-2 shape (16 heads, B=128) measured 351 ms/call
+            // versus 0.8 ms for the established F32 path. Keep gfx1201 on the
+            // correct fast path until it has a native wave32 implementation.
+            && !gpu.arch_caps.is_gfx1201()
             && n_heads % 16 == 0
             && head_dim % 16 == 0;
         // Dynamic shared-memory sizing is part of the captured launch node.
@@ -12136,6 +12141,7 @@ fn attention_block_batched_mixed(
         let use_dsa_wmma = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_DSA_WMMA").as_deref()
             != Ok("0")
             && gpu.arch_caps.has_wmma()
+            && !gpu.arch_caps.is_gfx1201()
             && n_heads % 16 == 0
             && head_dim % 16 == 0;
         let max_n_total = if capture_safe {
