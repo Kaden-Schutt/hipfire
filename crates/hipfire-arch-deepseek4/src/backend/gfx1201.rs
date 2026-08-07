@@ -104,7 +104,7 @@ impl MoeBiasAwareMq2Backend for Gfx1201Backend {
                     "deepseek4: loaded gfx1201 backend cannot execute MQ2 down on this GPU"
                         .to_owned()
                 })?
-                .mq2_lloyd_moe_down_expanded_lds_ep(
+                .mq2_lloyd_moe_down_expanded_ep(
                     expert_ptrs,
                     ownership_ptrs,
                     dummy,

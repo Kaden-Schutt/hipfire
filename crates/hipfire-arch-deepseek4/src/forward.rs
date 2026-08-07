@@ -3225,7 +3225,6 @@ fn indexer_forward(
     layer_idx: usize,
     position: u32,
     idx_weights_preprojected: bool,
-    q_idx_preprojected: bool,
 ) -> Result<usize, String> {
     let layer = weights.resolve_layer(layer_idx);
     if layer.compress_ratio != 4 {
@@ -3329,18 +3328,16 @@ fn indexer_forward(
         .as_ref()
         .ok_or_else(|| "indexer: q_lat_rot not allocated".to_string())?;
     let q_idx = state._indexer[layer_idx].q_idx.as_ref().unwrap();
-    if !q_idx_preprojected {
-        gemv_auto(
-            gpu,
-            weights.mq2r_backend,
-            wq_b,
-            q_lat_rot,
-            q_lat,
-            q_idx,
-            h * d,
-            cfg.q_lora_rank,
-        )?;
-    }
+    gemv_auto(
+        gpu,
+        weights.mq2r_backend,
+        wq_b,
+        q_lat_rot,
+        q_lat,
+        q_idx,
+        h * d,
+        cfg.q_lora_rank,
+    )?;
 
     // 2. Tail RoPE on q_idx with compress_rope_theta (matching is_indexer=true
     //    K-side compressor's RoPE). Use main `pos_buf` (already holds current
@@ -4298,7 +4295,7 @@ pub fn decode_step_body(
         if let Some(t) = state.hc_x_in.as_ref() {
             dump_stage_norm(gpu, "hc_x_in_attn", t, layer_idx, position);
         }
-        let q_idx_preprojected = q_lora(cfg, weights, state, gpu, layer_idx)?;
+        q_lora(cfg, weights, state, gpu, layer_idx)?;
 
         // (Q-LoRA call moved above into the fused RMSNorm + GEMV step.)
 
@@ -4342,16 +4339,7 @@ pub fn decode_step_body(
                     cfg, weights, state, gpu, layer_idx, &tmp_view, position,
                     /*is_indexer=*/ true,
                 )?;
-                let _n = indexer_forward(
-                    cfg,
-                    weights,
-                    state,
-                    gpu,
-                    layer_idx,
-                    position,
-                    false,
-                    q_idx_preprojected,
-                )?;
+                let _n = indexer_forward(cfg, weights, state, gpu, layer_idx, position, false)?;
                 dump_indexer_state(gpu, state, layer_idx, position, _n);
             }
         }
@@ -4455,7 +4443,7 @@ fn ds4_attn_block_core(
     mhc_pre(cfg, weights, state, gpu, layer_idx, /*is_attn=*/ true)?;
     q_lora_prepare(cfg, weights, state, gpu, layer_idx)?;
     let packed_input = attention_input_e8_pack_gfx1201(cfg, weights, state, gpu, layer_idx)?;
-    let q_idx_preprojected = q_lora_project(cfg, weights, state, gpu, layer_idx, packed_input)?;
+    q_lora_project(cfg, weights, state, gpu, layer_idx, packed_input)?;
     kv_joint(cfg, weights, state, gpu, layer_idx, packed_input)?;
     apply_tail_rope(cfg, weights, state, gpu, position, layer_idx)?;
     if layer.compress_ratio > 0 {
@@ -4490,16 +4478,7 @@ fn ds4_attn_block_core(
                     /*is_indexer=*/ true,
                 )?;
             }
-            let _n = indexer_forward(
-                cfg,
-                weights,
-                state,
-                gpu,
-                layer_idx,
-                position,
-                packed_input,
-                q_idx_preprojected,
-            )?;
+            let _n = indexer_forward(cfg, weights, state, gpu, layer_idx, position, packed_input)?;
             dump_indexer_state(gpu, state, layer_idx, position, _n);
         }
     }
@@ -4598,7 +4577,7 @@ fn ds4_attn_block_heterogeneous(
     std::mem::swap(&mut gpu.active_stream, &mut execution.dense_attn_stream);
     side_result?;
 
-    let q_idx_preprojected = q_lora_project(cfg, weights, state, gpu, layer_idx, false)?;
+    q_lora_project(cfg, weights, state, gpu, layer_idx, false)?;
     {
         let primary = gpu
             .active_stream
@@ -4615,16 +4594,7 @@ fn ds4_attn_block_heterogeneous(
 
     apply_tail_rope(cfg, weights, state, gpu, position, layer_idx)?;
     if layer.compress_ratio == 4 {
-        let n = indexer_forward(
-            cfg,
-            weights,
-            state,
-            gpu,
-            layer_idx,
-            position,
-            false,
-            q_idx_preprojected,
-        )?;
+        let n = indexer_forward(cfg, weights, state, gpu, layer_idx, position, false)?;
         dump_indexer_state(gpu, state, layer_idx, position, n);
     }
     attn_stub(
@@ -5982,7 +5952,7 @@ fn mtp_pre_ffn(
         mtp_layer_idx,
         /*is_attn=*/ true,
     )?;
-    let _ = q_lora(cfg, weights, state, gpu, mtp_layer_idx)?;
+    q_lora(cfg, weights, state, gpu, mtp_layer_idx)?;
     kv_joint(cfg, weights, state, gpu, mtp_layer_idx, false)?;
     apply_tail_rope(cfg, weights, state, gpu, position, mtp_layer_idx)?;
     // (No compressor / indexer for MTP — compress_ratio == 0.)
@@ -6712,46 +6682,29 @@ fn ffn_shared_project(
         dump_dense_activations_if_enabled(gpu, &names, ffn_x_plain, cfg.hidden_size)?;
     }
 
-    // 2-3. gate/up consume the same activation. Exact gfx1201 can preserve
-    // each projection's arithmetic while sharing activation loads and launch.
-    if gpu.arch == "gfx1201"
-        && weights.mq2r_backend.is_gfx1201()
-        && shared_w1.dtype == DType::MFP4G32E8SOA
-        && shared_w3.dtype == DType::MFP4G32E8SOA
-    {
-        gpu.gemv_mfp4g32_e8_soa_shared_pair_gfx1201(
-            shared_w1,
-            shared_w3,
-            ffn_x_rot,
-            &gate,
-            &up,
-            local_im,
-            local_im,
-            cfg.hidden_size,
-        )
-        .map_err(|error| format!("shared gate/up E8 pair l{layer_idx}: {error:?}"))?;
-    } else {
-        gemv_auto(
-            gpu,
-            weights.mq2r_backend,
-            shared_w1,
-            ffn_x_rot,
-            ffn_x_plain,
-            &gate,
-            local_im,
-            cfg.hidden_size,
-        )?;
-        gemv_auto(
-            gpu,
-            weights.mq2r_backend,
-            shared_w3,
-            ffn_x_rot,
-            ffn_x_plain,
-            &up,
-            local_im,
-            cfg.hidden_size,
-        )?;
-    }
+    // 2. gate = x @ shared_w1
+    gemv_auto(
+        gpu,
+        weights.mq2r_backend,
+        shared_w1,
+        ffn_x_rot,
+        ffn_x_plain,
+        &gate,
+        local_im,
+        cfg.hidden_size,
+    )?;
+
+    // 3. up = x @ shared_w3
+    gemv_auto(
+        gpu,
+        weights.mq2r_backend,
+        shared_w3,
+        ffn_x_rot,
+        ffn_x_plain,
+        &up,
+        local_im,
+        cfg.hidden_size,
+    )?;
 
     // 4-5. DeepSeek V4 SwiGLU with swiglu_limit clamp, optionally fused with
     //      the FWHT rotation when shared_w2 is MQ4. The fused kernel
@@ -9427,7 +9380,7 @@ fn q_lora_project(
     gpu: &mut Gpu,
     layer_idx: usize,
     wq_a_preprojected: bool,
-) -> Result<bool, String> {
+) -> Result<(), String> {
     let layer = weights.resolve_layer(layer_idx);
     let q_norm = layer
         .q_norm
@@ -9506,62 +9459,23 @@ fn q_lora_project(
     let q_total = cfg.num_attention_heads * cfg.head_dim;
     let mut q = state.q.as_ref().unwrap().sub_offset(0, q_total);
     q.shape = vec![cfg.num_attention_heads, cfg.head_dim];
-    let q_idx_preprojected = if gpu.arch == "gfx1201"
-        && cfg.mq2r
-        && weights.mq2r_backend.is_gfx1201()
-        && layer.compress_ratio == 4
-        && wq_b.dtype == DType::MFP4G32E8SOA
-    {
-        let indexer_wq_b = layer
-            .indexer_wq_b
-            .as_ref()
-            .ok_or_else(|| format!("idx_wq_b l{layer_idx}"))?;
-        if indexer_wq_b.dtype != DType::MFP4G32E8SOA {
-            false
-        } else {
-            let index_width = cfg.index_n_heads * cfg.index_head_dim;
-            if state._indexer[layer_idx].q_idx.is_none() {
-                state._indexer[layer_idx].q_idx = Some(
-                    gpu.alloc_tensor(&[cfg.index_n_heads, cfg.index_head_dim], DType::F32)
-                        .map_err(|error| format!("alloc paired q_idx l{layer_idx}: {error:?}"))?,
-                );
-            }
-            let q_idx = state._indexer[layer_idx].q_idx.as_ref().unwrap();
-            gpu.gemv_mfp4g32_e8_soa_shared_pair_gfx1201(
-                wq_b,
-                indexer_wq_b,
-                q_lat_rot,
-                &q,
-                q_idx,
-                q_total,
-                index_width,
-                cfg.q_lora_rank,
-            )
-            .map_err(|error| format!("main/indexer Q E8 pair l{layer_idx}: {error:?}"))?;
-            true
-        }
-    } else {
-        false
-    };
-    if !q_idx_preprojected {
-        gemv_auto(
-            gpu,
-            weights.mq2r_backend,
-            wq_b,
-            q_lat_rot,
-            q_lat,
-            &q,
-            q_total,
-            cfg.q_lora_rank,
-        )?;
-    }
+    gemv_auto(
+        gpu,
+        weights.mq2r_backend,
+        wq_b,
+        q_lat_rot,
+        q_lat,
+        &q,
+        q_total,
+        cfg.q_lora_rank,
+    )?;
 
     // 4.5. Per-head RMSNorm of Q (upstream DeepSeek V4:
     //     `q *= rsqrt(q.square().mean(-1, keepdim=True) + eps)`).
     gpu.rmsnorm_f32(&q, q_head_ones, &q, cfg.rms_norm_eps)
         .map_err(|e| format!("q per-head rmsnorm layer {layer_idx}: {e:?}"))?;
 
-    Ok(q_idx_preprojected)
+    Ok(())
 }
 
 fn q_lora(
@@ -9570,7 +9484,7 @@ fn q_lora(
     state: &mut DeepseekV4State,
     gpu: &mut Gpu,
     layer_idx: usize,
-) -> Result<bool, String> {
+) -> Result<(), String> {
     q_lora_prepare(cfg, weights, state, gpu, layer_idx)?;
     q_lora_project(cfg, weights, state, gpu, layer_idx, false)
 }
