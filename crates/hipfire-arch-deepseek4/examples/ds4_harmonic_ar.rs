@@ -19,7 +19,7 @@ use serde_json::json;
 fn main() -> Result<(), String> {
     let mut args = std::env::args().skip(1);
     let model = PathBuf::from(args.next().ok_or(
-        "usage: ds4_harmonic_ar MODEL --worker PATH --prompt PATH --generate N --runtime-dir PATH [--context N] [--output PATH] [--hotset-plan PATH] [--model-sha256 HEX --model-len N --model-mtime-secs N --model-mtime-nanos N]",
+        "usage: ds4_harmonic_ar MODEL --worker PATH --prompt PATH --generate N --runtime-dir PATH [--context N] [--output PATH] [--hotset-plan PATH] [--repeat-prompt-token] [--model-sha256 HEX --model-len N --model-mtime-secs N --model-mtime-nanos N]",
     )?);
     let mut worker = None;
     let mut prompt = None;
@@ -32,6 +32,7 @@ fn main() -> Result<(), String> {
     let mut model_mtime_secs = None;
     let mut model_mtime_nanos = None;
     let mut hotset_plan = None;
+    let mut repeat_prompt_token = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--worker" => worker = Some(PathBuf::from(args.next().ok_or("--worker needs PATH")?)),
@@ -62,6 +63,7 @@ fn main() -> Result<(), String> {
                     args.next().ok_or("--hotset-plan needs PATH")?,
                 ))
             }
+            "--repeat-prompt-token" => repeat_prompt_token = true,
             "--model-sha256" => model_sha256 = Some(args.next().ok_or("--model-sha256 needs HEX")?),
             "--model-len" => {
                 model_len = Some(
@@ -189,7 +191,12 @@ fn main() -> Result<(), String> {
     generated.push(greedy(&logits)?);
     while generated.len() < generate {
         let position = prompt_tokens.len() + generated.len() - 1;
-        logits = loaded.decode_step(*generated.last().unwrap(), position as u32)?;
+        let input_token = if repeat_prompt_token {
+            *prompt_tokens.last().unwrap()
+        } else {
+            *generated.last().unwrap()
+        };
+        logits = loaded.decode_step(input_token, position as u32)?;
         generated.push(greedy(&logits)?);
     }
     let decode_secs = decode_start.elapsed().as_secs_f64();
@@ -217,6 +224,7 @@ fn main() -> Result<(), String> {
         "prompt_md5": prompt_md5,
         "prompt_tokens": prompt_tokens.len(),
         "generated_tokens": generated.len(),
+        "repeat_prompt_token": repeat_prompt_token,
         "decoded_bytes": decoded.len(),
         "load_seconds": load_secs,
         "prefill_seconds": prefill_secs,
