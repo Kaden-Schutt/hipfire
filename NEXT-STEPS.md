@@ -128,6 +128,18 @@ MoE free; VMM arena release skipped by `free_tensor_checked` (now arena-aware).
 
 RESIDUAL DEBT (tracked, do not forget):
 
+0. **Terminal String-returning teardown surfaces — CLOSED.** `load_model`,
+   `unload_model`, the qwen35 carrier error path, `rollback_unfinished_qwen35`,
+   and the MTP-head failure logger now ENQUEUE owners that survive their
+   retry into the process-local retained-owner backlog
+   (`hipfire_runtime::gpu_cleanup::{enqueue_cleanup_failure, retry_backlog}`)
+   instead of dropping them while allocated. The next `load_model` /
+   `unload_model` drains the backlog; owners that still fail stay enqueued
+   (exact-retention) and are reported. `HIPFIRE_FROZEN_FAIL_FREE` is
+   continuous-while-set (any non-empty value) so an initial teardown AND its
+   retry can both be made to fail; the backlog is GPU-tested
+   (`retained_backlog_enqueues_after_double_failure_and_recovers_on_next_load`).
+
 1. **Qwen35 mid-constructor leaks (same class as the EP constructor leak
    above).** A failure partway through `DeltaNetState::new_with_quant`,
    `Qwen35Scratch::new_with_kv_max`, `PrefillBatchScratch::new_opt`, the

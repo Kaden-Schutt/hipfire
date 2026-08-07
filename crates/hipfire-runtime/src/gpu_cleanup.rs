@@ -82,7 +82,7 @@ impl std::fmt::Debug for RetainedGpuTensor {
 /// store). Category-preserving retry: the concrete owner type decides how
 /// its own cleanup is retried, so the generic [`GpuCleanupFailure`] can
 /// carry mixed owner kinds without flattening them.
-pub trait RetryableOwner: std::fmt::Debug {
+pub trait RetryableOwner: std::fmt::Debug + Send {
     /// Retry freeing this owner. On success it is consumed; on failure the
     /// owner is returned (same category, never flattened).
     fn retry_boxed(self: Box<Self>, gpu: &mut Gpu) -> Result<(), Box<dyn RetryableOwner>>;
@@ -364,4 +364,67 @@ macro_rules! retain_free {
 /// no best-effort `let _ =` free as a correctness mechanism.
 pub trait BundleTeardown {
     fn free_checked(self, gpu: &mut Gpu) -> Result<(), GpuCleanupFailure>;
+}
+
+// ── Process-local retained-owner backlog ──────────────────────────────
+
+/// The loader's String-returning surfaces (`load_model`, `unload_model`,
+/// carrier error paths) cannot carry [`GpuCleanupFailure`] owners onward.
+/// Instead of dropping them while allocated, the terminal paths ENQUEUE them
+/// here — the backlog is the exact-retention owner until a retry point
+/// drains it. [`retry_backlog`] runs at every load/unload boundary, so a
+/// later operation reclaims whatever an earlier one could not free.
+///
+/// The backlog holds whole [`GpuCleanupFailure`] entries (both categories —
+/// tensors and boxed [`RetryableOwner`]s travel together, never flattened).
+use std::sync::Mutex;
+
+static RETAINED_BACKLOG: Mutex<Vec<GpuCleanupFailure>> = Mutex::new(Vec::new());
+
+/// Enqueue a whole owner-carrying cleanup failure that a String-returning
+/// API cannot carry onward. Owners are retained here (never dropped while
+/// allocated) until the next retry point.
+pub fn enqueue_cleanup_failure(cf: GpuCleanupFailure) {
+    RETAINED_BACKLOG
+        .lock()
+        .expect("retained-owner backlog poisoned")
+        .push(cf);
+}
+
+/// Enqueue a single retained tensor (e.g. a per-owner retry failure at a
+/// String-returning boundary).
+pub fn enqueue_retained(r: RetainedGpuTensor) {
+    let mut cf = GpuCleanupFailure::empty();
+    cf.add_retained(r);
+    enqueue_cleanup_failure(cf);
+}
+
+/// Retry every enqueued owner once. Successful retries are consumed; owners
+/// that still fail are re-enqueued. Returns the number of allocations still
+/// pending (0 = backlog empty).
+pub fn retry_backlog(gpu: &mut Gpu) -> usize {
+    let mut backlog = RETAINED_BACKLOG
+        .lock()
+        .expect("retained-owner backlog poisoned");
+    let mut still = Vec::new();
+    for cf in backlog.drain(..) {
+        match cf.retry(gpu) {
+            Ok(()) => {} // consumed
+            Err(remaining) => still.push(remaining),
+        }
+    }
+    let pending: usize = still.iter().map(|cf| cf.num_failed()).sum();
+    *backlog = still;
+    pending
+}
+
+/// Number of allocations currently pending in the backlog (diagnostics and
+/// tests).
+pub fn backlog_pending() -> usize {
+    RETAINED_BACKLOG
+        .lock()
+        .expect("retained-owner backlog poisoned")
+        .iter()
+        .map(|cf| cf.num_failed())
+        .sum()
 }

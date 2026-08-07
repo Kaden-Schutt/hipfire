@@ -640,10 +640,16 @@ impl Carrier for Qwen35Carrier {
                                     }
                                 }
                                 Err(remaining) => {
+                                    let pending = remaining.num_failed();
+                                    let summaries = remaining.error_summaries();
+                                    hipfire_runtime::gpu_cleanup::enqueue_cleanup_failure(
+                                        remaining,
+                                    );
                                     eprintln!(
-                                        "  qwen35 bundle load cleanup retry failed ({} owner(s)): {}",
-                                        remaining.num_failed(),
-                                        remaining.error_summaries().join("; ")
+                                        "  qwen35 bundle load cleanup retry failed \
+                                         ({pending} owner(s) enqueued to the retained-owner \
+                                         backlog): {}",
+                                        summaries.join("; ")
                                     );
                                 }
                             }
