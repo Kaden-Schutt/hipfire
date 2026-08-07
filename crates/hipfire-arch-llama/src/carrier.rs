@@ -2,6 +2,7 @@ use crate::dspark_body::Qwen3DrafterAssets;
 use crate::Llama;
 use hipfire_runtime::arch::Architecture;
 use hipfire_runtime::dspark_core::DsparkWeights;
+use hipfire_runtime::gpu_cleanup::{retain_kv_failures, BundleTeardown, GpuCleanupFailure};
 use hipfire_runtime::llama::{
     ForwardScratch, KvCache, KvDims, KvLayers, KvTarget, LlamaConfig, LlamaWeights,
 };
@@ -165,5 +166,51 @@ impl LlamaBundle {
             "dflash extract layers must be strictly ascending: {layers:?}"
         );
         self.dflash_extract_layers = layers;
+    }
+}
+
+impl BundleTeardown for LlamaBundle {
+    /// Checked GPU cleanup for the whole bundle: every owned domain is freed
+    /// with a CHECKED free ([`LlamaWeights::free_checked`],
+    /// [`ForwardScratch::free_checked`], [`KvCache::free_checked`],
+    /// [`DsparkWeights::free_checked`], [`Qwen3DrafterAssets::free_checked`]);
+    /// owners that survive are merged into the returned
+    /// [`GpuCleanupFailure`] for exact-retention retry — no best-effort free
+    /// is used as a correctness mechanism.
+    fn free_checked(self, gpu: &mut rdna_compute::Gpu) -> Result<(), GpuCleanupFailure> {
+        let LlamaBundle {
+            config: _,
+            weights,
+            scratch,
+            kv,
+            dflash_extract_layers: _,
+            dspark_weights,
+            dspark_assets,
+        } = self;
+        // Match unload order of `free_gpu`: drafter assets → dspark globals →
+        // kv → scratch → weights.
+        let mut cf = GpuCleanupFailure::empty();
+        if let Some(assets) = dspark_assets {
+            if let Err(f) = assets.free_checked(gpu) {
+                cf.merge(f);
+            }
+        }
+        if let Some(w) = dspark_weights {
+            if let Err(f) = w.free_checked(gpu) {
+                cf.merge(f);
+            }
+        }
+        retain_kv_failures(kv.free_checked(gpu), &mut cf.failed_tensors);
+        if let Err(f) = scratch.free_checked(gpu) {
+            cf.merge(f);
+        }
+        if let Err(f) = weights.free_checked(gpu) {
+            cf.merge(f);
+        }
+        if cf.is_empty() {
+            Ok(())
+        } else {
+            Err(cf)
+        }
     }
 }

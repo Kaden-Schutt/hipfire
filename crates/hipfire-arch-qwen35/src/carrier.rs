@@ -3,6 +3,7 @@ use crate::qwen35::{
 };
 use crate::Qwen35;
 use hipfire_runtime::arch::Architecture;
+use hipfire_runtime::gpu_cleanup::{BundleTeardown, GpuCleanupFailure, RetainedGpuTensor};
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::kv_adaptive::{KvAdaptive, Preset};
 use hipfire_runtime::kv_backend::KvBackend;
@@ -21,56 +22,151 @@ pub struct Qwen35Bundle {
     pub kv_adaptive: Option<KvAdaptive>,
 }
 
+/// A failure while constructing the Qwen35 GPU bundle.
+///
+/// Carries every owner that the checked-free rollback could not free
+/// (`cleanup`), so the receiver can retry exact-retention cleanup before
+/// converting the message to a plain `String`. `None` cleanup means the
+/// rollback freed everything — only the message remains.
+#[must_use]
+pub struct Qwen35BundleLoadError {
+    pub message: String,
+    pub cleanup: Option<GpuCleanupFailure>,
+}
+
+impl std::fmt::Debug for Qwen35BundleLoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Redacted: message + owner count only. Never stringify the
+        // retained owners (they must be consumed through
+        // `cleanup.retry`, never dropped after a log).
+        f.debug_struct("Qwen35BundleLoadError")
+            .field("message", &self.message)
+            .field("cleanup", &self.cleanup.as_ref().map(|c| c.num_failed()))
+            .finish()
+    }
+}
+
 /// Build the Qwen35 GPU bundle from an HFQ source.
 ///
 /// CPU-only config/compat validation runs **before** weight upload. Every
 /// fallible GPU stage after weights is transactional: on failure, owners
-/// constructed so far are explicitly `free_gpu`'d (KvCache via
-/// [`KvCache::free_gpu`]) and the original error is preserved with any
-/// cleanup/VMM-pending context appended.
-pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Qwen35Bundle, String> {
+/// constructed so far are freed with CHECKED frees
+/// ([`KvCache::free_checked`], [`Qwen35Scratch::abort_checked`],
+/// [`Qwen35Weights::free_gpu_checked`], [`DeltaNetState::abort_checked`])
+/// and every owner that survives the rollback is carried in
+/// [`Qwen35BundleLoadError::cleanup`] for exact-retention retry — no
+/// best-effort `let _ =` free as a correctness mechanism.
+pub fn load_bundle(
+    src: ModelSource,
+    ctx: &mut LoadCtx,
+) -> Result<Qwen35Bundle, Qwen35BundleLoadError> {
     let ModelSource::Hfq(mut hfq) = src else {
-        return Err("qwen35: directory source unsupported".into());
+        return Err(Qwen35BundleLoadError {
+            message: "qwen35: directory source unsupported".into(),
+            cleanup: None,
+        });
     };
 
-    let config = <Qwen35 as Architecture>::config_from_hfq(&hfq).map_err(|e| e.to_string())?;
+    let config =
+        <Qwen35 as Architecture>::config_from_hfq(&hfq).map_err(|e| Qwen35BundleLoadError {
+            message: e.to_string(),
+            cleanup: None,
+        })?;
 
     // ── CPU-only parse + compatibility (zero GPU allocation) ─────────
-    let plan = plan_qwen35_gpu_stages(&config, ctx)?;
-    let dn_quant = parse_state_quant(ctx.state_quant_override)?;
+    let plan = plan_qwen35_gpu_stages(&config, ctx).map_err(|e| Qwen35BundleLoadError {
+        message: e,
+        cleanup: None,
+    })?;
+    let dn_quant =
+        parse_state_quant(ctx.state_quant_override).map_err(|e| Qwen35BundleLoadError {
+            message: e,
+            cleanup: None,
+        })?;
     eprintln!("  DeltaNet state: {}", state_quant_label(dn_quant));
     warn_tiny_model_state(&hfq, dn_quant);
 
     // ── Weight upload (first GPU ownership) ──────────────────────────
-    let weights = <Qwen35 as Architecture>::load_weights(&mut hfq, &config, ctx.gpu)?;
+    let weights =
+        <Qwen35 as Architecture>::load_weights(&mut hfq, &config, ctx.gpu).map_err(|e| {
+            Qwen35BundleLoadError {
+                message: e.to_string(),
+                cleanup: None,
+            }
+        })?;
     hipfire_runtime::maybe_screen_mmq(&weights, ctx.gpu);
 
-    // ── KV (transactional: free weights on fail) ─────────────────────
+    // ── KV (transactional: checked-free weights on fail) ─────────────
     let (kv, kv_adaptive) = match construct_kv_cache(&config, ctx, plan) {
         Ok(v) => v,
-        Err(e) => {
-            weights.free_gpu(ctx.gpu);
-            return Err(append_cleanup_context(e, note_vmm_after_free(ctx.gpu)));
+        // On reconfiguration failure the built KV is returned for cleanup.
+        Err((msg, kv_opt)) => {
+            return Err(bundle_fail(msg, None, None, kv_opt, Some(weights), ctx.gpu));
         }
     };
+    if crate::frozen_fault_inject::fail_stage() == Some("kv_construct") {
+        // Fault-injection seam (feature `frozen-fault-inject`): the KV was
+        // fully built — exercise the same checked-free rollback as a real
+        // failure, with the built KV carried into cleanup if a free fails.
+        return Err(bundle_fail(
+            "injected fault: kv_construct".into(),
+            None,
+            None,
+            Some(kv),
+            Some(weights),
+            ctx.gpu,
+        ));
+    }
 
-    // ── DeltaNet state (free kv + weights on fail) ───────────────────
+    // ── DeltaNet state (checked-free kv + weights on fail) ───────────
     let dn = match DeltaNetState::new_with_quant(ctx.gpu, &config, dn_quant) {
         Ok(v) => v,
         Err(e) => {
-            let cleanup = free_kv_and_weights(kv, weights, ctx.gpu);
-            return Err(append_cleanup_context(format!("{e}"), cleanup));
+            return Err(bundle_fail(
+                format!("{e}"),
+                None,
+                None,
+                Some(kv),
+                Some(weights),
+                ctx.gpu,
+            ));
         }
     };
+    if crate::frozen_fault_inject::fail_stage() == Some("dn_construct") {
+        return Err(bundle_fail(
+            "injected fault: dn_construct".into(),
+            None,
+            Some(dn),
+            Some(kv),
+            Some(weights),
+            ctx.gpu,
+        ));
+    }
 
-    // ── Scratch (free dn + kv + weights on fail) ─────────────────────
+    // ── Scratch (checked-free dn + kv + weights on fail) ─────────────
     let scratch = match Qwen35Scratch::new_with_kv_max(ctx.gpu, &config, 2048, ctx.max_seq) {
         Ok(v) => v,
         Err(e) => {
-            let cleanup = free_dn_kv_and_weights(dn, kv, weights, ctx.gpu);
-            return Err(append_cleanup_context(format!("{e}"), cleanup));
+            return Err(bundle_fail(
+                format!("{e}"),
+                None,
+                Some(dn),
+                Some(kv),
+                Some(weights),
+                ctx.gpu,
+            ));
         }
     };
+    if crate::frozen_fault_inject::fail_stage() == Some("scratch_construct") {
+        return Err(bundle_fail(
+            "injected fault: scratch_construct".into(),
+            Some(scratch),
+            Some(dn),
+            Some(kv),
+            Some(weights),
+            ctx.gpu,
+        ));
+    }
 
     Ok(Qwen35Bundle {
         config,
@@ -238,7 +334,7 @@ fn construct_kv_cache(
     config: &Qwen35Config,
     ctx: &mut LoadCtx,
     plan: Qwen35KvPlan,
-) -> Result<(KvCache, Option<KvAdaptive>), String> {
+) -> Result<(KvCache, Option<KvAdaptive>), (String, Option<KvCache>)> {
     if let Some(ad) = plan.adaptive {
         // Floors come from the controller, not separately parsed hints.
         let k_floor = ad.k_floor;
@@ -259,21 +355,21 @@ fn construct_kv_cache(
                     k_floor_bph,
                     v_floor,
                 )
-                .map_err(|e| format!("{e}"))?
+                .map_err(|e| (format!("{e}"), None))?
             }
             KvBackend::Contiguous => {
                 // Contiguous: allocate start-tier FWHT4/Q8 then floor-resize in place.
-                // If floor-resize fails, free the start-tier cache explicitly.
+                // If floor-resize fails, the start-tier cache is RETURNED with
+                // the error so the caller can checked-free it (never dropped).
                 let mut kv = KvCache::from_mode_with_backend(
                     start_mode,
                     KvBackend::Contiguous,
                     KvTarget::Single(ctx.gpu),
                     &plan.dims,
                 )
-                .map_err(|e| format!("{e}"))?;
+                .map_err(|e| (format!("{e}"), None))?;
                 if let Err(e) = kv.set_adaptive_floor_alloc(ctx.gpu, v_floor, k_floor_bph) {
-                    let cleanup = kv.free_gpu(ctx.gpu).map_err(|fe| fe.to_string());
-                    return Err(append_cleanup_context(format!("{e}"), cleanup));
+                    return Err((format!("{e}"), Some(kv)));
                 }
                 kv
             }
@@ -306,7 +402,7 @@ fn construct_kv_cache(
                     mode,
                     vm,
                 )
-                .map_err(|e| format!("{e}"))?
+                .map_err(|e| (format!("{e}"), None))?
             }
             (KvBackend::Contiguous, llama::VMode::Q8) => KvCache::from_mode_with_backend(
                 mode,
@@ -314,7 +410,7 @@ fn construct_kv_cache(
                 KvTarget::Single(ctx.gpu),
                 &plan.dims,
             )
-            .map_err(|e| format!("{e}"))?,
+            .map_err(|e| (format!("{e}"), None))?,
             (KvBackend::Contiguous, vm) => {
                 let mut kv = KvCache::from_mode_with_backend(
                     mode,
@@ -322,10 +418,10 @@ fn construct_kv_cache(
                     KvTarget::Single(ctx.gpu),
                     &plan.dims,
                 )
-                .map_err(|e| format!("{e}"))?;
+                .map_err(|e| (format!("{e}"), None))?;
                 if let Err(e) = kv.set_v_mode_realloc(ctx.gpu, vm) {
-                    let cleanup = kv.free_gpu(ctx.gpu).map_err(|fe| fe.to_string());
-                    return Err(append_cleanup_context(format!("{e}"), cleanup));
+                    // KV was built; return it so the caller can checked-free it.
+                    return Err((format!("{e}"), Some(kv)));
                 }
                 kv
             }
@@ -340,9 +436,70 @@ fn construct_kv_cache(
     }
 }
 
+/// Aggregate checked cleanup of every bundle domain constructed so far.
+///
+/// Each domain is attempted independently ([`Qwen35Scratch::abort_checked`],
+/// [`DeltaNetState::abort_checked`], [`KvCache::free_checked`],
+/// [`Qwen35Weights::free_gpu_checked`]); every owner that survives is
+/// carried in the returned error's `cleanup` for exact-retention retry.
+/// VMM-teardown context is appended to the message after all frees.
+fn bundle_fail(
+    msg: String,
+    scratch: Option<Qwen35Scratch>,
+    dn: Option<DeltaNetState>,
+    kv: Option<KvCache>,
+    weights: Option<Qwen35Weights>,
+    gpu: &mut rdna_compute::Gpu,
+) -> Qwen35BundleLoadError {
+    let mut cf = GpuCleanupFailure::empty();
+    if let Some(s) = scratch {
+        if let Err(failures) = s.abort_checked(gpu) {
+            for r in failures {
+                cf.add_retained(r);
+            }
+        }
+    }
+    if let Some(d) = dn {
+        if let Err(failures) = d.abort_checked(gpu) {
+            for r in failures {
+                cf.add_retained(r);
+            }
+        }
+    }
+    if let Some(k) = kv {
+        if let Err(failures) = k.free_checked(gpu) {
+            for (label, tensor) in failures {
+                cf.add_retained(RetainedGpuTensor {
+                    label,
+                    tensor,
+                    last_error: "kv free_checked failed".into(),
+                });
+            }
+        }
+    }
+    if let Some(w) = weights {
+        if let Err(f) = w.free_gpu_checked(gpu) {
+            cf.merge(f);
+        }
+    }
+    let vmm = note_vmm_after_free(gpu);
+    Qwen35BundleLoadError {
+        message: append_cleanup_context(msg, vmm),
+        cleanup: if cf.is_empty() { None } else { Some(cf) },
+    }
+}
+
 /// Free a fully constructed bundle. Used by loader finish-path rollback.
-/// Returns the first free error (VMM teardown) if any; always attempts full cleanup.
-pub fn free_qwen35_bundle(bundle: Qwen35Bundle, gpu: &mut rdna_compute::Gpu) -> Result<(), String> {
+///
+/// Every domain is freed with a CHECKED free ([`KvCache::free_checked`],
+/// [`Qwen35Scratch::abort_checked`], [`Qwen35Weights::free_gpu_checked`],
+/// [`DeltaNetState::abort_checked`]); owners that survive are collected into
+/// the returned [`GpuCleanupFailure`] for exact-retention retry — no
+/// best-effort free is used as a correctness mechanism.
+pub fn free_qwen35_bundle(
+    bundle: Qwen35Bundle,
+    gpu: &mut rdna_compute::Gpu,
+) -> Result<(), GpuCleanupFailure> {
     let Qwen35Bundle {
         config: _,
         weights,
@@ -352,53 +509,39 @@ pub fn free_qwen35_bundle(bundle: Qwen35Bundle, gpu: &mut rdna_compute::Gpu) -> 
         kv_adaptive: _,
     } = bundle;
     // Match unload_model Qwen35 order: kv → scratch → weights → dn.
-    let mut first: Option<String> = None;
-    if let Err(e) = kv_cache.free_gpu(gpu) {
-        first = Some(e.to_string());
+    let mut cf = GpuCleanupFailure::empty();
+    if let Err(failures) = kv_cache.free_checked(gpu) {
+        for (label, tensor) in failures {
+            cf.add_retained(RetainedGpuTensor {
+                label,
+                tensor,
+                last_error: "kv free_checked failed".into(),
+            });
+        }
     }
-    scratch.free_gpu(gpu);
-    weights.free_gpu(gpu);
-    dn_state.free_gpu(gpu);
-    let vmm = note_vmm_after_free(gpu);
-    match (first, vmm) {
-        (None, Ok(())) => Ok(()),
-        (Some(e), Ok(())) => Err(e),
-        (None, Err(c)) => Err(c),
-        (Some(e), Err(c)) => Err(format!("{e}; cleanup also failed: {c}")),
+    if let Err(failures) = scratch.abort_checked(gpu) {
+        for r in failures {
+            cf.add_retained(r);
+        }
     }
-}
-
-fn free_kv_and_weights(
-    kv: KvCache,
-    weights: Qwen35Weights,
-    gpu: &mut rdna_compute::Gpu,
-) -> Result<(), String> {
-    let mut first: Option<String> = None;
-    if let Err(e) = kv.free_gpu(gpu) {
-        first = Some(e.to_string());
+    if let Err(f) = weights.free_gpu_checked(gpu) {
+        cf.merge(f);
     }
-    weights.free_gpu(gpu);
-    match first {
-        Some(e) => Err(append_cleanup_context(e, note_vmm_after_free(gpu))),
-        None => note_vmm_after_free(gpu),
+    if let Err(failures) = dn_state.abort_checked(gpu) {
+        for r in failures {
+            cf.add_retained(r);
+        }
+    }
+    if cf.is_empty() {
+        Ok(())
+    } else {
+        Err(cf)
     }
 }
 
-fn free_dn_kv_and_weights(
-    dn: DeltaNetState,
-    kv: KvCache,
-    weights: Qwen35Weights,
-    gpu: &mut rdna_compute::Gpu,
-) -> Result<(), String> {
-    let mut first: Option<String> = None;
-    if let Err(e) = kv.free_gpu(gpu) {
-        first = Some(e.to_string());
-    }
-    dn.free_gpu(gpu);
-    weights.free_gpu(gpu);
-    match first {
-        Some(e) => Err(append_cleanup_context(e, note_vmm_after_free(gpu))),
-        None => note_vmm_after_free(gpu),
+impl BundleTeardown for Qwen35Bundle {
+    fn free_checked(self, gpu: &mut rdna_compute::Gpu) -> Result<(), GpuCleanupFailure> {
+        free_qwen35_bundle(self, gpu)
     }
 }
 

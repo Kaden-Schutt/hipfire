@@ -16,19 +16,21 @@ use hipfire_dispatch::families::moe::{
     decode_expert_refs, ExpertExecutionPlan, MoeStepPhases, RouterPlan,
 };
 use hipfire_dispatch::ops::delta_net::StateQuant as DispatchStateQuant;
+use hipfire_dispatch::pipeline::superop::{
+    ForwardBindings, LayerProgram, OpBinding, OpFlavor, SuperOp, SuperOpKind, WeightSlot,
+};
 use hipfire_dispatch::pipeline::{
     build_delta_net_batch_steps, build_delta_net_decode_steps, build_delta_net_tree_steps,
     execute_steps, execute_steps_mesh, DeltaNetOperandDescriptor, GemvInput, Step,
-};
-use hipfire_dispatch::pipeline::superop::{
-    ForwardBindings, LayerProgram, OpBinding, OpFlavor, SuperOp, SuperOpKind, WeightSlot,
 };
 use hipfire_dispatch::types::dtype_rotation_plan;
 use hipfire_dispatch::types::DispatchError;
 use hipfire_dispatch::types::RotationPlan;
 use hipfire_hardware::DeviceMesh;
+use hipfire_runtime::gpu_cleanup::{
+    free_tensor_retained, GpuCleanupFailure, RetainedGpuTensor, RetryableOwner,
+};
 use hipfire_runtime::hfq::{HfqFile, HfqTensorInfo};
-use hipfire_runtime::tp_shard::ShardConfig;
 use hipfire_runtime::llama::{
     self, f16_to_f32, fused_rmsnorm_rotate_for_mq, fused_rmsnorm_rotate_mq_batched_for,
     fused_silu_mul_rotate_mq_batched_for, rotate_x_mq_batched_for, weight_gemv_prerotated,
@@ -43,6 +45,7 @@ use hipfire_runtime::moe_plan::{
 use hipfire_runtime::multi_gpu::Gpus;
 use hipfire_runtime::paro::{paro_load_norm, paro_text_prefix};
 use hipfire_runtime::tp_shard::ExpertAssign;
+use hipfire_runtime::tp_shard::ShardConfig;
 use hipfire_runtime::weight_backend::{
     dequant_norm, dequant_weight_raw, load_awq_scale_for, load_embedding, resolve_lm_head,
     reupload_f16_as_f32, HfqBackend, ParoBackend,
@@ -1717,277 +1720,21 @@ pub fn frozen_eligible(config: &Qwen35Config) -> bool {
 }
 
 // ── Checked GPU cleanup types ───────────────────────────────────────
-
-/// A GPU tensor whose `free_tensor_checked` call failed.
-///
-/// Retains the original `GpuTensor` — the caller can inspect it or retry.
-/// Constructed only by the `free_gpu_checked` family; never by hand.
-pub struct RetainedQwenTensor {
-    pub(crate) label: String,
-    pub(crate) tensor: GpuTensor,
-    pub(crate) last_error: String,
-}
-
-impl RetainedQwenTensor {
-    /// Descriptive label identifying which weight field this tensor belongs to.
-    pub fn label(&self) -> &str {
-        &self.label
-    }
-
-    /// The original GPU tensor that could not be freed.
-    pub fn tensor(&self) -> &GpuTensor {
-        &self.tensor
-    }
-
-    /// Human-readable error from the failed free attempt.
-    pub fn last_error(&self) -> &str {
-        &self.last_error
-    }
-
-    /// Retry freeing this tensor.  On success the tensor is consumed.
-    /// On failure the tensor is returned alongside the new error.
-    pub fn retry(mut self, gpu: &mut Gpu) -> Result<(), RetainedQwenTensor> {
-        let mut opt = Some(self.tensor);
-        match gpu.free_tensor_checked(&mut opt) {
-            Ok(()) => {
-                // Tensor was taken by free_tensor_checked on success.
-                Ok(())
-            }
-            Err(e) => {
-                self.last_error = e.to_string();
-                self.tensor = opt
-                    .take()
-                    .expect("free_tensor_checked failed but left Option empty — this is a bug");
-                Err(self)
-            }
-        }
-    }
-}
-
-impl std::fmt::Debug for RetainedQwenTensor {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RetainedQwenTensor")
-            .field("label", &self.label)
-            .field("last_error", &self.last_error)
-            .finish()
-    }
-}
-
-/// Aggregate of all cleanup failures from a [`Qwen35Weights::free_gpu_checked`] call.
-///
-/// Contains:
-/// - Individual failed legacy tensors as [`RetainedQwenTensor`] entries.
-/// - A frozen [`SingleFreeFailed`] owner when the Frozen MoE resident
-///   could not be freed.
-///
-/// Successful frees are consumed and never appear here.
-pub struct Qwen35CleanupFailure {
-    pub(crate) failed_tensors: Vec<RetainedQwenTensor>,
-    pub(crate) frozen: Vec<SingleFreeFailed>,
-}
-
-impl Qwen35CleanupFailure {
-    /// Create an empty failure (no failed allocations).
-    pub fn empty() -> Self {
-        Self {
-            failed_tensors: Vec::new(),
-            frozen: Vec::new(),
-        }
-    }
-
-    /// True when no allocations failed.
-    pub fn is_empty(&self) -> bool {
-        self.failed_tensors.is_empty() && self.frozen.is_empty()
-    }
-
-    /// Add a single retained tensor to this failure.
-    pub fn add_retained(&mut self, retained: RetainedQwenTensor) {
-        self.failed_tensors.push(retained);
-    }
-
-    /// Add a single frozen owner to this failure.
-    pub fn add_frozen(&mut self, frozen: SingleFreeFailed) {
-        self.frozen.push(frozen);
-    }
-
-    /// Total number of failed allocations.
-    pub fn num_failed(&self) -> usize {
-        self.failed_tensors.len() + self.frozen.iter().map(|f| f.num_failed()).sum::<usize>()
-    }
-
-    /// Human-readable diagnostic summaries for every failure.
-    pub fn error_summaries(&self) -> Vec<String> {
-        let mut summaries: Vec<String> = self
-            .failed_tensors
-            .iter()
-            .map(|r| format!("{}: {}", r.label, r.last_error))
-            .collect();
-        for frozen in &self.frozen {
-            summaries.extend(frozen.error_summaries());
-        }
-        summaries
-    }
-
-    /// Create a [`Qwen35CleanupFailure`] from a [`SingleFreeFailed`]
-    /// (e.g. from a failed frozen store free during load rollback).
-    /// The frozen owner is added to the internal frozen list.
-    pub fn from_frozen(frozen_fail: SingleFreeFailed) -> Self {
-        Self {
-            failed_tensors: Vec::new(),
-            frozen: vec![frozen_fail],
-        }
-    }
-
-    /// Merge another [`Qwen35CleanupFailure`] into this one.
-    /// Used internally to combine per-layer failures.
-    ///
-    /// Every failed item from `other` is appended — no first-wins/drop
-    /// semantics.  If both sides carry frozen owners, both are retained
-    /// for independent retry.
-    pub fn merge(&mut self, other: Qwen35CleanupFailure) {
-        self.failed_tensors.extend(other.failed_tensors);
-        self.frozen.extend(other.frozen);
-    }
-
-    /// Retry every retained allocation.  Continues after failures.
-    ///
-    /// On success all resources are consumed.  On failure the remaining
-    /// failures are returned in a new [`Qwen35CleanupFailure`] — any
-    /// successful retries are consumed and must not be retried again.
-    pub fn retry(mut self, gpu: &mut Gpu) -> Result<(), Qwen35CleanupFailure> {
-        let mut failures = Vec::new();
-        for r in self.failed_tensors {
-            match r.retry(gpu) {
-                Ok(()) => {} // consumed
-                Err(r) => failures.push(r),
-            }
-        }
-        self.failed_tensors = failures;
-
-        // Retry every frozen owner, keep only those that fail again.
-        let mut frozen_failures = Vec::new();
-        for frozen in self.frozen {
-            match frozen.retry(gpu) {
-                Ok(()) => {} // consumed
-                Err(f) => frozen_failures.push(f),
-            }
-        }
-        self.frozen = frozen_failures;
-
-        if self.failed_tensors.is_empty() && self.frozen.is_empty() {
-            Ok(())
-        } else {
-            Err(self)
-        }
-    }
-}
-
-impl std::fmt::Debug for Qwen35CleanupFailure {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Qwen35CleanupFailure")
-            .field("num_failed", &self.num_failed())
-            .field("summaries", &self.error_summaries())
-            .finish()
-    }
-}
-
-// ── Continue-and-retain cleanup helper ────────────────────────────
-
-/// Production-used generic helper: given a (label, GpuTensor) pair, move
-/// the tensor into an `Option` and call `free_tensor_checked`, collecting
-/// the [`RetainedQwenTensor`] on failure.
-///
-/// # GPU evidence limitation
-///
-/// CPU tests using `GpuTensor::null_for_test()` exercise the ownership
-/// retention logic (label, identity, retry) but cannot prove that the HIP
-/// `hipFree` call actually succeeds or fails — that requires a real GPU
-/// with controlled error injection.
-///
-/// # Safety
-///
-/// The tensor is always taken from the `Option` by `free_tensor_checked`,
-/// so on success it is no longer accessible. On failure the original
-/// `GpuTensor` is preserved in `RetainedQwenTensor`.
-pub(crate) fn free_tensor_retained(
-    label: impl Into<String>,
-    tensor: GpuTensor,
-    gpu: &mut Gpu,
-    failures: &mut Vec<RetainedQwenTensor>,
-) {
-    let label = label.into();
-    let mut opt = Some(tensor);
-    if let Err(e) = gpu.free_tensor_checked(&mut opt) {
-        // free_tensor_checked only returns Err when bind_thread fails,
-        // which happens BEFORE the tensor is taken from the Option.
-        // If the Option is None here, it's an invariant violation in
-        // the GPU driver/checked-free contract — panic with a precise
-        // message matching RetainedQwenTensor::retry.
-        let t = opt.take().expect(
-            "free_tensor_retained: free_tensor_checked returned Err but consumed the tensor — this is a bug",
-        );
-        failures.push(RetainedQwenTensor {
-            label,
-            tensor: t,
-            last_error: e.to_string(),
-        });
-    }
-}
+//
+// The owner-preserving teardown types are generic and live in
+// hipfire-runtime (`gpu_cleanup`): `RetainedGpuTensor`,
+// `GpuCleanupFailure`, the `RetryableOwner` category for non-tensor
+// owners (the Frozen store's `SingleFreeFailed` implements it), and the
+// `free_tensor_retained` / `free_weight_all_checked` /
+// `free_weight_sidecars_checked` helpers used below.
 
 /// Continue-and-retain helper for `WeightTensor`: free all owned buffers
 /// (buf, paro sidecars, AWQ scale).  Skips aliased Paro rotations.
-pub(crate) fn free_weight_all_checked(
-    label: &str,
-    wt: WeightTensor,
-    gpu: &mut Gpu,
-    failures: &mut Vec<RetainedQwenTensor>,
-) {
-    // Paro sidecars (skip aliased — the shared owner frees them).
-    if let Some(paro) = wt.paro {
-        if !paro.is_alias {
-            free_tensor_retained(format!("{label}.paro.pairs"), paro.pairs, gpu, failures);
-            free_tensor_retained(format!("{label}.paro.theta"), paro.theta, gpu, failures);
-            free_tensor_retained(
-                format!("{label}.paro.channel_scales"),
-                paro.channel_scales,
-                gpu,
-                failures,
-            );
-        }
-    }
-    // AWQ sidecar.
-    if let Some(awq) = wt.awq_scale {
-        free_tensor_retained(format!("{label}.awq_scale"), awq, gpu, failures);
-    }
-    // Main buffer.
-    free_tensor_retained(format!("{label}.buf"), wt.buf, gpu, failures);
-}
-
+pub(crate) use hipfire_runtime::gpu_cleanup::free_weight_all_checked;
 /// Continue-and-retain helper for `WeightTensor`: free only sidecars
 /// (paro, AWQ).  Used when the main buffer is a non-owning alias
 /// (tied lm_head).
-pub(crate) fn free_weight_sidecars_checked(
-    label: &str,
-    wt: WeightTensor,
-    gpu: &mut Gpu,
-    failures: &mut Vec<RetainedQwenTensor>,
-) {
-    if let Some(paro) = wt.paro {
-        if !paro.is_alias {
-            free_tensor_retained(format!("{label}.paro.pairs"), paro.pairs, gpu, failures);
-            free_tensor_retained(format!("{label}.paro.theta"), paro.theta, gpu, failures);
-            free_tensor_retained(
-                format!("{label}.paro.channel_scales"),
-                paro.channel_scales,
-                gpu,
-                failures,
-            );
-        }
-    }
-    if let Some(awq) = wt.awq_scale {
-        free_tensor_retained(format!("{label}.awq_scale"), awq, gpu, failures);
-    }
-}
+pub(crate) use hipfire_runtime::gpu_cleanup::free_weight_sidecars_checked;
 
 /// Continue-and-retain helper for `MoeFfnWeights` (Legacy path).
 /// Frees every tensor in the MoE FFN struct, retaining on failure.
@@ -1995,7 +1742,7 @@ pub(crate) fn free_moe_ffn_checked(
     label: &str,
     ffn: MoeFfnWeights,
     gpu: &mut Gpu,
-    failures: &mut Vec<RetainedQwenTensor>,
+    failures: &mut Vec<RetainedGpuTensor>,
 ) {
     free_weight_all_checked(&format!("{label}.router"), ffn.router, gpu, failures);
     free_weight_all_checked(
@@ -2043,14 +1790,49 @@ pub(crate) fn free_moe_ffn_checked(
         free_tensor_retained(format!("{label}.expert_dtype_tags"), t, gpu, failures);
     }
 
-    for (i, e) in ffn.experts.into_iter().enumerate() {
-        free_weight_all_checked(
-            &format!("{label}.experts[{i}].gate_up"),
-            e.gate_up,
+    if let Some(owners) = ffn.packed_expert_owners {
+        // Packed expert WeightTensors are NON-OWNING views (interior
+        // pointers into the two layer blobs). Free only the metadata that
+        // remains individually owned (awq_scale/paro sidecars — the checked
+        // equivalent of the unchecked free_weight_metadata_only), then
+        // return each layer blob ONCE. NEVER free the view bufs: pooling an
+        // interior pointer aliases the live blob and orphans the owners.
+        for (i, e) in ffn.experts.into_iter().enumerate() {
+            free_weight_sidecars_checked(
+                &format!("{label}.experts[{i}].gate_up"),
+                e.gate_up,
+                gpu,
+                failures,
+            );
+            free_weight_sidecars_checked(
+                &format!("{label}.experts[{i}].down"),
+                e.down,
+                gpu,
+                failures,
+            );
+        }
+        free_tensor_retained(
+            format!("{label}.packed_expert_owners.gate_up"),
+            owners.gate_up,
             gpu,
             failures,
         );
-        free_weight_all_checked(&format!("{label}.experts[{i}].down"), e.down, gpu, failures);
+        free_tensor_retained(
+            format!("{label}.packed_expert_owners.down"),
+            owners.down,
+            gpu,
+            failures,
+        );
+    } else {
+        for (i, e) in ffn.experts.into_iter().enumerate() {
+            free_weight_all_checked(
+                &format!("{label}.experts[{i}].gate_up"),
+                e.gate_up,
+                gpu,
+                failures,
+            );
+            free_weight_all_checked(&format!("{label}.experts[{i}].down"), e.down, gpu, failures);
+        }
     }
 
     if let Some(s) = ffn.paro_shared {
@@ -2541,12 +2323,12 @@ impl Qwen35Weights {
     ///
     /// Frozen MoE storage (both per-layer markers and the optional resident)
     /// is freed through the resident's `free_checked` path; failures are
-    /// aggregated into the returned [`Qwen35CleanupFailure`].
+    /// aggregated into the returned [`GpuCleanupFailure`].
     ///
     /// The pager is freed as before (unchecked, since it owns no individual
     /// tensors at this level).
-    pub fn free_gpu_checked(self, gpu: &mut Gpu) -> Result<(), Qwen35CleanupFailure> {
-        let mut failures: Vec<RetainedQwenTensor> = Vec::new();
+    pub fn free_gpu_checked(self, gpu: &mut Gpu) -> Result<(), GpuCleanupFailure> {
+        let mut failures: Vec<RetainedGpuTensor> = Vec::new();
 
         // ── Top-level tensors ───────────────────────────────────────────
         free_tensor_retained("token_embd", self.token_embd, gpu, &mut failures);
@@ -2637,10 +2419,12 @@ impl Qwen35Weights {
         }
 
         // ── Frozen MoE resident ─────────────────────────────────────────
-        let mut frozen_failures: Vec<SingleFreeFailed> = Vec::new();
+        // Non-tensor owner category: kept whole (never flattened), retried
+        // via the RetryableOwner boxed path.
+        let mut frozen_failures: Vec<Box<dyn RetryableOwner>> = Vec::new();
         if let Some(resident) = self.moe_resident {
             if let Err(f) = resident.free_checked(gpu) {
-                frozen_failures.push(f);
+                frozen_failures.push(Box::new(f));
             }
         }
 
@@ -2657,9 +2441,9 @@ impl Qwen35Weights {
         if failures.is_empty() && frozen_failures.is_empty() {
             Ok(())
         } else {
-            Err(Qwen35CleanupFailure {
+            Err(GpuCleanupFailure {
                 failed_tensors: failures,
-                frozen: frozen_failures,
+                other: frozen_failures,
             })
         }
     }
@@ -2892,14 +2676,14 @@ impl DeltaNetState {
     /// allocations are freed via checked cleanup, and any that could not be
     /// freed are returned alongside the error message.
     ///
-    /// The returned `Vec<RetainedQwenTensor>` preserves ownership of every
+    /// The returned `Vec<RetainedGpuTensor>` preserves ownership of every
     /// allocation that survived the abort.  Callers must free these (or
     /// enqueue for later retry).
     pub fn new_with_quant_checked(
         gpu: &mut Gpu,
         config: &Qwen35Config,
         quant: StateQuant,
-    ) -> Result<Self, (String, Vec<RetainedQwenTensor>)> {
+    ) -> Result<Self, (String, Vec<RetainedGpuTensor>)> {
         let n_delta_layers = config
             .layer_types
             .iter()
@@ -3077,15 +2861,15 @@ impl DeltaNetState {
     ///
     /// Every tensor is attempted even after prior failures.  On success all
     /// resources are consumed (`Ok(())`).  On failure the returned
-    /// `Vec<RetainedQwenTensor>` carries the exact original tensors that
+    /// `Vec<RetainedGpuTensor>` carries the exact original tensors that
     /// could not be freed, ready for retry.
     ///
     /// ## GPU evidence limitation
     ///
     /// `free_tensor_checked` only fails on `bind_thread` errors (see
-    /// `Qwen35CleanupFailure` notes).  Full retry requires a real HIP device.
-    pub fn abort_checked(self, gpu: &mut Gpu) -> Result<(), Vec<RetainedQwenTensor>> {
-        let mut failures: Vec<RetainedQwenTensor> = Vec::new();
+    /// `GpuCleanupFailure` notes).  Full retry requires a real HIP device.
+    pub fn abort_checked(self, gpu: &mut Gpu) -> Result<(), Vec<RetainedGpuTensor>> {
+        let mut failures: Vec<RetainedGpuTensor> = Vec::new();
 
         for (i, t) in self.s_matrices.into_iter().enumerate() {
             free_tensor_retained(
@@ -5966,22 +5750,22 @@ pub(crate) fn load_moe_ffn(
     // `{p}.mlp.experts.{X}.gate_up_proj.weight` (shape [2*moe_intermediate, hidden_size])
     // and `{p}.mlp.experts.{X}.down_proj.weight` (shape [hidden_size, moe_intermediate]).
     //
-thread_local! {
-    static EP_EXPERT_SHARD: std::cell::RefCell<Option<(ShardConfig, usize)>> =
-        const { std::cell::RefCell::new(None) };
-}
+    thread_local! {
+        static EP_EXPERT_SHARD: std::cell::RefCell<Option<(ShardConfig, usize)>> =
+            const { std::cell::RefCell::new(None) };
+    }
 
-/// EP streaming-shard context, set (thread-locally) immediately before
-/// `load_weights` on each rank, then `None` immediately after. Mirrors
-/// DeepSeek-V4's `load_weights_sharded` but threaded via TLS so the 87
-/// existing `load_weights` callers need no signature change.
-pub fn set_ep_expert_shard(ctx: Option<(ShardConfig, usize)>) {
-    EP_EXPERT_SHARD.with(|c| *c.borrow_mut() = ctx);
-}
+    /// EP streaming-shard context, set (thread-locally) immediately before
+    /// `load_weights` on each rank, then `None` immediately after. Mirrors
+    /// DeepSeek-V4's `load_weights_sharded` but threaded via TLS so the 87
+    /// existing `load_weights` callers need no signature change.
+    pub fn set_ep_expert_shard(ctx: Option<(ShardConfig, usize)>) {
+        EP_EXPERT_SHARD.with(|c| *c.borrow_mut() = ctx);
+    }
 
-fn current_ep_expert_shard() -> Option<(ShardConfig, usize)> {
-    EP_EXPERT_SHARD.with(|c| c.borrow().clone())
-}
+    fn current_ep_expert_shard() -> Option<(ShardConfig, usize)> {
+        EP_EXPERT_SHARD.with(|c| c.borrow().clone())
+    }
 
     // REAP keep-map: `n_exp` is already the KEPT count (config.num_experts was
     // overridden in apply_reap_plan), and under a keep `ExpertPlan::n_slots`
@@ -7923,6 +7707,102 @@ impl Qwen35Scratch {
             pbs.free_gpu(gpu);
         }
     }
+
+    /// Checked GPU cleanup: attempts every tensor independently, retains
+    /// every allocation that could not be freed for retry.
+    ///
+    /// ## Ownership semantics
+    ///
+    /// Every tensor is attempted even after prior failures.  On success all
+    /// resources are consumed (`Ok(())`).  On failure the returned
+    /// `Vec<RetainedGpuTensor>` carries the exact original tensors that
+    /// could not be freed, ready for retry.
+    ///
+    /// `pos_buf` is a raw [`hip_bridge::DeviceBuffer`]; it is represented as
+    /// a `GpuTensor` with `shape=[]` / `DType::Raw` — the honest description
+    /// of a bare 4-byte allocation, not a fabrication.
+    pub fn abort_checked(self, gpu: &mut Gpu) -> Result<(), Vec<RetainedGpuTensor>> {
+        let mut failures: Vec<RetainedGpuTensor> = Vec::new();
+
+        free_tensor_retained("Qwen35Scratch.x", self.x, gpu, &mut failures);
+        free_tensor_retained("Qwen35Scratch.tmp", self.tmp, gpu, &mut failures);
+        // pos_buf: raw DeviceBuffer → honest GpuTensor wrapper (Raw dtype).
+        free_tensor_retained(
+            "Qwen35Scratch.pos_buf",
+            GpuTensor {
+                buf: self.pos_buf,
+                shape: vec![],
+                dtype: DType::Raw,
+            },
+            gpu,
+            &mut failures,
+        );
+        for (label, t) in [
+            ("Qwen35Scratch.dn_qkv", self.dn_qkv),
+            ("Qwen35Scratch.dn_z", self.dn_z),
+            ("Qwen35Scratch.dn_alpha", self.dn_alpha),
+            ("Qwen35Scratch.dn_beta", self.dn_beta),
+            ("Qwen35Scratch.dn_conv_out", self.dn_conv_out),
+            ("Qwen35Scratch.dn_q", self.dn_q),
+            ("Qwen35Scratch.dn_k", self.dn_k),
+            ("Qwen35Scratch.dn_v", self.dn_v),
+            ("Qwen35Scratch.dn_q_raw", self.dn_q_raw),
+            ("Qwen35Scratch.dn_k_raw", self.dn_k_raw),
+            ("Qwen35Scratch.dn_attn_out", self.dn_attn_out),
+            ("Qwen35Scratch.dn_normed", self.dn_normed),
+            ("Qwen35Scratch.fa_q_full", self.fa_q_full),
+            ("Qwen35Scratch.fa_q", self.fa_q),
+            ("Qwen35Scratch.fa_gate", self.fa_gate),
+            ("Qwen35Scratch.fa_k", self.fa_k),
+            ("Qwen35Scratch.fa_v", self.fa_v),
+            ("Qwen35Scratch.fa_attn_out", self.fa_attn_out),
+            ("Qwen35Scratch.o", self.o),
+            ("Qwen35Scratch.gate_ffn", self.gate_ffn),
+            ("Qwen35Scratch.up", self.up),
+            ("Qwen35Scratch.ffn_hidden", self.ffn_hidden),
+            ("Qwen35Scratch.ffn_out", self.ffn_out),
+            ("Qwen35Scratch.logits", self.logits),
+            ("Qwen35Scratch.sample_buf", self.sample_buf),
+            ("Qwen35Scratch.repeat_buf", self.repeat_buf),
+            ("Qwen35Scratch.x_rot", self.x_rot),
+            ("Qwen35Scratch.flash_partials", self.flash_partials),
+        ] {
+            free_tensor_retained(label, t, gpu, &mut failures);
+        }
+        // MoE scratch — only present for MoE configs; skip None.
+        for (label, t) in [
+            ("Qwen35Scratch.moe_router_logits", self.moe_router_logits),
+            ("Qwen35Scratch.moe_scalar_buf", self.moe_scalar_buf),
+            ("Qwen35Scratch.moe_x_rot", self.moe_x_rot),
+            ("Qwen35Scratch.moe_gate_up_buf", self.moe_gate_up_buf),
+            ("Qwen35Scratch.moe_gate_buf", self.moe_gate_buf),
+            ("Qwen35Scratch.moe_up_buf", self.moe_up_buf),
+            ("Qwen35Scratch.moe_ffn_hidden", self.moe_ffn_hidden),
+            ("Qwen35Scratch.moe_ffn_out", self.moe_ffn_out),
+            ("Qwen35Scratch.moe_gate_batch", self.moe_gate_batch),
+            ("Qwen35Scratch.moe_up_batch", self.moe_up_batch),
+            ("Qwen35Scratch.moe_rot_batch", self.moe_rot_batch),
+            ("Qwen35Scratch.moe_topk_indices", self.moe_topk_indices),
+            ("Qwen35Scratch.moe_topk_weights", self.moe_topk_weights),
+            ("Qwen35Scratch.moe_down_expanded", self.moe_down_expanded),
+        ] {
+            if let Some(t) = t {
+                free_tensor_retained(label, t, gpu, &mut failures);
+            }
+        }
+        // Optional batched-prefill scratch — delegate to its own checked abort.
+        if let Some(pbs) = self.prefill_batch {
+            if let Err(pbs_failures) = pbs.abort_checked(gpu) {
+                failures.extend(pbs_failures);
+            }
+        }
+
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(failures)
+        }
+    }
 }
 
 /// Per-device scratch bundle for the multi-GPU forward path. Each device gets
@@ -8775,6 +8655,152 @@ impl PrefillBatchScratch {
         .flatten()
         {
             let _ = gpu.free_tensor(t);
+        }
+    }
+
+    /// Checked GPU cleanup: attempts every tensor independently, retains
+    /// every allocation that could not be freed for retry.
+    ///
+    /// ## Ownership semantics
+    ///
+    /// Every tensor is attempted even after prior failures.  On success all
+    /// resources are consumed (`Ok(())`).  On failure the returned
+    /// `Vec<RetainedGpuTensor>` carries the exact original tensors that
+    /// could not be freed, ready for retry.
+    pub fn abort_checked(self, gpu: &mut Gpu) -> Result<(), Vec<RetainedGpuTensor>> {
+        let mut failures: Vec<RetainedGpuTensor> = Vec::new();
+
+        for (label, t) in [
+            ("PrefillBatchScratch.x_batch", self.x_batch),
+            ("PrefillBatchScratch.x_rot_batch", self.x_rot_batch),
+            ("PrefillBatchScratch.x_norm_batch", self.x_norm_batch),
+            ("PrefillBatchScratch.dn_qkv_batch", self.dn_qkv_batch),
+            ("PrefillBatchScratch.dn_z_batch", self.dn_z_batch),
+            ("PrefillBatchScratch.dn_alpha_batch", self.dn_alpha_batch),
+            ("PrefillBatchScratch.dn_beta_batch", self.dn_beta_batch),
+            ("PrefillBatchScratch.dn_q_raw_batch", self.dn_q_raw_batch),
+            ("PrefillBatchScratch.dn_k_raw_batch", self.dn_k_raw_batch),
+            ("PrefillBatchScratch.dn_v_batch", self.dn_v_batch),
+            ("PrefillBatchScratch.dn_q_batch", self.dn_q_batch),
+            ("PrefillBatchScratch.dn_k_batch", self.dn_k_batch),
+            (
+                "PrefillBatchScratch.dn_attn_out_batch",
+                self.dn_attn_out_batch,
+            ),
+            ("PrefillBatchScratch.dn_normed_batch", self.dn_normed_batch),
+            ("PrefillBatchScratch.gate_ffn_batch", self.gate_ffn_batch),
+            ("PrefillBatchScratch.up_batch", self.up_batch),
+            (
+                "PrefillBatchScratch.ffn_hidden_batch",
+                self.ffn_hidden_batch,
+            ),
+            (
+                "PrefillBatchScratch.dn_normed_rot_batch",
+                self.dn_normed_rot_batch,
+            ),
+            ("PrefillBatchScratch.positions", self.positions),
+            ("PrefillBatchScratch.rope_positions", self.rope_positions),
+            ("PrefillBatchScratch.tokens", self.tokens),
+            ("PrefillBatchScratch.fa_q_full_batch", self.fa_q_full_batch),
+            ("PrefillBatchScratch.fa_q_batch", self.fa_q_batch),
+            ("PrefillBatchScratch.fa_gate_batch", self.fa_gate_batch),
+            ("PrefillBatchScratch.fa_k_batch", self.fa_k_batch),
+            ("PrefillBatchScratch.fa_v_batch", self.fa_v_batch),
+            (
+                "PrefillBatchScratch.fa_attn_out_batch",
+                self.fa_attn_out_batch,
+            ),
+            (
+                "PrefillBatchScratch.fa_attn_out_rot_batch",
+                self.fa_attn_out_rot_batch,
+            ),
+        ] {
+            free_tensor_retained(label, t, gpu, &mut failures);
+        }
+        for (label, t) in [
+            (
+                "PrefillBatchScratch.moe_router_logits_batch",
+                self.moe_router_logits_batch,
+            ),
+            (
+                "PrefillBatchScratch.moe_shared_scalar_batch",
+                self.moe_shared_scalar_batch,
+            ),
+            (
+                "PrefillBatchScratch.moe_shared_gate_batch",
+                self.moe_shared_gate_batch,
+            ),
+            (
+                "PrefillBatchScratch.moe_shared_up_batch",
+                self.moe_shared_up_batch,
+            ),
+            (
+                "PrefillBatchScratch.moe_shared_rot_batch",
+                self.moe_shared_rot_batch,
+            ),
+            (
+                "PrefillBatchScratch.moe_topk_indices_batch",
+                self.moe_topk_indices_batch,
+            ),
+            (
+                "PrefillBatchScratch.moe_topk_weights_batch",
+                self.moe_topk_weights_batch,
+            ),
+            ("PrefillBatchScratch.moe_gate_batch", self.moe_gate_batch),
+            ("PrefillBatchScratch.moe_up_batch", self.moe_up_batch),
+            ("PrefillBatchScratch.moe_rot_batch", self.moe_rot_batch),
+            (
+                "PrefillBatchScratch.moe_down_expanded_batch",
+                self.moe_down_expanded_batch,
+            ),
+            (
+                "PrefillBatchScratch.moe_expert_token_counts",
+                self.moe_expert_token_counts,
+            ),
+            (
+                "PrefillBatchScratch.moe_expert_offsets",
+                self.moe_expert_offsets,
+            ),
+            (
+                "PrefillBatchScratch.moe_sorted_slot_index",
+                self.moe_sorted_slot_index,
+            ),
+            (
+                "PrefillBatchScratch.moe_inverse_perm",
+                self.moe_inverse_perm,
+            ),
+            (
+                "PrefillBatchScratch.moe_expert_tile_ids",
+                self.moe_expert_tile_ids,
+            ),
+            (
+                "PrefillBatchScratch.moe_y_gate_up_grouped",
+                self.moe_y_gate_up_grouped,
+            ),
+            (
+                "PrefillBatchScratch.moe_y_down_grouped",
+                self.moe_y_down_grouped,
+            ),
+            ("PrefillBatchScratch.dn_s_tape_q8", self.dn_s_tape_q8),
+            (
+                "PrefillBatchScratch.dn_s_tape_scales",
+                self.dn_s_tape_scales,
+            ),
+            ("PrefillBatchScratch.dn_s_tape_f32", self.dn_s_tape_f32),
+            #[cfg(feature = "emulated-ep2-harness")]
+            ("PrefillBatchScratch.ep2_partial0", self.ep2_partial0),
+            #[cfg(feature = "emulated-ep2-harness")]
+            ("PrefillBatchScratch.ep2_partial1", self.ep2_partial1),
+        ] {
+            if let Some(t) = t {
+                free_tensor_retained(label, t, gpu, &mut failures);
+            }
+        }
+
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(failures)
         }
     }
 }
@@ -17803,12 +17829,13 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
             MoeFfnStorage::Legacy(w) => MoeFfnView::Legacy(w),
             MoeFfnStorage::Frozen => {
                 return Err(DispatchError::Hip(
-                    "qwen35 run_moe: frozen storage requires the weights-level dispatch path".into(),
+                    "qwen35 run_moe: frozen storage requires the weights-level dispatch path"
+                        .into(),
                 ))
             }
         };
-        let plans = Qwen35MoeGroupPlans::resolve(config)
-            .map_err(|e| DispatchError::Hip(e.to_string()))?;
+        let plans =
+            Qwen35MoeGroupPlans::resolve(config).map_err(|e| DispatchError::Hip(e.to_string()))?;
         moe_ffn_dispatch(
             gpu,
             view,
@@ -17837,17 +17864,16 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
             LayerWeights::FullAttnMoe(l) => (&l.ffn, &l.ffn_norm),
             _ => return Err(DispatchError::Hip("MOE on dense layer".into())),
         };
-        let view = match ffn {
-            MoeFfnStorage::Legacy(w) => MoeFfnView::Legacy(w),
-            MoeFfnStorage::Frozen => {
-                return Err(DispatchError::Hip(
+        let view =
+            match ffn {
+                MoeFfnStorage::Legacy(w) => MoeFfnView::Legacy(w),
+                MoeFfnStorage::Frozen => return Err(DispatchError::Hip(
                     "qwen35 run_moe_ep: frozen storage requires the weights-level dispatch path"
                         .into(),
-                ))
-            }
-        };
-        let plans = Qwen35MoeGroupPlans::resolve(config)
-            .map_err(|e| DispatchError::Hip(e.to_string()))?;
+                )),
+            };
+        let plans =
+            Qwen35MoeGroupPlans::resolve(config).map_err(|e| DispatchError::Hip(e.to_string()))?;
         let refs = MoeScratchRef::from_scratch(s);
         let r = if view.gate_side_mq4() {
             gpu.fused_rmsnorm_rotate_mq(
@@ -18211,12 +18237,12 @@ fn moe_combine_next_rms_enabled(gpu: &Gpu, weights: &Qwen35Weights, config: &Qwe
     let mq4 =
         |w: &WeightTensor| w.gpu_dtype == DType::MQ4G256 && w.k == 2_048 && w.awq_scale.is_none();
 
-/// GATE-SIDE only MQ4 (router + shared expert), independent of the routed
-/// experts. When true, the fused rmsnorm+FWHT path + prerotated MoE decode are
-/// applicable even on a graded file. (Restored from upstream/beta — the merged
-/// LayerWeights carries MoeFfnStorage, so callers route through `as_legacy`.)
+    /// GATE-SIDE only MQ4 (router + shared expert), independent of the routed
+    /// experts. When true, the fused rmsnorm+FWHT path + prerotated MoE decode are
+    /// applicable even on a graded file. (Restored from upstream/beta — the merged
+    /// LayerWeights carries MoeFfnStorage, so callers route through `as_legacy`.)
 
-/// Uniform-MQ4 routed experts (router + shared + every expert gate_up MQ4G256).
+    /// Uniform-MQ4 routed experts (router + shared + every expert gate_up MQ4G256).
     let has_expanded_down = |ffn: &MoeFfnWeights| {
         ffn.expert_dtype_tags.is_some()
             || ffn.experts.first().is_some_and(|expert| {
@@ -23282,13 +23308,13 @@ mod tests {
 
     // ── Checked GPU cleanup (CPU tests) ─────────────────────────────
     //
-    // These tests exercise RetainedQwenTensor and Qwen35CleanupFailure
+    // These tests exercise RetainedGpuTensor and GpuCleanupFailure
     // ownership retention logic (label preservation, identity, counting,
     // merge, summaries) entirely on CPU.
     //
     // # GPU evidence limitation
     //
-    // free_gpu_checked and RetainedQwenTensor::retry require a real HIP
+    // free_gpu_checked and RetainedGpuTensor::retry require a real HIP
     // runtime + GPU to exercise the actual hipFree path.  These CPU tests
     // verify the data-structure semantics only (label propagation, merge
     // semantics, count/summary accuracy).  Proving that free_tensor_checked
@@ -23299,7 +23325,7 @@ mod tests {
     #[test]
     fn retained_tensor_label_and_error() {
         let t = GpuTensor::null_for_test();
-        let r = RetainedQwenTensor {
+        let r = RetainedGpuTensor {
             label: "test.tensor".into(),
             tensor: t,
             last_error: "mock error".into(),
@@ -23315,7 +23341,7 @@ mod tests {
         let mut t = GpuTensor::null_for_test();
         t.shape = vec![42, 7];
         t.dtype = DType::F16;
-        let r = RetainedQwenTensor {
+        let r = RetainedGpuTensor {
             label: "id.test".into(),
             tensor: t,
             last_error: "x".into(),
@@ -23327,9 +23353,9 @@ mod tests {
 
     #[test]
     fn cleanup_failure_empty_num_failed() {
-        let f = Qwen35CleanupFailure {
+        let f = GpuCleanupFailure {
             failed_tensors: vec![],
-            frozen: vec![],
+            other: vec![],
         };
         assert_eq!(f.num_failed(), 0);
         assert!(f.error_summaries().is_empty());
@@ -23338,25 +23364,25 @@ mod tests {
     #[test]
     fn cleanup_failure_counts_tensors_only() {
         let t = || GpuTensor::null_for_test();
-        let f = Qwen35CleanupFailure {
+        let f = GpuCleanupFailure {
             failed_tensors: vec![
-                RetainedQwenTensor {
+                RetainedGpuTensor {
                     label: "a".into(),
                     tensor: t(),
                     last_error: "e1".into(),
                 },
-                RetainedQwenTensor {
+                RetainedGpuTensor {
                     label: "b".into(),
                     tensor: t(),
                     last_error: "e2".into(),
                 },
-                RetainedQwenTensor {
+                RetainedGpuTensor {
                     label: "c".into(),
                     tensor: t(),
                     last_error: "e3".into(),
                 },
             ],
-            frozen: vec![],
+            other: vec![],
         };
         assert_eq!(f.num_failed(), 3);
     }
@@ -23364,20 +23390,20 @@ mod tests {
     #[test]
     fn cleanup_failure_error_summaries_format() {
         let t = || GpuTensor::null_for_test();
-        let f = Qwen35CleanupFailure {
+        let f = GpuCleanupFailure {
             failed_tensors: vec![
-                RetainedQwenTensor {
+                RetainedGpuTensor {
                     label: "token_embd".into(),
                     tensor: t(),
                     last_error: "bind_thread failed".into(),
                 },
-                RetainedQwenTensor {
+                RetainedGpuTensor {
                     label: "output_norm".into(),
                     tensor: t(),
                     last_error: "HIP error 999".into(),
                 },
             ],
-            frozen: vec![],
+            other: vec![],
         };
         let summaries = f.error_summaries();
         assert_eq!(summaries.len(), 2);
@@ -23390,28 +23416,28 @@ mod tests {
     #[test]
     fn cleanup_failure_merge_tensors_from_both() {
         let t = || GpuTensor::null_for_test();
-        let mut f1 = Qwen35CleanupFailure {
-            failed_tensors: vec![RetainedQwenTensor {
+        let mut f1 = GpuCleanupFailure {
+            failed_tensors: vec![RetainedGpuTensor {
                 label: "from1".into(),
                 tensor: t(),
                 last_error: "e1".into(),
             }],
-            frozen: vec![],
+            other: vec![],
         };
-        let f2 = Qwen35CleanupFailure {
+        let f2 = GpuCleanupFailure {
             failed_tensors: vec![
-                RetainedQwenTensor {
+                RetainedGpuTensor {
                     label: "from2.a".into(),
                     tensor: t(),
                     last_error: "e2a".into(),
                 },
-                RetainedQwenTensor {
+                RetainedGpuTensor {
                     label: "from2.b".into(),
                     tensor: t(),
                     last_error: "e2b".into(),
                 },
             ],
-            frozen: vec![],
+            other: vec![],
         };
         f1.merge(f2);
         assert_eq!(f1.num_failed(), 3);
@@ -23434,35 +23460,35 @@ mod tests {
         // is exercised by the zero-element case; real SingleFreeFailed
         // entries require GPU integration tests.
         let t = || GpuTensor::null_for_test();
-        let mut f1 = Qwen35CleanupFailure {
-            failed_tensors: vec![RetainedQwenTensor {
+        let mut f1 = GpuCleanupFailure {
+            failed_tensors: vec![RetainedGpuTensor {
                 label: "only".into(),
                 tensor: t(),
                 last_error: "e".into(),
             }],
-            frozen: vec![],
+            other: vec![],
         };
-        let f2 = Qwen35CleanupFailure {
+        let f2 = GpuCleanupFailure {
             failed_tensors: vec![],
-            frozen: vec![],
+            other: vec![],
         };
         f1.merge(f2);
         assert_eq!(f1.num_failed(), 1);
         assert_eq!(f1.failed_tensors[0].label(), "only");
         // Both frozen vecs were empty; the merge extended an empty vec.
-        assert!(f1.frozen.is_empty());
+        assert!(f1.other.is_empty());
     }
 
     #[test]
     fn cleanup_failure_debug_includes_summaries() {
         let t = || GpuTensor::null_for_test();
-        let f = Qwen35CleanupFailure {
-            failed_tensors: vec![RetainedQwenTensor {
+        let f = GpuCleanupFailure {
+            failed_tensors: vec![RetainedGpuTensor {
                 label: "x".into(),
                 tensor: t(),
                 last_error: "fail".into(),
             }],
-            frozen: vec![],
+            other: vec![],
         };
         let dbg = format!("{f:?}");
         assert!(dbg.contains("num_failed"));
@@ -23480,7 +23506,7 @@ mod tests {
         // bind_thread → hipSetDevice, which panics on CPU-only machines.
         // Integration tests on GPU hardware can exercise this path.
         let t = GpuTensor::null_for_test();
-        let r = RetainedQwenTensor {
+        let r = RetainedGpuTensor {
             label: "gpu_retry_test".into(),
             tensor: t,
             last_error: "placeholder".into(),
@@ -23495,7 +23521,7 @@ mod tests {
     #[test]
     fn free_tensor_retained_invariant_guard_compiles() {
         // The invariant guard in free_tensor_retained uses an expect()
-        // with a precise message matching RetainedQwenTensor::retry.
+        // with a precise message matching RetainedGpuTensor::retry.
         //
         // The guard handles the case where free_tensor_checked returns
         // Err but has already consumed the tensor from the Option.
@@ -23505,7 +23531,7 @@ mod tests {
         // silent swallowing if the contract ever changes.
         //
         // This test proves the expect message compiles and matches the
-        // pattern in RetainedQwenTensor::retry.  The actual panic path
+        // pattern in RetainedGpuTensor::retry.  The actual panic path
         // cannot be triggered without a GPU that returns Err while
         // consuming the tensor.
         //
@@ -23513,7 +23539,7 @@ mod tests {
         let msg = "free_tensor_retained: free_tensor_checked returned Err but consumed the tensor — this is a bug";
         assert!(msg.contains("free_tensor_retained"));
         assert!(msg.contains("this is a bug"));
-        // The matching message in RetainedQwenTensor::retry:
+        // The matching message in RetainedGpuTensor::retry:
         let retry_msg = "free_tensor_checked failed but left Option empty — this is a bug";
         assert!(retry_msg.contains("this is a bug"));
     }
@@ -23523,7 +23549,7 @@ mod tests {
     #[test]
     fn delta_net_state_abort_checked_full_f32_compiles() {
         // The method must exist and return the right types.
-        fn _sig(f: fn(DeltaNetState, &mut Gpu) -> Result<(), Vec<RetainedQwenTensor>>) {
+        fn _sig(f: fn(DeltaNetState, &mut Gpu) -> Result<(), Vec<RetainedGpuTensor>>) {
             let _ = f;
         }
         _sig(DeltaNetState::abort_checked);
@@ -23546,8 +23572,6 @@ mod tests {
         assert!(state.conv_states.is_empty());
         assert!(state.s_ef_residual.is_empty());
     }
-
-
 
     #[test]
     fn qwen35_scratch_abort_checked_constructable_with_null() {
@@ -23612,7 +23636,7 @@ mod tests {
         assert_eq!(scratch.x.shape, &[0]);
     }
 
-    // ── RetainedQwenTensor + cleanup labels for aux types ───────────
+    // ── RetainedGpuTensor + cleanup labels for aux types ───────────
 
     #[test]
     fn delta_net_state_abort_checked_labels_follow_convention() {

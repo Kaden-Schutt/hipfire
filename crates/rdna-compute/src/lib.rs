@@ -10,6 +10,10 @@ mod compiler;
 mod dispatch;
 pub mod embedding;
 pub mod feature_flags;
+/// Test-only free-failure injection for `Gpu::free_tensor_checked`
+/// (feature `frozen-fault-inject`). Never compiled into production builds.
+#[cfg(feature = "frozen-fault-inject")]
+pub mod frozen_fault_inject;
 pub mod gemm;
 pub mod gemv;
 pub mod graph;

@@ -110,3 +110,39 @@ any early return, then commit the list into the weights/state struct only on
 full success (or give `GpuTensor` itself a pool-returning `Drop`, the broader
 change). Deferred. Documented inline at the constructor call sites and on the
 `load_model_ep` doc-comment.
+
+## STEP-002R — Qwen35 Frozen construction rollback + BundleTeardown pivot (DONE)
+
+Owner-preserving teardown for the Qwen35 Frozen construction path (STEP-002R)
+and its generalization: `hipfire_runtime::gpu_cleanup` (`RetainedGpuTensor`,
+`GpuCleanupFailure` with a `RetryableOwner` category, `BundleTeardown`,
+`retain_free!`), checked `free_checked` on every arch bundle (qwen2, qwen35,
+llama, lfm2moe, minimax, cohere2moe, deepseek4, dots-ocr), `unload_model`
+dispatching through `ModelState::free_checked` with retry-before-log,
+env-var-driven fault injection (`frozen-fault-inject` feature,
+`HIPFIRE_FROZEN_FAIL_STAGE` / `HIPFIRE_FROZEN_FAIL_FREE`), GPU fault battery +
+per-arch load/unload VRAM verification + packed-MQ4 expert teardown test.
+Forensic discoveries fixed en route (see commit message): dspark sidecar pread
+`RefCell` borrow bug; packed-expert interior-view pooling hazard in the checked
+MoE free; VMM arena release skipped by `free_tensor_checked` (now arena-aware).
+
+RESIDUAL DEBT (tracked, do not forget):
+
+1. **Qwen35 mid-constructor leaks (same class as the EP constructor leak
+   above).** A failure partway through `DeltaNetState::new_with_quant`,
+   `Qwen35Scratch::new_with_kv_max`, `PrefillBatchScratch::new_opt`, the
+   `KvCache` constructors, or mid-iteration `fulfill_manifest_gpu` leaks the
+   already-uploaded tensors (the half-built value drops on `?`; `GpuTensor`
+   has no `Drop`). STEP-002R covers POST-construction rollback only — the
+   fault-injection stages fire after each constructor returns `Ok`. Proper
+   fix: the same allocation-tracking refactor as the EP loaders (scratch-list
+   staging or a pool-returning `Drop`). Deferred.
+
+2. **Qwen35 PP path (`load_qwen35_pp`, carriers.rs).** Load errors propagate
+   with plain `?`, leaking any already-built weights/kv/dn/scratch — same
+   unchecked-construction class as STEP-002R fixed for the single-GPU bundle
+   path. Owned by GEN-001/HW-004 (PP is device-mesh "Planned"). NOTE: PP
+   UNLOAD is verified safe — `free_gpu_multi` routes through
+   `free_moe_storage`, which handles packed experts — only the load-error
+   rollback is unchecked. No PP fault injection or tests were added (per
+   STEP-002R scope).

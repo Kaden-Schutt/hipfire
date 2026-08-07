@@ -33,6 +33,9 @@ use hipfire_dispatch::pipeline::{execute_steps_mesh, GemvInput, Step};
 use hipfire_dispatch::types::dtype_rotation_plan;
 use hipfire_hardware::DeviceMesh;
 use hipfire_runtime::arch_spec::{dense_forward, DenseArch, DenseKnobs, DenseLayer, DenseScratch};
+use hipfire_runtime::gpu_cleanup::{
+    free_tensor_retained, free_weight_all_checked, free_weight_sidecars_checked, GpuCleanupFailure,
+};
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama::{f16_to_f32, f32_to_f16};
 use hipfire_runtime::llama::{gemv_family, weight_gemm, EmbeddingFormat, WeightTensor};
@@ -297,6 +300,76 @@ impl Qwen2Weights {
             let _ = gpu.free_tensor(l.w_gate.buf);
             let _ = gpu.free_tensor(l.w_up.buf);
             let _ = gpu.free_tensor(l.w_down.buf);
+        }
+    }
+
+    /// Exact-retention checked GPU cleanup. Consumes `self`, attempts every
+    /// owned weight even after prior failures, retains the exact original
+    /// `GpuTensor` on failure, and returns only the failures for
+    /// exact-retention retry — no best-effort `let _ =` free as a
+    /// correctness mechanism.
+    ///
+    /// Uses `Gpu::free_tensor_checked(&mut Option<GpuTensor>)` everywhere
+    /// so that on bind/driver failure the tensor ownership is preserved.
+    pub fn free_checked(self, gpu: &mut Gpu) -> Result<(), GpuCleanupFailure> {
+        let mut cf = GpuCleanupFailure::empty();
+
+        free_tensor_retained(
+            "Qwen2Weights.token_embd",
+            self.token_embd,
+            gpu,
+            &mut cf.failed_tensors,
+        );
+        free_tensor_retained(
+            "Qwen2Weights.output_norm",
+            self.output_norm,
+            gpu,
+            &mut cf.failed_tensors,
+        );
+
+        // Output / LM head: when tied, `output.buf` aliases the embedding
+        // table, so only the sidecars (paro / AWQ) are owned here.
+        if self.tied_lm_head {
+            free_weight_sidecars_checked(
+                "Qwen2Weights.output",
+                self.output,
+                gpu,
+                &mut cf.failed_tensors,
+            );
+        } else {
+            free_weight_all_checked(
+                "Qwen2Weights.output",
+                self.output,
+                gpu,
+                &mut cf.failed_tensors,
+            );
+        }
+
+        for (i, layer) in self.layers.into_iter().enumerate() {
+            let lp = |field: &str| format!("Qwen2Weights.layers[{i}].{field}");
+            free_tensor_retained(
+                lp("attn_norm"),
+                layer.attn_norm,
+                gpu,
+                &mut cf.failed_tensors,
+            );
+            free_weight_all_checked(&lp("wq"), layer.wq, gpu, &mut cf.failed_tensors);
+            free_tensor_retained(lp("wq_bias"), layer.wq_bias, gpu, &mut cf.failed_tensors);
+            free_weight_all_checked(&lp("wk"), layer.wk, gpu, &mut cf.failed_tensors);
+            free_tensor_retained(lp("wk_bias"), layer.wk_bias, gpu, &mut cf.failed_tensors);
+            free_weight_all_checked(&lp("wv"), layer.wv, gpu, &mut cf.failed_tensors);
+            free_tensor_retained(lp("wv_bias"), layer.wv_bias, gpu, &mut cf.failed_tensors);
+            free_weight_all_checked(&lp("wo"), layer.wo, gpu, &mut cf.failed_tensors);
+            free_tensor_retained(lp("ffn_norm"), layer.ffn_norm, gpu, &mut cf.failed_tensors);
+            free_weight_all_checked(&lp("w_gate"), layer.w_gate, gpu, &mut cf.failed_tensors);
+            free_weight_all_checked(&lp("w_up"), layer.w_up, gpu, &mut cf.failed_tensors);
+            free_weight_all_checked(&lp("w_down"), layer.w_down, gpu, &mut cf.failed_tensors);
+        }
+
+        if cf.is_empty() {
+            Ok(())
+        } else {
+            Err(cf)
         }
     }
 }
@@ -990,6 +1063,72 @@ impl Qwen2State {
             let _ = gpu.free_tensor(t);
         }
         let _ = gpu.hip.free(self.pos_buf);
+    }
+
+    /// Exact-retention checked GPU cleanup. Consumes `self`, attempts every
+    /// owned tensor even after prior failures, retains the exact original
+    /// `GpuTensor` on failure, and returns only the failures for
+    /// exact-retention retry — no best-effort `let _ =` free as a
+    /// correctness mechanism.
+    ///
+    /// `pos_buf` is a raw [`hip_bridge::DeviceBuffer`]; it is represented as
+    /// a `GpuTensor` with `shape=[]` / `DType::Raw` — the honest description
+    /// of a bare 4-byte allocation, not a fabrication. Mirrors
+    /// `Qwen35Scratch::abort_checked` in `hipfire-arch-qwen35`.
+    pub fn free_checked(self, gpu: &mut Gpu) -> Result<(), GpuCleanupFailure> {
+        let mut cf = GpuCleanupFailure::empty();
+
+        for (label, t) in [
+            ("Qwen2State.x", self.x),
+            ("Qwen2State.tmp", self.tmp),
+            ("Qwen2State.x_rot", self.x_rot),
+            ("Qwen2State.q", self.q),
+            ("Qwen2State.k", self.k),
+            ("Qwen2State.v", self.v),
+            ("Qwen2State.attn_out", self.attn_out),
+            ("Qwen2State.o", self.o),
+            ("Qwen2State.gate", self.gate),
+            ("Qwen2State.up", self.up),
+            ("Qwen2State.ffn_hidden", self.ffn_hidden),
+            ("Qwen2State.ffn_out", self.ffn_out),
+            ("Qwen2State.logits", self.logits),
+            ("Qwen2State.attn_partials", self.attn_partials),
+        ] {
+            free_tensor_retained(label, t, gpu, &mut cf.failed_tensors);
+        }
+        // pos_buf: raw DeviceBuffer → honest GpuTensor wrapper (Raw dtype).
+        free_tensor_retained(
+            "Qwen2State.pos_buf",
+            GpuTensor {
+                buf: self.pos_buf,
+                shape: vec![],
+                dtype: DType::Raw,
+            },
+            gpu,
+            &mut cf.failed_tensors,
+        );
+        for (i, t) in self.k_cache.into_iter().enumerate() {
+            free_tensor_retained(
+                format!("Qwen2State.k_cache[{i}]"),
+                t,
+                gpu,
+                &mut cf.failed_tensors,
+            );
+        }
+        for (i, t) in self.v_cache.into_iter().enumerate() {
+            free_tensor_retained(
+                format!("Qwen2State.v_cache[{i}]"),
+                t,
+                gpu,
+                &mut cf.failed_tensors,
+            );
+        }
+
+        if cf.is_empty() {
+            Ok(())
+        } else {
+            Err(cf)
+        }
     }
 }
 

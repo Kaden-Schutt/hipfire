@@ -23,10 +23,11 @@ use crate::arch::Qwen35;
 use crate::qwen35::{
     DeltaNetLayerWeights, DeltaNetMoeLayerWeights, ExpertWeights, FullAttnLayerWeights,
     FullAttnMoeLayerWeights, LayerType, LayerWeights, MoeDtypeSnapshot, MoeFfnWeights,
-    Qwen35CleanupFailure, Qwen35Config, Qwen35Weights, SharedExpertWeights,
+    Qwen35Config, Qwen35Weights, SharedExpertWeights,
 };
 use hipfire_hardware::DeviceMesh;
 use hipfire_runtime::arch::Architecture;
+use hipfire_runtime::gpu_cleanup::{GpuCleanupFailure, RetainedGpuTensor};
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama::{EmbeddingFormat, WeightTensor};
 use hipfire_runtime::loader_api::ModelSource as LoaderModelSource;
@@ -1081,37 +1082,6 @@ fn convert_handle_forward_ready(
     Ok(Some(WeightHandle::Resident(converted)))
 }
 
-struct ReplacementGuard {
-    tensor: Option<GpuTensor>,
-    free: Box<dyn FnMut(GpuTensor)>,
-}
-
-impl ReplacementGuard {
-    fn new<F>(tensor: GpuTensor, free: F) -> Self
-    where
-        F: FnMut(GpuTensor) + 'static,
-    {
-        Self {
-            tensor: Some(tensor),
-            free: Box::new(free),
-        }
-    }
-
-    fn take(&mut self) -> GpuTensor {
-        self.tensor
-            .take()
-            .expect("replacement guard consumed twice")
-    }
-}
-
-impl Drop for ReplacementGuard {
-    fn drop(&mut self) {
-        if let Some(tensor) = self.tensor.take() {
-            (self.free)(tensor);
-        }
-    }
-}
-
 fn canonical_store_dtype(entry: &WeightEntry) -> Option<DType> {
     if entry.name.ends_with(AWQ_SUFFIX) || is_canonical_norm(entry) || is_raw_deltanet(entry) {
         Some(DType::F32)
@@ -1449,14 +1419,32 @@ pub fn assemble_qwen35_weights(
     manifest: &[WeightEntry],
     gpu: &mut Gpu,
 ) -> Result<Qwen35Weights, String> {
-    assemble_qwen35_weights_inner_with_mode(
+    let mut orphaned = Vec::new();
+    let result = assemble_qwen35_weights_inner_with_mode(
         store,
         config,
         manifest,
         gpu,
         false,
         MoeAssemblyMode::Legacy,
-    )
+        &mut orphaned,
+    );
+    // This String-error API cannot carry owners: retry each orphaned
+    // buffer once now that the assembly guard is gone (checked path).
+    // A survivor means two consecutive free failures AND a failed
+    // device bind — abort rather than drop an allocated owner
+    // (exact-retention: never drop while allocated).
+    for o in orphaned {
+        let mut opt = Some(o.tensor);
+        if let Err(e) = gpu.free_tensor_checked(&mut opt) {
+            panic!(
+                "assemble_qwen35_weights: rejected-replacement buffer '{}' could not be \
+                 freed after retry ({e}); refusing to drop an allocated owner",
+                o.label
+            );
+        }
+    }
+    result
 }
 
 /// Assemble with explicit [`MoeAssemblyMode`].
@@ -1477,6 +1465,7 @@ pub(crate) fn assemble_qwen35_weights_inner_with_mode(
     gpu: &mut Gpu,
     fail_after_commit: bool,
     mode: MoeAssemblyMode,
+    orphaned: &mut Vec<RetainedGpuTensor>,
 ) -> Result<Qwen35Weights, String> {
     let device = 0;
     let main_entries: Vec<&WeightEntry> = manifest
@@ -1641,9 +1630,43 @@ pub(crate) fn assemble_qwen35_weights_inner_with_mode(
             };
             if let Err((handle, error)) = guard.replace_atomic(slot, replacement_handle, free_fn) {
                 // The new handle was never installed — release its buffer so
-                // the failed replacement cannot leak it.
+                // the failed replacement cannot leak it. If that free ALSO
+                // fails, the rejected replacement is wrapped back into a typed
+                // tensor (real shape/dtype preserved) and its device pointer +
+                // free error are surfaced in the message — a still-allocated
+                // buffer is never silently dropped.
                 if let WeightHandle::Resident(tensor) = handle {
-                    let _ = unsafe { (&*gpu_ptr).hip.free_preserving(tensor.buf) };
+                    let ptr = tensor.buf.as_ptr() as usize;
+                    match unsafe { (&*gpu_ptr).hip.free_preserving(tensor.buf) } {
+                        Ok(()) => {}
+                        Err((returned_buf, free_err)) => {
+                            // The rejected replacement's free ALSO failed —
+                            // the buffer is still allocated. It cannot be
+                            // dropped (exact-retention) and cannot be freed
+                            // through the checked path while the assembly
+                            // guard borrows the GPU: carry it out through
+                            // `orphaned` (real shape/dtype preserved) for
+                            // the caller to retry or fold into the error.
+                            let shape = tensor.shape.clone();
+                            let dtype = tensor.dtype;
+                            let retained = rdna_compute::GpuTensor {
+                                buf: returned_buf,
+                                shape: tensor.shape,
+                                dtype: tensor.dtype,
+                            };
+                            orphaned.push(RetainedGpuTensor {
+                                label: format!("rejected-replacement '{}'", entry.name),
+                                tensor: retained,
+                                last_error: format!("{free_err:?}"),
+                            });
+                            return Err(format!(
+                                "forward-ready replacement for '{}' failed: {error:?}; \
+                                 freeing the rejected replacement ALSO failed \
+                                 (ptr=0x{ptr:x} shape={:?} dtype={:?}): {free_err:?}",
+                                entry.name, shape, dtype
+                            ));
+                        }
+                    }
                 }
                 return Err(format!(
                     "forward-ready replacement for '{}' failed: {error:?}",
@@ -2291,38 +2314,72 @@ fn load_qwen35_hfq_weights_frozen_prepared_inner(
         Qwen35LoadError::common_failure(format!("qwen35 Frozen common fulfillment: {e:?}"))
     })?;
 
+    // Fault-injection seam (feature `frozen-fault-inject`): fail after the
+    // store's allocations complete, exercising the checked store rollback
+    // with full-tensor-provenance retention (`try_free_all_checked`).
+    if crate::frozen_fault_inject::fail_stage() == Some("common_fulfill") {
+        let retained = store.try_free_all_checked(gpu);
+        let staging_retained: Vec<RetainedGpuTensor> = retained
+            .into_iter()
+            .map(|(label, tensor)| RetainedGpuTensor {
+                label,
+                tensor,
+                last_error: "store_free_failed".into(),
+            })
+            .collect();
+        return Err(Qwen35LoadError::common_failure_with_staging_retained(
+            "injected fault: common_fulfill".into(),
+            staging_retained,
+        ));
+    }
+
     // Phase 3: Assemble common weights with Frozen mode.
     // On failure, attempt checked free of the store's GPU buffers.
     // Any buffers that survive the free are preserved as typed retry
-    // owners in the error — they are NOT dropped.
-    let weights = match assemble_qwen35_frozen_common(&mut store, config, &prepared, gpu) {
-        Ok(w) => w,
-        Err(e) => {
-            let retained = store.try_free_all_on_gpu(gpu);
-            if retained.is_empty() {
-                return Err(Qwen35LoadError::common_failure(format!(
-                    "common assembly: {e}"
-                )));
+    // owners in the error — they are NOT dropped. Rejected-replacement
+    // buffers that survived a double-failure free are carried out
+    // through `orphaned` and folded into the same retained set.
+    let mut orphaned: Vec<RetainedGpuTensor> = Vec::new();
+    let weights =
+        match assemble_qwen35_frozen_common(&mut store, config, &prepared, gpu, &mut orphaned) {
+            Ok(w) => w,
+            Err(e) => {
+                // Checked free preserving full tensor provenance: any buffer that
+                // survives the free is retained as its REAL GpuTensor (true
+                // dtype+shape — no fabricated F32/[] metadata) and carried as a
+                // typed retry owner in the error.
+                let retained = store.try_free_all_checked(gpu);
+                let mut staging_retained: Vec<RetainedGpuTensor> = retained
+                    .into_iter()
+                    .map(|(label, tensor)| RetainedGpuTensor {
+                        label,
+                        tensor,
+                        last_error: "store_free_failed".into(),
+                    })
+                    .collect();
+                staging_retained.extend(orphaned);
+                if staging_retained.is_empty() {
+                    return Err(Qwen35LoadError::common_failure(format!(
+                        "common assembly: {e}"
+                    )));
+                }
+                return Err(Qwen35LoadError::common_failure_with_staging_retained(
+                    format!("common assembly: {e}"),
+                    staging_retained,
+                ));
             }
-            // Convert DeviceBuffer retainers to RetainedQwenTensor owners.
-            let staging_retained: Vec<crate::qwen35::RetainedQwenTensor> = retained
-                .into_iter()
-                .map(|(label, buf)| crate::qwen35::RetainedQwenTensor {
-                    label,
-                    tensor: rdna_compute::GpuTensor {
-                        buf,
-                        shape: vec![],
-                        dtype: rdna_compute::DType::F32,
-                    },
-                    last_error: "store_free_failed".into(),
-                })
-                .collect();
-            return Err(Qwen35LoadError::common_failure_with_staging_retained(
-                format!("common assembly: {e}"),
-                staging_retained,
-            ));
-        }
-    };
+        };
+
+    // Fault-injection seam (feature `frozen-fault-inject`): fail after
+    // common assembly succeeds, carrying the assembled weights in the error
+    // (the receiver frees them via `try_free`).
+    if crate::frozen_fault_inject::fail_stage() == Some("common_assembly") {
+        return Err(Qwen35LoadError::frozen_failure(
+            "injected fault: common_assembly".into(),
+            weights,
+            vec![],
+        ));
+    }
 
     // Phase 4: Build Frozen MoE resident from the MoE partition.
     let moe_entries = prepared.into_moe();
@@ -2968,6 +3025,7 @@ pub(crate) fn assemble_qwen35_frozen_common(
     config: &Qwen35Config,
     prepared: &PreparedFrozenHfqManifest,
     gpu: &mut Gpu,
+    orphaned: &mut Vec<RetainedGpuTensor>,
 ) -> Result<Qwen35Weights, String> {
     assemble_qwen35_weights_inner_with_mode(
         store,
@@ -2976,6 +3034,7 @@ pub(crate) fn assemble_qwen35_frozen_common(
         gpu,
         false,
         MoeAssemblyMode::Frozen,
+        orphaned,
     )
 }
 
@@ -3392,146 +3451,6 @@ pub(crate) fn validate_moe_pairing(
     validate_moe_pairing_kinds(&kinds, resident_idx)
 }
 
-// ═════════════════════════════════════════════════════════════════════
-/// Generic two-category cleanup aggregate (tensor owners + frozen
-/// owners) with category-preserving transition semantics.
-///
-/// Used by the Frozen complete-aggregate propagation — bundle-abort →
-/// [`Qwen35LoadError`] → `try_free` retry → loader backlog — every
-/// transition keeps the two categories distinct (frozen owners are
-/// NEVER flattened into tensor owners) and passes every owner through
-/// whole: consumed exactly once on success, retained whole on failure.
-/// Production instantiates it with the concrete owner types
-/// ([`crate::qwen35::RetainedQwenTensor`] /
-/// [`SingleFreeFailed`]); tests exercise the same semantics with opaque
-/// owner IDs.
-#[derive(Debug)]
-pub(crate) struct CleanupAggregate<T, F> {
-    tensor_owners: Vec<T>,
-    frozen_owners: Vec<F>,
-}
-
-impl<T, F> Default for CleanupAggregate<T, F> {
-    fn default() -> Self {
-        Self {
-            tensor_owners: Vec::new(),
-            frozen_owners: Vec::new(),
-        }
-    }
-}
-
-impl<T, F> CleanupAggregate<T, F> {
-    pub(crate) fn new() -> Self {
-        Self::default()
-    }
-
-    pub(crate) fn add_tensor(&mut self, owner: T) {
-        self.tensor_owners.push(owner);
-    }
-
-    pub(crate) fn add_frozen(&mut self, owner: F) {
-        self.frozen_owners.push(owner);
-    }
-
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "cleanup accounting seam exercised by the behavioral CleanupAggregate transition test (opaque owner IDs); no production call site reads counts"
-        )
-    )]
-    pub(crate) fn tensor_count(&self) -> usize {
-        self.tensor_owners.len()
-    }
-
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "cleanup accounting seam exercised by the behavioral CleanupAggregate transition test (opaque owner IDs); no production call site reads counts"
-        )
-    )]
-    pub(crate) fn frozen_count(&self) -> usize {
-        self.frozen_owners.len()
-    }
-
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "cleanup accounting seam exercised by the behavioral CleanupAggregate transition test (opaque owner IDs); no production call site reads counts"
-        )
-    )]
-    pub(crate) fn is_empty(&self) -> bool {
-        self.tensor_owners.is_empty() && self.frozen_owners.is_empty()
-    }
-
-    /// Merge another aggregate — categories stay distinct, owners are
-    /// appended whole.
-    pub(crate) fn merge(&mut self, other: CleanupAggregate<T, F>) {
-        self.tensor_owners.extend(other.tensor_owners);
-        self.frozen_owners.extend(other.frozen_owners);
-    }
-
-    /// Retry every owner wholesale.  Each retry closure consumes one
-    /// owner and returns it on failure; successes are consumed exactly
-    /// once.  Remaining failures are returned in a new aggregate with
-    /// both categories preserved.
-    pub(crate) fn retry(
-        self,
-        mut retry_tensor: impl FnMut(T) -> Result<(), T>,
-        mut retry_frozen: impl FnMut(F) -> Result<(), F>,
-    ) -> Result<(), CleanupAggregate<T, F>> {
-        let mut tensors = Vec::new();
-        for t in self.tensor_owners {
-            if let Err(t) = retry_tensor(t) {
-                tensors.push(t);
-            }
-        }
-        let mut frozen = Vec::new();
-        for f in self.frozen_owners {
-            if let Err(f) = retry_frozen(f) {
-                frozen.push(f);
-            }
-        }
-        if tensors.is_empty() && frozen.is_empty() {
-            Ok(())
-        } else {
-            Err(CleanupAggregate {
-                tensor_owners: tensors,
-                frozen_owners: frozen,
-            })
-        }
-    }
-}
-
-impl CleanupAggregate<crate::qwen35::RetainedQwenTensor, SingleFreeFailed> {
-    /// Split a concrete [`Qwen35CleanupFailure`] into the generic
-    /// aggregate (both categories).
-    fn from_cleanup_failure(cf: Qwen35CleanupFailure) -> Self {
-        let mut agg = CleanupAggregate::new();
-        for r in cf.failed_tensors {
-            agg.add_tensor(r);
-        }
-        for f in cf.frozen {
-            agg.add_frozen(f);
-        }
-        agg
-    }
-
-    /// Re-materialize the concrete aggregate (both categories).
-    fn into_cleanup_failure(self) -> Qwen35CleanupFailure {
-        let mut cf = Qwen35CleanupFailure::empty();
-        for t in self.tensor_owners {
-            cf.add_retained(t);
-        }
-        for f in self.frozen_owners {
-            cf.add_frozen(f);
-        }
-        cf
-    }
-}
-
 // Qwen35LoadError — typed load error preserving GPU cleanup ownership
 // ═════════════════════════════════════════════════════════════════════
 
@@ -3571,13 +3490,13 @@ pub struct Qwen35LoadError {
     /// Retained buffers from the store's `try_free_all_on_gpu` that could
     /// not be freed during common assembly rollback.  Each entry preserves
     /// ownership of the original `GpuTensor` for retry.
-    staging_retained: Vec<crate::qwen35::RetainedQwenTensor>,
+    staging_retained: Vec<RetainedGpuTensor>,
     /// Complete cleanup aggregate from a bundle-build abort.  Carries the
-    /// ENTIRE [`Qwen35CleanupFailure`] — both `failed_tensors` and the
+    /// ENTIRE [`GpuCleanupFailure`] — both `failed_tensors` and the
     /// frozen [`SingleFreeFailed`] owners — wholesale.  Callers must never
     /// flatten the frozen owners into tensor retainers; the aggregate is
     /// retried and enqueued as one unit.
-    cleanup: Option<Qwen35CleanupFailure>,
+    cleanup: Option<GpuCleanupFailure>,
 }
 
 impl std::fmt::Debug for Qwen35LoadError {
@@ -3622,7 +3541,7 @@ impl Qwen35LoadError {
     /// buffers that could not be freed during rollback.
     pub(crate) fn common_failure_with_staging_retained(
         msg: String,
-        staging_retained: Vec<crate::qwen35::RetainedQwenTensor>,
+        staging_retained: Vec<RetainedGpuTensor>,
     ) -> Self {
         Self {
             message: msg,
@@ -3637,26 +3556,24 @@ impl Qwen35LoadError {
     /// Create an error carrying a COMPLETE cleanup aggregate from a
     /// bundle-build abort.
     ///
-    /// `cleanup` is the whole [`Qwen35CleanupFailure`] returned by the
+    /// `cleanup` is the whole [`GpuCleanupFailure`] returned by the
     /// abort path — BOTH its `failed_tensors` and its frozen
     /// [`SingleFreeFailed`] owners — preserved wholesale.  Additional
     /// `retained` tensor owners (KV/DN/scratch domains) are folded INTO
-    /// the aggregate via the typed [`Qwen35CleanupFailure::add_retained`]
-    /// path; the frozen owners are never flattened into tensor retainers.
+    /// the aggregate via [`GpuCleanupFailure::add_retained`]; the frozen
+    /// owners are never flattened into tensor retainers.
     pub(crate) fn common_failure_with_cleanup_aggregate(
         msg: String,
-        retained: Vec<crate::qwen35::RetainedQwenTensor>,
-        cleanup: Option<Qwen35CleanupFailure>,
+        retained: Vec<RetainedGpuTensor>,
+        cleanup: Option<GpuCleanupFailure>,
     ) -> Self {
-        // Fold through the generic category-preserving aggregate: the
-        // complete cleanup's owners (BOTH categories) plus the extra
-        // retained domains, then re-materialize the concrete aggregate.
-        let mut aggregate = CleanupAggregate::new();
-        if let Some(cf) = cleanup {
-            aggregate.merge(CleanupAggregate::from_cleanup_failure(cf));
-        }
+        // The generic GpuCleanupFailure IS the category-preserving
+        // aggregate: merge the complete cleanup's owners (BOTH categories)
+        // with the extra retained domains, never flattening the boxed
+        // RetryableOwner category.
+        let mut cf = cleanup.unwrap_or_else(GpuCleanupFailure::empty);
         for r in retained {
-            aggregate.add_tensor(r);
+            cf.add_retained(r);
         }
         Self {
             message: msg,
@@ -3664,7 +3581,7 @@ impl Qwen35LoadError {
             frozen_store: None,
             builder_retained: Vec::new(),
             staging_retained: Vec::new(),
-            cleanup: Some(aggregate.into_cleanup_failure()),
+            cleanup: Some(cf),
         }
     }
 
@@ -3716,12 +3633,12 @@ impl Qwen35LoadError {
     pub fn try_free(
         mut self,
         gpu: &mut Gpu,
-    ) -> (String, Vec<SingleFreeFailed>, Option<Qwen35CleanupFailure>) {
+    ) -> (String, Vec<SingleFreeFailed>, Option<GpuCleanupFailure>) {
         let msg = self.message;
 
         // Phase A: staging_retained — store buffers that survived free attempt.
-        // Retry each; failures are collected into a Qwen35CleanupFailure.
-        let mut staging_failures = Qwen35CleanupFailure::empty();
+        // Retry each; failures are collected into a GpuCleanupFailure.
+        let mut staging_failures = GpuCleanupFailure::empty();
         for r in self.staging_retained.drain(..) {
             if let Err(still_retained) = r.retry(gpu) {
                 staging_failures.add_retained(still_retained);
@@ -3751,26 +3668,16 @@ impl Qwen35LoadError {
         };
 
         // Phase E: the complete bundle-build cleanup aggregate — retried
-        // WHOLESALE through the generic category-preserving transition
-        // (both tensor and frozen categories).  Whatever still fails is
-        // merged into the returned aggregate, never flattened.
+        // WHOLESALE through GpuCleanupFailure::retry, which preserves both
+        // categories (tensors + boxed RetryableOwner).  Whatever still
+        // fails is merged into the returned aggregate, never flattened.
         if let Some(aggregate) = self.cleanup.take() {
-            let agg = CleanupAggregate::from_cleanup_failure(aggregate);
-            // Both retry closures need `gpu`; the generic retry invokes
-            // them strictly sequentially, so route through a cell.
-            let gpu_cell = std::cell::RefCell::new(&mut *gpu);
-            let retry_tensor =
-                |r: crate::qwen35::RetainedQwenTensor| r.retry(&mut gpu_cell.borrow_mut());
-            let retry_frozen = |f: SingleFreeFailed| f.retry(&mut gpu_cell.borrow_mut());
-            match agg.retry(retry_tensor, retry_frozen) {
+            match aggregate.retry(gpu) {
                 Ok(()) => {}
-                Err(remaining) => {
-                    let remaining = remaining.into_cleanup_failure();
-                    match &mut common_failure {
-                        Some(cf) => cf.merge(remaining),
-                        None => common_failure = Some(remaining),
-                    }
-                }
+                Err(remaining) => match &mut common_failure {
+                    Some(cf) => cf.merge(remaining),
+                    None => common_failure = Some(remaining),
+                },
             }
         }
 
@@ -5193,6 +5100,20 @@ fn build_frozen_moe_resident_inner(
         Err(e) => return Err(freeze_fail(e)),
     };
 
+    // Fault-injection seam (feature `frozen-fault-inject`): fail after the
+    // store is frozen, freeing the frozen store and carrying any surviving
+    // owner in the builder error's `retained` (exact-retention).
+    if crate::frozen_fault_inject::fail_stage() == Some("moe_build") {
+        let mut retained = Vec::new();
+        if let Err(e) = store.free(gpu) {
+            retained.push(e);
+        }
+        return Err(FrozenMoeBuildError {
+            message: "injected fault: moe_build".into(),
+            retained,
+        });
+    }
+
     // Construct resident.
     let resident_result = {
         #[cfg(feature = "emulated-ep2-harness")]
@@ -6240,7 +6161,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
 
-    static GPU_TEST_LOCK: Mutex<()> = Mutex::new(());
+    pub(crate) static GPU_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     struct FakeParoTensor {
         info: TensorInfo,
@@ -6578,24 +6499,6 @@ mod tests {
         assert!(validate_typed_embedding_dtype(DType::F32).is_ok());
         assert!(validate_typed_embedding_dtype(DType::MQ4G256).is_err());
         assert!(validate_typed_embedding_dtype(DType::MQ3G256).is_err());
-    }
-
-    #[test]
-    fn replacement_guard_frees_new_tensor_when_old_free_is_injected_to_fail() {
-        use std::cell::Cell;
-        use std::rc::Rc;
-
-        let replacement_frees = Rc::new(Cell::new(0));
-        let result: Result<(), &str> = {
-            let _replacement = ReplacementGuard::new(GpuTensor::null_for_test(), {
-                let replacement_frees = replacement_frees.clone();
-                move |_tensor| replacement_frees.set(replacement_frees.get() + 1)
-            });
-            let injected_old_free: Result<(), &str> = Err("injected old-buffer free failure");
-            injected_old_free
-        };
-        assert!(result.is_err());
-        assert_eq!(replacement_frees.get(), 1);
     }
 
     #[test]
@@ -6982,6 +6885,7 @@ mod tests {
             &mut gpu,
             true,
             MoeAssemblyMode::Legacy,
+            &mut Vec::new(),
         );
         assert!(result.is_err());
         assert!(
@@ -10354,7 +10258,12 @@ mod tests {
     }
 
     impl Qwen35HfqFixture {
-        fn write(layer_types: &[&str], layer1_quant: u8, shared_quant: u8) -> Self {
+        fn write(
+            layer_types: &[&str],
+            layer1_quant: u8,
+            shared_quant: u8,
+            embed_quant: u8,
+        ) -> Self {
             let config_json = serde_json::json!({
                 "hidden_size": 8,
                 "intermediate_size": 16,
@@ -10397,9 +10306,13 @@ mod tests {
                 // norm conversion rejects quantized norm sources); layer-1
                 // routed experts carry `layer1_quant` (13 = MQ4, 15 = MQ6);
                 // layer-1 structural projections carry `shared_quant`;
+                // the token embedding carries `embed_quant` (the direct
+                // backend load path only accepts F16/F32/Q8_0 embeddings);
                 // everything else is MQ4 (13).
                 let qt = if is_canonical_norm(entry) {
                     1 // F16
+                } else if entry.name == "token_embd" {
+                    embed_quant
                 } else if is_layer1_routed_expert {
                     layer1_quant
                 } else if is_layer1_shared {
@@ -10476,6 +10389,7 @@ mod tests {
                 &["full_attention", "full_attention"],
                 layer1_quant,
                 shared_quant,
+                13,
             );
             let hfq = HfqFile::open(&fixture.path).expect("fixture HFQ must open");
             let config = fixture.config.clone();
@@ -10510,6 +10424,84 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires an AMD GPU (RDNA3); packed MQ4 expert teardown routing"]
+    fn packed_mq4_experts_free_checked_frees_blobs_once_and_reclaims_vram() {
+        // REAL execution of the packed_expert_owners branch in
+        // free_moe_ffn_checked (review finding M1). Packing engages on the
+        // DIRECT backend load path (`qwen35::load_weights` → `load_moe_ffn`,
+        // the PP-path loader) when routed experts are MQ4G256 on RDNA3 —
+        // the store-based single-GPU legacy loader never packs. The checked
+        // free must free per-expert METADATA only and return each owner blob
+        // exactly once: pooling the interior view bufs would alias the live
+        // blobs and leak them.
+        let _lock = GPU_TEST_LOCK.lock().unwrap();
+
+        let fixture = Qwen35HfqFixture::write(&["full_attention"], 13, 13, 3);
+        let mut hfq = HfqFile::open(&fixture.path).expect("fixture HFQ must open");
+        let config = fixture.config.clone();
+        let mut gpus = hipfire_runtime::multi_gpu::Gpus::init_uniform(1, config.n_layers)
+            .expect("single-device Gpus");
+        {
+            gpus.devices[0].drain_pool();
+            let layout = crate::qwen35::Layout::from_gpus(&gpus, config.n_layers);
+            let mut source = crate::qwen35::HfqSource::new(&mut hfq, &config);
+            let weights = crate::qwen35::load_weights(&mut source, &mut gpus.devices, &layout)
+                .map_err(|e| format!("{e}"))
+                .expect("direct MQ4 MoE load must succeed");
+
+            // Packing must have ENGAGED, or this test verifies nothing.
+            let packed_layers = weights
+                .layers
+                .iter()
+                .filter(|l| {
+                    matches!(
+                        l,
+                        LayerWeights::FullAttnMoe(l)
+                            if matches!(&l.ffn, MoeFfnStorage::Legacy(ffn) if ffn.packed_expert_owners.is_some())
+                    )
+                })
+                .count();
+            assert!(
+                packed_layers > 0,
+                "MQ4 expert packing must engage on RDNA3 (found {packed_layers} packed layers)"
+            );
+
+            // Warm-up cycle absorbs the one-time kernel/module residency,
+            // then the measured cycle must return VRAM to baseline — the
+            // blobs are freed exactly once, no interior pointer is pooled.
+            weights
+                .free_gpu_checked(&mut gpus.devices[0])
+                .expect("packed checked free must succeed");
+            gpus.devices[0].drain_pool();
+            let baseline = gpus.devices[0]
+                .hip
+                .get_vram_info()
+                .map(|(free, _)| free)
+                .expect("baseline");
+
+            let mut hfq2 = HfqFile::open(&fixture.path).expect("fixture HFQ must open");
+            let mut source2 = crate::qwen35::HfqSource::new(&mut hfq2, &config);
+            let weights2 = crate::qwen35::load_weights(&mut source2, &mut gpus.devices, &layout)
+                .map_err(|e| format!("{e}"))
+                .expect("second direct MQ4 MoE load must succeed");
+            weights2
+                .free_gpu_checked(&mut gpus.devices[0])
+                .expect("packed checked free #2 must succeed");
+            gpus.devices[0].drain_pool();
+            let after = gpus.devices[0]
+                .hip
+                .get_vram_info()
+                .map(|(free, _)| free)
+                .expect("after");
+            assert!(
+                baseline.abs_diff(after) < 64 * 1024 * 1024,
+                "packed expert teardown did not reclaim VRAM: baseline={baseline} after={after}"
+            );
+        }
+        drop(hfq);
+    }
+
+    #[test]
     #[ignore = "requires an AMD GPU; legacy assembly model-wide MQ6 fence"]
     fn legacy_assembly_derives_model_wide_mq6_fence() {
         // The Legacy assembly must derive `moe_has_mq6` through the shared
@@ -10528,6 +10520,7 @@ mod tests {
                 &["full_attention", "full_attention"],
                 layer1_quant,
                 shared_quant,
+                13,
             );
             let hfq = HfqFile::open(&fixture.path).expect("fixture HFQ must open");
             let config = fixture.config.clone();
@@ -10722,79 +10715,93 @@ mod tests {
         assert!(!moe.as_slice().is_empty(), "MoE entries must be non-empty");
     }
 
-    // ── Complete cleanup aggregate: generic category-preserving core ──
+    // ── Complete cleanup aggregate: category-preserving core ──
     //
     // The production complete-aggregate propagation (bundle-abort →
     // Qwen35LoadError → try_free retry → loader backlog) runs through
-    // the generic CleanupAggregate, whose transition semantics are
-    // tested here with OPAQUE owner IDs (u64 tensor owners, String
-    // frozen owners) — no GPU tensors, no raw pointers anywhere.
+    // `hipfire_runtime::gpu_cleanup::GpuCleanupFailure`. Its transition
+    // semantics are tested here with a fake non-tensor owner category —
+    // no HIP calls, no raw pointers anywhere (aggregate-level `retry`
+    // needs a real Gpu and is covered by the GPU fault-injection battery).
 
     #[test]
-    fn cleanup_aggregate_generic_transitions_preserve_both_categories() {
-        type Agg = CleanupAggregate<u64, String>;
+    fn cleanup_failure_generic_transitions_preserve_both_categories() {
+        use hipfire_runtime::gpu_cleanup::{GpuCleanupFailure, RetainedGpuTensor, RetryableOwner};
+
+        /// Fake non-tensor owner: an id string that decides retry success.
+        #[derive(Debug)]
+        struct FakeOwner {
+            id: String,
+            fail: bool,
+        }
+        impl RetryableOwner for FakeOwner {
+            fn retry_boxed(
+                self: Box<Self>,
+                _gpu: &mut rdna_compute::Gpu,
+            ) -> Result<(), Box<dyn RetryableOwner>> {
+                if self.fail {
+                    Err(self)
+                } else {
+                    Ok(())
+                }
+            }
+            fn num_failed(&self) -> usize {
+                1
+            }
+            fn error_summaries(&self) -> Vec<String> {
+                vec![self.id.clone()]
+            }
+        }
+
+        let retained = |id: &str| RetainedGpuTensor {
+            label: id.into(),
+            tensor: rdna_compute::GpuTensor::null_for_test(),
+            last_error: "test".into(),
+        };
 
         // Fold: both categories enter the aggregate.
-        let mut agg = Agg::new();
-        agg.add_tensor(10);
-        agg.add_tensor(20);
-        agg.add_frozen("frozen-A".to_string());
-        assert_eq!(agg.tensor_count(), 2);
-        assert_eq!(agg.frozen_count(), 1);
+        let mut cf = GpuCleanupFailure::empty();
+        cf.add_retained(retained("tensor-A"));
+        cf.add_retained(retained("tensor-B"));
+        cf.add_other(Box::new(FakeOwner {
+            id: "frozen-A".into(),
+            fail: true,
+        }));
+        assert_eq!(cf.num_failed(), 3);
 
         // Merge: categories stay distinct; disjoint owners are not
         // duplicated (each owner appears exactly once).
-        let mut other = Agg::new();
-        other.add_tensor(30);
-        other.add_frozen("frozen-B".to_string());
-        agg.merge(other);
-        assert_eq!(agg.tensor_count(), 3);
-        assert_eq!(agg.frozen_count(), 2);
+        let mut other = GpuCleanupFailure::empty();
+        other.add_retained(retained("tensor-C"));
+        other.add_other(Box::new(FakeOwner {
+            id: "frozen-B".into(),
+            fail: false,
+        }));
+        cf.merge(other);
+        assert_eq!(cf.num_failed(), 5);
+        let summaries = cf.error_summaries();
+        assert!(summaries.iter().any(|s| s.contains("tensor-A")));
+        assert!(summaries.iter().any(|s| s.contains("frozen-A")));
 
-        // Retry: successes consumed exactly once, failures retained
-        // whole IN THEIR CATEGORY — a failed frozen owner is never
-        // flattened into the tensor category.
-        let remaining = agg
-            .retry(
-                |id| {
-                    if id == 20 {
-                        Err(id)
-                    } else {
-                        Ok(())
-                    }
-                },
-                |f| {
-                    if f == "frozen-A" {
-                        Err(f)
-                    } else {
-                        Ok(())
-                    }
-                },
-            )
-            .expect_err("failed owners must be returned");
-        assert_eq!(remaining.tensor_count(), 1);
-        assert_eq!(remaining.frozen_count(), 1);
-        // The remaining owners are the exact failed ones — no
-        // duplicates, no cross-category moves.
-        remaining
-            .retry(
-                |id| {
-                    assert_eq!(id, 20, "only owner 20 may remain");
-                    Ok(())
-                },
-                |f| {
-                    assert_eq!(f, "frozen-A", "only frozen-A may remain");
-                    Ok(())
-                },
-            )
-            .expect("final retry must consume everything");
+        // Non-tensor owners are carried WHOLE in their own category — a
+        // frozen owner is never flattened into the tensor category, and a
+        // failing owner survives `retry_boxed` as the same category.
+        // (The boxed retry needs a `&mut Gpu`; FakeOwner ignores it, but a
+        // CPU test must not fabricate a Gpu reference. Aggregate-level
+        // retry is exercised by the GPU fault-injection battery instead.)
+        let failing = cf
+            .other
+            .into_iter()
+            .find(|o| o.error_summaries() == vec!["frozen-A".to_string()])
+            .expect("frozen-A must be carried whole as a RetryableOwner");
+        assert_eq!(
+            failing.num_failed(),
+            1,
+            "failing owner reports its allocation"
+        );
 
-        // A fully successful retry consumes everything.
-        let empty = Agg::new();
-        empty
-            .retry(|_| Ok(()), |_| Ok(()))
-            .expect("empty aggregate retries clean");
-        assert!(Agg::new().is_empty());
+        // An empty aggregate reports clean.
+        assert!(GpuCleanupFailure::empty().is_empty());
     }
 
     #[test]
@@ -11654,5 +11661,514 @@ mod frozen_preflight_tests {
             .collect();
         assert_eq!(expert_gu.len(), 16, "8 experts x 2 layers gate_up entries");
         let _ = std::fs::remove_file(&fixture.path);
+    }
+
+    // ═════════════════════════════════════════════════════════════════
+    // STEP-002R fault-injection tests (feature `frozen-fault-inject`)
+    // ═════════════════════════════════════════════════════════════════
+
+    /// Env-var-driven fault-injection tests for the Frozen construction
+    /// rollback paths (STEP-002R). Each stage test: (a) fails a load at one
+    /// construction stage via `HIPFIRE_FROZEN_FAIL_STAGE` (Err, not panic),
+    /// (b) runs the error's checked cleanup, (c) asserts VRAM returns to
+    /// baseline (within 64 MiB) after `drain_pool`, (d) runs a successful
+    /// load cycle to prove the GPU is still usable.
+    #[cfg(feature = "frozen-fault-inject")]
+    mod frozen_fault_tests {
+        use super::*;
+        // GPU_TEST_LOCK lives in `mod tests` (a sibling module); the
+        // declaration is `pub(crate)` so it stays reachable from here.
+        use crate::carrier::{self, Qwen35BundleLoadError};
+        use crate::mtp_head::{self, MtpHeadLoadError};
+        use crate::store::tests::GPU_TEST_LOCK;
+        use hipfire_runtime::kv_backend::KvBackend;
+        use hipfire_runtime::loader_api::{CaskConfig, LoadCtx, ModelSource, SpecLoadCfg};
+
+        const VRAM_TOLERANCE: usize = 64 * 1024 * 1024;
+
+        fn home_models(name: &str) -> String {
+            let home = std::env::var("HOME").unwrap_or_else(|_| "/home/bjoern".into());
+            format!("{home}/.hipfire/models/{name}")
+        }
+
+        /// Canonical Frozen fixture (qwen3.6-35b-a3b.mq4). Override with
+        /// `HIPFIRE_QWEN35_HFQ` for machines with a different path.
+        fn frozen_fixture() -> String {
+            std::env::var("HIPFIRE_QWEN35_HFQ")
+                .unwrap_or_else(|_| home_models("qwen3.6-35b-a3b.mq4"))
+        }
+
+        fn vram_free(gpu: &Gpu) -> usize {
+            gpu.hip.get_vram_info().expect("hipMemGetInfo").0
+        }
+
+        fn assert_vram_recovered(baseline: usize, gpu: &Gpu, stage: &str) {
+            let after = vram_free(gpu);
+            assert!(
+                baseline.abs_diff(after) < VRAM_TOLERANCE,
+                "VRAM not recovered after {stage}: baseline={baseline} after={after} (tolerance {VRAM_TOLERANCE})"
+            );
+        }
+
+        /// Retry every retained owner; all must succeed (the free-failure
+        /// env must be cleared by the caller).
+        fn retry_all(retained: Vec<RetainedGpuTensor>, gpu: &mut Gpu, ctx: &str) {
+            let mut still = Vec::new();
+            for r in retained {
+                if let Err(r) = r.retry(gpu) {
+                    still.push(r.label().to_string());
+                }
+            }
+            assert!(
+                still.is_empty(),
+                "{ctx}: retained owners failed retry: {still:?}"
+            );
+        }
+
+        /// One full Frozen load through the REAL publication seam
+        /// (`load_qwen35_hfq_weights_frozen_prepared`).
+        fn frozen_load_once(
+            gpu: &mut Gpu,
+            hfq: &HfqFile,
+            config: &Qwen35Config,
+            dispatch_ctx: &hipfire_dispatch::context::DispatchCtx,
+        ) -> Result<Qwen35Weights, Qwen35LoadError> {
+            let manifest = Qwen35::weight_manifest(config);
+            let prepared = prepare_frozen_hfq_manifest(config, &manifest)
+                .expect("frozen manifest must prepare");
+            load_qwen35_hfq_weights_frozen_prepared(prepared, hfq, config, dispatch_ctx, true, gpu)
+        }
+
+        /// Minimal single-GPU carrier load context (no CASK, no draft, no
+        /// adaptive, pp=1, contiguous KV).
+        fn bundle_load_ctx<'a>(
+            gpu: &'a mut Gpu,
+            path: &'a str,
+            cask: &'a CaskConfig,
+        ) -> LoadCtx<'a> {
+            LoadCtx {
+                path,
+                max_seq: 2048,
+                draft_path: None,
+                kv_mode_override: None,
+                kv_backend: KvBackend::default(),
+                kv_adaptive_override: None,
+                state_quant_override: None,
+                cask,
+                pp: 1,
+                pp_bands: None,
+                mtp_mode: "off",
+                mtp_k: 1,
+                spec: SpecLoadCfg::default(),
+                kv_physical_cap: None,
+                gpu,
+            }
+        }
+
+        /// One carrier load that MUST fail at `stage`, then checked cleanup,
+        /// pool drain, and VRAM-baseline assertion.
+        fn carrier_fail_cycle(gpu: &mut Gpu, path: &str, stage: &str, baseline: usize) {
+            let cask = CaskConfig::default();
+            let mut ctx = bundle_load_ctx(gpu, path, &cask);
+            let hfq = HfqFile::open(std::path::Path::new(path)).expect("fixture HFQ must open");
+            let err = match carrier::load_bundle(ModelSource::Hfq(hfq), &mut ctx) {
+                Ok(_) => panic!("injected fault must fail the bundle load"),
+                Err(e) => e,
+            };
+            let Qwen35BundleLoadError { message, cleanup } = err;
+            assert!(!message.is_empty(), "bundle error must carry a message");
+            if let Some(cf) = cleanup {
+                cf.retry(gpu).expect("bundle cleanup retry must succeed");
+            }
+            gpu.drain_pool();
+            assert_vram_recovered(baseline, gpu, stage);
+        }
+
+        /// One carrier load that MUST succeed, one forward step, checked
+        /// bundle free, cache invalidation, pool drain, VRAM-baseline
+        /// assertion — proves the GPU is usable after a rollback.
+        fn carrier_success_cycle(gpu: &mut Gpu, path: &str, baseline: usize) {
+            let cask = CaskConfig::default();
+            let mut ctx = bundle_load_ctx(gpu, path, &cask);
+            let hfq = HfqFile::open(std::path::Path::new(path)).expect("fixture HFQ must open");
+            let mut bundle = carrier::load_bundle(ModelSource::Hfq(hfq), &mut ctx)
+                .expect("bundle load must succeed");
+            crate::qwen35::forward_scratch(
+                gpu,
+                &bundle.weights,
+                &bundle.config,
+                42,
+                0,
+                &mut bundle.kv_cache,
+                &mut bundle.dn_state,
+                &bundle.scratch,
+            )
+            .expect("forward step must run");
+            carrier::free_qwen35_bundle(bundle, gpu).expect("bundle free must succeed");
+            gpu.invalidate_weight_caches();
+            gpu.invalidate_graph_state();
+            gpu.drain_pool();
+            assert_vram_recovered(baseline, gpu, "success cycle");
+        }
+
+        /// Full success carrier load + checked free + pool drain, no VRAM
+        /// assertion: the kernel warm-up. Kernel module loads are a one-time
+        /// per-Gpu residency cost, so every fault test pays it once BEFORE
+        /// taking its baseline — otherwise the rollback cleanup is measured
+        /// against a pre-kernel-compile value and fails spuriously.
+        fn carrier_warmup(gpu: &mut Gpu, path: &str) -> usize {
+            let cask = CaskConfig::default();
+            let mut ctx = bundle_load_ctx(gpu, path, &cask);
+            let hfq = HfqFile::open(std::path::Path::new(path)).expect("fixture HFQ must open");
+            let mut bundle = carrier::load_bundle(ModelSource::Hfq(hfq), &mut ctx)
+                .expect("warm-up bundle load must succeed");
+            carrier::free_qwen35_bundle(bundle, gpu).expect("warm-up bundle free must succeed");
+            gpu.drain_pool();
+            vram_free(gpu)
+        }
+
+        /// Frozen warm-up: one full success load through the real publication
+        /// seam + checked free + pool drain; returns the stable free-VRAM
+        /// baseline (absorbs the one-time kernel module residency).
+        fn frozen_warmup(
+            gpu: &mut Gpu,
+            hfq: &HfqFile,
+            config: &Qwen35Config,
+            dispatch_ctx: &hipfire_dispatch::context::DispatchCtx,
+        ) -> usize {
+            let weights = frozen_load_once(gpu, hfq, config, dispatch_ctx)
+                .expect("warm-up frozen load must succeed");
+            weights
+                .free_gpu_checked(gpu)
+                .expect("warm-up frozen free must succeed");
+            gpu.drain_pool();
+            vram_free(gpu)
+        }
+
+        #[test]
+        #[ignore = "requires an AMD GPU plus the qwen3.6-35b-a3b.mq4 fixture"]
+        fn frozen_rollback_at_common_fulfill() {
+            let _lock = GPU_TEST_LOCK.lock().unwrap();
+            let mut gpu = Gpu::init().expect("GPU required for frozen fault injection");
+            gpu.drain_pool();
+
+            let path = frozen_fixture();
+            let hfq = HfqFile::open(std::path::Path::new(&path)).expect("fixture HFQ must open");
+            let config = crate::qwen35::config_from_hfq(&hfq).expect("fixture config");
+            let dispatch_ctx = hipfire_dispatch::context::DispatchCtx::new(&gpu);
+            // Kernel warm-up BEFORE the baseline: one success load+free so
+            // the one-time kernel-module residency is not measured as a leak.
+            let baseline = frozen_warmup(&mut gpu, &hfq, &config, &dispatch_ctx);
+
+            let _env = EnvGuard::set("HIPFIRE_FROZEN_FAIL_STAGE", "common_fulfill");
+            rdna_compute::frozen_fault_inject::reset();
+            let err = match frozen_load_once(&mut gpu, &hfq, &config, &dispatch_ctx) {
+                Ok(_) => panic!("injected common_fulfill fault must fail the load"),
+                Err(e) => e,
+            };
+            let (msg, frozen_failures, cleanup) = err.try_free(&mut gpu);
+            assert!(!msg.is_empty());
+            assert!(
+                frozen_failures.is_empty(),
+                "no frozen owners may survive: {frozen_failures:?}"
+            );
+            assert!(
+                cleanup.is_none() || cleanup.unwrap().is_empty(),
+                "no common owners may survive cleanup"
+            );
+            gpu.drain_pool();
+            assert_vram_recovered(baseline, &gpu, "common_fulfill");
+
+            drop(_env);
+            let weights = frozen_load_once(&mut gpu, &hfq, &config, &dispatch_ctx)
+                .expect("successful frozen load after rollback");
+            weights
+                .free_gpu_checked(&mut gpu)
+                .expect("free must succeed");
+            gpu.drain_pool();
+            assert_vram_recovered(baseline, &gpu, "common_fulfill success cycle");
+        }
+
+        #[test]
+        #[ignore = "requires an AMD GPU plus the qwen3.6-35b-a3b.mq4 fixture"]
+        fn frozen_rollback_at_common_assembly() {
+            let _lock = GPU_TEST_LOCK.lock().unwrap();
+            let mut gpu = Gpu::init().expect("GPU required for frozen fault injection");
+            gpu.drain_pool();
+
+            let path = frozen_fixture();
+            let hfq = HfqFile::open(std::path::Path::new(&path)).expect("fixture HFQ must open");
+            let config = crate::qwen35::config_from_hfq(&hfq).expect("fixture config");
+            let dispatch_ctx = hipfire_dispatch::context::DispatchCtx::new(&gpu);
+            // Kernel warm-up BEFORE the baseline (one-time module residency).
+            let baseline = frozen_warmup(&mut gpu, &hfq, &config, &dispatch_ctx);
+
+            let _env = EnvGuard::set("HIPFIRE_FROZEN_FAIL_STAGE", "common_assembly");
+            rdna_compute::frozen_fault_inject::reset();
+            let err = match frozen_load_once(&mut gpu, &hfq, &config, &dispatch_ctx) {
+                Ok(_) => panic!("injected common_assembly fault must fail the load"),
+                Err(e) => e,
+            };
+            let (msg, frozen_failures, cleanup) = err.try_free(&mut gpu);
+            assert!(!msg.is_empty());
+            assert!(
+                frozen_failures.is_empty(),
+                "no frozen owners may survive: {frozen_failures:?}"
+            );
+            assert!(
+                cleanup.is_none() || cleanup.unwrap().is_empty(),
+                "no common owners may survive cleanup"
+            );
+            gpu.drain_pool();
+            assert_vram_recovered(baseline, &gpu, "common_assembly");
+
+            drop(_env);
+            let weights = frozen_load_once(&mut gpu, &hfq, &config, &dispatch_ctx)
+                .expect("successful frozen load after rollback");
+            weights
+                .free_gpu_checked(&mut gpu)
+                .expect("free must succeed");
+            gpu.drain_pool();
+            assert_vram_recovered(baseline, &gpu, "common_assembly success cycle");
+        }
+
+        #[test]
+        #[ignore = "requires an AMD GPU plus the qwen3.6-35b-a3b.mq4 fixture"]
+        fn frozen_rollback_at_kv_construct() {
+            let _lock = GPU_TEST_LOCK.lock().unwrap();
+            let mut gpu = Gpu::init().expect("GPU required for bundle fault injection");
+            gpu.drain_pool();
+            let path = frozen_fixture();
+            // Kernel warm-up BEFORE the baseline (one-time module residency).
+            let baseline = carrier_warmup(&mut gpu, &path);
+
+            let _env = EnvGuard::set("HIPFIRE_FROZEN_FAIL_STAGE", "kv_construct");
+            rdna_compute::frozen_fault_inject::reset();
+            carrier_fail_cycle(&mut gpu, &path, "kv_construct", baseline);
+            drop(_env);
+            carrier_success_cycle(&mut gpu, &path, baseline);
+        }
+
+        #[test]
+        #[ignore = "requires an AMD GPU plus the qwen3.6-35b-a3b.mq4 fixture"]
+        fn frozen_rollback_at_dn_construct() {
+            let _lock = GPU_TEST_LOCK.lock().unwrap();
+            let mut gpu = Gpu::init().expect("GPU required for bundle fault injection");
+            gpu.drain_pool();
+            let path = frozen_fixture();
+            // Kernel warm-up BEFORE the baseline (one-time module residency).
+            let baseline = carrier_warmup(&mut gpu, &path);
+
+            let _env = EnvGuard::set("HIPFIRE_FROZEN_FAIL_STAGE", "dn_construct");
+            rdna_compute::frozen_fault_inject::reset();
+            carrier_fail_cycle(&mut gpu, &path, "dn_construct", baseline);
+            drop(_env);
+            carrier_success_cycle(&mut gpu, &path, baseline);
+        }
+
+        #[test]
+        #[ignore = "requires an AMD GPU plus the qwen3.6-35b-a3b.mq4 fixture"]
+        fn frozen_rollback_at_scratch_construct() {
+            let _lock = GPU_TEST_LOCK.lock().unwrap();
+            let mut gpu = Gpu::init().expect("GPU required for bundle fault injection");
+            gpu.drain_pool();
+            let path = frozen_fixture();
+            // Kernel warm-up BEFORE the baseline (one-time module residency).
+            let baseline = carrier_warmup(&mut gpu, &path);
+
+            let _env = EnvGuard::set("HIPFIRE_FROZEN_FAIL_STAGE", "scratch_construct");
+            rdna_compute::frozen_fault_inject::reset();
+            carrier_fail_cycle(&mut gpu, &path, "scratch_construct", baseline);
+            drop(_env);
+            carrier_success_cycle(&mut gpu, &path, baseline);
+        }
+
+        #[test]
+        #[ignore = "requires an AMD GPU plus a bundled .mq4-mtp fixture (qwen3.5-4b.mq4-mtp)"]
+        fn frozen_rollback_at_mtp_upload() {
+            let _lock = GPU_TEST_LOCK.lock().unwrap();
+            let mut gpu = Gpu::init().expect("GPU required for MTP fault injection");
+            gpu.drain_pool();
+
+            // The canonical A3B trunk has no MTP bundle trailer; the fault
+            // test needs a bundled .mq4-mtp fixture (override via
+            // HIPFIRE_QWEN35_MTP_FIXTURE).
+            let path = std::env::var("HIPFIRE_QWEN35_MTP_FIXTURE")
+                .unwrap_or_else(|_| home_models("qwen3.5-4b.mq4-mtp"));
+            // Kernel warm-up BEFORE the baseline (one-time module residency).
+            let warm = mtp_head::load_mtp_head_bundled(std::path::Path::new(&path), &mut gpu, 2048)
+                .expect("bundled trailer present")
+                .expect("warm-up MTP load must succeed");
+            retry_all(
+                warm.free_checked(&mut gpu),
+                &mut gpu,
+                "mtp_upload warm-up free",
+            );
+            gpu.drain_pool();
+            let baseline = vram_free(&gpu);
+
+            let _env = EnvGuard::set("HIPFIRE_FROZEN_FAIL_STAGE", "mtp_upload");
+            rdna_compute::frozen_fault_inject::reset();
+            let err = match mtp_head::load_mtp_head_bundled(
+                std::path::Path::new(&path),
+                &mut gpu,
+                2048,
+            ) {
+                Ok(_) => panic!("injected mtp_upload fault must fail the load"),
+                Err(e) => e,
+            };
+            let MtpHeadLoadError { message, retained } = err;
+            assert!(!message.is_empty());
+            retry_all(retained, &mut gpu, "mtp_upload rollback");
+            gpu.drain_pool();
+            assert_vram_recovered(baseline, &gpu, "mtp_upload");
+
+            drop(_env);
+            let head = mtp_head::load_mtp_head_bundled(std::path::Path::new(&path), &mut gpu, 2048)
+                .expect("bundled trailer present")
+                .expect("successful MTP load after rollback");
+            retry_all(
+                head.free_checked(&mut gpu),
+                &mut gpu,
+                "mtp_upload success free",
+            );
+            gpu.drain_pool();
+            assert_vram_recovered(baseline, &gpu, "mtp_upload success cycle");
+        }
+
+        #[test]
+        #[ignore = "requires an AMD GPU plus the qwen3.6-35b-a3b.mq4 fixture"]
+        fn frozen_cleanup_failure_retains_and_retries() {
+            let _lock = GPU_TEST_LOCK.lock().unwrap();
+            let mut gpu = Gpu::init().expect("GPU required for cleanup-failure injection");
+            gpu.drain_pool();
+
+            let path = frozen_fixture();
+            let hfq = HfqFile::open(std::path::Path::new(&path)).expect("fixture HFQ must open");
+            let config = crate::qwen35::config_from_hfq(&hfq).expect("fixture config");
+            let dispatch_ctx = hipfire_dispatch::context::DispatchCtx::new(&gpu);
+            // Kernel warm-up BEFORE the baseline (one-time module residency).
+            let baseline = frozen_warmup(&mut gpu, &hfq, &config, &dispatch_ctx);
+
+            let _stage = EnvGuard::set("HIPFIRE_FROZEN_FAIL_STAGE", "common_assembly");
+            // The second env guard must not re-lock the crate env mutex.
+            let _free = EnvGuard::set_while_locked("HIPFIRE_FROZEN_FAIL_FREE", "1");
+            rdna_compute::frozen_fault_inject::reset();
+            let err = match frozen_load_once(&mut gpu, &hfq, &config, &dispatch_ctx) {
+                Ok(_) => panic!("injected common_assembly fault must fail the load"),
+                Err(e) => e,
+            };
+            // The injected common_assembly error carries the assembled
+            // weights; HIPFIRE_FROZEN_FAIL_FREE=1 makes the FIRST checked
+            // free inside `try_free` fail, so the exact-retention owner
+            // must come back in the cleanup aggregate.
+            let (msg, frozen_failures, cleanup) = err.try_free(&mut gpu);
+            assert!(!msg.is_empty());
+            assert!(
+                frozen_failures.is_empty(),
+                "no frozen owners may survive: {frozen_failures:?}"
+            );
+            let cf = cleanup.expect("free-failure injection must retain owners through try_free");
+            assert!(
+                cf.num_failed() > 0,
+                "exact-retention owners must be carried in the cleanup aggregate"
+            );
+            // Retry with the free-failure injection cleared: everything recovers.
+            drop(_free);
+            cf.retry(&mut gpu)
+                .expect("retry after clearing FAIL_FREE must succeed");
+            gpu.drain_pool();
+            assert_vram_recovered(baseline, &gpu, "cleanup-failure retry");
+
+            drop(_stage);
+            let weights = frozen_load_once(&mut gpu, &hfq, &config, &dispatch_ctx)
+                .expect("successful frozen load after cleanup-failure retry");
+            weights
+                .free_gpu_checked(&mut gpu)
+                .expect("free must succeed");
+            gpu.drain_pool();
+            assert_vram_recovered(baseline, &gpu, "cleanup-failure success cycle");
+        }
+
+        #[test]
+        #[ignore = "requires an AMD GPU plus the qwen3.6-35b-a3b.mq4 fixture"]
+        fn frozen_lifecycle_four_cycles() {
+            let _lock = GPU_TEST_LOCK.lock().unwrap();
+            rdna_compute::frozen_fault_inject::reset();
+            let mut gpu = Gpu::init().expect("GPU required for lifecycle test");
+            gpu.drain_pool();
+            let path = frozen_fixture();
+
+            let mut free_after_unload = Vec::new();
+            for cycle in 0..4 {
+                let cask = CaskConfig::default();
+                let mut ctx = bundle_load_ctx(&mut gpu, &path, &cask);
+                let hfq =
+                    HfqFile::open(std::path::Path::new(&path)).expect("fixture HFQ must open");
+                let mut bundle = carrier::load_bundle(ModelSource::Hfq(hfq), &mut ctx)
+                    .expect("bundle load must succeed");
+                crate::qwen35::forward_scratch(
+                    &mut gpu,
+                    &bundle.weights,
+                    &bundle.config,
+                    42,
+                    0,
+                    &mut bundle.kv_cache,
+                    &mut bundle.dn_state,
+                    &bundle.scratch,
+                )
+                .expect("forward step must run");
+                carrier::free_qwen35_bundle(bundle, &mut gpu).expect("bundle free must succeed");
+                gpu.invalidate_weight_caches();
+                gpu.invalidate_graph_state();
+                gpu.drain_pool();
+                let free = vram_free(&gpu);
+                free_after_unload.push(free);
+                eprintln!("[lifecycle] cycle {cycle}: free VRAM = {free}");
+            }
+
+            // No monotonic VRAM growth: every unload lands within 64 MiB of
+            // the post-first-unload baseline.
+            let anchor = free_after_unload[0];
+            for (cycle, free) in free_after_unload.iter().enumerate().skip(1) {
+                assert!(
+                    anchor.abs_diff(*free) < VRAM_TOLERANCE,
+                    "VRAM growth across cycles: anchor={anchor} cycle{cycle}={free}"
+                );
+            }
+        }
+
+        /// MoE-FFN MTP staging roundtrip. No MoE MTP fixture ships with the
+        /// canonical A3B trunk (no bundle trailer) — gate the test behind
+        /// `HIPFIRE_QWEN35_MOE_MTP` and skip when absent (documented fixture
+        /// requirement, same pattern as the in-crate `HIPFIRE_QWEN35_HFQ`
+        /// tests).
+        #[test]
+        #[ignore = "requires an AMD GPU plus an MoE .mtp fixture (HIPFIRE_QWEN35_MOE_MTP)"]
+        fn mtp_moe_staging_roundtrip() {
+            let path = match std::env::var("HIPFIRE_QWEN35_MOE_MTP") {
+                Ok(path) => path,
+                Err(_) => return,
+            };
+            let _lock = GPU_TEST_LOCK.lock().unwrap();
+            rdna_compute::frozen_fault_inject::reset();
+            let mut gpu = Gpu::init().expect("GPU required for MoE MTP roundtrip");
+            gpu.drain_pool();
+            // Kernel warm-up BEFORE the baseline (one-time module residency).
+            let warm = mtp_head::load_mtp_head(std::path::Path::new(&path), &mut gpu, 2048)
+                .expect("warm-up MoE MTP head must load");
+            retry_all(
+                warm.free_checked(&mut gpu),
+                &mut gpu,
+                "MoE MTP warm-up free",
+            );
+            gpu.drain_pool();
+            let baseline = vram_free(&gpu);
+            let head = mtp_head::load_mtp_head(std::path::Path::new(&path), &mut gpu, 2048)
+                .expect("MoE MTP head must load");
+            retry_all(head.free_checked(&mut gpu), &mut gpu, "MoE MTP free");
+            gpu.drain_pool();
+            assert_vram_recovered(baseline, &gpu, "MoE MTP roundtrip");
+        }
     }
 }

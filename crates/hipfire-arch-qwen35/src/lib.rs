@@ -84,6 +84,10 @@ pub mod grammar;
 /// drives the qwen35 `grammar` matcher. Built via [`spec_emit::Qwen35Emit::from_ctx`].
 pub mod spec_emit;
 
+/// Env-var-driven fault injection for the Frozen construction path. Compiles
+/// to a constant `None` in production builds (feature `frozen-fault-inject`).
+mod frozen_fault_inject;
+
 #[cfg(feature = "deltanet")]
 pub use arch::Qwen35;
 

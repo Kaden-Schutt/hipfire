@@ -50,6 +50,7 @@
 use crate::dots_ocr::{DotsOcrConfig, DotsOcrWeights};
 use hipfire_arch_qwen2::qwen2;
 use hipfire_arch_qwen2::qwen2::Qwen2State;
+use hipfire_runtime::gpu_cleanup::{BundleTeardown, GpuCleanupFailure};
 use hipfire_runtime::spec::{SpecAdvance, SpecScratch, SpecTarget};
 use rdna_compute::Gpu;
 
@@ -66,6 +67,24 @@ pub struct DotsOcrBundle {
     pub config: DotsOcrConfig,
     pub weights: DotsOcrWeights,
     pub state: Qwen2State,
+}
+
+impl BundleTeardown for DotsOcrBundle {
+    fn free_checked(self, gpu: &mut rdna_compute::Gpu) -> Result<(), GpuCleanupFailure> {
+        let mut cf = GpuCleanupFailure::empty();
+        if let Err(f) = self.weights.free_checked(gpu) {
+            cf.merge(f);
+        }
+        if let Err(f) = self.state.free_checked(gpu) {
+            cf.merge(f);
+        }
+        let _ = self.config; // host-side
+        if cf.is_empty() {
+            Ok(())
+        } else {
+            Err(cf)
+        }
+    }
 }
 
 // ─── DotsOcrSpecScratch ───────────────────────────────────────────────────────

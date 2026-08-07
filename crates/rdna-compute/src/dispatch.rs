@@ -2171,12 +2171,72 @@ impl Gpu {
 
     /// Fallibly free an optional tensor without losing ownership when the
     /// device bind fails. Reset paths use this for retryable request state.
+    ///
+    /// Mirrors [`Self::free_tensor`] for VMM arena owners (release the
+    /// arena, never pool arena memory) while preserving the checked-free
+    /// contract: on ANY failure the tensor stays in the `Option` and the
+    /// arena stays registered, so a retry re-attempts the release.
     pub fn free_tensor_checked(&mut self, tensor: &mut Option<GpuTensor>) -> HipResult<()> {
-        self.bind_thread()?;
-        if let Some(tensor) = tensor.take() {
-            self.pool.free(tensor.buf);
+        // Test-only fault injection (feature `frozen-fault-inject`): while
+        // HIPFIRE_FROZEN_FAIL_FREE=1, the FIRST free attempt fails WITHOUT
+        // consuming the tensor — the caller's Option stays `Some`, exactly
+        // like a real bind_thread failure, so the retained-owner rollback
+        // path is exercised end-to-end. The check runs before bind_thread
+        // so the synthetic failure is never masked by a real one.
+        #[cfg(feature = "frozen-fault-inject")]
+        if crate::frozen_fault_inject::free_should_fail() {
+            return Err(HipError::new(
+                0,
+                "injected checked-free failure (HIPFIRE_FROZEN_FAIL_FREE)",
+            ));
         }
-        Ok(())
+        self.bind_thread()?;
+        let Some(t) = tensor.as_ref() else {
+            return Ok(());
+        };
+        let key = t.buf.as_ptr() as usize;
+        if self.vmm_arenas.contains_key(&key) {
+            // VMM arena owner: release the arena (pooling arena memory and
+            // draining it later would double-free vs. the registered arena).
+            if !t.buf.is_vmm_owner() {
+                return Err(HipError::new(
+                    0,
+                    &format!("refusing to free borrowed VMM view at 0x{key:x}"),
+                ));
+            }
+            let t = tensor.take().expect("Option checked above");
+            let mut arena = self
+                .vmm_arenas
+                .remove(&key)
+                .expect("vmm_arenas contains_key checked above");
+            let result = arena.release(&self.hip);
+            if arena.is_released() {
+                // Arena consumed; tensor consumed. Return the release result
+                // (an Ok-with-live-arena is impossible here by construction).
+                result
+            } else {
+                // Release failed: keep BOTH owners retryable — the arena
+                // back in the registry, the tensor back in the Option.
+                self.vmm_arenas.insert(key, arena);
+                *tensor = Some(t);
+                let code = result.as_ref().err().map(|e| e.code).unwrap_or(0);
+                let msg = match result {
+                    Ok(()) => "VMM arena reported success but is still live; retained for retry"
+                        .to_string(),
+                    Err(e) => format!("{e}; arena retained for retry"),
+                };
+                Err(HipError::new(code, &msg))
+            }
+        } else if t.buf.is_borrowed() || t.buf.is_vmm_owner() {
+            Err(HipError::new(
+                0,
+                &format!("refusing to pool non-owning tensor at 0x{key:x}"),
+            ))
+        } else {
+            let t = tensor.take().expect("Option checked above");
+            self.pool.free(t.buf);
+            Ok(())
+        }
     }
 
     /// Drain the GPU memory pool. Actually calls hipFree on all pooled buffers.

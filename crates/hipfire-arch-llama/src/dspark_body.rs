@@ -57,6 +57,7 @@ use hipfire_runtime::dspark_core::{
     main_proj_ingest, main_proj_ingest_batched, noise_block_ids, DsparkBody, DsparkConfig,
     DsparkWeights,
 };
+use hipfire_runtime::gpu_cleanup::{retain_kv_failures, GpuCleanupFailure};
 use hipfire_runtime::hfq::{load_layer, load_weight_tensor_pread, HfqFile};
 use hipfire_runtime::llama::{
     weight_gemv, EmbeddingFormat, ForwardScratch, KvCache, LayerWeights, LlamaConfig, LlamaWeights,
@@ -96,6 +97,42 @@ pub struct Qwen3DrafterAssets {
     pub scratch: ForwardScratch,
     /// Block-parallel prefill scratch (block_size tokens × dim).
     pub pbs: PrefillBatchScratch,
+}
+
+impl Qwen3DrafterAssets {
+    /// Checked GPU cleanup: delegates to the checked free of every owned
+    /// domain ([`LlamaWeights::free_checked`], [`KvCache::free_checked`],
+    /// [`ForwardScratch::free_checked`], [`PrefillBatchScratch::free_checked`])
+    /// and merges all failures into the returned [`GpuCleanupFailure`].
+    ///
+    /// On success all resources are consumed (`Ok(())`). On failure every
+    /// allocation that could not be freed is carried for exact-retention
+    /// retry — no best-effort free is used as a correctness mechanism.
+    pub fn free_checked(self, gpu: &mut Gpu) -> Result<(), GpuCleanupFailure> {
+        let Qwen3DrafterAssets {
+            config: _,
+            weights,
+            kv,
+            scratch,
+            pbs,
+        } = self;
+        let mut cf = GpuCleanupFailure::empty();
+        if let Err(f) = weights.free_checked(gpu) {
+            cf.merge(f);
+        }
+        retain_kv_failures(kv.free_checked(gpu), &mut cf.failed_tensors);
+        if let Err(f) = scratch.free_checked(gpu) {
+            cf.merge(f);
+        }
+        if let Err(f) = pbs.free_checked(gpu) {
+            cf.merge(f);
+        }
+        if cf.is_empty() {
+            Ok(())
+        } else {
+            Err(cf)
+        }
+    }
 }
 
 struct DsparkLoadStaging {
@@ -253,13 +290,16 @@ pub fn load_qwen3_dspark(
         staged.milestone()?;
 
         // 5. Final norm (norm.weight → F32).
-        let (ni, nd) = source
-            .tensor_data_pread("norm.weight")
-            .ok_or_else(|| "qwen3_dspark: norm.weight missing".to_string())?;
-        staged.output_norm = Some(
+        // Block-scoped: the pread guard (Ref<Vec<u8>>) must drop before the
+        // next tensor_data_pread on this file, or the shared pread_buf stays
+        // borrowed and the next read panics ("RefCell already borrowed").
+        staged.output_norm = Some({
+            let (ni, nd) = source
+                .tensor_data_pread("norm.weight")
+                .ok_or_else(|| "qwen3_dspark: norm.weight missing".to_string())?;
             dequant_norm(gpu, ni.quant_type, &nd, &[cfg.dim], 0.0)
-                .map_err(|e| format!("qwen3_dspark: norm.weight: {e:?}"))?,
-        );
+                .map_err(|e| format!("qwen3_dspark: norm.weight: {e:?}"))?
+        });
         staged.milestone()?;
 
         // 6. lm_head.weight (qt=1 F16).
@@ -281,13 +321,15 @@ pub fn load_qwen3_dspark(
         staged.globals.main_proj = Some(load_global_tensor(source, gpu, "main_proj.weight")?);
         staged.milestone()?;
 
-        let (mi, md) = source
-            .tensor_data_pread("main_norm.weight")
-            .ok_or_else(|| "qwen3_dspark: main_norm.weight missing".to_string())?;
-        staged.globals.main_norm = Some(
+        staged.globals.main_norm = Some({
+            let (mi, md) = source
+                .tensor_data_pread("main_norm.weight")
+                .ok_or_else(|| "qwen3_dspark: main_norm.weight missing".to_string())?;
+            // Block-scoped like the norm guard above: the pread Ref must
+            // drop before the markov_w1 pread below.
             dequant_norm(gpu, mi.quant_type, &md, &[cfg.dim], 0.0)
-                .map_err(|e| format!("qwen3_dspark: main_norm.weight: {e:?}"))?,
-        );
+                .map_err(|e| format!("qwen3_dspark: main_norm.weight: {e:?}"))?
+        });
         staged.milestone()?;
 
         staged.globals.markov_w1 = Some(load_global_tensor(
@@ -311,29 +353,32 @@ pub fn load_qwen3_dspark(
             )?);
             staged.milestone()?;
 
-            let (bi, bd) = source
-                .tensor_data_pread("confidence_head.proj.bias")
-                .ok_or_else(|| "qwen3_dspark: confidence_head.proj.bias missing".to_string())?;
-            staged.globals.confidence_bias = Some(
+            staged.globals.confidence_bias = Some({
+                let (bi, bd) = source
+                    .tensor_data_pread("confidence_head.proj.bias")
+                    .ok_or_else(|| "qwen3_dspark: confidence_head.proj.bias missing".to_string())?;
                 dequant_f32(gpu, bi.quant_type, &bd, 1)
-                    .map_err(|e| format!("qwen3_dspark: confidence_head.proj.bias: {e:?}"))?,
-            );
+                    .map_err(|e| format!("qwen3_dspark: confidence_head.proj.bias: {e:?}"))?
+            });
             staged.milestone()?;
         }
 
         // d2t is temporary device state; free it even if the download fails.
         if dspark_cfg.draft_vocab_size > 0 {
-            let (di, dd) = source
-                .tensor_data_pread("d2t")
-                .ok_or_else(|| "qwen3_dspark: d2t missing but draft_vocab_size>0".to_string())?;
-            let dev = dequant_f32(gpu, di.quant_type, &dd, dspark_cfg.draft_vocab_size)
-                .map_err(|e| format!("qwen3_dspark: d2t dequant: {e:?}"))?;
-            let host = match gpu.download_f32(&dev) {
-                Ok(host) => host,
-                Err(error) => {
-                    let _ = gpu.free_tensor(dev);
-                    return Err(format!("qwen3_dspark: d2t download: {error:?}"));
-                }
+            let (dev, host) = {
+                let (di, dd) = source.tensor_data_pread("d2t").ok_or_else(|| {
+                    "qwen3_dspark: d2t missing but draft_vocab_size>0".to_string()
+                })?;
+                let dev = dequant_f32(gpu, di.quant_type, &dd, dspark_cfg.draft_vocab_size)
+                    .map_err(|e| format!("qwen3_dspark: d2t dequant: {e:?}"))?;
+                let host = match gpu.download_f32(&dev) {
+                    Ok(host) => host,
+                    Err(error) => {
+                        let _ = gpu.free_tensor(dev);
+                        return Err(format!("qwen3_dspark: d2t download: {error:?}"));
+                    }
+                };
+                (dev, host)
             };
             let _ = gpu.free_tensor(dev);
             staged.globals.d2t = Some(host.iter().map(|&v| v as u32).collect());
