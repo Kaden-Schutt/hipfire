@@ -103,18 +103,12 @@ fn sequential(
     m: usize,
 ) {
     for (weight, output) in weights.iter().zip(outputs) {
-        gpu.gemv_mfp4g32_e8_soa(weight, x, output, m, K)
+        gpu.gemv_mfp4g32_e8_soa_buffer_gfx1100(weight, x, output, m, K)
             .unwrap();
     }
 }
 
-fn shared(
-    gpu: &mut Gpu,
-    weights: &[GpuTensor],
-    x: &GpuTensor,
-    outputs: &[GpuTensor],
-    m: usize,
-) {
+fn shared(gpu: &mut Gpu, weights: &[GpuTensor], x: &GpuTensor, outputs: &[GpuTensor], m: usize) {
     let weight_refs: Vec<&GpuTensor> = weights.iter().collect();
     let output_refs: Vec<&GpuTensor> = outputs.iter().collect();
     gpu.gemv_mfp4g32_e8_soa_shared_jobs_gfx1100(&weight_refs, x, &output_refs, m, K)
@@ -144,14 +138,7 @@ fn median(values: &mut [f64]) -> f64 {
     values[values.len() / 2]
 }
 
-fn family(
-    gpu: &mut Gpu,
-    label: &str,
-    jobs: usize,
-    m: usize,
-    layers: usize,
-    seed: u64,
-) -> f64 {
+fn family(gpu: &mut Gpu, label: &str, jobs: usize, m: usize, layers: usize, seed: u64) -> f64 {
     let set_bytes = jobs * m * row_bytes();
     let replicas = ((L3_BYTES * 3 / 2) / set_bytes).max(2) + 1;
     let weight_sets: Vec<Vec<GpuTensor>> = (0..replicas)
@@ -182,22 +169,10 @@ fn family(
     let mut shared_ms = Vec::with_capacity(TRIALS);
     for trial in 0..TRIALS {
         let seq = |gpu: &mut Gpu, repeat: usize| {
-            sequential(
-                gpu,
-                &weight_sets[repeat % replicas],
-                &x,
-                &seq_y,
-                m,
-            )
+            sequential(gpu, &weight_sets[repeat % replicas], &x, &seq_y, m)
         };
         let shr = |gpu: &mut Gpu, repeat: usize| {
-            shared(
-                gpu,
-                &weight_sets[repeat % replicas],
-                &x,
-                &shared_y,
-                m,
-            )
+            shared(gpu, &weight_sets[repeat % replicas], &x, &shared_y, m)
         };
         if trial & 1 == 0 {
             seq_ms.push(event_ms(gpu, replicas, seq));
