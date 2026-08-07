@@ -1393,6 +1393,24 @@ fn e8_prefill_coop4_applies(arch: &str, m: usize, k: usize, batch_size: usize) -
         )
 }
 
+/// Measured token-tile width for the exact gfx1201 MQ2R TP prefill route.
+///
+/// TP3's balanced shards produce three classes: wide wq_b rows, 4,096-row
+/// reductions (wo_b and shared down), and narrow/replicated projections.  The
+/// gfx1201 channel screen measured B4, B2, and B1 respectively at the exact
+/// production shapes.  TP4 lands in the same classes, so the selector is
+/// shape-based rather than rank-count-based.
+#[inline]
+fn gfx1201_e8_prefill_batch_rows(m: usize) -> usize {
+    if m >= 8192 {
+        4
+    } else if m == 4096 {
+        2
+    } else {
+        1
+    }
+}
+
 /// F16×F16→F32 batched GEMM, arch-routed.
 ///
 /// `gemm_f16_x_f16_wmma` is built on the wave32 RDNA3 WMMA builtin and will
@@ -1432,6 +1450,27 @@ fn gemv_auto_batched_wmma(
     let e8_b4 = config_cache::e8_prefill_b4_on(&gpu.arch, mq2r_backend.is_gfx1151());
     let e8_tiles = e8_prefill_batch_tiles(batch_size, e8_b2, e8_b4);
     match weight.dtype {
+        DType::MFP4G32E8SOA
+            if mq2r_backend.is_gfx1201()
+                && gpu.arch_caps.is_gfx1201()
+                && k % 256 == 0
+                && x_f16_scratch.is_some() =>
+        {
+            let scratch = x_f16_scratch.unwrap();
+            gpu.deepseek4_convert_f32_to_f16(x_rotated_batch, scratch, (batch_size * k) as i64)
+                .map_err(|e| format!("convert_f32_to_f16 (gfx1201 E8 WMMA): {e:?}"))?;
+            match gfx1201_e8_prefill_batch_rows(m) {
+                4 => gpu
+                    .gemm_mfp4g32_e8_soa_wmma_b4_gfx1201_f16(weight, scratch, y, m, k, batch_size)
+                    .map_err(|e| format!("gemm gfx1201 MFP4-E8-SoA WMMA B4: {e:?}")),
+                2 => gpu
+                    .gemm_mfp4g32_e8_soa_wmma_b2_gfx1201_f16(weight, scratch, y, m, k, batch_size)
+                    .map_err(|e| format!("gemm gfx1201 MFP4-E8-SoA WMMA B2: {e:?}")),
+                _ => gpu
+                    .gemm_mfp4g32_e8_soa_wmma_gfx1201_f16(weight, scratch, y, m, k, batch_size)
+                    .map_err(|e| format!("gemm gfx1201 MFP4-E8-SoA WMMA B1: {e:?}")),
+            }
+        }
         DType::MFP4G32E8SOA if e8_batched_gemv_applies(&gpu.arch, batch_size, k) => gpu
             .gemv_mfp4g32_e8_soa_batched_gfx1151(weight, x_rotated_batch, y, batch_size, m, k)
             .map_err(|e| format!("gemv MFP4-E8-SoA batched B{batch_size}: {e:?}")),
@@ -16228,6 +16267,19 @@ mod tests {
         assert!(!config_cache::gfx1201_rmsnorm_rotate_nox_on(
             "gfx1100", true
         ));
+    }
+
+    #[test]
+    fn gfx1201_e8_prefill_tiles_follow_measured_tp_shapes() {
+        // TP3 wq_b: 24/24/16 local heads.
+        assert_eq!(gfx1201_e8_prefill_batch_rows(12288), 4);
+        assert_eq!(gfx1201_e8_prefill_batch_rows(8192), 4);
+        // TP3 wo_b and shared-down retain 4,096 output rows.
+        assert_eq!(gfx1201_e8_prefill_batch_rows(4096), 2);
+        // TP3 shared-up is 768/768/512 rows; replicated wq_a is 1,024.
+        assert_eq!(gfx1201_e8_prefill_batch_rows(1024), 1);
+        assert_eq!(gfx1201_e8_prefill_batch_rows(768), 1);
+        assert_eq!(gfx1201_e8_prefill_batch_rows(512), 1);
     }
 
     #[test]
