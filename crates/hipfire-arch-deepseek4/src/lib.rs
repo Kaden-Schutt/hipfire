@@ -84,9 +84,10 @@ pub use harmonic::{
     HarmonicSupervisor, HARMONIC_ACTIVATION_EXTENT, HARMONIC_RESULT_EXTENT,
 };
 pub use harmonic_ipc::{
-    harmonic_monotonic_tick, harmonic_payload_fingerprint, HarmonicExpertPoll,
-    HarmonicIntegrityMode, HarmonicIpcError, HarmonicResolved, HarmonicSharedRing,
-    HarmonicWireState, HarmonicWorkItem,
+    harmonic_monotonic_tick, harmonic_payload_fingerprint, HarmonicExpertMappedPoll,
+    HarmonicExpertPoll, HarmonicGpuMapping, HarmonicIntegrityMode, HarmonicIpcError,
+    HarmonicMappedResolved, HarmonicResolved, HarmonicSharedRing, HarmonicWireState,
+    HarmonicWorkItem,
 };
 #[cfg(feature = "harmonic-worker")]
 pub use harmonic_process::{

@@ -10,6 +10,7 @@
 //! deadlines, and bounded worker teardown live above this transport.
 
 use std::cell::UnsafeCell;
+use std::ffi::c_void;
 use std::fmt;
 use std::fs::File;
 use std::io;
@@ -17,6 +18,7 @@ use std::mem;
 use std::ptr;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
+use hip_bridge::{DeviceBuffer, HipRuntime};
 use memmap2::{MmapMut, MmapOptions};
 
 use crate::harmonic::{
@@ -153,6 +155,12 @@ pub struct HarmonicResolved {
     pub result_payload: Option<Vec<u8>>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HarmonicMappedResolved {
+    pub state: HarmonicSlotState,
+    pub completion: Option<HarmonicCompletion>,
+}
+
 /// One nonblocking observation by the persistent expert worker.
 ///
 /// `Pending` is the normal idle result. It is intentionally not an error and
@@ -161,6 +169,15 @@ pub struct HarmonicResolved {
 pub enum HarmonicExpertPoll {
     Pending,
     Work(HarmonicWorkItem),
+    Terminal(HarmonicWireState),
+}
+
+/// Nonblocking expert observation for a HIP-registered ring. Payload bytes
+/// remain in the mapped slot and are consumed by the local GPU alias.
+#[derive(Clone, Debug, PartialEq)]
+pub enum HarmonicExpertMappedPoll {
+    Pending,
+    Work(HarmonicRoutePacket),
     Terminal(HarmonicWireState),
 }
 
@@ -413,6 +430,151 @@ pub struct HarmonicSharedRing {
     mmap: MmapMut,
 }
 
+/// One process-local HIP registration of the shared ring's file-backed pages.
+///
+/// Each harmonic owner constructs its own instance after binding its exact
+/// device. The host mmap remains the protocol authority; `device_base` is only
+/// that process's address-space alias for asynchronous payload transfer. No
+/// pointer is sent to the peer process or shared between HIP contexts.
+pub struct HarmonicGpuMapping {
+    host_base: *mut c_void,
+    mapping_bytes: usize,
+    device_base: DeviceBuffer,
+    activation_offsets: [usize; HARMONIC_SLOT_COUNT],
+    result_offsets: [usize; HARMONIC_SLOT_COUNT],
+    registered: bool,
+}
+
+impl fmt::Debug for HarmonicGpuMapping {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HarmonicGpuMapping")
+            .field("host_base", &self.host_base)
+            .field("device_base", &self.device_base.as_ptr())
+            .field("mapping_bytes", &self.mapping_bytes)
+            .field("registered", &self.registered)
+            .finish()
+    }
+}
+
+impl HarmonicGpuMapping {
+    pub fn register(
+        ring: &mut HarmonicSharedRing,
+        hip: &HipRuntime,
+    ) -> hip_bridge::HipResult<Self> {
+        let host_base = ring.mmap.as_mut_ptr().cast::<c_void>();
+        let mapping_bytes = ring.mmap.len();
+        let base = host_base as usize;
+        let activation_offsets = std::array::from_fn(|slot| {
+            let payload = ring.layout().slots[slot]
+                .activation_payload
+                .bytes
+                .get()
+                .cast::<u8>() as usize;
+            payload
+                .checked_sub(base)
+                .expect("activation payload precedes ring base")
+        });
+        let result_offsets = std::array::from_fn(|slot| {
+            let payload = ring.layout().slots[slot]
+                .result_payload
+                .bytes
+                .get()
+                .cast::<u8>() as usize;
+            payload
+                .checked_sub(base)
+                .expect("result payload precedes ring base")
+        });
+        for (offset, extent) in activation_offsets
+            .iter()
+            .map(|offset| (*offset, HARMONIC_ACTIVATION_EXTENT as usize))
+            .chain(
+                result_offsets
+                    .iter()
+                    .map(|offset| (*offset, HARMONIC_RESULT_EXTENT as usize)),
+            )
+        {
+            assert!(
+                offset.saturating_add(extent) <= mapping_bytes,
+                "harmonic payload view exceeds registered mapping"
+            );
+        }
+
+        // SAFETY: `ring` owns this page-aligned live mmap. Product ownership
+        // keeps it mapped until `unregister` has synchronized and released the
+        // process-local HIP alias.
+        unsafe { hip.host_register_mapped(host_base, mapping_bytes)? };
+        let device_base = match unsafe { hip.host_get_device_buffer(host_base, mapping_bytes) } {
+            Ok(device_base) => device_base,
+            Err(error) => {
+                // SAFETY: registration succeeded above and no device alias was
+                // published, so no GPU operation can be using the mapping.
+                let _ = unsafe { hip.host_unregister(host_base) };
+                return Err(error);
+            }
+        };
+        Ok(Self {
+            host_base,
+            mapping_bytes,
+            device_base,
+            activation_offsets,
+            result_offsets,
+            registered: true,
+        })
+    }
+
+    pub fn activation_buffer(&self, epoch: u64) -> DeviceBuffer {
+        self.payload_buffer(
+            self.activation_offsets[epoch as usize % HARMONIC_SLOT_COUNT],
+            HARMONIC_ACTIVATION_EXTENT as usize,
+        )
+    }
+
+    pub fn result_buffer(&self, epoch: u64) -> DeviceBuffer {
+        self.payload_buffer(
+            self.result_offsets[epoch as usize % HARMONIC_SLOT_COUNT],
+            HARMONIC_RESULT_EXTENT as usize,
+        )
+    }
+
+    pub fn unregister(&mut self, hip: &HipRuntime) -> hip_bridge::HipResult<()> {
+        if !self.registered {
+            return Ok(());
+        }
+        // SAFETY: the owning execution object synchronizes its local streams
+        // before calling this method and the exact registration base is kept in
+        // this object.
+        unsafe { hip.host_unregister(self.host_base)? };
+        self.registered = false;
+        Ok(())
+    }
+
+    fn payload_buffer(&self, offset: usize, extent: usize) -> DeviceBuffer {
+        assert!(
+            self.registered,
+            "harmonic GPU mapping used after unregister"
+        );
+        assert!(offset.saturating_add(extent) <= self.mapping_bytes);
+        // SAFETY: registration covers the entire device alias and `offset` plus
+        // `extent` was range-checked against that allocation at construction.
+        unsafe {
+            DeviceBuffer::from_raw(
+                self.device_base.as_ptr().cast::<u8>().add(offset).cast(),
+                extent,
+            )
+        }
+    }
+}
+
+impl Drop for HarmonicGpuMapping {
+    fn drop(&mut self) {
+        if self.registered {
+            eprintln!(
+                "deepseek4 harmonic GPU mapping dropped while still registered; process teardown will reclaim it"
+            );
+        }
+    }
+}
+
 impl fmt::Debug for HarmonicSharedRing {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("HarmonicSharedRing")
@@ -488,6 +650,15 @@ impl HarmonicSharedRing {
         HarmonicIntegrityMode::decode(self.layout().header.integrity_mode.load(Ordering::Acquire))
     }
 
+    fn require_release_acquire_data_plane(&self) -> HarmonicIpcResult<()> {
+        if self.integrity_mode()? != HarmonicIntegrityMode::ReleaseAcquire {
+            return Err(HarmonicIpcError::InvalidLayout(
+                "mapped payload requires release/acquire integrity mode",
+            ));
+        }
+        Ok(())
+    }
+
     pub fn publish(
         &self,
         packet: HarmonicRoutePacket,
@@ -495,8 +666,30 @@ impl HarmonicSharedRing {
         now: u64,
         activation_payload: &[u8],
     ) -> HarmonicIpcResult<()> {
-        let slot = self.prepare_publish(packet, endpoint_generation, now, activation_payload)?;
+        validate_payload(
+            self.integrity_mode()?,
+            activation_payload,
+            HARMONIC_ACTIVATION_EXTENT as usize,
+            packet.activation_fingerprint,
+            "activation payload",
+        )?;
+        let slot = self.prepare_publish(packet, endpoint_generation, now)?;
         write_payload(&slot.activation_payload, activation_payload);
+        slot.state
+            .store(HarmonicWireState::Published as u32, Ordering::Release);
+        Ok(())
+    }
+
+    /// Publish control metadata after the exact activation extent has already
+    /// been transferred into this epoch's HIP-registered payload view.
+    pub fn publish_mapped(
+        &self,
+        packet: HarmonicRoutePacket,
+        endpoint_generation: u64,
+        now: u64,
+    ) -> HarmonicIpcResult<()> {
+        self.require_release_acquire_data_plane()?;
+        let slot = self.prepare_publish(packet, endpoint_generation, now)?;
         slot.state
             .store(HarmonicWireState::Published as u32, Ordering::Release);
         Ok(())
@@ -518,7 +711,14 @@ impl HarmonicSharedRing {
         activation_payload: &[u8],
         payload_words: usize,
     ) -> HarmonicIpcResult<()> {
-        let slot = self.prepare_publish(packet, endpoint_generation, now, activation_payload)?;
+        validate_payload(
+            self.integrity_mode()?,
+            activation_payload,
+            HARMONIC_ACTIVATION_EXTENT as usize,
+            packet.activation_fingerprint,
+            "activation payload",
+        )?;
+        let slot = self.prepare_publish(packet, endpoint_generation, now)?;
         write_payload_prefix(
             &slot.activation_payload,
             activation_payload,
@@ -532,18 +732,10 @@ impl HarmonicSharedRing {
         packet: HarmonicRoutePacket,
         endpoint_generation: u64,
         now: u64,
-        activation_payload: &[u8],
     ) -> HarmonicIpcResult<&HarmonicWireSlot> {
         self.check_endpoint(HarmonicOwner::DenseGfx1100, endpoint_generation)?;
         let contract = self.contract();
         contract.validate(&packet, now)?;
-        validate_payload(
-            self.integrity_mode()?,
-            activation_payload,
-            HARMONIC_ACTIVATION_EXTENT as usize,
-            packet.activation_fingerprint,
-            "activation payload",
-        )?;
         let slot = self.slot(packet.epoch);
         slot.transition(
             "reserve publish slot",
@@ -631,6 +823,37 @@ impl HarmonicSharedRing {
         })
     }
 
+    /// Acquire one published packet without copying its registered activation
+    /// payload through the CPU. The caller consumes [`HarmonicGpuMapping`]'s
+    /// activation view only after this acquire transition succeeds.
+    pub fn expert_begin_mapped(
+        &self,
+        epoch: u64,
+        endpoint_generation: u64,
+        now: u64,
+    ) -> HarmonicIpcResult<HarmonicRoutePacket> {
+        self.require_release_acquire_data_plane()?;
+        self.check_endpoint(HarmonicOwner::ExpertGfx1151, endpoint_generation)?;
+        let slot = self.slot(epoch);
+        slot.check_epoch(epoch)?;
+        let state = slot.state()?;
+        if state != HarmonicWireState::Published {
+            return Err(HarmonicIpcError::CompareExchange {
+                operation: "mapped expert begin",
+                expected: HarmonicWireState::Published,
+                actual: state,
+            });
+        }
+        let packet = slot.packet()?;
+        self.contract().validate(&packet, now)?;
+        slot.transition(
+            "mapped expert begin",
+            HarmonicWireState::Published,
+            HarmonicWireState::Running,
+        )?;
+        Ok(packet)
+    }
+
     /// Discover the next expert epoch directly from the shared ring.
     ///
     /// This is the product-shaped data-plane seam: no Unix-socket message,
@@ -678,6 +901,42 @@ impl HarmonicSharedRing {
         }
     }
 
+    pub fn expert_poll_mapped(
+        &self,
+        epoch: u64,
+        endpoint_generation: u64,
+    ) -> HarmonicIpcResult<HarmonicExpertMappedPoll> {
+        self.require_release_acquire_data_plane()?;
+        self.check_endpoint(HarmonicOwner::ExpertGfx1151, endpoint_generation)?;
+        let slot = self.slot(epoch);
+        let state = slot.state()?;
+        let observed_epoch = slot.epoch.load(Ordering::Acquire);
+        if observed_epoch != epoch {
+            if state == HarmonicWireState::Vacant || observed_epoch < epoch {
+                return Ok(HarmonicExpertMappedPoll::Pending);
+            }
+            return Err(HarmonicProtocolError::StaleEpoch {
+                expected: observed_epoch,
+                got: epoch,
+            }
+            .into());
+        }
+        match state {
+            HarmonicWireState::Published => self
+                .expert_begin_mapped(epoch, endpoint_generation, harmonic_monotonic_tick()?)
+                .map(HarmonicExpertMappedPoll::Work),
+            HarmonicWireState::Completed
+            | HarmonicWireState::Cancelled
+            | HarmonicWireState::TimedOut
+            | HarmonicWireState::FailedDense
+            | HarmonicWireState::FailedExpert => Ok(HarmonicExpertMappedPoll::Terminal(state)),
+            HarmonicWireState::Vacant
+            | HarmonicWireState::Publishing
+            | HarmonicWireState::Running
+            | HarmonicWireState::Completing => Ok(HarmonicExpertMappedPoll::Pending),
+        }
+    }
+
     pub fn expert_complete(
         &self,
         epoch: u64,
@@ -715,6 +974,44 @@ impl HarmonicSharedRing {
         slot.result_fingerprint
             .store(completion.result_fingerprint, Ordering::Relaxed);
         write_payload(&slot.result_payload, result_payload);
+        slot.flags
+            .fetch_or(FLAG_DESTINATION_QUIESCED, Ordering::Release);
+        slot.state
+            .store(HarmonicWireState::Completed as u32, Ordering::Release);
+        Ok(())
+    }
+
+    /// Release-complete one packet whose exact result extent has already been
+    /// written through this process's HIP-registered result view.
+    pub fn expert_complete_mapped(
+        &self,
+        epoch: u64,
+        endpoint_generation: u64,
+        completion: HarmonicCompletion,
+    ) -> HarmonicIpcResult<()> {
+        self.require_release_acquire_data_plane()?;
+        self.check_endpoint(HarmonicOwner::ExpertGfx1151, endpoint_generation)?;
+        let slot = self.slot(epoch);
+        slot.check_epoch(epoch)?;
+        let state = slot.state()?;
+        if state != HarmonicWireState::Running {
+            return Err(HarmonicIpcError::CompareExchange {
+                operation: "reserve mapped completion slot",
+                expected: HarmonicWireState::Running,
+                actual: state,
+            });
+        }
+        let packet = slot.packet()?;
+        if completion.result_extent != packet.result_extent {
+            return Err(HarmonicProtocolError::InvalidPacket("completion extent").into());
+        }
+        slot.transition(
+            "reserve mapped completion slot",
+            HarmonicWireState::Running,
+            HarmonicWireState::Completing,
+        )?;
+        slot.result_fingerprint
+            .store(completion.result_fingerprint, Ordering::Relaxed);
         slot.flags
             .fetch_or(FLAG_DESTINATION_QUIESCED, Ordering::Release);
         slot.state
@@ -760,6 +1057,36 @@ impl HarmonicSharedRing {
             state: state.logical(),
             completion,
             result_payload,
+        })
+    }
+
+    /// Resolve terminal control state while leaving the registered result
+    /// payload in place for an owner-local asynchronous GPU copy.
+    pub fn source_resolve_mapped(
+        &self,
+        epoch: u64,
+        endpoint_generation: u64,
+    ) -> HarmonicIpcResult<HarmonicMappedResolved> {
+        self.require_release_acquire_data_plane()?;
+        self.check_endpoint(HarmonicOwner::DenseGfx1100, endpoint_generation)?;
+        let slot = self.slot(epoch);
+        slot.check_epoch(epoch)?;
+        let state = slot.state()?;
+        if !state.is_terminal() {
+            return Err(HarmonicProtocolError::SlotNotTerminal {
+                slot: (epoch as usize % HARMONIC_SLOT_COUNT) as u8,
+                state: state.logical(),
+            }
+            .into());
+        }
+        let completion = (state == HarmonicWireState::Completed).then(|| HarmonicCompletion {
+            result_extent: slot.result_extent.load(Ordering::Relaxed),
+            result_fingerprint: slot.result_fingerprint.load(Ordering::Relaxed),
+        });
+        slot.flags.fetch_or(FLAG_SOURCE_OBSERVED, Ordering::Release);
+        Ok(HarmonicMappedResolved {
+            state: state.logical(),
+            completion,
         })
     }
 
@@ -1135,6 +1462,18 @@ mod tests {
 
     impl TestRing {
         fn new(source_generation: u64, destination_generation: u64) -> Self {
+            Self::new_with_integrity(source_generation, destination_generation, false)
+        }
+
+        fn new_data_plane(source_generation: u64, destination_generation: u64) -> Self {
+            Self::new_with_integrity(source_generation, destination_generation, true)
+        }
+
+        fn new_with_integrity(
+            source_generation: u64,
+            destination_generation: u64,
+            data_plane: bool,
+        ) -> Self {
             let nonce = TEST_NONCE.fetch_add(1, Ordering::Relaxed);
             let path = std::env::temp_dir().join(format!(
                 "hipfire-harmonic-ipc-{}-{nonce}",
@@ -1146,10 +1485,12 @@ mod tests {
                 .write(true)
                 .open(&path)
                 .unwrap();
-            let ring = HarmonicSharedRing::create(
-                &file,
-                HarmonicContract::frozen(source_generation, destination_generation),
-            )
+            let contract = HarmonicContract::frozen(source_generation, destination_generation);
+            let ring = if data_plane {
+                HarmonicSharedRing::create_data_plane(&file, contract)
+            } else {
+                HarmonicSharedRing::create(&file, contract)
+            }
             .unwrap();
             Self { path, ring }
         }
@@ -1213,6 +1554,36 @@ mod tests {
         let resolved = owner.ring.source_resolve(1, 7).unwrap();
         assert_eq!(resolved.state, HarmonicSlotState::Completed);
         assert_eq!(resolved.result_payload.unwrap(), result);
+        owner.ring.recycle(1).unwrap();
+        assert_eq!(owner.ring.state(1).unwrap(), HarmonicWireState::Vacant);
+    }
+
+    #[test]
+    fn mapped_control_plane_completes_without_copying_payload_through_cpu() {
+        let owner = TestRing::new_data_plane(7, 11);
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&owner.path)
+            .unwrap();
+        let peer = HarmonicSharedRing::open(&file).unwrap();
+        let (request, _) = request(owner.ring.contract(), 1, u64::MAX);
+
+        owner.ring.publish_mapped(request, 7, 0).unwrap();
+        let observed = match peer.expert_poll_mapped(1, 11).unwrap() {
+            HarmonicExpertMappedPoll::Work(packet) => packet,
+            state => panic!("expected mapped work, got {state:?}"),
+        };
+        assert_eq!(observed, request);
+
+        let completion = HarmonicCompletion {
+            result_extent: HARMONIC_RESULT_EXTENT,
+            result_fingerprint: 0xfeed_face_dead_beef,
+        };
+        peer.expert_complete_mapped(1, 11, completion).unwrap();
+        let resolved = owner.ring.source_resolve_mapped(1, 7).unwrap();
+        assert_eq!(resolved.state, HarmonicSlotState::Completed);
+        assert_eq!(resolved.completion, Some(completion));
         owner.ring.recycle(1).unwrap();
         assert_eq!(owner.ring.state(1).unwrap(), HarmonicWireState::Vacant);
     }

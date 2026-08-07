@@ -243,6 +243,9 @@ pub struct HipRuntime {
     // Memory
     fn_malloc: unsafe extern "C" fn(*mut *mut c_void, usize) -> u32,
     fn_ext_malloc_with_flags: Option<unsafe extern "C" fn(*mut *mut c_void, usize, c_uint) -> u32>,
+    fn_host_register: unsafe extern "C" fn(*mut c_void, usize, c_uint) -> u32,
+    fn_host_unregister: unsafe extern "C" fn(*mut c_void) -> u32,
+    fn_host_get_device_pointer: unsafe extern "C" fn(*mut *mut c_void, *mut c_void, c_uint) -> u32,
     fn_free: unsafe extern "C" fn(*mut c_void) -> u32,
     fn_mem_get_address_range:
         unsafe extern "C" fn(*mut *mut c_void, *mut usize, *mut c_void) -> u32,
@@ -472,6 +475,21 @@ impl HipRuntime {
                     lib,
                     "hipExtMallocWithFlags",
                     unsafe extern "C" fn(*mut *mut c_void, usize, c_uint) -> u32
+                ),
+                fn_host_register: load_fn!(
+                    lib,
+                    "hipHostRegister",
+                    unsafe extern "C" fn(*mut c_void, usize, c_uint) -> u32
+                ),
+                fn_host_unregister: load_fn!(
+                    lib,
+                    "hipHostUnregister",
+                    unsafe extern "C" fn(*mut c_void) -> u32
+                ),
+                fn_host_get_device_pointer: load_fn!(
+                    lib,
+                    "hipHostGetDevicePointer",
+                    unsafe extern "C" fn(*mut *mut c_void, *mut c_void, c_uint) -> u32
                 ),
                 fn_free: load_fn!(lib, "hipFree", unsafe extern "C" fn(*mut c_void) -> u32),
                 fn_mem_get_address_range: load_fn!(
@@ -953,6 +971,76 @@ impl HipRuntime {
             size,
             ownership: crate::DeviceBufferOwnership::HipMalloc,
         })
+    }
+
+    /// Register an existing host allocation as portable, device-mapped memory.
+    ///
+    /// This is the zero-copy seam for file-backed shared-memory transports. The
+    /// caller keeps ownership of the host allocation and must unregister the
+    /// exact same base only after every GPU access has completed.
+    ///
+    /// # Safety
+    ///
+    /// `host_ptr..host_ptr + size` must remain mapped and exclusively managed
+    /// by the caller until [`Self::host_unregister`] succeeds. Overlapping HIP
+    /// host registrations are forbidden.
+    pub unsafe fn host_register_mapped(&self, host_ptr: *mut c_void, size: usize) -> HipResult<()> {
+        if host_ptr.is_null() || size == 0 {
+            return Err(HipError::new(
+                0,
+                "hipHostRegister requires a non-empty mapping",
+            ));
+        }
+        // hipHostRegisterDefault is mapped and portable on AMD. Keep the flag
+        // explicit so this wrapper follows the native HIP contract rather than
+        // CUDA compatibility aliases.
+        const HIP_HOST_REGISTER_DEFAULT: c_uint = 0;
+        let code = unsafe { (self.fn_host_register)(host_ptr, size, HIP_HOST_REGISTER_DEFAULT) };
+        self.check(code, "hipHostRegister(mapped portable)")
+    }
+
+    /// Resolve the device-visible alias of a registered host allocation.
+    ///
+    /// # Safety
+    ///
+    /// `host_ptr` must be the live base of a successful host registration for
+    /// the current HIP device, and `size` must not exceed that registration.
+    pub unsafe fn host_get_device_buffer(
+        &self,
+        host_ptr: *mut c_void,
+        size: usize,
+    ) -> HipResult<DeviceBuffer> {
+        if host_ptr.is_null() || size == 0 {
+            return Err(HipError::new(
+                0,
+                "hipHostGetDevicePointer requires a non-empty mapping",
+            ));
+        }
+        let mut device_ptr = ptr::null_mut();
+        let code = unsafe { (self.fn_host_get_device_pointer)(&mut device_ptr, host_ptr, 0) };
+        self.check(code, "hipHostGetDevicePointer")?;
+        if device_ptr.is_null() {
+            return Err(HipError::new(0, "hipHostGetDevicePointer returned null"));
+        }
+        Ok(unsafe { DeviceBuffer::from_raw(device_ptr, size) })
+    }
+
+    /// Release one caller-owned host registration.
+    ///
+    /// # Safety
+    ///
+    /// `host_ptr` must be the exact live base passed to
+    /// [`Self::host_register_mapped`], with no GPU operation still using its
+    /// device alias.
+    pub unsafe fn host_unregister(&self, host_ptr: *mut c_void) -> HipResult<()> {
+        if host_ptr.is_null() {
+            return Err(HipError::new(
+                0,
+                "hipHostUnregister requires a non-null base",
+            ));
+        }
+        let code = unsafe { (self.fn_host_unregister)(host_ptr) };
+        self.check(code, "hipHostUnregister")
     }
 
     /// # Safety
