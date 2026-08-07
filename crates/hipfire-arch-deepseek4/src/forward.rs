@@ -318,15 +318,6 @@ mod config_cache {
     pub(super) fn gfx1201_e8_wo_grouped_on(arch: &str, mq2r: bool) -> bool {
         arch == "gfx1201" && mq2r
     }
-    /// Candidate-only exact-gfx1201 TP3 split compressed-attention route.
-    /// The product screen enables this explicitly; a promoted route removes
-    /// the developer flag and becomes an architecture/topology default.
-    pub(super) fn gfx1201_attn_split3_on(arch: &str, mq2r: bool) -> bool {
-        static V: OnceLock<bool> = OnceLock::new();
-        arch == "gfx1201"
-            && mq2r
-            && *V.get_or_init(|| flag_one("HIPFIRE_DEEPSEEK4_GFX1201_ATTN_SPLIT3"))
-    }
     /// Exact-gfx1201 MQ2R admission for the DeepSeek-only low-LDS fused
     /// RMSNorm + FWHT path. Adjacent models still call the generic method.
     pub(super) fn gfx1201_rmsnorm_rotate_nox_on(arch: &str, mq2r: bool) -> bool {
@@ -8124,15 +8115,6 @@ fn attn_stub(
 
         if do_mixed {
             let topk_max = cfg.index_topk;
-            let use_split3 = config_cache::gfx1201_attn_split3_on(&gpu.arch, cfg.mq2r)
-                && layer.attn_tp_size == 3
-                && layer.shared_tp_size == 3;
-            if use_split3 && state.attn_split3_scratch.is_none() {
-                state.attn_split3_scratch = Some(
-                    gpu.alloc_tensor(&[n_heads, win + topk_max], DType::F32)
-                        .map_err(|e| format!("alloc gfx1201 split-attention scratch: {e:?}"))?,
-                );
-            }
             if state._attention[layer_idx].gathered_k.is_none() {
                 state._attention[layer_idx].gathered_k = Some(
                     gpu.zeros(&[n_kv, head_dim, topk_max], DType::F32)
@@ -8201,43 +8183,23 @@ fn attn_stub(
             // single normalization, V = swa_v + gathered_v (K=V tied, so
             // we pass gathered_k as V too). n_valid_swa + n_active_topk
             // come from the device-side attn_state_buf.
-            if use_split3 {
-                gpu.deepseek4_attn_swa_topk_split3_gfx1201(
-                    q,
-                    swa_k,
-                    swa_v,
-                    gathered_k,
-                    gathered_k,
-                    attn_sink,
-                    state.attn_split3_scratch.as_ref().unwrap(),
-                    attn_out_raw,
-                    &n_valid_buf,
-                    &k_active_buf,
-                    n_heads as i32,
-                    head_dim as i32,
-                    win as i32,
-                    topk_max as i32,
-                )
-                .map_err(|e| format!("deepseek4_attn_swa_topk_split3 l{layer_idx}: {e:?}"))?;
-            } else {
-                gpu.deepseek4_attn_swa_topk_f32_buf(
-                    weights.mq2r_backend.is_gfx1151(),
-                    q,
-                    swa_k,
-                    swa_v,
-                    gathered_k,
-                    gathered_k,
-                    attn_sink,
-                    attn_out_raw,
-                    &n_valid_buf,
-                    &k_active_buf,
-                    n_heads as i32,
-                    head_dim as i32,
-                    win as i32,
-                    topk_max as i32,
-                )
-                .map_err(|e| format!("deepseek4_attn_swa_topk_buf l{layer_idx}: {e:?}"))?;
-            }
+            gpu.deepseek4_attn_swa_topk_f32_buf(
+                weights.mq2r_backend.is_gfx1151(),
+                q,
+                swa_k,
+                swa_v,
+                gathered_k,
+                gathered_k,
+                attn_sink,
+                attn_out_raw,
+                &n_valid_buf,
+                &k_active_buf,
+                n_heads as i32,
+                head_dim as i32,
+                win as i32,
+                topk_max as i32,
+            )
+            .map_err(|e| format!("deepseek4_attn_swa_topk_buf l{layer_idx}: {e:?}"))?;
             let _ = n_valid; // legacy host-computed value not used after migration
         } else {
             let swa_k = state._attention[layer_idx].swa_k.as_ref().unwrap();

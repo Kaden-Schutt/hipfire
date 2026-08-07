@@ -5412,8 +5412,6 @@ pub const STATE_OVERLAP_SHIFT_F32_BUF_SRC: &str =
 /// + `n_active_topk` from device buffers.
 pub const V4F_ATTN_SWA_TOPK_BUF_SRC: &str =
     include_str!("../../../kernels/src/deepseek4_attn_swa_topk_buf.hip");
-pub const V4F_ATTN_SWA_TOPK_SPLIT3_GFX1201_SRC: &str =
-    include_str!("../../../kernels/src/deepseek4_attn_swa_topk_split3.gfx1201.hip");
 pub const V4F_ATTN_SWA_TOPK_BUF_XLANE_GFX1151_SRC: &str = concat!(
     "#include <hip/hip_runtime.h>\n",
     include_str!("../../../kernels/src/gfx1151_xor_shuffle.h"),

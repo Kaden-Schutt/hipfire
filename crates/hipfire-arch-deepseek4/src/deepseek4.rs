@@ -1784,10 +1784,6 @@ pub struct DeepseekV4State {
     /// Raw attention output `[n_heads, head_dim]` F32 = 32768 elems.
     /// Fed into the O-LoRA projection (wo_a + wo_b → state.attn_out).
     pub attn_out_raw: Option<rdna_compute::GpuTensor>,
-    /// Candidate gfx1201 split-attention score/probability scratch
-    /// `[n_heads, sliding_window + index_topk]` F32. Allocated only by the
-    /// exact gfx1201 TP3 screening route and reused across serial layers.
-    pub attn_split3_scratch: Option<rdna_compute::GpuTensor>,
     /// FWHT-rotated `attn_out_raw` for wo_a GEMV input.
     pub attn_out_raw_rot: Option<rdna_compute::GpuTensor>,
     /// wo_a output `[n_groups * o_lora_rank]` F32 = 8192 elems.
@@ -1960,7 +1956,6 @@ impl DeepseekV4State {
             moe_down_expert_outputs: None,
             q_head_ones: None,
             attn_out_raw: None,
-            attn_split3_scratch: None,
             attn_out_raw_rot: None,
             wo_a_out: None,
             wo_a_out_rot: None,
@@ -2200,7 +2195,6 @@ impl DeepseekV4State {
         free_opt(gpu, &mut self.moe_down_expert_outputs);
         free_opt(gpu, &mut self.q_head_ones);
         free_opt(gpu, &mut self.attn_out_raw);
-        free_opt(gpu, &mut self.attn_split3_scratch);
         free_opt(gpu, &mut self.attn_out_raw_rot);
         free_opt(gpu, &mut self.wo_a_out);
         free_opt(gpu, &mut self.wo_a_out_rot);
