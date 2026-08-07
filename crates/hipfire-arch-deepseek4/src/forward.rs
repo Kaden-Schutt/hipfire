@@ -3819,6 +3819,30 @@ fn harmonic_capture_token_program(
         gpu.replay
             .begin_capture()
             .map_err(|error| format!("harmonic token begin capture: {error}"))?;
+        // The retained token body must consume the device-resident token ID.
+        // Capturing `embedding_lookup_q8(..., token_id, ...)` would bake the
+        // capture token into every replay. The ordinary DS4 Redline route uses
+        // this same buffer-driven broadcast as its first typed dispatch.
+        let token_embd = weights
+            .token_embd
+            .as_ref()
+            .ok_or_else(|| "harmonic retained embedding missing".to_owned())?;
+        let streams = state
+            .residual_streams
+            .as_ref()
+            .ok_or_else(|| "harmonic retained residual streams missing".to_owned())?;
+        let token_id_buf = state
+            .token_id_buf
+            .as_ref()
+            .ok_or_else(|| "harmonic retained token buffer missing".to_owned())?;
+        gpu.embedding_lookup_q8_buf_broadcast(
+            token_embd,
+            streams,
+            token_id_buf,
+            cfg.hidden_size,
+            cfg.hc_mult,
+        )
+        .map_err(|error| format!("harmonic retained embedding: {error:?}"))?;
         let mut gates = Vec::with_capacity(cfg.num_hidden_layers);
         let mut stage_dispatches = Vec::with_capacity(cfg.num_hidden_layers);
         let mut combine_dispatches = Vec::with_capacity(cfg.num_hidden_layers);
