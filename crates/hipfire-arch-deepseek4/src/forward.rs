@@ -4792,28 +4792,6 @@ impl<'a> ForwardBindings for Deepseek4Bindings<'a> {
         hc_ffn_mix(self.cfg, self.weights, self.state, gpu, self.layer_idx)
             .map_err(DispatchError::Hip)
     }
-    fn supports_ep_peer_reduce_add4(&self) -> bool {
-        true
-    }
-    fn ep_peer_reduce_add4_into_residual(
-        &mut self,
-        gpu: &mut Gpu,
-        partials: [&GpuTensor; 4],
-    ) -> Result<(), DispatchError> {
-        // The runtime exact-gates this hook to four peer-connected gfx1201
-        // ranks. Fold the routed sum directly into the replicated shared
-        // expert output, then run the same deferred HC mix as the RCCL path.
-        {
-            let ffn_out =
-                self.state.ffn_out.as_ref().ok_or_else(|| {
-                    DispatchError::Hip("ep_peer_reduce_add4: ffn_out unset".into())
-                })?;
-            gpu.ep_peer_reduce_add4_f32_gfx1201(ffn_out, partials)
-                .map_err(|e| DispatchError::Hip(e.to_string()))?;
-        }
-        hc_ffn_mix(self.cfg, self.weights, self.state, gpu, self.layer_idx)
-            .map_err(DispatchError::Hip)
-    }
     fn run_proj(
         &mut self,
         _gpu: &mut Gpu,

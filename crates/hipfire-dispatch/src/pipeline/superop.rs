@@ -378,30 +378,6 @@ pub trait ForwardBindings {
             quant: "",
         })
     }
-
-    /// Whether this architecture binding can consume four peer-visible routed
-    /// partials and fold their sum directly into its residual destination.
-    /// The runtime additionally exact-gates the device architecture and peer
-    /// topology before calling the hook.
-    fn supports_ep_peer_reduce_add4(&self) -> bool {
-        false
-    }
-
-    /// gfx1201 four-rank EP fast path: reduce peer partials and perform the
-    /// architecture-specific residual fold without materializing an RCCL
-    /// all-reduced partial on every rank.
-    fn ep_peer_reduce_add4_into_residual(
-        &mut self,
-        _gpu: &mut Gpu,
-        _partials: [&GpuTensor; 4],
-    ) -> Result<(), DispatchError> {
-        Err(DispatchError::UnsupportedVariant {
-            family: "ep",
-            variant: "ep_peer_reduce_add4-not-implemented-for-arch",
-            arch: "",
-            quant: "",
-        })
-    }
 }
 
 /// Dispatch a SINGLE super-op to its [`ForwardBindings`] method. Extracted from
