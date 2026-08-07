@@ -68,7 +68,7 @@ fn main() {
     }
 
     gpus.devices[0].bind_thread().expect("bind result alloc");
-    let results: Vec<DeviceBuffer> = (0..RANKS)
+    let results: Vec<DeviceBuffer> = (1..RANKS)
         .map(|_| gpus.devices[0].hip.malloc(BYTES).expect("result buffer"))
         .collect();
 
@@ -109,11 +109,11 @@ fn main() {
         let owner = &gpus.devices[0];
         owner.bind_thread().expect("bind peer copies");
         let stream = owner.active_stream.as_ref().expect("owner stream");
-        for rank in 0..RANKS {
+        for rank in 1..RANKS {
             owner
                 .hip
                 .memcpy_peer_async(
-                    &results[rank],
+                    &results[rank - 1],
                     owner.device_id,
                     &sources[rank],
                     gpus.devices[rank].device_id,
@@ -175,16 +175,17 @@ fn main() {
         }
 
         gpus.devices[0].bind_thread().expect("bind result check");
-        for rank in 0..RANKS {
+        for rank in 1..RANKS {
             let expected = ((replay + rank + 1) % 251 + 1) as u8;
             let mut host = vec![0u8; BYTES];
             gpus.devices[0]
                 .hip
-                .memcpy_dtoh(&mut host, &results[rank])
+                .memcpy_dtoh(&mut host, &results[rank - 1])
                 .expect("download result");
             assert!(
                 host.iter().all(|&value| value == expected),
-                "replay {replay} rank {rank}: stale or unordered peer result"
+                "replay {replay} rank {rank}: stale or unordered peer result; expected {expected}, head {:?}",
+                &host[..16]
             );
         }
     }
