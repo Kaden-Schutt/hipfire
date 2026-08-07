@@ -131,6 +131,53 @@ requires both the ownership revision and elimination or overlap of nearly all
 host, launch, and transport residual. T2 cannot come from residency alone; it
 requires reducing the 15.3657 ms serial gfx1100 tier as H3/H6 already specify.
 
+### 4.1 Rate-matched candidate and route-count distribution
+
+At the provisional 2.184x ratio, 2,025 ranked slots (14,332,755,600 bytes)
+produce 63.615194% decode coverage, within 0.031 percentage points of the
+calculated 63.5848% branch balance. The decode-side local-slot histogram is:
+
+```text
+hot slots       0     1     2     3     4     5     6
+occurrences   369  1102  2341  4381  6185  5368  2227
+records                                           21,973
+mean local slots                                    3.816912
+```
+
+The complementary gfx1151 histogram is the same row reversed. This is the
+shape distribution the exact-native micro must occurrence-weight. Measuring
+only top-k 6 would overstate both branches and is not an admission result.
+
+The 2,025-slot plan is provisional. The measured gfx1100/gfx1151 MQ2 ratio
+selects the final hot fraction and therefore the final budget; the loader must
+not hard-code this prompt-derived set as a universal registry asset.
+
+### 4.2 Exact-gfx1100 routed-down candidate prepared
+
+Source inspection found that gate/up is already the K4+LDS implementation
+explicitly ported from the gfx1100 MQ3 pattern. Deterministic routed-down still
+loads and converts all four FP16 codebook entries redundantly in every lane.
+An exact-gfx1100-only micro candidate now loads each K4 codebook cooperatively
+into 64 bytes of LDS while preserving index loads, K4 accumulator assignment,
+FMA expression order, wave reduction, and expanded result layout.
+
+Offline ROCm compilation for gfx1100 gives:
+
+| Resource | Incumbent down | LDS candidate |
+|---|---:|---:|
+| VGPR | 93 | 73 |
+| SGPR | 37 | 20 |
+| fixed LDS | 0 B | 64 B |
+| spills | 0 | 0 |
+| wavefront | 32 | 32 |
+| disassembled instructions | 685 | 517 |
+| compiler-reported waves/EU | 16 | 16 |
+
+The candidate therefore does not buy its shorter instruction path by reducing
+occupancy or spilling. This is still only an ISA/resource mechanism check. It
+does not become product dispatch unless the fresh-device micro proves raw-bit
+identity and an occurrence-weighted projection of at least 2% end to end.
+
 ## 5. Exactness contract
 
 Splitting the six selected experts into two owner-local aggregates would change
@@ -191,9 +238,13 @@ publication remains the admitted control structure.
 
 1. Collect or recover multi-genre 2,048+decode route dumps and cross-validate a
    static or prefill-derived plan. No GPU is needed if dumps already exist.
-2. In a fresh GPU session, micro-screen the exact DS4 MQ2-Lloyd gate/up and down
-   shapes on gfx1100. Measure the in-model shape distribution, raw-bit parity,
-   resource contract, and ratio against gfx1151.
+2. In a fresh GPU session, run
+   `bench_ds4_mq2lloyd_decode_gfx1100` with the preserved 0–6 decode histogram.
+   It resolves a portable device selector to a live PCI identity, rejects any
+   target other than exact gfx1100, checks the routed-down candidate raw-bit
+   exact at every local top-k 1 through 6, and occurrence-weights gate/up plus
+   down. Then measure the unchanged exact gfx1151 family under the complementary
+   histogram to establish the real architecture ratio.
 3. Select the branch-balanced hot fraction from the measured ratio; do not fill
    VRAM by default.
 4. Implement artifact-local subset upload behind the typed plan. Preserve the

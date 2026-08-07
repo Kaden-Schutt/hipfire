@@ -1791,6 +1791,32 @@ impl HipRuntime {
         self.check(code, "hipDeviceSynchronize")
     }
 
+    /// Get the user-facing GPU name from `hipDeviceProp_t::name`.
+    ///
+    /// This is discovery metadata only. Callers that choose a device by name
+    /// must still pin the unique match to its PCI identity before allocation or
+    /// dispatch because HIP ordinals can change across visibility filters,
+    /// reboot, and hotplug.
+    pub fn device_name(&self, device_id: i32) -> HipResult<String> {
+        let mut properties = vec![0_u8; 1024];
+        let code =
+            unsafe { (self.fn_get_device_properties)(properties.as_mut_ptr(), device_id as c_int) };
+        self.check(code, "hipGetDeviceProperties")?;
+        // hipDeviceProp_t begins with char name[256] on the supported HIP ABI.
+        let name = &properties[..256];
+        let end = name
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(name.len());
+        if end == 0 {
+            return Err(HipError::new(
+                0,
+                "hipDeviceProp_t returned an empty device name",
+            ));
+        }
+        Ok(String::from_utf8_lossy(&name[..end]).into_owned())
+    }
+
     /// Get GPU architecture string (e.g., "gfx1010", "gfx1030", "gfx1100").
     /// Allocates a large buffer for hipDeviceProp_t, reads gcnArchName from offset 0.
     pub fn get_arch(&self, device_id: i32) -> HipResult<String> {

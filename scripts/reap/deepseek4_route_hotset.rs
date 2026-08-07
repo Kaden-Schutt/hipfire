@@ -4,6 +4,7 @@
 //! Rank DeepSeek4 `(layer, expert)` residency slots by observed route count.
 //! This is a CPU-only capacity planner for preserved `DS4RTR01` dumps.
 
+use std::collections::BTreeSet;
 use std::convert::{TryFrom, TryInto};
 use std::path::PathBuf;
 
@@ -69,6 +70,70 @@ fn parse_counts_range(
 fn parse_counts(bytes: &[u8]) -> Result<(Vec<u64>, u64, usize), String> {
     let (counts, members, selected_records, _) = parse_counts_range(bytes, 0, None)?;
     Ok((counts, members, selected_records))
+}
+
+fn hot_count_histogram_range(
+    bytes: &[u8],
+    start_record: usize,
+    end_record: usize,
+    selected: &BTreeSet<usize>,
+) -> Result<Vec<u64>, String> {
+    if bytes.get(..8) != Some(b"DS4RTR01") {
+        return Err("bad DS4 route magic".to_owned());
+    }
+    let mut histogram = Vec::<u64>::new();
+    let mut offset = 8_usize;
+    let mut record = 0_usize;
+    while offset < bytes.len() {
+        let layer = read_u32(bytes, &mut offset)? as usize;
+        let k = read_u32(bytes, &mut offset)? as usize;
+        if layer >= LAYERS {
+            return Err(format!("route layer {layer} is outside 0..{LAYERS}"));
+        }
+        let mut hot = 0_usize;
+        for _ in 0..k {
+            let expert = read_u32(bytes, &mut offset)? as usize;
+            if expert >= EXPERTS {
+                return Err(format!("route expert {expert} is outside 0..{EXPERTS}"));
+            }
+            hot += usize::from(selected.contains(&(layer * EXPERTS + expert)));
+        }
+        for _ in 0..k {
+            let _ = read_u32(bytes, &mut offset)?;
+        }
+        if record >= start_record && record < end_record {
+            if histogram.len() <= hot {
+                histogram.resize(hot + 1, 0);
+            }
+            histogram[hot] += 1;
+        }
+        record += 1;
+    }
+    if end_record > record {
+        return Err(format!(
+            "histogram range ends at record {end_record}, dump has {record}"
+        ));
+    }
+    Ok(histogram)
+}
+
+fn print_hot_count_histogram(label: &str, histogram: &[u64]) {
+    let records = histogram.iter().sum::<u64>();
+    let members = histogram
+        .iter()
+        .enumerate()
+        .map(|(hot, count)| hot as u64 * count)
+        .sum::<u64>();
+    let encoded = histogram
+        .iter()
+        .enumerate()
+        .map(|(hot, count)| format!("{hot}:{count}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    println!(
+        "{label}_hot_count_histogram={encoded} records={records} mean_hot_slots={:.6}",
+        members as f64 / records.max(1) as f64
+    );
 }
 
 fn rank(counts: Vec<u64>) -> Vec<(u64, usize, usize)> {
@@ -208,7 +273,7 @@ fn main() -> Result<(), String> {
             let selected = ranked[..slots]
                 .iter()
                 .map(|(_, layer, expert)| layer * EXPERTS + expert)
-                .collect::<std::collections::BTreeSet<_>>();
+                .collect::<BTreeSet<_>>();
             let eval_covered = eval_counts
                 .iter()
                 .enumerate()
@@ -221,6 +286,11 @@ fn main() -> Result<(), String> {
                 coverage(&ranked, slots, train_members),
                 100.0 * eval_covered as f64 / eval_members.max(1) as f64,
             );
+            let train_histogram = hot_count_histogram_range(&sample, 0, train_records, &selected)?;
+            let eval_histogram =
+                hot_count_histogram_range(&sample, train_records, records, &selected)?;
+            print_hot_count_histogram("train", &train_histogram);
+            print_hot_count_histogram("eval", &eval_histogram);
             (ranked, train_members, "train")
         }
         _ => return Err("--train-tokens and --eval-tokens must be supplied together".to_owned()),

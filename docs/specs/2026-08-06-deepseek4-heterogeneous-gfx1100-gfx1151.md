@@ -362,7 +362,29 @@ router-selected expert order, gate/up/down kernels, and route scaling from the
 single-device MQ2R path. Only the input/output transport and state ownership
 change.
 
-### 9.3 No hidden global route state
+The complete routed-expert tier remains resident on gfx1151 even when a later
+rate-matched replica set is admitted on gfx1100. The gfx1100 set is a cache of
+whole `(layer, expert)` triples (`w1`, `w2`, `w3`), never a shard that makes
+the canonical gfx1151 route incomplete.
+
+### 9.3 Rate-matched hot-expert replicas
+
+After the full non-routed tier is resident, remaining gfx1100 capacity may hold
+a ranked set of complete routed-expert triples. Selection is learned from
+prefill routes and evaluated on subsequent decode routes. Capacity is an upper
+bound, not the objective: the selected fraction must equalize the measured
+gfx1100 local branch and gfx1151 remote branch. Filling all free memory after
+that point lengthens the critical path and is forbidden.
+
+Each of the six canonical route positions has exactly one owner per layer.
+Both devices produce separate F32 rows for the positions they own. The
+`DS4HARM3` join consumes positions 0 through 5 in original order with the
+original raw-bit route weight at the original fused multiply-add point. Owner
+masks must reject overlap, gaps, and unknown bits; stale unowned result rows
+are ignored. No owner may return an early aggregate whose floating-point
+association differs from single-device `moe_down_combine_k8_batched`.
+
+### 9.4 No hidden global route state
 
 Backend selection is carried by the owning weight/state type. Loading this
 route cannot change process-global behavior for Qwen, MiniMax, another DS4
@@ -423,6 +445,21 @@ spec.
 
 Run direct-HIP AR only. Do not add PM4 or speculation while ownership and
 ordering are still changing.
+
+### H2.1 — Rate-matched routed-expert residency
+
+Micro-screen the exact DS4 MQ2-Lloyd gate/up and deterministic expanded-down
+families on gfx1100 and gfx1151 over the observed 0–6 local-slot distribution.
+Every candidate must be raw-bit exact and must retain its architecture-local
+resource contract. Use the measured architecture ratio to select a
+branch-balanced whole-slot budget, then upload only those complete triples to
+gfx1100 behind a typed, stable residency identity. Keep the full expert tier on
+gfx1151 and fail before publication on any dtype, extent, capacity, or pointer
+ownership mismatch.
+
+Implement the `DS4HARM3` per-route-slot result contract and CPU exact-order
+oracle before any two-device product run. Product validation remains gated on
+a combined projection of at least 2%; a single-shape kernel win is not enough.
 
 ### H3 — Batched prefill
 
