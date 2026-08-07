@@ -293,6 +293,41 @@ Evidence is under:
 
 `hipx:/home/kaden/ds4-gfx1151-evidence/2026-08-07-harmonic-h4-packed-transport/`
 
+### 4.6 DS4HARM3 product integration
+
+Commits `b6440037d`, `1bff4f5df`, and `14f116afa` instantiate the typed
+hotset route in the product-shaped parent/worker path. The frozen manifest is
+`benchmarks/routes/ds4_0731_harmonic_hotset_1400.ds4hot`, SHA-256
+`af643539ff01acf706a14073dc4898c058bc1b8d241279b3cff7719151eca7b5`.
+It accounts for each selected expert's exact w1/w2/w3 payload plus its two
+owner-local pointer-table entries; the first bounded load caught and fixed the
+otherwise-hidden 16-byte-per-slot distinction before any kernel dispatch.
+
+The two-token gate matched the preserved canonical output prefix byte for
+byte. The 128-token gate matched all 592 decoded bytes of the canonical
+512-token output prefix. The full product gate then produced:
+
+| Fixture | top-k | Samples | Decode | Layer wall | Expert wait | Exactness |
+|---|---:|---:|---:|---:|---:|---|
+| 2,048 prompt / 512 generated, greedy | 6 | 1 fresh process | **31.5721 tok/s** | 30.9810 ms/token | 7.7294 ms/token | 2,491 bytes, MD5 `ee05ab4f07393fb7d624d966a7dde4af`, byte-identical |
+
+This is **+13.94%** over the accepted DS4HARM2 harmonic product at 27.7100
+tok/s. It is an accepted intermediate product win, not completion of the
+50 tok/s goal and not a repeated publication sample. Device identities were
+resolved at runtime to exact gfx1100 and gfx1151 owners; no PCI address is
+encoded in the route.
+
+The micro projection did not fully translate. Measured layer wall is 30.9810
+ms/token versus the 19.8086 ms/token device-useful projection, leaving an
+**11.1724 ms/token unclassified product residual**. The resident split did
+reduce expert wait from 12.5167 to 7.7294 ms/token, but the remaining residual
+must be stage-profiled in the product path before another kernel or scheduling
+lever is ranked. Unknown is not zero.
+
+Product evidence is under:
+
+`hipx:/home/kaden/ds4-gfx1151-evidence/2026-08-07-harmonic-h4-hotset-product/`
+
 ## 5. Exactness contract
 
 Splitting the six selected experts into two owner-local aggregates would change
@@ -353,17 +388,12 @@ publication remains the admitted control structure.
 
 1. Collect or recover multi-genre 2,048+decode route dumps and cross-validate a
    static or prefill-derived plan. No GPU is needed if dumps already exist.
-2. Implement the selected 1,400-slot artifact-local subset upload behind the
-   typed plan. Preserve the
-   complete gfx1151 residency and fail before allocation on any projection
-   mismatch.
-3. Implement packed per-route-slot result packets and use the accepted exact
-   GPU split-combine before
-   any two-device product run.
-4. Revisit the banked E8 prefetch only after the new branch balance predicts it
+2. Stage-profile the accepted DS4HARM3 product path and classify the 11.1724
+   ms/token gap between occurrence-weighted device work and layer wall.
+3. Revisit the banked E8 prefetch only after the new branch balance predicts it
    can reduce the maximum branch or serial path.
-5. Run the two-token, 128-token, then canonical 2,048/512 correctness and
-   product gates only after the combined projection exceeds 2%.
+4. Admit only a candidate that projects at least another 2% end to end; repeat
+   the two-token, 128-token, and canonical 2,048/512 exactness sequence.
 
-No GPU product number, promotion sample, or T1 claim was produced in this
-checkpoint.
+The one-sample 31.5721 tok/s result is a measured intermediate, not a repeated
+promotion or publication number. T1 remains open.
