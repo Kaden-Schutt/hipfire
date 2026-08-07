@@ -4101,6 +4101,39 @@ impl Gpu {
             "gemv_mfp4g32_e8_soa requires K%256==0, got K={k}"
         );
 
+        if self.arch_caps.arch() == "gfx1201" {
+            const KERNEL: &str = "gemv_mfp4g32_e8_soa_gfx1201";
+            self.ensure_kernel(KERNEL, kernels::GEMV_MFP4G32_E8_SOA_GFX1201_SRC, KERNEL)?;
+            let a_ptr = a_raw.buf.as_ptr();
+            let x_ptr = x.buf.as_ptr();
+            let y_ptr = y.buf.as_ptr();
+            let m_val = m as i32;
+            let k_val = k as i32;
+            let mut params: Vec<*mut c_void> = vec![
+                &a_ptr as *const _ as *mut c_void,
+                &x_ptr as *const _ as *mut c_void,
+                &y_ptr as *const _ as *mut c_void,
+                &m_val as *const _ as *mut c_void,
+                &k_val as *const _ as *mut c_void,
+            ];
+            return self.launch_maybe_blob(
+                KERNEL,
+                [m as u32, 1, 1],
+                [32, 1, 1],
+                0,
+                &mut params,
+                || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(a_ptr);
+                    b.push_ptr(x_ptr);
+                    b.push_ptr(y_ptr);
+                    b.push_i32(m_val);
+                    b.push_i32(k_val);
+                    b
+                },
+            );
+        }
+
         if self.arch_caps.is_gfx942() {
             const KERNEL: &str = "gemv_mfp4g32_e8_soa_gfx942";
             self.ensure_kernel(KERNEL, kernels::GEMV_MFP4G32_E8_SOA_GFX942_SRC, KERNEL)?;

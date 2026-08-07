@@ -1131,6 +1131,10 @@ pub const GEMV_MFP4G32_E8_GFX1151_SRC: &str =
 /// Reads the SoA layout (flag=0x06); bit-exact output vs AoS.
 pub const GEMV_MFP4G32_E8_SOA_SRC: &str =
     include_str!("../../../kernels/src/gemv_mfp4g32_e8_soa.hip");
+/// Exact-gfx1201 E8 SoA GEMV with value-identical branchless lattice decode.
+/// No adjacent architecture selects this source.
+pub const GEMV_MFP4G32_E8_SOA_GFX1201_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mfp4g32_e8_soa.gfx1201.hip");
 /// gfx1151-specific mfp4-E8 SoA GEMV — fully-coalesced 128B codeword reads.
 /// ONLY dispatched on gfx1151 (Strix Halo); other archs use GEMV_MFP4G32_E8_SOA_SRC.
 pub const GEMV_MFP4G32_E8_SOA_GFX1151_SRC: &str =
@@ -5691,6 +5695,116 @@ pub const GEMV_MQ2G256_LLOYD_MOE_DOWN_EXPANDED_K4_SRC: &str =
 /// ParoQuant Givens rotation: apply learned pairwise rotations + channel scaling
 /// to activations in-place. Called before each ParoQ4G128 GEMV.
 pub const GIVENS_ROTATE_SRC: &str = include_str!("../../../kernels/src/givens_rotate.hip");
+
+/// Host-side value-identity proof for the gfx1201 E8 decode rewrite.  These
+/// helpers feed a byte-exact decode route, so close numerical agreement is not
+/// sufficient: every produced coordinate and block scale must have identical
+/// bits to the generic implementation.
+#[cfg(test)]
+mod gfx1201_e8_decode_identity {
+    fn generic_cvt_e4m3(b: u8) -> f32 {
+        let exp = ((b >> 3) & 0xF) as i32;
+        let mant = (b & 0x7) as u32;
+        if exp == 0 {
+            return 0.015625 * (mant as f32) * 0.125;
+        }
+        if exp == 0xF && mant == 7 {
+            return 448.0;
+        }
+        f32::from_bits(((exp + 120) as u32) << 23) * (1.0 + (mant as f32) * 0.125)
+    }
+
+    fn gfx1201_cvt_e4m3(b: u8) -> f32 {
+        let u0 = (b as u32) & 0x7F;
+        let u = u0.min(126);
+        let normal = f32::from_bits((u + 960) << 20);
+        let sub = (u as f32) * 0.001953125;
+        if u < 8 {
+            sub
+        } else {
+            normal
+        }
+    }
+
+    fn generic_decode(idx: u32) -> [f32; 8] {
+        let coset = (idx >> 31) & 1;
+        let mut e = [0u32; 8];
+        let mut sum = 0u32;
+        for (i, slot) in e.iter_mut().take(7).enumerate() {
+            *slot = (idx >> (4 * i as u32)) & 0xF;
+            sum = sum.wrapping_add(*slot);
+        }
+        let p7 = ((idx >> 28) & 0x7) << 1;
+        e[7] = p7 | (sum.wrapping_add(p7) & 1);
+        let mut out = [0.0; 8];
+        for i in 0..8 {
+            let c = (e[i] as i32 - 7) as f32;
+            out[i] = if coset != 0 { c + 0.5 } else { c };
+        }
+        out
+    }
+
+    fn gfx1201_decode(idx: u32) -> [f32; 8] {
+        let lo = (idx & 0x0F0F_0F0F).to_le_bytes();
+        let hi = ((idx >> 4) & 0x0F0F_0F0F).to_le_bytes();
+        let e7 = ((idx >> 27) & 14) | ((idx & 0x0111_1111).count_ones() & 1);
+        let off = if idx & 0x8000_0000 != 0 { -6.5 } else { -7.0 };
+        [
+            lo[0] as f32 + off,
+            hi[0] as f32 + off,
+            lo[1] as f32 + off,
+            hi[1] as f32 + off,
+            lo[2] as f32 + off,
+            hi[2] as f32 + off,
+            lo[3] as f32 + off,
+            e7 as f32 + off,
+        ]
+    }
+
+    #[test]
+    fn block_scale_is_value_identical() {
+        for b in 0u16..=255 {
+            assert_eq!(
+                generic_cvt_e4m3(b as u8).to_bits(),
+                gfx1201_cvt_e4m3(b as u8).to_bits(),
+                "E4M3 scale byte 0x{b:02x}"
+            );
+        }
+    }
+
+    #[test]
+    fn lattice_coordinates_are_value_identical() {
+        let mut cases = Vec::new();
+        for top in 0u32..16 {
+            for i in 0..7u32 {
+                for v in 0u32..16 {
+                    cases.push((top << 28) | (v << (4 * i)));
+                }
+            }
+            cases.extend([
+                top << 28,
+                (top << 28) | 0x0FFF_FFFF,
+                (top << 28) | 0x0111_1111,
+            ]);
+        }
+        let mut state = 0x1234_5678u32;
+        for _ in 0..200_000 {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            cases.push(state);
+        }
+        for idx in cases {
+            let generic = generic_decode(idx);
+            let candidate = gfx1201_decode(idx);
+            for coord in 0..8 {
+                assert_eq!(
+                    generic[coord].to_bits(),
+                    candidate[coord].to_bits(),
+                    "E8 codeword 0x{idx:08x} coordinate {coord}"
+                );
+            }
+        }
+    }
+}
 
 #[cfg(test)]
 mod dispatch_tests {
