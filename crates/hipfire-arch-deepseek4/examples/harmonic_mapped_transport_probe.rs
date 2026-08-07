@@ -25,41 +25,71 @@ fn payload(len: usize, salt: u8) -> Vec<u8> {
         .collect()
 }
 
+fn resolve_device(selector: &str) -> Result<(i32, String, String, String), String> {
+    let hip = HipRuntime::load().map_err(|error| format!("HIP discovery: {error:?}"))?;
+    let count = hip
+        .device_count()
+        .map_err(|error| format!("HIP device count: {error:?}"))?;
+    let mut matches = Vec::new();
+    for device_id in 0..count {
+        let arch = hip
+            .get_arch(device_id)
+            .map_err(|error| format!("HIP device {device_id} arch: {error:?}"))?;
+        let name = hip
+            .device_name(device_id)
+            .map_err(|error| format!("HIP device {device_id} name: {error:?}"))?;
+        let pci = hip
+            .device_pci_bus_id(device_id)
+            .map_err(|error| format!("HIP device {device_id} PCI identity: {error:?}"))?;
+        let selected = selector
+            .strip_prefix("arch:")
+            .is_some_and(|expected| arch.eq_ignore_ascii_case(expected))
+            || selector.strip_prefix("name:").is_some_and(|needle| {
+                name.to_ascii_lowercase()
+                    .contains(&needle.to_ascii_lowercase())
+            })
+            || selector
+                .strip_prefix("pci:")
+                .is_some_and(|expected| pci.eq_ignore_ascii_case(expected));
+        if selected {
+            matches.push((device_id, pci, arch, name));
+        }
+    }
+    let [(device_id, pci, arch, name)] = matches.as_slice() else {
+        return Err(format!(
+            "selector {selector:?} matched {} visible devices; use a unique arch:, name:, or pci: selector",
+            matches.len()
+        ));
+    };
+    let pinned = hip
+        .device_by_pci_bus_id(pci)
+        .map_err(|error| format!("HIP pin {pci}: {error:?}"))?;
+    if pinned != *device_id {
+        return Err(format!(
+            "selector {selector:?} changed ordinal during PCI pin: discovered {device_id}, resolved {pinned} at {pci}"
+        ));
+    }
+    Ok((*device_id, pci.clone(), arch.clone(), name.clone()))
+}
+
 fn main() {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
-    let (pci_bus_id, expected_arch) = match args.as_slice() {
-        [pci_flag, pci, arch_flag, arch]
-            if pci_flag == "--pci" && arch_flag == "--expected-arch" =>
-        {
-            (pci, arch)
-        }
-        _ => panic!(
-            "usage: harmonic_mapped_transport_probe --pci <domain:bus:device.function> --expected-arch <gfx target>"
-        ),
+    let selector = match args.as_slice() {
+        [device_flag, selector] if device_flag == "--device" => selector,
+        _ => panic!("usage: harmonic_mapped_transport_probe --device arch:GFX|name:TEXT|pci:BDF"),
     };
-    let discovery = HipRuntime::load().expect("load HIP for exact PCI discovery");
-    let device_id = discovery
-        .device_by_pci_bus_id(&pci_bus_id)
-        .expect("resolve exact PCI device");
-    let normalized_pci = discovery
-        .device_pci_bus_id(device_id)
-        .expect("read resolved PCI identity");
-    assert_eq!(
-        normalized_pci.to_ascii_lowercase(),
-        pci_bus_id.to_ascii_lowercase(),
-        "HIP resolved a different physical device"
-    );
-    drop(discovery);
+    let (device_id, normalized_pci, expected_arch, marketing_name) =
+        resolve_device(selector).expect("resolve portable selector to exact PCI device");
 
     let gpu = Gpu::init_with_device(device_id).expect("initialize exact PCI probe GPU");
     assert_eq!(
         gpu.arch.to_ascii_lowercase(),
-        expected_arch.to_ascii_lowercase(),
+        expected_arch,
         "exact PCI device has an unexpected architecture"
     );
     println!(
-        "harmonic mapped transport probe: pci={} arch={} device={}",
-        normalized_pci, gpu.arch, gpu.device_id
+        "harmonic mapped transport probe: selector={} pci={} arch={} name={:?} device={}",
+        selector, normalized_pci, gpu.arch, marketing_name, gpu.device_id
     );
 
     let root = PathBuf::from("target").join(format!(
