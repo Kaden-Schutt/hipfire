@@ -347,6 +347,62 @@ fn time_gate(
     started.elapsed().as_secs_f64() * 1.0e6 / TRIALS as f64
 }
 
+fn time_activation(
+    gpu: &mut Gpu,
+    gate: &GpuTensor,
+    up: &GpuTensor,
+    activation: &GpuTensor,
+    k_top: usize,
+) -> f64 {
+    for _ in 0..WARMUP {
+        gpu.deepseek4_silu_mul_clamp_f32_batched(gate, up, activation, DOWN_K, k_top, 10.0)
+            .unwrap();
+    }
+    gpu.hip.device_synchronize().unwrap();
+    let started = Instant::now();
+    for _ in 0..TRIALS {
+        gpu.deepseek4_silu_mul_clamp_f32_batched(gate, up, activation, DOWN_K, k_top, 10.0)
+            .unwrap();
+    }
+    gpu.hip.device_synchronize().unwrap();
+    started.elapsed().as_secs_f64() * 1.0e6 / TRIALS as f64
+}
+
+fn time_rotation(gpu: &mut Gpu, activation: &GpuTensor, rotation: &GpuTensor, k_top: usize) -> f64 {
+    for _ in 0..WARMUP {
+        gpu.rotate_x_mq_batched(activation, rotation, DOWN_K, k_top)
+            .unwrap();
+    }
+    gpu.hip.device_synchronize().unwrap();
+    let started = Instant::now();
+    for _ in 0..TRIALS {
+        gpu.rotate_x_mq_batched(activation, rotation, DOWN_K, k_top)
+            .unwrap();
+    }
+    gpu.hip.device_synchronize().unwrap();
+    started.elapsed().as_secs_f64() * 1.0e6 / TRIALS as f64
+}
+
+fn time_combine(
+    gpu: &mut Gpu,
+    down_expanded: &GpuTensor,
+    topk_weights: &GpuTensor,
+    output: &GpuTensor,
+) -> f64 {
+    for _ in 0..WARMUP {
+        gpu.moe_down_combine_k8_batched(down_expanded, topk_weights, output, DOWN_M, TOP_K, 1)
+            .unwrap();
+    }
+    gpu.hip.device_synchronize().unwrap();
+    let started = Instant::now();
+    for _ in 0..TRIALS {
+        gpu.moe_down_combine_k8_batched(down_expanded, topk_weights, output, DOWN_M, TOP_K, 1)
+            .unwrap();
+    }
+    gpu.hip.device_synchronize().unwrap();
+    started.elapsed().as_secs_f64() * 1.0e6 / TRIALS as f64
+}
+
 fn median(values: &mut [f64]) -> f64 {
     values.sort_by(f64::total_cmp);
     let mid = values.len() / 2;
@@ -458,6 +514,16 @@ fn main() -> Result<(), String> {
     gpu.hip
         .memcpy_htod(&down_x_gpu, &down_x_bytes)
         .map_err(|e| format!("down x upload: {e:?}"))?;
+    let topk_weight_bytes = (0..TOP_K)
+        .flat_map(|rank| ((rank + 1) as f32 / 21.0).to_le_bytes())
+        .collect::<Vec<_>>();
+    let topk_weights_gpu = gpu
+        .hip
+        .malloc(topk_weight_bytes.len())
+        .map_err(|e| format!("top-k weights alloc: {e:?}"))?;
+    gpu.hip
+        .memcpy_htod(&topk_weights_gpu, &topk_weight_bytes)
+        .map_err(|e| format!("top-k weights upload: {e:?}"))?;
 
     let gate_output_bytes = TOP_K * (GATE_M / 2) * 4;
     let down_output_bytes = TOP_K * DOWN_M * 4;
@@ -477,6 +543,18 @@ fn main() -> Result<(), String> {
         .hip
         .malloc(down_output_bytes)
         .map_err(|e| format!("down candidate alloc: {e:?}"))?;
+    let activation_gpu = gpu
+        .hip
+        .malloc(TOP_K * DOWN_K * 4)
+        .map_err(|e| format!("activation output alloc: {e:?}"))?;
+    let rotation_gpu = gpu
+        .hip
+        .malloc(TOP_K * DOWN_K * 4)
+        .map_err(|e| format!("rotation output alloc: {e:?}"))?;
+    let combine_gpu = gpu
+        .hip
+        .malloc(DOWN_M * 4)
+        .map_err(|e| format!("combine output alloc: {e:?}"))?;
 
     let gate_ptrs = tensor_alias(
         gate_ptrs_gpu.as_ptr(),
@@ -508,6 +586,12 @@ fn main() -> Result<(), String> {
         vec![TOP_K, DOWN_K],
         DType::F32,
     );
+    let topk_weights = tensor_alias(
+        topk_weights_gpu.as_ptr(),
+        topk_weight_bytes.len(),
+        vec![TOP_K],
+        DType::F32,
+    );
     let gate = tensor_alias(
         gate_gpu.as_ptr(),
         gate_output_bytes,
@@ -532,8 +616,23 @@ fn main() -> Result<(), String> {
         vec![TOP_K, DOWN_M],
         DType::F32,
     );
+    let activation = tensor_alias(
+        activation_gpu.as_ptr(),
+        TOP_K * DOWN_K * 4,
+        vec![TOP_K, DOWN_K],
+        DType::F32,
+    );
+    let rotation = tensor_alias(
+        rotation_gpu.as_ptr(),
+        TOP_K * DOWN_K * 4,
+        vec![TOP_K, DOWN_K],
+        DType::F32,
+    );
+    let combine = tensor_alias(combine_gpu.as_ptr(), DOWN_M * 4, vec![DOWN_M], DType::F32);
 
     let mut gate_us = [0.0_f64; TOP_K + 1];
+    let mut activation_us = [0.0_f64; TOP_K + 1];
+    let mut rotation_us = [0.0_f64; TOP_K + 1];
     let mut down_base_us = [0.0_f64; TOP_K + 1];
     let mut down_candidate_us = [f64::NAN; TOP_K + 1];
     for k_top in 1..=TOP_K {
@@ -577,6 +676,8 @@ fn main() -> Result<(), String> {
         }
 
         gate_us[k_top] = time_gate(&mut gpu, &gate_ptrs, &indices, &gate_x, &gate, &up, k_top);
+        activation_us[k_top] = time_activation(&mut gpu, &gate, &up, &activation, k_top);
+        rotation_us[k_top] = time_rotation(&mut gpu, &activation, &rotation, k_top);
         let order: &[bool] = if candidate_supported {
             &[false, true, true, false]
         } else {
@@ -608,19 +709,29 @@ fn main() -> Result<(), String> {
         if candidate_supported {
             down_candidate_us[k_top] = median(&mut candidate_rows);
             println!(
-                "shape k_top={k_top} gate_us={:.3} down_baseline_us={:.3} down_candidate_us={:.3} down_speedup={:.6} bit_mismatch=0",
+                "shape k_top={k_top} gate_us={:.3} activation_us={:.3} rotation_us={:.3} down_baseline_us={:.3} down_candidate_us={:.3} down_speedup={:.6} bit_mismatch=0",
                 gate_us[k_top],
+                activation_us[k_top],
+                rotation_us[k_top],
                 down_base_us[k_top],
                 down_candidate_us[k_top],
                 down_base_us[k_top] / down_candidate_us[k_top]
             );
         } else {
             println!(
-                "shape k_top={k_top} gate_us={:.3} down_baseline_us={:.3} samples=4",
-                gate_us[k_top], down_base_us[k_top]
+                "shape k_top={k_top} gate_us={:.3} activation_us={:.3} rotation_us={:.3} down_baseline_us={:.3} samples=4",
+                gate_us[k_top], activation_us[k_top], rotation_us[k_top], down_base_us[k_top]
             );
         }
     }
+
+    let combine_source = if candidate_supported {
+        &down_candidate
+    } else {
+        &down_base
+    };
+    let combine_us = time_combine(&mut gpu, combine_source, &topk_weights, &combine);
+    println!("fixed combine_k6_us={combine_us:.3}");
 
     if let Some(histogram) = args.histogram {
         let records = histogram.iter().sum::<u64>() as f64;
@@ -633,6 +744,8 @@ fn main() -> Result<(), String> {
                 / records
         };
         let weighted_gate = weighted(&gate_us);
+        let weighted_activation = weighted(&activation_us);
+        let weighted_rotation = weighted(&rotation_us);
         let weighted_down_base = weighted(&down_base_us);
         if candidate_supported {
             // A zero-local-slot occurrence launches neither projection; replace
@@ -640,16 +753,20 @@ fn main() -> Result<(), String> {
             down_candidate_us[0] = 0.0;
             let weighted_down_candidate = weighted(&down_candidate_us);
             println!(
-                "weighted records={} gate_us={weighted_gate:.3} down_baseline_us={weighted_down_base:.3} down_candidate_us={weighted_down_candidate:.3} down_speedup={:.6} projection_speedup={:.6}",
+                "weighted records={} gate_us={weighted_gate:.3} activation_us={weighted_activation:.3} rotation_us={weighted_rotation:.3} down_baseline_us={weighted_down_base:.3} down_candidate_us={weighted_down_candidate:.3} combine_k6_us={combine_us:.3} down_speedup={:.6} branch_projection_speedup={:.6}",
                 records as u64,
                 weighted_down_base / weighted_down_candidate,
-                (weighted_gate + weighted_down_base) / (weighted_gate + weighted_down_candidate)
+                (weighted_gate + weighted_activation + weighted_rotation + weighted_down_base)
+                    / (weighted_gate
+                        + weighted_activation
+                        + weighted_rotation
+                        + weighted_down_candidate)
             );
         } else {
             println!(
-                "weighted records={} gate_us={weighted_gate:.3} down_baseline_us={weighted_down_base:.3} projection_us={:.3}",
+                "weighted records={} gate_us={weighted_gate:.3} activation_us={weighted_activation:.3} rotation_us={weighted_rotation:.3} down_baseline_us={weighted_down_base:.3} combine_k6_us={combine_us:.3} branch_projection_us={:.3}",
                 records as u64,
-                weighted_gate + weighted_down_base
+                weighted_gate + weighted_activation + weighted_rotation + weighted_down_base
             );
         }
     }
@@ -661,10 +778,14 @@ fn main() -> Result<(), String> {
         indices,
         gate_x,
         down_x,
+        topk_weights,
         gate,
         up,
         down_base,
         down_candidate,
+        activation,
+        rotation,
+        combine,
     ] {
         std::mem::forget(tensor);
     }
