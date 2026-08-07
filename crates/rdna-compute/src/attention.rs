@@ -2162,6 +2162,66 @@ impl Gpu {
             V_MODE_Q8,
             /*window=*/ 0,
             /*force_wmma_grid=*/ false,
+            None,
+            None,
+        )
+    }
+
+    /// Multi-slot Q8_0 tiled flash attention. `slot_descs` is `[n_slots]`
+    /// `KvSlotDesc`; `row_slot` is `[batch_size]` slot indices per query row.
+    /// Passing `None` for both is exactly the legacy single-sequence path
+    /// (identical to [`attention_flash_q8_0_batched_masked`]). This is the
+    /// long-context entry point: `attention_flash_q8_0_tile_batched` has no
+    /// LDS context cap, unlike the LDS kernel that degenerates above
+    /// `LDS_CTX_LIMIT`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_flash_q8_0_batched_masked_slots(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq: usize,
+        max_ctx_len: usize,
+        batch_size: usize,
+        partials: &GpuTensor,
+        tree_bias: Option<&GpuTensor>,
+        block_start: usize,
+        block_cols: usize,
+        slot_descs: Option<&GpuTensor>,
+        row_slot: Option<&GpuTensor>,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.launch_asym_flash_batched(
+            "attention_flash_q8_0_tile_batched",
+            kernels::ATTENTION_FLASH_Q8_0_TILE_BATCHED_SRC,
+            "attention_flash_q8_0_tile_batched",
+            q,
+            k_cache,
+            v_cache,
+            out,
+            positions,
+            q, // cos_theta dummy — kernel ignores
+            q, // sin_theta dummy — kernel ignores
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_seq,
+            max_ctx_len,
+            batch_size,
+            partials,
+            tree_bias,
+            block_start,
+            block_cols,
+            V_MODE_Q8,
+            /*window=*/ 0,
+            /*force_wmma_grid=*/ false,
+            slot_descs,
+            row_slot,
         )
     }
 
@@ -2215,6 +2275,8 @@ impl Gpu {
             V_MODE_Q8,
             window,
             /*force_wmma_grid=*/ false,
+            None,
+            None,
         )
     }
 
@@ -2541,15 +2603,35 @@ impl Gpu {
         if self.functions.contains_key(func_name) {
             return Ok(());
         }
+        // The runtime hipcc compile happens in a cache dir with no -I to
+        // kernels/src, so a literal #include of any of these headers does not
+        // resolve. Strip the directive and prepend the header body instead
+        // (same pattern the lazy ensure_kernel callers use for
+        // kv_slot_desc.h). kv_slot_desc.h is only stripped/prepended for
+        // kernels that actually #include it (currently just the q8 tile
+        // kernel — Task 5) so the other tile kernels' compiled source is
+        // untouched.
+        let needs_kv_slot_desc = body_src.contains("#include \"kv_slot_desc.h\"");
         let stripped = body_src
             .replace("#include \"turbo_common.h\"", "")
-            .replace("#include \"givens_common.h\"", "");
-        let full_src = format!(
-            "{}\n{}\n{}",
-            kernels::TURBO_COMMON_H,
-            kernels::GIVENS_COMMON_SRC,
-            stripped
-        );
+            .replace("#include \"givens_common.h\"", "")
+            .replace("#include \"kv_slot_desc.h\"", "");
+        let full_src = if needs_kv_slot_desc {
+            format!(
+                "{}\n{}\n{}\n{}",
+                kernels::TURBO_COMMON_H,
+                kernels::GIVENS_COMMON_SRC,
+                kernels::KV_SLOT_DESC_H,
+                stripped
+            )
+        } else {
+            format!(
+                "{}\n{}\n{}",
+                kernels::TURBO_COMMON_H,
+                kernels::GIVENS_COMMON_SRC,
+                stripped
+            )
+        };
         let obj_path = self.compiler.compile(name, &full_src)?;
         let obj_path_str = obj_path.to_str().unwrap().to_string();
         if !self.modules.contains_key(name) {
@@ -3530,6 +3612,18 @@ impl Gpu {
         // wrappers that already know their kernel is WMMA. Scalar callers
         // pass `false` (original behavior).
         force_wmma_grid: bool,
+        // `slot_descs`/`row_slot`: when both `Some`, `row_slot[row]` (GLOBAL
+        // row, i.e. batch_offset + blockIdx.z) selects the `KvSlotDesc` used
+        // to translate KV addresses and bound the causal window for that
+        // row, letting one launch serve several independent sequences with
+        // disjoint KV slabs. When either is `None` the tile kernel falls
+        // back to legacy single-arena addressing derived from
+        // `positions`/`max_seq`, byte-identical to the pre-SP1 kernel. Only
+        // the non-WMMA q8 tile kernel reads these today (see the assertion
+        // below); the asym/fwht/lloyd tile kernels declare fewer kernel args
+        // and never receive them.
+        slot_descs: Option<&GpuTensor>,
+        row_slot: Option<&GpuTensor>,
     ) -> HipResult<()> {
         const TILE_SIZE: usize = 128;
         const WMMA_BLOCK_M: usize = 16;
@@ -3571,6 +3665,12 @@ impl Gpu {
         // True when either the inline env-gated ladder fires (scalar→WMMA
         // upgrade) OR the dispatch path explicitly routes to a WMMA variant.
         let use_wmma_grid = wmma_ok || force_wmma_grid;
+        assert!(
+            !(use_wmma_grid && slot_descs.is_some()),
+            "multi-slot descriptors are not supported on the WMMA tile grid; \
+             the WMMA kernarg layout differs (omits v_mode_bits) and asym4-WMMA \
+             is out of SP1 scope"
+        );
         let (eff_tile_key, eff_tile_src, eff_tile_func): (
             &'static str,
             &'static str,
@@ -3626,6 +3726,14 @@ impl Gpu {
                 let bc = block_cols as i32;
                 let vm = v_mode_bits;
                 let wn = window;
+                let desc_ptr: *mut std::ffi::c_void = match slot_descs {
+                    Some(t) => t.buf.as_ptr(),
+                    None => std::ptr::null_mut(),
+                };
+                let row_slot_ptr: *mut std::ffi::c_void = match row_slot {
+                    Some(t) => t.buf.as_ptr(),
+                    None => std::ptr::null_mut(),
+                };
                 let mut params: Vec<*mut c_void> = vec![
                     &q_ptr as *const _ as *mut c_void,
                     &k_ptr as *const _ as *mut c_void,
@@ -3649,6 +3757,8 @@ impl Gpu {
                 if !use_wmma_grid {
                     params.push(&vm as *const _ as *mut c_void);
                     params.push(&wn as *const _ as *mut c_void);
+                    params.push(&desc_ptr as *const _ as *mut c_void);
+                    params.push(&row_slot_ptr as *const _ as *mut c_void);
                 }
                 let (grid, lds_bytes): ([u32; 3], u32) = if use_wmma_grid {
                     let m_tiles = (chunk + WMMA_BLOCK_M - 1) / WMMA_BLOCK_M;
@@ -3688,6 +3798,8 @@ impl Gpu {
                         if !use_wmma_grid {
                             b.push_i32(vm);
                             b.push_i32(wn);
+                            b.push_ptr(desc_ptr);
+                            b.push_ptr(row_slot_ptr);
                         }
                         b
                     },
@@ -4025,6 +4137,8 @@ impl Gpu {
             V_MODE_Q8,
             /*window=*/ 0,
             /*force_wmma_grid=*/ false,
+            None,
+            None,
         )
     }
 
@@ -4078,6 +4192,8 @@ impl Gpu {
             V_MODE_Q8,
             /*window=*/ 0,
             /*force_wmma_grid=*/ true,
+            None,
+            None,
         )
     }
 
@@ -4128,6 +4244,8 @@ impl Gpu {
             V_MODE_Q8,
             /*window=*/ 0,
             /*force_wmma_grid=*/ true,
+            None,
+            None,
         )
     }
 
@@ -4224,6 +4342,8 @@ impl Gpu {
             v_mode_bits,
             /*window=*/ 0,
             /*force_wmma_grid=*/ false,
+            None,
+            None,
         )
     }
 
@@ -4271,6 +4391,8 @@ impl Gpu {
             V_MODE_Q8,
             /*window=*/ 0,
             /*force_wmma_grid=*/ false,
+            None,
+            None,
         )
     }
 
@@ -4319,6 +4441,8 @@ impl Gpu {
             v_mode_bits,
             /*window=*/ 0,
             /*force_wmma_grid=*/ false,
+            None,
+            None,
         )
     }
 
@@ -4512,6 +4636,8 @@ impl Gpu {
             V_MODE_Q8,
             /*window=*/ 0,
             /*force_wmma_grid=*/ false,
+            None,
+            None,
         )
     }
 
@@ -4605,6 +4731,8 @@ impl Gpu {
             v_mode_bits,
             /*window=*/ 0,
             /*force_wmma_grid=*/ false,
+            None,
+            None,
         )
     }
 
