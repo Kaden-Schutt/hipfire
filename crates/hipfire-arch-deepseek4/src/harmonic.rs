@@ -29,6 +29,7 @@ pub const HARMONIC_RESULT_EXTENT: u32 = HARMONIC_X_ROT_BYTES as u32;
 pub const HARMONIC_HOTSET_ROUTE_IDENTITY: u64 = 0x4453_3448_4152_4d33; // DS4HARM3
 pub const HARMONIC_ROUTE_SLOT_RESULT_BYTES: usize = HARMONIC_X_ROT_BYTES;
 pub const HARMONIC_SPLIT_RESULT_EXTENT: usize = HARMONIC_TOP_K * HARMONIC_ROUTE_SLOT_RESULT_BYTES;
+pub const HARMONIC_REMOTE_SOURCE_BIT: u32 = 1_u32 << 31;
 pub const DS4_MQ2R_0731_IDENTITY: [u8; 32] = [
     0xcb, 0xf2, 0xbb, 0xcf, 0xa3, 0xf4, 0x7b, 0x17, 0x12, 0xa0, 0x71, 0x83, 0x6b, 0x2c, 0x48, 0x23,
     0x2d, 0xad, 0x7d, 0xfb, 0x76, 0x38, 0x13, 0xa7, 0x20, 0xf7, 0xd3, 0x48, 0xa9, 0x31, 0x8c, 0xce,
@@ -194,6 +195,64 @@ impl HarmonicSplitResultLayout {
             Some(HarmonicExpertExecutionOwner::ExpertGfx1151)
         }
     }
+
+    pub const fn local_count(self) -> usize {
+        self.local_mask.count_ones() as usize
+    }
+
+    pub const fn remote_count(self) -> usize {
+        self.remote_mask.count_ones() as usize
+    }
+
+    /// Pack selected expert IDs independently for each owner while preserving
+    /// canonical route-slot order. `slot_sources` is consumed directly by the
+    /// exact gfx1100 split-combine kernel: bit 31 selects the mapped remote
+    /// rows and the low bits select the packed row within that owner.
+    pub fn pack_route(self, expert_ids: [u32; HARMONIC_TOP_K]) -> HarmonicPackedExpertRoute {
+        let mut local_expert_ids = [0_u32; HARMONIC_TOP_K];
+        let mut remote_expert_ids = [0_u32; HARMONIC_TOP_K];
+        let mut slot_sources = [0_u32; HARMONIC_TOP_K];
+        let mut local_count = 0_usize;
+        let mut remote_count = 0_usize;
+        for (slot, expert) in expert_ids.into_iter().enumerate() {
+            match self.owner(slot).expect("validated split-result slot") {
+                HarmonicExpertExecutionOwner::DenseGfx1100 => {
+                    local_expert_ids[local_count] = expert;
+                    slot_sources[slot] = local_count as u32;
+                    local_count += 1;
+                }
+                HarmonicExpertExecutionOwner::ExpertGfx1151 => {
+                    remote_expert_ids[remote_count] = expert;
+                    slot_sources[slot] = HARMONIC_REMOTE_SOURCE_BIT | remote_count as u32;
+                    remote_count += 1;
+                }
+            }
+        }
+        HarmonicPackedExpertRoute {
+            layout: self,
+            local_expert_ids,
+            remote_expert_ids,
+            slot_sources,
+            local_count: local_count as u8,
+            remote_count: remote_count as u8,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HarmonicPackedExpertRoute {
+    pub layout: HarmonicSplitResultLayout,
+    pub local_expert_ids: [u32; HARMONIC_TOP_K],
+    pub remote_expert_ids: [u32; HARMONIC_TOP_K],
+    pub slot_sources: [u32; HARMONIC_TOP_K],
+    pub local_count: u8,
+    pub remote_count: u8,
+}
+
+impl HarmonicPackedExpertRoute {
+    pub const fn remote_result_extent(self) -> u32 {
+        self.remote_count as u32 * HARMONIC_ROUTE_SLOT_RESULT_BYTES as u32
+    }
 }
 
 /// CPU oracle for the existing deterministic `moe_down_combine_k8_batched`
@@ -258,6 +317,7 @@ pub enum HarmonicResidencyError {
     SlotOutOfRange { layer: usize, expert: usize },
     DuplicateSlot(HarmonicExpertSlot),
     RequiredBytesOverflow,
+    InvalidManifest(String),
 }
 
 impl fmt::Display for HarmonicResidencyError {
@@ -285,6 +345,88 @@ pub struct HarmonicExpertResidencyPlan {
 }
 
 impl HarmonicExpertResidencyPlan {
+    pub fn from_manifest(text: &str) -> Result<Self, HarmonicResidencyError> {
+        let mut lines = text.lines();
+        if lines.next() != Some("DS4HOT01") {
+            return Err(HarmonicResidencyError::InvalidManifest(
+                "missing DS4HOT01 magic".to_owned(),
+            ));
+        }
+        let parse_header = |line: Option<&str>, key: &str| -> Result<u64, HarmonicResidencyError> {
+            let value = line
+                .and_then(|line| line.strip_prefix(key))
+                .ok_or_else(|| {
+                    HarmonicResidencyError::InvalidManifest(format!("missing {key} header"))
+                })?;
+            value.parse::<u64>().map_err(|error| {
+                HarmonicResidencyError::InvalidManifest(format!("invalid {key}: {error}"))
+            })
+        };
+        let slot_bytes = parse_header(lines.next(), "slot_bytes=")?;
+        let budget_bytes = parse_header(lines.next(), "budget_bytes=")?;
+        let declared_slots =
+            usize::try_from(parse_header(lines.next(), "slots=")?).map_err(|_| {
+                HarmonicResidencyError::InvalidManifest("slot count overflow".to_owned())
+            })?;
+        let mut ranked = Vec::with_capacity(declared_slots);
+        for (line_index, line) in lines.enumerate() {
+            if line.is_empty() {
+                continue;
+            }
+            let mut fields = line.split_ascii_whitespace();
+            let layer = fields
+                .next()
+                .ok_or_else(|| {
+                    HarmonicResidencyError::InvalidManifest(format!(
+                        "line {} missing layer",
+                        line_index + 5
+                    ))
+                })?
+                .parse::<usize>()
+                .map_err(|error| {
+                    HarmonicResidencyError::InvalidManifest(format!(
+                        "line {} invalid layer: {error}",
+                        line_index + 5
+                    ))
+                })?;
+            let expert = fields
+                .next()
+                .ok_or_else(|| {
+                    HarmonicResidencyError::InvalidManifest(format!(
+                        "line {} missing expert",
+                        line_index + 5
+                    ))
+                })?
+                .parse::<usize>()
+                .map_err(|error| {
+                    HarmonicResidencyError::InvalidManifest(format!(
+                        "line {} invalid expert: {error}",
+                        line_index + 5
+                    ))
+                })?;
+            if fields.next().is_some() {
+                return Err(HarmonicResidencyError::InvalidManifest(format!(
+                    "line {} has extra fields",
+                    line_index + 5
+                )));
+            }
+            ranked.push(HarmonicExpertSlot::checked(layer, expert)?);
+        }
+        if ranked.len() != declared_slots {
+            return Err(HarmonicResidencyError::InvalidManifest(format!(
+                "manifest contains {} slots, declares {declared_slots}",
+                ranked.len()
+            )));
+        }
+        let plan = Self::from_ranked(slot_bytes, budget_bytes, ranked)?;
+        if plan.slots().len() != declared_slots {
+            return Err(HarmonicResidencyError::InvalidManifest(
+                "budget truncates declared slots".to_owned(),
+            ));
+        }
+        Ok(plan)
+    }
+
     pub fn from_ranked<I>(
         slot_bytes: u64,
         budget_bytes: u64,
@@ -406,6 +548,21 @@ impl HarmonicExpertResidencyPlan {
         &self.slots
     }
 
+    pub fn experts_in_layer(&self, layer: usize) -> impl Iterator<Item = u32> + '_ {
+        self.slots
+            .iter()
+            .filter(move |slot| slot.layer as usize == layer)
+            .map(|slot| u32::from(slot.expert))
+    }
+
+    /// Compact pointer-table index used by the gfx1100 replica allocation.
+    /// The plan's canonical `(layer, expert)` sort is also the upload order.
+    pub fn compact_expert_index(&self, layer: usize, expert: u32) -> Option<u32> {
+        self.experts_in_layer(layer)
+            .position(|candidate| candidate == expert)
+            .map(|index| index as u32)
+    }
+
     pub const fn slot_bytes(&self) -> u64 {
         self.slot_bytes
     }
@@ -460,6 +617,13 @@ pub struct HarmonicRoutePacket {
     pub destination_owner: HarmonicOwner,
     pub source_allocation_generation: u64,
     pub destination_allocation_generation: u64,
+    /// Zero for DS4HARM2. DS4HARM3 binds every packet to the exact immutable
+    /// replica bitmap used by the dense owner.
+    pub residency_identity: u64,
+    /// Number of leading `expert_ids` entries executed by the destination.
+    pub active_experts: u8,
+    /// Canonical route slots executed locally on gfx1100 (DS4HARM3 only).
+    pub local_mask: u8,
     pub expert_ids: [u32; HARMONIC_TOP_K],
     /// IEEE-754 bits keep the protocol equality check raw-bit exact.
     pub route_weight_bits: [u32; HARMONIC_TOP_K],
@@ -475,6 +639,7 @@ pub struct HarmonicRoutePacket {
 pub struct HarmonicContract {
     pub route_identity: u64,
     pub model_identity: [u8; 32],
+    pub residency_identity: u64,
     pub source_allocation_generation: u64,
     pub destination_allocation_generation: u64,
 }
@@ -484,6 +649,21 @@ impl HarmonicContract {
         Self {
             route_identity: HARMONIC_ROUTE_IDENTITY,
             model_identity: DS4_MQ2R_0731_IDENTITY,
+            residency_identity: 0,
+            source_allocation_generation: source_generation,
+            destination_allocation_generation: destination_generation,
+        }
+    }
+
+    pub const fn hotset(
+        source_generation: u64,
+        destination_generation: u64,
+        residency_identity: u64,
+    ) -> Self {
+        Self {
+            route_identity: HARMONIC_HOTSET_ROUTE_IDENTITY,
+            model_identity: DS4_MQ2R_0731_IDENTITY,
+            residency_identity,
             source_allocation_generation: source_generation,
             destination_allocation_generation: destination_generation,
         }
@@ -509,6 +689,9 @@ impl HarmonicContract {
             destination_owner: HarmonicOwner::ExpertGfx1151,
             source_allocation_generation: self.source_allocation_generation,
             destination_allocation_generation: self.destination_allocation_generation,
+            residency_identity: self.residency_identity,
+            active_experts: HARMONIC_TOP_K as u8,
+            local_mask: 0,
             expert_ids,
             route_weight_bits,
             activation_extent: HARMONIC_ACTIVATION_EXTENT,
@@ -518,12 +701,47 @@ impl HarmonicContract {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn split_packet(
+        self,
+        epoch: u64,
+        layer: u16,
+        packed: HarmonicPackedExpertRoute,
+        route_weight_bits: [u32; HARMONIC_TOP_K],
+        deadline_tick: u64,
+    ) -> HarmonicRoutePacket {
+        debug_assert_eq!(self.route_identity, HARMONIC_HOTSET_ROUTE_IDENTITY);
+        HarmonicRoutePacket {
+            route_identity: self.route_identity,
+            model_identity: self.model_identity,
+            epoch,
+            layer,
+            slot: (epoch as usize % HARMONIC_SLOT_COUNT) as u8,
+            source_owner: HarmonicOwner::DenseGfx1100,
+            destination_owner: HarmonicOwner::ExpertGfx1151,
+            source_allocation_generation: self.source_allocation_generation,
+            destination_allocation_generation: self.destination_allocation_generation,
+            residency_identity: self.residency_identity,
+            active_experts: packed.remote_count,
+            local_mask: packed.layout.local_mask(),
+            expert_ids: packed.remote_expert_ids,
+            route_weight_bits,
+            activation_extent: HARMONIC_ACTIVATION_EXTENT,
+            result_extent: packed.remote_result_extent(),
+            deadline_tick,
+            activation_fingerprint: 0,
+        }
+    }
+
     pub fn validate(self, packet: &HarmonicRoutePacket, now: u64) -> HarmonicResult<()> {
         if packet.route_identity != self.route_identity {
             return Err(HarmonicProtocolError::InvalidPacket("route identity"));
         }
         if packet.model_identity != self.model_identity {
             return Err(HarmonicProtocolError::InvalidPacket("model identity"));
+        }
+        if packet.residency_identity != self.residency_identity {
+            return Err(HarmonicProtocolError::InvalidPacket("residency identity"));
         }
         if packet.epoch == 0 {
             return Err(HarmonicProtocolError::InvalidPacket("zero epoch"));
@@ -553,10 +771,30 @@ impl HarmonicContract {
                 got: packet.destination_allocation_generation,
             });
         }
-        if packet.activation_extent != HARMONIC_ACTIVATION_EXTENT
-            || packet.result_extent != HARMONIC_RESULT_EXTENT
-        {
+        if packet.activation_extent != HARMONIC_ACTIVATION_EXTENT {
             return Err(HarmonicProtocolError::InvalidPacket("payload extent"));
+        }
+        if self.route_identity == HARMONIC_ROUTE_IDENTITY {
+            if packet.active_experts as usize != HARMONIC_TOP_K
+                || packet.local_mask != 0
+                || packet.result_extent != HARMONIC_RESULT_EXTENT
+            {
+                return Err(HarmonicProtocolError::InvalidPacket("DS4HARM2 payload"));
+            }
+        } else if self.route_identity == HARMONIC_HOTSET_ROUTE_IDENTITY {
+            let valid_mask = (1_u8 << HARMONIC_TOP_K) - 1;
+            if packet.local_mask & !valid_mask != 0
+                || packet.active_experts as usize
+                    != HARMONIC_TOP_K - packet.local_mask.count_ones() as usize
+                || packet.result_extent
+                    != packet.active_experts as u32 * HARMONIC_ROUTE_SLOT_RESULT_BYTES as u32
+            {
+                return Err(HarmonicProtocolError::InvalidPacket("DS4HARM3 payload"));
+            }
+        } else {
+            return Err(HarmonicProtocolError::InvalidPacket(
+                "unsupported route identity",
+            ));
         }
         if packet.deadline_tick <= now {
             return Err(HarmonicProtocolError::DeadlineExceeded {
@@ -564,7 +802,13 @@ impl HarmonicContract {
                 now,
             });
         }
-        for (index, expert) in packet.expert_ids.iter().copied().enumerate() {
+        for (index, expert) in packet
+            .expert_ids
+            .iter()
+            .copied()
+            .take(packet.active_experts as usize)
+            .enumerate()
+        {
             if expert >= HARMONIC_EXPERT_COUNT {
                 return Err(HarmonicProtocolError::InvalidPacket("expert out of range"));
             }
@@ -1408,6 +1652,48 @@ mod tests {
         let layout = plan.split_result_layout(5, [225, 11, 23, 12, 13, 14]);
         assert_eq!(layout.local_mask(), 0b00_0101);
         assert_eq!(layout.remote_mask(), 0b11_1010);
+    }
+
+    #[test]
+    fn split_layout_packs_each_owner_without_changing_route_order() {
+        let layout = HarmonicSplitResultLayout::checked(0b01_0101, 0b10_1010).unwrap();
+        let packed = layout.pack_route([10, 11, 12, 13, 14, 15]);
+        assert_eq!(packed.local_count, 3);
+        assert_eq!(packed.remote_count, 3);
+        assert_eq!(&packed.local_expert_ids[..3], &[10, 12, 14]);
+        assert_eq!(&packed.remote_expert_ids[..3], &[11, 13, 15]);
+        assert_eq!(
+            packed.slot_sources,
+            [
+                0,
+                HARMONIC_REMOTE_SOURCE_BIT,
+                1,
+                HARMONIC_REMOTE_SOURCE_BIT | 1,
+                2,
+                HARMONIC_REMOTE_SOURCE_BIT | 2,
+            ]
+        );
+        assert_eq!(packed.remote_result_extent(), 3 * 16_384);
+    }
+
+    #[test]
+    fn hotset_manifest_and_packet_bind_the_exact_residency_identity() {
+        let manifest = "DS4HOT01\nslot_bytes=10\nbudget_bytes=20\nslots=2\n5 225\n5 23\n";
+        let plan = HarmonicExpertResidencyPlan::from_manifest(manifest).unwrap();
+        assert_eq!(plan.compact_expert_index(5, 23), Some(0));
+        assert_eq!(plan.compact_expert_index(5, 225), Some(1));
+        let packed = plan
+            .split_result_layout(5, [225, 11, 23, 12, 13, 14])
+            .pack_route([225, 11, 23, 12, 13, 14]);
+        let contract = HarmonicContract::hotset(7, 11, plan.identity());
+        let packet = contract.split_packet(1, 5, packed, route_weights(), 100);
+        contract.validate(&packet, 1).unwrap();
+        assert_eq!(packet.local_mask, 0b00_0101);
+        assert_eq!(packet.active_experts, 4);
+        assert_eq!(packet.result_extent, 4 * 16_384);
+        let mut wrong = packet;
+        wrong.residency_identity ^= 1;
+        assert!(contract.validate(&wrong, 1).is_err());
     }
 
     #[test]

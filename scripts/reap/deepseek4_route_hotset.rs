@@ -167,6 +167,7 @@ fn main() -> Result<(), String> {
     let mut budget_bytes = None;
     let mut train_tokens = None;
     let mut eval_tokens = None;
+    let mut emit_plan = None;
     let mut arguments = std::env::args().skip(1);
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
@@ -206,6 +207,11 @@ fn main() -> Result<(), String> {
                         .parse::<usize>()
                         .map_err(|error| format!("invalid --eval-tokens: {error}"))?,
                 )
+            }
+            "--emit-plan" => {
+                emit_plan = Some(PathBuf::from(
+                    arguments.next().ok_or("--emit-plan requires PATH")?,
+                ));
             }
             value if path.is_none() => path = Some(PathBuf::from(value)),
             value => return Err(format!("unexpected argument {value:?}")),
@@ -299,6 +305,18 @@ fn main() -> Result<(), String> {
         "records={records} {label}_members={members} slot_bytes={slot_bytes} budget_bytes={budget_bytes} slots={slots} {label}_coverage={:.6}%",
         coverage(&ranked, slots, members)
     );
+    if let Some(path) = emit_plan {
+        let mut manifest = format!(
+            "DS4HOT01\nslot_bytes={slot_bytes}\nbudget_bytes={budget_bytes}\nslots={slots}\n"
+        );
+        for &(_, layer, expert) in ranked.iter().take(slots) {
+            use std::fmt::Write;
+            writeln!(&mut manifest, "{layer} {expert}").unwrap();
+        }
+        std::fs::write(&path, manifest)
+            .map_err(|error| format!("write {}: {error}", path.display()))?;
+        println!("plan_path={}", path.display());
+    }
     for (rank, &(count, layer, expert)) in ranked.iter().take(32).enumerate() {
         println!(
             "rank={:02} layer={layer:02} expert={expert:03} count={count} share={:.6}%",

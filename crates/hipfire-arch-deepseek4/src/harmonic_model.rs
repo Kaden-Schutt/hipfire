@@ -15,12 +15,17 @@ use hip_bridge::{Event, Stream};
 use hipfire_config::{Deepseek4ComputePlacement, DeviceSelector};
 use hipfire_runtime::arch::Architecture;
 use hipfire_runtime::hfq::HfqFile;
-use rdna_compute::Gpu;
+use rdna_compute::{DType, Gpu, GpuTensor};
 
-use crate::arch::DeepseekV4HeterogeneousProjection;
-use crate::deepseek4::{DeepseekV4Config, DeepseekV4DenseWeights, DeepseekV4State};
+use crate::arch::{DeepseekV4HarmonicResidencyProjection, DeepseekV4HeterogeneousProjection};
+use crate::deepseek4::{
+    DeepseekV4Config, DeepseekV4DenseWeights, DeepseekV4HarmonicReplicaWeights, DeepseekV4State,
+};
 use crate::forward::PrefillBatchScratch;
-use crate::harmonic::{HarmonicContract, HarmonicOwner, HARMONIC_TOP_K};
+use crate::harmonic::{
+    HarmonicContract, HarmonicExpertResidencyPlan, HarmonicOwner, HarmonicPackedExpertRoute,
+    HARMONIC_HIDDEN_SIZE, HARMONIC_MOE_INTERMEDIATE_SIZE, HARMONIC_TOP_K,
+};
 use crate::harmonic_ipc::{harmonic_monotonic_tick, HarmonicGpuMapping, HarmonicSharedRing};
 use crate::harmonic_process::{
     HarmonicExpertWorkerProcess, HarmonicExpertWorkerReady, HarmonicExpertWorkerSpec,
@@ -43,6 +48,7 @@ pub struct DeepseekV4HarmonicLoadPlan {
     pub control_timeout: Duration,
     pub exit_timeout: Duration,
     pub layer_timeout: Duration,
+    pub residency_plan: Option<HarmonicExpertResidencyPlan>,
 }
 
 impl DeepseekV4HarmonicLoadPlan {
@@ -60,7 +66,13 @@ impl DeepseekV4HarmonicLoadPlan {
             control_timeout: Duration::from_secs(2),
             exit_timeout: Duration::from_secs(5),
             layer_timeout: DEFAULT_LAYER_TIMEOUT,
+            residency_plan: None,
         }
+    }
+
+    pub fn with_residency_plan(mut self, residency_plan: HarmonicExpertResidencyPlan) -> Self {
+        self.residency_plan = Some(residency_plan);
+        self
     }
 
     fn validate(&self) -> Result<(), String> {
@@ -98,6 +110,7 @@ pub struct DeepseekV4HarmonicLoadReport {
     pub expert: HarmonicExpertWorkerReady,
     pub dense_free_before: usize,
     pub dense_free_after: usize,
+    pub hotset_projection: Option<DeepseekV4HarmonicResidencyProjection>,
 }
 
 /// Always-on aggregate timing for the harmonic diagnostic route. These are
@@ -141,6 +154,14 @@ pub(crate) struct DeepseekV4HarmonicExecution {
     pub(crate) route_weight_bits: [u32; HARMONIC_TOP_K],
     pub(crate) epoch: u64,
     pub(crate) timing: DeepseekV4HarmonicTiming,
+    pub(crate) residency_plan: Option<HarmonicExpertResidencyPlan>,
+    pub(crate) local_topk_indices: Option<GpuTensor>,
+    pub(crate) local_gate_batch: Option<GpuTensor>,
+    pub(crate) local_up_batch: Option<GpuTensor>,
+    pub(crate) local_rot_batch: Option<GpuTensor>,
+    pub(crate) local_down_expanded: Option<GpuTensor>,
+    pub(crate) slot_sources: Option<GpuTensor>,
+    pub(crate) packed_route: Option<HarmonicPackedExpertRoute>,
     ring_path: PathBuf,
     control_socket: PathBuf,
 }
@@ -152,6 +173,7 @@ impl DeepseekV4HarmonicExecution {
         mapping: HarmonicGpuMapping,
         worker: HarmonicExpertWorkerProcess,
         contract: HarmonicContract,
+        residency_plan: Option<HarmonicExpertResidencyPlan>,
         layer_timeout: Duration,
         ring_path: PathBuf,
         control_socket: PathBuf,
@@ -177,41 +199,85 @@ impl DeepseekV4HarmonicExecution {
             route_weight_bits: [0; HARMONIC_TOP_K],
             epoch: 0,
             timing: DeepseekV4HarmonicTiming::default(),
+            residency_plan,
+            local_topk_indices: None,
+            local_gate_batch: None,
+            local_up_batch: None,
+            local_rot_batch: None,
+            local_down_expanded: None,
+            slot_sources: None,
+            packed_route: None,
             ring_path,
             control_socket,
         };
-        let result =
-            (|| {
-                gpu.active_stream = Some(
-                    gpu.hip
-                        .stream_create()
-                        .map_err(|error| format!("deepseek4 harmonic primary stream: {error}"))?,
+        let result = (|| {
+            gpu.active_stream = Some(
+                gpu.hip
+                    .stream_create()
+                    .map_err(|error| format!("deepseek4 harmonic primary stream: {error}"))?,
+            );
+            execution.dense_attn_stream = Some(
+                gpu.hip
+                    .stream_create()
+                    .map_err(|error| format!("deepseek4 harmonic attention stream: {error}"))?,
+            );
+            execution.transfer_stream = Some(
+                gpu.hip
+                    .stream_create()
+                    .map_err(|error| format!("deepseek4 harmonic transfer stream: {error}"))?,
+            );
+            execution.dense_attn_fork_event = Some(
+                gpu.hip
+                    .event_create()
+                    .map_err(|error| format!("deepseek4 harmonic attention fork: {error}"))?,
+            );
+            execution.dense_attn_join_event = Some(
+                gpu.hip
+                    .event_create()
+                    .map_err(|error| format!("deepseek4 harmonic attention join: {error}"))?,
+            );
+            execution.route_ready_event = Some(
+                gpu.hip
+                    .event_create()
+                    .map_err(|error| format!("deepseek4 harmonic route-ready event: {error}"))?,
+            );
+            if execution.residency_plan.is_some() {
+                execution.local_topk_indices = Some(
+                    gpu.alloc_tensor(&[HARMONIC_TOP_K], DType::F32)
+                        .map_err(|error| format!("deepseek4 harmonic local indices: {error}"))?,
                 );
-                execution.dense_attn_stream =
-                    Some(gpu.hip.stream_create().map_err(|error| {
-                        format!("deepseek4 harmonic attention stream: {error}")
-                    })?);
-                execution.transfer_stream = Some(
-                    gpu.hip
-                        .stream_create()
-                        .map_err(|error| format!("deepseek4 harmonic transfer stream: {error}"))?,
+                execution.local_gate_batch = Some(
+                    gpu.alloc_tensor(
+                        &[HARMONIC_TOP_K, HARMONIC_MOE_INTERMEDIATE_SIZE],
+                        DType::F32,
+                    )
+                    .map_err(|error| format!("deepseek4 harmonic local gate: {error}"))?,
                 );
-                execution.dense_attn_fork_event = Some(
-                    gpu.hip
-                        .event_create()
-                        .map_err(|error| format!("deepseek4 harmonic attention fork: {error}"))?,
+                execution.local_up_batch = Some(
+                    gpu.alloc_tensor(
+                        &[HARMONIC_TOP_K, HARMONIC_MOE_INTERMEDIATE_SIZE],
+                        DType::F32,
+                    )
+                    .map_err(|error| format!("deepseek4 harmonic local up: {error}"))?,
                 );
-                execution.dense_attn_join_event = Some(
-                    gpu.hip
-                        .event_create()
-                        .map_err(|error| format!("deepseek4 harmonic attention join: {error}"))?,
+                execution.local_rot_batch = Some(
+                    gpu.alloc_tensor(
+                        &[HARMONIC_TOP_K, HARMONIC_MOE_INTERMEDIATE_SIZE],
+                        DType::F32,
+                    )
+                    .map_err(|error| format!("deepseek4 harmonic local rotation: {error}"))?,
                 );
-                execution.route_ready_event =
-                    Some(gpu.hip.event_create().map_err(|error| {
-                        format!("deepseek4 harmonic route-ready event: {error}")
-                    })?);
-                Ok(())
-            })();
+                execution.local_down_expanded = Some(
+                    gpu.alloc_tensor(&[HARMONIC_TOP_K, HARMONIC_HIDDEN_SIZE], DType::F32)
+                        .map_err(|error| format!("deepseek4 harmonic local down: {error}"))?,
+                );
+                execution.slot_sources = Some(
+                    gpu.alloc_tensor(&[HARMONIC_TOP_K], DType::F32)
+                        .map_err(|error| format!("deepseek4 harmonic slot sources: {error}"))?,
+                );
+            }
+            Ok(())
+        })();
         if let Err(error) = result {
             let _ = execution.release(gpu);
             return Err(error);
@@ -293,6 +359,21 @@ impl DeepseekV4HarmonicExecution {
             }
         }
         self.mapping.take();
+        for tensor in [
+            self.local_topk_indices.take(),
+            self.local_gate_batch.take(),
+            self.local_up_batch.take(),
+            self.local_rot_batch.take(),
+            self.local_down_expanded.take(),
+            self.slot_sources.take(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if let Err(error) = gpu.free_tensor(tensor) {
+                errors.push(format!("free gfx1100 harmonic split scratch: {error}"));
+            }
+        }
         for event in [
             self.route_ready_event.take(),
             self.dense_attn_fork_event.take(),
@@ -333,6 +414,7 @@ pub struct DeepseekV4HarmonicModel {
     pub weights: Option<DeepseekV4DenseWeights>,
     pub state: Option<DeepseekV4State>,
     pub prefill: Option<PrefillBatchScratch>,
+    pub replicas: Option<DeepseekV4HarmonicReplicaWeights>,
     execution: Option<DeepseekV4HarmonicExecution>,
     pub report: DeepseekV4HarmonicLoadReport,
 }
@@ -387,12 +469,44 @@ impl DeepseekV4HarmonicModel {
             .hip
             .get_vram_info()
             .map_err(|error| format!("deepseek4 harmonic dense preflight: {error}"))?;
+        let hotset_projection = plan
+            .residency_plan
+            .as_ref()
+            .map(|residency| {
+                DeepseekV4::project_harmonic_hot_experts_gfx1100(
+                    &hfq, &config, &dense_gpu, residency,
+                )
+            })
+            .transpose()?;
+        let replica_bytes = hotset_projection
+            .as_ref()
+            .map(|projection| {
+                projection
+                    .exact_bytes
+                    .saturating_add((projection.slot_count * 2 * std::mem::size_of::<u64>()) as u64)
+            })
+            .unwrap_or(0);
+        let split_scratch_bytes = if hotset_projection.is_some() {
+            (HARMONIC_TOP_K
+                * (3 * HARMONIC_MOE_INTERMEDIATE_SIZE + HARMONIC_HIDDEN_SIZE)
+                * std::mem::size_of::<f32>()
+                + 2 * HARMONIC_TOP_K * std::mem::size_of::<u32>()) as u64
+        } else {
+            0
+        };
+        let replica_bytes = usize::try_from(replica_bytes).map_err(|_| {
+            "deepseek4 harmonic replica projection exceeds address space".to_owned()
+        })?;
+        let split_scratch_bytes = usize::try_from(split_scratch_bytes)
+            .map_err(|_| "deepseek4 harmonic split scratch exceeds address space".to_owned())?;
         let dense_projected = projection
             .dense_bytes
             .checked_add(PrefillBatchScratch::projected_allocation_bytes(
                 &config,
                 plan.prefill_max_batch,
             )?)
+            .and_then(|bytes| bytes.checked_add(replica_bytes))
+            .and_then(|bytes| bytes.checked_add(split_scratch_bytes))
             .and_then(|bytes| bytes.checked_add(plan.safety_margin_bytes))
             .ok_or_else(|| "deepseek4 harmonic dense preflight overflow".to_owned())?;
         if dense_free_before < dense_projected {
@@ -406,9 +520,27 @@ impl DeepseekV4HarmonicModel {
             &config,
             &mut dense_gpu,
         )?);
+        let mut replicas = match plan.residency_plan.as_ref() {
+            Some(residency) => match DeepseekV4::load_weights_harmonic_hot_experts_gfx1100(
+                &mut hfq,
+                &config,
+                &mut dense_gpu,
+                residency,
+            ) {
+                Ok(replicas) => Some(replicas),
+                Err(error) => {
+                    weights.take().unwrap().free_gpu(&mut dense_gpu);
+                    return Err(error);
+                }
+            },
+            None => None,
+        };
         let mut state = match DeepseekV4State::new(&config) {
             Ok(state) => Some(state),
             Err(error) => {
+                if let Some(replicas) = replicas.take() {
+                    replicas.free_gpu(&mut dense_gpu);
+                }
                 weights.take().unwrap().free_gpu(&mut dense_gpu);
                 return Err(error);
             }
@@ -418,6 +550,9 @@ impl DeepseekV4HarmonicModel {
                 Ok(prefill) => Some(prefill),
                 Err(error) => {
                     state.take().unwrap().free_gpu(&mut dense_gpu);
+                    if let Some(replicas) = replicas.take() {
+                        replicas.free_gpu(&mut dense_gpu);
+                    }
                     weights.take().unwrap().free_gpu(&mut dense_gpu);
                     return Err(error);
                 }
@@ -436,6 +571,9 @@ impl DeepseekV4HarmonicModel {
             Err(error) => {
                 prefill.take().unwrap().free_gpu(&mut dense_gpu);
                 state.take().unwrap().free_gpu(&mut dense_gpu);
+                if let Some(replicas) = replicas.take() {
+                    replicas.free_gpu(&mut dense_gpu);
+                }
                 weights.take().unwrap().free_gpu(&mut dense_gpu);
                 return Err(error);
             }
@@ -445,7 +583,16 @@ impl DeepseekV4HarmonicModel {
             .map_err(|error| format!("deepseek4 harmonic runtime nonce: {error}"))?;
         let source_generation = nonce.max(1);
         let destination_generation = nonce.rotate_left(17).max(1);
-        let contract = HarmonicContract::frozen(source_generation, destination_generation);
+        let contract = plan.residency_plan.as_ref().map_or_else(
+            || HarmonicContract::frozen(source_generation, destination_generation),
+            |residency| {
+                HarmonicContract::hotset(
+                    source_generation,
+                    destination_generation,
+                    residency.identity(),
+                )
+            },
+        );
         let prefix = format!("ds4-harmonic-{}-{nonce}", std::process::id());
         let ring_path = plan.runtime_dir.join(format!("{prefix}.ring"));
         let control_socket = plan.runtime_dir.join(format!("{prefix}.sock"));
@@ -484,6 +631,9 @@ impl DeepseekV4HarmonicModel {
                 let _ = fs::remove_file(&ring_path);
                 prefill.take().unwrap().free_gpu(&mut dense_gpu);
                 state.take().unwrap().free_gpu(&mut dense_gpu);
+                if let Some(replicas) = replicas.take() {
+                    replicas.free_gpu(&mut dense_gpu);
+                }
                 weights.take().unwrap().free_gpu(&mut dense_gpu);
                 return Err(error);
             }
@@ -495,6 +645,7 @@ impl DeepseekV4HarmonicModel {
             mapping.take().unwrap(),
             worker,
             contract,
+            plan.residency_plan.clone(),
             plan.layer_timeout,
             ring_path,
             control_socket,
@@ -504,6 +655,9 @@ impl DeepseekV4HarmonicModel {
             Err(error) => {
                 prefill.take().unwrap().free_gpu(&mut dense_gpu);
                 state.take().unwrap().free_gpu(&mut dense_gpu);
+                if let Some(replicas) = replicas.take() {
+                    replicas.free_gpu(&mut dense_gpu);
+                }
                 weights.take().unwrap().free_gpu(&mut dense_gpu);
                 return Err(error);
             }
@@ -514,6 +668,7 @@ impl DeepseekV4HarmonicModel {
             weights,
             state,
             prefill,
+            replicas,
             execution: Some(execution),
             report: DeepseekV4HarmonicLoadReport {
                 model_sha256,
@@ -522,6 +677,7 @@ impl DeepseekV4HarmonicModel {
                 expert,
                 dense_free_before,
                 dense_free_after,
+                hotset_projection,
             },
         })
     }
@@ -545,6 +701,7 @@ impl DeepseekV4HarmonicModel {
             state,
             &mut self.dense_gpu,
             execution,
+            self.replicas.as_ref(),
             token_id,
             position,
         )
@@ -582,6 +739,9 @@ impl DeepseekV4HarmonicModel {
         }
         if let Some(state) = self.state.take() {
             state.free_gpu(&mut self.dense_gpu);
+        }
+        if let Some(replicas) = self.replicas.take() {
+            replicas.free_gpu(&mut self.dense_gpu);
         }
         if let Some(weights) = self.weights.take() {
             weights.free_gpu(&mut self.dense_gpu);

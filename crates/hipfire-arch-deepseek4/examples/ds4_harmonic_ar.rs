@@ -10,7 +10,7 @@ use std::time::Instant;
 
 use hipfire_arch_deepseek4::{
     DeepseekV4ArtifactReceipt, DeepseekV4HarmonicLoadPlan, DeepseekV4HarmonicModel,
-    DeepseekV4VerifiedArtifact,
+    DeepseekV4VerifiedArtifact, HarmonicExpertResidencyPlan,
 };
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::tokenizer::Tokenizer;
@@ -19,7 +19,7 @@ use serde_json::json;
 fn main() -> Result<(), String> {
     let mut args = std::env::args().skip(1);
     let model = PathBuf::from(args.next().ok_or(
-        "usage: ds4_harmonic_ar MODEL --worker PATH --prompt PATH --generate N --runtime-dir PATH [--output PATH] [--model-sha256 HEX --model-len N --model-mtime-secs N --model-mtime-nanos N]",
+        "usage: ds4_harmonic_ar MODEL --worker PATH --prompt PATH --generate N --runtime-dir PATH [--output PATH] [--hotset-plan PATH] [--model-sha256 HEX --model-len N --model-mtime-secs N --model-mtime-nanos N]",
     )?);
     let mut worker = None;
     let mut prompt = None;
@@ -30,6 +30,7 @@ fn main() -> Result<(), String> {
     let mut model_len = None;
     let mut model_mtime_secs = None;
     let mut model_mtime_nanos = None;
+    let mut hotset_plan = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--worker" => worker = Some(PathBuf::from(args.next().ok_or("--worker needs PATH")?)),
@@ -48,6 +49,11 @@ fn main() -> Result<(), String> {
                 ))
             }
             "--output" => output = Some(PathBuf::from(args.next().ok_or("--output needs PATH")?)),
+            "--hotset-plan" => {
+                hotset_plan = Some(PathBuf::from(
+                    args.next().ok_or("--hotset-plan needs PATH")?,
+                ))
+            }
             "--model-sha256" => model_sha256 = Some(args.next().ok_or("--model-sha256 needs HEX")?),
             "--model-len" => {
                 model_len = Some(
@@ -129,10 +135,15 @@ fn main() -> Result<(), String> {
     }
 
     let load_start = Instant::now();
-    let mut loaded = DeepseekV4HarmonicModel::load_verified(
-        &artifact,
-        DeepseekV4HarmonicLoadPlan::new(worker, runtime_dir),
-    )?;
+    let mut load_plan = DeepseekV4HarmonicLoadPlan::new(worker, runtime_dir);
+    if let Some(path) = hotset_plan {
+        let manifest = std::fs::read_to_string(&path)
+            .map_err(|error| format!("read hotset plan {}: {error}", path.display()))?;
+        let residency = HarmonicExpertResidencyPlan::from_manifest(&manifest)
+            .map_err(|error| format!("parse hotset plan {}: {error}", path.display()))?;
+        load_plan = load_plan.with_residency_plan(residency);
+    }
+    let mut loaded = DeepseekV4HarmonicModel::load_verified(&artifact, load_plan)?;
     let load_secs = load_start.elapsed().as_secs_f64();
     eprintln!(
         "harmonic_ready dense_pci={} expert_pci={} expert_pid_arch={} routed_tensors={} routed_bytes={}",

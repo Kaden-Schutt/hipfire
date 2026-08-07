@@ -1244,6 +1244,37 @@ pub struct DeepseekV4RoutedWeights {
     pub(crate) layers: Vec<DeepseekV4LayerWeights>,
 }
 
+/// Exact MQ2-Lloyd expert replicas owned by the gfx1100 half of DS4HARM3.
+///
+/// Pointer tables are compact per layer and therefore cannot be passed to an
+/// ordinary full-route executor. The plan identity and dedicated wrapper keep
+/// that invariant out of the accepted DS4HARM2 routed-weight type.
+pub struct DeepseekV4HarmonicReplicaWeights {
+    pub(crate) inner: DeepseekV4RoutedWeights,
+    pub(crate) plan_identity: u64,
+}
+
+impl DeepseekV4HarmonicReplicaWeights {
+    pub(crate) fn new(inner: DeepseekV4RoutedWeights, plan_identity: u64) -> Self {
+        Self {
+            inner,
+            plan_identity,
+        }
+    }
+
+    pub fn resolve_layer(&self, index: usize) -> &DeepseekV4LayerWeights {
+        self.inner.resolve_layer(index)
+    }
+
+    pub const fn plan_identity(&self) -> u64 {
+        self.plan_identity
+    }
+
+    pub fn free_gpu(self, gpu: &mut rdna_compute::Gpu) {
+        self.inner.free_gpu(gpu);
+    }
+}
+
 impl DeepseekV4RoutedWeights {
     pub(crate) fn new(cfg: &DeepseekV4Config, mq2r_backend: Mq2rBackend) -> Self {
         let layers = (0..cfg.num_hidden_layers)

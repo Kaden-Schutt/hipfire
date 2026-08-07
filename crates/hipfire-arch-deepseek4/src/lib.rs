@@ -79,14 +79,14 @@ pub use arch::{
 };
 pub use deepseek4::{
     config_from_safetensors, DeepseekV4Config, DeepseekV4DenseWeights,
-    DeepseekV4HeterogeneousWeights, DeepseekV4LocalOwnershipReceipt, DeepseekV4OwnershipAudit,
-    DeepseekV4RoutedWeights, DeepseekV4State, DeepseekV4Weights, IndexerLayerState,
-    MainAttentionLayerState,
+    DeepseekV4HarmonicReplicaWeights, DeepseekV4HeterogeneousWeights,
+    DeepseekV4LocalOwnershipReceipt, DeepseekV4OwnershipAudit, DeepseekV4RoutedWeights,
+    DeepseekV4State, DeepseekV4Weights, IndexerLayerState, MainAttentionLayerState,
 };
 pub use harmonic::{
     pack_harmonic_activation_payload, unpack_harmonic_x_rot, HarmonicCompletion, HarmonicContract,
-    HarmonicOwner, HarmonicProtocolError, HarmonicRoutePacket, HarmonicSlotState,
-    HarmonicSupervisor, HARMONIC_ACTIVATION_EXTENT, HARMONIC_RESULT_EXTENT,
+    HarmonicExpertResidencyPlan, HarmonicOwner, HarmonicProtocolError, HarmonicRoutePacket,
+    HarmonicSlotState, HarmonicSupervisor, HARMONIC_ACTIVATION_EXTENT, HARMONIC_RESULT_EXTENT,
     HARMONIC_SPLIT_RESULT_EXTENT,
 };
 pub use harmonic_ipc::{

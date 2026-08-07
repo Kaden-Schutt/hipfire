@@ -24,11 +24,14 @@
 //!   - Embedding lookup, lm_head matmul, sampler
 
 use crate::backend::Mq2rBackend;
-use crate::deepseek4::{DeepseekV4HeterogeneousWeights, DeepseekV4RoutedWeights};
+use crate::deepseek4::{
+    DeepseekV4HarmonicReplicaWeights, DeepseekV4HeterogeneousWeights, DeepseekV4RoutedWeights,
+};
 #[cfg(feature = "harmonic-worker")]
 use crate::harmonic::{
-    HarmonicProtocolError, HarmonicSlotState, HARMONIC_RESULT_EXTENT, HARMONIC_SLOT_COUNT,
-    HARMONIC_TOP_K, HARMONIC_X_ROT_BYTES,
+    HarmonicProtocolError, HarmonicSlotState, HARMONIC_HIDDEN_SIZE, HARMONIC_HOTSET_ROUTE_IDENTITY,
+    HARMONIC_RESULT_EXTENT, HARMONIC_SLOT_COUNT, HARMONIC_SPLIT_RESULT_EXTENT, HARMONIC_TOP_K,
+    HARMONIC_X_ROT_BYTES,
 };
 #[cfg(feature = "harmonic-worker")]
 use crate::harmonic_ipc::{harmonic_monotonic_tick, HarmonicIpcError};
@@ -3568,6 +3571,7 @@ pub(crate) fn decode_step_harmonic(
     state: &mut DeepseekV4State,
     gpu: &mut Gpu,
     execution: &mut DeepseekV4HarmonicExecution,
+    replicas: Option<&DeepseekV4HarmonicReplicaWeights>,
     token_id: u32,
     position: u32,
 ) -> Result<Vec<f32>, String> {
@@ -3605,6 +3609,7 @@ pub(crate) fn decode_step_harmonic(
         ffn_shared_project(cfg, weights, state, gpu, layer_idx)?;
 
         harmonic_publish_staged_route(gpu, execution, epoch, layer_idx)?;
+        harmonic_run_local_replicas(cfg, replicas, state, gpu, execution, layer_idx)?;
         harmonic_join_result(state, gpu, execution, epoch, layer_idx)?;
         hc_ffn_mix(cfg, weights, state, gpu, layer_idx)?;
         dump_residual_layer_norm(gpu, state, layer_idx, position);
@@ -6610,6 +6615,54 @@ fn harmonic_publish_staged_route(
         .map_err(|error| format!("harmonic route transfer completion l{layer_idx}: {error}"))?;
     let route_sync_elapsed = route_sync_start.elapsed();
     execution.record_route_sync(route_sync_elapsed);
+    let packed = if let Some(plan) = execution.residency_plan.as_ref() {
+        let mut packed = plan
+            .split_result_layout(layer_idx, execution.route_ids)
+            .pack_route(execution.route_ids);
+        for index in 0..packed.local_count as usize {
+            packed.local_expert_ids[index] = plan
+                .compact_expert_index(layer_idx, packed.local_expert_ids[index])
+                .ok_or_else(|| {
+                    format!(
+                        "harmonic local expert missing from compact plan l{layer_idx} e{}",
+                        packed.local_expert_ids[index]
+                    )
+                })?;
+        }
+        let primary = gpu
+            .active_stream
+            .as_ref()
+            .ok_or_else(|| "harmonic split primary stream missing".to_owned())?;
+        let local_bytes = unsafe {
+            std::slice::from_raw_parts(
+                packed.local_expert_ids.as_ptr().cast::<u8>(),
+                HARMONIC_TOP_K * std::mem::size_of::<u32>(),
+            )
+        };
+        gpu.hip
+            .memcpy_htod_async(
+                &execution.local_topk_indices.as_ref().unwrap().buf,
+                local_bytes,
+                primary,
+            )
+            .map_err(|error| format!("harmonic split local ids l{layer_idx}: {error}"))?;
+        let source_bytes = unsafe {
+            std::slice::from_raw_parts(
+                packed.slot_sources.as_ptr().cast::<u8>(),
+                HARMONIC_TOP_K * std::mem::size_of::<u32>(),
+            )
+        };
+        gpu.hip
+            .memcpy_htod_async(
+                &execution.slot_sources.as_ref().unwrap().buf,
+                source_bytes,
+                primary,
+            )
+            .map_err(|error| format!("harmonic split slot sources l{layer_idx}: {error}"))?;
+        Some(packed)
+    } else {
+        None
+    };
     if epoch > HARMONIC_SLOT_COUNT as u64 {
         // Reusing slot N%2 is legal only after the source's GPU has consumed
         // the mapped result from N-2. The current route-ready event was
@@ -6624,26 +6677,136 @@ fn harmonic_publish_staged_route(
     }
     execution
         .ring
-        .write_mapped_activation_metadata(epoch, execution.route_ids, execution.route_weight_bits)
+        .write_mapped_activation_metadata(
+            epoch,
+            packed.map_or(execution.route_ids, |route| route.remote_expert_ids),
+            execution.route_weight_bits,
+        )
         .map_err(|error| format!("harmonic route mirror l{layer_idx}: {error}"))?;
     let now = harmonic_monotonic_tick()
         .map_err(|error| format!("harmonic route clock l{layer_idx}: {error}"))?;
     let deadline =
         now.saturating_add(execution.layer_timeout.as_nanos().min(u64::MAX as u128) as u64);
-    let packet = execution.contract.packet(
-        epoch,
-        layer_idx as u16,
-        execution.route_ids,
-        execution.route_weight_bits,
-        deadline,
-        0,
+    let packet = packed.map_or_else(
+        || {
+            execution.contract.packet(
+                epoch,
+                layer_idx as u16,
+                execution.route_ids,
+                execution.route_weight_bits,
+                deadline,
+                0,
+            )
+        },
+        |route| {
+            execution.contract.split_packet(
+                epoch,
+                layer_idx as u16,
+                route,
+                execution.route_weight_bits,
+                deadline,
+            )
+        },
     );
+    execution.packed_route = packed;
     let result = execution
         .ring
         .publish_mapped(packet, execution.source_generation, now)
         .map_err(|error| format!("harmonic publish l{layer_idx}: {error}"));
     execution.record_publish_cpu(publish_start.elapsed().saturating_sub(route_sync_elapsed));
     result
+}
+
+#[cfg(feature = "harmonic-worker")]
+fn harmonic_run_local_replicas(
+    cfg: &DeepseekV4Config,
+    replicas: Option<&DeepseekV4HarmonicReplicaWeights>,
+    state: &DeepseekV4State,
+    gpu: &mut Gpu,
+    execution: &DeepseekV4HarmonicExecution,
+    layer_idx: usize,
+) -> Result<(), String> {
+    let Some(packed) = execution.packed_route else {
+        if replicas.is_some() {
+            return Err("harmonic replicas present on a DS4HARM2 route".to_owned());
+        }
+        return Ok(());
+    };
+    let replicas = replicas
+        .ok_or_else(|| "harmonic DS4HARM3 route is missing gfx1100 replica weights".to_owned())?;
+    if replicas.plan_identity() != execution.contract.residency_identity {
+        return Err("harmonic replica/contract identity mismatch".to_owned());
+    }
+    let k_top = packed.local_count as usize;
+    if k_top == 0 {
+        return Ok(());
+    }
+    let layer = replicas.resolve_layer(layer_idx);
+    let gate_up_ptrs = layer
+        .expert_gate_up_ptrs
+        .as_ref()
+        .ok_or_else(|| format!("harmonic local gate/up pointer table missing l{layer_idx}"))?;
+    let down_ptrs = layer
+        .expert_w2_ptrs
+        .as_ref()
+        .ok_or_else(|| format!("harmonic local down pointer table missing l{layer_idx}"))?;
+    let x_rot = state
+        .ffn_x_rot
+        .as_ref()
+        .ok_or_else(|| format!("harmonic local x_rot missing l{layer_idx}"))?;
+    {
+        let arch = gpu.arch.clone();
+        let mut device = gpu
+            .try_gfx1100()
+            .ok_or_else(|| format!("harmonic local expert requires exact gfx1100, got {arch}"))?;
+        device
+            .mq2_lloyd_moe_gate_up_k4_lds(
+                gate_up_ptrs,
+                execution.local_topk_indices.as_ref().unwrap(),
+                x_rot,
+                execution.local_gate_batch.as_ref().unwrap(),
+                execution.local_up_batch.as_ref().unwrap(),
+                2 * cfg.moe_intermediate_size,
+                cfg.hidden_size,
+                k_top,
+            )
+            .map_err(|error| format!("harmonic local gate/up l{layer_idx}: {error}"))?;
+    }
+    gpu.deepseek4_silu_mul_clamp_f32_batched(
+        execution.local_gate_batch.as_ref().unwrap(),
+        execution.local_up_batch.as_ref().unwrap(),
+        execution.local_gate_batch.as_ref().unwrap(),
+        cfg.moe_intermediate_size,
+        k_top,
+        cfg.swiglu_limit,
+    )
+    .map_err(|error| format!("harmonic local activation l{layer_idx}: {error}"))?;
+    gpu.rotate_x_mq_batched(
+        execution.local_gate_batch.as_ref().unwrap(),
+        execution.local_rot_batch.as_ref().unwrap(),
+        cfg.moe_intermediate_size,
+        k_top,
+    )
+    .map_err(|error| format!("harmonic local rotation l{layer_idx}: {error}"))?;
+    {
+        let arch = gpu.arch.clone();
+        let mut device = gpu
+            .try_gfx1100()
+            .ok_or_else(|| format!("harmonic local expert requires exact gfx1100, got {arch}"))?;
+        device
+            .mq2_lloyd_moe_down_expanded_lds_candidate(
+                down_ptrs,
+                execution.local_topk_indices.as_ref().unwrap(),
+                execution.local_rot_batch.as_ref().unwrap(),
+                execution.local_down_expanded.as_ref().unwrap(),
+                cfg.hidden_size,
+                cfg.moe_intermediate_size,
+                k_top,
+                1,
+            )
+            .map_err(|error| format!("harmonic local down l{layer_idx}: {error}"))?;
+    }
+    Ok(())
 }
 
 #[cfg(feature = "harmonic-worker")]
@@ -6699,10 +6862,13 @@ fn harmonic_join_result(
         }
     };
     execution.record_expert_wait(expert_wait_start.elapsed());
+    let expected_extent = execution
+        .packed_route
+        .map_or(HARMONIC_RESULT_EXTENT, |route| route.remote_result_extent());
     if resolved.state != HarmonicSlotState::Completed
         || resolved
             .completion
-            .is_none_or(|completion| completion.result_extent != HARMONIC_RESULT_EXTENT)
+            .is_none_or(|completion| completion.result_extent != expected_extent)
     {
         let cause = execution.isolate_worker(format!(
             "harmonic expert terminal state {:?} l{layer_idx}",
@@ -6723,6 +6889,58 @@ fn harmonic_join_result(
         .as_ref()
         .ok_or_else(|| "harmonic result mapping unavailable".to_owned())?
         .result_buffer(epoch);
+    if execution.contract.route_identity == HARMONIC_HOTSET_ROUTE_IDENTITY {
+        let packed = execution
+            .packed_route
+            .ok_or_else(|| format!("harmonic split route missing l{layer_idx}"))?;
+        if mapped_result.size() < HARMONIC_SPLIT_RESULT_EXTENT {
+            return Err(format!(
+                "harmonic split mapped result is {} bytes, expected {HARMONIC_SPLIT_RESULT_EXTENT}",
+                mapped_result.size()
+            ));
+        }
+        let remote_rows = GpuTensor {
+            // SAFETY: the execution owns the registered mapping until all
+            // primary-stream consumers quiesce during release.
+            buf: unsafe {
+                hip_bridge::DeviceBuffer::from_raw(
+                    mapped_result.as_ptr(),
+                    HARMONIC_SPLIT_RESULT_EXTENT,
+                )
+            },
+            shape: vec![HARMONIC_TOP_K, HARMONIC_HIDDEN_SIZE],
+            dtype: DType::F32,
+        };
+        let ffn_out = state
+            .ffn_out
+            .as_ref()
+            .ok_or_else(|| format!("harmonic shared output missing l{layer_idx}"))?;
+        let topk_weights = state
+            .moe_topk_weights
+            .as_ref()
+            .ok_or_else(|| format!("harmonic route weights missing l{layer_idx}"))?;
+        let arch = gpu.arch.clone();
+        let mut device = gpu
+            .try_gfx1100()
+            .ok_or_else(|| format!("harmonic split join requires exact gfx1100, got {arch}"))?;
+        device
+            .harmonic_moe_down_combine_split_candidate(
+                execution.local_down_expanded.as_ref().unwrap(),
+                &remote_rows,
+                execution.slot_sources.as_ref().unwrap(),
+                topk_weights,
+                ffn_out,
+                HARMONIC_HIDDEN_SIZE,
+                HARMONIC_TOP_K,
+            )
+            .map_err(|error| format!("harmonic split join l{layer_idx}: {error}"))?;
+        debug_assert_eq!(
+            packed.remote_count as usize * HARMONIC_HIDDEN_SIZE * std::mem::size_of::<f32>(),
+            expected_extent as usize
+        );
+        execution.record_join_enqueue_cpu(join_enqueue_start.elapsed());
+        return Ok(());
+    }
     let routed_partial = state
         .ffn_routed_overlap
         .as_ref()

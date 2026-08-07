@@ -20,8 +20,9 @@ use serde::Serialize;
 use crate::deepseek4::{DeepseekV4Config, DeepseekV4RoutedWeights};
 use crate::harmonic::{
     unpack_harmonic_x_rot, HarmonicCompletion, HarmonicContract, HarmonicOwner,
-    HARMONIC_EXPERT_COUNT, HARMONIC_HIDDEN_SIZE, HARMONIC_LAYER_COUNT,
-    HARMONIC_MOE_INTERMEDIATE_SIZE, HARMONIC_RESULT_EXTENT, HARMONIC_TOP_K, HARMONIC_X_ROT_BYTES,
+    HARMONIC_EXPERT_COUNT, HARMONIC_HIDDEN_SIZE, HARMONIC_HOTSET_ROUTE_IDENTITY,
+    HARMONIC_LAYER_COUNT, HARMONIC_MOE_INTERMEDIATE_SIZE, HARMONIC_RESULT_EXTENT, HARMONIC_TOP_K,
+    HARMONIC_X_ROT_BYTES,
 };
 use crate::harmonic_ipc::{harmonic_payload_fingerprint, HarmonicIntegrityMode, HarmonicWorkItem};
 use crate::HarmonicRoutePacket;
@@ -385,10 +386,18 @@ impl DeepseekV4HarmonicExpertService {
                 HARMONIC_LAYER_COUNT
             ));
         }
-        let contract = HarmonicContract::frozen(
-            packet.source_allocation_generation,
-            self.allocation_generation,
-        );
+        let contract = if packet.route_identity == HARMONIC_HOTSET_ROUTE_IDENTITY {
+            HarmonicContract::hotset(
+                packet.source_allocation_generation,
+                self.allocation_generation,
+                packet.residency_identity,
+            )
+        } else {
+            HarmonicContract::frozen(
+                packet.source_allocation_generation,
+                self.allocation_generation,
+            )
+        };
         contract
             .validate(packet, now_tick)
             .map_err(|error| format!("harmonic expert mapped route contract: {error}"))?;
@@ -398,11 +407,22 @@ impl DeepseekV4HarmonicExpertService {
                 activation_payload.size()
             ));
         }
-        if result_payload.size() < HARMONIC_RESULT_EXTENT as usize {
+        if result_payload.size() < packet.result_extent as usize {
             return Err(format!(
-                "harmonic mapped result has {} bytes, expected at least {HARMONIC_RESULT_EXTENT}",
-                result_payload.size()
+                "harmonic mapped result has {} bytes, expected at least {}",
+                result_payload.size(),
+                packet.result_extent
             ));
+        }
+        if packet.route_identity == HARMONIC_HOTSET_ROUTE_IDENTITY {
+            return self.execute_mapped_split_packet(
+                gpu,
+                cfg,
+                weights,
+                packet,
+                activation_payload,
+                result_payload,
+            );
         }
         encode_words(&packet.expert_ids, &mut self.topk_index_bytes);
         encode_words(&packet.route_weight_bits, &mut self.topk_weight_bytes);
@@ -561,6 +581,119 @@ impl DeepseekV4HarmonicExpertService {
         }
         Ok(HarmonicCompletion {
             result_extent: HARMONIC_RESULT_EXTENT,
+            result_fingerprint: 0,
+        })
+    }
+
+    fn execute_mapped_split_packet(
+        &mut self,
+        gpu: &mut Gpu,
+        cfg: &DeepseekV4Config,
+        weights: &DeepseekV4RoutedWeights,
+        packet: &HarmonicRoutePacket,
+        activation_payload: &DeviceBuffer,
+        result_payload: &DeviceBuffer,
+    ) -> Result<HarmonicCompletion, String> {
+        let k_top = packet.active_experts as usize;
+        if k_top == 0 {
+            return Ok(HarmonicCompletion {
+                result_extent: 0,
+                result_fingerprint: 0,
+            });
+        }
+        encode_words(&packet.expert_ids, &mut self.topk_index_bytes);
+        gpu.bind_thread()
+            .map_err(|error| format!("harmonic split expert bind execute: {error}"))?;
+        {
+            let stream = gpu
+                .active_stream
+                .as_ref()
+                .ok_or_else(|| "harmonic split expert local stream missing".to_owned())?;
+            gpu.hip
+                .memcpy_htod_async(
+                    &self.topk_indices.as_ref().unwrap().buf,
+                    &self.topk_index_bytes[..k_top * std::mem::size_of::<u32>()],
+                    stream,
+                )
+                .map_err(|error| format!("harmonic split upload top-k indices: {error}"))?;
+        }
+
+        let x_rot = GpuTensor {
+            // SAFETY: the registered activation mapping is live through the
+            // synchronous call and begins with one exact 4096-element row.
+            buf: unsafe {
+                DeviceBuffer::from_raw(activation_payload.as_ptr(), HARMONIC_X_ROT_BYTES)
+            },
+            shape: vec![HARMONIC_HIDDEN_SIZE],
+            dtype: DType::F32,
+        };
+        let layer_index = packet.layer as usize;
+        let layer = weights.resolve_layer(layer_index);
+        let expert_gate_up_ptrs = layer.expert_gate_up_ptrs.as_ref().ok_or_else(|| {
+            format!("harmonic split gate/up pointer table missing l{layer_index}")
+        })?;
+        let expert_down_ptrs = layer
+            .expert_w2_ptrs
+            .as_ref()
+            .ok_or_else(|| format!("harmonic split down pointer table missing l{layer_index}"))?;
+        gpu.deepseek4_gemv_mq2g256_lloyd_moe_gate_up_indexed(
+            expert_gate_up_ptrs,
+            self.topk_indices.as_ref().unwrap(),
+            &x_rot,
+            self.gate_batch.as_ref().unwrap(),
+            self.up_batch.as_ref().unwrap(),
+            2 * HARMONIC_MOE_INTERMEDIATE_SIZE,
+            HARMONIC_HIDDEN_SIZE,
+            k_top,
+        )
+        .map_err(|error| format!("harmonic split gate/up l{layer_index}: {error}"))?;
+        gpu.deepseek4_silu_mul_clamp_f32_batched(
+            self.gate_batch.as_ref().unwrap(),
+            self.up_batch.as_ref().unwrap(),
+            self.gate_batch.as_ref().unwrap(),
+            HARMONIC_MOE_INTERMEDIATE_SIZE,
+            k_top,
+            cfg.swiglu_limit,
+        )
+        .map_err(|error| format!("harmonic split activation l{layer_index}: {error}"))?;
+        gpu.rotate_x_mq_batched(
+            self.gate_batch.as_ref().unwrap(),
+            self.rot_batch.as_ref().unwrap(),
+            HARMONIC_MOE_INTERMEDIATE_SIZE,
+            k_top,
+        )
+        .map_err(|error| format!("harmonic split rotation l{layer_index}: {error}"))?;
+        gpu.deepseek4_gemv_mq2g256_lloyd_moe_down_expanded_k4(
+            expert_down_ptrs,
+            self.topk_indices.as_ref().unwrap(),
+            self.rot_batch.as_ref().unwrap(),
+            self.down_expanded.as_ref().unwrap(),
+            HARMONIC_HIDDEN_SIZE,
+            HARMONIC_MOE_INTERMEDIATE_SIZE,
+            k_top,
+            1,
+        )
+        .map_err(|error| format!("harmonic split down l{layer_index}: {error}"))?;
+        {
+            let stream = gpu.active_stream.as_ref().ok_or_else(|| {
+                "harmonic split expert local stream missing after dispatch".to_owned()
+            })?;
+            gpu.hip
+                .memcpy_dtod_async_at(
+                    result_payload,
+                    0,
+                    &self.down_expanded.as_ref().unwrap().buf,
+                    0,
+                    packet.result_extent as usize,
+                    stream,
+                )
+                .map_err(|error| format!("harmonic split publish result: {error}"))?;
+            gpu.hip
+                .stream_synchronize(stream)
+                .map_err(|error| format!("harmonic split local completion: {error}"))?;
+        }
+        Ok(HarmonicCompletion {
+            result_extent: packet.result_extent,
             result_fingerprint: 0,
         })
     }

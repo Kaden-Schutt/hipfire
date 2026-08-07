@@ -81,7 +81,7 @@ impl Gfx1100Device<'_> {
         )
     }
 
-    /// Benchmark-only routed-down candidate with one cooperative codebook load
+    /// Exact routed-down candidate with one cooperative codebook load
     /// per K4 group. Arithmetic and output ownership match the deterministic
     /// expanded incumbent; only redundant scalar loads are removed.
     #[allow(clippy::too_many_arguments)]
@@ -159,7 +159,7 @@ impl Gfx1100Device<'_> {
         result
     }
 
-    /// Benchmark-only exact-order combine for owner-packed harmonic expert rows.
+    /// Candidate exact-order combine for owner-packed harmonic expert rows.
     ///
     /// `slot_sources` contains six u32 values. Bit 31 selects `remote_outputs`;
     /// the remaining bits select the packed row within that owner. Both an

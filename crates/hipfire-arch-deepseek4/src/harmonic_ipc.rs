@@ -24,18 +24,19 @@ use memmap2::{MmapMut, MmapOptions};
 use crate::harmonic::{
     HarmonicCompletion, HarmonicContract, HarmonicOwner, HarmonicProtocolError,
     HarmonicRoutePacket, HarmonicSlotState, DS4_MQ2R_0731_IDENTITY, HARMONIC_ACTIVATION_EXTENT,
-    HARMONIC_ACTIVATION_RESERVED_OFFSET, HARMONIC_EXPERT_IDS_OFFSET, HARMONIC_RESULT_EXTENT,
-    HARMONIC_ROUTE_IDENTITY, HARMONIC_ROUTE_WEIGHTS_OFFSET, HARMONIC_SLOT_COUNT, HARMONIC_TOP_K,
+    HARMONIC_ACTIVATION_RESERVED_OFFSET, HARMONIC_EXPERT_IDS_OFFSET,
+    HARMONIC_HOTSET_ROUTE_IDENTITY, HARMONIC_ROUTE_IDENTITY, HARMONIC_ROUTE_WEIGHTS_OFFSET,
+    HARMONIC_SLOT_COUNT, HARMONIC_SPLIT_RESULT_EXTENT, HARMONIC_TOP_K,
 };
 
 const HARMONIC_WIRE_MAGIC: u64 = 0x4453_3448_4950_4331; // DS4HIPC1
-const HARMONIC_WIRE_VERSION: u32 = 2;
+const HARMONIC_WIRE_VERSION: u32 = 3;
 const FLAG_SOURCE_OBSERVED: u32 = 1 << 0;
 const FLAG_DESTINATION_QUIESCED: u32 = 1 << 1;
 const OWNER_DENSE_MASK: u32 = 1 << 0;
 const OWNER_EXPERT_MASK: u32 = 1 << 1;
 const ACTIVATION_WORDS: usize = HARMONIC_ACTIVATION_EXTENT as usize / mem::size_of::<u64>();
-const RESULT_WORDS: usize = HARMONIC_RESULT_EXTENT as usize / mem::size_of::<u64>();
+const RESULT_WORDS: usize = HARMONIC_SPLIT_RESULT_EXTENT / mem::size_of::<u64>();
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u32)]
@@ -236,6 +237,7 @@ struct HarmonicWireHeader {
     integrity_mode: AtomicU32,
     route_identity: AtomicU64,
     model_identity: [AtomicU64; 4],
+    residency_identity: AtomicU64,
     source_generation: AtomicU64,
     destination_generation: AtomicU64,
     isolated_owners: AtomicU32,
@@ -251,6 +253,7 @@ impl HarmonicWireHeader {
             integrity_mode: AtomicU32::new(integrity_mode as u32),
             route_identity: AtomicU64::new(contract.route_identity),
             model_identity: model_words.map(AtomicU64::new),
+            residency_identity: AtomicU64::new(contract.residency_identity),
             source_generation: AtomicU64::new(contract.source_allocation_generation),
             destination_generation: AtomicU64::new(contract.destination_allocation_generation),
             isolated_owners: AtomicU32::new(0),
@@ -265,6 +268,7 @@ impl HarmonicWireHeader {
                     .each_ref()
                     .map(|word| word.load(Ordering::Acquire)),
             ),
+            residency_identity: self.residency_identity.load(Ordering::Acquire),
             source_allocation_generation: self.source_generation.load(Ordering::Acquire),
             destination_allocation_generation: self.destination_generation.load(Ordering::Acquire),
         }
@@ -278,14 +282,6 @@ impl HarmonicWireHeader {
 #[repr(transparent)]
 struct HarmonicPayload<const N: usize> {
     bytes: UnsafeCell<[u8; N]>,
-}
-
-impl<const N: usize> HarmonicPayload<N> {
-    const fn new() -> Self {
-        Self {
-            bytes: UnsafeCell::new([0; N]),
-        }
-    }
 }
 
 // SAFETY: sharing is governed by the atomic slot state. Each payload has one
@@ -306,6 +302,9 @@ struct HarmonicWireSlot {
     destination_owner: AtomicU32,
     source_generation: AtomicU64,
     destination_generation: AtomicU64,
+    residency_identity: AtomicU64,
+    active_experts: AtomicU32,
+    local_mask: AtomicU32,
     expert_ids: [AtomicU32; HARMONIC_TOP_K],
     route_weight_bits: [AtomicU32; HARMONIC_TOP_K],
     activation_extent: AtomicU32,
@@ -318,31 +317,6 @@ struct HarmonicWireSlot {
 }
 
 impl HarmonicWireSlot {
-    fn new() -> Self {
-        Self {
-            state: AtomicU32::new(HarmonicWireState::Vacant as u32),
-            flags: AtomicU32::new(0),
-            epoch: AtomicU64::new(0),
-            route_identity: AtomicU64::new(0),
-            model_identity: [const { AtomicU64::new(0) }; 4],
-            layer: AtomicU32::new(0),
-            slot: AtomicU32::new(0),
-            source_owner: AtomicU32::new(0),
-            destination_owner: AtomicU32::new(0),
-            source_generation: AtomicU64::new(0),
-            destination_generation: AtomicU64::new(0),
-            expert_ids: [const { AtomicU32::new(0) }; HARMONIC_TOP_K],
-            route_weight_bits: [const { AtomicU32::new(0) }; HARMONIC_TOP_K],
-            activation_extent: AtomicU32::new(0),
-            result_extent: AtomicU32::new(0),
-            deadline_tick: AtomicU64::new(0),
-            activation_fingerprint: AtomicU64::new(0),
-            result_fingerprint: AtomicU64::new(0),
-            activation_payload: HarmonicPayload::new(),
-            result_payload: HarmonicPayload::new(),
-        }
-    }
-
     fn state(&self) -> HarmonicIpcResult<HarmonicWireState> {
         HarmonicWireState::decode(self.state.load(Ordering::Acquire))
     }
@@ -364,6 +338,11 @@ impl HarmonicWireSlot {
             destination_owner: decode_owner(self.destination_owner.load(Ordering::Relaxed))?,
             source_allocation_generation: self.source_generation.load(Ordering::Relaxed),
             destination_allocation_generation: self.destination_generation.load(Ordering::Relaxed),
+            residency_identity: self.residency_identity.load(Ordering::Relaxed),
+            active_experts: u8::try_from(self.active_experts.load(Ordering::Relaxed))
+                .map_err(|_| HarmonicIpcError::InvalidLayout("active experts"))?,
+            local_mask: u8::try_from(self.local_mask.load(Ordering::Relaxed))
+                .map_err(|_| HarmonicIpcError::InvalidLayout("local mask"))?,
             expert_ids: self
                 .expert_ids
                 .each_ref()
@@ -416,15 +395,6 @@ impl HarmonicWireSlot {
 struct HarmonicWireLayout {
     header: HarmonicWireHeader,
     slots: [HarmonicWireSlot; HARMONIC_SLOT_COUNT],
-}
-
-impl HarmonicWireLayout {
-    fn new(contract: HarmonicContract, integrity_mode: HarmonicIntegrityMode) -> Self {
-        Self {
-            header: HarmonicWireHeader::new(contract, integrity_mode),
-            slots: std::array::from_fn(|_| HarmonicWireSlot::new()),
-        }
-    }
 }
 
 pub struct HarmonicSharedRing {
@@ -491,7 +461,7 @@ impl HarmonicGpuMapping {
             .chain(
                 result_offsets
                     .iter()
-                    .map(|offset| (*offset, HARMONIC_RESULT_EXTENT as usize)),
+                    .map(|offset| (*offset, HARMONIC_SPLIT_RESULT_EXTENT)),
             )
         {
             assert!(
@@ -533,7 +503,7 @@ impl HarmonicGpuMapping {
     pub fn result_buffer(&self, epoch: u64) -> DeviceBuffer {
         self.payload_buffer(
             self.result_offsets[epoch as usize % HARMONIC_SLOT_COUNT],
-            HARMONIC_RESULT_EXTENT as usize,
+            HARMONIC_SPLIT_RESULT_EXTENT,
         )
     }
 
@@ -617,8 +587,14 @@ impl HarmonicSharedRing {
         // atomic, so later cross-process access never races through plain Rust
         // references.
         unsafe {
-            (mmap.as_mut_ptr() as *mut HarmonicWireLayout)
-                .write(HarmonicWireLayout::new(contract, integrity_mode));
+            let layout = mmap.as_mut_ptr() as *mut HarmonicWireLayout;
+            // Every all-zero field representation is valid here: integer
+            // atomics are zero, payload bytes are zero, and wire state zero is
+            // Vacant. Initializing the large payloads in place avoids placing
+            // two 96 KiB result slots on the test or serving thread stack.
+            layout.write_bytes(0, 1);
+            std::ptr::addr_of_mut!((*layout).header)
+                .write(HarmonicWireHeader::new(contract, integrity_mode));
         }
         mmap.flush()?;
         let ring = Self { mmap };
@@ -812,6 +788,12 @@ impl HarmonicSharedRing {
             .store(packet.source_allocation_generation, Ordering::Relaxed);
         slot.destination_generation
             .store(packet.destination_allocation_generation, Ordering::Relaxed);
+        slot.residency_identity
+            .store(packet.residency_identity, Ordering::Relaxed);
+        slot.active_experts
+            .store(packet.active_experts.into(), Ordering::Relaxed);
+        slot.local_mask
+            .store(packet.local_mask.into(), Ordering::Relaxed);
         for (wire, value) in slot.expert_ids.iter().zip(packet.expert_ids) {
             wire.store(value, Ordering::Relaxed);
         }
@@ -1017,7 +999,7 @@ impl HarmonicSharedRing {
         validate_payload(
             self.integrity_mode()?,
             result_payload,
-            HARMONIC_RESULT_EXTENT as usize,
+            completion.result_extent as usize,
             completion.result_fingerprint,
             "result payload",
         )?;
@@ -1028,7 +1010,7 @@ impl HarmonicSharedRing {
         )?;
         slot.result_fingerprint
             .store(completion.result_fingerprint, Ordering::Relaxed);
-        write_payload(&slot.result_payload, result_payload);
+        write_payload_bytes(&slot.result_payload, result_payload);
         slot.flags
             .fetch_or(FLAG_DESTINATION_QUIESCED, Ordering::Release);
         slot.state
@@ -1095,11 +1077,12 @@ impl HarmonicSharedRing {
                 result_extent: slot.result_extent.load(Ordering::Relaxed),
                 result_fingerprint: slot.result_fingerprint.load(Ordering::Relaxed),
             };
-            let result_payload = read_payload(&slot.result_payload);
+            let result_payload =
+                read_payload_prefix(&slot.result_payload, completion.result_extent as usize);
             validate_payload(
                 self.integrity_mode()?,
                 &result_payload,
-                HARMONIC_RESULT_EXTENT as usize,
+                completion.result_extent as usize,
                 completion.result_fingerprint,
                 "result payload",
             )?;
@@ -1398,8 +1381,17 @@ impl HarmonicSharedRing {
 }
 
 fn validate_frozen_contract(contract: HarmonicContract) -> HarmonicIpcResult<()> {
-    if contract.route_identity != HARMONIC_ROUTE_IDENTITY {
+    if !matches!(
+        contract.route_identity,
+        HARMONIC_ROUTE_IDENTITY | HARMONIC_HOTSET_ROUTE_IDENTITY
+    ) {
         return Err(HarmonicIpcError::InvalidLayout("route identity"));
+    }
+    if (contract.route_identity == HARMONIC_ROUTE_IDENTITY && contract.residency_identity != 0)
+        || (contract.route_identity == HARMONIC_HOTSET_ROUTE_IDENTITY
+            && contract.residency_identity == 0)
+    {
+        return Err(HarmonicIpcError::InvalidLayout("residency identity"));
     }
     if contract.model_identity != DS4_MQ2R_0731_IDENTITY {
         return Err(HarmonicIpcError::InvalidLayout("model identity"));
@@ -1457,6 +1449,19 @@ fn write_payload<const N: usize>(wire: &HarmonicPayload<N>, payload: &[u8]) {
     write_payload_prefix(wire, payload, N);
 }
 
+fn write_payload_bytes<const N: usize>(wire: &HarmonicPayload<N>, payload: &[u8]) {
+    debug_assert!(payload.len() <= N);
+    // SAFETY: the protocol grants the destination exclusive write ownership
+    // until release-completion and the checked source prefix fits the wire.
+    unsafe {
+        ptr::copy_nonoverlapping(
+            payload.as_ptr(),
+            wire.bytes.get().cast::<u8>(),
+            payload.len(),
+        );
+    }
+}
+
 fn write_payload_prefix<const N: usize>(wire: &HarmonicPayload<N>, payload: &[u8], words: usize) {
     debug_assert_eq!(payload.len(), N);
     let bytes = words.saturating_mul(mem::size_of::<u64>()).min(N);
@@ -1473,6 +1478,21 @@ fn read_payload<const N: usize>(wire: &HarmonicPayload<N>) -> Vec<u8> {
     // SAFETY: the caller first acquired Published or Completed, pairing with
     // the sole writer's release transition. The destination vector is exactly
     // N bytes and does not overlap the mapped payload.
+    unsafe {
+        ptr::copy_nonoverlapping(
+            wire.bytes.get().cast::<u8>(),
+            payload.as_mut_ptr(),
+            payload.len(),
+        );
+    }
+    payload
+}
+
+fn read_payload_prefix<const N: usize>(wire: &HarmonicPayload<N>, extent: usize) -> Vec<u8> {
+    debug_assert!(extent <= N);
+    let mut payload = vec![0_u8; extent];
+    // SAFETY: the caller acquired Completed and `extent` was validated by the
+    // route contract before the destination wrote this fixed payload prefix.
     unsafe {
         ptr::copy_nonoverlapping(
             wire.bytes.get().cast::<u8>(),
@@ -1506,7 +1526,9 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::*;
-    use crate::harmonic::{HARMONIC_ACTIVATION_EXTENT, HARMONIC_RESULT_EXTENT};
+    use crate::harmonic::{
+        HarmonicSplitResultLayout, HARMONIC_ACTIVATION_EXTENT, HARMONIC_RESULT_EXTENT,
+    };
 
     static TEST_NONCE: AtomicU64 = AtomicU64::new(0);
 
@@ -1529,6 +1551,13 @@ mod tests {
             destination_generation: u64,
             data_plane: bool,
         ) -> Self {
+            Self::new_contract(
+                HarmonicContract::frozen(source_generation, destination_generation),
+                data_plane,
+            )
+        }
+
+        fn new_contract(contract: HarmonicContract, data_plane: bool) -> Self {
             let nonce = TEST_NONCE.fetch_add(1, Ordering::Relaxed);
             let path = std::env::temp_dir().join(format!(
                 "hipfire-harmonic-ipc-{}-{nonce}",
@@ -1540,7 +1569,6 @@ mod tests {
                 .write(true)
                 .open(&path)
                 .unwrap();
-            let contract = HarmonicContract::frozen(source_generation, destination_generation);
             let ring = if data_plane {
                 HarmonicSharedRing::create_data_plane(&file, contract)
             } else {
@@ -1611,6 +1639,52 @@ mod tests {
         assert_eq!(resolved.result_payload.unwrap(), result);
         owner.ring.recycle(1).unwrap();
         assert_eq!(owner.ring.state(1).unwrap(), HarmonicWireState::Vacant);
+    }
+
+    #[test]
+    fn hotset_contract_copies_only_the_packed_remote_prefix() {
+        let contract = HarmonicContract::hotset(7, 11, 0xdead_beef_cafe_f00d);
+        let owner = TestRing::new_contract(contract, true);
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&owner.path)
+            .unwrap();
+        let peer = HarmonicSharedRing::open(&file).unwrap();
+        let activation = payload(HARMONIC_ACTIVATION_EXTENT as usize, 17);
+        let weights = [0.5f32, 0.4, 0.3, 0.2, 0.1, 0.05].map(f32::to_bits);
+
+        for (epoch, local_mask) in [(1_u64, 0b00_1011_u8), (2, 0b11_1111)] {
+            let remote_mask = 0b11_1111 ^ local_mask;
+            let packed = HarmonicSplitResultLayout::checked(local_mask, remote_mask)
+                .unwrap()
+                .pack_route([17, 23, 41, 59, 83, 127]);
+            let request = contract.split_packet(epoch, 3, packed, weights, u64::MAX);
+            let expected_extent = packed.remote_result_extent() as usize;
+            assert_eq!(request.result_extent as usize, expected_extent);
+            assert_eq!(request.active_experts, packed.remote_count);
+            assert_eq!(request.local_mask, local_mask);
+
+            owner.ring.publish(request, 7, 0, &activation).unwrap();
+            let observed = peer.expert_begin(epoch, 11, 1).unwrap();
+            assert_eq!(observed.packet, request);
+            let result = payload(expected_extent, epoch.wrapping_mul(97));
+            peer.expert_complete(
+                epoch,
+                11,
+                HarmonicCompletion {
+                    result_extent: request.result_extent,
+                    result_fingerprint: 0,
+                },
+                &result,
+            )
+            .unwrap();
+            let resolved = owner.ring.source_resolve(epoch, 7).unwrap();
+            assert_eq!(resolved.state, HarmonicSlotState::Completed);
+            assert_eq!(resolved.result_payload.unwrap(), result);
+            owner.ring.recycle(epoch).unwrap();
+            assert_eq!(owner.ring.state(epoch).unwrap(), HarmonicWireState::Vacant);
+        }
     }
 
     #[test]

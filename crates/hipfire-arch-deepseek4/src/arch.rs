@@ -17,9 +17,9 @@
 
 use crate::backend::Mq2rBackend;
 use crate::deepseek4::{
-    DeepseekV4Config, DeepseekV4DenseWeights, DeepseekV4HeterogeneousWeights,
-    DeepseekV4LayerWeights, DeepseekV4RoutedWeights, DeepseekV4State, DeepseekV4Weights,
-    DsparkConfig, DsparkWeights,
+    DeepseekV4Config, DeepseekV4DenseWeights, DeepseekV4HarmonicReplicaWeights,
+    DeepseekV4HeterogeneousWeights, DeepseekV4LayerWeights, DeepseekV4RoutedWeights,
+    DeepseekV4State, DeepseekV4Weights, DsparkConfig, DsparkWeights,
 };
 use crate::harmonic::{HarmonicExpertResidencyPlan, HarmonicOwner, HARMONIC_LAYER_COUNT};
 
@@ -1649,6 +1649,50 @@ impl DeepseekV4 {
             headroom_bytes,
             layer_slot_counts,
         })
+    }
+
+    /// Upload the already-projected exact replica set into compact per-layer
+    /// blobs on gfx1100. The caller must retain the full routed model on
+    /// gfx1151; this is an additive locality cache, never expert pruning.
+    pub fn load_weights_harmonic_hot_experts_gfx1100(
+        hfq: &mut HfqFile,
+        cfg: &DeepseekV4Config,
+        gpu: &mut Gpu,
+        plan: &HarmonicExpertResidencyPlan,
+    ) -> Result<DeepseekV4HarmonicReplicaWeights, String> {
+        let projection = Self::project_harmonic_hot_experts_gfx1100(hfq, cfg, gpu, plan)?;
+        if projection.layer_slot_counts.iter().any(|count| *count == 0) {
+            return Err(
+                "deepseek4 harmonic replica plan must select at least one expert per layer"
+                    .to_owned(),
+            );
+        }
+        hfq.drop_mmap();
+        let mut staging = DeepseekV4RoutedWeightStaging::new(
+            DeepseekV4RoutedWeights::new(cfg, Mq2rBackend::Portable),
+            gpu,
+        );
+        for layer_index in 0..cfg.num_hidden_layers {
+            let keep = plan.experts_in_layer(layer_index).collect::<Vec<_>>();
+            let layer = staging
+                .routed_mut()
+                .layer_mut(layer_index)
+                .ok_or_else(|| format!("deepseek4: replica owner missing layer {layer_index}"))?;
+            Self::upload_layer_routed_experts(
+                hfq,
+                gpu,
+                &format!("layers.{layer_index}"),
+                keep.len(),
+                layer,
+                None,
+                Some(&keep),
+            )?;
+        }
+        hfq.shrink_pread_buf();
+        Ok(DeepseekV4HarmonicReplicaWeights::new(
+            staging.publish(),
+            plan.identity(),
+        ))
     }
 
     /// Load only the packed routed experts into an independently owned

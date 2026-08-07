@@ -4,7 +4,7 @@
 
 #include <hip/hip_runtime.h>
 
-// Benchmark-only exact-gfx1100 combine for the harmonic DS4 expert split.
+// Candidate exact-gfx1100 combine for the harmonic DS4 expert split.
 //
 // local_outputs and remote_outputs are independently packed in canonical route
 // order. slot_sources maps each of the six original route slots to its owner
