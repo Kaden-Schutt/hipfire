@@ -24,8 +24,10 @@
 //!   - Embedding lookup, lm_head matmul, sampler
 
 use crate::backend::Mq2rBackend;
+#[cfg(feature = "harmonic-worker")]
+use crate::deepseek4::DeepseekV4HarmonicReplicaWeights;
 use crate::deepseek4::{
-    DeepseekV4HarmonicReplicaWeights, DeepseekV4HeterogeneousWeights, DeepseekV4RoutedWeights,
+    DeepseekV4DenseWeights, DeepseekV4HeterogeneousWeights, DeepseekV4RoutedWeights,
 };
 #[cfg(feature = "harmonic-worker")]
 use crate::harmonic::{
@@ -40,6 +42,7 @@ use crate::harmonic_ipc::{harmonic_monotonic_tick, HarmonicIpcError};
 use crate::harmonic_model::{DeepseekV4HarmonicExecution, HarmonicDenseRetainedFfn};
 use crate::heterogeneous::DeepseekV4HeterogeneousExecution;
 use crate::{DeepseekV4Config, DeepseekV4State, DeepseekV4Weights};
+use hip_bridge::{Event, Stream};
 use hipfire_dispatch::context::DispatchCtx;
 use hipfire_dispatch::pipeline::superop::{
     self, ForwardBindings, OpBinding, OpFlavor, SuperOp, SuperOpKind,
@@ -1013,13 +1016,15 @@ fn gemv_auto(
         weight.dtype,
         DType::MFP4G32E8 | DType::MFP4G32E8SOA | DType::MFP3G32E8
     ) {
+        if weight.dtype == DType::MFP4G32E8SOA
+            && mq2r_backend.try_dense_e8(gpu, weight, x_rotated, y, m, k)?
+        {
+            return Ok(());
+        }
         return match weight.dtype {
             DType::MFP4G32E8 => gpu
                 .gemv_mfp4g32_e8_prerotated(weight, x_rotated, y, m, k)
                 .map_err(|e| format!("gemv MFP4-E8: {e:?}")),
-            DType::MFP4G32E8SOA if gpu.arch_caps.is_gfx1100() => gpu
-                .gemv_mfp4g32_e8_soa_buffer_gfx1100(weight, x_rotated, y, m, k)
-                .map_err(|e| format!("gemv MFP4-E8-SoA gfx1100 buffer: {e:?}")),
             DType::MFP4G32E8SOA if config_cache::e8_u4_on(&gpu.arch, mq2r_backend.is_gfx1151()) => {
                 if mq2r_backend.is_gfx1151() {
                     gpu.gemv_mfp4g32_e8_soa_u4_buffer_cpol_gfx1151(0, weight, x_rotated, y, m, k)
@@ -3424,6 +3429,146 @@ fn two_stage_topk_capacity_eligible(arch: &str, max_compressed: usize) -> bool {
             || max_compressed > crate::deepseek4::INITIAL_COMPRESSED_ROWS)
 }
 
+/// Owner-local execution resources for the exact-gfx1100 DS4 critical-path
+/// gate. This contains no peer allocation, mapped ring, worker process, or
+/// cross-device signal. It exists to measure the dense/non-routed owner before
+/// any heterogeneous transport is admitted.
+pub struct DeepseekV4Gfx1100OwnerExecution {
+    side_stream: Option<Stream>,
+    fork_event: Option<Event>,
+    join_event: Option<Event>,
+}
+
+impl DeepseekV4Gfx1100OwnerExecution {
+    pub fn new(gpu: &mut Gpu) -> Result<Self, String> {
+        if !gpu.arch_caps.is_gfx1100() {
+            return Err(format!(
+                "deepseek4 gfx1100 owner gate requires exact gfx1100, got {}",
+                gpu.arch
+            ));
+        }
+        if gpu.active_stream.is_some() {
+            return Err("deepseek4 gfx1100 owner gate found a claimed primary stream".to_owned());
+        }
+        gpu.bind_thread()
+            .map_err(|error| format!("deepseek4 gfx1100 owner bind: {error:?}"))?;
+        let mut execution = Self {
+            side_stream: None,
+            fork_event: None,
+            join_event: None,
+        };
+        let result = (|| {
+            gpu.active_stream = Some(
+                gpu.hip
+                    .stream_create()
+                    .map_err(|error| format!("gfx1100 owner primary stream: {error:?}"))?,
+            );
+            execution.side_stream = Some(
+                gpu.hip
+                    .stream_create()
+                    .map_err(|error| format!("gfx1100 owner side stream: {error:?}"))?,
+            );
+            execution.fork_event = Some(
+                gpu.hip
+                    .event_create()
+                    .map_err(|error| format!("gfx1100 owner fork event: {error:?}"))?,
+            );
+            execution.join_event = Some(
+                gpu.hip
+                    .event_create()
+                    .map_err(|error| format!("gfx1100 owner join event: {error:?}"))?,
+            );
+            Ok(())
+        })();
+        if let Err(error) = result {
+            let _ = execution.close(gpu);
+            return Err(error);
+        }
+        Ok(execution)
+    }
+
+    pub fn close(mut self, gpu: &mut Gpu) -> Result<(), String> {
+        gpu.bind_thread_or_warn();
+        let mut errors = Vec::new();
+        for stream in [gpu.active_stream.as_ref(), self.side_stream.as_ref()]
+            .into_iter()
+            .flatten()
+        {
+            if let Err(error) = gpu.hip.stream_synchronize(stream) {
+                errors.push(format!("synchronize gfx1100 owner stream: {error:?}"));
+            }
+        }
+        for event in [self.join_event.take(), self.fork_event.take()]
+            .into_iter()
+            .flatten()
+        {
+            if let Err(error) = gpu.hip.event_destroy(event) {
+                errors.push(format!("destroy gfx1100 owner event: {error:?}"));
+            }
+        }
+        for stream in [self.side_stream.take(), gpu.active_stream.take()]
+            .into_iter()
+            .flatten()
+        {
+            if let Err(error) = gpu.hip.stream_destroy(stream) {
+                errors.push(format!("destroy gfx1100 owner stream: {error:?}"));
+            }
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("; "))
+        }
+    }
+}
+
+/// Run the exact gfx1100-owned portion of one DS4 token.
+///
+/// Routed-expert arithmetic is intentionally omitted and the shared-expert
+/// output proceeds directly into the canonical HC mix. The result is not a
+/// model-quality output; it is a model-shaped timing gate for every operation
+/// that harmonic execution assigns to gfx1100. Shapes, weights, routing,
+/// attention state, and launch topology are otherwise the production path.
+pub fn decode_step_gfx1100_owner_probe(
+    cfg: &DeepseekV4Config,
+    dense_weights: &DeepseekV4DenseWeights,
+    state: &mut DeepseekV4State,
+    gpu: &mut Gpu,
+    execution: &mut DeepseekV4Gfx1100OwnerExecution,
+    token_id: u32,
+    position: u32,
+) -> Result<Vec<f32>, String> {
+    let weights = &dense_weights.inner;
+    if !weights.mq2r_backend.is_gfx1100() || !gpu.arch_caps.is_gfx1100() {
+        return Err(format!(
+            "deepseek4 owner probe requires a model-owned gfx1100 backend on gfx1100, got backend={:?} arch={}",
+            weights.mq2r_backend, gpu.arch
+        ));
+    }
+    if gpu.replay.is_enabled() || gpu.graphs.capture_mode {
+        return Err("deepseek4 gfx1100 owner probe admits direct HIP only".to_owned());
+    }
+
+    ensure_compressor_capacity(cfg, state, gpu, (position as usize).saturating_add(1))?;
+    precompute_positions(cfg, state, gpu, position)?;
+    precompute_token_id(state, gpu, token_id)?;
+    init_residual_streams(cfg, weights, state, gpu, token_id)?;
+
+    for layer_idx in 0..cfg.num_hidden_layers {
+        ds4_attn_block_gfx1100_owner(cfg, weights, state, gpu, execution, layer_idx, position)?;
+        mhc_pre(cfg, weights, state, gpu, layer_idx, /*is_attn=*/ false)?;
+        ffn_prepare(cfg, weights, state, gpu, layer_idx)?;
+        heterogeneous_select_routes(cfg, weights, state, gpu, layer_idx)?;
+        ffn_shared_project(cfg, weights, state, gpu, layer_idx)?;
+        hc_ffn_mix(cfg, weights, state, gpu, layer_idx)?;
+    }
+
+    final_norm_and_head(cfg, weights, state, gpu)?;
+    state.n_tokens = state.n_tokens.saturating_add(1);
+    gpu.download_f32(state.logits.as_ref().unwrap())
+        .map_err(|error| format!("download gfx1100 owner logits: {error:?}"))
+}
+
 /// Single-token decode step. Takes the token id of the previous
 /// position, returns the logits over `vocab_size`.
 ///
@@ -4344,7 +4489,7 @@ pub fn decode_step_body(
         }
 
         // v + vi. Main attention + O-LoRA — STUB.
-        attn_stub(cfg, weights, state, gpu, layer_idx, OloraSchedule::Default)?;
+        attn_stub(cfg, weights, state, gpu, layer_idx)?;
         if let Some(t) = state.attn_out.as_ref() {
             dump_stage_norm(gpu, "attn_out", t, layer_idx, position);
         }
@@ -4457,7 +4602,7 @@ fn ds4_attn_block(
             dump_indexer_state(gpu, state, layer_idx, position, _n);
         }
     }
-    attn_stub(cfg, weights, state, gpu, layer_idx, OloraSchedule::Default)?;
+    attn_stub(cfg, weights, state, gpu, layer_idx)?;
     hc_attn_mix(cfg, weights, state, gpu, layer_idx)?;
     Ok(())
 }
@@ -4558,14 +4703,103 @@ fn ds4_attn_block_heterogeneous(
         let n = indexer_forward(cfg, weights, state, gpu, layer_idx, position)?;
         dump_indexer_state(gpu, state, layer_idx, position, n);
     }
-    attn_stub(
-        cfg,
-        weights,
-        state,
-        gpu,
-        layer_idx,
-        OloraSchedule::HeterogeneousGfx1100,
-    )?;
+    attn_stub(cfg, weights, state, gpu, layer_idx)?;
+    hc_attn_mix(cfg, weights, state, gpu, layer_idx)
+}
+
+/// Exact-gfx1100 dual-stream attention schedule without a second device.
+/// This is the owner-local half of the accepted heterogeneous schedule and is
+/// kept independent of the harmonic process/IPC types so it can serve as a
+/// hard architecture-throughput gate.
+fn ds4_attn_block_gfx1100_owner(
+    cfg: &DeepseekV4Config,
+    weights: &DeepseekV4Weights,
+    state: &mut DeepseekV4State,
+    gpu: &mut Gpu,
+    execution: &mut DeepseekV4Gfx1100OwnerExecution,
+    layer_idx: usize,
+    position: u32,
+) -> Result<(), String> {
+    let layer = weights.resolve_layer(layer_idx);
+    mhc_pre(cfg, weights, state, gpu, layer_idx, /*is_attn=*/ true)?;
+    q_lora_prepare(cfg, weights, state, gpu, layer_idx)?;
+
+    {
+        let primary = gpu
+            .active_stream
+            .as_ref()
+            .ok_or_else(|| "gfx1100 owner primary stream missing".to_owned())?;
+        let fork = execution
+            .fork_event
+            .as_ref()
+            .ok_or_else(|| "gfx1100 owner fork event missing".to_owned())?;
+        gpu.hip
+            .event_record(fork, Some(primary))
+            .map_err(|error| format!("gfx1100 owner attention fork l{layer_idx}: {error:?}"))?;
+        let side = execution
+            .side_stream
+            .as_ref()
+            .ok_or_else(|| "gfx1100 owner side stream missing".to_owned())?;
+        gpu.hip
+            .stream_wait_event(side, fork)
+            .map_err(|error| format!("gfx1100 owner side wait l{layer_idx}: {error:?}"))?;
+    }
+
+    std::mem::swap(&mut gpu.active_stream, &mut execution.side_stream);
+    let side_result = (|| {
+        kv_joint(cfg, weights, state, gpu, layer_idx)?;
+        if layer.compress_ratio > 0 {
+            let tmp_view = {
+                let tmp = state.tmp.as_ref().unwrap();
+                tmp.sub_offset(0, tmp.numel())
+            };
+            compressor_forward(
+                cfg, weights, state, gpu, layer_idx, &tmp_view, position,
+                /*is_indexer=*/ false,
+            )?;
+            if layer.compress_ratio == 4 {
+                compressor_forward(
+                    cfg, weights, state, gpu, layer_idx, &tmp_view, position,
+                    /*is_indexer=*/ true,
+                )?;
+            }
+        }
+        let side = gpu
+            .active_stream
+            .as_ref()
+            .ok_or_else(|| "gfx1100 owner active side stream missing".to_owned())?;
+        let join = execution
+            .join_event
+            .as_ref()
+            .ok_or_else(|| "gfx1100 owner join event missing".to_owned())?;
+        gpu.hip
+            .event_record(join, Some(side))
+            .map_err(|error| format!("gfx1100 owner attention join l{layer_idx}: {error:?}"))
+    })();
+    std::mem::swap(&mut gpu.active_stream, &mut execution.side_stream);
+    side_result?;
+
+    q_lora_project(cfg, weights, state, gpu, layer_idx)?;
+    {
+        let primary = gpu
+            .active_stream
+            .as_ref()
+            .ok_or_else(|| "gfx1100 owner primary missing after Q-LoRA".to_owned())?;
+        let join = execution
+            .join_event
+            .as_ref()
+            .ok_or_else(|| "gfx1100 owner join event missing".to_owned())?;
+        gpu.hip
+            .stream_wait_event(primary, join)
+            .map_err(|error| format!("gfx1100 owner primary wait l{layer_idx}: {error:?}"))?;
+    }
+
+    apply_tail_rope(cfg, weights, state, gpu, position, layer_idx)?;
+    if layer.compress_ratio == 4 {
+        let n = indexer_forward(cfg, weights, state, gpu, layer_idx, position)?;
+        dump_indexer_state(gpu, state, layer_idx, position, n);
+    }
+    attn_stub(cfg, weights, state, gpu, layer_idx)?;
     hc_attn_mix(cfg, weights, state, gpu, layer_idx)
 }
 
@@ -4660,14 +4894,7 @@ fn ds4_attn_block_harmonic(
         let n = indexer_forward(cfg, weights, state, gpu, layer_idx, position)?;
         dump_indexer_state(gpu, state, layer_idx, position, n);
     }
-    attn_stub(
-        cfg,
-        weights,
-        state,
-        gpu,
-        layer_idx,
-        OloraSchedule::HeterogeneousGfx1100,
-    )?;
+    attn_stub(cfg, weights, state, gpu, layer_idx)?;
     hc_attn_mix(cfg, weights, state, gpu, layer_idx)
 }
 
@@ -5651,14 +5878,7 @@ fn mtp_pre_ffn(
     kv_joint(cfg, weights, state, gpu, mtp_layer_idx)?;
     apply_tail_rope(cfg, weights, state, gpu, position, mtp_layer_idx)?;
     // (No compressor / indexer for MTP — compress_ratio == 0.)
-    attn_stub(
-        cfg,
-        weights,
-        state,
-        gpu,
-        mtp_layer_idx,
-        OloraSchedule::Default,
-    )?;
+    attn_stub(cfg, weights, state, gpu, mtp_layer_idx)?;
     hc_attn_mix(cfg, weights, state, gpu, mtp_layer_idx)?;
     Ok(())
 }
@@ -8092,19 +8312,12 @@ fn final_norm_and_head(
 ///
 /// This handles position 0. For position > 0 we need SWA cache +
 /// real Q·K·V over history — pending.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum OloraSchedule {
-    Default,
-    HeterogeneousGfx1100,
-}
-
 fn attn_stub(
     cfg: &DeepseekV4Config,
     weights: &DeepseekV4Weights,
     state: &mut DeepseekV4State,
     gpu: &mut Gpu,
     layer_idx: usize,
-    olora_schedule: OloraSchedule,
 ) -> Result<(), String> {
     // Final attention contribution: shape [hidden]. Consumed by hc_attn_mix.
     if state.attn_out.is_none() {
@@ -8478,18 +8691,16 @@ fn attn_stub(
             per_group_in,
         )
         .map_err(|e| format!("grouped E8 wo_a l{layer_idx}: {e:?}"))?;
-    } else if wo_a.dtype == DType::MFP4G32E8SOA
-        && olora_schedule == OloraSchedule::HeterogeneousGfx1100
-    {
-        gpu.gemv_mfp4g32_e8_soa_grouped_gfx1100(
+    } else if wo_a.dtype == DType::MFP4G32E8SOA && weights.mq2r_backend.is_gfx1100() {
+        weights.mq2r_backend.grouped_olora_e8(
+            gpu,
             wo_a,
             attn_out_raw_rot,
             wo_a_out,
             n_groups,
             o_lora_rank,
             per_group_in,
-        )
-        .map_err(|e| format!("grouped gfx1100 E8 wo_a l{layer_idx}: {e:?}"))?;
+        )?;
     } else if wo_a.dtype == DType::MFP4G32E8SOA
         && config_cache::gfx942_e8_wo_grouped_on(&gpu.arch, weights.mq2r_backend.is_gfx942())
         && per_group_in % 256 == 0

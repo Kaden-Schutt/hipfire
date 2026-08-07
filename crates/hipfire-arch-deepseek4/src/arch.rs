@@ -1875,6 +1875,10 @@ impl DeepseekV4 {
                 "554 E8 tensors"
             };
             match weights.mq2r_backend {
+                Mq2rBackend::Gfx1100(_) => eprintln!(
+                    "deepseek4: {sku} P3 tensor recipe verified; selected exact \
+                     gfx1100 backend ({dense}; routed experts absent or separately owned)"
+                ),
                 Mq2rBackend::Gfx1151 => eprintln!(
                     "deepseek4: {sku} P3 tensor recipe verified; selected \
                      gfx1151 backend ({dense}; routed experts qt=19)"

@@ -59,6 +59,34 @@ impl Gpu {
 }
 
 impl Gfx1100Device<'_> {
+    /// Exact-target DS4 dense E8 projection. The model crate must hold its own
+    /// verified MQ2R backend before it can reach this wrapper.
+    pub fn ds4_dense_e8(
+        &mut self,
+        weight: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.gpu
+            .gemv_mfp4g32_e8_soa_buffer_gfx1100(weight, x, y, m, k)
+    }
+
+    /// Exact-target one-dispatch DS4 O-LoRA projection.
+    pub fn ds4_grouped_olora_e8(
+        &mut self,
+        weight: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        groups: usize,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.gpu
+            .gemv_mfp4g32_e8_soa_grouped_gfx1100(weight, x, y, groups, m, k)
+    }
+
     /// Partition six canonical DS4 route slots against the immutable local
     /// replica map without returning IDs to the CPU or uploading packed IDs.
     #[allow(clippy::too_many_arguments)]
