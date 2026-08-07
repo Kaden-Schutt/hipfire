@@ -3589,7 +3589,6 @@ pub(crate) fn decode_step_harmonic(
     precompute_token_id(state, gpu, token_id)?;
     init_residual_streams(cfg, weights, state, gpu, token_id)?;
     ensure_ffn_split_resource(cfg, state, gpu)?;
-    execution.prepare_gpu_mailbox_token(gpu, cfg.num_hidden_layers)?;
 
     for layer_idx in 0..cfg.num_hidden_layers {
         let layer_start = std::time::Instant::now();
@@ -3598,78 +3597,15 @@ pub(crate) fn decode_step_harmonic(
         ffn_prepare(cfg, weights, state, gpu, layer_idx)?;
         heterogeneous_select_routes(cfg, weights, state, gpu, layer_idx, token_id)?;
 
-        let mapping = execution
-            .mapping
-            .as_ref()
-            .ok_or_else(|| "harmonic gfx1100 mapping unavailable".to_owned())?;
-        let header = mapping.header_buffer();
-        let slot0 = mapping.slot_control_buffer(0);
-        let slot1 = mapping.slot_control_buffer(1);
-        let activation0 = mapping.activation_buffer(0);
-        let activation1 = mapping.activation_buffer(1);
-        let result0 = mapping.result_buffer(0);
-        let result1 = mapping.result_buffer(1);
-        let ffn_x_rot = state
-            .ffn_x_rot
-            .as_ref()
-            .ok_or_else(|| format!("harmonic x_rot missing l{layer_idx}"))?;
-        let topk_indices = state
-            .moe_topk_indices
-            .as_ref()
-            .ok_or_else(|| format!("harmonic route indices missing l{layer_idx}"))?;
-        let topk_weights = state
-            .moe_topk_weights
-            .as_ref()
-            .ok_or_else(|| format!("harmonic route weights missing l{layer_idx}"))?;
-        let token_control = execution
-            .mailbox_token_control
-            .as_ref()
-            .ok_or_else(|| "harmonic mailbox token control unavailable".to_owned())?;
-        let mailbox_status = execution
-            .mailbox_status
-            .as_ref()
-            .ok_or_else(|| "harmonic mailbox status unavailable".to_owned())?;
-        gpu.deepseek4_harmonic_publish_gfx1100(
-            &header,
-            &slot0,
-            &slot1,
-            &activation0,
-            &activation1,
-            ffn_x_rot,
-            topk_indices,
-            topk_weights,
-            token_control,
-            layer_idx,
-            mailbox_status,
-        )
-        .map_err(|error| format!("harmonic GPU publish l{layer_idx}: {error:?}"))?;
+        let epoch = execution.next_epoch()?;
+        harmonic_stage_route_payload(cfg, state, gpu, execution, epoch, layer_idx)?;
 
-        // Publication and the independent shared projection are ordered on
-        // gfx1100's queue. The worker acquires Published as soon as the first
-        // kernel completes, so both devices execute the FFN branches together.
+        // The side transfer stream is now waiting on route-ready. Queue the
+        // independent shared branch immediately on the primary gfx1100 stream.
         ffn_shared_project(cfg, weights, state, gpu, layer_idx)?;
-        let routed_partial = state
-            .ffn_routed_overlap
-            .as_ref()
-            .ok_or_else(|| format!("harmonic routed partial missing l{layer_idx}"))?;
-        gpu.deepseek4_harmonic_wait_copy_gfx1100(
-            &slot0,
-            &slot1,
-            &result0,
-            &result1,
-            routed_partial,
-            token_control,
-            layer_idx,
-            1_000_000_000,
-            mailbox_status,
-        )
-        .map_err(|error| format!("harmonic GPU wait/copy l{layer_idx}: {error:?}"))?;
-        let ffn_out = state
-            .ffn_out
-            .as_ref()
-            .ok_or_else(|| format!("harmonic shared output missing l{layer_idx}"))?;
-        gpu.add_inplace_f32(ffn_out, routed_partial)
-            .map_err(|error| format!("harmonic ordered join l{layer_idx}: {error:?}"))?;
+
+        harmonic_publish_staged_route(gpu, execution, epoch, layer_idx)?;
+        harmonic_join_result(state, gpu, execution, epoch, layer_idx)?;
         hc_ffn_mix(cfg, weights, state, gpu, layer_idx)?;
         dump_residual_layer_norm(gpu, state, layer_idx, position);
         execution.record_layer(layer_start.elapsed());
@@ -3680,7 +3616,6 @@ pub(crate) fn decode_step_harmonic(
     let logits = gpu
         .download_f32(state.logits.as_ref().unwrap())
         .map_err(|error| format!("download harmonic logits: {error:?}"))?;
-    execution.finish_gpu_mailbox_token(gpu)?;
     execution.record_token();
     Ok(logits)
 }

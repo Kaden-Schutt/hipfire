@@ -5124,12 +5124,6 @@ pub const GEMV_MQ2G256_LLOYD_MOE_DOWN_ALLRANKS_GFX942_SRC: &str =
 pub const GEMV_MQ2G256_LLOYD_MOE_DOWN_EXPANDED_K4_GFX942_SRC: &str =
     include_str!("../../../kernels/src/gemv_mq2g256_lloyd_moe_down_expanded_k4.gfx942.hip");
 
-/// Exact-gfx1100 producer/consumer mailbox used by the fault-contained DS4
-/// harmonic route. The wait kernel is cycle-bounded; it never emits an
-/// indefinite cross-device PM4 wait.
-pub const DEEPSEEK4_HARMONIC_MAILBOX_GFX1100_SRC: &str =
-    include_str!("../../../kernels/src/deepseek4_harmonic_mailbox.gfx1100.hip");
-
 /// MQ3-Lloyd MoE indexed family (MiniMax-M2, arch_id=10): routed-experts
 /// gate_up + down with device-side topk routing + per-expert pointer table.
 /// Mirrors the MQ2-Lloyd MoE indexed kernels (3-bit + 8-entry codebook,

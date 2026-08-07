@@ -317,37 +317,6 @@ struct HarmonicWireSlot {
     result_payload: HarmonicPayload<{ RESULT_WORDS * mem::size_of::<u64>() }>,
 }
 
-// `deepseek4_harmonic_mailbox.gfx1100.hip` consumes only this control prefix.
-// Keep these assertions beside the authority type so an innocent Rust layout
-// edit fails the build instead of silently corrupting a cross-process packet.
-const _: () = {
-    assert!(HARMONIC_SLOT_COUNT == 2);
-    assert!(mem::offset_of!(HarmonicWireHeader, route_identity) == 24);
-    assert!(mem::offset_of!(HarmonicWireHeader, model_identity) == 32);
-    assert!(mem::offset_of!(HarmonicWireHeader, source_generation) == 64);
-    assert!(mem::offset_of!(HarmonicWireHeader, destination_generation) == 72);
-    assert!(mem::offset_of!(HarmonicWireHeader, isolated_owners) == 80);
-    assert!(mem::offset_of!(HarmonicWireSlot, state) == 0);
-    assert!(mem::offset_of!(HarmonicWireSlot, flags) == 4);
-    assert!(mem::offset_of!(HarmonicWireSlot, epoch) == 8);
-    assert!(mem::offset_of!(HarmonicWireSlot, route_identity) == 16);
-    assert!(mem::offset_of!(HarmonicWireSlot, model_identity) == 24);
-    assert!(mem::offset_of!(HarmonicWireSlot, layer) == 56);
-    assert!(mem::offset_of!(HarmonicWireSlot, slot) == 60);
-    assert!(mem::offset_of!(HarmonicWireSlot, source_owner) == 64);
-    assert!(mem::offset_of!(HarmonicWireSlot, destination_owner) == 68);
-    assert!(mem::offset_of!(HarmonicWireSlot, source_generation) == 72);
-    assert!(mem::offset_of!(HarmonicWireSlot, destination_generation) == 80);
-    assert!(mem::offset_of!(HarmonicWireSlot, expert_ids) == 88);
-    assert!(mem::offset_of!(HarmonicWireSlot, route_weight_bits) == 112);
-    assert!(mem::offset_of!(HarmonicWireSlot, activation_extent) == 136);
-    assert!(mem::offset_of!(HarmonicWireSlot, result_extent) == 140);
-    assert!(mem::offset_of!(HarmonicWireSlot, deadline_tick) == 144);
-    assert!(mem::offset_of!(HarmonicWireSlot, activation_fingerprint) == 152);
-    assert!(mem::offset_of!(HarmonicWireSlot, result_fingerprint) == 160);
-    assert!(mem::offset_of!(HarmonicWireSlot, activation_payload) == 168);
-};
-
 impl HarmonicWireSlot {
     fn new() -> Self {
         Self {
@@ -472,7 +441,6 @@ pub struct HarmonicGpuMapping {
     host_base: *mut c_void,
     mapping_bytes: usize,
     device_base: DeviceBuffer,
-    slot_offsets: [usize; HARMONIC_SLOT_COUNT],
     activation_offsets: [usize; HARMONIC_SLOT_COUNT],
     result_offsets: [usize; HARMONIC_SLOT_COUNT],
     registered: bool,
@@ -497,11 +465,6 @@ impl HarmonicGpuMapping {
         let host_base = ring.mmap.as_mut_ptr().cast::<c_void>();
         let mapping_bytes = ring.mmap.len();
         let base = host_base as usize;
-        let slot_offsets = std::array::from_fn(|slot| {
-            let slot = &ring.layout().slots[slot] as *const HarmonicWireSlot as usize;
-            slot.checked_sub(base)
-                .expect("harmonic slot precedes ring base")
-        });
         let activation_offsets = std::array::from_fn(|slot| {
             let payload = ring.layout().slots[slot]
                 .activation_payload
@@ -554,7 +517,6 @@ impl HarmonicGpuMapping {
             host_base,
             mapping_bytes,
             device_base,
-            slot_offsets,
             activation_offsets,
             result_offsets,
             registered: true,
@@ -565,18 +527,6 @@ impl HarmonicGpuMapping {
         self.payload_buffer(
             self.activation_offsets[epoch as usize % HARMONIC_SLOT_COUNT],
             HARMONIC_ACTIVATION_EXTENT as usize,
-        )
-    }
-
-    pub fn header_buffer(&self) -> DeviceBuffer {
-        self.payload_buffer(0, mem::size_of::<HarmonicWireHeader>())
-    }
-
-    pub fn slot_control_buffer(&self, slot: usize) -> DeviceBuffer {
-        assert!(slot < HARMONIC_SLOT_COUNT);
-        self.payload_buffer(
-            self.slot_offsets[slot],
-            mem::offset_of!(HarmonicWireSlot, activation_payload),
         )
     }
 
