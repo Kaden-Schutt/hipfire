@@ -114,6 +114,41 @@ fn print_stats(label: &str, stats: &Stats) {
     );
 }
 
+fn print_first_differences(base: &[Record], candidate: &[Record]) {
+    if let Some((record, (base, candidate))) = base
+        .iter()
+        .zip(candidate)
+        .enumerate()
+        .find(|(_, (base, candidate))| base.ids != candidate.ids)
+    {
+        println!(
+            "first-id-difference: record={record} layer={} base={:?} candidate={:?}",
+            base.layer, base.ids, candidate.ids
+        );
+    } else {
+        println!("first-id-difference: none");
+    }
+
+    if let Some((record, (base, candidate))) =
+        base.iter()
+            .zip(candidate)
+            .enumerate()
+            .find(|(_, (base, candidate))| {
+                base.weights
+                    .iter()
+                    .map(|weight| weight.to_bits())
+                    .ne(candidate.weights.iter().map(|weight| weight.to_bits()))
+            })
+    {
+        println!(
+            "first-weight-difference: record={record} layer={} base={:?} candidate={:?}",
+            base.layer, base.weights, candidate.weights
+        );
+    } else {
+        println!("first-weight-difference: none");
+    }
+}
+
 fn main() -> Result<(), String> {
     let mut args = std::env::args_os().skip(1);
     let first = args
@@ -149,6 +184,8 @@ fn main() -> Result<(), String> {
             candidate.len()
         ));
     }
+
+    print_first_differences(&base, &candidate);
 
     let mut all = Stats::default();
     let mut hash = Stats::default();
