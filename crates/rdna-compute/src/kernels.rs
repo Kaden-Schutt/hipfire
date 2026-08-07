@@ -5229,6 +5229,8 @@ pub const GEMM_MQ3G256_LLOYD_MOE_GROUPED_MMQ_GFX1151_SRC: &str =
 
 pub const GEMM_MQ2G256_LLOYD_MOE_GROUPED_WMMA_4W_K2_N32_SRC: &str =
     include_str!("../../../kernels/src/gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_n32.hip");
+pub const GEMM_MQ2G256_LLOYD_MOE_GROUPED_WMMA_4W_K2_N32_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_n32.gfx12.hip");
 
 pub const GEMM_MQ2G256_LLOYD_MOE_GROUPED_WMMA_4W_K2_CND_SRC: &str =
     include_str!("../../../kernels/src/gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_cnd.hip");
