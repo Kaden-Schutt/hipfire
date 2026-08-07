@@ -8,7 +8,8 @@ use std::time::Duration;
 
 use hip_bridge::HipRuntime;
 use hipfire_arch_deepseek4::harmonic::{
-    HarmonicExpertResidencyPlan, HARMONIC_EXPERT_COUNT, HARMONIC_LAYER_COUNT, HARMONIC_TOP_K,
+    HarmonicExpertResidencyPlan, HARMONIC_ACTIVATION_EXTENT, HARMONIC_EXPERT_COUNT,
+    HARMONIC_HIDDEN_SIZE, HARMONIC_LAYER_COUNT, HARMONIC_TOP_K,
 };
 use rdna_compute::replay::ReplayController;
 use rdna_compute::{DType, Gpu};
@@ -152,6 +153,16 @@ fn main() -> Result<(), String> {
     let count_gpu = gpu
         .alloc_tensor(&[1], DType::F32)
         .map_err(|error| format!("allocate local count: {error}"))?;
+    let x_rot_gpu = gpu
+        .alloc_tensor(&[HARMONIC_HIDDEN_SIZE], DType::F32)
+        .map_err(|error| format!("allocate staged x_rot: {error}"))?;
+    let weights_gpu = gpu
+        .alloc_tensor(&[HARMONIC_TOP_K], DType::F32)
+        .map_err(|error| format!("allocate staged route weights: {error}"))?;
+    let activation_packet = gpu
+        .hip
+        .malloc(HARMONIC_ACTIVATION_EXTENT as usize)
+        .map_err(|error| format!("allocate staged activation packet: {error}"))?;
 
     let mut comparisons = 0_u64;
     for layer in 0..HARMONIC_LAYER_COUNT as usize {
@@ -221,32 +232,62 @@ fn main() -> Result<(), String> {
         .alloc_tensor(&[1], DType::F32)
         .map_err(|error| format!("allocate checkpoint tail count: {error}"))?;
     let checkpoint_ids = std::array::from_fn(|slot| ((slot * 37 + 19) % 256) as u32);
+    let checkpoint_x = std::array::from_fn::<_, HARMONIC_HIDDEN_SIZE, _>(|index| {
+        ((index as f32 + 0.25) * 0.000_976_562_5).to_bits()
+    });
+    let checkpoint_weights = std::array::from_fn::<_, HARMONIC_TOP_K, _>(|slot| {
+        ((slot as f32 + 1.0) / HARMONIC_TOP_K as f32).to_bits()
+    });
     gpu.hip
         .memcpy_htod(&ids_gpu.buf, as_bytes(&checkpoint_ids))
         .map_err(|error| format!("upload checkpoint route: {error}"))?;
+    gpu.hip
+        .memcpy_htod(&x_rot_gpu.buf, as_bytes(&checkpoint_x))
+        .map_err(|error| format!("upload checkpoint x_rot: {error}"))?;
+    gpu.hip
+        .memcpy_htod(&weights_gpu.buf, as_bytes(&checkpoint_weights))
+        .map_err(|error| format!("upload checkpoint route weights: {error}"))?;
     let original_replay = std::mem::replace(&mut gpu.replay, ReplayController::new_manual_aql());
     gpu.replay
         .begin_capture()
         .map_err(|error| format!("begin checkpoint capture: {error}"))?;
-    for (local, sources, count) in [
-        (&local_gpu, &sources_gpu, &count_gpu),
-        (&local_tail_gpu, &sources_tail_gpu, &count_tail_gpu),
-    ] {
+    {
         let mut gfx1100 = gpu
             .try_gfx1100()
             .ok_or_else(|| "exact gfx1100 checkpoint proof disappeared".to_owned())?;
         gfx1100
+            .harmonic_stage_route(
+                &x_rot_gpu,
+                &ids_gpu,
+                &weights_gpu,
+                &compact_gpu,
+                &local_gpu,
+                &sources_gpu,
+                &count_gpu,
+                &activation_packet,
+                0,
+                HARMONIC_EXPERT_COUNT as usize,
+                HARMONIC_HIDDEN_SIZE,
+                HARMONIC_TOP_K,
+            )
+            .map_err(|error| format!("checkpoint capture route stage: {error}"))?;
+    }
+    {
+        let mut gfx1100 = gpu
+            .try_gfx1100()
+            .ok_or_else(|| "exact gfx1100 checkpoint tail proof disappeared".to_owned())?;
+        gfx1100
             .harmonic_partition_route(
                 &ids_gpu,
                 &compact_gpu,
-                local,
-                sources,
-                count,
+                &local_tail_gpu,
+                &sources_tail_gpu,
+                &count_tail_gpu,
                 0,
                 HARMONIC_EXPERT_COUNT as usize,
                 HARMONIC_TOP_K,
             )
-            .map_err(|error| format!("checkpoint capture partition: {error}"))?;
+            .map_err(|error| format!("checkpoint capture tail partition: {error}"))?;
     }
     let capture = gpu
         .replay
@@ -274,6 +315,10 @@ fn main() -> Result<(), String> {
             .memcpy_htod(&tensor.buf, as_bytes(&sentinel_count))
             .map_err(|error| format!("clear checkpoint count: {error}"))?;
     }
+    let packet_sentinel = vec![0xff_u8; HARMONIC_ACTIVATION_EXTENT as usize];
+    gpu.hip
+        .memcpy_htod(&activation_packet, &packet_sentinel)
+        .map_err(|error| format!("clear checkpoint activation packet: {error}"))?;
     let mut submission = unsafe {
         gpu.replay
             .submit_checkpointed_linear_aql(0)
@@ -294,6 +339,10 @@ fn main() -> Result<(), String> {
     gpu.hip
         .memcpy_dtoh(as_bytes_mut(&mut checkpoint_count), &count_gpu.buf)
         .map_err(|error| format!("download checkpoint count: {error}"))?;
+    let mut checkpoint_packet = vec![0_u8; HARMONIC_ACTIVATION_EXTENT as usize];
+    gpu.hip
+        .memcpy_dtoh(&mut checkpoint_packet, &activation_packet)
+        .map_err(|error| format!("download checkpoint activation packet: {error}"))?;
     submission
         .wait(Duration::from_secs(2))
         .map_err(|error| format!("wait checkpoint terminal: {error}"))?;
@@ -311,6 +360,24 @@ fn main() -> Result<(), String> {
         .map_err(|error| format!("download checkpoint tail count: {error}"))?;
     let (expected_local, expected_sources, expected_count) =
         expected_partition(&plan, 0, checkpoint_ids);
+    let mut expected_packet = packet_sentinel;
+    expected_packet[..std::mem::size_of_val(&checkpoint_x)]
+        .copy_from_slice(as_bytes(&checkpoint_x));
+    let ids_offset = std::mem::size_of_val(&checkpoint_x);
+    expected_packet[ids_offset..ids_offset + std::mem::size_of_val(&checkpoint_ids)]
+        .copy_from_slice(as_bytes(&checkpoint_ids));
+    let weights_offset = ids_offset + std::mem::size_of_val(&checkpoint_ids);
+    expected_packet[weights_offset..weights_offset + std::mem::size_of_val(&checkpoint_weights)]
+        .copy_from_slice(as_bytes(&checkpoint_weights));
+    if checkpoint_packet != expected_packet {
+        let mismatch = checkpoint_packet
+            .iter()
+            .zip(&expected_packet)
+            .position(|(got, expected)| got != expected);
+        return Err(format!(
+            "retained route-stage activation mismatch at byte {mismatch:?}"
+        ));
+    }
     for (label, local, sources, count) in [
         (
             "checkpoint",
@@ -353,6 +420,8 @@ fn main() -> Result<(), String> {
         local_tail_gpu,
         sources_tail_gpu,
         count_tail_gpu,
+        x_rot_gpu,
+        weights_gpu,
     ] {
         gpu.free_tensor(tensor)
             .map_err(|error| format!("free oracle tensor: {error}"))?;

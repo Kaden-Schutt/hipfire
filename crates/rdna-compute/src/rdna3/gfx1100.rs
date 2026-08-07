@@ -11,7 +11,7 @@
 
 use std::ffi::c_void;
 
-use hip_bridge::{HipResult, KernargBlob};
+use hip_bridge::{DeviceBuffer, HipResult, KernargBlob};
 
 use crate::{Gpu, GpuTensor};
 
@@ -26,6 +26,7 @@ const HARMONIC_SPLIT_COMBINE_CANDIDATE_KERNEL: &str =
 const HARMONIC_PARTITION_ROUTE_SRC: &str =
     include_str!("../../../../kernels/src/harmonic_partition_route.gfx1100.hip");
 const HARMONIC_PARTITION_ROUTE_KERNEL: &str = "harmonic_partition_route_gfx1100";
+const HARMONIC_STAGE_ROUTE_KERNEL: &str = "harmonic_stage_route_gfx1100";
 
 /// A mutable GPU borrow proven to target exact gfx1100.
 ///
@@ -112,6 +113,97 @@ impl Gfx1100Device<'_> {
                 blob.push_ptr(count_ptr);
                 blob.push_i32(layer_i32);
                 blob.push_i32(expert_count_i32);
+                blob.push_i32(top_k_i32);
+                blob
+            },
+        )
+    }
+
+    /// Publish one complete DS4 harmonic activation packet and partition its
+    /// route on gfx1100. This is the System-release checkpoint dispatch for an
+    /// owner-local retained batch; no peer pointer or peer wait is encoded.
+    #[allow(clippy::too_many_arguments)]
+    pub fn harmonic_stage_route(
+        &mut self,
+        x_rot: &GpuTensor,
+        expert_ids: &GpuTensor,
+        route_weights: &GpuTensor,
+        compact_index_map: &GpuTensor,
+        local_expert_ids: &GpuTensor,
+        slot_sources: &GpuTensor,
+        local_count: &GpuTensor,
+        activation_packet: &DeviceBuffer,
+        layer: usize,
+        expert_count: usize,
+        hidden_size: usize,
+        top_k: usize,
+    ) -> HipResult<()> {
+        assert_eq!(
+            hidden_size, 4096,
+            "gfx1100 harmonic hidden size must be 4096"
+        );
+        assert_eq!(
+            expert_count, 256,
+            "gfx1100 harmonic expert count must be 256"
+        );
+        assert_eq!(top_k, 6, "gfx1100 harmonic top-k must be 6");
+        assert!(layer < 43, "gfx1100 harmonic layer must be below 43");
+        let packet_bytes = (hidden_size + 2 * top_k) * std::mem::size_of::<u32>();
+        assert!(
+            activation_packet.size() >= packet_bytes,
+            "gfx1100 harmonic activation packet allocation is undersized"
+        );
+        self.gpu.bind_thread()?;
+        self.gpu.ensure_kernel(
+            HARMONIC_STAGE_ROUTE_KERNEL,
+            HARMONIC_PARTITION_ROUTE_SRC,
+            HARMONIC_STAGE_ROUTE_KERNEL,
+        )?;
+        let x_rot_ptr = x_rot.buf.as_ptr();
+        let ids_ptr = expert_ids.buf.as_ptr();
+        let weights_ptr = route_weights.buf.as_ptr();
+        let map_ptr = compact_index_map.buf.as_ptr();
+        let local_ptr = local_expert_ids.buf.as_ptr();
+        let sources_ptr = slot_sources.buf.as_ptr();
+        let count_ptr = local_count.buf.as_ptr();
+        let packet_ptr = activation_packet.as_ptr();
+        let layer_i32 = layer as i32;
+        let expert_count_i32 = expert_count as i32;
+        let hidden_size_i32 = hidden_size as i32;
+        let top_k_i32 = top_k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &x_rot_ptr as *const _ as *mut c_void,
+            &ids_ptr as *const _ as *mut c_void,
+            &weights_ptr as *const _ as *mut c_void,
+            &map_ptr as *const _ as *mut c_void,
+            &local_ptr as *const _ as *mut c_void,
+            &sources_ptr as *const _ as *mut c_void,
+            &count_ptr as *const _ as *mut c_void,
+            &packet_ptr as *const _ as *mut c_void,
+            &layer_i32 as *const _ as *mut c_void,
+            &expert_count_i32 as *const _ as *mut c_void,
+            &hidden_size_i32 as *const _ as *mut c_void,
+            &top_k_i32 as *const _ as *mut c_void,
+        ];
+        self.gpu.launch_maybe_blob(
+            HARMONIC_STAGE_ROUTE_KERNEL,
+            [1, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut blob = KernargBlob::new();
+                blob.push_ptr(x_rot_ptr);
+                blob.push_ptr(ids_ptr);
+                blob.push_ptr(weights_ptr);
+                blob.push_ptr(map_ptr);
+                blob.push_ptr(local_ptr);
+                blob.push_ptr(sources_ptr);
+                blob.push_ptr(count_ptr);
+                blob.push_ptr(packet_ptr);
+                blob.push_i32(layer_i32);
+                blob.push_i32(expert_count_i32);
+                blob.push_i32(hidden_size_i32);
                 blob.push_i32(top_k_i32);
                 blob
             },
