@@ -10557,10 +10557,14 @@ impl Gpu {
         )?;
         let qp = q.buf.as_ptr();
         let pp = pos_buf.buf.as_ptr();
+        let mut hd = 128_i32;
+        let mut nr = 64_i32;
         let mut fb = freq_base;
         let mut params: Vec<*mut c_void> = vec![
             &qp as *const _ as *mut c_void,
             &pp as *const _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut nr as *mut _ as *mut c_void,
             &mut fb as *mut _ as *mut c_void,
         ];
         let heads_per_block = block_threads / 32;
@@ -10574,6 +10578,8 @@ impl Gpu {
                 let mut b = hip_bridge::KernargBlob::new();
                 b.push_ptr(qp);
                 b.push_ptr(pp);
+                b.push_i32(hd);
+                b.push_i32(nr);
                 b.push_f32(fb);
                 b
             },

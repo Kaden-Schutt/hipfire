@@ -15,13 +15,12 @@
 extern "C" __global__ void rope_tail_interleaved_h64d128r64_gfx1201(
     float* __restrict__ q,
     const int* __restrict__ pos_buf,
+    int head_dim,
+    int n_rot,
     float freq_base
 ) {
     constexpr int kHeads = 64;
-    constexpr int kHeadDim = 128;
-    constexpr int kRot = 64;
-    constexpr int kHalf = kRot / 2;
-    constexpr int kTailOff = kHeadDim - kRot;
+    constexpr int kHalf = 32;
 
     __shared__ float cos_cache[kHalf];
     __shared__ float sin_cache[kHalf];
@@ -30,7 +29,7 @@ extern "C" __global__ void rope_tail_interleaved_h64d128r64_gfx1201(
     if (threadIdx.x < kHalf) {
         const int pos = *pos_buf;
         const float freq =
-            1.0f / powf(freq_base, (float)(2 * pair) / (float)kRot);
+            1.0f / powf(freq_base, (float)(2 * pair) / (float)n_rot);
         const float angle = (float)pos * freq;
         cos_cache[pair] = cosf(angle);
         sin_cache[pair] = sinf(angle);
@@ -41,9 +40,9 @@ extern "C" __global__ void rope_tail_interleaved_h64d128r64_gfx1201(
     const int head = blockIdx.x * heads_per_block + threadIdx.x / kHalf;
     if (head >= kHeads) return;
 
-    const int d_even = kTailOff + 2 * pair;
+    const int d_even = head_dim - n_rot + 2 * pair;
     const int d_odd = d_even + 1;
-    const int base = head * kHeadDim;
+    const int base = head * head_dim;
     const float x0 = q[base + d_even];
     const float x1 = q[base + d_odd];
     const float cos_a = cos_cache[pair];
