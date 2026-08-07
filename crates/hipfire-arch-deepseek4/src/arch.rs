@@ -1730,14 +1730,14 @@ impl DeepseekV4 {
         // Per-layer.
         for (l, layer) in weights.layers.iter_mut().enumerate() {
             // Dense TP is deliberately narrower than EP: exact gfx1201,
-            // four ranks, frozen MQ2R P3, ordinary AR. Other models, formats,
-            // rank counts, and architectures keep the replicated route.
+            // four ranks, frozen MQ2R P3. `load_dspark` is deliberately not an
+            // admission predicate: it records sidecar availability, not
+            // whether this request selected speculation. DSpark stage bundles
+            // are loaded separately and remain replicated.
+            // Other models, formats, rank counts, and architectures keep the
+            // replicated route.
             let dense_tp = shard.filter(|(plan, _)| {
-                gpu.arch_caps.is_gfx1201()
-                    && cfg.mq2r
-                    && !cfg.mq2rxt
-                    && !cfg.load_dspark
-                    && plan.tp_size == 4
+                gpu.arch_caps.is_gfx1201() && cfg.mq2r && !cfg.mq2rxt && plan.tp_size == 4
             });
 
             // Norms (F16 on disk → F32 on GPU).
