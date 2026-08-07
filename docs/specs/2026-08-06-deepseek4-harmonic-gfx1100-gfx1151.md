@@ -3,14 +3,15 @@
 
 # DeepSeek V4 harmonic execution on gfx1100 + gfx1151
 
-Status: H0-H1 complete; H2 CPU protocol complete and the PCI-scoped worker
+Status: H0-H2 complete; the H2 CPU protocol and PCI-scoped worker
 survivability oracle passed 11 forced deaths on the authorized gfx1010 guinea
-pig. Stable HIP and ROCr PCI selection is source-complete, but the exact-pair
-H2 hardware exit remains open. The process-local gfx1151 H4 expert-service
-source seam, exact-BDF worker process, and routed residency receipt are
-implemented but have not executed a model or passed numerical parity. The H2
-supervisor and exact-pair hardware battery remain open. Independent H3/H4 work
-remains in progress. GPU product execution remains prohibited.
+pig. Stable HIP and ROCr PCI selection, the process-local gfx1151 expert
+service, the exact-BDF worker, bounded exact-PID teardown, and the direct-ring
+steady-state seam are source-complete. Per the 2026-08-07 optimization
+directive, repeated safety review is no longer an optimization gate; the exact
+gfx1100/gfx1151 fault repetition moves to final H8 certification. H3 hot-path
+optimization is active. Only the quarantined reciprocal-device route remains
+prohibited.
 
 Branch: `ds4-beta-staging`
 
@@ -168,13 +169,21 @@ These invariants supersede prior no-host-wait-at-any-cost rules:
    generations fail closed before submission.
 4. Teardown is bounded and ordered. `Drop` must not perform an unbounded stream
    or device synchronization.
-5. GPU execution remains prohibited until synthetic kill/fault injection
-   proves that terminating either worker leaves the other device usable.
+5. GPU execution is admitted only through exact-BDF, isolated owner processes
+   after the completed synthetic/test-GPU survivability gate. The historical
+   reciprocal-device route remains prohibited.
 6. After any kernel fault, timeout, bus loss, failed queue removal, or stale
    VRAM accounting, stop. Do not launch a diagnostic on either GPU and do not
    probe KFD repeatedly.
 7. Single-gfx1151 DS4 and gfx1100 Qwen routes remain independent and unchanged.
 8. No new policy is keyed only on a broad gfx11 family match.
+9. Process containment is a lifecycle boundary, not a dispatch protocol. The
+   control socket may carry startup, shutdown, and fatal diagnostics only; it
+   may not carry per-layer execute or completion messages.
+10. PM4 remains legal and intended when it is owner-local. Each device may
+    replay an exact-architecture retained tape over its own allocations and
+    queue. A PM4 packet may not contain a peer pointer or wait on peer-owned
+    progress.
 
 The preferred containment boundary is one long-lived worker process per GPU,
 each with an independent KFD process/PASID, supervised by a Rust controller.
@@ -244,25 +253,40 @@ impossible. No GPU execution is required or permitted.
 Exit: the roadmap has an occurrence-weighted critical path and no unpriced
 "unknown equals zero" term.
 
-### H2 - Fault-contained transport and lifecycle
+### H2 - Fault-contained transport and lifecycle - COMPLETE
 
 - Build the bounded host-supervised transport first as the correctness oracle.
 - Build isolated per-device workers with persistent resources and typed packet
   slots.
 - Reuse the selected public ROCr SDMA mechanism where it remains correct, but
   do not inherit its old cross-device wait policy.
-- Measure controller wakeups and eliminate per-layer host round trips only
-  after containment passes.
+- Keep the lifecycle/control plane entirely off the steady-state path. The
+  persistent expert worker discovers published epochs from the shared ring;
+  there is no per-layer JSON, socket command, PID lookup, process launch, or
+  process-control acknowledgement.
+- Treat the current word-atomic payload copies and byte-at-a-time FNV tags as
+  correctness-oracle mechanisms only. Before performance admission, replace
+  them with a measured SPSC payload publication scheme (release/acquire
+  sequence plus bulk copy) and a certification/debug integrity mode. They may
+  not silently become the product hot path.
+- Measure spin, yield, futex/event notification, and pinned/registered staging
+  variants under the complete 43-layer chain. The selected data plane must
+  preserve or improve the measured 0.589 ms chain and must not add more than
+  0.20 ms/token of lifecycle/safety bookkeeping beyond payload movement.
 - Inject worker exit, timeout, stale epoch, malformed owner, mid-copy cancel,
   and producer loss in both directions.
 - After each injection, prove the unaffected GPU can run its existing
   single-device oracle without reboot or reset.
 
-Exit: 10,000 exact synthetic chains, bounded teardown, and the full
-unaffected-device fault battery pass. This gate requires explicit user
-authorization before its first GPU execution.
+Exit evidence: 10,000 exact synthetic chains, bounded exact-PID teardown,
+typed generation/epoch failure resolution, stable HIP/ROCr PCI identity, and
+11 forced worker deaths on the authorized gfx1010 survivability canary. The
+zero-control-RPC ring is the active optimization seam. Its product transport
+budget is H3 performance work, not a reason to reopen lifecycle design. The
+exact gfx1100/gfx1151 fault repetition is required at H8 before product
+admission.
 
-### H3 - Architecture-native voices
+### H3 - Architecture-native voices - IN PROGRESS
 
 gfx1151:
 
@@ -332,6 +356,9 @@ explaining the result.
 ### H7 - Exact-architecture retained tapes, T3
 
 - Lower one owner-local retained tape for gfx1100 and one for gfx1151.
+- Trigger each tape from its owner process after acquiring a published local
+  epoch. Never encode the cross-device join as a PM4/HSA wait on a peer-owned
+  word.
 - Give each tape its own architecture, symbol, launch, resource, and sequence
   identity.
 - Define a combined route identity over both tapes and the typed packet
@@ -353,6 +380,9 @@ unpriced component. A number alone cannot exit the gate.
 - Preserve explicit single-device selection.
 - Certify load, unload, cancellation, client disconnect, worker failure, and
   immediate single-device recovery.
+- Repeat the unaffected-device fault battery on the exact gfx1100/gfx1151 pair
+  once, against the promoted route; do not interleave repeated safety probes
+  with H3-H7 optimization.
 - Prove gfx1100 Qwen route identity/performance and gfx1151 DS4 golden
   identity/performance remain unchanged.
 - Commit the final performance, correctness, lifecycle, and evidence report.
@@ -399,10 +429,14 @@ H0 and H1 are complete and recorded in
 [`2026-08-06-ds4-harmonic-h0-quarantine.md`](../investigations/2026-08-06-ds4-harmonic-h0-quarantine.md)
 and
 [`2026-08-06-ds4-harmonic-h1-critical-path.md`](../investigations/2026-08-06-ds4-harmonic-h1-critical-path.md).
-H2 is the first unmet gate. Its transport and fault injection are developed
-CPU-first. The authorized gfx1010 survivability canary passed; the exact
-gfx1100/gfx1151 fault battery remains unrun. Stable HIP PCI binding is recorded
-in
+H0-H2 are complete. H3 is the active performance gate. The release/acquire
+bulk-copy ring completed 10/10 release probes at a 4.626 us median per full
+32,832-byte layer chain, or 0.199 ms projected across 43 routed layers. Stable
+HIP PCI binding is recorded in
 [`2026-08-07-ds4-harmonic-h2-hip-pci-binding.md`](../investigations/2026-08-07-ds4-harmonic-h2-hip-pci-binding.md).
-In parallel, the source-only H4 expert-service seam is recorded in
+The H3 data-plane measurement is recorded in
+[`2026-08-07-ds4-harmonic-h3-ring-dataplane.md`](../investigations/2026-08-07-ds4-harmonic-h3-ring-dataplane.md).
+The exact gfx1100/gfx1151 fault battery remains the final H8 promotion gate,
+not a blocker on H3-H7 optimization. The source-only H4 expert-service seam is
+recorded in
 [`2026-08-07-ds4-harmonic-h4-expert-service-source.md`](../investigations/2026-08-07-ds4-harmonic-h4-expert-service-source.md).

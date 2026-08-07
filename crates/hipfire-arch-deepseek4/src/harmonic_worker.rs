@@ -17,7 +17,7 @@ use crate::harmonic::{
     HARMONIC_EXPERT_COUNT, HARMONIC_HIDDEN_SIZE, HARMONIC_LAYER_COUNT,
     HARMONIC_MOE_INTERMEDIATE_SIZE, HARMONIC_RESULT_EXTENT, HARMONIC_TOP_K,
 };
-use crate::harmonic_ipc::{harmonic_payload_fingerprint, HarmonicWorkItem};
+use crate::harmonic_ipc::{harmonic_payload_fingerprint, HarmonicIntegrityMode, HarmonicWorkItem};
 
 /// All scratch and the one execution stream are owned by the gfx1151 worker
 /// process. `Option` fields make partial construction transactionally
@@ -159,12 +159,14 @@ impl DeepseekV4HarmonicExpertService {
         contract
             .validate(&work.packet, now_tick)
             .map_err(|error| format!("harmonic expert route contract: {error}"))?;
-        let observed_fingerprint = harmonic_payload_fingerprint(&work.activation_payload);
-        if observed_fingerprint != work.packet.activation_fingerprint {
-            return Err(format!(
-                "harmonic expert activation fingerprint mismatch: got {observed_fingerprint:#x}, expected {:#x}",
-                work.packet.activation_fingerprint
-            ));
+        if work.integrity_mode == HarmonicIntegrityMode::Fingerprint {
+            let observed_fingerprint = harmonic_payload_fingerprint(&work.activation_payload);
+            if observed_fingerprint != work.packet.activation_fingerprint {
+                return Err(format!(
+                    "harmonic expert activation fingerprint mismatch: got {observed_fingerprint:#x}, expected {:#x}",
+                    work.packet.activation_fingerprint
+                ));
+            }
         }
         let x_rot_bytes = unpack_harmonic_x_rot(&work.packet, &work.activation_payload)
             .map_err(|error| format!("harmonic expert activation layout: {error}"))?;
@@ -251,7 +253,11 @@ impl DeepseekV4HarmonicExpertService {
         }
         Ok(HarmonicCompletion {
             result_extent: HARMONIC_RESULT_EXTENT,
-            result_fingerprint: harmonic_payload_fingerprint(&self.result_payload),
+            result_fingerprint: if work.integrity_mode == HarmonicIntegrityMode::Fingerprint {
+                harmonic_payload_fingerprint(&self.result_payload)
+            } else {
+                0
+            },
         })
     }
 

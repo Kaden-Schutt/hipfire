@@ -15,16 +15,17 @@ use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use hipfire_arch_deepseek4::{
-    DeepseekV4, DeepseekV4HarmonicExpertService, DeepseekV4VerifiedArtifact, HarmonicOwner,
-    HarmonicSharedRing,
+    harmonic_monotonic_tick, DeepseekV4, DeepseekV4HarmonicExpertService,
+    DeepseekV4VerifiedArtifact, HarmonicExpertPoll, HarmonicExpertWorkerCommand,
+    HarmonicExpertWorkerEvent, HarmonicOwner, HarmonicSharedRing,
 };
 use hipfire_runtime::arch::Architecture;
 use hipfire_runtime::hfq::HfqFile;
 use rdna_compute::Gpu;
 use redline_rocr::{GpuSelector, PciBusId, Runtime};
-use serde::{Deserialize, Serialize};
 
 const EXPECTED_ARCH: &str = "gfx1151";
 
@@ -35,6 +36,7 @@ struct Args {
     ring: PathBuf,
     control_socket: PathBuf,
     allocation_generation: u64,
+    first_epoch: u64,
 }
 
 impl Args {
@@ -44,6 +46,7 @@ impl Args {
         let mut ring = None;
         let mut control_socket = None;
         let mut allocation_generation = None;
+        let mut first_epoch = None;
         let mut args = std::env::args().skip(1);
         while let Some(flag) = args.next() {
             let mut value = || {
@@ -61,9 +64,15 @@ impl Args {
                         format!("invalid nonzero --generation {raw:?}: {error}")
                     })?);
                 }
+                "--first-epoch" => {
+                    let raw = value()?;
+                    first_epoch = Some(raw.parse::<u64>().map_err(|error| {
+                        format!("invalid nonzero --first-epoch {raw:?}: {error}")
+                    })?);
+                }
                 "--help" | "-h" => {
                     return Err(
-                        "usage: deepseek4-harmonic-expert-worker --model PATH --pci-bdf 0000:BB:DD.F --ring PATH --control-socket PATH --generation N"
+                        "usage: deepseek4-harmonic-expert-worker --model PATH --pci-bdf 0000:BB:DD.F --ring PATH --control-socket PATH --generation N --first-epoch N"
                             .to_owned(),
                     );
                 }
@@ -75,22 +84,19 @@ impl Args {
         if allocation_generation == 0 {
             return Err("--generation must be nonzero".to_owned());
         }
+        let first_epoch = first_epoch.ok_or_else(|| "missing --first-epoch".to_owned())?;
+        if first_epoch == 0 {
+            return Err("--first-epoch must be nonzero".to_owned());
+        }
         Ok(Self {
             model: model.ok_or_else(|| "missing --model".to_owned())?,
             pci_bus_id: pci_bus_id.ok_or_else(|| "missing --pci-bdf".to_owned())?,
             ring: ring.ok_or_else(|| "missing --ring".to_owned())?,
             control_socket: control_socket.ok_or_else(|| "missing --control-socket".to_owned())?,
             allocation_generation,
+            first_epoch,
         })
     }
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
-enum WorkerCommand {
-    Execute { epoch: u64, now_tick: u64 },
-    AcknowledgeTerminal { epoch: u64 },
-    Shutdown,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -99,36 +105,7 @@ enum WorkerLoopExit {
     ShutdownRequested,
 }
 
-#[derive(Debug, Serialize)]
-#[serde(tag = "event", rename_all = "snake_case")]
-enum WorkerEvent<'a> {
-    Phase {
-        phase: &'a str,
-    },
-    Ready {
-        model_sha256: &'a str,
-        architecture: &'a str,
-        pci_bus_id: &'a str,
-        hip_device_ordinal: i32,
-        rocr_agent_name: &'a str,
-        allocation_generation: u64,
-        routed_tensor_count: usize,
-        routed_bytes: usize,
-    },
-    Completed {
-        epoch: u64,
-        result_fingerprint: u64,
-    },
-    Acknowledged {
-        epoch: u64,
-    },
-    Shutdown,
-    Fatal {
-        error: &'a str,
-    },
-}
-
-fn send_event(stream: &mut UnixStream, event: WorkerEvent<'_>) -> Result<(), String> {
+fn send_event(stream: &mut UnixStream, event: &HarmonicExpertWorkerEvent) -> Result<(), String> {
     serde_json::to_writer(&mut *stream, &event)
         .map_err(|error| format!("serialize worker event: {error}"))?;
     stream
@@ -160,8 +137,8 @@ fn run_loaded_worker(
     cfg.load_dspark = false;
     send_event(
         control,
-        WorkerEvent::Phase {
-            phase: "load_routed",
+        &HarmonicExpertWorkerEvent::Phase {
+            phase: "load_routed".to_owned(),
         },
     )?;
     let mut weights = Some(DeepseekV4::load_weights_harmonic_experts_gfx1151(
@@ -183,22 +160,23 @@ fn run_loaded_worker(
         )?);
         send_event(
             control,
-            WorkerEvent::Ready {
-                model_sha256,
-                architecture: &receipt.architecture,
-                pci_bus_id: &receipt.pci_bus_id,
+            &HarmonicExpertWorkerEvent::Ready {
+                model_sha256: model_sha256.to_owned(),
+                architecture: receipt.architecture.clone(),
+                pci_bus_id: receipt.pci_bus_id.clone(),
                 hip_device_ordinal: receipt.hip_device_ordinal,
-                rocr_agent_name,
+                rocr_agent_name: rocr_agent_name.to_owned(),
                 allocation_generation: args.allocation_generation,
                 routed_tensor_count: receipt.tensor_count,
                 routed_bytes: receipt.bytes,
             },
         )?;
 
-        command_loop(
+        worker_loop(
             control,
             ring,
             args.allocation_generation,
+            args.first_epoch,
             &mut gpu,
             &cfg,
             weights.as_ref().unwrap(),
@@ -216,14 +194,17 @@ fn run_loaded_worker(
     gpu.drain_pool();
     match result? {
         WorkerLoopExit::ControlClosed => Ok(()),
-        WorkerLoopExit::ShutdownRequested => send_event(control, WorkerEvent::Shutdown),
+        WorkerLoopExit::ShutdownRequested => {
+            send_event(control, &HarmonicExpertWorkerEvent::Shutdown)
+        }
     }
 }
 
-fn command_loop(
+fn worker_loop(
     control: &mut UnixStream,
     ring: &HarmonicSharedRing,
     allocation_generation: u64,
+    first_epoch: u64,
     gpu: &mut Gpu,
     cfg: &hipfire_arch_deepseek4::DeepseekV4Config,
     weights: &hipfire_arch_deepseek4::DeepseekV4RoutedWeights,
@@ -232,22 +213,20 @@ fn command_loop(
     let reader_stream = control
         .try_clone()
         .map_err(|error| format!("clone control socket: {error}"))?;
+    reader_stream
+        .set_nonblocking(true)
+        .map_err(|error| format!("set control socket nonblocking: {error}"))?;
     let mut reader = BufReader::new(reader_stream);
+    let mut epoch = first_epoch;
+    let mut idle_since = Instant::now();
     loop {
-        let mut line = String::new();
-        let bytes = reader
-            .read_line(&mut line)
-            .map_err(|error| format!("read worker command: {error}"))?;
-        if bytes == 0 {
-            return Ok(WorkerLoopExit::ControlClosed);
-        }
-        let command: WorkerCommand = serde_json::from_str(line.trim())
-            .map_err(|error| format!("decode worker command: {error}"))?;
-        match command {
-            WorkerCommand::Execute { epoch, now_tick } => {
-                let work = ring
-                    .expert_begin(epoch, allocation_generation, now_tick)
-                    .map_err(|error| format!("begin epoch {epoch}: {error}"))?;
+        match ring
+            .expert_poll(epoch, allocation_generation)
+            .map_err(|error| format!("poll epoch {epoch}: {error}"))?
+        {
+            HarmonicExpertPoll::Work(work) => {
+                let now_tick = harmonic_monotonic_tick()
+                    .map_err(|error| format!("clock epoch {epoch}: {error}"))?;
                 let completion = service
                     .execute_work_item(gpu, cfg, weights, &work, now_tick)
                     .map_err(|error| format!("execute epoch {epoch}: {error}"))?;
@@ -258,21 +237,52 @@ fn command_loop(
                     service.result_payload(),
                 )
                 .map_err(|error| format!("complete epoch {epoch}: {error}"))?;
-                send_event(
-                    control,
-                    WorkerEvent::Completed {
-                        epoch,
-                        result_fingerprint: completion.result_fingerprint,
-                    },
-                )?;
+                epoch = epoch
+                    .checked_add(1)
+                    .ok_or_else(|| "harmonic expert epoch exhausted".to_owned())?;
+                idle_since = Instant::now();
             }
-            WorkerCommand::AcknowledgeTerminal { epoch } => {
+            HarmonicExpertPoll::Terminal(_) => {
                 ring.expert_acknowledge_terminal(epoch, allocation_generation)
                     .map_err(|error| format!("acknowledge epoch {epoch}: {error}"))?;
-                send_event(control, WorkerEvent::Acknowledged { epoch })?;
+                epoch = epoch
+                    .checked_add(1)
+                    .ok_or_else(|| "harmonic expert epoch exhausted".to_owned())?;
+                idle_since = Instant::now();
             }
-            WorkerCommand::Shutdown => return Ok(WorkerLoopExit::ShutdownRequested),
+            HarmonicExpertPoll::Pending => {
+                let idle = idle_since.elapsed();
+                if idle < Duration::from_millis(2) {
+                    std::hint::spin_loop();
+                    continue;
+                }
+                if let Some(exit) = poll_control(&mut reader)? {
+                    return Ok(exit);
+                }
+                if idle < Duration::from_millis(10) {
+                    std::thread::yield_now();
+                } else {
+                    std::thread::sleep(Duration::from_micros(50));
+                }
+            }
         }
+    }
+}
+
+fn poll_control(reader: &mut BufReader<UnixStream>) -> Result<Option<WorkerLoopExit>, String> {
+    let mut line = String::new();
+    let bytes = match reader.read_line(&mut line) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
+        Err(error) => return Err(format!("read worker control command: {error}")),
+    };
+    if bytes == 0 {
+        return Ok(Some(WorkerLoopExit::ControlClosed));
+    }
+    let command: HarmonicExpertWorkerCommand = serde_json::from_str(line.trim())
+        .map_err(|error| format!("decode worker control command: {error}"))?;
+    match command {
+        HarmonicExpertWorkerCommand::Shutdown {} => Ok(Some(WorkerLoopExit::ShutdownRequested)),
     }
 }
 
@@ -292,8 +302,8 @@ fn run(args: &Args, control: &mut UnixStream) -> Result<(), String> {
     }
     send_event(
         control,
-        WorkerEvent::Phase {
-            phase: "verify_model",
+        &HarmonicExpertWorkerEvent::Phase {
+            phase: "verify_model".to_owned(),
         },
     )?;
     let artifact = DeepseekV4VerifiedArtifact::verify(&args.model)?;
@@ -309,8 +319,8 @@ fn run(args: &Args, control: &mut UnixStream) -> Result<(), String> {
 
     send_event(
         control,
-        WorkerEvent::Phase {
-            phase: "bind_device",
+        &HarmonicExpertWorkerEvent::Phase {
+            phase: "bind_device".to_owned(),
         },
     )?;
     let symbols = redline_rocr::load_symbols()
@@ -372,7 +382,12 @@ fn main() {
         }
     };
     if let Err(error) = run(&args, &mut control) {
-        let _ = send_event(&mut control, WorkerEvent::Fatal { error: &error });
+        let _ = send_event(
+            &mut control,
+            &HarmonicExpertWorkerEvent::Fatal {
+                error: error.clone(),
+            },
+        );
         eprintln!("deepseek4 harmonic expert worker: {error}");
         std::process::exit(1);
     }

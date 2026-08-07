@@ -60,6 +60,8 @@ pub mod forward;
 pub mod grammar;
 pub mod harmonic;
 pub mod harmonic_ipc;
+#[cfg(feature = "harmonic-worker")]
+pub mod harmonic_process;
 pub mod harmonic_worker;
 pub mod heterogeneous;
 pub mod mtp_speculator;
@@ -82,8 +84,14 @@ pub use harmonic::{
     HarmonicSupervisor, HARMONIC_ACTIVATION_EXTENT, HARMONIC_RESULT_EXTENT,
 };
 pub use harmonic_ipc::{
-    harmonic_payload_fingerprint, HarmonicIpcError, HarmonicResolved, HarmonicSharedRing,
+    harmonic_monotonic_tick, harmonic_payload_fingerprint, HarmonicExpertPoll,
+    HarmonicIntegrityMode, HarmonicIpcError, HarmonicResolved, HarmonicSharedRing,
     HarmonicWireState, HarmonicWorkItem,
+};
+#[cfg(feature = "harmonic-worker")]
+pub use harmonic_process::{
+    HarmonicExpertWorkerCommand, HarmonicExpertWorkerEvent, HarmonicExpertWorkerProcess,
+    HarmonicExpertWorkerReady, HarmonicExpertWorkerSpec, HarmonicWorkerIsolationReceipt,
 };
 pub use harmonic_worker::DeepseekV4HarmonicExpertService;
 pub use heterogeneous::{

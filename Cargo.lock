@@ -774,6 +774,7 @@ dependencies = [
  "hipfire-dispatch",
  "hipfire-reap",
  "hipfire-runtime",
+ "libc",
  "libloading",
  "memmap2",
  "rdna-compute",

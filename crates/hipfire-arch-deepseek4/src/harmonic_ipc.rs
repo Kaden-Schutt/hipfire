@@ -9,10 +9,12 @@
 //! after an acquire transition. No method waits or polls. Process supervision,
 //! deadlines, and bounded worker teardown live above this transport.
 
+use std::cell::UnsafeCell;
 use std::fmt;
 use std::fs::File;
 use std::io;
 use std::mem;
+use std::ptr;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use memmap2::{MmapMut, MmapOptions};
@@ -24,7 +26,7 @@ use crate::harmonic::{
 };
 
 const HARMONIC_WIRE_MAGIC: u64 = 0x4453_3448_4950_4331; // DS4HIPC1
-const HARMONIC_WIRE_VERSION: u32 = 1;
+const HARMONIC_WIRE_VERSION: u32 = 2;
 const FLAG_SOURCE_OBSERVED: u32 = 1 << 0;
 const FLAG_DESTINATION_QUIESCED: u32 = 1 << 1;
 const OWNER_DENSE_MASK: u32 = 1 << 0;
@@ -141,6 +143,7 @@ pub type HarmonicIpcResult<T> = Result<T, HarmonicIpcError>;
 pub struct HarmonicWorkItem {
     pub packet: HarmonicRoutePacket,
     pub activation_payload: Vec<u8>,
+    pub integrity_mode: HarmonicIntegrityMode,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -150,11 +153,69 @@ pub struct HarmonicResolved {
     pub result_payload: Option<Vec<u8>>,
 }
 
+/// One nonblocking observation by the persistent expert worker.
+///
+/// `Pending` is the normal idle result. It is intentionally not an error and
+/// does not require a control-socket command from the dense process.
+#[derive(Clone, Debug, PartialEq)]
+pub enum HarmonicExpertPoll {
+    Pending,
+    Work(HarmonicWorkItem),
+    Terminal(HarmonicWireState),
+}
+
+/// Runtime payload validation level for the shared ring.
+///
+/// The control fields, epoch, generations, owners, extents, and state machine
+/// are checked in both modes. `Fingerprint` additionally re-hashes each 16 KiB
+/// payload and is reserved for the CPU correctness oracle. `ReleaseAcquire`
+/// is the shipping-shaped data plane: publication ordering protects one bulk
+/// copy without a byte-wise checksum on every layer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum HarmonicIntegrityMode {
+    ReleaseAcquire = 0,
+    Fingerprint = 1,
+}
+
+impl HarmonicIntegrityMode {
+    fn decode(raw: u32) -> HarmonicIpcResult<Self> {
+        match raw {
+            0 => Ok(Self::ReleaseAcquire),
+            1 => Ok(Self::Fingerprint),
+            _ => Err(HarmonicIpcError::InvalidLayout("integrity mode")),
+        }
+    }
+}
+
+/// Cross-process monotonic nanoseconds used by packet deadlines.
+///
+/// Both worker processes call the same kernel clock; unlike `Instant`, the
+/// value can safely be carried through the shared-memory protocol.
+#[cfg(target_os = "linux")]
+pub fn harmonic_monotonic_tick() -> HarmonicIpcResult<u64> {
+    let mut value = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `value` is a valid writable timespec and CLOCK_MONOTONIC does
+    // not require any additional lifetime or ownership contract.
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut value) } != 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    let seconds = u64::try_from(value.tv_sec)
+        .map_err(|_| HarmonicIpcError::InvalidLayout("monotonic seconds"))?;
+    let nanos = u64::try_from(value.tv_nsec)
+        .map_err(|_| HarmonicIpcError::InvalidLayout("monotonic nanoseconds"))?;
+    Ok(seconds.saturating_mul(1_000_000_000).saturating_add(nanos))
+}
+
 #[repr(C, align(64))]
 struct HarmonicWireHeader {
     magic: AtomicU64,
     version: AtomicU32,
     slot_count: AtomicU32,
+    integrity_mode: AtomicU32,
     route_identity: AtomicU64,
     model_identity: [AtomicU64; 4],
     source_generation: AtomicU64,
@@ -163,12 +224,13 @@ struct HarmonicWireHeader {
 }
 
 impl HarmonicWireHeader {
-    fn new(contract: HarmonicContract) -> Self {
+    fn new(contract: HarmonicContract, integrity_mode: HarmonicIntegrityMode) -> Self {
         let model_words = identity_to_words(contract.model_identity);
         Self {
             magic: AtomicU64::new(HARMONIC_WIRE_MAGIC),
             version: AtomicU32::new(HARMONIC_WIRE_VERSION),
             slot_count: AtomicU32::new(HARMONIC_SLOT_COUNT as u32),
+            integrity_mode: AtomicU32::new(integrity_mode as u32),
             route_identity: AtomicU64::new(contract.route_identity),
             model_identity: model_words.map(AtomicU64::new),
             source_generation: AtomicU64::new(contract.source_allocation_generation),
@@ -191,6 +253,28 @@ impl HarmonicWireHeader {
     }
 }
 
+/// SPSC payload storage synchronized exclusively by the slot-state release and
+/// acquire transitions. The source process is the sole activation writer and
+/// the expert process is the sole result writer. Neither buffer is reused
+/// until both owners have observed a terminal epoch.
+#[repr(transparent)]
+struct HarmonicPayload<const N: usize> {
+    bytes: UnsafeCell<[u8; N]>,
+}
+
+impl<const N: usize> HarmonicPayload<N> {
+    const fn new() -> Self {
+        Self {
+            bytes: UnsafeCell::new([0; N]),
+        }
+    }
+}
+
+// SAFETY: sharing is governed by the atomic slot state. Each payload has one
+// fixed writer; readers acquire Published/Completed before copying, and slot
+// recycling requires both owners to report quiescence.
+unsafe impl<const N: usize> Sync for HarmonicPayload<N> {}
+
 #[repr(C, align(64))]
 struct HarmonicWireSlot {
     state: AtomicU32,
@@ -211,8 +295,8 @@ struct HarmonicWireSlot {
     deadline_tick: AtomicU64,
     activation_fingerprint: AtomicU64,
     result_fingerprint: AtomicU64,
-    activation_payload: [AtomicU64; ACTIVATION_WORDS],
-    result_payload: [AtomicU64; RESULT_WORDS],
+    activation_payload: HarmonicPayload<{ ACTIVATION_WORDS * mem::size_of::<u64>() }>,
+    result_payload: HarmonicPayload<{ RESULT_WORDS * mem::size_of::<u64>() }>,
 }
 
 impl HarmonicWireSlot {
@@ -236,8 +320,8 @@ impl HarmonicWireSlot {
             deadline_tick: AtomicU64::new(0),
             activation_fingerprint: AtomicU64::new(0),
             result_fingerprint: AtomicU64::new(0),
-            activation_payload: [const { AtomicU64::new(0) }; ACTIVATION_WORDS],
-            result_payload: [const { AtomicU64::new(0) }; RESULT_WORDS],
+            activation_payload: HarmonicPayload::new(),
+            result_payload: HarmonicPayload::new(),
         }
     }
 
@@ -317,9 +401,9 @@ struct HarmonicWireLayout {
 }
 
 impl HarmonicWireLayout {
-    fn new(contract: HarmonicContract) -> Self {
+    fn new(contract: HarmonicContract, integrity_mode: HarmonicIntegrityMode) -> Self {
         Self {
-            header: HarmonicWireHeader::new(contract),
+            header: HarmonicWireHeader::new(contract, integrity_mode),
             slots: std::array::from_fn(|_| HarmonicWireSlot::new()),
         }
     }
@@ -340,6 +424,21 @@ impl fmt::Debug for HarmonicSharedRing {
 
 impl HarmonicSharedRing {
     pub fn create(file: &File, contract: HarmonicContract) -> HarmonicIpcResult<Self> {
+        Self::create_with_integrity(file, contract, HarmonicIntegrityMode::Fingerprint)
+    }
+
+    /// Create the zero-checksum, release/acquire data plane used for
+    /// performance composition. Exact payload comparison remains a promotion
+    /// test; it is not repeated byte-by-byte on every model layer.
+    pub fn create_data_plane(file: &File, contract: HarmonicContract) -> HarmonicIpcResult<Self> {
+        Self::create_with_integrity(file, contract, HarmonicIntegrityMode::ReleaseAcquire)
+    }
+
+    fn create_with_integrity(
+        file: &File,
+        contract: HarmonicContract,
+        integrity_mode: HarmonicIntegrityMode,
+    ) -> HarmonicIpcResult<Self> {
         validate_frozen_contract(contract)?;
         let bytes = mem::size_of::<HarmonicWireLayout>();
         file.set_len(bytes as u64)?;
@@ -355,7 +454,8 @@ impl HarmonicSharedRing {
         // atomic, so later cross-process access never races through plain Rust
         // references.
         unsafe {
-            (mmap.as_mut_ptr() as *mut HarmonicWireLayout).write(HarmonicWireLayout::new(contract));
+            (mmap.as_mut_ptr() as *mut HarmonicWireLayout)
+                .write(HarmonicWireLayout::new(contract, integrity_mode));
         }
         mmap.flush()?;
         let ring = Self { mmap };
@@ -382,6 +482,10 @@ impl HarmonicSharedRing {
 
     pub fn contract(&self) -> HarmonicContract {
         self.layout().header.contract()
+    }
+
+    pub fn integrity_mode(&self) -> HarmonicIpcResult<HarmonicIntegrityMode> {
+        HarmonicIntegrityMode::decode(self.layout().header.integrity_mode.load(Ordering::Acquire))
     }
 
     pub fn publish(
@@ -434,6 +538,7 @@ impl HarmonicSharedRing {
         let contract = self.contract();
         contract.validate(&packet, now)?;
         validate_payload(
+            self.integrity_mode()?,
             activation_payload,
             HARMONIC_ACTIVATION_EXTENT as usize,
             packet.activation_fingerprint,
@@ -511,7 +616,9 @@ impl HarmonicSharedRing {
             HarmonicWireState::Running,
         )?;
         let activation_payload = read_payload(&slot.activation_payload);
+        let integrity_mode = self.integrity_mode()?;
         validate_payload(
+            integrity_mode,
             &activation_payload,
             HARMONIC_ACTIVATION_EXTENT as usize,
             packet.activation_fingerprint,
@@ -520,7 +627,55 @@ impl HarmonicSharedRing {
         Ok(HarmonicWorkItem {
             packet,
             activation_payload,
+            integrity_mode,
         })
+    }
+
+    /// Discover the next expert epoch directly from the shared ring.
+    ///
+    /// This is the product-shaped data-plane seam: no Unix-socket message,
+    /// serialization, process lookup, or GPU operation occurs while the slot
+    /// is idle. The worker may spin briefly and then apply its own idle
+    /// backoff around this nonblocking probe.
+    pub fn expert_poll(
+        &self,
+        epoch: u64,
+        endpoint_generation: u64,
+    ) -> HarmonicIpcResult<HarmonicExpertPoll> {
+        self.check_endpoint(HarmonicOwner::ExpertGfx1151, endpoint_generation)?;
+        let slot = self.slot(epoch);
+        let state = slot.state()?;
+        let observed_epoch = slot.epoch.load(Ordering::Acquire);
+        if observed_epoch != epoch {
+            // The persistent worker is allowed to advance to the next logical
+            // epoch before the source has resolved and recycled the older
+            // epoch occupying that physical slot. An older occupant is
+            // therefore backpressure, not a stale-worker fault. Seeing a
+            // newer epoch means this worker really did fall behind and must
+            // fail closed rather than execute a skipped request.
+            if state == HarmonicWireState::Vacant || observed_epoch < epoch {
+                return Ok(HarmonicExpertPoll::Pending);
+            }
+            return Err(HarmonicProtocolError::StaleEpoch {
+                expected: observed_epoch,
+                got: epoch,
+            }
+            .into());
+        }
+        match state {
+            HarmonicWireState::Published => self
+                .expert_begin(epoch, endpoint_generation, harmonic_monotonic_tick()?)
+                .map(HarmonicExpertPoll::Work),
+            HarmonicWireState::Completed
+            | HarmonicWireState::Cancelled
+            | HarmonicWireState::TimedOut
+            | HarmonicWireState::FailedDense
+            | HarmonicWireState::FailedExpert => Ok(HarmonicExpertPoll::Terminal(state)),
+            HarmonicWireState::Vacant
+            | HarmonicWireState::Publishing
+            | HarmonicWireState::Running
+            | HarmonicWireState::Completing => Ok(HarmonicExpertPoll::Pending),
+        }
     }
 
     pub fn expert_complete(
@@ -546,6 +701,7 @@ impl HarmonicSharedRing {
             return Err(HarmonicProtocolError::InvalidPacket("completion extent").into());
         }
         validate_payload(
+            self.integrity_mode()?,
             result_payload,
             HARMONIC_RESULT_EXTENT as usize,
             completion.result_fingerprint,
@@ -589,6 +745,7 @@ impl HarmonicSharedRing {
             };
             let result_payload = read_payload(&slot.result_payload);
             validate_payload(
+                self.integrity_mode()?,
                 &result_payload,
                 HARMONIC_RESULT_EXTENT as usize,
                 completion.result_fingerprint,
@@ -815,6 +972,7 @@ impl HarmonicSharedRing {
         if header.slot_count.load(Ordering::Acquire) != HARMONIC_SLOT_COUNT as u32 {
             return Err(HarmonicIpcError::InvalidLayout("slot count"));
         }
+        HarmonicIntegrityMode::decode(header.integrity_mode.load(Ordering::Acquire))?;
         validate_frozen_contract(header.contract())
     }
 
@@ -895,38 +1053,50 @@ pub fn harmonic_payload_fingerprint(payload: &[u8]) -> u64 {
 }
 
 fn validate_payload(
+    integrity_mode: HarmonicIntegrityMode,
     payload: &[u8],
     expected_len: usize,
     expected_fingerprint: u64,
     field: &'static str,
 ) -> HarmonicIpcResult<()> {
-    if payload.len() != expected_len
-        || harmonic_payload_fingerprint(payload) != expected_fingerprint
+    if payload.len() != expected_len {
+        return Err(HarmonicProtocolError::InvalidPacket(field).into());
+    }
+    if integrity_mode == HarmonicIntegrityMode::Fingerprint
+        && harmonic_payload_fingerprint(payload) != expected_fingerprint
     {
         return Err(HarmonicProtocolError::InvalidPacket(field).into());
     }
     Ok(())
 }
 
-fn write_payload<const N: usize>(wire: &[AtomicU64; N], payload: &[u8]) {
-    debug_assert_eq!(payload.len(), N * mem::size_of::<u64>());
+fn write_payload<const N: usize>(wire: &HarmonicPayload<N>, payload: &[u8]) {
+    debug_assert_eq!(payload.len(), N);
     write_payload_prefix(wire, payload, N);
 }
 
-fn write_payload_prefix<const N: usize>(wire: &[AtomicU64; N], payload: &[u8], words: usize) {
-    debug_assert_eq!(payload.len(), N * mem::size_of::<u64>());
-    for (word, bytes) in wire.iter().zip(payload.chunks_exact(8)).take(words) {
-        word.store(
-            u64::from_le_bytes(bytes.try_into().unwrap()),
-            Ordering::Relaxed,
-        );
+fn write_payload_prefix<const N: usize>(wire: &HarmonicPayload<N>, payload: &[u8], words: usize) {
+    debug_assert_eq!(payload.len(), N);
+    let bytes = words.saturating_mul(mem::size_of::<u64>()).min(N);
+    // SAFETY: the protocol grants this endpoint exclusive write ownership of
+    // the payload until release-publication. Source and destination payloads
+    // have distinct fixed writers, and `payload` has at least `bytes` bytes.
+    unsafe {
+        ptr::copy_nonoverlapping(payload.as_ptr(), wire.bytes.get().cast::<u8>(), bytes);
     }
 }
 
-fn read_payload<const N: usize>(wire: &[AtomicU64; N]) -> Vec<u8> {
-    let mut payload = vec![0_u8; N * mem::size_of::<u64>()];
-    for (word, bytes) in wire.iter().zip(payload.chunks_exact_mut(8)) {
-        bytes.copy_from_slice(&word.load(Ordering::Relaxed).to_le_bytes());
+fn read_payload<const N: usize>(wire: &HarmonicPayload<N>) -> Vec<u8> {
+    let mut payload = vec![0_u8; N];
+    // SAFETY: the caller first acquired Published or Completed, pairing with
+    // the sole writer's release transition. The destination vector is exactly
+    // N bytes and does not overlap the mapped payload.
+    unsafe {
+        ptr::copy_nonoverlapping(
+            wire.bytes.get().cast::<u8>(),
+            payload.as_mut_ptr(),
+            payload.len(),
+        );
     }
     payload
 }
@@ -1045,6 +1215,66 @@ mod tests {
         assert_eq!(resolved.result_payload.unwrap(), result);
         owner.ring.recycle(1).unwrap();
         assert_eq!(owner.ring.state(1).unwrap(), HarmonicWireState::Vacant);
+    }
+
+    #[test]
+    fn expert_poll_discovers_work_without_a_control_message() {
+        let owner = TestRing::new(7, 11);
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&owner.path)
+            .unwrap();
+        let peer = HarmonicSharedRing::open(&file).unwrap();
+        assert_eq!(
+            peer.expert_poll(1, 11).unwrap(),
+            HarmonicExpertPoll::Pending
+        );
+
+        let (request, activation) = request(owner.ring.contract(), 1, u64::MAX);
+        owner.ring.publish(request, 7, 0, &activation).unwrap();
+        let work = match peer.expert_poll(1, 11).unwrap() {
+            HarmonicExpertPoll::Work(work) => work,
+            state => panic!("expected work, got {state:?}"),
+        };
+        assert_eq!(work.packet, request);
+        assert_eq!(work.activation_payload, activation);
+    }
+
+    #[test]
+    fn expert_poll_observes_cancelled_epoch_for_local_acknowledgement() {
+        let owner = TestRing::new(7, 11);
+        let (request, activation) = request(owner.ring.contract(), 1, u64::MAX);
+        owner.ring.publish(request, 7, 0, &activation).unwrap();
+        owner.ring.source_cancel(1, 7).unwrap();
+        assert_eq!(
+            owner.ring.expert_poll(1, 11).unwrap(),
+            HarmonicExpertPoll::Terminal(HarmonicWireState::Cancelled)
+        );
+        owner.ring.expert_acknowledge_terminal(1, 11).unwrap();
+        owner.ring.recycle(1).unwrap();
+    }
+
+    #[test]
+    fn expert_poll_treats_older_slot_occupant_as_backpressure() {
+        let owner = TestRing::new(7, 11);
+        let (request, activation) = request(owner.ring.contract(), 1, u64::MAX);
+        owner.ring.publish(request, 7, 0, &activation).unwrap();
+        owner.ring.source_cancel(1, 7).unwrap();
+
+        // Epoch 3 maps to the same physical slot as epoch 1. The worker can
+        // reach this poll while the source is still resolving epoch 1.
+        assert_eq!(
+            owner.ring.expert_poll(3, 11).unwrap(),
+            HarmonicExpertPoll::Pending
+        );
+    }
+
+    #[test]
+    fn monotonic_ticks_are_process_comparable_and_non_decreasing() {
+        let first = harmonic_monotonic_tick().unwrap();
+        let second = harmonic_monotonic_tick().unwrap();
+        assert!(second >= first);
     }
 
     #[test]
