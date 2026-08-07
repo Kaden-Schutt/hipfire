@@ -11,9 +11,11 @@
 //! or host-specific BDF is compiled into this tool.
 
 use std::ffi::c_void;
+use std::sync::atomic::{fence, Ordering};
 use std::time::Instant;
 
 use hip_bridge::{HipResult, HipRuntime};
+use memmap2::MmapOptions;
 use rdna_compute::{DType, Gpu, GpuTensor};
 use redline_rocr::{GpuSelector, Runtime};
 
@@ -23,6 +25,7 @@ const GATE_M: usize = 4096;
 const GATE_K: usize = 4096;
 const DOWN_M: usize = 4096;
 const DOWN_K: usize = 2048;
+const DOWN_ROW_BYTES: usize = DOWN_M * std::mem::size_of::<f32>();
 const WARMUP: usize = 8;
 const TRIALS: usize = 40;
 
@@ -403,6 +406,80 @@ fn time_combine(
     started.elapsed().as_secs_f64() * 1.0e6 / TRIALS as f64
 }
 
+fn dispatch_split_combine(
+    gpu: &mut Gpu,
+    local_outputs: &GpuTensor,
+    remote_outputs: &GpuTensor,
+    slot_sources: &GpuTensor,
+    topk_weights: &GpuTensor,
+    output: &GpuTensor,
+) -> HipResult<()> {
+    gpu.try_gfx1100()
+        .expect("exact gfx1100 proof vanished")
+        .harmonic_moe_down_combine_split_candidate(
+            local_outputs,
+            remote_outputs,
+            slot_sources,
+            topk_weights,
+            output,
+            DOWN_M,
+            TOP_K,
+        )
+}
+
+fn time_split_combine(
+    gpu: &mut Gpu,
+    local_outputs: &GpuTensor,
+    remote_outputs: &GpuTensor,
+    slot_sources: &GpuTensor,
+    topk_weights: &GpuTensor,
+    output: &GpuTensor,
+) -> f64 {
+    for _ in 0..WARMUP {
+        dispatch_split_combine(
+            gpu,
+            local_outputs,
+            remote_outputs,
+            slot_sources,
+            topk_weights,
+            output,
+        )
+        .unwrap();
+    }
+    gpu.hip.device_synchronize().unwrap();
+    let started = Instant::now();
+    for _ in 0..TRIALS {
+        dispatch_split_combine(
+            gpu,
+            local_outputs,
+            remote_outputs,
+            slot_sources,
+            topk_weights,
+            output,
+        )
+        .unwrap();
+    }
+    gpu.hip.device_synchronize().unwrap();
+    started.elapsed().as_secs_f64() * 1.0e6 / TRIALS as f64
+}
+
+fn pack_split_rows(full: &[u8], remote_mask: u32) -> (Vec<u8>, Vec<u8>, Vec<u32>) {
+    let mut local = Vec::with_capacity(TOP_K * DOWN_ROW_BYTES);
+    let mut remote = Vec::with_capacity(TOP_K * DOWN_ROW_BYTES);
+    let mut sources = Vec::with_capacity(TOP_K);
+    for slot in 0..TOP_K {
+        let row = &full[slot * DOWN_ROW_BYTES..(slot + 1) * DOWN_ROW_BYTES];
+        if remote_mask & (1 << slot) != 0 {
+            sources.push(0x8000_0000 | (remote.len() / DOWN_ROW_BYTES) as u32);
+            remote.extend_from_slice(row);
+        } else {
+            sources.push((local.len() / DOWN_ROW_BYTES) as u32);
+            local.extend_from_slice(row);
+        }
+    }
+    (local, remote, sources)
+}
+
 fn median(values: &mut [f64]) -> f64 {
     values.sort_by(f64::total_cmp);
     let mid = values.len() / 2;
@@ -732,6 +809,263 @@ fn main() -> Result<(), String> {
     };
     let combine_us = time_combine(&mut gpu, combine_source, &topk_weights, &combine);
     println!("fixed combine_k6_us={combine_us:.3}");
+
+    if candidate_supported {
+        let mut full_rows = vec![0_u8; down_output_bytes];
+        gpu.hip
+            .memcpy_dtoh(&mut full_rows, &down_candidate_gpu)
+            .map_err(|error| format!("download exact down rows: {error:?}"))?;
+
+        let local_packed_gpu = gpu
+            .hip
+            .malloc(down_output_bytes)
+            .map_err(|error| format!("local packed alloc: {error:?}"))?;
+        let remote_packed_gpu = gpu
+            .hip
+            .malloc(down_output_bytes)
+            .map_err(|error| format!("remote packed alloc: {error:?}"))?;
+        let slot_sources_gpu = gpu
+            .hip
+            .malloc(TOP_K * std::mem::size_of::<u32>())
+            .map_err(|error| format!("slot sources alloc: {error:?}"))?;
+        let reference_gpu = gpu
+            .hip
+            .malloc(DOWN_ROW_BYTES)
+            .map_err(|error| format!("reference residual alloc: {error:?}"))?;
+        let split_device_gpu = gpu
+            .hip
+            .malloc(DOWN_ROW_BYTES)
+            .map_err(|error| format!("device split residual alloc: {error:?}"))?;
+        let split_mapped_gpu = gpu
+            .hip
+            .malloc(DOWN_ROW_BYTES)
+            .map_err(|error| format!("mapped split residual alloc: {error:?}"))?;
+        let mut remote_mapping = MmapOptions::new()
+            .len(down_output_bytes)
+            .map_anon()
+            .map_err(|error| format!("remote mapped rows: {error}"))?;
+        let remote_host = remote_mapping.as_mut_ptr().cast();
+        unsafe {
+            gpu.hip
+                .host_register_mapped(remote_host, down_output_bytes)
+                .map_err(|error| format!("register remote mapped rows: {error:?}"))?;
+        }
+        let remote_alias_gpu = unsafe {
+            gpu.hip
+                .host_get_device_buffer(remote_host, down_output_bytes)
+                .map_err(|error| format!("resolve remote mapped rows: {error:?}"))?
+        };
+
+        let local_packed = tensor_alias(
+            local_packed_gpu.as_ptr(),
+            down_output_bytes,
+            vec![TOP_K, DOWN_M],
+            DType::F32,
+        );
+        let remote_packed = tensor_alias(
+            remote_packed_gpu.as_ptr(),
+            down_output_bytes,
+            vec![TOP_K, DOWN_M],
+            DType::F32,
+        );
+        let remote_mapped = tensor_alias(
+            remote_alias_gpu.as_ptr(),
+            down_output_bytes,
+            vec![TOP_K, DOWN_M],
+            DType::F32,
+        );
+        let slot_sources = tensor_alias(
+            slot_sources_gpu.as_ptr(),
+            TOP_K * std::mem::size_of::<u32>(),
+            vec![TOP_K],
+            DType::Raw,
+        );
+        let reference = tensor_alias(
+            reference_gpu.as_ptr(),
+            DOWN_ROW_BYTES,
+            vec![DOWN_M],
+            DType::F32,
+        );
+        let split_device = tensor_alias(
+            split_device_gpu.as_ptr(),
+            DOWN_ROW_BYTES,
+            vec![DOWN_M],
+            DType::F32,
+        );
+        let split_mapped = tensor_alias(
+            split_mapped_gpu.as_ptr(),
+            DOWN_ROW_BYTES,
+            vec![DOWN_M],
+            DType::F32,
+        );
+        let residual_seed = (0..DOWN_M)
+            .flat_map(|index| (((index * 7) % 19) as f32 / 9.0 - 1.0).to_le_bytes())
+            .collect::<Vec<_>>();
+
+        for remote_mask in 0_u32..(1 << TOP_K) {
+            let (local_rows, remote_rows, sources) = pack_split_rows(&full_rows, remote_mask);
+            if !local_rows.is_empty() {
+                gpu.hip
+                    .memcpy_htod(&local_packed_gpu, &local_rows)
+                    .map_err(|error| format!("upload local packed rows: {error:?}"))?;
+            }
+            if !remote_rows.is_empty() {
+                gpu.hip
+                    .memcpy_htod(&remote_packed_gpu, &remote_rows)
+                    .map_err(|error| format!("upload remote packed rows: {error:?}"))?;
+                remote_mapping[..remote_rows.len()].copy_from_slice(&remote_rows);
+                fence(Ordering::SeqCst);
+            }
+            let source_bytes = sources
+                .iter()
+                .flat_map(|source| source.to_le_bytes())
+                .collect::<Vec<_>>();
+            gpu.hip
+                .memcpy_htod(&slot_sources_gpu, &source_bytes)
+                .map_err(|error| format!("upload slot sources: {error:?}"))?;
+            for residual in [&reference_gpu, &split_device_gpu, &split_mapped_gpu] {
+                gpu.hip
+                    .memcpy_htod(residual, &residual_seed)
+                    .map_err(|error| format!("upload residual seed: {error:?}"))?;
+            }
+            gpu.moe_down_combine_k8_batched(
+                &down_candidate,
+                &topk_weights,
+                &reference,
+                DOWN_M,
+                TOP_K,
+                1,
+            )
+            .map_err(|error| format!("reference combine: {error:?}"))?;
+            dispatch_split_combine(
+                &mut gpu,
+                &local_packed,
+                &remote_packed,
+                &slot_sources,
+                &topk_weights,
+                &split_device,
+            )
+            .map_err(|error| format!("device split combine: {error:?}"))?;
+            dispatch_split_combine(
+                &mut gpu,
+                &local_packed,
+                &remote_mapped,
+                &slot_sources,
+                &topk_weights,
+                &split_mapped,
+            )
+            .map_err(|error| format!("mapped split combine: {error:?}"))?;
+            gpu.hip
+                .device_synchronize()
+                .map_err(|error| format!("split correctness sync: {error:?}"))?;
+            let mut expected = vec![0_u8; DOWN_ROW_BYTES];
+            let mut device_observed = vec![0_u8; DOWN_ROW_BYTES];
+            let mut mapped_observed = vec![0_u8; DOWN_ROW_BYTES];
+            gpu.hip
+                .memcpy_dtoh(&mut expected, &reference_gpu)
+                .map_err(|error| format!("download reference combine: {error:?}"))?;
+            gpu.hip
+                .memcpy_dtoh(&mut device_observed, &split_device_gpu)
+                .map_err(|error| format!("download device split combine: {error:?}"))?;
+            gpu.hip
+                .memcpy_dtoh(&mut mapped_observed, &split_mapped_gpu)
+                .map_err(|error| format!("download mapped split combine: {error:?}"))?;
+            if expected != device_observed || expected != mapped_observed {
+                let device_mismatches = expected
+                    .chunks_exact(4)
+                    .zip(device_observed.chunks_exact(4))
+                    .filter(|(left, right)| left != right)
+                    .count();
+                let mapped_mismatches = expected
+                    .chunks_exact(4)
+                    .zip(mapped_observed.chunks_exact(4))
+                    .filter(|(left, right)| left != right)
+                    .count();
+                return Err(format!(
+                    "remote_mask={remote_mask:#04x} split mismatch device={device_mismatches} mapped={mapped_mismatches}"
+                ));
+            }
+        }
+        println!("split_combine_exact_masks=64 columns=4096 bit_mismatch=0");
+
+        for remote_count in 0..=TOP_K {
+            let remote_mask = if remote_count == 0 {
+                0
+            } else {
+                ((1_u32 << remote_count) - 1) << (TOP_K - remote_count)
+            };
+            let (local_rows, remote_rows, sources) = pack_split_rows(&full_rows, remote_mask);
+            if !local_rows.is_empty() {
+                gpu.hip
+                    .memcpy_htod(&local_packed_gpu, &local_rows)
+                    .map_err(|error| format!("upload timed local rows: {error:?}"))?;
+            }
+            if !remote_rows.is_empty() {
+                gpu.hip
+                    .memcpy_htod(&remote_packed_gpu, &remote_rows)
+                    .map_err(|error| format!("upload timed remote rows: {error:?}"))?;
+                remote_mapping[..remote_rows.len()].copy_from_slice(&remote_rows);
+                fence(Ordering::SeqCst);
+            }
+            let source_bytes = sources
+                .iter()
+                .flat_map(|source| source.to_le_bytes())
+                .collect::<Vec<_>>();
+            gpu.hip
+                .memcpy_htod(&slot_sources_gpu, &source_bytes)
+                .map_err(|error| format!("upload timed slot sources: {error:?}"))?;
+            let device_us = time_split_combine(
+                &mut gpu,
+                &local_packed,
+                &remote_packed,
+                &slot_sources,
+                &topk_weights,
+                &split_device,
+            );
+            let mapped_us = time_split_combine(
+                &mut gpu,
+                &local_packed,
+                &remote_mapped,
+                &slot_sources,
+                &topk_weights,
+                &split_mapped,
+            );
+            println!(
+                "split_combine remote_rows={remote_count} device_us={device_us:.3} direct_mapped_us={mapped_us:.3}"
+            );
+        }
+        gpu.hip
+            .device_synchronize()
+            .map_err(|error| format!("split final sync: {error:?}"))?;
+        unsafe {
+            gpu.hip
+                .host_unregister(remote_host)
+                .map_err(|error| format!("unregister remote mapped rows: {error:?}"))?;
+        }
+        for tensor in [
+            local_packed,
+            remote_packed,
+            remote_mapped,
+            slot_sources,
+            reference,
+            split_device,
+            split_mapped,
+        ] {
+            std::mem::forget(tensor);
+        }
+        for buffer in [
+            local_packed_gpu,
+            remote_packed_gpu,
+            slot_sources_gpu,
+            reference_gpu,
+            split_device_gpu,
+            split_mapped_gpu,
+        ] {
+            gpu.hip
+                .free(buffer)
+                .map_err(|error| format!("free split micro buffer: {error:?}"))?;
+        }
+    }
 
     if let Some(histogram) = args.histogram {
         let records = histogram.iter().sum::<u64>() as f64;

@@ -16,4 +16,5 @@ radiowave = { path = "../radiowave" }
 rayon = "1"
 
 [dev-dependencies]
+memmap2 = "0.9"
 redline-rocr = { path = "../redline-rocr" }

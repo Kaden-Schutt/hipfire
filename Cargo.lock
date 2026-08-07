@@ -1943,6 +1943,7 @@ version = "0.3.0"
 dependencies = [
  "hip-bridge",
  "hipfire-config",
+ "memmap2",
  "radiowave",
  "rayon",
  "redline-dispatch",

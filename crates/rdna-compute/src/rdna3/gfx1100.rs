@@ -19,6 +19,10 @@ const MQ2_LLOYD_DOWN_EXPANDED_LDS_CANDIDATE_SRC: &str =
     include_str!("../../../../kernels/src/gemv_mq2g256_lloyd_moe_down_expanded_k4_lds.gfx1100.hip");
 const MQ2_LLOYD_DOWN_EXPANDED_LDS_CANDIDATE_KERNEL: &str =
     "gemv_mq2g256_lloyd_moe_down_expanded_k4_lds_gfx1100_candidate";
+const HARMONIC_SPLIT_COMBINE_CANDIDATE_SRC: &str =
+    include_str!("../../../../kernels/src/moe_down_combine_harmonic_split.gfx1100.hip");
+const HARMONIC_SPLIT_COMBINE_CANDIDATE_KERNEL: &str =
+    "moe_down_combine_harmonic_split_gfx1100_candidate";
 
 /// A mutable GPU borrow proven to target exact gfx1100.
 ///
@@ -153,5 +157,65 @@ impl Gfx1100Device<'_> {
             timer.finish(&self.gpu.hip);
         }
         result
+    }
+
+    /// Benchmark-only exact-order combine for owner-packed harmonic expert rows.
+    ///
+    /// `slot_sources` contains six u32 values. Bit 31 selects `remote_outputs`;
+    /// the remaining bits select the packed row within that owner. Both an
+    /// ordinary VRAM remote buffer and a HIP-mapped host alias are legal inputs.
+    #[allow(clippy::too_many_arguments)]
+    pub fn harmonic_moe_down_combine_split_candidate(
+        &mut self,
+        local_outputs: &GpuTensor,
+        remote_outputs: &GpuTensor,
+        slot_sources: &GpuTensor,
+        topk_weights: &GpuTensor,
+        x_residual: &GpuTensor,
+        m: usize,
+        k_top: usize,
+    ) -> HipResult<()> {
+        assert_eq!(m, 4096, "gfx1100 harmonic combine requires M=4096");
+        assert_eq!(k_top, 6, "gfx1100 harmonic combine requires top-k 6");
+        self.gpu.bind_thread()?;
+        self.gpu.ensure_kernel(
+            HARMONIC_SPLIT_COMBINE_CANDIDATE_KERNEL,
+            HARMONIC_SPLIT_COMBINE_CANDIDATE_SRC,
+            HARMONIC_SPLIT_COMBINE_CANDIDATE_KERNEL,
+        )?;
+        let local_ptr = local_outputs.buf.as_ptr();
+        let remote_ptr = remote_outputs.buf.as_ptr();
+        let sources_ptr = slot_sources.buf.as_ptr();
+        let weights_ptr = topk_weights.buf.as_ptr();
+        let residual_ptr = x_residual.buf.as_ptr();
+        let m_i32 = m as i32;
+        let k_top_i32 = k_top as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &local_ptr as *const _ as *mut c_void,
+            &remote_ptr as *const _ as *mut c_void,
+            &sources_ptr as *const _ as *mut c_void,
+            &weights_ptr as *const _ as *mut c_void,
+            &residual_ptr as *const _ as *mut c_void,
+            &m_i32 as *const _ as *mut c_void,
+            &k_top_i32 as *const _ as *mut c_void,
+        ];
+        self.gpu.launch_maybe_blob(
+            HARMONIC_SPLIT_COMBINE_CANDIDATE_KERNEL,
+            [(m as u32).div_ceil(256), 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut blob = KernargBlob::new();
+                blob.push_ptr(local_ptr);
+                blob.push_ptr(remote_ptr);
+                blob.push_ptr(sources_ptr);
+                blob.push_ptr(weights_ptr);
+                blob.push_ptr(residual_ptr);
+                blob.push_i32(m_i32);
+                blob.push_i32(k_top_i32);
+                blob
+            },
+        )
     }
 }
