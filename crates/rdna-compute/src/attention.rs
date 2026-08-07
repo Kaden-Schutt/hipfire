@@ -1935,7 +1935,11 @@ impl Gpu {
     /// - `tile_slot[t]` selects the `KvSlotDesc` for tile `t`'s K/V base
     ///   address (never a causal bound — `positions[]` stays authoritative,
     ///   same rule as every other `_slots` entry point in this file).
-    /// - `tile_row0[t]` is the tile's first row *within its slot*.
+    /// - `tile_row0[t]` is ABI-reserved and **intentionally unused by the
+    ///   kernel**: the kernel's causal loop reads `positions[]` indexed by
+    ///   global flat row, so a slot-relative row0 lookup would be wrong, not
+    ///   redundant. Kept in the signature because kernel arguments are
+    ///   positional and it sits between `tile_slot` and `tile_qbase`.
     /// - `tile_qbase[t]` is the tile's first row in the *global* flat row
     ///   space, i.e. how `q`/`out`/`positions` are indexed. Conflating
     ///   `tile_row0` and `tile_qbase` leaves slot 0 correct and every later
@@ -1987,6 +1991,34 @@ impl Gpu {
              `None` while still translating KV addresses through a real \
              descriptor)"
         );
+        if multi_slot {
+            let ts_len = tile_slot.unwrap().numel();
+            let tr_len = tile_row0.unwrap().numel();
+            let tq_len = tile_qbase.unwrap().numel();
+            assert_eq!(
+                ts_len, tr_len,
+                "tile_slot and tile_row0 must have equal length (both are \
+                 indexed by the kernel's blockIdx.x): got tile_slot.len()={} \
+                 and tile_row0.len()={}. A mismatch causes the kernel to read \
+                 past the end of the shorter array, folding uninitialised data \
+                 into row0, slot, or both",
+                ts_len, tr_len
+            );
+            assert_eq!(
+                ts_len, tq_len,
+                "tile_slot and tile_qbase must have equal length (both are \
+                 indexed by the kernel's blockIdx.x): got tile_slot.len()={} \
+                 and tile_qbase.len()={}. A mismatch causes the kernel to read \
+                 past the end of the shorter array, folding uninitialised data \
+                 into qbase or slot",
+                ts_len, tq_len
+            );
+            debug_assert!(
+                batch_size > 0,
+                "batch_size must be > 0 in multi-slot mode (needed as rows_end \
+                 fallback for the kernel's final tile)"
+            );
+        }
         self.bind_thread()?;
         const NTHREADS: usize = 256;
         // The kernel's per-thread accumulator is a fixed float[32]; dpt must

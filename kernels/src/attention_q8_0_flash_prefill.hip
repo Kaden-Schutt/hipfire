@@ -27,6 +27,7 @@
 //   s[BR*BC] | m[BR] | l[BR] | corr[BR] | q[BR*head_dim] | kt[BC*bph*34] | vt[...]
 
 #include <hip/hip_runtime.h>
+#include <assert.h>
 #include "kv_slot_desc.h"
 
 #ifndef BR
@@ -146,6 +147,16 @@ extern "C" __global__ __launch_bounds__(NTHREADS) void attention_q8_0_flash_pref
     // doc comment above).
     int seq_len = 0;
     for (int r = 0; r < rows; r++) seq_len = max(seq_len, positions[qbase + r] + 1);
+
+    // Sanity invariant, not a correctness mechanism: a row may never attend
+    // past its own slot's logical KV length. Descriptor construction must
+    // keep desc.seq_len in sync with (max positions[row]+1 over that slot's
+    // rows); this simply catches a violation early in debug builds.
+#ifdef NDEBUG
+    if (slot_descs != nullptr) __builtin_assume(seq_len <= desc.seq_len);
+#else
+    if (slot_descs != nullptr) assert(seq_len <= desc.seq_len);
+#endif
 
     // ── K/V tile loop with online softmax ───────────────────────────────
     for (int t0 = 0; t0 < seq_len; t0 += BC) {
