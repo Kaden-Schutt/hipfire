@@ -1465,6 +1465,28 @@ git commit -m "perf(attn): multi-slot bench, TILE_SIZE sweep, 32GB budget gate"
 
 ### Task 9: asym3 quality gate
 
+> **MEMORY — this is the heaviest task in the plan; read before running anything.**
+> Task 9 loads *real models*: `qwen3.6-27b.mq4` (15 GB) and
+> `qwen3.6-35b-a3b.mq4r` (18.7 GB), each in two KV modes. That dwarfs every
+> other task's footprint, and this box has **no swap** with GPU memory coming
+> out of system RAM.
+> - **One model at a time. Never two loaded concurrently, and never while any
+>   other GPU task is running.** Check with `pgrep -a -f "cargo run|hipfire"`
+>   before starting, and wait rather than overlapping.
+> - **Run every model invocation through `scripts/run-bounded.sh`**, raising the
+>   cap deliberately for this task since the models are genuinely large:
+>   `HIPFIRE_MEM_CAP=28G ./scripts/run-bounded.sh …`. Exit 137 means shrink the
+>   run (shorter context, fewer prompts), not raise the cap further.
+> - **Preflight before each load:** require `MemAvailable` comfortably above the
+>   model size plus KV plus headroom. Skip and report rather than pushing.
+> - Between arms, make sure the previous process has fully exited before
+>   starting the next — a lingering daemon holding a model is how two models end
+>   up resident at once. See the stale-daemon hazard: `hipfire serve` uses
+>   `~/.hipfire/bin/daemon`, which can outlive an apparent exit.
+> - After each arm, check `journalctl -k --since "<start>" | grep -E 'Out of
+>   memory|oom-kill|page allocation failure'` and report the count. A live
+>   `free` will not reveal damage after the fact.
+
 Spec §13. asym3 is not what these models ship with; this decides whether it may become a batched default.
 
 **Files:**
