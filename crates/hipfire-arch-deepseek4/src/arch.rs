@@ -21,6 +21,7 @@ use crate::deepseek4::{
     DeepseekV4LayerWeights, DeepseekV4RoutedWeights, DeepseekV4State, DeepseekV4Weights,
     DsparkConfig, DsparkWeights,
 };
+use crate::harmonic::HarmonicOwner;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct DeepseekV4HeterogeneousProjection {
@@ -101,6 +102,15 @@ impl DeepseekV4WeightStaging {
         })
     }
 
+    fn into_dense(mut self) -> Result<DeepseekV4DenseWeights, String> {
+        if self.routed.is_some() {
+            return Err("deepseek4: dense-only staging retained a routed owner".to_owned());
+        }
+        let dense = self.dense.take().expect("DS4 staging disarmed twice");
+        DeepseekV4DenseWeights::validate_loaded(&dense)?;
+        Ok(DeepseekV4DenseWeights::from_loaded(dense))
+    }
+
     fn routed_layer_mut(&mut self, index: usize) -> Option<&mut DeepseekV4LayerWeights> {
         self.routed.as_mut()?.layer_mut(index)
     }
@@ -146,6 +156,51 @@ impl Drop for DeepseekV4WeightStaging {
             if let Some(dense) = dense {
                 dense.free_gpu(dense_gpu);
             }
+        }
+    }
+}
+
+/// Owner-correct cleanup for an independently loaded gfx1151 expert worker.
+/// The worker never constructs a dense weight object or another `Gpu`.
+struct DeepseekV4RoutedWeightStaging {
+    routed: Option<DeepseekV4RoutedWeights>,
+    gpu: *mut Gpu,
+}
+
+impl DeepseekV4RoutedWeightStaging {
+    fn new(routed: DeepseekV4RoutedWeights, gpu: &mut Gpu) -> Self {
+        Self {
+            routed: Some(routed),
+            gpu,
+        }
+    }
+
+    fn routed_mut(&mut self) -> &mut DeepseekV4RoutedWeights {
+        self.routed.as_mut().expect("DS4 routed staging disarmed")
+    }
+
+    fn publish(mut self) -> DeepseekV4RoutedWeights {
+        self.routed
+            .take()
+            .expect("DS4 routed staging disarmed twice")
+    }
+}
+
+impl Drop for DeepseekV4RoutedWeightStaging {
+    fn drop(&mut self) {
+        let Some(routed) = self.routed.take() else {
+            return;
+        };
+        eprintln!("deepseek4: routed-worker load failed; reclaiming expert tensors");
+        // SAFETY: `gpu` is the live, uniquely borrowed gfx1151 owner passed to
+        // the enclosing loader. The staging guard cannot outlive that call.
+        let errors = unsafe { routed.free_gpu_now(&mut *self.gpu) };
+        if !errors.is_empty() {
+            eprintln!(
+                "deepseek4: routed-worker cleanup reported {} error(s): {}",
+                errors.len(),
+                errors.join("; ")
+            );
         }
     }
 }
@@ -987,7 +1042,7 @@ impl Architecture for DeepseekV4 {
         cfg: &Self::Config,
         gpu: &mut Gpu,
     ) -> Result<Self::Weights, String> {
-        Ok(Self::load_weights_inner(hfq, cfg, gpu, None, None, None)?.into_single())
+        Ok(Self::load_weights_inner(hfq, cfg, gpu, None, None, None, false)?.into_single())
     }
 
     fn new_state(_gpu: &mut Gpu, cfg: &Self::Config) -> Result<Self::State, String> {
@@ -1379,7 +1434,10 @@ impl DeepseekV4 {
         shard: &hipfire_runtime::tp_shard::ShardConfig,
         rank: usize,
     ) -> Result<DeepseekV4Weights, String> {
-        Ok(Self::load_weights_inner(hfq, cfg, gpu, Some((shard, rank)), None, None)?.into_single())
+        Ok(
+            Self::load_weights_inner(hfq, cfg, gpu, Some((shard, rank)), None, None, false)?
+                .into_single(),
+        )
     }
 
     /// Load the fixed MQ2R artifact directly onto its two exact device owners:
@@ -1412,7 +1470,7 @@ impl DeepseekV4 {
                     .into(),
             );
         }
-        Self::load_weights_inner(hfq, cfg, dense_gpu, None, Some(routed_gpu), None)?
+        Self::load_weights_inner(hfq, cfg, dense_gpu, None, Some(routed_gpu), None, false)?
             .into_heterogeneous()
     }
 
@@ -1435,8 +1493,107 @@ impl DeepseekV4 {
                 "deepseek4 heterogeneous fault harness requires the exact admitted G2 route".into(),
             );
         }
-        Self::load_weights_inner(hfq, cfg, dense_gpu, None, Some(routed_gpu), Some(fault))?
-            .into_heterogeneous()
+        Self::load_weights_inner(
+            hfq,
+            cfg,
+            dense_gpu,
+            None,
+            Some(routed_gpu),
+            Some(fault),
+            false,
+        )?
+        .into_heterogeneous()
+    }
+
+    fn validate_harmonic_worker_role(
+        cfg: &DeepseekV4Config,
+        gpu: &Gpu,
+        owner: HarmonicOwner,
+    ) -> Result<(), String> {
+        owner.validate_arch(&gpu.arch).map_err(|error| {
+            format!(
+                "deepseek4 harmonic {:?} worker exact admission failed on device {}: {error}",
+                owner, gpu.device_id
+            )
+        })?;
+        if !cfg.mq2r || cfg.mq2rxt {
+            return Err(
+                "deepseek4 harmonic workers admit only the frozen MQ2R P3 artifact".to_owned(),
+            );
+        }
+        if cfg.load_dspark {
+            return Err("deepseek4 harmonic AR workers exclude DSpark".to_owned());
+        }
+        if cfg.num_hidden_layers != crate::harmonic::HARMONIC_LAYER_COUNT as usize
+            || cfg.n_routed_experts != crate::harmonic::HARMONIC_EXPERT_COUNT as usize
+            || cfg.num_experts_per_tok != crate::harmonic::HARMONIC_TOP_K
+        {
+            return Err(format!(
+                "deepseek4 harmonic workers require layers/experts/top-k={}/{}/{}; got {}/{}/{}",
+                crate::harmonic::HARMONIC_LAYER_COUNT,
+                crate::harmonic::HARMONIC_EXPERT_COUNT,
+                crate::harmonic::HARMONIC_TOP_K,
+                cfg.num_hidden_layers,
+                cfg.n_routed_experts,
+                cfg.num_experts_per_tok
+            ));
+        }
+        if cfg.reap_keep.is_some() {
+            return Err("deepseek4 harmonic workers exclude REAP expert keep maps".to_owned());
+        }
+        Ok(())
+    }
+
+    /// Load only the canonical non-routed tower into an independently owned
+    /// exact-gfx1100 worker. No routed expert payload or foreign `Gpu` is ever
+    /// constructed in this process.
+    pub fn load_weights_harmonic_dense_gfx1100(
+        hfq: &mut HfqFile,
+        cfg: &DeepseekV4Config,
+        gpu: &mut Gpu,
+    ) -> Result<DeepseekV4DenseWeights, String> {
+        Self::validate_harmonic_worker_role(cfg, gpu, HarmonicOwner::DenseGfx1100)?;
+        Self::load_weights_inner(hfq, cfg, gpu, None, None, None, true)?.into_dense()
+    }
+
+    /// Load only the packed routed experts into an independently owned
+    /// exact-gfx1151 worker. Dense weights, canonical state, routing, RMSNorm,
+    /// and FWHT remain absent from this process by construction.
+    pub fn load_weights_harmonic_experts_gfx1151(
+        hfq: &mut HfqFile,
+        cfg: &DeepseekV4Config,
+        gpu: &mut Gpu,
+    ) -> Result<DeepseekV4RoutedWeights, String> {
+        Self::validate_harmonic_worker_role(cfg, gpu, HarmonicOwner::ExpertGfx1151)?;
+        Self::validate_mq2r_tensor_policy(hfq, cfg)?;
+        hfq.drop_mmap();
+
+        let backend = Mq2rBackend::for_verified_mq2r(gpu);
+        if !backend.is_gfx1151() {
+            return Err(
+                "deepseek4 harmonic expert worker did not select the exact gfx1151 backend"
+                    .to_owned(),
+            );
+        }
+        let mut staging =
+            DeepseekV4RoutedWeightStaging::new(DeepseekV4RoutedWeights::new(cfg, backend), gpu);
+        for layer_index in 0..cfg.num_hidden_layers {
+            let layer = staging
+                .routed_mut()
+                .layer_mut(layer_index)
+                .ok_or_else(|| format!("deepseek4: routed owner missing layer {layer_index}"))?;
+            Self::upload_layer_routed_experts(
+                hfq,
+                gpu,
+                &format!("layers.{layer_index}"),
+                cfg.n_routed_experts,
+                layer,
+                None,
+                None,
+            )?;
+        }
+        hfq.shrink_pread_buf();
+        Ok(staging.publish())
     }
 
     fn load_weights_inner(
@@ -1446,6 +1603,7 @@ impl DeepseekV4 {
         shard: Option<(&hipfire_runtime::tp_shard::ShardConfig, usize)>,
         mut routed_gpu: Option<&mut Gpu>,
         heterogeneous_fault: Option<DeepseekV4HeterogeneousFault>,
+        dense_only: bool,
     ) -> Result<DeepseekV4WeightStaging, String> {
         // Model identity and route identity are intentionally separate.
         // `.mq2r` fixes the exact P3 tensor recipe on every architecture.
@@ -1471,10 +1629,11 @@ impl DeepseekV4 {
         // N). Layers >= N fall back to shared-only FFN. Each layer's
         // expert blob is ~1.84 GB on the FP4-fixed HFQ (post-unpack
         // logical shape), so 22 layers ≈ 40 GB.
-        let upload_experts = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_UPLOAD_EXPERTS")
-            .ok()
-            .as_deref()
-            != Some("0");
+        let upload_experts = !dense_only
+            && hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_UPLOAD_EXPERTS")
+                .ok()
+                .as_deref()
+                != Some("0");
         let expert_layer_end: Option<usize> =
             hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_EXPERT_LAYER_END")
                 .ok()
@@ -1495,7 +1654,7 @@ impl DeepseekV4 {
         // addon instead of the base. The MTP layer is present iff the addon
         // (or, for one-shot quants that put MTP in-band, the base) contains
         // `mtp.0.norm.weight`.
-        let mut mtp_addon: Option<HfqFile> = if routed_gpu.is_some() {
+        let mut mtp_addon: Option<HfqFile> = if routed_gpu.is_some() || dense_only {
             // G2 owns only the frozen trunk. Auxiliary/speculative weights are
             // admitted after the base split route has passed full correctness.
             None
@@ -2177,7 +2336,7 @@ impl DeepseekV4 {
             addon.shrink_pread_buf();
         }
 
-        if routed_gpu.is_some() && weights.mtp_layer.is_some() {
+        if (routed_gpu.is_some() || dense_only) && weights.mtp_layer.is_some() {
             return Err(
                 "deepseek4: heterogeneous G2 admits the frozen trunk only; in-band MTP is not allowed"
                     .into(),

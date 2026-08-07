@@ -36,6 +36,27 @@ impl HarmonicOwner {
             Self::ExpertGfx1151 => 1,
         }
     }
+
+    /// Exact architecture identity required for this owner. A broad gfx11
+    /// family match is never sufficient for harmonic admission.
+    pub const fn expected_arch(self) -> &'static str {
+        match self {
+            Self::DenseGfx1100 => "gfx1100",
+            Self::ExpertGfx1151 => "gfx1151",
+        }
+    }
+
+    pub fn validate_arch(self, actual: &str) -> HarmonicResult<()> {
+        if actual.eq_ignore_ascii_case(self.expected_arch()) {
+            Ok(())
+        } else {
+            Err(HarmonicProtocolError::WrongArchitecture {
+                owner: self,
+                expected: self.expected_arch(),
+                actual: actual.to_owned(),
+            })
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -234,6 +255,11 @@ pub enum HarmonicProtocolError {
     WrongOwner {
         expected: HarmonicOwner,
         got: HarmonicOwner,
+    },
+    WrongArchitecture {
+        owner: HarmonicOwner,
+        expected: &'static str,
+        actual: String,
     },
     DeadlineExceeded {
         deadline: u64,
@@ -749,6 +775,25 @@ mod tests {
         for packet in cases {
             assert!(contract.validate(&packet, 0).is_err());
         }
+    }
+
+    #[test]
+    fn owner_architecture_admission_is_exact_and_role_specific() {
+        assert!(HarmonicOwner::DenseGfx1100.validate_arch("gfx1100").is_ok());
+        assert!(HarmonicOwner::ExpertGfx1151
+            .validate_arch("GFX1151")
+            .is_ok());
+        assert!(matches!(
+            HarmonicOwner::DenseGfx1100.validate_arch("gfx1151"),
+            Err(HarmonicProtocolError::WrongArchitecture {
+                owner: HarmonicOwner::DenseGfx1100,
+                expected: "gfx1100",
+                ..
+            })
+        ));
+        assert!(HarmonicOwner::ExpertGfx1151
+            .validate_arch("gfx1101")
+            .is_err());
     }
 
     #[test]
