@@ -256,57 +256,53 @@ fn main() {
         .memcpy_htod(&split_source, &split_payload)
         .expect("upload split-result source");
 
-    gpu.hip
-        .event_record(&start, Some(&stream))
-        .expect("record split write start");
-    for _ in 0..COPY_ROUNDS {
+    assert_eq!(
+        HARMONIC_SPLIT_RESULT_EXTENT,
+        6 * HARMONIC_RESULT_EXTENT as usize,
+        "split-result extent must hold six packed DS4 expert rows"
+    );
+    let mut split_timings = Vec::with_capacity(6);
+    for row_count in 1..=6 {
+        let extent = row_count * HARMONIC_RESULT_EXTENT as usize;
         gpu.hip
-            .memcpy_dtod_async_at(
-                &split_device,
-                0,
-                &split_source,
-                0,
-                HARMONIC_SPLIT_RESULT_EXTENT,
-                &stream,
-            )
-            .expect("timed split device-to-mapped copy");
-    }
-    gpu.hip
-        .event_record(&stop, Some(&stream))
-        .expect("record split write stop");
-    gpu.hip.event_synchronize(&stop).expect("wait split writes");
-    let split_write_us = f64::from(
+            .event_record(&start, Some(&stream))
+            .expect("record split write start");
+        for _ in 0..COPY_ROUNDS {
+            gpu.hip
+                .memcpy_dtod_async_at(&split_device, 0, &split_source, 0, extent, &stream)
+                .expect("timed split device-to-mapped copy");
+        }
         gpu.hip
-            .event_elapsed_ms(&start, &stop)
-            .expect("time split mapped writes"),
-    ) * 1_000.0
-        / COPY_ROUNDS as f64;
+            .event_record(&stop, Some(&stream))
+            .expect("record split write stop");
+        gpu.hip.event_synchronize(&stop).expect("wait split writes");
+        let write_us = f64::from(
+            gpu.hip
+                .event_elapsed_ms(&start, &stop)
+                .expect("time split mapped writes"),
+        ) * 1_000.0
+            / COPY_ROUNDS as f64;
 
-    gpu.hip
-        .event_record(&start, Some(&stream))
-        .expect("record split read start");
-    for _ in 0..COPY_ROUNDS {
         gpu.hip
-            .memcpy_dtod_async_at(
-                &split_destination,
-                0,
-                &split_device,
-                0,
-                HARMONIC_SPLIT_RESULT_EXTENT,
-                &stream,
-            )
-            .expect("timed split mapped-to-device copy");
+            .event_record(&start, Some(&stream))
+            .expect("record split read start");
+        for _ in 0..COPY_ROUNDS {
+            gpu.hip
+                .memcpy_dtod_async_at(&split_destination, 0, &split_device, 0, extent, &stream)
+                .expect("timed split mapped-to-device copy");
+        }
+        gpu.hip
+            .event_record(&stop, Some(&stream))
+            .expect("record split read stop");
+        gpu.hip.event_synchronize(&stop).expect("wait split reads");
+        let read_us = f64::from(
+            gpu.hip
+                .event_elapsed_ms(&start, &stop)
+                .expect("time split mapped reads"),
+        ) * 1_000.0
+            / COPY_ROUNDS as f64;
+        split_timings.push((row_count, extent, write_us, read_us));
     }
-    gpu.hip
-        .event_record(&stop, Some(&stream))
-        .expect("record split read stop");
-    gpu.hip.event_synchronize(&stop).expect("wait split reads");
-    let split_read_us = f64::from(
-        gpu.hip
-            .event_elapsed_ms(&start, &stop)
-            .expect("time split mapped reads"),
-    ) * 1_000.0
-        / COPY_ROUNDS as f64;
     let mut observed_split = vec![0_u8; HARMONIC_SPLIT_RESULT_EXTENT];
     gpu.hip
         .memcpy_dtoh(&mut observed_split, &split_destination)
@@ -343,9 +339,10 @@ fn main() {
         result.len(),
         (write_us + read_us) * 43.0 / 1_000.0,
     );
-    println!(
-        "PASS split_result_bytes={} split_write_us={split_write_us:.3} split_read_us={split_read_us:.3} projected_43_layer_roundtrip_ms={:.3}",
-        HARMONIC_SPLIT_RESULT_EXTENT,
-        (split_write_us + split_read_us) * 43.0 / 1_000.0,
-    );
+    for (row_count, extent, split_write_us, split_read_us) in split_timings {
+        println!(
+            "PASS split_result_rows={row_count} split_result_bytes={extent} split_write_us={split_write_us:.3} split_read_us={split_read_us:.3} projected_43_layer_roundtrip_ms={:.3}",
+            (split_write_us + split_read_us) * 43.0 / 1_000.0,
+        );
+    }
 }
