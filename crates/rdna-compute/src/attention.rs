@@ -10515,6 +10515,71 @@ impl Gpu {
             },
         )
     }
+
+    /// Exact-gfx1201 DS4 indexer-Q RoPE at H64/D128/R64.
+    ///
+    /// `block_threads` selects 2, 4, or 8 head-waves per workgroup.  Keeping
+    /// this explicit lets the channel micro screen the occupancy/SFU balance;
+    /// the product route passes the certified fixed geometry.
+    pub fn rope_tail_interleaved_h64d128r64_gfx1201(
+        &mut self,
+        q: &GpuTensor,
+        pos_buf: &GpuTensor,
+        freq_base: f32,
+        block_threads: u32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if !self.arch_caps.is_gfx1201() {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "rope_tail_interleaved_h64d128r64_gfx1201 requires gfx1201, got {}",
+                    self.arch
+                ),
+            ));
+        }
+        if !matches!(block_threads, 64 | 128 | 256) {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "rope_tail_interleaved_h64d128r64_gfx1201 requires 64, 128, or 256 threads",
+            ));
+        }
+        if q.numel() != 64 * 128 || pos_buf.numel() != 1 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "rope_tail_interleaved_h64d128r64_gfx1201 shape mismatch",
+            ));
+        }
+        self.ensure_kernel(
+            "rope_tail_interleaved_h64d128r64_gfx1201",
+            kernels::ROPE_TAIL_INTERLEAVED_H64D128R64_GFX1201_SRC,
+            "rope_tail_interleaved_h64d128r64_gfx1201",
+        )?;
+        let qp = q.buf.as_ptr();
+        let pp = pos_buf.buf.as_ptr();
+        let mut fb = freq_base;
+        let mut params: Vec<*mut c_void> = vec![
+            &qp as *const _ as *mut c_void,
+            &pp as *const _ as *mut c_void,
+            &mut fb as *mut _ as *mut c_void,
+        ];
+        let heads_per_block = block_threads / 32;
+        self.launch_maybe_blob(
+            "rope_tail_interleaved_h64d128r64_gfx1201",
+            [64_u32.div_ceil(heads_per_block), 1, 1],
+            [block_threads, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(qp);
+                b.push_ptr(pp);
+                b.push_f32(fb);
+                b
+            },
+        )
+    }
+
     pub fn rope_tail_interleaved_batched(
         &mut self,
         q: &GpuTensor,

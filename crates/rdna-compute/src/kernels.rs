@@ -5395,6 +5395,10 @@ pub const SWA_RING_WRITE_BUF_SRC: &str =
 pub const ROPE_TAIL_INTERLEAVED_SRC: &str =
     include_str!("../../../kernels/src/rope_tail_interleaved.hip");
 
+/// Exact-gfx1201 head-parallel indexer-Q RoPE for DS4 H64/D128/R64.
+pub const ROPE_TAIL_INTERLEAVED_H64D128R64_GFX1201_SRC: &str =
+    include_str!("../../../kernels/src/rope_tail_interleaved_h64d128r64.gfx1201.hip");
+
 /// YaRN-aware tail-only RoPE for compressed-layer attention (DeepSeek V4).
 /// Adds per-call freq_scale / ext_factor / attn_factor / corr_dims to
 /// match antirez/ds4 rope_tail_ext_inplace. For dense (uncompressed)
