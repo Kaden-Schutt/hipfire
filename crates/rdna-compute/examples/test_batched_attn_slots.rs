@@ -38,6 +38,24 @@
 // descriptor to slot 0's before the multi-slot launch (simulating "reverted
 // a descriptor to slot 0"). Expected to fail loudly and immediately. See
 // task-7-report.md for the captured failure.
+//
+// The corruption is applied to the DEVICE-side descriptor table only (what
+// the candidate multi-slot kernel reads) — never to the host-side `descs`
+// that `run_*_reference` uses to slice the very same arenas for its
+// per-slot legacy-kernel reference. An earlier version of this control
+// corrupted both, which meant the reference read the identical wrong slab
+// as the candidate and the numeric comparison could never observe a fault
+// (see maybe_corrupt's doc comment). `main()` also restricts which shapes
+// run under NEGATIVE_CONTROL=1 to those with a uniform seq_len across
+// slots, so the device-side `positions[row]+1 <= desc.seq_len` guard added
+// in Tasks 5/6 does not trip and abort the process before the numeric
+// comparison gets a chance to run.
+//
+// Positive poison control: the isolation layer (layer 2 above) asserts a
+// NaN-poisoned NEIGHBOUR does not corrupt the target slot's output. That is
+// silent if the poison mechanism itself were inert. `test_poison_is_live`
+// poisons the TARGET slot itself and asserts its output DOES go
+// non-finite, proving the poison is live rather than assumed.
 
 use rdna_compute::kv_slots::{build_arena, build_asym3_k_arena, build_tiles, KvSlotDesc};
 use rdna_compute::{DType, Gpu, GpuTensor};
@@ -125,6 +143,20 @@ fn assert_close(label: &str, got: &[f32], want: &[f32]) {
     if let Some(i) = want.iter().position(|v| !v.is_finite()) {
         panic!("{label}: reference[{i}]={} is non-finite (got[{i}]={})", want[i], got[i]);
     }
+    // Non-degeneracy guard: both `out` buffers start life as `gpu.zeros`, and
+    // this harness's own comments (see build_tiles' doc comment on empty
+    // tiles) document a kernel mode that can leave rows unwritten. Two
+    // all-zero arrays pass the tolerance loop below at a perfect 0.000x —
+    // indistinguishable from genuine agreement. Require the reference to
+    // contain at least one nonzero element before trusting the comparison.
+    if !want.is_empty() {
+        assert!(
+            want.iter().any(|v| v.abs() > 0.0),
+            "{label}: reference array is all-zero ({} elements) — a kernel that wrote nothing \
+             would pass this comparison by accident; refusing to treat an all-zero pair as agreement",
+            want.len()
+        );
+    }
     let mut worst = 0.0f32;
     let mut worst_i = 0usize;
     for (i, (g, w)) in got.iter().zip(want).enumerate() {
@@ -147,6 +179,19 @@ fn assert_close(label: &str, got: &[f32], want: &[f32]) {
 /// If NEGATIVE_CONTROL=1, every slot's descriptor is overwritten with
 /// slot 0's — simulating "a descriptor reverted to slot 0" / "two slots
 /// pointed at the same base offset". Proves the harness can actually fail.
+///
+/// CALLER CONTRACT: apply this ONLY to the descriptor table that gets
+/// uploaded to the device for the CANDIDATE multi-slot launch, never to the
+/// host-side `Vec<KvSlotDesc>` that `run_*_reference` uses to slice the
+/// arenas for its per-slot legacy-kernel reference. If both arms see the
+/// corrupted table, the reference reads the identical wrong slab as the
+/// candidate and the comparison can never observe the fault — this was
+/// exactly the bug in an earlier version of this control (task-7 review,
+/// Fix 1): golden fell through to the numeric comparison, both sides
+/// silently agreed on the same wrong answer, and NEGATIVE_CONTROL=1 could
+/// only ever be observed to fail via the unrelated device-side
+/// `seq_len <= desc.seq_len` guard on shapes with non-uniform seq_lens —
+/// never via the tolerance comparison itself.
 fn maybe_corrupt(mut descs: Vec<KvSlotDesc>) -> Vec<KvSlotDesc> {
     if std::env::var("NEGATIVE_CONTROL").as_deref() == Ok("1") {
         let d0 = descs[0];
@@ -282,6 +327,21 @@ fn shapes_lds() -> Vec<Shape> {
             n_slots: 4,
             seq_lens: vec![32, 500, 2000, 8000],
             m_per_slot: vec![1, 1, 3, 1],
+            n_heads: nh,
+            n_kv_heads: nkv,
+            head_dim: 256,
+        });
+        // Mixed M including a zero-query slot (Fix 5, task-7 review):
+        // shapes_lds() previously never exercised M=0, though the brief
+        // requires M mixed across 0/1/3/8. A zero-query slot is a distinct
+        // hazard for the LDS decode path specifically — it creates a gap in
+        // descriptor indexing (slot 0 contributes no rows to the flat
+        // batch) that a wrong row->slot mapping could paper over on shapes
+        // where every slot has >=1 row.
+        v.push(Shape {
+            n_slots: 4,
+            seq_lens: vec![32, 500, 2000, 8000],
+            m_per_slot: vec![0, 1, 3, 8],
             n_heads: nh,
             n_kv_heads: nkv,
             head_dim: 256,
@@ -433,13 +493,38 @@ fn build_k_arena_for_mode(shape: &Shape, mode: KvMode, poison_except: Option<usi
 }
 
 fn build_general_batch(gpu: &mut Gpu, shape: &Shape, mode: KvMode, poison_except: Option<usize>) -> GeneralBatch {
+    build_general_batch_ex(gpu, shape, mode, poison_except, true)
+}
+
+/// `apply_negative_control=false` bypasses `maybe_corrupt` regardless of the
+/// NEGATIVE_CONTROL env var. Needed by `test_poison_is_live`: that check
+/// builds a batch via `poison_except` for an UNRELATED reason (proving the
+/// NaN-poison byte generator is live), and if NEGATIVE_CONTROL=1 happened to
+/// be set in the environment, the global descriptor corruption would
+/// override every slot's descriptor to slot 0's BEFORE the kernel launch —
+/// silently redirecting the "poisoned" slot's read to a clean neighbour and
+/// making the positive control fail for a reason that has nothing to do
+/// with whether the poison bytes themselves are live. The two controls test
+/// independent hazards (descriptor corruption vs. arena-content poisoning)
+/// and must not be coupled through the same env var.
+fn build_general_batch_ex(
+    gpu: &mut Gpu,
+    shape: &Shape,
+    mode: KvMode,
+    poison_except: Option<usize>,
+    apply_negative_control: bool,
+) -> GeneralBatch {
     let v_per_pos = mode.v_per_pos(shape.n_kv_heads, shape.head_dim);
     let (k_bytes, k_descs) = build_k_arena_for_mode(shape, mode, poison_except);
     let (v_bytes, v_descs) = build_arena(&shape.seq_lens, v_per_pos, poison_except);
     assert_varying(&k_bytes, "K arena");
     assert_varying(&v_bytes, "V arena");
-    let descs = maybe_corrupt(merge_descs(&k_descs, &v_descs));
-    let descs_dev = gpu.upload_raw(&pack_descs(&descs), &[shape.n_slots]).expect("descs upload");
+    // NEGATIVE_CONTROL corrupts only the device-bound copy — `descs` (used
+    // by run_general_reference to slice these same arenas) stays correct.
+    // See maybe_corrupt's doc comment.
+    let descs = merge_descs(&k_descs, &v_descs);
+    let descs_for_device = if apply_negative_control { maybe_corrupt(descs.clone()) } else { descs.clone() };
+    let descs_dev = gpu.upload_raw(&pack_descs(&descs_for_device), &[shape.n_slots]).expect("descs upload");
     let k_arena = gpu.upload_raw(&k_bytes, &[k_bytes.len()]).expect("k arena upload");
     let v_arena = gpu.upload_raw(&v_bytes, &[v_bytes.len()]).expect("v arena upload");
 
@@ -695,6 +780,55 @@ fn test_general_isolation(gpu: &mut Gpu, shape: &Shape, mode: KvMode, cos_theta:
     }
 }
 
+/// Positive control for the poison mechanism itself (Fix 2, task-7 review).
+/// The isolation checks above (`test_*_isolation`) all assert a NEGATIVE
+/// result: a NaN-poisoned NEIGHBOUR must not corrupt the target slot's
+/// output. If `poison_except` were inert — a no-op, or wired to the wrong
+/// slot — every one of those 542 checks would compare a run against a
+/// byte-identical run and pass at a perfect 0.000x, indistinguishable from
+/// the current (genuinely working) output. This flips the polarity: poison
+/// the TARGET slot itself (by naming a *different* slot as the
+/// `poison_except` survivor) and assert the target's own output DOES
+/// become non-finite. That is only true if the NaN bytes this harness
+/// writes (Q8_0's f16 scale field `0x7E00`, or asym3's `cnorm = NaN`) are
+/// actually reaching the device read the kernel performs for that slot.
+fn test_poison_is_live(gpu: &mut Gpu, mode: KvMode, cos_theta: &GpuTensor, sin_theta: &GpuTensor) {
+    let shape = Shape {
+        n_slots: 3,
+        seq_lens: vec![2048, 2048, 2048],
+        m_per_slot: vec![1, 1, 1],
+        n_heads: 16,
+        n_kv_heads: 2,
+        head_dim: 256,
+    };
+    let target = 1usize;
+    let bystander = 0usize; // poison_except's survivor — every OTHER slot,
+                             // including `target`, gets NaN'd.
+    // apply_negative_control=false: this check is orthogonal to
+    // NEGATIVE_CONTROL and must not be silently defeated by it if that env
+    // var happens to be set for an unrelated run — see build_general_batch_ex's
+    // doc comment.
+    let batch = build_general_batch_ex(gpu, &shape, mode, Some(bystander), false);
+    let out = run_general_candidate(gpu, &shape, mode, &batch, false, cos_theta, sin_theta);
+    batch.free(gpu);
+    let q_dim = shape.n_heads * shape.head_dim;
+    let victim = slot_output(&out, &shape, target, q_dim);
+    let n_bad = victim.iter().filter(|v| !v.is_finite()).count();
+    assert!(
+        n_bad > 0,
+        "positive poison control [{mode:?}]: target slot {target}'s OWN KV was poisoned with \
+         NaN (bystander slot {bystander} left clean), but its output stayed fully finite \
+         ({} elements, 0 non-finite) — the poison mechanism is not reaching this kernel's \
+         device reads, which means the isolation layer's passing checks are meaningless",
+        victim.len()
+    );
+    println!(
+        "  positive poison control [{mode:?}]: OK (target slot {target}'s poisoned output has \
+         {n_bad}/{} non-finite elements)",
+        victim.len()
+    );
+}
+
 // ─────────────────────────── LDS decode kernel path ──────────────────────
 // (attention_q8_0_kv_batched_masked_slots, Q8-only)
 
@@ -716,8 +850,10 @@ fn build_lds_batch(gpu: &mut Gpu, shape: &Shape, poison_except: Option<usize>) -
     let (v_bytes, v_descs) = build_arena(&shape.seq_lens, per_pos, poison_except);
     assert_varying(&k_bytes, "LDS K arena");
     assert_varying(&v_bytes, "LDS V arena");
-    let descs = maybe_corrupt(merge_descs(&k_descs, &v_descs));
-    let descs_dev = gpu.upload_raw(&pack_descs(&descs), &[shape.n_slots]).expect("descs upload");
+    // See build_general_batch: corrupt only the device-bound copy.
+    let descs = merge_descs(&k_descs, &v_descs);
+    let descs_for_device = maybe_corrupt(descs.clone());
+    let descs_dev = gpu.upload_raw(&pack_descs(&descs_for_device), &[shape.n_slots]).expect("descs upload");
     let k_arena = gpu.upload_raw(&k_bytes, &[k_bytes.len()]).expect("k arena upload");
     let v_arena = gpu.upload_raw(&v_bytes, &[v_bytes.len()]).expect("v arena upload");
 
@@ -881,8 +1017,10 @@ fn build_prefill_batch(gpu: &mut Gpu, shape: &Shape, br: usize, poison_except: O
     let (v_bytes, v_descs) = build_arena(&shape.seq_lens, per_pos, poison_except);
     assert_varying(&k_bytes, "prefill K arena");
     assert_varying(&v_bytes, "prefill V arena");
-    let descs = maybe_corrupt(merge_descs(&k_descs, &v_descs));
-    let descs_dev = gpu.upload_raw(&pack_descs(&descs), &[shape.n_slots]).expect("descs upload");
+    // See build_general_batch: corrupt only the device-bound copy.
+    let descs = merge_descs(&k_descs, &v_descs);
+    let descs_for_device = maybe_corrupt(descs.clone());
+    let descs_dev = gpu.upload_raw(&pack_descs(&descs_for_device), &[shape.n_slots]).expect("descs upload");
     let k_arena = gpu.upload_raw(&k_bytes, &[k_bytes.len()]).expect("k arena upload");
     let v_arena = gpu.upload_raw(&v_bytes, &[v_bytes.len()]).expect("v arena upload");
 
@@ -1051,12 +1189,35 @@ fn main() {
     eprintln!("build with --features deltanet");
 }
 
+/// True when the NEGATIVE_CONTROL=1 env var is set.
+fn negative_control_active() -> bool {
+    std::env::var("NEGATIVE_CONTROL").as_deref() == Ok("1")
+}
+
+/// Shapes with every slot at the same seq_len. Under NEGATIVE_CONTROL=1
+/// (every descriptor forced to slot 0's), a shape with UNEQUAL seq_lens
+/// trips the device-side `positions[row]+1 <= desc.seq_len` guard (Tasks
+/// 5/6) as soon as a later slot's real, larger position is checked against
+/// slot 0's smaller seq_len/cap — aborting the process before the numeric
+/// `assert_close` comparison ever runs. Restricting to uniform-seq_len
+/// shapes keeps that guard quiet (every desc — corrupted or not — has the
+/// same seq_len/cap) so the corrupted addressing shows up ONLY as a wrong
+/// numeric result, which is what Fix 1 (task-7 review) needs to prove
+/// assert_close is sensitive to a real addressing fault.
+fn uniform_seq_len(shape: &Shape) -> bool {
+    shape.seq_lens.iter().all(|&sl| sl == shape.seq_lens[0])
+}
+
 #[cfg(feature = "deltanet")]
 fn main() {
     let mut gpu = Gpu::init().expect("gpu init");
 
-    if std::env::var("NEGATIVE_CONTROL").as_deref() == Ok("1") {
-        println!("=== NEGATIVE_CONTROL=1: every descriptor forced to slot 0 — expecting a hard failure ===");
+    if negative_control_active() {
+        println!(
+            "=== NEGATIVE_CONTROL=1: every descriptor forced to slot 0, candidate arm only \
+             — restricted to uniform-seq_len shapes so the numeric comparison (not the device \
+             seq_len<=cap guard) is what has to catch it — expecting a hard failure ==="
+        );
     }
 
     // Step 4: assert the asym3 arm is really asym3 (not silently downgraded
@@ -1076,6 +1237,11 @@ fn main() {
     let cos_theta = gpu.upload_f32(&cos_vals, &[cos_vals.len()]).expect("cos upload");
     let sin_theta = gpu.upload_f32(&sin_vals, &[sin_vals.len()]).expect("sin upload");
 
+    println!("### Positive poison control (Fix 2, task-7 review) ###");
+    test_poison_is_live(&mut gpu, KvMode::Q8, &cos_theta, &sin_theta);
+    test_poison_is_live(&mut gpu, KvMode::Asym3, &cos_theta, &sin_theta);
+    println!();
+
     let mut n_ok = 0usize;
     let mut n_total = 0usize;
 
@@ -1089,7 +1255,13 @@ fn main() {
         head_dim: 256,
     };
     println!("### General tile-kernel sweep (Task 5 Q8 tile + Task 6 asym3 tile) ###");
-    let general_shapes: Vec<Shape> = if smoke { vec![smoke_shape()] } else { shapes() };
+    let general_shapes: Vec<Shape> = if smoke {
+        vec![smoke_shape()]
+    } else if negative_control_active() {
+        shapes().into_iter().filter(uniform_seq_len).collect()
+    } else {
+        shapes()
+    };
     for shape in general_shapes {
         for &mode in &[KvMode::Q8, KvMode::Asym3] {
             for &force_subbatch in &[false, true] {
@@ -1104,7 +1276,13 @@ fn main() {
     }
 
     println!("\n### LDS decode kernel sweep (Task 4, Q8-only, capped context) ###");
-    let lds_shapes: Vec<Shape> = if smoke { vec![smoke_shape()] } else { shapes_lds() };
+    let lds_shapes: Vec<Shape> = if smoke {
+        vec![smoke_shape()]
+    } else if negative_control_active() {
+        shapes_lds().into_iter().filter(uniform_seq_len).collect()
+    } else {
+        shapes_lds()
+    };
     for shape in lds_shapes {
         println!("-- {}", shape.label());
         n_total += 2;
@@ -1118,8 +1296,9 @@ fn main() {
     // Fresh `Gpu` per (shape, br, bc) rather than reusing the shared `gpu`
     // from the general/LDS sweeps above.
     //
-    // Found empirically while running this sweep (see task-7-report.md for
-    // the full repro): `attention_q8_0_flash_prefill_slots`
+    // Found empirically while running this sweep (see
+    // docs/perf-checkpoints/2026-08-07-flash-prefill-brbc-cache-defect.md
+    // for the full writeup and Task 8 warning): `attention_q8_0_flash_prefill_slots`
     // (crates/rdna-compute/src/attention.rs) compiles a BR/BC-templated
     // kernel per `(br, bc)` pair (module name
     // "attention_q8_0_flash_prefill_br{br}_bc{bc}", body `#define BR
@@ -1141,16 +1320,24 @@ fn main() {
     // per (br, bc) keeps each prefill kernel variant's compile-and-launch
     // pairing consistent, isolating what this harness actually tests
     // (multi-slot descriptor addressing) from this separate, pre-existing
-    // kernel-cache defect (reported in task-7-report.md, not fixed here —
-    // out of Task 7's scope, and the shared compile-cache code path is used
-    // by many other kernels).
+    // kernel-cache defect (pre-existing on origin/beta; written up in
+    // docs/perf-checkpoints/2026-08-07-flash-prefill-brbc-cache-defect.md,
+    // not fixed here — out of Task 7's scope, and the shared compile-cache
+    // code path is used by many other kernels. Task 8 sweeps br/bc/TILE_SIZE
+    // and MUST read that writeup before trusting any measurement from it).
     // Drain the shared `gpu`'s pool first: `free_tensor` above only recycles
     // buffers into `GpuPool`'s free-lists (real `hipFree` is deferred to
     // `drain_pool`/process exit — see kv_slots.rs / GeneralBatch::free's doc
     // comment), and this run is about to spin up several more `Gpu`
     // instances that need real headroom, not just pool-internal reuse.
     gpu.drain_pool();
-    let prefill_shapes: Vec<(Shape, usize, usize)> = if smoke { vec![(smoke_shape(), 4, 8)] } else { shapes_prefill() };
+    let prefill_shapes: Vec<(Shape, usize, usize)> = if smoke {
+        vec![(smoke_shape(), 4, 8)]
+    } else if negative_control_active() {
+        shapes_prefill().into_iter().filter(|(s, _, _)| uniform_seq_len(s)).collect()
+    } else {
+        shapes_prefill()
+    };
     for (shape, br, bc) in prefill_shapes {
         println!("-- {} br={br} bc={bc}", shape.label());
         let mut pgpu = Gpu::init().expect("gpu init (prefill, fresh per br/bc)");
