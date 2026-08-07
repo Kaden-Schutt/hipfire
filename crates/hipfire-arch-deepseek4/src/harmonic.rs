@@ -15,8 +15,16 @@ pub const HARMONIC_SLOT_COUNT: usize = 2;
 pub const HARMONIC_LAYER_COUNT: u16 = 43;
 pub const HARMONIC_EXPERT_COUNT: u32 = 256;
 pub const HARMONIC_TOP_K: usize = 6;
-pub const HARMONIC_ACTIVATION_EXTENT: u32 = 16_448;
-pub const HARMONIC_RESULT_EXTENT: u32 = 16_384;
+pub const HARMONIC_HIDDEN_SIZE: usize = 4_096;
+pub const HARMONIC_MOE_INTERMEDIATE_SIZE: usize = 2_048;
+pub const HARMONIC_X_ROT_BYTES: usize = HARMONIC_HIDDEN_SIZE * std::mem::size_of::<f32>();
+pub const HARMONIC_EXPERT_IDS_OFFSET: usize = HARMONIC_X_ROT_BYTES;
+pub const HARMONIC_ROUTE_WEIGHTS_OFFSET: usize =
+    HARMONIC_EXPERT_IDS_OFFSET + HARMONIC_TOP_K * std::mem::size_of::<u32>();
+pub const HARMONIC_ACTIVATION_RESERVED_OFFSET: usize =
+    HARMONIC_ROUTE_WEIGHTS_OFFSET + HARMONIC_TOP_K * std::mem::size_of::<u32>();
+pub const HARMONIC_ACTIVATION_EXTENT: u32 = (HARMONIC_ACTIVATION_RESERVED_OFFSET + 16) as u32;
+pub const HARMONIC_RESULT_EXTENT: u32 = HARMONIC_X_ROT_BYTES as u32;
 pub const DS4_MQ2R_0731_IDENTITY: [u8; 32] = [
     0xcb, 0xf2, 0xbb, 0xcf, 0xa3, 0xf4, 0x7b, 0x17, 0x12, 0xa0, 0x71, 0x83, 0x6b, 0x2c, 0x48, 0x23,
     0x2d, 0xad, 0x7d, 0xfb, 0x76, 0x38, 0x13, 0xa7, 0x20, 0xf7, 0xd3, 0x48, 0xa9, 0x31, 0x8c, 0xce,
@@ -281,6 +289,74 @@ impl fmt::Display for HarmonicProtocolError {
 impl std::error::Error for HarmonicProtocolError {}
 
 pub type HarmonicResult<T> = Result<T, HarmonicProtocolError>;
+
+/// Build the fixed harmonic activation payload without exposing a device
+/// pointer. The first 16 KiB is the exact F32 FWHT-rotated activation, followed
+/// by raw-bit mirrors of the six expert IDs and route weights. The final 16
+/// bytes stay zero for forward-compatible guards.
+pub fn pack_harmonic_activation_payload(
+    x_rot_bytes: &[u8],
+    expert_ids: [u32; HARMONIC_TOP_K],
+    route_weight_bits: [u32; HARMONIC_TOP_K],
+) -> HarmonicResult<Vec<u8>> {
+    if x_rot_bytes.len() != HARMONIC_X_ROT_BYTES {
+        return Err(HarmonicProtocolError::InvalidPacket(
+            "activation x_rot extent",
+        ));
+    }
+    let mut payload = vec![0_u8; HARMONIC_ACTIVATION_EXTENT as usize];
+    payload[..HARMONIC_X_ROT_BYTES].copy_from_slice(x_rot_bytes);
+    for (index, value) in expert_ids.into_iter().enumerate() {
+        let offset = HARMONIC_EXPERT_IDS_OFFSET + index * std::mem::size_of::<u32>();
+        payload[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+    for (index, value) in route_weight_bits.into_iter().enumerate() {
+        let offset = HARMONIC_ROUTE_WEIGHTS_OFFSET + index * std::mem::size_of::<u32>();
+        payload[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+    Ok(payload)
+}
+
+/// Validate the activation payload's self-description against the already
+/// validated route packet and return only the F32 activation bytes. This makes
+/// torn or mismatched control/payload publication fail before any H2D copy.
+pub fn unpack_harmonic_x_rot<'a>(
+    packet: &HarmonicRoutePacket,
+    payload: &'a [u8],
+) -> HarmonicResult<&'a [u8]> {
+    if payload.len() != HARMONIC_ACTIVATION_EXTENT as usize {
+        return Err(HarmonicProtocolError::InvalidPacket(
+            "activation payload extent",
+        ));
+    }
+    for (index, expected) in packet.expert_ids.into_iter().enumerate() {
+        let offset = HARMONIC_EXPERT_IDS_OFFSET + index * std::mem::size_of::<u32>();
+        let actual = u32::from_le_bytes(payload[offset..offset + 4].try_into().unwrap());
+        if actual != expected {
+            return Err(HarmonicProtocolError::InvalidPacket(
+                "activation expert mirror",
+            ));
+        }
+    }
+    for (index, expected) in packet.route_weight_bits.into_iter().enumerate() {
+        let offset = HARMONIC_ROUTE_WEIGHTS_OFFSET + index * std::mem::size_of::<u32>();
+        let actual = u32::from_le_bytes(payload[offset..offset + 4].try_into().unwrap());
+        if actual != expected {
+            return Err(HarmonicProtocolError::InvalidPacket(
+                "activation route-weight mirror",
+            ));
+        }
+    }
+    if payload[HARMONIC_ACTIVATION_RESERVED_OFFSET..]
+        .iter()
+        .any(|byte| *byte != 0)
+    {
+        return Err(HarmonicProtocolError::InvalidPacket(
+            "activation reserved bytes",
+        ));
+    }
+    Ok(&payload[..HARMONIC_X_ROT_BYTES])
+}
 
 #[derive(Clone, Debug)]
 pub struct HarmonicSlot {
@@ -715,6 +791,50 @@ mod tests {
 
     fn fingerprint(value: u64) -> u64 {
         value.wrapping_mul(0x9e37_79b9_7f4a_7c15).rotate_left(17)
+    }
+
+    #[test]
+    fn activation_payload_round_trips_and_mirrors_the_route() {
+        let expert_ids = experts(17);
+        let route_weight_bits = route_weights();
+        let x_rot = (0..HARMONIC_X_ROT_BYTES)
+            .map(|index| index.wrapping_mul(17) as u8)
+            .collect::<Vec<_>>();
+        let payload =
+            pack_harmonic_activation_payload(&x_rot, expert_ids, route_weight_bits).unwrap();
+        let packet =
+            HarmonicContract::frozen(7, 11).packet(1, 0, expert_ids, route_weight_bits, 100, 42);
+        assert_eq!(unpack_harmonic_x_rot(&packet, &payload).unwrap(), x_rot);
+        assert!(payload[HARMONIC_ACTIVATION_RESERVED_OFFSET..]
+            .iter()
+            .all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn activation_payload_rejects_control_mismatch_and_reserved_data() {
+        let expert_ids = experts(17);
+        let route_weight_bits = route_weights();
+        let x_rot = vec![0_u8; HARMONIC_X_ROT_BYTES];
+        let packet =
+            HarmonicContract::frozen(7, 11).packet(1, 0, expert_ids, route_weight_bits, 100, 42);
+        let mut mismatched =
+            pack_harmonic_activation_payload(&x_rot, expert_ids, route_weight_bits).unwrap();
+        mismatched[HARMONIC_EXPERT_IDS_OFFSET] ^= 1;
+        assert!(matches!(
+            unpack_harmonic_x_rot(&packet, &mismatched),
+            Err(HarmonicProtocolError::InvalidPacket(
+                "activation expert mirror"
+            ))
+        ));
+        let mut reserved =
+            pack_harmonic_activation_payload(&x_rot, expert_ids, route_weight_bits).unwrap();
+        reserved[HARMONIC_ACTIVATION_RESERVED_OFFSET] = 1;
+        assert!(matches!(
+            unpack_harmonic_x_rot(&packet, &reserved),
+            Err(HarmonicProtocolError::InvalidPacket(
+                "activation reserved bytes"
+            ))
+        ));
     }
 
     #[test]

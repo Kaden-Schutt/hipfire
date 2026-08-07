@@ -60,6 +60,7 @@ pub mod forward;
 pub mod grammar;
 pub mod harmonic;
 pub mod harmonic_ipc;
+pub mod harmonic_worker;
 pub mod heterogeneous;
 pub mod mtp_speculator;
 pub mod parent;
@@ -71,18 +72,20 @@ pub mod spec_impl;
 pub use arch::{DeepseekV4, DeepseekV4HeterogeneousFault, DeepseekV4HeterogeneousProjection};
 pub use deepseek4::{
     config_from_safetensors, DeepseekV4Config, DeepseekV4DenseWeights,
-    DeepseekV4HeterogeneousWeights, DeepseekV4OwnershipAudit, DeepseekV4RoutedWeights,
-    DeepseekV4State, DeepseekV4Weights, IndexerLayerState, MainAttentionLayerState,
+    DeepseekV4HeterogeneousWeights, DeepseekV4LocalOwnershipReceipt, DeepseekV4OwnershipAudit,
+    DeepseekV4RoutedWeights, DeepseekV4State, DeepseekV4Weights, IndexerLayerState,
+    MainAttentionLayerState,
 };
 pub use harmonic::{
-    HarmonicCompletion, HarmonicContract, HarmonicOwner, HarmonicProtocolError,
-    HarmonicRoutePacket, HarmonicSlotState, HarmonicSupervisor, HARMONIC_ACTIVATION_EXTENT,
-    HARMONIC_RESULT_EXTENT,
+    pack_harmonic_activation_payload, unpack_harmonic_x_rot, HarmonicCompletion, HarmonicContract,
+    HarmonicOwner, HarmonicProtocolError, HarmonicRoutePacket, HarmonicSlotState,
+    HarmonicSupervisor, HARMONIC_ACTIVATION_EXTENT, HARMONIC_RESULT_EXTENT,
 };
 pub use harmonic_ipc::{
     harmonic_payload_fingerprint, HarmonicIpcError, HarmonicResolved, HarmonicSharedRing,
     HarmonicWireState, HarmonicWorkItem,
 };
+pub use harmonic_worker::DeepseekV4HarmonicExpertService;
 pub use heterogeneous::{
     ensure_harmonic_execution_admitted, DeepseekV4HeterogeneousLoadPlan,
     DeepseekV4HeterogeneousLoadReport, DeepseekV4HeterogeneousModel, DeepseekV4VerifiedArtifact,

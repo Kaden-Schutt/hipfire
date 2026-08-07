@@ -1286,6 +1286,68 @@ impl DeepseekV4RoutedWeights {
             layer.visit_routed_tensors(&format!("layers.{index}"), visit);
         }
     }
+
+    /// Prove that every routed allocation belongs to this process-local HIP
+    /// context. This is intentionally a one-owner audit: the harmonic expert
+    /// worker must not construct or consult the dense GPU while producing its
+    /// residency receipt.
+    pub fn audit_local_owner(
+        &self,
+        gpu: &mut rdna_compute::Gpu,
+    ) -> Result<DeepseekV4LocalOwnershipReceipt, String> {
+        if !self.mq2r_backend.is_gfx1151() || !gpu.arch.eq_ignore_ascii_case("gfx1151") {
+            return Err(format!(
+                "deepseek4: routed-owner audit requires exact gfx1151 MQ2R, got backend={:?} arch={}",
+                self.mq2r_backend, gpu.arch
+            ));
+        }
+        gpu.bind_thread()
+            .map_err(|error| format!("deepseek4: bind routed owner for local audit: {error}"))?;
+        let mut receipt = DeepseekV4LocalOwnershipReceipt {
+            architecture: gpu.arch.clone(),
+            hip_device_ordinal: gpu.device_id,
+            ..DeepseekV4LocalOwnershipReceipt::default()
+        };
+        self.visit_tensors(&mut |name, tensor| {
+            receipt.tensor_count += 1;
+            receipt.bytes += tensor.buf.size();
+            match gpu.hip.pointer_get_attributes(&tensor.buf) {
+                Ok(attributes) if attributes.device == gpu.device_id => {}
+                Ok(attributes) => receipt.violations.push(format!(
+                    "{name}: routed owner device {} != expected {}",
+                    attributes.device, gpu.device_id
+                )),
+                Err(error) => receipt
+                    .violations
+                    .push(format!("{name}: routed pointer audit failed: {error}")),
+            }
+        });
+        if receipt.tensor_count == 0 || receipt.bytes == 0 {
+            receipt
+                .violations
+                .push("routed owner has no resident tensor bytes".to_owned());
+        }
+        if receipt.violations.is_empty() {
+            Ok(receipt)
+        } else {
+            Err(format!(
+                "deepseek4: local routed pointer-owner audit failed: {}",
+                receipt.violations.join("; ")
+            ))
+        }
+    }
+}
+
+/// Process-local routed residency receipt. The HIP ordinal is diagnostic only;
+/// the worker supervisor binds the process to a stable physical PCI identity
+/// before this audit runs.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct DeepseekV4LocalOwnershipReceipt {
+    pub architecture: String,
+    pub hip_device_ordinal: i32,
+    pub tensor_count: usize,
+    pub bytes: usize,
+    pub violations: Vec<String>,
 }
 
 /// Split-owner weights for the heterogeneous route. The type boundary makes
