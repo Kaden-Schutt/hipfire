@@ -277,3 +277,47 @@ pin the achievable ceiling and turn these percentages from indicative into
 exact. Until then, read them as "far below roofline", not as precise
 efficiency figures. The flatness across context is the robust part and does
 not depend on the denominator.
+
+---
+
+## Addendum 2: the bandwidth denominator, measured
+
+The addendum above divided by 256 GB/s — the Ryzen AI Max+ 395's *theoretical*
+LPDDR5X-8000 figure — and flagged that the iGPU may not reach it. It does not.
+BabelStream (`~/repos/BabelStream/build/hip-stream`, 268 MB arrays, 5 reps,
+device "AMD Radeon 8060S"):
+
+| kernel | GB/s |
+|---|---|
+| Copy | 239.3 |
+| Mul | 233.9 |
+| Add | 225.6 |
+| **Triad** | **223.9** |
+| Dot | 221.1 |
+
+So achievable is **~224-239 GB/s**, i.e. 87-93% of theoretical. Recomputing the
+attention kernel's utilisation against Triad (223.9, the conservative choice —
+attention is read-dominated, so the Copy figure of 239.3 is arguably the fairer
+ceiling and would make utilisation look *worse*, not better):
+
+| shape | ctx | achieved | % of Triad | headroom |
+|---|---|---|---|---|
+| 35B-A3B | 4,096 | 48.8 | 21.8% | 4.6× |
+| 35B-A3B | 16,384 | 61.7 | 27.6% | 3.6× |
+| 35B-A3B | 32,768 | 52.5 | 23.4% | 4.3× |
+| 35B-A3B | 65,536 | 50.4 | 22.5% | 4.4× |
+| 27B | 4,096 | 85.9 | 38.4% | 2.6× |
+| 27B | 16,384 | 73.4 | 32.8% | 3.1× |
+| 27B | 32,768 | 76.6 | 34.2% | 2.9× |
+| 27B | 65,536 | 73.1 | 32.6% | 3.1× |
+
+**The headroom claim is now measured rather than indicative: ~2.6-3.1× on the
+27B shape and ~3.6-4.6× on the 35B-A3B shape**, against a ceiling established
+on the same device with the same allocator. The earlier "3-5×" was close and
+slightly optimistic on the 27B side.
+
+Note the ordering: the 35B shape has *more* headroom precisely because it is
+*further* from the roofline (`n_kv_heads=2` gives each workgroup less contiguous
+KV per position than the 27B's 4). Whether batching converts headroom into
+throughput is what Task 8 measures; this only establishes that the headroom is
+real and quantified.
