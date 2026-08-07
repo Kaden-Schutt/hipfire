@@ -3835,6 +3835,13 @@ pub const KV_CACHE_WRITE_Q8_0_PAIR_GFX1100_SRC: &str =
 /// K and V caches stored as [max_seq × n_kv_heads × blocks_per_head × 34].
 pub const ATTENTION_Q8_0_KV_SRC: &str = include_str!("../../../kernels/src/attention_q8_0_kv.hip");
 
+/// Multi-slot KV descriptor header — see `kernels/src/kv_slot_desc.h`. The
+/// runtime hipcc compile happens in a cache dir that doesn't have
+/// `kernels/src` on its `-I` path, so kernels that `#include
+/// "kv_slot_desc.h"` have that directive stripped and this body prepended
+/// before compilation (same pattern as `TURBO_COMMON_H` / `GIVENS_COMMON_SRC`).
+pub const KV_SLOT_DESC_H: &str = include_str!("../../../kernels/src/kv_slot_desc.h");
+
 /// Batched counterpart of ATTENTION_Q8_0_KV_SRC. Processes N queries in
 /// one launch with per-row causal windows from a positions[] array.
 pub const ATTENTION_Q8_0_KV_BATCHED_SRC: &str =

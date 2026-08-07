@@ -3,6 +3,7 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 #include <hip/hip_runtime.h>
+#include "kv_slot_desc.h"
 
 // Batched causal attention with Q8_0 quantized KV cache. Counterpart of
 // attention_q8_0_kv for prefill batching — processes N queries in one launch,
@@ -54,7 +55,9 @@ extern "C" __global__ void attention_q8_0_kv_batched(
     int max_seq,
     float scale_attn,
     int block_start,                        // ignored when tree_bias == nullptr
-    int block_cols                          // ignored when tree_bias == nullptr
+    int block_cols,                         // ignored when tree_bias == nullptr
+    const KvSlotDesc* __restrict__ slot_descs,  // [n_slots] or nullptr = legacy
+    const int* __restrict__ row_slot            // [batch_size] or nullptr = legacy
 ) {
     const int h = blockIdx.x;
     const int b = blockIdx.y;
@@ -71,6 +74,19 @@ extern "C" __global__ void attention_q8_0_kv_batched(
     // Tree mode: iterate over the full cache including the block.
     // Causal mode: attend to 0..positions[b] inclusive (unchanged).
     const int seq_len = tree_mode ? (eff_block_start + block_cols) : (positions[b] + 1);
+
+    // One code path for both modes: in legacy mode we synthesise a descriptor
+    // with zero bases, so the address arithmetic below is unchanged and the
+    // output is bitwise identical to the pre-SP1 kernel.
+    const int slot = (row_slot != nullptr) ? row_slot[b] : 0;
+    const KvSlotDesc desc = (slot_descs != nullptr)
+        ? slot_descs[slot]
+        : kv_slot_legacy(seq_len, max_seq);
+    const int per_pos_bytes = n_kv_heads * (head_dim / 32) * 34;
+    // The slot's own length is authoritative for loop bounds when a
+    // descriptor is present; legacy mode keeps the original seq_len.
+    const int eff_seq_len = (slot_descs != nullptr) ? desc.seq_len : seq_len;
+
     extern __shared__ float sdata[];
 
     const int kv_group = n_heads / n_kv_heads;
@@ -96,10 +112,11 @@ extern "C" __global__ void attention_q8_0_kv_batched(
 
     // Phase 1: Q @ K^T with Q8_0 dequant.
     float local_max = -1e30f;
-    for (int t = tid; t < seq_len; t += nthreads) {
+    for (int t = tid; t < eff_seq_len; t += nthreads) {
         float dot = 0.0f;
         for (int bi = 0; bi < blocks_per_head; bi++) {
-            const unsigned char* blk = k_cache + (size_t)t * total_blocks_per_pos * 34
+            const unsigned char* blk = k_cache
+                                      + kv_offset_for_k(desc, t, per_pos_bytes)
                                       + (kv_head_block_start + bi) * 34;
             float d = (float)*((const _Float16*)blk);
             const float* qb = q_shared + bi * 32;
@@ -133,7 +150,7 @@ extern "C" __global__ void attention_q8_0_kv_batched(
     __syncthreads();
 
     float local_sum = 0.0f;
-    for (int t = tid; t < seq_len; t += nthreads) {
+    for (int t = tid; t < eff_seq_len; t += nthreads) {
         float e = expf(scores[t] - max_val);
         scores[t] = e;
         local_sum += e;
@@ -147,7 +164,7 @@ extern "C" __global__ void attention_q8_0_kv_batched(
     float sum_val = workspace[0];
     __syncthreads();
 
-    for (int t = tid; t < seq_len; t += nthreads) {
+    for (int t = tid; t < eff_seq_len; t += nthreads) {
         scores[t] /= sum_val;
     }
     __syncthreads();
@@ -158,8 +175,9 @@ extern "C" __global__ void attention_q8_0_kv_batched(
         float val = 0.0f;
         int bi = d / 32;
         int bj = d % 32;
-        for (int t = 0; t < seq_len; t++) {
-            const unsigned char* blk = v_cache + (size_t)t * total_blocks_per_pos * 34
+        for (int t = 0; t < eff_seq_len; t++) {
+            const unsigned char* blk = v_cache
+                                      + kv_offset_for_v(desc, t, per_pos_bytes)
                                       + (kv_head_block_start + bi) * 34;
             float vd = (float)*((const _Float16*)blk) * (float)(signed char)blk[2 + bj];
             val += scores[t] * vd;

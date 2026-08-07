@@ -1713,8 +1713,15 @@ impl Gpu {
     /// Shared memory: the tree-mode `seq_len` is always `block_start +
     /// block_cols`. Caller must pass `max_ctx_len` ≥ that value so the
     /// scores[] LDS slice is sized correctly.
+    ///
+    /// `slot_descs` / `row_slot`: when both `Some`, `row_slot[b]` selects the
+    /// `KvSlotDesc` used to translate KV addresses and to bound the causal
+    /// window for batch row `b`, letting one launch serve several
+    /// independent sequences with disjoint KV slabs. When either is `None`
+    /// the kernel falls back to legacy single-arena addressing derived from
+    /// `positions`/`max_seq`, byte-identical to the pre-slot kernel.
     #[allow(clippy::too_many_arguments)]
-    pub fn attention_q8_0_kv_batched_masked(
+    pub fn attention_q8_0_kv_batched_masked_slots(
         &mut self,
         q: &GpuTensor,
         k_cache: &GpuTensor,
@@ -1730,11 +1737,22 @@ impl Gpu {
         tree_bias: Option<&GpuTensor>,
         block_start: usize,
         block_cols: usize,
+        slot_descs: Option<&GpuTensor>,
+        row_slot: Option<&GpuTensor>,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        // The kernel source `#include`s kv_slot_desc.h, but the runtime hipcc
+        // compile happens in a cache dir with no -I to kernels/src. Strip the
+        // directive and prepend the header body instead (same pattern as
+        // ensure_givens4_kernel's turbo_common/givens_common handling).
+        let attn_q8_batched_src = {
+            let stripped = kernels::ATTENTION_Q8_0_KV_BATCHED_SRC
+                .replace("#include \"kv_slot_desc.h\"", "");
+            format!("{}\n{}", kernels::KV_SLOT_DESC_H, stripped)
+        };
         self.ensure_kernel(
             "attention_q8_0_kv_batched",
-            kernels::ATTENTION_Q8_0_KV_BATCHED_SRC,
+            &attn_q8_batched_src,
             "attention_q8_0_kv_batched",
         )?;
         let scale = 1.0f32 / (head_dim as f32).sqrt();
@@ -1755,6 +1773,14 @@ impl Gpu {
         let mut sc = scale;
         let mut bs = block_start as i32;
         let mut bc = block_cols as i32;
+        let mut desc_ptr: *mut std::ffi::c_void = match slot_descs {
+            Some(t) => t.buf.as_ptr(),
+            None => std::ptr::null_mut(),
+        };
+        let mut rs_ptr: *mut std::ffi::c_void = match row_slot {
+            Some(t) => t.buf.as_ptr(),
+            None => std::ptr::null_mut(),
+        };
         let mut params: Vec<*mut c_void> = vec![
             &mut q_ptr as *mut _ as *mut c_void,
             &mut k_ptr as *mut _ as *mut c_void,
@@ -1769,6 +1795,8 @@ impl Gpu {
             &mut sc as *mut _ as *mut c_void,
             &mut bs as *mut _ as *mut c_void,
             &mut bc as *mut _ as *mut c_void,
+            &mut desc_ptr as *mut _ as *mut c_void,
+            &mut rs_ptr as *mut _ as *mut c_void,
         ];
         let block_size = (max_ctx_len.max(head_dim) as u32)
             .next_power_of_two()
@@ -1782,6 +1810,8 @@ impl Gpu {
         let timer =
             crate::profile::begin_timer(&self.hip, "attention", "attention_q8_0_kv_batched", bytes);
         let bias_raw = bias_ptr; // alias for move into closure
+        let desc_raw = desc_ptr; // alias for move into closure
+        let rs_raw = rs_ptr; // alias for move into closure
         let result = self.launch_maybe_blob(
             "attention_q8_0_kv_batched",
             [n_heads as u32, batch_size as u32, 1],
@@ -1803,6 +1833,8 @@ impl Gpu {
                 b.push_f32(sc);
                 b.push_i32(bs);
                 b.push_i32(bc);
+                b.push_ptr(desc_raw);
+                b.push_ptr(rs_raw);
                 b
             },
         );
@@ -1810,6 +1842,34 @@ impl Gpu {
             t.finish(&self.hip);
         }
         result
+    }
+
+    /// Legacy single-sequence entry point. Preserved so existing call sites
+    /// are untouched; passes null descriptors, which the kernel treats as
+    /// legacy mode with bitwise-identical output.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_q8_0_kv_batched_masked(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq: usize,
+        max_ctx_len: usize,
+        batch_size: usize,
+        tree_bias: Option<&GpuTensor>,
+        block_start: usize,
+        block_cols: usize,
+    ) -> HipResult<()> {
+        self.attention_q8_0_kv_batched_masked_slots(
+            q, k_cache, v_cache, out, positions, n_heads, n_kv_heads, head_dim,
+            max_seq, max_ctx_len, batch_size, tree_bias, block_start, block_cols,
+            None, None,
+        )
     }
 
     /// Query-tiled Q8_0 flash prefill attention.
