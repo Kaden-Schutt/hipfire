@@ -10838,12 +10838,7 @@ impl Gpu {
         inverse: i32,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        // The wide source contains no gfx11-only ISA.  Keep product selection
-        // controlled by the model-owned route boolean, but allow the channel
-        // harness to screen the same implementation on exact gfx1201.
-        let wide = matches!(self.arch.as_str(), "gfx1151" | "gfx1201")
-            && n_rot <= 128
-            && deepseek4_gfx1151_route;
+        let wide = self.arch == "gfx1151" && n_rot <= 128 && deepseek4_gfx1151_route;
         let (logical_name, symbol, block) = if wide {
             (
                 "rope_tail_yarn_interleaved_wide",
