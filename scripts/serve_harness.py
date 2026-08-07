@@ -910,9 +910,12 @@ def turn_line(i, r, recall=""):
     fl = (" !" + ",".join(flags)) if flags else ""
     dec = r["decode_tok_s"]
     dec_str = f"{dec}~" if (dec is not None and r.get("decode_estimated")) else f"{dec}"
+    prefill_tok_s = r.get("prefill_tok_s")
+    prefill_str = f"{prefill_tok_s}" if prefill_tok_s is not None else "n/a"
     return (f"  t{i:<2} finish={str(r['finish']):<6} ctx={r['ctx']:<6} cached={r['cached']:<6} "
             f"gen={r['gen']:<5}(think {r['think_words']}/ans {r['ans_words']}w) "
-            f"prefill={r['prefill_ms']}ms decode={dec_str} tau={r['tau']}"
+            f"prefill={r['prefill_ms']}ms/{prefill_str}tok/s "
+            f"decode={dec_str}tok/s tau={r['tau']}"
             f"{recall}{fl} | {r['ans_preview']!r}")
 
 
@@ -965,11 +968,21 @@ def run(cfg, args):
             rows.append(r); print(turn_line(i+1, r, recall), flush=True)
     g = rows
     dec = [r["decode_tok_s"] for r in g if isinstance(r["decode_tok_s"], (int, float))]
-    pf = [(r["prefill_ms"] or 0)/1000 for r in g]
-    print(f"[{label} DONE] turns={len(g)} runaway={sum(r['runaway'] for r in g)} "
-          f"empty={sum(r['empty'] for r in g)} attractor={sum(r['attractor'] for r in g)} "
-          f"retrieval_miss={sum(bool(r.get('retrieval_missing')) for r in g)} "
-          f"avg_decode={sum(dec)/len(dec):.1f}tok/s" if dec else f"[{label} DONE] turns={len(g)}", flush=True)
+    prefill = [
+        r["prefill_tok_s"]
+        for r in g
+        if isinstance(r.get("prefill_tok_s"), (int, float))
+    ]
+    summary = (
+        f"[{label} DONE] turns={len(g)} runaway={sum(r['runaway'] for r in g)} "
+        f"empty={sum(r['empty'] for r in g)} attractor={sum(r['attractor'] for r in g)} "
+        f"retrieval_miss={sum(bool(r.get('retrieval_missing')) for r in g)}"
+    )
+    if prefill:
+        summary += f" avg_prefill={sum(prefill)/len(prefill):.1f}tok/s"
+    if dec:
+        summary += f" avg_decode={sum(dec)/len(dec):.1f}tok/s"
+    print(summary, flush=True)
     if args.out:
         json.dump(rows, open(args.out, "w"), indent=0)
     return rows
