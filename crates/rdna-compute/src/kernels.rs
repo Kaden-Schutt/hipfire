@@ -1242,6 +1242,8 @@ pub const GEMM_MFP4G32_E8_SOA_GROUPED_WMMA_B2_GFX1151_SRC: &str = concat!(
     "#define E8_GROUPED_PREFILL_KERNEL_NAME gemm_mfp4g32_e8_soa_grouped_wmma_b2_gfx1151\n",
     include_str!("../../../kernels/src/gemm_mfp4g32_e8_soa_grouped_wmma.gfx1151.hip")
 );
+pub const GEMM_MFP4G32_E8_SOA_GROUPED_WMMA_GFX1201_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mfp4g32_e8_soa_grouped_wmma.gfx12.hip");
 /// SoA E8 GEMV 4-way / 8-way unroll variants — bench experiments for the gfx1100
 /// cache-roofline MLP sweep (more codewords in flight per wave).
 pub const GEMV_MFP4G32_E8_SOA_U4_SRC: &str =

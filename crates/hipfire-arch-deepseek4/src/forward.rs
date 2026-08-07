@@ -10718,6 +10718,7 @@ fn wo_per_group_batched_e8_fallback(
     rank: usize,
     per_group_in: usize,
     batch_size: usize,
+    x_f16_scratch: Option<&GpuTensor>,
 ) -> Result<(), String> {
     debug_assert!(matches!(
         wo_a.dtype,
@@ -10727,6 +10728,31 @@ fn wo_per_group_batched_e8_fallback(
     // tier: profiled at B=1 the grouped WMMA costs 14.61 ms against the
     // decode grouped GEMV's 4.23 ms, the single largest term in the gap
     // between a batched forward and an AR decode step.
+    if wo_a.dtype == DType::MFP4G32E8SOA
+        && mq2r_backend.is_gfx1201()
+        && gpu.arch_caps.is_gfx1201()
+        && per_group_in % 256 == 0
+        && x_f16_scratch.is_some()
+    {
+        let scratch = x_f16_scratch.unwrap();
+        gpu.deepseek4_convert_f32_to_f16(
+            x_rotated_batch,
+            scratch,
+            (batch_size * n_groups * per_group_in) as i64,
+        )
+        .map_err(|e| format!("convert_f32_to_f16 (gfx1201 grouped E8 WMMA): {e:?}"))?;
+        return gpu
+            .gemm_mfp4g32_e8_soa_grouped_wmma_gfx1201_f16(
+                wo_a,
+                scratch,
+                y_batch,
+                n_groups,
+                rank,
+                per_group_in,
+                batch_size,
+            )
+            .map_err(|e| format!("grouped gfx1201 E8 O-LoRA A: {e:?}"));
+    }
     if wo_a.dtype == DType::MFP4G32E8SOA
         && e8_batched_gemv_applies(&gpu.arch, batch_size, per_group_in)
     {
@@ -11157,6 +11183,7 @@ fn attention_block_batched_swa_only(
                 o_lora_rank,
                 per_group_in,
                 batch_size,
+                Some(&pbs.wmma_x_scratch_f16),
             )
             .map_err(|e| format!("wo_per_group_batched_e8 l{layer_idx}: {e}"))?;
         }
@@ -12261,6 +12288,7 @@ fn attention_block_batched_mixed(
                 o_lora_rank,
                 per_group_in,
                 batch_size,
+                Some(&pbs.wmma_x_scratch_f16),
             )
             .map_err(|e| format!("wo_per_group_batched_e8 l{layer_idx}: {e}"))?;
         }
@@ -15524,6 +15552,7 @@ fn dspark_wo_project(
                 o_lora_rank,
                 per_group_in,
                 block,
+                Some(&pbs.wmma_x_scratch_f16),
             )
             .map_err(|e| format!("dspark wo_a e8[{stage}]: {e}"))?
         }

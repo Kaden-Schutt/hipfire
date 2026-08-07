@@ -1321,6 +1321,105 @@ fn run_prefill_gfx1201(gpu: &mut Gpu) {
             row_us / b4_us
         );
     }
+
+    // Exact TP3 O-LoRA A shape on the two 3-group ranks. This is the product
+    // fallback that used to issue B*G row-wise GEMVs per layer.
+    {
+        let (groups, m, k) = (3usize, 1024usize, 4096usize);
+        let aos = synth_e8_aos(groups * m, k, 0x1201_0A03);
+        let soa = aos_to_soa_full(&aos, groups * m, k);
+        let mut weights = gpu
+            .upload_raw(&soa, &[soa.len()])
+            .expect("upload grouped weights");
+        weights.dtype = DType::MFP4G32E8SOA;
+        let x = gpu
+            .alloc_tensor(&[batch * groups * k], DType::F32)
+            .expect("alloc grouped x");
+        let x_f16 = gpu
+            .alloc_tensor(&[batch * groups * k], DType::F16)
+            .expect("alloc grouped x f16");
+        let y_ref = gpu
+            .alloc_tensor(&[batch * groups * m], DType::F32)
+            .expect("alloc grouped reference");
+        let y_gfx12 = gpu
+            .alloc_tensor(&[batch * groups * m], DType::F32)
+            .expect("alloc grouped candidate");
+        let x_host = make_x(batch * groups * k, 0x1201_0A13);
+        gpu.hip
+            .memcpy_htod(&x.buf, bytes_of(&x_host))
+            .expect("upload grouped x");
+        gpu.deepseek4_convert_f32_to_f16(&x, &x_f16, (batch * groups * k) as i64)
+            .expect("convert grouped x");
+
+        let group_weight_bytes = soa.len() / groups;
+        let mut rowwise = |gpu: &mut Gpu| {
+            for b in 0..batch {
+                for g in 0..groups {
+                    let w = weights.sub_offset(g * group_weight_bytes, group_weight_bytes);
+                    let x_row = x.sub_offset((b * groups + g) * k, k);
+                    let y_row = y_ref.sub_offset((b * groups + g) * m, m);
+                    gpu.gemv_mfp4g32_e8_soa(&w, &x_row, &y_row, m, k)
+                        .expect("grouped row reference");
+                }
+            }
+        };
+        rowwise(gpu);
+        gpu.gemm_mfp4g32_e8_soa_grouped_wmma_gfx1201_f16(
+            &weights, &x_f16, &y_gfx12, groups, m, k, batch,
+        )
+        .expect("grouped gfx1201 WMMA");
+        gpu.hip.device_synchronize().expect("grouped parity sync");
+
+        let mut reference = vec![0.0f32; batch * groups * m];
+        let mut candidate = vec![0.0f32; batch * groups * m];
+        gpu.hip
+            .memcpy_dtoh(bytes_of_mut(&mut reference), &y_ref.buf)
+            .expect("download grouped reference");
+        gpu.hip
+            .memcpy_dtoh(bytes_of_mut(&mut candidate), &y_gfx12.buf)
+            .expect("download grouped candidate");
+        let mut err2 = 0.0f64;
+        let mut ref2 = 0.0f64;
+        let mut max_abs = 0.0f32;
+        for (&a, &b) in reference.iter().zip(&candidate) {
+            let delta = (a - b).abs();
+            max_abs = max_abs.max(delta);
+            err2 += (delta as f64) * (delta as f64);
+            ref2 += (a as f64) * (a as f64);
+        }
+        let rel_rmse = (err2 / ref2.max(f64::MIN_POSITIVE)).sqrt();
+        assert!(
+            candidate.iter().all(|value| value.is_finite()) && rel_rmse < 0.01,
+            "gfx1201 grouped O-LoRA parity failed: rel_rmse={rel_rmse} max_abs={max_abs}"
+        );
+
+        let row_start = Instant::now();
+        rowwise(gpu);
+        gpu.hip
+            .device_synchronize()
+            .expect("grouped row timing sync");
+        let row_us = row_start.elapsed().as_secs_f64() * 1.0e6;
+        for _ in 0..2 {
+            gpu.gemm_mfp4g32_e8_soa_grouped_wmma_gfx1201_f16(
+                &weights, &x_f16, &y_gfx12, groups, m, k, batch,
+            )
+            .expect("warm grouped gfx1201 WMMA");
+        }
+        gpu.hip.device_synchronize().expect("grouped warm sync");
+        let start = Instant::now();
+        for _ in 0..trials {
+            gpu.gemm_mfp4g32_e8_soa_grouped_wmma_gfx1201_f16(
+                &weights, &x_f16, &y_gfx12, groups, m, k, batch,
+            )
+            .expect("time grouped gfx1201 WMMA");
+        }
+        gpu.hip.device_synchronize().expect("grouped timing sync");
+        let grouped_us = start.elapsed().as_secs_f64() * 1.0e6 / trials as f64;
+        eprintln!(
+            "  tp3_wo_a_g3 B={batch}: rowwise={row_us:.2}us grouped={grouped_us:.2}us speedup={:.2}x rel_rmse={rel_rmse:.7} max_abs={max_abs:.6}",
+            row_us / grouped_us,
+        );
+    }
 }
 
 fn time_prefill_variant(
