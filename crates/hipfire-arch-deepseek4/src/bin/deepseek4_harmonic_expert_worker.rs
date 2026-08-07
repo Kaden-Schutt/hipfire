@@ -300,7 +300,7 @@ fn worker_loop(
     let mut idle_since = Instant::now();
     loop {
         match ring
-            .expert_poll_mapped(epoch, allocation_generation)
+            .expert_poll_gpu_mailbox(epoch, allocation_generation)
             .map_err(|error| format!("poll epoch {epoch}: {error}"))?
         {
             HarmonicExpertMappedPoll::Work(packet) => {
@@ -319,7 +319,7 @@ fn worker_loop(
                         now_tick,
                     )
                     .map_err(|error| format!("execute epoch {epoch}: {error}"))?;
-                ring.expert_complete_mapped(epoch, allocation_generation, completion)
+                ring.expert_complete_gpu_mailbox(epoch, allocation_generation, completion)
                     .map_err(|error| format!("complete epoch {epoch}: {error}"))?;
                 epoch = epoch
                     .checked_add(1)

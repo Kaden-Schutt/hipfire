@@ -12,18 +12,6 @@
 
 namespace {
 
-constexpr unsigned kVacant = 0;
-constexpr unsigned kPublishing = 1;
-constexpr unsigned kCompleted = 5;
-constexpr unsigned kCancelled = 6;
-constexpr unsigned kTimedOut = 7;
-constexpr unsigned kFailedDense = 8;
-constexpr unsigned kFailedExpert = 9;
-
-constexpr unsigned kSourceObserved = 1u << 0;
-constexpr unsigned kDestinationQuiesced = 1u << 1;
-constexpr unsigned kBothQuiesced = kSourceObserved | kDestinationQuiesced;
-
 constexpr unsigned kDenseOwner = 1;
 constexpr unsigned kExpertOwner = 2;
 
@@ -41,10 +29,10 @@ constexpr int kHeaderModelIdentity = 32;
 constexpr int kHeaderSourceGeneration = 64;
 constexpr int kHeaderDestinationGeneration = 72;
 constexpr int kHeaderIsolatedOwners = 80;
+constexpr int kHeaderPublishedEpochs = 128;
+constexpr int kHeaderCompletedEpochs = 192;
 
 // HarmonicWireSlot control-prefix ABI (payload pointers are passed separately).
-constexpr int kSlotState = 0;
-constexpr int kSlotFlags = 4;
 constexpr int kSlotEpoch = 8;
 constexpr int kSlotRouteIdentity = 16;
 constexpr int kSlotModelIdentity = 24;
@@ -107,17 +95,13 @@ __device__ __forceinline__ void set_first_error(unsigned *status,
   atomicCAS(status, kMailboxOk, detail);
 }
 
-__device__ __forceinline__ bool terminal_state(unsigned state) {
-  return state >= kCompleted && state <= kFailedExpert;
-}
-
 } // namespace
 
 // One workgroup publishes one layer. It copies the 4096-element activation,
 // mirrors route metadata, then release-publishes the packet to the CPU worker.
 // `token_control = [base_epoch, common_deadline_tick]`.
 extern "C" __global__ void deepseek4_harmonic_publish_gfx1100(
-    const char *__restrict__ header, char *__restrict__ slot0,
+    char *__restrict__ header, char *__restrict__ slot0,
     char *__restrict__ slot1, char *__restrict__ activation0,
     char *__restrict__ activation1, const float *__restrict__ x_rot,
     const int *__restrict__ topk_indices,
@@ -144,25 +128,18 @@ extern "C" __global__ void deepseek4_harmonic_publish_gfx1100(
                0) {
       set_first_error(status, kPublishEndpointIsolated, layer, 0, 0);
     } else {
-      unsigned state = sys_load_u32(slot, kSlotState, __ATOMIC_ACQUIRE);
-      unsigned flags = 0;
-      if (terminal_state(state)) {
-        flags = sys_load_u32(slot, kSlotFlags, __ATOMIC_ACQUIRE);
-        if ((flags & kBothQuiesced) == kBothQuiesced) {
-          // Dense gfx1100 is the sole recycler and sole publisher. The expert
-          // worker never mutates a terminal state, so no cross-agent CAS is
-          // needed (and host-mapped system CAS support varies by ASIC/IOMMU).
-          sys_store_u32(slot, kSlotState, kVacant, __ATOMIC_RELEASE);
-          state = kVacant;
-        }
-      }
-      if (state != kVacant) {
-        set_first_error(status, kPublishSlotBusy, layer, state, flags);
+      const unsigned long long prior_published =
+          sys_load_u64(header, kHeaderPublishedEpochs + slot_index * 8,
+                       __ATOMIC_ACQUIRE);
+      const unsigned long long prior_completed =
+          sys_load_u64(header, kHeaderCompletedEpochs + slot_index * 8,
+                       __ATOMIC_ACQUIRE);
+      if (prior_published != 0 && prior_completed != prior_published) {
+        set_first_error(status, kPublishSlotBusy, layer,
+                        static_cast<unsigned>(prior_published & 0xfu),
+                        static_cast<unsigned>(prior_completed & 0xfu));
       } else {
-        sys_store_u32(slot, kSlotState, kPublishing, __ATOMIC_RELEASE);
-        sys_store_u32(slot, kSlotFlags, 0, __ATOMIC_RELAXED);
-        // Epoch is the first new-occupant field observed by expert_poll_mapped.
-        sys_store_u64(slot, kSlotEpoch, epoch, __ATOMIC_RELEASE);
+        sys_store_u64(slot, kSlotEpoch, epoch, __ATOMIC_RELAXED);
         sys_store_u64(
             slot, kSlotRouteIdentity,
             sys_load_u64(header, kHeaderRouteIdentity, __ATOMIC_RELAXED),
@@ -227,7 +204,10 @@ extern "C" __global__ void deepseek4_harmonic_publish_gfx1100(
   __syncthreads();
   if (tid == 0) {
     __threadfence_system();
-    sys_store_u32(slot, kSlotState, kPublishing + 1, __ATOMIC_RELEASE);
+    // This word has exactly one writer (dense gfx1100). The expert acquires it
+    // before reading any slot metadata or activation bytes.
+    sys_store_u64(header, kHeaderPublishedEpochs + (epoch & 1ull) * 8,
+                  epoch, __ATOMIC_RELEASE);
   }
 }
 
@@ -237,13 +217,12 @@ extern "C" __global__ void deepseek4_harmonic_publish_gfx1100(
 // copies the peer-owned 16 KiB result into device-local routed_partial and
 // release-marks source quiescence.
 extern "C" __global__ void deepseek4_harmonic_wait_copy_gfx1100(
-    char *__restrict__ slot0, char *__restrict__ slot1,
-    const char *__restrict__ result0, const char *__restrict__ result1,
+    const char *__restrict__ header, const char *__restrict__ result0,
+    const char *__restrict__ result1,
     float *__restrict__ routed_partial,
     const unsigned long long *__restrict__ token_control, int layer,
     unsigned long long max_wait_clocks, unsigned *__restrict__ status) {
   __shared__ unsigned copy_result;
-  __shared__ char *slot;
   __shared__ const char *result;
 
   const int tid = threadIdx.x;
@@ -252,29 +231,26 @@ extern "C" __global__ void deepseek4_harmonic_wait_copy_gfx1100(
     const unsigned long long epoch =
         token_control[0] + static_cast<unsigned long long>(layer);
     const unsigned slot_index = static_cast<unsigned>(epoch & 1ull);
-    slot = slot_index == 0 ? slot0 : slot1;
     result = slot_index == 0 ? result0 : result1;
 
     if (atomicAdd(status, 0u) == kMailboxOk) {
       const unsigned long long start = clock64();
       for (;;) {
-        const unsigned long long observed_epoch =
-            sys_load_u64(slot, kSlotEpoch, __ATOMIC_ACQUIRE);
-        const unsigned state =
-            sys_load_u32(slot, kSlotState, __ATOMIC_ACQUIRE);
-        if (observed_epoch == epoch && terminal_state(state)) {
-          if (state != kCompleted) {
-            set_first_error(status, kWaitTerminalFailure, layer, state, 0);
-          } else if (sys_load_u32(slot, kSlotResultExtent,
-                                  __ATOMIC_RELAXED) != kResultExtent) {
-            set_first_error(status, kWaitResultExtent, layer, state, 0);
-          } else {
-            copy_result = 1;
-          }
+        const unsigned long long completed =
+            sys_load_u64(header, kHeaderCompletedEpochs + slot_index * 8,
+                         __ATOMIC_ACQUIRE);
+        if (completed == epoch) {
+          copy_result = 1;
+          break;
+        }
+        if (completed > epoch) {
+          set_first_error(status, kWaitTerminalFailure, layer,
+                          static_cast<unsigned>(completed & 0xfu), 0);
           break;
         }
         if (clock64() - start >= max_wait_clocks) {
-          set_first_error(status, kWaitTimeout, layer, state, 0);
+          set_first_error(status, kWaitTimeout, layer,
+                          static_cast<unsigned>(completed & 0xfu), 0);
           break;
         }
         __builtin_amdgcn_s_sleep(1);
@@ -286,13 +262,5 @@ extern "C" __global__ void deepseek4_harmonic_wait_copy_gfx1100(
   for (int index = tid; index < kHidden; index += blockDim.x) {
     routed_partial[index] =
         copy_result ? reinterpret_cast<const float *>(result)[index] : 0.0f;
-  }
-  __syncthreads();
-
-  if (tid == 0 && copy_result) {
-    __threadfence_system();
-    __hip_atomic_fetch_or(reinterpret_cast<unsigned *>(slot + kSlotFlags),
-                          kSourceObserved, __ATOMIC_RELEASE,
-                          __HIP_MEMORY_SCOPE_SYSTEM);
   }
 }

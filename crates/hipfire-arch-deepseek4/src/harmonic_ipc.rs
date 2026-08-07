@@ -29,7 +29,7 @@ use crate::harmonic::{
 };
 
 const HARMONIC_WIRE_MAGIC: u64 = 0x4453_3448_4950_4331; // DS4HIPC1
-const HARMONIC_WIRE_VERSION: u32 = 2;
+const HARMONIC_WIRE_VERSION: u32 = 3;
 const FLAG_SOURCE_OBSERVED: u32 = 1 << 0;
 const FLAG_DESTINATION_QUIESCED: u32 = 1 << 1;
 const OWNER_DENSE_MASK: u32 = 1 << 0;
@@ -229,6 +229,19 @@ pub fn harmonic_monotonic_tick() -> HarmonicIpcResult<u64> {
 }
 
 #[repr(C, align(64))]
+struct HarmonicEpochDoorbells {
+    slots: [AtomicU64; HARMONIC_SLOT_COUNT],
+}
+
+impl HarmonicEpochDoorbells {
+    const fn new() -> Self {
+        Self {
+            slots: [const { AtomicU64::new(0) }; HARMONIC_SLOT_COUNT],
+        }
+    }
+}
+
+#[repr(C, align(64))]
 struct HarmonicWireHeader {
     magic: AtomicU64,
     version: AtomicU32,
@@ -239,6 +252,12 @@ struct HarmonicWireHeader {
     source_generation: AtomicU64,
     destination_generation: AtomicU64,
     isolated_owners: AtomicU32,
+    /// Single-writer GPU-mailbox doorbells. Dense gfx1100 alone publishes;
+    /// expert gfx1151's CPU supervisor alone completes. Keeping the directions
+    /// on separate cache words avoids lost cross-agent RMW updates on mapped
+    /// host memory.
+    published_epochs: HarmonicEpochDoorbells,
+    completed_epochs: HarmonicEpochDoorbells,
 }
 
 impl HarmonicWireHeader {
@@ -254,6 +273,8 @@ impl HarmonicWireHeader {
             source_generation: AtomicU64::new(contract.source_allocation_generation),
             destination_generation: AtomicU64::new(contract.destination_allocation_generation),
             isolated_owners: AtomicU32::new(0),
+            published_epochs: HarmonicEpochDoorbells::new(),
+            completed_epochs: HarmonicEpochDoorbells::new(),
         }
     }
 
@@ -327,6 +348,8 @@ const _: () = {
     assert!(mem::offset_of!(HarmonicWireHeader, source_generation) == 64);
     assert!(mem::offset_of!(HarmonicWireHeader, destination_generation) == 72);
     assert!(mem::offset_of!(HarmonicWireHeader, isolated_owners) == 80);
+    assert!(mem::offset_of!(HarmonicWireHeader, published_epochs) == 128);
+    assert!(mem::offset_of!(HarmonicWireHeader, completed_epochs) == 192);
     assert!(mem::offset_of!(HarmonicWireSlot, state) == 0);
     assert!(mem::offset_of!(HarmonicWireSlot, flags) == 4);
     assert!(mem::offset_of!(HarmonicWireSlot, epoch) == 8);
@@ -1042,6 +1065,39 @@ impl HarmonicSharedRing {
         }
     }
 
+    /// Acquire a GPU-published packet through the single-writer epoch doorbell.
+    ///
+    /// Unlike [`Self::expert_poll_mapped`], this path never writes the slot's
+    /// shared state word. gfx1100 owns `published_epochs[slot]`; the expert
+    /// supervisor only observes it and executes epochs strictly in order.
+    pub fn expert_poll_gpu_mailbox(
+        &self,
+        epoch: u64,
+        endpoint_generation: u64,
+    ) -> HarmonicIpcResult<HarmonicExpertMappedPoll> {
+        self.require_release_acquire_data_plane()?;
+        self.check_endpoint(HarmonicOwner::ExpertGfx1151, endpoint_generation)?;
+        let slot_index = epoch as usize % HARMONIC_SLOT_COUNT;
+        let observed =
+            self.layout().header.published_epochs.slots[slot_index].load(Ordering::Acquire);
+        if observed < epoch {
+            return Ok(HarmonicExpertMappedPoll::Pending);
+        }
+        if observed > epoch {
+            return Err(HarmonicProtocolError::StaleEpoch {
+                expected: observed,
+                got: epoch,
+            }
+            .into());
+        }
+        let slot = self.slot(epoch);
+        slot.check_epoch(epoch)?;
+        let packet = slot.packet()?;
+        self.contract()
+            .validate(&packet, harmonic_monotonic_tick()?)?;
+        Ok(HarmonicExpertMappedPoll::Work(packet))
+    }
+
     pub fn expert_complete(
         &self,
         epoch: u64,
@@ -1121,6 +1177,29 @@ impl HarmonicSharedRing {
             .fetch_or(FLAG_DESTINATION_QUIESCED, Ordering::Release);
         slot.state
             .store(HarmonicWireState::Completed as u32, Ordering::Release);
+        Ok(())
+    }
+
+    /// Release-complete a GPU-mailbox packet through the expert-owned epoch
+    /// doorbell. No dense-owned synchronization word is modified here.
+    pub fn expert_complete_gpu_mailbox(
+        &self,
+        epoch: u64,
+        endpoint_generation: u64,
+        completion: HarmonicCompletion,
+    ) -> HarmonicIpcResult<()> {
+        self.require_release_acquire_data_plane()?;
+        self.check_endpoint(HarmonicOwner::ExpertGfx1151, endpoint_generation)?;
+        let slot = self.slot(epoch);
+        slot.check_epoch(epoch)?;
+        let packet = slot.packet()?;
+        if completion.result_extent != packet.result_extent {
+            return Err(HarmonicProtocolError::InvalidPacket("completion extent").into());
+        }
+        slot.result_fingerprint
+            .store(completion.result_fingerprint, Ordering::Relaxed);
+        let slot_index = epoch as usize % HARMONIC_SLOT_COUNT;
+        self.layout().header.completed_epochs.slots[slot_index].store(epoch, Ordering::Release);
         Ok(())
     }
 
@@ -1710,6 +1789,51 @@ mod tests {
         assert_eq!(resolved.completion, Some(completion));
         owner.ring.recycle(1).unwrap();
         assert_eq!(owner.ring.state(1).unwrap(), HarmonicWireState::Vacant);
+    }
+
+    #[test]
+    fn gpu_mailbox_uses_disjoint_single_writer_epoch_doorbells() {
+        let owner = TestRing::new_data_plane(7, 11);
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&owner.path)
+            .unwrap();
+        let peer = HarmonicSharedRing::open(&file).unwrap();
+        let (request, _) = request(owner.ring.contract(), 1, u64::MAX);
+
+        // `prepare_publish` supplies the exact packet metadata a GPU writes.
+        // The release doorbell, not the legacy multi-writer state word, is the
+        // visibility edge consumed by the expert worker.
+        owner.ring.prepare_publish(request, 7, 0).unwrap();
+        let slot_index = request.epoch as usize % HARMONIC_SLOT_COUNT;
+        owner.ring.layout().header.published_epochs.slots[slot_index]
+            .store(request.epoch, Ordering::Release);
+        let observed = match peer.expert_poll_gpu_mailbox(1, 11).unwrap() {
+            HarmonicExpertMappedPoll::Work(packet) => packet,
+            state => panic!("expected GPU-mailbox work, got {state:?}"),
+        };
+        assert_eq!(observed, request);
+        assert_eq!(
+            owner.ring.state(1).unwrap(),
+            HarmonicWireState::Publishing,
+            "expert observation must not write the dense-owned state word"
+        );
+
+        let completion = HarmonicCompletion {
+            result_extent: HARMONIC_RESULT_EXTENT,
+            result_fingerprint: 0,
+        };
+        peer.expert_complete_gpu_mailbox(1, 11, completion).unwrap();
+        assert_eq!(
+            owner.ring.layout().header.completed_epochs.slots[slot_index].load(Ordering::Acquire),
+            request.epoch
+        );
+        assert_eq!(
+            owner.ring.state(1).unwrap(),
+            HarmonicWireState::Publishing,
+            "expert completion must not write the dense-owned state word"
+        );
     }
 
     #[test]

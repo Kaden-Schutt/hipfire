@@ -88,8 +88,7 @@ impl Gpu {
     #[allow(clippy::too_many_arguments)]
     pub fn deepseek4_harmonic_wait_copy_gfx1100(
         &mut self,
-        slot0: &DeviceBuffer,
-        slot1: &DeviceBuffer,
+        header: &DeviceBuffer,
         result0: &DeviceBuffer,
         result1: &DeviceBuffer,
         routed_partial: &GpuTensor,
@@ -109,8 +108,7 @@ impl Gpu {
             kernels::DEEPSEEK4_HARMONIC_MAILBOX_GFX1100_SRC,
             KERNEL,
         )?;
-        let slot0_ptr = slot0.as_ptr();
-        let slot1_ptr = slot1.as_ptr();
+        let header_ptr = header.as_ptr();
         let result0_ptr = result0.as_ptr();
         let result1_ptr = result1.as_ptr();
         let routed_ptr = routed_partial.buf.as_ptr();
@@ -118,8 +116,7 @@ impl Gpu {
         let layer_i32 = layer as i32;
         let status_ptr = status.buf.as_ptr();
         let mut params: Vec<*mut c_void> = vec![
-            &slot0_ptr as *const _ as *mut c_void,
-            &slot1_ptr as *const _ as *mut c_void,
+            &header_ptr as *const _ as *mut c_void,
             &result0_ptr as *const _ as *mut c_void,
             &result1_ptr as *const _ as *mut c_void,
             &routed_ptr as *const _ as *mut c_void,
@@ -130,8 +127,7 @@ impl Gpu {
         ];
         self.launch_maybe_blob(KERNEL, [256, 1, 1], [256, 1, 1], 0, &mut params, || {
             let mut blob = hip_bridge::KernargBlob::new();
-            blob.push_ptr(slot0_ptr);
-            blob.push_ptr(slot1_ptr);
+            blob.push_ptr(header_ptr);
             blob.push_ptr(result0_ptr);
             blob.push_ptr(result1_ptr);
             blob.push_ptr(routed_ptr);
