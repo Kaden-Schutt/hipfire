@@ -213,6 +213,15 @@ fn main() {
     let candidate_down = gpu
         .alloc_tensor(&[TOP_K, DOWN_M], rdna_compute::DType::F32)
         .expect("candidate down");
+    let topk_weights = gpu
+        .upload_f32(&build_signal(TOP_K, 0x1201_4040), &[TOP_K])
+        .expect("upload top-k weights");
+    let base_combined = gpu
+        .zeros(&[DOWN_M], rdna_compute::DType::F32)
+        .expect("base combined");
+    let candidate_combined = gpu
+        .zeros(&[DOWN_M], rdna_compute::DType::F32)
+        .expect("candidate combined");
     gpu.deepseek4_gemv_mq2g256_lloyd_moe_down_expanded_k4(
         &down_ptrs, &topk, &rot, &base_down, DOWN_M, DOWN_K, TOP_K, 1,
     )
@@ -232,6 +241,30 @@ fn main() {
             1,
         )
         .expect("down candidate");
+    gpu.moe_down_combine_k8_batched(
+        &candidate_down,
+        &topk_weights,
+        &base_combined,
+        DOWN_M,
+        TOP_K,
+        1,
+    )
+    .expect("baseline deterministic combine");
+    gpu.try_gfx1201()
+        .expect("exact gfx1201")
+        .mq2_lloyd_moe_down_combined_ep(
+            &down_ptrs,
+            &gate_ptrs,
+            &dummy,
+            &topk,
+            &topk_weights,
+            &rot,
+            &candidate_combined,
+            DOWN_M,
+            DOWN_K,
+            TOP_K,
+        )
+        .expect("fused local down combine");
     gpu.hip.device_synchronize().expect("channel sync");
 
     let base_gate_host = gpu.download_f32(&base_gate).expect("download base gate");
@@ -246,9 +279,20 @@ fn main() {
     let candidate_down_host = gpu
         .download_f32(&candidate_down)
         .expect("download candidate down");
+    let base_combined_host = gpu
+        .download_f32(&base_combined)
+        .expect("download base combined");
+    let candidate_combined_host = gpu
+        .download_f32(&candidate_combined)
+        .expect("download candidate combined");
     assert_raw_equal("gate", &base_gate_host, &candidate_gate_host);
     assert_raw_equal("up", &base_up_host, &candidate_up_host);
     assert_raw_equal("down", &base_down_host, &candidate_down_host);
+    assert_raw_equal(
+        "down_combined",
+        &base_combined_host,
+        &candidate_combined_host,
+    );
     assert_nonowned_positive_zero("gate", &candidate_gate_host, GATE_M / 2);
     assert_nonowned_positive_zero("up", &candidate_up_host, GATE_M / 2);
     assert_nonowned_positive_zero("down", &candidate_down_host, DOWN_M);
@@ -321,11 +365,60 @@ fn main() {
             )
             .expect("timed down candidate");
     });
+    let combined_base_ms = elapsed_ms(&mut gpu, REPEATS, |gpu| {
+        gpu.try_gfx1201()
+            .expect("exact gfx1201")
+            .mq2_lloyd_moe_down_expanded_ep(
+                &down_ptrs,
+                &gate_ptrs,
+                &dummy,
+                &topk,
+                &rot,
+                &candidate_down,
+                DOWN_M,
+                DOWN_K,
+                TOP_K,
+                1,
+            )
+            .expect("timed expanded down");
+        gpu.moe_down_combine_k8_batched(
+            &candidate_down,
+            &topk_weights,
+            &base_combined,
+            DOWN_M,
+            TOP_K,
+            1,
+        )
+        .expect("timed deterministic combine");
+    });
+    let combined_candidate_ms = elapsed_ms(&mut gpu, REPEATS, |gpu| {
+        gpu.try_gfx1201()
+            .expect("exact gfx1201")
+            .mq2_lloyd_moe_down_combined_ep(
+                &down_ptrs,
+                &gate_ptrs,
+                &dummy,
+                &topk,
+                &topk_weights,
+                &rot,
+                &candidate_combined,
+                DOWN_M,
+                DOWN_K,
+                TOP_K,
+            )
+            .expect("timed fused local down combine");
+    });
     println!(
         "MICRO owned=2/6 repeats={REPEATS} gate_ms={gate_base_ms:.6}->{gate_candidate_ms:.6} \
          gate_speedup={:.3}x down_ms={down_base_ms:.6}->{down_candidate_ms:.6} \
          down_speedup={:.3}x",
         gate_base_ms / gate_candidate_ms,
         down_base_ms / down_candidate_ms,
+    );
+    let saved_ms_per_token = (combined_base_ms - combined_candidate_ms) * 43.0;
+    println!(
+        "FUSED_DOWN_COMBINE owned=2/6 repeats={REPEATS} expanded_plus_combine_ms={combined_base_ms:.6} fused_ms={combined_candidate_ms:.6} speedup={:.3}x saved_ms_per_43_layers={saved_ms_per_token:.6} projected_product_pct={:.3}",
+        combined_base_ms / combined_candidate_ms,
+        saved_ms_per_token / (1000.0 / 54.903757) * 100.0,
     );
 }

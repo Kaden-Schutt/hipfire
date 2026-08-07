@@ -21,6 +21,9 @@ const MQ2_LLOYD_DOWN_EXPANDED_EP_SRC: &str =
     include_str!("../../../../kernels/src/gemv_mq2g256_lloyd_moe_down_expanded_k4_ep.gfx1201.hip");
 const MQ2_LLOYD_DOWN_EXPANDED_EP_KERNEL: &str =
     "gemv_mq2g256_lloyd_moe_down_expanded_k4_gfx1201_ep";
+const MQ2_LLOYD_DOWN_COMBINED_EP_SRC: &str =
+    include_str!("../../../../kernels/src/gemv_mq2g256_lloyd_moe_down_combined_ep.gfx1201.hip");
+const MQ2_LLOYD_DOWN_COMBINED_EP_KERNEL: &str = "gemv_mq2g256_lloyd_moe_down_combined_gfx1201_ep";
 
 /// A mutable GPU borrow proven to target exact gfx1201.
 ///
@@ -175,6 +178,86 @@ impl Gfx1201Device<'_> {
                 blob.push_ptr(ownership_ptrs_ptr);
                 blob.push_ptr(dummy_ptr);
                 blob.push_ptr(topk_indices_ptr);
+                blob.push_ptr(rot_ptr);
+                blob.push_ptr(output_ptr);
+                blob.push_i32(m_i32);
+                blob.push_i32(k_i32);
+                blob.push_i32(k_top_i32);
+                blob
+            },
+        );
+        if let Some(timer) = timer {
+            timer.finish(&self.gpu.hip);
+        }
+        result
+    }
+
+    /// Micro-only deterministic TP3 decode screen that fuses the fixed-order
+    /// six-slot combine into the rank-local MQ2 down projection.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mq2_lloyd_moe_down_combined_ep(
+        &mut self,
+        expert_ptrs: &GpuTensor,
+        ownership_ptrs: &GpuTensor,
+        nonowned_dummy: &GpuTensor,
+        topk_indices: &GpuTensor,
+        topk_weights: &GpuTensor,
+        rot_batch: &GpuTensor,
+        ffn_out: &GpuTensor,
+        m: usize,
+        k: usize,
+        k_top: usize,
+    ) -> HipResult<()> {
+        self.gpu.bind_thread()?;
+        assert!(k.is_multiple_of(256), "gfx1201 MQ2 down requires K%256=0");
+        assert!(k_top <= 8, "gfx1201 MQ2 down combine requires K_TOP<=8");
+        self.gpu.ensure_kernel(
+            MQ2_LLOYD_DOWN_COMBINED_EP_KERNEL,
+            MQ2_LLOYD_DOWN_COMBINED_EP_SRC,
+            MQ2_LLOYD_DOWN_COMBINED_EP_KERNEL,
+        )?;
+        let expert_ptrs_ptr = expert_ptrs.buf.as_ptr();
+        let ownership_ptrs_ptr = ownership_ptrs.buf.as_ptr();
+        let dummy_ptr = nonowned_dummy.buf.as_ptr();
+        let topk_indices_ptr = topk_indices.buf.as_ptr();
+        let topk_weights_ptr = topk_weights.buf.as_ptr();
+        let rot_ptr = rot_batch.buf.as_ptr();
+        let output_ptr = ffn_out.buf.as_ptr();
+        let m_i32 = m as i32;
+        let k_i32 = k as i32;
+        let k_top_i32 = k_top as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &expert_ptrs_ptr as *const _ as *mut c_void,
+            &ownership_ptrs_ptr as *const _ as *mut c_void,
+            &dummy_ptr as *const _ as *mut c_void,
+            &topk_indices_ptr as *const _ as *mut c_void,
+            &topk_weights_ptr as *const _ as *mut c_void,
+            &rot_ptr as *const _ as *mut c_void,
+            &output_ptr as *const _ as *mut c_void,
+            &m_i32 as *const _ as *mut c_void,
+            &k_i32 as *const _ as *mut c_void,
+            &k_top_i32 as *const _ as *mut c_void,
+        ];
+        let bytes = k_top * (m * (k / 256) * 72 + k * 4) + (k_top + 2 * m) * 4;
+        let timer = crate::profile::begin_timer(
+            &self.gpu.hip,
+            "gemv",
+            MQ2_LLOYD_DOWN_COMBINED_EP_KERNEL,
+            bytes,
+        );
+        let result = self.gpu.launch_maybe_blob(
+            MQ2_LLOYD_DOWN_COMBINED_EP_KERNEL,
+            [m as u32, 1, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut blob = KernargBlob::new();
+                blob.push_ptr(expert_ptrs_ptr);
+                blob.push_ptr(ownership_ptrs_ptr);
+                blob.push_ptr(dummy_ptr);
+                blob.push_ptr(topk_indices_ptr);
+                blob.push_ptr(topk_weights_ptr);
                 blob.push_ptr(rot_ptr);
                 blob.push_ptr(output_ptr);
                 blob.push_i32(m_i32);
