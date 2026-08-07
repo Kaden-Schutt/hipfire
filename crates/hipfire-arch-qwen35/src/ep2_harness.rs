@@ -1110,8 +1110,8 @@ impl HarnessState {
             .map_err(|e| format!("KV reset (clear_gpu): {e}"))?;
         self.kv_cache.compact_offset = 0;
         self.dn_state
-            .reset_checked(gpu)
-            .map_err(|e| format!("DeltaNet reset (reset_checked): {e}"))?;
+            .reset(gpu)
+            .map_err(|e| format!("DeltaNet reset: {e}"))?;
         Ok(())
     }
 
@@ -1594,7 +1594,7 @@ mod tests {
             let _ = f;
         }
         _kv(hipfire_runtime::llama::KvCache::clear_gpu);
-        _dn(crate::qwen35::DeltaNetState::reset_checked);
+        _dn(crate::qwen35::DeltaNetState::reset);
     }
 
     // ── Terminal checked cleanup + actual HIP release (pool drain) ─────

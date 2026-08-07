@@ -7798,6 +7798,10 @@ impl Qwen35Scratch {
             moe_topk_indices: None,
             moe_topk_weights: None,
             moe_down_expanded: None,
+            #[cfg(feature = "emulated-ep2-harness")]
+            ep2_gu_partial0: None,
+            #[cfg(feature = "emulated-ep2-harness")]
+            ep2_gu_partial1: None,
             prefill_batch: None,
         })
         .and_then(|mut s| {
@@ -16916,6 +16920,7 @@ fn moe_ffn_dispatch_ep2(
         prerotated,
         Some(partial0),
         ep2_rank_skip_shared(0),
+        true, // defer_routed_combine — routed tail lands in partial0
     )?;
     // Rank 1: routed only (shared skipped) into partial1.
     moe_ffn_decode_impl(
@@ -16929,6 +16934,7 @@ fn moe_ffn_dispatch_ep2(
         prerotated,
         Some(partial1),
         ep2_rank_skip_shared(1),
+        true, // defer_routed_combine — routed tail lands in partial1
     )?;
 
     // Combine the routed partials and add to the residual exactly once.
@@ -18678,6 +18684,8 @@ pub fn forward_prefill_batch_ep(
                 false, // needs_last_token_logits (no lm_head in band)
                 None,  // max_layer
                 routed_out,
+                #[cfg(feature = "emulated-ep2-harness")]
+                None, // ep2: the EP driver combines the partials itself
             )?;
         }
 

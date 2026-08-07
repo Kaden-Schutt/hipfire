@@ -749,6 +749,14 @@ impl LoadedModel {
     }
 
     /// dots.ocr bundle if this model is arch_id=8, else None.
+    pub fn dots_ocr(&self) -> Option<&hipfire_arch_dots_ocr::DotsOcrBundle> {
+        match &self.state {
+            Some(ModelState::DotsOcr(b)) => Some(b),
+            _ => None,
+        }
+    }
+
+    /// dots.ocr bundle if this model is arch_id=8, else None.
     pub fn dots_ocr_mut(&mut self) -> Option<&mut hipfire_arch_dots_ocr::DotsOcrBundle> {
         match &mut self.state {
             Some(ModelState::DotsOcr(b)) => Some(b),
