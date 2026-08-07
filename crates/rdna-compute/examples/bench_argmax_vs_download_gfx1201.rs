@@ -34,10 +34,7 @@ fn main() {
 
     let mut host = (0..VOCAB)
         .map(|index| {
-            let mixed = index
-                .wrapping_mul(1_664_525)
-                .wrapping_add(1_013_904_223)
-                & 0x00ff_ffff;
+            let mixed = index.wrapping_mul(1_664_525).wrapping_add(1_013_904_223) & 0x00ff_ffff;
             mixed as f32 * (1.0 / 16_777_216.0) - 0.5
         })
         .collect::<Vec<_>>();
@@ -52,13 +49,15 @@ fn main() {
 
     let full_once = gpu.download_f32(&logits).expect("warm full download");
     assert_eq!(cpu_argmax(&full_once), EXPECTED);
-    assert_eq!(gpu.argmax_f32(&logits, VOCAB).expect("warm allocating"), EXPECTED);
+    assert_eq!(
+        gpu.argmax_f32(&logits, VOCAB).expect("warm allocating"),
+        EXPECTED
+    );
     gpu.argmax_f32_batched(&logits, &persistent, VOCAB, 1)
         .expect("warm persistent");
     let mut persistent_id = [0_i32; 1];
-    let persistent_bytes = unsafe {
-        std::slice::from_raw_parts_mut(persistent_id.as_mut_ptr().cast::<u8>(), 4)
-    };
+    let persistent_bytes =
+        unsafe { std::slice::from_raw_parts_mut(persistent_id.as_mut_ptr().cast::<u8>(), 4) };
     gpu.hip
         .memcpy_dtoh(persistent_bytes, &persistent.buf)
         .expect("warm persistent download");
@@ -110,9 +109,7 @@ fn main() {
     let full_us = median(&mut full_blocks);
     let allocating_us = median(&mut allocating_blocks);
     let persistent_us = median(&mut persistent_blocks);
-    println!(
-        "gfx1201 vocab={VOCAB} blocks={BLOCKS} repeats={REPEATS} expected={EXPECTED}"
-    );
+    println!("gfx1201 vocab={VOCAB} blocks={BLOCKS} repeats={REPEATS} expected={EXPECTED}");
     println!("full_download_cpu_argmax_us={full_us:.3}");
     println!(
         "allocating_gpu_argmax_us={allocating_us:.3} saved_us={:.3}",
