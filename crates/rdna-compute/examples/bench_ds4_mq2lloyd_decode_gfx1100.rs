@@ -284,9 +284,22 @@ fn time_gate(
     k_top: usize,
 ) -> f64 {
     for _ in 0..WARMUP {
-        gpu.try_gfx1100()
-            .expect("exact gfx1100 proof vanished")
-            .mq2_lloyd_moe_gate_up_k4_lds(
+        if gpu.arch_caps.is_gfx1100() {
+            gpu.try_gfx1100()
+                .expect("exact gfx1100 proof vanished")
+                .mq2_lloyd_moe_gate_up_k4_lds(
+                    expert_ptrs,
+                    topk_indices,
+                    x,
+                    gate,
+                    up,
+                    GATE_M,
+                    GATE_K,
+                    k_top,
+                )
+                .unwrap();
+        } else {
+            gpu.deepseek4_gemv_mq2g256_lloyd_moe_gate_up_indexed(
                 expert_ptrs,
                 topk_indices,
                 x,
@@ -297,13 +310,27 @@ fn time_gate(
                 k_top,
             )
             .unwrap();
+        }
     }
     gpu.hip.device_synchronize().unwrap();
     let started = Instant::now();
     for _ in 0..TRIALS {
-        gpu.try_gfx1100()
-            .expect("exact gfx1100 proof vanished")
-            .mq2_lloyd_moe_gate_up_k4_lds(
+        if gpu.arch_caps.is_gfx1100() {
+            gpu.try_gfx1100()
+                .expect("exact gfx1100 proof vanished")
+                .mq2_lloyd_moe_gate_up_k4_lds(
+                    expert_ptrs,
+                    topk_indices,
+                    x,
+                    gate,
+                    up,
+                    GATE_M,
+                    GATE_K,
+                    k_top,
+                )
+                .unwrap();
+        } else {
+            gpu.deepseek4_gemv_mq2g256_lloyd_moe_gate_up_indexed(
                 expert_ptrs,
                 topk_indices,
                 x,
@@ -314,6 +341,7 @@ fn time_gate(
                 k_top,
             )
             .unwrap();
+        }
     }
     gpu.hip.device_synchronize().unwrap();
     started.elapsed().as_secs_f64() * 1.0e6 / TRIALS as f64
@@ -321,15 +349,20 @@ fn time_gate(
 
 fn median(values: &mut [f64]) -> f64 {
     values.sort_by(f64::total_cmp);
-    (values[0] + values[1]) * 0.5
+    let mid = values.len() / 2;
+    if values.len().is_multiple_of(2) {
+        (values[mid - 1] + values[mid]) * 0.5
+    } else {
+        values[mid]
+    }
 }
 
 fn main() -> Result<(), String> {
     let args = Args::parse()?;
     let (pci, arch, discovered_name) = resolve_device(&args.device)?;
-    if arch != "gfx1100" {
+    if arch != "gfx1100" && arch != "gfx1151" {
         return Err(format!(
-            "DS4 harmonic MQ2 micro requires exact gfx1100; selector {} resolved {arch} at {pci}",
+            "DS4 harmonic MQ2 micro requires exact gfx1100 or gfx1151; selector {} resolved {arch} at {pci}",
             args.device
         ));
     }
@@ -337,9 +370,10 @@ fn main() -> Result<(), String> {
         "device_selector={} discovered_name={} resolved_pci={} resolved_arch={}",
         args.device, discovered_name, pci, arch
     );
-    let mut gpu = Gpu::init_with_pci_bus_id(&pci, "gfx1100")
-        .map_err(|error| format!("exact gfx1100 init: {error:?}"))?;
-    if gpu.try_gfx1100().is_none() {
+    let mut gpu = Gpu::init_with_pci_bus_id(&pci, &arch)
+        .map_err(|error| format!("exact {arch} init: {error:?}"))?;
+    let candidate_supported = gpu.arch_caps.is_gfx1100();
+    if candidate_supported && gpu.try_gfx1100().is_none() {
         return Err("exact gfx1100 proof unavailable after initialization".to_owned());
     }
 
@@ -501,47 +535,56 @@ fn main() -> Result<(), String> {
 
     let mut gate_us = [0.0_f64; TOP_K + 1];
     let mut down_base_us = [0.0_f64; TOP_K + 1];
-    let mut down_candidate_us = [0.0_f64; TOP_K + 1];
+    let mut down_candidate_us = [f64::NAN; TOP_K + 1];
     for k_top in 1..=TOP_K {
         dispatch_down(
             &mut gpu, false, &down_ptrs, &indices, &down_x, &down_base, k_top,
         )
         .map_err(|e| format!("down baseline dispatch: {e:?}"))?;
-        dispatch_down(
-            &mut gpu,
-            true,
-            &down_ptrs,
-            &indices,
-            &down_x,
-            &down_candidate,
-            k_top,
-        )
-        .map_err(|e| format!("down candidate dispatch: {e:?}"))?;
+        if candidate_supported {
+            dispatch_down(
+                &mut gpu,
+                true,
+                &down_ptrs,
+                &indices,
+                &down_x,
+                &down_candidate,
+                k_top,
+            )
+            .map_err(|e| format!("down candidate dispatch: {e:?}"))?;
+        }
         gpu.hip
             .device_synchronize()
             .map_err(|e| format!("correctness sync: {e:?}"))?;
-        let bytes = k_top * DOWN_M * 4;
-        let mut baseline = vec![0_u8; bytes];
-        let mut candidate = vec![0_u8; bytes];
-        gpu.hip
-            .memcpy_dtoh(&mut baseline, &down_base_gpu)
-            .map_err(|e| format!("baseline download: {e:?}"))?;
-        gpu.hip
-            .memcpy_dtoh(&mut candidate, &down_candidate_gpu)
-            .map_err(|e| format!("candidate download: {e:?}"))?;
-        let mismatches = baseline
-            .chunks_exact(4)
-            .zip(candidate.chunks_exact(4))
-            .filter(|(left, right)| left != right)
-            .count();
-        if mismatches != 0 {
-            return Err(format!("k_top={k_top} raw-bit mismatches={mismatches}"));
+        if candidate_supported {
+            let bytes = k_top * DOWN_M * 4;
+            let mut baseline = vec![0_u8; bytes];
+            let mut candidate = vec![0_u8; bytes];
+            gpu.hip
+                .memcpy_dtoh(&mut baseline, &down_base_gpu)
+                .map_err(|e| format!("baseline download: {e:?}"))?;
+            gpu.hip
+                .memcpy_dtoh(&mut candidate, &down_candidate_gpu)
+                .map_err(|e| format!("candidate download: {e:?}"))?;
+            let mismatches = baseline
+                .chunks_exact(4)
+                .zip(candidate.chunks_exact(4))
+                .filter(|(left, right)| left != right)
+                .count();
+            if mismatches != 0 {
+                return Err(format!("k_top={k_top} raw-bit mismatches={mismatches}"));
+            }
         }
 
         gate_us[k_top] = time_gate(&mut gpu, &gate_ptrs, &indices, &gate_x, &gate, &up, k_top);
-        let mut base_rows = Vec::with_capacity(2);
+        let order: &[bool] = if candidate_supported {
+            &[false, true, true, false]
+        } else {
+            &[false, false, false, false]
+        };
+        let mut base_rows = Vec::with_capacity(4);
         let mut candidate_rows = Vec::with_capacity(2);
-        for candidate_arm in [false, true, true, false] {
+        for &candidate_arm in order {
             let us = time_down(
                 &mut gpu,
                 candidate_arm,
@@ -562,14 +605,21 @@ fn main() -> Result<(), String> {
             }
         }
         down_base_us[k_top] = median(&mut base_rows);
-        down_candidate_us[k_top] = median(&mut candidate_rows);
-        println!(
-            "shape k_top={k_top} gate_us={:.3} down_baseline_us={:.3} down_candidate_us={:.3} down_speedup={:.6} bit_mismatch=0",
-            gate_us[k_top],
-            down_base_us[k_top],
-            down_candidate_us[k_top],
-            down_base_us[k_top] / down_candidate_us[k_top]
-        );
+        if candidate_supported {
+            down_candidate_us[k_top] = median(&mut candidate_rows);
+            println!(
+                "shape k_top={k_top} gate_us={:.3} down_baseline_us={:.3} down_candidate_us={:.3} down_speedup={:.6} bit_mismatch=0",
+                gate_us[k_top],
+                down_base_us[k_top],
+                down_candidate_us[k_top],
+                down_base_us[k_top] / down_candidate_us[k_top]
+            );
+        } else {
+            println!(
+                "shape k_top={k_top} gate_us={:.3} down_baseline_us={:.3} samples=4",
+                gate_us[k_top], down_base_us[k_top]
+            );
+        }
     }
 
     if let Some(histogram) = args.histogram {
@@ -584,13 +634,24 @@ fn main() -> Result<(), String> {
         };
         let weighted_gate = weighted(&gate_us);
         let weighted_down_base = weighted(&down_base_us);
-        let weighted_down_candidate = weighted(&down_candidate_us);
-        println!(
-            "weighted records={} gate_us={weighted_gate:.3} down_baseline_us={weighted_down_base:.3} down_candidate_us={weighted_down_candidate:.3} down_speedup={:.6} projection_speedup={:.6}",
-            records as u64,
-            weighted_down_base / weighted_down_candidate,
-            (weighted_gate + weighted_down_base) / (weighted_gate + weighted_down_candidate)
-        );
+        if candidate_supported {
+            // A zero-local-slot occurrence launches neither projection; replace
+            // the intentionally-NaN candidate sentinel for weighted folding.
+            down_candidate_us[0] = 0.0;
+            let weighted_down_candidate = weighted(&down_candidate_us);
+            println!(
+                "weighted records={} gate_us={weighted_gate:.3} down_baseline_us={weighted_down_base:.3} down_candidate_us={weighted_down_candidate:.3} down_speedup={:.6} projection_speedup={:.6}",
+                records as u64,
+                weighted_down_base / weighted_down_candidate,
+                (weighted_gate + weighted_down_base) / (weighted_gate + weighted_down_candidate)
+            );
+        } else {
+            println!(
+                "weighted records={} gate_us={weighted_gate:.3} down_baseline_us={weighted_down_base:.3} projection_us={:.3}",
+                records as u64,
+                weighted_gate + weighted_down_base
+            );
+        }
     }
 
     // These tensors alias the owning DeviceBuffers above.
