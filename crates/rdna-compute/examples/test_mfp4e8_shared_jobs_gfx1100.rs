@@ -111,7 +111,7 @@ fn sequential(
 fn shared(gpu: &mut Gpu, weights: &[GpuTensor], x: &GpuTensor, outputs: &[GpuTensor], m: usize) {
     let weight_refs: Vec<&GpuTensor> = weights.iter().collect();
     let output_refs: Vec<&GpuTensor> = outputs.iter().collect();
-    gpu.gemv_mfp4g32_e8_soa_shared_jobs_gfx1100(&weight_refs, x, &output_refs, m, K)
+    gpu.gemv_mfp4g32_e8_soa_shared_jobs_buffer_gfx1100(&weight_refs, x, &output_refs, m, K)
         .unwrap();
 }
 

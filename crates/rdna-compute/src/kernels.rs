@@ -1177,6 +1177,13 @@ pub const GEMV_MFP4G32_E8_SOA_GROUPED_GFX1100_SRC: &str = concat!(
 );
 pub const GEMV_MFP4G32_E8_SOA_SHARED_JOBS_GFX1100_SRC: &str =
     include_str!("../../../kernels/src/gemv_mfp4g32_e8_soa_shared_jobs.gfx1100.hip");
+pub const GEMV_MFP4G32_E8_SOA_SHARED_JOBS_BUFFER_GFX1100_SRC: &str = concat!(
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    "#define HIPFIRE_WEIGHT_BUFFER_LOADS_OPT_IN 1\n",
+    "#define HIPFIRE_WEIGHT_CPOL_AUX 0\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/gemv_mfp4g32_e8_soa_shared_jobs_buffer.gfx1100.hip")
+);
 pub const GEMM_MFP4G32_E8_SOA_WMMA_GFX1151_SRC: &str =
     include_str!("../../../kernels/src/gemm_mfp4g32_e8_soa_wmma.gfx1151.hip");
 pub const GEMM_MFP4G32_E8_SOA_WMMA_B2_GFX1151_SRC: &str = concat!(
