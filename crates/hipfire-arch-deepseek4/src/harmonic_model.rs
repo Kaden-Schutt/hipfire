@@ -153,39 +153,38 @@ impl DeepseekV4HarmonicExecution {
             ring_path,
             control_socket,
         };
-        let result = (|| {
-            gpu.active_stream = Some(
-                gpu.hip
-                    .stream_create()
-                    .map_err(|error| format!("deepseek4 harmonic primary stream: {error}"))?,
-            );
-            execution.dense_attn_stream = Some(
-                gpu.hip
-                    .stream_create()
-                    .map_err(|error| format!("deepseek4 harmonic attention stream: {error}"))?,
-            );
-            execution.transfer_stream = Some(
-                gpu.hip
-                    .stream_create()
-                    .map_err(|error| format!("deepseek4 harmonic transfer stream: {error}"))?,
-            );
-            execution.dense_attn_fork_event = Some(
-                gpu.hip
-                    .event_create()
-                    .map_err(|error| format!("deepseek4 harmonic attention fork: {error}"))?,
-            );
-            execution.dense_attn_join_event = Some(
-                gpu.hip
-                    .event_create()
-                    .map_err(|error| format!("deepseek4 harmonic attention join: {error}"))?,
-            );
-            execution.route_ready_event = Some(
-                gpu.hip
-                    .event_create()
-                    .map_err(|error| format!("deepseek4 harmonic route-ready event: {error}"))?,
-            );
-            Ok(())
-        })();
+        let result =
+            (|| {
+                gpu.active_stream = Some(
+                    gpu.hip
+                        .stream_create()
+                        .map_err(|error| format!("deepseek4 harmonic primary stream: {error}"))?,
+                );
+                execution.dense_attn_stream =
+                    Some(gpu.hip.stream_create().map_err(|error| {
+                        format!("deepseek4 harmonic attention stream: {error}")
+                    })?);
+                execution.transfer_stream = Some(
+                    gpu.hip
+                        .stream_create()
+                        .map_err(|error| format!("deepseek4 harmonic transfer stream: {error}"))?,
+                );
+                execution.dense_attn_fork_event = Some(
+                    gpu.hip
+                        .event_create()
+                        .map_err(|error| format!("deepseek4 harmonic attention fork: {error}"))?,
+                );
+                execution.dense_attn_join_event = Some(
+                    gpu.hip
+                        .event_create()
+                        .map_err(|error| format!("deepseek4 harmonic attention join: {error}"))?,
+                );
+                execution.route_ready_event =
+                    Some(gpu.hip.event_create().map_err(|error| {
+                        format!("deepseek4 harmonic route-ready event: {error}")
+                    })?);
+                Ok(())
+            })();
         if let Err(error) = result {
             let _ = execution.release(gpu);
             return Err(error);
@@ -297,6 +296,7 @@ impl DeepseekV4HarmonicModel {
             )
         })?;
         let model_sha256 = artifact.validate(artifact.path())?;
+        let artifact_receipt = artifact.receipt()?;
         let mut hfq = HfqFile::open(artifact.path()).map_err(|error| {
             format!(
                 "deepseek4 harmonic open {}: {error}",
@@ -359,18 +359,15 @@ impl DeepseekV4HarmonicModel {
                 return Err(error);
             }
         };
-        let mut prefill = match PrefillBatchScratch::new(
-            &mut dense_gpu,
-            &config,
-            plan.prefill_max_batch,
-        ) {
-            Ok(prefill) => Some(prefill),
-            Err(error) => {
-                state.take().unwrap().free_gpu(&mut dense_gpu);
-                weights.take().unwrap().free_gpu(&mut dense_gpu);
-                return Err(error);
-            }
-        };
+        let mut prefill =
+            match PrefillBatchScratch::new(&mut dense_gpu, &config, plan.prefill_max_batch) {
+                Ok(prefill) => Some(prefill),
+                Err(error) => {
+                    state.take().unwrap().free_gpu(&mut dense_gpu);
+                    weights.take().unwrap().free_gpu(&mut dense_gpu);
+                    return Err(error);
+                }
+            };
         let dense_free_after = match dense_gpu
             .bind_thread()
             .map_err(|error| format!("deepseek4 harmonic bind dense post-load: {error}"))
@@ -413,6 +410,7 @@ impl DeepseekV4HarmonicModel {
         let worker = HarmonicExpertWorkerProcess::spawn(HarmonicExpertWorkerSpec {
             executable: plan.worker_executable.clone(),
             model: artifact.path().to_path_buf(),
+            artifact_receipt,
             pci_bus_id: expert_pci_bus_id,
             ring: ring_path.clone(),
             control_socket: control_socket.clone(),
@@ -543,10 +541,8 @@ mod tests {
 
     #[test]
     fn default_roles_are_portable_exact_arch_selectors() {
-        let plan = DeepseekV4HarmonicLoadPlan::new(
-            PathBuf::from("worker"),
-            PathBuf::from("runtime"),
-        );
+        let plan =
+            DeepseekV4HarmonicLoadPlan::new(PathBuf::from("worker"), PathBuf::from("runtime"));
         assert_eq!(
             plan.placement,
             Deepseek4ComputePlacement::DenseExpertSplit {

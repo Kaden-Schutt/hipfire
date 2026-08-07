@@ -486,7 +486,7 @@ mod tests {
         for required in [
             "Gpu::init_with_pci_bus_id",
             "GpuSelector::PciBusId",
-            "DeepseekV4VerifiedArtifact::verify",
+            "DeepseekV4VerifiedArtifact::accept_parent_receipt",
             "load_weights_harmonic_experts_gfx1151",
         ] {
             assert!(source.contains(required), "missing {required}");

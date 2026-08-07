@@ -18,9 +18,10 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use hipfire_arch_deepseek4::{
-    harmonic_monotonic_tick, DeepseekV4, DeepseekV4HarmonicExpertService,
-    DeepseekV4VerifiedArtifact, HarmonicExpertMappedPoll, HarmonicExpertWorkerCommand,
-    HarmonicExpertWorkerEvent, HarmonicGpuMapping, HarmonicOwner, HarmonicSharedRing,
+    harmonic_monotonic_tick, DeepseekV4, DeepseekV4ArtifactReceipt,
+    DeepseekV4HarmonicExpertService, DeepseekV4VerifiedArtifact, HarmonicExpertMappedPoll,
+    HarmonicExpertWorkerCommand, HarmonicExpertWorkerEvent, HarmonicGpuMapping, HarmonicOwner,
+    HarmonicSharedRing,
 };
 use hipfire_runtime::arch::Architecture;
 use hipfire_runtime::hfq::HfqFile;
@@ -32,6 +33,10 @@ const EXPECTED_ARCH: &str = "gfx1151";
 #[derive(Debug)]
 struct Args {
     model: PathBuf,
+    model_sha256: String,
+    model_len: u64,
+    model_mtime_secs: u64,
+    model_mtime_nanos: u32,
     pci_bus_id: String,
     ring: PathBuf,
     control_socket: PathBuf,
@@ -42,6 +47,10 @@ struct Args {
 impl Args {
     fn parse() -> Result<Self, String> {
         let mut model = None;
+        let mut model_sha256 = None;
+        let mut model_len = None;
+        let mut model_mtime_secs = None;
+        let mut model_mtime_nanos = None;
         let mut pci_bus_id = None;
         let mut ring = None;
         let mut control_socket = None;
@@ -55,6 +64,27 @@ impl Args {
             };
             match flag.as_str() {
                 "--model" => model = Some(PathBuf::from(value()?)),
+                "--model-sha256" => model_sha256 = Some(value()?),
+                "--model-len" => {
+                    let raw = value()?;
+                    model_len = Some(
+                        raw.parse::<u64>()
+                            .map_err(|error| format!("invalid --model-len {raw:?}: {error}"))?,
+                    );
+                }
+                "--model-mtime-secs" => {
+                    let raw = value()?;
+                    model_mtime_secs =
+                        Some(raw.parse::<u64>().map_err(|error| {
+                            format!("invalid --model-mtime-secs {raw:?}: {error}")
+                        })?);
+                }
+                "--model-mtime-nanos" => {
+                    let raw = value()?;
+                    model_mtime_nanos = Some(raw.parse::<u32>().map_err(|error| {
+                        format!("invalid --model-mtime-nanos {raw:?}: {error}")
+                    })?);
+                }
                 "--pci-bdf" => pci_bus_id = Some(value()?),
                 "--ring" => ring = Some(PathBuf::from(value()?)),
                 "--control-socket" => control_socket = Some(PathBuf::from(value()?)),
@@ -72,7 +102,7 @@ impl Args {
                 }
                 "--help" | "-h" => {
                     return Err(
-                        "usage: deepseek4-harmonic-expert-worker --model PATH --pci-bdf 0000:BB:DD.F --ring PATH --control-socket PATH --generation N --first-epoch N"
+                        "usage: deepseek4-harmonic-expert-worker --model PATH --model-sha256 HEX --model-len N --model-mtime-secs N --model-mtime-nanos N --pci-bdf 0000:BB:DD.F --ring PATH --control-socket PATH --generation N --first-epoch N"
                             .to_owned(),
                     );
                 }
@@ -90,6 +120,12 @@ impl Args {
         }
         Ok(Self {
             model: model.ok_or_else(|| "missing --model".to_owned())?,
+            model_sha256: model_sha256.ok_or_else(|| "missing --model-sha256".to_owned())?,
+            model_len: model_len.ok_or_else(|| "missing --model-len".to_owned())?,
+            model_mtime_secs: model_mtime_secs
+                .ok_or_else(|| "missing --model-mtime-secs".to_owned())?,
+            model_mtime_nanos: model_mtime_nanos
+                .ok_or_else(|| "missing --model-mtime-nanos".to_owned())?,
             pci_bus_id: pci_bus_id.ok_or_else(|| "missing --pci-bdf".to_owned())?,
             ring: ring.ok_or_else(|| "missing --ring".to_owned())?,
             control_socket: control_socket.ok_or_else(|| "missing --control-socket".to_owned())?,
@@ -331,7 +367,13 @@ fn run(args: &Args, control: &mut UnixStream) -> Result<(), String> {
             phase: "verify_model".to_owned(),
         },
     )?;
-    let artifact = DeepseekV4VerifiedArtifact::verify(&args.model)?;
+    let artifact = DeepseekV4VerifiedArtifact::accept_parent_receipt(&DeepseekV4ArtifactReceipt {
+        canonical_path: args.model.clone(),
+        len: args.model_len,
+        modified_unix_secs: args.model_mtime_secs,
+        modified_subsec_nanos: args.model_mtime_nanos,
+        sha256: args.model_sha256.clone(),
+    })?;
 
     let mut ring = open_ring(&args.ring)?;
     let contract = ring.contract();

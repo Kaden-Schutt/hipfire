@@ -26,7 +26,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::harmonic::HarmonicOwner;
 use crate::harmonic_ipc::HarmonicSharedRing;
-use crate::heterogeneous::MQ2R_0731_SHA256;
+use crate::heterogeneous::{
+    DeepseekV4ArtifactReceipt, DeepseekV4VerifiedArtifact, MQ2R_0731_SHA256,
+};
 
 const CONTROL_LINE_LIMIT: usize = 16 * 1024;
 
@@ -75,6 +77,7 @@ pub struct HarmonicExpertWorkerReady {
 pub struct HarmonicExpertWorkerSpec {
     pub executable: PathBuf,
     pub model: PathBuf,
+    pub artifact_receipt: DeepseekV4ArtifactReceipt,
     pub pci_bus_id: String,
     pub ring: PathBuf,
     pub control_socket: PathBuf,
@@ -101,6 +104,17 @@ impl HarmonicExpertWorkerSpec {
                 "harmonic expert model is not a file: {}",
                 self.model.display()
             ));
+        }
+        let accepted = DeepseekV4VerifiedArtifact::accept_parent_receipt(&self.artifact_receipt)?;
+        if accepted.path()
+            != self.model.canonicalize().map_err(|error| {
+                format!(
+                    "harmonic expert canonicalize {}: {error}",
+                    self.model.display()
+                )
+            })?
+        {
+            return Err("harmonic expert model does not match its parent receipt".to_owned());
         }
         if !self.ring.is_file() {
             return Err(format!(
@@ -194,6 +208,14 @@ impl HarmonicExpertWorkerProcess {
         let child = Command::new(&spec.executable)
             .arg("--model")
             .arg(&spec.model)
+            .arg("--model-sha256")
+            .arg(&spec.artifact_receipt.sha256)
+            .arg("--model-len")
+            .arg(spec.artifact_receipt.len.to_string())
+            .arg("--model-mtime-secs")
+            .arg(spec.artifact_receipt.modified_unix_secs.to_string())
+            .arg("--model-mtime-nanos")
+            .arg(spec.artifact_receipt.modified_subsec_nanos.to_string())
             .arg("--pci-bdf")
             .arg(&spec.pci_bus_id)
             .arg("--ring")

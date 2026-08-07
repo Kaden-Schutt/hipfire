@@ -9,7 +9,7 @@
 //! single-device or homogeneous multi-GPU loaders.
 
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use hip_bridge::{DeviceBuffer, Event, HipRuntime, Stream};
 use hipfire_config::{Deepseek4ComputePlacement, DeviceSelector};
@@ -46,6 +46,19 @@ pub struct DeepseekV4VerifiedArtifact {
     path: PathBuf,
     len: u64,
     modified: SystemTime,
+    pub sha256: String,
+}
+
+/// Process-transferable proof that the parent already performed the expensive
+/// full-artifact SHA scan. A child accepts this receipt only while the exact
+/// canonical file, length, and nanosecond mtime are unchanged and the digest
+/// equals the frozen MQ2R 0731 identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeepseekV4ArtifactReceipt {
+    pub canonical_path: PathBuf,
+    pub len: u64,
+    pub modified_unix_secs: u64,
+    pub modified_subsec_nanos: u32,
     pub sha256: String,
 }
 
@@ -95,6 +108,66 @@ impl DeepseekV4VerifiedArtifact {
             return Err("deepseek4 verified artifact changed after identity scan".into());
         }
         Ok(self.sha256.clone())
+    }
+
+    pub fn receipt(&self) -> Result<DeepseekV4ArtifactReceipt, String> {
+        let modified = self
+            .modified
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| "deepseek4 verified artifact mtime predates Unix epoch".to_owned())?;
+        Ok(DeepseekV4ArtifactReceipt {
+            canonical_path: self.path.clone(),
+            len: self.len,
+            modified_unix_secs: modified.as_secs(),
+            modified_subsec_nanos: modified.subsec_nanos(),
+            sha256: self.sha256.clone(),
+        })
+    }
+
+    /// Reconstitute a verified artifact in a child process without rescanning
+    /// all 77+ GiB. The parent supplied the fixed digest only after its full
+    /// scan; this method proves the named file has not changed since then.
+    pub fn accept_parent_receipt(receipt: &DeepseekV4ArtifactReceipt) -> Result<Self, String> {
+        if receipt.sha256 != MQ2R_0731_SHA256 {
+            return Err(format!(
+                "deepseek4 parent receipt SHA mismatch: got {}, expected {MQ2R_0731_SHA256}",
+                receipt.sha256
+            ));
+        }
+        let path = receipt.canonical_path.canonicalize().map_err(|error| {
+            format!(
+                "deepseek4 receipt canonicalize {}: {error}",
+                receipt.canonical_path.display()
+            )
+        })?;
+        if path != receipt.canonical_path {
+            return Err(format!(
+                "deepseek4 receipt path is not canonical: {} != {}",
+                receipt.canonical_path.display(),
+                path.display()
+            ));
+        }
+        let metadata = path
+            .metadata()
+            .map_err(|error| format!("deepseek4 receipt metadata {}: {error}", path.display()))?;
+        let modified = metadata
+            .modified()
+            .map_err(|error| format!("deepseek4 receipt mtime {}: {error}", path.display()))?;
+        let expected_modified = UNIX_EPOCH
+            .checked_add(Duration::new(
+                receipt.modified_unix_secs,
+                receipt.modified_subsec_nanos,
+            ))
+            .ok_or_else(|| "deepseek4 parent receipt mtime overflow".to_owned())?;
+        if metadata.len() != receipt.len || modified != expected_modified {
+            return Err("deepseek4 artifact changed after parent identity scan".to_owned());
+        }
+        Ok(Self {
+            path,
+            len: receipt.len,
+            modified,
+            sha256: receipt.sha256.clone(),
+        })
     }
 
     pub fn path(&self) -> &Path {
@@ -921,6 +994,40 @@ impl Drop for DeepseekV4HeterogeneousModel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parent_artifact_receipt_reuses_identity_and_rejects_file_change() {
+        let path = std::env::temp_dir().join(format!(
+            "hipfire-ds4-artifact-receipt-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, b"verified-parent-artifact").unwrap();
+        let canonical = path.canonicalize().unwrap();
+        let metadata = canonical.metadata().unwrap();
+        let artifact = DeepseekV4VerifiedArtifact {
+            path: canonical,
+            len: metadata.len(),
+            modified: metadata.modified().unwrap(),
+            sha256: MQ2R_0731_SHA256.to_owned(),
+        };
+        let receipt = artifact.receipt().unwrap();
+        let accepted = DeepseekV4VerifiedArtifact::accept_parent_receipt(&receipt).unwrap();
+        assert_eq!(accepted.path(), artifact.path());
+        assert_eq!(accepted.sha256, MQ2R_0731_SHA256);
+
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(metadata.len() + 1)
+            .unwrap();
+        assert!(DeepseekV4VerifiedArtifact::accept_parent_receipt(&receipt).is_err());
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn harmonic_quarantine_is_stable_and_actionable() {

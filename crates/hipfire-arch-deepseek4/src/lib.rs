@@ -102,7 +102,7 @@ pub use harmonic_process::{
 };
 pub use harmonic_worker::DeepseekV4HarmonicExpertService;
 pub use heterogeneous::{
-    ensure_harmonic_execution_admitted, DeepseekV4HeterogeneousLoadPlan,
+    ensure_harmonic_execution_admitted, DeepseekV4ArtifactReceipt, DeepseekV4HeterogeneousLoadPlan,
     DeepseekV4HeterogeneousLoadReport, DeepseekV4HeterogeneousModel, DeepseekV4VerifiedArtifact,
     HARMONIC_EXECUTION_QUARANTINE,
 };
