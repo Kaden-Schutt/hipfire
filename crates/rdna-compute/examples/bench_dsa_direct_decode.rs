@@ -80,7 +80,7 @@ fn launch_split(
     gpu.launch_kernel_blob(
         SPLIT_PARTIAL,
         [heads as u32, n_chunks as u32, 1],
-        [256, 1, 1],
+        [chunk_size as u32, 1, 1],
         0,
         partial.as_mut_slice(),
     )
