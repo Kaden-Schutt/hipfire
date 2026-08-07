@@ -4154,7 +4154,7 @@ impl Gpu {
         self.fused_rmsnorm_rotate_mq_plain_with_policy(x, weight, x_rot, x_plain, k, eps, false)
     }
 
-    /// DeepSeek4-only sibling whose accepted gfx1151 route pins the no-XOR
+    /// DeepSeek4-only sibling whose admitted wave32 routes pin the no-XOR
     /// reduction. Keeping the policy argument off the generic method prevents
     /// Qwen/MiniMax from inheriting a loaded DS4 model's route.
     pub fn deepseek4_fused_rmsnorm_rotate_mq_plain(
@@ -4165,7 +4165,7 @@ impl Gpu {
         x_plain: &GpuTensor,
         k: usize,
         eps: f32,
-        deepseek4_gfx1151_route: bool,
+        deepseek4_wave32_route: bool,
     ) -> HipResult<()> {
         self.fused_rmsnorm_rotate_mq_plain_with_policy(
             x,
@@ -4174,7 +4174,7 @@ impl Gpu {
             x_plain,
             k,
             eps,
-            deepseek4_gfx1151_route,
+            deepseek4_wave32_route,
         )
     }
 
@@ -4186,11 +4186,11 @@ impl Gpu {
         x_plain: &GpuTensor,
         k: usize,
         eps: f32,
-        deepseek4_gfx1151_route: bool,
+        deepseek4_wave32_route: bool,
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_mq_signs()?;
-        let nox = self.arch == "gfx1151" && deepseek4_gfx1151_route;
+        let nox = matches!(self.arch.as_str(), "gfx1151" | "gfx1201") && deepseek4_wave32_route;
         let symbol = if nox {
             "fused_rmsnorm_mq_rotate_plain_nox"
         } else {

@@ -318,6 +318,11 @@ mod config_cache {
     pub(super) fn gfx1201_e8_wo_grouped_on(arch: &str, mq2r: bool) -> bool {
         arch == "gfx1201" && mq2r
     }
+    /// Exact-gfx1201 MQ2R admission for the DeepSeek-only low-LDS fused
+    /// RMSNorm + FWHT path. Adjacent models still call the generic method.
+    pub(super) fn gfx1201_rmsnorm_rotate_nox_on(arch: &str, mq2r: bool) -> bool {
+        arch == "gfx1201" && mq2r
+    }
     /// `HIPFIRE_DEEPSEEK4_GFX942_COMPRESSOR_GATE` — host-gate non-commit
     /// compressor commit-stage launches on exact `gfx942` MQ2R ordinary HIP.
     /// Default OFF; set `=1` to enable. Forced off during hipGraph capture
@@ -6528,7 +6533,8 @@ fn ffn_prepare(
             ffn_x_plain,
             cfg.hidden_size,
             cfg.rms_norm_eps,
-            weights.mq2r_backend.is_gfx1151(),
+            weights.mq2r_backend.is_gfx1151()
+                || config_cache::gfx1201_rmsnorm_rotate_nox_on(&gpu.arch, cfg.mq2r),
         )
         .map_err(|e| format!("fused_rmsnorm_rotate_mq_plain ffn layer {layer_idx}: {e:?}"))?;
     } else {
@@ -7400,7 +7406,8 @@ fn ffn_hash_routed(
             cfg.hidden_size,
             im,
             k_top,
-            weights.mq2r_backend.is_gfx1151(),
+            weights.mq2r_backend.is_gfx1151()
+                || config_cache::gfx1201_rmsnorm_rotate_nox_on(&gpu.arch, cfg.mq2r),
         )
         .map_err(|e| format!("fused down hash l{layer_idx}: {e:?}"))?;
     }
@@ -15666,6 +15673,16 @@ mod tests {
         assert!(!config_cache::gfx1201_e8_wo_grouped_on("gfx1201", false));
         assert!(!config_cache::gfx1201_e8_wo_grouped_on("gfx1151", true));
         assert!(!config_cache::gfx1201_e8_wo_grouped_on("gfx942", true));
+        assert!(config_cache::gfx1201_rmsnorm_rotate_nox_on("gfx1201", true));
+        assert!(!config_cache::gfx1201_rmsnorm_rotate_nox_on(
+            "gfx1201", false
+        ));
+        assert!(!config_cache::gfx1201_rmsnorm_rotate_nox_on(
+            "gfx1151", true
+        ));
+        assert!(!config_cache::gfx1201_rmsnorm_rotate_nox_on(
+            "gfx1100", true
+        ));
     }
 
     #[test]
