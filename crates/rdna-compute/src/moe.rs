@@ -977,6 +977,75 @@ impl Gpu {
             },
         )
     }
+    pub fn deepseek4_topk_kv_gather_batched_tiled_gfx1201(
+        &mut self,
+        kv_cache: &GpuTensor, // [N_compressed, head_dim] shared
+        topk_idx: &GpuTensor, // [B, K] i32
+        out: &GpuTensor,      // [B, head_dim, out_stride]
+        k_active: i32,
+        head_dim: i32,
+        n_compressed: i32,
+        out_stride: i32,
+        col_offset: i32,
+        scale: f32,
+        batch_size: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        debug_assert!(self.arch.eq_ignore_ascii_case("gfx1201"));
+        let kernel_name = "deepseek4_topk_kv_gather_batched_tiled_gfx1201";
+        self.ensure_kernel(
+            kernel_name,
+            kernels::V4F_TOPK_KV_GATHER_BATCHED_TILED_GFX1201_SRC,
+            kernel_name,
+        )?;
+        let cp = kv_cache.buf.as_ptr();
+        let ip = topk_idx.buf.as_ptr();
+        let op = out.buf.as_ptr();
+        let mut k = k_active;
+        let mut hd = head_dim;
+        let mut nc = n_compressed;
+        let mut os = out_stride;
+        let mut co = col_offset;
+        let mut sc = scale;
+        let mut bs = batch_size;
+        let mut params: Vec<*mut c_void> = vec![
+            &cp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &mut k as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut nc as *mut _ as *mut c_void,
+            &mut os as *mut _ as *mut c_void,
+            &mut co as *mut _ as *mut c_void,
+            &mut sc as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            kernel_name,
+            [
+                ((k_active + 31) / 32) as u32,
+                ((head_dim + 31) / 32) as u32,
+                batch_size as u32,
+            ],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(cp);
+                b.push_ptr(ip);
+                b.push_ptr(op);
+                b.push_i32(k);
+                b.push_i32(hd);
+                b.push_i32(nc);
+                b.push_i32(os);
+                b.push_i32(co);
+                b.push_f32(sc);
+                b.push_i32(bs);
+                b
+            },
+        )
+    }
     pub fn deepseek4_topk_kv_gather_f32_buf(
         &mut self,
         kv_cache: &GpuTensor,

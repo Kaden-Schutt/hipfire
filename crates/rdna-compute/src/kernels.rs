@@ -5496,6 +5496,8 @@ pub const COPY_F32_BUFFER_SRC: &str = include_str!("../../../kernels/src/copy_f3
 /// `[B, head_dim, out_stride]` buffer fed to deepseek4_attn_swa_topk_batched.
 pub const V4F_TOPK_KV_GATHER_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/deepseek4_topk_kv_gather_batched.hip");
+pub const V4F_TOPK_KV_GATHER_BATCHED_TILED_GFX1201_SRC: &str =
+    include_str!("../../../kernels/src/deepseek4_topk_kv_gather_batched_tiled.gfx1201.hip");
 
 /// DeepSeek V4 indexer score — BATCHED (Phase B2, 2026-05-18). Per-batch
 /// score against the shared compressed-K cache.
