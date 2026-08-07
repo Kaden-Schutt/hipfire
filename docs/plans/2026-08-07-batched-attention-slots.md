@@ -693,6 +693,17 @@ Null descriptor = legacy mode, verified bitwise identical."
 
 ### Task 5: Port `attention_flash_q8_0_tile_batched` and the shared launcher
 
+> **Invariant surfaced by the Task 4 review — `desc.seq_len <= launch-wide seq_len`.**
+> The ported kernels use the slot's own `desc.seq_len` for loop bounds but keep
+> LDS slice pointers on the launch-wide value, so per-row scratch stays inside
+> its allocation. That split is only safe while `desc.seq_len <= seq_len`. If a
+> descriptor ever reports a longer length than the launch was sized for,
+> `scores[t]` writes land in the `workspace`/`q_shared` region and corrupt that
+> row's own reduction — silently, with no crash. Task 4 could not exercise this
+> (all its call sites pass null). **Any task that passes real descriptors must
+> either enforce this invariant at the launcher or cover it with a test where a
+> slot's `seq_len` differs from `positions[b] + 1`.**
+
 > **Header inclusion — read before editing any `.hip` file.** Kernels are
 > compiled at **runtime** by `hipcc` in a cache directory with **no `-I` to
 > `kernels/src`**, so a literal `#include "kv_slot_desc.h"` does not resolve.
@@ -955,6 +966,17 @@ tile_qbase (global flat row, for q/out indexing)."
 ---
 
 ### Task 7: Correctness harness — golden, isolation, adversarial shapes
+
+> **Invariant surfaced by the Task 4 review — `desc.seq_len <= launch-wide seq_len`.**
+> The ported kernels use the slot's own `desc.seq_len` for loop bounds but keep
+> LDS slice pointers on the launch-wide value, so per-row scratch stays inside
+> its allocation. That split is only safe while `desc.seq_len <= seq_len`. If a
+> descriptor ever reports a longer length than the launch was sized for,
+> `scores[t]` writes land in the `workspace`/`q_shared` region and corrupt that
+> row's own reduction — silently, with no crash. Task 4 could not exercise this
+> (all its call sites pass null). **Any task that passes real descriptors must
+> either enforce this invariant at the launcher or cover it with a test where a
+> slot's `seq_len` differs from `positions[b] + 1`.**
 
 The gate for the whole sub-project. Spec §9.
 
