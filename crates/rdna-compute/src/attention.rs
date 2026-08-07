@@ -8664,18 +8664,20 @@ impl Gpu {
         post_scale: f32,
         sinkhorn_iters: i32,
         rsqrt_once: bool,
+        prefer_t1024: bool,
     ) -> HipResult<()> {
         self.bind_thread()?;
         // `HIPFIRE_HC_CTRL_T1024=1` selects the 1024-thread variant. See
         // `kernels::HC_COMPUTE_CONTROL_T1024_SRC` — same algorithm, wider
         // block, NOT bit-exact (the LDS partial tree widens 8 -> 32).
         static T1024: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let t1024 = *T1024.get_or_init(|| {
-            hipfire_config::developer_var("HIPFIRE_HC_CTRL_T1024")
-                .ok()
-                .as_deref()
-                == Some("1")
-        });
+        let t1024 = prefer_t1024
+            || *T1024.get_or_init(|| {
+                hipfire_config::developer_var("HIPFIRE_HC_CTRL_T1024")
+                    .ok()
+                    .as_deref()
+                    == Some("1")
+            });
         let (logical_name, src, threads) = if t1024 {
             (
                 "hc_compute_control_vec4_finalize_t1024",

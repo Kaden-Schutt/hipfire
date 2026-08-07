@@ -8629,6 +8629,7 @@ fn mhc_pre(
             post_scale,
             cfg.hc_sinkhorn_iters as i32,
             control_rsqrt_once,
+            false,
         )
         .map_err(|e| format!("hc_compute_control_vec4_finalize layer {layer_idx}: {e:?}"))?;
     } else {
