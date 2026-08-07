@@ -26,7 +26,9 @@
   // Copyright (c) 2026 Nick Woolmer
   // hipfire — see LICENSE and NOTICE in the project root.
   ```
-- **Build check after every Rust change:** `cargo build --release -p rdna-compute`.
+- **Always pass `--features deltanet`.** Every cargo command in this plan carries it. Both target models are DeltaNet hybrids, and more immediately: `cargo test -p rdna-compute` **cannot build without it** on `beta`. The example `rope_compact_offset_check` calls `rope_partial_interleaved_f32{,_batched}`, which are `#[cfg(feature = "deltanet")]` (`crates/rdna-compute/src/norm.rs:711` and `:966`), but the crate declares no `required-features` for it.
+- **That example breakage is PRE-EXISTING on `origin/beta` and is NOT ours to fix.** Do not "repair" it, do not add `required-features`, do not edit `rope_compact_offset_check`. If you see four `E0599: no method named rope_partial_interleaved_f32...` errors, you dropped `--features deltanet`. Verified baseline **with** the flag: `118 passed, 0 failed, 1 ignored`.
+- **Build check after every Rust change:** `cargo build --release -p rdna-compute --features deltanet`.
 - **Commit after every task.** No task may be left half-committed.
 
 ## File Structure
@@ -212,19 +214,19 @@ fn main() {
 
 - [ ] **Step 2: Verify it compiles**
 
-Run: `cargo build --release -p rdna-compute --example probe_batching_ceiling`
+Run: `cargo build --release -p rdna-compute --features deltanet --example probe_batching_ceiling`
 Expected: compiles clean. The `Gpu` API used here is `upload_f32`, `upload_raw`, `zeros`, and `gpu.hip.device_synchronize()` — there is no `alloc_tensor` for zeroed buffers, no `upload_i32`, and no `Gpu::synchronize`. `crates/rdna-compute/examples/q8_batched_attn_microbench.rs` is the reference idiom.
 
 - [ ] **Step 3: Run the probe**
 
-Run: `cargo run --release -p rdna-compute --example probe_batching_ceiling`
+Run: `cargo run --release -p rdna-compute --features deltanet --example probe_batching_ceiling`
 Expected: four `ctx=... median_ms=...` lines with monotonically increasing times, then a fit line with positive `a` and positive `b`.
 
 If `b` comes out near zero or negative, the measurement is broken — most likely the kernel is not actually reading the full context. Do not proceed; investigate first.
 
 - [ ] **Step 4: Run for the 27B shape**
 
-Run: `NH=24 NKV=4 HD=256 LAYERS=16 cargo run --release -p rdna-compute --example probe_batching_ceiling`
+Run: `NH=24 NKV=4 HD=256 LAYERS=16 cargo run --release -p rdna-compute --features deltanet --example probe_batching_ceiling`
 Expected: a noticeably steeper `b` than the 35B shape — the 27B moves 32 KB/token against the 35B's 10 KB.
 
 - [ ] **Step 5: Write the results note**
@@ -441,7 +443,7 @@ mod tests {
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `cargo test -p rdna-compute kv_slots`
+Run: `cargo test --release -p rdna-compute --features deltanet kv_slots`
 Expected: FAIL — `tiles_never_span_a_slot` and the others fail on empty vectors returned by the stub.
 
 - [ ] **Step 3: Write the implementation**
@@ -525,7 +527,7 @@ pub mod kv_slots;
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
-Run: `cargo test -p rdna-compute kv_slots`
+Run: `cargo test --release -p rdna-compute --features deltanet kv_slots`
 Expected: PASS, 7 tests.
 
 - [ ] **Step 5: Commit**
@@ -651,17 +653,17 @@ Then keep the original entry point as a thin delegate:
 
 - [ ] **Step 4: Build**
 
-Run: `cargo build --release -p rdna-compute`
+Run: `cargo build --release -p rdna-compute --features deltanet`
 Expected: compiles clean, no changes needed at any existing call site.
 
 - [ ] **Step 5: Verify legacy mode is bitwise identical**
 
-Run: `cargo run --release -p rdna-compute --example test_q8_flash_prefill`
+Run: `cargo run --release -p rdna-compute --features deltanet --example test_q8_flash_prefill`
 Expected: same pass output as on a clean `origin/beta` checkout. Capture both and compare:
 
 ```bash
-git stash && cargo run --release -p rdna-compute --example test_q8_flash_prefill > /tmp/before.txt 2>&1; git stash pop
-cargo run --release -p rdna-compute --example test_q8_flash_prefill > /tmp/after.txt 2>&1
+git stash && cargo run --release -p rdna-compute --features deltanet --example test_q8_flash_prefill > /tmp/before.txt 2>&1; git stash pop
+cargo run --release -p rdna-compute --features deltanet --example test_q8_flash_prefill > /tmp/after.txt 2>&1
 diff /tmp/before.txt /tmp/after.txt && echo BITWISE_IDENTICAL
 ```
 Expected: `BITWISE_IDENTICAL`.
@@ -794,8 +796,8 @@ Match the exact argument order of the existing `attention_flash_q8_0_batched_mas
 
 Run:
 ```bash
-cargo build --release -p rdna-compute
-cargo run --release -p rdna-compute --example q8_batched_attn_microbench > /tmp/mb_after.txt 2>&1
+cargo build --release -p rdna-compute --features deltanet
+cargo run --release -p rdna-compute --features deltanet --example q8_batched_attn_microbench > /tmp/mb_after.txt 2>&1
 ```
 Expected: builds clean; the microbench still runs and reports both arms.
 
@@ -891,15 +893,15 @@ Use `qbase` for every `q`/`out` offset and `row0` only where the query's positio
 
 Add `Gpu::attention_q8_0_flash_prefill_slots(...)` taking trailing `slot_descs`, `tile_slot`, `tile_row0`, `tile_qbase` as `Option<&GpuTensor>`, with the existing `attention_q8_0_flash_prefill` delegating with four `None`s. The grid becomes `[n_tiles, n_heads]` where `n_tiles = tile_slot.len()` in multi-slot mode and `batch_size.div_ceil(br)` in legacy mode.
 
-Run: `cargo test -p rdna-compute kv_slots`
+Run: `cargo test --release -p rdna-compute --features deltanet kv_slots`
 Expected: PASS, 7 tests (unchanged from Task 3 — this task adds no new host-side tests).
 
 - [ ] **Step 5: Build and check legacy prefill is unchanged**
 
 Run:
 ```bash
-cargo build --release -p rdna-compute
-cargo run --release -p rdna-compute --example test_q8_flash_prefill > /tmp/after6.txt 2>&1
+cargo build --release -p rdna-compute --features deltanet
+cargo run --release -p rdna-compute --features deltanet --example test_q8_flash_prefill > /tmp/after6.txt 2>&1
 diff /tmp/before.txt /tmp/after6.txt && echo LEGACY_UNCHANGED
 ```
 Expected: `LEGACY_UNCHANGED` against the Task 4 Step 5 baseline.
@@ -1097,7 +1099,7 @@ assert!(
 
 - [ ] **Step 5: Run the harness**
 
-Run: `cargo run --release -p rdna-compute --example test_batched_attn_slots`
+Run: `cargo run --release -p rdna-compute --features deltanet --example test_batched_attn_slots`
 Expected: every shape prints `OK` for golden and isolation on both KV modes, then a final `ALL SHAPES PASS` line.
 
 The most likely failure is the Task 5 global-row bug: correct at small batch, wrong once `partials` capacity forces sub-batching. If isolation fails only at larger `n_slots`, look there first.
@@ -1327,7 +1329,7 @@ Run:
 ```bash
 for ts in 64 128 256; do
   echo "=== TILE_SIZE=$ts ==="
-  HIPFIRE_ATTN_TILE_SIZE=$ts cargo run --release -p rdna-compute --example q8_batched_attn_microbench
+  HIPFIRE_ATTN_TILE_SIZE=$ts cargo run --release -p rdna-compute --features deltanet --example q8_batched_attn_microbench
 done
 ```
 Expected: batched beats sequential at every `n_slots >= 2`. Per spec §2 criterion 2, a regression against the sequential baseline is a failure, not a tuning outcome.
