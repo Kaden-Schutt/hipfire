@@ -216,3 +216,64 @@ shape and ~4% for the 27B shape (larger jitter attributable to more `layers`
 × larger per-layer bytes amplifying the same relative timer noise across a
 4-point fit). `a` stayed small and negative in all four runs. See the raw
 tables above for both runs' `median_ms` values.
+
+---
+
+## Addendum: achieved memory bandwidth — the actionable finding
+
+Neither the probe's own output nor the verdict above computed what the kernel
+actually achieves against the memory bus. Doing so changes the conclusion, so
+it is recorded here.
+
+Bytes moved per timed iteration are exactly known: `layers × ctx ×
+n_kv_heads × (head_dim/32) × 34 × 2` (K and V, Q8_0 = 34 B per 32 values).
+
+| shape | ctx | KV read | time | achieved | % of 256 GB/s |
+|---|---|---|---|---|---|
+| 35B-A3B | 4,096 | 44.6 MB | 0.914 ms | 48.8 GB/s | 19.0% |
+| 35B-A3B | 16,384 | 178.3 MB | 2.888 ms | 61.7 GB/s | 24.1% |
+| 35B-A3B | 32,768 | 356.5 MB | 6.797 ms | 52.5 GB/s | 20.5% |
+| 35B-A3B | 65,536 | 713.0 MB | 14.146 ms | 50.4 GB/s | 19.7% |
+| 27B | 4,096 | 142.6 MB | 1.661 ms | 85.9 GB/s | 33.5% |
+| 27B | 16,384 | 570.4 MB | 7.774 ms | 73.4 GB/s | 28.7% |
+| 27B | 32,768 | 1140.9 MB | 14.897 ms | 76.6 GB/s | 29.9% |
+| 27B | 65,536 | 2281.7 MB | 31.222 ms | 73.1 GB/s | 28.5% |
+
+**At batch 1 the attention kernel sustains roughly 20-24% (35B shape) and
+28-34% (27B shape) of the 256 GB/s bus.** Crucially the figure is *flat*
+across a 16× context range. If this were launch or fixed-overhead bound,
+utilisation would climb with context; it does not. This is a sustained
+kernel-efficiency ceiling at batch 1, not a small-size artifact.
+
+### Why this matters more than the fit
+
+Spec §8 argues that KV reads "never amortise across slots" and therefore cap
+the batching win. That is true in **bytes** and false in **time**. Four slots
+must read 4× the KV bytes — but at batch 1 we are 3-5× below the roofline, so
+those 4× bytes need not cost 4× the time. Batching supplies exactly what a
+memory system needs to close such a gap: more independent requests in flight.
+
+This makes spec §8's estimate **pessimistic about the attention term**, and it
+raises rather than lowers the expected value of SP1. It converts the central
+question from "how much does the non-amortising KV term erode the win" into a
+measurable one: **how much of that 3-5× headroom does batching recover?**
+Task 8's batched-vs-sequential sweep answers it directly.
+
+### It also explains the 2.2× vs 3.2× slope shortfall
+
+The 27B shape moves 3.2× the KV bytes per token of the 35B shape but its
+fitted slope is only ~2.2× steeper. The bandwidth table shows why: the 27B
+shape runs at ~29% utilisation against the 35B's ~20%, because `n_kv_heads=4`
+vs `2` gives each workgroup more contiguous KV per position. Being closer to
+the roofline, its extra bytes cost proportionally less time. The two
+observations are the same fact seen twice, and the earlier "more parallel work
+per KV tile" hypothesis is confirmed by the numbers.
+
+### Caveat on the denominator
+
+256 GB/s is the Ryzen AI Max+ 395's theoretical LPDDR5X-8000 figure. The iGPU
+cannot necessarily reach it. A BabelStream run (`~/repos/BabelStream`) would
+pin the achievable ceiling and turn these percentages from indicative into
+exact. Until then, read them as "far below roofline", not as precise
+efficiency figures. The flatness across context is the robust part and does
+not depend on the denominator.
