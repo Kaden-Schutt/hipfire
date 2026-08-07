@@ -10759,22 +10759,6 @@ fn wo_per_group_batched_e8_fallback(
             (batch_size * n_groups * per_group_in) as i64,
         )
         .map_err(|e| format!("convert_f32_to_f16 (gfx1201 grouped E8 WMMA): {e:?}"))?;
-        let screen_b32 = batch_size == 1024
-            && hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_GFX1201_GROUPED_E8_B32").as_deref()
-                == Ok("1");
-        if screen_b32 {
-            return gpu
-                .gemm_mfp4g32_e8_soa_grouped_wmma_b32_gfx1201_f16(
-                    wo_a,
-                    scratch,
-                    y_batch,
-                    n_groups,
-                    rank,
-                    per_group_in,
-                    batch_size,
-                )
-                .map_err(|e| format!("grouped gfx1201 E8 O-LoRA A B32: {e:?}"));
-        }
         return gpu
             .gemm_mfp4g32_e8_soa_grouped_wmma_gfx1201_f16(
                 wo_a,

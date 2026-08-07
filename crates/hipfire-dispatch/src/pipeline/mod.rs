@@ -1512,16 +1512,6 @@ fn use_gfx1151_i8_moe(arch: &str) -> bool {
     arch == "gfx1151"
 }
 
-/// Pre-promotion switch for the gfx1201 M128 grouped-MQ2 product screen.
-/// This is deliberately opt-in until the full serve harness clears the
-/// product gate; accepted behavior is promoted to an automatic exact-arch,
-/// full-chunk route in the follow-up commit.
-fn screen_gfx1201_mq2_m128(arch: &str, batch_size: usize) -> bool {
-    arch.eq_ignore_ascii_case("gfx1201")
-        && batch_size == 1024
-        && hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_GFX1201_MQ2_M128").as_deref() == Ok("1")
-}
-
 fn use_gfx1151_i8_moe_perm() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
@@ -1765,8 +1755,7 @@ pub fn run_moe_prefill_bias_aware(
     let arch_4w = gpu.arch.starts_with("gfx11") || gpu.arch.starts_with("gfx12");
     let n32 = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MOE_N32").as_deref() == Ok("1");
     let cnd = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MOE_CND").as_deref() == Ok("1");
-    let eightw = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MOE_8W").as_deref() == Ok("1")
-        || screen_gfx1201_mq2_m128(&gpu.arch, batch_size);
+    let eightw = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MOE_8W").as_deref() == Ok("1");
     let mmqload_env =
         hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MOE_MMQLOAD").as_deref() == Ok("1");
     let nosync_env =
