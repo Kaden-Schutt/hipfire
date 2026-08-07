@@ -3,6 +3,7 @@
 // hipfire — occurrence-weighted gfx1100 E8 two-pair VMEM-window screen.
 
 use rdna_compute::{DType, Gpu, GpuTensor};
+use redline_rocr::Runtime;
 
 const CACHE_BYTES: usize = 96 * 1024 * 1024;
 const SAMPLES: usize = 7;
@@ -97,8 +98,30 @@ fn median(values: &mut [f64]) -> f64 {
     values[values.len() / 2]
 }
 
+fn unique_gfx1100() -> Gpu {
+    let runtime = Runtime::initialize(redline_rocr::load_symbols().expect("load ROCr symbols"))
+        .expect("initialize ROCr");
+    let matches: Vec<_> = runtime
+        .gpu_devices()
+        .expect("enumerate ROCr GPUs")
+        .into_iter()
+        .filter(|device| device.name().eq_ignore_ascii_case("gfx1100"))
+        .collect();
+    assert_eq!(
+        matches.len(),
+        1,
+        "expected one exact gfx1100 device, found {}",
+        matches.len()
+    );
+    let pci_bus_id = matches[0].pci_bus_id().to_string();
+    let gpu = Gpu::init_with_pci_bus_id(&pci_bus_id, "gfx1100")
+        .expect("bind exact gfx1100 by resolved PCI identity");
+    println!("resolved gfx1100 at {pci_bus_id}");
+    gpu
+}
+
 fn main() {
-    let mut gpu = Gpu::init().expect("Gpu::init");
+    let mut gpu = unique_gfx1100();
     assert_eq!(gpu.arch, "gfx1100", "this micro requires exact gfx1100");
     println!("gfx1100 E8 two-pair VMEM-window full-route screen");
     println!(
@@ -123,14 +146,8 @@ fn main() {
 
         gpu.gemv_mfp4g32_e8_soa_buffer_gfx1100(&buffers[0], &x, &baseline, m, k)
             .expect("baseline correctness launch");
-        gpu.gemv_mfp4g32_e8_soa_prefetch4_buffer_gfx1100(
-            &buffers[0],
-            &x,
-            &candidate,
-            m,
-            k,
-        )
-        .expect("candidate correctness launch");
+        gpu.gemv_mfp4g32_e8_soa_prefetch4_buffer_gfx1100(&buffers[0], &x, &candidate, m, k)
+            .expect("candidate correctness launch");
         gpu.hip.device_synchronize().expect("correctness sync");
         let expected = gpu.download_f32(&baseline).expect("download baseline");
         let observed = gpu.download_f32(&candidate).expect("download candidate");
@@ -143,10 +160,8 @@ fn main() {
         for weight in &buffers {
             gpu.gemv_mfp4g32_e8_soa_buffer_gfx1100(weight, &x, &baseline, m, k)
                 .expect("baseline warmup");
-            gpu.gemv_mfp4g32_e8_soa_prefetch4_buffer_gfx1100(
-                weight, &x, &candidate, m, k,
-            )
-            .expect("candidate warmup");
+            gpu.gemv_mfp4g32_e8_soa_prefetch4_buffer_gfx1100(weight, &x, &candidate, m, k)
+                .expect("candidate warmup");
         }
         gpu.hip.device_synchronize().expect("warmup sync");
 
@@ -161,10 +176,8 @@ fn main() {
             };
             let cand = |gpu: &mut Gpu| {
                 elapsed_us(gpu, &buffers, |gpu, weight| {
-                    gpu.gemv_mfp4g32_e8_soa_prefetch4_buffer_gfx1100(
-                        weight, &x, &candidate, m, k,
-                    )
-                    .expect("timed candidate")
+                    gpu.gemv_mfp4g32_e8_soa_prefetch4_buffer_gfx1100(weight, &x, &candidate, m, k)
+                        .expect("timed candidate")
                 })
             };
             if sample & 1 == 0 {
