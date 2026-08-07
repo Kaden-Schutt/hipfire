@@ -3,8 +3,7 @@
 
 # DS4 harmonic hot-expert residency sizing
 
-Status: **CPU sizing accepted; typed artifact projection implemented; GPU
-execution not started**
+Status: **exact-device micro accepted; split product execution not wired**
 
 Branch: `ds4-beta-staging`
 
@@ -178,6 +177,83 @@ occupancy or spilling. This is still only an ISA/resource mechanism check. It
 does not become product dispatch unless the fresh-device micro proves raw-bit
 identity and an occurrence-weighted projection of at least 2% end to end.
 
+### 4.3 Exact-device complete-branch micro
+
+The fresh-device micro at commit `5fd9d587b` resolved each marketing-name
+selector through live HIP discovery to a PCI identity, then opened only that
+exact device under the GPU lock. The occurrence histograms are the 2,025-slot
+plan's complementary decode distributions from section 4.1.
+
+| Owner and histogram | Gate/up | Activation | Rotation | Down | Complete expert branch |
+|---|---:|---:|---:|---:|---:|
+| gfx1100 local, incumbent down | 31.786 us | 4.252 us | 4.161 us | 27.436 us | 67.635 us/layer |
+| gfx1100 local, LDS down | 31.786 us | 4.252 us | 4.161 us | **16.775 us** | **56.974 us/layer** |
+| gfx1151 remote, incumbent | 36.617 us | 1.990 us | 2.260 us | 29.807 us | **70.675 us/layer** |
+
+Every gfx1100 down shape from local top-k 1 through 6 was raw-bit identical.
+The LDS candidate reduces the complete local expert branch by 18.71%, or
+0.4584 ms/token across 43 layers. Including the fixed 1.6483 ms shared branch,
+the local side falls from 4.5566 to 4.0982 ms/token: an 11.19% fork reduction
+and a 2.15% useful-path projection. It therefore clears the campaign's 2%
+micro admission gate.
+
+The measured effective per-selected-slot architecture ratio is about 2.30x,
+but the product scheduler must use the measured whole-branch histograms rather
+than linearizing that ratio. Under the provisional 2,025-slot plan the local
+branch is now longer than the remote branch, so the final plan must use fewer
+replicas than this provisional set.
+
+Evidence:
+
+| File | SHA-256 |
+|---|---|
+| `gfx1100-complete-micro.txt` | `0f0f86ced7d97ba64a135b18a8f67a3634bcf7e9e48e7227d67f385c7b25c639` |
+| `gfx1151-complete-micro.txt` | `a4de717fde8c7eef446bd82463df563688028ed85627c0f6da0e53934b788f76` |
+
+Both are under:
+
+`hipx:/home/kaden/ds4-gfx1151-evidence/2026-08-07-harmonic-h4-exact-mq2-complete-branch/`
+
+### 4.4 Six-row result transport and revised ceiling
+
+The split route moves the deterministic six-slot combine to gfx1100. Its
+measured cost is 10.741 us/layer = 0.4619 ms/token. A separate page-backed,
+HIP-registered mapping probe at commit `c54cab05d` sized the full 98,304-byte
+DS4HARM3 result without changing the accepted DS4HARM2 ring:
+
+| Exact owner | 16 KiB write | 16 KiB read | 96 KiB write | 96 KiB read |
+|---|---:|---:|---:|---:|
+| gfx1151 | 4.392 us | 4.363 us | **5.805 us** | 5.796 us |
+| gfx1100 | 10.989 us | 9.537 us | 19.863 us | **20.946 us** |
+
+For the direction used by the product, gfx1151 publication is 0.2496 ms/token
+and gfx1100 acquisition is 0.9007 ms/token. The provisional whole-path device
+accounting is therefore:
+
+```text
+serial gfx1100 work before fork       15.3657 ms/token
+max(local 4.0982, remote 3.0390+0.2496) 4.0982
+gfx1100 96 KiB acquire + final combine  1.3625
+device-useful union                    20.8264 ms/token
+device-useful ceiling                   48.016 tok/s
+```
+
+This is not a product ceiling. It deliberately charges the most conservative
+fixed six-row transport. The packet already carries canonical route ownership,
+so the production candidate should send only the packed remote-owned rows and
+have one exact-order split-combine kernel select the packed local or remote row
+for slots 0 through 5. That removes unused mapped bytes without changing one
+FMA. Its occurrence-weighted transport and exact GPU combine are the next
+micro gate. The prior 6.036 ms/token host/queue residual also remains a product
+integration target; it is not included as unavoidable work.
+
+Transport evidence in the same durable directory:
+
+| File | SHA-256 |
+|---|---|
+| `gfx1151-split-transport.txt` | `5d290af5ab67de7324a1e80b397f2beb79d110c8e5f918ac1ad6738380901a10` |
+| `gfx1100-split-transport.txt` | `f07e169994e665f1662aefda3054c253bd8b546d271a6657801bb8d9bba20a79` |
+
 ## 5. Exactness contract
 
 Splitting the six selected experts into two owner-local aggregates would change
@@ -238,15 +314,10 @@ publication remains the admitted control structure.
 
 1. Collect or recover multi-genre 2,048+decode route dumps and cross-validate a
    static or prefill-derived plan. No GPU is needed if dumps already exist.
-2. In a fresh GPU session, run
-   `bench_ds4_mq2lloyd_decode_gfx1100` with the preserved 0–6 decode histogram.
-   It resolves a portable device selector to a live PCI identity, rejects any
-   target other than exact gfx1100, checks the routed-down candidate raw-bit
-   exact at every local top-k 1 through 6, and occurrence-weights gate/up plus
-   down. Then measure the unchanged exact gfx1151 family under the complementary
-   histogram to establish the real architecture ratio.
-3. Select the branch-balanced hot fraction from the measured ratio; do not fill
-   VRAM by default.
+2. Select the branch-balanced hot fraction from the measured complete-branch
+   histograms; do not fill VRAM by default.
+3. Micro-screen packed 1..6-row mapped transport and a raw-bit-exact GPU
+   split-combine. Reject a fixed six-row transfer as the product default.
 4. Implement artifact-local subset upload behind the typed plan. Preserve the
    complete gfx1151 residency and fail before allocation on any projection
    mismatch.
