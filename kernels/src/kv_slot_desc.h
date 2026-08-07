@@ -14,8 +14,9 @@
 // Layout must stay byte-identical to the Rust mirror in
 // crates/rdna-compute/src/kv_slots.rs. 24 bytes, 8-byte aligned.
 
-#ifndef HIPFIRE_KV_SLOT_DESC_H
-#define HIPFIRE_KV_SLOT_DESC_H
+#pragma once
+
+#include <hip/hip_runtime.h>
 
 struct KvSlotDesc {
     unsigned long long k_base;  // byte offset of this slot's K slab in the arena
@@ -52,5 +53,3 @@ __device__ __forceinline__ KvSlotDesc kv_slot_legacy(int seq_len, int max_seq)
     s.cap = max_seq;
     return s;
 }
-
-#endif  // HIPFIRE_KV_SLOT_DESC_H
