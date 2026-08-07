@@ -134,6 +134,7 @@ fn run_case(gpu: &mut Gpu, m: usize, k: usize, x_row_div: usize, rows: usize, la
     let output_bytes = M_TOTAL * m * 4;
     let d_ref = gpu.hip.malloc(output_bytes).unwrap();
     let d_n32 = gpu.hip.malloc(output_bytes).unwrap();
+    let d_m128 = gpu.hip.malloc(output_bytes).unwrap();
     gpu.hip.memcpy_htod(&d_ptrs, &pointer_bytes).unwrap();
     gpu.hip.memcpy_htod(&d_tiles, &tile_bytes).unwrap();
     gpu.hip.memcpy_htod(&d_slots, &slot_bytes).unwrap();
@@ -160,6 +161,7 @@ fn run_case(gpu: &mut Gpu, m: usize, k: usize, x_row_div: usize, rows: usize, la
     let x_tensor = wrap(d_x.as_ptr(), x_bytes.len(), vec![rows, k], DType::F32);
     let reference = wrap(d_ref.as_ptr(), output_bytes, vec![M_TOTAL, m], DType::F32);
     let candidate = wrap(d_n32.as_ptr(), output_bytes, vec![M_TOTAL, m], DType::F32);
+    let m128_output = wrap(d_m128.as_ptr(), output_bytes, vec![M_TOTAL, m], DType::F32);
 
     let incumbent = |gpu: &mut Gpu| {
         gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2(
@@ -191,24 +193,49 @@ fn run_case(gpu: &mut Gpu, m: usize, k: usize, x_row_div: usize, rows: usize, la
         )
         .unwrap();
     };
+    let m128 = |gpu: &mut Gpu| {
+        gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_8w_k2(
+            &ptrs,
+            &tiles,
+            &slot_index,
+            &x_tensor,
+            &m128_output,
+            m,
+            k,
+            x_row_div,
+            M_TOTAL,
+            rows,
+        )
+        .unwrap();
+    };
 
     incumbent(gpu);
     n32(gpu);
+    m128(gpu);
     gpu.hip.device_synchronize().unwrap();
     let mut ref_bytes = vec![0_u8; output_bytes];
     let mut n32_bytes = vec![0_u8; output_bytes];
+    let mut m128_bytes = vec![0_u8; output_bytes];
     gpu.hip.memcpy_dtoh(&mut ref_bytes, &d_ref).unwrap();
     gpu.hip.memcpy_dtoh(&mut n32_bytes, &d_n32).unwrap();
+    gpu.hip.memcpy_dtoh(&mut m128_bytes, &d_m128).unwrap();
     let mismatches = ref_bytes
         .chunks_exact(4)
         .zip(n32_bytes.chunks_exact(4))
         .filter(|(a, b)| a != b)
         .count();
     assert_eq!(mismatches, 0, "{label}: raw-bit mismatch");
+    let m128_mismatches = ref_bytes
+        .chunks_exact(4)
+        .zip(m128_bytes.chunks_exact(4))
+        .filter(|(a, b)| a != b)
+        .count();
+    assert_eq!(m128_mismatches, 0, "{label}: M128 raw-bit mismatch");
 
     for _ in 0..3 {
         incumbent(gpu);
         n32(gpu);
+        m128(gpu);
     }
     gpu.hip.device_synchronize().unwrap();
     let time = |gpu: &mut Gpu, launch: &dyn Fn(&mut Gpu)| -> f64 {
@@ -224,9 +251,14 @@ fn run_case(gpu: &mut Gpu, m: usize, k: usize, x_row_div: usize, rows: usize, la
     };
     let incumbent_us = time(gpu, &incumbent);
     let n32_us = time(gpu, &n32);
+    let m128_us = time(gpu, &m128);
     println!(
         "{label}: M={m} K={k} m_total={M_TOTAL} incumbent={incumbent_us:.3}us n32={n32_us:.3}us speedup={:.3}x raw_mismatches={mismatches}",
         incumbent_us / n32_us
+    );
+    println!(
+        "{label}: M={m} K={k} m_total={M_TOTAL} incumbent={incumbent_us:.3}us m128={m128_us:.3}us speedup={:.3}x raw_mismatches={m128_mismatches}",
+        incumbent_us / m128_us
     );
 
     std::mem::forget(ptrs);
@@ -235,6 +267,7 @@ fn run_case(gpu: &mut Gpu, m: usize, k: usize, x_row_div: usize, rows: usize, la
     std::mem::forget(x_tensor);
     std::mem::forget(reference);
     std::mem::forget(candidate);
+    std::mem::forget(m128_output);
 }
 
 fn main() {
