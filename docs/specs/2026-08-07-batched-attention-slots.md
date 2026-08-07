@@ -104,6 +104,17 @@ Capacity is the lesser half. KV traffic is the term that **never amortises
 across slots** (§8), so cutting it by 31% raises the batching ceiling itself,
 not merely the memory headroom.
 
+**OUTCOME (Task 9, measured 2026-08-07): asym3 was REJECTED as a default for
+both models and this capacity argument therefore FAILS.** asym3 changes ~30% of
+top-1 token choices against q8 (27B 68.8% agreement, 35B-A3B 70.3%; mean KLD
+0.297 / 0.552 nats), diverging within the first two generated tokens. It remains
+fully supported and opt-in via `HIPFIRE_KV_MODE=asym3`, but it does not ship as
+a default, so **4 agents × 128K on the 27B goes back to not fitting in 32 GB**.
+The fallback is fewer agents or shorter contexts on the 27B — not another
+compression trick. The 35B-A3B is unaffected: its 10 KB/token KV already fits 4
+agents × 128K in ~25.5 GB at q8. See
+`docs/perf-checkpoints/2026-08-07-asym3-quality-gate.md`.
+
 ### 4.3 Why this is cheap
 
 asym{2,3,4} and fwht{2,3,4} all route through a single shared
