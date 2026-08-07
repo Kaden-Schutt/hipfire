@@ -333,11 +333,7 @@ impl DeepseekV4HarmonicExecution {
         if status == 0 {
             return Ok(());
         }
-        let code = status & 0xff;
-        let layer = (status >> 8) & 0xff;
-        let state = (status >> 16) & 0xf;
-        let flags = (status >> 20) & 0xf;
-        let reason = match code {
+        let reason = match status {
             1 => "expert endpoint isolated before publication",
             2 => "mailbox slot was not quiescent at publication",
             3 => "bounded expert result wait expired",
@@ -346,7 +342,7 @@ impl DeepseekV4HarmonicExecution {
             _ => "unknown GPU mailbox status",
         };
         let cause = self.isolate_worker(format!(
-            "deepseek4 harmonic GPU mailbox failure status={status:#010x} code={code} layer={layer} state={state} flags={flags:#x}: {reason}"
+            "deepseek4 harmonic GPU mailbox failure status={status}: {reason}"
         ));
         Err(cause)
     }

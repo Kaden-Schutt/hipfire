@@ -97,14 +97,17 @@ sys_store_u64(char *base, int offset, unsigned long long value, int order) {
                      value, order, __HIP_MEMORY_SCOPE_SYSTEM);
 }
 
+__device__ __forceinline__ bool sys_cas_u32(char *base, int offset,
+                                            unsigned expected,
+                                            unsigned desired) {
+  return __hip_atomic_compare_exchange_strong(
+      reinterpret_cast<unsigned *>(base + offset), &expected, desired,
+      __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM);
+}
+
 __device__ __forceinline__ void set_first_error(unsigned *status,
-                                                 unsigned error, int layer,
-                                                 unsigned state,
-                                                 unsigned flags) {
-  const unsigned detail = error | ((static_cast<unsigned>(layer) & 0xffu) << 8) |
-                          ((state & 0xfu) << 16) |
-                          ((flags & 0xfu) << 20);
-  atomicCAS(status, kMailboxOk, detail);
+                                                 unsigned error) {
+  atomicCAS(status, kMailboxOk, error);
 }
 
 __device__ __forceinline__ bool terminal_state(unsigned state) {
@@ -142,24 +145,21 @@ extern "C" __global__ void deepseek4_harmonic_publish_gfx1100(
       // consumes state derived after a failed result.
     } else if (sys_load_u32(header, kHeaderIsolatedOwners, __ATOMIC_ACQUIRE) !=
                0) {
-      set_first_error(status, kPublishEndpointIsolated, layer, 0, 0);
+      set_first_error(status, kPublishEndpointIsolated);
     } else {
       unsigned state = sys_load_u32(slot, kSlotState, __ATOMIC_ACQUIRE);
-      unsigned flags = 0;
       if (terminal_state(state)) {
-        flags = sys_load_u32(slot, kSlotFlags, __ATOMIC_ACQUIRE);
-        if ((flags & kBothQuiesced) == kBothQuiesced) {
-          // Dense gfx1100 is the sole recycler and sole publisher. The expert
-          // worker never mutates a terminal state, so no cross-agent CAS is
-          // needed (and host-mapped system CAS support varies by ASIC/IOMMU).
-          sys_store_u32(slot, kSlotState, kVacant, __ATOMIC_RELEASE);
+        const unsigned flags =
+            sys_load_u32(slot, kSlotFlags, __ATOMIC_ACQUIRE);
+        if ((flags & kBothQuiesced) == kBothQuiesced &&
+            sys_cas_u32(slot, kSlotState, state, kVacant)) {
           state = kVacant;
         }
       }
-      if (state != kVacant) {
-        set_first_error(status, kPublishSlotBusy, layer, state, flags);
+      if (state != kVacant ||
+          !sys_cas_u32(slot, kSlotState, kVacant, kPublishing)) {
+        set_first_error(status, kPublishSlotBusy);
       } else {
-        sys_store_u32(slot, kSlotState, kPublishing, __ATOMIC_RELEASE);
         sys_store_u32(slot, kSlotFlags, 0, __ATOMIC_RELAXED);
         // Epoch is the first new-occupant field observed by expert_poll_mapped.
         sys_store_u64(slot, kSlotEpoch, epoch, __ATOMIC_RELEASE);
@@ -264,17 +264,17 @@ extern "C" __global__ void deepseek4_harmonic_wait_copy_gfx1100(
             sys_load_u32(slot, kSlotState, __ATOMIC_ACQUIRE);
         if (observed_epoch == epoch && terminal_state(state)) {
           if (state != kCompleted) {
-            set_first_error(status, kWaitTerminalFailure, layer, state, 0);
+            set_first_error(status, kWaitTerminalFailure);
           } else if (sys_load_u32(slot, kSlotResultExtent,
                                   __ATOMIC_RELAXED) != kResultExtent) {
-            set_first_error(status, kWaitResultExtent, layer, state, 0);
+            set_first_error(status, kWaitResultExtent);
           } else {
             copy_result = 1;
           }
           break;
         }
         if (clock64() - start >= max_wait_clocks) {
-          set_first_error(status, kWaitTimeout, layer, state, 0);
+          set_first_error(status, kWaitTimeout);
           break;
         }
         __builtin_amdgcn_s_sleep(1);
