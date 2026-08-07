@@ -3545,8 +3545,11 @@ pub fn decode_step_gfx1100_owner_probe(
             weights.mq2r_backend, gpu.arch
         ));
     }
-    if gpu.replay.is_enabled() || gpu.graphs.capture_mode {
-        return Err("deepseek4 gfx1100 owner probe admits direct HIP only".to_owned());
+    if (gpu.replay.is_enabled() && !gpu.replay.is_recording()) || gpu.graphs.capture_mode {
+        return Err(
+            "deepseek4 gfx1100 owner probe admits direct HIP or one explicit recording pass"
+                .to_owned(),
+        );
     }
 
     ensure_compressor_capacity(cfg, state, gpu, (position as usize).saturating_add(1))?;

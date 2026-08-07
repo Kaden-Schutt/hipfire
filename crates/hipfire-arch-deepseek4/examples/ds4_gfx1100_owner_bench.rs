@@ -19,6 +19,7 @@ use hipfire_arch_deepseek4::forward::{
 use hipfire_arch_deepseek4::{DeepseekV4, DeepseekV4State};
 use hipfire_runtime::arch::Architecture;
 use hipfire_runtime::hfq::HfqFile;
+use rdna_compute::replay::ReplayController;
 use rdna_compute::Gpu;
 use serde_json::json;
 
@@ -29,13 +30,14 @@ struct Args {
     warmups: usize,
     runs: usize,
     token: u32,
+    pm4: bool,
 }
 
 impl Args {
     fn parse() -> Result<Self, String> {
         let mut args = std::env::args().skip(1);
         let model = PathBuf::from(args.next().ok_or(
-            "usage: ds4_gfx1100_owner_bench MODEL [--context N] [--warmups N] [--runs N] [--token N]",
+            "usage: ds4_gfx1100_owner_bench MODEL [--context N] [--warmups N] [--runs N] [--token N] [--pm4]",
         )?);
         let mut parsed = Self {
             model,
@@ -43,8 +45,13 @@ impl Args {
             warmups: 4,
             runs: 12,
             token: 1,
+            pm4: false,
         };
         while let Some(flag) = args.next() {
+            if flag == "--pm4" {
+                parsed.pm4 = true;
+                continue;
+            }
             let value = args
                 .next()
                 .ok_or_else(|| format!("{flag} requires a value"))?;
@@ -124,6 +131,14 @@ fn median(values: &mut [f64]) -> f64 {
     }
 }
 
+fn bit_exact(left: &[f32], right: &[f32]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .all(|(left, right)| left.to_bits() == right.to_bits())
+}
+
 fn main() -> Result<(), String> {
     let args = Args::parse()?;
     let (pci, ordinal) = resolve_unique_gfx1100()?;
@@ -163,24 +178,100 @@ fn main() -> Result<(), String> {
         .device_synchronize()
         .map_err(|error| format!("gfx1100 owner warmup sync: {error:?}"))?;
 
+    let capture_position = args.context.saturating_add(args.warmups as u32);
+    let mut capture_logits = None;
+    let mut capture_json = serde_json::Value::Null;
+    let mut controller = if args.pm4 {
+        let mut controller = ReplayController::new_manual_pm4_single_queue();
+        std::mem::swap(&mut gpu.replay, &mut controller);
+        let capture_result = (|| {
+            gpu.replay
+                .begin_capture()
+                .map_err(|reason| format!("gfx1100 owner PM4 begin capture: {reason}"))?;
+            let logits = decode_step_gfx1100_owner_probe(
+                &cfg,
+                &weights,
+                &mut state,
+                &mut gpu,
+                &mut execution,
+                token,
+                capture_position,
+            )?;
+            gpu.hip
+                .device_synchronize()
+                .map_err(|error| format!("gfx1100 owner PM4 capture sync: {error:?}"))?;
+            let summary = gpu
+                .replay
+                .finish_capture()
+                .map_err(|reason| format!("gfx1100 owner PM4 finish capture: {reason}"))?;
+            let contracts = gpu
+                .replay
+                .probe_aql_contracts(gpu.device_id as usize)
+                .map_err(|reason| format!("gfx1100 owner PM4 AQL contracts: {reason}"))?;
+            gpu.replay
+                .prepare_pm4_prefix_for_pci_bus_id(&pci, summary.launch_count)
+                .map_err(|reason| format!("gfx1100 owner PM4 prepare: {reason}"))?;
+            let identity = gpu
+                .replay
+                .prepared_route_identity()
+                .ok_or_else(|| "gfx1100 owner PM4 prepared identity missing".to_owned())?;
+            capture_logits = Some(logits);
+            capture_json = json!({
+                "launches": summary.launch_count,
+                "unique_symbols": summary.unique_kernel_count,
+                "sequence_hash": summary.sequence_hash,
+                "aql_contracts": contracts.len(),
+                "prepared": {
+                    "dispatches": identity.dispatch_count,
+                    "packets": identity.packet_count,
+                    "queue_id": identity.queue_id,
+                    "command_dwords": identity.command_dwords,
+                    "queue_count": identity.queue_count,
+                    "phase_count": identity.phase_count,
+                }
+            });
+            Ok::<(), String>(())
+        })();
+        std::mem::swap(&mut gpu.replay, &mut controller);
+        capture_result?;
+        Some(controller)
+    } else {
+        None
+    };
+
     hip_bridge::launch_counters::reset();
     let mut samples_ms = Vec::with_capacity(args.runs);
+    let mut replay_bit_exact = true;
     for index in 0..args.runs {
-        let position = args
-            .context
-            .saturating_add(args.warmups as u32)
-            .saturating_add(index as u32);
+        let position = if args.pm4 {
+            capture_position
+        } else {
+            capture_position.saturating_add(index as u32)
+        };
         let started = Instant::now();
-        let logits = decode_step_gfx1100_owner_probe(
-            &cfg,
-            &weights,
-            &mut state,
-            &mut gpu,
-            &mut execution,
-            token,
-            position,
-        )?;
+        let logits = if let Some(controller) = controller.as_mut() {
+            // SAFETY: the model, scratch allocations, exact device, and captured
+            // binding layout remain owned by this scope until the controller is
+            // dropped below. Each replay waits for terminal completion.
+            unsafe { controller.replay_pm4(position as usize) }
+                .map_err(|reason| format!("gfx1100 owner PM4 replay: {reason}"))?;
+            gpu.download_f32(state.logits.as_ref().unwrap())
+                .map_err(|error| format!("gfx1100 owner PM4 logits: {error:?}"))?
+        } else {
+            decode_step_gfx1100_owner_probe(
+                &cfg,
+                &weights,
+                &mut state,
+                &mut gpu,
+                &mut execution,
+                token,
+                position,
+            )?
+        };
         samples_ms.push(started.elapsed().as_secs_f64() * 1000.0);
+        if let Some(expected) = capture_logits.as_ref() {
+            replay_bit_exact &= bit_exact(expected, &logits);
+        }
         token = argmax(&logits)?;
     }
     let launch_count = hip_bridge::launch_counters::launch_kernel::count();
@@ -193,7 +284,7 @@ fn main() -> Result<(), String> {
     println!(
         "{}",
         serde_json::to_string_pretty(&json!({
-            "route": "ds4-mq2r-gfx1100-owner-local",
+            "route": if args.pm4 { "ds4-mq2r-gfx1100-owner-pm4" } else { "ds4-mq2r-gfx1100-owner-hip" },
             "model": args.model,
             "device": { "ordinal": ordinal, "pci": pci, "arch": gpu.arch },
             "context_start": args.context,
@@ -201,6 +292,8 @@ fn main() -> Result<(), String> {
             "runs": args.runs,
             "routed_experts": "omitted-after-routing",
             "peer_devices": 0,
+            "capture": capture_json,
+            "replay_bit_exact": replay_bit_exact,
             "samples_ms": samples_ms,
             "median_ms_per_token": median_ms,
             "min_ms_per_token": min_ms,
@@ -214,6 +307,7 @@ fn main() -> Result<(), String> {
         .map_err(|error| error.to_string())?
     );
 
+    drop(controller);
     execution.close(&mut gpu)?;
     state.free_gpu(&mut gpu);
     weights.free_gpu(&mut gpu);
