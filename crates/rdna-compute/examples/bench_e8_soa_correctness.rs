@@ -33,6 +33,10 @@ fn main() {
         run_grouped_gfx1201(&mut gpu);
         return;
     }
+    if std::env::var_os("HIPFIRE_E8_PREFILL_GFX1201_ONLY").is_some() {
+        run_prefill_gfx1201(&mut gpu);
+        return;
+    }
 
     let shapes: Vec<(usize, usize, &str)> = vec![
         // --- A3B per-expert MoE shapes (the decode hot path; hidden=2048,
@@ -1170,6 +1174,141 @@ fn main() {
                 );
             }
         }
+    }
+}
+
+fn run_prefill_gfx1201(gpu: &mut Gpu) {
+    assert_eq!(gpu.arch, "gfx1201", "gfx12 E8 prefill screen needs gfx1201");
+    let batch = std::env::var("HIPFIRE_E8_PREFILL_GFX1201_BATCH")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(128);
+    let trials = std::env::var("HIPFIRE_E8_PREFILL_GFX1201_TRIALS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(5);
+    assert!(batch > 0 && trials > 0);
+    let shapes = [
+        (512usize, 2048usize, "channel"),
+        (1024usize, 4096usize, "wq_a/wo_a"),
+        (32768usize, 1024usize, "wq_b"),
+        (4096usize, 8192usize, "wo_b"),
+        (2048usize, 4096usize, "shared_up"),
+        (4096usize, 2048usize, "shared_down"),
+    ];
+
+    eprintln!("=== gfx1201 MFP4G32E8SOA WMMA prefill B={batch} ===");
+    eprintln!(
+        "  {:<12} {:>7} {:>7} {:>10} {:>10} {:>10} {:>10} {:>9}",
+        "shape", "M", "K", "row us", "B1 us", "B2 us", "B4 us", "B4 speed"
+    );
+
+    for (slot, (m, k, label)) in shapes.into_iter().enumerate() {
+        let aos = synth_e8_aos(m, k, 0x1201_E800 ^ slot as u64);
+        let soa = aos_to_soa_full(&aos, m, k);
+        let mut weights = gpu.upload_raw(&soa, &[soa.len()]).expect("upload weights");
+        weights.dtype = DType::MFP4G32E8SOA;
+        let x = gpu.alloc_tensor(&[batch * k], DType::F32).expect("alloc x");
+        let x_f16 = gpu
+            .alloc_tensor(&[batch * k], DType::F16)
+            .expect("alloc x f16");
+        let y_ref = gpu
+            .alloc_tensor(&[batch * m], DType::F32)
+            .expect("alloc row reference");
+        let y_b1 = gpu
+            .alloc_tensor(&[batch * m], DType::F32)
+            .expect("alloc B1 output");
+        let y_b2 = gpu
+            .alloc_tensor(&[batch * m], DType::F32)
+            .expect("alloc B2 output");
+        let y_b4 = gpu
+            .alloc_tensor(&[batch * m], DType::F32)
+            .expect("alloc B4 output");
+        let x_host = make_x(batch * k, 0xE812_0100 ^ slot as u64);
+        gpu.hip
+            .memcpy_htod(&x.buf, bytes_of(&x_host))
+            .expect("upload x");
+        gpu.deepseek4_convert_f32_to_f16(&x, &x_f16, (batch * k) as i64)
+            .expect("convert x to f16");
+
+        let mut rowwise = |gpu: &mut Gpu| {
+            for b in 0..batch {
+                gpu.gemv_mfp4g32_e8_soa(
+                    &weights,
+                    &x.sub_offset(b * k, k),
+                    &y_ref.sub_offset(b * m, m),
+                    m,
+                    k,
+                )
+                .expect("row-wise E8 reference");
+            }
+        };
+        rowwise(gpu);
+        gpu.gemm_mfp4g32_e8_soa_wmma_gfx1201_f16(&weights, &x_f16, &y_b1, m, k, batch)
+            .expect("gfx1201 B1");
+        gpu.gemm_mfp4g32_e8_soa_wmma_b2_gfx1201_f16(&weights, &x_f16, &y_b2, m, k, batch)
+            .expect("gfx1201 B2");
+        gpu.gemm_mfp4g32_e8_soa_wmma_b4_gfx1201_f16(&weights, &x_f16, &y_b4, m, k, batch)
+            .expect("gfx1201 B4");
+        gpu.hip
+            .device_synchronize()
+            .expect("correctness synchronize");
+
+        let mut reference = vec![0.0f32; batch * m];
+        gpu.hip
+            .memcpy_dtoh(bytes_of_mut(&mut reference), &y_ref.buf)
+            .expect("download reference");
+        for (name, candidate_tensor) in [("B1", &y_b1), ("B2", &y_b2), ("B4", &y_b4)] {
+            let mut candidate = vec![0.0f32; batch * m];
+            gpu.hip
+                .memcpy_dtoh(bytes_of_mut(&mut candidate), &candidate_tensor.buf)
+                .expect("download candidate");
+            let mut err2 = 0.0f64;
+            let mut ref2 = 0.0f64;
+            let mut max_abs = 0.0f32;
+            for (&a, &b) in reference.iter().zip(&candidate) {
+                let delta = (a - b).abs();
+                max_abs = max_abs.max(delta);
+                err2 += (delta as f64) * (delta as f64);
+                ref2 += (a as f64) * (a as f64);
+            }
+            let rel_rmse = (err2 / ref2.max(f64::MIN_POSITIVE)).sqrt();
+            assert!(
+                candidate.iter().all(|value| value.is_finite()) && rel_rmse < 0.01,
+                "gfx1201 {name} parity failed for {label}: rel_rmse={rel_rmse} max_abs={max_abs}"
+            );
+            eprintln!("  parity {label:<12} {name}: rel_rmse={rel_rmse:.7} max_abs={max_abs:.6}");
+        }
+
+        let mut time = |run: &mut dyn FnMut(&mut Gpu)| {
+            for _ in 0..2 {
+                run(gpu);
+            }
+            gpu.hip.device_synchronize().expect("warm synchronize");
+            let start = Instant::now();
+            for _ in 0..trials {
+                run(gpu);
+            }
+            gpu.hip.device_synchronize().expect("timing synchronize");
+            start.elapsed().as_secs_f64() * 1.0e6 / trials as f64
+        };
+        let row_us = time(&mut rowwise);
+        let b1_us = time(&mut |gpu| {
+            gpu.gemm_mfp4g32_e8_soa_wmma_gfx1201_f16(&weights, &x_f16, &y_b1, m, k, batch)
+                .expect("time B1");
+        });
+        let b2_us = time(&mut |gpu| {
+            gpu.gemm_mfp4g32_e8_soa_wmma_b2_gfx1201_f16(&weights, &x_f16, &y_b2, m, k, batch)
+                .expect("time B2");
+        });
+        let b4_us = time(&mut |gpu| {
+            gpu.gemm_mfp4g32_e8_soa_wmma_b4_gfx1201_f16(&weights, &x_f16, &y_b4, m, k, batch)
+                .expect("time B4");
+        });
+        eprintln!(
+            "  {label:<12} {m:>7} {k:>7} {row_us:>10.2} {b1_us:>10.2} {b2_us:>10.2} {b4_us:>10.2} {:>8.2}x",
+            row_us / b4_us
+        );
     }
 }
 

@@ -13524,6 +13524,140 @@ impl Gpu {
         result
     }
 
+    fn gemm_mfp4g32_e8_soa_wmma_gfx1201_f16_impl(
+        &mut self,
+        weight: &GpuTensor,
+        x_f16: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+        batch_rows_per_block: usize,
+        kernel: &'static str,
+        source: &'static str,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        debug_assert_eq!(
+            self.arch, "gfx1201",
+            "dense E8-SoA gfx12 WMMA is admitted only on gfx1201"
+        );
+        debug_assert_eq!(weight.dtype, DType::MFP4G32E8SOA);
+        debug_assert_eq!(x_f16.dtype, DType::F16);
+        assert!(k % 256 == 0, "dense E8-SoA gfx12 WMMA requires K%256==0");
+        self.ensure_kernel(kernel, source, kernel)?;
+        let ap = weight.buf.as_ptr();
+        let xp = x_f16.buf.as_ptr();
+        let yp = y.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let b_val = batch_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &ap as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+            &b_val as *const _ as *mut c_void,
+        ];
+        let row_tiles = m.div_ceil(16) as u32;
+        let batch_tiles = batch_size.div_ceil(batch_rows_per_block) as u32;
+        let bytes = weight.byte_size() + batch_size * (k * 2 + m * 4);
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel, bytes);
+        let result = self.launch_maybe_blob(
+            kernel,
+            [row_tiles, batch_tiles, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut blob = hip_bridge::KernargBlob::new();
+                blob.push_ptr(ap);
+                blob.push_ptr(xp);
+                blob.push_ptr(yp);
+                blob.push_i32(m_val);
+                blob.push_i32(k_val);
+                blob.push_i32(b_val);
+                blob
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// Exact-gfx1201 dense E8-SoA WMMA prefill kernel, one 16-token tile.
+    ///
+    /// The caller owns F32→F16 staging so multiple projections of the same
+    /// activation can share one conversion without pointer-keyed stale data.
+    pub fn gemm_mfp4g32_e8_soa_wmma_gfx1201_f16(
+        &mut self,
+        weight: &GpuTensor,
+        x_f16: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.gemm_mfp4g32_e8_soa_wmma_gfx1201_f16_impl(
+            weight,
+            x_f16,
+            y,
+            m,
+            k,
+            batch_size,
+            16,
+            "gemm_mfp4g32_e8_soa_wmma_gfx1201",
+            kernels::GEMM_MFP4G32_E8_SOA_WMMA_GFX1201_SRC,
+        )
+    }
+
+    /// Exact-gfx1201 dense E8-SoA WMMA prefill kernel, two token tiles.
+    pub fn gemm_mfp4g32_e8_soa_wmma_b2_gfx1201_f16(
+        &mut self,
+        weight: &GpuTensor,
+        x_f16: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.gemm_mfp4g32_e8_soa_wmma_gfx1201_f16_impl(
+            weight,
+            x_f16,
+            y,
+            m,
+            k,
+            batch_size,
+            32,
+            "gemm_mfp4g32_e8_soa_wmma_b2_gfx1201",
+            kernels::GEMM_MFP4G32_E8_SOA_WMMA_B2_GFX1201_SRC,
+        )
+    }
+
+    /// Exact-gfx1201 dense E8-SoA WMMA prefill kernel, four token tiles.
+    pub fn gemm_mfp4g32_e8_soa_wmma_b4_gfx1201_f16(
+        &mut self,
+        weight: &GpuTensor,
+        x_f16: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.gemm_mfp4g32_e8_soa_wmma_gfx1201_f16_impl(
+            weight,
+            x_f16,
+            y,
+            m,
+            k,
+            batch_size,
+            64,
+            "gemm_mfp4g32_e8_soa_wmma_b4_gfx1201",
+            kernels::GEMM_MFP4G32_E8_SOA_WMMA_B4_GFX1201_SRC,
+        )
+    }
+
     /// Four-wave cooperative E8-SoA WMMA candidate for gfx1151 prefill.
     ///
     /// Each wave retains the B4 arithmetic schedule while the workgroup

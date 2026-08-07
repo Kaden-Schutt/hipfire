@@ -1206,6 +1206,20 @@ pub const GEMM_MFP4G32_E8_SOA_WMMA_B4_GFX1151_SRC: &str = concat!(
     "#define E8_PREFILL_KERNEL_NAME gemm_mfp4g32_e8_soa_wmma_b4_gfx1151\n",
     include_str!("../../../kernels/src/gemm_mfp4g32_e8_soa_wmma.gfx1151.hip")
 );
+pub const GEMM_MFP4G32_E8_SOA_WMMA_GFX1201_SRC: &str = concat!(
+    "#define E8_PREFILL_KERNEL_NAME gemm_mfp4g32_e8_soa_wmma_gfx1201\n",
+    include_str!("../../../kernels/src/gemm_mfp4g32_e8_soa_wmma.gfx12.hip")
+);
+pub const GEMM_MFP4G32_E8_SOA_WMMA_B2_GFX1201_SRC: &str = concat!(
+    "#define E8_PREFILL_BATCH_TILES 2\n",
+    "#define E8_PREFILL_KERNEL_NAME gemm_mfp4g32_e8_soa_wmma_b2_gfx1201\n",
+    include_str!("../../../kernels/src/gemm_mfp4g32_e8_soa_wmma.gfx12.hip")
+);
+pub const GEMM_MFP4G32_E8_SOA_WMMA_B4_GFX1201_SRC: &str = concat!(
+    "#define E8_PREFILL_BATCH_TILES 4\n",
+    "#define E8_PREFILL_KERNEL_NAME gemm_mfp4g32_e8_soa_wmma_b4_gfx1201\n",
+    include_str!("../../../kernels/src/gemm_mfp4g32_e8_soa_wmma.gfx12.hip")
+);
 
 pub const GEMM_MFP4G32_E8_SOA_WMMA_COOP4_GFX1151_SRC: &str =
     include_str!("../../../kernels/src/gemm_mfp4g32_e8_soa_wmma_coop.gfx1151.hip");
