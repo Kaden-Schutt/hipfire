@@ -2,27 +2,27 @@
 
 Date: 2026-08-07  
 Branch: `ds4-gfx1201-opt`  
-Candidate: `6712a3d8d`  
+Candidate source checkpoint: `6712a3d8d`
 Parent promoted line: `150d3585c` (`53.376417` tok/s median)
 
 ## Verdict
 
-Promotion-ready, pending explicit operator approval for the persistent default
-flip. The composed exact-gfx1201 MQ2R candidate improves canonical TP3 AR
-decode to **54.903757 tok/s**, a **+2.8615% / +1.527340 tok/s** gain over the
-promoted 53.376417 line. Three fresh processes produced byte-identical decoded
-output, and a separate five-genre baseline/candidate battery also matched every
-response byte-for-byte.
+**Corrected after rebuilding the actual product daemon.** The three-process
+**54.903757 tok/s** checkpoint is a real **+2.8615% / +1.527340 tok/s** win,
+but it contains the T1024 HC-control lever only. The daemon used for those runs
+was stale with respect to the head-strided RoPE source and did not contain its
+kernel or environment gate. Three fresh processes produced byte-identical
+decoded output, and a separate five-genre baseline/candidate battery also
+matched every response byte-for-byte. T1024 remains pending explicit operator
+approval for a persistent default flip because it changes the FP32 reduction
+tree.
 
-The branch remains safe by default at this checkpoint: the candidate is
-selected only with both of these developer opt-ins while certification is in
-progress:
+The branch remains safe by default at this checkpoint: T1024 is selected only
+with this developer opt-in while certification is in progress:
 
-- `HIPFIRE_DEEPSEEK4_GFX1201_INDEXER_ROPE_HEADS=1`
 - `HIPFIRE_HC_CTRL_T1024=1`
 
-The intended promotion removes the first opt-in and selects both levers from
-the model-owned `Mq2rBackend::Gfx1201` plus exact `gpu.arch == "gfx1201"`.
+The head-strided RoPE remains opt-in and is not part of the product checkpoint.
 Portable, gfx1151, gfx1100, gfx942, Qwen, MiniMax, and non-MQ2R paths remain on
 their prior kernels.
 
@@ -44,8 +44,17 @@ The selected 32-wave geometry passed **98,304/98,304 raw-bit comparisons** at
 positions 0, 1, 2,052, and 131,071. An earlier per-head specialization was
 rejected before routing because LLVM constant folding introduced 1-ULP drift.
 
+After rebuilding the real product daemon, the corrected direct-HIP profile
+reduced this symbol from about 1.211 to 0.139 ms per position across all three
+ranks and reduced mean traced GPU time from 14.610 to 13.911 ms/rank/position.
+The canonical product screen nevertheless measured **54.928617 tok/s**, only
+**+0.045%** over the T1024-only median. The route is therefore rejected for
+product despite its device-time win.
+
 Evidence:
 `hiptrx:/home/kaden/ds4-hiptrx-evidence/2026-08-07-gfx1201-indexer-rope-heads/`
+`hiptrx:/home/kaden/ds4-hiptrx-evidence/2026-08-07-gfx1201-occupancy-profile-v2/`
+`hiptrx:/home/kaden/ds4-hiptrx-evidence/2026-08-07-gfx1201-occupancy-bundle-v2/`
 
 ### Wide HC control/finalize
 
@@ -114,7 +123,9 @@ canonical performance claim.
 - `daemon` SHA-256:
   `26d33688b9cee2ea6e91e3efb0fed1578b7282960a6393564bc170ad05b84bd1`
 
-The only remaining decode-checkpoint action is operator approval to make this
-measured bundle the exact-gfx1201 MQ2R default. No weight, format, top-k,
+The recorded binary hashes above identify the original evidence bundle, but
+the product attribution is corrected here: only T1024 was active. The remaining
+checkpoint action is operator approval to make T1024 the exact-gfx1201 MQ2R
+default. The head-strided RoPE is product-rejected. No weight, format, top-k,
 sampling, expert-count, KV, speculation, Redline/PM4, TP4, or long-context
-change is part of this candidate.
+change is part of this checkpoint.
