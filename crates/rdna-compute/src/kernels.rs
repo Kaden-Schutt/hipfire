@@ -1161,6 +1161,11 @@ pub const GEMV_MFP4G32_E8_SOA_GROUPED_GFX1151_SRC: &str =
 /// Exact-gfx1201 grouped E8-SoA GEMV for DeepSeek4's eight O-LoRA blocks.
 pub const GEMV_MFP4G32_E8_SOA_GROUPED_GFX1201_SRC: &str =
     include_str!("../../../kernels/src/gemv_mfp4g32_e8_soa_grouped.gfx1201.hip");
+pub const GEMV_MFP4G32_E8_SOA_MIXED_JOBS_GFX1201_SRC: &str = concat!(
+    include_str!("../../../kernels/src/gemv_mfp4g32_e8_soa.gfx1201.hip"),
+    "\n",
+    include_str!("../../../kernels/src/gemv_mfp4g32_e8_soa_mixed_jobs.gfx1201.hip")
+);
 /// Exact-gfx1100 build of the arithmetic-identical grouped E8 O-LoRA kernel.
 pub const GEMV_MFP4G32_E8_SOA_GROUPED_GFX1100_SRC: &str = concat!(
     "#define gemv_mfp4g32_e8_soa_grouped_gfx1151 gemv_mfp4g32_e8_soa_grouped_gfx1100\n",

@@ -4538,6 +4538,86 @@ impl Gpu {
         )
     }
 
+    /// Experimental exact-gfx1201 pack for two to seven independent E8
+    /// projections with one shared activation and a common K. Row counts may
+    /// differ; each workgroup preserves the incumbent one-wave row arithmetic.
+    pub fn gemv_mfp4g32_e8_soa_mixed_jobs_gfx1201(
+        &mut self,
+        weights: &[&GpuTensor],
+        x: &GpuTensor,
+        outputs: &[&GpuTensor],
+        rows: &[usize],
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert_eq!(
+            self.arch_caps.arch(),
+            "gfx1201",
+            "mixed E8 jobs require exact gfx1201"
+        );
+        assert!((2..=7).contains(&weights.len()));
+        assert_eq!(weights.len(), outputs.len());
+        assert_eq!(weights.len(), rows.len());
+        assert!(k % 256 == 0);
+        assert!(weights
+            .iter()
+            .all(|weight| weight.dtype == DType::MFP4G32E8SOA));
+        const KERNEL: &str = "gemv_mfp4g32_e8_soa_mixed_jobs_gfx1201";
+        self.ensure_kernel(
+            KERNEL,
+            kernels::GEMV_MFP4G32_E8_SOA_MIXED_JOBS_GFX1201_SRC,
+            KERNEL,
+        )?;
+        let mut a = [weights[0].buf.as_ptr(); 7];
+        let mut y = [outputs[0].buf.as_ptr(); 7];
+        let mut m = [0i32; 7];
+        for index in 0..weights.len() {
+            a[index] = weights[index].buf.as_ptr();
+            y[index] = outputs[index].buf.as_ptr();
+            m[index] = rows[index] as i32;
+        }
+        let x_ptr = x.buf.as_ptr();
+        let jobs = weights.len() as i32;
+        let k_i32 = k as i32;
+        let total_rows = rows.iter().sum::<usize>();
+        let mut params: Vec<*mut c_void> = Vec::with_capacity(24);
+        for ptr in &a {
+            params.push(ptr as *const _ as *mut c_void);
+        }
+        params.push(&x_ptr as *const _ as *mut c_void);
+        for ptr in &y {
+            params.push(ptr as *const _ as *mut c_void);
+        }
+        for value in &m {
+            params.push(value as *const _ as *mut c_void);
+        }
+        params.push(&jobs as *const _ as *mut c_void);
+        params.push(&k_i32 as *const _ as *mut c_void);
+        self.launch_maybe_blob(
+            KERNEL,
+            [total_rows as u32, 1, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut blob = hip_bridge::KernargBlob::new();
+                for ptr in a {
+                    blob.push_ptr(ptr);
+                }
+                blob.push_ptr(x_ptr);
+                for ptr in y {
+                    blob.push_ptr(ptr);
+                }
+                for value in m {
+                    blob.push_i32(value);
+                }
+                blob.push_i32(jobs);
+                blob.push_i32(k_i32);
+                blob
+            },
+        )
+    }
+
     /// Exact-gfx1100 path for collapsing the eight O-LoRA E8 GEMVs into one
     /// 2-D launch. The included kernel preserves the incumbent width-32
     /// per-row arithmetic.
