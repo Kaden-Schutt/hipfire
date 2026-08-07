@@ -1753,7 +1753,14 @@ pub fn run_moe_prefill_bias_aware(
             _ => None,
         };
     let arch_4w = gpu.arch.starts_with("gfx11") || gpu.arch.starts_with("gfx12");
-    let n32 = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MOE_N32").as_deref() == Ok("1");
+    // RDNA4's paired-tile native WMMA route reuses each decoded MQ2 fragment
+    // across two adjacent expert tiles. Keep the portable route everywhere
+    // else; the developer override remains available for A/B and rollback.
+    let n32 = match hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MOE_N32").as_deref() {
+        Ok("0") => false,
+        Ok("1") => true,
+        _ => gpu.arch.eq_ignore_ascii_case("gfx1201"),
+    };
     let cnd = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MOE_CND").as_deref() == Ok("1");
     let eightw = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MOE_8W").as_deref() == Ok("1");
     let mmqload_env =
