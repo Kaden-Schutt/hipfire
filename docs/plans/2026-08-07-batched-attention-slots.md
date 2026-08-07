@@ -29,6 +29,32 @@
 - **Always pass `--features deltanet`.** Every cargo command in this plan carries it. Both target models are DeltaNet hybrids, and more immediately: `cargo test -p rdna-compute` **cannot build without it** on `beta`. The example `rope_compact_offset_check` calls `rope_partial_interleaved_f32{,_batched}`, which are `#[cfg(feature = "deltanet")]` (`crates/rdna-compute/src/norm.rs:711` and `:966`), but the crate declares no `required-features` for it.
 - **That example breakage is PRE-EXISTING on `origin/beta` and is NOT ours to fix.** Do not "repair" it, do not add `required-features`, do not edit `rope_compact_offset_check`. If you see four `E0599: no method named rope_partial_interleaved_f32...` errors, you dropped `--features deltanet`. Verified baseline **with** the flag: `118 passed, 0 failed, 1 ignored`.
 - **Build check after every Rust change:** `cargo build --release -p rdna-compute --features deltanet`.
+- **MEMORY GATE — MANDATORY, NON-NEGOTIABLE.** On 2026-08-07 the SP1 harnesses
+  drove **nine global OOM kills** on the dev box between 18:41 and 19:14. The
+  victims were the user's applications — steamwebhelper x4, teams-for-linux x3,
+  slack, a Firefox tab — **not** our benchmark, which reported success. On Strix
+  Halo the GPU's GTT is system RAM and the box has **no swap**, so an overshoot
+  does not degrade; it goes straight to the *global* OOM killer, which picks
+  victims by `oom_score` rather than by who caused it.
+  - **Run every GPU harness or benchmark through `scripts/run-bounded.sh`.**
+    It runs the command in a cgroup (`MemoryMax`, default 24 GiB,
+    `HIPFIRE_MEM_CAP` to override) so an overshoot kills *our* process, not the
+    user's desktop. Exit 137 means the gate fired: **shrink the configuration,
+    do not raise the cap.** It also refuses to start when `MemAvailable` is
+    already below a floor.
+  - **Call `kv_slots::preflight_alloc(total_bytes, what)` before allocating**
+    in any new harness, passing the TOTAL held live at once, not one buffer. It
+    refuses configurations that exceed the 32 GiB R9700 target budget or would
+    leave this box without headroom, and it fails closed if `/proc/meminfo` is
+    unreadable. Skip the configuration on `Err`; do not proceed.
+  - **Free per-iteration GPU tensors inside sweep loops.** Holding every slot's
+    or every configuration's buffers live across a sweep is what turns a modest
+    per-run footprint into an OOM.
+  - **A live `free` will NOT show this problem.** Between runs the box looks
+    healthy (~60 GiB available). Diagnose after the fact with
+    `journalctl -k | grep -E 'page allocation failure|Out of memory|oom-kill'`.
+    The symptom the user actually notices is desktop stutter and applications
+    silently disappearing.
 - **Commit after every task.** No task may be left half-committed.
 
 ## File Structure

@@ -213,9 +213,117 @@ pub fn build_tiles(
     (tile_slot, tile_row0, tile_qbase)
 }
 
+
+// ── Memory preflight ────────────────────────────────────────────────────────
+//
+// On 2026-08-07 the SP1 harnesses drove nine GLOBAL OOM kills on the dev box,
+// killing the user's applications (steamwebhelper, teams-for-linux, slack,
+// Firefox) rather than the benchmark. On Strix Halo the GPU's GTT is system
+// RAM and the box has NO SWAP, so an overshoot does not degrade — it goes
+// straight to the global OOM killer, which picks victims by oom_score, not by
+// culpability.
+//
+// `scripts/run-bounded.sh` is the hard backstop (a cgroup, so a kill lands on
+// us). This function is the first line of defence: refuse cheaply and clearly
+// BEFORE allocating, so a bad configuration reports itself instead of dying
+// half-way through and leaving the GPU in an unknown state.
+
+/// Default deployment-target budget: the R9700 has 32 GB. A configuration that
+/// does not fit here cannot ship, regardless of what this 125 GiB dev box can
+/// absorb.
+pub const R9700_VRAM_BYTES: u64 = 32 * 1024 * 1024 * 1024;
+
+/// Headroom left for the rest of the system. Chosen so the desktop survives.
+const HEADROOM_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+
+/// `MemAvailable` from /proc/meminfo, in bytes. `None` if unreadable.
+pub fn mem_available_bytes() -> Option<u64> {
+    let txt = std::fs::read_to_string("/proc/meminfo").ok()?;
+    for line in txt.lines() {
+        if let Some(rest) = line.strip_prefix("MemAvailable:") {
+            let kb: u64 = rest.split_whitespace().next()?.parse().ok()?;
+            return Some(kb * 1024);
+        }
+    }
+    None
+}
+
+/// Refuse a planned allocation that would either exceed the deployment target's
+/// VRAM or leave this box without enough headroom to stay responsive.
+///
+/// `planned_bytes` must be the TOTAL the caller is about to hold live at once,
+/// not a single buffer. Returns `Err` with an actionable message; callers should
+/// skip the configuration rather than proceed.
+///
+/// Budget override: `HIPFIRE_VRAM_BUDGET_BYTES`.
+pub fn preflight_alloc(planned_bytes: u64, what: &str) -> Result<(), String> {
+    let budget = std::env::var("HIPFIRE_VRAM_BUDGET_BYTES")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(R9700_VRAM_BYTES);
+
+    let gib = |b: u64| b as f64 / 1073741824.0;
+
+    if planned_bytes > budget {
+        return Err(format!(
+            "{what}: needs {:.2} GiB but the deployment target (R9700) budget is \
+             {:.2} GiB. This configuration cannot ship even if this dev box can \
+             absorb it. Shrink slots x context.",
+            gib(planned_bytes),
+            gib(budget)
+        ));
+    }
+
+    match mem_available_bytes() {
+        Some(avail) => {
+            if planned_bytes.saturating_add(HEADROOM_BYTES) > avail {
+                return Err(format!(
+                    "{what}: needs {:.2} GiB but MemAvailable is only {:.2} GiB \
+                     (keeping {:.2} GiB headroom). This box has NO SWAP and GPU \
+                     memory comes from system RAM, so proceeding risks a GLOBAL \
+                     OOM that kills the user's applications, not this process. \
+                     Skipping.",
+                    gib(planned_bytes),
+                    gib(avail),
+                    gib(HEADROOM_BYTES)
+                ));
+            }
+            Ok(())
+        }
+        // Fail closed: if we cannot read MemAvailable we cannot reason about
+        // safety, and the failure mode we are guarding against costs the user
+        // their desktop session.
+        None => Err(format!(
+            "{what}: cannot read MemAvailable from /proc/meminfo; refusing to \
+             allocate {:.2} GiB blind.",
+            gib(planned_bytes)
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preflight_refuses_over_target_budget() {
+        // 64 GiB against the 32 GiB R9700 target: must refuse even though this
+        // dev box has 125 GiB.
+        let e = preflight_alloc(64 * 1024 * 1024 * 1024, "test").unwrap_err();
+        assert!(e.contains("deployment target"), "unexpected message: {e}");
+    }
+
+    #[test]
+    fn preflight_allows_a_small_allocation() {
+        // 64 MiB is under budget and under any plausible MemAvailable.
+        assert!(preflight_alloc(64 * 1024 * 1024, "test").is_ok());
+    }
+
+    #[test]
+    fn mem_available_is_readable_and_sane() {
+        let a = mem_available_bytes().expect("MemAvailable must be readable on Linux");
+        assert!(a > 0, "MemAvailable should be positive");
+    }
 
     #[test]
     fn desc_is_24_bytes() {
