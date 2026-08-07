@@ -621,19 +621,31 @@ impl Gpus {
         let signals = &self.tp_graph_signals;
         let devices = &mut self.devices;
         let n = devices.len();
-        for rank in 0..n {
-            devices[rank].tp_graph_signal_store_gfx1201(&signals[rank], epoch)?;
-        }
-        for destination in 0..n {
-            let peers: Vec<&DeviceBuffer> = (0..n)
-                .filter(|&source| source != destination)
-                .map(|source| &signals[source])
-                .collect();
-            if n == 3 {
+        if n == 4 {
+            // Publish and wait in one FIFO graph node per rank. The separate
+            // store-then-wait ordering is equivalent because all four rank
+            // graphs are launched before the host synchronizes any of them.
+            for destination in 0..n {
+                let peers: Vec<&DeviceBuffer> = (0..n)
+                    .filter(|&source| source != destination)
+                    .map(|source| &signals[source])
+                    .collect();
+                devices[destination].tp_graph_signal_barrier3_gfx1201(
+                    &signals[destination],
+                    [peers[0], peers[1], peers[2]],
+                    epoch,
+                )?;
+            }
+        } else {
+            for rank in 0..n {
+                devices[rank].tp_graph_signal_store_gfx1201(&signals[rank], epoch)?;
+            }
+            for destination in 0..n {
+                let peers: Vec<&DeviceBuffer> = (0..n)
+                    .filter(|&source| source != destination)
+                    .map(|source| &signals[source])
+                    .collect();
                 devices[destination].tp_graph_signal_wait2_gfx1201([peers[0], peers[1]], epoch)?;
-            } else {
-                devices[destination]
-                    .tp_graph_signal_wait3_gfx1201([peers[0], peers[1], peers[2]], epoch)?;
             }
         }
         self.tp_graph_capture_epoch += 1;
