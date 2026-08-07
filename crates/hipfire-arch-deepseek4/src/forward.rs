@@ -11963,23 +11963,48 @@ fn attention_block_batched_mixed(
                 .as_ref()
                 .ok_or_else(|| "main_kv_cache missing".to_string())?;
             if !use_topk_direct {
-                gpu.deepseek4_topk_kv_gather_batched_f32(
-                    main_kv_cache,
-                    &pbs.idx_topk_indices_batch,
-                    &pbs.topk_staged_batch,
-                    topk_max as i32,
-                    head_dim as i32,
-                    if capture_safe {
-                        max_compressed as i32
-                    } else {
-                        n_max_chunk as i32
-                    },
-                    topk_max as i32,
-                    0,
-                    /*scale=*/ 1.0,
-                    batch_size as i32,
-                )
-                .map_err(|e| format!("deepseek4_topk_kv_gather_batched l{layer_idx}: {e:?}"))?;
+                let n_compressed = if capture_safe {
+                    max_compressed as i32
+                } else {
+                    n_max_chunk as i32
+                };
+                let tiled_gfx1201 = gpu.arch.eq_ignore_ascii_case("gfx1201")
+                    && hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_GFX1201_TOPK_GATHER_TILED")
+                        .as_deref()
+                        != Ok("0");
+                if tiled_gfx1201 {
+                    gpu.deepseek4_topk_kv_gather_batched_tiled_gfx1201(
+                        main_kv_cache,
+                        &pbs.idx_topk_indices_batch,
+                        &pbs.topk_staged_batch,
+                        topk_max as i32,
+                        head_dim as i32,
+                        n_compressed,
+                        topk_max as i32,
+                        0,
+                        /*scale=*/ 1.0,
+                        batch_size as i32,
+                    )
+                    .map_err(|e| {
+                        format!(
+                            "deepseek4_topk_kv_gather_batched_tiled_gfx1201 l{layer_idx}: {e:?}"
+                        )
+                    })?;
+                } else {
+                    gpu.deepseek4_topk_kv_gather_batched_f32(
+                        main_kv_cache,
+                        &pbs.idx_topk_indices_batch,
+                        &pbs.topk_staged_batch,
+                        topk_max as i32,
+                        head_dim as i32,
+                        n_compressed,
+                        topk_max as i32,
+                        0,
+                        /*scale=*/ 1.0,
+                        batch_size as i32,
+                    )
+                    .map_err(|e| format!("deepseek4_topk_kv_gather_batched l{layer_idx}: {e:?}"))?;
+                }
             }
 
             // n_active_topk[b] = min(topk_max, n_per_batch[b]) — top-K
