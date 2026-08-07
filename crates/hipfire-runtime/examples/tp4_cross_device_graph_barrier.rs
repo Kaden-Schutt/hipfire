@@ -11,7 +11,7 @@
 //! Repeated exact downloads prove that event nodes bind to the current graph
 //! replay rather than passing on a stale record from the prior replay.
 
-use hip_bridge::{Event, Graph, GraphExec, HIP_EVENT_DISABLE_TIMING, HIP_EVENT_RELEASE_TO_SYSTEM};
+use hip_bridge::{DeviceBuffer, Graph, GraphExec};
 use hipfire_runtime::multi_gpu::Gpus;
 use rdna_compute::{DType, GpuTensor};
 
@@ -19,6 +19,9 @@ const RANKS: usize = 4;
 const ELEMS: usize = 4_096;
 const DELAY_BYTES: usize = 256 * 1024 * 1024;
 const CAPTURE_MODE_RELAXED: u32 = 2;
+const WAIT_EQ: u32 = 0x1;
+const SIGNAL_FLAGS: u32 = 0;
+const SIGNAL_MASK: u32 = u32::MAX;
 
 struct CapturedRank {
     graph: Graph,
@@ -57,7 +60,7 @@ fn main() {
 
     let mut sources: Vec<GpuTensor> = Vec::with_capacity(RANKS);
     let mut delays = Vec::with_capacity(RANKS);
-    let mut events: Vec<Event> = Vec::with_capacity(RANKS);
+    let mut signals: Vec<DeviceBuffer> = Vec::with_capacity(RANKS);
     for rank in 0..RANKS {
         let gpu = &mut gpus.devices[rank];
         gpu.bind_thread().expect("bind source alloc");
@@ -66,11 +69,14 @@ fn main() {
                 .expect("source tensor"),
         );
         delays.push(gpu.hip.malloc(DELAY_BYTES).expect("delay buffer"));
-        events.push(
+        signals.push(
             gpu.hip
-                .event_create_with_flags(HIP_EVENT_DISABLE_TIMING | HIP_EVENT_RELEASE_TO_SYSTEM)
-                .expect("cross-device event"),
+                .malloc_signal(std::mem::size_of::<u64>())
+                .expect("cross-device signal"),
         );
+        gpu.hip
+            .memset(&signals[rank], 0, signals[rank].size())
+            .expect("zero cross-device signal");
     }
 
     gpus.devices[0].bind_thread().expect("bind result alloc");
@@ -96,13 +102,15 @@ fn main() {
     }
     for rank in 0..RANKS {
         let gpu = &gpus.devices[rank];
-        gpu.bind_thread().expect("bind event record");
+        gpu.bind_thread().expect("bind signal write");
         gpu.hip
-            .event_record(
-                &events[rank],
-                Some(gpu.active_stream.as_ref().expect("active stream")),
+            .stream_write_value32(
+                gpu.active_stream.as_ref().expect("active stream"),
+                &signals[rank],
+                1,
+                SIGNAL_FLAGS,
             )
-            .expect("capture producer event");
+            .expect("capture producer signal");
     }
     for destination in 0..RANKS {
         let gpu = &gpus.devices[destination];
@@ -111,8 +119,8 @@ fn main() {
         for source in 0..RANKS {
             if source != destination {
                 gpu.hip
-                    .stream_wait_event(stream, &events[source])
-                    .expect("capture peer event wait");
+                    .stream_wait_value32(stream, &signals[source], 1, WAIT_EQ, SIGNAL_MASK)
+                    .expect("capture peer signal wait");
             }
         }
     }
@@ -153,6 +161,16 @@ fn main() {
         let host_values: Vec<Vec<f32>> = (0..RANKS)
             .map(|rank| vec![(replay * RANKS + rank + 1) as f32; ELEMS])
             .collect();
+
+        // Reset every per-rank barrier slot before any graph is launched. The
+        // production route can do this with one small async memset per rank.
+        for rank in 0..RANKS {
+            let gpu = &gpus.devices[rank];
+            gpu.bind_thread().expect("bind signal reset");
+            gpu.hip
+                .memset(&signals[rank], 0, signals[rank].size())
+                .expect("reset graph signal");
+        }
 
         // Enqueue every producer update before launching any graph. The large
         // prior write makes a stale event record observable rather than a race
