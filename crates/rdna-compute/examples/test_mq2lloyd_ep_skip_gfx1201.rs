@@ -158,12 +158,6 @@ fn main() {
     let candidate_up = gpu
         .alloc_tensor(&[TOP_K, GATE_M / 2], rdna_compute::DType::F32)
         .expect("candidate up");
-    let fixed_gate = gpu
-        .alloc_tensor(&[TOP_K, GATE_M / 2], rdna_compute::DType::F32)
-        .expect("fixed gate");
-    let fixed_up = gpu
-        .alloc_tensor(&[TOP_K, GATE_M / 2], rdna_compute::DType::F32)
-        .expect("fixed up");
 
     gpu.deepseek4_gemv_mq2g256_lloyd_moe_gate_up_indexed(
         &gate_ptrs, &topk, &x, &base_gate, &base_up, GATE_M, GATE_K, TOP_K,
@@ -183,20 +177,6 @@ fn main() {
             TOP_K,
         )
         .expect("gate candidate");
-    gpu.try_gfx1201()
-        .expect("exact gfx1201")
-        .mq2_lloyd_moe_gate_up_k4096_ep(
-            &gate_ptrs,
-            &dummy,
-            &topk,
-            &x,
-            &fixed_gate,
-            &fixed_up,
-            GATE_M,
-            GATE_K,
-            TOP_K,
-        )
-        .expect("fixed gate candidate");
 
     let down_owned0 = gpu
         .upload_raw(
@@ -271,8 +251,6 @@ fn main() {
     let candidate_up_host = gpu
         .download_f32(&candidate_up)
         .expect("download candidate up");
-    let fixed_gate_host = gpu.download_f32(&fixed_gate).expect("download fixed gate");
-    let fixed_up_host = gpu.download_f32(&fixed_up).expect("download fixed up");
     let base_down_host = gpu.download_f32(&base_down).expect("download base down");
     let candidate_down_host = gpu
         .download_f32(&candidate_down)
@@ -280,14 +258,10 @@ fn main() {
     let lds_down_host = gpu.download_f32(&lds_down).expect("download LDS down");
     assert_raw_equal("gate", &base_gate_host, &candidate_gate_host);
     assert_raw_equal("up", &base_up_host, &candidate_up_host);
-    assert_raw_equal("gate-k4096", &candidate_gate_host, &fixed_gate_host);
-    assert_raw_equal("up-k4096", &candidate_up_host, &fixed_up_host);
     assert_raw_equal("down", &base_down_host, &candidate_down_host);
     assert_raw_equal("down-lds", &candidate_down_host, &lds_down_host);
     assert_nonowned_positive_zero("gate", &candidate_gate_host, GATE_M / 2);
     assert_nonowned_positive_zero("up", &candidate_up_host, GATE_M / 2);
-    assert_nonowned_positive_zero("gate-k4096", &fixed_gate_host, GATE_M / 2);
-    assert_nonowned_positive_zero("up-k4096", &fixed_up_host, GATE_M / 2);
     assert_nonowned_positive_zero("down", &candidate_down_host, DOWN_M);
     assert_nonowned_positive_zero("down-lds", &lds_down_host, DOWN_M);
 
@@ -310,20 +284,6 @@ fn main() {
                 TOP_K,
             )
             .expect("warm gate candidate");
-        gpu.try_gfx1201()
-            .expect("exact gfx1201")
-            .mq2_lloyd_moe_gate_up_k4096_ep(
-                &gate_ptrs,
-                &dummy,
-                &topk,
-                &x,
-                &fixed_gate,
-                &fixed_up,
-                GATE_M,
-                GATE_K,
-                TOP_K,
-            )
-            .expect("warm fixed gate candidate");
     }
     gpu.hip.device_synchronize().expect("warmup sync");
 
@@ -349,22 +309,6 @@ fn main() {
                 TOP_K,
             )
             .expect("timed gate candidate");
-    });
-    let gate_fixed_ms = elapsed_ms(&mut gpu, REPEATS, |gpu| {
-        gpu.try_gfx1201()
-            .expect("exact gfx1201")
-            .mq2_lloyd_moe_gate_up_k4096_ep(
-                &gate_ptrs,
-                &dummy,
-                &topk,
-                &x,
-                &fixed_gate,
-                &fixed_up,
-                GATE_M,
-                GATE_K,
-                TOP_K,
-            )
-            .expect("timed fixed gate candidate");
     });
     let down_base_ms = elapsed_ms(&mut gpu, REPEATS, |gpu| {
         gpu.deepseek4_gemv_mq2g256_lloyd_moe_down_expanded_k4(
@@ -400,19 +344,14 @@ fn main() {
     const LAYERS: f32 = 43.0;
     const PRODUCT_TOK_S: f32 = 54.903_755;
     let product_ms = 1000.0 / PRODUCT_TOK_S;
-    let gate_saved_per_token_ms = (gate_candidate_ms - gate_fixed_ms) * LAYERS;
-    let down_saved_per_token_ms = (down_candidate_ms - down_lds_ms) * LAYERS;
-    let saved_per_token_ms = gate_saved_per_token_ms + down_saved_per_token_ms;
+    let saved_per_token_ms = (down_candidate_ms - down_lds_ms) * LAYERS;
     let projected_product_pct = saved_per_token_ms / product_ms * 100.0;
     println!(
         "MICRO owned=2/6 repeats={REPEATS} gate_ms={gate_base_ms:.6}->{gate_candidate_ms:.6} \
-         gate_speedup={:.3}x gate_k4096_ms={gate_fixed_ms:.6} gate_k4096_speedup={:.3}x \
-         gate_saved_43_layers_ms={gate_saved_per_token_ms:.6} down_ms={down_base_ms:.6}->{down_candidate_ms:.6} \
+         gate_speedup={:.3}x down_ms={down_base_ms:.6}->{down_candidate_ms:.6} \
          down_speedup={:.3}x down_lds_ms={down_lds_ms:.6} down_lds_speedup={:.3}x \
-         down_saved_43_layers_ms={down_saved_per_token_ms:.6} bundle_saved_ms={saved_per_token_ms:.6} \
-         bundle_projected_product_pct={projected_product_pct:.3}",
+         saved_43_layers_ms={saved_per_token_ms:.6} projected_product_pct={projected_product_pct:.3}",
         gate_base_ms / gate_candidate_ms,
-        gate_candidate_ms / gate_fixed_ms,
         down_base_ms / down_candidate_ms,
         down_candidate_ms / down_lds_ms,
     );
