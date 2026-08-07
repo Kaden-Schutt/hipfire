@@ -849,6 +849,26 @@ WMMA grid asserted out of scope — different kernarg layout."
 
 ### Task 6: Port `attention_flash_asym3_tile_batched` and `attention_q8_0_flash_prefill`
 
+> **Read this before touching either kernel — corrected by the Task 5 review.**
+> `positions[row] + 1` is the **per-row causal bound**; `desc.seq_len` is the
+> **slot's logical KV length**. They differ whenever a slot has more than one
+> query row (a slot verifying M draft tokens has rows at p, p+1, … p+M−1, and
+> row 0 must not see row 2's key). **`positions[]` stays authoritative for the
+> causal window. The descriptor supplies the slab BASE ADDRESS only.** Do not
+> derive tile counts or loop bounds from `desc.seq_len`.
+>
+> Task 5 got this wrong and it was Critical: the tile kernel bounded itself by
+> `desc.seq_len` while `attention_flash_asym_reduce_batched` still bounded
+> itself by `positions[]`, so the reduce folded stale partials — from a previous
+> sub-batch chunk or a previous layer — into the output, guarded only by a
+> `p[1] > 0.0f` check that stale data usually passes. A negative control
+> reproduced it at `max_abs=4.8e-3`. The asym3 tile kernel shares that same
+> reduce kernel, so the identical trap is live here.
+>
+> Also carry over from Task 5: assert `slot_descs.is_some() == row_slot.is_some()`
+> (the half-configured combination silently pins every row to slot 0), and assert
+> `tree_bias.is_none()` when descriptors are present (out of SP1 scope).
+
 > **Header inclusion — read before editing any `.hip` file.** Kernels are
 > compiled at **runtime** by `hipcc` in a cache directory with **no `-I` to
 > `kernels/src`**, so a literal `#include "kv_slot_desc.h"` does not resolve.
