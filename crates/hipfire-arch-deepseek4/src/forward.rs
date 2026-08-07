@@ -29,9 +29,10 @@ use crate::deepseek4::{
 };
 #[cfg(feature = "harmonic-worker")]
 use crate::harmonic::{
-    HarmonicProtocolError, HarmonicSlotState, HARMONIC_HIDDEN_SIZE, HARMONIC_HOTSET_ROUTE_IDENTITY,
-    HARMONIC_RESULT_EXTENT, HARMONIC_SLOT_COUNT, HARMONIC_SPLIT_RESULT_EXTENT, HARMONIC_TOP_K,
-    HARMONIC_X_ROT_BYTES,
+    HarmonicProtocolError, HarmonicSlotState, HARMONIC_EXPERT_COUNT, HARMONIC_EXPERT_IDS_OFFSET,
+    HARMONIC_HIDDEN_SIZE, HARMONIC_HOTSET_ROUTE_IDENTITY, HARMONIC_RESULT_EXTENT,
+    HARMONIC_ROUTE_WEIGHTS_OFFSET, HARMONIC_SLOT_COUNT, HARMONIC_SPLIT_RESULT_EXTENT,
+    HARMONIC_TOP_K, HARMONIC_X_ROT_BYTES,
 };
 #[cfg(feature = "harmonic-worker")]
 use crate::harmonic_ipc::{harmonic_monotonic_tick, HarmonicIpcError};
@@ -6525,6 +6526,28 @@ fn harmonic_stage_route_payload(
     }
     gpu.bind_thread()
         .map_err(|error| format!("harmonic stage bind dense l{layer_idx}: {error}"))?;
+    if execution.residency_plan.is_some() {
+        let topk_indices = state
+            .moe_topk_indices
+            .as_ref()
+            .ok_or_else(|| "harmonic route indices missing".to_owned())?;
+        let arch = gpu.arch.clone();
+        let mut device = gpu.try_gfx1100().ok_or_else(|| {
+            format!("harmonic route partition requires exact gfx1100, got {arch}")
+        })?;
+        device
+            .harmonic_partition_route(
+                topk_indices,
+                execution.compact_index_map.as_ref().unwrap(),
+                execution.local_topk_indices.as_ref().unwrap(),
+                execution.slot_sources.as_ref().unwrap(),
+                execution.local_topk_count.as_ref().unwrap(),
+                layer_idx,
+                HARMONIC_EXPERT_COUNT as usize,
+                HARMONIC_TOP_K,
+            )
+            .map_err(|error| format!("harmonic route partition l{layer_idx}: {error}"))?;
+    }
     let primary = gpu
         .active_stream
         .as_ref()
@@ -6571,23 +6594,25 @@ fn harmonic_stage_route_payload(
             transfer,
         )
         .map_err(|error| format!("harmonic stage x_rot l{layer_idx}: {error}"))?;
-    let ids_bytes = unsafe {
-        std::slice::from_raw_parts_mut(
-            execution.route_ids.as_mut_ptr().cast::<u8>(),
-            HARMONIC_TOP_K * std::mem::size_of::<u32>(),
-        )
-    };
     gpu.hip
-        .memcpy_dtoh_async(ids_bytes, &topk_indices.buf, transfer)
+        .memcpy_dtod_async_at(
+            &activation,
+            HARMONIC_EXPERT_IDS_OFFSET,
+            &topk_indices.buf,
+            0,
+            HARMONIC_TOP_K * std::mem::size_of::<u32>(),
+            transfer,
+        )
         .map_err(|error| format!("harmonic stage route ids l{layer_idx}: {error}"))?;
-    let weights_bytes = unsafe {
-        std::slice::from_raw_parts_mut(
-            execution.route_weight_bits.as_mut_ptr().cast::<u8>(),
-            HARMONIC_TOP_K * std::mem::size_of::<u32>(),
-        )
-    };
     gpu.hip
-        .memcpy_dtoh_async(weights_bytes, &topk_weights.buf, transfer)
+        .memcpy_dtod_async_at(
+            &activation,
+            HARMONIC_ROUTE_WEIGHTS_OFFSET,
+            &topk_weights.buf,
+            0,
+            HARMONIC_TOP_K * std::mem::size_of::<u32>(),
+            transfer,
+        )
         .map_err(|error| format!("harmonic stage route weights l{layer_idx}: {error}"))
 }
 
@@ -6615,6 +6640,12 @@ fn harmonic_publish_staged_route(
         .map_err(|error| format!("harmonic route transfer completion l{layer_idx}: {error}"))?;
     let route_sync_elapsed = route_sync_start.elapsed();
     execution.record_route_sync(route_sync_elapsed);
+    let (route_ids, route_weight_bits) = execution
+        .ring
+        .read_mapped_activation_metadata(epoch)
+        .map_err(|error| format!("harmonic route metadata l{layer_idx}: {error}"))?;
+    execution.route_ids = route_ids;
+    execution.route_weight_bits = route_weight_bits;
     let packed = if let Some(plan) = execution.residency_plan.as_ref() {
         let mut packed = plan
             .split_result_layout(layer_idx, execution.route_ids)
@@ -6629,36 +6660,6 @@ fn harmonic_publish_staged_route(
                     )
                 })?;
         }
-        let primary = gpu
-            .active_stream
-            .as_ref()
-            .ok_or_else(|| "harmonic split primary stream missing".to_owned())?;
-        let local_bytes = unsafe {
-            std::slice::from_raw_parts(
-                packed.local_expert_ids.as_ptr().cast::<u8>(),
-                HARMONIC_TOP_K * std::mem::size_of::<u32>(),
-            )
-        };
-        gpu.hip
-            .memcpy_htod_async(
-                &execution.local_topk_indices.as_ref().unwrap().buf,
-                local_bytes,
-                primary,
-            )
-            .map_err(|error| format!("harmonic split local ids l{layer_idx}: {error}"))?;
-        let source_bytes = unsafe {
-            std::slice::from_raw_parts(
-                packed.slot_sources.as_ptr().cast::<u8>(),
-                HARMONIC_TOP_K * std::mem::size_of::<u32>(),
-            )
-        };
-        gpu.hip
-            .memcpy_htod_async(
-                &execution.slot_sources.as_ref().unwrap().buf,
-                source_bytes,
-                primary,
-            )
-            .map_err(|error| format!("harmonic split slot sources l{layer_idx}: {error}"))?;
         Some(packed)
     } else {
         None

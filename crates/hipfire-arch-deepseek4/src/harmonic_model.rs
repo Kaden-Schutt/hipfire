@@ -24,7 +24,8 @@ use crate::deepseek4::{
 use crate::forward::PrefillBatchScratch;
 use crate::harmonic::{
     HarmonicContract, HarmonicExpertResidencyPlan, HarmonicOwner, HarmonicPackedExpertRoute,
-    HARMONIC_HIDDEN_SIZE, HARMONIC_MOE_INTERMEDIATE_SIZE, HARMONIC_TOP_K,
+    HARMONIC_EXPERT_COUNT, HARMONIC_HIDDEN_SIZE, HARMONIC_LAYER_COUNT,
+    HARMONIC_MOE_INTERMEDIATE_SIZE, HARMONIC_TOP_K,
 };
 use crate::harmonic_ipc::{harmonic_monotonic_tick, HarmonicGpuMapping, HarmonicSharedRing};
 use crate::harmonic_process::{
@@ -155,7 +156,9 @@ pub(crate) struct DeepseekV4HarmonicExecution {
     pub(crate) epoch: u64,
     pub(crate) timing: DeepseekV4HarmonicTiming,
     pub(crate) residency_plan: Option<HarmonicExpertResidencyPlan>,
+    pub(crate) compact_index_map: Option<GpuTensor>,
     pub(crate) local_topk_indices: Option<GpuTensor>,
+    pub(crate) local_topk_count: Option<GpuTensor>,
     pub(crate) local_gate_batch: Option<GpuTensor>,
     pub(crate) local_up_batch: Option<GpuTensor>,
     pub(crate) local_rot_batch: Option<GpuTensor>,
@@ -200,7 +203,9 @@ impl DeepseekV4HarmonicExecution {
             epoch: 0,
             timing: DeepseekV4HarmonicTiming::default(),
             residency_plan,
+            compact_index_map: None,
             local_topk_indices: None,
+            local_topk_count: None,
             local_gate_batch: None,
             local_up_batch: None,
             local_rot_batch: None,
@@ -242,9 +247,37 @@ impl DeepseekV4HarmonicExecution {
                     .map_err(|error| format!("deepseek4 harmonic route-ready event: {error}"))?,
             );
             if execution.residency_plan.is_some() {
+                let compact_index_table = execution
+                    .residency_plan
+                    .as_ref()
+                    .unwrap()
+                    .compact_index_table();
+                let compact_index_bytes = unsafe {
+                    std::slice::from_raw_parts(
+                        compact_index_table.as_ptr().cast::<u8>(),
+                        compact_index_table.len() * std::mem::size_of::<u32>(),
+                    )
+                };
+                let compact_index_map = gpu
+                    .alloc_tensor(
+                        &[
+                            HARMONIC_LAYER_COUNT as usize,
+                            HARMONIC_EXPERT_COUNT as usize,
+                        ],
+                        DType::F32,
+                    )
+                    .map_err(|error| format!("deepseek4 harmonic compact map: {error}"))?;
+                gpu.hip
+                    .memcpy_htod(&compact_index_map.buf, compact_index_bytes)
+                    .map_err(|error| format!("deepseek4 harmonic compact map upload: {error}"))?;
+                execution.compact_index_map = Some(compact_index_map);
                 execution.local_topk_indices = Some(
                     gpu.alloc_tensor(&[HARMONIC_TOP_K], DType::F32)
                         .map_err(|error| format!("deepseek4 harmonic local indices: {error}"))?,
+                );
+                execution.local_topk_count = Some(
+                    gpu.alloc_tensor(&[1], DType::F32)
+                        .map_err(|error| format!("deepseek4 harmonic local count: {error}"))?,
                 );
                 execution.local_gate_batch = Some(
                     gpu.alloc_tensor(
@@ -360,7 +393,9 @@ impl DeepseekV4HarmonicExecution {
         }
         self.mapping.take();
         for tensor in [
+            self.compact_index_map.take(),
             self.local_topk_indices.take(),
+            self.local_topk_count.take(),
             self.local_gate_batch.take(),
             self.local_up_batch.take(),
             self.local_rot_batch.take(),

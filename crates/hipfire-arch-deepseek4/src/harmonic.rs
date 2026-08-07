@@ -563,6 +563,19 @@ impl HarmonicExpertResidencyPlan {
             .map(|index| index as u32)
     }
 
+    /// Dense, layer-major expert-to-compact-index table consumed by the exact
+    /// gfx1100 route partition kernel. `u32::MAX` denotes a remote-only expert.
+    pub fn compact_index_table(&self) -> Vec<u32> {
+        let mut table =
+            vec![u32::MAX; HARMONIC_LAYER_COUNT as usize * HARMONIC_EXPERT_COUNT as usize];
+        for layer in 0..HARMONIC_LAYER_COUNT as usize {
+            for (compact, expert) in self.experts_in_layer(layer).enumerate() {
+                table[layer * HARMONIC_EXPERT_COUNT as usize + expert as usize] = compact as u32;
+            }
+        }
+        table
+    }
+
     pub const fn slot_bytes(&self) -> u64 {
         self.slot_bytes
     }

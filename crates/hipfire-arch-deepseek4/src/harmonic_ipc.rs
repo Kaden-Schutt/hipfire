@@ -715,6 +715,45 @@ impl HarmonicSharedRing {
         Ok(())
     }
 
+    /// Read route mirrors after the source-local transfer stream has
+    /// completed but before release-publication. This is the CPU half of the
+    /// gfx1100 graph path: the GPU writes the canonical IDs and weight bits
+    /// directly into the registered payload, avoiding a separate D2H buffer.
+    pub fn read_mapped_activation_metadata(
+        &self,
+        epoch: u64,
+    ) -> HarmonicIpcResult<([u32; HARMONIC_TOP_K], [u32; HARMONIC_TOP_K])> {
+        self.require_release_acquire_data_plane()?;
+        let slot = self.slot(epoch);
+        let base = slot.activation_payload.bytes.get().cast::<u8>();
+        let mut expert_ids = [0_u32; HARMONIC_TOP_K];
+        let mut route_weight_bits = [0_u32; HARMONIC_TOP_K];
+        // SAFETY: the caller synchronizes the sole source GPU writer before
+        // reading. Publication has not occurred, so the destination cannot
+        // concurrently consume or mutate this epoch.
+        unsafe {
+            for (index, value) in expert_ids.iter_mut().enumerate() {
+                let mut bytes = [0_u8; std::mem::size_of::<u32>()];
+                ptr::copy_nonoverlapping(
+                    base.add(HARMONIC_EXPERT_IDS_OFFSET + index * mem::size_of::<u32>()),
+                    bytes.as_mut_ptr(),
+                    bytes.len(),
+                );
+                *value = u32::from_le_bytes(bytes);
+            }
+            for (index, value) in route_weight_bits.iter_mut().enumerate() {
+                let mut bytes = [0_u8; std::mem::size_of::<u32>()];
+                ptr::copy_nonoverlapping(
+                    base.add(HARMONIC_ROUTE_WEIGHTS_OFFSET + index * mem::size_of::<u32>()),
+                    bytes.as_mut_ptr(),
+                    bytes.len(),
+                );
+                *value = u32::from_le_bytes(bytes);
+            }
+        }
+        Ok((expert_ids, route_weight_bits))
+    }
+
     /// Reserve a slot and write only a prefix of its activation payload.
     ///
     /// This deliberately leaves the slot in `Publishing`. It exists solely so

@@ -23,6 +23,9 @@ const HARMONIC_SPLIT_COMBINE_CANDIDATE_SRC: &str =
     include_str!("../../../../kernels/src/moe_down_combine_harmonic_split.gfx1100.hip");
 const HARMONIC_SPLIT_COMBINE_CANDIDATE_KERNEL: &str =
     "moe_down_combine_harmonic_split_gfx1100_candidate";
+const HARMONIC_PARTITION_ROUTE_SRC: &str =
+    include_str!("../../../../kernels/src/harmonic_partition_route.gfx1100.hip");
+const HARMONIC_PARTITION_ROUTE_KERNEL: &str = "harmonic_partition_route_gfx1100";
 
 /// A mutable GPU borrow proven to target exact gfx1100.
 ///
@@ -46,6 +49,72 @@ impl Gpu {
 }
 
 impl Gfx1100Device<'_> {
+    /// Partition six canonical DS4 route slots against the immutable local
+    /// replica map without returning IDs to the CPU or uploading packed IDs.
+    #[allow(clippy::too_many_arguments)]
+    pub fn harmonic_partition_route(
+        &mut self,
+        expert_ids: &GpuTensor,
+        compact_index_map: &GpuTensor,
+        local_expert_ids: &GpuTensor,
+        slot_sources: &GpuTensor,
+        local_count: &GpuTensor,
+        layer: usize,
+        expert_count: usize,
+        top_k: usize,
+    ) -> HipResult<()> {
+        assert_eq!(expert_ids.buf.size(), top_k * std::mem::size_of::<u32>());
+        assert!(layer < 43, "gfx1100 harmonic layer must be below 43");
+        assert_eq!(
+            expert_count, 256,
+            "gfx1100 harmonic expert count must be 256"
+        );
+        assert_eq!(top_k, 6, "gfx1100 harmonic top-k must be 6");
+        self.gpu.bind_thread()?;
+        self.gpu.ensure_kernel(
+            HARMONIC_PARTITION_ROUTE_KERNEL,
+            HARMONIC_PARTITION_ROUTE_SRC,
+            HARMONIC_PARTITION_ROUTE_KERNEL,
+        )?;
+        let ids_ptr = expert_ids.buf.as_ptr();
+        let map_ptr = compact_index_map.buf.as_ptr();
+        let local_ptr = local_expert_ids.buf.as_ptr();
+        let sources_ptr = slot_sources.buf.as_ptr();
+        let count_ptr = local_count.buf.as_ptr();
+        let layer_i32 = layer as i32;
+        let expert_count_i32 = expert_count as i32;
+        let top_k_i32 = top_k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &ids_ptr as *const _ as *mut c_void,
+            &map_ptr as *const _ as *mut c_void,
+            &local_ptr as *const _ as *mut c_void,
+            &sources_ptr as *const _ as *mut c_void,
+            &count_ptr as *const _ as *mut c_void,
+            &layer_i32 as *const _ as *mut c_void,
+            &expert_count_i32 as *const _ as *mut c_void,
+            &top_k_i32 as *const _ as *mut c_void,
+        ];
+        self.gpu.launch_maybe_blob(
+            HARMONIC_PARTITION_ROUTE_KERNEL,
+            [1, 1, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut blob = KernargBlob::new();
+                blob.push_ptr(ids_ptr);
+                blob.push_ptr(map_ptr);
+                blob.push_ptr(local_ptr);
+                blob.push_ptr(sources_ptr);
+                blob.push_ptr(count_ptr);
+                blob.push_i32(layer_i32);
+                blob.push_i32(expert_count_i32);
+                blob.push_i32(top_k_i32);
+                blob
+            },
+        )
+    }
+
     /// Shipping K4+LDS gate/up implementation under an exact-gfx1100 proof.
     ///
     /// The shared kernel was explicitly ported from the gfx1100 MQ3 pattern;
