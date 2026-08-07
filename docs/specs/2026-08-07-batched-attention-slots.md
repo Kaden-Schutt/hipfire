@@ -314,37 +314,42 @@ Two structural facts drive this:
   Four slots must read 4× the KV bytes but need not spend 4× the time: there is
   **~2.6-3.1× headroom on the 27B shape and ~3.6-4.6× on the 35B-A3B shape**.
 
-  **SECOND CORRECTION — RETRACTED 2026-08-07, DO NOT USE.** A correction was
-  committed here claiming batching yields only ~1.2-1.26x and recovers <10% of
-  the headroom, concluding that "the largest single win in attention is kernel
-  efficiency, not batching". **That conclusion was drawn from an unfair
-  measurement and is withdrawn.**
+  **MEASURED, third and current statement (2026-08-07).** Two earlier attempts
+  at this paragraph were wrong in opposite directions and are recorded in git
+  history: the original was too pessimistic about *whether* batching helps, and a
+  correction was too optimistic about *how much* — the latter drawn from a
+  benchmark whose sequential arm aliased K to V, touching half the distinct bytes
+  and running artificially fast. That defect was found in review, fixed, and
+  re-measured.
 
-  Task 8's benchmark passed the *same* device buffer as both K and V in the
-  sequential arm while the batched arm used two distinct buffers. The sequential
-  arm therefore touched half the distinct bytes, fitted in cache, and ran
-  artificially fast — biasing the comparison *against* batching, in exactly the
-  direction of the conclusion that was drawn. The review re-measured with
-  distinct K/V buffers:
+  Corrected, 35B-A3B shape, `TILE_SIZE=128`, median of 8 trials:
 
-  | shape | n=2 | n=4 | n=8 |
-  |---|---|---|---|
-  | as published (K aliased to V) | 1.06x | 1.15x | 1.26x |
-  | re-measured (distinct K, V) | ~1.12-1.16x | ~1.26-1.34x | **~1.36-1.47x** |
+  | n_slots | 1 | 2 | 4 | 8 |
+  |---|---|---|---|---|
+  | speedup | 1.00× | 1.16× | 1.21× | **1.36×** |
 
-  Also overturned: the n=1 "descriptor-indirection regression" (0.85x) vanishes
-  at 0.99-1.05x, so descriptor indirection costs approximately nothing; and
-  `TILE_SIZE=256` **passes** the batched-beats-sequential criterion once the arm
-  is fair, and is the fastest setting tested.
+  - **Batching is a real win that grows with slot count**, reaching ~1.36× on the
+    attention term at 8 slots.
+  - **Descriptor indirection is free.** The n=1 case is 1.00×; the previously
+    reported 0.85× "indirection cost" was the aliasing artefact.
+  - Achieved bandwidth at n=8, now counting `partials` round-trip as well as KV
+    (~24% of real DRAM traffic, previously uncounted): **72.2 GB/s** (35B-A3B) and
+    **95.5 GB/s** (27B) against the 223.9 GB/s Triad ceiling.
 
-  A further correction is pending: the GB/s figures count KV traffic only and
-  omit `partials` round-trip, which is ~24% of real DRAM traffic at n=8 — so the
-  utilisation and "headroom unclaimed" numbers are also overstated.
+  **Substantial headroom therefore remains** — roughly 2.3-3× at 8 slots — and
+  batching does not close it. Whether kernel-efficiency work (the 32-thread
+  workgroup, unaligned 34-byte Q8_0 reads, scalar dequant) is a larger prize than
+  further batching is a live and worthwhile question, but it is **not settled by
+  this data** and the earlier confident claim to that effect is withdrawn.
 
-  **The honest state of this question is: unresolved pending a re-run.** What is
-  established is that batching is a real win that grows with slot count; its
-  size, and whether kernel efficiency is the larger prize, both await corrected
-  measurement. The question is therefore **how much of that headroom
+  **Caveat on precision, not direction.** This pass ran on a box under load
+  average 8-9 from unrelated work. Even the shipped default failed the
+  batched-beats-sequential criterion in 1 of 8 trials on noise alone, and the 27B
+  n=2 margin was noisier still. The *direction and growth* of the win are solid;
+  individual margins are ±0.1. `TILE_SIZE=256` measured fastest at every slot
+  count (~7-13% over 128 by n=8) and now passes the criterion once the arm is
+  fair — but **the shipped default stays 128**, and flipping it should wait for a
+  confirmation run on an idle box. The question is therefore **how much of that headroom
   batching recovers**, which §10's batched-vs-sequential sweep measures
   directly. See `docs/perf-checkpoints/2026-08-07-batching-ceiling-probe.md`.
 - **MoE expert reads barely amortise at small batch.** Four sequences drawing
