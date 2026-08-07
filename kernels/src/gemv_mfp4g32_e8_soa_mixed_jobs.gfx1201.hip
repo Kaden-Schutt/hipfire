@@ -79,6 +79,16 @@ __device__ __forceinline__ float e8_dot_row_mixed_gfx1201(
     return acc;
 }
 
+// Operation-for-operation twin of sqrt_softplus_f32.  Keeping the post-op in
+// the row-owner lane removes a dependent elementwise launch without changing
+// the GEMV reduction or the activation arithmetic.
+__device__ __forceinline__ float e8_mixed_sqrt_softplus_gfx1201(float v) {
+    const float sp = (v > 0.0f)
+        ? (v + logf(1.0f + expf(-v)))
+        : logf(1.0f + expf(v));
+    return sqrtf(sp);
+}
+
 __launch_bounds__(32)
 extern "C" __global__ void gemv_mfp4g32_e8_soa_mixed_jobs_gfx1201(
     const char* __restrict__ A0,
@@ -121,4 +131,54 @@ extern "C" __global__ void gemv_mfp4g32_e8_soa_mixed_jobs_gfx1201(
     const float acc = e8_dot_row_mixed_gfx1201(
         weight + (long long)row * row_bytes, x, K);
     if (threadIdx.x == 0) output[row] = acc;
+}
+
+// TP3 FFN pack: identical mixed-row projection with one selected job receiving
+// the model's router activation at the store.  A distinct symbol keeps the
+// already-promoted attention pack's ABI and captured graph identity frozen.
+__launch_bounds__(32)
+extern "C" __global__ void gemv_mfp4g32_e8_soa_mixed_jobs_sqrt_softplus_gfx1201(
+    const char* __restrict__ A0,
+    const char* __restrict__ A1,
+    const char* __restrict__ A2,
+    const char* __restrict__ A3,
+    const char* __restrict__ A4,
+    const char* __restrict__ A5,
+    const char* __restrict__ A6,
+    const float* __restrict__ x,
+    float* __restrict__ y0,
+    float* __restrict__ y1,
+    float* __restrict__ y2,
+    float* __restrict__ y3,
+    float* __restrict__ y4,
+    float* __restrict__ y5,
+    float* __restrict__ y6,
+    int m0, int m1, int m2, int m3, int m4, int m5, int m6,
+    int jobs, int K, int sqrt_softplus_job
+) {
+    int row = (int)blockIdx.x;
+    int job = 0;
+    const int rows[7] = {m0, m1, m2, m3, m4, m5, m6};
+    #pragma unroll
+    for (int candidate = 0; candidate < 6; ++candidate) {
+        if (job == candidate && row >= rows[candidate]) {
+            row -= rows[candidate];
+            ++job;
+        }
+    }
+    if (job >= jobs || row >= rows[job]) return;
+
+    const char* weight = job == 0 ? A0 : job == 1 ? A1 : job == 2 ? A2
+                       : job == 3 ? A3 : job == 4 ? A4 : job == 5 ? A5 : A6;
+    float* output = job == 0 ? y0 : job == 1 ? y1 : job == 2 ? y2
+                  : job == 3 ? y3 : job == 4 ? y4 : job == 5 ? y5 : y6;
+    const int n_blocks = K / 32;
+    const int scale_padded = ((n_blocks + 15) >> 4) << 4;
+    const long long row_bytes = 16LL + scale_padded + (long long)n_blocks * 16;
+    float acc = e8_dot_row_mixed_gfx1201(
+        weight + (long long)row * row_bytes, x, K);
+    if (threadIdx.x == 0) {
+        if (job == sqrt_softplus_job) acc = e8_mixed_sqrt_softplus_gfx1201(acc);
+        output[row] = acc;
+    }
 }
