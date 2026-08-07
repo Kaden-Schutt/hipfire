@@ -19,6 +19,8 @@ use rdna_compute::replay::{Pm4GridPatch, Pm4KernargPatch};
 use rdna_compute::{DType, Gpu, GpuTensor};
 #[cfg(feature = "harmonic-stage-profile")]
 use serde::Serialize;
+#[cfg(not(feature = "harmonic-stage-profile"))]
+use std::time::Instant;
 
 use crate::deepseek4::{DeepseekV4Config, DeepseekV4RoutedWeights};
 #[cfg(not(feature = "harmonic-stage-profile"))]
@@ -59,6 +61,9 @@ struct HarmonicExpertRetainedSplit {
     dispatch_count: usize,
     command_dwords: u32,
     queue_id: u64,
+    replays: u64,
+    gpu_us: f64,
+    host_ns: u64,
 }
 
 #[cfg(feature = "harmonic-stage-profile")]
@@ -244,6 +249,12 @@ impl DeepseekV4HarmonicExpertService {
         })
     }
 
+    pub fn retained_split_timing(&self) -> Option<(u64, f64, u64)> {
+        self.retained_split
+            .as_ref()
+            .map(|retained| (retained.replays, retained.gpu_us, retained.host_ns))
+    }
+
     #[cfg(feature = "harmonic-stage-profile")]
     pub fn stage_timing(&self) -> HarmonicExpertStageTiming {
         self.stage_profile
@@ -384,6 +395,9 @@ impl DeepseekV4HarmonicExpertService {
             dispatch_count,
             command_dwords,
             queue_id,
+            replays: 0,
+            gpu_us: 0.0,
+            host_ns: 0,
         });
         eprintln!(
             "[harmonic] prepared gfx1151 expert chord: dispatches={dispatch_count} command_dwords={command_dwords} queue_id={queue_id} pci={pci_bus_id}"
@@ -958,16 +972,27 @@ impl DeepseekV4HarmonicExpertService {
                     workgroups: [HARMONIC_HIDDEN_SIZE as u32, k_top as u32, 1],
                 },
             ];
+            let retained = self.retained_split.as_mut().unwrap();
+            let replay_start = Instant::now();
             // SAFETY: every patched pointer belongs to this exact gfx1151
             // process and remains live through the synchronous replay.
-            unsafe {
-                self.retained_split
-                    .as_mut()
-                    .unwrap()
-                    .replay
-                    .replay_pm4_patched(packet.epoch as usize, &kernarg_patches, &grid_patches)
+            let replay = unsafe {
+                retained.replay.replay_pm4_patched(
+                    packet.epoch as usize,
+                    &kernarg_patches,
+                    &grid_patches,
+                )
+            };
+            retained.host_ns = retained
+                .host_ns
+                .saturating_add(replay_start.elapsed().as_nanos().min(u64::MAX as u128) as u64);
+            retained.replays = retained.replays.saturating_add(1);
+            if let Ok(timing) = replay.as_ref() {
+                retained.gpu_us += timing.span_microseconds();
             }
-            .map_err(|error| format!("harmonic retained expert chord l{layer_index}: {error}"))?;
+            replay.map_err(|error| {
+                format!("harmonic retained expert chord l{layer_index}: {error}")
+            })?;
         } else {
             self.dispatch_split_kernels(
                 gpu,

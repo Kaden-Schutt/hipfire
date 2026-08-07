@@ -244,6 +244,17 @@ fn run_loaded_worker(
                     "command_dwords": command_dwords,
                     "queue_id": queue_id,
                 })),
+            "harmonic_expert_retained_timing": service
+                .as_ref()
+                .unwrap()
+                .retained_split_timing()
+                .map(|(replays, gpu_us, host_ns)| serde_json::json!({
+                    "replays": replays,
+                    "gpu_us": gpu_us,
+                    "host_ns": host_ns,
+                    "gpu_us_per_replay": gpu_us / replays.max(1) as f64,
+                    "host_us_per_replay": host_ns as f64 / replays.max(1) as f64 / 1_000.0,
+                })),
             "harmonic_expert_owner_hip_calls": {
                 "launch_count": hip_bridge::launch_counters::launch_kernel::count(),
                 "launch_time_ns": hip_bridge::launch_counters::launch_kernel::time_ns(),
