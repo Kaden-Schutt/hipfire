@@ -794,6 +794,8 @@ impl fmt::Debug for CompletionSignal {
 }
 
 impl CompletionSignal {
+    const AMD_SIGNAL_IPC: u64 = 2;
+
     pub fn new(device: &GpuDevice) -> Result<Self, RuntimeError> {
         let mut raw = abi::Signal(0);
         // A zero consumer count permits both GPU barrier packets and the host
@@ -806,6 +808,76 @@ impl CompletionSignal {
         if raw.0 == 0 {
             return Err(RuntimeError::InvalidRuntimeObject(
                 "hsa_signal_create returned handle zero",
+            ));
+        }
+        Ok(Self {
+            runtime: device.runtime.clone(),
+            raw,
+        })
+    }
+
+    /// Create a signal that ROCr permits another process to attach. The
+    /// process exporting the handle must keep this owner live until every
+    /// imported reference has been destroyed.
+    pub fn new_ipc(device: &GpuDevice) -> Result<Self, RuntimeError> {
+        let create = device
+            .runtime
+            .symbols
+            .amd_signal_create
+            .ok_or(RuntimeError::IpcSignalUnavailable("hsa_amd_signal_create"))?;
+        let mut raw = abi::Signal(0);
+        // A zero consumer count admits both GPU agents and the supervising
+        // host. HSA_AMD_SIGNAL_IPC gives the signal system-wide interprocess
+        // visibility under the public ROCr contract.
+        let status = unsafe { create(1, 0, ptr::null(), Self::AMD_SIGNAL_IPC, &mut raw) };
+        check_status(&device.runtime.symbols, "hsa_amd_signal_create", status)?;
+        if raw.0 == 0 {
+            return Err(RuntimeError::InvalidRuntimeObject(
+                "hsa_amd_signal_create returned handle zero",
+            ));
+        }
+        Ok(Self {
+            runtime: device.runtime.clone(),
+            raw,
+        })
+    }
+
+    /// Export the process-independent 256-bit handle for an IPC-capable
+    /// signal. Ordinary completion signals fail closed at ROCr.
+    pub fn export_ipc(&self) -> Result<abi::IpcSignalHandle, RuntimeError> {
+        let export =
+            self.runtime
+                .symbols
+                .ipc_signal_create
+                .ok_or(RuntimeError::IpcSignalUnavailable(
+                    "hsa_amd_ipc_signal_create",
+                ))?;
+        let mut handle = abi::IpcSignalHandle { words: [0; 8] };
+        let status = unsafe { export(self.raw, &mut handle) };
+        check_status(&self.runtime.symbols, "hsa_amd_ipc_signal_create", status)?;
+        Ok(handle)
+    }
+
+    /// Attach an IPC signal exported by another process. Every successful
+    /// attach owns one ROCr reference and is released by `Drop`.
+    pub fn attach_ipc(
+        device: &GpuDevice,
+        handle: &abi::IpcSignalHandle,
+    ) -> Result<Self, RuntimeError> {
+        let attach =
+            device
+                .runtime
+                .symbols
+                .ipc_signal_attach
+                .ok_or(RuntimeError::IpcSignalUnavailable(
+                    "hsa_amd_ipc_signal_attach",
+                ))?;
+        let mut raw = abi::Signal(0);
+        let status = unsafe { attach(handle, &mut raw) };
+        check_status(&device.runtime.symbols, "hsa_amd_ipc_signal_attach", status)?;
+        if raw.0 == 0 {
+            return Err(RuntimeError::InvalidRuntimeObject(
+                "hsa_amd_ipc_signal_attach returned handle zero",
             ));
         }
         Ok(Self {
@@ -2610,6 +2682,7 @@ pub enum RuntimeError {
     DuplicateQueueId,
     InvalidCuMask(&'static str),
     ProfilingUnavailable(&'static str),
+    IpcSignalUnavailable(&'static str),
     InvalidRuntimeObject(&'static str),
     NoKernargPool,
     InvalidKernargAlignment(usize),
@@ -2708,6 +2781,9 @@ impl fmt::Display for RuntimeError {
             Self::InvalidCuMask(message) => write!(f, "invalid HSA CU mask: {message}"),
             Self::ProfilingUnavailable(symbol) => {
                 write!(f, "ROCr profiling capability is unavailable: {symbol}")
+            }
+            Self::IpcSignalUnavailable(symbol) => {
+                write!(f, "ROCr IPC signal capability is unavailable: {symbol}")
             }
             Self::InvalidRuntimeObject(message) => write!(f, "invalid ROCr object: {message}"),
             Self::NoKernargPool => write!(

@@ -93,6 +93,14 @@ pub struct Agent(pub u64);
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct Signal(pub u64);
 
+/// Public `hsa_amd_ipc_signal_t` layout. ROCr aliases this to the 256-bit
+/// `hsa_amd_ipc_memory_t` process-independent handle.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IpcSignalHandle {
+    pub words: [u32; 8],
+}
+
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct MemoryPool(pub u64);
@@ -159,6 +167,10 @@ pub type SignalDestroyFn = unsafe extern "C" fn(Signal) -> Status;
 pub type SignalLoadScAcquireFn = unsafe extern "C" fn(Signal) -> SignalValue;
 pub type SignalStoreRelaxedFn = unsafe extern "C" fn(Signal, SignalValue);
 pub type SignalStoreScReleaseFn = unsafe extern "C" fn(Signal, SignalValue);
+pub type AmdSignalCreateFn =
+    unsafe extern "C" fn(SignalValue, u32, *const Agent, u64, *mut Signal) -> Status;
+pub type IpcSignalCreateFn = unsafe extern "C" fn(Signal, *mut IpcSignalHandle) -> Status;
+pub type IpcSignalAttachFn = unsafe extern "C" fn(*const IpcSignalHandle, *mut Signal) -> Status;
 
 pub type QueueCreateFn = unsafe extern "C" fn(
     Agent,
@@ -254,6 +266,9 @@ pub struct Symbols {
     pub signal_load_scacquire: SignalLoadScAcquireFn,
     pub signal_store_relaxed: SignalStoreRelaxedFn,
     pub signal_store_screlease: SignalStoreScReleaseFn,
+    pub amd_signal_create: Option<AmdSignalCreateFn>,
+    pub ipc_signal_create: Option<IpcSignalCreateFn>,
+    pub ipc_signal_attach: Option<IpcSignalAttachFn>,
     pub queue_create: QueueCreateFn,
     pub queue_destroy: QueueDestroyFn,
     pub queue_inactivate: QueueInactivateFn,
@@ -347,6 +362,9 @@ impl Symbols {
             signal_load_scacquire: symbol!("hsa_signal_load_scacquire", SignalLoadScAcquireFn),
             signal_store_relaxed: symbol!("hsa_signal_store_relaxed", SignalStoreRelaxedFn),
             signal_store_screlease: symbol!("hsa_signal_store_screlease", SignalStoreScReleaseFn),
+            amd_signal_create: optional_symbol!("hsa_amd_signal_create", AmdSignalCreateFn),
+            ipc_signal_create: optional_symbol!("hsa_amd_ipc_signal_create", IpcSignalCreateFn),
+            ipc_signal_attach: optional_symbol!("hsa_amd_ipc_signal_attach", IpcSignalAttachFn),
             queue_create: symbol!("hsa_queue_create", QueueCreateFn),
             queue_destroy: symbol!("hsa_queue_destroy", QueueDestroyFn),
             queue_inactivate: symbol!("hsa_queue_inactivate", QueueInactivateFn),
@@ -446,6 +464,8 @@ const _: () = {
     assert!(std::mem::size_of::<usize>() == 8);
     assert!(std::mem::size_of::<Agent>() == 8);
     assert!(std::mem::size_of::<Signal>() == 8);
+    assert!(std::mem::size_of::<IpcSignalHandle>() == 32);
+    assert!(std::mem::align_of::<IpcSignalHandle>() == 4);
     assert!(std::mem::size_of::<MemoryPool>() == 8);
     assert!(std::mem::size_of::<Queue>() == 40);
     assert!(std::mem::align_of::<Queue>() == 8);
