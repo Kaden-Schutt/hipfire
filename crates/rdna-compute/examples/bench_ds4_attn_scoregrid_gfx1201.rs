@@ -51,6 +51,10 @@ fn run_shape(gpu: &mut Gpu, heads: usize) {
     let d_n_topk = upload_i32(gpu, &[TOPK as i32]);
     let d_reference = gpu.zeros(&[heads, D], DType::F32).expect("reference");
     let d_scoregrid = gpu.zeros(&[heads, D], DType::F32).expect("scoregrid");
+    let d_split3 = gpu.zeros(&[heads, D], DType::F32).expect("split3");
+    let d_split3_scratch = gpu
+        .zeros(&[heads, SWA + TOPK], DType::F32)
+        .expect("split3 scratch");
 
     let launch = |gpu: &mut Gpu, scoregrid: bool, output: &GpuTensor| {
         gpu.deepseek4_attn_swa_topk_f32_buf(
@@ -74,10 +78,28 @@ fn run_shape(gpu: &mut Gpu, heads: usize) {
 
     launch(gpu, false, &d_reference);
     launch(gpu, true, &d_scoregrid);
+    gpu.deepseek4_attn_swa_topk_split3_gfx1201(
+        &d_q,
+        &d_swa,
+        &d_swa,
+        &d_topk,
+        &d_topk,
+        &d_sink,
+        &d_split3_scratch,
+        &d_split3,
+        &d_n_swa,
+        &d_n_topk,
+        heads as i32,
+        D as i32,
+        SWA as i32,
+        TOPK as i32,
+    )
+    .expect("split3 launch");
     gpu.hip.device_synchronize().expect("correctness sync");
 
     let reference = gpu.download_f32(&d_reference).expect("reference output");
     let scoregrid = gpu.download_f32(&d_scoregrid).expect("scoregrid output");
+    let split3 = gpu.download_f32(&d_split3).expect("split3 output");
     let mut raw_equal = 0usize;
     let mut max_abs = 0.0f32;
     let mut max_rel = 0.0f32;
@@ -89,19 +111,61 @@ fn run_shape(gpu: &mut Gpu, heads: usize) {
             max_rel = max_rel.max(abs / expected.abs());
         }
     }
+    let split3_mismatches = reference
+        .iter()
+        .zip(&split3)
+        .filter(|(expected, actual)| expected.to_bits() != actual.to_bits())
+        .count();
 
     for _ in 0..10 {
         launch(gpu, false, &d_reference);
         launch(gpu, true, &d_scoregrid);
+        gpu.deepseek4_attn_swa_topk_split3_gfx1201(
+            &d_q,
+            &d_swa,
+            &d_swa,
+            &d_topk,
+            &d_topk,
+            &d_sink,
+            &d_split3_scratch,
+            &d_split3,
+            &d_n_swa,
+            &d_n_topk,
+            heads as i32,
+            D as i32,
+            SWA as i32,
+            TOPK as i32,
+        )
+        .expect("warm split3");
     }
     gpu.hip.device_synchronize().expect("warmup sync");
 
     let reference_us = elapsed_us(gpu, REPEATS, |gpu| launch(gpu, false, &d_reference));
     let scoregrid_us = elapsed_us(gpu, REPEATS, |gpu| launch(gpu, true, &d_scoregrid));
+    let split3_us = elapsed_us(gpu, REPEATS, |gpu| {
+        gpu.deepseek4_attn_swa_topk_split3_gfx1201(
+            &d_q,
+            &d_swa,
+            &d_swa,
+            &d_topk,
+            &d_topk,
+            &d_sink,
+            &d_split3_scratch,
+            &d_split3,
+            &d_n_swa,
+            &d_n_topk,
+            heads as i32,
+            D as i32,
+            SWA as i32,
+            TOPK as i32,
+        )
+        .expect("timed split3");
+    });
     println!(
-        "heads={heads} n_swa={SWA} n_topk={TOPK} raw_equal={raw_equal}/{} max_abs={max_abs:.9e} max_rel={max_rel:.9e} reference_us={reference_us:.3} scoregrid_us={scoregrid_us:.3} speedup_x={:.4}",
+        "heads={heads} n_swa={SWA} n_topk={TOPK} raw_equal={raw_equal}/{} max_abs={max_abs:.9e} max_rel={max_rel:.9e} reference_us={reference_us:.3} scoregrid_us={scoregrid_us:.3} speedup_x={:.4} split3_us={split3_us:.3} split3_speedup_x={:.4} split3_raw_mismatches={split3_mismatches}",
         reference.len(),
         reference_us / scoregrid_us,
+        reference_us / split3_us,
     );
 }
 
