@@ -9062,7 +9062,11 @@ impl Gpu {
     }
 
     /// Publish one TP4 graph barrier slot with system-scope release semantics.
-    pub fn tp4_graph_signal_store_gfx1201(&mut self, signal: &DeviceBuffer) -> HipResult<()> {
+    pub fn tp4_graph_signal_store_gfx1201(
+        &mut self,
+        signal: &DeviceBuffer,
+        slot: i32,
+    ) -> HipResult<()> {
         self.bind_thread()?;
         if !self.arch_caps.is_gfx1201() {
             return Err(hip_bridge::HipError::new(
@@ -9080,7 +9084,11 @@ impl Gpu {
         )?;
 
         let ptr = signal.as_ptr();
-        let mut params: Vec<*mut c_void> = vec![&ptr as *const _ as *mut c_void];
+        let mut slot_arg = slot;
+        let mut params: Vec<*mut c_void> = vec![
+            &ptr as *const _ as *mut c_void,
+            &mut slot_arg as *mut _ as *mut c_void,
+        ];
         self.launch_maybe_blob(
             "tp4_graph_signal_store_gfx1201",
             [1, 1, 1],
@@ -9090,13 +9098,18 @@ impl Gpu {
             || {
                 let mut b = hip_bridge::KernargBlob::new();
                 b.push_ptr(ptr);
+                b.push_i32(slot);
                 b
             },
         )
     }
 
     /// Wait for the other three TP4 ranks with system-scope acquire semantics.
-    pub fn tp4_graph_signal_wait3_gfx1201(&mut self, signals: [&DeviceBuffer; 3]) -> HipResult<()> {
+    pub fn tp4_graph_signal_wait3_gfx1201(
+        &mut self,
+        signals: [&DeviceBuffer; 3],
+        slot: i32,
+    ) -> HipResult<()> {
         self.bind_thread()?;
         if !self.arch_caps.is_gfx1201() {
             return Err(hip_bridge::HipError::new(
@@ -9116,10 +9129,12 @@ impl Gpu {
         let signal0 = signals[0].as_ptr();
         let signal1 = signals[1].as_ptr();
         let signal2 = signals[2].as_ptr();
+        let mut slot_arg = slot;
         let mut params: Vec<*mut c_void> = vec![
             &signal0 as *const _ as *mut c_void,
             &signal1 as *const _ as *mut c_void,
             &signal2 as *const _ as *mut c_void,
+            &mut slot_arg as *mut _ as *mut c_void,
         ];
         self.launch_maybe_blob(
             "tp4_graph_signal_wait3_gfx1201",
@@ -9132,6 +9147,7 @@ impl Gpu {
                 b.push_ptr(signal0);
                 b.push_ptr(signal1);
                 b.push_ptr(signal2);
+                b.push_i32(slot);
                 b
             },
         )

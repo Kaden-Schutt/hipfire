@@ -5049,6 +5049,269 @@ pub fn forward_ep(
     token: u32,
     position: u32,
 ) -> Result<(), String> {
+    let graph_slots = cfg.num_hidden_layers * 2;
+    let tp4_graph_admitted = gpus.devices.len() == 4
+        && weights_per_rank.len() == 4
+        && state_per_rank.len() == 4
+        && partials.len() == 4
+        && cfg.num_hidden_layers > 0
+        && cfg.mq2r
+        && !cfg.mq2rxt
+        && gpus.peer_access_enabled
+        && gpus.tp4_graph_signals_ready(graph_slots)
+        && gpus
+            .devices
+            .iter()
+            .all(|device| device.arch_caps.is_gfx1201())
+        && weights_per_rank.iter().all(|weights| {
+            let layer = weights.resolve_layer(0);
+            layer.attn_tp_size == 4 && layer.shared_tp_size == 4
+        })
+        // The dump synchronizes and downloads inside the layer loop; it is a
+        // deliberately direct diagnostic route, never a captured product path.
+        && hipfire_config::developer_var("HIPFIRE_EP_DUMP_POS").is_err();
+
+    if tp4_graph_admitted {
+        forward_ep_tp4_graph(
+            gpus,
+            weights_per_rank,
+            cfg,
+            state_per_rank,
+            partials,
+            token,
+            position,
+        )
+    } else {
+        forward_ep_direct(
+            gpus,
+            weights_per_rank,
+            cfg,
+            state_per_rank,
+            partials,
+            token,
+            position,
+        )
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn forward_ep_tp4_graph_body(
+    gpus: &mut hipfire_runtime::multi_gpu::Gpus,
+    weights_per_rank: &[DeepseekV4Weights],
+    cfg: &DeepseekV4Config,
+    state_per_rank: &mut [DeepseekV4State],
+    partials: &[GpuTensor],
+    token: u32,
+    position: u32,
+) -> Result<(), String> {
+    let n = gpus.devices.len();
+    let program = ds4_lower_program();
+    let skip_ffn = config_cache::skip_ffn();
+    for layer_idx in 0..cfg.num_hidden_layers {
+        let mut bindings: Vec<Deepseek4Bindings> = Vec::with_capacity(n);
+        for (rank, state) in state_per_rank.iter_mut().enumerate() {
+            bindings.push(Deepseek4Bindings {
+                cfg,
+                weights: &weights_per_rank[rank],
+                state,
+                layer_idx,
+                position,
+                token_id: token,
+                skip_ffn,
+            });
+        }
+        hipfire_runtime::ep::run_layer_program_ep(
+            gpus,
+            bindings.as_mut_slice(),
+            partials,
+            &program,
+            cfg.hidden_size,
+        )
+        .map_err(|error| format!("ds4 TP4 graph run_layer_program_ep L{layer_idx}: {error}"))?;
+    }
+
+    gpus.devices[0]
+        .bind_thread()
+        .map_err(|error| format!("ds4 TP4 graph final bind: {error:?}"))?;
+    final_norm_and_head(
+        cfg,
+        &weights_per_rank[0],
+        &mut state_per_rank[0],
+        &mut gpus.devices[0],
+    )
+}
+
+fn sync_ep_ranks(gpus: &mut hipfire_runtime::multi_gpu::Gpus, label: &str) -> Result<(), String> {
+    for rank in 0..gpus.devices.len() {
+        gpus.devices[rank]
+            .bind_thread()
+            .map_err(|error| format!("{label} bind rank {rank}: {error:?}"))?;
+        gpus.devices[rank]
+            .hip
+            .device_synchronize()
+            .map_err(|error| format!("{label} sync rank {rank}: {error:?}"))?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn forward_ep_tp4_graph(
+    gpus: &mut hipfire_runtime::multi_gpu::Gpus,
+    weights_per_rank: &[DeepseekV4Weights],
+    cfg: &DeepseekV4Config,
+    state_per_rank: &mut [DeepseekV4State],
+    partials: &[GpuTensor],
+    token: u32,
+    position: u32,
+) -> Result<(), String> {
+    let n = gpus.devices.len();
+    for rank in 0..n {
+        ensure_compressor_capacity(
+            cfg,
+            &mut state_per_rank[rank],
+            &mut gpus.devices[rank],
+            (position as usize).saturating_add(1),
+        )?;
+    }
+
+    // One ordinary pass admits every lazy allocation and JIT module before
+    // four-device capture. Layout growth resets this flag on every rank.
+    if state_per_rank
+        .iter()
+        .any(|state| !state.ar_forward_warmed_up)
+    {
+        for state in state_per_rank.iter_mut() {
+            state.ar_forward_warmed_up = true;
+        }
+        return forward_ep_direct(
+            gpus,
+            weights_per_rank,
+            cfg,
+            state_per_rank,
+            partials,
+            token,
+            position,
+        );
+    }
+
+    // Dynamic embedding stays outside the fixed graph body. Position, cache
+    // state, and token-id uploads are captured from stable host allocations,
+    // exactly like the certified single-device DS4 graph route.
+    for rank in 0..n {
+        gpus.devices[rank]
+            .bind_thread()
+            .map_err(|error| format!("ds4 TP4 graph stage bind {rank}: {error:?}"))?;
+        init_residual_streams(
+            cfg,
+            &weights_per_rank[rank],
+            &mut state_per_rank[rank],
+            &mut gpus.devices[rank],
+            token,
+        )?;
+    }
+
+    let captured = gpus
+        .devices
+        .iter()
+        .filter(|device| device.graphs.graph_exec.is_some())
+        .count();
+    if captured != 0 && captured != n {
+        return Err(format!(
+            "ds4 TP4 graph state is partial: {captured}/{n} rank graphs exist"
+        ));
+    }
+
+    if captured == 0 {
+        gpus.begin_tp4_graph_signal_capture()
+            .map_err(|error| format!("ds4 TP4 graph signal capture: {error:?}"))?;
+        for rank in 0..n {
+            let gpu = &mut gpus.devices[rank];
+            gpu.graphs
+                .begin_graph_capture_relaxed(
+                    &gpu.hip,
+                    gpu.device_id,
+                    gpu.active_stream
+                        .as_ref()
+                        .ok_or_else(|| format!("ds4 TP4 graph rank {rank} has no active stream"))?,
+                )
+                .map_err(|error| format!("ds4 TP4 graph begin rank {rank}: {error:?}"))?;
+        }
+        for rank in 0..n {
+            precompute_positions(
+                cfg,
+                &mut state_per_rank[rank],
+                &mut gpus.devices[rank],
+                position,
+            )?;
+            precompute_token_id(&mut state_per_rank[rank], &mut gpus.devices[rank], token)?;
+        }
+        forward_ep_tp4_graph_body(
+            gpus,
+            weights_per_rank,
+            cfg,
+            state_per_rank,
+            partials,
+            token,
+            position,
+        )?;
+
+        let captured_signals = gpus.tp4_graph_captured_signal_count();
+        let expected_signals = cfg.num_hidden_layers * 2;
+        if captured_signals != expected_signals {
+            return Err(format!(
+                "ds4 TP4 graph captured {captured_signals} barriers, expected {expected_signals}"
+            ));
+        }
+        for rank in 0..n {
+            let gpu = &mut gpus.devices[rank];
+            gpu.graphs
+                .end_graph_capture(&gpu.hip, gpu.device_id, gpu.active_stream.as_ref().unwrap())
+                .map_err(|error| format!("ds4 TP4 graph end rank {rank}: {error:?}"))?;
+        }
+        let blobs: usize = gpus
+            .devices
+            .iter()
+            .map(|device| device.graphs.ar_forward_blobs.len())
+            .sum();
+        eprintln!(
+            "[DeepSeek V4 gfx1201 TP4 hipGraph] captured 4 ranks, {captured_signals} barriers, {blobs} kernarg blobs"
+        );
+    } else {
+        for state in state_per_rank.iter_mut() {
+            update_pos_array_host(cfg, state, position);
+            update_attn_state_host(cfg, state, state.n_tokens as u32);
+            update_token_id_host(state, token);
+        }
+    }
+
+    // Clear all 86 epochs on every rank before any graph launch. Synchronous
+    // signal-memory resets are intentional: async per-rank resets race a fast
+    // peer store against another rank still holding the prior epoch's value.
+    gpus.reset_tp4_graph_signals()
+        .map_err(|error| format!("ds4 TP4 graph reset signals: {error:?}"))?;
+    for rank in 0..n {
+        let gpu = &gpus.devices[rank];
+        gpu.graphs
+            .graph_launch(&gpu.hip, gpu.device_id, gpu.active_stream.as_ref().unwrap())
+            .map_err(|error| format!("ds4 TP4 graph launch rank {rank}: {error:?}"))?;
+    }
+    sync_ep_ranks(gpus, "ds4 TP4 graph")?;
+    for state in state_per_rank.iter_mut() {
+        state.n_tokens += 1;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn forward_ep_direct(
+    gpus: &mut hipfire_runtime::multi_gpu::Gpus,
+    weights_per_rank: &[DeepseekV4Weights],
+    cfg: &DeepseekV4Config,
+    state_per_rank: &mut [DeepseekV4State],
+    partials: &[GpuTensor],
+    token: u32,
+    position: u32,
+) -> Result<(), String> {
     let n = gpus.devices.len();
     assert_eq!(
         weights_per_rank.len(),

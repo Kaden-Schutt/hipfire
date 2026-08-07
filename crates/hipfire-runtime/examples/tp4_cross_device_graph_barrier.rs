@@ -127,7 +127,7 @@ fn main() {
     // stores before any waits so this warmup cannot deadlock.
     for rank in 0..RANKS {
         gpus.devices[rank]
-            .tp4_graph_signal_store_gfx1201(&signals[rank])
+            .tp4_graph_signal_store_gfx1201(&signals[rank], 0)
             .expect("warm graph signal store");
     }
     for destination in 0..RANKS {
@@ -136,7 +136,7 @@ fn main() {
             .map(|source| &signals[source])
             .collect();
         gpus.devices[destination]
-            .tp4_graph_signal_wait3_gfx1201([peer_signals[0], peer_signals[1], peer_signals[2]])
+            .tp4_graph_signal_wait3_gfx1201([peer_signals[0], peer_signals[1], peer_signals[2]], 0)
             .expect("warm graph signal wait");
     }
     for rank in 0..RANKS {
@@ -165,7 +165,7 @@ fn main() {
     }
     for rank in 0..RANKS {
         gpus.devices[rank]
-            .tp4_graph_signal_store_gfx1201(&signals[rank])
+            .tp4_graph_signal_store_gfx1201(&signals[rank], 0)
             .expect("capture producer signal");
     }
     for destination in 0..RANKS {
@@ -174,7 +174,7 @@ fn main() {
             .map(|source| &signals[source])
             .collect();
         gpus.devices[destination]
-            .tp4_graph_signal_wait3_gfx1201([peer_signals[0], peer_signals[1], peer_signals[2]])
+            .tp4_graph_signal_wait3_gfx1201([peer_signals[0], peer_signals[1], peer_signals[2]], 0)
             .expect("capture peer signal wait");
     }
 

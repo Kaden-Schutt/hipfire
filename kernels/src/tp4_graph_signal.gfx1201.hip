@@ -10,25 +10,27 @@
 // correctly, so publish and consume the epoch through system-scope atomics.
 
 extern "C" __global__ void tp4_graph_signal_store_gfx1201(
-    unsigned int *__restrict__ signal) {
+    unsigned int *__restrict__ signals,
+    int slot) {
     if (blockIdx.x == 0 && threadIdx.x == 0) {
         __hip_atomic_exchange(
-            signal, 1u, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+            signals + slot, 1u, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
     }
 }
 
 extern "C" __global__ void tp4_graph_signal_wait3_gfx1201(
-    const unsigned int *__restrict__ signal0,
-    const unsigned int *__restrict__ signal1,
-    const unsigned int *__restrict__ signal2) {
+    const unsigned int *__restrict__ signals0,
+    const unsigned int *__restrict__ signals1,
+    const unsigned int *__restrict__ signals2,
+    int slot) {
     if (blockIdx.x != 0 || threadIdx.x != 0) return;
 
     while (__hip_atomic_load(
-               signal0, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) != 1u ||
+               signals0 + slot, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) != 1u ||
            __hip_atomic_load(
-               signal1, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) != 1u ||
+               signals1 + slot, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) != 1u ||
            __hip_atomic_load(
-               signal2, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) != 1u) {
+               signals2 + slot, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) != 1u) {
         __builtin_amdgcn_s_sleep(1);
     }
 }

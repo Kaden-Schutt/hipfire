@@ -1426,6 +1426,7 @@ impl Drop for Ds4EpStaging {
             dev.invalidate_graph_state();
             dev.drain_pool();
         }
+        let _ = gpus.free_tp4_graph_signals();
     }
 }
 
@@ -1600,6 +1601,24 @@ fn load_model_ep_ds4(path: &str, max_seq: usize, tp: usize) -> Result<LoadedMode
             .zeros(&[config.hidden_size], rdna_compute::DType::F32)
             .map_err(|e| format!("partial {r}: {e:?}"))?;
         staging.partials.push(p);
+    }
+    // Exact-gated gfx1201 MQ2R TP4 graph substrate. Allocate the 43 attention
+    // and 43 FFN boundary epochs before enabling peer access so every pointer
+    // is final when the peer mappings are established. No other architecture,
+    // model, or TP shape receives this state.
+    if tp == 4
+        && config.mq2r
+        && !config.mq2rxt
+        && staging
+            .gpus_mut()
+            .devices
+            .iter()
+            .all(|device| device.arch_caps.is_gfx1201())
+    {
+        staging
+            .gpus_mut()
+            .prepare_tp4_graph_signals(config.num_hidden_layers * 2)
+            .map_err(|e| format!("prepare gfx1201 TP4 graph signals: {e:?}"))?;
     }
     let peer = staging
         .gpus_mut()
@@ -1845,6 +1864,7 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(
             dev.invalidate_graph_state();
             dev.drain_pool();
         }
+        let _ = gpus.free_tp4_graph_signals();
         let _ = gpu;
         return Ok(());
         // `gpus` drops here, tearing down comms + devices.
