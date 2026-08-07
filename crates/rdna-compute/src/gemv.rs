@@ -4733,6 +4733,61 @@ impl Gpu {
         })
     }
 
+    /// Exact-gfx1201 micro candidate: four row waves reuse one LDS-staged X.
+    /// Product dispatch remains on the branchless one-row kernel until the
+    /// full occurrence-weighted DS4 shape screen clears.
+    pub fn gemv_mfp4g32_e8_soa_ldsx4_gfx1201(
+        &mut self,
+        weight: &GpuTensor,
+        x: &GpuTensor,
+        output: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert_eq!(
+            self.arch_caps.arch(),
+            "gfx1201",
+            "LDS-X E8 requires exact gfx1201"
+        );
+        assert!(k % 256 == 0, "LDS-X E8 requires K%256=0");
+        assert_eq!(weight.dtype, DType::MFP4G32E8SOA);
+        const KERNEL: &str = "gemv_mfp4g32_e8_soa_ldsx4_gfx1201";
+        self.ensure_kernel(
+            KERNEL,
+            kernels::GEMV_MFP4G32_E8_SOA_LDSX4_GFX1201_SRC,
+            KERNEL,
+        )?;
+        let a = weight.buf.as_ptr();
+        let x_ptr = x.buf.as_ptr();
+        let y = output.buf.as_ptr();
+        let m_i32 = m as i32;
+        let k_i32 = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &a as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &y as *const _ as *mut c_void,
+            &m_i32 as *const _ as *mut c_void,
+            &k_i32 as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            KERNEL,
+            [m.div_ceil(4) as u32, 1, 1],
+            [128, 1, 1],
+            (k * std::mem::size_of::<f32>()) as u32,
+            &mut params,
+            || {
+                let mut blob = hip_bridge::KernargBlob::new();
+                blob.push_ptr(a);
+                blob.push_ptr(x_ptr);
+                blob.push_ptr(y);
+                blob.push_i32(m_i32);
+                blob.push_i32(k_i32);
+                blob
+            },
+        )
+    }
+
     /// Experimental exact-gfx1201 late-scale E8 screen. This changes FP32
     /// grouping while preserving the mathematical dot product, so no product
     /// route selects it until numerical and model-level parity both clear.

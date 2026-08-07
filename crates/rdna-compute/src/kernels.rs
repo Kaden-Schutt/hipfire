@@ -1135,6 +1135,8 @@ pub const GEMV_MFP4G32_E8_SOA_SRC: &str =
 /// No adjacent architecture selects this source.
 pub const GEMV_MFP4G32_E8_SOA_GFX1201_SRC: &str =
     include_str!("../../../kernels/src/gemv_mfp4g32_e8_soa.gfx1201.hip");
+pub const GEMV_MFP4G32_E8_SOA_LDSX4_GFX1201_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mfp4g32_e8_soa_ldsx4.gfx1201.hip");
 /// gfx1151-specific mfp4-E8 SoA GEMV — fully-coalesced 128B codeword reads.
 /// ONLY dispatched on gfx1151 (Strix Halo); other archs use GEMV_MFP4G32_E8_SOA_SRC.
 pub const GEMV_MFP4G32_E8_SOA_GFX1151_SRC: &str =
