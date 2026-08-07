@@ -27,7 +27,7 @@ where
     gpu.hip.event_elapsed_ms(&start, &stop).expect("elapsed") as f64 * 1_000.0 / repeats as f64
 }
 
-fn run_shape(gpu: &mut Gpu, heads: usize) {
+fn run_shape(gpu: &mut Gpu, heads: usize, active_topk: usize) {
     const D: usize = 512;
     const SWA: usize = 128;
     const TOPK: usize = 512;
@@ -48,9 +48,13 @@ fn run_shape(gpu: &mut Gpu, heads: usize) {
     let d_topk = gpu.upload_f32(&topk, &[D, TOPK]).expect("upload topk");
     let d_sink = gpu.upload_f32(&sink, &[heads]).expect("upload sink");
     let d_n_swa = upload_i32(gpu, &[SWA as i32]);
-    let d_n_topk = upload_i32(gpu, &[TOPK as i32]);
+    let d_n_topk = upload_i32(gpu, &[active_topk as i32]);
     let d_reference = gpu.zeros(&[heads, D], DType::F32).expect("reference");
     let d_scoregrid = gpu.zeros(&[heads, D], DType::F32).expect("scoregrid");
+    let d_coop4 = gpu.zeros(&[heads, D], DType::F32).expect("coop4 output");
+    let d_coop4_scratch = gpu
+        .zeros(&[heads, 1540], DType::F32)
+        .expect("coop4 scratch");
 
     let launch = |gpu: &mut Gpu, scoregrid: bool, output: &GpuTensor| {
         gpu.deepseek4_attn_swa_topk_f32_buf(
@@ -71,13 +75,34 @@ fn run_shape(gpu: &mut Gpu, heads: usize) {
         )
         .expect("attention launch");
     };
+    let launch_coop4 = |gpu: &mut Gpu, output: &GpuTensor| {
+        gpu.deepseek4_attn_swa_topk_coop4_gfx1201(
+            &d_q,
+            &d_swa,
+            &d_swa,
+            &d_topk,
+            &d_topk,
+            &d_sink,
+            output,
+            &d_n_swa,
+            &d_n_topk,
+            &d_coop4_scratch,
+            heads as i32,
+            D as i32,
+            SWA as i32,
+            TOPK as i32,
+        )
+        .expect("coop4 attention launch");
+    };
 
     launch(gpu, false, &d_reference);
     launch(gpu, true, &d_scoregrid);
+    launch_coop4(gpu, &d_coop4);
     gpu.hip.device_synchronize().expect("correctness sync");
 
     let reference = gpu.download_f32(&d_reference).expect("reference output");
     let scoregrid = gpu.download_f32(&d_scoregrid).expect("scoregrid output");
+    let coop4 = gpu.download_f32(&d_coop4).expect("coop4 output");
     let mut raw_equal = 0usize;
     let mut max_abs = 0.0f32;
     let mut max_rel = 0.0f32;
@@ -89,25 +114,35 @@ fn run_shape(gpu: &mut Gpu, heads: usize) {
             max_rel = max_rel.max(abs / expected.abs());
         }
     }
+    let coop4_raw_mismatches = reference
+        .iter()
+        .zip(&coop4)
+        .filter(|(expected, actual)| expected.to_bits() != actual.to_bits())
+        .count();
 
     for _ in 0..10 {
         launch(gpu, false, &d_reference);
         launch(gpu, true, &d_scoregrid);
+        launch_coop4(gpu, &d_coop4);
     }
     gpu.hip.device_synchronize().expect("warmup sync");
 
     let reference_us = elapsed_us(gpu, REPEATS, |gpu| launch(gpu, false, &d_reference));
     let scoregrid_us = elapsed_us(gpu, REPEATS, |gpu| launch(gpu, true, &d_scoregrid));
+    let coop4_us = elapsed_us(gpu, REPEATS, |gpu| launch_coop4(gpu, &d_coop4));
     println!(
-        "heads={heads} n_swa={SWA} n_topk={TOPK} raw_equal={raw_equal}/{} max_abs={max_abs:.9e} max_rel={max_rel:.9e} reference_us={reference_us:.3} scoregrid_us={scoregrid_us:.3} speedup_x={:.4}",
+        "heads={heads} n_swa={SWA} n_topk={active_topk} topk_capacity={TOPK} raw_equal={raw_equal}/{} max_abs={max_abs:.9e} max_rel={max_rel:.9e} reference_us={reference_us:.3} scoregrid_us={scoregrid_us:.3} speedup_x={:.4} coop4_us={coop4_us:.3} coop4_speedup_x={:.4} coop4_raw_mismatches={coop4_raw_mismatches}",
         reference.len(),
         reference_us / scoregrid_us,
+        reference_us / coop4_us,
     );
 }
 
 fn main() {
     let mut gpu = Gpu::init().expect("gpu init");
     assert_eq!(gpu.arch, "gfx1201", "this screen requires exact gfx1201");
-    run_shape(&mut gpu, 24);
-    run_shape(&mut gpu, 16);
+    for active_topk in [16, 512] {
+        run_shape(&mut gpu, 24, active_topk);
+        run_shape(&mut gpu, 16, active_topk);
+    }
 }
