@@ -84,9 +84,10 @@ The candidate is rejected before product wiring. Evidence:
 ## Next gate
 
 The ungrouped E8 family remains hot, but these arithmetic variants do not
-provide the required next step. The next serious decode lever is graph
-structure: the captured TP3 route crosses 86 attention/FFN producer barriers
-per token. A gfx1201-only barrier/HC-consumer composition should be screened
-for removal of graph nodes while preserving fixed-rank reduction arithmetic.
-The parked shared-activation pair is composed only if that bundle's measured
-projection clears 2%; projections are not added arithmetically into a claim.
+provide the required next step. The follow-up graph-resident barrier/HC
+composition was screened and rejected: repeating peer-visible spin handshakes
+across every HC output block made the 86-boundary sequence 4.14x slower despite
+removing 516 graph nodes. See
+`2026-08-07-gfx1201-ds4-tp3-graph-barrier-screen.md`. The parked
+shared-activation pair remains only a bundle ingredient; projections are not
+added arithmetically into a claim.
