@@ -63,7 +63,10 @@ impl Gfx1100Device<'_> {
         expert_count: usize,
         top_k: usize,
     ) -> HipResult<()> {
-        assert_eq!(expert_ids.buf.size(), top_k * std::mem::size_of::<u32>());
+        assert!(
+            expert_ids.buf.size() >= top_k * std::mem::size_of::<u32>(),
+            "gfx1100 harmonic route IDs allocation is undersized"
+        );
         assert!(layer < 43, "gfx1100 harmonic layer must be below 43");
         assert_eq!(
             expert_count, 256,
