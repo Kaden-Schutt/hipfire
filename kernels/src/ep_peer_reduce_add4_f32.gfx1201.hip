@@ -2,6 +2,8 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
+#include <hip/hip_runtime.h>
+
 // Four-rank gfx1201 EP decode reduction. Each rank launches this kernel on its
 // local stream after a cross-rank producer barrier. Peer access makes p0..p3
 // directly readable from every rank, avoiding RCCL setup plus the separate
