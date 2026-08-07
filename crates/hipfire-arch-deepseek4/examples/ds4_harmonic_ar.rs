@@ -38,7 +38,9 @@ fn main() -> Result<(), String> {
                 )
             }
             "--runtime-dir" => {
-                runtime_dir = Some(PathBuf::from(args.next().ok_or("--runtime-dir needs PATH")?))
+                runtime_dir = Some(PathBuf::from(
+                    args.next().ok_or("--runtime-dir needs PATH")?,
+                ))
             }
             "--output" => output = Some(PathBuf::from(args.next().ok_or("--output needs PATH")?)),
             other => return Err(format!("unknown argument '{other}'")),
@@ -89,6 +91,7 @@ fn main() -> Result<(), String> {
     }
     let prefill_secs = prefill_start.elapsed().as_secs_f64();
 
+    loaded.reset_timing()?;
     let decode_start = Instant::now();
     let mut generated = Vec::with_capacity(generate);
     generated.push(greedy(&logits)?);
@@ -98,6 +101,9 @@ fn main() -> Result<(), String> {
         generated.push(greedy(&logits)?);
     }
     let decode_secs = decode_start.elapsed().as_secs_f64();
+    let timing = loaded.timing()?;
+    let timed_tokens = timing.tokens.max(1) as f64;
+    let ms_per_token = |nanos: u64| nanos as f64 / 1_000_000.0 / timed_tokens;
     let decoded = tokenizer.decode_bytes(&generated);
     if let Some(path) = output.as_deref() {
         std::fs::write(path, &decoded)
@@ -115,6 +121,17 @@ fn main() -> Result<(), String> {
         "prefill_tok_s": prompt_tokens.len() as f64 / prefill_secs,
         "decode_seconds": decode_secs,
         "decode_tok_s": generated.len() as f64 / decode_secs,
+        "harmonic_timing": {
+            "timed_tokens": timing.tokens,
+            "timed_layers": timing.layers,
+            "layer_wall_ms_per_token": ms_per_token(timing.layer_wall_ns),
+            "route_sync_ms_per_token": ms_per_token(timing.route_sync_ns),
+            "route_sync_max_us": timing.route_sync_max_ns as f64 / 1_000.0,
+            "expert_wait_ms_per_token": ms_per_token(timing.expert_wait_ns),
+            "expert_wait_max_us": timing.expert_wait_max_ns as f64 / 1_000.0,
+            "publish_cpu_ms_per_token": ms_per_token(timing.publish_cpu_ns),
+            "join_enqueue_cpu_ms_per_token": ms_per_token(timing.join_enqueue_cpu_ns),
+        },
     });
     println!(
         "{}",

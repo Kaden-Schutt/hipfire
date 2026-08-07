@@ -3588,6 +3588,7 @@ pub(crate) fn decode_step_harmonic(
     ensure_ffn_split_resource(cfg, state, gpu)?;
 
     for layer_idx in 0..cfg.num_hidden_layers {
+        let layer_start = std::time::Instant::now();
         ds4_attn_block_harmonic(cfg, weights, state, gpu, execution, layer_idx, position)?;
         mhc_pre(cfg, weights, state, gpu, layer_idx, /*is_attn=*/ false)?;
         ffn_prepare(cfg, weights, state, gpu, layer_idx)?;
@@ -3604,12 +3605,16 @@ pub(crate) fn decode_step_harmonic(
         harmonic_join_result(state, gpu, execution, epoch, layer_idx)?;
         hc_ffn_mix(cfg, weights, state, gpu, layer_idx)?;
         dump_residual_layer_norm(gpu, state, layer_idx, position);
+        execution.record_layer(layer_start.elapsed());
     }
 
     final_norm_and_head(cfg, weights, state, gpu)?;
     state.n_tokens += 1;
-    gpu.download_f32(state.logits.as_ref().unwrap())
-        .map_err(|error| format!("download harmonic logits: {error:?}"))
+    let logits = gpu
+        .download_f32(state.logits.as_ref().unwrap())
+        .map_err(|error| format!("download harmonic logits: {error:?}"))?;
+    execution.record_token();
+    Ok(logits)
 }
 
 /// HIP-graphs-aware decode_step. Opt-in via `HIPFIRE_DEEPSEEK4_GRAPH=1`.
@@ -4598,24 +4603,12 @@ fn ds4_attn_block_harmonic(
                 tmp.sub_offset(0, tmp.numel())
             };
             compressor_forward(
-                cfg,
-                weights,
-                state,
-                gpu,
-                layer_idx,
-                &tmp_view,
-                position,
+                cfg, weights, state, gpu, layer_idx, &tmp_view, position,
                 /*is_indexer=*/ false,
             )?;
             if layer.compress_ratio == 4 {
                 compressor_forward(
-                    cfg,
-                    weights,
-                    state,
-                    gpu,
-                    layer_idx,
-                    &tmp_view,
-                    position,
+                    cfg, weights, state, gpu, layer_idx, &tmp_view, position,
                     /*is_indexer=*/ true,
                 )?;
             }
@@ -6597,6 +6590,7 @@ fn harmonic_publish_staged_route(
     epoch: u64,
     layer_idx: usize,
 ) -> Result<(), String> {
+    let publish_start = std::time::Instant::now();
     let transfer = execution
         .transfer_stream
         .as_ref()
@@ -6607,9 +6601,12 @@ fn harmonic_publish_staged_route(
     // The transfer micro is sub-12 us on both product devices.
     gpu.bind_thread()
         .map_err(|error| format!("harmonic publish bind dense l{layer_idx}: {error}"))?;
+    let route_sync_start = std::time::Instant::now();
     gpu.hip
         .stream_synchronize(transfer)
         .map_err(|error| format!("harmonic route transfer completion l{layer_idx}: {error}"))?;
+    let route_sync_elapsed = route_sync_start.elapsed();
+    execution.record_route_sync(route_sync_elapsed);
     if epoch > HARMONIC_SLOT_COUNT as u64 {
         // Reusing slot N%2 is legal only after the source's GPU has consumed
         // the mapped result from N-2. The current route-ready event was
@@ -6624,20 +6621,12 @@ fn harmonic_publish_staged_route(
     }
     execution
         .ring
-        .write_mapped_activation_metadata(
-            epoch,
-            execution.route_ids,
-            execution.route_weight_bits,
-        )
+        .write_mapped_activation_metadata(epoch, execution.route_ids, execution.route_weight_bits)
         .map_err(|error| format!("harmonic route mirror l{layer_idx}: {error}"))?;
     let now = harmonic_monotonic_tick()
         .map_err(|error| format!("harmonic route clock l{layer_idx}: {error}"))?;
-    let deadline = now.saturating_add(
-        execution
-            .layer_timeout
-            .as_nanos()
-            .min(u64::MAX as u128) as u64,
-    );
+    let deadline =
+        now.saturating_add(execution.layer_timeout.as_nanos().min(u64::MAX as u128) as u64);
     let packet = execution.contract.packet(
         epoch,
         layer_idx as u16,
@@ -6646,10 +6635,12 @@ fn harmonic_publish_staged_route(
         deadline,
         0,
     );
-    execution
+    let result = execution
         .ring
         .publish_mapped(packet, execution.source_generation, now)
-        .map_err(|error| format!("harmonic publish l{layer_idx}: {error}"))
+        .map_err(|error| format!("harmonic publish l{layer_idx}: {error}"));
+    execution.record_publish_cpu(publish_start.elapsed().saturating_sub(route_sync_elapsed));
+    result
 }
 
 #[cfg(feature = "harmonic-worker")]
@@ -6662,25 +6653,19 @@ fn harmonic_join_result(
 ) -> Result<(), String> {
     let deadline = harmonic_monotonic_tick()
         .map_err(|error| format!("harmonic join clock l{layer_idx}: {error}"))?
-        .saturating_add(
-            execution
-                .layer_timeout
-                .as_nanos()
-                .min(u64::MAX as u128) as u64,
-        );
+        .saturating_add(execution.layer_timeout.as_nanos().min(u64::MAX as u128) as u64);
     let mut polls = 0_u32;
+    let expert_wait_start = std::time::Instant::now();
     let resolved = loop {
         match execution
             .ring
             .source_resolve_mapped(epoch, execution.source_generation)
         {
             Ok(resolved) => break resolved,
-            Err(HarmonicIpcError::Protocol(HarmonicProtocolError::SlotNotTerminal {
-                ..
-            })) => {}
+            Err(HarmonicIpcError::Protocol(HarmonicProtocolError::SlotNotTerminal { .. })) => {}
             Err(error) => {
-                let cause = execution
-                    .isolate_worker(format!("harmonic resolve l{layer_idx}: {error}"));
+                let cause =
+                    execution.isolate_worker(format!("harmonic resolve l{layer_idx}: {error}"));
                 return Err(cause);
             }
         }
@@ -6710,6 +6695,7 @@ fn harmonic_join_result(
             std::hint::spin_loop();
         }
     };
+    execution.record_expert_wait(expert_wait_start.elapsed());
     if resolved.state != HarmonicSlotState::Completed
         || resolved
             .completion
@@ -6722,6 +6708,7 @@ fn harmonic_join_result(
         return Err(cause);
     }
 
+    let join_enqueue_start = std::time::Instant::now();
     gpu.bind_thread()
         .map_err(|error| format!("harmonic join bind dense l{layer_idx}: {error}"))?;
     let stream = gpu
@@ -6752,7 +6739,9 @@ fn harmonic_join_result(
         .as_ref()
         .ok_or_else(|| format!("harmonic shared output missing l{layer_idx}"))?;
     gpu.add_inplace_f32(ffn_out, routed_partial)
-        .map_err(|error| format!("harmonic ordered join l{layer_idx}: {error:?}"))
+        .map_err(|error| format!("harmonic ordered join l{layer_idx}: {error:?}"))?;
+    execution.record_join_enqueue_cpu(join_enqueue_start.elapsed());
+    Ok(())
 }
 
 const HETEROGENEOUS_WAIT_EQ: u32 = 0x1;

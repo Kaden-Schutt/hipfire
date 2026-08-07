@@ -100,6 +100,31 @@ pub struct DeepseekV4HarmonicLoadReport {
     pub dense_free_after: usize,
 }
 
+/// Always-on aggregate timing for the harmonic diagnostic route. These are
+/// host-observed synchronization buckets, not kernel-profile claims: route
+/// sync absorbs the gfx1100 prefix through route publication, while expert
+/// wait spans release-publication through gfx1151 completion visibility.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DeepseekV4HarmonicTiming {
+    pub tokens: u64,
+    pub layers: u64,
+    pub layer_wall_ns: u64,
+    pub route_sync_ns: u64,
+    pub route_sync_max_ns: u64,
+    pub expert_wait_ns: u64,
+    pub expert_wait_max_ns: u64,
+    pub publish_cpu_ns: u64,
+    pub join_enqueue_cpu_ns: u64,
+}
+
+impl DeepseekV4HarmonicTiming {
+    fn add_ns(total: &mut u64, elapsed: Duration) -> u64 {
+        let nanos = elapsed.as_nanos().min(u64::MAX as u128) as u64;
+        *total = total.saturating_add(nanos);
+        nanos
+    }
+}
+
 pub(crate) struct DeepseekV4HarmonicExecution {
     pub(crate) dense_attn_stream: Option<Stream>,
     pub(crate) dense_attn_fork_event: Option<Event>,
@@ -115,6 +140,7 @@ pub(crate) struct DeepseekV4HarmonicExecution {
     pub(crate) route_ids: [u32; HARMONIC_TOP_K],
     pub(crate) route_weight_bits: [u32; HARMONIC_TOP_K],
     pub(crate) epoch: u64,
+    pub(crate) timing: DeepseekV4HarmonicTiming,
     ring_path: PathBuf,
     control_socket: PathBuf,
 }
@@ -150,6 +176,7 @@ impl DeepseekV4HarmonicExecution {
             route_ids: [0; HARMONIC_TOP_K],
             route_weight_bits: [0; HARMONIC_TOP_K],
             epoch: 0,
+            timing: DeepseekV4HarmonicTiming::default(),
             ring_path,
             control_socket,
         };
@@ -190,6 +217,33 @@ impl DeepseekV4HarmonicExecution {
             return Err(error);
         }
         Ok(execution)
+    }
+
+    pub(crate) fn record_route_sync(&mut self, elapsed: Duration) {
+        let nanos = DeepseekV4HarmonicTiming::add_ns(&mut self.timing.route_sync_ns, elapsed);
+        self.timing.route_sync_max_ns = self.timing.route_sync_max_ns.max(nanos);
+    }
+
+    pub(crate) fn record_expert_wait(&mut self, elapsed: Duration) {
+        let nanos = DeepseekV4HarmonicTiming::add_ns(&mut self.timing.expert_wait_ns, elapsed);
+        self.timing.expert_wait_max_ns = self.timing.expert_wait_max_ns.max(nanos);
+    }
+
+    pub(crate) fn record_publish_cpu(&mut self, elapsed: Duration) {
+        DeepseekV4HarmonicTiming::add_ns(&mut self.timing.publish_cpu_ns, elapsed);
+    }
+
+    pub(crate) fn record_join_enqueue_cpu(&mut self, elapsed: Duration) {
+        DeepseekV4HarmonicTiming::add_ns(&mut self.timing.join_enqueue_cpu_ns, elapsed);
+    }
+
+    pub(crate) fn record_layer(&mut self, elapsed: Duration) {
+        self.timing.layers = self.timing.layers.saturating_add(1);
+        DeepseekV4HarmonicTiming::add_ns(&mut self.timing.layer_wall_ns, elapsed);
+    }
+
+    pub(crate) fn record_token(&mut self) {
+        self.timing.tokens = self.timing.tokens.saturating_add(1);
     }
 
     pub(crate) fn next_epoch(&mut self) -> Result<u64, String> {
@@ -494,6 +548,22 @@ impl DeepseekV4HarmonicModel {
             token_id,
             position,
         )
+    }
+
+    pub fn reset_timing(&mut self) -> Result<(), String> {
+        let execution = self
+            .execution
+            .as_mut()
+            .ok_or_else(|| "deepseek4 harmonic execution unavailable".to_owned())?;
+        execution.timing = DeepseekV4HarmonicTiming::default();
+        Ok(())
+    }
+
+    pub fn timing(&self) -> Result<DeepseekV4HarmonicTiming, String> {
+        self.execution
+            .as_ref()
+            .map(|execution| execution.timing)
+            .ok_or_else(|| "deepseek4 harmonic execution unavailable".to_owned())
     }
 
     pub fn shutdown(mut self) -> Result<(), String> {

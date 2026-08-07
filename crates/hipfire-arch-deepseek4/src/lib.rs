@@ -94,6 +94,7 @@ pub use harmonic_ipc::{
 #[cfg(feature = "harmonic-worker")]
 pub use harmonic_model::{
     DeepseekV4HarmonicLoadPlan, DeepseekV4HarmonicLoadReport, DeepseekV4HarmonicModel,
+    DeepseekV4HarmonicTiming,
 };
 #[cfg(feature = "harmonic-worker")]
 pub use harmonic_process::{
