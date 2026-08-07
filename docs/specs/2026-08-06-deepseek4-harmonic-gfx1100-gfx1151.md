@@ -115,6 +115,19 @@ Canonical acceptance fixture:
 - Expected decoded bytes: 2,491.
 - Expected decoded MD5: `ee05ab4f07393fb7d624d966a7dde4af`.
 
+Composition screening fixture:
+
+- Prompt source: `benchmarks/prompts/ds4_heterogeneous_code_2048.txt`.
+- Prompt-source MD5: `593234a767e71b97a3a4dad6431b47ce`.
+- Prompt tokens: the first 128 tokens of that committed canonical source.
+- Generated tokens: 128.
+- Batch: 1.
+- Sampling: greedy, temperature 0.
+
+This TG128 fixture exists only for rapid correctness and performance screening
+while the two-owner decode route is being composed. It cannot satisfy T1-T3,
+support a prefill claim, or replace the canonical 2,048/512 promotion run.
+
 No change to weights, quantization, expert count, sampling, prompt, KV policy,
 or arithmetic may manufacture a performance result.
 

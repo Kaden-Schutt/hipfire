@@ -19,10 +19,11 @@ use serde_json::json;
 fn main() -> Result<(), String> {
     let mut args = std::env::args().skip(1);
     let model = PathBuf::from(args.next().ok_or(
-        "usage: ds4_harmonic_ar MODEL --worker PATH --prompt PATH --generate N --runtime-dir PATH [--output PATH] [--hotset-plan PATH] [--model-sha256 HEX --model-len N --model-mtime-secs N --model-mtime-nanos N]",
+        "usage: ds4_harmonic_ar MODEL --worker PATH --prompt PATH --generate N --runtime-dir PATH [--context N] [--output PATH] [--hotset-plan PATH] [--model-sha256 HEX --model-len N --model-mtime-secs N --model-mtime-nanos N]",
     )?);
     let mut worker = None;
     let mut prompt = None;
+    let mut context = 2048_usize;
     let mut generate = None;
     let mut runtime_dir = None;
     let mut output = None;
@@ -35,6 +36,13 @@ fn main() -> Result<(), String> {
         match arg.as_str() {
             "--worker" => worker = Some(PathBuf::from(args.next().ok_or("--worker needs PATH")?)),
             "--prompt" => prompt = Some(PathBuf::from(args.next().ok_or("--prompt needs PATH")?)),
+            "--context" => {
+                context = args
+                    .next()
+                    .ok_or("--context needs N")?
+                    .parse::<usize>()
+                    .map_err(|error| format!("invalid --context: {error}"))?
+            }
             "--generate" => {
                 generate = Some(
                     args.next()
@@ -89,6 +97,9 @@ fn main() -> Result<(), String> {
     if generate == 0 {
         return Err("--generate must be nonzero".to_owned());
     }
+    if context == 0 {
+        return Err("--context must be nonzero".to_owned());
+    }
 
     let inherited_receipt = match (
         model_sha256,
@@ -124,15 +135,25 @@ fn main() -> Result<(), String> {
         .map_err(|error| format!("open tokenizer metadata: {error}"))?;
     let tokenizer = Tokenizer::from_hfq_metadata(&hfq.metadata_json)
         .map_err(|error| format!("load tokenizer: {error}"))?;
-    let prompt_text = std::fs::read_to_string(&prompt)
+    let prompt_bytes = std::fs::read(&prompt)
         .map_err(|error| format!("read prompt {}: {error}", prompt.display()))?;
-    let prompt_tokens = tokenizer.encode(&prompt_text);
-    if prompt_tokens.len() != 2048 {
+    let prompt_md5 = format!("{:x}", md5::compute(&prompt_bytes));
+    let prompt_text = std::str::from_utf8(&prompt_bytes)
+        .map_err(|error| format!("prompt {} is not UTF-8: {error}", prompt.display()))?;
+    let full_prompt_tokens = tokenizer.encode(prompt_text);
+    if full_prompt_tokens.len() != 2048 {
         return Err(format!(
-            "harmonic acceptance prompt must encode to 2048 tokens, got {}",
-            prompt_tokens.len()
+            "harmonic canonical prompt must encode to 2048 tokens, got {}",
+            full_prompt_tokens.len()
         ));
     }
+    if context > full_prompt_tokens.len() {
+        return Err(format!(
+            "--context {context} exceeds canonical prompt length {}",
+            full_prompt_tokens.len()
+        ));
+    }
+    let prompt_tokens = &full_prompt_tokens[..context];
 
     let load_start = Instant::now();
     let mut load_plan = DeepseekV4HarmonicLoadPlan::new(worker, runtime_dir);
@@ -192,6 +213,8 @@ fn main() -> Result<(), String> {
         "model_sha256": loaded.report.model_sha256,
         "dense_pci_bus_id": loaded.report.dense_pci_bus_id,
         "expert_pci_bus_id": loaded.report.expert.pci_bus_id,
+        "prompt_path": prompt,
+        "prompt_md5": prompt_md5,
         "prompt_tokens": prompt_tokens.len(),
         "generated_tokens": generated.len(),
         "decoded_bytes": decoded.len(),

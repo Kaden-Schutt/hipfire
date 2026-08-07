@@ -25,6 +25,7 @@ redline-rocr = { path = "../redline-rocr", optional = true }
 
 [dev-dependencies]
 libloading.workspace = true
+md5 = "0.8"
 
 [features]
 harmonic-fault-injection = []

@@ -776,6 +776,7 @@ dependencies = [
  "hipfire-runtime",
  "libc",
  "libloading",
+ "md5",
  "memmap2",
  "rdna-compute",
  "redline-rocr",
