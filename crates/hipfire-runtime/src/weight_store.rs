@@ -237,6 +237,38 @@ impl WeightStore {
         failures
     }
 
+    /// Consuming checked cleanup that preserves full tensor provenance.
+    ///
+    /// Like [`try_free_all_on_gpu`] but the retained owners are the full
+    /// `GpuTensor`s (real dtype + shape, no fabrication): every buffer is
+    /// freed through `gpu.free_tensor_checked`, and each allocation that
+    /// could not be freed is returned as `(label, GpuTensor)` for retry.
+    ///
+    /// Every allocation is attempted even after prior failures.  Returns
+    /// an empty `Vec` on success.
+    pub fn try_free_all_checked(self, gpu: &mut Gpu) -> Vec<(String, GpuTensor)> {
+        let mut failures: Vec<(String, GpuTensor)> = Vec::new();
+        for ((name, layer, dev), handle) in self.placements {
+            if let WeightHandle::Resident(t) = handle {
+                if dev != 0 {
+                    // Multi-device not supported on single-GPU path.
+                    continue;
+                }
+                let label = match layer {
+                    Some(l) => format!("{name}[{l}]"),
+                    None => name.clone(),
+                };
+                let mut opt = Some(t);
+                if let Err(e) = gpu.free_tensor_checked(&mut opt) {
+                    if let Some(t) = opt.take() {
+                        failures.push((format!("{label} (free_tensor_checked: {e})"), t));
+                    }
+                }
+            }
+        }
+        failures
+    }
+
     /// Start a typed-assembly transaction. Entries taken through the returned
     /// transaction are protected alongside untaken entries until successful
     /// finalization; dropping either transaction form before then frees both

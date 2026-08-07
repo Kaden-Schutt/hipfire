@@ -2,6 +2,7 @@
 //! chain, qwen3 dense transformer) is the only arch-specific seam — see
 //! [`DsparkBody`]. Everything else (main_proj ingest, markov head, confidence
 //! head, window orchestration) lives here.
+use crate::gpu_cleanup::{free_tensor_retained, GpuCleanupFailure, RetainedGpuTensor};
 use crate::spec::{
     accept_greedy_prefix, MtpDrafter, MtpSpeculator, MtpWindow, SpecGrammar, SpecTarget, Speculator,
 };
@@ -250,6 +251,48 @@ impl DsparkWeights {
         .flatten()
         {
             let _ = gpu.free_tensor(tensor);
+        }
+    }
+
+    /// Checked GPU cleanup: attempts every tensor independently, retains
+    /// every allocation that could not be freed for retry.
+    ///
+    /// On success all resources are consumed (`Ok(())`). On failure the
+    /// returned [`GpuCleanupFailure`] carries the exact original tensors
+    /// that could not be freed, ready for retry.
+    pub fn free_checked(self, gpu: &mut Gpu) -> Result<(), GpuCleanupFailure> {
+        let Self {
+            cfg: _,
+            main_proj,
+            main_norm,
+            markov_w1,
+            markov_w2,
+            confidence_proj,
+            confidence_bias,
+            d2t: _,
+        } = self;
+        let mut failures: Vec<RetainedGpuTensor> = Vec::new();
+
+        for (label, t) in [
+            ("DsparkWeights.main_proj", main_proj),
+            ("DsparkWeights.main_norm", main_norm),
+            ("DsparkWeights.markov_w1", markov_w1),
+            ("DsparkWeights.markov_w2", markov_w2),
+            ("DsparkWeights.confidence_proj", confidence_proj),
+            ("DsparkWeights.confidence_bias", confidence_bias),
+        ] {
+            if let Some(t) = t {
+                free_tensor_retained(label, t, gpu, &mut failures);
+            }
+        }
+
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(GpuCleanupFailure {
+                failed_tensors: failures,
+                other: Vec::new(),
+            })
         }
     }
 }
@@ -1156,7 +1199,9 @@ impl MtpDrafter for DsparkDrafter {
         let no_abort = || false;
         let abort = abort.unwrap_or(&no_abort);
         match target.spec_advance(gpu, fill_tokens, start_pos, false, abort, None)? {
-            crate::spec::SpecAdvance::Ready { last_argmax, .. } if !abort() => Ok(Some(last_argmax)),
+            crate::spec::SpecAdvance::Ready { last_argmax, .. } if !abort() => {
+                Ok(Some(last_argmax))
+            }
             crate::spec::SpecAdvance::Ready { .. } | crate::spec::SpecAdvance::Aborted => Ok(None),
         }
     }

@@ -892,7 +892,7 @@ fn cleanup_errors_message(cleanup: &[String]) -> String {
 /// Summarize a checked weights cleanup failure for this single-shot harness.
 /// The retained-owner count and diagnostics are surfaced, but the owners are
 /// not preserved across the public string error; exact retention is STEP-002R.
-fn ep2_weights_cleanup_errors(e: crate::qwen35::Qwen35CleanupFailure) -> Vec<String> {
+fn ep2_weights_cleanup_errors(e: hipfire_runtime::gpu_cleanup::GpuCleanupFailure) -> Vec<String> {
     let mut out = Vec::new();
     out.push(format!(
         "weights free_checked: {} tensor(s) retained",
@@ -1654,8 +1654,8 @@ mod tests {
     fn ep2_weights_cleanup_errors_reports_retained_owners() {
         // The checked weights cleanup's retry/retention owners are surfaced
         // by count + summaries — never converted to a best-effort drop.
-        let f = crate::qwen35::Qwen35CleanupFailure {
-            failed_tensors: vec![crate::qwen35::RetainedQwenTensor {
+        let f = hipfire_runtime::gpu_cleanup::GpuCleanupFailure {
+            failed_tensors: vec![hipfire_runtime::gpu_cleanup::RetainedGpuTensor {
                 label: "token_embd".into(),
                 tensor: GpuTensor::null_for_test(),
                 last_error: "bind failed".into(),

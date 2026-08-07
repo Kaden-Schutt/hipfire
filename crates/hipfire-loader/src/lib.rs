@@ -25,6 +25,7 @@ use hipfire_arch_qwen35::speculative::DeltaNetSnapshot;
 use hipfire_arch_qwen35::Qwen35Bundle;
 use hipfire_arch_qwen35_vl::qwen35_vl;
 use hipfire_runtime::cask::CaskCtx;
+use hipfire_runtime::gpu_cleanup::{BundleTeardown, GpuCleanupFailure};
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama;
 use hipfire_runtime::llama::KvCache;
@@ -347,6 +348,26 @@ pub enum ModelState {
     Cohere2Moe(Cohere2MoeBundle),
     Deepseek4(hipfire_arch_deepseek4::Deepseek4Bundle),
     DotsOcr(hipfire_arch_dots_ocr::DotsOcrBundle),
+}
+
+/// Every ModelState variant implements checked owner-preserving teardown,
+/// so `unload_model` dispatches through ONE trait method instead of an
+/// unchecked per-arch free chain. The exhaustive match keeps the
+/// compile-time invariant: adding a variant without a teardown arm is a
+/// build error.
+impl BundleTeardown for ModelState {
+    fn free_checked(self, gpu: &mut rdna_compute::Gpu) -> Result<(), GpuCleanupFailure> {
+        match self {
+            ModelState::Qwen2(b) => b.free_checked(gpu),
+            ModelState::Qwen35(b) => b.free_checked(gpu),
+            ModelState::Llama(b) => b.free_checked(gpu),
+            ModelState::Lfm2Moe(b) => b.free_checked(gpu),
+            ModelState::Minimax(b) => b.free_checked(gpu),
+            ModelState::Cohere2Moe(b) => b.free_checked(gpu),
+            ModelState::Deepseek4(b) => b.free_checked(gpu),
+            ModelState::DotsOcr(b) => b.free_checked(gpu),
+        }
+    }
 }
 
 /// A typed discriminant for the architecture state used by reset ownership
@@ -685,7 +706,8 @@ impl LoadedModel {
             self.ep.as_ref(),
             &self.state,
         )?;
-        self.reset_checked(gpu).map_err(|message| ResetError::Session { message })?;
+        self.reset_checked(gpu)
+            .map_err(|message| ResetError::Session { message })?;
         if let Some(spec) = self.speculator.as_mut() {
             spec.reset(gpu)
                 .map_err(|message| ResetError::Speculator { message })?;
@@ -1550,7 +1572,35 @@ pub(crate) fn parse_state_quant(
 
 // ─── Core arch carrier load ─────────────────────────────────────────────
 
+/// Log an MTP-head load failure after retrying every retained owner.
+/// Exact-retention contract: owners are retried; whatever still fails is
+/// named in the log — never dropped silently.
+fn log_mtp_load_failure(
+    kind: &str,
+    e: hipfire_arch_qwen35::mtp_head::MtpHeadLoadError,
+    gpu: &mut Gpu,
+) {
+    let hipfire_arch_qwen35::mtp_head::MtpHeadLoadError { message, retained } = e;
+    let mut still_failed = Vec::new();
+    for r in retained {
+        if let Err(r) = r.retry(gpu) {
+            still_failed.push(r.label().to_string());
+        }
+    }
+    let mut note = format!("  MTP head ({kind}) load failed: {message} — MTP serving disabled");
+    if !still_failed.is_empty() {
+        note.push_str(&format!(
+            " ({} retained owner(s) could not be freed: {})",
+            still_failed.len(),
+            still_failed.join(", ")
+        ));
+    }
+    eprintln!("{note}");
+}
+
 /// Hard-error free for unfinished qwen35 finish path: bundle + optional VL.
+/// The bundle free is checked (exact-retention): if any owner survives the
+/// first attempt, a single retry runs; whatever still fails is logged.
 fn rollback_unfinished_qwen35(
     err: String,
     bundle: Qwen35Bundle,
@@ -1558,8 +1608,18 @@ fn rollback_unfinished_qwen35(
     gpu: &mut Gpu,
 ) -> String {
     let mut notes = Vec::new();
-    if let Err(c) = hipfire_arch_qwen35::free_qwen35_bundle(bundle, gpu) {
-        notes.push(c);
+    if let Err(cf) = hipfire_arch_qwen35::free_qwen35_bundle(bundle, gpu) {
+        let summaries = cf.error_summaries();
+        match cf.retry(gpu) {
+            Ok(()) => notes.push(format!(
+                "first cleanup attempt failed ({} owner(s)) but retry succeeded",
+                summaries.len()
+            )),
+            Err(remaining) => notes.push(format!(
+                "cleanup failed: {}",
+                remaining.error_summaries().join("; ")
+            )),
+        }
     }
     if let Some(vw) = vision_weights {
         vw.free_gpu(gpu);
@@ -1869,7 +1929,7 @@ fn finish_qwen35_load(
         let bundled = match mtp_head::load_mtp_head_bundled(trunk_path, ctx.gpu, physical_cap) {
             Ok(h) => h,
             Err(e) => {
-                eprintln!("  MTP head (bundled) load failed: {e} — MTP serving disabled");
+                log_mtp_load_failure("bundled", e, ctx.gpu);
                 None
             }
         };
@@ -1896,9 +1956,10 @@ fn finish_qwen35_load(
                             Some(h)
                         }
                         Err(e) => {
-                            eprintln!(
-                                "  MTP head (sidecar {}) load failed: {e} — MTP serving disabled",
-                                sidecar.display()
+                            log_mtp_load_failure(
+                                &format!("sidecar {}", sidecar.display()),
+                                e,
+                                ctx.gpu,
                             );
                             None
                         }
@@ -2842,7 +2903,12 @@ impl Drop for MinimaxEpStaging {
 /// built from the TP degree.
 pub fn load_model_ep(path: &str, max_seq: usize, tp: usize) -> Result<LoadedModel, String> {
     let mesh = DeviceMesh::rect(&[(DimKind::Tp, tp.max(1))]);
-    load_model_ep_with_mesh(path, max_seq, &mesh, hipfire_runtime::loader_api::SpecLoadCfg::default())
+    load_model_ep_with_mesh(
+        path,
+        max_seq,
+        &mesh,
+        hipfire_runtime::loader_api::SpecLoadCfg::default(),
+    )
 }
 
 /// EP load with an explicit mesh + spec (device-mesh admission path).
@@ -3441,42 +3507,42 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(
                     }
                 }
             }
-                EpArch::Minimax {
-                    weights,
-                    state,
-                    partials,
-                    ..
-                } => {
-                    for (r, w) in weights.into_iter().enumerate() {
-                        if let Some(dev) = gpus.devices.get_mut(r) {
-                            let _ = dev.bind_thread();
-                            w.free_gpu(dev);
-                        }
+            EpArch::Minimax {
+                weights,
+                state,
+                partials,
+                ..
+            } => {
+                for (r, w) in weights.into_iter().enumerate() {
+                    if let Some(dev) = gpus.devices.get_mut(r) {
+                        let _ = dev.bind_thread();
+                        w.free_gpu(dev);
                     }
-                    for (r, s) in state.into_iter().enumerate() {
-                        if let Some(dev) = gpus.devices.get_mut(r) {
-                            let _ = dev.bind_thread();
-                            s.free_gpu(dev);
-                        }
+                }
+                for (r, s) in state.into_iter().enumerate() {
+                    if let Some(dev) = gpus.devices.get_mut(r) {
+                        let _ = dev.bind_thread();
+                        s.free_gpu(dev);
                     }
-                    for (r, p) in partials.into_iter().enumerate() {
-                        if let Some(dev) = gpus.devices.get_mut(r) {
-                            let _ = dev.bind_thread();
-                            let _ = dev.free_tensor(p);
-                        }
+                }
+                for (r, p) in partials.into_iter().enumerate() {
+                    if let Some(dev) = gpus.devices.get_mut(r) {
+                        let _ = dev.bind_thread();
+                        let _ = dev.free_tensor(p);
                     }
                 }
             }
-            for dev in gpus.devices.iter_mut() {
-                let _ = dev.bind_thread();
-                dev.invalidate_weight_caches();
-                dev.invalidate_graph_state();
-                dev.drain_pool();
-            }
-            let _ = gpu;
-            // `gpus` drops here, tearing down comms + devices.
-            return Ok(());
         }
+        for dev in gpus.devices.iter_mut() {
+            let _ = dev.bind_thread();
+            dev.invalidate_weight_caches();
+            dev.invalidate_graph_state();
+            dev.drain_pool();
+        }
+        let _ = gpu;
+        // `gpus` drops here, tearing down comms + devices.
+        return Ok(());
+    }
     if m.pp > 1 {
         let mut gpus = m.pp_gpus.expect("pp>1 must carry pp_gpus");
         if let Some(scratch_set) = m.pp_scratch_set {
@@ -3485,8 +3551,7 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(
         match m.state.take() {
             Some(ModelState::Qwen35(b)) => {
                 b.kv_cache.free_gpu_multi(&mut gpus);
-                let la_to_device =
-                    m.pp_dn_la_to_device.expect("pp>1 must carry la_to_device");
+                let la_to_device = m.pp_dn_la_to_device.expect("pp>1 must carry la_to_device");
                 b.dn_state.free_gpu_multi(&mut gpus, &la_to_device);
                 b.weights.free_gpu_multi(&mut gpus);
             }
@@ -3549,45 +3614,19 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(
     for (_, snap) in m.dflash_checkpoints {
         snap.free_gpu(gpu);
     }
-    // Free arch-specific GPU state from the carrier bundle
+    // Free arch-specific GPU state from the carrier bundle — every arch
+    // teardown is checked and owner-preserving via `BundleTeardown`
+    // (single-device path; the PP/EP multi-device paths above keep their
+    // own multi-GPU teardown). Retry once before logging: whatever still
+    // fails is a bounded leak the operator must know about.
     if let Some(state) = m.state {
-        match state {
-            ModelState::Qwen2(b) => {
-                b.state.free_gpu(gpu);
-                b.weights.free_gpu(gpu);
-            }
-            ModelState::Qwen35(b) => {
-                note(b.kv_cache.free_gpu(gpu).map_err(|e| e.to_string()));
-                b.scratch.free_gpu(gpu);
-                b.weights.free_gpu(gpu);
-                b.dn_state.free_gpu(gpu);
-            }
-            ModelState::Llama(b) => {
-                b.scratch.free_gpu(gpu);
-                b.weights.free_gpu(gpu);
-                note(b.kv.free_gpu(gpu).map_err(|e| e.to_string()));
-            }
-            ModelState::Lfm2Moe(b) => {
-                b.state.free_gpu(gpu);
-                b.weights.free_gpu(gpu);
-            }
-            ModelState::Minimax(b) => {
-                b.state.free_gpu(gpu);
-                b.weights.free_gpu(gpu);
-            }
-            ModelState::Cohere2Moe(b) => {
-                b.state.free_gpu(gpu);
-                b.weights.free_gpu(gpu);
-            }
-            ModelState::Deepseek4(b) => {
-                b.pbs.free_gpu(gpu);
-                b.state.free_gpu(gpu);
-                b.weights.free_gpu(gpu);
-            }
-            ModelState::DotsOcr(b) => {
-                b.weights.free_gpu(gpu);
-                b.state.free_gpu(gpu);
-                // config is host-side — no GPU free
+        if let Err(cf) = state.free_checked(gpu) {
+            match cf.retry(gpu) {
+                Ok(()) => {} // first attempt partially failed; retry cleaned up
+                Err(remaining) => note(Err(format!(
+                    "state teardown: {}",
+                    remaining.error_summaries().join("; ")
+                ))),
             }
         }
     }
@@ -3637,42 +3676,24 @@ mod registry_tests {
 
     #[test]
     fn skeleton_defaults_mtp_k() {
-        let model = LoadedModel::skeleton(
-            5,
-            test_tokenizer(),
-            128,
-            128,
-            "model.mq4".to_string(),
-            None,
-        );
+        let model =
+            LoadedModel::skeleton(5, test_tokenizer(), 128, 128, "model.mq4".to_string(), None);
 
         assert_eq!(model.mtp_k, 3);
     }
 
     #[test]
     fn skeleton_defaults_mtp_mode() {
-        let model = LoadedModel::skeleton(
-            5,
-            test_tokenizer(),
-            128,
-            128,
-            "model.mq4".to_string(),
-            None,
-        );
+        let model =
+            LoadedModel::skeleton(5, test_tokenizer(), 128, 128, "model.mq4".to_string(), None);
 
         assert_eq!(model.mtp_mode, "auto");
     }
 
     #[test]
     fn skeleton_pp_carries_flat_pipeline_fields() {
-        let model = LoadedModel::skeleton(
-            5,
-            test_tokenizer(),
-            128,
-            128,
-            "model.mq4".to_string(),
-            None,
-        );
+        let model =
+            LoadedModel::skeleton(5, test_tokenizer(), 128, 128, "model.mq4".to_string(), None);
         assert_eq!(model.mtp_k, 3);
         assert_eq!(model.mtp_mode, "auto");
         assert!(model.pp_gpus.is_none());
@@ -3878,6 +3899,194 @@ mod registry_tests {
             after, baseline,
             "unload_model leaked published Qwen35 DFlash state: baseline={baseline}, after={after}"
         );
+    }
+
+    /// Per-arch load → unload cycle through the REAL production path
+    /// (`load_model` → `unload_model`), asserting the generic
+    /// `BundleTeardown` teardown returns VRAM to baseline. One warm-up
+    /// cycle absorbs kernel/module residency; the measured cycle must land
+    /// within 64 MiB of its baseline. Cohere2Moe has no fixture on the
+    /// canonical machine — env-override via `HIPFIRE_TEARDOWN_<NAME>`.
+    #[test]
+    #[ignore = "requires an AMD GPU plus per-arch model fixtures"]
+    fn bundle_teardown_unload_reclaims_vram_all_arches() {
+        use std::path::Path;
+        use std::sync::Mutex;
+
+        static GPU_LOCK: Mutex<()> = Mutex::new(());
+        let _lock = GPU_LOCK.lock().unwrap();
+
+        let home = std::env::var("HOME").expect("HOME required for default model paths");
+        let base = format!("{home}/.hipfire/models");
+        let fixture = |name: &str| -> Option<String> {
+            let env_key = format!("HIPFIRE_TEARDOWN_{}", name.to_uppercase().replace('-', "_"));
+            std::env::var(&env_key).ok().or_else(|| {
+                let p = format!("{base}/{name}");
+                Path::new(&p).exists().then(|| p)
+            })
+        };
+
+        // (arch label, fixture path). Cohere2Moe has no fixture on this
+        // machine — it stays None unless env-overridden.
+        let cases: Vec<(&str, String)> = [
+            ("qwen2", fixture("qwen25-0.5b-instruct.mq4")),
+            ("qwen35", fixture("qwen3.5-9b.mq4")),
+            ("llama", fixture("qwen3-8b.mq4")),
+            ("lfm2moe", fixture("lfm2.5-8b-a1b.mq4")),
+            ("minimax", fixture("MiniMax-M2.7.mq2")),
+            ("cohere2moe", None),
+            ("deepseek4", fixture("deepseek-v4-flash.mq2lloyd")),
+            ("dots-ocr", fixture("dots-ocr.q8.hfq")),
+        ]
+        .into_iter()
+        .filter_map(|(label, path)| path.map(|p| (label, p)))
+        .collect();
+
+        assert!(
+            !cases.is_empty(),
+            "no per-arch fixtures found under {base} (set HIPFIRE_TEARDOWN_<NAME> to override)"
+        );
+        let labels: Vec<&str> = cases.iter().map(|(l, _)| *l).collect();
+        eprintln!(
+            "[teardown] verifying {} arch bundle(s): {labels:?}",
+            cases.len()
+        );
+
+        let mut gpu = rdna_compute::Gpu::init().expect("Gpu::init");
+        let cask = super::CaskConfig::default();
+        let mesh = super::DeviceMesh::single();
+        let spec = super::SpecLoadCfg::default();
+        let mut failures: Vec<String> = Vec::new();
+
+        for (label, path) in &cases {
+            let load = |gpu: &mut rdna_compute::Gpu| {
+                super::load_model(
+                    path, 64, None, None, None, None, &cask, &mesh, None, spec, gpu,
+                )
+            };
+            // Warm-up: absorbs the one-time kernel/module residency so the
+            // measured cycle compares clean post-unload VRAM.
+            eprintln!("[teardown] {label}: load (warm-up)");
+            let warm = match load(&mut gpu) {
+                Ok(m) => m,
+                Err(e) => {
+                    failures.push(format!("{label}: warm-up load failed: {e}"));
+                    continue;
+                }
+            };
+            if let Err(e) = super::unload_model(warm, &mut gpu) {
+                failures.push(format!("{label}: warm-up unload failed: {e}"));
+                continue;
+            }
+            gpu.drain_pool();
+            let baseline = gpu
+                .hip
+                .get_vram_info()
+                .map(|(free, _)| free)
+                .expect("measure baseline");
+
+            eprintln!("[teardown] {label}: load (measured)");
+            let model = match load(&mut gpu) {
+                Ok(m) => m,
+                Err(e) => {
+                    failures.push(format!("{label}: measured load failed: {e}"));
+                    continue;
+                }
+            };
+            if let Err(e) = super::unload_model(model, &mut gpu) {
+                failures.push(format!("{label}: measured unload failed: {e}"));
+                continue;
+            }
+            gpu.drain_pool();
+            let after = gpu
+                .hip
+                .get_vram_info()
+                .map(|(free, _)| free)
+                .expect("measure after unload");
+            let tol = 64 * 1024 * 1024;
+            if baseline.abs_diff(after) > tol {
+                failures.push(format!(
+                    "{label}: VRAM not recovered after unload: baseline={baseline} after={after}"
+                ));
+            } else {
+                eprintln!("[teardown] {label}: OK (baseline={baseline} after={after})");
+            }
+        }
+
+        assert!(
+            failures.is_empty(),
+            "bundle teardown failures:\n{}",
+            failures.join("\n")
+        );
+    }
+
+    /// The checked teardown must be VMM-arena aware: with the VMM KV
+    /// backend, unload releases the arenas (never pools arena memory).
+    /// Regression test for the pivot's unload dispatch routing VMM KVs
+    /// through `KvCache::free_checked` → `free_tensor_checked`.
+    #[test]
+    #[ignore = "requires an AMD GPU plus a qwen35 fixture"]
+    fn vmm_kv_backend_unload_reclaims_arenas_and_vram() {
+        use std::path::Path;
+        use std::sync::Mutex;
+
+        static GPU_LOCK: Mutex<()> = Mutex::new(());
+        let _lock = GPU_LOCK.lock().unwrap();
+
+        let home = std::env::var("HOME").expect("HOME required for default model paths");
+        let path = std::env::var("HIPFIRE_QWEN35_VMM_FIXTURE")
+            .unwrap_or_else(|_| format!("{home}/.hipfire/models/qwen3.5-9b.mq4"));
+        assert!(
+            Path::new(&path).is_file(),
+            "fixture not found: {path} (set HIPFIRE_QWEN35_VMM_FIXTURE)"
+        );
+
+        let mut gpu = rdna_compute::Gpu::init().expect("Gpu::init");
+        let cask = super::CaskConfig::default();
+        let spec = super::SpecLoadCfg::default();
+
+        let load = |gpu: &mut rdna_compute::Gpu| {
+            super::load_model_with_kv_backend(
+                &path,
+                64,
+                None,
+                None,
+                Some("vmm"),
+                None,
+                None,
+                &cask,
+                1,
+                spec,
+                gpu,
+            )
+        };
+
+        // Warm-up absorbs kernel/module residency.
+        let warm = load(&mut gpu).expect("warm-up vmm load must succeed");
+        if let Err(e) = super::unload_model(warm, &mut gpu) {
+            panic!("warm-up vmm unload failed: {e}");
+        }
+        gpu.drain_pool();
+        let baseline = gpu
+            .hip
+            .get_vram_info()
+            .map(|(free, _)| free)
+            .expect("baseline");
+
+        let model = load(&mut gpu).expect("measured vmm load must succeed");
+        super::unload_model(model, &mut gpu)
+            .expect("measured vmm unload must succeed (arena release clean)");
+        gpu.drain_pool();
+        let after = gpu
+            .hip
+            .get_vram_info()
+            .map(|(free, _)| free)
+            .expect("after");
+        assert!(
+            baseline.abs_diff(after) < 64 * 1024 * 1024,
+            "VMM unload did not reclaim VRAM: baseline={baseline} after={after}"
+        );
+        eprintln!("[teardown] qwen35-vmm: OK (baseline={baseline} after={after})");
     }
 
     /// `finish_qwen35_load` receives a fully GPU-backed bundle before opening a
@@ -6625,9 +6834,7 @@ mod cap_001_loader_tests {
             Vec::<crate::construction_recorder::RecordedEvent>::new()
         );
     }
-
-
-}  // end mod cap_001_loader_tests
+} // end mod cap_001_loader_tests
 #[cfg(test)]
 mod session_state_tests {
     use super::LoadedModel;
@@ -6696,9 +6903,6 @@ mod session_state_tests {
         assert_eq!(model.seq_pos, 0);
         assert!(model.asst_turn_cache.contains_key(&7));
         assert_eq!(model.decoded_vocab.as_deref().map(Vec::len), Some(1));
-        assert_eq!(
-            (model.arch_id, model.model_path, model.chat_template),
-            meta
-        );
+        assert_eq!((model.arch_id, model.model_path, model.chat_template), meta);
     }
 }

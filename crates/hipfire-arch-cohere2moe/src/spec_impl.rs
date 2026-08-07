@@ -39,6 +39,7 @@
 use crate::cohere2moe::{Cohere2MoeState, Cohere2MoeWeights};
 use crate::config::Cohere2MoeConfig;
 use crate::forward;
+use hipfire_runtime::gpu_cleanup::{BundleTeardown, GpuCleanupFailure};
 use hipfire_runtime::spec::{SpecAdvance, SpecScratch, SpecTarget};
 use rdna_compute::Gpu;
 
@@ -266,6 +267,33 @@ impl SpecTarget for Cohere2MoeBundle {
 
 fn use_batched_cold_prefill(cold_start: bool, token_count: usize, supported: bool) -> bool {
     cold_start && token_count > 1 && supported
+}
+
+impl BundleTeardown for Cohere2MoeBundle {
+    /// Generic checked teardown the loader dispatches on: frees weights then
+    /// state, each with CHECKED frees. Owners that survive are carried in the
+    /// returned [`GpuCleanupFailure`] for exact-retention retry — no
+    /// best-effort free is used as a correctness mechanism.
+    fn free_checked(self, gpu: &mut Gpu) -> Result<(), GpuCleanupFailure> {
+        let Cohere2MoeBundle {
+            config: _,
+            weights,
+            state,
+            eos_tok: _,
+        } = self;
+        let mut cf = GpuCleanupFailure::empty();
+        if let Err(f) = weights.free_checked(gpu) {
+            cf.merge(f);
+        }
+        if let Err(f) = state.free_checked(gpu) {
+            cf.merge(f);
+        }
+        if cf.is_empty() {
+            Ok(())
+        } else {
+            Err(cf)
+        }
+    }
 }
 
 #[cfg(test)]

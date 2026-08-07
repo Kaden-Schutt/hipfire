@@ -15,6 +15,10 @@
 //! minimax convention). lm_head is tied to embed_tokens.
 
 use crate::config::{Lfm2MoeConfig, MixerKind};
+use hipfire_runtime::gpu_cleanup::{
+    free_tensor_retained, free_weight_all_checked, retain_kv_failures, GpuCleanupFailure,
+    RetainedGpuTensor,
+};
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama::{f16_to_f32, KvCache, WeightTensor};
 use hipfire_runtime::model_source::ModelSource;
@@ -299,10 +303,34 @@ impl MmqScreenable for Lfm2MoeWeights {
     }
 }
 
+/// Fold a retained-tensor list into a [`GpuCleanupFailure`], preserving every
+/// owner verbatim (used to collect `free_tensor_retained`/checked-free
+/// failures before the terminal `is_empty()` check).
+fn fold_retained(failures: Vec<RetainedGpuTensor>, cf: &mut GpuCleanupFailure) {
+    for r in failures {
+        cf.add_retained(r);
+    }
+}
+
 impl ExpertWeights {
     pub fn free_gpu(self, gpu: &mut Gpu) {
         self.gate_up.free_all(gpu);
         self.down.free_all(gpu);
+    }
+
+    /// Checked free: every owner is attempted even after prior failures; on
+    /// failure the exact unfreed `WeightTensor`s are retained for retry.
+    pub fn free_checked(self, gpu: &mut Gpu) -> Result<(), GpuCleanupFailure> {
+        let mut failures: Vec<RetainedGpuTensor> = Vec::new();
+        free_weight_all_checked("ExpertWeights.gate_up", self.gate_up, gpu, &mut failures);
+        free_weight_all_checked("ExpertWeights.down", self.down, gpu, &mut failures);
+        let mut cf = GpuCleanupFailure::empty();
+        fold_retained(failures, &mut cf);
+        if cf.is_empty() {
+            Ok(())
+        } else {
+            Err(cf)
+        }
     }
 }
 
@@ -311,6 +339,28 @@ impl ConvWeights {
         self.in_proj.free_all(gpu);
         let _ = gpu.free_tensor(self.conv_weight);
         self.out_proj.free_all(gpu);
+    }
+
+    /// Checked free: every owner is attempted even after prior failures; on
+    /// failure the exact unfreed tensors are retained for retry.
+    pub fn free_checked(self, gpu: &mut Gpu) -> Result<(), GpuCleanupFailure> {
+        let mut failures: Vec<RetainedGpuTensor> = Vec::new();
+        free_weight_all_checked("ConvWeights.in_proj", self.in_proj, gpu, &mut failures);
+        free_tensor_retained(
+            "ConvWeights.conv_weight",
+            self.conv_weight,
+            gpu,
+            &mut failures,
+        );
+        free_weight_all_checked("ConvWeights.out_proj", self.out_proj, gpu, &mut failures);
+        let _ = self.conv_state_idx; // host-side index
+        let mut cf = GpuCleanupFailure::empty();
+        fold_retained(failures, &mut cf);
+        if cf.is_empty() {
+            Ok(())
+        } else {
+            Err(cf)
+        }
     }
 }
 
@@ -323,6 +373,26 @@ impl AttnWeights {
         let _ = gpu.free_tensor(self.q_norm);
         let _ = gpu.free_tensor(self.k_norm);
     }
+
+    /// Checked free: every owner is attempted even after prior failures; on
+    /// failure the exact unfreed tensors are retained for retry.
+    pub fn free_checked(self, gpu: &mut Gpu) -> Result<(), GpuCleanupFailure> {
+        let mut failures: Vec<RetainedGpuTensor> = Vec::new();
+        free_weight_all_checked("AttnWeights.wq", self.wq, gpu, &mut failures);
+        free_weight_all_checked("AttnWeights.wk", self.wk, gpu, &mut failures);
+        free_weight_all_checked("AttnWeights.wv", self.wv, gpu, &mut failures);
+        free_weight_all_checked("AttnWeights.wo", self.wo, gpu, &mut failures);
+        free_tensor_retained("AttnWeights.q_norm", self.q_norm, gpu, &mut failures);
+        free_tensor_retained("AttnWeights.k_norm", self.k_norm, gpu, &mut failures);
+        let _ = self.kv_idx; // host-side index
+        let mut cf = GpuCleanupFailure::empty();
+        fold_retained(failures, &mut cf);
+        if cf.is_empty() {
+            Ok(())
+        } else {
+            Err(cf)
+        }
+    }
 }
 
 impl Mixer {
@@ -332,6 +402,14 @@ impl Mixer {
             Mixer::Attention(a) => a.free_gpu(gpu),
         }
     }
+
+    /// Checked free of the active mixer variant; failures are retained whole.
+    pub fn free_checked(self, gpu: &mut Gpu) -> Result<(), GpuCleanupFailure> {
+        match self {
+            Mixer::Conv(c) => c.free_checked(gpu),
+            Mixer::Attention(a) => a.free_checked(gpu),
+        }
+    }
 }
 
 impl DenseFfn {
@@ -339,6 +417,22 @@ impl DenseFfn {
         self.w1.free_all(gpu);
         self.w3.free_all(gpu);
         self.w2.free_all(gpu);
+    }
+
+    /// Checked free: every owner is attempted even after prior failures; on
+    /// failure the exact unfreed `WeightTensor`s are retained for retry.
+    pub fn free_checked(self, gpu: &mut Gpu) -> Result<(), GpuCleanupFailure> {
+        let mut failures: Vec<RetainedGpuTensor> = Vec::new();
+        free_weight_all_checked("DenseFfn.w1", self.w1, gpu, &mut failures);
+        free_weight_all_checked("DenseFfn.w3", self.w3, gpu, &mut failures);
+        free_weight_all_checked("DenseFfn.w2", self.w2, gpu, &mut failures);
+        let mut cf = GpuCleanupFailure::empty();
+        fold_retained(failures, &mut cf);
+        if cf.is_empty() {
+            Ok(())
+        } else {
+            Err(cf)
+        }
     }
 }
 
@@ -352,6 +446,38 @@ impl MoeFfn {
         let _ = gpu.free_tensor(self.expert_gate_up_ptrs);
         let _ = gpu.free_tensor(self.expert_down_ptrs);
     }
+
+    /// Checked free: every owner (router, bias, ptr tables, every expert) is
+    /// attempted even after prior failures; failures are retained for retry.
+    pub fn free_checked(self, gpu: &mut Gpu) -> Result<(), GpuCleanupFailure> {
+        let mut failures: Vec<RetainedGpuTensor> = Vec::new();
+        free_weight_all_checked("MoeFfn.router", self.router, gpu, &mut failures);
+        free_tensor_retained("MoeFfn.expert_bias", self.expert_bias, gpu, &mut failures);
+        free_tensor_retained(
+            "MoeFfn.expert_gate_up_ptrs",
+            self.expert_gate_up_ptrs,
+            gpu,
+            &mut failures,
+        );
+        free_tensor_retained(
+            "MoeFfn.expert_down_ptrs",
+            self.expert_down_ptrs,
+            gpu,
+            &mut failures,
+        );
+        let mut cf = GpuCleanupFailure::empty();
+        fold_retained(failures, &mut cf);
+        for e in self.experts {
+            if let Err(f) = e.free_checked(gpu) {
+                cf.merge(f);
+            }
+        }
+        if cf.is_empty() {
+            Ok(())
+        } else {
+            Err(cf)
+        }
+    }
 }
 
 impl Ffn {
@@ -359,6 +485,14 @@ impl Ffn {
         match self {
             Ffn::Dense(d) => d.free_gpu(gpu),
             Ffn::Moe(m) => m.free_gpu(gpu),
+        }
+    }
+
+    /// Checked free of the active FFN variant; failures are retained whole.
+    pub fn free_checked(self, gpu: &mut Gpu) -> Result<(), GpuCleanupFailure> {
+        match self {
+            Ffn::Dense(d) => d.free_checked(gpu),
+            Ffn::Moe(m) => m.free_checked(gpu),
         }
     }
 }
@@ -369,6 +503,37 @@ impl Lfm2MoeLayerWeights {
         let _ = gpu.free_tensor(self.ffn_norm);
         self.mixer.free_gpu(gpu);
         self.ffn.free_gpu(gpu);
+    }
+
+    /// Checked free: every owner (norms + both mixer/FFN variants) is
+    /// attempted even after prior failures; failures are retained for retry.
+    pub fn free_checked(self, gpu: &mut Gpu) -> Result<(), GpuCleanupFailure> {
+        let mut failures: Vec<RetainedGpuTensor> = Vec::new();
+        free_tensor_retained(
+            "Lfm2MoeLayerWeights.operator_norm",
+            self.operator_norm,
+            gpu,
+            &mut failures,
+        );
+        free_tensor_retained(
+            "Lfm2MoeLayerWeights.ffn_norm",
+            self.ffn_norm,
+            gpu,
+            &mut failures,
+        );
+        let mut cf = GpuCleanupFailure::empty();
+        fold_retained(failures, &mut cf);
+        if let Err(f) = self.mixer.free_checked(gpu) {
+            cf.merge(f);
+        }
+        if let Err(f) = self.ffn.free_checked(gpu) {
+            cf.merge(f);
+        }
+        if cf.is_empty() {
+            Ok(())
+        } else {
+            Err(cf)
+        }
     }
 }
 
@@ -675,6 +840,33 @@ impl Lfm2MoeWeights {
         self.lm_head.free_all(gpu);
         for layer in self.layers {
             layer.free_gpu(gpu);
+        }
+    }
+
+    /// Checked free: every owner (embed, norm, lm_head, every layer) is
+    /// attempted even after prior failures; on failure the exact unfreed
+    /// owners are retained for retry.
+    pub fn free_checked(self, gpu: &mut Gpu) -> Result<(), GpuCleanupFailure> {
+        let mut failures: Vec<RetainedGpuTensor> = Vec::new();
+        free_tensor_retained("Lfm2MoeWeights.embed", self.embed, gpu, &mut failures);
+        free_tensor_retained(
+            "Lfm2MoeWeights.embedding_norm",
+            self.embedding_norm,
+            gpu,
+            &mut failures,
+        );
+        free_weight_all_checked("Lfm2MoeWeights.lm_head", self.lm_head, gpu, &mut failures);
+        let mut cf = GpuCleanupFailure::empty();
+        fold_retained(failures, &mut cf);
+        for layer in self.layers {
+            if let Err(f) = layer.free_checked(gpu) {
+                cf.merge(f);
+            }
+        }
+        if cf.is_empty() {
+            Ok(())
+        } else {
+            Err(cf)
         }
     }
 }
@@ -1327,6 +1519,70 @@ impl Lfm2MoeState {
         let _ = gpu.free_tensor(self.down_expanded);
         let _ = gpu.free_tensor(self.final_norm_buf);
         let _ = gpu.free_tensor(self.logits);
+    }
+
+    /// Checked free: the KV cache, every conv-state ring buffer, `pos_buf`
+    /// and every scratch tensor are each attempted even after prior failures;
+    /// on failure the exact unfreed owners are retained for retry.
+    pub fn free_checked(self, gpu: &mut Gpu) -> Result<(), GpuCleanupFailure> {
+        let mut failures: Vec<RetainedGpuTensor> = Vec::new();
+        retain_kv_failures(self.kv.free_checked(gpu), &mut failures);
+        for (i, t) in self.conv_states.into_iter().enumerate() {
+            free_tensor_retained(
+                format!("Lfm2MoeState.conv_states[{i}]"),
+                t,
+                gpu,
+                &mut failures,
+            );
+        }
+        // pos_buf: raw DeviceBuffer → honest GpuTensor wrapper (Raw dtype).
+        free_tensor_retained(
+            "Lfm2MoeState.pos_buf",
+            GpuTensor {
+                buf: self.pos_buf,
+                shape: vec![],
+                dtype: DType::Raw,
+            },
+            gpu,
+            &mut failures,
+        );
+        for (label, t) in [
+            ("Lfm2MoeState.h", self.h),
+            ("Lfm2MoeState.tmp", self.tmp),
+            ("Lfm2MoeState.fa_q", self.fa_q),
+            ("Lfm2MoeState.fa_k", self.fa_k),
+            ("Lfm2MoeState.fa_v", self.fa_v),
+            ("Lfm2MoeState.fa_attn_out", self.fa_attn_out),
+            ("Lfm2MoeState.conv_bcx", self.conv_bcx),
+            ("Lfm2MoeState.conv_y", self.conv_y),
+            ("Lfm2MoeState.ffn_tmp", self.ffn_tmp),
+            ("Lfm2MoeState.ffn_x_rot", self.ffn_x_rot),
+            ("Lfm2MoeState.dense_gate", self.dense_gate),
+            ("Lfm2MoeState.dense_up", self.dense_up),
+            ("Lfm2MoeState.dense_act", self.dense_act),
+            ("Lfm2MoeState.router_logits", self.router_logits),
+            ("Lfm2MoeState.topk_indices", self.topk_indices),
+            ("Lfm2MoeState.topk_weights", self.topk_weights),
+            ("Lfm2MoeState.gate_batch", self.gate_batch),
+            ("Lfm2MoeState.up_batch", self.up_batch),
+            ("Lfm2MoeState.rot_batch", self.rot_batch),
+            ("Lfm2MoeState.down_expanded", self.down_expanded),
+            ("Lfm2MoeState.final_norm_buf", self.final_norm_buf),
+            ("Lfm2MoeState.logits", self.logits),
+        ] {
+            free_tensor_retained(label, t, gpu, &mut failures);
+        }
+        // Host-side fields (Copy types just need mentioning).
+        let _ = self.graph_warmed_up;
+        let _ = self.max_seq;
+        let _ = self.n_tokens;
+        let mut cf = GpuCleanupFailure::empty();
+        fold_retained(failures, &mut cf);
+        if cf.is_empty() {
+            Ok(())
+        } else {
+            Err(cf)
+        }
     }
 }
 

@@ -24,6 +24,7 @@ use crate::forward::{
     final_norm_and_argmax_all_batched_lazy, final_norm_and_sample_all_batched_lazy,
     forward_prefill_batch_chunk, PrefillBatchScratch,
 };
+use hipfire_runtime::gpu_cleanup::{BundleTeardown, GpuCleanupFailure};
 use hipfire_runtime::spec::{SpecAdvance, SpecScratch, SpecTarget};
 use rdna_compute::{Gpu, GpuTensor};
 
@@ -265,16 +266,16 @@ impl SpecTarget for Deepseek4Bundle {
             let take = remaining.len().min(pbs.max_batch);
             let chunk = &remaining[..take];
             let chunk_result = forward::forward_prefill_batch_chunk(
-            &self.config,
-            &self.weights,
-            &mut self.state,
-            gpu,
-            &pbs,
+                &self.config,
+                &self.weights,
+                &mut self.state,
+                gpu,
+                &pbs,
                 chunk,
                 pos_cursor as u32,
-        );
+            );
             if let Err(e) = chunk_result {
-        self.state.dspark_verify_pbs = Some(pbs);
+                self.state.dspark_verify_pbs = Some(pbs);
                 return Err(format!("Deepseek4Bundle::spec_advance prefill: {e}"));
             }
             if take == remaining.len() {
@@ -545,5 +546,37 @@ impl SpecTarget for Deepseek4Bundle {
                 .map_err(|e| format!("Deepseek4Bundle::capture_seed_main_hidden d2h: {e:?}"))?;
         }
         Ok(host)
+    }
+}
+
+/// Checked teardown for the full deepseek4 bundle: frees PBS, recurrent
+/// state, and weights with CHECKED frees, aggregating every owner that
+/// could not be freed into the returned [`GpuCleanupFailure`] for
+/// exact-retention retry — no best-effort free as a correctness mechanism.
+impl BundleTeardown for Deepseek4Bundle {
+    fn free_checked(self, gpu: &mut Gpu) -> Result<(), GpuCleanupFailure> {
+        let Deepseek4Bundle {
+            config: _,
+            weights,
+            state,
+            eos_tok: _,
+            pbs,
+        } = self;
+        // Match unload_model Deepseek4 order: pbs → state → weights.
+        let mut cf = GpuCleanupFailure::empty();
+        if let Err(f) = pbs.free_checked(gpu) {
+            cf.merge(f);
+        }
+        if let Err(f) = state.free_checked(gpu) {
+            cf.merge(f);
+        }
+        if let Err(f) = weights.free_checked(gpu) {
+            cf.merge(f);
+        }
+        if cf.is_empty() {
+            Ok(())
+        } else {
+            Err(cf)
+        }
     }
 }

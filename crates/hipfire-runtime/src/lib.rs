@@ -34,6 +34,7 @@ pub mod dspark_core;
 pub mod ep;
 pub mod eval_common;
 pub mod gguf;
+pub mod gpu_cleanup;
 pub mod hfq;
 pub mod kv_adaptive;
 pub mod kv_backend;
@@ -69,8 +70,8 @@ pub mod weight_store;
 pub mod emit_text;
 pub mod eos_filter;
 pub mod prompt_frame;
-pub mod stream_parser;
 pub mod semantic;
+pub mod stream_parser;
 pub mod tokenizer;
 
 pub mod tool_call;

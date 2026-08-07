@@ -6,11 +6,11 @@
 
 use crate::parallel_capability::ModelVariant;
 use crate::spec_build::Qwen35SlotGuard;
+use crate::Carrier;
 use crate::{
     finish_qwen35_load, reject_qwen_native_mtp, resolve_chat_template,
     resolve_chat_template_overrides, LoadedModel, ModelState,
 };
-use crate::Carrier;
 use hipfire_arch_minimax::{config_from_safetensors, load_weights_from_safetensors, MiniMaxState};
 use hipfire_arch_qwen35_vl::qwen35_vl::VisionWeights;
 use hipfire_runtime::hfq::HfqFile;
@@ -245,11 +245,7 @@ impl Carrier for Qwen2Carrier {
     fn classify_parallel_variant(&self, _src: &ModelSource) -> Result<ModelVariant, String> {
         Ok(ModelVariant::Qwen2)
     }
-    fn load(
-        &self,
-        src: ModelSource,
-        ctx: &mut LoadCtx,
-    ) -> Result<LoadedModel, String> {
+    fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
         if ctx.pp > 1 {
             return Err("qwen2: pipeline-parallel (pp>1) unsupported".into());
         }
@@ -354,7 +350,8 @@ fn load_qwen35_pp(
                         sum, config.n_layers
                     ));
                 }
-                hipfire_runtime::multi_gpu::Gpus::init_layers(&counts).map_err(|e| format!("{e}"))?
+                hipfire_runtime::multi_gpu::Gpus::init_layers(&counts)
+                    .map_err(|e| format!("{e}"))?
             }
             _ => hipfire_runtime::multi_gpu::Gpus::init_uniform(pp, config.n_layers)
                 .map_err(|e| format!("{e}"))?,
@@ -421,8 +418,13 @@ fn load_qwen35_pp(
     // Banded-PP silent-corruption guard at load time: recurrent-state
     // cardinality, layer→device map length, and device count must agree before
     // the model is published (same invariants the teardown path re-validates).
-    crate::validate_qwen35_pipeline_layout(&bundle, &la_to_device, gpus.devices.len(), meta.arch_id)
-        .map_err(|e| format!("qwen35 PP load layout: {e:?}"))?;
+    crate::validate_qwen35_pipeline_layout(
+        &bundle,
+        &la_to_device,
+        gpus.devices.len(),
+        meta.arch_id,
+    )
+    .map_err(|e| format!("qwen35 PP load layout: {e:?}"))?;
     Ok(LoadedModel {
         state: Some(ModelState::Qwen35(bundle)),
         mtp_mode: ctx.mtp_mode.to_string(),
@@ -519,11 +521,7 @@ impl Carrier for Qwen35Carrier {
             }
         }
     }
-    fn load(
-        &self,
-        src: ModelSource,
-        ctx: &mut LoadCtx,
-    ) -> Result<LoadedModel, String> {
+    fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
         reject_qwen_native_mtp(ctx.mtp_mode)?;
         // Dir + pp>1: early return before any diagnostics/meta resolution,
         // preserving the original error string and preventing tokenizer work.
@@ -623,7 +621,34 @@ impl Carrier for Qwen35Carrier {
                         if let Some(vw) = vision_weights {
                             vw.free_gpu(ctx.gpu);
                         }
-                        return Err(e);
+                        // The bundle error carries exact-retention cleanup
+                        // owners; retry once before reducing to a String.
+                        // Whatever still fails is logged — never dropped.
+                        let hipfire_arch_qwen35::carrier::Qwen35BundleLoadError {
+                            message,
+                            cleanup,
+                        } = e;
+                        if let Some(cf) = cleanup {
+                            let first_failures = cf.num_failed();
+                            match cf.retry(ctx.gpu) {
+                                Ok(()) => {
+                                    if first_failures > 0 {
+                                        eprintln!(
+                                            "  qwen35 bundle load: first cleanup attempt failed \
+                                             ({first_failures} owner(s)) but retry succeeded"
+                                        );
+                                    }
+                                }
+                                Err(remaining) => {
+                                    eprintln!(
+                                        "  qwen35 bundle load cleanup retry failed ({} owner(s)): {}",
+                                        remaining.num_failed(),
+                                        remaining.error_summaries().join("; ")
+                                    );
+                                }
+                            }
+                        }
+                        return Err(message);
                     }
                 };
                 finish_qwen35_load(
@@ -835,11 +860,7 @@ impl Carrier for LlamaCarrier {
             }
         }
     }
-    fn load(
-        &self,
-        src: ModelSource,
-        ctx: &mut LoadCtx,
-    ) -> Result<LoadedModel, String> {
+    fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
         if ctx.pp > 1 {
             return Err(match &src {
                 ModelSource::Hfq(_) => "llama: pipeline-parallel (pp>1) unsupported",
@@ -1555,11 +1576,7 @@ impl Carrier for DotsOcrCarrier {
     fn classify_parallel_variant(&self, _src: &ModelSource) -> Result<ModelVariant, String> {
         Ok(ModelVariant::DotsOcr)
     }
-    fn load(
-        &self,
-        src: ModelSource,
-        ctx: &mut LoadCtx,
-    ) -> Result<LoadedModel, String> {
+    fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
         if ctx.pp > 1 {
             return Err(match &src {
                 ModelSource::Hfq(_) => "dots_ocr: pipeline-parallel (pp>1) unsupported",
@@ -1655,11 +1672,7 @@ impl Carrier for Deepseek4Carrier {
     fn classify_parallel_variant(&self, _src: &ModelSource) -> Result<ModelVariant, String> {
         Ok(ModelVariant::Deepseek4)
     }
-    fn load(
-        &self,
-        src: ModelSource,
-        ctx: &mut LoadCtx,
-    ) -> Result<LoadedModel, String> {
+    fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
         if ctx.pp > 1 {
             return Err(match &src {
                 ModelSource::Hfq(_) => "deepseek4: pipeline-parallel (pp>1) unsupported",
@@ -1820,11 +1833,7 @@ impl Carrier for MinimaxCarrier {
     fn classify_parallel_variant(&self, _src: &ModelSource) -> Result<ModelVariant, String> {
         Ok(ModelVariant::Minimax)
     }
-    fn load(
-        &self,
-        src: ModelSource,
-        ctx: &mut LoadCtx,
-    ) -> Result<LoadedModel, String> {
+    fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
         if ctx.pp > 1 {
             // Preserve the two per-source error strings byte-for-byte.
             return Err(match &src {
@@ -1948,11 +1957,7 @@ impl Carrier for Lfm2MoeCarrier {
             }
         }
     }
-    fn load(
-        &self,
-        src: ModelSource,
-        ctx: &mut LoadCtx,
-    ) -> Result<LoadedModel, String> {
+    fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
         if ctx.pp > 1 {
             return Err(match &src {
                 ModelSource::Hfq(_) => "lfm2moe: pipeline-parallel (pp>1) unsupported",
@@ -2050,11 +2055,7 @@ impl Carrier for Cohere2MoeCarrier {
     fn classify_parallel_variant(&self, _src: &ModelSource) -> Result<ModelVariant, String> {
         Ok(ModelVariant::Cohere2Moe)
     }
-    fn load(
-        &self,
-        src: ModelSource,
-        ctx: &mut LoadCtx,
-    ) -> Result<LoadedModel, String> {
+    fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
         if ctx.pp > 1 {
             return Err("cohere2moe: pp>1 unsupported via registry".into());
         }
@@ -2793,11 +2794,7 @@ mod classification_tests {
             fn claims_arch_id(&self, _arch_id: u32, _is_dir: bool) -> bool {
                 true
             }
-            fn load(
-                &self,
-                _src: ModelSource,
-                _ctx: &mut LoadCtx,
-            ) -> Result<LoadedModel, String> {
+            fn load(&self, _src: ModelSource, _ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
                 Err("unused".into())
             }
         }

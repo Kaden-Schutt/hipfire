@@ -25,6 +25,7 @@
 
 use crate::{DeepseekV4Config, DeepseekV4State, DeepseekV4Weights};
 use hipfire_dispatch::families::moe::DeepSeekGroupedBounds;
+use hipfire_runtime::gpu_cleanup::{free_tensor_retained, GpuCleanupFailure, RetainedGpuTensor};
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 /// OnceLock-cached process-policy lookups for the DeepSeek V4 decode hot path.
@@ -5069,7 +5070,6 @@ fn ffn_stub(
     Ok(())
 }
 
-
 /// HC FFN mix — same pattern as `hc_attn_mix` but with `hc_ffn_*`
 /// tensors and `ffn_out` as transform_out.
 fn hc_ffn_mix(
@@ -7302,6 +7302,202 @@ impl PrefillBatchScratch {
         ] {
             let _ = gpu.free_tensor(t);
         }
+    }
+
+    /// Checked free of every GPU buffer this prefill-batch scratch owns.
+    /// Consumes self. Continues after individual failures; every owner that
+    /// could not be freed is returned for exact-retention retry.
+    pub fn free_checked(self, gpu: &mut Gpu) -> Result<(), GpuCleanupFailure> {
+        let mut failures: Vec<RetainedGpuTensor> = Vec::new();
+        for (label, t) in [
+            ("PrefillBatchScratch.embed_batch", self.embed_batch),
+            ("PrefillBatchScratch.streams_batch", self.streams_batch),
+            ("PrefillBatchScratch.tokens", self.tokens),
+            ("PrefillBatchScratch.tmp_batch", self.tmp_batch),
+            ("PrefillBatchScratch.tmp_plain_batch", self.tmp_plain_batch),
+            ("PrefillBatchScratch.q_lat_batch", self.q_lat_batch),
+            ("PrefillBatchScratch.q_lat_rot_batch", self.q_lat_rot_batch),
+            ("PrefillBatchScratch.q_batch", self.q_batch),
+            ("PrefillBatchScratch.q_head_ones", self.q_head_ones),
+            ("PrefillBatchScratch.kv_batch", self.kv_batch),
+            ("PrefillBatchScratch.positions", self.positions),
+            ("PrefillBatchScratch.hc_c_batch", self.hc_c_batch),
+            ("PrefillBatchScratch.hc_pre_batch", self.hc_pre_batch),
+            ("PrefillBatchScratch.hc_post_batch", self.hc_post_batch),
+            ("PrefillBatchScratch.hc_comb_batch", self.hc_comb_batch),
+            ("PrefillBatchScratch.hc_x_in_batch", self.hc_x_in_batch),
+            ("PrefillBatchScratch.attn_out_batch", self.attn_out_batch),
+            ("PrefillBatchScratch.ffn_out_batch", self.ffn_out_batch),
+            (
+                "PrefillBatchScratch.streams_out_batch",
+                self.streams_out_batch,
+            ),
+            (
+                "PrefillBatchScratch.swa_staged_batch",
+                self.swa_staged_batch,
+            ),
+            (
+                "PrefillBatchScratch.topk_staged_batch",
+                self.topk_staged_batch,
+            ),
+            ("PrefillBatchScratch.n_valid_swa_arr", self.n_valid_swa_arr),
+            (
+                "PrefillBatchScratch.n_active_topk_arr",
+                self.n_active_topk_arr,
+            ),
+            (
+                "PrefillBatchScratch.attn_out_raw_batch",
+                self.attn_out_raw_batch,
+            ),
+            (
+                "PrefillBatchScratch.attn_out_raw_rot_batch",
+                self.attn_out_raw_rot_batch,
+            ),
+            ("PrefillBatchScratch.wo_a_out_batch", self.wo_a_out_batch),
+            (
+                "PrefillBatchScratch.wo_a_out_rot_batch",
+                self.wo_a_out_rot_batch,
+            ),
+            ("PrefillBatchScratch.ffn_x_rot_batch", self.ffn_x_rot_batch),
+            (
+                "PrefillBatchScratch.ffn_x_plain_batch",
+                self.ffn_x_plain_batch,
+            ),
+            (
+                "PrefillBatchScratch.ffn_shared_gate_batch",
+                self.ffn_shared_gate_batch,
+            ),
+            (
+                "PrefillBatchScratch.ffn_shared_up_batch",
+                self.ffn_shared_up_batch,
+            ),
+            (
+                "PrefillBatchScratch.ffn_shared_rot_batch",
+                self.ffn_shared_rot_batch,
+            ),
+            (
+                "PrefillBatchScratch.moe_scores_batch",
+                self.moe_scores_batch,
+            ),
+            (
+                "PrefillBatchScratch.moe_topk_indices_batch",
+                self.moe_topk_indices_batch,
+            ),
+            (
+                "PrefillBatchScratch.moe_topk_weights_batch",
+                self.moe_topk_weights_batch,
+            ),
+            ("PrefillBatchScratch.moe_gate_batch", self.moe_gate_batch),
+            ("PrefillBatchScratch.moe_up_batch", self.moe_up_batch),
+            ("PrefillBatchScratch.moe_rot_batch", self.moe_rot_batch),
+            (
+                "PrefillBatchScratch.moe_down_expert_outputs",
+                self.moe_down_expert_outputs,
+            ),
+            ("PrefillBatchScratch.idx_q_batch", self.idx_q_batch),
+            ("PrefillBatchScratch.idx_w_batch", self.idx_w_batch),
+            (
+                "PrefillBatchScratch.idx_scores_batch",
+                self.idx_scores_batch,
+            ),
+            (
+                "PrefillBatchScratch.idx_topk_indices_batch",
+                self.idx_topk_indices_batch,
+            ),
+            (
+                "PrefillBatchScratch.comp_main_kv_batch",
+                self.comp_main_kv_batch,
+            ),
+            (
+                "PrefillBatchScratch.comp_main_score_batch",
+                self.comp_main_score_batch,
+            ),
+            (
+                "PrefillBatchScratch.comp_idx_kv_batch",
+                self.comp_idx_kv_batch,
+            ),
+            (
+                "PrefillBatchScratch.comp_idx_score_batch",
+                self.comp_idx_score_batch,
+            ),
+            ("PrefillBatchScratch.moe_sorted_b", self.moe_sorted_b),
+            (
+                "PrefillBatchScratch.moe_sorted_krank",
+                self.moe_sorted_krank,
+            ),
+            (
+                "PrefillBatchScratch.moe_sorted_expert",
+                self.moe_sorted_expert,
+            ),
+            (
+                "PrefillBatchScratch.moe_expert_starts",
+                self.moe_expert_starts,
+            ),
+            (
+                "PrefillBatchScratch.moe_expert_token_counts",
+                self.moe_expert_token_counts,
+            ),
+            (
+                "PrefillBatchScratch.moe_expert_offsets",
+                self.moe_expert_offsets,
+            ),
+            (
+                "PrefillBatchScratch.moe_sorted_slot_index",
+                self.moe_sorted_slot_index,
+            ),
+            (
+                "PrefillBatchScratch.moe_expert_tile_ids",
+                self.moe_expert_tile_ids,
+            ),
+            (
+                "PrefillBatchScratch.moe_inverse_perm",
+                self.moe_inverse_perm,
+            ),
+            (
+                "PrefillBatchScratch.moe_y_gate_up_grouped",
+                self.moe_y_gate_up_grouped,
+            ),
+            ("PrefillBatchScratch.moe_x_grouped", self.moe_x_grouped),
+            (
+                "PrefillBatchScratch.moe_y_down_grouped",
+                self.moe_y_down_grouped,
+            ),
+            ("PrefillBatchScratch.tmp_batch_f16", self.tmp_batch_f16),
+            (
+                "PrefillBatchScratch.tmp_plain_batch_f16",
+                self.tmp_plain_batch_f16,
+            ),
+            (
+                "PrefillBatchScratch.wmma_x_scratch_f16",
+                self.wmma_x_scratch_f16,
+            ),
+            ("PrefillBatchScratch.comp_positions", self.comp_positions),
+            (
+                "PrefillBatchScratch.pos_array_device_batch",
+                self.pos_array_device_batch,
+            ),
+            (
+                "PrefillBatchScratch.attn_state_buf_batch",
+                self.attn_state_buf_batch,
+            ),
+            (
+                "PrefillBatchScratch.mtp_tokens_batch",
+                self.mtp_tokens_batch,
+            ),
+            ("PrefillBatchScratch.mtp_embed_batch", self.mtp_embed_batch),
+            (
+                "PrefillBatchScratch.mtp_e_norm_batch",
+                self.mtp_e_norm_batch,
+            ),
+            (
+                "PrefillBatchScratch.mtp_h_norm_batch",
+                self.mtp_h_norm_batch,
+            ),
+            ("PrefillBatchScratch.mtp_x_e_batch", self.mtp_x_e_batch),
+        ] {
+            free_tensor_retained(label, t, gpu, &mut failures);
+        }
+        crate::deepseek4::finish_checked(failures)
     }
 }
 

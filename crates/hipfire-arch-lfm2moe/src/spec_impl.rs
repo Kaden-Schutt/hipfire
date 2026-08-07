@@ -35,6 +35,7 @@
 use crate::config::Lfm2MoeConfig;
 use crate::forward::decode_step;
 use crate::lfm2moe::{Lfm2MoeState, Lfm2MoeWeights};
+use hipfire_runtime::gpu_cleanup::{BundleTeardown, GpuCleanupFailure};
 use hipfire_runtime::spec::{SpecAdvance, SpecScratch, SpecTarget};
 use rdna_compute::{DType, Gpu, GpuTensor};
 
@@ -117,6 +118,33 @@ impl Lfm2MoeBundle {
                 .map_err(|e| format!("lfm2moe: restore conv snapshot: {e:?}"))?;
         }
         Ok(())
+    }
+}
+
+impl BundleTeardown for Lfm2MoeBundle {
+    /// Checked teardown of a fully constructed bundle: every GPU owner in
+    /// weights and state is freed with a checked free; on failure the exact
+    /// unfreed owners are retained in the returned [`GpuCleanupFailure`] for
+    /// retry — no best-effort free as a correctness mechanism.
+    fn free_checked(self, gpu: &mut Gpu) -> Result<(), GpuCleanupFailure> {
+        let Lfm2MoeBundle {
+            config: _,
+            weights,
+            state,
+            eos_tok: _,
+        } = self;
+        let mut cf = GpuCleanupFailure::empty();
+        if let Err(f) = weights.free_checked(gpu) {
+            cf.merge(f);
+        }
+        if let Err(f) = state.free_checked(gpu) {
+            cf.merge(f);
+        }
+        if cf.is_empty() {
+            Ok(())
+        } else {
+            Err(cf)
+        }
     }
 }
 

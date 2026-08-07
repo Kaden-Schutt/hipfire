@@ -12,6 +12,9 @@
 
 use crate::arch::MiniMaxM2;
 use hipfire_runtime::arch::Architecture;
+use hipfire_runtime::gpu_cleanup::{
+    free_tensor_retained, free_weight_all_checked, retain_kv_failures, GpuCleanupFailure,
+};
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama::{f16_to_f32, KvCache, WeightTensor};
 use hipfire_runtime::model_source::ModelSource;
@@ -1303,6 +1306,31 @@ impl MiniMaxExpertWeights {
         gate_up.free_all(gpu);
         down.free_all(gpu);
     }
+
+    /// Exact-retention checked GPU cleanup. Consumes `self`, attempts every
+    /// owned weight even after failures, retains the exact original owners on
+    /// failure, and returns only the failures.
+    pub fn free_checked(self, gpu: &mut Gpu) -> Result<(), GpuCleanupFailure> {
+        let MiniMaxExpertWeights { gate_up, down } = self;
+        let mut cf = GpuCleanupFailure::empty();
+        free_weight_all_checked(
+            "MiniMaxExpertWeights.gate_up",
+            gate_up,
+            gpu,
+            &mut cf.failed_tensors,
+        );
+        free_weight_all_checked(
+            "MiniMaxExpertWeights.down",
+            down,
+            gpu,
+            &mut cf.failed_tensors,
+        );
+        if cf.is_empty() {
+            Ok(())
+        } else {
+            Err(cf)
+        }
+    }
 }
 
 impl MiniMaxLayerWeights {
@@ -1342,6 +1370,73 @@ impl MiniMaxLayerWeights {
             let _ = gpu.free_tensor(dummy);
         }
     }
+
+    /// Exact-retention checked GPU cleanup. Consumes `self`, attempts every
+    /// owned weight even after failures, retains the exact original owners on
+    /// failure, and returns only the failures. Delegates each expert's packed
+    /// pair to [`MiniMaxExpertWeights::free_checked`] and merges its failures.
+    pub fn free_checked(self, gpu: &mut Gpu) -> Result<(), GpuCleanupFailure> {
+        let MiniMaxLayerWeights {
+            attn_norm,
+            ffn_norm,
+            q_norm,
+            k_norm,
+            wq,
+            wk,
+            wv,
+            wo,
+            router,
+            routing_bias,
+            experts,
+            expert_gate_up_ptrs,
+            expert_down_ptrs,
+            dummy_gate_up,
+        } = self;
+        let mut cf = GpuCleanupFailure::empty();
+        {
+            let failures = &mut cf.failed_tensors;
+            free_tensor_retained("MiniMaxLayerWeights.attn_norm", attn_norm, gpu, failures);
+            free_tensor_retained("MiniMaxLayerWeights.ffn_norm", ffn_norm, gpu, failures);
+            free_tensor_retained("MiniMaxLayerWeights.q_norm", q_norm, gpu, failures);
+            free_tensor_retained("MiniMaxLayerWeights.k_norm", k_norm, gpu, failures);
+            free_weight_all_checked("MiniMaxLayerWeights.wq", wq, gpu, failures);
+            free_weight_all_checked("MiniMaxLayerWeights.wk", wk, gpu, failures);
+            free_weight_all_checked("MiniMaxLayerWeights.wv", wv, gpu, failures);
+            free_weight_all_checked("MiniMaxLayerWeights.wo", wo, gpu, failures);
+            free_weight_all_checked("MiniMaxLayerWeights.router", router, gpu, failures);
+            free_tensor_retained(
+                "MiniMaxLayerWeights.routing_bias",
+                routing_bias,
+                gpu,
+                failures,
+            );
+            free_tensor_retained(
+                "MiniMaxLayerWeights.expert_gate_up_ptrs",
+                expert_gate_up_ptrs,
+                gpu,
+                failures,
+            );
+            free_tensor_retained(
+                "MiniMaxLayerWeights.expert_down_ptrs",
+                expert_down_ptrs,
+                gpu,
+                failures,
+            );
+            if let Some(dummy) = dummy_gate_up {
+                free_tensor_retained("MiniMaxLayerWeights.dummy_gate_up", dummy, gpu, failures);
+            }
+        }
+        for e in experts {
+            if let Err(f) = e.free_checked(gpu) {
+                cf.merge(f);
+            }
+        }
+        if cf.is_empty() {
+            Ok(())
+        } else {
+            Err(cf)
+        }
+    }
 }
 
 impl MiniMaxWeights {
@@ -1359,6 +1454,37 @@ impl MiniMaxWeights {
         lm_head.free_all(gpu);
         for layer in layers {
             layer.free_gpu(gpu);
+        }
+    }
+
+    /// Exact-retention checked GPU cleanup. Consumes `self`, attempts every
+    /// owned weight even after failures, retains the exact original owners on
+    /// failure, and returns only the failures. Each layer delegates to
+    /// [`MiniMaxLayerWeights::free_checked`] and its failures are merged.
+    pub fn free_checked(self, gpu: &mut Gpu) -> Result<(), GpuCleanupFailure> {
+        let MiniMaxWeights {
+            embed,
+            final_norm,
+            lm_head,
+            layers,
+            expert_manifest_cache: _, // pure CPU state — nothing to free
+        } = self;
+        let mut cf = GpuCleanupFailure::empty();
+        {
+            let failures = &mut cf.failed_tensors;
+            free_tensor_retained("MiniMaxWeights.embed", embed, gpu, failures);
+            free_tensor_retained("MiniMaxWeights.final_norm", final_norm, gpu, failures);
+            free_weight_all_checked("MiniMaxWeights.lm_head", lm_head, gpu, failures);
+        }
+        for layer in layers {
+            if let Err(f) = layer.free_checked(gpu) {
+                cf.merge(f);
+            }
+        }
+        if cf.is_empty() {
+            Ok(())
+        } else {
+            Err(cf)
         }
     }
 }
@@ -1472,6 +1598,88 @@ impl MiniMaxState {
             logits,
         ] {
             let _ = gpu.free_tensor(t);
+        }
+    }
+
+    /// Exact-retention checked GPU cleanup. Consumes `self`, attempts every
+    /// owned buffer even after failures (KV cache, position scalar, all
+    /// decode scratch), retains the exact original owners on failure, and
+    /// returns only the failures. `pos_host` is host memory (Box) — no GPU
+    /// free. `pos_buf` is a raw `DeviceBuffer` → honest `GpuTensor` wrapper
+    /// (`DType::Raw`), mirroring the qwen35 precedent.
+    pub fn free_checked(self, gpu: &mut Gpu) -> Result<(), GpuCleanupFailure> {
+        let MiniMaxState {
+            kv,
+            pos_buf,
+            pos_host: _,
+            max_seq: _,
+            n_tokens: _,
+            ar_warmed_up: _,
+            tmp,
+            x_rot,
+            fa_q,
+            fa_k,
+            fa_v,
+            fa_attn_out,
+            flash_partials,
+            h,
+            ffn_tmp,
+            ffn_x_rot,
+            router_logits,
+            topk_indices,
+            topk_weights,
+            gate_batch,
+            up_batch,
+            rot_batch,
+            down_expanded,
+            final_norm_buf,
+            final_rot,
+            logits,
+        } = self;
+        let mut cf = GpuCleanupFailure::empty();
+        {
+            let failures = &mut cf.failed_tensors;
+            retain_kv_failures(kv.free_checked(gpu), failures);
+            // pos_buf: raw DeviceBuffer → honest GpuTensor wrapper (Raw dtype).
+            free_tensor_retained(
+                "MiniMaxState.pos_buf",
+                GpuTensor {
+                    buf: pos_buf,
+                    shape: vec![],
+                    dtype: DType::Raw,
+                },
+                gpu,
+                failures,
+            );
+            for (label, t) in [
+                ("MiniMaxState.tmp", tmp),
+                ("MiniMaxState.x_rot", x_rot),
+                ("MiniMaxState.fa_q", fa_q),
+                ("MiniMaxState.fa_k", fa_k),
+                ("MiniMaxState.fa_v", fa_v),
+                ("MiniMaxState.fa_attn_out", fa_attn_out),
+                ("MiniMaxState.flash_partials", flash_partials),
+                ("MiniMaxState.h", h),
+                ("MiniMaxState.ffn_tmp", ffn_tmp),
+                ("MiniMaxState.ffn_x_rot", ffn_x_rot),
+                ("MiniMaxState.router_logits", router_logits),
+                ("MiniMaxState.topk_indices", topk_indices),
+                ("MiniMaxState.topk_weights", topk_weights),
+                ("MiniMaxState.gate_batch", gate_batch),
+                ("MiniMaxState.up_batch", up_batch),
+                ("MiniMaxState.rot_batch", rot_batch),
+                ("MiniMaxState.down_expanded", down_expanded),
+                ("MiniMaxState.final_norm_buf", final_norm_buf),
+                ("MiniMaxState.final_rot", final_rot),
+                ("MiniMaxState.logits", logits),
+            ] {
+                free_tensor_retained(label, t, gpu, failures);
+            }
+        }
+        if cf.is_empty() {
+            Ok(())
+        } else {
+            Err(cf)
         }
     }
 

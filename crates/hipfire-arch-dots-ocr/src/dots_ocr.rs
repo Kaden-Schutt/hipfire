@@ -40,11 +40,13 @@
 
 use hip_bridge::HipResult;
 use hipfire_arch_qwen2::qwen2::{Qwen2Config, Qwen2Weights};
+use hipfire_runtime::gpu_cleanup::{free_tensor_retained, GpuCleanupFailure, RetainedGpuTensor};
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama::{
     attention_family, f16_to_f32, f32_to_f16, DispatchCtx, FullAttnParams, KernelKey, ShapeInfo,
 };
 use hipfire_runtime::model_source::ModelSource;
+use hipfire_runtime::retain_free;
 use hipfire_runtime::MmqScreenable;
 use rdna_compute::{DType, Gpu, GpuTensor};
 
@@ -363,6 +365,43 @@ impl DotsVisionWeights {
         let _ = gpu.free_tensor(self.merger_fc2_w);
         let _ = gpu.free_tensor(self.merger_fc2_b);
     }
+
+    /// Checked GPU cleanup: attempts every tensor independently, retains
+    /// every allocation that could not be freed for retry.
+    pub fn free_checked(self, gpu: &mut Gpu) -> Result<(), GpuCleanupFailure> {
+        let mut failures = Vec::new();
+        retain_free!(gpu, failures,
+            "DotsVisionWeights.patch_embed_w" => Some(self.patch_embed_w),
+            "DotsVisionWeights.patch_embed_b" => Some(self.patch_embed_b),
+            "DotsVisionWeights.patch_embed_norm" => Some(self.patch_embed_norm),
+            "DotsVisionWeights.post_trunk_norm" => Some(self.post_trunk_norm),
+            "DotsVisionWeights.merger_ln_w" => Some(self.merger_ln_w),
+            "DotsVisionWeights.merger_ln_b" => Some(self.merger_ln_b),
+            "DotsVisionWeights.merger_fc1_w" => Some(self.merger_fc1_w),
+            "DotsVisionWeights.merger_fc1_b" => Some(self.merger_fc1_b),
+            "DotsVisionWeights.merger_fc2_w" => Some(self.merger_fc2_w),
+            "DotsVisionWeights.merger_fc2_b" => Some(self.merger_fc2_b),
+        );
+        for (i, b) in self.blocks.into_iter().enumerate() {
+            retain_free!(gpu, failures,
+                format!("DotsVisionWeights.blocks[{i}].norm1_w") => Some(b.norm1_w),
+                format!("DotsVisionWeights.blocks[{i}].qkv_w") => Some(b.qkv_w),
+                format!("DotsVisionWeights.blocks[{i}].proj_w") => Some(b.proj_w),
+                format!("DotsVisionWeights.blocks[{i}].norm2_w") => Some(b.norm2_w),
+                format!("DotsVisionWeights.blocks[{i}].fc13_proj") => Some(b.fc13_proj),
+                format!("DotsVisionWeights.blocks[{i}].fc2") => Some(b.fc2),
+            );
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            let mut cf = GpuCleanupFailure::empty();
+            for r in failures {
+                cf.add_retained(r);
+            }
+            Err(cf)
+        }
+    }
 }
 
 // ─── Outer weights wrapper ──────────────────────────────────────────────
@@ -413,6 +452,24 @@ impl DotsOcrWeights {
     pub fn free_gpu(self, gpu: &mut Gpu) {
         self.text.free_gpu(gpu);
         self.vision.free_gpu(gpu);
+    }
+
+    /// Checked GPU cleanup: both halves are freed independently; every
+    /// owner that survives (tensor or non-tensor category) is retained
+    /// whole for exact-retention retry — never flattened or fabricated.
+    pub fn free_checked(self, gpu: &mut Gpu) -> Result<(), GpuCleanupFailure> {
+        let mut cf = GpuCleanupFailure::empty();
+        if let Err(f) = self.text.free_checked(gpu) {
+            cf.merge(f);
+        }
+        if let Err(f) = self.vision.free_checked(gpu) {
+            cf.merge(f);
+        }
+        if cf.is_empty() {
+            Ok(())
+        } else {
+            Err(cf)
+        }
     }
 }
 

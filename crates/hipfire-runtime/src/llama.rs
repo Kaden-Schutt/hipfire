@@ -7,6 +7,10 @@
 
 use crate::arch::{screen_weight_tensor, MmqScreenable};
 use crate::gguf::{GgmlType, GgufFile, TensorInfo};
+use crate::gpu_cleanup::{
+    free_tensor_retained, free_weight_all_checked, free_weight_sidecars_checked, GpuCleanupFailure,
+    RetainedGpuTensor,
+};
 use crate::kv_backend::{
     KvBackend, KvChunkPlan, DEFAULT_KV_CHUNK_TOKENS, DEFAULT_VMM_PHYSICAL_CHUNK_BYTES,
 };
@@ -751,6 +755,61 @@ impl LlamaWeights {
             l.w_gate.free_all(g);
             l.w_up.free_all(g);
             l.w_down.free_all(g);
+        }
+    }
+
+    /// Checked GPU cleanup: attempts every tensor independently, retains
+    /// every allocation that could not be freed for retry.
+    ///
+    /// On success all resources are consumed (`Ok(())`). On failure the
+    /// returned [`GpuCleanupFailure`] carries the exact original tensors
+    /// that could not be freed, ready for retry. Mirrors
+    /// `Qwen35Weights::free_gpu_checked`: the tied lm_head output buffer
+    /// aliases `token_embd` and is skipped via `free_weight_sidecars_checked`.
+    pub fn free_checked(self, gpu: &mut Gpu) -> Result<(), GpuCleanupFailure> {
+        let mut failures: Vec<RetainedGpuTensor> = Vec::new();
+
+        free_tensor_retained("token_embd", self.token_embd, gpu, &mut failures);
+        free_tensor_retained("output_norm", self.output_norm, gpu, &mut failures);
+
+        // Output / LM head: skip buf when aliased (tied lm_head aliases token_embd).
+        if self.lm_head_aliases_embd {
+            free_weight_sidecars_checked("output", self.output, gpu, &mut failures);
+        } else {
+            free_weight_all_checked("output", self.output, gpu, &mut failures);
+        }
+
+        // ── Per-layer weights ───────────────────────────────────────────
+        for (i, layer) in self.layers.into_iter().enumerate() {
+            let lp = |field: &str| format!("layers[{i}].{field}");
+            free_tensor_retained(lp("attn_norm"), layer.attn_norm, gpu, &mut failures);
+            free_weight_all_checked(&lp("wq"), layer.wq, gpu, &mut failures);
+            free_weight_all_checked(&lp("wk"), layer.wk, gpu, &mut failures);
+            free_weight_all_checked(&lp("wv"), layer.wv, gpu, &mut failures);
+            free_weight_all_checked(&lp("wo"), layer.wo, gpu, &mut failures);
+            if let Some(t) = layer.q_norm {
+                free_tensor_retained(lp("q_norm"), t, gpu, &mut failures);
+            }
+            if let Some(t) = layer.k_norm {
+                free_tensor_retained(lp("k_norm"), t, gpu, &mut failures);
+            }
+            free_tensor_retained(lp("ffn_norm"), layer.ffn_norm, gpu, &mut failures);
+            free_weight_all_checked(&lp("w_gate"), layer.w_gate, gpu, &mut failures);
+            free_weight_all_checked(&lp("w_up"), layer.w_up, gpu, &mut failures);
+            free_weight_all_checked(&lp("w_down"), layer.w_down, gpu, &mut failures);
+        }
+
+        // Drop metadata fields (Copy types just need mentioning).
+        let _ = self.embd_format;
+        let _ = self.lm_head_aliases_embd;
+
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(GpuCleanupFailure {
+                failed_tensors: failures,
+                other: Vec::new(),
+            })
         }
     }
 }
@@ -2105,6 +2164,55 @@ impl PrefillBatchScratch {
             self.flash_partials,
         ] {
             let _ = gpu.free_tensor(t);
+        }
+    }
+
+    /// Checked GPU cleanup: attempts every tensor independently, retains
+    /// every allocation that could not be freed for retry.
+    ///
+    /// On success all resources are consumed (`Ok(())`). On failure the
+    /// returned [`GpuCleanupFailure`] carries the exact original tensors
+    /// that could not be freed, ready for retry.
+    pub fn free_checked(self, gpu: &mut Gpu) -> Result<(), GpuCleanupFailure> {
+        let mut failures: Vec<RetainedGpuTensor> = Vec::new();
+
+        for (label, t) in [
+            ("PrefillBatchScratch.x_batch", self.x_batch),
+            ("PrefillBatchScratch.x_rot_batch", self.x_rot_batch),
+            ("PrefillBatchScratch.positions", self.positions),
+            ("PrefillBatchScratch.tokens", self.tokens),
+            ("PrefillBatchScratch.fa_q_batch", self.fa_q_batch),
+            ("PrefillBatchScratch.fa_k_batch", self.fa_k_batch),
+            ("PrefillBatchScratch.fa_v_batch", self.fa_v_batch),
+            (
+                "PrefillBatchScratch.fa_attn_out_batch",
+                self.fa_attn_out_batch,
+            ),
+            (
+                "PrefillBatchScratch.fa_attn_out_rot_batch",
+                self.fa_attn_out_rot_batch,
+            ),
+            ("PrefillBatchScratch.gate_ffn_batch", self.gate_ffn_batch),
+            ("PrefillBatchScratch.up_batch", self.up_batch),
+            (
+                "PrefillBatchScratch.ffn_hidden_batch",
+                self.ffn_hidden_batch,
+            ),
+            ("PrefillBatchScratch.flash_partials", self.flash_partials),
+        ] {
+            free_tensor_retained(label, t, gpu, &mut failures);
+        }
+
+        // Host metadata (max_batch) — nothing to free.
+        let _ = self.max_batch;
+
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(GpuCleanupFailure {
+                failed_tensors: failures,
+                other: Vec::new(),
+            })
         }
     }
 }
@@ -3684,6 +3792,61 @@ impl ForwardScratch {
             let _ = gpu.free_tensor(t);
         }
         let _ = gpu.hip.free(self.pos_buf);
+    }
+
+    /// Checked GPU cleanup: attempts every tensor independently, retains
+    /// every allocation that could not be freed for retry.
+    ///
+    /// On success all resources are consumed (`Ok(())`). On failure the
+    /// returned [`GpuCleanupFailure`] carries the exact original tensors
+    /// that could not be freed, ready for retry.
+    ///
+    /// `pos_buf` is a raw [`hip_bridge::DeviceBuffer`]; it is represented as
+    /// a `GpuTensor` with `shape=[]` / `DType::Raw` — the honest description
+    /// of a bare 4-byte allocation, not a fabrication.
+    pub fn free_checked(self, gpu: &mut Gpu) -> Result<(), GpuCleanupFailure> {
+        let mut failures: Vec<RetainedGpuTensor> = Vec::new();
+
+        for (label, t) in [
+            ("ForwardScratch.x", self.x),
+            ("ForwardScratch.tmp", self.tmp),
+            ("ForwardScratch.q", self.q),
+            ("ForwardScratch.k", self.k),
+            ("ForwardScratch.v", self.v),
+            ("ForwardScratch.attn_out", self.attn_out),
+            ("ForwardScratch.o", self.o),
+            ("ForwardScratch.gate", self.gate),
+            ("ForwardScratch.up", self.up),
+            ("ForwardScratch.ffn_hidden", self.ffn_hidden),
+            ("ForwardScratch.ffn_out", self.ffn_out),
+            ("ForwardScratch.logits", self.logits),
+            ("ForwardScratch.sample_buf", self.sample_buf),
+            ("ForwardScratch.repeat_buf", self.repeat_buf),
+            ("ForwardScratch.attn_partials", self.attn_partials),
+            ("ForwardScratch.x_rot", self.x_rot),
+        ] {
+            free_tensor_retained(label, t, gpu, &mut failures);
+        }
+        // pos_buf: raw DeviceBuffer → honest GpuTensor wrapper (Raw dtype).
+        free_tensor_retained(
+            "ForwardScratch.pos_buf",
+            GpuTensor {
+                buf: self.pos_buf,
+                shape: vec![],
+                dtype: DType::Raw,
+            },
+            gpu,
+            &mut failures,
+        );
+
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(GpuCleanupFailure {
+                failed_tensors: failures,
+                other: Vec::new(),
+            })
+        }
     }
 }
 

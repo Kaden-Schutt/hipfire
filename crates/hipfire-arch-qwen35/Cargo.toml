@@ -22,6 +22,11 @@ test-utils = ["deltanet"]
 emulated-ep2-harness = ["deltanet"]
 # Propagates hipfire-runtime's test-only DFlash allocation fault injector.
 dflash-fault-inject = ["hipfire-runtime/dflash-fault-inject"]
+# Env-var-driven fault injection for the Frozen construction path
+# (HIPFIRE_FROZEN_FAIL_STAGE / HIPFIRE_FROZEN_FAIL_FREE). Test-only; the
+# stage injector compiles to a constant None in production builds and the
+# free injector is gated off entirely in rdna-compute.
+frozen-fault-inject = ["deltanet", "rdna-compute/frozen-fault-inject"]
 
 [dependencies]
 hipfire-config = { path = "../hipfire-config" }
