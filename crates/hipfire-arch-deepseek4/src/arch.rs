@@ -1729,6 +1729,17 @@ impl DeepseekV4 {
 
         // Per-layer.
         for (l, layer) in weights.layers.iter_mut().enumerate() {
+            // Dense TP is deliberately narrower than EP: exact gfx1201,
+            // four ranks, frozen MQ2R P3, ordinary AR. Other models, formats,
+            // rank counts, and architectures keep the replicated route.
+            let dense_tp = shard.filter(|(plan, _)| {
+                gpu.arch_caps.is_gfx1201()
+                    && cfg.mq2r
+                    && !cfg.mq2rxt
+                    && !cfg.load_dspark
+                    && plan.tp_size == 4
+            });
+
             // Norms (F16 on disk → F32 on GPU).
             layer.attn_norm = Some(Self::upload_global_f16_as_f32(
                 hfq,
@@ -1750,11 +1761,23 @@ impl DeepseekV4 {
                 gpu,
                 &format!("layers.{l}.attn.kv_norm.weight"),
             )?);
-            layer.attn_sink = Some(Self::upload_global_f16_as_f32(
-                hfq,
-                gpu,
-                &format!("layers.{l}.attn.attn_sink"),
-            )?);
+            let attn_sink_name = format!("layers.{l}.attn.attn_sink");
+            layer.attn_sink = Some(if let Some((plan, rank)) = dense_tp {
+                if cfg.num_attention_heads % plan.tp_size != 0 {
+                    return Err(format!(
+                        "deepseek4: attention heads {} not divisible by TP={} ",
+                        cfg.num_attention_heads, plan.tp_size
+                    ));
+                }
+                let local_heads = cfg.num_attention_heads / plan.tp_size;
+                let first = rank * local_heads;
+                let keep: Vec<u32> = (first..first + local_heads)
+                    .map(|head| head as u32)
+                    .collect();
+                Self::upload_global_f16_as_f32_keep(hfq, gpu, &attn_sink_name, &keep)?
+            } else {
+                Self::upload_global_f16_as_f32(hfq, gpu, &attn_sink_name)?
+            });
 
             // Attention LoRA + KV joint.
             // Attention projections — antirez recipe ships these as Q8_0
@@ -1766,26 +1789,59 @@ impl DeepseekV4 {
                 gpu,
                 &format!("layers.{l}.attn.wq_a.weight"),
             )?);
-            layer.wq_b = Some(Self::upload_quant_or_f16(
-                hfq,
-                gpu,
-                &format!("layers.{l}.attn.wq_b.weight"),
-            )?);
             layer.wkv = Some(Self::upload_quant_or_f16(
                 hfq,
                 gpu,
                 &format!("layers.{l}.attn.wkv.weight"),
             )?);
-            layer.wo_a = Some(Self::upload_quant_or_f16(
-                hfq,
-                gpu,
-                &format!("layers.{l}.attn.wo_a.weight"),
-            )?);
-            layer.wo_b = Some(Self::upload_quant_or_f16(
-                hfq,
-                gpu,
-                &format!("layers.{l}.attn.wo_b.weight"),
-            )?);
+            let wq_b_name = format!("layers.{l}.attn.wq_b.weight");
+            let wo_a_name = format!("layers.{l}.attn.wo_a.weight");
+            let wo_b_name = format!("layers.{l}.attn.wo_b.weight");
+            if let Some((plan, rank)) = dense_tp {
+                if cfg.o_groups % plan.tp_size != 0 {
+                    return Err(format!(
+                        "deepseek4: O-LoRA groups {} not divisible by TP={}",
+                        cfg.o_groups, plan.tp_size
+                    ));
+                }
+                layer.attn_tp_size = plan.tp_size;
+                layer.attn_tp_rank = rank;
+                if l == 0 {
+                    eprintln!(
+                        "deepseek4: exact gfx1201 attention dense TP active \
+                         (rank {rank}/{}, wq_b+wo_a output rows, wo_b whole-FWHT-group columns)",
+                        plan.tp_size
+                    );
+                }
+                layer.wq_b = Some(Self::upload_mfp4e8_soa_tp_shard(
+                    hfq,
+                    gpu,
+                    &wq_b_name,
+                    rank,
+                    plan.tp_size,
+                    true,
+                )?);
+                layer.wo_a = Some(Self::upload_mfp4e8_soa_tp_shard(
+                    hfq,
+                    gpu,
+                    &wo_a_name,
+                    rank,
+                    plan.tp_size,
+                    true,
+                )?);
+                layer.wo_b = Some(Self::upload_mfp4e8_soa_tp_shard(
+                    hfq,
+                    gpu,
+                    &wo_b_name,
+                    rank,
+                    plan.tp_size,
+                    false,
+                )?);
+            } else {
+                layer.wq_b = Some(Self::upload_quant_or_f16(hfq, gpu, &wq_b_name)?);
+                layer.wo_a = Some(Self::upload_quant_or_f16(hfq, gpu, &wo_a_name)?);
+                layer.wo_b = Some(Self::upload_quant_or_f16(hfq, gpu, &wo_b_name)?);
+            }
 
             // Main-attention compressor — only when ratio > 0. Use the
             // dual-dtype helper so `--non-expert-f16` quants land as F32
@@ -2026,9 +2082,7 @@ impl DeepseekV4 {
             // qt35 matrices: w1/w3 by output rows, w2 by whole FWHT-group
             // input columns. Other arches, rank counts, formats, and model
             // recipes retain the established replicated upload.
-            let shared_tp = shard.filter(|(plan, _)| {
-                gpu.arch_caps.is_gfx1201() && cfg.mq2r && !cfg.mq2rxt && plan.tp_size == 4
-            });
+            let shared_tp = dense_tp;
             let w1_name = format!("layers.{l}.ffn.shared_experts.w1.weight");
             let w2_name = format!("layers.{l}.ffn.shared_experts.w2.weight");
             let w3_name = format!("layers.{l}.ffn.shared_experts.w3.weight");

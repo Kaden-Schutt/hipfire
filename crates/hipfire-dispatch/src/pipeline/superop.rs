@@ -378,6 +378,47 @@ pub trait ForwardBindings {
             quant: "",
         })
     }
+
+    /// Whether this rank replaces replicated `Attend` with a rank-local
+    /// attention projection whose hidden-width result must be all-reduced.
+    /// False by default, so existing Qwen, MiniMax, and single-rank routes do
+    /// not change behavior.
+    fn attention_tp_enabled(&self) -> bool {
+        false
+    }
+
+    /// Run the rank-local attention body up to (but excluding) the residual
+    /// mix. Called only when every rank reports [`attention_tp_enabled`].
+    fn run_attend_ep(
+        &mut self,
+        _gpu: &mut Gpu,
+        _ctx: &DispatchCtx,
+        _op: &OpBinding,
+    ) -> Result<(), DispatchError> {
+        Err(DispatchError::UnsupportedVariant {
+            family: "ep",
+            variant: "run_attend_ep-not-implemented-for-arch",
+            arch: "",
+            quant: "",
+        })
+    }
+
+    /// Return the hidden-width rank-local attention partial produced by
+    /// [`run_attend_ep`]. The EP executor all-reduces this buffer in place.
+    fn ep_attention_partial(&self) -> Option<&GpuTensor> {
+        None
+    }
+
+    /// Finish the attention residual mix after the rank-local partial has been
+    /// all-reduced in place.
+    fn ep_finish_attend(&mut self, _gpu: &mut Gpu) -> Result<(), DispatchError> {
+        Err(DispatchError::UnsupportedVariant {
+            family: "ep",
+            variant: "ep_finish_attend-not-implemented-for-arch",
+            arch: "",
+            quant: "",
+        })
+    }
 }
 
 /// Dispatch a SINGLE super-op to its [`ForwardBindings`] method. Extracted from

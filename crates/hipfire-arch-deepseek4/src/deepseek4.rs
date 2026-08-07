@@ -580,6 +580,12 @@ pub struct DeepseekV4LayerWeights {
     pub wkv: Option<rdna_compute::GpuTensor>,
     pub wo_a: Option<rdna_compute::GpuTensor>,
     pub wo_b: Option<rdna_compute::GpuTensor>,
+    /// Exact gfx1201 four-rank dense-TP contract for the main attention
+    /// projections. `1/0` is the ordinary replicated route. The rank owns a
+    /// contiguous set of query heads / O-LoRA groups and produces one
+    /// hidden-width `wo_b` partial for the EP executor to all-reduce.
+    pub attn_tp_size: usize,
+    pub attn_tp_rank: usize,
 
     // Main-attention compressor (compress_ratio > 0). Stores compressed
     // KV at slot pos//ratio for later main-attention gather. Distinct
@@ -738,6 +744,8 @@ impl DeepseekV4LayerWeights {
             wkv: sc(&self.wkv),
             wo_a: sc(&self.wo_a),
             wo_b: sc(&self.wo_b),
+            attn_tp_size: self.attn_tp_size,
+            attn_tp_rank: self.attn_tp_rank,
             compressor_wkv: sc(&self.compressor_wkv),
             compressor_wgate: sc(&self.compressor_wgate),
             compressor_norm: sc(&self.compressor_norm),
@@ -805,6 +813,8 @@ impl DeepseekV4LayerWeights {
             wkv: None,
             wo_a: None,
             wo_b: None,
+            attn_tp_size: 1,
+            attn_tp_rank: 0,
             compressor_wkv: None,
             compressor_wgate: None,
             compressor_norm: None,

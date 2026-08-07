@@ -4343,15 +4343,17 @@ pub fn decode_step_body(
 // path is DEFAULT-ON after hipx byte-parity (plain AR + MTP spec-decode).
 // ─────────────────────────────────────────────────────────────────────────
 
-/// Attention block (replays decode_step_body's attn arm verbatim). HC residual
-/// streams + KV/compressor/indexer state are threaded through `state`.
-fn ds4_attn_block(
+/// Attention block core. `do_mix=false` leaves the rank-local `wo_b` partial
+/// in `state.attn_out`; exact gfx1201 attention TP all-reduces that tensor
+/// before invoking `hc_attn_mix` through the EP finish hook.
+fn ds4_attn_block_core(
     cfg: &DeepseekV4Config,
     weights: &DeepseekV4Weights,
     state: &mut DeepseekV4State,
     gpu: &mut Gpu,
     layer_idx: usize,
     position: u32,
+    do_mix: bool,
 ) -> Result<(), String> {
     let layer = weights.resolve_layer(layer_idx);
     mhc_pre(cfg, weights, state, gpu, layer_idx, /*is_attn=*/ true)?;
@@ -4375,8 +4377,22 @@ fn ds4_attn_block(
         }
     }
     attn_stub(cfg, weights, state, gpu, layer_idx, OloraSchedule::Default)?;
-    hc_attn_mix(cfg, weights, state, gpu, layer_idx)?;
+    if do_mix {
+        hc_attn_mix(cfg, weights, state, gpu, layer_idx)?;
+    }
     Ok(())
+}
+
+/// Replicated attention block (the established EP and single-GPU behavior).
+fn ds4_attn_block(
+    cfg: &DeepseekV4Config,
+    weights: &DeepseekV4Weights,
+    state: &mut DeepseekV4State,
+    gpu: &mut Gpu,
+    layer_idx: usize,
+    position: u32,
+) -> Result<(), String> {
+    ds4_attn_block_core(cfg, weights, state, gpu, layer_idx, position, true)
 }
 
 /// Exact-gfx1100 attention schedule for the heterogeneous route.
@@ -4727,6 +4743,51 @@ impl<'a> ForwardBindings for Deepseek4Bindings<'a> {
             self.position,
         )
         .map_err(DispatchError::Hip)
+    }
+    fn attention_tp_enabled(&self) -> bool {
+        self.weights.resolve_layer(self.layer_idx).attn_tp_size > 1
+    }
+    fn run_attend_ep(
+        &mut self,
+        gpu: &mut Gpu,
+        _ctx: &DispatchCtx,
+        _op: &OpBinding,
+    ) -> Result<(), DispatchError> {
+        let layer = self.weights.resolve_layer(self.layer_idx);
+        let tp_size = layer.attn_tp_size;
+        if tp_size <= 1
+            || self.cfg.num_attention_heads % tp_size != 0
+            || self.cfg.o_groups % tp_size != 0
+        {
+            return Err(DispatchError::Hip(format!(
+                "deepseek4 attention TP invalid at layer {}: heads={} groups={} tp={tp_size}",
+                self.layer_idx, self.cfg.num_attention_heads, self.cfg.o_groups
+            )));
+        }
+
+        // Every rank owns a contiguous head range and the corresponding
+        // contiguous O-LoRA groups. Head-local attention arithmetic is
+        // unchanged; only the explicit shape view becomes rank-local.
+        let mut local_cfg = self.cfg.clone();
+        local_cfg.num_attention_heads /= tp_size;
+        local_cfg.o_groups /= tp_size;
+        ds4_attn_block_core(
+            &local_cfg,
+            self.weights,
+            self.state,
+            gpu,
+            self.layer_idx,
+            self.position,
+            /*do_mix=*/ false,
+        )
+        .map_err(DispatchError::Hip)
+    }
+    fn ep_attention_partial(&self) -> Option<&GpuTensor> {
+        self.state.attn_out.as_ref()
+    }
+    fn ep_finish_attend(&mut self, gpu: &mut Gpu) -> Result<(), DispatchError> {
+        hc_attn_mix(self.cfg, self.weights, self.state, gpu, self.layer_idx)
+            .map_err(DispatchError::Hip)
     }
     fn run_moe(
         &mut self,
@@ -8445,9 +8506,14 @@ fn q_lora_prepare(
         );
     }
     if state.q.is_none() {
-        // 2D shape so rmsnorm_f32 does per-head normalization.
+        // Keep enough storage for both the rank-local Q tensor and the legacy
+        // non-pingpong HC mix scratch (`hc_mult * hidden`). Q operations below
+        // take an explicitly shaped local view, so attention TP does not make
+        // RMSNorm touch the unused tail.
+        let q_total = cfg.num_attention_heads * cfg.head_dim;
+        let q_storage = q_total.max(cfg.hc_mult * cfg.hidden_size);
         state.q = Some(
-            gpu.alloc_tensor(&[cfg.num_attention_heads, cfg.head_dim], DType::F32)
+            gpu.alloc_tensor(&[q_storage], DType::F32)
                 .map_err(|e| format!("alloc q: {e:?}"))?,
         );
     }
@@ -8550,7 +8616,6 @@ fn q_lora_project(
     let tmp_plain = state.tmp_plain.as_ref().unwrap();
     let q_lat = state.q_lat.as_ref().unwrap();
     let q_lat_rot = state.q_lat_rot.as_ref().unwrap();
-    let q = state.q.as_ref().unwrap();
     let q_head_ones = state.q_head_ones.as_ref().unwrap();
     let wq_b_needs_fwht = weight_needs_fwht(wq_b);
 
@@ -8608,20 +8673,22 @@ fn q_lora_project(
     // 4. wq_b @ q_lat_rot → q. M = n_heads * head_dim, K = q_lora_rank.
     //    Use q_lat (un-rotated) for F16 path; q_lat_rot for MQ4 path.
     let q_total = cfg.num_attention_heads * cfg.head_dim;
+    let mut q = state.q.as_ref().unwrap().sub_offset(0, q_total);
+    q.shape = vec![cfg.num_attention_heads, cfg.head_dim];
     gemv_auto(
         gpu,
         weights.mq2r_backend,
         wq_b,
         q_lat_rot,
         q_lat,
-        q,
+        &q,
         q_total,
         cfg.q_lora_rank,
     )?;
 
     // 4.5. Per-head RMSNorm of Q (upstream DeepSeek V4:
     //     `q *= rsqrt(q.square().mean(-1, keepdim=True) + eps)`).
-    gpu.rmsnorm_f32(q, q_head_ones, q, cfg.rms_norm_eps)
+    gpu.rmsnorm_f32(&q, q_head_ones, &q, cfg.rms_norm_eps)
         .map_err(|e| format!("q per-head rmsnorm layer {layer_idx}: {e:?}"))?;
 
     Ok(())
