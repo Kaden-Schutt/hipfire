@@ -2123,28 +2123,6 @@ fn compressor_forward_prebatched(
     )
 }
 
-fn ensure_compressor_projection_scratch(
-    state: &mut DeepseekV4State,
-    gpu: &mut Gpu,
-    layer_idx: usize,
-    proj_dim: usize,
-) -> Result<(), String> {
-    let l_state = &mut state._indexer[layer_idx];
-    if l_state.comp_kv_buf.is_none() {
-        l_state.comp_kv_buf = Some(
-            gpu.alloc_tensor(&[proj_dim], DType::F32)
-                .map_err(|e| format!("alloc comp_kv_buf l{layer_idx}: {e:?}"))?,
-        );
-    }
-    if l_state.comp_score_buf.is_none() {
-        l_state.comp_score_buf = Some(
-            gpu.alloc_tensor(&[proj_dim], DType::F32)
-                .map_err(|e| format!("alloc comp_score_buf l{layer_idx}: {e:?}"))?,
-        );
-    }
-    Ok(())
-}
-
 #[allow(dead_code, clippy::too_many_arguments)]
 fn compressor_forward_impl(
     cfg: &DeepseekV4Config,
@@ -2270,9 +2248,20 @@ fn compressor_forward_impl(
     }
 
     // Per-step scratch — lazy-alloc on layer's IndexerLayerState.
-    ensure_compressor_projection_scratch(state, gpu, layer_idx, proj_dim)?;
     {
         let l_state = &mut state._indexer[layer_idx];
+        if l_state.comp_kv_buf.is_none() {
+            l_state.comp_kv_buf = Some(
+                gpu.alloc_tensor(&[proj_dim], DType::F32)
+                    .map_err(|e| format!("alloc comp_kv_buf l{layer_idx}: {e:?}"))?,
+            );
+        }
+        if l_state.comp_score_buf.is_none() {
+            l_state.comp_score_buf = Some(
+                gpu.alloc_tensor(&[proj_dim], DType::F32)
+                    .map_err(|e| format!("alloc comp_score_buf l{layer_idx}: {e:?}"))?,
+            );
+        }
         if overlap && l_state.comp_concat_kv.is_none() {
             l_state.comp_concat_kv = Some(
                 gpu.alloc_tensor(&[2 * ratio, head_dim], DType::F32)
@@ -4434,7 +4423,23 @@ fn ds4_attn_block_heterogeneous(
 
     std::mem::swap(&mut gpu.active_stream, &mut execution.dense_attn_stream);
     let side_result = (|| {
-        heterogeneous_kv_and_compressors(cfg, weights, state, gpu, layer_idx, position)?;
+        kv_joint(cfg, weights, state, gpu, layer_idx)?;
+        if layer.compress_ratio > 0 {
+            let tmp_view = {
+                let tmp = state.tmp.as_ref().unwrap();
+                tmp.sub_offset(0, tmp.numel())
+            };
+            compressor_forward(
+                cfg, weights, state, gpu, layer_idx, &tmp_view, position,
+                /*is_indexer=*/ false,
+            )?;
+            if layer.compress_ratio == 4 {
+                compressor_forward(
+                    cfg, weights, state, gpu, layer_idx, &tmp_view, position,
+                    /*is_indexer=*/ true,
+                )?;
+            }
+        }
         let side = gpu
             .active_stream
             .as_ref()
@@ -4479,204 +4484,6 @@ fn ds4_attn_block_heterogeneous(
         OloraSchedule::HeterogeneousGfx1100,
     )?;
     hc_attn_mix(cfg, weights, state, gpu, layer_idx)
-}
-
-/// Evaluate the fixed-shape DS4 KV/compressor projection groups on the
-/// heterogeneous route. This dispatch is deliberately exact-gfx1100 and
-/// dtype-gated: every other device, quant, and ordinary single-GPU route keeps
-/// the historical projection sequence.
-fn heterogeneous_kv_and_compressors(
-    cfg: &DeepseekV4Config,
-    weights: &DeepseekV4Weights,
-    state: &mut DeepseekV4State,
-    gpu: &mut Gpu,
-    layer_idx: usize,
-    position: u32,
-) -> Result<(), String> {
-    let layer = weights.resolve_layer(layer_idx);
-    let ratio = layer.compress_ratio as usize;
-    if ratio == 0 || !gpu.arch_caps.is_gfx1100() {
-        kv_joint(cfg, weights, state, gpu, layer_idx)?;
-        return Ok(());
-    }
-
-    let wkv = layer
-        .wkv
-        .as_ref()
-        .ok_or_else(|| format!("layer {layer_idx} wkv missing"))?;
-    let main_wkv = layer
-        .compressor_wkv
-        .as_ref()
-        .ok_or_else(|| format!("comp_wkv l{layer_idx}"))?;
-    let main_wgate = layer
-        .compressor_wgate
-        .as_ref()
-        .ok_or_else(|| format!("comp_wgate l{layer_idx}"))?;
-    let exact_e8 = |weight: &GpuTensor| weight.dtype == DType::MFP4G32E8SOA;
-    let tmp_view = {
-        let tmp = state
-            .tmp
-            .as_ref()
-            .ok_or_else(|| format!("heterogeneous projections: state.tmp missing l{layer_idx}"))?;
-        tmp.sub_offset(0, tmp.numel())
-    };
-
-    if ratio == 128 && exact_e8(wkv) && exact_e8(main_wkv) && exact_e8(main_wgate) {
-        ensure_kv_joint_output(cfg, state, gpu)?;
-        ensure_compressor_projection_scratch(state, gpu, layer_idx, cfg.head_dim)?;
-        {
-            let kv = state.kv.as_ref().unwrap();
-            let comp_kv = state._indexer[layer_idx].comp_kv_buf.as_ref().unwrap();
-            let comp_score = state._indexer[layer_idx].comp_score_buf.as_ref().unwrap();
-            gpu.gemv_mfp4g32_e8_soa_shared_jobs_gfx1100(
-                &[wkv, main_wkv, main_wgate],
-                &tmp_view,
-                &[kv, comp_kv, comp_score],
-                cfg.head_dim,
-                cfg.hidden_size,
-            )
-            .map_err(|e| format!("heterogeneous shared KV/compressor l{layer_idx}: {e:?}"))?;
-        }
-        kv_joint_normalize(cfg, weights, state, gpu, layer_idx)?;
-        let (comp_kv, comp_score) = {
-            let l_state = &state._indexer[layer_idx];
-            (
-                l_state
-                    .comp_kv_buf
-                    .as_ref()
-                    .unwrap()
-                    .sub_offset(0, cfg.head_dim),
-                l_state
-                    .comp_score_buf
-                    .as_ref()
-                    .unwrap()
-                    .sub_offset(0, cfg.head_dim),
-            )
-        };
-        compressor_forward_prebatched(
-            cfg,
-            weights,
-            state,
-            gpu,
-            layer_idx,
-            position,
-            false,
-            &comp_kv,
-            &comp_score,
-            0,
-            true,
-        )?;
-        return Ok(());
-    }
-
-    // Ratio-4 layers keep the ordinary KV projection, then collapse each
-    // same-shaped compressor pair from two launches to one. Main runs before
-    // indexer so both can reuse the existing max-sized projection scratch.
-    kv_joint(cfg, weights, state, gpu, layer_idx)?;
-    if ratio != 4 {
-        compressor_forward(
-            cfg, weights, state, gpu, layer_idx, &tmp_view, position, false,
-        )?;
-        return Ok(());
-    }
-
-    let main_proj_dim = 2 * cfg.head_dim;
-    if exact_e8(main_wkv) && exact_e8(main_wgate) {
-        ensure_compressor_projection_scratch(state, gpu, layer_idx, main_proj_dim)?;
-        let (comp_kv, comp_score) = {
-            let l_state = &state._indexer[layer_idx];
-            (
-                l_state
-                    .comp_kv_buf
-                    .as_ref()
-                    .unwrap()
-                    .sub_offset(0, main_proj_dim),
-                l_state
-                    .comp_score_buf
-                    .as_ref()
-                    .unwrap()
-                    .sub_offset(0, main_proj_dim),
-            )
-        };
-        gpu.gemv_mfp4g32_e8_soa_shared_jobs_gfx1100(
-            &[main_wkv, main_wgate],
-            &tmp_view,
-            &[&comp_kv, &comp_score],
-            main_proj_dim,
-            cfg.hidden_size,
-        )
-        .map_err(|e| format!("heterogeneous shared main compressor l{layer_idx}: {e:?}"))?;
-        compressor_forward_prebatched(
-            cfg,
-            weights,
-            state,
-            gpu,
-            layer_idx,
-            position,
-            false,
-            &comp_kv,
-            &comp_score,
-            0,
-            true,
-        )?;
-    } else {
-        compressor_forward(
-            cfg, weights, state, gpu, layer_idx, &tmp_view, position, false,
-        )?;
-    }
-
-    let indexer_wkv = layer
-        .indexer_compressor_wkv
-        .as_ref()
-        .ok_or_else(|| format!("idx_comp_wkv l{layer_idx}"))?;
-    let indexer_wgate = layer
-        .indexer_compressor_wgate
-        .as_ref()
-        .ok_or_else(|| format!("idx_comp_wgate l{layer_idx}"))?;
-    let indexer_proj_dim = 2 * cfg.index_head_dim;
-    if exact_e8(indexer_wkv) && exact_e8(indexer_wgate) {
-        let (comp_kv, comp_score) = {
-            let l_state = &state._indexer[layer_idx];
-            (
-                l_state
-                    .comp_kv_buf
-                    .as_ref()
-                    .unwrap()
-                    .sub_offset(0, indexer_proj_dim),
-                l_state
-                    .comp_score_buf
-                    .as_ref()
-                    .unwrap()
-                    .sub_offset(0, indexer_proj_dim),
-            )
-        };
-        gpu.gemv_mfp4g32_e8_soa_shared_jobs_gfx1100(
-            &[indexer_wkv, indexer_wgate],
-            &tmp_view,
-            &[&comp_kv, &comp_score],
-            indexer_proj_dim,
-            cfg.hidden_size,
-        )
-        .map_err(|e| format!("heterogeneous shared indexer compressor l{layer_idx}: {e:?}"))?;
-        compressor_forward_prebatched(
-            cfg,
-            weights,
-            state,
-            gpu,
-            layer_idx,
-            position,
-            true,
-            &comp_kv,
-            &comp_score,
-            0,
-            true,
-        )?;
-    } else {
-        compressor_forward(
-            cfg, weights, state, gpu, layer_idx, &tmp_view, position, true,
-        )?;
-    }
-    Ok(())
 }
 
 /// FFN block (replays decode_step_body's FFN arm verbatim).
@@ -8518,8 +8325,18 @@ fn kv_joint(
         .wkv
         .as_ref()
         .ok_or_else(|| format!("layer {layer_idx} wkv missing"))?;
+    let kv_norm = layer
+        .kv_norm
+        .as_ref()
+        .ok_or_else(|| format!("layer {layer_idx} kv_norm missing"))?;
+
     let kv_dim = cfg.num_key_value_heads * cfg.head_dim;
-    ensure_kv_joint_output(cfg, state, gpu)?;
+    if state.kv.is_none() {
+        state.kv = Some(
+            gpu.alloc_tensor(&[kv_dim], DType::F32)
+                .map_err(|e| format!("alloc kv: {e:?}"))?,
+        );
+    }
     let tmp = state.tmp.as_ref().unwrap();
     let tmp_plain = state
         .tmp_plain
@@ -8539,40 +8356,14 @@ fn kv_joint(
         cfg.hidden_size,
     )?;
 
-    kv_joint_normalize(cfg, weights, state, gpu, layer_idx)
-}
-
-fn ensure_kv_joint_output(
-    cfg: &DeepseekV4Config,
-    state: &mut DeepseekV4State,
-    gpu: &mut Gpu,
-) -> Result<(), String> {
-    if state.kv.is_none() {
-        let kv_dim = cfg.num_key_value_heads * cfg.head_dim;
-        state.kv = Some(
-            gpu.alloc_tensor(&[kv_dim], DType::F32)
-                .map_err(|e| format!("alloc kv: {e:?}"))?,
-        );
-    }
-    Ok(())
-}
-
-fn kv_joint_normalize(
-    cfg: &DeepseekV4Config,
-    weights: &DeepseekV4Weights,
-    state: &DeepseekV4State,
-    gpu: &mut Gpu,
-    layer_idx: usize,
-) -> Result<(), String> {
-    let kv_norm = weights
-        .resolve_layer(layer_idx)
-        .kv_norm
-        .as_ref()
-        .ok_or_else(|| format!("layer {layer_idx} kv_norm missing"))?;
-    let kv = state.kv.as_ref().unwrap();
-    // Upstream DeepSeek V4 normalizes KV after projection and before RoPE.
+    // kv_norm RMSNorm in place (upstream DeepSeek V4: `kv = self.kv_norm(kv)`
+    // after wkv, before apply_rotary_emb). Was missing — likely
+    // contributed to the SWA attractor since Q is rmsnormed but K=V
+    // had arbitrary magnitudes.
     gpu.rmsnorm_f32(kv, kv_norm, kv, cfg.rms_norm_eps)
-        .map_err(|e| format!("kv_norm rmsnorm layer {layer_idx}: {e:?}"))
+        .map_err(|e| format!("kv_norm rmsnorm layer {layer_idx}: {e:?}"))?;
+
+    Ok(())
 }
 
 /// Step 3 (attention block): Q via Q-LoRA + tail-only RoPE.
