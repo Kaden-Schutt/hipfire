@@ -1745,16 +1745,18 @@ impl Gpu {
         // compile happens in a cache dir with no -I to kernels/src. Strip the
         // directive and prepend the header body instead (same pattern as
         // ensure_givens4_kernel's turbo_common/givens_common handling).
-        let attn_q8_batched_src = {
-            let stripped = kernels::ATTENTION_Q8_0_KV_BATCHED_SRC
-                .replace("#include \"kv_slot_desc.h\"", "");
-            format!("{}\n{}", kernels::KV_SLOT_DESC_H, stripped)
-        };
-        self.ensure_kernel(
-            "attention_q8_0_kv_batched",
-            &attn_q8_batched_src,
-            "attention_q8_0_kv_batched",
-        )?;
+        if !self.functions.contains_key("attention_q8_0_kv_batched") {
+            let attn_q8_batched_src = {
+                let stripped = kernels::ATTENTION_Q8_0_KV_BATCHED_SRC
+                    .replace("#include \"kv_slot_desc.h\"", "");
+                format!("{}\n{}", kernels::KV_SLOT_DESC_H, stripped)
+            };
+            self.ensure_kernel(
+                "attention_q8_0_kv_batched",
+                &attn_q8_batched_src,
+                "attention_q8_0_kv_batched",
+            )?;
+        }
         let scale = 1.0f32 / (head_dim as f32).sqrt();
         let mut q_ptr = q.buf.as_ptr();
         let mut k_ptr = k_cache.buf.as_ptr();
