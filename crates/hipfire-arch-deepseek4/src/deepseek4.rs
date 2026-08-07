@@ -1303,8 +1303,12 @@ impl DeepseekV4RoutedWeights {
         }
         gpu.bind_thread()
             .map_err(|error| format!("deepseek4: bind routed owner for local audit: {error}"))?;
+        let pci_bus_id = gpu
+            .pci_bus_id()
+            .map_err(|error| format!("deepseek4: routed owner PCI identity: {error}"))?;
         let mut receipt = DeepseekV4LocalOwnershipReceipt {
             architecture: gpu.arch.clone(),
+            pci_bus_id,
             hip_device_ordinal: gpu.device_id,
             ..DeepseekV4LocalOwnershipReceipt::default()
         };
@@ -1344,6 +1348,7 @@ impl DeepseekV4RoutedWeights {
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct DeepseekV4LocalOwnershipReceipt {
     pub architecture: String,
+    pub pci_bus_id: String,
     pub hip_device_ordinal: i32,
     pub tensor_count: usize,
     pub bytes: usize,

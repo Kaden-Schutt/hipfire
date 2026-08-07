@@ -5,10 +5,11 @@
 
 Status: H0-H1 complete; H2 CPU protocol complete and the PCI-scoped worker
 survivability oracle passed 11 forced deaths on the authorized gfx1010 guinea
-pig. Exact-pair H2 hardware exit remains open. The process-local gfx1151 H4
-expert-service source seam and routed residency receipt are implemented but
-have not executed a model or passed numerical parity. Independent H3/H4 work
-remains in progress. GPU product execution remains prohibited.
+pig. Stable HIP and ROCr PCI selection is source-complete, but the exact-pair
+H2 hardware exit remains open. The process-local gfx1151 H4 expert-service
+source seam and routed residency receipt are implemented but have not executed
+a model or passed numerical parity. Independent H3/H4 work remains in
+progress. GPU product execution remains prohibited.
 
 Branch: `ds4-beta-staging`
 
@@ -399,6 +400,8 @@ and
 [`2026-08-06-ds4-harmonic-h1-critical-path.md`](../investigations/2026-08-06-ds4-harmonic-h1-critical-path.md).
 H2 is the first unmet gate. Its transport and fault injection are developed
 CPU-first. The authorized gfx1010 survivability canary passed; the exact
-gfx1100/gfx1151 fault battery remains unrun. In parallel, the source-only H4
-expert-service seam is recorded in
+gfx1100/gfx1151 fault battery remains unrun. Stable HIP PCI binding is recorded
+in
+[`2026-08-07-ds4-harmonic-h2-hip-pci-binding.md`](../investigations/2026-08-07-ds4-harmonic-h2-hip-pci-binding.md).
+In parallel, the source-only H4 expert-service seam is recorded in
 [`2026-08-07-ds4-harmonic-h4-expert-service-source.md`](../investigations/2026-08-07-ds4-harmonic-h4-expert-service-source.md).

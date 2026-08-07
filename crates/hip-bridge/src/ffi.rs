@@ -229,6 +229,8 @@ pub struct HipRuntime {
     fn_set_device: unsafe extern "C" fn(c_int) -> u32,
     fn_set_device_flags: unsafe extern "C" fn(c_uint) -> u32,
     fn_get_device: unsafe extern "C" fn(*mut c_int) -> u32,
+    fn_device_get_pci_bus_id: unsafe extern "C" fn(*mut c_char, c_int, c_int) -> u32,
+    fn_device_get_by_pci_bus_id: unsafe extern "C" fn(*mut c_int, *const c_char) -> u32,
 
     // Multi-device / peer access
     fn_device_can_access_peer: unsafe extern "C" fn(*mut c_int, c_int, c_int) -> u32,
@@ -418,6 +420,16 @@ impl HipRuntime {
                     lib,
                     "hipGetDevice",
                     unsafe extern "C" fn(*mut c_int) -> u32
+                ),
+                fn_device_get_pci_bus_id: load_fn!(
+                    lib,
+                    "hipDeviceGetPCIBusId",
+                    unsafe extern "C" fn(*mut c_char, c_int, c_int) -> u32
+                ),
+                fn_device_get_by_pci_bus_id: load_fn!(
+                    lib,
+                    "hipDeviceGetByPCIBusId",
+                    unsafe extern "C" fn(*mut c_int, *const c_char) -> u32
                 ),
                 fn_device_can_access_peer: load_fn!(
                     lib,
@@ -752,6 +764,43 @@ impl HipRuntime {
         let code = unsafe { (self.fn_get_device_count)(&mut count) };
         self.check(code, "hipGetDeviceCount")?;
         Ok(count)
+    }
+
+    /// Resolve one process-local HIP ordinal from its stable physical PCI
+    /// identity. Persist the PCI identity, never the returned ordinal.
+    pub fn device_by_pci_bus_id(&self, pci_bus_id: &str) -> HipResult<i32> {
+        let pci_bus_id = CString::new(pci_bus_id)
+            .map_err(|_| HipError::new(0, "PCI bus ID contains an interior NUL"))?;
+        let mut device: c_int = -1;
+        let code = unsafe { (self.fn_device_get_by_pci_bus_id)(&mut device, pci_bus_id.as_ptr()) };
+        self.check(code, "hipDeviceGetByPCIBusId")?;
+        Ok(device)
+    }
+
+    /// Return HIP's normalized physical PCI identity for one process-local
+    /// device ordinal.
+    pub fn device_pci_bus_id(&self, device: i32) -> HipResult<String> {
+        let mut bytes = [0_u8; 32];
+        let code = unsafe {
+            (self.fn_device_get_pci_bus_id)(
+                bytes.as_mut_ptr().cast(),
+                bytes.len() as c_int,
+                device as c_int,
+            )
+        };
+        self.check(code, "hipDeviceGetPCIBusId")?;
+        let end = bytes.iter().position(|byte| *byte == 0).ok_or_else(|| {
+            HipError::new(0, "hipDeviceGetPCIBusId returned an unterminated identity")
+        })?;
+        let value = std::str::from_utf8(&bytes[..end])
+            .map_err(|_| HipError::new(0, "hipDeviceGetPCIBusId returned invalid UTF-8"))?;
+        if value.is_empty() {
+            return Err(HipError::new(
+                0,
+                "hipDeviceGetPCIBusId returned an empty identity",
+            ));
+        }
+        Ok(value.to_ascii_lowercase())
     }
 
     pub fn set_device(&self, id: i32) -> HipResult<()> {

@@ -752,6 +752,52 @@ impl Gpu {
 
     pub fn init_with_device(id: i32) -> HipResult<Self> {
         let hip = HipRuntime::load()?;
+        Self::init_with_runtime(hip, id)
+    }
+
+    /// Bind one exact physical GPU by PCI identity and architecture.
+    ///
+    /// This is the fail-closed multi-GPU admission path. HIP ordinals remain
+    /// process-local diagnostics and may be reordered by visibility filters.
+    pub fn init_with_pci_bus_id(pci_bus_id: &str, expected_arch: &str) -> HipResult<Self> {
+        let hip = HipRuntime::load()?;
+        let id = hip.device_by_pci_bus_id(pci_bus_id)?;
+        let resolved_pci = hip.device_pci_bus_id(id)?;
+        if !resolved_pci.eq_ignore_ascii_case(pci_bus_id) {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "HIP PCI round trip mismatch: requested {pci_bus_id}, resolved {resolved_pci}"
+                ),
+            ));
+        }
+        let physical_arch = hip.get_arch(id)?;
+        if !physical_arch.eq_ignore_ascii_case(expected_arch) {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "HIP device at {resolved_pci} is {physical_arch}, expected {expected_arch}"
+                ),
+            ));
+        }
+        let gpu = Self::init_with_runtime(hip, id)?;
+        if !gpu.arch.eq_ignore_ascii_case(expected_arch) {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "HIP compilation target {} does not match physical architecture {expected_arch} at {resolved_pci}",
+                    gpu.arch
+                ),
+            ));
+        }
+        Ok(gpu)
+    }
+
+    pub fn pci_bus_id(&self) -> HipResult<String> {
+        self.hip.device_pci_bus_id(self.device_id)
+    }
+
+    fn init_with_runtime(hip: HipRuntime, id: i32) -> HipResult<Self> {
         let count = hip.device_count()?;
         if count == 0 {
             return Err(hip_bridge::HipError::new(0, "no GPU devices found"));

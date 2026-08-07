@@ -36,10 +36,9 @@ The activation payload layout is fixed at 16,448 bytes: 16,384 bytes of F32
 and 16 reserved zero bytes. The result payload is exactly 16,384 bytes.
 
 `DeepseekV4RoutedWeights::audit_local_owner` produces a process-local residency
-receipt containing architecture, diagnostic HIP ordinal, tensor count, and
-resident bytes after querying HIP pointer ownership for every routed tensor.
-The eventual supervisor must bind the worker to a stable PCI identity before
-this audit; the ordinal is never the physical identity.
+receipt containing architecture, stable PCI identity, diagnostic HIP ordinal,
+tensor count, and resident bytes after querying HIP pointer ownership for every
+routed tensor. The ordinal is never the physical identity.
 
 ## Redline identity provenance
 
@@ -69,7 +68,9 @@ invariants only.
 
 Before H4 can close, a dedicated worker executable and supervisor must:
 
-1. select the HIP context and ROCr agent by the same stable PCI BDF;
+1. select the HIP context and ROCr agent by the same stable PCI BDF using the
+   fail-closed source API recorded in
+   [`2026-08-07-ds4-harmonic-h2-hip-pci-binding.md`](2026-08-07-ds4-harmonic-h2-hip-pci-binding.md);
 2. verify the model SHA before allocating;
 3. load routed-only weights and publish the local ownership receipt;
 4. service `expert_begin` to `expert_complete` under the typed shared ring;
