@@ -1,0 +1,1126 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
+//! Persistent CPU shared-memory ring for the DeepSeek V4 harmonic protocol.
+//!
+//! Every payload field is atomic. A source publishes with a release transition
+//! only after the complete packet has been written; the destination consumes
+//! after an acquire transition. No method waits or polls. Process supervision,
+//! deadlines, and bounded worker teardown live above this transport.
+
+use std::fmt;
+use std::fs::File;
+use std::io;
+use std::mem;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+
+use memmap2::{MmapMut, MmapOptions};
+
+use crate::harmonic::{
+    HarmonicCompletion, HarmonicContract, HarmonicOwner, HarmonicProtocolError,
+    HarmonicRoutePacket, HarmonicSlotState, DS4_MQ2R_0731_IDENTITY, HARMONIC_ACTIVATION_EXTENT,
+    HARMONIC_RESULT_EXTENT, HARMONIC_ROUTE_IDENTITY, HARMONIC_SLOT_COUNT, HARMONIC_TOP_K,
+};
+
+const HARMONIC_WIRE_MAGIC: u64 = 0x4453_3448_4950_4331; // DS4HIPC1
+const HARMONIC_WIRE_VERSION: u32 = 1;
+const FLAG_SOURCE_OBSERVED: u32 = 1 << 0;
+const FLAG_DESTINATION_QUIESCED: u32 = 1 << 1;
+const OWNER_DENSE_MASK: u32 = 1 << 0;
+const OWNER_EXPERT_MASK: u32 = 1 << 1;
+const ACTIVATION_WORDS: usize = HARMONIC_ACTIVATION_EXTENT as usize / mem::size_of::<u64>();
+const RESULT_WORDS: usize = HARMONIC_RESULT_EXTENT as usize / mem::size_of::<u64>();
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum HarmonicWireState {
+    Vacant = 0,
+    Publishing = 1,
+    Published = 2,
+    Running = 3,
+    Completing = 4,
+    Completed = 5,
+    Cancelled = 6,
+    TimedOut = 7,
+    FailedDense = 8,
+    FailedExpert = 9,
+}
+
+impl HarmonicWireState {
+    fn decode(raw: u32) -> HarmonicIpcResult<Self> {
+        match raw {
+            0 => Ok(Self::Vacant),
+            1 => Ok(Self::Publishing),
+            2 => Ok(Self::Published),
+            3 => Ok(Self::Running),
+            4 => Ok(Self::Completing),
+            5 => Ok(Self::Completed),
+            6 => Ok(Self::Cancelled),
+            7 => Ok(Self::TimedOut),
+            8 => Ok(Self::FailedDense),
+            9 => Ok(Self::FailedExpert),
+            _ => Err(HarmonicIpcError::InvalidLayout("wire state")),
+        }
+    }
+
+    pub const fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Completed
+                | Self::Cancelled
+                | Self::TimedOut
+                | Self::FailedDense
+                | Self::FailedExpert
+        )
+    }
+
+    pub const fn logical(self) -> HarmonicSlotState {
+        match self {
+            Self::Vacant => HarmonicSlotState::Vacant,
+            Self::Publishing | Self::Published => HarmonicSlotState::Published,
+            Self::Running | Self::Completing => HarmonicSlotState::Running,
+            Self::Completed => HarmonicSlotState::Completed,
+            Self::Cancelled => HarmonicSlotState::Cancelled,
+            Self::TimedOut => HarmonicSlotState::TimedOut,
+            Self::FailedDense => HarmonicSlotState::Failed(HarmonicOwner::DenseGfx1100),
+            Self::FailedExpert => HarmonicSlotState::Failed(HarmonicOwner::ExpertGfx1151),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum HarmonicIpcError {
+    Io(io::Error),
+    Protocol(HarmonicProtocolError),
+    InvalidLayout(&'static str),
+    CompareExchange {
+        operation: &'static str,
+        expected: HarmonicWireState,
+        actual: HarmonicWireState,
+    },
+}
+
+impl fmt::Display for HarmonicIpcError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io(error) => write!(f, "deepseek4 harmonic IPC I/O: {error}"),
+            Self::Protocol(error) => error.fmt(f),
+            Self::InvalidLayout(field) => {
+                write!(f, "deepseek4 harmonic IPC invalid shared layout: {field}")
+            }
+            Self::CompareExchange {
+                operation,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "deepseek4 harmonic IPC {operation}: expected {expected:?}, found {actual:?}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for HarmonicIpcError {}
+
+impl From<io::Error> for HarmonicIpcError {
+    fn from(value: io::Error) -> Self {
+        Self::Io(value)
+    }
+}
+
+impl From<HarmonicProtocolError> for HarmonicIpcError {
+    fn from(value: HarmonicProtocolError) -> Self {
+        Self::Protocol(value)
+    }
+}
+
+pub type HarmonicIpcResult<T> = Result<T, HarmonicIpcError>;
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct HarmonicWorkItem {
+    pub packet: HarmonicRoutePacket,
+    pub activation_payload: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HarmonicResolved {
+    pub state: HarmonicSlotState,
+    pub completion: Option<HarmonicCompletion>,
+    pub result_payload: Option<Vec<u8>>,
+}
+
+#[repr(C, align(64))]
+struct HarmonicWireHeader {
+    magic: AtomicU64,
+    version: AtomicU32,
+    slot_count: AtomicU32,
+    route_identity: AtomicU64,
+    model_identity: [AtomicU64; 4],
+    source_generation: AtomicU64,
+    destination_generation: AtomicU64,
+    isolated_owners: AtomicU32,
+}
+
+impl HarmonicWireHeader {
+    fn new(contract: HarmonicContract) -> Self {
+        let model_words = identity_to_words(contract.model_identity);
+        Self {
+            magic: AtomicU64::new(HARMONIC_WIRE_MAGIC),
+            version: AtomicU32::new(HARMONIC_WIRE_VERSION),
+            slot_count: AtomicU32::new(HARMONIC_SLOT_COUNT as u32),
+            route_identity: AtomicU64::new(contract.route_identity),
+            model_identity: model_words.map(AtomicU64::new),
+            source_generation: AtomicU64::new(contract.source_allocation_generation),
+            destination_generation: AtomicU64::new(contract.destination_allocation_generation),
+            isolated_owners: AtomicU32::new(0),
+        }
+    }
+
+    fn contract(&self) -> HarmonicContract {
+        HarmonicContract {
+            route_identity: self.route_identity.load(Ordering::Acquire),
+            model_identity: words_to_identity(
+                self.model_identity
+                    .each_ref()
+                    .map(|word| word.load(Ordering::Acquire)),
+            ),
+            source_allocation_generation: self.source_generation.load(Ordering::Acquire),
+            destination_allocation_generation: self.destination_generation.load(Ordering::Acquire),
+        }
+    }
+}
+
+#[repr(C, align(64))]
+struct HarmonicWireSlot {
+    state: AtomicU32,
+    flags: AtomicU32,
+    epoch: AtomicU64,
+    route_identity: AtomicU64,
+    model_identity: [AtomicU64; 4],
+    layer: AtomicU32,
+    slot: AtomicU32,
+    source_owner: AtomicU32,
+    destination_owner: AtomicU32,
+    source_generation: AtomicU64,
+    destination_generation: AtomicU64,
+    expert_ids: [AtomicU32; HARMONIC_TOP_K],
+    route_weight_bits: [AtomicU32; HARMONIC_TOP_K],
+    activation_extent: AtomicU32,
+    result_extent: AtomicU32,
+    deadline_tick: AtomicU64,
+    activation_fingerprint: AtomicU64,
+    result_fingerprint: AtomicU64,
+    activation_payload: [AtomicU64; ACTIVATION_WORDS],
+    result_payload: [AtomicU64; RESULT_WORDS],
+}
+
+impl HarmonicWireSlot {
+    fn new() -> Self {
+        Self {
+            state: AtomicU32::new(HarmonicWireState::Vacant as u32),
+            flags: AtomicU32::new(0),
+            epoch: AtomicU64::new(0),
+            route_identity: AtomicU64::new(0),
+            model_identity: [const { AtomicU64::new(0) }; 4],
+            layer: AtomicU32::new(0),
+            slot: AtomicU32::new(0),
+            source_owner: AtomicU32::new(0),
+            destination_owner: AtomicU32::new(0),
+            source_generation: AtomicU64::new(0),
+            destination_generation: AtomicU64::new(0),
+            expert_ids: [const { AtomicU32::new(0) }; HARMONIC_TOP_K],
+            route_weight_bits: [const { AtomicU32::new(0) }; HARMONIC_TOP_K],
+            activation_extent: AtomicU32::new(0),
+            result_extent: AtomicU32::new(0),
+            deadline_tick: AtomicU64::new(0),
+            activation_fingerprint: AtomicU64::new(0),
+            result_fingerprint: AtomicU64::new(0),
+            activation_payload: [const { AtomicU64::new(0) }; ACTIVATION_WORDS],
+            result_payload: [const { AtomicU64::new(0) }; RESULT_WORDS],
+        }
+    }
+
+    fn state(&self) -> HarmonicIpcResult<HarmonicWireState> {
+        HarmonicWireState::decode(self.state.load(Ordering::Acquire))
+    }
+
+    fn packet(&self) -> HarmonicIpcResult<HarmonicRoutePacket> {
+        Ok(HarmonicRoutePacket {
+            route_identity: self.route_identity.load(Ordering::Relaxed),
+            model_identity: words_to_identity(
+                self.model_identity
+                    .each_ref()
+                    .map(|word| word.load(Ordering::Relaxed)),
+            ),
+            epoch: self.epoch.load(Ordering::Relaxed),
+            layer: u16::try_from(self.layer.load(Ordering::Relaxed))
+                .map_err(|_| HarmonicIpcError::InvalidLayout("layer"))?,
+            slot: u8::try_from(self.slot.load(Ordering::Relaxed))
+                .map_err(|_| HarmonicIpcError::InvalidLayout("slot"))?,
+            source_owner: decode_owner(self.source_owner.load(Ordering::Relaxed))?,
+            destination_owner: decode_owner(self.destination_owner.load(Ordering::Relaxed))?,
+            source_allocation_generation: self.source_generation.load(Ordering::Relaxed),
+            destination_allocation_generation: self.destination_generation.load(Ordering::Relaxed),
+            expert_ids: self
+                .expert_ids
+                .each_ref()
+                .map(|expert| expert.load(Ordering::Relaxed)),
+            route_weight_bits: self
+                .route_weight_bits
+                .each_ref()
+                .map(|weight| weight.load(Ordering::Relaxed)),
+            activation_extent: self.activation_extent.load(Ordering::Relaxed),
+            result_extent: self.result_extent.load(Ordering::Relaxed),
+            deadline_tick: self.deadline_tick.load(Ordering::Relaxed),
+            activation_fingerprint: self.activation_fingerprint.load(Ordering::Relaxed),
+        })
+    }
+
+    fn check_epoch(&self, got: u64) -> HarmonicIpcResult<()> {
+        let expected = self.epoch.load(Ordering::Acquire);
+        if expected != got || expected == 0 {
+            return Err(HarmonicProtocolError::StaleEpoch { expected, got }.into());
+        }
+        Ok(())
+    }
+
+    fn transition(
+        &self,
+        operation: &'static str,
+        expected: HarmonicWireState,
+        next: HarmonicWireState,
+    ) -> HarmonicIpcResult<()> {
+        self.state
+            .compare_exchange(
+                expected as u32,
+                next as u32,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .map(|_| ())
+            .map_err(|actual| match HarmonicWireState::decode(actual) {
+                Ok(actual) => HarmonicIpcError::CompareExchange {
+                    operation,
+                    expected,
+                    actual,
+                },
+                Err(error) => error,
+            })
+    }
+}
+
+#[repr(C, align(64))]
+struct HarmonicWireLayout {
+    header: HarmonicWireHeader,
+    slots: [HarmonicWireSlot; HARMONIC_SLOT_COUNT],
+}
+
+impl HarmonicWireLayout {
+    fn new(contract: HarmonicContract) -> Self {
+        Self {
+            header: HarmonicWireHeader::new(contract),
+            slots: std::array::from_fn(|_| HarmonicWireSlot::new()),
+        }
+    }
+}
+
+pub struct HarmonicSharedRing {
+    mmap: MmapMut,
+}
+
+impl fmt::Debug for HarmonicSharedRing {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HarmonicSharedRing")
+            .field("bytes", &self.mmap.len())
+            .field("contract", &self.contract())
+            .finish()
+    }
+}
+
+impl HarmonicSharedRing {
+    pub fn create(file: &File, contract: HarmonicContract) -> HarmonicIpcResult<Self> {
+        validate_frozen_contract(contract)?;
+        let bytes = mem::size_of::<HarmonicWireLayout>();
+        file.set_len(bytes as u64)?;
+        // SAFETY: the file has just been resized to the exact mapping length and
+        // remains open for the lifetime of map creation. The returned mapping
+        // owns its VM reference independently of `file`.
+        let mut mmap = unsafe { MmapOptions::new().len(bytes).map_mut(file)? };
+        if !(mmap.as_ptr() as usize).is_multiple_of(mem::align_of::<HarmonicWireLayout>()) {
+            return Err(HarmonicIpcError::InvalidLayout("mapping alignment"));
+        }
+        // SAFETY: the mapping is writable, correctly aligned, exactly large
+        // enough, and has no typed aliases. Every field installed here is an
+        // atomic, so later cross-process access never races through plain Rust
+        // references.
+        unsafe {
+            (mmap.as_mut_ptr() as *mut HarmonicWireLayout).write(HarmonicWireLayout::new(contract));
+        }
+        mmap.flush()?;
+        let ring = Self { mmap };
+        ring.validate_layout()?;
+        Ok(ring)
+    }
+
+    pub fn open(file: &File) -> HarmonicIpcResult<Self> {
+        let bytes = mem::size_of::<HarmonicWireLayout>();
+        if file.metadata()?.len() != bytes as u64 {
+            return Err(HarmonicIpcError::InvalidLayout("file length"));
+        }
+        // SAFETY: the creator fixed the file to the exact shared-layout size.
+        // Validation below rejects an uninitialized or foreign mapping before
+        // any packet operation is admitted.
+        let mmap = unsafe { MmapOptions::new().len(bytes).map_mut(file)? };
+        if !(mmap.as_ptr() as usize).is_multiple_of(mem::align_of::<HarmonicWireLayout>()) {
+            return Err(HarmonicIpcError::InvalidLayout("mapping alignment"));
+        }
+        let ring = Self { mmap };
+        ring.validate_layout()?;
+        Ok(ring)
+    }
+
+    pub fn contract(&self) -> HarmonicContract {
+        self.layout().header.contract()
+    }
+
+    pub fn publish(
+        &self,
+        packet: HarmonicRoutePacket,
+        endpoint_generation: u64,
+        now: u64,
+        activation_payload: &[u8],
+    ) -> HarmonicIpcResult<()> {
+        let slot = self.prepare_publish(packet, endpoint_generation, now, activation_payload)?;
+        write_payload(&slot.activation_payload, activation_payload);
+        slot.state
+            .store(HarmonicWireState::Published as u32, Ordering::Release);
+        Ok(())
+    }
+
+    /// Reserve a slot and write only a prefix of its activation payload.
+    ///
+    /// This deliberately leaves the slot in `Publishing`. It exists solely so
+    /// the CPU process-isolation probe can kill the source between reservation
+    /// and release-publication, then prove that confirmed process isolation can
+    /// reclaim the abandoned slot. Product code cannot compile this method.
+    #[cfg(feature = "harmonic-fault-injection")]
+    #[doc(hidden)]
+    pub fn fault_inject_partial_publish_for_probe(
+        &self,
+        packet: HarmonicRoutePacket,
+        endpoint_generation: u64,
+        now: u64,
+        activation_payload: &[u8],
+        payload_words: usize,
+    ) -> HarmonicIpcResult<()> {
+        let slot = self.prepare_publish(packet, endpoint_generation, now, activation_payload)?;
+        write_payload_prefix(
+            &slot.activation_payload,
+            activation_payload,
+            payload_words.min(ACTIVATION_WORDS),
+        );
+        Ok(())
+    }
+
+    fn prepare_publish(
+        &self,
+        packet: HarmonicRoutePacket,
+        endpoint_generation: u64,
+        now: u64,
+        activation_payload: &[u8],
+    ) -> HarmonicIpcResult<&HarmonicWireSlot> {
+        self.check_endpoint(HarmonicOwner::DenseGfx1100, endpoint_generation)?;
+        let contract = self.contract();
+        contract.validate(&packet, now)?;
+        validate_payload(
+            activation_payload,
+            HARMONIC_ACTIVATION_EXTENT as usize,
+            packet.activation_fingerprint,
+            "activation payload",
+        )?;
+        let slot = self.slot(packet.epoch);
+        slot.transition(
+            "reserve publish slot",
+            HarmonicWireState::Vacant,
+            HarmonicWireState::Publishing,
+        )?;
+        slot.flags.store(0, Ordering::Relaxed);
+        slot.epoch.store(packet.epoch, Ordering::Relaxed);
+        slot.route_identity
+            .store(packet.route_identity, Ordering::Relaxed);
+        for (wire, value) in slot
+            .model_identity
+            .iter()
+            .zip(identity_to_words(packet.model_identity))
+        {
+            wire.store(value, Ordering::Relaxed);
+        }
+        slot.layer.store(packet.layer.into(), Ordering::Relaxed);
+        slot.slot.store(packet.slot.into(), Ordering::Relaxed);
+        slot.source_owner
+            .store(packet.source_owner as u32, Ordering::Relaxed);
+        slot.destination_owner
+            .store(packet.destination_owner as u32, Ordering::Relaxed);
+        slot.source_generation
+            .store(packet.source_allocation_generation, Ordering::Relaxed);
+        slot.destination_generation
+            .store(packet.destination_allocation_generation, Ordering::Relaxed);
+        for (wire, value) in slot.expert_ids.iter().zip(packet.expert_ids) {
+            wire.store(value, Ordering::Relaxed);
+        }
+        for (wire, value) in slot.route_weight_bits.iter().zip(packet.route_weight_bits) {
+            wire.store(value, Ordering::Relaxed);
+        }
+        slot.activation_extent
+            .store(packet.activation_extent, Ordering::Relaxed);
+        slot.result_extent
+            .store(packet.result_extent, Ordering::Relaxed);
+        slot.deadline_tick
+            .store(packet.deadline_tick, Ordering::Relaxed);
+        slot.activation_fingerprint
+            .store(packet.activation_fingerprint, Ordering::Relaxed);
+        slot.result_fingerprint.store(0, Ordering::Relaxed);
+        Ok(slot)
+    }
+
+    pub fn expert_begin(
+        &self,
+        epoch: u64,
+        endpoint_generation: u64,
+        now: u64,
+    ) -> HarmonicIpcResult<HarmonicWorkItem> {
+        self.check_endpoint(HarmonicOwner::ExpertGfx1151, endpoint_generation)?;
+        let slot = self.slot(epoch);
+        slot.check_epoch(epoch)?;
+        let state = slot.state()?;
+        if state != HarmonicWireState::Published {
+            return Err(HarmonicIpcError::CompareExchange {
+                operation: "expert begin",
+                expected: HarmonicWireState::Published,
+                actual: state,
+            });
+        }
+        // The acquire state load above pairs with source publication before
+        // any relaxed packet or payload word is consumed.
+        let packet = slot.packet()?;
+        self.contract().validate(&packet, now)?;
+        slot.transition(
+            "expert begin",
+            HarmonicWireState::Published,
+            HarmonicWireState::Running,
+        )?;
+        let activation_payload = read_payload(&slot.activation_payload);
+        validate_payload(
+            &activation_payload,
+            HARMONIC_ACTIVATION_EXTENT as usize,
+            packet.activation_fingerprint,
+            "activation payload",
+        )?;
+        Ok(HarmonicWorkItem {
+            packet,
+            activation_payload,
+        })
+    }
+
+    pub fn expert_complete(
+        &self,
+        epoch: u64,
+        endpoint_generation: u64,
+        completion: HarmonicCompletion,
+        result_payload: &[u8],
+    ) -> HarmonicIpcResult<()> {
+        self.check_endpoint(HarmonicOwner::ExpertGfx1151, endpoint_generation)?;
+        let slot = self.slot(epoch);
+        slot.check_epoch(epoch)?;
+        let state = slot.state()?;
+        if state != HarmonicWireState::Running {
+            return Err(HarmonicIpcError::CompareExchange {
+                operation: "reserve completion slot",
+                expected: HarmonicWireState::Running,
+                actual: state,
+            });
+        }
+        let packet = slot.packet()?;
+        if completion.result_extent != packet.result_extent {
+            return Err(HarmonicProtocolError::InvalidPacket("completion extent").into());
+        }
+        validate_payload(
+            result_payload,
+            HARMONIC_RESULT_EXTENT as usize,
+            completion.result_fingerprint,
+            "result payload",
+        )?;
+        slot.transition(
+            "reserve completion slot",
+            HarmonicWireState::Running,
+            HarmonicWireState::Completing,
+        )?;
+        slot.result_fingerprint
+            .store(completion.result_fingerprint, Ordering::Relaxed);
+        write_payload(&slot.result_payload, result_payload);
+        slot.flags
+            .fetch_or(FLAG_DESTINATION_QUIESCED, Ordering::Release);
+        slot.state
+            .store(HarmonicWireState::Completed as u32, Ordering::Release);
+        Ok(())
+    }
+
+    pub fn source_resolve(
+        &self,
+        epoch: u64,
+        endpoint_generation: u64,
+    ) -> HarmonicIpcResult<HarmonicResolved> {
+        self.check_endpoint(HarmonicOwner::DenseGfx1100, endpoint_generation)?;
+        let slot = self.slot(epoch);
+        slot.check_epoch(epoch)?;
+        let state = slot.state()?;
+        if !state.is_terminal() {
+            return Err(HarmonicProtocolError::SlotNotTerminal {
+                slot: (epoch as usize % HARMONIC_SLOT_COUNT) as u8,
+                state: state.logical(),
+            }
+            .into());
+        }
+        let (completion, result_payload) = if state == HarmonicWireState::Completed {
+            let completion = HarmonicCompletion {
+                result_extent: slot.result_extent.load(Ordering::Relaxed),
+                result_fingerprint: slot.result_fingerprint.load(Ordering::Relaxed),
+            };
+            let result_payload = read_payload(&slot.result_payload);
+            validate_payload(
+                &result_payload,
+                HARMONIC_RESULT_EXTENT as usize,
+                completion.result_fingerprint,
+                "result payload",
+            )?;
+            (Some(completion), Some(result_payload))
+        } else {
+            (None, None)
+        };
+        slot.flags.fetch_or(FLAG_SOURCE_OBSERVED, Ordering::Release);
+        Ok(HarmonicResolved {
+            state: state.logical(),
+            completion,
+            result_payload,
+        })
+    }
+
+    pub fn source_cancel(&self, epoch: u64, endpoint_generation: u64) -> HarmonicIpcResult<()> {
+        self.check_endpoint(HarmonicOwner::DenseGfx1100, endpoint_generation)?;
+        let slot = self.slot(epoch);
+        slot.check_epoch(epoch)?;
+        let state = slot.state()?;
+        if !matches!(
+            state,
+            HarmonicWireState::Published | HarmonicWireState::Running
+        ) {
+            return Err(HarmonicProtocolError::InvalidTransition {
+                state: state.logical(),
+                operation: "source cancel",
+            }
+            .into());
+        }
+        slot.transition("source cancel", state, HarmonicWireState::Cancelled)?;
+        slot.flags.fetch_or(FLAG_SOURCE_OBSERVED, Ordering::Release);
+        Ok(())
+    }
+
+    pub fn expert_acknowledge_terminal(
+        &self,
+        epoch: u64,
+        endpoint_generation: u64,
+    ) -> HarmonicIpcResult<()> {
+        self.check_endpoint(HarmonicOwner::ExpertGfx1151, endpoint_generation)?;
+        let slot = self.slot(epoch);
+        slot.check_epoch(epoch)?;
+        let state = slot.state()?;
+        if !state.is_terminal() {
+            return Err(HarmonicProtocolError::SlotNotTerminal {
+                slot: (epoch as usize % HARMONIC_SLOT_COUNT) as u8,
+                state: state.logical(),
+            }
+            .into());
+        }
+        slot.flags
+            .fetch_or(FLAG_DESTINATION_QUIESCED, Ordering::Release);
+        Ok(())
+    }
+
+    pub fn expire(&self, epoch: u64, now: u64) -> HarmonicIpcResult<bool> {
+        let slot = self.slot(epoch);
+        slot.check_epoch(epoch)?;
+        let deadline = slot.deadline_tick.load(Ordering::Acquire);
+        if now < deadline {
+            return Ok(false);
+        }
+        let state = slot.state()?;
+        if !matches!(
+            state,
+            HarmonicWireState::Published | HarmonicWireState::Running
+        ) {
+            return Ok(false);
+        }
+        slot.transition("expire", state, HarmonicWireState::TimedOut)?;
+        Ok(true)
+    }
+
+    /// Record a confirmed process-isolation boundary. The caller must invoke
+    /// this only after the worker has exited and can no longer issue memory or
+    /// device writes for `endpoint_generation`.
+    pub fn isolate_owner(
+        &self,
+        owner: HarmonicOwner,
+        endpoint_generation: u64,
+    ) -> HarmonicIpcResult<usize> {
+        self.check_endpoint(owner, endpoint_generation)?;
+        let mut failed = 0;
+        for slot in &self.layout().slots {
+            let state = slot.state()?;
+            if state == HarmonicWireState::Vacant {
+                continue;
+            }
+            match owner {
+                HarmonicOwner::DenseGfx1100 => {
+                    slot.flags.fetch_or(FLAG_SOURCE_OBSERVED, Ordering::Release);
+                    if state == HarmonicWireState::Publishing {
+                        // The release publication has not happened, so the
+                        // destination cannot have acquired this slot.
+                        slot.flags
+                            .fetch_or(FLAG_DESTINATION_QUIESCED, Ordering::Release);
+                    }
+                }
+                HarmonicOwner::ExpertGfx1151 => {
+                    slot.flags
+                        .fetch_or(FLAG_DESTINATION_QUIESCED, Ordering::Release);
+                }
+            }
+            if matches!(
+                state,
+                HarmonicWireState::Publishing
+                    | HarmonicWireState::Published
+                    | HarmonicWireState::Running
+                    | HarmonicWireState::Completing
+            ) {
+                let failed_state = match owner {
+                    HarmonicOwner::DenseGfx1100 => HarmonicWireState::FailedDense,
+                    HarmonicOwner::ExpertGfx1151 => HarmonicWireState::FailedExpert,
+                };
+                if slot
+                    .transition("isolate owner", state, failed_state)
+                    .is_ok()
+                {
+                    failed += 1;
+                }
+            }
+        }
+        self.layout()
+            .header
+            .isolated_owners
+            .fetch_or(owner_mask(owner), Ordering::Release);
+        Ok(failed)
+    }
+
+    pub fn advance_generation(
+        &self,
+        owner: HarmonicOwner,
+        current_generation: u64,
+        next_generation: u64,
+    ) -> HarmonicIpcResult<()> {
+        let isolated = self.layout().header.isolated_owners.load(Ordering::Acquire);
+        if isolated & owner_mask(owner) == 0 {
+            return Err(HarmonicProtocolError::WorkerAlreadyAvailable(owner).into());
+        }
+        let actual_generation = self.generation(owner).load(Ordering::Acquire);
+        if actual_generation != current_generation {
+            return Err(HarmonicProtocolError::StaleGeneration {
+                owner,
+                expected: actual_generation,
+                got: current_generation,
+            }
+            .into());
+        }
+        if next_generation <= current_generation {
+            return Err(HarmonicProtocolError::StaleGeneration {
+                owner,
+                expected: current_generation.saturating_add(1),
+                got: next_generation,
+            }
+            .into());
+        }
+        self.generation(owner)
+            .compare_exchange(
+                current_generation,
+                next_generation,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .map(|_| ())
+            .map_err(|actual| {
+                HarmonicIpcError::Protocol(HarmonicProtocolError::StaleGeneration {
+                    owner,
+                    expected: actual,
+                    got: current_generation,
+                })
+            })?;
+        self.layout()
+            .header
+            .isolated_owners
+            .fetch_and(!owner_mask(owner), Ordering::Release);
+        Ok(())
+    }
+
+    pub fn recycle(&self, epoch: u64) -> HarmonicIpcResult<()> {
+        let slot = self.slot(epoch);
+        slot.check_epoch(epoch)?;
+        let state = slot.state()?;
+        if !state.is_terminal() {
+            return Err(HarmonicProtocolError::SlotNotTerminal {
+                slot: (epoch as usize % HARMONIC_SLOT_COUNT) as u8,
+                state: state.logical(),
+            }
+            .into());
+        }
+        let flags = slot.flags.load(Ordering::Acquire);
+        let source_observed = flags & FLAG_SOURCE_OBSERVED != 0;
+        let destination_quiesced = flags & FLAG_DESTINATION_QUIESCED != 0;
+        if !source_observed || !destination_quiesced {
+            return Err(HarmonicProtocolError::TerminalNotQuiesced {
+                slot: (epoch as usize % HARMONIC_SLOT_COUNT) as u8,
+                epoch,
+                state: state.logical(),
+                source_observed,
+                destination_quiesced,
+            }
+            .into());
+        }
+        slot.transition("recycle", state, HarmonicWireState::Vacant)?;
+        Ok(())
+    }
+
+    pub fn state(&self, epoch: u64) -> HarmonicIpcResult<HarmonicWireState> {
+        let slot = self.slot(epoch);
+        slot.check_epoch(epoch)?;
+        slot.state()
+    }
+
+    fn validate_layout(&self) -> HarmonicIpcResult<()> {
+        let header = &self.layout().header;
+        if header.magic.load(Ordering::Acquire) != HARMONIC_WIRE_MAGIC {
+            return Err(HarmonicIpcError::InvalidLayout("magic"));
+        }
+        if header.version.load(Ordering::Acquire) != HARMONIC_WIRE_VERSION {
+            return Err(HarmonicIpcError::InvalidLayout("version"));
+        }
+        if header.slot_count.load(Ordering::Acquire) != HARMONIC_SLOT_COUNT as u32 {
+            return Err(HarmonicIpcError::InvalidLayout("slot count"));
+        }
+        validate_frozen_contract(header.contract())
+    }
+
+    fn check_endpoint(
+        &self,
+        owner: HarmonicOwner,
+        endpoint_generation: u64,
+    ) -> HarmonicIpcResult<()> {
+        let expected = self.generation(owner).load(Ordering::Acquire);
+        if expected != endpoint_generation {
+            return Err(HarmonicProtocolError::StaleGeneration {
+                owner,
+                expected,
+                got: endpoint_generation,
+            }
+            .into());
+        }
+        if self.layout().header.isolated_owners.load(Ordering::Acquire) & owner_mask(owner) != 0 {
+            return Err(HarmonicProtocolError::WorkerUnavailable(owner).into());
+        }
+        Ok(())
+    }
+
+    fn generation(&self, owner: HarmonicOwner) -> &AtomicU64 {
+        match owner {
+            HarmonicOwner::DenseGfx1100 => &self.layout().header.source_generation,
+            HarmonicOwner::ExpertGfx1151 => &self.layout().header.destination_generation,
+        }
+    }
+
+    fn slot(&self, epoch: u64) -> &HarmonicWireSlot {
+        &self.layout().slots[epoch as usize % HARMONIC_SLOT_COUNT]
+    }
+
+    fn layout(&self) -> &HarmonicWireLayout {
+        // SAFETY: `create` initializes, and `open` validates, an exactly sized
+        // aligned mapping. The layout contains only atomics; no mutable Rust
+        // references to mapped fields are ever created.
+        unsafe { &*(self.mmap.as_ptr() as *const HarmonicWireLayout) }
+    }
+}
+
+fn validate_frozen_contract(contract: HarmonicContract) -> HarmonicIpcResult<()> {
+    if contract.route_identity != HARMONIC_ROUTE_IDENTITY {
+        return Err(HarmonicIpcError::InvalidLayout("route identity"));
+    }
+    if contract.model_identity != DS4_MQ2R_0731_IDENTITY {
+        return Err(HarmonicIpcError::InvalidLayout("model identity"));
+    }
+    if contract.source_allocation_generation == 0 || contract.destination_allocation_generation == 0
+    {
+        return Err(HarmonicIpcError::InvalidLayout("zero generation"));
+    }
+    Ok(())
+}
+
+fn decode_owner(raw: u32) -> HarmonicIpcResult<HarmonicOwner> {
+    match raw {
+        value if value == HarmonicOwner::DenseGfx1100 as u32 => Ok(HarmonicOwner::DenseGfx1100),
+        value if value == HarmonicOwner::ExpertGfx1151 as u32 => Ok(HarmonicOwner::ExpertGfx1151),
+        _ => Err(HarmonicIpcError::InvalidLayout("owner")),
+    }
+}
+
+const fn owner_mask(owner: HarmonicOwner) -> u32 {
+    match owner {
+        HarmonicOwner::DenseGfx1100 => OWNER_DENSE_MASK,
+        HarmonicOwner::ExpertGfx1151 => OWNER_EXPERT_MASK,
+    }
+}
+
+pub fn harmonic_payload_fingerprint(payload: &[u8]) -> u64 {
+    // Stable FNV-1a integrity tag for the CPU oracle. Product GPU transport may
+    // replace this with a cheaper guard once exact byte parity is established.
+    payload.iter().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
+}
+
+fn validate_payload(
+    payload: &[u8],
+    expected_len: usize,
+    expected_fingerprint: u64,
+    field: &'static str,
+) -> HarmonicIpcResult<()> {
+    if payload.len() != expected_len
+        || harmonic_payload_fingerprint(payload) != expected_fingerprint
+    {
+        return Err(HarmonicProtocolError::InvalidPacket(field).into());
+    }
+    Ok(())
+}
+
+fn write_payload<const N: usize>(wire: &[AtomicU64; N], payload: &[u8]) {
+    debug_assert_eq!(payload.len(), N * mem::size_of::<u64>());
+    write_payload_prefix(wire, payload, N);
+}
+
+fn write_payload_prefix<const N: usize>(wire: &[AtomicU64; N], payload: &[u8], words: usize) {
+    debug_assert_eq!(payload.len(), N * mem::size_of::<u64>());
+    for (word, bytes) in wire.iter().zip(payload.chunks_exact(8)).take(words) {
+        word.store(
+            u64::from_le_bytes(bytes.try_into().unwrap()),
+            Ordering::Relaxed,
+        );
+    }
+}
+
+fn read_payload<const N: usize>(wire: &[AtomicU64; N]) -> Vec<u8> {
+    let mut payload = vec![0_u8; N * mem::size_of::<u64>()];
+    for (word, bytes) in wire.iter().zip(payload.chunks_exact_mut(8)) {
+        bytes.copy_from_slice(&word.load(Ordering::Relaxed).to_le_bytes());
+    }
+    payload
+}
+
+fn identity_to_words(identity: [u8; 32]) -> [u64; 4] {
+    std::array::from_fn(|index| {
+        let offset = index * 8;
+        u64::from_le_bytes(identity[offset..offset + 8].try_into().unwrap())
+    })
+}
+
+fn words_to_identity(words: [u64; 4]) -> [u8; 32] {
+    let mut identity = [0_u8; 32];
+    for (index, word) in words.into_iter().enumerate() {
+        let offset = index * 8;
+        identity[offset..offset + 8].copy_from_slice(&word.to_le_bytes());
+    }
+    identity
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs::{self, OpenOptions};
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use super::*;
+    use crate::harmonic::{HARMONIC_ACTIVATION_EXTENT, HARMONIC_RESULT_EXTENT};
+
+    static TEST_NONCE: AtomicU64 = AtomicU64::new(0);
+
+    struct TestRing {
+        path: PathBuf,
+        ring: HarmonicSharedRing,
+    }
+
+    impl TestRing {
+        fn new(source_generation: u64, destination_generation: u64) -> Self {
+            let nonce = TEST_NONCE.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "hipfire-harmonic-ipc-{}-{nonce}",
+                std::process::id()
+            ));
+            let file = OpenOptions::new()
+                .create_new(true)
+                .read(true)
+                .write(true)
+                .open(&path)
+                .unwrap();
+            let ring = HarmonicSharedRing::create(
+                &file,
+                HarmonicContract::frozen(source_generation, destination_generation),
+            )
+            .unwrap();
+            Self { path, ring }
+        }
+    }
+
+    impl Drop for TestRing {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+
+    fn payload(len: usize, seed: u64) -> Vec<u8> {
+        (0..len)
+            .map(|index| seed.wrapping_add(index as u64).rotate_left(7) as u8)
+            .collect()
+    }
+
+    fn request(
+        contract: HarmonicContract,
+        epoch: u64,
+        deadline: u64,
+    ) -> (HarmonicRoutePacket, Vec<u8>) {
+        let activation = payload(HARMONIC_ACTIVATION_EXTENT as usize, epoch);
+        let packet = contract.packet(
+            epoch,
+            epoch as u16 % 43,
+            [0, 1, 2, 3, 4, 5],
+            [0.5f32, 0.4, 0.3, 0.2, 0.1, 0.05].map(f32::to_bits),
+            deadline,
+            harmonic_payload_fingerprint(&activation),
+        );
+        (packet, activation)
+    }
+
+    #[test]
+    fn independent_mappings_complete_and_recycle_exact_packet() {
+        let owner = TestRing::new(7, 11);
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&owner.path)
+            .unwrap();
+        let peer = HarmonicSharedRing::open(&file).unwrap();
+        let contract = owner.ring.contract();
+        let (request, activation) = request(contract, 1, 100);
+        owner.ring.publish(request, 7, 0, &activation).unwrap();
+        let observed = peer.expert_begin(1, 11, 1).unwrap();
+        assert_eq!(observed.packet, request);
+        assert_eq!(observed.activation_payload, activation);
+        let result = payload(HARMONIC_RESULT_EXTENT as usize, 99);
+        peer.expert_complete(
+            1,
+            11,
+            HarmonicCompletion {
+                result_extent: HARMONIC_RESULT_EXTENT,
+                result_fingerprint: harmonic_payload_fingerprint(&result),
+            },
+            &result,
+        )
+        .unwrap();
+        let resolved = owner.ring.source_resolve(1, 7).unwrap();
+        assert_eq!(resolved.state, HarmonicSlotState::Completed);
+        assert_eq!(resolved.result_payload.unwrap(), result);
+        owner.ring.recycle(1).unwrap();
+        assert_eq!(owner.ring.state(1).unwrap(), HarmonicWireState::Vacant);
+    }
+
+    #[test]
+    fn cancelled_running_slot_needs_destination_ack() {
+        let owner = TestRing::new(7, 11);
+        let contract = owner.ring.contract();
+        let (request, activation) = request(contract, 1, 100);
+        owner.ring.publish(request, 7, 0, &activation).unwrap();
+        owner.ring.expert_begin(1, 11, 1).unwrap();
+        owner.ring.source_cancel(1, 7).unwrap();
+        assert!(owner.ring.recycle(1).is_err());
+        owner.ring.expert_acknowledge_terminal(1, 11).unwrap();
+        owner.ring.recycle(1).unwrap();
+    }
+
+    #[test]
+    fn isolated_expert_and_source_observation_reclaim_failed_slot() {
+        let owner = TestRing::new(7, 11);
+        let contract = owner.ring.contract();
+        let (request, activation) = request(contract, 1, 100);
+        owner.ring.publish(request, 7, 0, &activation).unwrap();
+        owner.ring.expert_begin(1, 11, 1).unwrap();
+        assert_eq!(
+            owner
+                .ring
+                .isolate_owner(HarmonicOwner::ExpertGfx1151, 11)
+                .unwrap(),
+            1
+        );
+        assert!(owner.ring.recycle(1).is_err());
+        let resolved = owner.ring.source_resolve(1, 7).unwrap();
+        assert_eq!(
+            resolved.state,
+            HarmonicSlotState::Failed(HarmonicOwner::ExpertGfx1151)
+        );
+        assert!(resolved.completion.is_none());
+        owner.ring.recycle(1).unwrap();
+    }
+
+    #[test]
+    fn generations_reject_stale_endpoints_and_invalid_payloads() {
+        let owner = TestRing::new(7, 11);
+        assert!(owner
+            .ring
+            .advance_generation(HarmonicOwner::ExpertGfx1151, 11, 12)
+            .is_err());
+        owner
+            .ring
+            .isolate_owner(HarmonicOwner::ExpertGfx1151, 11)
+            .unwrap();
+        owner
+            .ring
+            .advance_generation(HarmonicOwner::ExpertGfx1151, 11, 12)
+            .unwrap();
+        assert!(owner.ring.expert_begin(1, 11, 0).is_err());
+        assert!(owner
+            .ring
+            .advance_generation(HarmonicOwner::ExpertGfx1151, 11, 13)
+            .is_err());
+        let (mut bad, activation) = request(owner.ring.contract(), 1, 100);
+        bad.activation_extent = HARMONIC_ACTIVATION_EXTENT - 1;
+        assert!(owner.ring.publish(bad, 7, 0, &activation).is_err());
+    }
+
+    #[test]
+    fn timeout_cannot_be_recycled_until_both_sides_are_safe() {
+        let owner = TestRing::new(7, 11);
+        let contract = owner.ring.contract();
+        let (request, activation) = request(contract, 1, 10);
+        owner.ring.publish(request, 7, 0, &activation).unwrap();
+        owner.ring.expert_begin(1, 11, 1).unwrap();
+        assert!(owner.ring.expire(1, 10).unwrap());
+        assert!(owner.ring.recycle(1).is_err());
+        owner.ring.source_resolve(1, 7).unwrap();
+        assert!(owner.ring.recycle(1).is_err());
+        owner.ring.expert_acknowledge_terminal(1, 11).unwrap();
+        owner.ring.recycle(1).unwrap();
+    }
+}

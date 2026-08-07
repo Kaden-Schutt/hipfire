@@ -59,6 +59,7 @@ pub mod dspark_speculator;
 pub mod forward;
 pub mod grammar;
 pub mod harmonic;
+pub mod harmonic_ipc;
 pub mod heterogeneous;
 pub mod mtp_speculator;
 pub mod parent;
@@ -75,7 +76,12 @@ pub use deepseek4::{
 };
 pub use harmonic::{
     HarmonicCompletion, HarmonicContract, HarmonicOwner, HarmonicProtocolError,
-    HarmonicRoutePacket, HarmonicSlotState, HarmonicSupervisor,
+    HarmonicRoutePacket, HarmonicSlotState, HarmonicSupervisor, HARMONIC_ACTIVATION_EXTENT,
+    HARMONIC_RESULT_EXTENT,
+};
+pub use harmonic_ipc::{
+    harmonic_payload_fingerprint, HarmonicIpcError, HarmonicResolved, HarmonicSharedRing,
+    HarmonicWireState, HarmonicWorkItem,
 };
 pub use heterogeneous::{
     ensure_harmonic_execution_admitted, DeepseekV4HeterogeneousLoadPlan,

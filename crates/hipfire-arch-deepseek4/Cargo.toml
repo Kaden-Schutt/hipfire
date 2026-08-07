@@ -25,3 +25,8 @@ memmap2 = "0.9"
 libloading.workspace = true
 
 [features]
+harmonic-fault-injection = []
+
+[[example]]
+name = "harmonic_protocol_probe"
+required-features = ["harmonic-fault-injection"]
