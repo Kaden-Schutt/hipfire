@@ -31,8 +31,8 @@ where
     }
     gpu.hip.event_record(&stop, None).expect("record stop");
     gpu.hip.event_synchronize(&stop).expect("synchronize stop");
-    let us = gpu.hip.event_elapsed_ms(&start, &stop).expect("elapsed") as f64 * 1_000.0
-        / REPEATS as f64;
+    let us =
+        gpu.hip.event_elapsed_ms(&start, &stop).expect("elapsed") as f64 * 1_000.0 / REPEATS as f64;
     gpu.hip.event_destroy(start).expect("destroy start");
     gpu.hip.event_destroy(stop).expect("destroy stop");
     us
@@ -47,7 +47,12 @@ fn main() {
     let w_bits = (0..N_CTRL * X_DIM)
         .map(|i| {
             let magnitude = [0x2000_u16, 0x2400, 0x2800, 0x2c00][i & 3];
-            magnitude | if (i / 7 + i / X_DIM) & 1 == 0 { 0 } else { 0x8000 }
+            magnitude
+                | if (i / 7 + i / X_DIM) & 1 == 0 {
+                    0
+                } else {
+                    0x8000
+                }
         })
         .collect::<Vec<_>>();
     let base_bits = (0..N_CTRL)
@@ -58,6 +63,7 @@ fn main() {
     let base = upload_f16(&gpu, &base_bits, &[N_CTRL]);
     let inv = gpu.zeros(&[BATCH], DType::F32).expect("inv scratch");
     let reference = gpu.zeros(&[BATCH, N_CTRL], DType::F32).expect("reference");
+    let fused = gpu.zeros(&[BATCH, N_CTRL], DType::F32).expect("fused24");
     let candidates = [
         gpu.zeros(&[BATCH, N_CTRL], DType::F32).expect("B1"),
         gpu.zeros(&[BATCH, N_CTRL], DType::F32).expect("B2"),
@@ -74,6 +80,16 @@ fn main() {
         BATCH as i32,
     )
     .expect("baseline");
+    gpu.hc_compute_control_batched_fused24_gfx1201(
+        &x,
+        &w,
+        &base,
+        &fused,
+        N_CTRL as i32,
+        X_DIM as i32,
+        BATCH as i32,
+    )
+    .expect("fused24");
     for (index, tiles) in [1usize, 2, 4].into_iter().enumerate() {
         gpu.hc_compute_control_wmma_batched_gfx1201(
             &x,
@@ -90,8 +106,20 @@ fn main() {
     }
     gpu.hip.device_synchronize().expect("parity sync");
     let expected = gpu.download_f32(&reference).expect("download reference");
+    let fused_actual = gpu.download_f32(&fused).expect("download fused24");
+    let fused_mismatches = expected
+        .iter()
+        .zip(&fused_actual)
+        .filter(|(a, b)| a.to_bits() != b.to_bits())
+        .count();
+    println!(
+        "fused24 raw_mismatches={fused_mismatches}/{}",
+        expected.len()
+    );
     for (index, tiles) in [1usize, 2, 4].into_iter().enumerate() {
-        let actual = gpu.download_f32(&candidates[index]).expect("download candidate");
+        let actual = gpu
+            .download_f32(&candidates[index])
+            .expect("download candidate");
         let mut err2 = 0.0f64;
         let mut ref2 = 0.0f64;
         let mut max_abs = 0.0f32;
@@ -109,16 +137,44 @@ fn main() {
 
     for _ in 0..3 {
         gpu.hc_compute_control_batched(
-            &x, &w, &base, &reference, N_CTRL as i32, X_DIM as i32, BATCH as i32,
+            &x,
+            &w,
+            &base,
+            &reference,
+            N_CTRL as i32,
+            X_DIM as i32,
+            BATCH as i32,
         )
         .expect("warm baseline");
     }
     let baseline_us = event_us(&mut gpu, |gpu| {
         gpu.hc_compute_control_batched(
-            &x, &w, &base, &reference, N_CTRL as i32, X_DIM as i32, BATCH as i32,
+            &x,
+            &w,
+            &base,
+            &reference,
+            N_CTRL as i32,
+            X_DIM as i32,
+            BATCH as i32,
         )
         .expect("time baseline")
     });
+    let fused_us = event_us(&mut gpu, |gpu| {
+        gpu.hc_compute_control_batched_fused24_gfx1201(
+            &x,
+            &w,
+            &base,
+            &fused,
+            N_CTRL as i32,
+            X_DIM as i32,
+            BATCH as i32,
+        )
+        .expect("time fused24")
+    });
+    println!(
+        "fused24 baseline_us={baseline_us:.3} candidate_us={fused_us:.3} speedup_x={:.3}",
+        baseline_us / fused_us
+    );
     for (index, tiles) in [1usize, 2, 4].into_iter().enumerate() {
         let candidate_us = event_us(&mut gpu, |gpu| {
             gpu.hc_compute_control_wmma_batched_gfx1201(

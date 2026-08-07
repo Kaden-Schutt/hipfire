@@ -5474,6 +5474,8 @@ pub const HC_COMPUTE_CONTROL_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/hc_compute_control_batched.hip");
 pub const HC_INV_RMS_BATCHED_GFX1201_SRC: &str =
     include_str!("../../../kernels/src/hc_inv_rms_batched.gfx1201.hip");
+pub const HC_COMPUTE_CONTROL_BATCHED_FUSED24_GFX1201_SRC: &str =
+    include_str!("../../../kernels/src/hc_compute_control_batched_fused24.gfx1201.hip");
 pub const HC_COMPUTE_CONTROL_WMMA_B1_GFX1201_SRC: &str = concat!(
     "#define HC_WMMA_BATCH_TILES 1\n",
     "#define HC_WMMA_KERNEL_NAME hc_compute_control_wmma_b1_gfx1201\n",

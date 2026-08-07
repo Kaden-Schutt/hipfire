@@ -8896,6 +8896,63 @@ impl Gpu {
             },
         )
     }
+
+    /// Arithmetic-identical gfx1201 batched HC projection. One block owns all
+    /// 24 control rows for one token, sharing X and its RMS reduction while
+    /// retaining the established per-row F32 summation order.
+    pub fn hc_compute_control_batched_fused24_gfx1201(
+        &mut self,
+        x_flat: &GpuTensor,
+        w_fn: &GpuTensor,
+        base: &GpuTensor,
+        c_out: &GpuTensor,
+        n_ctrl: i32,
+        x_dim: i32,
+        batch_size: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        debug_assert!(self.arch_caps.is_gfx1201());
+        debug_assert_eq!(n_ctrl, 24);
+        self.ensure_kernel(
+            "hc_compute_control_batched_fused24_gfx1201",
+            kernels::HC_COMPUTE_CONTROL_BATCHED_FUSED24_GFX1201_SRC,
+            "hc_compute_control_batched_fused24_gfx1201",
+        )?;
+        let xp = x_flat.buf.as_ptr();
+        let wp = w_fn.buf.as_ptr();
+        let bp = base.buf.as_ptr();
+        let cp = c_out.buf.as_ptr();
+        let mut nc = n_ctrl;
+        let mut xd = x_dim;
+        let mut bs = batch_size;
+        let mut params: Vec<*mut c_void> = vec![
+            &xp as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &bp as *const _ as *mut c_void,
+            &cp as *const _ as *mut c_void,
+            &mut nc as *mut _ as *mut c_void,
+            &mut xd as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            "hc_compute_control_batched_fused24_gfx1201",
+            [batch_size as u32, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut blob = hip_bridge::KernargBlob::new();
+                blob.push_ptr(xp);
+                blob.push_ptr(wp);
+                blob.push_ptr(bp);
+                blob.push_ptr(cp);
+                blob.push_i32(nc);
+                blob.push_i32(xd);
+                blob.push_i32(bs);
+                blob
+            },
+        )
+    }
     pub fn hc_head_compute_pre(
         &mut self,
         x_flat: &GpuTensor,  // [hc_mult * hidden] F32
