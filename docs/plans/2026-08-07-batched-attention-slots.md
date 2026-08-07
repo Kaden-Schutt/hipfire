@@ -325,7 +325,7 @@ __device__ __forceinline__ KvSlotDesc kv_slot_legacy(int seq_len, int max_seq)
 Run:
 ```bash
 cd ~/repos/hipfire-batchattn && echo '#include "kernels/src/kv_slot_desc.h"
-__global__ void probe(const KvSlotDesc* d, unsigned long long* o){ *o = kv_offset_for_k(d[0], 5, 1088); }' > /tmp/kvdesc_probe.hip && hipcc -c /tmp/kvdesc_probe.hip -o /tmp/kvdesc_probe.o --offload-arch=gfx1151 && echo COMPILE_OK
+__global__ void probe(const KvSlotDesc* d, unsigned long long* o){ *o = kv_offset_for_k(d[0], 5, 1088); }' > /tmp/kvdesc_probe.hip && hipcc -c /tmp/kvdesc_probe.hip -o /tmp/kvdesc_probe.o --offload-arch=gfx1151 -I. && echo COMPILE_OK
 ```
 Expected: `COMPILE_OK`.
 
@@ -337,7 +337,7 @@ Run:
 ```bash
 cd ~/repos/hipfire-batchattn && echo '#include <cstdio>
 #include "kernels/src/kv_slot_desc.h"
-int main(){ printf("%zu %zu\n", sizeof(KvSlotDesc), alignof(KvSlotDesc)); }' > /tmp/kvdesc_size.cpp && g++ /tmp/kvdesc_size.cpp -o /tmp/kvdesc_size && /tmp/kvdesc_size
+int main(){ printf("%zu %zu\n", sizeof(KvSlotDesc), alignof(KvSlotDesc)); }' > /tmp/kvdesc_size.cpp && g++ -D__HIP_PLATFORM_AMD__ /tmp/kvdesc_size.cpp -o /tmp/kvdesc_size -I. -I/opt/rocm-7.2.2/include && /tmp/kvdesc_size
 ```
 Expected: `24 8`
 
@@ -1423,3 +1423,24 @@ would make the whole comparison meaningless."
 SP1 is done when spec §2's five criteria hold. At that point the descriptor ABI is frozen for SP2 (multi-slot KV allocator, batched DeltaNet, batched sampling), which should get its own spec before implementation.
 
 **What SP1 deliberately does not deliver:** an end-to-end throughput number. Three quarters of both models' layers are DeltaNet and still single-sequence, so every result here must be labelled an attention-kernel result until SP2/SP3 land.
+
+---
+
+## Verification notes discovered during execution
+
+**Include paths for the Task 2 probes.** `hipcc`/`g++` resolve `#include "..."`
+relative to the *probe file's own directory*, not the shell's CWD. Probes
+written to `/tmp` therefore need `-I.` pointing at the repo root, or they fail
+with `file not found` — which is easy to misread as the header being broken.
+
+**The header includes `<hip/hip_runtime.h>`** (added after review, so it is
+self-contained). A consequence: it can no longer be compiled by plain `g++`,
+because HIP's headers `#error` unless `__HIP_PLATFORM_AMD__` is defined. The
+host-side `sizeof`/`alignof` check therefore needs
+`-D__HIP_PLATFORM_AMD__ -I/opt/rocm-7.2.2/include`, or use `hipcc` for the host
+probe instead. Both routes were confirmed to print `24 8`.
+
+**Do not mask exit codes when verifying.** `cmd 2>&1 | tail -3 && echo OK`
+prints OK whenever `tail` succeeds, regardless of whether `cmd` failed. This
+bit twice during execution — once on a `cargo test` run that had actually
+failed to compile. Check the command's own status, or run it unpiped.
