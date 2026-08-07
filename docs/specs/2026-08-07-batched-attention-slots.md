@@ -312,9 +312,35 @@ Two structural facts drive this:
   denominator is measured, not theoretical: BabelStream on this device gives
   **223.9 GB/s Triad / 239.3 Copy** (87-93% of the 256 GB/s LPDDR5X figure).
   Four slots must read 4× the KV bytes but need not spend 4× the time: there is
-  **~2.6-3.1× headroom on the 27B shape and ~3.6-4.6× on the 35B-A3B shape**,
-  and batching supplies exactly what closes it — more independent requests in
-  flight. The question is therefore **how much of that headroom
+  **~2.6-3.1× headroom on the 27B shape and ~3.6-4.6× on the 35B-A3B shape**.
+
+  **SECOND CORRECTION, from Task 8's measurement (2026-08-07).** The sentence
+  that used to end this paragraph — "batching supplies exactly what closes it" —
+  was wrong, and in the opposite direction to the original error. Measured, at
+  8 slots:
+
+  | shape | batch-1 | batch-8 | utilisation | headroom recovered |
+  |---|---|---|---|---|
+  | 35B-A3B | 50.4 GB/s | 63.2 GB/s (1.25×) | 22.5% → 28.2% | **7.4%** |
+  | 27B | 73.1 GB/s | 88.4 GB/s (1.21×) | 32.6% → 39.5% | **10.1%** |
+
+  Batching gives a **real but modest** win — 1.06× at 2 slots rising to 1.26× at
+  8 — and it recovers **under a tenth** of the available headroom. Eight times the
+  independent work improved bandwidth by only ~25%, which means the kernel is
+  **not** starved of in-flight requests. Something else caps it: most likely the
+  32-thread workgroup, the unaligned 34-byte Q8_0 block reads, or the scalar
+  dequant loop.
+
+  **The consequence for the programme is important: the largest single win
+  available in attention is not batching, it is kernel efficiency.** Roughly 3-4×
+  is sitting unclaimed behind the memory-access pattern, and it would benefit
+  batch-1 decode and every slot count equally. That is a separate piece of work
+  from SP1-SP4 and should be specced on its own.
+
+  So the honest arc across three revisions: the original framing was too
+  pessimistic about *whether* batching helps, the first correction was too
+  optimistic about *how much*, and the measured answer is a dependable ~1.2-1.26×
+  on the attention term at 4-8 slots. The question is therefore **how much of that headroom
   batching recovers**, which §10's batched-vs-sequential sweep measures
   directly. See `docs/perf-checkpoints/2026-08-07-batching-ceiling-probe.md`.
 - **MoE expert reads barely amortise at small batch.** Four sequences drawing
