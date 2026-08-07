@@ -68,6 +68,9 @@ def main() -> None:
     kernels: dict[str, dict[str, object]] = defaultdict(
         lambda: {"calls": 0, "total_ns": 0, "min_ns": None, "max_ns": 0, "agents": set()}
     )
+    shapes: dict[tuple[str, ...], dict[str, object]] = defaultdict(
+        lambda: {"calls": 0, "total_ns": 0, "min_ns": None, "max_ns": 0}
+    )
     agents: dict[str, dict[str, int]] = defaultdict(lambda: {"calls": 0, "total_ns": 0})
     selected_rows = 0
     selected_anchors = 0
@@ -94,6 +97,26 @@ def main() -> None:
         entry["agents"].add(agent)
         agents[agent]["calls"] += 1
         agents[agent]["total_ns"] += duration
+
+        shape_key = (
+            name,
+            agent,
+            row[indexes["Grid_Size_X"]],
+            row[indexes["Grid_Size_Y"]],
+            row[indexes["Grid_Size_Z"]],
+            row[indexes["Workgroup_Size_X"]],
+            row[indexes["Workgroup_Size_Y"]],
+            row[indexes["Workgroup_Size_Z"]],
+            row[indexes["VGPR_Count"]],
+            row[indexes["SGPR_Count"]],
+            row[indexes["LDS_Block_Size"]],
+            row[indexes["Scratch_Size"]],
+        )
+        shape = shapes[shape_key]
+        shape["calls"] += 1
+        shape["total_ns"] += duration
+        shape["min_ns"] = duration if shape["min_ns"] is None else min(shape["min_ns"], duration)
+        shape["max_ns"] = max(shape["max_ns"], duration)
 
     if selected_anchors != anchor_needed:
         raise SystemExit(
@@ -122,6 +145,46 @@ def main() -> None:
         )
     ranked.sort(key=lambda entry: entry["total_ms"], reverse=True)
 
+    ranked_shapes = []
+    for key, entry in shapes.items():
+        (
+            name,
+            agent,
+            grid_x,
+            grid_y,
+            grid_z,
+            workgroup_x,
+            workgroup_y,
+            workgroup_z,
+            vgpr,
+            sgpr,
+            lds_bytes,
+            scratch_bytes,
+        ) = key
+        calls = int(entry["calls"])
+        shape_total_ns = int(entry["total_ns"])
+        ranked_shapes.append(
+            {
+                "name": name,
+                "agent": agent,
+                "grid": [int(grid_x), int(grid_y), int(grid_z)],
+                "workgroup": [int(workgroup_x), int(workgroup_y), int(workgroup_z)],
+                "vgpr": int(vgpr),
+                "sgpr": int(sgpr),
+                "lds_bytes": int(lds_bytes),
+                "scratch_bytes": int(scratch_bytes),
+                "calls": calls,
+                "calls_per_position": calls / args.positions,
+                "total_ms": shape_total_ns / 1e6,
+                "ms_per_position": shape_total_ns / args.positions / 1e6,
+                "average_ns": shape_total_ns / calls,
+                "percentage_of_aggregate_gpu_time": 100.0 * shape_total_ns / total_ns,
+                "min_ns": entry["min_ns"],
+                "max_ns": entry["max_ns"],
+            }
+        )
+    ranked_shapes.sort(key=lambda entry: entry["total_ms"], reverse=True)
+
     result = {
         "trace": str(args.trace),
         "positions": args.positions,
@@ -138,6 +201,7 @@ def main() -> None:
         "mean_gpu_ms_per_rank_position": total_ns / args.positions / args.ranks / 1e6,
         "agents": agents,
         "kernels": ranked,
+        "shapes": ranked_shapes,
     }
 
     if args.out:
@@ -157,6 +221,18 @@ def main() -> None:
             f"{entry['ms_per_position_all_ranks']:18.4f} "
             f"{entry['calls_per_position']:10.2f} "
             f"{entry['average_ns'] / 1000:7.2f}   {entry['name']}"
+        )
+
+    print("\n%gpu   ms/pos  calls/pos  avg_us   agent grid/workgroup vgpr/sgpr lds/scratch kernel")
+    for entry in ranked_shapes[: args.top]:
+        print(
+            f"{entry['percentage_of_aggregate_gpu_time']:5.2f} "
+            f"{entry['ms_per_position']:8.4f} "
+            f"{entry['calls_per_position']:10.2f} "
+            f"{entry['average_ns'] / 1000:7.2f}   {entry['agent']} "
+            f"{entry['grid']}/{entry['workgroup']} "
+            f"{entry['vgpr']}/{entry['sgpr']} "
+            f"{entry['lds_bytes']}/{entry['scratch_bytes']} {entry['name']}"
         )
 
 
