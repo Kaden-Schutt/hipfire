@@ -1697,12 +1697,14 @@ impl SingleQueueBatchGraph {
         self.checkpoint_signal.is_some()
     }
 
-    /// Patch one dynamic scalar in retained kernarg storage between replays.
-    pub fn patch_kernarg_u32(
+    /// Patch one explicitly bounded field in retained kernarg storage between
+    /// replays. Packet images retain the same kernarg address; only the owned
+    /// bytes behind that address change before queue publication.
+    pub fn patch_kernarg_bytes(
         &mut self,
         dispatch: usize,
         offset: usize,
-        value: u32,
+        value: &[u8],
     ) -> Result<(), ReplayError> {
         if self.in_flight {
             return Err(ReplayError::KernargPatchWhileInFlight);
@@ -1713,28 +1715,38 @@ impl SingleQueueBatchGraph {
                 .ok_or(ReplayError::KernargPatchOutOfBounds {
                     dispatch,
                     offset,
-                    bytes: 4,
+                    bytes: value.len(),
                     kernarg_bytes: 0,
                 })?;
         let kernarg_bytes = recorded.kernarg.len();
         let end = offset
-            .checked_add(4)
+            .checked_add(value.len())
             .ok_or(ReplayError::KernargPatchOutOfBounds {
                 dispatch,
                 offset,
-                bytes: 4,
+                bytes: value.len(),
                 kernarg_bytes,
             })?;
         let destination = recorded.kernarg.as_mut_bytes().get_mut(offset..end).ok_or(
             ReplayError::KernargPatchOutOfBounds {
                 dispatch,
                 offset,
-                bytes: 4,
+                bytes: value.len(),
                 kernarg_bytes,
             },
         )?;
-        destination.copy_from_slice(&value.to_le_bytes());
+        destination.copy_from_slice(value);
         Ok(())
+    }
+
+    /// Patch one dynamic scalar in retained kernarg storage between replays.
+    pub fn patch_kernarg_u32(
+        &mut self,
+        dispatch: usize,
+        offset: usize,
+        value: u32,
+    ) -> Result<(), ReplayError> {
+        self.patch_kernarg_bytes(dispatch, offset, &value.to_le_bytes())
     }
 
     /// # Safety

@@ -2398,6 +2398,15 @@ pub struct PreparedLinearAqlReplay {
 }
 
 impl PreparedLinearAqlReplay {
+    fn apply_kernarg_patches(&mut self, patches: &[AqlKernargPatch<'_>]) -> Result<(), String> {
+        for patch in patches {
+            self.graph
+                .patch_kernarg_bytes(patch.dispatch, patch.offset, patch.bytes)
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+
     fn patch_dynamic_bindings(&mut self) -> Result<(), String> {
         for dispatch in &self.dynamic_gdn_frames {
             let frame = crate::norm::reserve_gdn_requant_frames(1);
@@ -2418,17 +2427,16 @@ impl PreparedLinearAqlReplay {
         unsafe { self.graph.replay_and_wait() }.map_err(|error| error.to_string())
     }
 
-    /// Submit one checkpointed batch without waiting for its terminal signal.
-    ///
-    /// # Safety
-    ///
-    /// The pointer contract is identical to [`Self::replay_and_wait`]. Every
-    /// pointee must remain live until the returned ticket proves completion or
-    /// cancellation.
-    unsafe fn submit_checkpointed(&mut self) -> Result<SingleQueueBatchSubmission<'_>, String> {
+    /// Submit after applying one explicitly bounded set of owner-local kernarg
+    /// updates. The retained packet image and kernarg allocations stay fixed.
+    unsafe fn submit_checkpointed_patched(
+        &mut self,
+        patches: &[AqlKernargPatch<'_>],
+    ) -> Result<SingleQueueBatchSubmission<'_>, String> {
         if !self.graph.has_checkpoint() {
             return Err("prepared AQL replay has no checkpoint".to_owned());
         }
+        self.apply_kernarg_patches(patches)?;
         self.patch_dynamic_bindings()?;
         // SAFETY: forwarded from the caller that owns the model allocations.
         unsafe { self.graph.submit() }.map_err(|error| error.to_string())
@@ -2445,6 +2453,16 @@ impl PreparedLinearAqlReplay {
     pub fn queue_id(&self) -> u64 {
         self.graph.queue_id()
     }
+}
+
+/// One bounded replay-time update to an owner-local AQL kernarg allocation.
+/// The caller proves every patched pointer remains live through terminal
+/// completion; the prepared queue enforces mutation only while quiescent.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AqlKernargPatch<'a> {
+    pub dispatch: usize,
+    pub offset: usize,
+    pub bytes: &'a [u8],
 }
 
 /// One observed owner-local retained batch. The checkpoint may be consumed
@@ -4123,12 +4141,28 @@ impl ReplayController {
         &mut self,
         position: usize,
     ) -> Result<CheckpointedLinearAqlSubmission<'_>, String> {
+        // SAFETY: forwarded from this method's caller with no dynamic fields.
+        unsafe { self.submit_checkpointed_linear_aql_patched(position, &[]) }
+    }
+
+    /// Submit one checkpointed AQL batch after bounded owner-local kernarg
+    /// updates. Packet and queue identity remain stable.
+    ///
+    /// # Safety
+    ///
+    /// Every captured and patched pointer must remain live until the returned
+    /// ticket proves terminal completion or cancellation.
+    pub unsafe fn submit_checkpointed_linear_aql_patched(
+        &mut self,
+        position: usize,
+        kernarg_patches: &[AqlKernargPatch<'_>],
+    ) -> Result<CheckpointedLinearAqlSubmission<'_>, String> {
         let (prepared, observation) = (&mut self.prepared, &mut self.replay_observation);
         let prepared = prepared
             .as_mut()
             .ok_or_else(|| "no prepared AQL replay".to_owned())?;
         // SAFETY: forwarded from the model owner.
-        let submission = unsafe { prepared.submit_checkpointed()? };
+        let submission = unsafe { prepared.submit_checkpointed_patched(kernarg_patches)? };
         Ok(CheckpointedLinearAqlSubmission {
             submission: Some(submission),
             observation,

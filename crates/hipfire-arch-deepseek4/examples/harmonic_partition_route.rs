@@ -11,7 +11,7 @@ use hipfire_arch_deepseek4::harmonic::{
     HarmonicExpertResidencyPlan, HARMONIC_ACTIVATION_EXTENT, HARMONIC_EXPERT_COUNT,
     HARMONIC_HIDDEN_SIZE, HARMONIC_LAYER_COUNT, HARMONIC_TOP_K,
 };
-use rdna_compute::replay::ReplayController;
+use rdna_compute::replay::{AqlKernargPatch, ReplayController};
 use rdna_compute::{DType, Gpu};
 
 const ROUTES_PER_LAYER: usize = 256;
@@ -163,6 +163,10 @@ fn main() -> Result<(), String> {
         .hip
         .malloc(HARMONIC_ACTIVATION_EXTENT as usize)
         .map_err(|error| format!("allocate staged activation packet: {error}"))?;
+    let activation_packet_alt = gpu
+        .hip
+        .malloc(HARMONIC_ACTIVATION_EXTENT as usize)
+        .map_err(|error| format!("allocate alternate staged activation packet: {error}"))?;
 
     let mut comparisons = 0_u64;
     for layer in 0..HARMONIC_LAYER_COUNT as usize {
@@ -360,7 +364,7 @@ fn main() -> Result<(), String> {
         .map_err(|error| format!("download checkpoint tail count: {error}"))?;
     let (expected_local, expected_sources, expected_count) =
         expected_partition(&plan, 0, checkpoint_ids);
-    let mut expected_packet = packet_sentinel;
+    let mut expected_packet = packet_sentinel.clone();
     expected_packet[..std::mem::size_of_val(&checkpoint_x)]
         .copy_from_slice(as_bytes(&checkpoint_x));
     let ids_offset = std::mem::size_of_val(&checkpoint_x);
@@ -376,6 +380,39 @@ fn main() -> Result<(), String> {
             .position(|(got, expected)| got != expected);
         return Err(format!(
             "retained route-stage activation mismatch at byte {mismatch:?}"
+        ));
+    }
+    gpu.hip
+        .memcpy_htod(&activation_packet_alt, &packet_sentinel)
+        .map_err(|error| format!("clear alternate checkpoint activation packet: {error}"))?;
+    let alternate_address = (activation_packet_alt.as_ptr() as usize as u64).to_le_bytes();
+    let patch = AqlKernargPatch {
+        dispatch: 0,
+        offset: rdna_compute::rdna3::gfx1100::HARMONIC_STAGE_PACKET_POINTER_KERNARG_OFFSET,
+        bytes: &alternate_address,
+    };
+    let mut alternate_submission = unsafe {
+        gpu.replay
+            .submit_checkpointed_linear_aql_patched(1, &[patch])
+            .map_err(|error| format!("submit patched checkpoint AQL: {error}"))?
+    };
+    alternate_submission
+        .wait_checkpoint(Duration::from_secs(2))
+        .map_err(|error| format!("wait patched checkpoint AQL: {error}"))?;
+    let mut alternate_packet = vec![0_u8; HARMONIC_ACTIVATION_EXTENT as usize];
+    gpu.hip
+        .memcpy_dtoh(&mut alternate_packet, &activation_packet_alt)
+        .map_err(|error| format!("download patched activation packet: {error}"))?;
+    alternate_submission
+        .wait(Duration::from_secs(2))
+        .map_err(|error| format!("wait patched checkpoint terminal: {error}"))?;
+    if alternate_packet != expected_packet {
+        let mismatch = alternate_packet
+            .iter()
+            .zip(&expected_packet)
+            .position(|(got, expected)| got != expected);
+        return Err(format!(
+            "retained patched route-stage activation mismatch at byte {mismatch:?}"
         ));
     }
     for (label, local, sources, count) in [
@@ -400,7 +437,7 @@ fn main() -> Result<(), String> {
     drop(retained_replay);
 
     println!(
-        "harmonic partition exact: selector={} pci={} arch={} name={:?} routes={} raw_bit_comparisons={} checkpoint_dispatches={} checkpoint_packets={} checkpoint_queue={}",
+        "harmonic partition exact: selector={} pci={} arch={} name={:?} routes={} raw_bit_comparisons={} checkpoint_dispatches={} checkpoint_packets={} checkpoint_queue={} patched_slots=2",
         selector,
         pci,
         arch,
