@@ -168,8 +168,11 @@ fn resolve_device_selector(hip: &HipRuntime, selector: &DeviceSelector) -> Resul
                 )),
             }
         }
-        DeviceSelector::PciBdf(_) | DeviceSelector::Uuid(_) => Err(format!(
-            "deepseek4 heterogeneous selector {selector} is typed but this HIP discovery layer cannot resolve it yet"
+        DeviceSelector::PciBdf(pci_bus_id) => hip
+            .device_by_pci_bus_id(pci_bus_id)
+            .map_err(|error| format!("deepseek4 heterogeneous selector {selector}: {error}")),
+        DeviceSelector::Uuid(_) => Err(format!(
+            "deepseek4 heterogeneous selector {selector} is typed but this HIP discovery layer cannot resolve UUIDs yet"
         )),
     }
 }

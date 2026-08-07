@@ -5,6 +5,7 @@
 use std::fs::{self, OpenOptions};
 use std::path::PathBuf;
 
+use hip_bridge::HipRuntime;
 use hipfire_arch_deepseek4::{
     harmonic_monotonic_tick, HarmonicCompletion, HarmonicContract, HarmonicExpertMappedPoll,
     HarmonicGpuMapping, HarmonicSharedRing, HARMONIC_ACTIVATION_EXTENT, HARMONIC_RESULT_EXTENT,
@@ -23,10 +24,40 @@ fn payload(len: usize, salt: u8) -> Vec<u8> {
 }
 
 fn main() {
-    let gpu = Gpu::init().expect("initialize one visible probe GPU");
+    let args = std::env::args().skip(1).collect::<Vec<_>>();
+    let (pci_bus_id, expected_arch) = match args.as_slice() {
+        [pci_flag, pci, arch_flag, arch]
+            if pci_flag == "--pci" && arch_flag == "--expected-arch" =>
+        {
+            (pci, arch)
+        }
+        _ => panic!(
+            "usage: harmonic_mapped_transport_probe --pci <domain:bus:device.function> --expected-arch <gfx target>"
+        ),
+    };
+    let discovery = HipRuntime::load().expect("load HIP for exact PCI discovery");
+    let device_id = discovery
+        .device_by_pci_bus_id(&pci_bus_id)
+        .expect("resolve exact PCI device");
+    let normalized_pci = discovery
+        .device_pci_bus_id(device_id)
+        .expect("read resolved PCI identity");
+    assert_eq!(
+        normalized_pci.to_ascii_lowercase(),
+        pci_bus_id.to_ascii_lowercase(),
+        "HIP resolved a different physical device"
+    );
+    drop(discovery);
+
+    let gpu = Gpu::init_with_device(device_id).expect("initialize exact PCI probe GPU");
+    assert_eq!(
+        gpu.arch.to_ascii_lowercase(),
+        expected_arch.to_ascii_lowercase(),
+        "exact PCI device has an unexpected architecture"
+    );
     println!(
-        "harmonic mapped transport probe: arch={} device={}",
-        gpu.arch, gpu.device_id
+        "harmonic mapped transport probe: pci={} arch={} device={}",
+        normalized_pci, gpu.arch, gpu.device_id
     );
 
     let root = PathBuf::from("target").join(format!(
