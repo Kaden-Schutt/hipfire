@@ -17,6 +17,11 @@ use crate::{Gpu, GpuTensor};
 const MQ2_LLOYD_GATE_UP_EP_SRC: &str =
     include_str!("../../../../kernels/src/gemv_mq2g256_lloyd_moe_gate_up_indexed_ep.gfx1201.hip");
 const MQ2_LLOYD_GATE_UP_EP_KERNEL: &str = "gemv_mq2g256_lloyd_moe_gate_up_k8_indexed_gfx1201_ep";
+const MQ2_LLOYD_GATE_UP_K4096_EP_SRC: &str = include_str!(
+    "../../../../kernels/src/gemv_mq2g256_lloyd_moe_gate_up_indexed_k4096_ep.gfx1201.hip"
+);
+const MQ2_LLOYD_GATE_UP_K4096_EP_KERNEL: &str =
+    "gemv_mq2g256_lloyd_moe_gate_up_k8_indexed_k4096_gfx1201_ep";
 const MQ2_LLOYD_DOWN_EXPANDED_EP_SRC: &str =
     include_str!("../../../../kernels/src/gemv_mq2g256_lloyd_moe_down_expanded_k4_ep.gfx1201.hip");
 const MQ2_LLOYD_DOWN_EXPANDED_EP_KERNEL: &str =
@@ -115,6 +120,68 @@ impl Gfx1201Device<'_> {
             timer.finish(&self.gpu.hip);
         }
         result
+    }
+
+    /// Micro-screen sister of [`Self::mq2_lloyd_moe_gate_up_ep`] specialized
+    /// for DS4's fixed K=4096. All sixteen MQ2 codebooks are staged before the
+    /// unchanged four-chain dot-product sequence.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mq2_lloyd_moe_gate_up_k4096_ep(
+        &mut self,
+        expert_ptrs: &GpuTensor,
+        nonowned_dummy: &GpuTensor,
+        topk_indices: &GpuTensor,
+        x_rot: &GpuTensor,
+        y_gate: &GpuTensor,
+        y_up: &GpuTensor,
+        m: usize,
+        k: usize,
+        k_top: usize,
+    ) -> HipResult<()> {
+        self.gpu.bind_thread()?;
+        assert_eq!(k, 4096, "gfx1201 MQ2 fixed gate/up requires K=4096");
+        self.gpu.ensure_kernel(
+            MQ2_LLOYD_GATE_UP_K4096_EP_KERNEL,
+            MQ2_LLOYD_GATE_UP_K4096_EP_SRC,
+            MQ2_LLOYD_GATE_UP_K4096_EP_KERNEL,
+        )?;
+        let expert_ptrs_ptr = expert_ptrs.buf.as_ptr();
+        let dummy_ptr = nonowned_dummy.buf.as_ptr();
+        let topk_indices_ptr = topk_indices.buf.as_ptr();
+        let x_ptr = x_rot.buf.as_ptr();
+        let gate_ptr = y_gate.buf.as_ptr();
+        let up_ptr = y_up.buf.as_ptr();
+        let m_i32 = m as i32;
+        let k_i32 = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &expert_ptrs_ptr as *const _ as *mut c_void,
+            &dummy_ptr as *const _ as *mut c_void,
+            &topk_indices_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &gate_ptr as *const _ as *mut c_void,
+            &up_ptr as *const _ as *mut c_void,
+            &m_i32 as *const _ as *mut c_void,
+            &k_i32 as *const _ as *mut c_void,
+        ];
+        self.gpu.launch_maybe_blob(
+            MQ2_LLOYD_GATE_UP_K4096_EP_KERNEL,
+            [m as u32, k_top as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut blob = KernargBlob::new();
+                blob.push_ptr(expert_ptrs_ptr);
+                blob.push_ptr(dummy_ptr);
+                blob.push_ptr(topk_indices_ptr);
+                blob.push_ptr(x_ptr);
+                blob.push_ptr(gate_ptr);
+                blob.push_ptr(up_ptr);
+                blob.push_i32(m_i32);
+                blob.push_i32(k_i32);
+                blob
+            },
+        )
     }
 
     /// Deterministic DS4 TP/EP down projection. Ownership is derived from the
