@@ -5353,12 +5353,6 @@ fn forward_ep_tp_graph(
     position: u32,
 ) -> Result<(), String> {
     let n = gpus.devices.len();
-    let graph_resident_embedding = n == 4
-        && cfg.mq2r
-        && gpus
-            .devices
-            .iter()
-            .all(|device| device.arch_caps.is_gfx1201());
     for rank in 0..n {
         ensure_compressor_capacity(
             cfg,
@@ -5388,23 +5382,20 @@ fn forward_ep_tp_graph(
         );
     }
 
-    // TP3 retains the certified out-of-graph embedding route. Exact gfx1201
-    // TP4 captures the already-proven buffer-driven embedding broadcast below:
-    // the captured four-byte token upload stays dynamic across graph replays,
-    // while one kernel replaces the external lookup plus four D2D copies.
-    if !graph_resident_embedding {
-        for rank in 0..n {
-            gpus.devices[rank]
-                .bind_thread()
-                .map_err(|error| format!("ds4 TP{n} graph stage bind {rank}: {error:?}"))?;
-            init_residual_streams(
-                cfg,
-                &weights_per_rank[rank],
-                &mut state_per_rank[rank],
-                &mut gpus.devices[rank],
-                token,
-            )?;
-        }
+    // Dynamic embedding stays outside the fixed graph body. Position, cache
+    // state, and token-id uploads are captured from stable host allocations,
+    // exactly like the certified single-device DS4 graph route.
+    for rank in 0..n {
+        gpus.devices[rank]
+            .bind_thread()
+            .map_err(|error| format!("ds4 TP{n} graph stage bind {rank}: {error:?}"))?;
+        init_residual_streams(
+            cfg,
+            &weights_per_rank[rank],
+            &mut state_per_rank[rank],
+            &mut gpus.devices[rank],
+            token,
+        )?;
     }
 
     let captured = gpus
@@ -5419,20 +5410,6 @@ fn forward_ep_tp_graph(
     }
 
     if captured == 0 {
-        if graph_resident_embedding {
-            // JIT and launch once before capture. HIPRTC/module load is not a
-            // legal graph node; the captured launch below then reuses the
-            // resident module. This warmup launch is capture-only, never part
-            // of steady-state replay.
-            for rank in 0..n {
-                init_residual_streams_from_token_buf(
-                    cfg,
-                    &weights_per_rank[rank],
-                    &state_per_rank[rank],
-                    &mut gpus.devices[rank],
-                )?;
-            }
-        }
         gpus.begin_tp_graph_signal_capture()
             .map_err(|error| format!("ds4 TP{n} graph signal capture: {error:?}"))?;
         for rank in 0..n {
@@ -5455,14 +5432,6 @@ fn forward_ep_tp_graph(
                 position,
             )?;
             precompute_token_id(&mut state_per_rank[rank], &mut gpus.devices[rank], token)?;
-            if graph_resident_embedding {
-                init_residual_streams_from_token_buf(
-                    cfg,
-                    &weights_per_rank[rank],
-                    &state_per_rank[rank],
-                    &mut gpus.devices[rank],
-                )?;
-            }
         }
         forward_ep_tp_graph_body(
             gpus,
@@ -9915,38 +9884,6 @@ fn init_residual_streams(
     }
 
     Ok(())
-}
-
-/// Graph-safe twin of [`init_residual_streams`] for state whose decode warmup
-/// has already allocated the token-id scalar and residual streams. The
-/// buffer-driven Q8 kernel preserves the scalar dequantization arithmetic and
-/// broadcasts each value directly to all HC streams.
-fn init_residual_streams_from_token_buf(
-    cfg: &DeepseekV4Config,
-    weights: &DeepseekV4Weights,
-    state: &DeepseekV4State,
-    gpu: &mut Gpu,
-) -> Result<(), String> {
-    let token_embd = weights
-        .token_embd
-        .as_ref()
-        .ok_or_else(|| "graph embedding: token_embd missing".to_string())?;
-    let streams = state
-        .residual_streams
-        .as_ref()
-        .ok_or_else(|| "graph embedding: residual streams missing".to_string())?;
-    let token_id_buf = state
-        .token_id_buf
-        .as_ref()
-        .ok_or_else(|| "graph embedding: token-id buffer missing".to_string())?;
-    gpu.embedding_lookup_q8_buf_broadcast(
-        token_embd,
-        streams,
-        token_id_buf,
-        cfg.hidden_size,
-        cfg.hc_mult,
-    )
-    .map_err(|error| format!("graph embedding broadcast: {error:?}"))
 }
 
 /// Reusable per-call scratch for the batched-prefill driver.
