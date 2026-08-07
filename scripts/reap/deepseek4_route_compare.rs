@@ -147,6 +147,27 @@ fn print_first_differences(base: &[Record], candidate: &[Record]) {
     } else {
         println!("first-weight-difference: none");
     }
+
+    if let Some((record, (base, candidate))) =
+        base.iter()
+            .zip(candidate)
+            .enumerate()
+            .find(|(_, (base, candidate))| {
+                base.weights
+                    .iter()
+                    .zip(&candidate.weights)
+                    .map(|(base, candidate)| (*base as f64 - *candidate as f64).abs())
+                    .sum::<f64>()
+                    > 1.0e-5
+            })
+    {
+        println!(
+            "first-material-weight-difference: record={record} layer={} base={:?} candidate={:?}",
+            base.layer, base.weights, candidate.weights
+        );
+    } else {
+        println!("first-material-weight-difference: none");
+    }
 }
 
 fn main() -> Result<(), String> {
