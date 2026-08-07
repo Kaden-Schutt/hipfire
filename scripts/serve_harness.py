@@ -341,18 +341,45 @@ def _kill_serve():
     if pgid is None and _serve_proc is not None:
         pgid = _serve_proc.pid
     if pgid is not None:
-        try:
-            os.killpg(pgid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        except OSError as err:
-            # ESRCH: group already gone (benign race). Other errors: last-ditch
-            # kill the Popen handle if it is still around.
-            if getattr(err, "errno", None) != errno.ESRCH and _serve_proc is not None:
-                try:
-                    _serve_proc.kill()
-                except Exception:
-                    pass
+        # rocprof must observe a normal target shutdown to flush its CSV trace.
+        # The default remains the historical exact/fast SIGKILL cleanup; this
+        # opt-in is developer tooling for HIPFIRE_DAEMON_BIN wrappers such as
+        # scripts/rocprof-daemon-wrap.sh and never changes product serving.
+        graceful = os.environ.get("HIPFIRE_SERVE_HARNESS_GRACEFUL_CLEANUP") == "1"
+        if graceful:
+            try:
+                os.killpg(pgid, signal.SIGINT)
+            except ProcessLookupError:
+                pgid = None
+            except OSError as err:
+                if getattr(err, "errno", None) == errno.ESRCH:
+                    pgid = None
+            if pgid is not None:
+                deadline = time.monotonic() + 30.0
+                while time.monotonic() < deadline:
+                    try:
+                        os.killpg(pgid, 0)
+                    except ProcessLookupError:
+                        pgid = None
+                        break
+                    except OSError as err:
+                        if getattr(err, "errno", None) == errno.ESRCH:
+                            pgid = None
+                            break
+                    time.sleep(0.1)
+        if pgid is not None:
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            except OSError as err:
+                # ESRCH: group already gone (benign race). Other errors:
+                # last-ditch kill the Popen handle if it is still around.
+                if getattr(err, "errno", None) != errno.ESRCH and _serve_proc is not None:
+                    try:
+                        _serve_proc.kill()
+                    except Exception:
+                        pass
     _serve_proc = None
     _serve_pgid = None
     _clear_pid_file()
