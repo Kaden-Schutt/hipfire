@@ -5,24 +5,25 @@
 //! Admission screen for cross-device HIP-event dependencies captured into four
 //! independently instantiated graphs.
 //!
-//! Each replay first writes a fresh byte pattern on every rank. The captured
-//! rank graphs record one event per producer, wait on all peer events, and rank
-//! zero copies the peer buffers into local result buffers. Repeated exact
-//! downloads prove that event nodes bind to the current graph replay rather
-//! than passing on a stale record from the prior replay.
+//! Each replay delays and then writes fresh F32 values on every rank. The
+//! captured rank graphs record one event per producer, wait on all peer events,
+//! and rank zero sums three peer-visible tensors with graph-safe kernels.
+//! Repeated exact downloads prove that event nodes bind to the current graph
+//! replay rather than passing on a stale record from the prior replay.
 
-use hip_bridge::{
-    DeviceBuffer, Event, Graph, GraphExec, HIP_EVENT_DISABLE_TIMING, HIP_EVENT_RELEASE_TO_SYSTEM,
-};
+use hip_bridge::{Event, Graph, GraphExec, HIP_EVENT_DISABLE_TIMING, HIP_EVENT_RELEASE_TO_SYSTEM};
 use hipfire_runtime::multi_gpu::Gpus;
+use rdna_compute::{DType, GpuTensor};
 
 const RANKS: usize = 4;
-const BYTES: usize = 16_384;
+const ELEMS: usize = 4_096;
+const DELAY_BYTES: usize = 256 * 1024 * 1024;
 const CAPTURE_MODE_RELAXED: u32 = 2;
 
 struct CapturedRank {
     graph: Graph,
     exec: GraphExec,
+    _blobs: Vec<Vec<u8>>,
 }
 
 fn main() {
@@ -54,12 +55,17 @@ fn main() {
         gpu.active_stream = Some(gpu.hip.stream_create().expect("create stream"));
     }
 
-    let mut sources: Vec<DeviceBuffer> = Vec::with_capacity(RANKS);
+    let mut sources: Vec<GpuTensor> = Vec::with_capacity(RANKS);
+    let mut delays = Vec::with_capacity(RANKS);
     let mut events: Vec<Event> = Vec::with_capacity(RANKS);
     for rank in 0..RANKS {
         let gpu = &mut gpus.devices[rank];
         gpu.bind_thread().expect("bind source alloc");
-        sources.push(gpu.hip.malloc(BYTES).expect("source buffer"));
+        sources.push(
+            gpu.alloc_tensor(&[ELEMS], DType::F32)
+                .expect("source tensor"),
+        );
+        delays.push(gpu.hip.malloc(DELAY_BYTES).expect("delay buffer"));
         events.push(
             gpu.hip
                 .event_create_with_flags(HIP_EVENT_DISABLE_TIMING | HIP_EVENT_RELEASE_TO_SYSTEM)
@@ -68,14 +74,19 @@ fn main() {
     }
 
     gpus.devices[0].bind_thread().expect("bind result alloc");
-    let results: Vec<DeviceBuffer> = (1..RANKS)
-        .map(|_| gpus.devices[0].hip.malloc(BYTES).expect("result buffer"))
-        .collect();
+    let tmp = gpus.devices[0]
+        .alloc_tensor(&[ELEMS], DType::F32)
+        .expect("sum tmp");
+    let result = gpus.devices[0]
+        .alloc_tensor(&[ELEMS], DType::F32)
+        .expect("sum result");
 
     // Begin every device capture before adding any cross-device dependency.
     for rank in 0..RANKS {
-        let gpu = &gpus.devices[rank];
+        let gpu = &mut gpus.devices[rank];
         gpu.bind_thread().expect("bind capture begin");
+        gpu.graphs.capture_blobs.clear();
+        gpu.graphs.capture_mode = true;
         gpu.hip
             .stream_begin_capture(
                 gpu.active_stream.as_ref().expect("active stream"),
@@ -105,53 +116,65 @@ fn main() {
             }
         }
     }
-    {
-        let owner = &gpus.devices[0];
-        owner.bind_thread().expect("bind peer copies");
-        let stream = owner.active_stream.as_ref().expect("owner stream");
-        for rank in 1..RANKS {
-            owner
-                .hip
-                .memcpy_peer_async(
-                    &results[rank - 1],
-                    owner.device_id,
-                    &sources[rank],
-                    gpus.devices[rank].device_id,
-                    BYTES,
-                    stream,
-                )
-                .expect("capture peer copy");
-        }
-    }
+
+    // Use the same graph-safe peer-pointer load shape as the promoted TP4 HC
+    // consumer. Captured hipMemcpyPeerAsync is deliberately not used: on the
+    // current ROCm stack it instantiates but replays as a no-op.
+    gpus.devices[0].bind_thread().expect("bind peer sum");
+    gpus.devices[0]
+        .add_f32_graph_safe(&sources[1], &sources[2], &tmp)
+        .expect("capture first peer sum");
+    gpus.devices[0]
+        .add_f32_graph_safe(&tmp, &sources[3], &result)
+        .expect("capture second peer sum");
 
     let mut captures = Vec::with_capacity(RANKS);
     for rank in 0..RANKS {
-        let gpu = &gpus.devices[rank];
+        let gpu = &mut gpus.devices[rank];
         gpu.bind_thread().expect("bind capture end");
         let graph = gpu
             .hip
             .stream_end_capture(gpu.active_stream.as_ref().expect("active stream"))
             .expect("end rank capture");
+        gpu.graphs.capture_mode = false;
         let exec = gpu
             .hip
             .graph_instantiate(&graph)
             .expect("instantiate graph");
-        captures.push(CapturedRank { graph, exec });
+        let blobs = std::mem::take(&mut gpu.graphs.capture_blobs);
+        captures.push(CapturedRank {
+            graph,
+            exec,
+            _blobs: blobs,
+        });
     }
 
     for replay in 0..replays {
-        // Enqueue every producer update before launching any graph. This keeps
-        // each event record ordered after fresh data on its local rank while
-        // preventing rank-zero launch order from outrunning a peer update.
+        let host_values: Vec<Vec<f32>> = (0..RANKS)
+            .map(|rank| vec![(replay * RANKS + rank + 1) as f32; ELEMS])
+            .collect();
+
+        // Enqueue every producer update before launching any graph. The large
+        // prior write makes a stale event record observable rather than a race
+        // that usually happens to finish before rank zero reads the peer.
         for rank in 0..RANKS {
             let gpu = &gpus.devices[rank];
             gpu.bind_thread().expect("bind producer update");
-            let value = ((replay + rank + 1) % 251 + 1) as u8;
             gpu.hip
                 .memset_async(
-                    &sources[rank],
-                    value as i32,
-                    BYTES,
+                    &delays[rank],
+                    replay as i32,
+                    DELAY_BYTES,
+                    gpu.active_stream.as_ref().expect("active stream"),
+                )
+                .expect("enqueue producer delay");
+            let host = &host_values[rank];
+            let bytes =
+                unsafe { std::slice::from_raw_parts(host.as_ptr().cast::<u8>(), host.len() * 4) };
+            gpu.hip
+                .memcpy_htod_async(
+                    &sources[rank].buf,
+                    bytes,
                     gpu.active_stream.as_ref().expect("active stream"),
                 )
                 .expect("enqueue producer update");
@@ -175,19 +198,17 @@ fn main() {
         }
 
         gpus.devices[0].bind_thread().expect("bind result check");
-        for rank in 1..RANKS {
-            let expected = ((replay + rank + 1) % 251 + 1) as u8;
-            let mut host = vec![0u8; BYTES];
-            gpus.devices[0]
-                .hip
-                .memcpy_dtoh(&mut host, &results[rank - 1])
-                .expect("download result");
-            assert!(
-                host.iter().all(|&value| value == expected),
-                "replay {replay} rank {rank}: stale or unordered peer result; expected {expected}, head {:?}",
-                &host[..16]
-            );
-        }
+        let host = gpus.devices[0]
+            .download_f32(&result)
+            .expect("download peer sum");
+        let expected = (1..RANKS)
+            .map(|rank| (replay * RANKS + rank + 1) as f32)
+            .sum::<f32>();
+        assert!(
+            host.iter().all(|&value| value == expected),
+            "replay {replay}: stale or unordered peer sum; expected {expected}, head {:?}",
+            &host[..16]
+        );
     }
 
     for rank in 0..RANKS {
