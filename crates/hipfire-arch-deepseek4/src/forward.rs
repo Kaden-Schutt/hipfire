@@ -9943,9 +9943,6 @@ pub struct PrefillBatchScratch {
     /// _batched, in-place rescaled by hc_apply_alpha_batched, then split
     /// into pre/post/comb by hc_split_finalize_batched.
     pub hc_c_batch: GpuTensor,
-    /// Per-token inverse RMS scratch for the exact-gfx1201 HC WMMA prefill
-    /// projection. `[max_batch]`; only 4 KiB at the promoted B1024 chunk.
-    pub hc_inv_rms_batch: GpuTensor,
     /// HC `pre` weights `[max_batch, hc_mult=4]`. Used by
     /// hc_input_map_4stream_batched and hc_mix_4stream_batched.
     pub hc_pre_batch: GpuTensor,
@@ -10339,7 +10336,6 @@ impl PrefillBatchScratch {
         let kv_batch = alloc_f32!(&[max_batch, kv_dim], "kv_batch");
         let positions = alloc_f32!(&[max_batch], "positions");
         let hc_c_batch = alloc_f32!(&[max_batch, 24], "hc_c_batch");
-        let hc_inv_rms_batch = alloc_f32!(&[max_batch], "hc_inv_rms_batch");
         let hc_pre_batch = alloc_f32!(&[max_batch, hc_mult], "hc_pre_batch");
         let hc_post_batch = alloc_f32!(&[max_batch, hc_mult], "hc_post_batch");
         let hc_comb_batch = alloc_f32!(&[max_batch, hc_mult, hc_mult], "hc_comb_batch");
@@ -10499,7 +10495,6 @@ impl PrefillBatchScratch {
             kv_batch: kv_batch.into_tensor(),
             positions: positions.into_tensor(),
             hc_c_batch: hc_c_batch.into_tensor(),
-            hc_inv_rms_batch: hc_inv_rms_batch.into_tensor(),
             hc_pre_batch: hc_pre_batch.into_tensor(),
             hc_post_batch: hc_post_batch.into_tensor(),
             hc_comb_batch: hc_comb_batch.into_tensor(),
@@ -10613,7 +10608,6 @@ impl PrefillBatchScratch {
             self.kv_batch,
             self.positions,
             self.hc_c_batch,
-            self.hc_inv_rms_batch,
             self.hc_pre_batch,
             self.hc_post_batch,
             self.hc_comb_batch,
@@ -13403,25 +13397,26 @@ fn mhc_pre_batched(
         .unwrap_or(1.5);
 
     // 1. c = streams · W_fn · rsqrt(mean) + base. Per-batch. The promoted
-    // gfx1201 chunk computes the shared row norm once, then treats the 24
-    // control rows as the small-M GEMM they are. Every other architecture and
-    // unmeasured tail batch retains the established scalar reduction.
-    let gfx1201_wmma = gpu.arch_caps.is_gfx1201()
+    // gfx1201 chunk assigns one workgroup to each token and shares the X load
+    // and RMS reduction across all 24 control rows. It deliberately retains
+    // the established scalar F32 dot/reduction order for bit-identical output.
+    // Every other architecture and unmeasured tail batch keeps the established
+    // 24-workgroup route.
+    let gfx1201_fused24 = gpu.arch_caps.is_gfx1201()
         && batch_size == 1024
-        && hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_GFX1201_HC_WMMA").as_deref() != Ok("0");
-    if gfx1201_wmma {
-        gpu.hc_compute_control_wmma_batched_gfx1201(
+        && hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_GFX1201_HC_FUSED24").as_deref()
+            != Ok("0");
+    if gfx1201_fused24 {
+        gpu.hc_compute_control_batched_fused24_gfx1201(
             &pbs.streams_batch,
             hc_fn,
             hc_base,
-            &pbs.hc_inv_rms_batch,
             &pbs.hc_c_batch,
             n_ctrl as i32,
             x_dim as i32,
             batch_size as i32,
-            1,
         )
-        .map_err(|e| format!("hc_compute_control_wmma_batched_gfx1201 l{layer_idx}: {e:?}"))?;
+        .map_err(|e| format!("hc_compute_control_batched_fused24_gfx1201 l{layer_idx}: {e:?}"))?;
     } else {
         gpu.hc_compute_control_batched(
             &pbs.streams_batch,
