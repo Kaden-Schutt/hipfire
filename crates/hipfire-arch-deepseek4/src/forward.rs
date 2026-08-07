@@ -1395,14 +1395,23 @@ fn e8_prefill_coop4_applies(arch: &str, m: usize, k: usize, batch_size: usize) -
 
 /// Measured token-tile width for the exact gfx1201 MQ2R TP prefill route.
 ///
-/// TP3's balanced shards produce three classes: wide wq_b rows, 4,096-row
-/// reductions (wo_b and shared down), and narrow/replicated projections.  The
-/// gfx1201 channel screen measured B4, B2, and B1 respectively at the exact
-/// production shapes.  TP4 lands in the same classes, so the selector is
-/// shape-based rather than rank-count-based.
+/// At the production 1,024-token chunk, retaining more query tiles per wave
+/// amortizes the decoded E8 weight fragment.  The wide screen measured B8 for
+/// TP3's wq_b/wo_b/shared-down shapes, B4 for wq_a and the 768-row shared-up
+/// shard, and B2 for the 512-row shared-up shard.  Full-width wq_b is large
+/// enough to keep the higher-register B16 schedule occupied.  Smaller/tail
+/// batches retain the established selector until they are measured directly.
 #[inline]
-fn gfx1201_e8_prefill_batch_rows(m: usize) -> usize {
-    if m >= 8192 {
+fn gfx1201_e8_prefill_batch_rows(m: usize, batch_size: usize, wide: bool) -> usize {
+    if wide && batch_size == 1024 && m >= 16384 {
+        16
+    } else if wide && batch_size == 1024 && m >= 2048 {
+        8
+    } else if wide && batch_size == 1024 && m >= 768 {
+        4
+    } else if wide && batch_size == 1024 && m >= 512 {
+        2
+    } else if m >= 8192 {
         4
     } else if m == 4096 {
         2
@@ -1459,7 +1468,16 @@ fn gemv_auto_batched_wmma(
             let scratch = x_f16_scratch.unwrap();
             gpu.deepseek4_convert_f32_to_f16(x_rotated_batch, scratch, (batch_size * k) as i64)
                 .map_err(|e| format!("convert_f32_to_f16 (gfx1201 E8 WMMA): {e:?}"))?;
-            match gfx1201_e8_prefill_batch_rows(m) {
+            let wide = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_GFX1201_E8_WIDE")
+                .as_deref()
+                != Ok("0");
+            match gfx1201_e8_prefill_batch_rows(m, batch_size, wide) {
+                16 => gpu
+                    .gemm_mfp4g32_e8_soa_wmma_b16_gfx1201_f16(weight, scratch, y, m, k, batch_size)
+                    .map_err(|e| format!("gemm gfx1201 MFP4-E8-SoA WMMA B16: {e:?}")),
+                8 => gpu
+                    .gemm_mfp4g32_e8_soa_wmma_b8_gfx1201_f16(weight, scratch, y, m, k, batch_size)
+                    .map_err(|e| format!("gemm gfx1201 MFP4-E8-SoA WMMA B8: {e:?}")),
                 4 => gpu
                     .gemm_mfp4g32_e8_soa_wmma_b4_gfx1201_f16(weight, scratch, y, m, k, batch_size)
                     .map_err(|e| format!("gemm gfx1201 MFP4-E8-SoA WMMA B4: {e:?}")),
@@ -16347,14 +16365,19 @@ mod tests {
     #[test]
     fn gfx1201_e8_prefill_tiles_follow_measured_tp_shapes() {
         // TP3 wq_b: 24/24/16 local heads.
-        assert_eq!(gfx1201_e8_prefill_batch_rows(12288), 4);
-        assert_eq!(gfx1201_e8_prefill_batch_rows(8192), 4);
+        assert_eq!(gfx1201_e8_prefill_batch_rows(12288, 1024, true), 8);
+        assert_eq!(gfx1201_e8_prefill_batch_rows(8192, 1024, true), 8);
         // TP3 wo_b and shared-down retain 4,096 output rows.
-        assert_eq!(gfx1201_e8_prefill_batch_rows(4096), 2);
+        assert_eq!(gfx1201_e8_prefill_batch_rows(4096, 1024, true), 8);
         // TP3 shared-up is 768/768/512 rows; replicated wq_a is 1,024.
-        assert_eq!(gfx1201_e8_prefill_batch_rows(1024), 1);
-        assert_eq!(gfx1201_e8_prefill_batch_rows(768), 1);
-        assert_eq!(gfx1201_e8_prefill_batch_rows(512), 1);
+        assert_eq!(gfx1201_e8_prefill_batch_rows(1024, 1024, true), 4);
+        assert_eq!(gfx1201_e8_prefill_batch_rows(768, 1024, true), 4);
+        assert_eq!(gfx1201_e8_prefill_batch_rows(512, 1024, true), 2);
+
+        // Unmeasured tails and the rollback path retain the promoted schedule.
+        assert_eq!(gfx1201_e8_prefill_batch_rows(12288, 512, true), 4);
+        assert_eq!(gfx1201_e8_prefill_batch_rows(4096, 1024, false), 2);
+        assert_eq!(gfx1201_e8_prefill_batch_rows(768, 1024, false), 1);
     }
 
     #[test]
