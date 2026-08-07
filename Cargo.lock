@@ -777,6 +777,7 @@ dependencies = [
  "libloading",
  "memmap2",
  "rdna-compute",
+ "redline-rocr",
  "serde",
  "serde_json",
 ]

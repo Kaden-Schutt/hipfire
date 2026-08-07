@@ -20,12 +20,19 @@ serde_json = { version = "1", features = ["preserve_order"] }
 hipfire-dispatch = { path = "../hipfire-dispatch", features = ["from-hip-error"] }
 hipfire-reap = { path = "../hipfire-reap" }
 memmap2 = "0.9"
+redline-rocr = { path = "../redline-rocr", optional = true }
 
 [dev-dependencies]
 libloading.workspace = true
 
 [features]
 harmonic-fault-injection = []
+harmonic-worker = ["dep:redline-rocr"]
+
+[[bin]]
+name = "deepseek4-harmonic-expert-worker"
+path = "src/bin/deepseek4_harmonic_expert_worker.rs"
+required-features = ["harmonic-worker"]
 
 [[example]]
 name = "harmonic_protocol_probe"

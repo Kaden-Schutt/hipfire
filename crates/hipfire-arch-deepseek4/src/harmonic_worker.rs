@@ -13,11 +13,11 @@ use rdna_compute::{DType, Gpu, GpuTensor};
 
 use crate::deepseek4::{DeepseekV4Config, DeepseekV4RoutedWeights};
 use crate::harmonic::{
+    unpack_harmonic_x_rot, HarmonicCompletion, HarmonicContract, HarmonicOwner,
     HARMONIC_EXPERT_COUNT, HARMONIC_HIDDEN_SIZE, HARMONIC_LAYER_COUNT,
-    HARMONIC_MOE_INTERMEDIATE_SIZE, HARMONIC_RESULT_EXTENT, HARMONIC_TOP_K, HarmonicCompletion,
-    HarmonicContract, HarmonicOwner, unpack_harmonic_x_rot,
+    HARMONIC_MOE_INTERMEDIATE_SIZE, HARMONIC_RESULT_EXTENT, HARMONIC_TOP_K,
 };
-use crate::harmonic_ipc::{HarmonicWorkItem, harmonic_payload_fingerprint};
+use crate::harmonic_ipc::{harmonic_payload_fingerprint, HarmonicWorkItem};
 
 /// All scratch and the one execution stream are owned by the gfx1151 worker
 /// process. `Option` fields make partial construction transactionally
@@ -326,6 +326,29 @@ mod tests {
             ["stream_wait_", "value32"].concat(),
             ["stream_write_", "value32"].concat(),
             ["device", "_id"].concat(),
+        ] {
+            assert!(!source.contains(&forbidden), "found {forbidden}");
+        }
+    }
+
+    #[test]
+    fn expert_worker_process_is_exact_pci_bound_and_has_no_peer_path() {
+        let source = include_str!("bin/deepseek4_harmonic_expert_worker.rs");
+        for required in [
+            "Gpu::init_with_pci_bus_id",
+            "GpuSelector::PciBusId",
+            "DeepseekV4VerifiedArtifact::verify",
+            "load_weights_harmonic_experts_gfx1151",
+        ] {
+            assert!(source.contains(required), "missing {required}");
+        }
+        for forbidden in [
+            ["Gpu::init_with", "_device"].concat(),
+            ["GpuSelector::", "Ordinal"].concat(),
+            ["enable_peer", "_access"].concat(),
+            ["memcpy_", "peer"].concat(),
+            ["stream_wait_", "value32"].concat(),
+            ["stream_write_", "value32"].concat(),
         ] {
             assert!(!source.contains(&forbidden), "found {forbidden}");
         }

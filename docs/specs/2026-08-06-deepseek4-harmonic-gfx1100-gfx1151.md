@@ -7,9 +7,10 @@ Status: H0-H1 complete; H2 CPU protocol complete and the PCI-scoped worker
 survivability oracle passed 11 forced deaths on the authorized gfx1010 guinea
 pig. Stable HIP and ROCr PCI selection is source-complete, but the exact-pair
 H2 hardware exit remains open. The process-local gfx1151 H4 expert-service
-source seam and routed residency receipt are implemented but have not executed
-a model or passed numerical parity. Independent H3/H4 work remains in
-progress. GPU product execution remains prohibited.
+source seam, exact-BDF worker process, and routed residency receipt are
+implemented but have not executed a model or passed numerical parity. The H2
+supervisor and exact-pair hardware battery remain open. Independent H3/H4 work
+remains in progress. GPU product execution remains prohibited.
 
 Branch: `ds4-beta-staging`
 

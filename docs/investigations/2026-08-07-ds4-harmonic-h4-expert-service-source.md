@@ -40,6 +40,24 @@ receipt containing architecture, stable PCI identity, diagnostic HIP ordinal,
 tensor count, and resident bytes after querying HIP pointer ownership for every
 routed tensor. The ordinal is never the physical identity.
 
+The feature-gated `deepseek4-harmonic-expert-worker` binary now owns the
+process boundary around that service. It:
+
+- accepts only a canonical PCI BDF, never a HIP or ROCr ordinal;
+- verifies the exact 0731 MQ2R artifact SHA before initializing either runtime
+  or allocating model weights;
+- resolves HIP and ROCr independently by the same BDF, requires both to report
+  exact `gfx1151`, and rejects any physical-identity mismatch;
+- opens the already-created typed shared ring and requires its destination
+  allocation generation to equal the worker generation;
+- loads only routed weights, publishes the ownership receipt over a private
+  Unix-domain control socket, and services explicit epoch commands;
+- explicitly releases scratch and weights on every returned error and graceful
+  shutdown; a GPU stall remains the supervisor's process-kill boundary.
+
+The binary has no product entry point or automatic admission. Building it
+requires the `harmonic-worker` feature.
+
 ## Redline identity provenance
 
 The independent `warpfront/redline` repository was inspected at master
@@ -56,27 +74,27 @@ while the stable physical identity is lifted selectively and fail closed.
 ## Checks
 
 - `cargo check -p hipfire-arch-deepseek4`
+- `cargo check -p hipfire-arch-deepseek4 --features harmonic-worker --bin deepseek4-harmonic-expert-worker`
 - `cargo test -p hipfire-arch-deepseek4 --lib`
 - `scripts/fmt-changed.sh` against `origin/ds4-beta-staging`
 - `git diff --check`
 
-The crate-level static test rejects cross-device primitives in
-`harmonic_worker.rs`. These checks prove source shape and CPU protocol
-invariants only.
+The crate-level static tests reject cross-device primitives and ordinal
+fallbacks in both the service and worker process, and require exact HIP/ROCr
+PCI selectors plus artifact verification. These checks prove source shape and
+CPU protocol invariants only.
 
 ## Unmet exits
 
-Before H4 can close, a dedicated worker executable and supervisor must:
+Before H4 can close, the supervisor and hardware gates must:
 
-1. select the HIP context and ROCr agent by the same stable PCI BDF using the
-   fail-closed source API recorded in
-   [`2026-08-07-ds4-harmonic-h2-hip-pci-binding.md`](2026-08-07-ds4-harmonic-h2-hip-pci-binding.md);
-2. verify the model SHA before allocating;
-3. load routed-only weights and publish the local ownership receipt;
-4. service `expert_begin` to `expert_complete` under the typed shared ring;
-5. enforce a host deadline by terminating the worker process, never by placing
+1. spawn the exact-BDF worker, validate every phase/ready receipt, and reject
+   any unexpected child exit or protocol event;
+2. enforce a host deadline by terminating the exact child process, never by placing
    a reciprocal indefinite wait on either GPU;
-6. pass exact gfx1100/gfx1151 fault injection and then byte-exact selected-MoE
+3. confirm process exit before calling `isolate_owner`, advancing the
+   generation, or recycling an abandoned slot;
+4. pass exact gfx1100/gfx1151 fault injection and then byte-exact selected-MoE
    parity against the existing single-gfx1151 route.
 
 Until those exits pass, product execution remains quarantined.
