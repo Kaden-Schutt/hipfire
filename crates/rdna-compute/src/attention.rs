@@ -3814,9 +3814,15 @@ impl Gpu {
              been designed. Tree-verify + multi-slot is deliberately out of \
              SP1 scope."
         );
-        const TILE_SIZE: usize = 128;
+        // gfx1151 is the dev box; gfx1201 is the target. Never bake a tuned
+        // constant into a `const` — see spec §11.
+        let tile_size: usize = std::env::var("HIPFIRE_ATTN_TILE_SIZE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&t: &usize| t > 0 && t % 32 == 0)
+            .unwrap_or(128);
         const WMMA_BLOCK_M: usize = 16;
-        let max_tiles = (max_ctx_len + TILE_SIZE - 1) / TILE_SIZE;
+        let max_tiles = (max_ctx_len + tile_size - 1) / tile_size;
         let stride = 2 + head_dim;
         // Bytes of `partials` consumed per query row (n_heads * max_tiles *
         // (2+head_dim) floats) — drives how many rows fit in one sub-batch
@@ -3915,7 +3921,7 @@ impl Gpu {
                 let hd = head_dim as i32;
                 let ms = max_seq as i32;
                 let sc = scale;
-                let ts = TILE_SIZE as i32;
+                let ts = tile_size as i32;
                 let mt = max_tiles as i32;
                 let bo = offset as i32;
                 let bs = block_start as i32;
@@ -3962,7 +3968,7 @@ impl Gpu {
                 } else {
                     (
                         [n_heads as u32, max_tiles as u32, chunk as u32],
-                        (TILE_SIZE * 4) as u32,
+                        (tile_size * 4) as u32,
                     )
                 };
                 self.launch_maybe_blob(
@@ -4008,7 +4014,7 @@ impl Gpu {
                 let pos_ptr = positions.buf.as_ptr();
                 let nh = n_heads as i32;
                 let hd = head_dim as i32;
-                let ts = TILE_SIZE as i32;
+                let ts = tile_size as i32;
                 let mt = max_tiles as i32;
                 let bo = offset as i32;
                 let bs = block_start as i32;
