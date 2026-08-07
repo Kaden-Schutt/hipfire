@@ -27,7 +27,7 @@ where
     gpu.hip.event_elapsed_ms(&start, &stop).expect("elapsed") as f64 * 1_000.0 / repeats as f64
 }
 
-fn run_shape(gpu: &mut Gpu, heads: usize, active_topk: usize) {
+fn run_shape(gpu: &mut Gpu, heads: usize) {
     const D: usize = 512;
     const SWA: usize = 128;
     const TOPK: usize = 512;
@@ -48,7 +48,7 @@ fn run_shape(gpu: &mut Gpu, heads: usize, active_topk: usize) {
     let d_topk = gpu.upload_f32(&topk, &[D, TOPK]).expect("upload topk");
     let d_sink = gpu.upload_f32(&sink, &[heads]).expect("upload sink");
     let d_n_swa = upload_i32(gpu, &[SWA as i32]);
-    let d_n_topk = upload_i32(gpu, &[active_topk as i32]);
+    let d_n_topk = upload_i32(gpu, &[TOPK as i32]);
     let d_reference = gpu.zeros(&[heads, D], DType::F32).expect("reference");
     let d_scoregrid = gpu.zeros(&[heads, D], DType::F32).expect("scoregrid");
     let d_split3 = gpu.zeros(&[heads, D], DType::F32).expect("split3");
@@ -162,7 +162,7 @@ fn run_shape(gpu: &mut Gpu, heads: usize, active_topk: usize) {
         .expect("timed split3");
     });
     println!(
-        "heads={heads} n_swa={SWA} n_topk={active_topk} topk_capacity={TOPK} raw_equal={raw_equal}/{} max_abs={max_abs:.9e} max_rel={max_rel:.9e} reference_us={reference_us:.3} scoregrid_us={scoregrid_us:.3} speedup_x={:.4} split3_us={split3_us:.3} split3_speedup_x={:.4} split3_raw_mismatches={split3_mismatches}",
+        "heads={heads} n_swa={SWA} n_topk={TOPK} raw_equal={raw_equal}/{} max_abs={max_abs:.9e} max_rel={max_rel:.9e} reference_us={reference_us:.3} scoregrid_us={scoregrid_us:.3} speedup_x={:.4} split3_us={split3_us:.3} split3_speedup_x={:.4} split3_raw_mismatches={split3_mismatches}",
         reference.len(),
         reference_us / scoregrid_us,
         reference_us / split3_us,
@@ -172,8 +172,6 @@ fn run_shape(gpu: &mut Gpu, heads: usize, active_topk: usize) {
 fn main() {
     let mut gpu = Gpu::init().expect("gpu init");
     assert_eq!(gpu.arch, "gfx1201", "this screen requires exact gfx1201");
-    for active_topk in [16, 512] {
-        run_shape(&mut gpu, 24, active_topk);
-        run_shape(&mut gpu, 16, active_topk);
-    }
+    run_shape(&mut gpu, 24);
+    run_shape(&mut gpu, 16);
 }
