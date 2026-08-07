@@ -3653,7 +3653,8 @@ pub(crate) fn decode_step_harmonic(
             .as_ref()
             .ok_or_else(|| format!("harmonic routed partial missing l{layer_idx}"))?;
         gpu.deepseek4_harmonic_wait_copy_gfx1100(
-            &header,
+            &slot0,
+            &slot1,
             &result0,
             &result1,
             routed_partial,
