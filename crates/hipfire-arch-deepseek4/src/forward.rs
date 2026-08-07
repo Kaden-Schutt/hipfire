@@ -7036,7 +7036,7 @@ fn heterogeneous_run_selected(
 
     let params = hipfire_dispatch::families::moe::MoeSelectedParams {
         hidden: cfg.hidden_size,
-        mi: cfg.moe_intermediate_size,
+        mi: layer.expert_intermediate_size,
         k_top: cfg.num_experts_per_tok,
         swiglu_limit: cfg.swiglu_limit,
         uses_atomic_moe_down: weights.mq2r_backend.uses_atomic_moe_down(),
@@ -7188,7 +7188,12 @@ fn ffn_routed(
     let k = cfg.num_experts_per_tok;
     let n_exp = cfg.n_routed_experts;
     let _ = n_exp;
-    let im = cfg.moe_intermediate_size;
+    let im = layer.expert_intermediate_size;
+    if im == 0 || !im.is_multiple_of(256) {
+        return Err(format!(
+            "ffn_routed l{layer_idx}: invalid rank-local expert width {im}"
+        ));
+    }
     let ffn_x_rot = state.ffn_x_rot.as_ref().unwrap();
     let ffn_out = state.ffn_out.as_ref().unwrap();
     // Route-scale: env override (process-cached) else cfg.routed_scaling_factor.
@@ -7365,7 +7370,12 @@ fn ffn_hash_routed(
         ));
     }
 
-    let im = cfg.moe_intermediate_size;
+    let im = layer.expert_intermediate_size;
+    if im == 0 || !im.is_multiple_of(256) {
+        return Err(format!(
+            "ffn_hash_routed l{layer_idx}: invalid rank-local expert width {im}"
+        ));
+    }
     let ffn_x_rot = state.ffn_x_rot.as_ref().unwrap();
     let ffn_out = state.ffn_out.as_ref().unwrap();
     let route_scale_override: f32 = config_cache::route_scale(cfg.routed_scaling_factor, cfg.mq2r);
@@ -12660,6 +12670,12 @@ fn ffn_batched(
     let w2_ptrs = layer.expert_w2_ptrs.as_ref().unwrap();
     let n_exp = cfg.n_routed_experts;
     let k_top = cfg.num_experts_per_tok;
+    let routed_im = layer.expert_intermediate_size;
+    if routed_im == 0 || !routed_im.is_multiple_of(256) {
+        return Err(format!(
+            "ffn_batched l{layer_idx}: invalid rank-local expert width {routed_im}"
+        ));
+    }
     let route_scale: f32 = config_cache::route_scale(cfg.routed_scaling_factor, cfg.mq2r);
 
     // 8. Router GEMV: gate.weight @ ffn_x_rot_batch → moe_scores [B, n_exp].
@@ -12714,7 +12730,7 @@ fn ffn_batched(
 
     let moe_params = hipfire_dispatch::families::moe::MoeBiasAwarePrefillParams {
         hidden,
-        mi: im,
+        mi: routed_im,
         n_exp,
         k_top,
         batch_size,

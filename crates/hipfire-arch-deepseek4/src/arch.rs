@@ -422,16 +422,46 @@ impl DeepseekV4 {
             }
         }
         let src = |slot: usize| -> usize { keep.map(|k| k[slot] as usize).unwrap_or(slot) };
-        let owns = |e: usize| {
-            shard
-                .map(|(s, rank)| s.owns_expert(rank, e))
-                .unwrap_or(true)
+        // Exact gfx1201 TP4 balances the unavoidable six-expert/four-rank
+        // tail by storing one aligned half of every expert on its ordinary
+        // owner and the other half on a deterministic partner. The partner
+        // cycles across the three non-owners, so every rank receives exactly
+        // 64 secondary halves in addition to its 64 primary halves. Aggregate
+        // model bytes are unchanged. Other devices, TP sizes, and assignment
+        // policies retain whole-expert ownership byte-for-byte.
+        let split_tp4 = gpu.arch == "gfx1201"
+            && shard.is_some_and(|(s, _)| {
+                s.tp_size == 4
+                    && s.expert_to_rank.len() == n_exp
+                    && s.expert_to_rank
+                        .iter()
+                        .enumerate()
+                        .all(|(e, owner)| *owner as usize == e % 4)
+            });
+        let local_half = |e: usize| -> Option<usize> {
+            let Some((s, rank)) = shard else {
+                return Some(0);
+            };
+            if !split_tp4 {
+                return s.owns_expert(rank, e).then_some(0);
+            }
+            let owner = s.expert_to_rank[e] as usize;
+            let partner = (owner + 1 + ((e / 4) % 3)) % 4;
+            if rank == owner {
+                Some(0)
+            } else if rank == partner {
+                Some(1)
+            } else {
+                None
+            }
         };
         let mut local_of_global = vec![usize::MAX; n_exp];
+        let mut half_of_global = vec![usize::MAX; n_exp];
         let mut n_owned = 0usize;
         for e in 0..n_exp {
-            if owns(e) {
+            if let Some(half) = local_half(e) {
                 local_of_global[e] = n_owned;
+                half_of_global[e] = half;
                 n_owned += 1;
             }
         }
@@ -445,9 +475,21 @@ impl DeepseekV4 {
             .ok_or_else(|| format!("deepseek4: missing {w2_name0}"))?;
         let w2_stride = w2_info0.data_size;
         let w2_shape: Vec<usize> = w2_info0.shape.iter().map(|&s| s as usize).collect();
+        if w2_shape.len() != 2 {
+            return Err(format!(
+                "deepseek4: {w2_name0} expected rank-2 w2, got {w2_shape:?}"
+            ));
+        }
+        let global_im = w2_shape[1];
+        if split_tp4 && !global_im.is_multiple_of(512) {
+            return Err(format!(
+                "deepseek4: {prefix} TP4 split requires intermediate width {global_im} divisible by 512"
+            ));
+        }
+        let local_im = if split_tp4 { global_im / 2 } else { global_im };
         let mut w2_names = Vec::with_capacity(n_owned);
         for e in 0..n_exp {
-            if !owns(e) {
+            if local_half(e).is_none() {
                 continue;
             }
             let name = format!("{prefix}.ffn.experts.{}.w2.weight", src(e));
@@ -465,10 +507,10 @@ impl DeepseekV4 {
 
         let w1_name0 = format!("{prefix}.ffn.experts.{}.w1.weight", src(0));
         let w3_name0 = format!("{prefix}.ffn.experts.{}.w3.weight", src(0));
-        let w1_stride = hfq
+        let w1_info0 = hfq
             .find_tensor_info(&w1_name0)
-            .ok_or_else(|| format!("deepseek4: missing {w1_name0}"))?
-            .data_size;
+            .ok_or_else(|| format!("deepseek4: missing {w1_name0}"))?;
+        let w1_stride = w1_info0.data_size;
         let w3_stride = hfq
             .find_tensor_info(&w3_name0)
             .ok_or_else(|| format!("deepseek4: missing {w3_name0}"))?
@@ -478,10 +520,16 @@ impl DeepseekV4 {
                 "deepseek4: {prefix} w1/w3 stride mismatch: w1={w1_stride} w3={w3_stride}"
             ));
         }
+        let w1_shape: Vec<usize> = w1_info0.shape.iter().map(|&s| s as usize).collect();
+        if w1_shape.len() != 2 || w1_shape[0] != global_im {
+            return Err(format!(
+                "deepseek4: {w1_name0} shape {w1_shape:?} is incompatible with w2 {w2_shape:?}"
+            ));
+        }
         let combined_stride = w1_stride + w3_stride;
         let mut gate_up_names = Vec::with_capacity(n_owned * 2);
         for e in 0..n_exp {
-            if !owns(e) {
+            if local_half(e).is_none() {
                 continue;
             }
             for projection in ["w1", "w3"] {
@@ -508,10 +556,66 @@ impl DeepseekV4 {
         let mut buffers = read_hfq_jobs_ordered(hfq, &jobs)
             .map_err(|e| format!("deepseek4: parallel expert read {prefix}: {e}"))?
             .into_iter();
-        let w2_blob = buffers.next().expect("two planned expert jobs").data;
-        let gate_up_blob = buffers.next().expect("two planned expert jobs").data;
-        debug_assert_eq!(w2_blob.len(), w2_stride * n_owned);
-        debug_assert_eq!(gate_up_blob.len(), combined_stride * n_owned);
+        let w2_blob_full = buffers.next().expect("two planned expert jobs").data;
+        let gate_up_blob_full = buffers.next().expect("two planned expert jobs").data;
+        debug_assert_eq!(w2_blob_full.len(), w2_stride * n_owned);
+        debug_assert_eq!(gate_up_blob_full.len(), combined_stride * n_owned);
+
+        let (w2_blob, w2_stride, w2_shape, gate_up_blob, combined_stride) = if split_tp4 {
+            let w2_rows = w2_shape[0];
+            if w2_stride % w2_rows != 0 || w1_stride % global_im != 0 {
+                return Err(format!(
+                    "deepseek4: {prefix} TP4 split found non-integral packed row strides"
+                ));
+            }
+            let w2_row_stride = w2_stride / w2_rows;
+            if w2_row_stride % 2 != 0 || w1_stride % 2 != 0 {
+                return Err(format!(
+                    "deepseek4: {prefix} TP4 split found odd half-expert byte strides"
+                ));
+            }
+            let w2_local_row_stride = w2_row_stride / 2;
+            let w2_local_stride = w2_local_row_stride * w2_rows;
+            let w1_local_stride = w1_stride / 2;
+            let gate_up_local_stride = 2 * w1_local_stride;
+            let mut local_w2 = Vec::with_capacity(w2_local_stride * n_owned);
+            let mut local_gate_up = Vec::with_capacity(gate_up_local_stride * n_owned);
+            for e in 0..n_exp {
+                let slot = local_of_global[e];
+                if slot == usize::MAX {
+                    continue;
+                }
+                let half = half_of_global[e];
+                let w2_expert = &w2_blob_full[slot * w2_stride..(slot + 1) * w2_stride];
+                for row in 0..w2_rows {
+                    let start = row * w2_row_stride + half * w2_local_row_stride;
+                    local_w2.extend_from_slice(&w2_expert[start..start + w2_local_row_stride]);
+                }
+                let gate_up_expert =
+                    &gate_up_blob_full[slot * combined_stride..(slot + 1) * combined_stride];
+                let w1_start = half * w1_local_stride;
+                local_gate_up
+                    .extend_from_slice(&gate_up_expert[w1_start..w1_start + w1_local_stride]);
+                let w3_start = w1_stride + half * w1_local_stride;
+                local_gate_up
+                    .extend_from_slice(&gate_up_expert[w3_start..w3_start + w1_local_stride]);
+            }
+            (
+                local_w2,
+                w2_local_stride,
+                vec![w2_rows, local_im],
+                local_gate_up,
+                gate_up_local_stride,
+            )
+        } else {
+            (
+                w2_blob_full,
+                w2_stride,
+                w2_shape,
+                gate_up_blob_full,
+                combined_stride,
+            )
+        };
 
         // Preserve the historical allocation order exactly: w2 owner, w2
         // pointer table, gate_up owner, optional dummy, gate_up pointer table.
@@ -523,7 +627,7 @@ impl DeepseekV4 {
         let w2_base = w2_tensor.buf.as_ptr() as u64;
         let w2_ptrs: Vec<u64> = (0..n_exp)
             .map(|e| {
-                if owns(e) {
+                if local_half(e).is_some() {
                     w2_base + (local_of_global[e] * w2_stride) as u64
                 } else {
                     w2_base
@@ -559,7 +663,7 @@ impl DeepseekV4 {
             .unwrap_or(gate_up_base);
         let gate_up_ptrs: Vec<u64> = (0..n_exp)
             .map(|e| {
-                if owns(e) {
+                if local_half(e).is_some() {
                     gate_up_base + (local_of_global[e] * combined_stride) as u64
                 } else {
                     dummy_ptr
@@ -579,6 +683,7 @@ impl DeepseekV4 {
         layer.expert_gate_up_blob = Some(gate_up_tensor);
         layer.expert_gate_up_ptrs = Some(gate_up_ptr_tensor);
         layer.expert_gate_up_stride = combined_stride;
+        layer.expert_intermediate_size = local_im;
         layer.expert_gate_up_dummy = dummy_gate_up;
         Ok(())
     }
@@ -785,6 +890,7 @@ impl DeepseekV4 {
             layer.expert_gate_up_blob = Some(combined_tensor);
             layer.expert_gate_up_ptrs = Some(ptr_tensor);
             layer.expert_gate_up_stride = combined_stride;
+            layer.expert_intermediate_size = w1_info0.shape[0] as usize;
             // Store the owning handle (None on single-GPU / fully-owned shards).
             // Its device pointer is already baked into `ptr_tensor` above.
             layer.expert_gate_up_dummy = dummy_gate_up;
@@ -3129,6 +3235,7 @@ impl DeepseekV4 {
             layer.expert_gate_up_blob = Some(combined_tensor);
             layer.expert_gate_up_ptrs = Some(ptr_tensor);
             layer.expert_gate_up_stride = combined_stride;
+            layer.expert_intermediate_size = w1_info0.shape[0] as usize;
         }
         Ok(())
     }

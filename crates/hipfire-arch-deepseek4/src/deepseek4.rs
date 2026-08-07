@@ -713,6 +713,11 @@ pub struct DeepseekV4LayerWeights {
     pub expert_gate_up_blob: Option<rdna_compute::GpuTensor>,
     pub expert_gate_up_ptrs: Option<rdna_compute::GpuTensor>,
     pub expert_gate_up_stride: usize,
+    /// Rank-local routed intermediate width. This equals the model's full
+    /// `moe_intermediate_size` on ordinary EP routes. Exact gfx1201 TP4 may
+    /// split every expert across two ranks on 256-channel boundaries; those
+    /// ranks store and execute one half and publish that width here.
+    pub expert_intermediate_size: usize,
 
     /// EP-shard only: the shared zeroed gate_up buffer that non-owned experts'
     /// pointers index into (→ SwiGLU(0,0)=0 ⇒ 0 routed contribution). Owned
@@ -805,6 +810,7 @@ impl DeepseekV4LayerWeights {
             expert_gate_up_blob: sc(&self.expert_gate_up_blob),
             expert_gate_up_ptrs: sc(&self.expert_gate_up_ptrs),
             expert_gate_up_stride: self.expert_gate_up_stride,
+            expert_intermediate_size: self.expert_intermediate_size,
             expert_gate_up_dummy: sc(&self.expert_gate_up_dummy),
         }
     }
@@ -880,6 +886,7 @@ impl DeepseekV4LayerWeights {
             expert_gate_up_blob: None,
             expert_gate_up_ptrs: None,
             expert_gate_up_stride: 0,
+            expert_intermediate_size: 0,
             expert_gate_up_dummy: None,
         }
     }
