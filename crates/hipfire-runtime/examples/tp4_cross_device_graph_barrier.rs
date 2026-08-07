@@ -19,10 +19,6 @@ const RANKS: usize = 4;
 const ELEMS: usize = 4_096;
 const DELAY_BYTES: usize = 256 * 1024 * 1024;
 const CAPTURE_MODE_RELAXED: u32 = 2;
-const WAIT_EQ: u32 = 0x1;
-const SIGNAL_FLAGS: u32 = 0;
-const SIGNAL_MASK: u32 = u32::MAX;
-
 struct CapturedRank {
     graph: Graph,
     exec: GraphExec,
@@ -127,6 +123,33 @@ fn main() {
         &warm_result[..16]
     );
 
+    // JIT both graph-resident barrier symbols outside capture. Enqueue all
+    // stores before any waits so this warmup cannot deadlock.
+    for rank in 0..RANKS {
+        gpus.devices[rank]
+            .tp4_graph_signal_store_gfx1201(&signals[rank])
+            .expect("warm graph signal store");
+    }
+    for destination in 0..RANKS {
+        let peer_signals: Vec<&DeviceBuffer> = (0..RANKS)
+            .filter(|&source| source != destination)
+            .map(|source| &signals[source])
+            .collect();
+        gpus.devices[destination]
+            .tp4_graph_signal_wait3_gfx1201([peer_signals[0], peer_signals[1], peer_signals[2]])
+            .expect("warm graph signal wait");
+    }
+    for rank in 0..RANKS {
+        let gpu = &gpus.devices[rank];
+        gpu.bind_thread().expect("bind barrier warm sync");
+        gpu.hip
+            .stream_synchronize(gpu.active_stream.as_ref().expect("active stream"))
+            .expect("sync barrier warmup");
+        gpu.hip
+            .memset(&signals[rank], 0, signals[rank].size())
+            .expect("reset warmed signal");
+    }
+
     // Begin every device capture before adding any cross-device dependency.
     for rank in 0..RANKS {
         let gpu = &mut gpus.devices[rank];
@@ -141,28 +164,18 @@ fn main() {
             .expect("begin rank capture");
     }
     for rank in 0..RANKS {
-        let gpu = &gpus.devices[rank];
-        gpu.bind_thread().expect("bind signal write");
-        gpu.hip
-            .stream_write_value32(
-                gpu.active_stream.as_ref().expect("active stream"),
-                &signals[rank],
-                1,
-                SIGNAL_FLAGS,
-            )
+        gpus.devices[rank]
+            .tp4_graph_signal_store_gfx1201(&signals[rank])
             .expect("capture producer signal");
     }
     for destination in 0..RANKS {
-        let gpu = &gpus.devices[destination];
-        gpu.bind_thread().expect("bind peer waits");
-        let stream = gpu.active_stream.as_ref().expect("active stream");
-        for source in 0..RANKS {
-            if source != destination {
-                gpu.hip
-                    .stream_wait_value32(stream, &signals[source], 1, WAIT_EQ, SIGNAL_MASK)
-                    .expect("capture peer signal wait");
-            }
-        }
+        let peer_signals: Vec<&DeviceBuffer> = (0..RANKS)
+            .filter(|&source| source != destination)
+            .map(|source| &signals[source])
+            .collect();
+        gpus.devices[destination]
+            .tp4_graph_signal_wait3_gfx1201([peer_signals[0], peer_signals[1], peer_signals[2]])
+            .expect("capture peer signal wait");
     }
 
     // Use the same graph-safe peer-pointer load shape as the promoted TP4 HC

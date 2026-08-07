@@ -9060,6 +9060,83 @@ impl Gpu {
             },
         )
     }
+
+    /// Publish one TP4 graph barrier slot with system-scope release semantics.
+    pub fn tp4_graph_signal_store_gfx1201(&mut self, signal: &DeviceBuffer) -> HipResult<()> {
+        self.bind_thread()?;
+        if !self.arch_caps.is_gfx1201() {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "tp4_graph_signal_store_gfx1201 requires gfx1201, got {}",
+                    self.arch
+                ),
+            ));
+        }
+        self.ensure_kernel(
+            "tp4_graph_signal_store_gfx1201",
+            kernels::TP4_GRAPH_SIGNAL_GFX1201_SRC,
+            "tp4_graph_signal_store_gfx1201",
+        )?;
+
+        let ptr = signal.as_ptr();
+        let mut params: Vec<*mut c_void> = vec![&ptr as *const _ as *mut c_void];
+        self.launch_maybe_blob(
+            "tp4_graph_signal_store_gfx1201",
+            [1, 1, 1],
+            [64, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ptr);
+                b
+            },
+        )
+    }
+
+    /// Wait for the other three TP4 ranks with system-scope acquire semantics.
+    pub fn tp4_graph_signal_wait3_gfx1201(&mut self, signals: [&DeviceBuffer; 3]) -> HipResult<()> {
+        self.bind_thread()?;
+        if !self.arch_caps.is_gfx1201() {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "tp4_graph_signal_wait3_gfx1201 requires gfx1201, got {}",
+                    self.arch
+                ),
+            ));
+        }
+        self.ensure_kernel(
+            "tp4_graph_signal_wait3_gfx1201",
+            kernels::TP4_GRAPH_SIGNAL_GFX1201_SRC,
+            "tp4_graph_signal_wait3_gfx1201",
+        )?;
+
+        let signal0 = signals[0].as_ptr();
+        let signal1 = signals[1].as_ptr();
+        let signal2 = signals[2].as_ptr();
+        let mut params: Vec<*mut c_void> = vec![
+            &signal0 as *const _ as *mut c_void,
+            &signal1 as *const _ as *mut c_void,
+            &signal2 as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            "tp4_graph_signal_wait3_gfx1201",
+            [1, 1, 1],
+            [64, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(signal0);
+                b.push_ptr(signal1);
+                b.push_ptr(signal2);
+                b
+            },
+        )
+    }
+
     pub fn hc_mix_4stream_batched(
         &mut self,
         x_in: &GpuTensor,          // [batch, 4, hidden]

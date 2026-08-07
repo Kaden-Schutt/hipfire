@@ -5269,6 +5269,10 @@ pub const HC_MIX_4STREAM_SRC: &str = include_str!("../../../kernels/src/hc_mix_4
 pub const HC_MIX_4STREAM_PEER4_GFX1201_SRC: &str =
     include_str!("../../../kernels/src/hc_mix_4stream_peer4.gfx1201.hip");
 
+/// gfx1201 TP4 graph-resident system-scope producer barrier.
+pub const TP4_GRAPH_SIGNAL_GFX1201_SRC: &str =
+    include_str!("../../../kernels/src/tp4_graph_signal.gfx1201.hip");
+
 pub const HC_INPUT_MAP_SRC: &str = include_str!("../../../kernels/src/hc_input_map.hip");
 
 pub const HC_APPLY_ALPHA_SRC: &str = include_str!("../../../kernels/src/hc_apply_alpha.hip");
