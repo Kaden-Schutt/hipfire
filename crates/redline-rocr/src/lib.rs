@@ -31,7 +31,7 @@ mod pm4;
 mod pm4_gfx10;
 mod runtime;
 
-pub use abi::{IpcSignalHandle, MissingSymbol, Symbols};
+pub use abi::{MissingSymbol, Symbols};
 pub use packet::{
     BARRIER_DEPENDENCY_CAPACITY, FenceScope, HeaderPolicy, KernelMetadata, LaunchGeometry,
     PacketError,
