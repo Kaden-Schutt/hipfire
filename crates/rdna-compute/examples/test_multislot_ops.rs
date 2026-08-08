@@ -28,6 +28,18 @@
 //      and panics loudly on any non-finite element instead of silently
 //      scoring a shared-NaN pair as a match.
 //
+//      DeltaNet note: the original design gave every slot's launch a
+//      *shared*, `s_stride_elems`-strided S buffer plus a device-side
+//      `row_slot` selecting the offset. That design was found unsound
+//      before any caller shipped (`s_q8` and `s_scales` differ by a factor
+//      of HD, and `s_ef_residual` was never strided at all — see
+//      `gated_delta_net_q8_batch_seq_slots`'s doc in norm.rs) and was
+//      retired: `s_stride_elems` must now be 0. DeltaNet state is
+//      fixed-size and per-slot independent, so each slot instead gets its
+//      OWN `s_q8`/`s_scales`/EF device buffers and the harness calls the
+//      plain `gated_delta_net_q8_batch_seq` (no row_slot, no stride) —
+//      exactly what SP3's one-`DeltaNetState`-per-slot model already does.
+//
 //   2. Cross-slot isolation, with a positive poison control. KV write has
 //      no arena READ path (it only ever writes), so "poison every slot
 //      except the target" is translated as: pre-fill the WHOLE destination
@@ -35,26 +47,37 @@
 //      and require every OTHER slot's slab to still decode as 100% NaN —
 //      i.e. the write did not leak outside its own k_base..k_base+cap
 //      window. DeltaNet's slot-scoped launch DOES read its own S state on
-//      entry, so its isolation test is the direct SP1-style translation:
-//      poison every OTHER slot's S region, run the target's own launch,
-//      require its output stays finite. Each component gets its own
-//      positive control proving the poison mechanism is actually live
-//      (SP1's review caught a version of this check that would have passed
-//      vacuously against an inert poison).
+//      entry, so its isolation test poisons every OTHER slot's OWN device
+//      buffer, runs the target's launch against the target's OWN
+//      (unpoisoned) buffer, and requires the output stays finite. With
+//      genuinely separate per-slot buffers there is no shared array left
+//      for a neighbour's poison to leak through, so this no longer probes
+//      address-stride isolation the way the retired design did — it now
+//      checks that the harness wires each slot's own buffer handle to its
+//      own launch (and that neighbouring, simultaneously-live poisoned
+//      allocations don't get misrouted in), which is still worth having.
+//      Each component gets its own positive control proving the poison
+//      mechanism is actually live (SP1's review caught a version of this
+//      check that would have passed vacuously against an inert poison).
 //
 //   3. Negative control, corrupting the CANDIDATE ARM ONLY. Both components
 //      reuse the same mechanism: misroute one slot's device-side addressing
-//      (KV write: force every uploaded descriptor to slot 0's; DeltaNet:
-//      swap the uploaded row_slot value to a neighbour's id) so the write
-//      or read lands on a DIFFERENT, CLEAN (non-poisoned, numerically
-//      distinct) slot's data, while the reference computation still uses
-//      the slot's own true data. This produces a genuine finite numeric
-//      mismatch — not a crash and not the all-zero/non-finite guard rails —
-//      exactly the shape SP1's task-7 review demanded ("91.44x tolerance",
-//      not an assertion trip). Neither kernel has a device-side bounds
-//      guard that could abort before the comparison runs (kv_cache_write's
-//      only host guard is the slot_descs/row_slot both-or-neither assert,
-//      which both controls satisfy), so there is nothing to route around.
+//      so the write or read lands on a DIFFERENT, CLEAN (non-poisoned,
+//      numerically distinct) slot's data, while the reference computation
+//      still uses the slot's own true data. KV write forces every uploaded
+//      descriptor to slot 0's. DeltaNet, post-retirement, has no row_slot
+//      left to corrupt, so the equivalent corruption is at the call-site
+//      level: the candidate launch is wired to the BYSTANDER slot's own
+//      (clean, numerically distinct) S buffers while every other argument
+//      (q/k/v/gate/beta) stays the target's — the same class of bug a wrong
+//      buffer handle in a real caller would produce. This produces a
+//      genuine finite numeric mismatch — not a crash and not the
+//      all-zero/non-finite guard rails — exactly the shape SP1's task-7
+//      review demanded ("91.44x tolerance", not an assertion trip). Neither
+//      kernel has a device-side bounds guard that could abort before the
+//      comparison runs (kv_cache_write's only host guard is the
+//      slot_descs/row_slot both-or-neither assert, which that control
+//      satisfies), so there is nothing to route around.
 //
 //   4. Generator variance. Both components' synthetic-data generators are
 //      probed directly — hold slot fixed and vary position/token, then hold
@@ -824,31 +847,25 @@ mod dn {
         );
     }
 
-    /// Build the SHARED, slot-strided s_q8/s_scales host buffers for
-    /// `n_slots`. `poison_except`: when `Some(target)`, every OTHER slot's
-    /// region gets an NaN scale (int8 body irrelevant — poison propagates
-    /// through the S_f4 load, `scale * (float)src[..]`, which is NaN
-    /// regardless of `src`'s value, including 0).
-    fn build_dn_shared_state(n_slots: usize, poison_except: Option<usize>) -> (Vec<i8>, Vec<f32>) {
-        let mut s_q8 = vec![0i8; n_slots * DN_S_STRIDE];
-        let mut s_scales = vec![0f32; n_slots * DN_S_STRIDE]; // oversized on purpose: s_stride_elems
-                                                              // addresses s_q8 (bytes) and s_scales
-                                                              // (elements) with the SAME numeric
-                                                              // stride, so s_scales's per-slot region
-                                                              // is padded out to s_stride even though
-                                                              // only n_heads*HD entries are ever read.
-        for slot in 0..n_slots {
-            let poisoned = poison_except.is_some_and(|t| t != slot);
-            for i in 0..DN_S_STRIDE {
-                s_q8[slot * DN_S_STRIDE + i] = if poisoned { 0 } else { dn_state_q(slot, i) };
-            }
-            for i in 0..(DN_N_HEADS * DN_HD) {
-                s_scales[slot * DN_S_STRIDE + i] = if poisoned {
-                    f32::NAN
-                } else {
-                    dn_state_scale(slot, i)
-                };
-            }
+    /// Build ONE slot's OWN, independent s_q8/s_scales host buffers —
+    /// sized exactly to what the (now unstrided) kernel reads, since each
+    /// slot gets its own device buffer rather than a region carved out of a
+    /// shared, strided array. `poisoned`: when true, s_scales is filled
+    /// with NaN (int8 body irrelevant — poison propagates through the
+    /// S_f4 load, `scale * (float)src[..]`, which is NaN regardless of
+    /// `src`'s value, including 0).
+    fn build_dn_state(slot: usize, poisoned: bool) -> (Vec<i8>, Vec<f32>) {
+        let mut s_q8 = vec![0i8; DN_S_STRIDE];
+        let mut s_scales = vec![0f32; DN_N_HEADS * DN_HD];
+        for i in 0..DN_S_STRIDE {
+            s_q8[i] = if poisoned { 0 } else { dn_state_q(slot, i) };
+        }
+        for i in 0..(DN_N_HEADS * DN_HD) {
+            s_scales[i] = if poisoned {
+                f32::NAN
+            } else {
+                dn_state_scale(slot, i)
+            };
         }
         (s_q8, s_scales)
     }
@@ -966,29 +983,29 @@ mod dn {
     }
 
     /// Step 1 for DeltaNet: for each slot 0..n_slots, issue its OWN
-    /// slot-scoped launch into a SHARED, strided S buffer (exactly the
-    /// design SP2 Task 4 specifies — one launch per active slot, not one
-    /// combined launch), and compare both the output and the persisted
-    /// post-update state against the legacy per-slot reference.
+    /// slot-scoped launch into its OWN, independent S buffers (the
+    /// stride-retirement design SP2 Task 4 now specifies — one launch per
+    /// active slot against that slot's own state, mirroring SP3's
+    /// one-`DeltaNetState`-per-slot model), and compare both the output and
+    /// the persisted post-update state against the legacy per-slot
+    /// reference.
     fn test_dn_golden(gpu: &mut Gpu, n_slots: usize) {
-        let (s_q8_host, s_scales_host) = build_dn_shared_state(n_slots, None);
+        let states: Vec<(Vec<i8>, Vec<f32>)> = (0..n_slots)
+            .map(|slot| build_dn_state(slot, false))
+            .collect();
+        let all_q8: Vec<i8> = states.iter().flat_map(|(q, _)| q.iter().copied()).collect();
+        let all_scales: Vec<f32> = states.iter().flat_map(|(_, s)| s.iter().copied()).collect();
         assert_varying_i8(
-            &s_q8_host,
+            &all_q8,
             &format!("DN golden initial q8 state n_slots={n_slots}"),
         );
         assert_varying_f32(
-            &s_scales_host,
+            &all_scales,
             &format!("DN golden initial scales n_slots={n_slots}"),
         );
 
-        let s_q8_shared = gpu
-            .upload_raw(&i8_bytes(&s_q8_host), &[n_slots * DN_S_STRIDE])
-            .expect("s_q8_shared upload");
-        let s_scales_shared = gpu
-            .upload_f32(&s_scales_host, &[n_slots * DN_S_STRIDE])
-            .expect("s_scales_shared upload");
-
         for slot in 0..n_slots {
+            let (s_q8_init, s_scales_init) = &states[slot];
             let q = dn_gen(slot, DN_N_TOKENS, DN_N_HEADS, DN_HD, 3);
             let k = dn_gen(slot, DN_N_TOKENS, DN_N_HEADS, DN_HD, 5);
             let v = dn_gen(slot, DN_N_TOKENS, DN_N_HEADS, DN_HD, 7);
@@ -1014,35 +1031,34 @@ mod dn {
                 .zeros(&[DN_N_TOKENS * DN_N_HEADS * DN_HD], DType::F32)
                 .expect("out");
             let ef = dn_ef_buffer(gpu);
-            let row_slot_dev = gpu
-                .upload_raw(&i32_bytes(&[slot as i32]), &[1])
-                .expect("row_slot upload");
+            let s_q8_dev = gpu
+                .upload_raw(&i8_bytes(s_q8_init), &[DN_S_STRIDE])
+                .expect("s_q8 upload");
+            let s_scales_dev = gpu
+                .upload_f32(s_scales_init, &[DN_N_HEADS * DN_HD])
+                .expect("s_scales upload");
 
-            gpu.gated_delta_net_q8_batch_seq_slots(
+            gpu.gated_delta_net_q8_batch_seq(
                 &q_dev,
                 &k_dev,
                 &v_dev,
                 &gate_dev,
                 &beta_dev,
-                &s_q8_shared,
-                &s_scales_shared,
+                &s_q8_dev,
+                &s_scales_dev,
                 &out,
                 DN_N_TOKENS,
                 DN_N_HEADS,
                 DN_HD,
                 Some(&ef),
-                Some(&row_slot_dev),
-                DN_S_STRIDE,
             )
-            .expect("gated_delta_net_q8_batch_seq_slots");
+            .expect("gated_delta_net_q8_batch_seq");
             gpu.hip.device_synchronize().expect("sync");
             let out_host = gpu.download_f32(&out).expect("download out");
 
-            let sq_slice = s_q8_shared.sub_offset(slot * DN_S_STRIDE, DN_S_STRIDE);
-            let sq_bytes = download_raw(gpu, &sq_slice);
+            let sq_bytes = download_raw(gpu, &s_q8_dev);
             let sq_host: Vec<i8> = sq_bytes.iter().map(|&b| b as i8).collect();
-            let sc_slice = s_scales_shared.sub_offset(slot * DN_S_STRIDE, DN_N_HEADS * DN_HD);
-            let sc_host = gpu.download_f32(&sc_slice).expect("download scales slice");
+            let sc_host = gpu.download_f32(&s_scales_dev).expect("download s_scales");
             let state = decode_dn_state(&sq_host, &sc_host, DN_N_HEADS, DN_HD);
 
             gpu.free_tensor(q_dev).expect("free q_dev");
@@ -1052,11 +1068,9 @@ mod dn {
             gpu.free_tensor(beta_dev).expect("free beta_dev");
             gpu.free_tensor(out).expect("free out");
             gpu.free_tensor(ef).expect("free ef");
-            gpu.free_tensor(row_slot_dev).expect("free row_slot_dev");
+            gpu.free_tensor(s_q8_dev).expect("free s_q8_dev");
+            gpu.free_tensor(s_scales_dev).expect("free s_scales_dev");
 
-            let s_q8_init = &s_q8_host[slot * DN_S_STRIDE..(slot + 1) * DN_S_STRIDE];
-            let s_scales_init =
-                &s_scales_host[slot * DN_S_STRIDE..slot * DN_S_STRIDE + DN_N_HEADS * DN_HD];
             let reference = dn_legacy_reference(
                 gpu,
                 slot,
@@ -1080,28 +1094,45 @@ mod dn {
                 &reference.state,
             );
         }
-
-        gpu.free_tensor(s_q8_shared).expect("free s_q8_shared");
-        gpu.free_tensor(s_scales_shared)
-            .expect("free s_scales_shared");
     }
 
-    /// Step 2 for DeltaNet: poison every OTHER slot's S state, run the
-    /// target's own correctly-routed launch, and require its output/state
-    /// stay finite and match the (unpoisoned) reference.
+    /// Step 2 for DeltaNet: poison every OTHER slot's OWN device buffer,
+    /// run the target's launch against the target's OWN (unpoisoned)
+    /// buffer, and require its output/state stay finite and match the
+    /// reference. With the shared strided buffer retired there is no
+    /// address space left for a neighbour's poison to leak through — this
+    /// no longer probes stride addressing. What it still verifies: the
+    /// harness allocates every slot's buffer independently, keeps the
+    /// poisoned neighbours simultaneously live on the device (not freed
+    /// before the target's launch), and wires the TARGET's own handle —
+    /// not a neighbour's — into the target's call. That's a real, if
+    /// narrower, thing to get wrong (e.g. an off-by-one in which `states[i]`
+    /// pairs with which device buffer), so it stays worth checking even
+    /// though it can no longer catch an addressing-stride bug.
     fn test_dn_isolation(gpu: &mut Gpu, n_slots: usize) {
         if n_slots < 2 {
             println!("  DN isolation n_slots=1: skipped (no neighbour to poison)");
             return;
         }
         let target = n_slots - 1;
-        let (s_q8_host, s_scales_host) = build_dn_shared_state(n_slots, Some(target));
-        let s_q8_shared = gpu
-            .upload_raw(&i8_bytes(&s_q8_host), &[n_slots * DN_S_STRIDE])
-            .expect("s_q8_shared upload");
-        let s_scales_shared = gpu
-            .upload_f32(&s_scales_host, &[n_slots * DN_S_STRIDE])
-            .expect("s_scales_shared upload");
+        let states: Vec<(Vec<i8>, Vec<f32>)> = (0..n_slots)
+            .map(|slot| build_dn_state(slot, slot != target))
+            .collect();
+        // Upload every slot's buffer (not just target's) and keep them all
+        // alive through the target's launch, so a wrong-handle bug has
+        // live, poisoned neighbours to misroute into.
+        let device_bufs: Vec<(GpuTensor, GpuTensor)> = states
+            .iter()
+            .map(|(s_q8, s_scales)| {
+                let s_q8_dev = gpu
+                    .upload_raw(&i8_bytes(s_q8), &[DN_S_STRIDE])
+                    .expect("s_q8 upload");
+                let s_scales_dev = gpu
+                    .upload_f32(s_scales, &[DN_N_HEADS * DN_HD])
+                    .expect("s_scales upload");
+                (s_q8_dev, s_scales_dev)
+            })
+            .collect();
 
         let q = dn_gen(target, DN_N_TOKENS, DN_N_HEADS, DN_HD, 3);
         let k = dn_gen(target, DN_N_TOKENS, DN_N_HEADS, DN_HD, 5);
@@ -1128,25 +1159,21 @@ mod dn {
             .zeros(&[DN_N_TOKENS * DN_N_HEADS * DN_HD], DType::F32)
             .expect("out");
         let ef = dn_ef_buffer(gpu);
-        let row_slot_dev = gpu
-            .upload_raw(&i32_bytes(&[target as i32]), &[1])
-            .expect("row_slot upload");
+        let (target_s_q8_dev, target_s_scales_dev) = &device_bufs[target];
 
-        gpu.gated_delta_net_q8_batch_seq_slots(
+        gpu.gated_delta_net_q8_batch_seq(
             &q_dev,
             &k_dev,
             &v_dev,
             &gate_dev,
             &beta_dev,
-            &s_q8_shared,
-            &s_scales_shared,
+            target_s_q8_dev,
+            target_s_scales_dev,
             &out,
             DN_N_TOKENS,
             DN_N_HEADS,
             DN_HD,
             Some(&ef),
-            Some(&row_slot_dev),
-            DN_S_STRIDE,
         )
         .expect("isolation launch");
         gpu.hip.device_synchronize().expect("sync");
@@ -1159,20 +1186,19 @@ mod dn {
         gpu.free_tensor(beta_dev).expect("free beta_dev");
         gpu.free_tensor(out).expect("free out");
         gpu.free_tensor(ef).expect("free ef");
-        gpu.free_tensor(row_slot_dev).expect("free row_slot_dev");
-        gpu.free_tensor(s_q8_shared).expect("free s_q8_shared");
-        gpu.free_tensor(s_scales_shared)
-            .expect("free s_scales_shared");
+        for (s_q8_dev, s_scales_dev) in device_bufs {
+            gpu.free_tensor(s_q8_dev).expect("free s_q8_dev");
+            gpu.free_tensor(s_scales_dev).expect("free s_scales_dev");
+        }
 
         assert!(
             out_host.iter().all(|x| x.is_finite()),
             "DN isolation n_slots={n_slots}: target {target}'s output went non-finite with every \
-             OTHER slot poisoned — neighbour state leaked into target's own S read"
+             OTHER slot's OWN buffer poisoned — a neighbour's buffer got misrouted into target's \
+             own S read"
         );
 
-        let s_q8_init = &s_q8_host[target * DN_S_STRIDE..(target + 1) * DN_S_STRIDE];
-        let s_scales_init =
-            &s_scales_host[target * DN_S_STRIDE..target * DN_S_STRIDE + DN_N_HEADS * DN_HD];
+        let (s_q8_init, s_scales_init) = &states[target];
         let reference = dn_legacy_reference(
             gpu,
             target,
@@ -1193,25 +1219,28 @@ mod dn {
     }
 
     /// Positive poison control for DeltaNet, direct SP1-style translation:
-    /// poison the TARGET's own S region (every OTHER slot, `bystander`,
-    /// stays clean), run the target's own correctly-routed launch, and
-    /// assert its output DOES go non-finite. Proves the NaN scale really
-    /// does reach this kernel's S read and really does propagate to output
-    /// — the fact the isolation check above stayed finite is therefore
-    /// meaningful, not a byproduct of an inert poison mechanism.
+    /// poison the TARGET's own S buffer, run the target's own
+    /// correctly-routed launch, and assert its output DOES go non-finite.
+    /// Proves the NaN scale really does reach this kernel's S read and
+    /// really does propagate to output — the fact the isolation check
+    /// above stayed finite is therefore meaningful, not a byproduct of an
+    /// inert poison mechanism.
+    ///
+    /// Pre-retirement this poisoned "every slot but a bystander" inside a
+    /// shared array and relied on `target != bystander` to poison target.
+    /// With per-slot buffers there's no shared array for a clean
+    /// bystander to matter to this check — `build_dn_state(target, true)`
+    /// is the direct, equivalent replacement: only the target's own
+    /// buffer needs to exist, and it needs to be poisoned.
     fn test_dn_poison_is_live(gpu: &mut Gpu) {
-        let n_slots = 3;
         let target = 1usize;
-        let bystander = 0usize;
-        // poison_except(bystander): every slot other than `bystander` is
-        // poisoned, which includes `target`.
-        let (s_q8_host, s_scales_host) = build_dn_shared_state(n_slots, Some(bystander));
-        let s_q8_shared = gpu
-            .upload_raw(&i8_bytes(&s_q8_host), &[n_slots * DN_S_STRIDE])
-            .expect("s_q8_shared upload");
-        let s_scales_shared = gpu
-            .upload_f32(&s_scales_host, &[n_slots * DN_S_STRIDE])
-            .expect("s_scales_shared upload");
+        let (s_q8_host, s_scales_host) = build_dn_state(target, true);
+        let s_q8_dev = gpu
+            .upload_raw(&i8_bytes(&s_q8_host), &[DN_S_STRIDE])
+            .expect("s_q8 upload");
+        let s_scales_dev = gpu
+            .upload_f32(&s_scales_host, &[DN_N_HEADS * DN_HD])
+            .expect("s_scales upload");
 
         let q = dn_gen(target, DN_N_TOKENS, DN_N_HEADS, DN_HD, 3);
         let k = dn_gen(target, DN_N_TOKENS, DN_N_HEADS, DN_HD, 5);
@@ -1238,25 +1267,20 @@ mod dn {
             .zeros(&[DN_N_TOKENS * DN_N_HEADS * DN_HD], DType::F32)
             .expect("out");
         let ef = dn_ef_buffer(gpu);
-        let row_slot_dev = gpu
-            .upload_raw(&i32_bytes(&[target as i32]), &[1])
-            .expect("row_slot upload");
 
-        gpu.gated_delta_net_q8_batch_seq_slots(
+        gpu.gated_delta_net_q8_batch_seq(
             &q_dev,
             &k_dev,
             &v_dev,
             &gate_dev,
             &beta_dev,
-            &s_q8_shared,
-            &s_scales_shared,
+            &s_q8_dev,
+            &s_scales_dev,
             &out,
             DN_N_TOKENS,
             DN_N_HEADS,
             DN_HD,
             Some(&ef),
-            Some(&row_slot_dev),
-            DN_S_STRIDE,
         )
         .expect("poison-is-live launch");
         gpu.hip.device_synchronize().expect("sync");
@@ -1269,16 +1293,14 @@ mod dn {
         gpu.free_tensor(beta_dev).expect("free beta_dev");
         gpu.free_tensor(out).expect("free out");
         gpu.free_tensor(ef).expect("free ef");
-        gpu.free_tensor(row_slot_dev).expect("free row_slot_dev");
-        gpu.free_tensor(s_q8_shared).expect("free s_q8_shared");
-        gpu.free_tensor(s_scales_shared)
-            .expect("free s_scales_shared");
+        gpu.free_tensor(s_q8_dev).expect("free s_q8_dev");
+        gpu.free_tensor(s_scales_dev).expect("free s_scales_dev");
 
         let n_bad = out_host.iter().filter(|x| !x.is_finite()).count();
         assert!(
             n_bad > 0,
             "DN positive poison control: target slot {target}'s OWN S state was poisoned with \
-             NaN (bystander slot {bystander} left clean), but its output stayed fully finite \
+             NaN, but its output stayed fully finite \
              ({} elements, 0 non-finite) — the poison mechanism is not reaching this kernel's \
              device reads, which means the isolation layer's passing checks are meaningless",
             out_host.len()
@@ -1287,22 +1309,19 @@ mod dn {
     }
 
     /// Step 3 for DeltaNet: corrupt the CANDIDATE arm's device-side
-    /// row_slot only (target's own q/k/v, but rerouted to read/write
-    /// bystander's CLEAN-but-different S region) while the reference uses
-    /// target's true state. Bystander's state is numerically distinct, not
-    /// poisoned, so this produces a finite tolerance-ratio mismatch rather
-    /// than the non-finite guard rail.
+    /// addressing only. Pre-retirement this rerouted the device-side
+    /// `row_slot` value; with `row_slot` gone, the equivalent mistake a
+    /// real caller could make is passing the WRONG slot's S buffer handles
+    /// into the launch — target's own q/k/v/gate/beta, but wired to
+    /// bystander's CLEAN-but-different S buffers — while the reference
+    /// uses target's true state. Bystander's state is numerically
+    /// distinct, not poisoned, so this produces a finite tolerance-ratio
+    /// mismatch rather than the non-finite guard rail.
     fn test_dn_negative_control(gpu: &mut Gpu) {
-        let n_slots = 3;
         let target = 1usize;
         let bystander = 0usize;
-        let (s_q8_host, s_scales_host) = build_dn_shared_state(n_slots, None); // all clean, all distinct
-        let s_q8_shared = gpu
-            .upload_raw(&i8_bytes(&s_q8_host), &[n_slots * DN_S_STRIDE])
-            .expect("s_q8_shared upload");
-        let s_scales_shared = gpu
-            .upload_f32(&s_scales_host, &[n_slots * DN_S_STRIDE])
-            .expect("s_scales_shared upload");
+        let (target_s_q8, target_s_scales) = build_dn_state(target, false);
+        let (bystander_s_q8, bystander_s_scales) = build_dn_state(bystander, false); // clean, numerically distinct
 
         let q = dn_gen(target, DN_N_TOKENS, DN_N_HEADS, DN_HD, 3);
         let k = dn_gen(target, DN_N_TOKENS, DN_N_HEADS, DN_HD, 5);
@@ -1329,26 +1348,28 @@ mod dn {
             .zeros(&[DN_N_TOKENS * DN_N_HEADS * DN_HD], DType::F32)
             .expect("out");
         let ef = dn_ef_buffer(gpu);
-        // Device-side corruption: target's inputs claim to be `bystander`.
-        let row_slot_dev = gpu
-            .upload_raw(&i32_bytes(&[bystander as i32]), &[1])
-            .expect("row_slot upload (corrupt)");
+        // Device-side corruption: target's own inputs, but wired to
+        // bystander's S buffers.
+        let s_q8_dev = gpu
+            .upload_raw(&i8_bytes(&bystander_s_q8), &[DN_S_STRIDE])
+            .expect("s_q8 upload (corrupt)");
+        let s_scales_dev = gpu
+            .upload_f32(&bystander_s_scales, &[DN_N_HEADS * DN_HD])
+            .expect("s_scales upload (corrupt)");
 
-        gpu.gated_delta_net_q8_batch_seq_slots(
+        gpu.gated_delta_net_q8_batch_seq(
             &q_dev,
             &k_dev,
             &v_dev,
             &gate_dev,
             &beta_dev,
-            &s_q8_shared,
-            &s_scales_shared,
+            &s_q8_dev,
+            &s_scales_dev,
             &out,
             DN_N_TOKENS,
             DN_N_HEADS,
             DN_HD,
             Some(&ef),
-            Some(&row_slot_dev),
-            DN_S_STRIDE,
         )
         .expect("negative-control launch");
         gpu.hip.device_synchronize().expect("sync");
@@ -1361,19 +1382,14 @@ mod dn {
         gpu.free_tensor(beta_dev).expect("free beta_dev");
         gpu.free_tensor(out).expect("free out");
         gpu.free_tensor(ef).expect("free ef");
-        gpu.free_tensor(row_slot_dev).expect("free row_slot_dev");
-        gpu.free_tensor(s_q8_shared).expect("free s_q8_shared");
-        gpu.free_tensor(s_scales_shared)
-            .expect("free s_scales_shared");
+        gpu.free_tensor(s_q8_dev).expect("free s_q8_dev");
+        gpu.free_tensor(s_scales_dev).expect("free s_scales_dev");
 
-        let s_q8_init = &s_q8_host[target * DN_S_STRIDE..(target + 1) * DN_S_STRIDE];
-        let s_scales_init =
-            &s_scales_host[target * DN_S_STRIDE..target * DN_S_STRIDE + DN_N_HEADS * DN_HD];
         let reference = dn_legacy_reference(
             gpu,
             target,
-            s_q8_init,
-            s_scales_init,
+            &target_s_q8,
+            &target_s_scales,
             &q,
             &k,
             &v,
@@ -1383,7 +1399,7 @@ mod dn {
 
         expect_mismatch("DN negative control", move || {
             assert_close(
-                "DN negative control (row_slot rerouted to a clean neighbour, candidate arm only)",
+                "DN negative control (S buffers rerouted to a clean neighbour, candidate arm only)",
                 &out_host,
                 &reference.out,
             );
