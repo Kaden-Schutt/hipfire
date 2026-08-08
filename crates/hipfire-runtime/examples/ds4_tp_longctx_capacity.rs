@@ -22,6 +22,8 @@ struct Args {
     tokens: Vec<usize>,
     identity_tokens: Option<usize>,
     expected_identity_hash: Option<u64>,
+    replicated_cache: bool,
+    identity_detail: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -30,6 +32,8 @@ fn parse_args() -> Result<Args, String> {
     let mut tokens = DEFAULT_TOKENS.to_vec();
     let mut identity_tokens = None;
     let mut expected_identity_hash = None;
+    let mut replicated_cache = false;
+    let mut identity_detail = false;
     let argv: Vec<String> = std::env::args().collect();
     let mut i = 1usize;
     while i < argv.len() {
@@ -76,6 +80,14 @@ fn parse_args() -> Result<Args, String> {
                 );
                 i += 2;
             }
+            "--replicated-cache" => {
+                replicated_cache = true;
+                i += 1;
+            }
+            "--identity-detail" => {
+                identity_detail = true;
+                i += 1;
+            }
             flag => return Err(format!("unknown argument {flag}")),
         }
     }
@@ -100,6 +112,8 @@ fn parse_args() -> Result<Args, String> {
         tokens,
         identity_tokens,
         expected_identity_hash,
+        replicated_cache,
+        identity_detail,
     })
 }
 
@@ -188,6 +202,7 @@ fn prove_cache_identity(
     gpus: &mut [Gpu],
     identity_tokens: usize,
     expected_hash: Option<u64>,
+    identity_detail: bool,
 ) -> Result<(), String> {
     if states.len() != gpus.len() || states.len() < 2 {
         return Err(format!(
@@ -354,6 +369,16 @@ fn prove_cache_identity(
             for value in &global_bits {
                 mix_hash(&mut aggregate_hash, *value as usize);
             }
+            if identity_detail {
+                let mut tensor_hash = 0xcbf29ce484222325u64;
+                for value in &global_bits {
+                    mix_hash(&mut tensor_hash, *value as usize);
+                }
+                println!(
+                    "CACHE_TENSOR layer={layer_idx} cache={cache_name} rows={filled_rows} row_elems={row_elems} raw_bits={} hash=0x{tensor_hash:016x}",
+                    global_bits.len(),
+                );
+            }
             tensors += 1;
             compared_elements = compared_elements.saturating_add(global_bits.len());
         }
@@ -418,6 +443,12 @@ fn run() -> Result<(), String> {
             prefill.len(),
         ));
     }
+    if args.replicated_cache {
+        for rank_state in state.iter_mut() {
+            rank_state.compressor_cache_placement = CompressorCachePlacement::Replicated;
+        }
+        println!("CAPACITY_PROBE cache_placement=replicated_control");
+    }
 
     for rank in 0..args.tp {
         report_rank(
@@ -448,6 +479,7 @@ fn run() -> Result<(), String> {
             &mut ep.gpus.devices,
             identity_tokens,
             args.expected_identity_hash,
+            args.identity_detail,
         )?;
     }
 
