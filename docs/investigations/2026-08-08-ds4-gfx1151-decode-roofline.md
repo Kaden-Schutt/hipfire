@@ -201,32 +201,72 @@ that seam.
 §5 asserted that raising tau is the lever, on the reasoning that "weights load
 once per verify cycle regardless of how many tokens that cycle yields, so
 throughput scales nearly linearly with tau." **That reasoning is wrong for this
-model, and the measurement below corrects it.** It holds for a dense target. It
-does not hold for DS4, because each additional verify position routes to its
-own `k6` experts, so the union of experts touched grows with the block.
+model.** It holds for a dense target. It does not hold for DS4, because each
+additional verify position routes to its own `k6` experts, so the union of
+experts touched grows with the block.
+
+### Units: tau is accepted drafts, a window emits tau + 1
+
+The harness `tau` counts *accepted drafts*. Each window also emits one bonus
+token from the target's own prediction, so a window yields `tau + 1` tokens and
+
+```
+t_window = (tau + 1) / decode_tok_per_s
+```
+
+The ledger confirms it: the adaptive run accepted 85 drafts over 42 windows
+(85/42 = 2.0238095238095237 exactly) and emitted 85 + 42 + 1 seed = 128 tokens.
+Dividing `tau` rather than `tau + 1` understates the window by a third; an
+earlier revision of this section did exactly that and its cost model was wrong.
+
+### Measured cost curve
 
 Two serve_harness runs on the golden fixture, identical except for
 `HIPFIRE_DSPARK_ADAPTIVE_BLOCK`:
 
 | | adaptive (B settles ~2) | `ADAPTIVE_BLOCK=0` (B=5) |
 | --- | ---: | ---: |
-| tau | 2.0238095238095237 | 3.2333333333333334 |
+| tau (accepted drafts) | 2.0238095238095237 | 3.2333333333333334 |
+| tokens per window | 3.0238 | 4.2333 |
 | decode tok/s | 39.034 | 32.535 |
 | windows | 42 | 30 |
-| implied window time | 51.85 ms | 99.38 ms |
+| t_window | 77.47 ms | 130.1 ms |
 
-tau rose 59.8% while throughput *fell* 16.6%. Solving the two points for a
-linear window cost:
+tau rose 59.8% while throughput *fell* 16.6%. Solving the two points:
 
 ```
-t_window(B) ~= 36.0 + 15.84 * (B - 1)   ms
+t_window(B) ~= 58.7 + 17.84 * (B - 1)   ms
 ```
 
-The marginal cost of one extra verify position is 15.84 ms, or 44% of the
-36.0 ms fixed cost. On a dense target that marginal term would be near zero.
-Here it is large enough that the block-size controller settling at B=2 is
-correct behaviour, not a missed opportunity, and it explains the previously
-measured -5.7% for pinned B=5 at k6.
+An extra verify position costs 17.84 ms against a 58.7 ms fixed cost. On a
+dense target that marginal term would be near zero. Here it is large enough
+that the controller settling at B=2 is correct behaviour, not a missed
+opportunity, and it explains the previously measured -5.7% for pinned B=5.
+
+### Authoritative phase split
+
+`HIPFIRE_DSPARK_PROFILE=1` over `dspark_bench` (k6, 35 windows). Note this
+instrument was unreachable until the `Drop` fix in the same series -- its emit
+hung off an explicit model unload that neither a signal-terminated daemon nor a
+returning example ever performed.
+
+| phase | mean/window | share |
+| --- | ---: | ---: |
+| bootstrap (initial-ctx seed capture) | 2.29 ms | 3.0% |
+| draft_block | 4.30 ms | 5.6% |
+| run_heads | 3.73 ms | 4.9% |
+| verify_block | 66.33 ms | 86.5% |
+| rest (accept + commit) | 0.01 ms | 0.0% |
+| **total** | **76.66 ms** | |
+
+Draft-side cost is `draft_block + run_heads` = 8.03 ms/window, **10.5%**.
+
+An earlier revision of this section put drafting at 1.11%, obtained by grouping
+the §3 rocprof capture on the drafter's `q8_0` quantisation. That number is
+wrong by roughly 9x and should not be reused. Two reasons: rocprof measures GPU
+kernel time while the draft phase is launch-latency-bound, so its wall time far
+exceeds its kernel time; and `run_heads` does not run `q8_0` kernels at all, so
+format-grouping missed it entirely.
 
 ### Per-depth acceptance
 
@@ -246,40 +286,28 @@ windows proposed the full 5.
 | 5 | 78.6% | 39.3% |
 
 There is no acceptance cliff. Per-depth accuracy stays in the 70-97% band all
-the way to depth 5; what kills deep blocks is the 15.84 ms/position verify
-cost, not drafter collapse.
+the way to depth 5; deep blocks die of verify cost, not drafter collapse.
 
-### Where that leaves the tau lever
+### The break-even acceptance bar
 
-The lever survives but relocates, from block *depth* to per-position *accuracy
-at depths 1-2*. At B=2 the window is 51.85 ms, so 45 tok/s requires
+Adding verify position k costs 17.84 ms and yields R(k) tokens, so it is worth
+taking only while it beats the target rate. For 45 tok/s (0.045 tok/ms):
 
 ```
-tau = 0.045 * 51.85 = 2.333        (from 2.024, i.e. +15%)
+R(k) > 0.045 * 17.84 = 0.803
 ```
 
-which at fixed depth means lifting depth-2 acceptance from roughly 79% to
-roughly 90%. Depth-1 is already 96.7% and has little left to give.
+**Every depth carried must accept at better than ~80%.** Measured R(1) = 96.7%
+clears it; R(2) = 76.7% sits just under; R(3) = 71.4% and below are well under.
 
-### The drafter budget is nearly unspent
+This is the sharpest statement of what is missing. Not "tau must reach some
+value" -- tau is bounded by B, and at B=2 the window already emits 3.02 of a
+possible 3.0 tokens, so B=2 is saturated. Reaching 45 requires carrying *more*
+depth, which requires clearing the 80.3% bar at each depth carried. Depth 2 is
+roughly three points short, and depth 3 about nine.
 
-Grouping the rocprof capture in §3 by quantisation format -- the drafter is
-`q8_0`, the target `mfp4g32`/`mq2` -- separates the two passes:
+With drafting at 10.5% of the window, a stronger drafter is affordable but not
+free: doubling draft-side cost adds 8.03 ms (+10.5% window) and must buy back
+more than that in acceptance. That trade -- not deeper blocks at current
+accuracy, and not further kernel work -- is the remaining path to 45 tok/s.
 
-| pass | ms | share |
-| --- | ---: | ---: |
-| draft (`gemv_q8_0`, `gemv_q8_0_wide`, `gemm_q8_0_wmma`) | 27.68 | **1.11%** |
-| target verify + shared | 2464.79 | 98.89% |
-
-269 draft dispatches in the whole run, roughly 5.7 GEMVs per window: this is an
-MTP-style head, not a small model, and the 5.79 GB sidecar is dominated by
-vocab-width matrices. Drafting currently costs about one percent of the
-machine, so a substantially stronger drafter at the *same* depth is affordable
-even if it costs several times as much. That -- not deeper blocks, and not
-further kernel work -- is the remaining path to 45 tok/s at k6.
-
-Caveat: the 1.11% split is derived from the `dspark_bench` rocprof capture
-(tau 2.065), not from serve, so treat it as approximate. The built-in
-`HIPFIRE_DSPARK_PROFILE` reporter would give an authoritative
-bootstrap/draft/heads/verify/rest split, but its summary prints on drop and the
-harness terminates the daemon with a signal, so it did not emit here.
