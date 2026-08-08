@@ -815,3 +815,33 @@ and a per-component negative control that corrupts only the candidate arm."
 SP2 is done when the spec's seven success criteria hold. At that point SP3 can assemble a ragged multi-slot forward pass from `SlotPool` plus the four slot-aware op families, without inventing any allocation.
 
 **What SP2 deliberately does not deliver:** a running forward pass or an end-to-end token. That is SP3, and the scope was chosen explicitly.
+
+---
+
+## Task 2 finding: RoPE slot-independence — CONFIRMED, no change required
+
+The spec predicted RoPE needs no slot awareness. Verified; **Tasks 3-6 may treat
+RoPE as slot-agnostic.**
+
+**Evidence.** All three batched entry points take only the q/k activation
+tensors, `positions`, head counts, `head_dim` and `batch_size` — **no KV cache
+buffer and no `max_seq` stride**, which is what a per-sequence offset would
+require:
+
+- `rope_batched_f32` — `crates/rdna-compute/src/norm.rs:658-667`
+- `rope_partial_interleaved_f32_batched` — `norm.rs:966-976`
+- `rope_interleaved_f32_batched` — `norm.rs:1063-1073`
+
+Kernel-side, `kernels/src/rope_batched.hip`:
+- `:18` `int b = blockIdx.y;` — the batch index IS the global flat row.
+- `:22` `int pos = positions[b];` — position comes from the global-row-indexed
+  array SP1 already established as authoritative.
+- `:33-42` q and k are indexed as `base + i`, where `base` derives from `b`.
+
+So RoPE transforms activations in the flat row layout *before* the cache write,
+and every buffer it touches is already global-row-indexed. Adding a descriptor
+would be inert.
+
+**Consequence for the plan:** no Task 3b is needed. The KV *write* (Task 3) is
+the only place in this chain that needs slot awareness, because it is the step
+that actually lands bytes in a per-slot slab.
