@@ -600,7 +600,7 @@ drafter in-regime for this request?"
    trained-regime declaration at all, that gap is the first thing to close —
    detection before correction.
 
-## 10. F16 compressor cache: merged, and gfx1151 needs one kernel ported
+## 10. F16 compressor cache: gfx1151 ported with generation-correct WMMA
 
 `ds4-gfx1201-opt` was merged (29 commits, principally 2830c5cd8 with
 certification 1019a0e56). It adds a selectable F16 compressor cache confining
@@ -610,15 +610,15 @@ footprint from 14,428,405,760 to 7,214,202,880 bytes per rank and roughly
 doubling admissible context (475,136 tokens against 229,376 on the matched F32
 bracket, three 34.2 GB ranks).
 
-On `gfx1151` it is refused at load:
+Before the port, `gfx1151` was refused at load:
 
 ```
 deepseek4: kv_cache=f16 currently requires gfx1201 MQ2R TP3/TP4.
 GPU: gfx1151 (13532 MB free / 98304 MB total)
 ```
 
-This is the fifth encounter with the "kernel gated to another architecture"
-seam, and the second where the answer is *port*, not *re-gate*:
+This was the fifth encounter with the "kernel gated to another architecture"
+seam, and the second where the answer was *port*, not *re-gate*:
 
 | kernel | gfx12-only intrinsics | verdict |
 | --- | --- | --- |
@@ -648,7 +648,7 @@ to F32 — is where the speed would come from, and that is downstream of the por
 
 ### Ported: F16 compressor cache runs on gfx1151, free
 
-The port was done and measured. Three changes were needed, not one:
+The port was done and measured. Four changes were needed, not one:
 
 1. **Kernel.** The indexer score WMMA is now generation-selected in-source. The
    two generations take different fragment layouts, so both the staging and the
@@ -660,9 +660,9 @@ The port was done and measured. Three changes were needed, not one:
           D row = 2*j + k_half
    ```
 
-2. **Nine wrapper guards.** The loader gates admitted gfx1151 but every
+2. **Eleven wrapper guards.** The loader gates admitted gfx1151 but every
    per-kernel wrapper still asserted `is_gfx1201()`, so the first run panicked
-   at `attention.rs:8859` with `gen=0`. Widened exactly the nine wrappers
+   at `attention.rs:8859` with `gen=0`. Widened exactly the eleven wrappers
    compiling from the two verified-portable sources; the sharded/TP wrappers in
    the same files keep their gfx1201 assert.
 
@@ -670,6 +670,12 @@ The port was done and measured. Three changes were needed, not one:
    cosmetic: `scripts/compile-kernels.sh` treats `\.gfx[0-9]+\.hip$` as a
    variant tag, so an arch-suffixed file is AOT-compiled only for that arch and
    everything else silently falls back to JIT.
+
+4. **Capability and symbol cleanup.** The admission gate is the union of the
+   actual intrinsic capabilities: `has_wmma_w32` for gfx11 and
+   `has_wmma_w32_gfx12` for gfx12. It must not require the gfx11 bit while also
+   claiming to admit RDNA4. The last dual-arch wrapper also lost its stale
+   `_gfx1201` suffix.
 
 Measured on the golden fixture, warm kernels:
 
@@ -689,6 +695,15 @@ newly-named kernels inside the measured window — the AOT cache had no entry fo
 the new file names. The second run, with `.hipfire_kernels/gfx1151` warm,
 matched F32. Any kernel rename invalidates that cache, so the run immediately
 following one is not a valid measurement.
+
+The committed 8K NIAH fixture (`ctx=5427`) also showed no warm throughput
+penalty: F16 decoded at 20.6074 tok/s and F32 at 20.6186 tok/s. That fixture is
+not a valid exact-retrieval gate for this checkpoint: F16 returned
+`mauve-velocirapto-7741`, while the F32 baseline returned
+`mauve-velocirapt-7741`; both miss the expected `mauve-velociraptor-7741`.
+Consequently the byte-identical claim above is scoped to the short golden
+fixture, while the long-context evidence establishes coherent execution and
+throughput parity rather than exact output parity.
 
 ### Sub-F16 kv selectors now redirect instead of failing
 
