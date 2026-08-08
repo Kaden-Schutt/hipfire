@@ -892,3 +892,35 @@ protection here, and SP3/SP4 should not assume it does.
 Task 4) will trip `ci-rustfmt-changed.sh`'s whole-file check the first time that
 file appears in a PR diff. Not caused by SP2. Fix with
 `./scripts/fmt-changed.sh`, not bare `cargo fmt`.
+
+## Task 6 finding: the DeltaNet per-slot STRIDE design was unsound — rejected
+
+SP2 Task 6's harness caught that `s_ef_residual` was never slot-strided. Chasing
+it surfaced a second, larger defect in the same design, and together they
+retire the stride approach:
+
+1. **One stride cannot serve both buffers.** `s_q8` is `[n_heads x HD x HD]` per
+   slot; `s_scales` is `[n_heads x HD]` — a factor of HD (128) apart. Applying
+   the `s_q8` stride to `s_scales` would index slot 1 at **524,288 elements into
+   a buffer holding 4,096 per slot**.
+2. **`s_ef_residual` was never strided**, so every slot would alias slot 0's
+   error-feedback residual.
+
+**Neither ever reached production**: no caller passed a non-zero stride, and
+legacy mode (stride 0, null `row_slot`) is bitwise unchanged.
+
+**The correct design needs no stride at all.** DeltaNet state is fixed-size and
+per-slot independent, and one launch already advances exactly ONE slot — so the
+caller passes **that slot's own state tensors** to the existing
+`gated_delta_net_q8_batch_seq`. SP3 already holds one `DeltaNetState` per slot
+(`dn_states: &mut [DeltaNetState]`) for exactly this reason.
+
+`gated_delta_net_q8_batch_seq_slots` now **asserts `s_stride_elems == 0`** so the
+unsound path cannot be used silently. The kernel-side stride code is retained
+but inert.
+
+**The lesson generalises:** DeltaNet looked like it needed the same
+descriptor/stride treatment attention got, because it has the same
+multi-token/single-sequence shape. It does not — attention needs a descriptor
+because slots share one growing arena; DeltaNet slots share nothing. Applying a
+pattern by analogy rather than by need cost two latent bugs.

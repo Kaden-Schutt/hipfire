@@ -2571,9 +2571,38 @@ impl Gpu {
         // (and chunk-boundary) error — consistent with the per-token decode/replay.
         ef_residual: Option<&GpuTensor>,
         row_slot: Option<&GpuTensor>,
+        // RETAINED FOR ABI ONLY — must be 0. See the rejection below.
         s_stride_elems: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+
+        // The per-slot STRIDE design is unsound and is rejected rather than
+        // silently miscomputing. Two independent defects, both found before any
+        // caller existed:
+        //
+        //   1. ONE stride cannot serve both buffers. `s_q8` is
+        //      [n_heads x HD x HD] per slot while `s_scales` is [n_heads x HD]
+        //      — a factor of HD (128) apart. Applying the s_q8 stride to
+        //      s_scales would index slot 1 at 524,288 elements into a buffer
+        //      holding 4,096 per slot: a large out-of-bounds read.
+        //   2. `s_ef_residual` was never strided at all, so every slot would
+        //      alias slot 0's error-feedback residual.
+        //
+        // The correct design needs no stride. DeltaNet state is fixed-size and
+        // per-slot independent, and one launch already advances exactly ONE
+        // slot, so the caller simply passes THAT SLOT'S OWN state tensors to
+        // the existing `gated_delta_net_q8_batch_seq`. SP3 holds one
+        // `DeltaNetState` per slot for precisely this reason.
+        //
+        // Legacy behaviour is unaffected: stride 0 with a null `row_slot` is
+        // bitwise identical to the pre-SP2 path.
+        assert_eq!(
+            s_stride_elems, 0,
+            "gated_delta_net_q8_batch_seq_slots: the per-slot stride design is \
+             unsound (s_q8 and s_scales strides differ by HD; s_ef_residual was \
+             never strided). Pass each slot's own DeltaNetState tensors to \
+             gated_delta_net_q8_batch_seq instead — one launch advances one slot."
+        );
         let use_fast = !dn_requant_per_token();
         if row_slot.is_some() && !use_fast {
             return Err(hip_bridge::HipError::new(
