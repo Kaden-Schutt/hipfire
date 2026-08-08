@@ -2294,6 +2294,25 @@ impl Gpu {
         })
     }
 
+    /// Allocate a stable HMM tensor for an explicitly slow/paged tier. Managed
+    /// tensors bypass the device allocation pool on free.
+    pub fn alloc_managed_tensor(&mut self, shape: &[usize], dtype: DType) -> HipResult<GpuTensor> {
+        self.bind_thread()?;
+        let numel = shape
+            .iter()
+            .try_fold(1usize, |product, &dimension| product.checked_mul(dimension))
+            .ok_or_else(|| HipError::new(0, "managed tensor element count overflowed"))?;
+        let byte_size = numel
+            .checked_mul(dtype.size())
+            .ok_or_else(|| HipError::new(0, "managed tensor byte size overflowed"))?;
+        let buf = self.hip.malloc_managed(byte_size)?;
+        Ok(GpuTensor {
+            buf,
+            shape: shape.to_vec(),
+            dtype,
+        })
+    }
+
     /// Reserve a dense virtual tensor and optionally map its initial prefix.
     /// The returned tensor follows the normal kernel ABI, but its ownership is
     /// registered separately so `free_tensor` releases VMM handles instead of
@@ -2707,6 +2726,8 @@ impl Gpu {
                 0,
                 &format!("refusing to pool non-owning tensor at 0x{key:x}"),
             ))
+        } else if tensor.buf.is_managed() {
+            self.hip.free(tensor.buf)
         } else {
             self.pool.free(tensor.buf);
             Ok(())

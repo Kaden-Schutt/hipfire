@@ -938,7 +938,7 @@ impl HipRuntime {
         Ok(DeviceBuffer {
             ptr,
             size,
-            ownership: crate::DeviceBufferOwnership::HipMalloc,
+            ownership: crate::DeviceBufferOwnership::Managed,
         })
     }
 

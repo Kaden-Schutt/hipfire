@@ -1631,30 +1631,15 @@ fn load_model_ep_ds4(path: &str, max_seq: usize, tp: usize) -> Result<LoadedMode
             .iter()
             .all(|device| device.arch_caps.is_gfx1201());
     if gfx1201_mq2r_tp {
-        let device_ids: Vec<i32> = staging
-            .gpus
-            .as_ref()
-            .expect("staging gpus present")
-            .devices
-            .iter()
-            .map(|device| device.device_id)
-            .collect();
-        for (rank, state) in staging.state.iter_mut().enumerate() {
-            let shard = deepseek4::CompressorCacheShard::new(
-                rank,
-                tp,
-                deepseek4::CompressorCacheShard::GFX1201_BLOCK_ROWS,
-            )?;
-            state.compressor_cache_placement =
-                deepseek4::CompressorCachePlacement::BlockCyclic(shard);
-            state.compressor_cache_access_count = device_ids.len();
-            state.compressor_cache_access_devices[..device_ids.len()].copy_from_slice(&device_ids);
-        }
+        // Keep compressor caches replicated and device-local on the normal
+        // path. Peer-reading the block-cyclic experiment was exact but reduced
+        // 21K NIAH decode from 41.15 to 11.10 tok/s. Capacity growth may add a
+        // managed overflow tail, but never changes the local prefix route.
         // B=1024 is the certified short-context throughput schedule. At a
         // declared long-context ceiling, B=512 gives back about 1.34 GiB/rank
         // while retaining most grouped-MoE occupancy. At the advertised 1M
-        // horizon, B=128 gives the block-cyclic F32 cache enough physical
-        // headroom without changing user-facing configuration.
+        // horizon, B=128 reserves room for cache growth without changing
+        // user-facing configuration.
         const SHORT_CONTEXT_BATCH: usize = 1024;
         const LONG_CONTEXT_BATCH: usize = 512;
         const EXTREME_CONTEXT_BATCH: usize = 128;

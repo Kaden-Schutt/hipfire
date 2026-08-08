@@ -5433,12 +5433,12 @@ pub fn forward_ep(
     position: u32,
 ) -> Result<(), String> {
     let n = gpus.devices.len();
-    if matches!(
-        state_per_rank
-            .first()
-            .map(|state| state.compressor_cache_placement),
-        Some(crate::deepseek4::CompressorCachePlacement::BlockCyclic(_))
-    ) {
+    if state_per_rank.len() == n
+        && gpus
+            .devices
+            .iter()
+            .all(|device| compressor_cache_uses_vmm(device))
+    {
         for rank in 0..n {
             gpus.devices[rank]
                 .bind_thread()
