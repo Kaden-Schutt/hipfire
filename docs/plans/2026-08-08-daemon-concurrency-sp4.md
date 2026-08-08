@@ -27,7 +27,7 @@
 
   | model | weights | KV/token | 4 agents × 128K | 4 × 96K |
   |---|---|---|---|---|
-  | `qwen3.6:27b` | 15.0 GB | 34 KB | 33.25 GB — **does not fit** | 28.69 GB — fits |
+  | `qwen3.6:27b` | 15.0 GiB | 34 KiB | **exactly 32 GiB — zero headroom, rejected** | 28.7 GiB — fits |
   | `qwen3.6:35b-a3b` | ~20 GB | 10.6 KB | 25.8 GB — fits | 24.4 GB — fits |
 
   asym3 would have relaxed the 27B's limit but was **rejected on quality** (~30% of top-1 token choices change), so the cap is real, not temporary.
@@ -101,7 +101,9 @@ mod tests {
 
     #[test]
     fn the_27b_cannot_take_four_agents_at_128k() {
-        // 15 GB + 4 x 4.25 GB = 32.25 GB against a 32 GB card.
+        // 15 GiB + 4 x 4.25 GiB is an EXACT TIE with 32 GiB. Zero headroom is a
+        // rejection: nothing would remain for activations, scratch or driver
+        // overhead. Hence `need >= available` in the implementation, not `>`.
         let mut a = AdmissionController::new(f27b(), 32 * GIB);
         for _ in 0..3 {
             a.admit(128 * 1024).expect("first three must fit");
@@ -145,7 +147,9 @@ mod tests {
         }
         match a.admit(128 * 1024).unwrap_err() {
             AdmitError::WouldExceedBudget { need, available } => {
-                assert!(need > available, "need {need} should exceed available {available}");
+                // `>=`, not `>` -- the 4-agent 128K case lands exactly on the
+                // budget, so a strict inequality is unsatisfiable there.
+                assert!(need >= available, "need {need} should be at least available {available}");
                 assert!(available < 32 * GIB);
             }
             other => panic!("expected a budget rejection, got {other:?}"),

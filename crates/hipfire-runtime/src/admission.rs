@@ -173,7 +173,16 @@ mod tests {
         }
         match a.admit(128 * 1024).unwrap_err() {
             AdmitError::WouldExceedBudget { need, available } => {
-                assert!(need > available, "need {need} should exceed available {available}");
+                // `>=`, not `>`. Zero headroom is a rejection: 15 GiB of weights
+                // plus 4 x 4.25 GiB of KV is an EXACT tie with a 32 GiB budget,
+                // and a card with nothing left for activations, scratch and
+                // driver overhead does not fit the workload. The plan's comment
+                // claiming 32.25 GB was wrong -- 34 * 1024 IS the real per-token
+                // cost and the sum lands exactly on the budget.
+                assert!(
+                    need >= available,
+                    "need {need} should be at least available {available}"
+                );
                 assert!(available < 32 * GIB);
             }
             other => panic!("expected a budget rejection, got {other:?}"),
