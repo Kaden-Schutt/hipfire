@@ -202,6 +202,9 @@ pub struct FeatureFlags {
     /// Capture a pure-decode multi-slot step into a hipGraph and replay it
     /// (`HIPFIRE_SLOTS_DECODE_GRAPH`). Off by default.
     pub slots_decode_graph: bool,
+    /// Trace multi-slot session continuation matching (`HIPFIRE_SLOT_TRACE`).
+    /// Diagnostic only.
+    pub slot_trace: bool,
 
     // ── Kernels.rs env reads ───────────────────────────────────────
     pub lloyd_force_baseline: bool,
@@ -488,6 +491,7 @@ impl FeatureFlags {
             attn_tile_size: parse_usize("HIPFIRE_ATTN_TILE_SIZE"),
             slots_attn_crossover: parse_usize("HIPFIRE_SLOTS_ATTN_CROSSOVER"),
             slots_decode_graph: value("HIPFIRE_SLOTS_DECODE_GRAPH").ok().as_deref() == Some("1"),
+            slot_trace: value("HIPFIRE_SLOT_TRACE").ok().as_deref() == Some("1"),
 
             // Kernels.rs
             lloyd_force_baseline: value("HIPFIRE_LLOYD_FORCE_BASELINE").ok().as_deref()
@@ -703,6 +707,7 @@ impl FeatureFlags {
             attn_tile_size: None,
             slots_attn_crossover: None,
             slots_decode_graph: false,
+            slot_trace: false,
             lloyd_force_baseline: false,
             rdna2_variant: None,
             hipcc_extra_flags: String::new(),

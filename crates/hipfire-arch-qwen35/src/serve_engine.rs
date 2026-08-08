@@ -453,7 +453,7 @@ fn admit(
     // replay, and re-encoding the decoded reply is not guaranteed to round
     // trip. Reuse also keeps the DeltaNet state, which is the point.
     if !req.continuation.is_empty() {
-        if std::env::var("HIPFIRE_SLOT_TRACE").is_ok() {
+        if rig.gpu.slot_trace() {
             eprintln!(
                 "[slot-trace] continuation attempt: convo={:?} suffix={} tokens",
                 req.convo,
@@ -510,7 +510,7 @@ fn admit(
                 }
             }
         }
-        if std::env::var("HIPFIRE_SLOT_TRACE").is_ok() {
+        if rig.gpu.slot_trace() {
             eprintln!("[slot-trace] continuation MISS -- falling back to cold prefill");
         }
     }

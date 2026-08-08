@@ -685,8 +685,15 @@ pub fn gen_fwht_signs(seed: u32, n: usize) -> Vec<f32> {
 }
 
 impl Gpu {
+    /// Diagnostic: trace multi-slot session continuation matching.
+    pub fn slot_trace(&self) -> bool {
+        // bind_thread: skip — pure flag read, touches no device state.
+        self.flags.slot_trace
+    }
+
     /// Whether the multi-slot decode step should be hipGraph-captured.
     pub fn slots_decode_graph(&self) -> bool {
+        // bind_thread: skip — pure flag read, touches no device state.
         self.flags.slots_decode_graph
     }
 
@@ -697,6 +704,7 @@ impl Gpu {
     /// stream stays installed afterwards: every later launch simply goes to it
     /// instead of the null stream.
     pub fn ensure_capture_stream(&mut self) -> HipResult<()> {
+        self.bind_thread()?;
         if self.active_stream.is_none() {
             self.active_stream = Some(self.hip.stream_create()?);
         }
@@ -710,6 +718,7 @@ impl Gpu {
     /// this crate launches during capture must already be warm -- a kernel
     /// compile mid-capture is exactly the kind of call the mode forbids.
     pub fn begin_stream_capture(&mut self) -> HipResult<()> {
+        self.bind_thread()?;
         let stream = self.active_stream.as_ref().ok_or_else(|| {
             hip_bridge::HipError::new(0, "begin_stream_capture: no active stream")
         })?;
@@ -718,6 +727,7 @@ impl Gpu {
 
     /// Close the capture started by `begin_stream_capture`.
     pub fn end_stream_capture(&mut self) -> HipResult<hip_bridge::Graph> {
+        self.bind_thread()?;
         let stream = self
             .active_stream
             .as_ref()
@@ -727,6 +737,7 @@ impl Gpu {
 
     /// Launch a previously instantiated graph on this `Gpu`'s stream.
     pub fn launch_graph(&mut self, exec: &hip_bridge::GraphExec) -> HipResult<()> {
+        self.bind_thread()?;
         let stream = self
             .active_stream
             .as_ref()
@@ -1785,6 +1796,7 @@ impl Gpu {
     /// increases `max_tiles` and therefore the `partials` bytes each query row
     /// needs, which can exceed buffers sized elsewhere against the 128 default.
     pub fn attn_tile_size(&self) -> usize {
+        // bind_thread: skip — pure flag read, touches no device state.
         static CACHE: OnceLock<usize> = OnceLock::new();
         *CACHE.get_or_init(|| {
             self.flags
@@ -1797,6 +1809,7 @@ impl Gpu {
     /// Multi-slot attention flash-vs-scalar crossover override, in tokens.
     /// `None` leaves the per-arch default in place.
     pub fn slots_attn_crossover(&self) -> Option<usize> {
+        // bind_thread: skip — pure flag read, touches no device state.
         self.flags.slots_attn_crossover
     }
 
