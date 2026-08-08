@@ -243,11 +243,58 @@ across slots is 2.07x.
   could also win at B=1 with the tuned kernel's buffer-load strategy is
   untested.
 - Contexts beyond 4096 and slot counts beyond 4 are unmeasured.
-- **Launch gaps are now the third-largest term: 5.08 ms/step, 12.6% of wall,
-  across 1393 dispatches per step.** hipGraph capture of the decode step is the
-  obvious next target and is the largest remaining non-MoE item.
+- ~~Launch gaps~~ **Closed: there were none.** See "The launch-gap that wasn't".
 - MoE grouped MMQ is 35.7% of the step at ~120 GB/s effective. It is the floor
   for this model — four slots picking top-8 of 256 experts overlap only ~5% —
   but the bandwidth gap suggests some headroom in the kernel itself.
 - The gfx1151 crossover is measured at 4096 tokens and a wash near 1086; the
   region between is unmeasured, and no other arch was measured at all.
+
+## The launch-gap that wasn't (2026-08-08)
+
+The kernel trace showed 9.29 ms/step of GPU idle across 658 gaps, and host
+submission measured 4.16 ms/step over 1391 launches. That read as a GPU starved
+by submission, so the decode step was hipGraph-captured and replayed.
+
+It works — output is byte-identical across all 4 slots, and host submission
+falls from 3.9 ms/step over 1391 launches to 0.15 ms/step over 72. It is also
+worth nothing in wall time. Interleaved A/B, 3 reps, 4 slots at 4096 tokens:
+
+| | rep 1 | rep 2 | rep 3 | mean |
+|---|---|---|---|---|
+| graphs off | 31.90 | 31.64 | 31.38 | 31.64 ms |
+| graphs on | 31.67 | 32.31 | 31.73 | 31.90 ms |
+
+**The idle was the profiler.** rocprofv3 adds per-dispatch overhead; 1394
+dispatches x ~6.7 us is ~9.3 ms, which is both the "idle" and the gap between
+the profiled step (40.47 ms) and the unprofiled one (31.64 ms). GPU busy time
+was 31.18 ms against a 31.64 ms real step — the decode step is GPU-bound with
+almost no idle to reclaim. Removing 96% of submission cost changed nothing
+because nothing was waiting on it.
+
+This independently reproduces the earlier ds4 finding that graph capture buys
+~0 on gfx1151.
+
+**Method note:** rocprofv3 cannot compare the two paths — it instruments every
+graph node, so a replayed step profiles at 78 ms against 32 ms unprofiled. Only
+GPU-busy time is comparable across those traces. More generally, treat trace
+"idle" as an upper bound that includes the tool's own cost, and confirm any gap
+against unprofiled wall time before building anything to close it.
+
+The capture path is kept behind `HIPFIRE_SLOTS_DECODE_GRAPH` (default off): the
+CPU it frees is real even though the GPU does not care, and the hoisting it
+forced (`upload_step_inputs`, `advance_slot_seq_lens`) is better structure
+regardless.
+
+### Where the decode step actually goes
+
+Per-kernel shares from the trace remain valid (per-dispatch overhead inflates
+gaps, not kernel durations). Of ~31 ms of GPU-busy time at 4 slots:
+
+- MoE grouped MMQ 12.6 ms (36%) — the model's own weight traffic, ~5% expert
+  overlap across slots, so no dedup win
+- attention 5.9 ms (17%)
+- qkvza 2.9 ms, DeltaNet 2.8 ms, o_proj 2.3 ms, lm_head 1.5 ms
+
+The step is bandwidth-bound on expert weights. Further gains have to come from
+reading fewer or smaller expert bytes, not from scheduling.
