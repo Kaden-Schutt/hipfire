@@ -114,7 +114,65 @@ invalidated the expert-spill idea.
 - **Testing concurrency on a shared dev box is hard.** Several resident sessions
   is precisely the state that exhausts this machine, and one resident model
   already takes MemAvailable from ~58 GiB to ~19 GiB.
-- **The end-to-end win is unmeasured.** SP1 measured only the attention term
-  (~1.36× at 8 slots). Aggregate throughput across a full forward — where weight
-  reads amortise and MoE expert reads mostly do not — is still projected, not
-  measured. SP4 is where it finally becomes measurable.
+- ~~**The end-to-end win is unmeasured.**~~ **Measured — see §7.**
+
+## 7. Measured end-to-end throughput (2026-08-08)
+
+First full-forward measurement, closing the §6 risk. gfx1151 (Strix Halo dev
+box), `qwen3.6-35b-a3b.mq4r`, 4096-token context per slot, 512-token prefill
+chunks, 48 generated tokens per slot, first decode step discarded as warmup.
+Harness: `demo_multislot_generate` with `TARGET_PROMPT_TOKENS=4096
+PREFILL_CHUNK=512`.
+
+| slots | decode ms/step | aggregate decode | per slot | prefill (total) |
+|---|---|---|---|---|
+| 1 | 22.77 | 43.92 tok/s | 43.92 | 3.9 s |
+| 2 | 34.38 | 58.17 tok/s | 29.09 | 7.6 s |
+| 3 | 40.22 | 74.59 tok/s | 24.86 | 11.1 s |
+| 4 | 47.82 | 83.65 tok/s | 20.91 | 14.6 s |
+
+**1.90× aggregate at 4 concurrent agents.** Marginal cost is ~8.3 ms per added
+slot against a ~14 ms fixed step cost, so the curve is still climbing at 4.
+
+Read this as the shape of the win, not as an R9700 number: gfx1151 is unified
+memory and gfx1201 is not, and the two arches take different attention
+dispatches (see below). The programme's target hardware remains unmeasured.
+
+### What this measurement found
+
+Batching was initially *negative* at 2 users — 34.95 tok/s against 43.19 at 1
+user — because every decode step with 2+ active slots dispatched the WMMA
+flash-*prefill* kernel on a batch of `active_slots` rows, against a 16-row
+tile. A flat ~21 ms per-step penalty. Fixed in `bbe244b5` by gating the tile
+path on `n > active_slots` (prefill work remains) rather than on
+`active_slots > 1`.
+
+Two traps worth recording, both of which produced a confident wrong answer
+before being caught:
+
+- `HIPFIRE_FLASH_PREFILL=0` moves the reference arm *and* the candidate arm,
+  so a golden-gate pass under it does not show that two kernels agree — it
+  shows that one kernel agrees with itself.
+- A diagnostic flag forcing the multi-slot path at one active slot produced a
+  plausible-looking 22.75 ms/step, from a state
+  (`single_slot=None, n_tiles=None, eligible=true`) production never reaches
+  and whose output was wrong by 225× tolerance. Reverted rather than kept.
+
+### Confirmed, not projected
+
+- The gfx1201 dispatch outcome — `q8_flash_prefill_wmma_eligible` requires
+  `!has_wmma_w32_gfx12()`, so on the R9700 the tile path never fires and the
+  descriptor path runs unaided — passes the golden gate 10/10 at 0.000×. The
+  deployment target's path is correct, though still unmeasured for speed.
+- Prefill genuinely wants the WMMA kernel: 14.6 s against 19.2 s at 4 slots
+  with the path disabled outright.
+
+### Follow-ups
+
+- The tile path's profitability crossover between `WMMA_M_TILE` and full
+  prefill chunks is unmeasured; only the two endpoints are known.
+- Per-slot lm_head is a separate `Step::Gemv` per slot over a 248320-row
+  vocabulary — roughly the whole ~8.3 ms marginal per-slot cost. Batching it
+  into one GEMM over `n_slots` rows is the obvious next win and would flatten
+  the marginal term.
+- Contexts beyond 4096 and slot counts beyond 4 are unmeasured.
