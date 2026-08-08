@@ -20,6 +20,17 @@
 
 use rdna_compute::{DType, Gpu};
 
+/// The VRAM budget this harness measures against. `kv_slots::preflight_alloc`
+/// takes it as a parameter because production `src/` may not read HIPFIRE_*
+/// directly (scripts/check-env-docs.py); examples are exempt, so the override
+/// is read here.
+fn vram_budget_bytes() -> u64 {
+    std::env::var("HIPFIRE_VRAM_BUDGET_BYTES")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(rdna_compute::kv_slots::R9700_VRAM_BYTES)
+}
+
 fn env_usize(k: &str, d: usize) -> usize {
     std::env::var(k)
         .ok()
@@ -64,7 +75,7 @@ fn time_ms(gpu: &mut Gpu, warmups: usize, iters: usize, f: &dyn Fn(&mut Gpu)) ->
 /// anyway (a hand-rolled assert here would just re-introduce the exact
 /// footgun this gate replaces).
 fn preflight_or_skip(total_alloc_bytes: u64, what: &str) -> bool {
-    match rdna_compute::kv_slots::preflight_alloc(total_alloc_bytes, what) {
+    match rdna_compute::kv_slots::preflight_alloc(total_alloc_bytes, vram_budget_bytes(), what) {
         Ok(()) => true,
         Err(e) => {
             eprintln!("SKIP: {e}");
@@ -103,7 +114,7 @@ fn main() {
     // multi-slot section, because this buffer was already too small
     // upstream). Resolved up front so both the preflight estimate below and
     // the actual `partials` allocation further down use the identical value.
-    let tile = rdna_compute::kv_slots::attn_tile_size();
+    let tile = gpu.attn_tile_size();
     let max_tiles = ctx.div_ceil(tile);
 
     // This section's own allocations, checked against the same gate the new
@@ -271,7 +282,7 @@ fn main() {
     let bw_hd = env_usize("HD", 256);
     let bw_nh = env_usize("NH", 16); // MUST mirror bench_slots' own NH resolution
     let bw_per_pos_bytes = (bw_nkv * (bw_hd / 32) * 34) as f64;
-    let bw_tile = rdna_compute::kv_slots::attn_tile_size();
+    let bw_tile = gpu.attn_tile_size();
     for &n_slots in &[1usize, 2, 4, 8] {
         let per_slot_ctx = env_usize("SLOT_CTX", 32768);
         let shape = vec![per_slot_ctx; n_slots];
@@ -405,7 +416,7 @@ fn bench_slots(gpu: &mut Gpu, seq_lens: &[usize], m_per_slot: &[usize]) -> Optio
     // the launcher's own resolution undersizes `partials` and corrupts
     // device memory (empirically: illegal memory access at TILE_SIZE=64
     // before this was unified).
-    let max_tiles = max_ctx.div_ceil(rdna_compute::kv_slots::attn_tile_size());
+    let max_tiles = max_ctx.div_ceil(gpu.attn_tile_size());
 
     // Preflight (host RAM + 32 GiB target budget), computed analytically
     // from host-side sizes BEFORE any upload — see module doc.

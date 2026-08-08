@@ -227,17 +227,10 @@ pub fn build_tiles(
 // section for the illegal-memory-access this caused). Every caller that
 // needs this value MUST go through this function instead of re-deriving it.
 
-/// Resolve the batched-attention tile size from `HIPFIRE_ATTN_TILE_SIZE`,
-/// falling back to 128 when unset, non-numeric, zero, or not a multiple of
-/// 32. gfx1151 is the dev box; gfx1201 is the deployment target — never bake
-/// a tuned constant into a `const` (spec §11).
-pub fn attn_tile_size() -> usize {
-    std::env::var("HIPFIRE_ATTN_TILE_SIZE")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .filter(|&t: &usize| t > 0 && t % 32 == 0)
-        .unwrap_or(128)
-}
+// NOTE: the batched-attention tile size resolver lives on `Gpu::attn_tile_size()`
+// (crates/rdna-compute/src/dispatch.rs), not here. `kv_slots` is production
+// `src/`, where scripts/check-env-docs.py forbids direct HIPFIRE_* reads —
+// they must route through a central config reader (feature_flags.rs).
 
 // ── Memory preflight ────────────────────────────────────────────────────────
 //
@@ -280,12 +273,14 @@ pub fn mem_available_bytes() -> Option<u64> {
 /// not a single buffer. Returns `Err` with an actionable message; callers should
 /// skip the configuration rather than proceed.
 ///
-/// Budget override: `HIPFIRE_VRAM_BUDGET_BYTES`.
-pub fn preflight_alloc(planned_bytes: u64, what: &str) -> Result<(), String> {
-    let budget = std::env::var("HIPFIRE_VRAM_BUDGET_BYTES")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(R9700_VRAM_BYTES);
+/// `budget_bytes` is the deployment-target VRAM ceiling; pass
+/// [`R9700_VRAM_BYTES`] unless a harness deliberately overrides it. It is a
+/// parameter rather than an env read because the budget is *harness policy*,
+/// and `kv_slots` is production `src/`, where direct HIPFIRE_* reads are
+/// forbidden by scripts/check-env-docs.py. Harnesses live in `examples/`,
+/// which is exempt, so they read any override there and pass it in.
+pub fn preflight_alloc(planned_bytes: u64, budget_bytes: u64, what: &str) -> Result<(), String> {
+    let budget = budget_bytes;
 
     let gib = |b: u64| b as f64 / 1073741824.0;
 
@@ -334,14 +329,14 @@ mod tests {
     fn preflight_refuses_over_target_budget() {
         // 64 GiB against the 32 GiB R9700 target: must refuse even though this
         // dev box has 125 GiB.
-        let e = preflight_alloc(64 * 1024 * 1024 * 1024, "test").unwrap_err();
+        let e = preflight_alloc(64 * 1024 * 1024 * 1024, R9700_VRAM_BYTES, "test").unwrap_err();
         assert!(e.contains("deployment target"), "unexpected message: {e}");
     }
 
     #[test]
     fn preflight_allows_a_small_allocation() {
         // 64 MiB is under budget and under any plausible MemAvailable.
-        assert!(preflight_alloc(64 * 1024 * 1024, "test").is_ok());
+        assert!(preflight_alloc(64 * 1024 * 1024, R9700_VRAM_BYTES, "test").is_ok());
     }
 
     #[test]

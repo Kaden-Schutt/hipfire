@@ -1725,6 +1725,26 @@ impl Gpu {
         })
     }
 
+    /// Batched-attention tile size, from `HIPFIRE_ATTN_TILE_SIZE`.
+    ///
+    /// Falls back to 128 when unset, zero, or not a multiple of 32. This is the
+    /// single resolver for the whole crate — three hand-mirrored copies of this
+    /// logic previously caused silent device-memory corruption when one of them
+    /// drifted (see docs/plans/2026-08-07-batched-attention-slots.md).
+    ///
+    /// Directional safety note: RAISING the tile is always safe. LOWERING it
+    /// increases `max_tiles` and therefore the `partials` bytes each query row
+    /// needs, which can exceed buffers sized elsewhere against the 128 default.
+    pub fn attn_tile_size(&self) -> usize {
+        static CACHE: OnceLock<usize> = OnceLock::new();
+        *CACHE.get_or_init(|| {
+            self.flags
+                .attn_tile_size
+                .filter(|&t| t > 0 && t % 32 == 0)
+                .unwrap_or(128)
+        })
+    }
+
     /// Pre-compile a batch of kernels in parallel (hipcc), then load modules + functions.
     /// Each entry is (module_name, source, func_name). Turbo kernels should have
     /// TURBO_COMMON_H already prepended in their source.

@@ -190,6 +190,10 @@ pub struct FeatureFlags {
     pub rocblas_all_archs: bool,
     pub rocblas_off: bool,
     pub rocblas_min_batch: Option<usize>,
+    /// Batched-attention tile size (`HIPFIRE_ATTN_TILE_SIZE`). `None` = use the
+    /// 128 default. gfx1151 is the dev box, gfx1201 the deployment target, so
+    /// this must never be a baked-in `const` (spec §11).
+    pub attn_tile_size: Option<usize>,
 
     // ── Kernels.rs env reads ───────────────────────────────────────
     pub lloyd_force_baseline: bool,
@@ -473,6 +477,7 @@ impl FeatureFlags {
             rocblas_all_archs: value("HIPFIRE_ROCBLAS_ALL_ARCHS").ok().as_deref() == Some("1"),
             rocblas_off: value("HIPFIRE_ROCBLAS_OFF").ok().as_deref() == Some("1"),
             rocblas_min_batch: parse_usize("HIPFIRE_ROCBLAS_MIN_BATCH"),
+            attn_tile_size: parse_usize("HIPFIRE_ATTN_TILE_SIZE"),
 
             // Kernels.rs
             lloyd_force_baseline: value("HIPFIRE_LLOYD_FORCE_BASELINE").ok().as_deref()
@@ -685,6 +690,7 @@ impl FeatureFlags {
             rocblas_all_archs: false,
             rocblas_off: false,
             rocblas_min_batch: None,
+            attn_tile_size: None,
             lloyd_force_baseline: false,
             rdna2_variant: None,
             hipcc_extra_flags: String::new(),

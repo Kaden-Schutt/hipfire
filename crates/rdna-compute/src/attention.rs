@@ -3820,7 +3820,7 @@ impl Gpu {
         // caller of this value must share (see that function's doc comment
         // for the corruption bug three independent copies of this exact
         // logic caused).
-        let tile_size: usize = crate::kv_slots::attn_tile_size();
+        let tile_size: usize = self.attn_tile_size();
         const WMMA_BLOCK_M: usize = 16;
         let max_tiles = (max_ctx_len + tile_size - 1) / tile_size;
         let stride = 2 + head_dim;
