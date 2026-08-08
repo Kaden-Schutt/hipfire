@@ -5089,7 +5089,11 @@ impl Qwen35Scratch {
                     config.head_dim,
                     kv_max_seq,
                 )
-                .min(128);
+                .min(128)
+                // See llama.rs: also floor against the batched-attention tile,
+                // since a smaller HIPFIRE_ATTN_TILE_SIZE raises max_tiles and
+                // would undersize this same buffer.
+                .min(gpu.attn_tile_size());
                 let max_tiles = (kv_max_seq + tile_size - 1) / tile_size;
                 let batch_mult = hipfire_runtime::config::get()
                     .flash_partials_batch
