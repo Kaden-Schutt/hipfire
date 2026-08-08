@@ -18866,6 +18866,11 @@ fn generate_deepseek4_spec(
     } else {
         0.0
     };
+    let prefill_tok_s = if run.prefill_s > 0.0 {
+        run.prefill_tokens_len as f64 / run.prefill_s
+    } else {
+        0.0
+    };
     // accept_pct denominator is windows × k (the bespoke loop added `spec_k` per
     // window to `spec_drafts_offered`, not the actual n_proposed).
     let accept_pct = if run.spec_cycles > 0 && spec_k > 0 {
@@ -18938,6 +18943,8 @@ fn generate_deepseek4_spec(
                 "prefill_tokens": run.prefill_tokens_len,
                 "cached_tokens": cached_tokens,
                 "prefill_ms": (run.prefill_s * 1000.0) as u128,
+                "prefill_tok_s": (prefill_tok_s * 10.0).round() / 10.0,
+                "decode_tok_s": (tok_s * 10.0).round() / 10.0,
                 "total_ms": (run.total_s * 1000.0) as u128,
                 "finish_reason": finish_reason,
                 "drafter": drafter,
@@ -19676,6 +19683,11 @@ fn generate_deepseek4(
         };
         let prompt_tokens_total = prompt_ids.len();
         let prefill_tokens_actual = suffix_tokens.len();
+        let prefill_tok_s = if prefill_ms > 0 {
+            prefill_tokens_actual as f64 * 1000.0 / prefill_ms as f64
+        } else {
+            0.0
+        };
         let mut pending_done = serde_json::json!({
             "type": "done",
             "id": id,
@@ -19685,6 +19697,8 @@ fn generate_deepseek4(
             "prefill_tokens": prefill_tokens_actual,
             "cached_tokens": cached_tokens,
             "prefill_ms": prefill_ms,
+            "prefill_tok_s": (prefill_tok_s * 10.0).round() / 10.0,
+            "decode_tok_s": (tok_s * 10.0).round() / 10.0,
             "total_ms": total_ms,
             "finish_reason": finish_reason,
             "drafter": "ar",
