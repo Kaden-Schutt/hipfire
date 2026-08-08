@@ -57,6 +57,11 @@
 #   - kv_slots::preflight_alloc, called with the TOTAL held live at once
 #     (device AND host), refusing before allocating.
 #   - Not starting when MemAvailable is close to what the run needs.
+#   - GTT accounting, below. Since the kernel will not charge GTT to a memcg,
+#     we account for it ourselves: read the driver's own counter before and
+#     after, refuse to start when GTT is already high, and report any GTT this
+#     run leaked. A leak is invisible to `ps` and to `free`'s per-process view,
+#     so nothing else would surface it.
 #
 set -uo pipefail
 
@@ -88,6 +93,26 @@ if awk -v a="$avail_gib" -v n="$need_gib" 'BEGIN{exit !(a < n)}'; then
   exit 3
 fi
 
+# ── GTT accounting: the kernel will not do it for us ────────────────────────
+# amdgpu allocates GTT (GPU memory backed by system RAM) through TTM, outside
+# memcg entirely, and the DRM cgroup memory controller was never merged
+# upstream. So MemoryMax cannot see it. We read the driver counter directly.
+gtt_file=$(ls /sys/class/drm/card*/device/mem_info_gtt_used 2>/dev/null | head -1)
+gtt_before_gib=0
+if [ -n "$gtt_file" ] && [ -r "$gtt_file" ]; then
+  gtt_before_gib=$(awk '{printf "%.2f", $1/1073741824}' "$gtt_file")
+  gtt_ceiling_gib="${HIPFIRE_GTT_CEILING_GIB:-20}"
+  if awk -v g="$gtt_before_gib" -v c="$gtt_ceiling_gib" 'BEGIN{exit !(g > c)}'; then
+    echo "run-bounded: REFUSING — ${gtt_before_gib} GiB of GPU GTT is already held," >&2
+    echo "run-bounded: above the ${gtt_ceiling_gib} GiB ceiling. GTT is invisible to ps and to" >&2
+    echo "run-bounded: the cgroup, so this is the only place it gets checked. Something else" >&2
+    echo "run-bounded: is holding GPU memory — a resident model is the usual cause." >&2
+    echo "run-bounded: Free it, or raise HIPFIRE_GTT_CEILING_GIB deliberately." >&2
+    exit 4
+  fi
+  echo "run-bounded: GTT in use before run: ${gtt_before_gib} GiB (ceiling ${gtt_ceiling_gib} GiB)"
+fi
+
 echo "run-bounded: MemAvailable ${avail_gib} GiB, cap ${CAP} (need ${need_gib} GiB), swap off in scope"
 echo "run-bounded: $*"
 
@@ -106,6 +131,19 @@ systemd-run --user --scope --quiet \
   -p MemorySwapMax=0 \
   -- "$@"
 rc=$?
+
+# Report any GTT this run failed to release. A leak here is invisible to ps and
+# to free's per-process view, so if we do not say it, nothing will.
+if [ -n "$gtt_file" ] && [ -r "$gtt_file" ]; then
+  gtt_after_gib=$(awk '{printf "%.2f", $1/1073741824}' "$gtt_file")
+  leak_gib=$(awk -v a="$gtt_after_gib" -v b="$gtt_before_gib" 'BEGIN{printf "%.2f", a-b}')
+  if awk -v l="$leak_gib" 'BEGIN{exit !(l > 0.5)}'; then
+    echo "run-bounded: WARNING — GTT rose ${gtt_before_gib} -> ${gtt_after_gib} GiB (+${leak_gib} GiB)." >&2
+    echo "run-bounded: this run did not release its GPU memory. It will not show up in ps." >&2
+  else
+    echo "run-bounded: GTT after run: ${gtt_after_gib} GiB (delta ${leak_gib} GiB)"
+  fi
+fi
 
 if [ $rc -ne 0 ]; then
   echo "run-bounded: command exited $rc" >&2
