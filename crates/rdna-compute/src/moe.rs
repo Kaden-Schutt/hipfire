@@ -1524,7 +1524,7 @@ impl Gpu {
         let symbol = "deepseek4_topk_kv_gather_f16_buf_gfx1201";
         self.ensure_kernel(
             symbol,
-            kernels::DEEPSEEK4_COMPRESSOR_CACHE_F16_GFX1201_SRC,
+            kernels::DEEPSEEK4_COMPRESSOR_CACHE_F16_SRC,
             symbol,
         )?;
         let cp = cache.buf.as_ptr();
@@ -1584,7 +1584,7 @@ impl Gpu {
         let symbol = "deepseek4_topk_kv_gather_identity_f16_buf_gfx1201";
         self.ensure_kernel(
             symbol,
-            kernels::DEEPSEEK4_COMPRESSOR_CACHE_F16_GFX1201_SRC,
+            kernels::DEEPSEEK4_COMPRESSOR_CACHE_F16_SRC,
             symbol,
         )?;
         let cp = cache.buf.as_ptr();
@@ -1637,7 +1637,7 @@ impl Gpu {
         let symbol = "deepseek4_topk_kv_gather_batched_tiled_f16_gfx1201";
         self.ensure_kernel(
             symbol,
-            kernels::DEEPSEEK4_COMPRESSOR_CACHE_F16_GFX1201_SRC,
+            kernels::DEEPSEEK4_COMPRESSOR_CACHE_F16_SRC,
             symbol,
         )?;
         let cp = cache.buf.as_ptr();
@@ -1704,7 +1704,7 @@ impl Gpu {
         let symbol = "deepseek4_topk_kv_gather_identity_batched_f16_gfx1201";
         self.ensure_kernel(
             symbol,
-            kernels::DEEPSEEK4_COMPRESSOR_CACHE_F16_GFX1201_SRC,
+            kernels::DEEPSEEK4_COMPRESSOR_CACHE_F16_SRC,
             symbol,
         )?;
         let cp = cache.buf.as_ptr();

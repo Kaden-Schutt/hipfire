@@ -5719,10 +5719,10 @@ pub const INDEXER_RELU_SCORE_BUF_SRC: &str =
     include_str!("../../../kernels/src/indexer_relu_score_buf.hip");
 pub const INDEXER_RELU_SCORE_BUF_SHARDED_GFX1201_SRC: &str =
     include_str!("../../../kernels/src/indexer_relu_score_buf_sharded.gfx1201.hip");
-pub const DEEPSEEK4_COMPRESSOR_CACHE_F16_GFX1201_SRC: &str =
-    include_str!("../../../kernels/src/deepseek4_compressor_cache_f16.gfx1201.hip");
-pub const DEEPSEEK4_COMPRESSOR_COMMIT_STAGED_F16_GFX1201_SRC: &str =
-    include_str!("../../../kernels/src/compressor_commit_staged_f16.gfx1201.hip");
+pub const DEEPSEEK4_COMPRESSOR_CACHE_F16_SRC: &str =
+    include_str!("../../../kernels/src/deepseek4_compressor_cache_f16.hip");
+pub const DEEPSEEK4_COMPRESSOR_COMMIT_STAGED_F16_SRC: &str =
+    include_str!("../../../kernels/src/compressor_commit_staged_f16.hip");
 
 /// DeepSeek V4 batched indexer-extended SWA attention (Phase A1, 2026-05-18).
 /// Processes B query positions in parallel via grid dim Y. Each batch

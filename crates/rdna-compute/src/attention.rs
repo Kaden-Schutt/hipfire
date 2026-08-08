@@ -8541,7 +8541,7 @@ impl Gpu {
         let symbol = "compressor_softmax_pool_f32_staged_buf_gfx1201";
         self.ensure_kernel(
             symbol,
-            kernels::DEEPSEEK4_COMPRESSOR_COMMIT_STAGED_F16_GFX1201_SRC,
+            kernels::DEEPSEEK4_COMPRESSOR_COMMIT_STAGED_F16_SRC,
             symbol,
         )?;
         let kp = kv_state.buf.as_ptr();
@@ -8584,7 +8584,7 @@ impl Gpu {
         let symbol = "rmsnorm_f32_staged_buf_gfx1201";
         self.ensure_kernel(
             symbol,
-            kernels::DEEPSEEK4_COMPRESSOR_COMMIT_STAGED_F16_GFX1201_SRC,
+            kernels::DEEPSEEK4_COMPRESSOR_COMMIT_STAGED_F16_SRC,
             symbol,
         )?;
         let bp = staged.buf.as_ptr();
@@ -8638,7 +8638,7 @@ impl Gpu {
         let symbol = "rope_tail_yarn_interleaved_staged_buf_f32_gfx1201";
         self.ensure_kernel(
             symbol,
-            kernels::DEEPSEEK4_COMPRESSOR_COMMIT_STAGED_F16_GFX1201_SRC,
+            kernels::DEEPSEEK4_COMPRESSOR_COMMIT_STAGED_F16_SRC,
             symbol,
         )?;
         let bp = staged.buf.as_ptr();
@@ -8697,7 +8697,7 @@ impl Gpu {
         let symbol = "cast_f32_to_f16_at_slot_buf_gfx1201";
         self.ensure_kernel(
             symbol,
-            kernels::DEEPSEEK4_COMPRESSOR_COMMIT_STAGED_F16_GFX1201_SRC,
+            kernels::DEEPSEEK4_COMPRESSOR_COMMIT_STAGED_F16_SRC,
             symbol,
         )?;
         let sp = staged.buf.as_ptr();
@@ -8739,7 +8739,7 @@ impl Gpu {
         let symbol = "indexer_relu_score_f16_buf_gfx1201";
         self.ensure_kernel(
             symbol,
-            kernels::DEEPSEEK4_COMPRESSOR_CACHE_F16_GFX1201_SRC,
+            kernels::DEEPSEEK4_COMPRESSOR_CACHE_F16_SRC,
             symbol,
         )?;
         let qp = q.buf.as_ptr();
@@ -8797,7 +8797,7 @@ impl Gpu {
         let symbol = "indexer_relu_score_batched_f16_gfx1201";
         self.ensure_kernel(
             symbol,
-            kernels::DEEPSEEK4_COMPRESSOR_CACHE_F16_GFX1201_SRC,
+            kernels::DEEPSEEK4_COMPRESSOR_CACHE_F16_SRC,
             symbol,
         )?;
         let qp = q.buf.as_ptr();
@@ -8862,7 +8862,7 @@ impl Gpu {
         let symbol = "indexer_relu_score_wmma_batched_f16_gfx1201";
         self.ensure_kernel(
             symbol,
-            kernels::DEEPSEEK4_COMPRESSOR_CACHE_F16_GFX1201_SRC,
+            kernels::DEEPSEEK4_COMPRESSOR_CACHE_F16_SRC,
             symbol,
         )?;
         let qp = q.buf.as_ptr();
