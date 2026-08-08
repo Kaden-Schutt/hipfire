@@ -46,6 +46,7 @@ pub mod model_load;
 pub mod model_source;
 pub mod multi_gpu;
 pub mod paro;
+pub mod prefix;
 pub mod reset_core;
 pub mod safetensors_source;
 pub mod sampler;
