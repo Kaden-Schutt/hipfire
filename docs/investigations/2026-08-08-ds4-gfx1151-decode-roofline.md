@@ -195,3 +195,91 @@ without owning a named gate. The stronger check is the kernel inventory: all
 
 The tiled gather (`HIPFIRE_DS4_GATHER_TILED`) was the last portable item on
 that seam.
+
+## 6. The verify cost model: MoE does not amortise weights across the block
+
+§5 asserted that raising tau is the lever, on the reasoning that "weights load
+once per verify cycle regardless of how many tokens that cycle yields, so
+throughput scales nearly linearly with tau." **That reasoning is wrong for this
+model, and the measurement below corrects it.** It holds for a dense target. It
+does not hold for DS4, because each additional verify position routes to its
+own `k6` experts, so the union of experts touched grows with the block.
+
+Two serve_harness runs on the golden fixture, identical except for
+`HIPFIRE_DSPARK_ADAPTIVE_BLOCK`:
+
+| | adaptive (B settles ~2) | `ADAPTIVE_BLOCK=0` (B=5) |
+| --- | ---: | ---: |
+| tau | 2.0238095238095237 | 3.2333333333333334 |
+| decode tok/s | 39.034 | 32.535 |
+| windows | 42 | 30 |
+| implied window time | 51.85 ms | 99.38 ms |
+
+tau rose 59.8% while throughput *fell* 16.6%. Solving the two points for a
+linear window cost:
+
+```
+t_window(B) ~= 36.0 + 15.84 * (B - 1)   ms
+```
+
+The marginal cost of one extra verify position is 15.84 ms, or 44% of the
+36.0 ms fixed cost. On a dense target that marginal term would be near zero.
+Here it is large enough that the block-size controller settling at B=2 is
+correct behaviour, not a missed opportunity, and it explains the previously
+measured -5.7% for pinned B=5 at k6.
+
+### Per-depth acceptance
+
+From `HIPFIRE_DSPARK_DEBUG=1`, comparing `drafts` against `target_pick`
+prefix-wise. Conditioning matters: a window that proposed fewer than k drafts
+can never accept at depth k, and under the adaptive controller the decision to
+propose deeper is itself made on predicted confidence, which selects easy
+windows. Only the forced-depth run gives an unbiased estimate; 28 of its 30
+windows proposed the full 5.
+
+| depth k | p(k) = P(hit at k \| proposed k, survived k-1) | R(k) = P(accept >= k \| proposed >= k) |
+| ---: | ---: | ---: |
+| 1 | 96.7% | 96.7% |
+| 2 | 79.3% | 76.7% |
+| 3 | 90.9% | 71.4% |
+| 4 | 70.0% | 50.0% |
+| 5 | 78.6% | 39.3% |
+
+There is no acceptance cliff. Per-depth accuracy stays in the 70-97% band all
+the way to depth 5; what kills deep blocks is the 15.84 ms/position verify
+cost, not drafter collapse.
+
+### Where that leaves the tau lever
+
+The lever survives but relocates, from block *depth* to per-position *accuracy
+at depths 1-2*. At B=2 the window is 51.85 ms, so 45 tok/s requires
+
+```
+tau = 0.045 * 51.85 = 2.333        (from 2.024, i.e. +15%)
+```
+
+which at fixed depth means lifting depth-2 acceptance from roughly 79% to
+roughly 90%. Depth-1 is already 96.7% and has little left to give.
+
+### The drafter budget is nearly unspent
+
+Grouping the rocprof capture in §3 by quantisation format -- the drafter is
+`q8_0`, the target `mfp4g32`/`mq2` -- separates the two passes:
+
+| pass | ms | share |
+| --- | ---: | ---: |
+| draft (`gemv_q8_0`, `gemv_q8_0_wide`, `gemm_q8_0_wmma`) | 27.68 | **1.11%** |
+| target verify + shared | 2464.79 | 98.89% |
+
+269 draft dispatches in the whole run, roughly 5.7 GEMVs per window: this is an
+MTP-style head, not a small model, and the 5.79 GB sidecar is dominated by
+vocab-width matrices. Drafting currently costs about one percent of the
+machine, so a substantially stronger drafter at the *same* depth is affordable
+even if it costs several times as much. That -- not deeper blocks, and not
+further kernel work -- is the remaining path to 45 tok/s at k6.
+
+Caveat: the 1.11% split is derived from the `dspark_bench` rocprof capture
+(tau 2.065), not from serve, so treat it as approximate. The built-in
+`HIPFIRE_DSPARK_PROFILE` reporter would give an authoritative
+bootstrap/draft/heads/verify/rest split, but its summary prints on drop and the
+harness terminates the daemon with a signal, so it did not emit here.
