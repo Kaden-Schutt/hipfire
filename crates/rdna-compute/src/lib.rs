@@ -24,6 +24,7 @@ pub mod profiler;
 pub mod replay;
 pub mod sampling;
 pub mod scratch;
+pub mod slot_pool;
 
 pub use compiler::KernelCompiler;
 pub use dispatch::{
