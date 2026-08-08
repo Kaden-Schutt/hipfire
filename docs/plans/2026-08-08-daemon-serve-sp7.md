@@ -260,3 +260,45 @@ git commit -m "feat(serve): dispatch chat completions to SlotEngine behind serve
 **Still deferred:** async write-back (`park` stays synchronous); multi-turn reuse over HTTP (the engine supports `session`, but OpenAI chat completions are stateless, so mapping conversations to sessions needs a keying decision — prompt-prefix matching or a client-supplied id — that belongs in its own increment).
 
 **Type consistency.** `Event::{Accepted, Token, Done, Rejected}` and `DoneReason::{Eos, MaxTokens, ClientGone}` are defined in Task 1 and constructed with those names in Tasks 2–3. `SubmitRequest`'s four fields match between Task 1's definition and Tasks 2–4's construction. `EngineStats`'s four counters match between definition and Task 3's assertions.
+
+---
+
+## Execution record (2026-08-08)
+
+**Tasks 1-3 done.** Protocol types, the `SlotEngine` loop, and the concurrency
+gate are built, committed and green.
+
+Gate result, 6 clients against 4 slots:
+
+```
+clients 0-3: 12 tokens each, 4 DISTINCT token streams
+clients 4-5: REJECTED ("all slots busy")
+admitted=4 rejected=2 evictions=0
+```
+
+The rejections are the specified policy rather than a shortfall — eviction
+takes only *idle* sessions and all four residents were mid-generation. It does
+mean **`evictions=0`, so the engine's eviction path is not exercised by this
+gate.** It is covered at the SP6 level by `test_swap_equivalence`, but not yet
+through the engine. Closing that needs a gate where a session goes idle between
+turns, which is the same multi-turn shape Task 4 needs.
+
+**Task 4 (dispatch `/v1/chat/completions` to the engine) is NOT done.** It is
+the piece that makes any of this reachable by an agent, so its absence is the
+gap that matters. Two things need deciding first rather than coding through:
+
+1. **Session keying.** OpenAI chat completions are stateless: the client re-sends
+   the whole conversation each turn. To get prefix reuse, the engine must map a
+   request back to an existing session — either by longest-prefix match against
+   live sessions (transparent, and the reuse machinery already computes exactly
+   this) or by a client-supplied id (explicit, but no standard agent sends one).
+   Prefix matching is almost certainly right, and it makes `SessionTable` the
+   lookup index rather than a plain map.
+2. **Streaming shape.** The handler must turn `Event`s into SSE deltas, and the
+   existing serve path builds its response through `ServeRuntime`. The two need
+   a shared writer, or the new path needs its own.
+
+Neither is hard; both are decisions rather than typing, and getting them wrong
+in a 12,000-line file that is the daily driver is expensive. The engine is
+deliberately usable without them: `SlotEngine::spawn` + `submit` is the whole
+API surface.
