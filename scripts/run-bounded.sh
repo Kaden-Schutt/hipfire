@@ -34,13 +34,30 @@
 # target (so a run that fits here is plausible on target) while leaving this
 # 125 GiB box's desktop untouched.
 #
-# LIMITATION, STATED HONESTLY: amdgpu GTT pages are allocated by the kernel
-# driver on behalf of the process. Most are charged to the process memcg, but
-# this is not guaranteed for every allocation path on every kernel. The cgroup
-# is therefore a strong backstop, NOT a proof. Keep the in-process preflight
-# (kv_slots::preflight_alloc) as the first line of defence — it refuses before
-# allocating rather than dying part-way through.
-
+# THE CGROUP DOES NOT CONTAIN GPU MEMORY. MEASURED, 2026-08-07.
+# ------------------------------------------------------------
+# An earlier version of this header called the cgroup a "strong backstop" and
+# treated the in-process preflight as a first line of defence. That was the
+# wrong way round, and the box proved it: at 02:04:45 a gated run of
+# test_batched_attn_slots invoked the GLOBAL oom-killer
+# (constraint=CONSTRAINT_NONE, not a memcg OOM) and killed slack plus three
+# steamwebhelper processes -- while running inside this cgroup.
+#
+# amdgpu GTT pages are allocated by the kernel driver on behalf of the process
+# and are NOT reliably charged to the process memcg. So MemoryMax bounds our
+# host-side RSS and does essentially nothing about the GPU allocation that
+# actually exhausts the machine.
+#
+# What this script can therefore still do:
+#   1. Bound host-side RSS (real, but not the thing that OOMs the box).
+#   2. REFUSE TO START unless there is genuinely enough headroom -- which is now
+#      the primary protection, because we cannot rely on being killed first.
+#
+# What actually protects the box:
+#   - kv_slots::preflight_alloc, called with the TOTAL held live at once
+#     (device AND host), refusing before allocating.
+#   - Not starting when MemAvailable is close to what the run needs.
+#
 set -uo pipefail
 
 CAP="${HIPFIRE_MEM_CAP:-24G}"
@@ -55,14 +72,23 @@ avail_gib=$(awk -v k="$avail_kb" 'BEGIN{printf "%.1f", k/1048576}')
 
 # Refuse to start if the box is already under pressure. Starting a multi-GiB
 # run with little headroom is how the 19:14 burst happened.
-min_gib="${HIPFIRE_MEM_MIN_AVAIL_GIB:-12}"
-if awk -v a="$avail_gib" -v m="$min_gib" 'BEGIN{exit !(a < m)}'; then
-  echo "run-bounded: REFUSING — MemAvailable ${avail_gib} GiB is below the ${min_gib} GiB floor." >&2
-  echo "run-bounded: something else is using this box; wait or raise HIPFIRE_MEM_MIN_AVAIL_GIB." >&2
+# The floor scales with the cap: a run allowed to reach CAP needs CAP available
+# plus a margin for the desktop, because the cgroup will NOT stop its GPU
+# allocation. A flat floor let a 24 GiB-capped run start with 19 GiB free, and
+# it took out slack and three steamwebhelper processes.
+cap_gib=$(awk -v c="$CAP" 'BEGIN{ if (c ~ /[Gg]$/) {sub(/[Gg]$/,"",c); print c+0} else if (c ~ /[Mm]$/) {sub(/[Mm]$/,"",c); print (c+0)/1024} else print (c+0)/1073741824 }')
+margin_gib="${HIPFIRE_MEM_MARGIN_GIB:-10}"
+need_gib=$(awk -v c="$cap_gib" -v m="$margin_gib" 'BEGIN{printf "%.1f", c+m}')
+if awk -v a="$avail_gib" -v n="$need_gib" 'BEGIN{exit !(a < n)}'; then
+  echo "run-bounded: REFUSING — MemAvailable ${avail_gib} GiB, but a ${CAP} run needs" >&2
+  echo "run-bounded: ${need_gib} GiB (cap + ${margin_gib} GiB desktop margin)." >&2
+  echo "run-bounded: the cgroup does NOT contain amdgpu GTT, so starting anyway risks" >&2
+  echo "run-bounded: a GLOBAL OOM that kills the user's applications. Wait, shrink the" >&2
+  echo "run-bounded: run with a smaller HIPFIRE_MEM_CAP, or free memory first." >&2
   exit 3
 fi
 
-echo "run-bounded: MemAvailable ${avail_gib} GiB, cap ${CAP}, swap disabled inside scope"
+echo "run-bounded: MemAvailable ${avail_gib} GiB, cap ${CAP} (need ${need_gib} GiB), swap off in scope"
 echo "run-bounded: $*"
 
 if ! command -v systemd-run >/dev/null 2>&1; then
