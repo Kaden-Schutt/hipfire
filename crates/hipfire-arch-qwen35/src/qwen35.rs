@@ -7546,7 +7546,10 @@ fn q8_prefill_wmma_enabled_from_env(value: Option<&str>, arch: &str, has_wmma: b
     }
 }
 
-fn q8_prefill_wmma_enabled(gpu: &Gpu) -> bool {
+// pub(crate): also used by forward_slots.rs (SP3 Task 2) to pick the same
+// Q8 WMMA fused-kernel gate the dense batched-prefill path uses. Visibility
+// change only — behavior and callers inside this file are unchanged.
+pub(crate) fn q8_prefill_wmma_enabled(gpu: &Gpu) -> bool {
     q8_prefill_wmma_enabled_from_env(
         hipfire_config::developer_var("HIPFIRE_Q8_PREFILL_WMMA")
             .ok()
@@ -7618,7 +7621,10 @@ fn moe_ffn_batched_admissible(ffn: &MoeFfnWeights, admit_mq6: bool, arch: &str) 
 /// fused QKVZA / gate+up kernels are NOT plain GEMMs and are migrated in later
 /// slices (they need new table entries).
 #[inline]
-fn run_plain_gemm_key(
+// pub(crate): also used by forward_slots.rs (SP3 Task 2), which mirrors this
+// file's Q8_0 batched-prefill dispatch for the slot-aware path. Visibility
+// change only — body and existing callers are untouched.
+pub(crate) fn run_plain_gemm_key(
     gpu: &mut Gpu,
     key: hipfire_dispatch::types::KernelKey,
     w_buf: &GpuTensor,
@@ -7668,7 +7674,7 @@ fn run_plain_gemm_key(
 /// admits the current arch (it is NOT used to front-run the kernel's dispatch).
 #[inline]
 #[allow(clippy::too_many_arguments)]
-fn run_residual_gemm_key(
+pub(crate) fn run_residual_gemm_key(
     gpu: &mut Gpu,
     key: hipfire_dispatch::types::KernelKey,
     w_buf: &GpuTensor,
@@ -7721,7 +7727,7 @@ fn run_residual_gemm_key(
 /// admits the current arch — it does NOT front-run the kernel's internal dispatch.
 #[inline]
 #[allow(clippy::too_many_arguments)]
-fn run_fused_gate_up_key(
+pub(crate) fn run_fused_gate_up_key(
     gpu: &mut Gpu,
     key: hipfire_dispatch::types::KernelKey,
     w_gate: &GpuTensor,
@@ -7767,7 +7773,7 @@ fn run_fused_gate_up_key(
 /// ArchPredicate admits the current arch.
 #[inline]
 #[allow(clippy::too_many_arguments)]
-fn run_fused_qkv_key(
+pub(crate) fn run_fused_qkv_key(
     gpu: &mut Gpu,
     key: hipfire_dispatch::types::KernelKey,
     wq: &GpuTensor,
@@ -7811,7 +7817,7 @@ fn run_fused_qkv_key(
 /// call-site WMMA-vs-base arch split internally.
 #[inline]
 #[allow(clippy::too_many_arguments)]
-fn run_fused_qkvza_key(
+pub(crate) fn run_fused_qkvza_key(
     gpu: &mut Gpu,
     key: hipfire_dispatch::types::KernelKey,
     w_qkv: &GpuTensor,
