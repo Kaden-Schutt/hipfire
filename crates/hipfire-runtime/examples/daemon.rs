@@ -36,8 +36,8 @@ use hipfire_arch_qwen35::Qwen35Bundle;
 use hipfire_arch_qwen35_vl::image;
 use hipfire_arch_qwen35_vl::qwen35_vl;
 use hipfire_runtime::emit_text::{
-    currently_in_think, extract_tool_calls_from_text, ToolOutputRouter, ToolRouteError,
-    ToolRouteEvent,
+    currently_in_think, extract_tool_calls_from_text, ThinkOutputRouter, ThinkRouteEvent,
+    ToolOutputRouter, ToolRouteError, ToolRouteEvent,
 };
 use hipfire_runtime::eos_filter::{EosFilter, EosFilterConfig, FilterAction};
 use hipfire_runtime::hfq::HfqFile;
@@ -2334,6 +2334,18 @@ fn emit_visible_token(stdout: &mut impl std::io::Write, id: &str, text: &str) {
     let _ = stdout.flush();
 }
 
+/// Emit one producer-classified reasoning fragment.
+fn emit_reasoning_token(stdout: &mut impl std::io::Write, id: &str, text: &str) {
+    let envelope = serde_json::json!({
+        "type": "reasoning",
+        "id": id,
+        "text": text,
+        "attempt_id": active_attempt_id(),
+    });
+    let _ = writeln!(stdout, "{}", envelope);
+    let _ = stdout.flush();
+}
+
 /// Canonical `{name, arguments}` array for staged terminal / tool_calls events.
 fn tool_calls_canonical_json(
     calls: &[hipfire_runtime::prompt_frame::ToolCall],
@@ -2430,29 +2442,52 @@ fn emit_spec_cancel_after_rollback(
     );
 }
 
-/// Feed EosFilter-emitted UTF-8 into the AR semantic router and write only
-/// visible prose token events. Complete tool calls stay buffered in the
-/// router until [`qwen_ar_finish_route`].
-fn qwen_ar_route_filter_text(
+/// Route already-classified think/content events in order. Reasoning bypasses
+/// tool parsing; answer content remains subject to ToolOutputRouter.
+fn qwen_ar_route_think_events(
     stdout: &mut impl std::io::Write,
     id: &str,
     router: &mut ToolOutputRouter,
-    text: &str,
+    channel_events: Vec<ThinkRouteEvent>,
     visible_acc: &mut String,
 ) -> Result<(), ToolRouteError> {
-    let events = router.push(text)?;
-    for ev in events {
-        match ev {
-            ToolRouteEvent::VisibleText(vt) => {
-                visible_acc.push_str(vt.as_str());
-                emit_visible_token(stdout, id, vt.as_str());
+    for channel_event in channel_events {
+        match channel_event {
+            ThinkRouteEvent::Reasoning(reasoning) => {
+                emit_reasoning_token(stdout, id, &reasoning);
             }
-            ToolRouteEvent::ToolCall(_) => {
-                // Retained in router.tool_calls(); released only at safe terminal.
+            ThinkRouteEvent::Content(content) => {
+                let events = router.push(&content)?;
+                for ev in events {
+                    match ev {
+                        ToolRouteEvent::VisibleText(vt) => {
+                            visible_acc.push_str(vt.as_str());
+                            emit_visible_token(stdout, id, vt.as_str());
+                        }
+                        ToolRouteEvent::ToolCall(_) => {
+                            // Retained in router.tool_calls(); safe terminal releases it.
+                        }
+                    }
+                }
             }
         }
     }
     Ok(())
+}
+
+/// Feed EosFilter-emitted UTF-8 through think-channel routing, then pass only
+/// answer content to the tool router.
+fn qwen_ar_route_filter_text(
+    stdout: &mut impl std::io::Write,
+    id: &str,
+    think_router: &mut ThinkOutputRouter,
+    router: &mut ToolOutputRouter,
+    text: &str,
+    visible_acc: &mut String,
+) -> Result<(), ToolRouteError> {
+    let mut channel_events = Vec::new();
+    think_router.push_into(text, &mut channel_events);
+    qwen_ar_route_think_events(stdout, id, router, channel_events, visible_acc)
 }
 
 /// Outcome of finishing the Qwen AR semantic router for one turn.
@@ -2582,13 +2617,12 @@ fn qwen_ar_finish_route(
     }
 }
 
-/// EosFilter config for Qwen AR contract-v2 producer path: strip think
-/// spans (including `started_in_think` / orphan closer) and stop without
-/// emitting decoded ChatML / aux EOT marker bytes.
-fn qwen_ar_eos_filter_config(started_in_think: bool) -> EosFilterConfig {
+/// EosFilter config for Qwen AR contract-v2 producer path. EosFilter owns
+/// UTF-8/EOT filtering only; ThinkOutputRouter owns think-channel routing.
+fn qwen_ar_eos_filter_config() -> EosFilterConfig {
     EosFilterConfig {
-        strip_think: true,
-        started_in_think,
+        strip_think: false,
+        started_in_think: false,
         stop_at: vec![b"<|im_end|>".to_vec(), b"<|endoftext|>".to_vec()],
         holdback_prefixes: Vec::new(),
     }
@@ -2601,6 +2635,7 @@ fn qwen_ar_observe_and_route(
     stdout: &mut impl std::io::Write,
     id: &str,
     filter: &mut EosFilter,
+    think_router: &mut ThinkOutputRouter,
     router: &mut ToolOutputRouter,
     new_bytes: &[u8],
     visible_acc: &mut String,
@@ -2609,14 +2644,14 @@ fn qwen_ar_observe_and_route(
         FilterAction::Emit(text_bytes) => {
             let text = std::str::from_utf8(&text_bytes).unwrap_or("");
             if !text.is_empty() {
-                qwen_ar_route_filter_text(stdout, id, router, text, visible_acc)?;
+                qwen_ar_route_filter_text(stdout, id, think_router, router, text, visible_acc)?;
             }
             Ok(false)
         }
         FilterAction::EmitAndStop(text_bytes) => {
             let text = std::str::from_utf8(&text_bytes).unwrap_or("");
             if !text.is_empty() {
-                qwen_ar_route_filter_text(stdout, id, router, text, visible_acc)?;
+                qwen_ar_route_filter_text(stdout, id, think_router, router, text, visible_acc)?;
             }
             Ok(true)
         }
@@ -2626,29 +2661,27 @@ fn qwen_ar_observe_and_route(
 }
 
 /// Shared end-of-stream drain used by production decode and deterministic
-/// tests. Flushes ordinary pending marker-prefix prose into the router;
-/// never drains open think content or completed decoded stop markers.
+/// tests. Flushes EOT-prefix prose through think routing, then classifies any
+/// trailing partial think marker as ordinary text in its current channel.
 fn qwen_ar_drain_pending_into_router(
     stdout: &mut impl std::io::Write,
     id: &str,
     filter: &mut EosFilter,
+    think_router: &mut ThinkOutputRouter,
     router: &mut ToolOutputRouter,
     visible_acc: &mut String,
 ) -> Result<(), ToolRouteError> {
-    if filter.in_think() {
-        // Open think: drop residual; do not flush hidden bytes.
-        let _ = filter.flush_pending();
-        return Ok(());
-    }
     let pending = filter.flush_pending();
-    if pending.is_empty() {
-        return Ok(());
+    if !pending.is_empty() {
+        let text = std::str::from_utf8(&pending).unwrap_or("");
+        if !text.is_empty() {
+            qwen_ar_route_filter_text(stdout, id, think_router, router, text, visible_acc)?;
+        }
     }
-    let text = std::str::from_utf8(&pending).unwrap_or("");
-    if text.is_empty() {
-        return Ok(());
-    }
-    qwen_ar_route_filter_text(stdout, id, router, text, visible_acc)
+
+    let mut channel_events = Vec::new();
+    think_router.finish_into(&mut channel_events);
+    qwen_ar_route_think_events(stdout, id, router, channel_events, visible_acc)
 }
 
 /// Raw-commit bookkeeping shared by production and tests. Advances
@@ -2861,6 +2894,7 @@ fn emit_qwen_ar_open_think_terminal(
 struct QwenArSemanticProducer {
     id: String,
     filter: EosFilter,
+    think_router: ThinkOutputRouter,
     router: ToolOutputRouter,
     visible_acc: String,
     /// Tokens that completed raw-commit before classify for this producer.
@@ -2874,7 +2908,8 @@ impl QwenArSemanticProducer {
     fn new(id: impl Into<String>, started_in_think: bool) -> Self {
         Self {
             id: id.into(),
-            filter: EosFilter::new(qwen_ar_eos_filter_config(started_in_think)),
+            filter: EosFilter::new(qwen_ar_eos_filter_config()),
+            think_router: ThinkOutputRouter::new(started_in_think),
             router: ToolOutputRouter::new(),
             visible_acc: String::new(),
             raw_committed: Vec::new(),
@@ -2920,6 +2955,7 @@ impl QwenArSemanticProducer {
                     stdout,
                     &self.id,
                     &mut self.filter,
+                    &mut self.think_router,
                     &mut self.router,
                     new_bytes.as_ref(),
                     &mut self.visible_acc,
@@ -2991,7 +3027,7 @@ impl QwenArSemanticProducer {
         )
     }
 
-    /// Shared finish: drain pending (when not filter-stopped), then classify.
+    /// Shared finish: drain pending, finalize think routing, then classify.
     /// Emits trailing visible prose only. Tool-call release is deferred to the
     /// caller until after a successful client terminal Commit decision.
     /// Returns `(route_finish, final_visible_text)`.
@@ -3000,22 +3036,19 @@ impl QwenArSemanticProducer {
         stdout: &mut impl std::io::Write,
         hit_length_cap: bool,
     ) -> Result<(QwenArRouteFinish, String), ToolRouteError> {
-        let open_think = self.filter.in_think();
-        if !self.stopped_by_filter {
-            qwen_ar_drain_pending_into_router(
-                stdout,
-                &self.id,
-                &mut self.filter,
-                &mut self.router,
-                &mut self.visible_acc,
-            )?;
-        }
-        // Re-check after drain (drain never leaves think; open_think sticky).
-        let open_think = open_think || self.filter.in_think();
+        qwen_ar_drain_pending_into_router(
+            stdout,
+            &self.id,
+            &mut self.filter,
+            &mut self.think_router,
+            &mut self.router,
+            &mut self.visible_acc,
+        )?;
+        let open_think = self.think_router.in_think();
         let cause =
             QwenArTerminalCause::resolve(self.stopped_by_filter, hit_length_cap, open_think);
         if matches!(cause, QwenArTerminalCause::OpenThink) {
-            // Fail-closed: no hidden bytes/calls, no cache. Caller owns the
+            // Fail-closed: no calls/cache/done. Caller owns the
             // production rollback epilogue + single correlated error terminal
             // (tests call `emit_qwen_ar_open_think_terminal` after finish).
             let finish = QwenArRouteFinish {
@@ -24002,11 +24035,14 @@ mod qwen_ar_semantic_route_tests {
     }
 
     #[test]
-    fn started_in_think_suppresses_reasoning_until_close() {
+    fn started_in_think_routes_reasoning_until_close() {
         let (out, visible, fin, _, _, _) =
             drive_ar_semantic_path(&["hidden reasoning", "</think>answer"], true, false);
         let fin = fin.expect("finish");
-        assert!(!out.contains("hidden reasoning"));
+        let events = parse_jsonl(&out);
+        assert!(events
+            .iter()
+            .any(|e| { e["type"] == "reasoning" && e["text"] == "hidden reasoning" }));
         assert!(!out.contains("</think>"));
         assert!(!visible.contains("hidden"));
         assert!(visible.contains("answer") || out.contains("answer"));
@@ -24015,13 +24051,16 @@ mod qwen_ar_semantic_route_tests {
     }
 
     #[test]
-    fn paired_think_markers_stripped_from_visible() {
+    fn paired_think_markers_route_reasoning_separately() {
         let (out, visible, fin, _, _, _) =
             drive_ar_semantic_path(&["pre ", "<think>secret</think>", " post"], false, false);
         let fin = fin.expect("finish");
+        let events = parse_jsonl(&out);
         assert!(!out.contains("<think>"));
         assert!(!out.contains("</think>"));
-        assert!(!out.contains("secret"));
+        assert!(events
+            .iter()
+            .any(|e| e["type"] == "reasoning" && e["text"] == "secret"));
         assert!(!visible.contains("secret"));
         assert!(visible.contains("pre ") || out.contains("pre "));
         assert!(
@@ -24125,10 +24164,10 @@ mod qwen_ar_semantic_route_tests {
     }
 
     #[test]
-    fn eos_filter_config_enables_strip_and_both_terminators() {
-        let cfg = qwen_ar_eos_filter_config(true);
-        assert!(cfg.strip_think);
-        assert!(cfg.started_in_think);
+    fn eos_filter_config_delegates_think_and_keeps_both_terminators() {
+        let cfg = qwen_ar_eos_filter_config();
+        assert!(!cfg.strip_think);
+        assert!(!cfg.started_in_think);
         assert!(cfg.stop_at.contains(&b"<|im_end|>".to_vec()));
         assert!(cfg.stop_at.contains(&b"<|endoftext|>".to_vec()));
     }
@@ -24329,7 +24368,7 @@ mod qwen_ar_semantic_route_tests {
 
     #[test]
     fn open_think_is_fail_closed_validation_no_cache() {
-        // Finding 2: open think → no hidden bytes/calls, validation terminal, no cache.
+        // Open think streams reasoning, then fails closed: no calls/done/cache.
         let (out, visible, fin, _, _, _) = drive_ar_semantic_path(&["still thinking"], true, false);
         let fin = fin.expect("open think returns Ok finish with error cause");
         assert_eq!(fin.cause, QwenArTerminalCause::OpenThink);
@@ -24337,9 +24376,11 @@ mod qwen_ar_semantic_route_tests {
         assert!(fin.wire_tool_calls.is_empty());
         assert!(!fin.store_cache);
         assert!(visible.is_empty());
-        assert!(!out.contains("still thinking"));
-        assert!(!out.contains("<think>"));
         let events = parse_jsonl(&out);
+        assert!(events
+            .iter()
+            .any(|e| { e["type"] == "reasoning" && e["text"] == "still thinking" }));
+        assert!(!out.contains("<think>"));
         assert!(
             events
                 .iter()
@@ -24383,10 +24424,13 @@ mod qwen_ar_semantic_route_tests {
         let (out, visible, fin, _, _, _) =
             drive_ar_semantic_path(&["pre ", "<think>secret"], false, false);
         let fin = fin.expect("open think");
+        let events = parse_jsonl(&out);
         assert_eq!(fin.cause, QwenArTerminalCause::OpenThink);
         assert!(!fin.store_cache);
         assert!(visible.is_empty() || !visible.contains("secret"));
-        assert!(!out.contains("secret"));
+        assert!(events
+            .iter()
+            .any(|e| e["type"] == "reasoning" && e["text"] == "secret"));
         assert!(!out.contains("\"type\":\"tool_calls\""));
     }
 
@@ -24557,7 +24601,10 @@ mod qwen_ar_semantic_route_tests {
             let (out, visible, fin, _, _, _) = drive_ar_semantic_path(&chunks, false, false);
             let fin = fin.expect("finish");
             assert!(!out.contains("<think>"), "open split={split}");
-            assert!(!out.contains("secret"));
+            let events = parse_jsonl(&out);
+            assert!(events
+                .iter()
+                .any(|e| e["type"] == "reasoning" && e["text"] == "secret"));
             assert_eq!(fin.finish_reason, "stop");
             assert!(visible.contains("pre ") || out.contains("pre "));
             assert!(
@@ -24573,7 +24620,10 @@ mod qwen_ar_semantic_route_tests {
             let (out, visible, fin, _, _, _) = drive_ar_semantic_path(&chunks, false, false);
             let fin = fin.expect("finish");
             assert!(!out.contains("</think>"), "close split={split}");
-            assert!(!out.contains("secret"));
+            let events = parse_jsonl(&out);
+            assert!(events
+                .iter()
+                .any(|e| e["type"] == "reasoning" && e["text"] == "secret"));
             assert_eq!(fin.finish_reason, "stop");
             assert!(visible.contains("pre ") || out.contains("pre "));
         }
@@ -26306,7 +26356,15 @@ mod qwen_dflash_semantic_terminal_tests {
     fn open_think_is_error_xor_done_no_cache() {
         // Production emitter (prompt-started OpenThink) -> real FinishSummary
         // -> production wire terminal. No hand-built open_think mirrors.
-        let (_stream, fin, _raw) = drive_qwen_emit("still thinking", AssistantPrefix::OpenThink);
+        let (stream, fin, _raw) = drive_qwen_emit("still thinking", AssistantPrefix::OpenThink);
+        let reasoning: String = stream
+            .iter()
+            .filter_map(|e| match e {
+                ClientEvent::Reasoning(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(reasoning, "still thinking");
         assert!(fin.open_think, "emitter must latch open_think");
         assert_eq!(fin.finish_reason, "open_think");
         assert!(fin.events.is_empty());
@@ -26358,7 +26416,20 @@ mod qwen_dflash_semantic_terminal_tests {
             ("generated", AssistantPrefix::Plain, "pre <think>secret"),
         ];
         for (label, prefix, body) in cases {
-            let (_stream, fin, _raw) = drive_qwen_emit(body, prefix);
+            let (stream, fin, _raw) = drive_qwen_emit(body, prefix);
+            let reasoning: String = stream
+                .iter()
+                .filter_map(|e| match e {
+                    ClientEvent::Reasoning(text) => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect();
+            let expected_reasoning = if label == "prompt" {
+                "still thinking"
+            } else {
+                "secret"
+            };
+            assert_eq!(reasoning, expected_reasoning, "{label}");
             assert!(fin.open_think, "{label}: open_think");
             assert_eq!(fin.finish_reason, "open_think", "{label}");
             assert_eq!(fin.tool_calls, 0, "{label}");
