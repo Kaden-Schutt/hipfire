@@ -195,6 +195,7 @@ const PAGE_TOKENS: usize = 128;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SlotId(pub usize);
 
+#[derive(Debug)]
 pub struct SlotPool {
     descs: Vec<KvSlotDesc>,
     in_use: Vec<bool>,
