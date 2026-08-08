@@ -471,3 +471,42 @@ Three caveats before anyone treats 45 as forecast rather than ceiling:
    golden's byte-identity check, not a throughput delta.
 3. **The down-projection is assumed, not measured.** Only gate/up was
    instrumented.
+
+### Result: grouping was implemented, measured, and reverted
+
+The upper bound above was tested, not left as a projection. An expert-grouped
+variant kept the grid, buffers and launch shape identical and deduplicated
+inside each block: only the first routing index referencing an expert did work,
+looping over later indices sharing it, with the packed codes staged in LDS so
+each `(row, expert)` was read once.
+
+It was **correct and slower**, on both fixtures:
+
+| fixture | incumbent | grouped | delta | decoded text |
+| --- | ---: | ---: | ---: | --- |
+| golden, ctx 25 / gen 128 | 38.96293 | 38.25604 | **-1.81%** | `e49b9893a207d8a6` both |
+| pp526, ctx 505 / gen 256 | 29.07771 | 28.52744 | **-1.87%** | `72516fb2e7172ec4` both |
+
+Byte-identity held on both arms and tau was exact on both, which confirms the
+construction argument: grouping changes which block loads a weight, never how
+an output is summed. The kernel did what it was designed to do.
+
+The premise was wrong. The 37.4% duplicate fraction counts expert
+**references**, not **HBM traffic**. Those loads were already served from
+cache — §3 had already measured the GEMV block at 83-108% of peak bandwidth,
+and exceeding 100% is only possible with cache reuse. So grouping saved no
+bandwidth while adding real load imbalance: a multi-member block serialises its
+members while duplicate blocks exit immediately, which lengthens the critical
+path.
+
+The long-context arm is what makes this conclusive rather than suggestive. If
+cache capture were an artifact of the golden's small working set, ctx=505
+should have favoured grouping. It regressed by the same margin, so the
+duplicates are absorbed at both working-set sizes.
+
+**Conclusion: routed-expert duplication is not a lever, and the 17.84 ms
+marginal verify position is not explained by redundant weight traffic.** It is
+genuine additional traffic — distinct experts, distinct rows — which returns
+the remaining path to §6's conclusion: per-position acceptance, i.e. drafter
+quality. `HIPFIRE_DS4_EXPERT_OVERLAP` is retained; the measurement was sound,
+the inference drawn from it was not.
