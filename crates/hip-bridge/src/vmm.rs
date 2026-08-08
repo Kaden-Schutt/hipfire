@@ -70,14 +70,6 @@ fn take_fault(kind: VmmFaultKind) -> Option<HipError> {
     })
 }
 
-/// Physical backing tier for a VMM segment. Both tiers retain one stable GPU
-/// virtual address; only the physical allocation location changes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum VmmMemoryTier {
-    Device,
-    Host,
-}
-
 #[derive(Debug)]
 struct VmmSegment {
     offset: usize,
@@ -93,9 +85,6 @@ pub struct VmmArena {
     granularity: usize,
     reserved_bytes: usize,
     mapped_bytes: usize,
-    device_mapped_bytes: usize,
-    host_mapped_bytes: usize,
-    host_mapping_enabled: bool,
     segments: Vec<VmmSegment>,
     access_devices: Vec<i32>,
     releasing: bool,
@@ -107,25 +96,6 @@ unsafe impl Send for VmmArena {}
 
 impl VmmArena {
     pub fn reserve(hip: &HipRuntime, owner_device: i32, requested_bytes: usize) -> HipResult<Self> {
-        Self::reserve_impl(hip, owner_device, requested_bytes, false)
-    }
-
-    /// Reserve a VA range whose alignment is valid for both device and host
-    /// physical allocations, allowing an append-only host-backed tail.
-    pub fn reserve_tiered(
-        hip: &HipRuntime,
-        owner_device: i32,
-        requested_bytes: usize,
-    ) -> HipResult<Self> {
-        Self::reserve_impl(hip, owner_device, requested_bytes, true)
-    }
-
-    fn reserve_impl(
-        hip: &HipRuntime,
-        owner_device: i32,
-        requested_bytes: usize,
-        host_mapping_enabled: bool,
-    ) -> HipResult<Self> {
         if requested_bytes == 0 {
             return Err(HipError::new(
                 0,
@@ -141,21 +111,9 @@ impl VmmArena {
         }
 
         hip.set_device(owner_device)?;
-        let device_prop = HipMemAllocationProp::device_pinned(owner_device);
-        let device_granularity = hip.mem_get_allocation_granularity(
-            &device_prop,
-            HIP_MEM_ALLOCATION_GRANULARITY_RECOMMENDED,
-        )?;
-        let granularity = if host_mapping_enabled {
-            let host_prop = HipMemAllocationProp::host_pinned();
-            let host_granularity = hip.mem_get_allocation_granularity(
-                &host_prop,
-                HIP_MEM_ALLOCATION_GRANULARITY_RECOMMENDED,
-            )?;
-            common_granularity(device_granularity, host_granularity)?
-        } else {
-            device_granularity
-        };
+        let prop = HipMemAllocationProp::device_pinned(owner_device);
+        let granularity =
+            hip.mem_get_allocation_granularity(&prop, HIP_MEM_ALLOCATION_GRANULARITY_RECOMMENDED)?;
         if granularity == 0 {
             return Err(HipError::new(
                 0,
@@ -171,9 +129,6 @@ impl VmmArena {
             granularity,
             reserved_bytes,
             mapped_bytes: 0,
-            device_mapped_bytes: 0,
-            host_mapped_bytes: 0,
-            host_mapping_enabled,
             segments: Vec::new(),
             access_devices: vec![owner_device],
             releasing: false,
@@ -196,14 +151,6 @@ impl VmmArena {
         self.mapped_bytes
     }
 
-    pub const fn device_mapped_bytes(&self) -> usize {
-        self.device_mapped_bytes
-    }
-
-    pub const fn host_mapped_bytes(&self) -> usize {
-        self.host_mapped_bytes
-    }
-
     pub fn base_address(&self) -> usize {
         self.base as usize
     }
@@ -218,26 +165,10 @@ impl VmmArena {
         size: usize,
         access_devices: &[i32],
     ) -> HipResult<()> {
-        self.map_next_in_tier(hip, size, access_devices, VmmMemoryTier::Device)
-    }
-
-    pub fn map_next_in_tier(
-        &mut self,
-        hip: &HipRuntime,
-        size: usize,
-        access_devices: &[i32],
-        tier: VmmMemoryTier,
-    ) -> HipResult<()> {
         if self.releasing || self.is_released() {
             return Err(HipError::new(
                 0,
                 "VMM arena is releasing or already released",
-            ));
-        }
-        if tier == VmmMemoryTier::Host && !self.host_mapping_enabled {
-            return Err(HipError::new(
-                0,
-                "host VMM mapping requires VmmArena::reserve_tiered",
             ));
         }
         if size == 0 || !size.is_multiple_of(self.granularity) {
@@ -273,10 +204,7 @@ impl VmmArena {
                     &format!("VMM access device {device} is outside available range 0..{count}"),
                 ));
             }
-            if (tier == VmmMemoryTier::Device || self.device_mapped_bytes != 0)
-                && device != self.owner_device
-                && !hip.can_access_peer(device, self.owner_device)?
-            {
+            if device != self.owner_device && !hip.can_access_peer(device, self.owner_device)? {
                 return Err(HipError::new(
                     0,
                     &format!(
@@ -302,10 +230,7 @@ impl VmmArena {
             .collect();
 
         hip.set_device(self.owner_device)?;
-        let prop = match tier {
-            VmmMemoryTier::Device => HipMemAllocationProp::device_pinned(self.owner_device),
-            VmmMemoryTier::Host => HipMemAllocationProp::host_pinned(),
-        };
+        let prop = HipMemAllocationProp::device_pinned(self.owner_device);
         let handle = hip.mem_create(size, &prop)?;
         let address = offset_ptr(self.base, self.mapped_bytes);
         if let Err(err) = unsafe { hip.mem_map(address, size, handle) } {
@@ -385,10 +310,6 @@ impl VmmArena {
             mapped: true,
         });
         self.mapped_bytes = next_mapped;
-        match tier {
-            VmmMemoryTier::Device => self.device_mapped_bytes += size,
-            VmmMemoryTier::Host => self.host_mapped_bytes += size,
-        }
         Ok(())
     }
 
@@ -480,8 +401,6 @@ impl VmmArena {
                     self.base = std::ptr::null_mut();
                     self.reserved_bytes = 0;
                     self.mapped_bytes = 0;
-                    self.device_mapped_bytes = 0;
-                    self.host_mapped_bytes = 0;
                     self.access_devices.clear();
                 }
                 Err(err) => {
@@ -515,28 +434,6 @@ fn round_up(value: usize, alignment: usize) -> HipResult<usize> {
             .checked_add(alignment - remainder)
             .ok_or_else(|| HipError::new(0, "VMM reserve size overflowed during alignment"))
     }
-}
-
-fn common_granularity(a: usize, b: usize) -> HipResult<usize> {
-    if a == 0 || b == 0 {
-        return Err(HipError::new(
-            0,
-            "VMM allocation granularity must be non-zero",
-        ));
-    }
-    let divisor = gcd(a, b);
-    a.checked_div(divisor)
-        .and_then(|quotient| quotient.checked_mul(b))
-        .ok_or_else(|| HipError::new(0, "VMM common granularity overflowed"))
-}
-
-fn gcd(mut a: usize, mut b: usize) -> usize {
-    while b != 0 {
-        let remainder = a % b;
-        a = b;
-        b = remainder;
-    }
-    a
 }
 
 fn combined_cleanup_error(operation: HipError, cleanup: HipError) -> HipError {
@@ -593,12 +490,6 @@ mod tests {
             handle: Some(1usize as HipMemGenericAllocationHandle),
             mapped,
         }
-    }
-
-    #[test]
-    fn common_granularity_is_a_multiple_of_both_tiers() {
-        assert_eq!(common_granularity(4096, 65536).unwrap(), 65536);
-        assert_eq!(common_granularity(6144, 4096).unwrap(), 12288);
     }
 
     #[test]

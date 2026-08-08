@@ -2330,33 +2330,6 @@ impl Gpu {
         initial_mapped_bytes: usize,
         access_devices: &[i32],
     ) -> HipResult<GpuTensor> {
-        unsafe {
-            self.alloc_vmm_tensor_impl(shape, dtype, initial_mapped_bytes, access_devices, false)
-        }
-    }
-
-    /// Reserve a VMM tensor that may append host-backed physical pages while
-    /// retaining one stable GPU virtual address.
-    pub unsafe fn alloc_tiered_vmm_tensor(
-        &mut self,
-        shape: &[usize],
-        dtype: DType,
-        initial_mapped_bytes: usize,
-        access_devices: &[i32],
-    ) -> HipResult<GpuTensor> {
-        unsafe {
-            self.alloc_vmm_tensor_impl(shape, dtype, initial_mapped_bytes, access_devices, true)
-        }
-    }
-
-    unsafe fn alloc_vmm_tensor_impl(
-        &mut self,
-        shape: &[usize],
-        dtype: DType,
-        initial_mapped_bytes: usize,
-        access_devices: &[i32],
-        tiered: bool,
-    ) -> HipResult<GpuTensor> {
         self.bind_thread()?;
         let numel = shape
             .iter()
@@ -2365,11 +2338,7 @@ impl Gpu {
         let byte_size = numel
             .checked_mul(dtype.size())
             .ok_or_else(|| HipError::new(0, "VMM tensor byte size overflowed"))?;
-        let mut arena = if tiered {
-            VmmArena::reserve_tiered(&self.hip, self.device_id, byte_size)?
-        } else {
-            VmmArena::reserve(&self.hip, self.device_id, byte_size)?
-        };
+        let mut arena = VmmArena::reserve(&self.hip, self.device_id, byte_size)?;
         if initial_mapped_bytes > 0 {
             if let Err(err) = arena.map_next(&self.hip, initial_mapped_bytes, access_devices) {
                 return Err(self.retain_failed_vmm_arena(arena, err));
@@ -2437,36 +2406,6 @@ impl Gpu {
         Ok(mapped_bytes)
     }
 
-    /// Append physical pages from the selected tier to a tiered VMM tensor.
-    pub fn grow_vmm_tensor_in_tier(
-        &mut self,
-        tensor: &mut GpuTensor,
-        additional_bytes: usize,
-        access_devices: &[i32],
-        tier: hip_bridge::VmmMemoryTier,
-    ) -> HipResult<usize> {
-        self.bind_thread()?;
-        let key = tensor.buf.as_ptr() as usize;
-        let logical_bytes = tensor.byte_size();
-        let arena = self.vmm_arenas.get_mut(&key).ok_or_else(|| {
-            HipError::new(
-                0,
-                &format!("tensor at 0x{key:x} is not a registered VMM owner"),
-            )
-        })?;
-        arena.map_next_in_tier(&self.hip, additional_bytes, access_devices, tier)?;
-        let mapped_bytes = arena.mapped_bytes();
-        tensor.buf = unsafe { arena.owner_buffer(logical_bytes)? };
-        Ok(mapped_bytes)
-    }
-
-    /// Return mapped bytes by physical tier: `(device, host)`.
-    pub fn vmm_tier_mapped_bytes(&self, tensor: &GpuTensor) -> Option<(usize, usize)> {
-        self.vmm_arenas
-            .get(&(tensor.buf.as_ptr() as usize))
-            .map(|arena| (arena.device_mapped_bytes(), arena.host_mapped_bytes()))
-    }
-
     pub fn vmm_mapped_bytes(&self, tensor: &GpuTensor) -> Option<usize> {
         self.vmm_arenas
             .get(&(tensor.buf.as_ptr() as usize))
@@ -2487,33 +2426,6 @@ impl Gpu {
         let prop = HipMemAllocationProp::device_pinned(self.device_id);
         self.hip
             .mem_get_allocation_granularity(&prop, HIP_MEM_ALLOCATION_GRANULARITY_RECOMMENDED)
-    }
-
-    /// Return an alignment accepted by both device- and host-backed VMM pages.
-    pub fn vmm_tiered_recommended_granularity(&self) -> HipResult<usize> {
-        let device = self.vmm_recommended_granularity()?;
-        let host_prop = HipMemAllocationProp::host_pinned();
-        let host = self.hip.mem_get_allocation_granularity(
-            &host_prop,
-            HIP_MEM_ALLOCATION_GRANULARITY_RECOMMENDED,
-        )?;
-        if device == 0 || host == 0 {
-            return Err(HipError::new(
-                0,
-                "HIP returned zero VMM allocation granularity",
-            ));
-        }
-        let mut a = device;
-        let mut b = host;
-        while b != 0 {
-            let remainder = a % b;
-            a = b;
-            b = remainder;
-        }
-        device
-            .checked_div(a)
-            .and_then(|quotient| quotient.checked_mul(host))
-            .ok_or_else(|| HipError::new(0, "VMM common granularity overflowed"))
     }
 
     pub fn vmm_allocation_count(&self) -> usize {

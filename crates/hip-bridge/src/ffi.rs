@@ -114,7 +114,6 @@ pub type HipMemGenericAllocationHandle = *mut c_void;
 
 const HIP_SUCCESS: u32 = 0;
 pub const HIP_MEM_LOCATION_TYPE_DEVICE: u32 = 1;
-pub const HIP_MEM_LOCATION_TYPE_HOST: u32 = 2;
 pub const HIP_MEM_ALLOCATION_TYPE_PINNED: u32 = 1;
 pub const HIP_MEM_ACCESS_FLAGS_PROT_READ_WRITE: u32 = 3;
 pub const HIP_MEM_ALLOCATION_GRANULARITY_MINIMUM: u32 = 0;
@@ -163,13 +162,6 @@ impl HipMemLocation {
             id,
         }
     }
-
-    pub fn host() -> Self {
-        Self {
-            type_: HIP_MEM_LOCATION_TYPE_HOST,
-            id: 0,
-        }
-    }
 }
 
 #[repr(C)]
@@ -196,20 +188,6 @@ impl HipMemAllocationProp {
             type_: HIP_MEM_ALLOCATION_TYPE_PINNED,
             requested_handle_types: 0,
             location: HipMemLocation::device(device),
-            win32_handle_meta_data: ptr::null_mut(),
-            alloc_flags: HipMemAllocationFlags {
-                compression_type: 0,
-                gpu_direct_rdma_capable: 0,
-                usage: 0,
-            },
-        }
-    }
-
-    pub fn host_pinned() -> Self {
-        Self {
-            type_: HIP_MEM_ALLOCATION_TYPE_PINNED,
-            requested_handle_types: 0,
-            location: HipMemLocation::host(),
             win32_handle_meta_data: ptr::null_mut(),
             alloc_flags: HipMemAllocationFlags {
                 compression_type: 0,
