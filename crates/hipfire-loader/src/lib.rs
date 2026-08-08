@@ -1698,9 +1698,11 @@ fn load_model_ep_ds4(
         // remains entirely device-local; F16 storage is what makes 1M feasible.
         // B=1024 is the certified short-context throughput schedule. At a
         // declared long-context ceiling, B=512 gives back about 1.34 GiB/rank
-        // while retaining most grouped-MoE occupancy. At the advertised 1M
-        // horizon, B=128 reserves room for cache growth without changing
-        // user-facing configuration.
+        // while retaining most grouped-MoE occupancy. Preserve that established
+        // F32 schedule. An explicitly selected F16 cache may trade prefill
+        // throughput for additional physical depth with B=128 at an extreme
+        // declared ceiling. Replicated TP3 still tops out below 1M; the smaller
+        // batch maximizes its measured F16 capacity without regressing F32.
         const SHORT_CONTEXT_BATCH: usize = 1024;
         const LONG_CONTEXT_BATCH: usize = 512;
         const EXTREME_CONTEXT_BATCH: usize = 128;
@@ -1713,7 +1715,10 @@ fn load_model_ep_ds4(
         for state in &mut staging.state {
             state.compressor_cache_dtype = compressor_cache_dtype;
         }
-        let ep_prefill_max_batch = if max_seq > EXTREME_CONTEXT_THRESHOLD {
+        let ep_prefill_max_batch = if compressor_cache
+            == hipfire_config::Deepseek4CompressorCache::F16
+            && max_seq > EXTREME_CONTEXT_THRESHOLD
+        {
             EXTREME_CONTEXT_BATCH
         } else if max_seq > LONG_CONTEXT_THRESHOLD {
             LONG_CONTEXT_BATCH
