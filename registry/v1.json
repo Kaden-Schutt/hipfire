@@ -215,6 +215,7 @@
       "file": "deepseek-v4-flash.mq2lloyd",
       "size_gb": 82,
       "min_vram_gb": 96,
+      "default_kv_mode": "f32",
       "sampling": {
         "temperature": 1.0,
         "top_p": 1.0
@@ -242,7 +243,7 @@
       "file": "deepseek-v4-flash-0731.mq2lloyd",
       "size_gb": 86.2,
       "min_vram_gb": 96,
-      "default_kv_mode": "q8",
+      "default_kv_mode": "f32",
       "sampling": {
         "temperature": 1.0,
         "top_p": 1.0
@@ -280,7 +281,7 @@
         "sha256": "fedf663e1bd2c6b8b62bc4819d54398c68e137e248863ad494e66111eb294c64",
         "size_bytes": 5996334814
       },
-      "desc": "Official DeepSeek V4 Flash 0731 MQ2-Lloyd package (arch_id=9). Parent-faithful profiles use low effort with temp=1/top_p=1 by default, max effort with temp=1/top_p=0.95 for agentic coding, and no hidden thinking cap. Includes the checkpoint-aligned DSpark sidecar.",
+      "desc": "Official DeepSeek V4 Flash 0731 MQ2-Lloyd package (arch_id=9). The cache defaults to the implemented F32 route; F16 is selectable on the certified gfx1201 MQ2R TP route. Parent-faithful profiles use low effort with temp=1/top_p=1 by default, max effort with temp=1/top_p=0.95 for agentic coding, and no hidden thinking cap. Includes the checkpoint-aligned DSpark sidecar.",
       "arch_id": 9,
       "quant": "mq2lloyd"
     },
@@ -289,7 +290,7 @@
       "file": "deepseek-v4-flash-0731.mq2r",
       "size_gb": 82,
       "min_vram_gb": 96,
-      "default_kv_mode": "q8",
+      "default_kv_mode": "f32",
       "sampling": {
         "temperature": 1.0,
         "top_p": 1.0
@@ -328,7 +329,7 @@
         "sha256": "bc695a000643801d26e5ae96c9f4ac4c222a36d9db40566f4cc1de0e9d3d5d2e",
         "size_bytes": 5788397278
       },
-      "desc": "Official DeepSeek V4 Flash 0731 MQ2R (arch_id=9), quantized with the preserved P3 tensor recipe. Parent-faithful profiles use low effort with temp=1/top_p=1 by default, max effort with temp=1/top_p=0.95 for agentic coding, and no hidden thinking cap. Includes the target-aligned DSpark sidecar.",
+      "desc": "Official DeepSeek V4 Flash 0731 MQ2R (arch_id=9), quantized with the preserved P3 tensor recipe. The cache defaults to the implemented F32 route; F16 is selectable on gfx1201 TP3/TP4 for long-context capacity. Parent-faithful profiles use low effort with temp=1/top_p=1 by default, max effort with temp=1/top_p=0.95 for agentic coding, and no hidden thinking cap. Includes the target-aligned DSpark sidecar.",
       "arch_id": 9,
       "quant": "mq2r"
     },

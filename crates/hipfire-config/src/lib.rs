@@ -132,6 +132,38 @@ pub enum Deepseek4ComputePlacement {
     },
 }
 
+/// Storage policy for DeepSeek V4's long-lived compressor caches. This is
+/// deliberately separate from the ordinary KV-cache mode: it affects only
+/// the model's compressed main/indexer memory and never Qwen or other models.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Deepseek4CompressorCache {
+    #[default]
+    F32,
+    F16,
+}
+
+impl fmt::Display for Deepseek4CompressorCache {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::F32 => "f32",
+            Self::F16 => "f16",
+        })
+    }
+}
+
+impl std::str::FromStr for Deepseek4CompressorCache {
+    type Err = String;
+
+    fn from_str(raw: &str) -> std::result::Result<Self, Self::Err> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "f32" => Ok(Self::F32),
+            "f16" => Ok(Self::F16),
+            _ => Err("DeepSeek V4 compressor cache must be f32 or f16".to_string()),
+        }
+    }
+}
+
 impl fmt::Display for Deepseek4ComputePlacement {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -444,8 +476,8 @@ fn expand_tilde(value: &str) -> PathBuf {
 }
 
 const KV_MODES: &[&str] = &[
-    "auto", "q8", "asym4", "asym3", "asym2", "fwht4", "fwht3", "fwht2", "turbo", "turbo4",
-    "turbo3", "turbo2",
+    "auto", "f32", "f16", "q8", "asym4", "asym3", "asym2", "fwht4", "fwht3", "fwht2", "turbo",
+    "turbo4", "turbo3", "turbo2",
 ];
 const AUTO_ON_OFF: &[&str] = &["auto", "on", "off"];
 // `off` disables thinking outright. It resolves to a cap of 1, the engine's
@@ -581,7 +613,7 @@ pub static FIELDS: &[ConfigField] = &[
         true,
         false,
         Some("HIPFIRE_KV_MODE"),
-        "KV cache format; auto inherits the registry recommendation, then q8."
+        "KV cache format; auto inherits the registry recommendation, then q8. DeepSeek V4 currently supports f32 and f16."
     ),
     field!(
         "memory.kv_adaptive",
@@ -4908,6 +4940,25 @@ mod tests {
             layer.get("hardware.deepseek4_compute_placement"),
             Some(&ConfigValue::String(raw.into()))
         );
+    }
+
+    #[test]
+    fn deepseek4_compressor_cache_dtype_is_selected_through_kv_cache() {
+        let field = field("memory.kv_cache").unwrap();
+        assert_eq!(
+            field.parse_cli("f32").unwrap(),
+            ConfigValue::String("f32".into())
+        );
+        assert_eq!(
+            field.parse_cli("f16").unwrap(),
+            ConfigValue::String("f16".into())
+        );
+        assert_eq!(
+            "f16".parse::<Deepseek4CompressorCache>().unwrap(),
+            Deepseek4CompressorCache::F16
+        );
+        assert_eq!(Deepseek4CompressorCache::F32.to_string(), "f32");
+        assert!("auto".parse::<Deepseek4CompressorCache>().is_err());
     }
 
     #[test]

@@ -6699,7 +6699,6 @@ fn main() {
                         continue;
                     }
                 };
-
                 let loaded = if tp > 1 {
                     if deepseek4_experts_per_token.is_some() {
                         emit_uncorrelated_error(
@@ -6713,7 +6712,12 @@ fn main() {
                         let _ = stdout.flush();
                         continue;
                     }
-                    hipfire_loader::load_model_ep(path, max_seq, tp)
+                    hipfire_loader::load_model_ep_with_kv_mode(
+                        path,
+                        max_seq,
+                        tp,
+                        kv_mode_override.as_deref(),
+                    )
                 } else {
                     hipfire_loader::load_model_with_kv_backend(
                         path,

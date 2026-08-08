@@ -1798,6 +1798,7 @@ fn ensure_cache_tensor_rows(
     logical_rows: usize,
     required_rows: usize,
     row_elems: usize,
+    dtype: DType,
     access_devices: &[i32],
     label: &str,
 ) -> Result<bool, String> {
@@ -1809,12 +1810,10 @@ fn ensure_cache_tensor_rows(
         let tensor = if use_vmm {
             // Reserve the model horizon but map nothing until the request
             // preflight below computes the needed prefix.
-            unsafe {
-                gpu.alloc_vmm_tensor(&[logical_rows, row_elems], DType::F32, 0, access_devices)
-            }
-            .map_err(|e| format!("reserve VMM {label}: {e:?}"))?
+            unsafe { gpu.alloc_vmm_tensor(&[logical_rows, row_elems], dtype, 0, access_devices) }
+                .map_err(|e| format!("reserve VMM {label}: {e:?}"))?
         } else {
-            gpu.zeros(&[required_rows, row_elems], DType::F32)
+            gpu.zeros(&[required_rows, row_elems], dtype)
                 .map_err(|e| format!("alloc {label}: {e:?}"))?
         };
         *slot = Some(tensor);
@@ -1827,7 +1826,7 @@ fn ensure_cache_tensor_rows(
             .vmm_granularity(tensor)
             .ok_or_else(|| format!("{label}: VMM allocation has no granularity"))?;
         let row_bytes = row_elems
-            .checked_mul(std::mem::size_of::<f32>())
+            .checked_mul(dtype.size())
             .ok_or_else(|| format!("{label}: row-byte overflow"))?;
         let plan = hipfire_runtime::kv_backend::KvChunkPlan::new(
             row_bytes,
@@ -1855,7 +1854,7 @@ fn ensure_cache_tensor_rows(
     // Fallback for architectures without a certified DS4 VMM route: preserve
     // cache contents while growing the pointer-changing dense allocation.
     let replacement = gpu
-        .zeros(&[required_rows, row_elems], DType::F32)
+        .zeros(&[required_rows, row_elems], dtype)
         .map_err(|e| format!("grow {label}: {e:?}"))?;
     let copy_bytes = tensor.byte_size();
     gpu.hip
@@ -1934,11 +1933,12 @@ fn cache_growth_bytes(
     logical_rows: usize,
     required_rows: usize,
     row_elems: usize,
+    dtype: DType,
     default_granularity: usize,
     label: &str,
 ) -> Result<usize, String> {
     let row_bytes = row_elems
-        .checked_mul(std::mem::size_of::<f32>())
+        .checked_mul(dtype.size())
         .ok_or_else(|| format!("{label}: row-byte overflow"))?;
     if !compressor_cache_uses_vmm(gpu) {
         return match slot {
@@ -2010,6 +2010,7 @@ fn admit_compressor_growth(
                 local_logical_rows,
                 local_required_rows,
                 cfg.head_dim,
+                state.compressor_cache_dtype,
                 default_granularity,
                 &format!("main_kv_cache l{layer_idx}"),
             )?,
@@ -2024,6 +2025,7 @@ fn admit_compressor_growth(
                     local_logical_rows,
                     local_required_rows,
                     cfg.index_head_dim,
+                    state.compressor_cache_dtype,
                     default_granularity,
                     &format!("indexer_kv_cache l{layer_idx}"),
                 )?,
@@ -2116,6 +2118,7 @@ pub fn ensure_compressor_capacity(
             local_logical_rows,
             local_required_rows,
             cfg.head_dim,
+            state.compressor_cache_dtype,
             access_devices,
             &format!("main_kv_cache l{layer_idx}"),
         )?;
@@ -2126,6 +2129,7 @@ pub fn ensure_compressor_capacity(
                 local_logical_rows,
                 local_required_rows,
                 cfg.index_head_dim,
+                state.compressor_cache_dtype,
                 access_devices,
                 &format!("indexer_kv_cache l{layer_idx}"),
             )?;
@@ -2427,10 +2431,17 @@ fn compressor_forward_impl(
         .compressor_cache_placement
         .local_rows(max_compressed)
         .max(1);
+    let compressor_cache_dtype = state.compressor_cache_dtype;
 
     // Lazy-allocate state buffers per (layer, compressor-type).
     {
         let l_state = &mut state._indexer[layer_idx];
+        if compressor_cache_dtype == DType::F16 && l_state.comp_cache_row_f32.is_none() {
+            l_state.comp_cache_row_f32 = Some(
+                gpu.zeros(&[cfg.head_dim], DType::F32)
+                    .map_err(|e| format!("alloc comp cache staging row l{layer_idx}: {e:?}"))?,
+            );
+        }
         if is_indexer {
             if l_state.indexer_kv_state.is_none() {
                 l_state.indexer_kv_state = Some(
@@ -2449,7 +2460,7 @@ fn compressor_forward_impl(
             }
             if l_state.indexer_kv_cache.is_none() {
                 l_state.indexer_kv_cache = Some(
-                    gpu.zeros(&[local_max_compressed, head_dim], DType::F32)
+                    gpu.zeros(&[local_max_compressed, head_dim], compressor_cache_dtype)
                         .map_err(|e| format!("alloc idx kv_cache l{layer_idx}: {e:?}"))?,
                 );
             }
@@ -2470,7 +2481,7 @@ fn compressor_forward_impl(
             }
             if l_state.main_kv_cache.is_none() {
                 l_state.main_kv_cache = Some(
-                    gpu.zeros(&[local_max_compressed, head_dim], DType::F32)
+                    gpu.zeros(&[local_max_compressed, head_dim], compressor_cache_dtype)
                         .map_err(|e| format!("alloc main kv_cache l{layer_idx}: {e:?}"))?,
                 );
             }
@@ -2741,6 +2752,18 @@ fn compressor_forward_impl(
         // shift on every rank even when this rank does not own the cache row.
         if let Some(compressed_slot) = local_compressed_slot {
             let kv_cache_slot = kv_cache.sub_offset(compressed_slot * head_dim, head_dim);
+            let cache_is_f16 = kv_cache.dtype == DType::F16;
+            let commit_stage;
+            let commit_f32 = if cache_is_f16 {
+                commit_stage = l_state
+                    .comp_cache_row_f32
+                    .as_ref()
+                    .ok_or_else(|| format!("comp F16 staging row missing l{layer_idx}"))?
+                    .sub_offset(0, head_dim);
+                &commit_stage
+            } else {
+                &kv_cache_slot
+            };
 
             if overlap {
                 let concat_kv = l_state.comp_concat_kv.as_ref().unwrap();
@@ -2764,7 +2787,7 @@ fn compressor_forward_impl(
                 gpu.compressor_softmax_pool_f32(
                     concat_kv,
                     concat_score,
-                    &kv_cache_slot,
+                    commit_f32,
                     (2 * ratio) as i32,
                     head_dim as i32,
                 )
@@ -2773,17 +2796,37 @@ fn compressor_forward_impl(
                 gpu.compressor_softmax_pool_f32(
                     kv_state,
                     score_state,
-                    &kv_cache_slot,
+                    commit_f32,
                     ratio as i32,
                     head_dim as i32,
                 )
                 .map_err(|e| format!("comp pool no-overlap l{layer_idx}: {e:?}"))?;
             }
-            comp_dbg(&*gpu, "kv_cache(pool)", &kv_cache_slot, head_dim);
-            gpu.rmsnorm_f32(&kv_cache_slot, norm, &kv_cache_slot, cfg.rms_norm_eps)
+            comp_dbg(&*gpu, "kv_cache(pool)", commit_f32, head_dim);
+            gpu.rmsnorm_f32(commit_f32, norm, commit_f32, cfg.rms_norm_eps)
                 .map_err(|e| format!("comp rmsnorm l{layer_idx}: {e:?}"))?;
-            comp_dbg(&*gpu, "kv_cache(rmsnorm)", &kv_cache_slot, head_dim);
-            if do_rope && is_indexer {
+            comp_dbg(&*gpu, "kv_cache(rmsnorm)", commit_f32, head_dim);
+            if do_rope && cache_is_f16 {
+                let commit_slot_buf = state
+                    .attn_state_buf
+                    .as_ref()
+                    .ok_or_else(|| format!("comp l{layer_idx}: attn_state_buf missing"))?
+                    .sub_offset(if ratio == 4 { 7 } else { 9 }, 1);
+                gpu.rope_tail_yarn_interleaved_staged_buf_gfx1201(
+                    commit_f32,
+                    &pos_buf,
+                    &commit_slot_buf,
+                    head_dim as i32,
+                    cfg.qk_rope_head_dim as i32,
+                    freq_base,
+                    freq_scale,
+                    ext_factor,
+                    attn_factor,
+                    corr_low,
+                    corr_high,
+                )
+                .map_err(|e| format!("comp staged rope l{layer_idx}: {e:?}"))?;
+            } else if do_rope && is_indexer {
                 // Use the same device-slot-driven symbol as capture/replay.
                 // The separate plain-RoPE symbol rounds differently on gfx1151
                 // despite equivalent algebra, poisoning future indexer state
@@ -2827,7 +2870,11 @@ fn compressor_forward_impl(
                 )
                 .map_err(|e| format!("comp main rope l{layer_idx}: {e:?}"))?;
             }
-            comp_dbg(&*gpu, "kv_cache(rope)", &kv_cache_slot, head_dim);
+            comp_dbg(&*gpu, "kv_cache(rope)", commit_f32, head_dim);
+            if cache_is_f16 {
+                gpu.cast_f32_to_f16(commit_f32, &kv_cache_slot)
+                    .map_err(|e| format!("comp cache f16 store l{layer_idx}: {e:?}"))?;
+            }
         }
         if overlap {
             let shift_bytes = ratio * proj_dim * 4;
@@ -2879,6 +2926,18 @@ fn compressor_forward_impl(
 
     // Compress event — concat (overlap only) is unconditional within graph;
     // pool/rmsnorm/rope/shift all sentinel-gate on commit_slot_buf.
+    let cache_is_f16 = kv_cache.dtype == DType::F16;
+    let commit_stage;
+    let commit_f32 = if cache_is_f16 {
+        commit_stage = l_state
+            .comp_cache_row_f32
+            .as_ref()
+            .ok_or_else(|| format!("comp F16 staging row missing l{layer_idx}"))?
+            .sub_offset(0, head_dim);
+        &commit_stage
+    } else {
+        kv_cache
+    };
     if overlap {
         let concat_kv = l_state.comp_concat_kv.as_ref().unwrap();
         let concat_score = l_state.comp_concat_score.as_ref().unwrap();
@@ -2888,25 +2947,49 @@ fn compressor_forward_impl(
             .map_err(|e| format!("comp concat_score l{layer_idx}: {e:?}"))?;
         comp_dbg(&*gpu, "concat_kv", concat_kv, 2 * ratio * head_dim);
         comp_dbg(&*gpu, "concat_score", concat_score, 2 * ratio * head_dim);
-        gpu.compressor_softmax_pool_f32_buf(
-            concat_kv,
-            concat_score,
-            kv_cache,
-            &commit_slot_buf,
-            (2 * ratio) as i32,
-            head_dim as i32,
-        )
-        .map_err(|e| format!("comp pool buf l{layer_idx}: {e:?}"))?;
+        if cache_is_f16 {
+            gpu.compressor_softmax_pool_f32_staged_buf_gfx1201(
+                concat_kv,
+                concat_score,
+                commit_f32,
+                &commit_slot_buf,
+                (2 * ratio) as i32,
+                head_dim as i32,
+            )
+            .map_err(|e| format!("comp pool staged buf l{layer_idx}: {e:?}"))?;
+        } else {
+            gpu.compressor_softmax_pool_f32_buf(
+                concat_kv,
+                concat_score,
+                kv_cache,
+                &commit_slot_buf,
+                (2 * ratio) as i32,
+                head_dim as i32,
+            )
+            .map_err(|e| format!("comp pool buf l{layer_idx}: {e:?}"))?;
+        }
     } else {
-        gpu.compressor_softmax_pool_f32_buf(
-            kv_state,
-            score_state,
-            kv_cache,
-            &commit_slot_buf,
-            ratio as i32,
-            head_dim as i32,
-        )
-        .map_err(|e| format!("comp pool buf no-overlap l{layer_idx}: {e:?}"))?;
+        if cache_is_f16 {
+            gpu.compressor_softmax_pool_f32_staged_buf_gfx1201(
+                kv_state,
+                score_state,
+                commit_f32,
+                &commit_slot_buf,
+                ratio as i32,
+                head_dim as i32,
+            )
+            .map_err(|e| format!("comp pool staged buf no-overlap l{layer_idx}: {e:?}"))?;
+        } else {
+            gpu.compressor_softmax_pool_f32_buf(
+                kv_state,
+                score_state,
+                kv_cache,
+                &commit_slot_buf,
+                ratio as i32,
+                head_dim as i32,
+            )
+            .map_err(|e| format!("comp pool buf no-overlap l{layer_idx}: {e:?}"))?;
+        }
     }
     // Debug-only view of the row this position commits into. Built lazily
     // and bounds-checked on purpose: once `pos / ratio >= max_compressed`
@@ -2932,40 +3015,81 @@ fn compressor_forward_impl(
         else {
             return;
         };
-        comp_dbg(
-            gpu,
-            name,
-            &kv_cache.sub_offset(slot * head_dim, head_dim),
-            head_dim,
-        );
+        if cache_is_f16 {
+            comp_dbg(gpu, name, commit_f32, head_dim);
+        } else {
+            comp_dbg(
+                gpu,
+                name,
+                &kv_cache.sub_offset(slot * head_dim, head_dim),
+                head_dim,
+            );
+        }
     };
     comp_dbg_commit_row(&*gpu, "kv_cache(pool)");
-    gpu.rmsnorm_f32_at_slot_buf(
-        kv_cache,
-        norm,
-        &commit_slot_buf,
-        head_dim as i32,
-        cfg.rms_norm_eps,
-    )
-    .map_err(|e| format!("comp rmsnorm buf l{layer_idx}: {e:?}"))?;
-    comp_dbg_commit_row(&*gpu, "kv_cache(rmsnorm)");
-    if do_rope {
-        gpu.rope_tail_yarn_interleaved_at_slot_buf(
-            kv_cache,
-            &pos_buf,
+    if cache_is_f16 {
+        gpu.rmsnorm_f32_staged_buf_gfx1201(
+            commit_f32,
+            norm,
             &commit_slot_buf,
             head_dim as i32,
-            cfg.qk_rope_head_dim as i32,
-            freq_base,
-            freq_scale,
-            ext_factor,
-            attn_factor,
-            corr_low,
-            corr_high,
+            cfg.rms_norm_eps,
         )
-        .map_err(|e| format!("comp rope buf l{layer_idx}: {e:?}"))?;
+        .map_err(|e| format!("comp rmsnorm staged buf l{layer_idx}: {e:?}"))?;
+    } else {
+        gpu.rmsnorm_f32_at_slot_buf(
+            kv_cache,
+            norm,
+            &commit_slot_buf,
+            head_dim as i32,
+            cfg.rms_norm_eps,
+        )
+        .map_err(|e| format!("comp rmsnorm buf l{layer_idx}: {e:?}"))?;
+    }
+    comp_dbg_commit_row(&*gpu, "kv_cache(rmsnorm)");
+    if do_rope {
+        if cache_is_f16 {
+            gpu.rope_tail_yarn_interleaved_staged_buf_gfx1201(
+                commit_f32,
+                &pos_buf,
+                &commit_slot_buf,
+                head_dim as i32,
+                cfg.qk_rope_head_dim as i32,
+                freq_base,
+                freq_scale,
+                ext_factor,
+                attn_factor,
+                corr_low,
+                corr_high,
+            )
+            .map_err(|e| format!("comp rope staged buf l{layer_idx}: {e:?}"))?;
+        } else {
+            gpu.rope_tail_yarn_interleaved_at_slot_buf(
+                kv_cache,
+                &pos_buf,
+                &commit_slot_buf,
+                head_dim as i32,
+                cfg.qk_rope_head_dim as i32,
+                freq_base,
+                freq_scale,
+                ext_factor,
+                attn_factor,
+                corr_low,
+                corr_high,
+            )
+            .map_err(|e| format!("comp rope buf l{layer_idx}: {e:?}"))?;
+        }
     }
     comp_dbg_commit_row(&*gpu, "kv_cache(rope)");
+    if cache_is_f16 {
+        gpu.cast_f32_to_f16_at_slot_buf_gfx1201(
+            commit_f32,
+            kv_cache,
+            &commit_slot_buf,
+            head_dim as i32,
+        )
+        .map_err(|e| format!("comp cache f16 store buf l{layer_idx}: {e:?}"))?;
+    }
     if overlap {
         gpu.state_overlap_shift_f32_buf(kv_state, &shift_slot_buf, ratio as i32, proj_dim as i32)
             .map_err(|e| format!("comp kv_state shift buf l{layer_idx}: {e:?}"))?;
@@ -3057,10 +3181,17 @@ fn compressor_forward_batched(
         .compressor_cache_placement
         .local_rows(max_compressed)
         .max(1);
+    let compressor_cache_dtype = state.compressor_cache_dtype;
 
     // Lazy-alloc state buffers (mirror compressor_forward_impl exactly).
     {
         let l_state = &mut state._indexer[layer_idx];
+        if compressor_cache_dtype == DType::F16 && l_state.comp_cache_row_f32.is_none() {
+            l_state.comp_cache_row_f32 = Some(
+                gpu.zeros(&[cfg.head_dim], DType::F32)
+                    .map_err(|e| format!("alloc comp cache staging row l{layer_idx}: {e:?}"))?,
+            );
+        }
         if is_indexer {
             if l_state.indexer_kv_state.is_none() {
                 l_state.indexer_kv_state = Some(
@@ -3079,7 +3210,7 @@ fn compressor_forward_batched(
             }
             if l_state.indexer_kv_cache.is_none() {
                 l_state.indexer_kv_cache = Some(
-                    gpu.zeros(&[local_max_compressed, head_dim], DType::F32)
+                    gpu.zeros(&[local_max_compressed, head_dim], compressor_cache_dtype)
                         .map_err(|e| format!("alloc idx kv_cache l{layer_idx}: {e:?}"))?,
                 );
             }
@@ -3100,7 +3231,7 @@ fn compressor_forward_batched(
             }
             if l_state.main_kv_cache.is_none() {
                 l_state.main_kv_cache = Some(
-                    gpu.zeros(&[local_max_compressed, head_dim], DType::F32)
+                    gpu.zeros(&[local_max_compressed, head_dim], compressor_cache_dtype)
                         .map_err(|e| format!("alloc main kv_cache l{layer_idx}: {e:?}"))?,
                 );
             }
@@ -3229,13 +3360,23 @@ fn compressor_forward_batched(
                 local_compressed_slot_base * head_dim,
                 n_events_capped * head_dim,
             );
+            let cache_is_f16 = kv_cache.dtype == DType::F16;
+            let staged_out;
+            let commit_out = if cache_is_f16 {
+                staged_out = pbs
+                    .comp_cache_batch_f32
+                    .sub_offset(0, n_events_capped * head_dim);
+                &staged_out
+            } else {
+                &kv_cache_out
+            };
 
             gpu.compressor_compress_aligned_batched_f32(
                 &prev_kv,
                 &prev_score,
                 kv_batch_full,
                 score_batch_full,
-                &kv_cache_out,
+                commit_out,
                 ratio as i32,
                 head_dim as i32,
                 n_events_capped as i32,
@@ -3246,9 +3387,9 @@ fn compressor_forward_batched(
 
             // RMSNorm batched over n_events × head_dim.
             gpu.rmsnorm_batched(
-                &kv_cache_out,
+                commit_out,
                 norm,
-                &kv_cache_out,
+                commit_out,
                 n_events_capped,
                 head_dim,
                 cfg.rms_norm_eps,
@@ -3293,8 +3434,8 @@ fn compressor_forward_batched(
 
             if is_indexer {
                 gpu.rope_tail_interleaved_batched(
-                    &kv_cache_out,
-                    &kv_cache_out,
+                    commit_out,
+                    commit_out,
                     &pbs.comp_positions,
                     1,
                     0,
@@ -3308,8 +3449,8 @@ fn compressor_forward_batched(
                 let (freq_base, freq_scale, ext_factor, attn_factor, corr_low, corr_high) =
                     layer_rope_params(cfg, layer.compress_ratio);
                 gpu.rope_tail_yarn_interleaved_batched(
-                    &kv_cache_out,
-                    &kv_cache_out,
+                    commit_out,
+                    commit_out,
                     &pbs.comp_positions,
                     1,
                     0,
@@ -3325,6 +3466,10 @@ fn compressor_forward_batched(
                     n_events_capped as i32,
                 )
                 .map_err(|e| format!("comp main rope batched l{layer_idx}: {e:?}"))?;
+            }
+            if cache_is_f16 {
+                gpu.cast_f32_to_f16(commit_out, &kv_cache_out)
+                    .map_err(|e| format!("comp cache f16 store batched l{layer_idx}: {e:?}"))?;
             }
         }
 
@@ -3616,6 +3761,11 @@ fn indexer_forward(
     if let crate::deepseek4::CompressorCachePlacement::BlockCyclic(shard) =
         state.compressor_cache_placement
     {
+        if kv_cache.dtype == DType::F16 {
+            return Err(format!(
+                "F16 compressor cache does not support block-cyclic placement l{layer_idx}"
+            ));
+        }
         let l_state = &state._indexer[layer_idx];
         if l_state.cache_shard_count != shard.world() {
             return Err(format!(
@@ -3637,6 +3787,18 @@ fn indexer_forward(
             shard.block_rows() as i32,
         )
         .map_err(|e| format!("idx score sharded buf l{layer_idx}: {e:?}"))?;
+    } else if kv_cache.dtype == DType::F16 {
+        gpu.indexer_relu_score_f16_buf_gfx1201(
+            q_idx,
+            kv_cache,
+            idx_w,
+            scores,
+            &n_buf,
+            max_compressed as i32,
+            h as i32,
+            d as i32,
+        )
+        .map_err(|e| format!("idx score f16 buf l{layer_idx}: {e:?}"))?;
     } else {
         gpu.indexer_relu_score_f32_buf(
             q_idx,
@@ -8365,6 +8527,11 @@ fn attn_stub(
                 if let crate::deepseek4::CompressorCachePlacement::BlockCyclic(shard) =
                     state.compressor_cache_placement
                 {
+                    if main_kv_cache.dtype == DType::F16 {
+                        return Err(format!(
+                            "F16 compressor cache does not support block-cyclic gather l{layer_idx}"
+                        ));
+                    }
                     gpu.deepseek4_topk_kv_gather_f32_buf_sharded_gfx1201(
                         &state._indexer[layer_idx].main_kv_cache_shards,
                         topk_idx,
@@ -8380,6 +8547,20 @@ fn attn_stub(
                         shard.block_rows() as i32,
                     )
                     .map_err(|e| format!("mixed gather sharded (idx,buf) l{layer_idx}: {e:?}"))?;
+                } else if main_kv_cache.dtype == DType::F16 {
+                    gpu.deepseek4_topk_kv_gather_f16_buf_gfx1201(
+                        main_kv_cache,
+                        topk_idx,
+                        gathered_k,
+                        &k_active_buf,
+                        &n_compressed_buf,
+                        topk_max as i32,
+                        head_dim as i32,
+                        topk_max as i32,
+                        0,
+                        1.0,
+                    )
+                    .map_err(|e| format!("mixed gather f16 (idx,buf) l{layer_idx}: {e:?}"))?;
                 } else {
                     gpu.deepseek4_topk_kv_gather_f32_buf(
                         main_kv_cache,
@@ -8402,6 +8583,11 @@ fn attn_stub(
                 if let crate::deepseek4::CompressorCachePlacement::BlockCyclic(shard) =
                     state.compressor_cache_placement
                 {
+                    if main_kv_cache.dtype == DType::F16 {
+                        return Err(format!(
+                            "F16 compressor cache does not support block-cyclic identity gather l{layer_idx}"
+                        ));
+                    }
                     gpu.deepseek4_topk_kv_gather_identity_f32_buf_sharded_gfx1201(
                         &state._indexer[layer_idx].main_kv_cache_shards,
                         gathered_k,
@@ -8413,6 +8599,16 @@ fn attn_stub(
                         shard.block_rows() as i32,
                     )
                     .map_err(|e| format!("mixed gather sharded (all,buf) l{layer_idx}: {e:?}"))?;
+                } else if main_kv_cache.dtype == DType::F16 {
+                    gpu.deepseek4_topk_kv_gather_identity_f16_buf_gfx1201(
+                        main_kv_cache,
+                        gathered_k,
+                        &k_active_buf,
+                        topk_max as i32,
+                        head_dim as i32,
+                        topk_max as i32,
+                    )
+                    .map_err(|e| format!("mixed gather f16 (all,buf) l{layer_idx}: {e:?}"))?;
                 } else {
                     gpu.deepseek4_topk_kv_gather_identity_f32_buf(
                         main_kv_cache,
@@ -10286,6 +10482,9 @@ pub struct PrefillBatchScratch {
     pub comp_main_score_batch: GpuTensor, // [B, 2*head_dim]
     pub comp_idx_kv_batch: GpuTensor,     // [B, 2*idx_head_dim]
     pub comp_idx_score_batch: GpuTensor,  // [B, 2*idx_head_dim]
+    /// F32 compressor output stage `[B, head_dim]` used only when the
+    /// long-lived cache is F16. Main and indexer commits reuse it serially.
+    pub comp_cache_batch_f32: GpuTensor,
     // ── Scatter-by-expert MoE sort outputs ──
     // Single counting-sort produces these per layer; the grouped MoE
     // GEMVs then read each expert weight slab once with cache reuse.
@@ -10477,6 +10676,7 @@ impl PrefillBatchScratch {
         add(b * idx_topk)?;
         add(4 * b * head_dim)?; // main compressor kv + score
         add(4 * b * idx_dim)?; // indexer compressor kv + score
+        add(b * head_dim)?; // F16 compressor-cache commit staging
         add(3 * b * topk)?; // sorted b/krank/expert
         add(n_exp + 1)?; // expert starts
         raw_bytes += n_exp * 4; // expert token counts
@@ -10681,6 +10881,7 @@ impl PrefillBatchScratch {
             alloc_f32!(&[max_batch, 2 * cfg.index_head_dim], "comp_idx_kv_batch");
         let comp_idx_score_batch =
             alloc_f32!(&[max_batch, 2 * cfg.index_head_dim], "comp_idx_score_batch");
+        let comp_cache_batch_f32 = alloc_f32!(&[max_batch, head_dim], "comp_cache_batch_f32");
         let moe_sorted_b = alloc_f32!(&[max_batch * cfg.num_experts_per_tok], "moe_sorted_b");
         let moe_sorted_krank =
             alloc_f32!(&[max_batch * cfg.num_experts_per_tok], "moe_sorted_krank");
@@ -10784,6 +10985,7 @@ impl PrefillBatchScratch {
             comp_main_score_batch: comp_main_score_batch.into_tensor(),
             comp_idx_kv_batch: comp_idx_kv_batch.into_tensor(),
             comp_idx_score_batch: comp_idx_score_batch.into_tensor(),
+            comp_cache_batch_f32: comp_cache_batch_f32.into_tensor(),
             moe_sorted_b: moe_sorted_b.into_tensor(),
             moe_sorted_krank: moe_sorted_krank.into_tensor(),
             moe_sorted_expert: moe_sorted_expert.into_tensor(),
@@ -10902,6 +11104,7 @@ impl PrefillBatchScratch {
             self.comp_main_score_batch,
             self.comp_idx_kv_batch,
             self.comp_idx_score_batch,
+            self.comp_cache_batch_f32,
             self.moe_sorted_b,
             self.moe_sorted_krank,
             self.moe_sorted_expert,
@@ -11645,6 +11848,7 @@ fn attention_block_batched_mixed(
     // gathered path, whose live row counts are device-buffer driven.
     let use_topk_direct = !capture_safe
         && ratio == 4
+        && state.compressor_cache_dtype == DType::F32
         && matches!(
             state.compressor_cache_placement,
             crate::deepseek4::CompressorCachePlacement::Replicated
@@ -12138,6 +12342,11 @@ fn attention_block_batched_mixed(
             if let crate::deepseek4::CompressorCachePlacement::BlockCyclic(shard) =
                 state.compressor_cache_placement
             {
+                if kv_cache.dtype == DType::F16 {
+                    return Err(format!(
+                        "F16 compressor cache does not support block-cyclic batched score l{layer_idx}"
+                    ));
+                }
                 let l_state = &state._indexer[layer_idx];
                 if l_state.cache_shard_count != shard.world() {
                     return Err(format!(
@@ -12162,6 +12371,32 @@ fn attention_block_batched_mixed(
                 .map_err(|e| {
                     format!("indexer_relu_score_wmma_batched_sharded l{layer_idx}: {e:?}")
                 })?;
+            } else if kv_cache.dtype == DType::F16 && use_indexer_wmma {
+                gpu.indexer_relu_score_wmma_batched_f16_gfx1201(
+                    &pbs.idx_q_batch,
+                    kv_cache,
+                    &pbs.idx_w_batch,
+                    n_compressed_arr,
+                    &pbs.idx_scores_batch,
+                    h_idx as i32,
+                    d_idx as i32,
+                    max_compressed as i32,
+                    batch_size as i32,
+                )
+                .map_err(|e| format!("indexer_relu_score_wmma_batched_f16 l{layer_idx}: {e:?}"))?;
+            } else if kv_cache.dtype == DType::F16 {
+                gpu.indexer_relu_score_batched_f16_gfx1201(
+                    &pbs.idx_q_batch,
+                    kv_cache,
+                    &pbs.idx_w_batch,
+                    n_compressed_arr,
+                    &pbs.idx_scores_batch,
+                    h_idx as i32,
+                    d_idx as i32,
+                    max_compressed as i32,
+                    batch_size as i32,
+                )
+                .map_err(|e| format!("indexer_relu_score_batched_f16 l{layer_idx}: {e:?}"))?;
             } else if use_indexer_wmma {
                 if gpu.arch.eq_ignore_ascii_case("gfx1151") {
                     // All four WMMA warps consume the same 16x128 K tile.
@@ -12297,6 +12532,11 @@ fn attention_block_batched_mixed(
                 if let crate::deepseek4::CompressorCachePlacement::BlockCyclic(shard) =
                     state.compressor_cache_placement
                 {
+                    if main_kv_cache.dtype == DType::F16 {
+                        return Err(format!(
+                            "F16 compressor cache does not support block-cyclic batched gather l{layer_idx}"
+                        ));
+                    }
                     gpu.deepseek4_topk_kv_gather_batched_tiled_sharded_gfx1201(
                         &state._indexer[layer_idx].main_kv_cache_shards,
                         &pbs.idx_topk_indices_batch,
@@ -12314,6 +12554,24 @@ fn attention_block_batched_mixed(
                     .map_err(|e| {
                         format!(
                             "deepseek4_topk_kv_gather_batched_tiled_sharded_gfx1201 l{layer_idx}: {e:?}"
+                        )
+                    })?;
+                } else if main_kv_cache.dtype == DType::F16 {
+                    gpu.deepseek4_topk_kv_gather_batched_tiled_f16_gfx1201(
+                        main_kv_cache,
+                        &pbs.idx_topk_indices_batch,
+                        &pbs.topk_staged_batch,
+                        topk_max as i32,
+                        head_dim as i32,
+                        n_compressed,
+                        topk_max as i32,
+                        0,
+                        /*scale=*/ 1.0,
+                        batch_size as i32,
+                    )
+                    .map_err(|e| {
+                        format!(
+                            "deepseek4_topk_kv_gather_batched_tiled_f16_gfx1201 l{layer_idx}: {e:?}"
                         )
                     })?;
                 } else if tiled_gfx1201 {
@@ -12378,6 +12636,11 @@ fn attention_block_batched_mixed(
             if let crate::deepseek4::CompressorCachePlacement::BlockCyclic(shard) =
                 state.compressor_cache_placement
             {
+                if main_kv_cache.dtype == DType::F16 {
+                    return Err(format!(
+                        "F16 compressor cache does not support block-cyclic batched identity gather l{layer_idx}"
+                    ));
+                }
                 gpu.deepseek4_topk_kv_gather_identity_batched_sharded_gfx1201(
                     &state._indexer[layer_idx].main_kv_cache_shards,
                     &pbs.topk_staged_batch,
@@ -12390,6 +12653,18 @@ fn attention_block_batched_mixed(
                 )
                 .map_err(|e| {
                     format!("deepseek4_topk_kv_gather_identity_batched_sharded l{layer_idx}: {e:?}")
+                })?;
+            } else if main_kv_cache.dtype == DType::F16 {
+                gpu.deepseek4_topk_kv_gather_identity_batched_f16_gfx1201(
+                    main_kv_cache,
+                    &pbs.topk_staged_batch,
+                    gather_n_compressed as i32,
+                    head_dim as i32,
+                    topk_max as i32,
+                    batch_size as i32,
+                )
+                .map_err(|e| {
+                    format!("deepseek4_topk_kv_gather_identity_batched_f16 l{layer_idx}: {e:?}")
                 })?;
             } else {
                 gpu.deepseek4_topk_kv_gather_identity_batched_f32(

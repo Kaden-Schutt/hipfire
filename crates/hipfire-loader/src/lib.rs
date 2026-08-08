@@ -1531,9 +1531,43 @@ impl Drop for MinimaxEpStaging {
 /// tests the completed-rank cleanup path (which IS fixed), not this inner window.
 /// The proper fix is an unwind-safe allocation-tracking loader refactor. Deferred.
 pub fn load_model_ep(path: &str, max_seq: usize, tp: usize) -> Result<LoadedModel, String> {
+    load_model_ep_with_compressor_cache(
+        path,
+        max_seq,
+        tp,
+        hipfire_config::Deepseek4CompressorCache::F32,
+    )
+}
+
+fn resolve_deepseek4_compressor_cache_kv_mode(
+    kv_mode: Option<&str>,
+) -> Result<hipfire_config::Deepseek4CompressorCache, String> {
+    match kv_mode.unwrap_or("f32").to_ascii_lowercase().as_str() {
+        "" | "auto" | "f32" => Ok(hipfire_config::Deepseek4CompressorCache::F32),
+        "f16" => Ok(hipfire_config::Deepseek4CompressorCache::F16),
+        other => Err(format!(
+            "DeepSeek V4 kv_cache={other} is not implemented; use f32 (golden/default) or f16 (gfx1201 MQ2R TP3/TP4 capacity route)"
+        )),
+    }
+}
+
+/// EP load using the standard user-facing KV selector. DeepSeek V4 maps f32/f16
+/// to its long-lived compressor-cache storage; MiniMax retains its historical
+/// EP behavior and does not inherit DeepSeek-specific policy.
+pub fn load_model_ep_with_kv_mode(
+    path: &str,
+    max_seq: usize,
+    tp: usize,
+    kv_mode: Option<&str>,
+) -> Result<LoadedModel, String> {
     let hfq = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
     match hfq.arch_id {
-        9 => load_model_ep_ds4(path, max_seq, tp),
+        9 => load_model_ep_ds4(
+            path,
+            max_seq,
+            tp,
+            resolve_deepseek4_compressor_cache_kv_mode(kv_mode)?,
+        ),
         10 => load_model_ep_minimax(path, max_seq, tp),
         id => Err(format!(
             "EP not supported for arch_id={id} (expected 9 for DeepSeek V4 or 10 for MiniMax)"
@@ -1541,7 +1575,34 @@ pub fn load_model_ep(path: &str, max_seq: usize, tp: usize) -> Result<LoadedMode
     }
 }
 
-fn load_model_ep_ds4(path: &str, max_seq: usize, tp: usize) -> Result<LoadedModel, String> {
+/// Expert-parallel load with an explicit DeepSeek V4 compressor-cache storage
+/// policy. The compatibility wrapper above deliberately retains the historical
+/// F32 route.
+pub fn load_model_ep_with_compressor_cache(
+    path: &str,
+    max_seq: usize,
+    tp: usize,
+    compressor_cache: hipfire_config::Deepseek4CompressorCache,
+) -> Result<LoadedModel, String> {
+    let hfq = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
+    match hfq.arch_id {
+        9 => load_model_ep_ds4(path, max_seq, tp, compressor_cache),
+        10 if compressor_cache == hipfire_config::Deepseek4CompressorCache::F32 => {
+            load_model_ep_minimax(path, max_seq, tp)
+        }
+        10 => Err("DeepSeek V4 compressor-cache storage cannot be applied to MiniMax".to_string()),
+        id => Err(format!(
+            "EP not supported for arch_id={id} (expected 9 for DeepSeek V4 or 10 for MiniMax)"
+        )),
+    }
+}
+
+fn load_model_ep_ds4(
+    path: &str,
+    max_seq: usize,
+    tp: usize,
+    compressor_cache: hipfire_config::Deepseek4CompressorCache,
+) -> Result<LoadedModel, String> {
     use hipfire_runtime::arch::Architecture;
     use hipfire_runtime::tp_shard::{ExpertAssign, ShardConfig};
 
@@ -1633,8 +1694,8 @@ fn load_model_ep_ds4(path: &str, max_seq: usize, tp: usize) -> Result<LoadedMode
     if gfx1201_mq2r_tp {
         // Keep compressor caches replicated and device-local on the normal
         // path. Peer-reading the block-cyclic experiment was exact but reduced
-        // 21K NIAH decode from 41.15 to 11.10 tok/s. Capacity growth may add a
-        // managed overflow tail, but never changes the local prefix route.
+        // 21K NIAH decode from 41.15 to 11.10 tok/s. Capacity growth therefore
+        // remains entirely device-local; F16 storage is what makes 1M feasible.
         // B=1024 is the certified short-context throughput schedule. At a
         // declared long-context ceiling, B=512 gives back about 1.34 GiB/rank
         // while retaining most grouped-MoE occupancy. At the advertised 1M
@@ -1645,6 +1706,13 @@ fn load_model_ep_ds4(path: &str, max_seq: usize, tp: usize) -> Result<LoadedMode
         const EXTREME_CONTEXT_BATCH: usize = 128;
         const LONG_CONTEXT_THRESHOLD: usize = 32 * 1024;
         const EXTREME_CONTEXT_THRESHOLD: usize = 256 * 1024;
+        let compressor_cache_dtype = match compressor_cache {
+            hipfire_config::Deepseek4CompressorCache::F32 => rdna_compute::DType::F32,
+            hipfire_config::Deepseek4CompressorCache::F16 => rdna_compute::DType::F16,
+        };
+        for state in &mut staging.state {
+            state.compressor_cache_dtype = compressor_cache_dtype;
+        }
         let ep_prefill_max_batch = if max_seq > EXTREME_CONTEXT_THRESHOLD {
             EXTREME_CONTEXT_BATCH
         } else if max_seq > LONG_CONTEXT_THRESHOLD {
@@ -1677,7 +1745,7 @@ fn load_model_ep_ds4(path: &str, max_seq: usize, tp: usize) -> Result<LoadedMode
             staging.prefill.push(pbs);
         }
         eprintln!(
-            "[loader] gfx1201 TP{tp} batched prefill: B={} scratch={:.2} GiB/rank",
+            "[loader] gfx1201 TP{tp} batched prefill: B={} scratch={:.2} GiB/rank compressor_cache={compressor_cache}",
             ep_prefill_max_batch,
             projected as f64 / (1u64 << 30) as f64,
         );
@@ -1685,6 +1753,19 @@ fn load_model_ep_ds4(path: &str, max_seq: usize, tp: usize) -> Result<LoadedMode
             .gpus_mut()
             .prepare_tp_graph_signals(config.num_hidden_layers * 2)
             .map_err(|e| format!("prepare gfx1201 TP graph signals: {e:?}"))?;
+    } else if compressor_cache == hipfire_config::Deepseek4CompressorCache::F16 {
+        return Err(format!(
+            "DeepSeek V4 compressor_cache=f16 currently requires gfx1201 MQ2R TP3/TP4; got tp={tp}, mq2r={}, mq2rxt={}, devices={}",
+            config.mq2r,
+            config.mq2rxt,
+            staging
+                .gpus_mut()
+                .devices
+                .iter()
+                .map(|device| device.arch.as_str())
+                .collect::<Vec<_>>()
+                .join(",")
+        ));
     }
     let peer = staging
         .gpus_mut()
@@ -2083,7 +2164,31 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(
 
 #[cfg(test)]
 mod registry_tests {
-    use super::REGISTRY;
+    use super::{resolve_deepseek4_compressor_cache_kv_mode, REGISTRY};
+
+    #[test]
+    fn deepseek4_kv_mode_is_truthful_and_fail_closed() {
+        use hipfire_config::Deepseek4CompressorCache::{F16, F32};
+
+        assert_eq!(
+            resolve_deepseek4_compressor_cache_kv_mode(None).unwrap(),
+            F32
+        );
+        assert_eq!(
+            resolve_deepseek4_compressor_cache_kv_mode(Some("auto")).unwrap(),
+            F32
+        );
+        assert_eq!(
+            resolve_deepseek4_compressor_cache_kv_mode(Some("f32")).unwrap(),
+            F32
+        );
+        assert_eq!(
+            resolve_deepseek4_compressor_cache_kv_mode(Some("f16")).unwrap(),
+            F16
+        );
+        let error = resolve_deepseek4_compressor_cache_kv_mode(Some("q8")).unwrap_err();
+        assert!(error.contains("not implemented"), "{error}");
+    }
 
     /// Every known arch_id must be claimed by AT MOST one carrier, for both
     /// source namespaces (HFQ header ids and `derive_arch_id` dir ids). This

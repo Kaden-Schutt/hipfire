@@ -4,15 +4,16 @@
 
 //! DeepSeek V4 TP compressed-cache capacity probe.
 //!
-//! Loads the production EP/TP route once, grows the request-owned F32
+//! Loads the production EP/TP route once, grows the request-owned
 //! compressor caches through a list of capacities, and records per-rank VMM
 //! reserve/mapping plus physical VRAM. It intentionally performs no prefill;
 //! use `scripts/serve_harness.py` for coherent long-context generation.
 
 use hipfire_arch_deepseek4::forward::{ensure_request_capacity, forward_ep_prefill_batch_chunked};
 use hipfire_arch_deepseek4::{CompressorCachePlacement, DeepseekV4State};
-use hipfire_loader::{load_model_ep, EpArch};
-use rdna_compute::Gpu;
+use hipfire_config::Deepseek4CompressorCache;
+use hipfire_loader::{load_model_ep_with_compressor_cache, EpArch};
+use rdna_compute::{DType, Gpu};
 
 const DEFAULT_TOKENS: &[usize] = &[20_480, 81_920, 1_048_576];
 
@@ -24,6 +25,7 @@ struct Args {
     expected_identity_hash: Option<u64>,
     replicated_cache: bool,
     identity_detail: bool,
+    compressor_cache: Deepseek4CompressorCache,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -34,6 +36,7 @@ fn parse_args() -> Result<Args, String> {
     let mut expected_identity_hash = None;
     let mut replicated_cache = false;
     let mut identity_detail = false;
+    let mut compressor_cache = Deepseek4CompressorCache::F32;
     let argv: Vec<String> = std::env::args().collect();
     let mut i = 1usize;
     while i < argv.len() {
@@ -88,6 +91,10 @@ fn parse_args() -> Result<Args, String> {
                 identity_detail = true;
                 i += 1;
             }
+            "--compressor-cache" => {
+                compressor_cache = value(i, "--compressor-cache")?.parse()?;
+                i += 2;
+            }
             flag => return Err(format!("unknown argument {flag}")),
         }
     }
@@ -114,6 +121,7 @@ fn parse_args() -> Result<Args, String> {
         expected_identity_hash,
         replicated_cache,
         identity_detail,
+        compressor_cache,
     })
 }
 
@@ -192,9 +200,23 @@ fn cache_bits(
     elements: usize,
 ) -> Result<Vec<u32>, String> {
     let view = tensor.sub_offset(0, elements);
-    gpu.download_f32(&view)
-        .map(|values| values.into_iter().map(f32::to_bits).collect())
-        .map_err(|error| format!("download compressor cache: {error:?}"))
+    match view.dtype {
+        DType::F32 => gpu
+            .download_f32(&view)
+            .map(|values| values.into_iter().map(f32::to_bits).collect())
+            .map_err(|error| format!("download F32 compressor cache: {error:?}")),
+        DType::F16 => {
+            let mut bytes = vec![0u8; view.byte_size()];
+            gpu.hip
+                .memcpy_dtoh(&mut bytes, &view.buf)
+                .map_err(|error| format!("download F16 compressor cache: {error:?}"))?;
+            Ok(bytes
+                .chunks_exact(2)
+                .map(|pair| u16::from_le_bytes([pair[0], pair[1]]) as u32)
+                .collect())
+        }
+        dtype => Err(format!("unsupported compressor cache dtype {dtype:?}")),
+    }
 }
 
 fn prove_cache_identity(
@@ -408,10 +430,11 @@ fn run() -> Result<(), String> {
     let max_seq =
         (*args.tokens.last().expect("nonempty tokens")).max(args.identity_tokens.unwrap_or(0));
     println!(
-        "CAPACITY_PROBE model={} tp={} max_seq={} tokens={:?}",
-        args.model, args.tp, max_seq, args.tokens
+        "CAPACITY_PROBE model={} tp={} max_seq={} tokens={:?} compressor_cache={}",
+        args.model, args.tp, max_seq, args.tokens, args.compressor_cache
     );
-    let mut loaded = load_model_ep(&args.model, max_seq, args.tp)?;
+    let mut loaded =
+        load_model_ep_with_compressor_cache(&args.model, max_seq, args.tp, args.compressor_cache)?;
     let ep = loaded
         .ep
         .as_mut()

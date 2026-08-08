@@ -6,7 +6,7 @@
 
 use std::ffi::c_void;
 
-use crate::dispatch::{Gpu, GpuTensor};
+use crate::dispatch::{DType, Gpu, GpuTensor};
 use crate::kernels;
 use hip_bridge::HipResult;
 
@@ -1493,6 +1493,242 @@ impl Gpu {
                 b.push_i32(os);
                 b.push_i32(ranks);
                 b.push_i32(block);
+                b
+            },
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn deepseek4_topk_kv_gather_f16_buf_gfx1201(
+        &mut self,
+        cache: &GpuTensor,
+        topk_idx: &GpuTensor,
+        out: &GpuTensor,
+        k_buf: &GpuTensor,
+        n_compressed_buf: &GpuTensor,
+        max_k: i32,
+        head_dim: i32,
+        out_stride: i32,
+        col_offset: i32,
+        scale: f32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert!(self.arch_caps.is_gfx1201());
+        assert_eq!(cache.dtype, DType::F16);
+        let symbol = "deepseek4_topk_kv_gather_f16_buf_gfx1201";
+        self.ensure_kernel(
+            symbol,
+            kernels::DEEPSEEK4_COMPRESSOR_CACHE_F16_GFX1201_SRC,
+            symbol,
+        )?;
+        let cp = cache.buf.as_ptr();
+        let ip = topk_idx.buf.as_ptr();
+        let op = out.buf.as_ptr();
+        let kbp = k_buf.buf.as_ptr();
+        let ncp = n_compressed_buf.buf.as_ptr();
+        let mut hd = head_dim;
+        let mut os = out_stride;
+        let mut co = col_offset;
+        let mut sc = scale;
+        let mut params: Vec<*mut c_void> = vec![
+            &cp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &kbp as *const _ as *mut c_void,
+            &ncp as *const _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut os as *mut _ as *mut c_void,
+            &mut co as *mut _ as *mut c_void,
+            &mut sc as *mut _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            symbol,
+            [max_k as u32, 1, 1],
+            [head_dim as u32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(cp);
+                b.push_ptr(ip);
+                b.push_ptr(op);
+                b.push_ptr(kbp);
+                b.push_ptr(ncp);
+                b.push_i32(hd);
+                b.push_i32(os);
+                b.push_i32(co);
+                b.push_f32(sc);
+                b
+            },
+        )
+    }
+
+    pub fn deepseek4_topk_kv_gather_identity_f16_buf_gfx1201(
+        &mut self,
+        cache: &GpuTensor,
+        out: &GpuTensor,
+        k_buf: &GpuTensor,
+        max_k: i32,
+        head_dim: i32,
+        out_stride: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert!(self.arch_caps.is_gfx1201());
+        assert_eq!(cache.dtype, DType::F16);
+        let symbol = "deepseek4_topk_kv_gather_identity_f16_buf_gfx1201";
+        self.ensure_kernel(
+            symbol,
+            kernels::DEEPSEEK4_COMPRESSOR_CACHE_F16_GFX1201_SRC,
+            symbol,
+        )?;
+        let cp = cache.buf.as_ptr();
+        let op = out.buf.as_ptr();
+        let kbp = k_buf.buf.as_ptr();
+        let mut hd = head_dim;
+        let mut os = out_stride;
+        let mut params: Vec<*mut c_void> = vec![
+            &cp as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &kbp as *const _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut os as *mut _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            symbol,
+            [max_k as u32, 1, 1],
+            [head_dim as u32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(cp);
+                b.push_ptr(op);
+                b.push_ptr(kbp);
+                b.push_i32(hd);
+                b.push_i32(os);
+                b
+            },
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn deepseek4_topk_kv_gather_batched_tiled_f16_gfx1201(
+        &mut self,
+        cache: &GpuTensor,
+        topk_idx: &GpuTensor,
+        out: &GpuTensor,
+        k_active: i32,
+        head_dim: i32,
+        n_compressed: i32,
+        out_stride: i32,
+        col_offset: i32,
+        scale: f32,
+        batch_size: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert!(self.arch_caps.is_gfx1201());
+        assert_eq!(cache.dtype, DType::F16);
+        let symbol = "deepseek4_topk_kv_gather_batched_tiled_f16_gfx1201";
+        self.ensure_kernel(
+            symbol,
+            kernels::DEEPSEEK4_COMPRESSOR_CACHE_F16_GFX1201_SRC,
+            symbol,
+        )?;
+        let cp = cache.buf.as_ptr();
+        let ip = topk_idx.buf.as_ptr();
+        let op = out.buf.as_ptr();
+        let mut k = k_active;
+        let mut hd = head_dim;
+        let mut nc = n_compressed;
+        let mut os = out_stride;
+        let mut co = col_offset;
+        let mut sc = scale;
+        let mut bs = batch_size;
+        let mut params: Vec<*mut c_void> = vec![
+            &cp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &mut k as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut nc as *mut _ as *mut c_void,
+            &mut os as *mut _ as *mut c_void,
+            &mut co as *mut _ as *mut c_void,
+            &mut sc as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            symbol,
+            [
+                (k_active as u32).div_ceil(32),
+                (head_dim as u32).div_ceil(32),
+                batch_size as u32,
+            ],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(cp);
+                b.push_ptr(ip);
+                b.push_ptr(op);
+                b.push_i32(k);
+                b.push_i32(hd);
+                b.push_i32(nc);
+                b.push_i32(os);
+                b.push_i32(co);
+                b.push_f32(sc);
+                b.push_i32(bs);
+                b
+            },
+        )
+    }
+
+    pub fn deepseek4_topk_kv_gather_identity_batched_f16_gfx1201(
+        &mut self,
+        cache: &GpuTensor,
+        out: &GpuTensor,
+        k_active: i32,
+        head_dim: i32,
+        out_stride: i32,
+        batch_size: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert!(self.arch_caps.is_gfx1201());
+        assert_eq!(cache.dtype, DType::F16);
+        let symbol = "deepseek4_topk_kv_gather_identity_batched_f16_gfx1201";
+        self.ensure_kernel(
+            symbol,
+            kernels::DEEPSEEK4_COMPRESSOR_CACHE_F16_GFX1201_SRC,
+            symbol,
+        )?;
+        let cp = cache.buf.as_ptr();
+        let op = out.buf.as_ptr();
+        let mut k = k_active;
+        let mut hd = head_dim;
+        let mut os = out_stride;
+        let mut bs = batch_size;
+        let mut params: Vec<*mut c_void> = vec![
+            &cp as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &mut k as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut os as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            symbol,
+            [k_active as u32, batch_size as u32, 1],
+            [head_dim as u32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(cp);
+                b.push_ptr(op);
+                b.push_i32(k);
+                b.push_i32(hd);
+                b.push_i32(os);
+                b.push_i32(bs);
                 b
             },
         )

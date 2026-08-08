@@ -1527,7 +1527,8 @@ pub struct IndexerLayerState {
     pub compress_ratio: u32,
 
     // ── Main-attention compressor state (ratio > 0) ────────────────
-    /// Compressed KV cache `[max_compressed_pos, head_dim]` F32. Holds
+    /// Compressed KV cache `[max_compressed_pos, head_dim]`. F32 on existing
+    /// routes; F16 on the exact gfx1201 MQ2R TP3/TP4 long-context route. Holds
     /// gated-pooled compressed values at slot pos//ratio. Used by main
     /// attention's gather step to extend SWA window.
     pub main_kv_cache: Option<rdna_compute::GpuTensor>,
@@ -1541,8 +1542,8 @@ pub struct IndexerLayerState {
 
     // ── Indexer state (ratio == 4 only) ────────────────────────────
     /// Indexer-specific compressed KV cache `[max_compressed_pos, idx_head_dim]`
-    /// F32. Built by indexer's separate compressor. Used by Q · K_idx
-    /// scoring step.
+    /// Built by indexer's separate compressor. Uses the same storage dtype as
+    /// `main_kv_cache` and is converted to F32 by scoring kernels.
     pub indexer_kv_cache: Option<rdna_compute::GpuTensor>,
     /// Exact gfx1201 TP peer table for block-cyclic compressor storage.
     /// Entries are stable VMM reservation bases, not owning buffers.
@@ -1577,6 +1578,9 @@ pub struct IndexerLayerState {
     /// Concat scratch for overlap-pool   [2*ratio, head_dim] F32.
     pub comp_concat_kv: Option<rdna_compute::GpuTensor>,
     pub comp_concat_score: Option<rdna_compute::GpuTensor>,
+    /// One-row F32 commit stage. F16 cache routes perform pool, RMSNorm, and
+    /// RoPE here, then round once at the final cache store.
+    pub comp_cache_row_f32: Option<rdna_compute::GpuTensor>,
 }
 
 /// Per-layer scratch for the main attention path's gathered K/V rows.
@@ -1653,6 +1657,11 @@ pub struct DeepseekV4State {
     /// Rank-local physical ownership for the long-lived main/indexer
     /// compressor caches. Small recurrent rings remain replicated.
     pub compressor_cache_placement: CompressorCachePlacement,
+
+    /// Storage dtype for the two long-lived compressor caches only. All
+    /// compressor arithmetic, score reductions, recurrent rings, and scratch
+    /// remain F32.
+    pub compressor_cache_dtype: rdna_compute::DType,
 
     /// Physical device ids granted read/write access to every sharded VMM
     /// cache reservation. Empty on replicated and single-GPU routes.
@@ -2022,6 +2031,7 @@ impl DeepseekV4State {
                 comp_score_buf: None,
                 comp_concat_kv: None,
                 comp_concat_score: None,
+                comp_cache_row_f32: None,
             });
             attention.push(MainAttentionLayerState {
                 swa_k: None,
@@ -2035,6 +2045,7 @@ impl DeepseekV4State {
         Ok(DeepseekV4State {
             compressor_capacity: CompressorCapacityPlan::new(cfg.max_position_embeddings)?,
             compressor_cache_placement: CompressorCachePlacement::Replicated,
+            compressor_cache_dtype: rdna_compute::DType::F32,
             compressor_cache_access_devices: [0; 4],
             compressor_cache_access_count: 0,
             _indexer: indexer,
@@ -2219,6 +2230,7 @@ impl DeepseekV4State {
             z(gpu, &l.comp_score_buf);
             z(gpu, &l.comp_concat_kv);
             z(gpu, &l.comp_concat_score);
+            z(gpu, &l.comp_cache_row_f32);
         }
         for l in &self._attention {
             z(gpu, &l.swa_k);
@@ -2275,6 +2287,7 @@ impl DeepseekV4State {
             free_opt(gpu, &mut l.comp_score_buf);
             free_opt(gpu, &mut l.comp_concat_kv);
             free_opt(gpu, &mut l.comp_concat_score);
+            free_opt(gpu, &mut l.comp_cache_row_f32);
         }
         for mut l in self._attention.drain(..) {
             free_opt(gpu, &mut l.swa_k);
