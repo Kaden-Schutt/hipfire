@@ -263,6 +263,75 @@ fn main() {
         after.payload.len()
     );
 
+    // ---- cost breakdown: what a synchronous eviction actually blocks on ----
+    // `park` runs on the ENGINE thread inside admit, so whatever it costs
+    // stalls every in-flight slot, not just the evicting request.
+    {
+        let dn_refs = dn_buffers(&dn_states[0]);
+        let t = std::time::Instant::now();
+        let snap = capture_slot(
+            &mut gpu,
+            &pool,
+            SlotId(0),
+            &k_arenas,
+            &v_arenas,
+            &dn_refs,
+            &prompt,
+            stamp,
+        )
+        .expect("capture timing");
+        let capture_ms = t.elapsed().as_secs_f64() * 1e3;
+        drop(dn_refs);
+
+        let t = std::time::Instant::now();
+        let encoded = snap.to_bytes();
+        let encode_ms = t.elapsed().as_secs_f64() * 1e3;
+
+        let tmp = std::env::temp_dir().join("hipfire-park-timing.bin");
+        let t = std::time::Instant::now();
+        std::fs::write(&tmp, &encoded).expect("write timing");
+        let write_ms = t.elapsed().as_secs_f64() * 1e3;
+
+        let t = std::time::Instant::now();
+        let read_back = std::fs::read(&tmp).expect("read timing");
+        let read_ms = t.elapsed().as_secs_f64() * 1e3;
+        let t = std::time::Instant::now();
+        let parsed = SlotSnapshot::from_bytes(&read_back).expect("parse timing");
+        let parse_ms = t.elapsed().as_secs_f64() * 1e3;
+        let _ = std::fs::remove_file(&tmp);
+
+        let dn_refs = dn_buffers(&dn_states[0]);
+        let t = std::time::Instant::now();
+        restore_slot(
+            &mut gpu,
+            &mut pool,
+            SlotId(0),
+            &k_arenas,
+            &v_arenas,
+            &dn_refs,
+            &parsed,
+            stamp,
+        )
+        .expect("restore timing");
+        let restore_ms = t.elapsed().as_secs_f64() * 1e3;
+        drop(dn_refs);
+
+        let mb = snap.payload.len() as f64 / 1e6;
+        println!("\n--- eviction cost breakdown ({mb:.1} MB snapshot) ---");
+        println!("  capture (GPU->host)   {capture_ms:8.2} ms   <- synchronous either way");
+        println!("  to_bytes (host copy)  {encode_ms:8.2} ms   <- only on the disk tier");
+        println!("  fs::write             {write_ms:8.2} ms   <- only on the disk tier");
+        println!("  ---- host tier park is a Vec move: ~0 ms ----");
+        println!("  fs::read              {read_ms:8.2} ms");
+        println!("  from_bytes            {parse_ms:8.2} ms");
+        println!("  restore (host->GPU)   {restore_ms:8.2} ms");
+        println!(
+            "  => a disk eviction blocks the engine for ~{:.1} ms; host ~{:.1} ms",
+            capture_ms + encode_ms + write_ms,
+            capture_ms
+        );
+    }
+
     // ---- disk tier: the serialised form must survive a file round trip ----
     let bytes = before.to_bytes();
     let parsed = SlotSnapshot::from_bytes(&bytes).expect("parse");
