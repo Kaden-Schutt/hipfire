@@ -583,13 +583,13 @@ authoritative constraint; a task is marked `in progress` only when work begins.
 
 ### STEP-003 Adopt Step/Manifest For Recurrent And Conv State
 
-- **Status:** ready
+- **Status:** in progress
 - **Dependencies:** COR-002, STEP-001
 - **Goal:** Represent recurrent and convolution operations/state in Step execution with mesh-aware placement and reset.
 - **Acceptance criteria:** Recurrent and conv state manifests encode layer ownership; Step execution handles prefill/decode state updates on the owning stage/device; boundary movement is explicit; the adapter implements the COR-002 reset contract; bespoke recurrent/conv forward loops are removed after parity.
 - **Validation:** Run state placement tests, multi-token prefill/decode parity, COR-002 conformance, repeated multi-turn tests, PP emulation, and Qwen35 recurrent coherence tests.
 - **Hardware:** A supported AMD GPU; physical PP closure is HW-004.
-- **Evidence:** Pending
+- **Evidence:** Increment 1 landed 2026-08-08 in `9dcb1862a` (`refactor(qwen35): manifest-derived recurrent/conv state placement`): the hand-built DeltaNet `la_to_device` sidecar is defined out of existence. `qwen35_la_devices(cfg, gpus)` derives the compact LA-layer → device map by filtering `state_manifest` `StateKind::Recurrent` entries (global-layer keyed) through `Gpus::device_for_layer`; `DeltaNetState::new_with_quant_multi` returns `Self` only and `free_gpu_multi` takes `&Qwen35Config`; `LoadedModel.pp_dn_la_to_device` and the `skeleton_pp` param are deleted; loader `validate_qwen35_pipeline_layout` / `reset_qwen35_pipeline_recurrent` / `validate_reset_layout` derive placement from config + mesh (single-model rejection keys off `pp_gpus`); daemon `reset_qwen35_recurrent`, both `generate_multi` reset blocks, and `reset_pp_uncommitted_state!` derive the map from bundle config + gpus. New GPU-gated test `qwen35_la_devices_matches_mesh_placement` proves the manifest map equals the mesh placement and state allocations land on their owning devices (passes with `HIPFIRE_EMULATE_GPUS=2`; the pointer-placement assertion is gated to distinct physical devices because emulated ranks alias one device). CPU suites: loader 106 passed / 12 ignored, qwen35 424 passed / 21 ignored, daemon example 192 passed; `cargo check --workspace --all-targets` clean; `git diff --check` clean. Remaining acceptance scope (not yet closed): single-GPU decode/prefill already execute the six DeltaNet Steps (`build_delta_net_decode_steps` / `build_delta_net_batch_steps` / `build_delta_net_tree_steps`), but the PP multi-GPU forward (`forward_scratch_layers_multi`) still runs bespoke raw kernels and `execute_steps_mesh` still asserts a 1×1 mesh — porting PP recurrent/conv Step execution on the owning stage/device and removing the bespoke loop after parity is the remaining work (overlaps GEN-001 arch-resident PP folding). Emulated PP parity gate (`pp_parity_chatml_50_decode`, `HIPFIRE_HAVE_2_GPU=1` + emulation) diverges at decode step 1 identically with and without this change — pre-existing on this box, HW-004-class, not introduced here.
 
 ### STEP-004 Migrate Remaining Forward Paths
 
