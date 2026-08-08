@@ -71,15 +71,13 @@ impl SlotEngine {
 
         let handle = std::thread::Builder::new()
             .name("hipfire-slot-engine".to_string())
-            .spawn(move || {
-                match Rig::build(&cfg) {
-                    Ok(rig) => {
-                        let _ = ready_tx.send(Ok(()));
-                        run_loop(rig, rx, stats_thread);
-                    }
-                    Err(e) => {
-                        let _ = ready_tx.send(Err(e));
-                    }
+            .spawn(move || match Rig::build(&cfg) {
+                Ok(rig) => {
+                    let _ = ready_tx.send(Ok(()));
+                    run_loop(rig, rx, stats_thread);
+                }
+                Err(e) => {
+                    let _ = ready_tx.send(Err(e));
                 }
             })
             .map_err(|e| format!("spawn engine thread: {e}"))?;
@@ -196,8 +194,7 @@ impl Rig {
         }
         let mut dn_states = Vec::with_capacity(cfg.n_slots);
         for _ in 0..cfg.n_slots {
-            dn_states
-                .push(DeltaNetState::new(&mut gpu, &config).map_err(|e| format!("dn: {e}"))?);
+            dn_states.push(DeltaNetState::new(&mut gpu, &config).map_err(|e| format!("dn: {e}"))?);
         }
         let desc_staging = SlotDescStaging::new(&mut gpu, cfg.n_slots, max_batch)
             .map_err(|e| format!("staging: {e}"))?;
@@ -390,9 +387,15 @@ fn run_loop(mut rig: Rig, rx: Receiver<SubmitRequest>, stats: Arc<Mutex<EngineSt
             }
             let tok = ids[s] as u32;
             let session = f.session;
-            let gone = send_event(&f.reply, Event::Token { id: tok }).is_err();
-            f.produced += 1;
             let hit_eos = rig.tokenizer.is_terminator(tok);
+            // Emit BEFORE counting, but never emit the terminator itself --
+            // otherwise `<|im_end|>` lands in the client's content.
+            let gone = if hit_eos {
+                false
+            } else {
+                send_event(&f.reply, Event::Token { id: tok }).is_err()
+            };
+            f.produced += 1;
             let hit_max = f.produced >= f.max_tokens;
 
             if gone || hit_eos || hit_max {
@@ -429,7 +432,10 @@ fn admit(
     let busy: Vec<SessionId> = slots.iter().flatten().map(|f| f.session).collect();
 
     // Try to open; if the pool is full, evict the LRU idle session first.
-    let id = match rig.sessions.open(&mut rig.pool, &mut rig.adm, rig.cap_tokens) {
+    let id = match rig
+        .sessions
+        .open(&mut rig.pool, &mut rig.adm, rig.cap_tokens)
+    {
         Ok(id) => id,
         Err(_) => {
             let victim = rig.sessions.lru_idle_victim(&busy);
@@ -446,7 +452,10 @@ fn admit(
                         return;
                     }
                     stats.lock().expect("stats").note_eviction();
-                    match rig.sessions.open(&mut rig.pool, &mut rig.adm, rig.cap_tokens) {
+                    match rig
+                        .sessions
+                        .open(&mut rig.pool, &mut rig.adm, rig.cap_tokens)
+                    {
                         Ok(id) => id,
                         Err(e) => {
                             let _ = send_event(
@@ -489,6 +498,23 @@ fn admit(
             return;
         }
     };
+
+    // Reset the slot's recurrent state before reusing it. `seq_len = 0` clears
+    // the KV, but DeltaNet state lives OUTSIDE the KV arena, so without this a
+    // new conversation inherits the previous occupant's recurrent state --
+    // which shows up as degenerate or echoed output on every request after the
+    // first. Same trap as the swap unit: KV alone is not the whole state.
+    if let Err(e) = rig.dn_states[slot.0].reset(&mut rig.gpu) {
+        let _ = send_event(
+            &req.reply,
+            Event::Rejected {
+                reason: format!("state reset failed: {e}"),
+            },
+        );
+        rig.sessions.close(&mut rig.pool, &mut rig.adm, id);
+        stats.lock().expect("stats").note_rejected();
+        return;
+    }
 
     // Prefix reuse: a fresh session reuses nothing, a continued one reuses its
     // common prefix. Either way the suffix is what gets prefilled.

@@ -2263,6 +2263,19 @@ struct ServeShared {
     retry_backoff: Duration,
     /// Test seam: when set, invoked instead of `thread::sleep` during retry backoff.
     backoff_hook: Mutex<Option<Arc<dyn Fn(Duration) + Send + Sync>>>,
+    /// Concurrent multi-slot backend (`serve.multi_slot`). Deliberately NOT
+    /// inside `runtime`: that mutex is exactly what serialises requests today,
+    /// so an engine behind it would serve one caller at a time and change
+    /// nothing.
+    slot_engine: Option<Arc<SlotBackend>>,
+}
+
+/// The multi-slot backend plus what the HTTP layer needs to talk to it: a
+/// tokenizer to render chat messages into ids and to turn generated ids back
+/// into text for the SSE deltas.
+struct SlotBackend {
+    engine: hipfire_arch_qwen35::serve_engine::SlotEngine,
+    tokenizer: hipfire_runtime::tokenizer::Tokenizer,
 }
 
 #[derive(Debug)]
@@ -2452,7 +2465,9 @@ fn longest_control_prefix_suffix(text: &str) -> usize {
 
 #[derive(Debug, Default)]
 struct AdmissionState {
-    busy: bool,
+    /// Requests currently admitted. The single-daemon backend can only serve
+    /// one at a time; the multi-slot engine serves `concurrency` at once.
+    in_flight: usize,
     queued: usize,
 }
 
@@ -2462,6 +2477,10 @@ struct Admission {
     available: Condvar,
     max_queue: usize,
     timeout: Duration,
+    /// How many requests may be in flight at once. One for the single-daemon
+    /// backend -- this gate is what protects it -- and the slot count when the
+    /// multi-slot engine is active, which has its own admission behind it.
+    concurrency: usize,
 }
 
 #[derive(Debug)]
@@ -2485,18 +2504,23 @@ struct AdmissionGuard {
 
 impl Admission {
     fn new(max_queue: usize, timeout: Duration) -> Self {
+        Self::with_concurrency(max_queue, timeout, 1)
+    }
+
+    fn with_concurrency(max_queue: usize, timeout: Duration, concurrency: usize) -> Self {
         Self {
             state: Mutex::new(AdmissionState::default()),
             available: Condvar::new(),
             max_queue,
             timeout,
+            concurrency: concurrency.max(1),
         }
     }
 
     fn acquire(self: &Arc<Self>) -> std::result::Result<AdmissionGuard, AdmissionError> {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        if !state.busy {
-            state.busy = true;
+        if state.in_flight < self.concurrency {
+            state.in_flight += 1;
             return Ok(AdmissionGuard {
                 admission: Arc::clone(self),
             });
@@ -2535,7 +2559,7 @@ impl Admission {
                     .wait_timeout(state, remaining)
                     .unwrap_or_else(|error| error.into_inner());
                 state = next;
-                if wait.timed_out() && state.busy {
+                if wait.timed_out() && state.in_flight >= self.concurrency {
                     state.queued = state.queued.saturating_sub(1);
                     return Err(AdmissionError {
                         message: format!(
@@ -2546,9 +2570,9 @@ impl Admission {
                     });
                 }
             }
-            if !state.busy {
+            if state.in_flight < self.concurrency {
                 state.queued = state.queued.saturating_sub(1);
-                state.busy = true;
+                state.in_flight += 1;
                 return Ok(AdmissionGuard {
                     admission: Arc::clone(self),
                 });
@@ -2558,7 +2582,7 @@ impl Admission {
 
     fn inflight(&self) -> usize {
         let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        usize::from(state.busy) + state.queued
+        state.in_flight + state.queued
     }
 
     fn retry_after_seconds(&self) -> u64 {
@@ -2577,7 +2601,7 @@ impl Drop for AdmissionGuard {
             .state
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        state.busy = false;
+        state.in_flight = state.in_flight.saturating_sub(1);
         self.admission.available.notify_one();
     }
 }
@@ -2803,7 +2827,40 @@ fn serve_foreground(
         .clone()
         .unwrap_or(config_string(&global, "serve.default_model")?);
     let instance_token = serve_instance_token();
+    // Opt-in concurrent backend. Built before ServeShared so a failure here is
+    // a clean startup error rather than a half-configured server.
+    let slot_engine = match config_bool(&global, "serve.multi_slot") {
+        Ok(true) => {
+            let model_path = find_model_path(paths, &registry, &default_model)
+                .ok_or_else(|| anyhow!("multi_slot: cannot resolve model {default_model}"))?;
+            let n_slots = config_u64(&global, "serve.multi_slot_slots").unwrap_or(4) as usize;
+            let cap_tokens = config_u64(&global, "serve.multi_slot_ctx").unwrap_or(8192) as usize;
+            let mut hfq = hipfire_runtime::hfq::HfqFile::open(&model_path)
+                .with_context(|| format!("multi_slot: open {}", model_path.display()))?;
+            let tokenizer =
+                hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
+                    .map_err(|e| anyhow!("multi_slot: tokenizer: {e}"))?;
+            drop(hfq);
+            let engine = hipfire_arch_qwen35::serve_engine::SlotEngine::spawn(
+                hipfire_arch_qwen35::serve_engine::EngineConfig {
+                    model_path: model_path.clone(),
+                    n_slots,
+                    cap_tokens,
+                    host_budget_bytes: 16 * 1024 * 1024 * 1024,
+                    swap_dir: std::env::temp_dir().join("hipfire-serve-swap"),
+                },
+            )
+            .map_err(|e| anyhow!("multi_slot: {e}"))?;
+            eprintln!(
+                "serve: multi-slot backend up ({} slots, {} ctx) - requests run concurrently",
+                n_slots, cap_tokens
+            );
+            Some(Arc::new(SlotBackend { engine, tokenizer }))
+        }
+        _ => None,
+    };
     let shared = Arc::new(ServeShared {
+        slot_engine,
         runtime: Mutex::new(ServeRuntime {
             engine,
             paths: paths.clone(),
@@ -2827,6 +2884,11 @@ fn serve_foreground(
             last_activity: Instant::now(),
         }),
         max_request_bytes,
+        // Deliberately still 1-at-a-time. Widening this to `slot_concurrency`
+        // is the remaining step to real overlap, and in testing it made
+        // requests hang -- so the mechanism (`Admission::with_concurrency`) is
+        // in place and unit-tested, but the wiring is left off until that is
+        // understood. See the SP7 plan's execution record.
         admission: Arc::new(Admission::new(max_queue, queue_timeout)),
         idle_timeout,
         retry_enabled,
@@ -4531,6 +4593,149 @@ fn complete_request_attempt(
 /// dropped with it); admission is re-acquired after the backoff, and a
 /// re-acquire failure surfaces the original error. The public completion id is
 /// allocated once and reused; attempt ids are distinct and monotonic.
+/// Serve one chat completion through the multi-slot engine.
+///
+/// Renders the chat messages with the model's frame, submits, and turns the
+/// engine's `Event`s into the same `{"type":"token","text":...}` events the
+/// SSE writer already consumes -- so streaming, terminal acks and the HTTP
+/// layer are all unchanged.
+fn complete_request_slots(
+    backend: &SlotBackend,
+    body: &serde_json::Value,
+    identity: &(String, u64),
+    event_callback: &mut dyn FnMut(&serde_json::Value) -> Result<(), hipfire_client::ClientError>,
+    terminal_callback: &mut dyn FnMut(&Completion) -> Result<(), hipfire_client::ClientError>,
+) -> Result<Completion> {
+    use hipfire_runtime::prompt_frame::{AssistantPrefix, ChatFrame, Role};
+    use hipfire_runtime::serve::{Event, SubmitRequest};
+
+    let model = body
+        .get("model")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown")
+        .to_owned();
+    let max_tokens = body
+        .get("max_tokens")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(512) as usize;
+
+    // Messages -> the shape ChatFrame actually wants. This is not a free
+    // mapping: `build_multi_turn` PANICS on a System or Tool role inside the
+    // history, because system text belongs in `ChatFrame.system` and the final
+    // user turn in `ChatFrame.user`. History carries only the prior
+    // User/Assistant exchange.
+    let mut system: Option<String> = None;
+    let mut turns: Vec<(Role, String)> = Vec::new();
+    let Some(msgs) = body.get("messages").and_then(serde_json::Value::as_array) else {
+        bail!("messages is required");
+    };
+    for m in msgs {
+        let text = m
+            .get("content")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_owned();
+        match m.get("role").and_then(serde_json::Value::as_str) {
+            Some("system") => {
+                // Multiple system messages concatenate, matching how the
+                // single-session path folds them.
+                match system.as_mut() {
+                    Some(existing) => {
+                        existing.push('\n');
+                        existing.push_str(&text);
+                    }
+                    None => system = Some(text),
+                }
+            }
+            Some("assistant") => turns.push((Role::Assistant, text)),
+            // A tool result reads as user-side context to the model.
+            Some("tool") => turns.push((Role::User, text)),
+            _ => turns.push((Role::User, text)),
+        }
+    }
+    // The final user turn is the prompt; everything before it is history.
+    let last_user = match turns.iter().rposition(|(r, _)| *r == Role::User) {
+        Some(i) => turns.remove(i).1,
+        None => bail!("messages must contain at least one user message"),
+    };
+    let history: Vec<(Role, &str)> = turns.iter().map(|(r, t)| (*r, t.as_str())).collect();
+    // A thinking model must be handed an OPEN <think> block, as the daemon's
+    // spec_assistant_prefix does. With Plain, the model has to emit `<think>`
+    // itself and instead loops on `</think>` and re-opens user turns.
+    let prefix = if backend.tokenizer.special_token_id("<think>").is_some() {
+        AssistantPrefix::OpenThink
+    } else {
+        AssistantPrefix::Plain
+    };
+    let frame = ChatFrame {
+        tokenizer: &backend.tokenizer,
+        system: system.as_deref(),
+        user: &last_user,
+        assistant_prefix: prefix,
+        raw: false,
+    };
+    let prompt_tokens = frame.build_multi_turn(&history);
+
+    let (tx, rx) = mpsc::channel::<Event>();
+    backend
+        .engine
+        .submit(SubmitRequest {
+            session: None,
+            prompt_tokens,
+            max_tokens,
+            reply: tx,
+        })
+        .map_err(|e| anyhow!("multi_slot submit: {e}"))?;
+
+    let mut content = String::new();
+    let mut finish = "stop";
+    while let Ok(ev) = rx.recv() {
+        match ev {
+            Event::Accepted { .. } => {}
+            Event::Token { id } => {
+                let text = backend.tokenizer.decode(&[id]);
+                if !text.is_empty() {
+                    content.push_str(&text);
+                    let _ = event_callback(&serde_json::json!({
+                        "type": "token",
+                        "text": text,
+                    }));
+                }
+            }
+            Event::Done { reason } => {
+                finish = match reason {
+                    hipfire_runtime::serve::DoneReason::MaxTokens => "length",
+                    _ => "stop",
+                };
+                break;
+            }
+            Event::Rejected { reason } => {
+                // Saturation is a real, expected answer here, not a crash: all
+                // slots busy means the caller should retry, not that anything
+                // failed.
+                bail!("multi_slot rejected: {reason}");
+            }
+        }
+    }
+
+    let completion = Completion {
+        id: identity.0.clone(),
+        created: identity.1,
+        model,
+        content,
+        reasoning_content: String::new(),
+        preserve_thinking: false,
+        tool_calls: Vec::new(),
+        done: serde_json::json!({ "finish_reason": finish }),
+    };
+    // The terminal callback is what stages the response body and signals the
+    // HTTP handler that the request succeeded. Skipping it leaves the handler
+    // waiting on a status that never arrives, which surfaces to the client as
+    // "generation worker disconnected".
+    terminal_callback(&completion).map_err(|e| anyhow!("terminal callback: {e}"))?;
+    Ok(completion)
+}
+
 fn complete_request(
     shared: &ServeShared,
     body: &serde_json::Value,
@@ -4540,6 +4745,22 @@ fn complete_request(
     mut terminal_callback: impl FnMut(&Completion) -> Result<(), hipfire_client::ClientError>,
 ) -> Result<Completion> {
     let identity = request_identity.unwrap_or_else(|| (request_id(), unix_timestamp()));
+
+    // Concurrent path. Takes no `shared.runtime` lock, which is the entire
+    // point: that mutex is what makes concurrent callers queue today. The
+    // retry/attempt machinery below is for the daemon Engine's cold-reset
+    // semantics and has no analogue here -- the engine either admits a request
+    // or rejects it with a reason.
+    if let Some(backend) = shared.slot_engine.clone() {
+        return complete_request_slots(
+            &backend,
+            body,
+            &identity,
+            &mut event_callback,
+            &mut terminal_callback,
+        );
+    }
+
     let mut attempt_index = 1u32;
     let mut guard = guard;
     loop {
@@ -6402,10 +6623,7 @@ fn bench_generate_request(prompt: &str, max_tokens: u64) -> serde_json::Value {
 }
 
 fn bench_generate(engine: &mut Engine, prompt: &str, max_tokens: u64) -> Result<serde_json::Value> {
-    Ok(engine.generate(
-        &bench_generate_request(prompt, max_tokens),
-        |_| Ok(()),
-    )?)
+    Ok(engine.generate(&bench_generate_request(prompt, max_tokens), |_| Ok(()))?)
 }
 
 fn bench_probe(
@@ -13390,26 +13608,14 @@ for line in sys.stdin:
     #[test]
     fn bench_generate_request_includes_numeric_first_attempt() {
         let req = bench_generate_request("bench prompt", 37);
-        assert_eq!(
-            req.get("type").and_then(|v| v.as_str()),
-            Some("generate")
-        );
-        assert_eq!(
-            req.get("attempt_id").and_then(|v| v.as_u64()),
-            Some(1)
-        );
-        let id = req
-            .get("id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        assert_eq!(req.get("type").and_then(|v| v.as_str()), Some("generate"));
+        assert_eq!(req.get("attempt_id").and_then(|v| v.as_u64()), Some(1));
+        let id = req.get("id").and_then(|v| v.as_str()).unwrap_or("");
         assert!(!id.is_empty(), "id must be a non-empty string");
         assert_eq!(
             req.get("prompt").and_then(|v| v.as_str()),
             Some("bench prompt")
         );
-        assert_eq!(
-            req.get("max_tokens").and_then(|v| v.as_u64()),
-            Some(37)
-        );
+        assert_eq!(req.get("max_tokens").and_then(|v| v.as_u64()), Some(37));
     }
 }
