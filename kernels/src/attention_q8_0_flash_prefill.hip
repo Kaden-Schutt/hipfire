@@ -152,11 +152,13 @@ extern "C" __global__ __launch_bounds__(NTHREADS) void attention_q8_0_flash_pref
     // past its own slot's logical KV length. Descriptor construction must
     // keep desc.seq_len in sync with (max positions[row]+1 over that slot's
     // rows); this simply catches a violation early in debug builds.
-#ifdef NDEBUG
-    if (slot_descs != nullptr) __builtin_assume(seq_len <= desc.seq_len);
-#else
-    if (slot_descs != nullptr) assert(seq_len <= desc.seq_len);
-#endif
+    // NOTE: a debug `assert(seq_len <= desc.seq_len)` used to sit here. It was
+    // removed: crates/rdna-compute/src/compiler.rs never passes -DNDEBUG, so the
+    // assert shipped in RELEASE and cost 64 bytes/lane of scratch on every one of
+    // these kernels. The paired `__builtin_assume` was worse than useless — it
+    // would only take effect under -DNDEBUG, where it becomes a UB licence on a
+    // fact the kernel never otherwise uses, buying no optimisation. The invariant
+    // is documented on KvSlotDesc and checked host-side by the builders instead.
 
     // ── K/V tile loop with online softmax ───────────────────────────────
     for (int t0 = 0; t0 < seq_len; t0 += BC) {
@@ -167,8 +169,24 @@ extern "C" __global__ __launch_bounds__(NTHREADS) void attention_q8_0_flash_pref
             const int j  = i / (bph * 34);
             const int bo = i % (bph * 34);
             const int t  = t0 + j;
-            kt[i] = k_cache[kv_offset_for_k(desc, t, per_pos_bytes) + kv_blk * 34 + bo];
-            vt[i] = v_cache[kv_offset_for_v(desc, t, per_pos_bytes) + kv_blk * 34 + bo];
+            // ONE shared slab offset for both caches, deliberately.
+            //
+            // Using kv_offset_for_v here as well would keep a SECOND runtime-
+            // unknown 64-bit base (desc.v_base) live across this staging loop,
+            // which stages K and V in a single pass. Measured on gfx1151 with the
+            // production flags, that costs 23 VGPRs and drops occupancy from 16 to
+            // 12 waves/SIMD — a 25% loss, on the NULL-descriptor legacy path, in
+            // the chunked-prefill kernel on the agent critical path. It regresses
+            // identically on gfx1201, the deployment target.
+            //
+            // Safe because this kernel is Q8_0-only, where K and V share a stride
+            // (see per_pos_bytes above), so a slot occupies the same offset in
+            // both arenas. That is an ABI CONSTRAINT on the descriptor for this
+            // kernel: v_base MUST equal k_base. asym3 must never adopt this — its
+            // K and V strides genuinely differ.
+            const unsigned long long slab = kv_offset_for_k(desc, t, per_pos_bytes);
+            kt[i] = k_cache[slab + kv_blk * 34 + bo];
+            vt[i] = v_cache[slab + kv_blk * 34 + bo];
         }
         __syncthreads();
 

@@ -115,11 +115,13 @@ __global__ void attention_flash_q8_0_tile_batched(
     // past its own slot's logical KV length. Descriptor construction must
     // keep desc.seq_len in sync with (max positions[row]+1 over that slot's
     // rows); this simply catches a violation early in debug builds.
-#ifdef NDEBUG
-    if (slot_descs != nullptr) __builtin_assume(seq_len <= desc.seq_len);
-#else
-    if (slot_descs != nullptr) assert(seq_len <= desc.seq_len);
-#endif
+    // NOTE: a debug `assert(seq_len <= desc.seq_len)` used to sit here. It was
+    // removed: crates/rdna-compute/src/compiler.rs never passes -DNDEBUG, so the
+    // assert shipped in RELEASE and cost 64 bytes/lane of scratch on every one of
+    // these kernels. The paired `__builtin_assume` was worse than useless — it
+    // would only take effect under -DNDEBUG, where it becomes a UB licence on a
+    // fact the kernel never otherwise uses, buying no optimisation. The invariant
+    // is documented on KvSlotDesc and checked host-side by the builders instead.
 
     // Sliding-window lower bound: a query at position eff_seq_len-1 attends
     // only to keys in [eff_seq_len-window, eff_seq_len); keys at t < win_lo

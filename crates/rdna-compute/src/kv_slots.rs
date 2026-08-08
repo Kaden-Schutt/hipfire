@@ -12,6 +12,15 @@
 /// Byte-identical mirror of `struct KvSlotDesc` in `kernels/src/kv_slot_desc.h`.
 /// 24 bytes, 8-byte aligned. Changing either side without the other silently
 /// corrupts every KV address.
+/// **ABI constraint for the Q8_0 flash-prefill kernel: `v_base` MUST equal
+/// `k_base`.** That kernel stages K and V in one pass and uses a single shared
+/// slab offset; keeping a second runtime-unknown 64-bit base live across the
+/// loop costs 23 VGPRs and 25% of its occupancy (16 -> 12 waves/SIMD), measured
+/// on gfx1151 and gfx1201. Q8_0 K and V share a stride, so a slot sits at the
+/// same offset in both arenas and the constraint is free to honour.
+///
+/// asym3 is exempt and must keep both bases: its K and V strides genuinely
+/// differ (3-bit rotated K against Q8_0 V).
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KvSlotDesc {
@@ -22,6 +31,11 @@ pub struct KvSlotDesc {
     /// Logical KV length. The kernel reads positions `[0, seq_len)`.
     pub seq_len: i32,
     /// Physical slab capacity in tokens. Invariant: `seq_len <= cap`.
+    ///
+    /// Both invariants (`seq_len <= cap`, and `positions[row] + 1 <= seq_len`)
+    /// are checked host-side by the builders. They are deliberately NOT asserted
+    /// device-side: `compiler.rs` never passes `-DNDEBUG`, so a device `assert`
+    /// ships in release and cost 64 bytes/lane of scratch on all four kernels.
     pub cap: i32,
 }
 
