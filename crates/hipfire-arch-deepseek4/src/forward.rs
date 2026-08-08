@@ -2173,6 +2173,21 @@ fn refresh_compressor_cache_shard_tables(states: &mut [DeepseekV4State]) -> Resu
             "DeepSeek V4 compressor shard table requires TP3/TP4 (got TP{world})"
         ));
     }
+    if states.iter().all(|state| {
+        matches!(
+            state.compressor_cache_placement,
+            crate::deepseek4::CompressorCachePlacement::Replicated
+        )
+    }) {
+        for state in states.iter_mut() {
+            for layer in &mut state._indexer {
+                layer.main_kv_cache_shards = [0; 4];
+                layer.indexer_kv_cache_shards = [0; 4];
+                layer.cache_shard_count = 0;
+            }
+        }
+        return Ok(());
+    }
     for (rank, state) in states.iter().enumerate() {
         let crate::deepseek4::CompressorCachePlacement::BlockCyclic(shard) =
             state.compressor_cache_placement
