@@ -137,8 +137,8 @@ fn main() {
         vec![DeltaNetState::new(&mut gpu, &config).expect("DeltaNetState::new")];
     let mut desc_staging = SlotDescStaging::new(&mut gpu, 1, max_batch).expect("SlotDescStaging");
     let pbs = PrefillBatchScratch::new(&mut gpu, &config, max_batch).expect("PrefillBatchScratch");
-    let scratch = Qwen35Scratch::new_with_kv_max(&mut gpu, &config, 64, cap_tokens)
-        .expect("Qwen35Scratch");
+    let scratch =
+        Qwen35Scratch::new_with_kv_max(&mut gpu, &config, 64, cap_tokens).expect("Qwen35Scratch");
     let logits_out = gpu
         .zeros(&[config.vocab_size], DType::F32)
         .expect("logits_out");
@@ -279,16 +279,7 @@ fn main() {
 
         // Warm turn: prefill only, no decode kept.
         if let Some(w) = warm {
-            let _ = drive(
-                gpu,
-                pool,
-                dn_states,
-                desc_staging,
-                &mut graph,
-                w,
-                0,
-                0,
-            );
+            let _ = drive(gpu, pool, dn_states, desc_staging, &mut graph, w, 0, 0);
             let s = table.get_mut(sid).expect("session");
             s.tokens.extend_from_slice(w);
             s.next_pos = w.len();
