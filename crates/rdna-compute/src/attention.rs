@@ -1490,7 +1490,14 @@ impl Gpu {
     }
 
     /// Batched Q8_0 KV cache write: quantize multiple positions in one launch.
-    pub fn kv_cache_write_q8_0_batched(
+    ///
+    /// `slot_descs` / `row_slot`: when both `Some`, `row_slot[b]` selects the
+    /// `KvSlotDesc` used to translate the destination address for batch row
+    /// `b`, letting one launch write several independent sequences into
+    /// disjoint KV slabs. When either is `None` the kernel falls back to
+    /// legacy single-arena addressing derived from `positions`, byte-identical
+    /// to the pre-slot kernel.
+    pub fn kv_cache_write_q8_0_batched_slots(
         &mut self,
         dst: &GpuTensor,
         src: &GpuTensor,
@@ -1498,19 +1505,43 @@ impl Gpu {
         n_kv_heads: usize,
         head_dim: usize,
         batch_size: usize,
+        slot_descs: Option<&GpuTensor>,
+        row_slot: Option<&GpuTensor>,
     ) -> HipResult<()> {
+        assert_eq!(
+            slot_descs.is_some(),
+            row_slot.is_some(),
+            "kv_cache_write_q8_0_batched_slots: slot_descs and row_slot are both-or-neither. \
+             Passing only slot_descs silently pins every row to slot 0, writing every \
+             sequence's KV into slot 0's slab."
+        );
         self.bind_thread()?;
-        self.ensure_kernel(
-            "kv_cache_write_q8_0_batched",
-            kernels::KV_CACHE_WRITE_Q8_0_BATCHED_SRC,
-            "kv_cache_write_q8_0_batched",
-        )?;
+        // The kernel source `#include`s kv_slot_desc.h, but the runtime hipcc
+        // compile happens in a cache dir with no -I to kernels/src. Strip the
+        // directive and prepend the header body instead (same pattern as
+        // attention_q8_0_kv_batched_masked_slots). Guarded behind the
+        // functions cache check so the format!/replace allocation only runs
+        // once, not on every launch of this hot path.
+        if !self.functions.contains_key("kv_cache_write_q8_0_batched") {
+            let stripped = kernels::KV_CACHE_WRITE_Q8_0_BATCHED_SRC
+                .replace("#include \"kv_slot_desc.h\"", "");
+            let src = format!("{}\n{}", kernels::KV_SLOT_DESC_H, stripped);
+            self.ensure_kernel("kv_cache_write_q8_0_batched", &src, "kv_cache_write_q8_0_batched")?;
+        }
         let mut d = dst.buf.as_ptr();
         let mut s = src.buf.as_ptr();
         let mut p = positions.buf.as_ptr();
         let mut nkv = n_kv_heads as i32;
         let mut hd = head_dim as i32;
         let mut bs = batch_size as i32;
+        let mut desc_ptr: *mut std::ffi::c_void = match slot_descs {
+            Some(t) => t.buf.as_ptr(),
+            None => std::ptr::null_mut(),
+        };
+        let mut rs_ptr: *mut std::ffi::c_void = match row_slot {
+            Some(t) => t.buf.as_ptr(),
+            None => std::ptr::null_mut(),
+        };
         let mut params: Vec<*mut c_void> = vec![
             &mut d as *mut _ as *mut c_void,
             &mut s as *mut _ as *mut c_void,
@@ -1518,8 +1549,12 @@ impl Gpu {
             &mut nkv as *mut _ as *mut c_void,
             &mut hd as *mut _ as *mut c_void,
             &mut bs as *mut _ as *mut c_void,
+            &mut desc_ptr as *mut _ as *mut c_void,
+            &mut rs_ptr as *mut _ as *mut c_void,
         ];
         let total_blocks = (n_kv_heads * head_dim / 32) as u32;
+        let desc_raw = desc_ptr; // alias for move into closure
+        let rs_raw = rs_ptr; // alias for move into closure
         self.launch_maybe_blob(
             "kv_cache_write_q8_0_batched",
             [total_blocks, batch_size as u32, 1],
@@ -1534,8 +1569,27 @@ impl Gpu {
                 b.push_i32(nkv);
                 b.push_i32(hd);
                 b.push_i32(bs);
+                b.push_ptr(desc_raw);
+                b.push_ptr(rs_raw);
                 b
             },
+        )
+    }
+
+    /// Legacy single-sequence entry point. Preserved so existing call sites are
+    /// untouched; passes null descriptors, which the kernel treats as legacy
+    /// mode with bitwise-identical output.
+    pub fn kv_cache_write_q8_0_batched(
+        &mut self,
+        dst: &GpuTensor,
+        src: &GpuTensor,
+        positions: &GpuTensor,
+        n_kv_heads: usize,
+        head_dim: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.kv_cache_write_q8_0_batched_slots(
+            dst, src, positions, n_kv_heads, head_dim, batch_size, None, None,
         )
     }
 
