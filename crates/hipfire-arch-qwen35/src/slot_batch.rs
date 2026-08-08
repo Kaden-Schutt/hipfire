@@ -90,10 +90,7 @@ mod tests {
 
     #[test]
     fn idle_slots_contribute_no_rows() {
-        let b = SlotBatch::build(&[
-            (SlotId(0), &[][..], 0),
-            (SlotId(1), &[5u32][..], 42),
-        ]);
+        let b = SlotBatch::build(&[(SlotId(0), &[][..], 0), (SlotId(1), &[5u32][..], 42)]);
         assert_eq!(b.m_per_slot, vec![0, 1]);
         assert_eq!(b.tokens, vec![5]);
         assert_eq!(b.positions, vec![42]);

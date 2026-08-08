@@ -79,7 +79,11 @@ mod tests {
             decoding: false,
         }];
         let b = s.next_batch(&mut work);
-        assert_eq!(b.total_rows(), 256, "must take one chunk, not the whole prompt");
+        assert_eq!(
+            b.total_rows(),
+            256,
+            "must take one chunk, not the whole prompt"
+        );
         assert_eq!(work[0].remaining_prompt.len(), 744);
         assert_eq!(work[0].next_pos, 256);
     }
@@ -102,7 +106,11 @@ mod tests {
             },
         ];
         let b = s.next_batch(&mut work);
-        assert_eq!(b.m_per_slot, vec![256, 1], "a prefilling slot must not block a decoding one");
+        assert_eq!(
+            b.m_per_slot,
+            vec![256, 1],
+            "a prefilling slot must not block a decoding one"
+        );
     }
 
     #[test]

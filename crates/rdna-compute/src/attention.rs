@@ -1523,10 +1523,14 @@ impl Gpu {
         // functions cache check so the format!/replace allocation only runs
         // once, not on every launch of this hot path.
         if !self.functions.contains_key("kv_cache_write_q8_0_batched") {
-            let stripped = kernels::KV_CACHE_WRITE_Q8_0_BATCHED_SRC
-                .replace("#include \"kv_slot_desc.h\"", "");
+            let stripped =
+                kernels::KV_CACHE_WRITE_Q8_0_BATCHED_SRC.replace("#include \"kv_slot_desc.h\"", "");
             let src = format!("{}\n{}", kernels::KV_SLOT_DESC_H, stripped);
-            self.ensure_kernel("kv_cache_write_q8_0_batched", &src, "kv_cache_write_q8_0_batched")?;
+            self.ensure_kernel(
+                "kv_cache_write_q8_0_batched",
+                &src,
+                "kv_cache_write_q8_0_batched",
+            )?;
         }
         let mut d = dst.buf.as_ptr();
         let mut s = src.buf.as_ptr();
@@ -1942,9 +1946,22 @@ impl Gpu {
         block_cols: usize,
     ) -> HipResult<()> {
         self.attention_q8_0_kv_batched_masked_slots(
-            q, k_cache, v_cache, out, positions, n_heads, n_kv_heads, head_dim,
-            max_seq, max_ctx_len, batch_size, tree_bias, block_start, block_cols,
-            None, None,
+            q,
+            k_cache,
+            v_cache,
+            out,
+            positions,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_seq,
+            max_ctx_len,
+            batch_size,
+            tree_bias,
+            block_start,
+            block_cols,
+            None,
+            None,
         )
     }
 
@@ -1971,8 +1988,22 @@ impl Gpu {
         bc: usize,
     ) -> HipResult<()> {
         self.attention_q8_0_flash_prefill_slots(
-            q, k_cache, v_cache, out, positions, n_heads, n_kv_heads, head_dim,
-            max_ctx_len, batch_size, br, bc, None, None, None, None,
+            q,
+            k_cache,
+            v_cache,
+            out,
+            positions,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx_len,
+            batch_size,
+            br,
+            bc,
+            None,
+            None,
+            None,
+            None,
         )
     }
 
@@ -2313,11 +2344,18 @@ impl Gpu {
         // attention_q8_0_flash_prefill_slots and ensure_givens4_kernel). The
         // module name varies by variant but the loaded function name does
         // not, so gate on that — mirrors the scalar port's guard.
-        if !self.functions.contains_key("attention_q8_0_flash_prefill_wmma") {
+        if !self
+            .functions
+            .contains_key("attention_q8_0_flash_prefill_wmma")
+        {
             let stripped = kernel_src.replace("#include \"kv_slot_desc.h\"", "");
             let src = format!(
                 "#define SPLIT_Q {}\n#define FIXED_HEAD_DIM {}\n#define PREFETCH_V {}\n{}\n{}",
-                split_q as u32, fixed_hd, prefetch_v as u32, kernels::KV_SLOT_DESC_H, stripped
+                split_q as u32,
+                fixed_hd,
+                prefetch_v as u32,
+                kernels::KV_SLOT_DESC_H,
+                stripped
             );
             self.ensure_kernel(&module, &src, "attention_q8_0_flash_prefill_wmma")?;
         }

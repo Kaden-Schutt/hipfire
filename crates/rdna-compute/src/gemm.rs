@@ -9958,7 +9958,10 @@ impl Gpu {
         // gfx11 sister of the gfx12 ldsstage path. Reorders FP32 K accumulation;
         // K must be a multiple of 512. Batch ceiling: see the measured 3.6-trunk
         // tables on LDSSTAGE_MAX_BATCH_GFX11 (one value covers dGPU and iGPU).
-        if self.flags.hfq4g256_ldsstage_wmma && k % 512 == 0 && batch_size <= LDSSTAGE_MAX_BATCH_GFX11 {
+        if self.flags.hfq4g256_ldsstage_wmma
+            && k % 512 == 0
+            && batch_size <= LDSSTAGE_MAX_BATCH_GFX11
+        {
             let kname = "gemm_gate_up_hfq4g256_wmma_ldsstage";
             let ksrc = kernels::GEMM_GATE_UP_HFQ4G256_WMMA_SRC;
             self.ensure_kernel(kname, ksrc, kname)?;
@@ -15047,7 +15050,10 @@ impl Gpu {
         // gfx11 sister of the gfx12 ldsstage path. Reorders FP32 K accumulation;
         // K must be a multiple of 512. Batch ceiling: see the measured 3.6-trunk
         // tables on LDSSTAGE_MAX_BATCH_GFX11 (one value covers dGPU and iGPU).
-        if self.flags.hfq4g256_ldsstage_wmma && k % 512 == 0 && batch_size <= LDSSTAGE_MAX_BATCH_GFX11 {
+        if self.flags.hfq4g256_ldsstage_wmma
+            && k % 512 == 0
+            && batch_size <= LDSSTAGE_MAX_BATCH_GFX11
+        {
             let kname = "gemm_hfq4g256_residual_wmma_ldsstage";
             let ksrc = kernels::GEMM_HFQ4G256_RESIDUAL_WMMA_SRC;
             self.ensure_kernel(kname, ksrc, kname)?;

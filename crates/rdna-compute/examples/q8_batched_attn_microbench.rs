@@ -293,8 +293,8 @@ fn main() {
         };
         let total_kv_bytes = n_slots as f64 * per_slot_ctx as f64 * bw_per_pos_bytes * 2.0;
         let max_tiles = per_slot_ctx.div_ceil(bw_tile);
-        let partials_bytes = n_slots as f64 * bw_nh as f64 * max_tiles as f64
-            * (2.0 + bw_hd as f64) * 4.0 * 2.0; // write + read
+        let partials_bytes =
+            n_slots as f64 * bw_nh as f64 * max_tiles as f64 * (2.0 + bw_hd as f64) * 4.0 * 2.0; // write + read
         let total_bytes = total_kv_bytes + partials_bytes;
         let batched_gbs = total_bytes / (batched_ms * 1e6);
         let seq_gbs = total_bytes / (seq_ms * 1e6);
@@ -335,12 +335,12 @@ fn main() {
                 // Included anyway for GB/s consistency with the n_slots
                 // sweep above (review finding I1).
                 let max_tiles = 100_000usize.div_ceil(bw_tile);
-                let partials_bytes = 4.0 * bw_nh as f64 * max_tiles as f64
-                    * (2.0 + bw_hd as f64) * 4.0 * 2.0;
+                let partials_bytes =
+                    4.0 * bw_nh as f64 * max_tiles as f64 * (2.0 + bw_hd as f64) * 4.0 * 2.0;
                 let useful_gbs =
                     (useful as f64 * bw_per_pos_bytes * 2.0 + partials_bytes) / (ragged_ms * 1e6);
-                let uniform_gbs =
-                    (launched as f64 * bw_per_pos_bytes * 2.0 + partials_bytes) / (uniform_ms * 1e6);
+                let uniform_gbs = (launched as f64 * bw_per_pos_bytes * 2.0 + partials_bytes)
+                    / (uniform_ms * 1e6);
                 // Time cost per 1000 USEFUL positions — the number that
                 // actually answers "how much does raggedness cost", as
                 // distinct from "what fraction of the launched grid
@@ -420,7 +420,10 @@ fn bench_slots(gpu: &mut Gpu, seq_lens: &[usize], m_per_slot: &[usize]) -> Optio
 
     // Preflight (host RAM + 32 GiB target budget), computed analytically
     // from host-side sizes BEFORE any upload — see module doc.
-    let slabs_bytes: u64 = descs.iter().map(|d| d.cap as u64 * per_pos_bytes as u64).sum();
+    let slabs_bytes: u64 = descs
+        .iter()
+        .map(|d| d.cap as u64 * per_pos_bytes as u64)
+        .sum();
     let total_alloc_bytes: u64 = 2 * arena.len() as u64 // k_cache + v_cache
         + (descs.len() * std::mem::size_of::<KvSlotDesc>()) as u64 // d_descs
         + (tile_slot.len() * 4) as u64 // d_row_slot
@@ -444,11 +447,14 @@ fn bench_slots(gpu: &mut Gpu, seq_lens: &[usize], m_per_slot: &[usize]) -> Optio
             descs.len() * std::mem::size_of::<KvSlotDesc>(),
         )
     };
-    let d_descs = gpu.upload_raw(desc_bytes, &[descs.len() * 3]).expect("descs");
-    let ts_bytes = unsafe {
-        std::slice::from_raw_parts(tile_slot.as_ptr() as *const u8, tile_slot.len() * 4)
-    };
-    let d_row_slot = gpu.upload_raw(ts_bytes, &[tile_slot.len()]).expect("row_slot");
+    let d_descs = gpu
+        .upload_raw(desc_bytes, &[descs.len() * 3])
+        .expect("descs");
+    let ts_bytes =
+        unsafe { std::slice::from_raw_parts(tile_slot.as_ptr() as *const u8, tile_slot.len() * 4) };
+    let d_row_slot = gpu
+        .upload_raw(ts_bytes, &[tile_slot.len()])
+        .expect("row_slot");
 
     // positions[r] = that row's own slot's seq_len - 1
     let mut pos_data: Vec<i32> = Vec::with_capacity(rows);
@@ -457,8 +463,7 @@ fn bench_slots(gpu: &mut Gpu, seq_lens: &[usize], m_per_slot: &[usize]) -> Optio
             pos_data.push(seq_lens[slot] as i32 - 1);
         }
     }
-    let pos_bytes =
-        unsafe { std::slice::from_raw_parts(pos_data.as_ptr() as *const u8, rows * 4) };
+    let pos_bytes = unsafe { std::slice::from_raw_parts(pos_data.as_ptr() as *const u8, rows * 4) };
     let positions = gpu.upload_raw(pos_bytes, &[rows]).expect("positions");
 
     let q_data: Vec<f32> = (0..rows * nh * hd)
@@ -473,8 +478,23 @@ fn bench_slots(gpu: &mut Gpu, seq_lens: &[usize], m_per_slot: &[usize]) -> Optio
 
     let batched = time_ms(gpu, warmups, iters, &|g: &mut Gpu| {
         g.attention_flash_q8_0_batched_masked_slots(
-            &q, &k_cache, &v_cache, &out, &positions, nh, nkv, hd, max_ctx, max_ctx,
-            rows, &partials, None, 0, 0, Some(&d_descs), Some(&d_row_slot),
+            &q,
+            &k_cache,
+            &v_cache,
+            &out,
+            &positions,
+            nh,
+            nkv,
+            hd,
+            max_ctx,
+            max_ctx,
+            rows,
+            &partials,
+            None,
+            0,
+            0,
+            Some(&d_descs),
+            Some(&d_row_slot),
         )
         .expect("batched slots");
     });
@@ -502,12 +522,14 @@ fn bench_slots(gpu: &mut Gpu, seq_lens: &[usize], m_per_slot: &[usize]) -> Optio
         .map(|(slot, &sl)| {
             let off = descs[slot].k_base as usize;
             let len = descs[slot].cap as usize * per_pos_bytes;
-            let slab_k = gpu.upload_raw(&arena[off..off + len], &[len]).expect("slab k");
-            let slab_v = gpu.upload_raw(&arena[off..off + len], &[len]).expect("slab v");
+            let slab_k = gpu
+                .upload_raw(&arena[off..off + len], &[len])
+                .expect("slab k");
+            let slab_v = gpu
+                .upload_raw(&arena[off..off + len], &[len])
+                .expect("slab v");
             let pos = sl as i32 - 1;
-            let pb = unsafe {
-                std::slice::from_raw_parts(&pos as *const i32 as *const u8, 4)
-            };
+            let pb = unsafe { std::slice::from_raw_parts(&pos as *const i32 as *const u8, 4) };
             let p = gpu.upload_raw(pb, &[1]).expect("slab pos");
             (slab_k, slab_v, p, sl)
         })
@@ -576,14 +598,14 @@ fn bench_lds_path(gpu: &mut Gpu, ctx: usize, n_slots: usize) -> Option<f64> {
     };
     let d_descs = gpu.upload_raw(desc_bytes, &[descs.len()]).expect("descs");
     let row_slot: Vec<i32> = (0..n_slots as i32).collect();
-    let rs_bytes = unsafe {
-        std::slice::from_raw_parts(row_slot.as_ptr() as *const u8, row_slot.len() * 4)
-    };
-    let d_row_slot = gpu.upload_raw(rs_bytes, &[row_slot.len()]).expect("row_slot");
+    let rs_bytes =
+        unsafe { std::slice::from_raw_parts(row_slot.as_ptr() as *const u8, row_slot.len() * 4) };
+    let d_row_slot = gpu
+        .upload_raw(rs_bytes, &[row_slot.len()])
+        .expect("row_slot");
 
     let pos_data: Vec<i32> = seq_lens.iter().map(|&sl| sl as i32 - 1).collect();
-    let pos_bytes =
-        unsafe { std::slice::from_raw_parts(pos_data.as_ptr() as *const u8, rows * 4) };
+    let pos_bytes = unsafe { std::slice::from_raw_parts(pos_data.as_ptr() as *const u8, rows * 4) };
     let positions = gpu.upload_raw(pos_bytes, &[rows]).expect("positions");
 
     let q_data: Vec<f32> = (0..rows * nh * hd)
@@ -594,8 +616,22 @@ fn bench_lds_path(gpu: &mut Gpu, ctx: usize, n_slots: usize) -> Option<f64> {
 
     let ms = time_ms(gpu, warmups, iters, &|g: &mut Gpu| {
         g.attention_q8_0_kv_batched_masked_slots(
-            &q, &k_cache, &v_cache, &out, &positions, nh, nkv, hd, ctx, ctx, rows,
-            None, 0, 0, Some(&d_descs), Some(&d_row_slot),
+            &q,
+            &k_cache,
+            &v_cache,
+            &out,
+            &positions,
+            nh,
+            nkv,
+            hd,
+            ctx,
+            ctx,
+            rows,
+            None,
+            0,
+            0,
+            Some(&d_descs),
+            Some(&d_row_slot),
         )
         .expect("lds path");
     });

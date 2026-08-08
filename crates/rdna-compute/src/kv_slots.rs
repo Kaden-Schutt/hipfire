@@ -178,7 +178,10 @@ pub fn build_asym3_k_arena(
                 };
                 arena.extend_from_slice(&cnorm.to_ne_bytes());
                 for j in 0..(head_bytes - 4) {
-                    arena.push((((pos * 31 + j * 17 + slot * 101 + kvh * 53) % 251) as i32 - 125) as i8 as u8);
+                    arena.push(
+                        (((pos * 31 + j * 17 + slot * 101 + kvh * 53) % 251) as i32 - 125) as i8
+                            as u8,
+                    );
                 }
             }
         }
@@ -205,10 +208,7 @@ pub fn build_asym3_k_arena(
 ///
 /// Slots with zero query rows produce no tiles — an empty tile would read
 /// uninitialised Q and write garbage into `out`.
-pub fn build_tiles(
-    slot_query_counts: &[usize],
-    br: usize,
-) -> (Vec<i32>, Vec<i32>, Vec<i32>) {
+pub fn build_tiles(slot_query_counts: &[usize], br: usize) -> (Vec<i32>, Vec<i32>, Vec<i32>) {
     assert!(br > 0, "br must be positive");
     let mut tile_slot = Vec::new();
     let mut tile_row0 = Vec::new();
@@ -226,7 +226,6 @@ pub fn build_tiles(
     }
     (tile_slot, tile_row0, tile_qbase)
 }
-
 
 // ── Attention tile size ─────────────────────────────────────────────────────
 //

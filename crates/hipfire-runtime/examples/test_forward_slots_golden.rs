@@ -81,8 +81,8 @@ fn main() {
 
     const N_SLOTS_MAX: usize = 4;
     const DECODE_STEPS: usize = 0; // was 3 — see the mrope decode note below
-    // SlotPool rounds cap_tokens up to a multiple of 128 internally, so this
-    // just needs to clear every prompt length + DECODE_STEPS (max 9 + 3).
+                                   // SlotPool rounds cap_tokens up to a multiple of 128 internally, so this
+                                   // just needs to clear every prompt length + DECODE_STEPS (max 9 + 3).
     const CAP_TOKENS: usize = 64;
     // Distinct, deliberately non-tile-aligned per-slot prompt lengths —
     // exercises the LDS-decode kernel's M>1 ("verify"-shaped) path on the
@@ -112,13 +112,18 @@ fn main() {
     fn build_token_stream(lens: &[usize], salt: u32) -> Vec<Vec<u32>> {
         lens.iter()
             .enumerate()
-            .map(|(s, &plen)| (0..plen + DECODE_STEPS).map(|i| deterministic_token(s, i, salt)).collect())
+            .map(|(s, &plen)| {
+                (0..plen + DECODE_STEPS)
+                    .map(|i| deterministic_token(s, i, salt))
+                    .collect()
+            })
             .collect()
     }
 
     fn build_prefill_batch(lens: &[usize], streams: &[Vec<u32>]) -> SlotBatch {
-        let triples: Vec<(SlotId, &[u32], usize)> =
-            (0..lens.len()).map(|s| (SlotId(s), &streams[s][..lens[s]], 0usize)).collect();
+        let triples: Vec<(SlotId, &[u32], usize)> = (0..lens.len())
+            .map(|s| (SlotId(s), &streams[s][..lens[s]], 0usize))
+            .collect();
         SlotBatch::build(&triples)
     }
 
@@ -141,10 +146,16 @@ fn main() {
     fn assert_close(label: &str, got: &[f32], want: &[f32]) {
         assert_eq!(got.len(), want.len(), "{label}: length mismatch");
         if let Some(i) = got.iter().position(|v| !v.is_finite()) {
-            panic!("{label}: candidate[{i}]={} is non-finite (want[{i}]={})", got[i], want[i]);
+            panic!(
+                "{label}: candidate[{i}]={} is non-finite (want[{i}]={})",
+                got[i], want[i]
+            );
         }
         if let Some(i) = want.iter().position(|v| !v.is_finite()) {
-            panic!("{label}: reference[{i}]={} is non-finite (got[{i}]={})", want[i], got[i]);
+            panic!(
+                "{label}: reference[{i}]={} is non-finite (got[{i}]={})",
+                want[i], got[i]
+            );
         }
         if !want.is_empty() {
             assert!(
@@ -188,8 +199,14 @@ fn main() {
         prompt_len: usize,
     ) -> Vec<Vec<f32>> {
         let kv_seq = (prompt_len + DECODE_STEPS + 16).max(CAP_TOKENS).max(512);
-        let mut kv_cache = KvCache::new_gpu_q8(gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq)
-            .expect("reference: KvCache::new_gpu_q8");
+        let mut kv_cache = KvCache::new_gpu_q8(
+            gpu,
+            config.n_layers,
+            config.n_kv_heads,
+            config.head_dim,
+            kv_seq,
+        )
+        .expect("reference: KvCache::new_gpu_q8");
         let mut dn_state = DeltaNetState::new(gpu, config).expect("reference: DeltaNetState::new");
         let scratch = Qwen35Scratch::new_with_kv_max(gpu, config, 128, kv_seq)
             .expect("reference: Qwen35Scratch::new_with_kv_max");
@@ -212,7 +229,10 @@ fn main() {
         )
         .expect("reference: prefill forward");
         gpu.hip.device_synchronize().expect("sync");
-        steps.push(gpu.download_f32(&scratch.logits).expect("reference: download logits"));
+        steps.push(
+            gpu.download_f32(&scratch.logits)
+                .expect("reference: download logits"),
+        );
 
         for k in 0..DECODE_STEPS {
             // `forward_scratch`, NOT forward_prefill_batch with a 1-token slice.
@@ -235,7 +255,10 @@ fn main() {
             )
             .expect("reference: decode forward");
             gpu.hip.device_synchronize().expect("sync");
-            steps.push(gpu.download_f32(&scratch.logits).expect("reference: download logits"));
+            steps.push(
+                gpu.download_f32(&scratch.logits)
+                    .expect("reference: download logits"),
+            );
         }
 
         kv_cache.free_gpu(gpu).expect("reference: free kv_cache");
@@ -272,7 +295,8 @@ fn main() {
         let n_slots = lens.len();
         let max_batch = lens.iter().sum::<usize>();
 
-        let mut pool = SlotPool::new(n_slots, CAP_TOKENS, per_pos_bytes).expect("candidate: SlotPool::new");
+        let mut pool =
+            SlotPool::new(n_slots, CAP_TOKENS, per_pos_bytes).expect("candidate: SlotPool::new");
         for s in 0..n_slots {
             let id = pool.acquire().expect("candidate: SlotPool::acquire");
             assert_eq!(
@@ -284,23 +308,32 @@ fn main() {
 
         let arena_bytes = pool.arena_bytes();
         let k_arenas: Vec<GpuTensor> = (0..n_fa_layers)
-            .map(|_| gpu.zeros(&[arena_bytes], DType::Raw).expect("candidate: alloc k_arena"))
+            .map(|_| {
+                gpu.zeros(&[arena_bytes], DType::Raw)
+                    .expect("candidate: alloc k_arena")
+            })
             .collect();
         let v_arenas: Vec<GpuTensor> = (0..n_fa_layers)
-            .map(|_| gpu.zeros(&[arena_bytes], DType::Raw).expect("candidate: alloc v_arena"))
+            .map(|_| {
+                gpu.zeros(&[arena_bytes], DType::Raw)
+                    .expect("candidate: alloc v_arena")
+            })
             .collect();
         let mut dn_states: Vec<DeltaNetState> = (0..n_slots)
             .map(|_| DeltaNetState::new(gpu, config).expect("candidate: DeltaNetState::new"))
             .collect();
         let mut desc_staging =
             SlotDescStaging::new(gpu, n_slots, max_batch).expect("candidate: SlotDescStaging::new");
-        let pbs = PrefillBatchScratch::new(gpu, config, max_batch).expect("candidate: PrefillBatchScratch::new");
+        let pbs = PrefillBatchScratch::new(gpu, config, max_batch)
+            .expect("candidate: PrefillBatchScratch::new");
         let scratch = Qwen35Scratch::new_with_kv_max(gpu, config, 64, CAP_TOKENS)
             .expect("candidate: Qwen35Scratch::new_with_kv_max");
-        let logits_out =
-            gpu.zeros(&[n_slots * config.vocab_size], DType::F32).expect("candidate: alloc logits_out");
+        let logits_out = gpu
+            .zeros(&[n_slots * config.vocab_size], DType::F32)
+            .expect("candidate: alloc logits_out");
 
-        let mut per_slot_steps: Vec<Vec<Vec<f32>>> = vec![Vec::with_capacity(1 + DECODE_STEPS); n_slots];
+        let mut per_slot_steps: Vec<Vec<Vec<f32>>> =
+            vec![Vec::with_capacity(1 + DECODE_STEPS); n_slots];
 
         for step_idx in 0..=DECODE_STEPS {
             let mut batch = if step_idx == 0 {
@@ -342,12 +375,16 @@ fn main() {
             // [0, seq_len)"), not whatever the corrupted call happened to
             // address this step.
             for s in 0..n_slots {
-                pool.set_seq_len(SlotId(s), lens[s] + step_idx).expect("candidate: set_seq_len");
+                pool.set_seq_len(SlotId(s), lens[s] + step_idx)
+                    .expect("candidate: set_seq_len");
             }
 
-            let flat = gpu.download_f32(&logits_out).expect("candidate: download logits_out");
+            let flat = gpu
+                .download_f32(&logits_out)
+                .expect("candidate: download logits_out");
             for s in 0..n_slots {
-                per_slot_steps[s].push(flat[s * config.vocab_size..(s + 1) * config.vocab_size].to_vec());
+                per_slot_steps[s]
+                    .push(flat[s * config.vocab_size..(s + 1) * config.vocab_size].to_vec());
             }
         }
 
@@ -363,7 +400,8 @@ fn main() {
         desc_staging.free_gpu(gpu);
         pbs.free_gpu(gpu);
         scratch.free_gpu(gpu);
-        gpu.free_tensor(logits_out).expect("candidate: free logits_out");
+        gpu.free_tensor(logits_out)
+            .expect("candidate: free logits_out");
 
         per_slot_steps
     }
@@ -383,7 +421,16 @@ fn main() {
         let reference: Vec<Vec<Vec<f32>>> = (0..n_slots)
             .map(|s| run_reference_for_slot(gpu, weights, config, &streams[s], lens[s]))
             .collect();
-        let candidate = run_candidate(gpu, weights, config, n_fa_layers, per_pos_bytes, &lens, &streams, None);
+        let candidate = run_candidate(
+            gpu,
+            weights,
+            config,
+            n_fa_layers,
+            per_pos_bytes,
+            &lens,
+            &streams,
+            None,
+        );
 
         let mut n_ok = 0usize;
         let n_total = n_slots * (1 + DECODE_STEPS);
@@ -409,15 +456,25 @@ fn main() {
         n_fa_layers: usize,
         per_pos_bytes: usize,
     ) {
-        println!("\n=== negative control: candidate arm's row_slot corrupted (slot 1 -> slot 0) ===");
+        println!(
+            "\n=== negative control: candidate arm's row_slot corrupted (slot 1 -> slot 0) ==="
+        );
         let lens = vec![6usize, 9usize];
         let streams = build_token_stream(&lens, 1); // salt=1: a dataset distinct from the golden sweep's
 
         let reference_slot1 = run_reference_for_slot(gpu, weights, config, &streams[1], lens[1]);
 
         let corrupt_step = 2usize; // second decode: slot 0 @ pos 7, slot 1 @ pos 10
-        let candidate =
-            run_candidate(gpu, weights, config, n_fa_layers, per_pos_bytes, &lens, &streams, Some((corrupt_step, 1, 0)));
+        let candidate = run_candidate(
+            gpu,
+            weights,
+            config,
+            n_fa_layers,
+            per_pos_bytes,
+            &lens,
+            &streams,
+            Some((corrupt_step, 1, 0)),
+        );
 
         // This comparison is EXPECTED to panic — suppress the default panic
         // hook's stderr spam for the duration of the probe, then restore it.
@@ -468,21 +525,34 @@ fn main() {
     // config values rather than guessed constants. ----
     let mut hfq = HfqFile::open(Path::new(&model_path)).expect("open model");
     let config = qwen35::config_from_hfq(&hfq).expect("parse Qwen3.5 config");
-    let n_fa_layers = config.layer_types.iter().filter(|t| **t == LayerType::FullAttention).count();
-    let n_delta_layers = config.layer_types.iter().filter(|t| **t == LayerType::LinearAttention).count();
+    let n_fa_layers = config
+        .layer_types
+        .iter()
+        .filter(|t| **t == LayerType::FullAttention)
+        .count();
+    let n_delta_layers = config
+        .layer_types
+        .iter()
+        .filter(|t| **t == LayerType::LinearAttention)
+        .count();
     let per_pos_bytes = config.n_kv_heads * (config.head_dim / 32) * 34; // Q8_0 K and V, same stride
 
     // ---- preflight: itemized, not a magic number. A prior harness in this
     // project undercounted by ~30% by omitting host-side Vecs; this adds up
     // every device AND host allocation this run holds live at once, at its
     // worst case (n_slots=N_SLOTS_MAX). ----
-    let weight_bytes = std::fs::metadata(&model_path).expect("stat model file").len();
+    let weight_bytes = std::fs::metadata(&model_path)
+        .expect("stat model file")
+        .len();
     let cap_rounded = CAP_TOKENS.div_ceil(128) * 128;
 
     // Candidate arm: K+V arenas across every FullAttention layer, sized for
     // N_SLOTS_MAX and held live for that iteration of the sweep.
-    let candidate_kv_bytes =
-        (n_fa_layers as u64) * 2 * (N_SLOTS_MAX as u64) * (cap_rounded as u64) * (per_pos_bytes as u64);
+    let candidate_kv_bytes = (n_fa_layers as u64)
+        * 2
+        * (N_SLOTS_MAX as u64)
+        * (cap_rounded as u64)
+        * (per_pos_bytes as u64);
 
     // Candidate arm: one DeltaNetState per slot (s_matrices Q8 1B/elem +
     // s_scales f32 + s_ef_residual f16 + conv_states f32), N_SLOTS_MAX held
@@ -490,8 +560,8 @@ fn main() {
     let dn_s_dim = config.linear_key_head_dim;
     let dn_heads = config.linear_num_value_heads;
     let dn_s_size = dn_heads * dn_s_dim * dn_s_dim;
-    let dn_conv_channels =
-        config.linear_num_key_heads * config.linear_key_head_dim * 2 + config.linear_num_value_heads * config.linear_value_head_dim;
+    let dn_conv_channels = config.linear_num_key_heads * config.linear_key_head_dim * 2
+        + config.linear_num_value_heads * config.linear_value_head_dim;
     let dn_conv_state_size = dn_conv_channels * config.conv_kernel_dim.saturating_sub(1);
     let per_slot_dn_bytes = (n_delta_layers as u64)
         * (dn_s_size as u64
@@ -511,8 +581,10 @@ fn main() {
     let golden_ref_downloads: usize = (1..=N_SLOTS_MAX).sum::<usize>() * (1 + DECODE_STEPS);
     let golden_cand_downloads: usize = N_SLOTS_MAX * (1 + DECODE_STEPS);
     let neg_ctrl_downloads: usize = (1 + DECODE_STEPS) * 2; // one reference slot + one candidate run
-    let host_logit_bytes =
-        (golden_ref_downloads + golden_cand_downloads + neg_ctrl_downloads) as u64 * (config.vocab_size as u64) * 4;
+    let host_logit_bytes = (golden_ref_downloads + golden_cand_downloads + neg_ctrl_downloads)
+        as u64
+        * (config.vocab_size as u64)
+        * 4;
 
     let planned = weight_bytes
         + candidate_kv_bytes
@@ -550,7 +622,14 @@ fn main() {
     let mut n_ok = 0usize;
     let mut n_total = 0usize;
     for n_slots in 1..=N_SLOTS_MAX {
-        let (ok, total) = run_golden_equivalence(&mut gpu, &weights, &config, n_slots, n_fa_layers, per_pos_bytes);
+        let (ok, total) = run_golden_equivalence(
+            &mut gpu,
+            &weights,
+            &config,
+            n_slots,
+            n_fa_layers,
+            per_pos_bytes,
+        );
         n_ok += ok;
         n_total += total;
     }

@@ -43,15 +43,23 @@ fn main() {
 
     let mut hfq = HfqFile::open(Path::new(&model_path)).expect("open model");
     let config = qwen35::config_from_hfq(&hfq).expect("parse Qwen3.5 config");
-    let n_fa_layers = config.layer_types.iter().filter(|t| **t == LayerType::FullAttention).count();
+    let n_fa_layers = config
+        .layer_types
+        .iter()
+        .filter(|t| **t == LayerType::FullAttention)
+        .count();
     let per_pos_bytes = config.n_kv_heads * (config.head_dim / 32) * 34;
     let dim = config.dim;
 
     const PROMPT_LEN: usize = 5;
     const CAP_TOKENS: usize = 64;
-    let tokens: Vec<u32> = (0..PROMPT_LEN).map(|i| ((i as u32) * 131 % 900) + 1).collect();
+    let tokens: Vec<u32> = (0..PROMPT_LEN)
+        .map(|i| ((i as u32) * 131 % 900) + 1)
+        .collect();
 
-    let weight_bytes = std::fs::metadata(&model_path).expect("stat model file").len();
+    let weight_bytes = std::fs::metadata(&model_path)
+        .expect("stat model file")
+        .len();
     let planned = weight_bytes + 2 * 1024 * 1024 * 1024u64; // weights + generous flat slop
     preflight_alloc(planned, R9700_VRAM_BYTES, "bisect_forward_slots").expect("preflight refused");
 
@@ -63,7 +71,10 @@ fn main() {
     }
     .expect("load weights");
 
-    println!("model: {} layers, dim={dim}, prompt_len={PROMPT_LEN}", config.n_layers);
+    println!(
+        "model: {} layers, dim={dim}, prompt_len={PROMPT_LEN}",
+        config.n_layers
+    );
     println!(
         "{:>3} {:>16} {:>14} {:>14} {:>10}",
         "L", "type", "max|ref|", "max|ref-cand|", "rel"
@@ -73,13 +84,19 @@ fn main() {
 
     for max_layer in 1..=config.n_layers {
         // ---- reference: fresh KvCache + DeltaNetState + scratch every time ----
-        let mut ref_kv =
-            KvCache::new_gpu_q8(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq)
-                .expect("ref KvCache");
+        let mut ref_kv = KvCache::new_gpu_q8(
+            &mut gpu,
+            config.n_layers,
+            config.n_kv_heads,
+            config.head_dim,
+            kv_seq,
+        )
+        .expect("ref KvCache");
         let mut ref_dn = DeltaNetState::new(&mut gpu, &config).expect("ref DeltaNetState");
         let ref_scratch = Qwen35Scratch::new_with_kv_max(&mut gpu, &config, 128, kv_seq)
             .expect("ref Qwen35Scratch");
-        let ref_pbs = PrefillBatchScratch::new(&mut gpu, &config, PROMPT_LEN).expect("ref PrefillBatchScratch");
+        let ref_pbs = PrefillBatchScratch::new(&mut gpu, &config, PROMPT_LEN)
+            .expect("ref PrefillBatchScratch");
 
         qwen35::forward_prefill_batch_with_pbs_opts(
             &mut gpu,
@@ -101,7 +118,9 @@ fn main() {
         )
         .expect("reference forward (bounded)");
         gpu.hip.device_synchronize().expect("sync ref");
-        let ref_x = gpu.download_f32(&ref_pbs.x_batch.sub_offset(0, PROMPT_LEN * dim)).expect("dl ref x");
+        let ref_x = gpu
+            .download_f32(&ref_pbs.x_batch.sub_offset(0, PROMPT_LEN * dim))
+            .expect("dl ref x");
 
         ref_kv.free_gpu(&mut gpu).expect("free ref_kv");
         ref_dn.free_gpu(&mut gpu);
@@ -113,16 +132,23 @@ fn main() {
         let slot0 = pool.acquire().expect("acquire slot 0");
         assert_eq!(slot0.0, 0);
         let arena_bytes = pool.arena_bytes();
-        let k_arenas: Vec<GpuTensor> =
-            (0..n_fa_layers).map(|_| gpu.zeros(&[arena_bytes], DType::Raw).expect("k_arena")).collect();
-        let v_arenas: Vec<GpuTensor> =
-            (0..n_fa_layers).map(|_| gpu.zeros(&[arena_bytes], DType::Raw).expect("v_arena")).collect();
-        let mut dn_states = vec![DeltaNetState::new(&mut gpu, &config).expect("cand DeltaNetState")];
-        let mut desc_staging = SlotDescStaging::new(&mut gpu, 1, PROMPT_LEN).expect("SlotDescStaging");
-        let cand_pbs = PrefillBatchScratch::new(&mut gpu, &config, PROMPT_LEN).expect("cand PrefillBatchScratch");
-        let cand_scratch =
-            Qwen35Scratch::new_with_kv_max(&mut gpu, &config, 64, CAP_TOKENS).expect("cand Qwen35Scratch");
-        let logits_out = gpu.zeros(&[config.vocab_size], DType::F32).expect("logits_out");
+        let k_arenas: Vec<GpuTensor> = (0..n_fa_layers)
+            .map(|_| gpu.zeros(&[arena_bytes], DType::Raw).expect("k_arena"))
+            .collect();
+        let v_arenas: Vec<GpuTensor> = (0..n_fa_layers)
+            .map(|_| gpu.zeros(&[arena_bytes], DType::Raw).expect("v_arena"))
+            .collect();
+        let mut dn_states =
+            vec![DeltaNetState::new(&mut gpu, &config).expect("cand DeltaNetState")];
+        let mut desc_staging =
+            SlotDescStaging::new(&mut gpu, 1, PROMPT_LEN).expect("SlotDescStaging");
+        let cand_pbs = PrefillBatchScratch::new(&mut gpu, &config, PROMPT_LEN)
+            .expect("cand PrefillBatchScratch");
+        let cand_scratch = Qwen35Scratch::new_with_kv_max(&mut gpu, &config, 64, CAP_TOKENS)
+            .expect("cand Qwen35Scratch");
+        let logits_out = gpu
+            .zeros(&[config.vocab_size], DType::F32)
+            .expect("logits_out");
         let batch = SlotBatch::build(&[(SlotId(0), &tokens[..], 0usize)]);
 
         forward_batch_slots_with_max_layer(
@@ -142,7 +168,9 @@ fn main() {
         )
         .expect("candidate forward (bounded)");
         gpu.hip.device_synchronize().expect("sync cand");
-        let cand_x = gpu.download_f32(&cand_pbs.x_batch.sub_offset(0, PROMPT_LEN * dim)).expect("dl cand x");
+        let cand_x = gpu
+            .download_f32(&cand_pbs.x_batch.sub_offset(0, PROMPT_LEN * dim))
+            .expect("dl cand x");
 
         for t in k_arenas {
             gpu.free_tensor(t).expect("free k_arena");

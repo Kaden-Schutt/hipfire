@@ -121,7 +121,10 @@ fn gen_givens_angles(seed: u32, n_blocks: usize) -> (Vec<f32>, Vec<f32>) {
 /// any comparison against it.
 fn assert_varying(data: &[u8], label: &str) {
     let all_same = data.windows(2).all(|w| w[0] == w[1]);
-    assert!(!all_same, "{label}: generator produced constant bytes — not a real test");
+    assert!(
+        !all_same,
+        "{label}: generator produced constant bytes — not a real test"
+    );
 }
 
 fn assert_close(label: &str, got: &[f32], want: &[f32]) {
@@ -138,10 +141,16 @@ fn assert_close(label: &str, got: &[f32], want: &[f32]) {
     // check first, so a shared-NaN input is a hard failure, not a silent
     // 0.000x.
     if let Some(i) = got.iter().position(|v| !v.is_finite()) {
-        panic!("{label}: candidate[{i}]={} is non-finite (want[{i}]={})", got[i], want[i]);
+        panic!(
+            "{label}: candidate[{i}]={} is non-finite (want[{i}]={})",
+            got[i], want[i]
+        );
     }
     if let Some(i) = want.iter().position(|v| !v.is_finite()) {
-        panic!("{label}: reference[{i}]={} is non-finite (got[{i}]={})", want[i], got[i]);
+        panic!(
+            "{label}: reference[{i}]={} is non-finite (got[{i}]={})",
+            want[i], got[i]
+        );
     }
     // Non-degeneracy guard: both `out` buffers start life as `gpu.zeros`, and
     // this harness's own comments (see build_tiles' doc comment on empty
@@ -237,7 +246,12 @@ impl Shape {
     fn label(&self) -> String {
         format!(
             "slots={} seq_lens={:?} m={:?} nh={} nkv={} hd={}",
-            self.n_slots, self.seq_lens, self.m_per_slot, self.n_heads, self.n_kv_heads, self.head_dim
+            self.n_slots,
+            self.seq_lens,
+            self.m_per_slot,
+            self.n_heads,
+            self.n_kv_heads,
+            self.head_dim
         )
     }
 
@@ -479,20 +493,38 @@ impl GeneralBatch {
     }
 }
 
-fn build_k_arena_for_mode(shape: &Shape, mode: KvMode, poison_except: Option<usize>) -> (Vec<u8>, Vec<KvSlotDesc>) {
+fn build_k_arena_for_mode(
+    shape: &Shape,
+    mode: KvMode,
+    poison_except: Option<usize>,
+) -> (Vec<u8>, Vec<KvSlotDesc>) {
     match mode {
         // Generic block filler is safe for Q8_0: the "scale" it poisons is
         // always exactly the f16 field the kernel reads.
-        KvMode::Q8 => build_arena(&shape.seq_lens, mode.k_per_pos(shape.n_kv_heads, shape.head_dim), poison_except),
+        KvMode::Q8 => build_arena(
+            &shape.seq_lens,
+            mode.k_per_pos(shape.n_kv_heads, shape.head_dim),
+            poison_except,
+        ),
         // asym3's K `cnorm` is a 4-byte float read at a non-34-byte-aligned
         // offset — see build_asym3_k_arena's doc comment for why the
         // generic filler is unsafe here (empirically found while building
         // this harness, not a hypothetical).
-        KvMode::Asym3 => build_asym3_k_arena(&shape.seq_lens, shape.n_kv_heads, shape.head_dim, poison_except),
+        KvMode::Asym3 => build_asym3_k_arena(
+            &shape.seq_lens,
+            shape.n_kv_heads,
+            shape.head_dim,
+            poison_except,
+        ),
     }
 }
 
-fn build_general_batch(gpu: &mut Gpu, shape: &Shape, mode: KvMode, poison_except: Option<usize>) -> GeneralBatch {
+fn build_general_batch(
+    gpu: &mut Gpu,
+    shape: &Shape,
+    mode: KvMode,
+    poison_except: Option<usize>,
+) -> GeneralBatch {
     build_general_batch_ex(gpu, shape, mode, poison_except, true)
 }
 
@@ -523,10 +555,20 @@ fn build_general_batch_ex(
     // by run_general_reference to slice these same arenas) stays correct.
     // See maybe_corrupt's doc comment.
     let descs = merge_descs(&k_descs, &v_descs);
-    let descs_for_device = if apply_negative_control { maybe_corrupt(descs.clone()) } else { descs.clone() };
-    let descs_dev = gpu.upload_raw(&pack_descs(&descs_for_device), &[shape.n_slots]).expect("descs upload");
-    let k_arena = gpu.upload_raw(&k_bytes, &[k_bytes.len()]).expect("k arena upload");
-    let v_arena = gpu.upload_raw(&v_bytes, &[v_bytes.len()]).expect("v arena upload");
+    let descs_for_device = if apply_negative_control {
+        maybe_corrupt(descs.clone())
+    } else {
+        descs.clone()
+    };
+    let descs_dev = gpu
+        .upload_raw(&pack_descs(&descs_for_device), &[shape.n_slots])
+        .expect("descs upload");
+    let k_arena = gpu
+        .upload_raw(&k_bytes, &[k_bytes.len()])
+        .expect("k arena upload");
+    let v_arena = gpu
+        .upload_raw(&v_bytes, &[v_bytes.len()])
+        .expect("v arena upload");
 
     let q_dim = shape.n_heads * shape.head_dim;
     let positions_per_slot = shape.positions();
@@ -544,9 +586,15 @@ fn build_general_batch_ex(
         }
     }
     let batch_size = positions_flat.len();
-    let q = gpu.upload_f32(&q_data, &[batch_size.max(1) * q_dim]).expect("q upload");
-    let positions = gpu.upload_raw(&i32_bytes(&positions_flat), &[batch_size.max(1)]).expect("positions upload");
-    let row_slot_dev = gpu.upload_raw(&i32_bytes(&row_slot), &[batch_size.max(1)]).expect("row_slot upload");
+    let q = gpu
+        .upload_f32(&q_data, &[batch_size.max(1) * q_dim])
+        .expect("q upload");
+    let positions = gpu
+        .upload_raw(&i32_bytes(&positions_flat), &[batch_size.max(1)])
+        .expect("positions upload");
+    let row_slot_dev = gpu
+        .upload_raw(&i32_bytes(&row_slot), &[batch_size.max(1)])
+        .expect("row_slot upload");
     let max_ctx_len = *shape.seq_lens.iter().max().unwrap();
 
     GeneralBatch {
@@ -584,9 +632,14 @@ fn run_general_candidate(
         batch.batch_size
     };
     let partials = gpu
-        .zeros(&[rows_for_partials * shape.n_heads * max_tiles * (2 + shape.head_dim)], DType::F32)
+        .zeros(
+            &[rows_for_partials * shape.n_heads * max_tiles * (2 + shape.head_dim)],
+            DType::F32,
+        )
         .expect("partials");
-    let out = gpu.zeros(&[batch.batch_size * q_dim], DType::F32).expect("out");
+    let out = gpu
+        .zeros(&[batch.batch_size * q_dim], DType::F32)
+        .expect("out");
 
     match mode {
         KvMode::Q8 => {
@@ -643,7 +696,14 @@ fn run_general_candidate(
     result
 }
 
-fn run_general_reference(gpu: &mut Gpu, shape: &Shape, mode: KvMode, batch: &GeneralBatch, cos_theta: &GpuTensor, sin_theta: &GpuTensor) -> Vec<f32> {
+fn run_general_reference(
+    gpu: &mut Gpu,
+    shape: &Shape,
+    mode: KvMode,
+    batch: &GeneralBatch,
+    cos_theta: &GpuTensor,
+    sin_theta: &GpuTensor,
+) -> Vec<f32> {
     let q_dim = shape.n_heads * shape.head_dim;
     let k_per_pos = mode.k_per_pos(shape.n_kv_heads, shape.head_dim);
     let v_per_pos = mode.v_per_pos(shape.n_kv_heads, shape.head_dim);
@@ -658,25 +718,64 @@ fn run_general_reference(gpu: &mut Gpu, shape: &Shape, mode: KvMode, batch: &Gen
         let desc = batch.descs[s];
         let cap = desc.cap as usize;
         let sl = shape.seq_lens[s];
-        let k_view = batch.k_arena.sub_offset(desc.k_base as usize, cap * k_per_pos);
-        let v_view = batch.v_arena.sub_offset(desc.v_base as usize, cap * v_per_pos);
+        let k_view = batch
+            .k_arena
+            .sub_offset(desc.k_base as usize, cap * k_per_pos);
+        let v_view = batch
+            .v_arena
+            .sub_offset(desc.v_base as usize, cap * v_per_pos);
         let q_slice = batch.q.sub_offset(row0 * q_dim, m * q_dim);
-        let pos_dev = gpu.upload_raw(&i32_bytes(&positions_per_slot[s]), &[m]).expect("pos_ref upload");
+        let pos_dev = gpu
+            .upload_raw(&i32_bytes(&positions_per_slot[s]), &[m])
+            .expect("pos_ref upload");
         let max_tiles = sl.div_ceil(128);
-        let partials_ref = gpu.zeros(&[m * shape.n_heads * max_tiles * (2 + shape.head_dim)], DType::F32).expect("partials_ref");
+        let partials_ref = gpu
+            .zeros(
+                &[m * shape.n_heads * max_tiles * (2 + shape.head_dim)],
+                DType::F32,
+            )
+            .expect("partials_ref");
         let out_ref = gpu.zeros(&[m * q_dim], DType::F32).expect("out_ref");
         match mode {
             KvMode::Q8 => {
                 gpu.attention_flash_q8_0_batched_masked(
-                    &q_slice, &k_view, &v_view, &out_ref, &pos_dev, shape.n_heads, shape.n_kv_heads, shape.head_dim, sl, sl, m, &partials_ref,
-                    None, 0, 0,
+                    &q_slice,
+                    &k_view,
+                    &v_view,
+                    &out_ref,
+                    &pos_dev,
+                    shape.n_heads,
+                    shape.n_kv_heads,
+                    shape.head_dim,
+                    sl,
+                    sl,
+                    m,
+                    &partials_ref,
+                    None,
+                    0,
+                    0,
                 )
                 .expect("q8 legacy reference");
             }
             KvMode::Asym3 => {
                 gpu.attention_flash_asym3_batched_masked(
-                    &q_slice, &k_view, &v_view, &out_ref, &pos_dev, cos_theta, sin_theta, shape.n_heads, shape.n_kv_heads, shape.head_dim, sl,
-                    sl, m, &partials_ref, None, 0, 0,
+                    &q_slice,
+                    &k_view,
+                    &v_view,
+                    &out_ref,
+                    &pos_dev,
+                    cos_theta,
+                    sin_theta,
+                    shape.n_heads,
+                    shape.n_kv_heads,
+                    shape.head_dim,
+                    sl,
+                    sl,
+                    m,
+                    &partials_ref,
+                    None,
+                    0,
+                    0,
                 )
                 .expect("asym3 legacy reference");
             }
@@ -706,30 +805,65 @@ fn slot_output<'a>(flat: &'a [f32], shape: &Shape, target: usize, q_dim: usize) 
     &flat[row0 * q_dim..(row0 + m) * q_dim]
 }
 
-fn test_general_golden(gpu: &mut Gpu, shape: &Shape, mode: KvMode, cos_theta: &GpuTensor, sin_theta: &GpuTensor, force_subbatch: bool) {
+fn test_general_golden(
+    gpu: &mut Gpu,
+    shape: &Shape,
+    mode: KvMode,
+    cos_theta: &GpuTensor,
+    sin_theta: &GpuTensor,
+    force_subbatch: bool,
+) {
     let batch = build_general_batch(gpu, shape, mode, None);
     if batch.batch_size == 0 {
         batch.free(gpu);
         return;
     }
     let reference = run_general_reference(gpu, shape, mode, &batch, cos_theta, sin_theta);
-    let candidate = run_general_candidate(gpu, shape, mode, &batch, force_subbatch, cos_theta, sin_theta);
+    let candidate = run_general_candidate(
+        gpu,
+        shape,
+        mode,
+        &batch,
+        force_subbatch,
+        cos_theta,
+        sin_theta,
+    );
     batch.free(gpu);
     assert_close(
-        &format!("golden [{:?} subbatch={}] {}", mode, force_subbatch, shape.label()),
+        &format!(
+            "golden [{:?} subbatch={}] {}",
+            mode,
+            force_subbatch,
+            shape.label()
+        ),
         &candidate,
         &reference,
     );
 }
 
-fn test_general_isolation(gpu: &mut Gpu, shape: &Shape, mode: KvMode, cos_theta: &GpuTensor, sin_theta: &GpuTensor, force_subbatch: bool) {
+fn test_general_isolation(
+    gpu: &mut Gpu,
+    shape: &Shape,
+    mode: KvMode,
+    cos_theta: &GpuTensor,
+    sin_theta: &GpuTensor,
+    force_subbatch: bool,
+) {
     let q_dim = shape.n_heads * shape.head_dim;
     let clean_batch = build_general_batch(gpu, shape, mode, None);
     if clean_batch.batch_size == 0 {
         clean_batch.free(gpu);
         return;
     }
-    let clean = run_general_candidate(gpu, shape, mode, &clean_batch, force_subbatch, cos_theta, sin_theta);
+    let clean = run_general_candidate(
+        gpu,
+        shape,
+        mode,
+        &clean_batch,
+        force_subbatch,
+        cos_theta,
+        sin_theta,
+    );
     // Free clean_batch's arenas/q/positions/row_slot now — every remaining
     // use in this function reads only the downloaded `clean: Vec<f32>`, not
     // the GPU tensors. Each loop iteration below builds and frees its own
@@ -741,7 +875,15 @@ fn test_general_isolation(gpu: &mut Gpu, shape: &Shape, mode: KvMode, cos_theta:
             continue;
         }
         let poisoned_batch = build_general_batch(gpu, shape, mode, Some(target));
-        let poisoned = run_general_candidate(gpu, shape, mode, &poisoned_batch, force_subbatch, cos_theta, sin_theta);
+        let poisoned = run_general_candidate(
+            gpu,
+            shape,
+            mode,
+            &poisoned_batch,
+            force_subbatch,
+            cos_theta,
+            sin_theta,
+        );
         poisoned_batch.free(gpu);
         let a = slot_output(&clean, shape, target, q_dim);
         let b = slot_output(&poisoned, shape, target, q_dim);
@@ -773,7 +915,12 @@ fn test_general_isolation(gpu: &mut Gpu, shape: &Shape, mode: KvMode, cos_theta:
             shape.label()
         );
         assert_close(
-            &format!("isolation [{:?} subbatch={}] slot={target} {}", mode, force_subbatch, shape.label()),
+            &format!(
+                "isolation [{:?} subbatch={}] slot={target} {}",
+                mode,
+                force_subbatch,
+                shape.label()
+            ),
             b,
             a,
         );
@@ -803,11 +950,11 @@ fn test_poison_is_live(gpu: &mut Gpu, mode: KvMode, cos_theta: &GpuTensor, sin_t
     };
     let target = 1usize;
     let bystander = 0usize; // poison_except's survivor — every OTHER slot,
-                             // including `target`, gets NaN'd.
-    // apply_negative_control=false: this check is orthogonal to
-    // NEGATIVE_CONTROL and must not be silently defeated by it if that env
-    // var happens to be set for an unrelated run — see build_general_batch_ex's
-    // doc comment.
+                            // including `target`, gets NaN'd.
+                            // apply_negative_control=false: this check is orthogonal to
+                            // NEGATIVE_CONTROL and must not be silently defeated by it if that env
+                            // var happens to be set for an unrelated run — see build_general_batch_ex's
+                            // doc comment.
     let batch = build_general_batch_ex(gpu, &shape, mode, Some(bystander), false);
     let out = run_general_candidate(gpu, &shape, mode, &batch, false, cos_theta, sin_theta);
     batch.free(gpu);
@@ -853,9 +1000,15 @@ fn build_lds_batch(gpu: &mut Gpu, shape: &Shape, poison_except: Option<usize>) -
     // See build_general_batch: corrupt only the device-bound copy.
     let descs = merge_descs(&k_descs, &v_descs);
     let descs_for_device = maybe_corrupt(descs.clone());
-    let descs_dev = gpu.upload_raw(&pack_descs(&descs_for_device), &[shape.n_slots]).expect("descs upload");
-    let k_arena = gpu.upload_raw(&k_bytes, &[k_bytes.len()]).expect("k arena upload");
-    let v_arena = gpu.upload_raw(&v_bytes, &[v_bytes.len()]).expect("v arena upload");
+    let descs_dev = gpu
+        .upload_raw(&pack_descs(&descs_for_device), &[shape.n_slots])
+        .expect("descs upload");
+    let k_arena = gpu
+        .upload_raw(&k_bytes, &[k_bytes.len()])
+        .expect("k arena upload");
+    let v_arena = gpu
+        .upload_raw(&v_bytes, &[v_bytes.len()])
+        .expect("v arena upload");
 
     let q_dim = shape.n_heads * shape.head_dim;
     let positions_per_slot = shape.positions();
@@ -873,11 +1026,27 @@ fn build_lds_batch(gpu: &mut Gpu, shape: &Shape, poison_except: Option<usize>) -
         }
     }
     let batch_size = positions_flat.len();
-    let q = gpu.upload_f32(&q_data, &[batch_size.max(1) * q_dim]).expect("q upload");
-    let positions = gpu.upload_raw(&i32_bytes(&positions_flat), &[batch_size.max(1)]).expect("positions upload");
-    let row_slot_dev = gpu.upload_raw(&i32_bytes(&row_slot), &[batch_size.max(1)]).expect("row_slot upload");
+    let q = gpu
+        .upload_f32(&q_data, &[batch_size.max(1) * q_dim])
+        .expect("q upload");
+    let positions = gpu
+        .upload_raw(&i32_bytes(&positions_flat), &[batch_size.max(1)])
+        .expect("positions upload");
+    let row_slot_dev = gpu
+        .upload_raw(&i32_bytes(&row_slot), &[batch_size.max(1)])
+        .expect("row_slot upload");
     let max_ctx_len = *shape.seq_lens.iter().max().unwrap();
-    LdsBatch { k_arena, v_arena, descs, descs_dev, q, positions, row_slot: row_slot_dev, batch_size, max_ctx_len }
+    LdsBatch {
+        k_arena,
+        v_arena,
+        descs,
+        descs_dev,
+        q,
+        positions,
+        row_slot: row_slot_dev,
+        batch_size,
+        max_ctx_len,
+    }
 }
 
 impl LdsBatch {
@@ -896,7 +1065,9 @@ fn run_lds_candidate(gpu: &mut Gpu, shape: &Shape, batch: &LdsBatch) -> Vec<f32>
     if batch.batch_size == 0 {
         return Vec::new();
     }
-    let out = gpu.zeros(&[batch.batch_size * q_dim], DType::F32).expect("out");
+    let out = gpu
+        .zeros(&[batch.batch_size * q_dim], DType::F32)
+        .expect("out");
     gpu.attention_q8_0_kv_batched_masked_slots(
         &batch.q,
         &batch.k_arena,
@@ -936,13 +1107,32 @@ fn run_lds_reference(gpu: &mut Gpu, shape: &Shape, batch: &LdsBatch) -> Vec<f32>
         let desc = batch.descs[s];
         let cap = desc.cap as usize;
         let sl = shape.seq_lens[s];
-        let k_view = batch.k_arena.sub_offset(desc.k_base as usize, cap * per_pos);
-        let v_view = batch.v_arena.sub_offset(desc.v_base as usize, cap * per_pos);
+        let k_view = batch
+            .k_arena
+            .sub_offset(desc.k_base as usize, cap * per_pos);
+        let v_view = batch
+            .v_arena
+            .sub_offset(desc.v_base as usize, cap * per_pos);
         let q_slice = batch.q.sub_offset(row0 * q_dim, m * q_dim);
-        let pos_dev = gpu.upload_raw(&i32_bytes(&positions_per_slot[s]), &[m]).expect("pos_ref upload");
+        let pos_dev = gpu
+            .upload_raw(&i32_bytes(&positions_per_slot[s]), &[m])
+            .expect("pos_ref upload");
         let out_ref = gpu.zeros(&[m * q_dim], DType::F32).expect("out_ref");
         gpu.attention_q8_0_kv_batched_masked(
-            &q_slice, &k_view, &v_view, &out_ref, &pos_dev, shape.n_heads, shape.n_kv_heads, shape.head_dim, sl, sl, m, None, 0, 0,
+            &q_slice,
+            &k_view,
+            &v_view,
+            &out_ref,
+            &pos_dev,
+            shape.n_heads,
+            shape.n_kv_heads,
+            shape.head_dim,
+            sl,
+            sl,
+            m,
+            None,
+            0,
+            0,
         )
         .expect("lds legacy reference");
         gpu.hip.device_synchronize().expect("sync");
@@ -964,7 +1154,11 @@ fn test_lds_golden(gpu: &mut Gpu, shape: &Shape) {
     let reference = run_lds_reference(gpu, shape, &batch);
     let candidate = run_lds_candidate(gpu, shape, &batch);
     batch.free(gpu);
-    assert_close(&format!("LDS golden {}", shape.label()), &candidate, &reference);
+    assert_close(
+        &format!("LDS golden {}", shape.label()),
+        &candidate,
+        &reference,
+    );
 }
 
 fn test_lds_isolation(gpu: &mut Gpu, shape: &Shape) {
@@ -990,7 +1184,11 @@ fn test_lds_isolation(gpu: &mut Gpu, shape: &Shape) {
             "LDS isolation {}: slot {target} NaN leaked in from a neighbouring slot",
             shape.label()
         );
-        assert_close(&format!("LDS isolation slot={target} {}", shape.label()), b, a);
+        assert_close(
+            &format!("LDS isolation slot={target} {}", shape.label()),
+            b,
+            a,
+        );
     }
 }
 
@@ -1011,7 +1209,12 @@ struct PrefillBatch {
     batch_size: usize,
 }
 
-fn build_prefill_batch(gpu: &mut Gpu, shape: &Shape, br: usize, poison_except: Option<usize>) -> PrefillBatch {
+fn build_prefill_batch(
+    gpu: &mut Gpu,
+    shape: &Shape,
+    br: usize,
+    poison_except: Option<usize>,
+) -> PrefillBatch {
     let per_pos = KvMode::Q8.k_per_pos(shape.n_kv_heads, shape.head_dim); // K == V stride for prefill
     let (k_bytes, k_descs) = build_arena(&shape.seq_lens, per_pos, poison_except);
     let (v_bytes, v_descs) = build_arena(&shape.seq_lens, per_pos, poison_except);
@@ -1020,9 +1223,15 @@ fn build_prefill_batch(gpu: &mut Gpu, shape: &Shape, br: usize, poison_except: O
     // See build_general_batch: corrupt only the device-bound copy.
     let descs = merge_descs(&k_descs, &v_descs);
     let descs_for_device = maybe_corrupt(descs.clone());
-    let descs_dev = gpu.upload_raw(&pack_descs(&descs_for_device), &[shape.n_slots]).expect("descs upload");
-    let k_arena = gpu.upload_raw(&k_bytes, &[k_bytes.len()]).expect("k arena upload");
-    let v_arena = gpu.upload_raw(&v_bytes, &[v_bytes.len()]).expect("v arena upload");
+    let descs_dev = gpu
+        .upload_raw(&pack_descs(&descs_for_device), &[shape.n_slots])
+        .expect("descs upload");
+    let k_arena = gpu
+        .upload_raw(&k_bytes, &[k_bytes.len()])
+        .expect("k arena upload");
+    let v_arena = gpu
+        .upload_raw(&v_bytes, &[v_bytes.len()])
+        .expect("v arena upload");
 
     let q_dim = shape.n_heads * shape.head_dim;
     let positions_per_slot = shape.positions();
@@ -1038,14 +1247,24 @@ fn build_prefill_batch(gpu: &mut Gpu, shape: &Shape, br: usize, poison_except: O
         }
     }
     let batch_size = positions_flat.len();
-    let q = gpu.upload_f32(&q_data, &[batch_size.max(1) * q_dim]).expect("q upload");
-    let positions = gpu.upload_raw(&i32_bytes(&positions_flat), &[batch_size.max(1)]).expect("positions upload");
+    let q = gpu
+        .upload_f32(&q_data, &[batch_size.max(1) * q_dim])
+        .expect("q upload");
+    let positions = gpu
+        .upload_raw(&i32_bytes(&positions_flat), &[batch_size.max(1)])
+        .expect("positions upload");
 
     let (tile_slot, tile_row0, tile_qbase) = build_tiles(&shape.m_per_slot, br);
     let n_tiles = tile_slot.len();
-    let tile_slot_dev = gpu.upload_raw(&i32_bytes(&tile_slot), &[n_tiles.max(1)]).expect("tile_slot upload");
-    let tile_row0_dev = gpu.upload_raw(&i32_bytes(&tile_row0), &[n_tiles.max(1)]).expect("tile_row0 upload");
-    let tile_qbase_dev = gpu.upload_raw(&i32_bytes(&tile_qbase), &[n_tiles.max(1)]).expect("tile_qbase upload");
+    let tile_slot_dev = gpu
+        .upload_raw(&i32_bytes(&tile_slot), &[n_tiles.max(1)])
+        .expect("tile_slot upload");
+    let tile_row0_dev = gpu
+        .upload_raw(&i32_bytes(&tile_row0), &[n_tiles.max(1)])
+        .expect("tile_row0 upload");
+    let tile_qbase_dev = gpu
+        .upload_raw(&i32_bytes(&tile_qbase), &[n_tiles.max(1)])
+        .expect("tile_qbase upload");
 
     PrefillBatch {
         k_arena,
@@ -1075,12 +1294,20 @@ impl PrefillBatch {
     }
 }
 
-fn run_prefill_candidate(gpu: &mut Gpu, shape: &Shape, batch: &PrefillBatch, br: usize, bc: usize) -> Vec<f32> {
+fn run_prefill_candidate(
+    gpu: &mut Gpu,
+    shape: &Shape,
+    batch: &PrefillBatch,
+    br: usize,
+    bc: usize,
+) -> Vec<f32> {
     let q_dim = shape.n_heads * shape.head_dim;
     if batch.batch_size == 0 {
         return Vec::new();
     }
-    let out = gpu.zeros(&[batch.batch_size * q_dim], DType::F32).expect("out");
+    let out = gpu
+        .zeros(&[batch.batch_size * q_dim], DType::F32)
+        .expect("out");
     gpu.attention_q8_0_flash_prefill_slots(
         &batch.q,
         &batch.k_arena,
@@ -1107,7 +1334,13 @@ fn run_prefill_candidate(gpu: &mut Gpu, shape: &Shape, batch: &PrefillBatch, br:
     result
 }
 
-fn run_prefill_reference(gpu: &mut Gpu, shape: &Shape, batch: &PrefillBatch, br: usize, bc: usize) -> Vec<f32> {
+fn run_prefill_reference(
+    gpu: &mut Gpu,
+    shape: &Shape,
+    batch: &PrefillBatch,
+    br: usize,
+    bc: usize,
+) -> Vec<f32> {
     let q_dim = shape.n_heads * shape.head_dim;
     let per_pos = KvMode::Q8.k_per_pos(shape.n_kv_heads, shape.head_dim);
     let positions_per_slot = shape.positions();
@@ -1120,13 +1353,30 @@ fn run_prefill_reference(gpu: &mut Gpu, shape: &Shape, batch: &PrefillBatch, br:
         }
         let desc = batch.descs[s];
         let cap = desc.cap as usize;
-        let k_view = batch.k_arena.sub_offset(desc.k_base as usize, cap * per_pos);
-        let v_view = batch.v_arena.sub_offset(desc.v_base as usize, cap * per_pos);
+        let k_view = batch
+            .k_arena
+            .sub_offset(desc.k_base as usize, cap * per_pos);
+        let v_view = batch
+            .v_arena
+            .sub_offset(desc.v_base as usize, cap * per_pos);
         let q_slice = batch.q.sub_offset(row0 * q_dim, m * q_dim);
-        let pos_dev = gpu.upload_raw(&i32_bytes(&positions_per_slot[s]), &[m]).expect("pos_ref upload");
+        let pos_dev = gpu
+            .upload_raw(&i32_bytes(&positions_per_slot[s]), &[m])
+            .expect("pos_ref upload");
         let out_ref = gpu.zeros(&[m * q_dim], DType::F32).expect("out_ref");
         gpu.attention_q8_0_flash_prefill(
-            &q_slice, &k_view, &v_view, &out_ref, &pos_dev, shape.n_heads, shape.n_kv_heads, shape.head_dim, cap, m, br, bc,
+            &q_slice,
+            &k_view,
+            &v_view,
+            &out_ref,
+            &pos_dev,
+            shape.n_heads,
+            shape.n_kv_heads,
+            shape.head_dim,
+            cap,
+            m,
+            br,
+            bc,
         )
         .expect("prefill legacy reference");
         gpu.hip.device_synchronize().expect("sync");
@@ -1148,7 +1398,11 @@ fn test_prefill_golden(gpu: &mut Gpu, shape: &Shape, br: usize, bc: usize) {
     let reference = run_prefill_reference(gpu, shape, &batch, br, bc);
     let candidate = run_prefill_candidate(gpu, shape, &batch, br, bc);
     batch.free(gpu);
-    assert_close(&format!("prefill golden [br={br} bc={bc}] {}", shape.label()), &candidate, &reference);
+    assert_close(
+        &format!("prefill golden [br={br} bc={bc}] {}", shape.label()),
+        &candidate,
+        &reference,
+    );
 }
 
 fn test_prefill_isolation(gpu: &mut Gpu, shape: &Shape, br: usize, bc: usize) {
@@ -1175,7 +1429,10 @@ fn test_prefill_isolation(gpu: &mut Gpu, shape: &Shape, br: usize, bc: usize) {
             shape.label()
         );
         assert_close(
-            &format!("prefill isolation [br={br} bc={bc}] slot={target} {}", shape.label()),
+            &format!(
+                "prefill isolation [br={br} bc={bc}] slot={target} {}",
+                shape.label()
+            ),
             b,
             a,
         );
@@ -1234,8 +1491,12 @@ fn main() {
     println!("asym3 K bytes/pos={asym3_bytes_per_pos} < Q8 K bytes/pos={q8_bytes_per_pos}: OK (asym3 path confirmed active)\n");
 
     let (cos_vals, sin_vals) = gen_givens_angles(42, hd / 2);
-    let cos_theta = gpu.upload_f32(&cos_vals, &[cos_vals.len()]).expect("cos upload");
-    let sin_theta = gpu.upload_f32(&sin_vals, &[sin_vals.len()]).expect("sin upload");
+    let cos_theta = gpu
+        .upload_f32(&cos_vals, &[cos_vals.len()])
+        .expect("cos upload");
+    let sin_theta = gpu
+        .upload_f32(&sin_vals, &[sin_vals.len()])
+        .expect("sin upload");
 
     println!("### Positive poison control (Fix 2, task-7 review) ###");
     test_poison_is_live(&mut gpu, KvMode::Q8, &cos_theta, &sin_theta);
@@ -1265,11 +1526,28 @@ fn main() {
     for shape in general_shapes {
         for &mode in &[KvMode::Q8, KvMode::Asym3] {
             for &force_subbatch in &[false, true] {
-                println!("-- {} mode={mode:?} subbatch={force_subbatch}", shape.label());
+                println!(
+                    "-- {} mode={mode:?} subbatch={force_subbatch}",
+                    shape.label()
+                );
                 n_total += 2;
-                test_general_golden(&mut gpu, &shape, mode, &cos_theta, &sin_theta, force_subbatch);
+                test_general_golden(
+                    &mut gpu,
+                    &shape,
+                    mode,
+                    &cos_theta,
+                    &sin_theta,
+                    force_subbatch,
+                );
                 n_ok += 1;
-                test_general_isolation(&mut gpu, &shape, mode, &cos_theta, &sin_theta, force_subbatch);
+                test_general_isolation(
+                    &mut gpu,
+                    &shape,
+                    mode,
+                    &cos_theta,
+                    &sin_theta,
+                    force_subbatch,
+                );
                 n_ok += 1;
             }
         }
@@ -1334,7 +1612,10 @@ fn main() {
     let prefill_shapes: Vec<(Shape, usize, usize)> = if smoke {
         vec![(smoke_shape(), 4, 8)]
     } else if negative_control_active() {
-        shapes_prefill().into_iter().filter(|(s, _, _)| uniform_seq_len(s)).collect()
+        shapes_prefill()
+            .into_iter()
+            .filter(|(s, _, _)| uniform_seq_len(s))
+            .collect()
     } else {
         shapes_prefill()
     };

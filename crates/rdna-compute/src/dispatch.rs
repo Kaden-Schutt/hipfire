@@ -2862,50 +2862,41 @@ impl Gpu {
                     "attention_q8_0_kv",
                     kernels::ATTENTION_Q8_0_KV_SRC.to_string(),
                 ));
-                specs.push((
-                    "attention_q8_0_kv_batched",
-                    {
-                        // Same header-stripping treatment as
-                        // attention_q8_0_kv_batched_masked_slots: the kernel
-                        // #includes kv_slot_desc.h, but this precompile path
-                        // (like the runtime hipcc compile) has no -I to
-                        // kernels/src, so the directive must be stripped and
-                        // the header body prepended instead.
-                        let stripped = kernels::ATTENTION_Q8_0_KV_BATCHED_SRC
-                            .replace("#include \"kv_slot_desc.h\"", "");
-                        format!("{}\n{}", kernels::KV_SLOT_DESC_H, stripped)
-                    },
-                ));
-                specs.push((
-                    "attention_q8_0_flash_prefill",
-                    {
-                        // Same header-stripping treatment as
-                        // attention_q8_0_kv_batched above: the kernel now
-                        // #includes kv_slot_desc.h (Task 6), but this
-                        // precompile path (like the runtime hipcc compile in
-                        // attention_q8_0_flash_prefill_slots) has no -I to
-                        // kernels/src, so the directive must be stripped and
-                        // the header body prepended instead.
-                        let stripped = kernels::ATTENTION_Q8_0_FLASH_PREFILL_SRC
-                            .replace("#include \"kv_slot_desc.h\"", "");
-                        format!("{}\n{}", kernels::KV_SLOT_DESC_H, stripped)
-                    },
-                ));
-                specs.push((
-                    "kv_cache_write_q8_0_batched",
-                    {
-                        // Same header-stripping treatment as
-                        // attention_q8_0_kv_batched above: the kernel now
-                        // #includes kv_slot_desc.h (Task 3), but this
-                        // precompile path (like the runtime hipcc compile in
-                        // kv_cache_write_q8_0_batched_slots) has no -I to
-                        // kernels/src, so the directive must be stripped and
-                        // the header body prepended instead.
-                        let stripped = kernels::KV_CACHE_WRITE_Q8_0_BATCHED_SRC
-                            .replace("#include \"kv_slot_desc.h\"", "");
-                        format!("{}\n{}", kernels::KV_SLOT_DESC_H, stripped)
-                    },
-                ));
+                specs.push(("attention_q8_0_kv_batched", {
+                    // Same header-stripping treatment as
+                    // attention_q8_0_kv_batched_masked_slots: the kernel
+                    // #includes kv_slot_desc.h, but this precompile path
+                    // (like the runtime hipcc compile) has no -I to
+                    // kernels/src, so the directive must be stripped and
+                    // the header body prepended instead.
+                    let stripped = kernels::ATTENTION_Q8_0_KV_BATCHED_SRC
+                        .replace("#include \"kv_slot_desc.h\"", "");
+                    format!("{}\n{}", kernels::KV_SLOT_DESC_H, stripped)
+                }));
+                specs.push(("attention_q8_0_flash_prefill", {
+                    // Same header-stripping treatment as
+                    // attention_q8_0_kv_batched above: the kernel now
+                    // #includes kv_slot_desc.h (Task 6), but this
+                    // precompile path (like the runtime hipcc compile in
+                    // attention_q8_0_flash_prefill_slots) has no -I to
+                    // kernels/src, so the directive must be stripped and
+                    // the header body prepended instead.
+                    let stripped = kernels::ATTENTION_Q8_0_FLASH_PREFILL_SRC
+                        .replace("#include \"kv_slot_desc.h\"", "");
+                    format!("{}\n{}", kernels::KV_SLOT_DESC_H, stripped)
+                }));
+                specs.push(("kv_cache_write_q8_0_batched", {
+                    // Same header-stripping treatment as
+                    // attention_q8_0_kv_batched above: the kernel now
+                    // #includes kv_slot_desc.h (Task 3), but this
+                    // precompile path (like the runtime hipcc compile in
+                    // kv_cache_write_q8_0_batched_slots) has no -I to
+                    // kernels/src, so the directive must be stripped and
+                    // the header body prepended instead.
+                    let stripped = kernels::KV_CACHE_WRITE_Q8_0_BATCHED_SRC
+                        .replace("#include \"kv_slot_desc.h\"", "");
+                    format!("{}\n{}", kernels::KV_SLOT_DESC_H, stripped)
+                }));
                 specs.push((
                     "attention_flash_q8_0_tile",
                     kernels::ATTENTION_FLASH_Q8_0_TILE_SRC.to_string(),

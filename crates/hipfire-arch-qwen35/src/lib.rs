@@ -35,6 +35,14 @@ pub mod carrier;
 /// based draft verify.
 #[cfg(feature = "deltanet")]
 pub mod dflash_spec;
+/// SP3 Task 2 — `forward_batch_slots`, the N-slot forward pass. A PARALLEL
+/// entry point to `qwen35::forward_prefill_batch_with_pbs_opts` (never a
+/// modification of it — see the module doc for why), routing attention
+/// and KV-write through SP1's slot-aware `_slots` kernels and DeltaNet
+/// through SP2's per-slot `DeltaNetState`. Q8_0-only; depends on `qwen35`
+/// for weight/config/scratch types, hence deltanet-gated like it.
+#[cfg(feature = "deltanet")]
+pub mod forward_slots;
 #[cfg(feature = "deltanet")]
 pub(crate) mod layer_driver;
 #[cfg(feature = "deltanet")]
@@ -55,14 +63,6 @@ pub(crate) mod paro_moe;
 pub mod pflash;
 #[cfg(feature = "deltanet")]
 pub mod qwen35;
-/// SP3 Task 2 — `forward_batch_slots`, the N-slot forward pass. A PARALLEL
-/// entry point to `qwen35::forward_prefill_batch_with_pbs_opts` (never a
-/// modification of it — see the module doc for why), routing attention
-/// and KV-write through SP1's slot-aware `_slots` kernels and DeltaNet
-/// through SP2's per-slot `DeltaNetState`. Q8_0-only; depends on `qwen35`
-/// for weight/config/scratch types, hence deltanet-gated like it.
-#[cfg(feature = "deltanet")]
-pub mod forward_slots;
 /// Qwen3.5 impls of the arch-generic `hipfire_runtime::spec` seam
 /// (`impl SpecTarget for ModelSlot`). Deltanet-gated — it touches `ModelSlot`.
 #[cfg(feature = "deltanet")]

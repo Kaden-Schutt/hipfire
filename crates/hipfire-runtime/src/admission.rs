@@ -51,7 +51,11 @@ pub struct AdmissionController {
 
 impl AdmissionController {
     pub fn new(footprint: ModelFootprint, budget_bytes: u64) -> Self {
-        Self { footprint, budget_bytes, admitted: Vec::new() }
+        Self {
+            footprint,
+            budget_bytes,
+            admitted: Vec::new(),
+        }
     }
 
     /// Bytes currently committed: weights once (if anything is admitted) plus
@@ -75,8 +79,11 @@ impl AdmissionController {
     pub fn admit(&mut self, requested_ctx: usize) -> Result<usize, AdmitError> {
         let kv_need = requested_ctx as u64 * self.footprint.kv_bytes_per_token;
         // Weights are charged once, on the first admission.
-        let weights_need =
-            if self.admitted.is_empty() { self.footprint.weights_bytes } else { 0 };
+        let weights_need = if self.admitted.is_empty() {
+            self.footprint.weights_bytes
+        } else {
+            0
+        };
         let need = kv_need + weights_need;
         let available = self.budget_bytes.saturating_sub(self.used_bytes());
         // >= rather than >: an admission that would consume the LAST byte of
@@ -107,12 +114,18 @@ mod tests {
 
     /// qwen3.6:27b — 15.0 GB of weights, 34 KB of KV per token.
     fn f27b() -> ModelFootprint {
-        ModelFootprint { weights_bytes: 15 * GIB, kv_bytes_per_token: 34 * 1024 }
+        ModelFootprint {
+            weights_bytes: 15 * GIB,
+            kv_bytes_per_token: 34 * 1024,
+        }
     }
 
     /// qwen3.6:35b-a3b — ~20 GB of weights, 10.6 KB of KV per token.
     fn f35b() -> ModelFootprint {
-        ModelFootprint { weights_bytes: 20 * GIB, kv_bytes_per_token: 10_854 }
+        ModelFootprint {
+            weights_bytes: 20 * GIB,
+            kv_bytes_per_token: 10_854,
+        }
     }
 
     #[test]
@@ -135,14 +148,18 @@ mod tests {
             a.admit(128 * 1024).expect("first three must fit");
         }
         let e = a.admit(128 * 1024).unwrap_err();
-        assert!(matches!(e, AdmitError::WouldExceedBudget { .. }), "got {e:?}");
+        assert!(
+            matches!(e, AdmitError::WouldExceedBudget { .. }),
+            "got {e:?}"
+        );
     }
 
     #[test]
     fn the_27b_does_take_four_agents_at_96k() {
         let mut a = AdmissionController::new(f27b(), 32 * GIB);
         for i in 0..4 {
-            a.admit(96 * 1024).unwrap_or_else(|e| panic!("agent {i} rejected: {e:?}"));
+            a.admit(96 * 1024)
+                .unwrap_or_else(|e| panic!("agent {i} rejected: {e:?}"));
         }
     }
 
@@ -150,7 +167,8 @@ mod tests {
     fn the_35b_does_take_four_agents_at_128k() {
         let mut a = AdmissionController::new(f35b(), 32 * GIB);
         for i in 0..4 {
-            a.admit(128 * 1024).unwrap_or_else(|e| panic!("agent {i} rejected: {e:?}"));
+            a.admit(128 * 1024)
+                .unwrap_or_else(|e| panic!("agent {i} rejected: {e:?}"));
         }
     }
 
@@ -162,7 +180,8 @@ mod tests {
         }
         assert!(a.admit(128 * 1024).is_err());
         a.release(128 * 1024);
-        a.admit(128 * 1024).expect("budget must be reusable after release");
+        a.admit(128 * 1024)
+            .expect("budget must be reusable after release");
     }
 
     #[test]
@@ -193,6 +212,9 @@ mod tests {
     fn a_single_session_over_budget_is_rejected_not_silently_capped() {
         // One agent asking for more than the whole card can hold.
         let mut a = AdmissionController::new(f27b(), 32 * GIB);
-        assert!(a.admit(2 * 1024 * 1024).is_err(), "must reject, not silently truncate");
+        assert!(
+            a.admit(2 * 1024 * 1024).is_err(),
+            "must reject, not silently truncate"
+        );
     }
 }

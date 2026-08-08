@@ -20,7 +20,10 @@ use rdna_compute::{DType, Gpu};
 use std::time::Instant;
 
 fn env_usize(k: &str, d: usize) -> usize {
-    std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+    std::env::var(k)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(d)
 }
 
 /// Least-squares fit of y = a + b*x. Returns (a, b).
@@ -74,15 +77,16 @@ fn main() {
         let k_cache = gpu.upload_raw(&kv, &[cache_bytes]).expect("k upload");
         let v_cache = gpu.upload_raw(&kv, &[cache_bytes]).expect("v upload");
 
-        let q_data: Vec<f32> = (0..nh * hd).map(|i| ((i % 17) as f32 - 8.0) * 0.05).collect();
+        let q_data: Vec<f32> = (0..nh * hd)
+            .map(|i| ((i % 17) as f32 - 8.0) * 0.05)
+            .collect();
         let q = gpu.upload_f32(&q_data, &[nh * hd]).expect("q upload");
         let out = gpu.zeros(&[nh * hd], DType::F32).expect("out");
 
         // positions are i32 bits uploaded through upload_raw — there is no
         // upload_i32 on Gpu. This matches q8_batched_attn_microbench.rs.
         let pos_data: Vec<i32> = vec![(ctx - 1) as i32];
-        let pos_bytes =
-            unsafe { std::slice::from_raw_parts(pos_data.as_ptr() as *const u8, 4) };
+        let pos_bytes = unsafe { std::slice::from_raw_parts(pos_data.as_ptr() as *const u8, 4) };
         let positions = gpu.upload_raw(pos_bytes, &[1]).expect("pos upload");
 
         let stride = 2 + hd;
@@ -94,8 +98,8 @@ fn main() {
         let mut run = |g: &mut Gpu| {
             for _ in 0..layers {
                 g.attention_flash_q8_0_batched_masked(
-                    &q, &k_cache, &v_cache, &out, &positions,
-                    nh, nkv, hd, ctx, ctx, 1, &partials, None, 0, 0,
+                    &q, &k_cache, &v_cache, &out, &positions, nh, nkv, hd, ctx, ctx, 1, &partials,
+                    None, 0, 0,
                 )
                 .expect("attn");
             }
@@ -127,12 +131,18 @@ fn main() {
     println!();
     println!("fit: t(ctx) = {a:.4} ms + {:.6} ms per 1K ctx", b * 1000.0);
     println!("  a (context-independent, does amortise across slots): {a:.4} ms");
-    println!("  b (KV term, does NOT amortise across slots):         {:.6} ms/1K", b * 1000.0);
+    println!(
+        "  b (KV term, does NOT amortise across slots):         {:.6} ms/1K",
+        b * 1000.0
+    );
     for n in [2usize, 4, 8] {
         for &ctx in &ctxs {
             let seq = (a + b * ctx as f64) * n as f64;
             let bat = a + b * ctx as f64 * n as f64;
-            println!("  N={n} ctx={ctx:>7}: seq={seq:8.3}ms batched={bat:8.3}ms speedup={:.2}x", seq / bat);
+            println!(
+                "  N={n} ctx={ctx:>7}: seq={seq:8.3}ms batched={bat:8.3}ms speedup={:.2}x",
+                seq / bat
+            );
         }
     }
 }

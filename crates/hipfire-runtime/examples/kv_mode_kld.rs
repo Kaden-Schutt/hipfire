@@ -136,9 +136,13 @@ fn main() {
         kv_seq: usize,
     ) -> KvCache {
         match mode {
-            "q8" => {
-                KvCache::new_gpu_q8(gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq)
-            }
+            "q8" => KvCache::new_gpu_q8(
+                gpu,
+                config.n_layers,
+                config.n_kv_heads,
+                config.head_dim,
+                kv_seq,
+            ),
             "asym4" | "turbo4" => KvCache::new_gpu_asym4(
                 gpu,
                 config.n_layers,

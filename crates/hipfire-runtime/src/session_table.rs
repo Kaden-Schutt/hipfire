@@ -62,18 +62,18 @@ impl SessionTable {
         self.next_id += 1;
         self.sessions.insert(
             id,
-            Session { slot, granted_ctx, tokens: Vec::new(), next_pos: 0 },
+            Session {
+                slot,
+                granted_ctx,
+                tokens: Vec::new(),
+                next_pos: 0,
+            },
         );
         Ok(SessionId(id))
     }
 
     /// Close a session, returning its slot and budget together.
-    pub fn close(
-        &mut self,
-        pool: &mut SlotPool,
-        adm: &mut AdmissionController,
-        id: SessionId,
-    ) {
+    pub fn close(&mut self, pool: &mut SlotPool, adm: &mut AdmissionController, id: SessionId) {
         if let Some(session) = self.sessions.remove(&id.0) {
             pool.release(session.slot);
             adm.release(session.granted_ctx);
@@ -105,7 +105,10 @@ mod tests {
     fn rig(n_slots: usize) -> (SlotPool, AdmissionController, SessionTable) {
         let pool = SlotPool::new(n_slots, 4096, PPB).unwrap();
         let adm = AdmissionController::new(
-            ModelFootprint { weights_bytes: GIB, kv_bytes_per_token: 1024 },
+            ModelFootprint {
+                weights_bytes: GIB,
+                kv_bytes_per_token: 1024,
+            },
             32 * GIB,
         );
         (pool, adm, SessionTable::default())
@@ -121,7 +124,8 @@ mod tests {
         t.close(&mut pool, &mut adm, id);
         assert_eq!(t.active(), 0);
         // And is reusable.
-        t.open(&mut pool, &mut adm, 1024).expect("slot must be reusable");
+        t.open(&mut pool, &mut adm, 1024)
+            .expect("slot must be reusable");
     }
 
     #[test]
@@ -129,8 +133,13 @@ mod tests {
         let (mut pool, mut adm, mut t) = rig(2);
         // Far beyond the budget.
         assert!(t.open(&mut pool, &mut adm, 100_000_000).is_err());
-        assert_eq!(t.active(), 0, "a rejected session must leave the pool untouched");
-        t.open(&mut pool, &mut adm, 1024).expect("pool must still have both slots");
+        assert_eq!(
+            t.active(),
+            0,
+            "a rejected session must leave the pool untouched"
+        );
+        t.open(&mut pool, &mut adm, 1024)
+            .expect("pool must still have both slots");
     }
 
     #[test]

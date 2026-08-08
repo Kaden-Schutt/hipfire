@@ -712,7 +712,7 @@ impl FeatureFlags {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hipfire_config::{ConfigLayer, ConfigSource, NamedLayer, ProcessConfig, resolve};
+    use hipfire_config::{resolve, ConfigLayer, ConfigSource, NamedLayer, ProcessConfig};
 
     #[test]
     fn force_unfused_defaults_false_in_test_ctor() {

@@ -102,7 +102,9 @@ fn main() {
         format!("{home}/.hipfire/models/qwen3.5-4b-q8.hf4")
     });
 
-    println!("=== demo_concurrent_serve: {n_slots} sessions via SessionTable + AdmissionController ===");
+    println!(
+        "=== demo_concurrent_serve: {n_slots} sessions via SessionTable + AdmissionController ==="
+    );
     println!("model: {model_path}");
     println!(
         "(programme reference numbers, NOT used below — the live gate uses this run's own \
@@ -146,13 +148,18 @@ fn main() {
     let max_batch = prompt_lens.iter().sum::<usize>().max(pool_capacity);
 
     for (i, (p, toks)) in prompts.iter().zip(&prompt_tokens).enumerate() {
-        println!("  session {i} (pending): \"{p}\" ({} prompt tokens)", toks.len());
+        println!(
+            "  session {i} (pending): \"{p}\" ({} prompt tokens)",
+            toks.len()
+        );
     }
 
     // ---- preflight: same itemized accounting as demo_multislot_generate,
     // sized to pool_capacity (n_slots + 1) since that many slabs/DeltaNet
     // states are allocated regardless of how many are ever acquired. ----
-    let weight_bytes = std::fs::metadata(&model_path).expect("stat model file").len();
+    let weight_bytes = std::fs::metadata(&model_path)
+        .expect("stat model file")
+        .len();
     let cap_rounded = cap_tokens.div_ceil(128) * 128;
 
     let candidate_kv_bytes = (n_fa_layers as u64)
@@ -236,7 +243,10 @@ fn main() {
     for (i, toks) in prompt_tokens.iter().enumerate() {
         match sessions.open(&mut pool, &mut adm, cap_tokens) {
             Ok(id) => {
-                let slot = sessions.get(id).expect("just-opened session must resolve").slot;
+                let slot = sessions
+                    .get(id)
+                    .expect("just-opened session must resolve")
+                    .slot;
                 slot_session[slot.0] = Some(id);
                 println!(
                     "  ADMITTED session {}: slot={}, granted_ctx={cap_tokens} tokens, \
@@ -263,7 +273,9 @@ fn main() {
     // make a REJECTION actually happen here rather than merely being
     // possible in principle.
     const RIDICULOUS_CTX: usize = 1_000_000_000_000; // 1e12 tokens
-    println!("\n--- one deliberately over-budget request (RIDICULOUS_CTX={RIDICULOUS_CTX} tokens) ---");
+    println!(
+        "\n--- one deliberately over-budget request (RIDICULOUS_CTX={RIDICULOUS_CTX} tokens) ---"
+    );
     match sessions.open(&mut pool, &mut adm, RIDICULOUS_CTX) {
         Ok(id) => panic!(
             "session {} was admitted at {RIDICULOUS_CTX} tokens — the budget gate did not fire, \
@@ -300,8 +312,14 @@ fn main() {
     let mut k_arenas = Vec::with_capacity(n_fa_layers);
     let mut v_arenas = Vec::with_capacity(n_fa_layers);
     for _ in 0..n_fa_layers {
-        k_arenas.push(gpu.zeros(&[arena_bytes], DType::Raw).expect("alloc k_arena"));
-        v_arenas.push(gpu.zeros(&[arena_bytes], DType::Raw).expect("alloc v_arena"));
+        k_arenas.push(
+            gpu.zeros(&[arena_bytes], DType::Raw)
+                .expect("alloc k_arena"),
+        );
+        v_arenas.push(
+            gpu.zeros(&[arena_bytes], DType::Raw)
+                .expect("alloc v_arena"),
+        );
     }
     let mut dn_states: Vec<DeltaNetState> = (0..pool_capacity)
         .map(|_| DeltaNetState::new(&mut gpu, &config).expect("DeltaNetState::new"))
@@ -315,7 +333,9 @@ fn main() {
     let logits_out = gpu
         .zeros(&[pool_capacity * config.vocab_size], DType::F32)
         .expect("alloc logits_out");
-    let out_tokens = gpu.zeros(&[pool_capacity], DType::F32).expect("alloc out_tokens");
+    let out_tokens = gpu
+        .zeros(&[pool_capacity], DType::F32)
+        .expect("alloc out_tokens");
 
     let sample_params: Vec<SlotSampleParams> = (0..pool_capacity)
         .map(|_| SlotSampleParams {
@@ -372,8 +392,14 @@ fn main() {
         .expect("forward_batch_slots");
         gpu.hip.device_synchronize().expect("sync after forward");
 
-        gpu.sample_per_slot(&logits_out, &sample_params, pool_capacity, config.vocab_size, &out_tokens)
-            .expect("sample_per_slot");
+        gpu.sample_per_slot(
+            &logits_out,
+            &sample_params,
+            pool_capacity,
+            config.vocab_size,
+            &out_tokens,
+        )
+        .expect("sample_per_slot");
         gpu.hip.device_synchronize().expect("sync after sample");
 
         let mut token_ids = vec![0i32; pool_capacity];
@@ -381,7 +407,9 @@ fn main() {
             let bytes: &mut [u8] = unsafe {
                 std::slice::from_raw_parts_mut(token_ids.as_mut_ptr() as *mut u8, pool_capacity * 4)
             };
-            gpu.hip.memcpy_dtoh(bytes, &out_tokens.buf).expect("download out_tokens");
+            gpu.hip
+                .memcpy_dtoh(bytes, &out_tokens.buf)
+                .expect("download out_tokens");
         }
 
         print!("  step {step:>3}:");
@@ -434,7 +462,11 @@ fn main() {
             adm.used_bytes() as f64 / GIB as f64,
         );
     }
-    assert_eq!(sessions.active(), 0, "every opened session was closed above");
+    assert_eq!(
+        sessions.active(),
+        0,
+        "every opened session was closed above"
+    );
 
     // ---- free everything held live ----
     for t in k_arenas {
