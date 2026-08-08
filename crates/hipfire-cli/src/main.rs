@@ -4613,6 +4613,7 @@ fn complete_request_slots(
     event_callback: &mut dyn FnMut(&serde_json::Value) -> Result<(), hipfire_client::ClientError>,
     terminal_callback: &mut dyn FnMut(&Completion) -> Result<(), hipfire_client::ClientError>,
 ) -> Result<Completion> {
+    use hipfire_runtime::emit_text::{ThinkOutputRouter, ThinkRouteEvent};
     use hipfire_runtime::prompt_frame::{AssistantPrefix, ChatFrame, Role};
     use hipfire_runtime::serve::{Event, SubmitRequest};
 
@@ -4726,18 +4727,51 @@ fn complete_request_slots(
         .map_err(|e| anyhow!("multi_slot submit: {e}"))?;
 
     let mut content = String::new();
+    let mut reasoning_content = String::new();
     let mut finish = "stop";
+
+    // Split <think> spans out of the visible answer. Without this the whole
+    // reasoning preamble lands in `content` -- a 4B answer arrives as ~2 KB of
+    // "Thinking Process: 1. **Analyze the Request**..." with reasoning_content
+    // empty. `started_in_think` is true because the prompt itself opened the
+    // block (AssistantPrefix::OpenThink above), so generation begins inside it
+    // and there is no opening marker in the generated stream to detect.
+    let mut think = ThinkOutputRouter::new(matches!(prefix, AssistantPrefix::OpenThink));
+    let mut routed: Vec<ThinkRouteEvent> = Vec::new();
+
+    let mut drain_routed = |routed: &mut Vec<ThinkRouteEvent>,
+                            content: &mut String,
+                            reasoning_content: &mut String,
+                            cb: &mut dyn FnMut(
+        &serde_json::Value,
+    ) -> Result<(), hipfire_client::ClientError>| {
+        for ev in routed.drain(..) {
+            match ev {
+                ThinkRouteEvent::Content(text) => {
+                    content.push_str(&text);
+                    let _ = cb(&serde_json::json!({ "type": "token", "text": text }));
+                }
+                ThinkRouteEvent::Reasoning(text) => {
+                    reasoning_content.push_str(&text);
+                    let _ = cb(&serde_json::json!({ "type": "reasoning", "text": text }));
+                }
+            }
+        }
+    };
+
     while let Ok(ev) = rx.recv() {
         match ev {
             Event::Accepted { .. } => {}
             Event::Token { id } => {
                 let text = backend.tokenizer.decode(&[id]);
                 if !text.is_empty() {
-                    content.push_str(&text);
-                    let _ = event_callback(&serde_json::json!({
-                        "type": "token",
-                        "text": text,
-                    }));
+                    think.push_into(&text, &mut routed);
+                    drain_routed(
+                        &mut routed,
+                        &mut content,
+                        &mut reasoning_content,
+                        event_callback,
+                    );
                 }
             }
             Event::Done { reason } => {
@@ -4756,12 +4790,21 @@ fn complete_request_slots(
         }
     }
 
+    // Flush any trailing partial marker as ordinary text in its channel.
+    think.finish_into(&mut routed);
+    drain_routed(
+        &mut routed,
+        &mut content,
+        &mut reasoning_content,
+        event_callback,
+    );
+
     let completion = Completion {
         id: identity.0.clone(),
         created: identity.1,
         model,
         content,
-        reasoning_content: String::new(),
+        reasoning_content,
         preserve_thinking: false,
         tool_calls: Vec::new(),
         done: serde_json::json!({ "finish_reason": finish }),

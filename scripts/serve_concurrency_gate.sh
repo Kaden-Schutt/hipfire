@@ -155,9 +155,15 @@ outs = []
 for i in range(n):
     with open(f"{work}/con{i}.json") as fh:
         d = json.load(fh)
-    c = d["choices"][0]["message"]["content"]
+    m = d["choices"][0]["message"]
+    # Either channel counts. A thinking model on a small token budget spends
+    # it all reasoning, so `content` is legitimately empty while
+    # `reasoning_content` carries the text -- that is a served request, not a
+    # failure. What this phase actually tests is per-client isolation.
+    c = (m.get("content") or "") + (m.get("reasoning_content") or "")
     if not c.strip():
-        print(f"FAIL: concurrent request {i} returned empty content", file=sys.stderr)
+        print(f"FAIL: concurrent request {i} produced no text in EITHER channel",
+              file=sys.stderr)
         sys.exit(1)
     outs.append(c)
     print(f"  c{i}: {c[-46:]!r}")
@@ -176,6 +182,42 @@ if speedup < min_speedup:
           file=sys.stderr)
     sys.exit(1)
 PY
+
+# ---- reasoning channel. A thinking model's <think> span must land in
+# `reasoning_content`, not in the visible answer. Before this was routed, a
+# 4B reply arrived as ~2 KB of "Thinking Process: 1. **Analyze the
+# Request**..." in `content` with `reasoning_content` empty -- technically a
+# 200, entirely unusable as an answer.
+echo "[phase] reasoning channel"
+echo "--- reasoning channel ---"
+code="$(curl -s -m 300 -X POST "$URL" -H 'Content-Type: application/json' \
+  -d "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"What is the capital of France?\"}],\"max_tokens\":600}" \
+  -o "$WORK/reason.json" -w '%{http_code}')"
+[ "$code" = "200" ] || fail "reasoning-channel request returned HTTP $code"
+python3 - "$WORK/reason.json" <<'PY2' || exit 1
+import json, sys
+d = json.load(open(sys.argv[1]))
+m = d["choices"][0]["message"]
+content = m.get("content") or ""
+reasoning = m.get("reasoning_content") or ""
+print(f"  content {len(content)} chars, reasoning_content {len(reasoning)} chars")
+for marker in ("<think>", "</think>"):
+    if marker in content:
+        print(f"FAIL: {marker!r} leaked into the visible answer", file=sys.stderr)
+        sys.exit(1)
+if not reasoning.strip():
+    print("FAIL: reasoning_content is empty -- the think span was not routed, "
+          "so it is either being dropped or left in the visible answer",
+          file=sys.stderr)
+    sys.exit(1)
+# 600 tokens is enough for this model to finish reasoning AND answer, so an
+# empty answer here means the split swallowed the visible text.
+if not content.strip():
+    print("FAIL: content is empty with 600 tokens -- the visible answer was "
+          "routed into reasoning or dropped", file=sys.stderr)
+    sys.exit(1)
+print(f"  answer: {content.strip()[:60]!r}")
+PY2
 
 # ---- streaming (`"stream": true`) goes through respond_streaming, a
 # different function from the non-streaming path above. Agents commonly use
@@ -208,11 +250,16 @@ for l in lines[:-1]:
     if obj.get("object") != "chat.completion.chunk":
         print(f"FAIL: unexpected SSE object {obj.get('object')!r}", file=sys.stderr)
         sys.exit(1)
-    text += obj["choices"][0].get("delta", {}).get("content", "") or ""
+    delta = obj["choices"][0].get("delta", {})
+    # Reasoning streams as a `reasoning_content` delta. Counting only
+    # `content` would call a correctly-routed thinking stream empty.
+    text += delta.get("content", "") or ""
+    text += delta.get("reasoning_content", "") or ""
 if not text.strip():
-    print("FAIL: stream delivered frames but no content deltas", file=sys.stderr)
+    print("FAIL: stream delivered frames but no content or reasoning deltas",
+          file=sys.stderr)
     sys.exit(1)
-print(f"  {len(lines)} SSE frames, {len(text)} chars of content, [DONE] present")
+print(f"  {len(lines)} SSE frames, {len(text)} chars across both channels, [DONE] present")
 print(f"  stream: {text[-46:]!r}")
 PY2
 
