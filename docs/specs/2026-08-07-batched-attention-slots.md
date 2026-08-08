@@ -29,7 +29,16 @@ SP1 is done when all of the following hold:
    is faster than `N` sequential single-slot launches, measured by the §10
    microbenchmark. (The size of the win is an output of the work, not a
    precondition; regression against the sequential baseline is a failure.)
-3. The `TILE_SIZE` default is confirmed or replaced by a measured sweep, and the LDS-vs-tile crossover behaviour for multi-slot batches is recorded.
+3. The `TILE_SIZE` default is confirmed or replaced by a measured sweep, and the
+   LDS-vs-tile crossover behaviour for multi-slot batches is recorded.
+   **Status: partially met.** The sweep ran and the crossover is recorded (§10,
+   and the bench checkpoint) — TILE won 62 of 63 multi-slot trials, contradicting
+   the shipped `LDS_CTX_LIMIT = 15000`, which was deliberately left unchanged as
+   an SP3 routing decision. The default remains 128 and is **not** confirmed:
+   `TILE_SIZE=256` measured fastest at every slot count once the benchmark's
+   sequential arm was corrected, but that pass ran at load average 9 where even
+   the shipped default failed its criterion in 1 trial of 8 on noise alone.
+   Promoting 256 requires a confirmation run on an idle box.
 4. Task 1's measured batching ceiling is recorded. **AMENDED 2026-08-07:** an
    attention-only probe cannot measure the weights term, so §8's *aggregate*
    3.3× / 1.8× figures are explicitly out of SP1's reach and are deferred to
@@ -196,33 +205,68 @@ struct KvSlotDesc {        // one per active slot
     int32_t  cap;          // physical slab capacity, in tokens
 };
 
-// tile_slot[t] -> slot index for flat row tile t
-// tile_row0[t] -> first query row of tile t, within its slot
+// row_slot[r]   -> slot index for flat query row r   (BR == 1 kernels)
+// tile_slot[t]  -> slot index for flat row tile t    (prefill, BR > 1)
+// tile_row0[t]  -> first query row of tile t WITHIN ITS SLOT
+// tile_qbase[t] -> first query row of tile t in the GLOBAL flat row space
 ```
 
-Grid becomes `[n_heads, n_tiles]` for the decode kernels and
-`[n_tiles, n_heads]` for the prefill kernel (preserving each kernel's existing
-axis order, so the launch-config code stays recognisable).
+**AS BUILT — this section was corrected after implementation. Three things
+differ from the original design and SP2 must read the corrected version.**
 
-The kernel-side change is mechanical: every `k_cache + pos*kv_stride` becomes
-`k_cache + kv_offset_for(slot, pos)`.
+**Three tile arrays, not two.** `tile_row0` is slot-relative; `tile_qbase` is
+global. They coincide only with a single slot. `q` and `out` are packed across
+all slots, so they are indexed by `tile_qbase`, while causal masking is
+slot-relative. **`tile_qbase` is the load-bearing one.** `tile_row0` is
+currently **ABI-reserved and unread by every kernel** — it stays in the
+positional kernarg layout between `tile_slot` and `tile_qbase`, because
+`positions[]` is already indexed by global row and therefore carries each row's
+own absolute position, making a slot-relative lookup redundant. Do not remove
+it without re-cutting the kernarg order.
+
+**The decode kernels did NOT get a tile grid.** The original text said "grid
+becomes `[n_heads, n_tiles]` for the decode kernels". They keep
+`[n_heads, batch_size]` and index `row_slot[row]` directly, because at `BR == 1`
+a tile *is* a row and a tile list would be pure indirection. Only the prefill
+kernel (`BR > 1`) uses the tile arrays, on `[n_tiles, n_heads]`.
+
+**`positions[]` is authoritative for the causal bound — never `desc.seq_len`.**
+`positions[row] + 1` is the per-row causal window; `desc.seq_len` is the slot's
+logical length. They differ whenever a slot has more than one query row. The
+descriptor supplies the slab **base address only**. Violating this caused SP1's
+only Critical defect: a tile kernel bounded by `desc.seq_len` while the shared
+reduce kernel still bounded by `positions[]`, so the reduce folded in stale
+partials the tile kernel never wrote.
 
 Descriptor tables are uploaded once per step, not per layer. Following the ds4
 precedent, the upload is skipped when the table is unchanged.
 
 ### 6.3 The paged seam
 
-All KV addressing goes through **one** device-side helper:
+All KV addressing goes through device-side helpers in
+`kernels/src/kv_slot_desc.h`:
 
 ```c
-__device__ inline uint64_t kv_offset_for(const KvSlotDesc& s, int pos);
-// today:  s.k_base + (uint64_t)pos * kv_stride       (contiguous slabs)
-// later:  block_table[s.block_ofs + pos/PAGE] * PAGE_BYTES + (pos%PAGE)*kv_stride
+__device__ inline unsigned long long kv_offset_for_k(const KvSlotDesc& s, int pos, int per_pos_bytes);
+__device__ inline unsigned long long kv_offset_for_v(const KvSlotDesc& s, int pos, int per_pos_bytes);
+// today:  s.{k,v}_base + (unsigned long long)pos * per_pos_bytes   (contiguous slabs)
+// later:  block_table[...] * PAGE_BYTES + (pos % PAGE) * per_pos_bytes
 ```
 
-`kv_stride` is the existing per-position stride scalar
-(`n_kv_heads * head_dim`, in the kernel's element units) already passed to these
-kernels — it is not part of the descriptor, because it is uniform across slots.
+**AS BUILT — two helpers, not one, and the stride is a parameter.** asym3 forced
+this: its K is 3-bit Givens-rotated while its V is Q8_0, so K and V have
+*different* per-position strides and cannot share one helper or one stride
+scalar. The stride is therefore passed per call rather than living in the
+descriptor.
+
+**ABI constraint that fell out of it:** the Q8_0 flash-prefill kernel requires
+`v_base == k_base` and uses a single shared slab offset. Keeping both bases live
+across its K/V staging loop — which stages both in one pass — costs 23 VGPRs and
+25% of its occupancy (16 → 12 waves/SIMD), measured on gfx1151 *and* gfx1201, on
+the null-descriptor legacy path. Q8_0 K and V share a stride, so a slot sits at
+the same offset in both arenas and the constraint is free to honour. **asym3 is
+exempt and must keep both bases.** SP2's allocator must satisfy this for Q8
+arenas.
 
 Swapping to a block table changes this function and the descriptor struct — not
 the kernels. Because the flash path already walks KV in tiles, choosing
@@ -265,7 +309,7 @@ because it removes what looked like the main kernel work.
 
 The tile path launches `grid = [n_heads, max_tiles, chunk]` with 32-thread
 blocks, where `max_tiles = ceil(max_ctx_len / TILE_SIZE)` and
-`TILE_SIZE = 128` (`attention.rs:3473`). The KV-split axis is already there. At
+`TILE_SIZE = 128`, now resolved once by `Gpu::attn_tile_size()`. The KV-split axis is already there. At
 `n_heads = 16`, 32K context and 4 slots that is `16 × 256 × 4 ≈ 16k`
 workgroups — ample. And because routing crosses to this path above
 `LDS_CTX_LIMIT = 15000`, the contexts agents actually run at are served by the
@@ -360,9 +404,7 @@ Two structural facts drive this:
   individual margins are ±0.1. `TILE_SIZE=256` measured fastest at every slot
   count (~7-13% over 128 by n=8) and now passes the criterion once the arm is
   fair — but **the shipped default stays 128**, and flipping it should wait for a
-  confirmation run on an idle box. The question is therefore **how much of that headroom
-  batching recovers**, which §10's batched-vs-sequential sweep measures
-  directly. See `docs/perf-checkpoints/2026-08-07-batching-ceiling-probe.md`.
+  confirmation run on an idle box. That question was answered — see the measured statement below. See `docs/perf-checkpoints/2026-08-07-batching-ceiling-probe.md`.
 - **MoE expert reads barely amortise at small batch.** Four sequences drawing
   top-8 of 256 experts collide rarely, so expert traffic scales ~4×. Only the
   dense half of the 35B amortises.
