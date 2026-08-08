@@ -1012,7 +1012,25 @@ mod config_cache {
             && mq2r
             && *V.get_or_init(|| flag_one("HIPFIRE_DS4_GFX1100_E8_PACK"))
     }
-
+    /// `HIPFIRE_DS4_GFX1100_E8_MIX=1` — mixed-M, shared-input MFP4-E8 SoA pack
+    /// for the attention starved tier on exact gfx1100 + MQ2R; default OFF.
+    /// Independent of `HIPFIRE_DS4_GFX1100_E8_PACK` — the two gates are
+    /// separately screenable (different kernels, different launch geometry).
+    /// MIX supersedes PACK where both could apply: the forward path checks
+    /// MIX first and skips the PACK pair-collapse when MIX has already fused
+    /// those rows into the larger mixed launch. This ordering is explicit and
+    /// documented at the call sites and in `crates/rdna-compute/src/kernels.rs`.
+    ///
+    /// Mixed-M changes only launch geometry (1-D grid over `sum(rows)` with
+    /// job index recovered by prefix subtract); each row's dot product keeps
+    /// its exact accumulation (`acc0+acc1`) and `__shfl_down` reduction order,
+    /// so the result is raw-bit identical to serial GEMVs (unlike split-K,
+    /// which changes reduction order and forfeits bit-exactness).
+    pub(super) fn gfx1100_e8_mix_on(arch: &str, mq2r: bool) -> bool {
+        static V: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| flag_one("HIPFIRE_DS4_GFX1100_E8_MIX"));
+        arch == "gfx1100" && mq2r && *V
+    }
 }
 
 /// Crate-visible init log for A2 gfx942 levers (called from arch load path).
@@ -4621,10 +4639,18 @@ fn ds4_attn_block_core(
     let layer = weights.resolve_layer(layer_idx);
     mhc_pre(cfg, weights, state, gpu, layer_idx, /*is_attn=*/ true)?;
     q_lora_prepare(cfg, weights, state, gpu, layer_idx)?;
-    let packed_input = attention_input_e8_pack_gfx1201(cfg, weights, state, gpu, layer_idx)?;
+    // MIX (R4-MIX) supersedes PACK where both could apply. Check MIX first:
+    // one mixed-M launch over wq_a(1024)+wkv(512)+main compressor pair
+    // (1024 or 512 each) collapses 4 launches at ~2.7-10.7 waves/CU into one
+    // at ~32 waves/CU (M_total 2560-3584). Exact-gfx1100+MQ2R only; default OFF.
+    // Gfx1201 path remains via the exact-gfx1201 pack below; the two are
+    // mutually exclusive by arch, and MIX's preprojected flag skips the
+    // PACK pair path in compressor_forward when MIX has already fused those rows.
+    let packed_mix = attention_input_e8_mix_gfx1100(cfg, weights, state, gpu, layer_idx)?;
+    let packed_gfx1201 = attention_input_e8_pack_gfx1201(cfg, weights, state, gpu, layer_idx)?;
+    let packed_input = packed_mix || packed_gfx1201;
     q_lora_project(cfg, weights, state, gpu, layer_idx, packed_input)?;
     kv_joint(cfg, weights, state, gpu, layer_idx, packed_input)?;
-    apply_tail_rope(cfg, weights, state, gpu, position, layer_idx)?;
     if layer.compress_ratio > 0 {
         if packed_input {
             compressor_forward_preprojected(
@@ -9576,6 +9602,144 @@ fn indexer_compressor_e8_pack_gfx1201(
         cfg.hidden_size,
     )
     .map_err(|error| format!("packed indexer compressor E8 l{layer_idx}: {error:?}"))?;
+    Ok(true)
+}
+
+/// Exact-gfx1100 MQ2R attention-input MIX pack (R4-MIX, harmonic restart).
+///
+/// Mirrors `attention_input_e8_pack_gfx1201`'s mechanism but for the gfx1100
+/// starved tier and gated independently behind `HIPFIRE_DS4_GFX1100_E8_MIX`.
+/// Q-LoRA A, joint KV, and the main compressor pair all read the same
+/// attention-normed rotated `tmp` (K=4096) and are mutually independent. One
+/// mixed-row dispatch preserves every per-row operation (same E4M3 decode,
+/// same E8 lattice decode, same `acc0+acc1` FMA order, same `__shfl_down`
+/// reduction) while collapsing 2-4 launches at M=1024/512 into one launch
+/// at M_total ~1536-3584 (depending on ratio). Grid goes from ~2.7-10.7
+/// waves/CU to ~32 waves/CU for the attention starved tier.
+///
+/// Independence evidence (one line each, verified from call sites):
+/// - `wq_a` (M=1024): `gemv_mfp4g32_e8_soa` on `state.tmp` → `state.q_lat` (read-only `tmp`, disjoint `q_lat`). See `q_lora_project`.
+/// - `wkv` (M=512): `gemv_mfp4g32_e8_soa` on `state.tmp` → `state.kv` (disjoint `kv`). See `kv_joint`.
+/// - `compressor_wkv` (M=proj_dim): `gemv_mfp4g32_e8_soa` on `state.tmp` → `comp_kv_buf` (disjoint). See `compressor_forward_impl`.
+/// - `compressor_wgate` (M=proj_dim): same `tmp` → `comp_score_buf` (disjoint). See `compressor_forward_impl`.
+///
+/// All share K=hidden=4096 (asserted). `ffn.gate` (M=256) reads distinct `ffn_x`
+/// not `tmp`, so it is NOT packed here — packing across different x would violate
+/// the independent-reads requirement. The indexer compressor pair (`M=256` each)
+/// reads `tmp` as well, but is left to its own PACK path (2×256→512) or to a
+/// future dedicated mix if measured; forcing it into the attention pack would
+/// conflate two different scratch lifetimes (main vs indexer `comp_*_buf`).
+/// `HIPFIRE_DS4_GFX1100_E8_MIX` supersedes `HIPFIRE_DS4_GFX1100_E8_PACK` where
+/// both could apply: when MIX has fused `compressor_wkv`/`wgate`, the PACK
+/// pair path is skipped via the `preprojected` flag (enforced below).
+fn attention_input_e8_mix_gfx1100(
+    cfg: &DeepseekV4Config,
+    weights: &DeepseekV4Weights,
+    state: &mut DeepseekV4State,
+    gpu: &mut Gpu,
+    layer_idx: usize,
+) -> Result<bool, String> {
+    if !config_cache::gfx1100_e8_mix_on(&gpu.arch, cfg.mq2r) {
+        return Ok(false);
+    }
+    if gpu.arch != "gfx1100" || !cfg.mq2r {
+        return Ok(false);
+    }
+    let layer = weights.resolve_layer(layer_idx);
+    let ratio = layer.compress_ratio as usize;
+    // Gather candidates. All must be E8-SoA to stay bit-exact; any non-E8
+    // (F16/Q8 fallback for --non-expert-f16 etc.) falls back to serial.
+    let wq_a = layer
+        .wq_a
+        .as_ref()
+        .ok_or_else(|| format!("mix wq_a l{layer_idx}"))?;
+    let wkv = layer
+        .wkv
+        .as_ref()
+        .ok_or_else(|| format!("mix wkv l{layer_idx}"))?;
+    let mut projection_weights: Vec<&GpuTensor> = Vec::with_capacity(5);
+    let mut rows: Vec<usize> = Vec::with_capacity(5);
+    let mut outputs: Vec<&GpuTensor> = Vec::with_capacity(5);
+    projection_weights.push(wq_a);
+    rows.push(cfg.q_lora_rank); // 1024
+    let kv_dim = cfg.num_key_value_heads * cfg.head_dim; // 512
+    projection_weights.push(wkv);
+    rows.push(kv_dim);
+    // Ensure base outputs exist before we borrow them.
+    if state.q_lat.is_none() {
+        return Err(format!("mix q_lat missing l{layer_idx}"));
+    }
+    if state.kv.is_none() {
+        state.kv = Some(
+            gpu.alloc_tensor(&[kv_dim], DType::F32)
+                .map_err(|e| format!("alloc mix kv l{layer_idx}: {e:?}"))?,
+        );
+    }
+    outputs.push(state.q_lat.as_ref().unwrap());
+    outputs.push(state.kv.as_ref().unwrap());
+    // Main compressor pair is present only when compress_ratio > 0.
+    if ratio != 0 {
+        let comp_wkv = layer
+            .compressor_wkv
+            .as_ref()
+            .ok_or_else(|| format!("mix comp_wkv l{layer_idx}"))?;
+        let comp_wgate = layer
+            .compressor_wgate
+            .as_ref()
+            .ok_or_else(|| format!("mix comp_wgate l{layer_idx}"))?;
+        let proj_dim = if ratio == 4 {
+            2 * cfg.head_dim // 1024
+        } else {
+            cfg.head_dim // 512
+        };
+        projection_weights.push(comp_wkv);
+        projection_weights.push(comp_wgate);
+        rows.push(proj_dim);
+        rows.push(proj_dim);
+        // Allocate / validate comp buffers.
+        {
+            let indexer = &mut state._indexer[layer_idx];
+            if indexer.comp_kv_buf.is_none() {
+                indexer.comp_kv_buf = Some(
+                    gpu.alloc_tensor(&[proj_dim], DType::F32)
+                        .map_err(|e| format!("alloc mix comp kv l{layer_idx}: {e:?}"))?,
+                );
+            } else if indexer.comp_kv_buf.as_ref().unwrap().numel() < proj_dim {
+                return Err(format!("mix comp kv undersized l{layer_idx}"));
+            }
+            if indexer.comp_score_buf.is_none() {
+                indexer.comp_score_buf = Some(
+                    gpu.alloc_tensor(&[proj_dim], DType::F32)
+                        .map_err(|e| format!("alloc mix comp score l{layer_idx}: {e:?}"))?,
+                );
+            } else if indexer.comp_score_buf.as_ref().unwrap().numel() < proj_dim {
+                return Err(format!("mix comp score undersized l{layer_idx}"));
+            }
+        }
+        outputs.push(state._indexer[layer_idx].comp_kv_buf.as_ref().unwrap());
+        outputs.push(state._indexer[layer_idx].comp_score_buf.as_ref().unwrap());
+    }
+    if projection_weights
+        .iter()
+        .any(|w| w.dtype != DType::MFP4G32E8SOA)
+    {
+        return Ok(false);
+    }
+    // All share the same attention-normed rotated x.
+    let x = state
+        .tmp
+        .as_ref()
+        .ok_or_else(|| format!("mix tmp l{layer_idx}"))?;
+    // K is hidden for all dense projections (verified per call site).
+    assert!(cfg.hidden_size % 256 == 0);
+    gpu.gemv_mfp4g32_e8_soa_mixed_jobs_gfx1100(
+        &projection_weights,
+        x,
+        &outputs,
+        &rows,
+        cfg.hidden_size,
+    )
+    .map_err(|e| format!("mix attention input E8 l{layer_idx}: {e:?}"))?;
     Ok(true)
 }
 
@@ -16555,6 +16719,18 @@ mod tests {
         assert!(!config_cache::gfx1100_rmsnorm_rotate_nox_on(
             "gfx1151", true
         ));
+        // MIX and PACK stay default-OFF behind their respective env gates;
+        // MIX supersedes PACK where both could apply (documented at the call sites).
+        assert!(!config_cache::gfx1100_e8_pack_on("gfx1100", true));
+        assert!(!config_cache::gfx1100_e8_pack_on("gfx1100", false));
+        assert!(!config_cache::gfx1100_e8_pack_on("gfx1201", true));
+        assert!(!config_cache::gfx1100_e8_mix_on("gfx1100", true));
+        assert!(!config_cache::gfx1100_e8_mix_on("gfx1100", false));
+        assert!(!config_cache::gfx1100_e8_mix_on("gfx1201", true));
+        assert!(!config_cache::gfx1100_e8_mix_on("gfx1151", true));
+        // MLP (R4-BW) also default-OFF.
+        assert!(!config_cache::e8_mlp_on("gfx1100", true));
+        assert!(!config_cache::e8_mlp_on("gfx1151", true));
         // T1024 prefer is env-driven; without HIPFIRE_HC_CTRL_T1024 it is off
         // even when fuse would admit (fuse itself default-off on gfx1100).
         assert!(!config_cache::hc_ctrl_t1024_prefer(

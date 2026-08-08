@@ -4907,18 +4907,98 @@ impl Gpu {
         )
     }
 
+    /// Exact-gfx1100 mixed-M, shared-input MFP4-E8 SoA GEMV (R4-MIX, harmonic restart).
+    ///
+    /// One launch evaluates up to seven projections with a common K and activation
+    /// but independent M. Each workgroup still executes the incumbent one-wave-
+    /// per-row arithmetic and reduction order, so the result is raw-bit identical
+    /// to N serial `gemv_mfp4g32_e8_soa` calls (same E4M3 scale decode, same E8
+    /// lattice decode, same `acc0+acc1` order, same `__shfl_down` tree). Only
+    /// launch geometry changes (1-D grid over `sum(rows)` with job recovered by
+    /// prefix subtract). Independent of `HIPFIRE_DS4_GFX1100_E8_PACK` — the two
+    /// gates are separately screenable; MIX supersedes PACK where both could apply
+    /// (enforced in `hipfire-arch-deepseek4::forward`).
+    ///
+    /// This mirrors `gemv_mfp4g32_e8_soa_mixed_jobs_gfx1201` but targets exact
+    /// gfx1100 and reuses the gfx1100/generic E8 decode body byte-for-byte.
+    /// Gated behind `HIPFIRE_DS4_GFX1100_E8_MIX=1` + exact gfx1100 + MQ2R; default OFF.
+    pub fn gemv_mfp4g32_e8_soa_mixed_jobs_gfx1100(
+        &mut self,
+        weights: &[&GpuTensor],
+        x: &GpuTensor,
+        outputs: &[&GpuTensor],
+        rows: &[usize],
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert!(
+            self.arch_caps.is_gfx1100(),
+            "mixed E8 jobs require exact gfx1100"
+        );
+        assert!((2..=7).contains(&weights.len()));
+        assert_eq!(weights.len(), outputs.len());
+        assert_eq!(weights.len(), rows.len());
+        assert!(k % 256 == 0);
+        assert!(weights
+            .iter()
+            .all(|weight| weight.dtype == DType::MFP4G32E8SOA));
+        const KERNEL: &str = "gemv_mfp4g32_e8_soa_mixed_jobs_gfx1100";
+        self.ensure_kernel(
+            KERNEL,
+            kernels::GEMV_MFP4G32_E8_SOA_MIXED_JOBS_GFX1100_SRC,
+            KERNEL,
+        )?;
+        let mut a = [weights[0].buf.as_ptr(); 7];
+        let mut y = [outputs[0].buf.as_ptr(); 7];
+        let mut m = [0i32; 7];
+        for index in 0..weights.len() {
+            a[index] = weights[index].buf.as_ptr();
+            y[index] = outputs[index].buf.as_ptr();
+            m[index] = rows[index] as i32;
+        }
+        let x_ptr = x.buf.as_ptr();
+        let jobs = weights.len() as i32;
+        let k_i32 = k as i32;
+        let total_rows = rows.iter().sum::<usize>();
+        let mut params: Vec<*mut c_void> = Vec::with_capacity(24);
+        for ptr in &a {
+            params.push(ptr as *const _ as *mut c_void);
+        }
+        params.push(&x_ptr as *const _ as *mut c_void);
+        for ptr in &y {
+            params.push(ptr as *const _ as *mut c_void);
+        }
+        for value in &m {
+            params.push(value as *const _ as *mut c_void);
+        }
+        params.push(&jobs as *const _ as *mut c_void);
+        params.push(&k_i32 as *const _ as *mut c_void);
+        self.launch_maybe_blob(
+            KERNEL,
+            [total_rows as u32, 1, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut blob = hip_bridge::KernargBlob::new();
+                for ptr in a {
+                    blob.push_ptr(ptr);
+                }
+                blob.push_ptr(x_ptr);
+                for ptr in y {
+                    blob.push_ptr(ptr);
+                }
+                for value in m {
+                    blob.push_i32(value);
+                }
+                blob.push_i32(jobs);
+                blob.push_i32(k_i32);
+                blob
+            },
+        )
+    }
+
     /// Exact-gfx1100 MLP variant for DS4 dense E8 GEMV (R4-BW, harmonic restart).
-    ///
-    /// Bit-exact with `gemv_mfp4g32_e8_soa` / `gemv_mfp4g32_e8_soa_gfx1151` for
-    /// identical inputs: same E4M3 scale decode, same E8 lattice decode,
-    /// same per-row FMA accumulation order, same wave32 shfl reduction.
-    /// Only the memory-parallelism levers differ (dwordx4 codeword loads,
-    /// 8 rows per 256-thread workgroup, quad unroll).
-    ///
-    /// This is an explicit opt-in surface: no product dispatch selects it
-    /// unless `HIPFIRE_DS4_GFX1100_E8_MLP=1` + exact gfx1100 + MQ2R all hold
-    /// (enforced in `hipfire-arch-deepseek4::forward::config_cache::e8_mlp_on`).
-    /// The `assert!(is_gfx1100)` fails closed if that gating ever bleeds.
     pub fn gemv_mfp4g32_e8_soa_mlp_gfx1100(
         &mut self,
         a_raw: &GpuTensor,

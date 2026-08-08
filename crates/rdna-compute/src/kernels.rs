@@ -1194,6 +1194,29 @@ pub const GEMV_MFP4G32_E8_SOA_GROUPED_GFX1100_SRC: &str = concat!(
 );
 pub const GEMV_MFP4G32_E8_SOA_SHARED_JOBS_GFX1100_SRC: &str =
     include_str!("../../../kernels/src/gemv_mfp4g32_e8_soa_shared_jobs.gfx1100.hip");
+/// Exact-gfx1100 mixed-row, shared-input MFP4-E8 SoA GEMV (R4-MIX, harmonic restart).
+///
+/// Bit-exact with `gemv_mfp4g32_e8_soa` for identical inputs: same E4M3 scale
+/// decode, same E8 lattice decode, same per-row FMA accumulation order, same
+/// wave32 shfl reduction. Only launch geometry changes (1-D grid over
+/// `sum(rows)` with job index recovered by prefix subtract), so the lever is
+/// raw-bit and needs no golden re-certification (unlike split-K which changes
+/// accumulation order). Independent of `HIPFIRE_DS4_GFX1100_E8_PACK` — the two
+/// gates are separately screenable; MIX supersedes PACK where both could apply
+/// (documented in `forward.rs` and here, enforced in the forward path).
+///
+/// Gated behind `HIPFIRE_DS4_GFX1100_E8_MIX=1` + exact gfx1100 + MQ2R; default
+/// OFF. Supports up to 7 jobs with independent M (vs `shared_jobs` which
+/// requires identical M and 2-3 jobs). Attaches to the attention-normed
+/// rotated x (K=4096) pack: `wq_a` (1024) + `wkv` (512) + main compressor
+/// `wkv`/`wgate` pair (1024 or 512 each) into one ~2560-3584-row launch
+/// instead of 4-6 launches at M=1024/512. Grid goes from ~2.7-10.7 waves/CU
+/// to ~32 waves/CU, directly attacking the 214 and 120 GB/s rows. A second
+/// pack for the FFN-side group (ffn.gate + idx comp) is not built because
+/// they read distinct x (`ffn_x` vs `tmp`); packing across different x is
+/// prohibited.
+pub const GEMV_MFP4G32_E8_SOA_MIXED_JOBS_GFX1100_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mfp4g32_e8_soa_mixed_jobs.gfx1100.hip");
 /// Exact-gfx1100 MLP variant for the DS4 dense E8 GEMV (R4-BW).
 /// Bit-exact with the generic/gfx1151 SoA path; only the memory-parallelism
 /// levers differ (dwordx4 codeword loads, 8 rows per workgroup,
