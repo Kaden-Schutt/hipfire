@@ -230,6 +230,7 @@ fn main() -> Result<(), String> {
 
     let mut state_per_rank = Vec::with_capacity(TARGET_RANKS);
     let mut pbs_per_rank = Vec::with_capacity(TARGET_RANKS);
+    let mut partials = Vec::with_capacity(TARGET_RANKS);
     for rank in 0..TARGET_RANKS {
         gpus.devices[rank]
             .bind_thread()
@@ -240,7 +241,14 @@ fn main() -> Result<(), String> {
             &cfg,
             args.verify_batch.max(8),
         )?);
+        partials.push(
+            gpus.devices[rank]
+                .zeros(&[cfg.hidden_size], DType::F32)
+                .map_err(|e| format!("allocate target partial rank {rank}: {e:?}"))?,
+        );
     }
+    gpus.prepare_tp_graph_signals(cfg.num_hidden_layers * 2)
+        .map_err(|e| format!("prepare TP3 graph signals: {e:?}"))?;
 
     let mut drafter_gpu = Gpu::init_with_device(DRAFTER_DEVICE)
         .map_err(|e| format!("initialize drafter device 3: {e:?}"))?;
@@ -416,13 +424,45 @@ fn main() -> Result<(), String> {
         }
     }
 
+    // Control: verify the same B tokens as independent calls through the
+    // shipping TP3 retained hipGraph. This gives a hard fallback ceiling and
+    // proves whether the small-B batched path, rather than TP3 itself, is the
+    // blocker.
+    let mut sequential_verify_ms = Vec::with_capacity(args.samples);
+    for iteration in 0..args.warmups + args.samples {
+        let start_pos = args.position
+            + 2 * (args.warmups + args.samples) as u32 * dspark.cfg.block_size as u32
+            + iteration as u32 * args.verify_batch as u32;
+        sync_target(&mut gpus)?;
+        let started = Instant::now();
+        for (offset, &token) in verify_tokens.iter().enumerate() {
+            hipfire_arch_deepseek4::forward::forward_ep(
+                &mut gpus,
+                &weights_per_rank,
+                &cfg,
+                &mut state_per_rank,
+                &partials,
+                token,
+                start_pos + offset as u32,
+            )?;
+        }
+        sync_target(&mut gpus)?;
+        let elapsed = started.elapsed().as_secs_f64() * 1e3;
+        if iteration >= args.warmups {
+            sequential_verify_ms.push(elapsed);
+        }
+    }
+
     let peer_us_med = median(&mut peer_us);
     let draft_ms_med = median(&mut draft_ms);
     let verify_trunk_ms_med = median(&mut verify_trunk_ms);
     let verify_heads_ms_med = median(&mut verify_heads_ms);
     let verify_ms_med = median(&mut verify_ms);
+    let sequential_verify_ms_med = median(&mut sequential_verify_ms);
     let window_ms = peer_us_med / 1e3 + draft_ms_med + verify_ms_med;
     let projected_tps = args.tau * 1e3 / window_ms;
+    let sequential_window_ms = peer_us_med / 1e3 + draft_ms_med + sequential_verify_ms_med;
+    let sequential_projected_tps = args.tau * 1e3 / sequential_window_ms;
     println!("=== TP3 target + device3 DSpark admission probe ===");
     println!("samples={} warmups={}", args.samples, args.warmups);
     println!(
@@ -437,7 +477,15 @@ fn main() -> Result<(), String> {
         args.verify_batch
     );
     println!(
+        "sequential_retained_verify_ms_median={sequential_verify_ms_med:.3} verify_batch={}",
+        args.verify_batch
+    );
+    println!(
         "serial_window_ms={window_ms:.3} historical_tau={:.3} projected_tok_s={projected_tps:.3}",
+        args.tau
+    );
+    println!(
+        "sequential_serial_window_ms={sequential_window_ms:.3} historical_tau={:.3} projected_tok_s={sequential_projected_tps:.3}",
         args.tau
     );
     println!("draft_tokens={last_draft:?}");
