@@ -167,12 +167,40 @@ before being caught:
 - Prefill genuinely wants the WMMA kernel: 14.6 s against 19.2 s at 4 slots
   with the path disabled outright.
 
+### Batched lm_head (done)
+
+The per-slot `rmsnorm + Step::Gemv` loop was the last per-slot-serialised op;
+everything else was already one launch across all rows. `gemv_hfq4g256_xbatch`
+makes it one weight pass over B activation vectors.
+
+| slots | before | after | ms/step |
+|---|---|---|---|
+| 1 | 43.92 | 42.33 tok/s | unchanged path (noise) |
+| 2 | 58.17 | 59.98 tok/s | 34.38 → 33.34 |
+| 3 | 74.59 | 77.24 tok/s | 40.22 → 38.84 |
+| 4 | 83.65 | **89.32 tok/s** | 47.82 → 44.79 |
+
+**Aggregate scaling is now ~2.1× at 4 concurrent agents.**
+
+Correcting an earlier claim in this document's follow-up list: the lm_head was
+described as "roughly the whole ~8.3 ms marginal per-slot cost". It is not.
+`dim` is 2048, not 4096, so the weight pass is 270 MiB ≈ 1.27 ms per slot —
+about 15% of the marginal. The rest is MoE expert traffic (~3B active params
+per token ≈ 1.6 GB), which is irreducible here: four slots picking top-8 of 256
+experts overlap by only ~5%, so there is no dedup win to take.
+
+It was still worth doing, for a reason the arithmetic does not show: it was the
+only structurally serial op left in the forward.
+
 ### Follow-ups
 
 - The tile path's profitability crossover between `WMMA_M_TILE` and full
   prefill chunks is unmeasured; only the two endpoints are known.
-- Per-slot lm_head is a separate `Step::Gemv` per slot over a 248320-row
-  vocabulary — roughly the whole ~8.3 ms marginal per-slot cost. Batching it
-  into one GEMM over `n_slots` rows is the obvious next win and would flatten
-  the marginal term.
+- `gemv_hfq4g256_xbatch` caps at B=4 (`HIPFIRE_HFQ4G256_XBATCH_MAX`, which
+  sizes its accumulator arrays). Beyond 4 slots the path falls back to the
+  per-slot loop rather than chunking.
+- Q8_0 lm_heads (the dense 4B) have no batched path; only MQ4G256 does.
+- The B=1 case is a 0.96× loss, so it is gated off. Whether a batched kernel
+  could also win at B=1 with the tuned kernel's buffer-load strategy is
+  untested.
 - Contexts beyond 4096 and slot counts beyond 4 are unmeasured.
