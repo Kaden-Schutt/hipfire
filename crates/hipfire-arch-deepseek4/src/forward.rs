@@ -11990,7 +11990,24 @@ fn attention_block_batched_mixed(
                     && hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_GFX1201_TOPK_GATHER_TILED")
                         .as_deref()
                         != Ok("0");
-                if tiled_gfx1201 {
+                // Same portable LDS-transpose gather on gfx1151. Promoted to
+                // an architecture default: opt out with
+                // HIPFIRE_DS4_GATHER_TILED=0.
+                //
+                // The incumbent scatters its store: thread d writes addresses
+                // `out_stride` floats apart, fully uncoalesced, measured at
+                // 5.0% of decode GPU time — the largest non-GEMV consumer.
+                // Isolated micro on gfx1151 at real shapes (head_dim=512,
+                // K=512): 9.94x / 10.99x / 11.85x at B=2/3/5, byte-identical.
+                // End-to-end on the golden k6 DSpark fixture (serve_harness,
+                // 3 fresh processes/arm): 37.20601 -> 38.76924 tok/s median,
+                // +4.20%, with tau 2.0238095238095237 and the decoded answer
+                // identical across both arms. Post-change rocprof puts the
+                // kernel at 0.23% of GPU, down from 5.0%.
+                let tiled_gfx1151 = gpu.arch.eq_ignore_ascii_case("gfx1151")
+                    && hipfire_config::developer_var("HIPFIRE_DS4_GATHER_TILED").as_deref()
+                        != Ok("0");
+                if tiled_gfx1201 || tiled_gfx1151 {
                     gpu.deepseek4_topk_kv_gather_batched_tiled_gfx1201(
                         main_kv_cache,
                         &pbs.idx_topk_indices_batch,

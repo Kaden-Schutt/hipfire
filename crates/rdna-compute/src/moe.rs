@@ -991,7 +991,13 @@ impl Gpu {
         batch_size: i32,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        debug_assert!(self.arch.eq_ignore_ascii_case("gfx1201"));
+        // Portable LDS-transpose gather. Named for the arch that first shipped
+        // it, but there is no gfx12 ISA dependency: 32x33 LDS tile + an index
+        // cache, no WMMA, no gfx12 builtins. Verified to compile clean for
+        // gfx1151 (VGPR 14, occupancy 16, LDS 4352, zero spills).
+        debug_assert!(
+            self.arch.eq_ignore_ascii_case("gfx1201") || self.arch.eq_ignore_ascii_case("gfx1151")
+        );
         let kernel_name = "deepseek4_topk_kv_gather_batched_tiled_gfx1201";
         self.ensure_kernel(
             kernel_name,
