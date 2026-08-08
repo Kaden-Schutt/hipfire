@@ -560,3 +560,48 @@ quantisation mode. Both are cheap to test with a bisect against
 itself has never been reached, so nothing is yet known about the multi-slot
 forward's numerics — good or bad. This is the single highest-value open item in
 the programme.
+
+## Task 3 RESULT: the gate RAN and FAILED — `forward_batch_slots` is incorrect
+
+Executed against `qwen3.5-4b-q8.hf4` (dense Q8_0 Qwen3.5, 4.49 GB — chosen to
+fit alongside a resident model). **The gate produced a verdict, and the verdict
+is that the multi-slot forward is wrong:**
+
+```
+n_slots=1 slot=0 step=0: worst element 20981 at 20.49x tolerance
+  (got 0.018739678, want 0.03922677)
+```
+
+This is `n_slots=1` — the **simplest possible case**, where `forward_batch_slots`
+should reduce to exactly the single-sequence path. The values differ by ~2×, far
+outside any tolerance argument. It is a genuine correctness defect in SP3 Task 2,
+not a harness artefact: the reference arm is the unmodified
+`forward_prefill_batch`, and both arms are fed the identical token stream by
+construction.
+
+**SP3's forward must not be used until this is diagnosed.** Since it fails at one
+slot, the bug is in the per-layer sequence itself rather than in anything
+slot-related — start by diffing `forward_slots.rs`'s layer loop against the
+enumeration in `sp3-task-2-report.md`.
+
+### Two harness defects fixed on the way to this result
+
+1. **Decode used the wrong entry point.** It called `forward_prefill_batch` with
+   a 1-token slice; the canonical decode entry is `forward_scratch`, which is
+   what `daemon.rs` uses and which performs the `ensure_mapped_capacity` growth
+   the batched path does not do for a single token. Corrected.
+2. **`DECODE_STEPS` reduced 3 → 0.** Single-token decode segfaults on this
+   checkpoint through **both** entry points, inside `gated_delta_net_q8_compact2`
+   on the pre-existing path. The model is a VL/M-RoPE wrapper
+   (`mrope_interleaved=true mrope_section=[11,11,10]`) and prefill works while
+   decode does not, so this looks like an M-RoPE single-token decode issue in
+   existing code rather than anything SP3 introduced. Restoring decode coverage
+   needs either a **non-VL** dense Q8_0 Qwen3.5 checkpoint (none small enough is
+   on this box) or that issue fixed.
+
+Ruled out along the way, each with evidence: the model itself (`dump_logits_qwen35`
+runs it through the same entry point, exit 0, at prefill 5/8/64), prompt length,
+`Qwen35Scratch` `max_batch` (64→128), the `kv_seq` floor (64→512), KV mode (the
+control passes under `HIPFIRE_KV_MODE=q8`), AR hipGraph capture (disabling it
+changes nothing), out-of-vocab tokens (generator is `% 900 + 1`), config
+mutation, and allocation ordering. Zero OOM events on every run.

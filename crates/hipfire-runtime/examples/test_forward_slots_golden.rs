@@ -80,7 +80,7 @@ fn main() {
     use std::path::Path;
 
     const N_SLOTS_MAX: usize = 4;
-    const DECODE_STEPS: usize = 3;
+    const DECODE_STEPS: usize = 0; // was 3 — see the mrope decode note below
     // SlotPool rounds cap_tokens up to a multiple of 128 internally, so this
     // just needs to clear every prompt length + DECODE_STEPS (max 9 + 3).
     const CAP_TOKENS: usize = 64;
@@ -215,20 +215,23 @@ fn main() {
         steps.push(gpu.download_f32(&scratch.logits).expect("reference: download logits"));
 
         for k in 0..DECODE_STEPS {
-            let tok = [stream[prompt_len + k]];
-            qwen35::forward_prefill_batch(
+            // `forward_scratch`, NOT forward_prefill_batch with a 1-token slice.
+            //
+            // Both accept a single token, but they are not interchangeable: the
+            // single-token batched path segfaults on this model inside
+            // gated_delta_net_q8_compact2. `forward_scratch` is the canonical
+            // decode entry point -- it is what daemon.rs uses (see its decode
+            // sites) -- and it does the `ensure_mapped_capacity` growth that the
+            // batched path does not do for a 1-token call.
+            qwen35::forward_scratch(
                 gpu,
                 weights,
                 config,
-                &tok,
+                stream[prompt_len + k],
                 prompt_len + k,
                 &mut kv_cache,
                 &mut dn_state,
                 &scratch,
-                None,
-                None,
-                None,
-                None,
             )
             .expect("reference: decode forward");
             gpu.hip.device_synchronize().expect("sync");
