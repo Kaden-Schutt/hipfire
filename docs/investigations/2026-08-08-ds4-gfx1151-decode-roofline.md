@@ -351,3 +351,57 @@ free: doubling draft-side cost adds 8.03 ms (+10.5% window) and must buy back
 more than that in acceptance. That trade -- not deeper blocks at current
 accuracy, and not further kernel work -- is the remaining path to 45 tok/s.
 
+## 7. Output determinism at k6, and why k4 stays a diagnostic
+
+### k6 is bit-deterministic
+
+Every k6 run recorded here — six fresh processes across three commits
+(`8bcba53ea`, `b071cff8a`, and the golden trio) — produced byte-identical
+generated text:
+
+```
+assistant_content md5 e49b9893a207d8a6, length 534, on all six
+tau                   2.0238095238095237, identical to 13 digits
+```
+
+Greedy DSpark decode on this fixture is reproducible, not merely
+reproducible-in-throughput. That is a stronger property than a tok/s figure and
+is worth stating explicitly when the number is quoted.
+
+### Output depends on the block trajectory
+
+k4 (`--deepseek4-experts-per-token 4`) is a diagnostic here; it is not adopted,
+because reducing routed experts is a quality trade. Running it did surface a
+property of the engine worth recording. Three k4 arms, same fixture, same
+prompt, greedy:
+
+| arm | text md5 | len | tau | decode |
+| --- | --- | ---: | ---: | ---: |
+| gather off, adaptive B | `0f6363c0da139637` | 538 | 1.6458333333333333 | 39.1633 |
+| gather on, adaptive B | `beb683948784e749` / `0f6363c0da139637` | 534 / 538 | 1.886 / 1.54 / 1.396 | 41.79 / 40.26 / 39.40 |
+| gather on, `ADAPTIVE_BLOCK=0` | `59c689f95b8e383a` | 530 | 2.5277777777777777 | 31.1730 / 31.1728 / 31.1692 |
+
+Each *fixed* block trajectory is perfectly deterministic — the pinned arm
+repeats to 0.012% with identical text and identical tau. What varies is the
+trajectory itself: at k4 the verify cost curve is flat enough that the block
+controller's argmax wanders between runs on ordinary timing noise, and a
+different block selects different `b1..b6` GEMV variants, whose differing
+reduction orders round differently and flip the argmax at a near-tie.
+
+So output is a deterministic function of the block trajectory, and the
+trajectory is timing-sensitive wherever the cost curve is flat. This is not a
+race: pinning the block removes the variation completely. It is also not
+specific to the tiled gather — the gather only perturbed timing enough to
+expose it. k6 never trips it because its cost curve is steep enough (17.84
+ms/position, §6) that the argmax lands in the same place every run.
+
+The pinned k4 arm independently reproduces the §6 result: tau rose to 2.5278,
+the highest of any k4 arm, while throughput fell to 31.17 tok/s. Deeper blocks
+lose on this architecture whatever the expert count.
+
+**Consequence for benchmarking.** A configuration whose block controller
+wanders cannot be quoted to four significant figures, and its spread will be
+dominated by trajectory selection rather than by measurement noise: the k4
+adaptive arm spread 6.1% against k6's 0.079%. Report tau alongside tok/s; a
+varying tau is the signal that the trajectory moved.
+
