@@ -1969,8 +1969,8 @@ fn cache_growth_bytes(
 
 /// Refuse a growth request before mutating any cache allocation when its
 /// complete physical footprint cannot fit. This keeps the session retryable
-/// (for example with quantized KV) instead of leaving a partially mapped F32
-/// cache after a late-layer allocation failure.
+/// with a smaller request or lower-precision cache instead of leaving a
+/// partially mapped cache after a late-layer allocation failure.
 fn admit_compressor_growth(
     cfg: &DeepseekV4Config,
     state: &DeepseekV4State,
@@ -2072,7 +2072,8 @@ fn admit_compressor_growth(
         .ok_or_else(|| "DeepSeek V4 admission-byte overflow".to_string())?;
     if required_with_headroom > free_bytes {
         return Err(format!(
-            "DeepSeek V4 F32 compressed cache cannot admit {required_tokens} tokens atomically: growth {:.2} GiB + {:.2} GiB headroom exceeds {:.2} GiB free ({:.2} GiB addressable); use quantized KV or a shorter request",
+            "DeepSeek V4 {:?} compressed cache cannot admit {required_tokens} tokens atomically: growth {:.2} GiB + {:.2} GiB headroom exceeds {:.2} GiB free ({:.2} GiB addressable); use a lower-precision compressor cache or a shorter request",
+            state.compressor_cache_dtype,
             growth_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
             COMPRESSOR_GROWTH_HEADROOM_BYTES as f64 / (1024.0 * 1024.0 * 1024.0),
             free_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
