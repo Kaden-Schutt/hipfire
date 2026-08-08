@@ -622,3 +622,36 @@ expert-spill idea, and `docs/perf-checkpoints/2026-08-07-batching-ceiling-probe.
 Confirm that 4 agents × ~100K is genuinely insufficient. A swap subsystem is
 real work — eviction policy, transfer scheduling, and the correctness risk of a
 half-swapped slot being read — and 96K × 4 fits today at 28.69 GB.
+
+## 16. SCOPE GAP found by SP3 (2026-08-08): the WMMA flash-prefill kernel
+
+§6.5 listed four kernels for the slot port and noted `attention_q8_0_flash_prefill`
+"(+ `_wmma`)" in the prior-art table — but **only the scalar variant was ported.
+`attention_q8_0_flash_prefill_wmma` has no `_slots` version anywhere.**
+
+That omission was invisible until SP3's golden gate ran, because the legacy
+fingerprint exercises the *scalar* path (every one of its 11 rows prints
+`kernel=scalar`). On **gfx11xx — including this dev box and the gfx1201 target —
+the `AttnQ8_0KvBatchedMasked` dispatch defaults ON into the WMMA
+f16-accumulate kernel for *any* batched prefill, before it ever reaches the
+LDS/tiled crossover that SP1 ported.** So the kernel the reference actually uses
+for batched prefill on the target hardware is the one kernel SP1 did not port.
+
+**Consequence, measured:** `forward_batch_slots` is bit-identical to the
+reference at `n_slots == 1` (0.000× tolerance, after SP3 special-cases the
+single-active-slot step onto the WMMA kernel directly), and diverges at
+`n_slots >= 2` at 20.49× tolerance — because a genuinely multi-slot step has no
+single active slot and falls back to the ported kernels, which are not what the
+reference runs.
+
+**This is new kernel work in `rdna-compute`, not a `forward_slots.rs` fix.**
+Porting `attention_q8_0_flash_prefill_wmma` to take `KvSlotDesc` + `row_slot` is
+the same mechanical change SP1 applied four times, with one added constraint
+already recorded in §6.3: the WMMA grid has a **different kernarg layout** (it
+omits `v_mode_bits`), which is why SP1's `launch_asym_flash_batched` asserts
+descriptors can never reach it. That assertion is now load-bearing and must be
+revisited as part of the port.
+
+Until then, **the multi-slot forward is correct for one slot and incorrect for
+more than one** — which is precisely the case the whole programme exists to
+serve, so this is the top-priority follow-up.
