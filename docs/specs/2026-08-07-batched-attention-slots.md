@@ -48,7 +48,7 @@ SP1 is done when all of the following hold:
 | **SP1** | **Ragged multi-slot batched attention kernels + descriptor ABI** | **this spec** |
 | SP2 | Multi-slot KV allocator lifecycle, batched KV write/RoPE, batched DeltaNet state update, batched sampling | later |
 | SP3 | Ragged batched forward through the qwen35 layer driver; scheduler mixing chunked prefill with decode; per-slot spec decode with independent draft lengths and acceptance | later |
-| SP4 | Daemon concurrency: multiple in-flight requests, per-slot session + prefix cache, admission control, 32 GB budget enforcement | later |
+| SP4 | Daemon concurrency: multiple in-flight requests, per-slot session + prefix cache, admission control, 32 GB budget enforcement, **KV swap-on-idle** (§15) | later |
 
 **SP1 explicitly excludes** the KV allocator lifecycle, DeltaNet batching, the
 scheduler, and any daemon change. SP1 *does* own the descriptor ABI and the
@@ -524,3 +524,59 @@ would be cheap to attempt. It is rejected for this program on four grounds:
 memory, so a spilled-expert design would show **no** penalty in testing here and
 fall off a cliff on the R9700. Any such experiment needs R9700 access to mean
 anything. This is the same class of hazard as the 32 GB budget assertion in §10.
+
+## 15. KV swap-on-idle (SP4)
+
+Added 2026-08-07 after the asym3 rejection removed the capacity lever that
+§4.2 relied on. **Scope: SP4, as an admission-control feature — not kernel work.**
+
+### The problem it solves
+
+The 27B needs 33.25 GB for 4 agents × 128K at q8 (15 GB weights + 18.25 GB KV
+at 34 KB/token) against 32 GB of card, less whatever is reserved. asym3 would
+have closed the gap but was rejected on quality (§13). 4 agents × ~96-112K fits
+today with no new machinery, so this is only worth building if 128K × 4 is a
+hard requirement on that specific model — the 35B-A3B already does 4 × 128K in
+25.8 GB.
+
+### What is viable, and what is not
+
+**Per-step streaming is not viable and must not be built.** During decode every
+slot reads its *entire* KV every step — there is no cold portion to leave
+behind. For the 27B at 128K that is 4.56 GB per slot per step: 7.1 ms from
+R9700 VRAM at ~640 GB/s versus **91.3 ms** over PCIe 5.0 x16 at ~50 GB/s.
+Layer-wise prefetch does not rescue it either — per layer that is 285 MB, 5.7 ms
+of transfer against 0.44 ms of compute, so there is nothing to hide it behind.
+The result would be ~11 tok/s aggregate, worse than simply admitting fewer
+agents.
+
+**Swap-on-idle is viable.** Page a slot's *whole* KV to host when its agent is
+not generating, page it back on resume. The 4.56 GB is then paid **once per
+activation** (~91 ms) and amortised over an entire generation, rather than per
+step. Coding agents are bursty — they generate, then block on tool calls, test
+runs or the human — so typically 1-2 of 4 are decoding at any instant. Two
+resident plus two swapped is 15 + 2×4.56 = **24.1 GB**, comfortable.
+
+This is OS virtual memory, and it is what vLLM does for preemption.
+
+### Why it belongs in SP4
+
+Deciding *who is resident* is admission control. SP4 already owns per-slot
+sessions, the prefix cache and 32 GB budget enforcement; residency is the same
+decision surface. It needs nothing from the kernels beyond what SP1 already
+shipped: `kv_offset_for()` is the seam a swappable or paged KV plugs into, and
+`WeightPager` is precedent for the paging machinery itself.
+
+### Hazard, and it is the same one that sank expert spill
+
+**Strix Halo has unified memory, so a swap prototype will show near-zero
+transfer cost on the dev box and fall off a cliff on the R9700, where the
+transfer crosses PCIe.** Any latency claim about this feature requires R9700
+access to mean anything. See §14, where this exact hazard invalidated the
+expert-spill idea, and `docs/perf-checkpoints/2026-08-07-batching-ceiling-probe.md`.
+
+### Prerequisite before building
+
+Confirm that 4 agents × ~100K is genuinely insufficient. A swap subsystem is
+real work — eviction policy, transfer scheduling, and the correctness risk of a
+half-swapped slot being read — and 96K × 4 fits today at 28.69 GB.
