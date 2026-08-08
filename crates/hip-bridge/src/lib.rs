@@ -27,7 +27,7 @@ pub use ffi::{
 pub use kernarg::KernargBlob;
 pub use rccl::{RcclComms, RcclDataType, RcclError, RcclRedOp, RcclResult, NCCL_SUCCESS};
 pub use rocblas::{Rocblas, RocblasDatatype, RocblasError, RocblasOperation, RocblasResult};
-pub use vmm::{clear_vmm_faults, inject_vmm_fault, VmmArena, VmmFaultKind};
+pub use vmm::{clear_vmm_faults, inject_vmm_fault, VmmArena, VmmFaultKind, VmmMemoryTier};
 
 /// Re-export memory copy direction for callers.
 #[repr(u32)]
