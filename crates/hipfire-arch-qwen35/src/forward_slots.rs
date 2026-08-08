@@ -50,6 +50,8 @@ use crate::qwen35::{
 };
 use crate::slot_batch::SlotBatch;
 use hip_bridge::{HipError, HipResult};
+use hipfire_dispatch::context::DispatchCtx;
+use hipfire_dispatch::pipeline::{execute_steps, GemvInput, Step};
 use hipfire_dispatch::types::KernelKey;
 use hipfire_runtime::llama::EmbeddingFormat;
 use rdna_compute::kv_slots::KvSlotDesc;
@@ -525,13 +527,74 @@ fn run_deltanet_layer_slots(
     )
 }
 
+/// Mirrors the `flash_optin && wmma_ok` gate that
+/// `hipfire-dispatch/src/families/attention.rs` applies to
+/// `KernelKey::AttnQ8_0KvBatchedMasked` BEFORE it ever reaches the LDS/tiled
+/// crossover below — on gfx11xx (RDNA3/3.5) this gate is DEFAULT ON (not an
+/// opt-in corner case), so any batched Q8 prefill on that hardware (any
+/// `n > 1`) actually runs through `attention_q8_0_flash_prefill_wmma`
+/// (f16-accumulate WMMA flash-prefill), never the LDS-backed masked kernel
+/// this file's crossover assumed was the whole story. Confirmed empirically
+/// (see `sp3-defect-report.md`): forcing `HIPFIRE_FLASH_PREFILL=0` on the
+/// reference cuts the golden test's worst-element error from 20.49x to
+/// 3.93x tolerance, and a layer-by-layer bisection shows the FIRST nonzero
+/// hidden-state divergence appears exactly at the first `FullAttention`
+/// layer — both point at this kernel-selection gap, not a per-layer op
+/// bug.
+///
+/// Mirrors ONLY the unconditional gfx11 branch of the reference's
+/// `flash_default_on = arch.starts_with("gfx11") || gfx12_query16_route_ok`:
+/// the gfx12 disjunct reads three `hipfire-dispatch`-private eligibility
+/// predicates (one needs a live `DispatchCtx`) this crate has no visibility
+/// into. Restricting to `has_wmma_w32() && !has_wmma_w32_gfx12()` means this
+/// NEVER opts in on gfx12 even if `HIPFIRE_FLASH_PREFILL=1` forces the
+/// reference on there too — a strict narrowing (documented scope gap, same
+/// category as the crossover below already carries for the scalar
+/// flash-prefill ladder), not a guess at gfx12's real eligibility window.
+fn q8_flash_prefill_wmma_eligible(gpu: &Gpu, head_dim: usize, batch_size: usize) -> bool {
+    if batch_size <= 1 {
+        return false;
+    }
+    let default_on = gpu.arch.starts_with("gfx11");
+    let flash_optin = match hipfire_config::developer_var("HIPFIRE_FLASH_PREFILL")
+        .ok()
+        .as_deref()
+    {
+        Some("0") | Some("off") | Some("false") => false,
+        Some("1") | Some("on") | Some("true") => true,
+        _ => default_on,
+    };
+    if !flash_optin {
+        return false;
+    }
+    let variant = hipfire_config::developer_var("HIPFIRE_FLASH_PREFILL_KERNEL")
+        .unwrap_or_else(|_| "wmma".to_owned());
+    variant != "scalar"
+        && gpu.arch_caps.has_wmma_w32()
+        && !gpu.arch_caps.has_wmma_w32_gfx12()
+        && head_dim % 32 == 0
+        && head_dim <= 256
+}
+
 /// Crossover between the LDS-backed masked kernel (no context ceiling issue
 /// below the crossover) and the tiled no-LDS-cap flash kernel, mirroring the
 /// fallback ladder in `hipfire-dispatch/src/families/attention.rs`'s
-/// `AttnQ8_0KvBatchedMasked` arm. Deliberately narrower than that arm: the
-/// WMMA flash-prefill and scalar flash-prefill opt-in variants it also tries
-/// have no `_slots` port (SP1 built only the two families used here), so
-/// this uses only those two.
+/// `AttnQ8_0KvBatchedMasked` arm. Deliberately narrower than that arm in one
+/// remaining respect: the scalar flash-prefill opt-in variant (gated by
+/// `HIPFIRE_FLASH_PREFILL_KERNEL=scalar` + a long-context minimum) has no
+/// `_slots` port, so that one case still falls through to this crossover —
+/// SP1 built only the two families used here, plus (below) the WMMA
+/// flash-prefill family for the single-active-slot reduction.
+///
+/// `single_slot`, when `Some((k_base, slab_bytes))`, means exactly one slot
+/// is active in this step (true for every `n_slots == 1` call, and for a
+/// larger pool whenever only one slot has live rows this step) — the WMMA
+/// flash-prefill kernel has no slot-descriptor concept at all, so it is only
+/// safe to call when the whole batch belongs to one sequence. `k_base` is
+/// that slot's byte offset into the shared arena (`SlotPool` guarantees
+/// `v_base == k_base`); slot 0 of a fresh pool always has `k_base == 0`, so
+/// this reduces byte-for-byte to the reference's own `k_cache`/`v_cache`
+/// addressing when `n_slots == 1`.
 #[allow(clippy::too_many_arguments)]
 fn q8_attend_slots(
     gpu: &mut Gpu,
@@ -549,7 +612,25 @@ fn q8_attend_slots(
     flash_partials: &GpuTensor,
     descs_dev: &GpuTensor,
     row_slot_dev: &GpuTensor,
+    single_slot: Option<(u64, usize)>,
 ) -> HipResult<()> {
+    if let Some((k_base, slab_bytes)) = single_slot {
+        if q8_flash_prefill_wmma_eligible(gpu, head_dim, batch_size) {
+            let k_view = k_cache.sub_offset(k_base as usize, slab_bytes);
+            let v_view = v_cache.sub_offset(k_base as usize, slab_bytes);
+            return gpu.attention_q8_0_flash_prefill_wmma(
+                q,
+                &k_view,
+                &v_view,
+                out,
+                positions,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                batch_size,
+            );
+        }
+    }
     let crossover = if gpu.arch_caps.is_gfx1200() || gpu.arch_caps.is_gfx1201() {
         4096
     } else {
@@ -616,6 +697,7 @@ fn run_fullattn_layer_slots(
     n: usize,
     physical_cap: usize,
     max_ctx_len: usize,
+    single_slot: Option<(u64, usize)>,
 ) -> HipResult<()> {
     require_q8_fullattn_layer(layer)?;
 
@@ -780,6 +862,7 @@ fn run_fullattn_layer_slots(
         &s.flash_partials,
         &desc_staging.descs_dev,
         &desc_staging.row_slot_dev,
+        single_slot,
     )?;
 
     // 8. sigmoid(gate) * attn_out.
@@ -835,12 +918,26 @@ fn run_fullattn_layer_slots(
 /// row to `n_slots` rows. Idle slots' rows in `logits_out` are left
 /// whatever was already there; callers must not sample them (this is the
 /// same contract `SlotBatch.m_per_slot` already establishes).
+///
+/// Single-active-slot reduction: when the whole pool is exactly one active
+/// slot, skip the batched rmsnorm+GEMM below and run the reference's own
+/// single-vector legacy-path kernels (`rmsnorm_f32` + `Step::Gemv`,
+/// `qwen35.rs:11984-12008`) byte-for-byte instead. Confirmed by a
+/// layer-by-layer bisection (see `sp3-defect-report.md`): with the
+/// FullAttention kernel-selection fix above also in place, EVERY layer's
+/// hidden state is bit-identical between this file and the reference up to
+/// (and including) the last layer — the only remaining divergence at
+/// `n_slots == 1` was here, a `rmsnorm_batched`+`GemmQ8_0BatchedChunked`
+/// (n=1) vs `rmsnorm_f32`+GEMV numeric mismatch between two
+/// mathematically-equivalent but differently-implemented kernel families,
+/// not a logic bug.
 fn final_logits_per_slot(
     gpu: &mut Gpu,
     weights: &Qwen35Weights,
     config: &Qwen35Config,
     batch: &SlotBatch,
     pbs: &PrefillBatchScratch,
+    s: &Qwen35Scratch,
     logits_out: &GpuTensor,
 ) -> HipResult<()> {
     if !matches!(weights.output.gpu_dtype, DType::Q8_0) {
@@ -862,6 +959,23 @@ fn final_logits_per_slot(
         logits_out.numel(),
         n_slots * config.vocab_size
     );
+
+    if n_slots == 1 && batch.m_per_slot[0] > 0 {
+        let m = batch.m_per_slot[0];
+        let last_row = m - 1;
+        let dim_row_bytes = dim * 4;
+        gpu.memcpy_dtod_at_auto(&s.x.buf, 0, &pbs.x_batch.buf, last_row * dim_row_bytes, dim_row_bytes)?;
+        gpu.rmsnorm_f32(&s.x, &weights.output_norm, &s.tmp, config.norm_eps)?;
+        let ctx = DispatchCtx::new(gpu);
+        let wr = weights.output.dispatch_ref();
+        let logits_view = logits_out.sub_offset(0, config.vocab_size);
+        let step = Step::Gemv {
+            w: &wr,
+            input: GemvInput::Raw(&s.tmp),
+            out: &logits_view,
+        };
+        return execute_steps(gpu, &ctx, &[step]).map_err(|e| HipError::new(0, &e.to_string()));
+    }
 
     // x_rot_batch and x_norm_batch are both dead at this point (their last
     // use was this layer's FFN, already consumed by the w_down residual
@@ -931,6 +1045,54 @@ pub fn forward_batch_slots(
     pbs: &PrefillBatchScratch,
     s: &Qwen35Scratch,
     logits_out: &GpuTensor,
+) -> HipResult<()> {
+    forward_batch_slots_with_max_layer(
+        gpu,
+        weights,
+        config,
+        batch,
+        pool,
+        dn_states,
+        k_arenas,
+        v_arenas,
+        desc_staging,
+        pbs,
+        s,
+        logits_out,
+        None,
+    )
+}
+
+/// Debugging/bisection variant of [`forward_batch_slots`]: early-exits the
+/// layer loop at `max_layer` (exclusive), mirroring the reference's own
+/// `max_layer` parameter on `forward_prefill_batch_with_pbs_opts`
+/// (`qwen35.rs:6554`). `pbs.x_batch[0..n*dim]` holds the post-layer hidden
+/// state on return when `max_layer` is `Some` — read it directly (it is
+/// `pub`) to diff against the reference's own `pbs.x_batch` after an
+/// identically-bounded call. Skips the final norm/lm_head AND the per-slot
+/// KV-length advance when `max_layer` is `Some`, exactly as the reference
+/// skips `do_lm_head` — an early-exit call must not mutate `pool`'s
+/// bookkeeping with a partial forward's positions.
+///
+/// Not `#[cfg(test)]`-gated: kept as a normal `pub fn` so
+/// `test_forward_slots_golden` (an `examples/` binary in a different crate)
+/// can call it without a feature flag plumbing exercise. `forward_batch_slots`
+/// above is the real entry point every other caller keeps using unchanged.
+#[allow(clippy::too_many_arguments)]
+pub fn forward_batch_slots_with_max_layer(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    batch: &SlotBatch,
+    pool: &mut SlotPool,
+    dn_states: &mut [DeltaNetState],
+    k_arenas: &[GpuTensor],
+    v_arenas: &[GpuTensor],
+    desc_staging: &mut SlotDescStaging,
+    pbs: &PrefillBatchScratch,
+    s: &Qwen35Scratch,
+    logits_out: &GpuTensor,
+    max_layer: Option<usize>,
 ) -> HipResult<()> {
     if batch.is_empty() {
         return Ok(());
@@ -1018,10 +1180,31 @@ pub fn forward_batch_slots(
         .max(1);
     let q8_wmma_arch = q8_prefill_wmma_enabled(gpu);
 
+    // Exactly one active slot this step? (Always true for n_slots == 1;
+    // also true for a larger pool when every row this step belongs to the
+    // same slot.) When so, `q8_attend_slots` can safely reduce to the
+    // reference's own WMMA flash-prefill kernel (see its doc comment) —
+    // that kernel has no slot-descriptor concept, so it is unsafe to use
+    // whenever more than one slot has live rows in the same call.
+    let active_slots = batch.m_per_slot.iter().filter(|&&m| m > 0).count();
+    let single_slot = if active_slots == 1 {
+        let slot_idx = batch
+            .m_per_slot
+            .iter()
+            .position(|&m| m > 0)
+            .expect("active_slots == 1 implies exactly one m_per_slot entry > 0");
+        let k_base = pool.descriptors()[slot_idx].k_base;
+        let slab_bytes = pool.arena_bytes() / n_slots;
+        Some((k_base, slab_bytes))
+    } else {
+        None
+    };
+
     // ── 4. Per-layer loop ─────────────────────────────────────────────────
+    let layer_end = config.n_layers.min(max_layer.unwrap_or(usize::MAX));
     let mut delta_layer_idx = 0usize;
     let mut kv_layer_idx = 0usize;
-    for layer_idx in 0..config.n_layers {
+    for layer_idx in 0..layer_end {
         match (&weights.layers[layer_idx], config.layer_types[layer_idx]) {
             (LayerWeights::DeltaNet(layer), LayerType::LinearAttention) => {
                 run_deltanet_layer_slots(
@@ -1051,6 +1234,7 @@ pub fn forward_batch_slots(
                     n,
                     physical_cap,
                     max_ctx_len,
+                    single_slot,
                 )?;
                 kv_layer_idx += 1;
             }
@@ -1073,8 +1257,16 @@ pub fn forward_batch_slots(
         }
     }
 
+    if max_layer.is_some() {
+        // Early-exit for bisection: mirror the reference's `do_lm_head =
+        // ... && max_layer.is_none()` — skip the final norm/lm_head AND the
+        // KV-length advance below (a partial forward must not tell `pool`
+        // this step's positions were fully written).
+        return Ok(());
+    }
+
     // ── 5. Final norm + per-slot last-token logits ──────────────────────
-    final_logits_per_slot(gpu, weights, config, batch, pbs, logits_out)?;
+    final_logits_per_slot(gpu, weights, config, batch, pbs, s, logits_out)?;
 
     // ── 6. Advance each slot's logical KV length ────────────────────────
     //
