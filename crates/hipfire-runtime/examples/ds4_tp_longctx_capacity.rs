@@ -171,7 +171,15 @@ fn cache_summary(state: &DeepseekV4State, gpu: &Gpu) -> CacheSummary {
     summary
 }
 
-fn report_rank(stage: &str, rank: usize, state: &DeepseekV4State, gpu: &Gpu, pbs_rows: usize) {
+fn report_rank(
+    stage: &str,
+    rank: usize,
+    state: &DeepseekV4State,
+    gpu: &Gpu,
+    pbs_rows: usize,
+) -> Result<(), String> {
+    gpu.bind_thread()
+        .map_err(|error| format!("bind rank {rank} for capacity report: {error:?}"))?;
     let summary = cache_summary(state, gpu);
     let (free_bytes, total_bytes) = gpu.hip.get_vram_info().expect("hipMemGetInfo");
     let used_bytes = total_bytes.saturating_sub(free_bytes);
@@ -192,6 +200,7 @@ fn report_rank(stage: &str, rank: usize, state: &DeepseekV4State, gpu: &Gpu, pbs
         free_bytes,
         total_bytes,
     );
+    Ok(())
 }
 
 fn cache_bits(
@@ -480,7 +489,7 @@ fn run() -> Result<(), String> {
             &state[rank],
             &ep.gpus.devices[rank],
             prefill[rank].idx_score_capacity,
-        );
+        )?;
     }
 
     if let Some(identity_tokens) = args.identity_tokens {
@@ -539,7 +548,7 @@ fn run() -> Result<(), String> {
                 &state[rank],
                 &ep.gpus.devices[rank],
                 prefill[rank].idx_score_capacity,
-            );
+            )?;
         }
         if !errors.is_empty() {
             break;
