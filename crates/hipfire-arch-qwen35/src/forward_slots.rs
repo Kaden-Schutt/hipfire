@@ -1761,10 +1761,24 @@ fn final_logits_per_slot(
     s: &Qwen35Scratch,
     logits_out: &GpuTensor,
 ) -> HipResult<()> {
-    if !matches!(weights.output.gpu_dtype, DType::Q8_0) {
+    // The lm_head goes through `Step::Gemv` + `weights.output.dispatch_ref()`
+    // below, which is exactly what the reference does (qwen35.rs, the
+    // `weights.output` GEMV) and is dtype-generic — the dispatcher picks the
+    // kernel from `gpu_dtype`. A Q8_0-only gate here was therefore
+    // over-restrictive and blocked A3B, whose untied lm_head is MQ4G256, even
+    // though the very next lines would have dispatched it correctly.
+    //
+    // Kept as an allow-list rather than removed: an unsupported dtype should
+    // still fail here with a clear message naming the lm_head, not deep inside
+    // the dispatcher.
+    if !matches!(weights.output.gpu_dtype, DType::Q8_0 | DType::MQ4G256) {
         return Err(HipError::new(
             0,
-            "forward_batch_slots: lm_head (weights.output) must be Q8_0",
+            &format!(
+                "forward_batch_slots: lm_head (weights.output) dtype {:?} is not \
+                 supported by the multi-slot path (expected Q8_0 or MQ4G256)",
+                weights.output.gpu_dtype
+            ),
         ));
     }
     let dim = config.dim;
