@@ -16,7 +16,9 @@
 //! on [`FinishSummary`] until the daemon wrapper classifies a tool-safe terminal.
 
 use crate::grammar;
-use hipfire_runtime::emit_text::{currently_in_think, ToolOutputRouter, ToolRouteEvent};
+use hipfire_runtime::emit_text::{
+    currently_in_think, ThinkOutputRouter, ThinkRouteEvent, ToolOutputRouter, ToolRouteEvent,
+};
 use hipfire_runtime::eos_filter::{EosFilter, EosFilterConfig, FilterAction};
 use hipfire_runtime::prompt_frame::AssistantPrefix;
 use hipfire_runtime::spec::{
@@ -35,6 +37,8 @@ pub struct Qwen35Emit<'a> {
     streamed_tokens: Vec<u32>,
     /// Incremental tool-protocol authority. Fed only EosFilter-emitted UTF-8.
     router: ToolOutputRouter,
+    /// Incremental reasoning/content authority, upstream of tool routing.
+    think_router: ThinkOutputRouter,
     /// Classifier-authorized visible prose accumulated this turn (cache fp).
     visible_acc: String,
     /// Latched when the router fails closed mid-stream or at finish.
@@ -69,13 +73,12 @@ fn think_continuation_text() -> String {
         .unwrap_or_else(|_| "</think>\n\n".to_string())
 }
 
-/// EosFilter config for the Qwen DFlash/spec semantic-v2 producer: strip think
-/// spans (including `started_in_think` / orphan closer) and stop without
-/// emitting decoded ChatML / aux EOT marker bytes.
-fn qwen_dflash_eos_filter_config(started_in_think: bool) -> EosFilterConfig {
+/// EosFilter config for the Qwen DFlash/spec semantic-v2 producer. EosFilter
+/// owns UTF-8/EOT filtering; ThinkOutputRouter owns think-channel routing.
+fn qwen_dflash_eos_filter_config() -> EosFilterConfig {
     EosFilterConfig {
-        strip_think: true,
-        started_in_think,
+        strip_think: false,
+        started_in_think: false,
         stop_at: vec![b"<|im_end|>".to_vec(), b"<|endoftext|>".to_vec()],
         holdback_prefixes: Vec::new(),
     }
@@ -121,10 +124,11 @@ impl<'a> Qwen35Emit<'a> {
         let open_think_prefix = matches!(ctx.assistant_prefix, AssistantPrefix::OpenThink);
         Box::new(Self {
             tokenizer: ctx.tokenizer,
-            filter: EosFilter::new(qwen_dflash_eos_filter_config(open_think_prefix)),
+            filter: EosFilter::new(qwen_dflash_eos_filter_config()),
             bytes_fed_to_filter: 0,
             streamed_tokens: Vec::new(),
             router: ToolOutputRouter::new(),
+            think_router: ThinkOutputRouter::new(open_think_prefix),
             visible_acc: String::new(),
             router_malformed: false,
             filter_stopped: false,
@@ -144,10 +148,10 @@ impl<'a> Qwen35Emit<'a> {
         })
     }
 
-    /// Route one EosFilter-emitted UTF-8 chunk. Visible prose becomes
+    /// Route one content chunk. Visible prose becomes
     /// `ClientEvent::Token`; complete tool calls stay buffered in the router
     /// until [`SpecEmit::finish`]. Malformed protocol latches fail-closed.
-    fn route_filter_text(&mut self, text: &str, events: &mut Vec<ClientEvent>) {
+    fn route_content_text(&mut self, text: &str, events: &mut Vec<ClientEvent>) {
         if text.is_empty() || self.router_malformed {
             return;
         }
@@ -169,6 +173,37 @@ impl<'a> Qwen35Emit<'a> {
                 self.router_malformed = true;
             }
         }
+    }
+
+    /// Route classified reasoning/content events. Content continues through
+    /// the tool protocol router; reasoning bypasses it and is never cached as
+    /// visible prose.
+    fn route_think_events(
+        &mut self,
+        channel_events: Vec<ThinkRouteEvent>,
+        events: &mut Vec<ClientEvent>,
+    ) {
+        for channel_event in channel_events {
+            if self.router_malformed {
+                continue;
+            }
+            match channel_event {
+                ThinkRouteEvent::Reasoning(text) => {
+                    events.push(ClientEvent::Reasoning(text));
+                }
+                ThinkRouteEvent::Content(text) => self.route_content_text(&text, events),
+            }
+        }
+    }
+
+    /// Route one EosFilter-emitted UTF-8 chunk through reasoning classification.
+    fn route_filter_text(&mut self, text: &str, events: &mut Vec<ClientEvent>) {
+        if text.is_empty() {
+            return;
+        }
+        let mut channel_events = Vec::new();
+        self.think_router.push_into(text, &mut channel_events);
+        self.route_think_events(channel_events, events);
     }
 
     /// Apply one filter observe step into the semantic router.
@@ -208,18 +243,17 @@ impl<'a> Qwen35Emit<'a> {
         events
     }
 
-    /// Drain ordinary pending filter prose into the router (not open-think).
+    /// Drain pending EOT-prefix prose, then finalize partial think markers.
     fn drain_pending_into_router(&mut self, events: &mut Vec<ClientEvent>) {
-        if self.filter.in_think() {
-            let _ = self.filter.flush_pending();
-            return;
-        }
         let pending = self.filter.flush_pending();
-        if pending.is_empty() {
-            return;
+        if !pending.is_empty() {
+            let text = std::str::from_utf8(&pending).unwrap_or("");
+            self.route_filter_text(text, events);
         }
-        let text = std::str::from_utf8(&pending).unwrap_or("");
-        self.route_filter_text(text, events);
+
+        let mut channel_events = Vec::new();
+        self.think_router.finish_into(&mut channel_events);
+        self.route_think_events(channel_events, events);
     }
 
     /// Whether a streamed token id is a decoded EOT / terminator.
@@ -359,8 +393,7 @@ impl<'a> SpecEmit for Qwen35Emit<'a> {
                     return EmitOutcome { events, stop: None };
                 }
                 // A pathological re-open after the injected close hard-stops.
-                // Do not push raw "</think>\n" as a Token — think is stripped;
-                // surface stop only.
+                // Do not push raw "</think>\n" as a Token; surface stop only.
                 return EmitOutcome {
                     events,
                     stop: Some(StopReason::ThinkCap),
@@ -376,10 +409,8 @@ impl<'a> SpecEmit for Qwen35Emit<'a> {
         // ToolCalls are held on FinishSummary for the wrapper — generate_spec
         // must NOT render them before length/malformed/open-think is known.
         let mut events = Vec::new();
-        let open_think = self.filter.in_think();
         self.drain_pending_into_router(&mut events);
-        // Sticky: drain never leaves think; open_think remains if still open.
-        let open_think = open_think || self.filter.in_think();
+        let open_think = self.think_router.in_think();
         let decoded_eot = self.decoded_eot();
 
         if open_think {
@@ -619,6 +650,16 @@ mod tests {
         s
     }
 
+    fn reasoning_text(events: &[ClientEvent]) -> String {
+        let mut s = String::new();
+        for ev in events {
+            if let ClientEvent::Reasoning(t) = ev {
+                s.push_str(t);
+            }
+        }
+        s
+    }
+
     fn held_calls(finish: &FinishSummary) -> Vec<ToolCall> {
         finish
             .events
@@ -712,6 +753,7 @@ mod tests {
         assert!(!visible.contains("<think>"));
         assert!(!visible.contains("secret"));
         assert!(visible.contains("answer"));
+        assert_eq!(reasoning_text(&stream), "secret");
         assert_eq!(finish.finish_reason, "stop");
     }
 
@@ -849,9 +891,9 @@ mod tests {
 
     #[test]
     fn filter_config_matches_ar_semantic_v2() {
-        let cfg = qwen_dflash_eos_filter_config(true);
-        assert!(cfg.strip_think);
-        assert!(cfg.started_in_think);
+        let cfg = qwen_dflash_eos_filter_config();
+        assert!(!cfg.strip_think);
+        assert!(!cfg.started_in_think);
         assert!(cfg.stop_at.iter().any(|s| s == b"<|im_end|>"));
         assert!(cfg.stop_at.iter().any(|s| s == b"<|endoftext|>"));
     }

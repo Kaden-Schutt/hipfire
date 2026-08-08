@@ -1140,10 +1140,8 @@ impl<A: MtpDrafter> Speculator for MtpSpeculator<A> {
 pub enum ClientEvent {
     /// Visible answer text (post-filter, post-think-strip). → `{"type":"token"}`.
     Token(String),
-    /// Reasoning/think-block text surfaced separately (DSML reasoning channel).
-    /// → `{"type":"reasoning"}`. Unused by the qwen35 emitter (it strips think
-    /// only when configured and never emits a separate reasoning channel), but
-    /// part of the shared vocabulary the deepseek4 emitter will populate.
+    /// Reasoning/think-block text surfaced separately by model emitters.
+    /// → `{"type":"reasoning"}`.
     Reasoning(String),
     /// Parsed tool calls for this turn. → `{"type":"tool_calls"}`.
     ToolCalls(Vec<crate::prompt_frame::ToolCall>),
