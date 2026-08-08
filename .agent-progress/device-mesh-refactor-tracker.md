@@ -30,7 +30,7 @@ Emulation can prove structure and byte parity, but it cannot satisfy an acceptan
 
 ## Current Status
 
-**Foundation implemented; refactor incomplete.** `COR-004`, `COR-003`, `COR-002`, `COR-005`, `COR-006`, `STEP-001`, and `PAR-001` are complete. The mesh, manifest, Step execution, generic AR dispatch, model-parallel ownership, god-struct foundation, COR-002 terminal reset, COR-003 terminal lifecycle, COR-005 transactional loading, COR-006 eviction physical-cap KV alignment, STEP-001 DeltaNet migration, and PAR-001 policy characterization work are substantial and tested. Remaining architecture migrations and the separate physical PP/TP/EP topology tasks tracked below remain open. No open item is implicitly waived by earlier emulated validation.
+**Foundation implemented; refactor incomplete.** `COR-001` through `COR-006`, `DOC-001`, `STEP-001`, `STEP-002`, `STEP-002R`, `PAR-001`, `CAP-001`, and `COMP-001` are complete. The mesh, manifest, Step execution, generic AR dispatch, model-parallel ownership, god-struct foundation, COR-002 terminal reset, COR-003 terminal lifecycle, COR-005 transactional loading, COR-006 eviction physical-cap KV alignment, STEP-001 DeltaNet migration, STEP-002 MoE Step/manifest adoption, STEP-002R owner-preserving bundle teardown, PAR-001 policy characterization, CAP-001 capability admission, and COMP-001 TP×EP refusal work are substantial and tested. `GEN-001` was briefly mis-marked complete in `b1d54d5c2`; corrected 2026-08-08 to blocked — Qwen35 arch-resident PP remains `generate_multi` (see the task's blocked reason). Remaining architecture migrations and the separate physical PP/TP/EP topology tasks tracked below remain open. No open item is implicitly waived by earlier emulated validation.
 
 Contributor validation on two gfx1201 R9700s (2026-07-14, commit `4df03537`) confirmed balanced Qwen35 PP allocation and peer access, but did not close either physical PP gate: dense LLaMA forward hit an unclassified illegal access and Qwen35 PP=2 diverged at token 58/100. The evidence and bounded follow-up are recorded under HW-003 and HW-004; neither changes the current execution queue or relaxes exact-parity requirements.
 
@@ -39,15 +39,12 @@ Contributor validation on two gfx1201 R9700s (2026-07-14, commit `4df03537`) con
 This is the implementation queue. The dependency graph below remains the
 authoritative constraint; a task is marked `in progress` only when work begins.
 
-1. `COMP-001` — decide and enforce the TP x EP scope boundary.
-2. `CAP-001` — define the architecture capability contract and dense-EP normalization.
+1. `STEP-003` — adopt Step/manifest for recurrent and conv state (ready; deps COR-002, STEP-001 complete). Unblocks `STEP-004`, which gates `AXIS-001` through `AXIS-004`.
+2. `GEN-002` — DeepSeek4 single-GPU fallback (ready; deps COR-002 complete). Independent stream; can proceed alongside STEP-003.
+3. `SPEC-001` — unify AR and speculative orchestration (ready; deps COR-001..003 complete). Unblocks `SPEC-002` and `VL-002`.
+4. `VL-001` — shared lifecycle for Qwen35-VL (ready; deps COR-002, COR-003 complete). Independent multimodal stream.
 
-`PAR-001` and `COR-006` are complete; the next queue is `COMP-001`, then `CAP-001`.
-The `AXIS-001` through `AXIS-004`, `PAR-002`, and `HW-001` through `HW-013`
-tasks remain dependency-blocked until their capability, family, implementation,
-and topology prerequisites are satisfied. Hardware tasks remain blocked until
-the required distinct-GPU topology is available; emulation does not advance
-them toward completion.
+`COMP-001` (TP×EP refusal) and `CAP-001` (capability contract + dense-EP normalization) are complete and are no longer queue items. `STEP-002R` (owner-preserving bundle teardown) is complete as of 2026-08-08 (PR #18 mirror, commits `064e26e0d` + `c7f142af8`). `GEN-001` is blocked on STEP-003. The `AXIS-001` through `AXIS-004`, `PAR-002`, and `HW-001` through `HW-013` tasks remain dependency-blocked until their capability, family, implementation, and topology prerequisites are satisfied. Hardware tasks remain blocked until the required distinct-GPU topology is available; emulation does not advance them toward completion.
 
 ## Completed Foundation Evidence
 
@@ -313,12 +310,13 @@ them toward completion.
 
 ### GEN-001 Complete Qwen35 Arch-Resident PP
 
-- **Status:** complete
+- **Status:** blocked
 - **Dependencies:** COR-002, STEP-001, STEP-002, STEP-003
 - **Goal:** Own and complete Qwen35 PP for both dense and MoE cells through the arch-resident `ModelParallel::Pp(PipelineImpl::ArchResident)` path for hybrid attention and DeltaNet layers.
 - **Acceptance criteria:** Dense and MoE Qwen35 load, prefill, decode, recurrent/conv state, sampling, and unload use the generic PP ownership and stage interfaces; the Qwen35 adapter implements the COR-002 reset contract without creating a second reset authority; no legacy `pp`/`pp_gpus` side channel or duplicate Qwen35 PP loop remains; dense and MoE emulated PP parity is byte- or token-identical before physical validation.
 - **Validation:** Run dense and MoE Qwen35 single-versus-emulated-PP deterministic parity, COR-002 conformance and recurrent multi-turn/reset tests, placement assertions, and repeated unload tests; then hand off both PP families to HW-004.
 - **Hardware:** One supported AMD GPU for emulated PP; physical closure is HW-004.
+- **Blocked reason:** Status correction 2026-08-08 — the `complete` flip in `b1d54d5c2` was premature. STEP-003 (recurrent/conv Step/manifest adoption) is not complete, PR #527's architecture table still records Qwen35 PP as `Partial: Pp(ArchResident), still generate_multi`, and `docs/MODELS.md` still labels PP "partial arch-resident (GEN-001; not production-supported)". The arch-resident PP owner exists but the generation path remains `generate_multi`, not the unified PP loop; the acceptance criteria and validation are unproven.
 - **Evidence:** Pending
 
 ### GEN-002 Add DeepSeek4 Single-GPU Fallback
@@ -515,7 +513,7 @@ them toward completion.
 
 ### STEP-002R Make Qwen35 Frozen Construction Rollback Owner-Preserving
 
-- **Status:** ready
+- **Status:** complete
 - **Dependencies:** STEP-002
 - **Goal:** Replace best-effort Qwen35 Frozen pre-publication rollback with
   origin-preserving, retryable transactions for common weights and every
@@ -535,14 +533,49 @@ them toward completion.
   repeated failed-load/retry/unload GPU tests and prove post-retry VRAM recovery.
 - **Hardware:** CPU fault-ledger coverage plus one supported AMD GPU with the
   canonical Qwen35-MoE HFQ fixture.
-- **Evidence:** Created from Oracle Gate A rejection on 2026-07-27. Confirmed
-  debt includes unchecked legacy common fulfillment/assembly rollback,
-  conversion replacement ownership, typed DeltaNet/scratch constructor error
-  propagation, PBS/KV rollback, partial MTP staging, and missing per-allocation
-  fault evidence. Remains accepted debt through Oracle Gate B (2026-08-03) per
-  explicit user decision for this slice; it does not count as exact
-  failed-free retention evidence and must not be represented as such.
-  Recovery checkpoints:
+- **Evidence:** Implemented and validated by PR #18 (fivetide mirror of this
+  branch; commits `064e26e0d` `feat(loader): owner-preserving teardown for
+  every arch bundle` and `c7f142af8` `fix(loader): retained-owner backlog
+  closes the String-error teardown gap`, 2026-08-07). The generic core lives
+  in `hipfire-runtime/src/gpu_cleanup.rs`: `RetainedGpuTensor`,
+  `GpuCleanupFailure` (tensors + boxed `RetryableOwner` category; frozen
+  stores travel whole, never flattened), `BundleTeardown` trait,
+  `retain_free!` macro, checked frees (`free_tensor_retained`,
+  `free_weight_all_checked`, `free_weight_sidecars_checked`,
+  `retain_kv_failures`), and a process-local retained-owner backlog
+  (`enqueue_cleanup_failure` / `retry_backlog` / `backlog_pending`) so owners
+  surviving a terminal retry are enqueued and drained at the next
+  load/unload boundary. Qwen35: `Qwen35BundleLoadError` carries cleanup
+  owners, checked rollback (`KvCache::free_checked`,
+  `Qwen35Scratch::abort_checked`, `PrefillBatchScratch::abort_checked`,
+  `Qwen35Weights::free_gpu_checked`), `construct_kv_cache` returns the built
+  KV on reconfiguration failure, transactional MTP-head staging
+  (`MtpHeadStaging`), store rollback keeps real dtype/shape, and
+  rejected-replacement buffers thread into `staging_retained`. Every other
+  arch bundle (qwen2, llama incl. dspark, lfm2moe, minimax, cohere2moe,
+  deepseek4, dots-ocr) implements `BundleTeardown`; `unload_model`
+  dispatches exhaustively through `ModelState::free_checked` and reports
+  only after a same-call retry. Fault injection: `frozen-fault-inject`
+  feature + `HIPFIRE_FROZEN_FAIL_STAGE` /
+  `HIPFIRE_FROZEN_FAIL_FREE` (continuous-while-set). Forensic fixes en
+  route: dspark sidecar pread `RefCell` borrow panic, packed-MQ4 expert
+  interior-view pooling corruption (`free_moe_ffn_checked`),
+  VMM-arena release skipped by `free_tensor_checked`. Validation: GPU fault
+  battery 13/13; per-arch load→unload VRAM teardown 8/8 (exact-zero for
+  llama/dots-ocr/VMM); retained-backlog double-failure test (620 owners
+  enqueued → drained) 5/5 runs; serve_harness battery (qwen3.5:9b) 5/5
+  turns, empty=0, attractor=0; CPU suites runtime 821 / loader 106 / qwen35
+  424 / qwen2 8 / llama 1 / lfm2moe 2 / minimax 28 / cohere2moe 9 /
+  deepseek4 117 / dots-ocr 27; clippy (new symbols) clean; independent
+  review 0 blockers (2 majors + 3 minors, all resolved). Residual debt is
+  explicitly tracked, not waived: Qwen35 mid-constructor leaks
+  (`DeltaNetState::new_with_quant` / `Qwen35Scratch::new_with_kv_max` /
+  `PrefillBatchScratch::new_opt` / KV constructors / mid-`fulfill_manifest_gpu`
+  — same class as the EP constructor leak; deferred to the allocation-
+  tracking refactor) and `load_qwen35_pp` load-error rollback (owned by
+  GEN-001/HW-004). Cohere2Moe GPU verification remains env-gated
+  (`HIPFIRE_TEARDOWN_COHERE2MOE`). See NEXT-STEPS.md "STEP-002R" section
+  and PR #18 body for the full report. Prior recovery checkpoints:
   `/tmp/opencode/qwen35-post-second-recovery-20260727.patch`,
   `/tmp/opencode/qwen35-phase-b-20260727.patch`, and
   `/tmp/opencode/qwen35-phase-b-remediated-20260727.patch` (SHA-256
