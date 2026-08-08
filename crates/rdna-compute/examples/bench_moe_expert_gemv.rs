@@ -125,6 +125,9 @@ fn main() {
     eprintln!(
         "\n  Reference: current grouped MMQ does 40 layers in 12.631 ms at 136 GB/s effective."
     );
-    eprintln!("  Per-launch overhead is included above ({} launches per layer);", LIVE_EXPERTS * 2);
+    eprintln!(
+        "  Per-launch overhead is included above ({} launches per layer);",
+        LIVE_EXPERTS * 2
+    );
     eprintln!("  a real kernel would fuse these into 2 launches per layer.");
 }
