@@ -70,6 +70,7 @@ use crate::qwen35::{
 use crate::slot_batch::SlotBatch;
 use hip_bridge::{HipError, HipResult};
 use hipfire_dispatch::context::DispatchCtx;
+use hipfire_dispatch::families::gemv::{GemvFamily, RotateInputs};
 use hipfire_dispatch::pipeline::{execute_steps, GemvInput, Step};
 use hipfire_dispatch::types::KernelKey;
 use hipfire_runtime::llama::{
@@ -1830,6 +1831,85 @@ fn final_logits_per_slot(
     // only the WMMA gap left n_slots=2 failing at ~4.4x tolerance — the same
     // residual root-cause-#2 numbers SP3 first saw at n_slots=1 before this
     // exact fix.
+    // ── x-batched fast path ──────────────────────────────────────────────
+    // The loop below is the last per-slot-serialised op in this file:
+    // everything else is one launch across all rows. Each iteration re-reads
+    // the whole lm_head weight matrix (270 MiB at vocab 248320 x dim 2048,
+    // MQ4G256), so a 4-slot decode step reads it four times for four
+    // different activation vectors.
+    //
+    // `gemv_hfq4g256_xbatch` reads it once and dots it against all B vectors.
+    // It is bitwise identical to running the single-vector GEMV B times --
+    // gated by `test_gemv_hfq4g256_xbatch`, which checks against the actual
+    // hand-tuned gfx1151 lm_head kernel this shape selects, not a generic
+    // stand-in. Measured there at M=248320 K=2048:
+    //
+    //   B=1 1.265 -> 1.312 ms (0.96x)   B=3 3.973 -> 1.457 ms (2.73x)
+    //   B=2 2.576 -> 1.325 ms (1.94x)   B=4 5.104 -> 1.868 ms (2.73x)
+    //
+    // B=1 is a small loss, hence the `>= 2` gate: one slot keeps the tuned
+    // single-vector kernel untouched.
+    //
+    // Only the GEMV is batched. The rmsnorm and the FWHT rotation stay
+    // exactly as the per-slot path runs them -- same `rmsnorm_f32`, same
+    // `GemvFamily::rotate` with `RotateInputs::default()`, which is what
+    // `Step::Gemv { input: Raw }` does internally and is what carries the
+    // weight's AWQ sidecar. They are ~8 KiB of work per slot; the 270 MiB
+    // weight pass is the whole cost, and reproducing their numerics exactly
+    // is worth more than batching them.
+    //
+    // Requires every slot active so batch row `b` IS slot `b` and the kernel
+    // writes straight into `logits_out` with no scatter. That holds on every
+    // decode step, which is the only place this matters.
+    let all_active = batch.m_per_slot.iter().all(|&m| m > 0);
+    if matches!(weights.output.gpu_dtype, DType::MQ4G256)
+        && all_active
+        && (2..=Gpu::HFQ4G256_XBATCH_MAX).contains(&n_slots)
+        && pbs.x_rot_batch.numel() >= n_slots * dim
+    {
+        let dim_row_bytes = dim * 4;
+        let wr = weights.output.dispatch_ref();
+        let family = GemvFamily::new();
+        let mut row_off = 0usize;
+        for (slot, &m) in batch.m_per_slot.iter().enumerate() {
+            let last_row = row_off + m - 1;
+            gpu.memcpy_dtod_at_auto(
+                &s.x.buf,
+                0,
+                &pbs.x_batch.buf,
+                last_row * dim_row_bytes,
+                dim_row_bytes,
+            )?;
+            gpu.rmsnorm_f32(&s.x, &weights.output_norm, &s.tmp, config.norm_eps)?;
+            let ctx = DispatchCtx::new(gpu);
+            let rot = family
+                .rotate(&ctx, gpu, &wr, &s.tmp, &RotateInputs::default())
+                .map_err(|e| HipError::new(0, &e.to_string()))?;
+            // `rotate` hands back an alias of a single shared scratch buffer,
+            // so each slot's result must be copied out before the next
+            // iteration overwrites it.
+            gpu.memcpy_dtod_at_auto(
+                &pbs.x_rot_batch.buf,
+                slot * dim_row_bytes,
+                &rot.buf().buf,
+                0,
+                dim_row_bytes,
+            )?;
+            row_off += m;
+        }
+        debug_assert_eq!(row_off, batch.total_rows());
+        let x_rot_all = pbs.x_rot_batch.sub_offset(0, n_slots * dim);
+        gpu.gemv_hfq4g256_xbatch(
+            wr.buf,
+            &x_rot_all,
+            logits_out,
+            config.vocab_size,
+            dim,
+            n_slots,
+        )?;
+        return Ok(());
+    }
+
     let mut row_off = 0usize;
     for (slot, &m) in batch.m_per_slot.iter().enumerate() {
         if m > 0 {

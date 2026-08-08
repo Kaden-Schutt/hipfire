@@ -1235,6 +1235,24 @@ pub const GEMV_HFQ4G256_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4
 /// gfx1151 LM-head one-row candidate. Keep wave-uniform HFQ headers on scalar
 /// loads, lower lane-divergent packed weights to temporal VMEM, and specialize
 /// the hot 248320x2048 shape so the compiler removes dynamic tail control.
+/// x-batched HFQ4-G256 GEMV: one weight pass, B activation vectors. Used by
+/// the multi-slot decode path for the lm_head, where every slot dots the same
+/// 270 MB weight matrix against its own hidden state. `K2048` is set because
+/// that is the lm_head shape this is built for; the kernel still reads K at
+/// runtime for the non-specialised case.
+///
+/// Deliberately does NOT set the weight-buffer-load / cache-policy defines the
+/// single-vector gfx1151 lm_head variant uses: those tune a pass that reads
+/// weights once per x, and this kernel's premise is that the weight pass is
+/// amortised over B.
+pub const GEMV_HFQ4G256_XBATCH_SRC: &str = concat!(
+    "#define HIPFIRE_HFQ4G256_XBATCH 1\n",
+    "#define HIPFIRE_HFQ4G256_XBATCH_MAX 4\n",
+    "#define HIPFIRE_HFQ4G256_K2048 1\n",
+    "#define HIPFIRE_HFQ4G256_XBATCH_KERNEL gemv_hfq4g256_xbatch\n",
+    include_str!("../../../kernels/src/gemv_hfq4g256.hip")
+);
+
 pub const GEMV_HFQ4G256_LM_HEAD_R1_HYBRID_BUFFER_GFX1151_SRC: &str = concat!(
     "#define HIPFIRE_WEIGHT_BUFFER_LOADS_OPT_IN 1\n",
     "#define HIPFIRE_WEIGHT_CPOL_AUX 0\n",

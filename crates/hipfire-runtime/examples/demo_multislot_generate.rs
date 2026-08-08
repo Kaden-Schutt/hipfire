@@ -120,6 +120,15 @@ fn main() {
         .filter(|t| **t == LayerType::LinearAttention)
         .count();
     let per_pos_bytes = config.n_kv_heads * (config.head_dim / 32) * 34; // Q8_0 K and V, same stride
+    println!(
+        "  config: dim={} n_heads={} n_kv_heads={} head_dim={} vocab={} lm_head_dtype={:?}",
+        config.dim,
+        config.n_heads,
+        config.n_kv_heads,
+        config.head_dim,
+        config.vocab_size,
+        "(see loader)",
+    );
 
     // TARGET_PROMPT_TOKENS repeats each base prompt until it encodes to at
     // least that many tokens. The default (0) leaves the short built-in

@@ -2213,9 +2213,7 @@ impl Gpu {
             return self.fused_rmsnorm_rotate_mq_split_gfx1100(x, weight, x_rot, k, eps);
         }
         if self.arch_caps.is_gfx1100() && self.flags.rdna3_rmsnorm_wavegrid && k == 2048 {
-            return self.fused_rmsnorm_rotate_mq_wavegrid_gfx1100(
-                x, weight, x_rot, k, eps,
-            );
+            return self.fused_rmsnorm_rotate_mq_wavegrid_gfx1100(x, weight, x_rot, k, eps);
         }
         let gfx1151_radiowave_fusions = self.arch_caps.is_gfx1151();
         let vecsum = k == 2048
@@ -2444,25 +2442,18 @@ impl Gpu {
 
         let bytes = k * 4 * 3 + 2 * 256 * 4;
         let timer = crate::profile::begin_timer(&self.hip, "fused", KERNEL, bytes);
-        let result = self.launch_maybe_blob(
-            KERNEL,
-            [8, 1, 1],
-            [32, 1, 1],
-            0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(xp);
-                b.push_ptr(wp);
-                b.push_ptr(s1);
-                b.push_ptr(s2);
-                b.push_ptr(xrp);
-                b.push_ptr(scratch);
-                b.push_i32(kv);
-                b.push_f32(eps_v);
-                b
-            },
-        );
+        let result = self.launch_maybe_blob(KERNEL, [8, 1, 1], [32, 1, 1], 0, &mut params, || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(xp);
+            b.push_ptr(wp);
+            b.push_ptr(s1);
+            b.push_ptr(s2);
+            b.push_ptr(xrp);
+            b.push_ptr(scratch);
+            b.push_i32(kv);
+            b.push_f32(eps_v);
+            b
+        });
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
@@ -4976,6 +4967,72 @@ impl Gpu {
         }
     }
 
+    /// Largest `batch` `gemv_hfq4g256_xbatch` accepts. Must stay in step with
+    /// `HIPFIRE_HFQ4G256_XBATCH_MAX` in `GEMV_HFQ4G256_XBATCH_SRC`, which sizes
+    /// the kernel's accumulator arrays.
+    pub const HFQ4G256_XBATCH_MAX: usize = 4;
+
+    /// x-batched HFQ4-G256 GEMV: `y[b][row] = A[row] . x[b]` for b in 0..batch,
+    /// reading each weight row ONCE instead of once per b.
+    ///
+    /// `x_rot` is `[batch x k]` and `y` is `[batch x m]`, both row-major and
+    /// f32. For MQ4G256 the caller must have rotated every row already (the
+    /// weights are FWHT-rotated HFQ4-G256).
+    ///
+    /// `batch` must not exceed `HFQ4G256_XBATCH_MAX`; the kernel's accumulator
+    /// arrays are that size. Callers with more rows should chunk.
+    pub fn gemv_hfq4g256_xbatch(
+        &mut self,
+        a_raw: &GpuTensor,
+        x_rot: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch: usize,
+    ) -> HipResult<()> {
+        assert!(
+            batch >= 1 && batch <= Self::HFQ4G256_XBATCH_MAX,
+            "gemv_hfq4g256_xbatch: batch {batch} outside 1..={}",
+            Self::HFQ4G256_XBATCH_MAX
+        );
+        assert_eq!(
+            k % 256,
+            0,
+            "gemv_hfq4g256_xbatch: k must be a multiple of 256"
+        );
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemv_hfq4g256_xbatch",
+            kernels::GEMV_HFQ4G256_XBATCH_SRC,
+            "gemv_hfq4g256_xbatch",
+        )?;
+        let func = &self.functions["gemv_hfq4g256_xbatch"];
+        let a_ptr = a_raw.buf.as_ptr();
+        let x_ptr = x_rot.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let b_val = batch as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &a_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &y_ptr as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+            &b_val as *const _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [m as u32, 1, 1],
+                [32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     /// HFQ4-G256 GEMV: flat 4-bit with 256-weight groups. K must be multiple of 256.
     pub fn gemv_hfq4g256(
         &mut self,
@@ -4994,9 +5051,8 @@ impl Gpu {
             && *GFX1151_LM_HEAD_DOT2.get_or_init(|| {
                 hipfire_config::developer_var("HIPFIRE_GFX1151_LM_HEAD_DOT2").as_deref() == Ok("1")
             });
-        let gfx1151_lm_head_r1_hybrid_buffer = self.arch_caps.is_gfx1151()
-            && m == 248_320
-            && k == 2_048;
+        let gfx1151_lm_head_r1_hybrid_buffer =
+            self.arch_caps.is_gfx1151() && m == 248_320 && k == 2_048;
         let use_lm_head_k2048 = self.arch_caps.is_gfx1100()
             && self.flags.rdna3_hfq4_lm_head_k2048
             && m == 248_320
@@ -5062,16 +5118,15 @@ impl Gpu {
         // the per-arch defaults.
         let rdna3 = self.arch_caps.is_rdna3_dgpu();
         let rows = self.arch_caps.gemv_rows_default();
-        let use_multirow = rows > 1
-            && !gfx1151_lm_head_dot2
-            && !gfx1151_lm_head_r1_hybrid_buffer;
+        let use_multirow = rows > 1 && !gfx1151_lm_head_dot2 && !gfx1151_lm_head_r1_hybrid_buffer;
         static GFX1151_LM_HEAD_BUFFER: OnceLock<bool> = OnceLock::new();
         let gfx1151_lm_head_buffer = self.arch_caps.is_gfx1151()
             && rows == 2
             && m == 248_320
             && k == 2_048
             && *GFX1151_LM_HEAD_BUFFER.get_or_init(|| {
-                hipfire_config::developer_var("HIPFIRE_GFX1151_LM_HEAD_BUFFER").as_deref() == Ok("1")
+                hipfire_config::developer_var("HIPFIRE_GFX1151_LM_HEAD_BUFFER").as_deref()
+                    == Ok("1")
             });
         static GFX1151_LM_HEAD_HYBRID_BUFFER: OnceLock<bool> = OnceLock::new();
         let gfx1151_lm_head_hybrid_buffer = self.arch_caps.is_gfx1151()
@@ -5079,7 +5134,8 @@ impl Gpu {
             && m == 248_320
             && k == 2_048
             && *GFX1151_LM_HEAD_HYBRID_BUFFER.get_or_init(|| {
-                hipfire_config::developer_var("HIPFIRE_GFX1151_LM_HEAD_HYBRID_BUFFER").as_deref() == Ok("1")
+                hipfire_config::developer_var("HIPFIRE_GFX1151_LM_HEAD_HYBRID_BUFFER").as_deref()
+                    == Ok("1")
             });
         static GFX1151_LM_HEAD_ALL_BUFFER: OnceLock<bool> = OnceLock::new();
         let gfx1151_lm_head_all_buffer = self.arch_caps.is_gfx1151()
@@ -5087,20 +5143,20 @@ impl Gpu {
             && m == 248_320
             && k == 2_048
             && *GFX1151_LM_HEAD_ALL_BUFFER.get_or_init(|| {
-                hipfire_config::developer_var("HIPFIRE_GFX1151_LM_HEAD_ALL_BUFFER").as_deref() == Ok("1")
+                hipfire_config::developer_var("HIPFIRE_GFX1151_LM_HEAD_ALL_BUFFER").as_deref()
+                    == Ok("1")
             });
         static GFX1151_LM_HEAD_CPOL: OnceLock<Option<String>> = OnceLock::new();
-        let gfx1151_lm_head_cpol = if self.arch_caps.is_gfx1151()
-            && rows == 2
-            && m == 248_320
-            && k == 2_048
-        {
-            GFX1151_LM_HEAD_CPOL
-                .get_or_init(|| hipfire_config::developer_var("HIPFIRE_GFX1151_LM_HEAD_CPOL").ok())
-                .as_deref()
-        } else {
-            None
-        };
+        let gfx1151_lm_head_cpol =
+            if self.arch_caps.is_gfx1151() && rows == 2 && m == 248_320 && k == 2_048 {
+                GFX1151_LM_HEAD_CPOL
+                    .get_or_init(|| {
+                        hipfire_config::developer_var("HIPFIRE_GFX1151_LM_HEAD_CPOL").ok()
+                    })
+                    .as_deref()
+            } else {
+                None
+            };
         static GFX1151_LM_HEAD_K2048: OnceLock<bool> = OnceLock::new();
         let gfx1151_lm_head_k2048 = self.arch_caps.is_gfx1151()
             && rows == 2
@@ -5241,12 +5297,14 @@ impl Gpu {
                 // Keep residual separate from the combined gfx1151 probe:
                 // LLVM spills this dual-row raw-buffer schedule (private=16),
                 // which is not admissible for the scratch-free PM4 replay.
-                hipfire_config::developer_var("HIPFIRE_GFX1151_WEIGHT_BUFFER_RESIDUAL").as_deref() == Ok("1")
+                hipfire_config::developer_var("HIPFIRE_GFX1151_WEIGHT_BUFFER_RESIDUAL").as_deref()
+                    == Ok("1")
             });
         static GFX1151_RESIDUAL_HYBRID_BUFFER: OnceLock<bool> = OnceLock::new();
         let gfx1151_hybrid_buffer = self.arch_caps.is_gfx1151()
             && *GFX1151_RESIDUAL_HYBRID_BUFFER.get_or_init(|| {
-                hipfire_config::developer_var("HIPFIRE_GFX1151_RESIDUAL_HYBRID_BUFFER").as_deref() == Ok("1")
+                hipfire_config::developer_var("HIPFIRE_GFX1151_RESIDUAL_HYBRID_BUFFER").as_deref()
+                    == Ok("1")
             });
         let gfx1151_rt_low = self.arch_caps.is_gfx1151();
         static GFX1151_RESIDUAL_ROW1: OnceLock<bool> = OnceLock::new();
@@ -5259,15 +5317,14 @@ impl Gpu {
             && m == 2_048
             && k == 4_096
             && *GFX1151_RESIDUAL_K4096.get_or_init(|| {
-                hipfire_config::developer_var("HIPFIRE_GFX1151_RESIDUAL_K4096").as_deref() == Ok("1")
+                hipfire_config::developer_var("HIPFIRE_GFX1151_RESIDUAL_K4096").as_deref()
+                    == Ok("1")
             });
         static RESIDUAL_CPOL: OnceLock<Option<String>> = OnceLock::new();
         let cpol = RESIDUAL_CPOL
             .get_or_init(|| hipfire_config::developer_var("HIPFIRE_RESIDUAL_CPOL").ok())
             .as_deref();
-        let cpol = if self.arch_caps.is_gfx1100()
-            && self.flags.rdna3_hfq4_residual_stage_x32
-        {
+        let cpol = if self.arch_caps.is_gfx1100() && self.flags.rdna3_hfq4_residual_stage_x32 {
             cpol
         } else {
             None
@@ -5358,19 +5415,22 @@ impl Gpu {
         static GFX1151_RESIDUAL_WAVE64: OnceLock<bool> = OnceLock::new();
         let gfx1151_wave64 = self.arch_caps.is_gfx1151()
             && *GFX1151_RESIDUAL_WAVE64.get_or_init(|| {
-                hipfire_config::developer_var("HIPFIRE_GFX1151_RESIDUAL_WAVE64").as_deref() == Ok("1")
+                hipfire_config::developer_var("HIPFIRE_GFX1151_RESIDUAL_WAVE64").as_deref()
+                    == Ok("1")
             });
         static GFX1151_RESIDUAL_TIGHT_GRID: OnceLock<bool> = OnceLock::new();
         let gfx1151_tight_grid = self.arch_caps.is_gfx1151()
             && *GFX1151_RESIDUAL_TIGHT_GRID.get_or_init(|| {
-                hipfire_config::developer_var("HIPFIRE_GFX1151_RESIDUAL_TIGHT_GRID").as_deref() == Ok("1")
+                hipfire_config::developer_var("HIPFIRE_GFX1151_RESIDUAL_TIGHT_GRID").as_deref()
+                    == Ok("1")
             });
         static GFX1151_RESIDUAL_MULTIROW_R2: OnceLock<bool> = OnceLock::new();
         let gfx1151_multirow_r2 = self.arch_caps.is_gfx1151()
             && m == 2_048
             && k == 2_048
             && *GFX1151_RESIDUAL_MULTIROW_R2.get_or_init(|| {
-                hipfire_config::developer_var("HIPFIRE_GFX1151_RESIDUAL_MULTIROW_R2").as_deref() == Ok("1")
+                hipfire_config::developer_var("HIPFIRE_GFX1151_RESIDUAL_MULTIROW_R2").as_deref()
+                    == Ok("1")
             });
         let cdna3 = self.arch_caps.is_wave64_native() || gfx1151_wave64;
 
@@ -5519,22 +5579,15 @@ impl Gpu {
             } else {
                 m as u32
             };
-            self.launch_maybe_blob(
-                func_name,
-                [grid, 1, 1],
-                [32, 1, 1],
-                0,
-                &mut params,
-                || {
-                    let mut b = hip_bridge::KernargBlob::new();
-                    b.push_ptr(a_ptr);
-                    b.push_ptr(x_ptr);
-                    b.push_ptr(y_ptr);
-                    b.push_i32(m_val);
-                    b.push_i32(k_val);
-                    b
-                },
-            )
+            self.launch_maybe_blob(func_name, [grid, 1, 1], [32, 1, 1], 0, &mut params, || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b
+            })
         };
         if let Some(t) = timer {
             t.finish(&self.hip);
@@ -5686,18 +5739,18 @@ impl Gpu {
         k: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let rdna3_rows4 = self.arch_caps.is_rdna3_dgpu()
-            && self.flags.rdna3_hfq4_sigmoid_rows4;
-        let rdna3_buffer = self.arch_caps.is_rdna3_dgpu()
-            && self.flags.rdna3_hfq4_sigmoid_buffer;
+        let rdna3_rows4 = self.arch_caps.is_rdna3_dgpu() && self.flags.rdna3_hfq4_sigmoid_rows4;
+        let rdna3_buffer = self.arch_caps.is_rdna3_dgpu() && self.flags.rdna3_hfq4_sigmoid_buffer;
         use std::sync::OnceLock;
         static GFX1151_WEIGHT_BUFFER_LOADS: OnceLock<bool> = OnceLock::new();
         let gfx1151_k512_buffer = self.arch_caps.is_gfx1151()
             && m == 2_048
             && k == 512
             && *GFX1151_WEIGHT_BUFFER_LOADS.get_or_init(|| {
-                hipfire_config::developer_var("HIPFIRE_GFX1151_WEIGHT_BUFFER_LOADS").as_deref() == Ok("1")
-                    || hipfire_config::developer_var("HIPFIRE_GFX1151_WEIGHT_BUFFER_SIGMOID").as_deref()
+                hipfire_config::developer_var("HIPFIRE_GFX1151_WEIGHT_BUFFER_LOADS").as_deref()
+                    == Ok("1")
+                    || hipfire_config::developer_var("HIPFIRE_GFX1151_WEIGHT_BUFFER_SIGMOID")
+                        .as_deref()
                         == Ok("1")
             });
         static SIGMOID_K512: OnceLock<bool> = OnceLock::new();
@@ -5708,7 +5761,8 @@ impl Gpu {
             && m == 2_048
             && k == 512
             && *SIGMOID_HOIST_X16.get_or_init(|| {
-                hipfire_config::developer_var("HIPFIRE_RDNA3_HFQ4_SIGMOID_HOIST_X16").as_deref() == Ok("1")
+                hipfire_config::developer_var("HIPFIRE_RDNA3_HFQ4_SIGMOID_HOIST_X16").as_deref()
+                    == Ok("1")
             });
         let rdna3_k512 = self.arch_caps.is_gfx1100()
             && rdna3_buffer
@@ -5716,7 +5770,8 @@ impl Gpu {
             && m == 2_048
             && k == 512
             && *SIGMOID_K512.get_or_init(|| {
-                hipfire_config::developer_var("HIPFIRE_RDNA3_HFQ4_SIGMOID_K512").as_deref() == Ok("1")
+                hipfire_config::developer_var("HIPFIRE_RDNA3_HFQ4_SIGMOID_K512").as_deref()
+                    == Ok("1")
             });
         let (module, source) = if rdna3_hoist_x16 {
             (
@@ -5754,11 +5809,7 @@ impl Gpu {
                 kernels::GEMV_HFQ4G256_RESIDUAL_SCALED_SRC,
             )
         };
-        self.ensure_kernel(
-            module,
-            source,
-            "gemv_hfq4g256_residual_sigmoid_scaled_gpu",
-        )?;
+        self.ensure_kernel(module, source, "gemv_hfq4g256_residual_sigmoid_scaled_gpu")?;
         let a_ptr = a_raw.buf.as_ptr();
         let x_ptr = x.buf.as_ptr();
         let y_ptr = y.buf.as_ptr();
@@ -5782,9 +5833,7 @@ impl Gpu {
         );
         let grid_m = if rdna3_rows4 {
             m.div_ceil(4)
-        } else if self.arch_caps.is_rdna3_dgpu()
-            && self.flags.rdna3_hfq4_sigmoid_tight_grid
-        {
+        } else if self.arch_caps.is_rdna3_dgpu() && self.flags.rdna3_hfq4_sigmoid_tight_grid {
             m.div_ceil(2)
         } else {
             m
@@ -6370,11 +6419,7 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         let name = "moe_router_softmax_topk_k8_wave64";
-        self.ensure_kernel(
-            name,
-            kernels::MOE_ROUTER_SOFTMAX_TOPK_K8_WAVE64_SRC,
-            name,
-        )?;
+        self.ensure_kernel(name, kernels::MOE_ROUTER_SOFTMAX_TOPK_K8_WAVE64_SRC, name)?;
         let lp = logits.buf.as_ptr();
         let ip = topk_idx.buf.as_ptr();
         let wp = topk_w.buf.as_ptr();
@@ -6387,22 +6432,15 @@ impl Gpu {
             &n as *const _ as *mut c_void,
             &nr as *const _ as *mut c_void,
         ];
-        self.launch_maybe_blob(
-            name,
-            [1, 1, 1],
-            [64, 1, 1],
-            0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(lp);
-                b.push_ptr(ip);
-                b.push_ptr(wp);
-                b.push_i32(n);
-                b.push_i32(nr);
-                b
-            },
-        )
+        self.launch_maybe_blob(name, [1, 1, 1], [64, 1, 1], 0, &mut params, || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(lp);
+            b.push_ptr(ip);
+            b.push_ptr(wp);
+            b.push_i32(n);
+            b.push_i32(nr);
+            b
+        })
     }
 
     /// gfx1100 wave64 fused router which emulates the production 256-thread
@@ -6435,22 +6473,15 @@ impl Gpu {
             &n as *const _ as *mut c_void,
             &nr as *const _ as *mut c_void,
         ];
-        self.launch_maybe_blob(
-            name,
-            [1, 1, 1],
-            [64, 1, 1],
-            0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(lp);
-                b.push_ptr(ip);
-                b.push_ptr(wp);
-                b.push_i32(n);
-                b.push_i32(nr);
-                b
-            },
-        )
+        self.launch_maybe_blob(name, [1, 1, 1], [64, 1, 1], 0, &mut params, || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(lp);
+            b.push_ptr(ip);
+            b.push_ptr(wp);
+            b.push_i32(n);
+            b.push_i32(nr);
+            b
+        })
     }
 
     /// gfx1100 heterogeneous dispatch for the two independent operations
@@ -6860,14 +6891,16 @@ impl Gpu {
             && k == 2_048
             && n_ranks == 8
             && *GFX1151_GATE_UP_PERSISTENT_RANK8.get_or_init(|| {
-                hipfire_config::developer_var("HIPFIRE_GFX1151_GATE_UP_PERSISTENT_RANK8").as_deref() == Ok("1")
+                hipfire_config::developer_var("HIPFIRE_GFX1151_GATE_UP_PERSISTENT_RANK8").as_deref()
+                    == Ok("1")
             });
         static GFX1151_GATE_UP_PAIRED_WAVES: OnceLock<bool> = OnceLock::new();
         let gfx1151_paired_waves = !gfx1151_persistent_rank8
             && self.arch_caps.is_gfx1151()
             && k == 2_048
             && *GFX1151_GATE_UP_PAIRED_WAVES.get_or_init(|| {
-                hipfire_config::developer_var("HIPFIRE_GFX1151_GATE_UP_PAIRED_WAVES").as_deref() == Ok("1")
+                hipfire_config::developer_var("HIPFIRE_GFX1151_GATE_UP_PAIRED_WAVES").as_deref()
+                    == Ok("1")
             });
         static GFX1151_GATE_UP_SPLIT: OnceLock<bool> = OnceLock::new();
         let gfx1151_split = self.arch_caps.is_gfx1151()
@@ -6892,7 +6925,8 @@ impl Gpu {
             && !gfx1151_paired_waves
             && self.arch_caps.is_gfx1151()
             && *GFX1151_GATE_UP_WAVE64.get_or_init(|| {
-                hipfire_config::developer_var("HIPFIRE_GFX1151_GATE_UP_WAVE64").as_deref() == Ok("1")
+                hipfire_config::developer_var("HIPFIRE_GFX1151_GATE_UP_WAVE64").as_deref()
+                    == Ok("1")
             });
         let cdna_wave64 = self.arch_caps.is_wave64_native() || gfx1151_wave64;
         let (func_name, block, grid_x) = if cdna_wave64 {
@@ -6932,7 +6966,8 @@ impl Gpu {
             static GATE_UP_TIGHT_GRID: OnceLock<bool> = OnceLock::new();
             let tight_grid = if self.arch_caps.is_gfx1100() {
                 *GATE_UP_TIGHT_GRID.get_or_init(|| {
-                    hipfire_config::developer_var("HIPFIRE_MOE_GATE_UP_TIGHT_GRID").as_deref() != Ok("0")
+                    hipfire_config::developer_var("HIPFIRE_MOE_GATE_UP_TIGHT_GRID").as_deref()
+                        != Ok("0")
                 })
             } else if self.arch_caps.is_gfx1151() {
                 // gfx1151 keeps its own performance-admission gate. The
@@ -6941,8 +6976,10 @@ impl Gpu {
                 // explicit gfx1151 experiment before making it that arch's
                 // default. Do not let the gfx1100 default bleed through a
                 // shared RDNA3 capability predicate.
-                hipfire_config::developer_var("HIPFIRE_GFX1151_MOE_TIGHT_GRID").as_deref() == Ok("1")
-                    || hipfire_config::developer_var("HIPFIRE_GFX1151_GATE_UP_TIGHT_GRID").as_deref()
+                hipfire_config::developer_var("HIPFIRE_GFX1151_MOE_TIGHT_GRID").as_deref()
+                    == Ok("1")
+                    || hipfire_config::developer_var("HIPFIRE_GFX1151_GATE_UP_TIGHT_GRID")
+                        .as_deref()
                         == Ok("1")
             } else {
                 false
@@ -6955,23 +6992,27 @@ impl Gpu {
             // Token-id exact vs base (per-row math unchanged). Grid divisor here
             // MUST match the kernel's MOE_GATE_UP_NUM_ROWS.
             static GATE_UP_FUSED: OnceLock<bool> = OnceLock::new();
-            let fused = *GATE_UP_FUSED
-                .get_or_init(|| hipfire_config::developer_var("HIPFIRE_MOE_GATE_UP_FUSED").as_deref() == Ok("1"));
+            let fused = *GATE_UP_FUSED.get_or_init(|| {
+                hipfire_config::developer_var("HIPFIRE_MOE_GATE_UP_FUSED").as_deref() == Ok("1")
+            });
             static GATE_UP_RANK_INTERLEAVE: OnceLock<bool> = OnceLock::new();
             let rank_interleave = self.arch_caps.is_gfx1100()
                 && n_ranks == 8
                 && *GATE_UP_RANK_INTERLEAVE.get_or_init(|| {
-                    hipfire_config::developer_var("HIPFIRE_MOE_GATE_UP_RANK_INTERLEAVE").as_deref() == Ok("1")
+                    hipfire_config::developer_var("HIPFIRE_MOE_GATE_UP_RANK_INTERLEAVE").as_deref()
+                        == Ok("1")
                 });
             static GATE_UP_LOW_VGPR: OnceLock<bool> = OnceLock::new();
             let low_vgpr = self.arch_caps.is_gfx1100()
                 && *GATE_UP_LOW_VGPR.get_or_init(|| {
-                    hipfire_config::developer_var("HIPFIRE_MOE_GATE_UP_LOW_VGPR").as_deref() == Ok("1")
+                    hipfire_config::developer_var("HIPFIRE_MOE_GATE_UP_LOW_VGPR").as_deref()
+                        == Ok("1")
                 });
             static GATE_UP_PAIR_VGPR: OnceLock<bool> = OnceLock::new();
             let pair_vgpr = self.arch_caps.is_gfx1100()
                 && *GATE_UP_PAIR_VGPR.get_or_init(|| {
-                    hipfire_config::developer_var("HIPFIRE_MOE_GATE_UP_PAIR_VGPR").as_deref() == Ok("1")
+                    hipfire_config::developer_var("HIPFIRE_MOE_GATE_UP_PAIR_VGPR").as_deref()
+                        == Ok("1")
                 });
             static GATE_UP_CPOL: OnceLock<String> = OnceLock::new();
             let cpol = if self.arch_caps.is_gfx1100() {
@@ -6996,58 +7037,69 @@ impl Gpu {
             let gfx1151_k2048 = self.arch_caps.is_gfx1151()
                 && k == 2_048
                 && *GFX1151_GATE_UP_K2048.get_or_init(|| {
-                    hipfire_config::developer_var("HIPFIRE_GFX1151_GATE_UP_K2048").as_deref() == Ok("1")
+                    hipfire_config::developer_var("HIPFIRE_GFX1151_GATE_UP_K2048").as_deref()
+                        == Ok("1")
                 });
             static GFX1151_GATE_UP_LOW_VGPR: OnceLock<bool> = OnceLock::new();
             let gfx1151_low_vgpr = self.arch_caps.is_gfx1151()
                 && k == 2_048
                 && *GFX1151_GATE_UP_LOW_VGPR.get_or_init(|| {
-                    hipfire_config::developer_var("HIPFIRE_GFX1151_GATE_UP_LOW_VGPR").as_deref() == Ok("1")
+                    hipfire_config::developer_var("HIPFIRE_GFX1151_GATE_UP_LOW_VGPR").as_deref()
+                        == Ok("1")
                 });
             static GFX1151_GATE_UP_PAIR_VGPR: OnceLock<bool> = OnceLock::new();
             let gfx1151_pair_vgpr = self.arch_caps.is_gfx1151()
                 && k == 2_048
                 && *GFX1151_GATE_UP_PAIR_VGPR.get_or_init(|| {
-                    hipfire_config::developer_var("HIPFIRE_GFX1151_GATE_UP_PAIR_VGPR").as_deref() == Ok("1")
+                    hipfire_config::developer_var("HIPFIRE_GFX1151_GATE_UP_PAIR_VGPR").as_deref()
+                        == Ok("1")
                 });
             static GFX1151_GATE_UP_PAIR_BUFFER: OnceLock<bool> = OnceLock::new();
             let gfx1151_pair_buffer = self.arch_caps.is_gfx1151()
                 && k == 2_048
                 && *GFX1151_GATE_UP_PAIR_BUFFER.get_or_init(|| {
-                    hipfire_config::developer_var("HIPFIRE_GFX1151_GATE_UP_PAIR_BUFFER").as_deref() == Ok("1")
+                    hipfire_config::developer_var("HIPFIRE_GFX1151_GATE_UP_PAIR_BUFFER").as_deref()
+                        == Ok("1")
                 });
             static GFX1151_GATE_UP_HYBRID_BUFFER: OnceLock<bool> = OnceLock::new();
             let gfx1151_hybrid_buffer = self.arch_caps.is_gfx1151()
                 && k == 2_048
                 && *GFX1151_GATE_UP_HYBRID_BUFFER.get_or_init(|| {
-                    hipfire_config::developer_var("HIPFIRE_GFX1151_GATE_UP_HYBRID_BUFFER").as_deref() == Ok("1")
+                    hipfire_config::developer_var("HIPFIRE_GFX1151_GATE_UP_HYBRID_BUFFER")
+                        .as_deref()
+                        == Ok("1")
                 });
             static GFX1151_WEIGHT_BUFFER_LOADS: OnceLock<bool> = OnceLock::new();
             let gfx1151_k2048_buffer = self.arch_caps.is_gfx1151()
                 && k == 2_048
                 && *GFX1151_WEIGHT_BUFFER_LOADS.get_or_init(|| {
-                    hipfire_config::developer_var("HIPFIRE_GFX1151_WEIGHT_BUFFER_LOADS").as_deref() == Ok("1")
-                        || hipfire_config::developer_var("HIPFIRE_GFX1151_WEIGHT_BUFFER_GATE_UP").as_deref()
+                    hipfire_config::developer_var("HIPFIRE_GFX1151_WEIGHT_BUFFER_LOADS").as_deref()
+                        == Ok("1")
+                        || hipfire_config::developer_var("HIPFIRE_GFX1151_WEIGHT_BUFFER_GATE_UP")
+                            .as_deref()
                             == Ok("1")
                 });
             static GFX1151_GATE_UP_ALL_BUFFER: OnceLock<bool> = OnceLock::new();
             let gfx1151_all_buffer = self.arch_caps.is_gfx1151()
                 && k == 2_048
                 && *GFX1151_GATE_UP_ALL_BUFFER.get_or_init(|| {
-                    hipfire_config::developer_var("HIPFIRE_GFX1151_GATE_UP_ALL_BUFFER").as_deref() == Ok("1")
+                    hipfire_config::developer_var("HIPFIRE_GFX1151_GATE_UP_ALL_BUFFER").as_deref()
+                        == Ok("1")
                 });
             static GFX1151_GATE_UP_ROUTE_ALL_BUFFER: OnceLock<bool> = OnceLock::new();
             let gfx1151_route_all_buffer = self.arch_caps.is_gfx1151()
                 && k == 2_048
                 && *GFX1151_GATE_UP_ROUTE_ALL_BUFFER.get_or_init(|| {
-                    hipfire_config::developer_var("HIPFIRE_GFX1151_GATE_UP_ROUTE_ALL_BUFFER").as_deref()
+                    hipfire_config::developer_var("HIPFIRE_GFX1151_GATE_UP_ROUTE_ALL_BUFFER")
+                        .as_deref()
                         == Ok("1")
                 });
             static GFX1151_GATE_UP_PAIR_ALL_BUFFER: OnceLock<bool> = OnceLock::new();
             let gfx1151_pair_all_buffer = self.arch_caps.is_gfx1151()
                 && k == 2_048
                 && *GFX1151_GATE_UP_PAIR_ALL_BUFFER.get_or_init(|| {
-                    hipfire_config::developer_var("HIPFIRE_GFX1151_GATE_UP_PAIR_ALL_BUFFER").as_deref()
+                    hipfire_config::developer_var("HIPFIRE_GFX1151_GATE_UP_PAIR_ALL_BUFFER")
+                        .as_deref()
                         == Ok("1")
                 });
             if gfx1151_persistent_rank8 {
@@ -7088,7 +7140,11 @@ impl Gpu {
                 (
                     "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_route_all_buffer_gfx1151",
                     [32u32, 1, 1],
-                    if tight_grid { (m as u32) >> 1 } else { m as u32 },
+                    if tight_grid {
+                        (m as u32) >> 1
+                    } else {
+                        m as u32
+                    },
                 )
             } else if gfx1151_pair_all_buffer {
                 self.ensure_kernel(
@@ -7099,7 +7155,11 @@ impl Gpu {
                 (
                     "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_pair_all_buffer_gfx1151",
                     [32u32, 1, 1],
-                    if tight_grid { (m as u32) >> 1 } else { m as u32 },
+                    if tight_grid {
+                        (m as u32) >> 1
+                    } else {
+                        m as u32
+                    },
                 )
             } else if gfx1151_all_buffer {
                 self.ensure_kernel(
@@ -7110,7 +7170,11 @@ impl Gpu {
                 (
                     "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_all_buffer_gfx1151",
                     [32u32, 1, 1],
-                    if tight_grid { (m as u32) >> 1 } else { m as u32 },
+                    if tight_grid {
+                        (m as u32) >> 1
+                    } else {
+                        m as u32
+                    },
                 )
             } else if gfx1151_pair_buffer {
                 self.ensure_kernel(
@@ -7121,7 +7185,11 @@ impl Gpu {
                 (
                     "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_pair_buffer_gfx1151",
                     [32u32, 1, 1],
-                    if tight_grid { (m as u32) >> 1 } else { m as u32 },
+                    if tight_grid {
+                        (m as u32) >> 1
+                    } else {
+                        m as u32
+                    },
                 )
             } else if gfx1151_low_vgpr {
                 self.ensure_kernel(
@@ -7132,7 +7200,11 @@ impl Gpu {
                 (
                     "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_low_vgpr_gfx1151",
                     [32u32, 1, 1],
-                    if tight_grid { (m as u32) >> 1 } else { m as u32 },
+                    if tight_grid {
+                        (m as u32) >> 1
+                    } else {
+                        m as u32
+                    },
                 )
             } else if gfx1151_pair_vgpr {
                 self.ensure_kernel(
@@ -7143,7 +7215,11 @@ impl Gpu {
                 (
                     "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_pair_vgpr_gfx1151",
                     [32u32, 1, 1],
-                    if tight_grid { (m as u32) >> 1 } else { m as u32 },
+                    if tight_grid {
+                        (m as u32) >> 1
+                    } else {
+                        m as u32
+                    },
                 )
             } else if gfx1151_k2048 {
                 self.ensure_kernel(
@@ -7154,7 +7230,11 @@ impl Gpu {
                 (
                     "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_gfx1151",
                     [32u32, 1, 1],
-                    if tight_grid { (m as u32) >> 1 } else { m as u32 },
+                    if tight_grid {
+                        (m as u32) >> 1
+                    } else {
+                        m as u32
+                    },
                 )
             } else if pair_vgpr {
                 self.ensure_kernel(
@@ -7937,32 +8017,39 @@ impl Gpu {
         static GFX1151_WEIGHT_BUFFER_LOADS: OnceLock<bool> = OnceLock::new();
         let gfx1151_buffer = self.arch_caps.is_gfx1151()
             && *GFX1151_WEIGHT_BUFFER_LOADS.get_or_init(|| {
-                hipfire_config::developer_var("HIPFIRE_GFX1151_WEIGHT_BUFFER_LOADS").as_deref() == Ok("1")
-                    || hipfire_config::developer_var("HIPFIRE_GFX1151_WEIGHT_BUFFER_DOWN").as_deref() == Ok("1")
+                hipfire_config::developer_var("HIPFIRE_GFX1151_WEIGHT_BUFFER_LOADS").as_deref()
+                    == Ok("1")
+                    || hipfire_config::developer_var("HIPFIRE_GFX1151_WEIGHT_BUFFER_DOWN")
+                        .as_deref()
+                        == Ok("1")
             });
         static GFX1151_DOWN_HYBRID_BUFFER: OnceLock<bool> = OnceLock::new();
         let gfx1151_hybrid_buffer = self.arch_caps.is_gfx1151()
             && k == 512
             && *GFX1151_DOWN_HYBRID_BUFFER.get_or_init(|| {
-                hipfire_config::developer_var("HIPFIRE_GFX1151_DOWN_HYBRID_BUFFER").as_deref() == Ok("1")
+                hipfire_config::developer_var("HIPFIRE_GFX1151_DOWN_HYBRID_BUFFER").as_deref()
+                    == Ok("1")
             });
         static GFX1151_DOWN_ROW1_BUFFER: OnceLock<bool> = OnceLock::new();
         let gfx1151_row1_buffer = self.arch_caps.is_gfx1151()
             && k == 512
             && *GFX1151_DOWN_ROW1_BUFFER.get_or_init(|| {
-                hipfire_config::developer_var("HIPFIRE_GFX1151_DOWN_ROW1_BUFFER").as_deref() == Ok("1")
+                hipfire_config::developer_var("HIPFIRE_GFX1151_DOWN_ROW1_BUFFER").as_deref()
+                    == Ok("1")
             });
         static GFX1151_DOWN_ROW2_BUFFER: OnceLock<bool> = OnceLock::new();
         let gfx1151_row2_buffer = self.arch_caps.is_gfx1151()
             && k == 512
             && *GFX1151_DOWN_ROW2_BUFFER.get_or_init(|| {
-                hipfire_config::developer_var("HIPFIRE_GFX1151_DOWN_ROW2_BUFFER").as_deref() == Ok("1")
+                hipfire_config::developer_var("HIPFIRE_GFX1151_DOWN_ROW2_BUFFER").as_deref()
+                    == Ok("1")
             });
         static GFX1151_DOWN_ROW2_CLUSTERED: OnceLock<bool> = OnceLock::new();
         let gfx1151_row2_clustered = self.arch_caps.is_gfx1151()
             && k == 512
             && *GFX1151_DOWN_ROW2_CLUSTERED.get_or_init(|| {
-                hipfire_config::developer_var("HIPFIRE_GFX1151_DOWN_ROW2_CLUSTERED").as_deref() == Ok("1")
+                hipfire_config::developer_var("HIPFIRE_GFX1151_DOWN_ROW2_CLUSTERED").as_deref()
+                    == Ok("1")
             });
         static GFX1151_DOWN_ROW8: OnceLock<bool> = OnceLock::new();
         let gfx1151_row8 = self.arch_caps.is_gfx1151()
@@ -8038,12 +8125,7 @@ impl Gpu {
             &kt_val as *const _ as *mut c_void,
         ];
         let bytes = batch_size * k_top * (crate::profile::gemv_hfq4g256_bytes(m, k) + m * 4);
-        let timer = crate::profile::begin_timer(
-            &self.hip,
-            "gemv",
-            func_name,
-            bytes,
-        );
+        let timer = crate::profile::begin_timer(&self.hip, "gemv", func_name, bytes);
         // The expanded kernel owns four consecutive output rows per workgroup.
         // Keep this opt-in while it is qualified on gfx1100: the legacy launch
         // used `m` workgroups, leaving three quarters to exit at the row0 guard.
@@ -8057,7 +8139,8 @@ impl Gpu {
             // measurement independent from gfx1100 even though the launch
             // contraction is semantically target-neutral.
             hipfire_config::developer_var("HIPFIRE_GFX1151_MOE_TIGHT_GRID").as_deref() == Ok("1")
-                || hipfire_config::developer_var("HIPFIRE_GFX1151_DOWN_TIGHT_GRID").as_deref() == Ok("1")
+                || hipfire_config::developer_var("HIPFIRE_GFX1151_DOWN_TIGHT_GRID").as_deref()
+                    == Ok("1")
         } else {
             false
         };
@@ -8141,12 +8224,8 @@ impl Gpu {
             &k_val as *const _ as *mut c_void,
         ];
         let bytes = 8 * crate::profile::gemv_hfq4g256_bytes(2 * mi, k) + k * 4;
-        let timer = crate::profile::begin_timer(
-            &self.hip,
-            "gemv",
-            "gemv_hfq4g256_moe_ninepath_d3",
-            bytes,
-        );
+        let timer =
+            crate::profile::begin_timer(&self.hip, "gemv", "gemv_hfq4g256_moe_ninepath_d3", bytes);
         let result = self.launch_maybe_blob(
             "gemv_hfq4g256_moe_ninepath_d3",
             [(mi as u32) / 8, 1, 1],
@@ -8209,15 +8288,10 @@ impl Gpu {
             &dm_val as *const _ as *mut c_void,
             &dk_val as *const _ as *mut c_void,
         ];
-        let bytes = 8 * crate::profile::gemv_hfq4g256_bytes(down_m, down_k)
-            + 8 * down_k * 4
-            + down_m * 4;
-        let timer = crate::profile::begin_timer(
-            &self.hip,
-            "gemv",
-            "gemv_hfq4g256_moe_ninepath_d4",
-            bytes,
-        );
+        let bytes =
+            8 * crate::profile::gemv_hfq4g256_bytes(down_m, down_k) + 8 * down_k * 4 + down_m * 4;
+        let timer =
+            crate::profile::begin_timer(&self.hip, "gemv", "gemv_hfq4g256_moe_ninepath_d4", bytes);
         let result = self.launch_maybe_blob(
             "gemv_hfq4g256_moe_ninepath_d4",
             [(down_m as u32) / 16, 1, 1],
@@ -8294,8 +8368,7 @@ impl Gpu {
         let grid_x = if self.arch_caps.is_gfx1100()
             && *DOWN_TIGHT_GRID.get_or_init(|| {
                 hipfire_config::developer_var("HIPFIRE_MOE_DOWN_TIGHT_GRID").as_deref() == Ok("1")
-            })
-        {
+            }) {
             (m as u32).div_ceil(4)
         } else {
             m as u32
@@ -8375,7 +8448,8 @@ impl Gpu {
         ];
         // Fused path skips the expanded [N×K_TOP×M] write + re-read; traffic
         // is the routed-expert weight reads plus the per-token residual write.
-        let bytes = batch_size * k_top * crate::profile::gemv_hfq4g256_bytes(m, k) + batch_size * m * 4;
+        let bytes =
+            batch_size * k_top * crate::profile::gemv_hfq4g256_bytes(m, k) + batch_size * m * 4;
         let timer = crate::profile::begin_timer(
             &self.hip,
             "gemv",
@@ -8409,7 +8483,6 @@ impl Gpu {
         }
         result
     }
-
 
     /// HFQ4G128 (ParoQuant) variant of the atomic-free batched indexed
     /// MoE down. Same expanded-output contract as the HFQ4G256 sibling;
