@@ -1193,11 +1193,36 @@ fn q8_attend_slots(
             );
         }
     }
-    let crossover = if gpu.arch_caps.is_gfx1200() || gpu.arch_caps.is_gfx1201() {
-        4096
-    } else {
-        8192
-    };
+    // Context length above which the flash (context-split) kernel beats the
+    // scalar one. Overridable via HIPFIRE_SLOTS_ATTN_CROSSOVER.
+    //
+    // gfx1151's 2048 is measured on this path, not inherited: at 4096-token
+    // context the scalar kernel reads 17.8 MiB of KV per FA layer in 586 us
+    // (~30 GB/s) because it launches only n_kv_heads x slots = 64 workgroups
+    // and each scans the whole context serially. The flash kernel splits the
+    // context and recovers that parallelism. Interleaved A/B, 35B-A3B, 4
+    // slots, 4096-token context, 3 reps each, no overlap between arms:
+    //
+    //   scalar 38.02 / 38.60 / 38.18 ms per decode step  (mean 38.27)
+    //   flash  35.66 / 35.94 / 36.53 ms                  (mean 36.04)
+    //
+    // Flash also won at 1, 2 and 3 slots (21.46->18.24, 29.19->26.85,
+    // 34.49->31.25), so this is not a batching effect -- the old 8192 was
+    // simply on the wrong side for this path. At ~1086 tokens the two arms
+    // were within run-to-run noise, hence 2048 rather than 0.
+    //
+    // Left at 8192 for other non-gfx120x parts: the measurement is gfx1151's
+    // and does not transfer. gfx1200/gfx1201 keep 4096, which already puts a
+    // 4096-token context on the flash side.
+    let crossover = gpu.slots_attn_crossover().unwrap_or({
+        if gpu.arch_caps.is_gfx1200() || gpu.arch_caps.is_gfx1201() {
+            4096
+        } else if gpu.arch_caps.is_gfx1151() {
+            2048
+        } else {
+            8192
+        }
+    });
     if max_ctx_len <= crossover {
         gpu.attention_q8_0_kv_batched_masked_slots(
             q,

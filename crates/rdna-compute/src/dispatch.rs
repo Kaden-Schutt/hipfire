@@ -1745,6 +1745,12 @@ impl Gpu {
         })
     }
 
+    /// Multi-slot attention flash-vs-scalar crossover override, in tokens.
+    /// `None` leaves the per-arch default in place.
+    pub fn slots_attn_crossover(&self) -> Option<usize> {
+        self.flags.slots_attn_crossover
+    }
+
     /// Pre-compile a batch of kernels in parallel (hipcc), then load modules + functions.
     /// Each entry is (module_name, source, func_name). Turbo kernels should have
     /// TURBO_COMMON_H already prepended in their source.

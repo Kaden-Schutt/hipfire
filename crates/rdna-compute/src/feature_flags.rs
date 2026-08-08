@@ -194,6 +194,11 @@ pub struct FeatureFlags {
     /// 128 default. gfx1151 is the dev box, gfx1201 the deployment target, so
     /// this must never be a baked-in `const` (spec §11).
     pub attn_tile_size: Option<usize>,
+    /// Multi-slot attention flash-vs-scalar crossover in tokens
+    /// (`HIPFIRE_SLOTS_ATTN_CROSSOVER`). `None` = the per-arch default. Same
+    /// reasoning as `attn_tile_size`: gfx1151 is the dev box and gfx1201 the
+    /// deployment target, so this must be overridable rather than baked in.
+    pub slots_attn_crossover: Option<usize>,
 
     // ── Kernels.rs env reads ───────────────────────────────────────
     pub lloyd_force_baseline: bool,
@@ -478,6 +483,7 @@ impl FeatureFlags {
             rocblas_off: value("HIPFIRE_ROCBLAS_OFF").ok().as_deref() == Some("1"),
             rocblas_min_batch: parse_usize("HIPFIRE_ROCBLAS_MIN_BATCH"),
             attn_tile_size: parse_usize("HIPFIRE_ATTN_TILE_SIZE"),
+            slots_attn_crossover: parse_usize("HIPFIRE_SLOTS_ATTN_CROSSOVER"),
 
             // Kernels.rs
             lloyd_force_baseline: value("HIPFIRE_LLOYD_FORCE_BASELINE").ok().as_deref()
@@ -691,6 +697,7 @@ impl FeatureFlags {
             rocblas_off: false,
             rocblas_min_batch: None,
             attn_tile_size: None,
+            slots_attn_crossover: None,
             lloyd_force_baseline: false,
             rdna2_variant: None,
             hipcc_extra_flags: String::new(),
