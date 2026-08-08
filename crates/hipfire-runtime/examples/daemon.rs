@@ -13498,9 +13498,6 @@ fn generate_qwen35_mtp(
     // ── Decode loop ─────────────────────────────────────────────────────
     let t_prefill = Instant::now();
     let mut emitted: Vec<u32> = vec![seed_token];
-    let mut streamed_tokens: Vec<u32> = Vec::new();
-    let mut bytes_fed_to_filter = 0usize;
-    let mut filter = EosFilter::new(EosFilterConfig::default());
     let mut last_committed = seed_token;
     let mut cur_pos = prompt_tokens.len();
     let mut generated = 0usize;
@@ -13508,10 +13505,24 @@ fn generate_qwen35_mtp(
     let mut accepted_total = 0usize;
     let mut think_count: usize = 0;
     let mut prev_in_think = false;
-    // Once the cap closes the first reasoning span, stop counting and continue
-    // into the visible answer. The close is applied at a spec-block boundary so
-    // the emitted stream and trunk/MTP caches remain aligned.
+    // MTP force-closes only at a committed block boundary so its target/head
+    // caches stay aligned. Keep that policy local; the shared emitter owns only
+    // byte filtering plus reasoning/content/tool routing for this path.
     let mut think_closed = false;
+    let mut grammar_violated = false;
+    let mut emit =
+        hipfire_arch_qwen35::spec_emit::Qwen35Emit::from_ctx(hipfire_runtime::spec::SpecEmitCtx {
+            tokenizer,
+            eos: eos_token,
+            im_end: im_end_token,
+            tools: None,
+            stop: stop.to_vec(),
+            max_think: 0,
+            max_tokens,
+            assistant_prefix: spec_assistant_prefix(started_in_think),
+            think_mode: ThinkMode::NonThink,
+            decoded_vocab: None,
+        });
 
     // Open the user-facing stream contract before the seed's committed/token
     // events. MTP performs its own decode loop and therefore does not inherit
@@ -13523,37 +13534,23 @@ fn generate_qwen35_mtp(
         gen_start_contract_version_for_arch(m.arch_id),
     );
 
-    // Emit the seed token first (TTFT = prefill).
-    streamed_tokens.push(seed_token);
-    emit_committed_event(
+    // Emit the seed token first (TTFT = prefill) through the shared semantic
+    // router so an open reasoning prefix never leaks into visible content.
+    let seed_begin = emit.begin(seed_token);
+    render_client_events(
         stdout,
         id,
-        seed_token,
-        streamed_tokens.len() - 1,
+        &seed_begin.events,
         t0.elapsed().as_millis() as u64,
+        false,
     );
-    {
-        let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
-        let new_bytes = &all_bytes[bytes_fed_to_filter..];
-        bytes_fed_to_filter = all_bytes.len();
-        if let FilterAction::Emit(text_bytes) = filter.observe(new_bytes) {
-            if let Ok(text) = std::str::from_utf8(&text_bytes) {
-                let _ = writeln!(
-                    stdout,
-                    r#"{{"type":"token","id":"{}","text":{},"attempt_id":{}}}"#,
-                    id,
-                    serde_json::to_string(&text).unwrap_or_default(),
-                    active_attempt_id()
-                );
-                let _ = stdout.flush();
-            }
-        }
-    }
     generated += 1;
-
-    let seed_is_eos = seed_token == eos_token
-        || im_end_token == Some(seed_token)
-        || tokenizer.is_terminator(seed_token);
+    let mut semantic_stop = if spec_stop_is_semantic(seed_begin.stop) {
+        seed_begin.stop
+    } else {
+        None
+    };
+    let seed_is_eos = seed_begin.stop.is_some();
 
     let mut step_error: Option<String> = None;
     while !seed_is_eos && generated < max_tokens {
@@ -13587,44 +13584,31 @@ fn generate_qwen35_mtp(
             if generated >= max_tokens {
                 break;
             }
-            emitted.push(tok);
-            streamed_tokens.push(tok);
-            emit_committed_event(
-                stdout,
-                id,
-                tok,
-                streamed_tokens.len() - 1,
-                t0.elapsed().as_millis() as u64,
-            );
-            let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
-            let new_bytes = &all_bytes[bytes_fed_to_filter..];
-            bytes_fed_to_filter = all_bytes.len();
-            if let FilterAction::Emit(text_bytes) = filter.observe(new_bytes) {
-                if let Ok(text) = std::str::from_utf8(&text_bytes) {
-                    let _ = writeln!(
-                        stdout,
-                        r#"{{"type":"token","id":"{}","text":{},"attempt_id":{}}}"#,
-                        id,
-                        serde_json::to_string(&text).unwrap_or_default(),
-                        active_attempt_id()
-                    );
-                    let _ = stdout.flush();
-                }
-            }
-            generated += 1;
-            if tok == eos_token || im_end_token == Some(tok) || tokenizer.is_terminator(tok) {
+            emit.set_generated_hint(generated);
+            let outcome = emit.observe(tok);
+            if outcome.stop == Some(StopReason::GrammarViolation) {
+                grammar_violated = true;
                 hit_eos = true;
                 break;
             }
-            if !stop.is_empty() {
-                let decoded_suffix = tokenizer.decode(&streamed_tokens);
-                if stop.iter().any(|s| decoded_suffix.ends_with(s.as_str())) {
-                    hit_eos = true;
-                    break;
-                }
+            emitted.push(tok);
+            render_client_events(
+                stdout,
+                id,
+                &outcome.events,
+                t0.elapsed().as_millis() as u64,
+                false,
+            );
+            generated += 1;
+            if semantic_stop.is_none() && spec_stop_is_semantic(outcome.stop) {
+                semantic_stop = outcome.stop;
+            }
+            if outcome.stop.is_some() {
+                hit_eos = true;
+                break;
             }
             if max_think_tokens > 0 && !think_closed {
-                let raw_so_far = tokenizer.decode_bytes(&streamed_tokens);
+                let raw_so_far = tokenizer.decode_bytes(&emitted);
                 let raw_str = std::str::from_utf8(&raw_so_far).unwrap_or("");
                 let in_think = currently_in_think(raw_str, started_in_think);
                 if in_think && !prev_in_think {
@@ -13682,35 +13666,34 @@ fn generate_qwen35_mtp(
         {
             let close_ids = tokenizer.encode(&think_continuation());
             if !close_ids.is_empty() {
+                let mut forced_stop = false;
                 for &ct in &close_ids {
                     if generated >= max_tokens {
                         break;
                     }
+                    emit.set_generated_hint(generated);
+                    let outcome = emit.observe(ct);
+                    if outcome.stop == Some(StopReason::GrammarViolation) {
+                        grammar_violated = true;
+                        forced_stop = true;
+                        break;
+                    }
                     emitted.push(ct);
-                    streamed_tokens.push(ct);
-                    emit_committed_event(
+                    render_client_events(
                         stdout,
                         id,
-                        ct,
-                        streamed_tokens.len() - 1,
+                        &outcome.events,
                         t0.elapsed().as_millis() as u64,
+                        false,
                     );
-                    let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
-                    let new_bytes = &all_bytes[bytes_fed_to_filter..];
-                    bytes_fed_to_filter = all_bytes.len();
-                    if let FilterAction::Emit(text_bytes) = filter.observe(new_bytes) {
-                        if let Ok(text) = std::str::from_utf8(&text_bytes) {
-                            let _ = writeln!(
-                                stdout,
-                                r#"{{"type":"token","id":"{}","text":{},"attempt_id":{}}}"#,
-                                id,
-                                serde_json::to_string(&text).unwrap_or_default(),
-                                active_attempt_id()
-                            );
-                            let _ = stdout.flush();
-                        }
-                    }
                     generated += 1;
+                    if semantic_stop.is_none() && spec_stop_is_semantic(outcome.stop) {
+                        semantic_stop = outcome.stop;
+                    }
+                    if outcome.stop.is_some() {
+                        forced_stop = true;
+                        break;
+                    }
                 }
 
                 // Match the MTP loop's deferred-token invariant: advance the
@@ -13763,12 +13746,21 @@ fn generate_qwen35_mtp(
                 last_committed = *close_ids.last().unwrap();
                 think_closed = true;
                 prev_in_think = false;
+                if forced_stop {
+                    break;
+                }
             }
         }
     }
 
     let t_end = Instant::now();
     let aborted = check_abort(id);
+    let finish = if step_error.is_none() && !aborted {
+        Some(emit.finish())
+    } else {
+        drop(emit);
+        None
+    };
 
     // ── Free the per-request MtpSpecState + put the bundle back ─────────
     // CRITICAL (state-bleed guard): free_gpu releases the MTP-private KV cache
@@ -13801,6 +13793,8 @@ fn generate_qwen35_mtp(
         emit_spec_cancel_after_rollback(stdout, id, generated, &ep);
         return;
     }
+    let finish = finish.expect("normal MTP exit must finalize its emitter");
+    render_client_events(stdout, id, &finish.events, 0, true);
 
     // ── Done envelope ──────────────────────────────────────────────────
     // Timing + pending done fixed before handshake so commit_ready carries
@@ -13830,9 +13824,37 @@ fn generate_qwen35_mtp(
         0.0
     };
     let _ = accepted_total;
-    let hit_length_cap = generated >= max_tokens;
-    let finish_reason = if hit_length_cap { "length" } else { "stop" };
-    let pending_done = serde_json::json!({
+    let hit_length_cap = qwen_dflash_hit_length_cap(
+        generated,
+        max_tokens,
+        finish.decoded_eot,
+        semantic_stop.is_some(),
+    );
+    let visible = if !finish.visible_text.is_empty() {
+        finish.visible_text.clone()
+    } else {
+        qwen_dflash_visible_from_finish(&finish)
+    };
+    let terminal =
+        qwen_dflash_wire_terminal(&finish, hit_length_cap, grammar_violated, &visible, false);
+    let (finish_reason, wire_tool_calls) = match &terminal {
+        QwenDflashWireTerminal::Malformed {
+            message,
+            class,
+            retryable,
+            ..
+        } => {
+            let ep = production_fail_closed_rollback(m, gpu, None, None);
+            emit_qwen_dflash_malformed_terminal(stdout, id, message, class, *retryable, &ep);
+            return;
+        }
+        QwenDflashWireTerminal::Done {
+            finish_reason,
+            wire_tool_calls,
+            ..
+        } => (*finish_reason, wire_tool_calls.as_slice()),
+    };
+    let mut pending_done = serde_json::json!({
         "type": "done",
         "id": id,
         "tokens": generated,
@@ -13849,6 +13871,7 @@ fn generate_qwen35_mtp(
         "finish_reason": finish_reason,
         "attempt_id": active_attempt_id(),
     });
+    stage_terminal_tool_calls(&mut pending_done, finish_reason, wire_tool_calls);
     let decision = await_client_terminal_commit(stdout, id, &pending_done);
     if decision != ClientTerminalDecision::Commit {
         let ep = production_fail_closed_rollback(m, gpu, None, None);
