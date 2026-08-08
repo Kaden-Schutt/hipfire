@@ -405,3 +405,69 @@ dominated by trajectory selection rather than by measurement noise: the k4
 adaptive arm spread 6.1% against k6's 0.079%. Report tau alongside tok/s; a
 varying tau is the signal that the trajectory moved.
 
+
+## 8. Routed-expert duplication across verify positions
+
+§6 established a 17.84 ms marginal cost per verify position and read it as "MoE
+does not amortise weights across the block." That is the symptom. The cause is
+an implementation choice, not physics.
+
+The routed gate/up kernel actually used in decode is
+`gemv_mq2g256_lloyd_moe_gate_up_k8_indexed_batched_k4096_lds` -- rocprof
+attributes all 1641 dispatches to it and none to the `_k4` variant. It launches
+on grid `(M, K_TOP, N)` and resolves the expert per position:
+
+```
+const int expert_id = topk_indices[bid * K_TOP + krank];
+```
+
+so an expert's weights stream once per position that routes to it, even when
+two verify positions in the same call route to the same expert. Its
+`__shared__ float cb_lds[64]` caches the quantisation codebook, not weights.
+
+`HIPFIRE_DS4_EXPERT_OVERLAP=1` measures the duplicate fraction. On the golden
+fixture (tau 2.0238095238095237 confirmed, so this is the shipping routing
+behaviour):
+
+| B | distinct / total expert refs | ratio |
+| ---: | ---: | ---: |
+| 6 | 12168 / 21954 | 0.5542 |
+| 3 | 15441 / 26544 | 0.5817 |
+| 2 | 18884 / 31056 | 0.6081 |
+| 3 | 21941 / 35562 | 0.6170 |
+| 3 | 25080 / 40062 | 0.6260 |
+
+Ratios are cumulative across calls; the `B` column is the current call's block.
+A ratio of 1.0 would mean zero reuse. At 0.626, **37.4% of routed-expert weight
+references are duplicates.**
+
+The ratio *falls* as B rises (0.554 at B=6 against ~0.61 at B=2): deeper blocks
+carry more redundancy, so grouping is worth most exactly where the §6 cost
+model is most punishing. Grouping verify columns by routed expert would
+therefore flatten the marginal-position cost that currently pins the controller
+at B=2, which is the mechanism capping tau.
+
+Upper bound, assuming `moe_down_residual_scaled_k8all` shares the structure
+(measured on gate/up only):
+
+```
+(24.75% + 11.40%) * 0.374  ~= 13.5% of GPU
+1 / (1 - 0.135)            ~= +15.6%
+38.97 tok/s                -> ~45.0 tok/s
+```
+
+This is the first identified lever whose ceiling reaches 45, and unlike the
+small-kernel tail (capped at 44.04 by §4 even if every small kernel were
+deleted) it removes bytes from the 77.68% GEMV block rather than trying to
+outrun bandwidth.
+
+Three caveats before anyone treats 45 as forecast rather than ceiling:
+
+1. **L2 already absorbs some duplicates.** §3 measured the GEMV block at
+   83-108% of peak bandwidth, and above 100% implies cache reuse is already
+   occurring. Realised savings will be below 37.4%, possibly well below.
+2. **Grouping changes MoE reduction order**, which is the same near-tie
+   territory that produced the k4 output flicker in §7. It requires the
+   golden's byte-identity check, not a throughput delta.
+3. **The down-projection is assumed, not measured.** Only gate/up was
+   instrumented.
