@@ -62,6 +62,7 @@ pub mod emit_text;
 pub mod eos_filter;
 pub mod prompt_frame;
 pub mod semantic;
+pub mod session_table;
 pub mod tokenizer;
 
 pub mod tool_call;
