@@ -14,18 +14,36 @@
 // `_slots` entry points SP1 built, and DeltaNet through a per-slot loop
 // over SP2's per-slot `DeltaNetState`.
 //
-// Scope: Q8_0 only. Every weight this path touches (QKV/QKVZA, wo,
-// gate/up, down, and the lm_head) must be `DType::Q8_0`, the KV cache is
-// Q8_0-quantized, and DeltaNet state is `StateQuant::Q8`. This matches the
-// ABI the multi-slot infrastructure was actually built against —
-// `SlotPool`'s per-slot addressing is documented as a Q8_0 ABI (asym3 is
-// explicitly exempted because its K/V strides differ and it cannot share
-// `k_base`/`v_base`), `kv_cache_write_q8_0_batched_slots` and both
-// `attention_*_batched_masked_slots` entry points are Q8_0-named, and
-// `gated_delta_net_q8_batch_seq` is the Q8 recurrence. Extending this to
-// other dtypes is future work, not silently guessed at here — a non-Q8
-// weight or a MoE layer returns a clear `HipError` rather than attempting
-// a dtype branch nothing in SP1/SP2 covers.
+// Scope: dense layers stay Q8_0 only. Every weight a `DeltaNet`/`FullAttn`
+// (dense) layer touches (QKV/QKVZA, wo, gate/up, down, and the lm_head) must
+// be `DType::Q8_0`, the KV cache is Q8_0-quantized, and DeltaNet state is
+// `StateQuant::Q8`. This matches the ABI the multi-slot infrastructure was
+// actually built against — `SlotPool`'s per-slot addressing is documented as
+// a Q8_0 ABI (asym3 is explicitly exempted because its K/V strides differ and
+// it cannot share `k_base`/`v_base`), `kv_cache_write_q8_0_batched_slots` and
+// both `attention_*_batched_masked_slots` entry points are Q8_0-named, and
+// `gated_delta_net_q8_batch_seq` is the Q8 recurrence. The KV cache tier is
+// unconditionally Q8_0 for EVERY layer this file drives, dense or MoE — slot
+// addressing is a KV-cache-tier property, not a weight-quant property, so the
+// attend/KV-write steps below never change no matter what a layer's
+// projection weights are quantized to.
+//
+// `DeltaNetMoe`/`FullAttnMoe` layers (qwen3.6-35b-a3b and similar A3B
+// checkpoints) additionally admit uniformly-`MQ4G256` projection weights,
+// mirroring `forward_prefill_chunk`'s own `is_mq` dispatch fork for these
+// layer kinds (rmsnorm+FWHT-rotate via `fused_rmsnorm_rotate_mq_batched_for`
+// / `rotate_x_mq_batched_for`, then the same `*Hfq4G256` kernel keys the
+// dense HFQ4G256 path already uses — MQ4G256 is byte-identical to HFQ4G256,
+// only the input activations are pre-rotated). The MoE FFN itself is
+// stateless per row (no kv_cache, no dn_state, no positions — confirmed by
+// reading `moe_ffn_decode`'s signature), so it needs no slot machinery at
+// all: `run_deltanet_moe_layer_slots`/`run_fullattn_moe_layer_slots` call
+// the reference's own `prefill_moe_ffn_body_batched` directly over the flat
+// N-row batch, gated by the reference's own `moe_ffn_batched_admissible`.
+// MQ6/PARO/Lloyd/E8/mixed-dtype MoE attention or FFN weights are out of
+// scope here (see `require_batchable_deltanet_moe_layer` /
+// `require_batchable_fullattn_moe_layer` / `require_batchable_moe_ffn`) —
+// each returns a clear `HipError` rather than guessing at an untested path.
 //
 // DeltaNet slot-state note: only the GDN recurrence and the conv1d causal
 // state are sequential-per-slot (both carry state across steps: the S
@@ -43,17 +61,20 @@
 // entry points — RoPE is slot-agnostic per SP2 Task 2 and needs no split).
 
 use crate::qwen35::{
+    mq6_batched_admit_enabled_from_env, moe_ffn_batched_admissible, prefill_moe_ffn_body_batched,
     q8_prefill_wmma_enabled, run_fused_gate_up_key, run_fused_qkv_key, run_fused_qkvza_key,
-    run_plain_gemm_key, run_residual_gemm_key, DeltaNetLayerWeights, DeltaNetState,
-    FullAttnLayerWeights, LayerType, LayerWeights, PrefillBatchScratch, Qwen35Config,
-    Qwen35Scratch, Qwen35Weights, StateQuant,
+    run_plain_gemm_key, run_residual_gemm_key, DeltaNetLayerWeights, DeltaNetMoeLayerWeights,
+    DeltaNetState, FullAttnLayerWeights, FullAttnMoeLayerWeights, LayerType, LayerWeights,
+    MoeFfnWeights, PrefillBatchScratch, Qwen35Config, Qwen35Scratch, Qwen35Weights, StateQuant,
 };
 use crate::slot_batch::SlotBatch;
 use hip_bridge::{HipError, HipResult};
 use hipfire_dispatch::context::DispatchCtx;
 use hipfire_dispatch::pipeline::{execute_steps, GemvInput, Step};
 use hipfire_dispatch::types::KernelKey;
-use hipfire_runtime::llama::EmbeddingFormat;
+use hipfire_runtime::llama::{
+    fused_rmsnorm_rotate_mq_batched_for, rotate_x_mq_batched_for, EmbeddingFormat, WeightTensor,
+};
 use rdna_compute::kv_slots::{build_tiles, KvSlotDesc};
 use rdna_compute::slot_pool::SlotPool;
 use rdna_compute::{DType, Gpu, GpuTensor};
@@ -194,6 +215,139 @@ fn require_q8_fullattn_layer(layer: &FullAttnLayerWeights) -> HipResult<()> {
              the multi-slot batched path is Q8_0-only (see sp3-task-2-report.md)",
         ))
     }
+}
+
+/// Which batched projection dispatch a MoE attention body should take.
+/// Mirrors the `is_q8` / `is_mq` dtype forks `forward_prefill_chunk` applies
+/// to `DeltaNetMoe`/`FullAttnMoe` layers (qwen35.rs's DeltaNetMoe LA branch
+/// and FullAttnMoe FA branch) — narrowed to the two dtypes this file
+/// actually implements a slot-aware body for. MQ6G256/HFQ6G256, ParoQ4G128,
+/// and mixed-dtype-within-layer are real paths in the reference but are NOT
+/// ported here; see `require_batchable_deltanet_moe_layer` /
+/// `require_batchable_fullattn_moe_layer`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum MoeAttnDtype {
+    Q8_0,
+    Mq4G256,
+}
+
+/// Q8_0-or-MQ4G256 weight-dtype gate for a `DeltaNetMoeLayerWeights`,
+/// uniform across all five attention projections (wqkv/wz/w_beta/w_alpha/wo)
+/// — a mixed Q8/MQ4 layer would misroute through a single-stride fused
+/// kernel against differently-strided weights, the same corruption class
+/// `require_q8_deltanet_layer` guards against for the dense path. MQ4G256
+/// requires the caller to additionally rotate activations via
+/// `fused_rmsnorm_rotate_mq_batched_for`/`rotate_x_mq_batched_for` before
+/// each GEMM — see `run_deltanet_moe_layer_slots`.
+fn require_batchable_deltanet_moe_layer(layer: &DeltaNetMoeLayerWeights) -> HipResult<MoeAttnDtype> {
+    let all_q8 = matches!(layer.wqkv.gpu_dtype, DType::Q8_0)
+        && matches!(layer.wz.gpu_dtype, DType::Q8_0)
+        && matches!(layer.w_beta.gpu_dtype, DType::Q8_0)
+        && matches!(layer.w_alpha.gpu_dtype, DType::Q8_0)
+        && matches!(layer.wo.gpu_dtype, DType::Q8_0);
+    if all_q8 {
+        return Ok(MoeAttnDtype::Q8_0);
+    }
+    let all_mq4 = matches!(layer.wqkv.gpu_dtype, DType::MQ4G256)
+        && matches!(layer.wz.gpu_dtype, DType::MQ4G256)
+        && matches!(layer.w_beta.gpu_dtype, DType::MQ4G256)
+        && matches!(layer.w_alpha.gpu_dtype, DType::MQ4G256)
+        && matches!(layer.wo.gpu_dtype, DType::MQ4G256);
+    if all_mq4 {
+        return Ok(MoeAttnDtype::Mq4G256);
+    }
+    Err(HipError::new(
+        0,
+        "forward_batch_slots: DeltaNetMoe layer attention weights must be \
+         uniformly Q8_0 or uniformly MQ4G256 (mirrors forward_prefill_chunk's \
+         is_q8/is_mq dispatch); MQ6G256/HFQ6G256, ParoQ4G128, and mixed-dtype \
+         MoE attention are out of scope for the multi-slot batched path",
+    ))
+}
+
+/// Same gate as [`require_batchable_deltanet_moe_layer`] for a
+/// `FullAttnMoeLayerWeights` (wq/wk/wv/wo).
+fn require_batchable_fullattn_moe_layer(layer: &FullAttnMoeLayerWeights) -> HipResult<MoeAttnDtype> {
+    let all_q8 = matches!(layer.wq.gpu_dtype, DType::Q8_0)
+        && matches!(layer.wk.gpu_dtype, DType::Q8_0)
+        && matches!(layer.wv.gpu_dtype, DType::Q8_0)
+        && matches!(layer.wo.gpu_dtype, DType::Q8_0);
+    if all_q8 {
+        return Ok(MoeAttnDtype::Q8_0);
+    }
+    let all_mq4 = matches!(layer.wq.gpu_dtype, DType::MQ4G256)
+        && matches!(layer.wk.gpu_dtype, DType::MQ4G256)
+        && matches!(layer.wv.gpu_dtype, DType::MQ4G256)
+        && matches!(layer.wo.gpu_dtype, DType::MQ4G256);
+    if all_mq4 {
+        return Ok(MoeAttnDtype::Mq4G256);
+    }
+    Err(HipError::new(
+        0,
+        "forward_batch_slots: FullAttnMoe layer attention weights must be \
+         uniformly Q8_0 or uniformly MQ4G256 (mirrors forward_prefill_chunk's \
+         qkv_is_q8/qkv_is_mq dispatch); MQ6G256/HFQ6G256, ParoQ4G128, and \
+         mixed-dtype MoE attention are out of scope for the multi-slot \
+         batched path",
+    ))
+}
+
+/// MoE-FFN weight-dtype admissibility gate, delegating to the reference's own
+/// `moe_ffn_batched_admissible` (same predicate `prefill_batch_pbs_eligible`
+/// checks before ever entering `forward_prefill_chunk`'s MoE branches) so
+/// this file's notion of "batchable MoE FFN" can never drift from the
+/// function it is about to call (`prefill_moe_ffn_body_batched`). `admit_mq6`
+/// is computed identically to the reference's own call site
+/// (`prefill_batch_pbs_eligible`, qwen35.rs) via the same env-keyed helper.
+fn require_batchable_moe_ffn(gpu: &Gpu, ffn: &MoeFfnWeights) -> HipResult<()> {
+    let arch = gpu.arch.as_str();
+    let admit_mq6 = mq6_batched_admit_enabled_from_env(
+        hipfire_config::developer_var("HIPFIRE_MOE_MQ6_ADMIT")
+            .ok()
+            .as_deref(),
+        arch,
+    );
+    if moe_ffn_batched_admissible(ffn, admit_mq6, arch) {
+        Ok(())
+    } else {
+        Err(HipError::new(
+            0,
+            "forward_batch_slots: MoE FFN weight dtypes are not admissible for \
+             the batched prefill path (see moe_ffn_batched_admissible); this \
+             file requires the same admission the reference's own \
+             prefill_batch_pbs_eligible checks before entering the batched MoE \
+             branches",
+        ))
+    }
+}
+
+/// FWHT-rotated MQ4G256 residual projection: `y[0..n*m] += w · FWHT(x[0..n*k])`.
+/// Mirrors the reference's default (non-Q8/non-6bit/non-PARO) wo / w_down
+/// dispatch fork for `DeltaNetMoe`/`FullAttnMoe` layers — `GemmHfq4G256Residual`
+/// against a `rotate_x_mq_batched_for`-rotated input. `scratch` is the
+/// caller's dead buffer to rotate into (mirrors `pbs.dn_normed_rot_batch` /
+/// `pbs.fa_attn_out_rot_batch` reuse in the dense Q8 path's `q8_residual_proj`).
+fn mq4_residual_proj(
+    gpu: &mut Gpu,
+    w: &WeightTensor,
+    x: &GpuTensor,
+    y: &GpuTensor,
+    scratch: &GpuTensor,
+    n: usize,
+) -> HipResult<()> {
+    rotate_x_mq_batched_for(gpu, w, x, scratch, w.k, n)?;
+    let y_n = y.sub_offset(0, n * w.m);
+    run_residual_gemm_key(
+        gpu,
+        KernelKey::GemmHfq4G256Residual,
+        &w.buf,
+        w.gpu_dtype,
+        scratch,
+        &y_n,
+        w.m,
+        w.k,
+        n,
+    )
 }
 
 /// `y[0..n*m] += w · x[0..n*k]`, dispatched through the same
@@ -558,6 +712,317 @@ fn run_deltanet_layer_slots(
         &pbs.x_rot_batch,
         n,
         q8_wmma_arch,
+    )
+}
+
+/// Run one `LinearAttention` (DeltaNet) + MoE layer across the whole step.
+///
+/// Same shape as [`run_deltanet_layer_slots`] — the stateless attention
+/// pieces run once over all `n` rows, the stateful pieces (conv1d, GDN) loop
+/// per slot — except: (a) the QKVZA projection and wo admit MQ4G256 as well
+/// as Q8_0 (see `require_batchable_deltanet_moe_layer`), and (b) the dense
+/// FFN (rmsnorm+gate/up+silu_mul+down) is replaced by a call to the
+/// reference's own `prefill_moe_ffn_body_batched`. The MoE FFN is stateless
+/// per row — it takes no `kv_cache`, `dn_state`, or `positions` — so no
+/// slot-aware variant is needed: the flat `[n × dim]` `pbs.x_batch` this
+/// function already threads through the attention body is exactly the input
+/// shape `prefill_moe_ffn_body_batched` expects.
+#[allow(clippy::too_many_arguments)]
+fn run_deltanet_moe_layer_slots(
+    gpu: &mut Gpu,
+    config: &Qwen35Config,
+    layer: &DeltaNetMoeLayerWeights,
+    batch: &SlotBatch,
+    dn_states: &mut [DeltaNetState],
+    pbs: &PrefillBatchScratch,
+    q8_wmma_arch: bool,
+    n: usize,
+    delta_layer_idx: usize,
+    // Whole-MODEL flag (not per-layer): true when ANY MoE layer anywhere in
+    // the model has an MQ6 FFN projection. Threaded straight through to
+    // `prefill_moe_ffn_body_batched`'s `model_has_mq6_moe` — see that
+    // parameter's use at qwen35.rs:8488 (`force_mq4_grouped_fp16`), a
+    // cross-layer kernel-selection consistency knob on gfx1151. Passing this
+    // layer's own (uniform-MQ4G256, per `require_batchable_moe_ffn`) dtype
+    // instead of the model-wide flag would silently diverge from the
+    // reference whenever the SAME model mixes an MQ6 layer elsewhere.
+    weights_moe_has_mq6: bool,
+) -> HipResult<()> {
+    let attn_dtype = require_batchable_deltanet_moe_layer(layer)?;
+    require_batchable_moe_ffn(gpu, &layer.ffn)?;
+
+    let k_dim = config.linear_num_key_heads * config.linear_key_head_dim;
+    let v_dim = config.linear_num_value_heads * config.linear_value_head_dim;
+    let qkv_dim = k_dim * 2 + v_dim;
+    let n_v_heads = config.linear_num_value_heads;
+    let hd = config.linear_key_head_dim;
+
+    // 1-2. rmsnorm(+FWHT-rotate for MQ4) then the batched 4-way QKVZA
+    // projection. Mirrors forward_prefill_chunk's DeltaNetMoe `is_mq`/`is_q8`
+    // forks (qwen35.rs) — MQ4G256 shares HFQ4G256's byte layout, so the only
+    // difference from HFQ4G256 is the FWHT-rotated input.
+    match attn_dtype {
+        MoeAttnDtype::Mq4G256 => {
+            fused_rmsnorm_rotate_mq_batched_for(
+                gpu,
+                &pbs.x_batch,
+                &layer.attn_norm,
+                &layer.wqkv,
+                &pbs.x_rot_batch,
+                config.dim,
+                config.norm_eps,
+                n,
+            )?;
+            run_fused_qkvza_key(
+                gpu,
+                KernelKey::FusedQkvzaHfq4G256,
+                &layer.wqkv.buf,
+                &layer.wz.buf,
+                &layer.w_beta.buf,
+                &layer.w_alpha.buf,
+                &pbs.x_rot_batch,
+                &pbs.dn_qkv_batch,
+                &pbs.dn_z_batch,
+                &pbs.dn_beta_batch,
+                &pbs.dn_alpha_batch,
+                layer.wqkv.m,
+                layer.wz.m,
+                layer.w_beta.m,
+                layer.w_alpha.m,
+                layer.wqkv.k,
+                n,
+            )?;
+        }
+        MoeAttnDtype::Q8_0 => {
+            gpu.rmsnorm_batched(
+                &pbs.x_batch,
+                &layer.attn_norm,
+                &pbs.x_rot_batch,
+                n,
+                config.dim,
+                config.norm_eps,
+            )?;
+            if q8_wmma_arch {
+                run_fused_qkvza_key(
+                    gpu,
+                    KernelKey::FusedQkvzaQ8_0,
+                    &layer.wqkv.buf,
+                    &layer.wz.buf,
+                    &layer.w_beta.buf,
+                    &layer.w_alpha.buf,
+                    &pbs.x_rot_batch,
+                    &pbs.dn_qkv_batch,
+                    &pbs.dn_z_batch,
+                    &pbs.dn_beta_batch,
+                    &pbs.dn_alpha_batch,
+                    layer.wqkv.m,
+                    layer.wz.m,
+                    layer.w_beta.m,
+                    layer.w_alpha.m,
+                    layer.wqkv.k,
+                    n,
+                )?;
+            } else {
+                run_plain_gemm_key(
+                    gpu,
+                    KernelKey::GemmQ8_0BatchedChunked,
+                    &layer.wqkv.buf,
+                    layer.wqkv.gpu_dtype,
+                    &pbs.x_rot_batch,
+                    &pbs.dn_qkv_batch,
+                    layer.wqkv.m,
+                    layer.wqkv.k,
+                    n,
+                )?;
+                run_plain_gemm_key(
+                    gpu,
+                    KernelKey::GemmQ8_0BatchedChunked,
+                    &layer.wz.buf,
+                    layer.wz.gpu_dtype,
+                    &pbs.x_rot_batch,
+                    &pbs.dn_z_batch,
+                    layer.wz.m,
+                    layer.wz.k,
+                    n,
+                )?;
+                run_plain_gemm_key(
+                    gpu,
+                    KernelKey::GemmQ8_0BatchedChunked,
+                    &layer.w_beta.buf,
+                    layer.w_beta.gpu_dtype,
+                    &pbs.x_rot_batch,
+                    &pbs.dn_beta_batch,
+                    layer.w_beta.m,
+                    layer.w_beta.k,
+                    n,
+                )?;
+                run_plain_gemm_key(
+                    gpu,
+                    KernelKey::GemmQ8_0BatchedChunked,
+                    &layer.w_alpha.buf,
+                    layer.w_alpha.gpu_dtype,
+                    &pbs.x_rot_batch,
+                    &pbs.dn_alpha_batch,
+                    layer.w_alpha.m,
+                    layer.w_alpha.k,
+                    n,
+                )?;
+            }
+        }
+    }
+
+    // 3. Fused sigmoid(beta) + alpha_gate(alpha) — stateless, batched over N.
+    gpu.fused_sigmoid_alpha_gate_f32_batched(
+        &pbs.dn_beta_batch,
+        &pbs.dn_alpha_batch,
+        &layer.dt_bias,
+        &layer.a_log,
+        n_v_heads,
+        n,
+    )?;
+
+    // 4. conv1d — STATEFUL (ring buffer), looped per slot. Byte-identical to
+    // run_deltanet_layer_slots step 4 — conv_weight is a dequantized F32
+    // GpuTensor regardless of the layer's projection weight dtype.
+    let mut row_off = 0usize;
+    for (s, &m) in batch.m_per_slot.iter().enumerate() {
+        if m > 0 {
+            let q_out = pbs.dn_q_raw_batch.sub_offset(row_off * k_dim, m * k_dim);
+            let k_out = pbs.dn_k_raw_batch.sub_offset(row_off * k_dim, m * k_dim);
+            let v_out = pbs.dn_v_batch.sub_offset(row_off * v_dim, m * v_dim);
+            let input = pbs.dn_qkv_batch.sub_offset(row_off * qkv_dim, m * qkv_dim);
+            gpu.conv1d_silu_split_f32_n(
+                &q_out,
+                &k_out,
+                &v_out,
+                &input,
+                &layer.conv_weight,
+                &dn_states[s].conv_states[delta_layer_idx],
+                k_dim,
+                v_dim,
+                m,
+            )?;
+        }
+        row_off += m;
+    }
+    debug_assert_eq!(row_off, n);
+
+    // 5. Q/K L2-norm(+scale, +repeat-interleave) — stateless, batched over N.
+    if config.linear_num_key_heads < n_v_heads {
+        let ratio = n_v_heads / config.linear_num_key_heads;
+        gpu.fused_qk_l2_norm_scale_interleave_f32_batched(
+            &pbs.dn_q_raw_batch,
+            &pbs.dn_k_raw_batch,
+            &pbs.dn_q_batch,
+            &pbs.dn_k_batch,
+            config.linear_num_key_heads,
+            ratio,
+            hd,
+            1.0 / (hd as f32).sqrt(),
+            config.norm_eps,
+            n,
+        )?;
+    } else {
+        gpu.fused_qk_l2_norm_scale_f32_batched(
+            &pbs.dn_q_raw_batch,
+            &pbs.dn_k_raw_batch,
+            config.linear_num_key_heads,
+            hd,
+            1.0 / (hd as f32).sqrt(),
+            config.norm_eps,
+            n,
+        )?;
+        gpu.memcpy_dtod_auto(&pbs.dn_q_batch.buf, &pbs.dn_q_raw_batch.buf, n * k_dim * 4)?;
+        gpu.memcpy_dtod_auto(&pbs.dn_k_batch.buf, &pbs.dn_k_raw_batch.buf, n * k_dim * 4)?;
+    }
+
+    // 6. Gated Delta Net recurrence — STATEFUL (S matrix), looped per slot.
+    // Same Q8-only per-slot dispatch as run_deltanet_layer_slots step 6 —
+    // the GDN recurrence dtype is a DeltaNetState property, independent of
+    // this layer's projection weight dtype.
+    let mut row_off = 0usize;
+    for (s, &m) in batch.m_per_slot.iter().enumerate() {
+        if m > 0 {
+            if !matches!(dn_states[s].quant, StateQuant::Q8) {
+                return Err(HipError::new(
+                    0,
+                    "forward_batch_slots: DeltaNetState must be StateQuant::Q8 \
+                     (the multi-slot batched path is Q8-only)",
+                ));
+            }
+            let q_view = pbs.dn_q_batch.sub_offset(row_off * v_dim, m * v_dim);
+            let k_view = pbs.dn_k_batch.sub_offset(row_off * v_dim, m * v_dim);
+            let v_view = pbs.dn_v_batch.sub_offset(row_off * v_dim, m * v_dim);
+            let gate_view = pbs.dn_alpha_batch.sub_offset(row_off * n_v_heads, m * n_v_heads);
+            let beta_view = pbs.dn_beta_batch.sub_offset(row_off * n_v_heads, m * n_v_heads);
+            let out_view = pbs.dn_attn_out_batch.sub_offset(row_off * v_dim, m * v_dim);
+            gpu.gated_delta_net_q8_batch_seq(
+                &q_view,
+                &k_view,
+                &v_view,
+                &gate_view,
+                &beta_view,
+                &dn_states[s].s_matrices[delta_layer_idx],
+                &dn_states[s].s_scales[delta_layer_idx],
+                &out_view,
+                m,
+                n_v_heads,
+                config.linear_value_head_dim,
+                dn_states[s].ef_residual(delta_layer_idx),
+            )?;
+        }
+        row_off += m;
+    }
+    debug_assert_eq!(row_off, n);
+
+    // 7. Batched gated output norm — stateless, batched over N.
+    gpu.gated_norm_f32_batched(
+        &pbs.dn_attn_out_batch,
+        &pbs.dn_z_batch,
+        &layer.norm_weight,
+        &pbs.dn_normed_batch,
+        n_v_heads,
+        config.linear_value_head_dim,
+        config.norm_eps,
+        n,
+    )?;
+
+    // 8. wo + residual.
+    match attn_dtype {
+        MoeAttnDtype::Mq4G256 => mq4_residual_proj(
+            gpu,
+            &layer.wo,
+            &pbs.dn_normed_batch,
+            &pbs.x_batch,
+            &pbs.dn_normed_rot_batch,
+            n,
+        )?,
+        MoeAttnDtype::Q8_0 => q8_residual_proj(
+            gpu,
+            &layer.wo,
+            &pbs.dn_normed_batch,
+            &pbs.x_batch,
+            &pbs.dn_normed_rot_batch,
+            n,
+            q8_wmma_arch,
+        )?,
+    }
+
+    // 9. Batched MoE FFN replaces the dense (rmsnorm + gate+up + silu_mul +
+    // w_down) block — stateless per row, no slot machinery needed. Takes
+    // pbs.x_batch as input and accumulates the FFN output residual back
+    // into it (same contract as the reference's own call site).
+    let ctx = DispatchCtx::new(gpu);
+    prefill_moe_ffn_body_batched(
+        gpu,
+        &layer.ffn,
+        &layer.ffn_norm,
+        config,
+        pbs,
+        n,
+        &ctx,
+        weights_moe_has_mq6,
+        /*routed_out=*/ None,
     )
 }
 
@@ -1001,6 +1466,267 @@ fn run_fullattn_layer_slots(
     )
 }
 
+/// Run one `FullAttention` + MoE layer across the whole step. Same shape as
+/// [`run_fullattn_layer_slots`] — attention (KV write + attend) is a SINGLE
+/// slot-aware launch across every slot via the `_slots` entry points,
+/// unconditionally on the Q8_0 KV-cache tier regardless of this layer's
+/// projection weight dtype — except: (a) the QKV projection and wo admit
+/// MQ4G256 as well as Q8_0 (see `require_batchable_fullattn_moe_layer`), and
+/// (b) the dense FFN is replaced by the reference's own
+/// `prefill_moe_ffn_body_batched` (stateless per row, no slot machinery
+/// needed — see `run_deltanet_moe_layer_slots`'s doc comment).
+#[allow(clippy::too_many_arguments)]
+fn run_fullattn_moe_layer_slots(
+    gpu: &mut Gpu,
+    config: &Qwen35Config,
+    layer: &FullAttnMoeLayerWeights,
+    pbs: &PrefillBatchScratch,
+    s: &Qwen35Scratch,
+    k_cache: &GpuTensor,
+    v_cache: &GpuTensor,
+    desc_staging: &SlotDescStaging,
+    q8_wmma_arch: bool,
+    n: usize,
+    physical_cap: usize,
+    max_ctx_len: usize,
+    single_slot: Option<(u64, usize)>,
+    n_tiles: Option<usize>,
+    weights_moe_has_mq6: bool,
+) -> HipResult<()> {
+    let attn_dtype = require_batchable_fullattn_moe_layer(layer)?;
+    require_batchable_moe_ffn(gpu, &layer.ffn)?;
+
+    let dim = config.dim;
+
+    // 1-2. rmsnorm(+FWHT-rotate for MQ4) then the batched 3-way QKV
+    // projection. Mirrors forward_prefill_chunk's FullAttnMoe
+    // `qkv_is_mq`/`qkv_is_q8` forks (qwen35.rs).
+    match attn_dtype {
+        MoeAttnDtype::Mq4G256 => {
+            fused_rmsnorm_rotate_mq_batched_for(
+                gpu,
+                &pbs.x_batch,
+                &layer.attn_norm,
+                &layer.wq,
+                &pbs.x_rot_batch,
+                dim,
+                config.norm_eps,
+                n,
+            )?;
+            run_fused_qkv_key(
+                gpu,
+                KernelKey::FusedQkvHfq4G256,
+                &layer.wq.buf,
+                &layer.wk.buf,
+                &layer.wv.buf,
+                &pbs.x_rot_batch,
+                &pbs.fa_q_full_batch,
+                &pbs.fa_k_batch,
+                &pbs.fa_v_batch,
+                layer.wq.m,
+                layer.wk.m,
+                layer.wv.m,
+                layer.wq.k,
+                n,
+            )?;
+        }
+        MoeAttnDtype::Q8_0 => {
+            gpu.rmsnorm_batched(
+                &pbs.x_batch,
+                &layer.attn_norm,
+                &pbs.x_rot_batch,
+                n,
+                dim,
+                config.norm_eps,
+            )?;
+            if q8_wmma_arch {
+                run_fused_qkv_key(
+                    gpu,
+                    KernelKey::FusedQkvQ8_0,
+                    &layer.wq.buf,
+                    &layer.wk.buf,
+                    &layer.wv.buf,
+                    &pbs.x_rot_batch,
+                    &pbs.fa_q_full_batch,
+                    &pbs.fa_k_batch,
+                    &pbs.fa_v_batch,
+                    layer.wq.m,
+                    layer.wk.m,
+                    layer.wv.m,
+                    layer.wq.k,
+                    n,
+                )?;
+            } else {
+                run_plain_gemm_key(
+                    gpu,
+                    KernelKey::GemmQ8_0BatchedChunked,
+                    &layer.wq.buf,
+                    layer.wq.gpu_dtype,
+                    &pbs.x_rot_batch,
+                    &pbs.fa_q_full_batch,
+                    layer.wq.m,
+                    layer.wq.k,
+                    n,
+                )?;
+                run_plain_gemm_key(
+                    gpu,
+                    KernelKey::GemmQ8_0BatchedChunked,
+                    &layer.wk.buf,
+                    layer.wk.gpu_dtype,
+                    &pbs.x_rot_batch,
+                    &pbs.fa_k_batch,
+                    layer.wk.m,
+                    layer.wk.k,
+                    n,
+                )?;
+                run_plain_gemm_key(
+                    gpu,
+                    KernelKey::GemmQ8_0BatchedChunked,
+                    &layer.wv.buf,
+                    layer.wv.gpu_dtype,
+                    &pbs.x_rot_batch,
+                    &pbs.fa_v_batch,
+                    layer.wv.m,
+                    layer.wv.k,
+                    n,
+                )?;
+            }
+        }
+    }
+
+    // 3. Deinterleave Q + gate.
+    gpu.deinterleave_f32_batched(
+        &pbs.fa_q_full_batch,
+        &pbs.fa_q_batch,
+        &pbs.fa_gate_batch,
+        config.n_heads,
+        config.head_dim,
+        n,
+    )?;
+
+    // 4. Per-head Q/K rmsnorm.
+    gpu.rmsnorm_batched(
+        &pbs.fa_q_batch,
+        &layer.q_norm,
+        &pbs.fa_q_batch,
+        n * config.n_heads,
+        config.head_dim,
+        config.norm_eps,
+    )?;
+    gpu.rmsnorm_batched(
+        &pbs.fa_k_batch,
+        &layer.k_norm,
+        &pbs.fa_k_batch,
+        n * config.n_kv_heads,
+        config.head_dim,
+        config.norm_eps,
+    )?;
+
+    // 5. RoPE — slot-agnostic (SP2 Task 2).
+    let n_rot = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
+    gpu.rope_partial_interleaved_f32_batched(
+        &pbs.fa_q_batch,
+        &pbs.fa_k_batch,
+        &pbs.positions,
+        config.n_heads,
+        config.n_kv_heads,
+        config.head_dim,
+        n_rot,
+        config.rope_theta,
+        n,
+        0,
+    )?;
+
+    // 6. Batched KV write — slot-aware, Q8_0 KV-cache tier regardless of
+    // this layer's projection weight dtype (see module doc).
+    gpu.kv_cache_write_q8_0_batched_slots(
+        k_cache,
+        &pbs.fa_k_batch,
+        &pbs.positions,
+        config.n_kv_heads,
+        config.head_dim,
+        n,
+        Some(&desc_staging.descs_dev),
+        Some(&desc_staging.row_slot_dev),
+    )?;
+    gpu.kv_cache_write_q8_0_batched_slots(
+        v_cache,
+        &pbs.fa_v_batch,
+        &pbs.positions,
+        config.n_kv_heads,
+        config.head_dim,
+        n,
+        Some(&desc_staging.descs_dev),
+        Some(&desc_staging.row_slot_dev),
+    )?;
+
+    // 7. Batched attend — slot-aware, one launch across every slot.
+    q8_attend_slots(
+        gpu,
+        &pbs.fa_q_batch,
+        k_cache,
+        v_cache,
+        &pbs.fa_attn_out_batch,
+        &pbs.positions,
+        config.n_heads,
+        config.n_kv_heads,
+        config.head_dim,
+        physical_cap,
+        max_ctx_len,
+        n,
+        &s.flash_partials,
+        &desc_staging.descs_dev,
+        &desc_staging.row_slot_dev,
+        single_slot,
+        n_tiles.map(|nt| {
+            (
+                &desc_staging.tile_slot_dev,
+                &desc_staging.tile_row0_dev,
+                &desc_staging.tile_qbase_dev,
+                nt,
+            )
+        }),
+    )?;
+
+    // 8. sigmoid(gate) * attn_out.
+    gpu.sigmoid_mul_f32(&pbs.fa_attn_out_batch, &pbs.fa_gate_batch)?;
+
+    // 9. wo + residual.
+    match attn_dtype {
+        MoeAttnDtype::Mq4G256 => mq4_residual_proj(
+            gpu,
+            &layer.wo,
+            &pbs.fa_attn_out_batch,
+            &pbs.x_batch,
+            &pbs.fa_attn_out_rot_batch,
+            n,
+        )?,
+        MoeAttnDtype::Q8_0 => q8_residual_proj(
+            gpu,
+            &layer.wo,
+            &pbs.fa_attn_out_batch,
+            &pbs.x_batch,
+            &pbs.fa_attn_out_rot_batch,
+            n,
+            q8_wmma_arch,
+        )?,
+    }
+
+    // 10. Batched MoE FFN — stateless per row, no slot machinery needed.
+    let ctx = DispatchCtx::new(gpu);
+    prefill_moe_ffn_body_batched(
+        gpu,
+        &layer.ffn,
+        &layer.ffn_norm,
+        config,
+        pbs,
+        n,
+        &ctx,
+        weights_moe_has_mq6,
+        /*routed_out=*/ None,
+    )
+}
+
 /// Final output norm + per-slot last-token logits. Gathers only the last
 /// row of each ACTIVE slot (`m_per_slot[s] > 0`) into a compact
 /// `[n_slots × dim]` block before rmsnorm + the lm_head GEMM, rather than
@@ -1117,8 +1843,11 @@ fn final_logits_per_slot(
 /// `k_base`/`v_base` byte offsets. `dn_states` holds one `DeltaNetState`
 /// per slot (indexed the same as `pool`/`desc_staging`).
 ///
-/// Q8_0-only (see module doc). A non-Q8_0 weight, a non-Q8 `DeltaNetState`,
-/// or a MoE layer returns `Err` rather than guessing at an untested path.
+/// Dense layers are Q8_0-only; `DeltaNetMoe`/`FullAttnMoe` layers additionally
+/// admit uniform MQ4G256 (see module doc). A non-admitted weight dtype, a
+/// non-Q8 `DeltaNetState`, or a MoE FFN dtype combination
+/// `moe_ffn_batched_admissible` rejects returns `Err` rather than guessing at
+/// an untested path.
 #[allow(clippy::too_many_arguments)]
 pub fn forward_batch_slots(
     gpu: &mut Gpu,
@@ -1365,12 +2094,40 @@ pub fn forward_batch_slots_with_max_layer(
                 )?;
                 kv_layer_idx += 1;
             }
-            (LayerWeights::DeltaNetMoe(_), _) | (LayerWeights::FullAttnMoe(_), _) => {
-                return Err(HipError::new(
-                    0,
-                    "forward_batch_slots: MoE layers are out of scope for the \
-                     multi-slot batched path (see sp3-task-2-report.md)",
-                ));
+            (LayerWeights::DeltaNetMoe(layer), LayerType::LinearAttention) => {
+                run_deltanet_moe_layer_slots(
+                    gpu,
+                    config,
+                    layer,
+                    batch,
+                    dn_states,
+                    pbs,
+                    q8_wmma_arch,
+                    n,
+                    delta_layer_idx,
+                    weights.moe_has_mq6,
+                )?;
+                delta_layer_idx += 1;
+            }
+            (LayerWeights::FullAttnMoe(layer), LayerType::FullAttention) => {
+                run_fullattn_moe_layer_slots(
+                    gpu,
+                    config,
+                    layer,
+                    pbs,
+                    s,
+                    &k_arenas[kv_layer_idx],
+                    &v_arenas[kv_layer_idx],
+                    desc_staging,
+                    q8_wmma_arch,
+                    n,
+                    physical_cap,
+                    max_ctx_len,
+                    single_slot,
+                    n_tiles,
+                    weights.moe_has_mq6,
+                )?;
+                kv_layer_idx += 1;
             }
             (_, lt) => {
                 return Err(HipError::new(
