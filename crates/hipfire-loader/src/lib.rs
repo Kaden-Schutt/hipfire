@@ -1781,25 +1781,25 @@ fn load_model_ep_ds4(
             .prepare_tp_graph_signals(config.num_hidden_layers * 2)
             .map_err(|e| format!("prepare gfx1201 TP graph signals: {e:?}"))?;
     } else if compressor_cache == hipfire_config::Deepseek4CompressorCache::F16 {
-        // Single-device gfx1151 MQ2R also carries the F16 compressor cache.
-        // The two F16 kernels are portable to gfx11: compressor_commit_staged
-        // uses no architecture intrinsics, and the indexer score kernel's WMMA
-        // is generation-selected in the source (gfx12 8-wide fragments with a
-        // D row of 8 * k_half + j, gfx11 16-wide fragments with 2 * j +
-        // k_half). Storage stays confined to main_kv_cache and
-        // indexer_kv_cache, halving the two ctx-scaled allocations; commit
-        // arithmetic remains F32 before the single F32-to-F16 store.
-        let gfx1151_mq2r_single = tp <= 1
+        // Single-device MQ2R also carries the F16 compressor cache on any
+        // architecture whose kernels can compile it. Admission is the
+        // capability predicate rather than a chip list: the two F16 sources
+        // select their WMMA fragment layout in-source, so the set that can run
+        // them is "wave32 WMMA on RDNA3 or RDNA4", and that fact belongs in
+        // arch_caps next to the kernels it describes. Storage stays confined
+        // to main_kv_cache and indexer_kv_cache; commit arithmetic remains F32
+        // before the single F32-to-F16 store.
+        let f16_single = tp <= 1
             && config.mq2r
             && !config.mq2rxt
             && staging
                 .gpus_mut()
                 .devices
                 .iter()
-                .all(|device| device.arch.eq_ignore_ascii_case("gfx1151"));
-        if !gfx1151_mq2r_single {
+                .all(|device| device.arch_caps.supports_ds4_f16_compressor_cache());
+        if !f16_single {
             return Err(format!(
-                "DeepSeek V4 compressor_cache=f16 requires gfx1201 MQ2R TP3/TP4 or single-device gfx1151 MQ2R; got tp={tp}, mq2r={}, mq2rxt={}, devices={}",
+                "DeepSeek V4 compressor_cache=f16 requires MQ2R on TP3/TP4 gfx1201, or single-device MQ2R on an architecture with wave32 WMMA (RDNA3/RDNA4); got tp={tp}, mq2r={}, mq2rxt={}, devices={}",
                 config.mq2r,
                 config.mq2rxt,
                 staging

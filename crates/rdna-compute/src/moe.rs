@@ -1505,7 +1505,7 @@ impl Gpu {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn deepseek4_topk_kv_gather_f16_buf_gfx1201(
+    pub fn deepseek4_topk_kv_gather_f16_buf(
         &mut self,
         cache: &GpuTensor,
         topk_idx: &GpuTensor,
@@ -1519,9 +1519,9 @@ impl Gpu {
         scale: f32,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        assert!(self.arch_caps.is_gfx1201() || self.arch.eq_ignore_ascii_case("gfx1151"));
+        assert!(self.arch_caps.supports_ds4_f16_compressor_cache());
         assert_eq!(cache.dtype, DType::F16);
-        let symbol = "deepseek4_topk_kv_gather_f16_buf_gfx1201";
+        let symbol = "deepseek4_topk_kv_gather_f16_buf";
         self.ensure_kernel(
             symbol,
             kernels::DEEPSEEK4_COMPRESSOR_CACHE_F16_SRC,
@@ -1569,7 +1569,7 @@ impl Gpu {
         )
     }
 
-    pub fn deepseek4_topk_kv_gather_identity_f16_buf_gfx1201(
+    pub fn deepseek4_topk_kv_gather_identity_f16_buf(
         &mut self,
         cache: &GpuTensor,
         out: &GpuTensor,
@@ -1579,9 +1579,9 @@ impl Gpu {
         out_stride: i32,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        assert!(self.arch_caps.is_gfx1201() || self.arch.eq_ignore_ascii_case("gfx1151"));
+        assert!(self.arch_caps.supports_ds4_f16_compressor_cache());
         assert_eq!(cache.dtype, DType::F16);
-        let symbol = "deepseek4_topk_kv_gather_identity_f16_buf_gfx1201";
+        let symbol = "deepseek4_topk_kv_gather_identity_f16_buf";
         self.ensure_kernel(
             symbol,
             kernels::DEEPSEEK4_COMPRESSOR_CACHE_F16_SRC,
@@ -1618,7 +1618,7 @@ impl Gpu {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn deepseek4_topk_kv_gather_batched_tiled_f16_gfx1201(
+    pub fn deepseek4_topk_kv_gather_batched_tiled_f16(
         &mut self,
         cache: &GpuTensor,
         topk_idx: &GpuTensor,
@@ -1632,9 +1632,9 @@ impl Gpu {
         batch_size: i32,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        assert!(self.arch_caps.is_gfx1201() || self.arch.eq_ignore_ascii_case("gfx1151"));
+        assert!(self.arch_caps.supports_ds4_f16_compressor_cache());
         assert_eq!(cache.dtype, DType::F16);
-        let symbol = "deepseek4_topk_kv_gather_batched_tiled_f16_gfx1201";
+        let symbol = "deepseek4_topk_kv_gather_batched_tiled_f16";
         self.ensure_kernel(
             symbol,
             kernels::DEEPSEEK4_COMPRESSOR_CACHE_F16_SRC,
@@ -1689,7 +1689,7 @@ impl Gpu {
         )
     }
 
-    pub fn deepseek4_topk_kv_gather_identity_batched_f16_gfx1201(
+    pub fn deepseek4_topk_kv_gather_identity_batched_f16(
         &mut self,
         cache: &GpuTensor,
         out: &GpuTensor,
@@ -1699,9 +1699,9 @@ impl Gpu {
         batch_size: i32,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        assert!(self.arch_caps.is_gfx1201() || self.arch.eq_ignore_ascii_case("gfx1151"));
+        assert!(self.arch_caps.supports_ds4_f16_compressor_cache());
         assert_eq!(cache.dtype, DType::F16);
-        let symbol = "deepseek4_topk_kv_gather_identity_batched_f16_gfx1201";
+        let symbol = "deepseek4_topk_kv_gather_identity_batched_f16";
         self.ensure_kernel(
             symbol,
             kernels::DEEPSEEK4_COMPRESSOR_CACHE_F16_SRC,

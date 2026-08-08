@@ -8,7 +8,7 @@
 
 // Address-only twin of compressor_softmax_pool_f32_buf: slot_buf is the
 // commit gate, while arithmetic lands in one F32 staging row.
-extern "C" __global__ void compressor_softmax_pool_f32_staged_buf_gfx1201(
+extern "C" __global__ void compressor_softmax_pool_f32_staged_buf(
     const float *__restrict__ kv_state,
     const float *__restrict__ score_state, float *__restrict__ staged,
     const int *__restrict__ slot_buf, int T, int head_dim) {
@@ -34,7 +34,7 @@ extern "C" __global__ void compressor_softmax_pool_f32_staged_buf_gfx1201(
 }
 
 // Address-only twin of rmsnorm_f32_at_slot_buf.
-extern "C" __global__ void rmsnorm_f32_staged_buf_gfx1201(
+extern "C" __global__ void rmsnorm_f32_staged_buf(
     float *__restrict__ staged, const float *__restrict__ weight,
     const int *__restrict__ slot_buf, int n, float eps) {
   extern __shared__ float sdata[];
@@ -59,7 +59,7 @@ extern "C" __global__ void rmsnorm_f32_staged_buf_gfx1201(
 
 // Address-only twin of rope_tail_yarn_interleaved_at_slot_buf_f32.
 extern "C" __global__ void
-rope_tail_yarn_interleaved_staged_buf_f32_gfx1201(
+rope_tail_yarn_interleaved_staged_buf_f32(
     float *__restrict__ staged, const int *__restrict__ pos_buf,
     const int *__restrict__ slot_buf, int head_dim, int n_rot,
     float freq_base, float freq_scale, float ext_factor, float attn_factor,
@@ -108,7 +108,7 @@ rope_tail_yarn_interleaved_staged_buf_f32_gfx1201(
   staged[d_odd] = x0 * sin_a + x1 * cos_a;
 }
 
-extern "C" __global__ void cast_f32_to_f16_at_slot_buf_gfx1201(
+extern "C" __global__ void cast_f32_to_f16_at_slot_buf(
     const float *__restrict__ staged, _Float16 *__restrict__ cache,
     const int *__restrict__ slot_buf, int n) {
   const int slot = slot_buf[0];

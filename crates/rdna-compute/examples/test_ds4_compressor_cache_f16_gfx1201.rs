@@ -126,7 +126,7 @@ fn test_staged_commit(gpu: &mut Gpu) {
         D as i32,
     )
     .unwrap();
-    gpu.compressor_softmax_pool_f32_staged_buf_gfx1201(
+    gpu.compressor_softmax_pool_f32_staged_buf(
         &kv_state,
         &score_state,
         &staged,
@@ -137,7 +137,7 @@ fn test_staged_commit(gpu: &mut Gpu) {
     .unwrap();
     gpu.rmsnorm_f32_at_slot_buf(&reference_f32, &weight, &slot, D as i32, 1.0e-6)
         .unwrap();
-    gpu.rmsnorm_f32_staged_buf_gfx1201(&staged, &weight, &slot, D as i32, 1.0e-6)
+    gpu.rmsnorm_f32_staged_buf(&staged, &weight, &slot, D as i32, 1.0e-6)
         .unwrap();
     gpu.rope_tail_yarn_interleaved_at_slot_buf(
         &reference_f32,
@@ -172,7 +172,7 @@ fn test_staged_commit(gpu: &mut Gpu) {
     let reference_f16 = gpu.zeros(&[D], DType::F16).unwrap();
     gpu.cast_f32_to_f16(&reference_slot, &reference_f16)
         .unwrap();
-    gpu.cast_f32_to_f16_at_slot_buf_gfx1201(&staged, &candidate_f16, &slot, D as i32)
+    gpu.cast_f32_to_f16_at_slot_buf(&staged, &candidate_f16, &slot, D as i32)
         .unwrap();
     let candidate_slot = candidate_f16.sub_offset(SLOT * D, D);
     assert_raw_f16_eq(gpu, "staged_commit", &reference_f16, &candidate_slot);
@@ -216,7 +216,7 @@ fn test_readers(gpu: &mut Gpu) {
         D as i32,
     )
     .unwrap();
-    gpu.indexer_relu_score_f16_buf_gfx1201(
+    gpu.indexer_relu_score_f16_buf(
         &q_one,
         &cache_f16,
         &weights_one,
@@ -243,7 +243,7 @@ fn test_readers(gpu: &mut Gpu) {
         B as i32,
     )
     .unwrap();
-    gpu.indexer_relu_score_batched_f16_gfx1201(
+    gpu.indexer_relu_score_batched_f16(
         &q,
         &cache_f16,
         &weights,
@@ -271,7 +271,7 @@ fn test_readers(gpu: &mut Gpu) {
         B as i32,
     )
     .unwrap();
-    gpu.indexer_relu_score_wmma_batched_f16_gfx1201(
+    gpu.indexer_relu_score_wmma_batched_f16(
         &q,
         &cache_f16,
         &weights,
@@ -306,7 +306,7 @@ fn test_readers(gpu: &mut Gpu) {
         0.75,
     )
     .unwrap();
-    gpu.deepseek4_topk_kv_gather_f16_buf_gfx1201(
+    gpu.deepseek4_topk_kv_gather_f16_buf(
         &cache_f16,
         &indices_one,
         &decode_f16,
@@ -336,7 +336,7 @@ fn test_readers(gpu: &mut Gpu) {
         B as i32,
     )
     .unwrap();
-    gpu.deepseek4_topk_kv_gather_batched_tiled_f16_gfx1201(
+    gpu.deepseek4_topk_kv_gather_batched_tiled_f16(
         &cache_f16,
         &indices,
         &gather_f16,
@@ -362,7 +362,7 @@ fn test_readers(gpu: &mut Gpu) {
         B as i32,
     )
     .unwrap();
-    gpu.deepseek4_topk_kv_gather_identity_batched_f16_gfx1201(
+    gpu.deepseek4_topk_kv_gather_identity_batched_f16(
         &cache_f16,
         &identity_f16,
         K as i32,
@@ -384,7 +384,7 @@ fn test_readers(gpu: &mut Gpu) {
         K as i32,
     )
     .unwrap();
-    gpu.deepseek4_topk_kv_gather_identity_f16_buf_gfx1201(
+    gpu.deepseek4_topk_kv_gather_identity_f16_buf(
         &cache_f16,
         &identity_decode_f16,
         &k_one,

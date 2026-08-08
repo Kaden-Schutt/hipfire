@@ -1106,11 +1106,10 @@ impl Carrier for Deepseek4Carrier {
         // F32-to-F16 store.
         let f16_ok = config.mq2r
             && !config.mq2rxt
-            && (ctx.gpu.arch.eq_ignore_ascii_case("gfx1151")
-                || ctx.gpu.arch.eq_ignore_ascii_case("gfx1201"));
+            && ctx.gpu.arch_caps.supports_ds4_f16_compressor_cache();
         if compressor_cache == hipfire_config::Deepseek4CompressorCache::F16 && !f16_ok {
             return Err(format!(
-                "deepseek4: kv_cache=f16 requires MQ2R on gfx1151 or gfx1201; got arch={}, mq2r={}, mq2rxt={}",
+                "deepseek4: kv_cache=f16 requires MQ2R on an architecture with wave32 WMMA (RDNA3/RDNA4); got arch={}, mq2r={}, mq2rxt={}",
                 ctx.gpu.arch, config.mq2r, config.mq2rxt
             ));
         }

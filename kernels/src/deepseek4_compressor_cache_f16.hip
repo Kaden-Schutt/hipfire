@@ -7,7 +7,7 @@
 #define MAX_HEADS 64
 
 extern "C" __global__ __launch_bounds__(MAX_HEADS, 4)
-void indexer_relu_score_f16_buf_gfx1201(
+void indexer_relu_score_f16_buf(
     const float *__restrict__ q, const _Float16 *__restrict__ cache,
     const float *__restrict__ weights, float *__restrict__ scores,
     const int *__restrict__ N_buf, int H, int D) {
@@ -40,7 +40,7 @@ void indexer_relu_score_f16_buf_gfx1201(
 }
 
 extern "C" __global__ __launch_bounds__(MAX_HEADS, 4)
-void indexer_relu_score_batched_f16_gfx1201(
+void indexer_relu_score_batched_f16(
     const float *__restrict__ q, const _Float16 *__restrict__ cache,
     const float *__restrict__ weights,
     const int *__restrict__ n_per_batch, float *__restrict__ scores, int H,
@@ -102,7 +102,7 @@ typedef float __attribute__((ext_vector_type(8))) float8_t;
 #define WARPS_PER_BLOCK 4
 
 __launch_bounds__(128, 2) extern "C" __global__ void
-indexer_relu_score_wmma_batched_f16_gfx1201(
+indexer_relu_score_wmma_batched_f16(
     const float *__restrict__ q, const _Float16 *__restrict__ cache,
     const float *__restrict__ weights,
     const int *__restrict__ n_per_batch, float *__restrict__ scores, int H,
@@ -188,7 +188,7 @@ indexer_relu_score_wmma_batched_f16_gfx1201(
   }
 }
 
-extern "C" __global__ void deepseek4_topk_kv_gather_f16_buf_gfx1201(
+extern "C" __global__ void deepseek4_topk_kv_gather_f16_buf(
     const _Float16 *__restrict__ cache, const int *__restrict__ topk_idx,
     float *__restrict__ out, const int *__restrict__ K_buf,
     const int *__restrict__ N_compressed_buf, int head_dim, int out_stride,
@@ -207,7 +207,7 @@ extern "C" __global__ void deepseek4_topk_kv_gather_f16_buf_gfx1201(
 }
 
 extern "C" __global__ void
-deepseek4_topk_kv_gather_identity_f16_buf_gfx1201(
+deepseek4_topk_kv_gather_identity_f16_buf(
     const _Float16 *__restrict__ cache, float *__restrict__ out,
     const int *__restrict__ K_buf, int head_dim, int out_stride) {
   const int K = K_buf[0];
@@ -219,7 +219,7 @@ deepseek4_topk_kv_gather_identity_f16_buf_gfx1201(
 }
 
 extern "C" __global__ __launch_bounds__(256, 4)
-void deepseek4_topk_kv_gather_batched_tiled_f16_gfx1201(
+void deepseek4_topk_kv_gather_batched_tiled_f16(
     const _Float16 *__restrict__ cache, const int *__restrict__ topk_idx,
     float *__restrict__ out, int K, int head_dim, int N_compressed,
     int out_stride, int col_offset, float scale, int batch_size) {
@@ -265,7 +265,7 @@ void deepseek4_topk_kv_gather_batched_tiled_f16_gfx1201(
 }
 
 extern "C" __global__ void
-deepseek4_topk_kv_gather_identity_batched_f16_gfx1201(
+deepseek4_topk_kv_gather_identity_batched_f16(
     const _Float16 *__restrict__ cache, float *__restrict__ out, int K,
     int head_dim, int out_stride, int batch_size) {
   const int k = blockIdx.x;

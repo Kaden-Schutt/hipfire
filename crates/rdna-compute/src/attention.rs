@@ -8526,7 +8526,7 @@ impl Gpu {
         )
     }
 
-    pub fn compressor_softmax_pool_f32_staged_buf_gfx1201(
+    pub fn compressor_softmax_pool_f32_staged_buf(
         &mut self,
         kv_state: &GpuTensor,
         score_state: &GpuTensor,
@@ -8536,9 +8536,9 @@ impl Gpu {
         head_dim: i32,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        assert!(self.arch_caps.is_gfx1201());
+        assert!(self.arch_caps.supports_ds4_f16_compressor_cache());
         assert_eq!(staged.dtype, DType::F32);
-        let symbol = "compressor_softmax_pool_f32_staged_buf_gfx1201";
+        let symbol = "compressor_softmax_pool_f32_staged_buf";
         self.ensure_kernel(
             symbol,
             kernels::DEEPSEEK4_COMPRESSOR_COMMIT_STAGED_F16_SRC,
@@ -8571,7 +8571,7 @@ impl Gpu {
         })
     }
 
-    pub fn rmsnorm_f32_staged_buf_gfx1201(
+    pub fn rmsnorm_f32_staged_buf(
         &mut self,
         staged: &GpuTensor,
         weight: &GpuTensor,
@@ -8580,8 +8580,8 @@ impl Gpu {
         eps: f32,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        assert!(self.arch_caps.is_gfx1201());
-        let symbol = "rmsnorm_f32_staged_buf_gfx1201";
+        assert!(self.arch_caps.supports_ds4_f16_compressor_cache());
+        let symbol = "rmsnorm_f32_staged_buf";
         self.ensure_kernel(
             symbol,
             kernels::DEEPSEEK4_COMPRESSOR_COMMIT_STAGED_F16_SRC,
@@ -8634,8 +8634,8 @@ impl Gpu {
         corr_high: f32,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        assert!(self.arch_caps.is_gfx1201() || self.arch.eq_ignore_ascii_case("gfx1151"));
-        let symbol = "rope_tail_yarn_interleaved_staged_buf_f32_gfx1201";
+        assert!(self.arch_caps.supports_ds4_f16_compressor_cache());
+        let symbol = "rope_tail_yarn_interleaved_staged_buf_f32";
         self.ensure_kernel(
             symbol,
             kernels::DEEPSEEK4_COMPRESSOR_COMMIT_STAGED_F16_SRC,
@@ -8683,7 +8683,7 @@ impl Gpu {
         })
     }
 
-    pub fn cast_f32_to_f16_at_slot_buf_gfx1201(
+    pub fn cast_f32_to_f16_at_slot_buf(
         &mut self,
         staged: &GpuTensor,
         cache: &GpuTensor,
@@ -8691,10 +8691,10 @@ impl Gpu {
         n: i32,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        assert!(self.arch_caps.is_gfx1201() || self.arch.eq_ignore_ascii_case("gfx1151"));
+        assert!(self.arch_caps.supports_ds4_f16_compressor_cache());
         assert_eq!(staged.dtype, DType::F32);
         assert_eq!(cache.dtype, DType::F16);
-        let symbol = "cast_f32_to_f16_at_slot_buf_gfx1201";
+        let symbol = "cast_f32_to_f16_at_slot_buf";
         self.ensure_kernel(
             symbol,
             kernels::DEEPSEEK4_COMPRESSOR_COMMIT_STAGED_F16_SRC,
@@ -8722,7 +8722,7 @@ impl Gpu {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn indexer_relu_score_f16_buf_gfx1201(
+    pub fn indexer_relu_score_f16_buf(
         &mut self,
         q: &GpuTensor,
         cache: &GpuTensor,
@@ -8734,9 +8734,9 @@ impl Gpu {
         d: i32,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        assert!(self.arch_caps.is_gfx1201() || self.arch.eq_ignore_ascii_case("gfx1151"));
+        assert!(self.arch_caps.supports_ds4_f16_compressor_cache());
         assert_eq!(cache.dtype, DType::F16);
-        let symbol = "indexer_relu_score_f16_buf_gfx1201";
+        let symbol = "indexer_relu_score_f16_buf";
         self.ensure_kernel(
             symbol,
             kernels::DEEPSEEK4_COMPRESSOR_CACHE_F16_SRC,
@@ -8779,7 +8779,7 @@ impl Gpu {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn indexer_relu_score_batched_f16_gfx1201(
+    pub fn indexer_relu_score_batched_f16(
         &mut self,
         q: &GpuTensor,
         cache: &GpuTensor,
@@ -8792,9 +8792,9 @@ impl Gpu {
         batch_size: i32,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        assert!(self.arch_caps.is_gfx1201() || self.arch.eq_ignore_ascii_case("gfx1151"));
+        assert!(self.arch_caps.supports_ds4_f16_compressor_cache());
         assert_eq!(cache.dtype, DType::F16);
-        let symbol = "indexer_relu_score_batched_f16_gfx1201";
+        let symbol = "indexer_relu_score_batched_f16";
         self.ensure_kernel(
             symbol,
             kernels::DEEPSEEK4_COMPRESSOR_CACHE_F16_SRC,
@@ -8843,7 +8843,7 @@ impl Gpu {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn indexer_relu_score_wmma_batched_f16_gfx1201(
+    pub fn indexer_relu_score_wmma_batched_f16(
         &mut self,
         q: &GpuTensor,
         cache: &GpuTensor,
@@ -8856,10 +8856,10 @@ impl Gpu {
         batch_size: i32,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        assert!(self.arch_caps.is_gfx1201() || self.arch.eq_ignore_ascii_case("gfx1151"));
+        assert!(self.arch_caps.supports_ds4_f16_compressor_cache());
         assert_eq!(cache.dtype, DType::F16);
         assert_eq!((h, d), (64, 128));
-        let symbol = "indexer_relu_score_wmma_batched_f16_gfx1201";
+        let symbol = "indexer_relu_score_wmma_batched_f16";
         self.ensure_kernel(
             symbol,
             kernels::DEEPSEEK4_COMPRESSOR_CACHE_F16_SRC,

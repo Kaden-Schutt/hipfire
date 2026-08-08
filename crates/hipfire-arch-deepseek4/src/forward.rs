@@ -2949,7 +2949,7 @@ fn compressor_forward_impl(
         comp_dbg(&*gpu, "concat_kv", concat_kv, 2 * ratio * head_dim);
         comp_dbg(&*gpu, "concat_score", concat_score, 2 * ratio * head_dim);
         if cache_is_f16 {
-            gpu.compressor_softmax_pool_f32_staged_buf_gfx1201(
+            gpu.compressor_softmax_pool_f32_staged_buf(
                 concat_kv,
                 concat_score,
                 commit_f32,
@@ -2971,7 +2971,7 @@ fn compressor_forward_impl(
         }
     } else {
         if cache_is_f16 {
-            gpu.compressor_softmax_pool_f32_staged_buf_gfx1201(
+            gpu.compressor_softmax_pool_f32_staged_buf(
                 kv_state,
                 score_state,
                 commit_f32,
@@ -3029,7 +3029,7 @@ fn compressor_forward_impl(
     };
     comp_dbg_commit_row(&*gpu, "kv_cache(pool)");
     if cache_is_f16 {
-        gpu.rmsnorm_f32_staged_buf_gfx1201(
+        gpu.rmsnorm_f32_staged_buf(
             commit_f32,
             norm,
             &commit_slot_buf,
@@ -3083,7 +3083,7 @@ fn compressor_forward_impl(
     }
     comp_dbg_commit_row(&*gpu, "kv_cache(rope)");
     if cache_is_f16 {
-        gpu.cast_f32_to_f16_at_slot_buf_gfx1201(
+        gpu.cast_f32_to_f16_at_slot_buf(
             commit_f32,
             kv_cache,
             &commit_slot_buf,
@@ -3789,7 +3789,7 @@ fn indexer_forward(
         )
         .map_err(|e| format!("idx score sharded buf l{layer_idx}: {e:?}"))?;
     } else if kv_cache.dtype == DType::F16 {
-        gpu.indexer_relu_score_f16_buf_gfx1201(
+        gpu.indexer_relu_score_f16_buf(
             q_idx,
             kv_cache,
             idx_w,
@@ -8549,7 +8549,7 @@ fn attn_stub(
                     )
                     .map_err(|e| format!("mixed gather sharded (idx,buf) l{layer_idx}: {e:?}"))?;
                 } else if main_kv_cache.dtype == DType::F16 {
-                    gpu.deepseek4_topk_kv_gather_f16_buf_gfx1201(
+                    gpu.deepseek4_topk_kv_gather_f16_buf(
                         main_kv_cache,
                         topk_idx,
                         gathered_k,
@@ -8601,7 +8601,7 @@ fn attn_stub(
                     )
                     .map_err(|e| format!("mixed gather sharded (all,buf) l{layer_idx}: {e:?}"))?;
                 } else if main_kv_cache.dtype == DType::F16 {
-                    gpu.deepseek4_topk_kv_gather_identity_f16_buf_gfx1201(
+                    gpu.deepseek4_topk_kv_gather_identity_f16_buf(
                         main_kv_cache,
                         gathered_k,
                         &k_active_buf,
@@ -12373,7 +12373,7 @@ fn attention_block_batched_mixed(
                     format!("indexer_relu_score_wmma_batched_sharded l{layer_idx}: {e:?}")
                 })?;
             } else if kv_cache.dtype == DType::F16 && use_indexer_wmma {
-                gpu.indexer_relu_score_wmma_batched_f16_gfx1201(
+                gpu.indexer_relu_score_wmma_batched_f16(
                     &pbs.idx_q_batch,
                     kv_cache,
                     &pbs.idx_w_batch,
@@ -12386,7 +12386,7 @@ fn attention_block_batched_mixed(
                 )
                 .map_err(|e| format!("indexer_relu_score_wmma_batched_f16 l{layer_idx}: {e:?}"))?;
             } else if kv_cache.dtype == DType::F16 {
-                gpu.indexer_relu_score_batched_f16_gfx1201(
+                gpu.indexer_relu_score_batched_f16(
                     &pbs.idx_q_batch,
                     kv_cache,
                     &pbs.idx_w_batch,
@@ -12579,7 +12579,7 @@ fn attention_block_batched_mixed(
                         )
                     })?;
                 } else if main_kv_cache.dtype == DType::F16 {
-                    gpu.deepseek4_topk_kv_gather_batched_tiled_f16_gfx1201(
+                    gpu.deepseek4_topk_kv_gather_batched_tiled_f16(
                         main_kv_cache,
                         &pbs.idx_topk_indices_batch,
                         &pbs.topk_staged_batch,
@@ -12593,7 +12593,7 @@ fn attention_block_batched_mixed(
                     )
                     .map_err(|e| {
                         format!(
-                            "deepseek4_topk_kv_gather_batched_tiled_f16_gfx1201 l{layer_idx}: {e:?}"
+                            "deepseek4_topk_kv_gather_batched_tiled_f16 l{layer_idx}: {e:?}"
                         )
                     })?;
                 } else if tiled_gfx1201 || tiled_gfx1151 {
@@ -12677,7 +12677,7 @@ fn attention_block_batched_mixed(
                     format!("deepseek4_topk_kv_gather_identity_batched_sharded l{layer_idx}: {e:?}")
                 })?;
             } else if main_kv_cache.dtype == DType::F16 {
-                gpu.deepseek4_topk_kv_gather_identity_batched_f16_gfx1201(
+                gpu.deepseek4_topk_kv_gather_identity_batched_f16(
                     main_kv_cache,
                     &pbs.topk_staged_batch,
                     gather_n_compressed as i32,
