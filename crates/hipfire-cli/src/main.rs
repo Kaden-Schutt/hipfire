@@ -6156,6 +6156,25 @@ fn apply_http_reasoning_request(
         request["reasoning_effort"] = serde_json::json!("none");
         return Ok(());
     }
+    // Thinking is ON from here down (config default, or explicit
+    // enable_thinking=true / reasoning effort >= minimal). OPEN the <think>
+    // block so the model actually reasons instead of emitting an empty
+    // <think></think> and answering directly.
+    //
+    // Only the thinking-OFF cases above used to set assistant_prefix; the ON
+    // path set none, so the daemon fell back to plain framing and generic
+    // OpenAI clients -- which never send assistant_prefix -- silently got
+    // no-think behaviour. On Qwen3.6 that reasons in plain prose and derails
+    // (LiveBench reasoning ~0).
+    //
+    // This was fixed in the TypeScript CLI in June 2026 (98c65020) and lost
+    // when the CLI was rewritten in Rust: that commit edits cli/index.ts,
+    // which no longer exists, so the fix cannot be cherry-picked -- only
+    // re-applied here.
+    //
+    // Safe for non-thinking models: the daemon's prompt frame falls back to
+    // Plain when the tokenizer has no `<think>` special token.
+    request["assistant_prefix"] = serde_json::json!("open_think");
     if let Some(effort) = effort {
         let max_think = match effort {
             "minimal" => 64,
@@ -12746,6 +12765,8 @@ for line in sys.stdin:
 
             let registry = hipfire_registry::bundled().unwrap();
             let shared = Arc::new(ServeShared {
+                // Test harness drives the single-daemon path.
+                slot_engine: None,
                 runtime: Mutex::new(ServeRuntime {
                     engine,
                     paths: paths.clone(),
