@@ -369,3 +369,40 @@ request, which is what protected the single daemon.
 to the slot count made requests hang (empty responses, engine still up), so the
 wiring is reverted rather than shipped broken. Diagnosing that hang is the next
 step, and it is the only thing between here and genuine concurrency.
+
+
+## Integration testing (2026-08-08)
+
+`scripts/serve_concurrency_gate.sh` is the only test that exercises the path an
+agent actually uses: the real `hipfire` binary, `serve.multi_slot`, real HTTP,
+real OpenAI JSON, and the admission gate. Everything else in the programme is
+in-process — `test_serve_concurrent` drives `SlotEngine` directly and never
+touches HTTP.
+
+```
+sequential 3.41s | concurrent 1.52s | 2.24x | 4/4 distinct | ALL CHECKS PASS
+```
+
+Both negative controls verified to fire:
+
+| control | expected | result |
+|---|---|---|
+| `SERVE_GATE_MIN_SPEEDUP=10` | fail on speedup floor | exit 1 |
+| `HIPFIRE_SERVE_MULTI_SLOT=0` | fail, backend absent | exit 1 |
+
+The second control **initially did not fire**: the script hardcoded
+`HIPFIRE_SERVE_MULTI_SLOT=1`, silently overriding the caller, so the "control"
+ran the same arm as the positive case and passed. Now defaulted rather than
+forced. Same class of mistake as an A/B where the flag moves both arms.
+
+### Harness rules the script encodes
+
+Each was learned by getting it wrong first:
+
+- Liveness is `ss -ltn`, never `pgrep -f`. A `pgrep -f` pattern that appears in
+  the checking command's own argv matches itself and reports UP.
+- Concurrent waits use explicit PIDs, never bare `wait`, which also waits on the
+  backgrounded server and hangs until timeout.
+- Teardown kills the server's **children**, not just the `run-bounded` wrapper.
+  Killing the wrapper leaves the model resident (46 GiB of GTT observed) and
+  every later run is refused by the memory gate.
