@@ -2975,9 +2975,25 @@ impl DeltaNetState {
             + config.linear_num_value_heads * config.linear_value_head_dim;
         let conv_state_size = conv_channels * (config.conv_kernel_dim - 1);
 
+        // EF (error-feedback) residual: MUST mirror the single-GPU ctor's
+        // default (Q8 + HIPFIRE_DN_STATE_EF != "0"). The DeltaNet recurrence
+        // kernel uses the EF residual for deterministic error-feedback
+        // requantization of the Q8 state; without it the stochastic path
+        // produces different state values and pp=2 decode diverges from pp=1
+        // at the first DeltaNet layer (root-caused via per-layer hidden-state
+        // bisect: pos-0 outputs identical, pos-1 dev0 layers diverge).
+        // Allocated per LA layer on its manifest-derived device, in the same
+        // compact-LA order as s_matrices (slot_for_global_layer indexes
+        // s_ef_residual by the compact index).
+        let ef_enabled = quant == StateQuant::Q8
+            && hipfire_config::developer_var("HIPFIRE_DN_STATE_EF")
+                .map(|v| v != "0")
+                .unwrap_or(true);
+
         let mut s_matrices = Vec::new();
         let mut s_scales = Vec::new();
         let mut conv_states = Vec::new();
+        let mut s_ef_residual = Vec::new();
 
         for &dev_idx in la_to_device.iter() {
             let g = &mut gpus.devices[dev_idx as usize];
@@ -3011,16 +3027,16 @@ impl DeltaNetState {
                     s_scales.push(g.zeros(&[n_heads * s_dim], DType::F32)?);
                 }
             }
+            if ef_enabled {
+                s_ef_residual.push(g.zeros(&[s_size], DType::F16)?);
+            }
             conv_states.push(g.zeros(&[conv_state_size], DType::F32)?);
         }
         Ok(Self {
             s_matrices,
             s_scales,
             conv_states,
-            // EF residual not wired for the multi-GPU band split (would need
-            // per-device residual alloc routed by device_for_layer); empty ⇒
-            // ef_residual() returns None ⇒ kernel uses the stochastic path.
-            s_ef_residual: Vec::new(),
+            s_ef_residual,
             quant,
         })
     }
@@ -10970,61 +10986,6 @@ fn run_fused_qkvza_key(
 /// through the batched Step variant; its GEMM kernels have different arch
 /// predicates and launch contracts.
 #[inline]
-#[allow(clippy::too_many_arguments)]
-fn run_fused_qkvza_scalar_key(
-    gpu: &mut Gpu,
-    key: hipfire_dispatch::types::KernelKey,
-    w_qkv: &GpuTensor,
-    w_z: &GpuTensor,
-    w_beta: &GpuTensor,
-    w_alpha: &GpuTensor,
-    x: &GpuTensor,
-    y_qkv: &GpuTensor,
-    y_z: &GpuTensor,
-    y_beta: &GpuTensor,
-    y_alpha: &GpuTensor,
-    qkv_m: usize,
-    z_m: usize,
-    beta_m: usize,
-    alpha_m: usize,
-    k: usize,
-) -> HipResult<()> {
-    use hipfire_dispatch::families::fused_qkv::FusedQkvParams;
-    let ctx = DispatchCtx::new(gpu);
-    let params = FusedQkvParams {
-        kind: key,
-        weights: &[w_qkv, w_z, w_beta, w_alpha],
-        x,
-        outputs: &[y_qkv, y_z, y_beta, y_alpha],
-        m: &[qkv_m, z_m, beta_m, alpha_m],
-        k,
-        rot_scratch: &[],
-        batch_size: None,
-    };
-    hipfire_runtime::llama::fused_qkv_family()
-        .run(&ctx, gpu, &params)
-        .map_err(HipError::from)
-}
-
-fn scalar_qkvza_key(
-    wqkv: DType,
-    wz: DType,
-    w_beta: DType,
-    w_alpha: DType,
-) -> Option<hipfire_dispatch::types::KernelKey> {
-    if wqkv == wz && wz == w_beta && w_beta == w_alpha {
-        match wqkv {
-            DType::MQ4G256 | DType::HFQ4G256 => {
-                Some(hipfire_dispatch::types::KernelKey::FusedQkvzaHfq4G256)
-            }
-            DType::MQ3G256Lloyd => Some(hipfire_dispatch::types::KernelKey::FusedQkvzaMq3G256Lloyd),
-            _ => None,
-        }
-    } else {
-        None
-    }
-}
-
 /// Batched MoE FFN for `forward_prefill_chunk`. Takes the post-attention
 /// residual stream in `pbs.x_batch` ([N × dim]) and writes the FFN output
 /// residual back into the same buffer in-place.
@@ -15462,8 +15423,9 @@ fn run_fa_layer_body(
         gpu.memcpy_htod_auto(&s.pos_buf, &phys.to_ne_bytes())?;
     }
     let ctx = DispatchCtx::new(gpu);
-    let fused_epilogue =
-        kv_cache_attention_dispatch(&ctx, gpu, kv_cache, s, config, &layer.wo, layer_idx, pos)?;
+    let fused_epilogue = kv_cache_attention_dispatch(
+        &ctx, gpu, kv_cache, s, config, &layer.wo, layer_idx, pos, None, None,
+    )?;
 
     if !fused_epilogue {
         gpu.sigmoid_mul_f32(&s.fa_attn_out, &s.fa_gate)?;
@@ -16065,7 +16027,7 @@ fn forward_scratch_layers_inner(
                 }
 
                 let fused_epilogue = kv_cache_attention_dispatch(
-                    &ctx, gpu, kv_cache, s, config, &layer.wo, layer_idx, pos,
+                    &ctx, gpu, kv_cache, s, config, &layer.wo, layer_idx, pos, None, None,
                 )?;
 
                 if !fused_epilogue {
@@ -16340,7 +16302,7 @@ fn forward_scratch_layers_inner(
                 }
 
                 let fused_epilogue = kv_cache_attention_dispatch(
-                    &ctx, gpu, kv_cache, s, config, &layer.wo, layer_idx, pos,
+                    &ctx, gpu, kv_cache, s, config, &layer.wo, layer_idx, pos, None, None,
                 )?;
 
                 if !fused_epilogue {
@@ -17010,6 +16972,8 @@ fn kv_cache_attention_dispatch(
     wo: &WeightTensor,
     layer_idx: usize,
     pos: usize,
+    givens_cos: Option<&GpuTensor>,
+    givens_sin: Option<&GpuTensor>,
 ) -> HipResult<bool> {
     let plan = KvTierPlan::derive(KvTierInputs {
         pos,
@@ -17039,8 +17003,8 @@ fn kv_cache_attention_dispatch(
         batch_size: 1,
         max_ctx_len: 0,
         flash_partials: Some(&s.flash_partials),
-        givens_cos: kv_cache.givens_cos.as_ref(),
-        givens_sin: kv_cache.givens_sin.as_ref(),
+        givens_cos: givens_cos.or(kv_cache.givens_cos.as_ref()),
+        givens_sin: givens_sin.or(kv_cache.givens_sin.as_ref()),
         tree_bias: None,
         block_start: 0,
         block_cols: 0,
@@ -17662,6 +17626,8 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
                     wo,
                     self.layer_idx,
                     self.pos,
+                    None,
+                    None,
                 )?;
                 if !fused_epilogue {
                     gpu.sigmoid_mul_f32(&s.fa_attn_out, &s.fa_gate)?;
@@ -18839,108 +18805,28 @@ fn forward_scratch_layers_multi(
             let givens_sin_dev = gpus.givens_sin_per_dev.get(dev_idx);
             let gpu = &mut gpus.devices[dev_idx];
 
-            // Resolve givens lazily — asym{2,3,4} branches use these,
-            // others don't. Multi-GPU prefers the per-device replica
-            // populated by the KV ctor; fall back to kv_cache.givens_*
-            // for single-GPU shape compatibility (shouldn't fire in
-            // pp > 1 since asym ctors always populate per-device).
-            macro_rules! ct {
-                () => {
-                    givens_cos_dev.unwrap_or_else(|| kv_cache.givens_cos.as_ref().unwrap())
-                };
-            }
-            macro_rules! st {
-                () => {
-                    givens_sin_dev.unwrap_or_else(|| kv_cache.givens_sin.as_ref().unwrap())
-                };
-            }
-
             match (&weights.layers[layer_idx], config.layer_types[layer_idx]) {
                 (LayerWeights::DeltaNet(layer), LayerType::LinearAttention) => {
-                    let x_rot = fused_rmsnorm_rotate_for_mq(
+                    let ctx = DispatchCtx::new(gpu);
+                    // STEP-004 Inc 2: QKVZA via the shared Step-based helper —
+                    // the same fused/unfused dispatch the single-GPU hand path uses.
+                    qkvza_via_execute_steps(
                         gpu,
+                        &ctx,
                         &layer.wqkv,
-                        &s.x,
+                        &layer.wz,
+                        &layer.w_beta,
+                        &layer.w_alpha,
                         &layer.attn_norm,
+                        &s.x,
                         &s.tmp,
                         &s.x_rot,
+                        &s.dn_qkv,
+                        &s.dn_z,
+                        &s.dn_beta,
+                        &s.dn_alpha,
                         config.norm_eps,
                     )?;
-                    let dt = layer.wqkv.gpu_dtype;
-                    let la4_same_dtype = layer.wz.gpu_dtype == dt
-                        && layer.w_beta.gpu_dtype == dt
-                        && layer.w_alpha.gpu_dtype == dt;
-                    let fused_la4_mq4 =
-                        la4_same_dtype && (dt == DType::MQ4G256 || dt == DType::HFQ4G256);
-                    let fused_la4_lloyd_mq3 = la4_same_dtype && dt == DType::MQ3G256Lloyd;
-                    let fused_la4_lloyd_mq4 = la4_same_dtype && dt == DType::MQ4G256Lloyd;
-                    debug_assert_eq!(
-                        scalar_qkvza_key(
-                            layer.wqkv.gpu_dtype,
-                            layer.wz.gpu_dtype,
-                            layer.w_beta.gpu_dtype,
-                            layer.w_alpha.gpu_dtype,
-                        ),
-                        if fused_la4_mq4 {
-                            Some(hipfire_dispatch::types::KernelKey::FusedQkvzaHfq4G256)
-                        } else if fused_la4_lloyd_mq3 {
-                            Some(hipfire_dispatch::types::KernelKey::FusedQkvzaMq3G256Lloyd)
-                        } else {
-                            None
-                        }
-                    );
-                    if fused_la4_mq4 {
-                        let eff_x = match x_rot {
-                            Some(xr) => xr,
-                            None => &s.tmp,
-                        };
-                        run_fused_qkvza_scalar_key(
-                            gpu,
-                            hipfire_dispatch::types::KernelKey::FusedQkvzaHfq4G256,
-                            &layer.wqkv.buf,
-                            &layer.wz.buf,
-                            &layer.w_beta.buf,
-                            &layer.w_alpha.buf,
-                            eff_x,
-                            &s.dn_qkv,
-                            &s.dn_z,
-                            &s.dn_beta,
-                            &s.dn_alpha,
-                            layer.wqkv.m,
-                            layer.wz.m,
-                            layer.w_beta.m,
-                            layer.w_alpha.m,
-                            layer.wqkv.k,
-                        )?;
-                    } else if fused_la4_lloyd_mq3 {
-                        let eff_x = match x_rot {
-                            Some(xr) => xr,
-                            None => &s.tmp,
-                        };
-                        run_fused_qkvza_scalar_key(
-                            gpu,
-                            hipfire_dispatch::types::KernelKey::FusedQkvzaMq3G256Lloyd,
-                            &layer.wqkv.buf,
-                            &layer.wz.buf,
-                            &layer.w_beta.buf,
-                            &layer.w_alpha.buf,
-                            eff_x,
-                            &s.dn_qkv,
-                            &s.dn_z,
-                            &s.dn_beta,
-                            &s.dn_alpha,
-                            layer.wqkv.m,
-                            layer.wz.m,
-                            layer.w_beta.m,
-                            layer.w_alpha.m,
-                            layer.wqkv.k,
-                        )?;
-                    } else {
-                        weight_gemv_prerotated(gpu, &layer.wqkv, &s.tmp, x_rot, &s.dn_qkv)?;
-                        weight_gemv_prerotated(gpu, &layer.wz, &s.tmp, x_rot, &s.dn_z)?;
-                        weight_gemv_prerotated(gpu, &layer.w_beta, &s.tmp, x_rot, &s.dn_beta)?;
-                        weight_gemv_prerotated(gpu, &layer.w_alpha, &s.tmp, x_rot, &s.dn_alpha)?;
-                    }
                     let slot = dn_state
                         .slot_for_global_layer(&config.layer_types, layer_idx)
                         .ok_or_else(|| HipError::new(0, "missing compact DeltaNet state slot"))?;
@@ -18977,7 +18863,6 @@ fn forward_scratch_layers_multi(
                             StateQuant::Q4 => DispatchStateQuant::Q4,
                         },
                     };
-                    let ctx = DispatchCtx::new(gpu);
                     #[cfg(feature = "test-utils")]
                     if crate::test_utils::raw_delta_net_enabled() {
                         crate::test_utils::raw_delta_net_decode_body(
@@ -19007,7 +18892,6 @@ fn forward_scratch_layers_multi(
                             .map_err(|e| HipError::new(0, &e.to_string()))?;
                     }
                     {
-                        let ctx = DispatchCtx::new(gpu);
                         let wr = layer.wo.dispatch_ref();
                         execute_steps_mesh(
                             &DeviceMesh::single(),
@@ -19023,56 +18907,20 @@ fn forward_scratch_layers_multi(
                         .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
                     }
 
-                    let x_rot = fused_rmsnorm_rotate_for_mq(
+                    // STEP-004 Inc 2: gate/up via the shared Step-based helper.
+                    gate_up_via_execute_steps(
                         gpu,
+                        &ctx,
                         &layer.w_gate,
-                        &s.x,
+                        &layer.w_up,
                         &layer.ffn_norm,
+                        &s.x,
                         &s.tmp,
                         &s.x_rot,
+                        &s.gate_ffn,
+                        &s.up,
                         config.norm_eps,
                     )?;
-                    let dt_g = layer.w_gate.gpu_dtype;
-                    let same_dtype = layer.w_up.gpu_dtype == dt_g;
-                    let fused_gu_mq4 =
-                        same_dtype && (dt_g == DType::MQ4G256 || dt_g == DType::HFQ4G256);
-                    let fused_gu_lloyd_mq3 = same_dtype && dt_g == DType::MQ3G256Lloyd;
-                    let fused_gu_lloyd_mq4 = same_dtype && dt_g == DType::MQ4G256Lloyd;
-                    if fused_gu_mq4 {
-                        let eff_x = match x_rot {
-                            Some(xr) => xr,
-                            None => &s.tmp,
-                        };
-                        gpu.fused_gate_up_hfq4g256(
-                            &layer.w_gate.buf,
-                            &layer.w_up.buf,
-                            eff_x,
-                            &s.gate_ffn,
-                            &s.up,
-                            layer.w_gate.m,
-                            layer.w_up.m,
-                            layer.w_gate.k,
-                        )?;
-                    } else if fused_gu_lloyd_mq3 {
-                        let eff_x = match x_rot {
-                            Some(xr) => xr,
-                            None => &s.tmp,
-                        };
-                        gpu.fused_gate_up_mq3g256_lloyd(
-                            &layer.w_gate.buf,
-                            &layer.w_up.buf,
-                            eff_x,
-                            &s.gate_ffn,
-                            &s.up,
-                            layer.w_gate.m,
-                            layer.w_up.m,
-                            layer.w_gate.k,
-                        )?;
-                    } else {
-                        weight_gemv_prerotated(gpu, &layer.w_gate, &s.tmp, x_rot, &s.gate_ffn)?;
-
-                        weight_gemv_prerotated(gpu, &layer.w_up, &s.tmp, x_rot, &s.up)?;
-                    }
                     weight_gemv_swiglu_residual(
                         gpu,
                         &layer.w_down,
@@ -19084,63 +18932,23 @@ fn forward_scratch_layers_multi(
                 }
 
                 (LayerWeights::FullAttn(layer), LayerType::FullAttention) => {
-                    let x_rot = fused_rmsnorm_rotate_for_mq(
+                    let ctx = DispatchCtx::new(gpu);
+                    // STEP-004 Inc 2: QKV via the shared Step-based helper.
+                    qkv_via_execute_steps(
                         gpu,
+                        &ctx,
                         &layer.wq,
-                        &s.x,
+                        &layer.wk,
+                        &layer.wv,
                         &layer.attn_norm,
+                        &s.x,
                         &s.tmp,
                         &s.x_rot,
+                        &s.fa_q_full,
+                        &s.fa_k,
+                        &s.fa_v,
                         config.norm_eps,
                     )?;
-                    let dt = layer.wq.gpu_dtype;
-                    let fa3_same_dtype = layer.wk.gpu_dtype == dt && layer.wv.gpu_dtype == dt;
-                    let fused_fa3_mq4 =
-                        fa3_same_dtype && (dt == DType::MQ4G256 || dt == DType::HFQ4G256);
-                    let fused_fa3_lloyd_mq3 = fa3_same_dtype && dt == DType::MQ3G256Lloyd;
-                    let fused_fa3_lloyd_mq4 = fa3_same_dtype && dt == DType::MQ4G256Lloyd;
-                    if fused_fa3_mq4 {
-                        let eff_x = match x_rot {
-                            Some(xr) => xr,
-                            None => &s.tmp,
-                        };
-                        gpu.fused_qkv_hfq4g256(
-                            &layer.wq.buf,
-                            &layer.wk.buf,
-                            &layer.wv.buf,
-                            eff_x,
-                            &s.fa_q_full,
-                            &s.fa_k,
-                            &s.fa_v,
-                            layer.wq.m,
-                            layer.wk.m,
-                            layer.wv.m,
-                            layer.wq.k,
-                        )?;
-                    } else if fused_fa3_lloyd_mq3 {
-                        let eff_x = match x_rot {
-                            Some(xr) => xr,
-                            None => &s.tmp,
-                        };
-                        gpu.fused_qkv_mq3g256_lloyd(
-                            &layer.wq.buf,
-                            &layer.wk.buf,
-                            &layer.wv.buf,
-                            eff_x,
-                            &s.fa_q_full,
-                            &s.fa_k,
-                            &s.fa_v,
-                            layer.wq.m,
-                            layer.wk.m,
-                            layer.wv.m,
-                            layer.wq.k,
-                        )?;
-                    } else {
-                        weight_gemv_prerotated(gpu, &layer.wq, &s.tmp, x_rot, &s.fa_q_full)?;
-
-                        weight_gemv_prerotated(gpu, &layer.wk, &s.tmp, x_rot, &s.fa_k)?;
-                        weight_gemv_prerotated(gpu, &layer.wv, &s.tmp, x_rot, &s.fa_v)?;
-                    }
                     gpu.deinterleave_f32(
                         &s.fa_q_full,
                         &s.fa_q,
@@ -19156,7 +18964,6 @@ fn forward_scratch_layers_multi(
                         config.head_dim,
                         config.norm_eps,
                     )?;
-                    let kv_dim = config.n_kv_heads * config.head_dim;
                     gpu.rmsnorm_batched(
                         &s.fa_k,
                         &layer.k_norm,
@@ -19186,271 +18993,37 @@ fn forward_scratch_layers_multi(
                         gpu.memcpy_htod_auto(&s.pos_buf, &phys.to_ne_bytes())?;
                     }
 
-                    if kv_cache.quant_asym4 {
-                        let ct = ct!();
-                        let st = st!();
-                        if kv_cache.quant_fwht {
-                            gpu.kv_cache_write_fwht4_fused(
-                                &kv_cache.k_gpu[layer_idx],
-                                &kv_cache.v_gpu[layer_idx],
-                                &s.fa_k,
-                                &s.fa_v,
-                                &s.pos_buf,
-                                ct,
-                                st,
-                                config.n_kv_heads,
-                                config.head_dim,
-                                kv_cache.v_mode_bits(),
-                            )?;
-                            gpu.attention_flash_fwht4(
-                                &s.fa_q,
-                                &kv_cache.k_gpu[layer_idx],
-                                &kv_cache.v_gpu[layer_idx],
-                                &s.fa_attn_out,
-                                &s.pos_buf,
-                                ct,
-                                st,
-                                pos + 1,
-                                config.n_heads,
-                                config.n_kv_heads,
-                                config.head_dim,
-                                kv_cache.physical_cap,
-                                &s.flash_partials,
-                                kv_cache.v_mode_bits(),
-                            )?;
-                        } else {
-                            gpu.kv_cache_write_asym4_fused(
-                                &kv_cache.k_gpu[layer_idx],
-                                &kv_cache.v_gpu[layer_idx],
-                                &s.fa_k,
-                                &s.fa_v,
-                                &s.pos_buf,
-                                ct,
-                                st,
-                                config.n_kv_heads,
-                                config.head_dim,
-                            )?;
-                            gpu.attention_flash_asym4(
-                                &s.fa_q,
-                                &kv_cache.k_gpu[layer_idx],
-                                &kv_cache.v_gpu[layer_idx],
-                                &s.fa_attn_out,
-                                &s.pos_buf,
-                                ct,
-                                st,
-                                pos + 1,
-                                config.n_heads,
-                                config.n_kv_heads,
-                                config.head_dim,
-                                kv_cache.physical_cap,
-                                &s.flash_partials,
-                            )?;
-                        }
-                    } else if kv_cache.quant_asym3 {
-                        let ct = ct!();
-                        let st = st!();
-                        if kv_cache.quant_fwht {
-                            gpu.kv_cache_write_fwht3_fused(
-                                &kv_cache.k_gpu[layer_idx],
-                                &kv_cache.v_gpu[layer_idx],
-                                &s.fa_k,
-                                &s.fa_v,
-                                &s.pos_buf,
-                                ct,
-                                st,
-                                config.n_kv_heads,
-                                config.head_dim,
-                                kv_cache.v_mode_bits(),
-                            )?;
-                            gpu.attention_flash_fwht3(
-                                &s.fa_q,
-                                &kv_cache.k_gpu[layer_idx],
-                                &kv_cache.v_gpu[layer_idx],
-                                &s.fa_attn_out,
-                                &s.pos_buf,
-                                ct,
-                                st,
-                                pos + 1,
-                                config.n_heads,
-                                config.n_kv_heads,
-                                config.head_dim,
-                                kv_cache.physical_cap,
-                                &s.flash_partials,
-                                kv_cache.v_mode_bits(),
-                            )?;
-                        } else {
-                            gpu.kv_cache_write_asym3_fused(
-                                &kv_cache.k_gpu[layer_idx],
-                                &kv_cache.v_gpu[layer_idx],
-                                &s.fa_k,
-                                &s.fa_v,
-                                &s.pos_buf,
-                                ct,
-                                st,
-                                config.n_kv_heads,
-                                config.head_dim,
-                            )?;
-                            gpu.attention_flash_asym3(
-                                &s.fa_q,
-                                &kv_cache.k_gpu[layer_idx],
-                                &kv_cache.v_gpu[layer_idx],
-                                &s.fa_attn_out,
-                                &s.pos_buf,
-                                ct,
-                                st,
-                                pos + 1,
-                                config.n_heads,
-                                config.n_kv_heads,
-                                config.head_dim,
-                                kv_cache.physical_cap,
-                                &s.flash_partials,
-                            )?;
-                        }
-                    } else if kv_cache.quant_asym2 {
-                        let ct = ct!();
-                        let st = st!();
-                        if kv_cache.quant_fwht {
-                            gpu.kv_cache_write_fwht2_fused(
-                                &kv_cache.k_gpu[layer_idx],
-                                &kv_cache.v_gpu[layer_idx],
-                                &s.fa_k,
-                                &s.fa_v,
-                                &s.pos_buf,
-                                ct,
-                                st,
-                                config.n_kv_heads,
-                                config.head_dim,
-                                kv_cache.v_mode_bits(),
-                            )?;
-                            gpu.attention_flash_fwht2(
-                                &s.fa_q,
-                                &kv_cache.k_gpu[layer_idx],
-                                &kv_cache.v_gpu[layer_idx],
-                                &s.fa_attn_out,
-                                &s.pos_buf,
-                                ct,
-                                st,
-                                pos + 1,
-                                config.n_heads,
-                                config.n_kv_heads,
-                                config.head_dim,
-                                kv_cache.physical_cap,
-                                &s.flash_partials,
-                                kv_cache.v_mode_bits(),
-                            )?;
-                        } else {
-                            gpu.kv_cache_write_asym2_fused(
-                                &kv_cache.k_gpu[layer_idx],
-                                &kv_cache.v_gpu[layer_idx],
-                                &s.fa_k,
-                                &s.fa_v,
-                                &s.pos_buf,
-                                ct,
-                                st,
-                                config.n_kv_heads,
-                                config.head_dim,
-                            )?;
-                            gpu.attention_flash_asym2(
-                                &s.fa_q,
-                                &kv_cache.k_gpu[layer_idx],
-                                &kv_cache.v_gpu[layer_idx],
-                                &s.fa_attn_out,
-                                &s.pos_buf,
-                                ct,
-                                st,
-                                pos + 1,
-                                config.n_heads,
-                                config.n_kv_heads,
-                                config.head_dim,
-                                kv_cache.physical_cap,
-                                &s.flash_partials,
-                            )?;
-                        }
-                    } else if kv_cache.quant_q8 {
-                        gpu.kv_cache_write_q8_0(
-                            &kv_cache.k_gpu[layer_idx],
-                            &s.fa_k,
-                            &s.pos_buf,
-                            config.n_kv_heads,
-                            config.head_dim,
-                        )?;
-                        gpu.kv_cache_write_q8_0(
-                            &kv_cache.v_gpu[layer_idx],
-                            &s.fa_v,
-                            &s.pos_buf,
-                            config.n_kv_heads,
-                            config.head_dim,
-                        )?;
-                        let use_flash = gpu.graphs.capture_mode
-                            || s.flash_mode == 2
-                            || (s.flash_mode == 1 && pos + 1 >= 2048)
-                            || pos + 1 > 15000;
-                        if use_flash {
-                            gpu.attention_flash_q8_0(
-                                &s.fa_q,
-                                &kv_cache.k_gpu[layer_idx],
-                                &kv_cache.v_gpu[layer_idx],
-                                &s.fa_attn_out,
-                                &s.pos_buf,
-                                pos + 1,
-                                config.n_heads,
-                                config.n_kv_heads,
-                                config.head_dim,
-                                kv_cache.physical_cap,
-                                &s.flash_partials,
-                            )?;
-                        } else {
-                            gpu.attention_q8_0_kv(
-                                &s.fa_q,
-                                &kv_cache.k_gpu[layer_idx],
-                                &kv_cache.v_gpu[layer_idx],
-                                &s.fa_attn_out,
-                                &s.pos_buf,
-                                pos + 1,
-                                config.n_heads,
-                                config.n_kv_heads,
-                                config.head_dim,
-                                kv_cache.physical_cap,
-                            )?;
-                        }
-                    } else {
-                        gpu.kv_cache_write(
-                            &kv_cache.k_gpu[layer_idx],
-                            &s.fa_k,
-                            &s.pos_buf,
-                            kv_dim,
-                        )?;
-                        gpu.kv_cache_write(
-                            &kv_cache.v_gpu[layer_idx],
-                            &s.fa_v,
-                            &s.pos_buf,
-                            kv_dim,
-                        )?;
-                        gpu.attention_f32(
-                            &s.fa_q,
-                            &kv_cache.k_gpu[layer_idx],
-                            &kv_cache.v_gpu[layer_idx],
-                            &s.fa_attn_out,
-                            &s.pos_buf,
-                            pos + 1,
-                            config.n_heads,
-                            config.n_kv_heads,
-                            config.head_dim,
-                            kv_cache.physical_cap,
-                        )?;
+                    // STEP-004 Inc 2: KV write + attention via the shared
+                    // Step-based dispatch (per-device givens for asym modes).
+                    let fused_epilogue = kv_cache_attention_dispatch(
+                        &ctx,
+                        gpu,
+                        kv_cache,
+                        s,
+                        config,
+                        &layer.wo,
+                        layer_idx,
+                        pos,
+                        givens_cos_dev,
+                        givens_sin_dev,
+                    )?;
+                    if !fused_epilogue {
+                        gpu.sigmoid_mul_f32(&s.fa_attn_out, &s.fa_gate)?;
                     }
-
-                    gpu.sigmoid_mul_f32(&s.fa_attn_out, &s.fa_gate)?;
                     {
-                        let ctx = DispatchCtx::new(gpu);
                         let wr = layer.wo.dispatch_ref();
+                        let input = if fused_epilogue {
+                            GemvInput::Prerotated(&s.fa_attn_out)
+                        } else {
+                            GemvInput::Raw(&s.fa_attn_out)
+                        };
                         execute_steps_mesh(
                             &DeviceMesh::single(),
                             gpu,
                             &ctx,
                             &[Step::GemvResidual {
                                 w: &wr,
-                                input: GemvInput::Raw(&s.fa_attn_out),
+                                input,
                                 residual: &s.x,
                                 out: &s.x,
                             }],
@@ -19458,56 +19031,20 @@ fn forward_scratch_layers_multi(
                         .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
                     }
 
-                    let x_rot = fused_rmsnorm_rotate_for_mq(
+                    // STEP-004 Inc 2: gate/up via the shared Step-based helper.
+                    gate_up_via_execute_steps(
                         gpu,
+                        &ctx,
                         &layer.w_gate,
-                        &s.x,
+                        &layer.w_up,
                         &layer.ffn_norm,
+                        &s.x,
                         &s.tmp,
                         &s.x_rot,
+                        &s.gate_ffn,
+                        &s.up,
                         config.norm_eps,
                     )?;
-                    let dt_g = layer.w_gate.gpu_dtype;
-                    let same_dtype = layer.w_up.gpu_dtype == dt_g;
-                    let fused_gu_mq4 =
-                        same_dtype && (dt_g == DType::MQ4G256 || dt_g == DType::HFQ4G256);
-                    let fused_gu_lloyd_mq3 = same_dtype && dt_g == DType::MQ3G256Lloyd;
-                    let fused_gu_lloyd_mq4 = same_dtype && dt_g == DType::MQ4G256Lloyd;
-                    if fused_gu_mq4 {
-                        let eff_x = match x_rot {
-                            Some(xr) => xr,
-                            None => &s.tmp,
-                        };
-                        gpu.fused_gate_up_hfq4g256(
-                            &layer.w_gate.buf,
-                            &layer.w_up.buf,
-                            eff_x,
-                            &s.gate_ffn,
-                            &s.up,
-                            layer.w_gate.m,
-                            layer.w_up.m,
-                            layer.w_gate.k,
-                        )?;
-                    } else if fused_gu_lloyd_mq3 {
-                        let eff_x = match x_rot {
-                            Some(xr) => xr,
-                            None => &s.tmp,
-                        };
-                        gpu.fused_gate_up_mq3g256_lloyd(
-                            &layer.w_gate.buf,
-                            &layer.w_up.buf,
-                            eff_x,
-                            &s.gate_ffn,
-                            &s.up,
-                            layer.w_gate.m,
-                            layer.w_up.m,
-                            layer.w_gate.k,
-                        )?;
-                    } else {
-                        weight_gemv_prerotated(gpu, &layer.w_gate, &s.tmp, x_rot, &s.gate_ffn)?;
-
-                        weight_gemv_prerotated(gpu, &layer.w_up, &s.tmp, x_rot, &s.up)?;
-                    }
                     weight_gemv_swiglu_residual(
                         gpu,
                         &layer.w_down,
@@ -19519,75 +19056,26 @@ fn forward_scratch_layers_multi(
                 }
 
                 (LayerWeights::DeltaNetMoe(layer), LayerType::LinearAttention) => {
-                    let x_rot = fused_rmsnorm_rotate_for_mq(
+                    let ctx = DispatchCtx::new(gpu);
+                    // STEP-004 Inc 2: QKVZA via the shared Step-based helper —
+                    // the same fused/unfused dispatch the single-GPU hand path uses.
+                    qkvza_via_execute_steps(
                         gpu,
+                        &ctx,
                         &layer.wqkv,
-                        &s.x,
+                        &layer.wz,
+                        &layer.w_beta,
+                        &layer.w_alpha,
                         &layer.attn_norm,
+                        &s.x,
                         &s.tmp,
                         &s.x_rot,
+                        &s.dn_qkv,
+                        &s.dn_z,
+                        &s.dn_beta,
+                        &s.dn_alpha,
                         config.norm_eps,
                     )?;
-                    let dt = layer.wqkv.gpu_dtype;
-                    let la4_same_dtype = layer.wz.gpu_dtype == dt
-                        && layer.w_beta.gpu_dtype == dt
-                        && layer.w_alpha.gpu_dtype == dt;
-                    let fused_la4_mq4 =
-                        la4_same_dtype && (dt == DType::MQ4G256 || dt == DType::HFQ4G256);
-                    let fused_la4_lloyd_mq3 = la4_same_dtype && dt == DType::MQ3G256Lloyd;
-                    let fused_la4_lloyd_mq4 = la4_same_dtype && dt == DType::MQ4G256Lloyd;
-                    if fused_la4_mq4 {
-                        let eff_x = match x_rot {
-                            Some(xr) => xr,
-                            None => &s.tmp,
-                        };
-                        run_fused_qkvza_scalar_key(
-                            gpu,
-                            hipfire_dispatch::types::KernelKey::FusedQkvzaHfq4G256,
-                            &layer.wqkv.buf,
-                            &layer.wz.buf,
-                            &layer.w_beta.buf,
-                            &layer.w_alpha.buf,
-                            eff_x,
-                            &s.dn_qkv,
-                            &s.dn_z,
-                            &s.dn_beta,
-                            &s.dn_alpha,
-                            layer.wqkv.m,
-                            layer.wz.m,
-                            layer.w_beta.m,
-                            layer.w_alpha.m,
-                            layer.wqkv.k,
-                        )?;
-                    } else if fused_la4_lloyd_mq3 {
-                        let eff_x = match x_rot {
-                            Some(xr) => xr,
-                            None => &s.tmp,
-                        };
-                        run_fused_qkvza_scalar_key(
-                            gpu,
-                            hipfire_dispatch::types::KernelKey::FusedQkvzaMq3G256Lloyd,
-                            &layer.wqkv.buf,
-                            &layer.wz.buf,
-                            &layer.w_beta.buf,
-                            &layer.w_alpha.buf,
-                            eff_x,
-                            &s.dn_qkv,
-                            &s.dn_z,
-                            &s.dn_beta,
-                            &s.dn_alpha,
-                            layer.wqkv.m,
-                            layer.wz.m,
-                            layer.w_beta.m,
-                            layer.w_alpha.m,
-                            layer.wqkv.k,
-                        )?;
-                    } else {
-                        weight_gemv_prerotated(gpu, &layer.wqkv, &s.tmp, x_rot, &s.dn_qkv)?;
-                        weight_gemv_prerotated(gpu, &layer.wz, &s.tmp, x_rot, &s.dn_z)?;
-                        weight_gemv_prerotated(gpu, &layer.w_beta, &s.tmp, x_rot, &s.dn_beta)?;
-                        weight_gemv_prerotated(gpu, &layer.w_alpha, &s.tmp, x_rot, &s.dn_alpha)?;
-                    }
                     let slot = dn_state
                         .slot_for_global_layer(&config.layer_types, layer_idx)
                         .ok_or_else(|| HipError::new(0, "missing compact DeltaNet state slot"))?;
@@ -19624,7 +19112,6 @@ fn forward_scratch_layers_multi(
                             StateQuant::Q4 => DispatchStateQuant::Q4,
                         },
                     };
-                    let ctx = DispatchCtx::new(gpu);
                     #[cfg(feature = "test-utils")]
                     if crate::test_utils::raw_delta_net_enabled() {
                         crate::test_utils::raw_delta_net_decode_body(
@@ -19654,7 +19141,6 @@ fn forward_scratch_layers_multi(
                             .map_err(|e| HipError::new(0, &e.to_string()))?;
                     }
                     {
-                        let ctx = DispatchCtx::new(gpu);
                         let wr = layer.wo.dispatch_ref();
                         execute_steps_mesh(
                             &DeviceMesh::single(),
@@ -19690,63 +19176,23 @@ fn forward_scratch_layers_multi(
                 }
 
                 (LayerWeights::FullAttnMoe(layer), LayerType::FullAttention) => {
-                    let x_rot = fused_rmsnorm_rotate_for_mq(
+                    let ctx = DispatchCtx::new(gpu);
+                    // STEP-004 Inc 2: QKV via the shared Step-based helper.
+                    qkv_via_execute_steps(
                         gpu,
+                        &ctx,
                         &layer.wq,
-                        &s.x,
+                        &layer.wk,
+                        &layer.wv,
                         &layer.attn_norm,
+                        &s.x,
                         &s.tmp,
                         &s.x_rot,
+                        &s.fa_q_full,
+                        &s.fa_k,
+                        &s.fa_v,
                         config.norm_eps,
                     )?;
-                    let dt = layer.wq.gpu_dtype;
-                    let fa3_same_dtype = layer.wk.gpu_dtype == dt && layer.wv.gpu_dtype == dt;
-                    let fused_fa3_mq4 =
-                        fa3_same_dtype && (dt == DType::MQ4G256 || dt == DType::HFQ4G256);
-                    let fused_fa3_lloyd_mq3 = fa3_same_dtype && dt == DType::MQ3G256Lloyd;
-                    let fused_fa3_lloyd_mq4 = fa3_same_dtype && dt == DType::MQ4G256Lloyd;
-                    if fused_fa3_mq4 {
-                        let eff_x = match x_rot {
-                            Some(xr) => xr,
-                            None => &s.tmp,
-                        };
-                        gpu.fused_qkv_hfq4g256(
-                            &layer.wq.buf,
-                            &layer.wk.buf,
-                            &layer.wv.buf,
-                            eff_x,
-                            &s.fa_q_full,
-                            &s.fa_k,
-                            &s.fa_v,
-                            layer.wq.m,
-                            layer.wk.m,
-                            layer.wv.m,
-                            layer.wq.k,
-                        )?;
-                    } else if fused_fa3_lloyd_mq3 {
-                        let eff_x = match x_rot {
-                            Some(xr) => xr,
-                            None => &s.tmp,
-                        };
-                        gpu.fused_qkv_mq3g256_lloyd(
-                            &layer.wq.buf,
-                            &layer.wk.buf,
-                            &layer.wv.buf,
-                            eff_x,
-                            &s.fa_q_full,
-                            &s.fa_k,
-                            &s.fa_v,
-                            layer.wq.m,
-                            layer.wk.m,
-                            layer.wv.m,
-                            layer.wq.k,
-                        )?;
-                    } else {
-                        weight_gemv_prerotated(gpu, &layer.wq, &s.tmp, x_rot, &s.fa_q_full)?;
-
-                        weight_gemv_prerotated(gpu, &layer.wk, &s.tmp, x_rot, &s.fa_k)?;
-                        weight_gemv_prerotated(gpu, &layer.wv, &s.tmp, x_rot, &s.fa_v)?;
-                    }
                     gpu.deinterleave_f32(
                         &s.fa_q_full,
                         &s.fa_q,
@@ -19762,7 +19208,6 @@ fn forward_scratch_layers_multi(
                         config.head_dim,
                         config.norm_eps,
                     )?;
-                    let kv_dim = config.n_kv_heads * config.head_dim;
                     gpu.rmsnorm_batched(
                         &s.fa_k,
                         &layer.k_norm,
@@ -19792,271 +19237,37 @@ fn forward_scratch_layers_multi(
                         gpu.memcpy_htod_auto(&s.pos_buf, &phys.to_ne_bytes())?;
                     }
 
-                    if kv_cache.quant_asym4 {
-                        let ct = ct!();
-                        let st = st!();
-                        if kv_cache.quant_fwht {
-                            gpu.kv_cache_write_fwht4_fused(
-                                &kv_cache.k_gpu[layer_idx],
-                                &kv_cache.v_gpu[layer_idx],
-                                &s.fa_k,
-                                &s.fa_v,
-                                &s.pos_buf,
-                                ct,
-                                st,
-                                config.n_kv_heads,
-                                config.head_dim,
-                                kv_cache.v_mode_bits(),
-                            )?;
-                            gpu.attention_flash_fwht4(
-                                &s.fa_q,
-                                &kv_cache.k_gpu[layer_idx],
-                                &kv_cache.v_gpu[layer_idx],
-                                &s.fa_attn_out,
-                                &s.pos_buf,
-                                ct,
-                                st,
-                                pos + 1,
-                                config.n_heads,
-                                config.n_kv_heads,
-                                config.head_dim,
-                                kv_cache.physical_cap,
-                                &s.flash_partials,
-                                kv_cache.v_mode_bits(),
-                            )?;
-                        } else {
-                            gpu.kv_cache_write_asym4_fused(
-                                &kv_cache.k_gpu[layer_idx],
-                                &kv_cache.v_gpu[layer_idx],
-                                &s.fa_k,
-                                &s.fa_v,
-                                &s.pos_buf,
-                                ct,
-                                st,
-                                config.n_kv_heads,
-                                config.head_dim,
-                            )?;
-                            gpu.attention_flash_asym4(
-                                &s.fa_q,
-                                &kv_cache.k_gpu[layer_idx],
-                                &kv_cache.v_gpu[layer_idx],
-                                &s.fa_attn_out,
-                                &s.pos_buf,
-                                ct,
-                                st,
-                                pos + 1,
-                                config.n_heads,
-                                config.n_kv_heads,
-                                config.head_dim,
-                                kv_cache.physical_cap,
-                                &s.flash_partials,
-                            )?;
-                        }
-                    } else if kv_cache.quant_asym3 {
-                        let ct = ct!();
-                        let st = st!();
-                        if kv_cache.quant_fwht {
-                            gpu.kv_cache_write_fwht3_fused(
-                                &kv_cache.k_gpu[layer_idx],
-                                &kv_cache.v_gpu[layer_idx],
-                                &s.fa_k,
-                                &s.fa_v,
-                                &s.pos_buf,
-                                ct,
-                                st,
-                                config.n_kv_heads,
-                                config.head_dim,
-                                kv_cache.v_mode_bits(),
-                            )?;
-                            gpu.attention_flash_fwht3(
-                                &s.fa_q,
-                                &kv_cache.k_gpu[layer_idx],
-                                &kv_cache.v_gpu[layer_idx],
-                                &s.fa_attn_out,
-                                &s.pos_buf,
-                                ct,
-                                st,
-                                pos + 1,
-                                config.n_heads,
-                                config.n_kv_heads,
-                                config.head_dim,
-                                kv_cache.physical_cap,
-                                &s.flash_partials,
-                                kv_cache.v_mode_bits(),
-                            )?;
-                        } else {
-                            gpu.kv_cache_write_asym3_fused(
-                                &kv_cache.k_gpu[layer_idx],
-                                &kv_cache.v_gpu[layer_idx],
-                                &s.fa_k,
-                                &s.fa_v,
-                                &s.pos_buf,
-                                ct,
-                                st,
-                                config.n_kv_heads,
-                                config.head_dim,
-                            )?;
-                            gpu.attention_flash_asym3(
-                                &s.fa_q,
-                                &kv_cache.k_gpu[layer_idx],
-                                &kv_cache.v_gpu[layer_idx],
-                                &s.fa_attn_out,
-                                &s.pos_buf,
-                                ct,
-                                st,
-                                pos + 1,
-                                config.n_heads,
-                                config.n_kv_heads,
-                                config.head_dim,
-                                kv_cache.physical_cap,
-                                &s.flash_partials,
-                            )?;
-                        }
-                    } else if kv_cache.quant_asym2 {
-                        let ct = ct!();
-                        let st = st!();
-                        if kv_cache.quant_fwht {
-                            gpu.kv_cache_write_fwht2_fused(
-                                &kv_cache.k_gpu[layer_idx],
-                                &kv_cache.v_gpu[layer_idx],
-                                &s.fa_k,
-                                &s.fa_v,
-                                &s.pos_buf,
-                                ct,
-                                st,
-                                config.n_kv_heads,
-                                config.head_dim,
-                                kv_cache.v_mode_bits(),
-                            )?;
-                            gpu.attention_flash_fwht2(
-                                &s.fa_q,
-                                &kv_cache.k_gpu[layer_idx],
-                                &kv_cache.v_gpu[layer_idx],
-                                &s.fa_attn_out,
-                                &s.pos_buf,
-                                ct,
-                                st,
-                                pos + 1,
-                                config.n_heads,
-                                config.n_kv_heads,
-                                config.head_dim,
-                                kv_cache.physical_cap,
-                                &s.flash_partials,
-                                kv_cache.v_mode_bits(),
-                            )?;
-                        } else {
-                            gpu.kv_cache_write_asym2_fused(
-                                &kv_cache.k_gpu[layer_idx],
-                                &kv_cache.v_gpu[layer_idx],
-                                &s.fa_k,
-                                &s.fa_v,
-                                &s.pos_buf,
-                                ct,
-                                st,
-                                config.n_kv_heads,
-                                config.head_dim,
-                            )?;
-                            gpu.attention_flash_asym2(
-                                &s.fa_q,
-                                &kv_cache.k_gpu[layer_idx],
-                                &kv_cache.v_gpu[layer_idx],
-                                &s.fa_attn_out,
-                                &s.pos_buf,
-                                ct,
-                                st,
-                                pos + 1,
-                                config.n_heads,
-                                config.n_kv_heads,
-                                config.head_dim,
-                                kv_cache.physical_cap,
-                                &s.flash_partials,
-                            )?;
-                        }
-                    } else if kv_cache.quant_q8 {
-                        gpu.kv_cache_write_q8_0(
-                            &kv_cache.k_gpu[layer_idx],
-                            &s.fa_k,
-                            &s.pos_buf,
-                            config.n_kv_heads,
-                            config.head_dim,
-                        )?;
-                        gpu.kv_cache_write_q8_0(
-                            &kv_cache.v_gpu[layer_idx],
-                            &s.fa_v,
-                            &s.pos_buf,
-                            config.n_kv_heads,
-                            config.head_dim,
-                        )?;
-                        let use_flash = gpu.graphs.capture_mode
-                            || s.flash_mode == 2
-                            || (s.flash_mode == 1 && pos + 1 >= 2048)
-                            || pos + 1 > 15000;
-                        if use_flash {
-                            gpu.attention_flash_q8_0(
-                                &s.fa_q,
-                                &kv_cache.k_gpu[layer_idx],
-                                &kv_cache.v_gpu[layer_idx],
-                                &s.fa_attn_out,
-                                &s.pos_buf,
-                                pos + 1,
-                                config.n_heads,
-                                config.n_kv_heads,
-                                config.head_dim,
-                                kv_cache.physical_cap,
-                                &s.flash_partials,
-                            )?;
-                        } else {
-                            gpu.attention_q8_0_kv(
-                                &s.fa_q,
-                                &kv_cache.k_gpu[layer_idx],
-                                &kv_cache.v_gpu[layer_idx],
-                                &s.fa_attn_out,
-                                &s.pos_buf,
-                                pos + 1,
-                                config.n_heads,
-                                config.n_kv_heads,
-                                config.head_dim,
-                                kv_cache.physical_cap,
-                            )?;
-                        }
-                    } else {
-                        gpu.kv_cache_write(
-                            &kv_cache.k_gpu[layer_idx],
-                            &s.fa_k,
-                            &s.pos_buf,
-                            kv_dim,
-                        )?;
-                        gpu.kv_cache_write(
-                            &kv_cache.v_gpu[layer_idx],
-                            &s.fa_v,
-                            &s.pos_buf,
-                            kv_dim,
-                        )?;
-                        gpu.attention_f32(
-                            &s.fa_q,
-                            &kv_cache.k_gpu[layer_idx],
-                            &kv_cache.v_gpu[layer_idx],
-                            &s.fa_attn_out,
-                            &s.pos_buf,
-                            pos + 1,
-                            config.n_heads,
-                            config.n_kv_heads,
-                            config.head_dim,
-                            kv_cache.physical_cap,
-                        )?;
+                    // STEP-004 Inc 2: KV write + attention via the shared
+                    // Step-based dispatch (per-device givens for asym modes).
+                    let fused_epilogue = kv_cache_attention_dispatch(
+                        &ctx,
+                        gpu,
+                        kv_cache,
+                        s,
+                        config,
+                        &layer.wo,
+                        layer_idx,
+                        pos,
+                        givens_cos_dev,
+                        givens_sin_dev,
+                    )?;
+                    if !fused_epilogue {
+                        gpu.sigmoid_mul_f32(&s.fa_attn_out, &s.fa_gate)?;
                     }
-
-                    gpu.sigmoid_mul_f32(&s.fa_attn_out, &s.fa_gate)?;
                     {
-                        let ctx = DispatchCtx::new(gpu);
                         let wr = layer.wo.dispatch_ref();
+                        let input = if fused_epilogue {
+                            GemvInput::Prerotated(&s.fa_attn_out)
+                        } else {
+                            GemvInput::Raw(&s.fa_attn_out)
+                        };
                         execute_steps_mesh(
                             &DeviceMesh::single(),
                             gpu,
                             &ctx,
                             &[Step::GemvResidual {
                                 w: &wr,
-                                input: GemvInput::Raw(&s.fa_attn_out),
+                                input,
                                 residual: &s.x,
                                 out: &s.x,
                             }],
@@ -20085,6 +19296,9 @@ fn forward_scratch_layers_multi(
 
                 _ => panic!("layer type mismatch at layer {layer_idx}"),
             }
+            // DIAG (mirror of the hand path): per-token hidden-state dump for
+            // pp=1-vs-pp=2 divergence localization (HIPFIRE_DUMP_HIDDEN).
+            dump_hidden_localize(gpu, &s.x, 1, pos, config.dim, layer_idx, "pertoken");
         }
 
         prev_dev = Some(dev_idx);
@@ -20810,42 +20024,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn pp_decode_qkvza_selection_stays_scalar() {
-        assert_eq!(
-            scalar_qkvza_key(
-                DType::MQ4G256,
-                DType::MQ4G256,
-                DType::MQ4G256,
-                DType::MQ4G256
-            ),
-            Some(hipfire_dispatch::types::KernelKey::FusedQkvzaHfq4G256)
-        );
-        // MQ3-Lloyd must remain on the scalar family: gfx10 has no safe
-        // batched QKVZA/GEMM path for this format.
-        assert_eq!(
-            scalar_qkvza_key(
-                DType::MQ3G256Lloyd,
-                DType::MQ3G256Lloyd,
-                DType::MQ3G256Lloyd,
-                DType::MQ3G256Lloyd,
-            ),
-            Some(hipfire_dispatch::types::KernelKey::FusedQkvzaMq3G256Lloyd)
-        );
-        assert_eq!(
-            scalar_qkvza_key(DType::Q8_0, DType::Q8_0, DType::Q8_0, DType::Q8_0),
-            None
-        );
-        assert_eq!(
-            scalar_qkvza_key(
-                DType::MQ4G256,
-                DType::HFQ4G256,
-                DType::MQ4G256,
-                DType::MQ4G256
-            ),
-            None
-        );
-    }
-
     fn x_rot_covers_deltanet_value_width_for_moe_configs() {
         assert_eq!(qwen35_x_rot_len(2048, 0, 4096), 4096);
         assert_eq!(qwen35_x_rot_len(2048, 8192, 4096), 8192);

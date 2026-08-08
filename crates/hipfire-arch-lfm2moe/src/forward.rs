@@ -19,14 +19,18 @@
 //! = 4 (the batched GEMV variants take k_top as a runtime arg).
 
 use crate::config::Lfm2MoeConfig;
-use crate::lfm2moe::{
-    AttnWeights, ConvWeights, DenseFfn, Ffn, Lfm2MoeLayerWeights, Lfm2MoeState, Lfm2MoeWeights,
-    Mixer, MoeFfn,
+use crate::lfm2moe::{Ffn, Lfm2MoeState, Lfm2MoeWeights, Mixer};
+use hipfire_dispatch::families::moe::{ExpertExecutionPlan, RouterPlan};
+use hipfire_dispatch::pipeline::{
+    execute_steps, GemvInput, MoeActivationVariant, MoeProj, ScoreActKind, Step,
 };
-use hipfire_runtime::llama::{
-    fused_silu_mul_rotate_mq_batched_for, rotate_x_mq_for, weight_gemv, weight_gemv_residual,
+use hipfire_dispatch::types::{dtype_rotation_plan, RotationPlan};
+use hipfire_runtime::llama::rotate_x_mq_for;
+use hipfire_runtime::moe_plan::{
+    execute_lowered_moe, lower_moe_steps, MoEExecutionPolicy, MoeExecutionTarget, MoeProgramParts,
+    RoutedMoeStepPhases,
 };
-use rdna_compute::{DType, Gpu};
+use rdna_compute::Gpu;
 
 /// Decode one token; returns the full logits vector.
 ///
@@ -139,15 +143,40 @@ fn decode_step_layers_and_head(
 
     for (l, layer) in weights.layers.iter().enumerate() {
         // ── Mixer block (pre-norm) ──────────────────────────────────────────
-        gpu.rmsnorm_f32(&state.h, &layer.operator_norm, &state.tmp, eps)
-            .map_err(|e| format!("lfm2moe L{l}: operator rmsnorm: {e:?}"))?;
-
+        // STEP-004 Inc 3: norm + projections + qk-norm + RoPE via Step lists.
+        // Rotation is dtype-driven (FWHT for MQ-family weights, none for Q8)
+        // so Prerotated inputs stay valid — mirrors the qwen35 helpers.
         match &layer.mixer {
             Mixer::Conv(c) => {
-                // in_proj → [3*hidden] (B | C_gate | x), Q8 plain.
-                weight_gemv(gpu, &c.in_proj, &state.tmp, &state.conv_bcx)
-                    .map_err(|e| format!("lfm2moe L{l}: conv in_proj: {e}"))?;
-                // double-gated depthwise causal short-conv (advances conv state).
+                let rot = dtype_rotation_plan(c.in_proj.gpu_dtype);
+                let w_in = c.in_proj.dispatch_ref();
+                let ctx = hipfire_dispatch::context::DispatchCtx::new(gpu);
+                execute_steps(
+                    gpu,
+                    &ctx,
+                    &[
+                        Step::RmsnormAutomatic {
+                            x: &state.h,
+                            norm_weight: &layer.operator_norm,
+                            x_plain: &state.tmp,
+                            out: &state.tmp,
+                            awq_scale: None,
+                            k: hidden,
+                            eps,
+                            rotation: rot,
+                        },
+                        Step::Gemv {
+                            w: &w_in,
+                            input: GemvInput::Prerotated(&state.tmp),
+                            out: &state.conv_bcx,
+                        },
+                    ],
+                )
+                .map_err(|e| format!("lfm2moe L{l}: conv in_proj: {e:?}"))?;
+                // STEP-004 inventory exception #5: the double-gated depthwise
+                // causal short-conv mixer is stateful and architecturally
+                // unique; the per-call Step path keeps it direct (the lowered
+                // substrate handles it via SuperOpKind::Conv).
                 gpu.conv1d_gated_decode_f32(
                     &state.conv_bcx,
                     &state.conv_states[c.conv_state_idx],
@@ -159,35 +188,79 @@ fn decode_step_layers_and_head(
                 )
                 .map_err(|e| format!("lfm2moe L{l}: conv gated decode: {e:?}"))?;
                 // out_proj + residual: h += W_out · y (Q8).
-                weight_gemv_residual(gpu, &c.out_proj, &state.conv_y, &state.h)
-                    .map_err(|e| format!("lfm2moe L{l}: conv out_proj: {e}"))?;
+                let w_out = c.out_proj.dispatch_ref();
+                execute_steps(
+                    gpu,
+                    &ctx,
+                    &[Step::GemvResidual {
+                        w: &w_out,
+                        input: GemvInput::Raw(&state.conv_y),
+                        residual: &state.h,
+                        out: &state.h,
+                    }],
+                )
+                .map_err(|e| format!("lfm2moe L{l}: conv out_proj: {e:?}"))?;
             }
             Mixer::Attention(a) => {
-                weight_gemv(gpu, &a.wq, &state.tmp, &state.fa_q)
-                    .map_err(|e| format!("lfm2moe L{l}: q_proj: {e}"))?;
-                weight_gemv(gpu, &a.wk, &state.tmp, &state.fa_k)
-                    .map_err(|e| format!("lfm2moe L{l}: k_proj: {e}"))?;
-                weight_gemv(gpu, &a.wv, &state.tmp, &state.fa_v)
-                    .map_err(|e| format!("lfm2moe L{l}: v_proj: {e}"))?;
-
-                // Per-HEAD QK-norm: RMSNorm over each head's head_dim slice,
-                // sharing the [head_dim] weight across heads (batch = n_heads).
-                gpu.rmsnorm_batched(&state.fa_q, &a.q_norm, &state.fa_q, n_heads, head_dim, eps)
-                    .map_err(|e| format!("lfm2moe L{l}: q_norm: {e:?}"))?;
-                gpu.rmsnorm_batched(&state.fa_k, &a.k_norm, &state.fa_k, n_kv, head_dim, eps)
-                    .map_err(|e| format!("lfm2moe L{l}: k_norm: {e:?}"))?;
-
-                // Full-dim rotate_half RoPE (no partial rotary).
-                gpu.rope_f32(
-                    &state.fa_q,
-                    &state.fa_k,
-                    &state.pos_buf,
-                    n_heads,
-                    n_kv,
-                    head_dim,
-                    cfg.rope_theta,
-                )
-                .map_err(|e| format!("lfm2moe L{l}: rope: {e:?}"))?;
+                let rot = dtype_rotation_plan(a.wq.gpu_dtype);
+                let (wq, wk, wv) = (
+                    a.wq.dispatch_ref(),
+                    a.wk.dispatch_ref(),
+                    a.wv.dispatch_ref(),
+                );
+                let ctx = hipfire_dispatch::context::DispatchCtx::new(gpu);
+                let steps = [
+                    Step::RmsnormAutomatic {
+                        x: &state.h,
+                        norm_weight: &layer.operator_norm,
+                        x_plain: &state.tmp,
+                        out: &state.tmp,
+                        awq_scale: None,
+                        k: hidden,
+                        eps,
+                        rotation: rot,
+                    },
+                    Step::Gemv {
+                        w: &wq,
+                        input: GemvInput::Prerotated(&state.tmp),
+                        out: &state.fa_q,
+                    },
+                    Step::Gemv {
+                        w: &wk,
+                        input: GemvInput::Prerotated(&state.tmp),
+                        out: &state.fa_k,
+                    },
+                    Step::Gemv {
+                        w: &wv,
+                        input: GemvInput::Prerotated(&state.tmp),
+                        out: &state.fa_v,
+                    },
+                    Step::QkNorm {
+                        x: &state.fa_q,
+                        weight: &a.q_norm,
+                        n_groups: n_heads,
+                        head_dim,
+                        eps,
+                    },
+                    Step::QkNorm {
+                        x: &state.fa_k,
+                        weight: &a.k_norm,
+                        n_groups: n_kv,
+                        head_dim,
+                        eps,
+                    },
+                    Step::Rope {
+                        q: &state.fa_q,
+                        k: &state.fa_k,
+                        pos_buf: &state.pos_buf,
+                        n_heads,
+                        n_kv_heads: n_kv,
+                        head_dim,
+                        theta: cfg.rope_theta,
+                    },
+                ];
+                execute_steps(gpu, &ctx, &steps)
+                    .map_err(|e| format!("lfm2moe L{l}: attention prep: {e:?}"))?;
 
                 // KV cache write (Q8) + GQA flash attention.
                 let kv_idx = a.kv_idx;
@@ -222,8 +295,19 @@ fn decode_step_layers_and_head(
                 .map_err(|e| format!("lfm2moe L{l}: attention: {e:?}"))?;
 
                 // out_proj + residual: h += W_out · attn_out (Q8).
-                weight_gemv_residual(gpu, &a.wo, &state.fa_attn_out, &state.h)
-                    .map_err(|e| format!("lfm2moe L{l}: out_proj: {e}"))?;
+                let wo_ref = a.wo.dispatch_ref();
+                let ctx = hipfire_dispatch::context::DispatchCtx::new(gpu);
+                execute_steps(
+                    gpu,
+                    &ctx,
+                    &[Step::GemvResidual {
+                        w: &wo_ref,
+                        input: GemvInput::Raw(&state.fa_attn_out),
+                        residual: &state.h,
+                        out: &state.h,
+                    }],
+                )
+                .map_err(|e| format!("lfm2moe L{l}: out_proj: {e:?}"))?;
             }
         }
 
@@ -237,22 +321,90 @@ fn decode_step_layers_and_head(
         }
 
         // ── FFN block (pre-norm): dense SwiGLU OR top-4 MoE ─────────────────
-        gpu.rmsnorm_f32(&state.h, &layer.ffn_norm, &state.ffn_tmp, eps)
-            .map_err(|e| format!("lfm2moe L{l}: ffn rmsnorm: {e:?}"))?;
-
+        // STEP-004 Inc 3: dense FFN through the Step interpreter (dtype-driven
+        // rotation; the gate_up window fuses where eligible).
         match &layer.ffn {
             Ffn::Dense(d) => {
-                weight_gemv(gpu, &d.w1, &state.ffn_tmp, &state.dense_gate)
-                    .map_err(|e| format!("lfm2moe L{l}: dense w1: {e}"))?;
-                weight_gemv(gpu, &d.w3, &state.ffn_tmp, &state.dense_up)
-                    .map_err(|e| format!("lfm2moe L{l}: dense w3: {e}"))?;
-                gpu.silu_mul_f32(&state.dense_gate, &state.dense_up, &state.dense_act)
-                    .map_err(|e| format!("lfm2moe L{l}: dense silu_mul: {e:?}"))?;
-                weight_gemv_residual(gpu, &d.w2, &state.dense_act, &state.h)
-                    .map_err(|e| format!("lfm2moe L{l}: dense w2: {e}"))?;
+                let rot = dtype_rotation_plan(d.w1.gpu_dtype);
+                let (w1, w3, w2) = (
+                    d.w1.dispatch_ref(),
+                    d.w3.dispatch_ref(),
+                    d.w2.dispatch_ref(),
+                );
+                let ctx = hipfire_dispatch::context::DispatchCtx::new(gpu);
+                let steps = [
+                    Step::RmsnormAutomatic {
+                        x: &state.h,
+                        norm_weight: &layer.ffn_norm,
+                        x_plain: &state.tmp,
+                        out: &state.ffn_tmp,
+                        awq_scale: None,
+                        k: hidden,
+                        eps,
+                        rotation: rot,
+                    },
+                    Step::Gemv {
+                        w: &w1,
+                        input: GemvInput::Prerotated(&state.ffn_tmp),
+                        out: &state.dense_gate,
+                    },
+                    Step::Gemv {
+                        w: &w3,
+                        input: GemvInput::Prerotated(&state.ffn_tmp),
+                        out: &state.dense_up,
+                    },
+                    Step::SiluMul {
+                        gate: &state.dense_gate,
+                        up: &state.dense_up,
+                        out: &state.dense_act,
+                    },
+                ];
+                execute_steps(gpu, &ctx, &steps)
+                    .map_err(|e| format!("lfm2moe L{l}: dense w1/w3: {e:?}"))?;
+                execute_steps(
+                    gpu,
+                    &ctx,
+                    &[Step::GemvResidual {
+                        w: &w2,
+                        input: GemvInput::Raw(&state.dense_act),
+                        residual: &state.h,
+                        out: &state.h,
+                    }],
+                )
+                .map_err(|e| format!("lfm2moe L{l}: dense w2: {e:?}"))?;
             }
             Ffn::Moe(m) => {
-                // FWHT-rotate the FFN input for the MQ4 experts (router stays plain).
+                let w_r = m.router.dispatch_ref();
+                let ctx = hipfire_dispatch::context::DispatchCtx::new(gpu);
+                // STEP-004 Inc 3: ffn norm + router + sigmoid + bias-aware
+                // top-k via Steps (ScoreActivation + MoeRoute launch the same
+                // two kernels the direct path ran, in the same order). The
+                // norm stays PLAIN (RotationPlan::None): the Q8 router reads
+                // the plain input and the MQ4 experts rotate via the direct
+                // rotate_x_mq_for below (same split as minimax).
+                let steps = [
+                    Step::RmsnormAutomatic {
+                        x: &state.h,
+                        norm_weight: &layer.ffn_norm,
+                        x_plain: &state.tmp,
+                        out: &state.ffn_tmp,
+                        awq_scale: None,
+                        k: hidden,
+                        eps,
+                        rotation: RotationPlan::None,
+                    },
+                    Step::Gemv {
+                        w: &w_r,
+                        input: GemvInput::Raw(&state.ffn_tmp),
+                        out: &state.router_logits,
+                    },
+                ];
+                execute_steps(gpu, &ctx, &steps)
+                    .map_err(|e| format!("lfm2moe L{l}: router: {e:?}"))?;
+
+                // FWHT-rotate the FFN input for the MQ4 experts (router stays
+                // plain). Family scaling lives outside the routed program
+                // (same split as minimax).
                 rotate_x_mq_for(
                     gpu,
                     &m.experts[0].gate_up,
@@ -262,103 +414,114 @@ fn decode_step_layers_and_head(
                 )
                 .map_err(|e| format!("lfm2moe L{l}: ffn rotate: {e:?}"))?;
 
-                // Router: sigmoid(logits) + bias-aware top-k (gather unbiased,
-                // renormalize, scale). expert_bias steers SELECTION only.
-                weight_gemv(gpu, &m.router, &state.ffn_tmp, &state.router_logits)
-                    .map_err(|e| format!("lfm2moe L{l}: router: {e}"))?;
-                gpu.sigmoid_f32(&state.router_logits)
-                    .map_err(|e| format!("lfm2moe L{l}: sigmoid: {e:?}"))?;
-                gpu.deepseek4_moe_topk_bias_aware_f32(
-                    &state.router_logits,
-                    &m.expert_bias,
-                    &state.topk_indices,
-                    &state.topk_weights,
-                    n_exp as i32,
-                    k_top as i32,
-                    cfg.routed_scaling_factor,
-                )
-                .map_err(|e| format!("lfm2moe L{l}: topk: {e:?}"))?;
-
-                // gate_up (rotated input, batched k_top) → silu·mul·rotate → down → combine.
-                // Experts are uniform per layer (gate_up/down share dtype). MQ6G256
-                // experts use the HFQ6 (200 B/group, 6-bit) indexed kernels; MQ4G256
-                // (default) uses the HFQ4 (136 B/group, 4-bit) siblings. Both consume
-                // the same FWHT-rotated `ffn_x_rot` — only the weight dequant differs.
-                let experts_mq6 = m.experts[0].gate_up.gpu_dtype == DType::MQ6G256;
-                if experts_mq6 {
-                    gpu.gemv_hfq6g256_moe_gate_up_k8_indexed_batched(
-                        &m.expert_gate_up_ptrs,
-                        &state.topk_indices,
-                        &state.ffn_x_rot,
-                        &state.gate_batch,
-                        &state.up_batch,
-                        2 * moe_inter,
-                        hidden,
+                // Routed expert program (sigmoid → bias-aware top-k →
+                // gate_up → silu·mul·rotate → down → combine): built from the
+                // shared Step building blocks and lowered through the
+                // manifest-born ExpertGroupPlan (lower_moe_steps) + the
+                // sealed Single executor. The launch schedule is derived from
+                // the concrete borrowed steps; the kernels are the same
+                // indexed-MoE family the direct sequence launched (MQ4→HFQ4,
+                // MQ6→HFQ6 by the expert refs' dtype) — the combine
+                // accumulates into the residual (the Single executor never
+                // zeroes `out`).
+                let gu_ref = hipfire_dispatch::families::moe::MoeExpertRef {
+                    gate_up_ptrs: &m.expert_gate_up_ptrs,
+                    down_ptrs: &m.expert_down_ptrs,
+                    dummy_gate_up: None,
+                    dtype: m.experts[0].gate_up.gpu_dtype,
+                    n_experts: n_exp,
+                    expert_m: moe_inter,
+                    expert_k: hidden,
+                    owned: &[],
+                };
+                let dn_ref = hipfire_dispatch::families::moe::MoeExpertRef {
+                    gate_up_ptrs: &m.expert_gate_up_ptrs,
+                    down_ptrs: &m.expert_down_ptrs,
+                    dummy_gate_up: None,
+                    dtype: m.experts[0].down.gpu_dtype,
+                    n_experts: n_exp,
+                    expert_m: moe_inter,
+                    expert_k: hidden,
+                    owned: &[],
+                };
+                let phases = RoutedMoeStepPhases {
+                    router: vec![
+                        Step::ScoreActivation {
+                            scores: &state.router_logits,
+                            kind: ScoreActKind::Sigmoid,
+                        },
+                        Step::MoeRoute {
+                            scores: &state.router_logits,
+                            gate_bias: &m.expert_bias,
+                            topk_indices: &state.topk_indices,
+                            topk_weights: &state.topk_weights,
+                            k: k_top,
+                            n_experts: n_exp,
+                            route_scale: cfg.routed_scaling_factor,
+                        },
+                    ],
+                    gate_up: vec![Step::IndexedMoeGemv {
+                        experts: &gu_ref,
+                        which: MoeProj::GateUp {
+                            up_out: &state.up_batch,
+                        },
+                        topk_indices: &state.topk_indices,
+                        input: GemvInput::Prerotated(&state.ffn_x_rot),
+                        out: &state.gate_batch,
                         k_top,
-                        1,
-                    )
-                    .map_err(|e| format!("lfm2moe L{l}: gate_up(mq6): {e:?}"))?;
-                } else {
-                    gpu.gemv_hfq4g256_moe_gate_up_k8_indexed_batched(
-                        &m.expert_gate_up_ptrs,
-                        &state.topk_indices,
-                        &state.ffn_x_rot,
-                        &state.gate_batch,
-                        &state.up_batch,
-                        2 * moe_inter,
-                        hidden,
+                        batch_size: 1,
+                    }],
+                    activation: vec![Step::MoeActivation {
+                        variant: MoeActivationVariant::MinimaxFused {
+                            awq_scale: m.experts[0].down.awq_scale.as_ref(),
+                        },
+                        gate: &state.gate_batch,
+                        up: &state.up_batch,
+                        rot_out: &state.rot_batch,
+                        inter: moe_inter,
                         k_top,
-                        1,
-                    )
-                    .map_err(|e| format!("lfm2moe L{l}: gate_up: {e:?}"))?;
-                }
-
-                fused_silu_mul_rotate_mq_batched_for(
-                    gpu,
-                    &m.experts[0].down,
-                    &state.gate_batch,
-                    &state.up_batch,
-                    &state.rot_batch,
-                    moe_inter,
-                    k_top,
-                )
-                .map_err(|e| format!("lfm2moe L{l}: silu_mul_rotate: {e:?}"))?;
-
-                if experts_mq6 {
-                    gpu.gemv_hfq6g256_moe_down_k8_indexed_batched_expanded(
-                        &m.expert_down_ptrs,
-                        &state.topk_indices,
-                        &state.rot_batch,
-                        &state.down_expanded,
-                        hidden,
-                        moe_inter,
+                    }],
+                    down: vec![Step::IndexedMoeGemv {
+                        experts: &dn_ref,
+                        which: MoeProj::DownExpanded,
+                        topk_indices: &state.topk_indices,
+                        input: GemvInput::Prerotated(&state.rot_batch),
+                        out: &state.down_expanded,
                         k_top,
-                        1,
-                    )
-                    .map_err(|e| format!("lfm2moe L{l}: down(mq6): {e:?}"))?;
-                } else {
-                    gpu.gemv_hfq4g256_moe_down_k8_indexed_batched_expanded(
-                        &m.expert_down_ptrs,
-                        &state.topk_indices,
-                        &state.rot_batch,
-                        &state.down_expanded,
+                        batch_size: 1,
+                    }],
+                    combine: vec![Step::MoeCombine {
+                        down_out: &state.down_expanded,
+                        topk_weights: &state.topk_weights,
+                        out: &state.h,
+                        k: k_top,
                         hidden,
-                        moe_inter,
+                        batch_size: 1,
+                        inverse_perm: None,
+                    }],
+                    finish: Vec::new(),
+                };
+                let parts = MoeProgramParts {
+                    router: RouterPlan::SigmoidTopK {
+                        scores: &state.router_logits,
+                        topk_indices: &state.topk_indices,
+                        topk_weights: &state.topk_weights,
                         k_top,
-                        1,
-                    )
-                    .map_err(|e| format!("lfm2moe L{l}: down: {e:?}"))?;
-                }
-
-                gpu.moe_down_combine_k8_batched(
-                    &state.down_expanded,
-                    &state.topk_weights,
-                    &state.h,
-                    hidden,
-                    k_top,
-                    1,
-                )
-                .map_err(|e| format!("lfm2moe L{l}: combine: {e:?}"))?;
+                        normalize: true,
+                        route_scale: cfg.routed_scaling_factor,
+                    },
+                    execution: ExpertExecutionPlan::IndexedQuantized,
+                    ranks: vec![phases],
+                };
+                let plan = weights
+                    .moe_group_plans(cfg)
+                    .map_err(|e| format!("lfm2moe L{l}: expert-group plan: {e}"))?
+                    .by_layer(l)?;
+                let policy = MoEExecutionPolicy::single();
+                let program = lower_moe_steps(plan, &policy, parts)
+                    .map_err(|e| format!("lfm2moe L{l}: lower_moe_steps: {e:?}"))?;
+                execute_lowered_moe(&program, MoeExecutionTarget::Single { gpu, ctx: &ctx })
+                    .map_err(|e| format!("lfm2moe L{l}: execute_lowered_moe: {e:?}"))?;
             }
         }
 
@@ -375,274 +538,33 @@ fn decode_step_layers_and_head(
     state.n_tokens = seq_len;
 
     // Final RMSNorm + lm_head (tied to embed_tokens, Q8).
-    gpu.rmsnorm_f32(
-        &state.h,
-        &weights.embedding_norm,
-        &state.final_norm_buf,
-        eps,
-    )
-    .map_err(|e| format!("lfm2moe: final rmsnorm: {e:?}"))?;
-    weight_gemv(gpu, &weights.lm_head, &state.final_norm_buf, &state.logits)
-        .map_err(|e| format!("lfm2moe: lm_head: {e}"))?;
-    Ok(())
-}
-
-/// Conv mixer block (operator-norm folded in). Mirrors the hand-loop Conv arm.
-fn conv_mixer_block(
-    gpu: &mut Gpu,
-    cfg: &Lfm2MoeConfig,
-    op_norm: &rdna_compute::GpuTensor,
-    c: &ConvWeights,
-    state: &Lfm2MoeState,
-    l: usize,
-) -> Result<(), String> {
-    let hidden = cfg.hidden_size;
-    gpu.rmsnorm_f32(&state.h, op_norm, &state.tmp, cfg.rms_norm_eps)
-        .map_err(|e| format!("lfm2moe L{l}: operator rmsnorm: {e:?}"))?;
-    weight_gemv(gpu, &c.in_proj, &state.tmp, &state.conv_bcx)
-        .map_err(|e| format!("lfm2moe L{l}: conv in_proj: {e}"))?;
-    gpu.conv1d_gated_decode_f32(
-        &state.conv_bcx,
-        &state.conv_states[c.conv_state_idx],
-        &c.conv_weight,
-        &state.conv_y,
-        1,
-        hidden,
-        cfg.conv_kernel_size,
-    )
-    .map_err(|e| format!("lfm2moe L{l}: conv gated decode: {e:?}"))?;
-    weight_gemv_residual(gpu, &c.out_proj, &state.conv_y, &state.h)
-        .map_err(|e| format!("lfm2moe L{l}: conv out_proj: {e}"))
-}
-
-/// Attention mixer block (operator-norm folded in). Mirrors the hand-loop Attn arm.
-fn attn_mixer_block(
-    gpu: &mut Gpu,
-    cfg: &Lfm2MoeConfig,
-    op_norm: &rdna_compute::GpuTensor,
-    a: &AttnWeights,
-    state: &Lfm2MoeState,
-    l: usize,
-    seq_len: usize,
-) -> Result<(), String> {
-    let head_dim = cfg.head_dim;
-    let n_heads = cfg.num_attention_heads;
-    let n_kv = cfg.num_key_value_heads;
-    let eps = cfg.rms_norm_eps;
-    gpu.rmsnorm_f32(&state.h, op_norm, &state.tmp, eps)
-        .map_err(|e| format!("lfm2moe L{l}: operator rmsnorm: {e:?}"))?;
-    weight_gemv(gpu, &a.wq, &state.tmp, &state.fa_q)
-        .map_err(|e| format!("lfm2moe L{l}: q_proj: {e}"))?;
-    weight_gemv(gpu, &a.wk, &state.tmp, &state.fa_k)
-        .map_err(|e| format!("lfm2moe L{l}: k_proj: {e}"))?;
-    weight_gemv(gpu, &a.wv, &state.tmp, &state.fa_v)
-        .map_err(|e| format!("lfm2moe L{l}: v_proj: {e}"))?;
-    gpu.rmsnorm_batched(&state.fa_q, &a.q_norm, &state.fa_q, n_heads, head_dim, eps)
-        .map_err(|e| format!("lfm2moe L{l}: q_norm: {e:?}"))?;
-    gpu.rmsnorm_batched(&state.fa_k, &a.k_norm, &state.fa_k, n_kv, head_dim, eps)
-        .map_err(|e| format!("lfm2moe L{l}: k_norm: {e:?}"))?;
-    gpu.rope_f32(
-        &state.fa_q,
-        &state.fa_k,
-        &state.pos_buf,
-        n_heads,
-        n_kv,
-        head_dim,
-        cfg.rope_theta,
-    )
-    .map_err(|e| format!("lfm2moe L{l}: rope: {e:?}"))?;
-    let kv_idx = a.kv_idx;
-    // KV write (Q8) + attention via the shared KV-usage abstraction. lfm2moe is
-    // Q8 non-flash unconditional → derive's q8_attend_key returns AttnQ8_0Kv at
-    // pos+1<=15000 (byte-identical; needs no partials, hence flash_partials:
-    // None). It flips to AttnFlashQ8_0 at pos+1>15000 (the documented
-    // Q8-fidelity edge — rare for this decode model). capture_mode is NOT
-    // threaded: the non-flash kernel is capture-safe and lfm2moe captures it.
+    let rot = dtype_rotation_plan(weights.lm_head.gpu_dtype);
+    let w_head = weights.lm_head.dispatch_ref();
     let ctx = hipfire_dispatch::context::DispatchCtx::new(gpu);
-    let plan = hipfire_dispatch::families::kv_tier::KvTierPlan::derive(
-        hipfire_dispatch::families::kv_tier::KvTierInputs {
-            pos: seq_len - 1,
-            ..state.kv.tier_inputs()
-        },
-    )
-    .map_err(|e| format!("lfm2moe L{l}: kv tier: {e}"))?;
-    let io = hipfire_dispatch::families::attention::AttnParams {
-        q: &state.fa_q,
-        k: &state.fa_k,
-        v: &state.fa_v,
-        k_cache: &state.kv.k_gpu[kv_idx],
-        v_cache: &state.kv.v_gpu[kv_idx],
-        k_scales: None,
-        v_scales: None,
-        pos_buf: &state.pos_buf,
-        pos: seq_len - 1,
-        positions: None,
-        n_heads,
-        n_kv_heads: n_kv,
-        head_dim,
-        physical_cap: state.kv.physical_cap,
-        batch_size: 1,
-        max_ctx_len: 0,
-        flash_partials: None,
-        givens_cos: None,
-        givens_sin: None,
-        tree_bias: None,
-        block_start: 0,
-        block_cols: 0,
-        output_gate: None,
-        output: &state.fa_attn_out,
-    };
-    hipfire_dispatch::pipeline::execute_steps(
+    execute_steps(
         gpu,
         &ctx,
-        &[hipfire_dispatch::pipeline::Step::Attend { plan, io }],
+        &[
+            Step::RmsnormAutomatic {
+                x: &state.h,
+                norm_weight: &weights.embedding_norm,
+                x_plain: &state.final_norm_buf,
+                out: &state.final_norm_buf,
+                awq_scale: None,
+                k: hidden,
+                eps,
+                rotation: rot,
+            },
+            Step::Gemv {
+                w: &w_head,
+                input: GemvInput::Prerotated(&state.final_norm_buf),
+                out: &state.logits,
+            },
+        ],
     )
-    .map_err(|e| format!("lfm2moe L{l}: attention: {e:?}"))?;
-    weight_gemv_residual(gpu, &a.wo, &state.fa_attn_out, &state.h)
-        .map_err(|e| format!("lfm2moe L{l}: out_proj: {e}"))
+    .map_err(|e| format!("lfm2moe: final rmsnorm/lm_head: {e:?}"))?;
+    Ok(())
 }
-
-/// Dense FFN gate/up half (ffn-norm folded in). Mirrors the hand-loop Dense head.
-fn dense_gate_up_block(
-    gpu: &mut Gpu,
-    cfg: &Lfm2MoeConfig,
-    ffn_norm: &rdna_compute::GpuTensor,
-    d: &DenseFfn,
-    state: &Lfm2MoeState,
-    l: usize,
-) -> Result<(), String> {
-    gpu.rmsnorm_f32(&state.h, ffn_norm, &state.ffn_tmp, cfg.rms_norm_eps)
-        .map_err(|e| format!("lfm2moe L{l}: ffn rmsnorm: {e:?}"))?;
-    weight_gemv(gpu, &d.w1, &state.ffn_tmp, &state.dense_gate)
-        .map_err(|e| format!("lfm2moe L{l}: dense w1: {e}"))?;
-    weight_gemv(gpu, &d.w3, &state.ffn_tmp, &state.dense_up)
-        .map_err(|e| format!("lfm2moe L{l}: dense w3: {e}"))
-}
-
-/// Dense FFN down half (silu·mul + w2 residual). Mirrors the hand-loop Dense tail.
-fn dense_down_block(
-    gpu: &mut Gpu,
-    d: &DenseFfn,
-    state: &Lfm2MoeState,
-    l: usize,
-) -> Result<(), String> {
-    gpu.silu_mul_f32(&state.dense_gate, &state.dense_up, &state.dense_act)
-        .map_err(|e| format!("lfm2moe L{l}: dense silu_mul: {e:?}"))?;
-    weight_gemv_residual(gpu, &d.w2, &state.dense_act, &state.h)
-        .map_err(|e| format!("lfm2moe L{l}: dense w2: {e}"))
-}
-
-/// MoE FFN block (ffn-norm folded in). Mirrors the hand-loop Moe arm.
-fn moe_ffn_block(
-    gpu: &mut Gpu,
-    cfg: &Lfm2MoeConfig,
-    ffn_norm: &rdna_compute::GpuTensor,
-    m: &MoeFfn,
-    state: &Lfm2MoeState,
-    l: usize,
-) -> Result<(), String> {
-    let hidden = cfg.hidden_size;
-    let moe_inter = cfg.moe_intermediate_size;
-    let n_exp = cfg.num_experts;
-    let k_top = cfg.num_experts_per_tok;
-    gpu.rmsnorm_f32(&state.h, ffn_norm, &state.ffn_tmp, cfg.rms_norm_eps)
-        .map_err(|e| format!("lfm2moe L{l}: ffn rmsnorm: {e:?}"))?;
-    rotate_x_mq_for(
-        gpu,
-        &m.experts[0].gate_up,
-        &state.ffn_tmp,
-        &state.ffn_x_rot,
-        hidden,
-    )
-    .map_err(|e| format!("lfm2moe L{l}: ffn rotate: {e:?}"))?;
-    weight_gemv(gpu, &m.router, &state.ffn_tmp, &state.router_logits)
-        .map_err(|e| format!("lfm2moe L{l}: router: {e}"))?;
-    gpu.sigmoid_f32(&state.router_logits)
-        .map_err(|e| format!("lfm2moe L{l}: sigmoid: {e:?}"))?;
-    gpu.deepseek4_moe_topk_bias_aware_f32(
-        &state.router_logits,
-        &m.expert_bias,
-        &state.topk_indices,
-        &state.topk_weights,
-        n_exp as i32,
-        k_top as i32,
-        cfg.routed_scaling_factor,
-    )
-    .map_err(|e| format!("lfm2moe L{l}: topk: {e:?}"))?;
-    let experts_mq6 = m.experts[0].gate_up.gpu_dtype == DType::MQ6G256;
-    if experts_mq6 {
-        gpu.gemv_hfq6g256_moe_gate_up_k8_indexed_batched(
-            &m.expert_gate_up_ptrs,
-            &state.topk_indices,
-            &state.ffn_x_rot,
-            &state.gate_batch,
-            &state.up_batch,
-            2 * moe_inter,
-            hidden,
-            k_top,
-            1,
-        )
-        .map_err(|e| format!("lfm2moe L{l}: gate_up(mq6): {e:?}"))?;
-    } else {
-        gpu.gemv_hfq4g256_moe_gate_up_k8_indexed_batched(
-            &m.expert_gate_up_ptrs,
-            &state.topk_indices,
-            &state.ffn_x_rot,
-            &state.gate_batch,
-            &state.up_batch,
-            2 * moe_inter,
-            hidden,
-            k_top,
-            1,
-        )
-        .map_err(|e| format!("lfm2moe L{l}: gate_up: {e:?}"))?;
-    }
-    fused_silu_mul_rotate_mq_batched_for(
-        gpu,
-        &m.experts[0].down,
-        &state.gate_batch,
-        &state.up_batch,
-        &state.rot_batch,
-        moe_inter,
-        k_top,
-    )
-    .map_err(|e| format!("lfm2moe L{l}: silu_mul_rotate: {e:?}"))?;
-    if experts_mq6 {
-        gpu.gemv_hfq6g256_moe_down_k8_indexed_batched_expanded(
-            &m.expert_down_ptrs,
-            &state.topk_indices,
-            &state.rot_batch,
-            &state.down_expanded,
-            hidden,
-            moe_inter,
-            k_top,
-            1,
-        )
-        .map_err(|e| format!("lfm2moe L{l}: down(mq6): {e:?}"))?;
-    } else {
-        gpu.gemv_hfq4g256_moe_down_k8_indexed_batched_expanded(
-            &m.expert_down_ptrs,
-            &state.topk_indices,
-            &state.rot_batch,
-            &state.down_expanded,
-            hidden,
-            moe_inter,
-            k_top,
-            1,
-        )
-        .map_err(|e| format!("lfm2moe L{l}: down: {e:?}"))?;
-    }
-    gpu.moe_down_combine_k8_batched(
-        &state.down_expanded,
-        &state.topk_weights,
-        &state.h,
-        hidden,
-        k_top,
-        1,
-    )
-    .map_err(|e| format!("lfm2moe L{l}: combine: {e:?}"))
-}
-
 
 /// hipGraph-amortized decode_step. Opt-in via `HIPFIRE_LFM2_GRAPH=1`
 /// (default OFF → exact `decode_step_inner` behavior). Mirrors the working

@@ -32,7 +32,7 @@ use crate::minimax::{
 };
 use hipfire_dispatch::context::DispatchCtx;
 use hipfire_dispatch::pipeline::{execute_steps, GemvInput, Step};
-use hipfire_dispatch::types::dtype_rotation_plan;
+use hipfire_dispatch::types::{dtype_rotation_plan, RotationPlan};
 use hipfire_runtime::llama::{
     fused_silu_mul_rotate_mq_batched_for, rotate_x_mq_batched_for, rotate_x_mq_for, weight_gemv,
 };
@@ -251,12 +251,31 @@ fn decode_step_body(
             .map_err(|e| format!("minimax L{l}: {e}"))?;
 
         // Per-LAYER QK-norm: RMSNorm over the whole flat q[q_dim]/k[kv_dim]
-        // vector (batch=1), BEFORE head reshape.
+        // vector (batch=1), BEFORE head reshape. STEP-004 Inc 5: via
+        // Step::QkNorm with n_groups=1 (the flat form) — dispatches the exact
+        // original rmsnorm_batched kernel.
         if cfg.use_qk_norm {
-            gpu.rmsnorm_batched(&state.fa_q, &layer.q_norm, &state.fa_q, 1, q_dim, eps)
-                .map_err(|e| format!("minimax L{l}: q_norm: {e:?}"))?;
-            gpu.rmsnorm_batched(&state.fa_k, &layer.k_norm, &state.fa_k, 1, kv_dim, eps)
-                .map_err(|e| format!("minimax L{l}: k_norm: {e:?}"))?;
+            execute_steps(
+                gpu,
+                &ctx,
+                &[
+                    Step::QkNorm {
+                        x: &state.fa_q,
+                        weight: &layer.q_norm,
+                        n_groups: 1,
+                        head_dim: q_dim,
+                        eps,
+                    },
+                    Step::QkNorm {
+                        x: &state.fa_k,
+                        weight: &layer.k_norm,
+                        n_groups: 1,
+                        head_dim: kv_dim,
+                        eps,
+                    },
+                ],
+            )
+            .map_err(|e| format!("minimax L{l}: q_norm: {e:?}"))?;
         }
 
         // Partial rotate_half RoPE on the first `rotary_dim` of each head.
@@ -336,11 +355,26 @@ fn decode_step_body(
         // validated plan.
         let plan = authority.plan_for_layer(l)?;
         // ffn_tmp = rmsnorm(h) (plain, feeds the Q8 router); ffn_x_rot =
-        // FWHT(ffn_tmp) (feeds the FWHT-pre-rotated experts). Input prep and
-        // the router GEMV stay direct: they live OUTSIDE the routed program
-        // (no Step twin for fused rmsnorm+rotate / the router projection).
-        gpu.rmsnorm_f32(&state.h, &layer.ffn_norm, &state.ffn_tmp, eps)
-            .map_err(|e| format!("minimax L{l}: ffn rmsnorm: {e:?}"))?;
+        // FWHT(ffn_tmp) (feeds the FWHT-pre-rotated experts). STEP-004 Inc 5:
+        // the norm runs through Step::RmsnormAutomatic (the same rmsnorm_f32
+        // kernel); the FWHT rotate and the router GEMV stay direct — they
+        // live OUTSIDE the routed program (no Step twin for fused
+        // rmsnorm+rotate / the router projection).
+        execute_steps(
+            gpu,
+            &ctx,
+            &[Step::RmsnormAutomatic {
+                x: &state.h,
+                norm_weight: &layer.ffn_norm,
+                x_plain: &state.ffn_tmp,
+                out: &state.ffn_tmp,
+                awq_scale: None,
+                k: hidden,
+                eps,
+                rotation: RotationPlan::None,
+            }],
+        )
+        .map_err(|e| format!("minimax L{l}: ffn rmsnorm: {e:?}"))?;
         rotate_x_mq_for(
             gpu,
             &layer.experts[0].gate_up,
@@ -418,11 +452,32 @@ fn decode_step_body(
     }
     state.n_tokens = seq_len;
 
-    // Final RMSNorm + lm_head (Q8 → plain).
-    gpu.rmsnorm_f32(&state.h, &weights.final_norm, &state.final_norm_buf, eps)
-        .map_err(|e| format!("minimax: final rmsnorm: {e:?}"))?;
-    weight_gemv(gpu, &weights.lm_head, &state.final_norm_buf, &state.logits)
-        .map_err(|e| format!("minimax: lm_head: {e}"))?;
+    // Final RMSNorm + lm_head (Q8 → plain). STEP-004 Inc 5: via Steps — the
+    // same kernels (rmsnorm_f32 + run_auto GEMV).
+    let w_head = weights.lm_head.dispatch_ref();
+    let ctx = DispatchCtx::new(gpu);
+    execute_steps(
+        gpu,
+        &ctx,
+        &[
+            Step::RmsnormAutomatic {
+                x: &state.h,
+                norm_weight: &weights.final_norm,
+                x_plain: &state.final_norm_buf,
+                out: &state.final_norm_buf,
+                awq_scale: None,
+                k: hidden,
+                eps,
+                rotation: RotationPlan::None,
+            },
+            Step::Gemv {
+                w: &w_head,
+                input: GemvInput::Raw(&state.final_norm_buf),
+                out: &state.logits,
+            },
+        ],
+    )
+    .map_err(|e| format!("minimax: final rmsnorm/lm_head: {e:?}"))?;
     Ok(())
 }
 
@@ -807,7 +862,6 @@ pub(crate) fn minimax_moe_program<'a>(
         )],
     }
 }
-
 
 /// True iff every layer's expert gate_up + down dtypes have batched kernels, so
 /// `forward_batch` won't `Err` partway through a pass. Pre-check this before

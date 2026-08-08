@@ -311,5 +311,6 @@ pub fn load_from_source(
         final_norm,
         lm_head,
         layers,
+        moe_group_plans: std::sync::OnceLock::new(),
     })
 }
