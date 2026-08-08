@@ -192,6 +192,45 @@ experts overlap by only ~5%, so there is no dedup win to take.
 It was still worth doing, for a reason the arithmetic does not show: it was the
 only structurally serial op left in the forward.
 
+### Profile of a 4-slot decode step (rocprofv3)
+
+Kernel trace, 35B-A3B, 4 slots, 4096-token context, decode phase isolated by
+timestamp. After the fixes below, 36.2 ms/step wall, ~35.4 ms GPU busy,
+**1393 dispatches per step**:
+
+| kernel | ms/step | % | calls | us/call |
+|---|---|---|---|---|
+| `gemm_hfq4g256_moe_grouped_mmq` | 12.63 | 35.7 | 80 | 158.0 |
+| `attention_q8_0_kv_batched` | 5.86 | 16.6 | 10 | 586.4 |
+| `gemm_qkvza_hfq4g256_wmma` | 2.94 | 8.3 | 30 | 98.3 |
+| `gated_delta_net_q8_fast` | 2.81 | 7.9 | 120 | 23.4 |
+| `gemm_hfq4g256_residual_wmma_k2` | 2.33 | 6.6 | 40 | 58.3 |
+| `gemv_hfq4g256_xbatch` (lm_head) | 1.49 | 4.2 | 1 | 1492.0 |
+| launch gaps (GPU idle) | 5.08 | 12.6 | — | — |
+
+Two findings came out of it, both landed:
+
+1. **`sigmoid_mul_f32` ran over the whole batch buffer.** It takes its element
+   count from the tensor handed to it, and both FA call sites passed the full
+   `fa_attn_out_batch` — sized for the largest prefill batch. A 4-row decode
+   step did a full prefill chunk's work: 8388608 elements, 427.6 us x 10 calls
+   = 4.28 ms/step on 2044 dead rows. The reference has the same pattern but
+   only reaches it during prefill, where `n` really is the batch.
+2. **The flash-attention crossover was on the wrong side.** See the commit; the
+   scalar kernel launches only 64 workgroups and ran at ~30 GB/s.
+
+### Aggregate decode throughput, 4096-token context
+
+| slots | SP4 first measurement | after decode-tile fix | after lm_head batching | after gate + crossover |
+|---|---|---|---|---|
+| 1 | 43.19 | 43.92 | 42.33 | **53.34** |
+| 2 | 34.95 | 58.17 | 59.98 | **75.47** |
+| 3 | 48.57 | 74.59 | 77.24 | **93.95** |
+| 4 | 58.31 | 83.65 | 89.32 | **110.42** |
+
+**1.89x at 4 concurrent agents over the session's starting point**, and scaling
+across slots is 2.07x.
+
 ### Follow-ups
 
 - The tile path's profitability crossover between `WMMA_M_TILE` and full
@@ -204,3 +243,11 @@ only structurally serial op left in the forward.
   could also win at B=1 with the tuned kernel's buffer-load strategy is
   untested.
 - Contexts beyond 4096 and slot counts beyond 4 are unmeasured.
+- **Launch gaps are now the third-largest term: 5.08 ms/step, 12.6% of wall,
+  across 1393 dispatches per step.** hipGraph capture of the decode step is the
+  obvious next target and is the largest remaining non-MoE item.
+- MoE grouped MMQ is 35.7% of the step at ~120 GB/s effective. It is the floor
+  for this model — four slots picking top-8 of 256 experts overlap only ~5% —
+  but the bandwidth gap suggests some headroom in the kernel itself.
+- The gfx1151 crossover is measured at 4096 tokens and a wash near 1086; the
+  region between is unmeasured, and no other arch was measured at all.
