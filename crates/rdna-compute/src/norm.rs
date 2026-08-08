@@ -4190,18 +4190,7 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_mq_signs()?;
-        // gfx1151/gfx1201: product `deepseek4_wave32_route` alone. gfx1100:
-        // same route flag PLUS `HIPFIRE_DS4_GFX1100_NOX=1` (default off).
-        // Changes FP32 reduce order vs the full-K LDS path — Wave 2 golden.
-        static GFX1100_NOX: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-            hipfire_config::developer_var("HIPFIRE_DS4_GFX1100_NOX")
-                .ok()
-                .as_deref()
-                == Some("1")
-        });
-        let gfx1100_nox = self.arch == "gfx1100" && deepseek4_wave32_route && *GFX1100_NOX;
-        let nox = (matches!(self.arch.as_str(), "gfx1151" | "gfx1201") && deepseek4_wave32_route)
-            || gfx1100_nox;
+        let nox = matches!(self.arch.as_str(), "gfx1151" | "gfx1201") && deepseek4_wave32_route;
         let symbol = if nox {
             "fused_rmsnorm_mq_rotate_plain_nox"
         } else {

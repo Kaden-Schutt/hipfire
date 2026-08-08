@@ -8670,23 +8670,14 @@ impl Gpu {
         // `HIPFIRE_HC_CTRL_T1024=1` selects the 1024-thread variant. See
         // `kernels::HC_COMPUTE_CONTROL_T1024_SRC` — same algorithm, wider
         // block, NOT bit-exact (the LDS partial tree widens 8 -> 32).
-        //
-        // On exact gfx1100 the bare env is intentionally NOT sufficient:
-        // the T1024 symbol only exists on the fused control path (R2
-        // `HIPFIRE_DS4_GFX1100_HC_FUSE`). Product passes `prefer_t1024`
-        // after checking fuse+MQ2R; env alone logs and no-ops there.
-        static T1024: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-            hipfire_config::developer_var("HIPFIRE_HC_CTRL_T1024")
-                .ok()
-                .as_deref()
-                == Some("1")
-        });
-        let env_t1024 = *T1024;
-        let t1024 = if self.arch == "gfx1100" {
-            prefer_t1024
-        } else {
-            prefer_t1024 || env_t1024
-        };
+        static T1024: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let t1024 = prefer_t1024
+            || *T1024.get_or_init(|| {
+                hipfire_config::developer_var("HIPFIRE_HC_CTRL_T1024")
+                    .ok()
+                    .as_deref()
+                    == Some("1")
+            });
         let (logical_name, src, threads) = if t1024 {
             (
                 "hc_compute_control_vec4_finalize_t1024",

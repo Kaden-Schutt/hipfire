@@ -484,3 +484,99 @@ Post-merge re-measurement on `hipx`, branch `ds4-beta-staging` @ `54948214e`.
   `hipx:/home/kaden/ds4-r1-rocprof-20260808/`.
 
 Gap to the 50 tok/s AR target from this waterline: **+55.5%**.
+
+---
+
+# 13. HALTED — rig incident 2026-08-08, implementation reverted
+
+**Status: this plan is PAUSED. All Wave 1 / Wave 2 code has been reverted.
+Only this document survives.**
+
+## What happened
+
+Screening the first candidate lever (`HIPFIRE_DS4_GFX1100_E8_PACK`, the
+`shared_jobs` compressor/FFN packing) on `hipx` produced an SDMA fault that
+took gfx1100 off the PCIe bus:
+
+```text
+sdma1 timeout seq 1362/1364
+sdma reset failed
+GPU reset -19
+device lost from bus
+SMU: bus error ... response:0xFFFFFFFF
+```
+
+The run never emitted `"status":"generated"` and stalled with the dense GPU at
+0%. The next lever screened (`HC_FUSE`) then hung in D state
+(`drm_sched_entity_flush`, `amdgpu_vm_wait_idle`) because it could not
+enumerate an absent device — **collateral, not a defect in that lever.**
+
+Recovery without a reboot was attempted and **failed**. Config space on the
+GPU, and on both ports of the card's on-board Navi switch (`0000:65:00.0`,
+`0000:64:00.0`), all read `ffff`; only the root port `0000:00:03.1` stayed
+alive. `echo 1 > .../remove` unbound amdgpu but then blocked permanently
+against stuck TTM kworkers (6 → 16). A secondary bus reset driven from the
+root port did not re-train the link. The machine required a physical reboot.
+
+## Verdicts
+
+| Lever | Verdict |
+|---|---|
+| baseline (no gates) | 32.1926 tok/s, golden SHA matched, coherent — **valid** |
+| `E8_PACK` | **HARD DEFECT** — SDMA timeout, card off bus |
+| `HC_FUSE` | **UNJUDGED** — collateral of the wedge, never ran |
+| `E8_MLP`, `NOX`, `T1024`, `E8_MIX` | never screened |
+
+## Why it was halted
+
+The operator is remote; a wedged card requires someone physically present to
+reset the machine. That risk is not worth a decode-throughput experiment. The
+implementation is reverted to the `ds4-gfx1201-opt` merge point
+(`eb55cda9b`) so no gate, kernel, or dispatch path from this campaign remains
+in the tree.
+
+## Preventable causes — all spec-level, all mine
+
+1. **No fault-containment protocol in the task spec.** `/usr/local/sbin/gpukill`
+   exists on this fleet for exactly this failure and was never mentioned. The
+   screener used bare `timeout 600`; the child outlived SIGTERM, orphaned, and
+   kept holding the card.
+2. **Fixture discipline inverted.** This repo's own rule is that TG128 is the
+   screening fixture and 2,048/512 is reserved for a passing promotion
+   candidate. Four never-executed kernels were sent straight at the promotion
+   fixture on an 82 GB model.
+3. **Static validation mistaken for verification.** VGPR counts, zero spills,
+   `global_load_b128`, and bit-exact accumulation order were all checked. None
+   of them says anything about *addressing*, and an out-of-range row offset is
+   precisely what times out SDMA. `test_mfp4e8_shared_jobs_gfx1100.rs` already
+   existed as a micro for the failing kernel and was never run.
+4. **Rig cleared as healthy while it was dying.** The post-hang check was
+   `dmesg | tail -40 | grep`, too narrow to catch the SDMA errors, so the next
+   lever was allowed to start on a card already off the bus.
+
+## Preconditions for any resumption
+
+Do not restart this campaign without all four:
+
+- **Micro before model.** Every new kernel runs its standalone unit test on
+  small buffers first. No exceptions.
+- **TG128 before 2,048/512.**
+- **`gpukill` teardown after every run**, never bare `timeout`.
+- **Health gate between screens**: full-dmesg scan for
+  `lost from bus|reset failed|ring timeout|GPU reset`, plus a trivial HIP
+  context open. Never a truncated tail.
+- **Physical access to the machine, or an out-of-band power control**, before
+  the first candidate is screened.
+
+## What remains valid
+
+Sections 1–12 stand as analysis. The measured R0 waterline (32.1926 tok/s,
+golden SHA `3611840208334c77b3cfcf85984786920deabd550ba83311645f413d3ba6608b`)
+and the R1 per-shape bill in §3.3 are real measurements and are the correct
+starting point if this is ever resumed. §3.3's central finding — that the
+small-M tier burns 43.7% of dense-E8 time for 25.3% of the bytes at 216 GB/s,
+because one row per workgroup gives 2.7 waves/CU at M=256 — is independent of
+the reverted implementation.
+
+The reverted code is recoverable from git history at `dfe7bda37` and
+`6720ac059` should it ever be wanted; it is removed from the tree, not lost.
