@@ -1074,5 +1074,36 @@ pub fn forward_batch_slots(
     }
 
     // ── 5. Final norm + per-slot last-token logits ──────────────────────
-    final_logits_per_slot(gpu, weights, config, batch, pbs, logits_out)
+    final_logits_per_slot(gpu, weights, config, batch, pbs, logits_out)?;
+
+    // ── 6. Advance each slot's logical KV length ────────────────────────
+    //
+    // This step exists because SP1 removed the device-side
+    // `positions[row] + 1 <= desc.seq_len` guard: it shipped in release
+    // (compiler.rs never passes -DNDEBUG) and cost 64 bytes/lane of scratch on
+    // four kernels. Removing it was right for occupancy, but it left the
+    // invariant unenforced — and SP3 Task 3's review found that nothing was
+    // keeping `seq_len` in sync with a slot's real history either. A caller who
+    // forgot to update it got no error, just quietly-wrong metadata that the
+    // next step would read as the slot's length.
+    //
+    // Maintaining it HERE rather than asking callers to remember is
+    // correct-by-construction: this function is the only thing that advances a
+    // slot's KV, so it is the only thing that can get the length right.
+    for (slot_ix, &m) in batch.m_per_slot.iter().enumerate() {
+        if m == 0 {
+            continue;
+        }
+        // The slot's new length is one past its highest written position. Rows
+        // are packed in slot order, so this slot's last row is the highest.
+        let last_row = batch
+            .row_slot
+            .iter()
+            .rposition(|&s| s as usize == slot_ix)
+            .expect("m_per_slot > 0 implies at least one row for this slot");
+        let new_len = (batch.positions[last_row] + 1) as usize;
+        pool.set_seq_len(rdna_compute::slot_pool::SlotId(slot_ix), new_len)
+            .map_err(|e| HipError::new(0, &format!("forward_batch_slots: {e}")))?;
+    }
+    Ok(())
 }
