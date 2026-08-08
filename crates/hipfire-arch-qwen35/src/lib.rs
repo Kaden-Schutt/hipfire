@@ -72,6 +72,11 @@ pub mod grammar;
 /// drives the qwen35 `grammar` matcher. Built via [`spec_emit::Qwen35Emit::from_ctx`].
 pub mod spec_emit;
 
+/// `SlotBatch` — one forward step's ragged work across N slots. Pure CPU
+/// data structure; no GPU dependencies. See module docs for the
+/// per-slot-absolute `positions[]` invariant.
+pub mod slot_batch;
+
 #[cfg(feature = "deltanet")]
 pub use arch::Qwen35;
 
