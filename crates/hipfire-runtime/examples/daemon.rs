@@ -13480,6 +13480,16 @@ fn generate_qwen35_mtp(
     // the emitted stream and trunk/MTP caches remain aligned.
     let mut think_closed = false;
 
+    // Open the user-facing stream contract before the seed's committed/token
+    // events. MTP performs its own decode loop and therefore does not inherit
+    // the AR/DFlash gen_start emission.
+    emit_gen_start(
+        stdout,
+        id,
+        started_in_think,
+        gen_start_contract_version_for_arch(m.arch_id),
+    );
+
     // Emit the seed token first (TTFT = prefill).
     streamed_tokens.push(seed_token);
     emit_committed_event(
