@@ -320,7 +320,7 @@ fn run_loop(mut rig: Rig, rx: Receiver<SubmitRequest>, stats: Arc<Mutex<EngineSt
         if batch.is_empty() {
             continue;
         }
-        if forward_batch_slots_graphed(
+        let fwd = forward_batch_slots_graphed(
             &mut rig.gpu,
             &rig.weights,
             &rig.config,
@@ -334,17 +334,20 @@ fn run_loop(mut rig: Rig, rx: Receiver<SubmitRequest>, stats: Arc<Mutex<EngineSt
             &rig.scratch,
             &rig.logits_out,
             &mut graph,
-        )
-        .is_err()
-        {
-            // A forward failure is not recoverable per-request; end every
-            // in-flight request rather than looping on a broken rig.
+        );
+        if let Err(e) = fwd {
+            // A forward failure is not recoverable per-request. Report it as a
+            // REJECTION carrying the reason, not as a normal Done: an
+            // unsupported model (e.g. "DeltaNet layer has a non-Q8_0 weight")
+            // otherwise reaches the client as a successful, empty 200, which
+            // looks like the model chose to say nothing.
+            let reason = e.to_string();
             for (s, f) in slots.iter_mut().enumerate() {
                 if let Some(f) = f.take() {
                     let _ = send_event(
                         &f.reply,
-                        Event::Done {
-                            reason: DoneReason::ClientGone,
+                        Event::Rejected {
+                            reason: reason.clone(),
                         },
                     );
                     rig.sessions.close(&mut rig.pool, &mut rig.adm, f.session);
