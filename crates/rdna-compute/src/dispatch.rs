@@ -685,6 +685,55 @@ pub fn gen_fwht_signs(seed: u32, n: usize) -> Vec<f32> {
 }
 
 impl Gpu {
+    /// Whether the multi-slot decode step should be hipGraph-captured.
+    pub fn slots_decode_graph(&self) -> bool {
+        self.flags.slots_decode_graph
+    }
+
+    /// Install a real stream if launches are still going to the null stream.
+    ///
+    /// HIP refuses to capture the legacy default stream, so anything that
+    /// wants `begin_stream_capture` must call this first. Idempotent, and the
+    /// stream stays installed afterwards: every later launch simply goes to it
+    /// instead of the null stream.
+    pub fn ensure_capture_stream(&mut self) -> HipResult<()> {
+        if self.active_stream.is_none() {
+            self.active_stream = Some(self.hip.stream_create()?);
+        }
+        Ok(())
+    }
+
+    /// Begin capturing this `Gpu`'s stream into a graph.
+    ///
+    /// Mode 1 is `hipStreamCaptureModeThreadLocal`: only this thread is
+    /// restricted, rather than mode 0's process-wide restriction. Everything
+    /// this crate launches during capture must already be warm -- a kernel
+    /// compile mid-capture is exactly the kind of call the mode forbids.
+    pub fn begin_stream_capture(&mut self) -> HipResult<()> {
+        let stream = self.active_stream.as_ref().ok_or_else(|| {
+            hip_bridge::HipError::new(0, "begin_stream_capture: no active stream")
+        })?;
+        self.hip.stream_begin_capture(stream, 1)
+    }
+
+    /// Close the capture started by `begin_stream_capture`.
+    pub fn end_stream_capture(&mut self) -> HipResult<hip_bridge::Graph> {
+        let stream = self
+            .active_stream
+            .as_ref()
+            .ok_or_else(|| hip_bridge::HipError::new(0, "end_stream_capture: no active stream"))?;
+        self.hip.stream_end_capture(stream)
+    }
+
+    /// Launch a previously instantiated graph on this `Gpu`'s stream.
+    pub fn launch_graph(&mut self, exec: &hip_bridge::GraphExec) -> HipResult<()> {
+        let stream = self
+            .active_stream
+            .as_ref()
+            .ok_or_else(|| hip_bridge::HipError::new(0, "launch_graph: no active stream"))?;
+        self.hip.graph_launch(exec, stream)
+    }
+
     /// Returns the active stream ref for kernel launches (None = null stream).
     pub(crate) fn stream_ref(&self) -> Option<&hip_bridge::Stream> {
         self.active_stream.as_ref()

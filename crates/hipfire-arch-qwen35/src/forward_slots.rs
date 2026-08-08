@@ -2069,6 +2069,301 @@ pub fn forward_batch_slots(
 /// can call it without a feature flag plumbing exercise. `forward_batch_slots`
 /// above is the real entry point every other caller keeps using unchanged.
 #[allow(clippy::too_many_arguments)]
+/// Context-length bucket for the decode graph cache, in tokens.
+///
+/// A captured graph bakes `max_ctx_len` into kernargs, but it grows by one
+/// every decode step, so capturing per step would be pointless. Instead the
+/// bound is rounded up to a bucket and the graph is reused until the context
+/// crosses into the next one -- one capture per 256 generated tokens.
+///
+/// Over-scanning inside a bucket is correct, not merely tolerable:
+/// `positions[]` is the authoritative causal bound everywhere downstream
+/// (SP1's only Critical defect), so positions past a row's own are masked.
+/// It costs at most one bucket of extra KV scan per step.
+pub const DECODE_GRAPH_CTX_BUCKET: usize = 256;
+
+/// Identity of a captured decode graph. Any change invalidates it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct DecodeGraphKey {
+    n_slots: usize,
+    n_rows: usize,
+    ctx_bucket: usize,
+    max_layer: Option<usize>,
+}
+
+/// A hipGraph of one pure-decode step, reused across steps.
+///
+/// Why: a 4-slot decode step issues ~1390 kernel launches. Profiled on
+/// gfx1151 at 4096-token context, that is 4.16 ms/step of host submission
+/// (2.99 us per launch) against 9.29 ms/step of measured GPU idle -- the GPU
+/// spends 23% of the step waiting to be fed. Replaying one graph replaces all
+/// of those submissions with a single launch.
+///
+/// Only pure-decode steps are captured. Prefill batches vary in shape step to
+/// step, and the win is concentrated in decode anyway: prefill launches the
+/// same number of kernels but each does far more work, so submission is not
+/// the bottleneck there.
+#[derive(Default)]
+pub struct SlotDecodeGraph {
+    exec: Option<hip_bridge::GraphExec>,
+    graph: Option<hip_bridge::Graph>,
+    key: Option<DecodeGraphKey>,
+    captures: usize,
+    replays: usize,
+}
+
+impl SlotDecodeGraph {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// How many captures and replays this cache has served. A healthy decode
+    /// run shows captures ~= generated_tokens / DECODE_GRAPH_CTX_BUCKET.
+    pub fn stats(&self) -> (usize, usize) {
+        (self.captures, self.replays)
+    }
+
+    fn release(&mut self, gpu: &Gpu) {
+        if let Some(exec) = self.exec.take() {
+            let _ = gpu.hip.graph_exec_destroy(exec);
+        }
+        if let Some(graph) = self.graph.take() {
+            let _ = gpu.hip.graph_destroy(graph);
+        }
+        self.key = None;
+    }
+}
+
+/// `forward_batch_slots` with hipGraph capture/replay for pure-decode steps.
+///
+/// Falls back to the plain path whenever the step is not pure decode, the
+/// feature is off, or capture fails -- so this is never load-bearing for
+/// correctness, only for speed.
+#[allow(clippy::too_many_arguments)]
+pub fn forward_batch_slots_graphed(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    batch: &SlotBatch,
+    pool: &mut SlotPool,
+    dn_states: &mut [DeltaNetState],
+    k_arenas: &[GpuTensor],
+    v_arenas: &[GpuTensor],
+    desc_staging: &mut SlotDescStaging,
+    pbs: &PrefillBatchScratch,
+    s: &Qwen35Scratch,
+    logits_out: &GpuTensor,
+    cache: &mut SlotDecodeGraph,
+) -> HipResult<()> {
+    let pure_decode = !batch.is_empty() && batch.m_per_slot.iter().all(|&m| m == 1);
+    if !gpu.slots_decode_graph() || !pure_decode {
+        return forward_batch_slots(
+            gpu,
+            weights,
+            config,
+            batch,
+            pool,
+            dn_states,
+            k_arenas,
+            v_arenas,
+            desc_staging,
+            pbs,
+            s,
+            logits_out,
+        );
+    }
+
+    let physical_cap = pool.descriptors()[0].cap as usize;
+    let true_ctx = (batch.positions.iter().copied().max().unwrap_or(0) as usize + 1)
+        .min(physical_cap)
+        .max(1);
+    let ctx_bucket = true_ctx
+        .div_ceil(DECODE_GRAPH_CTX_BUCKET)
+        .saturating_mul(DECODE_GRAPH_CTX_BUCKET)
+        .min(physical_cap)
+        .max(1);
+    let key = DecodeGraphKey {
+        n_slots: pool.descriptors().len(),
+        n_rows: batch.total_rows(),
+        ctx_bucket,
+        max_layer: None,
+    };
+
+    // The per-step inputs always go up outside the graph: their host source
+    // buffers are temporaries, and a captured memcpy node bakes its source
+    // pointer. The captured kernels read the device buffers these fill, so
+    // fresh contents reach a replay without re-capturing.
+    upload_step_inputs(gpu, batch, pool, desc_staging, pbs)?;
+
+    if cache.key != Some(key) {
+        cache.release(gpu);
+        gpu.ensure_capture_stream()?;
+        // Everything must already be warm: a kernel compile inside capture is
+        // exactly what ThreadLocal capture mode forbids. One uncaptured step
+        // at this shape guarantees it.
+        forward_batch_slots_opts(
+            gpu,
+            weights,
+            config,
+            batch,
+            pool,
+            dn_states,
+            k_arenas,
+            v_arenas,
+            desc_staging,
+            pbs,
+            s,
+            logits_out,
+            None,
+            SlotStepOpts {
+                skip_uploads: true,
+                ctx_override: Some(ctx_bucket),
+            },
+        )?;
+        // The warm-up step above already advanced the slot lengths; re-running
+        // the capture body would advance them a second time, so roll back to
+        // the pre-step lengths before capturing.
+        rewind_slot_seq_lens(batch, pool)?;
+
+        gpu.begin_stream_capture()?;
+        let captured = forward_batch_slots_opts(
+            gpu,
+            weights,
+            config,
+            batch,
+            pool,
+            dn_states,
+            k_arenas,
+            v_arenas,
+            desc_staging,
+            pbs,
+            s,
+            logits_out,
+            None,
+            SlotStepOpts {
+                skip_uploads: true,
+                ctx_override: Some(ctx_bucket),
+            },
+        );
+        let graph = gpu.end_stream_capture()?;
+        captured?;
+        let exec = gpu.hip.graph_instantiate(&graph)?;
+        cache.graph = Some(graph);
+        cache.exec = Some(exec);
+        cache.key = Some(key);
+        cache.captures += 1;
+        // Capture does not execute, and the warm-up step above already did
+        // this step's work, so nothing is launched here.
+        return Ok(());
+    }
+
+    let exec = cache
+        .exec
+        .take()
+        .expect("cache.key set implies an instantiated exec");
+    let launched = gpu.launch_graph(&exec);
+    cache.exec = Some(exec);
+    launched?;
+    cache.replays += 1;
+    // Host-side bookkeeping the replay cannot do for itself.
+    advance_slot_seq_lens(batch, pool)?;
+    Ok(())
+}
+
+/// Undo `advance_slot_seq_lens` for this batch: restore each active slot to
+/// the length it had before the step. Used only by the graph path, which runs
+/// the same step body twice (once to warm, once to capture).
+fn rewind_slot_seq_lens(batch: &SlotBatch, pool: &mut SlotPool) -> HipResult<()> {
+    for (slot_ix, &m) in batch.m_per_slot.iter().enumerate() {
+        if m == 0 {
+            continue;
+        }
+        let first_row = batch
+            .row_slot
+            .iter()
+            .position(|&s| s as usize == slot_ix)
+            .expect("m_per_slot > 0 implies at least one row for this slot");
+        let old_len = batch.positions[first_row] as usize;
+        pool.set_seq_len(rdna_compute::slot_pool::SlotId(slot_ix), old_len)
+            .map_err(|e| HipError::new(0, &format!("rewind_slot_seq_lens: {e}")))?;
+    }
+    Ok(())
+}
+
+/// Knobs the graph path needs and no other caller does.
+#[derive(Clone, Copy, Default)]
+pub struct SlotStepOpts {
+    /// The per-step H2D uploads (tokens, positions, row_slot, descriptors)
+    /// were already done by the caller. Set when capturing into a hipGraph:
+    /// those copies read from short-lived host buffers, and a captured memcpy
+    /// node bakes its source pointer -- replaying one would read freed
+    /// memory. The caller does them per step, outside the graph.
+    pub skip_uploads: bool,
+    /// Use this context bound instead of deriving it from `batch.positions`.
+    /// A captured graph bakes `max_ctx_len` into kernargs, but it grows every
+    /// decode step, so the graph path rounds it up to a bucket and re-captures
+    /// only when the bucket changes. Over-scanning within a bucket is safe:
+    /// `positions[]` is the authoritative causal bound (SP1's Critical
+    /// defect), so the extra positions are masked out.
+    pub ctx_override: Option<usize>,
+}
+
+/// The per-step H2D uploads, hoisted so the graph path can run them outside
+/// the captured region. Must run before every step, captured or not.
+pub fn upload_step_inputs(
+    gpu: &mut Gpu,
+    batch: &SlotBatch,
+    pool: &mut SlotPool,
+    desc_staging: &mut SlotDescStaging,
+    pbs: &PrefillBatchScratch,
+) -> HipResult<()> {
+    let n = batch.total_rows();
+    let tokens_host: Vec<i32> = batch.tokens.iter().map(|&t| t as i32).collect();
+    let tokens_bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(tokens_host.as_ptr() as *const u8, n * 4) };
+    gpu.hip.memcpy_htod(&pbs.tokens.buf, tokens_bytes)?;
+
+    let positions_host: Vec<i32> = batch.positions.clone();
+    let positions_bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(positions_host.as_ptr() as *const u8, n * 4) };
+    gpu.hip.memcpy_htod(&pbs.positions.buf, positions_bytes)?;
+
+    let row_slot_bytes: Vec<u8> = batch
+        .row_slot
+        .iter()
+        .flat_map(|x| x.to_ne_bytes())
+        .collect();
+    gpu.hip
+        .memcpy_htod(&desc_staging.row_slot_dev.buf, &row_slot_bytes)?;
+    if pool.descriptors_dirty() {
+        let desc_bytes = pack_descs(pool.descriptors());
+        gpu.hip
+            .memcpy_htod(&desc_staging.descs_dev.buf, &desc_bytes)?;
+        pool.mark_uploaded();
+    }
+    Ok(())
+}
+
+/// Post-step host bookkeeping: advance each active slot's logical KV length.
+/// Hoisted for the same reason as the uploads -- it is host code, so a graph
+/// replay does not run it, and the caller must.
+pub fn advance_slot_seq_lens(batch: &SlotBatch, pool: &mut SlotPool) -> HipResult<()> {
+    for (slot_ix, &m) in batch.m_per_slot.iter().enumerate() {
+        if m == 0 {
+            continue;
+        }
+        let last_row = batch
+            .row_slot
+            .iter()
+            .rposition(|&s| s as usize == slot_ix)
+            .expect("m_per_slot > 0 implies at least one row for this slot");
+        let new_len = (batch.positions[last_row] + 1) as usize;
+        pool.set_seq_len(rdna_compute::slot_pool::SlotId(slot_ix), new_len)
+            .map_err(|e| HipError::new(0, &format!("forward_batch_slots: {e}")))?;
+    }
+    Ok(())
+}
+
 pub fn forward_batch_slots_with_max_layer(
     gpu: &mut Gpu,
     weights: &Qwen35Weights,
@@ -2083,6 +2378,41 @@ pub fn forward_batch_slots_with_max_layer(
     s: &Qwen35Scratch,
     logits_out: &GpuTensor,
     max_layer: Option<usize>,
+) -> HipResult<()> {
+    forward_batch_slots_opts(
+        gpu,
+        weights,
+        config,
+        batch,
+        pool,
+        dn_states,
+        k_arenas,
+        v_arenas,
+        desc_staging,
+        pbs,
+        s,
+        logits_out,
+        max_layer,
+        SlotStepOpts::default(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn forward_batch_slots_opts(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    batch: &SlotBatch,
+    pool: &mut SlotPool,
+    dn_states: &mut [DeltaNetState],
+    k_arenas: &[GpuTensor],
+    v_arenas: &[GpuTensor],
+    desc_staging: &mut SlotDescStaging,
+    pbs: &PrefillBatchScratch,
+    s: &Qwen35Scratch,
+    logits_out: &GpuTensor,
+    max_layer: Option<usize>,
+    opts: SlotStepOpts,
 ) -> HipResult<()> {
     if batch.is_empty() {
         return Ok(());
@@ -2138,10 +2468,12 @@ pub fn forward_batch_slots_with_max_layer(
              batched path is Q8_0-only, see sp3-task-2-report.md)",
         ));
     }
-    let tokens_host: Vec<i32> = batch.tokens.iter().map(|&t| t as i32).collect();
-    let tokens_bytes: &[u8] =
-        unsafe { std::slice::from_raw_parts(tokens_host.as_ptr() as *const u8, n * 4) };
-    gpu.hip.memcpy_htod(&pbs.tokens.buf, tokens_bytes)?;
+    if !opts.skip_uploads {
+        let tokens_host: Vec<i32> = batch.tokens.iter().map(|&t| t as i32).collect();
+        let tokens_bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(tokens_host.as_ptr() as *const u8, n * 4) };
+        gpu.hip.memcpy_htod(&pbs.tokens.buf, tokens_bytes)?;
+    }
     gpu.embedding_lookup_q8_batched(&weights.token_embd, &pbs.x_batch, &pbs.tokens, n, dim)?;
 
     // ── 2. Upload positions ──────────────────────────────────────────────
@@ -2149,31 +2481,37 @@ pub fn forward_batch_slots_with_max_layer(
     // for the causal bound everywhere downstream (RoPE angle, KV write
     // slot-relative index, and the attend kernels' per-row seq_len). Never
     // `desc.seq_len` — see SP1's only Critical defect.
-    let positions_host: Vec<i32> = batch.positions.clone();
-    let positions_bytes: &[u8] =
-        unsafe { std::slice::from_raw_parts(positions_host.as_ptr() as *const u8, n * 4) };
-    gpu.hip.memcpy_htod(&pbs.positions.buf, positions_bytes)?;
+    if !opts.skip_uploads {
+        let positions_host: Vec<i32> = batch.positions.clone();
+        let positions_bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(positions_host.as_ptr() as *const u8, n * 4) };
+        gpu.hip.memcpy_htod(&pbs.positions.buf, positions_bytes)?;
+    }
 
     // ── 3. Upload row_slot (every step) and the descriptor table (only
     // when dirty) — once per step, not once per layer. ──────────────────
-    let row_slot_bytes: Vec<u8> = batch
-        .row_slot
-        .iter()
-        .flat_map(|x| x.to_ne_bytes())
-        .collect();
-    gpu.hip
-        .memcpy_htod(&desc_staging.row_slot_dev.buf, &row_slot_bytes)?;
-    if pool.descriptors_dirty() {
-        let desc_bytes = pack_descs(pool.descriptors());
+    if !opts.skip_uploads {
+        let row_slot_bytes: Vec<u8> = batch
+            .row_slot
+            .iter()
+            .flat_map(|x| x.to_ne_bytes())
+            .collect();
         gpu.hip
-            .memcpy_htod(&desc_staging.descs_dev.buf, &desc_bytes)?;
-        pool.mark_uploaded();
+            .memcpy_htod(&desc_staging.row_slot_dev.buf, &row_slot_bytes)?;
+        if pool.descriptors_dirty() {
+            let desc_bytes = pack_descs(pool.descriptors());
+            gpu.hip
+                .memcpy_htod(&desc_staging.descs_dev.buf, &desc_bytes)?;
+            pool.mark_uploaded();
+        }
     }
 
     let physical_cap = pool.descriptors()[0].cap as usize;
-    let max_ctx_len = (batch.positions.iter().copied().max().unwrap_or(0) as usize + 1)
-        .min(physical_cap)
-        .max(1);
+    let max_ctx_len = opts.ctx_override.unwrap_or(
+        (batch.positions.iter().copied().max().unwrap_or(0) as usize + 1)
+            .min(physical_cap)
+            .max(1),
+    );
     let q8_wmma_arch = q8_prefill_wmma_enabled(gpu);
 
     // Exactly one active slot this step? (Always true for n_slots == 1;
@@ -2372,20 +2710,6 @@ pub fn forward_batch_slots_with_max_layer(
     // Maintaining it HERE rather than asking callers to remember is
     // correct-by-construction: this function is the only thing that advances a
     // slot's KV, so it is the only thing that can get the length right.
-    for (slot_ix, &m) in batch.m_per_slot.iter().enumerate() {
-        if m == 0 {
-            continue;
-        }
-        // The slot's new length is one past its highest written position. Rows
-        // are packed in slot order, so this slot's last row is the highest.
-        let last_row = batch
-            .row_slot
-            .iter()
-            .rposition(|&s| s as usize == slot_ix)
-            .expect("m_per_slot > 0 implies at least one row for this slot");
-        let new_len = (batch.positions[last_row] + 1) as usize;
-        pool.set_seq_len(rdna_compute::slot_pool::SlotId(slot_ix), new_len)
-            .map_err(|e| HipError::new(0, &format!("forward_batch_slots: {e}")))?;
-    }
+    advance_slot_seq_lens(batch, pool)?;
     Ok(())
 }

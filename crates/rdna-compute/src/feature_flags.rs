@@ -199,6 +199,9 @@ pub struct FeatureFlags {
     /// reasoning as `attn_tile_size`: gfx1151 is the dev box and gfx1201 the
     /// deployment target, so this must be overridable rather than baked in.
     pub slots_attn_crossover: Option<usize>,
+    /// Capture a pure-decode multi-slot step into a hipGraph and replay it
+    /// (`HIPFIRE_SLOTS_DECODE_GRAPH`). Off by default.
+    pub slots_decode_graph: bool,
 
     // ── Kernels.rs env reads ───────────────────────────────────────
     pub lloyd_force_baseline: bool,
@@ -484,6 +487,7 @@ impl FeatureFlags {
             rocblas_min_batch: parse_usize("HIPFIRE_ROCBLAS_MIN_BATCH"),
             attn_tile_size: parse_usize("HIPFIRE_ATTN_TILE_SIZE"),
             slots_attn_crossover: parse_usize("HIPFIRE_SLOTS_ATTN_CROSSOVER"),
+            slots_decode_graph: value("HIPFIRE_SLOTS_DECODE_GRAPH").ok().as_deref() == Some("1"),
 
             // Kernels.rs
             lloyd_force_baseline: value("HIPFIRE_LLOYD_FORCE_BASELINE").ok().as_deref()
@@ -698,6 +702,7 @@ impl FeatureFlags {
             rocblas_min_batch: None,
             attn_tile_size: None,
             slots_attn_crossover: None,
+            slots_decode_graph: false,
             lloyd_force_baseline: false,
             rdna2_variant: None,
             hipcc_extra_flags: String::new(),

@@ -64,7 +64,9 @@ fn main() {
 
 #[cfg(feature = "deltanet")]
 fn main() {
-    use hipfire_arch_qwen35::forward_slots::{forward_batch_slots, SlotDescStaging};
+    use hipfire_arch_qwen35::forward_slots::{
+        forward_batch_slots_graphed, SlotDecodeGraph, SlotDescStaging,
+    };
     use hipfire_arch_qwen35::qwen35::{
         self, DeltaNetState, LayerType, PrefillBatchScratch, Qwen35Scratch, Qwen35Weights,
     };
@@ -346,6 +348,9 @@ fn main() {
     let mut prefill_steps: usize = 0;
     let mut prefill_secs: f64 = 0.0;
     let mut decode_step_ms: Vec<f64> = Vec::new();
+    let mut decode_graph = SlotDecodeGraph::new();
+    let (mut host_launch_ns, mut host_launch_n) = (0u64, 0u64);
+    let (mut host_h2d_ns, mut host_d2d_ns, mut host_sync_ns) = (0u64, 0u64, 0u64);
 
     // Safety net against an infinite loop from a logic error above; a
     // correct run always terminates within n_steps.
@@ -360,7 +365,7 @@ fn main() {
         let is_decode_only = active_rows == active_slots;
         let t_step = std::time::Instant::now();
 
-        forward_batch_slots(
+        forward_batch_slots_graphed(
             &mut gpu,
             &weights,
             &config,
@@ -373,8 +378,9 @@ fn main() {
             &pbs,
             &scratch,
             &logits_out,
+            &mut decode_graph,
         )
-        .expect("forward_batch_slots");
+        .expect("forward_batch_slots_graphed");
         gpu.hip.device_synchronize().expect("sync after forward");
 
         gpu.sample_per_slot(
@@ -397,7 +403,23 @@ fn main() {
                 .expect("download out_tokens");
         }
         let step_secs = t_step.elapsed().as_secs_f64();
+        // Host-side submission cost for this step. If the GPU idle seen in a
+        // kernel trace is submission-bound, this accounts for it and graph
+        // capture can recover it; if it is far smaller, the gaps are something
+        // graphs cannot remove and the trace is pointing elsewhere.
+        let lk_ns = hip_bridge::launch_counters::launch_kernel::time_ns();
+        let lk_n = hip_bridge::launch_counters::launch_kernel::count();
+        let h2d_ns = hip_bridge::launch_counters::memcpy_htod::time_ns();
+        let d2d_ns = hip_bridge::launch_counters::memcpy_dtod::time_ns();
+        let sync_ns = hip_bridge::launch_counters::device_sync::time_ns()
+            + hip_bridge::launch_counters::stream_sync::time_ns();
+        hip_bridge::launch_counters::reset();
         if is_decode_only {
+            host_launch_ns += lk_ns;
+            host_launch_n += lk_n;
+            host_h2d_ns += h2d_ns;
+            host_d2d_ns += d2d_ns;
+            host_sync_ns += sync_ns;
             decode_steps += 1;
             // Discard the first decode step (warmup) from the rate, but still
             // record it in the per-step list so the warmup cost is visible.
@@ -452,6 +474,21 @@ fn main() {
             decode_tokens as f64 / decode_secs,
             decode_tokens as f64 / decode_secs / n_slots as f64
         );
+        let ds = decode_steps as f64;
+        println!(
+            "  host submit: {:.2} ms/step over {:.0} launches ({:.2} us/launch)",
+            host_launch_ns as f64 / ds / 1e6,
+            host_launch_n as f64 / ds,
+            host_launch_ns as f64 / host_launch_n.max(1) as f64 / 1e3
+        );
+        println!(
+            "  host other:  h2d {:.2} ms/step, d2d {:.2} ms/step, sync {:.2} ms/step",
+            host_h2d_ns as f64 / ds / 1e6,
+            host_d2d_ns as f64 / ds / 1e6,
+            host_sync_ns as f64 / ds / 1e6
+        );
+        let (caps, reps) = decode_graph.stats();
+        println!("  decode graph: {caps} capture(s), {reps} replay(s)");
         if let Some(&warm) = decode_step_ms.first() {
             println!("  (warmup step was {warm:.2} ms)");
         }
