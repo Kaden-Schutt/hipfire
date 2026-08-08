@@ -246,7 +246,8 @@ fn main() {
                 let slot = sessions
                     .get(id)
                     .expect("just-opened session must resolve")
-                    .slot;
+                    .slot
+                    .expect("a freshly opened session is Resident and holds a slot");
                 slot_session[slot.0] = Some(id);
                 println!(
                     "  ADMITTED session {}: slot={}, granted_ctx={cap_tokens} tokens, \
