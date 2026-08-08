@@ -17,7 +17,7 @@
 - **Do not modify `forward_prefill_batch_with_pbs_opts`.** It carries hipGraph capture eligibility, tree-verify, GDN tape and MTP interactions whose interaction with a slot axis is unknown. Breaking AR decode is a far worse outcome than duplication.
 - **`positions[]` is authoritative for the causal bound — never `desc.seq_len`.** They differ whenever a slot has more than one query row. This caused SP1's only Critical defect.
 - **The KV write resolves both arenas through `k_base`.** Correct under the Q8 ABI (`v_base == k_base`, enforced by `SlotPool`), but **asym3 cannot use that path** — its K and V strides differ. Do not treat the write kernel as mode-agnostic.
-- **DeltaNet: one launch per slot.** The recurrence is sequential within a slot. Mixing slots in one launch would interleave independent recurrences.
+- **DeltaNet: one launch per slot, using that slot's own `DeltaNetState` and the EXISTING `gated_delta_net_q8_batch_seq`.** The per-slot stride API is retired and asserts a zero stride — it was unsound (one stride cannot serve `s_q8` and `s_scales`, which differ by a factor of HD; `s_ef_residual` was never strided). No stride is needed: one launch already advances exactly one slot.
 - **RoPE is slot-agnostic** — verified in SP2 Task 2, no work needed.
 - **`tree_bias` with descriptors is asserted out of scope** in SP1 and stays that way.
 - **MEMORY — binding and measured.**
@@ -244,7 +244,7 @@ The largest task in the plan. It mirrors the per-layer sequence of `forward_pref
 - Modify: `crates/hipfire-arch-qwen35/src/lib.rs`
 
 **Interfaces:**
-- Consumes: `SlotBatch` (Task 1); `SlotPool` (SP2 Task 1); `Gpu::kv_cache_write_q8_0_batched_slots` (SP2 Task 3); `Gpu::gated_delta_net_q8_batch_seq_slots` (SP2 Task 4); `Gpu::sample_per_slot` (SP2 Task 5); `Gpu::attention_flash_q8_0_batched_masked_slots` and `Gpu::attention_q8_0_kv_batched_masked_slots` (SP1).
+- Consumes: `SlotBatch` (Task 1); `SlotPool` (SP2 Task 1); `Gpu::kv_cache_write_q8_0_batched_slots` (SP2 Task 3); `Gpu::gated_delta_net_q8_batch_seq` (existing, unmodified — the SP2 Task 4 stride API is retired, see Task 2 Step 3); `Gpu::sample_per_slot` (SP2 Task 5); `Gpu::attention_flash_q8_0_batched_masked_slots` and `Gpu::attention_q8_0_kv_batched_masked_slots` (SP1).
 - Produces: `pub fn forward_batch_slots(gpu, weights, config, batch: &SlotBatch, pool: &mut SlotPool, dn_states: &mut [DeltaNetState], scratch, logits_out: &GpuTensor) -> HipResult<()>`
 
 - [ ] **Step 1: Read the reference implementation**
@@ -261,7 +261,24 @@ Route attention through the `_slots` entry points, passing `Some(&descs_dev)` an
 
 - [ ] **Step 3: Add the DeltaNet layers**
 
-One launch per slot, per layer. For each slot with `m_per_slot[s] > 0`, call `gated_delta_net_q8_batch_seq_slots` with that slot's token rows and its own state, using the slot stride. The recurrence is sequential within a slot; do not attempt to batch slots into one launch.
+One launch per slot, per layer. For each slot with `m_per_slot[s] > 0`, call the
+**existing, unmodified** `gated_delta_net_q8_batch_seq` with that slot's token
+rows and **that slot's own `DeltaNetState`** from `dn_states[s]`.
+
+**Do NOT use `gated_delta_net_q8_batch_seq_slots` or any stride.** That API now
+asserts `s_stride_elems == 0` because the stride design was found unsound:
+one stride cannot serve both `s_q8` (`[n_heads × HD × HD]` per slot) and
+`s_scales` (`[n_heads × HD]`) — they differ by a factor of HD, so slot 1 would
+index `s_scales` 524,288 elements into a buffer holding 4,096 — and
+`s_ef_residual` was never strided at all.
+
+No stride is needed. DeltaNet state is fixed-size and per-slot independent, and
+one launch already advances exactly one slot, so passing that slot's own tensors
+is both simpler and correct by construction. This is why the signature takes
+`dn_states: &mut [DeltaNetState]` rather than one state plus a stride.
+
+The recurrence is sequential within a slot; do not attempt to batch slots into
+one launch.
 
 - [ ] **Step 4: Build and gate**
 
