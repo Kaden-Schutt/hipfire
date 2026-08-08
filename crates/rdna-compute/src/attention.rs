@@ -2200,6 +2200,60 @@ impl Gpu {
         head_dim: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.attention_q8_0_flash_prefill_wmma_slots(
+            q, k_cache, v_cache, out, positions, n_heads, n_kv_heads, head_dim, batch_size, None,
+            None, None, None,
+        )
+    }
+
+    /// Multi-slot variant of `attention_q8_0_flash_prefill_wmma`.
+    ///
+    /// Same tile-array ABI as [`attention_q8_0_flash_prefill_slots`] (the
+    /// scalar sibling): `tile_slot[t]` selects the `KvSlotDesc` for tile `t`'s
+    /// K/V base address (never a causal bound — `positions[]` stays
+    /// authoritative), `tile_row0[t]` is ABI-reserved and unread, and
+    /// `tile_qbase[t]` is how `q`/`out`/`positions` are indexed. Tiles here are
+    /// fixed at `M_TILE = 16` rows (the WMMA fragment shape) rather than the
+    /// scalar kernel's tunable `BR` — build the tile arrays with
+    /// `kv_slots::build_tiles(slot_query_counts, 16)`.
+    ///
+    /// `slot_descs` / `tile_slot` / `tile_row0` / `tile_qbase` MUST be all
+    /// `Some` or all `None`. When all `None` this is byte-identical to
+    /// [`attention_q8_0_flash_prefill_wmma`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_q8_0_flash_prefill_wmma_slots(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        batch_size: usize,
+        slot_descs: Option<&GpuTensor>,
+        tile_slot: Option<&GpuTensor>,
+        tile_row0: Option<&GpuTensor>,
+        tile_qbase: Option<&GpuTensor>,
+    ) -> HipResult<()> {
+        let multi_slot = slot_descs.is_some();
+        assert_eq!(
+            multi_slot,
+            tile_slot.is_some(),
+            "slot_descs and tile_slot must be both Some or both None"
+        );
+        assert_eq!(
+            multi_slot,
+            tile_row0.is_some(),
+            "slot_descs and tile_row0 must be both Some or both None"
+        );
+        assert_eq!(
+            multi_slot,
+            tile_qbase.is_some(),
+            "slot_descs and tile_qbase must be both Some or both None: a \
+             partially configured combination has no defined contract"
+        );
         self.bind_thread()?;
         assert!(
             head_dim % 32 == 0,
@@ -2253,11 +2307,20 @@ impl Gpu {
         } else {
             kernels::ATTENTION_Q8_0_FLASH_PREFILL_WMMA_SRC
         };
-        let src = format!(
-            "#define SPLIT_Q {}\n#define FIXED_HEAD_DIM {}\n#define PREFETCH_V {}\n{}",
-            split_q as u32, fixed_hd, prefetch_v as u32, kernel_src
-        );
-        self.ensure_kernel(&module, &src, "attention_q8_0_flash_prefill_wmma")?;
+        // The kernel source `#include`s kv_slot_desc.h, but the runtime hipcc
+        // compile happens in a cache dir with no -I to kernels/src. Strip the
+        // directive and prepend the header body instead (same pattern as
+        // attention_q8_0_flash_prefill_slots and ensure_givens4_kernel). The
+        // module name varies by variant but the loaded function name does
+        // not, so gate on that — mirrors the scalar port's guard.
+        if !self.functions.contains_key("attention_q8_0_flash_prefill_wmma") {
+            let stripped = kernel_src.replace("#include \"kv_slot_desc.h\"", "");
+            let src = format!(
+                "#define SPLIT_Q {}\n#define FIXED_HEAD_DIM {}\n#define PREFETCH_V {}\n{}\n{}",
+                split_q as u32, fixed_hd, prefetch_v as u32, kernels::KV_SLOT_DESC_H, stripped
+            );
+            self.ensure_kernel(&module, &src, "attention_q8_0_flash_prefill_wmma")?;
+        }
         const M_TILE: usize = 16;
         const N_TILE: usize = 16;
         const S_STRIDE: usize = 18;
@@ -2286,6 +2349,22 @@ impl Gpu {
         let mut hd = head_dim as i32;
         let mut bs = batch_size as i32;
         let mut sc = scale;
+        let mut desc_ptr: *mut std::ffi::c_void = match slot_descs {
+            Some(t) => t.buf.as_ptr(),
+            None => std::ptr::null_mut(),
+        };
+        let mut tile_slot_ptr: *mut std::ffi::c_void = match tile_slot {
+            Some(t) => t.buf.as_ptr(),
+            None => std::ptr::null_mut(),
+        };
+        let mut tile_row0_ptr: *mut std::ffi::c_void = match tile_row0 {
+            Some(t) => t.buf.as_ptr(),
+            None => std::ptr::null_mut(),
+        };
+        let mut tile_qbase_ptr: *mut std::ffi::c_void = match tile_qbase {
+            Some(t) => t.buf.as_ptr(),
+            None => std::ptr::null_mut(),
+        };
         let mut params: Vec<*mut c_void> = vec![
             &mut q_ptr as *mut _ as *mut c_void,
             &mut k_ptr as *mut _ as *mut c_void,
@@ -2297,8 +2376,16 @@ impl Gpu {
             &mut hd as *mut _ as *mut c_void,
             &mut bs as *mut _ as *mut c_void,
             &mut sc as *mut _ as *mut c_void,
+            &mut desc_ptr as *mut _ as *mut c_void,
+            &mut tile_slot_ptr as *mut _ as *mut c_void,
+            &mut tile_row0_ptr as *mut _ as *mut c_void,
+            &mut tile_qbase_ptr as *mut _ as *mut c_void,
         ];
-        let grid_x = batch_size.div_ceil(M_TILE) as u32;
+        let grid_x = if let Some(ts) = tile_slot {
+            ts.numel() as u32
+        } else {
+            batch_size.div_ceil(M_TILE) as u32
+        };
         self.launch_maybe_blob(
             "attention_q8_0_flash_prefill_wmma",
             [grid_x, n_heads as u32, 1],
@@ -2317,6 +2404,10 @@ impl Gpu {
                 b.push_i32(hd);
                 b.push_i32(bs);
                 b.push_f32(sc);
+                b.push_ptr(desc_ptr);
+                b.push_ptr(tile_slot_ptr);
+                b.push_ptr(tile_row0_ptr);
+                b.push_ptr(tile_qbase_ptr);
                 b
             },
         )

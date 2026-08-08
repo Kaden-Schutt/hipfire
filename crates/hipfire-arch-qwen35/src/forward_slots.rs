@@ -54,7 +54,7 @@ use hipfire_dispatch::context::DispatchCtx;
 use hipfire_dispatch::pipeline::{execute_steps, GemvInput, Step};
 use hipfire_dispatch::types::KernelKey;
 use hipfire_runtime::llama::EmbeddingFormat;
-use rdna_compute::kv_slots::KvSlotDesc;
+use rdna_compute::kv_slots::{build_tiles, KvSlotDesc};
 use rdna_compute::slot_pool::SlotPool;
 use rdna_compute::{DType, Gpu, GpuTensor};
 
@@ -90,23 +90,54 @@ fn pack_descs(descs: &[KvSlotDesc]) -> Vec<u8> {
 pub struct SlotDescStaging {
     pub descs_dev: GpuTensor,
     pub row_slot_dev: GpuTensor,
+    /// Flat row-tile lists for the WMMA flash-prefill kernel
+    /// (`attention_q8_0_flash_prefill_wmma_slots`) — the only `_slots` kernel
+    /// with `BR > 1` (fixed `M_TILE = 16`) that this file drives, so it is
+    /// the only one that needs tile arrays rather than a plain `row_slot`
+    /// map. Capacity is `max_rows` i32 entries: a tile always owns >= 1 row,
+    /// so the tile count can never exceed the row count. Rebuilt and
+    /// re-uploaded every step (like `row_slot_dev`) whenever more than one
+    /// slot is active this step — batch composition legitimately changes
+    /// step to step and `SlotBatch` carries no dirty-tracking of its own.
+    /// Only their PREFIX (`0..n_tiles_this_step`) is meaningful; callers
+    /// must track `n_tiles` themselves (see `forward_batch_slots_with_max_layer`).
+    pub tile_slot_dev: GpuTensor,
+    pub tile_row0_dev: GpuTensor,
+    pub tile_qbase_dev: GpuTensor,
     n_slots: usize,
     max_rows: usize,
 }
 
 impl SlotDescStaging {
     pub fn new(gpu: &mut Gpu, n_slots: usize, max_rows: usize) -> HipResult<Self> {
-        let descs_dev = gpu.alloc_tensor(&[n_slots * 24], DType::Raw)?;
-        let row_slot_dev = match gpu.alloc_tensor(&[max_rows * 4], DType::Raw) {
-            Ok(t) => t,
-            Err(e) => {
-                let _ = gpu.free_tensor(descs_dev);
-                return Err(e);
+        // Allocate all five staging buffers, freeing whatever already
+        // succeeded if a later allocation fails partway through.
+        let mut allocated: Vec<GpuTensor> = Vec::new();
+        let shapes: [&[usize]; 5] = [
+            &[n_slots * 24], // descs_dev
+            &[max_rows * 4], // row_slot_dev
+            &[max_rows * 4], // tile_slot_dev
+            &[max_rows * 4], // tile_row0_dev
+            &[max_rows * 4], // tile_qbase_dev
+        ];
+        for shape in shapes {
+            match gpu.alloc_tensor(shape, DType::Raw) {
+                Ok(t) => allocated.push(t),
+                Err(e) => {
+                    for t in allocated.drain(..) {
+                        let _ = gpu.free_tensor(t);
+                    }
+                    return Err(e);
+                }
             }
-        };
+        }
+        let mut it = allocated.into_iter();
         Ok(Self {
-            descs_dev,
-            row_slot_dev,
+            descs_dev: it.next().unwrap(),
+            row_slot_dev: it.next().unwrap(),
+            tile_slot_dev: it.next().unwrap(),
+            tile_row0_dev: it.next().unwrap(),
+            tile_qbase_dev: it.next().unwrap(),
             n_slots,
             max_rows,
         })
@@ -115,6 +146,9 @@ impl SlotDescStaging {
     pub fn free_gpu(self, gpu: &mut Gpu) {
         let _ = gpu.free_tensor(self.descs_dev);
         let _ = gpu.free_tensor(self.row_slot_dev);
+        let _ = gpu.free_tensor(self.tile_slot_dev);
+        let _ = gpu.free_tensor(self.tile_row0_dev);
+        let _ = gpu.free_tensor(self.tile_qbase_dev);
     }
 }
 
@@ -583,18 +617,34 @@ fn q8_flash_prefill_wmma_eligible(gpu: &Gpu, head_dim: usize, batch_size: usize)
 /// remaining respect: the scalar flash-prefill opt-in variant (gated by
 /// `HIPFIRE_FLASH_PREFILL_KERNEL=scalar` + a long-context minimum) has no
 /// `_slots` port, so that one case still falls through to this crossover —
-/// SP1 built only the two families used here, plus (below) the WMMA
-/// flash-prefill family for the single-active-slot reduction.
+/// SP1 built the two families used here, plus (below) the WMMA flash-prefill
+/// family, now ported for BOTH the single-active-slot reduction and the
+/// genuinely-multi-slot case (`attention_q8_0_flash_prefill_wmma_slots`).
 ///
 /// `single_slot`, when `Some((k_base, slab_bytes))`, means exactly one slot
 /// is active in this step (true for every `n_slots == 1` call, and for a
-/// larger pool whenever only one slot has live rows this step) — the WMMA
-/// flash-prefill kernel has no slot-descriptor concept at all, so it is only
-/// safe to call when the whole batch belongs to one sequence. `k_base` is
+/// larger pool whenever only one slot has live rows this step). `k_base` is
 /// that slot's byte offset into the shared arena (`SlotPool` guarantees
 /// `v_base == k_base`); slot 0 of a fresh pool always has `k_base == 0`, so
 /// this reduces byte-for-byte to the reference's own `k_cache`/`v_cache`
-/// addressing when `n_slots == 1`.
+/// addressing when `n_slots == 1`. This path is kept (rather than folded into
+/// the general multi-slot path below) because it is strictly cheaper: no
+/// tile-array build/upload, no descriptor indirection, no extra kernarg
+/// pointers or per-tile table lookups — just the plain legacy kernel against
+/// a pointer-shifted view, address-identical to what SP3 verified
+/// bit-identical (0.000x tolerance) against the reference.
+///
+/// `multi_slot_tiles`, when `Some((tile_slot_dev, tile_row0_dev,
+/// tile_qbase_dev, n_tiles))`, means MORE than one slot is active this step
+/// AND the reference's own gfx11 WMMA-flash-prefill gate
+/// (`q8_flash_prefill_wmma_eligible`) would fire for this shape — the exact
+/// condition under which the reference's single-sequence dispatch (which has
+/// no concept of "slots" at all, just a flat batch) would have run this
+/// kernel. `tile_*_dev` are persistent per-step staging buffers (see
+/// `SlotDescStaging`) sized to `desc_staging.max_rows`; only their first
+/// `n_tiles` entries are valid this step, hence the `sub_offset` views built
+/// below (which exist purely to give the launcher's `tile_slot.numel()` grid
+/// sizing the correct `n_tiles`, not `max_rows`).
 #[allow(clippy::too_many_arguments)]
 fn q8_attend_slots(
     gpu: &mut Gpu,
@@ -613,6 +663,7 @@ fn q8_attend_slots(
     descs_dev: &GpuTensor,
     row_slot_dev: &GpuTensor,
     single_slot: Option<(u64, usize)>,
+    multi_slot_tiles: Option<(&GpuTensor, &GpuTensor, &GpuTensor, usize)>,
 ) -> HipResult<()> {
     if let Some((k_base, slab_bytes)) = single_slot {
         if q8_flash_prefill_wmma_eligible(gpu, head_dim, batch_size) {
@@ -628,6 +679,37 @@ fn q8_attend_slots(
                 n_kv_heads,
                 head_dim,
                 batch_size,
+            );
+        }
+    } else if let Some((tile_slot_dev, tile_row0_dev, tile_qbase_dev, n_tiles)) = multi_slot_tiles
+    {
+        // Caller (forward_batch_slots_with_max_layer) only populates
+        // multi_slot_tiles when q8_flash_prefill_wmma_eligible already held —
+        // re-check anyway so this function's own contract doesn't depend on
+        // the caller getting that right, matching this crate's usual
+        // defense-in-depth style (see require_q8_fullattn_layer et al.).
+        if n_tiles > 0 && q8_flash_prefill_wmma_eligible(gpu, head_dim, batch_size) {
+            // Views exist only so `.numel()` reports n_tiles, not the
+            // persistent buffers' max_rows capacity — see this function's
+            // doc comment. Byte length as reported by the view is otherwise
+            // unused (only the pointer is read downstream).
+            let tile_slot_view = tile_slot_dev.sub_offset(0, n_tiles);
+            let tile_row0_view = tile_row0_dev.sub_offset(0, n_tiles);
+            let tile_qbase_view = tile_qbase_dev.sub_offset(0, n_tiles);
+            return gpu.attention_q8_0_flash_prefill_wmma_slots(
+                q,
+                k_cache,
+                v_cache,
+                out,
+                positions,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                batch_size,
+                Some(descs_dev),
+                Some(&tile_slot_view),
+                Some(&tile_row0_view),
+                Some(&tile_qbase_view),
             );
         }
     }
@@ -698,6 +780,7 @@ fn run_fullattn_layer_slots(
     physical_cap: usize,
     max_ctx_len: usize,
     single_slot: Option<(u64, usize)>,
+    n_tiles: Option<usize>,
 ) -> HipResult<()> {
     require_q8_fullattn_layer(layer)?;
 
@@ -863,6 +946,14 @@ fn run_fullattn_layer_slots(
         &desc_staging.descs_dev,
         &desc_staging.row_slot_dev,
         single_slot,
+        n_tiles.map(|nt| {
+            (
+                &desc_staging.tile_slot_dev,
+                &desc_staging.tile_row0_dev,
+                &desc_staging.tile_qbase_dev,
+                nt,
+            )
+        }),
     )?;
 
     // 8. sigmoid(gate) * attn_out.
@@ -919,18 +1010,22 @@ fn run_fullattn_layer_slots(
 /// whatever was already there; callers must not sample them (this is the
 /// same contract `SlotBatch.m_per_slot` already establishes).
 ///
-/// Single-active-slot reduction: when the whole pool is exactly one active
-/// slot, skip the batched rmsnorm+GEMM below and run the reference's own
-/// single-vector legacy-path kernels (`rmsnorm_f32` + `Step::Gemv`,
-/// `qwen35.rs:11984-12008`) byte-for-byte instead. Confirmed by a
-/// layer-by-layer bisection (see `sp3-defect-report.md`): with the
-/// FullAttention kernel-selection fix above also in place, EVERY layer's
+/// Per-active-slot reduction: for EVERY active slot (not just when the pool
+/// has exactly one), run the reference's own single-vector legacy-path
+/// kernels (`rmsnorm_f32` + `Step::Gemv`, `qwen35.rs:11984-12008`)
+/// byte-for-byte, rather than a single batched `rmsnorm_batched` +
+/// `GemmQ8_0BatchedChunked(n_slots)` call. Originally an `n_slots == 1`
+/// special case (SP3's fix for root cause #2, confirmed by a layer-by-layer
+/// bisection — see `sp3-defect-report.md`: with the FullAttention
+/// kernel-selection fix in `q8_attend_slots` also in place, EVERY layer's
 /// hidden state is bit-identical between this file and the reference up to
-/// (and including) the last layer — the only remaining divergence at
-/// `n_slots == 1` was here, a `rmsnorm_batched`+`GemmQ8_0BatchedChunked`
-/// (n=1) vs `rmsnorm_f32`+GEMV numeric mismatch between two
-/// mathematically-equivalent but differently-implemented kernel families,
-/// not a logic bug.
+/// and including the last layer, so the only divergence was here, a
+/// `rmsnorm_batched`+`GemmQ8_0BatchedChunked` (n=1) vs `rmsnorm_f32`+GEMV
+/// numeric mismatch between two mathematically-equivalent but
+/// differently-implemented kernel families, not a logic bug). Generalized
+/// to every slot count once the WMMA flash-prefill port (root cause #1)
+/// stopped masking the same mismatch at `n_slots >= 2` — see the loop body
+/// below for the empirical confirmation.
 fn final_logits_per_slot(
     gpu: &mut Gpu,
     weights: &Qwen35Weights,
@@ -960,61 +1055,54 @@ fn final_logits_per_slot(
         n_slots * config.vocab_size
     );
 
-    if n_slots == 1 && batch.m_per_slot[0] > 0 {
-        let m = batch.m_per_slot[0];
-        let last_row = m - 1;
-        let dim_row_bytes = dim * 4;
-        gpu.memcpy_dtod_at_auto(&s.x.buf, 0, &pbs.x_batch.buf, last_row * dim_row_bytes, dim_row_bytes)?;
-        gpu.rmsnorm_f32(&s.x, &weights.output_norm, &s.tmp, config.norm_eps)?;
-        let ctx = DispatchCtx::new(gpu);
-        let wr = weights.output.dispatch_ref();
-        let logits_view = logits_out.sub_offset(0, config.vocab_size);
-        let step = Step::Gemv {
-            w: &wr,
-            input: GemvInput::Raw(&s.tmp),
-            out: &logits_view,
-        };
-        return execute_steps(gpu, &ctx, &[step]).map_err(|e| HipError::new(0, &e.to_string()));
-    }
-
-    // x_rot_batch and x_norm_batch are both dead at this point (their last
-    // use was this layer's FFN, already consumed by the w_down residual
-    // add) — reused here as compact last-token-per-slot scratch.
+    // Per-active-slot reduction: run the reference's own single-vector
+    // legacy-path kernels (`rmsnorm_f32` + `Step::Gemv`, `qwen35.rs:11984-
+    // 12008`) once per active slot, byte-for-byte, rather than a single
+    // batched `rmsnorm_batched`+`GemmQ8_0BatchedChunked(n_slots)` call.
+    //
+    // This generalizes what was originally an `n_slots == 1` special case
+    // (SP3's fix for root cause #2 — see sp3-defect-report.md) to every
+    // slot count. That generalization is necessary, not merely tidier: the
+    // REFERENCE this file is checked against (`run_reference_for_slot` in
+    // `test_forward_slots_golden.rs`) always computes each slot through an
+    // independent single-sequence `forward_prefill_batch` call, which is
+    // ALWAYS one row through the GEVM path — regardless of how many slots
+    // this file's own SlotBatch happens to have. A batched GEMM over M =
+    // n_slots rows is a mathematically-equivalent but numerically DIFFERENT
+    // kernel from M independent GEVMs (different accumulation order), so it
+    // was never going to match at n_slots >= 2 either, once the FullAttention
+    // kernel-selection gap (root cause #1, the WMMA flash-prefill port)
+    // stopped masking it. Confirmed empirically: before this change, fixing
+    // only the WMMA gap left n_slots=2 failing at ~4.4x tolerance — the same
+    // residual root-cause-#2 numbers SP3 first saw at n_slots=1 before this
+    // exact fix.
     let mut row_off = 0usize;
     for (slot, &m) in batch.m_per_slot.iter().enumerate() {
         if m > 0 {
             let last_row = row_off + m - 1;
-            gpu.hip.memcpy_dtod_at(
-                &pbs.x_rot_batch.buf,
-                slot * dim * 4,
+            let dim_row_bytes = dim * 4;
+            gpu.memcpy_dtod_at_auto(
+                &s.x.buf,
+                0,
                 &pbs.x_batch.buf,
-                last_row * dim * 4,
-                dim * 4,
+                last_row * dim_row_bytes,
+                dim_row_bytes,
             )?;
+            gpu.rmsnorm_f32(&s.x, &weights.output_norm, &s.tmp, config.norm_eps)?;
+            let ctx = DispatchCtx::new(gpu);
+            let wr = weights.output.dispatch_ref();
+            let logits_view = logits_out.sub_offset(slot * config.vocab_size, config.vocab_size);
+            let step = Step::Gemv {
+                w: &wr,
+                input: GemvInput::Raw(&s.tmp),
+                out: &logits_view,
+            };
+            execute_steps(gpu, &ctx, &[step]).map_err(|e| HipError::new(0, &e.to_string()))?;
         }
         row_off += m;
     }
     debug_assert_eq!(row_off, batch.total_rows());
-
-    gpu.rmsnorm_batched(
-        &pbs.x_rot_batch,
-        &weights.output_norm,
-        &pbs.x_norm_batch,
-        n_slots,
-        dim,
-        config.norm_eps,
-    )?;
-    run_plain_gemm_key(
-        gpu,
-        KernelKey::GemmQ8_0BatchedChunked,
-        &weights.output.buf,
-        weights.output.gpu_dtype,
-        &pbs.x_norm_batch,
-        logits_out,
-        weights.output.m,
-        weights.output.k,
-        n_slots,
-    )
+    Ok(())
 }
 
 /// Advance every active slot in `batch` by one step: embed, run every
@@ -1200,6 +1288,44 @@ pub fn forward_batch_slots_with_max_layer(
         None
     };
 
+    // Genuinely multi-slot AND the reference's own gfx11 WMMA-flash-prefill
+    // gate (q8_flash_prefill_wmma_eligible) would fire for this shape: the
+    // exact condition under which the reference's flat, slot-unaware
+    // dispatch would have run attention_q8_0_flash_prefill_wmma. Built once
+    // per step here (not once per FullAttention layer — head_dim/batch_size
+    // are layer-invariant config, and re-uploading per layer would repeat
+    // identical work), mirroring row_slot_dev's "every step, not every
+    // layer" upload policy.
+    let n_tiles: Option<usize> = if single_slot.is_none()
+        && active_slots > 1
+        && q8_flash_prefill_wmma_eligible(gpu, config.head_dim, n)
+    {
+        // Fixed M_TILE = 16: the WMMA kernel's WMMA-fragment tile size, not
+        // the scalar kernel's tunable BR.
+        const WMMA_M_TILE: usize = 16;
+        let (tile_slot, tile_row0, tile_qbase) = build_tiles(&batch.m_per_slot, WMMA_M_TILE);
+        let nt = tile_slot.len();
+        assert!(
+            nt <= desc_staging.max_rows,
+            "forward_batch_slots: n_tiles ({nt}) exceeds desc_staging.max_rows \
+             ({}) capacity — a tile always owns >= 1 row so this should be \
+             unreachable unless max_rows was undersized",
+            desc_staging.max_rows
+        );
+        if nt > 0 {
+            let to_bytes = |v: &[i32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_ne_bytes()).collect() };
+            gpu.hip
+                .memcpy_htod(&desc_staging.tile_slot_dev.buf, &to_bytes(&tile_slot))?;
+            gpu.hip
+                .memcpy_htod(&desc_staging.tile_row0_dev.buf, &to_bytes(&tile_row0))?;
+            gpu.hip
+                .memcpy_htod(&desc_staging.tile_qbase_dev.buf, &to_bytes(&tile_qbase))?;
+        }
+        Some(nt)
+    } else {
+        None
+    };
+
     // ── 4. Per-layer loop ─────────────────────────────────────────────────
     let layer_end = config.n_layers.min(max_layer.unwrap_or(usize::MAX));
     let mut delta_layer_idx = 0usize;
@@ -1235,6 +1361,7 @@ pub fn forward_batch_slots_with_max_layer(
                     physical_cap,
                     max_ctx_len,
                     single_slot,
+                    n_tiles,
                 )?;
                 kv_layer_idx += 1;
             }

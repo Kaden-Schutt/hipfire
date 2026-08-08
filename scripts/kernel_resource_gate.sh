@@ -71,6 +71,16 @@ assemble "$WORK/asym2.hip"   '' attention_flash_asym2_tile_batched.hip \
 # models' layers are DeltaNet, so a register regression in it is as costly as one
 # in attention -- and the gate did not cover it until SP2 Task 4 found the gap.
 assemble "$WORK/dn_q8.hip"   '' gated_delta_net_q8_fast.hip
+# WMMA flash-prefill: this is the kernel dispatch actually runs for batched
+# prefill on gfx11xx by default (see AttnQ8_0KvBatchedMasked's flash_default_on
+# in hipfire-dispatch), so its register/occupancy behavior matters as much as
+# the scalar prefill kernel's above. gfx11 and gfx12 are DIFFERENT source
+# files (different WMMA operand mapping), so each arch below compiles its own
+# native variant rather than sharing one assembled source. Defines mirror the
+# runtime's default config (FIXED_HEAD_DIM=256, SPLIT_Q=0, PREFETCH_V=1).
+WMMA_DEFS='#define SPLIT_Q 0\n#define FIXED_HEAD_DIM 256\n#define PREFETCH_V 1\n'
+assemble "$WORK/wmma_gfx11.hip" "$WMMA_DEFS" attention_q8_0_flash_prefill_wmma.hip kv_slot_desc.h
+assemble "$WORK/wmma_gfx12.hip" "$WMMA_DEFS" attention_q8_0_flash_prefill_wmma.gfx12.hip kv_slot_desc.h
 
 for arch in gfx1151 gfx1201; do
   for k in prefill q8_lds q8_tile asym3 asym2 dn_q8; do
@@ -84,4 +94,15 @@ for arch in gfx1151 gfx1201; do
                END{ if (v=="") print "COMPILE_FAILED"; else printf "vgpr=%-4d scratch=%-4d occupancy=%d", v, s, o }')
     printf '%-8s %-9s %s\n' "$arch" "$k" "$line"
   done
+  # WMMA uses its own arch-native source instead of the shared-source loop above.
+  wmma_src="wmma_gfx11"; [ "$arch" = gfx1201 ] && wmma_src="wmma_gfx12"
+  line=$("$HIPCC" --genco "--offload-arch=$arch" -O3 \
+           -Rpass-analysis=kernel-resource-usage \
+           -o "$WORK/$wmma_src.$arch.o" "$WORK/$wmma_src.hip" 2>&1 \
+         | awk -F': ' '
+             /VGPRs:/            && !v {v=$NF+0}
+             /ScratchSize/       && s=="" {s=$NF+0}
+             /Occupancy/         && !o {o=$NF+0}
+             END{ if (v=="") print "COMPILE_FAILED"; else printf "vgpr=%-4d scratch=%-4d occupancy=%d", v, s, o }')
+  printf '%-8s %-9s %s\n' "$arch" "wmma" "$line"
 done
