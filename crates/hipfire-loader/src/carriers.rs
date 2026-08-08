@@ -387,7 +387,7 @@ fn load_qwen35_pp(
     .map_err(|e| format!("{e}"))?;
     let dn_quant =
         crate::parse_state_quant(ctx.state_quant_override).map_err(|e| format!("{e}"))?;
-    let (dn, la_to_device) = hipfire_arch_qwen35::qwen35::DeltaNetState::new_with_quant_multi(
+    let dn = hipfire_arch_qwen35::qwen35::DeltaNetState::new_with_quant_multi(
         &mut gpus, &config, dn_quant,
     )
     .map_err(|e| format!("{e}"))?;
@@ -416,15 +416,12 @@ fn load_qwen35_pp(
         kv_adaptive: None,
     };
     // Banded-PP silent-corruption guard at load time: recurrent-state
-    // cardinality, layer→device map length, and device count must agree before
-    // the model is published (same invariants the teardown path re-validates).
-    crate::validate_qwen35_pipeline_layout(
-        &bundle,
-        &la_to_device,
-        gpus.devices.len(),
-        meta.arch_id,
-    )
-    .map_err(|e| format!("qwen35 PP load layout: {e:?}"))?;
+    // cardinality and device count must agree before the model is published
+    // (same invariants the teardown path re-validates). The layer→device map
+    // is now derived from the state manifest + mesh (STEP-003), so no
+    // sidecar can drift from the mesh.
+    crate::validate_qwen35_pipeline_layout(&bundle, &gpus, meta.arch_id)
+        .map_err(|e| format!("qwen35 PP load layout: {e:?}"))?;
     Ok(LoadedModel {
         state: Some(ModelState::Qwen35(bundle)),
         mtp_mode: ctx.mtp_mode.to_string(),
@@ -439,7 +436,6 @@ fn load_qwen35_pp(
             pp,
             gpus,
             scratch_set,
-            la_to_device,
         )
     })
 }

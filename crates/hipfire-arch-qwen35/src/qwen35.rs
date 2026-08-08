@@ -2963,7 +2963,11 @@ impl DeltaNetState {
         gpus: &mut Gpus,
         config: &Qwen35Config,
         quant: StateQuant,
-    ) -> HipResult<(Self, Vec<u8>)> {
+    ) -> HipResult<Self> {
+        // STEP-003: placement derives from the state manifest + mesh, not a
+        // hand-built sidecar. The map is compact-LA-layer → device, in
+        // manifest (global-layer) order.
+        let la_to_device = crate::arch::qwen35_la_devices(config, gpus);
         let s_dim = config.linear_key_head_dim;
         let n_heads = config.linear_num_value_heads;
         let s_size = n_heads * s_dim * s_dim;
@@ -2974,15 +2978,9 @@ impl DeltaNetState {
         let mut s_matrices = Vec::new();
         let mut s_scales = Vec::new();
         let mut conv_states = Vec::new();
-        let mut la_to_device: Vec<u8> = Vec::new();
 
-        for (orig_layer_idx, lt) in config.layer_types.iter().enumerate() {
-            if *lt != LayerType::LinearAttention {
-                continue;
-            }
-            let dev_idx = gpus.device_for_layer(orig_layer_idx);
-            la_to_device.push(dev_idx as u8);
-            let g = &mut gpus.devices[dev_idx];
+        for &dev_idx in la_to_device.iter() {
+            let g = &mut gpus.devices[dev_idx as usize];
             // g.hip.malloc/memset bypass the Stage 2 bind_thread audit
             // (HipRuntime methods don't carry a device id). Bind explicitly
             // before any raw HIP ops so allocations land on the right device.
@@ -3015,24 +3013,23 @@ impl DeltaNetState {
             }
             conv_states.push(g.zeros(&[conv_state_size], DType::F32)?);
         }
-        Ok((
-            Self {
-                s_matrices,
-                s_scales,
-                conv_states,
-                // EF residual not wired for the multi-GPU band split (would need
-                // per-device residual alloc routed by device_for_layer); empty ⇒
-                // ef_residual() returns None ⇒ kernel uses the stochastic path.
-                s_ef_residual: Vec::new(),
-                quant,
-            },
-            la_to_device,
-        ))
+        Ok(Self {
+            s_matrices,
+            s_scales,
+            conv_states,
+            // EF residual not wired for the multi-GPU band split (would need
+            // per-device residual alloc routed by device_for_layer); empty ⇒
+            // ef_residual() returns None ⇒ kernel uses the stochastic path.
+            s_ef_residual: Vec::new(),
+            quant,
+        })
     }
 
-    /// Free per-LA-layer tensors on the devices listed in `la_to_device`
-    /// (the second tuple element returned by `new_with_quant_multi`).
-    pub fn free_gpu_multi(self, gpus: &mut Gpus, la_to_device: &[u8]) {
+    /// Free per-LA-layer tensors on their manifest-derived owning devices.
+    /// Placement is computed from the state manifest + mesh (STEP-003), the
+    /// same map `new_with_quant_multi` allocated with.
+    pub fn free_gpu_multi(self, gpus: &mut Gpus, config: &Qwen35Config) {
+        let la_to_device = crate::arch::qwen35_la_devices(config, gpus);
         for (i, t) in self.s_matrices.into_iter().enumerate() {
             let _ = gpus.devices[la_to_device[i] as usize].free_tensor(t);
         }

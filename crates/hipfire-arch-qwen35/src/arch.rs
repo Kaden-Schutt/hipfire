@@ -48,6 +48,26 @@ use rdna_compute::{DType, Gpu};
 /// the hybrid DeltaNet + FullAttention layer scheme.
 pub struct Qwen35;
 
+/// STEP-003: derive the compact DeltaNet LA-layer → device map from the
+/// state manifest + mesh, defining the hand-built `la_to_device` sidecar
+/// out of existence.
+///
+/// The manifest (`state_manifest`) emits one `StateKind::Recurrent` entry
+/// per LinearAttention layer, keyed by GLOBAL layer index. Filtering for
+/// Recurrent entries in manifest order yields exactly the compact DeltaNet
+/// layer order, and the owning device is the mesh's
+/// `device_for_layer(global_layer)` — the same placement the KV cache and
+/// scratch sets use. The sidecar duplicated this computation in a second,
+/// unkeyed `Vec<u8>` that could drift from the mesh; this helper is the
+/// single source of truth for recurrent/conv state placement.
+pub fn qwen35_la_devices(cfg: &Qwen35Config, gpus: &hipfire_hardware::Gpus) -> Vec<u8> {
+    <Qwen35 as Architecture>::state_manifest(cfg)
+        .iter()
+        .filter(|e| matches!(e.kind, StateKind::Recurrent))
+        .map(|e| gpus.device_for_layer(e.layer) as u8)
+        .collect()
+}
+
 /// Qwen3.5-specific TP admission check. The current Qwen35 loader does not
 /// materialize a TP manifest yet, so admission is deliberately pure config
 /// policy: known unsafe packed layouts cannot be permitted by incomplete or
@@ -1093,6 +1113,66 @@ mod tests {
         );
         assert_eq!(state[4], StateEntry::new(StateKind::Recurrent, 3));
         assert_eq!(state[5], StateEntry::new(StateKind::Conv, 3));
+    }
+
+    #[test]
+    #[ignore] // GPU: HIPFIRE_EMULATE_GPUS=2 (or 2 real devices); see pp_parity.rs
+    fn qwen35_la_devices_matches_mesh_placement() {
+        use hipfire_runtime::multi_gpu::Gpus;
+        // 5 layers, 2 devices → uniform split [3, 2]:
+        //   layers 0-2 → dev 0, layers 3-4 → dev 1.
+        let cfg = config(&[
+            "full_attention",
+            "linear_attention",
+            "full_attention",
+            "linear_attention",
+            "linear_attention",
+        ]);
+        let mut gpus = Gpus::init_uniform(2, cfg.n_layers).expect("init_uniform");
+        let map = qwen35_la_devices(&cfg, &gpus);
+        // LA layers (global 1, 3, 4) → compact 0, 1, 2.
+        let expected: Vec<u8> = [1usize, 3, 4]
+            .iter()
+            .map(|&l| gpus.device_for_layer(l) as u8)
+            .collect();
+        assert_eq!(
+            map, expected,
+            "manifest-derived LA map must equal mesh placement"
+        );
+        assert_eq!(map.len(), 3, "one entry per LinearAttention layer");
+        // Sanity: the band split really is [3, 2] on a 5-layer/2-device mesh.
+        assert_eq!(gpus.layer_to_device[0], 0);
+        assert_eq!(gpus.layer_to_device[2], 0);
+        assert_eq!(gpus.layer_to_device[3], 1);
+        assert_eq!(gpus.layer_to_device[4], 1);
+        // The derived map is what allocation uses: rebuild the state and check
+        // the LA layer S matrices landed on the manifest-derived device.
+        // Under HIPFIRE_EMULATE_GPUS the logical ranks alias one physical
+        // device, so pointer_get_attributes cannot distinguish them; assert
+        // placement only when the physical devices are distinct.
+        let distinct_physical = (0..gpus.devices.len()).all(|a| {
+            (0..gpus.devices.len())
+                .all(|b| a == b || gpus.devices[a].device_id != gpus.devices[b].device_id)
+        });
+        let dn = crate::qwen35::DeltaNetState::new_with_quant_multi(
+            &mut gpus,
+            &cfg,
+            crate::qwen35::StateQuant::Q8,
+        )
+        .expect("dn multi");
+        if distinct_physical {
+            for (i, &dev) in map.iter().enumerate() {
+                let attr = gpus.devices[dev as usize]
+                    .hip
+                    .pointer_get_attributes(&dn.s_matrices[i].buf)
+                    .expect("s_matrix attrs");
+                assert_eq!(
+                    attr.device, dev as i32,
+                    "DeltaNetState s_matrices[{i}] must live on its manifest-derived device"
+                );
+            }
+        }
+        dn.free_gpu_multi(&mut gpus, &cfg);
     }
 
     // ── STEP-002 Task 9: Single expert-group manifest ─────────────────────
