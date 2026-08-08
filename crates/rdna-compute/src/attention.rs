@@ -10019,6 +10019,88 @@ impl Gpu {
             },
         )
     }
+    pub fn indexer_relu_score_wmma_batched_sharded_gfx1201(
+        &mut self,
+        q: &GpuTensor,
+        cache_ptrs: &[usize; 4],
+        weights: &GpuTensor,
+        n_per_batch: &GpuTensor,
+        scores: &GpuTensor,
+        n_idx_heads: i32,
+        idx_head_dim: i32,
+        n_max: i32,
+        batch_size: i32,
+        world: i32,
+        block_rows: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert!(self.arch_caps.is_gfx1201());
+        assert_eq!(n_idx_heads, 64);
+        assert_eq!(idx_head_dim, 128);
+        assert!(matches!(world, 3 | 4));
+        let symbol = "indexer_relu_score_wmma_batched_sharded_gfx1201";
+        self.ensure_kernel(
+            symbol,
+            kernels::INDEXER_RELU_SCORE_WMMA_BATCHED_SHARDED_GFX1201_SRC,
+            symbol,
+        )?;
+        let qp = q.buf.as_ptr();
+        let cp0 = cache_ptrs[0] as *mut c_void;
+        let cp1 = cache_ptrs[1] as *mut c_void;
+        let cp2 = cache_ptrs[2] as *mut c_void;
+        let cp3 = cache_ptrs[3] as *mut c_void;
+        let wp = weights.buf.as_ptr();
+        let np = n_per_batch.buf.as_ptr();
+        let sp = scores.buf.as_ptr();
+        let mut h = n_idx_heads;
+        let mut d = idx_head_dim;
+        let mut nc = n_max;
+        let mut bs = batch_size;
+        let mut ranks = world;
+        let mut block = block_rows;
+        let mut params: Vec<*mut c_void> = vec![
+            &qp as *const _ as *mut c_void,
+            &cp0 as *const _ as *mut c_void,
+            &cp1 as *const _ as *mut c_void,
+            &cp2 as *const _ as *mut c_void,
+            &cp3 as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &np as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &mut h as *mut _ as *mut c_void,
+            &mut d as *mut _ as *mut c_void,
+            &mut nc as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+            &mut ranks as *mut _ as *mut c_void,
+            &mut block as *mut _ as *mut c_void,
+        ];
+        let grid_n = (n_max as u32 + 15) / 16;
+        self.launch_maybe_blob(
+            symbol,
+            [batch_size as u32, grid_n, 1],
+            [128, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(qp);
+                b.push_ptr(cp0);
+                b.push_ptr(cp1);
+                b.push_ptr(cp2);
+                b.push_ptr(cp3);
+                b.push_ptr(wp);
+                b.push_ptr(np);
+                b.push_ptr(sp);
+                b.push_i32(h);
+                b.push_i32(d);
+                b.push_i32(nc);
+                b.push_i32(bs);
+                b.push_i32(ranks);
+                b.push_i32(block);
+                b
+            },
+        )
+    }
     pub fn indexer_relu_score_wmma_batched_klds_gfx1151(
         &mut self,
         q: &GpuTensor,
@@ -10142,6 +10224,78 @@ impl Gpu {
             0,
             &mut params,
             blob_builder,
+        )
+    }
+    pub fn indexer_relu_score_f32_buf_sharded_gfx1201(
+        &mut self,
+        q: &GpuTensor,
+        cache_ptrs: &[usize; 4],
+        weights: &GpuTensor,
+        scores: &GpuTensor,
+        n_buf: &GpuTensor,
+        max_n: i32,
+        h: i32,
+        d: i32,
+        world: i32,
+        block_rows: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert!(self.arch_caps.is_gfx1201());
+        assert!(matches!(world, 3 | 4));
+        let symbol = "indexer_relu_score_f32_buf_sharded_gfx1201";
+        self.ensure_kernel(
+            symbol,
+            kernels::INDEXER_RELU_SCORE_BUF_SHARDED_GFX1201_SRC,
+            symbol,
+        )?;
+        let qp = q.buf.as_ptr();
+        let cp0 = cache_ptrs[0] as *mut c_void;
+        let cp1 = cache_ptrs[1] as *mut c_void;
+        let cp2 = cache_ptrs[2] as *mut c_void;
+        let cp3 = cache_ptrs[3] as *mut c_void;
+        let wp = weights.buf.as_ptr();
+        let sp = scores.buf.as_ptr();
+        let nbp = n_buf.buf.as_ptr();
+        let mut hi = h;
+        let mut di = d;
+        let mut ranks = world;
+        let mut block = block_rows;
+        let mut params: Vec<*mut c_void> = vec![
+            &qp as *const _ as *mut c_void,
+            &cp0 as *const _ as *mut c_void,
+            &cp1 as *const _ as *mut c_void,
+            &cp2 as *const _ as *mut c_void,
+            &cp3 as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &nbp as *const _ as *mut c_void,
+            &mut hi as *mut _ as *mut c_void,
+            &mut di as *mut _ as *mut c_void,
+            &mut ranks as *mut _ as *mut c_void,
+            &mut block as *mut _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            symbol,
+            [max_n as u32, 1, 1],
+            [h as u32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(qp);
+                b.push_ptr(cp0);
+                b.push_ptr(cp1);
+                b.push_ptr(cp2);
+                b.push_ptr(cp3);
+                b.push_ptr(wp);
+                b.push_ptr(sp);
+                b.push_ptr(nbp);
+                b.push_i32(hi);
+                b.push_i32(di);
+                b.push_i32(ranks);
+                b.push_i32(block);
+                b
+            },
         )
     }
     pub fn indexer_top_k(
