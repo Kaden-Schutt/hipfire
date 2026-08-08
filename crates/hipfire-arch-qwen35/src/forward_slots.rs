@@ -14,10 +14,15 @@
 // `_slots` entry points SP1 built, and DeltaNet through a per-slot loop
 // over SP2's per-slot `DeltaNetState`.
 //
-// Scope: dense layers stay Q8_0 only. Every weight a `DeltaNet`/`FullAttn`
-// (dense) layer touches (QKV/QKVZA, wo, gate/up, down, and the lm_head) must
-// be `DType::Q8_0`, the KV cache is Q8_0-quantized, and DeltaNet state is
-// `StateQuant::Q8`. This matches the ABI the multi-slot infrastructure was
+// Scope: dense layers admit uniform `Q8_0` or uniform `MQ4G256`. Every weight
+// a `DeltaNet`/`FullAttn` (dense) layer touches (QKV/QKVZA, wo, gate/up, down,
+// and the lm_head) must share one of those two dtypes; the KV cache is
+// Q8_0-quantized and DeltaNet state is `StateQuant::Q8` regardless. MQ4G256
+// differs only in that activations are FWHT-rotated before each GEMM and the
+// `*Hfq4G256` kernel keys are used (MQ4 shares HFQ4's byte layout) — the same
+// treatment the MoE bodies already gave their attention projections. This is
+// what lets a dense MQ4 checkpoint such as `qwen3.6-27b.mq4` run multi-slot.
+// MQ6/HFQ6, MQ3, ParoQ4G128 and mixed-dtype-within-layer remain unported. This matches the ABI the multi-slot infrastructure was
 // actually built against — `SlotPool`'s per-slot addressing is documented as
 // a Q8_0 ABI (asym3 is explicitly exempted because its K/V strides differ and
 // it cannot share `k_base`/`v_base`), `kv_cache_write_q8_0_batched_slots` and
@@ -74,7 +79,8 @@ use hipfire_dispatch::families::gemv::{GemvFamily, RotateInputs};
 use hipfire_dispatch::pipeline::{execute_steps, GemvInput, Step};
 use hipfire_dispatch::types::KernelKey;
 use hipfire_runtime::llama::{
-    fused_rmsnorm_rotate_mq_batched_for, rotate_x_mq_batched_for, EmbeddingFormat, WeightTensor,
+    fused_rmsnorm_rotate_mq_batched_for, fused_silu_mul_rotate_mq_batched_for,
+    rotate_x_mq_batched_for, EmbeddingFormat, WeightTensor,
 };
 use rdna_compute::kv_slots::{build_tiles, KvSlotDesc};
 use rdna_compute::slot_pool::SlotPool;
@@ -174,51 +180,63 @@ impl SlotDescStaging {
     }
 }
 
-/// Q8-only weight-dtype gate for a `DeltaNetLayerWeights`. All eight
-/// projections must be `Q8_0` — a mixed-dtype layer would silently
-/// misroute through a Q8-stride kernel against a differently-strided
-/// weight, the exact corruption class the dense batched-prefill path
-/// guards against at every one of its own dtype branches.
-fn require_q8_deltanet_layer(layer: &DeltaNetLayerWeights) -> HipResult<()> {
-    let ok = matches!(layer.wqkv.gpu_dtype, DType::Q8_0)
-        && matches!(layer.wz.gpu_dtype, DType::Q8_0)
-        && matches!(layer.w_beta.gpu_dtype, DType::Q8_0)
-        && matches!(layer.w_alpha.gpu_dtype, DType::Q8_0)
-        && matches!(layer.wo.gpu_dtype, DType::Q8_0)
-        && matches!(layer.w_gate.gpu_dtype, DType::Q8_0)
-        && matches!(layer.w_up.gpu_dtype, DType::Q8_0)
-        && matches!(layer.w_down.gpu_dtype, DType::Q8_0);
-    if ok {
-        Ok(())
-    } else {
-        Err(HipError::new(
-            0,
-            "forward_batch_slots: DeltaNet layer has a non-Q8_0 weight; the \
-             multi-slot batched path is Q8_0-only (see sp3-task-2-report.md)",
-        ))
+/// Uniform-dtype gate for a `DeltaNetLayerWeights`. All eight projections must
+/// share ONE dtype — `Q8_0` or `MQ4G256`. Uniformity is the load-bearing part:
+/// a mixed-dtype layer would silently misroute through one dtype's stride
+/// against a differently-strided weight, the exact corruption class the dense
+/// batched-prefill path guards against at every one of its own dtype branches.
+fn require_batchable_deltanet_layer(layer: &DeltaNetLayerWeights) -> HipResult<AttnProjDtype> {
+    let all = |d: DType| {
+        layer.wqkv.gpu_dtype == d
+            && layer.wz.gpu_dtype == d
+            && layer.w_beta.gpu_dtype == d
+            && layer.w_alpha.gpu_dtype == d
+            && layer.wo.gpu_dtype == d
+            && layer.w_gate.gpu_dtype == d
+            && layer.w_up.gpu_dtype == d
+            && layer.w_down.gpu_dtype == d
+    };
+    if all(DType::Q8_0) {
+        return Ok(AttnProjDtype::Q8_0);
     }
+    if all(DType::MQ4G256) {
+        return Ok(AttnProjDtype::Mq4G256);
+    }
+    Err(HipError::new(
+        0,
+        "forward_batch_slots: dense DeltaNet layer is neither uniformly Q8_0 nor \
+         uniformly MQ4G256; the multi-slot batched path implements those two \
+         (MQ6/HFQ6, MQ3, ParoQ4G128 and mixed-dtype-within-layer are real \
+         reference paths but are not ported here)",
+    ))
 }
 
-fn require_q8_fullattn_layer(layer: &FullAttnLayerWeights) -> HipResult<()> {
-    let ok = matches!(layer.wq.gpu_dtype, DType::Q8_0)
-        && matches!(layer.wk.gpu_dtype, DType::Q8_0)
-        && matches!(layer.wv.gpu_dtype, DType::Q8_0)
-        && matches!(layer.wo.gpu_dtype, DType::Q8_0)
-        && matches!(layer.w_gate.gpu_dtype, DType::Q8_0)
-        && matches!(layer.w_up.gpu_dtype, DType::Q8_0)
-        && matches!(layer.w_down.gpu_dtype, DType::Q8_0);
-    if ok {
-        Ok(())
-    } else {
-        Err(HipError::new(
-            0,
-            "forward_batch_slots: FullAttention layer has a non-Q8_0 weight; \
-             the multi-slot batched path is Q8_0-only (see sp3-task-2-report.md)",
-        ))
+fn require_batchable_fullattn_layer(layer: &FullAttnLayerWeights) -> HipResult<AttnProjDtype> {
+    let all = |d: DType| {
+        layer.wq.gpu_dtype == d
+            && layer.wk.gpu_dtype == d
+            && layer.wv.gpu_dtype == d
+            && layer.wo.gpu_dtype == d
+            && layer.w_gate.gpu_dtype == d
+            && layer.w_up.gpu_dtype == d
+            && layer.w_down.gpu_dtype == d
+    };
+    if all(DType::Q8_0) {
+        return Ok(AttnProjDtype::Q8_0);
     }
+    if all(DType::MQ4G256) {
+        return Ok(AttnProjDtype::Mq4G256);
+    }
+    Err(HipError::new(
+        0,
+        "forward_batch_slots: dense FullAttention layer is neither uniformly \
+         Q8_0 nor uniformly MQ4G256; see require_batchable_deltanet_layer",
+    ))
 }
 
-/// Which batched projection dispatch a MoE attention body should take.
+/// Which batched projection dispatch an attention body should take. Applies to
+/// dense and MoE layers alike: the projections are the same weights either way,
+/// and only the FFN downstream differs.
 /// Mirrors the `is_q8` / `is_mq` dtype forks `forward_prefill_chunk` applies
 /// to `DeltaNetMoe`/`FullAttnMoe` layers (qwen35.rs's DeltaNetMoe LA branch
 /// and FullAttnMoe FA branch) — narrowed to the two dtypes this file
@@ -227,7 +245,7 @@ fn require_q8_fullattn_layer(layer: &FullAttnLayerWeights) -> HipResult<()> {
 /// ported here; see `require_batchable_deltanet_moe_layer` /
 /// `require_batchable_fullattn_moe_layer`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum MoeAttnDtype {
+enum AttnProjDtype {
     Q8_0,
     Mq4G256,
 }
@@ -242,14 +260,14 @@ enum MoeAttnDtype {
 /// each GEMM — see `run_deltanet_moe_layer_slots`.
 fn require_batchable_deltanet_moe_layer(
     layer: &DeltaNetMoeLayerWeights,
-) -> HipResult<MoeAttnDtype> {
+) -> HipResult<AttnProjDtype> {
     let all_q8 = matches!(layer.wqkv.gpu_dtype, DType::Q8_0)
         && matches!(layer.wz.gpu_dtype, DType::Q8_0)
         && matches!(layer.w_beta.gpu_dtype, DType::Q8_0)
         && matches!(layer.w_alpha.gpu_dtype, DType::Q8_0)
         && matches!(layer.wo.gpu_dtype, DType::Q8_0);
     if all_q8 {
-        return Ok(MoeAttnDtype::Q8_0);
+        return Ok(AttnProjDtype::Q8_0);
     }
     let all_mq4 = matches!(layer.wqkv.gpu_dtype, DType::MQ4G256)
         && matches!(layer.wz.gpu_dtype, DType::MQ4G256)
@@ -257,7 +275,7 @@ fn require_batchable_deltanet_moe_layer(
         && matches!(layer.w_alpha.gpu_dtype, DType::MQ4G256)
         && matches!(layer.wo.gpu_dtype, DType::MQ4G256);
     if all_mq4 {
-        return Ok(MoeAttnDtype::Mq4G256);
+        return Ok(AttnProjDtype::Mq4G256);
     }
     Err(HipError::new(
         0,
@@ -272,20 +290,20 @@ fn require_batchable_deltanet_moe_layer(
 /// `FullAttnMoeLayerWeights` (wq/wk/wv/wo).
 fn require_batchable_fullattn_moe_layer(
     layer: &FullAttnMoeLayerWeights,
-) -> HipResult<MoeAttnDtype> {
+) -> HipResult<AttnProjDtype> {
     let all_q8 = matches!(layer.wq.gpu_dtype, DType::Q8_0)
         && matches!(layer.wk.gpu_dtype, DType::Q8_0)
         && matches!(layer.wv.gpu_dtype, DType::Q8_0)
         && matches!(layer.wo.gpu_dtype, DType::Q8_0);
     if all_q8 {
-        return Ok(MoeAttnDtype::Q8_0);
+        return Ok(AttnProjDtype::Q8_0);
     }
     let all_mq4 = matches!(layer.wq.gpu_dtype, DType::MQ4G256)
         && matches!(layer.wk.gpu_dtype, DType::MQ4G256)
         && matches!(layer.wv.gpu_dtype, DType::MQ4G256)
         && matches!(layer.wo.gpu_dtype, DType::MQ4G256);
     if all_mq4 {
-        return Ok(MoeAttnDtype::Mq4G256);
+        return Ok(AttnProjDtype::Mq4G256);
     }
     Err(HipError::new(
         0,
@@ -457,6 +475,109 @@ fn q8_gate_up_proj(
     }
 }
 
+/// Dense FFN body, dtype-forked. Mirrors the reference's dense
+/// `ffn_is_mq`/`ffn_is_q8` forks (qwen35.rs LA and FA branches) exactly:
+///
+///   * MQ4G256 — `fused_rmsnorm_rotate_mq_batched_for(w_gate)`, the
+///     `FusedGateUpHfq4G256` fused gate+up, then **`fused_silu_mul_rotate_mq_
+///     batched_for(w_down)`** and a plain `GemmHfq4G256Residual`. The rotate
+///     for `w_down` is FUSED INTO the SwiGLU, so this must NOT route through
+///     `mq4_residual_proj` (which rotates its own input) — that would rotate
+///     twice and is the one place the two dtypes are not symmetric.
+///   * Q8_0 — plain rmsnorm, `q8_gate_up_proj`, plain `silu_mul_f32`,
+///     `q8_residual_proj`.
+#[allow(clippy::too_many_arguments)]
+fn dense_ffn_body_slots(
+    gpu: &mut Gpu,
+    config: &Qwen35Config,
+    ffn_norm: &GpuTensor,
+    w_gate: &WeightTensor,
+    w_up: &WeightTensor,
+    w_down: &WeightTensor,
+    pbs: &PrefillBatchScratch,
+    dtype: AttnProjDtype,
+    n: usize,
+    q8_wmma_arch: bool,
+) -> HipResult<()> {
+    match dtype {
+        AttnProjDtype::Mq4G256 => {
+            fused_rmsnorm_rotate_mq_batched_for(
+                gpu,
+                &pbs.x_batch,
+                ffn_norm,
+                w_gate,
+                &pbs.x_rot_batch,
+                config.dim,
+                config.norm_eps,
+                n,
+            )?;
+            run_fused_gate_up_key(
+                gpu,
+                KernelKey::FusedGateUpHfq4G256,
+                &w_gate.buf,
+                &w_up.buf,
+                &pbs.x_rot_batch,
+                &pbs.gate_ffn_batch,
+                &pbs.up_batch,
+                w_gate.m,
+                w_up.m,
+                w_gate.k,
+                n,
+            )?;
+            fused_silu_mul_rotate_mq_batched_for(
+                gpu,
+                w_down,
+                &pbs.gate_ffn_batch,
+                &pbs.up_batch,
+                &pbs.ffn_hidden_batch,
+                w_down.k,
+                n,
+            )?;
+            run_residual_gemm_key(
+                gpu,
+                KernelKey::GemmHfq4G256Residual,
+                &w_down.buf,
+                w_down.gpu_dtype,
+                &pbs.ffn_hidden_batch,
+                &pbs.x_batch,
+                w_down.m,
+                w_down.k,
+                n,
+            )
+        }
+        AttnProjDtype::Q8_0 => {
+            gpu.rmsnorm_batched(
+                &pbs.x_batch,
+                ffn_norm,
+                &pbs.x_rot_batch,
+                n,
+                config.dim,
+                config.norm_eps,
+            )?;
+            q8_gate_up_proj(
+                gpu,
+                w_gate,
+                w_up,
+                &pbs.x_rot_batch,
+                &pbs.gate_ffn_batch,
+                &pbs.up_batch,
+                n,
+                q8_wmma_arch,
+            )?;
+            gpu.silu_mul_f32(&pbs.gate_ffn_batch, &pbs.up_batch, &pbs.ffn_hidden_batch)?;
+            q8_residual_proj(
+                gpu,
+                w_down,
+                &pbs.ffn_hidden_batch,
+                &pbs.x_batch,
+                &pbs.x_rot_batch,
+                n,
+                q8_wmma_arch,
+            )
+        }
+    }
+}
+
 /// Run one `LinearAttention` (DeltaNet) layer across the whole step.
 ///
 /// The stateless pieces (rmsnorm, the 4-way QKVZA projection,
@@ -475,7 +596,7 @@ fn run_deltanet_layer_slots(
     n: usize,
     delta_layer_idx: usize,
 ) -> HipResult<()> {
-    require_q8_deltanet_layer(layer)?;
+    let attn_dtype = require_batchable_deltanet_layer(layer)?;
 
     let k_dim = config.linear_num_key_heads * config.linear_key_head_dim;
     let v_dim = config.linear_num_value_heads * config.linear_value_head_dim;
@@ -483,7 +604,41 @@ fn run_deltanet_layer_slots(
     let n_v_heads = config.linear_num_value_heads;
     let hd = config.linear_key_head_dim;
 
-    // 1. rmsnorm (plain — Q8 needs no FWHT rotate).
+    // 1-2. rmsnorm (+FWHT-rotate for MQ4) then the batched 4-way QKVZA
+    // projection. Mirrors the reference's dense LA `is_mq` fork: MQ4G256
+    // shares HFQ4G256's byte layout, so the only difference is the rotated
+    // input (qwen35.rs's `FusedQkvzaHfq4G256` default branch).
+    if attn_dtype == AttnProjDtype::Mq4G256 {
+        fused_rmsnorm_rotate_mq_batched_for(
+            gpu,
+            &pbs.x_batch,
+            &layer.attn_norm,
+            &layer.wqkv,
+            &pbs.x_rot_batch,
+            config.dim,
+            config.norm_eps,
+            n,
+        )?;
+        run_fused_qkvza_key(
+            gpu,
+            KernelKey::FusedQkvzaHfq4G256,
+            &layer.wqkv.buf,
+            &layer.wz.buf,
+            &layer.w_beta.buf,
+            &layer.w_alpha.buf,
+            &pbs.x_rot_batch,
+            &pbs.dn_qkv_batch,
+            &pbs.dn_z_batch,
+            &pbs.dn_beta_batch,
+            &pbs.dn_alpha_batch,
+            layer.wqkv.m,
+            layer.wz.m,
+            layer.w_beta.m,
+            layer.w_alpha.m,
+            layer.wqkv.k,
+            n,
+        )?;
+    } else {
     gpu.rmsnorm_batched(
         &pbs.x_batch,
         &layer.attn_norm,
@@ -559,6 +714,7 @@ fn run_deltanet_layer_slots(
             layer.w_alpha.k,
             n,
         )?;
+    }
     }
 
     // 3. Fused sigmoid(beta) + alpha_gate(alpha) — stateless, batched over N.
@@ -682,43 +838,38 @@ fn run_deltanet_layer_slots(
         n,
     )?;
 
-    // 8. wo + residual.
-    q8_residual_proj(
-        gpu,
-        &layer.wo,
-        &pbs.dn_normed_batch,
-        &pbs.x_batch,
-        &pbs.x_rot_batch,
-        n,
-        q8_wmma_arch,
-    )?;
+    // 8. wo + residual. MQ4 rotates its input for the pre-rotated weights
+    // (the reference's `wo_is_mq` fork); Q8 projects directly.
+    match attn_dtype {
+        AttnProjDtype::Mq4G256 => mq4_residual_proj(
+            gpu,
+            &layer.wo,
+            &pbs.dn_normed_batch,
+            &pbs.x_batch,
+            &pbs.dn_normed_rot_batch,
+            n,
+        )?,
+        AttnProjDtype::Q8_0 => q8_residual_proj(
+            gpu,
+            &layer.wo,
+            &pbs.dn_normed_batch,
+            &pbs.x_batch,
+            &pbs.x_rot_batch,
+            n,
+            q8_wmma_arch,
+        )?,
+    }
 
-    // 9. FFN: rmsnorm, gate+up, silu_mul, w_down + residual.
-    gpu.rmsnorm_batched(
-        &pbs.x_batch,
-        &layer.ffn_norm,
-        &pbs.x_rot_batch,
-        n,
-        config.dim,
-        config.norm_eps,
-    )?;
-    q8_gate_up_proj(
+    // 9. FFN: rmsnorm, gate+up, silu_mul, w_down + residual — dtype-forked.
+    dense_ffn_body_slots(
         gpu,
+        config,
+        &layer.ffn_norm,
         &layer.w_gate,
         &layer.w_up,
-        &pbs.x_rot_batch,
-        &pbs.gate_ffn_batch,
-        &pbs.up_batch,
-        n,
-        q8_wmma_arch,
-    )?;
-    gpu.silu_mul_f32(&pbs.gate_ffn_batch, &pbs.up_batch, &pbs.ffn_hidden_batch)?;
-    q8_residual_proj(
-        gpu,
         &layer.w_down,
-        &pbs.ffn_hidden_batch,
-        &pbs.x_batch,
-        &pbs.x_rot_batch,
+        pbs,
+        attn_dtype,
         n,
         q8_wmma_arch,
     )
@@ -771,7 +922,7 @@ fn run_deltanet_moe_layer_slots(
     // forks (qwen35.rs) — MQ4G256 shares HFQ4G256's byte layout, so the only
     // difference from HFQ4G256 is the FWHT-rotated input.
     match attn_dtype {
-        MoeAttnDtype::Mq4G256 => {
+        AttnProjDtype::Mq4G256 => {
             fused_rmsnorm_rotate_mq_batched_for(
                 gpu,
                 &pbs.x_batch,
@@ -802,7 +953,7 @@ fn run_deltanet_moe_layer_slots(
                 n,
             )?;
         }
-        MoeAttnDtype::Q8_0 => {
+        AttnProjDtype::Q8_0 => {
             gpu.rmsnorm_batched(
                 &pbs.x_batch,
                 &layer.attn_norm,
@@ -1002,7 +1153,7 @@ fn run_deltanet_moe_layer_slots(
 
     // 8. wo + residual.
     match attn_dtype {
-        MoeAttnDtype::Mq4G256 => mq4_residual_proj(
+        AttnProjDtype::Mq4G256 => mq4_residual_proj(
             gpu,
             &layer.wo,
             &pbs.dn_normed_batch,
@@ -1010,7 +1161,7 @@ fn run_deltanet_moe_layer_slots(
             &pbs.dn_normed_rot_batch,
             n,
         )?,
-        MoeAttnDtype::Q8_0 => q8_residual_proj(
+        AttnProjDtype::Q8_0 => q8_residual_proj(
             gpu,
             &layer.wo,
             &pbs.dn_normed_batch,
@@ -1287,11 +1438,40 @@ fn run_fullattn_layer_slots(
     single_slot: Option<(u64, usize)>,
     n_tiles: Option<usize>,
 ) -> HipResult<()> {
-    require_q8_fullattn_layer(layer)?;
+    let attn_dtype = require_batchable_fullattn_layer(layer)?;
 
     let dim = config.dim;
 
-    // 1. rmsnorm.
+    // 1-2. rmsnorm (+FWHT-rotate for MQ4) then the batched 3-way QKV
+    // projection — the reference's dense FA `is_mq` fork.
+    if attn_dtype == AttnProjDtype::Mq4G256 {
+        fused_rmsnorm_rotate_mq_batched_for(
+            gpu,
+            &pbs.x_batch,
+            &layer.attn_norm,
+            &layer.wq,
+            &pbs.x_rot_batch,
+            dim,
+            config.norm_eps,
+            n,
+        )?;
+        run_fused_qkv_key(
+            gpu,
+            KernelKey::FusedQkvHfq4G256,
+            &layer.wq.buf,
+            &layer.wk.buf,
+            &layer.wv.buf,
+            &pbs.x_rot_batch,
+            &pbs.fa_q_full_batch,
+            &pbs.fa_k_batch,
+            &pbs.fa_v_batch,
+            layer.wq.m,
+            layer.wk.m,
+            layer.wv.m,
+            layer.wq.k,
+            n,
+        )?;
+    } else {
     gpu.rmsnorm_batched(
         &pbs.x_batch,
         &layer.attn_norm,
@@ -1353,6 +1533,7 @@ fn run_fullattn_layer_slots(
             layer.wv.k,
             n,
         )?;
+    }
     }
 
     // 3. Deinterleave Q + gate.
@@ -1484,43 +1665,37 @@ fn run_fullattn_layer_slots(
         &pbs.fa_gate_batch.sub_offset(0, gate_elems),
     )?;
 
-    // 9. wo + residual.
-    q8_residual_proj(
-        gpu,
-        &layer.wo,
-        &pbs.fa_attn_out_batch,
-        &pbs.x_batch,
-        &pbs.x_rot_batch,
-        n,
-        q8_wmma_arch,
-    )?;
+    // 9. wo + residual — MQ4 rotates into the pre-rotated weights first.
+    match attn_dtype {
+        AttnProjDtype::Mq4G256 => mq4_residual_proj(
+            gpu,
+            &layer.wo,
+            &pbs.fa_attn_out_batch,
+            &pbs.x_batch,
+            &pbs.fa_attn_out_rot_batch,
+            n,
+        )?,
+        AttnProjDtype::Q8_0 => q8_residual_proj(
+            gpu,
+            &layer.wo,
+            &pbs.fa_attn_out_batch,
+            &pbs.x_batch,
+            &pbs.x_rot_batch,
+            n,
+            q8_wmma_arch,
+        )?,
+    }
 
-    // 10. FFN: rmsnorm, gate+up, silu_mul, w_down + residual.
-    gpu.rmsnorm_batched(
-        &pbs.x_batch,
-        &layer.ffn_norm,
-        &pbs.x_rot_batch,
-        n,
-        dim,
-        config.norm_eps,
-    )?;
-    q8_gate_up_proj(
+    // 10. FFN: rmsnorm, gate+up, silu_mul, w_down + residual — dtype-forked.
+    dense_ffn_body_slots(
         gpu,
+        config,
+        &layer.ffn_norm,
         &layer.w_gate,
         &layer.w_up,
-        &pbs.x_rot_batch,
-        &pbs.gate_ffn_batch,
-        &pbs.up_batch,
-        n,
-        q8_wmma_arch,
-    )?;
-    gpu.silu_mul_f32(&pbs.gate_ffn_batch, &pbs.up_batch, &pbs.ffn_hidden_batch)?;
-    q8_residual_proj(
-        gpu,
         &layer.w_down,
-        &pbs.ffn_hidden_batch,
-        &pbs.x_batch,
-        &pbs.x_rot_batch,
+        pbs,
+        attn_dtype,
         n,
         q8_wmma_arch,
     )
@@ -1562,7 +1737,7 @@ fn run_fullattn_moe_layer_slots(
     // projection. Mirrors forward_prefill_chunk's FullAttnMoe
     // `qkv_is_mq`/`qkv_is_q8` forks (qwen35.rs).
     match attn_dtype {
-        MoeAttnDtype::Mq4G256 => {
+        AttnProjDtype::Mq4G256 => {
             fused_rmsnorm_rotate_mq_batched_for(
                 gpu,
                 &pbs.x_batch,
@@ -1590,7 +1765,7 @@ fn run_fullattn_moe_layer_slots(
                 n,
             )?;
         }
-        MoeAttnDtype::Q8_0 => {
+        AttnProjDtype::Q8_0 => {
             gpu.rmsnorm_batched(
                 &pbs.x_batch,
                 &layer.attn_norm,
@@ -1773,7 +1948,7 @@ fn run_fullattn_moe_layer_slots(
 
     // 9. wo + residual.
     match attn_dtype {
-        MoeAttnDtype::Mq4G256 => mq4_residual_proj(
+        AttnProjDtype::Mq4G256 => mq4_residual_proj(
             gpu,
             &layer.wo,
             &pbs.fa_attn_out_batch,
@@ -1781,7 +1956,7 @@ fn run_fullattn_moe_layer_slots(
             &pbs.fa_attn_out_rot_batch,
             n,
         )?,
-        MoeAttnDtype::Q8_0 => q8_residual_proj(
+        AttnProjDtype::Q8_0 => q8_residual_proj(
             gpu,
             &layer.wo,
             &pbs.fa_attn_out_batch,
@@ -2016,8 +2191,8 @@ fn final_logits_per_slot(
 /// `k_base`/`v_base` byte offsets. `dn_states` holds one `DeltaNetState`
 /// per slot (indexed the same as `pool`/`desc_staging`).
 ///
-/// Dense layers are Q8_0-only; `DeltaNetMoe`/`FullAttnMoe` layers additionally
-/// admit uniform MQ4G256 (see module doc). A non-admitted weight dtype, a
+/// Dense and MoE layers alike admit uniform `Q8_0` or uniform `MQ4G256`
+/// (see module doc). A non-admitted weight dtype, a
 /// non-Q8 `DeltaNetState`, or a MoE FFN dtype combination
 /// `moe_ffn_batched_admissible` rejects returns `Err` rather than guessing at
 /// an untested path.

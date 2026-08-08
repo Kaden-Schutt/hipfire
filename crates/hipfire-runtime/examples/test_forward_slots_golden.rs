@@ -39,8 +39,10 @@
 // write always lands at an offset no real row is also writing to that step,
 // and the redirected read is unambiguously wrong.
 //
-// SCOPE. `forward_batch_slots` is Q8_0-only (see its module doc) and refuses
-// MoE layers, so this harness requires a DENSE Q8_0 Qwen3.5 checkpoint —
+// SCOPE. `forward_batch_slots` admits uniform Q8_0 or uniform MQ4G256 (see its
+// module doc) and refuses MoE layers, so this harness requires a DENSE
+// Q8_0-or-MQ4G256 Qwen3.5/3.6 checkpoint. Verified against both
+// `qwen3.5-4b-q8.hf4` (Q8) and `qwen3.6-27b.mq4` (MQ4, 64 layers) —
 // `qwen3.5-4b-q8.hf4` on this box (32 layers, 8 FullAttention / 24
 // LinearAttention, no MoE — confirmed via its embedded metadata, not
 // guessed). If a different model is passed that doesn't meet that bar,
