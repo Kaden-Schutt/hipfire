@@ -64,10 +64,8 @@ pub struct SlotSnapshot {
 impl SlotSnapshot {
     /// Bytes the payload must contain for this stamp and `seq_len`.
     pub fn expected_len(&self) -> usize {
-        let kv = self.stamp.n_fa_layers as usize
-            * 2
-            * self.seq_len
-            * self.stamp.per_pos_bytes as usize;
+        let kv =
+            self.stamp.n_fa_layers as usize * 2 * self.seq_len * self.stamp.per_pos_bytes as usize;
         kv + self.stamp.dn_bytes as usize
     }
 
