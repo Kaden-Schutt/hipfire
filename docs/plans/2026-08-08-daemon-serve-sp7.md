@@ -283,7 +283,9 @@ gate.** It is covered at the SP6 level by `test_swap_equivalence`, but not yet
 through the engine. Closing that needs a gate where a session goes idle between
 turns, which is the same multi-turn shape Task 4 needs.
 
-**Task 4 (dispatch `/v1/chat/completions` to the engine) is NOT done.** It is
+**Task 4 is now partly done — see the update below.**
+
+~~**Task 4 (dispatch `/v1/chat/completions` to the engine) is NOT done.**~~ It is
 the piece that makes any of this reachable by an agent, so its absence is the
 gap that matters. Two things need deciding first rather than coding through:
 
@@ -302,3 +304,45 @@ Neither is hard; both are decisions rather than typing, and getting them wrong
 in a 12,000-line file that is the daily driver is expensive. The engine is
 deliberately usable without them: `SlotEngine::spawn` + `submit` is the whole
 API surface.
+
+
+## Task 4 update (2026-08-08)
+
+`hipfire serve` now answers `/v1/chat/completions` from the `SlotEngine` behind
+`serve.multi_slot`. Verified against a real HTTP client:
+
+```
+"What is the capital of France?"    -> "The capital of France is Paris."
+"Who described the laws of motion?" -> "...Philosophiae Naturalis Principia"
+```
+
+Three bugs surfaced only by running it end to end:
+
+1. **The terminal callback was never invoked.** It stages the response body and
+   signals the handler; without it every request returned "generation worker
+   disconnected" — a worker that finished without reporting.
+2. **`build_multi_turn` panics on System/Tool inside history.** System text
+   belongs in `ChatFrame.system`, the final user turn in `.user`; history is
+   only the prior User/Assistant exchange.
+3. **DeltaNet state was not reset when a slot was reused.** `seq_len = 0` clears
+   the KV, but DN state lives outside the KV arena, so every request after the
+   first inherited the previous conversation's recurrent state and echoed or
+   degenerated. The same trap SP6 documented for the swap unit, in a new place —
+   worth noting that writing it down did not prevent hitting it again.
+
+Plus a framing fix: thinking models need `AssistantPrefix::OpenThink`, as the
+daemon's `spec_assistant_prefix` uses. With `Plain` the model loops on
+`</think>` and re-opens user turns.
+
+### Still serialised — the remaining work
+
+Measured 4 concurrent against 4 sequential: **1.01x**. The requests reach the
+engine correctly and produce 4/4 distinct correct answers, but they do not
+overlap, because the HTTP admission gate is a single busy flag — one in-flight
+request, which is what protected the single daemon.
+
+`AdmissionState.busy: bool` is now `in_flight: usize` with an
+`Admission::with_concurrency` constructor, and that much is in place. Wiring it
+to the slot count made requests hang (empty responses, engine still up), so the
+wiring is reverted rather than shipped broken. Diagnosing that hang is the next
+step, and it is the only thing between here and genuine concurrency.
