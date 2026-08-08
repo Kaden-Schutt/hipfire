@@ -406,3 +406,48 @@ Each was learned by getting it wrong first:
 - Teardown kills the server's **children**, not just the `run-bounded` wrapper.
   Killing the wrapper leaves the model resident (46 GiB of GTT observed) and
   every later run is refused by the memory gate.
+
+
+## Upstream branch / PR review (2026-08-08)
+
+Checked whether existing work already fixes the multi-turn reuse gap. It does
+not, but the search found two other things worth acting on.
+
+### `nw_qwen36_openai_thinking` — obsolete as written, but its bug is live
+
+`98c65020 fix(serve): open <think> by default ...` is 10 lines in
+`cli/index.ts`. The TypeScript CLI no longer exists — it was rewritten as
+`crates/hipfire-cli` — and **the fix did not come across**.
+`apply_http_reasoning_request` had exactly the pre-fix shape: three
+`closed_think` assignments and no `open_think` anywhere, so `enable_thinking=
+true` was a no-op for generic OpenAI clients. Re-applied in `08cb9b53`; the
+branch itself cannot be cherry-picked because the file is gone.
+
+Neither that branch nor its `_pr` variant touches `prompt_frame.rs` or history
+rendering.
+
+### PR #572 `fix(serve): emit Qwen reasoning content` — not our fix, but we need it
+
+Routes `<think>` spans to the typed reasoning channel instead of leaking them.
+Touches `spec_emit.rs`, `daemon.rs`, `emit_text.rs`, `spec.rs` — **no
+prompt/history rendering**, so it does not close the reuse gap either.
+
+It does expose exactly what the slots path is missing. `ThinkOutputRouter`
+(`new(started_in_think)` / `push_into` / `finish_into`, chunk-boundary
+invariant) is a reusable incremental router. `complete_request_slots` currently
+dumps everything into `content` and leaves `reasoning_content` empty, so
+reasoning leaks into the answer — visible in gate output as content ending
+`"...Deliver the answer.✅\n</think>\n\nThe capital of France is Paris."`,
+with a raw `</think>` marker in the answer body, and as short replies that are
+entirely thinking preamble.
+
+**Follow-up when #572 lands on beta:** adopt `ThinkOutputRouter` in
+`complete_request_slots`, feeding `Event::Token` text through it and splitting
+into `content` / `reasoning_content`. Not cherry-picked here: #572 is still
+open, and vendoring unmerged work would make the eventual merge worse.
+
+### The reuse gap remains unowned
+
+Nothing in-tree or in-flight addresses history rendering that reproduces the
+generated assistant opener. That is still the one piece of work between here
+and multi-turn prefix reuse over HTTP.
