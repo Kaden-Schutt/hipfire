@@ -187,11 +187,11 @@ fn main() {
         stream: &[u32],
         prompt_len: usize,
     ) -> Vec<Vec<f32>> {
-        let kv_seq = (prompt_len + DECODE_STEPS + 16).max(CAP_TOKENS);
+        let kv_seq = (prompt_len + DECODE_STEPS + 16).max(CAP_TOKENS).max(512);
         let mut kv_cache = KvCache::new_gpu_q8(gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq)
             .expect("reference: KvCache::new_gpu_q8");
         let mut dn_state = DeltaNetState::new(gpu, config).expect("reference: DeltaNetState::new");
-        let scratch = Qwen35Scratch::new_with_kv_max(gpu, config, 64, kv_seq)
+        let scratch = Qwen35Scratch::new_with_kv_max(gpu, config, 128, kv_seq)
             .expect("reference: Qwen35Scratch::new_with_kv_max");
 
         let mut steps = Vec::with_capacity(1 + DECODE_STEPS);

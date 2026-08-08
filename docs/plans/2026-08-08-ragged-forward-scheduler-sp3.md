@@ -511,3 +511,52 @@ Non-Q8_0 weights and MoE layers return a clear `HipError` rather than silently
 mis-executing. The attend crossover mirrors the dense path's LDS-vs-tile
 threshold, but only across the two kernel families that have `_slots` ports; the
 WMMA and scalar flash-prefill opt-ins in the dense fallback ladder do not.
+
+## Task 3 status: harness RUNS but segfaults in the REFERENCE arm — OPEN
+
+The golden-equivalence gate was executed against `qwen3.5-4b-q8.hf4` (a dense
+Q8_0 Qwen3.5 checkpoint, 4.49 GB — chosen because it fits alongside a resident
+model, unlike the 15-20 GB target checkpoints). It **crashes before comparing
+anything**, at the very first shape (`n_slots=1 prompt_lens=[5]`).
+
+**The crash is NOT in SP1-SP4 code.** Backtrace from the core dump:
+
+```
+#5  hip_bridge::ffi::HipRuntime::launch_kernel
+#6  rdna_compute::dispatch::Gpu::gated_delta_net_q8_compact2
+#7  Qwen35Bindings::run_recurrent
+#8  hipfire_dispatch::pipeline::superop::dispatch_super_op
+#9  qwen35::forward_scratch_layers
+#10 qwen35::forward_scratch
+#11 qwen35::forward_prefill_batch_with_pbs_opts
+#12 qwen35::forward_prefill_batch          <-- the REFERENCE arm
+```
+
+It dies in the **existing single-sequence path**, in `gated_delta_net_q8_compact2`
+— a kernel none of SP1-SP4 modified (SP2 touched `gated_delta_net_q8_fast`).
+
+### Ruled out, with evidence
+
+| hypothesis | verdict |
+|---|---|
+| Bad/unsupported model | **No** — `dump_logits_qwen35` runs the same model through the same `forward_prefill_batch` path, exit 0 |
+| Small prompt length | **No** — that control succeeds at prefill 5, 8 and 64 |
+| `Qwen35Scratch` `max_batch` too small (64) | **No** — raising to 128, matching the control, still segfaults |
+| `kv_seq` floor too low (64 vs the control's 512) | **No** — flooring at 512 still segfaults |
+| Memory pressure / OOM | **No** — `journalctl -k` reports **0** OOM events on every run |
+
+Both speculative parameter changes (`max_batch` 64→128, `kv_seq` floor →512) are
+retained because they match the known-good control, but neither was the cause.
+
+### What remains
+
+The difference must lie elsewhere in the harness's reference-arm setup — the
+remaining untested candidates are ordering (whether candidate-side allocation
+precedes the reference call and perturbs the allocator) and `DeltaNetState`
+quantisation mode. Both are cheap to test with a bisect against
+`dump_logits_qwen35`, which is a known-good caller of the identical entry point.
+
+**Consequence: SP3's golden equivalence is unverified.** `forward_batch_slots`
+itself has never been reached, so nothing is yet known about the multi-slot
+forward's numerics — good or bad. This is the single highest-value open item in
+the programme.
