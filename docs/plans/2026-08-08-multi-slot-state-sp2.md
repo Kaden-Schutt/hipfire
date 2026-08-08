@@ -845,3 +845,27 @@ would be inert.
 **Consequence for the plan:** no Task 3b is needed. The KV *write* (Task 3) is
 the only place in this chain that needs slot awareness, because it is the step
 that actually lands bytes in a per-slot slab.
+
+## Task 3 finding: the KV write resolves both K and V through `k_base`
+
+The write kernel is invoked **twice** from existing call sites — once for K and
+once for V, with a different `dst` each time — but it always resolves the slab
+base via `desc.k_base`, never `desc.v_base`.
+
+**This is correct and deliberate for Q8_0**, and it is the same decision the
+flash-prefill kernel makes: the Q8 ABI requires `v_base == k_base`, so one base
+serves both arenas, and `SlotPool` guarantees it (Task 1's
+`q8_abi_requires_v_base_equals_k_base` test).
+
+**But it is a trap for whoever wires real descriptors, and for asym3.** Two
+consequences to carry into Task 6 and SP3:
+
+1. When the V-write call is given a real `slot_descs` array, that array's
+   `k_base` field must hold the **V arena's** offset — which is automatic under
+   the Q8 ABI, since the two are equal, but is not automatic if anyone ever
+   relaxes it.
+2. **asym3 cannot use this path.** Its K and V strides genuinely differ, so
+   `v_base != k_base` and a single-base write would land V at the K offset. asym3
+   needs either its own write variant or a `use_v_base` flag. SP2 does not need
+   it — SP1's asym3 support is read-side only — but SP3 must not assume this
+   kernel is mode-agnostic.
