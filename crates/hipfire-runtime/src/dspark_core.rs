@@ -117,6 +117,20 @@ impl DsparkProfiler {
     }
 }
 
+/// The summary is emitted from `Drop` rather than from an explicit teardown
+/// call. `mtp_free` still drops the profiler on the model-unload path, so that
+/// route is unchanged, but a process that simply exits — `dspark_bench`, any
+/// one-shot example — now reports too. Previously `print_summary` was reachable
+/// only through `Speculator::free`, which a signal-terminated daemon never
+/// performs, so `HIPFIRE_DSPARK_PROFILE=1` silently produced nothing in every
+/// normal run. `print_summary` already no-ops unless the profiler is enabled
+/// and has recorded at least one window.
+impl Drop for DsparkProfiler {
+    fn drop(&mut self) {
+        self.print_summary();
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct DsparkConfig {
     pub block_size: usize,
@@ -1652,7 +1666,6 @@ impl MtpDrafter for DsparkDrafter {
     }
 
     fn mtp_free(self: Box<Self>, gpu: &mut Gpu) {
-        self.profiler.print_summary();
         if let Some(dev) = self.main_hidden_dev {
             let _ = gpu.free_tensor(dev);
         }
