@@ -73,7 +73,7 @@ impl MtpSamplingConfig {
 fn mtp_device_token_chain_enabled_from_env() -> bool {
     // Default on: this path is token-identical in greedy mode and removes the
     // proposal-loop host data dependency needed for later graph capture.
-    match std::env::var("HIPFIRE_MTP_DEVICE_TOKEN_CHAIN") {
+    match hipfire_config::developer_var("HIPFIRE_MTP_DEVICE_TOKEN_CHAIN") {
         Ok(v) => {
             let v = v.trim().to_ascii_lowercase();
             !(v == "0" || v == "false" || v == "off" || v == "no")
@@ -85,7 +85,7 @@ fn mtp_device_token_chain_enabled_from_env() -> bool {
 fn mtp_snapshot_overlap_enabled_from_env() -> bool {
     // Default off: current gfx1201 benches show this stream split regresses,
     // but the hook is useful as an opt-in cross-arch experiment.
-    match std::env::var("HIPFIRE_MTP_SNAPSHOT_OVERLAP") {
+    match hipfire_config::developer_var("HIPFIRE_MTP_SNAPSHOT_OVERLAP") {
         Ok(v) => {
             let v = v.trim().to_ascii_lowercase();
             v == "1" || v == "true" || v == "on" || v == "yes"
@@ -98,7 +98,7 @@ fn mtp_gpu_greedy_accept_enabled_from_env() -> bool {
     // Default on for greedy device-token-chain MTP: candidates and verify
     // argmaxes are already on-device, so the prefix accept + bonus selection
     // can stay there until a compact two-int result is needed on host.
-    match std::env::var("HIPFIRE_MTP_GPU_ACCEPT") {
+    match hipfire_config::developer_var("HIPFIRE_MTP_GPU_ACCEPT") {
         Ok(v) => {
             let v = v.trim().to_ascii_lowercase();
             !(v == "0" || v == "false" || v == "off" || v == "no")
@@ -122,7 +122,9 @@ fn mtp_q8_verify_wmma_enabled_from_env() -> bool {
     // WMMA when the arch/shape supports it, otherwise it falls back to scalar.
     // Prompt-sweep parity is clean; opt out with HIPFIRE_MTP_Q8_VERIFY_WMMA=0.
     mtp_q8_verify_wmma_enabled_from_env_value(
-        std::env::var("HIPFIRE_MTP_Q8_VERIFY_WMMA").ok().as_deref(),
+        hipfire_config::developer_var("HIPFIRE_MTP_Q8_VERIFY_WMMA")
+            .ok()
+            .as_deref(),
     )
 }
 
@@ -138,7 +140,7 @@ fn mtp_q8_verify_wmma_enabled_from_env() -> bool {
 /// p_min=0). Override on any arch via HIPFIRE_MTP_P_MIN (e.g. =0.6 to enable
 /// elsewhere, =0 to disable). An explicit `set_p_min` call still overrides this.
 fn default_mtp_p_min(arch: &str) -> f32 {
-    if let Some(v) = std::env::var("HIPFIRE_MTP_P_MIN").ok() {
+    if let Some(v) = hipfire_config::developer_var("HIPFIRE_MTP_P_MIN").ok() {
         return v
             .trim()
             .parse::<f32>()
@@ -180,7 +182,9 @@ fn mtp_proposal_graph_policy_from_env_value(value: Option<&str>) -> MtpProposalG
 
 fn mtp_proposal_graph_policy_from_env() -> MtpProposalGraphPolicy {
     mtp_proposal_graph_policy_from_env_value(
-        std::env::var("HIPFIRE_MTP_PROPOSAL_GRAPH").ok().as_deref(),
+        hipfire_config::developer_var("HIPFIRE_MTP_PROPOSAL_GRAPH")
+            .ok()
+            .as_deref(),
     )
 }
 
@@ -776,9 +780,9 @@ impl MtpSpecState {
     /// (stale absolute positions from the prior turn must not be re-read) and
     /// destroys any captured proposal graph (its node positions are turn-stale).
     /// The trunk's KV + DeltaNet reset is the daemon's concern (it owns the
-    /// bundle and calls `reset_recurrent`); this clears only head-local state.
+    /// bundle through the central model reset); this clears only head-local state.
     pub fn reset(&mut self, gpu: &mut Gpu) -> HipResult<()> {
-        destroy_mtp_proposal_graph(gpu, self);
+        destroy_mtp_proposal_graph(gpu, self)?;
         self.mtp_proposal_graph_warmed = false;
         self.mtp_proposal_graph_seq_cap = 0;
         self.mtp_kv.reset(gpu)?;
@@ -832,7 +836,7 @@ impl MtpSpecState {
         // Qwen35MtpHeadKvCache::free_gpu does `drop(inner)` which does not
         // release GPU memory (llama::KvCache has no Drop). Call the inner
         // KvCache's own free_gpu directly to properly hipFree each tensor.
-        self.mtp_kv.inner.free_gpu(gpu);
+        let _ = self.mtp_kv.inner.free_gpu(gpu);
     }
 }
 
@@ -1050,15 +1054,23 @@ fn abort_mtp_proposal_graph_capture(gpu: &mut Gpu) {
     gpu.graphs.capture_blobs.clear();
 }
 
-fn destroy_mtp_proposal_graph(gpu: &mut Gpu, state: &mut MtpSpecState) {
+fn destroy_mtp_proposal_graph(gpu: &mut Gpu, state: &mut MtpSpecState) -> HipResult<()> {
+    let mut first_error = None;
     if let Some(exec) = state.mtp_proposal_graph_exec.take() {
-        let _ = gpu.hip.graph_exec_destroy(exec);
+        if let Err(error) = gpu.hip.graph_exec_destroy(exec) {
+            first_error = Some(error);
+        }
     }
     if let Some(graph) = state.mtp_proposal_graph.take() {
-        let _ = gpu.hip.graph_destroy(graph);
+        if let Err(error) = gpu.hip.graph_destroy(graph) {
+            if first_error.is_none() {
+                first_error = Some(error);
+            }
+        }
     }
     state.mtp_proposal_graph_blobs.clear();
     state.mtp_proposal_graph_seq_cap = 0;
+    first_error.map_or(Ok(()), Err)
 }
 
 fn greedy_trunk_spine_accept(
@@ -1122,14 +1134,51 @@ fn assemble_greedy_accept_from_gpu_result(
 
 /// DS4-style Qwen MTP prefill fill.
 ///
-/// Runs trunk prefill once while capturing post-output-norm hidden for every
+/// Runs trunk prefill while capturing post-output-norm hidden for every
 /// prompt token, then runs the MTP block-only path over those same prompt
 /// positions. The MTP layer enters decode with a warm private KV cache instead
 /// of starting at the first generated token.
+///
+/// Trunk prefill is split into `<= PREFILL_MAX_BATCH` committed chunks so
+/// adaptive-KV (and similar) controllers can run `maybe_downshift` between
+/// chunks at the exact committed trunk position. Without that boundary the
+/// internal `forward_prefill_batch` loop would write past the current-tier
+/// capacity (adaptive start `side_cap`) before any downshift could fire —
+/// post-prefill-only downshift is insufficient when prompt_len > start cap.
+///
+/// MTP private-cache offsets stay absolute: each chunk fills MTP KV at
+/// `start_pos + off + i` (same schedule as the trunk), so multi-chunk prefill
+/// is position-identical to a single whole-prompt fill. Non-adaptive callers
+/// keep the same end state: full trunk KV + full MTP private KV + last-token logits.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct TrunkSpinePrefillTimings {
     pub trunk_prefill_secs: f64,
     pub mtp_prompt_fill_secs: f64,
+}
+
+/// Absolute trunk positions at which a multi-chunk MTP prefill has committed
+/// KV after each `<= chunk_max` slice. Empty when `prompt_len == 0`.
+///
+/// Used by adaptive serve hooks and unit tests so downshift sites stay locked
+/// to the same schedule the prefill helper actually writes.
+pub fn mtp_prefill_committed_boundaries(
+    prompt_len: usize,
+    start_pos: usize,
+    chunk_max: usize,
+) -> Vec<usize> {
+    debug_assert!(chunk_max >= 1);
+    let chunk_max = chunk_max.max(1);
+    if prompt_len == 0 {
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(prompt_len.div_ceil(chunk_max));
+    let mut off = 0usize;
+    while off < prompt_len {
+        let end = (off + chunk_max).min(prompt_len);
+        out.push(start_pos + end);
+        off = end;
+    }
+    out
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1141,8 +1190,41 @@ pub fn prefill_trunk_and_mtp_cache(
     prompt_tokens: &[u32],
     start_pos: usize,
 ) -> HipResult<TrunkSpinePrefillTimings> {
+    Ok(prefill_trunk_and_mtp_cache_abortable(
+        gpu,
+        target,
+        head,
+        state,
+        prompt_tokens,
+        start_pos,
+        &|| false,
+    )?
+    .expect("non-abortable qwen35 MTP prefill aborted"))
+}
+
+/// Abort-aware Qwen MTP prefill. The callback is checked at every native MTP
+/// token boundary and around the blocking trunk/final-head work. Returning
+/// `Ok(None)` deliberately leaves cleanup to the caller's canonical reset path;
+/// the native state may already contain a partially filled turn.
+/// Abort-aware Qwen MTP prefill. The callback is checked at every native MTP
+/// token boundary and around the blocking trunk/final-head work. Returning
+/// `Ok(None)` deliberately leaves cleanup to the caller's canonical reset path;
+/// the native state may already contain a partially filled turn.
+#[allow(clippy::too_many_arguments)]
+pub fn prefill_trunk_and_mtp_cache_abortable(
+    gpu: &mut Gpu,
+    target: &mut ModelSlot,
+    head: &Qwen35MtpHead,
+    state: &mut MtpSpecState,
+    prompt_tokens: &[u32],
+    start_pos: usize,
+    abort: &dyn Fn() -> bool,
+) -> HipResult<Option<TrunkSpinePrefillTimings>> {
+    if abort() {
+        return Ok(None);
+    }
     if prompt_tokens.is_empty() {
-        return Ok(TrunkSpinePrefillTimings::default());
+        return Ok(Some(TrunkSpinePrefillTimings::default()));
     }
 
     let dim = target.config.dim;
@@ -1150,8 +1232,11 @@ pub fn prefill_trunk_and_mtp_cache(
     let prompt_hidden = gpu.alloc_tensor(&[prompt_tokens.len() * dim], DType::F32)?;
 
     let result = (|| -> HipResult<TrunkSpinePrefillTimings> {
+        if abort() {
+            return Ok(TrunkSpinePrefillTimings::default());
+        }
         let t_trunk = Instant::now();
-        qwen35::forward_prefill_batch(
+        let completed = qwen35::forward_prefill_batch_abortable(
             gpu,
             &target.weights,
             &target.config,
@@ -1164,11 +1249,21 @@ pub fn prefill_trunk_and_mtp_cache(
             Some(&prompt_hidden),
             None,
             None,
+            abort,
         )?;
+        if !completed {
+            return Ok(TrunkSpinePrefillTimings::default());
+        }
+        if abort() {
+            return Ok(TrunkSpinePrefillTimings::default());
+        }
         let trunk_prefill_secs = t_trunk.elapsed().as_secs_f64();
 
         let t_mtp_fill = Instant::now();
         for (i, &token) in prompt_tokens.iter().enumerate() {
+            if abort() {
+                return Ok(TrunkSpinePrefillTimings::default());
+            }
             let hidden_row = prompt_hidden.sub_offset(i * dim, dim);
             mtp_head::mtp_head_forward_block_only(
                 gpu,
@@ -1181,6 +1276,129 @@ pub fn prefill_trunk_and_mtp_cache(
                 start_pos + i,
                 &target.weights,
             )?;
+            if abort() {
+                return Ok(TrunkSpinePrefillTimings::default());
+            }
+        }
+
+        let last = prompt_tokens.len() - 1;
+        if abort() {
+            return Ok(TrunkSpinePrefillTimings::default());
+        }
+        gpu.hip.memcpy_dtod_at(
+            &state.prev_hidden.buf,
+            0,
+            &prompt_hidden.buf,
+            last * dim_bytes,
+            dim_bytes,
+        )?;
+        if abort() {
+            return Ok(TrunkSpinePrefillTimings::default());
+        }
+        let mtp_prompt_fill_secs = t_mtp_fill.elapsed().as_secs_f64();
+        Ok(TrunkSpinePrefillTimings {
+            trunk_prefill_secs,
+            mtp_prompt_fill_secs,
+        })
+    })();
+
+    let _ = gpu.free_tensor(prompt_hidden);
+    if abort() {
+        Ok(None)
+    } else {
+        result.map(Some)
+    }
+}
+
+/// Explicit DS4-shaped Qwen MTP spec step.
+///
+/// This is the discrete-token trunk spine: serial MTP proposals, one trunk
+/// batched verify, greedy/sampling accept, then rollback/replay only when the
+/// full verify state cannot be kept. It intentionally delegates to the mature
+/// compressed-serial implementation, whose name describes the lm_head storage
+/// mode rather than the spine architecture.
+#[allow(clippy::too_many_arguments)]
+/// Like [`prefill_trunk_and_mtp_cache`], but invokes `on_committed_boundary`
+/// after each trunk+MTP chunk commits, with the exclusive end position of the
+/// committed prefix (`start_pos + tokens_written_so_far`).
+///
+/// The callback runs while `target.kv_cache` holds the just-written prefix and
+/// before the next chunk may write past the current-tier capacity. Failures
+/// propagate and abort the remaining prefill (caller must free MTP state).
+#[allow(clippy::too_many_arguments)]
+pub fn prefill_trunk_and_mtp_cache_with_boundary<F>(
+    gpu: &mut Gpu,
+    target: &mut ModelSlot,
+    head: &Qwen35MtpHead,
+    state: &mut MtpSpecState,
+    prompt_tokens: &[u32],
+    start_pos: usize,
+    mut on_committed_boundary: F,
+) -> HipResult<TrunkSpinePrefillTimings>
+where
+    F: FnMut(&mut Gpu, &mut ModelSlot, usize) -> HipResult<()>,
+{
+    if prompt_tokens.is_empty() {
+        return Ok(TrunkSpinePrefillTimings::default());
+    }
+
+    let dim = target.config.dim;
+    let dim_bytes = dim * 4;
+    let prompt_hidden = gpu.alloc_tensor(&[prompt_tokens.len() * dim], DType::F32)?;
+    // Match adaptive margin / AR daemon chunking. Internal forward_prefill_batch
+    // also caps at this size; externalizing the loop exposes commit boundaries.
+    let chunk_max = qwen35::PREFILL_MAX_BATCH.max(1);
+
+    let result = (|| -> HipResult<TrunkSpinePrefillTimings> {
+        let mut trunk_prefill_secs = 0.0f64;
+        let mut mtp_prompt_fill_secs = 0.0f64;
+        let mut off = 0usize;
+        while off < prompt_tokens.len() {
+            let end = (off + chunk_max).min(prompt_tokens.len());
+            let chunk = &prompt_tokens[off..end];
+            let chunk_start_pos = start_pos + off;
+            let committed_pos = start_pos + end;
+
+            // Per-chunk hidden destination: row-major slice of the full prompt buffer.
+            let chunk_hidden = prompt_hidden.sub_offset(off * dim, chunk.len() * dim);
+
+            let t_trunk = Instant::now();
+            qwen35::forward_prefill_batch(
+                gpu,
+                &target.weights,
+                &target.config,
+                chunk,
+                chunk_start_pos,
+                &mut target.kv_cache,
+                &mut target.dn_state,
+                &target.scratch,
+                None,
+                Some(&chunk_hidden),
+                None,
+                None,
+            )?;
+            trunk_prefill_secs += t_trunk.elapsed().as_secs_f64();
+
+            let t_mtp_fill = Instant::now();
+            for (i, &token) in chunk.iter().enumerate() {
+                let hidden_row = prompt_hidden.sub_offset((off + i) * dim, dim);
+                mtp_head::mtp_head_forward_block_only(
+                    gpu,
+                    head,
+                    &state.mtp_scratch,
+                    &mut state.mtp_kv,
+                    token,
+                    &hidden_row,
+                    None,
+                    chunk_start_pos + i,
+                    &target.weights,
+                )?;
+            }
+            mtp_prompt_fill_secs += t_mtp_fill.elapsed().as_secs_f64();
+
+            // Committed boundary: trunk + MTP private KV now cover [0, committed_pos).
+            on_committed_boundary(gpu, target, committed_pos)?;
+            off = end;
         }
 
         let last = prompt_tokens.len() - 1;
@@ -1191,7 +1409,6 @@ pub fn prefill_trunk_and_mtp_cache(
             last * dim_bytes,
             dim_bytes,
         )?;
-        let mtp_prompt_fill_secs = t_mtp_fill.elapsed().as_secs_f64();
         Ok(TrunkSpinePrefillTimings {
             trunk_prefill_secs,
             mtp_prompt_fill_secs,
@@ -1201,6 +1418,14 @@ pub fn prefill_trunk_and_mtp_cache(
     let _ = gpu.free_tensor(prompt_hidden);
     result
 }
+
+/// Explicit DS4-shaped Qwen MTP spec step.
+///
+/// This is the discrete-token trunk spine: serial MTP proposals, one trunk
+/// batched verify, greedy/sampling accept, then rollback/replay only when the
+/// full verify state cannot be kept. It intentionally delegates to the mature
+/// compressed-serial implementation, whose name describes the lm_head storage
+/// mode rather than the spine architecture.
 
 /// Explicit DS4-shaped Qwen MTP spec step.
 ///
@@ -1219,7 +1444,8 @@ pub fn spec_step_mtp_trunk_spine(
     last_committed: u32,
     eos_token_id: u32,
 ) -> HipResult<MtpSpecResult> {
-    spec_step_mtp_compressed_serial(
+    let k = state.max_n;
+    spec_step_mtp_compressed_serial_with_k(
         gpu,
         target,
         head,
@@ -1227,6 +1453,31 @@ pub fn spec_step_mtp_trunk_spine(
         cur_pos,
         last_committed,
         eos_token_id,
+        k,
+    )
+}
+
+/// Budget-aware trunk spine: draft at most `k` candidates (k may be 0).
+#[allow(clippy::too_many_arguments)]
+pub fn spec_step_mtp_trunk_spine_with_k(
+    gpu: &mut Gpu,
+    target: &mut ModelSlot,
+    head: &Qwen35MtpHead,
+    state: &mut MtpSpecState,
+    cur_pos: usize,
+    last_committed: u32,
+    eos_token_id: u32,
+    k: usize,
+) -> HipResult<MtpSpecResult> {
+    spec_step_mtp_compressed_serial_with_k(
+        gpu,
+        target,
+        head,
+        state,
+        cur_pos,
+        last_committed,
+        eos_token_id,
+        k,
     )
 }
 
@@ -1670,7 +1921,10 @@ pub fn spec_step_mtp(
     // HIPFIRE_MTP_TAPE_REPLAY=0 forces the original full-replay path (A/B gate).
     let use_tape_replay = tape_captured
         && advance >= 2
-        && std::env::var("HIPFIRE_MTP_TAPE_REPLAY").ok().as_deref() != Some("0");
+        && hipfire_config::developer_var("HIPFIRE_MTP_TAPE_REPLAY")
+            .ok()
+            .as_deref()
+            != Some("0");
     state.trunk_snap.restore_to(&mut target.dn_state, gpu)?;
     if use_tape_replay {
         // Batched verify populated the tape this cycle — cheap GDN-only replay.
@@ -2282,6 +2536,8 @@ fn mtp_sampled_accept(
 // times instead of 1 batched, costing extra launch overhead and per-step
 // argmax+D2H. On a 248K-vocab model this is dwarfed by the BW savings.
 // On smaller-vocab models the lossy batched path may still be faster.
+/// Legacy entry: drafts `state.max_n` candidates. Prefer
+/// [`spec_step_mtp_compressed_serial_with_k`] when a per-call budget is known.
 #[allow(clippy::too_many_arguments)]
 pub fn spec_step_mtp_compressed_serial(
     gpu: &mut Gpu,
@@ -2292,7 +2548,35 @@ pub fn spec_step_mtp_compressed_serial(
     last_committed: u32,
     eos_token_id: u32,
 ) -> HipResult<MtpSpecResult> {
-    let max_n = state.max_n;
+    let k = state.max_n;
+    spec_step_mtp_compressed_serial_with_k(
+        gpu,
+        target,
+        head,
+        state,
+        cur_pos,
+        last_committed,
+        eos_token_id,
+        k,
+    )
+}
+
+/// Budget-aware compressed-serial MTP step: draft at most `k` candidates.
+/// `k == 0` verifies `[last_committed]` only and emits the single bonus token.
+#[allow(clippy::too_many_arguments)]
+pub fn spec_step_mtp_compressed_serial_with_k(
+    gpu: &mut Gpu,
+    target: &mut ModelSlot,
+    head: &Qwen35MtpHead,
+    state: &mut MtpSpecState,
+    cur_pos: usize,
+    last_committed: u32,
+    eos_token_id: u32,
+    k: usize,
+) -> HipResult<MtpSpecResult> {
+    // Per-call k is authoritative (remaining max_emit from MtpSpeculator). Never
+    // draft more than state.max_n, and k==0 means verify [seed] only + bonus.
+    let max_n = k.min(state.max_n);
     let dim = target.config.dim;
     let vocab = target.config.vocab_size;
     let trunk_weights: &Qwen35Weights = &target.weights;
@@ -2421,7 +2705,10 @@ pub fn spec_step_mtp_compressed_serial(
         (true, false) => DraftMode::Greedy,
     };
     let use_p_min = matches!(draft_mode, DraftMode::PMin { .. });
-    let use_sampling = matches!(draft_mode, DraftMode::Sampled | DraftMode::SampledPMin { .. });
+    let use_sampling = matches!(
+        draft_mode,
+        DraftMode::Sampled | DraftMode::SampledPMin { .. }
+    );
     let use_sampled_pmin = matches!(draft_mode, DraftMode::SampledPMin { .. });
     let log_p_min = match draft_mode {
         DraftMode::PMin { log_p_min } | DraftMode::SampledPMin { log_p_min } => log_p_min,
@@ -2453,7 +2740,10 @@ pub fn spec_step_mtp_compressed_serial(
     } else {
         Vec::new()
     };
-    let use_device_token_chain = mtp_device_token_chain_enabled_from_env()
+    // k==0 one-token path: never run device-token chain / proposal graph
+    // (both assume max_n ≥ 1 for candidate buffer views).
+    let use_device_token_chain = max_n > 0
+        && mtp_device_token_chain_enabled_from_env()
         && mtp_device_token_chain_eligible_for(trunk_weights.embd_format, use_sampling, use_p_min);
     if use_device_token_chain && !use_full_vocab {
         assert!(
@@ -2462,7 +2752,8 @@ pub fn spec_step_mtp_compressed_serial(
         );
     }
     let proposal_graph_policy = mtp_proposal_graph_policy_from_env();
-    let use_proposal_graph = !state.mtp_proposal_graph_disabled
+    let use_proposal_graph = max_n > 0
+        && !state.mtp_proposal_graph_disabled
         && mtp_proposal_graph_eligible_for(
             proposal_graph_policy,
             use_device_token_chain,
@@ -2478,7 +2769,7 @@ pub fn spec_step_mtp_compressed_serial(
         && state.mtp_proposal_graph_exec.is_some()
         && proposal_graph_seq_cap > state.mtp_proposal_graph_seq_cap
     {
-        destroy_mtp_proposal_graph(gpu, state);
+        destroy_mtp_proposal_graph(gpu, state)?;
         state.mtp_proposal_graph_warmed = true;
     }
     if use_device_token_chain {
@@ -3260,6 +3551,46 @@ pub fn spec_step_mtp_compressed_serial(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mtp_prefill_boundaries_chunk_at_prefill_max_batch() {
+        let b = mtp_prefill_committed_boundaries(600, 0, qwen35::PREFILL_MAX_BATCH);
+        assert_eq!(
+            b,
+            vec![256, 512, 600],
+            "adaptive maybe_downshift must see every committed end ≤ PREFILL_MAX_BATCH apart"
+        );
+        // Empty prompt → no boundaries (no KV writes).
+        assert!(mtp_prefill_committed_boundaries(0, 0, qwen35::PREFILL_MAX_BATCH).is_empty());
+        // start_pos offset is absolute trunk position.
+        assert_eq!(
+            mtp_prefill_committed_boundaries(300, 10, 256),
+            vec![266, 310]
+        );
+        // Single short chunk → one boundary at full length.
+        assert_eq!(
+            mtp_prefill_committed_boundaries(40, 0, qwen35::PREFILL_MAX_BATCH),
+            vec![40]
+        );
+    }
+
+    #[test]
+    fn mtp_prefill_boundaries_never_exceed_chunk_stride() {
+        let chunk = qwen35::PREFILL_MAX_BATCH;
+        let bounds = mtp_prefill_committed_boundaries(10_000, 0, chunk);
+        let mut prev = 0usize;
+        for &pos in &bounds {
+            assert!(pos > prev);
+            assert!(
+                pos - prev <= chunk,
+                "boundary gap {} exceeds chunk_max {}",
+                pos - prev,
+                chunk
+            );
+            prev = pos;
+        }
+        assert_eq!(*bounds.last().unwrap(), 10_000);
+    }
 
     #[test]
     fn trunk_spine_verify_tokens_are_seed_plus_candidates() {

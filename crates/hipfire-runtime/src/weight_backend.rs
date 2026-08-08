@@ -9,7 +9,7 @@
 
 use crate::hfq::HfqFile;
 use crate::llama::{f16_to_f32, EmbeddingFormat, KvCache, WeightTensor};
-use hip_bridge::HipResult;
+use hip_bridge::{HipError, HipResult};
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 /// Widen a little-endian BF16 byte stream to F32 (lossless: bf16 is the high
@@ -157,26 +157,34 @@ pub fn embedding_format_dtype(fmt: EmbeddingFormat) -> DType {
 /// unexpected quant_type/shape.
 ///
 /// Moved from `hipfire-arch-qwen35::qwen35::load_awq_scale_for`.
-pub fn load_awq_scale_for(hfq: &HfqFile, gpu: &Gpu, name: &str, k: usize) -> Option<GpuTensor> {
+pub fn load_awq_scale_for(
+    hfq: &HfqFile,
+    gpu: &mut Gpu,
+    name: &str,
+    k: usize,
+) -> HipResult<Option<GpuTensor>> {
     let sidecar_name = match name.strip_suffix(".weight") {
         Some(stem) => format!("{stem}.awq_scale.weight"),
         None => format!("{name}.awq_scale.weight"),
     };
-    let (sc_info, sc_data) = hfq.tensor_data_pread(&sidecar_name)?;
+    let (sc_info, sc_data) = match hfq.tensor_data_pread(&sidecar_name) {
+        Some(data) => data,
+        None => return Ok(None),
+    };
     // Must be 1D F16, length K. quant_type 1 = F16.
     if sc_info.quant_type != 1 {
         eprintln!(
             "warning: AWQ sidecar {sidecar_name} has quant_type={} (expected 1=F16); skipping",
             sc_info.quant_type
         );
-        return None;
+        return Ok(None);
     }
     if sc_info.shape.len() != 1 || sc_info.shape[0] as usize != k {
         eprintln!(
             "warning: AWQ sidecar {sidecar_name} shape mismatch ({:?} vs expected [{}]); skipping",
             sc_info.shape, k
         );
-        return None;
+        return Ok(None);
     }
     // F16 → F32 on host so the kernel takes a plain `const float*`.
     let f32_data: Vec<f32> = sc_data
@@ -184,7 +192,15 @@ pub fn load_awq_scale_for(hfq: &HfqFile, gpu: &Gpu, name: &str, k: usize) -> Opt
         .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
         .collect();
     let f32_bytes: Vec<u8> = f32_data.iter().flat_map(|&v| v.to_le_bytes()).collect();
-    gpu.upload_raw(&f32_bytes, &[f32_bytes.len()]).ok()
+    let scale = gpu.upload_raw(&f32_bytes, &[f32_bytes.len()])?;
+    #[cfg(feature = "dflash-fault-inject")]
+    if let Err(error) = crate::dflash_generic::generic_dflash_allocation_boundary(
+        crate::dflash_generic::GenericDflashConstructionStage::AwqScaleUpload(0),
+    ) {
+        let _ = gpu.free_tensor(scale);
+        return Err(hip_bridge::HipError::new(0, &error));
+    }
+    Ok(Some(scale))
 }
 
 /// Decode a little-endian f16 byte buffer to `f32`. Pure (GPU-free). The shared
@@ -520,15 +536,24 @@ pub fn dequant_norm(
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect(),
-        _ => panic!("expected F16/F32 for norm, got qt={quant_type}"),
+        16 => widen_bf16(data),
+        _ => {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("expected F16/F32 for norm, got qt={quant_type}"),
+            ));
+        }
     };
     let expected: usize = shape.iter().product();
-    assert_eq!(
-        f32_data.len(),
-        expected,
-        "dequant_norm: tensor has {} elements, expected {expected} (shape {shape:?})",
-        f32_data.len()
-    );
+    if f32_data.len() != expected {
+        return Err(hip_bridge::HipError::new(
+            0,
+            &format!(
+                "dequant_norm: tensor has {} elements, expected {expected} (shape {shape:?})",
+                f32_data.len()
+            ),
+        ));
+    }
     for v in &mut f32_data {
         *v += bias;
     }
@@ -929,8 +954,22 @@ pub fn dequant_f32(gpu: &mut Gpu, quant_type: u8, data: &[u8], n: usize) -> HipR
             }
             out
         }
-        _ => panic!("unsupported quant_type {quant_type} for dequant_f32"),
+        _ => {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("unsupported quant_type {quant_type} for dequant_f32"),
+            ));
+        }
     };
+    if f32_data.len() < n {
+        return Err(hip_bridge::HipError::new(
+            0,
+            &format!(
+                "dequant_f32: tensor has {} elements, expected at least {n}",
+                f32_data.len()
+            ),
+        ));
+    }
     gpu.upload_f32(&f32_data[..n], &[n])
 }
 
@@ -945,6 +984,7 @@ use crate::paro::{load_fp16_weight_from_source, paro_load_f32, paro_load_norm};
 /// for `norm`/`raw_f32` it carries the on-disk suffix (e.g. `input_layernorm.weight`).
 /// Set the active layer with `set_layer` before each layer's calls.
 pub trait WeightBackend {
+    fn gpu(&mut self) -> &mut Gpu;
     fn set_layer(&mut self, layer: usize);
     fn proj(&mut self, rel: &str, m: usize, k: usize) -> HipResult<WeightTensor>;
     fn norm(&mut self, rel: &str, shape: &[usize]) -> HipResult<GpuTensor>;
@@ -961,12 +1001,22 @@ pub struct HfqBackend<'a> {
     pub gpu: &'a mut Gpu,
     pub norm_bias: f32,
     pub candidates: fn(&str) -> Vec<String>,
-    pub read_proj:
-        fn(&HfqFile, &Gpu, &str, usize, usize, fn(&str) -> Vec<String>) -> HipResult<WeightTensor>,
+    pub read_proj: fn(
+        &HfqFile,
+        &mut Gpu,
+        &str,
+        usize,
+        usize,
+        fn(&str) -> Vec<String>,
+    ) -> HipResult<WeightTensor>,
     pub layer: usize,
 }
 
 impl<'a> WeightBackend for HfqBackend<'a> {
+    fn gpu(&mut self) -> &mut Gpu {
+        self.gpu
+    }
+
     fn set_layer(&mut self, layer: usize) {
         self.layer = layer;
     }
@@ -984,26 +1034,28 @@ impl<'a> WeightBackend for HfqBackend<'a> {
     fn norm(&mut self, rel: &str, shape: &[usize]) -> HipResult<GpuTensor> {
         let name = hfq_plain_name(self.layer, rel);
         let (info, data) = read_first(self.hfq, &name, self.candidates)
-            .unwrap_or_else(|| panic!("tensor not found: {name}"));
+            .ok_or_else(|| HipError::new(0, &format!("tensor not found: {name}")))?;
         dequant_norm(self.gpu, info.quant_type, &data, shape, self.norm_bias)
     }
     fn raw_f32(&mut self, rel: &str, n: usize) -> HipResult<GpuTensor> {
         let name = hfq_plain_name(self.layer, rel);
         let (info, data) = read_first(self.hfq, &name, self.candidates)
-            .unwrap_or_else(|| panic!("tensor not found: {name}"));
+            .ok_or_else(|| HipError::new(0, &format!("tensor not found: {name}")))?;
         dequant_f32(self.gpu, info.quant_type, &data, n)
     }
     fn bias(&mut self, rel: &str, n: usize) -> HipResult<GpuTensor> {
         let name = hfq_plain_name(self.layer, rel);
         let (info, data) = read_first(self.hfq, &name, self.candidates)
-            .unwrap_or_else(|| panic!("tensor not found: {name}"));
+            .ok_or_else(|| HipError::new(0, &format!("tensor not found: {name}")))?;
         let t = dequant_f32(self.gpu, info.quant_type, &data, n)?;
-        assert_eq!(
-            t.numel(),
-            n,
-            "bias {name} has {} elements, expected {n}",
-            t.numel()
-        );
+        if t.numel() != n {
+            let actual = t.numel();
+            let _ = self.gpu.free_tensor(t);
+            return Err(HipError::new(
+                0,
+                &format!("bias {name} has {actual} elements, expected {n}"),
+            ));
+        }
         Ok(t)
     }
 }
@@ -1034,6 +1086,10 @@ pub struct ParoBackend<'a> {
 }
 
 impl<'a> WeightBackend for ParoBackend<'a> {
+    fn gpu(&mut self) -> &mut Gpu {
+        self.gpu
+    }
+
     fn set_layer(&mut self, layer: usize) {
         self.layer = layer;
     }
@@ -1330,5 +1386,105 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    #[ignore = "requires an AMD GPU and an HFQ fixture containing an invalid-size bias tensor"]
+    fn malformed_hfq_backend_helpers_return_errors_and_reclaim_prior_allocations() {
+        use std::path::Path;
+
+        let path = std::env::var("HIPFIRE_HFQ_BACKEND_MALFORMED_FIXTURE")
+            .expect("HIPFIRE_HFQ_BACKEND_MALFORMED_FIXTURE is required");
+        let bias_rel = std::env::var("HIPFIRE_HFQ_INVALID_BIAS_REL")
+            .expect("HIPFIRE_HFQ_INVALID_BIAS_REL is required");
+        let bias_n: usize = std::env::var("HIPFIRE_HFQ_INVALID_BIAS_EXPECTED")
+            .expect("HIPFIRE_HFQ_INVALID_BIAS_EXPECTED is required")
+            .parse()
+            .expect("HIPFIRE_HFQ_INVALID_BIAS_EXPECTED must be numeric");
+        assert!(Path::new(&path).is_file());
+
+        let mut hfq = crate::hfq::HfqFile::open(Path::new(&path)).expect("open malformed HFQ");
+        hfq.drop_mmap();
+        let mut gpu = Gpu::init().expect("Gpu::init");
+        let baseline = gpu.hip.get_vram_info().expect("baseline VRAM");
+
+        fn check(
+            gpu: &mut Gpu,
+            baseline: (usize, usize),
+            label: &str,
+            result: HipResult<GpuTensor>,
+        ) {
+            assert!(result.is_err(), "{label} unexpectedly succeeded");
+            gpu.drain_pool();
+            assert_eq!(
+                gpu.hip.get_vram_info().expect("post-error VRAM"),
+                baseline,
+                "{label} leaked prior allocations"
+            );
+        }
+
+        let sentinel = gpu.zeros(&[16], DType::F32).expect("norm sentinel");
+        let result = {
+            let mut backend = HfqBackend {
+                hfq: &hfq,
+                gpu: &mut gpu,
+                norm_bias: 0.0,
+                candidates: flat_name_candidates,
+                read_proj: crate::hfq::load_weight_tensor,
+                layer: 0,
+            };
+            backend.norm("missing_norm", &[1])
+        };
+        let _ = gpu.free_tensor(sentinel);
+        check(&mut gpu, baseline, "missing norm", result);
+
+        let sentinel = gpu.zeros(&[16], DType::F32).expect("raw sentinel");
+        let result = {
+            let mut backend = HfqBackend {
+                hfq: &hfq,
+                gpu: &mut gpu,
+                norm_bias: 0.0,
+                candidates: flat_name_candidates,
+                read_proj: crate::hfq::load_weight_tensor,
+                layer: 0,
+            };
+            backend.raw_f32("missing_raw", 1)
+        };
+        let _ = gpu.free_tensor(sentinel);
+        check(&mut gpu, baseline, "missing raw_f32", result);
+
+        let sentinel = gpu.zeros(&[16], DType::F32).expect("bias sentinel");
+        let result = {
+            let mut backend = HfqBackend {
+                hfq: &hfq,
+                gpu: &mut gpu,
+                norm_bias: 0.0,
+                candidates: flat_name_candidates,
+                read_proj: crate::hfq::load_weight_tensor,
+                layer: 0,
+            };
+            backend.bias(&bias_rel, bias_n)
+        };
+        let _ = gpu.free_tensor(sentinel);
+        check(&mut gpu, baseline, "invalid bias size", result);
+
+        let sentinel = gpu
+            .zeros(&[16], DType::F32)
+            .expect("unsupported dequant sentinel");
+        let result = dequant_f32(&mut gpu, 255, &[], 1);
+        let _ = gpu.free_tensor(sentinel);
+        check(
+            &mut gpu,
+            baseline,
+            "unsupported dequant_f32 quant type",
+            result,
+        );
+
+        let sentinel = gpu
+            .zeros(&[16], DType::F32)
+            .expect("undersized dequant sentinel");
+        let result = dequant_f32(&mut gpu, 1, &[0, 0], 2);
+        let _ = gpu.free_tensor(sentinel);
+        check(&mut gpu, baseline, "undersized dequant_f32 tensor", result);
     }
 }

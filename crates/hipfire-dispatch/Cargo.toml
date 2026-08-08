@@ -2,10 +2,13 @@
 name = "hipfire-dispatch"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 
 [dependencies]
 hip-bridge = { path = "../hip-bridge" }
+hipfire-config = { path = "../hipfire-config" }
 rdna-compute = { path = "../rdna-compute" }
+hipfire-hardware = { path = "../hipfire-hardware" }
 
 [features]
 default = []
@@ -17,4 +20,4 @@ new-fused-qkv = []
 new-attention = []
 new-moe = []
 from-hip-error = []
-deltanet = ["rdna-compute/deltanet"]
+deltanet = ["rdna-compute/deltanet", "hipfire-hardware/deltanet"]

@@ -7,7 +7,12 @@ description = "Compute kernel dispatch for RDNA GPUs"
 
 [features]
 deltanet = []
+# Test-only: makes `Gpu::free_tensor_checked` fail on the FIRST free attempt
+# while `HIPFIRE_FROZEN_FAIL_FREE=1` is set (qwen35 Frozen rollback tests).
+frozen-fault-inject = []
 
 [dependencies]
 hip-bridge = { path = "../hip-bridge" }
+hipfire-config = { path = "../hipfire-config" }
+redline-dispatch = { path = "../redline-dispatch" }
 rayon = "1"

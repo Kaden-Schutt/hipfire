@@ -72,7 +72,7 @@ impl<'a> Cohere2MoeEmit<'a> {
     pub fn from_ctx(ctx: SpecEmitCtx<'a>) -> Box<dyn SpecEmit + 'a> {
         let tk = ctx.tokenizer;
         let mark = |s: &str, fb: u32| -> u32 { tk.special_token_id(s).unwrap_or(fb) };
-        let empty_turn_guard = std::env::var("HIPFIRE_C2M_EMPTY_TURN_GUARD")
+        let empty_turn_guard = hipfire_config::developer_var("HIPFIRE_C2M_EMPTY_TURN_GUARD")
             .ok()
             .as_deref()
             != Some("0");
@@ -146,6 +146,7 @@ impl<'a> Cohere2MoeEmit<'a> {
             }
             return EmitOutcome {
                 events: Vec::new(),
+                generation_advanced: false,
                 stop: Some(StopReason::Eos),
             };
         }
@@ -219,7 +220,11 @@ impl<'a> Cohere2MoeEmit<'a> {
             self.think_force_closed = true;
         }
 
-        EmitOutcome { events, stop: None }
+        EmitOutcome {
+            events,
+            generation_advanced: true,
+            stop: None,
+        }
     }
 }
 
@@ -255,6 +260,10 @@ impl<'a> SpecEmit for Cohere2MoeEmit<'a> {
             events,
             finish_reason,
             tool_calls,
+            finalized: None,
+            visible_text: String::new(),
+            decoded_eot: false,
+            open_think: false,
         }
     }
 }

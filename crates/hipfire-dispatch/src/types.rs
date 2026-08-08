@@ -26,6 +26,25 @@ pub enum PipelineOp {
     IndexedGateUp,
     IndexedDownExpanded,
     MoeCombine,
+    /// Bias-aware top-K routing (Step-IR [`crate::pipeline::steps::Step::MoeRoute`]).
+    /// Writes topk_indices + topk_weights. Not fusible.
+    MoeRoute,
+    /// Indexed per-expert GEMV (Step-IR [`crate::pipeline::steps::Step::IndexedMoeGemv`]).
+    /// Covers GateUp, DownExpanded, and DownResidual shapes — all three return this tag
+    /// so fusion matching treats them uniformly (none participate in any fused pattern).
+    IndexedMoeGemv,
+    /// Scatter+histogram for grouped-GEMM prefill (Step-IR [`crate::pipeline::steps::Step::MoeScatter`]).
+    /// Builds sorted_slot_index / expert_tile_ids / inverse_perm from topk_indices.
+    /// Not fusible.
+    MoeScatter,
+    /// Grouped-WMMA expert GEMM (Step-IR [`crate::pipeline::steps::Step::GroupedMoeGemm`]).
+    /// Covers both gate_up and down projections (distinguished by `which: MoeProj`).
+    /// Not fusible.
+    GroupedMoeGemm,
+    /// Deinterleave the grouped gate_up result into gate_batch + up_batch
+    /// (Step-IR [`crate::pipeline::steps::Step::MoeGateUpUnscatter`]).
+    /// Not fusible.
+    MoeGateUpUnscatter,
     /// Fused rmsnorm + optional rotation (MQ-weight producer step).
     /// rotation=FwhtG256 → rmsnorm + FWHT. rotation=None → rmsnorm only.
     RmsnormAutomatic,
@@ -38,6 +57,24 @@ pub enum PipelineOp {
     QkNorm,
     /// In-place bias add on one tensor (per-op only).
     BiasAdd,
+    #[cfg(feature = "deltanet")]
+    /// Prepare DeltaNet alpha and beta gates in-place.
+    DeltaGatePrep,
+    #[cfg(feature = "deltanet")]
+    /// Causal DeltaNet convolution followed by Q/K/V splitting.
+    DeltaConvSplit,
+    #[cfg(feature = "deltanet")]
+    /// Independently L2-normalize DeltaNet Q and K heads.
+    DeltaQkL2Norm,
+    #[cfg(feature = "deltanet")]
+    /// Repeat DeltaNet key heads into the value/query head layout.
+    DeltaRepeatHeads,
+    #[cfg(feature = "deltanet")]
+    /// Update/read the caller-owned DeltaNet recurrent state.
+    DeltaRecurrence,
+    #[cfg(feature = "deltanet")]
+    /// Apply DeltaNet z gating and output normalization.
+    DeltaGatedNorm,
 }
 
 // ── Variant enums ─────────────────────────────────────
@@ -339,6 +376,9 @@ pub enum KernelKey {
     FusedQkvzaParo4G128T,
     FusedQkvParo4G128T,
     FusedGateUpQ8_0,
+    #[cfg(feature = "deltanet")]
+    /// Batched DeltaNet Q/K L2 norm plus head-repeat fusion.
+    FusedDeltaQkL2NormRepeat,
     // Rotation
     RotateMq,
     RotateMqG128,

@@ -50,6 +50,7 @@
 use crate::dots_ocr::{DotsOcrConfig, DotsOcrWeights};
 use hipfire_arch_qwen2::qwen2;
 use hipfire_arch_qwen2::qwen2::Qwen2State;
+use hipfire_runtime::gpu_cleanup::{BundleTeardown, GpuCleanupFailure};
 use hipfire_runtime::spec::{SpecAdvance, SpecScratch, SpecTarget};
 use rdna_compute::Gpu;
 
@@ -66,6 +67,24 @@ pub struct DotsOcrBundle {
     pub config: DotsOcrConfig,
     pub weights: DotsOcrWeights,
     pub state: Qwen2State,
+}
+
+impl BundleTeardown for DotsOcrBundle {
+    fn free_checked(self, gpu: &mut rdna_compute::Gpu) -> Result<(), GpuCleanupFailure> {
+        let mut cf = GpuCleanupFailure::empty();
+        if let Err(f) = self.weights.free_checked(gpu) {
+            cf.merge(f);
+        }
+        if let Err(f) = self.state.free_checked(gpu) {
+            cf.merge(f);
+        }
+        let _ = self.config; // host-side
+        if cf.is_empty() {
+            Ok(())
+        } else {
+            Err(cf)
+        }
+    }
 }
 
 // ─── DotsOcrSpecScratch ───────────────────────────────────────────────────────
@@ -89,11 +108,12 @@ impl SpecTarget for DotsOcrBundle {
         self
     }
 
-    fn reset_recurrent(&mut self, _gpu: &mut Gpu) {
+    fn reset_recurrent(&mut self, _gpu: &mut Gpu) -> Result<(), String> {
         // Pure attention: no recurrent state to zero. Rewind the KV
         // position cursor so the next prefill writes from slot 0.
         // Mirrors the Qwen2 reset path (qwen2 spec_impl.rs).
         self.state.reset();
+        Ok(())
     }
 
     fn new_spec_scratch(
@@ -114,12 +134,12 @@ impl SpecTarget for DotsOcrBundle {
         _hidden_out: Option<&mut Vec<f32>>,
     ) -> Result<SpecAdvance, String> {
         if reset {
-            self.state.reset();
+            self.reset_recurrent(gpu)
+                .map_err(|e| format!("dots-ocr spec_advance reset: {e}"))?;
         }
         self.state.next_pos = start_pos;
         for &tok in tokens {
             if abort() {
-                self.state.reset();
                 return Ok(SpecAdvance::Aborted);
             }
             qwen2::forward_step(
@@ -134,7 +154,10 @@ impl SpecTarget for DotsOcrBundle {
         let last_argmax = gpu
             .argmax_f32(&self.state.logits, self.config.text.vocab_size)
             .map_err(|e| format!("{e:?}"))?;
-        Ok(SpecAdvance::Ready { last_argmax })
+        Ok(SpecAdvance::Ready {
+            last_argmax,
+            last_logits: None,
+        })
     }
 
     fn verify_block(

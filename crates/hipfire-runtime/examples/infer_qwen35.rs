@@ -156,7 +156,10 @@ fn main() {
     .expect("failed to load weights");
 
     let kv_seq = 2048usize;
-    let kv_mode = std::env::var("HIPFIRE_KV_MODE").unwrap_or_else(|_| "q8".to_string());
+    let kv_mode = match hipfire_runtime::config::get().kv_mode.as_str() {
+        "auto" => "q8".to_string(),
+        mode => mode.to_string(),
+    };
     let mut kv_cache = match kv_mode.as_str() {
         "givens4" => {
             eprintln!("KV cache: givens4");
@@ -545,9 +548,9 @@ fn main() {
         };
     }
 
-    // Drain any bytes the EosFilter was holding back at end-of-stream.
+    // Finalize the EosFilter and drain any bytes held back at end-of-stream.
     if use_guards {
-        let drained = filter.flush_pending();
+        let drained = filter.finish();
         if !drained.is_empty() {
             if let Ok(text) = std::str::from_utf8(&drained) {
                 print!("{text}");

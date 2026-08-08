@@ -303,6 +303,92 @@ impl Qwen35MtpHeadWeights {
             let _ = gpu.free_tensor(vmap);
         }
     }
+
+    /// Checked GPU cleanup: attempts every tensor independently using
+    /// `free_tensor_checked`, retaining any that could not be freed.
+    pub fn free_checked(
+        self,
+        gpu: &mut Gpu,
+    ) -> Vec<hipfire_runtime::gpu_cleanup::RetainedGpuTensor> {
+        let mut failures = Vec::new();
+
+        macro_rules! try_free {
+            ($label:expr, $tensor:expr) => {
+                let mut opt = Some($tensor);
+                if let Err(_e) = gpu.free_tensor_checked(&mut opt) {
+                    if let Some(t) = opt.take() {
+                        failures.push(hipfire_runtime::gpu_cleanup::RetainedGpuTensor {
+                            label: $label.into(),
+                            tensor: t,
+                            last_error: "free_tensor_checked failed".into(),
+                        });
+                    }
+                }
+            };
+        }
+
+        try_free!("MtpHeadWeights.shared_head_norm", self.shared_head_norm);
+        try_free!("MtpHeadWeights.enorm", self.enorm);
+        try_free!("MtpHeadWeights.hnorm", self.hnorm);
+        try_free!("MtpHeadWeights.attn_norm", self.attn_norm);
+        try_free!("MtpHeadWeights.attn_post_norm", self.attn_post_norm);
+        try_free!("MtpHeadWeights.attn_q_norm", self.attn_q_norm);
+        try_free!("MtpHeadWeights.attn_k_norm", self.attn_k_norm);
+        try_free!("MtpHeadWeights.eh_proj", self.eh_proj.buf);
+        try_free!("MtpHeadWeights.wq", self.wq.buf);
+        try_free!("MtpHeadWeights.wk", self.wk.buf);
+        try_free!("MtpHeadWeights.wv", self.wv.buf);
+        try_free!("MtpHeadWeights.wo", self.wo.buf);
+        match self.ffn {
+            Qwen35MtpFfnWeights::Dense(ffn) => {
+                try_free!("MtpHeadWeights.ffn.gate", ffn.gate.buf);
+                try_free!("MtpHeadWeights.ffn.up", ffn.up.buf);
+                try_free!("MtpHeadWeights.ffn.down", ffn.down.buf);
+            }
+            Qwen35MtpFfnWeights::Moe(ffn) => {
+                try_free!("MtpHeadWeights.ffn.router", ffn.router.buf);
+                try_free!(
+                    "MtpHeadWeights.ffn.shared_expert_gate",
+                    ffn.shared_expert_gate.buf
+                );
+                try_free!(
+                    "MtpHeadWeights.ffn.shared_expert.gate",
+                    ffn.shared_expert.gate.buf
+                );
+                try_free!(
+                    "MtpHeadWeights.ffn.shared_expert.up",
+                    ffn.shared_expert.up.buf
+                );
+                try_free!(
+                    "MtpHeadWeights.ffn.shared_expert.down",
+                    ffn.shared_expert.down.buf
+                );
+                try_free!(
+                    "MtpHeadWeights.ffn.expert_gate_up_ptrs",
+                    ffn.expert_gate_up_ptrs
+                );
+                try_free!("MtpHeadWeights.ffn.expert_down_ptrs", ffn.expert_down_ptrs);
+                for (i, expert) in ffn.experts.into_iter().enumerate() {
+                    try_free!(
+                        format!("MtpHeadWeights.ffn.experts[{i}].gate_up"),
+                        expert.gate_up.buf
+                    );
+                    try_free!(
+                        format!("MtpHeadWeights.ffn.experts[{i}].down"),
+                        expert.down.buf
+                    );
+                }
+            }
+        }
+        if let Some(t) = self.lm_head_draft {
+            try_free!("MtpHeadWeights.lm_head_draft", t.buf);
+        }
+        if let Some(t) = self.lm_head_draft_vocab_map_gpu {
+            try_free!("MtpHeadWeights.lm_head_draft_vocab_map_gpu", t);
+        }
+
+        failures
+    }
 }
 
 // ─── Scratch ─────────────────────────────────────────────────────────────
@@ -729,7 +815,7 @@ impl Qwen35MtpHeadKvCache {
         // leaks the k_gpu/v_gpu buffers. Free them explicitly. (The old
         // "they free on Drop" comment was false; see mtp_spec/mtp_compose
         // which already bypass this wrapper for the same reason.)
-        self.inner.free_gpu(gpu);
+        let _ = self.inner.free_gpu(gpu);
     }
 }
 
@@ -746,6 +832,15 @@ pub struct Qwen35MtpHead {
 impl Qwen35MtpHead {
     pub fn free_gpu(self, gpu: &mut Gpu) {
         self.weights.free_gpu(gpu);
+    }
+
+    /// Checked GPU cleanup: attempts every tensor independently, returns
+    /// those that could not be freed.
+    pub fn free_checked(
+        self,
+        gpu: &mut Gpu,
+    ) -> Vec<hipfire_runtime::gpu_cleanup::RetainedGpuTensor> {
+        self.weights.free_checked(gpu)
     }
 }
 
@@ -796,7 +891,7 @@ pub fn load_mtp_head_bundled(
     path: &Path,
     gpu: &mut Gpu,
     max_seq: usize,
-) -> HipResult<Option<Qwen35MtpHead>> {
+) -> Result<Option<Qwen35MtpHead>, MtpHeadLoadError> {
     let mtp_offset = match detect_bundled_mtp_offset(path) {
         Ok(Some(off)) => off,
         Ok(None) => return Ok(None),
@@ -808,12 +903,220 @@ pub fn load_mtp_head_bundled(
 
 // ─── Loader ──────────────────────────────────────────────────────────────
 
+/// A failure while loading the MTP head, carrying every already-uploaded
+/// tensor that the staging rollback could not free (exact-retention owners).
+#[must_use]
+pub struct MtpHeadLoadError {
+    pub message: String,
+    pub retained: Vec<hipfire_runtime::gpu_cleanup::RetainedGpuTensor>,
+}
+
+impl std::fmt::Debug for MtpHeadLoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Redacted: message + retained-owner count only. Never stringify
+        // the owners (they must be retried, never dropped after a log).
+        f.debug_struct("MtpHeadLoadError")
+            .field("message", &self.message)
+            .field("retained", &self.retained.len())
+            .finish()
+    }
+}
+
+impl std::fmt::Display for MtpHeadLoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl std::error::Error for MtpHeadLoadError {}
+
+/// Transactional staging for the MTP-head upload sequence.
+///
+/// Every successfully uploaded tensor is parked in its slot here. On any
+/// later upload failure [`MtpHeadStaging::fail`] frees every parked owner
+/// with CHECKED frees and returns the error carrying whatever could not be
+/// freed; on success [`MtpHeadStaging::publish`] moves every slot into a
+/// [`Qwen35MtpHeadWeights`]. A mid-load failure can no longer leak the
+/// already-uploaded tensors (they were previously dropped on `?`).
+#[derive(Default)]
+struct MtpHeadStaging {
+    shared_head_norm: Option<GpuTensor>,
+    enorm: Option<GpuTensor>,
+    hnorm: Option<GpuTensor>,
+    attn_norm: Option<GpuTensor>,
+    attn_post_norm: Option<GpuTensor>,
+    attn_q_norm: Option<GpuTensor>,
+    attn_k_norm: Option<GpuTensor>,
+    eh_proj: Option<WeightTensor>,
+    wq: Option<WeightTensor>,
+    wk: Option<WeightTensor>,
+    wv: Option<WeightTensor>,
+    wo: Option<WeightTensor>,
+    // Dense FFN pieces.
+    ffn_gate: Option<WeightTensor>,
+    ffn_up: Option<WeightTensor>,
+    ffn_down: Option<WeightTensor>,
+    // MoE FFN pieces (all staged independently for partial rollback).
+    moe_router: Option<WeightTensor>,
+    moe_shared_expert_gate: Option<WeightTensor>,
+    moe_shared_gate: Option<WeightTensor>,
+    moe_shared_up: Option<WeightTensor>,
+    moe_shared_down: Option<WeightTensor>,
+    /// In-flight expert whose gate_up is uploaded but whose down failed
+    /// (or the current expert not yet committed to `moe_experts`).
+    moe_expert_inflight: Option<WeightTensor>,
+    moe_experts: Vec<Qwen35MtpMoeExpertWeights>,
+    moe_gu_ptrs: Option<GpuTensor>,
+    moe_dn_ptrs: Option<GpuTensor>,
+    // Compressed lm_head_draft sidecar.
+    lm_head_draft: Option<WeightTensor>,
+    lm_head_draft_vocab_map: Option<Vec<u32>>,
+    vmap_gpu: Option<GpuTensor>,
+    compressed_vocab_size: Option<usize>,
+}
+
+impl MtpHeadStaging {
+    /// Checked rollback: free every parked owner independently; the error
+    /// carries whatever could not be freed (exact-retention owners).
+    fn fail(&mut self, gpu: &mut Gpu, message: String) -> MtpHeadLoadError {
+        use hipfire_runtime::gpu_cleanup::{free_tensor_retained, free_weight_all_checked};
+
+        let mut retained: Vec<hipfire_runtime::gpu_cleanup::RetainedGpuTensor> = Vec::new();
+        for (label, t) in [
+            (
+                "MtpHeadStaging.shared_head_norm",
+                self.shared_head_norm.take(),
+            ),
+            ("MtpHeadStaging.enorm", self.enorm.take()),
+            ("MtpHeadStaging.hnorm", self.hnorm.take()),
+            ("MtpHeadStaging.attn_norm", self.attn_norm.take()),
+            ("MtpHeadStaging.attn_post_norm", self.attn_post_norm.take()),
+            ("MtpHeadStaging.attn_q_norm", self.attn_q_norm.take()),
+            ("MtpHeadStaging.attn_k_norm", self.attn_k_norm.take()),
+            ("MtpHeadStaging.moe_gu_ptrs", self.moe_gu_ptrs.take()),
+            ("MtpHeadStaging.moe_dn_ptrs", self.moe_dn_ptrs.take()),
+            ("MtpHeadStaging.vmap_gpu", self.vmap_gpu.take()),
+        ] {
+            if let Some(t) = t {
+                free_tensor_retained(label, t, gpu, &mut retained);
+            }
+        }
+        for (label, wt) in [
+            ("MtpHeadStaging.eh_proj", self.eh_proj.take()),
+            ("MtpHeadStaging.wq", self.wq.take()),
+            ("MtpHeadStaging.wk", self.wk.take()),
+            ("MtpHeadStaging.wv", self.wv.take()),
+            ("MtpHeadStaging.wo", self.wo.take()),
+            ("MtpHeadStaging.ffn_gate", self.ffn_gate.take()),
+            ("MtpHeadStaging.ffn_up", self.ffn_up.take()),
+            ("MtpHeadStaging.ffn_down", self.ffn_down.take()),
+            ("MtpHeadStaging.moe_router", self.moe_router.take()),
+            (
+                "MtpHeadStaging.moe_shared_expert_gate",
+                self.moe_shared_expert_gate.take(),
+            ),
+            (
+                "MtpHeadStaging.moe_shared_gate",
+                self.moe_shared_gate.take(),
+            ),
+            ("MtpHeadStaging.moe_shared_up", self.moe_shared_up.take()),
+            (
+                "MtpHeadStaging.moe_shared_down",
+                self.moe_shared_down.take(),
+            ),
+            (
+                "MtpHeadStaging.moe_expert_inflight",
+                self.moe_expert_inflight.take(),
+            ),
+            ("MtpHeadStaging.lm_head_draft", self.lm_head_draft.take()),
+        ] {
+            if let Some(wt) = wt {
+                free_weight_all_checked(label, wt, gpu, &mut retained);
+            }
+        }
+        for (i, e) in self.moe_experts.drain(..).enumerate() {
+            free_weight_all_checked(
+                &format!("MtpHeadStaging.moe_experts[{i}].gate_up"),
+                e.gate_up,
+                gpu,
+                &mut retained,
+            );
+            free_weight_all_checked(
+                &format!("MtpHeadStaging.moe_experts[{i}].down"),
+                e.down,
+                gpu,
+                &mut retained,
+            );
+        }
+        MtpHeadLoadError { message, retained }
+    }
+
+    /// Move every parked owner into the final weights struct. All slots
+    /// referenced by `ffn_kind` are `Some` by construction on the success
+    /// path; the `expect`s are invariant guards.
+    fn publish(mut self, ffn_kind: Qwen35MtpFfnKind) -> Qwen35MtpHeadWeights {
+        let take_t = |slot: &mut Option<GpuTensor>, name: &str| {
+            slot.take()
+                .unwrap_or_else(|| panic!("MtpHeadStaging.{name} unset at publish"))
+        };
+        let take_w = |slot: &mut Option<WeightTensor>, name: &str| {
+            slot.take()
+                .unwrap_or_else(|| panic!("MtpHeadStaging.{name} unset at publish"))
+        };
+        let ffn = match ffn_kind {
+            Qwen35MtpFfnKind::Dense => Qwen35MtpFfnWeights::Dense(Qwen35MtpDenseFfnWeights {
+                gate: take_w(&mut self.ffn_gate, "ffn_gate"),
+                up: take_w(&mut self.ffn_up, "ffn_up"),
+                down: take_w(&mut self.ffn_down, "ffn_down"),
+            }),
+            Qwen35MtpFfnKind::Moe => Qwen35MtpFfnWeights::Moe(Qwen35MtpMoeFfnWeights {
+                router: take_w(&mut self.moe_router, "moe_router"),
+                shared_expert_gate: take_w(
+                    &mut self.moe_shared_expert_gate,
+                    "moe_shared_expert_gate",
+                ),
+                shared_expert: Qwen35MtpMoeSharedExpertWeights {
+                    gate: take_w(&mut self.moe_shared_gate, "moe_shared_gate"),
+                    up: take_w(&mut self.moe_shared_up, "moe_shared_up"),
+                    down: take_w(&mut self.moe_shared_down, "moe_shared_down"),
+                },
+                experts: self.moe_experts,
+                expert_gate_up_ptrs: take_t(&mut self.moe_gu_ptrs, "moe_gu_ptrs"),
+                expert_down_ptrs: take_t(&mut self.moe_dn_ptrs, "moe_dn_ptrs"),
+            }),
+        };
+        Qwen35MtpHeadWeights {
+            shared_head_norm: take_t(&mut self.shared_head_norm, "shared_head_norm"),
+            enorm: take_t(&mut self.enorm, "enorm"),
+            hnorm: take_t(&mut self.hnorm, "hnorm"),
+            attn_norm: take_t(&mut self.attn_norm, "attn_norm"),
+            attn_post_norm: take_t(&mut self.attn_post_norm, "attn_post_norm"),
+            attn_q_norm: take_t(&mut self.attn_q_norm, "attn_q_norm"),
+            attn_k_norm: take_t(&mut self.attn_k_norm, "attn_k_norm"),
+            eh_proj: take_w(&mut self.eh_proj, "eh_proj"),
+            wq: take_w(&mut self.wq, "wq"),
+            wk: take_w(&mut self.wk, "wk"),
+            wv: take_w(&mut self.wv, "wv"),
+            wo: take_w(&mut self.wo, "wo"),
+            ffn,
+            lm_head_draft: self.lm_head_draft.take(),
+            lm_head_draft_vocab_map: self.lm_head_draft_vocab_map.take(),
+            lm_head_draft_vocab_map_gpu: self.vmap_gpu.take(),
+            compressed_vocab_size: self.compressed_vocab_size,
+        }
+    }
+}
+
 /// Load a `.mtp` file (arch_id = 21) created by `mtp_extract` (Task 8).
 /// Returns the head ready for `mtp_head_forward`.
 ///
 /// `max_seq` bounds the per-position KV cache later allocated by
 /// [`Qwen35MtpHeadKvCache::new`]; pick to match your decode budget.
-pub fn load_mtp_head(path: &Path, gpu: &mut Gpu, max_seq: usize) -> HipResult<Qwen35MtpHead> {
+pub fn load_mtp_head(
+    path: &Path,
+    gpu: &mut Gpu,
+    max_seq: usize,
+) -> Result<Qwen35MtpHead, MtpHeadLoadError> {
     load_mtp_head_at_offset(path, gpu, max_seq, 0)
 }
 
@@ -825,7 +1128,7 @@ pub fn load_mtp_head_at_offset(
     gpu: &mut Gpu,
     max_seq: usize,
     base_offset: u64,
-) -> HipResult<Qwen35MtpHead> {
+) -> Result<Qwen35MtpHead, MtpHeadLoadError> {
     let hfq = HfqFile::open_at_offset(path, base_offset).unwrap_or_else(|e| {
         panic!(
             "open .mtp file {} @ offset {base_offset}: {e}",
@@ -853,62 +1156,143 @@ pub fn load_mtp_head_at_offset(
     let n_embd = config.n_embd;
     let head_dim = config.head_dim;
 
+    // Every upload parks its owner in `staging`; a failure at any point
+    // rolls back everything uploaded so far (checked frees, exact-retention
+    // owners in the error) instead of leaking it.
+    let mut staging = MtpHeadStaging::default();
+    macro_rules! stage {
+        ($slot:ident, $label:expr, $expr:expr) => {
+            match $expr {
+                Ok(v) => {
+                    staging.$slot = Some(v);
+                }
+                Err(e) => {
+                    return Err(staging.fail(gpu, format!("{}: {e}", $label)));
+                }
+            }
+        };
+    }
+
     // shared_head_norm gets +1.0 like the per-layer norms — empirically
     // verified 2026-05-15 A/B: removing +1.0 regressed K=3 from τ=3.08 to
     // τ=2.00 on 27B-3.5 LRU bench. The MTP head trains its `mtp.norm` with
     // the trunk per-layer convention, NOT the trunk final-norm convention.
-    let shared_head_norm = load_norm_raw(&hfq, gpu, "shared_head_norm", n_embd)?;
-    let enorm = load_norm_raw(&hfq, gpu, "enorm", n_embd)?;
-    let hnorm = load_norm_raw(&hfq, gpu, "hnorm", n_embd)?;
-    let attn_norm = load_norm_raw(&hfq, gpu, "attn_norm", n_embd)?;
-    let attn_post_norm = load_norm_raw(&hfq, gpu, "attn_post_norm", n_embd)?;
-    let attn_q_norm = load_norm_raw(&hfq, gpu, "attn_q_norm", head_dim)?;
-    let attn_k_norm = load_norm_raw(&hfq, gpu, "attn_k_norm", head_dim)?;
+    stage!(
+        shared_head_norm,
+        "load norm 'shared_head_norm'",
+        load_norm_raw(&hfq, gpu, "shared_head_norm", n_embd)
+    );
+    stage!(
+        enorm,
+        "load norm 'enorm'",
+        load_norm_raw(&hfq, gpu, "enorm", n_embd)
+    );
+    stage!(
+        hnorm,
+        "load norm 'hnorm'",
+        load_norm_raw(&hfq, gpu, "hnorm", n_embd)
+    );
+    stage!(
+        attn_norm,
+        "load norm 'attn_norm'",
+        load_norm_raw(&hfq, gpu, "attn_norm", n_embd)
+    );
+    stage!(
+        attn_post_norm,
+        "load norm 'attn_post_norm'",
+        load_norm_raw(&hfq, gpu, "attn_post_norm", n_embd)
+    );
+    stage!(
+        attn_q_norm,
+        "load norm 'attn_q_norm'",
+        load_norm_raw(&hfq, gpu, "attn_q_norm", head_dim)
+    );
+    stage!(
+        attn_k_norm,
+        "load norm 'attn_k_norm'",
+        load_norm_raw(&hfq, gpu, "attn_k_norm", head_dim)
+    );
 
     // ── 2D weights ──────────────────────────────────────────────────────
     let q_full_dim = 2 * head_dim * config.n_head;
     let kv_dim = head_dim * config.n_head_kv;
     let q_dim = head_dim * config.n_head;
 
-    let eh_proj = load_weight_raw(&hfq, gpu, "eh_proj", n_embd, 2 * n_embd)?;
-    let wq = load_weight_raw(&hfq, gpu, "wq", q_full_dim, n_embd)?;
-    let wk = load_weight_raw(&hfq, gpu, "wk", kv_dim, n_embd)?;
-    let wv = load_weight_raw(&hfq, gpu, "wv", kv_dim, n_embd)?;
-    let wo = load_weight_raw(&hfq, gpu, "wo", n_embd, q_dim)?;
-    let ffn = match config.ffn_kind {
-        Qwen35MtpFfnKind::Dense => Qwen35MtpFfnWeights::Dense(Qwen35MtpDenseFfnWeights {
-            gate: load_weight_raw(&hfq, gpu, "ffn_gate", config.n_ff, n_embd)?,
-            up: load_weight_raw(&hfq, gpu, "ffn_up", config.n_ff, n_embd)?,
-            down: load_weight_raw(&hfq, gpu, "ffn_down", n_embd, config.n_ff)?,
-        }),
+    stage!(
+        eh_proj,
+        "load weight 'eh_proj'",
+        load_weight_raw(&hfq, gpu, "eh_proj", n_embd, 2 * n_embd)
+    );
+    // Fault-injection seam (feature `frozen-fault-inject`): fail mid-upload
+    // so the staging rollback frees the norm + eh_proj owners already parked.
+    if crate::frozen_fault_inject::fail_stage() == Some("mtp_upload") {
+        return Err(staging.fail(gpu, "injected fault: mtp_upload".into()));
+    }
+    stage!(
+        wq,
+        "load weight 'wq'",
+        load_weight_raw(&hfq, gpu, "wq", q_full_dim, n_embd)
+    );
+    stage!(
+        wk,
+        "load weight 'wk'",
+        load_weight_raw(&hfq, gpu, "wk", kv_dim, n_embd)
+    );
+    stage!(
+        wv,
+        "load weight 'wv'",
+        load_weight_raw(&hfq, gpu, "wv", kv_dim, n_embd)
+    );
+    stage!(
+        wo,
+        "load weight 'wo'",
+        load_weight_raw(&hfq, gpu, "wo", n_embd, q_dim)
+    );
+    match config.ffn_kind {
+        Qwen35MtpFfnKind::Dense => {
+            stage!(
+                ffn_gate,
+                "load weight 'ffn_gate'",
+                load_weight_raw(&hfq, gpu, "ffn_gate", config.n_ff, n_embd)
+            );
+            stage!(
+                ffn_up,
+                "load weight 'ffn_up'",
+                load_weight_raw(&hfq, gpu, "ffn_up", config.n_ff, n_embd)
+            );
+            stage!(
+                ffn_down,
+                "load weight 'ffn_down'",
+                load_weight_raw(&hfq, gpu, "ffn_down", n_embd, config.n_ff)
+            );
+        }
         Qwen35MtpFfnKind::Moe => {
             assert_eq!(
                 config.num_experts_per_tok, 8,
                 "MoE MTP runtime currently supports top_k=8, got {}",
                 config.num_experts_per_tok
             );
-            Qwen35MtpFfnWeights::Moe(load_mtp_moe_ffn(&hfq, gpu, &config)?)
+            load_mtp_moe_ffn(&hfq, gpu, &config, &mut staging)?;
         }
-    };
+    }
 
     // ── Optional FastMTP-style compressed lm_head_draft + vocab map ────
     let has_compressed = meta
         .get("has_compressed_lm_head_draft")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    let (
-        lm_head_draft,
-        lm_head_draft_vocab_map,
-        lm_head_draft_vocab_map_gpu,
-        compressed_vocab_size,
-    ) = if has_compressed {
+    if has_compressed {
         let cvs = meta
             .get("compressed_vocab_size")
             .and_then(|v| v.as_u64())
             .expect("metadata claims has_compressed_lm_head_draft but lacks compressed_vocab_size")
             as usize;
         assert!(cvs > 0, "compressed_vocab_size must be positive");
-        let lm_d = load_weight_raw(&hfq, gpu, "lm_head_draft.weight", cvs, n_embd)?;
+        stage!(
+            lm_head_draft,
+            "load weight 'lm_head_draft.weight'",
+            load_weight_raw(&hfq, gpu, "lm_head_draft.weight", cvs, n_embd)
+        );
         let (vmap_info, vmap_bytes) = hfq
             .tensor_data_vec("lm_head_draft.vocab_map")
             .expect("compressed sidecar missing vocab_map tensor");
@@ -928,31 +1312,16 @@ pub fn load_mtp_head_at_offset(
             .chunks_exact(4)
             .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
-        let vmap_gpu = gpu.upload_raw(&vmap_bytes, &[vmap_bytes.len()])?;
-        (Some(lm_d), Some(vmap), Some(vmap_gpu), Some(cvs))
-    } else {
-        (None, None, None, None)
-    };
+        stage!(
+            vmap_gpu,
+            "upload lm_head_draft.vocab_map",
+            gpu.upload_raw(&vmap_bytes, &[vmap_bytes.len()])
+        );
+        staging.lm_head_draft_vocab_map = Some(vmap);
+        staging.compressed_vocab_size = Some(cvs);
+    }
 
-    let weights = Qwen35MtpHeadWeights {
-        shared_head_norm,
-        enorm,
-        hnorm,
-        attn_norm,
-        attn_post_norm,
-        attn_q_norm,
-        attn_k_norm,
-        eh_proj,
-        wq,
-        wk,
-        wv,
-        wo,
-        ffn,
-        lm_head_draft,
-        lm_head_draft_vocab_map,
-        lm_head_draft_vocab_map_gpu,
-        compressed_vocab_size,
-    };
+    let weights = staging.publish(config.ffn_kind);
 
     Ok(Qwen35MtpHead { config, weights })
 }
@@ -1041,7 +1410,8 @@ fn load_mtp_moe_ffn(
     hfq: &HfqFile,
     gpu: &mut Gpu,
     config: &Qwen35MtpHeadConfig,
-) -> HipResult<Qwen35MtpMoeFfnWeights> {
+    staging: &mut MtpHeadStaging,
+) -> Result<(), MtpHeadLoadError> {
     let n_exp = config.num_experts;
     let dim = config.n_embd;
     let mi = config.moe_intermediate_size;
@@ -1053,42 +1423,106 @@ fn load_mtp_moe_ffn(
         "MoE MTP config has shared_expert_intermediate_size=0"
     );
 
-    let router = load_weight_raw(hfq, gpu, "moe_router", n_exp, dim)?;
-    let shared_expert_gate = load_weight_raw(hfq, gpu, "moe_shared_expert_gate", 1, dim)?;
-    let shared_expert = Qwen35MtpMoeSharedExpertWeights {
-        gate: load_weight_raw(hfq, gpu, "moe_shared_gate", smi, dim)?,
-        up: load_weight_raw(hfq, gpu, "moe_shared_up", smi, dim)?,
-        down: load_weight_raw(hfq, gpu, "moe_shared_down", dim, smi)?,
-    };
+    macro_rules! stage {
+        ($slot:ident, $label:expr, $expr:expr) => {
+            match $expr {
+                Ok(v) => {
+                    staging.$slot = Some(v);
+                }
+                Err(e) => {
+                    return Err(staging.fail(gpu, format!("{}: {e}", $label)));
+                }
+            }
+        };
+    }
+
+    stage!(
+        moe_router,
+        "load weight 'moe_router'",
+        load_weight_raw(hfq, gpu, "moe_router", n_exp, dim)
+    );
+    stage!(
+        moe_shared_expert_gate,
+        "load weight 'moe_shared_expert_gate'",
+        load_weight_raw(hfq, gpu, "moe_shared_expert_gate", 1, dim)
+    );
+    stage!(
+        moe_shared_gate,
+        "load weight 'moe_shared_gate'",
+        load_weight_raw(hfq, gpu, "moe_shared_gate", smi, dim)
+    );
+    stage!(
+        moe_shared_up,
+        "load weight 'moe_shared_up'",
+        load_weight_raw(hfq, gpu, "moe_shared_up", smi, dim)
+    );
+    stage!(
+        moe_shared_down,
+        "load weight 'moe_shared_down'",
+        load_weight_raw(hfq, gpu, "moe_shared_down", dim, smi)
+    );
 
     let mut experts = Vec::with_capacity(n_exp);
     for x in 0..n_exp {
-        let gate_up = load_weight_raw(hfq, gpu, &format!("moe_experts.{x}.gate_up"), 2 * mi, dim)?;
-        let down = load_weight_raw(hfq, gpu, &format!("moe_experts.{x}.down"), dim, mi)?;
+        stage!(
+            moe_expert_inflight,
+            "load weight 'moe_experts.{x}.gate_up'",
+            load_weight_raw(hfq, gpu, &format!("moe_experts.{x}.gate_up"), 2 * mi, dim)
+        );
+        let gate_up = staging
+            .moe_expert_inflight
+            .take()
+            .expect("stage! just parked gate_up");
+        stage!(
+            moe_expert_inflight,
+            "load weight 'moe_experts.{x}.down'",
+            load_weight_raw(hfq, gpu, &format!("moe_experts.{x}.down"), dim, mi)
+        );
+        let down = staging
+            .moe_expert_inflight
+            .take()
+            .expect("stage! just parked down");
         experts.push(Qwen35MtpMoeExpertWeights { gate_up, down });
     }
+    // Park the completed experts in staging; `publish` moves them into the
+    // weights struct (single owner-handoff point, like the Dense FFN slots).
+    staging.moe_experts = experts;
 
     let mut gu_ptrs: Vec<u64> = Vec::with_capacity(n_exp);
     let mut dn_ptrs: Vec<u64> = Vec::with_capacity(n_exp);
-    for e in &experts {
+    for e in &staging.moe_experts {
         gu_ptrs.push(e.gate_up.buf.buf.as_ptr() as u64);
         dn_ptrs.push(e.down.buf.buf.as_ptr() as u64);
     }
     let gu_bytes: Vec<u8> = gu_ptrs.iter().flat_map(|p| p.to_ne_bytes()).collect();
     let dn_bytes: Vec<u8> = dn_ptrs.iter().flat_map(|p| p.to_ne_bytes()).collect();
-    let expert_gate_up_ptrs = gpu.alloc_tensor(&[2 * n_exp], DType::F32)?;
-    let expert_down_ptrs = gpu.alloc_tensor(&[2 * n_exp], DType::F32)?;
-    gpu.hip.memcpy_htod(&expert_gate_up_ptrs.buf, &gu_bytes)?;
-    gpu.hip.memcpy_htod(&expert_down_ptrs.buf, &dn_bytes)?;
-
-    Ok(Qwen35MtpMoeFfnWeights {
-        router,
-        shared_expert,
-        shared_expert_gate,
-        experts,
-        expert_gate_up_ptrs,
-        expert_down_ptrs,
-    })
+    stage!(
+        moe_gu_ptrs,
+        "alloc expert_gate_up_ptrs",
+        gpu.alloc_tensor(&[2 * n_exp], DType::F32)
+    );
+    stage!(
+        moe_dn_ptrs,
+        "alloc expert_down_ptrs",
+        gpu.alloc_tensor(&[2 * n_exp], DType::F32)
+    );
+    // memcpy is fallible; on failure the tables go BACK into staging so the
+    // rollback frees them (exact-retention, never dropped).
+    let expert_gate_up_ptrs = staging.moe_gu_ptrs.take().expect("stage! just parked");
+    let expert_down_ptrs = staging.moe_dn_ptrs.take().expect("stage! just parked");
+    if let Err(e) = gpu.hip.memcpy_htod(&expert_gate_up_ptrs.buf, &gu_bytes) {
+        staging.moe_gu_ptrs = Some(expert_gate_up_ptrs);
+        staging.moe_dn_ptrs = Some(expert_down_ptrs);
+        return Err(staging.fail(gpu, format!("memcpy expert_gate_up_ptrs: {e}")));
+    }
+    if let Err(e) = gpu.hip.memcpy_htod(&expert_down_ptrs.buf, &dn_bytes) {
+        staging.moe_gu_ptrs = Some(expert_gate_up_ptrs);
+        staging.moe_dn_ptrs = Some(expert_down_ptrs);
+        return Err(staging.fail(gpu, format!("memcpy expert_down_ptrs: {e}")));
+    }
+    staging.moe_gu_ptrs = Some(expert_gate_up_ptrs);
+    staging.moe_dn_ptrs = Some(expert_down_ptrs);
+    Ok(())
 }
 
 /// Cross-check the on-disk shape against the caller's expected (m, k).
@@ -1603,6 +2037,7 @@ pub fn mtp_head_forward_block_only_with_pos_buf(
         tree_bias: None,
         block_start: 0,
         block_cols: 0,
+        output_gate: None,
         output: &scratch.attn_out,
     };
     hipfire_dispatch::pipeline::execute_steps(
@@ -1859,7 +2294,7 @@ pub fn mtp_head_apply_lm_head_batched(
             // the head lm_head is ALSO scalar today — gets the fix too. WMMA
             // needs wave32 (gfx11+) and K%32==0; else fall back to scalar.
             // Opt out with HIPFIRE_MTP_HEAD_LMHEAD_WMMA=0.
-            let use_wmma = std::env::var("HIPFIRE_MTP_HEAD_LMHEAD_WMMA")
+            let use_wmma = hipfire_config::developer_var("HIPFIRE_MTP_HEAD_LMHEAD_WMMA")
                 .ok()
                 .as_deref()
                 != Some("0")

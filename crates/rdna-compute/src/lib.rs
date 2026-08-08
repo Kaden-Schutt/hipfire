@@ -10,6 +10,10 @@ mod compiler;
 mod dispatch;
 pub mod embedding;
 pub mod feature_flags;
+/// Test-only free-failure injection for `Gpu::free_tensor_checked`
+/// (feature `frozen-fault-inject`). Never compiled into production builds.
+#[cfg(feature = "frozen-fault-inject")]
+pub mod frozen_fault_inject;
 pub mod gemm;
 pub mod gemv;
 pub mod graph;
@@ -20,13 +24,14 @@ pub mod pool;
 pub mod profile;
 pub mod profile_rocprof;
 pub mod profiler;
+pub mod replay;
 pub mod sampling;
 pub mod scratch;
 
 pub use compiler::KernelCompiler;
 pub use dispatch::{
-    gen_fwht_signs, BlockHessianAcc, DType, Gpu, GpuTensor, HessianCapture, LLOYD_MQ3_GROUP_BYTES,
-    LLOYD_MQ4_GROUP_BYTES, MMQ_CURRENT_LAYER,
+    gen_fwht_signs, AllocationDomainId, BlockHessianAcc, DType, Gpu, GpuTensor, HessianCapture,
+    LLOYD_MQ3_GROUP_BYTES, LLOYD_MQ4_GROUP_BYTES, MMQ_CURRENT_LAYER,
 };
 pub use feature_flags::FeatureFlags;
 pub use kernels::GEMV_SRC;

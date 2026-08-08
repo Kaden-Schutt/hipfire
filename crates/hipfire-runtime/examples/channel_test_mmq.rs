@@ -6,7 +6,7 @@
 //!
 //! Compares i8 WMMA + Q8_1 (MMQ) output against f16 WMMA output at each
 //! GEMM call site in a transformer layer to diagnose which site/channel/layer
-//! causes tool-call output corruption (ref: Kaden-Schutt/hipfire#87).
+//! causes tool-call output corruption (ref: warpfront/hipfire#87).
 //!
 //! # Usage
 //!

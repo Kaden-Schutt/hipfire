@@ -19,12 +19,11 @@
 //! `decode_step` naturally applies the right windowed or full-causal attention
 //! mask for the current token's position. The "parallel block" structure of
 //! Cohere2-MoE (single RMSNorm feeding BOTH attention AND FFN branches) does
-//! not help here because `forward_batch` uses a different scratch layout, and
-//! building a windowed-mask batched verify for the verification use-case (B
-//! tokens from position P, each attending `[0..P+i]`) would require a new
-//! attention kernel that replicates the sliding-window mask across the batch
-//! axis. That batched verify path is an explicit FOLLOW-UP; the sequential
-//! path is the correct, zero-risk baseline and is deployed here.
+//! not help here because `forward_batch` uses a different scratch layout for
+//! causal-within-block verification. Cold speculative prefill is different:
+//! it uses the same chunked `forward_batch` path as AR, selected by the
+//! explicit cold-start signal, so the first speculative token remains
+//! numerically parity-aligned.
 //!
 //! NOTE (follow-up): a block-parallel `forward_batch`-based verify could
 //! reuse the existing `attention_flash_q8_0_windowed` path with a
@@ -40,6 +39,7 @@
 use crate::cohere2moe::{Cohere2MoeState, Cohere2MoeWeights};
 use crate::config::Cohere2MoeConfig;
 use crate::forward;
+use hipfire_runtime::gpu_cleanup::{BundleTeardown, GpuCleanupFailure};
 use hipfire_runtime::spec::{SpecAdvance, SpecScratch, SpecTarget};
 use rdna_compute::Gpu;
 
@@ -63,6 +63,69 @@ pub struct Cohere2MoeBundle {
     pub eos_tok: u32,
 }
 
+impl Cohere2MoeBundle {
+    fn advance(
+        &mut self,
+        gpu: &mut Gpu,
+        tokens: &[u32],
+        start_pos: usize,
+        cold_start: bool,
+        abort: &dyn Fn() -> bool,
+    ) -> Result<SpecAdvance, String> {
+        self.state.n_tokens = start_pos;
+        if use_batched_cold_prefill(
+            cold_start,
+            tokens.len(),
+            forward::forward_batch_supported(&self.weights),
+        ) {
+            let mut last_logits = Vec::new();
+            let mut offset = 0;
+            while offset < tokens.len() {
+                if abort() {
+                    return Ok(SpecAdvance::Aborted);
+                }
+                let end = (offset + 256).min(tokens.len());
+                let pos = self.state.n_tokens;
+                last_logits = forward::forward_batch(
+                    &self.config,
+                    &self.weights,
+                    &mut self.state,
+                    gpu,
+                    &tokens[offset..end],
+                    pos,
+                )
+                .map_err(|e| format!("{e:?}"))?;
+                offset = end;
+            }
+            let last_argmax = last_logits
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|(idx, _)| idx as u32)
+                .unwrap_or(0);
+            return Ok(SpecAdvance::Ready {
+                last_argmax,
+                last_logits: Some(last_logits),
+            });
+        }
+        for &tok in tokens {
+            if abort() {
+                return Ok(SpecAdvance::Aborted);
+            }
+            let pos = self.state.n_tokens as u32;
+            forward::decode_step(&self.config, &self.weights, &mut self.state, gpu, tok, pos)
+                .map_err(|e| format!("{e:?}"))?;
+        }
+        let last_argmax = gpu
+            .argmax_f32(&self.state.logits, self.config.vocab_size)
+            .map_err(|e| format!("{e:?}"))?;
+        Ok(SpecAdvance::Ready {
+            last_argmax,
+            last_logits: None,
+        })
+    }
+}
+
 /// Cohere2-MoE verify scratch: nothing persistent. Pure attention — no
 /// recurrent state to snapshot between windows. The verify reuses the
 /// bundle's own `Cohere2MoeState` scratch (dense GQA + MoE, no DeltaNet).
@@ -81,18 +144,13 @@ impl SpecTarget for Cohere2MoeBundle {
         self
     }
 
-    fn reset_recurrent(&mut self, gpu: &mut Gpu) {
+    fn reset_recurrent(&mut self, gpu: &mut Gpu) -> Result<(), String> {
         // Pure attention: no recurrent state to zero. Clear the KV cache and
         // rewind the position cursor so the next prefill writes from slot 0.
         // Mirrors the daemon's arch_id=12 reset handler.
-        //
-        // Note: `Cohere2MoeState::reset` takes `&mut Gpu` because it zeros the
-        // KV buffers on device (unlike qwen2's cursor-only rewind). We ignore
-        // the GPU error here (alloc failures on a zero-size memset are
-        // structurally impossible; log-and-continue is the codebase pattern).
-        if let Err(e) = self.state.reset(gpu) {
-            eprintln!("cohere2moe spec reset_recurrent: {e}");
-        }
+        self.state
+            .reset(gpu)
+            .map_err(|e| format!("cohere2moe reset_recurrent: {e}"))
     }
 
     fn new_spec_scratch(
@@ -112,72 +170,37 @@ impl SpecTarget for Cohere2MoeBundle {
         abort: &dyn Fn() -> bool,
         _hidden_out: Option<&mut Vec<f32>>,
     ) -> Result<SpecAdvance, String> {
-        // Pure attention: "reset" clears KV and rewinds the position cursor;
-        // the per-token decode_step then overwrites KV at the absolute positions.
         if reset {
-            self.state
-                .reset(gpu)
+            self.reset_recurrent(gpu)
                 .map_err(|e| format!("cohere2moe spec_advance reset: {e}"))?;
         }
-        self.state.n_tokens = start_pos;
-        // Bulk prefill (reset path): mirror the AR `generate_cohere2moe` BATCHED
-        // `forward_batch` chunked prefill so the spec path's KV is numerically
-        // identical to AR's. Per-token `decode_step` prefill is *correct* but not
-        // bit-identical to batched (different GEMM accumulation) — enough to drift
-        // greedy decode a few tokens in. `forward_batch` advances `state.n_tokens`
-        // internally (= start+b) and returns the last position's host logits.
-        if reset && tokens.len() > 1 && forward::forward_batch_supported(&self.weights) {
-            let mut last_logits: Vec<f32> = Vec::new();
-            let mut i = 0;
-            while i < tokens.len() {
-                if abort() {
-                    self.state
-                        .reset(gpu)
-                        .map_err(|e| format!("cohere2moe spec_advance abort reset: {e}"))?;
-                    return Ok(SpecAdvance::Aborted);
-                }
-                let end = (i + 256).min(tokens.len());
-                let start = self.state.n_tokens;
-                last_logits = forward::forward_batch(
-                    &self.config,
-                    &self.weights,
-                    &mut self.state,
-                    gpu,
-                    &tokens[i..end],
-                    start,
-                )
-                .map_err(|e| format!("{e:?}"))?;
-                i = end;
-            }
-            // Host argmax over the final position's logits (greedy first seed) —
-            // matches AR's `sample_token(temp=0)` on the same `forward_batch` output.
-            let last_argmax = last_logits
-                .iter()
-                .enumerate()
-                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
-                .map(|(idx, _)| idx as u32)
-                .unwrap_or(0);
-            return Ok(SpecAdvance::Ready { last_argmax });
-        }
-        for &tok in tokens {
-            if abort() {
-                self.state
-                    .reset(gpu)
-                    .map_err(|e| format!("cohere2moe spec_advance abort reset: {e}"))?;
-                return Ok(SpecAdvance::Aborted);
-            }
-            let pos = self.state.n_tokens as u32;
-            forward::decode_step(&self.config, &self.weights, &mut self.state, gpu, tok, pos)
-                .map_err(|e| format!("{e:?}"))?;
-            // `decode_step` (via `decode_step_body`) already sets
-            // `state.n_tokens = position + 1`; do NOT advance again or the cursor
-            // double-steps (KV scattered across 0,2,4,… → corrupt context).
-        }
-        // decode_step leaves the logits in state.logits. Take the argmax.
-        let last_argmax = gpu
-            .argmax_f32(&self.state.logits, self.config.vocab_size)
-            .map_err(|e| format!("{e:?}"))?;
-        Ok(SpecAdvance::Ready { last_argmax })
+        self.advance(gpu, tokens, start_pos, false, abort)
+    }
+
+    fn spec_advance_cold_start(
+        &mut self,
+        gpu: &mut Gpu,
+        tokens: &[u32],
+        start_pos: usize,
+        cold_start: bool,
+        abort: &dyn Fn() -> bool,
+        _hidden_out: Option<&mut Vec<f32>>,
+    ) -> Result<SpecAdvance, String> {
+        eprintln!(
+            "[cohere-spec-prefill] mode={} cold_start={} token_count={}",
+            if use_batched_cold_prefill(
+                cold_start,
+                tokens.len(),
+                forward::forward_batch_supported(&self.weights),
+            ) {
+                "batched"
+            } else {
+                "per_token"
+            },
+            cold_start,
+            tokens.len(),
+        );
+        self.advance(gpu, tokens, start_pos, cold_start, abort)
     }
 
     fn verify_block(
@@ -240,4 +263,48 @@ impl SpecTarget for Cohere2MoeBundle {
     // kv_cache_mut: default None — Cohere2MoeState is not a `llama::KvCache`,
     // and arch_id=12 has no FlashCASK eviction (the daemon's eviction sites
     // are `if let Some(ev)`-gated, so this is never reached).
+}
+
+fn use_batched_cold_prefill(cold_start: bool, token_count: usize, supported: bool) -> bool {
+    cold_start && token_count > 1 && supported
+}
+
+impl BundleTeardown for Cohere2MoeBundle {
+    /// Generic checked teardown the loader dispatches on: frees weights then
+    /// state, each with CHECKED frees. Owners that survive are carried in the
+    /// returned [`GpuCleanupFailure`] for exact-retention retry — no
+    /// best-effort free is used as a correctness mechanism.
+    fn free_checked(self, gpu: &mut Gpu) -> Result<(), GpuCleanupFailure> {
+        let Cohere2MoeBundle {
+            config: _,
+            weights,
+            state,
+            eos_tok: _,
+        } = self;
+        let mut cf = GpuCleanupFailure::empty();
+        if let Err(f) = weights.free_checked(gpu) {
+            cf.merge(f);
+        }
+        if let Err(f) = state.free_checked(gpu) {
+            cf.merge(f);
+        }
+        if cf.is_empty() {
+            Ok(())
+        } else {
+            Err(cf)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::use_batched_cold_prefill;
+
+    #[test]
+    fn speculative_cold_prefill_matches_batched_ar_only_on_cold_multi_token_span() {
+        assert!(use_batched_cold_prefill(true, 8, true));
+        assert!(!use_batched_cold_prefill(false, 8, true));
+        assert!(!use_batched_cold_prefill(true, 1, true));
+        assert!(!use_batched_cold_prefill(true, 8, false));
+    }
 }

@@ -743,13 +743,61 @@ fn gemv_family_resolves_mq3_prerotated_on_all_wave32_archs_not_cdna() {
     // gate is now HasWave32 (was HasWmma), so it resolves on every RDNA gen
     // (RDNA1/2/3/4) but still NOT on CDNA wave64 (a [32,1,1] kernel needs wave32).
     let fam = GemvFamily::new();
-    assert!(fam.resolve(DType::MQ3G256, GemvVariant::Prerotated, false, &ctx_rdna1(), None).is_ok());
-    assert!(fam.resolve(DType::MQ3G256, GemvVariant::Prerotated, false, &ctx_rdna2(), None).is_ok());
-    assert!(fam.resolve(DType::MQ3G256, GemvVariant::Prerotated, false, &ctx_rdna3(), None).is_ok());
-    assert!(fam.resolve(DType::MQ3G256, GemvVariant::Prerotated, false, &ctx_rdna4(), None).is_ok());
+    assert!(fam
+        .resolve(
+            DType::MQ3G256,
+            GemvVariant::Prerotated,
+            false,
+            &ctx_rdna1(),
+            None
+        )
+        .is_ok());
+    assert!(fam
+        .resolve(
+            DType::MQ3G256,
+            GemvVariant::Prerotated,
+            false,
+            &ctx_rdna2(),
+            None
+        )
+        .is_ok());
+    assert!(fam
+        .resolve(
+            DType::MQ3G256,
+            GemvVariant::Prerotated,
+            false,
+            &ctx_rdna3(),
+            None
+        )
+        .is_ok());
+    assert!(fam
+        .resolve(
+            DType::MQ3G256,
+            GemvVariant::Prerotated,
+            false,
+            &ctx_rdna4(),
+            None
+        )
+        .is_ok());
     // CDNA wave64 (gfx906) still excluded by HasWave32.
-    assert!(fam.resolve(DType::MQ3G256, GemvVariant::Prerotated, false, &ctx_gfx906(), None).is_err());
-    assert!(fam.resolve(DType::MQ4G256, GemvVariant::Prerotated, false, &ctx_rdna2(), None).is_ok());
+    assert!(fam
+        .resolve(
+            DType::MQ3G256,
+            GemvVariant::Prerotated,
+            false,
+            &ctx_gfx906(),
+            None
+        )
+        .is_err());
+    assert!(fam
+        .resolve(
+            DType::MQ4G256,
+            GemvVariant::Prerotated,
+            false,
+            &ctx_rdna2(),
+            None
+        )
+        .is_ok());
     // F32 Prerotated now falls back to GemvF32 (rotation-free dtype → plain key).
     // It resolves on any arch because GemvF32 has no arch gate.
     assert!(fam
@@ -818,6 +866,8 @@ fn dtypes_all_mq4() -> MoeDtypes {
         routed_down: DType::MQ4G256,
         routed_has_mixed_experts: false,
         has_paro_shared: false,
+        gate_side_has_awq: false,
+        routed_down_has_awq: false,
         per_expert_gate_up: None,
         per_expert_down: None,
     }
@@ -865,6 +915,35 @@ fn moe_res_mq5_routed_indexable() {
     assert!(!r.routed_indexable_mq4);
     assert!(!r.routed_indexable_mq6);
     assert!(r.use_gpu_topk);
+}
+
+#[test]
+fn moe_res_e8_routed_indexable_consistent_when_admitted() {
+    // E8 routed experts (MFP4G32E8/MFP4G32E8) are indexable ONLY on the
+    // RDNA3 wave32-WMMA family (`arch_has_e8_wmma`). `routed_indexable()`
+    // must report admitted E8 consistently with the per-flag accessors.
+    let d = MoeDtypes {
+        routed_gate_up: DType::MFP4G32E8,
+        routed_down: DType::MFP4G32E8,
+        experts_all_gate_up_mq4: false,
+        ..dtypes_all_mq4()
+    };
+    // Arch-agnostic resolve() never admits E8 (no wave32-WMMA).
+    let r0 = MoeResolution::resolve(&d, 8);
+    assert!(!r0.routed_indexable_e8, "E8 requires wave32-WMMA admission");
+    assert!(!r0.use_gpu_topk, "unadmitted E8 must not use GPU top-K");
+    assert!(
+        !r0.routed_indexable(),
+        "unadmitted E8 must not be reported indexable"
+    );
+    // Admitted E8 (wave32-WMMA family) must be consistently indexable.
+    let r1 = MoeResolution::resolve_arch(&d, 8, true);
+    assert!(r1.routed_indexable_e8);
+    assert!(r1.use_gpu_topk);
+    assert!(
+        r1.routed_indexable(),
+        "admitted E8 must be included in routed_indexable()"
+    );
 }
 
 #[test]
@@ -1328,6 +1407,8 @@ fn moe_dtypes_mq4() -> MoeDtypes {
         routed_down: DType::MQ4G256,
         routed_has_mixed_experts: false,
         has_paro_shared: false,
+        gate_side_has_awq: false,
+        routed_down_has_awq: false,
         per_expert_gate_up: None,
         per_expert_down: None,
     }
@@ -1351,7 +1432,7 @@ fn moe_dtypes_paro() -> MoeDtypes {
 }
 
 fn flags_default() -> rdna_compute::feature_flags::FeatureFlags {
-    rdna_compute::feature_flags::FeatureFlags::from_env_for_test("gfx1100")
+    rdna_compute::feature_flags::FeatureFlags::for_test("gfx1100")
 }
 
 #[test]

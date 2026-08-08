@@ -61,6 +61,18 @@ pub mod qwen35;
 mod spec_impl;
 #[cfg(feature = "deltanet")]
 pub mod speculative;
+#[cfg(feature = "deltanet")]
+pub mod store;
+/// Test-only access to the unchanged legacy Qwen3.5 forward sequence.
+#[cfg(feature = "test-utils")]
+pub mod test_utils;
+
+/// Emulated EP2 harness (STEP-002 Task 8, Phase 2B): high-level
+/// Single-vs-EP2 parity driver over the one-owner Frozen path.  Test-only,
+/// non-default feature; exposes only `Ep2HarnessOptions`, `Ep2HarnessReport`,
+/// and `run` — no store/tensor/raw-ownership types.
+#[cfg(feature = "emulated-ep2-harness")]
+pub mod ep2_harness;
 
 /// Grammar-guided decoding for qwen35 tool-call format. Independent of
 /// the deltanet feature gate — pure data-structure work, no GPU
@@ -72,12 +84,22 @@ pub mod grammar;
 /// drives the qwen35 `grammar` matcher. Built via [`spec_emit::Qwen35Emit::from_ctx`].
 pub mod spec_emit;
 
+/// Env-var-driven fault injection for the Frozen construction path. Compiles
+/// to a constant `None` in production builds (feature `frozen-fault-inject`).
+mod frozen_fault_inject;
+
 #[cfg(feature = "deltanet")]
 pub use arch::Qwen35;
 
 #[cfg(feature = "deltanet")]
-pub use carrier::{load_bundle as load_qwen35_bundle, Qwen35Bundle};
+pub use carrier::{free_qwen35_bundle, load_bundle as load_qwen35_bundle, Qwen35Bundle};
 #[cfg(feature = "deltanet")]
 pub use mtp_compose::{spec_step_dflash_mtp_tree, MtpComposeTreeResult, MtpComposeTreeState};
 #[cfg(feature = "deltanet")]
 pub use mtp_speculator::{build_qwen35_mtp_speculator, Qwen35MtpDrafter};
+#[cfg(feature = "deltanet")]
+pub use store::{
+    load_qwen35_hfq_weights, load_qwen35_paro_weights, preflight_qwen35_frozen,
+    Qwen35FrozenIneligible, Qwen35FrozenPlan, Qwen35FrozenPreflight, Qwen35LoadError,
+    Qwen35MoeLoadFlags,
+};

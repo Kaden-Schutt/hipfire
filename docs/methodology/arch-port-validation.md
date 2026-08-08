@@ -3,142 +3,241 @@ SPDX-License-Identifier: Apache-2.0
 Copyright (c) 2026 Kaden Schutt
 hipfire — see LICENSE and NOTICE in the project root.
 -->
-# Architecture-port validation methodology
 
-How to bring up a new model architecture in hipfire and **prove the forward
-pass is correct cheaply** — before spending GPU-hours quantizing the real
-weights or chasing coherence on a 200B model. This is the method used for the
-MiniMax-M2 port (2026-05-29); it caught 3 real bugs in seconds-per-iteration on
-a tiny model with no GPU-hours wasted.
+# Architecture-port validation
 
-> TL;DR: build a **dimension-faithful tiny random-weight oracle** from the
-> *reference* implementation, compare **per-layer hidden states** (not final
-> logits), and when a layer diverges, **bisect within the layer** and
-> **precision-sweep** to separate a real arch bug from quantization noise.
+Evidence tiers for **GPU arch** ports (RDNA/CDNA kernel/dispatch routes)
+and **model-arch** forward bring-up. This file is procedure and pitfall
+guidance only.
 
-## Why this works
+| Field | Value |
+|---|---|
+| Inventory date | 2026-07-19 |
+| Audited source ref | `692a726dde53508cb53de1a74c720e75a7c9f33e` |
+| Route selector | [`docs/VALIDATION.md`](../VALIDATION.md) |
+| Executable GPU-arch skill | [`.agents/skills/hipfire-arch-port/`](../../.agents/skills/hipfire-arch-port/) |
+| ISA / fit-view skill | [`.agents/skills/hipfire-kernel-atlas/`](../../.agents/skills/hipfire-kernel-atlas/) |
 
-A new arch port is mostly *plumbing existing kernels in the right order*. The
-failure modes are: wrong norm convention, wrong RoPE convention, wrong
-gate/up split, wrong routing math, a kernel-shape/`k_top` mismatch, a
-dtype/rotation mismatch. **All of these produce a per-layer cosine well below
-1.0; quantization noise does not.** So a per-layer cosine harness against a
-trusted reference localizes the bug to a layer and a sub-block in minutes.
+**Rules**
 
-Doing this on a *tiny* model (2 layers, hidden 256) means each iteration is
-~5 s and needs no real weights — you decouple *arch correctness* from *weight
-download* and *quantization quality*.
+1. Pick routes only from [`VALIDATION.md`](../VALIDATION.md). This page
+   does not invent gates.
+2. There is **no universal replacement gate** and **no C/A attestation**.
+3. `scripts/coherence-gate-*.sh` batteries are **retired as acceptance**
+   (historical reproduction only). Do not require them for merge,
+   promotion, or arch-port certification language.
+4. Hardware-unwitnessed paths are **blocked**, not assumed green.
+5. A green automatic no-GPU CI run is never GPU-arch proof.
 
-## The loop
+---
 
-1. **Build a tiny reference oracle from the reference implementation.**
-   Use the HF `transformers` (or upstream) modeling code — the *ground truth* —
-   to instantiate a small random-weight model and dump its per-layer hidden
-   states. Use `scripts/gen_tiny_oracle.py` (adapt the per-arch block). Critical
-   dim rules (see Pitfalls): keep the *real* `head_dim`/`rotary_dim`, make every
-   2D weight `k % group_size == 0`, and match any **hardcoded kernel `k_top`**.
+## What “arch port” means here
 
-2. **Dump per-layer POST-residual hidden states from both sides** in the shared
-   `HFHS` binary format (`magic "HFHS\0\0\0\0"`, `<IIII>` = n_layers, n_pos,
-   hidden, reserved, then `n_layers × [n_pos, hidden]` f32, row-major). The HF
-   side is in the gen script; the hipfire side is a tiny example mirroring
-   `crates/hipfire-arch-*/examples/dump_*_hidden_states.rs` (run `decode_step`
-   per position with a per-layer capture hook). Convention: capture the
-   residual **after each decoder layer, before the final norm** — match it on
-   both sides.
+Two orthogonal surfaces share this methodology owner:
 
-3. **Compare with `scripts/compare_hidden_states.py`.** It prints per-layer
-   `rms`, `rel_L2`, `mean_cos`, `min_cos`. Read the drift profile:
-   - cosine ≈ 1.0 (≥0.999 for Q8-grade, ≥0.99 for 4-bit experts) → correct.
-   - cosine flat across layers but < 1 → uniform per-layer error (quant noise
-     *or* a per-layer systematic bug — disambiguate in step 5).
-   - cosine craters at a specific layer / compounds → structural bug there.
+| Surface | Meaning | Primary evidence |
+|---|---|---|
+| **GPU arch** | New/changed `gfx*` routing in kernels, `dispatch.rs`, WMMA/MFMA builtins | Channel + speed (+ path oracle when the change can break numbers) |
+| **Model arch** | New/changed forward for a model family (`hipfire-arch-*`) | Path-specific hidden-state / logit / state parity; serve only for user-facing semantics |
 
-4. **Bisect within the diverging layer.** Add a second capture point (e.g.
-   post-attention, pre-MoE) gated by an env var, and dump the **isolated
-   block output** (`block_out = post_block − pre_block`). MiniMax: post-attn
-   was 0.9999 (attention correct) but isolated `moe_out` cosine was 0.07
-   (orthogonal) → the bug was entirely in the MoE.
+WMMA operand shapes, builtin names, and lane layouts live in the
+arch-port skill (`wmma-matrix.md`), not here.
 
-5. **Precision-sweep to separate quant-noise from arch-bug.** Re-quantize the
-   suspect block at a *higher* precision (e.g. 4-bit → 6-bit) and re-compare.
-   - error shrinks ∝ precision → it was quant noise; the arch is fine.
-   - error **unchanged** → structural bug, independent of bit-width. (MiniMax:
-     MQ4→MQ6 didn't move the 0.96 → proved it wasn't quant.)
+---
 
-6. **Stage-dump + cross-check in Python to root-cause.** Dump the block's
-   intermediates (router logits, top-k indices/weights, gate/up, down) from
-   hipfire and recompute the *same* in numpy/torch from the F32 weights.
-   Compare each stage; the first stage that diverges is the bug. (MiniMax:
-   routing indices matched but logits were 30× → F16 router hit the lm-head
-   GEMM kernel; later, the expert gate matched but the final output was
-   orthogonal + **non-deterministic** → a hardcoded-`k8` kernel reading past a
-   top-2 buffer.)
+## Evidence tiers (fail closed)
 
-7. **Resolve ambiguities by reading the kernel/dispatch source, not guessing.**
-   RoPE convention (rotate_half vs interleaved), `route_scale`, FWHT-rotation
-   matching between quantizer and `rotate_x_mq`, FP8 dequant multiply-vs-divide
-   — every one was verified against the `.hip` kernel or a numeric reference
-   (e.g. dequant a real tensor in torch → check the distribution is sane)
-   before trusting it.
+Use the **narrowest** tier set that covers the changed surface. Higher
+tiers do not replace lower ones when lower ones apply.
 
-## Pitfall checklist (bake into the tiny-oracle dims)
+### Tier C — Kernel channel (GPU numeric)
 
-These are the traps that cost iterations on MiniMax — encode them in the tiny
-config so they can't bite:
+| Item | Path / command |
+|---|---|
+| Wrapper | [`scripts/test-kernels.sh`](../../scripts/test-kernels.sh) `[arch]` |
+| QA wrapper | [`scripts/test-kernelsQA.sh`](../../scripts/test-kernelsQA.sh) `[arch]` |
+| Binaries | `cargo build --release --features deltanet -p hipfire-runtime --example test_kernels --example test_kernelsQA` then `./target/release/examples/test_kernels` / `test_kernelsQA` |
+| Role | Element-wise GPU vs CPU reference on the **detected** arch. Catches silent WMMA/MFMA C-mapping bugs that throughput and chat smoke miss. |
+| Not this tier | Dispatch `bind_thread` coverage ([`scripts/verify-bind-thread.sh`](../../scripts/verify-bind-thread.sh)); model coherence; perf floors. |
 
-- **Match hardcoded kernel `k_top`.** The indexed-MoE GEMV kernels are often
-  hardcoded (`_k8_` → top-8) with no `k_top` parameter. A tiny model with a
-  *different* top-k overflows the output buffers and reads garbage
-  (non-deterministic!). Set the tiny `num_experts_per_tok` to the kernel's
-  hardcoded value (and `num_local_experts` > k_top for real sparsity).
-- **`k % group_size == 0`** for every quantized 2D weight (G256 → every dim a
-  multiple of 256). The expert intermediate is the usual offender; size the
-  tiny model so even the down projection is divisible.
-- **Use the real `head_dim` / `rotary_dim`.** Attention/RoPE kernels are tuned
-  for specific head_dim (e.g. 128); a tiny `head_dim=32` may hit an untested
-  path. Shrink the *number* of heads/layers, not head_dim.
-- **Keep routing/precision-sensitive tensors at Q8, never F16.** `weight_gemv`'s
-  F16 arm dispatches the lm-head batched GEMM kernel, which is wrong for a
-  router's tiny output dim (m = n_experts). Q8 (`gemv_q8_0`) is well-behaved at
-  any m.
-- **The reference oracle must match the *runtime* layout.** If the HF modeling
-  stores experts packed (`gate_up_proj [E,2I,H]`) but your loader/kernels want
-  split (`experts.E.w1/w2/w3`), re-split the saved tensors so the oracle and
-  hipfire consume the same numbers (numerically identical, just reorganized).
-- **Standard vs Gemma RMSNorm.** Check whether the norm is `weight * x̂` or
-  `(1+weight) * x̂` before loading norm weights; a wrong `+1` corrupts every
-  layer uniformly.
+**Arch argument caveat:** `test-kernels.sh [arch]` does **not** select or
+assert the GPU under test. The optional argument only changes the wrapper
+banner (`=== hipfire kernel test harness (${ARCH}) ===`); the binary
+independently detects and prints the real GPU. Always confirm the binary’s
+detected arch in the run log. When an expected-arch assertion is required,
+use `test-kernelsQA.sh <arch>` (passes `--expected-arch` to the QA binary).
 
-## Reusable artifacts
+**Pass:** every exercised case reports OK/PASS; any FAIL/MISMATCH blocks
+the port for that kernel.
 
-- `scripts/gen_tiny_oracle.py` — generalized tiny-oracle generator (adapt the
-  marked per-arch block: config builder, the post-attention hook module path,
-  any packed→split re-split). `scripts/gen_tiny_minimax.py` is the worked
-  example.
-- `scripts/compare_hidden_states.py` — arch-agnostic HFHS comparator.
-- `crates/hipfire-arch-*/examples/dump_*_hidden_states.rs` — the hipfire-side
-  per-layer dumper pattern (clone per arch; ~80 lines: load HFQ, per-token
-  `decode_step` with a `capture: &mut [Vec<f32>]` hook, write HFHS).
+### Tier P — Path-specific parity / state oracle (model or fusion)
 
-## When this does NOT generalize
+| Item | Path |
+|---|---|
+| Comparator | [`scripts/compare_hidden_states.py`](../../scripts/compare_hidden_states.py) |
+| Tiny oracles | [`scripts/gen_tiny_oracle.py`](../../scripts/gen_tiny_oracle.py), worked: [`scripts/gen_tiny_minimax.py`](../../scripts/gen_tiny_minimax.py), [`scripts/gen_tiny_lfm2moe.py`](../../scripts/gen_tiny_lfm2moe.py) |
+| HF dump helper | [`scripts/dump_hf_hidden_states.py`](../../scripts/dump_hf_hidden_states.py) |
+| Hipfire dumpers (examples) | `crates/hipfire-arch-*/examples/dump_*_hidden_states.rs` (e.g. minimax, lfm2moe, qwen35 in runtime examples) |
+| Graph / batch oracles (when present) | Arch-owned examples such as `graph_parity_*`, `prefill_batch_parity`, `conv1d_*_parity` under the touched crate |
 
-This validates *plumbing* against existing kernels. It assumes the new arch
-**maps onto kernels that already exist** (attention family × MoE/quant family).
-MiniMax-M2 needed **zero new kernels** — that was the enabler. An arch that
-needs a *new* HIP kernel (e.g. a quant format with no indexed-decode MoE GEMV)
-needs kernel-level oracles too, and the cosine harness can only validate it
-once that kernel exists. Map the closest existing arch + the shared helpers
-(via a codebase survey) *before* writing, to confirm the kernel coverage.
+**Role:** per-layer hidden-state cosine / rel-L2, final-token logit
+parity, KV/conv/`n_tokens` state parity — whatever the oracle for that
+surface defines.
 
-## Worked example: MiniMax-M2 (arch_id 10)
+**Blocked:** if no oracle exists for the changed surface, numerical
+parity is **blocked**. Do not substitute
+[`scripts/serve_harness.py`](../../scripts/serve_harness.py) or retired
+coherence-gate scripts for parity.
 
-- Template: qwen35 GQA attention + deepseek4 sigmoid-bias MoE routing, **0 new
-  kernels**.
-- Oracle: HF `transformers` `MiniMaxM2`, tiny (2L, hidden 256, **head_dim 128 /
-  rotary 64**, inter 256 [÷256], **16 experts top-8** [matches `_k8`]), packed→split.
-- Bugs caught: (1) tiny used top-2 vs hardcoded-k8 kernel → buffer overflow;
-  (2) F16 router → lm-head GEMM kernel → 30× logits; (3) initial confusion
-  between quant-noise and bug, resolved by the MQ4→MQ6 precision sweep.
-- Result: per-layer cosine **0.9996** (mq4 experts) / **0.9987** (mq2-lloyd),
-  attention isolated 0.99990, routing exact — all on a tiny model, no GPU-hours.
+Cosine guidance used on prior ports (not universal floors): ~≥0.999
+Q8-grade plumbing; ~≥0.99 common for 4-bit expert noise once structure
+is right. Always state the tol the oracle/docs for that format define.
+
+### Tier S — Speed floor (when a baseline file exists)
+
+| Item | Path |
+|---|---|
+| Script | [`scripts/speed-gate.sh`](../../scripts/speed-gate.sh) |
+| Baselines | [`tests/speed-baselines/<arch>.txt`](../../tests/speed-baselines/) |
+| Bench binary | `./target/release/examples/bench_qwen35_mq4` (built by the script) |
+| Modes | default all sizes; `--fast` (4B-oriented); `--update-baselines`; `--tolerance`; `--verbose` |
+
+**Present baseline files (inventory):** `gfx1013`, `gfx1030`, `gfx1031`,
+`gfx1100`, `gfx1100x2_pp`, `gfx1151`, `gfx1201`, `gfx906`, `gfx908`,
+`gfx942`.
+
+**Role:** prefill/decode vs committed floor for the **detected** arch
+(`HIPFIRE_BASELINE_ARCH` / probe). Default tolerance 5% unless overridden.
+
+**Blocked / not certification:**
+
+- No matching `tests/speed-baselines/<arch>.txt` → speed-floor claim for
+  that arch is **blocked** until a baseline is earned under
+  [`perf-benchmarking.md`](perf-benchmarking.md) and recorded deliberately.
+- Speed-gate green is **not** model admission and **not** Redline route
+  proof ([`REDLINE.md`](../REDLINE.md)).
+- Dirty-tree or stale-binary comparisons are measurement failures, not
+  wins. Force a clean bench binary rebuild when comparing diffs
+  (`rm target/release/examples/bench_qwen35_mq4` before re-run so
+  `ensure_build` rebuilds).
+
+### Tier U — User-facing serve semantics (optional, claim-scoped)
+
+Only when the port changes observable serve behavior:
+
+| Harness | Path | Scope |
+|---|---|---|
+| Generic serve | [`scripts/serve_harness.py`](../../scripts/serve_harness.py) | Model-agnostic battery / chain / session |
+| LFM framing | [`scripts/serve_harness.py`](../../scripts/serve_harness.py) with the exact `lfm2.5:*` tag | LFM thinking / combined output only |
+| Maintained wrapper | [`scripts/gates.sh`](../../scripts/gates.sh) | Optional Redline capture + serve + optional `probe_commits.sh`; requires `--model`; **does not** call retired coherence-gate scripts |
+
+Semantics success ≠ numerical parity ≠ product timed-arm / PM4 proof.
+
+### Tier R — Measurement corpus (Kernel Atlas)
+
+For Amdahl, ISA fit, and candidate experiment queues — not acceptance:
+
+- CLI: [`scripts/kernel_atlas.py`](../../scripts/kernel_atlas.py)
+- Method: [`kernel-atlas.md`](kernel-atlas.md)
+- Architecture: [`kernel-atlas-architecture.md`](kernel-atlas-architecture.md)
+- Agent wrapper: `.agents/skills/hipfire-kernel-atlas/`
+
+Atlas `status: ok` is a successful observation only. Rows become INDEX
+**measured** evidence only with a complete fixture/binary/model identity and
+date manifest; incomplete rows stay exploratory. Neither class admits a route
+into [`admissions.yml`](../admissions.yml).
+
+---
+
+## GPU arch port — minimum route
+
+Per [`VALIDATION.md`](../VALIDATION.md) “Arch port” row:
+
+1. **Tier C** on the **target** GPU (real hardware; no emulator path).
+2. **Tier S** on every baseline arch whose dispatch/kernel path the
+   diff can touch (commonly the contributor’s baseline card **and** any
+   arch with a committed floor that shares the edited predicates).
+3. **Tier P** when the change can alter numeric forward/state for a
+   model path that has an oracle; otherwise leave parity **blocked**
+   rather than inventing a gate.
+4. Never restore retired `coherence-gate-*.sh` as the acceptance bar.
+
+If target hardware is unavailable, the port stays **blocked** for
+channel proof. Coordinate with a hardware holder
+(`.agents/skills/hipfire-arch-port/contributor-onboarding.md`); do not
+merge on “should be identical” alone.
+
+---
+
+## Model-arch forward bring-up — cheap parity loop
+
+Use when plumbing an existing kernel family into a new model crate.
+Assumes kernels already exist; new HIP kernels need Tier C first.
+
+1. **Tiny reference oracle** from HF/upstream modeling via
+   `scripts/gen_tiny_oracle.py` (adapt the marked arch block) or a
+   worked sibling (`gen_tiny_minimax.py`, `gen_tiny_lfm2moe.py`).
+2. **Dump post-residual, pre-final-norm** hidden states both sides in
+   HFHS: magic `HFHS\0\0\0\0`, then `<IIII>` =
+   `(n_layers, n_pos, hidden, reserved)`, then
+   `n_layers × [n_pos, hidden]` f32 row-major.
+3. **Compare** with `scripts/compare_hidden_states.py`
+   (`rms`, `rel_L2`, `mean_cos`, `min_cos`).
+4. **Bisect** inside the first bad layer (post-attn vs FFN/MoE;
+   isolated `block_out = post − pre`).
+5. **Precision-sweep** suspect blocks (e.g. 4-bit → higher) to separate
+   quant noise (error shrinks) from structural bugs (error flat).
+6. **Stage-dump** router/topk/gate intermediates vs numpy/torch from F32
+   weights; first diverging stage is the bug.
+7. **Read kernel/dispatch source** for RoPE convention, RMSNorm `+1`,
+   route scale, rotation matching — do not guess.
+
+### Tiny-oracle pitfall checklist
+
+- Match hardcoded kernel `k_top` (e.g. `_k8_` → `num_experts_per_tok=8`).
+- Every quantized 2D weight: `k % group_size == 0` (often 256).
+- Keep **real** `head_dim` / `rotary_dim`; shrink head/layer counts, not head_dim.
+- Keep routing tensors on well-behaved paths (Q8 `gemv_q8_0`); avoid F16
+  router hits on lm-head GEMM shapes.
+- Re-split packed expert layouts to the runtime’s split layout when needed.
+- Confirm standard vs Gemma RMSNorm (`weight` vs `1+weight`) before load.
+
+### When this does not generalize
+
+If the model needs a **new** HIP kernel or quant family with no decode
+path, Tier C (and any kernel micro-oracle) comes first. Cosine harnesses
+only validate plumbing once the kernel exists.
+
+Historical worked example (MiniMax-M2 / arch_id 10): tiny HF oracle
+caught top-k vs `_k8` overflow, F16 router→lm-head GEMM, and quant-vs-bug
+via MQ4→MQ6 sweep — **measured** on that campaign, not a live floor.
+
+---
+
+## Explicit non-routes
+
+| Anti-pattern | Disposition |
+|---|---|
+| Retired coherence-gate script batteries as current acceptance | **Rejected** (historical only; see VALIDATION) |
+| Generic bare coherence-gate entry script | **Absent** — do not invent it; route via VALIDATION |
+| Serve harness as numerical/state parity | **Rejected** |
+| No-GPU CI as GPU-arch proof | **Rejected** |
+| Atlas / bench tok/s as admission or certification | **Rejected** |
+| Claiming an unwitnessed WMMA/MFMA path “works” | **Blocked** |
+| Universal “three gates green = ship” ritual including coherence | **Rejected** — use VALIDATION tiers only |
+| Inferred [`admissions.yml`](../admissions.yml) row | **Rejected** under schema v2 (no wildcards; exact earned rows only) |
+
+---
+
+## Related owners
+
+| Concern | Owner |
+|---|---|
+| Claim → route map | [`docs/VALIDATION.md`](../VALIDATION.md) |
+| Perf measurement protocol | [`perf-benchmarking.md`](perf-benchmarking.md) |
+| Bench-suite layout | [`bench-suite.md`](bench-suite.md) |
+| Kernel Atlas usage | [`kernel-atlas.md`](kernel-atlas.md) |
+| Kernel Atlas architecture | [`kernel-atlas-architecture.md`](kernel-atlas-architecture.md) |
+| rocprof vs internal profile | [`rocprof-coverage.md`](rocprof-coverage.md) |
+| Redline certification | [`docs/REDLINE.md`](../REDLINE.md) |
+| GPU-arch skill (playbook, WMMA matrix) | `.agents/skills/hipfire-arch-port/` |

@@ -40,11 +40,14 @@
 
 use hip_bridge::HipResult;
 use hipfire_arch_qwen2::qwen2::{Qwen2Config, Qwen2Weights};
+use hipfire_runtime::gpu_cleanup::GpuCleanupFailure;
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama::{
     attention_family, f16_to_f32, f32_to_f16, DispatchCtx, FullAttnParams, KernelKey, ShapeInfo,
 };
 use hipfire_runtime::model_source::ModelSource;
+use hipfire_runtime::retain_free;
+use hipfire_runtime::MmqScreenable;
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 // ─── Config ─────────────────────────────────────────────────────────────
@@ -362,6 +365,43 @@ impl DotsVisionWeights {
         let _ = gpu.free_tensor(self.merger_fc2_w);
         let _ = gpu.free_tensor(self.merger_fc2_b);
     }
+
+    /// Checked GPU cleanup: attempts every tensor independently, retains
+    /// every allocation that could not be freed for retry.
+    pub fn free_checked(self, gpu: &mut Gpu) -> Result<(), GpuCleanupFailure> {
+        let mut failures = Vec::new();
+        retain_free!(gpu, failures,
+            "DotsVisionWeights.patch_embed_w" => Some(self.patch_embed_w),
+            "DotsVisionWeights.patch_embed_b" => Some(self.patch_embed_b),
+            "DotsVisionWeights.patch_embed_norm" => Some(self.patch_embed_norm),
+            "DotsVisionWeights.post_trunk_norm" => Some(self.post_trunk_norm),
+            "DotsVisionWeights.merger_ln_w" => Some(self.merger_ln_w),
+            "DotsVisionWeights.merger_ln_b" => Some(self.merger_ln_b),
+            "DotsVisionWeights.merger_fc1_w" => Some(self.merger_fc1_w),
+            "DotsVisionWeights.merger_fc1_b" => Some(self.merger_fc1_b),
+            "DotsVisionWeights.merger_fc2_w" => Some(self.merger_fc2_w),
+            "DotsVisionWeights.merger_fc2_b" => Some(self.merger_fc2_b),
+        );
+        for (i, b) in self.blocks.into_iter().enumerate() {
+            retain_free!(gpu, failures,
+                format!("DotsVisionWeights.blocks[{i}].norm1_w") => Some(b.norm1_w),
+                format!("DotsVisionWeights.blocks[{i}].qkv_w") => Some(b.qkv_w),
+                format!("DotsVisionWeights.blocks[{i}].proj_w") => Some(b.proj_w),
+                format!("DotsVisionWeights.blocks[{i}].norm2_w") => Some(b.norm2_w),
+                format!("DotsVisionWeights.blocks[{i}].fc13_proj") => Some(b.fc13_proj),
+                format!("DotsVisionWeights.blocks[{i}].fc2") => Some(b.fc2),
+            );
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            let mut cf = GpuCleanupFailure::empty();
+            for r in failures {
+                cf.add_retained(r);
+            }
+            Err(cf)
+        }
+    }
 }
 
 // ─── Outer weights wrapper ──────────────────────────────────────────────
@@ -374,6 +414,14 @@ impl DotsVisionWeights {
 pub struct DotsOcrWeights {
     pub text: Qwen2Weights,
     pub vision: DotsVisionWeights,
+}
+
+impl MmqScreenable for DotsOcrWeights {
+    fn screen_mmq_weights(&self, gpu: &mut Gpu) -> (usize, usize) {
+        // The vision tower is F16-only; all MMQ-eligible tensors are in the
+        // Qwen2 text model.
+        self.text.screen_mmq_weights(gpu)
+    }
 }
 
 impl DotsOcrWeights {
@@ -404,6 +452,24 @@ impl DotsOcrWeights {
     pub fn free_gpu(self, gpu: &mut Gpu) {
         self.text.free_gpu(gpu);
         self.vision.free_gpu(gpu);
+    }
+
+    /// Checked GPU cleanup: both halves are freed independently; every
+    /// owner that survives (tensor or non-tensor category) is retained
+    /// whole for exact-retention retry — never flattened or fabricated.
+    pub fn free_checked(self, gpu: &mut Gpu) -> Result<(), GpuCleanupFailure> {
+        let mut cf = GpuCleanupFailure::empty();
+        if let Err(f) = self.text.free_checked(gpu) {
+            cf.merge(f);
+        }
+        if let Err(f) = self.vision.free_checked(gpu) {
+            cf.merge(f);
+        }
+        if cf.is_empty() {
+            Ok(())
+        } else {
+            Err(cf)
+        }
     }
 }
 
@@ -1307,9 +1373,10 @@ pub fn vision_forward(
     // names match `benchmarks/references/dots_ocr_smoke_001_activations/`:
     // patch_embed, block_00, block_21, block_41, post_trunk_norm, merger.
     // Each is written as a NumPy `.npy` file in native row-major F32.
-    let dump_dir: Option<std::path::PathBuf> = std::env::var("HIPFIRE_DOTS_OCR_DUMP_DIR")
-        .ok()
-        .map(std::path::PathBuf::from);
+    let dump_dir: Option<std::path::PathBuf> =
+        hipfire_config::developer_var("HIPFIRE_DOTS_OCR_DUMP_DIR")
+            .ok()
+            .map(std::path::PathBuf::from);
     if let Some(ref d) = dump_dir {
         std::fs::create_dir_all(d).map_err(|e| {
             hip_bridge::HipError::new(0, &format!("dump_dir mkdir {}: {e}", d.display()))
@@ -1342,7 +1409,10 @@ pub fn vision_forward(
     //
     // patch_embed_w on GPU is the 4-D conv weight flattened to a
     // `[embed_dim, patch_dim]` linear (verified during load).
-    let trace_pre = std::env::var("HIPFIRE_DOTS_OCR_TRACE").ok().as_deref() == Some("1");
+    let trace_pre = hipfire_config::developer_var("HIPFIRE_DOTS_OCR_TRACE")
+        .ok()
+        .as_deref()
+        == Some("1");
     let dump_stats = |gpu: &Gpu, t: &GpuTensor, label: &str| -> HipResult<()> {
         if !trace_pre {
             return Ok(());
@@ -1405,7 +1475,7 @@ pub fn vision_forward(
     // residual stream is bf16-precision throughout. Emulate that by
     // bf16-truncating at every block boundary (after each residual add).
     // Optional via env var so it can be A/B tested.
-    let bf16_residual = std::env::var("HIPFIRE_DOTS_OCR_BF16_RESIDUAL")
+    let bf16_residual = hipfire_config::developer_var("HIPFIRE_DOTS_OCR_BF16_RESIDUAL")
         .ok()
         .as_deref()
         == Some("1");
@@ -1435,7 +1505,10 @@ pub fn vision_forward(
     // the first failing kernel surfaces directly instead of via a sticky
     // error reported later (HIP errors are async-sticky — the call that
     // reports them is rarely the launch that caused them).
-    let trace = std::env::var("HIPFIRE_DOTS_OCR_TRACE").ok().as_deref() == Some("1");
+    let trace = hipfire_config::developer_var("HIPFIRE_DOTS_OCR_TRACE")
+        .ok()
+        .as_deref()
+        == Some("1");
     macro_rules! probe {
         ($gpu:expr, $msg:literal) => {
             if trace {

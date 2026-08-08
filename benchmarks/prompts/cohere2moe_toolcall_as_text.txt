@@ -1,0 +1,1 @@
+Show me the exact function call you would make to look up the current weather in Tokyo. Write it out as a JSON object with the function name and its arguments.

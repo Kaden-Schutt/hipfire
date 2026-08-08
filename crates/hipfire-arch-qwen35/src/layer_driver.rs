@@ -10,6 +10,7 @@ use crate::qwen35::{
     DeltaNetLayerWeights, DeltaNetMoeLayerWeights, FullAttnLayerWeights, FullAttnMoeLayerWeights,
     LayerType, LayerWeights, MoeFfnWeights, Qwen35Config,
 };
+use crate::store::MoeFfnStorage;
 use hip_bridge::HipResult;
 use hipfire_runtime::weight_backend::WeightBackend;
 
@@ -95,7 +96,7 @@ pub(crate) fn load_layer<B: WeightBackend>(
             norm_weight: b.raw_f32("linear_attn.norm.weight", config.linear_value_head_dim)?,
             wo: b.proj("linear_attn.out_proj", config.dim, d_inner)?,
             ffn_norm: b.norm("post_attention_layernorm.weight", &[config.dim])?,
-            ffn: load_moe(b, config, layer_idx)?,
+            ffn: MoeFfnStorage::Legacy(load_moe(b, config, layer_idx)?),
         }),
         (LayerType::FullAttention, true) => LayerWeights::FullAttnMoe(FullAttnMoeLayerWeights {
             attn_norm: b.norm("input_layernorm.weight", &[config.dim])?,
@@ -106,7 +107,7 @@ pub(crate) fn load_layer<B: WeightBackend>(
             q_norm: b.norm("self_attn.q_norm.weight", &[config.head_dim])?,
             k_norm: b.norm("self_attn.k_norm.weight", &[config.head_dim])?,
             ffn_norm: b.norm("post_attention_layernorm.weight", &[config.dim])?,
-            ffn: load_moe(b, config, layer_idx)?,
+            ffn: MoeFfnStorage::Legacy(load_moe(b, config, layer_idx)?),
         }),
     })
 }

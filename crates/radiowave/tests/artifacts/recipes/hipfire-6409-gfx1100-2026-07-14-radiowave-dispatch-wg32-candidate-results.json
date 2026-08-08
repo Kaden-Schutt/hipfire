@@ -1,0 +1,9 @@
+{
+  "external_archive_sha256": "d4d0911e751e891b952f2983c0a78e05c304b854321ce5f438794ca7a8abda2b",
+  "kind": "radiowave_recipe_provenance",
+  "note": "Full raw result history is externally archived; this fixture is a deterministic provenance record only and does not embed measurement rows.",
+  "original_byte_size": 113282,
+  "original_result_path": "examples/hipfire-6409/results/gfx1100/2026-07-14-radiowave-dispatch-wg32/candidate/results.json",
+  "original_sha256": "295e9d29bccf9ef57b0e78c5aca4446b308e8ccac8c9137ef9370bb92714e98c",
+  "schema_version": 1
+}

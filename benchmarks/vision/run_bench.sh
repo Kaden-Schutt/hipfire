@@ -45,7 +45,6 @@ run_hipfire_cli() {
   # $1 = image path, $2 = prompt, $3 = out file
   local img=$1 prompt=$2 out=$3
   # `hipfire run --image` self-locks; we MUST NOT wrap in gpu_acquire.
-  $HOME/.hipfire/cli/index.ts >/dev/null 2>&1 || true  # ensure CLI is built/runnable
   # Use the prebuilt infer example binary (avoids re-running cargo which would
   # change CWD and break relative output paths).
   timeout 120s $HOME/git/hipfire/target/release/examples/infer \

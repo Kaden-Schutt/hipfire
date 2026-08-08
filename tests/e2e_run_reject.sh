@@ -13,6 +13,8 @@
 
 set -uo pipefail
 MODEL=${MODEL:-qwen3.5:0.8b}
+HIPFIRE=${HIPFIRE_CLI_BIN:-./target/release/hipfire}
+[ -x "$HIPFIRE" ] || { echo "native hipfire CLI not found" >&2; exit 2; }
 TMPCFG=$(mktemp -d)
 # shellcheck disable=SC2329 # invoked by trap
 cleanup() {
@@ -20,7 +22,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Isolated HOME; only config.json differs, models/bin are symlinked.
+# Isolated HOME; only config.toml differs, models/bin are symlinked.
 mkdir -p "$TMPCFG/.hipfire"
 ln -sfn "$HOME/.hipfire/models" "$TMPCFG/.hipfire/models"
 ln -sfn "$HOME/.hipfire/bin"    "$TMPCFG/.hipfire/bin"
@@ -28,13 +30,18 @@ ln -sfn "$HOME/.hipfire/bin"    "$TMPCFG/.hipfire/bin"
 # the min-viable bump in buildLoadMessage (max_tokens+1024), so load still
 # picks max_seq=max_tokens+1024, and a request with max_tokens >> that gets
 # rejected by the daemon. We pass max_tokens directly on the CLI.
-cat > "$TMPCFG/.hipfire/config.json" <<'JSON'
-{"max_seq": 512, "max_tokens": 16, "default_model": "qwen3.5:0.8b"}
-JSON
+cat > "$TMPCFG/.hipfire/config.toml" <<'TOML'
+[memory]
+max_seq = 512
+[generation]
+max_tokens = 16
+[serve]
+default_model = "qwen3.5:0.8b"
+TOML
 
 OUT=$(mktemp); ERR=$(mktemp)
 HIPFIRE_LOCAL=1 HOME="$TMPCFG" \
-  bun cli/index.ts run "$MODEL" --max-tokens 100000 "hi" > "$OUT" 2> "$ERR"
+  "$HIPFIRE" run "$MODEL" --max-tokens 100000 "hi" > "$OUT" 2> "$ERR"
 EC=$?
 echo "exit=$EC"
 echo "--- stdout (head) ---"

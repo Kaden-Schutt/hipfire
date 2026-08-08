@@ -6,6 +6,7 @@
 //! holds only what the arch crates need to implement a carrier.
 
 use crate::hfq::HfqFile;
+use crate::kv_backend::KvBackend;
 use crate::safetensors_source::SafetensorsSource;
 use rdna_compute::Gpu;
 use std::path::Path;
@@ -62,11 +63,28 @@ pub struct LoadCtx<'a> {
     pub max_seq: usize,
     pub draft_path: Option<&'a str>,
     pub kv_mode_override: Option<&'a str>,
+    pub kv_backend: KvBackend,
     pub kv_adaptive_override: Option<&'a str>,
     pub state_quant_override: Option<&'a str>,
     pub cask: &'a CaskConfig,
     pub pp: usize,
+    /// Explicit per-stage PP layer bands from `HIPFIRE_PP_LAYERS`, parsed +
+    /// length-validated at the daemon edge. `Some` → ragged (`init_layers`,
+    /// VRAM-delta gate OFF); `None` → uniform (`init_uniform`, gate ON). Only
+    /// ever set on the qwen35 PP path.
+    pub pp_bands: Option<&'a [usize]>,
+    /// Load-resolved MTP mode for immutable model metadata.
+    pub mtp_mode: &'static str,
+    /// Load-resolved MTP K for model construction and speculative decoding.
+    pub mtp_k: usize,
     pub spec: SpecLoadCfg,
+    /// Eviction-aware KV physical capacity override. When `Some(cap)` and
+    /// `cap < max_seq`, the carrier's KvCache allocation uses `cap` instead of
+    /// `max_seq` for the physical buffer size (keeping `max_seq` as the logical
+    /// RoPE/mask range). Set by the CASK/TriAttention physical-cap derivation to
+    /// shrink KV allocation from full-context to the eviction working window.
+    /// `None` means physical_cap == max_seq (no eviction bounding).
+    pub kv_physical_cap: Option<usize>,
     pub gpu: &'a mut Gpu,
 }
 
@@ -79,10 +97,15 @@ pub struct LoadCtx<'a> {
 ///
 /// The master `speculation` selector lives entirely CLI-side: it is lowered into
 /// the per-mechanism signals (`dflash_mode`/`draft`, `mtp_mode`, and this), so
-/// `build_speculator`'s first-match cascade (dflash > mtp > n-gram) naturally
+/// `build_speculator`'s first-match cascade (dflash > n-gram) naturally
 /// yields the chosen mechanism without the loader needing a selector of its own.
 #[derive(Clone, Copy, Default)]
 pub struct SpecLoadCfg {
+    /// Load-resolved MTP mode. `None` = auto, `Some(true)` = on,
+    /// `Some(false)` = off.
+    pub mtp_mode: Option<bool>,
+    /// Load-resolved MTP K. `None` = loader default.
+    pub mtp_k: Option<usize>,
     /// Enable the model-free n-gram drafter for this load. `None` = unspecified.
     pub ngram_draft: Option<bool>,
     /// n-gram draft window K (`HIPFIRE_NGRAM_DRAFT_K`). `None` = loader default.

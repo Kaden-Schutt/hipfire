@@ -1,14 +1,43 @@
 use crate::qwen2::{Qwen2Config, Qwen2State, Qwen2Weights};
 use crate::Qwen2;
 use hipfire_runtime::arch::Architecture;
+use hipfire_runtime::gpu_cleanup::{BundleTeardown, GpuCleanupFailure};
 use hipfire_runtime::loader_api::{LoadCtx, ModelSource};
 // Trait in scope for `tensor_info`/`quant_config` on the Dir source.
 use hipfire_runtime::model_source::ModelSource as _;
+use rdna_compute::Gpu;
 
 pub struct Qwen2Bundle {
     pub config: Qwen2Config,
     pub weights: Qwen2Weights,
     pub state: Qwen2State,
+}
+
+impl BundleTeardown for Qwen2Bundle {
+    /// Exact-retention checked teardown: delegates to the nested checked
+    /// frees ([`Qwen2Weights::free_checked`],
+    /// [`Qwen2State::free_checked`]), merging every failure category whole
+    /// via [`GpuCleanupFailure::merge`] — owners that survive are carried
+    /// in the returned [`GpuCleanupFailure`] for exact-retention retry.
+    fn free_checked(self, gpu: &mut Gpu) -> Result<(), GpuCleanupFailure> {
+        let Qwen2Bundle {
+            config: _,
+            weights,
+            state,
+        } = self;
+        let mut cf = GpuCleanupFailure::empty();
+        if let Err(f) = weights.free_checked(gpu) {
+            cf.merge(f);
+        }
+        if let Err(f) = state.free_checked(gpu) {
+            cf.merge(f);
+        }
+        if cf.is_empty() {
+            Ok(())
+        } else {
+            Err(cf)
+        }
+    }
 }
 
 /// Build the Qwen2 GPU bundle from an HFQ or safetensors-directory source.
@@ -65,6 +94,7 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Qwen2Bundle, S
             (config, weights)
         }
     };
+    hipfire_runtime::maybe_screen_mmq(&weights, ctx.gpu);
     let state = Qwen2State::new_with_max_seq(ctx.gpu, &config, ctx.max_seq)
         .map_err(|e| format!("qwen2: Qwen2State::new_with_max_seq failed: {e:?}"))?;
     Ok(Qwen2Bundle {

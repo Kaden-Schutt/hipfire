@@ -8,9 +8,27 @@
 //! `config.json`. Defaults come from the released
 //! `deepseek-ai/DeepSeek-V4-Flash` checkpoint.
 
+use hipfire_runtime::gpu_cleanup::{free_tensor_retained, GpuCleanupFailure, RetainedGpuTensor};
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::model_source::ModelSource;
+use hipfire_runtime::moe_plan::MoEExecutionPolicy;
+use hipfire_runtime::retain_free;
 use serde::{Deserialize, Serialize};
+
+/// Wrap a retained-tensor list into the crate-standard checked-free result:
+/// `Ok(())` when everything was freed, else a [`GpuCleanupFailure`] carrying
+/// every retained owner for exact-retention retry.
+pub(crate) fn finish_checked(failures: Vec<RetainedGpuTensor>) -> Result<(), GpuCleanupFailure> {
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        let mut cf = GpuCleanupFailure::empty();
+        for r in failures {
+            cf.add_retained(r);
+        }
+        Err(cf)
+    }
+}
 
 /// Per-layer compression mode for the indexer / KV path.
 ///
@@ -239,7 +257,7 @@ impl DeepseekV4Config {
         // New generic env HIPFIRE_REAP_PLAN=<dir> (reap_plan.json); legacy
         // HIPFIRE_DEEPSEEK4_REAP_KEEPMAP=<dir> (keep_by_layer.json) is still
         // honored as a keep-only alias via ReapPlan::load_any.
-        if let Some(plan) = hipfire_reap::plan::ReapPlan::from_env(
+        if let Some(plan) = hipfire_reap::plan::ReapPlan::from_config(
             "deepseek4",
             Some("HIPFIRE_DEEPSEEK4_REAP_KEEPMAP"),
             config.num_hidden_layers,
@@ -343,6 +361,26 @@ impl DsparkWeights {
         for stage in self.stages.drain(..) {
             stage.free_gpu(gpu);
         }
+    }
+
+    /// Checked free of every GPU buffer the DSpark module owns: frees the
+    /// DSpark globals, then drains each stage via the shared
+    /// `DeepseekV4LayerWeights` checked-free body. Continues after individual
+    /// failures; every owner that could not be freed is returned for
+    /// exact-retention retry. Consumes self.
+    pub fn free_checked(self, gpu: &mut rdna_compute::Gpu) -> Result<(), GpuCleanupFailure> {
+        let mut failures: Vec<RetainedGpuTensor> = Vec::new();
+        retain_free!(gpu, failures,
+            "DsparkWeights.main_proj" => self.main_proj,
+            "DsparkWeights.main_norm" => self.main_norm,
+            "DsparkWeights.markov_w1" => self.markov_w1,
+            "DsparkWeights.markov_w2" => self.markov_w2,
+            "DsparkWeights.confidence_proj" => self.confidence_proj,
+        );
+        for (i, stage) in self.stages.into_iter().enumerate() {
+            stage.free_checked_into(&format!("DsparkWeights.stages[{i}]"), gpu, &mut failures);
+        }
+        finish_checked(failures)
     }
 }
 
@@ -761,6 +799,86 @@ impl DeepseekV4LayerWeights {
         // is the sole owner.
         free_opt(gpu, &mut self.expert_gate_up_dummy);
     }
+
+    /// Shared checked-free body for a [`DeepseekV4LayerWeights`]: attempts
+    /// every GPU-owning field, continuing after individual failures, with
+    /// `prefix.field` labels so retained owners carry their index (e.g.
+    /// `DeepseekV4Weights.layers[3].attn_norm`). Used by the layer's own
+    /// `free_checked`, `DeepseekV4Weights::free_checked` (main layers + MTP
+    /// slot) and `DsparkWeights::free_checked` (stages).
+    pub(crate) fn free_checked_into(
+        self,
+        prefix: &str,
+        gpu: &mut rdna_compute::Gpu,
+        mut failures: &mut Vec<RetainedGpuTensor>,
+    ) {
+        let lp = |field: &str| format!("{prefix}.{field}");
+        retain_free!(gpu, failures,
+            lp("attn_norm") => self.attn_norm,
+            lp("ffn_norm") => self.ffn_norm,
+            lp("q_norm") => self.q_norm,
+            lp("kv_norm") => self.kv_norm,
+            lp("attn_sink") => self.attn_sink,
+            lp("wq_a") => self.wq_a,
+            lp("wq_b") => self.wq_b,
+            lp("wkv") => self.wkv,
+            lp("wo_a") => self.wo_a,
+            lp("wo_b") => self.wo_b,
+            lp("compressor_wkv") => self.compressor_wkv,
+            lp("compressor_wgate") => self.compressor_wgate,
+            lp("compressor_norm") => self.compressor_norm,
+            lp("compressor_ape") => self.compressor_ape,
+            lp("compressor_wkv_f16") => self.compressor_wkv_f16,
+            lp("compressor_wgate_f16") => self.compressor_wgate_f16,
+            lp("indexer_wq_b") => self.indexer_wq_b,
+            lp("indexer_weights_proj") => self.indexer_weights_proj,
+            lp("indexer_compressor_wkv") => self.indexer_compressor_wkv,
+            lp("indexer_compressor_wgate") => self.indexer_compressor_wgate,
+            lp("indexer_compressor_wkv_f16") => self.indexer_compressor_wkv_f16,
+            lp("indexer_compressor_wgate_f16") => self.indexer_compressor_wgate_f16,
+            lp("indexer_compressor_norm") => self.indexer_compressor_norm,
+            lp("indexer_compressor_ape") => self.indexer_compressor_ape,
+            lp("mtp_enorm") => self.mtp_enorm,
+            lp("mtp_hnorm") => self.mtp_hnorm,
+            lp("mtp_e_proj") => self.mtp_e_proj,
+            lp("mtp_h_proj") => self.mtp_h_proj,
+            lp("mtp_final_norm") => self.mtp_final_norm,
+            lp("mtp_hc_head_fn") => self.mtp_hc_head_fn,
+            lp("mtp_hc_head_base") => self.mtp_hc_head_base,
+            lp("hc_attn_base") => self.hc_attn_base,
+            lp("hc_attn_fn") => self.hc_attn_fn,
+            lp("hc_attn_scale") => self.hc_attn_scale,
+            lp("hc_ffn_base") => self.hc_ffn_base,
+            lp("hc_ffn_fn") => self.hc_ffn_fn,
+            lp("hc_ffn_scale") => self.hc_ffn_scale,
+            lp("gate_weight") => self.gate_weight,
+            lp("gate_bias") => self.gate_bias,
+            lp("tid2eid_dev") => self.tid2eid_dev,
+            lp("shared_w1") => self.shared_w1,
+            lp("shared_w2") => self.shared_w2,
+            lp("shared_w3") => self.shared_w3,
+            lp("expert_w1_blob") => self.expert_w1_blob,
+            lp("expert_w2_blob") => self.expert_w2_blob,
+            lp("expert_w3_blob") => self.expert_w3_blob,
+            lp("expert_w1_ptrs") => self.expert_w1_ptrs,
+            lp("expert_w2_ptrs") => self.expert_w2_ptrs,
+            lp("expert_w3_ptrs") => self.expert_w3_ptrs,
+            lp("expert_gate_up_blob") => self.expert_gate_up_blob,
+            lp("expert_gate_up_ptrs") => self.expert_gate_up_ptrs,
+            // EP-shard dummy gate_up buffer — freed last so the pointer
+            // table that baked its address is already gone.
+            lp("expert_gate_up_dummy") => self.expert_gate_up_dummy,
+        );
+    }
+
+    /// Checked free of every GPU buffer this layer owns. Continues after
+    /// individual failures; every owner that could not be freed is returned
+    /// for exact-retention retry. Consumes self.
+    pub fn free_checked(self, gpu: &mut rdna_compute::Gpu) -> Result<(), GpuCleanupFailure> {
+        let mut failures: Vec<RetainedGpuTensor> = Vec::new();
+        self.free_checked_into("DeepseekV4LayerWeights", gpu, &mut failures);
+        finish_checked(failures)
+    }
 }
 
 /// DeepSeek V4 weights — fully populated: global embeddings + norms, per-layer
@@ -768,9 +886,8 @@ impl DeepseekV4LayerWeights {
 /// Hyper-Connections gates, routed-expert blobs, and the optional MTP
 /// addon layer (`mtp.0.*`).
 ///
-/// `mtp_layer` is `Some` after Phase 5 lands (when the
-/// `mtp.` prefix-skip in `hipfire-quantize` is lifted and MTP
-/// tensors are quantized alongside main layers).
+/// `mtp_layer` is `Some` once the MTP addon (or an in-band `mtp.0.*`
+/// quant) is loaded — env-gated, see arch.rs MTP addon discovery.
 pub struct DeepseekV4Weights {
     /// Token embedding table. Stored as raw Q8F16 bytes on GPU
     /// (matches the `embed.weight` quant_type from Phase 1 ingest).
@@ -791,12 +908,35 @@ pub struct DeepseekV4Weights {
     pub layers: Vec<DeepseekV4LayerWeights>,
     /// MTP head — structurally identical to a main layer, plus an
     /// `input_proj` conditioning on the base model's hidden state.
-    /// `None` at scaffold stage; populated when Phase 5 ships.
+    /// `None` at scaffold stage; loaded from the MTP addon / in-band
+    /// `mtp.0.*` tensors (env-gated, see arch.rs MTP addon discovery).
     pub mtp_layer: Option<DeepseekV4LayerWeights>,
     /// Optional DSpark 3-stage draft module, loaded from the
     /// `<stem>-dspark.<ext>` sidecar. Additive to `mtp_layer` — both can be
     /// present. `None` when no DSpark sidecar exists (silent no-op).
     pub dspark: Option<DsparkWeights>,
+    /// Canonical single-rank execution policy of this model: ONE stable
+    /// object for the model's lifetime. `DeviceMesh::single()` issues a fresh
+    /// mesh epoch per call, so a per-call `MoEExecutionPolicy::single()`
+    /// would be a DIFFERENT exact policy every call and the exact-key plan
+    /// cache would reject every call after the first. The single forward
+    /// path passes this object on every call — never a per-call
+    /// reconstruction (mirrors MiniMax's stable single policy). Parallel
+    /// policies are constructed once by the mesh owner and threaded the same
+    /// way. Initialized in every constructor; CPU-only.
+    pub(crate) moe_policy: MoEExecutionPolicy,
+    /// Lane-A model-owned MoE manifest/cache: resolves the static expert
+    /// manifest AT MOST ONCE (`OnceLock::get_or_init`) under the exact
+    /// execution policy + manifest config identity + complete per-rank
+    /// resident router-profile matrix (main layers then the optional MTP
+    /// slot), and caches success OR failure. The same key borrows the entry
+    /// forever; a different key is refused with an explicit mismatch (no
+    /// retry/replacement/global cache). Only the canonical aggregate
+    /// accessor (`crate::moe_lower::ds4_cached_moe_plans`) touches this cell:
+    /// it always serves from the rank-0 weights instance on a parallel mesh;
+    /// `Single` is the sole owner on the single-GPU path. Nonzero-rank cells
+    /// stay empty forever. CPU-only (contains no GPU handles).
+    pub(crate) moe_plan_cache: std::sync::OnceLock<crate::moe_lower::Ds4PlanCacheEntry>,
     pub _scaffold: (),
 }
 
@@ -857,6 +997,47 @@ impl DeepseekV4Weights {
             );
         }
     }
+
+    /// Checked free of every GPU buffer these weights own. Consumes self.
+    /// Continues after individual failures; every owner that could not be
+    /// freed is returned for exact-retention retry.
+    pub fn free_checked(self, gpu: &mut rdna_compute::Gpu) -> Result<(), GpuCleanupFailure> {
+        let mut cf = GpuCleanupFailure::empty();
+        let mut failures: Vec<RetainedGpuTensor> = Vec::new();
+        retain_free!(gpu, failures,
+            "DeepseekV4Weights.token_embd" => self.token_embd,
+            "DeepseekV4Weights.output_norm" => self.output_norm,
+            "DeepseekV4Weights.head" => self.head,
+            "DeepseekV4Weights.hc_head_fn" => self.hc_head_fn,
+            "DeepseekV4Weights.hc_head_base" => self.hc_head_base,
+        );
+        for (i, layer) in self.layers.into_iter().enumerate() {
+            layer.free_checked_into(
+                &format!("DeepseekV4Weights.layers[{i}]"),
+                gpu,
+                &mut failures,
+            );
+        }
+        if let Some(mtp) = self.mtp_layer {
+            mtp.free_checked_into("DeepseekV4Weights.mtp_layer", gpu, &mut failures);
+        }
+        for r in failures {
+            cf.add_retained(r);
+        }
+        // DSpark sidecar is a nested owner with its own checked free — its
+        // failure category travels whole (never flattened into tensor
+        // entries).
+        if let Some(d) = self.dspark {
+            if let Err(f) = d.free_checked(gpu) {
+                cf.merge(f);
+            }
+        }
+        if cf.is_empty() {
+            Ok(())
+        } else {
+            Err(cf)
+        }
+    }
 }
 
 /// Per-layer state for the compressed-KV indexer (Phase 2, Lever 3).
@@ -915,6 +1096,32 @@ pub struct IndexerLayerState {
     pub comp_concat_score: Option<rdna_compute::GpuTensor>,
 }
 
+impl IndexerLayerState {
+    /// Checked free of every GPU buffer this indexer layer state owns.
+    /// Continues after individual failures; every owner that could not be
+    /// freed is returned for exact-retention retry. Consumes self.
+    pub fn free_checked(self, gpu: &mut rdna_compute::Gpu) -> Result<(), GpuCleanupFailure> {
+        let mut failures: Vec<RetainedGpuTensor> = Vec::new();
+        retain_free!(gpu, failures,
+            "IndexerLayerState.main_kv_cache" => self.main_kv_cache,
+            "IndexerLayerState.main_kv_state" => self.main_kv_state,
+            "IndexerLayerState.main_score_state" => self.main_score_state,
+            "IndexerLayerState.indexer_kv_cache" => self.indexer_kv_cache,
+            "IndexerLayerState.indexer_kv_state" => self.indexer_kv_state,
+            "IndexerLayerState.indexer_score_state" => self.indexer_score_state,
+            "IndexerLayerState.q_idx" => self.q_idx,
+            "IndexerLayerState.idx_weights" => self.idx_weights,
+            "IndexerLayerState.index_score" => self.index_score,
+            "IndexerLayerState.topk_idx_indices" => self.topk_idx_indices,
+            "IndexerLayerState.comp_kv_buf" => self.comp_kv_buf,
+            "IndexerLayerState.comp_score_buf" => self.comp_score_buf,
+            "IndexerLayerState.comp_concat_kv" => self.comp_concat_kv,
+            "IndexerLayerState.comp_concat_score" => self.comp_concat_score,
+        );
+        finish_checked(failures)
+    }
+}
+
 /// Per-layer scratch for the main attention path's gathered K/V rows.
 ///
 /// The main attention attends to `sliding_window + index_topk` total
@@ -943,6 +1150,57 @@ pub struct MainAttentionLayerState {
     /// sliding_window + index_topk]` F32, lazy-alloc.
     pub gathered_k: Option<rdna_compute::GpuTensor>,
     pub gathered_v: Option<rdna_compute::GpuTensor>,
+}
+
+impl MainAttentionLayerState {
+    /// Checked free of every GPU buffer this main-attention layer state
+    /// owns. Continues after individual failures; every owner that could not
+    /// be freed is returned for exact-retention retry. Consumes self.
+    pub fn free_checked(self, gpu: &mut rdna_compute::Gpu) -> Result<(), GpuCleanupFailure> {
+        let mut failures: Vec<RetainedGpuTensor> = Vec::new();
+        retain_free!(gpu, failures,
+            "MainAttentionLayerState.swa_k" => self.swa_k,
+            "MainAttentionLayerState.swa_v" => self.swa_v,
+            "MainAttentionLayerState.full_k_cache" => self.full_k_cache,
+            "MainAttentionLayerState.full_v_cache" => self.full_v_cache,
+            "MainAttentionLayerState.gathered_k" => self.gathered_k,
+            "MainAttentionLayerState.gathered_v" => self.gathered_v,
+        );
+        finish_checked(failures)
+    }
+}
+
+/// Reusable host buffers for the hash-router FALLBACK path in
+/// `ffn_hash_routed` (when `layer.tid2eid_dev` is missing). Clear+reuse
+/// across hash-routed layers; capacity sized to `num_experts_per_tok`.
+#[derive(Debug, Default)]
+pub struct HashTopkHostScratch {
+    pub topk_ids: Vec<u32>,
+    pub idx_i32: Vec<i32>,
+    pub idx_bytes: Vec<u8>,
+    pub w_scaled: Vec<f32>,
+    pub w_bytes: Vec<u8>,
+}
+
+impl HashTopkHostScratch {
+    pub fn with_capacity(k: usize) -> Self {
+        Self {
+            topk_ids: Vec::with_capacity(k),
+            idx_i32: Vec::with_capacity(k),
+            idx_bytes: Vec::with_capacity(k * 4),
+            w_scaled: Vec::with_capacity(k),
+            w_bytes: Vec::with_capacity(k * 4),
+        }
+    }
+
+    /// Drop lengths to 0 while keeping capacity for the next layer.
+    pub fn clear(&mut self) {
+        self.topk_ids.clear();
+        self.idx_i32.clear();
+        self.idx_bytes.clear();
+        self.w_scaled.clear();
+        self.w_bytes.clear();
+    }
 }
 
 /// DeepSeek V4 per-decode state. Held on the daemon's per-session struct,
@@ -1248,6 +1506,12 @@ pub struct DeepseekV4State {
     /// Lazily allocated by `capture_seed_main_hidden` / `new_spec_scratch`.
     pub dspark_verify_pbs: Option<crate::forward::PrefillBatchScratch>,
 
+    /// Host-side top-K scratch for the hash-router FALLBACK arm in
+    /// `ffn_hash_routed` (when `layer.tid2eid_dev` is missing). Sized to
+    /// `num_experts_per_tok` and reused across hash-routed layers so the
+    /// d2h/host-gather/h2d path does not allocate per layer.
+    pub hash_topk_host: HashTopkHostScratch,
+
     /// Monotonic position counter — how many tokens this session has
     /// processed. Used to compute the SWA cache slot (`pos % window`)
     /// and number of valid cached positions.
@@ -1353,6 +1617,7 @@ impl DeepseekV4State {
             dspark_cap_ones: None,
             dspark_main_hidden: None,
             dspark_verify_pbs: None,
+            hash_topk_host: HashTopkHostScratch::with_capacity(cfg.num_experts_per_tok),
             n_tokens: 0,
             _scaffold: (),
         })
@@ -1389,12 +1654,10 @@ impl DeepseekV4State {
     /// reset and uses `start_pos = lcp_len` instead.
     pub fn reset(&mut self) {
         self.n_tokens = 0;
-        // mtp_last_hidden carries the prior decode's full HC residual
-        // stream and is only consumed by `mtp_forward` (spec decode).
-        // Leaving it populated would let the first MTP step of a new
-        // turn read stale data; drop the handle so the next request's
-        // first spec step takes the alloc-then-fill path again.
-        self.mtp_last_hidden = None;
+        // `mtp_last_hidden` is GPU-owned. Call `reset_with_gpu` from a reset
+        // path that owns a GPU so it is returned to the pool before this
+        // handle is cleared. Keeping the plain reset GPU-free avoids silently
+        // leaking that allocation.
         // Force the next decode loop to retrace the warmup path
         // (`decode_step` direct dispatch) before re-entering capture.
         // Pairs with `gpu.invalidate_graph_state()` in the daemon's
@@ -1424,6 +1687,18 @@ impl DeepseekV4State {
         // are overwritten on first use and don't need explicit zeroing.
     }
 
+    /// Reset request state and release the MTP chaining buffer first.
+    pub fn reset_with_gpu(&mut self, gpu: &mut rdna_compute::Gpu) -> hip_bridge::HipResult<()> {
+        // Free the old chaining allocation before reset clears its handle.
+        if let Err(error) = gpu.free_tensor_checked(&mut self.mtp_last_hidden) {
+            // The optional handle remains populated when binding/freeing fails,
+            // so a later reset or unload can retry the release.
+            return Err(error);
+        }
+        self.reset();
+        Ok(())
+    }
+
     /// Zero the persistent per-layer decode caches (SWA ring, full + compressed
     /// KV, indexer/compressor scratch) so a fresh conversation starts from the
     /// same clean state as a freshly-launched daemon.
@@ -1436,41 +1711,59 @@ impl DeepseekV4State {
     /// Must be called where `gpu` is available (the daemon's lcp==0 fresh-
     /// conversation handler), not from `reset()` (no gpu there).
     pub fn zero_decode_caches(&mut self, gpu: &mut rdna_compute::Gpu) {
-        fn z(gpu: &mut rdna_compute::Gpu, t: &Option<rdna_compute::GpuTensor>) {
+        let _ = self.zero_decode_caches_checked(gpu);
+    }
+
+    /// Fallible variant of [`Self::zero_decode_caches`] for reset paths that
+    /// must report GPU failures to their owner.
+    pub fn zero_decode_caches_checked(
+        &mut self,
+        gpu: &mut rdna_compute::Gpu,
+    ) -> hip_bridge::HipResult<()> {
+        fn z(
+            gpu: &mut rdna_compute::Gpu,
+            t: &Option<rdna_compute::GpuTensor>,
+        ) -> hip_bridge::HipResult<()> {
             if let Some(t) = t {
-                let _ = gpu.hip.memset(&t.buf, 0, t.byte_size());
+                gpu.hip.memset(&t.buf, 0, t.byte_size())?;
             }
+            Ok(())
         }
         // The compressor `score_state` ring must reset to -inf, NOT 0 (matches
         // the reference `torch.full(-inf)`): a fresh conversation's first
         // compressed block has no overlap prev-window, and those unfilled slots
         // must get zero softmax weight in the pooling. Reset to 0 would instead
         // pool the prior turn's stale window (or dilute block 0 with zeros).
-        fn zinf(gpu: &mut rdna_compute::Gpu, t: &Option<rdna_compute::GpuTensor>) {
+        fn zinf(
+            gpu: &mut rdna_compute::Gpu,
+            t: &Option<rdna_compute::GpuTensor>,
+        ) -> hip_bridge::HipResult<()> {
             if let Some(t) = t {
-                let _ = gpu.fill_f32(t, f32::NEG_INFINITY);
+                gpu.fill_f32(t, f32::NEG_INFINITY)?;
             }
+            Ok(())
         }
         for l in &self._indexer {
-            z(gpu, &l.main_kv_cache);
-            z(gpu, &l.main_kv_state);
-            zinf(gpu, &l.main_score_state);
-            z(gpu, &l.indexer_kv_cache);
-            z(gpu, &l.indexer_kv_state);
-            zinf(gpu, &l.indexer_score_state);
-            z(gpu, &l.comp_kv_buf);
-            z(gpu, &l.comp_score_buf);
-            z(gpu, &l.comp_concat_kv);
-            z(gpu, &l.comp_concat_score);
+            z(gpu, &l.main_kv_cache)?;
+            z(gpu, &l.main_kv_state)?;
+            zinf(gpu, &l.main_score_state)?;
+            z(gpu, &l.indexer_kv_cache)?;
+            z(gpu, &l.indexer_kv_state)?;
+            zinf(gpu, &l.indexer_score_state)?;
+            z(gpu, &l.comp_kv_buf)?;
+            z(gpu, &l.comp_score_buf)?;
+            z(gpu, &l.comp_concat_kv)?;
+            z(gpu, &l.comp_concat_score)?;
         }
         for l in &self._attention {
-            z(gpu, &l.swa_k);
-            z(gpu, &l.swa_v);
-            z(gpu, &l.full_k_cache);
-            z(gpu, &l.full_v_cache);
-            z(gpu, &l.gathered_k);
-            z(gpu, &l.gathered_v);
+            z(gpu, &l.swa_k)?;
+            z(gpu, &l.swa_v)?;
+            z(gpu, &l.full_k_cache)?;
+            z(gpu, &l.full_v_cache)?;
+            z(gpu, &l.gathered_k)?;
+            z(gpu, &l.gathered_v)?;
         }
+        Ok(())
     }
 
     /// Release every GPU buffer this state owns back to the pool.
@@ -1574,6 +1867,118 @@ impl DeepseekV4State {
         }
         if let Some(pbs) = self.dspark_verify_pbs.take() {
             pbs.free_gpu(gpu);
+        }
+    }
+
+    /// Checked free of every GPU buffer this state owns. Consumes self.
+    /// Continues after individual failures; every owner that could not be
+    /// freed is returned for exact-retention retry.
+    pub fn free_checked(self, gpu: &mut rdna_compute::Gpu) -> Result<(), GpuCleanupFailure> {
+        let mut cf = GpuCleanupFailure::empty();
+
+        // Per-layer indexer + main-attention caches (each a nested owner
+        // with its own checked free — failure categories travel whole).
+        for l in self._indexer {
+            if let Err(f) = l.free_checked(gpu) {
+                cf.merge(f);
+            }
+        }
+        for l in self._attention {
+            if let Err(f) = l.free_checked(gpu) {
+                cf.merge(f);
+            }
+        }
+
+        // Top-level scratch.
+        let mut failures: Vec<RetainedGpuTensor> = Vec::new();
+        retain_free!(gpu, failures,
+            "DeepseekV4State.residual_streams" => self.residual_streams,
+            "DeepseekV4State.embed_scratch" => self.embed_scratch,
+            "DeepseekV4State.tmp" => self.tmp,
+            "DeepseekV4State.tmp_plain" => self.tmp_plain,
+            "DeepseekV4State.mtp_e_norm_scratch" => self.mtp_e_norm_scratch,
+            "DeepseekV4State.mtp_h_norm_scratch" => self.mtp_h_norm_scratch,
+            "DeepseekV4State.mtp_last_hidden" => self.mtp_last_hidden,
+            "DeepseekV4State.q_lat" => self.q_lat,
+            "DeepseekV4State.q_lat_rot" => self.q_lat_rot,
+            "DeepseekV4State.q" => self.q,
+            "DeepseekV4State.kv" => self.kv,
+            "DeepseekV4State.pos_buf" => self.pos_buf,
+            "DeepseekV4State.comp_pos_buf" => self.comp_pos_buf,
+            "DeepseekV4State.pos_array_device" => self.pos_array_device,
+            "DeepseekV4State.token_id_buf" => self.token_id_buf,
+            "DeepseekV4State.attn_state_buf" => self.attn_state_buf,
+            "DeepseekV4State.attn_out" => self.attn_out,
+            "DeepseekV4State.ffn_out" => self.ffn_out,
+            "DeepseekV4State.ffn_x_rot" => self.ffn_x_rot,
+            "DeepseekV4State.ffn_x_plain" => self.ffn_x_plain,
+            "DeepseekV4State.ffn_gate" => self.ffn_gate,
+            "DeepseekV4State.ffn_up" => self.ffn_up,
+            "DeepseekV4State.ffn_silu_rot" => self.ffn_silu_rot,
+            "DeepseekV4State.final_norm" => self.final_norm,
+            "DeepseekV4State.logits" => self.logits,
+            "DeepseekV4State.final_norm_rot" => self.final_norm_rot,
+            "DeepseekV4State.hc_x_in" => self.hc_x_in,
+            "DeepseekV4State.hc_c" => self.hc_c,
+            "DeepseekV4State.router_scores" => self.router_scores,
+            "DeepseekV4State.topk_indices" => self.topk_indices,
+            "DeepseekV4State.routed_expert_out" => self.routed_expert_out,
+            "DeepseekV4State.moe_topk_indices" => self.moe_topk_indices,
+            "DeepseekV4State.moe_topk_weights" => self.moe_topk_weights,
+            "DeepseekV4State.moe_gate_batch" => self.moe_gate_batch,
+            "DeepseekV4State.moe_up_batch" => self.moe_up_batch,
+            "DeepseekV4State.moe_rot_batch" => self.moe_rot_batch,
+            "DeepseekV4State.moe_down_expert_outputs" => self.moe_down_expert_outputs,
+            "DeepseekV4State.q_head_ones" => self.q_head_ones,
+            "DeepseekV4State.attn_out_raw" => self.attn_out_raw,
+            "DeepseekV4State.attn_out_raw_rot" => self.attn_out_raw_rot,
+            "DeepseekV4State.wo_a_out" => self.wo_a_out,
+            "DeepseekV4State.wo_a_out_rot" => self.wo_a_out_rot,
+            "DeepseekV4State.head_hc_pre" => self.head_hc_pre,
+            "DeepseekV4State.head_hc_out" => self.head_hc_out,
+            "DeepseekV4State.head_norm_batch" => self.head_norm_batch,
+            "DeepseekV4State.head_x_f16" => self.head_x_f16,
+            "DeepseekV4State.head_logits_batch" => self.head_logits_batch,
+        );
+
+        // DSpark draft-module state.
+        for (i, ring) in self.dspark_swa_k.into_iter().enumerate() {
+            if let Some(t) = ring {
+                free_tensor_retained(
+                    format!("DeepseekV4State.dspark_swa_k[{i}]"),
+                    t,
+                    gpu,
+                    &mut failures,
+                );
+            }
+        }
+        retain_free!(gpu, failures,
+            "DeepseekV4State.dspark_main_x" => self.dspark_main_x,
+            "DeepseekV4State.dspark_staged" => self.dspark_staged,
+            "DeepseekV4State.dspark_caps" => self.dspark_caps,
+            "DeepseekV4State.dspark_cap_ones" => self.dspark_cap_ones,
+            "DeepseekV4State.dspark_main_hidden" => self.dspark_main_hidden,
+        );
+        for r in failures {
+            cf.add_retained(r);
+        }
+
+        // Nested PBS owners (block + verify-trunk scratch) — their failure
+        // categories travel whole via merge.
+        if let Some(pbs) = self.dspark_pbs {
+            if let Err(f) = pbs.free_checked(gpu) {
+                cf.merge(f);
+            }
+        }
+        if let Some(pbs) = self.dspark_verify_pbs {
+            if let Err(f) = pbs.free_checked(gpu) {
+                cf.merge(f);
+            }
+        }
+        if cf.is_empty() {
+            Ok(())
+        } else {
+            Err(cf)
         }
     }
 }

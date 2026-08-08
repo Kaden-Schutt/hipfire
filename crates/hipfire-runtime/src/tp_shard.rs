@@ -38,6 +38,35 @@
 
 use std::ops::Range;
 
+/// Tensor-parallel expert slice descriptor.
+///
+/// Passed alongside `ShardConfig` (or standalone) when every rank owns ALL
+/// routed experts but each expert's weight matrix is column/row-split across
+/// `tp` ranks. Distinct from EP (`ShardConfig::expert_to_rank`), where ranks
+/// own different expert subsets.
+///
+/// - gate‖up `[2·inter, hidden]` → each rank holds `[2·(inter/tp), hidden]`
+///   (column split via `weight_store::expert_tp_column_pair`).
+/// - down `[hidden, inter]` → each rank holds `[hidden, inter/tp]`
+///   (row gather via `weight_store::expert_tp_row_gather`).
+///
+/// `inter/tp` must be divisible by 256 (the packed-quant group size).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TpExpertSlice {
+    /// Total number of TP ranks.
+    pub tp: usize,
+    /// This rank's index (`0 .. tp`).
+    pub rank: usize,
+}
+
+impl TpExpertSlice {
+    /// Intermediate dimension owned by this rank (`inter / tp`).
+    #[inline]
+    pub fn inter_local(&self, inter: usize) -> usize {
+        inter / self.tp
+    }
+}
+
 /// Routed-expert → rank assignment policy (A3B MoE, Stage 5).
 ///
 /// `Stride` (default) load-balances better when top-k draws cluster on hot
@@ -48,17 +77,6 @@ pub enum ExpertAssign {
     Contiguous,
     /// Expert `e` → rank `e % tp_size`.
     Stride,
-}
-
-impl ExpertAssign {
-    /// Resolve from `HIPFIRE_TP_EXPERT_ASSIGN` (`contiguous` | `stride`).
-    /// Default `Stride` per TP plan §3.6.
-    pub fn from_env() -> Self {
-        match std::env::var("HIPFIRE_TP_EXPERT_ASSIGN").ok().as_deref() {
-            Some("contiguous") | Some("block") => ExpertAssign::Contiguous,
-            _ => ExpertAssign::Stride,
-        }
-    }
 }
 
 /// Pure-CPU TP shard descriptor. Cheap to clone; carries no GPU handles.

@@ -18,7 +18,21 @@ fn sample_parallel_enabled() -> bool {
     use std::sync::OnceLock;
     static EN: OnceLock<bool> = OnceLock::new();
     *EN.get_or_init(|| {
-        std::env::var("HIPFIRE_SAMPLE_PARALLEL")
+        hipfire_config::developer_var("HIPFIRE_SAMPLE_PARALLEL")
+            .map(|v| v != "0")
+            .unwrap_or(true)
+    })
+}
+
+/// Whether the tie-safe fast reducer is enabled (default ON). This keeps the
+/// exact legacy parallel reducer available as a same-binary correctness and
+/// performance control without falling all the way back to the single-block
+/// sampler.
+fn sample_fast_stable_enabled() -> bool {
+    use std::sync::OnceLock;
+    static EN: OnceLock<bool> = OnceLock::new();
+    *EN.get_or_init(|| {
+        hipfire_config::developer_var("HIPFIRE_SAMPLE_FAST")
             .map(|v| v != "0")
             .unwrap_or(true)
     })
@@ -306,6 +320,7 @@ impl Gpu {
         min_p_val: f32,
     ) -> HipResult<(u32, u32)> {
         const N_BLOCKS: u32 = 128;
+        let any_penalty = repeat_penalty > 1.0 || presence_penalty > 0.0 || frequency_penalty > 0.0;
         // ARCHBLEED FIX (was d3472d9e): the gather budget is REQUEST-SELECTED,
         // not a global hardcode. W7 P2b widened TOP_K 20→64 (so minimax top_k=40
         // is honored) and dropped the block 256→128 to fit LDS — but did so
@@ -326,60 +341,58 @@ impl Gpu {
         // keyed by function name and skips reload once a name is present (see
         // compile_and_load_kernel), so the wide variant SUFFIXES its entry
         // points to coexist with the default without clobbering it.
-        let (m, suffix): (&str, &str) = if wide {
-            ("sample_top_p_parallel_w64", "_w64")
+        let (m, fn_penalty, fn_partial, fn_finalize) = if wide {
+            (
+                "sample_top_p_parallel_w64",
+                "sample_apply_repeat_penalty_w64",
+                "sample_topk_partial_w64",
+                "sample_topk_finalize_w64",
+            )
         } else {
-            ("sample_top_p_parallel", "")
+            (
+                "sample_top_p_parallel",
+                "sample_apply_repeat_penalty",
+                "sample_topk_partial",
+                "sample_topk_finalize",
+            )
         };
-        let src: String = if wide {
-            kernels::SAMPLE_TOP_P_PARALLEL_SRC
-                .replace(
-                    "sample_apply_repeat_penalty",
-                    "sample_apply_repeat_penalty_w64",
-                )
-                .replace("sample_topk_partial", "sample_topk_partial_w64")
-                .replace("sample_topk_finalize", "sample_topk_finalize_w64")
-        } else {
-            kernels::SAMPLE_TOP_P_PARALLEL_SRC.replace("#define TOP_K 64", "#define TOP_K 20")
-        };
-        let fn_penalty = format!("sample_apply_repeat_penalty{suffix}");
-        let fn_partial = format!("sample_topk_partial{suffix}");
-        let fn_finalize = format!("sample_topk_finalize{suffix}");
-        self.ensure_kernel(m, &src, &fn_penalty)?;
-        self.ensure_kernel(m, &src, &fn_partial)?;
-        self.ensure_kernel(m, &src, &fn_finalize)?;
+        // `ensure_kernel` caches compiled functions, but constructing/replacing
+        // the full HIP source used to happen before that cache check on every
+        // generated token. Only materialize source when a function is missing.
+        if !self.functions.contains_key(fn_penalty)
+            || !self.functions.contains_key(fn_partial)
+            || !self.functions.contains_key(fn_finalize)
+        {
+            let src: String = if wide {
+                kernels::SAMPLE_TOP_P_PARALLEL_SRC
+                    .replace(
+                        "sample_apply_repeat_penalty",
+                        "sample_apply_repeat_penalty_w64",
+                    )
+                    .replace("sample_topk_partial", "sample_topk_partial_w64")
+                    .replace("sample_topk_finalize", "sample_topk_finalize_w64")
+            } else {
+                kernels::SAMPLE_TOP_P_PARALLEL_SRC.replace("#define TOP_K 64", "#define TOP_K 20")
+            };
+            self.ensure_kernel(m, &src, fn_penalty)?;
+            self.ensure_kernel(m, &src, fn_partial)?;
+            self.ensure_kernel(m, &src, fn_finalize)?;
+        }
 
         // Partials scratch: [N_BLOCKS*TOP_K] f32 vals then [N_BLOCKS*TOP_K] i32 idx.
         let n_cand = N_BLOCKS as usize * top_k;
         let val_bytes = n_cand * 4;
-        let partial_base = self
-            .scratch
-            .ensure_sample_partials(&self.hip, val_bytes * 2)?;
-        let partial_val_ptr = partial_base;
-        let partial_idx_ptr =
-            unsafe { (partial_base as *mut u8).add(val_bytes) as *mut std::ffi::c_void };
-
         let mut logits_ptr = logits.buf.as_ptr();
-        let mut result_ptr = result_buf.buf.as_ptr();
         let mut repeat_ptr = repeat_buf.buf.as_ptr();
         let mut vs = vocab_size as i32;
-        let mut nb = N_BLOCKS as i32;
-        let mut ncand = n_cand as i32;
-        let mut temp = temperature;
-        let mut tp = top_p;
-        let mut rng = rng_state;
         let mut rw = repeat_window as i32;
         let mut rp = repeat_penalty;
         let mut pp = presence_penalty;
         let mut fp = frequency_penalty;
-        let mut pval = partial_val_ptr;
-        let mut pidx = partial_idx_ptr;
-        let mut tk = top_k_req;
-        let mut mp = min_p_val;
 
-        let any_penalty = repeat_penalty > 1.0 || presence_penalty > 0.0 || frequency_penalty > 0.0;
-
-        // 1) Penalty prepass (in-place on logits), only when active.
+        // 1) Penalty prepass (in-place on logits), only when active. It runs
+        // before the fast attempt so an ambiguity fallback can reuse the
+        // adjusted logits without applying the penalty twice.
         if any_penalty && repeat_window > 0 {
             let mut params: Vec<*mut c_void> = vec![
                 &mut logits_ptr as *mut _ as *mut c_void,
@@ -390,7 +403,7 @@ impl Gpu {
                 &mut pp as *mut _ as *mut c_void,
                 &mut fp as *mut _ as *mut c_void,
             ];
-            let func = &self.functions[fn_penalty.as_str()];
+            let func = &self.functions[fn_penalty];
             unsafe {
                 self.hip.launch_kernel(
                     func,
@@ -403,6 +416,47 @@ impl Gpu {
             }
         }
 
+        // The top-21 reducer uses a different internal order but accepts its
+        // result only when the ordering is provably unambiguous. A sentinel
+        // falls through to the exact reducer below. The penalty prepass has
+        // already run exactly once for both outcomes.
+        if sample_fast_stable_enabled()
+            && top_k_req > 0
+            && top_k_req <= 20
+            && vocab_size <= N_BLOCKS as usize * 256 * 16
+        {
+            if let Some(result) = self.sample_top_p_fast_stable_impl(
+                logits,
+                result_buf,
+                vocab_size,
+                temperature,
+                top_p,
+                rng_state,
+                top_k_req,
+                min_p_val,
+            )? {
+                return Ok(result);
+            }
+        }
+
+        let partial_base = self
+            .scratch
+            .ensure_sample_partials(&self.hip, val_bytes * 2)?;
+        let partial_val_ptr = partial_base;
+        let partial_idx_ptr =
+            unsafe { (partial_base as *mut u8).add(val_bytes) as *mut std::ffi::c_void };
+
+        let mut result_ptr = result_buf.buf.as_ptr();
+        let mut nb = N_BLOCKS as i32;
+        let mut ncand = n_cand as i32;
+        let mut temp = temperature;
+        let mut tp = top_p;
+        let mut rng = rng_state;
+        let mut pval = partial_val_ptr;
+        let mut pidx = partial_idx_ptr;
+        let mut tk = top_k_req;
+        let mut mp = min_p_val;
+
         // 2) Per-block partial top-K over vocab strips.
         {
             let mut params: Vec<*mut c_void> = vec![
@@ -412,7 +466,7 @@ impl Gpu {
                 &mut pval as *mut _ as *mut c_void,
                 &mut pidx as *mut _ as *mut c_void,
             ];
-            let func = &self.functions[fn_partial.as_str()];
+            let func = &self.functions[fn_partial];
             unsafe {
                 self.hip.launch_kernel(
                     func,
@@ -438,7 +492,7 @@ impl Gpu {
                 &mut tk as *mut _ as *mut c_void,
                 &mut mp as *mut _ as *mut c_void,
             ];
-            let func = &self.functions[fn_finalize.as_str()];
+            let func = &self.functions[fn_finalize];
             unsafe {
                 self.hip.launch_kernel(
                     func,
@@ -456,6 +510,123 @@ impl Gpu {
         let token_id = u32::from_ne_bytes([out[0], out[1], out[2], out[3]]);
         let new_rng = u32::from_ne_bytes([out[4], out[5], out[6], out[7]]);
         Ok((token_id, new_rng))
+    }
+
+    /// Fast top-21 reducer for the common top_k<=20 path. Any requested penalty
+    /// is applied by the caller before entry. Returns `None` when the kernel
+    /// detects a probability tie whose stable ordering could differ from the
+    /// legacy reduction; the caller then runs legacy on the same adjusted logits.
+    #[allow(clippy::too_many_arguments)]
+    fn sample_top_p_fast_stable_impl(
+        &mut self,
+        logits: &GpuTensor,
+        result_buf: &GpuTensor,
+        vocab_size: usize,
+        temperature: f32,
+        top_p: f32,
+        rng_state: u32,
+        top_k_req: i32,
+        min_p_val: f32,
+    ) -> HipResult<Option<(u32, u32)>> {
+        const N_BLOCKS: u32 = 128;
+        const TOP_K: usize = 21;
+        const PARTIAL_BLOCK: u32 = 256;
+        const FINALIZE_BLOCK: u32 = 128;
+        const FN_PARTIAL: &str = "sample_topk_partial_fast21";
+        const FN_FINALIZE: &str = "sample_topk_finalize_fast21";
+
+        if !self.functions.contains_key(FN_PARTIAL) || !self.functions.contains_key(FN_FINALIZE) {
+            let src = kernels::SAMPLE_TOP_P_PARALLEL_SRC
+                .replace(
+                    "#define TOP_K 64",
+                    "#define TOP_K 21\n#define SAMPLE_FAST_STABLE 1",
+                )
+                .replace(
+                    "sample_apply_repeat_penalty",
+                    "sample_apply_repeat_penalty_fast21",
+                )
+                .replace("sample_topk_partial", FN_PARTIAL)
+                .replace("sample_topk_finalize", FN_FINALIZE);
+            self.ensure_kernel("sample_top_p_parallel_fast21", &src, FN_PARTIAL)?;
+            self.ensure_kernel("sample_top_p_parallel_fast21", &src, FN_FINALIZE)?;
+        }
+
+        let n_cand = N_BLOCKS as usize * TOP_K;
+        let val_bytes = n_cand * 4;
+        let partial_base = self
+            .scratch
+            .ensure_sample_partials(&self.hip, val_bytes * 2)?;
+        let partial_val_ptr = partial_base;
+        let partial_idx_ptr =
+            unsafe { (partial_base as *mut u8).add(val_bytes) as *mut std::ffi::c_void };
+
+        let mut logits_ptr = logits.buf.as_ptr();
+        let mut result_ptr = result_buf.buf.as_ptr();
+        let mut vs = vocab_size as i32;
+        let mut nb = N_BLOCKS as i32;
+        let mut ncand = n_cand as i32;
+        let mut temp = temperature;
+        let mut tp = top_p;
+        let mut rng = rng_state;
+        let mut pval = partial_val_ptr;
+        let mut pidx = partial_idx_ptr;
+        let mut tk = top_k_req;
+        let mut mp = min_p_val;
+
+        {
+            let mut params: Vec<*mut c_void> = vec![
+                &mut logits_ptr as *mut _ as *mut c_void,
+                &mut vs as *mut _ as *mut c_void,
+                &mut nb as *mut _ as *mut c_void,
+                &mut pval as *mut _ as *mut c_void,
+                &mut pidx as *mut _ as *mut c_void,
+            ];
+            let func = &self.functions[FN_PARTIAL];
+            unsafe {
+                self.hip.launch_kernel(
+                    func,
+                    [N_BLOCKS, 1, 1],
+                    [PARTIAL_BLOCK, 1, 1],
+                    PARTIAL_BLOCK * 4 * 2,
+                    self.stream_ref(),
+                    &mut params,
+                )?;
+            }
+        }
+        {
+            let mut params: Vec<*mut c_void> = vec![
+                &mut pval as *mut _ as *mut c_void,
+                &mut pidx as *mut _ as *mut c_void,
+                &mut ncand as *mut _ as *mut c_void,
+                &mut result_ptr as *mut _ as *mut c_void,
+                &mut temp as *mut _ as *mut c_void,
+                &mut tp as *mut _ as *mut c_void,
+                &mut rng as *mut _ as *mut c_void,
+                &mut tk as *mut _ as *mut c_void,
+                &mut mp as *mut _ as *mut c_void,
+            ];
+            let func = &self.functions[FN_FINALIZE];
+            unsafe {
+                self.hip.launch_kernel(
+                    func,
+                    [1, 1, 1],
+                    [FINALIZE_BLOCK, 1, 1],
+                    FINALIZE_BLOCK * 4 * 3,
+                    self.stream_ref(),
+                    &mut params,
+                )?;
+            }
+        }
+
+        let mut out = [0u8; 8];
+        self.hip.memcpy_dtoh(&mut out, &result_buf.buf)?;
+        let token_id = u32::from_ne_bytes([out[0], out[1], out[2], out[3]]);
+        let new_rng = u32::from_ne_bytes([out[4], out[5], out[6], out[7]]);
+        if token_id == u32::MAX {
+            Ok(None)
+        } else {
+            Ok(Some((token_id, new_rng)))
+        }
     }
 
     /// Launch sampling kernel only (no readback). For use during graph capture.

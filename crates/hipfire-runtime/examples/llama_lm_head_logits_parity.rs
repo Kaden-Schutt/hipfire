@@ -50,11 +50,16 @@ fn main() {
         max_seq: 2048,
         draft_path: None,
         kv_mode_override: None,
+        kv_backend: hipfire_runtime::kv_backend::KvBackend::Contiguous,
         kv_adaptive_override: None,
         state_quant_override: None,
         cask: &cask,
         pp: 1,
+        pp_bands: None,
+        mtp_mode: "auto",
+        mtp_k: 3,
         spec: SpecLoadCfg::default(),
+        kv_physical_cap: None,
         gpu: &mut gpu,
     };
 
@@ -76,7 +81,7 @@ fn main() {
         .expect("spec_advance");
 
     let last_argmax = match adv {
-        SpecAdvance::Ready { last_argmax } => {
+        SpecAdvance::Ready { last_argmax, .. } => {
             eprintln!("[task2b] spec_advance Ready, last_argmax={last_argmax}");
             last_argmax
         }

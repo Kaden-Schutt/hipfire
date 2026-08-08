@@ -2,6 +2,7 @@
 //! chain, qwen3 dense transformer) is the only arch-specific seam — see
 //! [`DsparkBody`]. Everything else (main_proj ingest, markov head, confidence
 //! head, window orchestration) lives here.
+use crate::gpu_cleanup::{free_tensor_retained, GpuCleanupFailure, RetainedGpuTensor};
 use crate::spec::{
     accept_greedy_prefix, MtpDrafter, MtpSpeculator, MtpWindow, SpecGrammar, SpecTarget, Speculator,
 };
@@ -22,7 +23,7 @@ struct DsparkProfiler {
 
 impl DsparkProfiler {
     fn new() -> Self {
-        let enabled = std::env::var("HIPFIRE_DSPARK_PROFILE")
+        let enabled = hipfire_config::developer_var("HIPFIRE_DSPARK_PROFILE")
             .map(|s| s == "1")
             .unwrap_or(false);
         Self {
@@ -226,6 +227,76 @@ pub struct DsparkWeights {
     pub d2t: Option<Vec<u32>>,
 }
 
+impl DsparkWeights {
+    pub fn free_gpu(self, gpu: &mut Gpu) {
+        let Self {
+            cfg: _,
+            main_proj,
+            main_norm,
+            markov_w1,
+            markov_w2,
+            confidence_proj,
+            confidence_bias,
+            d2t: _,
+        } = self;
+        for tensor in [
+            main_proj,
+            main_norm,
+            markov_w1,
+            markov_w2,
+            confidence_proj,
+            confidence_bias,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let _ = gpu.free_tensor(tensor);
+        }
+    }
+
+    /// Checked GPU cleanup: attempts every tensor independently, retains
+    /// every allocation that could not be freed for retry.
+    ///
+    /// On success all resources are consumed (`Ok(())`). On failure the
+    /// returned [`GpuCleanupFailure`] carries the exact original tensors
+    /// that could not be freed, ready for retry.
+    pub fn free_checked(self, gpu: &mut Gpu) -> Result<(), GpuCleanupFailure> {
+        let Self {
+            cfg: _,
+            main_proj,
+            main_norm,
+            markov_w1,
+            markov_w2,
+            confidence_proj,
+            confidence_bias,
+            d2t: _,
+        } = self;
+        let mut failures: Vec<RetainedGpuTensor> = Vec::new();
+
+        for (label, t) in [
+            ("DsparkWeights.main_proj", main_proj),
+            ("DsparkWeights.main_norm", main_norm),
+            ("DsparkWeights.markov_w1", markov_w1),
+            ("DsparkWeights.markov_w2", markov_w2),
+            ("DsparkWeights.confidence_proj", confidence_proj),
+            ("DsparkWeights.confidence_bias", confidence_bias),
+        ] {
+            if let Some(t) = t {
+                free_tensor_retained(label, t, gpu, &mut failures);
+            }
+        }
+
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(GpuCleanupFailure {
+                failed_tensors: failures,
+                other: Vec::new(),
+            })
+        }
+    }
+}
+
 /// The arch-specific seam: draft one window's block given the assembled
 /// multi-slot context, returning the per-slot post-final-norm hidden (`x_head`).
 ///
@@ -238,7 +309,7 @@ pub struct DsparkWeights {
 /// contract (backward-compatible with Stage 1).  The deepseek4 body always
 /// calls with `ctx_len = 1` (Stage 3 will change this); the qwen3 body uses
 /// the full multi-slot `ctx_len` once Stage 2 wires it.
-pub trait DsparkBody {
+pub trait DsparkBody: Send {
     fn draft_block(
         &mut self,
         gpu: &mut Gpu,
@@ -252,6 +323,14 @@ pub trait DsparkBody {
     ) -> Result<(), String>;
     fn block_size(&self) -> usize;
     fn free(self: Box<Self>, gpu: &mut Gpu);
+
+    /// Clear body-local conversation/draft residuals so a cold retry cannot
+    /// bleed prior-window rings (DeepSeek `dspark_swa_k`, etc.).
+    ///
+    /// Default: no-op for bodies without persistent draft-local GPU state.
+    /// [`DsparkDrafter::mtp_reset`] always invokes this after clearing its own
+    /// multi-slot context cache.
+    fn reset_for_retry(&mut self, _gpu: &mut Gpu) {}
 }
 
 /// Per-window draft output: `block_size` token ids + per-slot confidence.
@@ -411,7 +490,7 @@ fn gemv_auto_batched_wmma(
             .gemm_f32_register_tiled(weight, x_plain_batch, y, m, k, batch_size)
             .map_err(|e| format!("gemm_f32_register_tiled: {e:?}")),
         DType::Q8_0 => {
-            let wmma_on = std::env::var("HIPFIRE_DSPARK_Q8_WMMA")
+            let wmma_on = hipfire_config::developer_var("HIPFIRE_DSPARK_Q8_WMMA")
                 .map(|s| s != "0")
                 .unwrap_or(true);
             if wmma_on && gpu.arch_caps.is_rdna4() {
@@ -419,7 +498,8 @@ fn gemv_auto_batched_wmma(
                     let n = (batch_size * k) as i64;
                     gpu.deepseek4_convert_f32_to_f16(x_plain_batch, scratch, n)
                         .map_err(|e| format!("convert_f32_to_f16 (Q8 WMMA): {e:?}"))?;
-                    let opt_out = std::env::var("HIPFIRE_DSPARK_Q8_4W").as_deref() == Ok("0");
+                    let opt_out =
+                        hipfire_config::developer_var("HIPFIRE_DSPARK_Q8_4W").as_deref() == Ok("0");
                     let use_4w = !opt_out
                         && batch_size >= 256
                         && m >= 4096
@@ -440,7 +520,8 @@ fn gemv_auto_batched_wmma(
                     let n = (batch_size * k) as i64;
                     gpu.deepseek4_convert_f32_to_f16(x_plain_batch, scratch, n)
                         .map_err(|e| format!("convert_f32_to_f16 (Q8 WMMA): {e:?}"))?;
-                    let opt_out_4w = std::env::var("HIPFIRE_DSPARK_Q8_4W").as_deref() == Ok("0");
+                    let opt_out_4w =
+                        hipfire_config::developer_var("HIPFIRE_DSPARK_Q8_4W").as_deref() == Ok("0");
                     if !opt_out_4w && batch_size >= 64 && batch_size % 64 == 0 {
                         return gpu
                             .gemm_q8_0_wmma_4w(weight, scratch, y, m, k, batch_size)
@@ -487,7 +568,7 @@ fn gemv_auto_batched_wmma(
             }
         }
         _ => {
-            let wmma_on = std::env::var("HIPFIRE_DSPARK_HFQ4_WMMA")
+            let wmma_on = hipfire_config::developer_var("HIPFIRE_DSPARK_HFQ4_WMMA")
                 .map(|s| s != "0")
                 .unwrap_or(true);
             if wmma_on {
@@ -775,25 +856,24 @@ pub fn run_heads(
     // Reduced-vocab (d2t Some) forces the host path: each argmax is a DRAFT id
     // that must be d2t-remapped to a TARGET id before it can index the
     // full-target-vocab markov chain — the on-GPU chain kernel can't do that gather.
-    let chain_bufs: Option<(GpuTensor, GpuTensor)> = if markov_w1_device_embeddable(markov_w1)
-        && weights.d2t.is_none()
-    {
-        let chain = gpu
-            .alloc_tensor(&[block + 1], DType::F32)
-            .map_err(|e| format!("run_heads alloc token chain: {e:?}"))?;
-        let seed_i32 = prev_token as i32;
-        let seed_bytes: &[u8] =
-            unsafe { std::slice::from_raw_parts(&seed_i32 as *const i32 as *const u8, 4) };
-        gpu.hip
-            .memcpy_htod(&chain.buf, seed_bytes)
-            .map_err(|e| format!("run_heads htod token chain seed: {e:?}"))?;
-        let argmax_scratch = gpu
-            .alloc_tensor(&[1], DType::F32)
-            .map_err(|e| format!("run_heads alloc argmax scratch: {e:?}"))?;
-        Some((chain, argmax_scratch))
-    } else {
-        None
-    };
+    let chain_bufs: Option<(GpuTensor, GpuTensor)> =
+        if markov_w1_device_embeddable(markov_w1) && weights.d2t.is_none() {
+            let chain = gpu
+                .alloc_tensor(&[block + 1], DType::F32)
+                .map_err(|e| format!("run_heads alloc token chain: {e:?}"))?;
+            let seed_i32 = prev_token as i32;
+            let seed_bytes: &[u8] =
+                unsafe { std::slice::from_raw_parts(&seed_i32 as *const i32 as *const u8, 4) };
+            gpu.hip
+                .memcpy_htod(&chain.buf, seed_bytes)
+                .map_err(|e| format!("run_heads htod token chain seed: {e:?}"))?;
+            let argmax_scratch = gpu
+                .alloc_tensor(&[1], DType::F32)
+                .map_err(|e| format!("run_heads alloc argmax scratch: {e:?}"))?;
+            Some((chain, argmax_scratch))
+        } else {
+            None
+        };
 
     // Confidence head buffers (ON GPU per slot inside the loop):
     // `conf_batch[block]` holds the per-slot confidence logit.
@@ -1046,6 +1126,10 @@ pub struct DsparkDrafter {
 }
 
 impl MtpDrafter for DsparkDrafter {
+    fn name(&self) -> &'static str {
+        "dspark"
+    }
+
     fn mtp_prefill(
         &mut self,
         gpu: &mut Gpu,
@@ -1055,7 +1139,7 @@ impl MtpDrafter for DsparkDrafter {
         cache_hit: bool,
     ) -> Result<u32, String> {
         if !cache_hit {
-            target.reset_recurrent(gpu);
+            target.reset_recurrent(gpu)?;
         }
         // Invalidate multi-slot context: mtp_step re-bootstraps for the first seed.
         // As in the deepseek4 drafter, we do NOT warm the DSpark stage rings
@@ -1078,15 +1162,47 @@ impl MtpDrafter for DsparkDrafter {
             return Err("DsparkDrafter::mtp_prefill: fill_tokens is empty".into());
         }
 
-        // Run the full prefill through spec_advance (reset=false; recurrent was
-        // already reset above on cache_miss). Returns argmax at the last position,
+        // Run the full prefill through spec_advance (the central reset already
+        // ran on a cache miss). Returns argmax at the last position,
         // which is the seed for the first decode window.
         let abort = &|| false;
         match target.spec_advance(gpu, fill_tokens, start_pos, false, abort, None)? {
-            crate::spec::SpecAdvance::Ready { last_argmax } => Ok(last_argmax),
+            crate::spec::SpecAdvance::Ready { last_argmax, .. } => Ok(last_argmax),
             crate::spec::SpecAdvance::Aborted => {
                 Err("DsparkDrafter::mtp_prefill: spec_advance aborted".into())
             }
+        }
+    }
+
+    fn mtp_prefill_abortable(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+        fill_tokens: &[u32],
+        start_pos: usize,
+        _cache_hit: bool,
+        abort: Option<&dyn Fn() -> bool>,
+    ) -> Result<Option<u32>, String> {
+        if abort.is_some_and(|check| check()) {
+            return Ok(None);
+        }
+        if let Some(dev) = self.main_hidden_dev.take() {
+            let _ = gpu.free_tensor(dev);
+        }
+        self.ctx_positions.clear();
+        if let Some(c) = self.block_controller.as_mut() {
+            c.reset();
+        }
+        if fill_tokens.is_empty() {
+            return Err("DsparkDrafter::mtp_prefill: fill_tokens is empty".into());
+        }
+        let no_abort = || false;
+        let abort = abort.unwrap_or(&no_abort);
+        match target.spec_advance(gpu, fill_tokens, start_pos, false, abort, None)? {
+            crate::spec::SpecAdvance::Ready { last_argmax, .. } if !abort() => {
+                Ok(Some(last_argmax))
+            }
+            crate::spec::SpecAdvance::Ready { .. } | crate::spec::SpecAdvance::Aborted => Ok(None),
         }
     }
 
@@ -1106,14 +1222,20 @@ impl MtpDrafter for DsparkDrafter {
 
         let layers = self.weights.cfg.target_layer_ids.clone();
         let n_targets = layers.len();
-        // Adaptive path overrides the caller's k with the controller's current cap;
+        // Adaptive path may shrink below the caller's k, but MUST NOT exceed it:
+        // per-call k from MtpSpeculator is the remaining max_emit budget.
         // fixed path (opt-out) keeps the old behaviour exactly.
         let effective_k = self
             .block_controller
             .as_ref()
-            .map(|c| c.block())
+            .map(|c| c.block().min(k))
             .unwrap_or(k);
-        let block = self.weights.cfg.block_size.min(effective_k).max(1);
+        // k==0 is the true one-token path (verify seed only, no drafts).
+        let block = if k == 0 {
+            0
+        } else {
+            self.weights.cfg.block_size.min(effective_k).max(1)
+        };
         let vocab = self.lm_head.shape[0];
         let hidden = {
             // Infer hidden from stage_norm shape (it's [hidden]).
@@ -1129,7 +1251,7 @@ impl MtpDrafter for DsparkDrafter {
         if self.ctx_positions.is_empty() {
             // Initial window: bootstrap with a 1-token capture-armed forward.
             let hidden_host = target.capture_seed_main_hidden(gpu, seed, position, &layers)?;
-            if std::env::var("HIPFIRE_DSPARK_DEBUG").as_deref() == Ok("1") {
+            if hipfire_config::developer_var("HIPFIRE_DSPARK_DEBUG").as_deref() == Ok("1") {
                 let n = hidden_host.len();
                 let mean = hidden_host.iter().sum::<f32>() / n.max(1) as f32;
                 let rms = (hidden_host.iter().map(|x| x * x).sum::<f32>() / n.max(1) as f32).sqrt();
@@ -1169,64 +1291,69 @@ impl MtpDrafter for DsparkDrafter {
         // DEBUG: HIPFIRE_DSPARK_ZERO_CTX=1 zeros the context main_hidden to test
         // whether the drafter attends to it at all (identical drafts ⇒ ctx unused).
         let _zero_ctx_holder;
-        let main_hidden = if std::env::var("HIPFIRE_DSPARK_ZERO_CTX").as_deref() == Ok("1") {
-            let n: usize = main_hidden_real.shape.iter().product();
-            _zero_ctx_holder = upload_f32(gpu, &vec![0.0f32; n])?;
-            &_zero_ctx_holder
+        let main_hidden =
+            if hipfire_config::developer_var("HIPFIRE_DSPARK_ZERO_CTX").as_deref() == Ok("1") {
+                let n: usize = main_hidden_real.shape.iter().product();
+                _zero_ctx_holder = upload_f32(gpu, &vec![0.0f32; n])?;
+                &_zero_ctx_holder
+            } else {
+                main_hidden_real
+            };
+
+        // ── 2–3. Draft the block (skipped on k==0 one-token path) ──────────
+        // k==0: verify [seed] only and emit the single bonus — no draft_block /
+        // run_heads, and no conf-threshold that would force keep≥1.
+        let (mut drafts, draft_confidence): (Vec<u32>, Vec<f32>) = if block == 0 {
+            (Vec::new(), Vec::new())
         } else {
-            main_hidden_real
-        };
+            let x_head_out = gpu
+                .alloc_tensor(&[block, hidden], DType::F32)
+                .map_err(|e| format!("DsparkDrafter: alloc x_head: {e:?}"))?;
+            let t_draft = self.profiler.sync_start(gpu);
+            self.body.draft_block(
+                gpu,
+                &self.weights,
+                main_hidden,
+                &ctx_positions,
+                seed,
+                position,
+                block,
+                &x_head_out,
+            )?;
+            self.profiler.sync_end(gpu, t_draft, 1);
 
-        // ── 2. Draft the block with DsparkBody ──────────────────────────────
-        let x_head_out = gpu
-            .alloc_tensor(&[block, hidden], DType::F32)
-            .map_err(|e| format!("DsparkDrafter: alloc x_head: {e:?}"))?;
-        let t_draft = self.profiler.sync_start(gpu);
-        self.body.draft_block(
-            gpu,
-            &self.weights,
-            main_hidden,
-            &ctx_positions,
-            seed,
-            position,
-            block,
-            &x_head_out,
-        )?;
-        self.profiler.sync_end(gpu, t_draft, 1);
+            let t_heads = self.profiler.sync_start(gpu);
+            let draft = run_heads(
+                gpu,
+                &self.weights,
+                &self.stage_norm,
+                &self.lm_head,
+                &x_head_out,
+                seed,
+                block,
+                vocab,
+            )?;
+            self.profiler.sync_end(gpu, t_heads, 2);
+            let _ = gpu.free_tensor(x_head_out);
 
-        // ── 3. Heads: markov argmax + confidence ────────────────────────────
-        let t_heads = self.profiler.sync_start(gpu);
-        let draft = run_heads(
-            gpu,
-            &self.weights,
-            &self.stage_norm,
-            &self.lm_head,
-            &x_head_out,
-            seed,
-            block,
-            vocab,
-        )?;
-        self.profiler.sync_end(gpu, t_heads, 2);
-        let _ = gpu.free_tensor(x_head_out);
-
-        let mut drafts: Vec<u32> = draft.tokens.into_iter().take(block).collect();
-
-        // ── 3a. Confidence-threshold truncation ─────────────────────────────
-        // Mirror Deepseek4DsparkDrafter exactly: walk slots, truncate at first
-        // slot whose sigmoid(confidence) < conf_threshold; always keep ≥1.
-        let conf_threshold = self.conf_threshold;
-        let confident_len = {
-            let mut l = drafts.len();
-            for (i, &c) in draft.confidence.iter().enumerate().take(drafts.len()) {
-                let survival = 1.0f32 / (1.0 + (-c).exp());
-                if survival < conf_threshold {
-                    l = i;
-                    break;
+            let mut drafts: Vec<u32> = draft.tokens.into_iter().take(block).collect();
+            // Confidence-threshold truncation: walk slots, truncate at first
+            // slot whose sigmoid(confidence) < conf_threshold; always keep ≥1.
+            let conf_threshold = self.conf_threshold;
+            let confident_len = {
+                let mut l = drafts.len();
+                for (i, &c) in draft.confidence.iter().enumerate().take(drafts.len()) {
+                    let survival = 1.0f32 / (1.0 + (-c).exp());
+                    if survival < conf_threshold {
+                        l = i;
+                        break;
+                    }
                 }
-            }
-            l.max(1)
+                l.max(1)
+            };
+            drafts.truncate(confident_len);
+            (drafts, draft.confidence)
         };
-        drafts.truncate(confident_len);
         let n_proposed = drafts.len();
 
         // ── 4. Verify: target forward over [seed, draft0..draft_{n-1}] ───────
@@ -1286,12 +1413,12 @@ impl MtpDrafter for DsparkDrafter {
 
         // ── 5. Greedy accept ─────────────────────────────────────────────────
         let t_rest = self.profiler.sync_start(gpu);
-        if std::env::var("HIPFIRE_DSPARK_DEBUG").as_deref() == Ok("1") {
+        if hipfire_config::developer_var("HIPFIRE_DSPARK_DEBUG").as_deref() == Ok("1") {
             eprintln!(
                 "[dspark] pos={position} seed={seed} n_prop={n_proposed} drafts={:?} target_pick={:?} conf={:?}",
                 &drafts,
                 &target_pick[..target_pick.len().min(drafts.len() + 1)],
-                &draft.confidence[..draft.confidence.len().min(4)]
+                &draft_confidence[..draft_confidence.len().min(4)]
             );
         }
         let acc = accept_greedy_prefix(&drafts, &target_pick, Some(eos));
@@ -1313,8 +1440,9 @@ impl MtpDrafter for DsparkDrafter {
         // Each slot contributes n_targets * hidden floats (row = concat of
         // extract-layer hiddens at that position).
         // Cap ctx_len to block+1 (the scratch `max_ctx_len` in the qwen3 body).
+        // block==0 (k==0 one-token path) still needs at least one ctx slot.
         let new_ctx_len_raw = accept_len + 1; // seed + accepted drafts
-        let new_ctx_len = new_ctx_len_raw.min(block + 1);
+        let new_ctx_len = new_ctx_len_raw.min(block.max(1) + 1);
         if captured {
             // Slice the accepted prefix (new_ctx_len slots) out of the GPU capture
             // buffer into a fresh drafter-owned buffer — all on-device, no D2H+H2D.
@@ -1329,9 +1457,8 @@ impl MtpDrafter for DsparkDrafter {
                 .map_err(|e| format!("DsparkDrafter: alloc ctx hidden: {e:?}"))?;
             gpu.memcpy_dtod_at_auto(&dev.buf, 0, &capture_buf.buf, src_offset * 4, n_floats * 4)
                 .map_err(|e| format!("DsparkDrafter: d2d ctx hidden: {e:?}"))?;
-            if let Some(old) = self.main_hidden_dev.take() {
-                let _ = gpu.free_tensor(old);
-            }
+            gpu.free_tensor_checked(&mut self.main_hidden_dev)
+                .map_err(|e| format!("DsparkDrafter: free old ctx hidden: {e:?}"))?;
             self.main_hidden_dev = Some(dev);
             // ctx positions: position + start_slot .. position + start_slot + new_ctx_len
             self.ctx_positions = (start_slot..start_slot + new_ctx_len)
@@ -1346,9 +1473,8 @@ impl MtpDrafter for DsparkDrafter {
             // `capture_seed_main_hidden` advances the KV by exactly 1 for the
             // bonus, which is the right thing).  This is the Stage 1 behaviour
             // and is correct — just forfeits the multi-slot ctx for one window.
-            if let Some(old) = self.main_hidden_dev.take() {
-                let _ = gpu.free_tensor(old);
-            }
+            gpu.free_tensor_checked(&mut self.main_hidden_dev)
+                .map_err(|e| format!("DsparkDrafter: free stale ctx hidden: {e:?}"))?;
             self.ctx_positions.clear();
         }
         let _ = gpu.free_tensor(capture_buf);
@@ -1368,12 +1494,39 @@ impl MtpDrafter for DsparkDrafter {
         })
     }
 
-    fn mtp_reset(&mut self, gpu: &mut Gpu) {
-        // Clear multi-slot context so the next prefill re-bootstraps.
+    fn mtp_forced_advance(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+        tokens: &[u32],
+        start_pos: usize,
+        abort: &dyn Fn() -> bool,
+    ) -> Result<bool, String> {
+        // Forced tokens advance the trunk via plain spec_advance; multi-slot
+        // DSpark context is invalidated so the next mtp_step re-bootstraps
+        // from the new seed (same posture as mtp_prefill on any cache path).
+        if tokens.is_empty() {
+            return Ok(true);
+        }
         if let Some(dev) = self.main_hidden_dev.take() {
             let _ = gpu.free_tensor(dev);
         }
         self.ctx_positions.clear();
+        match target.spec_advance(gpu, tokens, start_pos, false, abort, None)? {
+            crate::spec::SpecAdvance::Ready { .. } => Ok(true),
+            crate::spec::SpecAdvance::Aborted => Ok(true),
+        }
+    }
+
+    fn mtp_reset(&mut self, gpu: &mut Gpu) -> Result<(), String> {
+        // Clear multi-slot context so the next prefill re-bootstraps.
+        gpu.free_tensor_checked(&mut self.main_hidden_dev)
+            .map_err(|e| format!("DSpark reset main_hidden_dev: {e}"))?;
+        self.ctx_positions.clear();
+        // Body-owned draft rings / scratch (e.g. DeepSeek dspark_swa_k) must
+        // not survive cold reset — otherwise retry sees prior-window KV.
+        self.body.reset_for_retry(gpu);
+        Ok(())
     }
 
     fn mtp_free(self: Box<Self>, gpu: &mut Gpu) {
@@ -1381,6 +1534,7 @@ impl MtpDrafter for DsparkDrafter {
         if let Some(dev) = self.main_hidden_dev {
             let _ = gpu.free_tensor(dev);
         }
+        self.weights.free_gpu(gpu);
         self.body.free(gpu);
     }
 
@@ -1432,7 +1586,7 @@ pub fn build_dspark_speculator(
 ) -> Box<dyn Speculator> {
     let block = block.clamp(1, 8);
     // Default-on; HIPFIRE_DSPARK_ADAPTIVE_BLOCK=0 opts out (fixed block == today).
-    let adaptive = std::env::var("HIPFIRE_DSPARK_ADAPTIVE_BLOCK")
+    let adaptive = hipfire_config::developer_var("HIPFIRE_DSPARK_ADAPTIVE_BLOCK")
         .ok()
         .as_deref()
         != Some("0");
@@ -1462,4 +1616,17 @@ pub fn build_dspark_speculator(
         profiler: DsparkProfiler::new(),
         block_controller,
     }))
+}
+
+// ── Send-bound assertions ──────────────────────────────────────────────
+#[cfg(test)]
+mod send_assertions {
+    /// Helper: compile-time Send assertion.
+    fn _assert_send<T: Send>() {}
+
+    /// `Box<dyn DsparkBody>` must be Send (nested inside DsparkDrafter).
+    #[test]
+    fn box_dyn_dspark_body_is_send() {
+        _assert_send::<Box<dyn super::DsparkBody>>();
+    }
 }

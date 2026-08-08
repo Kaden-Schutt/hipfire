@@ -38,10 +38,13 @@ fn main() -> Result<(), String> {
     let max_seq = 512usize;
     let cask = hipfire_runtime::loader_api::CaskConfig::default();
     let spec_cfg = hipfire_runtime::loader_api::SpecLoadCfg {
+        mtp_mode: None,
+        mtp_k: None,
         dspark: None, // auto: load sidecar if present
         ..Default::default()
     };
 
+    let mesh = hipfire_runtime::config::resolve_mesh(1, 1, 1, None); // single-GPU
     let mut m = hipfire_loader::load_model(
         &target_path,
         max_seq,
@@ -50,7 +53,8 @@ fn main() -> Result<(), String> {
         None, // kv_adaptive_override
         None, // state_quant_override
         &cask,
-        1, // pp
+        &mesh,
+        None, // pp_bands
         spec_cfg,
         &mut gpu,
     )?;
@@ -112,9 +116,10 @@ fn main() -> Result<(), String> {
             target,
             position,
             seed,
-            &[],  // emitted (empty: no prior context for repeat-penalty)
-            None, // grammar
-            0.0,  // temp: greedy
+            &[],        // emitted (empty: no prior context for repeat-penalty)
+            None,       // grammar
+            0.0,        // temp: greedy
+            usize::MAX, // uncapped bench window
         )
         .map_err(|e| format!("step: {e}"))?;
 

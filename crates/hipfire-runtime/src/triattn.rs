@@ -41,9 +41,13 @@
 
 use std::io::{Read, Write};
 use std::path::Path;
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
+#[cfg(test)]
+use hip_bridge::HipError;
 use hip_bridge::HipResult;
 use hipfire_dispatch::families::kv_tier::KTier;
 use rdna_compute::{DType, Gpu, GpuTensor};
@@ -851,6 +855,74 @@ pub struct EvictionCtx {
     pub eviction_count: std::cell::Cell<usize>,
 }
 
+/// Constructor-local owner for `EvictionCtx` allocations. GPU tensors have no
+/// `Drop`, so a later allocation error must explicitly free every earlier one.
+struct EvictionCtxStaging {
+    centers_dev: Option<GpuTensor>,
+    scores_buf: Option<GpuTensor>,
+    k_compact: Option<GpuTensor>,
+    v_compact: Option<GpuTensor>,
+    retain_dev: Option<GpuTensor>,
+}
+
+impl EvictionCtxStaging {
+    fn new() -> Self {
+        Self {
+            centers_dev: None,
+            scores_buf: None,
+            k_compact: None,
+            v_compact: None,
+            retain_dev: None,
+        }
+    }
+
+    fn free_gpu(&mut self, gpu: &mut Gpu) {
+        if let Some(tensor) = self.retain_dev.take() {
+            let _ = gpu.free_tensor(tensor);
+        }
+        if let Some(tensor) = self.v_compact.take() {
+            let _ = gpu.free_tensor(tensor);
+        }
+        if let Some(tensor) = self.k_compact.take() {
+            let _ = gpu.free_tensor(tensor);
+        }
+        if let Some(tensor) = self.scores_buf.take() {
+            let _ = gpu.free_tensor(tensor);
+        }
+        if let Some(tensor) = self.centers_dev.take() {
+            let _ = gpu.free_tensor(tensor);
+        }
+    }
+}
+
+#[cfg(test)]
+static EVICTION_NEW_FAIL_AFTER: AtomicUsize = AtomicUsize::new(usize::MAX);
+#[cfg(test)]
+static EVICTION_NEW_ALLOCATION_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(test)]
+fn set_eviction_new_fail_after(allocation: usize) {
+    EVICTION_NEW_ALLOCATION_COUNT.store(0, Ordering::SeqCst);
+    EVICTION_NEW_FAIL_AFTER.store(allocation, Ordering::SeqCst);
+}
+
+#[cfg(test)]
+fn maybe_fail_eviction_new_after_allocation() -> HipResult<()> {
+    let allocation = EVICTION_NEW_ALLOCATION_COUNT.fetch_add(1, Ordering::SeqCst) + 1;
+    if allocation == EVICTION_NEW_FAIL_AFTER.load(Ordering::SeqCst) {
+        return Err(HipError::new(
+            1,
+            "test-only EvictionCtx constructor allocation failure",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(test))]
+fn maybe_fail_eviction_new_after_allocation() -> HipResult<()> {
+    Ok(())
+}
+
 impl EvictionCtx {
     /// Upload centers and pre-size scratch. `fa_layer_ids` must match the
     /// layer indices the caller will pass through the forward pass (i.e.
@@ -893,25 +965,38 @@ impl EvictionCtx {
                 }
             }
         }
-        let centers_dev = gpu.upload_f32(&centers_flat, &[centers_flat.len()])?;
+        let mut staged = EvictionCtxStaging::new();
+        let result = (|| -> HipResult<()> {
+            staged.centers_dev = Some(gpu.upload_f32(&centers_flat, &[centers_flat.len()])?);
+            maybe_fail_eviction_new_after_allocation()?;
 
-        // Reusable scratch. For compaction temp we allocate enough bytes to
-        // hold `budget` rows in the widest layout (Q8_0 V, since K in asym3
-        // is narrower). Passing different bytes_per_pos to the gather
-        // kernel is safe as long as `budget × bytes_per_pos` fits.
-        let q8_bpp = n_kv_heads * (head_dim / 32) * 34;
-        let asym3_k_bpp = n_kv_heads * (4 + (head_dim * 3) / 8);
-        let asym4_k_bpp = n_kv_heads * (4 + head_dim / 2);
-        let asym2_k_bpp = n_kv_heads * (4 + head_dim / 4);
-        let widest_bpp = q8_bpp.max(asym3_k_bpp).max(asym4_k_bpp).max(asym2_k_bpp);
+            // Reusable scratch. For compaction temp we allocate enough bytes to
+            // hold `budget` rows in the widest layout (Q8_0 V, since K in asym3
+            // is narrower). Passing different bytes_per_pos to the gather
+            // kernel is safe as long as `budget × bytes_per_pos` fits.
+            let q8_bpp = n_kv_heads * (head_dim / 32) * 34;
+            let asym3_k_bpp = n_kv_heads * (4 + (head_dim * 3) / 8);
+            let asym4_k_bpp = n_kv_heads * (4 + head_dim / 2);
+            let asym2_k_bpp = n_kv_heads * (4 + head_dim / 4);
+            let widest_bpp = q8_bpp.max(asym3_k_bpp).max(asym4_k_bpp).max(asym2_k_bpp);
 
-        let scores_buf = gpu.alloc_tensor(&[n_heads * max_seq], DType::F32)?;
-        let k_compact = gpu.zeros(&[(budget * widest_bpp + 3) / 4], DType::F32)?;
-        let v_compact = gpu.zeros(&[(budget * q8_bpp + 3) / 4], DType::F32)?;
-        let retain_dev = gpu.alloc_tensor(&[budget], DType::F32)?;
+            staged.scores_buf = Some(gpu.alloc_tensor(&[n_heads * max_seq], DType::F32)?);
+            maybe_fail_eviction_new_after_allocation()?;
+            staged.k_compact = Some(gpu.zeros(&[(budget * widest_bpp + 3) / 4], DType::F32)?);
+            maybe_fail_eviction_new_after_allocation()?;
+            staged.v_compact = Some(gpu.zeros(&[(budget * q8_bpp + 3) / 4], DType::F32)?);
+            maybe_fail_eviction_new_after_allocation()?;
+            staged.retain_dev = Some(gpu.alloc_tensor(&[budget], DType::F32)?);
+            maybe_fail_eviction_new_after_allocation()?;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            staged.free_gpu(gpu);
+            return Err(error);
+        }
 
         Ok(Self {
-            centers_dev,
+            centers_dev: staged.centers_dev.take().expect("staged centers missing"),
             fa_layer_ids,
             centers_per_layer,
             budget,
@@ -922,10 +1007,13 @@ impl EvictionCtx {
             n_rot,
             rope_theta,
             max_seq,
-            scores_buf,
-            k_compact,
-            v_compact,
-            retain_dev,
+            scores_buf: staged.scores_buf.take().expect("staged scores missing"),
+            k_compact: staged.k_compact.take().expect("staged K scratch missing"),
+            v_compact: staged.v_compact.take().expect("staged V scratch missing"),
+            retain_dev: staged
+                .retain_dev
+                .take()
+                .expect("staged retain scratch missing"),
             eviction_count: std::cell::Cell::new(0),
         })
     }
@@ -1125,6 +1213,72 @@ pub fn pearson(x: &[f32], y: &[f32]) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    static EVICTION_GPU_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    /// A constructor failure after the centers upload must return every staged
+    /// buffer to the pool. The failpoint is deliberately test-only.
+    #[test]
+    #[ignore = "requires an AMD GPU"]
+    fn eviction_constructor_rolls_back_prior_gpu_allocations() {
+        let _gpu_test_lock = EVICTION_GPU_TEST_LOCK
+            .lock()
+            .expect("TriAttention GPU test lock poisoned");
+        let mut gpu = Gpu::init().expect("Gpu::init");
+        let centers = TriAttnCenters::new(1, 1, 64, 10_000.0, 1.0);
+
+        // Pay one-time allocator/cache initialization before taking an exact
+        // baseline; the measured lifetime below must contain only the failure.
+        let warmup = EvictionCtx::new(
+            &mut gpu,
+            &centers,
+            vec![0],
+            8,
+            4,
+            1,
+            1,
+            64,
+            64,
+            10_000.0,
+            16,
+        )
+        .expect("warmup EvictionCtx");
+        warmup.free_gpu(&mut gpu);
+        gpu.drain_pool();
+        let (before, _) = gpu.hip.get_vram_info().expect("measure before");
+
+        for (allocation, boundary) in ["centers", "scores", "K compact", "V compact", "retain"]
+            .into_iter()
+            .enumerate()
+        {
+            set_eviction_new_fail_after(allocation + 1);
+            let result = EvictionCtx::new(
+                &mut gpu,
+                &centers,
+                vec![0],
+                8,
+                4,
+                1,
+                1,
+                64,
+                64,
+                10_000.0,
+                16,
+            );
+            set_eviction_new_fail_after(usize::MAX);
+
+            assert!(
+                result.is_err(),
+                "{boundary} allocation failure must reach caller"
+            );
+            gpu.drain_pool();
+            let (after, _) = gpu.hip.get_vram_info().expect("measure after");
+            assert_eq!(
+                after, before,
+                "EvictionCtx::new leaked staged GPU buffers after {boundary}: before={before}, after={after}"
+            );
+        }
+    }
 
     #[test]
     fn accumulator_means_one_sample() {

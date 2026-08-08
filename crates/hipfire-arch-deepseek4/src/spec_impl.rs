@@ -24,6 +24,7 @@ use crate::forward::{
     final_norm_and_argmax_all_batched_lazy, final_norm_and_sample_all_batched_lazy,
     forward_prefill_batch_chunk, PrefillBatchScratch,
 };
+use hipfire_runtime::gpu_cleanup::{BundleTeardown, GpuCleanupFailure};
 use hipfire_runtime::spec::{SpecAdvance, SpecScratch, SpecTarget};
 use rdna_compute::{Gpu, GpuTensor};
 
@@ -35,6 +36,9 @@ pub struct Deepseek4Bundle {
     pub weights: DeepseekV4Weights,
     pub state: DeepseekV4State,
     pub eos_tok: u32,
+    /// Single-GPU chunked-prefill scratch, allocated once at load. (Relocated
+    /// here from a loose LoadedModel field — god-struct collapse Increment 2.)
+    pub pbs: crate::forward::PrefillBatchScratch,
 }
 
 /// Thin verify scratch for the DSpark `DsparkDrafter` path. DeepSeek V4's SWA
@@ -55,7 +59,7 @@ impl SpecScratch for Deepseek4DsparkScratch {
 /// Max batch for the trunk-side verify PBS (bootstrap 1-token + verify up to
 /// block+1 tokens). Mirror of `Deepseek4DsparkDrafter::pbs_max_batch`.
 fn dspark_verify_pbs_max_batch() -> usize {
-    std::env::var("HIPFIRE_DEEPSEEK4_PP_BATCH")
+    hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_PP_BATCH")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(1024)
@@ -194,13 +198,20 @@ impl SpecTarget for Deepseek4Bundle {
         self
     }
 
-    fn reset_recurrent(&mut self, _gpu: &mut Gpu) {
-        // n_tokens → 0 + mtp_last_hidden cleared; the position-indexed KV / SWA /
-        // compressed-KV rings are overwritten by the next prefill, never read
-        // beyond n_tokens (see `DeepseekV4State::reset`). No GPU work needed.
+    fn reset_recurrent(&mut self, gpu: &mut Gpu) -> Result<(), String> {
+        // Host counters + MTP residual + graph-warmup flag, then zero every
+        // position-indexed SWA/full/compressed/indexer cache so a fresh
+        // conversation cannot bleed prior-turn residue (pairs with the
+        // daemon's `gpu.invalidate_graph_state()` after this hook).
         self.state.reset();
+        self.state.zero_decode_caches(gpu);
+        Ok(())
     }
 
+    fn retry_reset_eligible(&self) -> bool {
+        // reset() + zero_decode_caches; daemon pairs invalidate_graph_state.
+        true
+    }
     fn eos_token(&self) -> u32 {
         self.eos_tok
     }
@@ -218,19 +229,22 @@ impl SpecTarget for Deepseek4Bundle {
     /// argmax at the last position. Used by `DsparkDrafter::mtp_prefill` to
     /// run the prompt through the trunk in a single pass.
     ///
-    /// `reset` is always `false` here — the caller (`DsparkDrafter::mtp_prefill`)
-    /// calls `reset_recurrent` separately on cache miss. `abort` and `hidden_out`
-    /// are ignored for this arch (deepseek4 is not abort-capable in this path
-    /// and does not expose hidden states via `spec_advance`).
+    /// `reset` is always `false` here — the central model reset has already run
+    /// on a cache miss. The abort callback is checked between prefill chunks and
+    /// before/after the final head pass.
     fn spec_advance(
         &mut self,
         gpu: &mut Gpu,
         tokens: &[u32],
         start_pos: usize,
-        _reset: bool,
-        _abort: &dyn Fn() -> bool,
+        reset: bool,
+        abort: &dyn Fn() -> bool,
         _hidden_out: Option<&mut Vec<f32>>,
     ) -> Result<SpecAdvance, String> {
+        if reset {
+            self.reset_recurrent(gpu)
+                .map_err(|e| format!("deepseek4 spec_advance reset: {e}"))?;
+        }
         // Lazily allocate the trunk-sized PBS.
         if self.state.dspark_verify_pbs.is_none() {
             self.state.dspark_verify_pbs = Some(
@@ -239,23 +253,66 @@ impl SpecTarget for Deepseek4Bundle {
             );
         }
         // Take the PBS out of state to avoid a simultaneous immutable + mutable
-        // borrow of self.state (forward_prefill_batch_chunked takes &mut state).
+        // borrow of self.state (the chunked forward path takes &mut state).
         // Restore it afterward (it is always Some after the lazy alloc above).
         let pbs = self.state.dspark_verify_pbs.take().unwrap();
-        let result = forward::forward_prefill_batch_chunked(
-            &self.config,
-            &self.weights,
-            &mut self.state,
-            gpu,
-            tokens,
-            start_pos as u32,
-            &pbs,
-        );
-        self.state.dspark_verify_pbs = Some(pbs);
-        let last_logits =
-            result.map_err(|e| format!("Deepseek4Bundle::spec_advance prefill: {e}"))?;
+        let mut pos_cursor = start_pos;
+        let mut remaining = tokens;
+        let last_logits = loop {
+            if abort() {
+                self.state.dspark_verify_pbs = Some(pbs);
+                return Ok(SpecAdvance::Aborted);
+            }
+            let take = remaining.len().min(pbs.max_batch);
+            let chunk = &remaining[..take];
+            let chunk_result = forward::forward_prefill_batch_chunk(
+                &self.config,
+                &self.weights,
+                &mut self.state,
+                gpu,
+                &pbs,
+                chunk,
+                pos_cursor as u32,
+            );
+            if let Err(e) = chunk_result {
+                self.state.dspark_verify_pbs = Some(pbs);
+                return Err(format!("Deepseek4Bundle::spec_advance prefill: {e}"));
+            }
+            if take == remaining.len() {
+                if abort() {
+                    self.state.dspark_verify_pbs = Some(pbs);
+                    return Ok(SpecAdvance::Aborted);
+                }
+                let logits_result = forward::final_norm_and_head_last_batched(
+                    &self.config,
+                    &self.weights,
+                    &mut self.state,
+                    &pbs,
+                    gpu,
+                    take,
+                );
+                let logits = match logits_result {
+                    Ok(logits) => logits,
+                    Err(e) => {
+                        self.state.dspark_verify_pbs = Some(pbs);
+                        return Err(format!("Deepseek4Bundle::spec_advance head: {e}"));
+                    }
+                };
+                if abort() {
+                    self.state.dspark_verify_pbs = Some(pbs);
+                    return Ok(SpecAdvance::Aborted);
+                }
+                break logits;
+            }
+            pos_cursor += take;
+            remaining = &remaining[take..];
+        };
         let last_argmax = crate::spec_decode::logits_argmax(&last_logits) as u32;
-        Ok(SpecAdvance::Ready { last_argmax })
+        self.state.dspark_verify_pbs = Some(pbs);
+        Ok(SpecAdvance::Ready {
+            last_argmax,
+            last_logits: Some(last_logits),
+        })
     }
 
     // ── DSpark verify primitives ──────────────────────────────────────────
@@ -489,5 +546,37 @@ impl SpecTarget for Deepseek4Bundle {
                 .map_err(|e| format!("Deepseek4Bundle::capture_seed_main_hidden d2h: {e:?}"))?;
         }
         Ok(host)
+    }
+}
+
+/// Checked teardown for the full deepseek4 bundle: frees PBS, recurrent
+/// state, and weights with CHECKED frees, aggregating every owner that
+/// could not be freed into the returned [`GpuCleanupFailure`] for
+/// exact-retention retry — no best-effort free as a correctness mechanism.
+impl BundleTeardown for Deepseek4Bundle {
+    fn free_checked(self, gpu: &mut Gpu) -> Result<(), GpuCleanupFailure> {
+        let Deepseek4Bundle {
+            config: _,
+            weights,
+            state,
+            eos_tok: _,
+            pbs,
+        } = self;
+        // Match unload_model Deepseek4 order: pbs → state → weights.
+        let mut cf = GpuCleanupFailure::empty();
+        if let Err(f) = pbs.free_checked(gpu) {
+            cf.merge(f);
+        }
+        if let Err(f) = state.free_checked(gpu) {
+            cf.merge(f);
+        }
+        if let Err(f) = weights.free_checked(gpu) {
+            cf.merge(f);
+        }
+        if cf.is_empty() {
+            Ok(())
+        } else {
+            Err(cf)
+        }
     }
 }

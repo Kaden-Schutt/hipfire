@@ -1,72 +1,99 @@
 ---
 name: hipfire-kernel-atlas
-description: Use Kernel Atlas to collect phase-aware hipfire measurements and render ISA Fit View visualizations for AMD GPU kernels, quant formats, and architectures. Use when a user asks how MQ/HFQ/HFP/Q8 quants occupy hardware, asks for an ASCII ISA visualization, wants to compare gfx1010/gfx1030/gfx11/gfx12 kernel fit, or wants an agent-readable "left on table" summary from Atlas rows.
+description: Use Kernel Atlas to collect phase-aware hipfire measurements and render ISA Fit View visualizations for AMD GPU kernels, quant formats, and architectures. Use when a user asks how MQ/HFQ/HFP/Q8 quants occupy hardware, asks for an ASCII ISA visualization, wants to compare gfx1010/gfx1030/gfx11/gfx12 kernel fit, or wants an agent-readable "left on table" summary from Atlas rows. Atlas output is measurement evidence only — never runtime or promotion proof.
 ---
 
 # hipfire-kernel-atlas
 
-Use this skill when the task is to explain or visualize how a hipfire quant
-format and kernel use an AMD GPU ISA target. The primary tool is
-`scripts/kernel_atlas.py`; this skill is a thin agent wrapper around that CLI.
+Thin agent wrapper around `scripts/kernel_atlas.py` and
+`.agents/skills/hipfire-kernel-atlas/render-fit.sh`.
 
-## Core Workflow
+**Canonical methodology (phases, corpus layout, ISA/dispatch manifests, task/eval
+loop):** [`docs/methodology/kernel-atlas.md`](../../../docs/methodology/kernel-atlas.md).
 
-1. **Collect or locate Atlas rows**
-   - Prefer existing JSONL under `.codeinsight+research/kernel-atlas/runs/`.
-   - For AR prefill/decode, collect with `collect-ar`.
-   - Use `--profile-prefill` / `--profile-decode` for AR rows when the user wants the ISA view scoped to runtime-hot kernels and tagged by op role.
-   - For speculative decode, collect with `collect-dflash`.
-   - Keep raw run data in `.codeinsight+research/`; it is ignored and may be private.
+**Promotion / correctness routes:** [`docs/VALIDATION.md`](../../../docs/VALIDATION.md)
+and, for timed claims, [`docs/methodology/perf-benchmarking.md`](../../../docs/methodology/perf-benchmarking.md).
+Atlas does not replace those owners.
 
-2. **Attach ISA metadata**
-   - Use `--isa-file` for one known HSACO/code object.
-   - Use `--isa-dir .hipfire_kernels/<arch>` plus `--isa-filter` for a bounded set.
-   - Prefer `--isa-output <path>.json` so multiple rows reference one manifest.
+## What Atlas is
 
-3. **Attach dispatch/source provenance**
-   - Use `--dispatch-provenance` when rows have profiled kernel names.
-   - Prefer `--dispatch-output <path>.json` so multiple rows reference one manifest.
-   - Treat dispatch references as evidence to inspect, not proof of a unique runtime branch.
-   - Prefer rows with a known `arch`; source ranking is target-arch-aware when arch-specific kernel files exist.
+| Atlas produces | Atlas does **not** prove |
+|---|---|
+| Phase-tagged JSONL rows (`prefill`, `decode_ar`, `decode_dflash`) | Shippable kernel or dispatch wins |
+| Optional ISA manifests (VGPR/SGPR/LDS/spills, opcode mix) | Full hardware occupancy or roofline |
+| Optional dispatch/source provenance for profiled names | A unique runtime branch |
+| ASCII ISA Fit View + heuristic “likely limit / left on table” | Product defaults or admissions |
+| `suggest` experiment queues; `task` / `eval` local ledgers | Correctness, serve semantics, or Redline route proof |
 
-4. **Render the ISA Fit View**
-   - Use `.agents/skills/hipfire-kernel-atlas/render-fit.sh`.
-   - If a row has `artifacts.profile_kernels`, the view joins profiled kernel names to ISA object kernel names/symbols and summarizes only matched objects.
-   - If a row has dispatch provenance, the view prints hot-kernel op/source/dispatch attribution.
-   - Report the visual plus a short readout of `likely limit` and `left on table`.
+Treat every row as **measured** evidence tied to binary/prompt/git identity in
+the row. Dirty worktrees: cite `provenance.diff_md5` and do not compare as a
+shipped baseline.
 
-5. **Ask Atlas for candidate experiments**
-   - Use `python3 scripts/kernel_atlas.py suggest --row ... --isa ... --dispatch ...`.
-   - Prefer `--format markdown` for humans and JSON for automation.
-   - Let `suggest` auto-load default history from `.codeinsight+research/kernel-atlas/tasks/`; use `--history` only for extra history paths.
-   - Treat suggestions as an experiment queue, not as predicted wins.
-   - Each suggestion should name the lever type, hot kernel, files, risk, rationale, and eval contract.
+## Producer / renderer surface
 
-6. **Create an optimization task**
-   - Use `python3 scripts/kernel_atlas.py task` to turn a row into `task.json` and `TASK.md`.
-   - Include `--allowed-file` for every path an agent may edit.
-   - Include correctness commands for DFlash or risky runtime changes.
-   - Generated tasks strip known profiling/instrumentation env from eval and preserve the original row env as `baseline.row_env`.
+CLI (verify with `python3 scripts/kernel_atlas.py --help`):
 
-7. **Evaluate a candidate**
-   - Use `python3 scripts/kernel_atlas.py eval --task ... --runs 5 --warmup-runs 1 --output-dir ...`.
-   - Use `--refresh-baseline` first to write `baseline.json`; use `--baseline <baseline.json>` for candidate comparisons.
-   - Report `result.json` status, selected metric median, speedup, stability, and any failed command output tail.
-   - Treat the local `ledger.jsonl` as experiment lineage, not a public benchmark.
-   - If status is `needs_baseline`, do not claim a speedup; refresh or provide a clean baseline first.
+| Subcommand | Role |
+|---|---|
+| `collect-ar` | AR prefill + decode_ar rows from bench output |
+| `collect-dflash` | Spec-decode rows (acceptance/tau when printed) |
+| `parse` | Metrics-only parse of saved bench/DFlash text → bare JSON metrics (not an identity-bearing Atlas row) |
+| `render-fit` | ASCII ISA/quant fit view |
+| `suggest` | Ranked experiment ideas (not predicted wins) |
+| `task` / `task-pytorch` | Bounded edit + eval contract bundles |
+| `eval` | Rerun task bench/correctness commands; local ledger |
+| `graph-ab` | `HIPFIRE_GRAPH=0/1` A/B from a row |
 
-## Commands
-
-Render an existing row:
+Renderer wrapper (repo-root aware):
 
 ```bash
 .agents/skills/hipfire-kernel-atlas/render-fit.sh \
   --row .codeinsight+research/kernel-atlas/runs/atlas.jsonl \
   --row-index 0 \
   --isa .codeinsight+research/kernel-atlas/runs/isa.json
+# --dispatch optional; also optional if the row already references manifests
 ```
 
-Collect a small AR smoke with ISA:
+Raw corpus stays private/ignored:
+
+```bash
+mkdir -p .codeinsight+research/kernel-atlas/runs
+mkdir -p .codeinsight+research/kernel-atlas/tasks
+```
+
+## Workflow
+
+1. **Collect or locate rows** under `.codeinsight+research/kernel-atlas/runs/`.
+   Prefer existing JSONL before re-collecting.
+2. **Attach ISA** with `--isa-file` or `--isa-dir` + `--isa-filter`; prefer
+   `--isa-output <path>.json` so many rows share one manifest. Needs ROCm LLVM
+   tools when inspecting HSACO (`clang-offload-bundler`, `llvm-readobj`,
+   `llvm-objdump`).
+3. **Attach dispatch provenance** with `--dispatch-provenance` and
+   `--dispatch-output` when profiled kernel names exist. Evidence to inspect,
+   not proof of one branch. Ranking is arch-aware when arch-specific sources
+   exist (e.g. `*.gfx1201.hip`).
+4. **Render** via `render-fit.sh`. With `artifacts.profile_kernels`, the view
+   joins profiled names to ISA symbols and scopes the summary; unmatched hot
+   names are printed on purpose.
+5. **`suggest`** → experiment queue only. Auto-loads history from
+   `.codeinsight+research/kernel-atlas/tasks/` unless extra `--history` paths.
+6. **`task`** → `task.json` + `TASK.md`. Pass `--allowed-file` for every editable
+   path. Pass `--correctness-command` only as a **claim-scoped** command that
+   still exists and matches [`docs/VALIDATION.md`](../../../docs/VALIDATION.md)
+   for that change (path-specific oracle, `test_kernels`, serve harness, etc.).
+   Do **not** treat retired batteries as acceptance; use VALIDATION.
+7. **`eval`** → refresh baseline first when the row carried profiling env
+   (`--refresh-baseline`); compare candidates with `--baseline`. Status
+   `needs_baseline` or `unstable` → no speedup claim. Ledger is local lineage,
+   not a public benchmark.
+
+## Example commands
+
+Paths and model files must exist on the machine; swap tags/files from
+[`registry/models.json`](../../../registry/models.json).
+
+Collect AR smoke with ISA + dispatch (illustrative):
 
 ```bash
 python3 scripts/kernel_atlas.py collect-ar \
@@ -79,99 +106,110 @@ python3 scripts/kernel_atlas.py collect-ar \
   --kv-mode asym3 \
   --profile-prefill \
   --profile-decode \
-  --isa-dir .hipfire_kernels/gfx1030 \
+  --isa-dir .hipfire_kernels \
   --isa-filter 'gemm_hfq4g256|gemv_hfq4g256' \
-  --isa-output .codeinsight+research/kernel-atlas/runs/isa-gfx1030.json \
+  --isa-output .codeinsight+research/kernel-atlas/runs/isa.json \
   --dispatch-provenance \
-  --dispatch-output .codeinsight+research/kernel-atlas/runs/dispatch-gfx1030.json \
-  --output .codeinsight+research/kernel-atlas/runs/atlas-gfx1030.jsonl
+  --dispatch-output .codeinsight+research/kernel-atlas/runs/dispatch.json \
+  --output .codeinsight+research/kernel-atlas/runs/atlas.jsonl
 ```
 
-Suggest candidate experiments from a profiled row:
+DFlash collection (prompts under `benchmarks/prompts/` when present):
+
+```bash
+python3 scripts/kernel_atlas.py collect-dflash \
+  --target ~/.hipfire/models/qwen3.5-27b.mq4 \
+  --draft ~/.hipfire/models/qwen35-27b-dflash-mq4.hfq \
+  --prompt-file benchmarks/prompts/merge_sort_thinking_off.txt \
+  --workload qwen3.5-27b-dflash-merge-sort \
+  --max-tokens 256 \
+  --ctx 2048 \
+  --kv-mode q8 \
+  --output .codeinsight+research/kernel-atlas/runs/atlas-dflash.jsonl
+```
+
+Suggest / task / eval:
 
 ```bash
 python3 scripts/kernel_atlas.py suggest \
-  --row .codeinsight+research/kernel-atlas/runs/atlas-gfx1201.jsonl \
+  --row .codeinsight+research/kernel-atlas/runs/atlas.jsonl \
   --row-index 1 \
-  --isa .codeinsight+research/kernel-atlas/runs/isa-gfx1201.json \
-  --dispatch .codeinsight+research/kernel-atlas/runs/dispatch-gfx1201.json \
+  --isa .codeinsight+research/kernel-atlas/runs/isa.json \
+  --dispatch .codeinsight+research/kernel-atlas/runs/dispatch.json \
   --format markdown
-```
 
-Create a bounded task from a profiled row:
-
-```bash
 python3 scripts/kernel_atlas.py task \
-  --row .codeinsight+research/kernel-atlas/runs/atlas-gfx1201.jsonl \
+  --row .codeinsight+research/kernel-atlas/runs/atlas.jsonl \
   --row-index 1 \
-  --isa .codeinsight+research/kernel-atlas/runs/isa-gfx1201.json \
-  --dispatch .codeinsight+research/kernel-atlas/runs/dispatch-gfx1201.json \
+  --isa .codeinsight+research/kernel-atlas/runs/isa.json \
+  --dispatch .codeinsight+research/kernel-atlas/runs/dispatch.json \
   --allowed-file kernels/src/gemv_hfq4g256_multirow.hip \
-  --output-dir .codeinsight+research/kernel-atlas/tasks/gfx1201-gemv-r4
+  --output-dir .codeinsight+research/kernel-atlas/tasks/example-gemv
+
+python3 scripts/kernel_atlas.py eval \
+  --task .codeinsight+research/kernel-atlas/tasks/example-gemv/task.json \
+  --runs 5 --warmup-runs 1 \
+  --refresh-baseline \
+  --output-dir .codeinsight+research/kernel-atlas/tasks/example-gemv/eval-baseline
+
+python3 scripts/kernel_atlas.py eval \
+  --task .codeinsight+research/kernel-atlas/tasks/example-gemv/task.json \
+  --baseline .codeinsight+research/kernel-atlas/tasks/example-gemv/eval-baseline/baseline.json \
+  --runs 5 --warmup-runs 1 \
+  --output-dir .codeinsight+research/kernel-atlas/tasks/example-gemv/eval-001
 ```
 
-Create a PyTorch-shape task for non-Qwen work:
+PyTorch-shape task shell (no automatic PyTorch kernel extract yet):
 
 ```bash
 python3 scripts/kernel_atlas.py task-pytorch \
-  --name llama-rmsnorm-shape \
+  --name example-rmsnorm-shape \
   --op rmsnorm \
   --input-shape 1,2048,4096 \
   --dtype float16 \
   --eval-command 'python3 bench_rmsnorm.py' \
   --allowed-file kernels/src/rmsnorm_candidate.hip \
-  --output-dir .codeinsight+research/kernel-atlas/tasks/llama-rmsnorm-shape
+  --output-dir .codeinsight+research/kernel-atlas/tasks/example-rmsnorm-shape
 ```
 
-Refresh a stable baseline and then evaluate a candidate:
+## Interpretation rules
 
-```bash
-python3 scripts/kernel_atlas.py eval \
-  --task .codeinsight+research/kernel-atlas/tasks/gfx1201-gemv-r4/task.json \
-  --runs 5 \
-  --warmup-runs 1 \
-  --refresh-baseline \
-  --output-dir .codeinsight+research/kernel-atlas/tasks/gfx1201-gemv-r4/eval-baseline
+- **ISA fit ≠ occupancy.** Counters, residency, clocks, cache, and launch
+  overlap are out of band unless separately measured.
+- Matrix units present with zero observed matrix ops → ask whether the phase
+  should use WMMA/MFMA or is a memory/launch-dominated decode GEMV.
+- High VGPR/SGPR/spills → register pressure before bandwidth narratives.
+- DFlash rows: tok/s is not correctness. Use VALIDATION’s claim-scoped route
+  (serve semantics, path oracle, etc.) — not Atlas alone, and not retired
+  batteries as current acceptance.
+- `eval` `unstable` → measurement failure until run shape / thermal / DPM settles.
+- Multi-host (e.g. hiptrx vs another box): compare only when prompt, binary md5,
+  git diff md5, model, and variant env match; pin arch with
+  `HIPFIRE_TARGET_ARCH` / `ROCR_VISIBLE_DEVICES` when multiple GPUs are visible.
 
-python3 scripts/kernel_atlas.py eval \
-  --task .codeinsight+research/kernel-atlas/tasks/gfx1201-gemv-r4/task.json \
-  --baseline .codeinsight+research/kernel-atlas/tasks/gfx1201-gemv-r4/eval-baseline/baseline.json \
-  --runs 5 \
-  --warmup-runs 1 \
-  --output-dir .codeinsight+research/kernel-atlas/tasks/gfx1201-gemv-r4/eval-001
-```
+## After Atlas, before any ship claim
 
-## Interpretation Rules
+1. Rerun the **VALIDATION** route for the actual claim class (kernel channel,
+   path oracle, serve harness, speed-gate / probe, Redline ladder — as applicable).
+2. Follow perf protocol for any tok/s delta (fresh process, warmup, identity).
+3. Do not write Atlas medians into product docs as floors or admissions.
+4. Kernel-edit workflow after a hot kernel is identified: skill
+   `hipfire-kernel-tuning`. New ISA targets: `hipfire-arch-port`.
 
-- Treat the view as **ISA fit**, not full hardware occupancy. True occupancy
-  also needs counters, wave residency, clocks, cache behavior, and launch
-  overlap.
-- If matrix units are available but observed matrix ops are zero, ask whether
-  the workload phase should route through WMMA/MFMA or whether it is a decode
-  GEMV path where memory/launch dominates.
-- If VGPR/SGPR/spills are high, prioritize register pressure and spill removal
-  before claiming a bandwidth win.
-- If the row is DFlash, do not treat tok/s alone as correctness evidence. Run
-  the DFlash coherence gate before claiming a spec-decode improvement.
-- If `eval` reports `unstable`, do not claim a win or regression; tighten the
-  run shape or rerun after DPM/thermal state settles.
-- For PyTorch-shape tasks, treat the eval command as the source of truth until
-  Atlas has a real PyTorch profiler/extractor producer.
-- If the worktree is dirty, cite the row's `provenance.diff_md5` and avoid
-  comparing it as a shipped baseline.
-
-## Good Agent Output
+## Good agent output
 
 Include:
 
-- the rendered ASCII fit view, or the most relevant section of it
-- the row path and ISA manifest path
-- arch, quant, phase, and shape bucket
+- rendered fit section (or path to full render)
+- row path, row index, ISA/dispatch manifest paths
+- arch, quant, phase, shape bucket
 - runtime metric used for the readout
-- one concise interpretation of `likely limit` and `left on table`
+- one short reading of `likely limit` / `left on table`
+- explicit label: **measured evidence, not promotion proof**
 
 Avoid:
 
 - calling the heuristic a roofline model
-- claiming a perf win from smoke runs
-- mixing rows from different prompts or dirty binaries without saying so
+- claiming a perf win from smoke or single dirty-tree rows
+- mixing prompts/binaries without saying so
+- citing Atlas success as merge/admission authority

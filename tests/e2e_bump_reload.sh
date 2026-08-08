@@ -4,7 +4,9 @@ set -uo pipefail
 PORT=${PORT:-11440}
 MODEL=${MODEL:-qwen3.5:0.8b}
 LOG=$(mktemp)
-HIPFIRE_MODEL="$MODEL" bun cli/index.ts serve "$PORT" > "$LOG" 2>&1 &
+HIPFIRE=${HIPFIRE_CLI_BIN:-./target/release/hipfire}
+[ -x "$HIPFIRE" ] || { echo "native hipfire CLI not found" >&2; exit 2; }
+"$HIPFIRE" serve --model "$MODEL" "$PORT" > "$LOG" 2>&1 &
 PID=$!
 # shellcheck disable=SC2329 # invoked by trap
 cleanup() {

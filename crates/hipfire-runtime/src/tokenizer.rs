@@ -1492,18 +1492,16 @@ pub fn strip_trailing_line_ws(s: &str) -> String {
 /// is itself a no-op fast-path when its trigger pattern is absent.
 pub fn maybe_normalize_prompt(s: &str) -> std::borrow::Cow<'_, str> {
     // Default ON. Explicit "0" / "false" / "off" / "no" opts out (parsed once in
-    // RuntimeConfig::from_env). Delegates to the flag-parameterized core so the
+    // RuntimeConfig::from_process_config). Delegates to the flag-parameterized core so the
     // pipeline is unit-testable without the memoized `config::get()` singleton.
     normalize_prompt_with(s, crate::config::get().normalize_prompt)
 }
 
 /// Core prompt-normalization pipeline, parameterized on the enable flag.
 /// `maybe_normalize_prompt` is the production entry point; tests call this
-/// directly with an explicit flag. (The global `config::get()` is a memoized
-/// `OnceLock`, so toggling `HIPFIRE_NORMALIZE_PROMPT` per-call can't drive it
-/// in a shared test process — that mismatch is what silently broke the
-/// opt-out tests until CI surfaced it.)
-fn normalize_prompt_with(s: &str, enabled: bool) -> std::borrow::Cow<'_, str> {
+/// directly with an explicit flag. The global `config::get()` is an immutable
+/// process snapshot, so per-call mutation is intentionally unsupported.
+pub fn normalize_prompt_with(s: &str, enabled: bool) -> std::borrow::Cow<'_, str> {
     use std::borrow::Cow;
     if !enabled {
         return Cow::Borrowed(s);

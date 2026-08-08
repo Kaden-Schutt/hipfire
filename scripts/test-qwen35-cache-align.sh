@@ -22,15 +22,15 @@
 # Prereqs:
 #   - Daemon must be loadable with qwen3.6-27b.mq4 (its dflash sidecar
 #     qwen36-27b-dflash-mq4.hfq is auto-discovered next to it).
-#   - dflash must be enabled. Either set `dflash_mode: "on"` in
-#     ~/.hipfire/config.json globally, or per-model. Default is "off".
+#   - dflash must be enabled globally or per-model with `hipfire config`.
+#     Default is "off".
 #   - Daemon launched with HIPFIRE_QWEN_CACHE_TRACE=1 so the dflash
 #     cache-store log line is visible (the script greps it for proof).
 #
 # Quick setup:
-#   jq '. + {dflash_mode: "on"}' ~/.hipfire/config.json > /tmp/c && mv /tmp/c ~/.hipfire/config.json
+#   hipfire config set dflash_mode on
 #   scripts/serve-restart.sh 11435 --kill-only
-#   HIPFIRE_QWEN_CACHE_TRACE=1 setsid bun cli/index.ts serve 0.0.0.0 11435 >~/.hipfire/serve.log 2>&1 & disown
+#   HIPFIRE_QWEN_CACHE_TRACE=1 hipfire serve 127.0.0.1:11435 -d
 #   bash scripts/test-qwen35-cache-align.sh
 set -uo pipefail
 PORT=11435

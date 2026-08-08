@@ -39,7 +39,11 @@ impl GpuPool {
     /// is no VRAM padding waste.
     fn bucket_key(size: usize) -> usize {
         const MIN: usize = 256;
-        if size <= MIN { MIN } else { size.next_power_of_two() }
+        if size <= MIN {
+            MIN
+        } else {
+            size.next_power_of_two()
+        }
     }
 
     /// Get a buffer of at least `size` bytes. Reuses from the free-list
@@ -91,6 +95,50 @@ impl GpuPool {
             for buf in list {
                 let _ = hip.free(buf);
             }
+        }
+    }
+
+    /// Free all pooled buffers using [`HipRuntime::free_preserving`] so that
+    /// every buffer whose `hipFree` fails is re-inserted into the pool and
+    /// the error is reported rather than lost.  The pool retains ownership
+    /// of failed buffers for retry.
+    ///
+    /// Returns `Ok(())` when all buffers were freed, or an aggregate error
+    /// with the count of failures.  The pool is still usable after a partial
+    /// failure — the caller can retry [`drain_checked`] or continue using the
+    /// pool (failed buffers remain in their free-list bucket).
+    pub fn drain_checked(&mut self, hip: &HipRuntime) -> Result<(), String> {
+        // Collect all buffers into one flat Vec, then drain free_lists
+        // completely before attempting any free. This avoids borrowing
+        // self.free_lists mutably while iterating.
+        let all_bufs: Vec<DeviceBuffer> =
+            self.free_lists.drain().flat_map(|(_, list)| list).collect();
+        let mut failures: usize = 0;
+        let mut first_err = String::new();
+        for buf in all_bufs {
+            match hip.free_preserving(buf) {
+                Ok(()) => {}
+                Err((returned_buf, e)) => {
+                    failures += 1;
+                    if first_err.is_empty() {
+                        first_err = format!("{e:?}");
+                    }
+                    // Reinsert the failed buffer into the pool so ownership
+                    // is preserved and the caller can retry.
+                    let bucket = Self::bucket_key(returned_buf.size());
+                    self.free_lists
+                        .entry(bucket)
+                        .or_default()
+                        .push(returned_buf);
+                }
+            }
+        }
+        if failures == 0 {
+            Ok(())
+        } else {
+            Err(format!(
+                "{failures} pool buffer(s) failed to drain (first error: {first_err})"
+            ))
         }
     }
 }

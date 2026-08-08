@@ -29,9 +29,13 @@
 
 use hip_bridge::{DeviceBuffer, HipResult};
 use hipfire_dispatch::context::DispatchCtx;
-use hipfire_dispatch::pipeline::{execute_steps, GemvInput, Step};
+use hipfire_dispatch::pipeline::{execute_steps_mesh, GemvInput, Step};
 use hipfire_dispatch::types::dtype_rotation_plan;
+use hipfire_hardware::DeviceMesh;
 use hipfire_runtime::arch_spec::{dense_forward, DenseArch, DenseKnobs, DenseLayer, DenseScratch};
+use hipfire_runtime::gpu_cleanup::{
+    free_tensor_retained, free_weight_all_checked, free_weight_sidecars_checked, GpuCleanupFailure,
+};
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama::{f16_to_f32, f32_to_f16};
 use hipfire_runtime::llama::{gemv_family, weight_gemm, EmbeddingFormat, WeightTensor};
@@ -40,6 +44,7 @@ use hipfire_runtime::weight_backend::{
     dequant_norm, dequant_weight_raw, flat_name_candidates, load_embedding, resolve_lm_head,
     HfqBackend, WeightBackend,
 };
+use hipfire_runtime::{screen_weight_tensor, MmqScreenable};
 use rdna_compute::{DType, Gpu, GpuTensor};
 use serde::Deserialize;
 
@@ -297,6 +302,97 @@ impl Qwen2Weights {
             let _ = gpu.free_tensor(l.w_down.buf);
         }
     }
+
+    /// Exact-retention checked GPU cleanup. Consumes `self`, attempts every
+    /// owned weight even after prior failures, retains the exact original
+    /// `GpuTensor` on failure, and returns only the failures for
+    /// exact-retention retry — no best-effort `let _ =` free as a
+    /// correctness mechanism.
+    ///
+    /// Uses `Gpu::free_tensor_checked(&mut Option<GpuTensor>)` everywhere
+    /// so that on bind/driver failure the tensor ownership is preserved.
+    pub fn free_checked(self, gpu: &mut Gpu) -> Result<(), GpuCleanupFailure> {
+        let mut cf = GpuCleanupFailure::empty();
+
+        free_tensor_retained(
+            "Qwen2Weights.token_embd",
+            self.token_embd,
+            gpu,
+            &mut cf.failed_tensors,
+        );
+        free_tensor_retained(
+            "Qwen2Weights.output_norm",
+            self.output_norm,
+            gpu,
+            &mut cf.failed_tensors,
+        );
+
+        // Output / LM head: when tied, `output.buf` aliases the embedding
+        // table, so only the sidecars (paro / AWQ) are owned here.
+        if self.tied_lm_head {
+            free_weight_sidecars_checked(
+                "Qwen2Weights.output",
+                self.output,
+                gpu,
+                &mut cf.failed_tensors,
+            );
+        } else {
+            free_weight_all_checked(
+                "Qwen2Weights.output",
+                self.output,
+                gpu,
+                &mut cf.failed_tensors,
+            );
+        }
+
+        for (i, layer) in self.layers.into_iter().enumerate() {
+            let lp = |field: &str| format!("Qwen2Weights.layers[{i}].{field}");
+            free_tensor_retained(
+                lp("attn_norm"),
+                layer.attn_norm,
+                gpu,
+                &mut cf.failed_tensors,
+            );
+            free_weight_all_checked(&lp("wq"), layer.wq, gpu, &mut cf.failed_tensors);
+            free_tensor_retained(lp("wq_bias"), layer.wq_bias, gpu, &mut cf.failed_tensors);
+            free_weight_all_checked(&lp("wk"), layer.wk, gpu, &mut cf.failed_tensors);
+            free_tensor_retained(lp("wk_bias"), layer.wk_bias, gpu, &mut cf.failed_tensors);
+            free_weight_all_checked(&lp("wv"), layer.wv, gpu, &mut cf.failed_tensors);
+            free_tensor_retained(lp("wv_bias"), layer.wv_bias, gpu, &mut cf.failed_tensors);
+            free_weight_all_checked(&lp("wo"), layer.wo, gpu, &mut cf.failed_tensors);
+            free_tensor_retained(lp("ffn_norm"), layer.ffn_norm, gpu, &mut cf.failed_tensors);
+            free_weight_all_checked(&lp("w_gate"), layer.w_gate, gpu, &mut cf.failed_tensors);
+            free_weight_all_checked(&lp("w_up"), layer.w_up, gpu, &mut cf.failed_tensors);
+            free_weight_all_checked(&lp("w_down"), layer.w_down, gpu, &mut cf.failed_tensors);
+        }
+
+        if cf.is_empty() {
+            Ok(())
+        } else {
+            Err(cf)
+        }
+    }
+}
+
+impl MmqScreenable for Qwen2Weights {
+    fn screen_mmq_weights(&self, gpu: &mut Gpu) -> (usize, usize) {
+        let (mut safe, mut unsafe_count) = (0usize, 0usize);
+        screen_weight_tensor(&self.output, gpu, &mut safe, &mut unsafe_count);
+        for layer in &self.layers {
+            for weight in [
+                &layer.wq,
+                &layer.wk,
+                &layer.wv,
+                &layer.wo,
+                &layer.w_gate,
+                &layer.w_up,
+                &layer.w_down,
+            ] {
+                screen_weight_tensor(weight, gpu, &mut safe, &mut unsafe_count);
+            }
+        }
+        (safe, unsafe_count)
+    }
 }
 
 /// Free-function loader, takes a borrowed `Gpu` so the trait impl in
@@ -463,7 +559,7 @@ fn load_norm_weight_raw(
 /// implementation.
 fn load_weight_tensor(
     hfq: &HfqFile,
-    gpu: &Gpu,
+    gpu: &mut Gpu,
     name: &str,
     m: usize,
     k: usize,
@@ -968,6 +1064,72 @@ impl Qwen2State {
         }
         let _ = gpu.hip.free(self.pos_buf);
     }
+
+    /// Exact-retention checked GPU cleanup. Consumes `self`, attempts every
+    /// owned tensor even after prior failures, retains the exact original
+    /// `GpuTensor` on failure, and returns only the failures for
+    /// exact-retention retry — no best-effort `let _ =` free as a
+    /// correctness mechanism.
+    ///
+    /// `pos_buf` is a raw [`hip_bridge::DeviceBuffer`]; it is represented as
+    /// a `GpuTensor` with `shape=[]` / `DType::Raw` — the honest description
+    /// of a bare 4-byte allocation, not a fabrication. Mirrors
+    /// `Qwen35Scratch::abort_checked` in `hipfire-arch-qwen35`.
+    pub fn free_checked(self, gpu: &mut Gpu) -> Result<(), GpuCleanupFailure> {
+        let mut cf = GpuCleanupFailure::empty();
+
+        for (label, t) in [
+            ("Qwen2State.x", self.x),
+            ("Qwen2State.tmp", self.tmp),
+            ("Qwen2State.x_rot", self.x_rot),
+            ("Qwen2State.q", self.q),
+            ("Qwen2State.k", self.k),
+            ("Qwen2State.v", self.v),
+            ("Qwen2State.attn_out", self.attn_out),
+            ("Qwen2State.o", self.o),
+            ("Qwen2State.gate", self.gate),
+            ("Qwen2State.up", self.up),
+            ("Qwen2State.ffn_hidden", self.ffn_hidden),
+            ("Qwen2State.ffn_out", self.ffn_out),
+            ("Qwen2State.logits", self.logits),
+            ("Qwen2State.attn_partials", self.attn_partials),
+        ] {
+            free_tensor_retained(label, t, gpu, &mut cf.failed_tensors);
+        }
+        // pos_buf: raw DeviceBuffer → honest GpuTensor wrapper (Raw dtype).
+        free_tensor_retained(
+            "Qwen2State.pos_buf",
+            GpuTensor {
+                buf: self.pos_buf,
+                shape: vec![],
+                dtype: DType::Raw,
+            },
+            gpu,
+            &mut cf.failed_tensors,
+        );
+        for (i, t) in self.k_cache.into_iter().enumerate() {
+            free_tensor_retained(
+                format!("Qwen2State.k_cache[{i}]"),
+                t,
+                gpu,
+                &mut cf.failed_tensors,
+            );
+        }
+        for (i, t) in self.v_cache.into_iter().enumerate() {
+            free_tensor_retained(
+                format!("Qwen2State.v_cache[{i}]"),
+                t,
+                gpu,
+                &mut cf.failed_tensors,
+            );
+        }
+
+        if cf.is_empty() {
+            Ok(())
+        } else {
+            Err(cf)
+        }
+    }
 }
 
 // ─── Forward pass ───────────────────────────────────────────────────────
@@ -1141,6 +1303,8 @@ fn forward_step_after_x(
     let kv_dim = n_kv_heads * head_dim;
 
     let ctx = DispatchCtx::new(gpu);
+    // P-A: single (1×1) device mesh threaded to the dispatch chokepoint.
+    let mesh = DeviceMesh::single();
 
     for layer_idx in 0..cfg.num_hidden_layers {
         let layer = &weights.layers[layer_idx];
@@ -1152,7 +1316,8 @@ fn forward_step_after_x(
         let wrq = layer.wq.dispatch_ref();
         let wrk = layer.wk.dispatch_ref();
         let wrv = layer.wv.dispatch_ref();
-        execute_steps(
+        execute_steps_mesh(
+            &mesh,
             gpu,
             &ctx,
             &[
@@ -1228,7 +1393,7 @@ fn forward_step_after_x(
         // (2 for dots.ocr), so lower occupancy but eliminates the partials
         // DRAM round-trip + reduce dispatch. Probe of launch-overhead vs
         // occupancy tradeoff.
-        let use_fused = std::env::var("HIPFIRE_GQA_FUSED")
+        let use_fused = hipfire_config::developer_var("HIPFIRE_GQA_FUSED")
             .map(|v| v == "1")
             .unwrap_or(false);
         if use_fused && n_kv_heads < n_heads {
@@ -1288,7 +1453,8 @@ fn forward_step_after_x(
 
         // (7–8) o_proj + residual via execute_steps.
         let wro = layer.wo.dispatch_ref();
-        execute_steps(
+        execute_steps_mesh(
+            &mesh,
             gpu,
             &ctx,
             &[Step::GemvResidual {
@@ -1305,7 +1471,8 @@ fn forward_step_after_x(
         let ffn_rot = dtype_rotation_plan(layer.w_gate.gpu_dtype);
         let wrg = layer.w_gate.dispatch_ref();
         let wru = layer.w_up.dispatch_ref();
-        execute_steps(
+        execute_steps_mesh(
+            &mesh,
             gpu,
             &ctx,
             &[
@@ -1336,7 +1503,8 @@ fn forward_step_after_x(
         // SwiGLU activation + w_down + residual.
         gpu.silu_mul_f32(&state.gate, &state.up, &state.ffn_hidden)?;
         let wrd = layer.w_down.dispatch_ref();
-        execute_steps(
+        execute_steps_mesh(
+            &mesh,
             gpu,
             &ctx,
             &[Step::GemvResidual {
@@ -1352,7 +1520,8 @@ fn forward_step_after_x(
     // Final RMSNorm + lm_head.
     gpu.rmsnorm_f32(&state.x, &weights.output_norm, &state.tmp, cfg.rms_norm_eps)?;
     let wr_out = weights.output.dispatch_ref();
-    execute_steps(
+    execute_steps_mesh(
+        &mesh,
         gpu,
         &ctx,
         &[Step::Gemv {
@@ -1891,7 +2060,12 @@ pub fn forward_verify_block_batched(
 fn qwen2_forward_lowered_enabled() -> bool {
     use std::sync::OnceLock;
     static F: OnceLock<bool> = OnceLock::new();
-    *F.get_or_init(|| std::env::var("HIPFIRE_FORWARD_LOWERED").ok().as_deref() != Some("0"))
+    *F.get_or_init(|| {
+        hipfire_config::developer_var("HIPFIRE_FORWARD_LOWERED")
+            .ok()
+            .as_deref()
+            != Some("0")
+    })
 }
 
 /// Lowered (#397 Ship 6) per-layer decode loop + final norm/head. Behaviorally
@@ -1907,6 +2081,8 @@ fn forward_step_after_x_lowered(
     pos: usize,
 ) -> HipResult<()> {
     let ctx = DispatchCtx::new(gpu);
+    // P-A: single (1×1) device mesh threaded to the dispatch chokepoint.
+    let mesh = DeviceMesh::single();
     let knobs = DenseKnobs {
         attn_bias: true,
         qk_norm: false,
@@ -1929,7 +2105,8 @@ fn forward_step_after_x_lowered(
     // Final RMSNorm + lm_head (outside layer loop).
     gpu.rmsnorm_f32(&state.x, &weights.output_norm, &state.tmp, cfg.rms_norm_eps)?;
     let wr_out = weights.output.dispatch_ref();
-    execute_steps(
+    execute_steps_mesh(
+        &mesh,
         gpu,
         &ctx,
         &[Step::Gemv {
@@ -2012,7 +2189,7 @@ impl DenseArch for Qwen2Dense<'_> {
         gpu.kv_cache_write(&st.k_cache[l], &st.k, &st.pos_buf, k.kv_dim)?;
         gpu.kv_cache_write(&st.v_cache[l], &st.v, &st.pos_buf, k.kv_dim)?;
         // Attention — 4-way select (exact mirror of the SuperOp run_attend path).
-        let use_fused = std::env::var("HIPFIRE_GQA_FUSED")
+        let use_fused = hipfire_config::developer_var("HIPFIRE_GQA_FUSED")
             .map(|v| v == "1")
             .unwrap_or(false);
         if use_fused && k.n_kv_heads < k.n_heads {
@@ -2084,7 +2261,7 @@ impl DenseArch for Qwen2Dense<'_> {
         let k = &self.knobs;
         // Read HIPFIRE_GQA_FUSED here, mirroring the hand attend() (which also
         // reads it per layer) — same result, strict no-op.
-        let fused = std::env::var("HIPFIRE_GQA_FUSED")
+        let fused = hipfire_config::developer_var("HIPFIRE_GQA_FUSED")
             .map(|v| v == "1")
             .unwrap_or(false);
         let pos = self.seq_len - 1;
@@ -2140,6 +2317,7 @@ impl DenseArch for Qwen2Dense<'_> {
             tree_bias: None,
             block_start: 0,
             block_cols: 0,
+            output_gate: None,
             output: &st.attn_out,
         };
         Ok(Some((plan, io)))

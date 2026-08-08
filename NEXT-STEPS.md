@@ -11,9 +11,11 @@ gfx1201. This file lists the deliberate follow-ups.
    path (design §2 non-goal: DFlash a fast-follow). Add `maybe_downshift` at the
    `generate_dflash` committed-position site (near the `ev.maybe_evict` calls,
    `daemon.rs:3375`/`3558`), handling spec-decode position semantics (commit
-   only on accepted positions, not tree branches). Must pass
-   `scripts/coherence-gate-dflash.sh` (3-tier attractor thresholds). DFlash perf
-   gates use q8 or FWHT KV — never asym.
+   only on accepted positions, not tree branches). Validate via
+   `scripts/serve_harness.py` (`battery` + `chain`) per
+   [docs/VALIDATION.md](docs/VALIDATION.md) and eyeball the decoded output for
+   attractors — the old `scripts/coherence-gate-dflash.sh` is retired and absent.
+   DFlash perf gates use q8 or FWHT KV — never asym.
 
 2. **Default-on decision.** Adaptive is opt-in (`HIPFIRE_KV_ADAPTIVE=off`
    default). Because it runs the fast high-precision tiers until the cap,
@@ -108,3 +110,55 @@ any early return, then commit the list into the weights/state struct only on
 full success (or give `GpuTensor` itself a pool-returning `Drop`, the broader
 change). Deferred. Documented inline at the constructor call sites and on the
 `load_model_ep` doc-comment.
+
+## STEP-002R — Qwen35 Frozen construction rollback + BundleTeardown pivot (DONE)
+
+Shipped as **PR #18** (fivetide/hipfire): `feat(loader): owner-preserving
+teardown for every arch bundle` + `fix(loader): retained-owner backlog closes
+the String-error teardown gap`. Commits `c7f142af8` (amended) and parent.
+
+Owner-preserving teardown for the Qwen35 Frozen construction path (STEP-002R)
+and its generalization: `hipfire_runtime::gpu_cleanup` (`RetainedGpuTensor`,
+`GpuCleanupFailure` with a `RetryableOwner` category, `BundleTeardown`,
+`retain_free!`), checked `free_checked` on every arch bundle (qwen2, qwen35,
+llama, lfm2moe, minimax, cohere2moe, deepseek4, dots-ocr), `unload_model`
+dispatching through `ModelState::free_checked` with retry-before-log,
+env-var-driven fault injection (`frozen-fault-inject` feature,
+`HIPFIRE_FROZEN_FAIL_STAGE` / `HIPFIRE_FROZEN_FAIL_FREE`), GPU fault battery +
+per-arch load/unload VRAM verification + packed-MQ4 expert teardown test.
+Forensic discoveries fixed en route (see commit message): dspark sidecar pread
+`RefCell` borrow bug; packed-expert interior-view pooling hazard in the checked
+MoE free; VMM arena release skipped by `free_tensor_checked` (now arena-aware).
+
+RESIDUAL DEBT (tracked, do not forget):
+
+0. **Terminal String-returning teardown surfaces — CLOSED.** `load_model`,
+   `unload_model`, the qwen35 carrier error path, `rollback_unfinished_qwen35`,
+   and the MTP-head failure logger now ENQUEUE owners that survive their
+   retry into the process-local retained-owner backlog
+   (`hipfire_runtime::gpu_cleanup::{enqueue_cleanup_failure, retry_backlog}`)
+   instead of dropping them while allocated. The next `load_model` /
+   `unload_model` drains the backlog; owners that still fail stay enqueued
+   (exact-retention) and are reported. `HIPFIRE_FROZEN_FAIL_FREE` is
+   continuous-while-set (any non-empty value) so an initial teardown AND its
+   retry can both be made to fail; the backlog is GPU-tested
+   (`retained_backlog_enqueues_after_double_failure_and_recovers_on_next_load`).
+
+1. **Qwen35 mid-constructor leaks (same class as the EP constructor leak
+   above).** A failure partway through `DeltaNetState::new_with_quant`,
+   `Qwen35Scratch::new_with_kv_max`, `PrefillBatchScratch::new_opt`, the
+   `KvCache` constructors, or mid-iteration `fulfill_manifest_gpu` leaks the
+   already-uploaded tensors (the half-built value drops on `?`; `GpuTensor`
+   has no `Drop`). STEP-002R covers POST-construction rollback only — the
+   fault-injection stages fire after each constructor returns `Ok`. Proper
+   fix: the same allocation-tracking refactor as the EP loaders (scratch-list
+   staging or a pool-returning `Drop`). Deferred.
+
+2. **Qwen35 PP path (`load_qwen35_pp`, carriers.rs).** Load errors propagate
+   with plain `?`, leaking any already-built weights/kv/dn/scratch — same
+   unchecked-construction class as STEP-002R fixed for the single-GPU bundle
+   path. Owned by GEN-001/HW-004 (PP is device-mesh "Planned"). NOTE: PP
+   UNLOAD is verified safe — `free_gpu_multi` routes through
+   `free_moe_storage`, which handles packed experts — only the load-error
+   rollback is unchecked. No PP fault injection or tests were added (per
+   STEP-002R scope).

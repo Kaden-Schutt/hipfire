@@ -1,0 +1,5 @@
+model	off_median_tok_s	on_median_tok_s	delta_pct
+Qwen3.5-0.8B MQ4	7974.7	8403.4	5.38
+Qwen3.5-4B MQ4	2685.0	2826.9	5.28
+Qwen3.5-27B MQ4	598.3	620.6	3.73
+Qwen3.6-27B MQ4	595.0	613.8	3.16

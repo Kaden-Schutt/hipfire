@@ -177,25 +177,25 @@ pub const KNOBS: &[KnobInfo] = &[
     KnobInfo {
         key: "mtp_mode",
         title: "Multi-token prediction (MTP)",
-        summary: "Uses a model's MTP head to predict several tokens per step where supported.",
-        effect: "Can raise decode throughput on MTP-capable models with no correctness cost; a no-op on models without an MTP head.",
+        summary: "Uses DeepSeek's in-weights MTP head to propose several tokens per step.",
+        effect: "Can raise DeepSeek decode throughput with no correctness cost. Qwen native MTP is disabled pending SPEC-003: on rejects; auto and off use AR.",
         default: "auto",
-        when: "Leave on auto; force on/off only when A/B-testing throughput.",
-        note: None,
+        when: "Leave on auto for DeepSeek; use off for AR A/B tests. Do not enable it for Qwen.",
+        note: Some("DeepSeek reads the load-resolved MTP K from immutable model metadata. Qwen on rejects before native-head preflight, open, or GPU upload."),
         options: &[
             ("off", "No multi-token prediction."),
-            ("on", "Force the MTP head where the model has one."),
-            ("auto", "Use MTP when supported, else single-token."),
+            ("on", "Force DeepSeek MTP; Qwen rejects pending SPEC-003."),
+            ("auto", "Use DeepSeek MTP when weights are present; Qwen stays AR."),
         ],
     },
     KnobInfo {
         key: "mtp_k",
         title: "MTP depth (K)",
-        summary: "How many tokens the MTP head proposes per step.",
-        effect: "Higher K can accept more per step (faster) but risks lower acceptance on hard text. Only used when MTP is active.",
+        summary: "How many tokens DeepSeek's MTP head proposes per step.",
+        effect: "Higher K can accept more per step (faster) but risks lower acceptance on hard text. Only used by active DeepSeek MTP.",
         default: "3",
-        when: "Tune only when measuring MTP throughput; the default is a safe middle.",
-        note: None,
+        when: "Tune only when measuring DeepSeek MTP throughput; the default is a safe middle.",
+        note: Some("`HIPFIRE_MTP_K` overrides CLI and config; the resolved value is fixed at model load."),
         options: &[],
     },
     KnobInfo {
@@ -411,16 +411,33 @@ mod tests {
     fn load_bearing_interactions_are_documented() {
         // The two interactions this phase exists to surface.
         assert!(
-            knob_info("dflash_mode").unwrap().note.unwrap().contains("thinking"),
+            knob_info("dflash_mode")
+                .unwrap()
+                .note
+                .unwrap()
+                .contains("thinking"),
             "dflash note must mention the thinking interaction"
         );
         assert!(
-            knob_info("thinking").unwrap().note.unwrap().to_lowercase().contains("dflash")
-                || knob_info("thinking").unwrap().note.unwrap().contains("spec-decode"),
+            knob_info("thinking")
+                .unwrap()
+                .note
+                .unwrap()
+                .to_lowercase()
+                .contains("dflash")
+                || knob_info("thinking")
+                    .unwrap()
+                    .note
+                    .unwrap()
+                    .contains("spec-decode"),
             "thinking note must mention the dflash interaction"
         );
         assert!(
-            knob_info("kv_cache").unwrap().note.unwrap().contains("inherit"),
+            knob_info("kv_cache")
+                .unwrap()
+                .note
+                .unwrap()
+                .contains("inherit"),
             "kv_cache note must explain auto = inherit"
         );
     }

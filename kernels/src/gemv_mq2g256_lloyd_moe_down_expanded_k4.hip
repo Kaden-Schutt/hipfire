@@ -110,3 +110,90 @@ extern "C" __global__ void gemv_mq2g256_lloyd_moe_down_expanded_k4(
         expert_outputs[(long long)bid * K_TOP * M + (long long)krank * M + row] = acc;
     }
 }
+
+// ---------------------------------------------------------------------------
+// Reproducible int64-accumulating expanded variant (MQ2-Lloyd)
+//
+// Same per-cell write as gemv_mq2g256_lloyd_moe_down_expanded_k4 (no atomics,
+// one writer per expert_outputs cell), but the inner K-dot uses int64
+// fixed-point accumulation (S=2^24) for partition invariance under K-split.
+//
+// Per-group partial is warp-reduced in FP32 (same as base), then converted to
+// i64 before cross-group accumulation — same scheme as the residual i64 variant
+// but writing to the expanded output buffer rather than atomicAdd'ing.
+//
+// expert_outputs_i64: [N × K_TOP × M] raw unsigned long long (signed i64 bits).
+// Call `moe_i64_residual_to_f32` element-wise on each cell to convert.
+// topk_weights is NOT consumed here — the combine step applies it.
+// ---------------------------------------------------------------------------
+
+__launch_bounds__(32, 16)
+extern "C" __global__ void gemv_mq2g256_lloyd_moe_down_expanded_i64_k4(
+    const unsigned long long* __restrict__ expert_ptrs, // [n_exp]
+    const int*   __restrict__ topk_indices,              // [N × K_TOP]
+    const float* __restrict__ rot_batch,                 // [N × K_TOP × K]
+    unsigned long long* __restrict__ expert_outputs_i64, // [N × K_TOP × M] int64
+    int M, int K, int K_TOP
+) {
+    const int row   = blockIdx.x;
+    if (row >= M) return;
+    const int krank = blockIdx.y;
+    const int bid   = blockIdx.z;
+    const int tid   = threadIdx.x;
+
+    const int routing_base = bid * K_TOP;
+    const int expert_id = topk_indices[routing_base + krank];
+    const char* __restrict__ A =
+        reinterpret_cast<const char*>(expert_ptrs[expert_id]);
+    const float* __restrict__ x =
+        rot_batch + ((long long)bid * K_TOP + krank) * K;
+
+    const int groups_per_row = K / 256;
+    const int row_bytes = groups_per_row * 72;
+    const char* row_ptr = A + (long long)row * row_bytes;
+    const int boff = tid * 2;
+
+    __shared__ float cb_lds[4];
+
+    long long acc_i64 = 0LL;
+    const float S = (float)(1 << 24);
+
+    for (int g = 0; g < groups_per_row; g++) {
+        const char* gp = row_ptr + g * 72;
+
+        if (tid < 4) {
+            cb_lds[tid] = __half2float(((const __half*)gp)[tid]);
+        }
+        __syncthreads();
+
+        const unsigned char* d = (const unsigned char*)(gp + 8) + boff;
+        unsigned char b0 = d[0];
+        unsigned char b1 = d[1];
+        int base = g * 256 + tid * 8;
+
+        float partial =
+              cb_lds[ b0        & 3u] * x[base]
+            + cb_lds[(b0 >>  2) & 3u] * x[base + 1]
+            + cb_lds[(b0 >>  4) & 3u] * x[base + 2]
+            + cb_lds[ b0 >>  6      ] * x[base + 3]
+            + cb_lds[ b1        & 3u] * x[base + 4]
+            + cb_lds[(b1 >>  2) & 3u] * x[base + 5]
+            + cb_lds[(b1 >>  4) & 3u] * x[base + 6]
+            + cb_lds[ b1 >>  6      ] * x[base + 7];
+
+        for (int offset = 16; offset > 0; offset >>= 1)
+            partial += __shfl_down(partial, offset);
+
+        // Lane 0: accumulate per-group partial into int64 (no topk_w here —
+        // weight is applied by the combine step after expand).
+        if (tid == 0) {
+            acc_i64 += (long long)llroundf(partial * S);
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        expert_outputs_i64[(long long)bid * K_TOP * M + (long long)krank * M + row] =
+            (unsigned long long)acc_i64;
+    }
+}

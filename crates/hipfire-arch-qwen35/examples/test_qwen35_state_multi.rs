@@ -15,6 +15,7 @@
 //!         --example test_qwen35_state_multi -- \
 //!         ~/.hipfire/models/qwen3.5-0.8b.mq4
 
+use hipfire_arch_qwen35::arch::qwen35_la_devices;
 use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, LayerType, Qwen35ScratchSet, StateQuant};
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama::KvCache;
@@ -105,7 +106,7 @@ fn main() {
     }
 
     println!("\n── DeltaNetState::new_with_quant_multi ───────────────────");
-    let (dn, la_to_device) =
+    let dn =
         DeltaNetState::new_with_quant_multi(&mut gpus, &config, StateQuant::Q8).expect("DN multi");
     let n_la = config
         .layer_types
@@ -113,6 +114,8 @@ fn main() {
         .filter(|t| **t == LayerType::LinearAttention)
         .count();
     assert_eq!(dn.s_matrices.len(), n_la);
+    // STEP-003: placement derives from the state manifest + mesh.
+    let la_to_device = qwen35_la_devices(&config, &gpus);
     assert_eq!(la_to_device.len(), n_la);
     println!("  n_la={n_la}, la_to_device={:?}", la_to_device);
     let probe_la = [0usize, n_la / 2, n_la - 1];
@@ -135,7 +138,7 @@ fn main() {
     println!("  peer_access_enabled = true");
 
     println!("\n── free everything on owning devices ─────────────────────");
-    dn.free_gpu_multi(&mut gpus, &la_to_device);
+    dn.free_gpu_multi(&mut gpus, &config);
     kv.free_gpu_multi(&mut gpus);
     scratch_set.free_gpu_multi(&mut gpus);
     println!("  all state freed");
@@ -152,9 +155,8 @@ fn main() {
 
     println!("\n  [1/3] DeltaNetState::new_with_quant_multi Q8 — first LA on dev 0");
     gpus.devices[1].bind_thread().expect("misbind dev 1");
-    let (dn2, la_to_device2) =
-        DeltaNetState::new_with_quant_multi(&mut gpus, &config, StateQuant::Q8)
-            .expect("DN regression");
+    let dn2 = DeltaNetState::new_with_quant_multi(&mut gpus, &config, StateQuant::Q8)
+        .expect("DN regression");
     let attr = gpus.devices[0]
         .hip
         .pointer_get_attributes(&dn2.s_matrices[0].buf)
@@ -167,7 +169,7 @@ fn main() {
         attr.device,
     );
     println!("    s_matrices[0].device={} OK", attr.device);
-    dn2.free_gpu_multi(&mut gpus, &la_to_device2);
+    dn2.free_gpu_multi(&mut gpus, &config);
 
     println!("  [2/3] KvCache::new_gpu_asym3_capped_multi — layer 0 on dev 0");
     gpus.devices[1].bind_thread().expect("misbind dev 1");

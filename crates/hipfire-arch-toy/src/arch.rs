@@ -14,9 +14,12 @@
 //! `crates/hipfire-arch-qwen35/src/arch.rs`.
 
 use crate::toy_model::{ToyConfig, ToyState, ToyWeights};
-use hipfire_runtime::arch::{Architecture, EosFilterOverrides, LoopGuardOverrides,
-                            PromptFrameOverrides, SamplerOverrides};
+use hipfire_runtime::arch::{
+    Architecture, EosFilterOverrides, LoopGuardOverrides, PromptFrameOverrides, SamplerOverrides,
+};
 use hipfire_runtime::hfq::HfqFile;
+use hipfire_runtime::weight_manifest::{PinTarget, ShardPolicy, WeightEntry};
+use rdna_compute::DType;
 use rdna_compute::Gpu;
 
 /// Type marker for the toy arch. Zero-sized — no per-instance state.
@@ -72,6 +75,106 @@ impl Architecture for Toy {
     /// and `ForwardScratch::new` in `hipfire-runtime::llama` (dense FA).
     fn new_state(_gpu: &mut Gpu, cfg: &Self::Config) -> Result<Self::State, String> {
         ToyState::new(cfg)
+    }
+
+    /// Reference weight manifest (device-mesh Phase 2): the canonical dense
+    /// transformer placement, expressed declaratively so the engine's
+    /// mesh-driven `fulfill_manifest` can place/shard it on any topology.
+    /// A real arch transcribes its `load_weights` tensor map the same way.
+    fn weight_manifest(cfg: &Self::Config) -> Vec<WeightEntry> {
+        use ShardPolicy::*;
+        let d = cfg.dim;
+        let ffn = 4 * d; // toy convention
+        let mut m = Vec::new();
+        // Token embedding → pinned to stage 0.
+        m.push(WeightEntry::model(
+            "token_embd",
+            vec![cfg.vocab_size, d],
+            DType::F16,
+            Pin(PinTarget::Embed),
+        ));
+        for l in 0..cfg.layers {
+            // Attention: Q/K/V column-parallel, O row-parallel (Megatron).
+            m.push(WeightEntry::layer(
+                "wq",
+                l,
+                vec![d, d],
+                DType::F16,
+                ColumnShard { axis: 0 },
+            ));
+            m.push(WeightEntry::layer(
+                "wk",
+                l,
+                vec![d, d],
+                DType::F16,
+                ColumnShard { axis: 0 },
+            ));
+            m.push(WeightEntry::layer(
+                "wv",
+                l,
+                vec![d, d],
+                DType::F16,
+                ColumnShard { axis: 0 },
+            ));
+            m.push(WeightEntry::layer(
+                "wo",
+                l,
+                vec![d, d],
+                DType::F16,
+                RowShard { axis: 1 },
+            ));
+            // FFN: gate/up column-parallel, down row-parallel.
+            m.push(WeightEntry::layer(
+                "ffn_gate",
+                l,
+                vec![ffn, d],
+                DType::F16,
+                ColumnShard { axis: 0 },
+            ));
+            m.push(WeightEntry::layer(
+                "ffn_up",
+                l,
+                vec![ffn, d],
+                DType::F16,
+                ColumnShard { axis: 0 },
+            ));
+            m.push(WeightEntry::layer(
+                "ffn_down",
+                l,
+                vec![d, ffn],
+                DType::F16,
+                RowShard { axis: 1 },
+            ));
+            // Norms replicated.
+            m.push(WeightEntry::layer(
+                "attn_norm",
+                l,
+                vec![d],
+                DType::F32,
+                Replicate,
+            ));
+            m.push(WeightEntry::layer(
+                "ffn_norm",
+                l,
+                vec![d],
+                DType::F32,
+                Replicate,
+            ));
+        }
+        // Final norm replicated; lm_head pinned to the output (last) stage.
+        m.push(WeightEntry::model(
+            "output_norm",
+            vec![d],
+            DType::F32,
+            Replicate,
+        ));
+        m.push(WeightEntry::model(
+            "lm_head",
+            vec![cfg.vocab_size, d],
+            DType::F16,
+            Pin(PinTarget::Output),
+        ));
+        m
     }
 
     // ── Optional overrides ────────────────────────────────────────────
@@ -131,5 +234,34 @@ mod tests {
     fn toy_arch_id_is_reserved() {
         assert_eq!(Toy::arch_id(), 0xFF);
         assert_eq!(Toy::name(), "toy");
+    }
+}
+
+#[cfg(test)]
+mod manifest_tests {
+    use super::*;
+
+    #[test]
+    fn toy_weight_manifest_dense_layout() {
+        let cfg = ToyConfig {
+            vocab_size: 256,
+            dim: 8,
+            layers: 2,
+        };
+        let m = <Toy as Architecture>::weight_manifest(&cfg);
+        // embed + 9 per layer * 2 + output_norm + lm_head = 1 + 18 + 2 = 21
+        assert_eq!(m.len(), 21);
+        // embed pinned to stage 0.
+        assert!(matches!(m[0].policy, ShardPolicy::Pin(PinTarget::Embed)));
+        assert_eq!(m[0].layer, None);
+        // lm_head pinned to output.
+        let lm = m.iter().find(|e| e.name == "lm_head").unwrap();
+        assert!(matches!(lm.policy, ShardPolicy::Pin(PinTarget::Output)));
+        // wo is row-parallel, wq column-parallel, layer-scoped.
+        let wo = m.iter().find(|e| e.name == "wo").unwrap();
+        assert!(matches!(wo.policy, ShardPolicy::RowShard { axis: 1 }));
+        assert_eq!(wo.layer, Some(0));
+        let wq = m.iter().find(|e| e.name == "wq").unwrap();
+        assert!(matches!(wq.policy, ShardPolicy::ColumnShard { axis: 0 }));
     }
 }

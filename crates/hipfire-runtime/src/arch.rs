@@ -46,7 +46,8 @@
 //!      time.
 
 use crate::hfq::HfqFile;
-use rdna_compute::Gpu;
+use crate::llama::WeightTensor;
+use rdna_compute::{DType, Gpu};
 
 /// Bring-up contract for a hipfire architecture.
 ///
@@ -152,6 +153,34 @@ pub trait Architecture: Send + 'static {
     ///   `hipfire-runtime::llama`) — KV cache plus attention
     ///   workspace; no recurrent state.
     fn new_state(gpu: &mut Gpu, cfg: &Self::Config) -> Result<Self::State, String>;
+
+    /// Declarative weight-placement manifest (Phase 2, device-mesh plan): for
+    /// each tensor, its logical shape/dtype + [`ShardPolicy`]. The engine slices
+    /// each tensor to its `(stage, tp_rank)` via the mesh before the arch sees
+    /// it, so the arch declares *what it needs*, not *where it goes*. Pure CPU,
+    /// no GPU/HFQ dependency — implement by transcribing the arch's existing
+    /// imperative loader; unit-test before the fulfillment loop exists. Default
+    /// is unimplemented so arches opt in incrementally.
+    fn weight_manifest(_cfg: &Self::Config) -> Vec<crate::weight_manifest::WeightEntry> {
+        unimplemented!("weight_manifest not yet implemented for this arch")
+    }
+
+    /// Declarative per-layer state manifest (KV/recurrent/conv) — sibling of
+    /// [`Architecture::weight_manifest`], placed by the same mesh projection.
+    /// Default empty (arches opt in). See device-mesh plan §4.
+    fn state_manifest(_cfg: &Self::Config) -> Vec<crate::weight_manifest::StateEntry> {
+        Vec::new()
+    }
+
+    /// Declarative MoE expert-group manifest. The runtime resolves global
+    /// expert ids to owners and compact local slots; non-MoE architectures
+    /// retain their existing behavior through the empty default.
+    fn expert_group_manifest(
+        _cfg: &Self::Config,
+        _policy: &crate::moe_plan::MoEExecutionPolicy,
+    ) -> Vec<crate::weight_manifest::ExpertGroupSpec> {
+        Vec::new()
+    }
 
     // Forward pass shapes are arch-specific; declare the surface but
     // don't constrain types in this trait — concrete arch crates
@@ -273,4 +302,57 @@ pub struct EosFilterOverrides {
     /// If `Some`, override whether to strip `<think>...</think>` blocks
     /// from the visible stream. Default is on for thinking-mode arches.
     pub strip_think: Option<bool>,
+}
+
+/// Architecture-owned iteration over weights eligible for load-time MMQ
+/// safety screening. Each implementation returns `(safe, unsafe)` counts.
+pub trait MmqScreenable {
+    fn screen_mmq_weights(&self, gpu: &mut Gpu) -> (usize, usize);
+}
+
+/// Screen one weight tensor when its storage layout is accepted by the HFQ4
+/// MMQ reference probe. The dtype guard is load-bearing: probing a different
+/// packed layout can read beyond the tensor buffer.
+pub fn screen_weight_tensor(
+    weight: &WeightTensor,
+    gpu: &mut Gpu,
+    safe: &mut usize,
+    unsafe_count: &mut usize,
+) {
+    if !matches!(weight.gpu_dtype, DType::HFQ4G256 | DType::MQ4G256) {
+        return;
+    }
+    if gpu.mmq_screen_weight(&weight.buf, weight.m, weight.k) {
+        *safe += 1;
+    } else {
+        *unsafe_count += 1;
+    }
+}
+
+/// Apply the current enable/architecture policy and screen an architecture's
+/// weights. Screening remains opt-in; disabled loads return immediately.
+pub fn maybe_screen_mmq(weights: &impl MmqScreenable, gpu: &mut Gpu) {
+    if !gpu.mmq_screen.enabled
+        || !matches!(
+            gpu.arch.as_str(),
+            "gfx906"
+                | "gfx1100"
+                | "gfx1101"
+                | "gfx1102"
+                | "gfx1103"
+                | "gfx1150"
+                | "gfx1151"
+                | "gfx1152"
+        )
+    {
+        return;
+    }
+
+    let started = std::time::Instant::now();
+    let (safe, unsafe_count) = weights.screen_mmq_weights(gpu);
+    eprintln!(
+        "  MMQ screening: {safe} safe, {unsafe_count} unsafe (threshold={:.2}, {:.1}ms)",
+        gpu.mmq_screen.threshold,
+        started.elapsed().as_secs_f64() * 1000.0,
+    );
 }

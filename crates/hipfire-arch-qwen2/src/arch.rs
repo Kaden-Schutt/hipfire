@@ -14,9 +14,14 @@
 //! [`crate::qwen2::forward_step_greedy`] directly.
 
 use crate::qwen2::{Qwen2Config, Qwen2State, Qwen2Weights};
-use hipfire_runtime::arch::{Architecture, EosFilterOverrides, LoopGuardOverrides,
-                            PromptFrameOverrides, SamplerOverrides};
+use hipfire_runtime::arch::{
+    Architecture, EosFilterOverrides, LoopGuardOverrides, PromptFrameOverrides, SamplerOverrides,
+};
 use hipfire_runtime::hfq::HfqFile;
+use hipfire_runtime::weight_manifest::{
+    FusedQkvLayout, PinTarget, ShardPolicy, StateEntry, StateKind, WeightEntry,
+};
+use rdna_compute::DType;
 use rdna_compute::Gpu;
 
 /// Zero-sized type marker for the Qwen2 arch.
@@ -59,6 +64,151 @@ impl Architecture for Qwen2 {
 
     fn new_state(gpu: &mut Gpu, cfg: &Self::Config) -> Result<Self::State, String> {
         Qwen2State::new(gpu, cfg)
+    }
+
+    /// Dense (GQA) weight manifest (device-mesh Phase 2). Qwen2 specifics vs
+    /// vanilla llama: attention Q/K/V carry **biases** (`attention_bias`), and
+    /// the lm_head may be **tied** to the embedding (`tie_word_embeddings`).
+    fn weight_manifest(cfg: &Self::Config) -> Vec<WeightEntry> {
+        use ShardPolicy::*;
+        let (d, ff, hd) = (cfg.hidden_size, cfg.intermediate_size, cfg.head_dim);
+        let (nh, nkv) = (cfg.num_attention_heads, cfg.num_key_value_heads);
+        let mut m = Vec::new();
+        m.push(WeightEntry::model(
+            "token_embd",
+            vec![cfg.vocab_size, d],
+            DType::F16,
+            Pin(PinTarget::Embed),
+        ));
+        for l in 0..cfg.num_hidden_layers {
+            m.push(WeightEntry::layer(
+                "wq",
+                l,
+                vec![nh * hd, d],
+                DType::F16,
+                FusedQkv {
+                    q_heads: nh,
+                    kv_heads: nkv,
+                    head_dim: hd,
+                    layout: FusedQkvLayout::Qkv,
+                },
+            ));
+            m.push(WeightEntry::layer(
+                "wk",
+                l,
+                vec![nkv * hd, d],
+                DType::F16,
+                ColumnShard { axis: 0 },
+            ));
+            m.push(WeightEntry::layer(
+                "wv",
+                l,
+                vec![nkv * hd, d],
+                DType::F16,
+                ColumnShard { axis: 0 },
+            ));
+            m.push(WeightEntry::layer(
+                "wo",
+                l,
+                vec![d, nh * hd],
+                DType::F16,
+                RowShard { axis: 1 },
+            ));
+            if cfg.attention_bias {
+                // Biases shard with their (column-parallel) projection's output.
+                m.push(WeightEntry::layer(
+                    "bq",
+                    l,
+                    vec![nh * hd],
+                    DType::F32,
+                    ColumnShard { axis: 0 },
+                ));
+                m.push(WeightEntry::layer(
+                    "bk",
+                    l,
+                    vec![nkv * hd],
+                    DType::F32,
+                    ColumnShard { axis: 0 },
+                ));
+                m.push(WeightEntry::layer(
+                    "bv",
+                    l,
+                    vec![nkv * hd],
+                    DType::F32,
+                    ColumnShard { axis: 0 },
+                ));
+            }
+            m.push(WeightEntry::layer(
+                "ffn_gate",
+                l,
+                vec![ff, d],
+                DType::F16,
+                ColumnShard { axis: 0 },
+            ));
+            m.push(WeightEntry::layer(
+                "ffn_up",
+                l,
+                vec![ff, d],
+                DType::F16,
+                ColumnShard { axis: 0 },
+            ));
+            m.push(WeightEntry::layer(
+                "ffn_down",
+                l,
+                vec![d, ff],
+                DType::F16,
+                RowShard { axis: 1 },
+            ));
+            m.push(WeightEntry::layer(
+                "attn_norm",
+                l,
+                vec![d],
+                DType::F32,
+                Replicate,
+            ));
+            m.push(WeightEntry::layer(
+                "ffn_norm",
+                l,
+                vec![d],
+                DType::F32,
+                Replicate,
+            ));
+        }
+        m.push(WeightEntry::model(
+            "output_norm",
+            vec![d],
+            DType::F32,
+            Replicate,
+        ));
+        // Tied lm_head aliases the embedding; else a separate output-pinned weight.
+        let lm_policy = if cfg.tie_word_embeddings {
+            Tied {
+                source: "token_embd".to_string(),
+            }
+        } else {
+            Pin(PinTarget::Output)
+        };
+        m.push(WeightEntry::model(
+            "lm_head",
+            vec![cfg.vocab_size, d],
+            DType::F16,
+            lm_policy,
+        ));
+        m
+    }
+
+    /// Qwen2 is full-attention → one KV `StateEntry` per layer.
+    fn state_manifest(cfg: &Self::Config) -> Vec<StateEntry> {
+        (0..cfg.num_hidden_layers)
+            .map(|l| {
+                StateEntry::new(
+                    StateKind::Kv {
+                        quant: String::new(),
+                    },
+                    l,
+                )
+            })
+            .collect()
     }
 
     // ── Optional overrides ────────────────────────────────────────────

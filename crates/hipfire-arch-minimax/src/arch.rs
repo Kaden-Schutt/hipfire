@@ -12,6 +12,13 @@
 use crate::minimax::{MiniMaxConfig, MiniMaxState, MiniMaxWeights};
 use hipfire_runtime::arch::Architecture;
 use hipfire_runtime::hfq::HfqFile;
+use hipfire_runtime::moe_plan::{MoEExecutionKind, MoEExecutionPolicy};
+use hipfire_runtime::tp_shard::ExpertAssign;
+use hipfire_runtime::weight_manifest::{
+    ExpertExecutionIdentity, ExpertGroupSpec, ExpertParallelism, ExpertResourceRequirements,
+    ExpertSourceLayout, FusedQkvLayout, PinTarget, ShardPolicy, StateEntry, StateKind, WeightEntry,
+};
+use rdna_compute::DType;
 use rdna_compute::Gpu;
 
 /// Zero-sized type marker for MiniMax-M2. Trait dispatch uses the type.
@@ -41,11 +48,196 @@ impl Architecture for MiniMaxM2 {
         cfg: &Self::Config,
         gpu: &mut Gpu,
     ) -> Result<Self::Weights, String> {
-        MiniMaxWeights::load(hfq, cfg, gpu, None)
+        MiniMaxWeights::load(hfq, cfg, gpu, None, None)
     }
 
     fn new_state(gpu: &mut Gpu, cfg: &Self::Config) -> Result<Self::State, String> {
         MiniMaxState::new(gpu, cfg)
+    }
+
+    /// MoE weight manifest (device-mesh Phase 2) — first production use of
+    /// `ExpertSharded`. Every layer is MoE: dense attention (Q/K/V column, O
+    /// row) + a replicated router + `num_local_experts` experts distributed
+    /// across the `Ep` group (the zeroed-dummy convention lives in the engine's
+    /// fulfillment). Expert gate/up/down are one `ExpertSharded` entry each.
+    fn weight_manifest(cfg: &Self::Config) -> Vec<WeightEntry> {
+        use ShardPolicy::*;
+        let (d, ff, hd) = (cfg.hidden_size, cfg.intermediate_size, cfg.head_dim);
+        let (nh, nkv, ne) = (
+            cfg.num_attention_heads,
+            cfg.num_key_value_heads,
+            cfg.num_local_experts,
+        );
+        let expert = || ExpertSharded {
+            n_experts: ne,
+            assign: ExpertAssign::Stride,
+        };
+        let mut m = Vec::new();
+        m.push(WeightEntry::model(
+            "token_embd",
+            vec![cfg.vocab_size, d],
+            DType::F16,
+            Pin(PinTarget::Embed),
+        ));
+        for l in 0..cfg.num_hidden_layers {
+            // Attention (dense).
+            m.push(WeightEntry::layer(
+                "wq",
+                l,
+                vec![nh * hd, d],
+                DType::F16,
+                FusedQkv {
+                    q_heads: nh,
+                    kv_heads: nkv,
+                    head_dim: hd,
+                    layout: FusedQkvLayout::Qkv,
+                },
+            ));
+            m.push(WeightEntry::layer(
+                "wk",
+                l,
+                vec![nkv * hd, d],
+                DType::F16,
+                ColumnShard { axis: 0 },
+            ));
+            m.push(WeightEntry::layer(
+                "wv",
+                l,
+                vec![nkv * hd, d],
+                DType::F16,
+                ColumnShard { axis: 0 },
+            ));
+            m.push(WeightEntry::layer(
+                "wo",
+                l,
+                vec![d, nh * hd],
+                DType::F16,
+                RowShard { axis: 1 },
+            ));
+            // MoE: router replicated; experts sharded across the Ep group.
+            m.push(WeightEntry::layer(
+                "router",
+                l,
+                vec![ne, d],
+                DType::F32,
+                Replicate,
+            ));
+            m.push(WeightEntry::layer(
+                "experts_gate",
+                l,
+                vec![ne, ff, d],
+                DType::F16,
+                expert(),
+            ));
+            m.push(WeightEntry::layer(
+                "experts_up",
+                l,
+                vec![ne, ff, d],
+                DType::F16,
+                expert(),
+            ));
+            m.push(WeightEntry::layer(
+                "experts_down",
+                l,
+                vec![ne, d, ff],
+                DType::F16,
+                expert(),
+            ));
+            m.push(WeightEntry::layer(
+                "attn_norm",
+                l,
+                vec![d],
+                DType::F32,
+                Replicate,
+            ));
+            m.push(WeightEntry::layer(
+                "ffn_norm",
+                l,
+                vec![d],
+                DType::F32,
+                Replicate,
+            ));
+        }
+        m.push(WeightEntry::model(
+            "output_norm",
+            vec![d],
+            DType::F32,
+            Replicate,
+        ));
+        m.push(WeightEntry::model(
+            "lm_head",
+            vec![cfg.vocab_size, d],
+            DType::F16,
+            Pin(PinTarget::Output),
+        ));
+        m
+    }
+
+    /// MiniMax is full-attention (Mixtral-style) → one KV `StateEntry`/layer.
+    fn state_manifest(cfg: &Self::Config) -> Vec<StateEntry> {
+        (0..cfg.num_hidden_layers)
+            .map(|l| {
+                StateEntry::new(
+                    StateKind::Kv {
+                        quant: String::new(),
+                    },
+                    l,
+                )
+            })
+            .collect()
+    }
+
+    /// Policy-aware MoE expert-group manifest (Phase 3, Task 7) — one
+    /// layer-local group per MoE layer. Parallelism and assignment derive
+    /// EXCLUSIVELY from the caller-supplied policy and the arch's stride-
+    /// assignment loader convention — never from a locally reconstructed mesh:
+    ///   - `Single` → `ExpertParallelism::Single` (one rank owns the group)
+    ///   - `Tp`     → `ExpertParallelism::TensorParallel`
+    ///   - `Ep`     → `ExpertParallelism::ExpertParallel`
+    /// Router identity is `sigmoid_topk` (MiniMax scores are sigmoid-activated;
+    /// the bias-aware top-k selection runs inside the routed program's
+    /// `MoeRoute` step), and the execution identity `indexed_quantized` matches
+    /// the typed `ExpertExecutionPlan` the forward's `IndexedMoeGemv` program
+    /// lowers with. Sources reference the weight-manifest expert entries
+    /// (`experts_gate` / `experts_up` / `experts_down`) and the replicated
+    /// router (`router`).
+    fn expert_group_manifest(
+        cfg: &Self::Config,
+        policy: &MoEExecutionPolicy,
+    ) -> Vec<ExpertGroupSpec> {
+        let parallelism = match policy.kind() {
+            MoEExecutionKind::Single => ExpertParallelism::Single,
+            MoEExecutionKind::Tp => ExpertParallelism::TensorParallel,
+            MoEExecutionKind::Ep => ExpertParallelism::ExpertParallel,
+        };
+        (0..cfg.num_hidden_layers)
+            .map(|l| ExpertGroupSpec {
+                group: "moe".into(),
+                layer: Some(l),
+                n_experts: cfg.num_local_experts,
+                parallelism,
+                assignment: ExpertAssign::Stride,
+                source_layout: ExpertSourceLayout::PackedSeparate {
+                    gate: "experts_gate".into(),
+                    up: "experts_up".into(),
+                    down: "experts_down".into(),
+                    sidecars: Vec::new(),
+                },
+                resources: ExpertResourceRequirements {
+                    // Truthful declared F16 footprint of one expert: three
+                    // projections (gate w1, up w3, down w2), each
+                    // hidden x intermediate elements x 2 bytes F16. (The
+                    // lowerer never reads this field — it is manifest
+                    // metadata; plain arithmetic matches the loader's
+                    // usize shapes.)
+                    bytes_per_expert: 3 * cfg.hidden_size * cfg.intermediate_size * 2,
+                    alignment: 256,
+                },
+                router: "router".into(),
+                router_identity: "sigmoid_topk".into(),
+                allowed_executions: vec![ExpertExecutionIdentity::IndexedQuantized],
+            })
+            .collect()
     }
 
     // Optional overrides left at the ChatML defaults for the scaffold.

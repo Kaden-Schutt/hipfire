@@ -1,67 +1,95 @@
-# `hipfire chat` — Interactive Chat TUI
+# Chat
 
-## Usage
+hipfire provides two native Rust chat surfaces:
 
+- `hipfire tui` (or bare `hipfire`) opens the full ratatui application and its
+  Chat tab.
+- `hipfire chat [model]` is a lightweight line-oriented multi-turn client for
+  terminals and scripts.
+
+Both use the native OpenAI-compatible service documented in
+[`SERVE.md`](SERVE.md).
+
+## Full terminal UI
+
+```bash
+hipfire
+# or
+hipfire tui
 ```
-hipfire chat <model-tag>
+
+Open the Chat tab, select a downloaded model in Models, or use `/model <tag>`.
+The TUI supports streaming, multiline input (`Ctrl+O`), cancellation, saved
+sessions, model/system/sampling commands, regeneration/edit/copy actions, and
+live serve status. Run `/help` in Chat for the current command list.
+
+The TUI asks the native CLI to start a detached service when the configured
+endpoint is offline. Config, registry, model lifecycle, and HTTP calls all use
+the shared Rust crates; there is no separate script runtime.
+
+## Lightweight chat command
+
+```bash
+hipfire chat qwen3.6:35b-a3b-mq4r
 ```
 
-Example:
+```text
+you> Explain wave32 WMMA briefly.
+assistant> ...
+you> /clear
+you> /exit
 ```
-hipfire chat qwen3.5:9b
-```
 
-Requires a running `hipfire serve` or auto-spawns a dedicated daemon.
+Supported local commands are `/clear`, `/exit`, and `/quit`. Flags:
 
-## Keybindings
-
-| Key | Action |
-|-----|--------|
-| CTRL+O | Insert newline (multi-line input) |
-| Enter | Submit message |
-| CTRL+C | Abort stream (press twice to exit) |
-| CTRL+L | Clear screen |
-| CTRL+D | Exit (when input empty) |
-| Up / Down | Navigate input history |
-| Left / Right | Move cursor |
-| Home / End | Jump to start / end of line |
-| Backspace / Delete | Delete characters |
-
-## Slash Commands
-
-| Command | Description |
-|---------|-------------|
-| `/help`, `/?` | Show help |
-| `/clear` | Clear conversation history |
-| `/stats` | Show model stats |
-| `/trim` | Drop old messages to free context |
-| `/exit`, `/quit` | Exit chat |
-
-## Features
-
-- **Multi-line input:** Use CTRL+O to insert newlines. Bracketed paste works automatically.
-- **Markdown rendering:** Code blocks, inline code, bold, and italic are rendered with ANSI styling.
-- **Streaming:** See tokens appear in real-time. Abort with CTRL+C.
-- **Input history:** Use up/down arrows to recall previous messages.
-- **Context awareness:** Warning when approaching the model's context limit.
-
-## Color output
-
-Colors and OSC 8 hyperlinks track your terminal palette automatically (we
-use 16-color ANSI throughout, no truecolor). To disable styling entirely:
-
-| Trigger | Effect |
+| Flag | Purpose |
 |---|---|
-| `hipfire chat <tag> --no-color` | One-shot: this session only |
-| `NO_COLOR=1 hipfire chat <tag>` | Honors the [no-color.org](https://no-color.org) standard |
-| `CLICOLOR=0 hipfire chat <tag>` | De-facto-standard fallback also honored |
+| `-t, --temp <f>` | Explicit temperature for this session |
+| `--top-p <f>` | Explicit nucleus probability |
+| `-n, --max-tokens <n>` | Per-turn generation cap |
+| `--system <text>` | Initial system message |
+| `--no-color` | Compatibility flag; the line client emits no ANSI color |
 
-When disabled, all SGR (bold/dim/italic/color) and OSC 8 hyperlink
-sequences are stripped at write-time — markdown still renders to
-plain text but loses styling.
+If no healthy service exists, the command starts a tracked detached native
+service on the configured host/port with lazy model loading. That service
+remains available after the line client exits; use `hipfire stop` when you want
+to release it.
 
-## Daemon Lifecycle
+## Resolution and request behavior
 
-`hipfire chat` reuses a running `hipfire serve` if one is detected on the
-configured port. Otherwise it spawns a dedicated daemon and tears it down on
-exit.
+- Model names use the same registry/alias/path resolver as `run` and `serve`.
+- The service resolves load-time KV/speculation/model overrides from
+  `config.toml`, `models.toml`, registry recommendations, and compatible env.
+- Explicit chat sampling flags are sent on every turn. Omitted sampling fields
+  follow the service's per-model/registry/daemon fallback contract.
+- The full `messages` array is sent each turn, so conversation context is
+  preserved by request content rather than hidden client state.
+- Streaming answer and reasoning deltas share the same Rust HTTP client used by
+  the TUI.
+
+## Thinking and model framing
+
+Reasoning models may emit a thinking stream before the answer. The HTTP API
+exposes it as `reasoning_content`; visible answer text remains `content`.
+`thinking`, `thinking_budget`, and `max_think_tokens` are owned by
+[`CONFIG.md`](CONFIG.md). Per-request `reasoning_effort` and
+`chat_template_kwargs.enable_thinking` are documented in
+[`SERVE.md`](SERVE.md).
+
+Chat framing and stop behavior are model-specific. Use the exact registry tag
+and do not assume Qwen `<think>` conventions apply to LFM or other families.
+The LFM framing smoke route is `scripts/serve_harness.py` with the exact
+`lfm2.5:*` tag; see [`VALIDATION.md`](VALIDATION.md).
+
+## Troubleshooting
+
+| Symptom | Action |
+|---|---|
+| Model not found | `hipfire list -r`, then `hipfire pull <tag>` |
+| Service will not start | `hipfire diag`; inspect `~/.hipfire/serve.log` |
+| Port conflict | `hipfire ps`; stop the owned service with `hipfire stop` |
+| Truncated answer | Raise `--max-tokens` and check the thinking budget |
+| Need richer session controls | Use `hipfire tui` and its Chat tab |
+
+The service has no authentication or TLS. Local chat should use a loopback bind;
+see [`SERVE.md`](SERVE.md) before exposing it to a network.

@@ -82,7 +82,8 @@ fn main() {
         }
 
         let refs: Vec<&DeviceBuffer> = buffers.iter().collect();
-        gpus.all_reduce_sum_f32(&refs, count)
+        let group: Vec<usize> = (0..refs.len()).collect();
+        gpus.all_reduce_sum_f32(&group, &refs, count)
             .expect("all_reduce_sum_f32");
 
         // Sync all rank streams before readback.
@@ -132,9 +133,10 @@ fn main() {
     for &bytes in SIZES_BYTES {
         let count = bytes / std::mem::size_of::<f32>();
         let refs: Vec<&DeviceBuffer> = buffers.iter().collect();
+        let group: Vec<usize> = (0..refs.len()).collect();
 
         for _ in 0..warmup {
-            gpus.all_reduce_sum_f32(&refs, count)
+            gpus.all_reduce_sum_f32(&group, &refs, count)
                 .expect("all_reduce warm");
             for dev in &gpus.devices {
                 dev.bind_thread().expect("bind");
@@ -147,7 +149,8 @@ fn main() {
         let mut samples = Vec::with_capacity(iters);
         for _ in 0..iters {
             let t = Instant::now();
-            gpus.all_reduce_sum_f32(&refs, count).expect("all_reduce");
+            gpus.all_reduce_sum_f32(&group, &refs, count)
+                .expect("all_reduce");
             for dev in &gpus.devices {
                 dev.bind_thread().expect("bind");
                 dev.hip

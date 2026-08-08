@@ -1,0 +1,954 @@
+{
+  "_comment": "Curated hipfire model registry overlay. Keep entry shape: { repo, file, size_gb, min_vram_gb, desc }. Empty repo = local-only. Aliases are simple string\u2192string redirects. Run scripts/registry_gen.py after editing.",
+  "models": {
+    "qwen3.5:0.8b": {
+      "repo": "schuttdev/hipfire-qwen3.5-0.8b",
+      "file": "qwen3.5-0.8b.mq4",
+      "size_gb": 0.55,
+      "min_vram_gb": 2.0,
+      "default_kv_mode": "q8",
+      "desc": "386 / 5100 tok/s",
+      "quant_recipe": "v3-awq-f1",
+      "recommended_settings": {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20,
+        "min_p": 0.0,
+        "presence_penalty": 1.5,
+        "repeat_penalty": 1.0
+      }
+    },
+    "qwen3.5:4b": {
+      "repo": "schuttdev/hipfire-qwen3.5-4b",
+      "file": "qwen3.5-4b.mq4",
+      "size_gb": 2.59,
+      "min_vram_gb": 4.1,
+      "default_kv_mode": "q8",
+      "desc": "169 / 1900 tok/s",
+      "quant_recipe": "v3-awq-f1",
+      "recommended_settings": {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20,
+        "min_p": 0.0,
+        "presence_penalty": 1.5,
+        "repeat_penalty": 1.0
+      },
+      "sampling_profiles": {
+        "general": {
+          "temperature": 1.0,
+          "top_p": 0.95,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 1.5,
+          "repeat_penalty": 1.0
+        },
+        "coding": {
+          "temperature": 0.6,
+          "top_p": 0.95,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 0.0,
+          "repeat_penalty": 1.0
+        },
+        "instruct": {
+          "temperature": 0.7,
+          "top_p": 0.8,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 1.5,
+          "repeat_penalty": 1.0
+        }
+      }
+    },
+    "qwen3.5:9b": {
+      "repo": "schuttdev/hipfire-qwen3.5-9b",
+      "file": "qwen3.5-9b.mq4",
+      "size_gb": 5.31,
+      "min_vram_gb": 6.8,
+      "default_kv_mode": "q8",
+      "desc": "125 / 1720 tok/s",
+      "quant_recipe": "v3-awq-f1",
+      "recommended_settings": {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20,
+        "min_p": 0.0,
+        "presence_penalty": 1.5,
+        "repeat_penalty": 1.0
+      },
+      "sampling_profiles": {
+        "general": {
+          "temperature": 1.0,
+          "top_p": 0.95,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 1.5,
+          "repeat_penalty": 1.0
+        },
+        "coding": {
+          "temperature": 0.6,
+          "top_p": 0.95,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 0.0,
+          "repeat_penalty": 1.0
+        },
+        "instruct": {
+          "temperature": 0.7,
+          "top_p": 0.8,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 1.5,
+          "repeat_penalty": 1.0
+        }
+      }
+    },
+    "qwen3.5:27b": {
+      "repo": "schuttdev/hipfire-qwen3.5-27b",
+      "file": "qwen3.5-27b.mq4",
+      "size_gb": 15.0,
+      "min_vram_gb": 16,
+      "default_kv_mode": "q8",
+      "desc": "45 / 489 tok/s, 16GB+",
+      "recommended_settings": {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20,
+        "min_p": 0.0,
+        "presence_penalty": 1.5,
+        "repeat_penalty": 1.0
+      },
+      "sampling_profiles": {
+        "general": {
+          "temperature": 1.0,
+          "top_p": 0.95,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 1.5,
+          "repeat_penalty": 1.0
+        },
+        "coding": {
+          "temperature": 0.6,
+          "top_p": 0.95,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 0.0,
+          "repeat_penalty": 1.0
+        },
+        "instruct": {
+          "temperature": 0.7,
+          "top_p": 0.8,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 1.5,
+          "repeat_penalty": 1.0
+        }
+      }
+    },
+    "qwen3.5:35b-a3b": {
+      "repo": "schuttdev/hipfire-qwen3.5-35b-a3b",
+      "file": "qwen3.5-35b-a3b.mq4",
+      "size_gb": 19.7,
+      "min_vram_gb": 22,
+      "default_kv_mode": "q8",
+      "desc": "MoE 35B/3B-active, 115 tok/s",
+      "recommended_settings": {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20,
+        "min_p": 0.0,
+        "presence_penalty": 1.5,
+        "repeat_penalty": 1.0
+      },
+      "sampling_profiles": {
+        "general": {
+          "temperature": 1.0,
+          "top_p": 0.95,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 1.5,
+          "repeat_penalty": 1.0
+        },
+        "coding": {
+          "temperature": 0.6,
+          "top_p": 0.95,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 0.0,
+          "repeat_penalty": 1.0
+        },
+        "instruct": {
+          "temperature": 0.7,
+          "top_p": 0.8,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 1.5,
+          "repeat_penalty": 1.0
+        }
+      }
+    },
+    "deepseek-v4-flash": {
+      "repo": "nwoolmer/hipfire-deepseek-v4-flash",
+      "file": "deepseek-v4-flash.mq2lloyd",
+      "size_gb": 82,
+      "min_vram_gb": 96,
+      "sampling": { "temperature": 1.0, "top_p": 1.0 },
+      "mtp": {
+        "file": "deepseek-v4-flash-mtp.mq2lloyd"
+      },
+      "dspark": {
+        "file": "deepseek-v4-flash-dspark.mq2lloyd"
+      },
+      "recommended_settings": {
+        "temperature": 1.0,
+        "top_p": 1.0
+      },
+      "desc": "DeepSeek V4 Flash, MQ2-Lloyd routed-expert MoE (arch_id=9). Includes MTP sidecar for K=2 spec-decode (+29% TG on code) and a DSpark 3-stage drafter sidecar (auto-wins over MTP under --spec dspark/auto). temp=1.0 is safety-critical: greedy/low-temp falls into token loops on the quant."
+    },
+    "minimax-m2.7": {
+      "repo": "hipfire-models/hipfire-MiniMax-M2.7",
+      "file": "MiniMax-M2.7.mq2",
+      "size_gb": 79.2,
+      "min_vram_gb": 96,
+      "recommended_settings": {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 40,
+        "system_prompt": "You are a helpful assistant. Your name is MiniMax-M2.7 and is built by MiniMax."
+      },
+      "desc": "MiniMax-M2.7 Mixtral-style 256-expert MoE (arch_id=10). MQ2 SKU (~79GB); fits gfx1151/96GB or multi-GPU EP. Card temp=1.0/top_p=0.95/top_k=40 + default identity system prompt."
+    },
+    "north-mini-code": {
+      "repo": "nwoolmer/hipfire-north-mini-code",
+      "file": "north-mini-code.mq4.hfq",
+      "size_gb": 16,
+      "min_vram_gb": 24,
+      "sampling": { "temperature": 1.0, "top_p": 0.95 },
+      "desc": "CohereLabs North-Mini-Code-1.0 (Cohere2-MoE, arch_id=12). MQ4 4-bit. Agentic code model: parallel block, sigmoid 128-expert MoE; <|START_THINKING|>/<|START_TEXT|>/<|START_ACTION|> tool-call format. ~880 tok/s prefill, ~37 tok/s decode on gfx1151."
+    },
+    "qwen3.6:35b-a3b": {
+      "repo": "schuttdev/hipfire-qwen3.6-35b-a3b",
+      "mtp": {
+        "file": "qwen3.6-35b-a3b.mtp"
+      },
+      "file": "qwen3.6-35b-a3b.mq4p",
+      "size_gb": 19.8,
+      "min_vram_gb": 22,
+      "default_kv_mode": "q8",
+      "recommended_settings": {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20,
+        "min_p": 0.0,
+        "presence_penalty": 1.5,
+        "repeat_penalty": 1.0
+      },
+      "sampling_profiles": {
+        "general": {
+          "temperature": 1.0,
+          "top_p": 0.95,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 1.5,
+          "repeat_penalty": 1.0
+        },
+        "coding": {
+          "temperature": 0.6,
+          "top_p": 0.95,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 0.0,
+          "repeat_penalty": 1.0
+        },
+        "instruct": {
+          "temperature": 0.7,
+          "top_p": 0.8,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 1.5,
+          "repeat_penalty": 1.0
+        }
+      },
+      "desc": "MoE 35B/3B-active. mq4p graded-HQ default (robust on all arches; supersedes the dense-AWQ mq4 which is gfx12-only)."
+    },
+    "qwen3.6:35b-a3b-mq2": {
+      "recommended_settings": {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20,
+        "min_p": 0.0,
+        "presence_penalty": 1.5,
+        "repeat_penalty": 1.0
+      },
+      "sampling_profiles": {
+        "general": {
+          "temperature": 1.0,
+          "top_p": 0.95,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 1.5,
+          "repeat_penalty": 1.0
+        },
+        "coding": {
+          "temperature": 0.6,
+          "top_p": 0.95,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 0.0,
+          "repeat_penalty": 1.0
+        },
+        "instruct": {
+          "temperature": 0.7,
+          "top_p": 0.8,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 1.5,
+          "repeat_penalty": 1.0
+        }
+      },
+      "repo": "schuttdev/hipfire-qwen3.6-35b-a3b",
+      "mtp": {
+        "file": "qwen3.6-35b-a3b.mtp"
+      },
+      "file": "qwen3.6-35b-a3b.mq2",
+      "size_gb": 11.6,
+      "min_vram_gb": 14,
+      "desc": "Floor SKU \u2014 smallest, coherent but degraded."
+    },
+    "qwen3.6:35b-a3b-mq3p": {
+      "recommended_settings": {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20,
+        "min_p": 0.0,
+        "presence_penalty": 1.5,
+        "repeat_penalty": 1.0
+      },
+      "sampling_profiles": {
+        "general": {
+          "temperature": 1.0,
+          "top_p": 0.95,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 1.5,
+          "repeat_penalty": 1.0
+        },
+        "coding": {
+          "temperature": 0.6,
+          "top_p": 0.95,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 0.0,
+          "repeat_penalty": 1.0
+        },
+        "instruct": {
+          "temperature": 0.7,
+          "top_p": 0.8,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 1.5,
+          "repeat_penalty": 1.0
+        }
+      },
+      "repo": "schuttdev/hipfire-qwen3.6-35b-a3b",
+      "mtp": {
+        "file": "qwen3.6-35b-a3b.mtp"
+      },
+      "file": "qwen3.6-35b-a3b.mq3p",
+      "size_gb": 17.2,
+      "min_vram_gb": 20,
+      "desc": "MQ3+P graded \u2014 MQ4 quality at MQ3 size."
+    },
+    "qwen3.6:35b-a3b-mq4p": {
+      "recommended_settings": {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20,
+        "min_p": 0.0,
+        "presence_penalty": 1.5,
+        "repeat_penalty": 1.0
+      },
+      "sampling_profiles": {
+        "general": {
+          "temperature": 1.0,
+          "top_p": 0.95,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 1.5,
+          "repeat_penalty": 1.0
+        },
+        "coding": {
+          "temperature": 0.6,
+          "top_p": 0.95,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 0.0,
+          "repeat_penalty": 1.0
+        },
+        "instruct": {
+          "temperature": 0.7,
+          "top_p": 0.8,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 1.5,
+          "repeat_penalty": 1.0
+        }
+      },
+      "repo": "schuttdev/hipfire-qwen3.6-35b-a3b",
+      "mtp": {
+        "file": "qwen3.6-35b-a3b.mtp"
+      },
+      "file": "qwen3.6-35b-a3b.mq4p",
+      "size_gb": 19.8,
+      "min_vram_gb": 22,
+      "desc": "MQ4+P graded \u2014 robust 4-bit default, beats uniform MQ4."
+    },
+    "qwen3.6:35b-a3b-mfp4": {
+      "recommended_settings": {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20,
+        "min_p": 0.0,
+        "presence_penalty": 1.5,
+        "repeat_penalty": 1.0
+      },
+      "sampling_profiles": {
+        "general": {
+          "temperature": 1.0,
+          "top_p": 0.95,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 1.5,
+          "repeat_penalty": 1.0
+        },
+        "coding": {
+          "temperature": 0.6,
+          "top_p": 0.95,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 0.0,
+          "repeat_penalty": 1.0
+        },
+        "instruct": {
+          "temperature": 0.7,
+          "top_p": 0.8,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 1.5,
+          "repeat_penalty": 1.0
+        }
+      },
+      "repo": "schuttdev/hipfire-qwen3.6-35b-a3b",
+      "mtp": {
+        "file": "qwen3.6-35b-a3b.mtp"
+      },
+      "file": "qwen3.6-35b-a3b.mfp4",
+      "size_gb": 20.2,
+      "min_vram_gb": 22,
+      "desc": "MFP4-E8 vector quant \u2014 the 4-bit quality leader."
+    },
+    "qwen3.6:35b-a3b-mq5": {
+      "recommended_settings": {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20,
+        "min_p": 0.0,
+        "presence_penalty": 1.5,
+        "repeat_penalty": 1.0
+      },
+      "sampling_profiles": {
+        "general": {
+          "temperature": 1.0,
+          "top_p": 0.95,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 1.5,
+          "repeat_penalty": 1.0
+        },
+        "coding": {
+          "temperature": 0.6,
+          "top_p": 0.95,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 0.0,
+          "repeat_penalty": 1.0
+        },
+        "instruct": {
+          "temperature": 0.7,
+          "top_p": 0.8,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 1.5,
+          "repeat_penalty": 1.0
+        }
+      },
+      "repo": "schuttdev/hipfire-qwen3.6-35b-a3b",
+      "mtp": {
+        "file": "qwen3.6-35b-a3b.mtp"
+      },
+      "file": "qwen3.6-35b-a3b.mq5",
+      "size_gb": 23.7,
+      "min_vram_gb": 26,
+      "desc": "Quality SKU \u2014 ~80% MQ4->f32."
+    },
+    "qwen3.6:35b-a3b-mq6": {
+      "recommended_settings": {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20,
+        "min_p": 0.0,
+        "presence_penalty": 1.5,
+        "repeat_penalty": 1.0
+      },
+      "sampling_profiles": {
+        "general": {
+          "temperature": 1.0,
+          "top_p": 0.95,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 1.5,
+          "repeat_penalty": 1.0
+        },
+        "coding": {
+          "temperature": 0.6,
+          "top_p": 0.95,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 0.0,
+          "repeat_penalty": 1.0
+        },
+        "instruct": {
+          "temperature": 0.7,
+          "top_p": 0.8,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 1.5,
+          "repeat_penalty": 1.0
+        }
+      },
+      "repo": "schuttdev/hipfire-qwen3.6-35b-a3b",
+      "mtp": {
+        "file": "qwen3.6-35b-a3b.mtp"
+      },
+      "file": "qwen3.6-35b-a3b.mq6",
+      "size_gb": 27.7,
+      "min_vram_gb": 30,
+      "desc": "Max quality; needs 30GB+."
+    },
+    "qwen3.6:35b-a3b-mq4r": {
+      "recommended_settings": {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20,
+        "min_p": 0.0,
+        "presence_penalty": 1.5,
+        "repeat_penalty": 1.0
+      },
+      "sampling_profiles": {
+        "general": {
+          "temperature": 1.0,
+          "top_p": 0.95,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 1.5,
+          "repeat_penalty": 1.0
+        },
+        "coding": {
+          "temperature": 0.6,
+          "top_p": 0.95,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 0.0,
+          "repeat_penalty": 1.0
+        },
+        "instruct": {
+          "temperature": 0.7,
+          "top_p": 0.8,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 1.5,
+          "repeat_penalty": 1.0
+        }
+      },
+      "repo": "schuttdev/hipfire-qwen3.6-35b-a3b",
+      "mtp": {
+        "file": "qwen3.6-35b-a3b.mtp"
+      },
+      "file": "qwen3.6-35b-a3b.mq4r",
+      "size_gb": 18.7,
+      "min_vram_gb": 22,
+      "desc": "MQ4 Redline speed SKU: uniform MQ4 attention and gate-side weights, graded routed experts, fused gate path. TG128 AR: 253.3 tok/s gfx1100, 115.1 gfx1151, 203.9 gfx1201. Lower quality than protected-attention MQ4P/MFP4."
+    },
+    "qwen3.6:27b": {
+      "recommended_settings": {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20,
+        "min_p": 0.0
+      },
+      "repo": "schuttdev/hipfire-qwen3.6-27b",
+      "file": "qwen3.6-27b.mq4",
+      "size_gb": 15.0,
+      "min_vram_gb": 16,
+      "default_kv_mode": "q8",
+      "desc": "44 tok/s AR / 185 tok/s w/ draft on code",
+      "triattn": {
+        "file": "qwen3.6-27b.mq4.triattn.blended_v3.bin"
+      }
+    },
+    "qwen3.5:0.8b-mq6": {
+      "repo": "schuttdev/hipfire-qwen3.5-0.8b",
+      "file": "qwen3.5-0.8b.mq6",
+      "size_gb": 0.67,
+      "min_vram_gb": 2.2,
+      "desc": "MQ6, higher quality",
+      "default_kv_mode": "q8",
+      "quant_recipe": "v3-awq-f1"
+    },
+    "qwen3.5:4b-mq6": {
+      "repo": "schuttdev/hipfire-qwen3.5-4b",
+      "file": "qwen3.5-4b.mq6",
+      "size_gb": 3.48,
+      "min_vram_gb": 5.0,
+      "desc": "MQ6, higher quality",
+      "default_kv_mode": "q8",
+      "quant_recipe": "v3-awq-f1"
+    },
+    "qwen3.5:9b-mq6": {
+      "repo": "schuttdev/hipfire-qwen3.5-9b",
+      "file": "qwen3.5-9b.mq6",
+      "size_gb": 7.3,
+      "min_vram_gb": 8.8,
+      "desc": "MQ6, higher quality",
+      "default_kv_mode": "q8",
+      "quant_recipe": "v3-awq-f1"
+    },
+    "qwen3.5:27b-mq6": {
+      "repo": "schuttdev/hipfire-qwen3.5-27b",
+      "file": "qwen3.5-27b.mq6",
+      "size_gb": 21.4,
+      "min_vram_gb": 24,
+      "desc": "MQ6, higher quality"
+    },
+    "qwen3.5:9b-mq3": {
+      "repo": "schuttdev/hipfire-qwen3.5-9b",
+      "file": "qwen3.5-9b.mq3",
+      "size_gb": 4.57,
+      "min_vram_gb": 6.1,
+      "desc": "MQ3 alpha (3.25 bpw, gfx11/gfx12). Smaller than MQ4, comparable decode. Quality eval pending \u2014 see issue #113. Sub-9B MQ3 not shipped \u2014 see #114.",
+      "default_kv_mode": "q8",
+      "quant_recipe": "v3-awq-f1"
+    },
+    "qwen3.5:27b-mq3": {
+      "repo": "schuttdev/hipfire-qwen3.5-27b",
+      "file": "qwen3.5-27b.mq3",
+      "size_gb": 10.7,
+      "min_vram_gb": 12,
+      "desc": "MQ3 alpha \u2014 fits 128K asym3 ctx on 24 GB (MQ4 OOMs at ~98K). gfx11/gfx12 only."
+    },
+    "qwen3.6:27b-mq3": {
+      "recommended_settings": {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20,
+        "min_p": 0.0
+      },
+      "repo": "schuttdev/hipfire-qwen3.6-27b",
+      "file": "qwen3.6-27b.mq3",
+      "size_gb": 10.7,
+      "min_vram_gb": 12,
+      "desc": "MQ3 alpha \u2014 fits 128K asym3 ctx on 24 GB. Pairs well with mq4 DFlash draft (126 tok/s \u03c4=7.0)."
+    },
+    "qwen3.5:27b-draft-mq3": {
+      "repo": "schuttdev/hipfire-qwen3.5-27b",
+      "file": "qwen35-27b-dflash-mq3.hfq",
+      "size_gb": 0.67,
+      "min_vram_gb": 12,
+      "desc": "MQ3 DFlash draft for qwen3.5:27b \u2014 671 MB vs 920 MB MQ4 draft. ~30% lower \u03c4 on code prompts; trades draft VRAM for ctx fit."
+    },
+    "qwen3.6:27b-draft-mq3": {
+      "recommended_settings": {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20,
+        "min_p": 0.0
+      },
+      "repo": "schuttdev/hipfire-qwen3.6-27b",
+      "file": "qwen36-27b-dflash-mq3.hfq",
+      "size_gb": 0.67,
+      "min_vram_gb": 12,
+      "desc": "MQ3 DFlash draft for qwen3.6:27b. Pairs with target/mq3 or target/mq4."
+    },
+    "qwen3:0.6b": {
+      "repo": "schuttdev/hipfire-qwen3-0.6b",
+      "file": "qwen3-0.6b.hf4",
+      "size_gb": 0.4,
+      "min_vram_gb": 1,
+      "desc": "standard attention"
+    },
+    "qwen3:8b": {
+      "repo": "schuttdev/hipfire-qwen3-8b",
+      "file": "qwen3-8b.hf4",
+      "size_gb": 4.1,
+      "min_vram_gb": 6,
+      "desc": "60 tok/s, standard attention"
+    },
+    "qwen3.5:2b": {
+      "repo": "schuttdev/hipfire-qwen3.5-2b",
+      "file": "qwen3.5-2b.mq4",
+      "size_gb": 1.29,
+      "min_vram_gb": 2.8,
+      "desc": "2B, HF4 (legacy 4-bit format)",
+      "quant_recipe": "v3-awq-f1"
+    },
+    "qwen3.5:2b-hf6": {
+      "repo": "schuttdev/hipfire-qwen3.5-2b",
+      "file": "qwen3.5-2b.hf6",
+      "size_gb": 1.6,
+      "min_vram_gb": 3,
+      "desc": "2B, HF6 (legacy 6-bit), higher quality"
+    },
+    "qwen3.5:9b-draft": {
+      "repo": "schuttdev/hipfire-qwen3.5-9b",
+      "file": "qwen35-9b-dflash-mq4.hfq",
+      "size_gb": 0.55,
+      "min_vram_gb": 6,
+      "desc": "DFlash draft for qwen3.5:9b \u2014 pairs with target for 2-3\u00d7 decode on code/instruct"
+    },
+    "qwen3.5:27b-draft": {
+      "repo": "schuttdev/hipfire-qwen3.5-27b",
+      "file": "qwen35-27b-dflash-mq4.hfq",
+      "size_gb": 0.92,
+      "min_vram_gb": 16,
+      "desc": "DFlash draft for qwen3.5:27b \u2014 pairs with target for 4\u00d7 decode on code (212 tok/s peak)"
+    },
+    "qwen3.6:27b-draft": {
+      "recommended_settings": {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20,
+        "min_p": 0.0
+      },
+      "repo": "schuttdev/hipfire-qwen3.6-27b",
+      "file": "qwen36-27b-dflash-mq4.hfq",
+      "size_gb": 0.92,
+      "min_vram_gb": 16,
+      "desc": "DFlash draft for qwen3.6:27b \u2014 pairs with target for ~4\u00d7 decode on code (refreshed 2026-04-27 from z-lab@0919688)"
+    },
+    "carnice:9b": {
+      "repo": "schuttdev/hipfire-carnice-9b",
+      "file": "carnice-9b.mq4",
+      "size_gb": 5.0,
+      "min_vram_gb": 6,
+      "desc": "Hermes tool-use, MQ4",
+      "default_tool_format": "hermes"
+    },
+    "carnice:27b": {
+      "repo": "schuttdev/hipfire-carnice-27b",
+      "file": "carnice-27b.mq4",
+      "size_gb": 15.0,
+      "min_vram_gb": 16,
+      "desc": "Hermes 27B tool-use, MQ4",
+      "default_tool_format": "hermes"
+    },
+    "carnice:9b-mq6": {
+      "repo": "schuttdev/hipfire-carnice-9b",
+      "file": "carnice-9b.mq6",
+      "size_gb": 7.3,
+      "min_vram_gb": 8,
+      "desc": "Hermes tool-use, MQ6 higher quality",
+      "default_tool_format": "hermes"
+    },
+    "carnice:27b-mq6": {
+      "repo": "schuttdev/hipfire-carnice-27b",
+      "file": "carnice-27b.mq6",
+      "size_gb": 21.4,
+      "min_vram_gb": 24,
+      "desc": "Hermes 27B, MQ6 higher quality",
+      "default_tool_format": "hermes"
+    },
+    "qwopus:9b": {
+      "repo": "schuttdev/hipfire-qwopus-9b",
+      "file": "qwopus-9b.mq4",
+      "size_gb": 5.3,
+      "min_vram_gb": 6,
+      "desc": "Qwopus3.5 v3, MQ4"
+    },
+    "qwopus:4b": {
+      "repo": "schuttdev/hipfire-qwopus-4b",
+      "file": "qwopus-4b.mq4",
+      "size_gb": 2.6,
+      "min_vram_gb": 4,
+      "desc": "Qwopus3.5 v3, 4B MQ4"
+    },
+    "qwopus:27b": {
+      "repo": "schuttdev/hipfire-qwopus-27b",
+      "file": "qwopus-27b.mq4",
+      "size_gb": 15.0,
+      "min_vram_gb": 16,
+      "desc": "Qwopus3.5 v3, 27B MQ4"
+    },
+    "qwopus:9b-mq6": {
+      "repo": "schuttdev/hipfire-qwopus-9b",
+      "file": "qwopus-9b.mq6",
+      "size_gb": 7.3,
+      "min_vram_gb": 8,
+      "desc": "Qwopus3.5 v3, MQ6 higher quality"
+    },
+    "qwopus:4b-mq6": {
+      "repo": "schuttdev/hipfire-qwopus-4b",
+      "file": "qwopus-4b.mq6",
+      "size_gb": 3.8,
+      "min_vram_gb": 5,
+      "desc": "Qwopus3.5 v3, 4B MQ6"
+    },
+    "qwopus:27b-mq6": {
+      "repo": "schuttdev/hipfire-qwopus-27b",
+      "file": "qwopus-27b.mq6",
+      "size_gb": 21.4,
+      "min_vram_gb": 24,
+      "desc": "Qwopus3.5 v3, 27B MQ6"
+    },
+    "lfm2.5:350m": {
+      "repo": "hipfire-models/hipfire-LFM2.5-350M",
+      "file": "lfm2.5-350m.q8",
+      "size_gb": 0.38,
+      "min_vram_gb": 1.9,
+      "desc": "LFM2.5 350M dense (MQ4, embedded chat template)",
+      "quant_recipe": "q8"
+    },
+    "lfm2.5:8b-a1b": {
+      "repo": "hipfire-models/hipfire-LFM2.5-8B-A1B",
+      "file": "lfm2.5-8b-a1b.mq4",
+      "size_gb": 4.66,
+      "min_vram_gb": 6.2,
+      "desc": "LFM2.5 8B-A1B MoE (MQ4, jinja-validated)",
+      "quant_recipe": "mq4-moe"
+    },
+    "lfm2.5:1.2b": {
+      "repo": "hipfire-models/hipfire-LFM2.5-1.2B",
+      "file": "lfm2.5-1.2b.mq4",
+      "size_gb": 0.7,
+      "min_vram_gb": 2.2,
+      "desc": "LFM2.5 1.2B Instruct dense (Q8, embedded chat template)",
+      "quant_recipe": "v3-awq-f1"
+    },
+    "lfm2.5:1.2b-thinking": {
+      "repo": "hipfire-models/hipfire-LFM2.5-1.2B-Thinking",
+      "file": "lfm2.5-1.2b-thinking.mq4",
+      "size_gb": 0.7,
+      "min_vram_gb": 2.2,
+      "desc": "LFM2.5 1.2B Thinking dense (Q8, reasoning)",
+      "quant_recipe": "v3-awq-f1"
+    },
+    "qwen3.5:2b-mq3": {
+      "repo": "schuttdev/hipfire-qwen3.5-2b",
+      "file": "qwen3.5-2b.mq3",
+      "size_gb": 1.16,
+      "min_vram_gb": 2.7,
+      "desc": "Qwen3.5 2b mq3 (v3-awq-f1)",
+      "quant_recipe": "v3-awq-f1"
+    },
+    "qwen3.5:2b-mq6": {
+      "repo": "schuttdev/hipfire-qwen3.5-2b",
+      "file": "qwen3.5-2b.mq6",
+      "size_gb": 1.63,
+      "min_vram_gb": 3.1,
+      "desc": "Qwen3.5 2b mq6 (v3-awq-f1)",
+      "quant_recipe": "v3-awq-f1"
+    },
+    "qwen3.5:4b-mq3": {
+      "default_kv_mode": "q8",
+      "repo": "schuttdev/hipfire-qwen3.5-4b",
+      "file": "qwen3.5-4b.mq3",
+      "size_gb": 2.25,
+      "min_vram_gb": 3.8,
+      "desc": "Qwen3.5 4b mq3 (v3-awq-f1)",
+      "quant_recipe": "v3-awq-f1"
+    },
+    "qwopus3.6:27b-coder": {
+      "repo": "schuttdev/hipfire-qwopus3.6-27b-coder",
+      "file": "qwopus3.6-27b-coder.mq4",
+      "size_gb": 15.0,
+      "min_vram_gb": 16,
+      "default_kv_mode": "q8",
+      "quant_recipe": "v3-awq-f1",
+      "recommended_settings": {
+        "temperature": 1.0,
+        "top_p": 0.95
+      },
+      "desc": "Qwen3.6-27B agentic coder finetune (Jackrong, SWE-bench Verified 67%). 33 tok/s AR single-GPU."
+    },
+    "nex-n2:mini": {
+      "repo": "schuttdev/hipfire-nex-n2-mini",
+      "file": "nex-n2-mini.mq4p",
+      "size_gb": 19.82,
+      "min_vram_gb": 22,
+      "default_kv_mode": "q8",
+      "quant_recipe": "a3b-tiermap-T3-3L",
+      "recommended_settings": {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20,
+        "min_p": 0.0,
+        "presence_penalty": 1.5
+      },
+      "desc": "Qwen3.5-35B-A3B agentic MoE (nex-agi, SWE-bench Verified 74.4). 88 tok/s. T3-3L graded experts (MQ6/MQ4/MQ3L). Tool-use: qwen3 reasoning / qwen3_coder tool-call format."
+    },
+    "vibethinker:3b": {
+      "repo": "xfivetide/VibeThinker-3B-hipfire",
+      "file": "vibethinker-3b.mq4.hfq",
+      "size_gb": 1.82,
+      "min_vram_gb": 3.5,
+      "desc": "VibeThinker-3B (WeiboAI), Qwen2 MQ4. ~36-90 tok/s on gfx1151."
+    },
+    "vibethinker:3b-mq6": {
+      "repo": "xfivetide/VibeThinker-3B-hipfire",
+      "file": "vibethinker-3b.mq6.hfq",
+      "size_gb": 2.51,
+      "min_vram_gb": 5.0,
+      "desc": "VibeThinker-3B (WeiboAI), Qwen2 MQ6 6-bit. ~25-60 tok/s on gfx1151."
+    }
+  },
+  "aliases": {
+    "qwen3.5": "qwen3.5:4b",
+    "qwen3.5:latest": "qwen3.5:9b",
+    "qwen3.5:small": "qwen3.5:0.8b",
+    "qwen3.5:large": "qwen3.5:27b",
+    "qwen3.6": "qwen3.6:35b-a3b",
+    "qwen3.6:a3b": "qwen3.6:35b-a3b",
+    "qwen3": "qwen3:8b",
+    "carnice": "carnice:9b",
+    "qwopus": "qwopus:9b",
+    "deepseek4": "deepseek-v4-flash",
+    "deepseek-v4": "deepseek-v4-flash",
+    "qwen3.5:0.8b-mq4": "qwen3.5:0.8b",
+    "qwen3.5:4b-mq4": "qwen3.5:4b",
+    "qwen3.5:9b-mq4": "qwen3.5:9b",
+    "qwen3.5:27b-mq4": "qwen3.5:27b",
+    "qwen3.5:0.8b-hf4": "qwen3.5:0.8b",
+    "qwen3.5:2b-hf4": "qwen3.5:2b",
+    "qwen3.5:4b-hf4": "qwen3.5:4b",
+    "qwen3.5:9b-hf4": "qwen3.5:9b",
+    "qwen3.5:27b-hf4": "qwen3.5:27b",
+    "qwen3.5:0.8b-hf6": "qwen3.5:0.8b-mq6",
+    "qwen3.5:4b-hf6": "qwen3.5:4b-mq6",
+    "qwen3.5:9b-hf6": "qwen3.5:9b-mq6",
+    "qwen3.5:27b-hf6": "qwen3.5:27b-mq6",
+    "qwopus:9b-hf4": "qwopus:9b",
+    "qwopus:4b-hf4": "qwopus:4b",
+    "qwopus:27b-hf4": "qwopus:27b",
+    "qwopus:9b-mq4": "qwopus:9b",
+    "qwopus:4b-mq4": "qwopus:4b",
+    "qwopus:27b-mq4": "qwopus:27b",
+    "qwen3.5-9b:draft": "qwen3.5:9b-draft",
+    "qwen3.5-27b:draft": "qwen3.5:27b-draft",
+    "qwen3.6-27b:draft": "qwen3.6:27b-draft",
+    "qwen3.5:9b:draft": "qwen3.5:9b-draft",
+    "qwen3.5:27b:draft": "qwen3.5:27b-draft",
+    "qwen3.6:27b:draft": "qwen3.6:27b-draft",
+    "qwen3.5:2b-mq4": "qwen3.5:2b",
+    "vibethinker": "vibethinker:3b"
+  }
+}

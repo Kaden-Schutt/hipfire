@@ -133,3 +133,122 @@ extern "C" __global__ void gemv_mq3g256_lloyd_moe_down_residual_scaled_k8_indexe
         atomicAdd(&x_residual[row], scale * acc);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Reproducible int64-accumulating variant
+//
+// Same codebook decode as above, but each 256-group's FP warp-reduced partial
+// is converted to i64 (S=2^24 fixed-point) before cross-group accumulation.
+// The topk_w is folded at GROUP level (not expert level) for partition
+// invariance: `round(topk_w * partial_g * S)` is accumulated per group, then
+// written via integer atomicAdd.  This makes the result partition-invariant
+// under any K-split where groups are 256-aligned:
+//   full_i64[row] == half_a_i64[row] + half_b_i64[row]   (bit-exact)
+// because (a) each group is wholly on one rank (K 256-aligned), (b) the
+// within-group warp reduce is FP (same as before, independent per group),
+// (c) topk_w is folded per group (so each group contributes exactly the same
+//     bits regardless of which rank holds it), and
+// (d) atomicAdd on unsigned long long is integer (order-independent).
+//
+// NOTE: folding topk_w AFTER summing all groups (i.e. round(topk_w * acc_i64))
+// is NOT partition-invariant because round(w*(a+b)) != round(w*a)+round(w*b).
+// The per-group fold avoids this: each rank accumulates only its own groups and
+// the integer sum across ranks equals the single-rank result.
+//
+// Call `moe_i64_residual_to_f32` after all expert launches to convert back.
+//
+// residual_i64  must be zero-initialised by the caller before the launch.
+// ---------------------------------------------------------------------------
+
+__launch_bounds__(32, 16)
+extern "C" __global__ void gemv_mq3g256_lloyd_moe_down_residual_i64_k8_indexed(
+    const unsigned long long* __restrict__ expert_ptrs, // [n_exp] device pointers
+    const int*   __restrict__ topk_indices,              // [k_top]
+    const float* __restrict__ topk_weights,              // [k_top]
+    const float* __restrict__ rot_batch,                 // [k_top × K] FWHT-rotated
+    unsigned long long* __restrict__ residual_i64,       // [M] int64, S-scaled, init=0
+    int M, int K
+) {
+    const int row   = blockIdx.x;
+    if (row >= M) return;
+    const int krank = blockIdx.y;
+    const int tid   = threadIdx.x;
+
+    const int expert_id = topk_indices[krank];
+    const char* __restrict__ A =
+        reinterpret_cast<const char*>(expert_ptrs[expert_id]);
+    const float* __restrict__ x = rot_batch + (long long)krank * K;
+
+    const int groups_per_row = K / 256;
+    const int row_bytes = groups_per_row * 112;
+    const char* row_ptr = A + (long long)row * row_bytes;
+    const int boff = tid * 3;
+
+    __shared__ float cb_lds[8]; // single-group codebook in LDS
+
+    long long acc_i64 = 0LL;
+
+    // Scale: S = 2^24.  topk_w read once per thread block (same for all groups).
+    const float S = (float)(1 << 24);
+    const float topk_w = topk_weights[krank];
+
+    for (int g = 0; g < groups_per_row; g++) {
+        const char* gp = row_ptr + g * 112;
+
+        // Cooperative load: 8 threads load the 8 fp16 codebook entries.
+        if (tid < 8) {
+            cb_lds[tid] = __half2float(((const __half*)gp)[tid]);
+        }
+        __syncthreads();
+
+        const unsigned char* d = (const unsigned char*)(gp + 16) + boff;
+        unsigned int pk = (unsigned int)d[0] | ((unsigned int)d[1] << 8)
+                        | ((unsigned int)d[2] << 16);
+        int base = g * 256 + tid * 8;
+
+        float partial =
+              cb_lds[ (pk)        & 7u] * x[base]
+            + cb_lds[((pk) >>  3) & 7u] * x[base + 1]
+            + cb_lds[((pk) >>  6) & 7u] * x[base + 2]
+            + cb_lds[((pk) >>  9) & 7u] * x[base + 3]
+            + cb_lds[((pk) >> 12) & 7u] * x[base + 4]
+            + cb_lds[((pk) >> 15) & 7u] * x[base + 5]
+            + cb_lds[((pk) >> 18) & 7u] * x[base + 6]
+            + cb_lds[((pk) >> 21) & 7u] * x[base + 7];
+
+        // FP warp reduce across 32 threads → group_partial on lane 0
+        for (int offset = 16; offset > 0; offset >>= 1)
+            partial += __shfl_down(partial, offset);
+
+        // Lane 0: fold topk_w at GROUP level and accumulate in int64.
+        // round(topk_w * partial * S) per group — partition-invariant because
+        // each group is wholly on one TP rank; no cross-rank rounding error.
+        if (tid == 0) {
+            acc_i64 += (long long)llroundf(topk_w * partial * S);
+        }
+        __syncthreads(); // guard LDS reload for next iteration
+    }
+
+    // Write accumulated i64 (topk_w already folded per group) via atomicAdd.
+    // unsigned long long atomicAdd reinterprets signed i64 bits (two's-complement
+    // addition is identical for both types).
+    if (tid == 0) {
+        atomicAdd(&residual_i64[row], (unsigned long long)acc_i64);
+    }
+}
+
+// Convert int64 S-scaled residual buffer to f32 output.
+// Launch with a 1-D grid: gridDim.x × blockDim.x >= n elements.
+extern "C" __global__ void moe_i64_residual_to_f32(
+    const unsigned long long* __restrict__ residual_i64, // [n] int64 as ull
+    float*                    __restrict__ out_f32,       // [n]
+    int n,
+    float inv_S                                           // = 1.0f / (1<<24)
+) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    // Reinterpret as signed i64
+    long long v;
+    memcpy(&v, &residual_i64[i], sizeof(v));
+    out_f32[i] = (float)((double)v * (double)inv_S);
+}

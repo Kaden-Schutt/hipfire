@@ -5,8 +5,12 @@ edition.workspace = true
 license.workspace = true
 description = "LLaMA / Mistral / plain-Qwen3 architecture for hipfire"
 
+[features]
+dflash-fault-inject = ["hipfire-runtime/dflash-fault-inject"]
+
 [dependencies]
 hipfire-runtime = { path = "../hipfire-runtime" }
 hipfire-dispatch = { path = "../hipfire-dispatch", features = ["from-hip-error"] }
+hipfire-hardware = { path = "../hipfire-hardware" }
 hip-bridge = { path = "../hip-bridge" }
 rdna-compute = { path = "../rdna-compute" }

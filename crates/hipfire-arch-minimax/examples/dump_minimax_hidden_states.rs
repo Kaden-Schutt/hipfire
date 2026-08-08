@@ -99,7 +99,7 @@ fn main() {
         cfg.num_experts_per_tok,
         cfg.rotary_dim
     );
-    let weights = MiniMaxWeights::load(&mut hfq, &cfg, &mut gpu, None).expect("weights");
+    let weights = MiniMaxWeights::load(&mut hfq, &cfg, &mut gpu, None, None).expect("weights");
     let mut state = MiniMaxState::new_with_max_seq(&mut gpu, &cfg, n_ctx + 16).expect("state");
 
     // ---- per-token forward with per-layer capture ----

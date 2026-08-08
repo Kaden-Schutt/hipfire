@@ -27,6 +27,15 @@ fn fnv1a(ids: &[u32]) -> u64 {
     h
 }
 
+fn fnv1a_bytes(data: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for &b in data {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
 fn main() {
     use hipfire_arch_deepseek4::forward;
     use hipfire_arch_deepseek4::{DeepseekV4, DeepseekV4State};
@@ -45,6 +54,7 @@ fn main() {
     let mut tp: usize = 4;
     let mut no_bos = false;
     let mut mtp = false;
+    let mut no_dspark = false;
     let mut i = 1;
     while i < argv.len() {
         match argv[i].as_str() {
@@ -72,6 +82,10 @@ fn main() {
                 mtp = true;
                 i += 1;
             }
+            "--no-dspark" => {
+                no_dspark = true;
+                i += 1;
+            }
             other => {
                 eprintln!("unknown arg {other}");
                 std::process::exit(1);
@@ -82,7 +96,11 @@ fn main() {
 
     // ── config + tokenizer (per-rank loads reopen the file) ─────────────────
     let hfq0 = HfqFile::open(&model).expect("open model");
-    let cfg = DeepseekV4::config_from_hfq(&hfq0).expect("config");
+    let mut cfg = DeepseekV4::config_from_hfq(&hfq0).expect("config");
+    if no_dspark {
+        cfg.load_dspark = false;
+        eprintln!("  --no-dspark: DSpark sidecar skipped (D2a A/B baseline mode)");
+    }
     let tok = Tokenizer::from_hfq_metadata(&hfq0.metadata_json).expect("tokenizer");
     let n_exp = cfg.n_routed_experts;
     eprintln!(
@@ -110,12 +128,27 @@ fn main() {
     drop(hfq0);
 
     // ── bring up N ranks ────────────────────────────────────────────────────
-    let mut gpus = Gpus::init_tp(tp, cfg.num_hidden_layers).expect("init_tp");
+    // The mesh is built once and shared by the GPU construction (binding the
+    // weight-origin epoch the sealed executor validates) and the MoE policy.
+    let mesh = hipfire_runtime::multi_gpu::DeviceMesh::rect(&[(
+        hipfire_runtime::multi_gpu::DimKind::Ep,
+        tp,
+    )]);
+    // from_mesh delegates to init_tp for an Ep axis — used for ALL rank
+    // counts including named Ep=1: the bound mesh epoch is what the sealed
+    // executor validates, and rank-one Ep runs the sealed program (no
+    // manual/rank-one schedule exists).
+    let mut gpus = Gpus::from_mesh(&mesh, cfg.num_hidden_layers).expect("from_mesh");
     let n = gpus.devices.len();
     assert_eq!(
         n, tp,
-        "init_tp gave {n} devices (check HIP_VISIBLE_DEVICES)"
+        "from_mesh gave {n} devices (check HIP_VISIBLE_DEVICES)"
     );
+    let policy = hipfire_runtime::moe_plan::MoEExecutionPolicy::new(
+        hipfire_runtime::moe_plan::MoEExecutionKind::Ep,
+        mesh,
+    )
+    .expect("ep policy");
     for (r, d) in gpus.devices.iter().enumerate() {
         eprintln!("  rank {r}: device_id={} arch={}", d.device_id, d.arch);
     }
@@ -154,6 +187,9 @@ fn main() {
 
     let mut state_per_rank: Vec<DeepseekV4State> = Vec::with_capacity(n);
     let mut partials: Vec<GpuTensor> = Vec::with_capacity(n);
+    // int64 scratch: hidden * 8 bytes per element (raw bytes, DType::Raw).
+    // Used by DownResidualI64 on the EP i64 path; pre-zeroed per step by the executor.
+    let mut partials_i64: Vec<GpuTensor> = Vec::with_capacity(n);
     for r in 0..n {
         gpus.devices[r].bind_thread().expect("bind");
         state_per_rank.push(DeepseekV4State::new(&cfg).expect("state"));
@@ -162,10 +198,15 @@ fn main() {
                 .zeros(&[cfg.hidden_size], DType::F32)
                 .expect("partial"),
         );
+        partials_i64.push(
+            gpus.devices[r]
+                .zeros(&[cfg.hidden_size * 8], DType::Raw)
+                .expect("partial_i64"),
+        );
     }
     let peer = gpus.enable_peer_all().expect("enable_peer_all");
     eprintln!("  peer_access_enabled={peer}");
-    hipfire_runtime::ep::ensure_rank_streams(&mut gpus).expect("ensure_rank_streams");
+    gpus.ensure_rank_streams().expect("ensure_rank_streams");
 
     let argmax = |v: &[f32]| -> u32 {
         let mut bi = 0u32;
@@ -198,6 +239,9 @@ fn main() {
             .join(" ")
     };
 
+    let prompt_fingerprint = fnv1a_bytes(prompt.as_bytes());
+    eprintln!("prompt fnv1a_bytes: 0x{prompt_fingerprint:016x}  max: {max}  tp: {tp}");
+
     // ── EP prefill (per-token) + greedy decode ──────────────────────────────
     eprintln!(
         "\nprompt {:?} → {} tokens (bos-prepended={})",
@@ -213,6 +257,8 @@ fn main() {
             &cfg,
             &mut state_per_rank,
             &partials,
+            &partials_i64,
+            &policy,
             t,
             pos as u32,
         )
@@ -264,7 +310,9 @@ fn main() {
             &cfg,
             &mut state_per_rank,
             &partials,
+            &partials_i64,
             &h_n_per_rank,
+            &policy,
             t0,
             prompt_ids.len() as u32,
         )
@@ -299,6 +347,8 @@ fn main() {
             &cfg,
             &mut state_per_rank,
             &partials,
+            &partials_i64,
+            &policy,
             next,
             pos as u32,
         )
@@ -335,7 +385,18 @@ fn main() {
         tok.decode(&gen)
     );
     eprintln!("gen ids: {:?}", &gen[..gen.len().min(40)]);
-    eprintln!("gen FNV: 0x{:016x}", fnv1a(&gen));
+    let fnv = fnv1a(&gen);
+    eprintln!("gen FNV: 0x{fnv:016x}");
+    // on-box EP-2 baseline (--no-dspark); decomposed pre-down is the sole path.
+    // Re-pinned 2026-07-11: the original `0x6c0f2f000f1d398f` (pinned at da0adf28)
+    // drifted very early post-pin — this value has been stable and coherent across
+    // the whole subsequent history (verified at baee671d/f1ac664e/HEAD; the D2a
+    // decomposition off==on is byte-identical, so it is NOT the cause; output stays
+    // coherent "Paris… on the Seine… the Eiffel Tower"). A legitimate early
+    // reproducibility/kernel numerical change was never re-pinned here. Anchor now
+    // tracks the long-stable value.
+    const DS4_EP2_FNV: u64 = 0x26a13602bedf9926;
+    assert_eq!(fnv, DS4_EP2_FNV, "output drifted from pinned D2a hash");
 
     // MTP-EP accept check: the draft predicted the token AFTER t0; the decode
     // loop's gen[1] IS that true token. A match = spec-decode accept.

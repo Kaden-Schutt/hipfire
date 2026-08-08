@@ -184,17 +184,31 @@ impl GraphState {
 
     /// Destroy the captured graph and free all retained kernarg blobs.
     pub fn graph_destroy(&mut self, hip: &HipRuntime, device_id: i32) {
-        bind_thread_or_warn(hip, device_id);
+        let _ = self.graph_destroy_checked(hip, device_id);
+    }
+
+    /// Fallible graph teardown for reset/unload owners that must surface HIP
+    /// destruction failures instead of treating them as a successful reset.
+    pub fn graph_destroy_checked(&mut self, hip: &HipRuntime, device_id: i32) -> HipResult<()> {
+        bind_thread(hip, device_id)?;
+        let mut first_error = None;
         if let Some(exec) = self.graph_exec.take() {
-            let _ = hip.graph_exec_destroy(exec);
+            if let Err(error) = hip.graph_exec_destroy(exec) {
+                first_error = Some(error);
+            }
         }
         if let Some(graph) = self.captured_graph.take() {
-            let _ = hip.graph_destroy(graph);
+            if let Err(error) = hip.graph_destroy(graph) {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
         }
         self.capture_blobs.clear();
         self.ar_forward_blobs.clear();
         self.ar_forward_kernel_dirty = true;
         self.ar_forward_replay_enabled = false;
+        first_error.map_or(Ok(()), Err)
     }
 
     // ── Per-B verify-forward graph cache ─────────────────────────────────
@@ -302,14 +316,28 @@ impl GraphState {
 
     /// Destroy all cached verify graphs and their blobs.
     pub fn verify_graph_destroy_all(&mut self, hip: &HipRuntime, device_id: i32) {
-        bind_thread_or_warn(hip, device_id);
+        let _ = self.verify_graph_destroy_all_checked(hip, device_id);
+    }
+
+    pub fn verify_graph_destroy_all_checked(
+        &mut self,
+        hip: &HipRuntime,
+        device_id: i32,
+    ) -> HipResult<()> {
+        bind_thread(hip, device_id)?;
+        let mut first_error = None;
         for (_, (graph, exec, _blobs)) in self.verify.cache.drain() {
-            let _ = hip.graph_exec_destroy(exec);
-            let _ = hip.graph_destroy(graph);
+            if let Err(error) = hip.graph_exec_destroy(exec) {
+                first_error.get_or_insert(error);
+            }
+            if let Err(error) = hip.graph_destroy(graph) {
+                first_error.get_or_insert(error);
+            }
         }
         self.verify.warmed_up.clear();
         self.verify.lmhead_argmax.clear();
         self.verify.capturing = None;
+        first_error.map_or(Ok(()), Err)
     }
 
     // ── Replay-graph cache (tape replay after verify) ────────────────────
@@ -398,12 +426,26 @@ impl GraphState {
 
     /// Destroy all cached replay graphs and their blobs.
     pub fn replay_graph_destroy_all(&mut self, hip: &HipRuntime, device_id: i32) {
-        bind_thread_or_warn(hip, device_id);
+        let _ = self.replay_graph_destroy_all_checked(hip, device_id);
+    }
+
+    pub fn replay_graph_destroy_all_checked(
+        &mut self,
+        hip: &HipRuntime,
+        device_id: i32,
+    ) -> HipResult<()> {
+        bind_thread(hip, device_id)?;
+        let mut first_error = None;
         for (_, (graph, exec, _blobs)) in self.replay.cache.drain() {
-            let _ = hip.graph_exec_destroy(exec);
-            let _ = hip.graph_destroy(graph);
+            if let Err(error) = hip.graph_exec_destroy(exec) {
+                first_error.get_or_insert(error);
+            }
+            if let Err(error) = hip.graph_destroy(graph) {
+                first_error.get_or_insert(error);
+            }
         }
         self.replay.warmed_up.clear();
         self.replay.capturing = None;
+        first_error.map_or(Ok(()), Err)
     }
 }

@@ -2,12 +2,12 @@
 """Generate registry/v1.json — the dynamic model registry (task #47).
 
 Sources of truth:
-  - cli/registry.json : curated overlay — tags, repos, files, size_gb,
+  - registry/models.json : curated overlay — tags, repos, files, size_gb,
     min_vram_gb, desc, aliases. Hand-edited; stays the editing surface.
   - Hugging Face Hub API : per-file LFS sha256 + size_bytes (ground truth
     for what is actually downloadable), probed live on every run.
 
-Output (registry/v1.json) is a STRICT SUPERSET of cli/registry.json:
+Output (registry/v1.json) is a STRICT SUPERSET of registry/models.json:
 old CLIs that read {models, aliases} keep working unchanged; new fields are
 purely additive:
   top-level : schema_version, generated_at
@@ -72,8 +72,8 @@ KNOWN_QUANTS = {
     "hfq",
 }
 # Allowlist for the optional per-entry `default_kv_mode` field (the registry is
-# the per-model card). MUST stay in sync with cli/index.ts validateConfigValue
-# /resolveKvMode and cli/registry_loader.ts REGISTRY_KV_MODE_VALUES. A curated
+# the per-model card). MUST stay in sync with the hipfire-config schema and
+# hipfire-registry parser. A curated
 # entry carrying an unknown value fails the run (fail-closed, like arch_id/quant).
 KNOWN_KV_MODES = {
     "auto",
@@ -89,10 +89,11 @@ KNOWN_KV_MODES = {
     "turbo3",
     "turbo2",
 }
+KNOWN_TOOL_FORMATS = {"hermes", "qwen_xml"}
 
 # Bounds for the optional curated `recommended_settings` (author-recommended
 # inference settings inherited from the parent model card). MUST stay in sync
-# with cli/registry_loader.ts validRecommendedSettings. Each present numeric
+# with hipfire-registry's recommended-settings validation. Each present numeric
 # knob is range-checked; an out-of-range value fails the run (fail-closed).
 #   (lo, hi, int_only)
 RECOMMENDED_BOUNDS = {
@@ -108,7 +109,7 @@ RECOMMENDED_BOUNDS = {
 def validate_recommended_settings(tag: str, rs: object, errors: list) -> None:
     """Carry-through validator for `recommended_settings` (verbatim in v1.json).
 
-    Mirrors cli/registry_loader.ts validRecommendedSettings bounds. Adds a
+    Mirrors hipfire-registry's recommended-settings bounds. Adds a
     descriptive error per offending key; does not mutate rs (deepcopy already
     carries it through)."""
     if rs is None:
@@ -137,7 +138,7 @@ def validate_recommended_settings(tag: str, rs: object, errors: list) -> None:
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-CURATED_PATH = REPO_ROOT / "cli" / "registry.json"
+CURATED_PATH = REPO_ROOT / "registry" / "models.json"
 OUTPUT_PATH = REPO_ROOT / "registry" / "v1.json"
 
 
@@ -175,6 +176,8 @@ def arch_id_for(tag: str, entry: dict) -> int | None:
         return 11
     if family == "north-mini-code":
         return 12
+    if family == "vibethinker":
+        return 7   # Qwen2 dense (WeiboAI/VibeThinker-3B base)
     return None
 
 
@@ -316,9 +319,33 @@ def build_registry(curated: dict, token: str | None) -> tuple[dict | None, list[
                 f"(allowed: {sorted(KNOWN_KV_MODES)})"
             )
 
+        tool_format = entry.get("default_tool_format")
+        if tool_format is not None and tool_format not in KNOWN_TOOL_FORMATS:
+            errors.append(
+                f"{tag}: invalid default_tool_format {tool_format!r} "
+                f"(allowed: {sorted(KNOWN_TOOL_FORMATS)})"
+            )
+
         # Optional curated recommended_settings (carried verbatim by deepcopy).
-        # Validate bounds — fail-closed, mirroring registry_loader.ts.
+        # Validate bounds — fail-closed, matching hipfire-registry.
         validate_recommended_settings(tag, entry.get("recommended_settings"), errors)
+
+        # Optional per-mode sampling_profiles (carried verbatim by deepcopy).
+        # Validate each present profile with the same bounds — fail-closed,
+        # matching hipfire-registry's SamplingProfiles parser.
+        profiles = entry.get("sampling_profiles")
+        if profiles is not None:
+            if not isinstance(profiles, dict):
+                errors.append(f"{tag}: sampling_profiles must be an object")
+            else:
+                for mode, rs in profiles.items():
+                    if mode not in ("general", "coding", "instruct"):
+                        errors.append(
+                            f"{tag}: sampling_profiles has unknown mode {mode!r} "
+                            f"(allowed: ['coding', 'general', 'instruct'])"
+                        )
+                        continue
+                    validate_recommended_settings(f"{tag} sampling_profiles.{mode}", rs, errors)
 
         repo = entry.get("repo", "")
         if not repo:
@@ -344,7 +371,7 @@ def build_registry(curated: dict, token: str | None) -> tuple[dict | None, list[
                             errors.append(
                                 f"{tag}: size mismatch — curated {curated_gb} GB vs "
                                 f"HF {size_bytes / 1e9:.2f} GB ({drift:.0%} drift); "
-                                f"update cli/registry.json"
+                                f"update registry/models.json"
                             )
             for kind in ("triattn", "mtp"):
                 if isinstance(entry.get(kind), dict):
@@ -361,8 +388,8 @@ def build_registry(curated: dict, token: str | None) -> tuple[dict | None, list[
         "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "_comment": (
             "GENERATED by scripts/registry_gen.py — do not hand-edit. "
-            "Edit cli/registry.json (curated overlay) and re-run the generator. "
-            "Strict superset of cli/registry.json: models/aliases keep the legacy "
+            "Edit registry/models.json (curated overlay) and re-run the generator. "
+            "Strict superset of registry/models.json: models/aliases keep the curated "
             "shape; sha256/size_bytes come from the HF LFS API; arch_id per "
             "docs/architecture-ids.md; min_vram_gb gates pull/run on VRAM."
         ),

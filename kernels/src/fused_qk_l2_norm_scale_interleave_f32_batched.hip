@@ -15,12 +15,8 @@
 // relative to a per-dst-head approach.
 //
 // Shapes:
-//   q_src      : [N × n_key_heads × head_dim] f32 (read; also valid to
-//                                                  alias with q_dst when
-//                                                  the source layout is
-//                                                  the same as dst — not
-//                                                  here, dst is wider)
-//   k_src      : [N × n_key_heads × head_dim] f32
+//   q_src      : [N × n_key_heads × head_dim] f32 (normalized in-place)
+//   k_src      : [N × n_key_heads × head_dim] f32 (normalized in-place)
 //   q_dst      : [N × n_value_heads × head_dim] f32 (written; n_value =
 //                                                   n_key * ratio)
 //   k_dst      : [N × n_value_heads × head_dim] f32 (written)
@@ -28,8 +24,8 @@
 // Grid: [n_key_heads, N, 1]. Block: [32] (wave32 reduction).
 
 extern "C" __global__ void fused_qk_l2_norm_scale_interleave_f32_batched(
-    const float* __restrict__ q_src,
-    const float* __restrict__ k_src,
+    float*       __restrict__ q_src,
+    float*       __restrict__ k_src,
     float*       __restrict__ q_dst,
     float*       __restrict__ k_dst,
     int n_key_heads,
@@ -44,8 +40,8 @@ extern "C" __global__ void fused_qk_l2_norm_scale_interleave_f32_batched(
     const int tid = threadIdx.x;
 
     const long long src_batch_off = (long long)b * n_key_heads * head_dim;
-    const float* q_head = q_src + src_batch_off + kh * head_dim;
-    const float* k_head = k_src + src_batch_off + kh * head_dim;
+    float* q_head = q_src + src_batch_off + kh * head_dim;
+    float* k_head = k_src + src_batch_off + kh * head_dim;
 
     // ── L2 norm of Q (single reduction, wave32) ──
     float q_sq = 0.0f;
@@ -63,11 +59,18 @@ extern "C" __global__ void fused_qk_l2_norm_scale_interleave_f32_batched(
         k_sq += __shfl_xor(k_sq, o);
     float k_inv_norm = rsqrtf(k_sq + eps);
 
-    // ── Replicate-and-write across `ratio` value-head slots ──
+    // ── Mutate the normalized source exactly once ──
     // Match the legacy q[i] *= inv_norm; q[i] *= scale order — the two
     // multiplies aren't associative under FP32 and combining into one
     // breaks the quality-gated byte-identity vs the un-fused path
     // (per the comment in fused_qk_l2_norm_scale.hip:43).
+    for (int i = tid; i < head_dim; i += 32) {
+        q_head[i] *= q_inv_norm;
+        q_head[i] *= q_scale;
+        k_head[i] *= k_inv_norm;
+    }
+
+    // ── Replicate-and-write across `ratio` value-head slots ──
     const int n_value_heads = n_key_heads * ratio;
     const long long dst_batch_off = (long long)b * n_value_heads * head_dim;
     for (int r = 0; r < ratio; r++) {
@@ -75,10 +78,8 @@ extern "C" __global__ void fused_qk_l2_norm_scale_interleave_f32_batched(
         float* q_out = q_dst + dst_batch_off + vh * head_dim;
         float* k_out = k_dst + dst_batch_off + vh * head_dim;
         for (int i = tid; i < head_dim; i += 32) {
-            float qv = q_head[i] * q_inv_norm;
-            qv *= q_scale;
-            q_out[i] = qv;
-            k_out[i] = k_head[i] * k_inv_norm;
+            q_out[i] = q_head[i];
+            k_out[i] = k_head[i];
         }
     }
 }

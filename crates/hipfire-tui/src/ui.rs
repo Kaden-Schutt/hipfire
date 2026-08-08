@@ -71,7 +71,7 @@ fn draw_help_overlay(frame: &mut Frame, app: &App, area: Rect) {
             "Global",
             Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
         )),
-        Line::from("  Tab / BackTab    switch tabs"),
+        Line::from("  Tab / Shift+Tab  switch tabs"),
         Line::from("  ?                toggle this help"),
         Line::from("  r                refresh live data"),
         Line::from("  q                quit"),
@@ -84,10 +84,10 @@ fn draw_help_overlay(frame: &mut Frame, app: &App, area: Rect) {
     ];
     // The active-tab keys, one per line — keeps each short so nothing wraps and
     // clips inside the modal, and makes the line count (hence height) exact. The
-    // globally-listed keys (Tab/BackTab, q) are skipped to avoid duplication.
+    // globally-listed keys (Tab/Shift+Tab, q) are skipped to avoid duplication.
     for part in footer_hints(app).split('·') {
         let part = part.trim();
-        if part.is_empty() || part.starts_with("Tab/BackTab") || part == "q quit" {
+        if part.is_empty() || part.starts_with("Tab/Shift+Tab") || part == "q quit" {
             continue;
         }
         lines.push(Line::from(format!("  {part}")));
@@ -102,7 +102,12 @@ fn draw_help_overlay(frame: &mut Frame, app: &App, area: Rect) {
     let h = (lines.len() as u16 + 2).min(area.height.saturating_sub(2));
     let x = area.x + area.width.saturating_sub(w) / 2;
     let y = area.y + area.height.saturating_sub(h) / 2;
-    let rect = Rect { x, y, width: w, height: h };
+    let rect = Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    };
 
     frame.render_widget(Clear, rect);
     frame.render_widget(
@@ -184,10 +189,10 @@ fn draw_header(frame: &mut Frame, app: &mut App, area: Rect) {
 }
 
 /// Per-tab keybind hints shown in the footer. Each tab lists ITS relevant keys;
-/// the global `Tab/BackTab switch · q quit` suffix is appended for non-edit
+/// the global `Tab/Shift+Tab switch · q quit` suffix is appended for non-edit
 /// states. Kept here (not in App) so the hint text lives next to the renderer.
 fn footer_hints(app: &App) -> String {
-    let global = "Tab/BackTab switch · q quit";
+    let global = "Tab/Shift+Tab switch · q quit";
     match app.tab {
         Tab::Home => format!("r refresh · {global}"),
         Tab::Dashboard => {
@@ -199,13 +204,16 @@ fn footer_hints(app: &App) -> String {
         }
         Tab::Chat => {
             // Chat owns q/r as text input, so it has its own exit hints.
-            "Enter send (/help for commands) · Ctrl+O newline · Up/Down scroll · Esc stop / blur".to_string()
+            "Enter send (/help for commands) · Ctrl+O newline · Up/Down scroll · Esc stop / blur"
+                .to_string()
         }
         Tab::Models => {
             if app.confirm_delete.is_some() {
                 "Delete this model?  y confirm · n / Esc cancel".to_string()
             } else {
-                format!("Up/Down select · Enter open/expand · p pull · d delete · r refresh · {global}")
+                format!(
+                    "Up/Down select · Enter open/expand · p pull · d delete · r refresh · {global}"
+                )
             }
         }
         Tab::Settings => {
@@ -349,7 +357,7 @@ fn draw_home(frame: &mut Frame, app: &App, area: Rect) {
     ];
     frame.render_widget(
         List::new(actions)
-            .block(block("Tabs  (Tab / BackTab to switch)"))
+            .block(block("Tabs  (Tab / Shift+Tab to switch)"))
             .style(Style::default().fg(TEXT).bg(PANEL)),
         left[1],
     );
@@ -381,21 +389,18 @@ fn draw_home(frame: &mut Frame, app: &App, area: Rect) {
     );
 
     let keys = vec![
-        Row::new(["Tab / BackTab", "switch tabs"]),
+        Row::new(["Tab / Shift+Tab", "switch tabs"]),
         Row::new(["\u{2191}  \u{2193}", "move within a tab"]),
         Row::new(["Enter", "select / send"]),
         Row::new(["r", "refresh live data"]),
         Row::new(["q", "quit"]),
     ];
     frame.render_widget(
-        Table::new(
-            keys,
-            [Constraint::Length(16), Constraint::Min(20)],
-        )
-        .header(Row::new(["Key", "Action"]).style(Style::default().fg(MUTED)))
-        .block(block("Keys  (full list in each tab's footer)"))
-        .style(Style::default().fg(TEXT).bg(PANEL))
-        .row_highlight_style(Style::default().bg(PANEL_2)),
+        Table::new(keys, [Constraint::Length(16), Constraint::Min(20)])
+            .header(Row::new(["Key", "Action"]).style(Style::default().fg(MUTED)))
+            .block(block("Keys  (full list in each tab's footer)"))
+            .style(Style::default().fg(TEXT).bg(PANEL))
+            .row_highlight_style(Style::default().bg(PANEL_2)),
         right[1],
     );
 }
@@ -420,7 +425,10 @@ fn draw_dashboard(frame: &mut Frame, app: &App, area: Rect) {
         let d = dash.unwrap();
         serve_lines.push(Line::from(vec![
             Span::raw("Serve      "),
-            Span::styled("offline", Style::default().fg(RED).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "offline",
+                Style::default().fg(RED).add_modifier(Modifier::BOLD),
+            ),
         ]));
         serve_lines.push(Line::from(format!("Endpoint   {}", d.endpoint)));
         serve_lines.push(Line::from(""));
@@ -438,7 +446,10 @@ fn draw_dashboard(frame: &mut Frame, app: &App, area: Rect) {
         let d = dash.unwrap();
         serve_lines.push(Line::from(vec![
             Span::raw("Serve      "),
-            Span::styled("online", Style::default().fg(GREEN).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "online",
+                Style::default().fg(GREEN).add_modifier(Modifier::BOLD),
+            ),
         ]));
         serve_lines.push(Line::from(format!("Endpoint   {}", d.endpoint)));
         serve_lines.push(Line::from(format!(
@@ -455,7 +466,10 @@ fn draw_dashboard(frame: &mut Frame, app: &App, area: Rect) {
                 ),
                 Span::raw("  in-flight"),
             ]));
-            serve_lines.push(Line::from(format!("Requests   {} served", s.requests_served)));
+            serve_lines.push(Line::from(format!(
+                "Requests   {} served",
+                s.requests_served
+            )));
             serve_lines.push(Line::from(match s.recent_tok_s {
                 Some(t) => format!("Recent     {t:.1} tok/s"),
                 None => "Recent     — (no completed generation yet)".into(),
@@ -707,7 +721,7 @@ fn draw_models(frame: &mut Frame, app: &App, area: Rect) {
             )),
             Line::from(""),
             Line::from(Span::styled(
-                "The registry (cli/registry.json) lists available ids; downloads land in ~/.hipfire/models.",
+                "The bundled registry lists available ids; downloads land in the configured models directory.",
                 Style::default().fg(MUTED),
             )),
         ];
@@ -823,14 +837,16 @@ fn draw_models(frame: &mut Frame, app: &App, area: Rect) {
 fn draw_models_status(frame: &mut Frame, app: &App, area: Rect) {
     if let Some(tag) = &app.confirm_delete {
         frame.render_widget(
-            Paragraph::new(format!("Delete {tag}?  press y to confirm, n / Esc to cancel"))
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .border_style(Style::default().fg(RED))
-                        .title(" Confirm delete "),
-                )
-                .style(Style::default().fg(TEXT).bg(PANEL)),
+            Paragraph::new(format!(
+                "Delete {tag}?  press y to confirm, n / Esc to cancel"
+            ))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(RED))
+                    .title(" Confirm delete "),
+            )
+            .style(Style::default().fg(TEXT).bg(PANEL)),
             area,
         );
     } else if let Some(job) = &app.pull {
@@ -860,12 +876,15 @@ fn draw_models_status(frame: &mut Frame, app: &App, area: Rect) {
 /// editor (5b — the copy must not promise preview semantics for booleans).
 fn selected_action_hint(app: &App) -> &'static str {
     use crate::hipfire::writer::{self, FieldKind};
-    match app.selected_setting_key().and_then(|k| writer::field_spec(&k).map(|s| s.kind)) {
+    match app
+        .selected_setting_key()
+        .and_then(|k| writer::field_spec(&k).map(|s| s.kind))
+    {
         Some(FieldKind::Enum(_)) => "Left/Right/Space preview values, Enter commits.",
         Some(FieldKind::Bool) => "Left/Right/Space toggles on/off (applies immediately).",
-        Some(FieldKind::Int { .. }) | Some(FieldKind::Float { .. }) | Some(FieldKind::FreeStr { .. }) => {
-            "Enter to edit the value."
-        }
+        Some(FieldKind::Int { .. })
+        | Some(FieldKind::Float { .. })
+        | Some(FieldKind::FreeStr { .. }) => "Enter to edit the value.",
         None => "This row is set elsewhere (Models tab / serve).",
     }
 }
@@ -900,7 +919,10 @@ fn settings_row_display(
     if let Some(pv) = preview {
         return (
             format!("● {pv} (preview)"),
-            Style::default().fg(YELLOW).bg(PANEL_2).add_modifier(Modifier::ITALIC),
+            Style::default()
+                .fg(YELLOW)
+                .bg(PANEL_2)
+                .add_modifier(Modifier::ITALIC),
         );
     }
     let is_override = override_state == Some(true);
@@ -923,14 +945,18 @@ fn draw_settings(frame: &mut Frame, app: &App, area: Rect) {
     // fixed slice; the table keeps the elastic middle so it never disappears.
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Min(10), Constraint::Min(8)])
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(10),
+            Constraint::Min(8),
+        ])
         .split(pad(area, 1, 0));
     if app.confirm_reset_all {
-        // Destructive: clears the whole config.json (default_model / host / port
+        // Destructive: clears all overrides in config.toml (default_model / host / port
         // included). RED-bordered, like the Models delete-confirm.
         frame.render_widget(
             Paragraph::new(
-                "Reset ALL settings to defaults? This clears ~/.hipfire/config.json.  \
+                "Reset ALL settings to defaults? This clears ~/.hipfire/config.toml.  \
                  y = confirm · n / Esc = cancel",
             )
             .block(
@@ -950,16 +976,26 @@ fn draw_settings(frame: &mut Frame, app: &App, area: Rect) {
         };
         let note = if let Some(p) = &app.settings_pending {
             // 5b: a staged enum preview is not yet written.
-            format!("preview {} = {} (uncommitted) — Enter commit, Esc cancel", p.key, p.value)
+            format!(
+                "preview {} = {} (uncommitted) — Enter commit, Esc cancel",
+                p.key, p.value
+            )
         } else if let Some(edit) = &app.settings_edit {
             // Show the live edit buffer.
-            format!("editing {} = {}_  (Enter save, Esc cancel)", edit.key, edit.buffer)
+            format!(
+                "editing {} = {}_  (Enter save, Esc cancel)",
+                edit.key, edit.buffer
+            )
         } else {
             // Tailor the hint to the SELECTED row's kind so the copy never
             // overstates preview semantics (booleans toggle immediately; only
             // enums preview-then-commit).
             let action = selected_action_hint(app);
-            let switch = if app.settings_easy { "a for advanced" } else { "e for easy" };
+            let switch = if app.settings_easy {
+                "a for advanced"
+            } else {
+                "e for easy"
+            };
             format!("{action}  Del resets. Press {switch}.")
         };
         frame.render_widget(
@@ -1038,7 +1074,7 @@ fn draw_settings(frame: &mut Frame, app: &App, area: Rect) {
         frame.render_widget(
             Table::new(rows, [Constraint::Length(28), Constraint::Min(20)])
                 .header(Row::new(["Key", "Value"]).style(Style::default().fg(MUTED)))
-                .block(block("Advanced config.json view  (● = your override)"))
+                .block(block("Advanced config.toml view  (● = your override)"))
                 .style(Style::default().fg(TEXT).bg(PANEL)),
             chunks[1],
         );
@@ -1075,7 +1111,10 @@ fn draw_settings_explainer(frame: &mut Frame, app: &App, area: Rect) {
     match help_key.as_deref().and_then(knobs::knob_info) {
         Some(info) => {
             let mut head = vec![
-                Span::styled(info.title, Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    info.title,
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                ),
                 Span::styled(format!("  ({})", info.key), Style::default().fg(MUTED)),
                 Span::styled(
                     format!("   default: {}", default_display(info.default)),
@@ -1083,10 +1122,16 @@ fn draw_settings_explainer(frame: &mut Frame, app: &App, area: Rect) {
                 ),
             ];
             if !cur.is_empty() {
-                head.push(Span::styled(format!("   now: {cur}"), Style::default().fg(TEXT)));
+                head.push(Span::styled(
+                    format!("   now: {cur}"),
+                    Style::default().fg(TEXT),
+                ));
             }
             lines.push(Line::from(head));
-            lines.push(Line::from(Span::styled(info.summary, Style::default().fg(TEXT))));
+            lines.push(Line::from(Span::styled(
+                info.summary,
+                Style::default().fg(TEXT),
+            )));
             lines.push(Line::from(vec![
                 Span::styled("Effect: ", Style::default().fg(YELLOW)),
                 Span::styled(info.effect, Style::default().fg(TEXT)),
@@ -1094,14 +1139,23 @@ fn draw_settings_explainer(frame: &mut Frame, app: &App, area: Rect) {
             // Per-option help: what each selectable value does, with the current
             // value marked "▸" (accent) and a staged preview marked "●" (yellow).
             if !info.options.is_empty() {
-                lines.push(Line::from(Span::styled("Options:", Style::default().fg(YELLOW))));
+                lines.push(Line::from(Span::styled(
+                    "Options:",
+                    Style::default().fg(YELLOW),
+                )));
                 for (val, desc) in info.options {
                     let is_pending = pending.as_deref() == Some(*val);
                     let is_current = !is_pending && cur == *val;
                     let (marker, vstyle) = if is_pending {
-                        ("● ", Style::default().fg(YELLOW).add_modifier(Modifier::BOLD))
+                        (
+                            "● ",
+                            Style::default().fg(YELLOW).add_modifier(Modifier::BOLD),
+                        )
                     } else if is_current {
-                        ("▸ ", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD))
+                        (
+                            "▸ ",
+                            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                        )
                     } else {
                         ("  ", Style::default().fg(TEXT))
                     };
@@ -1117,7 +1171,10 @@ fn draw_settings_explainer(frame: &mut Frame, app: &App, area: Rect) {
             ]));
             if let Some(note) = info.note {
                 lines.push(Line::from(vec![
-                    Span::styled("Note: ", Style::default().fg(RED).add_modifier(Modifier::BOLD)),
+                    Span::styled(
+                        "Note: ",
+                        Style::default().fg(RED).add_modifier(Modifier::BOLD),
+                    ),
                     Span::styled(note, Style::default().fg(TEXT)),
                 ]));
             }
@@ -1354,17 +1411,18 @@ fn card(title: &str, lines: Vec<Line<'static>>) -> Paragraph<'static> {
 fn draw_logs(frame: &mut Frame, app: &App, area: Rect) {
     use crate::hipfire::log_tail::LogStatus;
     let inner = pad(area, 1, 0);
-    let (title, body): (String, Text) = match &app.logs.status {
-        LogStatus::Pending => (
-            "serve.log".into(),
-            Text::from(Line::from(Span::styled(
-                "reading serve.log\u{2026}",
-                Style::default().fg(MUTED),
-            ))),
-        ),
-        LogStatus::Missing => (
-            "serve.log (not found)".into(),
-            Text::from(vec![
+    let (title, body): (String, Text) =
+        match &app.logs.status {
+            LogStatus::Pending => (
+                "serve.log".into(),
+                Text::from(Line::from(Span::styled(
+                    "reading serve.log\u{2026}",
+                    Style::default().fg(MUTED),
+                ))),
+            ),
+            LogStatus::Missing => (
+                "serve.log (not found)".into(),
+                Text::from(vec![
                 Line::from(Span::styled("No serve.log yet.", Style::default().fg(YELLOW))),
                 Line::from(""),
                 Line::from(Span::styled(
@@ -1372,33 +1430,33 @@ fn draw_logs(frame: &mut Frame, app: &App, area: Rect) {
                     Style::default().fg(MUTED),
                 )),
             ]),
-        ),
-        LogStatus::Empty => (
-            "serve.log (empty)".into(),
-            Text::from(Line::from(Span::styled(
-                "serve.log is empty.",
-                Style::default().fg(MUTED),
-            ))),
-        ),
-        LogStatus::Error(e) => (
-            "serve.log (error)".into(),
-            Text::from(Line::from(Span::styled(
-                format!("read error: {e}"),
-                Style::default().fg(RED),
-            ))),
-        ),
-        LogStatus::Ok => {
-            let title = format!("serve.log (last {} lines)", app.logs.lines.len());
-            // Show the tail that fits, newest at the bottom.
-            let height = inner.height.saturating_sub(2) as usize; // borders
-            let start = app.logs.lines.len().saturating_sub(height.max(1));
-            let lines: Vec<Line> = app.logs.lines[start..]
-                .iter()
-                .map(|l| Line::from(l.as_str()))
-                .collect();
-            (title, Text::from(lines))
-        }
-    };
+            ),
+            LogStatus::Empty => (
+                "serve.log (empty)".into(),
+                Text::from(Line::from(Span::styled(
+                    "serve.log is empty.",
+                    Style::default().fg(MUTED),
+                ))),
+            ),
+            LogStatus::Error(e) => (
+                "serve.log (error)".into(),
+                Text::from(Line::from(Span::styled(
+                    format!("read error: {e}"),
+                    Style::default().fg(RED),
+                ))),
+            ),
+            LogStatus::Ok => {
+                let title = format!("serve.log (last {} lines)", app.logs.lines.len());
+                // Show the tail that fits, newest at the bottom.
+                let height = inner.height.saturating_sub(2) as usize; // borders
+                let start = app.logs.lines.len().saturating_sub(height.max(1));
+                let lines: Vec<Line> = app.logs.lines[start..]
+                    .iter()
+                    .map(|l| Line::from(l.as_str()))
+                    .collect();
+                (title, Text::from(lines))
+            }
+        };
     frame.render_widget(
         Paragraph::new(body)
             .block(block(&title))
@@ -1524,7 +1582,10 @@ mod render_tests {
         // dashboard == None (initial frame) must render honest "probing" text,
         // not a crash and not zeros-as-data.
         let text = render_dashboard(None);
-        assert!(text.contains("Probing serve"), "expected probing placeholder");
+        assert!(
+            text.contains("Probing serve"),
+            "expected probing placeholder"
+        );
     }
 
     use crate::hipfire::dashboard::{Probe, SystemInfo};
@@ -1572,7 +1633,10 @@ mod render_tests {
         assert!(text.contains("Radeon RX 7900 XTX"), "expected gpu name");
         assert!(text.contains("gfx1100"), "expected gpu arch");
         assert!(text.contains("HIP 6.2"), "expected HIP version");
-        assert!(text.contains(".hipfire_kernels"), "expected kernel cache path");
+        assert!(
+            text.contains(".hipfire_kernels"),
+            "expected kernel cache path"
+        );
         assert!(text.contains("deadbeef"), "expected model checksum");
         // Must NOT show the old static placeholder.
         assert!(
@@ -1587,7 +1651,9 @@ mod render_tests {
             gpu_name: Probe::Unavailable("unavailable: rocm-smi not installed".into()),
             gpu_arch: Probe::Unavailable("unavailable: rocminfo not installed".into()),
             hip_version: Probe::Unavailable("unavailable: hipconfig absent".into()),
-            kernel_cache: Probe::Unavailable("/home/u/.hipfire_kernels (absent — populated on first run)".into()),
+            kernel_cache: Probe::Unavailable(
+                "/home/u/.hipfire_kernels (absent — populated on first run)".into(),
+            ),
             loaded_model: Probe::Unavailable("no model loaded".into()),
             model_checksum: Probe::Unavailable("no model loaded".into()),
         };
@@ -1596,7 +1662,10 @@ mod render_tests {
             app.dashboard = Some(dash_with_system(sys));
         });
         assert!(text.contains("unavailable"), "expected honest unavailable");
-        assert!(text.contains("no model loaded"), "expected idle model state");
+        assert!(
+            text.contains("no model loaded"),
+            "expected idle model state"
+        );
         // No fabricated gfx string when the probe failed.
         assert!(!text.contains("gfx1"), "must not invent a gfx target");
     }
@@ -1616,7 +1685,10 @@ mod render_tests {
     #[test]
     fn footer_hints_are_per_tab() {
         let settings = render_with(|app| app.tab = Tab::Settings);
-        assert!(settings.contains("change"), "settings footer mentions change");
+        assert!(
+            settings.contains("change"),
+            "settings footer mentions change"
+        );
         assert!(settings.contains("easy"), "settings footer mentions easy");
 
         let models = render_with(|app| app.tab = Tab::Models);
@@ -1624,13 +1696,19 @@ mod render_tests {
         assert!(models.contains("expand"), "models footer mentions expand");
 
         let dash = render_with(|app| app.tab = Tab::Dashboard);
-        assert!(dash.contains("refresh"), "dashboard footer mentions refresh");
+        assert!(
+            dash.contains("refresh"),
+            "dashboard footer mentions refresh"
+        );
 
         let chat = render_with(|app| app.tab = Tab::Chat);
         assert!(chat.contains("send"), "chat footer mentions send");
 
         let system = render_with(|app| app.tab = Tab::System);
-        assert!(system.contains("diagnostics"), "system footer mentions diagnostics");
+        assert!(
+            system.contains("diagnostics"),
+            "system footer mentions diagnostics"
+        );
         // Global hints present on a non-chat tab.
         assert!(dash.contains("quit"), "global quit hint present");
     }
@@ -1656,7 +1734,10 @@ mod render_tests {
             app.registry.models.clear();
             app.registry.local_files.clear();
         });
-        assert!(text.contains("No models found"), "expected empty-state header");
+        assert!(
+            text.contains("No models found"),
+            "expected empty-state header"
+        );
         assert!(text.contains("hipfire pull"), "expected pull guidance");
     }
 
@@ -1702,7 +1783,9 @@ mod render_tests {
         let width = buf.area().width as usize;
         let row = app.tab_row_y as usize;
         let content = buf.content();
-        let row_text: String = (0..width).map(|c| content[row * width + c].symbol()).collect();
+        let row_text: String = (0..width)
+            .map(|c| content[row * width + c].symbol())
+            .collect();
         for (start, _end, tab) in &app.tab_hitboxes {
             let title = tab.title();
             let title_col = (*start as usize) + 1; // title is drawn after the 1-col left pad
@@ -1736,7 +1819,11 @@ mod render_tests {
         for (_, end, _) in &app.tab_hitboxes {
             assert!(*end <= 20, "hit region clamped to the area width");
         }
-        assert_eq!(app.tab_at(100, app.tab_row_y), None, "click far past the tabs");
+        assert_eq!(
+            app.tab_at(100, app.tab_row_y),
+            None,
+            "click far past the tabs"
+        );
     }
 
     #[test]
@@ -1758,7 +1845,10 @@ mod render_tests {
         let text = render_with(|app| app.tab = Tab::Dashboard);
         assert!(text.contains("s start"), "serve start control in footer");
         assert!(text.contains("x stop"), "serve stop control in footer");
-        assert!(text.contains("R restart"), "serve restart control in footer");
+        assert!(
+            text.contains("R restart"),
+            "serve restart control in footer"
+        );
     }
 
     #[test]
@@ -1780,7 +1870,7 @@ mod render_tests {
             app.confirm_reset_all = true;
         });
         assert!(text.contains("Confirm reset-all"), "confirm prompt title");
-        assert!(text.contains("config.json"), "names the file it clears");
+        assert!(text.contains("config.toml"), "names the file it clears");
         assert!(text.contains("y = confirm"), "y/n guidance shown");
     }
 
@@ -1825,7 +1915,11 @@ mod render_tests {
         // PANEL_2 highlight background (not just yellow text floating on PANEL).
         let (_s, st) = settings_row_display("auto", Some("on"), Some(false), true);
         assert_eq!(st.fg, Some(YELLOW), "preview keeps its distinct yellow");
-        assert_eq!(st.bg, Some(PANEL_2), "preview row uses the highlight background");
+        assert_eq!(
+            st.bg,
+            Some(PANEL_2),
+            "preview row uses the highlight background"
+        );
     }
 
     #[test]
@@ -1848,8 +1942,12 @@ mod render_tests {
             app.config.overrides.clear();
             app.config.overrides.insert("kv_cache".into());
             // Put the override row under the cursor so it is on-screen.
-            app.settings_selected =
-                app.config.values.keys().position(|k| k == "kv_cache").unwrap();
+            app.settings_selected = app
+                .config
+                .values
+                .keys()
+                .position(|k| k == "kv_cache")
+                .unwrap();
         });
         assert!(text.contains("● "), "override row marked with a bullet");
         assert!(text.contains("your override"), "legend explains the marker");
@@ -1868,7 +1966,10 @@ mod render_tests {
             app.settings_selected = 0; // Model row
         });
         // Only default_model is overridden, so the single bullet is the Model row.
-        assert!(text.contains("● "), "Model composite row marked via default_model override");
+        assert!(
+            text.contains("● "),
+            "Model composite row marked via default_model override"
+        );
     }
 
     #[test]
@@ -1878,12 +1979,22 @@ mod render_tests {
         let text = render_with(|app| {
             app.tab = Tab::Settings;
             app.settings_easy = false;
-            app.settings_selected =
-                app.config.values.keys().position(|k| k == "dflash_mode").unwrap();
+            app.settings_selected = app
+                .config
+                .values
+                .keys()
+                .position(|k| k == "dflash_mode")
+                .unwrap();
         });
-        assert!(text.contains("About this setting"), "explainer pane present");
+        assert!(
+            text.contains("About this setting"),
+            "explainer pane present"
+        );
         assert!(text.contains("Spec decode"), "shows the knob title");
-        assert!(text.contains("thinking"), "surfaces the thinking↔dflash interaction");
+        assert!(
+            text.contains("thinking"),
+            "surfaces the thinking↔dflash interaction"
+        );
         assert!(text.contains("default:"), "shows the default");
     }
 
@@ -1894,14 +2005,24 @@ mod render_tests {
         let text = render_with(|app| {
             app.tab = Tab::Settings;
             app.settings_easy = false;
-            app.settings_selected =
-                app.config.values.keys().position(|k| k == "kv_adaptive").unwrap();
+            app.settings_selected = app
+                .config
+                .values
+                .keys()
+                .position(|k| k == "kv_adaptive")
+                .unwrap();
         });
         assert!(text.contains("Options:"), "options section present");
         assert!(text.contains("aggressive"), "an option value is listed");
         // The three presets are now distinct tiers — balanced is the middle floor.
-        assert!(text.contains("Middle floor"), "an option description is shown");
-        assert!(text.contains("▸"), "the current option is marked with a pointer");
+        assert!(
+            text.contains("Middle floor"),
+            "an option description is shown"
+        );
+        assert!(
+            text.contains("▸"),
+            "the current option is marked with a pointer"
+        );
     }
 
     #[test]
@@ -1913,7 +2034,10 @@ mod render_tests {
             app.settings_easy = true;
             app.settings_selected = 0; // Model row
         });
-        assert!(text.contains("Default model"), "Model row resolves to default_model help");
+        assert!(
+            text.contains("Default model"),
+            "Model row resolves to default_model help"
+        );
     }
 
     #[test]
@@ -1928,7 +2052,10 @@ mod render_tests {
             app.config.values.insert("cask_budget".into(), "512".into());
             app.settings_selected = 0;
         });
-        assert!(text.contains("No extended help"), "honest fallback for uncurated key");
+        assert!(
+            text.contains("No extended help"),
+            "honest fallback for uncurated key"
+        );
     }
 
     #[test]
@@ -1938,8 +2065,7 @@ mod render_tests {
         let bool_text = render_with(|app| {
             app.tab = Tab::Settings;
             app.settings_easy = false;
-            app.settings_selected =
-                app.config.values.keys().position(|k| k == "cask").unwrap();
+            app.settings_selected = app.config.values.keys().position(|k| k == "cask").unwrap();
         });
         assert!(
             bool_text.contains("toggles on/off") && bool_text.contains("immediately"),
@@ -1949,8 +2075,12 @@ mod render_tests {
         let enum_text = render_with(|app| {
             app.tab = Tab::Settings;
             app.settings_easy = false;
-            app.settings_selected =
-                app.config.values.keys().position(|k| k == "kv_cache").unwrap();
+            app.settings_selected = app
+                .config
+                .values
+                .keys()
+                .position(|k| k == "kv_cache")
+                .unwrap();
         });
         assert!(
             enum_text.contains("preview values") && enum_text.contains("Enter commits"),
@@ -1966,15 +2096,22 @@ mod render_tests {
             app.tab = Tab::Settings;
             app.settings_easy = false;
             // Select the previewed row so it's on-screen (scroll follows selection).
-            app.settings_selected =
-                app.config.values.keys().position(|k| k == "dflash_mode").unwrap();
+            app.settings_selected = app
+                .config
+                .values
+                .keys()
+                .position(|k| k == "dflash_mode")
+                .unwrap();
             app.settings_pending = Some(crate::app::PendingEnum {
                 key: "dflash_mode".into(),
                 value: "auto".into(),
             });
         });
         assert!(text.contains("auto (preview)"), "previewed value is marked");
-        assert!(text.contains("Enter commit"), "commit/cancel guidance shown");
+        assert!(
+            text.contains("Enter commit"),
+            "commit/cancel guidance shown"
+        );
     }
 
     #[test]
@@ -2001,7 +2138,10 @@ mod render_tests {
                 status: LogStatus::Missing,
             };
         });
-        assert!(text.contains("No serve.log yet"), "honest missing-state guidance");
+        assert!(
+            text.contains("No serve.log yet"),
+            "honest missing-state guidance"
+        );
     }
 
     #[test]
@@ -2015,7 +2155,10 @@ mod render_tests {
                 secs: 0.85,
             }];
         });
-        assert!(text.contains("Recent requests"), "inspector section present");
+        assert!(
+            text.contains("Recent requests"),
+            "inspector section present"
+        );
         assert!(text.contains("128 tok"), "token count shown");
     }
 
@@ -2069,6 +2212,9 @@ mod render_tests {
             };
         });
         assert!(text.contains("loaded qwen3.5:9b"), "tail line is shown");
-        assert!(text.contains("last 2 lines"), "title reflects the line count");
+        assert!(
+            text.contains("last 2 lines"),
+            "title reflects the line count"
+        );
     }
 }

@@ -74,7 +74,7 @@ fn run_single_gpu(path: &str) -> Vec<u32> {
     // leak fits inside the 2 GiB tolerance.
     scratch.free_gpu(&mut gpu);
     dn.free_gpu(&mut gpu);
-    kv.free_gpu(&mut gpu);
+    let _ = kv.free_gpu(&mut gpu);
     weights.free_gpu(&mut gpu);
     gpu.drain_pool();
     tokens
@@ -99,7 +99,7 @@ fn run_multi_gpu(path: &str) -> Vec<u32> {
         4096,
     )
     .expect("kv multi");
-    let (mut dn, _la_to_device) =
+    let mut dn =
         DeltaNetState::new_with_quant_multi(&mut gpus, &config, StateQuant::Q8).expect("dn multi");
     let _ = gpus.enable_peer_all().expect("enable_peer_all");
 

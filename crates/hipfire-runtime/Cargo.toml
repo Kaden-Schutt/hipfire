@@ -41,7 +41,7 @@ description = "Inference orchestrator for RDNA GPUs"
 # each example needs and as the gate for downstream library consumers
 # who attempt to build examples through their own build script.
 default = ["arch-qwen35", "arch-qwen35-vl", "arch-llama", "arch-qwen2", "arch-deepseek4", "arch-cohere2moe", "arch-dots-ocr", "deltanet"]
-deltanet = ["rdna-compute/deltanet", "hipfire-dispatch/deltanet"]
+deltanet = ["rdna-compute/deltanet", "hipfire-dispatch/deltanet", "hipfire-hardware/deltanet"]
 arch-qwen35 = []
 arch-qwen35-vl = []
 arch-llama = []
@@ -57,11 +57,35 @@ arch-dots-ocr = []
 # and the synthetic-error branches OUT, so HIPFIRE_EP_FAIL_RANK has no effect.
 # Build the GPU cleanup test with `--features deltanet,ep-fault-inject`.
 ep-fault-inject = []
+# dflash-fault-inject: enables test-only deterministic DFlash allocation faults.
+# It is intentionally excluded from default/release feature sets.
+dflash-fault-inject = []
+# loader-internal: exposes raw TP/PP HFQ constructors (`load_from_hfq`)
+# that are consumed by hipfire-loader's CAP-001 Task 3 admitted-load path.
+# Not in default — only hipfire-loader activates it.  External consumers
+# should use `hipfire_loader::admit_path` + `load_admitted` instead.
+loader-internal = []
+# emulated-ep2-harness: forwards the test-only Qwen35 emulated-EP2 parity
+# harness feature (STEP-002 Task 8) from the arch crate so the
+# `ep_decode_parity` example can build. Never enabled by default; the
+# harness is one GPU-bearing invocation per process and never constructs
+# `EpArch::Qwen35` or adds daemon Qwen EP admission.
+emulated-ep2-harness = ["hipfire-arch-qwen35/emulated-ep2-harness"]
+# serve-fault-inject: test-only GPU fault injection + test_state_snapshot for
+# serve-hardening retry parity. NOT in the default set: production builds
+# compile the generate field, one-shot after-prefill hooks, and snapshot
+# command OUT. Build the GPU parity harness daemon with
+# `--features deltanet,serve-fault-inject`.
+serve-fault-inject = []
 [dependencies]
 hip-bridge = { path = "../hip-bridge" }
+hipfire-config = { path = "../hipfire-config" }
 rdna-compute = { path = "../rdna-compute" }
+hipfire-hardware = { path = "../hipfire-hardware" }
 hipfire-dispatch = { path = "../hipfire-dispatch" }
 memmap2 = "0.9"
+safetensors.workspace = true
+half.workspace = true
 byteorder = "1"
 serde = { version = "1", features = ["derive"] }
 # preserve_order: keep JSON object key insertion-order (IndexMap) instead of the
@@ -99,6 +123,7 @@ minijinja = { version = "2", features = ["loop_controls", "json", "preserve_orde
 # work on plain Jinja values — required by the Qwen3 family
 # template which uses these throughout.
 minijinja-contrib = { version = "2", features = ["pycompat"] }
+tracing = "0.1"
 
 # Examples in this crate (daemon, infer_qwen35, infer_qwen3, infer_vl, etc.)
 # consume the arch crates. These are dev-dependencies — cargo refuses
@@ -123,6 +148,7 @@ hipfire-detect = { path = "../hipfire-detect" }
 hipfire-atlas = { path = "../hipfire-atlas" }
 # In-test minimal HFQ writer (overlay resolution tests in src/hfq.rs).
 tempfile = "3"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 
 # Each example below carries `required-features` listing the cargo
 # features its `use hipfire_arch_*` imports depend on. This documents
@@ -144,6 +170,10 @@ required-features = []
 [[example]]
 name = "coherence_probe"
 required-features = []
+
+[[example]]
+name = "ep_decode_parity"
+required-features = ["emulated-ep2-harness"]
 
 [[example]]
 name = "gpus_smoke"
@@ -328,6 +358,16 @@ required-features = ["arch-qwen35", "deltanet"]
 [[example]]
 name = "pp2_vram_probe"
 required-features = ["arch-qwen35", "deltanet"]
+
+# Batched pipeline-parallel prefill parity — llama-family only, no arch/deltanet
+# features (mirrors auto-discovered pp_decode_parity).
+[[example]]
+name = "pp_prefill_parity"
+
+# Batched tensor-parallel prefill parity — llama-family only, no arch/deltanet
+# features (mirrors auto-discovered tp_decode_parity).
+[[example]]
+name = "tp_prefill_parity"
 
 # build_kld_ref needs no GPU / arch features — it just orchestrates
 # llama-perplexity and reduces uint16 logits to top-K. Stdlib-only.

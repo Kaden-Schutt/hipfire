@@ -24,6 +24,10 @@
 //! kernels for the MQ4/MQ6 tiers.
 
 use crate::config::{AttnKind, Cohere2MoeConfig};
+use hipfire_runtime::gpu_cleanup::{
+    free_tensor_retained, free_weight_all_checked, retain_kv_failures, GpuCleanupFailure,
+    RetainedGpuTensor,
+};
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama::{f16_to_f32, KvCache, WeightTensor};
 use rdna_compute::{DType, Gpu, GpuTensor};
@@ -192,6 +196,11 @@ pub struct Cohere2MoeWeights {
     pub final_norm: GpuTensor, // model.norm.weight (RMSNorm gamma)
     pub lm_head: WeightTensor, // tied = embed_tokens
     pub layers: Vec<Cohere2MoeLayerWeights>,
+    /// Model-owned resolved expert-group plans for the single policy
+    /// (STEP-004 follow-up): resolved exactly once through the manifest
+    /// authority, keyed on the load-bound config identity. Seeded lazily on
+    /// the first MoE forward; success AND failure are cached.
+    pub(crate) moe_group_plans: std::sync::OnceLock<Cohere2MoeGroupPlansCacheEntry>,
 }
 
 impl Cohere2MoeWeights {
@@ -349,7 +358,180 @@ impl Cohere2MoeWeights {
             final_norm,
             lm_head,
             layers,
+            moe_group_plans: std::sync::OnceLock::new(),
         })
+    }
+}
+
+/// Model-owned resolved expert-group plans for the single policy (STEP-004
+/// follow-up). Resolution runs exactly once per model through the manifest
+/// authority ([`crate::arch::Cohere2Moe`]'s `weight_manifest` +
+/// `expert_group_manifest`, projected through
+/// `resolve_expert_manifest_for_policy`); every later MoE decode borrows the
+/// same immutable state — no per-token plan construction.
+pub struct Cohere2MoeGroupPlans {
+    pub(crate) plans: Vec<hipfire_runtime::weight_manifest::ExpertGroupPlan>,
+}
+
+impl Cohere2MoeGroupPlans {
+    /// Resolve one validated plan per MoE layer through the manifest
+    /// authority. Dense-only (num_experts == 0) configs resolve an empty set.
+    pub(crate) fn resolve(config: &Cohere2MoeConfig) -> Result<Self, String> {
+        if config.num_experts == 0 {
+            return Ok(Self { plans: Vec::new() });
+        }
+        let policy = hipfire_runtime::moe_plan::MoEExecutionPolicy::single();
+        let specs =
+            <crate::arch::Cohere2Moe as hipfire_runtime::arch::Architecture>::expert_group_manifest(
+                config, &policy,
+            );
+        let manifest =
+            <crate::arch::Cohere2Moe as hipfire_runtime::arch::Architecture>::weight_manifest(
+                config,
+            );
+        let resolution = hipfire_runtime::weight_manifest::resolve_expert_manifest_for_policy(
+            &specs, &manifest, &policy,
+        )?;
+        Ok(Self {
+            plans: resolution.plans,
+        })
+    }
+
+    /// Borrow the immutable plan for one global MoE layer. Plans are
+    /// declared in layer order for the MoE span
+    /// (`first_k_dense_replace..num_hidden_layers`), so the layer is found
+    /// by scope, not by index.
+    pub(crate) fn by_layer(
+        &self,
+        layer: usize,
+    ) -> Result<&hipfire_runtime::weight_manifest::ExpertGroupPlan, String> {
+        self.plans
+            .iter()
+            .find(|plan| plan.layer == Some(layer))
+            .ok_or_else(|| format!("cohere2moe: no expert-group plan for MoE layer {layer}"))
+    }
+}
+
+/// Every `Cohere2MoeConfig` field consumed by the Cohere2 manifest
+/// declarations (arch.rs) — the complete cache identity.
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct Cohere2MoeGroupPlanKey {
+    vocab_size: usize,
+    hidden_size: usize,
+    num_hidden_layers: usize,
+    num_attention_heads: usize,
+    num_key_value_heads: usize,
+    head_dim: usize,
+    moe_intermediate_size: usize,
+    dense_intermediate_size: usize,
+    num_experts: usize,
+    num_experts_per_tok: usize,
+    first_k_dense_replace: usize,
+    tie_word_embeddings: bool,
+}
+
+impl Cohere2MoeGroupPlanKey {
+    fn from_config(cfg: &Cohere2MoeConfig) -> Self {
+        Cohere2MoeGroupPlanKey {
+            vocab_size: cfg.vocab_size,
+            hidden_size: cfg.hidden_size,
+            num_hidden_layers: cfg.num_hidden_layers,
+            num_attention_heads: cfg.num_attention_heads,
+            num_key_value_heads: cfg.num_key_value_heads,
+            head_dim: cfg.head_dim,
+            moe_intermediate_size: cfg.moe_intermediate_size,
+            dense_intermediate_size: cfg.dense_intermediate_size,
+            num_experts: cfg.num_experts,
+            num_experts_per_tok: cfg.num_experts_per_tok,
+            first_k_dense_replace: cfg.first_k_dense_replace,
+            tie_word_embeddings: cfg.tie_word_embeddings,
+        }
+    }
+}
+
+/// Fast-path request identity (all scalars — no owned clones on the hot path).
+struct Cohere2MoeGroupPlanKeyRef {
+    vocab_size: usize,
+    hidden_size: usize,
+    num_hidden_layers: usize,
+    num_attention_heads: usize,
+    num_key_value_heads: usize,
+    head_dim: usize,
+    moe_intermediate_size: usize,
+    dense_intermediate_size: usize,
+    num_experts: usize,
+    num_experts_per_tok: usize,
+    first_k_dense_replace: usize,
+    tie_word_embeddings: bool,
+}
+
+impl Cohere2MoeGroupPlanKeyRef {
+    fn from_config(cfg: &Cohere2MoeConfig) -> Self {
+        Cohere2MoeGroupPlanKeyRef {
+            vocab_size: cfg.vocab_size,
+            hidden_size: cfg.hidden_size,
+            num_hidden_layers: cfg.num_hidden_layers,
+            num_attention_heads: cfg.num_attention_heads,
+            num_key_value_heads: cfg.num_key_value_heads,
+            head_dim: cfg.head_dim,
+            moe_intermediate_size: cfg.moe_intermediate_size,
+            dense_intermediate_size: cfg.dense_intermediate_size,
+            num_experts: cfg.num_experts,
+            num_experts_per_tok: cfg.num_experts_per_tok,
+            first_k_dense_replace: cfg.first_k_dense_replace,
+            tie_word_embeddings: cfg.tie_word_embeddings,
+        }
+    }
+}
+
+impl PartialEq<Cohere2MoeGroupPlanKeyRef> for Cohere2MoeGroupPlanKey {
+    fn eq(&self, other: &Cohere2MoeGroupPlanKeyRef) -> bool {
+        self.vocab_size == other.vocab_size
+            && self.hidden_size == other.hidden_size
+            && self.num_hidden_layers == other.num_hidden_layers
+            && self.num_attention_heads == other.num_attention_heads
+            && self.num_key_value_heads == other.num_key_value_heads
+            && self.head_dim == other.head_dim
+            && self.moe_intermediate_size == other.moe_intermediate_size
+            && self.dense_intermediate_size == other.dense_intermediate_size
+            && self.num_experts == other.num_experts
+            && self.num_experts_per_tok == other.num_experts_per_tok
+            && self.first_k_dense_replace == other.first_k_dense_replace
+            && self.tie_word_embeddings == other.tie_word_embeddings
+    }
+}
+
+pub(crate) struct Cohere2MoeGroupPlansCacheEntry {
+    key: Cohere2MoeGroupPlanKey,
+    result: Result<Cohere2MoeGroupPlans, String>,
+}
+
+impl Cohere2MoeWeights {
+    /// The model-owned resolved expert-group plans (STEP-004 follow-up):
+    /// resolved exactly once per model through the validated manifest
+    /// authority; every later MoE decode borrows the same immutable state.
+    /// The entry caches the `Result` (success AND failure) under the config
+    /// identity it was resolved for; a different config identity returns an
+    /// explicit mismatch error and never replaces the cached entry.
+    pub(crate) fn moe_group_plans(
+        &self,
+        config: &Cohere2MoeConfig,
+    ) -> Result<&Cohere2MoeGroupPlans, String> {
+        let request = Cohere2MoeGroupPlanKeyRef::from_config(config);
+        let entry = self
+            .moe_group_plans
+            .get_or_init(|| Cohere2MoeGroupPlansCacheEntry {
+                key: Cohere2MoeGroupPlanKey::from_config(config),
+                result: Cohere2MoeGroupPlans::resolve(config),
+            });
+        if entry.key == request {
+            entry.result.as_ref().map_err(|error| error.clone())
+        } else {
+            Err(format!(
+                "cohere2moe plan cache: config identity mismatch — cached for a \
+                 different config than requested; refusing silent stale reuse"
+            ))
+        }
     }
 }
 
@@ -360,6 +542,26 @@ impl DenseFfn {
         up.free_all(gpu);
         down.free_all(gpu);
     }
+
+    /// Checked teardown: every owner is freed with a checked free; owners that
+    /// survive are carried in the returned [`GpuCleanupFailure`] for
+    /// exact-retention retry.
+    pub fn free_checked(self, gpu: &mut Gpu) -> Result<(), GpuCleanupFailure> {
+        let DenseFfn { gate, up, down } = self;
+        let mut failures: Vec<RetainedGpuTensor> = Vec::new();
+        free_weight_all_checked("DenseFfn.gate", gate, gpu, &mut failures);
+        free_weight_all_checked("DenseFfn.up", up, gpu, &mut failures);
+        free_weight_all_checked("DenseFfn.down", down, gpu, &mut failures);
+        let mut cf = GpuCleanupFailure::empty();
+        for r in failures {
+            cf.add_retained(r);
+        }
+        if cf.is_empty() {
+            Ok(())
+        } else {
+            Err(cf)
+        }
+    }
 }
 
 impl ExpertWeights {
@@ -367,6 +569,83 @@ impl ExpertWeights {
         let ExpertWeights { gate_up, down } = self;
         gate_up.free_all(gpu);
         down.free_all(gpu);
+    }
+
+    /// Checked teardown: see [`DenseFfn::free_checked`].
+    pub fn free_checked(self, gpu: &mut Gpu) -> Result<(), GpuCleanupFailure> {
+        let ExpertWeights { gate_up, down } = self;
+        let mut failures: Vec<RetainedGpuTensor> = Vec::new();
+        free_weight_all_checked("ExpertWeights.gate_up", gate_up, gpu, &mut failures);
+        free_weight_all_checked("ExpertWeights.down", down, gpu, &mut failures);
+        let mut cf = GpuCleanupFailure::empty();
+        for r in failures {
+            cf.add_retained(r);
+        }
+        if cf.is_empty() {
+            Ok(())
+        } else {
+            Err(cf)
+        }
+    }
+}
+
+impl Cohere2MoeParoSidecars {
+    /// Checked teardown: see [`DenseFfn::free_checked`].
+    pub fn free_checked(self, gpu: &mut Gpu) -> Result<(), GpuCleanupFailure> {
+        let Cohere2MoeParoSidecars {
+            gate_up_pairs,
+            gate_up_theta,
+            gate_up_channel_scales,
+            down_pairs,
+            down_theta,
+            down_channel_scales,
+        } = self;
+        let mut failures: Vec<RetainedGpuTensor> = Vec::new();
+        free_tensor_retained(
+            "Cohere2MoeParoSidecars.gate_up_pairs",
+            gate_up_pairs,
+            gpu,
+            &mut failures,
+        );
+        free_tensor_retained(
+            "Cohere2MoeParoSidecars.gate_up_theta",
+            gate_up_theta,
+            gpu,
+            &mut failures,
+        );
+        free_tensor_retained(
+            "Cohere2MoeParoSidecars.gate_up_channel_scales",
+            gate_up_channel_scales,
+            gpu,
+            &mut failures,
+        );
+        free_tensor_retained(
+            "Cohere2MoeParoSidecars.down_pairs",
+            down_pairs,
+            gpu,
+            &mut failures,
+        );
+        free_tensor_retained(
+            "Cohere2MoeParoSidecars.down_theta",
+            down_theta,
+            gpu,
+            &mut failures,
+        );
+        free_tensor_retained(
+            "Cohere2MoeParoSidecars.down_channel_scales",
+            down_channel_scales,
+            gpu,
+            &mut failures,
+        );
+        let mut cf = GpuCleanupFailure::empty();
+        for r in failures {
+            cf.add_retained(r);
+        }
+        if cf.is_empty() {
+            Ok(())
+        } else {
+            Err(cf)
+        }
     }
 }
 
@@ -402,6 +681,50 @@ impl MoeFfn {
             let _ = gpu.free_tensor(down_channel_scales);
         }
     }
+
+    /// Checked teardown: see [`DenseFfn::free_checked`].
+    pub fn free_checked(self, gpu: &mut Gpu) -> Result<(), GpuCleanupFailure> {
+        let MoeFfn {
+            router,
+            experts,
+            expert_gate_up_ptrs,
+            expert_down_ptrs,
+            paro_shared,
+        } = self;
+        let mut failures: Vec<RetainedGpuTensor> = Vec::new();
+        free_weight_all_checked("MoeFfn.router", router, gpu, &mut failures);
+        free_tensor_retained(
+            "MoeFfn.expert_gate_up_ptrs",
+            expert_gate_up_ptrs,
+            gpu,
+            &mut failures,
+        );
+        free_tensor_retained(
+            "MoeFfn.expert_down_ptrs",
+            expert_down_ptrs,
+            gpu,
+            &mut failures,
+        );
+        let mut cf = GpuCleanupFailure::empty();
+        for r in failures {
+            cf.add_retained(r);
+        }
+        for e in experts {
+            if let Err(f) = e.free_checked(gpu) {
+                cf.merge(f);
+            }
+        }
+        if let Some(s) = paro_shared {
+            if let Err(f) = s.free_checked(gpu) {
+                cf.merge(f);
+            }
+        }
+        if cf.is_empty() {
+            Ok(())
+        } else {
+            Err(cf)
+        }
+    }
 }
 
 impl Ffn {
@@ -409,6 +732,28 @@ impl Ffn {
         match self {
             Ffn::Dense(d) => d.free_gpu(gpu),
             Ffn::Moe(m) => m.free_gpu(gpu),
+        }
+    }
+
+    /// Checked teardown: see [`DenseFfn::free_checked`].
+    pub fn free_checked(self, gpu: &mut Gpu) -> Result<(), GpuCleanupFailure> {
+        let mut cf = GpuCleanupFailure::empty();
+        match self {
+            Ffn::Dense(d) => {
+                if let Err(f) = d.free_checked(gpu) {
+                    cf.merge(f);
+                }
+            }
+            Ffn::Moe(m) => {
+                if let Err(f) = m.free_checked(gpu) {
+                    cf.merge(f);
+                }
+            }
+        }
+        if cf.is_empty() {
+            Ok(())
+        } else {
+            Err(cf)
         }
     }
 }
@@ -431,6 +776,42 @@ impl Cohere2MoeLayerWeights {
         wo.free_all(gpu);
         ffn.free_gpu(gpu);
     }
+
+    /// Checked teardown: see [`DenseFfn::free_checked`].
+    pub fn free_checked(self, gpu: &mut Gpu) -> Result<(), GpuCleanupFailure> {
+        let Cohere2MoeLayerWeights {
+            input_norm,
+            wq,
+            wk,
+            wv,
+            wo,
+            ffn,
+            attn_kind: _,
+        } = self;
+        let mut failures: Vec<RetainedGpuTensor> = Vec::new();
+        free_tensor_retained(
+            "Cohere2MoeLayerWeights.input_norm",
+            input_norm,
+            gpu,
+            &mut failures,
+        );
+        free_weight_all_checked("Cohere2MoeLayerWeights.wq", wq, gpu, &mut failures);
+        free_weight_all_checked("Cohere2MoeLayerWeights.wk", wk, gpu, &mut failures);
+        free_weight_all_checked("Cohere2MoeLayerWeights.wv", wv, gpu, &mut failures);
+        free_weight_all_checked("Cohere2MoeLayerWeights.wo", wo, gpu, &mut failures);
+        let mut cf = GpuCleanupFailure::empty();
+        for r in failures {
+            cf.add_retained(r);
+        }
+        if let Err(f) = ffn.free_checked(gpu) {
+            cf.merge(f);
+        }
+        if cf.is_empty() {
+            Ok(())
+        } else {
+            Err(cf)
+        }
+    }
 }
 
 impl Cohere2MoeWeights {
@@ -441,12 +822,52 @@ impl Cohere2MoeWeights {
             final_norm,
             lm_head,
             layers,
+            ..
         } = self;
         let _ = gpu.free_tensor(embed);
         let _ = gpu.free_tensor(final_norm);
         lm_head.free_all(gpu);
         for layer in layers {
             layer.free_gpu(gpu);
+        }
+    }
+
+    /// Checked teardown: every GPU owner (embed, final_norm, lm_head, and
+    /// every per-layer tensor) is freed with a checked free; owners that
+    /// survive are carried in the returned [`GpuCleanupFailure`] for
+    /// exact-retention retry. `lm_head` is a separately-uploaded tied copy
+    /// (not a buffer alias), so its buf is owned and freed here.
+    pub fn free_checked(self, gpu: &mut Gpu) -> Result<(), GpuCleanupFailure> {
+        let Cohere2MoeWeights {
+            embed,
+            embed_dtype: _,
+            final_norm,
+            lm_head,
+            layers,
+            ..
+        } = self;
+        let mut failures: Vec<RetainedGpuTensor> = Vec::new();
+        free_tensor_retained("Cohere2MoeWeights.embed", embed, gpu, &mut failures);
+        free_tensor_retained(
+            "Cohere2MoeWeights.final_norm",
+            final_norm,
+            gpu,
+            &mut failures,
+        );
+        free_weight_all_checked("Cohere2MoeWeights.lm_head", lm_head, gpu, &mut failures);
+        let mut cf = GpuCleanupFailure::empty();
+        for r in failures {
+            cf.add_retained(r);
+        }
+        for layer in layers {
+            if let Err(f) = layer.free_checked(gpu) {
+                cf.merge(f);
+            }
+        }
+        if cf.is_empty() {
+            Ok(())
+        } else {
+            Err(cf)
         }
     }
 }
@@ -549,7 +970,7 @@ impl Cohere2MoeState {
             logits,
             flash_partials,
         } = self;
-        kv.free_gpu(gpu);
+        let _ = kv.free_gpu(gpu);
         let _ = gpu.hip.free(pos_buf);
         for t in [
             h,
@@ -577,6 +998,133 @@ impl Cohere2MoeState {
             flash_partials,
         ] {
             let _ = gpu.free_tensor(t);
+        }
+    }
+
+    /// Checked teardown: every GPU owner (KV cache, `pos_buf`, and all
+    /// scratch tensors) is freed with a checked free; owners that survive
+    /// are carried in the returned [`GpuCleanupFailure`] for exact-retention
+    /// retry. `pos_buf` is a raw [`hip_bridge::DeviceBuffer`]; it is
+    /// represented as a `GpuTensor` with `shape=[]` / `DType::Raw` — the
+    /// honest description of a bare 4-byte allocation, not a fabrication.
+    pub fn free_checked(self, gpu: &mut Gpu) -> Result<(), GpuCleanupFailure> {
+        let Cohere2MoeState {
+            kv,
+            pos_buf,
+            max_seq: _,
+            n_tokens: _,
+            h,
+            normed,
+            fa_q,
+            fa_k,
+            fa_v,
+            fa_attn_out,
+            dense_gate,
+            dense_up,
+            dense_act,
+            ffn_x_rot,
+            router_logits,
+            topk_indices,
+            topk_weights,
+            gate_batch,
+            up_batch,
+            rot_batch,
+            down_expanded,
+            expert_gate_up,
+            expert_act,
+            expert_down,
+            final_norm_buf,
+            logits,
+            flash_partials,
+        } = self;
+        let mut failures: Vec<RetainedGpuTensor> = Vec::new();
+        retain_kv_failures(kv.free_checked(gpu), &mut failures);
+        free_tensor_retained(
+            "Cohere2MoeState.pos_buf",
+            GpuTensor {
+                buf: pos_buf,
+                shape: vec![],
+                dtype: DType::Raw,
+            },
+            gpu,
+            &mut failures,
+        );
+        free_tensor_retained("Cohere2MoeState.h", h, gpu, &mut failures);
+        free_tensor_retained("Cohere2MoeState.normed", normed, gpu, &mut failures);
+        free_tensor_retained("Cohere2MoeState.fa_q", fa_q, gpu, &mut failures);
+        free_tensor_retained("Cohere2MoeState.fa_k", fa_k, gpu, &mut failures);
+        free_tensor_retained("Cohere2MoeState.fa_v", fa_v, gpu, &mut failures);
+        free_tensor_retained(
+            "Cohere2MoeState.fa_attn_out",
+            fa_attn_out,
+            gpu,
+            &mut failures,
+        );
+        free_tensor_retained("Cohere2MoeState.dense_gate", dense_gate, gpu, &mut failures);
+        free_tensor_retained("Cohere2MoeState.dense_up", dense_up, gpu, &mut failures);
+        free_tensor_retained("Cohere2MoeState.dense_act", dense_act, gpu, &mut failures);
+        free_tensor_retained("Cohere2MoeState.ffn_x_rot", ffn_x_rot, gpu, &mut failures);
+        free_tensor_retained(
+            "Cohere2MoeState.router_logits",
+            router_logits,
+            gpu,
+            &mut failures,
+        );
+        free_tensor_retained(
+            "Cohere2MoeState.topk_indices",
+            topk_indices,
+            gpu,
+            &mut failures,
+        );
+        free_tensor_retained(
+            "Cohere2MoeState.topk_weights",
+            topk_weights,
+            gpu,
+            &mut failures,
+        );
+        free_tensor_retained("Cohere2MoeState.gate_batch", gate_batch, gpu, &mut failures);
+        free_tensor_retained("Cohere2MoeState.up_batch", up_batch, gpu, &mut failures);
+        free_tensor_retained("Cohere2MoeState.rot_batch", rot_batch, gpu, &mut failures);
+        free_tensor_retained(
+            "Cohere2MoeState.down_expanded",
+            down_expanded,
+            gpu,
+            &mut failures,
+        );
+        free_tensor_retained(
+            "Cohere2MoeState.expert_gate_up",
+            expert_gate_up,
+            gpu,
+            &mut failures,
+        );
+        free_tensor_retained("Cohere2MoeState.expert_act", expert_act, gpu, &mut failures);
+        free_tensor_retained(
+            "Cohere2MoeState.expert_down",
+            expert_down,
+            gpu,
+            &mut failures,
+        );
+        free_tensor_retained(
+            "Cohere2MoeState.final_norm_buf",
+            final_norm_buf,
+            gpu,
+            &mut failures,
+        );
+        free_tensor_retained("Cohere2MoeState.logits", logits, gpu, &mut failures);
+        free_tensor_retained(
+            "Cohere2MoeState.flash_partials",
+            flash_partials,
+            gpu,
+            &mut failures,
+        );
+        let mut cf = GpuCleanupFailure::empty();
+        for r in failures {
+            cf.add_retained(r);
+        }
+        if cf.is_empty() {
+            Ok(())
+        } else {
+            Err(cf)
         }
     }
 

@@ -1,5 +1,12 @@
 # hipfire installer for Windows — detects GPU, installs deps, downloads binary + kernels.
-# Usage: irm https://raw.githubusercontent.com/Kaden-Schutt/hipfire/master/scripts/install.ps1 | iex
+# Usage: irm https://raw.githubusercontent.com/warpfront/hipfire/master/scripts/install.ps1 | iex
+param(
+    [string]$Ref,
+    [string]$Branch,
+    [string]$Tag,
+    [string]$Commit
+)
+
 $ErrorActionPreference = "Stop"
 
 # ─── Paths ───────────────────────────────────────────────
@@ -10,10 +17,91 @@ $ModelsDir   = "$HipfireDir\models"
 $SrcDir      = "$HipfireDir\src"
 
 # ─── Constants ───────────────────────────────────────────
-$GithubRepo   = "Kaden-Schutt/hipfire"
-$GithubBranch = "master"
+$GithubRepo = "warpfront/hipfire"
+$InstallRef = if ($env:HIPFIRE_INSTALL_REF) { $env:HIPFIRE_INSTALL_REF } else { "master" }
+$InstallRefKind = if ($env:HIPFIRE_INSTALL_REF) { "auto" } else { "branch" }
+$Selectors = @(
+    if ($PSBoundParameters.ContainsKey("Ref")) { @{ Value = $Ref; Kind = "auto" } }
+    if ($PSBoundParameters.ContainsKey("Branch")) { @{ Value = $Branch; Kind = "branch" } }
+    if ($PSBoundParameters.ContainsKey("Tag")) { @{ Value = $Tag; Kind = "tag" } }
+    if ($PSBoundParameters.ContainsKey("Commit")) { @{ Value = $Commit; Kind = "commit" } }
+)
+if ($Selectors.Count -gt 1) {
+    throw "Choose only one -Ref, -Branch, -Tag, or -Commit."
+}
+if ($Selectors.Count -eq 1) {
+    $InstallRef = [string]$Selectors[0].Value
+    $InstallRefKind = [string]$Selectors[0].Kind
+}
+$InstallRef = $InstallRef.Trim().TrimStart("@")
+if ($InstallRef.StartsWith("refs/heads/")) {
+    $InstallRef = $InstallRef.Substring(11)
+    $InstallRefKind = "branch"
+} elseif ($InstallRef.StartsWith("refs/tags/")) {
+    $InstallRef = $InstallRef.Substring(10)
+    $InstallRefKind = "tag"
+} elseif ($InstallRef.StartsWith("origin/")) {
+    $InstallRef = $InstallRef.Substring(7)
+    if ($InstallRefKind -eq "auto") { $InstallRefKind = "branch" }
+}
+if (
+    [string]::IsNullOrWhiteSpace($InstallRef) -or
+    $InstallRef -match '^[./-]|[./]$|\.\.|@\{|//|[\s\\:\?\*\[\]\^~]'
+) {
+    throw "Unsafe or invalid git revision '$InstallRef'."
+}
+if ($InstallRefKind -eq "commit" -and $InstallRef -notmatch '^[0-9a-fA-F]{7,40}$') {
+    throw "-Commit requires a 7-40 character hexadecimal git commit."
+}
+
+function Test-RemoteRef([string]$Repo, [string]$RemoteRef) {
+    & git -C $Repo ls-remote --exit-code origin $RemoteRef 2>&1 | Out-Null
+    return $LASTEXITCODE -eq 0
+}
+
+function Checkout-InstallRef([string]$Repo) {
+    $kind = $script:InstallRefKind
+    if ($kind -eq "auto") {
+        if (Test-RemoteRef $Repo "refs/heads/$script:InstallRef") {
+            $kind = "branch"
+        } elseif (Test-RemoteRef $Repo "refs/tags/$script:InstallRef") {
+            $kind = "tag"
+        } else {
+            $kind = "commit"
+        }
+    }
+    switch ($kind) {
+        "branch" {
+            if (-not (Test-RemoteRef $Repo "refs/heads/$script:InstallRef")) {
+                throw "Origin has no branch '$script:InstallRef'."
+            }
+            & git -C $Repo fetch --depth 1 origin "+refs/heads/$script:InstallRef`:refs/remotes/origin/$script:InstallRef"
+            if ($LASTEXITCODE -ne 0) { throw "git fetch branch failed." }
+            & git -C $Repo checkout -B $script:InstallRef "refs/remotes/origin/$script:InstallRef"
+            if ($LASTEXITCODE -ne 0) { throw "git checkout branch failed." }
+        }
+        "tag" {
+            if (-not (Test-RemoteRef $Repo "refs/tags/$script:InstallRef")) {
+                throw "Origin has no tag '$script:InstallRef'."
+            }
+            & git -C $Repo fetch --depth 1 origin "refs/tags/$script:InstallRef"
+            if ($LASTEXITCODE -ne 0) { throw "git fetch tag failed." }
+            & git -C $Repo checkout --detach "FETCH_HEAD^{commit}"
+            if ($LASTEXITCODE -ne 0) { throw "git checkout tag failed." }
+        }
+        "commit" {
+            & git -C $Repo fetch --depth 1 origin $script:InstallRef
+            if ($LASTEXITCODE -ne 0) { throw "git fetch commit failed." }
+            & git -C $Repo checkout --detach "FETCH_HEAD^{commit}"
+            if ($LASTEXITCODE -ne 0) { throw "git checkout commit failed." }
+        }
+        default { throw "Unsupported revision kind '$kind'." }
+    }
+    $script:InstallRefKind = $kind
+}
 
 Write-Host "=== hipfire installer ===" -ForegroundColor Cyan
+Write-Host "Requested source: $InstallRefKind '$InstallRef'"
 Write-Host ""
 
 # ─── GPU Detection ───────────────────────────────────────
@@ -189,32 +277,6 @@ if ($HipDllFound -and $GpuArch -ne "unknown") {
     }
 }
 
-# ─── Bun (CLI runtime) ───────────────────────────────────
-Write-Host ""
-Write-Host "Checking Bun..." -ForegroundColor Cyan
-
-$BunBin = "$env:USERPROFILE\.bun\bin"
-if (Get-Command bun -ErrorAction SilentlyContinue) {
-    Write-Host "  Bun: found ✓" -ForegroundColor Green
-} else {
-    Write-Host "  Bun not found. Installing..." -ForegroundColor Yellow
-    try {
-        powershell -c "irm bun.sh/install.ps1 | iex"
-        # Add bun to PATH for remainder of this session
-        $env:PATH = "$BunBin;$env:PATH"
-        if (Get-Command bun -ErrorAction SilentlyContinue) {
-            Write-Host "  Bun installed ✓" -ForegroundColor Green
-        } else {
-            Write-Host "  Bun installed but not in PATH. Add manually:" -ForegroundColor Yellow
-            Write-Host "    $BunBin"
-        }
-    } catch {
-        Write-Host "  Bun install failed: $_" -ForegroundColor Red
-        Write-Host "  Visit https://bun.sh and install manually, then re-run."
-        exit 1
-    }
-}
-
 # ─── Clone / update repo ─────────────────────────────────
 Write-Host ""
 Write-Host "Setting up hipfire source..." -ForegroundColor Cyan
@@ -229,41 +291,59 @@ if (-not (Test-Path "$SrcDir\.git")) {
         Write-Host "  ERROR: git is required. Install from https://git-scm.com and re-run." -ForegroundColor Red
         exit 1
     }
-    Write-Host "  Cloning https://github.com/$GithubRepo.git ..."
+    Write-Host "  Initializing https://github.com/$GithubRepo.git ..."
     try {
-        git clone --depth 1 --branch $GithubBranch "https://github.com/$GithubRepo.git" $SrcDir
-        Write-Host "  Cloned ✓" -ForegroundColor Green
+        if ((Test-Path $SrcDir) -and (Get-ChildItem $SrcDir -Force -ErrorAction SilentlyContinue | Select-Object -First 1)) {
+            throw "$SrcDir exists but is not a git checkout; move it aside and retry."
+        }
+        New-Item -ItemType Directory -Force -Path $SrcDir | Out-Null
+        & git -C $SrcDir init --quiet
+        if ($LASTEXITCODE -ne 0) { throw "git init failed." }
+        & git -C $SrcDir remote add origin "https://github.com/$GithubRepo.git"
+        if ($LASTEXITCODE -ne 0) { throw "git remote add failed." }
+        Checkout-InstallRef $SrcDir
+        Write-Host "  Checked out $InstallRefKind '$InstallRef' ✓" -ForegroundColor Green
         $SourceUpdated = $true
     } catch {
-        Write-Host "  Clone failed: $_" -ForegroundColor Red
-        Write-Host "  Try manually: git clone https://github.com/$GithubRepo.git $SrcDir"
+        Write-Host "  Checkout failed: $_" -ForegroundColor Red
         exit 1
     }
 } else {
     Write-Host "  Existing clone found at $SrcDir"
+    $PreviousCommit = (& git -C $SrcDir rev-parse --verify HEAD 2>$null | Out-String).Trim()
+    if ($PreviousCommit) {
+        $stamp = [DateTime]::UtcNow.ToString("yyyy-MM-ddTHH-mm-ssZ")
+        $shortCommit = $PreviousCommit.Substring(0, [Math]::Min(12, $PreviousCommit.Length))
+        $backupRef = "refs/hipfire/backups/pre-install-$stamp-$shortCommit"
+        & git -C $SrcDir update-ref $backupRef $PreviousCommit
+        if ($LASTEXITCODE -eq 0) {
+            Write-Host "  Previous source retained at $backupRef" -ForegroundColor Yellow
+        }
+    }
     $status = & git -C $SrcDir status --porcelain 2>&1 | Out-String
+    $ProceedWithUpdate = $true
     if ($status.Trim()) {
         Write-Host "  WARNING: local modifications detected." -ForegroundColor Yellow
-        $reply = Read-Host "  Overwrite local changes and update? [y/N]"
+        $reply = Read-Host "  Stash local changes and update? [y/N]"
         if ($reply -match "^[Yy]$") {
-            try {
-                & git -C $SrcDir fetch origin $GithubBranch --depth 1 2>&1 | Out-Null
-                & git -C $SrcDir reset --hard "origin/$GithubBranch" 2>&1 | Out-Null
-                Write-Host "  Updated ✓" -ForegroundColor Green
-                $SourceUpdated = $true
-            } catch {
-                Write-Host "  Update failed (non-fatal)." -ForegroundColor Yellow
+            $stamp = [DateTime]::UtcNow.ToString("yyyy-MM-ddTHH-mm-ssZ")
+            $stashMessage = "hipfire-install-$stamp"
+            & git -C $SrcDir stash push --include-untracked -m $stashMessage
+            if ($LASTEXITCODE -ne 0) {
+                throw "git stash failed; source checkout was not changed."
             }
+            Write-Host "  Recover later with: git -C $SrcDir stash pop" -ForegroundColor Yellow
         } else {
             Write-Host "  Keeping existing checkout." -ForegroundColor Yellow
+            $ProceedWithUpdate = $false
         }
-    } else {
-        Write-Host "  Updating..."
+    }
+    if ($ProceedWithUpdate) {
+        Write-Host "  Updating to $InstallRefKind '$InstallRef'..."
         try {
             $env:GIT_TERMINAL_PROMPT = "0"
-            & git -C $SrcDir fetch origin $GithubBranch --depth 1 2>&1 | Out-Null
-            & git -C $SrcDir reset --hard "origin/$GithubBranch" 2>&1 | Out-Null
-            Write-Host "  Updated ✓" -ForegroundColor Green
+            Checkout-InstallRef $SrcDir
+            Write-Host "  Checked out $InstallRefKind '$InstallRef' ✓" -ForegroundColor Green
             $SourceUpdated = $true
         } catch {
             Write-Host "  Update failed (non-fatal). Using existing checkout." -ForegroundColor Yellow
@@ -272,6 +352,13 @@ if (-not (Test-Path "$SrcDir\.git")) {
 }
 
 $RepoDir = $SrcDir
+$ResolvedCommit = (& git -C $RepoDir rev-parse --verify HEAD 2>$null | Out-String).Trim()
+$ResolvedRef = (& git -C $RepoDir describe --tags --exact-match HEAD 2>$null | Out-String).Trim()
+if (-not $ResolvedRef) {
+    $ResolvedRef = (& git -C $RepoDir symbolic-ref --short HEAD 2>$null | Out-String).Trim()
+}
+if (-not $ResolvedRef) { $ResolvedRef = "detached" }
+Write-Host "Source resolved: $ResolvedRef @ $ResolvedCommit" -ForegroundColor Green
 
 # ─── Build / install binaries ────────────────────────────
 Write-Host ""
@@ -391,6 +478,7 @@ if ($PreBuilt -and $PreBuilt -ne "$BinDir\daemon.exe") {
     Push-Location $RepoDir
     try {
         cargo build --release --features deltanet --example daemon --example infer --example infer_hfq -p hipfire-runtime
+        cargo build --release -p hipfire-cli
         # OPTIONAL build (terminal UI). Must NOT abort the install if it fails:
         # the mandatory daemon/CLI are installed regardless. Under PowerShell 7
         # `$PSNativeCommandUseErrorActionPreference` a native non-zero exit from
@@ -435,6 +523,40 @@ if ($PreBuilt -and $PreBuilt -ne "$BinDir\daemon.exe") {
     Write-Host "  Build complete ✓" -ForegroundColor Green
 }
 
+# The release API currently distributes the daemon independently. The control
+# plane is always built from the checked-out source so its config and registry
+# schemas cannot drift from the installed daemon.
+if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
+    Write-Host "  Installing Rust via rustup for the native CLI..." -ForegroundColor Yellow
+    $RustupUrl  = "https://win.rustup.rs/x86_64"
+    $RustupExe  = "$env:TEMP\rustup-init.exe"
+    Invoke-WebRequest -Uri $RustupUrl -OutFile $RustupExe -UseBasicParsing
+    & $RustupExe -y --default-toolchain stable
+    $env:PATH = "$env:USERPROFILE\.cargo\bin;$env:PATH"
+}
+# Cargo may have been installed after the initial target-directory probe, and
+# CARGO_TARGET_DIR/workspace overrides must also apply when the daemon came
+# from a prebuilt release asset.
+try {
+    $Meta = cargo metadata --format-version 1 --manifest-path "$RepoDir\Cargo.toml" 2>$null | ConvertFrom-Json
+    if ($Meta.target_directory) { $TargetDir = $Meta.target_directory }
+} catch {}
+$CliExe = "$TargetDir\release\hipfire.exe"
+if (-not (Test-Path $CliExe) -or $SourceUpdated) {
+    Push-Location $RepoDir
+    try {
+        cargo build --release -p hipfire-cli
+        if ($LASTEXITCODE -ne 0) { throw "native CLI build failed" }
+    } finally {
+        Pop-Location
+    }
+}
+if (-not (Test-Path $CliExe)) {
+    Write-Host "  Native CLI binary not found at $CliExe" -ForegroundColor Red
+    exit 1
+}
+Copy-Item $CliExe "$BinDir\hipfire.exe" -Force
+
 # Copy optional helper binaries if present
 foreach ($exe in @("infer.exe", "infer_hfq.exe")) {
     $src = "$TargetDir\release\examples\$exe"
@@ -463,48 +585,27 @@ if (Test-Path $TuiExe) {
     Write-Warning "hipfire-tui (terminal UI) was not built — it will be unavailable. To get it: install Rust, then ``cargo build --release -p hipfire-tui`` and re-run scripts\install.ps1 (copies it into ~/.hipfire/bin/)."
 }
 
-# ─── CLI ─────────────────────────────────────────────────
+# CPU quantizer (optional, but build it on demand so `hipfire quantize` works
+# without a second manual installation step).
+$QuantExe = "$TargetDir\release\hipfire-quantize.exe"
+if (-not (Test-Path $QuantExe) -and (Get-Command cargo -ErrorAction SilentlyContinue)) {
+    Push-Location $RepoDir
+    try { cargo build --release -p hipfire-quantize } catch {} finally { Pop-Location }
+}
+if (Test-Path $QuantExe) {
+    Copy-Item $QuantExe "$BinDir\hipfire-quantize.exe" -Force
+} else {
+    Write-Warning "hipfire-quantize was not built; the quantize subcommand will be unavailable."
+}
+
+# ─── Native CLI ──────────────────────────────────────────
 Write-Host ""
 Write-Host "Installing CLI..." -ForegroundColor Cyan
-
-$CliDir = "$HipfireDir\cli"
-New-Item -ItemType Directory -Force -Path $CliDir | Out-Null
-# Recursive copy of the whole cli\ directory, then prune dev/test artifacts.
-# New .ts files added to cli\ (next chat helper, future slash-command module)
-# are picked up automatically — no install-script edit required. Replaces
-# the previous per-file enumeration that grew stale after PR #129 added
-# chat.ts/chat_pure.ts (issue #163, patched in #165; this is the structural
-# follow-up that PR left for later).
-if (-not (Test-Path "$RepoDir\cli\registry.json") -or -not (Test-Path "$RepoDir\cli\index.ts")) {
-    Write-Host "ERROR: cli\registry.json or cli\index.ts missing in $RepoDir" -ForegroundColor Red
-    Write-Host "       Repo checkout may be incomplete; aborting install." -ForegroundColor Red
-    exit 1
-}
-# Robocopy mirrors better than Copy-Item -Recurse for this case (handles
-# permissions, exit-code semantics, and is on every Windows installation),
-# but Copy-Item is more portable across PowerShell core / Windows PS / pwsh
-# on macOS-via-PS-remoting; sticking with Copy-Item for parity with the rest
-# of the script.
-Copy-Item "$RepoDir\cli\*" $CliDir -Recurse -Force
-# Prune dev artifacts. Patterns mirror install.sh — tests follow
-# `*.test.ts` / `test_*.ts` / `bench_*.ts` Bun conventions; node_modules
-# and dotfiles are dev-only. Adding a new test file with the same naming
-# requires no install-script change.
-$prunePaths = @("node_modules", ".gitignore", "tsconfig.json", "README.md", "bun.lock")
-foreach ($p in $prunePaths) {
-    $target = Join-Path $CliDir $p
-    if (Test-Path $target) { Remove-Item $target -Recurse -Force -ErrorAction SilentlyContinue }
-}
-Get-ChildItem -Path $CliDir -File | Where-Object {
-    $_.Name -like "*.test.ts" -or $_.Name -like "test_*.ts" -or $_.Name -like "bench_*.ts"
-} | Remove-Item -Force -ErrorAction SilentlyContinue
-
-# Create hipfire.cmd wrapper
-$CmdWrapper = "@echo off`r`nbun run `"%USERPROFILE%\.hipfire\cli\index.ts`" %*`r`n"
-[System.IO.File]::WriteAllText("$BinDir\hipfire.cmd", $CmdWrapper)
-
-Write-Host "  CLI installed to $CliDir ✓" -ForegroundColor Green
-Write-Host "  Wrapper: $BinDir\hipfire.cmd ✓" -ForegroundColor Green
+$LegacyCliDir = "$HipfireDir\cli"
+if (Test-Path $LegacyCliDir) { Remove-Item $LegacyCliDir -Recurse -Force }
+$LegacyWrapper = "$BinDir\hipfire.cmd"
+if (Test-Path $LegacyWrapper) { Remove-Item $LegacyWrapper -Force }
+Write-Host "  Native CLI: $BinDir\hipfire.exe ✓" -ForegroundColor Green
 
 # ─── Kernels ─────────────────────────────────────────────
 # kernels/compiled/<arch>/ is gitignored, so a fresh git clone never ships
@@ -575,15 +676,10 @@ if (Test-Path $DaemonExe) {
 }
 
 # ─── Config ──────────────────────────────────────────────
-$ConfigFile = "$HipfireDir\config.json"
-if (-not (Test-Path $ConfigFile)) {
-    $Config = [ordered]@{
-        temperature = 0.3
-        top_p       = 0.8
-        max_tokens  = 512
-        gpu_arch    = $GpuArch
-    } | ConvertTo-Json
-    [System.IO.File]::WriteAllText($ConfigFile, $Config)
+$ConfigFile = "$HipfireDir\config.toml"
+$LegacyConfigFile = "$HipfireDir\config.json"
+if (-not (Test-Path $ConfigFile) -and -not (Test-Path $LegacyConfigFile)) {
+    [System.IO.File]::WriteAllText($ConfigFile, "schema_version = 1`n")
     Write-Host ""
     Write-Host "Config written: $ConfigFile" -ForegroundColor Green
 }
@@ -623,11 +719,16 @@ if ($NoPath) {
 # ─── Quick start ─────────────────────────────────────────
 Write-Host ""
 Write-Host "=== hipfire installed ===" -ForegroundColor Cyan
+if (Test-Path "$BinDir\hipfire.exe") {
+    & "$BinDir\hipfire.exe" --version
+    Write-Host "  source: $ResolvedRef @ $ResolvedCommit" -ForegroundColor Green
+}
 Write-Host ""
 Write-Host "Quick start:" -ForegroundColor Green
 Write-Host "  hipfire list                        # see local models"
 Write-Host "  hipfire run <model.hfq> `"Hello`"    # generate text"
 Write-Host "  hipfire serve                       # start OpenAI-compatible API"
+Write-Host "  hipfire version                     # verify binary/source identity"
 Write-Host ""
 Write-Host "Models go in $ModelsDir"
 Write-Host ""

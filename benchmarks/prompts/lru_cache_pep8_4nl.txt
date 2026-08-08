@@ -1,0 +1,28 @@
+class LRUCache:
+    def __init__(self, capacity: int):
+        self.capacity = capacity
+        self.cache = {}
+        self.head = ListNode(0, 0)
+        self.tail = ListNode(0, 0)
+        self.head.next = self.tail
+        self.tail.prev = self.head
+
+
+
+    def _remove(self, node: ListNode) -> None:
+        prev_node = node.prev
+        next_node = node.next
+        prev_node.next = next_node
+        next_node.prev = prev_node
+
+
+
+    def _add_to_front(self, node: ListNode) -> None:
+        node.next = self.head.next
+        node.prev = self.head
+        self.head.next.prev = node
+        self.head.next = node
+
+
+
+    def get(self, key: int) -> int:

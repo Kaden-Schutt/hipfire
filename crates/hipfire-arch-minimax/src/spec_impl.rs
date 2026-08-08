@@ -20,6 +20,7 @@
 //! verify kernel is an explicit follow-up.
 
 use crate::minimax::{MiniMaxConfig, MiniMaxState, MiniMaxWeights};
+use hipfire_runtime::gpu_cleanup::{BundleTeardown, GpuCleanupFailure};
 use hipfire_runtime::spec::{SpecAdvance, SpecScratch, SpecTarget};
 use rdna_compute::Gpu;
 
@@ -31,6 +32,35 @@ pub struct MiniMaxBundle {
     pub weights: MiniMaxWeights,
     pub state: MiniMaxState,
     pub eos_tok: u32,
+}
+
+impl BundleTeardown for MiniMaxBundle {
+    /// Exact-retention checked bundle teardown. Every GPU owner is freed with
+    /// CHECKED frees (weights → [`MiniMaxWeights::free_checked`], state →
+    /// [`MiniMaxState::free_checked`]); on success all resources are consumed
+    /// (`Ok(())`), on failure the returned [`GpuCleanupFailure`] carries every
+    /// owner that could not be freed for exact-retention retry. Config and
+    /// `eos_tok` are pure CPU state — nothing to free.
+    fn free_checked(self, gpu: &mut Gpu) -> Result<(), GpuCleanupFailure> {
+        let MiniMaxBundle {
+            config: _,
+            weights,
+            state,
+            eos_tok: _,
+        } = self;
+        let mut cf = GpuCleanupFailure::empty();
+        if let Err(f) = weights.free_checked(gpu) {
+            cf.merge(f);
+        }
+        if let Err(f) = state.free_checked(gpu) {
+            cf.merge(f);
+        }
+        if cf.is_empty() {
+            Ok(())
+        } else {
+            Err(cf)
+        }
+    }
 }
 
 /// MiniMax verify scratch: nothing persistent. Pure attention → no recurrent
@@ -50,11 +80,12 @@ impl SpecTarget for MiniMaxBundle {
         self
     }
 
-    fn reset_recurrent(&mut self, _gpu: &mut Gpu) {
+    fn reset_recurrent(&mut self, _gpu: &mut Gpu) -> Result<(), String> {
         // Pure attention: no recurrent state to zero. Rewind the position cursor
         // so the next prefill writes from slot 0. Mirrors the daemon's
         // arch_id=10 reset handler.
         self.state.reset();
+        Ok(())
     }
 
     fn new_spec_scratch(
@@ -74,16 +105,14 @@ impl SpecTarget for MiniMaxBundle {
         abort: &dyn Fn() -> bool,
         _hidden_out: Option<&mut Vec<f32>>,
     ) -> Result<SpecAdvance, String> {
-        // Pure attention: "reset" rewinds the position cursor; the per-token
-        // prefill then overwrites KV at the absolute positions it writes.
         if reset {
-            self.state.reset();
+            self.reset_recurrent(gpu)
+                .map_err(|e| format!("minimax spec_advance reset: {e}"))?;
         }
         self.state.n_tokens = start_pos;
         let mut last_logits: Vec<f32> = Vec::new();
         for &tok in tokens {
             if abort() {
-                self.state.reset();
                 return Ok(SpecAdvance::Aborted);
             }
             let position = self.state.n_tokens as u32;
@@ -106,7 +135,10 @@ impl SpecTarget for MiniMaxBundle {
             .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
             .map(|(i, _)| i as u32)
             .unwrap_or(0);
-        Ok(SpecAdvance::Ready { last_argmax })
+        Ok(SpecAdvance::Ready {
+            last_argmax,
+            last_logits: Some(last_logits),
+        })
     }
 
     fn verify_block(

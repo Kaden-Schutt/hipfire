@@ -102,7 +102,13 @@ impl RcclComms {
     /// `ncclCommInitAll`. Each comm[i] binds to `device_ids[i]`.
     pub fn init_all(device_ids: &[i32]) -> RcclResult<Self> {
         let lib = unsafe {
-            let candidates = ["librccl.so", "librccl.so.1", "librccl.so.1.0"];
+            // Resolved ROCm roots first, bare sonames last, so RCCL is found on
+            // side-by-side and /opt/rocm/core-<ver> installs too.
+            let candidates = hipfire_config::rocm::library_candidates(&[
+                "librccl.so",
+                "librccl.so.1",
+                "librccl.so.1.0",
+            ]);
             let mut loaded = None;
             for name in &candidates {
                 if let Ok(l) = Library::new(name) {

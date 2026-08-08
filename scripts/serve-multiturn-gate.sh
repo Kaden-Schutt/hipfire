@@ -15,8 +15,9 @@
 # guard: if reset no-ops and state bleeds, request 2+ collapses into a
 # low-unique-token / high-max-frequency attractor and the gate hard-fails.
 #
-# Exit codes: 0 = all requests coherent; 1 = a request degraded (bleed/attractor);
-# 2 = infra error (build/lock/daemon panic/zero tokens); 3 = SKIPPED (no models).
+# Exit codes: 0 = all requests coherent; 1 = quality failure (degraded,
+# panic/error event, zero output, missing terminal frame, or daemon failure);
+# 2 = setup error (invalid config, build, or lock); 3 = SKIPPED (no models).
 #
 # Covers AR (always, small model) and DFlash (the catastrophic path, when a
 # 27B target + draft are present).
@@ -26,6 +27,65 @@ EXE="./target/release/examples/daemon"
 MODELS_DIR="${HIPFIRE_MODELS_DIR:-${HIPFIRE_DIR:-$HOME/.hipfire}/models}"
 OUT="${HIPFIRE_SERVE_GATE_OUT:-/tmp/serve-multiturn-$(date +%Y%m%d-%H%M%S).md}"
 LOCK_SCRIPT="./scripts/gpu-lock.sh"
+STALE_SOURCES=(
+    crates/hipfire-runtime/examples/daemon.rs
+    crates/hipfire-runtime/src/triattn.rs
+    crates/hipfire-runtime/src/cask.rs
+    crates/hipfire-runtime/src/dflash.rs
+    crates/hipfire-loader/src/lib.rs
+    crates/hipfire-loader/src/carriers.rs
+    crates/hipfire-loader/src/spec_build.rs
+    crates/hipfire-arch-qwen35/src/qwen35.rs
+    crates/hipfire-arch-qwen35/src/speculative.rs
+    crates/hipfire-arch-qwen35/src/dflash_spec.rs
+)
+
+validate_cask_budget() {
+    local value="$1"
+    if [ -n "$value" ] && [[ ! "$value" =~ ^[0-9]+$ ]]; then
+        echo "serve-multiturn-gate: HIPFIRE_SERVE_GATE_CASK_BUDGET must be an integer, got $value" >&2
+        return 2
+    fi
+    # Decimal-only input has already been checked above. Match all zero digits
+    # instead of shell arithmetic so leading zeros cannot imply octal or overflow.
+    if [[ "$value" =~ ^0+$ ]]; then
+        echo "serve-multiturn-gate: HIPFIRE_SERVE_GATE_CASK_BUDGET must be greater than zero" >&2
+        return 2
+    fi
+}
+
+run_self_check() {
+    local zero
+    if [ "${HIPFIRE_SERVE_GATE_SELF_CHECK_FORCE_FAIL:-}" = 1 ]; then
+        echo "serve-multiturn-gate: self-check forced failure" >&2
+        return 1
+    fi
+    for zero in 0 00 000; do
+        if validate_cask_budget "$zero" >/dev/null 2>&1; then
+            echo "serve-multiturn-gate: self-check accepted zero budget $zero" >&2
+            return 1
+        fi
+    done
+    validate_cask_budget 32
+    echo "serve-multiturn-gate: self-check PASS" >&2
+}
+
+if [ "${1:-}" = "--self-check" ]; then
+    run_self_check
+    exit $?
+fi
+
+# Opt-in only: without a sidecar, `build_session` emits the exact historical
+# load JSONL. A DFlash draft always requests plain TriAttention (`cask:false`)
+# because CASK m-folding plus DFlash is intentionally unsupported.
+if [ -n "${HIPFIRE_SERVE_GATE_CASK_SIDECAR:-}" ]; then
+    validate_cask_budget "${HIPFIRE_SERVE_GATE_CASK_BUDGET:-}" || exit $?
+    value="${HIPFIRE_SERVE_GATE_CASK_BETA:-}"
+    if [ -n "$value" ] && [[ ! "$value" =~ ^[0-9]+$ ]]; then
+        echo "serve-multiturn-gate: HIPFIRE_SERVE_GATE_CASK_BETA must be an integer, got $value" >&2
+        exit 2
+    fi
+fi
 
 # Distinct prompts — different topics so a bled recurrent state can't be
 # mistaken for legitimate continuation. Greedy (temp 0) for determinism.
@@ -38,9 +98,18 @@ PROMPTS=(
 MAX_TOKENS=80
 
 # ── Build daemon if stale ─────────────────────────────────────────────────
-if [ ! -x "$EXE" ] || \
-   [ crates/hipfire-runtime/examples/daemon.rs -nt "$EXE" ] || \
-   [ crates/hipfire-loader/src/lib.rs -nt "$EXE" ]; then
+stale=0
+if [ ! -x "$EXE" ]; then
+    stale=1
+else
+    for source in "${STALE_SOURCES[@]}"; do
+        if [ "$source" -nt "$EXE" ]; then
+            stale=1
+            break
+        fi
+    done
+fi
+if [ "$stale" -ne 0 ]; then
     echo "serve-multiturn-gate: building daemon..." >&2
     cargo build --release --example daemon --features deltanet >&2 || { echo "build failed" >&2; exit 2; }
 fi
@@ -57,19 +126,22 @@ echo "# serve-multiturn gate — $(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$OUT"
 hard_fail=0
 ran_any=0
 
-# detect(out_file): per-request attractor detection over a daemon JSONL log.
+# detect(out_file, expected_request_ids...): per-request attractor detection
+# over a daemon JSONL log. A session is valid only after every submitted request
+# terminates with `done` and the daemon acknowledges `unloaded`.
 # Hard-fails (exit 1) if any request's visible text is an attractor:
 #   - unique word ratio < 0.30  (structural loop, e.g. "منذ منذ منذ…")
 #   - max single-word frequency > 0.50
 #   - a </think> with no opening <think> AND heavy repetition (the #462 signature)
 # Prints a per-request PASS/FAIL table to the report.
 detect() {
-    python3 - "$1" "$OUT" <<'PY'
+    python3 - "$1" "$OUT" "${@:2}" <<'PY'
 import sys, json, re
-out_file, report = sys.argv[1], sys.argv[2]
-reqs = {}      # id -> [token text...]
-order = []
+out_file, report, *expected = sys.argv[1:]
+reqs = {rid: [] for rid in expected}
+dones = {rid: [] for rid in expected}
 panic = False
+unloaded = False
 with open(out_file, errors="replace") as f:
     for line in f:
         line = line.strip()
@@ -85,15 +157,20 @@ with open(out_file, errors="replace") as f:
         t = m.get("type")
         if t == "token":
             rid = m.get("id", "?")
-            if rid not in reqs:
-                reqs[rid] = []; order.append(rid)
-            reqs[rid].append(m.get("text", ""))
+            if rid in reqs:
+                reqs[rid].append(m.get("text", ""))
+        elif t == "done":
+            rid = m.get("id", "?")
+            if rid in dones:
+                dones[rid].append(m)
         elif t == "error":
             panic = True
+        elif t == "unloaded":
+            unloaded = True
 
 rows = []
 failed = False
-for i, rid in enumerate(order, 1):
+for i, rid in enumerate(expected, 1):
     txt = "".join(reqs[rid])
     words = txt.split()
     n = len(words)
@@ -102,18 +179,23 @@ for i, rid in enumerate(order, 1):
     think_close = txt.count("</think>")
     think_open = txt.count("<think>")
     runaway_think = think_close > think_open and uniq < 0.4
-    bad = (n == 0) or (uniq < 0.30) or (maxf > 0.50) or runaway_think
+    terminal = len(dones[rid]) == 1
+    bad = (not terminal) or (n == 0) or (uniq < 0.30) or (maxf > 0.50) or runaway_think
     if bad:
         failed = True
-    rows.append((i, rid, n, uniq, maxf, "FAIL" if bad else "pass", repr(txt[:90])))
+    rows.append((i, rid, n, len(dones[rid]), uniq, maxf, "FAIL" if bad else "pass", repr(txt[:90])))
+if not unloaded:
+    failed = True
 
 with open(report, "a") as r:
-    r.write("\n| # | req | toks | uniq | maxfreq | status | sample |\n")
-    r.write("|---|-----|------|------|---------|--------|--------|\n")
-    for (i, rid, n, uniq, maxf, st, samp) in rows:
-        r.write(f"| {i} | {rid} | {n} | {uniq:.2f} | {maxf:.2f} | {st} | {samp} |\n")
+    r.write("\n| # | req | words | done | uniq | maxfreq | status | sample |\n")
+    r.write("|---|-----|-------|------|------|---------|--------|--------|\n")
+    for (i, rid, n, done, uniq, maxf, st, samp) in rows:
+        r.write(f"| {i} | {rid} | {n} | {done} | {uniq:.2f} | {maxf:.2f} | {st} | {samp} |\n")
     if panic:
         r.write("\n**HARD: daemon panic / error event**\n")
+    if not unloaded:
+        r.write("\n**HARD: daemon did not acknowledge unload**\n")
 
 sys.exit(1 if (failed or panic) else 0)
 PY
@@ -121,17 +203,21 @@ PY
 
 run_session() {
     local label="$1"; shift
-    local in_file out_file
+    local in_file out_file ec i
+    local expected_ids=()
     in_file="$(mktemp)"; out_file="$(mktemp)"
     printf '%s\n' "$@" > "$in_file"
     echo "== $label =="
     echo -e "\n## $label" >> "$OUT"
     timeout 900 "$EXE" < "$in_file" > "$out_file" 2>&1
-    local ec=$?
-    if [ "$ec" -ne 0 ] && [ "$ec" -ne 124 ]; then
+    ec=$?
+    if [ "$ec" -ne 0 ]; then
         echo "**HARD: daemon exit=$ec**" >> "$OUT"; hard_fail=1
     fi
-    detect "$out_file" || hard_fail=1
+    for ((i = 1; i <= ${#PROMPTS[@]}; i++)); do
+        expected_ids+=("r$i")
+    done
+    detect "$out_file" "${expected_ids[@]}" || hard_fail=1
     rm -f "$in_file" "$out_file"
 }
 
@@ -140,6 +226,13 @@ build_session() {
     local model="$1" draft="${2:-}"
     local params="\"max_seq\":2048"
     [ -n "$draft" ] && params="$params,\"draft\":\"$draft\""
+    if [ -n "${HIPFIRE_SERVE_GATE_CASK_SIDECAR:-}" ]; then
+        local sidecar_json budget beta
+        sidecar_json="$(python3 -c 'import json, sys; print(json.dumps(sys.argv[1]))' "$HIPFIRE_SERVE_GATE_CASK_SIDECAR")"
+        budget="${HIPFIRE_SERVE_GATE_CASK_BUDGET:-32}"
+        beta="${HIPFIRE_SERVE_GATE_CASK_BETA:-8}"
+        params="$params,\"cask_sidecar\":$sidecar_json,\"cask\":false,\"cask_budget\":$budget,\"cask_beta\":$beta"
+    fi
     printf '{"type":"load","model":"%s","params":{%s}}\n' "$model" "$params"
     local i=0
     for p in "${PROMPTS[@]}"; do

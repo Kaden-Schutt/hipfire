@@ -11,16 +11,22 @@ mod ffi;
 mod kernarg;
 mod rccl;
 mod rocblas;
+mod vmm;
 
 pub use error::{
     HipError, HipResult, HIP_ERROR_INVALID_IMAGE, HIP_ERROR_PEER_ACCESS_ALREADY_ENABLED,
     HIP_ERROR_PEER_ACCESS_NOT_ENABLED, HIP_ERROR_PEER_ACCESS_UNSUPPORTED,
 };
 pub use ffi::launch_counters;
-pub use ffi::{Event, Function, Graph, GraphExec, HipPointerAttribute, HipRuntime, Module, Stream};
+pub use ffi::{
+    Event, Function, Graph, GraphExec, HipMemAccessDesc, HipMemAllocationProp,
+    HipMemGenericAllocationHandle, HipMemLocation, HipPointerAttribute, HipRuntime, Module, Stream,
+    HIP_MEM_ALLOCATION_GRANULARITY_MINIMUM, HIP_MEM_ALLOCATION_GRANULARITY_RECOMMENDED,
+};
 pub use kernarg::KernargBlob;
 pub use rccl::{RcclComms, RcclDataType, RcclError, RcclRedOp, RcclResult, NCCL_SUCCESS};
 pub use rocblas::{Rocblas, RocblasDatatype, RocblasError, RocblasOperation, RocblasResult};
+pub use vmm::{clear_vmm_faults, inject_vmm_fault, VmmArena, VmmFaultKind};
 
 /// Re-export memory copy direction for callers.
 #[repr(u32)]
@@ -63,6 +69,14 @@ impl MemoryType {
 pub struct DeviceBuffer {
     ptr: *mut std::ffi::c_void,
     size: usize,
+    ownership: DeviceBufferOwnership,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DeviceBufferOwnership {
+    HipMalloc,
+    Vmm,
+    Borrowed,
 }
 
 impl DeviceBuffer {
@@ -74,6 +88,18 @@ impl DeviceBuffer {
         self.size
     }
 
+    pub fn is_hip_allocation(&self) -> bool {
+        self.ownership == DeviceBufferOwnership::HipMalloc
+    }
+
+    pub fn is_vmm_owner(&self) -> bool {
+        self.ownership == DeviceBufferOwnership::Vmm
+    }
+
+    pub fn is_borrowed(&self) -> bool {
+        self.ownership == DeviceBufferOwnership::Borrowed
+    }
+
     /// Create a non-owning DeviceBuffer from a raw pointer and size.
     /// The caller must ensure the pointer is valid GPU memory.
     /// The resulting buffer must NOT be freed (it doesn't own the memory).
@@ -83,7 +109,25 @@ impl DeviceBuffer {
     /// `ptr` must point to at least `size` bytes of valid GPU-accessible
     /// memory for the lifetime of the returned non-owning wrapper.
     pub unsafe fn from_raw(ptr: *mut std::ffi::c_void, size: usize) -> DeviceBuffer {
-        DeviceBuffer { ptr, size }
+        DeviceBuffer {
+            ptr,
+            size,
+            ownership: DeviceBufferOwnership::Borrowed,
+        }
+    }
+
+    /// Create the unique owner descriptor for a VMM arena base address.
+    ///
+    /// # Safety
+    ///
+    /// The caller must register exactly one such descriptor with the VMM owner
+    /// that will unmap and release it. Aliases must use `from_raw` or `alias`.
+    pub unsafe fn from_vmm_owner(ptr: *mut std::ffi::c_void, size: usize) -> DeviceBuffer {
+        DeviceBuffer {
+            ptr,
+            size,
+            ownership: DeviceBufferOwnership::Vmm,
+        }
     }
 
     /// Create a non-owning alias to the same GPU memory.
@@ -95,6 +139,7 @@ impl DeviceBuffer {
         DeviceBuffer {
             ptr: self.ptr,
             size: self.size,
+            ownership: DeviceBufferOwnership::Borrowed,
         }
     }
 }
@@ -102,3 +147,29 @@ impl DeviceBuffer {
 // DeviceBuffer is Send — GPU pointers can be sent between threads.
 // They are NOT Sync — concurrent access requires stream synchronization.
 unsafe impl Send for DeviceBuffer {}
+
+#[cfg(test)]
+mod device_buffer_tests {
+    use super::*;
+
+    #[test]
+    fn raw_and_alias_buffers_are_borrowed() {
+        let raw = unsafe { DeviceBuffer::from_raw(std::ptr::dangling_mut(), 4096) };
+        assert!(raw.is_borrowed());
+        assert!(!raw.is_hip_allocation());
+        assert!(!raw.is_vmm_owner());
+
+        let alias = unsafe { raw.alias() };
+        assert!(alias.is_borrowed());
+    }
+
+    #[test]
+    fn vmm_owner_marker_is_distinct_from_views() {
+        let owner = unsafe { DeviceBuffer::from_vmm_owner(std::ptr::dangling_mut(), 4096) };
+        assert!(owner.is_vmm_owner());
+        assert!(!owner.is_borrowed());
+        let view = unsafe { owner.alias() };
+        assert!(view.is_borrowed());
+        assert!(!view.is_vmm_owner());
+    }
+}

@@ -4,6 +4,12 @@
 
 //! MoE scatter, permute, combine, and unscatter dispatch methods.
 
+/// Scale exponent for the reproducible MoE down fixed-point scheme.
+/// Each 256-group FP partial is multiplied by `2^E` and rounded to i64
+/// before accumulation, making cross-group / cross-rank / cross-k_top sums
+/// integer (associative → partition-invariant under TP all-reduce).
+pub const MOE_DOWN_REPRO_E: i32 = 24;
+
 use std::ffi::c_void;
 
 use crate::dispatch::{Gpu, GpuTensor};
@@ -25,11 +31,25 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel(
-            "moe_down_combine_k8_batched",
-            kernels::MOE_DOWN_COMBINE_K8_BATCHED_SRC,
-            "moe_down_combine_k8_batched",
-        )?;
+        let use_vec4 = self.arch_caps.is_rdna3_dgpu()
+            && self.flags.moe_down_combine_vec4
+            && k_top == 8
+            && m.is_multiple_of(4);
+        let func_name = if use_vec4 {
+            self.ensure_kernel(
+                "moe_down_combine_k8_batched_vec4",
+                kernels::MOE_DOWN_COMBINE_K8_BATCHED_VEC4_SRC,
+                "moe_down_combine_k8_batched_vec4",
+            )?;
+            "moe_down_combine_k8_batched_vec4"
+        } else {
+            self.ensure_kernel(
+                "moe_down_combine_k8_batched",
+                kernels::MOE_DOWN_COMBINE_K8_BATCHED_SRC,
+                "moe_down_combine_k8_batched",
+            )?;
+            "moe_down_combine_k8_batched"
+        };
         let eop = expert_outputs.buf.as_ptr();
         let wp = topk_weights.buf.as_ptr();
         let xrp = x_residual.buf.as_ptr();
@@ -51,9 +71,10 @@ impl Gpu {
             bytes,
         );
         let block_m: u32 = 256;
-        let grid_x = (m as u32 + block_m - 1) / block_m;
+        let columns_per_thread = if use_vec4 { 4 } else { 1 };
+        let grid_x = (m as u32).div_ceil(block_m * columns_per_thread);
         let result = self.launch_maybe_blob(
-            "moe_down_combine_k8_batched",
+            func_name,
             [grid_x, batch_size as u32, 1],
             [block_m, 1, 1],
             0,
@@ -71,6 +92,87 @@ impl Gpu {
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
+        result
+    }
+
+    /// gfx1100 decode experiment: finish one atomic-free routed-MoE row and
+    /// immediately produce the following layer's RMS-normalized MQ rotation.
+    /// This replaces `moe_down_combine_k8_batched` plus
+    /// `fused_rmsnorm_mq_rotate_vecsum` while retaining the exact arithmetic
+    /// order of both kernels.
+    #[allow(clippy::too_many_arguments)]
+    pub fn moe_down_combine_rmsnorm_mq_rotate_vecsum_gfx1100(
+        &mut self,
+        expert_outputs: &GpuTensor,
+        topk_weights: &GpuTensor,
+        x_residual: &GpuTensor,
+        norm_weight: &GpuTensor,
+        x_rot: &GpuTensor,
+        m: usize,
+        k_top: usize,
+        eps: f32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_mq_signs()?;
+        let (module, src, kernel) = if self.arch_caps.is_gfx1151() {
+            (
+                "moe_down_combine_rmsnorm_mq_rotate_vecsum_gfx1151",
+                kernels::MOE_DOWN_COMBINE_RMSNORM_MQ_ROTATE_VECSUM_GFX1151_SRC,
+                "moe_down_combine_rmsnorm_mq_rotate_vecsum_gfx1151",
+            )
+        } else {
+            (
+                "moe_down_combine_rmsnorm_mq_rotate_vecsum_gfx1100",
+                kernels::MOE_DOWN_COMBINE_RMSNORM_MQ_ROTATE_VECSUM_GFX1100_SRC,
+                "moe_down_combine_rmsnorm_mq_rotate_vecsum",
+            )
+        };
+        self.ensure_kernel(module, src, kernel)?;
+
+        let eop = expert_outputs.buf.as_ptr();
+        let twp = topk_weights.buf.as_ptr();
+        let xrp = x_residual.buf.as_ptr();
+        let nwp = norm_weight.buf.as_ptr();
+        let s1p = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
+        let s2p = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
+        let xop = x_rot.buf.as_ptr();
+        let mv = m as i32;
+        let ktv = k_top as i32;
+        let epsv = eps;
+        let mut params: Vec<*mut c_void> = vec![
+            &eop as *const _ as *mut c_void,
+            &twp as *const _ as *mut c_void,
+            &xrp as *const _ as *mut c_void,
+            &nwp as *const _ as *mut c_void,
+            &s1p as *const _ as *mut c_void,
+            &s2p as *const _ as *mut c_void,
+            &xop as *const _ as *mut c_void,
+            &mv as *const _ as *mut c_void,
+            &ktv as *const _ as *mut c_void,
+            &epsv as *const _ as *mut c_void,
+        ];
+
+        let bytes = (k_top * m + k_top + 2 * m + m + 512 + m) * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "fused", kernel, bytes);
+        let result = self.launch_maybe_blob(kernel, [1, 1, 1], [256, 1, 1], 0, &mut params, || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(eop);
+            b.push_ptr(twp);
+            b.push_ptr(xrp);
+            b.push_ptr(nwp);
+            b.push_ptr(s1p);
+            b.push_ptr(s2p);
+            b.push_ptr(xop);
+            b.push_i32(mv);
+            b.push_i32(ktv);
+            b.push_f32(epsv);
+            b
+        });
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        self.scratch.invalidate_x_caches_for(xrp);
+        self.scratch.invalidate_x_caches_for(xop);
         result
     }
 
@@ -1002,5 +1104,372 @@ impl Gpu {
             &mut params,
             blob_builder,
         )
+    }
+    /// MQ2-Lloyd MoE down GEMV — reproducible int64 variant (single-token).
+    ///
+    /// Writes into `residual_i64` (raw `unsigned long long`, i.e. two's-complement
+    /// int64, S-scaled by `2^MOE_DOWN_REPRO_E = 2^24`).  The buffer must be
+    /// zero-initialised by the caller before the first expert launch.  After all
+    /// k_top expert launches, call `moe_i64_residual_to_f32` to get the f32 output.
+    ///
+    /// Partition invariant: launching with `K = K_full` gives the same `residual_i64`
+    /// as two launches with `K = K/2` slices (K must be 256-aligned per slice).
+    pub fn moe_down_mq2g256_lloyd_residual_i64_indexed(
+        &mut self,
+        expert_ptrs: &GpuTensor,  // [n_exp] device pointers
+        topk_indices: &GpuTensor, // [k_top] i32
+        topk_weights: &GpuTensor, // [k_top] f32
+        rot_batch: &GpuTensor,    // [k_top × K] f32, FWHT-rotated
+        residual_i64: &GpuTensor, // [M] raw (u64/i64 reinterpret), S-scaled
+        m: usize,
+        k: usize,
+        k_top: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemv_mq2g256_lloyd_moe_down_repro",
+            kernels::GEMV_MQ2G256_LLOYD_MOE_DOWN_REPRO_SRC,
+            "gemv_mq2g256_lloyd_moe_down_residual_i64_k8_indexed",
+        )?;
+        let pp = expert_ptrs.buf.as_ptr();
+        let ip = topk_indices.buf.as_ptr();
+        let wp = topk_weights.buf.as_ptr();
+        let rbp = rot_batch.buf.as_ptr();
+        let rip = residual_i64.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &pp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &rbp as *const _ as *mut c_void,
+            &rip as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+        ];
+        let mq2_weight_bytes = m * (k / 256) * 72;
+        let bytes = k_top * (mq2_weight_bytes + k * 4 + m * 8);
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "gemv",
+            "moe_down_mq2g256_lloyd_residual_i64_indexed",
+            bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "gemv_mq2g256_lloyd_moe_down_residual_i64_k8_indexed",
+            [m as u32, k_top as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(pp);
+                b.push_ptr(ip);
+                b.push_ptr(wp);
+                b.push_ptr(rbp);
+                b.push_ptr(rip);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// MQ2-Lloyd MoE down GEMV — reproducible int64 batched variant.
+    ///
+    /// Same partition invariance as the single-token variant but supports
+    /// N > 1 tokens (Grid: M × K_TOP × N).  `residual_i64` is [N × M].
+    #[allow(clippy::too_many_arguments)]
+    pub fn moe_down_mq2g256_lloyd_residual_i64_indexed_batched(
+        &mut self,
+        expert_ptrs: &GpuTensor,  // [n_exp] device pointers
+        topk_indices: &GpuTensor, // [N × k_top] i32
+        topk_weights: &GpuTensor, // [N × k_top] f32
+        rot_batch: &GpuTensor,    // [N × k_top × K] f32, FWHT-rotated
+        residual_i64: &GpuTensor, // [N × M] raw (u64/i64 reinterpret), S-scaled
+        m: usize,
+        k: usize,
+        k_top: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemv_mq2g256_lloyd_moe_down_repro_batched",
+            kernels::GEMV_MQ2G256_LLOYD_MOE_DOWN_INDEXED_BATCHED_K4_REPRO_SRC,
+            "gemv_mq2g256_lloyd_moe_down_residual_i64_k8_indexed_batched_k4",
+        )?;
+        let pp = expert_ptrs.buf.as_ptr();
+        let ip = topk_indices.buf.as_ptr();
+        let wp = topk_weights.buf.as_ptr();
+        let rbp = rot_batch.buf.as_ptr();
+        let rip = residual_i64.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let kt_val = k_top as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &pp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &rbp as *const _ as *mut c_void,
+            &rip as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+            &kt_val as *const _ as *mut c_void,
+        ];
+        let mq2_weight_bytes = m * (k / 256) * 72;
+        let bytes = batch_size * k_top * (mq2_weight_bytes + k * 4 + m * 8);
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "gemv",
+            "moe_down_mq2g256_lloyd_residual_i64_indexed_batched",
+            bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "gemv_mq2g256_lloyd_moe_down_residual_i64_k8_indexed_batched_k4",
+            [m as u32, k_top as u32, batch_size as u32],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(pp);
+                b.push_ptr(ip);
+                b.push_ptr(wp);
+                b.push_ptr(rbp);
+                b.push_ptr(rip);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(kt_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// MQ2-Lloyd MoE down expanded — reproducible int64 variant.
+    ///
+    /// Writes per-(token, krank) int64 S-scaled dot into `expert_outputs_i64`
+    /// [N × K_TOP × M].  No atomics — one writer per cell.  Partition-invariant
+    /// under K-split.  Pair with a weighted int64-aware combine step.
+    #[allow(clippy::too_many_arguments)]
+    pub fn moe_down_mq2g256_lloyd_expanded_i64(
+        &mut self,
+        expert_ptrs: &GpuTensor,        // [n_exp] device pointers
+        topk_indices: &GpuTensor,       // [N × k_top] i32
+        rot_batch: &GpuTensor,          // [N × k_top × K] f32, FWHT-rotated
+        expert_outputs_i64: &GpuTensor, // [N × k_top × M] raw (u64/i64), init=0 or overwrite
+        m: usize,
+        k: usize,
+        k_top: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemv_mq2g256_lloyd_moe_down_expanded_i64",
+            kernels::GEMV_MQ2G256_LLOYD_MOE_DOWN_EXPANDED_K4_REPRO_SRC,
+            "gemv_mq2g256_lloyd_moe_down_expanded_i64_k4",
+        )?;
+        let pp = expert_ptrs.buf.as_ptr();
+        let ip = topk_indices.buf.as_ptr();
+        let rbp = rot_batch.buf.as_ptr();
+        let eop = expert_outputs_i64.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let kt_val = k_top as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &pp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &rbp as *const _ as *mut c_void,
+            &eop as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+            &kt_val as *const _ as *mut c_void,
+        ];
+        let mq2_weight_bytes = m * (k / 256) * 72;
+        let bytes = batch_size * k_top * (mq2_weight_bytes + k * 4 + m * 8);
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "gemv",
+            "moe_down_mq2g256_lloyd_expanded_i64",
+            bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "gemv_mq2g256_lloyd_moe_down_expanded_i64_k4",
+            [m as u32, k_top as u32, batch_size as u32],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(pp);
+                b.push_ptr(ip);
+                b.push_ptr(rbp);
+                b.push_ptr(eop);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(kt_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// MQ3-Lloyd MoE down GEMV — reproducible int64 variant.
+    ///
+    /// Writes into `residual_i64` (raw `unsigned long long`, i.e. two's-complement
+    /// int64, S-scaled by `2^MOE_DOWN_REPRO_E = 2^24`).  The buffer must be
+    /// zero-initialised by the caller before the first expert launch.  After all
+    /// k_top expert launches, call `moe_i64_residual_to_f32` to get the f32 output.
+    ///
+    /// Partition invariant: launching with `K = K_full` gives the same `residual_i64`
+    /// as two launches with `K = K/2` slices (K must be 256-aligned per slice).
+    pub fn moe_down_mq3g256_lloyd_residual_i64_indexed(
+        &mut self,
+        expert_ptrs: &GpuTensor,  // [n_exp] device pointers
+        topk_indices: &GpuTensor, // [k_top] i32
+        topk_weights: &GpuTensor, // [k_top] f32
+        rot_batch: &GpuTensor,    // [k_top × K] f32, FWHT-rotated
+        residual_i64: &GpuTensor, // [M] raw (u64/i64 reinterpret), S-scaled
+        m: usize,
+        k: usize,
+        k_top: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemv_mq3g256_lloyd_moe_down_repro",
+            kernels::GEMV_MQ3G256_LLOYD_MOE_DOWN_REPRO_SRC,
+            "gemv_mq3g256_lloyd_moe_down_residual_i64_k8_indexed",
+        )?;
+        let pp = expert_ptrs.buf.as_ptr();
+        let ip = topk_indices.buf.as_ptr();
+        let wp = topk_weights.buf.as_ptr();
+        let rbp = rot_batch.buf.as_ptr();
+        let rip = residual_i64.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &pp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &rbp as *const _ as *mut c_void,
+            &rip as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+        ];
+        let mq3_weight_bytes = m * (k / 256) * 112;
+        let bytes = (k_top) * (mq3_weight_bytes + k * 4 + m * 8);
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "gemv",
+            "moe_down_mq3g256_lloyd_residual_i64_indexed",
+            bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "gemv_mq3g256_lloyd_moe_down_residual_i64_k8_indexed",
+            [m as u32, k_top as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(pp);
+                b.push_ptr(ip);
+                b.push_ptr(wp);
+                b.push_ptr(rbp);
+                b.push_ptr(rip);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// Convert an int64 S-scaled residual buffer to f32.
+    ///
+    /// `residual_i64` is raw (reinterpreted as `unsigned long long` on GPU but
+    /// semantically signed int64).  `out_f32` receives `(i64[i] as f64) / S`.
+    /// `n` = number of elements.
+    pub fn moe_i64_residual_to_f32(
+        &mut self,
+        residual_i64: &GpuTensor, // [n] raw (i64)
+        out_f32: &GpuTensor,      // [n] f32
+        n: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "moe_i64_residual_to_f32",
+            kernels::GEMV_MQ3G256_LLOYD_MOE_DOWN_REPRO_SRC,
+            "moe_i64_residual_to_f32",
+        )?;
+        let rip = residual_i64.buf.as_ptr();
+        let op = out_f32.buf.as_ptr();
+        let n_val = n as i32;
+        let inv_s = 1.0f32 / (1u32 << (MOE_DOWN_REPRO_E as u32)) as f32;
+        let mut params: Vec<*mut c_void> = vec![
+            &rip as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &n_val as *const _ as *mut c_void,
+            &inv_s as *const _ as *mut c_void,
+        ];
+        let result = self.launch_maybe_blob(
+            "moe_i64_residual_to_f32",
+            [(n as u32 + 255) / 256, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(rip);
+                b.push_ptr(op);
+                b.push_i32(n_val);
+                b.push_f32(inv_s);
+                b
+            },
+        );
+        result
+    }
+}
+
+#[cfg(test)]
+mod repro_scheme_tests {
+    const S: f64 = (1u64 << 24) as f64; // E=24
+    fn to_i64(x: f64) -> i64 {
+        (x * S).round() as i64
+    }
+    fn accf(groups: &[f64]) -> i64 {
+        groups.iter().map(|&g| to_i64(g)).sum()
+    } // group-wise round then int-sum
+    #[test]
+    fn split_equals_whole_bit_exact() {
+        // 6 group partials (as the kernel would produce them, bit-identical per group)
+        let g = [1.5f64, -0.25, 3.0, 7.125, -2.5, 0.0625];
+        let whole = accf(&g);
+        let half = accf(&g[0..3]) + accf(&g[3..6]); // TP-2 split + int all-reduce
+        assert_eq!(whole, half, "int64 group-sum must be partition-invariant");
+        // convert-after is identical
+        assert_eq!(whole as f64 / S, half as f64 / S);
+    }
+    #[test]
+    fn no_overflow_worst_case() {
+        // worst envelope: 1536 groups * |512| per group * S, well under i64::MAX
+        let worst = 1536i128 * (512.0 * S) as i128;
+        assert!(
+            worst < i64::MAX as i128,
+            "int64 must not overflow (got {worst})"
+        );
     }
 }

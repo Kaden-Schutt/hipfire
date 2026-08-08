@@ -130,15 +130,20 @@ pub fn run_layer_program_ep<B: ForwardBindings>(
             //    that path uses all_reduce_sum_f32_peer directly. Opt decode into
             //    peer-direct with HIPFIRE_EP_PEER_ALLREDUCE_DECODE=1 if needed.
             let refs: Vec<&DeviceBuffer> = partials.iter().map(|p| &p.buf).collect();
+            // All ranks participate in the decode all-reduce (same ownership as
+            // the per-rank partials below); the merged Gpus API takes the group
+            // explicitly.
+            let ranks: Vec<usize> = (0..n).collect();
             static PEER_DECODE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
             let use_peer = *PEER_DECODE.get_or_init(|| {
-                std::env::var("HIPFIRE_EP_PEER_ALLREDUCE_DECODE").as_deref() == Ok("1")
+                hipfire_config::developer_var("HIPFIRE_EP_PEER_ALLREDUCE_DECODE").as_deref()
+                    == Ok("1")
             });
             if use_peer {
-                gpus.all_reduce_sum_f32_peer(&refs, residual_dim)
+                gpus.all_reduce_sum_f32_peer(&ranks, &refs, residual_dim)
                     .map_err(hip_err)?;
             } else {
-                gpus.all_reduce_sum_f32(&refs, residual_dim)
+                gpus.all_reduce_sum_f32(&ranks, &refs, residual_dim)
                     .map_err(hip_err)?;
             }
 

@@ -93,10 +93,36 @@ fn run() -> Result<String, Outcome> {
     let out = gpu
         .download_f32(&d_out)
         .map_err(|e| Outcome::Fail(format!("download out failed: {e}")))?;
-    if !out[0].is_finite() {
+
+    // One-position causal attention has softmax weight 1, so every output
+    // dimension must match the dequantized V vector from the Q8 cache bytes.
+    // Checking only out[0] finiteness misses the Phase-B ownership bug where
+    // most dimensions never accumulate their V contribution.
+    let mut attn_max_err = 0.0f32;
+    let mut worst_dim = 0usize;
+    let mut worst_expected = 0.0f32;
+    let mut worst_actual = 0.0f32;
+    const ATTN_TOL: f32 = 1e-4;
+    for i in 0..head_dim {
+        let q8 = raw[2 + i] as i8;
+        let expected = scale * q8 as f32;
+        let actual = out[i];
+        if !actual.is_finite() {
+            return Err(Outcome::Fail(format!(
+                "attention output non-finite at dim {i}: expected={expected:.6} actual={actual}"
+            )));
+        }
+        let err = (actual - expected).abs();
+        if err > attn_max_err {
+            attn_max_err = err;
+            worst_dim = i;
+            worst_expected = expected;
+            worst_actual = actual;
+        }
+    }
+    if attn_max_err > ATTN_TOL {
         return Err(Outcome::Fail(format!(
-            "attention output is non-finite: {}",
-            out[0]
+            "attention dequant-V mismatch: dim={worst_dim} expected={worst_expected:.6} actual={worst_actual:.6} max_err={attn_max_err:.6} tol={ATTN_TOL}"
         )));
     }
 
@@ -113,7 +139,7 @@ fn run() -> Result<String, Outcome> {
         .map_err(|e| Outcome::Fail(format!("free out failed: {e}")))?;
 
     Ok(format!(
-        "max_roundtrip_err={max_err:.6} attention_out0={:.4}",
+        "max_roundtrip_err={max_err:.6} attention_max_err={attn_max_err:.6} attention_out0={:.4}",
         out[0]
     ))
 }

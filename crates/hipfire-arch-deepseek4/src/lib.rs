@@ -57,6 +57,7 @@ pub mod dsml;
 pub mod dspark_speculator;
 pub mod forward;
 pub mod grammar;
+pub(crate) mod moe_lower;
 pub mod mtp_speculator;
 pub mod sampling;
 pub mod spec_decode;

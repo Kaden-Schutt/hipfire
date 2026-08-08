@@ -10,15 +10,38 @@ description = "Qwen3.5 architecture (dense + MoE) for hipfire"
 # because qwen35 is a hybrid arch (DeltaNet + FullAttention layers).
 default = ["deltanet"]
 deltanet = ["hipfire-runtime/deltanet", "rdna-compute/deltanet"]
+# Expose the unchanged legacy forward sequence to focused Qwen3.5 tests only.
+# This is intentionally not part of the default feature set.
+test-utils = ["deltanet"]
+# Test-only emulated EP2 harness (STEP-002 Task 8): two logical expert
+# ownership partitions over ONE GPU, staged as rank-masked gate-up pointer
+# tables inside the existing single-owner Frozen resident.  Never enabled by
+# default; production Qwen35 EP remains Planned { owner: "AXIS-002" }.
+# Implies `deltanet`: the harness runs the Qwen35 hybrid forward path, and
+# the production wrapper must never compile it by accident.
+emulated-ep2-harness = ["deltanet"]
+# Propagates hipfire-runtime's test-only DFlash allocation fault injector.
+dflash-fault-inject = ["hipfire-runtime/dflash-fault-inject"]
+# Env-var-driven fault injection for the Frozen construction path
+# (HIPFIRE_FROZEN_FAIL_STAGE / HIPFIRE_FROZEN_FAIL_FREE). Test-only; the
+# stage injector compiles to a constant None in production builds and the
+# free injector is gated off entirely in rdna-compute.
+frozen-fault-inject = ["deltanet", "rdna-compute/frozen-fault-inject"]
 
 [dependencies]
+hipfire-config = { path = "../hipfire-config" }
 hipfire-runtime = { path = "../hipfire-runtime" }
 hipfire-dispatch = { path = "../hipfire-dispatch", features = ["from-hip-error"] }
+hipfire-hardware = { path = "../hipfire-hardware" }
 hip-bridge = { path = "../hip-bridge" }
 rdna-compute = { path = "../rdna-compute" }
 hipfire-reap = { path = "../hipfire-reap" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+[dev-dependencies]
+quote = "1"
+syn = { version = "2", features = ["full", "visit"] }
 
 [[example]]
 name = "test_qwen35_load_multi"
@@ -34,3 +57,13 @@ required-features = ["deltanet"]
 name = "mtp_head_smoke"
 path = "examples/mtp_head_smoke.rs"
 required-features = ["deltanet"]
+
+[[test]]
+name = "test_utils_compile"
+path = "tests/test_utils_compile.rs"
+required-features = ["test-utils"]
+
+[[test]]
+name = "delta_net_parity"
+path = "tests/delta_net_parity.rs"
+required-features = ["test-utils"]

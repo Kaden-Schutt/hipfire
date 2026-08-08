@@ -33,10 +33,21 @@
 use crate::cohere2moe::{Cohere2MoeState, Cohere2MoeWeights, Ffn};
 use crate::config::{AttnKind, Cohere2MoeConfig};
 use hipfire_dispatch::context::DispatchCtx;
-use hipfire_dispatch::families::moe::{MoeDtypes, MoePrefillParams};
+use hipfire_dispatch::families::moe::{
+    ExpertExecutionPlan, MoeDtypes, MoeExpertRef, MoePrefillParams, RouterPlan,
+};
+use hipfire_dispatch::pipeline::{
+    execute_steps_mesh, GemvInput, MoeActivationVariant, MoeProj, Step,
+};
+use hipfire_dispatch::types::RotationPlan;
+use hipfire_hardware::DeviceMesh;
 use hipfire_runtime::llama::{
     fused_silu_mul_rotate_mq_batched_for, moe_family, rotate_x_mq_batched_for, rotate_x_mq_for,
     weight_gemv, weight_gemv_residual,
+};
+use hipfire_runtime::moe_plan::{
+    execute_lowered_moe, lower_moe_steps, MoEExecutionPolicy, MoeExecutionTarget, MoeProgramParts,
+    RoutedMoeStepPhases,
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
 
@@ -71,7 +82,9 @@ fn moe_grouped_m_total_bound(total_slots: usize, n_exp: usize) -> usize {
 /// validation prompt and ~9× faster prefill.
 fn q8_wmma_enabled() -> bool {
     static EN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *EN.get_or_init(|| std::env::var("HIPFIRE_COHERE2MOE_Q8_SCALAR").as_deref() != Ok("1"))
+    *EN.get_or_init(|| {
+        hipfire_config::developer_var("HIPFIRE_COHERE2MOE_Q8_SCALAR").as_deref() != Ok("1")
+    })
 }
 
 #[inline]
@@ -113,7 +126,11 @@ pub fn decode_step(
         .memcpy_htod(&state.pos_buf, &(position as i32).to_ne_bytes())
         .map_err(|e| format!("cohere2moe: htod pos: {e:?}"))?;
     embed_lookup(gpu, weights, cfg.hidden_size, token_id, &mut state.h)?;
-    decode_step_body(cfg, weights, state, gpu, position)?;
+    // P-A: single (1×1) device mesh threaded to the dispatch chokepoint. Real
+    // mesh resolution replaces this construction in P-B without touching the
+    // internal threading.
+    let mesh = DeviceMesh::single();
+    decode_step_body(cfg, weights, state, &mesh, gpu, position)?;
     let mut logits = gpu
         .download_f32(&state.logits)
         .map_err(|e| format!("cohere2moe: download logits: {e:?}"))?;
@@ -157,6 +174,7 @@ fn decode_step_body(
     cfg: &Cohere2MoeConfig,
     weights: &Cohere2MoeWeights,
     state: &mut Cohere2MoeState,
+    mesh: &DeviceMesh,
     gpu: &mut Gpu,
     position: u32,
 ) -> Result<(), String> {
@@ -174,16 +192,58 @@ fn decode_step_body(
         // ── Parallel block: ONE RMSNorm → `normed`, fed to BOTH the attention
         //    and the FFN branch. cohere2_moe uses plain RMSNorm (LlamaRMSNorm,
         //    rms_norm_eps), NOT base Cohere2's mean-centered LayerNorm. ────────
-        gpu.rmsnorm_batched(&state.h, &layer.input_norm, &state.normed, 1, hidden, eps)
-            .map_err(|e| format!("cohere2moe L{l}: input rmsnorm: {e:?}"))?;
+        // STEP-004 Inc 4: batched norm + QKV projections via Steps. The norm is
+        // its OWN step list (RmsnormBatched must never sit in a fused-QKV
+        // window — launch_fused destructures RmsnormAutomatic); the Q8 Gemvs
+        // are Raw → run_auto, byte-identical to weight_gemv.
+        let ctx = DispatchCtx::new(gpu);
+        execute_steps_mesh(
+            mesh,
+            gpu,
+            &ctx,
+            &[Step::RmsnormBatched {
+                x: &state.h,
+                norm_weight: &layer.input_norm,
+                x_plain: &state.normed,
+                out: &state.normed,
+                awq_scale: None,
+                k: hidden,
+                eps,
+                rotation: RotationPlan::None,
+                batch: 1,
+            }],
+        )
+        .map_err(|e| format!("cohere2moe L{l}: input rmsnorm: {e:?}"))?;
 
         // ── Attention branch (reads `normed`) ──────────────────────────────
-        weight_gemv(gpu, &layer.wq, &state.normed, &state.fa_q)
-            .map_err(|e| format!("cohere2moe L{l}: q_proj: {e}"))?;
-        weight_gemv(gpu, &layer.wk, &state.normed, &state.fa_k)
-            .map_err(|e| format!("cohere2moe L{l}: k_proj: {e}"))?;
-        weight_gemv(gpu, &layer.wv, &state.normed, &state.fa_v)
-            .map_err(|e| format!("cohere2moe L{l}: v_proj: {e}"))?;
+        let (wq, wk, wv) = (
+            layer.wq.dispatch_ref(),
+            layer.wk.dispatch_ref(),
+            layer.wv.dispatch_ref(),
+        );
+        execute_steps_mesh(
+            mesh,
+            gpu,
+            &ctx,
+            &[
+                Step::Gemv {
+                    w: &wq,
+                    input: GemvInput::Raw(&state.normed),
+                    out: &state.fa_q,
+                },
+                Step::Gemv {
+                    w: &wk,
+                    input: GemvInput::Raw(&state.normed),
+                    out: &state.fa_k,
+                },
+                Step::Gemv {
+                    w: &wv,
+                    input: GemvInput::Raw(&state.normed),
+                    out: &state.fa_v,
+                },
+            ],
+        )
+        .map_err(|e| format!("cohere2moe L{l}: q/k/v proj: {e:?}"))?;
 
         // NoPE: only `sliding_attention` layers apply RoPE. `full_attention`
         // (global) layers use NO positional embedding (Cohere2 sets
@@ -262,9 +322,11 @@ fn decode_step_body(
             tree_bias: None,
             block_start: 0,
             block_cols: 0,
+            output_gate: None,
             output: &state.fa_attn_out,
         };
-        hipfire_dispatch::pipeline::execute_steps(
+        hipfire_dispatch::pipeline::execute_steps_mesh(
+            mesh,
             gpu,
             &ctx,
             &[hipfire_dispatch::pipeline::Step::Attend { plan, io }],
@@ -272,28 +334,87 @@ fn decode_step_body(
         .map_err(|e| format!("cohere2moe L{l}: attention: {e:?}"))?;
 
         // h += o_proj · attn_out  (attention into the residual).
-        weight_gemv_residual(gpu, &layer.wo, &state.fa_attn_out, &state.h)
-            .map_err(|e| format!("cohere2moe L{l}: o_proj: {e}"))?;
+        let wo_ref = layer.wo.dispatch_ref();
+        execute_steps_mesh(
+            mesh,
+            gpu,
+            &ctx,
+            &[Step::GemvResidual {
+                w: &wo_ref,
+                input: GemvInput::Raw(&state.fa_attn_out),
+                residual: &state.h,
+                out: &state.h,
+            }],
+        )
+        .map_err(|e| format!("cohere2moe L{l}: o_proj: {e:?}"))?;
 
         // ── FFN branch (reads the SAME `normed`, NOT post-attention `h`) ─────
         match &layer.ffn {
             Ffn::Dense(d) => {
-                weight_gemv(gpu, &d.gate, &state.normed, &state.dense_gate)
-                    .map_err(|e| format!("cohere2moe L{l}: dense gate_proj: {e}"))?;
-                weight_gemv(gpu, &d.up, &state.normed, &state.dense_up)
-                    .map_err(|e| format!("cohere2moe L{l}: dense up_proj: {e}"))?;
-                gpu.silu_mul_f32(&state.dense_gate, &state.dense_up, &state.dense_act)
-                    .map_err(|e| format!("cohere2moe L{l}: dense silu_mul: {e:?}"))?;
-                weight_gemv_residual(gpu, &d.down, &state.dense_act, &state.h)
-                    .map_err(|e| format!("cohere2moe L{l}: dense down_proj: {e}"))?;
+                let (wg, wu, wd) = (
+                    d.gate.dispatch_ref(),
+                    d.up.dispatch_ref(),
+                    d.down.dispatch_ref(),
+                );
+                execute_steps_mesh(
+                    mesh,
+                    gpu,
+                    &ctx,
+                    &[
+                        Step::Gemv {
+                            w: &wg,
+                            input: GemvInput::Raw(&state.normed),
+                            out: &state.dense_gate,
+                        },
+                        Step::Gemv {
+                            w: &wu,
+                            input: GemvInput::Raw(&state.normed),
+                            out: &state.dense_up,
+                        },
+                        Step::SiluMul {
+                            gate: &state.dense_gate,
+                            up: &state.dense_up,
+                            out: &state.dense_act,
+                        },
+                    ],
+                )
+                .map_err(|e| format!("cohere2moe L{l}: dense gate/up: {e:?}"))?;
+                execute_steps_mesh(
+                    mesh,
+                    gpu,
+                    &ctx,
+                    &[Step::GemvResidual {
+                        w: &wd,
+                        input: GemvInput::Raw(&state.dense_act),
+                        residual: &state.h,
+                        out: &state.h,
+                    }],
+                )
+                .map_err(|e| format!("cohere2moe L{l}: dense down_proj: {e:?}"))?;
             }
             Ffn::Moe(m) => {
+                // Router projection via Steps (Q8 → Raw, identical to
+                // weight_gemv). The sigmoid + top-k below stay direct —
+                // STEP-004 inventory exception #9: Cohere2's sigmoid+topk
+                // (norm_topk_prob=false, NO gate_bias) has no matching Step
+                // variant; MoeRoute requires a gate_bias tensor, and
+                // MoeSoftmaxTopK prepends an unwanted softmax.
+                let w_r = m.router.dispatch_ref();
+                execute_steps_mesh(
+                    mesh,
+                    gpu,
+                    &ctx,
+                    &[Step::Gemv {
+                        w: &w_r,
+                        input: GemvInput::Raw(&state.normed),
+                        out: &state.router_logits,
+                    }],
+                )
+                .map_err(|e| format!("cohere2moe L{l}: router: {e:?}"))?;
                 // Router: sigmoid(logits) → top-k. `norm_topk_prob=false` for
                 // North-Mini-Code, so the top-8 raw sigmoid scores are the
                 // combine weights (NO renormalization). Selection by sigmoid is
                 // monotonic in the logits, so it matches HF `expert_selection_fn`.
-                weight_gemv(gpu, &m.router, &state.normed, &state.router_logits)
-                    .map_err(|e| format!("cohere2moe L{l}: router: {e}"))?;
                 gpu.sigmoid_f32(&state.router_logits)
                     .map_err(|e| format!("cohere2moe L{l}: sigmoid: {e:?}"))?;
                 gpu.moe_topk_renorm_k8(
@@ -305,11 +426,18 @@ fn decode_step_body(
                 )
                 .map_err(|e| format!("cohere2moe L{l}: topk: {e:?}"))?;
 
+                // STEP-004 inventory exceptions #7 + routed-expert: the
+                // indexed-MoE expert phases (rotate / gate_up /
+                // silu·mul·rotate / down / combine) stay on the direct kernel
+                // sequence — no Step route exists without the manifest-born
+                // ExpertGroupPlan (lower_moe_steps), which lands with the
+                // device-mesh manifest projection (AXIS-002). The per-expert
+                // fallback (BF16/Q8/F16) has no indexed-MoE Step for those
+                // dtypes (exception #7).
                 let edt = m.experts[0].gate_up.gpu_dtype;
                 match edt {
                     // FWHT-pre-rotated indexed MoE GEMV (MQ4/MQ6 tiers).
                     DType::MQ4G256 | DType::HFQ4G256 | DType::MQ6G256 | DType::HFQ6G256 => {
-                        let mq6 = matches!(edt, DType::MQ6G256 | DType::HFQ6G256);
                         rotate_x_mq_for(
                             gpu,
                             &m.experts[0].gate_up,
@@ -318,77 +446,103 @@ fn decode_step_body(
                             hidden,
                         )
                         .map_err(|e| format!("cohere2moe L{l}: ffn rotate: {e:?}"))?;
-                        if mq6 {
-                            gpu.gemv_hfq6g256_moe_gate_up_k8_indexed_batched(
-                                &m.expert_gate_up_ptrs,
-                                &state.topk_indices,
-                                &state.ffn_x_rot,
-                                &state.gate_batch,
-                                &state.up_batch,
-                                2 * moe_inter,
-                                hidden,
+                        // Routed expert program (gate_up → silu·mul·rotate →
+                        // down → combine): lowered through the manifest-born
+                        // ExpertGroupPlan (lower_moe_steps) + the sealed
+                        // Single executor. The router phase is EMPTY — the
+                        // sigmoid + top-k ran bespoke above (exception #9);
+                        // the kernel sequence is the same indexed-MoE family
+                        // the direct path launched (MQ4→HFQ4, MQ6→HFQ6 by the
+                        // expert refs' dtype), and the combine accumulates
+                        // into the residual (the Single executor never zeroes
+                        // `out`).
+                        let gu_ref = hipfire_dispatch::families::moe::MoeExpertRef {
+                            gate_up_ptrs: &m.expert_gate_up_ptrs,
+                            down_ptrs: &m.expert_down_ptrs,
+                            dummy_gate_up: None,
+                            dtype: m.experts[0].gate_up.gpu_dtype,
+                            n_experts: n_exp,
+                            expert_m: moe_inter,
+                            expert_k: hidden,
+                            owned: &[],
+                        };
+                        let dn_ref = hipfire_dispatch::families::moe::MoeExpertRef {
+                            gate_up_ptrs: &m.expert_gate_up_ptrs,
+                            down_ptrs: &m.expert_down_ptrs,
+                            dummy_gate_up: None,
+                            dtype: m.experts[0].down.gpu_dtype,
+                            n_experts: n_exp,
+                            expert_m: moe_inter,
+                            expert_k: hidden,
+                            owned: &[],
+                        };
+                        let phases = RoutedMoeStepPhases {
+                            router: Vec::new(),
+                            gate_up: vec![Step::IndexedMoeGemv {
+                                experts: &gu_ref,
+                                which: MoeProj::GateUp {
+                                    up_out: &state.up_batch,
+                                },
+                                topk_indices: &state.topk_indices,
+                                input: GemvInput::Prerotated(&state.ffn_x_rot),
+                                out: &state.gate_batch,
                                 k_top,
-                                1,
-                            )
-                            .map_err(|e| format!("cohere2moe L{l}: gate_up(mq6): {e:?}"))?;
-                        } else {
-                            gpu.gemv_hfq4g256_moe_gate_up_k8_indexed_batched(
-                                &m.expert_gate_up_ptrs,
-                                &state.topk_indices,
-                                &state.ffn_x_rot,
-                                &state.gate_batch,
-                                &state.up_batch,
-                                2 * moe_inter,
-                                hidden,
+                                batch_size: 1,
+                            }],
+                            activation: vec![Step::MoeActivation {
+                                variant: MoeActivationVariant::MinimaxFused {
+                                    awq_scale: m.experts[0].down.awq_scale.as_ref(),
+                                },
+                                gate: &state.gate_batch,
+                                up: &state.up_batch,
+                                rot_out: &state.rot_batch,
+                                inter: moe_inter,
                                 k_top,
-                                1,
-                            )
-                            .map_err(|e| format!("cohere2moe L{l}: gate_up(mq4): {e:?}"))?;
-                        }
-                        fused_silu_mul_rotate_mq_batched_for(
-                            gpu,
-                            &m.experts[0].down,
-                            &state.gate_batch,
-                            &state.up_batch,
-                            &state.rot_batch,
-                            moe_inter,
-                            k_top,
+                            }],
+                            down: vec![Step::IndexedMoeGemv {
+                                experts: &dn_ref,
+                                which: MoeProj::DownExpanded,
+                                topk_indices: &state.topk_indices,
+                                input: GemvInput::Prerotated(&state.rot_batch),
+                                out: &state.down_expanded,
+                                k_top,
+                                batch_size: 1,
+                            }],
+                            combine: vec![Step::MoeCombine {
+                                down_out: &state.down_expanded,
+                                topk_weights: &state.topk_weights,
+                                out: &state.h,
+                                k: k_top,
+                                hidden,
+                                batch_size: 1,
+                                inverse_perm: None,
+                            }],
+                            finish: Vec::new(),
+                        };
+                        let parts = MoeProgramParts {
+                            router: RouterPlan::SigmoidTopK {
+                                scores: &state.router_logits,
+                                topk_indices: &state.topk_indices,
+                                topk_weights: &state.topk_weights,
+                                k_top,
+                                normalize: false,
+                                route_scale: 1.0,
+                            },
+                            execution: ExpertExecutionPlan::IndexedQuantized,
+                            ranks: vec![phases],
+                        };
+                        let plan = weights
+                            .moe_group_plans(cfg)
+                            .map_err(|e| format!("cohere2moe L{l}: expert-group plan: {e}"))?
+                            .by_layer(l)?;
+                        let policy = MoEExecutionPolicy::single();
+                        let program = lower_moe_steps(plan, &policy, parts)
+                            .map_err(|e| format!("cohere2moe L{l}: lower_moe_steps: {e:?}"))?;
+                        execute_lowered_moe(
+                            &program,
+                            MoeExecutionTarget::Single { gpu, ctx: &ctx },
                         )
-                        .map_err(|e| format!("cohere2moe L{l}: silu_mul_rotate: {e:?}"))?;
-                        if mq6 {
-                            gpu.gemv_hfq6g256_moe_down_k8_indexed_batched_expanded(
-                                &m.expert_down_ptrs,
-                                &state.topk_indices,
-                                &state.rot_batch,
-                                &state.down_expanded,
-                                hidden,
-                                moe_inter,
-                                k_top,
-                                1,
-                            )
-                            .map_err(|e| format!("cohere2moe L{l}: down(mq6): {e:?}"))?;
-                        } else {
-                            gpu.gemv_hfq4g256_moe_down_k8_indexed_batched_expanded(
-                                &m.expert_down_ptrs,
-                                &state.topk_indices,
-                                &state.rot_batch,
-                                &state.down_expanded,
-                                hidden,
-                                moe_inter,
-                                k_top,
-                                1,
-                            )
-                            .map_err(|e| format!("cohere2moe L{l}: down(mq4): {e:?}"))?;
-                        }
-                        gpu.moe_down_combine_k8_batched(
-                            &state.down_expanded,
-                            &state.topk_weights,
-                            &state.h,
-                            hidden,
-                            k_top,
-                            1,
-                        )
-                        .map_err(|e| format!("cohere2moe L{l}: combine: {e:?}"))?;
+                        .map_err(|e| format!("cohere2moe L{l}: execute_lowered_moe: {e:?}"))?;
                     }
                     // Per-expert path for the bf16 oracle + Q8 tier (no indexed
                     // kernel for these dtypes). Reads the 8 selected experts off
@@ -405,7 +559,7 @@ fn decode_step_body(
                 }
             }
         }
-        if std::env::var_os("HIPFIRE_COHERE_DEBUG").is_some() {
+        if hipfire_config::developer_var_os("HIPFIRE_COHERE_DEBUG").is_some() {
             if let Ok(hv) = gpu.download_f32(&state.h) {
                 let l2 = hv.iter().map(|v| v * v).sum::<f32>().sqrt();
                 let mx = hv.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
@@ -420,17 +574,32 @@ fn decode_step_body(
     state.n_tokens = seq_len;
 
     // Final RMSNorm + lm_head (tied embed).
-    gpu.rmsnorm_batched(
-        &state.h,
-        &weights.final_norm,
-        &state.final_norm_buf,
-        1,
-        hidden,
-        eps,
+    let w_head = weights.lm_head.dispatch_ref();
+    let ctx = DispatchCtx::new(gpu);
+    execute_steps_mesh(
+        mesh,
+        gpu,
+        &ctx,
+        &[
+            Step::RmsnormBatched {
+                x: &state.h,
+                norm_weight: &weights.final_norm,
+                x_plain: &state.final_norm_buf,
+                out: &state.final_norm_buf,
+                awq_scale: None,
+                k: hidden,
+                eps,
+                rotation: RotationPlan::None,
+                batch: 1,
+            },
+            Step::Gemv {
+                w: &w_head,
+                input: GemvInput::Raw(&state.final_norm_buf),
+                out: &state.logits,
+            },
+        ],
     )
-    .map_err(|e| format!("cohere2moe: final rmsnorm: {e:?}"))?;
-    weight_gemv(gpu, &weights.lm_head, &state.final_norm_buf, &state.logits)
-        .map_err(|e| format!("cohere2moe: lm_head: {e}"))?;
+    .map_err(|e| format!("cohere2moe: final rmsnorm/lm_head: {e:?}"))?;
     Ok(())
 }
 
@@ -517,7 +686,7 @@ pub fn forward_batch_supported(weights: &Cohere2MoeWeights) -> bool {
 /// long-context collapse can be pinned to the exact layer + op (post-attn vs
 /// post-ffn) where the residual blows up or flattens. Off by default.
 fn c2m_normdump_step() -> Option<usize> {
-    std::env::var("HIPFIRE_C2M_NORMDUMP")
+    hipfire_config::developer_var("HIPFIRE_C2M_NORMDUMP")
         .ok()
         .map(|s| s.trim().parse().unwrap_or(4096))
 }
@@ -586,6 +755,9 @@ pub fn forward_batch(
                 .to_string(),
         );
     }
+    // P-A: single (1×1) device mesh threaded to the dispatch chokepoint (see
+    // decode_step). Replaced by resolved-mesh in P-B.
+    let mesh = DeviceMesh::single();
     let hidden = cfg.hidden_size;
     let q_dim = cfg.q_dim();
     let kv_dim = cfg.kv_dim();
@@ -743,9 +915,11 @@ pub fn forward_batch(
             tree_bias: None,
             block_start: 0,
             block_cols: 0,
+            output_gate: None,
             output: &attn_out,
         };
-        hipfire_dispatch::pipeline::execute_steps(
+        hipfire_dispatch::pipeline::execute_steps_mesh(
+            &mesh,
             gpu,
             &ctx,
             &[hipfire_dispatch::pipeline::Step::Attend { plan, io }],
@@ -851,6 +1025,8 @@ pub fn forward_batch(
                         per_expert_gate_up: None,
                         per_expert_down: None,
                         has_paro_shared: false,
+                        gate_side_has_awq: false,
+                        routed_down_has_awq: false,
                     },
                     batch_size: b,
                     mi: moe_inter,

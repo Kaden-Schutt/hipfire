@@ -4,6 +4,8 @@ members = [
     "crates/hip-bridge",
     "crates/hsa-bridge",
     "crates/rdna-compute",
+    "crates/hipfire-hardware",
+    "crates/radiowave",
     "crates/hipfire-runtime",
     "crates/hipfire-arch-qwen35",
     "crates/hipfire-arch-qwen35-vl",
@@ -19,14 +21,28 @@ members = [
     "crates/hipfire-detect",
     "crates/hipfire-atlas",
     "crates/redline",
+    "crates/redline-rocr",
+    "crates/redline-dispatch",
     "crates/hipfire-dispatch",
     "crates/hipfire-dispatch-tests",
     "crates/hipfire-tui",
     "crates/hipfire-reap",
     "crates/hipfire-loader",
+    "crates/hipfire-config",
+    "crates/hipfire-registry",
+    "crates/hipfire-cli",
+    "crates/hipfire-client",
 ]
 
 [workspace.package]
-version = "0.2.1"
+version = "0.3.0"
 edition = "2021"
-license = "MIT"
+# Outbound license for the work as a whole. Individual files whose authors
+# have not elected Apache-2.0 keep an MIT SPDX header; see LICENSE and NOTICE.
+license = "Apache-2.0"
+
+[workspace.dependencies]
+half = "2.7"
+libloading = "0.9"
+proptest = { version = "1.11", default-features = false, features = ["std"] }
+safetensors = "0.8"

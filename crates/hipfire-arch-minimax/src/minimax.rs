@@ -10,9 +10,20 @@
 //! Expert weights ship pre-split (w1/w2/w3) in the HFQ; the loader byte-fuses
 //! w1‖w3 into the per-expert `gate_up` blob the indexed GEMV kernels expect.
 
+use crate::arch::MiniMaxM2;
+use hipfire_runtime::arch::Architecture;
+use hipfire_runtime::gpu_cleanup::{
+    free_tensor_retained, free_weight_all_checked, retain_kv_failures, GpuCleanupFailure,
+};
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama::{f16_to_f32, KvCache, WeightTensor};
 use hipfire_runtime::model_source::ModelSource;
+use hipfire_runtime::moe_plan::{select_moe_executor, MoEExecutionPolicy, MoeExecutorKind};
+use hipfire_runtime::weight_manifest::{
+    resolve_expert_manifest_for_policy, ExpertExecutionIdentity, ExpertGroupPlan,
+    ExpertManifestResolution,
+};
+use hipfire_runtime::{screen_weight_tensor, MmqScreenable};
 use rdna_compute::{DType, Gpu, GpuTensor};
 use serde::Deserialize;
 
@@ -171,7 +182,7 @@ impl MiniMaxConfig {
 /// literal original full-load path — byte-identical to baseline. REAP and EP
 /// sharding are MUTUALLY EXCLUSIVE; that guard lives in `MiniMaxWeights::load`.
 pub fn apply_reap_plan(config: &mut MiniMaxConfig) -> Result<(), String> {
-    if let Some(plan) = hipfire_reap::plan::ReapPlan::from_env(
+    if let Some(plan) = hipfire_reap::plan::ReapPlan::from_config(
         "minimax",
         None,
         config.num_hidden_layers,
@@ -380,6 +391,21 @@ fn wt_from_raw(
     })
 }
 
+/// Bytes per packed-quant block (256 elements) for a given quant_type byte.
+/// Used for TP-of-experts slicing (`expert_tp_column_pair`/`expert_tp_row_gather`).
+/// Only the Lloyd variants used in M2.7.mq2 are currently supported; others
+/// return an error so TP slicing fails fast rather than corrupting data.
+fn block_bytes_for_qt(qt: u8) -> Result<usize, String> {
+    match qt {
+        19 => Ok(72),  // MQ2G256Lloyd (confirmed: weight_store.rs)
+        20 => Ok(112), // MQ3G256Lloyd (confirmed: weight_store.rs)
+        other => Err(format!(
+            "minimax TP-expert-slice: quant_type {other} not supported for column/row slicing \
+             (only MQ2G256Lloyd/MQ3G256Lloyd implemented)"
+        )),
+    }
+}
+
 // ──────────────────────────── Weights ────────────────────────────
 
 /// Per-layer GPU-resident weights.
@@ -417,6 +443,464 @@ pub struct MiniMaxWeights {
     pub final_norm: GpuTensor, // model.norm.weight
     pub lm_head: WeightTensor, // lm_head.weight
     pub layers: Vec<MiniMaxLayerWeights>,
+    /// Model-owned immutable CPU state: the authoritative policy-aware expert
+    /// manifest resolution for the exact key (load-bound manifest config
+    /// identity + exact policy) of the model's forward path, cached here.
+    /// SEALED: the cache type is private to this module; the public surface is
+    /// [`expert_manifest_for_policy`](MiniMaxWeights::expert_manifest_for_policy)
+    /// and the crate-visible
+    /// [`single_policy`](MiniMaxWeights::single_policy).
+    expert_manifest_cache: MiniMaxExpertManifestCache,
+}
+
+/// Model-owned immutable CPU cache of the authoritative policy-aware expert
+/// manifest resolution for ONE exact key: the exact [`MoEExecutionPolicy`]
+/// (kind + epoch-identity-sensitive mesh) AND the LOAD-BOUND manifest config
+/// identity (every [`MiniMaxConfig`] field consumed by
+/// [`MiniMaxM2::weight_manifest`] and [`MiniMaxM2::expert_group_manifest`]).
+///
+/// The cache is SEALED: type, field, constructors, resolver, and entry
+/// internals are private to this module. The only authority doors are
+/// [`MiniMaxWeights::expert_manifest_for_policy`] (public) and
+/// [`MiniMaxWeights::single_policy`] (crate-visible for the forward path).
+///
+/// `MiniMaxWeights::load` cannot know the execution policy — the loader API
+/// takes no policy, and threading one through would be a loader algorithm
+/// change — so resolution is LAZY on the first forward, then cached. This is
+/// the "lazy first-forward" case of the manifest-authority contract:
+///
+/// - **The config identity is bound at load**: both weight load paths
+///   construct the cache with the identity of the config they loaded. Every
+///   request compares its config identity against this load-time identity
+///   BEFORE `get_or_init`; a wrong FIRST request is explicitly refused and
+///   leaves the cache unseeded (no first-call-wins config binding).
+/// - **Resolution** runs exactly once per exact key through
+///   [`resolve_expert_manifest_for_policy`] over the authoritative
+///   [`MiniMaxM2::weight_manifest`] + policy-aware
+///   [`MiniMaxM2::expert_group_manifest`] specs, via `OnceLock::get_or_init`
+///   — concurrent same-key callers never double-resolve. Success AND failure
+///   are cached. Plans contain no GPU pointers.
+/// - **Cached lookups are allocation-free**: the fast path compares the
+///   BORROWED request (policy ref + load-bound config identity) against the
+///   stored key; the owned epoch-sensitive policy/mesh is constructed only by
+///   the winning `get_or_init` initializer (losing cold contenders clone
+///   nothing). A different policy returns an explicit mismatch — never the
+///   winner's resolution (no wrong-policy reuse), never a recompute, never a
+///   replacement.
+/// - **No fallback**: a failed resolution stays failed; validation is never
+///   weakened.
+struct MiniMaxExpertManifestCache {
+    /// The manifest config identity the model was loaded with.
+    load_identity: MiniMaxManifestConfigIdentity,
+    entry: std::sync::OnceLock<CachedExpertManifestResolution>,
+    /// The canonical single-rank execution policy of the model — ONE stable
+    /// object (see [`Self::single_policy`]).
+    single_policy: std::sync::OnceLock<MoEExecutionPolicy>,
+    #[cfg(test)]
+    resolver: MiniMaxManifestResolver,
+    /// cfg(test)-only race seam: invoked after a caller observes the empty
+    /// cell and immediately before `get_or_init`, so every contender reaches
+    /// the once-boundary without deadlocking inside the initializer.
+    #[cfg(test)]
+    race_before_init: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+    /// cfg(test)-only construction counter: counts owned-key constructions by
+    /// the WINNING `get_or_init` initializer (proves losing cold contenders
+    /// clone nothing and repeated initialized lookups construct nothing).
+    #[cfg(test)]
+    cold_constructs: std::sync::atomic::AtomicUsize,
+}
+
+/// The complete cache key: the exact execution policy plus the load-bound
+/// manifest/config identity. Do not under-key: every identity field is
+/// consumed by `MiniMaxM2::weight_manifest` / `expert_group_manifest`
+/// (arch.rs) and therefore changes the resolution.
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct MiniMaxManifestKey {
+    policy: MoEExecutionPolicy,
+    config: MiniMaxManifestConfigIdentity,
+}
+
+/// Every `MiniMaxConfig` field consumed by the MiniMax manifest declarations.
+/// `reap_keep` is deliberately absent: it is already folded into
+/// `num_local_experts` at config-parse time (the only manifest-visible effect).
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct MiniMaxManifestConfigIdentity {
+    vocab_size: usize,
+    hidden_size: usize,
+    num_hidden_layers: usize,
+    num_attention_heads: usize,
+    num_key_value_heads: usize,
+    head_dim: usize,
+    intermediate_size: usize,
+    num_local_experts: usize,
+}
+
+impl MiniMaxManifestConfigIdentity {
+    fn from_cfg(cfg: &MiniMaxConfig) -> Self {
+        MiniMaxManifestConfigIdentity {
+            vocab_size: cfg.vocab_size,
+            hidden_size: cfg.hidden_size,
+            num_hidden_layers: cfg.num_hidden_layers,
+            num_attention_heads: cfg.num_attention_heads,
+            num_key_value_heads: cfg.num_key_value_heads,
+            head_dim: cfg.head_dim,
+            intermediate_size: cfg.intermediate_size,
+            num_local_experts: cfg.num_local_experts,
+        }
+    }
+}
+
+struct CachedExpertManifestResolution {
+    key: MiniMaxManifestKey,
+    resolution: Result<ExpertManifestResolution, String>,
+}
+
+/// Deterministic cache-level resolver seam: production resolves through the
+/// authoritative arch manifests; tests inject a resolver to prove once-only
+/// resolution and exact-key semantics without GPU objects.
+#[cfg(test)]
+enum MiniMaxManifestResolver {
+    Arch,
+    Test(
+        Box<
+            dyn Fn(&MiniMaxConfig, &MoEExecutionPolicy) -> Result<ExpertManifestResolution, String>
+                + Send
+                + Sync,
+        >,
+    ),
+}
+
+/// Resolve the authoritative MiniMax expert manifest for one exact policy.
+fn resolve_arch_manifest(
+    cfg: &MiniMaxConfig,
+    policy: &MoEExecutionPolicy,
+) -> Result<ExpertManifestResolution, String> {
+    let specs = MiniMaxM2::expert_group_manifest(cfg, policy);
+    let manifest = MiniMaxM2::weight_manifest(cfg);
+    resolve_expert_manifest_for_policy(&specs, &manifest, policy)
+}
+
+fn identity_fmt(identity: &MiniMaxManifestConfigIdentity) -> String {
+    format!(
+        "(vocab {}, hidden {}, layers {}, heads {}, kv_heads {}, head_dim {}, inter {}, experts {})",
+        identity.vocab_size,
+        identity.hidden_size,
+        identity.num_hidden_layers,
+        identity.num_attention_heads,
+        identity.num_key_value_heads,
+        identity.head_dim,
+        identity.intermediate_size,
+        identity.num_local_experts,
+    )
+}
+
+fn config_mismatch_error(
+    load: &MiniMaxManifestConfigIdentity,
+    request: &MiniMaxManifestConfigIdentity,
+) -> String {
+    format!(
+        "minimax expert manifest cache: model was loaded with config identity {}; requested          config identity {} differs — refusing reuse (cache is per loaded model / load-bound          manifest config)",
+        identity_fmt(load),
+        identity_fmt(request),
+    )
+}
+
+fn policy_mismatch_error(stored: &MoEExecutionPolicy, requested: &MoEExecutionPolicy) -> String {
+    format!(
+        "minimax expert manifest cache: bound to exact policy {:?} (mesh {:?}); requested policy          {:?} (mesh {:?}) differs — refusing reuse (cache is per loaded model / exact policy)",
+        stored.kind(),
+        stored.mesh(),
+        requested.kind(),
+        requested.mesh(),
+    )
+}
+
+impl MiniMaxExpertManifestCache {
+    /// Construct the cache bound to the manifest config identity of the
+    /// config the model was loaded with. Both weight load paths
+    /// (`MiniMaxWeights::load` and `load_weights_from_safetensors`) derive
+    /// this identity from the SAME `cfg` they load weights with.
+    fn new(load_identity: MiniMaxManifestConfigIdentity) -> Self {
+        Self {
+            load_identity,
+            entry: std::sync::OnceLock::new(),
+            single_policy: std::sync::OnceLock::new(),
+            #[cfg(test)]
+            resolver: MiniMaxManifestResolver::Arch,
+            #[cfg(test)]
+            race_before_init: None,
+            #[cfg(test)]
+            cold_constructs: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// cfg(test) seam: deterministic resolver + optional race hook (see
+    /// `race_before_init`), so concurrency / exact-key / load-bound semantics
+    /// are proven without GPU objects.
+    #[cfg(test)]
+    fn with_seams(
+        load_identity: MiniMaxManifestConfigIdentity,
+        resolver: Box<
+            dyn Fn(&MiniMaxConfig, &MoEExecutionPolicy) -> Result<ExpertManifestResolution, String>
+                + Send
+                + Sync,
+        >,
+        race_before_init: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+    ) -> Self {
+        Self {
+            load_identity,
+            entry: std::sync::OnceLock::new(),
+            single_policy: std::sync::OnceLock::new(),
+            resolver: MiniMaxManifestResolver::Test(resolver),
+            race_before_init,
+            cold_constructs: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// The canonical single-rank execution policy of this model: ONE stable
+    /// object for the model's lifetime. `DeviceMesh::single()` issues a fresh
+    /// mesh epoch per call, so a per-token `MoEExecutionPolicy::single()`
+    /// would be a different exact policy every token and the exact-key cache
+    /// would reject every token after the first. The single forward path
+    /// passes this object on every call — never a per-token reconstruction.
+    fn single_policy(&self) -> &MoEExecutionPolicy {
+        self.single_policy.get_or_init(MoEExecutionPolicy::single)
+    }
+
+    /// Return the cached resolution for the exact key, resolving and binding
+    /// the cache on first use via `OnceLock::get_or_init` (same-key
+    /// resolution runs exactly once, even under concurrency).
+    ///
+    /// Order of admission:
+    /// 1. LOAD-BOUND config identity check (BEFORE `get_or_init`): a request
+    ///    whose config identity differs from the load-time identity is
+    ///    refused explicitly and leaves the cache unseeded.
+    /// 2. Cached fast path: the BORROWED request policy is compared against
+    ///    the stored key — no owned policy/mesh clone on the cached path.
+    /// 3. Cold path: the owned policy/key is constructed only here, inside
+    ///    the winning initializer; the post-init borrowed compare rejects a
+    ///    concurrent winner with a different exact policy (never winner
+    ///    reuse).
+    fn get_or_resolve<'a>(
+        &'a self,
+        cfg: &MiniMaxConfig,
+        policy: &MoEExecutionPolicy,
+    ) -> Result<&'a ExpertManifestResolution, String> {
+        // 1. Load-bound config identity — before get_or_init, so a wrong
+        //    FIRST request refuses and leaves the cache unseeded.
+        let request_identity = MiniMaxManifestConfigIdentity::from_cfg(cfg);
+        if request_identity != self.load_identity {
+            return Err(config_mismatch_error(
+                &self.load_identity,
+                &request_identity,
+            ));
+        }
+        // 2. Cached fast path: borrowed comparison, zero owned-key clones.
+        if let Some(entry) = self.entry.get() {
+            if entry.key.policy != *policy {
+                return Err(policy_mismatch_error(&entry.key.policy, policy));
+            }
+            return entry.resolution.as_ref().map_err(|err| err.clone());
+        }
+        // cfg(test) race seam: every contender that observed the empty cell
+        // rendezvouses here BEFORE get_or_init (never inside the initializer,
+        // so the once-boundary is reached without deadlock).
+        #[cfg(test)]
+        if let Some(hook) = &self.race_before_init {
+            hook();
+        }
+        // 3. Cold path: the WINNING `get_or_init` initializer constructs the
+        //    owned policy/key exactly once. Losing cold contenders never
+        //    clone the epoch-sensitive policy/mesh axis and never build an
+        //    owned key — they only borrow-compare against the winner's
+        //    stored key below.
+        let entry = self.entry.get_or_init(|| {
+            #[cfg(test)]
+            self.cold_constructs
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let key = MiniMaxManifestKey {
+                policy: policy.clone(),
+                config: request_identity,
+            };
+            #[cfg(test)]
+            let resolution = match &self.resolver {
+                MiniMaxManifestResolver::Arch => resolve_arch_manifest(cfg, &key.policy),
+                MiniMaxManifestResolver::Test(resolve) => resolve(cfg, &key.policy),
+            };
+            #[cfg(not(test))]
+            let resolution = resolve_arch_manifest(cfg, &key.policy);
+            CachedExpertManifestResolution { key, resolution }
+        });
+        // A concurrent first caller may have won with a different exact
+        // policy: NEVER winner reuse — borrowed compare, explicit mismatch.
+        if entry.key.policy != *policy {
+            return Err(policy_mismatch_error(&entry.key.policy, policy));
+        }
+        entry.resolution.as_ref().map_err(|err| err.clone())
+    }
+}
+
+/// The common Single-rank MoE authority of one model: the stable canonical
+/// single policy PLUS the model-owned cached expert-manifest resolution bound
+/// to it (load-bound config identity + exact policy). BOTH forward entries —
+/// sequential `decode_step_body` and production batched `forward_batch` —
+/// obtain their Single authority through [`minimax_single_moe_authority`],
+/// never a per-token policy construction, never a local plan fabrication.
+#[derive(Debug)]
+pub(crate) struct SingleMoeAuthority<'a> {
+    policy: &'a MoEExecutionPolicy,
+    resolution: &'a ExpertManifestResolution,
+}
+
+impl<'a> SingleMoeAuthority<'a> {
+    /// CPU-testable construction from a policy + resolution pair (tests and
+    /// malformed-seam cases). Production acquisition always goes through
+    /// [`Self::from_cache`].
+    #[cfg(test)]
+    pub(crate) fn new(
+        policy: &'a MoEExecutionPolicy,
+        resolution: &'a ExpertManifestResolution,
+    ) -> Self {
+        SingleMoeAuthority { policy, resolution }
+    }
+
+    /// CPU-testable acquisition core from the model-owned cache: the stable
+    /// canonical single policy and the cached resolution for it. A
+    /// stale-config / different-policy / failed resolution is refused HERE —
+    /// in `forward_batch` this runs BEFORE any GPU allocation or launch, in
+    /// `decode_step_body` before the layer loop. Production goes through
+    /// [`minimax_single_moe_authority`] (the same path via the weights
+    /// accessors); the CPU tests use this core directly.
+    #[cfg(test)]
+    pub(crate) fn from_cache(
+        cache: &'a MiniMaxExpertManifestCache,
+        cfg: &MiniMaxConfig,
+    ) -> Result<Self, String> {
+        let policy = cache.single_policy();
+        let resolution = cache
+            .get_or_resolve(cfg, policy)
+            .map_err(|e| format!("minimax: expert manifest (single): {e}"))?;
+        Ok(SingleMoeAuthority { policy, resolution })
+    }
+
+    /// The stable canonical single policy of this authority.
+    pub(crate) fn policy(&self) -> &'a MoEExecutionPolicy {
+        self.policy
+    }
+
+    /// The model-owned cached resolution of this authority.
+    #[cfg(test)]
+    pub(crate) fn resolution(&self) -> &'a ExpertManifestResolution {
+        self.resolution
+    }
+
+    /// Borrow and validate the layer-`l` plan BEFORE any kernel uses that
+    /// layer. Admission (all allocation-free):
+    /// 1. the resolution must cover the layer (out-of-range fails closed);
+    /// 2. the plan must be layer-scoped (`plans[l].layer == Some(l)`);
+    /// 3. the plan must declare the exact `sigmoid_topk` router identity —
+    ///    the direct batched indexed sigmoid kernels require it;
+    /// 4. the plan must admit [`ExpertExecutionIdentity::IndexedQuantized`] —
+    ///    the direct batched kernels are the indexed quantized family;
+    /// 5. Single executor admission ([`select_moe_executor`] — group size vs
+    ///    rank count, parallelism, and the post-combine collective all agree
+    ///    with the canonical single policy).
+    /// The batched path runs this as an admission pin before its direct
+    /// established batched MoE dispatch; the sequential path lowers with the
+    /// returned plan.
+    pub(crate) fn plan_for_layer(&self, l: usize) -> Result<&'a ExpertGroupPlan, String> {
+        let plan = self.resolution.plans.get(l).ok_or_else(|| {
+            format!(
+                "minimax: expert manifest resolution has {} plan(s); layer {l} is out of range",
+                self.resolution.plans.len()
+            )
+        })?;
+        if plan.layer != Some(l) {
+            return Err(format!(
+                "minimax: expert manifest resolution plan[{l}] is scoped to layer {:?}, not Some({l})",
+                plan.layer
+            ));
+        }
+        if plan.router_identity != "sigmoid_topk" {
+            return Err(format!(
+                "minimax: expert manifest resolution plan[{l}] router identity '{}' is not                  'sigmoid_topk' (the direct batched indexed sigmoid kernels require it)",
+                plan.router_identity
+            ));
+        }
+        if !plan
+            .allowed_executions
+            .contains(&ExpertExecutionIdentity::IndexedQuantized)
+        {
+            return Err(format!(
+                "minimax: expert manifest resolution plan[{l}] allowed executions {:?} do not                  admit IndexedQuantized (the direct batched indexed kernels require it)",
+                plan.allowed_executions
+            ));
+        }
+        match select_moe_executor(plan, self.policy) {
+            Ok(MoeExecutorKind::SingleMesh) => Ok(plan),
+            Ok(MoeExecutorKind::Parallel) => Err(format!(
+                "minimax: expert manifest resolution plan[{l}] (group '{}', parallelism {:?},                  collective {:?}) is not Single-admitted",
+                plan.group, plan.parallelism, plan.collective
+            )),
+            Err(err) => Err(format!(
+                "minimax: expert manifest resolution plan[{l}] is not Single-admitted: {err:?}"
+            )),
+        }
+    }
+}
+
+/// The common Single-authority accessor used by BOTH `decode_step_body` and
+/// `forward_batch`: obtains the cache-owned stable `weights.single_policy()`
+/// and `weights.expert_manifest_for_policy(cfg, policy)` (load-bound config /
+/// policy / failure refusal propagated), exposed as the per-layer-validating
+/// [`SingleMoeAuthority`].
+pub(crate) fn minimax_single_moe_authority<'a>(
+    weights: &'a MiniMaxWeights,
+    cfg: &MiniMaxConfig,
+) -> Result<SingleMoeAuthority<'a>, String> {
+    let policy = weights.single_policy();
+    let resolution = weights
+        .expert_manifest_for_policy(cfg, policy)
+        .map_err(|e| format!("minimax: expert manifest (single): {e}"))?;
+    Ok(SingleMoeAuthority { policy, resolution })
+}
+
+impl MiniMaxWeights {
+    /// The cached authoritative policy-aware expert-manifest resolution for
+    /// `policy` — the single production plan source (see
+    /// [`MiniMaxExpertManifestCache::get_or_resolve`]). The forward paths
+    /// borrow plans by layer from the returned resolution; the object is
+    /// identical (same pointer) on every repeat call for the same policy.
+    pub fn expert_manifest_for_policy<'a>(
+        &'a self,
+        cfg: &MiniMaxConfig,
+        policy: &MoEExecutionPolicy,
+    ) -> Result<&'a ExpertManifestResolution, String> {
+        self.expert_manifest_cache.get_or_resolve(cfg, policy)
+    }
+
+    /// The canonical single-rank execution policy of this model — ONE stable
+    /// object for the model's lifetime (see
+    /// [`MiniMaxExpertManifestCache::single_policy`]); the single forward
+    /// path must never reconstruct the policy per token.
+    pub(crate) fn single_policy(&self) -> &MoEExecutionPolicy {
+        self.expert_manifest_cache.single_policy()
+    }
+}
+
+impl MmqScreenable for MiniMaxWeights {
+    fn screen_mmq_weights(&self, gpu: &mut Gpu) -> (usize, usize) {
+        let (mut safe, mut unsafe_count) = (0usize, 0usize);
+        screen_weight_tensor(&self.lm_head, gpu, &mut safe, &mut unsafe_count);
+        // Routed experts use packed/indirect storage. Screen the resident
+        // attention projections and dense router tensors here.
+        for layer in &self.layers {
+            for weight in [&layer.wq, &layer.wk, &layer.wv, &layer.wo, &layer.router] {
+                screen_weight_tensor(weight, gpu, &mut safe, &mut unsafe_count);
+            }
+        }
+        (safe, unsafe_count)
+    }
 }
 
 impl MiniMaxWeights {
@@ -428,11 +912,19 @@ impl MiniMaxWeights {
     /// pointers point at a shared zeroed gate_up buffer (→ 0 contribution). The
     /// non-expert weights (embed / lm_head / attention / norms) are always loaded
     /// in full (replicated per rank). `shard = None` loads everything (single-GPU).
+    ///
+    /// `tp_slice = Some(TpExpertSlice { tp, rank })` enables **TP-of-experts**:
+    /// every rank owns ALL experts but each expert's weight matrix is column/row-split.
+    /// gate‖up: column split `[2·inter, hidden]` → `[2·inter/tp, hidden]` (via
+    /// `weight_store::expert_tp_column_pair`). down: row gather `[hidden, inter]` →
+    /// `[hidden, inter/tp]` (via `weight_store::expert_tp_row_gather`). Mutually
+    /// exclusive with EP `shard` (which sub-sets which experts are loaded).
     pub fn load(
         hfq: &mut HfqFile,
         cfg: &MiniMaxConfig,
         gpu: &mut Gpu,
         shard: Option<(&hipfire_runtime::tp_shard::ShardConfig, usize)>,
+        tp_slice: Option<hipfire_runtime::tp_shard::TpExpertSlice>,
     ) -> Result<Self, String> {
         let hidden = cfg.hidden_size;
         let q_dim = cfg.q_dim();
@@ -449,6 +941,13 @@ impl MiniMaxWeights {
         if cfg.reap_keep.is_some() && shard.is_some() {
             return Err("minimax: REAP keep-map + EP sharding are mutually exclusive".into());
         }
+        // TP-of-experts and EP sharding are also mutually exclusive.
+        if tp_slice.is_some() && shard.is_some() {
+            return Err("minimax: TP expert slice + EP sharding are mutually exclusive".into());
+        }
+        // inter_local: intermediate dim per TP rank. Under TP this is inter/tp;
+        // under no TP it equals inter (tp=1, inter_local==inter → byte-identical).
+        let inter_local = tp_slice.map(|ts| ts.inter_local(inter)).unwrap_or(inter);
 
         // Globals.
         let (_qt, embed_bytes) = read_tensor(hfq, "model.embed_tokens.weight")?;
@@ -563,8 +1062,12 @@ impl MiniMaxWeights {
             // tiny oracle: gfx1151 cosine unchanged).
             let mut gu_combined: Vec<u8> = Vec::new();
             let mut dn_combined: Vec<u8> = Vec::new();
-            let mut gu_stride = 0usize;
-            let mut dn_stride = 0usize;
+            let mut gu_stride = 0usize; // raw per-expert blob size (for validation only)
+            let mut dn_stride = 0usize; // raw per-expert blob size (for validation only)
+                                        // Packed per-expert size in the combined blob (equals raw stride when no
+                                        // TP slicing; equals sliced size when tp_slice is Some).
+            let mut gu_packed_stride = 0usize;
+            let mut dn_packed_stride = 0usize;
             let mut qt_gu = 0u8;
             let mut qt_dn = 0u8;
             // EP shard: only upload rank-owned experts into the compact blob.
@@ -619,9 +1122,39 @@ impl MiniMaxWeights {
                     let route = if shard.is_some() { e } else { slot };
                     local_of_global[route] = n_owned;
                     n_owned += 1;
-                    gu_combined.extend_from_slice(&w1);
-                    gu_combined.extend_from_slice(&w3);
-                    dn_combined.extend_from_slice(&w2);
+                    if let Some(ts) = tp_slice {
+                        // TP-of-experts: slice this expert's gate‖up blob (column
+                        // split) and down blob (row gather) to rank-local inter/tp.
+                        let bb_gu = block_bytes_for_qt(qt_gu)?;
+                        let bb_dn = block_bytes_for_qt(qt_dn)?;
+                        // gate‖up raw blob for this expert: w1‖w3 concatenated.
+                        let mut raw_gu = Vec::with_capacity(w1.len() + w3.len());
+                        raw_gu.extend_from_slice(&w1);
+                        raw_gu.extend_from_slice(&w3);
+                        let sliced_gu = hipfire_runtime::weight_store::expert_tp_column_pair(
+                            &raw_gu, inter, hidden, bb_gu, ts.rank, ts.tp,
+                        )
+                        .map_err(|e2| format!("minimax L{l}E{e}: TP column slice gate_up: {e2}"))?;
+                        let sliced_dn = hipfire_runtime::weight_store::expert_tp_row_gather(
+                            &w2, hidden, inter, bb_dn, ts.rank, ts.tp,
+                        )
+                        .map_err(|e2| format!("minimax L{l}E{e}: TP row gather down: {e2}"))?;
+                        // Record the sliced per-expert size for the pointer table.
+                        if n_owned == 1 {
+                            gu_packed_stride = sliced_gu.len();
+                            dn_packed_stride = sliced_dn.len();
+                        }
+                        gu_combined.extend_from_slice(&sliced_gu);
+                        dn_combined.extend_from_slice(&sliced_dn);
+                    } else {
+                        if n_owned == 1 {
+                            gu_packed_stride = gu_stride;
+                            dn_packed_stride = dn_stride;
+                        }
+                        gu_combined.extend_from_slice(&w1);
+                        gu_combined.extend_from_slice(&w3);
+                        dn_combined.extend_from_slice(&w2);
+                    }
                 }
                 // Non-owned: w1/w3/w2 read from the file (for stride validation)
                 // then dropped — never uploaded. That is the EP memory win.
@@ -634,9 +1167,10 @@ impl MiniMaxWeights {
             // (the forward's rotate_x_mq / silu_mul_rotate / dtype dispatch read
             // those + the AWQ scale, never the buffer's full extent — per-expert
             // data is reached through the pointer table below).
-            let mut gate_up = wt_from_raw(gpu, qt_gu, &gu_combined, 2 * inter, hidden)
+            // Under TP: inter_local = inter/tp, so gate_up m=2*inter_local, down k=inter_local.
+            let mut gate_up = wt_from_raw(gpu, qt_gu, &gu_combined, 2 * inter_local, hidden)
                 .map_err(|e2| format!("minimax: pack gate_up L{l}: {e2}"))?;
-            let mut down = wt_from_raw(gpu, qt_dn, &dn_combined, hidden, inter)
+            let mut down = wt_from_raw(gpu, qt_dn, &dn_combined, hidden, inter_local)
                 .map_err(|e2| format!("minimax: pack down L{l}: {e2}"))?;
             drop(gu_combined);
             drop(dn_combined);
@@ -646,7 +1180,7 @@ impl MiniMaxWeights {
                 &format!("{p}.block_sparse_moe.awq_scale_gate_up.weight"),
                 hidden,
             );
-            if std::env::var_os("HIPFIRE_MINIMAX_ENABLE_DOWN_AWQ").is_some() {
+            if hipfire_config::developer_var_os("HIPFIRE_MINIMAX_ENABLE_DOWN_AWQ").is_some() {
                 // down-AWQ harmful (shared s_down bad approx); opt-in
                 down.awq_scale = load_mm_awq_scale(
                     hfq,
@@ -668,27 +1202,26 @@ impl MiniMaxWeights {
             // (base + local*stride); non-owned e → a shared ZEROED gate_up buffer
             // (→ 0 output ⇒ 0 contribution; down ptr is irrelevant since its rot
             // input is 0, so it reuses the compact down base).
-            // Owned (not forgotten): held in `dummy_gate_up` on the layer below
-            // so the staging guard reclaims it if a later layer fails to load,
-            // and `free_gpu` reclaims it on a successful EP unload. GpuTensor has
-            // no Drop, so leaving it on the stack here would leak its buffer; we
-            // must thread it into the layer struct.
-            let dummy_gate_up = if shard.is_some() && n_owned < n_exp {
-                let z = gpu
-                    .zeros(&[gu_stride / 4], DType::F32)
+            // Owned in `dummy_gate_up` on the layer below so `free_gpu` reclaims
+            // it on a successful EP unload. GpuTensor has no Drop, so leaving it
+            // on the stack here would leak its buffer; we must thread it into
+            // the layer struct.
+            let dummy_slot = if shard.is_some() && n_owned < n_exp {
+                let slot = gpu
+                    .zeros(&[gu_packed_stride / 4], DType::F32)
                     .map_err(|e| format!("minimax L{l}: zero gate_up dummy: {e:?}"))?;
-                Some(z)
+                Some(slot)
             } else {
                 None
             };
-            let dummy_gu = dummy_gate_up
+            let dummy_gu = dummy_slot
                 .as_ref()
                 .map(|z| z.buf.as_ptr() as u64)
                 .unwrap_or(gu_base);
             let gu_bytes: Vec<u8> = (0..n_exp)
                 .flat_map(|e| {
                     let ptr = if owns(e) {
-                        gu_base + (local_of_global[e] * gu_stride) as u64
+                        gu_base + (local_of_global[e] * gu_packed_stride) as u64
                     } else {
                         dummy_gu
                     };
@@ -698,7 +1231,7 @@ impl MiniMaxWeights {
             let dn_bytes: Vec<u8> = (0..n_exp)
                 .flat_map(|e| {
                     let ptr = if owns(e) {
-                        dn_base + (local_of_global[e] * dn_stride) as u64
+                        dn_base + (local_of_global[e] * dn_packed_stride) as u64
                     } else {
                         dn_base // rot input is 0 for non-owned ⇒ output 0 regardless
                     };
@@ -717,6 +1250,7 @@ impl MiniMaxWeights {
             gpu.hip
                 .memcpy_htod(&expert_down_ptrs.buf, &dn_bytes)
                 .map_err(|e| format!("minimax: htod dn_ptrs: {e:?}"))?;
+            let dummy_gate_up = dummy_slot;
 
             layers.push(MiniMaxLayerWeights {
                 attn_norm,
@@ -741,6 +1275,9 @@ impl MiniMaxWeights {
             final_norm,
             lm_head,
             layers,
+            expert_manifest_cache: MiniMaxExpertManifestCache::new(
+                MiniMaxManifestConfigIdentity::from_cfg(cfg),
+            ),
         })
     }
 }
@@ -750,19 +1287,49 @@ impl MiniMaxWeights {
 // compile error, not a silent VRAM leak. WeightTensors use `free_all`
 // (buf + non-aliased ParoQuant rotation + AWQ sidecar).
 //
-// SHARD=None (single-GPU) LAYOUT ONLY. The only caller that reaches this via
-// unload_model is `load_minimax` (shard=None, MiniMaxWeights::load → arch.rs
-// `..None`), where every expert is a distinct allocation. The EP packed-blob
-// path (shard=Some) aliases non-owned experts onto a shared zeroed buffer and
-// lives only in the standalone ep_minimax example, which manages its own
-// teardown and never builds a LoadedModel — so per-expert free is double-free
-// safe here.
+// Every load layout owns ONE packed gate_up/down pair per layer (the indexed
+// kernels reach all experts through the device-pointer tables into those
+// blobs):
+// - shard=None (single-GPU) and the safetensors path: the layer's single
+//   `MiniMaxExpertWeights` IS the full packed pair over all experts.
+// - shard=Some (EP packed blob, load_model_ep_minimax → LoadedModel →
+//   unload_model): the layer's pair packs only the rank-owned expert subset;
+//   non-owned experts alias the shared zeroed `dummy_gate_up` buffer, which
+//   the layer additionally owns and frees (None otherwise).
+// Per-expert `free_gpu` therefore releases each packed blob exactly once in
+// every layout — no double free, no leak — and the dummy, when present, is
+// reclaimed with its layer.
 
 impl MiniMaxExpertWeights {
     pub fn free_gpu(self, gpu: &mut Gpu) {
         let MiniMaxExpertWeights { gate_up, down } = self;
         gate_up.free_all(gpu);
         down.free_all(gpu);
+    }
+
+    /// Exact-retention checked GPU cleanup. Consumes `self`, attempts every
+    /// owned weight even after failures, retains the exact original owners on
+    /// failure, and returns only the failures.
+    pub fn free_checked(self, gpu: &mut Gpu) -> Result<(), GpuCleanupFailure> {
+        let MiniMaxExpertWeights { gate_up, down } = self;
+        let mut cf = GpuCleanupFailure::empty();
+        free_weight_all_checked(
+            "MiniMaxExpertWeights.gate_up",
+            gate_up,
+            gpu,
+            &mut cf.failed_tensors,
+        );
+        free_weight_all_checked(
+            "MiniMaxExpertWeights.down",
+            down,
+            gpu,
+            &mut cf.failed_tensors,
+        );
+        if cf.is_empty() {
+            Ok(())
+        } else {
+            Err(cf)
+        }
     }
 }
 
@@ -803,6 +1370,73 @@ impl MiniMaxLayerWeights {
             let _ = gpu.free_tensor(dummy);
         }
     }
+
+    /// Exact-retention checked GPU cleanup. Consumes `self`, attempts every
+    /// owned weight even after failures, retains the exact original owners on
+    /// failure, and returns only the failures. Delegates each expert's packed
+    /// pair to [`MiniMaxExpertWeights::free_checked`] and merges its failures.
+    pub fn free_checked(self, gpu: &mut Gpu) -> Result<(), GpuCleanupFailure> {
+        let MiniMaxLayerWeights {
+            attn_norm,
+            ffn_norm,
+            q_norm,
+            k_norm,
+            wq,
+            wk,
+            wv,
+            wo,
+            router,
+            routing_bias,
+            experts,
+            expert_gate_up_ptrs,
+            expert_down_ptrs,
+            dummy_gate_up,
+        } = self;
+        let mut cf = GpuCleanupFailure::empty();
+        {
+            let failures = &mut cf.failed_tensors;
+            free_tensor_retained("MiniMaxLayerWeights.attn_norm", attn_norm, gpu, failures);
+            free_tensor_retained("MiniMaxLayerWeights.ffn_norm", ffn_norm, gpu, failures);
+            free_tensor_retained("MiniMaxLayerWeights.q_norm", q_norm, gpu, failures);
+            free_tensor_retained("MiniMaxLayerWeights.k_norm", k_norm, gpu, failures);
+            free_weight_all_checked("MiniMaxLayerWeights.wq", wq, gpu, failures);
+            free_weight_all_checked("MiniMaxLayerWeights.wk", wk, gpu, failures);
+            free_weight_all_checked("MiniMaxLayerWeights.wv", wv, gpu, failures);
+            free_weight_all_checked("MiniMaxLayerWeights.wo", wo, gpu, failures);
+            free_weight_all_checked("MiniMaxLayerWeights.router", router, gpu, failures);
+            free_tensor_retained(
+                "MiniMaxLayerWeights.routing_bias",
+                routing_bias,
+                gpu,
+                failures,
+            );
+            free_tensor_retained(
+                "MiniMaxLayerWeights.expert_gate_up_ptrs",
+                expert_gate_up_ptrs,
+                gpu,
+                failures,
+            );
+            free_tensor_retained(
+                "MiniMaxLayerWeights.expert_down_ptrs",
+                expert_down_ptrs,
+                gpu,
+                failures,
+            );
+            if let Some(dummy) = dummy_gate_up {
+                free_tensor_retained("MiniMaxLayerWeights.dummy_gate_up", dummy, gpu, failures);
+            }
+        }
+        for e in experts {
+            if let Err(f) = e.free_checked(gpu) {
+                cf.merge(f);
+            }
+        }
+        if cf.is_empty() {
+            Ok(())
+        } else {
+            Err(cf)
+        }
+    }
 }
 
 impl MiniMaxWeights {
@@ -813,12 +1447,44 @@ impl MiniMaxWeights {
             final_norm,
             lm_head,
             layers,
+            expert_manifest_cache: _, // pure CPU state — nothing to free
         } = self;
         let _ = gpu.free_tensor(embed);
         let _ = gpu.free_tensor(final_norm);
         lm_head.free_all(gpu);
         for layer in layers {
             layer.free_gpu(gpu);
+        }
+    }
+
+    /// Exact-retention checked GPU cleanup. Consumes `self`, attempts every
+    /// owned weight even after failures, retains the exact original owners on
+    /// failure, and returns only the failures. Each layer delegates to
+    /// [`MiniMaxLayerWeights::free_checked`] and its failures are merged.
+    pub fn free_checked(self, gpu: &mut Gpu) -> Result<(), GpuCleanupFailure> {
+        let MiniMaxWeights {
+            embed,
+            final_norm,
+            lm_head,
+            layers,
+            expert_manifest_cache: _, // pure CPU state — nothing to free
+        } = self;
+        let mut cf = GpuCleanupFailure::empty();
+        {
+            let failures = &mut cf.failed_tensors;
+            free_tensor_retained("MiniMaxWeights.embed", embed, gpu, failures);
+            free_tensor_retained("MiniMaxWeights.final_norm", final_norm, gpu, failures);
+            free_weight_all_checked("MiniMaxWeights.lm_head", lm_head, gpu, failures);
+        }
+        for layer in layers {
+            if let Err(f) = layer.free_checked(gpu) {
+                cf.merge(f);
+            }
+        }
+        if cf.is_empty() {
+            Ok(())
+        } else {
+            Err(cf)
         }
     }
 }
@@ -906,7 +1572,7 @@ impl MiniMaxState {
             final_rot,
             logits,
         } = self;
-        kv.free_gpu(gpu);
+        let _ = kv.free_gpu(gpu);
         // pos_buf is a raw DeviceBuffer (no Drop impl) — free explicitly.
         let _ = gpu.hip.free(pos_buf);
         for t in [
@@ -932,6 +1598,88 @@ impl MiniMaxState {
             logits,
         ] {
             let _ = gpu.free_tensor(t);
+        }
+    }
+
+    /// Exact-retention checked GPU cleanup. Consumes `self`, attempts every
+    /// owned buffer even after failures (KV cache, position scalar, all
+    /// decode scratch), retains the exact original owners on failure, and
+    /// returns only the failures. `pos_host` is host memory (Box) — no GPU
+    /// free. `pos_buf` is a raw `DeviceBuffer` → honest `GpuTensor` wrapper
+    /// (`DType::Raw`), mirroring the qwen35 precedent.
+    pub fn free_checked(self, gpu: &mut Gpu) -> Result<(), GpuCleanupFailure> {
+        let MiniMaxState {
+            kv,
+            pos_buf,
+            pos_host: _,
+            max_seq: _,
+            n_tokens: _,
+            ar_warmed_up: _,
+            tmp,
+            x_rot,
+            fa_q,
+            fa_k,
+            fa_v,
+            fa_attn_out,
+            flash_partials,
+            h,
+            ffn_tmp,
+            ffn_x_rot,
+            router_logits,
+            topk_indices,
+            topk_weights,
+            gate_batch,
+            up_batch,
+            rot_batch,
+            down_expanded,
+            final_norm_buf,
+            final_rot,
+            logits,
+        } = self;
+        let mut cf = GpuCleanupFailure::empty();
+        {
+            let failures = &mut cf.failed_tensors;
+            retain_kv_failures(kv.free_checked(gpu), failures);
+            // pos_buf: raw DeviceBuffer → honest GpuTensor wrapper (Raw dtype).
+            free_tensor_retained(
+                "MiniMaxState.pos_buf",
+                GpuTensor {
+                    buf: pos_buf,
+                    shape: vec![],
+                    dtype: DType::Raw,
+                },
+                gpu,
+                failures,
+            );
+            for (label, t) in [
+                ("MiniMaxState.tmp", tmp),
+                ("MiniMaxState.x_rot", x_rot),
+                ("MiniMaxState.fa_q", fa_q),
+                ("MiniMaxState.fa_k", fa_k),
+                ("MiniMaxState.fa_v", fa_v),
+                ("MiniMaxState.fa_attn_out", fa_attn_out),
+                ("MiniMaxState.flash_partials", flash_partials),
+                ("MiniMaxState.h", h),
+                ("MiniMaxState.ffn_tmp", ffn_tmp),
+                ("MiniMaxState.ffn_x_rot", ffn_x_rot),
+                ("MiniMaxState.router_logits", router_logits),
+                ("MiniMaxState.topk_indices", topk_indices),
+                ("MiniMaxState.topk_weights", topk_weights),
+                ("MiniMaxState.gate_batch", gate_batch),
+                ("MiniMaxState.up_batch", up_batch),
+                ("MiniMaxState.rot_batch", rot_batch),
+                ("MiniMaxState.down_expanded", down_expanded),
+                ("MiniMaxState.final_norm_buf", final_norm_buf),
+                ("MiniMaxState.final_rot", final_rot),
+                ("MiniMaxState.logits", logits),
+            ] {
+                free_tensor_retained(label, t, gpu, failures);
+            }
+        }
+        if cf.is_empty() {
+            Ok(())
+        } else {
+            Err(cf)
         }
     }
 
@@ -1049,7 +1797,6 @@ impl MiniMaxState {
     pub fn reset(&mut self) {
         self.n_tokens = 0;
     }
-
 }
 
 // ──────────────── ModelSource (safetensors) load helpers ────────────────
@@ -1351,7 +2098,7 @@ pub fn load_weights_from_safetensors(
             &format!("{p}.block_sparse_moe.awq_scale_gate_up.weight"),
             hidden,
         );
-        if std::env::var_os("HIPFIRE_MINIMAX_ENABLE_DOWN_AWQ").is_some() {
+        if hipfire_config::developer_var_os("HIPFIRE_MINIMAX_ENABLE_DOWN_AWQ").is_some() {
             down.awq_scale = load_mm_awq_scale_from_source(
                 source,
                 gpu,
@@ -1419,5 +2166,526 @@ pub fn load_weights_from_safetensors(
         final_norm,
         lm_head,
         layers,
+        expert_manifest_cache: MiniMaxExpertManifestCache::new(
+            MiniMaxManifestConfigIdentity::from_cfg(cfg),
+        ),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::arch::MiniMaxM2;
+    use hipfire_runtime::arch::Architecture;
+    use hipfire_runtime::moe_plan::{MoEExecutionKind, MoEExecutionPolicy};
+    use hipfire_runtime::multi_gpu::{DeviceMesh, DimKind};
+    use hipfire_runtime::weight_manifest::{
+        resolve_expert_manifest_for_policy, ExpertExecutionIdentity,
+    };
+
+    /// TP-valid fixture: even attention head counts (Tp=2 divisibility) and
+    /// inter=512 so every projected TP local slice is 256-aligned.
+    fn test_config_512() -> MiniMaxConfig {
+        MiniMaxConfig {
+            vocab_size: 16,
+            hidden_size: 64,
+            num_hidden_layers: 1,
+            num_attention_heads: 2,
+            num_key_value_heads: 2,
+            head_dim: 64,
+            intermediate_size: 512,
+            num_local_experts: 4,
+            num_experts_per_tok: 2,
+            rotary_dim: 2,
+            rope_theta: 10_000.0,
+            rms_norm_eps: 1e-6,
+            max_position_embeddings: 64,
+            use_qk_norm: true,
+            use_routing_bias: true,
+            scoring_func: "sigmoid".into(),
+            num_mtp_modules: 0,
+            reap_keep: None,
+        }
+    }
+
+    fn test_config_512_layers(n: usize) -> MiniMaxConfig {
+        let mut cfg = test_config_512();
+        cfg.num_hidden_layers = n;
+        cfg
+    }
+
+    /// `test_config_512` with an intermediate dim the TP projection path must
+    /// refuse (8/2 = 4 is not a multiple of 256) — a genuine resolution
+    /// failure used to pin the cached-failure semantics.
+    fn test_config_8() -> MiniMaxConfig {
+        let mut cfg = test_config_512();
+        cfg.intermediate_size = 8;
+        cfg
+    }
+
+    fn projection_policy(kind: MoEExecutionKind, ranks: usize) -> MoEExecutionPolicy {
+        let mesh = match kind {
+            MoEExecutionKind::Single => DeviceMesh::single(),
+            MoEExecutionKind::Tp => DeviceMesh::rect(&[(DimKind::Tp, ranks)]),
+            MoEExecutionKind::Ep => DeviceMesh::rect(&[(DimKind::Ep, ranks)]),
+        };
+        MoEExecutionPolicy::new(kind, mesh).unwrap()
+    }
+
+    #[test]
+    fn expert_group_spec_declares_truthful_f16_footprint() {
+        // One expert's resident F16 footprint = gate (w1) + up (w3) + down
+        // (w2) matrices, each hidden x inter elements x 2 bytes.
+        let cfg = test_config_512();
+        let specs = MiniMaxM2::expert_group_manifest(&cfg, &MoEExecutionPolicy::single());
+        assert_eq!(
+            specs[0].resources.bytes_per_expert,
+            3 * cfg.hidden_size * cfg.intermediate_size * 2,
+            "truthful declared F16 footprint is 3 * hidden * inter * 2"
+        );
+    }
+
+    #[test]
+    fn authority_plan_borrow_rejects_router_identity_mismatch() {
+        // Batched semantic admission: the direct batched indexed sigmoid
+        // kernels require the exact `sigmoid_topk` router identity. A plan
+        // declaring any other router identity must be refused before kernels
+        // use that layer.
+        let cfg = test_config_512();
+        let single = MoEExecutionPolicy::single();
+        let specs = MiniMaxM2::expert_group_manifest(&cfg, &single);
+        let manifest = MiniMaxM2::weight_manifest(&cfg);
+        let resolution = resolve_expert_manifest_for_policy(&specs, &manifest, &single).unwrap();
+        let mut wrong_router = resolution.clone();
+        wrong_router.plans[0].router_identity = "bias_aware_topk".into();
+        let authority = SingleMoeAuthority::new(&single, &wrong_router);
+        let err = authority.plan_for_layer(0).unwrap_err();
+        assert!(err.contains("sigmoid_topk"), "got: {err}");
+    }
+
+    /// Canned seam output: a valid resolution tagged with the requested
+    /// policy kind + rank count, so a winner-tagged result can be proven to
+    /// belong to the requesting thread's OWN key.
+    fn canned_resolution_tagged(
+        policy: &MoEExecutionPolicy,
+        tag: &str,
+    ) -> ExpertManifestResolution {
+        use hipfire_runtime::tp_shard::ExpertAssign;
+        use hipfire_runtime::weight_manifest::{
+            ExpertGroupPlan, ExpertParallelism, ExpertResourceRequirements, ExpertSourceLayout,
+        };
+        ExpertManifestResolution {
+            plans: vec![ExpertGroupPlan {
+                group: format!("{tag}:{:?}:{}", policy.kind(), policy.rank_count()),
+                layer: Some(0),
+                n_experts: 4,
+                group_size: policy.rank_count(),
+                parallelism: match policy.kind() {
+                    MoEExecutionKind::Single => ExpertParallelism::Single,
+                    MoEExecutionKind::Tp => ExpertParallelism::TensorParallel,
+                    MoEExecutionKind::Ep => ExpertParallelism::ExpertParallel,
+                },
+                assignment: ExpertAssign::Stride,
+                experts: Vec::new(),
+                source_layout: ExpertSourceLayout::PackedSeparate {
+                    gate: "experts_gate".into(),
+                    up: "experts_up".into(),
+                    down: "experts_down".into(),
+                    sidecars: Vec::new(),
+                },
+                resources: ExpertResourceRequirements {
+                    bytes_per_expert: 1,
+                    alignment: 256,
+                },
+                router: "router".into(),
+                router_identity: "sigmoid_topk".into(),
+                allowed_executions: vec![ExpertExecutionIdentity::IndexedQuantized],
+                collective: None,
+            }],
+            layer_collectives: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn first_call_wrong_config_refuses_and_leaves_cache_unseeded() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let cfg_a = test_config_512();
+        // Success-capable mismatch: cfg_b would resolve fine, but it is NOT
+        // the config the cache was bound to at load.
+        let cfg_b = test_config_512_layers(2);
+        let cache = MiniMaxExpertManifestCache::with_seams(
+            MiniMaxManifestConfigIdentity::from_cfg(&cfg_a),
+            Box::new({
+                let calls = Arc::clone(&calls);
+                move |_cfg: &MiniMaxConfig, policy: &MoEExecutionPolicy| {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(canned_resolution_tagged(policy, "a"))
+                }
+            }),
+            None,
+        );
+        let single = MoEExecutionPolicy::single();
+        // WRONG FIRST request: refused explicitly, and the cache stays
+        // unseeded — the resolver (launch-capable seam) never runs.
+        let err = cache.get_or_resolve(&cfg_b, &single).unwrap_err();
+        assert!(err.contains("refusing reuse"), "got: {err}");
+        assert!(err.contains("config"), "got: {err}");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "a wrong first request must leave the cache empty/unbound"
+        );
+        // The load-bound config then resolves fresh.
+        let first = cache.get_or_resolve(&cfg_a, &single).unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        // Repeated load-bound requests reuse the identical cached object.
+        let second = cache.get_or_resolve(&cfg_a, &single).unwrap();
+        assert!(std::ptr::eq(first, second));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn cache_reuses_identical_object_and_rejects_policy_mismatch() {
+        let cfg = test_config_512();
+        let cache = MiniMaxExpertManifestCache::new(MiniMaxManifestConfigIdentity::from_cfg(&cfg));
+        let single = MoEExecutionPolicy::single();
+        let first = cache.get_or_resolve(&cfg, &single).unwrap();
+        let second = cache.get_or_resolve(&cfg, &single).unwrap();
+        assert!(std::ptr::eq(first, second));
+        assert_eq!(first, second);
+        assert_eq!(first.plans[0].collective, None);
+        // Same kind (Tp) but a different mesh — both constructible — refuses
+        // reuse instead of re-resolving.
+        let tp2 = projection_policy(MoEExecutionKind::Tp, 2);
+        let tp1 = projection_policy(MoEExecutionKind::Tp, 1);
+        let cache = MiniMaxExpertManifestCache::new(MiniMaxManifestConfigIdentity::from_cfg(&cfg));
+        assert_eq!(
+            cache.get_or_resolve(&cfg, &tp2).unwrap().plans[0].group_size,
+            2
+        );
+        let err = cache.get_or_resolve(&cfg, &tp1).unwrap_err();
+        assert!(err.contains("exact policy"), "got: {err}");
+        assert!(err.contains("Tp"), "got: {err}");
+        let ep2 = projection_policy(MoEExecutionKind::Ep, 2);
+        let err = cache.get_or_resolve(&cfg, &ep2).unwrap_err();
+        assert!(err.contains("exact policy"), "got: {err}");
+    }
+
+    #[test]
+    fn cache_caches_failure_and_stays_bound() {
+        // TP projection of the invalid fixture is refused (local slice 8/2=4
+        // is not a multiple of 256) — a genuine resolution failure cached as
+        // failure: no fallback, no re-resolution, no weakening.
+        let cfg = test_config_8();
+        let cache = MiniMaxExpertManifestCache::new(MiniMaxManifestConfigIdentity::from_cfg(&cfg));
+        let tp2 = projection_policy(MoEExecutionKind::Tp, 2);
+        let err1 = cache.get_or_resolve(&cfg, &tp2).unwrap_err();
+        assert!(err1.contains("multiple of 256"), "got: {err1}");
+        let err2 = cache.get_or_resolve(&cfg, &tp2).unwrap_err();
+        assert_eq!(err1, err2, "cached failure must stay the same failure");
+        // The cache stays bound to the FAILED policy: a policy that would
+        // otherwise resolve (Single) is refused — proof the failure was
+        // cached, not re-resolved.
+        let err3 = cache
+            .get_or_resolve(&cfg, &MoEExecutionPolicy::single())
+            .unwrap_err();
+        assert!(err3.contains("exact policy"), "got: {err3}");
+    }
+
+    #[test]
+    fn single_policy_object_is_stable() {
+        let cfg = test_config_512();
+        let cache = MiniMaxExpertManifestCache::new(MiniMaxManifestConfigIdentity::from_cfg(&cfg));
+        let p1 = cache.single_policy();
+        let p2 = cache.single_policy();
+        assert!(
+            std::ptr::eq(p1, p2),
+            "single policy must be one stable object"
+        );
+        assert_eq!(p1.rank_count(), 1);
+        assert_eq!(p1.kind(), MoEExecutionKind::Single);
+        let first = cache.get_or_resolve(&cfg, p1).unwrap();
+        let second = cache.get_or_resolve(&cfg, p2).unwrap();
+        assert!(std::ptr::eq(first, second));
+    }
+
+    #[test]
+    fn initialized_tp_lookup_constructs_no_owned_key() {
+        use std::sync::atomic::Ordering;
+        // The cached fast path must compare the BORROWED request against the
+        // stored key — no owned MoEExecutionPolicy/mesh-axis clone on
+        // repeated initialized lookups. The cfg(test) construction counter
+        // counts cold-path owned-key constructions.
+        let cfg = test_config_512();
+        let policy = projection_policy(MoEExecutionKind::Tp, 2);
+        let cache = MiniMaxExpertManifestCache::new(MiniMaxManifestConfigIdentity::from_cfg(&cfg));
+        let first = cache.get_or_resolve(&cfg, &policy).unwrap();
+        assert_eq!(cache.cold_constructs.load(Ordering::SeqCst), 1);
+        for _ in 0..100 {
+            let again = cache.get_or_resolve(&cfg, &policy).unwrap();
+            assert!(std::ptr::eq(first, again));
+        }
+        assert_eq!(
+            cache.cold_constructs.load(Ordering::SeqCst),
+            1,
+            "repeated initialized TP/EP lookup must perform zero owned-key/policy constructions"
+        );
+    }
+
+    #[test]
+    fn concurrent_same_key_resolves_once_via_race_seam() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Barrier};
+        const N: usize = 8;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let rendezvous = Arc::new(Barrier::new(N));
+        let cfg = test_config_512();
+        let cache = MiniMaxExpertManifestCache::with_seams(
+            MiniMaxManifestConfigIdentity::from_cfg(&cfg),
+            Box::new({
+                let calls = Arc::clone(&calls);
+                move |_cfg: &MiniMaxConfig, policy: &MoEExecutionPolicy| {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(canned_resolution_tagged(policy, "same"))
+                }
+            }),
+            Some(Arc::new(move || {
+                rendezvous.wait();
+            })),
+        );
+        let policy = MoEExecutionPolicy::single();
+        // Shared references: the spawn closures move copies of these.
+        let cache = &cache;
+        let cfg = &cfg;
+        let policy = &policy;
+        let start = Arc::new(Barrier::new(N));
+        let results: Vec<Result<usize, String>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..N)
+                .map(|_| {
+                    let start = Arc::clone(&start);
+                    scope.spawn(move || {
+                        start.wait();
+                        cache
+                            .get_or_resolve(&cfg, &policy)
+                            .map(|r| r as *const ExpertManifestResolution as usize)
+                            .map_err(|e| e)
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        // Every contender observed the empty cell, rendezvoused at the
+        // cfg(test) hook, and then all entered get_or_init: exactly one
+        // resolver invocation, one cached object.
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "same-key resolution must run exactly once"
+        );
+        assert_eq!(
+            cache.cold_constructs.load(Ordering::SeqCst),
+            1,
+            "only the winning initializer may construct the owned key/policy"
+        );
+        assert!(results.iter().all(|r| r.is_ok()), "{results:?}");
+        let addr = results[0].as_ref().unwrap();
+        assert!(
+            results.iter().all(|r| r.as_ref().unwrap() == addr),
+            "all callers must observe the IDENTICAL cached object"
+        );
+    }
+
+    #[test]
+    fn concurrent_distinct_policy_first_calls_one_winner_via_race_seam() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Barrier};
+        const N: usize = 8;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let rendezvous = Arc::new(Barrier::new(N));
+        let cfg = test_config_512();
+        let cache = MiniMaxExpertManifestCache::with_seams(
+            MiniMaxManifestConfigIdentity::from_cfg(&cfg),
+            Box::new({
+                let calls = Arc::clone(&calls);
+                move |_cfg: &MiniMaxConfig, policy: &MoEExecutionPolicy| {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(canned_resolution_tagged(policy, "policy"))
+                }
+            }),
+            Some(Arc::new(move || {
+                rendezvous.wait();
+            })),
+        );
+        // Shared references: the spawn closures move copies of these.
+        let cache = &cache;
+        let cfg = &cfg;
+        let start = Arc::new(Barrier::new(N));
+        let policies: Vec<MoEExecutionPolicy> = (1..=N)
+            .map(|r| projection_policy(MoEExecutionKind::Tp, r))
+            .collect();
+        let results: Vec<(MoEExecutionPolicy, Result<String, String>)> =
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = policies
+                    .iter()
+                    .map(|policy| {
+                        let start = Arc::clone(&start);
+                        scope.spawn(move || {
+                            start.wait();
+                            let out = cache
+                                .get_or_resolve(&cfg, policy)
+                                .map(|r| r.plans[0].group.clone());
+                            (policy.clone(), out)
+                        })
+                    })
+                    .collect();
+                handles.into_iter().map(|h| h.join().unwrap()).collect()
+            });
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "distinct first calls: exactly one resolver invocation"
+        );
+        assert_eq!(
+            cache.cold_constructs.load(Ordering::SeqCst),
+            1,
+            "only the winning initializer may construct the owned key/policy"
+        );
+        let oks: Vec<&(MoEExecutionPolicy, Result<String, String>)> =
+            results.iter().filter(|(_, r)| r.is_ok()).collect();
+        let mismatches: Vec<&(MoEExecutionPolicy, Result<String, String>)> =
+            results.iter().filter(|(_, r)| r.is_err()).collect();
+        assert_eq!(oks.len(), 1, "exactly one distinct-key caller may win");
+        assert_eq!(
+            mismatches.len(),
+            N - 1,
+            "every other caller gets a mismatch"
+        );
+        let (winner_policy, winner_group) = (oks[0].0.clone(), oks[0].1.as_ref().unwrap());
+        assert_eq!(
+            winner_group,
+            &format!(
+                "policy:{:?}:{}",
+                winner_policy.kind(),
+                winner_policy.rank_count()
+            ),
+            "winner must observe its OWN key's resolution"
+        );
+        for (policy, r) in &mismatches {
+            let err = r.as_ref().unwrap_err();
+            assert!(err.contains("refusing reuse"), "policy {policy:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn authority_sequential_and_batched_share_identical_objects() {
+        let cfg = test_config_512();
+        let cache = MiniMaxExpertManifestCache::new(MiniMaxManifestConfigIdentity::from_cfg(&cfg));
+        let seq = SingleMoeAuthority::from_cache(&cache, &cfg).unwrap();
+        let batch = SingleMoeAuthority::from_cache(&cache, &cfg).unwrap();
+        assert!(std::ptr::eq(seq.policy(), batch.policy()));
+        assert!(std::ptr::eq(seq.resolution(), batch.resolution()));
+        let again = SingleMoeAuthority::from_cache(&cache, &cfg).unwrap();
+        assert!(std::ptr::eq(batch.policy(), again.policy()));
+        assert!(std::ptr::eq(batch.resolution(), again.resolution()));
+    }
+
+    #[test]
+    fn authority_refuses_mismatched_config_before_admission() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let cfg_a = test_config_512();
+        let cache = MiniMaxExpertManifestCache::with_seams(
+            MiniMaxManifestConfigIdentity::from_cfg(&cfg_a),
+            Box::new({
+                let calls = Arc::clone(&calls);
+                move |_cfg: &MiniMaxConfig, policy: &MoEExecutionPolicy| {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(canned_resolution_tagged(policy, "authority"))
+                }
+            }),
+            None,
+        );
+        let a = SingleMoeAuthority::from_cache(&cache, &cfg_a).unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let mut cfg_b = test_config_512();
+        cfg_b.hidden_size = 128;
+        let err = SingleMoeAuthority::from_cache(&cache, &cfg_b).unwrap_err();
+        assert!(err.contains("refusing reuse"), "got: {err}");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "a mismatched config must never reach the resolver (launch-capable) callback"
+        );
+        assert!(a.plan_for_layer(0).is_ok());
+    }
+
+    #[test]
+    fn authority_plan_borrow_validates_layer_and_single_admission() {
+        let cfg = test_config_512_layers(3);
+        let cache = MiniMaxExpertManifestCache::new(MiniMaxManifestConfigIdentity::from_cfg(&cfg));
+        let authority = SingleMoeAuthority::from_cache(&cache, &cfg).unwrap();
+        for l in 0..3 {
+            let plan = authority.plan_for_layer(l).unwrap();
+            assert_eq!(plan.layer, Some(l));
+            // Exact batched semantic admission on the borrowed plan.
+            assert_eq!(plan.router_identity, "sigmoid_topk");
+            assert!(plan
+                .allowed_executions
+                .contains(&ExpertExecutionIdentity::IndexedQuantized));
+        }
+        // One residual dense row-parallel (wo) collective per layer; the
+        // claimed expert sources are excluded exactly once per layer.
+        assert_eq!(authority.resolution().layer_collectives.len(), 3);
+        assert!(authority
+            .resolution()
+            .layer_collectives
+            .iter()
+            .all(|(l, c)| *l < 3
+                && *c
+                    == hipfire_runtime::multi_gpu::CollectiveHint::AllReduce {
+                        kind: hipfire_runtime::multi_gpu::DimKind::Tp
+                    }));
+        let err = authority.plan_for_layer(3).unwrap_err();
+        assert!(err.contains("out of range"), "got: {err}");
+        let mut mis_scoped = authority.resolution().clone();
+        mis_scoped.plans[0].layer = Some(7);
+        let bad = SingleMoeAuthority::new(authority.policy(), &mis_scoped);
+        let err = bad.plan_for_layer(0).unwrap_err();
+        assert!(err.contains("Some(0)"), "got: {err}");
+        let tp_policy = projection_policy(MoEExecutionKind::Tp, 2);
+        let specs = MiniMaxM2::expert_group_manifest(&cfg, &tp_policy);
+        let manifest = MiniMaxM2::weight_manifest(&cfg);
+        let tp_resolution =
+            resolve_expert_manifest_for_policy(&specs, &manifest, &tp_policy).unwrap();
+        let single = MoEExecutionPolicy::single();
+        let tp_authority = SingleMoeAuthority::new(&single, &tp_resolution);
+        let err = tp_authority.plan_for_layer(0).unwrap_err();
+        assert!(err.contains("not Single-admitted"), "got: {err}");
+        let empty = ExpertManifestResolution {
+            plans: Vec::new(),
+            layer_collectives: Vec::new(),
+        };
+        let empty_authority = SingleMoeAuthority::new(&single, &empty);
+        assert!(empty_authority.plan_for_layer(0).is_err());
+    }
+
+    #[test]
+    fn authority_plan_borrow_rejects_non_indexed_execution() {
+        // Batched semantic admission: the direct batched kernels are the
+        // indexed quantized family; a plan that does not admit
+        // `IndexedQuantized` must be refused before kernels use that layer.
+        let cfg = test_config_512();
+        let single = MoEExecutionPolicy::single();
+        let specs = MiniMaxM2::expert_group_manifest(&cfg, &single);
+        let manifest = MiniMaxM2::weight_manifest(&cfg);
+        let resolution = resolve_expert_manifest_for_policy(&specs, &manifest, &single).unwrap();
+        let mut grouped = resolution.clone();
+        grouped.plans[0].allowed_executions = vec![ExpertExecutionIdentity::GroupedQuantized];
+        let authority = SingleMoeAuthority::new(&single, &grouped);
+        let err = authority.plan_for_layer(0).unwrap_err();
+        assert!(err.contains("IndexedQuantized"), "got: {err}");
+    }
 }
