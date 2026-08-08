@@ -14774,8 +14774,32 @@ pub fn forward_ep_prefill_batch_chunked(
         }
 
         for layer_idx in 0..cfg.num_hidden_layers {
+            let cache_owner = match state_per_rank[0].compressor_cache_placement {
+                crate::deepseek4::CompressorCachePlacement::Replicated => None,
+                crate::deepseek4::CompressorCachePlacement::BlockCyclic(shard) => {
+                    let ratio =
+                        weights_per_rank[0].resolve_layer(layer_idx).compress_ratio as usize;
+                    (ratio > 0).then(|| shard.owner(chunk_start as usize / ratio))
+                }
+            };
+            let rank_at = |ordinal: usize| match cache_owner {
+                None => ordinal,
+                Some(owner) if ordinal == 0 => owner,
+                Some(owner) => {
+                    let other = ordinal - 1;
+                    if other >= owner {
+                        other + 1
+                    } else {
+                        other
+                    }
+                }
+            };
             // Rank-local attention projection and attention body.
-            for rank in 0..n_ranks {
+            // A sharded compressor owner runs first. Its system-scope event
+            // then releases the newly committed rows before the remaining
+            // ranks enqueue sparse-attention reads of that peer allocation.
+            for rank_order in 0..n_ranks {
+                let rank = rank_at(rank_order);
                 let weights = &weights_per_rank[rank];
                 let layer = weights.resolve_layer(layer_idx);
                 if layer.attn_tp_size != n_ranks
@@ -14853,6 +14877,13 @@ pub fn forward_ep_prefill_batch_chunked(
                         false,
                         attention_input_precomputed,
                     )?;
+                }
+                if cache_owner == Some(rank) {
+                    gpus.handoff_rank_stream_reuse(rank).map_err(|error| {
+                        format!(
+                            "TP{n_ranks} prefill compressor handoff l{layer_idx} owner={rank}: {error:?}"
+                        )
+                    })?;
                 }
             }
 
