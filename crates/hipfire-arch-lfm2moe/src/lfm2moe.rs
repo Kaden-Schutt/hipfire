@@ -270,6 +270,11 @@ pub struct Lfm2MoeWeights {
     pub embedding_norm: GpuTensor, // model.embedding_norm.weight (final norm)
     pub lm_head: WeightTensor, // tied = embed_tokens (loaded as Q8 weight)
     pub layers: Vec<Lfm2MoeLayerWeights>,
+    /// Model-owned resolved expert-group plans for the single policy
+    /// (STEP-004 follow-up): resolved exactly once through the manifest
+    /// authority, keyed on the load-bound config identity. Seeded lazily on
+    /// the first MoE forward; success AND failure are cached.
+    pub(crate) moe_group_plans: std::sync::OnceLock<Lfm2MoeGroupPlansCacheEntry>,
 }
 
 impl MmqScreenable for Lfm2MoeWeights {
@@ -831,6 +836,7 @@ impl Lfm2MoeWeights {
             embedding_norm,
             lm_head,
             layers,
+            moe_group_plans: std::sync::OnceLock::new(),
         })
     }
 
@@ -1329,7 +1335,185 @@ pub fn load_weights_from_source(
         embedding_norm,
         lm_head,
         layers,
+        moe_group_plans: std::sync::OnceLock::new(),
     })
+}
+
+/// Model-owned resolved expert-group plans for the single policy (STEP-004
+/// follow-up). Resolution runs exactly once per model through the manifest
+/// authority ([`crate::arch::Lfm2Moe`]'s `weight_manifest` +
+/// `expert_group_manifest`, projected through
+/// `resolve_expert_manifest_for_policy`); every later MoE decode borrows the
+/// same immutable state — no per-token plan construction.
+pub struct Lfm2MoeGroupPlans {
+    pub(crate) plans: Vec<hipfire_runtime::weight_manifest::ExpertGroupPlan>,
+}
+
+impl Lfm2MoeGroupPlans {
+    /// Resolve one validated plan per MoE layer through the manifest
+    /// authority. Dense-only (num_experts == 0) configs resolve an empty set.
+    pub(crate) fn resolve(config: &Lfm2MoeConfig) -> Result<Self, String> {
+        if config.num_experts == 0 {
+            return Ok(Self { plans: Vec::new() });
+        }
+        let policy = hipfire_runtime::moe_plan::MoEExecutionPolicy::single();
+        let specs =
+            <crate::arch::Lfm2Moe as hipfire_runtime::arch::Architecture>::expert_group_manifest(
+                config, &policy,
+            );
+        let manifest =
+            <crate::arch::Lfm2Moe as hipfire_runtime::arch::Architecture>::weight_manifest(config);
+        let resolution = hipfire_runtime::weight_manifest::resolve_expert_manifest_for_policy(
+            &specs, &manifest, &policy,
+        )?;
+        Ok(Self {
+            plans: resolution.plans,
+        })
+    }
+
+    /// Borrow the immutable plan for one global MoE layer. Plans are
+    /// declared in layer order for the MoE span
+    /// (`num_dense_layers..num_hidden_layers`), so the layer is found by
+    /// scope, not by index.
+    pub(crate) fn by_layer(
+        &self,
+        layer: usize,
+    ) -> Result<&hipfire_runtime::weight_manifest::ExpertGroupPlan, String> {
+        self.plans
+            .iter()
+            .find(|plan| plan.layer == Some(layer))
+            .ok_or_else(|| format!("lfm2moe: no expert-group plan for MoE layer {layer}"))
+    }
+}
+
+/// Every `Lfm2MoeConfig` field consumed by the LFM2 manifest declarations
+/// (arch.rs) — the complete cache identity. `reap_keep` is deliberately
+/// absent: it is folded into the loaded expert set at config time and does
+/// not change the declared manifest shapes.
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct Lfm2MoeGroupPlanKey {
+    vocab_size: usize,
+    hidden_size: usize,
+    num_hidden_layers: usize,
+    num_attention_heads: usize,
+    num_key_value_heads: usize,
+    head_dim: usize,
+    intermediate_size: usize,
+    moe_intermediate_size: usize,
+    num_experts: usize,
+    num_experts_per_tok: usize,
+    num_dense_layers: usize,
+    tie_word_embeddings: bool,
+    layer_types: Vec<crate::config::MixerKind>,
+}
+
+impl Lfm2MoeGroupPlanKey {
+    fn from_config(cfg: &Lfm2MoeConfig) -> Self {
+        Lfm2MoeGroupPlanKey {
+            vocab_size: cfg.vocab_size,
+            hidden_size: cfg.hidden_size,
+            num_hidden_layers: cfg.num_hidden_layers,
+            num_attention_heads: cfg.num_attention_heads,
+            num_key_value_heads: cfg.num_key_value_heads,
+            head_dim: cfg.head_dim,
+            intermediate_size: cfg.intermediate_size,
+            moe_intermediate_size: cfg.moe_intermediate_size,
+            num_experts: cfg.num_experts,
+            num_experts_per_tok: cfg.num_experts_per_tok,
+            num_dense_layers: cfg.num_dense_layers,
+            tie_word_embeddings: cfg.tie_word_embeddings,
+            layer_types: cfg.layer_types.clone(),
+        }
+    }
+}
+
+/// Borrowed fast-path request identity (no owned clones on the hot path).
+struct Lfm2MoeGroupPlanKeyRef<'a> {
+    vocab_size: usize,
+    hidden_size: usize,
+    num_hidden_layers: usize,
+    num_attention_heads: usize,
+    num_key_value_heads: usize,
+    head_dim: usize,
+    intermediate_size: usize,
+    moe_intermediate_size: usize,
+    num_experts: usize,
+    num_experts_per_tok: usize,
+    num_dense_layers: usize,
+    tie_word_embeddings: bool,
+    layer_types: &'a [crate::config::MixerKind],
+}
+
+impl<'a> Lfm2MoeGroupPlanKeyRef<'a> {
+    fn from_config(cfg: &'a Lfm2MoeConfig) -> Self {
+        Lfm2MoeGroupPlanKeyRef {
+            vocab_size: cfg.vocab_size,
+            hidden_size: cfg.hidden_size,
+            num_hidden_layers: cfg.num_hidden_layers,
+            num_attention_heads: cfg.num_attention_heads,
+            num_key_value_heads: cfg.num_key_value_heads,
+            head_dim: cfg.head_dim,
+            intermediate_size: cfg.intermediate_size,
+            moe_intermediate_size: cfg.moe_intermediate_size,
+            num_experts: cfg.num_experts,
+            num_experts_per_tok: cfg.num_experts_per_tok,
+            num_dense_layers: cfg.num_dense_layers,
+            tie_word_embeddings: cfg.tie_word_embeddings,
+            layer_types: &cfg.layer_types,
+        }
+    }
+}
+
+impl PartialEq<Lfm2MoeGroupPlanKeyRef<'_>> for Lfm2MoeGroupPlanKey {
+    fn eq(&self, other: &Lfm2MoeGroupPlanKeyRef<'_>) -> bool {
+        self.vocab_size == other.vocab_size
+            && self.hidden_size == other.hidden_size
+            && self.num_hidden_layers == other.num_hidden_layers
+            && self.num_attention_heads == other.num_attention_heads
+            && self.num_key_value_heads == other.num_key_value_heads
+            && self.head_dim == other.head_dim
+            && self.intermediate_size == other.intermediate_size
+            && self.moe_intermediate_size == other.moe_intermediate_size
+            && self.num_experts == other.num_experts
+            && self.num_experts_per_tok == other.num_experts_per_tok
+            && self.num_dense_layers == other.num_dense_layers
+            && self.tie_word_embeddings == other.tie_word_embeddings
+            && self.layer_types.as_slice() == other.layer_types
+    }
+}
+
+pub(crate) struct Lfm2MoeGroupPlansCacheEntry {
+    key: Lfm2MoeGroupPlanKey,
+    result: Result<Lfm2MoeGroupPlans, String>,
+}
+
+impl Lfm2MoeWeights {
+    /// The model-owned resolved expert-group plans (STEP-004 follow-up):
+    /// resolved exactly once per model through the validated manifest
+    /// authority; every later MoE decode borrows the same immutable state.
+    /// The entry caches the `Result` (success AND failure) under the config
+    /// identity it was resolved for; a different config identity returns an
+    /// explicit mismatch error and never replaces the cached entry.
+    pub(crate) fn moe_group_plans(
+        &self,
+        config: &Lfm2MoeConfig,
+    ) -> Result<&Lfm2MoeGroupPlans, String> {
+        let request = Lfm2MoeGroupPlanKeyRef::from_config(config);
+        let entry = self
+            .moe_group_plans
+            .get_or_init(|| Lfm2MoeGroupPlansCacheEntry {
+                key: Lfm2MoeGroupPlanKey::from_config(config),
+                result: Lfm2MoeGroupPlans::resolve(config),
+            });
+        if entry.key == request {
+            entry.result.as_ref().map_err(|error| error.clone())
+        } else {
+            Err(format!(
+                "lfm2moe plan cache: config identity mismatch — cached for a \
+                 different config than requested; refusing silent stale reuse"
+            ))
+        }
+    }
 }
 
 /// Per-decode GPU scratch + KV cache (attention layers) + conv-state cache
