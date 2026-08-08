@@ -13,6 +13,7 @@
 //! (DFlash, DDTree), demand paging (cpu_router, weight_pager), and the
 //! [`arch::Architecture`] trait.
 
+pub mod admission;
 pub mod arch;
 pub mod arch_spec;
 pub mod augmentor;
