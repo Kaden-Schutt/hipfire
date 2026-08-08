@@ -135,7 +135,21 @@ rc=$?
 # Report any GTT this run failed to release. A leak here is invisible to ps and
 # to free's per-process view, so if we do not say it, nothing will.
 if [ -n "$gtt_file" ] && [ -r "$gtt_file" ]; then
+  # Let the driver settle before reading. amdgpu frees GTT asynchronously after
+  # the process exits, so sampling immediately reports a phantom leak -- this
+  # check's very first real use flagged +4.80 GiB that had fully drained a few
+  # seconds later. Poll until it stops falling rather than trusting one sample.
   gtt_after_gib=$(awk '{printf "%.2f", $1/1073741824}' "$gtt_file")
+  for _ in 1 2 3 4 5 6; do
+    sleep 0.5
+    gtt_now_gib=$(awk '{printf "%.2f", $1/1073741824}' "$gtt_file")
+    # Stop early once it is back at or below where we started.
+    if awk -v n="$gtt_now_gib" -v b="$gtt_before_gib" 'BEGIN{exit !(n <= b + 0.05)}'; then
+      gtt_after_gib="$gtt_now_gib"
+      break
+    fi
+    gtt_after_gib="$gtt_now_gib"
+  done
   leak_gib=$(awk -v a="$gtt_after_gib" -v b="$gtt_before_gib" 'BEGIN{printf "%.2f", a-b}')
   if awk -v l="$leak_gib" 'BEGIN{exit !(l > 0.5)}'; then
     echo "run-bounded: WARNING — GTT rose ${gtt_before_gib} -> ${gtt_after_gib} GiB (+${leak_gib} GiB)." >&2
