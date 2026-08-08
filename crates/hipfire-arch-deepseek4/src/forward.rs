@@ -323,6 +323,45 @@ mod config_cache {
     pub(super) fn gfx1201_rmsnorm_rotate_nox_on(arch: &str, mq2r: bool) -> bool {
         arch == "gfx1201" && mq2r
     }
+    /// Exact-gfx1100 MQ2R low-LDS RMSNorm/FWHT (`nox`). Default OFF behind
+    /// `HIPFIRE_DS4_GFX1100_NOX=1`. Independent of R3b T1024; both change
+    /// FP32 reduction order and need separate goldens.
+    pub(super) fn gfx1100_rmsnorm_rotate_nox_on(arch: &str, mq2r: bool) -> bool {
+        static V: LazyLock<bool> = LazyLock::new(|| flag_one("HIPFIRE_DS4_GFX1100_NOX"));
+        arch == "gfx1100" && mq2r && *V
+    }
+    /// `HIPFIRE_HC_CTRL_T1024` prefer flag for the fused control path.
+    /// gfx1100: requires R2 fuse (`hc_control_finalize_fused_on`) + MQ2R;
+    /// logs once and returns false if T1024 is set without fuse. Other
+    /// arches leave selection to `attention.rs` env (prefer stays false).
+    pub(super) fn hc_ctrl_t1024_prefer(
+        arch: &str,
+        mq2r: bool,
+        fused_control_finalize: bool,
+    ) -> bool {
+        static ENV: LazyLock<bool> = LazyLock::new(|| flag_one("HIPFIRE_HC_CTRL_T1024"));
+        let env_on = *ENV;
+        if !env_on {
+            return false;
+        }
+        if arch != "gfx1100" {
+            // Bare env still honored inside `hc_compute_control_vec4_finalize`
+            // for gfx1151/gfx1201/etc. Prefer stays false so the two paths
+            // don't double-count.
+            return false;
+        }
+        if fused_control_finalize && mq2r {
+            return true;
+        }
+        static WARNED: OnceLock<()> = OnceLock::new();
+        let _ = WARNED.get_or_init(|| {
+            eprintln!(
+                "[hipfire] HIPFIRE_HC_CTRL_T1024=1 on gfx1100 ignored without \
+                 HIPFIRE_DS4_GFX1100_HC_FUSE=1 and MQ2R; control width stays 256"
+            );
+        });
+        false
+    }
     /// Candidate-only exact-gfx1201 head-strided indexer-Q RoPE. Default OFF
     /// until the composed product route clears its performance and decoded-byte
     /// gates; the promoted form becomes an architecture default.
@@ -770,6 +809,23 @@ mod config_cache {
                         != Some("0")
                 }))
     }
+    /// `HIPFIRE_DS4_GFX1100_E8_MLP` — dense E8 SoA MLP variant for gfx1100 (R4-BW).
+    /// Widen codeword loads to dwordx4, 8 rows per 256-thread workgroup,
+    /// quad unroll, min-waves hint. Bit-exact with the generic SoA path
+    /// (same decode + same FMA order + same shfl reduction); only the
+    /// launch geometry and vector-width differ. Default OFF — Wave 2 screens
+    /// each lever independently, so no lever may implicitly enable another.
+    /// Additionally gated on exact `gfx1100` + MQ2R; inert on gfx1151,
+    /// gfx1201, Qwen, MiniMax and every other arch/format.
+    pub(super) fn e8_mlp_on(arch: &str, mq2r: bool) -> bool {
+        static V: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            hipfire_config::developer_var("HIPFIRE_DS4_GFX1100_E8_MLP")
+                .ok()
+                .as_deref()
+                == Some("1")
+        });
+        arch == "gfx1100" && mq2r && *V
+    }
     /// `HIPFIRE_DEEPSEEK4_FUSED_ROUTE_ACT` — fold the MoE routing activation
     /// `sqrt(softplus(.))` into the store of the gate GEMV instead of running
     /// the standalone `sqrt_softplus_f32` launch.
@@ -888,17 +944,31 @@ mod config_cache {
         static V: OnceLock<bool> = OnceLock::new();
         arch == "gfx1151" && (mq2r || *V.get_or_init(|| flag_one("HIPFIRE_DEEPSEEK4_HC_PINGPONG")))
     }
+    /// Fused single-wave HC finalizer (`hc_finalize_control`) replacing the
+    /// three scalar launches. gfx1151 MQ2R / opt-in; gfx1201 MQ2R always;
+    /// gfx1100 MQ2R behind `HIPFIRE_DS4_GFX1100_HC_FUSE=1` (default off).
     pub(super) fn hc_finalize_fused_on(arch: &str, mq2r: bool) -> bool {
         static V: OnceLock<bool> = OnceLock::new();
+        static GFX1100: OnceLock<bool> = OnceLock::new();
         (arch == "gfx1151"
             && (mq2r || *V.get_or_init(|| flag_one("HIPFIRE_DEEPSEEK4_HC_FINALIZE_FUSED"))))
             || (arch == "gfx1201" && mq2r)
+            || (arch == "gfx1100"
+                && mq2r
+                && *GFX1100.get_or_init(|| flag_one("HIPFIRE_DS4_GFX1100_HC_FUSE")))
     }
+    /// Fused control+finalize (`hc_compute_control_vec4_finalize`). Same arch
+    /// matrix as `hc_finalize_fused_on`. R3b T1024 sits on this path only —
+    /// read this helper rather than re-checking arch/format.
     pub(super) fn hc_control_finalize_fused_on(arch: &str, mq2r: bool) -> bool {
         static V: OnceLock<bool> = OnceLock::new();
+        static GFX1100: OnceLock<bool> = OnceLock::new();
         (arch == "gfx1151"
             && (mq2r || *V.get_or_init(|| flag_one("HIPFIRE_DEEPSEEK4_HC_CONTROL_FINALIZE_FUSED"))))
             || (arch == "gfx1201" && mq2r)
+            || (arch == "gfx1100"
+                && mq2r
+                && *GFX1100.get_or_init(|| flag_one("HIPFIRE_DS4_GFX1100_HC_FUSE")))
     }
     pub(super) fn retained_embedding_on(arch: &str, mq2r: bool) -> bool {
         static V: OnceLock<bool> = OnceLock::new();
@@ -930,6 +1000,19 @@ mod config_cache {
             && arch == "gfx1151"
             && *V.get_or_init(|| flag_one("HIPFIRE_DEEPSEEK4_REDLINE_FFN_SPLIT"))
     }
+    /// `HIPFIRE_DS4_GFX1100_E8_PACK=1` — collapse independent same-shape
+    /// MFP4G32E8SOA projections via the exact-gfx1100 shared-jobs kernel.
+    /// Exact gfx1100 + MQ2R only; default OFF. Gate is inert on gfx1151,
+    /// gfx1201, Qwen, MiniMax and every other arch/format. Jobs share one
+    /// activation vector and one K, and require equal M — caller verifies
+    /// each pair before dispatching.
+    pub(super) fn gfx1100_e8_pack_on(arch: &str, mq2r: bool) -> bool {
+        static V: OnceLock<bool> = OnceLock::new();
+        arch == "gfx1100"
+            && mq2r
+            && *V.get_or_init(|| flag_one("HIPFIRE_DS4_GFX1100_E8_PACK"))
+    }
+
 }
 
 /// Crate-visible init log for A2 gfx942 levers (called from arch load path).
@@ -1032,6 +1115,15 @@ fn gemv_auto(
                     gpu.gemv_mfp4g32_e8_soa_u4(weight, x_rotated, y, m, k)
                 }
                 .map_err(|e| format!("gemv MFP4-E8-SoA-U4: {e:?}"))
+            }
+            DType::MFP4G32E8SOA if config_cache::e8_mlp_on(&gpu.arch, true) => {
+                // Gated on exact gfx1100 + MQ2R (the latter is implicit in
+                // this DType::MFP4G32E8SOA arm — only the 0731 MQ2R recipe
+                // emits that dtype). The helper additionally fails closed on
+                // any non-gfx1100 arch, and the rdna-compute method
+                // `gemv_mfp4g32_e8_soa_mlp_gfx1100` asserts is_gfx1100 again.
+                gpu.gemv_mfp4g32_e8_soa_mlp_gfx1100(weight, x_rotated, y, m, k)
+                    .map_err(|e| format!("gemv MFP4-E8-SoA-MLP gfx1100: {e:?}"))
             }
             DType::MFP4G32E8SOA => gpu
                 .gemv_mfp4g32_e8_soa_prerotated(weight, x_rotated, y, m, k)
@@ -2423,6 +2515,36 @@ fn compressor_forward_impl(
         owned_kv_buf = kv_b.sub_offset(b_off * proj_dim, proj_dim);
         owned_score_buf = score_b.sub_offset(b_off * proj_dim, proj_dim);
         (&owned_kv_buf, &owned_score_buf)
+    } else if config_cache::gfx1100_e8_pack_on(&gpu.arch, cfg.mq2r)
+        && wkv.dtype == DType::MFP4G32E8SOA
+        && wgate.dtype == DType::MFP4G32E8SOA
+        && hidden % 256 == 0
+    {
+        // HIPFIRE_DS4_GFX1100_E8_PACK — collapse the two independent
+        // same-shape E8 compressor projections (wkv+wgate share M=proj_dim,
+        // K=hidden, same x) into one shared-jobs launch. Covers all four
+        // groups partitioned by proj_dim:
+        //   main r4   : proj_dim 1024 (42 layers)
+        //   main r128 : proj_dim  512 (40 layers)
+        //   indexer   : proj_dim  256 (42 layers, is_indexer=true, ratio=4)
+        // Arithmetic unchanged: per-row decode + shuffle-down reduction is
+        // identical; only grid collapses from 2×[M,1] to [M,2].
+        // Independence: both read the same x_rotated and write disjoint
+        // buffers (kv_buf vs score_buf); same M/K verified above.
+        let kvb = state._indexer[layer_idx].comp_kv_buf.as_ref().unwrap();
+        let scb = state._indexer[layer_idx].comp_score_buf.as_ref().unwrap();
+        // For E8SOA dtype_needs_rotation is true, so the shared x is the
+        // FWHT-rotated activation (x_rotated). Keep the gate inert on
+        // non-E8 (F16/Q8) where tmp_plain would be the real input.
+        gpu.gemv_mfp4g32_e8_soa_shared_jobs_gfx1100(
+            &[wkv, wgate],
+            x_rotated,
+            &[kvb, scb],
+            proj_dim,
+            hidden,
+        )
+        .map_err(|e| format!("packed comp wkv/wgate l{layer_idx}: {e:?}"))?;
+        (kvb, scb)
     } else {
         let kvb = state._indexer[layer_idx].comp_kv_buf.as_ref().unwrap();
         let scb = state._indexer[layer_idx].comp_score_buf.as_ref().unwrap();
@@ -6685,7 +6807,8 @@ fn ffn_prepare(
             cfg.hidden_size,
             cfg.rms_norm_eps,
             weights.mq2r_backend.is_gfx1151()
-                || config_cache::gfx1201_rmsnorm_rotate_nox_on(&gpu.arch, cfg.mq2r),
+                || config_cache::gfx1201_rmsnorm_rotate_nox_on(&gpu.arch, cfg.mq2r)
+                || config_cache::gfx1100_rmsnorm_rotate_nox_on(&gpu.arch, cfg.mq2r),
         )
         .map_err(|e| format!("fused_rmsnorm_rotate_mq_plain ffn layer {layer_idx}: {e:?}"))?;
     } else {
@@ -6739,29 +6862,57 @@ fn ffn_shared_project(
         dump_dense_activations_if_enabled(gpu, &names, ffn_x_plain, cfg.hidden_size)?;
     }
 
-    // 2. gate = x @ shared_w1
-    gemv_auto(
-        gpu,
-        weights.mq2r_backend,
-        shared_w1,
-        ffn_x_rot,
-        ffn_x_plain,
-        &gate,
-        local_im,
-        cfg.hidden_size,
-    )?;
+    // HIPFIRE_DS4_GFX1100_E8_PACK — collapse the two independent same-shape
+    // E8 projections (w1 and w3 share M=local_im, K=hidden, same x) into one
+    // shared-jobs launch. Arithmetic unchanged: the kernel's per-row body is
+    // byte-identical to two serial E8 GEMVs (same decode, same shuffle-down
+    // reduction), only the grid goes from 2×[M,1] to [M,2].
+    let ffn_pack = config_cache::gfx1100_e8_pack_on(&gpu.arch, cfg.mq2r)
+        && shared_w1.dtype == DType::MFP4G32E8SOA
+        && shared_w3.dtype == DType::MFP4G32E8SOA
+        && cfg.hidden_size % 256 == 0;
+    if ffn_pack {
+        // Independence: gate@w1 and up@w3 both read ffn_x_{rot,plain} and write
+        // disjoint outputs (gate vs up); no data dependency. Same M/K verified
+        // above (M = local_im for both, K = hidden for both).
+        let x = if weight_needs_fwht(shared_w1) {
+            ffn_x_rot
+        } else {
+            ffn_x_plain
+        };
+        gpu.gemv_mfp4g32_e8_soa_shared_jobs_gfx1100(
+            &[shared_w1, shared_w3],
+            x,
+            &[&gate, &up],
+            local_im,
+            cfg.hidden_size,
+        )
+        .map_err(|e| format!("packed shared w1/w3 layer {layer_idx}: {e:?}"))?;
+    } else {
+        // 2. gate = x @ shared_w1
+        gemv_auto(
+            gpu,
+            weights.mq2r_backend,
+            shared_w1,
+            ffn_x_rot,
+            ffn_x_plain,
+            &gate,
+            local_im,
+            cfg.hidden_size,
+        )?;
 
-    // 3. up = x @ shared_w3
-    gemv_auto(
-        gpu,
-        weights.mq2r_backend,
-        shared_w3,
-        ffn_x_rot,
-        ffn_x_plain,
-        &up,
-        local_im,
-        cfg.hidden_size,
-    )?;
+        // 3. up = x @ shared_w3
+        gemv_auto(
+            gpu,
+            weights.mq2r_backend,
+            shared_w3,
+            ffn_x_rot,
+            ffn_x_plain,
+            &up,
+            local_im,
+            cfg.hidden_size,
+        )?;
+    }
 
     // 4-5. DeepSeek V4 SwiGLU with swiglu_limit clamp, optionally fused with
     //      the FWHT rotation when shared_w2 is MQ4. The fused kernel
@@ -7558,7 +7709,8 @@ fn ffn_hash_routed(
             im,
             k_top,
             weights.mq2r_backend.is_gfx1151()
-                || config_cache::gfx1201_rmsnorm_rotate_nox_on(&gpu.arch, cfg.mq2r),
+                || config_cache::gfx1201_rmsnorm_rotate_nox_on(&gpu.arch, cfg.mq2r)
+                || config_cache::gfx1100_rmsnorm_rotate_nox_on(&gpu.arch, cfg.mq2r),
         )
         .map_err(|e| format!("fused down hash l{layer_idx}: {e:?}"))?;
     }
@@ -8705,7 +8857,7 @@ fn mhc_pre(
             post_scale,
             cfg.hc_sinkhorn_iters as i32,
             control_rsqrt_once,
-            false,
+            config_cache::hc_ctrl_t1024_prefer(&gpu.arch, cfg.mq2r, fused_control_finalize),
         )
         .map_err(|e| format!("hc_compute_control_vec4_finalize layer {layer_idx}: {e:?}"))?;
     } else {
@@ -9218,7 +9370,8 @@ fn q_lora_prepare(
             tmp_plain,
             cfg.hidden_size,
             cfg.rms_norm_eps,
-            weights.mq2r_backend.is_gfx1151(),
+            weights.mq2r_backend.is_gfx1151()
+                || config_cache::gfx1100_rmsnorm_rotate_nox_on(&gpu.arch, cfg.mq2r),
         )
         .map_err(|e| format!("fused_rmsnorm_rotate_mq_plain layer {layer_idx}: {e:?}"))?;
     } else {
@@ -16366,8 +16519,15 @@ mod tests {
         assert!(!config_cache::hc_control_finalize_fused_on(
             "gfx1201", false
         ));
+        // gfx1100 HC fusions stay default-OFF behind HIPFIRE_DS4_GFX1100_HC_FUSE.
         assert!(!config_cache::hc_finalize_fused_on("gfx1100", true));
+        assert!(!config_cache::hc_control_finalize_fused_on("gfx1100", true));
+        assert!(!config_cache::hc_finalize_fused_on("gfx1100", false));
+        assert!(!config_cache::hc_control_finalize_fused_on(
+            "gfx1100", false
+        ));
         assert!(!config_cache::hc_finalize_fused_on("gfx942", true));
+        assert!(!config_cache::hc_control_finalize_fused_on("gfx942", true));
         assert!(config_cache::gfx1201_e8_wo_grouped_on("gfx1201", true));
         assert!(!config_cache::gfx1201_e8_wo_grouped_on("gfx1201", false));
         assert!(!config_cache::gfx1201_e8_wo_grouped_on("gfx1151", true));
@@ -16381,6 +16541,30 @@ mod tests {
         ));
         assert!(!config_cache::gfx1201_rmsnorm_rotate_nox_on(
             "gfx1100", true
+        ));
+        // gfx1100 nox stays default-OFF behind HIPFIRE_DS4_GFX1100_NOX.
+        assert!(!config_cache::gfx1100_rmsnorm_rotate_nox_on(
+            "gfx1100", true
+        ));
+        assert!(!config_cache::gfx1100_rmsnorm_rotate_nox_on(
+            "gfx1100", false
+        ));
+        assert!(!config_cache::gfx1100_rmsnorm_rotate_nox_on(
+            "gfx1201", true
+        ));
+        assert!(!config_cache::gfx1100_rmsnorm_rotate_nox_on(
+            "gfx1151", true
+        ));
+        // T1024 prefer is env-driven; without HIPFIRE_HC_CTRL_T1024 it is off
+        // even when fuse would admit (fuse itself default-off on gfx1100).
+        assert!(!config_cache::hc_ctrl_t1024_prefer(
+            "gfx1100", true, true
+        ));
+        assert!(!config_cache::hc_ctrl_t1024_prefer(
+            "gfx1100", true, false
+        ));
+        assert!(!config_cache::hc_ctrl_t1024_prefer(
+            "gfx1201", true, true
         ));
     }
 

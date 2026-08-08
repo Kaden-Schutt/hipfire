@@ -131,24 +131,38 @@ same efficiency on gfx1100 is **802 GB/s**. That, not 600, is the target.
 
 #### Why the dense kernel sits at 39%
 
-From source. The limiter is memory-level parallelism, not decode arithmetic:
+**Corrected 2026-08-07 against generated ISA.** An earlier revision of this
+section claimed codeword loads were "4 B per lane, a plain `dword`" and that
+widening to `dwordx4` was the primary lever. That was read off source index
+arithmetic, not compiled output, and it is **wrong**. Disassembly of both
+kernels at `--offload-arch=gfx1100`:
+
+| Kernel | `global_load_b128` | `global_load_b32` | `global_load_u8` |
+|---|---:|---:|---:|
+| generic `gemv_mfp4g32_e8_soa` | 6 | 3 | 3 |
+| candidate `..._mlp.gfx1100` | 10 | 5 | 5 |
+
+`b128` is a 16 B/lane load. The compiler **already** vectorizes the incumbent.
+Load width was never the deficit.
+
+The real limiter is still memory-level parallelism, but it is composed of:
 
 - `__launch_bounds__(32)` with no min-waves hint. The grouped and gfx1151
-  twins both set `(32, 7)`; the generic and buffer variants omit it.
-- One wave per workgroup, one row per workgroup.
-- Codeword loads are 32 × u32 = 128 B per wave — **4 B per lane, a plain
-  `dword`**. A `dwordx4` gives 4× the bytes in flight per instruction.
-- Zero LDS, register decode. ALU is ~10% utilized at these rates; it is not
-  the constraint.
+  twins both set `(32, 7)`; the generic omits it.
+- **One wave per workgroup, one row per workgroup** — the dominant term. Only
+  one memory stream per workgroup, so requests in flight scale with workgroup
+  count rather than with waves.
+- **Shallow unroll** — 2 groups/iteration and 2 accumulators, giving 6 wide
+  loads in flight per iteration where 10 are reachable.
+- Zero LDS, register decode. ALU is ~10% utilized; it is not the constraint.
 - The grouped variant reached 544.2 GB/s from **CU fill alone** (one
-  8,192-wave grid replacing eight 1,024-wave grids), with an identical decode
-  body. That is the direct evidence that occupancy and request concurrency are
-  what is missing.
+  8,192-wave grid replacing eight 1,024-wave grids) with an identical decode
+  body — direct evidence that concurrency, not per-request width, is missing.
 
-Little's Law confirms it: 800 GB/s at ~400 ns VRAM latency needs ~313 KB in
-flight, i.e. ~3.3 KB per CU across 96 CUs. At 128 B per wave-load that is 26
-concurrent loads per CU; at `dwordx4` it is 7. The second is comfortably
-reachable, the first is not.
+Little's Law: 800 GB/s at ~400 ns needs ~313 KB in flight, ~3.3 KB per CU
+across 96 CUs. At `b128` that is ~7 concurrent wide loads per CU — reachable
+by raising waves per workgroup and unroll depth, which is what the candidate
+does.
 
 #### The lift
 
@@ -159,15 +173,87 @@ reachable, the first is not.
 | 700 | 72.9% | 11.41 ms | 1.04 ms |
 | **802** | **83.5%** | **10.86 ms** | **0.93 ms** |
 
-Work items, in the order the evidence supports: widen loads to `dwordx4`;
-multiple rows per workgroup (256 threads × 8 rows) for memory parallelism;
-the `(32, 7)` min-waves hint; deeper unroll for independent loads in flight.
+Work items in evidence order: **rows per workgroup** (256 threads = 8 waves,
+one row each) and **unroll depth** first; min-waves hint second; load width is
+already handled by the compiler and needs no work.
 
-**Blocking caveat:** `ds4_dense_e8` already dispatches
-`gemv_mfp4g32_e8_soa_buffer_gfx1100`
-(`crates/rdna-compute/src/rdna3/gfx1100.rs:70-74`), while H1's 376.7 GB/s is
-the **pre-buffer** profiled symbol. The 7.586 ms line item may already be
-stale. **Re-billing is mandatory before this sizing is trusted** — gate R1.
+**Baseline caveat resolved.** An earlier revision warned that `ds4_dense_e8`
+might dispatch `gemv_mfp4g32_e8_soa_buffer_gfx1100`, making H1's 376.7 GB/s a
+stale pre-buffer number. **It does not.** `ds4_dense_e8`,
+`crates/rdna-compute/src/rdna3/gfx1100.rs`, and
+`gemv_mfp4g32_e8_soa_buffer.gfx1100.hip` do not exist on `ds4-beta-staging` —
+they are `ds4-harmonic-experimental` assets that the scouting pass read from
+the wrong worktree. On staging the live gfx1100 dense-E8 dispatch is the
+**generic fallback** at `crates/rdna-compute/src/gemv.rs`, with no gfx1100
+branch at all. H1's profiled symbol is the deployed symbol, so the 7.586 ms
+line item stands. R1 still re-bills per shape, but the sizing is not at risk.
+
+The harmonic branch's unlanded gfx1100 E8 assets (`buffer`, `prefetch4_buffer`,
+`scale_broadcast`) remain available as prior art if R4-BW needs them.
+
+### 3.3 MEASURED per-shape bill (R1, 2026-08-08)
+
+`rocprofv3` over the last 20 decode positions on `hipx`, branch `54948214e`.
+Aggregate confirms the plan: **511 calls, 7.637 ms/token, 2.858 GB, 374.1 GB/s**
+against a predicted 7.586 / 376.7 — 0.7% apart. Live symbol is the generic
+`gemv_mfp4g32_e8_soa` via `gemv_mfp4g32_e8_soa_prerotated`
+(`forward.rs:1128-1130`). Baseline stands.
+
+Grid is reported in **threads**; workgroup is 32 and one row maps to one
+workgroup, so `M = grid / 32`. Decomposed on that basis (self-consistent to
+0.1% on time and 0.2% on bytes):
+
+| M | calls/tok | ms/tok | MB/tok | GB/s | % peak | projections |
+|---:|---:|---:|---:|---:|---:|---|
+| 129,280 | 1 | 0.412 | 283.4 | 687 | 71.6% | `lm_head` |
+| 32,768 | 43 | 1.610 | 789.1 | 490 | 51.1% | `wq_b` |
+| 8,192 | 21 | 0.230 | 96.3 | 419 | 43.6% | indexer `wq_b` |
+| 4,096 | 86 | 2.042 | 963.8 | 472 | 49.2% | `wo_b` + shared `w2` |
+| 2,048 | 86 | 0.999 | 386.1 | 386 | 40.2% | shared `w1` + `w3` |
+| 1,024 | 85 | 0.890 | 190.8 | **214** | 22.3% | `wq_a` + main comp r4 pair |
+| 512 | 83 | 0.774 | 93.2 | **120** | 12.5% | `wkv` + main comp r128 pair |
+| 256 | 85 | 0.558 | 47.7 | **85** | 8.9% | `ffn.gate` + idx comp pair |
+| 64 | 21 | 0.110 | 2.9 | **27** | 2.8% | indexer `weights_proj` |
+| **total** | **511** | **7.627** | **2853.2** | **374** | 39.0% | |
+
+**This overturns §3.2's targeting.** The plan named `wq_b` + `wo_b` +
+`lm_head` (64.5% of bytes) as the problem. They are the *healthy* half:
+
+| Tier | time | bytes | achieved |
+|---|---:|---:|---:|
+| small-M (M ≤ 2048) | 3.333 ms — **43.7% of time** | 720.7 MB — 25.3% of bytes | **216 GB/s** |
+| large-M (M > 2048) | 4.294 ms — 56.3% | 2132.5 MB — 74.7% | 497 GB/s |
+
+`lm_head` is already at 71.6% of peak. The starvation is entirely in small-M,
+and the cause is trivial once `M = grid/32` is seen: at one row per workgroup,
+M=256 launches 256 waves across 96 CUs — **2.7 waves per CU**. M=64 launches
+0.7. There is nothing to hide latency with.
+
+#### Consequence for R4-BW
+
+**The candidate kernel as built targets the wrong half.** Packing 8 rows into a
+256-thread workgroup leaves the *wave count unchanged* — M=256 becomes 32
+workgroups × 8 waves = the same 256 waves. It improves per-workgroup latency
+hiding, which helps the large-M tier that is already at 497 GB/s. It cannot
+create parallelism where M itself is the limit.
+
+Small-M needs one of:
+- **split-K** — partition K across workgroups, partial dot products, reduce.
+  For M=256, K=4096 an 8-way split gives 2,048 workgroups instead of 256.
+- **R4-PACK** — already implemented, and worth far more than the ~1.45 ms this
+  document originally sized. Every packed group sits inside the starved tier
+  (`w1`+`w3` at 386, main comp r4 at 214, r128 at 120, idx comp at 85 GB/s),
+  and packing a pair doubles the grid exactly where occupancy is the binding
+  constraint.
+
+#### Revised tier projection
+
+| Case | small-M | large-M | tier total | saving | weighted |
+|---|---:|---:|---:|---:|---:|
+| today | 216 | 497 | 7.627 ms | — | 374 GB/s |
+| conservative | 497 | 600 | 5.004 ms | 2.623 ms | 570 GB/s |
+| mid | 687 | 700 | 4.095 ms | 3.532 ms | 697 GB/s |
+| target | 802 | 802 | 3.558 ms | 4.069 ms | 802 GB/s |
 
 ## 4. The imported method (non-negotiable)
 
@@ -372,3 +458,29 @@ gfx1201 work "is isolated on `ds4-gfx1201-opt`" and that the heterogeneous line
 "remains on `ds4-beta-staging`". Both clauses are stale after §7. The file is a
 dated investigation record, so it is left as-written; this section is the
 correction.
+
+## 12. R0 waterline (certified 2026-08-08)
+
+Post-merge re-measurement on `hipx`, branch `ds4-beta-staging` @ `54948214e`.
+
+| Sample | decode tok/s |
+|---|---:|
+| 1 | 32.1705 |
+| 2 | 32.1542 |
+| 3 | 32.1372 |
+
+- **Median 32.154 tok/s**, range spread **0.104%**, 31.100 ms/token.
+- vs the historical 32.003 line: **+0.47%**, within DPM/thermal noise. The
+  merge did not regress the hetero route.
+- All three outputs byte-identical, 2,491 bytes, MD5 `ee05ab4f07393fb7d624d966a7dde4af`.
+- **Golden SHA-256 for every Wave 2 screen:**
+  `3611840208334c77b3cfcf85984786920deabd550ba83311645f413d3ba6608b`
+- Decoded text read and coherent (a Python benchmarking harness); not a token
+  attractor.
+- Binary SHA-256 `921566f4d8e3d3848b0741c0b12c48eabaf8aba4a65e3cf0588c57d59230ced7`,
+  prompt MD5 `593234a767e71b97a3a4dad6431b47ce`, model SHA-256
+  `cbf2bbcfa3f47b1712a071836b2c48232dad7dfb763813a720f7d348a9318cce`.
+- Evidence: `hipx:/home/kaden/ds4-r0-waterline-20260808/`,
+  `hipx:/home/kaden/ds4-r1-rocprof-20260808/`.
+
+Gap to the 50 tok/s AR target from this waterline: **+55.5%**.

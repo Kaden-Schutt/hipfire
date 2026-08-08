@@ -4907,6 +4907,60 @@ impl Gpu {
         )
     }
 
+    /// Exact-gfx1100 MLP variant for DS4 dense E8 GEMV (R4-BW, harmonic restart).
+    ///
+    /// Bit-exact with `gemv_mfp4g32_e8_soa` / `gemv_mfp4g32_e8_soa_gfx1151` for
+    /// identical inputs: same E4M3 scale decode, same E8 lattice decode,
+    /// same per-row FMA accumulation order, same wave32 shfl reduction.
+    /// Only the memory-parallelism levers differ (dwordx4 codeword loads,
+    /// 8 rows per 256-thread workgroup, quad unroll).
+    ///
+    /// This is an explicit opt-in surface: no product dispatch selects it
+    /// unless `HIPFIRE_DS4_GFX1100_E8_MLP=1` + exact gfx1100 + MQ2R all hold
+    /// (enforced in `hipfire-arch-deepseek4::forward::config_cache::e8_mlp_on`).
+    /// The `assert!(is_gfx1100)` fails closed if that gating ever bleeds.
+    pub fn gemv_mfp4g32_e8_soa_mlp_gfx1100(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert!(
+            self.arch_caps.is_gfx1100(),
+            "MLP E8 SoA requires exact gfx1100"
+        );
+        assert!(k % 256 == 0, "MLP E8 SoA requires K%256==0, got K={k}");
+        assert_eq!(a_raw.dtype, DType::MFP4G32E8SOA);
+        const KERNEL: &str = "gemv_mfp4g32_e8_soa_mlp_gfx1100";
+        self.ensure_kernel(KERNEL, kernels::GEMV_MFP4G32_E8_SOA_MLP_GFX1100_SRC, KERNEL)?;
+        let a_ptr = a_raw.buf.as_ptr();
+        let x_ptr = x.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let m_i32 = m as i32;
+        let k_i32 = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &a_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &y_ptr as *const _ as *mut c_void,
+            &m_i32 as *const _ as *mut c_void,
+            &k_i32 as *const _ as *mut c_void,
+        ];
+        // 8 rows per workgroup (256 threads = 8 waves). ceil(M/8) workgroups.
+        let grid_x = m.div_ceil(8) as u32;
+        self.launch_maybe_blob(KERNEL, [grid_x, 1, 1], [256, 1, 1], 0, &mut params, || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(a_ptr);
+            b.push_ptr(x_ptr);
+            b.push_ptr(y_ptr);
+            b.push_i32(m_i32);
+            b.push_i32(k_i32);
+            b
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn gemv_mfp4g32_e8_soa_grouped_impl(
         &mut self,

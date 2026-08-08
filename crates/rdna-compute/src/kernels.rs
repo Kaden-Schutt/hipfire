@@ -1194,6 +1194,14 @@ pub const GEMV_MFP4G32_E8_SOA_GROUPED_GFX1100_SRC: &str = concat!(
 );
 pub const GEMV_MFP4G32_E8_SOA_SHARED_JOBS_GFX1100_SRC: &str =
     include_str!("../../../kernels/src/gemv_mfp4g32_e8_soa_shared_jobs.gfx1100.hip");
+/// Exact-gfx1100 MLP variant for the DS4 dense E8 GEMV (R4-BW).
+/// Bit-exact with the generic/gfx1151 SoA path; only the memory-parallelism
+/// levers differ (dwordx4 codeword loads, 8 rows per workgroup,
+/// deeper quad unroll). Gated behind HIPFIRE_DS4_GFX1100_E8_MLP — zero
+/// behaviour change unless the gate is set, and additionally gated on
+/// exact gfx1100 + MQ2R in the forward path.
+pub const GEMV_MFP4G32_E8_SOA_MLP_GFX1100_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mfp4g32_e8_soa_mlp.gfx1100.hip");
 pub const GEMM_MFP4G32_E8_SOA_WMMA_GFX1151_SRC: &str =
     include_str!("../../../kernels/src/gemm_mfp4g32_e8_soa_wmma.gfx1151.hip");
 pub const GEMM_MFP4G32_E8_SOA_WMMA_B2_GFX1151_SRC: &str = concat!(
