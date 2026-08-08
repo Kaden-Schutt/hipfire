@@ -10,7 +10,7 @@
 //! use `scripts/serve_harness.py` for coherent long-context generation.
 
 use hipfire_arch_deepseek4::forward::{ensure_request_capacity, forward_ep_prefill_batch_chunked};
-use hipfire_arch_deepseek4::DeepseekV4State;
+use hipfire_arch_deepseek4::{CompressorCachePlacement, DeepseekV4State};
 use hipfire_loader::{load_model_ep, EpArch};
 use rdna_compute::Gpu;
 
@@ -21,6 +21,7 @@ struct Args {
     tp: usize,
     tokens: Vec<usize>,
     identity_tokens: Option<usize>,
+    expected_identity_hash: Option<u64>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -28,6 +29,7 @@ fn parse_args() -> Result<Args, String> {
     let mut tp = 3usize;
     let mut tokens = DEFAULT_TOKENS.to_vec();
     let mut identity_tokens = None;
+    let mut expected_identity_hash = None;
     let argv: Vec<String> = std::env::args().collect();
     let mut i = 1usize;
     while i < argv.len() {
@@ -65,6 +67,15 @@ fn parse_args() -> Result<Args, String> {
                 );
                 i += 2;
             }
+            "--expected-identity-hash" => {
+                let raw = value(i, "--expected-identity-hash")?;
+                let hex = raw.strip_prefix("0x").unwrap_or(&raw);
+                expected_identity_hash = Some(
+                    u64::from_str_radix(hex, 16)
+                        .map_err(|_| format!("invalid --expected-identity-hash {raw:?}"))?,
+                );
+                i += 2;
+            }
             flag => return Err(format!("unknown argument {flag}")),
         }
     }
@@ -80,11 +91,15 @@ fn parse_args() -> Result<Args, String> {
     if !tokens.windows(2).all(|pair| pair[0] < pair[1]) {
         return Err("--tokens entries must be strictly increasing".to_string());
     }
+    if expected_identity_hash.is_some() && identity_tokens.is_none() {
+        return Err("--expected-identity-hash requires --identity-tokens".to_string());
+    }
     Ok(Args {
         model: model.ok_or_else(|| "--model is required".to_string())?,
         tp,
         tokens,
         identity_tokens,
+        expected_identity_hash,
     })
 }
 
@@ -172,6 +187,7 @@ fn prove_cache_identity(
     states: &[DeepseekV4State],
     gpus: &mut [Gpu],
     identity_tokens: usize,
+    expected_hash: Option<u64>,
 ) -> Result<(), String> {
     if states.len() != gpus.len() || states.len() < 2 {
         return Err(format!(
@@ -181,9 +197,43 @@ fn prove_cache_identity(
         ));
     }
 
+    let placements: Vec<_> = states
+        .iter()
+        .map(|state| state.compressor_cache_placement)
+        .collect();
+    let sharded = placements
+        .iter()
+        .any(|placement| matches!(placement, CompressorCachePlacement::BlockCyclic(_)));
+    if sharded {
+        let mut common_world = None;
+        let mut common_block_rows = None;
+        for (rank, placement) in placements.iter().copied().enumerate() {
+            let CompressorCachePlacement::BlockCyclic(shard) = placement else {
+                return Err("compressor identity cannot mix replicated and sharded ranks".into());
+            };
+            if shard.rank() != rank || shard.world() != states.len() {
+                return Err(format!(
+                    "compressor identity shard topology mismatch: slot={rank}, shard_rank={}, shard_world={}, states={}",
+                    shard.rank(),
+                    shard.world(),
+                    states.len(),
+                ));
+            }
+            if common_world
+                .replace(shard.world())
+                .is_some_and(|value| value != shard.world())
+                || common_block_rows
+                    .replace(shard.block_rows())
+                    .is_some_and(|value| value != shard.block_rows())
+            {
+                return Err("compressor identity shard geometry differs between ranks".into());
+            }
+        }
+    }
+
     let mut tensors = 0usize;
     let mut compared_elements = 0usize;
-    let mut rank_hashes = vec![0xcbf29ce484222325u64; states.len()];
+    let mut aggregate_hash = 0xcbf29ce484222325u64;
     for layer_idx in 0..states[0]._indexer.len() {
         let ratio = states[0]._indexer[layer_idx].compress_ratio as usize;
         if ratio == 0 {
@@ -219,10 +269,7 @@ fn prove_cache_identity(
                     "rank 0 missing {cache_name} compressor cache at layer {layer_idx}"
                 ));
             };
-            let elements = filled_rows
-                .checked_mul(row_elems)
-                .ok_or_else(|| "compressor identity element overflow".to_string())?;
-            let mut reference: Option<Vec<u32>> = None;
+            let mut rank_bits = Vec::with_capacity(states.len());
             for rank in 0..states.len() {
                 gpus[rank]
                     .bind_thread()
@@ -238,51 +285,95 @@ fn prove_cache_identity(
                         "rank {rank} missing {cache_name} compressor cache at layer {layer_idx}"
                     )
                 })?;
+                let required_rows = placements[rank].local_rows(filled_rows);
                 if tensor.shape.get(1).copied() != Some(row_elems)
-                    || tensor.shape.first().copied().unwrap_or(0) < filled_rows
+                    || tensor.shape.first().copied().unwrap_or(0) < required_rows
                 {
                     return Err(format!(
-                        "rank {rank} {cache_name} compressor cache shape mismatch at layer {layer_idx}: shape={:?}, required_rows={filled_rows}, row_elems={row_elems}",
+                        "rank {rank} {cache_name} compressor cache shape mismatch at layer {layer_idx}: shape={:?}, required_rows={required_rows}, row_elems={row_elems}",
                         tensor.shape,
                     ));
                 }
+                let elements = required_rows
+                    .checked_mul(row_elems)
+                    .ok_or_else(|| "compressor identity element overflow".to_string())?;
                 let bits = cache_bits(&mut gpus[rank], tensor, elements)?;
-                for &value in &bits {
-                    mix_hash(&mut rank_hashes[rank], value as usize);
+                rank_bits.push(bits);
+            }
+
+            let global_bits = if sharded {
+                let CompressorCachePlacement::BlockCyclic(shard0) = placements[0] else {
+                    unreachable!("sharded topology validated above")
+                };
+                let global_elements = filled_rows
+                    .checked_mul(row_elems)
+                    .ok_or_else(|| "compressor identity element overflow".to_string())?;
+                let mut rebuilt = Vec::with_capacity(global_elements);
+                for global_row in 0..filled_rows {
+                    let owner = shard0.owner(global_row);
+                    let local_row =
+                        placements[owner]
+                            .global_to_local(global_row)
+                            .ok_or_else(|| {
+                                format!(
+                                    "rank {owner} does not own global compressor row {global_row}"
+                                )
+                            })?;
+                    let begin = local_row
+                        .checked_mul(row_elems)
+                        .ok_or_else(|| "compressor identity offset overflow".to_string())?;
+                    let end = begin + row_elems;
+                    let row = rank_bits[owner].get(begin..end).ok_or_else(|| {
+                        format!(
+                            "rank {owner} cache is too short for global row {global_row}: local_row={local_row}, values={}",
+                            rank_bits[owner].len(),
+                        )
+                    })?;
+                    rebuilt.extend_from_slice(row);
                 }
-                if let Some(expected) = reference.as_ref() {
-                    if &bits != expected {
+                rebuilt
+            } else {
+                let reference = rank_bits
+                    .first()
+                    .ok_or_else(|| "compressor identity has no rank data".to_string())?;
+                for (rank, bits) in rank_bits.iter().enumerate().skip(1) {
+                    if bits != reference {
                         let first = bits
                             .iter()
-                            .zip(expected)
+                            .zip(reference)
                             .position(|(actual, wanted)| actual != wanted)
                             .unwrap_or(0);
                         return Err(format!(
                             "compressor cache differs: rank={rank} layer={layer_idx} cache={cache_name} element={first} expected=0x{:08x} actual=0x{:08x}",
-                            expected[first], bits[first],
+                            reference[first], bits[first],
                         ));
                     }
-                } else {
-                    reference = Some(bits);
                 }
+                reference.clone()
+            };
+            for value in &global_bits {
+                mix_hash(&mut aggregate_hash, *value as usize);
             }
             tensors += 1;
-            compared_elements = compared_elements.saturating_add(elements);
+            compared_elements = compared_elements.saturating_add(global_bits.len());
         }
     }
 
-    if !rank_hashes.windows(2).all(|pair| pair[0] == pair[1]) {
-        return Err(format!(
-            "compressor cache aggregate hash mismatch after element parity: {rank_hashes:x?}"
-        ));
+    if let Some(expected) = expected_hash {
+        if aggregate_hash != expected {
+            return Err(format!(
+                "compressor cache aggregate hash mismatch: expected=0x{expected:016x}, actual=0x{aggregate_hash:016x}"
+            ));
+        }
     }
     println!(
-        "CACHE_IDENTITY status=pass tokens={identity_tokens} ranks={} tensors={} compared_elements={} raw_bits_per_rank={} aggregate_hash=0x{:016x}",
+        "CACHE_IDENTITY status=pass storage={} tokens={identity_tokens} ranks={} tensors={} compared_elements={} global_raw_bits={} aggregate_hash=0x{:016x}",
+        if sharded { "block_cyclic" } else { "replicated" },
         states.len(),
         tensors,
         compared_elements,
         compared_elements,
-        rank_hashes[0],
+        aggregate_hash,
     );
     Ok(())
 }
@@ -352,7 +443,12 @@ fn run() -> Result<(), String> {
             &identity_input,
             0,
         )?;
-        prove_cache_identity(state, &mut ep.gpus.devices, identity_tokens)?;
+        prove_cache_identity(
+            state,
+            &mut ep.gpus.devices,
+            identity_tokens,
+            args.expected_identity_hash,
+        )?;
     }
 
     for required_tokens in args.tokens {
