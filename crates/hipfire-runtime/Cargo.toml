@@ -313,6 +313,10 @@ name = "test_forward_slots_golden"
 required-features = ["arch-qwen35", "deltanet"]
 
 [[example]]
+name = "demo_multislot_generate"
+required-features = ["arch-qwen35", "deltanet"]
+
+[[example]]
 name = "triattn_accuracy_sweep"
 required-features = ["arch-qwen35"]
 
