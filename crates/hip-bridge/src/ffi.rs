@@ -119,6 +119,10 @@ pub const HIP_MEM_ALLOCATION_TYPE_PINNED: u32 = 1;
 pub const HIP_MEM_ACCESS_FLAGS_PROT_READ_WRITE: u32 = 3;
 pub const HIP_MEM_ALLOCATION_GRANULARITY_MINIMUM: u32 = 0;
 pub const HIP_MEM_ALLOCATION_GRANULARITY_RECOMMENDED: u32 = 1;
+pub const HIP_MEM_ATTACH_GLOBAL: u32 = 0x1;
+pub const HIP_CPU_DEVICE_ID: i32 = -1;
+pub const HIP_MEM_ADVISE_SET_PREFERRED_LOCATION: u32 = 3;
+pub const HIP_MEM_ADVISE_SET_ACCESSED_BY: u32 = 5;
 /// Dependency event: omit profiling state and retain the default system fence.
 pub const HIP_EVENT_DISABLE_TIMING: u32 = 0x2;
 /// Request an explicit system-scope release when recording an event.
@@ -262,6 +266,10 @@ pub struct HipRuntime {
 
     // Memory
     fn_malloc: unsafe extern "C" fn(*mut *mut c_void, usize) -> u32,
+    fn_malloc_managed: Option<unsafe extern "C" fn(*mut *mut c_void, usize, c_uint) -> u32>,
+    fn_mem_prefetch_async:
+        Option<unsafe extern "C" fn(*const c_void, usize, c_int, HipStream) -> u32>,
+    fn_mem_advise: Option<unsafe extern "C" fn(*const c_void, usize, c_uint, c_int) -> u32>,
     fn_ext_malloc_with_flags: Option<unsafe extern "C" fn(*mut *mut c_void, usize, c_uint) -> u32>,
     fn_free: unsafe extern "C" fn(*mut c_void) -> u32,
     fn_mem_get_address_range:
@@ -477,6 +485,21 @@ impl HipRuntime {
                     lib,
                     "hipMalloc",
                     unsafe extern "C" fn(*mut *mut c_void, usize) -> u32
+                ),
+                fn_malloc_managed: load_optional_fn!(
+                    lib,
+                    "hipMallocManaged",
+                    unsafe extern "C" fn(*mut *mut c_void, usize, c_uint) -> u32
+                ),
+                fn_mem_prefetch_async: load_optional_fn!(
+                    lib,
+                    "hipMemPrefetchAsync",
+                    unsafe extern "C" fn(*const c_void, usize, c_int, HipStream) -> u32
+                ),
+                fn_mem_advise: load_optional_fn!(
+                    lib,
+                    "hipMemAdvise",
+                    unsafe extern "C" fn(*const c_void, usize, c_uint, c_int) -> u32
                 ),
                 fn_ext_malloc_with_flags: load_optional_fn!(
                     lib,
@@ -903,6 +926,51 @@ impl HipRuntime {
             size,
             ownership: crate::DeviceBufferOwnership::HipMalloc,
         })
+    }
+
+    /// Allocate a stable HMM pointer whose pages can migrate between host and
+    /// device memory. The allocation is released by the ordinary `hipFree`.
+    pub fn malloc_managed(&self, size: usize) -> HipResult<DeviceBuffer> {
+        let func = self.missing_vmm_symbol("hipMallocManaged", self.fn_malloc_managed)?;
+        let mut ptr: *mut c_void = ptr::null_mut();
+        let code = unsafe { func(&mut ptr, size, HIP_MEM_ATTACH_GLOBAL) };
+        self.check(code, "hipMallocManaged")?;
+        Ok(DeviceBuffer {
+            ptr,
+            size,
+            ownership: crate::DeviceBufferOwnership::HipMalloc,
+        })
+    }
+
+    pub fn mem_prefetch_async(
+        &self,
+        buf: &DeviceBuffer,
+        offset: usize,
+        size: usize,
+        device: i32,
+        stream: Option<&Stream>,
+    ) -> HipResult<()> {
+        assert!(offset <= buf.size && size <= buf.size - offset);
+        let func = self.missing_vmm_symbol("hipMemPrefetchAsync", self.fn_mem_prefetch_async)?;
+        let ptr = unsafe { (buf.ptr as *const u8).add(offset).cast::<c_void>() };
+        let stream_raw = stream.map_or(ptr::null_mut(), |s| s.0);
+        let code = unsafe { func(ptr, size, device, stream_raw) };
+        self.check(code, "hipMemPrefetchAsync")
+    }
+
+    pub fn mem_advise(
+        &self,
+        buf: &DeviceBuffer,
+        offset: usize,
+        size: usize,
+        advice: u32,
+        device: i32,
+    ) -> HipResult<()> {
+        assert!(offset <= buf.size && size <= buf.size - offset);
+        let func = self.missing_vmm_symbol("hipMemAdvise", self.fn_mem_advise)?;
+        let ptr = unsafe { (buf.ptr as *const u8).add(offset).cast::<c_void>() };
+        let code = unsafe { func(ptr, size, advice, device) };
+        self.check(code, "hipMemAdvise")
     }
 
     /// Allocate system-visible signal memory for stream wait/write operations.

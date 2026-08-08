@@ -21,8 +21,9 @@ pub use ffi::launch_counters;
 pub use ffi::{
     Event, Function, Graph, GraphExec, HipMemAccessDesc, HipMemAllocationProp,
     HipMemGenericAllocationHandle, HipMemLocation, HipPointerAttribute, HipRuntime, Module, Stream,
-    HIP_EVENT_DISABLE_TIMING, HIP_EVENT_RELEASE_TO_SYSTEM, HIP_MEM_ALLOCATION_GRANULARITY_MINIMUM,
-    HIP_MEM_ALLOCATION_GRANULARITY_RECOMMENDED,
+    HIP_CPU_DEVICE_ID, HIP_EVENT_DISABLE_TIMING, HIP_EVENT_RELEASE_TO_SYSTEM,
+    HIP_MEM_ADVISE_SET_ACCESSED_BY, HIP_MEM_ADVISE_SET_PREFERRED_LOCATION,
+    HIP_MEM_ALLOCATION_GRANULARITY_MINIMUM, HIP_MEM_ALLOCATION_GRANULARITY_RECOMMENDED,
 };
 pub use kernarg::KernargBlob;
 pub use rccl::{RcclComms, RcclDataType, RcclError, RcclRedOp, RcclResult, NCCL_SUCCESS};
