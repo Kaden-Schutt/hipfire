@@ -253,7 +253,14 @@ fn main() {
         // A is evicted: capture its whole state, then park it.
         let dn_refs = dn_buffers(&dn_states[0]);
         let snap = capture_slot(
-            &mut gpu, &pool, SlotId(0), &k_arenas, &v_arenas, &dn_refs, &prompt_a, stamp,
+            &mut gpu,
+            &pool,
+            SlotId(0),
+            &k_arenas,
+            &v_arenas,
+            &dn_refs,
+            &prompt_a,
+            stamp,
         )
         .expect("capture A");
         drop(dn_refs);

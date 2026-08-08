@@ -50,6 +50,7 @@ pub mod prefix;
 pub mod reset_core;
 pub mod safetensors_source;
 pub mod sampler;
+pub mod serve;
 pub mod spec;
 
 pub mod spec_ngram;
