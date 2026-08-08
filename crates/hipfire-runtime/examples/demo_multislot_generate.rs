@@ -131,6 +131,14 @@ fn main() {
         config.vocab_size,
         "(see loader)",
     );
+    println!(
+        "  moe: n_experts={} top_k={} moe_inter={} shared_inter={} hidden_dim={}",
+        config.num_experts,
+        config.num_experts_per_tok,
+        config.moe_intermediate_size,
+        config.shared_expert_intermediate_size,
+        config.hidden_dim,
+    );
 
     // TARGET_PROMPT_TOKENS repeats each base prompt until it encodes to at
     // least that many tokens. The default (0) leaves the short built-in
@@ -149,7 +157,13 @@ fn main() {
         .unwrap_or(0);
     let prompts: Vec<String> = (0..n_slots)
         .map(|i| {
-            let base = DEFAULT_PROMPTS[i % DEFAULT_PROMPTS.len()];
+            // IDENTICAL_PROMPTS=1 gives every slot the same prompt, so all
+            // slots route to the same experts every step. With expert dedup
+            // working, the routed-expert weight traffic then collapses to the
+            // 1-slot figure; without it, it stays at the 4-slot figure. That
+            // is the measurement, not a feature.
+            let same = std::env::var("IDENTICAL_PROMPTS").ok().as_deref() == Some("1");
+            let base = DEFAULT_PROMPTS[if same { 0 } else { i % DEFAULT_PROMPTS.len() }];
             if target_prompt_tokens == 0 {
                 return base.to_string();
             }

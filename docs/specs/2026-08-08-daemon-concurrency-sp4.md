@@ -291,10 +291,71 @@ regardless.
 Per-kernel shares from the trace remain valid (per-dispatch overhead inflates
 gaps, not kernel durations). Of ~31 ms of GPU-busy time at 4 slots:
 
-- MoE grouped MMQ 12.6 ms (36%) — the model's own weight traffic, ~5% expert
-  overlap across slots, so no dedup win
+- MoE grouped MMQ 12.6 ms (36%) — see "Expert dedup" below
 - attention 5.9 ms (17%)
 - qkvza 2.9 ms, DeltaNet 2.8 ms, o_proj 2.3 ms, lm_head 1.5 ms
 
 The step is bandwidth-bound on expert weights. Further gains have to come from
 reading fewer or smaller expert bytes, not from scheduling.
+
+## Expert dedup: already implemented, and the real bandwidth number
+
+Two earlier claims in this document were wrong. Correcting both, with the
+measurements that settle them.
+
+**Claim 1: "no dedup, 32 expert-instances per layer."** Wrong. It was inferred
+from `grid_y == n_rows * k_top`, without checking what those tiles do. The
+scatter pipeline sorts tokens by expert and pads each expert's run to
+`BLOCK_M=16`, so every slot that picked expert *e* lands in the SAME tile, and
+that expert's weights are read once. `grid_y` is a host-side worst case — the
+host cannot know the per-expert counts without a device sync — and surplus
+tiles hit a sentinel and return *before* loading the weight pointer:
+
+```c
+const int expert_id = expert_tile_ids[tile_y];
+if (expert_id < 0) return;
+const char* A = expert_weight_ptrs[expert_id];
+```
+
+Proof by measurement (`IDENTICAL_PROMPTS=1` makes all four slots route
+identically, so the live expert count drops from ~23 to 8 while `grid_y` stays
+32):
+
+| | MoE ms/step | grid_y |
+|---|---|---|
+| 1 slot | 4.309 | 8 |
+| 4 slots, identical prompts | 4.460 | 32 |
+| 4 slots, distinct prompts | 12.631 | 32 |
+
+Four slots routing identically cost 1.03x the one-slot case, not 4x. Dedup
+works; the extra 3% is the wasted launch of 24 sentinel tiles.
+
+**Claim 2: "MoE runs at ~169 GB/s, ~79% of achievable."** That used the
+inflated 32-expert byte count. Taking the identical-prompt run as the
+known-8-expert reference, the distinct-prompt case costs 2.83x it, implying
+**~22.7 live experts per layer of 32 picks — 29% of the picks are already being
+deduped**. Actual traffic is therefore ~1515 MB/step, not 2139:
+
+| | bytes/step | time | effective |
+|---|---|---|---|
+| 1 slot | 535 MB | 4.31 ms | 124 GB/s |
+| 4 slots, identical | 535 MB | 4.46 ms | 120 GB/s |
+| 4 slots, distinct | 1515 MB | 12.63 ms | **120 GB/s** |
+
+Against the 214 GB/s this box streams on the lm_head (same HFQ4-G256 layout,
+same run), the MoE grouped GEMM sits at **56% of achievable** — and notably it
+is 120 GB/s in all three regimes, so the shortfall is structural to the kernel,
+not a function of batch or expert count.
+
+**So there is more headroom than previously stated, and it is not in dedup.**
+Closing to 214 GB/s would take MoE from 12.63 to ~7.1 ms — about 5.5 ms/step,
+~15% aggregate at 4 slots. The suspect is the 16-row tile: at decode each tile
+carries 1-4 real rows against 16, so the i8 MMQ tile GEMM streams a 1.67 MB
+expert blob to do almost no arithmetic. A decode-shaped path (few rows, many
+experts) may want a GEMV-style expert kernel rather than the tile GEMM that
+prefill wants.
+
+Unverified: the ~22.7 live-expert figure is inferred from timing ratios, not
+from reading back `moe_expert_token_counts`. It assumes MoE time is proportional
+to live experts with negligible fixed cost, which the 1-slot vs identical-prompt
+pair supports (4.309 vs 4.460 ms for the same 8 experts).
