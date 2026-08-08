@@ -1245,6 +1245,17 @@ pub const GEMV_HFQ4G256_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4
 /// single-vector gfx1151 lm_head variant uses: those tune a pass that reads
 /// weights once per x, and this kernel's premise is that the weight pass is
 /// amortised over B.
+/// General-K companion of `GEMV_HFQ4G256_XBATCH_SRC`. The lm_head build hard-
+/// codes `groups_per_row = 8` via `HIPFIRE_HFQ4G256_K2048`; the MoE expert
+/// shapes are K=2048 (gate_up) and K=512 (down), so the down side needs the
+/// runtime `K / 256`.
+pub const GEMV_HFQ4G256_XBATCH_GEN_SRC: &str = concat!(
+    "#define HIPFIRE_HFQ4G256_XBATCH 1\n",
+    "#define HIPFIRE_HFQ4G256_XBATCH_MAX 4\n",
+    "#define HIPFIRE_HFQ4G256_XBATCH_KERNEL gemv_hfq4g256_xbatch_gen\n",
+    include_str!("../../../kernels/src/gemv_hfq4g256.hip")
+);
+
 pub const GEMV_HFQ4G256_XBATCH_SRC: &str = concat!(
     "#define HIPFIRE_HFQ4G256_XBATCH 1\n",
     "#define HIPFIRE_HFQ4G256_XBATCH_MAX 4\n",

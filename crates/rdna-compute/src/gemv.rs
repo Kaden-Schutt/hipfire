@@ -5001,12 +5001,24 @@ impl Gpu {
             "gemv_hfq4g256_xbatch: k must be a multiple of 256"
         );
         self.bind_thread()?;
-        self.ensure_kernel(
-            "gemv_hfq4g256_xbatch",
-            kernels::GEMV_HFQ4G256_XBATCH_SRC,
-            "gemv_hfq4g256_xbatch",
-        )?;
-        let func = &self.functions["gemv_hfq4g256_xbatch"];
+        // The K2048 build hard-codes groups_per_row=8; anything else needs the
+        // runtime K/256 form.
+        let name = if k == 2048 {
+            self.ensure_kernel(
+                "gemv_hfq4g256_xbatch",
+                kernels::GEMV_HFQ4G256_XBATCH_SRC,
+                "gemv_hfq4g256_xbatch",
+            )?;
+            "gemv_hfq4g256_xbatch"
+        } else {
+            self.ensure_kernel(
+                "gemv_hfq4g256_xbatch_gen",
+                kernels::GEMV_HFQ4G256_XBATCH_GEN_SRC,
+                "gemv_hfq4g256_xbatch_gen",
+            )?;
+            "gemv_hfq4g256_xbatch_gen"
+        };
+        let func = &self.functions[name];
         let a_ptr = a_raw.buf.as_ptr();
         let x_ptr = x_rot.buf.as_ptr();
         let y_ptr = y.buf.as_ptr();

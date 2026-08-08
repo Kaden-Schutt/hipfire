@@ -347,15 +347,40 @@ same run), the MoE grouped GEMM sits at **56% of achievable** — and notably it
 is 120 GB/s in all three regimes, so the shortfall is structural to the kernel,
 not a function of batch or expert count.
 
-**So there is more headroom than previously stated, and it is not in dedup.**
-Closing to 214 GB/s would take MoE from 12.63 to ~7.1 ms — about 5.5 ms/step,
-~15% aggregate at 4 slots. The suspect is the 16-row tile: at decode each tile
-carries 1-4 real rows against 16, so the i8 MMQ tile GEMM streams a 1.67 MB
-expert blob to do almost no arithmetic. A decode-shaped path (few rows, many
-experts) may want a GEMV-style expert kernel rather than the tile GEMM that
-prefill wants.
+**Live experts, measured directly.** `moe_expert_token_counts` read back per
+step (last layer) replaces the timing inference: **mean 25.7 of 32 picks, range
+22..30** at 4 slots; exactly 8.0 at 1 slot and 8.0 with identical prompts. So
+dedup removes ~20% of expert reads, and real traffic is 40 x 25.7 x 1.671 MB =
+1718 MB/step, giving **136 GB/s** (not the 120 inferred earlier).
 
-Unverified: the ~22.7 live-expert figure is inferred from timing ratios, not
-from reading back `moe_expert_token_counts`. It assumes MoE time is proportional
-to live experts with negligible fixed cost, which the 1-slot vs identical-prompt
-pair supports (4.309 vs 4.460 ms for the same 8 experts).
+**The 214 GB/s target was not fair, and the GEMV idea is wrong.** The lm_head
+streams one contiguous 270 MB matrix; MoE reads ~26 scattered 1.67 MB blobs per
+layer. `bench_moe_expert_gemv` measures the alternative shape directly, running
+the validated `gemv_hfq4g256_xbatch` per expert at the real shapes (gate_up
+1024x2048, down 2048x512, 26 experts):
+
+| B | per-layer | GB/s | 40-layer est | vs grouped MMQ |
+|---|---|---|---|---|
+| 1 | 0.372 ms | 117 | 14.89 ms | 0.85x |
+| 2 | 0.428 ms | 101 | 17.12 ms | 0.74x |
+| 3 | 0.521 ms | 83 | 20.85 ms | 0.61x |
+| 4 | 0.565 ms | 77 | 22.60 ms | 0.56x |
+
+A GEMV-shaped expert kernel is **worse at every B**, and worst exactly where it
+was supposed to win (B=4, all four slots sharing an expert). Even its best case
+(117 GB/s, minimal arithmetic, essentially pure streaming) lands *below* the
+grouped MMQ's 136 GB/s.
+
+That is the answer to "why not 214": scattered small-matrix reads do not stream
+like one large contiguous matrix on this memory system. ~117-136 GB/s appears to
+be the practical ceiling for this access pattern, and the existing tile GEMM is
+already at the top of it. The 16-rows-carrying-1-4 observation is true but not
+costly — the weight pass dominates and it is already amortised across the tile.
+
+**Consequence for further MoE work:** the lever is fewer or smaller expert
+bytes, not faster reads. Lower-bit expert quantisation, or routing that
+increases slot overlap, would pay; kernel rewrites of this projection will not.
+
+The existing decode MoE path cannot help either: `run_moe_decode` guards
+`batch_size == 1` ("`>1` must route to grouped prefill"), so serving 4 slots
+through it means 4 calls and 32 undeduped expert reads.

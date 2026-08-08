@@ -363,6 +363,7 @@ fn main() {
     let mut prefill_secs: f64 = 0.0;
     let mut decode_step_ms: Vec<f64> = Vec::new();
     let mut decode_graph = SlotDecodeGraph::new();
+    let mut live_experts: Vec<(usize, i32)> = Vec::new();
     let (mut host_launch_ns, mut host_launch_n) = (0u64, 0u64);
     let (mut host_h2d_ns, mut host_d2d_ns, mut host_sync_ns) = (0u64, 0u64, 0u64);
 
@@ -415,6 +416,23 @@ fn main() {
             gpu.hip
                 .memcpy_dtoh(bytes, &out_tokens.buf)
                 .expect("download out_tokens");
+        }
+        // Direct live-expert count for the LAST layer of this step. The
+        // scatter reuses one counts buffer per layer, so this samples layer
+        // n_layers-1 rather than averaging all of them -- enough to replace an
+        // inference from timing ratios with a measurement.
+        if let Some(counts) = pbs.moe_expert_token_counts.as_ref() {
+            // The counts tensor is shaped in BYTES (num_experts * 4), so its
+            // element count is numel()/4.
+            let n_exp = counts.numel() / 4;
+            let mut host = vec![0i32; n_exp];
+            let bytes: &mut [u8] =
+                unsafe { std::slice::from_raw_parts_mut(host.as_mut_ptr() as *mut u8, n_exp * 4) };
+            if gpu.hip.memcpy_dtoh(bytes, &counts.buf).is_ok() {
+                let live = host.iter().filter(|&&c| c > 0).count();
+                let toks: i32 = host.iter().sum();
+                live_experts.push((live, toks));
+            }
         }
         let step_secs = t_step.elapsed().as_secs_f64();
         // Host-side submission cost for this step. If the GPU idle seen in a
@@ -501,6 +519,16 @@ fn main() {
             host_d2d_ns as f64 / ds / 1e6,
             host_sync_ns as f64 / ds / 1e6
         );
+        if !live_experts.is_empty() {
+            let tail = &live_experts[live_experts.len().saturating_sub(38)..];
+            let mean: f64 = tail.iter().map(|(l, _)| *l as f64).sum::<f64>() / tail.len() as f64;
+            let lo = tail.iter().map(|(l, _)| *l).min().unwrap_or(0);
+            let hi = tail.iter().map(|(l, _)| *l).max().unwrap_or(0);
+            let toks = tail.first().map(|(_, t)| *t).unwrap_or(0);
+            println!(
+                "  live experts (last layer): mean {mean:.1} of {toks} picks, range {lo}..{hi}"
+            );
+        }
         let (caps, reps) = decode_graph.stats();
         println!("  decode graph: {caps} capture(s), {reps} replay(s)");
         if let Some(&warm) = decode_step_ms.first() {
