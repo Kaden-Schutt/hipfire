@@ -8619,7 +8619,7 @@ impl Gpu {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn rope_tail_yarn_interleaved_staged_buf_gfx1201(
+    pub fn rope_tail_yarn_interleaved_staged_buf(
         &mut self,
         staged: &GpuTensor,
         pos_buf: &GpuTensor,

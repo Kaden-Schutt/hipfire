@@ -2813,7 +2813,7 @@ fn compressor_forward_impl(
                     .as_ref()
                     .ok_or_else(|| format!("comp l{layer_idx}: attn_state_buf missing"))?
                     .sub_offset(if ratio == 4 { 7 } else { 9 }, 1);
-                gpu.rope_tail_yarn_interleaved_staged_buf_gfx1201(
+                gpu.rope_tail_yarn_interleaved_staged_buf(
                     commit_f32,
                     &pos_buf,
                     &commit_slot_buf,
@@ -3050,7 +3050,7 @@ fn compressor_forward_impl(
     comp_dbg_commit_row(&*gpu, "kv_cache(rmsnorm)");
     if do_rope {
         if cache_is_f16 {
-            gpu.rope_tail_yarn_interleaved_staged_buf_gfx1201(
+            gpu.rope_tail_yarn_interleaved_staged_buf(
                 commit_f32,
                 &pos_buf,
                 &commit_slot_buf,

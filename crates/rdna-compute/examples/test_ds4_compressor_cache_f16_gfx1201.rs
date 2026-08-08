@@ -153,7 +153,7 @@ fn test_staged_commit(gpu: &mut Gpu) {
         24.0,
     )
     .unwrap();
-    gpu.rope_tail_yarn_interleaved_staged_buf_gfx1201(
+    gpu.rope_tail_yarn_interleaved_staged_buf(
         &staged,
         &pos,
         &slot,
