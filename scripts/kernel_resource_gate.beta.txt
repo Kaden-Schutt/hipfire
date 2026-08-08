@@ -3,8 +3,10 @@ gfx1151  q8_lds    vgpr=32   scratch=0    occupancy=16
 gfx1151  q8_tile   vgpr=40   scratch=0    occupancy=16
 gfx1151  asym3     vgpr=37   scratch=0    occupancy=16
 gfx1151  asym2     vgpr=24   scratch=0    occupancy=16
+gfx1151  dn_q8     vgpr=58   scratch=0    occupancy=16
 gfx1201  prefill   vgpr=92   scratch=0    occupancy=16
 gfx1201  q8_lds    vgpr=31   scratch=0    occupancy=16
 gfx1201  q8_tile   vgpr=40   scratch=0    occupancy=16
 gfx1201  asym3     vgpr=37   scratch=0    occupancy=16
 gfx1201  asym2     vgpr=24   scratch=0    occupancy=16
+gfx1201  dn_q8     vgpr=58   scratch=0    occupancy=16

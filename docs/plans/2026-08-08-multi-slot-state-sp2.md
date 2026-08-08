@@ -869,3 +869,26 @@ consequences to carry into Task 6 and SP3:
    needs either its own write variant or a `use_v_base` flag. SP2 does not need
    it — SP1's asym3 support is read-side only — but SP3 must not assume this
    kernel is mode-agnostic.
+
+## Task 4 findings
+
+**1. The resource gate did not cover DeltaNet — now fixed.** Task 4's clean gate
+diff was not evidence about DeltaNet register pressure, because the gate
+fingerprinted only the five attention kernels. The implementer spotted this and
+ran a supplementary compile-only check (58 VGPR / 0 scratch / 16 waves,
+unchanged on both arches). The gate now includes `gated_delta_net_q8_fast`
+permanently: three quarters of both models' layers are DeltaNet, so a register
+regression there costs as much as one in attention.
+
+**2. Pre-existing dead validation in `replay.rs` — recorded, not fixed.**
+`expected_kernarg_bytes("gated_delta_net_q8_fast")` is hardcoded to 96, but the
+real kernarg segment is **88 bytes before SP2 and 100 after** (verified with
+hipcc + llvm-readelf). So replay-based resource-access validation for this kernel
+was **already silently dead before this work**, and remains so. Out of scope for
+SP2 and deliberately untouched — but it means the replay path offers no
+protection here, and SP3/SP4 should not assume it does.
+
+**3. Pre-existing rustfmt debt in `norm.rs`** (4 spots, present at HEAD before
+Task 4) will trip `ci-rustfmt-changed.sh`'s whole-file check the first time that
+file appears in a PR diff. Not caused by SP2. Fix with
+`./scripts/fmt-changed.sh`, not bare `cargo fmt`.
