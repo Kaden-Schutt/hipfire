@@ -510,3 +510,82 @@ genuine additional traffic — distinct experts, distinct rows — which returns
 the remaining path to §6's conclusion: per-position acceptance, i.e. drafter
 quality. `HIPFIRE_DS4_EXPERT_OVERLAP` is retained; the measurement was sound,
 the inference drawn from it was not.
+
+## 9. Open problem: DSpark tau collapses at longer context
+
+Not solved here. Recorded so the next attempt starts from evidence rather than
+rediscovering it.
+
+### The observation
+
+tau degrades monotonically as the request grows, on the same engine and model:
+
+| fixture | tau |
+| --- | ---: |
+| ctx 25, gen 128 (golden) | 2.0238095238095237 |
+| ctx 25, gen 256 | 1.8021978021978025 |
+| ctx 505, gen 256 (`ds4_dspark_pp526_code.json`) | 0.795774647887324 |
+
+At tau 0.796 speculation is barely paying for itself. Decode at ctx 505 is
+29.07 tok/s against 38.97 on the golden, and most of that gap is tau, not
+kernel time.
+
+### The drafter does depend on context
+
+`HIPFIRE_DSPARK_ZERO_CTX=1` zeroes the context `main_hidden` handed to the
+drafter. On the pp526 fixture:
+
+| | tau | decode |
+| --- | ---: | ---: |
+| context on | 0.795774647887324 | 29.060 |
+| context zeroed | 0.032388663967611336 | 17.598 |
+
+tau falls to 0.032, so the head is critically dependent on what it is fed. The
+long-context weakness is not the drafter ignoring the prompt.
+
+### It is NOT attention dilution, and DFlash's fix does not port
+
+The obvious hypothesis — the drafter drowning in 505 rows of context — is
+wrong. DSpark's drafter never sees the prompt. Its context is a slot list
+bounded by the verify window, not by sequence length:
+
+- `dspark_core.rs`: `max_context_floats = (self.block + 1) * layers.len() * hidden`
+- bootstrap sets `ctx_positions = vec![position]` (one slot)
+- steady state sets `ctx_positions = (start_slot..start_slot + new_ctx_len)`
+
+so the head consumes roughly `block + 1` hidden-state vectors — about 3 to 6 —
+regardless of context length. That is already a tighter window than DFlash's.
+
+This matters because DFlash has a mature answer to drafter-degradation at long
+context (`HIPFIRE_DFLASH_WINDOW`: SWA over the last W rows on draft layers
+`0..n-2`, full attention on the last layer, W defaulting to the draft
+artifact's declared `sliding_window`). **That fix does not transfer.** The two
+drafters are architecturally different: DFlash's is a standalone small model
+with its own KV cache attending over real context, so a sliding window is
+correct for it; DSpark's is an MTP-style head consuming target hidden states,
+already windowed by construction, with no long attention to mask.
+
+What degrades is therefore the *statistics of the hidden states* the head
+consumes — a hidden state at position 505 inside a dense multi-part request is
+a different distribution from one at position 25 after a one-line request — not
+the quantity of them. That is drafter quality, consistent with §6.
+
+### The transferable idea from DFlash
+
+Not the SWA mask: the **regime declaration**. DFlash reads the width the draft
+was trained at out of the artifact and enforces it, commenting that this is
+"the only width correct by construction," and deliberately degrades tau with a
+warning when a request exceeds it. DSpark declares nothing and enforces
+nothing — it ran at tau 0.796, and at 0.032 under `ZERO_CTX`, while still
+reporting a healthy tok/s. Nothing in the system can currently answer "is this
+drafter in-regime for this request?"
+
+### Next two steps, both cheap
+
+1. **Disambiguate length from difficulty.** `ds4_dspark_pp526_code.json` is
+   both longer *and* a harder multi-part deliverable, so it confounds them. A
+   short prompt demanding complex output against a long prompt demanding
+   trivial output separates the two in two runs.
+2. **Read the sidecar's metadata.** If the DS4 DSpark artifact carries no
+   trained-regime declaration at all, that gap is the first thing to close —
+   detection before correction.
