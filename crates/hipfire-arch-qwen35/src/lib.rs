@@ -63,11 +63,13 @@ pub(crate) mod paro_moe;
 pub mod pflash;
 #[cfg(feature = "deltanet")]
 pub mod qwen35;
+#[cfg(feature = "deltanet")]
+#[cfg(feature = "deltanet")]
+pub mod serve_engine;
 /// Qwen3.5 impls of the arch-generic `hipfire_runtime::spec` seam
 /// (`impl SpecTarget for ModelSlot`). Deltanet-gated — it touches `ModelSlot`.
 #[cfg(feature = "deltanet")]
 mod spec_impl;
-#[cfg(feature = "deltanet")]
 pub mod speculative;
 
 /// Grammar-guided decoding for qwen35 tool-call format. Independent of

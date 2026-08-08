@@ -54,7 +54,8 @@ pub enum Event {
 /// holds a slot, and on a 4-slot box that is 25% of capacity generating output
 /// nobody will read.
 pub fn send_event(tx: &Sender<Event>, e: Event) -> Result<(), String> {
-    tx.send(e).map_err(|_| "client receiver dropped".to_string())
+    tx.send(e)
+        .map_err(|_| "client receiver dropped".to_string())
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
