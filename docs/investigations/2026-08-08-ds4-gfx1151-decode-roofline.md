@@ -645,3 +645,59 @@ certification calls F16 "a capacity route, not yet a speed promotion." It buys
 context length, not tok/s. Its own stated next step — "keep gathered compressed
 K/V in native F16 through the WMMA consumers" rather than widening halves back
 to F32 — is where the speed would come from, and that is downstream of the port.
+
+### Ported: F16 compressor cache runs on gfx1151, free
+
+The port was done and measured. Three changes were needed, not one:
+
+1. **Kernel.** The indexer score WMMA is now generation-selected in-source. The
+   two generations take different fragment layouts, so both the staging and the
+   D row mapping differ — a macro swapping the builtin spelling is not enough.
+
+   ```
+   gfx12  8-wide fragments, K chunk split across lane halves, D row = 8*k_half + j
+   gfx11  16-wide fragments, whole K chunk per lane with 16..31 duplicating,
+          D row = 2*j + k_half
+   ```
+
+2. **Nine wrapper guards.** The loader gates admitted gfx1151 but every
+   per-kernel wrapper still asserted `is_gfx1201()`, so the first run panicked
+   at `attention.rs:8859` with `gen=0`. Widened exactly the nine wrappers
+   compiling from the two verified-portable sources; the sharded/TP wrappers in
+   the same files keep their gfx1201 assert.
+
+3. **File names.** Both kernels lost their `.gfx1201` suffix. This is not
+   cosmetic: `scripts/compile-kernels.sh` treats `\.gfx[0-9]+\.hip$` as a
+   variant tag, so an arch-suffixed file is AOT-compiled only for that arch and
+   everything else silently falls back to JIT.
+
+Measured on the golden fixture, warm kernels:
+
+| arm | decode tok/s | tau | decoded text |
+| --- | ---: | ---: | --- |
+| f16 | 38.92349 | 2.0238095238095237 | `e49b9893a207d8a6` |
+| f32 | 38.97186 | 2.0238095238095237 | `e49b9893a207d8a6` |
+| f16 | 38.90918 | 2.0238095238095237 | `e49b9893a207d8a6` |
+
+**-0.14%, inside run-to-run noise, with byte-identical decoded output.** F16
+storage costs nothing here and halves the two ctx-scaled allocations, so it is
+purely a capacity gain on this route.
+
+One measurement trap worth recording: the first f16 run after the rename
+reported 30.62997, a 21% apparent regression. That was JIT compilation of the
+newly-named kernels inside the measured window — the AOT cache had no entry for
+the new file names. The second run, with `.hipfire_kernels/gfx1151` warm,
+matched F32. Any kernel rename invalidates that cache, so the run immediately
+following one is not a valid measurement.
+
+### Sub-F16 kv selectors now redirect instead of failing
+
+DS4 stores its compressor cache as F32 or F16 only. `q8`, `asym{2,3,4}`,
+`fwht{2,3,4}` and `turbo*` now resolve to F16 — the nearest implemented storage
+below F32, and a widening in precision terms relative to what was requested —
+with a one-line notice at resolve time rather than a hard load failure. Only
+unrecognised strings still fail.
+
+This means the historic `--kv q8` invocation runs again, but it now selects F16
+storage rather than the F32 golden. Section 0's fixture says `--kv f32`
+explicitly for that reason.

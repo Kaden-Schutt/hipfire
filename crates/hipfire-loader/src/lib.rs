@@ -2231,8 +2231,22 @@ mod registry_tests {
             resolve_deepseek4_compressor_cache_kv_mode(Some("f16")).unwrap(),
             F16
         );
-        let error = resolve_deepseek4_compressor_cache_kv_mode(Some("q8")).unwrap_err();
-        assert!(error.contains("not implemented"), "{error}");
+        // Sub-F16 selectors redirect to F16 rather than failing: DS4 stores
+        // its compressor cache as F32 or F16 only, and F16 is the nearest
+        // implemented storage below F32 — a widening relative to what these
+        // ask for. Only unrecognised strings still fail closed.
+        for mode in [
+            "q8", "asym2", "asym3", "asym4", "fwht2", "fwht3", "fwht4", "turbo", "turbo3",
+            "turbo4",
+        ] {
+            assert_eq!(
+                resolve_deepseek4_compressor_cache_kv_mode(Some(mode)).unwrap(),
+                F16,
+                "{mode} should redirect to F16"
+            );
+        }
+        let error = resolve_deepseek4_compressor_cache_kv_mode(Some("nonsense")).unwrap_err();
+        assert!(error.contains("not recognised"), "{error}");
     }
 
     /// Every known arch_id must be claimed by AT MOST one carrier, for both
