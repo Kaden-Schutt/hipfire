@@ -8984,7 +8984,15 @@ fn ep_serve_ds4(
                 break;
             }
             if let Err(e) = deepseek4::forward::forward_ep(
-                gpus, weights, config, state, partials, partials_i64, policy, t, pos as u32,
+                gpus,
+                weights,
+                config,
+                state,
+                partials,
+                partials_i64,
+                policy,
+                t,
+                pos as u32,
             ) {
                 emit_active_attempt_error(
                     stdout,
@@ -9127,9 +9135,17 @@ fn ep_serve_ds4(
         else {
             break;
         };
-        if let Err(e) =
-            deepseek4::forward::forward_ep(gpus, weights, config, state, partials, partials_i64, policy, next, pos as u32)
-        {
+        if let Err(e) = deepseek4::forward::forward_ep(
+            gpus,
+            weights,
+            config,
+            state,
+            partials,
+            partials_i64,
+            policy,
+            next,
+            pos as u32,
+        ) {
             emit_active_attempt_error(
                 stdout,
                 Some(id),
@@ -9390,9 +9406,17 @@ fn ep_serve_minimax(
                 break;
             }
             let pos = (prefill_from + i) as u32;
-            if let Err(e) =
-                minimax::forward::forward_ep(gpus, weights, config, state, partials, partials_i64, policy, t, pos)
-            {
+            if let Err(e) = minimax::forward::forward_ep(
+                gpus,
+                weights,
+                config,
+                state,
+                partials,
+                partials_i64,
+                policy,
+                t,
+                pos,
+            ) {
                 emit_active_attempt_error(
                     stdout,
                     Some(id),
@@ -9504,9 +9528,17 @@ fn ep_serve_minimax(
         else {
             break;
         };
-        if let Err(e) =
-            minimax::forward::forward_ep(gpus, weights, config, state, partials, partials_i64, policy, next, pos as u32)
-        {
+        if let Err(e) = minimax::forward::forward_ep(
+            gpus,
+            weights,
+            config,
+            state,
+            partials,
+            partials_i64,
+            policy,
+            next,
+            pos as u32,
+        ) {
             emit_active_attempt_error(
                 stdout,
                 Some(id),
@@ -9737,11 +9769,10 @@ fn plan_from_rendered(
 fn reset_qwen35_recurrent(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(), String> {
     let mut first_err: Option<String> = None;
     if m.pp > 1 {
-        if let (Some(ModelState::Qwen35(b)), Some(gpus), Some(la)) = (
-            m.state.as_ref(),
-            m.pp_gpus.as_mut(),
-            m.pp_dn_la_to_device.as_ref(),
-        ) {
+        if let (Some(ModelState::Qwen35(b)), Some(gpus)) = (m.state.as_ref(), m.pp_gpus.as_mut()) {
+            // STEP-003: recurrent/conv state placement derives from the state
+            // manifest + mesh; no `la_to_device` sidecar is stored.
+            let la = hipfire_arch_qwen35::arch::qwen35_la_devices(&b.config, gpus);
             let dn = &b.dn_state;
             for (i, s) in dn.s_matrices.iter().enumerate() {
                 let g = &mut gpus.devices[la[i] as usize];
@@ -12777,11 +12808,12 @@ fn generate_multi(
         // because a `&tokenizer` borrow of `m` is live here; covers both the
         // pp>1 per-LA-device path and the single-GPU path.
         if m.pp > 1 {
-            if let (Some(ModelState::Qwen35(b)), Some(ref mut gpus), Some(ref la)) = (
-                m.state.as_ref(),
-                m.pp_gpus.as_mut(),
-                m.pp_dn_la_to_device.as_ref(),
-            ) {
+            if let (Some(ModelState::Qwen35(b)), Some(gpus)) =
+                (m.state.as_ref(), m.pp_gpus.as_mut())
+            {
+                // STEP-003: recurrent/conv placement derives from the state
+                // manifest + mesh; no `la_to_device` sidecar is stored.
+                let la = hipfire_arch_qwen35::arch::qwen35_la_devices(&b.config, gpus);
                 let dn = &b.dn_state;
                 for (i, s) in dn.s_matrices.iter().enumerate() {
                     let g = &mut gpus.devices[la[i] as usize];
@@ -13032,11 +13064,12 @@ fn generate_multi(
         // qwen35 recurrent state lives in the bundle (ModelState::Qwen35), not
         // the always-None m.dn_state/m.kv_cache. Covers pp>1 + single-GPU.
         if m.pp > 1 {
-            if let (Some(ModelState::Qwen35(b)), Some(ref mut gpus), Some(ref la)) = (
-                m.state.as_ref(),
-                m.pp_gpus.as_mut(),
-                m.pp_dn_la_to_device.as_ref(),
-            ) {
+            if let (Some(ModelState::Qwen35(b)), Some(gpus)) =
+                (m.state.as_ref(), m.pp_gpus.as_mut())
+            {
+                // STEP-003: recurrent/conv placement derives from the state
+                // manifest + mesh; no `la_to_device` sidecar is stored.
+                let la = hipfire_arch_qwen35::arch::qwen35_la_devices(&b.config, gpus);
                 let dn = &b.dn_state;
                 for (i, s) in dn.s_matrices.iter().enumerate() {
                     let g = &mut gpus.devices[la[i] as usize];
@@ -13135,7 +13168,9 @@ fn generate_multi(
     let kv = &mut b.kv_cache;
     let dn = &mut b.dn_state;
     let gpus = m.pp_gpus.as_mut().unwrap();
-    let dn_la_to_device = m.pp_dn_la_to_device.as_ref().unwrap();
+    // STEP-003: recurrent/conv placement derives from the state manifest +
+    // mesh; no `la_to_device` sidecar is stored.
+    let dn_la_to_device = hipfire_arch_qwen35::arch::qwen35_la_devices(config, gpus);
 
     macro_rules! reset_pp_uncommitted_state {
         () => {{

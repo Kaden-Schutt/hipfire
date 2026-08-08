@@ -116,7 +116,7 @@ fn main() {
     after = after_kv;
 
     // Stage 4: DeltaNetState
-    let (dn, la_to_device) =
+    let dn =
         DeltaNetState::new_with_quant_multi(&mut gpus, &config, StateQuant::Q8).expect("dn multi");
     let after_dn = used_gb(&gpus, &baseline_free);
     let dn_delta: Vec<f64> = after_dn
@@ -173,7 +173,7 @@ fn main() {
     );
 
     // Cleanup
-    dn.free_gpu_multi(&mut gpus, &la_to_device);
+    dn.free_gpu_multi(&mut gpus, &config);
     kv.free_gpu_multi(&mut gpus);
     scratch_set.free_gpu_multi(&mut gpus);
     weights.free_gpu_multi(&mut gpus);

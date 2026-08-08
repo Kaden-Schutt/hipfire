@@ -560,7 +560,6 @@ pub struct LoadedModel {
     pub pp: usize,
     pub pp_gpus: Option<Gpus>,
     pub pp_scratch_set: Option<hipfire_arch_qwen35::qwen35::Qwen35ScratchSet>,
-    pub pp_dn_la_to_device: Option<Vec<u8>>,
     pub ep: Option<EpState>,
     // Shared arch state
     pub state: Option<ModelState>,
@@ -702,7 +701,6 @@ impl LoadedModel {
             self.arch_id,
             self.pp,
             self.pp_gpus.as_ref(),
-            self.pp_dn_la_to_device.as_deref(),
             self.ep.as_ref(),
             &self.state,
         )?;
@@ -835,7 +833,6 @@ impl LoadedModel {
             ep: None,
             pp_gpus: None,
             pp_scratch_set: None,
-            pp_dn_la_to_device: None,
             state: None,
             kv_cache: None,
             dn_state: None,
@@ -878,8 +875,9 @@ impl LoadedModel {
 
     /// Qwen35 arch-resident pipeline-parallel (pp>1) skeleton: the flat PP
     /// fields set together so they cannot be set piecemeal (a dropped
-    /// `pp_scratch_set` is a silent VRAM leak; `pp_gpus`/`pp_dn_la_to_device`
-    /// are `.expect()`ed in unload).
+    /// `pp_scratch_set` is a silent VRAM leak; `pp_gpus` is `.expect()`ed in
+    /// unload). Recurrent/conv state placement derives from the state
+    /// manifest + mesh (STEP-003); no `la_to_device` sidecar is stored.
     pub fn skeleton_pp(
         arch_id: u32,
         tokenizer: hipfire_runtime::tokenizer::Tokenizer,
@@ -890,13 +888,11 @@ impl LoadedModel {
         pp: usize,
         pp_gpus: Gpus,
         pp_scratch_set: Qwen35ScratchSet,
-        pp_dn_la_to_device: Vec<u8>,
     ) -> Self {
         LoadedModel {
             pp,
             pp_gpus: Some(pp_gpus),
             pp_scratch_set: Some(pp_scratch_set),
-            pp_dn_la_to_device: Some(pp_dn_la_to_device),
             ..LoadedModel::skeleton(
                 arch_id,
                 tokenizer,
@@ -1031,16 +1027,18 @@ fn validate_qwen35_recurrent_cardinality(
 }
 
 /// Validate a banded qwen35 PP load against the flat canonical fields: the
-/// recurrent-state cardinalities must agree with the layer→device map
-/// (`LoadedModel.pp_dn_la_to_device`), and every mapped device must exist in
-/// the PP mesh (`LoadedModel.pp_gpus`). Callers pass the layer→device map and
-/// device count directly so the pure helper stays testable without a GPU.
+/// recurrent-state cardinalities must agree with the manifest-derived
+/// layer→device map, and every mapped device must exist in the PP mesh
+/// (`LoadedModel.pp_gpus`). STEP-003: the map is derived from the state
+/// manifest + mesh (`qwen35_la_devices`), so the sidecar is gone; the
+/// cardinality check now verifies the manifest agrees with the allocated
+/// state instead of a hand-built copy.
 fn validate_qwen35_pipeline_layout(
     bundle: &hipfire_arch_qwen35::Qwen35Bundle,
-    dn_la_to_device: &[u8],
-    device_len: usize,
+    gpus: &Gpus,
     arch_id: u32,
 ) -> Result<(), ResetError> {
+    let dn_la_to_device = hipfire_arch_qwen35::arch::qwen35_la_devices(&bundle.config, gpus);
     let expected = bundle.dn_state.s_matrices.len();
     validate_qwen35_recurrent_cardinality(
         expected,
@@ -1050,7 +1048,7 @@ fn validate_qwen35_pipeline_layout(
         dn_la_to_device.len(),
         arch_id,
     )?;
-    qwen35_pp_owner_visitation(dn_la_to_device, expected, device_len, arch_id)?;
+    qwen35_pp_owner_visitation(&dn_la_to_device, expected, gpus.devices.len(), arch_id)?;
     Ok(())
 }
 
@@ -1121,8 +1119,9 @@ fn architecture_error(
 
 /// Validate the flat parallel layout against the concrete arch state before a
 /// context reset / teardown. Single qwen35 models must NOT carry PP metadata;
-/// pp>1 qwen35 models MUST carry `pp_gpus` + `pp_dn_la_to_device` and satisfy
-/// the banded-PP invariants; EP models must match their arch's state/device
+/// pp>1 qwen35 models MUST carry `pp_gpus` and satisfy the banded-PP
+/// invariants (recurrent/conv placement derived from the state manifest +
+/// mesh, STEP-003); EP models must match their arch's state/device
 /// cardinality. Called from `unload_model` so a corrupted layout fails with a
 /// descriptive error instead of a partial free or an `.expect()` panic.
 fn qwen35_recurrent_groups<'a, T>(
@@ -1149,9 +1148,9 @@ fn reset_owned_arch_state(
         return Ok(());
     }
     if m.pp > 1 {
-        match (&mut m.state, &mut m.pp_gpus, m.pp_dn_la_to_device.as_ref()) {
-            (Some(ModelState::Qwen35(bundle)), Some(gpus), Some(la)) => {
-                reset_qwen35_pipeline_recurrent(&bundle.dn_state, la, gpus, arch_id)?;
+        match (&mut m.state, &mut m.pp_gpus) {
+            (Some(ModelState::Qwen35(bundle)), Some(gpus)) => {
+                reset_qwen35_pipeline_recurrent(&bundle.dn_state, &bundle.config, gpus, arch_id)?;
                 bundle.kv_cache.compact_offset = 0;
                 Ok(())
             }
@@ -1313,12 +1312,14 @@ fn reset_ep_state(ep: &mut EpState, arch_id: u32) -> Result<(), ResetError> {
 
 fn reset_qwen35_pipeline_recurrent(
     dn: &hipfire_arch_qwen35::qwen35::DeltaNetState,
-    dn_la_to_device: &[u8],
+    config: &hipfire_arch_qwen35::qwen35::Qwen35Config,
     gpus: &mut Gpus,
     arch_id: u32,
 ) -> Result<(), ResetError> {
+    // STEP-003: placement derives from the state manifest + mesh; no sidecar.
+    let dn_la_to_device = hipfire_arch_qwen35::arch::qwen35_la_devices(config, gpus);
     let owner_devices = qwen35_pp_owner_visitation(
-        dn_la_to_device,
+        &dn_la_to_device,
         dn.s_matrices.len(),
         gpus.devices.len(),
         arch_id,
@@ -1402,7 +1403,6 @@ fn validate_reset_layout(
     arch_id: u32,
     pp: usize,
     pp_gpus: Option<&Gpus>,
-    pp_dn_la_to_device: Option<&[u8]>,
     ep: Option<&EpState>,
     state: &Option<ModelState>,
 ) -> Result<(), ResetError> {
@@ -1423,18 +1423,10 @@ fn validate_reset_layout(
                     "pp>1 without pp_gpus".to_string(),
                 )
             })?;
-            let dn_la_to_device = pp_dn_la_to_device.ok_or_else(|| {
-                architecture_error(
-                    ModelParallelKind::PpQwen35,
-                    Some(ModelStateKind::Qwen35),
-                    arch_id,
-                    "pp>1 without pp_dn_la_to_device".to_string(),
-                )
-            })?;
-            validate_qwen35_pipeline_layout(bundle, dn_la_to_device, gpus.devices.len(), arch_id)
+            validate_qwen35_pipeline_layout(bundle, gpus, arch_id)
         }
         Some(ModelState::Qwen35(_)) => {
-            reject_qwen35_single_pipeline_metadata(pp_dn_la_to_device.is_some(), arch_id)
+            reject_qwen35_single_pipeline_metadata(pp_gpus.is_some(), arch_id)
         }
         _ => Ok(()),
     }
@@ -3502,15 +3494,8 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(
     // Silent-corruption guard: validate the flat parallel layout BEFORE any
     // teardown, so a corrupted PP/EP/qwen35 layout fails with a descriptive
     // error instead of a partial free or an `.expect()` panic mid-free.
-    validate_reset_layout(
-        m.arch_id,
-        m.pp,
-        m.pp_gpus.as_ref(),
-        m.pp_dn_la_to_device.as_deref(),
-        m.ep.as_ref(),
-        &m.state,
-    )
-    .map_err(|e| format!("unload aborted: {e:?}"))?;
+    validate_reset_layout(m.arch_id, m.pp, m.pp_gpus.as_ref(), m.ep.as_ref(), &m.state)
+        .map_err(|e| format!("unload aborted: {e:?}"))?;
 
     // EP unload-free. An EP model owns its own `Gpus` (the daemon's single `gpu`
     // is unused for tp>1). Without this branch a SUCCESSFUL EP unload leaked every
@@ -3579,8 +3564,7 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(
         match m.state.take() {
             Some(ModelState::Qwen35(b)) => {
                 b.kv_cache.free_gpu_multi(&mut gpus);
-                let la_to_device = m.pp_dn_la_to_device.expect("pp>1 must carry la_to_device");
-                b.dn_state.free_gpu_multi(&mut gpus, &la_to_device);
+                b.dn_state.free_gpu_multi(&mut gpus, &b.config);
                 b.weights.free_gpu_multi(&mut gpus);
             }
             // Only Qwen35 supports pp>1 today, so the other carriers can never
@@ -3738,7 +3722,6 @@ mod registry_tests {
         assert_eq!(model.mtp_mode, "auto");
         assert!(model.pp_gpus.is_none());
         assert!(model.pp_scratch_set.is_none());
-        assert!(model.pp_dn_la_to_device.is_none());
     }
 
     #[test]
