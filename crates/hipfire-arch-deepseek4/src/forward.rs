@@ -10588,6 +10588,11 @@ impl PrefillBatchScratch {
         let old = std::mem::replace(&mut self.idx_scores_batch, replacement);
         gpu.free_tensor(old)
             .map_err(|e| format!("PrefillBatchScratch free old idx_scores_batch: {e:?}"))?;
+        // This is a request-boundary geometry change, not a hot-loop free.
+        // Keeping the old, potentially hundreds-of-MiB score slab in the pool
+        // can make the cache's second admission check fail after the first one
+        // passed. Return pooled blocks to HIP before committing the new stride.
+        gpu.drain_pool();
         self.idx_score_capacity = required_rows;
         Ok(true)
     }

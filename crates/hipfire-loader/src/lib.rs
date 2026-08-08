@@ -1631,15 +1631,23 @@ fn load_model_ep_ds4(path: &str, max_seq: usize, tp: usize) -> Result<LoadedMode
             .iter()
             .all(|device| device.arch_caps.is_gfx1201());
     if gfx1201_mq2r_tp {
-        // B=1024 fills the grouped-MoE expert tiles substantially better than
-        // B=128: top-k 6 supplies 6,144 routed rows (24/expert on average)
-        // instead of 768 (3/expert), while reducing a 2K prompt from sixteen
-        // full-model chunks to two. The projected-allocation guard below keeps
-        // this exact gfx1201 TP3/TP4 route fail-closed on insufficient VRAM.
-        const EP_PREFILL_MAX_BATCH: usize = 1024;
+        // B=1024 is the certified short-context throughput schedule. At a
+        // declared long-context ceiling, B=512 gives back about 1.34 GiB/rank
+        // to the replicated F32 compressor cache while retaining most of the
+        // grouped-MoE occupancy. Keep this automatic and exact-gated to the
+        // gfx1201 MQ2R TP route: callers should not need an environment knob
+        // merely to make the advertised context geometry admissible.
+        const SHORT_CONTEXT_BATCH: usize = 1024;
+        const LONG_CONTEXT_BATCH: usize = 512;
+        const LONG_CONTEXT_THRESHOLD: usize = 32 * 1024;
+        let ep_prefill_max_batch = if max_seq > LONG_CONTEXT_THRESHOLD {
+            LONG_CONTEXT_BATCH
+        } else {
+            SHORT_CONTEXT_BATCH
+        };
         let projected = deepseek4::forward::PrefillBatchScratch::projected_allocation_bytes(
             &config,
-            EP_PREFILL_MAX_BATCH,
+            ep_prefill_max_batch,
         )?;
         for rank in 0..n {
             let dev = &mut staging.gpus_mut().devices[rank];
@@ -1657,13 +1665,13 @@ fn load_model_ep_ds4(path: &str, max_seq: usize, tp: usize) -> Result<LoadedMode
                 ));
             }
             let pbs =
-                deepseek4::forward::PrefillBatchScratch::new(dev, &config, EP_PREFILL_MAX_BATCH)
+                deepseek4::forward::PrefillBatchScratch::new(dev, &config, ep_prefill_max_batch)
                     .map_err(|e| format!("allocate gfx1201 TP prefill rank {rank}: {e}"))?;
             staging.prefill.push(pbs);
         }
         eprintln!(
             "[loader] gfx1201 TP{tp} batched prefill: B={} scratch={:.2} GiB/rank",
-            EP_PREFILL_MAX_BATCH,
+            ep_prefill_max_batch,
             projected as f64 / (1u64 << 30) as f64,
         );
         staging
