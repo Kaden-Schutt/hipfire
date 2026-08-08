@@ -131,8 +131,8 @@ fn main() {
 
     let stats = engine.stats();
     println!(
-        "  stats: admitted={} rejected={} evictions={} restores={}",
-        stats.admitted, stats.rejected, stats.evictions, stats.restores
+        "  stats: admitted={} rejected={} evictions={} restores={} prefix_hits={}",
+        stats.admitted, stats.rejected, stats.evictions, stats.restores, stats.prefix_hits
     );
 
     assert!(
@@ -160,6 +160,11 @@ fn main() {
         stats.evictions > 0 || rejected > 0,
         "{n_clients} clients on {N_SLOTS} slots forced neither an eviction nor a rejection — \
          the gate did not exercise admission"
+    );
+    assert_eq!(
+        stats.prefix_hits, 0,
+        "every client here is single-turn with an empty conversation key, so a \
+         prefix hit would mean unrelated sessions are being matched to each other"
     );
     println!("ALL CHECKS PASS");
 }

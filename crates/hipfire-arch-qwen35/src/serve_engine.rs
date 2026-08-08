@@ -461,10 +461,11 @@ fn admit(
             );
             for (id, sess) in rig.sessions.iter() {
                 eprintln!(
-                    "[slot-trace]   session {} convo={:?} slot={:?} tokens={}",
+                    "[slot-trace]   session {} convo={:?} slot={:?} residency={:?} tokens={}",
                     id,
                     sess.convo,
                     sess.slot,
+                    sess.residency,
                     sess.tokens.len()
                 );
             }
@@ -475,7 +476,32 @@ fn admit(
                 .get(existing)
                 .map(|s| s.tokens.clone())
                 .unwrap_or_default();
-            let slot = rig.sessions.get(existing).and_then(|s| s.slot);
+            // A matched session may be SWAPPED. Bring it back before use --
+            // this is the half of SP6 that makes eviction worth doing, and
+            // without it evicted snapshots accumulate and their sessions are
+            // never seen again.
+            let mut slot = rig.sessions.get(existing).and_then(|s| s.slot);
+            if slot.is_none() {
+                let free = rig.pool.acquire().or_else(|| {
+                    rig.sessions
+                        .lru_idle_victim(&busy)
+                        .filter(|v| *v != existing)
+                        .and_then(|v| {
+                            evict(rig, v);
+                            rig.pool.acquire()
+                        })
+                });
+                if let Some(target) = free {
+                    if restore(rig, existing, target) {
+                        stats.lock().expect("stats").note_restore();
+                        slot = Some(target);
+                    } else {
+                        // restore marked it Cold; its tokens survive, so the
+                        // cold path below re-prefills.
+                        rig.pool.release(target);
+                    }
+                }
+            }
             if let Some(slot) = slot {
                 let mut extended = base;
                 extended.extend_from_slice(&req.continuation);
@@ -502,9 +528,17 @@ fn admit(
                             max_tokens: req.max_tokens.max(1),
                         });
                         rig.sessions.touch(existing);
+                        if rig.gpu.slot_trace() {
+                            eprintln!(
+                                "[slot-trace] continuation HIT -- session {} reused {} of {} tokens",
+                                existing.0,
+                                plan.reused,
+                                extended.len()
+                            );
+                        }
                         let mut st = stats.lock().expect("stats");
                         st.note_admitted();
-                        st.note_restore(); // a prefix-cache hit
+                        st.note_prefix_hit();
                     }
                     return;
                 }
@@ -512,50 +546,6 @@ fn admit(
         }
         if rig.gpu.slot_trace() {
             eprintln!("[slot-trace] continuation MISS -- falling back to cold prefill");
-        }
-    }
-
-    // Multi-turn prefix reuse. OpenAI chat completions are stateless -- the
-    // client resends the whole conversation each turn -- so a follow-up turn
-    // is recognised by its prompt STRICTLY EXTENDING a resident session's
-    // tokens. `find_extendable` enforces strict extension because DeltaNet
-    // state is recurrent and cannot be rewound (see its doc comment).
-    //
-    // Reusing skips both the fresh `open` and the DN reset: keeping that
-    // recurrent state is exactly what makes the second turn cheap.
-    if let Some(existing) = rig.sessions.find_extendable(&req.prompt_tokens, &busy) {
-        if let Some(slot) = rig.sessions.get(existing).and_then(|s| s.slot) {
-            if let Ok(plan) = rig
-                .sessions
-                .begin_turn(&mut rig.pool, existing, &req.prompt_tokens)
-            {
-                if let Some(sess) = rig.sessions.get_mut(existing) {
-                    sess.tokens = req.prompt_tokens.clone();
-                }
-                if send_event(
-                    &req.reply,
-                    Event::Accepted {
-                        session: existing.0,
-                    },
-                )
-                .is_ok()
-                {
-                    work[slot.0].remaining_prompt = req.prompt_tokens[plan.reused..].to_vec();
-                    work[slot.0].next_pos = plan.reused;
-                    work[slot.0].decoding = false;
-                    slots[slot.0] = Some(InFlight {
-                        session: existing,
-                        reply: req.reply,
-                        produced: 0,
-                        max_tokens: req.max_tokens.max(1),
-                    });
-                    rig.sessions.touch(existing);
-                    let mut st = stats.lock().expect("stats");
-                    st.note_admitted();
-                    st.note_restore(); // a prefix-cache hit
-                }
-                return;
-            }
         }
     }
 
@@ -724,7 +714,6 @@ fn evict(rig: &mut Rig, victim: SessionId) -> bool {
 
 /// Restore a previously swapped session into `slot`. Any failure marks it
 /// `Cold` so the caller re-prefills from tokens.
-#[allow(dead_code)]
 fn restore(rig: &mut Rig, id: SessionId, slot: SlotId) -> bool {
     match rig.swap.unpark(id.0) {
         Ok(snap) => {

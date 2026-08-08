@@ -87,6 +87,7 @@ echo "  $SLOTS slots, $MAX_TOKENS tokens/request, port $PORT"
 # test the same arm as the positive run.
 HIPFIRE_DAEMON_BIN="$DAEMON" \
 HIPFIRE_SERVE_MULTI_SLOT="${HIPFIRE_SERVE_MULTI_SLOT:-1}" \
+HIPFIRE_SLOT_TRACE="${HIPFIRE_SLOT_TRACE:-1}" \
 HIPFIRE_MEM_CAP="${HIPFIRE_MEM_CAP:-34G}" \
   "$ROOT/scripts/run-bounded.sh" "$ROOT/target/release/hipfire" serve \
     --model "$MODEL" --no-prewarm "$PORT" > "$WORK/serve.log" 2>&1 &
@@ -281,6 +282,17 @@ E=$(date +%s.%N)
 T1=$(echo "$E - $S" | bc)
 
 REPLY="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["choices"][0]["message"]["content"])' "$WORK/t1.json")"
+
+# Push turn 1's session out of its slot before continuing it, so turn 2 has to
+# RESTORE from the swap store rather than finding it resident. Without this the
+# restore path is wired but never exercised -- the same "evictions=0 proves
+# nothing" trap this gate exists to avoid.
+echo "  evicting turn 1's session with $((SLOTS + 1)) unrelated conversations..."
+for e in $(seq 0 "$SLOTS"); do
+  curl -s -m 300 -X POST "$URL" -H 'Content-Type: application/json' \
+    -d "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"Unrelated question number $e about geology?\"}],\"max_tokens\":8}" \
+    -o /dev/null || fail "eviction filler request $e failed"
+done
 S=$(date +%s.%N)
 code="$(curl -s -m 300 -X POST "$URL" -H 'Content-Type: application/json' \
   -d "$(python3 -c 'import json,sys; print(json.dumps({"model":"m","messages":[{"role":"user","content":sys.argv[1]},{"role":"assistant","content":sys.argv[2]},{"role":"user","content":"And what caused its decline?"}],"max_tokens":int(sys.argv[3])}))' "$LONG" "$REPLY" "$MAX_TOKENS")" \
@@ -288,7 +300,22 @@ code="$(curl -s -m 300 -X POST "$URL" -H 'Content-Type: application/json' \
 E=$(date +%s.%N)
 [ "$code" = "200" ] || fail "turn 2 returned HTTP $code"
 T2=$(echo "$E - $S" | bc)
-echo "  turn 1 (cold): ${T1}s   turn 2 (continues turn 1): ${T2}s"
+echo "  turn 1 (cold): ${T1}s   turn 2 (continues turn 1, after eviction): ${T2}s"
+
+# Reuse is asserted on the ENGINE EVENT, not on latency. Latency alone cannot
+# carry this claim: turn 1 pays one-off warm-up, so turn 2 comes in ~20-30%
+# cheaper even when the continuation MISSES and re-prefills from cold. A run
+# that reported "reuse saved 23%" was doing exactly that -- the trace said
+# `continuation MISS`. The timing figure stays below as information only.
+if [ "${SERVE_GATE_REQUIRE_REUSE:-1}" = "1" ]; then
+  HITS=$(grep -c 'continuation HIT' "$WORK/serve.log" || true)
+  if [ "$HITS" -eq 0 ]; then
+    echo "FAIL: no 'continuation HIT' in serve.log -- prefix reuse did not fire." >&2
+    grep -E '\[slot-trace\]' "$WORK/serve.log" | tail -20 >&2
+    fail "prefix reuse did not fire (0 continuation HITs)"
+  fi
+  echo "  continuation HIT x$HITS (engine reused the session's KV)"
+fi
 
 # Asserted by default. Reuse works: the engine matches the conversation by its
 # USER turns and then APPENDS `continuation_suffix` to the session's exact
@@ -297,7 +324,7 @@ echo "  turn 1 (cold): ${T1}s   turn 2 (continues turn 1): ${T2}s"
 # OpenThink opener that history rendering does not replay, and re-encoding the
 # decoded reply is a detokenise/retokenise round trip that is not guaranteed to
 # be the identity. Appending sidesteps both.
-python3 - "$T1" "$T2" "${SERVE_GATE_REQUIRE_REUSE:-1}" <<'PY3' || exit 1
+python3 - "$T1" "$T2" "0" <<'PY3' || exit 1
 import sys
 t1, t2, require = float(sys.argv[1]), float(sys.argv[2]), sys.argv[3] == "1"
 ratio = t2 / t1 if t1 > 0 else 1.0

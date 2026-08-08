@@ -174,41 +174,16 @@ impl SessionTable {
         self.sessions
             .iter()
             .filter(|(id, s)| {
-                s.slot.is_some()
+                // Residency is deliberately NOT a filter. A swapped session is
+                // exactly the case swap exists for: its snapshot holds the KV
+                // this turn wants. The caller restores it before use. Cold
+                // sessions have no snapshot, so they are excluded.
+                s.residency != Residency::Cold
                     && s.convo.as_slice() == expect
                     && !s.tokens.is_empty()
                     && !busy.iter().any(|b| b.0 == **id)
             })
             .max_by_key(|(_, s)| s.last_used)
-            .map(|(id, _)| SessionId(*id))
-    }
-
-    /// Find a resident, non-busy session whose stored tokens are a **strict
-    /// prefix** of `prompt` — i.e. the new prompt extends that conversation.
-    /// Returns the longest such match.
-    ///
-    /// Strict extension only, and that restriction is load-bearing for
-    /// linear-attention models. `begin_turn` can rewind KV to any point, but
-    /// DeltaNet state is *recurrent*: it cannot be un-applied. A session whose
-    /// conversation diverged half way through has recurrent state for tokens
-    /// the new prompt does not contain, and there is no way to roll it back —
-    /// so that session must not be reused, however long the common prefix is.
-    ///
-    /// Full-attention-only models could reuse a partial match safely. This is
-    /// deliberately the conservative rule for both, because picking per-model
-    /// would mean the reuse policy silently changes meaning with the
-    /// checkpoint.
-    pub fn find_extendable(&self, prompt: &[u32], busy: &[SessionId]) -> Option<SessionId> {
-        self.sessions
-            .iter()
-            .filter(|(id, s)| {
-                s.slot.is_some()
-                    && !s.tokens.is_empty()
-                    && s.tokens.len() < prompt.len()
-                    && prompt.starts_with(&s.tokens)
-                    && !busy.iter().any(|b| b.0 == **id)
-            })
-            .max_by_key(|(_, s)| s.tokens.len())
             .map(|(id, _)| SessionId(*id))
     }
 
@@ -426,6 +401,34 @@ mod tests {
     }
 
     #[test]
+    fn find_continuation_matches_a_swapped_session() {
+        // The whole point of swap: its snapshot holds the KV this turn wants.
+        let (mut pool, mut adm, mut t) = rig(2);
+        let a = t.open(&mut pool, &mut adm, 1024).unwrap();
+        {
+            let s = t.get_mut(a).unwrap();
+            s.convo = vec![11];
+            s.tokens = vec![1, 2, 3];
+        }
+        t.mark_swapped(&mut pool, a);
+        assert_eq!(t.find_continuation(&[11, 22], &[]), Some(a));
+    }
+
+    #[test]
+    fn find_continuation_refuses_a_cold_session() {
+        // Cold means no snapshot exists, so there is nothing to restore.
+        let (mut pool, mut adm, mut t) = rig(2);
+        let a = t.open(&mut pool, &mut adm, 1024).unwrap();
+        {
+            let s = t.get_mut(a).unwrap();
+            s.convo = vec![11];
+            s.tokens = vec![1, 2, 3];
+        }
+        t.mark_cold(&mut pool, a);
+        assert_eq!(t.find_continuation(&[11, 22], &[]), None);
+    }
+
+    #[test]
     fn find_continuation_refuses_a_different_conversation() {
         let (mut pool, mut adm, mut t) = rig(2);
         let a = t.open(&mut pool, &mut adm, 1024).unwrap();
@@ -460,61 +463,6 @@ mod tests {
             None,
             "turn 1 is not a continuation"
         );
-    }
-
-    #[test]
-    fn find_extendable_matches_a_strict_extension() {
-        let (mut pool, mut adm, mut t) = rig(2);
-        let a = t.open(&mut pool, &mut adm, 1024).unwrap();
-        t.get_mut(a).unwrap().tokens.extend_from_slice(&[1, 2, 3]);
-        assert_eq!(t.find_extendable(&[1, 2, 3, 4, 5], &[]), Some(a));
-    }
-
-    #[test]
-    fn find_extendable_refuses_a_divergent_conversation() {
-        let (mut pool, mut adm, mut t) = rig(2);
-        let a = t.open(&mut pool, &mut adm, 1024).unwrap();
-        t.get_mut(a).unwrap().tokens.extend_from_slice(&[1, 2, 3]);
-        // Shares [1,2] but diverges: the recurrent state already absorbed 3
-        // and cannot be un-applied, so this session must NOT be reused.
-        assert_eq!(t.find_extendable(&[1, 2, 9, 9], &[]), None);
-    }
-
-    #[test]
-    fn find_extendable_refuses_an_exact_match() {
-        // An identical prompt leaves nothing to prefill, so there would be no
-        // logits to sample; begin_turn's own cap would fight it.
-        let (mut pool, mut adm, mut t) = rig(2);
-        let a = t.open(&mut pool, &mut adm, 1024).unwrap();
-        t.get_mut(a).unwrap().tokens.extend_from_slice(&[1, 2, 3]);
-        assert_eq!(t.find_extendable(&[1, 2, 3], &[]), None);
-    }
-
-    #[test]
-    fn find_extendable_skips_busy_and_non_resident_sessions() {
-        let (mut pool, mut adm, mut t) = rig(2);
-        let a = t.open(&mut pool, &mut adm, 1024).unwrap();
-        t.get_mut(a).unwrap().tokens.extend_from_slice(&[1, 2]);
-        assert_eq!(t.find_extendable(&[1, 2, 3], &[a]), None, "busy is skipped");
-        t.mark_swapped(&mut pool, a);
-        assert_eq!(
-            t.find_extendable(&[1, 2, 3], &[]),
-            None,
-            "a session holding no slot cannot be extended in place"
-        );
-    }
-
-    #[test]
-    fn find_extendable_prefers_the_longest_match() {
-        let (mut pool, mut adm, mut t) = rig(3);
-        let a = t.open(&mut pool, &mut adm, 1024).unwrap();
-        let b = t.open(&mut pool, &mut adm, 1024).unwrap();
-        t.get_mut(a).unwrap().tokens.extend_from_slice(&[1, 2]);
-        t.get_mut(b)
-            .unwrap()
-            .tokens
-            .extend_from_slice(&[1, 2, 3, 4]);
-        assert_eq!(t.find_extendable(&[1, 2, 3, 4, 5], &[]), Some(b));
     }
 
     #[test]

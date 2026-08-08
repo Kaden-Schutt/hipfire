@@ -73,6 +73,10 @@ pub struct EngineStats {
     pub rejected: usize,
     pub evictions: usize,
     pub restores: usize,
+    /// Continuations served from a session's existing KV. Counted separately
+    /// from `restores`: a hit on a still-resident session restores nothing, and
+    /// conflating the two makes a gate that never restores look like it did.
+    pub prefix_hits: usize,
 }
 
 impl EngineStats {
@@ -87,6 +91,9 @@ impl EngineStats {
     }
     pub fn note_restore(&mut self) {
         self.restores += 1;
+    }
+    pub fn note_prefix_hit(&mut self) {
+        self.prefix_hits += 1;
     }
 }
 
