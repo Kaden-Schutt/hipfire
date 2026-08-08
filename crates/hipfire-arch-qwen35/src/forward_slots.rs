@@ -1436,8 +1436,28 @@ fn run_fullattn_layer_slots(
         }),
     )?;
 
-    // 8. sigmoid(gate) * attn_out.
-    gpu.sigmoid_mul_f32(&pbs.fa_attn_out_batch, &pbs.fa_gate_batch)?;
+    // 8. sigmoid(gate) * attn_out, over the `n` LIVE rows only.
+    //
+    // `fa_attn_out_batch` / `fa_gate_batch` are sized for the largest prefill
+    // batch, and `sigmoid_mul_f32` derives its element count from the tensor
+    // it is handed. Passing the whole buffer therefore did the same work on a
+    // 4-row decode step as on a full prefill chunk: profiled at 8388608
+    // elements (2048 rows x n_heads*head_dim) and 427.6 us per call, 10 calls
+    // per step -- 4.28 ms, 10.3% of a 4-slot decode step, on 2044 dead rows.
+    //
+    // The reference does the same thing at its own batched call sites, but
+    // only ever reaches them for prefill, where n is the batch. Its decode
+    // path uses the single-row `s.fa_attn_out` scratch instead. This path is
+    // the one that runs a batched buffer at decode row counts.
+    //
+    // Rows >= n keep whatever they held rather than being overwritten with
+    // sigmoid(garbage)*garbage; nothing downstream reads them (o_proj takes
+    // n rows), and the golden gate holds at 0.000x.
+    let gate_elems = n * config.n_heads * config.head_dim;
+    gpu.sigmoid_mul_f32(
+        &pbs.fa_attn_out_batch.sub_offset(0, gate_elems),
+        &pbs.fa_gate_batch.sub_offset(0, gate_elems),
+    )?;
 
     // 9. wo + residual.
     q8_residual_proj(
@@ -1703,8 +1723,28 @@ fn run_fullattn_moe_layer_slots(
         }),
     )?;
 
-    // 8. sigmoid(gate) * attn_out.
-    gpu.sigmoid_mul_f32(&pbs.fa_attn_out_batch, &pbs.fa_gate_batch)?;
+    // 8. sigmoid(gate) * attn_out, over the `n` LIVE rows only.
+    //
+    // `fa_attn_out_batch` / `fa_gate_batch` are sized for the largest prefill
+    // batch, and `sigmoid_mul_f32` derives its element count from the tensor
+    // it is handed. Passing the whole buffer therefore did the same work on a
+    // 4-row decode step as on a full prefill chunk: profiled at 8388608
+    // elements (2048 rows x n_heads*head_dim) and 427.6 us per call, 10 calls
+    // per step -- 4.28 ms, 10.3% of a 4-slot decode step, on 2044 dead rows.
+    //
+    // The reference does the same thing at its own batched call sites, but
+    // only ever reaches them for prefill, where n is the batch. Its decode
+    // path uses the single-row `s.fa_attn_out` scratch instead. This path is
+    // the one that runs a batched buffer at decode row counts.
+    //
+    // Rows >= n keep whatever they held rather than being overwritten with
+    // sigmoid(garbage)*garbage; nothing downstream reads them (o_proj takes
+    // n rows), and the golden gate holds at 0.000x.
+    let gate_elems = n * config.n_heads * config.head_dim;
+    gpu.sigmoid_mul_f32(
+        &pbs.fa_attn_out_batch.sub_offset(0, gate_elems),
+        &pbs.fa_gate_batch.sub_offset(0, gate_elems),
+    )?;
 
     // 9. wo + residual.
     match attn_dtype {
