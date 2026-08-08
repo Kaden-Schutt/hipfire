@@ -111,35 +111,63 @@ the union. **Consequences:**
 - Adding gfx1100 as an *expert co-owner* is worth little. Its value is as the
   **dense/serial owner**, and that is where it is currently squandered.
 
-### 3.2 Honest sizing of the gfx1100 kernel campaign
+### 3.2 Sizing the gfx1100 kernel campaign
 
-Two corrections to naive sizing, both from source inspection:
+H1's own H3 note proposed 600 GB/s. **That target is too weak** — it is 62.5%
+of peak, and this codebase already does better than that on harder memory.
 
-1. **The grouped O-LoRA 544.2 GB/s win came from CU fill** — one 8,192-wave
-   grid replacing eight 1,024-wave grids — *not* from a better decode, LDS
-   codebook, or coalescing change. Both kernels use zero LDS and identical
-   register-decode. That win does **not** transfer to already-fat single-row
-   GEMVs.
-2. **64.5% of the generic tier's bytes are `wq_b` (27.6%), `wo_b` (27.0%) and
-   `lm_head` (9.9%)** — single-row serial GEMVs that grouping cannot touch.
-   Only ~1.45 ms of the 7.586 ms is addressable by the existing `shared_jobs`
-   packing (shared `w1`/`w3`, compressor pairs, indexer compressor).
+#### The efficiency proof point
 
-So the lift is a real per-shape kernel job, not one trick:
+| Achieved | Peak | % | Kernel |
+|---:|---:|---:|---|
+| 213.7 | 256 | **83.5%** | gfx1151 MQ2-Lloyd expert gate/up + down (production) |
+| 544.2 | 960 | 56.7% | gfx1100 grouped O-LoRA E8 (accepted G5) |
+| 403.1 | 960 | 42.0% | gfx1100 dense E8, weighted (the problem) |
+| 376.7 | 960 | 39.2% | gfx1100 generic tier (H1 baseline symbol) |
 
-| Weighted generic-tier BW | ms/token | Saving |
-|---:|---:|---:|
-| 376.7 (H1 baseline) | 7.587 | — |
-| 450 | 6.351 | 1.236 ms |
-| 500 | 5.716 | 1.871 ms |
-| 600 (H1's own H3 target) | 4.763 | 2.824 ms |
+Our own gfx1151 expert kernel sustains **83.5% of peak on unified LPDDR5X** —
+an APU memory system that is *harder* to saturate than discrete GDDR6. The
+same efficiency on gfx1100 is **802 GB/s**. That, not 600, is the target.
+
+#### Why the dense kernel sits at 39%
+
+From source. The limiter is memory-level parallelism, not decode arithmetic:
+
+- `__launch_bounds__(32)` with no min-waves hint. The grouped and gfx1151
+  twins both set `(32, 7)`; the generic and buffer variants omit it.
+- One wave per workgroup, one row per workgroup.
+- Codeword loads are 32 × u32 = 128 B per wave — **4 B per lane, a plain
+  `dword`**. A `dwordx4` gives 4× the bytes in flight per instruction.
+- Zero LDS, register decode. ALU is ~10% utilized at these rates; it is not
+  the constraint.
+- The grouped variant reached 544.2 GB/s from **CU fill alone** (one
+  8,192-wave grid replacing eight 1,024-wave grids), with an identical decode
+  body. That is the direct evidence that occupancy and request concurrency are
+  what is missing.
+
+Little's Law confirms it: 800 GB/s at ~400 ns VRAM latency needs ~313 KB in
+flight, i.e. ~3.3 KB per CU across 96 CUs. At 128 B per wave-load that is 26
+concurrent loads per CU; at `dwordx4` it is 7. The second is comfortably
+reachable, the first is not.
+
+#### The lift
+
+| Weighted dense-E8 BW | % peak | serial tier | shared branch |
+|---:|---:|---:|---:|
+| 403.1 (today) | 42.0% | 14.62 ms | 1.65 ms |
+| 600 | 62.5% | 12.14 ms | 1.18 ms |
+| 700 | 72.9% | 11.41 ms | 1.04 ms |
+| **802** | **83.5%** | **10.86 ms** | **0.93 ms** |
+
+Work items, in the order the evidence supports: widen loads to `dwordx4`;
+multiple rows per workgroup (256 threads × 8 rows) for memory parallelism;
+the `(32, 7)` min-waves hint; deeper unroll for independent loads in flight.
 
 **Blocking caveat:** `ds4_dense_e8` already dispatches
 `gemv_mfp4g32_e8_soa_buffer_gfx1100`
 (`crates/rdna-compute/src/rdna3/gfx1100.rs:70-74`), while H1's 376.7 GB/s is
 the **pre-buffer** profiled symbol. The 7.586 ms line item may already be
-stale. **Re-billing is mandatory before any of this sizing is trusted** — that
-is gate R1.
+stale. **Re-billing is mandatory before this sizing is trusted** — gate R1.
 
 ## 4. The imported method (non-negotiable)
 
@@ -209,30 +237,46 @@ and `gemv_mfp4g32_e8_soa_shared_jobs.gfx1100.hip` are now all in the base tree.
 **AR target: 50 tok/s** on the canonical 2,048/512 fixture, gfx1100 + gfx1151.
 Locked 2026-08-07. `20.000 ms/token` total wall.
 
-The bill does not reach it on the kernel campaign plus residency alone. At the
-dispatch-proportional residual those two levers land **45–47 tok/s**:
+The single variable that decides the campaign is the **achieved dense-E8
+bandwidth on gfx1100** (§3.2). Sweeping it against the residual:
 
-| Weighted generic-E8 BW | useful union | residual 5.15 ms |
-|---:|---:|---:|
-| 500 | 17.17 ms | 44.8 tok/s |
-| 544.2 | 16.71 ms | 45.7 tok/s |
-| 600 | 16.22 ms | 46.8 tok/s |
+| Dense-E8 BW | % peak | useful union | resid 5.15 | resid 4.0 | resid 3.0 | resid 1.0 |
+|---:|---:|---:|---:|---:|---:|---:|
+| 403 (today) | 42.0% | 19.04 ms | 41.3 | 43.4 | 45.4 | 49.9 |
+| 500 | 52.1% | 17.38 ms | 44.4 | 46.8 | 49.1 | **54.4** |
+| 600 | 62.5% | 16.23 ms | 46.8 | 49.4 | **52.0** | **58.0** |
+| 700 | 72.9% | 15.41 ms | 48.6 | **51.5** | **54.3** | **60.9** |
+| **802** | **83.5%** | **14.79 ms** | **50.2** | **53.2** | **56.2** | **63.3** |
+| 850 | 88.5% | 14.54 ms | **50.8** | **53.9** | **57.0** | **64.3** |
 
-A third structural lever is required. It is the one the previous campaign died
-on, so it is stated precisely in §8.2.
+`resid 5.15` is Levers A + B with launch fusion but **no Lever C**.
+`resid 1.0` is Lever C landing fully.
+
+Two conclusions:
+
+1. **At 802 GB/s the target is met without Lever C** (50.2 tok/s). The kernel
+   campaign carries the campaign. This is the primary path.
+2. **T2 = 60 tok/s is back on the table** at 802 GB/s with Lever C (63.3). An
+   earlier revision of this document called T2 unsupported; that was an
+   artefact of the weak 600 GB/s target, and is withdrawn.
 
 ### 8.1 Why the residual only falls to ~5.15 ms from kernels alone
 
 The residual is dominated by host launch cost, so it tracks dispatch count.
-H1 measured 3,165 dispatches/token against a 6.036 ms residual. The kernel
-campaign's mechanism *is* launch-count reduction, so it attacks both terms:
-`hc-fusions` removes 3 launches × 86 layers = 258; mixed-E8 packing removes
-~205. That is 3,165 → 2,702, a 14.6% cut, and 6.036 → **5.153 ms**. Real, but
-not enough on its own.
+H1 measured 3,165 dispatches/token against a 6.036 ms residual. Launch fusion
+attacks both terms: `hc-fusions` removes 3 × 86 = 258 dispatches, mixed-E8
+packing ~205. That is 3,165 → 2,702, a 14.6% cut, and 6.036 → **5.153 ms**.
+Note the bandwidth work does *not* reduce launch count — wider loads and
+better occupancy leave the dispatch count unchanged — so these two halves of
+Lever A are independent and both are needed.
 
 ### 8.2 Lever C — coarse whole-token retained owner body
 
-Already measured, on this exact hardware
+**Status: margin, not requirement.** It is the difference between hitting 50
+and hitting 60, and it is the insurance policy if the E8 tier lands at 700
+rather than 802.
+
+Already measured on this exact hardware
 (`docs/investigations/2026-08-07-ds4-gfx1100-owner-throughput-gate.md:13-20`):
 
 | gfx1100 owner body | ms/token | tok/s |
@@ -255,20 +299,9 @@ TG128 doc itself prescribes at `:118-132`.
 **Hard pre-gate, no exceptions:** before any model run, screen the
 continuation protocol with a small multi-checkpoint oracle and demonstrate a
 projected ≥2% end-to-end win. If the oracle does not clear, Lever C is dead
-and the target is renegotiated — not pursued on faith. This is exactly the
-gate the previous campaign lacked.
-
-### 8.3 Envelope with A + B + C
-
-| Weighted generic-E8 BW | useful union | resid 3.0 | resid 2.5 | resid 2.0 | resid 1.5 |
-|---:|---:|---:|---:|---:|---:|
-| 450 | 17.80 ms | 48.1 | 49.2 | **50.5** | **51.8** |
-| 500 | 17.17 ms | 49.6 | **50.8** | **52.2** | **53.6** |
-| 544.2 | 16.71 ms | **50.7** | **52.1** | **53.5** | **54.9** |
-| 600 | 16.22 ms | **52.0** | **53.4** | **54.9** | **56.4** |
-
-50 tok/s needs the generic-E8 tier at ≥500 GB/s **and** Lever C landing. There
-is no combination of two levers that reaches it. T2 = 60 remains unsupported.
+and we ship on the kernel campaign — not pursued on faith. This is exactly
+the gate the previous campaign lacked. Because C is now margin rather than
+requirement, killing it is cheap.
 
 ## 9. Restart ladder
 
@@ -279,28 +312,43 @@ concurrently. Implementation parallelizes; screening does not.
 **Wave 1 — implement concurrently, each behind its own admission flag,
 default off.** No benchmarking, no shared-file coordination needed.
 
-| Slice | Work |
-|---|---|
-| C-oracle | Multi-checkpoint continuation oracle for Lever C (§8.2 pre-gate) |
-| R2 | `hc-fusions` re-gate onto exact-gfx1100 MQ2R (`forward.rs:888-896`) |
-| R3 | `nox` re-gate (`norm.rs:4193`) + T1024 flag, as two independent gates |
-| R4a | `__launch_bounds__(32,7)` on the dense buffer kernel |
-| R4b | `shared_jobs` wiring for `w1`/`w3` + compressor pairs |
+| Slice | Work | Owns |
+|---|---|---|
+| **R4-BW** | **The campaign.** Rewrite the gfx1100 dense E8 GEMV for memory-level parallelism: `dwordx4` loads, multiple rows per workgroup, `(32,7)` min-waves, deeper unroll. Target 802 GB/s. | `gemv_mfp4g32_e8_soa_buffer.gfx1100.hip` |
+| R2 | `hc-fusions` re-gate onto exact-gfx1100 MQ2R | `forward.rs:888-896` |
+| R3 | `nox` re-gate + T1024, as two independent gates | `norm.rs:4193`, `attention.rs` |
+| R4-PACK | `shared_jobs` wiring for `w1`/`w3` + compressor pairs (~1.45 ms) | `gemv.rs`, `forward.rs` call sites |
+| C-oracle | Multi-checkpoint continuation oracle for Lever C (§8.2 pre-gate) | new bench |
+
+R4-BW is the critical path and should be staffed accordingly: §8 shows the
+whole target turns on it, and every other slice is worth 2–7% against its
+~9 tok/s.
 
 **Wave 2 — screen serially on hipx, in this order.** Each under §4: 3 fresh
 processes, median + range spread, mandatory byte-identical golden, 2% gate,
 revert on reject.
 
 - **R0** Re-establish the waterline. Every figure in §2 predates the merge.
-- **R1** Re-bill the serial tier **per projection shape**, not flat. Confirm
-  whether `buffer_gfx1100` or the generic symbol is live — this decides
-  whether Lever A is worth 1.2 ms or 2.8 ms, and it may show the 7.586 ms line
-  item is already stale.
-- **R2** → **R3** (two screens) → **R4a** → **R4b** → **R4c** fat-M bandwidth
-  for `wq_b`/`wo_b`/`lm_head` (~4.90 ms, 64.5% of bytes, scoped by R1).
-- **C** Lever C, only if its oracle cleared ≥2%.
+- **R1** Re-bill the dense E8 tier **per projection shape**, not flat, and
+  confirm whether `buffer_gfx1100` or the generic symbol is live. This scopes
+  R4-BW and may show the 7.586 ms line item is already partly stale.
+- **R4-BW** first, because it is the campaign. Screen at the shape level
+  before the product run: a per-shape bandwidth micro is cheap and its
+  projection gates the product sample.
+- **R2** → **R3** (two separate screens, both need fresh goldens) →
+  **R4-PACK**.
+- **C** only if its oracle cleared ≥2%. Skip without regret if R4-BW landed
+  at or above 802 GB/s.
 - **R5** Rate-matched residency last. Measure `r` once; §3.1 shows it is worth
   ~4 tok/s of ceiling, not a campaign. Do not max-fill VRAM.
+
+### 9.1 Stop conditions
+
+- R4-BW below **700 GB/s** after the shape work: Lever C moves from margin to
+  required, and its oracle becomes a blocking gate rather than optional.
+- R4-BW below **600 GB/s**: stop and re-bill. The memory-parallelism diagnosis
+  in §3.2 is then wrong and the campaign needs a new root cause before more
+  effort is spent.
 
 ## 10. Do not retry
 
