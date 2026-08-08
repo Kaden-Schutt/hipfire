@@ -95,7 +95,9 @@ __global__ void HIPFIRE_GDN_KERNEL(
     int n_heads,
     int head_dim,
     unsigned int frame,
-    __half* __restrict__ s_ef_residual
+    __half* __restrict__ s_ef_residual,
+    const int* __restrict__ row_slot,   // [n_tokens] or nullptr = legacy (all slot 0)
+    int s_stride_elems                  // elements between consecutive slots' S state
 ) {
     const int h = blockIdx.x;
     const int tile = blockIdx.y;
@@ -127,9 +129,15 @@ __global__ void HIPFIRE_GDN_KERNEL(
 #define HIPFIRE_GDN_S_INDEX(r, lane) (((r) * 32) + (lane))
 #endif
 
-    signed char* sq_base = s_q8 + h * HD * HD + row_start * HD;
+    // Each slot owns an independent, fixed-size S state. There is no shared
+    // arena and no ragged length here, unlike KV — just a stride. In legacy
+    // mode row_slot is null, the offset is 0, and addressing is unchanged.
+    const int dn_slot = (row_slot != nullptr) ? row_slot[0] : 0;
+    const long long s_off = (long long)dn_slot * (long long)s_stride_elems;
+
+    signed char* sq_base = s_q8 + s_off + h * HD * HD + row_start * HD;
     for (int r = 0; r < TILE_ROWS; r++) {
-        const float scale = s_scales[h * HD + row_start + r];
+        const float scale = s_scales[s_off + h * HD + row_start + r];
         const signed char* src = sq_base + r * HD;
         S_f4[HIPFIRE_GDN_S_INDEX(r, tid)] = make_float4(
             scale * (float)src[tid],
@@ -288,7 +296,7 @@ __global__ void HIPFIRE_GDN_KERNEL(
             dst[tid+32]   = (signed char)qf1;
             dst[tid+64]   = (signed char)qf2;
             dst[tid+96]   = (signed char)qf3;
-            if (tid == 0) s_scales[h * HD + rr] = scale;
+            if (tid == 0) s_scales[s_off + h * HD + rr] = scale;
         } else {
             // Stochastic rounding.
             unsigned int rng = (unsigned int)(h * 1664525u + rr * 1013904223u
@@ -305,7 +313,7 @@ __global__ void HIPFIRE_GDN_KERNEL(
             #undef STOCH_ROUND
             if (tid == 0) {
                 float scale = (my_max > 0.0f) ? (my_max / 127.0f) : 1.0f;
-                s_scales[h * HD + rr] = scale;
+                s_scales[s_off + h * HD + rr] = scale;
             }
         }
     }
