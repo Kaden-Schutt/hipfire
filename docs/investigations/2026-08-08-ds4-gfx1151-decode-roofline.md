@@ -37,12 +37,22 @@ run time; sha256 as recorded with the previous golden
 ```bash
 ROCR_VISIBLE_DEVICES=1 python3 scripts/serve_harness.py \
   --model /home/kaden/ds4-gfx1151-evidence/2026-08-03-ds4-dspark-pm4-canary/model-e8/deepseek-v4-flash-0731.mq2r \
-  --kv q8 --kv-backend contiguous \
+  --kv f32 --kv-backend contiguous \
   --speculation dspark --mtp off --dflash off \
   --thinking off --thinking-effort none \
   --sampling greedy --max-tokens 128 --mode battery \
   --prompts-file benchmarks/prompts/ds4_dspark_genre_code.json
 ```
+
+**The `--kv` value changed, the configuration did not.** Every measurement in
+this document was originally taken with `--kv q8`. DS4 never implemented a q8
+compressor cache: it silently ran F32 under a q8 label. The
+`ds4-gfx1201-opt` merge makes that fail closed —
+`kv_cache=q8 is not implemented; use f32` — so the command above now says
+`f32`, which is what was always executing and is also the registry default for
+`deepseek-v4-flash:mq2r`. Re-verified at the merge commit: 38.96833 and
+38.96865 tok/s, tau and decoded text unchanged, within 0.01% of the recorded
+median. Numbers taken before the merge under `--kv q8` remain comparable.
 
 **Validity signature.** A run of this fixture that does not report
 `tau = 2.0238095238095237` with `ctx=25 gen=128` is not the golden
@@ -589,3 +599,49 @@ drafter in-regime for this request?"
 2. **Read the sidecar's metadata.** If the DS4 DSpark artifact carries no
    trained-regime declaration at all, that gap is the first thing to close —
    detection before correction.
+
+## 10. F16 compressor cache: merged, and gfx1151 needs one kernel ported
+
+`ds4-gfx1201-opt` was merged (29 commits, principally 2830c5cd8 with
+certification 1019a0e56). It adds a selectable F16 compressor cache confining
+F16 storage to `main_kv_cache` and `indexer_kv_cache` — the two ctx-scaled
+allocations traced in §9 — halving the replicated compressor/indexer VMM
+footprint from 14,428,405,760 to 7,214,202,880 bytes per rank and roughly
+doubling admissible context (475,136 tokens against 229,376 on the matched F32
+bracket, three 34.2 GB ranks).
+
+On `gfx1151` it is refused at load:
+
+```
+deepseek4: kv_cache=f16 currently requires gfx1201 MQ2R TP3/TP4.
+GPU: gfx1151 (13532 MB free / 98304 MB total)
+```
+
+This is the fifth encounter with the "kernel gated to another architecture"
+seam, and the second where the answer is *port*, not *re-gate*:
+
+| kernel | gfx12-only intrinsics | verdict |
+| --- | --- | --- |
+| `compressor_commit_staged_f16.gfx1201.hip` | none | portable, re-gate |
+| `deepseek4_compressor_cache_f16.gfx1201.hip` | `__builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12` (one call site, line 125) | port required |
+
+A macro swapping the builtin spelling is **not** sufficient. The two
+generations take different fragment layouts:
+
+```
+gfx11  typedef _Float16 __attribute__((ext_vector_type(16))) half16_t;   // attention_dflash_wmma.hip
+gfx12  typedef _Float16 __attribute__((ext_vector_type(8)))  half8_t;    // deepseek4_compressor_cache_f16
+```
+
+so the staging loop (`q_frag[i] = qh[k + k_half * 8 + i]`) must be rewritten for
+16-wide fragments and gfx11 lane duplication. That failure mode is silent —
+wrong attention scores, not a compile error — so it needs the coherence gate,
+not a throughput delta. The gfx11 spelling is already proven in-tree
+(`attention_dflash_wmma.hip`, and `attention_dflash_wmma_m128_n32_f16kv_v7_f32.hip`
+is f16-KV WMMA attention), so the target form exists to model against.
+
+Worth being clear about the payoff before anyone spends the day: the
+certification calls F16 "a capacity route, not yet a speed promotion." It buys
+context length, not tok/s. Its own stated next step — "keep gathered compressed
+K/V in native F16 through the WMMA consumers" rather than widening halves back
+to F32 — is where the speed would come from, and that is downstream of the port.
