@@ -76,7 +76,26 @@ void indexer_relu_score_batched_f16_gfx1201(
     scores[(size_t)b * N_max + n] = reduce[0];
 }
 
-typedef _Float16 __attribute__((ext_vector_type(8))) half8_t;
+// WMMA fragment width differs by generation, so the A/B staging and the D
+// row mapping below are both generation-specific.
+//
+//   gfx12  A/B are 8-wide per lane; the wave splits each 16-element K chunk
+//          across lane halves (k_half selects which half). D row is
+//          8 * k_half + j.
+//   gfx11  A/B are 16-wide per lane; every lane carries the whole 16-element
+//          K chunk and lanes 16..31 duplicate lanes 0..15. D row is
+//          2 * j + k_half.
+//
+// Both keep the same D column (lane16), the same accumulator type, and F32
+// accumulation. See attention_dflash_wmma.hip for the established gfx11
+// spelling and its D-layout comment.
+#if defined(__gfx1200__) || defined(__gfx1201__)
+#define HF_WMMA_FRAG_WIDTH 8
+typedef _Float16 __attribute__((ext_vector_type(8))) half_frag_t;
+#else
+#define HF_WMMA_FRAG_WIDTH 16
+typedef _Float16 __attribute__((ext_vector_type(16))) half_frag_t;
+#endif
 typedef float __attribute__((ext_vector_type(8))) float8_t;
 #define WMMA_TILE 16
 #define HEADS_PER_WARP 16
@@ -115,8 +134,9 @@ indexer_relu_score_wmma_batched_f16_gfx1201(
   const _Float16 *kn = cache + (size_t)safe_n * D;
   float8_t acc = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
   for (int k = 0; k < D; k += WMMA_TILE) {
-    half8_t q_frag;
-    half8_t k_frag;
+    half_frag_t q_frag;
+    half_frag_t k_frag;
+#if defined(__gfx1200__) || defined(__gfx1201__)
 #pragma unroll
     for (int i = 0; i < 8; ++i) {
       q_frag[i] = (_Float16)qh[k + k_half * 8 + i];
@@ -124,12 +144,27 @@ indexer_relu_score_wmma_batched_f16_gfx1201(
     }
     acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(q_frag, k_frag,
                                                             acc);
+#else
+#pragma unroll
+    for (int i = 0; i < WMMA_TILE; ++i) {
+      q_frag[i] = (_Float16)qh[k + i];
+      k_frag[i] = (_Float16)kn[k + i];
+    }
+    acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(q_frag, k_frag, acc);
+#endif
   }
   __shared__ float lds[MAX_HEADS][WMMA_TILE];
   const int slot = n_start + lane16;
 #pragma unroll
   for (int j = 0; j < 8; ++j) {
+#if defined(__gfx1200__) || defined(__gfx1201__)
     const int head = h_start + 8 * k_half + j;
+#else
+    // gfx11 wave32 D layout: element j of lane t is row 2*j + (t >> 4),
+    // column t & 15 — so the head stride across j is 2, not 1, and k_half
+    // selects the odd row rather than the upper eight heads.
+    const int head = h_start + 2 * j + k_half;
+#endif
     float value = 0.0f;
     if (head < H && slot < n_valid_b) {
       const float qk = acc[j];

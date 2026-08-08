@@ -1539,14 +1539,36 @@ pub fn load_model_ep(path: &str, max_seq: usize, tp: usize) -> Result<LoadedMode
     )
 }
 
+/// DeepSeek V4 stores its long-lived compressor cache as F32 or F16 only; it
+/// has no block-quantised path. Rather than reject the quantised selectors,
+/// map every sub-F16 request up to F16 — the nearest storage the model
+/// actually implements, and the one whose intent ("smaller than F32") the
+/// caller expressed. Redirecting rather than failing keeps `q8`, the historic
+/// DS4 default, and the `asym`/`fwht`/`turbo` families usable, and it is a
+/// widening in precision terms: F16 carries more of the value than any of
+/// them would have.
+///
+/// This is deliberately not silent. A caller that asked for `q8` and received
+/// F16 storage is running a different configuration from the F32 golden, so
+/// the redirect is reported once at resolve time.
 fn resolve_deepseek4_compressor_cache_kv_mode(
     kv_mode: Option<&str>,
 ) -> Result<hipfire_config::Deepseek4CompressorCache, String> {
-    match kv_mode.unwrap_or("f32").to_ascii_lowercase().as_str() {
+    let raw = kv_mode.unwrap_or("f32").to_ascii_lowercase();
+    match raw.as_str() {
         "" | "auto" | "f32" => Ok(hipfire_config::Deepseek4CompressorCache::F32),
         "f16" => Ok(hipfire_config::Deepseek4CompressorCache::F16),
+        "q8" | "asym2" | "asym3" | "asym4" | "fwht2" | "fwht3" | "fwht4" | "turbo" | "turbo3"
+        | "turbo4" => {
+            eprintln!(
+                "[deepseek4] kv_cache={raw} has no DeepSeek V4 implementation; \
+                 using the F16 compressor cache instead (nearest supported storage \
+                 below F32). Pass --kv f32 for the golden configuration."
+            );
+            Ok(hipfire_config::Deepseek4CompressorCache::F16)
+        }
         other => Err(format!(
-            "DeepSeek V4 kv_cache={other} is not implemented; use f32 (golden/default) or f16 (gfx1201 MQ2R TP3/TP4 capacity route)"
+            "DeepSeek V4 kv_cache={other} is not recognised; use f32 (golden/default) or f16"
         )),
     }
 }
@@ -1759,18 +1781,36 @@ fn load_model_ep_ds4(
             .prepare_tp_graph_signals(config.num_hidden_layers * 2)
             .map_err(|e| format!("prepare gfx1201 TP graph signals: {e:?}"))?;
     } else if compressor_cache == hipfire_config::Deepseek4CompressorCache::F16 {
-        return Err(format!(
-            "DeepSeek V4 compressor_cache=f16 currently requires gfx1201 MQ2R TP3/TP4; got tp={tp}, mq2r={}, mq2rxt={}, devices={}",
-            config.mq2r,
-            config.mq2rxt,
-            staging
+        // Single-device gfx1151 MQ2R also carries the F16 compressor cache.
+        // The two F16 kernels are portable to gfx11: compressor_commit_staged
+        // uses no architecture intrinsics, and the indexer score kernel's WMMA
+        // is generation-selected in the source (gfx12 8-wide fragments with a
+        // D row of 8 * k_half + j, gfx11 16-wide fragments with 2 * j +
+        // k_half). Storage stays confined to main_kv_cache and
+        // indexer_kv_cache, halving the two ctx-scaled allocations; commit
+        // arithmetic remains F32 before the single F32-to-F16 store.
+        let gfx1151_mq2r_single = tp <= 1
+            && config.mq2r
+            && !config.mq2rxt
+            && staging
                 .gpus_mut()
                 .devices
                 .iter()
-                .map(|device| device.arch.as_str())
-                .collect::<Vec<_>>()
-                .join(",")
-        ));
+                .all(|device| device.arch.eq_ignore_ascii_case("gfx1151"));
+        if !gfx1151_mq2r_single {
+            return Err(format!(
+                "DeepSeek V4 compressor_cache=f16 requires gfx1201 MQ2R TP3/TP4 or single-device gfx1151 MQ2R; got tp={tp}, mq2r={}, mq2rxt={}, devices={}",
+                config.mq2r,
+                config.mq2rxt,
+                staging
+                    .gpus_mut()
+                    .devices
+                    .iter()
+                    .map(|device| device.arch.as_str())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ));
+        }
     }
     let peer = staging
         .gpus_mut()

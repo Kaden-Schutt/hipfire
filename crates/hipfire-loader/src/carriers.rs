@@ -1098,11 +1098,29 @@ impl Carrier for Deepseek4Carrier {
                 (config, weights)
             }
         };
-        if compressor_cache == hipfire_config::Deepseek4CompressorCache::F16 {
-            return Err("deepseek4: kv_cache=f16 currently requires gfx1201 MQ2R TP3/TP4".into());
+        // F16 compressor cache on the single-device path: gfx1201 (certified)
+        // and gfx1151 (ported — the indexer score kernel's WMMA is
+        // generation-selected in the kernel source). Storage is confined to
+        // main_kv_cache and indexer_kv_cache; every other compressor buffer
+        // stays F32 and commit arithmetic completes in F32 before the single
+        // F32-to-F16 store.
+        let f16_ok = config.mq2r
+            && !config.mq2rxt
+            && (ctx.gpu.arch.eq_ignore_ascii_case("gfx1151")
+                || ctx.gpu.arch.eq_ignore_ascii_case("gfx1201"));
+        if compressor_cache == hipfire_config::Deepseek4CompressorCache::F16 && !f16_ok {
+            return Err(format!(
+                "deepseek4: kv_cache=f16 requires MQ2R on gfx1151 or gfx1201; got arch={}, mq2r={}, mq2rxt={}",
+                ctx.gpu.arch, config.mq2r, config.mq2rxt
+            ));
         }
         let mut state = deepseek4::DeepseekV4State::new(&config)?;
-        state.compressor_cache_dtype = rdna_compute::DType::F32;
+        state.compressor_cache_dtype =
+            if compressor_cache == hipfire_config::Deepseek4CompressorCache::F16 {
+                rdna_compute::DType::F16
+            } else {
+                rdna_compute::DType::F32
+            };
         let pbs_max_batch: usize = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_PP_BATCH")
             .ok()
             .and_then(|s| s.parse().ok())
