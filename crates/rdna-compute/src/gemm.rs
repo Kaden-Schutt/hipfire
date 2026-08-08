@@ -19250,6 +19250,20 @@ impl Gpu {
             kernels::GEMM_QKVZA_Q8_0_WMMA_SRC,
             "gemm_qkvza_q8_0_wmma",
         )?;
+        // Invalidate the fp16-conversion cache: `x` is the DeltaNet LA
+        // preamble's rmsnorm output (e.g. `pbs.x_rot_batch`), a scratch
+        // buffer whose pointer is stable across the per-layer calls this
+        // function gets within one forward pass — but whose data is
+        // rewritten by rmsnorm every layer — AND whose backing allocation
+        // is itself freed and reallocated across separate forward-pass
+        // scratch (`PrefillBatchScratch`) instances, so the device
+        // allocator can also hand a later, unrelated call the very same
+        // address. Either hazard makes `ensure_fp16_x`'s pointer-keyed
+        // cache report a false hit; without this reset it would skip the
+        // f32->fp16 conversion and feed stale fp16 values — from a
+        // previous layer, or a previous, already-freed forward pass — into
+        // this GEMM.
+        self.scratch.fp16_x_source_ptr = std::ptr::null_mut();
         let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
 
         let mut a_qkv_p = a_qkv.buf.as_ptr();
@@ -19726,6 +19740,16 @@ impl Gpu {
             kernels::GEMM_QKVZA_Q8_0_WMMA_GFX12_SRC,
             "gemm_qkvza_q8_0_wmma_gfx12",
         )?;
+        // See the identical comment in `gemm_qkvza_q8_0_wmma` (this
+        // function's gfx11 sibling, which delegates here on RDNA4): `x`'s
+        // pointer is stable across this function's per-layer calls within
+        // one forward pass but its data is rewritten by rmsnorm every
+        // layer, and its backing `PrefillBatchScratch` allocation is freed
+        // and reallocated across separate forward passes, so the device
+        // allocator can hand a later, unrelated call the same address.
+        // Reset the fp16-conversion cache so `ensure_fp16_x` cannot report
+        // a false hit against either hazard.
+        self.scratch.fp16_x_source_ptr = std::ptr::null_mut();
         let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
 
         let mut a_qkv_p = a_qkv.buf.as_ptr();
