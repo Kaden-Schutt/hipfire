@@ -1786,6 +1786,12 @@ fn attention_input_e8_pack_b3(
 ///     applies tail RoPE with cfg.compress_rope_theta;
 ///     targets `state._indexer[l].indexer_*`
 ///
+fn compressor_cache_uses_vmm(gpu: &Gpu) -> bool {
+    // Keep this model-owned route chip-strict. gfx1100 and every other
+    // architecture retain the existing dense grow-and-copy fallback.
+    gpu.arch_caps.is_gfx1151() || gpu.arch_caps.is_gfx1201()
+}
+
 fn ensure_cache_tensor_rows(
     gpu: &mut Gpu,
     slot: &mut Option<GpuTensor>,
@@ -1795,7 +1801,7 @@ fn ensure_cache_tensor_rows(
     label: &str,
 ) -> Result<bool, String> {
     let required_rows = required_rows.min(logical_rows).max(1);
-    let use_vmm = gpu.arch == "gfx1151";
+    let use_vmm = compressor_cache_uses_vmm(gpu);
     let mut changed = false;
 
     if slot.is_none() {
@@ -1843,8 +1849,8 @@ fn ensure_cache_tensor_rows(
         return Ok(changed);
     }
 
-    // Non-gfx1151 fallback: preserve cache contents while growing the dense
-    // allocation. gfx1151 never takes this pointer-changing path.
+    // Fallback for architectures without a certified DS4 VMM route: preserve
+    // cache contents while growing the pointer-changing dense allocation.
     let replacement = gpu
         .zeros(&[required_rows, row_elems], DType::F32)
         .map_err(|e| format!("grow {label}: {e:?}"))?;
@@ -1931,7 +1937,7 @@ fn cache_growth_bytes(
     let row_bytes = row_elems
         .checked_mul(std::mem::size_of::<f32>())
         .ok_or_else(|| format!("{label}: row-byte overflow"))?;
-    if gpu.arch != "gfx1151" {
+    if !compressor_cache_uses_vmm(gpu) {
         return match slot {
             Some(tensor) if tensor.shape.first().copied().unwrap_or(0) >= required_rows => Ok(0),
             _ => required_rows
@@ -1973,9 +1979,9 @@ fn admit_compressor_growth(
     let prepared_target = state
         .compressor_capacity
         .prepared_target_for_tokens(required_tokens)?;
-    let default_granularity = if gpu.arch == "gfx1151" {
+    let default_granularity = if compressor_cache_uses_vmm(gpu) {
         gpu.vmm_recommended_granularity()
-            .map_err(|e| format!("query gfx1151 VMM granularity: {e:?}"))?
+            .map_err(|e| format!("query {} VMM granularity: {e:?}", gpu.arch))?
     } else {
         1
     };
