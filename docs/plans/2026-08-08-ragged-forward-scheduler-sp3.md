@@ -483,3 +483,31 @@ forward and scheduler driving several independent sequences on one GPU."
 SP3 is done when the spec's six success criteria hold, most importantly that the demo runs N sequences concurrently and that the existing single-sequence paths are untouched.
 
 **What SP3 does not deliver:** anything reachable by a client. That is SP4.
+
+## Task 2 finding: DeltaNet layers have TWO stateful pieces, not one
+
+The plan's Step 3 named only the GDN recurrence as needing a per-slot loop. That
+was incomplete. **`conv1d_silu_split_f32_n` carries a ring-buffer state with the
+same cross-slot contamination hazard** — it seeds a slot's first rows from the
+*previous* call, so running it once across all N rows would feed slot 1's
+leading tokens with slot 0's tail. It is looped per slot for the same reason the
+recurrence is.
+
+Everything else in both layer types is stateless per row and correctly runs once
+across all N rows: rmsnorm, projections, the sigmoid/alpha gate, Q/K L2-norm, the
+gated norm, `wo` + residual, FFN, RoPE, the KV write and the attend call.
+
+**The generalisable rule for SP4 and beyond:** the question is not "is this
+layer DeltaNet or attention" but **"does this op carry state across calls?"**
+Two ops do. Everything else is a pure function of its rows. Auditing by that
+question would have caught the conv1d ring buffer in the plan rather than in
+implementation.
+
+### Scope narrowing recorded
+
+`forward_batch_slots` is **Q8_0 only** throughout — weights, KV cache,
+DeltaNetState, embedding and lm_head — matching what SP1 and SP2 actually built.
+Non-Q8_0 weights and MoE layers return a clear `HipError` rather than silently
+mis-executing. The attend crossover mirrors the dense path's LDS-vs-tile
+threshold, but only across the two kernel families that have `_slots` ports; the
+WMMA and scalar flash-prefill opt-ins in the dense fallback ladder do not.
