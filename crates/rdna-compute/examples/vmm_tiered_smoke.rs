@@ -49,6 +49,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let requested_tier_bytes = env_usize("HIPFIRE_VMM_TIER_BYTES", DEFAULT_TIER_BYTES);
     let repeats = env_usize("HIPFIRE_VMM_REPEATS", DEFAULT_REPEATS);
     let mut gpu = Gpu::init_with_device(device)?;
+    let (free_before, _) = gpu.hip.get_vram_info()?;
     let granularity = gpu.vmm_tiered_recommended_granularity()?;
     let tier_bytes = requested_tier_bytes.div_ceil(granularity) * granularity;
     assert_eq!(tier_bytes % std::mem::size_of::<f32>(), 0);
@@ -58,7 +59,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut mixed = unsafe {
         gpu.alloc_tiered_vmm_tensor(&[total_bytes / 4], DType::F32, tier_bytes, &access)?
     };
+    let (free_after_device_prefix, _) = gpu.hip.get_vram_info()?;
     gpu.grow_vmm_tensor_in_tier(&mut mixed, tier_bytes, &access, VmmMemoryTier::Host)?;
+    let (free_after_host_tail, _) = gpu.hip.get_vram_info()?;
     assert_eq!(
         gpu.vmm_tier_mapped_bytes(&mixed),
         Some((tier_bytes, tier_bytes))
@@ -87,12 +90,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let device_only = unsafe {
         gpu.alloc_tiered_vmm_tensor(&[total_bytes / 4], DType::F32, total_bytes, &access)?
     };
+    let (free_after_device_control, _) = gpu.hip.get_vram_info()?;
     gpu.hip.memcpy_htod(&device_only.buf, input_bytes)?;
     let device_gb_s = scale_gb_s(&mut gpu, &device_only, repeats)?;
     let mixed_gb_s = scale_gb_s(&mut gpu, &mixed, repeats)?;
 
     println!(
-        "vmm_tiered_smoke: PASS device={} granularity={} device_bytes={} host_bytes={} repeats={} device_gb_s={:.3} mixed_gb_s={:.3} mixed_over_device={:.3}",
+        "vmm_tiered_smoke: PASS device={} granularity={} device_bytes={} host_bytes={} repeats={} device_gb_s={:.3} mixed_gb_s={:.3} mixed_over_device={:.3} vram_delta_device_prefix={} vram_delta_host_tail={} vram_delta_device_control={}",
         device,
         granularity,
         tier_bytes,
@@ -100,7 +104,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         repeats,
         device_gb_s,
         mixed_gb_s,
-        mixed_gb_s / device_gb_s
+        mixed_gb_s / device_gb_s,
+        free_before.saturating_sub(free_after_device_prefix),
+        free_after_device_prefix.saturating_sub(free_after_host_tail),
+        free_after_host_tail.saturating_sub(free_after_device_control),
     );
     gpu.free_tensor(device_only)?;
     gpu.free_tensor(mixed)?;
