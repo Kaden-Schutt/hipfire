@@ -11565,11 +11565,28 @@ impl Gpu {
     ) -> HipResult<()> {
         debug_assert_eq!(k, 4096);
         self.bind_thread()?;
-        self.ensure_kernel(
-            "gemv_mq2g256_lloyd_moe_gate_up_indexed_batched_k4096_lds",
-            kernels::GEMV_MQ2G256_LLOYD_MOE_GATE_UP_INDEXED_BATCHED_K4096_LDS_SRC,
-            "gemv_mq2g256_lloyd_moe_gate_up_k8_indexed_batched_k4096_lds",
-        )?;
+        // Expert grouping (HIPFIRE_DS4_MOE_GROUP=1, default off). Identical
+        // grid, buffers and launch shape — only the kernel differs, so this is
+        // a name swap. The grouped variant deduplicates routing entries inside
+        // each block so a (row, expert) weight row is read once per verify
+        // window rather than once per position routing to it. Measured
+        // duplicate fraction on the golden k6 fixture is 37.4%.
+        // Only worth selecting when there is more than one position to share
+        // across.
+        let grouped = batch_size > 1
+            && hipfire_config::developer_var("HIPFIRE_DS4_MOE_GROUP").as_deref() == Ok("1");
+        let (src, sym) = if grouped {
+            (
+                kernels::GEMV_MQ2G256_LLOYD_MOE_GATE_UP_INDEXED_BATCHED_K4096_LDS_GROUPED_SRC,
+                "gemv_mq2g256_lloyd_moe_gate_up_k8_indexed_batched_k4096_lds_grouped",
+            )
+        } else {
+            (
+                kernels::GEMV_MQ2G256_LLOYD_MOE_GATE_UP_INDEXED_BATCHED_K4096_LDS_SRC,
+                "gemv_mq2g256_lloyd_moe_gate_up_k8_indexed_batched_k4096_lds",
+            )
+        };
+        self.ensure_kernel(sym, src, sym)?;
         self.ds4_expert_overlap_probe(topk_indices, k_top, batch_size)?;
         let pp = expert_ptrs.buf.as_ptr();
         let ip = topk_indices.buf.as_ptr();
@@ -11598,7 +11615,7 @@ impl Gpu {
             bytes,
         );
         let result = self.launch_maybe_blob(
-            "gemv_mq2g256_lloyd_moe_gate_up_k8_indexed_batched_k4096_lds",
+            sym,
             [m as u32, k_top as u32, batch_size as u32],
             [32, 1, 1],
             0,

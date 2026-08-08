@@ -5671,6 +5671,15 @@ pub const GEMV_MQ2G256_LLOYD_MOE_GATE_UP_INDEXED_BATCHED_K4096_LDS_SRC: &str = i
     "../../../kernels/src/gemv_mq2g256_lloyd_moe_gate_up_indexed_batched_k4096_lds.hip"
 );
 
+/// Expert-grouped twin of the K=4096 LDS-codebook routed gate/up kernel. Same
+/// grid and buffers; each block deduplicates itself so a given (row, expert)
+/// weight row is read once per verify window instead of once per position
+/// routing to it. Bit-identical: grouping changes which block loads a weight,
+/// never how an output is summed.
+pub const GEMV_MQ2G256_LLOYD_MOE_GATE_UP_INDEXED_BATCHED_K4096_LDS_GROUPED_SRC: &str = include_str!(
+    "../../../kernels/src/gemv_mq2g256_lloyd_moe_gate_up_indexed_batched_k4096_lds_grouped.hip"
+);
+
 /// DeepSeek V4 MoE down — POSITION-BATCHED MQ2-Lloyd indexed GEMV with K4-unrolled
 /// accumulator and scaled residual atomicAdd. Sibling of qwen35's HFQ4 K4
 /// unroll. Drop-in replacement for
