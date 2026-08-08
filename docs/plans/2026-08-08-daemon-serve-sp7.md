@@ -334,7 +334,30 @@ Plus a framing fix: thinking models need `AssistantPrefix::OpenThink`, as the
 daemon's `spec_assistant_prefix` uses. With `Plain` the model loops on
 `</think>` and re-opens user turns.
 
-### Still serialised — the remaining work
+### RESOLVED (2026-08-08): concurrent, 1.82x
+
+Widening the gate works. Measured against a live server, four
+`/v1/chat/completions` at 48 tokens:
+
+```
+4 sequential : 3.114 s
+4 concurrent : 1.705 s   -> 1.82x, 4/4 distinct correct answers
+```
+
+The earlier "hang" report was wrong, and both symptoms were the test harness:
+
+- The hang was a bare `wait`, which waited on the backgrounded `serve` job as
+  well as the `curl` jobs.
+- The follow-up "connection refused" runs were hitting a server already killed
+  when the invocation that started it ended — while `pgrep -f "hipfire serve"`
+  reported it UP by matching its own shell command line.
+
+Two harness rules worth keeping: `pgrep -f` matching a pattern that appears in
+the checking command's own argv is a false positive, and a server backgrounded
+in one invocation does not survive into the next. Start it and measure it in the
+same invocation, waiting on explicit PIDs.
+
+### Superseded: the earlier "still serialised" finding
 
 Measured 4 concurrent against 4 sequential: **1.01x**. The requests reach the
 engine correctly and produce 4/4 distinct correct answers, but they do not
