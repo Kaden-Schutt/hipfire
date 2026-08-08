@@ -451,3 +451,59 @@ open, and vendoring unmerged work would make the eventual merge worse.
 Nothing in-tree or in-flight addresses history rendering that reproduces the
 generated assistant opener. That is still the one piece of work between here
 and multi-turn prefix reuse over HTTP.
+
+
+## Multi-turn prefix reuse: FIXED (2026-08-08)
+
+```
+turn 1 (cold)            1.19s
+turn 2 (continues it)    0.79s   -> 33% of turn-2 latency saved
+```
+
+Asserted by default in the gate now (`SERVE_GATE_REQUIRE_REUSE=0` to downgrade).
+
+### Why re-rendering the history could never work
+
+Two independent obstacles, either fatal on its own:
+
+1. Turn 1 generates after an `OpenThink` opener (`assistant\n<think>\n`) that
+   history rendering does not replay.
+2. Even with the opener fixed, re-encoding the decoded reply is a
+   detokenise/retokenise round trip, not guaranteed to be the identity.
+
+### What is done instead
+
+The prompt is not re-rendered. A conversation is keyed by its **user turns** —
+the assistant side is whatever we generated, and the client's echo of it may
+differ (reasoning routed to its own channel after PR #572, whitespace, an
+edited message), so it cannot be part of the key. On a match,
+`prompt_frame::continuation_suffix` is **appended** to the session's exact
+stored tokens, making the result a strict extension of what the KV holds by
+construction rather than by hoping two renders agree.
+
+`find_continuation` requires the candidate to be exactly one user turn behind,
+not merely a prefix: a session two turns behind is missing an assistant reply
+that never entered its KV, so appending the newest user turn would skip a turn.
+
+Finished sessions now stay resident and idle rather than being closed, which is
+what makes reuse reachable at all; LRU eviction reclaims their slots.
+
+### The bug that hid it
+
+The "keep sessions resident" change was written in a two-edit script whose
+*second* edit raised `AssertionError`, aborting before the write — so **neither**
+edit landed. Re-running only the second one left the first silently missing, and
+`sessions.close` stayed unconditional. The symptom was reuse never firing; the
+trace showing zero resident sessions at turn 2 is what located it.
+
+Worth generalising: a multi-edit script that asserts and aborts leaves the file
+untouched, so a later partial re-run can silently drop earlier edits. Verify the
+edit landed, do not assume the script's success message covers all of it.
+
+### Diagnostics added
+
+- `HIPFIRE_SLOT_TRACE=1` — logs each continuation attempt with the conversation
+  key and every resident session's key, slot and token count.
+- The gate keeps its server log at `/tmp/serve-gate.log` and prints per-phase
+  markers. A gate that deletes its only diagnostic on failure forces every
+  investigation to begin by reproducing the failure.
