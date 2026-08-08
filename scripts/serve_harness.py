@@ -60,6 +60,23 @@ GENRE_BATTERY = [
 REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
 
+def resolve_kv_mode(explicit, tag, registry_path):
+    """Resolve the cache mode from an explicit override or the model registry."""
+    if explicit is not None:
+        return explicit, "explicit(--kv)"
+    try:
+        registry = json.load(open(registry_path))
+        canonical = (registry.get("aliases") or {}).get(tag, tag)
+        entry = (registry.get("models") or {}).get(canonical, {})
+        mode = entry.get("default_kv_mode")
+        if mode:
+            return mode, f"registry({canonical})"
+    except Exception as e:
+        print(f"  [warn] could not resolve default_kv_mode from {registry_path}: {e}",
+              file=sys.stderr)
+    return "auto", "default(auto)"
+
+
 def resolve_sampling(spec, tag, registry_path):
     """Return (values_dict, source_dict). spec: 'registry'|'registry:<mode>'|'greedy'|'recipe:NAME'|json string."""
     src = {}
@@ -143,6 +160,7 @@ def infer_tag(model_path):
 
 def build_config(args):
     tag = args.tag or infer_tag(args.model)
+    kv, kv_source = resolve_kv_mode(args.kv, tag, args.registry)
     samp, samp_src = resolve_sampling(args.sampling, tag, args.registry)
     # Effort is parent-model prompt semantics. Budget is an independent hipfire
     # cap policy and must never be inferred from the effort level.
@@ -173,7 +191,8 @@ def build_config(args):
         env_draft = os.environ.get("HIPFIRE_DFLASH_DRAFT")
         draft = os.path.abspath(os.path.expanduser(env_draft)) if env_draft else None
     return {
-        "model": args.model, "tag": tag, "kv": args.kv, "mtp": args.mtp,
+        "model": args.model, "tag": tag, "kv": kv, "kv_source": kv_source,
+        "mtp": args.mtp,
         "kv_backend": getattr(args, "kv_backend", "contiguous") or "contiguous",
         "dflash": getattr(args, "dflash", "off") or "off",
         "draft": draft,
@@ -231,7 +250,9 @@ def show_config(cfg):
     print("==================== serve_harness pre-flight (CONFIRM before run) ====================")
     print(f"  model         : {cfg['model']}")
     print(f"  registry tag  : {cfg['tag'] or '(none — sampling cannot be registry-resolved)'}")
-    print(f"  kv_mode       : {cfg['kv']}   kv_backend: {cfg.get('kv_backend', 'contiguous')}   mtp_mode: {cfg['mtp']}   mode: {cfg['mode']}")
+    print(f"  kv_mode       : {cfg['kv']} [{cfg.get('kv_source', 'unknown')}]"
+          f"   kv_backend: {cfg.get('kv_backend', 'contiguous')}"
+          f"   mtp_mode: {cfg['mtp']}   mode: {cfg['mode']}")
     print(f"  dflash        : {cfg.get('dflash', 'off')}   draft: {cfg.get('draft') or '(none / filename auto-match)'}")
     _spec = cfg.get("speculation_mode")
     print(f"  speculation   : {_spec or '(derived from --dflash/--mtp above)'}"
@@ -747,6 +768,25 @@ def _self_test_device_config():
     print("serve_harness: device-config self-test OK", flush=True)
 
 
+def _self_test_kv_resolution():
+    """Prove registry defaults, aliases, explicit overrides, and fallback."""
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as tmp:
+        json.dump({
+            "models": {"deepseek-v4-flash:mq2r": {"default_kv_mode": "f32"}},
+            "aliases": {"deepseek4:mq2r": "deepseek-v4-flash:mq2r"},
+        }, tmp)
+        path = tmp.name
+    try:
+        assert resolve_kv_mode(None, "deepseek4:mq2r", path) == (
+            "f32", "registry(deepseek-v4-flash:mq2r)")
+        assert resolve_kv_mode("f16", "deepseek4:mq2r", path) == (
+            "f16", "explicit(--kv)")
+        assert resolve_kv_mode(None, "missing", path) == ("auto", "default(auto)")
+    finally:
+        os.unlink(path)
+    print("serve_harness: kv-resolution self-test OK", flush=True)
+
+
 
 def _native_service_warm(port, expected_model=None, proc=None):
     """True only when health is ready for *this* spawn.
@@ -1037,7 +1077,8 @@ def main():
     )
     ap.add_argument("--tag", default=None, help="registry tag for recommended_settings (else inferred)")
     ap.add_argument("--registry", default=os.path.join(REPO, "registry/v1.json"))
-    ap.add_argument("--kv", default="fwht3")
+    ap.add_argument("--kv", default=None,
+                    help="cache mode override; omitted resolves the registry default")
     ap.add_argument("--kv-backend", default="contiguous", choices=["contiguous", "vmm"],
                     help="hipfire serve --kv-backend override (default contiguous; use vmm for PR #549 path)")
     ap.add_argument("--mtp", default="off", choices=["off", "on", "auto"])
@@ -1122,6 +1163,7 @@ def main():
         _self_test_serve_path_proofs()
         _self_test_prompt_sources()
         _self_test_device_config()
+        _self_test_kv_resolution()
         return
     if not args.model:
         ap.error("--model is required unless --self-test")
