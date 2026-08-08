@@ -206,7 +206,11 @@ fn run() -> Result<(), String> {
                 break;
             }
         }
-        let status = if errors.is_empty() { "pass" } else { "rejected" };
+        let status = if errors.is_empty() {
+            "pass"
+        } else {
+            "rejected"
+        };
         println!(
             "CAPACITY_RESULT tokens={required_tokens} status={status} errors={:?}",
             errors

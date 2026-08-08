@@ -1548,7 +1548,11 @@ fn load_model_ep_ds4(path: &str, max_seq: usize, tp: usize) -> Result<LoadedMode
     let hfq = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
     let tokenizer = hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
         .map_err(|e| format!("tokenizer not found: {e}"))?;
-    let config = <deepseek4::DeepseekV4 as Architecture>::config_from_hfq(&hfq)?;
+    let mut config = <deepseek4::DeepseekV4 as Architecture>::config_from_hfq(&hfq)?;
+    // The EP/TP serve path has no speculative verifier. Do not auto-discover
+    // and replicate an adjacent DSpark sidecar onto every rank when it cannot
+    // be selected; ordinary AR must retain that memory for per-rank KV state.
+    config.load_dspark = false;
     let arch_id = hfq.arch_id;
     let n_exp = config.n_routed_experts;
 
