@@ -7,7 +7,7 @@
 
 use std::ffi::c_void;
 
-use crate::dispatch::{Gpu, GpuTensor};
+use crate::dispatch::{DType, Gpu, GpuTensor};
 use crate::kernels;
 use hip_bridge::HipResult;
 
@@ -1373,5 +1373,165 @@ impl Gpu {
                 bl
             },
         )
+    }
+
+    /// Sample one token per slot from `[n_slots x vocab]` logits.
+    ///
+    /// Takes the existing `argmax_f32_batched` fast path when every slot is
+    /// greedy; otherwise samples each slot with its own parameters. Per-slot
+    /// dispatch is correct but not optimal — a fused kernel is a later
+    /// optimisation, and SP2 is explicitly components-not-performance.
+    pub fn sample_per_slot(
+        &mut self,
+        logits: &GpuTensor,
+        params: &[SlotSampleParams],
+        n_slots: usize,
+        vocab: usize,
+        out_tokens: &GpuTensor,
+    ) -> HipResult<()> {
+        assert_eq!(
+            params.len(),
+            n_slots,
+            "sample_per_slot: one SlotSampleParams per slot required"
+        );
+        if all_greedy(params) {
+            // NOTE: argmax_f32_batched's real signature is
+            // (data, result, n=reduction_dim, batch_size), i.e. vocab comes
+            // before n_slots — the brief's illustrative call had these
+            // swapped; confirmed against call sites in
+            // crates/hipfire-arch-deepseek4/src/forward.rs and others.
+            return self.argmax_f32_batched(logits, out_tokens, vocab, n_slots);
+        }
+        for (i, p) in params.iter().enumerate() {
+            self.sample_slot_row(logits, i, vocab, p, out_tokens)?;
+        }
+        Ok(())
+    }
+
+    /// Sample a single slot's row `i` from `[n_slots x vocab]` logits, writing
+    /// the resulting token id into `out_tokens[i]`.
+    ///
+    /// A greedy row (`temperature == 0.0`) within an otherwise-mixed batch
+    /// takes the exact single-row argmax rather than routing through
+    /// `sample_top_p_pf` with temperature 0 — this keeps a greedy slot's
+    /// result identical to what it would get on the all-greedy fast path,
+    /// regardless of which other slots in the batch are sampling.
+    fn sample_slot_row(
+        &mut self,
+        logits: &GpuTensor,
+        i: usize,
+        vocab: usize,
+        p: &SlotSampleParams,
+        out_tokens: &GpuTensor,
+    ) -> HipResult<()> {
+        let row = logits.sub_offset(i * vocab, vocab);
+        let out_row = out_tokens.sub_offset(i, 1);
+
+        let token_id: u32 = if p.temperature == 0.0 {
+            self.argmax_f32(&row, vocab)?
+        } else {
+            // Existing sample_top_p kernel, dispatched per row. `sample_top_p`
+            // itself is a fixed-top_k=20 shim over `sample_top_p_pf`; calling
+            // `_pf` directly lets each slot's own top_k through rather than
+            // silently discarding it, without introducing a new kernel.
+            let result_buf = self.alloc_tensor(&[2], DType::F32)?;
+            let repeat_buf = self.alloc_tensor(&[1], DType::F32)?;
+            let top_k = if p.top_k > 0 {
+                Some(p.top_k as u32)
+            } else {
+                None
+            };
+            let sample_result = self.sample_top_p_pf(
+                &row,
+                &result_buf,
+                &repeat_buf,
+                vocab,
+                p.temperature,
+                p.top_p,
+                p.seed,
+                0,   // repeat_window: no cross-slot repetition history here
+                1.0, // repeat_penalty: 1.0 == disabled (kernel checks `> 1.0`)
+                0.0, // presence_penalty: disabled
+                0.0, // frequency_penalty: disabled
+                top_k,
+                None, // min_p: disabled
+            );
+            self.free_tensor(result_buf)?;
+            self.free_tensor(repeat_buf)?;
+            sample_result?.0
+        };
+
+        self.hip.memcpy_htod(&out_row.buf, &token_id.to_ne_bytes())
+    }
+}
+
+/// Per-slot sampling parameters, uploaded as a table like `KvSlotDesc`.
+///
+/// A single scalar temperature across a batch is wrong as soon as two agents
+/// differ, and a uniform-parameter test cannot see that bug — hence a table
+/// rather than scalars.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SlotSampleParams {
+    /// 0.0 means greedy/argmax for this slot.
+    pub temperature: f32,
+    pub top_p: f32,
+    /// 0 disables top-k for this slot.
+    pub top_k: i32,
+    pub seed: u32,
+}
+
+/// True when every slot is greedy, so the batch can take the argmax fast path.
+/// One sampling slot disables it for the whole batch.
+pub fn all_greedy(params: &[SlotSampleParams]) -> bool {
+    params.iter().all(|p| p.temperature == 0.0)
+}
+
+#[cfg(test)]
+mod slot_sample_tests {
+    use super::*;
+
+    #[test]
+    fn params_struct_is_16_bytes_repr_c() {
+        // Uploaded straight to the GPU as a table, like KvSlotDesc.
+        assert_eq!(std::mem::size_of::<SlotSampleParams>(), 16);
+        assert_eq!(std::mem::align_of::<SlotSampleParams>(), 4);
+    }
+
+    #[test]
+    fn all_greedy_is_detectable_as_a_fast_path() {
+        let greedy = vec![
+            SlotSampleParams {
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: 0,
+                seed: 1,
+            },
+            SlotSampleParams {
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: 0,
+                seed: 2,
+            },
+        ];
+        assert!(all_greedy(&greedy));
+        let mixed = vec![
+            SlotSampleParams {
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: 0,
+                seed: 1,
+            },
+            SlotSampleParams {
+                temperature: 0.7,
+                top_p: 0.95,
+                top_k: 20,
+                seed: 2,
+            },
+        ];
+        assert!(
+            !all_greedy(&mixed),
+            "one sampling slot must disable the greedy fast path"
+        );
     }
 }
