@@ -61,7 +61,7 @@
 // entry points — RoPE is slot-agnostic per SP2 Task 2 and needs no split).
 
 use crate::qwen35::{
-    mq6_batched_admit_enabled_from_env, moe_ffn_batched_admissible, prefill_moe_ffn_body_batched,
+    moe_ffn_batched_admissible, mq6_batched_admit_enabled_from_env, prefill_moe_ffn_body_batched,
     q8_prefill_wmma_enabled, run_fused_gate_up_key, run_fused_qkv_key, run_fused_qkvza_key,
     run_plain_gemm_key, run_residual_gemm_key, DeltaNetLayerWeights, DeltaNetMoeLayerWeights,
     DeltaNetState, FullAttnLayerWeights, FullAttnMoeLayerWeights, LayerType, LayerWeights,
@@ -239,7 +239,9 @@ enum MoeAttnDtype {
 /// requires the caller to additionally rotate activations via
 /// `fused_rmsnorm_rotate_mq_batched_for`/`rotate_x_mq_batched_for` before
 /// each GEMM — see `run_deltanet_moe_layer_slots`.
-fn require_batchable_deltanet_moe_layer(layer: &DeltaNetMoeLayerWeights) -> HipResult<MoeAttnDtype> {
+fn require_batchable_deltanet_moe_layer(
+    layer: &DeltaNetMoeLayerWeights,
+) -> HipResult<MoeAttnDtype> {
     let all_q8 = matches!(layer.wqkv.gpu_dtype, DType::Q8_0)
         && matches!(layer.wz.gpu_dtype, DType::Q8_0)
         && matches!(layer.w_beta.gpu_dtype, DType::Q8_0)
@@ -267,7 +269,9 @@ fn require_batchable_deltanet_moe_layer(layer: &DeltaNetMoeLayerWeights) -> HipR
 
 /// Same gate as [`require_batchable_deltanet_moe_layer`] for a
 /// `FullAttnMoeLayerWeights` (wq/wk/wv/wo).
-fn require_batchable_fullattn_moe_layer(layer: &FullAttnMoeLayerWeights) -> HipResult<MoeAttnDtype> {
+fn require_batchable_fullattn_moe_layer(
+    layer: &FullAttnMoeLayerWeights,
+) -> HipResult<MoeAttnDtype> {
     let all_q8 = matches!(layer.wq.gpu_dtype, DType::Q8_0)
         && matches!(layer.wk.gpu_dtype, DType::Q8_0)
         && matches!(layer.wv.gpu_dtype, DType::Q8_0)
@@ -639,8 +643,12 @@ fn run_deltanet_layer_slots(
             let q_view = pbs.dn_q_batch.sub_offset(row_off * v_dim, m * v_dim);
             let k_view = pbs.dn_k_batch.sub_offset(row_off * v_dim, m * v_dim);
             let v_view = pbs.dn_v_batch.sub_offset(row_off * v_dim, m * v_dim);
-            let gate_view = pbs.dn_alpha_batch.sub_offset(row_off * n_v_heads, m * n_v_heads);
-            let beta_view = pbs.dn_beta_batch.sub_offset(row_off * n_v_heads, m * n_v_heads);
+            let gate_view = pbs
+                .dn_alpha_batch
+                .sub_offset(row_off * n_v_heads, m * n_v_heads);
+            let beta_view = pbs
+                .dn_beta_batch
+                .sub_offset(row_off * n_v_heads, m * n_v_heads);
             let out_view = pbs.dn_attn_out_batch.sub_offset(row_off * v_dim, m * v_dim);
             gpu.gated_delta_net_q8_batch_seq(
                 &q_view,
@@ -953,8 +961,12 @@ fn run_deltanet_moe_layer_slots(
             let q_view = pbs.dn_q_batch.sub_offset(row_off * v_dim, m * v_dim);
             let k_view = pbs.dn_k_batch.sub_offset(row_off * v_dim, m * v_dim);
             let v_view = pbs.dn_v_batch.sub_offset(row_off * v_dim, m * v_dim);
-            let gate_view = pbs.dn_alpha_batch.sub_offset(row_off * n_v_heads, m * n_v_heads);
-            let beta_view = pbs.dn_beta_batch.sub_offset(row_off * n_v_heads, m * n_v_heads);
+            let gate_view = pbs
+                .dn_alpha_batch
+                .sub_offset(row_off * n_v_heads, m * n_v_heads);
+            let beta_view = pbs
+                .dn_beta_batch
+                .sub_offset(row_off * n_v_heads, m * n_v_heads);
             let out_view = pbs.dn_attn_out_batch.sub_offset(row_off * v_dim, m * v_dim);
             gpu.gated_delta_net_q8_batch_seq(
                 &q_view,
@@ -1050,7 +1062,18 @@ fn run_deltanet_moe_layer_slots(
 /// reference on there too — a strict narrowing (documented scope gap, same
 /// category as the crossover below already carries for the scalar
 /// flash-prefill ladder), not a guess at gfx12's real eligibility window.
+/// The WMMA flash-prefill kernel's query-row tile size (its WMMA-fragment
+/// tile, not the scalar kernel's tunable BR). Both the eligibility floor and
+/// `build_tiles` must use the same value.
+const WMMA_M_TILE: usize = 16;
+
 fn q8_flash_prefill_wmma_eligible(gpu: &Gpu, head_dim: usize, batch_size: usize) -> bool {
+    // Mirrors the reference's own gate exactly (`batch_size > 1`), and must
+    // keep doing so: the single-active-slot reduction below uses this answer
+    // to decide whether it may drop into the reference's own WMMA kernel, and
+    // any divergence there breaks byte-exactness with the reference arm.
+    // The decode-batch floor lives on the multi-slot tile path instead, which
+    // has no reference counterpart -- see MULTI_SLOT_TILE_MIN_ROWS.
     if batch_size <= 1 {
         return false;
     }
@@ -1135,19 +1158,10 @@ fn q8_attend_slots(
             let k_view = k_cache.sub_offset(k_base as usize, slab_bytes);
             let v_view = v_cache.sub_offset(k_base as usize, slab_bytes);
             return gpu.attention_q8_0_flash_prefill_wmma(
-                q,
-                &k_view,
-                &v_view,
-                out,
-                positions,
-                n_heads,
-                n_kv_heads,
-                head_dim,
-                batch_size,
+                q, &k_view, &v_view, out, positions, n_heads, n_kv_heads, head_dim, batch_size,
             );
         }
-    } else if let Some((tile_slot_dev, tile_row0_dev, tile_qbase_dev, n_tiles)) = multi_slot_tiles
-    {
+    } else if let Some((tile_slot_dev, tile_row0_dev, tile_qbase_dev, n_tiles)) = multi_slot_tiles {
         // Caller (forward_batch_slots_with_max_layer) only populates
         // multi_slot_tiles when q8_flash_prefill_wmma_eligible already held —
         // re-check anyway so this function's own contract doesn't depend on
@@ -1997,11 +2011,17 @@ pub fn forward_batch_slots_with_max_layer(
 
     // ── 3. Upload row_slot (every step) and the descriptor table (only
     // when dirty) — once per step, not once per layer. ──────────────────
-    let row_slot_bytes: Vec<u8> = batch.row_slot.iter().flat_map(|x| x.to_ne_bytes()).collect();
-    gpu.hip.memcpy_htod(&desc_staging.row_slot_dev.buf, &row_slot_bytes)?;
+    let row_slot_bytes: Vec<u8> = batch
+        .row_slot
+        .iter()
+        .flat_map(|x| x.to_ne_bytes())
+        .collect();
+    gpu.hip
+        .memcpy_htod(&desc_staging.row_slot_dev.buf, &row_slot_bytes)?;
     if pool.descriptors_dirty() {
         let desc_bytes = pack_descs(pool.descriptors());
-        gpu.hip.memcpy_htod(&desc_staging.descs_dev.buf, &desc_bytes)?;
+        gpu.hip
+            .memcpy_htod(&desc_staging.descs_dev.buf, &desc_bytes)?;
         pool.mark_uploaded();
     }
 
@@ -2031,6 +2051,34 @@ pub fn forward_batch_slots_with_max_layer(
         None
     };
 
+    // `n > active_slots` means at least one slot contributes more than one row
+    // this step -- i.e. there is prompt left to prefill. A step where every
+    // active slot contributes exactly one row is pure decode, and there the
+    // WMMA *prefill* kernel is both wrong to use and slow:
+    //
+    //   - Wrong: the reference decodes each sequence with batch_size == 1, so
+    //     its own `batch_size <= 1` gate puts it on the scalar path. Batching
+    //     N sequences into N rows and then firing the WMMA kernel because
+    //     N > 1 diverges from what the reference did for those same tokens.
+    //   - Slow: it tiles query rows in WMMA_M_TILE (16) blocks, so 2-4 decode
+    //     rows launch a full, mostly-padded tile. Measured on gfx1151,
+    //     35B-A3B, 4096-token context, per decode step:
+    //
+    //       slots | firing on decode | pure-decode scalar | aggregate decode
+    //         2   |     57.23 ms     |      33.64 ms      | 34.95 -> 59.45 tok/s
+    //         3   |     61.77 ms     |      40.41 ms      | 48.57 -> 74.23 tok/s
+    //         4   |     68.60 ms     |      48.47 ms      | 58.31 -> 82.52 tok/s
+    //
+    //     A flat ~21 ms penalty that made two concurrent users slower *in
+    //     aggregate* than one. Prefill still takes the kernel and still wants
+    //     it: the 4-slot run prefills in 14.7 s either way, against 19.2 s
+    //     with the path disabled outright.
+    //
+    // Gating on row count instead (n >= 16) was tried and is wrong: it also
+    // pushes small *prefill* batches (the golden gate's 14-row, 2-slot case)
+    // onto the scalar kernel, which is not bit-identical to the reference's
+    // WMMA kernel, and the golden gate fails at 225x tolerance.
+    //
     // Genuinely multi-slot AND the reference's own gfx11 WMMA-flash-prefill
     // gate (q8_flash_prefill_wmma_eligible) would fire for this shape: the
     // exact condition under which the reference's flat, slot-unaware
@@ -2041,11 +2089,9 @@ pub fn forward_batch_slots_with_max_layer(
     // layer" upload policy.
     let n_tiles: Option<usize> = if single_slot.is_none()
         && active_slots > 1
+        && n > active_slots
         && q8_flash_prefill_wmma_eligible(gpu, config.head_dim, n)
     {
-        // Fixed M_TILE = 16: the WMMA kernel's WMMA-fragment tile size, not
-        // the scalar kernel's tunable BR.
-        const WMMA_M_TILE: usize = 16;
         let (tile_slot, tile_row0, tile_qbase) = build_tiles(&batch.m_per_slot, WMMA_M_TILE);
         let nt = tile_slot.len();
         assert!(
@@ -2056,7 +2102,8 @@ pub fn forward_batch_slots_with_max_layer(
             desc_staging.max_rows
         );
         if nt > 0 {
-            let to_bytes = |v: &[i32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_ne_bytes()).collect() };
+            let to_bytes =
+                |v: &[i32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_ne_bytes()).collect() };
             gpu.hip
                 .memcpy_htod(&desc_staging.tile_slot_dev.buf, &to_bytes(&tile_slot))?;
             gpu.hip

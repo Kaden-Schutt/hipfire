@@ -121,20 +121,68 @@ fn main() {
         .count();
     let per_pos_bytes = config.n_kv_heads * (config.head_dim / 32) * 34; // Q8_0 K and V, same stride
 
+    // TARGET_PROMPT_TOKENS repeats each base prompt until it encodes to at
+    // least that many tokens. The default (0) leaves the short built-in
+    // prompts alone. This exists because the built-in prompts encode to ~60
+    // tokens, where attention is a negligible share of a decode step -- a
+    // throughput number taken there measures weight-read amortisation only
+    // and says nothing about the batched-attention work, which is what a
+    // coding agent's multi-thousand-token context actually exercises.
+    //
+    // The repeated text is real prompt text, not random filler, but a long
+    // self-repeating prompt is still out of distribution: use these runs for
+    // timing, not for judging output quality.
+    let target_prompt_tokens: usize = std::env::var("TARGET_PROMPT_TOKENS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
     let prompts: Vec<String> = (0..n_slots)
-        .map(|i| DEFAULT_PROMPTS[i % DEFAULT_PROMPTS.len()].to_string())
+        .map(|i| {
+            let base = DEFAULT_PROMPTS[i % DEFAULT_PROMPTS.len()];
+            if target_prompt_tokens == 0 {
+                return base.to_string();
+            }
+            let mut text = base.to_string();
+            while tokenizer.encode(&text).len() < target_prompt_tokens {
+                text.push(' ');
+                text.push_str(base);
+            }
+            text
+        })
         .collect();
     let prompt_tokens: Vec<Vec<u32>> = prompts.iter().map(|p| tokenizer.encode(p)).collect();
     let prompt_lens: Vec<usize> = prompt_tokens.iter().map(|t| t.len()).collect();
     let max_prompt_len = prompt_lens.iter().copied().max().unwrap_or(1);
-    let max_batch = prompt_lens.iter().sum::<usize>().max(n_slots);
+    // Upper bound on rows in one batch. Computed after chunk_size below is
+    // known would be circular, so bound it by the chunk env var directly:
+    // each slot contributes at most chunk_size rows per step.
+    let chunk_cap = std::env::var("PREFILL_CHUNK")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|c| *c > 0)
+        .unwrap_or(usize::MAX);
+    let max_batch = prompt_lens
+        .iter()
+        .map(|l| (*l).min(chunk_cap))
+        .sum::<usize>()
+        .max(n_slots);
 
     // Chunk size at least as large as the longest prompt: every slot's
     // whole prompt drains in Scheduler's FIRST call, so step 0 is one
     // ragged prefill batch and every step after that is pure decode — see
     // the module doc for why this makes "is this slot's logits row ready
     // to sample" trivially always-yes.
-    let chunk_size = max_prompt_len;
+    // PREFILL_CHUNK caps how many prompt tokens one slot contributes per
+    // step. Left unset it stays max_prompt_len, so step 0 drains every
+    // prompt in one ragged batch (the original behaviour). At long contexts
+    // that single batch is huge, so a cap keeps the prefill activation
+    // buffers bounded -- and chunked prefill is what SP3's scheduler is for.
+    let chunk_size = std::env::var("PREFILL_CHUNK")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|c| *c > 0)
+        .map(|c| c.min(max_prompt_len))
+        .unwrap_or(max_prompt_len);
     // Cap far below the 96K/128K budget figures this program is built
     // toward — this demo's whole point is the interleaving, not context
     // depth, and a deliberately small cap keeps the run well inside the
@@ -149,7 +197,9 @@ fn main() {
     // test_forward_slots_golden's accounting (device AND host, the TOTAL
     // held live at once). No "reference arm" here (this demo has only the
     // candidate path), so this is simpler than the golden harness's. ----
-    let weight_bytes = std::fs::metadata(&model_path).expect("stat model file").len();
+    let weight_bytes = std::fs::metadata(&model_path)
+        .expect("stat model file")
+        .len();
     let cap_rounded = cap_tokens.div_ceil(128) * 128;
 
     let candidate_kv_bytes =
@@ -171,7 +221,9 @@ fn main() {
     // Host-side downloads: only per-slot token ids (4 bytes/slot/step) —
     // unlike the golden harness this demo samples on-device via
     // `sample_per_slot` and never downloads full logits.
-    let n_steps = 1 + max_new_tokens;
+    // One step per prefill chunk (ceil), then one step per generated token.
+    let n_prefill_steps = max_prompt_len.div_ceil(chunk_size);
+    let n_steps = n_prefill_steps + max_new_tokens;
     let host_token_bytes = (n_steps * n_slots * 4) as u64;
 
     let planned = weight_bytes
@@ -216,17 +268,24 @@ fn main() {
     let mut k_arenas = Vec::with_capacity(n_fa_layers);
     let mut v_arenas = Vec::with_capacity(n_fa_layers);
     for _ in 0..n_fa_layers {
-        k_arenas.push(gpu.zeros(&[arena_bytes], DType::Raw).expect("alloc k_arena"));
-        v_arenas.push(gpu.zeros(&[arena_bytes], DType::Raw).expect("alloc v_arena"));
+        k_arenas.push(
+            gpu.zeros(&[arena_bytes], DType::Raw)
+                .expect("alloc k_arena"),
+        );
+        v_arenas.push(
+            gpu.zeros(&[arena_bytes], DType::Raw)
+                .expect("alloc v_arena"),
+        );
     }
     let mut dn_states: Vec<DeltaNetState> = (0..n_slots)
         .map(|_| DeltaNetState::new(&mut gpu, &config).expect("DeltaNetState::new"))
         .collect();
     let mut desc_staging =
         SlotDescStaging::new(&mut gpu, n_slots, max_batch).expect("SlotDescStaging::new");
-    let pbs = PrefillBatchScratch::new(&mut gpu, &config, max_batch).expect("PrefillBatchScratch::new");
-    let scratch =
-        Qwen35Scratch::new_with_kv_max(&mut gpu, &config, 64, cap_tokens).expect("Qwen35Scratch::new_with_kv_max");
+    let pbs =
+        PrefillBatchScratch::new(&mut gpu, &config, max_batch).expect("PrefillBatchScratch::new");
+    let scratch = Qwen35Scratch::new_with_kv_max(&mut gpu, &config, 64, cap_tokens)
+        .expect("Qwen35Scratch::new_with_kv_max");
     let logits_out = gpu
         .zeros(&[n_slots * config.vocab_size], DType::F32)
         .expect("alloc logits_out");
@@ -263,6 +322,22 @@ fn main() {
 
     println!("\n--- generating (each line: one step, one token per still-active slot) ---");
 
+    // Aggregate decode throughput. A step is "decode-only" when every active
+    // slot contributes exactly one row -- i.e. the scheduler has no prompt
+    // chunk left to feed. Prefill steps are timed separately because their
+    // cost scales with prompt length, not with the slot count, and mixing
+    // them into the decode figure would make the 1-vs-4 comparison depend on
+    // prompt length rather than on batching.
+    //
+    // The first decode step is discarded as warmup: it is where any lazy
+    // kernel compilation and first-touch page faults land.
+    let mut decode_steps: usize = 0;
+    let mut decode_tokens: usize = 0;
+    let mut decode_secs: f64 = 0.0;
+    let mut prefill_steps: usize = 0;
+    let mut prefill_secs: f64 = 0.0;
+    let mut decode_step_ms: Vec<f64> = Vec::new();
+
     // Safety net against an infinite loop from a logic error above; a
     // correct run always terminates within n_steps.
     for step in 0..n_steps {
@@ -270,6 +345,11 @@ fn main() {
         if batch.is_empty() {
             break;
         }
+
+        let active_rows: usize = batch.total_rows();
+        let active_slots: usize = batch.m_per_slot.iter().filter(|&&m| m > 0).count();
+        let is_decode_only = active_rows == active_slots;
+        let t_step = std::time::Instant::now();
 
         forward_batch_slots(
             &mut gpu,
@@ -288,15 +368,38 @@ fn main() {
         .expect("forward_batch_slots");
         gpu.hip.device_synchronize().expect("sync after forward");
 
-        gpu.sample_per_slot(&logits_out, &sample_params, n_slots, config.vocab_size, &out_tokens)
-            .expect("sample_per_slot");
+        gpu.sample_per_slot(
+            &logits_out,
+            &sample_params,
+            n_slots,
+            config.vocab_size,
+            &out_tokens,
+        )
+        .expect("sample_per_slot");
         gpu.hip.device_synchronize().expect("sync after sample");
 
         let mut token_ids = vec![0i32; n_slots];
         {
-            let bytes: &mut [u8] =
-                unsafe { std::slice::from_raw_parts_mut(token_ids.as_mut_ptr() as *mut u8, n_slots * 4) };
-            gpu.hip.memcpy_dtoh(bytes, &out_tokens.buf).expect("download out_tokens");
+            let bytes: &mut [u8] = unsafe {
+                std::slice::from_raw_parts_mut(token_ids.as_mut_ptr() as *mut u8, n_slots * 4)
+            };
+            gpu.hip
+                .memcpy_dtoh(bytes, &out_tokens.buf)
+                .expect("download out_tokens");
+        }
+        let step_secs = t_step.elapsed().as_secs_f64();
+        if is_decode_only {
+            decode_steps += 1;
+            // Discard the first decode step (warmup) from the rate, but still
+            // record it in the per-step list so the warmup cost is visible.
+            if decode_steps > 1 {
+                decode_secs += step_secs;
+                decode_tokens += active_slots;
+            }
+            decode_step_ms.push(step_secs * 1e3);
+        } else {
+            prefill_steps += 1;
+            prefill_secs += step_secs;
         }
 
         print!("  step {step:>3}:");
@@ -321,6 +424,30 @@ fn main() {
         if finished.iter().all(|&f| f) {
             break;
         }
+    }
+
+    println!("\n--- throughput (n_slots={n_slots}) ---");
+    println!(
+        "  prefill: {prefill_steps} step(s), {:.1} ms total",
+        prefill_secs * 1e3
+    );
+    if decode_tokens > 0 {
+        let per_step_ms = decode_secs * 1e3 / (decode_steps - 1) as f64;
+        println!(
+            "  decode:  {} timed step(s) (+1 warmup discarded), {:.2} ms/step",
+            decode_steps - 1,
+            per_step_ms
+        );
+        println!(
+            "  AGGREGATE decode throughput: {:.2} tok/s  ({:.2} tok/s per slot x {n_slots})",
+            decode_tokens as f64 / decode_secs,
+            decode_tokens as f64 / decode_secs / n_slots as f64
+        );
+        if let Some(&warm) = decode_step_ms.first() {
+            println!("  (warmup step was {warm:.2} ms)");
+        }
+    } else {
+        println!("  decode:  too few decode-only steps to time");
     }
 
     println!("\n--- final text per slot ---");

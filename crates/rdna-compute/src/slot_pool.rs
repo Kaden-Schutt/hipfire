@@ -39,11 +39,7 @@ impl SlotPool {
     ///
     /// Refuses rather than allocates when the arena would exceed the
     /// deployment-target budget — see `kv_slots::preflight_alloc`.
-    pub fn new(
-        n_slots: usize,
-        cap_tokens: usize,
-        per_pos_bytes: usize,
-    ) -> Result<Self, String> {
+    pub fn new(n_slots: usize, cap_tokens: usize, per_pos_bytes: usize) -> Result<Self, String> {
         assert!(n_slots > 0, "n_slots must be positive");
         assert!(per_pos_bytes > 0, "per_pos_bytes must be positive");
         let cap = cap_tokens.div_ceil(PAGE_TOKENS) * PAGE_TOKENS;
@@ -156,7 +152,12 @@ mod tests {
         assert_eq!(d[0].cap, 384);
         for i in 1..4 {
             let prev_end = d[i - 1].k_base + (d[i - 1].cap as u64) * PPB as u64;
-            assert_eq!(d[i].k_base, prev_end, "slab {i} must start where {} ended", i - 1);
+            assert_eq!(
+                d[i].k_base,
+                prev_end,
+                "slab {i} must start where {} ended",
+                i - 1
+            );
         }
     }
 
@@ -198,7 +199,11 @@ mod tests {
         p.set_seq_len(id, 100).unwrap();
         p.release(id);
         let id2 = p.acquire().unwrap();
-        assert_eq!(p.descriptors()[id2.0].seq_len, 0, "reused slot must start empty");
+        assert_eq!(
+            p.descriptors()[id2.0].seq_len,
+            0,
+            "reused slot must start empty"
+        );
     }
 
     #[test]
@@ -208,15 +213,24 @@ mod tests {
         assert!(!p.descriptors_dirty());
         let id = p.acquire().unwrap();
         p.set_seq_len(id, 10).unwrap();
-        assert!(p.descriptors_dirty(), "a seq_len change must dirty the table");
+        assert!(
+            p.descriptors_dirty(),
+            "a seq_len change must dirty the table"
+        );
         p.mark_uploaded();
         assert!(!p.descriptors_dirty());
     }
 
     #[test]
     fn oversized_pool_is_refused_not_allocated() {
-        // 8 slots x 1M tokens x 1088 B = ~8.7 TB, far over the 32 GiB target budget.
-        let e = SlotPool::new(8, 1_000_000, PPB).unwrap_err();
+        // 8 slots x 4M tokens x 1088 B/pos x 2 (K and V) = ~69.6 GB, over the
+        // 32 GiB target budget.
+        //
+        // Was 1M tokens, which is ~17.4 GB once K and V are counted -- under
+        // the budget, so `new` correctly returned Ok and the `unwrap_err` here
+        // panicked. The test's comment said "8.7 TB", off by 1000x; the
+        // refusal it is checking was never actually being exercised.
+        let e = SlotPool::new(8, 4_000_000, PPB).unwrap_err();
         assert!(e.contains("budget") || e.contains("GiB"), "unexpected: {e}");
     }
 }
