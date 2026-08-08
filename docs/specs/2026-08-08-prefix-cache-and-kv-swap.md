@@ -2,7 +2,7 @@
 
 - **Date:** 2026-08-08
 - **Base:** `feat/batched-attn-impl` (SP1–SP4)
-- **Status:** design
+- **Status:** implemented (2026-08-08); see §13
 
 ## 1. Goal
 
@@ -217,3 +217,54 @@ Two implementation plans, in order:
 - **LRU over idle sessions can thrash** if more than four sessions are
   continuously active. Out of scope to solve; admission should reject rather
   than thrash, and the measurement plan should show whether it happens.
+
+## 13. Implementation result (2026-08-08)
+
+Both phases are built and gated on 35B-A3B.
+
+**SP5 — prefix cache.** `prefix.rs` (`lcp`, `plan_turn`) and
+`SessionTable::begin_turn`. Gate `test_prefix_cache_equivalence`: reusing 11 of
+21 prompt tokens produced **24/24 tokens identical** to a cold full prefill.
+
+Two harness defects had to be fixed before that gate meant anything, both of
+which would have made it prove the wrong thing:
+
+- The arms chunked prefill differently (one batch of 21 vs 11+10). Different
+  batch shapes take different kernel paths, so the first failure was
+  chunked-vs-unchunked prefill, not reuse-vs-recompute. The tell was that the
+  two streams differed at exactly one position and then re-aligned — a near-tie
+  flip, not a real divergence.
+- The driver sampled after *every* step including intermediate prefill chunks,
+  appending a generated token into the middle of the prompt.
+
+**SP6 — KV swap.** `swap/snapshot.rs`, `swap/store.rs`, `swap/mod.rs`
+(`SwapManager`), plus `Residency`/LRU on `SessionTable` and a host budget on
+`AdmissionController`.
+
+- `test_swap_roundtrip`: **50,778,880 B restored bitwise**, with a scribble
+  between capture and restore, a positive control that capture *observes* the
+  scribble (proving it reads the right region), corruption and stamp mismatch
+  both refused, and a refused restore shown to leave the slot untouched.
+- `test_swap_equivalence`: A evicted for B then restored — **16 tokens
+  identical to control on both the host and disk tiers**, with `evictions > 0`
+  asserted so the gate cannot silently test nothing.
+
+### What the measurements confirmed
+
+At 14 tokens the split was **KV 0.15 MiB against DeltaNet state 48.28 MiB**.
+§4's warning was if anything understated: at short contexts the fixed DN cost is
+essentially the entire swap, and a KV-only implementation would have looked
+correct on any short test while being 99.7% wrong.
+
+### Deferred from the plans
+
+- Async write-back: `SwapManager::park` is synchronous. The store call is a
+  memcpy or a file write, so the win is real but small, and a worker thread is
+  the one concurrency addition in this design — worth landing separately with
+  its own race test rather than inside the correctness work.
+- Wiring eviction into a request loop: the pieces (`lru_idle_victim`,
+  `mark_swapped`, `park`/`unpark`, `mark_resident`) are built and gated, but
+  nothing calls them in sequence yet. That belongs with SP7 daemon integration,
+  which is where a request loop exists at all.
+- Latency measurement: correctness only so far. Per §9, host-tier numbers from
+  this box would not transfer to the R9700 anyway.
