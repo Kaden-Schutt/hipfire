@@ -204,56 +204,111 @@ It also changes the restart's shape — `hc_finalize_control.hip`,
 `hc_compute_control.hip` (vec4_finalize + T1024), the `nox` RMSNorm variant,
 and `gemv_mfp4g32_e8_soa_shared_jobs.gfx1100.hip` are now all in the base tree.
 
-## 8. Restart ladder
+## 8. Target and feasibility envelope
 
-Gates run in order. Each is a single lever under §4 rules.
+**AR target: 50 tok/s** on the canonical 2,048/512 fixture, gfx1100 + gfx1151.
+Locked 2026-08-07. `20.000 ms/token` total wall.
 
-- **R0 — Re-establish the waterline.** Rebuild HEAD, re-measure the canonical
-  2,048/512 direct-HIP hetero route, 3 fresh processes. Record binary and
-  prompt digests and the golden output SHA. Nothing proceeds without a current
-  number; every figure in §2 predates the merge.
-- **R1 — Re-bill the gfx1100 serial tier, per shape.** rocprof the decode tail
-  and attribute the dense E8 tier **by projection shape**, not flat. Confirm
-  whether `buffer_gfx1100` or the generic symbol is live. Deliverable: the
-  §3.2 table with measured per-shape bandwidth. This gate decides whether
-  Lever A is worth 1.2 ms or 2.8 ms.
-- **R2 — `hc-fusions` re-gate.** Admit `hc_finalize_control` +
-  `hc_compute_control_vec4_finalize` on exact-gfx1100 MQ2R. Largest gfx1201
-  delta, trivial cost, order-preserving. Golden required.
-- **R3 — `nox` re-gate + T1024.** Both change FP32 reduction order; each needs
-  its own gfx1100 golden re-certification. Run as two separate screens, not a
-  bundle.
-- **R4 — E8 shape work.** Driven by R1. Cheap trial first: clone
-  `__launch_bounds__(32,7)` onto the dense buffer kernel (grouped and gfx1151
-  set the min-waves hint; generic and buffer omit it). Then wire `shared_jobs`
-  for the `w1`/`w3` and compressor pairs (~1.45 ms addressable). Then fat-M
-  single-row bandwidth for `wq_b`/`wo_b`/`lm_head` (~4.90 ms, 64.5% of bytes,
-  not reachable by packing).
-- **R5 — Rate-matched hot-expert residency.** Only after R2–R4. Measure `r`
-  once, pick the balanced hot fraction, do not max-fill VRAM. §3.1 shows this
-  is worth ~4 tok/s of ceiling, not a campaign.
+The bill does not reach it on the kernel campaign plus residency alone. At the
+dispatch-proportional residual those two levers land **45–47 tok/s**:
 
-### Projected outcome
+| Weighted generic-E8 BW | useful union | residual 5.15 ms |
+|---:|---:|---:|
+| 500 | 17.17 ms | 44.8 tok/s |
+| 544.2 | 16.71 ms | 45.7 tok/s |
+| 600 | 16.22 ms | 46.8 tok/s |
 
-With Lever A at the mid case and residency at `r = 2.184`:
+A third structural lever is required. It is the one the previous campaign died
+on, so it is stated precisely in §8.2.
 
-| Residual | Product |
-|---:|---:|
-| 6.0 ms (today's unsafe path) | 44.0 tok/s |
-| 3.0 ms | **49.6 tok/s** |
-| 1.5 ms | 54.9 tok/s |
+### 8.1 Why the residual only falls to ~5.15 ms from kernels alone
 
-T1 = 50 tok/s is reachable, and only reachable, with **all three** of the
-kernel campaign, the residency revision, and the residual at ~3 ms. T2 = 60 is
-not supported by this bill. Revise the targets accordingly rather than
-carrying an unreachable number.
+The residual is dominated by host launch cost, so it tracks dispatch count.
+H1 measured 3,165 dispatches/token against a 6.036 ms residual. The kernel
+campaign's mechanism *is* launch-count reduction, so it attacks both terms:
+`hc-fusions` removes 3 launches × 86 layers = 258; mixed-E8 packing removes
+~205. That is 3,165 → 2,702, a 14.6% cut, and 6.036 → **5.153 ms**. Real, but
+not enough on its own.
 
-## 9. Do not retry
+### 8.2 Lever C — coarse whole-token retained owner body
+
+Already measured, on this exact hardware
+(`docs/investigations/2026-08-07-ds4-gfx1100-owner-throughput-gate.md:13-20`):
+
+| gfx1100 owner body | ms/token | tok/s |
+|---|---:|---:|
+| direct HIP | 21.318 | 46.9086 |
+| retained as **one** PM4 packet | 16.440 | 60.8265 |
+
+**4.878 ms/token of host/launch cost removed, bit-identical logits, 12/12
+samples.** Discounted for the dispatches Lever A already removes, retention is
+worth ~4.16 ms — taking the residual to ~1.0 ms.
+
+**This is the lever that killed the last campaign, and the distinction is the
+whole plan.** What was rejected on TG128 (−58.74%) was *43 separately prepared,
+per-layer checkpointed queues* costing ~1.20 ms/layer of submit/wakeup/wait.
+What is proposed is *one persistent owner tape per token* with owner-local
+finite gates, measured at **6.181 µs/gate = 0.266 ms/token** across 43 gates.
+That is a 194× difference in synchronization tax, and it is the next cut the
+TG128 doc itself prescribes at `:118-132`.
+
+**Hard pre-gate, no exceptions:** before any model run, screen the
+continuation protocol with a small multi-checkpoint oracle and demonstrate a
+projected ≥2% end-to-end win. If the oracle does not clear, Lever C is dead
+and the target is renegotiated — not pursued on faith. This is exactly the
+gate the previous campaign lacked.
+
+### 8.3 Envelope with A + B + C
+
+| Weighted generic-E8 BW | useful union | resid 3.0 | resid 2.5 | resid 2.0 | resid 1.5 |
+|---:|---:|---:|---:|---:|---:|
+| 450 | 17.80 ms | 48.1 | 49.2 | **50.5** | **51.8** |
+| 500 | 17.17 ms | 49.6 | **50.8** | **52.2** | **53.6** |
+| 544.2 | 16.71 ms | **50.7** | **52.1** | **53.5** | **54.9** |
+| 600 | 16.22 ms | **52.0** | **53.4** | **54.9** | **56.4** |
+
+50 tok/s needs the generic-E8 tier at ≥500 GB/s **and** Lever C landing. There
+is no combination of two levers that reaches it. T2 = 60 remains unsupported.
+
+## 9. Restart ladder
+
+Measurement on `hipx` is a **serial resource** — fresh-process benchmarking
+with ±10–15% DPM/thermal drift means no two candidates may be timed
+concurrently. Implementation parallelizes; screening does not.
+
+**Wave 1 — implement concurrently, each behind its own admission flag,
+default off.** No benchmarking, no shared-file coordination needed.
+
+| Slice | Work |
+|---|---|
+| C-oracle | Multi-checkpoint continuation oracle for Lever C (§8.2 pre-gate) |
+| R2 | `hc-fusions` re-gate onto exact-gfx1100 MQ2R (`forward.rs:888-896`) |
+| R3 | `nox` re-gate (`norm.rs:4193`) + T1024 flag, as two independent gates |
+| R4a | `__launch_bounds__(32,7)` on the dense buffer kernel |
+| R4b | `shared_jobs` wiring for `w1`/`w3` + compressor pairs |
+
+**Wave 2 — screen serially on hipx, in this order.** Each under §4: 3 fresh
+processes, median + range spread, mandatory byte-identical golden, 2% gate,
+revert on reject.
+
+- **R0** Re-establish the waterline. Every figure in §2 predates the merge.
+- **R1** Re-bill the serial tier **per projection shape**, not flat. Confirm
+  whether `buffer_gfx1100` or the generic symbol is live — this decides
+  whether Lever A is worth 1.2 ms or 2.8 ms, and it may show the 7.586 ms line
+  item is already stale.
+- **R2** → **R3** (two screens) → **R4a** → **R4b** → **R4c** fat-M bandwidth
+  for `wq_b`/`wo_b`/`lm_head` (~4.90 ms, 64.5% of bytes, scoped by R1).
+- **C** Lever C, only if its oracle cleared ≥2%.
+- **R5** Rate-matched residency last. Measure `r` once; §3.1 shows it is worth
+  ~4 tok/s of ceiling, not a campaign. Do not max-fill VRAM.
+
+## 10. Do not retry
 
 - **Per-layer checkpointed / host-gated AQL composition.** −58.74% on TG128.
   The gfx1201 branch independently closed the same family after one screen
   (graph-resident barrier, −17.442%). Two branches, two mechanisms, same
-  verdict: fine-grained in-queue synchronization loses.
+  verdict: fine-grained in-queue synchronization loses. Lever C (§8.2) is the
+  *coarse* one-tape-per-token shape, not this; keep the distinction sharp.
 - **E8 four-group prefetch.** Micro won 1.034 ms; product lost 0.534% because
   the gfx1151 wait branch lengthened. Conditional revisit *after* R5 balance,
   never as a cold retry.
@@ -262,7 +317,7 @@ carrying an unreachable number.
   `drm_sched_entity_flush`.
 - **Any device-side reciprocal peer wait.** Quarantined; strands both GPUs.
 
-## 10. Follow-up
+## 11. Follow-up
 
 `docs/investigations/2026-08-07-gfx1201-ds4-dense-tp.md:11-17` states the
 gfx1201 work "is isolated on `ds4-gfx1201-opt`" and that the heterogeneous line
