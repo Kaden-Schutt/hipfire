@@ -109,12 +109,12 @@ rope_tail_yarn_interleaved_staged_buf_f32_gfx1201(
 }
 
 extern "C" __global__ void cast_f32_to_f16_at_slot_buf_gfx1201(
-    const float *__restrict__ staged, __half *__restrict__ cache,
+    const float *__restrict__ staged, _Float16 *__restrict__ cache,
     const int *__restrict__ slot_buf, int n) {
   const int slot = slot_buf[0];
   if (slot < 0)
     return;
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i < n)
-    cache[(size_t)slot * n + i] = __float2half_rn(staged[i]);
+    cache[(size_t)slot * n + i] = (_Float16)staged[i];
 }

@@ -8,7 +8,7 @@
 
 extern "C" __global__ __launch_bounds__(MAX_HEADS, 4)
 void indexer_relu_score_f16_buf_gfx1201(
-    const float *__restrict__ q, const __half *__restrict__ cache,
+    const float *__restrict__ q, const _Float16 *__restrict__ cache,
     const float *__restrict__ weights, float *__restrict__ scores,
     const int *__restrict__ N_buf, int H, int D) {
   const int N = N_buf[0];
@@ -22,10 +22,10 @@ void indexer_relu_score_f16_buf_gfx1201(
   if (tid >= H)
     return;
   const float *qh = q + (size_t)tid * D;
-  const __half *kt = cache + (size_t)n * D;
+  const _Float16 *kt = cache + (size_t)n * D;
   float dot = 0.0f;
   for (int d = 0; d < D; ++d)
-    dot += qh[d] * __half2float(kt[d]);
+    dot += qh[d] * (float)kt[d];
   const float v = (dot > 0.0f ? dot : 0.0f) * weights[tid];
   __shared__ float reduce[MAX_HEADS];
   reduce[tid] = v;
@@ -41,7 +41,7 @@ void indexer_relu_score_f16_buf_gfx1201(
 
 extern "C" __global__ __launch_bounds__(MAX_HEADS, 4)
 void indexer_relu_score_batched_f16_gfx1201(
-    const float *__restrict__ q, const __half *__restrict__ cache,
+    const float *__restrict__ q, const _Float16 *__restrict__ cache,
     const float *__restrict__ weights,
     const int *__restrict__ n_per_batch, float *__restrict__ scores, int H,
     int D, int N_max, int batch_size) {
@@ -58,10 +58,10 @@ void indexer_relu_score_batched_f16_gfx1201(
     return;
   }
   const float *qh = q + ((size_t)b * H + tid) * D;
-  const __half *kt = cache + (size_t)n * D;
+  const _Float16 *kt = cache + (size_t)n * D;
   float dot = 0.0f;
   for (int d = 0; d < D; ++d)
-    dot += qh[d] * __half2float(kt[d]);
+    dot += qh[d] * (float)kt[d];
   const float v =
       (dot > 0.0f ? dot : 0.0f) * weights[(size_t)b * H + tid];
   __shared__ float reduce[MAX_HEADS];
@@ -84,7 +84,7 @@ typedef float __attribute__((ext_vector_type(8))) float8_t;
 
 __launch_bounds__(128, 2) extern "C" __global__ void
 indexer_relu_score_wmma_batched_f16_gfx1201(
-    const float *__restrict__ q, const __half *__restrict__ cache,
+    const float *__restrict__ q, const _Float16 *__restrict__ cache,
     const float *__restrict__ weights,
     const int *__restrict__ n_per_batch, float *__restrict__ scores, int H,
     int D, int N_max, int batch_size) {
@@ -112,7 +112,7 @@ indexer_relu_score_wmma_batched_f16_gfx1201(
   const int safe_h = my_h < H ? my_h : H - 1;
   const int safe_n = my_n < n_valid_b ? my_n : n_valid_b - 1;
   const float *qh = q + ((size_t)b * H + safe_h) * D;
-  const __half *kn = cache + (size_t)safe_n * D;
+  const _Float16 *kn = cache + (size_t)safe_n * D;
   float8_t acc = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
   for (int k = 0; k < D; k += WMMA_TILE) {
     half8_t q_frag;
@@ -154,7 +154,7 @@ indexer_relu_score_wmma_batched_f16_gfx1201(
 }
 
 extern "C" __global__ void deepseek4_topk_kv_gather_f16_buf_gfx1201(
-    const __half *__restrict__ cache, const int *__restrict__ topk_idx,
+    const _Float16 *__restrict__ cache, const int *__restrict__ topk_idx,
     float *__restrict__ out, const int *__restrict__ K_buf,
     const int *__restrict__ N_compressed_buf, int head_dim, int out_stride,
     int col_offset, float scale) {
@@ -167,25 +167,25 @@ extern "C" __global__ void deepseek4_topk_kv_gather_f16_buf_gfx1201(
   const int idx = topk_idx[k];
   float value = 0.0f;
   if (idx >= 0 && idx < N)
-    value = __half2float(cache[(size_t)idx * head_dim + d]) * scale;
+    value = (float)cache[(size_t)idx * head_dim + d] * scale;
   out[d * out_stride + col_offset + k] = value;
 }
 
 extern "C" __global__ void
 deepseek4_topk_kv_gather_identity_f16_buf_gfx1201(
-    const __half *__restrict__ cache, float *__restrict__ out,
+    const _Float16 *__restrict__ cache, float *__restrict__ out,
     const int *__restrict__ K_buf, int head_dim, int out_stride) {
   const int K = K_buf[0];
   const int k = blockIdx.x;
   const int d = threadIdx.x;
   if (k < K && d < head_dim)
     out[d * out_stride + k] =
-        __half2float(cache[(size_t)k * head_dim + d]);
+        (float)cache[(size_t)k * head_dim + d];
 }
 
 extern "C" __global__ __launch_bounds__(256, 4)
 void deepseek4_topk_kv_gather_batched_tiled_f16_gfx1201(
-    const __half *__restrict__ cache, const int *__restrict__ topk_idx,
+    const _Float16 *__restrict__ cache, const int *__restrict__ topk_idx,
     float *__restrict__ out, int K, int head_dim, int N_compressed,
     int out_stride, int col_offset, float scale, int batch_size) {
   constexpr int TILE = 32;
@@ -212,7 +212,7 @@ void deepseek4_topk_kv_gather_batched_tiled_f16_gfx1201(
     const int idx = selected[local_k];
     float value = 0.0f;
     if (k < K && d < head_dim && idx >= 0 && idx < N_compressed)
-      value = __half2float(cache[(size_t)idx * head_dim + d]) * scale;
+      value = (float)cache[(size_t)idx * head_dim + d] * scale;
     tile[local_k][local_d] = value;
   }
   __syncthreads();
@@ -231,12 +231,12 @@ void deepseek4_topk_kv_gather_batched_tiled_f16_gfx1201(
 
 extern "C" __global__ void
 deepseek4_topk_kv_gather_identity_batched_f16_gfx1201(
-    const __half *__restrict__ cache, float *__restrict__ out, int K,
+    const _Float16 *__restrict__ cache, float *__restrict__ out, int K,
     int head_dim, int out_stride, int batch_size) {
   const int k = blockIdx.x;
   const int b = blockIdx.y;
   const int d = threadIdx.x;
   if (k < K && b < batch_size && d < head_dim)
     out[((size_t)b * head_dim + d) * out_stride + k] =
-        __half2float(cache[(size_t)k * head_dim + d]);
+        (float)cache[(size_t)k * head_dim + d];
 }
