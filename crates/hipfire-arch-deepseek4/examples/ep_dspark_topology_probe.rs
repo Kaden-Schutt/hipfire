@@ -371,6 +371,8 @@ fn main() -> Result<(), String> {
     if verify_tokens.len() != args.verify_batch {
         return Err("drafter returned too few tokens for verify batch".into());
     }
+    let mut verify_trunk_ms = Vec::with_capacity(args.samples);
+    let mut verify_heads_ms = Vec::with_capacity(args.samples);
     let mut verify_ms = Vec::with_capacity(args.samples);
     for iteration in 0..args.warmups + args.samples {
         let start_pos = args.position
@@ -387,12 +389,15 @@ fn main() -> Result<(), String> {
             &verify_tokens,
             start_pos,
         )?;
+        sync_target(&mut gpus)?;
+        let trunk_elapsed = verify_started.elapsed().as_secs_f64() * 1e3;
         // The TP3 helper computes the last-row head. Add the exact all-row
         // greedy head used by DSpark verification. This deliberately counts
         // the last head twice, making the admission projection conservative.
         gpus.devices[0]
             .bind_thread()
             .map_err(|e| format!("bind rank0 verify head: {e:?}"))?;
+        let heads_started = Instant::now();
         let _ = final_norm_and_argmax_all_batched(
             &cfg,
             &weights_per_rank[0],
@@ -402,14 +407,19 @@ fn main() -> Result<(), String> {
             args.verify_batch,
         )?;
         sync_target(&mut gpus)?;
-        let verify_elapsed = verify_started.elapsed().as_secs_f64() * 1e3;
+        let heads_elapsed = heads_started.elapsed().as_secs_f64() * 1e3;
+        let verify_elapsed = trunk_elapsed + heads_elapsed;
         if iteration >= args.warmups {
+            verify_trunk_ms.push(trunk_elapsed);
+            verify_heads_ms.push(heads_elapsed);
             verify_ms.push(verify_elapsed);
         }
     }
 
     let peer_us_med = median(&mut peer_us);
     let draft_ms_med = median(&mut draft_ms);
+    let verify_trunk_ms_med = median(&mut verify_trunk_ms);
+    let verify_heads_ms_med = median(&mut verify_heads_ms);
     let verify_ms_med = median(&mut verify_ms);
     let window_ms = peer_us_med / 1e3 + draft_ms_med + verify_ms_med;
     let projected_tps = args.tau * 1e3 / window_ms;
@@ -420,6 +430,8 @@ fn main() -> Result<(), String> {
         main_hidden_src.buf.size()
     );
     println!("draft_ms_median={draft_ms_med:.3}");
+    println!("verify_trunk_plus_last_head_ms_median={verify_trunk_ms_med:.3}");
+    println!("verify_all_heads_ms_median={verify_heads_ms_med:.3}");
     println!(
         "verify_ms_median={verify_ms_med:.3} verify_batch={} (conservative: duplicate last-row head)",
         args.verify_batch
