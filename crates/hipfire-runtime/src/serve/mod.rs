@@ -26,7 +26,16 @@ use std::sync::mpsc::Sender;
 pub struct SubmitRequest {
     /// Continue an existing session, or `None` to open a new one.
     pub session: Option<u64>,
+    /// Full cold render of the conversation. Used when nothing is reusable.
     pub prompt_tokens: Vec<u32>,
+    /// Hashes of the conversation's user turns, in order. Identity for
+    /// continuation matching — see `Session::convo`.
+    pub convo: Vec<u64>,
+    /// Tokens that continue the previous turn into this one, from
+    /// `prompt_frame::continuation_suffix`. When a matching session is found
+    /// these are APPENDED to its exact stored tokens, so the result is a
+    /// strict extension of the KV rather than a re-render of it.
+    pub continuation: Vec<u32>,
     pub max_tokens: usize,
     pub reply: Sender<Event>,
 }

@@ -58,6 +58,9 @@ cleanup() {
   for p in $kids $SRV_PID; do
     [ -n "$p" ] && kill -KILL "$p" 2>/dev/null || true
   done
+  # Keep the server log: a gate that deletes its only diagnostic on failure
+  # forces every investigation to start by reproducing the failure.
+  [ -f "$WORK/serve.log" ] && cp "$WORK/serve.log" /tmp/serve-gate.log 2>/dev/null || true
   rm -rf "$WORK"
 }
 trap cleanup EXIT
@@ -115,6 +118,7 @@ req() { # req <prompt> <outfile>
     -o "$2" -w '%{http_code}'
 }
 
+echo "[phase] sequential"
 echo "--- ${#Q[@]} requests sequentially ---"
 S=$(date +%s.%N)
 for i in "${!Q[@]}"; do
@@ -125,6 +129,7 @@ E=$(date +%s.%N)
 SEQ=$(echo "$E - $S" | bc)
 echo "  sequential: ${SEQ}s"
 
+echo "[phase] concurrent"
 echo "--- the same ${#Q[@]} concurrently ---"
 S=$(date +%s.%N)
 PIDS=()
@@ -176,6 +181,7 @@ PY
 # different function from the non-streaming path above. Agents commonly use
 # it, so it gets its own assertions: SSE framing, at least one content
 # delta, and the [DONE] sentinel.
+echo "[phase] streaming"
 echo "--- streaming request ---"
 code="$(curl -s -m 300 -X POST "$URL" -H 'Content-Type: application/json' \
   -d "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"What is the capital of France?\"}],\"max_tokens\":$MAX_TOKENS,\"stream\":true}" \
@@ -215,6 +221,7 @@ PY2
 # That is what makes turn 2's rendered tokens a strict extension of turn 1's;
 # merely appending text to a single user message is NOT, because the chat
 # frame puts the assistant opener at the end.
+echo "[phase] multi-turn"
 echo "--- multi-turn prefix reuse ---"
 LONG="$(python3 -c 'print("Explain the history of the Roman empire in detail. " * 40, end="")')"
 
@@ -236,29 +243,24 @@ E=$(date +%s.%N)
 T2=$(echo "$E - $S" | bc)
 echo "  turn 1 (cold): ${T1}s   turn 2 (continues turn 1): ${T2}s"
 
-# KNOWN GAP, so this is reported rather than asserted by default. Set
-# SERVE_GATE_REQUIRE_REUSE=1 to make it a hard failure once it is fixed.
-#
-# The engine-side mechanism is correct and unit-tested
-# (`SessionTable::find_extendable`, strict-extension only because DeltaNet
-# state cannot be rewound). What does not line up is the chat template:
-# turn 1 generates after `<|im_start|>assistant\n<think>\n`, but turn 2
-# re-renders that same assistant turn as `<|im_start|>assistant\n{reply}
-# <|im_end|>` with NO `<think>` opener. The two token sequences diverge
-# there, so turn 2 is not a strict extension and reuse correctly declines.
-#
-# Fixing it means making history rendering reproduce what was actually
-# generated, which is what the daemon's `qwen35_history_render` modes do.
-# Until then a follow-up turn re-prefills, which is slow but never wrong.
-python3 - "$T1" "$T2" "${SERVE_GATE_REQUIRE_REUSE:-0}" <<'PY3' || exit 1
+# Asserted by default. Reuse works: the engine matches the conversation by its
+# USER turns and then APPENDS `continuation_suffix` to the session's exact
+# stored tokens, rather than re-rendering the history. Re-rendering could never
+# match, for two independent reasons: the generated turn began after an
+# OpenThink opener that history rendering does not replay, and re-encoding the
+# decoded reply is a detokenise/retokenise round trip that is not guaranteed to
+# be the identity. Appending sidesteps both.
+python3 - "$T1" "$T2" "${SERVE_GATE_REQUIRE_REUSE:-1}" <<'PY3' || exit 1
 import sys
 t1, t2, require = float(sys.argv[1]), float(sys.argv[2]), sys.argv[3] == "1"
 ratio = t2 / t1 if t1 > 0 else 1.0
 print(f"  turn2/turn1 = {ratio:.2f}")
 if ratio >= 0.90:
     msg = ("turn 2 was not cheaper than turn 1 -- prefix reuse did not fire. "
-           "Known gap: the assistant opener does not render identically across "
-           "turns for a thinking model, so turn 2 is not a strict extension.")
+           "Either the conversation key stopped matching (SessionTable::"
+           "find_continuation), or finished sessions are being closed instead "
+           "of kept resident, or the continuation suffix no longer lines up "
+           "with the stored tokens.")
     if require:
         print(f"FAIL: {msg}", file=sys.stderr)
         sys.exit(1)

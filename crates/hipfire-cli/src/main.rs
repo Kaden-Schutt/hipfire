@@ -4683,12 +4683,43 @@ fn complete_request_slots(
     };
     let prompt_tokens = frame.build_multi_turn(&history);
 
+    // Conversation identity is the USER turns. The assistant side is whatever
+    // we generated, and the client's echo of it may differ (reasoning split to
+    // its own channel, whitespace, an edited message), so it cannot be part of
+    // the key.
+    fn turn_hash(s: &str) -> u64 {
+        let mut h = 0xcbf29ce484222325_u64;
+        for b in s.as_bytes() {
+            h ^= u64::from(*b);
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        h
+    }
+    let mut convo: Vec<u64> = turns
+        .iter()
+        .filter(|(r, _)| *r == Role::User)
+        .map(|(_, t)| turn_hash(t))
+        .collect();
+    convo.push(turn_hash(&last_user));
+
+    // Tokens that continue the previous assistant turn into this user turn.
+    // The engine appends these to the session's exact stored tokens instead of
+    // re-rendering the history, which is what makes the result a strict
+    // extension of the KV. Only meaningful from turn 2 onwards.
+    let continuation = if convo.len() >= 2 {
+        hipfire_runtime::prompt_frame::continuation_suffix(&backend.tokenizer, &last_user, prefix)
+    } else {
+        Vec::new()
+    };
+
     let (tx, rx) = mpsc::channel::<Event>();
     backend
         .engine
         .submit(SubmitRequest {
             session: None,
             prompt_tokens,
+            convo,
+            continuation,
             max_tokens,
             reply: tx,
         })

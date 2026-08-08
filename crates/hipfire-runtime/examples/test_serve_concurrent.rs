@@ -81,6 +81,10 @@ fn main() {
             .submit(SubmitRequest {
                 session: None,
                 prompt_tokens: toks,
+                // Single-turn: nothing to continue, so no conversation key and
+                // no continuation tokens.
+                convo: Vec::new(),
+                continuation: Vec::new(),
                 max_tokens: MAX_TOKENS,
                 reply: tx,
             })

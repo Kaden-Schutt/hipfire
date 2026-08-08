@@ -409,7 +409,18 @@ fn run_loop(mut rig: Rig, rx: Receiver<SubmitRequest>, stats: Arc<Mutex<EngineSt
                 let _ = send_event(&f.reply, Event::Done { reason });
                 slots[s] = None;
                 work[s].remaining_prompt.clear();
-                rig.sessions.close(&mut rig.pool, &mut rig.adm, session);
+                if matches!(reason, DoneReason::ClientGone) {
+                    // Nobody will follow up on a vanished client, so hand the
+                    // slot back at once.
+                    rig.sessions.close(&mut rig.pool, &mut rig.adm, session);
+                } else {
+                    // Keep the session RESIDENT but idle. Its KV and recurrent
+                    // state are exactly what a follow-up turn continuing this
+                    // conversation needs; closing here is what made multi-turn
+                    // reuse impossible. LRU eviction reclaims the slot when
+                    // someone else needs it.
+                    rig.sessions.touch(session);
+                }
             } else {
                 work[s].remaining_prompt.push(tok);
                 if let Some(sess) = rig.sessions.get_mut(session) {
@@ -430,6 +441,76 @@ fn admit(
     req: SubmitRequest,
 ) {
     let busy: Vec<SessionId> = slots.iter().flatten().map(|f| f.session).collect();
+
+    // Multi-turn continuation. The client resends the whole conversation, so a
+    // follow-up turn is matched by its USER turns and then built by APPENDING
+    // `continuation` to the session's exact stored tokens. Appending rather
+    // than re-rendering is what makes it a strict extension: the generated
+    // turn began after an OpenThink opener that history rendering does not
+    // replay, and re-encoding the decoded reply is not guaranteed to round
+    // trip. Reuse also keeps the DeltaNet state, which is the point.
+    if !req.continuation.is_empty() {
+        if std::env::var("HIPFIRE_SLOT_TRACE").is_ok() {
+            eprintln!(
+                "[slot-trace] continuation attempt: convo={:?} suffix={} tokens",
+                req.convo,
+                req.continuation.len()
+            );
+            for (id, sess) in rig.sessions.iter() {
+                eprintln!(
+                    "[slot-trace]   session {} convo={:?} slot={:?} tokens={}",
+                    id,
+                    sess.convo,
+                    sess.slot,
+                    sess.tokens.len()
+                );
+            }
+        }
+        if let Some(existing) = rig.sessions.find_continuation(&req.convo, &busy) {
+            let base = rig
+                .sessions
+                .get(existing)
+                .map(|s| s.tokens.clone())
+                .unwrap_or_default();
+            let slot = rig.sessions.get(existing).and_then(|s| s.slot);
+            if let Some(slot) = slot {
+                let mut extended = base;
+                extended.extend_from_slice(&req.continuation);
+                if let Ok(plan) = rig.sessions.begin_turn(&mut rig.pool, existing, &extended) {
+                    if let Some(sess) = rig.sessions.get_mut(existing) {
+                        sess.tokens = extended.clone();
+                        sess.convo = req.convo.clone();
+                    }
+                    if send_event(
+                        &req.reply,
+                        Event::Accepted {
+                            session: existing.0,
+                        },
+                    )
+                    .is_ok()
+                    {
+                        work[slot.0].remaining_prompt = extended[plan.reused..].to_vec();
+                        work[slot.0].next_pos = plan.reused;
+                        work[slot.0].decoding = false;
+                        slots[slot.0] = Some(InFlight {
+                            session: existing,
+                            reply: req.reply,
+                            produced: 0,
+                            max_tokens: req.max_tokens.max(1),
+                        });
+                        rig.sessions.touch(existing);
+                        let mut st = stats.lock().expect("stats");
+                        st.note_admitted();
+                        st.note_restore(); // a prefix-cache hit
+                    }
+                    return;
+                }
+            }
+        }
+        if std::env::var("HIPFIRE_SLOT_TRACE").is_ok() {
+            eprintln!("[slot-trace] continuation MISS -- falling back to cold prefill");
+        }
+    }
 
     // Multi-turn prefix reuse. OpenAI chat completions are stateless -- the
     // client resends the whole conversation each turn -- so a follow-up turn
@@ -576,6 +657,7 @@ fn admit(
     };
     if let Some(sess) = rig.sessions.get_mut(id) {
         sess.tokens = req.prompt_tokens.clone();
+        sess.convo = req.convo.clone();
     }
 
     if send_event(&req.reply, Event::Accepted { session: id.0 }).is_err() {

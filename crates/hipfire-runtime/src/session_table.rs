@@ -44,6 +44,14 @@ pub struct Session {
     pub tokens: Vec<u32>,
     pub next_pos: usize,
     pub residency: Residency,
+    /// Hashes of this conversation's USER turns, in order.
+    ///
+    /// Identity is the user turns alone, deliberately. The assistant side is
+    /// whatever *we* generated, and the client's echo of it may differ —
+    /// reasoning split into a separate channel, whitespace, or an edited
+    /// message. Matching on the user turns and then replaying our own tokens
+    /// keeps the prompt aligned with the KV we actually hold.
+    pub convo: Vec<u64>,
     /// Monotonic stamp for LRU. Bumped by `touch`.
     pub last_used: u64,
 }
@@ -89,6 +97,7 @@ impl SessionTable {
                 tokens: Vec::new(),
                 next_pos: 0,
                 residency: Residency::Resident,
+                convo: Vec::new(),
                 last_used: {
                     self.clock += 1;
                     self.clock
@@ -149,6 +158,29 @@ impl SessionTable {
         session.tokens.truncate(plan.reused);
         session.next_pos = plan.reused;
         Ok(plan)
+    }
+
+    /// Find a resident, non-busy session whose conversation `convo` is one user
+    /// turn shorter than `want` and a prefix of it — i.e. `want` continues it.
+    ///
+    /// Exactly one turn shorter, not merely a prefix: a session two turns
+    /// behind is missing an assistant reply that never entered its KV, so
+    /// appending the newest user turn to it would skip a turn.
+    pub fn find_continuation(&self, want: &[u64], busy: &[SessionId]) -> Option<SessionId> {
+        if want.len() < 2 {
+            return None;
+        }
+        let expect = &want[..want.len() - 1];
+        self.sessions
+            .iter()
+            .filter(|(id, s)| {
+                s.slot.is_some()
+                    && s.convo.as_slice() == expect
+                    && !s.tokens.is_empty()
+                    && !busy.iter().any(|b| b.0 == **id)
+            })
+            .max_by_key(|(_, s)| s.last_used)
+            .map(|(id, _)| SessionId(*id))
     }
 
     /// Find a resident, non-busy session whose stored tokens are a **strict
@@ -236,6 +268,11 @@ impl SessionTable {
             s.next_pos = seq_len;
             s.last_used = now;
         }
+    }
+
+    /// Iterate sessions as `(id, session)`. For diagnostics.
+    pub fn iter(&self) -> impl Iterator<Item = (u64, &Session)> {
+        self.sessions.iter().map(|(id, s)| (*id, s))
     }
 
     pub fn resident(&self) -> usize {
@@ -374,6 +411,55 @@ mod tests {
         let id = t.open(&mut pool, &mut adm, 1024).unwrap();
         t.close(&mut pool, &mut adm, id);
         assert!(t.begin_turn(&mut pool, id, &[1, 2]).is_err());
+    }
+
+    #[test]
+    fn find_continuation_matches_the_previous_turn() {
+        let (mut pool, mut adm, mut t) = rig(2);
+        let a = t.open(&mut pool, &mut adm, 1024).unwrap();
+        {
+            let s = t.get_mut(a).unwrap();
+            s.convo = vec![11];
+            s.tokens = vec![1, 2, 3];
+        }
+        assert_eq!(t.find_continuation(&[11, 22], &[]), Some(a));
+    }
+
+    #[test]
+    fn find_continuation_refuses_a_different_conversation() {
+        let (mut pool, mut adm, mut t) = rig(2);
+        let a = t.open(&mut pool, &mut adm, 1024).unwrap();
+        {
+            let s = t.get_mut(a).unwrap();
+            s.convo = vec![99];
+            s.tokens = vec![1];
+        }
+        assert_eq!(t.find_continuation(&[11, 22], &[]), None);
+    }
+
+    #[test]
+    fn find_continuation_refuses_a_session_two_turns_behind() {
+        // Its KV never saw turn 2's exchange, so appending turn 3 would skip one.
+        let (mut pool, mut adm, mut t) = rig(2);
+        let a = t.open(&mut pool, &mut adm, 1024).unwrap();
+        {
+            let s = t.get_mut(a).unwrap();
+            s.convo = vec![11];
+            s.tokens = vec![1];
+        }
+        assert_eq!(t.find_continuation(&[11, 22, 33], &[]), None);
+    }
+
+    #[test]
+    fn find_continuation_needs_a_first_turn_to_continue() {
+        let (mut pool, mut adm, mut t) = rig(2);
+        let a = t.open(&mut pool, &mut adm, 1024).unwrap();
+        t.get_mut(a).unwrap().convo = vec![11];
+        assert_eq!(
+            t.find_continuation(&[11], &[]),
+            None,
+            "turn 1 is not a continuation"
+        );
     }
 
     #[test]
