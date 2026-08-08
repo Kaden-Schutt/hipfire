@@ -154,9 +154,8 @@ accept rate roughly 67% -> 73%. That is drafter quality, not kernel work.
 **Closed finding — the `admit an existing kernel that was gated to another
 architecture` seam is now exhausted for this route.**
 
-The four architecture-specific gates in
-`crates/hipfire-arch-deepseek4/src/forward.rs` were each checked and found
-already covered on `gfx1151` or previously rejected:
+This was checked two ways. First, the four architecture-specific gates in
+`crates/hipfire-arch-deepseek4/src/forward.rs`:
 
 - `e8_wo_grouped` — `gfx1151` has its own grouped O-LoRA path, selected first
   at `forward.rs:8352`.
@@ -166,6 +165,33 @@ already covered on `gfx1151` or previously rejected:
 - `indexer_rope_heads` — candidate-only, default off, previously measured at
   +0.045% and not promoted.
 - `indexer_topk_two_stage`.
+
+A gate census is the weaker check, because a kernel can be arch-restricted
+without owning a named gate. The stronger check is the kernel inventory: all
+21 `kernels/src/*.gfx1201.hip` files, each classified by why it is or is not a
+`gfx1151` decode lever.
+
+- `deepseek4_topk_kv_gather_batched_tiled` — **portable; shipped** (§1).
+- `hc_compute_control_batched_fused24` — admission requires
+  `batch_size == 1024` (`forward.rs:13422`), a prefill-chunk shape. It assigns
+  one workgroup per token to share the X load and RMS reduction across all 24
+  control rows, which needs a large batch to fill the machine. At decode
+  batch (B is approximately 2) it never fires and would not help if it did.
+- `hc_compute_control_wmma`, `hc_inv_rms_batched` — use
+  `__builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12`, a gfx12-only intrinsic,
+  so this is a port rather than a re-gate. It also lowers each decoded X value
+  to F16 at the WMMA boundary, so unlike the gather it is **not** bit-identical.
+  That makes it a precision trade, which this route does not take.
+- `hc_mix_4stream_peer4`, `tp4_graph_signal` — three/four-rank tensor-parallel
+  reductions relying on HIP peer access across ranks. Not applicable to a
+  single card.
+- `rope_tail_interleaved_h64d128r64` — reached only through
+  `gfx1201_indexer_rope_heads_on`, the candidate above that measured +0.045%.
+- The eleven `gemv_*` files — `gfx1151` already has its own specialised
+  `_gfx1151` GEMV family (visible in the §3 attribution). More importantly the
+  GEMV block is bandwidth-bound at 83-108% of measured peak, so a different
+  code shape cannot beat the physics; only fewer bytes can.
+- `conv1d_silu_split_qknorm` — not on the DS4 decode path.
 
 The tiled gather (`HIPFIRE_DS4_GATHER_TILED`) was the last portable item on
 that seam.
