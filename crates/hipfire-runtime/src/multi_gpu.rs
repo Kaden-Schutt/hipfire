@@ -486,6 +486,84 @@ impl Gpus {
         Ok(())
     }
 
+    /// One-way stream-event handoff from a rank that produced peer-visible
+    /// state to every other rank that will consume it next.
+    ///
+    /// Unlike [`Self::barrier_rank_streams_reuse`], this does not wait for the
+    /// destination ranks and therefore can be inserted between an owner-first
+    /// producer launch and the remaining peer consumers without deadlocking.
+    /// The event uses a system-scope release and is reused with FIFO stream
+    /// ordering, matching the full-rank barrier's lifetime contract.
+    pub fn handoff_rank_stream_reuse(&mut self, source: usize) -> HipResult<()> {
+        let n = self.devices.len();
+        if source >= n {
+            return Err(HipError::new(
+                0,
+                &format!("handoff_rank_stream_reuse: source={source} out of range (n_devices={n})"),
+            ));
+        }
+        if self.rank_barrier_events.is_empty() {
+            let mut events = Vec::with_capacity(n);
+            for rank in 0..n {
+                let gpu = &self.devices[rank];
+                gpu.bind_thread()?;
+                match gpu
+                    .hip
+                    .event_create_with_flags(HIP_EVENT_DISABLE_TIMING | HIP_EVENT_RELEASE_TO_SYSTEM)
+                {
+                    Ok(event) => events.push(event),
+                    Err(error) => {
+                        for (owner, event) in events.drain(..).enumerate() {
+                            let _ = self.devices[owner].hip.event_destroy(event);
+                        }
+                        return Err(error);
+                    }
+                }
+            }
+            self.rank_barrier_events = events;
+        } else if self.rank_barrier_events.len() != n {
+            return Err(HipError::new(
+                0,
+                &format!(
+                    "handoff_rank_stream_reuse: event count {} != device count {n}",
+                    self.rank_barrier_events.len()
+                ),
+            ));
+        }
+
+        let producer = &self.devices[source];
+        producer.bind_thread()?;
+        let producer_stream = producer.active_stream.as_ref().ok_or_else(|| {
+            HipError::new(
+                0,
+                &format!("handoff_rank_stream_reuse: source device {source} has no active_stream"),
+            )
+        })?;
+        producer
+            .hip
+            .event_record(&self.rank_barrier_events[source], Some(producer_stream))?;
+
+        for destination in 0..n {
+            if destination == source {
+                continue;
+            }
+            let consumer = &self.devices[destination];
+            consumer.bind_thread()?;
+            let consumer_stream = consumer.active_stream.as_ref().ok_or_else(|| {
+                HipError::new(
+                    0,
+                    &format!(
+                        "handoff_rank_stream_reuse: destination device {destination} has no active_stream"
+                    ),
+                )
+            })?;
+            consumer
+                .hip
+                .stream_wait_event(consumer_stream, &self.rank_barrier_events[source])?;
+        }
+        Ok(())
+    }
+
     /// Allocate one fixed gfx1201 TP3/TP4 graph epoch before peer access is
     /// enabled. ROCm signal memory accepts the proven 8-byte allocation; a
     /// monotonically increasing epoch reuses it for every layer boundary.

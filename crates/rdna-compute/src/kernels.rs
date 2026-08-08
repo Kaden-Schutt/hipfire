@@ -5428,12 +5428,16 @@ pub const V4F_ATTN_SWA_TOPK_BUF_LARGE_SERIAL_GFX1151_SRC: &str = concat!(
 /// early-return.
 pub const V4F_TOPK_KV_GATHER_BUF_SRC: &str =
     include_str!("../../../kernels/src/deepseek4_topk_kv_gather_buf.hip");
+pub const V4F_TOPK_KV_GATHER_BUF_SHARDED_GFX1201_SRC: &str =
+    include_str!("../../../kernels/src/deepseek4_topk_kv_gather_buf_sharded.gfx1201.hip");
 pub const V4F_TOPK_KV_GATHER_TILED_GFX1151_SRC: &str =
     include_str!("../../../kernels/src/deepseek4_topk_kv_gather_tiled.gfx1151.hip");
 
 /// HIP-graphs-safe twin of `deepseek4_topk_kv_gather_identity_f32`.
 pub const V4F_TOPK_KV_GATHER_IDENTITY_BUF_SRC: &str =
     include_str!("../../../kernels/src/deepseek4_topk_kv_gather_identity_buf.hip");
+pub const V4F_TOPK_KV_GATHER_IDENTITY_BUF_SHARDED_GFX1201_SRC: &str =
+    include_str!("../../../kernels/src/deepseek4_topk_kv_gather_identity_buf_sharded.gfx1201.hip");
 
 /// HIP-graphs-safe variant of swa_ring_write_f32: reads `slot` from a
 /// device buffer instead of an i32 kernarg, so the captured kernel
@@ -5527,6 +5531,8 @@ pub const V4F_TOPK_KV_GATHER_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/deepseek4_topk_kv_gather_batched.hip");
 pub const V4F_TOPK_KV_GATHER_BATCHED_TILED_GFX1201_SRC: &str =
     include_str!("../../../kernels/src/deepseek4_topk_kv_gather_batched_tiled.gfx1201.hip");
+pub const V4F_TOPK_KV_GATHER_BATCHED_TILED_SHARDED_GFX1201_SRC: &str =
+    include_str!("../../../kernels/src/deepseek4_topk_kv_gather_batched_tiled_sharded.gfx1201.hip");
 
 /// DeepSeek V4 indexer score — BATCHED (Phase B2, 2026-05-18). Per-batch
 /// score against the shared compressed-K cache.
@@ -5541,6 +5547,8 @@ pub const INDEXER_RELU_SCORE_WMMA_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/indexer_relu_score_wmma_batched.hip");
 pub const INDEXER_RELU_SCORE_WMMA_BATCHED_GFX12_SRC: &str =
     include_str!("../../../kernels/src/indexer_relu_score_wmma_batched.gfx12.hip");
+pub const INDEXER_RELU_SCORE_WMMA_BATCHED_SHARDED_GFX1201_SRC: &str =
+    include_str!("../../../kernels/src/indexer_relu_score_wmma_batched_sharded.gfx1201.hip");
 
 /// gfx1151 DeepSeek V4 indexer score with one cooperative LDS-staged K tile
 /// shared by the four WMMA warps in each block.
@@ -5566,6 +5574,9 @@ pub const SWA_RING_WRITE_BATCHED_SRC: &str =
 /// batch row's slab.
 pub const V4F_TOPK_KV_GATHER_IDENTITY_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/deepseek4_topk_kv_gather_identity_batched.hip");
+pub const V4F_TOPK_KV_GATHER_IDENTITY_BATCHED_SHARDED_GFX1201_SRC: &str = include_str!(
+    "../../../kernels/src/deepseek4_topk_kv_gather_identity_batched_sharded.gfx1201.hip"
+);
 
 /// DeepSeek V4 per-group O-LoRA batched GEMV — F32 (Phase B2, 2026-05-18).
 /// Block-diagonal: wo_a[G, M, K] @ x_in[B, G, K] → y_out[B, G, M].
@@ -5706,6 +5717,12 @@ pub const COMPRESSOR_OVERLAP_CONCAT_SRC: &str =
 
 pub const INDEXER_RELU_SCORE_BUF_SRC: &str =
     include_str!("../../../kernels/src/indexer_relu_score_buf.hip");
+pub const INDEXER_RELU_SCORE_BUF_SHARDED_GFX1201_SRC: &str =
+    include_str!("../../../kernels/src/indexer_relu_score_buf_sharded.gfx1201.hip");
+pub const DEEPSEEK4_COMPRESSOR_CACHE_F16_GFX1201_SRC: &str =
+    include_str!("../../../kernels/src/deepseek4_compressor_cache_f16.gfx1201.hip");
+pub const DEEPSEEK4_COMPRESSOR_COMMIT_STAGED_F16_GFX1201_SRC: &str =
+    include_str!("../../../kernels/src/compressor_commit_staged_f16.gfx1201.hip");
 
 /// DeepSeek V4 batched indexer-extended SWA attention (Phase A1, 2026-05-18).
 /// Processes B query positions in parallel via grid dim Y. Each batch
@@ -5752,6 +5769,11 @@ pub const INDEXER_TOP_K_BATCHED_SRC: &str =
 /// the portable O(N^2) rank-count once N exceeds K during DS4 prefill.
 pub const INDEXER_TOP_K_BATCHED_BOUNDED_GFX1151_SRC: &str =
     include_str!("../../../kernels/src/indexer_top_k_batched_bounded.gfx1151.hip");
+
+/// gfx1201 exact bounded batched indexer top-K. Kept as a separate source and
+/// symbol so admitting RDNA4 cannot alter gfx1151's certified code object.
+pub const INDEXER_TOP_K_BATCHED_BOUNDED_GFX1201_SRC: &str =
+    include_str!("../../../kernels/src/indexer_top_k_batched_bounded.gfx1201.hip");
 
 /// HC 4-stream residual mix — BATCHED (Phase A5, 2026-05-18). Twin of
 /// HC_MIX_4STREAM_SRC; batch dim parallelizes cleanly across blockIdx.z.

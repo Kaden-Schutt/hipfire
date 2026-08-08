@@ -68,9 +68,10 @@ pub mod spec_impl;
 
 pub use arch::{DeepseekV4, DeepseekV4HeterogeneousFault, DeepseekV4HeterogeneousProjection};
 pub use deepseek4::{
-    config_from_safetensors, DeepseekV4Config, DeepseekV4DenseWeights,
-    DeepseekV4HeterogeneousWeights, DeepseekV4OwnershipAudit, DeepseekV4RoutedWeights,
-    DeepseekV4State, DeepseekV4Weights, IndexerLayerState, MainAttentionLayerState,
+    config_from_safetensors, CompressorCachePlacement, CompressorCacheShard, DeepseekV4Config,
+    DeepseekV4DenseWeights, DeepseekV4HeterogeneousWeights, DeepseekV4OwnershipAudit,
+    DeepseekV4RoutedWeights, DeepseekV4State, DeepseekV4Weights, IndexerLayerState,
+    MainAttentionLayerState,
 };
 pub use heterogeneous::{
     DeepseekV4HeterogeneousLoadPlan, DeepseekV4HeterogeneousLoadReport,

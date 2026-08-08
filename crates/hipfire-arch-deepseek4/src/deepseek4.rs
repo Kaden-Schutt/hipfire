@@ -31,6 +31,117 @@ pub type CompressRatio = u32;
 /// grow geometrically up to the checkpoint's advertised context horizon.
 pub const INITIAL_COMPRESSED_ROWS: usize = 2_048;
 
+/// Stable block-cyclic ownership for a tensor-parallel compressor cache.
+///
+/// Ownership is derived solely from the global compressed-row index, so VMM
+/// growth never moves an existing row between ranks. Contiguous blocks retain
+/// the compressor and gather kernels' coalesced row layout, while cycling
+/// blocks across ranks avoids concentrating every short-context row on rank 0.
+/// The 256-row block matches the exact gfx1201 B=1024 ratio-4 prefill quantum
+/// (and two B=512 quanta), keeping ordinary chunk commits owner-contiguous.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompressorCacheShard {
+    rank: usize,
+    world: usize,
+    block_rows: usize,
+}
+
+impl CompressorCacheShard {
+    pub const GFX1201_BLOCK_ROWS: usize = 256;
+
+    pub fn new(rank: usize, world: usize, block_rows: usize) -> Result<Self, String> {
+        if world < 2 {
+            return Err("DeepSeek V4 compressor sharding requires at least two ranks".to_string());
+        }
+        if rank >= world {
+            return Err(format!(
+                "DeepSeek V4 compressor shard rank {rank} is outside world {world}"
+            ));
+        }
+        if block_rows == 0 || !block_rows.is_power_of_two() {
+            return Err(format!(
+                "DeepSeek V4 compressor shard block_rows must be a nonzero power of two (got {block_rows})"
+            ));
+        }
+        Ok(Self {
+            rank,
+            world,
+            block_rows,
+        })
+    }
+
+    pub const fn rank(self) -> usize {
+        self.rank
+    }
+
+    pub const fn world(self) -> usize {
+        self.world
+    }
+
+    pub const fn block_rows(self) -> usize {
+        self.block_rows
+    }
+
+    pub fn owner(self, global_row: usize) -> usize {
+        (global_row / self.block_rows) % self.world
+    }
+
+    pub fn global_to_local(self, global_row: usize) -> Option<usize> {
+        let global_block = global_row / self.block_rows;
+        if global_block % self.world != self.rank {
+            return None;
+        }
+        Some((global_block / self.world) * self.block_rows + global_row % self.block_rows)
+    }
+
+    pub fn local_to_global(self, local_row: usize) -> usize {
+        let local_block = local_row / self.block_rows;
+        (local_block * self.world + self.rank) * self.block_rows + local_row % self.block_rows
+    }
+
+    /// Number of rows owned by this rank in the global prefix `[0, rows)`.
+    pub fn local_rows_for_prefix(self, rows: usize) -> usize {
+        let full_blocks = rows / self.block_rows;
+        let tail_rows = rows % self.block_rows;
+        let full_cycles = full_blocks / self.world;
+        let tail_owner = full_blocks % self.world;
+        let rank_full_blocks = full_cycles + usize::from(self.rank < tail_owner);
+        rank_full_blocks * self.block_rows
+            + if self.rank == tail_owner {
+                tail_rows
+            } else {
+                0
+            }
+    }
+}
+
+/// Physical placement of the long-lived compressor caches. Single-GPU and
+/// existing routes remain replicated. The sharded variant is admitted only by
+/// the exact gfx1201 TP orchestration after its cross-rank raw-bit identity
+/// gate has passed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CompressorCachePlacement {
+    #[default]
+    Replicated,
+    BlockCyclic(CompressorCacheShard),
+}
+
+impl CompressorCachePlacement {
+    pub fn local_rows(self, global_rows: usize) -> usize {
+        match self {
+            Self::Replicated => global_rows,
+            Self::BlockCyclic(shard) => shard.local_rows_for_prefix(global_rows),
+        }
+    }
+
+    pub fn global_to_local(self, global_row: usize) -> Option<usize> {
+        match self {
+            Self::Replicated => Some(global_row),
+            Self::BlockCyclic(shard) => shard.global_to_local(global_row),
+        }
+    }
+}
+
 /// State-owned compressed-cache sizing. This replaces the former
 /// process-global `HIPFIRE_DEEPSEEK4_MAX_COMPRESS_POS` value: capacity is a
 /// property of the loaded checkpoint/session, not ambient process state.
@@ -1416,7 +1527,8 @@ pub struct IndexerLayerState {
     pub compress_ratio: u32,
 
     // ── Main-attention compressor state (ratio > 0) ────────────────
-    /// Compressed KV cache `[max_compressed_pos, head_dim]` F32. Holds
+    /// Compressed KV cache `[max_compressed_pos, head_dim]`. F32 on existing
+    /// routes; F16 on the exact gfx1201 MQ2R TP3/TP4 long-context route. Holds
     /// gated-pooled compressed values at slot pos//ratio. Used by main
     /// attention's gather step to extend SWA window.
     pub main_kv_cache: Option<rdna_compute::GpuTensor>,
@@ -1430,9 +1542,14 @@ pub struct IndexerLayerState {
 
     // ── Indexer state (ratio == 4 only) ────────────────────────────
     /// Indexer-specific compressed KV cache `[max_compressed_pos, idx_head_dim]`
-    /// F32. Built by indexer's separate compressor. Used by Q · K_idx
-    /// scoring step.
+    /// Built by indexer's separate compressor. Uses the same storage dtype as
+    /// `main_kv_cache` and is converted to F32 by scoring kernels.
     pub indexer_kv_cache: Option<rdna_compute::GpuTensor>,
+    /// Exact gfx1201 TP peer table for block-cyclic compressor storage.
+    /// Entries are stable VMM reservation bases, not owning buffers.
+    pub main_kv_cache_shards: [usize; 4],
+    pub indexer_kv_cache_shards: [usize; 4],
+    pub cache_shard_count: usize,
     pub indexer_kv_state: Option<rdna_compute::GpuTensor>,
     pub indexer_score_state: Option<rdna_compute::GpuTensor>,
     /// Per-step indexer scratch:
@@ -1461,6 +1578,9 @@ pub struct IndexerLayerState {
     /// Concat scratch for overlap-pool   [2*ratio, head_dim] F32.
     pub comp_concat_kv: Option<rdna_compute::GpuTensor>,
     pub comp_concat_score: Option<rdna_compute::GpuTensor>,
+    /// One-row F32 commit stage. F16 cache routes perform pool, RMSNorm, and
+    /// RoPE here, then round once at the final cache store.
+    pub comp_cache_row_f32: Option<rdna_compute::GpuTensor>,
 }
 
 /// Per-layer scratch for the main attention path's gathered K/V rows.
@@ -1533,6 +1653,20 @@ pub struct DeepseekV4State {
     /// horizon follows `max_position_embeddings`; the active launch/scratch
     /// bucket grows automatically at request boundaries.
     pub compressor_capacity: CompressorCapacityPlan,
+
+    /// Rank-local physical ownership for the long-lived main/indexer
+    /// compressor caches. Small recurrent rings remain replicated.
+    pub compressor_cache_placement: CompressorCachePlacement,
+
+    /// Storage dtype for the two long-lived compressor caches only. All
+    /// compressor arithmetic, score reductions, recurrent rings, and scratch
+    /// remain F32.
+    pub compressor_cache_dtype: rdna_compute::DType,
+
+    /// Physical device ids granted read/write access to every sharded VMM
+    /// cache reservation. Empty on replicated and single-GPU routes.
+    pub compressor_cache_access_devices: [i32; 4],
+    pub compressor_cache_access_count: usize,
 
     /// Per-layer (43 + 1 MTP = 44). Layers with `compress_ratio == 0`
     /// skip the indexer.
@@ -1690,7 +1824,7 @@ pub struct DeepseekV4State {
     /// as `pos_array_host`: captured memcpy nodes re-read this pointer
     /// on each graph replay and find the values written for the current
     /// position.
-    pub attn_state_host: Option<Box<[i32; 10]>>,
+    pub attn_state_host: Option<Box<[i32; 12]>>,
 
     /// Per-token attention output `[hidden]` F32, fed to HC attn mix
     /// as the `transform_out` arg. Currently a stub: holds a sliced
@@ -1882,6 +2016,9 @@ impl DeepseekV4State {
                 main_kv_state: None,
                 main_score_state: None,
                 indexer_kv_cache: None,
+                main_kv_cache_shards: [0; 4],
+                indexer_kv_cache_shards: [0; 4],
+                cache_shard_count: 0,
                 indexer_kv_state: None,
                 indexer_score_state: None,
                 q_idx: None,
@@ -1894,6 +2031,7 @@ impl DeepseekV4State {
                 comp_score_buf: None,
                 comp_concat_kv: None,
                 comp_concat_score: None,
+                comp_cache_row_f32: None,
             });
             attention.push(MainAttentionLayerState {
                 swa_k: None,
@@ -1906,6 +2044,10 @@ impl DeepseekV4State {
         }
         Ok(DeepseekV4State {
             compressor_capacity: CompressorCapacityPlan::new(cfg.max_position_embeddings)?,
+            compressor_cache_placement: CompressorCachePlacement::Replicated,
+            compressor_cache_dtype: rdna_compute::DType::F32,
+            compressor_cache_access_devices: [0; 4],
+            compressor_cache_access_count: 0,
             _indexer: indexer,
             _attention: attention,
             residual_streams: None, // allocated on first `decode_step` (needs Gpu).
@@ -2088,6 +2230,7 @@ impl DeepseekV4State {
             z(gpu, &l.comp_score_buf);
             z(gpu, &l.comp_concat_kv);
             z(gpu, &l.comp_concat_score);
+            z(gpu, &l.comp_cache_row_f32);
         }
         for l in &self._attention {
             z(gpu, &l.swa_k);
@@ -2144,6 +2287,7 @@ impl DeepseekV4State {
             free_opt(gpu, &mut l.comp_score_buf);
             free_opt(gpu, &mut l.comp_concat_kv);
             free_opt(gpu, &mut l.comp_concat_score);
+            free_opt(gpu, &mut l.comp_cache_row_f32);
         }
         for mut l in self._attention.drain(..) {
             free_opt(gpu, &mut l.swa_k);
@@ -2251,6 +2395,56 @@ mod tests {
         plan.mark_prepared(12);
         assert_eq!(plan.prepared_tokens(), 73);
         assert!(CompressorCapacityPlan::new(0).is_err());
+    }
+
+    #[test]
+    fn compressor_cache_shards_are_stable_complete_and_balanced() {
+        const WORLD: usize = 3;
+        const BLOCK: usize = CompressorCacheShard::GFX1201_BLOCK_ROWS;
+        let shards: Vec<_> = (0..WORLD)
+            .map(|rank| CompressorCacheShard::new(rank, WORLD, BLOCK).unwrap())
+            .collect();
+
+        for rows in [1, 255, 256, 257, 2_048, 32_768, 262_144] {
+            let local_rows: Vec<_> = shards
+                .iter()
+                .map(|shard| shard.local_rows_for_prefix(rows))
+                .collect();
+            assert_eq!(local_rows.iter().sum::<usize>(), rows);
+            assert!(
+                local_rows.iter().max().unwrap() - local_rows.iter().min().unwrap() <= BLOCK,
+                "rows={rows}, local_rows={local_rows:?}"
+            );
+
+            for global_row in 0..rows {
+                let owner = shards[0].owner(global_row);
+                let local_row = shards[owner]
+                    .global_to_local(global_row)
+                    .expect("owner must map its global row");
+                assert!(local_row < local_rows[owner]);
+                assert_eq!(shards[owner].local_to_global(local_row), global_row);
+                for (rank, shard) in shards.iter().enumerate() {
+                    assert_eq!(shard.global_to_local(global_row).is_some(), rank == owner);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn compressor_cache_shard_ownership_does_not_move_when_prefix_grows() {
+        let shard =
+            CompressorCacheShard::new(1, 3, CompressorCacheShard::GFX1201_BLOCK_ROWS).unwrap();
+        let before: Vec<_> = (0..8_192)
+            .filter_map(|global| shard.global_to_local(global).map(|local| (global, local)))
+            .collect();
+        assert!(shard.local_rows_for_prefix(262_144) > shard.local_rows_for_prefix(8_192));
+        for (global, local) in before {
+            assert_eq!(shard.global_to_local(global), Some(local));
+        }
+        assert!(CompressorCacheShard::new(0, 1, 256).is_err());
+        assert!(CompressorCacheShard::new(3, 3, 256).is_err());
+        assert!(CompressorCacheShard::new(0, 3, 0).is_err());
+        assert!(CompressorCacheShard::new(0, 3, 192).is_err());
     }
 
     const DEEPSEEK4_CONFIG_JSON: &str = r#"{

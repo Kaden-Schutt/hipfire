@@ -1786,26 +1786,34 @@ fn attention_input_e8_pack_b3(
 ///     applies tail RoPE with cfg.compress_rope_theta;
 ///     targets `state._indexer[l].indexer_*`
 ///
+fn compressor_cache_uses_vmm(gpu: &Gpu) -> bool {
+    // Keep this model-owned route chip-strict. gfx1100 and every other
+    // architecture retain the existing dense grow-and-copy fallback.
+    gpu.arch_caps.is_gfx1151() || gpu.arch_caps.is_gfx1201()
+}
+
 fn ensure_cache_tensor_rows(
     gpu: &mut Gpu,
     slot: &mut Option<GpuTensor>,
     logical_rows: usize,
     required_rows: usize,
     row_elems: usize,
+    dtype: DType,
+    access_devices: &[i32],
     label: &str,
 ) -> Result<bool, String> {
     let required_rows = required_rows.min(logical_rows).max(1);
-    let use_vmm = gpu.arch == "gfx1151";
+    let use_vmm = compressor_cache_uses_vmm(gpu);
     let mut changed = false;
 
     if slot.is_none() {
         let tensor = if use_vmm {
             // Reserve the model horizon but map nothing until the request
             // preflight below computes the needed prefix.
-            unsafe { gpu.alloc_vmm_tensor(&[logical_rows, row_elems], DType::F32, 0, &[]) }
+            unsafe { gpu.alloc_vmm_tensor(&[logical_rows, row_elems], dtype, 0, access_devices) }
                 .map_err(|e| format!("reserve VMM {label}: {e:?}"))?
         } else {
-            gpu.zeros(&[required_rows, row_elems], DType::F32)
+            gpu.zeros(&[required_rows, row_elems], dtype)
                 .map_err(|e| format!("alloc {label}: {e:?}"))?
         };
         *slot = Some(tensor);
@@ -1818,7 +1826,7 @@ fn ensure_cache_tensor_rows(
             .vmm_granularity(tensor)
             .ok_or_else(|| format!("{label}: VMM allocation has no granularity"))?;
         let row_bytes = row_elems
-            .checked_mul(std::mem::size_of::<f32>())
+            .checked_mul(dtype.size())
             .ok_or_else(|| format!("{label}: row-byte overflow"))?;
         let plan = hipfire_runtime::kv_backend::KvChunkPlan::new(
             row_bytes,
@@ -1832,7 +1840,7 @@ fn ensure_cache_tensor_rows(
             .growth(mapped, required_rows)
             .map_err(|e| format!("{label}: VMM growth: {e}"))?
         {
-            gpu.grow_vmm_tensor(tensor, growth.size_bytes, &[])
+            gpu.grow_vmm_tensor(tensor, growth.size_bytes, access_devices)
                 .map_err(|e| format!("map VMM {label}: {e:?}"))?;
             changed = true;
         }
@@ -1843,10 +1851,10 @@ fn ensure_cache_tensor_rows(
         return Ok(changed);
     }
 
-    // Non-gfx1151 fallback: preserve cache contents while growing the dense
-    // allocation. gfx1151 never takes this pointer-changing path.
+    // Fallback for architectures without a certified DS4 VMM route: preserve
+    // cache contents while growing the pointer-changing dense allocation.
     let replacement = gpu
-        .zeros(&[required_rows, row_elems], DType::F32)
+        .zeros(&[required_rows, row_elems], dtype)
         .map_err(|e| format!("grow {label}: {e:?}"))?;
     let copy_bytes = tensor.byte_size();
     gpu.hip
@@ -1925,13 +1933,14 @@ fn cache_growth_bytes(
     logical_rows: usize,
     required_rows: usize,
     row_elems: usize,
+    dtype: DType,
     default_granularity: usize,
     label: &str,
 ) -> Result<usize, String> {
     let row_bytes = row_elems
-        .checked_mul(std::mem::size_of::<f32>())
+        .checked_mul(dtype.size())
         .ok_or_else(|| format!("{label}: row-byte overflow"))?;
-    if gpu.arch != "gfx1151" {
+    if !compressor_cache_uses_vmm(gpu) {
         return match slot {
             Some(tensor) if tensor.shape.first().copied().unwrap_or(0) >= required_rows => Ok(0),
             _ => required_rows
@@ -1960,8 +1969,8 @@ fn cache_growth_bytes(
 
 /// Refuse a growth request before mutating any cache allocation when its
 /// complete physical footprint cannot fit. This keeps the session retryable
-/// (for example with quantized KV) instead of leaving a partially mapped F32
-/// cache after a late-layer allocation failure.
+/// with a smaller request or lower-precision cache instead of leaving a
+/// partially mapped cache after a late-layer allocation failure.
 fn admit_compressor_growth(
     cfg: &DeepseekV4Config,
     state: &DeepseekV4State,
@@ -1973,9 +1982,9 @@ fn admit_compressor_growth(
     let prepared_target = state
         .compressor_capacity
         .prepared_target_for_tokens(required_tokens)?;
-    let default_granularity = if gpu.arch == "gfx1151" {
+    let default_granularity = if compressor_cache_uses_vmm(gpu) {
         gpu.vmm_recommended_granularity()
-            .map_err(|e| format!("query gfx1151 VMM granularity: {e:?}"))?
+            .map_err(|e| format!("query {} VMM granularity: {e:?}", gpu.arch))?
     } else {
         1
     };
@@ -1988,14 +1997,20 @@ fn admit_compressor_growth(
         }
         let logical_rows = state.compressor_capacity.max_tokens().div_ceil(ratio);
         let required_layer_rows = prepared_target.div_ceil(ratio).max(1);
+        let local_logical_rows = state.compressor_cache_placement.local_rows(logical_rows);
+        let local_required_rows = state
+            .compressor_cache_placement
+            .local_rows(required_layer_rows)
+            .max(1);
         checked_add_growth(
             &mut growth_bytes,
             cache_growth_bytes(
                 gpu,
                 &layer.main_kv_cache,
-                logical_rows,
-                required_layer_rows,
+                local_logical_rows,
+                local_required_rows,
                 cfg.head_dim,
+                state.compressor_cache_dtype,
                 default_granularity,
                 &format!("main_kv_cache l{layer_idx}"),
             )?,
@@ -2007,9 +2022,10 @@ fn admit_compressor_growth(
                 cache_growth_bytes(
                     gpu,
                     &layer.indexer_kv_cache,
-                    logical_rows,
-                    required_layer_rows,
+                    local_logical_rows,
+                    local_required_rows,
                     cfg.index_head_dim,
+                    state.compressor_cache_dtype,
                     default_granularity,
                     &format!("indexer_kv_cache l{layer_idx}"),
                 )?,
@@ -2056,7 +2072,8 @@ fn admit_compressor_growth(
         .ok_or_else(|| "DeepSeek V4 admission-byte overflow".to_string())?;
     if required_with_headroom > free_bytes {
         return Err(format!(
-            "DeepSeek V4 F32 compressed cache cannot admit {required_tokens} tokens atomically: growth {:.2} GiB + {:.2} GiB headroom exceeds {:.2} GiB free ({:.2} GiB addressable); use quantized KV or a shorter request",
+            "DeepSeek V4 {:?} compressed cache cannot admit {required_tokens} tokens atomically: growth {:.2} GiB + {:.2} GiB headroom exceeds {:.2} GiB free ({:.2} GiB addressable); use a lower-precision compressor cache or a shorter request",
+            state.compressor_cache_dtype,
             growth_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
             COMPRESSOR_GROWTH_HEADROOM_BYTES as f64 / (1024.0 * 1024.0 * 1024.0),
             free_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
@@ -2083,6 +2100,9 @@ pub fn ensure_compressor_capacity(
     let active_rows = next_plan.active_rows();
     let prepared_target = next_plan.prepared_target_for_tokens(required_tokens)?;
     let mut layout_grew = bucket_grew;
+    let access_devices =
+        &state.compressor_cache_access_devices[..state.compressor_cache_access_count];
+    let placement = state.compressor_cache_placement;
 
     for (layer_idx, layer) in state._indexer.iter_mut().enumerate() {
         let ratio = layer.compress_ratio as usize;
@@ -2091,21 +2111,27 @@ pub fn ensure_compressor_capacity(
         }
         let logical_rows = next_plan.max_tokens().div_ceil(ratio);
         let required_layer_rows = prepared_target.div_ceil(ratio).max(1);
+        let local_logical_rows = placement.local_rows(logical_rows);
+        let local_required_rows = placement.local_rows(required_layer_rows).max(1);
         layout_grew |= ensure_cache_tensor_rows(
             gpu,
             &mut layer.main_kv_cache,
-            logical_rows,
-            required_layer_rows,
+            local_logical_rows,
+            local_required_rows,
             cfg.head_dim,
+            state.compressor_cache_dtype,
+            access_devices,
             &format!("main_kv_cache l{layer_idx}"),
         )?;
         if ratio == 4 {
             layout_grew |= ensure_cache_tensor_rows(
                 gpu,
                 &mut layer.indexer_kv_cache,
-                logical_rows,
-                required_layer_rows,
+                local_logical_rows,
+                local_required_rows,
                 cfg.index_head_dim,
+                state.compressor_cache_dtype,
+                access_devices,
                 &format!("indexer_kv_cache l{layer_idx}"),
             )?;
             layout_grew |= ensure_indexer_scratch_rows(gpu, layer, active_rows, layer_idx)?;
@@ -2143,6 +2169,83 @@ pub fn ensure_request_capacity(
     let scratch_grew = pbs.ensure_idx_score_capacity(gpu, target_rows)?;
     let cache_grew = ensure_compressor_capacity(cfg, state, gpu, required_tokens)?;
     Ok(scratch_grew || cache_grew)
+}
+
+fn refresh_compressor_cache_shard_tables(states: &mut [DeepseekV4State]) -> Result<(), String> {
+    let world = states.len();
+    if !matches!(world, 3 | 4) {
+        return Err(format!(
+            "DeepSeek V4 compressor shard table requires TP3/TP4 (got TP{world})"
+        ));
+    }
+    if states.iter().all(|state| {
+        matches!(
+            state.compressor_cache_placement,
+            crate::deepseek4::CompressorCachePlacement::Replicated
+        )
+    }) {
+        for state in states.iter_mut() {
+            for layer in &mut state._indexer {
+                layer.main_kv_cache_shards = [0; 4];
+                layer.indexer_kv_cache_shards = [0; 4];
+                layer.cache_shard_count = 0;
+            }
+        }
+        return Ok(());
+    }
+    for (rank, state) in states.iter().enumerate() {
+        let crate::deepseek4::CompressorCachePlacement::BlockCyclic(shard) =
+            state.compressor_cache_placement
+        else {
+            return Err(format!(
+                "DeepSeek V4 compressor shard table rank {rank} is not block-cyclic"
+            ));
+        };
+        if shard.rank() != rank || shard.world() != world {
+            return Err(format!(
+                "DeepSeek V4 compressor shard topology mismatch at rank {rank}: placement={shard:?}, world={world}"
+            ));
+        }
+    }
+
+    let n_layers = states[0]._indexer.len();
+    if states.iter().any(|state| state._indexer.len() != n_layers) {
+        return Err("DeepSeek V4 compressor shard layer-count mismatch".to_string());
+    }
+    for layer_idx in 0..n_layers {
+        let ratio = states[0]._indexer[layer_idx].compress_ratio;
+        if ratio == 0 {
+            continue;
+        }
+        let mut main_ptrs = [0usize; 4];
+        let mut indexer_ptrs = [0usize; 4];
+        for rank in 0..world {
+            let layer = &states[rank]._indexer[layer_idx];
+            main_ptrs[rank] = layer
+                .main_kv_cache
+                .as_ref()
+                .ok_or_else(|| format!("TP{world} rank {rank} main cache missing l{layer_idx}"))?
+                .buf
+                .as_ptr() as usize;
+            if ratio == 4 {
+                indexer_ptrs[rank] = layer
+                    .indexer_kv_cache
+                    .as_ref()
+                    .ok_or_else(|| {
+                        format!("TP{world} rank {rank} indexer cache missing l{layer_idx}")
+                    })?
+                    .buf
+                    .as_ptr() as usize;
+            }
+        }
+        for state in states.iter_mut() {
+            let layer = &mut state._indexer[layer_idx];
+            layer.main_kv_cache_shards = main_ptrs;
+            layer.indexer_kv_cache_shards = indexer_ptrs;
+            layer.cache_shard_count = world;
+        }
+    }
+    Ok(())
 }
 
 #[allow(dead_code, clippy::too_many_arguments)]
@@ -2325,10 +2428,21 @@ fn compressor_forward_impl(
     };
 
     let max_compressed = state.compressor_capacity.active_rows();
+    let local_max_compressed = state
+        .compressor_cache_placement
+        .local_rows(max_compressed)
+        .max(1);
+    let compressor_cache_dtype = state.compressor_cache_dtype;
 
     // Lazy-allocate state buffers per (layer, compressor-type).
     {
         let l_state = &mut state._indexer[layer_idx];
+        if compressor_cache_dtype == DType::F16 && l_state.comp_cache_row_f32.is_none() {
+            l_state.comp_cache_row_f32 = Some(
+                gpu.zeros(&[cfg.head_dim], DType::F32)
+                    .map_err(|e| format!("alloc comp cache staging row l{layer_idx}: {e:?}"))?,
+            );
+        }
         if is_indexer {
             if l_state.indexer_kv_state.is_none() {
                 l_state.indexer_kv_state = Some(
@@ -2347,7 +2461,7 @@ fn compressor_forward_impl(
             }
             if l_state.indexer_kv_cache.is_none() {
                 l_state.indexer_kv_cache = Some(
-                    gpu.zeros(&[max_compressed, head_dim], DType::F32)
+                    gpu.zeros(&[local_max_compressed, head_dim], compressor_cache_dtype)
                         .map_err(|e| format!("alloc idx kv_cache l{layer_idx}: {e:?}"))?,
                 );
             }
@@ -2368,7 +2482,7 @@ fn compressor_forward_impl(
             }
             if l_state.main_kv_cache.is_none() {
                 l_state.main_kv_cache = Some(
-                    gpu.zeros(&[max_compressed, head_dim], DType::F32)
+                    gpu.zeros(&[local_max_compressed, head_dim], compressor_cache_dtype)
                         .map_err(|e| format!("alloc main kv_cache l{layer_idx}: {e:?}"))?,
                 );
             }
@@ -2594,14 +2708,15 @@ fn compressor_forward_impl(
                 "comp l{layer_idx}: attn_state_buf missing (precompute_attn_state must run first)"
             )
         })?;
-        let (ring_off, commit_off) = if ratio == 4 {
-            (6usize, 7usize)
+        let (ring_off, commit_off, shift_off) = if ratio == 4 {
+            (6usize, 7usize, 10usize)
         } else {
-            (8usize, 9usize)
+            (8usize, 9usize, 11usize)
         };
         Some((
             attn_buf.sub_offset(ring_off, 1),
             attn_buf.sub_offset(commit_off, 1),
+            attn_buf.sub_offset(shift_off, 1),
         ))
     };
 
@@ -2625,50 +2740,94 @@ fn compressor_forward_impl(
         if !should_compress {
             return Ok(());
         }
-        let compressed_slot = pos / ratio;
-        if compressed_slot >= max_compressed {
+        let global_compressed_slot = pos / ratio;
+        if global_compressed_slot >= max_compressed {
             return Ok(());
         }
-        let kv_cache_slot = kv_cache.sub_offset(compressed_slot * head_dim, head_dim);
+        let local_compressed_slot = state
+            .compressor_cache_placement
+            .global_to_local(global_compressed_slot);
 
-        if overlap {
-            let concat_kv = l_state.comp_concat_kv.as_ref().unwrap();
-            let concat_score = l_state.comp_concat_score.as_ref().unwrap();
-            gpu.compressor_overlap_concat_f32(kv_state, concat_kv, ratio as i32, head_dim as i32)
+        // Long-lived cache storage is owner-only on the exact gfx1201 TP
+        // route. The compressor rings below remain replicated and therefore
+        // shift on every rank even when this rank does not own the cache row.
+        if let Some(compressed_slot) = local_compressed_slot {
+            let kv_cache_slot = kv_cache.sub_offset(compressed_slot * head_dim, head_dim);
+            let cache_is_f16 = kv_cache.dtype == DType::F16;
+            let commit_stage;
+            let commit_f32 = if cache_is_f16 {
+                commit_stage = l_state
+                    .comp_cache_row_f32
+                    .as_ref()
+                    .ok_or_else(|| format!("comp F16 staging row missing l{layer_idx}"))?
+                    .sub_offset(0, head_dim);
+                &commit_stage
+            } else {
+                &kv_cache_slot
+            };
+
+            if overlap {
+                let concat_kv = l_state.comp_concat_kv.as_ref().unwrap();
+                let concat_score = l_state.comp_concat_score.as_ref().unwrap();
+                gpu.compressor_overlap_concat_f32(
+                    kv_state,
+                    concat_kv,
+                    ratio as i32,
+                    head_dim as i32,
+                )
                 .map_err(|e| format!("comp concat_kv l{layer_idx}: {e:?}"))?;
-            gpu.compressor_overlap_concat_f32(
-                score_state,
-                concat_score,
-                ratio as i32,
-                head_dim as i32,
-            )
-            .map_err(|e| format!("comp concat_score l{layer_idx}: {e:?}"))?;
-            comp_dbg(&*gpu, "concat_kv", concat_kv, 2 * ratio * head_dim);
-            comp_dbg(&*gpu, "concat_score", concat_score, 2 * ratio * head_dim);
-            gpu.compressor_softmax_pool_f32(
-                concat_kv,
-                concat_score,
-                &kv_cache_slot,
-                (2 * ratio) as i32,
-                head_dim as i32,
-            )
-            .map_err(|e| format!("comp pool l{layer_idx}: {e:?}"))?;
-        } else {
-            gpu.compressor_softmax_pool_f32(
-                kv_state,
-                score_state,
-                &kv_cache_slot,
-                ratio as i32,
-                head_dim as i32,
-            )
-            .map_err(|e| format!("comp pool no-overlap l{layer_idx}: {e:?}"))?;
-        }
-        comp_dbg(&*gpu, "kv_cache(pool)", &kv_cache_slot, head_dim);
-        gpu.rmsnorm_f32(&kv_cache_slot, norm, &kv_cache_slot, cfg.rms_norm_eps)
-            .map_err(|e| format!("comp rmsnorm l{layer_idx}: {e:?}"))?;
-        comp_dbg(&*gpu, "kv_cache(rmsnorm)", &kv_cache_slot, head_dim);
-        if do_rope {
-            if is_indexer {
+                gpu.compressor_overlap_concat_f32(
+                    score_state,
+                    concat_score,
+                    ratio as i32,
+                    head_dim as i32,
+                )
+                .map_err(|e| format!("comp concat_score l{layer_idx}: {e:?}"))?;
+                comp_dbg(&*gpu, "concat_kv", concat_kv, 2 * ratio * head_dim);
+                comp_dbg(&*gpu, "concat_score", concat_score, 2 * ratio * head_dim);
+                gpu.compressor_softmax_pool_f32(
+                    concat_kv,
+                    concat_score,
+                    commit_f32,
+                    (2 * ratio) as i32,
+                    head_dim as i32,
+                )
+                .map_err(|e| format!("comp pool l{layer_idx}: {e:?}"))?;
+            } else {
+                gpu.compressor_softmax_pool_f32(
+                    kv_state,
+                    score_state,
+                    commit_f32,
+                    ratio as i32,
+                    head_dim as i32,
+                )
+                .map_err(|e| format!("comp pool no-overlap l{layer_idx}: {e:?}"))?;
+            }
+            comp_dbg(&*gpu, "kv_cache(pool)", commit_f32, head_dim);
+            gpu.rmsnorm_f32(commit_f32, norm, commit_f32, cfg.rms_norm_eps)
+                .map_err(|e| format!("comp rmsnorm l{layer_idx}: {e:?}"))?;
+            comp_dbg(&*gpu, "kv_cache(rmsnorm)", commit_f32, head_dim);
+            if do_rope && cache_is_f16 {
+                let commit_slot_buf = state
+                    .attn_state_buf
+                    .as_ref()
+                    .ok_or_else(|| format!("comp l{layer_idx}: attn_state_buf missing"))?
+                    .sub_offset(if ratio == 4 { 7 } else { 9 }, 1);
+                gpu.rope_tail_yarn_interleaved_staged_buf_gfx1201(
+                    commit_f32,
+                    &pos_buf,
+                    &commit_slot_buf,
+                    head_dim as i32,
+                    cfg.qk_rope_head_dim as i32,
+                    freq_base,
+                    freq_scale,
+                    ext_factor,
+                    attn_factor,
+                    corr_low,
+                    corr_high,
+                )
+                .map_err(|e| format!("comp staged rope l{layer_idx}: {e:?}"))?;
+            } else if do_rope && is_indexer {
                 // Use the same device-slot-driven symbol as capture/replay.
                 // The separate plain-RoPE symbol rounds differently on gfx1151
                 // despite equivalent algebra, poisoning future indexer state
@@ -2692,7 +2851,7 @@ fn compressor_forward_impl(
                     0.0,
                 )
                 .map_err(|e| format!("comp rope slot l{layer_idx}: {e:?}"))?;
-            } else {
+            } else if do_rope {
                 gpu.rope_tail_yarn_interleaved(
                     weights.mq2r_backend.is_gfx1151(),
                     &kv_cache_slot,
@@ -2712,8 +2871,12 @@ fn compressor_forward_impl(
                 )
                 .map_err(|e| format!("comp main rope l{layer_idx}: {e:?}"))?;
             }
+            comp_dbg(&*gpu, "kv_cache(rope)", commit_f32, head_dim);
+            if cache_is_f16 {
+                gpu.cast_f32_to_f16(commit_f32, &kv_cache_slot)
+                    .map_err(|e| format!("comp cache f16 store l{layer_idx}: {e:?}"))?;
+            }
         }
-        comp_dbg(&*gpu, "kv_cache(rope)", &kv_cache_slot, head_dim);
         if overlap {
             let shift_bytes = ratio * proj_dim * 4;
             let src_view = kv_state.sub_offset(ratio * proj_dim, ratio * proj_dim);
@@ -2729,7 +2892,7 @@ fn compressor_forward_impl(
     }
 
     // ---- Decode / graph-captured path (state-buffer-driven slots) ----
-    let (ring_slot_buf, commit_slot_buf) =
+    let (ring_slot_buf, commit_slot_buf, shift_slot_buf) =
         attn_buf_view.expect("attn_buf_view populated when !pre_batched.is_some()");
 
     // Ring write — unconditional within graph, no-op on -1 sentinel.
@@ -2764,6 +2927,18 @@ fn compressor_forward_impl(
 
     // Compress event — concat (overlap only) is unconditional within graph;
     // pool/rmsnorm/rope/shift all sentinel-gate on commit_slot_buf.
+    let cache_is_f16 = kv_cache.dtype == DType::F16;
+    let commit_stage;
+    let commit_f32 = if cache_is_f16 {
+        commit_stage = l_state
+            .comp_cache_row_f32
+            .as_ref()
+            .ok_or_else(|| format!("comp F16 staging row missing l{layer_idx}"))?
+            .sub_offset(0, head_dim);
+        &commit_stage
+    } else {
+        kv_cache
+    };
     if overlap {
         let concat_kv = l_state.comp_concat_kv.as_ref().unwrap();
         let concat_score = l_state.comp_concat_score.as_ref().unwrap();
@@ -2773,25 +2948,49 @@ fn compressor_forward_impl(
             .map_err(|e| format!("comp concat_score l{layer_idx}: {e:?}"))?;
         comp_dbg(&*gpu, "concat_kv", concat_kv, 2 * ratio * head_dim);
         comp_dbg(&*gpu, "concat_score", concat_score, 2 * ratio * head_dim);
-        gpu.compressor_softmax_pool_f32_buf(
-            concat_kv,
-            concat_score,
-            kv_cache,
-            &commit_slot_buf,
-            (2 * ratio) as i32,
-            head_dim as i32,
-        )
-        .map_err(|e| format!("comp pool buf l{layer_idx}: {e:?}"))?;
+        if cache_is_f16 {
+            gpu.compressor_softmax_pool_f32_staged_buf_gfx1201(
+                concat_kv,
+                concat_score,
+                commit_f32,
+                &commit_slot_buf,
+                (2 * ratio) as i32,
+                head_dim as i32,
+            )
+            .map_err(|e| format!("comp pool staged buf l{layer_idx}: {e:?}"))?;
+        } else {
+            gpu.compressor_softmax_pool_f32_buf(
+                concat_kv,
+                concat_score,
+                kv_cache,
+                &commit_slot_buf,
+                (2 * ratio) as i32,
+                head_dim as i32,
+            )
+            .map_err(|e| format!("comp pool buf l{layer_idx}: {e:?}"))?;
+        }
     } else {
-        gpu.compressor_softmax_pool_f32_buf(
-            kv_state,
-            score_state,
-            kv_cache,
-            &commit_slot_buf,
-            ratio as i32,
-            head_dim as i32,
-        )
-        .map_err(|e| format!("comp pool buf no-overlap l{layer_idx}: {e:?}"))?;
+        if cache_is_f16 {
+            gpu.compressor_softmax_pool_f32_staged_buf_gfx1201(
+                kv_state,
+                score_state,
+                commit_f32,
+                &commit_slot_buf,
+                ratio as i32,
+                head_dim as i32,
+            )
+            .map_err(|e| format!("comp pool staged buf no-overlap l{layer_idx}: {e:?}"))?;
+        } else {
+            gpu.compressor_softmax_pool_f32_buf(
+                kv_state,
+                score_state,
+                kv_cache,
+                &commit_slot_buf,
+                ratio as i32,
+                head_dim as i32,
+            )
+            .map_err(|e| format!("comp pool buf no-overlap l{layer_idx}: {e:?}"))?;
+        }
     }
     // Debug-only view of the row this position commits into. Built lazily
     // and bounds-checked on purpose: once `pos / ratio >= max_compressed`
@@ -2807,50 +3006,97 @@ fn compressor_forward_impl(
         if !comp_dump_here {
             return;
         }
-        let slot = pos / ratio;
-        if slot >= max_compressed {
+        let global_slot = pos / ratio;
+        if global_slot >= max_compressed {
             return;
         }
-        comp_dbg(
-            gpu,
-            name,
-            &kv_cache.sub_offset(slot * head_dim, head_dim),
-            head_dim,
-        );
+        let Some(slot) = state
+            .compressor_cache_placement
+            .global_to_local(global_slot)
+        else {
+            return;
+        };
+        if cache_is_f16 {
+            comp_dbg(gpu, name, commit_f32, head_dim);
+        } else {
+            comp_dbg(
+                gpu,
+                name,
+                &kv_cache.sub_offset(slot * head_dim, head_dim),
+                head_dim,
+            );
+        }
     };
     comp_dbg_commit_row(&*gpu, "kv_cache(pool)");
-    gpu.rmsnorm_f32_at_slot_buf(
-        kv_cache,
-        norm,
-        &commit_slot_buf,
-        head_dim as i32,
-        cfg.rms_norm_eps,
-    )
-    .map_err(|e| format!("comp rmsnorm buf l{layer_idx}: {e:?}"))?;
-    comp_dbg_commit_row(&*gpu, "kv_cache(rmsnorm)");
-    if do_rope {
-        gpu.rope_tail_yarn_interleaved_at_slot_buf(
-            kv_cache,
-            &pos_buf,
+    if cache_is_f16 {
+        gpu.rmsnorm_f32_staged_buf_gfx1201(
+            commit_f32,
+            norm,
             &commit_slot_buf,
             head_dim as i32,
-            cfg.qk_rope_head_dim as i32,
-            freq_base,
-            freq_scale,
-            ext_factor,
-            attn_factor,
-            corr_low,
-            corr_high,
+            cfg.rms_norm_eps,
         )
-        .map_err(|e| format!("comp rope buf l{layer_idx}: {e:?}"))?;
+        .map_err(|e| format!("comp rmsnorm staged buf l{layer_idx}: {e:?}"))?;
+    } else {
+        gpu.rmsnorm_f32_at_slot_buf(
+            kv_cache,
+            norm,
+            &commit_slot_buf,
+            head_dim as i32,
+            cfg.rms_norm_eps,
+        )
+        .map_err(|e| format!("comp rmsnorm buf l{layer_idx}: {e:?}"))?;
+    }
+    comp_dbg_commit_row(&*gpu, "kv_cache(rmsnorm)");
+    if do_rope {
+        if cache_is_f16 {
+            gpu.rope_tail_yarn_interleaved_staged_buf_gfx1201(
+                commit_f32,
+                &pos_buf,
+                &commit_slot_buf,
+                head_dim as i32,
+                cfg.qk_rope_head_dim as i32,
+                freq_base,
+                freq_scale,
+                ext_factor,
+                attn_factor,
+                corr_low,
+                corr_high,
+            )
+            .map_err(|e| format!("comp rope staged buf l{layer_idx}: {e:?}"))?;
+        } else {
+            gpu.rope_tail_yarn_interleaved_at_slot_buf(
+                kv_cache,
+                &pos_buf,
+                &commit_slot_buf,
+                head_dim as i32,
+                cfg.qk_rope_head_dim as i32,
+                freq_base,
+                freq_scale,
+                ext_factor,
+                attn_factor,
+                corr_low,
+                corr_high,
+            )
+            .map_err(|e| format!("comp rope buf l{layer_idx}: {e:?}"))?;
+        }
     }
     comp_dbg_commit_row(&*gpu, "kv_cache(rope)");
+    if cache_is_f16 {
+        gpu.cast_f32_to_f16_at_slot_buf_gfx1201(
+            commit_f32,
+            kv_cache,
+            &commit_slot_buf,
+            head_dim as i32,
+        )
+        .map_err(|e| format!("comp cache f16 store buf l{layer_idx}: {e:?}"))?;
+    }
     if overlap {
-        gpu.state_overlap_shift_f32_buf(kv_state, &commit_slot_buf, ratio as i32, proj_dim as i32)
+        gpu.state_overlap_shift_f32_buf(kv_state, &shift_slot_buf, ratio as i32, proj_dim as i32)
             .map_err(|e| format!("comp kv_state shift buf l{layer_idx}: {e:?}"))?;
         gpu.state_overlap_shift_f32_buf(
             score_state,
-            &commit_slot_buf,
+            &shift_slot_buf,
             ratio as i32,
             proj_dim as i32,
         )
@@ -2932,10 +3178,21 @@ fn compressor_forward_batched(
     let state_rows = coff * ratio;
 
     let max_compressed = state.compressor_capacity.active_rows();
+    let local_max_compressed = state
+        .compressor_cache_placement
+        .local_rows(max_compressed)
+        .max(1);
+    let compressor_cache_dtype = state.compressor_cache_dtype;
 
     // Lazy-alloc state buffers (mirror compressor_forward_impl exactly).
     {
         let l_state = &mut state._indexer[layer_idx];
+        if compressor_cache_dtype == DType::F16 && l_state.comp_cache_row_f32.is_none() {
+            l_state.comp_cache_row_f32 = Some(
+                gpu.zeros(&[cfg.head_dim], DType::F32)
+                    .map_err(|e| format!("alloc comp cache staging row l{layer_idx}: {e:?}"))?,
+            );
+        }
         if is_indexer {
             if l_state.indexer_kv_state.is_none() {
                 l_state.indexer_kv_state = Some(
@@ -2954,7 +3211,7 @@ fn compressor_forward_batched(
             }
             if l_state.indexer_kv_cache.is_none() {
                 l_state.indexer_kv_cache = Some(
-                    gpu.zeros(&[max_compressed, head_dim], DType::F32)
+                    gpu.zeros(&[local_max_compressed, head_dim], compressor_cache_dtype)
                         .map_err(|e| format!("alloc idx kv_cache l{layer_idx}: {e:?}"))?,
                 );
             }
@@ -2975,7 +3232,7 @@ fn compressor_forward_batched(
             }
             if l_state.main_kv_cache.is_none() {
                 l_state.main_kv_cache = Some(
-                    gpu.zeros(&[max_compressed, head_dim], DType::F32)
+                    gpu.zeros(&[local_max_compressed, head_dim], compressor_cache_dtype)
                         .map_err(|e| format!("alloc main kv_cache l{layer_idx}: {e:?}"))?,
                 );
             }
@@ -3077,107 +3334,144 @@ fn compressor_forward_batched(
             state._indexer[layer_idx].main_kv_cache.as_ref().unwrap()
         };
 
-        // `prev_kv` / `prev_score` for event 0 = first R rows of ring state.
-        // For overlap=1: ring rows 0..R hold the prior chunk's last NEW window
-        //   (FIRST half is the OLD-contribution; SECOND half unused).
-        // For chunk 0 (start_pos=0): ring state is zeros — correct: OLD == 0.
-        let prev_kv = kv_state.sub_offset(0, ratio * proj_dim);
-        let prev_score = score_state.sub_offset(0, ratio * proj_dim);
+        if let crate::deepseek4::CompressorCachePlacement::BlockCyclic(shard) =
+            state.compressor_cache_placement
+        {
+            let last_slot = compressed_slot_base + n_events_capped - 1;
+            if shard.owner(compressed_slot_base) != shard.owner(last_slot) {
+                return Err(format!(
+                    "compressor chunk crosses a TP cache ownership block: l{layer_idx}, start_slot={compressed_slot_base}, events={n_events_capped}, block_rows={}",
+                    shard.block_rows()
+                ));
+            }
+        }
+        let local_compressed_slot_base = state
+            .compressor_cache_placement
+            .global_to_local(compressed_slot_base);
 
-        let kv_cache_out =
-            kv_cache.sub_offset(compressed_slot_base * head_dim, n_events_capped * head_dim);
+        if let Some(local_compressed_slot_base) = local_compressed_slot_base {
+            // `prev_kv` / `prev_score` for event 0 = first R rows of ring state.
+            // For overlap=1: ring rows 0..R hold the prior chunk's last NEW window
+            //   (FIRST half is the OLD-contribution; SECOND half unused).
+            // For chunk 0 (start_pos=0): ring state is zeros — correct: OLD == 0.
+            let prev_kv = kv_state.sub_offset(0, ratio * proj_dim);
+            let prev_score = score_state.sub_offset(0, ratio * proj_dim);
 
-        gpu.compressor_compress_aligned_batched_f32(
-            &prev_kv,
-            &prev_score,
-            kv_batch_full,
-            score_batch_full,
-            &kv_cache_out,
-            ratio as i32,
-            head_dim as i32,
-            n_events_capped as i32,
-            if overlap { 1 } else { 0 },
-            batch_size as i32,
-        )
-        .map_err(|e| format!("compressor_compress_aligned_batched l{layer_idx}: {e:?}"))?;
+            let kv_cache_out = kv_cache.sub_offset(
+                local_compressed_slot_base * head_dim,
+                n_events_capped * head_dim,
+            );
+            let cache_is_f16 = kv_cache.dtype == DType::F16;
+            let staged_out;
+            let commit_out = if cache_is_f16 {
+                staged_out = pbs
+                    .comp_cache_batch_f32
+                    .sub_offset(0, n_events_capped * head_dim);
+                &staged_out
+            } else {
+                &kv_cache_out
+            };
 
-        // RMSNorm batched over n_events × head_dim.
-        gpu.rmsnorm_batched(
-            &kv_cache_out,
-            norm,
-            &kv_cache_out,
-            n_events_capped,
-            head_dim,
-            cfg.rms_norm_eps,
-        )
-        .map_err(|e| format!("comp rmsnorm batched l{layer_idx}: {e:?}"))?;
+            gpu.compressor_compress_aligned_batched_f32(
+                &prev_kv,
+                &prev_score,
+                kv_batch_full,
+                score_batch_full,
+                commit_out,
+                ratio as i32,
+                head_dim as i32,
+                n_events_capped as i32,
+                if overlap { 1 } else { 0 },
+                batch_size as i32,
+            )
+            .map_err(|e| format!("compressor_compress_aligned_batched l{layer_idx}: {e:?}"))?;
 
-        // Tail RoPE batched. Per event we want a per-event position.
-        // Build the position array on host and upload once.
-        // See note in `update_pos_array_host` — "start" matches reference
-        // ds4 (`comp_pos = pos + 1 - ratio`). Default to that; "mid" / "end"
-        // remain available via env var for diagnostic A/B.
-        let rope_pos_mode = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_COMP_ROPE_POS")
-            .ok()
-            .unwrap_or_else(|| "start".to_string());
-        let positions_host: Vec<i32> = (0..n_events_capped)
-            .map(|k| {
-                let absolute_event_pos = first_event_chunk_pos + k * ratio + (start_pos as usize);
-                if is_indexer {
-                    // Indexer always uses start-of-window.
-                    (absolute_event_pos / ratio * ratio) as i32
-                } else {
-                    match rope_pos_mode.as_str() {
-                        "end" => absolute_event_pos as i32,
-                        "mid" => ((absolute_event_pos / ratio * ratio) + ratio / 2) as i32,
-                        _ => (absolute_event_pos / ratio * ratio) as i32,
+            // RMSNorm batched over n_events × head_dim.
+            gpu.rmsnorm_batched(
+                commit_out,
+                norm,
+                commit_out,
+                n_events_capped,
+                head_dim,
+                cfg.rms_norm_eps,
+            )
+            .map_err(|e| format!("comp rmsnorm batched l{layer_idx}: {e:?}"))?;
+
+            // Tail RoPE batched. Per event we want a per-event position.
+            // Build the position array on host and upload once.
+            // See note in `update_pos_array_host` — "start" matches reference
+            // ds4 (`comp_pos = pos + 1 - ratio`). Default to that; "mid" / "end"
+            // remain available via env var for diagnostic A/B.
+            let rope_pos_mode = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_COMP_ROPE_POS")
+                .ok()
+                .unwrap_or_else(|| "start".to_string());
+            let positions_host: Vec<i32> = (0..n_events_capped)
+                .map(|k| {
+                    let absolute_event_pos =
+                        first_event_chunk_pos + k * ratio + (start_pos as usize);
+                    if is_indexer {
+                        // Indexer always uses start-of-window.
+                        (absolute_event_pos / ratio * ratio) as i32
+                    } else {
+                        match rope_pos_mode.as_str() {
+                            "end" => absolute_event_pos as i32,
+                            "mid" => ((absolute_event_pos / ratio * ratio) + ratio / 2) as i32,
+                            _ => (absolute_event_pos / ratio * ratio) as i32,
+                        }
                     }
-                }
-            })
-            .collect();
-        // Use the existing pbs.positions field as scratch (it's [max_batch] F32).
-        // We need at least n_events_capped slots. n_events_capped <= max_batch
-        // because each event consumes R positions of input. Safe.
-        let pos_bytes: &[u8] = unsafe {
-            std::slice::from_raw_parts(positions_host.as_ptr() as *const u8, n_events_capped * 4)
-        };
-        gpu.memcpy_htod_auto(&pbs.comp_positions.buf, pos_bytes)
-            .map_err(|e| format!("htod comp positions l{layer_idx}: {e:?}"))?;
+                })
+                .collect();
+            // Use the existing pbs.positions field as scratch (it's [max_batch] F32).
+            // We need at least n_events_capped slots. n_events_capped <= max_batch
+            // because each event consumes R positions of input. Safe.
+            let pos_bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(
+                    positions_host.as_ptr() as *const u8,
+                    n_events_capped * 4,
+                )
+            };
+            gpu.memcpy_htod_auto(&pbs.comp_positions.buf, pos_bytes)
+                .map_err(|e| format!("htod comp positions l{layer_idx}: {e:?}"))?;
 
-        if is_indexer {
-            gpu.rope_tail_interleaved_batched(
-                &kv_cache_out,
-                &kv_cache_out,
-                &pbs.comp_positions,
-                1,
-                0,
-                head_dim as i32,
-                cfg.qk_rope_head_dim as i32,
-                cfg.compress_rope_theta,
-                n_events_capped as i32,
-            )
-            .map_err(|e| format!("comp idx rope batched l{layer_idx}: {e:?}"))?;
-        } else {
-            let (freq_base, freq_scale, ext_factor, attn_factor, corr_low, corr_high) =
-                layer_rope_params(cfg, layer.compress_ratio);
-            gpu.rope_tail_yarn_interleaved_batched(
-                &kv_cache_out,
-                &kv_cache_out,
-                &pbs.comp_positions,
-                1,
-                0,
-                head_dim as i32,
-                cfg.qk_rope_head_dim as i32,
-                freq_base,
-                freq_scale,
-                ext_factor,
-                attn_factor,
-                corr_low,
-                corr_high,
-                /*inverse=*/ 0,
-                n_events_capped as i32,
-            )
-            .map_err(|e| format!("comp main rope batched l{layer_idx}: {e:?}"))?;
+            if is_indexer {
+                gpu.rope_tail_interleaved_batched(
+                    commit_out,
+                    commit_out,
+                    &pbs.comp_positions,
+                    1,
+                    0,
+                    head_dim as i32,
+                    cfg.qk_rope_head_dim as i32,
+                    cfg.compress_rope_theta,
+                    n_events_capped as i32,
+                )
+                .map_err(|e| format!("comp idx rope batched l{layer_idx}: {e:?}"))?;
+            } else {
+                let (freq_base, freq_scale, ext_factor, attn_factor, corr_low, corr_high) =
+                    layer_rope_params(cfg, layer.compress_ratio);
+                gpu.rope_tail_yarn_interleaved_batched(
+                    commit_out,
+                    commit_out,
+                    &pbs.comp_positions,
+                    1,
+                    0,
+                    head_dim as i32,
+                    cfg.qk_rope_head_dim as i32,
+                    freq_base,
+                    freq_scale,
+                    ext_factor,
+                    attn_factor,
+                    corr_low,
+                    corr_high,
+                    /*inverse=*/ 0,
+                    n_events_capped as i32,
+                )
+                .map_err(|e| format!("comp main rope batched l{layer_idx}: {e:?}"))?;
+            }
+            if cache_is_f16 {
+                gpu.cast_f32_to_f16(commit_out, &kv_cache_out)
+                    .map_err(|e| format!("comp cache f16 store batched l{layer_idx}: {e:?}"))?;
+            }
         }
 
         // Update ring state for next chunk: kv_state[0..R] ← last NEW window's
@@ -3465,17 +3759,60 @@ fn indexer_forward(
         .ok_or_else(|| "indexer: attn_state_buf missing".to_string())?;
     let n_buf = attn_buf.sub_offset(2, 1); // n_compressed_4
     let k_buf = attn_buf.sub_offset(4, 1); // k_active_4
-    gpu.indexer_relu_score_f32_buf(
-        q_idx,
-        kv_cache,
-        idx_w,
-        scores,
-        &n_buf,
-        max_compressed as i32,
-        h as i32,
-        d as i32,
-    )
-    .map_err(|e| format!("idx score buf l{layer_idx}: {e:?}"))?;
+    if let crate::deepseek4::CompressorCachePlacement::BlockCyclic(shard) =
+        state.compressor_cache_placement
+    {
+        if kv_cache.dtype == DType::F16 {
+            return Err(format!(
+                "F16 compressor cache does not support block-cyclic placement l{layer_idx}"
+            ));
+        }
+        let l_state = &state._indexer[layer_idx];
+        if l_state.cache_shard_count != shard.world() {
+            return Err(format!(
+                "indexer shard table missing l{layer_idx}: have {}, want {}",
+                l_state.cache_shard_count,
+                shard.world()
+            ));
+        }
+        gpu.indexer_relu_score_f32_buf_sharded_gfx1201(
+            q_idx,
+            &l_state.indexer_kv_cache_shards,
+            idx_w,
+            scores,
+            &n_buf,
+            max_compressed as i32,
+            h as i32,
+            d as i32,
+            shard.world() as i32,
+            shard.block_rows() as i32,
+        )
+        .map_err(|e| format!("idx score sharded buf l{layer_idx}: {e:?}"))?;
+    } else if kv_cache.dtype == DType::F16 {
+        gpu.indexer_relu_score_f16_buf_gfx1201(
+            q_idx,
+            kv_cache,
+            idx_w,
+            scores,
+            &n_buf,
+            max_compressed as i32,
+            h as i32,
+            d as i32,
+        )
+        .map_err(|e| format!("idx score f16 buf l{layer_idx}: {e:?}"))?;
+    } else {
+        gpu.indexer_relu_score_f32_buf(
+            q_idx,
+            kv_cache,
+            idx_w,
+            scores,
+            &n_buf,
+            max_compressed as i32,
+            h as i32,
+            d as i32,
+        )
+        .map_err(|e| format!("idx score buf l{layer_idx}: {e:?}"))?;
+    }
 
     // 5. Top-K: read N + K from device buffers.
     let topk = state._indexer[layer_idx].topk_idx_indices.as_ref().unwrap();
@@ -4151,22 +4488,22 @@ pub(crate) fn precompute_attn_state(
 ) -> Result<(), String> {
     if state.attn_state_buf.is_none() {
         state.attn_state_buf = Some(
-            gpu.alloc_tensor(&[10], DType::F32)
+            gpu.alloc_tensor(&[12], DType::F32)
                 .map_err(|e| format!("alloc attn_state_buf: {e:?}"))?,
         );
     }
     if state.attn_state_host.is_none() {
-        state.attn_state_host = Some(Box::new([0i32; 10]));
+        state.attn_state_host = Some(Box::new([0i32; 12]));
     }
     fill_attn_state_host(cfg, state, state.n_tokens as u32);
     let host = state.attn_state_host.as_ref().unwrap();
     let dev = state.attn_state_buf.as_ref().unwrap();
-    let bytes = unsafe { std::slice::from_raw_parts(host.as_ptr() as *const u8, 10 * 4) };
+    let bytes = unsafe { std::slice::from_raw_parts(host.as_ptr() as *const u8, 12 * 4) };
     gpu.memcpy_htod_auto(&dev.buf, bytes)
         .map_err(|e| format!("htod attn_state: {e:?}"))
 }
 
-/// Internal helper: fill `state.attn_state_host[0..10]` from `position`
+/// Internal helper: fill `state.attn_state_host[0..12]` from `position`
 /// using DeepSeek V4's compress-ratio + index_topk constants. Used by both
 /// `precompute_attn_state` (decode entry) and `update_attn_state_host`
 /// (graph replay path).
@@ -4195,7 +4532,7 @@ fn fill_attn_state_host(cfg: &DeepseekV4Config, state: &mut DeepseekV4State, pos
     // pos/ratio at commit positions, -1 otherwise (commit kernels
     // early-return on -1).
     let ring_slot_4 = 4 + (pos % 4);
-    let commit_slot_4 = if (pos + 1) % 4 == 0 {
+    let global_commit_slot_4 = if (pos + 1) % 4 == 0 {
         let s = pos / 4;
         if s < max_compressed {
             s
@@ -4206,13 +4543,31 @@ fn fill_attn_state_host(cfg: &DeepseekV4Config, state: &mut DeepseekV4State, pos
         -1
     };
     let ring_slot_128 = pos % 128; // overlap=false (ratio=128)
-    let commit_slot_128 = if (pos + 1) % 128 == 0 {
+    let global_commit_slot_128 = if (pos + 1) % 128 == 0 {
         let s = pos / 128;
         if s < max_compressed {
             s
         } else {
             -1
         }
+    } else {
+        -1
+    };
+    let commit_slot_4 = if global_commit_slot_4 >= 0 {
+        state
+            .compressor_cache_placement
+            .global_to_local(global_commit_slot_4 as usize)
+            .map(|slot| slot as i32)
+            .unwrap_or(-1)
+    } else {
+        -1
+    };
+    let commit_slot_128 = if global_commit_slot_128 >= 0 {
+        state
+            .compressor_cache_placement
+            .global_to_local(global_commit_slot_128 as usize)
+            .map(|slot| slot as i32)
+            .unwrap_or(-1)
     } else {
         -1
     };
@@ -4230,6 +4585,10 @@ fn fill_attn_state_host(cfg: &DeepseekV4Config, state: &mut DeepseekV4State, pos
     host[7] = commit_slot_4;
     host[8] = ring_slot_128;
     host[9] = commit_slot_128;
+    // Cache writes use rank-local slots above. Ring state remains replicated,
+    // so its overlap shift must fire on every rank at each global commit.
+    host[10] = global_commit_slot_4;
+    host[11] = global_commit_slot_128;
 }
 
 /// Update host-only `attn_state_host[]` (no device copy). Used by the
@@ -5237,6 +5596,25 @@ pub fn forward_ep(
     position: u32,
 ) -> Result<(), String> {
     let n = gpus.devices.len();
+    if state_per_rank.len() == n
+        && gpus
+            .devices
+            .iter()
+            .all(|device| compressor_cache_uses_vmm(device))
+    {
+        for rank in 0..n {
+            gpus.devices[rank]
+                .bind_thread()
+                .map_err(|error| format!("ds4 TP{n} cache bind rank {rank}: {error:?}"))?;
+            ensure_compressor_capacity(
+                cfg,
+                &mut state_per_rank[rank],
+                &mut gpus.devices[rank],
+                (position as usize).saturating_add(1),
+            )?;
+        }
+        refresh_compressor_cache_shard_tables(state_per_rank)?;
+    }
     let graph_slots = cfg.num_hidden_layers * 2;
     let tp_graph_admitted = matches!(n, 3 | 4)
         && weights_per_rank.len() == n
@@ -8147,32 +8525,102 @@ fn attn_stub(
                 let topk_idx = state._indexer[layer_idx].topk_idx_indices.as_ref().unwrap();
                 let main_kv_cache = state._indexer[layer_idx].main_kv_cache.as_ref().unwrap();
                 let gathered_k = state._attention[layer_idx].gathered_k.as_ref().unwrap();
-                gpu.deepseek4_topk_kv_gather_f32_buf(
-                    main_kv_cache,
-                    topk_idx,
-                    gathered_k,
-                    &k_active_buf,
-                    &n_compressed_buf,
-                    topk_max as i32,
-                    head_dim as i32,
-                    topk_max as i32,
-                    0,
-                    1.0,
-                )
-                .map_err(|e| format!("mixed gather (idx,buf) l{layer_idx}: {e:?}"))?;
+                if let crate::deepseek4::CompressorCachePlacement::BlockCyclic(shard) =
+                    state.compressor_cache_placement
+                {
+                    if main_kv_cache.dtype == DType::F16 {
+                        return Err(format!(
+                            "F16 compressor cache does not support block-cyclic gather l{layer_idx}"
+                        ));
+                    }
+                    gpu.deepseek4_topk_kv_gather_f32_buf_sharded_gfx1201(
+                        &state._indexer[layer_idx].main_kv_cache_shards,
+                        topk_idx,
+                        gathered_k,
+                        &k_active_buf,
+                        &n_compressed_buf,
+                        topk_max as i32,
+                        head_dim as i32,
+                        topk_max as i32,
+                        0,
+                        1.0,
+                        shard.world() as i32,
+                        shard.block_rows() as i32,
+                    )
+                    .map_err(|e| format!("mixed gather sharded (idx,buf) l{layer_idx}: {e:?}"))?;
+                } else if main_kv_cache.dtype == DType::F16 {
+                    gpu.deepseek4_topk_kv_gather_f16_buf_gfx1201(
+                        main_kv_cache,
+                        topk_idx,
+                        gathered_k,
+                        &k_active_buf,
+                        &n_compressed_buf,
+                        topk_max as i32,
+                        head_dim as i32,
+                        topk_max as i32,
+                        0,
+                        1.0,
+                    )
+                    .map_err(|e| format!("mixed gather f16 (idx,buf) l{layer_idx}: {e:?}"))?;
+                } else {
+                    gpu.deepseek4_topk_kv_gather_f32_buf(
+                        main_kv_cache,
+                        topk_idx,
+                        gathered_k,
+                        &k_active_buf,
+                        &n_compressed_buf,
+                        topk_max as i32,
+                        head_dim as i32,
+                        topk_max as i32,
+                        0,
+                        1.0,
+                    )
+                    .map_err(|e| format!("mixed gather (idx,buf) l{layer_idx}: {e:?}"))?;
+                }
             } else {
                 // ratio=128 (or fallback): identity gather over first K rows.
                 let main_kv_cache = state._indexer[layer_idx].main_kv_cache.as_ref().unwrap();
                 let gathered_k = state._attention[layer_idx].gathered_k.as_ref().unwrap();
-                gpu.deepseek4_topk_kv_gather_identity_f32_buf(
-                    main_kv_cache,
-                    gathered_k,
-                    &k_active_buf,
-                    topk_max as i32,
-                    head_dim as i32,
-                    topk_max as i32,
-                )
-                .map_err(|e| format!("mixed gather (all,buf) l{layer_idx}: {e:?}"))?;
+                if let crate::deepseek4::CompressorCachePlacement::BlockCyclic(shard) =
+                    state.compressor_cache_placement
+                {
+                    if main_kv_cache.dtype == DType::F16 {
+                        return Err(format!(
+                            "F16 compressor cache does not support block-cyclic identity gather l{layer_idx}"
+                        ));
+                    }
+                    gpu.deepseek4_topk_kv_gather_identity_f32_buf_sharded_gfx1201(
+                        &state._indexer[layer_idx].main_kv_cache_shards,
+                        gathered_k,
+                        &k_active_buf,
+                        topk_max as i32,
+                        head_dim as i32,
+                        topk_max as i32,
+                        shard.world() as i32,
+                        shard.block_rows() as i32,
+                    )
+                    .map_err(|e| format!("mixed gather sharded (all,buf) l{layer_idx}: {e:?}"))?;
+                } else if main_kv_cache.dtype == DType::F16 {
+                    gpu.deepseek4_topk_kv_gather_identity_f16_buf_gfx1201(
+                        main_kv_cache,
+                        gathered_k,
+                        &k_active_buf,
+                        topk_max as i32,
+                        head_dim as i32,
+                        topk_max as i32,
+                    )
+                    .map_err(|e| format!("mixed gather f16 (all,buf) l{layer_idx}: {e:?}"))?;
+                } else {
+                    gpu.deepseek4_topk_kv_gather_identity_f32_buf(
+                        main_kv_cache,
+                        gathered_k,
+                        &k_active_buf,
+                        topk_max as i32,
+                        head_dim as i32,
+                        topk_max as i32,
+                    )
+                    .map_err(|e| format!("mixed gather (all,buf) l{layer_idx}: {e:?}"))?;
+                }
             }
 
             let swa_k = state._attention[layer_idx].swa_k.as_ref().unwrap();
@@ -10035,6 +10483,9 @@ pub struct PrefillBatchScratch {
     pub comp_main_score_batch: GpuTensor, // [B, 2*head_dim]
     pub comp_idx_kv_batch: GpuTensor,     // [B, 2*idx_head_dim]
     pub comp_idx_score_batch: GpuTensor,  // [B, 2*idx_head_dim]
+    /// F32 compressor output stage `[B, head_dim]` used only when the
+    /// long-lived cache is F16. Main and indexer commits reuse it serially.
+    pub comp_cache_batch_f32: GpuTensor,
     // ── Scatter-by-expert MoE sort outputs ──
     // Single counting-sort produces these per layer; the grouped MoE
     // GEMVs then read each expert weight slab once with cache reuse.
@@ -10226,6 +10677,7 @@ impl PrefillBatchScratch {
         add(b * idx_topk)?;
         add(4 * b * head_dim)?; // main compressor kv + score
         add(4 * b * idx_dim)?; // indexer compressor kv + score
+        add(b * head_dim)?; // F16 compressor-cache commit staging
         add(3 * b * topk)?; // sorted b/krank/expert
         add(n_exp + 1)?; // expert starts
         raw_bytes += n_exp * 4; // expert token counts
@@ -10430,6 +10882,7 @@ impl PrefillBatchScratch {
             alloc_f32!(&[max_batch, 2 * cfg.index_head_dim], "comp_idx_kv_batch");
         let comp_idx_score_batch =
             alloc_f32!(&[max_batch, 2 * cfg.index_head_dim], "comp_idx_score_batch");
+        let comp_cache_batch_f32 = alloc_f32!(&[max_batch, head_dim], "comp_cache_batch_f32");
         let moe_sorted_b = alloc_f32!(&[max_batch * cfg.num_experts_per_tok], "moe_sorted_b");
         let moe_sorted_krank =
             alloc_f32!(&[max_batch * cfg.num_experts_per_tok], "moe_sorted_krank");
@@ -10533,6 +10986,7 @@ impl PrefillBatchScratch {
             comp_main_score_batch: comp_main_score_batch.into_tensor(),
             comp_idx_kv_batch: comp_idx_kv_batch.into_tensor(),
             comp_idx_score_batch: comp_idx_score_batch.into_tensor(),
+            comp_cache_batch_f32: comp_cache_batch_f32.into_tensor(),
             moe_sorted_b: moe_sorted_b.into_tensor(),
             moe_sorted_krank: moe_sorted_krank.into_tensor(),
             moe_sorted_expert: moe_sorted_expert.into_tensor(),
@@ -10582,6 +11036,11 @@ impl PrefillBatchScratch {
         let old = std::mem::replace(&mut self.idx_scores_batch, replacement);
         gpu.free_tensor(old)
             .map_err(|e| format!("PrefillBatchScratch free old idx_scores_batch: {e:?}"))?;
+        // This is a request-boundary geometry change, not a hot-loop free.
+        // Keeping the old, potentially hundreds-of-MiB score slab in the pool
+        // can make the cache's second admission check fail after the first one
+        // passed. Return pooled blocks to HIP before committing the new stride.
+        gpu.drain_pool();
         self.idx_score_capacity = required_rows;
         Ok(true)
     }
@@ -10646,6 +11105,7 @@ impl PrefillBatchScratch {
             self.comp_main_score_batch,
             self.comp_idx_kv_batch,
             self.comp_idx_score_batch,
+            self.comp_cache_batch_f32,
             self.moe_sorted_b,
             self.moe_sorted_krank,
             self.moe_sorted_expert,
@@ -11389,6 +11849,11 @@ fn attention_block_batched_mixed(
     // gathered path, whose live row counts are device-buffer driven.
     let use_topk_direct = !capture_safe
         && ratio == 4
+        && state.compressor_cache_dtype == DType::F32
+        && matches!(
+            state.compressor_cache_placement,
+            crate::deepseek4::CompressorCachePlacement::Replicated
+        )
         && hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_ATTN_TOPK_DIRECT")
             .map(|s| s != "0")
             .unwrap_or(gpu.arch == "gfx1151" && batch_size >= 64);
@@ -11875,7 +12340,65 @@ fn attention_block_batched_mixed(
                 && hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_INDEXER_WMMA")
                     .map(|s| s != "0")
                     .unwrap_or(true);
-            if use_indexer_wmma {
+            if let crate::deepseek4::CompressorCachePlacement::BlockCyclic(shard) =
+                state.compressor_cache_placement
+            {
+                if kv_cache.dtype == DType::F16 {
+                    return Err(format!(
+                        "F16 compressor cache does not support block-cyclic batched score l{layer_idx}"
+                    ));
+                }
+                let l_state = &state._indexer[layer_idx];
+                if l_state.cache_shard_count != shard.world() {
+                    return Err(format!(
+                        "batched indexer shard table missing l{layer_idx}: have {}, want {}",
+                        l_state.cache_shard_count,
+                        shard.world()
+                    ));
+                }
+                gpu.indexer_relu_score_wmma_batched_sharded_gfx1201(
+                    &pbs.idx_q_batch,
+                    &l_state.indexer_kv_cache_shards,
+                    &pbs.idx_w_batch,
+                    n_compressed_arr,
+                    &pbs.idx_scores_batch,
+                    h_idx as i32,
+                    d_idx as i32,
+                    max_compressed as i32,
+                    batch_size as i32,
+                    shard.world() as i32,
+                    shard.block_rows() as i32,
+                )
+                .map_err(|e| {
+                    format!("indexer_relu_score_wmma_batched_sharded l{layer_idx}: {e:?}")
+                })?;
+            } else if kv_cache.dtype == DType::F16 && use_indexer_wmma {
+                gpu.indexer_relu_score_wmma_batched_f16_gfx1201(
+                    &pbs.idx_q_batch,
+                    kv_cache,
+                    &pbs.idx_w_batch,
+                    n_compressed_arr,
+                    &pbs.idx_scores_batch,
+                    h_idx as i32,
+                    d_idx as i32,
+                    max_compressed as i32,
+                    batch_size as i32,
+                )
+                .map_err(|e| format!("indexer_relu_score_wmma_batched_f16 l{layer_idx}: {e:?}"))?;
+            } else if kv_cache.dtype == DType::F16 {
+                gpu.indexer_relu_score_batched_f16_gfx1201(
+                    &pbs.idx_q_batch,
+                    kv_cache,
+                    &pbs.idx_w_batch,
+                    n_compressed_arr,
+                    &pbs.idx_scores_batch,
+                    h_idx as i32,
+                    d_idx as i32,
+                    max_compressed as i32,
+                    batch_size as i32,
+                )
+                .map_err(|e| format!("indexer_relu_score_batched_f16 l{layer_idx}: {e:?}"))?;
+            } else if use_indexer_wmma {
                 if gpu.arch.eq_ignore_ascii_case("gfx1151") {
                     // All four WMMA warps consume the same 16x128 K tile.
                     // Stage it once on gfx1151; the portable symbol retains
@@ -11960,6 +12483,23 @@ fn attention_block_batched_mixed(
                 .map_err(|e| {
                     format!("indexer_top_k_batched_bounded_gfx1151 l{layer_idx}: {e:?}")
                 })?;
+            } else if gpu.arch.eq_ignore_ascii_case("gfx1201") {
+                // gfx1201's portable rank-count is O(N^2) once compressed
+                // history exceeds K=512. Keep a separate symbol from gfx1151
+                // while using the same exact score/index ordering contract.
+                gpu.indexer_top_k_batched_bounded_gfx1201(
+                    &pbs.idx_scores_batch,
+                    &pbs.idx_topk_indices_batch,
+                    /*n_idx_heads=*/ 1,
+                    max_compressed as i32,
+                    n_max_chunk as i32,
+                    topk_max as i32,
+                    k_fill as i32,
+                    batch_size as i32,
+                )
+                .map_err(|e| {
+                    format!("indexer_top_k_batched_bounded_gfx1201 l{layer_idx}: {e:?}")
+                })?;
             } else {
                 gpu.indexer_top_k_batched(
                     &pbs.idx_scores_batch,
@@ -12004,10 +12544,59 @@ fn attention_block_batched_mixed(
                 // +4.20%, with tau 2.0238095238095237 and the decoded answer
                 // identical across both arms. Post-change rocprof puts the
                 // kernel at 0.23% of GPU, down from 5.0%.
+                //
+                // Ordered after the sharded and F16 routes: those select on
+                // cache placement and dtype, this one on architecture, and the
+                // F32 single-owner tiled gather is the fallthrough both share.
                 let tiled_gfx1151 = gpu.arch.eq_ignore_ascii_case("gfx1151")
                     && hipfire_config::developer_var("HIPFIRE_DS4_GATHER_TILED").as_deref()
                         != Ok("0");
-                if tiled_gfx1201 || tiled_gfx1151 {
+                if let crate::deepseek4::CompressorCachePlacement::BlockCyclic(shard) =
+                    state.compressor_cache_placement
+                {
+                    if main_kv_cache.dtype == DType::F16 {
+                        return Err(format!(
+                            "F16 compressor cache does not support block-cyclic batched gather l{layer_idx}"
+                        ));
+                    }
+                    gpu.deepseek4_topk_kv_gather_batched_tiled_sharded_gfx1201(
+                        &state._indexer[layer_idx].main_kv_cache_shards,
+                        &pbs.idx_topk_indices_batch,
+                        &pbs.topk_staged_batch,
+                        topk_max as i32,
+                        head_dim as i32,
+                        n_compressed,
+                        topk_max as i32,
+                        0,
+                        /*scale=*/ 1.0,
+                        batch_size as i32,
+                        shard.world() as i32,
+                        shard.block_rows() as i32,
+                    )
+                    .map_err(|e| {
+                        format!(
+                            "deepseek4_topk_kv_gather_batched_tiled_sharded_gfx1201 l{layer_idx}: {e:?}"
+                        )
+                    })?;
+                } else if main_kv_cache.dtype == DType::F16 {
+                    gpu.deepseek4_topk_kv_gather_batched_tiled_f16_gfx1201(
+                        main_kv_cache,
+                        &pbs.idx_topk_indices_batch,
+                        &pbs.topk_staged_batch,
+                        topk_max as i32,
+                        head_dim as i32,
+                        n_compressed,
+                        topk_max as i32,
+                        0,
+                        /*scale=*/ 1.0,
+                        batch_size as i32,
+                    )
+                    .map_err(|e| {
+                        format!(
+                            "deepseek4_topk_kv_gather_batched_tiled_f16_gfx1201 l{layer_idx}: {e:?}"
+                        )
+                    })?;
+                } else if tiled_gfx1201 || tiled_gfx1151 {
                     gpu.deepseek4_topk_kv_gather_batched_tiled_gfx1201(
                         main_kv_cache,
                         &pbs.idx_topk_indices_batch,
@@ -12066,17 +12655,52 @@ fn attention_block_batched_mixed(
                 .main_kv_cache
                 .as_ref()
                 .ok_or_else(|| "main_kv_cache missing".to_string())?;
-            gpu.deepseek4_topk_kv_gather_identity_batched_f32(
-                main_kv_cache,
-                &pbs.topk_staged_batch,
-                gather_n_compressed as i32,
-                head_dim as i32,
-                topk_max as i32,
-                batch_size as i32,
-            )
-            .map_err(|e| {
-                format!("deepseek4_topk_kv_gather_identity_batched l{layer_idx}: {e:?}")
-            })?;
+            if let crate::deepseek4::CompressorCachePlacement::BlockCyclic(shard) =
+                state.compressor_cache_placement
+            {
+                if main_kv_cache.dtype == DType::F16 {
+                    return Err(format!(
+                        "F16 compressor cache does not support block-cyclic batched identity gather l{layer_idx}"
+                    ));
+                }
+                gpu.deepseek4_topk_kv_gather_identity_batched_sharded_gfx1201(
+                    &state._indexer[layer_idx].main_kv_cache_shards,
+                    &pbs.topk_staged_batch,
+                    gather_n_compressed as i32,
+                    head_dim as i32,
+                    topk_max as i32,
+                    batch_size as i32,
+                    shard.world() as i32,
+                    shard.block_rows() as i32,
+                )
+                .map_err(|e| {
+                    format!("deepseek4_topk_kv_gather_identity_batched_sharded l{layer_idx}: {e:?}")
+                })?;
+            } else if main_kv_cache.dtype == DType::F16 {
+                gpu.deepseek4_topk_kv_gather_identity_batched_f16_gfx1201(
+                    main_kv_cache,
+                    &pbs.topk_staged_batch,
+                    gather_n_compressed as i32,
+                    head_dim as i32,
+                    topk_max as i32,
+                    batch_size as i32,
+                )
+                .map_err(|e| {
+                    format!("deepseek4_topk_kv_gather_identity_batched_f16 l{layer_idx}: {e:?}")
+                })?;
+            } else {
+                gpu.deepseek4_topk_kv_gather_identity_batched_f32(
+                    main_kv_cache,
+                    &pbs.topk_staged_batch,
+                    gather_n_compressed as i32,
+                    head_dim as i32,
+                    topk_max as i32,
+                    batch_size as i32,
+                )
+                .map_err(|e| {
+                    format!("deepseek4_topk_kv_gather_identity_batched l{layer_idx}: {e:?}")
+                })?;
+            }
             for b in 0..batch_size {
                 let n_b = (((start_pos as usize) + b + 1) / ratio)
                     .min(max_compressed)
@@ -14409,13 +15033,25 @@ pub fn forward_ep_prefill_batch_chunked(
             required_tokens,
         )?;
     }
+    refresh_compressor_cache_shard_tables(state_per_rank)?;
 
     let mut consumed = 0usize;
     let mut last_batch = 0usize;
     while consumed < tokens.len() {
-        let batch_size = (tokens.len() - consumed).min(max_batch);
-        let chunk = &tokens[consumed..consumed + batch_size];
         let chunk_start = start_pos + consumed as u32;
+        let mut batch_size = (tokens.len() - consumed).min(max_batch);
+        if let crate::deepseek4::CompressorCachePlacement::BlockCyclic(shard) =
+            state_per_rank[0].compressor_cache_placement
+        {
+            // Ratio-4 is the finest compressor. Do not let one batched commit
+            // cross a physical ownership block; this keeps the incumbent
+            // contiguous compressor kernel unchanged on the owning rank.
+            let ownership_token_span = shard.block_rows() * 4;
+            let until_boundary =
+                ownership_token_span - (chunk_start as usize % ownership_token_span);
+            batch_size = batch_size.min(until_boundary);
+        }
+        let chunk = &tokens[consumed..consumed + batch_size];
         last_batch = batch_size;
 
         // Dynamic request inputs and replicated embedding/HC initialization.
@@ -14450,8 +15086,32 @@ pub fn forward_ep_prefill_batch_chunked(
         }
 
         for layer_idx in 0..cfg.num_hidden_layers {
+            let cache_owner = match state_per_rank[0].compressor_cache_placement {
+                crate::deepseek4::CompressorCachePlacement::Replicated => None,
+                crate::deepseek4::CompressorCachePlacement::BlockCyclic(shard) => {
+                    let ratio =
+                        weights_per_rank[0].resolve_layer(layer_idx).compress_ratio as usize;
+                    (ratio > 0).then(|| shard.owner(chunk_start as usize / ratio))
+                }
+            };
+            let rank_at = |ordinal: usize| match cache_owner {
+                None => ordinal,
+                Some(owner) if ordinal == 0 => owner,
+                Some(owner) => {
+                    let other = ordinal - 1;
+                    if other >= owner {
+                        other + 1
+                    } else {
+                        other
+                    }
+                }
+            };
             // Rank-local attention projection and attention body.
-            for rank in 0..n_ranks {
+            // A sharded compressor owner runs first. Its system-scope event
+            // then releases the newly committed rows before the remaining
+            // ranks enqueue sparse-attention reads of that peer allocation.
+            for rank_order in 0..n_ranks {
+                let rank = rank_at(rank_order);
                 let weights = &weights_per_rank[rank];
                 let layer = weights.resolve_layer(layer_idx);
                 if layer.attn_tp_size != n_ranks
@@ -14529,6 +15189,13 @@ pub fn forward_ep_prefill_batch_chunked(
                         false,
                         attention_input_precomputed,
                     )?;
+                }
+                if cache_owner == Some(rank) {
+                    gpus.handoff_rank_stream_reuse(rank).map_err(|error| {
+                        format!(
+                            "TP{n_ranks} prefill compressor handoff l{layer_idx} owner={rank}: {error:?}"
+                        )
+                    })?;
                 }
             }
 

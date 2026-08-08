@@ -1011,11 +1011,18 @@ impl Carrier for Deepseek4Carrier {
         }
         dir_diag(&src);
         let meta = resolve_source_meta(&src, ctx.path)?;
+        let compressor_cache =
+            crate::resolve_deepseek4_compressor_cache_kv_mode(ctx.kv_mode_override)?;
 
         if !matches!(
             ctx.deepseek4_compute_placement,
             hipfire_config::Deepseek4ComputePlacement::Single
         ) {
+            if compressor_cache == hipfire_config::Deepseek4CompressorCache::F16 {
+                return Err(
+                    "deepseek4: kv_cache=f16 currently requires gfx1201 MQ2R TP3/TP4".into(),
+                );
+            }
             if !matches!(&src, ModelSource::Hfq(_)) {
                 return Err(
                     "deepseek4 heterogeneous placement requires the frozen MQ2R HFQ artifact"
@@ -1091,7 +1098,11 @@ impl Carrier for Deepseek4Carrier {
                 (config, weights)
             }
         };
-        let state = deepseek4::DeepseekV4State::new(&config)?;
+        if compressor_cache == hipfire_config::Deepseek4CompressorCache::F16 {
+            return Err("deepseek4: kv_cache=f16 currently requires gfx1201 MQ2R TP3/TP4".into());
+        }
+        let mut state = deepseek4::DeepseekV4State::new(&config)?;
+        state.compressor_cache_dtype = rdna_compute::DType::F32;
         let pbs_max_batch: usize = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_PP_BATCH")
             .ok()
             .and_then(|s| s.parse().ok())

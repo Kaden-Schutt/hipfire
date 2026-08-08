@@ -614,6 +614,8 @@ mod tests {
 
         assert_eq!(mq2lloyd.file, "deepseek-v4-flash-0731.mq2lloyd");
         assert_eq!(mq2r.file, "deepseek-v4-flash-0731.mq2r");
+        assert_eq!(mq2lloyd.default_kv_mode.as_deref(), Some("f32"));
+        assert_eq!(mq2r.default_kv_mode.as_deref(), Some("f32"));
         assert_eq!(
             mq2r.sha256.as_deref(),
             Some("cbf2bbcfa3f47b1712a071836b2c48232dad7dfb763813a720f7d348a9318cce")
