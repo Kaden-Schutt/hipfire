@@ -12,6 +12,46 @@ All throughput figures in §1 are from the acceptance oracle
 profiling diagnostic (`rocprofv3` over `examples/dspark_bench`) and are
 explicitly **not** acceptance numbers — see §3 caveat.
 
+## 0. Current k6 golden (benchmark against this)
+
+This supersedes the 37.3165 tok/s k6 golden in
+[`2026-08-06-ds4-dspark-localmaxxing-k4-k6.md`](2026-08-06-ds4-dspark-localmaxxing-k4-k6.md).
+That figure remains correct for the commit it was taken at; it is simply no
+longer the shipping number.
+
+| | |
+| --- | --- |
+| **Median** | **38.97192 tok/s** |
+| Runs (3 fresh processes) | 38.94236 / 38.97192 / 38.97297 |
+| Range spread | 0.079% |
+| tau (accepted drafts) | 2.0238095238095237 |
+| Prompt / generated | ctx 25 / gen 128 |
+| Decoded-answer md5 | `53c8ce5ed7b1` |
+| Commit | `b071cff8a` |
+| `examples/daemon` sha256 | `ae11516e338558d119d1d7e44403619536359d37a164837306fc3f2936f7b749` |
+
+Fixture — trunk 82,191,359,851 B and sidecar 5,788,397,278 B, sizes verified at
+run time; sha256 as recorded with the previous golden
+(`cbf2bbcf…` trunk, `bc695a00…` sidecar):
+
+```bash
+ROCR_VISIBLE_DEVICES=1 python3 scripts/serve_harness.py \
+  --model /home/kaden/ds4-gfx1151-evidence/2026-08-03-ds4-dspark-pm4-canary/model-e8/deepseek-v4-flash-0731.mq2r \
+  --kv q8 --kv-backend contiguous \
+  --speculation dspark --mtp off --dflash off \
+  --thinking off --thinking-effort none \
+  --sampling greedy --max-tokens 128 --mode battery \
+  --prompts-file benchmarks/prompts/ds4_dspark_genre_code.json
+```
+
+**Validity signature.** A run of this fixture that does not report
+`tau = 2.0238095238095237` with `ctx=25 gen=128` is not the golden
+configuration, whatever tok/s it prints. Two failure modes hit this exact
+fixture during the work recorded here: DSpark silently falling back to AR when
+no `-dspark` sibling sits beside the model path (`tau` comes back null), and a
+neighbouring evidence trio that used `--max-tokens 256` and therefore reports
+a legitimately different tau of 1.8022. Check tau before trusting the number.
+
 ## 1. The shipped win: tiled LDS top-K gather
 
 **Oracle:** `scripts/serve_harness.py` on the golden k6 fixture. This is the

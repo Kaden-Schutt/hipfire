@@ -4,6 +4,16 @@ Date: 2026-08-06
 Branch: `ds4-beta-staging`  
 Host/device: `hipx`, Radeon 8060S, `gfx1151`, ROCm 7.14
 
+> **Superseded as the k6 baseline (2026-08-08).** The 37.3165 tok/s figure below
+> remains the correct golden *for the commit it was measured at*, and this
+> document's k6/k4 comparison stands. It is no longer the number to benchmark
+> against: the tiled LDS top-K gather (`3bc2b47ee`) moved the shipping k6 path
+> to **38.97192 tok/s** median. See
+> [`2026-08-08-ds4-gfx1151-decode-roofline.md`](2026-08-08-ds4-gfx1151-decode-roofline.md)
+> § "Current k6 golden" for the current reference, and § 6 of that document for
+> the verify cost model, which corrects the assumption that decode throughput
+> scales with tau.
+
 This comparison reproduces the shipping top-k6 DSpark golden three times and
 then measures the same production serve path three times with runtime routed
 expert fanout set to four. It supersedes the earlier `dspark_bench` k4 smoke
