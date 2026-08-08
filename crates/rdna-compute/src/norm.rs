@@ -2246,12 +2246,6 @@ impl Gpu {
         // when both code paths are compiled into one function (108→172 bytes scratch).
         // EF residual is supported in both paths; the split is only about cadence.
         let use_fast = !dn_requant_per_token();
-        // Single-token entry point has no slot concept of its own; this call
-        // site always launches in legacy (slot 0, zero-stride) mode, which
-        // the kernel's `row_slot == nullptr` fast path makes bitwise
-        // identical to the pre-slot addressing.
-        let row_slot_null: *mut c_void = std::ptr::null_mut();
-        let s_stride_zero: i32 = 0;
 
         let result = if use_fast {
             self.ensure_kernel(
@@ -2273,8 +2267,6 @@ impl Gpu {
                 &hd as *const _ as *mut c_void,
                 &fr as *const _ as *mut c_void,
                 &efp as *const _ as *mut c_void,
-                &row_slot_null as *const _ as *mut c_void,
-                &s_stride_zero as *const _ as *mut c_void,
             ];
             let timer = crate::profile::begin_timer(
                 &self.hip,
@@ -2303,8 +2295,6 @@ impl Gpu {
                     b.push_i32(hd);
                     b.push_i32(fr);
                     b.push_ptr(efp);
-                    b.push_ptr(row_slot_null);
-                    b.push_i32(s_stride_zero);
                     b
                 },
             );
@@ -2535,22 +2525,23 @@ impl Gpu {
     /// gate/beta are [N × n_heads] row-major.
     /// S_q8 / s_scales are the shared state (advanced N steps).
     ///
-    /// `row_slot` / `s_stride_elems`: DeltaNet's S state is fixed-size and
-    /// per-slot independent (unlike KV, no shared arena, no ragged length,
-    /// no offset descriptor) — so the slot axis here is a stride, not a
-    /// descriptor table. `row_slot[0]` selects the slot for the *entire*
-    /// launch: the recurrence is sequential within a slot and never crosses
-    /// slots, so one launch advances exactly one slot across its `n_tokens`
-    /// tokens (a batch spanning several slots issues one launch per slot).
-    /// `row_slot == None` (equivalently a null device pointer) with
-    /// `s_stride_elems == 0` is legacy mode: the offset is 0 and addressing
-    /// is bitwise unchanged. Only wired into the fast (`gated_delta_net_q8_fast`)
-    /// kernel; the per-token-requant slow path (`gated_delta_net_q8`) does not
-    /// support slots yet, so `row_slot.is_some()` with that path is rejected
-    /// host-side rather than silently pinning every slot's writes to slot 0.
+    /// There is deliberately NO slot axis on this kernel. DeltaNet's S state is
+    /// fixed-size and per-slot independent, and one launch advances exactly one
+    /// slot, so a caller serving slot `i` simply passes slot `i`'s own state
+    /// tensors — SP3 holds one `DeltaNetState` per slot for that reason.
+    ///
+    /// An earlier revision added `row_slot` / `s_stride_elems` kernel params to
+    /// express the slot axis as a stride. That was wrong twice over: one stride
+    /// cannot serve both `s_q8` ([n_heads x HD x HD] per slot) and `s_scales`
+    /// ([n_heads x HD] per slot), and `s_ef_residual` was never strided at all.
+    /// It was also actively harmful — `gated_delta_net_q8_fast.hip` is the
+    /// shared source for the `gated_delta_net_q8_compact2_*` variants too, so
+    /// two extra params changed the ABI of kernels whose launch sites still
+    /// packed the old 13, and the single-sequence decode path segfaulted inside
+    /// hipModuleLaunchKernel. The params are gone; the ABI is single again.
     #[cfg(feature = "deltanet")]
     #[allow(clippy::too_many_arguments)]
-    pub fn gated_delta_net_q8_batch_seq_slots(
+    pub fn gated_delta_net_q8_batch_seq(
         &mut self,
         q_batch: &GpuTensor,
         k_batch: &GpuTensor,
@@ -2567,48 +2558,10 @@ impl Gpu {
         // batched path requants per token in-launch, so EF carries token-to-token
         // (and chunk-boundary) error — consistent with the per-token decode/replay.
         ef_residual: Option<&GpuTensor>,
-        row_slot: Option<&GpuTensor>,
-        // RETAINED FOR ABI ONLY — must be 0. See the rejection below.
-        s_stride_elems: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
 
-        // The per-slot STRIDE design is unsound and is rejected rather than
-        // silently miscomputing. Two independent defects, both found before any
-        // caller existed:
-        //
-        //   1. ONE stride cannot serve both buffers. `s_q8` is
-        //      [n_heads x HD x HD] per slot while `s_scales` is [n_heads x HD]
-        //      — a factor of HD (128) apart. Applying the s_q8 stride to
-        //      s_scales would index slot 1 at 524,288 elements into a buffer
-        //      holding 4,096 per slot: a large out-of-bounds read.
-        //   2. `s_ef_residual` was never strided at all, so every slot would
-        //      alias slot 0's error-feedback residual.
-        //
-        // The correct design needs no stride. DeltaNet state is fixed-size and
-        // per-slot independent, and one launch already advances exactly ONE
-        // slot, so the caller simply passes THAT SLOT'S OWN state tensors to
-        // the existing `gated_delta_net_q8_batch_seq`. SP3 holds one
-        // `DeltaNetState` per slot for precisely this reason.
-        //
-        // Legacy behaviour is unaffected: stride 0 with a null `row_slot` is
-        // bitwise identical to the pre-SP2 path.
-        assert_eq!(
-            s_stride_elems, 0,
-            "gated_delta_net_q8_batch_seq_slots: the per-slot stride design is \
-             unsound (s_q8 and s_scales strides differ by HD; s_ef_residual was \
-             never strided). Pass each slot's own DeltaNetState tensors to \
-             gated_delta_net_q8_batch_seq instead — one launch advances one slot."
-        );
         let use_fast = !dn_requant_per_token();
-        if row_slot.is_some() && !use_fast {
-            return Err(hip_bridge::HipError::new(
-                0,
-                "gated_delta_net_q8_batch_seq_slots: slot mode requires the fast \
-                 (single-end-requant) kernel; HIPFIRE_DN_REQUANT_PER_TOKEN=1 selects the \
-                 per-token-requant slow kernel, which does not support the slot axis yet",
-            ));
-        }
         let kernel_name = if use_fast {
             "gated_delta_net_q8_fast"
         } else {
@@ -2648,10 +2601,6 @@ impl Gpu {
             .map(|t| t.buf.as_ptr())
             .unwrap_or(std::ptr::null_mut());
         let mut rpt = dn_requant_per_token() as i32;
-        let mut rsp: *mut c_void = row_slot
-            .map(|t| t.buf.as_ptr())
-            .unwrap_or(std::ptr::null_mut());
-        let mut sse = s_stride_elems as i32;
         let bytes = crate::profile::gated_delta_net_q8_bytes(n_tokens, n_heads, head_dim);
         let timer = crate::profile::begin_timer(
             &self.hip,
@@ -2675,8 +2624,6 @@ impl Gpu {
                 &mut hd as *mut _ as *mut c_void,
                 &mut fr as *mut _ as *mut c_void,
                 &mut efp as *mut _ as *mut c_void,
-                &mut rsp as *mut _ as *mut c_void,
-                &mut sse as *mut _ as *mut c_void,
             ];
             self.launch_maybe_blob(
                 "gated_delta_net_q8_fast",
@@ -2699,8 +2646,6 @@ impl Gpu {
                     b.push_i32(hd);
                     b.push_i32(fr);
                     b.push_ptr(efp);
-                    b.push_ptr(rsp);
-                    b.push_i32(sse);
                     b
                 },
             )
@@ -2751,44 +2696,6 @@ impl Gpu {
             t.finish(&self.hip);
         }
         result
-    }
-
-    /// Legacy single-slot entry point. Preserved so existing call sites are
-    /// untouched; passes `None, 0` (null row_slot, zero stride), which the
-    /// kernel's `row_slot == nullptr` fast path treats as slot 0 with a
-    /// zero offset — bitwise identical to the pre-slot addressing.
-    #[cfg(feature = "deltanet")]
-    pub fn gated_delta_net_q8_batch_seq(
-        &mut self,
-        q_batch: &GpuTensor,
-        k_batch: &GpuTensor,
-        v_batch: &GpuTensor,
-        gate_batch: &GpuTensor,
-        beta_batch: &GpuTensor,
-        s_q8: &GpuTensor,
-        s_scales: &GpuTensor,
-        output_batch: &GpuTensor,
-        n_tokens: usize,
-        n_heads: usize,
-        head_dim: usize,
-        ef_residual: Option<&GpuTensor>,
-    ) -> HipResult<()> {
-        self.gated_delta_net_q8_batch_seq_slots(
-            q_batch,
-            k_batch,
-            v_batch,
-            gate_batch,
-            beta_batch,
-            s_q8,
-            s_scales,
-            output_batch,
-            n_tokens,
-            n_heads,
-            head_dim,
-            ef_residual,
-            None,
-            0,
-        )
     }
 
     /// Tree-aware variant of `gated_delta_net_q8_batch_seq`. Per-token
