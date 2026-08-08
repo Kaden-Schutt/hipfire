@@ -34,7 +34,9 @@ fn main() {
     };
     use hipfire_arch_qwen35::scheduler::{PendingWork, Scheduler};
     use hipfire_runtime::hfq::HfqFile;
-    use hipfire_runtime::swap::snapshot::{capture_slot, restore_slot, SnapshotStamp, SlotSnapshot};
+    use hipfire_runtime::swap::snapshot::{
+        capture_slot, restore_slot, SlotSnapshot, SnapshotStamp,
+    };
     use hipfire_runtime::swap::SwapError;
     use hipfire_runtime::tokenizer::Tokenizer;
     use rdna_compute::kv_slots::{preflight_alloc, R9700_VRAM_BYTES};
@@ -104,9 +106,7 @@ fn main() {
     let pbs = PrefillBatchScratch::new(&mut gpu, &config, max_batch).expect("pbs");
     let scratch =
         Qwen35Scratch::new_with_kv_max(&mut gpu, &config, 64, cap_tokens).expect("scratch");
-    let logits_out = gpu
-        .zeros(&[config.vocab_size], DType::F32)
-        .expect("logits");
+    let logits_out = gpu.zeros(&[config.vocab_size], DType::F32).expect("logits");
 
     // The DeltaNet buffers, in the order `DeltaNetState::reset` uses. This
     // ordering is the contract between capture and restore; both call sites
@@ -173,17 +173,28 @@ fn main() {
 
     let dn_refs = dn_buffers(&dn_states[0]);
     let before = capture_slot(
-        &mut gpu, &pool, SlotId(0), &k_arenas, &v_arenas, &dn_refs, &prompt, stamp,
+        &mut gpu,
+        &pool,
+        SlotId(0),
+        &k_arenas,
+        &v_arenas,
+        &dn_refs,
+        &prompt,
+        stamp,
     )
     .expect("capture");
     drop(dn_refs);
 
     // ---- scribble: a restore that copies nothing must not pass ----
     for a in k_arenas.iter().chain(v_arenas.iter()) {
-        gpu.hip.memset(&a.buf, 0xAB, a.buf.size()).expect("scribble kv");
+        gpu.hip
+            .memset(&a.buf, 0xAB, a.buf.size())
+            .expect("scribble kv");
     }
     for t in dn_buffers(&dn_states[0]) {
-        gpu.hip.memset(&t.buf, 0xCD, t.buf.size()).expect("scribble dn");
+        gpu.hip
+            .memset(&t.buf, 0xCD, t.buf.size())
+            .expect("scribble dn");
     }
     gpu.hip.device_synchronize().expect("sync");
 
@@ -191,7 +202,14 @@ fn main() {
     // proves it reads the region the scribble touched and not some other one.
     let dn_refs = dn_buffers(&dn_states[0]);
     let scribbled = capture_slot(
-        &mut gpu, &pool, SlotId(0), &k_arenas, &v_arenas, &dn_refs, &prompt, stamp,
+        &mut gpu,
+        &pool,
+        SlotId(0),
+        &k_arenas,
+        &v_arenas,
+        &dn_refs,
+        &prompt,
+        stamp,
     )
     .expect("capture scribbled");
     drop(dn_refs);
@@ -219,7 +237,14 @@ fn main() {
 
     let dn_refs = dn_buffers(&dn_states[0]);
     let after = capture_slot(
-        &mut gpu, &pool, SlotId(0), &k_arenas, &v_arenas, &dn_refs, &prompt, stamp,
+        &mut gpu,
+        &pool,
+        SlotId(0),
+        &k_arenas,
+        &v_arenas,
+        &dn_refs,
+        &prompt,
+        stamp,
     )
     .expect("capture after");
     drop(dn_refs);
@@ -288,7 +313,14 @@ fn main() {
     // A refused restore must have left the slot alone.
     let dn_refs = dn_buffers(&dn_states[0]);
     let untouched = capture_slot(
-        &mut gpu, &pool, SlotId(0), &k_arenas, &v_arenas, &dn_refs, &prompt, stamp,
+        &mut gpu,
+        &pool,
+        SlotId(0),
+        &k_arenas,
+        &v_arenas,
+        &dn_refs,
+        &prompt,
+        stamp,
     )
     .expect("capture untouched");
     drop(dn_refs);

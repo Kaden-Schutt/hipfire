@@ -22,17 +22,37 @@ use rdna_compute::slot_pool::{SlotId, SlotPool};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SessionId(pub u64);
 
+/// Where a session's GPU state currently lives.
+///
+/// A property of the SESSION, not the slot: a restored session may land in a
+/// different slot than it left, so nothing may assume slot affinity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Residency {
+    /// Holds a slot; its KV and recurrent state are on the GPU.
+    Resident,
+    /// Holds no slot, but a snapshot exists and can be restored.
+    Swapped,
+    /// Holds no slot and no snapshot. Its tokens are still authoritative, so
+    /// the next turn re-prefills from them. Every swap failure lands here.
+    Cold,
+}
+
 pub struct Session {
-    pub slot: SlotId,
+    /// `None` whenever the session is not `Resident`.
+    pub slot: Option<SlotId>,
     pub granted_ctx: usize,
     pub tokens: Vec<u32>,
     pub next_pos: usize,
+    pub residency: Residency,
+    /// Monotonic stamp for LRU. Bumped by `touch`.
+    pub last_used: u64,
 }
 
 #[derive(Default)]
 pub struct SessionTable {
     sessions: HashMap<u64, Session>,
     next_id: u64,
+    clock: u64,
 }
 
 impl SessionTable {
@@ -64,10 +84,15 @@ impl SessionTable {
         self.sessions.insert(
             id,
             Session {
-                slot,
+                slot: Some(slot),
                 granted_ctx,
                 tokens: Vec::new(),
                 next_pos: 0,
+                residency: Residency::Resident,
+                last_used: {
+                    self.clock += 1;
+                    self.clock
+                },
             },
         );
         Ok(SessionId(id))
@@ -76,7 +101,9 @@ impl SessionTable {
     /// Close a session, returning its slot and budget together.
     pub fn close(&mut self, pool: &mut SlotPool, adm: &mut AdmissionController, id: SessionId) {
         if let Some(session) = self.sessions.remove(&id.0) {
-            pool.release(session.slot);
+            if let Some(slot) = session.slot {
+                pool.release(slot);
+            }
             adm.release(session.granted_ctx);
         }
     }
@@ -112,13 +139,78 @@ impl SessionTable {
             .sessions
             .get_mut(&id.0)
             .ok_or_else(|| format!("begin_turn: unknown session {}", id.0))?;
-        let held = pool.descriptors()[session.slot.0].seq_len as usize;
+        let slot = session
+            .slot
+            .ok_or_else(|| format!("begin_turn: session {} holds no slot", id.0))?;
+        let held = pool.descriptors()[slot.0].seq_len as usize;
         let plan = plan_turn(&session.tokens, held, prompt);
-        pool.set_seq_len(session.slot, plan.reused)
+        pool.set_seq_len(slot, plan.reused)
             .map_err(|e| format!("begin_turn: {e}"))?;
         session.tokens.truncate(plan.reused);
         session.next_pos = plan.reused;
         Ok(plan)
+    }
+
+    /// Mark a session as most-recently used, for LRU.
+    pub fn touch(&mut self, id: SessionId) {
+        self.clock += 1;
+        let now = self.clock;
+        if let Some(s) = self.sessions.get_mut(&id.0) {
+            s.last_used = now;
+        }
+    }
+
+    /// The least-recently-used session that currently holds a slot and is not
+    /// in `busy`.
+    ///
+    /// Sessions mid-generation are never candidates: preempting one would
+    /// strand a half-finished response. When every resident session is busy
+    /// this returns `None`, and the caller must queue or reject rather than
+    /// thrash.
+    pub fn lru_idle_victim(&self, busy: &[SessionId]) -> Option<SessionId> {
+        self.sessions
+            .iter()
+            .filter(|(id, s)| s.slot.is_some() && !busy.iter().any(|b| b.0 == **id))
+            .min_by_key(|(_, s)| s.last_used)
+            .map(|(id, _)| SessionId(*id))
+    }
+
+    /// Give up the slot, keeping the session restorable from its snapshot.
+    pub fn mark_swapped(&mut self, pool: &mut SlotPool, id: SessionId) {
+        if let Some(s) = self.sessions.get_mut(&id.0) {
+            if let Some(slot) = s.slot.take() {
+                pool.release(slot);
+            }
+            s.residency = Residency::Swapped;
+        }
+    }
+
+    /// Give up the slot with no usable snapshot. The tokens survive, so the
+    /// next turn re-prefills — slow, never wrong. Every swap failure ends here.
+    pub fn mark_cold(&mut self, pool: &mut SlotPool, id: SessionId) {
+        if let Some(s) = self.sessions.get_mut(&id.0) {
+            if let Some(slot) = s.slot.take() {
+                pool.release(slot);
+            }
+            s.residency = Residency::Cold;
+            s.next_pos = 0;
+        }
+    }
+
+    /// Re-attach a session to a slot after its state has been restored.
+    pub fn mark_resident(&mut self, id: SessionId, slot: SlotId, seq_len: usize) {
+        self.clock += 1;
+        let now = self.clock;
+        if let Some(s) = self.sessions.get_mut(&id.0) {
+            s.slot = Some(slot);
+            s.residency = Residency::Resident;
+            s.next_pos = seq_len;
+            s.last_used = now;
+        }
+    }
+
+    pub fn resident(&self) -> usize {
+        self.sessions.values().filter(|s| s.slot.is_some()).count()
     }
 
     pub fn active(&self) -> usize {
@@ -205,7 +297,8 @@ mod tests {
             s.tokens.extend_from_slice(&[1, 2, 3, 4]);
             s.next_pos = 4;
         }
-        pool.set_seq_len(t.get(id).unwrap().slot, 4).unwrap();
+        pool.set_seq_len(t.get(id).unwrap().slot.unwrap(), 4)
+            .unwrap();
 
         // Turn 2 continues the same conversation.
         let plan = t.begin_turn(&mut pool, id, &[1, 2, 3, 4, 5, 6]).unwrap();
@@ -218,7 +311,7 @@ mod tests {
             vec![1, 2, 3, 4],
             "tokens truncated to the reuse point"
         );
-        assert_eq!(pool.descriptors()[s.slot.0].seq_len, 4);
+        assert_eq!(pool.descriptors()[s.slot.unwrap().0].seq_len, 4);
     }
 
     #[test]
@@ -230,7 +323,8 @@ mod tests {
             s.tokens.extend_from_slice(&[1, 2, 3, 4]);
             s.next_pos = 4;
         }
-        pool.set_seq_len(t.get(id).unwrap().slot, 4).unwrap();
+        pool.set_seq_len(t.get(id).unwrap().slot.unwrap(), 4)
+            .unwrap();
 
         let plan = t.begin_turn(&mut pool, id, &[1, 2, 7, 8]).unwrap();
         assert_eq!(plan.reused, 2);
@@ -239,7 +333,7 @@ mod tests {
         assert_eq!(s.tokens, vec![1, 2], "diverged tokens are dropped");
         assert_eq!(s.next_pos, 2);
         assert_eq!(
-            pool.descriptors()[s.slot.0].seq_len,
+            pool.descriptors()[s.slot.unwrap().0].seq_len,
             2,
             "the slot must forget the diverged KV"
         );
@@ -251,6 +345,88 @@ mod tests {
         let id = t.open(&mut pool, &mut adm, 1024).unwrap();
         t.close(&mut pool, &mut adm, id);
         assert!(t.begin_turn(&mut pool, id, &[1, 2]).is_err());
+    }
+
+    #[test]
+    fn lru_victim_is_the_least_recently_used_idle_session() {
+        let (mut pool, mut adm, mut t) = rig(3);
+        let a = t.open(&mut pool, &mut adm, 1024).unwrap();
+        let b = t.open(&mut pool, &mut adm, 1024).unwrap();
+        let c = t.open(&mut pool, &mut adm, 1024).unwrap();
+        t.touch(a);
+        t.touch(c);
+        t.touch(b); // a is now oldest
+        assert_eq!(t.lru_idle_victim(&[]), Some(a));
+    }
+
+    #[test]
+    fn a_busy_session_is_never_evicted() {
+        let (mut pool, mut adm, mut t) = rig(2);
+        let a = t.open(&mut pool, &mut adm, 1024).unwrap();
+        let b = t.open(&mut pool, &mut adm, 1024).unwrap();
+        t.touch(a);
+        t.touch(b); // a is oldest, but busy
+        assert_eq!(t.lru_idle_victim(&[a]), Some(b));
+        assert_eq!(
+            t.lru_idle_victim(&[a, b]),
+            None,
+            "all resident sessions busy => no victim, caller must queue"
+        );
+    }
+
+    #[test]
+    fn a_swapped_session_holds_no_slot_and_frees_it() {
+        let (mut pool, mut adm, mut t) = rig(1);
+        let a = t.open(&mut pool, &mut adm, 1024).unwrap();
+        t.mark_swapped(&mut pool, a);
+        assert!(t.get(a).unwrap().slot.is_none());
+        assert_eq!(t.get(a).unwrap().residency, Residency::Swapped);
+        assert_eq!(t.resident(), 0);
+        t.open(&mut pool, &mut adm, 1024)
+            .expect("the freed slot must be reusable");
+    }
+
+    #[test]
+    fn a_cold_session_keeps_its_tokens() {
+        let (mut pool, mut adm, mut t) = rig(1);
+        let a = t.open(&mut pool, &mut adm, 1024).unwrap();
+        t.get_mut(a).unwrap().tokens.extend_from_slice(&[1, 2, 3]);
+        t.mark_cold(&mut pool, a);
+        assert_eq!(t.get(a).unwrap().residency, Residency::Cold);
+        assert_eq!(
+            t.get(a).unwrap().tokens,
+            vec![1, 2, 3],
+            "tokens are authoritative and must survive going cold"
+        );
+        assert_eq!(t.get(a).unwrap().next_pos, 0, "cold means recompute from 0");
+    }
+
+    #[test]
+    fn a_restored_session_may_land_in_a_different_slot() {
+        let (mut pool, mut adm, mut t) = rig(2);
+        let a = t.open(&mut pool, &mut adm, 1024).unwrap();
+        let first = t.get(a).unwrap().slot.unwrap();
+        t.mark_swapped(&mut pool, a);
+        // The pool hands back whichever slot is free, which is usually the one
+        // just released. What matters is that mark_resident accepts ANY slot --
+        // residency is a property of the session, not the slot -- so restore
+        // into a deliberately different one.
+        let other = SlotId(if first.0 == 0 { 1 } else { 0 });
+        t.mark_resident(a, other, 7);
+        assert_eq!(t.get(a).unwrap().slot, Some(other));
+        assert_eq!(t.get(a).unwrap().next_pos, 7);
+        assert_eq!(t.get(a).unwrap().residency, Residency::Resident);
+    }
+
+    #[test]
+    fn begin_turn_on_a_swapped_session_is_an_error() {
+        let (mut pool, mut adm, mut t) = rig(1);
+        let a = t.open(&mut pool, &mut adm, 1024).unwrap();
+        t.mark_swapped(&mut pool, a);
+        assert!(
+            t.begin_turn(&mut pool, a, &[1, 2]).is_err(),
+            "a session with no slot cannot begin a turn"
+        );
     }
 
     #[test]

@@ -47,6 +47,11 @@ pub struct AdmissionController {
     budget_bytes: u64,
     /// Granted context per admitted session, in tokens.
     admitted: Vec<usize>,
+    /// Host-tier budget for swapped-out snapshots. Separate from the VRAM
+    /// budget: admission is the production memory gate for BOTH, because the
+    /// control group does not contain amdgpu GTT.
+    host_budget: u64,
+    host_used: u64,
 }
 
 impl AdmissionController {
@@ -55,6 +60,8 @@ impl AdmissionController {
             footprint,
             budget_bytes,
             admitted: Vec::new(),
+            host_budget: crate::swap::DEFAULT_HOST_BUDGET_BYTES,
+            host_used: 0,
         }
     }
 
@@ -99,6 +106,34 @@ impl AdmissionController {
     }
 
     /// Return a session's context allowance to the budget.
+    /// Reserve host-tier bytes for a swapped-out session. Returns false when
+    /// the budget cannot cover it, in which case the caller spills to disk
+    /// rather than exceeding the budget.
+    pub fn admit_host(&mut self, bytes: u64) -> bool {
+        if self.host_used.saturating_add(bytes) > self.host_budget {
+            return false;
+        }
+        self.host_used += bytes;
+        true
+    }
+
+    pub fn release_host(&mut self, bytes: u64) {
+        self.host_used = self.host_used.saturating_sub(bytes);
+    }
+
+    pub fn host_used_bytes(&self) -> u64 {
+        self.host_used
+    }
+
+    pub fn host_budget_bytes(&self) -> u64 {
+        self.host_budget
+    }
+
+    /// Set the host-tier budget. Defaults to `DEFAULT_HOST_BUDGET_BYTES`.
+    pub fn set_host_budget(&mut self, bytes: u64) {
+        self.host_budget = bytes;
+    }
+
     pub fn release(&mut self, granted_ctx: usize) {
         if let Some(i) = self.admitted.iter().position(|&c| c == granted_ctx) {
             self.admitted.remove(i);
@@ -216,5 +251,27 @@ mod tests {
             a.admit(2 * 1024 * 1024).is_err(),
             "must reject, not silently truncate"
         );
+    }
+
+    #[test]
+    fn the_host_tier_has_its_own_budget() {
+        let mut a = AdmissionController::new(
+            ModelFootprint {
+                weights_bytes: 0,
+                kv_bytes_per_token: 0,
+            },
+            1 << 30,
+        );
+        a.set_host_budget(1000);
+        assert!(a.admit_host(600));
+        assert_eq!(a.host_used_bytes(), 600);
+        assert!(
+            !a.admit_host(600),
+            "the second must not fit; the caller spills to disk instead"
+        );
+        assert_eq!(a.host_used_bytes(), 600, "a refused admit reserves nothing");
+        a.release_host(600);
+        assert_eq!(a.host_used_bytes(), 0);
+        assert!(a.admit_host(600), "released budget must be reusable");
     }
 }
