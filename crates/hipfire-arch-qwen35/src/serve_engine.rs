@@ -431,6 +431,50 @@ fn admit(
 ) {
     let busy: Vec<SessionId> = slots.iter().flatten().map(|f| f.session).collect();
 
+    // Multi-turn prefix reuse. OpenAI chat completions are stateless -- the
+    // client resends the whole conversation each turn -- so a follow-up turn
+    // is recognised by its prompt STRICTLY EXTENDING a resident session's
+    // tokens. `find_extendable` enforces strict extension because DeltaNet
+    // state is recurrent and cannot be rewound (see its doc comment).
+    //
+    // Reusing skips both the fresh `open` and the DN reset: keeping that
+    // recurrent state is exactly what makes the second turn cheap.
+    if let Some(existing) = rig.sessions.find_extendable(&req.prompt_tokens, &busy) {
+        if let Some(slot) = rig.sessions.get(existing).and_then(|s| s.slot) {
+            if let Ok(plan) = rig
+                .sessions
+                .begin_turn(&mut rig.pool, existing, &req.prompt_tokens)
+            {
+                if let Some(sess) = rig.sessions.get_mut(existing) {
+                    sess.tokens = req.prompt_tokens.clone();
+                }
+                if send_event(
+                    &req.reply,
+                    Event::Accepted {
+                        session: existing.0,
+                    },
+                )
+                .is_ok()
+                {
+                    work[slot.0].remaining_prompt = req.prompt_tokens[plan.reused..].to_vec();
+                    work[slot.0].next_pos = plan.reused;
+                    work[slot.0].decoding = false;
+                    slots[slot.0] = Some(InFlight {
+                        session: existing,
+                        reply: req.reply,
+                        produced: 0,
+                        max_tokens: req.max_tokens.max(1),
+                    });
+                    rig.sessions.touch(existing);
+                    let mut st = stats.lock().expect("stats");
+                    st.note_admitted();
+                    st.note_restore(); // a prefix-cache hit
+                }
+                return;
+            }
+        }
+    }
+
     // Try to open; if the pool is full, evict the LRU idle session first.
     let id = match rig
         .sessions

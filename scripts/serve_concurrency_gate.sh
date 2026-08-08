@@ -172,4 +172,99 @@ if speedup < min_speedup:
     sys.exit(1)
 PY
 
+# ---- streaming (`"stream": true`) goes through respond_streaming, a
+# different function from the non-streaming path above. Agents commonly use
+# it, so it gets its own assertions: SSE framing, at least one content
+# delta, and the [DONE] sentinel.
+echo "--- streaming request ---"
+code="$(curl -s -m 300 -X POST "$URL" -H 'Content-Type: application/json' \
+  -d "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"What is the capital of France?\"}],\"max_tokens\":$MAX_TOKENS,\"stream\":true}" \
+  -o "$WORK/stream.sse" -w '%{http_code}')"
+[ "$code" = "200" ] || fail "streaming request returned HTTP $code"
+
+python3 - "$WORK/stream.sse" <<'PY2' || exit 1
+import json, sys
+path = sys.argv[1]
+lines = [l for l in open(path).read().splitlines() if l.startswith("data: ")]
+if not lines:
+    print("FAIL: streaming response contained no SSE `data:` frames", file=sys.stderr)
+    sys.exit(1)
+if lines[-1].strip() != "data: [DONE]":
+    print(f"FAIL: stream did not end with [DONE], last frame: {lines[-1][:80]!r}", file=sys.stderr)
+    sys.exit(1)
+text = ""
+for l in lines[:-1]:
+    try:
+        obj = json.loads(l[6:])
+    except json.JSONDecodeError:
+        print(f"FAIL: SSE frame is not valid JSON: {l[:80]!r}", file=sys.stderr)
+        sys.exit(1)
+    if obj.get("object") != "chat.completion.chunk":
+        print(f"FAIL: unexpected SSE object {obj.get('object')!r}", file=sys.stderr)
+        sys.exit(1)
+    text += obj["choices"][0].get("delta", {}).get("content", "") or ""
+if not text.strip():
+    print("FAIL: stream delivered frames but no content deltas", file=sys.stderr)
+    sys.exit(1)
+print(f"  {len(lines)} SSE frames, {len(text)} chars of content, [DONE] present")
+print(f"  stream: {text[-46:]!r}")
+PY2
+
+# ---- multi-turn prefix reuse. OpenAI completions are stateless, so a
+# follow-up turn resends the WHOLE conversation: [user, assistant, user].
+# That is what makes turn 2's rendered tokens a strict extension of turn 1's;
+# merely appending text to a single user message is NOT, because the chat
+# frame puts the assistant opener at the end.
+echo "--- multi-turn prefix reuse ---"
+LONG="$(python3 -c 'print("Explain the history of the Roman empire in detail. " * 40, end="")')"
+
+S=$(date +%s.%N)
+code="$(curl -s -m 300 -X POST "$URL" -H 'Content-Type: application/json' \
+  -d "$(python3 -c 'import json,sys; print(json.dumps({"model":"m","messages":[{"role":"user","content":sys.argv[1]}],"max_tokens":int(sys.argv[2])}))' "$LONG" "$MAX_TOKENS")" \
+  -o "$WORK/t1.json" -w '%{http_code}')"
+E=$(date +%s.%N)
+[ "$code" = "200" ] || fail "turn 1 returned HTTP $code"
+T1=$(echo "$E - $S" | bc)
+
+REPLY="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["choices"][0]["message"]["content"])' "$WORK/t1.json")"
+S=$(date +%s.%N)
+code="$(curl -s -m 300 -X POST "$URL" -H 'Content-Type: application/json' \
+  -d "$(python3 -c 'import json,sys; print(json.dumps({"model":"m","messages":[{"role":"user","content":sys.argv[1]},{"role":"assistant","content":sys.argv[2]},{"role":"user","content":"And what caused its decline?"}],"max_tokens":int(sys.argv[3])}))' "$LONG" "$REPLY" "$MAX_TOKENS")" \
+  -o "$WORK/t2.json" -w '%{http_code}')"
+E=$(date +%s.%N)
+[ "$code" = "200" ] || fail "turn 2 returned HTTP $code"
+T2=$(echo "$E - $S" | bc)
+echo "  turn 1 (cold): ${T1}s   turn 2 (continues turn 1): ${T2}s"
+
+# KNOWN GAP, so this is reported rather than asserted by default. Set
+# SERVE_GATE_REQUIRE_REUSE=1 to make it a hard failure once it is fixed.
+#
+# The engine-side mechanism is correct and unit-tested
+# (`SessionTable::find_extendable`, strict-extension only because DeltaNet
+# state cannot be rewound). What does not line up is the chat template:
+# turn 1 generates after `<|im_start|>assistant\n<think>\n`, but turn 2
+# re-renders that same assistant turn as `<|im_start|>assistant\n{reply}
+# <|im_end|>` with NO `<think>` opener. The two token sequences diverge
+# there, so turn 2 is not a strict extension and reuse correctly declines.
+#
+# Fixing it means making history rendering reproduce what was actually
+# generated, which is what the daemon's `qwen35_history_render` modes do.
+# Until then a follow-up turn re-prefills, which is slow but never wrong.
+python3 - "$T1" "$T2" "${SERVE_GATE_REQUIRE_REUSE:-0}" <<'PY3' || exit 1
+import sys
+t1, t2, require = float(sys.argv[1]), float(sys.argv[2]), sys.argv[3] == "1"
+ratio = t2 / t1 if t1 > 0 else 1.0
+print(f"  turn2/turn1 = {ratio:.2f}")
+if ratio >= 0.90:
+    msg = ("turn 2 was not cheaper than turn 1 -- prefix reuse did not fire. "
+           "Known gap: the assistant opener does not render identically across "
+           "turns for a thinking model, so turn 2 is not a strict extension.")
+    if require:
+        print(f"FAIL: {msg}", file=sys.stderr)
+        sys.exit(1)
+    print(f"  KNOWN GAP: {msg}")
+else:
+    print(f"  reuse saved {100*(1-ratio):.0f}% of turn-2 latency")
+PY3
+
 echo "ALL CHECKS PASS"
