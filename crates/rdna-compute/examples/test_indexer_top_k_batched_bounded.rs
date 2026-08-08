@@ -2,8 +2,8 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Raw-order parity and shape-distributed microbench for the gfx1151 bounded
-//! batched indexer top-K used by DeepSeek V4 prefill.
+//! Raw-order parity and shape-distributed microbench for the gfx1151/gfx1201
+//! bounded batched indexer top-K used by DeepSeek V4 prefill.
 //!
 //! The portable O(N^2) rank-count and gfx1151 bounded O(N log^2 K) kernels run
 //! in the same process against the same frozen score buffer. Every ordered i32
@@ -69,7 +69,8 @@ fn build_scores(case: &Case) -> Vec<f32> {
             // Compressed history grows by roughly one row per four prompt
             // tokens. Earlier rows in the same chunk therefore have a real
             // -inf suffix even though the launch uses the chunk-wide n_iter.
-            case.n_iter.saturating_sub((case.batch - 1 - batch).div_ceil(4))
+            case.n_iter
+                .saturating_sub((case.batch - 1 - batch).div_ceil(4))
         } else {
             case.n_iter
         };
@@ -92,9 +93,7 @@ fn oracle(scores: &[f32], case: &Case) -> Vec<i32> {
         let row = &scores[batch * case.n_stride..batch * case.n_stride + case.n_iter];
         let mut indices: Vec<usize> = (0..case.n_iter).collect();
         indices.sort_unstable_by(|&lhs, &rhs| {
-            row[rhs]
-                .total_cmp(&row[lhs])
-                .then_with(|| lhs.cmp(&rhs))
+            row[rhs].total_cmp(&row[lhs]).then_with(|| lhs.cmp(&rhs))
         });
         for (rank, index) in indices.into_iter().take(K).enumerate() {
             out[batch * K + rank] = index as i32;
@@ -118,17 +117,30 @@ fn launch_reference(gpu: &mut Gpu, scores: &GpuTensor, out: &GpuTensor, case: &C
 }
 
 fn launch_candidate(gpu: &mut Gpu, scores: &GpuTensor, out: &GpuTensor, case: &Case) {
-    gpu.indexer_top_k_batched_bounded_gfx1151(
-        scores,
-        out,
-        1,
-        case.n_stride as i32,
-        case.n_iter as i32,
-        K as i32,
-        K.min(case.n_iter) as i32,
-        case.batch as i32,
-    )
-    .expect("launch gfx1151 bounded batched top-K");
+    let result = match gpu.arch.as_str() {
+        "gfx1151" => gpu.indexer_top_k_batched_bounded_gfx1151(
+            scores,
+            out,
+            1,
+            case.n_stride as i32,
+            case.n_iter as i32,
+            K as i32,
+            K.min(case.n_iter) as i32,
+            case.batch as i32,
+        ),
+        "gfx1201" => gpu.indexer_top_k_batched_bounded_gfx1201(
+            scores,
+            out,
+            1,
+            case.n_stride as i32,
+            case.n_iter as i32,
+            K as i32,
+            K.min(case.n_iter) as i32,
+            case.batch as i32,
+        ),
+        other => panic!("refuse: unsupported product-candidate arch {other}"),
+    };
+    result.expect("launch bounded batched top-K");
 }
 
 fn first_diff(lhs: &[i32], rhs: &[i32]) -> Option<(usize, i32, i32)> {
@@ -176,9 +188,9 @@ fn time_arm(
 
 fn main() {
     let mut gpu = Gpu::init().expect("GPU init");
-    assert_eq!(
-        gpu.arch, "gfx1151",
-        "refuse: this product-candidate probe is gfx1151-only"
+    assert!(
+        matches!(gpu.arch.as_str(), "gfx1151" | "gfx1201"),
+        "refuse: this product-candidate probe is gfx1151/gfx1201-only"
     );
     eprintln!("detected_arch={} arch_gate=PASS", gpu.arch);
 
@@ -245,10 +257,7 @@ fn main() {
         let reference_ms = time_arm(&mut gpu, &scores, &reference, case, false);
         let candidate_ms = time_arm(&mut gpu, &scores, &candidate, case, true);
         let speedup = reference_ms / candidate_ms;
-        let pass = ref_diff.is_none()
-            && cand_diff.is_none()
-            && poison_ref == 0
-            && poison_cand == 0;
+        let pass = ref_diff.is_none() && cand_diff.is_none() && poison_ref == 0 && poison_cand == 0;
         failed |= !pass;
         eprintln!(
             "CASE name={} batch={} n_iter={} n_stride={} raw_i32_equal={} \
@@ -268,9 +277,7 @@ fn main() {
             if pass { "PASS" } else { "FAIL" },
         );
         if let Some((slot, expected, actual)) = ref_diff {
-            eprintln!(
-                "  REFERENCE_DIFF slot={slot} oracle={actual} reference={expected}"
-            );
+            eprintln!("  REFERENCE_DIFF slot={slot} oracle={actual} reference={expected}");
         }
         if let Some((slot, reference_value, candidate_value)) = cand_diff {
             eprintln!(

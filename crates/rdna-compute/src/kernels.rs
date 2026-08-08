@@ -5753,6 +5753,11 @@ pub const INDEXER_TOP_K_BATCHED_SRC: &str =
 pub const INDEXER_TOP_K_BATCHED_BOUNDED_GFX1151_SRC: &str =
     include_str!("../../../kernels/src/indexer_top_k_batched_bounded.gfx1151.hip");
 
+/// gfx1201 exact bounded batched indexer top-K. Kept as a separate source and
+/// symbol so admitting RDNA4 cannot alter gfx1151's certified code object.
+pub const INDEXER_TOP_K_BATCHED_BOUNDED_GFX1201_SRC: &str =
+    include_str!("../../../kernels/src/indexer_top_k_batched_bounded.gfx1201.hip");
+
 /// HC 4-stream residual mix — BATCHED (Phase A5, 2026-05-18). Twin of
 /// HC_MIX_4STREAM_SRC; batch dim parallelizes cleanly across blockIdx.z.
 pub const HC_MIX_4STREAM_BATCHED_SRC: &str =

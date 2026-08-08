@@ -11971,6 +11971,23 @@ fn attention_block_batched_mixed(
                 .map_err(|e| {
                     format!("indexer_top_k_batched_bounded_gfx1151 l{layer_idx}: {e:?}")
                 })?;
+            } else if gpu.arch.eq_ignore_ascii_case("gfx1201") {
+                // gfx1201's portable rank-count is O(N^2) once compressed
+                // history exceeds K=512. Keep a separate symbol from gfx1151
+                // while using the same exact score/index ordering contract.
+                gpu.indexer_top_k_batched_bounded_gfx1201(
+                    &pbs.idx_scores_batch,
+                    &pbs.idx_topk_indices_batch,
+                    /*n_idx_heads=*/ 1,
+                    max_compressed as i32,
+                    n_max_chunk as i32,
+                    topk_max as i32,
+                    k_fill as i32,
+                    batch_size as i32,
+                )
+                .map_err(|e| {
+                    format!("indexer_top_k_batched_bounded_gfx1201 l{layer_idx}: {e:?}")
+                })?;
             } else {
                 gpu.indexer_top_k_batched(
                     &pbs.idx_scores_batch,
