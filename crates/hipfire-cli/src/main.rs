@@ -2859,6 +2859,11 @@ fn serve_foreground(
         }
         _ => None,
     };
+    let slot_concurrency = if slot_engine.is_some() {
+        config_u64(&global, "serve.multi_slot_slots").unwrap_or(4) as usize
+    } else {
+        1
+    };
     let shared = Arc::new(ServeShared {
         slot_engine,
         runtime: Mutex::new(ServeRuntime {
@@ -2884,12 +2889,14 @@ fn serve_foreground(
             last_activity: Instant::now(),
         }),
         max_request_bytes,
-        // Deliberately still 1-at-a-time. Widening this to `slot_concurrency`
-        // is the remaining step to real overlap, and in testing it made
-        // requests hang -- so the mechanism (`Admission::with_concurrency`) is
-        // in place and unit-tested, but the wiring is left off until that is
-        // understood. See the SP7 plan's execution record.
-        admission: Arc::new(Admission::new(max_queue, queue_timeout)),
+        // The HTTP gate must admit as many requests as there are slots, or
+        // they queue here and never reach the engine -- which is the exact
+        // serialisation this path exists to remove.
+        admission: Arc::new(Admission::with_concurrency(
+            max_queue,
+            queue_timeout,
+            slot_concurrency,
+        )),
         idle_timeout,
         retry_enabled,
         retry_backoff,
