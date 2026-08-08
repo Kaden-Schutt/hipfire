@@ -30,7 +30,7 @@ Emulation can prove structure and byte parity, but it cannot satisfy an acceptan
 
 ## Current Status
 
-**Foundation implemented; refactor incomplete.** `COR-001` through `COR-006`, `DOC-001`, `STEP-001`, `STEP-002`, `STEP-002R`, `PAR-001`, `CAP-001`, and `COMP-001` are complete. The mesh, manifest, Step execution, generic AR dispatch, model-parallel ownership, god-struct foundation, COR-002 terminal reset, COR-003 terminal lifecycle, COR-005 transactional loading, COR-006 eviction physical-cap KV alignment, STEP-001 DeltaNet migration, STEP-002 MoE Step/manifest adoption, STEP-002R owner-preserving bundle teardown, PAR-001 policy characterization, CAP-001 capability admission, and COMP-001 TP×EP refusal work are substantial and tested. `GEN-001` was briefly mis-marked complete in `b1d54d5c2`; corrected 2026-08-08 to blocked — Qwen35 arch-resident PP remains `generate_multi` (see the task's blocked reason). Remaining architecture migrations and the separate physical PP/TP/EP topology tasks tracked below remain open. No open item is implicitly waived by earlier emulated validation.
+**Foundation implemented; refactor incomplete.** `COR-001` through `COR-006`, `DOC-001`, `STEP-001`, `STEP-002`, `STEP-002R`, `STEP-003`, `PAR-001`, `CAP-001`, and `COMP-001` are complete. The mesh, manifest, Step execution, generic AR dispatch, model-parallel ownership, god-struct foundation, COR-002 terminal reset, COR-003 terminal lifecycle, COR-005 transactional loading, COR-006 eviction physical-cap KV alignment, STEP-001 DeltaNet migration, STEP-002 MoE Step/manifest adoption, STEP-002R owner-preserving bundle teardown, STEP-003 recurrent/conv Step/manifest adoption, PAR-001 policy characterization, CAP-001 capability admission, and COMP-001 TP×EP refusal work are substantial and tested. `GEN-001` was briefly mis-marked complete in `b1d54d5c2`; corrected 2026-08-08 to blocked, then unblocked the same day when STEP-003 completed (see the task's blocked reason). Remaining architecture migrations and the separate physical PP/TP/EP topology tasks tracked below remain open. No open item is implicitly waived by earlier emulated validation.
 
 Contributor validation on two gfx1201 R9700s (2026-07-14, commit `4df03537`) confirmed balanced Qwen35 PP allocation and peer access, but did not close either physical PP gate: dense LLaMA forward hit an unclassified illegal access and Qwen35 PP=2 diverged at token 58/100. The evidence and bounded follow-up are recorded under HW-003 and HW-004; neither changes the current execution queue or relaxes exact-parity requirements.
 
@@ -39,12 +39,13 @@ Contributor validation on two gfx1201 R9700s (2026-07-14, commit `4df03537`) con
 This is the implementation queue. The dependency graph below remains the
 authoritative constraint; a task is marked `in progress` only when work begins.
 
-1. `STEP-003` — adopt Step/manifest for recurrent and conv state (ready; deps COR-002, STEP-001 complete). Unblocks `STEP-004`, which gates `AXIS-001` through `AXIS-004`.
-2. `GEN-002` — DeepSeek4 single-GPU fallback (ready; deps COR-002 complete). Independent stream; can proceed alongside STEP-003.
-3. `SPEC-001` — unify AR and speculative orchestration (ready; deps COR-001..003 complete). Unblocks `SPEC-002` and `VL-002`.
-4. `VL-001` — shared lifecycle for Qwen35-VL (ready; deps COR-002, COR-003 complete). Independent multimodal stream.
+1. `STEP-003` — complete as of 2026-08-08 (`9dcb1862a` + increment 2 verification): all DeltaNet recurrent/conv ops run through Steps on the owning device.
+2. `STEP-004` — migrate remaining forward paths (ready; deps STEP-001, STEP-002, STEP-003, PAR-001 complete). Gates `AXIS-001` through `AXIS-004`.
+3. `GEN-002` — DeepSeek4 single-GPU fallback (ready; deps COR-002 complete). Independent stream; can proceed alongside STEP-004.
+4. `SPEC-001` — unify AR and speculative orchestration (ready; deps COR-001..003 complete). Unblocks `SPEC-002` and `VL-002`.
+5. `VL-001` — shared lifecycle for Qwen35-VL (ready; deps COR-002, COR-003 complete). Independent multimodal stream.
 
-`COMP-001` (TP×EP refusal) and `CAP-001` (capability contract + dense-EP normalization) are complete and are no longer queue items. `STEP-002R` (owner-preserving bundle teardown) is complete as of 2026-08-08 (PR #18 mirror, commits `064e26e0d` + `c7f142af8`). `GEN-001` is blocked on STEP-003. The `AXIS-001` through `AXIS-004`, `PAR-002`, and `HW-001` through `HW-013` tasks remain dependency-blocked until their capability, family, implementation, and topology prerequisites are satisfied. Hardware tasks remain blocked until the required distinct-GPU topology is available; emulation does not advance them toward completion.
+`COMP-001` (TP×EP refusal) and `CAP-001` (capability contract + dense-EP normalization) are complete and are no longer queue items. `STEP-002R` (owner-preserving bundle teardown) is complete as of 2026-08-08 (PR #18 mirror, commits `064e26e0d` + `c7f142af8`). `STEP-003` is complete as of 2026-08-08. `GEN-001` is unblocked and ready — its last pending dependency (STEP-003) is complete; all deps (COR-002, STEP-001, STEP-002, STEP-003) are satisfied. The `AXIS-001` through `AXIS-004`, `PAR-002`, and `HW-001` through `HW-013` tasks remain dependency-blocked until their capability, family, implementation, and topology prerequisites are satisfied. Hardware tasks remain blocked until the required distinct-GPU topology is available; emulation does not advance them toward completion.
 
 ## Completed Foundation Evidence
 
@@ -310,13 +311,13 @@ authoritative constraint; a task is marked `in progress` only when work begins.
 
 ### GEN-001 Complete Qwen35 Arch-Resident PP
 
-- **Status:** blocked
+- **Status:** ready
 - **Dependencies:** COR-002, STEP-001, STEP-002, STEP-003
 - **Goal:** Own and complete Qwen35 PP for both dense and MoE cells through the arch-resident `ModelParallel::Pp(PipelineImpl::ArchResident)` path for hybrid attention and DeltaNet layers.
 - **Acceptance criteria:** Dense and MoE Qwen35 load, prefill, decode, recurrent/conv state, sampling, and unload use the generic PP ownership and stage interfaces; the Qwen35 adapter implements the COR-002 reset contract without creating a second reset authority; no legacy `pp`/`pp_gpus` side channel or duplicate Qwen35 PP loop remains; dense and MoE emulated PP parity is byte- or token-identical before physical validation.
 - **Validation:** Run dense and MoE Qwen35 single-versus-emulated-PP deterministic parity, COR-002 conformance and recurrent multi-turn/reset tests, placement assertions, and repeated unload tests; then hand off both PP families to HW-004.
 - **Hardware:** One supported AMD GPU for emulated PP; physical closure is HW-004.
-- **Blocked reason:** Status correction 2026-08-08 — the `complete` flip in `b1d54d5c2` was premature. STEP-003 (recurrent/conv Step/manifest adoption) is not complete, PR #527's architecture table still records Qwen35 PP as `Partial: Pp(ArchResident), still generate_multi`, and `docs/MODELS.md` still labels PP "partial arch-resident (GEN-001; not production-supported)". The arch-resident PP owner exists but the generation path remains `generate_multi`, not the unified PP loop; the acceptance criteria and validation are unproven.
+- **Blocked reason (resolved 2026-08-08 — STEP-003 complete; see STEP-003 evidence):** Status correction 2026-08-08 — the `complete` flip in `b1d54d5c2` was premature. STEP-003 (recurrent/conv Step/manifest adoption) is not complete, PR #527's architecture table still records Qwen35 PP as `Partial: Pp(ArchResident), still generate_multi`, and `docs/MODELS.md` still labels PP "partial arch-resident (GEN-001; not production-supported)". The arch-resident PP owner exists but the generation path remains `generate_multi`, not the unified PP loop; the acceptance criteria and validation are unproven.
 - **Evidence:** Pending
 
 ### GEN-002 Add DeepSeek4 Single-GPU Fallback
@@ -583,13 +584,43 @@ authoritative constraint; a task is marked `in progress` only when work begins.
 
 ### STEP-003 Adopt Step/Manifest For Recurrent And Conv State
 
-- **Status:** in progress
+- **Status:** complete
 - **Dependencies:** COR-002, STEP-001
 - **Goal:** Represent recurrent and convolution operations/state in Step execution with mesh-aware placement and reset.
 - **Acceptance criteria:** Recurrent and conv state manifests encode layer ownership; Step execution handles prefill/decode state updates on the owning stage/device; boundary movement is explicit; the adapter implements the COR-002 reset contract; bespoke recurrent/conv forward loops are removed after parity.
 - **Validation:** Run state placement tests, multi-token prefill/decode parity, COR-002 conformance, repeated multi-turn tests, PP emulation, and Qwen35 recurrent coherence tests.
 - **Hardware:** A supported AMD GPU; physical PP closure is HW-004.
-- **Evidence:** Increment 1 landed 2026-08-08 in `9dcb1862a` (`refactor(qwen35): manifest-derived recurrent/conv state placement`): the hand-built DeltaNet `la_to_device` sidecar is defined out of existence. `qwen35_la_devices(cfg, gpus)` derives the compact LA-layer → device map by filtering `state_manifest` `StateKind::Recurrent` entries (global-layer keyed) through `Gpus::device_for_layer`; `DeltaNetState::new_with_quant_multi` returns `Self` only and `free_gpu_multi` takes `&Qwen35Config`; `LoadedModel.pp_dn_la_to_device` and the `skeleton_pp` param are deleted; loader `validate_qwen35_pipeline_layout` / `reset_qwen35_pipeline_recurrent` / `validate_reset_layout` derive placement from config + mesh (single-model rejection keys off `pp_gpus`); daemon `reset_qwen35_recurrent`, both `generate_multi` reset blocks, and `reset_pp_uncommitted_state!` derive the map from bundle config + gpus. New GPU-gated test `qwen35_la_devices_matches_mesh_placement` proves the manifest map equals the mesh placement and state allocations land on their owning devices (passes with `HIPFIRE_EMULATE_GPUS=2`; the pointer-placement assertion is gated to distinct physical devices because emulated ranks alias one device). CPU suites: loader 106 passed / 12 ignored, qwen35 424 passed / 21 ignored, daemon example 192 passed; `cargo check --workspace --all-targets` clean; `git diff --check` clean. Remaining acceptance scope (not yet closed): single-GPU decode/prefill already execute the six DeltaNet Steps (`build_delta_net_decode_steps` / `build_delta_net_batch_steps` / `build_delta_net_tree_steps`), but the PP multi-GPU forward (`forward_scratch_layers_multi`) still runs bespoke raw kernels and `execute_steps_mesh` still asserts a 1×1 mesh — porting PP recurrent/conv Step execution on the owning stage/device and removing the bespoke loop after parity is the remaining work (overlaps GEN-001 arch-resident PP folding). Emulated PP parity gate (`pp_parity_chatml_50_decode`, `HIPFIRE_HAVE_2_GPU=1` + emulation) diverges at decode step 1 identically with and without this change — pre-existing on this box, HW-004-class, not introduced here.
+- **Evidence:** Increment 1 (2026-08-08, `9dcb1862a`): manifest-derived
+  recurrent/conv state placement. `qwen35_la_devices(cfg, gpus)` derives the
+  compact LA-layer → device map from `state_manifest` `StateKind::Recurrent`
+  entries + `Gpus::device_for_layer`; `DeltaNetState::new_with_quant_multi`
+  returns `Self` only; `free_gpu_multi` takes `&Qwen35Config`;
+  `LoadedModel.pp_dn_la_to_device` deleted; loader/daemon reset and validation
+  derive from config + mesh. GPU-gated test `qwen35_la_devices_matches_mesh_placement`
+  passes with `HIPFIRE_EMULATE_GPUS=2`. CPU suites: loader 106, qwen35 424,
+  daemon 192; workspace `cargo check --workspace --all-targets` clean.
+  Increment 2 verification (2026-08-08): re-investigation confirms the
+  multi-GPU PP forward (`forward_scratch_layers_multi`, qwen35.rs:18799)
+  already runs all DeltaNet recurrent/conv ops through
+  `build_delta_net_decode_steps` + `execute_steps_mesh` on the per-device
+  `gpu` handle (lines 18999, 19005, 19646, 19652 — both dense-LA and MoE-LA
+  arms; the `test-utils` raw path is test-only gated). The `wo` projection
+  after the DeltaNet body also uses `Step::GemvResidual` via
+  `execute_steps_mesh` (lines 19012, 19659). Single-GPU prefill
+  (`forward_prefill_chunk`, line 11996) uses `build_delta_net_batch_steps`
+  / `build_delta_net_tree_steps`. The bespoke raw kernels remaining in
+  `forward_scratch_layers_multi` are QKVZA projection
+  (`run_fused_qkvza_scalar_key` / `weight_gemv_prerotated`, line 18897),
+  FFN gate/up (`gpu.fused_gate_up_*` / `weight_gemv_prerotated`, line
+  19046), and RMSNorm (`fused_rmsnorm_rotate_for_mq`, line 18860) — all
+  standard projection/FFN/norm ops, not recurrent/conv. These belong to
+  STEP-004 (Migrate Remaining Forward Paths). All five acceptance criteria
+  are met: (1) state manifests encode layer ownership (manifest-derived
+  placement, sidecar gone), (2) Step execution handles prefill/decode
+  recurrent/conv state updates on the owning device (both single and multi),
+  (3) boundary movement is explicit (boundary_copy), (4) COR-002 reset
+  contract (manifest-routed), (5) bespoke recurrent/conv forward loops
+  removed (all DeltaNet ops are Steps; remaining bespoke is projection/FFN).
 
 ### STEP-004 Migrate Remaining Forward Paths
 
@@ -774,3 +805,4 @@ DOC-002 cannot complete from a generic “tests pass” statement. Its evidence 
 4. Replace `Evidence: Pending` with commit hashes, exact commands/results, hardware topology, GPU architecture, ROCm/RCCL versions, and artifact/report links as applicable. Use `None` only when evidence or a field genuinely does not apply.
 5. Update this tracker in the same change that alters task status. After pushing, synchronize the matching checklist IDs in PR #527.
 6. If the PR and tracker diverge, correct the PR mirror; never edit historical evidence to manufacture agreement.
+
