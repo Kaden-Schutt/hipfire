@@ -76,7 +76,6 @@ pub struct DeviceBuffer {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DeviceBufferOwnership {
     HipMalloc,
-    Managed,
     Vmm,
     Borrowed,
 }
@@ -91,14 +90,7 @@ impl DeviceBuffer {
     }
 
     pub fn is_hip_allocation(&self) -> bool {
-        matches!(
-            self.ownership,
-            DeviceBufferOwnership::HipMalloc | DeviceBufferOwnership::Managed
-        )
-    }
-
-    pub fn is_managed(&self) -> bool {
-        self.ownership == DeviceBufferOwnership::Managed
+        self.ownership == DeviceBufferOwnership::HipMalloc
     }
 
     pub fn is_vmm_owner(&self) -> bool {
@@ -180,18 +172,5 @@ mod device_buffer_tests {
         let view = unsafe { owner.alias() };
         assert!(view.is_borrowed());
         assert!(!view.is_vmm_owner());
-    }
-
-    #[test]
-    fn managed_allocation_is_hip_freed_but_distinct_from_pool_memory() {
-        let managed = DeviceBuffer {
-            ptr: std::ptr::dangling_mut(),
-            size: 4096,
-            ownership: DeviceBufferOwnership::Managed,
-        };
-        assert!(managed.is_hip_allocation());
-        assert!(managed.is_managed());
-        assert!(!managed.is_borrowed());
-        assert!(!managed.is_vmm_owner());
     }
 }
