@@ -11448,6 +11448,7 @@ impl Gpu {
             kernels::GEMV_MQ2G256_LLOYD_MOE_GATE_UP_INDEXED_BATCHED_K4_SRC,
             "gemv_mq2g256_lloyd_moe_gate_up_k8_indexed_batched_k4",
         )?;
+        self.ds4_expert_overlap_probe(topk_indices, k_top, batch_size)?;
         let pp = expert_ptrs.buf.as_ptr();
         let ip = topk_indices.buf.as_ptr();
         let xp = x_rot.buf.as_ptr();
@@ -11498,6 +11499,58 @@ impl Gpu {
         }
         result
     }
+    /// Diagnostic (`HIPFIRE_DS4_EXPERT_OVERLAP=1`, default off): how much
+    /// routed-expert reuse exists ACROSS verify positions.
+    ///
+    /// The routed gate/up kernels launch on grid `(M, K_TOP, N)` and resolve the
+    /// expert per position (`topk_indices[bid * K_TOP + krank]`), so an expert's
+    /// weights stream once per position that routes to it even when two verify
+    /// positions agree. That is the mechanism behind the measured 17.84 ms
+    /// marginal cost per verify position, which pins the block controller at
+    /// B=2 and therefore caps tau.
+    ///
+    /// Grouping verify columns by routed expert can recover at most the
+    /// duplicate fraction, so this measures that fraction before any kernel work
+    /// is committed. A ratio of 1.0 means zero reuse and no headroom.
+    ///
+    /// Forces a device sync plus a D2H per call: diagnostic only, never a perf
+    /// path.
+    fn ds4_expert_overlap_probe(
+        &mut self,
+        topk_indices: &GpuTensor,
+        k_top: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        if batch_size <= 1
+            || hipfire_config::developer_var("HIPFIRE_DS4_EXPERT_OVERLAP").as_deref() != Ok("1")
+        {
+            return Ok(());
+        }
+        static ACC: std::sync::LazyLock<std::sync::Mutex<(usize, usize, usize)>> =
+            std::sync::LazyLock::new(|| std::sync::Mutex::new((0, 0, 0)));
+        self.hip.device_synchronize()?;
+        let n = batch_size * k_top;
+        let mut idx = vec![0i32; n];
+        let raw = unsafe { std::slice::from_raw_parts_mut(idx.as_mut_ptr() as *mut u8, n * 4) };
+        if self.hip.memcpy_dtoh(raw, &topk_indices.buf).is_ok() {
+            idx.sort_unstable();
+            idx.dedup();
+            if let Ok(mut g) = ACC.lock() {
+                g.0 += idx.len();
+                g.1 += n;
+                g.2 += 1;
+                if g.2 % 256 == 0 {
+                    eprintln!(
+                        "[ds4-overlap] calls={} B={} k_top={} distinct/total={}/{} ratio={:.4} (1.0 = zero reuse)",
+                        g.2, batch_size, k_top, g.0, g.1,
+                        g.0 as f64 / g.1.max(1) as f64
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn deepseek4_gemv_mq2g256_lloyd_moe_gate_up_indexed_batched_k4096_lds(
         &mut self,
         expert_ptrs: &GpuTensor,
@@ -11517,6 +11570,7 @@ impl Gpu {
             kernels::GEMV_MQ2G256_LLOYD_MOE_GATE_UP_INDEXED_BATCHED_K4096_LDS_SRC,
             "gemv_mq2g256_lloyd_moe_gate_up_k8_indexed_batched_k4096_lds",
         )?;
+        self.ds4_expert_overlap_probe(topk_indices, k_top, batch_size)?;
         let pp = expert_ptrs.buf.as_ptr();
         let ip = topk_indices.buf.as_ptr();
         let xp = x_rot.buf.as_ptr();
