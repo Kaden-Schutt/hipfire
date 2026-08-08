@@ -4,6 +4,13 @@ Date: 2026-08-08 UTC
 Branch: `ds4-gfx1201-opt`
 Runtime commit: `3b8bf149d8c0a7bda24ece3038446afc321ab4cb`
 
+> **Update:** the 85K performance and retrieval failure below were resolved by
+> exact-gfx1201 bounded prefill top-K in `576069e87`. The same fixture now runs
+> at 268.664 prefill tok/s and returns `mauve-velociraptor-7741` exactly (recall
+> 1/1), versus 84.293 tok/s and recall 0/1 here. See
+> [`2026-08-08-gfx1201-ds4-tp3-bounded-topk.md`](2026-08-08-gfx1201-ds4-tp3-bounded-topk.md).
+> The per-rank 1M F32 capacity rejection remains unchanged.
+
 ## Verdict
 
 The exact gfx1201 TP3 route now uses the same stable-address compressor-cache
