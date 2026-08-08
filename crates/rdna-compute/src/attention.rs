@@ -8634,7 +8634,7 @@ impl Gpu {
         corr_high: f32,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        assert!(self.arch_caps.is_gfx1201());
+        assert!(self.arch_caps.is_gfx1201() || self.arch.eq_ignore_ascii_case("gfx1151"));
         let symbol = "rope_tail_yarn_interleaved_staged_buf_f32_gfx1201";
         self.ensure_kernel(
             symbol,
@@ -8691,7 +8691,7 @@ impl Gpu {
         n: i32,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        assert!(self.arch_caps.is_gfx1201());
+        assert!(self.arch_caps.is_gfx1201() || self.arch.eq_ignore_ascii_case("gfx1151"));
         assert_eq!(staged.dtype, DType::F32);
         assert_eq!(cache.dtype, DType::F16);
         let symbol = "cast_f32_to_f16_at_slot_buf_gfx1201";
@@ -8734,7 +8734,7 @@ impl Gpu {
         d: i32,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        assert!(self.arch_caps.is_gfx1201());
+        assert!(self.arch_caps.is_gfx1201() || self.arch.eq_ignore_ascii_case("gfx1151"));
         assert_eq!(cache.dtype, DType::F16);
         let symbol = "indexer_relu_score_f16_buf_gfx1201";
         self.ensure_kernel(
@@ -8792,7 +8792,7 @@ impl Gpu {
         batch_size: i32,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        assert!(self.arch_caps.is_gfx1201());
+        assert!(self.arch_caps.is_gfx1201() || self.arch.eq_ignore_ascii_case("gfx1151"));
         assert_eq!(cache.dtype, DType::F16);
         let symbol = "indexer_relu_score_batched_f16_gfx1201";
         self.ensure_kernel(
@@ -8856,7 +8856,7 @@ impl Gpu {
         batch_size: i32,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        assert!(self.arch_caps.is_gfx1201());
+        assert!(self.arch_caps.is_gfx1201() || self.arch.eq_ignore_ascii_case("gfx1151"));
         assert_eq!(cache.dtype, DType::F16);
         assert_eq!((h, d), (64, 128));
         let symbol = "indexer_relu_score_wmma_batched_f16_gfx1201";

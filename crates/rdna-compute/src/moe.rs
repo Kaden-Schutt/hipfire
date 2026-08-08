@@ -1519,7 +1519,7 @@ impl Gpu {
         scale: f32,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        assert!(self.arch_caps.is_gfx1201());
+        assert!(self.arch_caps.is_gfx1201() || self.arch.eq_ignore_ascii_case("gfx1151"));
         assert_eq!(cache.dtype, DType::F16);
         let symbol = "deepseek4_topk_kv_gather_f16_buf_gfx1201";
         self.ensure_kernel(
@@ -1579,7 +1579,7 @@ impl Gpu {
         out_stride: i32,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        assert!(self.arch_caps.is_gfx1201());
+        assert!(self.arch_caps.is_gfx1201() || self.arch.eq_ignore_ascii_case("gfx1151"));
         assert_eq!(cache.dtype, DType::F16);
         let symbol = "deepseek4_topk_kv_gather_identity_f16_buf_gfx1201";
         self.ensure_kernel(
@@ -1632,7 +1632,7 @@ impl Gpu {
         batch_size: i32,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        assert!(self.arch_caps.is_gfx1201());
+        assert!(self.arch_caps.is_gfx1201() || self.arch.eq_ignore_ascii_case("gfx1151"));
         assert_eq!(cache.dtype, DType::F16);
         let symbol = "deepseek4_topk_kv_gather_batched_tiled_f16_gfx1201";
         self.ensure_kernel(
@@ -1699,7 +1699,7 @@ impl Gpu {
         batch_size: i32,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        assert!(self.arch_caps.is_gfx1201());
+        assert!(self.arch_caps.is_gfx1201() || self.arch.eq_ignore_ascii_case("gfx1151"));
         assert_eq!(cache.dtype, DType::F16);
         let symbol = "deepseek4_topk_kv_gather_identity_batched_f16_gfx1201";
         self.ensure_kernel(
