@@ -1636,6 +1636,88 @@ impl Gpu {
             },
         )
     }
+    /// Masked independent-sequence Q8_0 KV write. Derives physical lane from
+    /// grid y (blockIdx.y, same as the unmasked independent kernel) and
+    /// returns before any inactive-lane read/write. Full-mask callers are
+    /// routed through the existing unmasked `kv_cache_write_q8_0_independent`
+    /// for exact ABI parity. Supports up to 64 lanes without unsafe shift.
+    pub fn kv_cache_write_q8_0_independent_masked(
+        &mut self,
+        dst: &GpuTensor,
+        src: &GpuTensor,
+        positions: &GpuTensor,
+        n_kv_heads: usize,
+        head_dim: usize,
+        batch_size: usize,
+        lane_capacity: usize,
+        active_mask: u64,
+    ) -> HipResult<()> {
+        let full_mask = if batch_size >= 64 {
+            u64::MAX
+        } else if batch_size == 0 {
+            0u64
+        } else {
+            (1u64 << batch_size) - 1
+        };
+        if active_mask == full_mask {
+            return self.kv_cache_write_q8_0_independent(
+                dst,
+                src,
+                positions,
+                n_kv_heads,
+                head_dim,
+                batch_size,
+                lane_capacity,
+            );
+        }
+        if active_mask == 0 {
+            return Ok(());
+        }
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "kv_cache_write_q8_0_independent_masked",
+            kernels::KV_CACHE_WRITE_Q8_0_BATCHED_SRC,
+            "kv_cache_write_q8_0_independent_masked",
+        )?;
+        let mut d = dst.buf.as_ptr();
+        let mut s = src.buf.as_ptr();
+        let mut p = positions.buf.as_ptr();
+        let mut nkv = n_kv_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut bs = batch_size as i32;
+        let mut cap = lane_capacity as i32;
+        let mut mask = active_mask;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut d as *mut _ as *mut c_void,
+            &mut s as *mut _ as *mut c_void,
+            &mut p as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+            &mut cap as *mut _ as *mut c_void,
+            &mut mask as *mut _ as *mut c_void,
+        ];
+        let total_blocks = (n_kv_heads * head_dim / 32) as u32;
+        self.launch_maybe_blob(
+            "kv_cache_write_q8_0_independent_masked",
+            [total_blocks, batch_size as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(d);
+                b.push_ptr(s);
+                b.push_ptr(p);
+                b.push_i32(nkv);
+                b.push_i32(hd);
+                b.push_i32(bs);
+                b.push_i32(cap);
+                b.push_u64(mask);
+                b
+            },
+        )
+    }
     /// Write KV vector to Q8_0 quantized cache (same format as GGML Q8_0).
     pub fn kv_cache_write_q8_0(
         &mut self,

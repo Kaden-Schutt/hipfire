@@ -77,3 +77,52 @@ extern "C" __global__ void conv1d_silu_split_f32(
         }
     }
 }
+
+// Masked sibling: same conv1d + SiLU + Q/K/V split but lane-masked.
+// Derives physical lane from blockIdx.y (existing grid y) and returns before
+// any inactive-lane read/write. Full-mask callers use the unmasked
+// `conv1d_silu_split_f32` path for exact parity.
+extern "C" __global__ void conv1d_silu_split_f32_masked(
+    float* __restrict__ q_out,
+    float* __restrict__ k_out,
+    float* __restrict__ v_out,
+    const float* __restrict__ input,
+    const float* __restrict__ weight,
+    float* __restrict__ state,
+    int k_dim,
+    int v_dim,
+    int n_tokens,
+    unsigned long long active_mask
+) {
+    int c = blockIdx.x * blockDim.x + threadIdx.x;
+    int lane = blockIdx.y;
+    if (((active_mask >> lane) & 1ULL) == 0) return;
+    int n_channels = 2 * k_dim + v_dim;
+    if (c >= n_channels) return;
+
+    for (int t = 0; t < n_tokens; t++) {
+        int row = lane * n_tokens + t;
+        int state_base = lane * n_channels * 3;
+        float x = input[row * n_channels + c];
+        float s0 = state[state_base + c * 3];
+        float s1 = state[state_base + c * 3 + 1];
+        float s2 = state[state_base + c * 3 + 2];
+
+        float y = weight[c * 4 + 3] * x + weight[c * 4 + 2] * s0
+                + weight[c * 4 + 1] * s1 + weight[c * 4] * s2;
+
+        float result = y / (1.0f + expf(-y));
+
+        state[state_base + c * 3 + 2] = s1;
+        state[state_base + c * 3 + 1] = s0;
+        state[state_base + c * 3]     = x;
+
+        if (c < k_dim) {
+            q_out[row * k_dim + c] = result;
+        } else if (c < 2 * k_dim) {
+            k_out[row * k_dim + (c - k_dim)] = result;
+        } else {
+            v_out[row * v_dim + (c - 2 * k_dim)] = result;
+        }
+    }
+}

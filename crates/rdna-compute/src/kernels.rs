@@ -5447,6 +5447,11 @@ pub const HC_FINALIZE_INPUT_MAP_SRC: &str =
 
 pub const ZERO_F32_SRC: &str = include_str!("../../../kernels/src/zero_f32.hip");
 
+/// Zero inactive rows for EP routed partials / final hidden isolation.
+/// Masked sibling writes exact +0.0f only to inactive rows (row = lane).
+pub const ZERO_INACTIVE_ROWS_F32_SRC: &str =
+    include_str!("../../../kernels/src/zero_inactive_rows_f32.hip");
+
 pub const SQRT_SOFTPLUS_F32_SRC: &str = include_str!("../../../kernels/src/sqrt_softplus_f32.hip");
 
 pub const V4F_ATTN_POS0_SRC: &str = include_str!("../../../kernels/src/deepseek4_attn_pos0.hip");

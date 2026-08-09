@@ -55,6 +55,61 @@ impl Drop for BoundaryEvent {
     }
 }
 
+/// Opaque unique non-clone peer-reduce scratch lease.
+///
+/// Exactly `N-1` buffers per rank are allocated under this lease; `N=4`
+/// yields 3 per rank and 12 total. Acquisition is exclusive — a second
+/// owner is rejected. The lease never clones/copies; ownership is
+/// transferred by move. Validation of id/rank_count/bytes is performed on
+/// every leased reduce/release.
+pub struct PeerReduceScratchLease {
+    id: u64,
+    bytes: usize,
+    rank_count: usize,
+    _private: (),
+}
+
+impl std::fmt::Debug for PeerReduceScratchLease {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PeerReduceScratchLease")
+            .field("id", &self.id)
+            .field("bytes", &self.bytes)
+            .field("rank_count", &self.rank_count)
+            .finish()
+    }
+}
+
+/// Pure helper: per-device peer scratch bytes for `rank_count` ranks and
+/// `requested_bytes` per reduction. Returns `None` on overflow or
+/// zero ranks. For `N=4`, per-rank is `3*requested_bytes` and total is
+/// `12*requested_bytes`.
+#[inline]
+pub fn peer_reduce_scratch_bytes_per_rank(
+    rank_count: usize,
+    requested_bytes: usize,
+) -> Option<usize> {
+    if rank_count == 0 {
+        return None;
+    }
+    let per_rank = rank_count.checked_sub(1)?.checked_mul(requested_bytes)?;
+    Some(per_rank)
+}
+
+/// Pure helper: total peer scratch bytes across all ranks.
+#[inline]
+pub fn peer_reduce_scratch_total_bytes(rank_count: usize, requested_bytes: usize) -> Option<usize> {
+    let per_rank = peer_reduce_scratch_bytes_per_rank(rank_count, requested_bytes)?;
+    rank_count.checked_mul(per_rank)
+}
+
+/// Internal active lease record stored inside `Gpus` while a lease is live.
+#[derive(Debug)]
+struct ActivePeerLease {
+    id: u64,
+    bytes: usize,
+    rank_count: usize,
+}
+
 pub struct Gpus {
     /// RCCL communicators (one per rank), lazily initialized on the first
     /// `all_reduce_sum_*` call. Declared BEFORE `devices` so `Drop` tears
@@ -82,6 +137,15 @@ pub struct Gpus {
     /// `count` seen. Leaked on teardown (raw `DeviceBuffer`, no Drop-free).
     peer_ar_tmp: Vec<Vec<DeviceBuffer>>,
     peer_ar_tmp_bytes: usize,
+    /// Unique peer-rooted scratch lease (TP4 EP). `None` when no lease is
+    /// active. When `Some`, `peer_lease_buffers[r]` holds `N-1` buffers per
+    /// rank at least `peer_lease.bytes` and leased reduces must use that
+    /// buffer set without allocation/growth. A failed release quarantines
+    /// the scratch so no future owner can use a partially freed set.
+    active_peer_lease: Option<ActivePeerLease>,
+    peer_lease_buffers: Vec<Vec<DeviceBuffer>>,
+    peer_lease_next_id: u64,
+    peer_lease_quarantined: bool,
     /// One process-lifetime dependency event per rank for peer-consumer
     /// collectives. Re-recording avoids 86 create/destroy pairs per DS4 token.
     rank_barrier_events: Vec<Event>,
@@ -174,6 +238,10 @@ impl Gpus {
             givens_sin_per_dev: Vec::new(),
             peer_ar_tmp: Vec::new(),
             peer_ar_tmp_bytes: 0,
+            active_peer_lease: None,
+            peer_lease_buffers: Vec::new(),
+            peer_lease_next_id: 0,
+            peer_lease_quarantined: false,
             rank_barrier_events: Vec::new(),
             tp_graph_signals: Vec::new(),
             tp_graph_barrier_count: 0,
@@ -208,14 +276,13 @@ impl Gpus {
         let device_ids = resolve_device_ids(tp_size)?;
         let devices = construct_devices(&device_ids)?;
         preflight_vram_with_opts(&devices, /*check_vram_delta=*/ true)?;
+        let band_starts = (0..=tp_size)
+            .map(|rank| if rank == 0 { 0 } else { n_layers })
+            .collect();
 
         // PP=1 TP topology: every device runs every layer. Encode the layer
         // map so PP helpers see device 0 owning all layers and devices ≥1
         // owning empty bands.
-        let mut band_starts = vec![0usize; tp_size];
-        for b in band_starts.iter_mut().skip(1) {
-            *b = n_layers;
-        }
         Ok(Self {
             rccl_comms: None,
             devices,
@@ -227,6 +294,10 @@ impl Gpus {
             givens_sin_per_dev: Vec::new(),
             peer_ar_tmp: Vec::new(),
             peer_ar_tmp_bytes: 0,
+            active_peer_lease: None,
+            peer_lease_buffers: Vec::new(),
+            peer_lease_next_id: 0,
+            peer_lease_quarantined: false,
             rank_barrier_events: Vec::new(),
             tp_graph_signals: Vec::new(),
             tp_graph_barrier_count: 0,
@@ -743,6 +814,10 @@ impl Gpus {
             givens_sin_per_dev: Vec::new(),
             peer_ar_tmp: Vec::new(),
             peer_ar_tmp_bytes: 0,
+            active_peer_lease: None,
+            peer_lease_buffers: Vec::new(),
+            peer_lease_next_id: 0,
+            peer_lease_quarantined: false,
             rank_barrier_events: Vec::new(),
             tp_graph_signals: Vec::new(),
             tp_graph_barrier_count: 0,
@@ -863,8 +938,18 @@ impl Gpus {
 
     /// Ensure `peer_ar_tmp[r]` holds `n-1` buffers of at least `bytes` on each
     /// device. Lazily allocates; grows (freeing the old set) if `bytes` exceeds
-    /// the current size. No-op for `n <= 1`.
+    /// the current size. No-op for `n <= 1`. Fails while a unique peer lease
+    /// is active or quarantined — the leased path owns the scratch exclusively.
     fn ensure_peer_ar_tmp(&mut self, bytes: usize) -> HipResult<()> {
+        if self.active_peer_lease.is_some()
+            || self.peer_lease_quarantined
+            || !self.peer_lease_buffers.is_empty()
+        {
+            return Err(HipError::new(
+                0,
+                "ensure_peer_ar_tmp: peer scratch is leased — unleased reduce/resize is forbidden while a lease lives",
+            ));
+        }
         let n = self.devices.len();
         if n <= 1 {
             return Ok(());
@@ -874,14 +959,25 @@ impl Gpus {
         }
         // Free the old (too-small) set on its owning devices before regrowing.
         if !self.peer_ar_tmp.is_empty() {
+            let mut first_err: Option<HipError> = None;
             for (r, row) in std::mem::take(&mut self.peer_ar_tmp)
                 .into_iter()
                 .enumerate()
             {
-                let _ = self.devices[r].bind_thread();
-                for buf in row {
-                    let _ = self.devices[r].hip.free(buf);
+                if let Err(e) = self.devices[r].bind_thread() {
+                    first_err.get_or_insert(e);
+                    continue;
                 }
+                for buf in row {
+                    if let Err(e) = self.devices[r].hip.free(buf) {
+                        first_err.get_or_insert(e);
+                    }
+                }
+                let _ = self.devices[r].hip.device_synchronize();
+            }
+            self.peer_ar_tmp_bytes = 0;
+            if let Some(e) = first_err {
+                return Err(e);
             }
         }
         let mut all = Vec::with_capacity(n);
@@ -889,7 +985,35 @@ impl Gpus {
             self.devices[r].bind_thread()?;
             let mut row = Vec::with_capacity(n - 1);
             for _ in 0..(n - 1) {
-                row.push(self.devices[r].hip.malloc(bytes)?);
+                match self.devices[r].hip.malloc(bytes) {
+                    Ok(buf) => row.push(buf),
+                    Err(e) => {
+                        // Roll back everything allocated so far on its owning device.
+                        let mut first_err: Option<HipError> = Some(e);
+                        for buf in row {
+                            if let Err(fe) = self.devices[r]
+                                .bind_thread()
+                                .and_then(|_| self.devices[r].hip.free(buf))
+                            {
+                                first_err.get_or_insert(fe);
+                            }
+                        }
+                        for (rr, rrow) in all.into_iter().enumerate() {
+                            let _ = self.devices[rr].bind_thread();
+                            for buf in rrow {
+                                if let Err(fe) = self.devices[rr].hip.free(buf) {
+                                    first_err.get_or_insert(fe);
+                                }
+                            }
+                            let _ = self.devices[rr].hip.device_synchronize();
+                        }
+                        let _ = self.devices[r].hip.device_synchronize();
+                        if first_err.is_some() {
+                            self.peer_lease_quarantined = true;
+                        }
+                        return Err(first_err.unwrap());
+                    }
+                }
             }
             all.push(row);
         }
@@ -897,26 +1021,210 @@ impl Gpus {
         self.peer_ar_tmp_bytes = bytes;
         Ok(())
     }
-    /// Public wrapper for `ensure_peer_ar_tmp` used by the EP batch route.
-    /// Reserves peer-direct all-reduce scratch of at least `bytes` on each device.
-    pub fn reserve_peer_reduce_scratch(&mut self, bytes: usize) -> HipResult<()> {
-        self.ensure_peer_ar_tmp(bytes)
-    }
 
-    /// Release peer-direct all-reduce scratch. No-op if not allocated; frees otherwise.
-    pub fn release_peer_reduce_scratch(&mut self) {
-        if self.peer_ar_tmp.is_empty() {
-            return;
+    /// Acquire an exclusive peer-rooted scratch lease for `bytes` per reduction.
+    ///
+    /// Allocates exactly `N` rows of `N-1` buffers (3 per rank, 12 total for
+    /// TP4) on their owning devices. Rejects a second concurrent owner and
+    /// quarantined state. Partial allocation rolls back on owning devices,
+    /// binds/synchronizes owners, attempts every free, and preserves the
+    /// first error. The returned `PeerReduceScratchLease` is opaque,
+    /// non-Clone/non-Copy, and must be passed to leased reduce/release.
+    pub fn acquire_peer_reduce_scratch(
+        &mut self,
+        bytes: usize,
+    ) -> HipResult<PeerReduceScratchLease> {
+        if self.peer_lease_quarantined {
+            return Err(HipError::new(
+                0,
+                "acquire_peer_reduce_scratch: scratch is quarantined after a prior free failure",
+            ));
         }
-        for (r, row) in std::mem::take(&mut self.peer_ar_tmp).into_iter().enumerate() {
-            let _ = self.devices[r].bind_thread();
-            for buf in row {
-                let _ = self.devices[r].hip.free(buf);
+        if self.active_peer_lease.is_some() {
+            return Err(HipError::new(
+                0,
+                "acquire_peer_reduce_scratch: a lease is already active — second owner rejected",
+            ));
+        }
+        if !self.peer_ar_tmp.is_empty() {
+            return Err(HipError::new(
+                0,
+                "acquire_peer_reduce_scratch: unleased scratch is live — free it before acquiring a lease",
+            ));
+        }
+        let n = self.devices.len();
+        if n <= 1 {
+            // Degenerate: still issue a lease but allocate nothing.
+            let id = self
+                .peer_lease_next_id
+                .checked_add(1)
+                .ok_or_else(|| HipError::new(0, "lease id overflow"))?;
+            self.peer_lease_next_id = id;
+            let lease = PeerReduceScratchLease {
+                id,
+                bytes,
+                rank_count: n,
+                _private: (),
+            };
+            self.active_peer_lease = Some(ActivePeerLease {
+                id,
+                bytes,
+                rank_count: n,
+            });
+            self.peer_lease_buffers = Vec::new();
+            return Ok(lease);
+        }
+        // Validate overflow for diagnostics via shared helper (pure).
+        let _per_rank = peer_reduce_scratch_bytes_per_rank(n, bytes).ok_or_else(|| {
+            HipError::new(
+                0,
+                "acquire_peer_reduce_scratch: overflow in per-rank projection",
+            )
+        })?;
+        let mut all: Vec<Vec<DeviceBuffer>> = Vec::with_capacity(n);
+        let mut first_err: Option<HipError> = None;
+        for r in 0..n {
+            if let Err(e) = self.devices[r].bind_thread() {
+                first_err.get_or_insert(e);
+                break;
+            }
+            let mut row = Vec::with_capacity(n - 1);
+            for _ in 0..(n - 1) {
+                match self.devices[r].hip.malloc(bytes) {
+                    Ok(buf) => row.push(buf),
+                    Err(e) => {
+                        first_err.get_or_insert(e);
+                        break;
+                    }
+                }
+            }
+            if first_err.is_some() {
+                all.push(row);
+                break;
+            }
+            all.push(row);
+            if all.len() != r + 1 {
+                break;
             }
         }
-        self.peer_ar_tmp_bytes = 0;
+        if let Some(e) = first_err {
+            // Roll back every allocated row on its owning device, bind/sync, preserve first error.
+            let mut rollback_first: Option<HipError> = Some(e);
+            for (rr, rrow) in all.into_iter().enumerate() {
+                if let Err(be) = self.devices[rr].bind_thread() {
+                    rollback_first.get_or_insert(be);
+                    continue;
+                }
+                for buf in rrow {
+                    if let Err(fe) = self.devices[rr].hip.free(buf) {
+                        rollback_first.get_or_insert(fe);
+                    }
+                }
+                if let Err(se) = self.devices[rr].hip.device_synchronize() {
+                    rollback_first.get_or_insert(se);
+                }
+            }
+            self.peer_lease_quarantined = true;
+            return Err(rollback_first.unwrap());
+        }
+        if all.len() != n {
+            // Defensive: ensure we built N rows.
+            let mut rb_first: Option<HipError> = None;
+            for (rr, rrow) in all.into_iter().enumerate() {
+                let _ = self.devices[rr].bind_thread();
+                for buf in rrow {
+                    if let Err(fe) = self.devices[rr].hip.free(buf) {
+                        rb_first.get_or_insert(fe);
+                    }
+                }
+                let _ = self.devices[rr].hip.device_synchronize();
+            }
+            self.peer_lease_quarantined = true;
+            return Err(rb_first.unwrap_or_else(|| {
+                HipError::new(0, "acquire_peer_reduce_scratch: incomplete allocation")
+            }));
+        }
+        let id = self
+            .peer_lease_next_id
+            .checked_add(1)
+            .ok_or_else(|| HipError::new(0, "lease id overflow"))?;
+        self.peer_lease_next_id = id;
+        self.active_peer_lease = Some(ActivePeerLease {
+            id,
+            bytes,
+            rank_count: n,
+        });
+        self.peer_lease_buffers = all;
+        Ok(PeerReduceScratchLease {
+            id,
+            bytes,
+            rank_count: n,
+            _private: (),
+        })
     }
 
+    /// Release an active peer lease, freeing its scratch on owning devices.
+    ///
+    /// Binds and synchronizes every owning device, attempts every free,
+    /// preserves the first error, and clears the active lease only after
+    /// complete success. A failed release quarantines the scratch so no
+    /// future owner can use a partially freed set.
+    pub fn release_peer_reduce_scratch(&mut self, lease: &PeerReduceScratchLease) -> HipResult<()> {
+        let active = self
+            .active_peer_lease
+            .as_ref()
+            .ok_or_else(|| HipError::new(0, "release_peer_reduce_scratch: no active lease"))?;
+        if active.id != lease.id {
+            return Err(HipError::new(
+                0,
+                &format!(
+                    "release_peer_reduce_scratch: lease id {} != active {}",
+                    lease.id, active.id
+                ),
+            ));
+        }
+        if active.bytes != lease.bytes || active.rank_count != lease.rank_count {
+            return Err(HipError::new(
+                0,
+                "release_peer_reduce_scratch: lease bytes/rank_count mismatch",
+            ));
+        }
+        if lease.rank_count != self.devices.len() {
+            return Err(HipError::new(
+                0,
+                &format!(
+                    "release_peer_reduce_scratch: lease rank_count {} != n_devices {}",
+                    lease.rank_count,
+                    self.devices.len()
+                ),
+            ));
+        }
+        let buffers = std::mem::take(&mut self.peer_lease_buffers);
+        let mut first_err: Option<HipError> = None;
+        for (r, row) in buffers.into_iter().enumerate() {
+            if let Err(e) = self.devices[r].bind_thread() {
+                first_err.get_or_insert(e);
+                continue;
+            }
+            for buf in row {
+                if let Err(e) = self.devices[r].hip.free(buf) {
+                    first_err.get_or_insert(e);
+                }
+            }
+            if let Err(e) = self.devices[r].hip.device_synchronize() {
+                first_err.get_or_insert(e);
+            }
+        }
+        if let Some(e) = first_err {
+            self.peer_lease_quarantined = true;
+            // Keep the active lease so no future acquire can succeed without quarantine clear.
+            // Buffers already taken; leave empty to prevent use.
+            return Err(e);
+        }
+        self.active_peer_lease = None;
+        self.peer_lease_quarantined = false;
+        Ok(())
+    }
 
     /// All-reduce-sum of f32 buffers across all ranks via **direct peer copy +
     /// local add** — bypassing RCCL. On consumer/prosumer RDNA P2P (no xGMI,
@@ -938,6 +1246,15 @@ impl Gpus {
         buffers: &[&DeviceBuffer],
         count: usize,
     ) -> HipResult<()> {
+        if self.active_peer_lease.is_some()
+            || self.peer_lease_quarantined
+            || !self.peer_lease_buffers.is_empty()
+        {
+            return Err(HipError::new(
+                0,
+                "all_reduce_sum_f32_peer: peer scratch is leased — use leased API or release lease",
+            ));
+        }
         let n = self.devices.len();
         if buffers.len() != n {
             return Err(HipError::new(
@@ -953,7 +1270,6 @@ impl Gpus {
         }
         let bytes = count * 4;
         self.ensure_peer_ar_tmp(bytes)?;
-
         // Phase 1: read every peer's ORIGINAL buffer into a local temp.
         let mut evts = Vec::with_capacity(n * (n - 1));
         for r in 0..n {
@@ -1007,6 +1323,16 @@ impl Gpus {
         buffers: &[&DeviceBuffer],
         count: usize,
     ) -> HipResult<()> {
+        // Fail closed while a lease owns the scratch — the leased path must be used.
+        if self.active_peer_lease.is_some()
+            || self.peer_lease_quarantined
+            || !self.peer_lease_buffers.is_empty()
+        {
+            return Err(HipError::new(
+                0,
+                "all_reduce_sum_f32_peer_rooted: peer scratch is leased — use all_reduce_sum_f32_peer_rooted_leased",
+            ));
+        }
         let n = self.devices.len();
         if buffers.len() != n {
             return Err(HipError::new(
@@ -1056,6 +1382,137 @@ impl Gpus {
         // boundary_copy is enqueued on rank 0's active stream, after the
         // ordered add kernels above. Waiting makes the result visible before
         // any peer starts its HC mix.
+        let mut broadcast_events = Vec::with_capacity(n - 1);
+        for rank in 1..n {
+            broadcast_events.push(self.boundary_copy(0, rank, buffers[0], buffers[rank], bytes)?);
+        }
+        for event in broadcast_events {
+            self.wait_boundary(event)?;
+        }
+        Ok(())
+    }
+
+    /// Leased variant of the deterministic rooted peer all-reduce. Uses the
+    /// scratch allocated under `lease` and never allocates or grows. Validates
+    /// lease identity, rank count, `count*4 <= lease.bytes`, row lengths and
+    /// capacities. The rooted order is exactly `(((rank0 + rank1)+rank2)+rank3)`.
+    pub fn all_reduce_sum_f32_peer_rooted_leased(
+        &mut self,
+        lease: &PeerReduceScratchLease,
+        buffers: &[&DeviceBuffer],
+        count: usize,
+    ) -> HipResult<()> {
+        let n = self.devices.len();
+        let active = self.active_peer_lease.as_ref().ok_or_else(|| {
+            HipError::new(0, "all_reduce_sum_f32_peer_rooted_leased: no active lease")
+        })?;
+        if active.id != lease.id {
+            return Err(HipError::new(
+                0,
+                &format!(
+                    "leased reduce: lease id {} != active {}",
+                    lease.id, active.id
+                ),
+            ));
+        }
+        if active.bytes != lease.bytes || active.rank_count != lease.rank_count {
+            return Err(HipError::new(
+                0,
+                "leased reduce: lease bytes/rank_count mismatch vs active record",
+            ));
+        }
+        if lease.rank_count != n {
+            return Err(HipError::new(
+                0,
+                &format!(
+                    "leased reduce: lease rank_count {} != n_devices {}",
+                    lease.rank_count, n
+                ),
+            ));
+        }
+        if buffers.len() != n {
+            return Err(HipError::new(
+                0,
+                &format!(
+                    "all_reduce_sum_f32_peer_rooted_leased: buffers.len()={} != n_devices={n}",
+                    buffers.len()
+                ),
+            ));
+        }
+        if n == 1 {
+            return Ok(());
+        }
+        let bytes = count
+            .checked_mul(4)
+            .ok_or_else(|| HipError::new(0, "leased reduce: count overflow"))?;
+        if bytes > lease.bytes {
+            return Err(HipError::new(
+                0,
+                &format!(
+                    "leased reduce: count*4 {} > lease.bytes {}",
+                    bytes, lease.bytes
+                ),
+            ));
+        }
+        if bytes > active.bytes {
+            return Err(HipError::new(
+                0,
+                "leased reduce: count*4 exceeds active lease bytes",
+            ));
+        }
+        if self.peer_lease_buffers.len() != n {
+            return Err(HipError::new(
+                0,
+                "leased reduce: peer_lease_buffers row count mismatch",
+            ));
+        }
+        for (r, row) in self.peer_lease_buffers.iter().enumerate() {
+            if row.len() != n - 1 {
+                return Err(HipError::new(
+                    0,
+                    &format!("leased reduce: row {r} len {} != N-1 {}", row.len(), n - 1),
+                ));
+            }
+            for buf in row {
+                if buf.size() < bytes {
+                    return Err(HipError::new(
+                        0,
+                        "leased reduce: scratch buffer too small for count",
+                    ));
+                }
+            }
+        }
+        if self.peer_lease_quarantined {
+            return Err(HipError::new(0, "leased reduce: scratch is quarantined"));
+        }
+        // Gather N-1 peers into rank-0 lease scratch, never allocating.
+        let mut gather_events = Vec::with_capacity(n - 1);
+        for rank in 1..n {
+            gather_events.push(self.boundary_copy(
+                rank,
+                0,
+                buffers[rank],
+                &self.peer_lease_buffers[0][rank - 1],
+                bytes,
+            )?);
+        }
+        for event in gather_events {
+            self.wait_boundary(event)?;
+        }
+        let root = GpuTensor {
+            buf: unsafe { buffers[0].alias() },
+            shape: vec![count],
+            dtype: DType::F32,
+        };
+        self.devices[0].bind_thread()?;
+        for slot in 0..n - 1 {
+            let peer = GpuTensor {
+                buf: unsafe { self.peer_lease_buffers[0][slot].alias() },
+                shape: vec![count],
+                dtype: DType::F32,
+            };
+            self.devices[0].add_inplace_f32(&root, &peer)?;
+        }
         let mut broadcast_events = Vec::with_capacity(n - 1);
         for rank in 1..n {
             broadcast_events.push(self.boundary_copy(0, rank, buffers[0], buffers[rank], bytes)?);
