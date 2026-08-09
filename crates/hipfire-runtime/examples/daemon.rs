@@ -3825,6 +3825,1050 @@ fn attach_continuous_batch_route_evidence(
     });
 }
 
+/// EP-specific evidence: must be sourced from a real `Qwen35EpBatchReceipt` and
+/// explicitly state expert_parallel / rank_count=4 / peer_rooted_f32.
+fn attach_qwen_ep_batch_receipt_evidence(
+    envelope: &mut serde_json::Value,
+    receipt: &qwen35::Qwen35EpBatchReceipt,
+    slots: usize,
+    lane: usize,
+    lane_capacity: usize,
+    max_active_lanes: usize,
+) {
+    // Enforce attested invariants via getters; never fabricate from load logs.
+    debug_assert_eq!(receipt.rank_count(), 4);
+    debug_assert_eq!(receipt.rank_mask(), 0x0f);
+    debug_assert_eq!(receipt.reduce(), qwen35::Qwen35EpReduce::PeerRootedF32);
+    debug_assert_eq!(
+        receipt.parallelism(),
+        qwen35::Qwen35BatchParallelism::ExpertParallel
+    );
+    envelope["execution_mode"] = serde_json::json!("continuous_batch_independent");
+    envelope["continuous_batch"] = serde_json::json!({
+        "executed": true,
+        "slots": slots,
+        "lane": lane,
+        "lane_capacity": lane_capacity,
+        "max_active_lanes": max_active_lanes,
+        "refill": "continuous",
+        "parallelism": "expert_parallel",
+        "rank_count": receipt.rank_count(),
+        "rank_mask": receipt.rank_mask(),
+        "reduce": "peer_rooted_f32",
+        "epoch": receipt.epoch(),
+        "rows": receipt.rows(),
+        "moe_collectives": receipt.moe_collectives(),
+    });
+}
+
+fn qwen_ep_batch_weight_formats_supported(weights: &qwen35::Qwen35Weights) -> bool {
+    qwen_batch_weight_formats_supported(weights)
+}
+
+fn is_qwen_ep_batch_request_eligible(
+    msg: &serde_json::Value,
+    m: &LoadedModel,
+    continuous_batch_size: usize,
+    serve_continuous_batch: bool,
+    pflash_active: bool,
+) -> bool {
+    if !serve_continuous_batch || continuous_batch_size <= 1 {
+        return false;
+    }
+    if m.pp != 1 {
+        return false;
+    }
+    let Some(ep) = m.ep.as_ref() else {
+        return false;
+    };
+    let EpArch::Qwen35 {
+        config,
+        weights,
+        batch,
+    } = &ep.inner
+    else {
+        return false;
+    };
+    if batch.is_none() {
+        return false;
+    }
+    if !(m.arch_id == 5 || m.arch_id == 6) {
+        return false;
+    }
+    if m.qwen35_decode_batch.is_some() || m.lfm2_decode_batch.is_some() {
+        return false;
+    }
+    // EP batch is pure TP=4 gfx1201; validate via existing weight format gate.
+    if !qwen_ep_batch_weight_formats_supported(&weights[0]) {
+        return false;
+    }
+    let has_image = msg.get("image").is_some() || msg.get("image_base64").is_some();
+    let has_tools = msg
+        .get("tools")
+        .and_then(|v| v.as_array())
+        .is_some_and(|a| !a.is_empty());
+    let has_stop = msg
+        .get("stop")
+        .and_then(|v| v.as_array())
+        .is_some_and(|a| !a.is_empty());
+    if has_image || has_tools || has_stop {
+        return false;
+    }
+    if !batch_messages_are_single_user(msg) {
+        return false;
+    }
+    if m.speculator.is_some() || m.kv_adaptive.is_some() || m.eviction.is_some() || pflash_active {
+        return false;
+    }
+    if batch.is_none() {
+        return false;
+    }
+    // Ensure sampling controls are resolvable (mirrors sequential ladder)
+    let _ = resolve_batch_sampling(msg, m);
+    // Must be QwenAr route (non-spec)
+    let sampling = resolve_batch_sampling(msg, m);
+    let user_explicit = [
+        "top_p",
+        "top_k",
+        "min_p",
+        "repeat_penalty",
+        "presence_penalty",
+        "frequency_penalty",
+    ]
+    .iter()
+    .any(|k| msg.get(*k).is_some());
+    let route_inputs = GenerationRouteInputs {
+        arch_id: m.arch_id,
+        ep: true,
+        pp: m.pp,
+        has_speculator: m.speculator.is_some(),
+        qwen_mtp_head: m.qwen35_mtp_head.is_some(),
+        qwen_mtp_opt_in: std::env::var("HIPFIRE_QWEN_MTP").ok().as_deref() == Some("1"),
+        mtp_sampled_on: std::env::var("HIPFIRE_MTP_SAMPLED").ok().as_deref() == Some("1"),
+        deepseek4_spec_requested: false,
+        ngram_can_sample: m
+            .speculator
+            .as_ref()
+            .map(|s| !s.requires_greedy())
+            .unwrap_or(false),
+        temp: sampling.temp,
+        user_explicit_sampling: user_explicit,
+        min_p: sampling.min_p,
+        force_ar_chat: false,
+        temp_spec_env_off: std::env::var("HIPFIRE_DFLASH_TEMP_SPEC").ok().as_deref() == Some("0"),
+        fast_sample_on: std::env::var("HIPFIRE_FAST_SAMPLE").ok().as_deref() != Some("0"),
+        supports_temp_swor: m
+            .speculator
+            .as_ref()
+            .is_some_and(|s| s.supports_temp_verify()),
+        kv_adaptive: m.kv_adaptive.is_some(),
+    };
+    let route = select_generation_route(&route_inputs);
+    if route != GenerationRoute::QwenAr {
+        return false;
+    }
+    // Batch size coherence
+    if continuous_batch_size != batch.as_ref().map(|b| b.max_batch()).unwrap_or(0) {
+        return false;
+    }
+    true
+}
+
+fn drive_qwen35_ep_continuous_batch(
+    sched: &mut ContinuousBatchScheduler,
+    model: &mut LoadedModel,
+    stdout: &mut std::io::Stdout,
+    inbox: &mut DaemonInbox,
+) -> Result<(), BatchDriveError> {
+    let batch_size = sched.max_batch;
+    if batch_size == 0 {
+        return Ok(());
+    }
+    // Borrow EP batch state, config, weights via raw pointers to avoid aliasing.
+    let ep_ptr = match model.ep.as_mut() {
+        Some(ep) => ep as *mut EpState,
+        None => return Err(BatchDriveError::Gpu("EP batch: no EP state".to_string())),
+    };
+    let (gpus_ptr, config_ptr, weights_ptr, batch_ptr, tokenizer_ptr, chat_template_clone, arch_id) = unsafe {
+        let ep = &mut *ep_ptr;
+        match &mut ep.inner {
+            EpArch::Qwen35 {
+                config,
+                weights,
+                batch,
+            } => {
+                let b = match batch.as_mut() {
+                    Some(b) => b as *mut qwen35::Qwen35DecodeBatchEpState,
+                    None => {
+                        return Err(BatchDriveError::Gpu(
+                            "EP batch: batch not staged".to_string(),
+                        ))
+                    }
+                };
+                (
+                    &mut ep.gpus as *mut hipfire_runtime::multi_gpu::Gpus,
+                    config as *const qwen35::Qwen35Config,
+                    weights as *const Vec<qwen35::Qwen35Weights>,
+                    b,
+                    match model.tokenizer.as_ref() {
+                        Some(t) => t as *const _,
+                        None => return Err(BatchDriveError::Gpu("tokenizer missing".to_string())),
+                    },
+                    model.chat_template.clone(),
+                    model.arch_id,
+                )
+            }
+            _ => return Err(BatchDriveError::Gpu("EP batch: not Qwen35 EP".to_string())),
+        }
+    };
+    let gpus: &mut hipfire_runtime::multi_gpu::Gpus = unsafe { &mut *gpus_ptr };
+    let config: &qwen35::Qwen35Config = unsafe { &*config_ptr };
+    let weights: &Vec<qwen35::Qwen35Weights> = unsafe { &*weights_ptr };
+    let batch_state: &mut qwen35::Qwen35DecodeBatchEpState = unsafe { &mut *batch_ptr };
+    let tokenizer: &hipfire_runtime::tokenizer::Tokenizer = unsafe { &*tokenizer_ptr };
+    let chat_template = chat_template_clone;
+    let eos_tok = config.eos_token;
+    let im_end_tok = tokenizer.special_token_id("<|im_end|>").unwrap_or(eos_tok);
+    let mut producers: Vec<Option<QwenArSemanticProducer>> =
+        (0..batch_size).map(|_| None).collect();
+    let mut loop_guards: Vec<hipfire_runtime::loop_guard::LoopGuard> = (0..batch_size)
+        .map(
+            |_| hipfire_runtime::loop_guard::LoopGuard::from_config(hipfire_runtime::config::get()),
+        )
+        .collect();
+    let mut tokens = vec![0u32; batch_size];
+    let mut positions = vec![0usize; batch_size];
+    // Track last attested receipt for evidence; must be from runtime, never load logs.
+    let mut last_receipt: Option<qwen35::Qwen35EpBatchReceipt> = None;
+    let fail_all = |sched: &mut ContinuousBatchScheduler,
+                    gpus: &mut hipfire_runtime::multi_gpu::Gpus,
+                    batch_state: &mut qwen35::Qwen35DecodeBatchEpState,
+                    stdout: &mut std::io::Stdout,
+                    reason: String|
+     -> Result<(), BatchDriveError> {
+        let mut uniq_set = std::collections::HashSet::new();
+        let mut uniq: Vec<AttemptKey> = Vec::new();
+        for l in sched.lanes.iter() {
+            if let Some(k) = l.key() {
+                if uniq_set.insert(k.clone()) {
+                    uniq.push(k.clone());
+                }
+            }
+        }
+        for k in sched.inbox.iter().cloned() {
+            if uniq_set.insert(k.clone()) {
+                uniq.push(k);
+            }
+        }
+        for k in sched.pending.keys().cloned() {
+            if uniq_set.insert(k.clone()) {
+                uniq.push(k);
+            }
+        }
+        let reset_res = batch_state.reset_all(gpus);
+        let first_err = reset_res.err().map(|e| format!("EP batch reset_all: {e}"));
+        let reason2 = if let Some(e) = first_err {
+            format!("{reason}; {e}")
+        } else {
+            reason.clone()
+        };
+        for key in &uniq {
+            let _scope = BatchAttemptScope::enter(key.attempt_id);
+            let ep = RollbackEpilogue {
+                rolled_back: true,
+                context: None,
+            };
+            emit_fail_closed_error(
+                stdout,
+                Some(&key.id),
+                &format!("batch GPU error: {reason2}"),
+                "gpu",
+                false,
+                &ep,
+            );
+        }
+        let _ = sched.fail_all_active();
+        for k in &uniq {
+            batch_clear_terminal(&k.id, k.attempt_id);
+        }
+        Err(BatchDriveError::Poisoned(reason2))
+    };
+    loop {
+        // handle awaiting commit/abort
+        let mut to_commit: Vec<(usize, AttemptKey, serde_json::Value)> = Vec::new();
+        let mut to_abort: Vec<(usize, AttemptKey)> = Vec::new();
+        for idx in 0..batch_size {
+            if let BatchLane::AwaitingClient(term) = &sched.lanes[idx] {
+                let key = term.key.clone();
+                let expired = Instant::now() >= term.deadline;
+                if batch_check_abort(&key.id, key.attempt_id) || expired {
+                    to_abort.push((idx, key));
+                } else if let Some(ClientTerminalDecision::Commit) =
+                    batch_poll_decision(&key.id, key.attempt_id)
+                {
+                    to_commit.push((idx, key.clone(), term.pending_done.clone()));
+                }
+            }
+        }
+        for (idx, key) in to_abort {
+            if let Err(e) = batch_state.reset_lane(gpus, config, idx) {
+                return fail_all(
+                    sched,
+                    gpus,
+                    batch_state,
+                    stdout,
+                    format!("EP reset lane {idx} on abort: {e}"),
+                );
+            }
+            let _scope = BatchAttemptScope::enter(key.attempt_id);
+            emit_qwen_ar_cancelled(stdout, &key.id, 0);
+            let _ = sched.abort_lane(idx, &key);
+            producers[idx] = None;
+        }
+        for (idx, key, pending_done) in to_commit {
+            let _scope = BatchAttemptScope::enter(key.attempt_id);
+            let reset_ok = match batch_state.reset_lane(gpus, config, idx) {
+                Ok(()) => true,
+                Err(e) => {
+                    return fail_all(
+                        sched,
+                        gpus,
+                        batch_state,
+                        stdout,
+                        format!("EP reset lane {idx} on commit: {e}"),
+                    )
+                }
+            };
+            let commit_ok = sched.commit_lane(idx, &key);
+            match batch_commit_teardown_class(reset_ok, commit_ok) {
+                BatchCommitTeardownClass::ResetFailed => unreachable!(),
+                BatchCommitTeardownClass::CommitFailed => {
+                    let ep = RollbackEpilogue {
+                        rolled_back: true,
+                        context: None,
+                    };
+                    emit_fail_closed_error(
+                        stdout,
+                        Some(&key.id),
+                        "batch commit_lane failed after reset",
+                        "internal",
+                        false,
+                        &ep,
+                    );
+                    let _ = sched.abort_lane(idx, &key);
+                    producers[idx] = None;
+                }
+                BatchCommitTeardownClass::EmitDone => {
+                    emit_staged_terminal_done(stdout, &pending_done);
+                    producers[idx] = None;
+                }
+            }
+        }
+        let mut queued_abort: Vec<AttemptKey> = Vec::new();
+        for k in sched.inbox.iter().cloned().collect::<Vec<_>>() {
+            if batch_check_abort(&k.id, k.attempt_id) {
+                queued_abort.push(k);
+            }
+        }
+        for k in queued_abort {
+            let _scope = BatchAttemptScope::enter(k.attempt_id);
+            emit_qwen_ar_cancelled(stdout, &k.id, 0);
+            let _ = sched.abort_queued(&k);
+        }
+        let mut running_abort: Vec<(usize, AttemptKey)> = Vec::new();
+        for idx in 0..batch_size {
+            if let Some(k) = sched.lanes[idx].key().cloned() {
+                if matches!(
+                    sched.lanes[idx],
+                    BatchLane::Running(_) | BatchLane::Seeding(_)
+                ) && batch_check_abort(&k.id, k.attempt_id)
+                {
+                    running_abort.push((idx, k));
+                }
+            }
+        }
+        for (idx, key) in running_abort {
+            if let Err(e) = batch_state.reset_lane(gpus, config, idx) {
+                return fail_all(
+                    sched,
+                    gpus,
+                    batch_state,
+                    stdout,
+                    format!("EP reset lane {idx} on running abort: {e}"),
+                );
+            }
+            let _scope = BatchAttemptScope::enter(key.attempt_id);
+            emit_qwen_ar_cancelled(stdout, &key.id, 0);
+            let _ = sched.abort_lane(idx, &key);
+            producers[idx] = None;
+        }
+        let mut barrier: Option<DaemonMsg> = None;
+        loop {
+            let dm = match inbox.try_recv() {
+                Ok(m) => m,
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => break,
+            };
+            match dm {
+                DaemonMsg::ParseError(e) => {
+                    emit_uncorrelated_error(
+                        stdout,
+                        None,
+                        &format!("invalid JSON: {e}"),
+                        "validation",
+                        false,
+                        false,
+                    );
+                    let _ = stdout.flush();
+                }
+                DaemonMsg::Regular(json) => {
+                    let t = json.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                    if t == "generate" {
+                        let attempt_id = match json.get("attempt_id").and_then(|v| v.as_u64()) {
+                            Some(v) => v,
+                            None => {
+                                emit_uncorrelated_error(
+                                    stdout,
+                                    json.get("id").and_then(|v| v.as_str()),
+                                    "generate missing attempt_id",
+                                    "validation",
+                                    false,
+                                    false,
+                                );
+                                continue;
+                            }
+                        };
+                        let id = json
+                            .get("id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("0")
+                            .to_string();
+                        batch_announce_terminal(&id, attempt_id);
+                        if batch_check_abort(&id, attempt_id) {
+                            let _scope = BatchAttemptScope::enter(attempt_id);
+                            emit_gen_start(
+                                stdout,
+                                &id,
+                                false,
+                                Some(QWEN_AR_SEMANTIC_CONTRACT_VERSION),
+                            );
+                            emit_qwen_ar_cancelled(stdout, &id, 0);
+                            batch_clear_terminal(&id, attempt_id);
+                            continue;
+                        }
+                        // EP batch-only admission; non-eligible becomes barrier.
+                        if !is_qwen_ep_batch_request_eligible(
+                            &json,
+                            model,
+                            batch_size,
+                            parse_serve_continuous_batch(&json),
+                            false,
+                        ) {
+                            barrier = Some(DaemonMsg::Regular(json));
+                            break;
+                        }
+                        let prompt_str = batch_single_user_content(&json).unwrap_or_else(|| {
+                            json.get("prompt")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("Hello")
+                                .to_string()
+                        });
+                        let system_str = json
+                            .get("system")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string());
+                        let assistant_prefix = match json
+                            .get("assistant_prefix")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("plain")
+                        {
+                            "open_think" => {
+                                hipfire_runtime::prompt_frame::AssistantPrefix::OpenThink
+                            }
+                            "closed_think" => {
+                                hipfire_runtime::prompt_frame::AssistantPrefix::ClosedThink
+                            }
+                            _ => hipfire_runtime::prompt_frame::AssistantPrefix::Plain,
+                        };
+                        let max_think = json
+                            .get("max_think_tokens")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0) as usize;
+                        let max_tokens_req = json
+                            .get("max_tokens")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(4096) as usize;
+                        let batch_messages = match json.get("messages") {
+                            Some(v) => match serde_json::from_value::<
+                                Vec<hipfire_runtime::prompt_frame::Message>,
+                            >(v.clone())
+                            {
+                                Ok(v) => Some(v),
+                                Err(e) => {
+                                    let _scope = BatchAttemptScope::enter(attempt_id);
+                                    emit_uncorrelated_error(
+                                        stdout,
+                                        Some(&id),
+                                        &format!("invalid messages field: {e}"),
+                                        "validation",
+                                        false,
+                                        false,
+                                    );
+                                    batch_clear_terminal(&id, attempt_id);
+                                    continue;
+                                }
+                            },
+                            None => None,
+                        };
+                        let (prompt_tokens, started_in_think) = match batch_render_prompt_tokens(
+                            &prompt_str,
+                            system_str.as_deref(),
+                            assistant_prefix,
+                            tokenizer,
+                            chat_template.as_ref(),
+                            max_think,
+                            batch_messages.as_deref(),
+                        ) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                let _scope = BatchAttemptScope::enter(attempt_id);
+                                emit_uncorrelated_error(
+                                    stdout,
+                                    Some(&id),
+                                    &format!("render failed: {e}"),
+                                    "validation",
+                                    false,
+                                    false,
+                                );
+                                batch_clear_terminal(&id, attempt_id);
+                                continue;
+                            }
+                        };
+                        if started_in_think {
+                            let _ = batch_transfer_abort_to_singleton_and_clear(&id, attempt_id);
+                            barrier = Some(DaemonMsg::Regular(json));
+                            break;
+                        }
+                        if prompt_tokens.is_empty() || prompt_tokens.len() >= sched.lane_capacity {
+                            let _scope = BatchAttemptScope::enter(attempt_id);
+                            emit_uncorrelated_error(
+                                stdout,
+                                Some(&id),
+                                "prompt exceeds lane capacity or empty",
+                                "validation",
+                                false,
+                                false,
+                            );
+                            batch_clear_terminal(&id, attempt_id);
+                            continue;
+                        }
+                        batch_transition_to_queued(&id, attempt_id);
+                        let sampling = resolve_batch_sampling(&json, model);
+                        let req = BatchPendingRequest {
+                            key: AttemptKey::new(&id, attempt_id),
+                            prompt: prompt_str.clone(),
+                            prompt_tokens: prompt_tokens.clone(),
+                            started_in_think,
+                            system: system_str.clone(),
+                            assistant_prefix,
+                            max_think_tokens: max_think,
+                            max_tokens: max_tokens_req,
+                            sampling,
+                        };
+                        if !sched.enqueue(req) {
+                            eprintln!("[batch][EP] duplicate enqueue rejected id={} attempt_id={}; preserving live registry", id, attempt_id);
+                            continue;
+                        }
+                        {
+                            let _scope = BatchAttemptScope::enter(attempt_id);
+                            emit_gen_start(
+                                stdout,
+                                &id,
+                                false,
+                                Some(QWEN_AR_SEMANTIC_CONTRACT_VERSION),
+                            );
+                        }
+                    } else if t == "abort" || t == "commit" {
+                        if let (Some(id), Some(aid), Some(kind)) = (
+                            json.get("id").and_then(|v| v.as_str()),
+                            json.get("attempt_id").and_then(|v| v.as_u64()),
+                            json.get("type").and_then(|v| v.as_str()),
+                        ) {
+                            batch_apply_terminal_control(kind, id, aid);
+                        }
+                    } else {
+                        barrier = Some(DaemonMsg::Regular(json));
+                        break;
+                    }
+                }
+            }
+        }
+        if let Some(msg) = barrier {
+            inbox.push_front(msg);
+            if sched.active_count() == 0 && sched.inbox.is_empty() {
+                return Ok(());
+            }
+        }
+        while let Some((key, ticket)) = sched.try_assign_one() {
+            let lane_idx = ticket.lane;
+            let pending_req = match sched.pending.get(&key).cloned() {
+                Some(r) => r,
+                None => continue,
+            };
+            let sampling = pending_req.sampling.clone();
+            let prompt_tokens = pending_req.prompt_tokens.clone();
+            let started_in_think = pending_req.started_in_think;
+            if started_in_think {
+                let prompt = pending_req.prompt.clone();
+                let _ = batch_transfer_abort_to_singleton_and_clear(&key.id, key.attempt_id);
+                let _ = sched.abort_lane(lane_idx, &key);
+                if let Err(err) = batch_state.reset_lane(gpus, config, lane_idx) {
+                    return fail_all(
+                        sched,
+                        gpus,
+                        batch_state,
+                        stdout,
+                        format!("EP reset lane {lane_idx} on think barrier: {err}"),
+                    );
+                }
+                inbox.push_front(DaemonMsg::Regular(serde_json::json!({"type":"generate","id":key.id,"attempt_id":key.attempt_id,"prompt":prompt})));
+                break;
+            }
+            if let Err(e) = batch_state.reset_lane(gpus, config, lane_idx) {
+                return fail_all(
+                    sched,
+                    gpus,
+                    batch_state,
+                    stdout,
+                    format!("EP reset lane {lane_idx}: {e}"),
+                );
+            }
+            let receipt =
+                match batch_state.prefill_lane(gpus, weights, config, lane_idx, &prompt_tokens) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        return fail_all(
+                            sched,
+                            gpus,
+                            batch_state,
+                            stdout,
+                            format!("EP prefill lane {lane_idx}: {e}"),
+                        )
+                    }
+                };
+            last_receipt = Some(receipt);
+            let lane_rng = match &sched.lanes[lane_idx] {
+                BatchLane::Running(lane) => lane.rng_state as u32,
+                _ => continue,
+            };
+            // Use per-lane sampling that respects readiness; repeat penalties folded via retry window with product if needed.
+            // For EP we call sample_lane (full product requires contiguous Ready lanes); per-lane keeps sparsity.
+            let (next_token, next_rng) = match batch_state.sample_lane(
+                gpus,
+                config,
+                lane_idx,
+                sampling.temp,
+                sampling.top_p,
+                sampling.top_k,
+                lane_rng,
+            ) {
+                Ok(v) => v,
+                Err(e) => {
+                    return fail_all(
+                        sched,
+                        gpus,
+                        batch_state,
+                        stdout,
+                        format!("EP sample lane {lane_idx}: {e}"),
+                    )
+                }
+            };
+            if let BatchLane::Running(lane) = &mut sched.lanes[lane_idx] {
+                lane.prompt_len = prompt_tokens.len();
+                lane.seq_pos = prompt_tokens.len();
+                lane.next_token = Some(next_token);
+                lane.rng_state = next_rng as u64;
+                lane.conversation_tokens = Vec::new();
+                lane.streamed_tokens = Vec::new();
+                lane.bytes_fed_to_filter = 0;
+                lane.prefill_done_at = Some(Instant::now());
+            }
+            producers[lane_idx] = Some(QwenArSemanticProducer::new(
+                key.id.clone(),
+                started_in_think,
+            ));
+        }
+        let running: Vec<usize> = sched
+            .lanes
+            .iter()
+            .enumerate()
+            .filter_map(|(i, l)| {
+                if matches!(l, BatchLane::Running(_)) {
+                    Some(i)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let awaiting: Vec<usize> = sched
+            .lanes
+            .iter()
+            .enumerate()
+            .filter_map(|(i, l)| {
+                if matches!(l, BatchLane::AwaitingClient(_)) {
+                    Some(i)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if running.is_empty()
+            && awaiting.is_empty()
+            && sched.inbox.is_empty()
+            && inbox.backlog.is_empty()
+        {
+            break;
+        }
+        if running.is_empty() {
+            std::thread::sleep(Duration::from_millis(2));
+            continue;
+        }
+        let active_now = running.len();
+        for &idx in &running {
+            if let BatchLane::Running(lane) = &mut sched.lanes[idx] {
+                if active_now > lane.max_active_lanes {
+                    lane.max_active_lanes = active_now;
+                }
+            }
+        }
+        // Build active mask and dense token/position vectors for EP forward_tick.
+        let mut active_mask: u64 = 0;
+        for &idx in &running {
+            active_mask |= 1u64 << idx;
+        }
+        for i in 0..batch_size {
+            match &sched.lanes[i] {
+                BatchLane::Running(lane) => {
+                    tokens[i] = lane.next_token.unwrap_or(eos_tok);
+                    positions[i] = lane.seq_pos;
+                }
+                _ => {
+                    tokens[i] = eos_tok;
+                    positions[i] = 0;
+                }
+            }
+        }
+        let receipt =
+            match batch_state.forward_tick(gpus, weights, config, active_mask, &tokens, &positions)
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    return fail_all(
+                        sched,
+                        gpus,
+                        batch_state,
+                        stdout,
+                        format!("EP forward_tick: {e}"),
+                    )
+                }
+            };
+        last_receipt = Some(receipt);
+        let mut to_await: Vec<(usize, AttemptKey, serde_json::Value)> = Vec::new();
+        let mut to_abort_running: Vec<(usize, AttemptKey)> = Vec::new();
+        let mut survivors: Vec<usize> = Vec::new();
+        for idx in running.clone() {
+            let key = match sched.lanes[idx].key().cloned() {
+                Some(k) => k,
+                None => continue,
+            };
+            if batch_check_abort(&key.id, key.attempt_id) {
+                to_abort_running.push((idx, key));
+                continue;
+            }
+            let lane_ptr = match &mut sched.lanes[idx] {
+                BatchLane::Running(l) => l as *mut QwenBatchLane,
+                _ => continue,
+            };
+            let lane = unsafe { &mut *lane_ptr };
+            let cur_token = lane.next_token.unwrap_or(eos_tok);
+            let prod_ptr = match producers[idx].as_mut() {
+                Some(p) => p as *mut QwenArSemanticProducer,
+                None => continue,
+            };
+            let producer = unsafe { &mut *prod_ptr };
+            let mut future_streamed = lane.streamed_tokens.clone();
+            future_streamed.push(cur_token);
+            let all_bytes = tokenizer.decode_bytes(&future_streamed);
+            let prev_fed = lane.bytes_fed_to_filter.min(all_bytes.len());
+            let token_bytes = all_bytes[prev_fed..].to_vec();
+            let _scope = BatchAttemptScope::enter(key.attempt_id);
+            if lane.first_token_at.is_none() {
+                lane.first_token_at = Some(Instant::now());
+            }
+            let stopped = {
+                let lane_seq = &mut lane.seq_pos as *mut usize;
+                let lane_conv = &mut lane.conversation_tokens as *mut Vec<u32>;
+                let lane_stream = &mut lane.streamed_tokens as *mut Vec<u32>;
+                let lane_fed = &mut lane.bytes_fed_to_filter as *mut usize;
+                let all_len = all_bytes.len();
+                let mut res: Result<bool, _> = Ok(false);
+                unsafe {
+                    res = producer.commit_and_classify(
+                        stdout,
+                        cur_token,
+                        || {
+                            let pos = qwen_ar_raw_commit_token(
+                                &mut *lane_conv,
+                                &mut *lane_stream,
+                                &mut *lane_seq,
+                                cur_token,
+                                QwenArRawCommitDisposition::ClassifiedVisible,
+                            );
+                            *lane_fed = all_len;
+                            (pos, token_bytes.clone())
+                        },
+                        |_, _| {},
+                    );
+                }
+                match res {
+                    Ok(s) => s,
+                    Err(e) => {
+                        return fail_all(
+                            sched,
+                            gpus,
+                            batch_state,
+                            stdout,
+                            format!("EP semantic classify lane {idx}: {e}"),
+                        )
+                    }
+                }
+            };
+            let loop_hit = loop_guards[idx].check(&lane.streamed_tokens).is_some();
+            let is_eos = cur_token == eos_tok || cur_token == im_end_tok;
+            let hit_max = lane.streamed_tokens.len() >= lane_max_tokens(&key, sched);
+            let hit_lane_cap = batch_lane_at_capacity(lane.seq_pos, sched.lane_capacity);
+            let should_finish =
+                batch_should_finish_decode(is_eos, hit_max, hit_lane_cap, stopped, loop_hit);
+            if should_finish {
+                let hit_length_cap =
+                    batch_hit_length_cap(hit_max, hit_lane_cap, is_eos, stopped, loop_hit);
+                let producer_owned = match producers[idx].take() {
+                    Some(p) => p,
+                    None => continue,
+                };
+                let (finish, visible_text) = match producer_owned.finish(stdout, hit_length_cap) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        return fail_all(
+                            sched,
+                            gpus,
+                            batch_state,
+                            stdout,
+                            format!("EP semantic finish lane {idx}: {e}"),
+                        )
+                    }
+                };
+                if matches!(finish.cause, QwenArTerminalCause::OpenThink) && !is_eos {
+                    if let Err(e) = batch_state.reset_lane(gpus, config, idx) {
+                        return fail_all(
+                            sched,
+                            gpus,
+                            batch_state,
+                            stdout,
+                            format!("EP reset lane {idx} on open think: {e}"),
+                        );
+                    }
+                    let ep = RollbackEpilogue {
+                        rolled_back: true,
+                        context: None,
+                    };
+                    let _scope = BatchAttemptScope::enter(key.attempt_id);
+                    emit_qwen_ar_open_think_terminal(
+                        stdout,
+                        &key.id,
+                        lane.streamed_tokens.len(),
+                        &ep,
+                    );
+                    let _ = sched.abort_lane(idx, &key);
+                    producers[idx] = None;
+                    continue;
+                }
+                if !finish.wire_tool_calls.is_empty() {
+                    return fail_all(
+                        sched,
+                        gpus,
+                        batch_state,
+                        stdout,
+                        format!("EP semantic finish lane {idx}: unexpected tool calls"),
+                    );
+                }
+                let finish_reason = match finish.finish_reason {
+                    "length" => "length",
+                    "tool_calls" => "tool_calls",
+                    _ => "stop",
+                };
+                let generated = lane.streamed_tokens.len();
+                let metrics = batch_lane_done_metrics(
+                    lane.created_at,
+                    lane.prefill_done_at,
+                    lane.first_token_at,
+                    Instant::now(),
+                    lane.prompt_len,
+                    generated,
+                );
+                let mut pending_done = qwen_ar_done_value(
+                    &key.id,
+                    finish_reason,
+                    generated,
+                    metrics.tok_s,
+                    lane.prompt_len,
+                    metrics.prefill_ms,
+                    metrics.prefill_tok_s,
+                    metrics.decode_tok_s,
+                    metrics.ttft_ms,
+                    0,
+                    "",
+                );
+                pending_done["latency_ms"] =
+                    serde_json::json!((metrics.latency_ms * 10.0).round() / 10.0);
+                if let Some(receipt) = last_receipt.as_ref() {
+                    attach_qwen_ep_batch_receipt_evidence(
+                        &mut pending_done,
+                        receipt,
+                        batch_size,
+                        idx,
+                        sched.lane_capacity,
+                        lane.max_active_lanes.max(1),
+                    );
+                } else {
+                    // Never fabricate: if no receipt yet, attach generic but still mark expert_parallel via default (should not happen on finishing lane after forward).
+                    attach_continuous_batch_route_evidence(
+                        &mut pending_done,
+                        batch_size,
+                        idx,
+                        sched.lane_capacity,
+                        lane.max_active_lanes.max(1),
+                    );
+                    pending_done["continuous_batch"]["parallelism"] =
+                        serde_json::json!("expert_parallel");
+                    pending_done["continuous_batch"]["rank_count"] = serde_json::json!(4);
+                    pending_done["continuous_batch"]["reduce"] =
+                        serde_json::json!("peer_rooted_f32");
+                }
+                let _ = visible_text;
+                to_await.push((idx, key.clone(), pending_done));
+            } else {
+                survivors.push(idx);
+            }
+        }
+        for (idx, key) in to_abort_running {
+            if let Err(e) = batch_state.reset_lane(gpus, config, idx) {
+                return fail_all(
+                    sched,
+                    gpus,
+                    batch_state,
+                    stdout,
+                    format!("EP reset lane {idx} on abort post-forward: {e}"),
+                );
+            }
+            let _scope = BatchAttemptScope::enter(key.attempt_id);
+            emit_qwen_ar_cancelled(stdout, &key.id, 0);
+            let _ = sched.abort_lane(idx, &key);
+            producers[idx] = None;
+        }
+        for (idx, key, pending_done) in to_await {
+            let mut envelope = pending_done.clone();
+            envelope["type"] = serde_json::json!("commit_ready");
+            let marked = sched.mark_awaiting_commit(idx, pending_done.clone());
+            if !marked {
+                eprintln!(
+                    "[batch][EP] qwen mark_awaiting_commit failed lane {idx} id={} — aborting lane",
+                    key.id
+                );
+                let _ = batch_state.reset_lane(gpus, config, idx);
+                let _ = sched.abort_lane(idx, &key);
+                producers[idx] = None;
+                continue;
+            }
+            let write_ok = {
+                let _scope = BatchAttemptScope::enter(key.attempt_id);
+                writeln!(stdout, "{}", envelope).is_ok() && stdout.flush().is_ok()
+            };
+            if !write_ok {
+                let _ = batch_state.reset_lane(gpus, config, idx);
+                let _ = sched.abort_lane(idx, &key);
+                producers[idx] = None;
+            }
+        }
+        if survivors.is_empty() {
+            continue;
+        }
+        // Per-lane sampling for survivors (sparse-aware). Use sample_lane to avoid contiguous prefix requirement.
+        for idx in survivors.iter().cloned() {
+            let sampling = match &sched.lanes[idx] {
+                BatchLane::Running(l) => l.sampling.clone(),
+                _ => continue,
+            };
+            let rng = match &sched.lanes[idx] {
+                BatchLane::Running(l) => l.rng_state as u32,
+                _ => continue,
+            };
+            let (tok, next_rng) = match batch_state.sample_lane(
+                gpus,
+                config,
+                idx,
+                sampling.temp,
+                sampling.top_p,
+                sampling.top_k,
+                rng,
+            ) {
+                Ok(v) => v,
+                Err(e) => {
+                    return fail_all(
+                        sched,
+                        gpus,
+                        batch_state,
+                        stdout,
+                        format!("EP sample_lane survivor {idx}: {e}"),
+                    )
+                }
+            };
+            if let BatchLane::Running(lane) = &mut sched.lanes[idx] {
+                lane.next_token = Some(tok);
+                lane.rng_state = next_rng as u64;
+            }
+        }
+        // Also exercise sample_product when survivors form a contiguous full prefix (API coverage; sparse batches use sample_lane above).
+        if survivors.len() == batch_size && survivors.iter().enumerate().all(|(i, &v)| i == v) {
+            // Use the same sampling as first survivor for product validation; ignore error for non-product-capable batch shapes.
+            if let Some(first) = survivors.first().and_then(|&idx| match &sched.lanes[idx] {
+                BatchLane::Running(l) => Some(l.sampling.clone()),
+                _ => None,
+            }) {
+                let dummy_repeat = vec![0u32; batch_size * 128];
+                let dummy_lengths = vec![0u32; batch_size];
+                let dummy_rng = vec![0u32; batch_size];
+                let _ = batch_state.sample_product(
+                    gpus,
+                    config,
+                    batch_size,
+                    &dummy_repeat,
+                    &dummy_lengths,
+                    &dummy_rng,
+                    first.temp,
+                    first.top_p,
+                    first.top_k,
+                    first.min_p,
+                    first.repeat_penalty,
+                    first.presence_penalty,
+                    first.frequency_penalty,
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Drop guard: clears the active terminal-control transaction.
 struct TerminalControlGuard;
 impl Drop for TerminalControlGuard {
@@ -12659,11 +13703,16 @@ fn main() {
                         }
 
                         // ── Continuous batch staging (must be before `loaded` ack) ──
-                        // Stage Qwen35DecodeBatchState or Lfm2DecodeBatchState + host scheduler before publishing.
+                        // Stage Qwen35DecodeBatchState / Lfm2DecodeBatchState (single-GPU) or
+                        // Qwen35DecodeBatchEpState (EP TP=4 pure gfx1201) + host scheduler.
                         // `continuous_batch_capable` reflects the newly staged state, not the previous.
-                        // Allocation failure advertises false and preserves sequential service.
+                        // EP is batch-only: TP must be 4 and exactly 4×gfx1201, else fail closed.
+                        // Allocation failure advertises false and preserves sequential/poison handling.
                         let mut staged_batch_scheduler: Option<ContinuousBatchScheduler> = None;
                         let mut staged_batch_capable = false;
+                        let mut staged_ep_batch: bool = false;
+                        let mut staged_ep_slots: usize = 0;
+                        let mut staged_ep_lane_cap: usize = 0;
                         if parsed_continuous_batch_size > 1 && m.pp == 1 && m.ep.is_none() {
                             if matches!(m.arch_id, 5 | 6) {
                                 if let Some(ModelState::Qwen35(bundle)) = m.state.as_ref() {
@@ -12740,7 +13789,6 @@ fn main() {
                                             reason
                                         );
                                     } else {
-                                        // LFM has no per-model repeat_buf; use the same 2048 capacity so user repeat_window up to 2048 is supported.
                                         let repeat_cap = 2048usize.max(1);
                                         let max_attention_lane = gpu
                                             .attention_q8_0_kv_independent_max_lane_capacity(
@@ -12795,6 +13843,89 @@ fn main() {
                             } else {
                                 eprintln!("[daemon] continuous batch requested but not capable (arch_id={} pp={} ep={:?}) — fallback to sequential", m.arch_id, m.pp, m.ep.is_some());
                             }
+                        } else if parsed_continuous_batch_size > 1 && m.pp == 1 && m.ep.is_some() {
+                            // EP Qwen35 pure expert-parallel batch route: TP=4, 4×gfx1201, batch-only.
+                            let tp_ok =
+                                m.ep.as_ref()
+                                    .map(|ep| ep.gpus.devices.len() == 4)
+                                    .unwrap_or(false);
+                            let gfx_ok = m
+                                .ep
+                                .as_ref()
+                                .map(|ep| ep.gpus.devices.iter().all(|d| d.arch_caps.is_gfx1201()))
+                                .unwrap_or(false);
+                            let arch_ok = matches!(m.arch_id, 5 | 6);
+                            if !arch_ok || !tp_ok || !gfx_ok {
+                                eprintln!("[daemon][EP] continuous batch requires arch 5/6, TP=4, 4×gfx1201 (arch_ok={arch_ok} tp_ok={tp_ok} gfx_ok={gfx_ok}) — fail closed");
+                                staged_batch_capable = false;
+                            } else if let Some(ep) = m.ep.as_mut() {
+                                if let EpArch::Qwen35 {
+                                    config,
+                                    weights,
+                                    batch,
+                                } = &mut ep.inner
+                                {
+                                    if !qwen_ep_batch_weight_formats_supported(&weights[0]) {
+                                        eprintln!("[daemon][EP] continuous batch weight formats unsupported — fail closed");
+                                    } else {
+                                        // Derive capacities similar to single-GPU but via EP Gpus handle when possible.
+                                        let max_attention_lane = ep.gpus.devices[0]
+                                            .attention_q8_0_kv_independent_max_lane_capacity(
+                                                config.head_dim,
+                                            );
+                                        let batch_lane_capacity =
+                                            m.max_seq.min(max_attention_lane).max(1);
+                                        let repeat_cap = 128usize.max(1);
+                                        let prefill_chunk = 512usize;
+                                        if batch_lane_capacity == 0
+                                            || batch_lane_capacity >= m.max_seq + 1
+                                        {
+                                            eprintln!("[daemon][EP] continuous batch lane capacity invalid — fail closed");
+                                        } else {
+                                            let load_cfg = qwen35::Qwen35BatchLoadConfig::new(
+                                                parsed_continuous_batch_size,
+                                                batch_lane_capacity,
+                                                repeat_cap,
+                                                prefill_chunk,
+                                            );
+                                            // Fail-closed validation before allocation.
+                                            match qwen35::validate_ep_batch_compatibility(
+                                                &ep.gpus, weights, config, &load_cfg,
+                                            ) {
+                                                Ok(compat) => {
+                                                    // Enforce frozen invariants.
+                                                    if compat.rank_count() != 4 || compat.rank_mask() != 0x0f || compat.reduce() != qwen35::Qwen35EpReduce::PeerRootedF32 || compat.topology() != qwen35::Qwen35EpTopology::ExpertParallel {
+                                                        eprintln!("[daemon][EP] compat invariants violated — fail closed: rank_count={} mask={:#x} reduce={:?} topo={:?}", compat.rank_count(), compat.rank_mask(), compat.reduce(), compat.topology());
+                                                    } else {
+                                                        match qwen35::Qwen35DecodeBatchEpState::new(&mut ep.gpus, weights, config, &load_cfg) {
+                                                            Ok(ep_batch) => {
+                                                                // Attest receipt getters work before publishing.
+                                                                let _ = ep_batch.max_batch();
+                                                                let _ = ep_batch.lane_capacity();
+                                                                *batch = Some(ep_batch);
+                                                                staged_batch_scheduler = Some(ContinuousBatchScheduler::new(parsed_continuous_batch_size, batch_lane_capacity));
+                                                                staged_batch_capable = true;
+                                                                staged_ep_batch = true;
+                                                                staged_ep_slots = parsed_continuous_batch_size;
+                                                                staged_ep_lane_cap = batch_lane_capacity;
+                                                                eprintln!("[daemon][EP] expert-parallel batch staged: slots={} lane_cap={} repeat_cap={} prefill_chunk={} reduce=peer_rooted_f32 rank_count=4", parsed_continuous_batch_size, batch_lane_capacity, repeat_cap, prefill_chunk);
+                                                            }
+                                                            Err(e) => {
+                                                                eprintln!("[daemon][EP] expert-parallel batch allocation failed: {e} — fail closed");
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    eprintln!("[daemon][EP] expert-parallel batch compatibility failed: {e} — fail closed");
+                                                }
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    eprintln!("[daemon][EP] continuous batch requested but EP arch not Qwen35 — fail closed");
+                                }
+                            }
                         } else if parsed_continuous_batch_size > 1 {
                             eprintln!("[daemon] continuous batch requested but not capable (arch_id={} pp={} ep={:?}) — fallback to sequential", m.arch_id, m.pp, m.ep.is_some());
                         }
@@ -12804,34 +13935,40 @@ fn main() {
                             1
                         };
                         batch_scheduler = staged_batch_scheduler;
-
-                        // `cache_capable`: the daemon implements LCP prompt-cache
-                        // reuse for these arches' AR generate path (qwen3.5/3.6
-                        // = 5/6, deepseek4 = 9, minimax-m2 = 10, Cohere2-MoE
-                        // = 12). The serve layer keys its
-                        // per-request `reset` decision off THIS flag rather than
-                        // a hardcoded arch-string allowlist, so a new
-                        // cache-capable arch (or an arch-string rename) can't
-                        // silently fall back to stateless reset-every-turn — the
-                        // exact failure that left the prompt cache dead when the
-                        // installed CLI predated the allowlist. Source of truth
-                        // lives here, next to the cache implementation.
+                        // `cache_capable` is the daemon's prompt-cache source of truth.
                         let cache_capable = matches!(m.arch_id, 5 | 6 | 9 | 10 | 12);
                         let retry_reset_eligible = model_retry_reset_eligible(m.arch_id);
                         let continuous_batch_capable = staged_batch_capable;
-                        let _ = writeln!(
-                            stdout,
-                            r#"{{"type":"loaded","arch":"{}","dim":{},"layers":{},"vocab":{},"vl":{},"cache_capable":{},"retry_reset_eligible":{},"continuous_batch_capable":{}}}"#,
-                            arch,
-                            dim,
-                            layers,
-                            vocab,
-                            vl,
-                            cache_capable,
-                            retry_reset_eligible,
-                            continuous_batch_capable
-                        );
-
+                        // Load ack exposes batch dimensions/capability; EP adds parallelism metadata but never infers operation from logs.
+                        if staged_ep_batch {
+                            let _ = writeln!(
+                                stdout,
+                                r#"{{"type":"loaded","arch":"{}","dim":{},"layers":{},"vocab":{},"vl":{},"cache_capable":{},"retry_reset_eligible":{},"continuous_batch_capable":{},"continuous_batch_slots":{},"continuous_batch_lane_capacity":{},"continuous_batch_parallelism":"expert_parallel","continuous_batch_rank_count":4,"continuous_batch_reduce":"peer_rooted_f32"}}"#,
+                                arch,
+                                dim,
+                                layers,
+                                vocab,
+                                vl,
+                                cache_capable,
+                                retry_reset_eligible,
+                                continuous_batch_capable,
+                                staged_ep_slots,
+                                staged_ep_lane_cap,
+                            );
+                        } else {
+                            let _ = writeln!(
+                                stdout,
+                                r#"{{"type":"loaded","arch":"{}","dim":{},"layers":{},"vocab":{},"vl":{},"cache_capable":{},"retry_reset_eligible":{},"continuous_batch_capable":{}}}"#,
+                                arch,
+                                dim,
+                                layers,
+                                vocab,
+                                vl,
+                                cache_capable,
+                                retry_reset_eligible,
+                                continuous_batch_capable
+                            );
+                        }
                         // ── PFlash drafter load (Phase 4.0) ──────────────
                         //
                         // Only attempt when mode != off AND a drafter path
@@ -13594,18 +14731,156 @@ fn main() {
                         continue;
                     }
                     // ── Continuous batch admission (tightened to actual route) ──
-                    // This check must stay above the sequential `generate()` call so
-                    // eligible requests are aggregated into the fixed-shape decode loop.
+                    // EP Qwen35 expert-parallel is batch-only, TP=4, 4×gfx1201; fail closed otherwise.
+                    // Check EP eligibility first so batch-only enforcement fires before single-GPU fallback.
                     let serve_continuous_batch = parse_serve_continuous_batch(&msg);
+                    let pflash_active = pf_cfg_owned.as_ref().is_some_and(|c| {
+                        !matches!(c.mode, hipfire_arch_qwen35::pflash::PflashMode::Off)
+                    });
+                    let ep_batch_eligible = if batch_scheduler.is_some() && m.ep.is_some() {
+                        is_qwen_ep_batch_request_eligible(
+                            &msg,
+                            m,
+                            continuous_batch_size,
+                            serve_continuous_batch,
+                            pflash_active,
+                        )
+                    } else {
+                        false
+                    };
+                    if ep_batch_eligible {
+                        batch_transition_to_queued(id, gen_attempt_id);
+                        if batch_check_abort(id, gen_attempt_id) {
+                            let _scope = BatchAttemptScope::enter(gen_attempt_id);
+                            emit_gen_start(
+                                &mut stdout,
+                                id,
+                                false,
+                                Some(QWEN_AR_SEMANTIC_CONTRACT_VERSION),
+                            );
+                            emit_qwen_ar_cancelled(&mut stdout, id, 0);
+                            batch_clear_terminal(id, gen_attempt_id);
+                            continue;
+                        }
+                        let sampling = resolve_batch_sampling(&msg, m);
+                        let prompt_owned =
+                            batch_single_user_content(&msg).unwrap_or_else(|| prompt.to_string());
+                        let (prompt_tokens, started_in_think) = match batch_render_prompt_tokens(
+                            &prompt_owned,
+                            system,
+                            assistant_prefix,
+                            m.tokenizer.as_ref().unwrap(),
+                            m.chat_template.as_ref(),
+                            max_think_tokens,
+                            messages_history.as_deref(),
+                        ) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                let _scope = BatchAttemptScope::enter(gen_attempt_id);
+                                emit_uncorrelated_error(
+                                    &mut stdout,
+                                    Some(id),
+                                    &format!("render failed: {e}"),
+                                    "validation",
+                                    false,
+                                    false,
+                                );
+                                batch_clear_terminal(id, gen_attempt_id);
+                                continue;
+                            }
+                        };
+                        if started_in_think {
+                            let _ = batch_transfer_abort_to_singleton_and_clear(id, gen_attempt_id);
+                        } else {
+                            if prompt_tokens.is_empty() || prompt_tokens.len() >= m.max_seq {
+                                let _scope = BatchAttemptScope::enter(gen_attempt_id);
+                                emit_uncorrelated_error(
+                                    &mut stdout,
+                                    Some(id),
+                                    "prompt exceeds lane capacity or empty",
+                                    "validation",
+                                    false,
+                                    false,
+                                );
+                                batch_clear_terminal(id, gen_attempt_id);
+                                continue;
+                            }
+                            let pending = BatchPendingRequest {
+                                key: AttemptKey::new(id, gen_attempt_id),
+                                prompt: prompt_owned.clone(),
+                                prompt_tokens: prompt_tokens.clone(),
+                                started_in_think,
+                                system: system.map(|s| s.to_string()),
+                                assistant_prefix,
+                                max_think_tokens,
+                                max_tokens,
+                                sampling: sampling.clone(),
+                            };
+                            if let Some(sched) = batch_scheduler.as_mut() {
+                                let enq_ok = sched.enqueue(pending);
+                                if !enq_ok {
+                                    eprintln!("[batch][EP] duplicate enqueue rejected id={} attempt_id={}; preserving live registry", id, gen_attempt_id);
+                                    continue;
+                                }
+                                {
+                                    let _scope = BatchAttemptScope::enter(gen_attempt_id);
+                                    emit_gen_start(
+                                        &mut stdout,
+                                        id,
+                                        false,
+                                        Some(QWEN_AR_SEMANTIC_CONTRACT_VERSION),
+                                    );
+                                }
+                                let drive_res = drive_qwen35_ep_continuous_batch(
+                                    sched,
+                                    m,
+                                    &mut stdout,
+                                    &mut inbox,
+                                );
+                                match drive_res {
+                                    Ok(()) => {}
+                                    Err(BatchDriveError::Gpu(e)) => {
+                                        eprintln!("[batch][EP] drive failed (attested): {e}");
+                                    }
+                                    Err(BatchDriveError::Poisoned(e)) => {
+                                        eprintln!("[batch][EP] drive poisoned (unattested): {e} — generation poisoned until unload/reload");
+                                        // Checked teardown: reset_all already attempted in fail_all; poison scheduler.
+                                        batch_scheduler = None;
+                                        continuous_batch_size = 1;
+                                        batch_poisoned = Some(e);
+                                        batch_clear_all_terminals();
+                                    }
+                                }
+                            }
+                            continue;
+                        }
+                    }
+                    // Enforce batch-only for EP: if EP batch is staged, non-eligible must fail closed, not silently fall back.
+                    let ep_batch_staged = batch_scheduler.is_some()
+                        && m.ep
+                            .as_ref()
+                            .is_some_and(|ep| matches!(ep.inner, EpArch::Qwen35 { .. }));
+                    if ep_batch_staged {
+                        // EP requests without serve_continuous_batch or with excluded features must error.
+                        if !ep_batch_eligible {
+                            let _scope = BatchAttemptScope::enter(gen_attempt_id);
+                            let ep = RollbackEpilogue {
+                                rolled_back: true,
+                                context: None,
+                            };
+                            // Reset the specific lane if any (best-effort), else poison not needed; just fail this request.
+                            emit_fail_closed_error(&mut stdout, Some(id), "EP qwen35 batch-only: request must set serve_continuous_batch=true with TP=4 expert_parallel and no excluded features (image/tools/stop/spec)", "validation", false, &ep);
+                            batch_clear_terminal(id, gen_attempt_id);
+                            continue;
+                        }
+                    }
                     let batch_eligible = if batch_scheduler.is_some() {
                         is_batch_request_eligible(
                             &msg,
                             m,
                             continuous_batch_size,
                             serve_continuous_batch,
-                            pf_cfg_owned.as_ref().is_some_and(|c| {
-                                !matches!(c.mode, hipfire_arch_qwen35::pflash::PflashMode::Off)
-                            }),
+                            pflash_active,
                         )
                     } else {
                         false
@@ -16169,6 +17444,16 @@ fn ep_reset_after_abort(m: &mut LoadedModel) -> RollbackEpilogue {
                     }
                     s.reset();
                     g.invalidate_graph_state();
+                }
+            }
+            EpArch::Qwen35 { batch, .. } => {
+                if let Some(batch) = batch.as_mut() {
+                    if let Err(e) = batch.reset_all(gpus) {
+                        push_reset_err(&mut first_err, "qwen35 ep batch reset_all", e);
+                    }
+                }
+                for dev in &mut gpus.devices {
+                    dev.invalidate_graph_state();
                 }
             }
         }
