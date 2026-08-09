@@ -24061,6 +24061,36 @@ fn generate_lfm2moe(
         v
     };
 
+    // Capacity guard BEFORE gen_start — an oversized prompt is a validation error
+    // and must not emit gen_start (client expects no stream on validation failure).
+    // saturating_add: an adversarially huge max_tokens must not wrap usize
+    // and slip under the cap.
+    let cap = m.lfm2moe().unwrap().state.max_seq;
+    if prompt_ids.len().saturating_add(max_tokens) > cap {
+        emit_active_attempt_error(
+            stdout,
+            Some(id),
+            &format!("prompt exceeds context capacity: prompt={} + max_tokens={} > capacity={} — reload model with a larger max_seq", prompt_ids.len(), max_tokens, cap),
+            "context_length",
+            false,
+            false
+        );
+        let _ = stdout.flush();
+        return;
+    }
+
+    // Open the stream contract BEFORE any GPU work or token emission.
+    // The HTTP CLI's StreamContractGate requires the first event to be
+    // `gen_start` with the exact (id, attempt_id). Without this, the
+    // first `token` is rejected as "stream must begin with gen_start",
+    // the client sends `abort`, and the daemon hangs awaiting `commit`
+    // while the HTTP handler waits for a stream that will never deliver.
+    // This was the root cause of the 3-minute hang on native `hipfire serve`
+    // for LFM2.5-230M/350M (direct `infer_lfm2moe` bypasses the gate and was
+    // coherent). Mirrors the DS4 fix `e99583afa` and Qwen's `emit_gen_start`.
+    let gen_contract = gen_start_contract_version_for_arch(m.arch_id);
+    emit_gen_start(stdout, id, false, gen_contract);
+
     // Cross-conversation reset (FIX: LFM turn-to-turn KV accumulation). The
     // prior design only reset on capacity overflow, so every request APPENDED to
     // the KV at the growing `n_tokens` and the model attended to all prior
@@ -24078,31 +24108,14 @@ fn generate_lfm2moe(
     m.seq_pos = 0;
     m.conversation_tokens.clear();
 
-    // After the reset the KV starts at 0, so the only overflow risk is a SINGLE
-    // prompt+generation larger than the whole context — the prefill decode_step
-    // loop would write past the KV (sized for state.max_seq) and panic, taking
-    // down serve. Emit a clean error BEFORE prefill — mirror the minimax/qwen2
-    // guard. saturating_add: an adversarially huge max_tokens must not wrap usize
-    // and slip under the cap.
-    let cap = m.lfm2moe().unwrap().state.max_seq;
-    if prompt_ids.len().saturating_add(max_tokens) > cap {
-        emit_active_attempt_error(
-            stdout,
-            Some(id),
-            &format!("prompt exceeds context capacity: prompt={} + max_tokens={} > capacity={} — reload model with a larger max_seq", prompt_ids.len(), max_tokens, cap),
-            "context_length",
-            false,
-            false
-        );
-        let _ = stdout.flush();
-        return;
-    }
-
     let t0 = Instant::now();
 
     // ── Prefill: decode_step per prompt token. The LAST decode_step's logits
-    // are the predictions for the first generated token. ──
+    // are the predictions for the first generated token. Abort is checked
+    // before each token so a client cancel during a long prompt (thousands of
+    // tokens) does not run the full prefill before honoring the cancel. ──
     let mut last_logits: Vec<f32> = Vec::new();
+    let mut prefill_aborted = false;
     {
         let b = m.lfm2moe_mut().unwrap();
         let cfg = &b.config;
@@ -24110,6 +24123,10 @@ fn generate_lfm2moe(
         let state = &mut b.state;
         let mut position = state.n_tokens as u32;
         for &tok in &prompt_ids {
+            if check_abort(id) {
+                prefill_aborted = true;
+                break;
+            }
             match lfm2moe::forward::decode_step(cfg, weights, state, gpu, tok, position) {
                 Ok(logits) => last_logits = logits,
                 Err(e) => {
@@ -24120,12 +24137,22 @@ fn generate_lfm2moe(
             position += 1;
         }
     }
+    if prefill_aborted || check_abort(id) {
+        let ep = production_fail_closed_rollback(m, gpu, None, None);
+        emit_spec_cancel_after_rollback(stdout, id, 0, &ep);
+        return;
+    }
     for &tok in &prompt_ids {
         m.conversation_tokens.push(tok);
     }
     let prefill_ms = t0.elapsed().as_millis();
 
-    // ── Decode loop. Sample host-side from the running logits vector. ──
+    // ── Decode loop. Sample host-side from the running logits vector.
+    // Abort is checked at the top of every iteration so a mid-decode
+    // client cancel stops the loop immediately and emits `aborted`+`done`.
+    // Without this, the loop would run for the full `max_tokens` of wasted
+    // work after the HTTP client has already timed out and sent `abort`.
+    // ──
     let seed = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
@@ -24135,6 +24162,11 @@ fn generate_lfm2moe(
     let mut generated_count: usize = 0;
     let decode_t0 = Instant::now();
     loop {
+        if check_abort(id) {
+            let ep = production_fail_closed_rollback(m, gpu, None, None);
+            emit_spec_cancel_after_rollback(stdout, id, generated_count, &ep);
+            return;
+        }
         if generated_count >= max_tokens {
             break;
         }
@@ -24167,6 +24199,14 @@ fn generate_lfm2moe(
         m.conversation_tokens.push(next_tok);
         generated_count += 1;
 
+        // Check abort before the next GPU decode_step to avoid launching
+        // more work after the client has already cancelled.
+        if check_abort(id) {
+            let ep = production_fail_closed_rollback(m, gpu, None, None);
+            emit_spec_cancel_after_rollback(stdout, id, generated_count, &ep);
+            return;
+        }
+
         let step = {
             let b = m.lfm2moe_mut().unwrap();
             let cfg = &b.config;
@@ -24182,6 +24222,15 @@ fn generate_lfm2moe(
                 return;
             }
         }
+    }
+
+    // Abort latched between loop exit and commit must not proceed to the
+    // two-phase commit handshake — emit the attested `aborted` terminal
+    // instead so the client's drain loop terminates.
+    if check_abort(id) {
+        let ep = production_fail_closed_rollback(m, gpu, None, None);
+        emit_spec_cancel_after_rollback(stdout, id, generated_count, &ep);
+        return;
     }
 
     m.seq_pos = m.lfm2moe().unwrap().state.n_tokens;
@@ -24204,7 +24253,10 @@ fn generate_lfm2moe(
     });
     match await_client_terminal_commit(stdout, id, &pending_done) {
         ClientTerminalDecision::Commit => emit_staged_terminal_done(stdout, &pending_done),
-        ClientTerminalDecision::Abort => {}
+        ClientTerminalDecision::Abort => {
+            let ep = production_fail_closed_rollback(m, gpu, None, None);
+            emit_spec_cancel_after_rollback(stdout, id, generated_count, &ep);
+        }
     }
 }
 

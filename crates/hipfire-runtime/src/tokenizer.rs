@@ -510,10 +510,29 @@ impl Tokenizer {
                 }
             }
             // Honor HF `add_bos_token` from the embedded tokenizer_config (e.g.
-            // Cohere2 = true). Drives the BOS prepend in `encode()`.
-            if let Some(tc) = meta.get("tokenizer_config") {
-                if let Some(ab) = tc.get("add_bos_token").and_then(|v| v.as_bool()) {
-                    t.add_bos = ab;
+            // Cohere2 = true). Drives the BOS prepend in `encode()`. An explicit
+            // true or false is authoritative; only fall through to arch defaults
+            // when the key is absent.
+            let add_bos_explicit = meta
+                .get("tokenizer_config")
+                .and_then(|tc| tc.get("add_bos_token"))
+                .and_then(|v| v.as_bool());
+            if let Some(ab) = add_bos_explicit {
+                t.add_bos = ab;
+            } else if let Some(arch) = meta.get("architecture").and_then(|v| v.as_str()) {
+                // LFM2.5 family (arch "lfm2" / "lfm2_moe") is BOS-trained: the
+                // chat_template starts with `{{- bos_token -}}` and HF's
+                // AutoTokenizer adds BOS for raw prompts (verified: 350M
+                // "The capital of France is" -> [1, 1098, ...] via HF, but
+                // hipfire's add_bos is false when tokenizer_config lacks
+                // `add_bos_token`, so raw prompts miss BOS and the model
+                // sees position-shifted inputs -> single-token attractor
+                // (230M: 856 " is" x8, 350M: 540 x8). Default add_bos true
+                // for LFM only when the flag is absent; encode() still
+                // suppresses a double-BOS when text already starts with the
+                // BOS literal (Jinja-rendered chat path).
+                if arch == "lfm2" || arch == "lfm2_moe" {
+                    t.add_bos = true;
                 }
             }
             return Ok(t);
@@ -697,13 +716,19 @@ impl Tokenizer {
     /// segments are encoded via BPE or SentencePiece.
     pub fn encode(&self, text: &str) -> Vec<u32> {
         let mut result = Vec::new();
-        // Honor HF `add_bos_token` (Cohere2 add_bos_token=true, BOS=2): prepend
-        // the BOS id once. Raw-text/PPL eval relies on this; without it
-        // BOS-trained models degenerate. (A chat-template serving path that
-        // already emits <BOS_TOKEN> must encode with add_bos disabled to avoid
-        // a double BOS — a serving concern, separate from raw encode.)
+        // Honor HF `add_bos_token` (Cohere2/LFM2): prepend bos_id once for
+        // raw prompts. Suppress a duplicate when `text` already begins with
+        // the BOS vocabulary literal (Jinja chat templates emit
+        // `{{- bos_token -}}` up front).
         if self.add_bos {
-            result.push(self.bos_id);
+            let bos_str = self
+                .vocab
+                .get(self.bos_id as usize)
+                .map(|s| s.as_str())
+                .unwrap_or("");
+            if bos_str.is_empty() || !text.starts_with(bos_str) {
+                result.push(self.bos_id);
+            }
         }
         if self.special_tokens.is_empty() {
             result.extend(self.encode_raw(text));
@@ -2284,5 +2309,101 @@ mod prompt_norm_tests {
         let out = normalize_prompt_with(s, false);
         assert!(matches!(out, std::borrow::Cow::Borrowed(_)));
         assert_eq!(out.as_ref(), s);
+    }
+}
+
+#[cfg(test)]
+mod lfm2_bos_tests {
+    //! Behavioral coverage for LFM2/lfm2_moe `add_bos` resolution in
+    //! `from_hfq_metadata` and the encode-time single-BOS guard.
+    use super::*;
+    use serde_json::json;
+
+    /// Smallest HF tokenizer.json that `from_hf_json` accepts and that can
+    /// encode ASCII via the SentencePiece path (no `Ġ` → non-GPT2).
+    fn minimal_tok_json() -> String {
+        json!({
+            "model": {
+                "type": "BPE",
+                "vocab": {
+                    "<unk>": 0,
+                    "h": 3,
+                    "i": 4,
+                    "\u{2581}": 5
+                },
+                "merges": []
+            },
+            "added_tokens": [
+                {"id": 1, "content": "<|startoftext|>", "special": true},
+                {"id": 2, "content": "<|endoftext|>", "special": true}
+            ]
+        })
+        .to_string()
+    }
+
+    fn lfm_meta(add_bos_token: Option<bool>) -> String {
+        let mut root = json!({
+            "architecture": "lfm2",
+            "tokenizer": minimal_tok_json(),
+            "generation_config": {
+                "bos_token_id": 1,
+                "eos_token_id": 2
+            },
+            "tokenizer_config": {}
+        });
+        if let Some(ab) = add_bos_token {
+            root["tokenizer_config"]["add_bos_token"] = json!(ab);
+        }
+        root.to_string()
+    }
+
+    #[test]
+    fn lfm2_absent_add_bos_defaults_true_and_prepends_once() {
+        let tok = Tokenizer::from_hfq_metadata(&lfm_meta(None)).expect("meta");
+        assert!(
+            tok.add_bos,
+            "absent add_bos_token must default true for lfm2"
+        );
+        assert_eq!(tok.bos_id, 1);
+        let ids = tok.encode("hi");
+        assert_eq!(
+            ids.first().copied(),
+            Some(1),
+            "raw text must begin with bos_id"
+        );
+        assert_eq!(
+            ids.iter().filter(|&&id| id == 1).count(),
+            1,
+            "exactly one leading bos_id"
+        );
+    }
+
+    #[test]
+    fn lfm2_explicit_false_is_authoritative() {
+        let tok = Tokenizer::from_hfq_metadata(&lfm_meta(Some(false))).expect("meta");
+        assert!(
+            !tok.add_bos,
+            "explicit add_bos_token=false must not be overwritten by LFM default"
+        );
+        let ids = tok.encode("hi");
+        assert_ne!(
+            ids.first().copied(),
+            Some(tok.bos_id),
+            "must not prepend bos when add_bos is false"
+        );
+    }
+
+    #[test]
+    fn lfm2_jinja_bos_literal_not_double_prepended() {
+        let tok = Tokenizer::from_hfq_metadata(&lfm_meta(None)).expect("meta");
+        assert!(tok.add_bos);
+        // Jinja chat path already emits the BOS vocabulary string.
+        let ids = tok.encode("<|startoftext|>hi");
+        assert_eq!(ids.first().copied(), Some(tok.bos_id));
+        assert_eq!(
+            ids.iter().take_while(|&&id| id == tok.bos_id).count(),
+            1,
+            "must not double-prepend when text already starts with BOS literal"
+        );
     }
 }
