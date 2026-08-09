@@ -1646,4 +1646,82 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn peer_rooted_projection_n4_buffers_per_device_and_total() {
+        // N=4 → N-1 = 3 scratch buffers per device, 12 total.
+        let requested = 4096usize;
+        let per = peer_reduce_scratch_bytes_per_rank(4, requested).expect("N=4 per-rank");
+        let total = peer_reduce_scratch_total_bytes(4, requested).expect("N=4 total");
+        assert_eq!(per, 3 * requested, "3 scratch buffers per device");
+        assert_eq!(total, 12 * requested, "12 scratch buffers total");
+        // Buffer counts implied by the byte projection (one buffer = requested_bytes).
+        assert_eq!(per / requested, 3);
+        assert_eq!(total / requested, 12);
+        assert_eq!(total, 4 * per);
+    }
+
+    #[test]
+    fn peer_rooted_projection_requested_bytes_multiplication_exact() {
+        for &requested in &[0usize, 1, 4, 64, 1024, 4096, 1 << 20] {
+            for n in 1usize..=8 {
+                let per = peer_reduce_scratch_bytes_per_rank(n, requested)
+                    .unwrap_or_else(|| panic!("per-rank None for n={n} req={requested}"));
+                let total = peer_reduce_scratch_total_bytes(n, requested)
+                    .unwrap_or_else(|| panic!("total None for n={n} req={requested}"));
+                assert_eq!(per, (n - 1).checked_mul(requested).unwrap());
+                assert_eq!(total, n.checked_mul(per).unwrap());
+                assert_eq!(total, n.checked_mul(n - 1).unwrap().checked_mul(requested).unwrap());
+            }
+        }
+        // Zero ranks is rejected (not a projection).
+        assert_eq!(peer_reduce_scratch_bytes_per_rank(0, 64), None);
+        assert_eq!(peer_reduce_scratch_total_bytes(0, 64), None);
+    }
+
+    #[test]
+    fn peer_rooted_projection_checked_overflow_returns_error() {
+        // per_rank = (n-1) * requested overflows → None.
+        let huge = usize::MAX / 2 + 1;
+        assert_eq!(
+            peer_reduce_scratch_bytes_per_rank(4, huge),
+            None,
+            "3 * huge must overflow"
+        );
+        assert_eq!(
+            peer_reduce_scratch_total_bytes(4, huge),
+            None,
+            "total inherits per-rank overflow"
+        );
+
+        // per_rank fits but total = n * per_rank overflows → None.
+        // For n=4: per = 3 * req; total = 4 * 3 * req = 12 * req.
+        // Choose req so 3*req fits but 12*req overflows.
+        let req = (usize::MAX / 3).saturating_sub(0);
+        // Ensure 3*req is Some (fits) when possible; if 3*req already overflows, still None.
+        if let Some(per) = peer_reduce_scratch_bytes_per_rank(4, req) {
+            assert!(
+                4usize.checked_mul(per).is_none() || peer_reduce_scratch_total_bytes(4, req).is_some(),
+                "when total fits, helper must agree"
+            );
+            if 4usize.checked_mul(per).is_none() {
+                assert_eq!(peer_reduce_scratch_total_bytes(4, req), None);
+            }
+        }
+
+        // Direct total overflow: pick n and req where (n-1)*req fits in usize but n*(n-1)*req does not.
+        // n=3 → per = 2*req; total = 3*2*req = 6*req.
+        let req2 = usize::MAX / 4; // 2*req2 fits; 6*req2 may overflow
+        if let Some(per2) = peer_reduce_scratch_bytes_per_rank(3, req2) {
+            if 3usize.checked_mul(per2).is_none() {
+                assert_eq!(peer_reduce_scratch_total_bytes(3, req2), None);
+            }
+        }
+
+        // Maximum multiply that still overflows for N=4 per-rank path.
+        assert_eq!(peer_reduce_scratch_bytes_per_rank(4, usize::MAX), None);
+        assert_eq!(peer_reduce_scratch_total_bytes(4, usize::MAX), None);
+        assert_eq!(peer_reduce_scratch_bytes_per_rank(usize::MAX, 2), None);
+        assert_eq!(peer_reduce_scratch_total_bytes(usize::MAX, 2), None);
+    }
 }
