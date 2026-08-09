@@ -2310,8 +2310,7 @@ class ServeHarnessWarmTests(unittest.TestCase):
                 with self.subTest(fixture=fixture):
                     prompt_path.write_bytes(fixture)
                     rows = sh.load_prompt_battery(None, str(prompt_path))
-                    self.assertEqual(rows, [("prose", fixture.decode("utf-8"))])
-
+                    self.assertEqual(rows, [("prose", fixture.decode("utf-8"), [])])
     def test_prompt_file_and_prompts_file_are_mutually_exclusive(self):
         sh = self._load_serve_harness()
         argv = [
@@ -2428,6 +2427,509 @@ class ServeHarnessWarmTests(unittest.TestCase):
             # Parent still wrote the PID file via its own os.environ.
             self.assertTrue(pid_path.is_file())
             self.assertEqual(pid_path.read_text(encoding="utf-8").strip(), "4242")
+
+
+class CoherenceCustomTests(unittest.TestCase):
+    """Opt-in capability-appropriate prompt path (Flagstaff preserved by default)."""
+
+    @staticmethod
+    def args(work_dir, transport="pm4", extra=None):
+        base = {
+            "daemon": str(Path(work_dir) / "daemon"),
+            "cli": str(Path(work_dir) / "hipfire"),
+            "model": str(Path(work_dir) / "model.hfq"),
+            "work_dir": work_dir,
+            "timeout": 30.0,
+            "kv_mode": "q8",
+            "max_seq": 2048,
+            "transport": transport,
+        }
+        if extra:
+            base.update(extra)
+        return SimpleNamespace(**base)
+
+    @staticmethod
+    def coherent_row(**overrides):
+        row = {
+            "request_id": "chatcmpl-coherence-1",
+            "finish": "stop",
+            "empty": False,
+            "runaway": False,
+            "attractor": False,
+            "ans_words": 12,
+            "decode_tok_s": 999.0,
+            "ans_preview": "Paris is the capital.",
+            "assistant_content": "Paris is the capital of France.",
+        }
+        row.update(overrides)
+        return row
+
+    def _prepare_binaries(self, work_dir):
+        model = Path(work_dir) / "model.hfq"
+        daemon = Path(work_dir) / "daemon"
+        cli = Path(work_dir) / "hipfire"
+        model.write_bytes(b"model")
+        daemon.write_bytes(b"daemon")
+        cli.write_bytes(b"cli")
+        daemon.chmod(0o755)
+        cli.chmod(0o755)
+        return model, daemon, cli
+
+    @staticmethod
+    def _write_prompt_file(work_dir, content_bytes):
+        p = Path(work_dir) / "custom_prompt.txt"
+        p.write_bytes(content_bytes)
+        return p
+
+    @staticmethod
+    def _write_route_proof_marker(argv, transport="pm4", request_id="chatcmpl-coherence-1"):
+        if "--serve-log" not in argv:
+            return
+        serve_log = Path(argv[argv.index("--serve-log") + 1])
+        serve_log.parent.mkdir(parents=True, exist_ok=True)
+        marker = (
+            f"HIPFIRE_REPLAY_ROUTE_PROOF transport={transport} "
+            f"position=1 request_id={request_id} replays=64\n"
+        )
+        with serve_log.open("a", encoding="utf-8") as h:
+            h.write(marker)
+
+    def test_default_flagstaff_unchanged(self):
+        """Default must remain bit-for-bit Flagstaff when no custom args."""
+        captured = {}
+
+        def fake_run(argv, cwd=None, env=None, capture_output=None, text=None, timeout=None):
+            captured["argv"] = list(argv)
+            out_path = Path(argv[argv.index("--out") + 1])
+            out_path.write_text(json.dumps([self.coherent_row(
+                assistant_content="Flagstaff was named after a flagpole raised by settlers in 1876."
+            )]) + "\n")
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        with tempfile.TemporaryDirectory() as work_dir:
+            self._prepare_binaries(work_dir)
+            args = self.args(work_dir, transport="aql")
+            with patch("tools.redline.product_bench.subprocess.run", side_effect=fake_run):
+                result = product_bench.run_coherence_smoke(args, "hip")
+            self.assertEqual(result["coherence_mode"], "flagstaff")
+            self.assertEqual(result["prompt"], product_bench.COHERENCE_PROMPT)
+            self.assertIsNone(result["prompt_file"])
+            self.assertIsNone(result["prompt_md5"])
+            self.assertIsNone(result["prompt_sha256"])
+            self.assertIsNone(result["expected_substrings"])
+            self.assertEqual(result["config"]["prompt"], product_bench.COHERENCE_PROMPT)
+            self.assertEqual(result["config"]["coherence_mode"], "flagstaff")
+            self.assertEqual(result["thinking"], product_bench.COHERENCE_THINKING)
+            self.assertEqual(result["max_tokens"], product_bench.COHERENCE_MAX_TOKENS)
+            argv = captured["argv"]
+            self.assertIn(product_bench.COHERENCE_PROMPT, Path(argv[argv.index("--prompts-file")+1]).read_text())
+            prompts = json.loads(Path(argv[argv.index("--prompts-file")+1]).read_text())
+            self.assertEqual(prompts, [{"genre": "factual", "prompt": product_bench.COHERENCE_PROMPT}])
+
+    def test_missing_invalid_custom_args_rejected_before_gpu(self):
+        with tempfile.TemporaryDirectory() as work_dir:
+            model, daemon, cli = self._prepare_binaries(work_dir)
+            good_prompt = self._write_prompt_file(work_dir, b"What is 2+2?")
+            # Missing expected substring
+            with self.assertRaises(SystemExit) as cm:
+                product_bench.main([
+                    "--model", str(model), "--daemon", str(daemon), "--cli", str(cli),
+                    "--transport", "aql",
+                    "--coherence-prompt-file", str(good_prompt),
+                    "--work-dir", work_dir, "--out", str(Path(work_dir)/"out.json"),
+                ])
+            self.assertNotEqual(cm.exception.code, 0)
+            # Missing file path
+            missing = Path(work_dir) / "missing.txt"
+            with patch("tools.redline.product_bench.run_pm4_preflight", side_effect=AssertionError("must not reach GPU")), \
+                 patch("tools.redline.product_bench.run_coherence_smoke", side_effect=AssertionError("must not reach GPU")), \
+                 patch("tools.redline.product_bench.run_arm", side_effect=AssertionError("must not reach GPU")):
+                with self.assertRaises(SystemExit) as cm:
+                    product_bench.main([
+                        "--model", str(model), "--daemon", str(daemon), "--cli", str(cli),
+                        "--transport", "pm4",
+                        "--coherence-prompt-file", str(missing),
+                        "--coherence-expected-substring", "Paris",
+                        "--work-dir", work_dir, "--out", str(Path(work_dir)/"out3.json"),
+                    ])
+                self.assertIn("coherence prompt file invalid", str(cm.exception))
+            # Expected substring without file
+            with self.assertRaises(SystemExit):
+                product_bench.main([
+                    "--model", str(model), "--daemon", str(daemon), "--cli", str(cli),
+                    "--transport", "aql",
+                    "--coherence-expected-substring", "Paris",
+                    "--work-dir", work_dir, "--out", str(Path(work_dir)/"out4.json"),
+                ])
+            # Empty expected substring
+            with self.assertRaises(SystemExit):
+                product_bench.main([
+                    "--model", str(model), "--daemon", str(daemon), "--cli", str(cli),
+                    "--transport", "aql",
+                    "--coherence-prompt-file", str(good_prompt),
+                    "--coherence-expected-substring", "   ",
+                    "--work-dir", work_dir, "--out", str(Path(work_dir)/"out5.json"),
+                ])
+            # Thinking without file
+            with self.assertRaises(SystemExit):
+                product_bench.main([
+                    "--model", str(model), "--daemon", str(daemon), "--cli", str(cli),
+                    "--transport", "aql",
+                    "--coherence-thinking", "off",
+                    "--work-dir", work_dir, "--out", str(Path(work_dir)/"out6.json"),
+                ])
+            # max-tokens without file
+            with self.assertRaises(SystemExit):
+                product_bench.main([
+                    "--model", str(model), "--daemon", str(daemon), "--cli", str(cli),
+                    "--transport", "aql",
+                    "--coherence-max-tokens", "512",
+                    "--work-dir", work_dir, "--out", str(Path(work_dir)/"out7.json"),
+                ])
+            # skip + custom
+            with self.assertRaises(SystemExit):
+                product_bench.main([
+                    "--model", str(model), "--daemon", str(daemon), "--cli", str(cli),
+                    "--transport", "aql",
+                    "--skip-coherence",
+                    "--coherence-prompt-file", str(good_prompt),
+                    "--coherence-expected-substring", "4",
+                    "--work-dir", work_dir, "--out", str(Path(work_dir)/"out8.json"),
+                ])
+            # Empty file
+            empty2 = Path(work_dir) / "empty_prompt.txt"
+            empty2.write_bytes(b"   \n")
+            with patch("tools.redline.product_bench.run_pm4_preflight", side_effect=AssertionError("must not reach GPU")), \
+                 patch("tools.redline.product_bench.run_coherence_smoke", side_effect=AssertionError("must not reach GPU")), \
+                 patch("tools.redline.product_bench.run_arm", side_effect=AssertionError("must not reach GPU")):
+                with self.assertRaises(SystemExit):
+                    product_bench.main([
+                        "--model", str(model), "--daemon", str(daemon), "--cli", str(cli),
+                        "--transport", "aql",
+                        "--coherence-prompt-file", str(empty2),
+                        "--coherence-expected-substring", "x",
+                        "--work-dir", work_dir, "--out", str(Path(work_dir)/"out9.json"),
+                    ])
+            with self.assertRaises(SystemExit):
+                product_bench.main([
+                    "--model", str(model), "--daemon", str(daemon), "--cli", str(cli),
+                    "--transport", "aql",
+                    "--coherence-prompt-file", str(good_prompt),
+                    "--coherence-expected-substring", "2",
+                    "--coherence-max-tokens", "0",
+                    "--work-dir", work_dir, "--out", str(Path(work_dir)/"out10.json"),
+                ])
+            # max_tokens <= thinking cap (low=512, so 512 invalid)
+            with patch("tools.redline.product_bench.run_pm4_preflight", side_effect=AssertionError("must not reach GPU")), \
+                 patch("tools.redline.product_bench.run_coherence_smoke", side_effect=AssertionError("must not reach GPU")), \
+                 patch("tools.redline.product_bench.run_arm", side_effect=AssertionError("must not reach GPU")):
+                with self.assertRaises(SystemExit) as cm:
+                    product_bench.main([
+                        "--model", str(model), "--daemon", str(daemon), "--cli", str(cli),
+                        "--transport", "aql",
+                        "--coherence-prompt-file", str(good_prompt),
+                        "--coherence-expected-substring", "2",
+                        "--coherence-max-tokens", "512",
+                        "--work-dir", work_dir, "--out", str(Path(work_dir)/"out11.json"),
+                    ])
+                self.assertIn("must exceed thinking cap", str(cm.exception))
+
+    def test_exact_prompt_byte_hashing(self):
+        payload = b"Solve: 2+2?\nAnswer 4.\n"
+        import hashlib
+        expected_md5 = hashlib.md5(payload).hexdigest()
+        expected_sha = hashlib.sha256(payload).hexdigest()
+        with tempfile.TemporaryDirectory() as work_dir:
+            prompt = self._write_prompt_file(work_dir, payload)
+            args = SimpleNamespace(
+                daemon=str(Path(work_dir)/"daemon"),
+                cli=str(Path(work_dir)/"hipfire"),
+                model=str(Path(work_dir)/"model.hfq"),
+                work_dir=work_dir,
+                timeout=30.0,
+                kv_mode="q8",
+                max_seq=2048,
+                transport="aql",
+                coherence_prompt_file=str(prompt),
+                coherence_expected_substring=["4"],
+                coherence_thinking=None,
+                coherence_max_tokens=None,
+            )
+            self._prepare_binaries(work_dir)
+            # Direct helper hashing must be byte-identical
+            info = product_bench._coherence_custom_files(args)
+            self.assertEqual(info["md5"], expected_md5)
+            self.assertEqual(info["sha256"], expected_sha)
+            self.assertEqual(info["path"], prompt.resolve())
+            self.assertEqual(info["text"], payload.decode("utf-8"))
+            # Smoke must record identical hashes
+            def fake_run(argv, cwd=None, env=None, capture_output=None, text=None, timeout=None):
+                out_path = Path(argv[argv.index("--out")+1])
+                out_path.write_text(json.dumps([self.coherent_row(
+                    assistant_content="The answer is 4."
+                )]) + "\n")
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+            with patch("tools.redline.product_bench.subprocess.run", side_effect=fake_run):
+                result = product_bench.run_coherence_smoke(args, "hip")
+            self.assertEqual(result["prompt_md5"], expected_md5)
+            self.assertEqual(result["prompt_sha256"], expected_sha)
+            self.assertEqual(result["prompt_file"], str(prompt.resolve()))
+            self.assertEqual(result["config"]["prompt_md5"], expected_md5)
+            self.assertEqual(result["config"]["prompt_sha256"], expected_sha)
+            # Modify one byte must change hash
+            prompt2 = Path(work_dir)/"prompt2.txt"
+            prompt2.write_bytes(b"Solve: 2+2?\nAnswer 5.\n")
+            args2 = SimpleNamespace(**{**vars(args), "coherence_prompt_file": str(prompt2)})
+            info2 = product_bench._coherence_custom_files(args2)
+            self.assertNotEqual(info["md5"], info2["md5"])
+            self.assertNotEqual(info["sha256"], info2["sha256"])
+
+    def test_expected_answer_pass_and_fail(self):
+        with tempfile.TemporaryDirectory() as work_dir:
+            prompt = self._write_prompt_file(work_dir, b"What is the capital of Japan?")
+            self._prepare_binaries(work_dir)
+            base_args = SimpleNamespace(
+                daemon=str(Path(work_dir)/"daemon"),
+                cli=str(Path(work_dir)/"hipfire"),
+                model=str(Path(work_dir)/"model.hfq"),
+                work_dir=work_dir,
+                timeout=30.0,
+                kv_mode="q8",
+                max_seq=2048,
+                transport="aql",
+                coherence_prompt_file=str(prompt),
+                coherence_expected_substring=["Tokyo"],
+                coherence_thinking="off",
+                coherence_max_tokens=256,
+            )
+            # Pass case: case-insensitive match
+            def fake_pass(argv, cwd=None, env=None, capture_output=None, text=None, timeout=None):
+                out_path = Path(argv[argv.index("--out")+1])
+                out_path.write_text(json.dumps([self.coherent_row(
+                    assistant_content="The capital is TOKYO."
+                )]) + "\n")
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+            with patch("tools.redline.product_bench.subprocess.run", side_effect=fake_pass):
+                result = product_bench.run_coherence_smoke(base_args, "hip")
+            self.assertTrue(result["valid"])
+            # Fail: missing substring
+            def fake_missing(argv, cwd=None, env=None, capture_output=None, text=None, timeout=None):
+                out_path = Path(argv[argv.index("--out")+1])
+                out_path.write_text(json.dumps([self.coherent_row(
+                    assistant_content="The capital is Kyoto."
+                )]) + "\n")
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+            with patch("tools.redline.product_bench.subprocess.run", side_effect=fake_missing):
+                with self.assertRaisesRegex(RuntimeError, "missing expected substring"):
+                    product_bench.run_coherence_smoke(base_args, "hip")
+            # Fail: multiple substrings, one missing
+            base_args2 = SimpleNamespace(**{**vars(base_args), "coherence_expected_substring": ["Tokyo", "Japan"]})
+            def fake_partial(argv, cwd=None, env=None, capture_output=None, text=None, timeout=None):
+                out_path = Path(argv[argv.index("--out")+1])
+                out_path.write_text(json.dumps([self.coherent_row(
+                    assistant_content="Tokyo is nice."
+                )]) + "\n")
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+            with patch("tools.redline.product_bench.subprocess.run", side_effect=fake_partial):
+                with self.assertRaisesRegex(RuntimeError, "Japan"):
+                    product_bench.run_coherence_smoke(base_args2, "hip")
+            # Fail: empty output
+            def fake_empty(argv, cwd=None, env=None, capture_output=None, text=None, timeout=None):
+                out_path = Path(argv[argv.index("--out")+1])
+                out_path.write_text(json.dumps([self.coherent_row(
+                    assistant_content="   "
+                )]) + "\n")
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+            with patch("tools.redline.product_bench.subprocess.run", side_effect=fake_empty):
+                with self.assertRaisesRegex(RuntimeError, "nonempty string"):
+                    product_bench.run_coherence_smoke(base_args, "hip")
+            # Fail: attractor
+            def fake_attractor(argv, cwd=None, env=None, capture_output=None, text=None, timeout=None):
+                out_path = Path(argv[argv.index("--out")+1])
+                out_path.write_text(json.dumps([self.coherent_row(
+                    assistant_content="Tokyo Tokyo Tokyo", attractor=True
+                )]) + "\n")
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+            with patch("tools.redline.product_bench.subprocess.run", side_effect=fake_attractor):
+                with self.assertRaisesRegex(RuntimeError, "attractor"):
+                    product_bench.run_coherence_smoke(base_args, "hip")
+            # Fail: empty flag
+            def fake_empty_flag(argv, cwd=None, env=None, capture_output=None, text=None, timeout=None):
+                out_path = Path(argv[argv.index("--out")+1])
+                out_path.write_text(json.dumps([self.coherent_row(
+                    assistant_content="Tokyo", empty=True
+                )]) + "\n")
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+            with patch("tools.redline.product_bench.subprocess.run", side_effect=fake_empty_flag):
+                with self.assertRaisesRegex(RuntimeError, "empty generation"):
+                    product_bench.run_coherence_smoke(base_args, "hip")
+
+    def test_hip_pm4_arm_parity(self):
+        payload = b"Count to 3: 1 2 3"
+        with tempfile.TemporaryDirectory() as work_dir:
+            prompt = self._write_prompt_file(work_dir, payload)
+            self._prepare_binaries(work_dir)
+            args = SimpleNamespace(
+                daemon=str(Path(work_dir)/"daemon"),
+                cli=str(Path(work_dir)/"hipfire"),
+                model=str(Path(work_dir)/"model.hfq"),
+                work_dir=work_dir,
+                timeout=30.0,
+                kv_mode="q8",
+                max_seq=2048,
+                transport="pm4",
+                coherence_prompt_file=str(prompt),
+                coherence_expected_substring=["3"],
+                coherence_thinking="low",
+                coherence_max_tokens=1024,
+            )
+            captures = {}
+            def make_fake(backend):
+                def fake(argv, cwd=None, env=None, capture_output=None, text=None, timeout=None):
+                    captures[backend] = {
+                        "argv": list(argv),
+                        "prompts": Path(argv[argv.index("--prompts-file")+1]).read_text(),
+                    }
+                    out_path = Path(argv[argv.index("--out")+1])
+                    out_path.write_text(json.dumps([self.coherent_row(
+                        assistant_content="Count: 1 2 3"
+                    )]) + "\n")
+                    # PM4 requires route proof, HIP must not emit
+                    if backend == "auto":
+                        self._write_route_proof_marker(argv, transport="pm4")
+                    return SimpleNamespace(returncode=0, stdout="", stderr="")
+                return fake
+            with patch("tools.redline.product_bench.subprocess.run", side_effect=make_fake("hip")):
+                hip = product_bench.run_coherence_smoke(args, "hip")
+            with patch("tools.redline.product_bench.subprocess.run", side_effect=make_fake("auto")):
+                auto = product_bench.run_coherence_smoke(args, "auto")
+            # Byte-identical prompt and hashes
+            self.assertEqual(hip["prompt"], auto["prompt"])
+            self.assertEqual(hip["prompt"], payload.decode("utf-8"))
+            self.assertEqual(hip["prompt_md5"], auto["prompt_md5"])
+            self.assertEqual(hip["prompt_sha256"], auto["prompt_sha256"])
+            self.assertEqual(hip["prompt_file"], auto["prompt_file"])
+            self.assertEqual(hip["expected_substrings"], auto["expected_substrings"])
+            self.assertEqual(hip["thinking"], auto["thinking"])
+            self.assertEqual(hip["max_tokens"], auto["max_tokens"])
+            self.assertEqual(captures["hip"]["prompts"], captures["auto"]["prompts"])
+            self.assertIn(payload.decode("utf-8"), captures["hip"]["prompts"])
+            # Settings identical
+            self.assertEqual(captures["hip"]["argv"][captures["hip"]["argv"].index("--thinking")+1],
+                             captures["auto"]["argv"][captures["auto"]["argv"].index("--thinking")+1])
+            self.assertEqual(captures["hip"]["argv"][captures["hip"]["argv"].index("--max-tokens")+1],
+                             captures["auto"]["argv"][captures["auto"]["argv"].index("--max-tokens")+1])
+            # Route proof gates retained
+            self.assertTrue(auto["route_evidence"]["valid"])
+            self.assertTrue(auto["route_evidence"]["required"])
+            self.assertFalse(hip["route_evidence"]["required"] if "required" in hip["route_evidence"] else True)
+            # HIP must still reject unexpected marker if we would emit, but we omitted for hip so valid
+            self.assertTrue(hip["valid"])
+            self.assertTrue(auto["valid"])
+
+    def test_report_serialization_distinguishes_modes(self):
+        with tempfile.TemporaryDirectory() as work_dir:
+            model, daemon, cli = self._prepare_binaries(work_dir)
+            out_flag = Path(work_dir)/"flag.json"
+            out_custom = Path(work_dir)/"custom.json"
+            out_skip = Path(work_dir)/"skip.json"
+            prompt = self._write_prompt_file(work_dir, b"Custom Q: answer is 42")
+            # Helpers to fake successful arms and coherence
+            arm = {
+                "tok_s": {"median": 100.0},
+                "measurement_validation": {"valid": True},
+                "route_proof": {"valid": True},
+                "lifecycle_route_proof": {"valid": True},
+            }
+            preflight = {"redline_route": {"prepared": {"dispatches": 604}}, "seconds": 1.0}
+            # Flagstaff main
+            def fake_flag_coherence(_args, backend):
+                return {
+                    "valid": True, "seconds": 0.1, "errors": [], "speed_checked": False,
+                    "prompt": product_bench.COHERENCE_PROMPT,
+                    "prompt_file": None, "prompt_md5": None, "prompt_sha256": None,
+                    "expected_substrings": None, "coherence_mode": "flagstaff",
+                    "thinking": product_bench.COHERENCE_THINKING,
+                    "max_tokens": product_bench.COHERENCE_MAX_TOKENS,
+                    "config": {}, "row": {}, "rows": [], "route_evidence": {"valid": True, "required": backend=="auto"}
+                }
+            with patch("tools.redline.product_bench.run_pm4_preflight", return_value=preflight), \
+                 patch("tools.redline.product_bench.run_coherence_smoke", side_effect=fake_flag_coherence), \
+                 patch("tools.redline.product_bench.run_arm", return_value=arm), \
+                 patch("tools.redline.product_bench.git_head", return_value="deadbeef"):
+                product_bench.main([
+                    "--model", str(model), "--daemon", str(daemon), "--cli", str(cli),
+                    "--transport", "aql", "--work-dir", work_dir, "--out", str(out_flag)
+                ])
+            flag_report = json.loads(out_flag.read_text())
+            self.assertEqual(flag_report["coherence"]["mode"], "flagstaff")
+            self.assertIsNone(flag_report["coherence"]["prompt_file"])
+            self.assertIsNone(flag_report["coherence"]["prompt_md5"])
+            self.assertIsNone(flag_report["coherence"]["prompt_sha256"])
+            self.assertIsNone(flag_report["coherence"]["expected_substrings"])
+            self.assertTrue(flag_report["valid"])
+            # Custom main — use real coherence smoke patch that returns custom valid
+            def fake_custom_coherence(_args, backend):
+                return {
+                    "valid": True, "seconds": 0.1, "errors": [], "speed_checked": False,
+                    "prompt": "Custom Q: answer is 42",
+                    "prompt_file": str(prompt.resolve()),
+                    "prompt_md5": "abc", "prompt_sha256": "def",
+                    "expected_substrings": ["42"], "coherence_mode": "custom",
+                    "thinking": "off", "max_tokens": 256,
+                    "config": {"prompt_md5": "abc", "prompt_sha256": "def"}, "row": {}, "rows": [], "route_evidence": {"valid": True}
+                }
+            with patch("tools.redline.product_bench.run_pm4_preflight", return_value=preflight), \
+                 patch("tools.redline.product_bench.run_coherence_smoke", side_effect=fake_custom_coherence), \
+                 patch("tools.redline.product_bench.run_arm", return_value=arm), \
+                 patch("tools.redline.product_bench.git_head", return_value="deadbeef"):
+                product_bench.main([
+                    "--model", str(model), "--daemon", str(daemon), "--cli", str(cli),
+                    "--transport", "aql",
+                    "--coherence-prompt-file", str(prompt),
+                    "--coherence-expected-substring", "42",
+                    "--coherence-thinking", "off",
+                    "--coherence-max-tokens", "256",
+                    "--work-dir", work_dir, "--out", str(out_custom)
+                ])
+            custom_report = json.loads(out_custom.read_text())
+            self.assertEqual(custom_report["coherence"]["mode"], "custom")
+            self.assertEqual(custom_report["coherence"]["prompt_file"], str(prompt.resolve()))
+            self.assertIsNotNone(custom_report["coherence"]["prompt_md5"])
+            self.assertIsNotNone(custom_report["coherence"]["prompt_sha256"])
+            self.assertEqual(custom_report["coherence"]["expected_substrings"], ["42"])
+            self.assertEqual(custom_report["coherence"]["thinking"], "off")
+            self.assertEqual(custom_report["coherence"]["max_tokens"], 256)
+            self.assertTrue(custom_report["valid"])
+            # Skip must remain invalid even with otherwise valid arms
+            with patch("tools.redline.product_bench.run_pm4_preflight", return_value=preflight), \
+                 patch("tools.redline.product_bench.run_arm", return_value=arm), \
+                 patch("tools.redline.product_bench.git_head", return_value="deadbeef"):
+                # main with skip should not call coherence smoke; we ensure valid false
+                try:
+                    product_bench.main([
+                        "--model", str(model), "--daemon", str(daemon), "--cli", str(cli),
+                        "--transport", "aql",
+                        "--skip-coherence",
+                        "--work-dir", work_dir, "--out", str(out_skip)
+                    ])
+                except SystemExit as e:
+                    pass
+            skip_report = json.loads(out_skip.read_text())
+            self.assertEqual(skip_report["coherence"]["mode"], "skipped")
+            self.assertFalse(skip_report["valid"])
+            self.assertIsNone(skip_report["coherence"]["hip"]["valid"])
+
+    def test_help_smoke(self):
+        import subprocess as sp
+        result = sp.run([os.sys.executable, "-m", "tools.redline.product_bench", "--help"],
+                        capture_output=True, text=True, cwd=str(product_bench.REPO))
+        self.assertEqual(result.returncode, 0)
+        help_text = result.stdout + result.stderr
+        self.assertIn("--coherence-prompt-file", help_text)
+        self.assertIn("--coherence-expected-substring", help_text)
+        self.assertIn("--coherence-thinking", help_text)
+        self.assertIn("--coherence-max-tokens", help_text)
 
 
 if __name__ == "__main__":
