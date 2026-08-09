@@ -249,6 +249,64 @@ def _custom_coherence_answer_errors(content: str, expected_substrings) -> list[s
                 )
     return errors
 
+def sampled_output_parity_errors(hip_rows: object, replay_rows: object, *, label: str) -> list[str]:
+    """Pure helper: exact sampled-output parity for paired rows.
+
+    Compares paired dict rows with exact Python equality for
+    ``assistant_content``, ``ctx``, and ``gen``. Rejects non-list,
+    count, type, and missing-field mismatches with deterministic
+    actionable errors. Performs no normalization, case folding, or
+    substring matching; byte-identical rows pass.
+    """
+    errors: list[str] = []
+    prefix = f"{label} " if label else ""
+    prefix_colon = f"{label}: " if label else ""
+    if not isinstance(hip_rows, list):
+        errors.append(f"{prefix_colon}hip_rows must be a list, got {type(hip_rows).__name__}")
+        if not isinstance(replay_rows, list):
+            errors.append(f"{prefix_colon}replay_rows must be a list, got {type(replay_rows).__name__}")
+        return errors
+    if not isinstance(replay_rows, list):
+        errors.append(f"{prefix_colon}replay_rows must be a list, got {type(replay_rows).__name__}")
+        return errors
+    if len(hip_rows) != len(replay_rows):
+        errors.append(
+            f"{prefix_colon}sampled-output row count differs: hip {len(hip_rows)} vs replay {len(replay_rows)}"
+        )
+        return errors
+    for idx, (hip_row, replay_row) in enumerate(zip(hip_rows, replay_rows), 1):
+        if not isinstance(hip_row, dict):
+            errors.append(f"{prefix}turn {idx}: hip row must be an object, got {type(hip_row).__name__}")
+            continue
+        if not isinstance(replay_row, dict):
+            errors.append(f"{prefix}turn {idx}: replay row must be an object, got {type(replay_row).__name__}")
+            continue
+        for field in ("assistant_content", "ctx", "gen"):
+            hip_has = field in hip_row
+            replay_has = field in replay_row
+            if not hip_has or not replay_has:
+                if not hip_has and not replay_has:
+                    errors.append(f"{prefix}turn {idx}: {field} is missing from both rows")
+                elif not hip_has:
+                    errors.append(f"{prefix}turn {idx}: hip {field} is missing")
+                else:
+                    errors.append(f"{prefix}turn {idx}: replay {field} is missing")
+                continue
+            hip_val = hip_row[field]
+            replay_val = replay_row[field]
+            if hip_val != replay_val:
+                if field == "assistant_content":
+                    errors.append(f"{prefix}turn {idx}: sampled output differs between HIP and PM4")
+                elif field == "ctx":
+                    errors.append(
+                        f"{prefix}turn {idx}: prompt-token count differs between HIP and PM4 (ctx hip={hip_val!r} vs replay={replay_val!r})"
+                    )
+                else:  # gen
+                    errors.append(
+                        f"{prefix}turn {idx}: generated-token count differs between HIP and PM4 (gen hip={hip_val!r} vs replay={replay_val!r})"
+                    )
+    return errors
+
 
 def _is_coherence_custom(args) -> bool:
     return getattr(args, "coherence_prompt_file", None) is not None
@@ -1211,6 +1269,7 @@ def run_coherence_smoke(args, backend):
         thinking = getattr(args, "coherence_thinking", None) or COHERENCE_THINKING
         raw_max = getattr(args, "coherence_max_tokens", None)
         max_tokens = int(raw_max) if raw_max is not None else COHERENCE_MAX_TOKENS
+        sampling = getattr(args, "coherence_sampling", None) or COHERENCE_SAMPLING
         cap = _coherence_thinking_cap(thinking)
         if cap != 0 and max_tokens <= cap:
             raise RuntimeError(
@@ -1231,6 +1290,7 @@ def run_coherence_smoke(args, backend):
         thinking = COHERENCE_THINKING
         cap = COHERENCE_THINKING_CAP_TOKENS
         max_tokens = COHERENCE_MAX_TOKENS
+        sampling = COHERENCE_SAMPLING
 
     model = Path(args.model).expanduser().resolve()
     daemon_src = Path(args.daemon).expanduser().resolve()
@@ -1269,7 +1329,7 @@ def run_coherence_smoke(args, backend):
         "--max-seq",
         str(args.max_seq),
         "--sampling",
-        COHERENCE_SAMPLING,
+        sampling,
         "--mode",
         COHERENCE_MODE,
         "--seed",
@@ -1320,7 +1380,7 @@ def run_coherence_smoke(args, backend):
         "thinking_cap_tokens": cap,
         "max_tokens": max_tokens,
         "seed": COHERENCE_SEED,
-        "sampling": COHERENCE_SAMPLING,
+        "sampling": sampling,
         "mode": COHERENCE_MODE,
         "mtp": COHERENCE_MTP,
         "kv_mode": args.kv_mode,
@@ -1435,6 +1495,7 @@ def run_coherence_smoke(args, backend):
         "coherence_mode": "custom" if is_custom else "flagstaff",
         "thinking": thinking,
         "max_tokens": max_tokens,
+        "sampling": sampling,
         "config": config,
         "row": row,
         "rows": rows,
@@ -2062,6 +2123,16 @@ def main(argv=None):
             "thinking cap); only valid with --coherence-prompt-file"
         ),
     )
+    parser.add_argument(
+        "--coherence-sampling",
+        default=None,
+        help=(
+            "serve_harness sampling spec pinned identically on both custom HIP and auto "
+            "coherence smokes (default registry); only valid with --coherence-prompt-file; "
+            "accepts the same nonempty specs as serve_harness --sampling "
+            "(registry | registry:… | greedy | recipe:… | json:{…})"
+        ),
+    )
     args = parser.parse_args(argv)
     try:
         args.pm4_policy = pm4_policy_with_overrides(args.pm4_policy_override)
@@ -2088,13 +2159,21 @@ def main(argv=None):
     has_custom_expected = args.coherence_expected_substring is not None
     has_custom_thinking = args.coherence_thinking is not None
     has_custom_max = args.coherence_max_tokens is not None
-    if has_custom_file or has_custom_expected or has_custom_thinking or has_custom_max:
+    has_custom_sampling = args.coherence_sampling is not None
+    if (
+        has_custom_file
+        or has_custom_expected
+        or has_custom_thinking
+        or has_custom_max
+        or has_custom_sampling
+    ):
         if args.skip_coherence:
             parser.error("cannot combine --skip-coherence with custom coherence prompt")
         if not has_custom_file:
             parser.error(
                 "--coherence-prompt-file is required when "
-                "--coherence-expected-substring/--coherence-thinking/--coherence-max-tokens is used"
+                "--coherence-expected-substring/--coherence-thinking/"
+                "--coherence-max-tokens/--coherence-sampling is used"
             )
         if not has_custom_expected:
             parser.error(
@@ -2108,7 +2187,14 @@ def main(argv=None):
                 )
         if args.coherence_max_tokens is not None and args.coherence_max_tokens <= 0:
             parser.error("--coherence-max-tokens must be positive")
-    # Thinking/max_tokens alone without a file is already rejected above; no extra
+        if has_custom_sampling and (
+            not isinstance(args.coherence_sampling, str)
+            or not args.coherence_sampling.strip()
+        ):
+            parser.error(
+                "--coherence-sampling must be a nonempty serve_harness sampling spec"
+            )
+    # Thinking/max_tokens/sampling alone without a file is already rejected above; no extra
     # branching needed. The file existence / UTF-8 / hash validation happens after
     # model checks but before any GPU work (same order as multiturn session).
 
@@ -2154,6 +2240,9 @@ def main(argv=None):
         args.coherence_prompt_md5 = info["md5"]
         args.coherence_prompt_sha256 = info["sha256"]
         args.coherence_prompt_resolved = str(info["path"])
+        # Resolve sampling once so both arms and the report share one pin.
+        if args.coherence_sampling is None:
+            args.coherence_sampling = COHERENCE_SAMPLING
     # Validate optional multiturn session JSON before any GPU work.
     if args.pm4_multiturn_session is not None:
         try:
@@ -2207,6 +2296,20 @@ def main(argv=None):
             f"coherence: auto passed ({coherence_auto['seconds']:.2f}s)",
             flush=True,
         )
+        # Sampled-output parity is exact; substring/semantic checks are health hints only.
+        hip_rows = coherence_hip.get("rows")
+        auto_rows = coherence_auto.get("rows")
+        if hip_rows is not None or auto_rows is not None:
+            parity_errors = sampled_output_parity_errors(
+                hip_rows,
+                auto_rows,
+                label="coherence",
+            )
+            if parity_errors:
+                raise SystemExit(
+                    "coherence sampled outputs differ between HIP and replay: "
+                    + "; ".join(parity_errors)
+                )
 
     report = {
         "started_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -2263,6 +2366,9 @@ def main(argv=None):
             "max_tokens": args.coherence_max_tokens
             if has_custom_file and args.coherence_max_tokens is not None
             else COHERENCE_MAX_TOKENS,
+            "sampling": args.coherence_sampling
+            if has_custom_file
+            else COHERENCE_SAMPLING,
             "default_prompt": COHERENCE_PROMPT,
         },
         "hip": run_arm(args, "hip"),

@@ -22,11 +22,11 @@ use std::sync::Arc;
 use hip_bridge::HipRuntime;
 use radiowave::{CodeObjectCertification, KernelArgumentAccess, MutableReadCache};
 use redline_dispatch::aql::{
-    load_symbols, BatchFencePolicy, Executable, Gfx10DispatchInitiatorPolicy,
-    Gfx10Pm4CommandBuffer, Gfx11ComputeResourceLimitsPolicy, Gfx11DispatchInterleave,
-    Gfx12Pm4CommandBuffer, GpuBatchTiming, GpuDevice, GpuMultiQueueTiming, GpuSelector,
-    HeaderPolicy, KernargBuffer, KernargPool, Kernel, LaunchGeometry, PhasedMultiQueuePm4Ib,
-    QueuePolicy, RecordedDispatch, Runtime, SingleQueueBatchGraph, SingleQueuePm4Ib,
+    BatchFencePolicy, Executable, Gfx10DispatchInitiatorPolicy, Gfx10Pm4CommandBuffer,
+    Gfx11ComputeResourceLimitsPolicy, Gfx11DispatchInterleave, Gfx12Pm4CommandBuffer,
+    GpuBatchTiming, GpuDevice, GpuMultiQueueTiming, GpuSelector, HeaderPolicy, KernargBuffer,
+    KernargPool, Kernel, LaunchGeometry, PhasedMultiQueuePm4Ib, QueuePolicy, RecordedDispatch,
+    Runtime, SingleQueueBatchGraph, SingleQueuePm4Ib, load_symbols,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -47,6 +47,24 @@ enum Pm4Architecture {
     Gfx10,
     Gfx11,
     Gfx12,
+}
+
+/// Per-stream producer/consumer visibility for legacy (gfx10/gfx11) PM4 IBs.
+///
+/// `CsPartialFlush` retains the historical EVENT_WRITE path. `ReleaseWait` is
+/// admitted only for exact gfx1010 single-queue retained replay and pairs a
+/// fine-grained host word with RELEASE_MEM + WAIT_REG_MEM epochs.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LegacyDependencyMode {
+    CsPartialFlush,
+    ReleaseWait { address: u64, next_epoch: u32 },
+}
+
+/// Exact gfx1010 gate for the RELEASE_MEM/WAIT_REG_MEM dependency fence.
+/// Architecture must already be the gfx10 family map; the device name is
+/// matched ASCII-case-insensitively so only the Navi10 agent is selected.
+fn gfx1010_release_wait_required(architecture: Pm4Architecture, device_name: &str) -> bool {
+    architecture == Pm4Architecture::Gfx10 && device_name.eq_ignore_ascii_case("gfx1010")
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -80,6 +98,7 @@ enum Pm4Commands {
     Legacy {
         architecture: Pm4Architecture,
         commands: Gfx10Pm4CommandBuffer,
+        dependency_mode: LegacyDependencyMode,
     },
     Gfx12(Gfx12Pm4CommandBuffer),
 }
@@ -102,6 +121,7 @@ fn create_phased_pm4_graph(
                             Pm4Commands::Legacy {
                                 architecture: actual,
                                 commands,
+                                ..
                             } if *actual == architecture => Ok(commands.clone()),
                             _ => Err("mixed PM4 architecture in phased graph".to_owned()),
                         })
@@ -158,6 +178,24 @@ impl Pm4Commands {
         dispatch_interleave: Option<Gfx11DispatchInterleave>,
         resource_limits_policy: Gfx11ComputeResourceLimitsPolicy,
     ) -> Self {
+        Self::new_with_dependency(
+            architecture,
+            policy,
+            dispatch_initiator_policy,
+            dispatch_interleave,
+            resource_limits_policy,
+            LegacyDependencyMode::CsPartialFlush,
+        )
+    }
+
+    fn new_with_dependency(
+        architecture: Pm4Architecture,
+        policy: Pm4RegisterPolicy,
+        dispatch_initiator_policy: Gfx10DispatchInitiatorPolicy,
+        dispatch_interleave: Option<Gfx11DispatchInterleave>,
+        resource_limits_policy: Gfx11ComputeResourceLimitsPolicy,
+        dependency_mode: LegacyDependencyMode,
+    ) -> Self {
         match architecture {
             Pm4Architecture::Gfx10 | Pm4Architecture::Gfx11 => {
                 let commands = match policy {
@@ -172,9 +210,14 @@ impl Pm4Commands {
                 Self::Legacy {
                     architecture,
                     commands,
+                    dependency_mode,
                 }
             }
             Pm4Architecture::Gfx12 => {
+                debug_assert!(
+                    matches!(dependency_mode, LegacyDependencyMode::CsPartialFlush),
+                    "gfx12 never uses legacy dependency fences"
+                );
                 let commands = match policy {
                     Pm4RegisterPolicy::Legacy => Gfx12Pm4CommandBuffer::new(),
                     Pm4RegisterPolicy::Static => Gfx12Pm4CommandBuffer::new_static_stateful(),
@@ -198,6 +241,31 @@ impl Pm4Commands {
         }
     }
 
+    /// Emit the sentinel epoch-0 release/wait before entry acquire so every
+    /// immutable replay starts from a known fence word (ABA prevention).
+    fn emit_entry_sentinel_reset(&mut self) -> Result<(), String> {
+        match self {
+            Self::Legacy {
+                commands,
+                dependency_mode:
+                    LegacyDependencyMode::ReleaseWait {
+                        address,
+                        next_epoch,
+                    },
+                ..
+            } => {
+                if *next_epoch != 0 {
+                    return Err(format!(
+                        "gfx1010 dependency fence entry sentinel requires next_epoch=0, got {next_epoch}"
+                    ));
+                }
+                commands.dependency_fence(*address, 0);
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
     fn acquire_inter_node(&mut self, gfx12_gcr_trim: bool, vmem_only: bool) {
         match self {
             Self::Legacy { commands, .. } if vmem_only => commands.acquire_inter_node_vmem(),
@@ -211,10 +279,50 @@ impl Pm4Commands {
         matches!(self, Self::Legacy { .. })
     }
 
-    fn wait_compute_idle(&mut self) {
+    fn wait_compute_idle(&mut self) -> Result<(), String> {
         match self {
-            Self::Legacy { commands, .. } => commands.wait_compute_idle(),
-            Self::Gfx12(commands) => commands.wait_compute_idle(),
+            Self::Legacy {
+                commands,
+                dependency_mode:
+                    LegacyDependencyMode::ReleaseWait {
+                        address,
+                        next_epoch,
+                    },
+                ..
+            } => {
+                let epoch = next_epoch.checked_add(1).ok_or_else(|| {
+                    "gfx1010 dependency fence epoch overflow (u32 exhausted)".to_owned()
+                })?;
+                *next_epoch = epoch;
+                commands.dependency_fence(*address, epoch);
+                Ok(())
+            }
+            Self::Legacy { commands, .. } => {
+                commands.wait_compute_idle();
+                Ok(())
+            }
+            Self::Gfx12(commands) => {
+                commands.wait_compute_idle();
+                Ok(())
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn dependency_mode(&self) -> Option<LegacyDependencyMode> {
+        match self {
+            Self::Legacy {
+                dependency_mode, ..
+            } => Some(*dependency_mode),
+            Self::Gfx12(_) => None,
+        }
+    }
+
+    #[cfg(test)]
+    fn dwords(&self) -> Option<&[u32]> {
+        match self {
+            Self::Legacy { commands, .. } => Some(commands.dwords()),
+            Self::Gfx12(_) => None,
         }
     }
 
@@ -286,10 +394,12 @@ impl Pm4Commands {
             Self::Legacy {
                 architecture: Pm4Architecture::Gfx10,
                 commands,
+                ..
             } => SingleQueuePm4Ib::create_profiled_gfx10(device, pool, commands),
             Self::Legacy {
                 architecture: Pm4Architecture::Gfx11,
                 commands,
+                ..
             } => SingleQueuePm4Ib::create_profiled_gfx11(device, pool, commands),
             Self::Legacy {
                 architecture: Pm4Architecture::Gfx12,
@@ -2649,6 +2759,11 @@ pub struct PreparedPm4Replay {
     // programmed into the immutable indirect buffer.
     _kernels: Vec<Kernel>,
     kernargs: Vec<KernargBuffer>,
+    /// gfx1010 RELEASE_MEM/WAIT_REG_MEM fence word. Owned for the full
+    /// executable lifetime of `graph` so the IB's absolute address stays valid
+    /// through every replay; dropped only after queue quiescence via normal
+    /// PreparedPm4Replay teardown (field order: graph first).
+    _dependency_fence: Option<KernargBuffer>,
     dynamic_gdn_frames: Vec<usize>,
     dynamic_grids: Vec<(usize, ReplayGridBinding, [u32; 3], [u32; 3])>,
     pm4_architecture: Pm4Architecture,
@@ -2679,15 +2794,14 @@ impl PreparedPm4Replay {
             let dimensions = if self.pm4_architecture == Pm4Architecture::Gfx12 {
                 let mut workitems = [0_u32; 3];
                 for axis in 0..3 {
-                    workitems[axis] =
-                        workgroups[axis]
-                            .checked_mul(workgroup[axis])
-                            .ok_or_else(|| {
-                                format!(
+                    workitems[axis] = workgroups[axis].checked_mul(workgroup[axis]).ok_or_else(
+                        || {
+                            format!(
                                 "dynamic PM4 grid overflow axis={axis} workgroups={} workgroup={}",
                                 workgroups[axis], workgroup[axis]
                             )
-                            })?;
+                        },
+                    )?;
                 }
                 workitems
             } else {
@@ -3525,6 +3639,18 @@ impl ReplayController {
         if cu_mask.is_some() && queue_limit != 1 {
             return Err("gfx1151 CU-mask experiments require single-queue PM4 replay".to_owned());
         }
+        let release_wait = gfx1010_release_wait_required(pm4_architecture, device.name());
+        // Exact gfx1010 admits only single-queue non-native single-phase lowering.
+        // Multi-queue / multi-phase / native-sync topologies stay on CS_PARTIAL_FLUSH
+        // elsewhere and are fail-closed here rather than silently degraded.
+        if release_wait && queue_limit != 1 {
+            return Err(
+                "gfx1010 RELEASE_MEM/WAIT_REG_MEM dependency fence requires single-queue \
+                 non-native single-phase retained PM4"
+                    .to_owned(),
+            );
+        }
+        let mut dependency_fence = None;
         let mut dispatch_boundaries = Vec::new();
         let (graph, command_dwords) = if queue_limit == 1 {
             let recorded = &self.recorded[..prefix];
@@ -3557,13 +3683,36 @@ impl ReplayController {
                     order
                 }
             };
-            let mut commands = Pm4Commands::new(
+            let dependency_mode = if release_wait {
+                let fence = pool
+                    .allocate_fine_grained_bytes(4, 4)
+                    .map_err(|error| format!("allocate gfx1010 dependency fence: {error}"))?;
+                let address = fence.address() as u64;
+                if address == 0 || address & 3 != 0 {
+                    return Err(format!(
+                        "gfx1010 dependency fence address {address:#x} is null or unaligned"
+                    ));
+                }
+                dependency_fence = Some(fence);
+                LegacyDependencyMode::ReleaseWait {
+                    address,
+                    next_epoch: 0,
+                }
+            } else {
+                LegacyDependencyMode::CsPartialFlush
+            };
+            let mut commands = Pm4Commands::new_with_dependency(
                 pm4_architecture,
                 self.pm4_register_policy,
                 dispatch_initiator_policy,
                 dispatch_interleave,
                 resource_limits_policy,
+                dependency_mode,
             );
+            // Sentinel epoch 0 before entry acquire: every immutable replay
+            // re-submits this prefix so a stale prior epoch cannot satisfy the
+            // next run (ABA).
+            commands.emit_entry_sentinel_reset()?;
             commands.acquire_entry(gfx12_gcr_trim, entry_acquire_policy);
             let mut resource_frontier = ResourceFrontier::default();
             let mut dependency_waits = 0usize;
@@ -3587,7 +3736,7 @@ impl ReplayController {
                     if !independent {
                         dependency_waits += 1;
                         boundary.wait_compute_idle = true;
-                        commands.wait_compute_idle();
+                        commands.wait_compute_idle()?;
                     }
                     resource_frontier.advance(current_launch, resources_independent);
                     let acquire = (!independent && commands.requires_dependency_acquire())
@@ -3619,7 +3768,7 @@ impl ReplayController {
                     dispatch_boundaries.push(boundary);
                 }
             }
-            commands.wait_compute_idle();
+            commands.wait_compute_idle()?;
             if dispatch_profile {
                 commands.populate_dispatch_span_boundaries(&mut dispatch_boundaries)?;
             }
@@ -3775,7 +3924,7 @@ impl ReplayController {
                                 let resources_independent =
                                     resource_frontier.independent(current_launch);
                                 if !resources_independent {
-                                    lane.wait_compute_idle();
+                                    lane.wait_compute_idle()?;
                                 }
                                 resource_frontier.advance(current_launch, resources_independent);
                                 if (!resources_independent && lane.requires_dependency_acquire())
@@ -3805,7 +3954,7 @@ impl ReplayController {
                         }
                     }
                     for commands in &mut lanes {
-                        commands.wait_compute_idle();
+                        commands.wait_compute_idle()?;
                         command_dwords = command_dwords
                             .checked_add(commands.len_dwords())
                             .ok_or_else(|| "PM4 command dword count overflow".to_owned())?;
@@ -3840,7 +3989,7 @@ impl ReplayController {
                             Pm4WaitPolicy::Resource => resources_independent,
                         };
                         if !independent {
-                            commands.wait_compute_idle();
+                            commands.wait_compute_idle()?;
                         }
                         resource_frontier.advance(current_launch, resources_independent);
                         if (!independent && commands.requires_dependency_acquire())
@@ -3870,7 +4019,7 @@ impl ReplayController {
                         )
                         .map_err(|error| format!("{}: {error}", self.recorded[index].kernel))?;
                 }
-                commands.wait_compute_idle();
+                commands.wait_compute_idle()?;
                 command_dwords = command_dwords
                     .checked_add(commands.len_dwords())
                     .ok_or_else(|| "PM4 command dword count overflow".to_owned())?;
@@ -3906,6 +4055,7 @@ impl ReplayController {
             graph,
             _kernels: kernels,
             kernargs,
+            _dependency_fence: dependency_fence,
             dynamic_gdn_frames,
             dynamic_grids,
             pm4_architecture,
@@ -4523,6 +4673,209 @@ mod tests {
     }
 
     #[test]
+    fn gfx1010_release_wait_selector_is_exact() {
+        assert!(gfx1010_release_wait_required(
+            Pm4Architecture::Gfx10,
+            "gfx1010"
+        ));
+        assert!(gfx1010_release_wait_required(
+            Pm4Architecture::Gfx10,
+            "GFX1010"
+        ));
+        assert!(!gfx1010_release_wait_required(
+            Pm4Architecture::Gfx10,
+            "gfx1030"
+        ));
+        assert!(!gfx1010_release_wait_required(
+            Pm4Architecture::Gfx10,
+            "gfx1011"
+        ));
+        assert!(!gfx1010_release_wait_required(
+            Pm4Architecture::Gfx11,
+            "gfx1100"
+        ));
+        assert!(!gfx1010_release_wait_required(
+            Pm4Architecture::Gfx11,
+            "gfx1151"
+        ));
+        assert!(!gfx1010_release_wait_required(
+            Pm4Architecture::Gfx12,
+            "gfx1201"
+        ));
+        // Architecture gate is conjunctive: wrong family never selects even if
+        // the name string matches by accident.
+        assert!(!gfx1010_release_wait_required(
+            Pm4Architecture::Gfx11,
+            "gfx1010"
+        ));
+    }
+
+    #[test]
+    fn gfx1010_release_wait_emits_sentinel_then_checked_epochs() {
+        const FENCE_ADDR: u64 = 0x1234_5678_9abc_def0;
+        let mut commands = Pm4Commands::new_with_dependency(
+            Pm4Architecture::Gfx10,
+            Pm4RegisterPolicy::Legacy,
+            Gfx10DispatchInitiatorPolicy::Legacy,
+            None,
+            Gfx11ComputeResourceLimitsPolicy::Legacy,
+            LegacyDependencyMode::ReleaseWait {
+                address: FENCE_ADDR,
+                next_epoch: 0,
+            },
+        );
+        commands.emit_entry_sentinel_reset().unwrap();
+        commands.wait_compute_idle().unwrap();
+        commands.wait_compute_idle().unwrap();
+
+        let dwords = commands.dwords().expect("legacy dwords");
+        // One fence is RELEASE_MEM (8 dwords) + WAIT_REG_MEM (7 dwords) = 15.
+        assert_eq!(dwords.len(), 15 * 3);
+        // Sentinel epoch 0, then dependency epochs 1 and 2.
+        assert_eq!(dwords[5], 0);
+        assert_eq!(dwords[12], 0);
+        assert_eq!(dwords[15 + 5], 1);
+        assert_eq!(dwords[15 + 12], 1);
+        assert_eq!(dwords[30 + 5], 2);
+        assert_eq!(dwords[30 + 12], 2);
+        // No CS_PARTIAL_FLUSH EVENT_WRITE on the selected path.
+        const EVENT_WRITE_IDLE: u32 = 0xc000_4600;
+        assert!(!dwords.contains(&EVENT_WRITE_IDLE));
+        assert_eq!(
+            commands.dependency_mode(),
+            Some(LegacyDependencyMode::ReleaseWait {
+                address: FENCE_ADDR,
+                next_epoch: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn gfx1010_release_wait_rejects_u32_epoch_overflow() {
+        let mut commands = Pm4Commands::new_with_dependency(
+            Pm4Architecture::Gfx10,
+            Pm4RegisterPolicy::Legacy,
+            Gfx10DispatchInitiatorPolicy::Legacy,
+            None,
+            Gfx11ComputeResourceLimitsPolicy::Legacy,
+            LegacyDependencyMode::ReleaseWait {
+                address: 0x1000,
+                next_epoch: u32::MAX,
+            },
+        );
+        let err = commands.wait_compute_idle().unwrap_err();
+        assert!(
+            err.contains("epoch overflow"),
+            "unexpected overflow error: {err}"
+        );
+    }
+
+    #[test]
+    fn gfx1010_release_wait_aba_reset_starts_each_stream_at_zero() {
+        // Two independently constructed immutable streams both begin with the
+        // sentinel epoch-0 fence, so a stale prior epoch cannot satisfy the
+        // next replay (reset-to-zero / ABA shape).
+        const FENCE_ADDR: u64 = 0xaaa0;
+        let mut first = Pm4Commands::new_with_dependency(
+            Pm4Architecture::Gfx10,
+            Pm4RegisterPolicy::Legacy,
+            Gfx10DispatchInitiatorPolicy::Legacy,
+            None,
+            Gfx11ComputeResourceLimitsPolicy::Legacy,
+            LegacyDependencyMode::ReleaseWait {
+                address: FENCE_ADDR,
+                next_epoch: 0,
+            },
+        );
+        first.emit_entry_sentinel_reset().unwrap();
+        first.wait_compute_idle().unwrap();
+
+        let mut second = Pm4Commands::new_with_dependency(
+            Pm4Architecture::Gfx10,
+            Pm4RegisterPolicy::Legacy,
+            Gfx10DispatchInitiatorPolicy::Legacy,
+            None,
+            Gfx11ComputeResourceLimitsPolicy::Legacy,
+            LegacyDependencyMode::ReleaseWait {
+                address: FENCE_ADDR,
+                next_epoch: 0,
+            },
+        );
+        second.emit_entry_sentinel_reset().unwrap();
+
+        let first_dwords = first.dwords().unwrap();
+        let second_dwords = second.dwords().unwrap();
+        assert_eq!(first_dwords[5], 0);
+        assert_eq!(second_dwords[5], 0);
+        assert_eq!(&first_dwords[..15], &second_dwords[..15]);
+        // First stream advanced past the sentinel; second is still at epoch 0.
+        assert_eq!(
+            first.dependency_mode(),
+            Some(LegacyDependencyMode::ReleaseWait {
+                address: FENCE_ADDR,
+                next_epoch: 1,
+            })
+        );
+        assert_eq!(
+            second.dependency_mode(),
+            Some(LegacyDependencyMode::ReleaseWait {
+                address: FENCE_ADDR,
+                next_epoch: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn default_dependency_mode_keeps_cs_partial_flush() {
+        let mut commands = Pm4Commands::new(
+            Pm4Architecture::Gfx10,
+            Pm4RegisterPolicy::Legacy,
+            Gfx10DispatchInitiatorPolicy::Legacy,
+            None,
+            Gfx11ComputeResourceLimitsPolicy::Legacy,
+        );
+        assert_eq!(
+            commands.dependency_mode(),
+            Some(LegacyDependencyMode::CsPartialFlush)
+        );
+        commands.emit_entry_sentinel_reset().unwrap();
+        commands.wait_compute_idle().unwrap();
+        let dwords = commands.dwords().unwrap();
+        // EVENT_WRITE CS_PARTIAL_FLUSH only — no RELEASE_MEM / WAIT_REG_MEM.
+        assert_eq!(dwords, &[0xc000_4600, 0x407]);
+    }
+
+    #[test]
+    fn sequence_hash_inputs_unchanged_by_dependency_mode() {
+        // Fence selection must not alter capture identity / sequence hashing.
+        let launches = [
+            RecordedHipLaunch {
+                kernel: "a".to_owned(),
+                artifact: None,
+                grid: [1, 2, 3],
+                block: [32, 1, 1],
+                shared_mem: 0,
+                grid_binding: None,
+                kernarg: vec![1, 2, 3, 4],
+                accesses: None,
+            },
+            RecordedHipLaunch {
+                kernel: "b".to_owned(),
+                artifact: None,
+                grid: [4, 5, 6],
+                block: [64, 1, 1],
+                shared_mem: 128,
+                grid_binding: None,
+                kernarg: vec![5, 6],
+                accesses: None,
+            },
+        ];
+        let hash = replay_sequence_hash(&launches);
+        assert_eq!(hash, replay_sequence_hash(launches.iter()));
+        assert_ne!(hash, 0);
+    }
+
+    #[test]
     fn gfx1151_radiowave_symbols_keep_resource_contracts() {
         let gate = "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_all_buffer_gfx1151";
         let gate_hybrid = "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_hybrid_gfx1151";
@@ -4645,20 +4998,8 @@ mod tests {
     // Fail if a codebook MoE kernel variant is added without resource-contract registration.
     #[test]
     fn codebook_moe_symbols_have_resource_contracts() {
-        let gate_up_effects = vec![
-            read(0),
-            read(8),
-            read(16),
-            write(24),
-            write(32),
-        ];
-        let down_effects = vec![
-            read(0),
-            read(8),
-            read(16),
-            read(24),
-            write(32),
-        ];
+        let gate_up_effects = vec![read(0), read(8), read(16), write(24), write(32)];
+        let down_effects = vec![read(0), read(8), read(16), read(24), write(32)];
         for (symbol, kernarg_bytes, effects) in [
             (
                 "gemv_mq2g256_lloyd_moe_gate_up_k8_indexed",
@@ -4762,7 +5103,6 @@ mod tests {
         }
     }
 
-
     #[test]
     fn moe_shared_down_and_routed_gate_up_are_independent_siblings() {
         assert!(independent_sibling(
@@ -4819,28 +5159,42 @@ mod tests {
             Pm4MidAcquirePolicy::from_value("required-only"),
             Some(Pm4MidAcquirePolicy::RequiredOnly)
         );
-        assert!(Pm4MidAcquirePolicy::Conservative
-            .acquire_between("rmsnorm_f32", "rope_partial_halfsplit_f32"));
-        assert!(!Pm4MidAcquirePolicy::EntryOnly
-            .acquire_between("rmsnorm_f32", "rope_partial_halfsplit_f32"));
+        assert!(
+            Pm4MidAcquirePolicy::Conservative
+                .acquire_between("rmsnorm_f32", "rope_partial_halfsplit_f32")
+        );
+        assert!(
+            !Pm4MidAcquirePolicy::EntryOnly
+                .acquire_between("rmsnorm_f32", "rope_partial_halfsplit_f32")
+        );
         assert!(!Pm4MidAcquirePolicy::Conservative.acquire_between("rmsnorm_f32", "gemv_hfq4g256"));
-        assert!(!Pm4MidAcquirePolicy::WithoutRope
-            .acquire_between("rmsnorm_f32", "rope_partial_halfsplit_f32"));
-        assert!(Pm4MidAcquirePolicy::WithoutRope
-            .acquire_between("repeat_interleave_qk_f32", "rope_partial_halfsplit_f32"));
+        assert!(
+            !Pm4MidAcquirePolicy::WithoutRope
+                .acquire_between("rmsnorm_f32", "rope_partial_halfsplit_f32")
+        );
+        assert!(
+            Pm4MidAcquirePolicy::WithoutRope
+                .acquire_between("repeat_interleave_qk_f32", "rope_partial_halfsplit_f32")
+        );
         assert!(
             !Pm4MidAcquirePolicy::WithoutMqRotate.acquire_between("mq_rotate_x", "gemv_hfq4g256")
         );
-        assert!(Pm4MidAcquirePolicy::RequiredOnly
-            .acquire_between("rmsnorm_f32", "rope_partial_halfsplit_f32"));
-        assert!(Pm4MidAcquirePolicy::RequiredOnly
-            .acquire_between("fused_silu_mul_mq_rotate", "gemv_hfq4g256_residual"));
+        assert!(
+            Pm4MidAcquirePolicy::RequiredOnly
+                .acquire_between("rmsnorm_f32", "rope_partial_halfsplit_f32")
+        );
+        assert!(
+            Pm4MidAcquirePolicy::RequiredOnly
+                .acquire_between("fused_silu_mul_mq_rotate", "gemv_hfq4g256_residual")
+        );
         assert!(Pm4MidAcquirePolicy::RequiredOnly.acquire_between(
             "fused_silu_mul_mq_rotate",
             "gemv_hfq4g256_residual_k2048_gfx1201"
         ));
-        assert!(!Pm4MidAcquirePolicy::RequiredOnly
-            .acquire_between("fused_silu_mul_mq_rotate", "gemv_hfq4g256"));
+        assert!(
+            !Pm4MidAcquirePolicy::RequiredOnly
+                .acquire_between("fused_silu_mul_mq_rotate", "gemv_hfq4g256")
+        );
         assert!(Pm4MidAcquirePolicy::RequiredOnly.acquire_between(
             "fused_qk_l2_norm_scale_f32",
             "gated_delta_net_q8_compact2_b2"
@@ -5654,9 +6008,11 @@ mod tests {
         let mut controller = ReplayController::new(ReplayBackendRequest::Auto);
         controller.route_proof_log = true;
         controller.observe_replay_result(127, Ok(())).unwrap();
-        assert!(controller
-            .observe_replay_result::<()>(128, Err("dispatch failed".to_owned()))
-            .is_err());
+        assert!(
+            controller
+                .observe_replay_result::<()>(128, Err("dispatch failed".to_owned()))
+                .is_err()
+        );
 
         assert_eq!(
             controller.replay_observation_marker("chatcmpl-turn-1"),

@@ -33,6 +33,7 @@ from tools.redline.product_bench import (
     run_coherence_smoke,
     run_pm4_multiturn_session,
     run_pm4_preflight,
+    sampled_output_parity_errors,
     validate_route_proof,
 )
 
@@ -2930,6 +2931,100 @@ class CoherenceCustomTests(unittest.TestCase):
         self.assertIn("--coherence-expected-substring", help_text)
         self.assertIn("--coherence-thinking", help_text)
         self.assertIn("--coherence-max-tokens", help_text)
+
+class SampledOutputParityTests(unittest.TestCase):
+    """Exact parity helper: byte-identical passes, substring not sufficient."""
+
+    @staticmethod
+    def _paris_row(content: str = "Paris is the capital of France.", ctx: int = 10, gen: int = 7) -> dict:
+        return {"assistant_content": content, "ctx": ctx, "gen": gen}
+
+    def test_exact_paris_rows_pass(self):
+        hip = [self._paris_row()]
+        replay = [self._paris_row()]
+        errors = sampled_output_parity_errors(hip, replay, label="coherence")
+        self.assertEqual(errors, [])
+
+    def test_paris_county_long_wrong_fails_despite_shared_substring(self):
+        hip = [self._paris_row("Paris is the capital of France.")]
+        # Long wrong output that merely contains "Paris" substring but is not byte-identical
+        replay = [self._paris_row("Paris is the capital of France. Paris County is a fictional county with many parishes and a long deterministically wrong suffix that contains Paris as substring.")]
+        errors = sampled_output_parity_errors(hip, replay, label="coherence")
+        self.assertTrue(errors, "long wrong output must be rejected despite shared substring")
+        self.assertTrue(any("assistant_content" in e or "sampled output" in e for e in errors))
+        # Health-hint substring check would have passed, but exact parity must fail
+        self.assertIn("Paris", hip[0]["assistant_content"])
+        self.assertIn("Paris", replay[0]["assistant_content"])
+        # Ensure case-folding not applied: same content with different case must still fail
+        hip_case = [self._paris_row("Paris is the capital of France.")]
+        replay_case = [self._paris_row("paris is the capital of france.")]
+        case_errors = sampled_output_parity_errors(hip_case, replay_case, label="coherence")
+        self.assertTrue(case_errors)
+
+    def test_count_mismatch_fails(self):
+        hip = [self._paris_row(), self._paris_row()]
+        replay = [self._paris_row()]
+        errors = sampled_output_parity_errors(hip, replay, label="coherence")
+        self.assertTrue(errors)
+        self.assertTrue(any("row count" in e for e in errors))
+
+    def test_type_mismatch_fails(self):
+        # hip_rows not a list
+        errors = sampled_output_parity_errors("not-a-list", [self._paris_row()], label="coherence")
+        self.assertTrue(errors)
+        self.assertTrue(any("must be a list" in e for e in errors))
+        # replay_rows not a list
+        errors2 = sampled_output_parity_errors([self._paris_row()], {"not": "list"}, label="coherence")
+        self.assertTrue(errors2)
+        self.assertTrue(any("must be a list" in e for e in errors2))
+        # row not a dict
+        errors3 = sampled_output_parity_errors([self._paris_row()], ["not-a-dict"], label="coherence")
+        self.assertTrue(errors3)
+        self.assertTrue(any("must be an object" in e for e in errors3))
+        errors4 = sampled_output_parity_errors(["not-a-dict"], [self._paris_row()], label="coherence")
+        self.assertTrue(errors4)
+        self.assertTrue(any("must be an object" in e for e in errors4))
+
+    def test_missing_field_fails(self):
+        hip = [self._paris_row()]
+        # missing gen
+        replay_missing_gen = [{"assistant_content": "Paris is the capital of France.", "ctx": 10}]
+        errors = sampled_output_parity_errors(hip, replay_missing_gen, label="coherence")
+        self.assertTrue(errors)
+        self.assertTrue(any("gen" in e for e in errors))
+        # missing assistant_content
+        replay_missing_ac = [{"ctx": 10, "gen": 7}]
+        errors2 = sampled_output_parity_errors(hip, replay_missing_ac, label="coherence")
+        self.assertTrue(errors2)
+        self.assertTrue(any("assistant_content" in e for e in errors2))
+        # missing ctx
+        replay_missing_ctx = [{"assistant_content": "Paris is the capital of France.", "gen": 7}]
+        errors3 = sampled_output_parity_errors(hip, replay_missing_ctx, label="coherence")
+        self.assertTrue(errors3)
+        self.assertTrue(any("ctx" in e for e in errors3))
+
+    def test_ctx_and_gen_exact_equality(self):
+        hip = [self._paris_row(ctx=128, gen=8)]
+        replay_ctx_diff = [self._paris_row(ctx=129, gen=8)]
+        errors = sampled_output_parity_errors(hip, replay_ctx_diff, label="coherence")
+        self.assertTrue(errors)
+        self.assertTrue(any("ctx" in e for e in errors))
+        replay_gen_diff = [self._paris_row(ctx=128, gen=9)]
+        errors2 = sampled_output_parity_errors(hip, replay_gen_diff, label="coherence")
+        self.assertTrue(errors2)
+        self.assertTrue(any("gen" in e for e in errors2))
+        # exact identical passes
+        replay_same = [self._paris_row(ctx=128, gen=8)]
+        self.assertEqual(sampled_output_parity_errors(hip, replay_same, label="coherence"), [])
+
+    def test_no_normalization_or_substring(self):
+        # Trailing whitespace / newline difference must fail exact equality
+        hip = [self._paris_row("Paris is the capital of France.")]
+        replay = [self._paris_row("Paris is the capital of France. ")]  # extra space
+        errors = sampled_output_parity_errors(hip, replay, label="coherence")
+        self.assertTrue(errors)
+        # Substring health hint would pass, but exact must fail already checked above
+
 
 
 if __name__ == "__main__":

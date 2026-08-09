@@ -45,8 +45,8 @@ REPO = Path(__file__).resolve().parent.parent
 # Coherent max_tokens must exceed that cap (product_bench rejects otherwise).
 COHERENCE_THINKING = "off"
 COHERENCE_THINKING_CAP = 1
-COHERENCE_MAX_TOKENS = 1024
-assert COHERENCE_MAX_TOKENS > COHERENCE_THINKING_CAP
+DEFAULT_COHERENCE_MAX_TOKENS = 1024
+assert DEFAULT_COHERENCE_MAX_TOKENS > COHERENCE_THINKING_CAP
 
 # Env keys recorded as the effective allowlist (child + parent visibility).
 ENV_ALLOWLIST_KEYS = (
@@ -439,6 +439,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="Max sequence length (default: 2048)",
     )
     p.add_argument(
+        "--coherence-max-tokens",
+        type=int,
+        default=DEFAULT_COHERENCE_MAX_TOKENS,
+        dest="coherence_max_tokens",
+        help="Custom-coherence generation limit (default: 1024; must exceed thinking-off cap 1)",
+    )
+    p.add_argument(
+        "--coherence-sampling",
+        default="registry",
+        dest="coherence_sampling",
+        help=(
+            "Custom-coherence serve_harness sampling pin forwarded identically to both "
+            "HIP and auto arms (default: registry; nonempty serve_harness --sampling spec)"
+        ),
+    )
+    p.add_argument(
         "--work-dir",
         default=None,
         dest="work_dir",
@@ -498,6 +514,18 @@ def parse_args(argv=None) -> argparse.Namespace:
         parser.error("--iterations must be >= 1")
     if args.max_seq < 512 or args.max_seq > 1048576:
         parser.error("--max-seq must be between 512 and 1048576")
+    if args.coherence_max_tokens <= COHERENCE_THINKING_CAP:
+        parser.error(
+            "--coherence-max-tokens must exceed the thinking-off cap "
+            f"({COHERENCE_THINKING_CAP})"
+        )
+    if (
+        not isinstance(args.coherence_sampling, str)
+        or not args.coherence_sampling.strip()
+    ):
+        parser.error(
+            "--coherence-sampling must be a nonempty serve_harness sampling spec"
+        )
     if args.timeout <= 0:
         parser.error("--timeout must be > 0")
 
@@ -575,6 +603,8 @@ def _validate_child_report(
     prompt_md5: str,
     prompt_sha256: str,
     expected_substrings: List[str],
+    coherence_max_tokens: int,
+    coherence_sampling: str,
     transport: str,
     process_index: int,
 ) -> List[str]:
@@ -633,14 +663,29 @@ def _validate_child_report(
             f"{prefix}: coherence.thinking must be {COHERENCE_THINKING!r} "
             f"(got {coh.get('thinking')!r})"
         )
-    if coh.get("max_tokens") != COHERENCE_MAX_TOKENS:
+    if coh.get("max_tokens") != coherence_max_tokens:
         errors.append(
-            f"{prefix}: coherence.max_tokens must be {COHERENCE_MAX_TOKENS} "
+            f"{prefix}: coherence.max_tokens must be {coherence_max_tokens} "
             f"(got {coh.get('max_tokens')!r})"
         )
-
+    if coh.get("sampling") != coherence_sampling:
+        errors.append(
+            f"{prefix}: coherence.sampling must be {coherence_sampling!r} "
+            f"(got {coh.get('sampling')!r})"
+        )
     for arm in ("hip", "auto"):
         arm_coh = coh.get(arm) if isinstance(coh.get(arm), dict) else {}
+        arm_cfg = arm_coh.get("config") if isinstance(arm_coh.get("config"), dict) else {}
+        if arm_coh.get("sampling") != coherence_sampling:
+            errors.append(
+                f"{prefix}: coherence.{arm}.sampling must be {coherence_sampling!r} "
+                f"(got {arm_coh.get('sampling')!r})"
+            )
+        if arm_cfg.get("sampling") != coherence_sampling:
+            errors.append(
+                f"{prefix}: coherence.{arm}.config.sampling must be "
+                f"{coherence_sampling!r} (got {arm_cfg.get('sampling')!r})"
+            )
         if not _is_true(arm_coh.get("valid")):
             errors.append(
                 f"{prefix}: coherence.{arm}.valid is not true (got {arm_coh.get('valid')!r})"
@@ -882,7 +927,9 @@ def main(argv=None) -> int:
             "--coherence-thinking",
             COHERENCE_THINKING,
             "--coherence-max-tokens",
-            str(COHERENCE_MAX_TOKENS),
+            str(args.coherence_max_tokens),
+            "--coherence-sampling",
+            args.coherence_sampling,
         ]
         for sub in args.expected_substring:
             child_argv.extend(["--coherence-expected-substring", sub])
@@ -1014,6 +1061,8 @@ def main(argv=None) -> int:
                     prompt_sha256=prompt_sha256,
                     expected_substrings=list(args.expected_substring),
                     transport=args.transport,
+                    coherence_max_tokens=args.coherence_max_tokens,
+                    coherence_sampling=args.coherence_sampling,
                     process_index=proc_idx,
                 )
             )
@@ -1144,7 +1193,8 @@ def main(argv=None) -> int:
             "out": args.out,
             "timeout": args.timeout,
             "coherence_thinking": COHERENCE_THINKING,
-            "coherence_max_tokens": COHERENCE_MAX_TOKENS,
+            "coherence_max_tokens": args.coherence_max_tokens,
+            "coherence_sampling": args.coherence_sampling,
         },
         "work_dir": str(work_root),
         "log_dir": str(log_root),

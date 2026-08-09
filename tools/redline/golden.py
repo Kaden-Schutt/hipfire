@@ -23,6 +23,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from tools.redline.product_bench import sampled_output_parity_errors
+
 
 REPO = Path(__file__).resolve().parents[2]
 DEFAULT_REGISTRY = REPO / "registry" / "redline-golden-v1.json"
@@ -759,6 +761,18 @@ def validate_report(
         expected_transport=transport,
         errors=errors,
     )
+    # Exact sampled-output parity for the one-turn coherence arms; substring/semantic checks are health hints only.
+    if isinstance(coherence, dict):
+        hip_coh = coherence.get("hip")
+        auto_coh = coherence.get("auto")
+        if isinstance(hip_coh, dict) and isinstance(auto_coh, dict):
+            if not hip_coh.get("skipped") and not auto_coh.get("skipped"):
+                hip_rows = hip_coh.get("rows")
+                auto_rows = auto_coh.get("rows")
+                # Legacy reports without rows (pre-parity) are back-compat; enforce when either side carries rows.
+                if hip_rows is not None or auto_rows is not None:
+                    parity_errors = sampled_output_parity_errors(hip_rows, auto_rows, label="coherence")
+                    errors.extend(parity_errors)
 
     hip_arm = _require_mapping(report.get("hip"), "hip", errors)
     auto_arm = _require_mapping(report.get("auto"), "auto", errors)
