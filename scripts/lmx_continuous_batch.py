@@ -57,6 +57,34 @@ _current_pgid: Optional[int] = None
 _current_proc: Optional[subprocess.Popen] = None
 _shutdown = False
 
+_SECRET_ENV_NAME_PARTS = (
+    "ACCESS_KEY",
+    "API_KEY",
+    "_KEY",
+    "AUTH",
+    "COOKIE",
+    "CREDENTIAL",
+    "JWT",
+    "PASSWORD",
+    "PASSWD",
+    "PRIVATE_KEY",
+    "SECRET",
+    "SESSION",
+    "TOKEN",
+)
+
+
+def _redacted_environment(source: Dict[str, str]) -> Dict[str, str]:
+    """Retain environment shape without persisting credential values."""
+    return {
+        key: (
+            "<redacted>"
+            if any(part in key.upper() for part in _SECRET_ENV_NAME_PARTS)
+            else value
+        )
+        for key, value in source.items()
+    }
+
 
 def _set_current_pgid(pgid: Optional[int], proc: Optional[subprocess.Popen] = None) -> None:
     global _current_pgid, _current_proc
@@ -717,8 +745,8 @@ def main(argv=None) -> int:
 
     # Command / env / git / host
     command_argv = sys.argv
-    # Full environment: copy but redact secrets? Keep all for seal-case
-    env_snapshot = dict(os.environ)
+    # Retain every environment key for reproducibility, but never credential values.
+    env_snapshot = _redacted_environment(dict(os.environ))
     git_info = _git_info()
     host = socket.gethostname()
     platform_info = {
@@ -1266,7 +1294,7 @@ def main(argv=None) -> int:
             "HOME_ROOT": str(home_root),
             "LOG_DIR": str(log_dir),
             "PORT": args.port,
-            # Include full env snapshot for seal-case (redact nothing, but keep size manageable)
+            # Keys are complete; credential-bearing values are redacted above.
             "full_env": env_snapshot,
         },
         "git": git_info,
