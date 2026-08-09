@@ -1600,6 +1600,12 @@ impl DaemonInbox {
         }
         self.rx.try_recv()
     }
+    fn recv_timeout(&mut self, timeout: Duration) -> Result<DaemonMsg, mpsc::RecvTimeoutError> {
+        if let Some(msg) = self.backlog.pop_front() {
+            return Ok(msg);
+        }
+        self.rx.recv_timeout(timeout)
+    }
     fn push_front(&mut self, msg: DaemonMsg) {
         self.backlog.push_front(msg);
     }
@@ -2738,10 +2744,38 @@ fn drive_lfm_continuous_batch(
             let _ = sched.abort_lane(idx, &key);
         }
         let mut barrier: Option<DaemonMsg> = None;
+        // A fresh continuous-batch wave reaches the daemon through many
+        // concurrent HTTP handlers. Give that first wave a small, bounded
+        // coalescing window so admission does not race the second request and
+        // serialize the remainder through single-lane prefill.
+        let admission_deadline = (sched.active_count() == 0 && sched.awaiting_count() == 0)
+            .then(|| Instant::now() + Duration::from_millis(20));
         loop {
             let dm = match inbox.try_recv() {
                 Ok(m) => m,
-                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Empty) => {
+                    let Some(deadline) = admission_deadline else {
+                        break;
+                    };
+                    if sched.active_count() != 0
+                        || sched.awaiting_count() != 0
+                        || sched.inbox.len() >= batch_size
+                    {
+                        break;
+                    }
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        break;
+                    }
+                    match inbox.recv_timeout(remaining) {
+                        Ok(m) => m,
+                        Err(
+                            mpsc::RecvTimeoutError::Timeout | mpsc::RecvTimeoutError::Disconnected,
+                        ) => {
+                            break;
+                        }
+                    }
+                }
                 Err(mpsc::TryRecvError::Disconnected) => break,
             };
             match dm {
