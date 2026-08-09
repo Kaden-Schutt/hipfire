@@ -1447,15 +1447,18 @@ impl Lfm2MoeState {
         })
     }
 
-    /// Reset for a new sequence: clear conv state and token count.
+    /// Reset for a new sequence: clear KV + conv state and token count.
+    /// Preserves `graph_warmed_up`; no host allocations.
     pub fn reset(&mut self, gpu: &mut Gpu) -> Result<(), String> {
-        self.n_tokens = 0;
+        self.kv
+            .clear_gpu(gpu)
+            .map_err(|e| format!("lfm2moe: reset kv: {e:?}"))?;
         for cs in &self.conv_states {
-            let zeros = vec![0u8; cs.numel() * 4];
             gpu.hip
-                .memcpy_htod(&cs.buf, &zeros)
+                .memset(&cs.buf, 0, cs.buf.size())
                 .map_err(|e| format!("lfm2moe: reset conv_state: {e:?}"))?;
         }
+        self.n_tokens = 0;
         Ok(())
     }
 

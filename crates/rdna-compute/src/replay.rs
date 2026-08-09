@@ -22,11 +22,11 @@ use std::sync::Arc;
 use hip_bridge::HipRuntime;
 use radiowave::{CodeObjectCertification, KernelArgumentAccess, MutableReadCache};
 use redline_dispatch::aql::{
-    BatchFencePolicy, Executable, Gfx10DispatchInitiatorPolicy, Gfx10Pm4CommandBuffer,
-    Gfx11ComputeResourceLimitsPolicy, Gfx11DispatchInterleave, Gfx12Pm4CommandBuffer,
-    GpuBatchTiming, GpuDevice, GpuMultiQueueTiming, GpuSelector, HeaderPolicy, KernargBuffer,
-    KernargPool, Kernel, LaunchGeometry, PhasedMultiQueuePm4Ib, QueuePolicy, RecordedDispatch,
-    Runtime, SingleQueueBatchGraph, SingleQueuePm4Ib, load_symbols,
+    load_symbols, BatchFencePolicy, Executable, Gfx10DispatchInitiatorPolicy,
+    Gfx10Pm4CommandBuffer, Gfx11ComputeResourceLimitsPolicy, Gfx11DispatchInterleave,
+    Gfx12Pm4CommandBuffer, GpuBatchTiming, GpuDevice, GpuMultiQueueTiming, GpuSelector,
+    HeaderPolicy, KernargBuffer, KernargPool, Kernel, LaunchGeometry, PhasedMultiQueuePm4Ib,
+    QueuePolicy, RecordedDispatch, Runtime, SingleQueueBatchGraph, SingleQueuePm4Ib,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -849,6 +849,10 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             write(64),
         ]),
         "fused_sigmoid_alpha_gate_f32" => Some(vec![write(0), write(8), read(16), read(24)]),
+        // LFM retained-PM4 fallback: state is RMW at @8 (write covers RMW).
+        "conv1d_gated_decode_f32" => Some(vec![read(0), write(8), read(16), write(24)]),
+        // LFM retained-PM4 fallback: q/k/v read, out write, pos read.
+        "attention_q8_0_kv" => Some(vec![read(0), read(8), read(16), write(24), read(32)]),
         "conv1d_silu_split_f32" => Some(vec![
             write(0),
             write(8),
@@ -1242,7 +1246,8 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "kv_cache_write_q8_0_pair"
         | "mq_rotate_x"
         | "repeat_interleave_qk_f32"
-        | "rope_partial_halfsplit_f32" => Some(48),
+        | "rope_partial_halfsplit_f32"
+        | "conv1d_gated_decode_f32" => Some(48),
         "conv1d_silu_split_f32"
         | "gated_norm_mq_rotate_gfx1100"
         | "gated_norm_mq_rotate_gfx1151"
@@ -1251,7 +1256,8 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1100"
         | "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1151"
         | "fused_rmsnorm_mq_rotate_wavegrid"
-        | "rotate_with_rms_gfx1100" => Some(64),
+        | "rotate_with_rms_gfx1100"
+        | "attention_q8_0_kv" => Some(64),
         "moe_down_combine_rmsnorm_mq_rotate_vecsum"
         | "moe_down_combine_rmsnorm_mq_rotate_vecsum_gfx1151" => Some(72),
         "gemv_hfq4g256_moe_down_k8_indexed_last_combine" => Some(64),
@@ -2794,14 +2800,15 @@ impl PreparedPm4Replay {
             let dimensions = if self.pm4_architecture == Pm4Architecture::Gfx12 {
                 let mut workitems = [0_u32; 3];
                 for axis in 0..3 {
-                    workitems[axis] = workgroups[axis].checked_mul(workgroup[axis]).ok_or_else(
-                        || {
-                            format!(
+                    workitems[axis] =
+                        workgroups[axis]
+                            .checked_mul(workgroup[axis])
+                            .ok_or_else(|| {
+                                format!(
                                 "dynamic PM4 grid overflow axis={axis} workgroups={} workgroup={}",
                                 workgroups[axis], workgroup[axis]
                             )
-                        },
-                    )?;
+                            })?;
                 }
                 workitems
             } else {
@@ -4876,6 +4883,42 @@ mod tests {
     }
 
     #[test]
+    fn lfm_retained_effect_contracts() {
+        assert_eq!(expected_kernarg_bytes("conv1d_gated_decode_f32"), Some(48));
+        let conv = pointer_effects("conv1d_gated_decode_f32").expect("conv contract");
+        assert_eq!(conv.len(), 4);
+        assert_eq!(conv[0].offset, 0);
+        assert_eq!(conv[0].mode, RecordedAccessMode::Read);
+        assert_eq!(conv[1].offset, 8);
+        assert_eq!(
+            conv[1].mode,
+            RecordedAccessMode::Write,
+            "conv state @8 is RMW, recorded as write"
+        );
+        assert_eq!(conv[2].offset, 16);
+        assert_eq!(conv[2].mode, RecordedAccessMode::Read);
+        assert_eq!(conv[3].offset, 24);
+        assert_eq!(conv[3].mode, RecordedAccessMode::Write);
+
+        assert_eq!(expected_kernarg_bytes("attention_q8_0_kv"), Some(64));
+        let attn = pointer_effects("attention_q8_0_kv").expect("attn contract");
+        assert_eq!(attn.len(), 5);
+        assert_eq!(attn[0].offset, 0);
+        assert_eq!(attn[0].mode, RecordedAccessMode::Read);
+        assert_eq!(attn[1].offset, 8);
+        assert_eq!(attn[1].mode, RecordedAccessMode::Read);
+        assert_eq!(attn[2].offset, 16);
+        assert_eq!(attn[2].mode, RecordedAccessMode::Read);
+        assert_eq!(attn[3].offset, 24);
+        assert_eq!(attn[3].mode, RecordedAccessMode::Write);
+        assert_eq!(attn[4].offset, 32);
+        assert_eq!(attn[4].mode, RecordedAccessMode::Read);
+
+        assert!(expected_kernarg_bytes("unknown_kernel_xyz").is_none());
+        assert!(pointer_effects("unknown_kernel_xyz").is_none());
+    }
+
+    #[test]
     fn gfx1151_radiowave_symbols_keep_resource_contracts() {
         let gate = "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_all_buffer_gfx1151";
         let gate_hybrid = "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_hybrid_gfx1151";
@@ -5159,42 +5202,28 @@ mod tests {
             Pm4MidAcquirePolicy::from_value("required-only"),
             Some(Pm4MidAcquirePolicy::RequiredOnly)
         );
-        assert!(
-            Pm4MidAcquirePolicy::Conservative
-                .acquire_between("rmsnorm_f32", "rope_partial_halfsplit_f32")
-        );
-        assert!(
-            !Pm4MidAcquirePolicy::EntryOnly
-                .acquire_between("rmsnorm_f32", "rope_partial_halfsplit_f32")
-        );
+        assert!(Pm4MidAcquirePolicy::Conservative
+            .acquire_between("rmsnorm_f32", "rope_partial_halfsplit_f32"));
+        assert!(!Pm4MidAcquirePolicy::EntryOnly
+            .acquire_between("rmsnorm_f32", "rope_partial_halfsplit_f32"));
         assert!(!Pm4MidAcquirePolicy::Conservative.acquire_between("rmsnorm_f32", "gemv_hfq4g256"));
-        assert!(
-            !Pm4MidAcquirePolicy::WithoutRope
-                .acquire_between("rmsnorm_f32", "rope_partial_halfsplit_f32")
-        );
-        assert!(
-            Pm4MidAcquirePolicy::WithoutRope
-                .acquire_between("repeat_interleave_qk_f32", "rope_partial_halfsplit_f32")
-        );
+        assert!(!Pm4MidAcquirePolicy::WithoutRope
+            .acquire_between("rmsnorm_f32", "rope_partial_halfsplit_f32"));
+        assert!(Pm4MidAcquirePolicy::WithoutRope
+            .acquire_between("repeat_interleave_qk_f32", "rope_partial_halfsplit_f32"));
         assert!(
             !Pm4MidAcquirePolicy::WithoutMqRotate.acquire_between("mq_rotate_x", "gemv_hfq4g256")
         );
-        assert!(
-            Pm4MidAcquirePolicy::RequiredOnly
-                .acquire_between("rmsnorm_f32", "rope_partial_halfsplit_f32")
-        );
-        assert!(
-            Pm4MidAcquirePolicy::RequiredOnly
-                .acquire_between("fused_silu_mul_mq_rotate", "gemv_hfq4g256_residual")
-        );
+        assert!(Pm4MidAcquirePolicy::RequiredOnly
+            .acquire_between("rmsnorm_f32", "rope_partial_halfsplit_f32"));
+        assert!(Pm4MidAcquirePolicy::RequiredOnly
+            .acquire_between("fused_silu_mul_mq_rotate", "gemv_hfq4g256_residual"));
         assert!(Pm4MidAcquirePolicy::RequiredOnly.acquire_between(
             "fused_silu_mul_mq_rotate",
             "gemv_hfq4g256_residual_k2048_gfx1201"
         ));
-        assert!(
-            !Pm4MidAcquirePolicy::RequiredOnly
-                .acquire_between("fused_silu_mul_mq_rotate", "gemv_hfq4g256")
-        );
+        assert!(!Pm4MidAcquirePolicy::RequiredOnly
+            .acquire_between("fused_silu_mul_mq_rotate", "gemv_hfq4g256"));
         assert!(Pm4MidAcquirePolicy::RequiredOnly.acquire_between(
             "fused_qk_l2_norm_scale_f32",
             "gated_delta_net_q8_compact2_b2"
@@ -6008,11 +6037,9 @@ mod tests {
         let mut controller = ReplayController::new(ReplayBackendRequest::Auto);
         controller.route_proof_log = true;
         controller.observe_replay_result(127, Ok(())).unwrap();
-        assert!(
-            controller
-                .observe_replay_result::<()>(128, Err("dispatch failed".to_owned()))
-                .is_err()
-        );
+        assert!(controller
+            .observe_replay_result::<()>(128, Err("dispatch failed".to_owned()))
+            .is_err());
 
         assert_eq!(
             controller.replay_observation_marker("chatcmpl-turn-1"),
