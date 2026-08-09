@@ -5628,9 +5628,7 @@ mod mtp_adaptive_route_contract {
 /// Pure — no GPU, no launch counters, no Instant reads under test.
 #[cfg(test)]
 mod mtp_host_timing_contract {
-    use super::{
-        attach_mtp_window_timings, mtp_window_timing_kind, mtp_window_timing_record,
-    };
+    use super::{attach_mtp_window_timings, mtp_window_timing_kind, mtp_window_timing_record};
 
     #[test]
     fn route_kind_covers_ngram_mtp_and_ar() {
@@ -5648,9 +5646,7 @@ mod mtp_host_timing_contract {
 
     #[test]
     fn timing_record_preserves_exact_wire_fields() {
-        let rec = mtp_window_timing_record(
-            "ngram", 11, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12,
-        );
+        let rec = mtp_window_timing_record("ngram", 11, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12);
         let obj = rec.as_object().expect("object");
         let expected = [
             "kind",
@@ -5728,7 +5724,6 @@ mod mtp_host_timing_contract {
         assert_eq!(arr[2]["wall_us"], 3);
     }
 }
-
 
 /// Daemon writer contract: active-attempt errors cannot take a caller-chosen
 /// attempt_id (including hard-coded 0). Uncorrelated rejects are a separate API.
@@ -14011,7 +14006,10 @@ fn generate_qwen35_mtp(
             // Short-lock record_draft_result for every ngram attempt.
             {
                 let mut pool = ngram_mod_pool.as_ref().unwrap().lock().unwrap();
-                let _ = pool.record_draft_result(result.drafts_generated as u32, result.accept_count as u32);
+                let _ = pool.record_draft_result(
+                    result.drafts_generated as u32,
+                    result.accept_count as u32,
+                );
             }
             // Positive ngram acceptance latches retirement; zero-accept before
             // takeover stays MTP-capable (single-row repair handled in core).
