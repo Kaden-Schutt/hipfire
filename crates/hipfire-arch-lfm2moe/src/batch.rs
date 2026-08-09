@@ -159,11 +159,10 @@ impl Lfm2DecodeBatchState {
         let _ = conv_hist_per_layer;
         let _ = repeat_tokens_len;
 
-        let is_kv_layer: Vec<bool> = cfg
-            .layer_types
-            .iter()
-            .map(|t| *t == MixerKind::Attention)
-            .collect();
+        // `AttnWeights::kv_idx` is compact over attention layers only. Keep the
+        // batch cache in that same index space; global mixer-layer placeholders
+        // would let a compact index land on a one-element Conv placeholder.
+        let is_kv_layer = batch_kv_slot_mask(&cfg.layer_types);
 
         let kv = match KvCache::new_gpu_q8_filtered(
             gpu,
@@ -810,5 +809,38 @@ impl Lfm2DecodeBatchState {
             top_k,
             min_p,
         )
+    }
+}
+
+fn batch_kv_slot_mask(layer_types: &[MixerKind]) -> Vec<bool> {
+    let attention_slots = layer_types
+        .iter()
+        .filter(|&&kind| kind == MixerKind::Attention)
+        .count()
+        .max(1);
+    vec![true; attention_slots]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn batch_kv_slots_match_compact_attention_indices() {
+        let layer_types = [
+            MixerKind::Conv,
+            MixerKind::Attention,
+            MixerKind::Conv,
+            MixerKind::Attention,
+            MixerKind::Conv,
+        ];
+        let mask = batch_kv_slot_mask(&layer_types);
+        assert_eq!(mask.len(), 2);
+        assert!(mask.into_iter().all(|enabled| enabled));
+    }
+
+    #[test]
+    fn batch_kv_slots_keep_zero_attention_shape_allocatable() {
+        assert_eq!(batch_kv_slot_mask(&[MixerKind::Conv]), vec![true]);
     }
 }
