@@ -35,10 +35,13 @@ use rdna_compute::{DType, Gpu};
 
 /// Decode one token; returns the full logits vector.
 ///
-/// Routes to the hipGraph capture/replay path when `HIPFIRE_LFM2_GRAPH=1`
-/// (default OFF → exact prior behavior). The graph path amortizes the ~377
-/// per-token kernel launches by replaying a single captured graph; see
-/// `decode_step_with_graph`.
+/// Routes to the retained replay path when the Redline controller is enabled
+/// (dense-only) — otherwise falls back to the hipGraph path when
+/// `HIPFIRE_LFM2_GRAPH=1` (default OFF → exact prior behavior). Retained takes
+/// precedence over HipGraph. Dense-only: non-dense models poison/disable the
+/// controller and continue via the existing HIP path without falsely claiming
+/// replay. Any decode while `retained_state_poisoned` is true rejects until
+/// `reset()` clears it.
 pub fn decode_step(
     cfg: &Lfm2MoeConfig,
     weights: &Lfm2MoeWeights,
@@ -47,12 +50,153 @@ pub fn decode_step(
     token_id: u32,
     position: u32,
 ) -> Result<Vec<f32>, String> {
+    if state.retained_state_poisoned {
+        return Err("lfm2moe: retained state poisoned until reset".to_string());
+    }
+    if gpu.replay.is_enabled() {
+        if !cfg.is_dense() {
+            gpu.replay.set_forward_eligible(false);
+            gpu.replay
+                .poison("LFM retained replay requires dense model");
+        } else {
+            gpu.replay.set_forward_eligible(true);
+            return decode_step_with_retained_replay(cfg, weights, state, gpu, token_id, position);
+        }
+    }
     if graph_enabled() {
         return decode_step_with_graph(cfg, weights, state, gpu, token_id, position);
     }
     decode_step_inner(cfg, weights, state, gpu, token_id, position, None)?;
     gpu.download_f32(&state.logits)
         .map_err(|e| format!("lfm2moe: download logits: {e:?}"))
+}
+
+fn decode_step_with_retained_replay(
+    cfg: &Lfm2MoeConfig,
+    weights: &Lfm2MoeWeights,
+    state: &mut Lfm2MoeState,
+    gpu: &mut Gpu,
+    token_id: u32,
+    position: u32,
+) -> Result<Vec<f32>, String> {
+    if state.retained_state_poisoned {
+        return Err("lfm2moe: retained state poisoned until reset".to_string());
+    }
+    if !cfg.is_dense() {
+        gpu.replay.set_forward_eligible(false);
+        gpu.replay
+            .poison("LFM retained replay requires dense model");
+        decode_step_inner(cfg, weights, state, gpu, token_id, position, None)?;
+        return gpu
+            .download_f32(&state.logits)
+            .map_err(|e| format!("lfm2moe: download logits (non-dense fallback): {e:?}"));
+    }
+    gpu.replay.set_forward_eligible(true);
+    if !state.retained_warmed_up {
+        decode_step_inner(cfg, weights, state, gpu, token_id, position, None)?;
+        state.retained_warmed_up = true;
+        return gpu
+            .download_f32(&state.logits)
+            .map_err(|e| format!("lfm2moe: download logits (retained warmup): {e:?}"));
+    }
+    prepare_retained_decode_inputs(cfg, weights, state, gpu, token_id, position)?;
+    if !gpu.replay.should_route_aql() && !gpu.replay.should_route_pm4() {
+        let _ = gpu.replay.begin_auto_capture_if_armed();
+        if gpu.replay.state() == rdna_compute::replay::ReplayState::Armed {
+            let _ = gpu.replay.begin_capture();
+        }
+    }
+    if gpu.replay.should_route_aql() || gpu.replay.should_route_pm4() {
+        gpu.hip
+            .device_synchronize()
+            .map_err(|e| format!("lfm2moe: retained adapter sync: {e:?}"))?;
+        let replay_result = if gpu.replay.should_route_aql() {
+            unsafe { gpu.replay.replay_linear_aql(position as usize) }.map(|_| ())
+        } else {
+            unsafe { gpu.replay.replay_pm4(position as usize) }.map(|_| ())
+        };
+        match replay_result {
+            Ok(_) => {
+                state.n_tokens = position as usize + 1;
+                return gpu
+                    .download_f32(&state.logits)
+                    .map_err(|e| format!("lfm2moe: download logits (retained replay): {e:?}"));
+            }
+            Err(reason) => {
+                let msg = format!("LFM retained replay failed: {reason}");
+                gpu.replay.poison(msg);
+                state.retained_state_poisoned = true;
+                return Err(reason);
+            }
+        }
+    }
+    run_retained_decode_body(cfg, weights, state, gpu, position)?;
+    if gpu.replay.should_auto_finalize_capture() {
+        gpu.hip
+            .device_synchronize()
+            .map_err(|e| format!("lfm2moe: retained capture sync: {e:?}"))?;
+        let capture = gpu
+            .replay
+            .finish_capture()
+            .map_err(|e| format!("lfm2moe: finish capture: {e}"))?;
+        let launches = gpu.replay.recorded_launches().len();
+        let prepare = if gpu.replay.uses_pm4_transport() {
+            gpu.replay
+                .prepare_pm4_prefix(gpu.device_id as usize, launches)
+                .map(|_| ())
+        } else {
+            gpu.replay
+                .prepare_linear_aql_prefix(gpu.device_id as usize, launches)
+                .map(|_| ())
+        };
+        match prepare {
+            Ok(()) => {
+                eprintln!(
+                    "[LFM2.5-MoE redline] retained route ready: capture={capture:?} identity={:?}",
+                    gpu.replay.prepared_route_identity()
+                );
+            }
+            Err(reason) => {
+                gpu.replay
+                    .poison(format!("LFM Redline prepare after warmup failed: {reason}"));
+                eprintln!("[LFM2.5-MoE redline] falling back to HIP: {reason}");
+            }
+        }
+    } else if gpu.replay.state() == rdna_compute::replay::ReplayState::RecordingWarmup {
+        gpu.hip
+            .device_synchronize()
+            .map_err(|e| format!("lfm2moe: retained capture sync: {e:?}"))?;
+        if let Ok(capture) = gpu.replay.finish_capture() {
+            let launches = gpu.replay.recorded_launches().len();
+            let prepare = if gpu.replay.uses_pm4_transport() {
+                gpu.replay
+                    .prepare_pm4_prefix(gpu.device_id as usize, launches)
+                    .map(|_| ())
+            } else {
+                // Manual capture needs at least 2 dispatches for linear AQL.
+                if launches >= 2 {
+                    gpu.replay
+                        .prepare_linear_aql_prefix(gpu.device_id as usize, launches)
+                        .map(|_| ())
+                } else {
+                    Err("no captured launch sequence".to_owned())
+                }
+            };
+            match prepare {
+                Ok(()) => eprintln!(
+                    "[LFM2.5-MoE redline] retained route ready (manual): capture={capture:?} identity={:?}",
+                    gpu.replay.prepared_route_identity()
+                ),
+                Err(reason) => {
+                    gpu.replay
+                        .poison(format!("LFM Redline manual prepare failed: {reason}"));
+                    eprintln!("[LFM2.5-MoE redline] falling back to HIP: {reason}");
+                }
+            }
+        }
+    }
+    gpu.download_f32(&state.logits)
+        .map_err(|e| format!("lfm2moe: download logits (retained capture): {e:?}"))
 }
 
 /// `HIPFIRE_LFM2_GRAPH=1` opt-in switch. Default OFF (unset / "0") →

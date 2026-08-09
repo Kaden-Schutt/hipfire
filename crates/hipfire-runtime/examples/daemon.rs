@@ -6682,6 +6682,14 @@ fn redline_bench_decode_lfm2moe(
         redline_prime_retained_fixture(gpu, loaded, context)
             .map_err(|error| format!("bench_decode prefill prime failed: {error}"))?;
         loaded.seq_pos = context;
+        // Manual capture and prepared product routes are already warm paths.
+        // The first product warmup must still materialize lazy allocations and
+        // record the route; later requests replay from their first timed token.
+        if capture || (product_route && gpu.replay.prepared_route_identity().is_some()) {
+            if let Some(ModelState::Lfm2Moe(bundle)) = loaded.state.as_mut() {
+                bundle.state.retained_warmed_up = true;
+            }
+        }
         if capture {
             redline_prepare_retained_fixture(gpu, loaded, 101, context)
                 .map_err(|error| format!("bench_decode stage failed: {error}"))?;
@@ -6732,47 +6740,93 @@ fn redline_bench_decode_lfm2moe(
                 "tok_s": iterations as f64 / elapsed.max(f64::MIN_POSITIVE),
             });
             response["redline_capture"] = redline_capture_json(gpu, summary, capture_detail);
-            if product_route {
-                // Product route not used with capture; still handled for completeness.
-                let prepared = gpu.replay.prepared_route_identity().map(|identity| {
-                    serde_json::json!({
-                        "dispatches": identity.dispatch_count,
-                        "packets": identity.packet_count,
-                        "queue_id": identity.queue_id,
-                        "command_dwords": identity.command_dwords,
-                        "queues": identity.queue_count,
-                        "phases": identity.phase_count,
-                    })
-                });
-                let sequence = gpu.replay.capture_summary();
-                response["redline_route"] = serde_json::json!({
-                    "requested_backend": format!("{:?}", gpu.replay.request()).to_ascii_lowercase(),
-                    "transport": gpu.replay.transport_name(),
-                    "state": format!("{:?}", gpu.replay.state()).to_ascii_lowercase(),
-                    "fallback_reason": gpu.replay.fallback_reason(),
-                    "execution_mode": "plain_ar",
-                    "prepared": prepared,
-                    "sequence": {
-                        "launches": sequence.launch_count,
-                        "unique_kernels": sequence.unique_kernel_count,
-                        "hash": format!("{:016x}", sequence.sequence_hash),
-                    },
-                    "observed": {
-                        "count_before": 0,
-                        "count_after": 0,
-                        "count_delta": 0,
-                        "first_position": null,
-                        "last_position": null,
-                    },
-                    "retained_replay_observed": false,
-                });
+            Ok(response)
+        } else if product_route {
+            // Production timed arm: call production decode_step so retained
+            // replay selection and host n_tokens commit happen in-runtime.
+            // Route proof is observation-only — never the requested backend.
+            gpu.replay.begin_replay_observation_window();
+            let replay_before = gpu.replay.replay_observation();
+            gpu.hip
+                .device_synchronize()
+                .map_err(|error| error.to_string())?;
+            let started = Instant::now();
+            for i in 0..iterations {
+                let token = 101 + (i as u32 % 1000);
+                let pos = (context + i) as u32;
+                {
+                    let bundle = match loaded.state.as_mut() {
+                        Some(ModelState::Lfm2Moe(bundle)) => bundle,
+                        _ => unreachable!(),
+                    };
+                    lfm2moe::forward::decode_step(
+                        &bundle.config,
+                        &bundle.weights,
+                        &mut bundle.state,
+                        gpu,
+                        token,
+                        pos,
+                    )
+                    .map_err(|error| format!("bench_decode forward failed: {error}"))?;
+                }
+                loaded.seq_pos = context + i + 1;
             }
+            gpu.hip
+                .device_synchronize()
+                .map_err(|error| error.to_string())?;
+            let elapsed = started.elapsed().as_secs_f64();
+            let replay_after = gpu.replay.replay_observation();
+            loaded.seq_pos = 0;
+            loaded.conversation_tokens.clear();
+            let bundle = match loaded.state.as_mut() {
+                Some(ModelState::Lfm2Moe(bundle)) => bundle,
+                _ => unreachable!(),
+            };
+            redline_reset_lfm2moe(gpu, bundle)?;
+            let mut response = serde_json::json!({
+                "type": "decode_result",
+                "context_tokens": context,
+                "iterations": iterations,
+                "ms": elapsed * 1000.0,
+                "us_per_token": elapsed * 1_000_000.0 / iterations as f64,
+                "tok_s": iterations as f64 / elapsed.max(f64::MIN_POSITIVE),
+            });
+            let prepared = gpu.replay.prepared_route_identity().map(|identity| {
+                serde_json::json!({
+                    "dispatches": identity.dispatch_count,
+                    "packets": identity.packet_count,
+                    "queue_id": identity.queue_id,
+                    "command_dwords": identity.command_dwords,
+                    "queues": identity.queue_count,
+                    "phases": identity.phase_count,
+                })
+            });
+            let sequence = gpu.replay.capture_summary();
+            let replay_delta = replay_after.count.saturating_sub(replay_before.count);
+            response["redline_route"] = serde_json::json!({
+                "requested_backend": format!("{:?}", gpu.replay.request()).to_ascii_lowercase(),
+                "transport": gpu.replay.transport_name(),
+                "state": format!("{:?}", gpu.replay.state()).to_ascii_lowercase(),
+                "fallback_reason": gpu.replay.fallback_reason(),
+                "execution_mode": "plain_ar",
+                "prepared": prepared,
+                "sequence": {
+                    "launches": sequence.launch_count,
+                    "unique_kernels": sequence.unique_kernel_count,
+                    "hash": format!("{:016x}", sequence.sequence_hash),
+                },
+                "observed": {
+                    "count_before": replay_before.count,
+                    "count_after": replay_after.count,
+                    "count_delta": replay_delta,
+                    "first_position": replay_after.first_position,
+                    "last_position": replay_after.last_position,
+                },
+                "retained_replay_observed": replay_delta > 0,
+            });
             Ok(response)
         } else {
-            if product_route {
-                gpu.replay.begin_replay_observation_window();
-            }
-            let replay_before = gpu.replay.replay_observation();
+            // Manual oracle timing path: stage outside, body only (no product decode_step).
             gpu.hip
                 .device_synchronize()
                 .map_err(|error| error.to_string())?;
@@ -6795,12 +6849,12 @@ fn redline_bench_decode_lfm2moe(
                     )
                     .map_err(|error| format!("bench_decode forward failed: {error}"))?;
                 }
+                loaded.seq_pos = context + i + 1;
             }
             gpu.hip
                 .device_synchronize()
                 .map_err(|error| error.to_string())?;
             let elapsed = started.elapsed().as_secs_f64();
-            let replay_after = gpu.replay.replay_observation();
             loaded.seq_pos = 0;
             loaded.conversation_tokens.clear();
             let bundle = match loaded.state.as_mut() {
@@ -6808,51 +6862,14 @@ fn redline_bench_decode_lfm2moe(
                 _ => unreachable!(),
             };
             redline_reset_lfm2moe(gpu, bundle)?;
-            let mut response = serde_json::json!({
+            Ok(serde_json::json!({
                 "type": "decode_result",
                 "context_tokens": context,
                 "iterations": iterations,
                 "ms": elapsed * 1000.0,
                 "us_per_token": elapsed * 1_000_000.0 / iterations as f64,
                 "tok_s": iterations as f64 / elapsed.max(f64::MIN_POSITIVE),
-            });
-            // No capture in this branch.
-            if product_route {
-                let prepared = gpu.replay.prepared_route_identity().map(|identity| {
-                    serde_json::json!({
-                        "dispatches": identity.dispatch_count,
-                        "packets": identity.packet_count,
-                        "queue_id": identity.queue_id,
-                        "command_dwords": identity.command_dwords,
-                        "queues": identity.queue_count,
-                        "phases": identity.phase_count,
-                    })
-                });
-                let sequence = gpu.replay.capture_summary();
-                let replay_delta = replay_after.count.saturating_sub(replay_before.count);
-                response["redline_route"] = serde_json::json!({
-                    "requested_backend": format!("{:?}", gpu.replay.request()).to_ascii_lowercase(),
-                    "transport": gpu.replay.transport_name(),
-                    "state": format!("{:?}", gpu.replay.state()).to_ascii_lowercase(),
-                    "fallback_reason": gpu.replay.fallback_reason(),
-                    "execution_mode": "plain_ar",
-                    "prepared": prepared,
-                    "sequence": {
-                        "launches": sequence.launch_count,
-                        "unique_kernels": sequence.unique_kernel_count,
-                        "hash": format!("{:016x}", sequence.sequence_hash),
-                    },
-                    "observed": {
-                        "count_before": replay_before.count,
-                        "count_after": replay_after.count,
-                        "count_delta": replay_delta,
-                        "first_position": replay_after.first_position,
-                        "last_position": replay_after.last_position,
-                    },
-                    "retained_replay_observed": replay_delta > 0,
-                });
-            }
-            Ok(response)
+            }))
         }
     })();
     match inner {
@@ -7088,12 +7105,22 @@ fn redline_shadow_deepseek4(
             }))
         })();
         match inner {
-            Ok(value) => Ok(value),
+            Ok(value) => {
+                rdna_compute::norm::restore_gdn_requant_frame_checkpoint(frame_checkpoint);
+                if let Some(ModelState::Lfm2Moe(bundle)) = loaded.state.as_mut() {
+                    let _ = redline_reset_lfm2moe(gpu, bundle);
+                    loaded.seq_pos = 0;
+                    loaded.conversation_tokens.clear();
+                    let _ = gpu.hip.device_synchronize();
+                }
+                Ok(value)
+            }
             Err(error) => {
                 rdna_compute::norm::restore_gdn_requant_frame_checkpoint(frame_checkpoint);
                 if let Some(ModelState::Lfm2Moe(bundle)) = loaded.state.as_mut() {
                     let _ = redline_reset_lfm2moe(gpu, bundle);
                     loaded.seq_pos = 0;
+                    loaded.conversation_tokens.clear();
                     let _ = gpu.hip.device_synchronize();
                 }
                 Err(error)
@@ -15478,6 +15505,11 @@ fn main() {
                         } else {
                             unsafe { gpu.replay.replay_linear_aql(context) }?;
                         }
+                        // Commit host n_tokens only after successful replay body.
+                        if let Some(ModelState::Lfm2Moe(bundle)) = loaded.state.as_mut() {
+                            bundle.state.n_tokens = context + 1;
+                            loaded.seq_pos = context + 1;
+                        }
                         gpu.hip
                             .device_synchronize()
                             .map_err(|error| error.to_string())?;
@@ -15518,6 +15550,11 @@ fn main() {
                         let replay_started = Instant::now();
                         gpu.replay_recorded_hip_prefix(prefix)
                             .map_err(|error| error.to_string())?;
+                        // Commit host n_tokens only after successful blob body.
+                        if let Some(ModelState::Lfm2Moe(bundle)) = loaded.state.as_mut() {
+                            bundle.state.n_tokens = context + 1;
+                            loaded.seq_pos = context + 1;
+                        }
                         gpu.hip
                             .device_synchronize()
                             .map_err(|error| error.to_string())?;
@@ -15580,6 +15617,14 @@ fn main() {
                             "hip": hip_snapshot.json(),
                         })
                     );
+                    if let Some(loaded) = model.as_mut() {
+                        if let Some(ModelState::Lfm2Moe(bundle)) = loaded.state.as_mut() {
+                            let _ = redline_reset_lfm2moe(&mut gpu, bundle);
+                            loaded.seq_pos = 0;
+                            loaded.conversation_tokens.clear();
+                            let _ = gpu.hip.device_synchronize();
+                        }
+                    }
                     let _ = stdout.flush();
                     continue;
                 }

@@ -1310,6 +1310,13 @@ pub struct Lfm2MoeState {
     /// decode runs direct (so kernel JIT / lazy alloc happen outside any
     /// stream capture). Unused when the graph path is disabled.
     pub graph_warmed_up: bool,
+    /// Retained replay warmup latch: false until the first dense decode runs
+    /// direct (allocation/JIT outside capture). Survives `reset()` — warmup
+    /// describes allocation/JIT, not sequence state.
+    pub retained_warmed_up: bool,
+    /// Fail-closed poison: true after a retained replay error until a full
+    /// KV+conv reset clears it. Any `decode_step` must reject while poisoned.
+    pub retained_state_poisoned: bool,
     pub max_seq: usize,
     pub n_tokens: usize,
 
@@ -1420,6 +1427,8 @@ impl Lfm2MoeState {
             conv_states,
             pos_buf,
             graph_warmed_up: false,
+            retained_warmed_up: false,
+            retained_state_poisoned: false,
             max_seq,
             n_tokens: 0,
             h: alloc(gpu, hidden, "h")?,
@@ -1448,7 +1457,9 @@ impl Lfm2MoeState {
     }
 
     /// Reset for a new sequence: clear KV + conv state and token count.
-    /// Preserves `graph_warmed_up`; no host allocations.
+    /// Preserves `graph_warmed_up` and `retained_warmed_up`; clears
+    /// `retained_state_poisoned` only after the full KV+conv reset so a
+    /// poisoned recurrent/KV cannot be reused. No host allocations.
     pub fn reset(&mut self, gpu: &mut Gpu) -> Result<(), String> {
         self.kv
             .clear_gpu(gpu)
@@ -1459,6 +1470,7 @@ impl Lfm2MoeState {
                 .map_err(|e| format!("lfm2moe: reset conv_state: {e:?}"))?;
         }
         self.n_tokens = 0;
+        self.retained_state_poisoned = false;
         Ok(())
     }
 
