@@ -2311,6 +2311,12 @@ fn required_mid_acquire(previous: &str, current: &str) -> bool {
     if previous == "fused_silu_mul_mq_rotate" && current.starts_with("gemv_hfq4g256_residual") {
         return true;
     }
+    // LFM's rotated projection buffer is consumed immediately by GEMV. A
+    // compute-idle wait orders execution, but gfx12 needs a vector-cache
+    // acquire before the consumer reads mq_rotate_x output.
+    if previous == "mq_rotate_x" {
+        return true;
+    }
     matches!(
         previous,
         "repeat_interleave_qk_f32" | "rope_partial_halfsplit_f32"
@@ -3377,11 +3383,14 @@ impl ReplayController {
                 launch.kernel.as_str(),
                 "fused_silu_mul_mq_rotate" | "mq_rotate_x" | "rope_partial_halfsplit_f32"
             ) {
-                headers[index] = if launch.kernel == "mq_rotate_x" {
-                    HeaderPolicy::BATCH_INTERNAL_RELEASE_SYSTEM
+                if launch.kernel == "mq_rotate_x" {
+                    headers[index] = HeaderPolicy::BATCH_INTERNAL_RELEASE_SYSTEM;
+                    if index + 1 < headers.len() {
+                        headers[index + 1] = HeaderPolicy::BATCH_INTERNAL_ACQUIRE_SYSTEM;
+                    }
                 } else {
-                    HeaderPolicy::RECORDED_DISPATCH
-                };
+                    headers[index] = HeaderPolicy::RECORDED_DISPATCH;
+                }
             }
         }
         for index in 1..headers.len() {
@@ -5214,6 +5223,8 @@ mod tests {
         assert!(
             !Pm4MidAcquirePolicy::WithoutMqRotate.acquire_between("mq_rotate_x", "gemv_hfq4g256")
         );
+        assert!(Pm4MidAcquirePolicy::RequiredOnly
+            .acquire_between("mq_rotate_x", "gemv_hfq4g256_multirow_r2"));
         assert!(Pm4MidAcquirePolicy::RequiredOnly
             .acquire_between("rmsnorm_f32", "rope_partial_halfsplit_f32"));
         assert!(Pm4MidAcquirePolicy::RequiredOnly

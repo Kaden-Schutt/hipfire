@@ -7006,6 +7006,12 @@ fn redline_shadow_deepseek4(
             let mut gpu_us = 0.0;
             for index in 0..iterations {
                 redline_prepare_retained_fixture(gpu, loaded, 101 + index as u32, context + index)?;
+                // Input staging runs on the HIP stream, while retained AQL/PM4
+                // executes on a ROCr queue. Complete the producer handoff
+                // before the replay queue reads h and pos_buf.
+                gpu.hip
+                    .device_synchronize()
+                    .map_err(|error| error.to_string())?;
                 if pm4 {
                     let timing = unsafe { gpu.replay.replay_pm4(context + index) }?;
                     if let Some(ModelState::Lfm2Moe(bundle)) = loaded.state.as_mut() {
@@ -15427,6 +15433,157 @@ fn main() {
                     .get("pm4")
                     .and_then(|value| value.as_bool())
                     .unwrap_or(false);
+                if model.as_ref().is_some_and(redline_is_dense_lfm) {
+                    let prepared = match if pm4 {
+                        gpu.replay
+                            .prepare_pm4_prefix(gpu.device_id as usize, prefix)
+                            .map(|(dispatches, dwords, queue)| (dispatches, 1, queue, Some(dwords)))
+                    } else {
+                        gpu.replay
+                            .prepare_linear_aql_prefix(gpu.device_id as usize, prefix)
+                            .map(|(dispatches, packets, queue)| (dispatches, packets, queue, None))
+                    } {
+                        Ok(summary) => summary,
+                        Err(reason) => {
+                            if let Some(loaded) = model.as_mut() {
+                                if let Some(ModelState::Lfm2Moe(bundle)) = loaded.state.as_mut() {
+                                    let _ = redline_reset_lfm2moe(&mut gpu, bundle);
+                                    loaded.seq_pos = 0;
+                                    let _ = gpu.hip.device_synchronize();
+                                }
+                            }
+                            emit_uncorrelated_error(
+                                &mut stdout,
+                                None,
+                                &reason,
+                                "internal",
+                                false,
+                                false,
+                            );
+                            let _ = stdout.flush();
+                            continue;
+                        }
+                    };
+                    let aql_arm = (|| -> Result<_, String> {
+                        let loaded = model.as_mut().unwrap();
+                        redline_prime_retained_fixture(&mut gpu, loaded, context)?;
+                        redline_prepare_retained_fixture(&mut gpu, loaded, 101, context)?;
+                        gpu.hip
+                            .device_synchronize()
+                            .map_err(|error| error.to_string())?;
+                        let initial = redline_snapshot(&gpu, loaded)?;
+                        let replay_started = Instant::now();
+                        if pm4 {
+                            unsafe { gpu.replay.replay_pm4(context) }?;
+                        } else {
+                            unsafe { gpu.replay.replay_linear_aql(context) }?;
+                        }
+                        gpu.hip
+                            .device_synchronize()
+                            .map_err(|error| error.to_string())?;
+                        let direct_host_us = replay_started.elapsed().as_secs_f64() * 1e6;
+                        let snapshot = redline_snapshot(&gpu, loaded)?;
+                        Ok((initial, snapshot, direct_host_us))
+                    })();
+                    let (aql_initial, aql_snapshot, direct_host_us) = match aql_arm {
+                        Ok(result) => result,
+                        Err(reason) => {
+                            if let Some(loaded) = model.as_mut() {
+                                if let Some(ModelState::Lfm2Moe(bundle)) = loaded.state.as_mut() {
+                                    let _ = redline_reset_lfm2moe(&mut gpu, bundle);
+                                    loaded.seq_pos = 0;
+                                    let _ = gpu.hip.device_synchronize();
+                                }
+                            }
+                            emit_uncorrelated_error(
+                                &mut stdout,
+                                None,
+                                &format!("AQL prefix failed: {reason}"),
+                                "internal",
+                                false,
+                                false,
+                            );
+                            let _ = stdout.flush();
+                            continue;
+                        }
+                    };
+                    let hip_arm = (|| -> Result<_, String> {
+                        let loaded = model.as_mut().unwrap();
+                        redline_prime_retained_fixture(&mut gpu, loaded, context)?;
+                        redline_prepare_retained_fixture(&mut gpu, loaded, 101, context)?;
+                        gpu.hip
+                            .device_synchronize()
+                            .map_err(|error| error.to_string())?;
+                        let initial = redline_snapshot(&gpu, loaded)?;
+                        let replay_started = Instant::now();
+                        gpu.replay_recorded_hip_prefix(prefix)
+                            .map_err(|error| error.to_string())?;
+                        gpu.hip
+                            .device_synchronize()
+                            .map_err(|error| error.to_string())?;
+                        let hip_host_us = replay_started.elapsed().as_secs_f64() * 1e6;
+                        let snapshot = redline_snapshot(&gpu, loaded)?;
+                        Ok((initial, snapshot, hip_host_us))
+                    })();
+                    let (hip_initial, hip_snapshot, hip_host_us) = match hip_arm {
+                        Ok(result) => result,
+                        Err(reason) => {
+                            if let Some(loaded) = model.as_mut() {
+                                if let Some(ModelState::Lfm2Moe(bundle)) = loaded.state.as_mut() {
+                                    let _ = redline_reset_lfm2moe(&mut gpu, bundle);
+                                    loaded.seq_pos = 0;
+                                    let _ = gpu.hip.device_synchronize();
+                                }
+                            }
+                            emit_uncorrelated_error(
+                                &mut stdout,
+                                None,
+                                &format!("HIP prefix failed: {reason}"),
+                                "internal",
+                                false,
+                                false,
+                            );
+                            let _ = stdout.flush();
+                            continue;
+                        }
+                    };
+                    let mut differing = Vec::new();
+                    if aql_snapshot.logits() != hip_snapshot.logits() {
+                        differing.push("logits");
+                    }
+                    if aql_snapshot.kv() != hip_snapshot.kv() {
+                        differing.push("kv");
+                    }
+                    if aql_snapshot.recurrent() != hip_snapshot.recurrent() {
+                        differing.push("recurrent");
+                    }
+                    let initial_equal = aql_initial.logits() == hip_initial.logits()
+                        && aql_initial.kv() == hip_initial.kv()
+                        && aql_initial.recurrent() == hip_initial.recurrent();
+                    let _ = writeln!(
+                        stdout,
+                        "{}",
+                        serde_json::json!({
+                            "type": "redline_prefix_result",
+                            "prefix": prefix,
+                            "backend": if pm4 { "pm4_ib" } else { "aql_packets" },
+                            "dispatches": prepared.0,
+                            "packets": prepared.1,
+                            "queue_id": prepared.2,
+                            "command_dwords": prepared.3,
+                            "direct_host_us": direct_host_us,
+                            "hip_host_us": hip_host_us,
+                            "equal": differing.is_empty(),
+                            "differing": differing,
+                            "initial_equal": initial_equal,
+                            "aql": aql_snapshot.json(),
+                            "hip": hip_snapshot.json(),
+                        })
+                    );
+                    let _ = stdout.flush();
+                    continue;
+                }
+
                 let eligible = model.as_ref().is_some_and(|loaded| {
                     loaded.pp == 1
                         && loaded.ep.is_none()
