@@ -2708,13 +2708,17 @@ impl Drop for AdmissionGuard {
     }
 }
 
-/// Conservative batch eligibility for independent Qwen3.5 decode.
+/// Conservative batch eligibility for independent continuous-batch decode.
 ///
-/// Eligible only for Qwen arch 5/6, single-GPU, stateless text with no
-/// tools/images/stops/spec/adaptive/prefix behavior. All others fall back to
-/// sequential. Check is intentionally strict and synchronous; model arch is
-/// taken from `current_arch` when available, otherwise inferred from the
-/// requested model name containing `qwen`.
+/// Eligible only for Qwen (arch 5/6) or dense LFM2 (`lfm` arch identity),
+/// single-GPU, stateless text with no tools/images/stops/spec/adaptive/prefix
+/// behavior. All others fall back to sequential. Check is intentionally strict
+/// and synchronous; model arch is taken from `current_arch` when available,
+/// otherwise inferred from the requested model name containing `qwen` or `lfm`.
+///
+/// Message-shape gate matches daemon admission: absent/empty `messages` are
+/// eligible; otherwise only exactly one `user` message with plain string
+/// content (no tool_calls, no multipart/array content).
 fn is_batch_eligible_request(
     body: &serde_json::Value,
     tp: Option<u64>,
@@ -2728,15 +2732,17 @@ fn is_batch_eligible_request(
     if tp.unwrap_or(1) != 1 {
         return false;
     }
-    // Qwen arch 5/6 only. Prefer runtime arch when known.
-    let is_qwen = if let Some(arch) = current_arch {
-        arch.contains("qwen")
+    // Qwen or LFM2 only. Prefer runtime arch when known.
+    let is_batch_arch = if let Some(arch) = current_arch {
+        let arch_l = arch.to_ascii_lowercase();
+        arch_l.contains("qwen") || arch_l.contains("lfm")
     } else if let Some(model) = body.get("model").and_then(|v| v.as_str()) {
-        model.to_ascii_lowercase().contains("qwen")
+        let model_l = model.to_ascii_lowercase();
+        model_l.contains("qwen") || model_l.contains("lfm")
     } else {
         false
     };
-    if !is_qwen {
+    if !is_batch_arch {
         return false;
     }
     // Stateless text: no tools, no images, no stops, no spec, no adaptive, no prefix.
@@ -2750,15 +2756,13 @@ fn is_batch_eligible_request(
     if body.get("tool_choice").is_some() {
         return false;
     }
-    // Images via messages containing image_url or explicit image_base64.
+    // Images via explicit image_base64.
     if body.get("image_base64").is_some() {
         return false;
     }
-    if let Some(messages) = body.get("messages") {
-        let serialized = messages.to_string();
-        if serialized.contains("image_url") {
-            return false;
-        }
+    // Message history must match daemon single-user plain-string shape.
+    if !batch_messages_are_single_user(body) {
+        return false;
     }
     if body.get("stop").is_some() {
         return false;
@@ -2778,6 +2782,44 @@ fn is_batch_eligible_request(
         }
     }
     true
+}
+
+/// HTTP/OpenAI `messages` are batch-eligible only when absent/empty (prompt
+/// path) or exactly one user turn with plain string content. Multi-turn,
+/// system/assistant/tool roles, tool_call payloads, and multipart/image
+/// content stay on the sequential route — same contract as the daemon.
+fn batch_messages_are_single_user(body: &serde_json::Value) -> bool {
+    let Some(messages) = body.get("messages") else {
+        return true;
+    };
+    let Some(arr) = messages.as_array() else {
+        return false;
+    };
+    if arr.is_empty() {
+        return true;
+    }
+    if arr.len() != 1 {
+        return false;
+    }
+    let m0 = &arr[0];
+    if m0.get("role").and_then(|v| v.as_str()) != Some("user") {
+        return false;
+    }
+    // Tool-call payloads on the sole message force sequential (batch v1 has
+    // no tools path). Empty / missing tool_calls is fine.
+    if let Some(tc) = m0.get("tool_calls") {
+        if tc.as_array().is_some_and(|a| !a.is_empty()) || tc.is_object() {
+            return false;
+        }
+    }
+    // Content must be a plain string (reject multipart/array/image parts).
+    match m0.get("content") {
+        Some(serde_json::Value::String(_)) => true,
+        // Missing content is not a plain user string turn.
+        None => false,
+        // Arrays (multipart/text+image), objects, numbers, bool, null.
+        Some(_) => false,
+    }
 }
 
 fn serve_command(paths: &Paths, mut args: ServeArgs) -> Result<()> {
@@ -10640,9 +10682,25 @@ mod tests {
 
     #[test]
     fn batch_eligibility_conservative_checks() {
-        // Eligible: single-GPU qwen with stateless text.
+        // Eligible: single-GPU qwen with one plain user string.
         let body =
             serde_json::json!({"model":"qwen3.5:7b","messages":[{"role":"user","content":"hi"}]});
+        assert!(is_batch_eligible_request(
+            &body,
+            Some(1),
+            Some("qwen35"),
+            true
+        ));
+        // Eligible: absent messages (prompt path) for Qwen.
+        let body = serde_json::json!({"model":"qwen3.5:7b","prompt":"hi"});
+        assert!(is_batch_eligible_request(
+            &body,
+            Some(1),
+            Some("qwen35"),
+            true
+        ));
+        // Eligible: empty messages array for Qwen.
+        let body = serde_json::json!({"model":"qwen3.5:7b","messages":[]});
         assert!(is_batch_eligible_request(
             &body,
             Some(1),
@@ -10657,8 +10715,50 @@ mod tests {
             Some("qwen35"),
             true
         ));
-        // Images disqualify.
+        // Image / multipart content disqualifies.
         let body = serde_json::json!({"model":"qwen3.5:7b","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:"}}]}]});
+        assert!(!is_batch_eligible_request(
+            &body,
+            Some(1),
+            Some("qwen35"),
+            true
+        ));
+        // Multipart text-only array content also disqualifies (must be plain string).
+        let body = serde_json::json!({"model":"qwen3.5:7b","messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]});
+        assert!(!is_batch_eligible_request(
+            &body,
+            Some(1),
+            Some("qwen35"),
+            true
+        ));
+        // system+user history disqualifies.
+        let body = serde_json::json!({"model":"qwen3.5:7b","messages":[
+            {"role":"system","content":"be brief"},
+            {"role":"user","content":"hi"}
+        ]});
+        assert!(!is_batch_eligible_request(
+            &body,
+            Some(1),
+            Some("qwen35"),
+            true
+        ));
+        // user+assistant multi-turn disqualifies.
+        let body = serde_json::json!({"model":"qwen3.5:7b","messages":[
+            {"role":"user","content":"hi"},
+            {"role":"assistant","content":"hello"}
+        ]});
+        assert!(!is_batch_eligible_request(
+            &body,
+            Some(1),
+            Some("qwen35"),
+            true
+        ));
+        // Tool-call content on the sole message disqualifies.
+        let body = serde_json::json!({"model":"qwen3.5:7b","messages":[{
+            "role":"user",
+            "content":"hi",
+            "tool_calls":[{"id":"c0","type":"function","function":{"name":"x","arguments":"{}"}}]
+        }]});
         assert!(!is_batch_eligible_request(
             &body,
             Some(1),
@@ -10690,6 +10790,136 @@ mod tests {
             Some("qwen35"),
             false
         ));
+        // Eligible: single-GPU LFM2 dense with one plain user string when daemon admits batch.
+        let body =
+            serde_json::json!({"model":"lfm2.5:1.2b","messages":[{"role":"user","content":"hi"}]});
+        assert!(is_batch_eligible_request(
+            &body,
+            Some(1),
+            Some("lfm2"),
+            true
+        ));
+        // Eligible: absent messages for LFM.
+        let body = serde_json::json!({"model":"lfm2.5:1.2b","prompt":"hi"});
+        assert!(is_batch_eligible_request(
+            &body,
+            Some(1),
+            Some("lfm2"),
+            true
+        ));
+        // Eligible: empty messages for LFM.
+        let body = serde_json::json!({"model":"lfm2.5:1.2b","messages":[]});
+        assert!(is_batch_eligible_request(
+            &body,
+            Some(1),
+            Some("lfm2"),
+            true
+        ));
+        // LFM rejects system+user the same way.
+        let body = serde_json::json!({"model":"lfm2.5:1.2b","messages":[
+            {"role":"system","content":"be brief"},
+            {"role":"user","content":"hi"}
+        ]});
+        assert!(!is_batch_eligible_request(
+            &body,
+            Some(1),
+            Some("lfm2"),
+            true
+        ));
+        // LFM rejects user+assistant.
+        let body = serde_json::json!({"model":"lfm2.5:1.2b","messages":[
+            {"role":"user","content":"hi"},
+            {"role":"assistant","content":"hello"}
+        ]});
+        assert!(!is_batch_eligible_request(
+            &body,
+            Some(1),
+            Some("lfm2"),
+            true
+        ));
+        // LFM rejects tool-call content.
+        let body = serde_json::json!({"model":"lfm2.5:1.2b","messages":[{
+            "role":"user",
+            "content":"hi",
+            "tool_calls":[{"id":"c0","type":"function","function":{"name":"x","arguments":"{}"}}]
+        }]});
+        assert!(!is_batch_eligible_request(
+            &body,
+            Some(1),
+            Some("lfm2"),
+            true
+        ));
+        // LFM rejects image/multipart content.
+        let body = serde_json::json!({"model":"lfm2.5:1.2b","messages":[{"role":"user","content":[
+            {"type":"text","text":"describe"},
+            {"type":"image_url","image_url":{"url":"data:image/png;base64,YWJj"}}
+        ]}]});
+        assert!(!is_batch_eligible_request(
+            &body,
+            Some(1),
+            Some("lfm2"),
+            true
+        ));
+        // Daemon load says batch incapable: LFM HTTP admission must not invent it.
+        let body =
+            serde_json::json!({"model":"lfm2.5:1.2b","messages":[{"role":"user","content":"hi"}]});
+        assert!(!is_batch_eligible_request(
+            &body,
+            Some(1),
+            Some("lfm2"),
+            false
+        ));
+    }
+
+    #[test]
+    fn batch_messages_shape_matches_daemon_contract() {
+        // Absent / empty → eligible shape.
+        assert!(batch_messages_are_single_user(&serde_json::json!({})));
+        assert!(batch_messages_are_single_user(
+            &serde_json::json!({"messages":[]})
+        ));
+        // Exactly one plain user string → eligible.
+        assert!(batch_messages_are_single_user(&serde_json::json!({
+            "messages":[{"role":"user","content":"hi"}]
+        })));
+        // system+user, user+assistant → reject.
+        assert!(!batch_messages_are_single_user(&serde_json::json!({
+            "messages":[
+                {"role":"system","content":"sys"},
+                {"role":"user","content":"hi"}
+            ]
+        })));
+        assert!(!batch_messages_are_single_user(&serde_json::json!({
+            "messages":[
+                {"role":"user","content":"hi"},
+                {"role":"assistant","content":"yo"}
+            ]
+        })));
+        // Non-user sole role → reject.
+        assert!(!batch_messages_are_single_user(&serde_json::json!({
+            "messages":[{"role":"system","content":"sys"}]
+        })));
+        // tool_calls payload → reject.
+        assert!(!batch_messages_are_single_user(&serde_json::json!({
+            "messages":[{
+                "role":"user",
+                "content":"hi",
+                "tool_calls":[{"id":"c0"}]
+            }]
+        })));
+        // Multipart / image array content → reject.
+        assert!(!batch_messages_are_single_user(&serde_json::json!({
+            "messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]
+        })));
+        assert!(!batch_messages_are_single_user(&serde_json::json!({
+            "messages":[{"role":"user","content":[
+                {"type":"image_url","image_url":{"url":"data:"}}
+            ]}]
+        })));
+        // Non-array messages → reject.
+        assert!(!batch_messages_are_single_user(&serde_json::json!({
+            "messages":"not-an-array"
+        })));
     }
 
     #[test]

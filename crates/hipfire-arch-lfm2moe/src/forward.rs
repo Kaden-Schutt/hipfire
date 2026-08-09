@@ -102,9 +102,16 @@ fn decode_step_inner(
         .memcpy_htod(&state.pos_buf, &(position as i32).to_ne_bytes())
         .map_err(|e| format!("lfm2moe: htod pos: {e:?}"))?;
 
-    // Embedding lookup → residual stream h (Q8 table).
-    gpu.embedding_lookup_q8(&weights.embed, &state.h, token_id, hidden)
-        .map_err(|e| format!("lfm2moe: embed lookup: {e:?}"))?;
+    // Embedding lookup → residual stream h (dispatch on embedding format).
+    hipfire_runtime::llama::embedding_lookup_dispatch(
+        gpu,
+        weights.embd_format,
+        &weights.embed,
+        &state.h,
+        token_id,
+        hidden,
+    )
+    .map_err(|e| format!("lfm2moe: embed lookup: {e:?}"))?;
 
     decode_step_layers_and_head(cfg, weights, state, gpu, position, capture)
 }
@@ -981,9 +988,15 @@ pub fn decode_step_with_graph(
         .memcpy_htod(&state.pos_buf, &(position as i32).to_ne_bytes())
         .map_err(|e| format!("lfm2moe: htod pos (graph): {e:?}"))?;
     // embedding lookup: token_id is a kernarg → must run per-token, not captured.
-    gpu.embedding_lookup_q8(&weights.embed, &state.h, token_id, hidden)
-        .map_err(|e| format!("lfm2moe: embed lookup (graph): {e:?}"))?;
-
+    hipfire_runtime::llama::embedding_lookup_dispatch(
+        gpu,
+        weights.embd_format,
+        &weights.embed,
+        &state.h,
+        token_id,
+        hidden,
+    )
+    .map_err(|e| format!("lfm2moe: embed lookup (graph): {e:?}"))?;
     if gpu.graphs.graph_exec.is_none() {
         // ── Capture phase ──────────────────────────────────────────────────
         gpu.graphs

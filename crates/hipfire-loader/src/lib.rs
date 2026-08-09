@@ -304,6 +304,7 @@ pub struct LoadedModel {
     // Shared arch state
     pub state: Option<ModelState>,
     pub qwen35_decode_batch: Option<hipfire_arch_qwen35::qwen35::Qwen35DecodeBatchState>,
+    pub lfm2_decode_batch: Option<hipfire_arch_lfm2moe::batch::Lfm2DecodeBatchState>,
     pub kv_cache: Option<llama::KvCache>,
     pub dn_state: Option<DeltaNetState>,
     // Reusable Qwen2 recurrent state (used by dots_ocr and Qwen2 non-core falcon)
@@ -401,6 +402,7 @@ impl LoadedModel {
             pp_dn_la_to_device: None,
             state: None,
             qwen35_decode_batch: None,
+            lfm2_decode_batch: None,
             kv_cache: None,
             dn_state: None,
             qwen2_state: None,
@@ -2076,6 +2078,12 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(
             dev.drain_pool();
         }
         let _ = gpus.free_tp_graph_signals();
+        if let Some(batch_state) = m.lfm2_decode_batch.take() {
+            // Single-GPU dense LFM batch is not expected on EP, but free it on
+            // the provided single gpu before multi-device teardown to avoid
+            // leaking if staging ever leaves residual state.
+            batch_state.free_gpu(gpu);
+        }
         let _ = gpu;
         return Ok(());
         // `gpus` drops here, tearing down comms + devices.
@@ -2083,6 +2091,12 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(
     if m.pp > 1 {
         let mut gpus = m.pp_gpus.expect("pp>1 must carry pp_gpus");
         if let Some(batch_state) = m.qwen35_decode_batch.take() {
+            // Single-GPU batch state is not expected for pp>1, but free it on
+            // the provided single gpu before multi-device teardown to avoid
+            // leaking if a test ever stages it.
+            batch_state.free_gpu(gpu);
+        }
+        if let Some(batch_state) = m.lfm2_decode_batch.take() {
             // Single-GPU batch state is not expected for pp>1, but free it on
             // the provided single gpu before multi-device teardown to avoid
             // leaking if a test ever stages it.
@@ -2154,6 +2168,9 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(
         snap.free_gpu(gpu);
     }
     if let Some(batch_state) = m.qwen35_decode_batch.take() {
+        batch_state.free_gpu(gpu);
+    }
+    if let Some(batch_state) = m.lfm2_decode_batch.take() {
         batch_state.free_gpu(gpu);
     }
     // Free arch-specific GPU state from the carrier bundle
