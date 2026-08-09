@@ -465,6 +465,244 @@ def _is_attractor(text: str) -> bool:
     return False
 
 
+
+# ---------------------------------------------------------------------------
+# TP / device selector + batch receipt validation
+# ---------------------------------------------------------------------------
+
+TP_ALLOWED = (1, 4)
+TP4_DEFAULT_DEVICES = "0,1,2,3"
+
+
+def _parse_device_selector(device: str) -> List[str]:
+    """Split a HIP_VISIBLE_DEVICES-style selector into non-empty tokens."""
+    return [p.strip() for p in str(device).split(",") if p.strip()]
+
+
+def _parse_device_indices(device: str) -> List[int]:
+    """Parse comma-separated nonnegative device indices; raise ValueError on bad input."""
+    parts = _parse_device_selector(device)
+    if not parts:
+        raise ValueError(f"empty device selector: {device!r}")
+    indices: List[int] = []
+    for p in parts:
+        if not p.isdigit():
+            raise ValueError(
+                f"device selector entries must be nonnegative integers; got {p!r} in {device!r}"
+            )
+        indices.append(int(p))
+    return indices
+
+
+def _validate_tp_device_selector(tp: int, device: str) -> Optional[str]:
+    """Fail closed when --device does not match the --tp contract.
+
+    tp=1: exactly one nonnegative index.
+    tp=4: exactly four distinct nonnegative indices.
+    Returns an error string, or None when the selector is admissible.
+    """
+    try:
+        indices = _parse_device_indices(device)
+    except ValueError as e:
+        return str(e)
+    if tp == 1:
+        if len(indices) != 1:
+            return (
+                f"--tp 1 requires a single-device --device selector; "
+                f"got {len(indices)} device(s): {device!r}"
+            )
+        return None
+    if tp == 4:
+        if len(indices) != 4:
+            return (
+                f"--tp 4 requires a four-device --device selector "
+                f"(default {TP4_DEFAULT_DEVICES!r}); got {len(indices)} device(s): {device!r}"
+            )
+        if len(set(indices)) != 4:
+            return (
+                f"--tp 4 requires four distinct devices in --device; "
+                f"got duplicates in {device!r}"
+            )
+        return None
+    return f"--tp must be one of {TP_ALLOWED}; got {tp}"
+
+
+def _any_selected_device_occupied(device: str) -> Optional[str]:
+    """Occupancy preflight over every selected physical GPU.
+
+    Returns the first occupied device id as a string, or None if none are
+    known-occupied (or no reliable monitor exists).
+    """
+    parts = _parse_device_selector(device)
+    if not parts:
+        parts = ["0"]
+    for part in parts:
+        if _is_device_occupied(part):
+            return part
+    return None
+
+
+def _validate_hipfire_batch_receipt(
+    hip: Any,
+    *,
+    batch_size: int,
+    tp: int,
+    run_idx: int,
+    req_idx: Any,
+) -> List[str]:
+    """Validate hipfire runtime receipt against B/tp continuous-batch contract.
+
+    Source-grounded on daemon attach_continuous_batch_route_evidence /
+    attach_qwen_ep_batch_receipt_evidence:
+      B>1 -> execution_mode continuous_batch_independent + executed/slots/refill/lane*
+      tp=4 -> continuous_batch.parallelism=expert_parallel, rank_count=4,
+             reduce=peer_rooted_f32 (never inferred from load logs)
+      tp=1 -> must not claim expert_parallel
+      B=1 -> must not claim batch execution
+    """
+    errors: List[str] = []
+    prefix = f"run {run_idx} req {req_idx}"
+
+    if batch_size > 1:
+        if not isinstance(hip, dict):
+            errors.append(f"{prefix}: missing hipfire evidence for B>1")
+            return errors
+
+        em = hip.get("execution_mode")
+        if em != "continuous_batch_independent":
+            errors.append(
+                f"{prefix}: hipfire.execution_mode {em!r} != 'continuous_batch_independent'"
+            )
+
+        cb = hip.get("continuous_batch")
+        if not isinstance(cb, dict):
+            errors.append(f"{prefix}: missing continuous_batch object")
+            return errors
+
+        if cb.get("executed") is not True:
+            errors.append(f"{prefix}: continuous_batch.executed != true")
+        if cb.get("slots") != batch_size:
+            errors.append(
+                f"{prefix}: continuous_batch.slots {cb.get('slots')} != {batch_size}"
+            )
+        if cb.get("refill") != "continuous":
+            errors.append(
+                f"{prefix}: continuous_batch.refill {cb.get('refill')!r} != 'continuous'"
+            )
+        for field in ("lane", "lane_capacity", "max_active_lanes"):
+            if field not in cb:
+                errors.append(f"{prefix}: continuous_batch.{field} missing")
+
+        if tp == 4:
+            # Fail-closed EP receipt: expert_parallel / rank_count=4 / peer_rooted_f32.
+            if cb.get("parallelism") != "expert_parallel":
+                errors.append(
+                    f"{prefix}: continuous_batch.parallelism "
+                    f"{cb.get('parallelism')!r} != 'expert_parallel' (tp=4)"
+                )
+            if cb.get("rank_count") != 4:
+                errors.append(
+                    f"{prefix}: continuous_batch.rank_count "
+                    f"{cb.get('rank_count')!r} != 4"
+                )
+            if cb.get("reduce") != "peer_rooted_f32":
+                errors.append(
+                    f"{prefix}: continuous_batch.reduce "
+                    f"{cb.get('reduce')!r} != 'peer_rooted_f32'"
+                )
+        else:
+            # Single-GPU receipts must not claim expert_parallel.
+            if cb.get("parallelism") == "expert_parallel":
+                errors.append(
+                    f"{prefix}: continuous_batch.parallelism 'expert_parallel' "
+                    f"forbidden for tp={tp}"
+                )
+            if hip.get("parallelism") == "expert_parallel":
+                errors.append(
+                    f"{prefix}: hipfire.parallelism 'expert_parallel' forbidden for tp={tp}"
+                )
+    else:
+        # B == 1: honest sequential control — no false batch attestation.
+        if isinstance(hip, dict):
+            em = hip.get("execution_mode")
+            if em == "continuous_batch_independent":
+                errors.append(
+                    f"{prefix}: false batch attestation execution_mode "
+                    f"continuous_batch_independent for B=1"
+                )
+            cb = hip.get("continuous_batch")
+            if isinstance(cb, dict) and cb.get("executed") is True:
+                errors.append(
+                    f"{prefix}: false batch attestation continuous_batch.executed "
+                    f"true for B=1"
+                )
+            if tp == 1:
+                if hip.get("parallelism") == "expert_parallel":
+                    errors.append(
+                        f"{prefix}: hipfire.parallelism 'expert_parallel' "
+                        f"forbidden for tp=1"
+                    )
+                if isinstance(cb, dict) and cb.get("parallelism") == "expert_parallel":
+                    errors.append(
+                        f"{prefix}: continuous_batch.parallelism 'expert_parallel' "
+                        f"forbidden for tp=1"
+                    )
+
+    return errors
+
+
+def _build_serve_cmd(
+    cli_abs: str,
+    port: int,
+    model: str,
+    batch_size: int,
+    tp: int,
+) -> List[str]:
+    """Construct hipfire serve argv; always forwards ``--tp <N>``."""
+    return [
+        cli_abs,
+        "serve",
+        "127.0.0.1",
+        str(port),
+        "--model",
+        str(model),
+        "--continuous-batch-size",
+        str(batch_size),
+        "--tp",
+        str(tp),
+    ]
+
+
+def _extract_runtime_receipt_evidence(hip: Any) -> Optional[Dict[str, Any]]:
+    """Pull EP/batch receipt fields from hipfire evidence for the report (no claims)."""
+    if not isinstance(hip, dict):
+        return None
+    cb = hip.get("continuous_batch")
+    out: Dict[str, Any] = {
+        "execution_mode": hip.get("execution_mode"),
+    }
+    if isinstance(cb, dict):
+        for k in (
+            "executed",
+            "slots",
+            "lane",
+            "lane_capacity",
+            "max_active_lanes",
+            "refill",
+            "parallelism",
+            "rank_count",
+            "rank_mask",
+            "reduce",
+            "epoch",
+            "rows",
+            "moe_collectives",
+            "requested_tp",
+        ):
+            if k in cb:
+                out[k] = cb[k]
+    return out
+
+
 # ---------------------------------------------------------------------------
 # HTTP request
 # ---------------------------------------------------------------------------
@@ -613,9 +851,11 @@ def build_parser() -> argparse.ArgumentParser:
             "  python scripts/lmx_continuous_batch.py --model /path/model.mq4 --prompt-file prompts.txt \\\n"
             "      --batch-size 4 --requests 8 --runs 5 --max-tokens 128 --max-seq 4096 \\\n"
             "      --port 11520 --home-root /tmp/lmx_home --log-dir /tmp/lmx_logs --out report.json\n"
+            "  python scripts/lmx_continuous_batch.py ... --tp 4 --device 0,1,2,3\n"
             "\n"
             "Notes:\n"
             "  --runs must be >=3\n"
+            "  --tp choices: 1 (default) or 4 (Qwen expert-parallel continuous batch)\n"
             "  --thinking is restricted to 'off' for this v1 exact route\n"
             "  Every run starts a fresh process group and never reuses a server\n"
             "  Atomic output write; signal-safe pgid cleanup only\n"
@@ -636,9 +876,33 @@ def build_parser() -> argparse.ArgumentParser:
     # Optional
     p.add_argument("--cli", default="target/release/hipfire", help="Path to hipfire CLI binary (default: target/release/hipfire)")
     p.add_argument("--daemon", default="target/release/examples/daemon", help="Path to daemon binary for HIPFIRE_DAEMON_BIN (default: target/release/examples/daemon)")
-    p.add_argument("--device", default=None, help="KFD device selector for HIP_VISIBLE_DEVICES (default: env HIP_VISIBLE_DEVICES or 0)")
+    p.add_argument(
+        "--device",
+        default=None,
+        help=(
+            "KFD device selector for HIP_VISIBLE_DEVICES and ROCR_VISIBLE_DEVICES. "
+            "tp=1: one nonnegative index (default: env HIP_VISIBLE_DEVICES or 0). "
+            f"tp=4: exactly four distinct nonnegative indices (default: {TP4_DEFAULT_DEVICES})."
+        ),
+    )
+    p.add_argument(
+        "--tp",
+        type=int,
+        choices=list(TP_ALLOWED),
+        default=1,
+        help=(
+            "Expert-parallel degree for hipfire serve (choices: 1,4; default: 1). "
+            "Forwarded as '--tp N'. tp=4 requires a four-device --device selector and "
+            "runtime receipt expert_parallel/rank_count=4/peer_rooted_f32."
+        ),
+    )
     p.add_argument("--timeout", type=float, default=300.0, help="Per-request and health-wait timeout seconds (default: 300)")
     p.add_argument("--thinking", default="off", help="Thinking mode; restricted to 'off' for this v1 exact route (default: off)")
+    p.add_argument(
+        "--self-test",
+        action="store_true",
+        help="Run pure-Python self-tests (no daemon/GPU) and exit",
+    )
     return p
 
 
@@ -674,17 +938,36 @@ def parse_args(argv=None) -> argparse.Namespace:
     if args.thinking != "off":
         parser.error("--thinking is restricted to 'off' for this v1 exact route")
 
-    # Device default resolution
+    # --tp is choices-validated; keep an explicit guard for programmatic callers.
+    if args.tp not in TP_ALLOWED:
+        parser.error(f"--tp must be one of {list(TP_ALLOWED)}; got {args.tp}")
+
+    # Device default resolution depends on tp degree.
     if args.device is None:
-        args.device = os.environ.get("HIP_VISIBLE_DEVICES", "0")
+        if args.tp == 4:
+            args.device = TP4_DEFAULT_DEVICES
+        else:
+            args.device = os.environ.get("HIP_VISIBLE_DEVICES", "0")
+
+    # Canonicalize to comma-joined indices and fail closed on bad selectors.
+    try:
+        indices = _parse_device_indices(str(args.device))
+        args.device = ",".join(str(i) for i in indices)
+    except ValueError as e:
+        parser.error(str(e))
+
+    sel_err = _validate_tp_device_selector(int(args.tp), str(args.device))
+    if sel_err is not None:
+        parser.error(sel_err)
 
     # Resolve timeout
     if args.timeout <= 0:
         parser.error("--timeout must be >0")
 
-    # Check prompt-file exists
-    if not Path(args.prompt_file).is_file():
-        parser.error(f"--prompt-file not found: {args.prompt_file}")
+    # Check prompt-file exists (skip for --self-test which uses dummy required args)
+    if not getattr(args, "self_test", False):
+        if not Path(args.prompt_file).is_file():
+            parser.error(f"--prompt-file not found: {args.prompt_file}")
 
     # Check model file exists (warn but not hard error for CPU-only parse? Keep error)
     # For --help / import parse we still require file? Only error after parse
@@ -758,9 +1041,13 @@ def main(argv=None) -> int:
     }
     utc_now = datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z")
 
-    # Mode label
+    # Mode label + tp/device (parse_args already validated)
     B = args.batch_size
     R = args.requests
+    tp = int(args.tp)
+    device_str = str(args.device)
+    device_indices = _parse_device_indices(device_str)
+    requested_parallelism = "expert_parallel" if tp == 4 else "none"
     if B == 1:
         mode_label = "sequential_control"
     elif R <= B:
@@ -793,10 +1080,13 @@ def main(argv=None) -> int:
         run_errors: List[str] = []
         run_validation_passed = True
 
-        # 1) Device occupancy check
-        device_str = str(args.device)
-        if _is_device_occupied(device_str):
-            msg = f"run {run_idx}: KFD device {device_str} is known occupied (reliable monitor) — refusing"
+        # 1) Device occupancy check — every selected physical GPU
+        occupied = _any_selected_device_occupied(device_str)
+        if occupied is not None:
+            msg = (
+                f"run {run_idx}: KFD device {occupied} (from selector {device_str}) "
+                f"is known occupied (reliable monitor) — refusing"
+            )
             run_errors.append(msg)
             overall_validation_errors.append(msg)
             overall_passed = False
@@ -806,6 +1096,10 @@ def main(argv=None) -> int:
                 "home": None,
                 "log_path": None,
                 "error": msg,
+                "tp_degree": tp,
+                "devices": device_str,
+                "device_indices": device_indices,
+                "requested_parallelism": requested_parallelism,
                 "requests": [],
                 "aggregate": None,
                 "validation": {"passed": False, "errors": [msg]},
@@ -846,21 +1140,13 @@ def main(argv=None) -> int:
             run_validation_passed = False
 
         # 3) Start CLI foreground in new process group
-        serve_cmd = [
-            cli_abs,
-            "serve",
-            "127.0.0.1",
-            str(args.port),
-            "--model",
-            str(args.model),
-            "--continuous-batch-size",
-            str(B),
-        ]
+        serve_cmd = _build_serve_cmd(cli_abs, args.port, str(args.model), B, tp)
         env = dict(os.environ)
         env["HOME"] = str(run_home)
         # Contain HIPFIRE_HOME to isolated HOME to avoid host leakage
         env["HIPFIRE_HOME"] = str(run_home / ".hipfire")
         env["HIP_VISIBLE_DEVICES"] = device_str
+        env["ROCR_VISIBLE_DEVICES"] = device_str
         env["HIPFIRE_DAEMON_BIN"] = daemon_abs
         # Ensure no stale PID file leakage? Clear HIPFIRE_SERVE_HARNESS_PID_FILE if present
         # Keep it but we control pgid ourselves
@@ -911,6 +1197,11 @@ def main(argv=None) -> int:
                     "home": str(run_home),
                     "log_path": str(log_path),
                     "log_bytes": log_bytes,
+                    "serve_cmd": list(serve_cmd),
+                    "tp_degree": tp,
+                    "devices": device_str,
+                    "device_indices": list(device_indices),
+                    "requested_parallelism": requested_parallelism,
                     "isolated_config": {
                         "path": str(isolated_cfg_path) if 'isolated_cfg_path' in locals() else None,
                         "max_seq": args.max_seq,
@@ -1037,51 +1328,20 @@ def main(argv=None) -> int:
                         run_errors.append(msg)
                         run_validation_passed = False
 
-                # Batch attestation
+                # Batch / EP receipt attestation (fail-closed; never from load logs)
                 hip = rec.get("hipfire")
                 timings = rec.get("timings")
-                # For B>1
-                if B > 1:
-                    if not isinstance(hip, dict):
-                        msg = f"run {run_idx} req {idx}: missing hipfire evidence for B>1"
-                        run_errors.append(msg)
-                        run_validation_passed = False
-                    else:
-                        em = hip.get("execution_mode")
-                        if em != "continuous_batch_independent":
-                            msg = f"run {run_idx} req {idx}: hipfire.execution_mode {em!r} != 'continuous_batch_independent'"
-                            run_errors.append(msg)
-                            run_validation_passed = False
-                        cb = hip.get("continuous_batch")
-                        if not isinstance(cb, dict):
-                            msg = f"run {run_idx} req {idx}: missing continuous_batch object"
-                            run_errors.append(msg)
-                            run_validation_passed = False
-                        else:
-                            if cb.get("executed") is not True:
-                                msg = f"run {run_idx} req {idx}: continuous_batch.executed != true"
-                                run_errors.append(msg)
-                                run_validation_passed = False
-                            if cb.get("slots") != B:
-                                msg = f"run {run_idx} req {idx}: continuous_batch.slots {cb.get('slots')} != {B}"
-                                run_errors.append(msg)
-                                run_validation_passed = False
-                            # refill continuous
-                            if cb.get("refill") != "continuous":
-                                msg = f"run {run_idx} req {idx}: continuous_batch.refill {cb.get('refill')!r} != 'continuous'"
-                                run_errors.append(msg)
-                                run_validation_passed = False
-                            # Also check presence of lane fields
-                            # Not strictly required to fail if missing, but log
-                            for field in ("lane", "lane_capacity", "max_active_lanes"):
-                                if field not in cb:
-                                    msg = f"run {run_idx} req {idx}: continuous_batch.{field} missing"
-                                    run_errors.append(msg)
-                                    run_validation_passed = False
+                receipt_errors = _validate_hipfire_batch_receipt(
+                    hip, batch_size=B, tp=tp, run_idx=run_idx, req_idx=idx
+                )
+                for msg in receipt_errors:
+                    run_errors.append(msg)
+                    run_validation_passed = False
+                # Capture runtime receipt evidence on the per-request record (report only)
+                rec["runtime_receipt_evidence"] = _extract_runtime_receipt_evidence(hip)
 
+                if B > 1:
                     # Honest nonzero metrics: tok_s, prefill_ms, prefill_tok_s, decode_tok_s, ttft_ms, latency_ms
-                    # tok_s under hipfire.tok_s or hipfire.tok_s etc. Check both hipfire and timings
-                    # Check nonzero
                     def _get_metric(name: str) -> Optional[float]:
                         # Check hipfire first, then timings
                         v = None
@@ -1103,22 +1363,6 @@ def main(argv=None) -> int:
                             val = timings.get("latency_ms")
                         if not isinstance(val, (int, float)) or float(val) <= 0:
                             msg = f"run {run_idx} req {idx}: metric {metric} missing or not >0 (got {val!r})"
-                            run_errors.append(msg)
-                            run_validation_passed = False
-
-                    # Also check latency_ms wall vs reported? Already above
-
-                else:  # B == 1
-                    # Require no false batch attestation
-                    if isinstance(hip, dict):
-                        em = hip.get("execution_mode")
-                        if em == "continuous_batch_independent":
-                            msg = f"run {run_idx} req {idx}: false batch attestation execution_mode continuous_batch_independent for B=1"
-                            run_errors.append(msg)
-                            run_validation_passed = False
-                        cb = hip.get("continuous_batch")
-                        if isinstance(cb, dict) and cb.get("executed") is True:
-                            msg = f"run {run_idx} req {idx}: false batch attestation continuous_batch.executed true for B=1"
                             run_errors.append(msg)
                             run_validation_passed = False
 
@@ -1158,11 +1402,25 @@ def main(argv=None) -> int:
             # Also capture log text tail for quick debugging? But retain full log on disk
             # For report, we should not embed full log if huge; keep path and bytes
 
+            # Collect runtime receipt evidence from first successful request (if any)
+            run_receipt_evidence = None
+            for rec in per_req_sorted:
+                ev = rec.get("runtime_receipt_evidence")
+                if isinstance(ev, dict):
+                    run_receipt_evidence = ev
+                    break
+
             runs.append({
                 "run_index": run_idx,
                 "home": str(run_home),
                 "log_path": str(log_path),
                 "log_bytes": log_bytes,
+                "serve_cmd": list(serve_cmd),
+                "tp_degree": tp,
+                "devices": device_str,
+                "device_indices": list(device_indices),
+                "requested_parallelism": requested_parallelism,
+                "runtime_receipt_evidence": run_receipt_evidence,
                 "isolated_config": {
                     "path": str(isolated_cfg_path),
                     "max_seq": args.max_seq,
@@ -1206,6 +1464,10 @@ def main(argv=None) -> int:
                 "home": str(run_home) if 'run_home' in locals() else None,
                 "log_path": str(log_path) if 'log_path' in locals() else None,
                 "log_bytes": log_bytes,
+                "tp_degree": tp,
+                "devices": device_str,
+                "device_indices": list(device_indices),
+                "requested_parallelism": requested_parallelism,
                 "isolated_config": {
                     "path": str(isolated_cfg_path) if 'isolated_cfg_path' in locals() else None,
                     "max_seq": args.max_seq if 'args' in locals() else None,
@@ -1290,6 +1552,7 @@ def main(argv=None) -> int:
         "argv": command_argv,
         "environment": {
             "HIP_VISIBLE_DEVICES": device_str,
+            "ROCR_VISIBLE_DEVICES": device_str,
             "HIPFIRE_DAEMON_BIN": daemon_abs,
             "HOME_ROOT": str(home_root),
             "LOG_DIR": str(log_dir),
@@ -1324,6 +1587,7 @@ def main(argv=None) -> int:
             "cli": args.cli,
             "daemon": args.daemon,
             "device": device_str,
+            "tp": tp,
             "timeout": args.timeout,
             "thinking": args.thinking,
         },
@@ -1331,6 +1595,11 @@ def main(argv=None) -> int:
         "concurrency": R,
         "request_counts": {"batch_size": B, "requests_per_run": R, "runs": args.runs, "total_requests": args.runs * R},
         "batch_concurrency": B,
+        "tp_degree": tp,
+        "devices": device_str,
+        "device_indices": list(device_indices),
+        "requested_tp": tp,
+        "requested_parallelism": requested_parallelism,
         "mode": mode_label,
         "mode_label": mode_label,
         "effective_max_seq": args.max_seq,
@@ -1348,6 +1617,10 @@ def main(argv=None) -> int:
             "errors": overall_validation_errors,
             "mode_label": mode_label,
             "batch_attestation_required": B > 1,
+            "expert_parallel_required": tp == 4,
+            "tp_degree": tp,
+            "devices": device_str,
+            "requested_parallelism": requested_parallelism,
         },
     }
 
@@ -1383,7 +1656,157 @@ def main(argv=None) -> int:
     return 0
 
 
+
+def run_self_tests() -> int:
+    """Deterministic pure-Python checks (no daemon / GPU)."""
+    failures: List[str] = []
+
+    def check(cond: bool, msg: str) -> None:
+        if not cond:
+            failures.append(msg)
+
+    # --tp choices / defaults
+    check(TP_ALLOWED == (1, 4), f"TP_ALLOWED={TP_ALLOWED!r}")
+    check(TP4_DEFAULT_DEVICES == "0,1,2,3", f"TP4_DEFAULT_DEVICES={TP4_DEFAULT_DEVICES!r}")
+
+    # Device selector gate
+    check(_validate_tp_device_selector(1, "0") is None, "tp1 single device should pass")
+    check(_validate_tp_device_selector(1, "7") is None, "tp1 any single device should pass")
+    check(_validate_tp_device_selector(1, "0,1") is not None, "tp1 multi-device must fail")
+    check(_validate_tp_device_selector(4, "0,1,2,3") is None, "tp4 default devices should pass")
+    check(_validate_tp_device_selector(4, "0,1,2") is not None, "tp4 three devices must fail")
+    check(_validate_tp_device_selector(4, "0,1,2,2") is not None, "tp4 duplicate devices must fail")
+    check(_validate_tp_device_selector(4, "0") is not None, "tp4 single device must fail")
+    check(_validate_tp_device_selector(4, "a,b,c,d") is not None, "tp4 non-int devices must fail")
+
+    # Indices parser
+    check(_parse_device_indices("0,1,2,3") == [0, 1, 2, 3], "parse four devices")
+    try:
+        _parse_device_indices("")
+        check(False, "empty device selector must raise")
+    except ValueError:
+        check(True, "empty device selector raises")
+
+    # serve argv: always forwards --tp N
+    cmd1 = _build_serve_cmd("/cli", 11520, "/m.mq4", 4, 1)
+    check(cmd1[-2:] == ["--tp", "1"], f"tp=1 must forward --tp 1, got {cmd1}")
+    check(cmd1[cmd1.index("--continuous-batch-size") + 1] == "4", "batch size in serve argv")
+    cmd4 = _build_serve_cmd("/cli", 11520, "/m.mq4", 8, 4)
+    check(cmd4[-2:] == ["--tp", "4"], f"tp=4 must append --tp 4, got {cmd4}")
+
+    # B>1 tp=4 requires full expert-parallel receipt (source-grounded fields)
+    good_tp4 = {
+        "execution_mode": "continuous_batch_independent",
+        "continuous_batch": {
+            "executed": True,
+            "parallelism": "expert_parallel",
+            "rank_count": 4,
+            "reduce": "peer_rooted_f32",
+            "slots": 4,
+            "lane": 0,
+            "lane_capacity": 4096,
+            "max_active_lanes": 2,
+            "refill": "continuous",
+        },
+    }
+    check(
+        _validate_hipfire_batch_receipt(good_tp4, batch_size=4, tp=4, run_idx=0, req_idx=0) == [],
+        "good tp4 receipt should pass",
+    )
+    bad_missing_ep = {
+        "execution_mode": "continuous_batch_independent",
+        "continuous_batch": {
+            "executed": True,
+            "slots": 4,
+            "lane": 0,
+            "lane_capacity": 4096,
+            "max_active_lanes": 2,
+            "refill": "continuous",
+        },
+    }
+    errs = _validate_hipfire_batch_receipt(bad_missing_ep, batch_size=4, tp=4, run_idx=0, req_idx=0)
+    check(any("expert_parallel" in e for e in errs), f"tp4 missing EP fields must fail: {errs}")
+    check(any("rank_count" in e for e in errs), f"tp4 missing rank_count must fail: {errs}")
+    check(any("peer_rooted_f32" in e for e in errs), f"tp4 missing reduce must fail: {errs}")
+
+    # B>1 tp=1 must reject expert_parallel labels
+    bad_tp1_ep = {
+        "execution_mode": "continuous_batch_independent",
+        "continuous_batch": {
+            "executed": True,
+            "parallelism": "expert_parallel",
+            "slots": 4,
+            "lane": 0,
+            "lane_capacity": 4096,
+            "max_active_lanes": 2,
+            "refill": "continuous",
+        },
+    }
+    errs = _validate_hipfire_batch_receipt(bad_tp1_ep, batch_size=4, tp=1, run_idx=0, req_idx=0)
+    check(any("forbidden for tp=1" in e for e in errs), f"tp1 EP label must fail: {errs}")
+
+    good_tp1 = {
+        "execution_mode": "continuous_batch_independent",
+        "continuous_batch": {
+            "executed": True,
+            "slots": 4,
+            "lane": 0,
+            "lane_capacity": 4096,
+            "max_active_lanes": 2,
+            "refill": "continuous",
+        },
+    }
+    check(
+        _validate_hipfire_batch_receipt(good_tp1, batch_size=4, tp=1, run_idx=0, req_idx=0) == [],
+        "good tp1 batch receipt should pass",
+    )
+
+    # B=1 must not claim batch; also reject expert_parallel at tp=1
+    check(
+        _validate_hipfire_batch_receipt(None, batch_size=1, tp=1, run_idx=0, req_idx=0) == [],
+        "B=1 with no hipfire should pass",
+    )
+    errs = _validate_hipfire_batch_receipt(good_tp1, batch_size=1, tp=1, run_idx=0, req_idx=0)
+    check(any("false batch attestation" in e for e in errs), f"B=1 batch claim must fail: {errs}")
+    errs = _validate_hipfire_batch_receipt(
+        {"parallelism": "expert_parallel"},
+        batch_size=1,
+        tp=1,
+        run_idx=0,
+        req_idx=0,
+    )
+    check(any("expert_parallel" in e for e in errs), f"B=1 tp1 EP must fail: {errs}")
+
+    # Receipt extractor preserves EP fields without inventing them
+    extracted = _extract_runtime_receipt_evidence(good_tp4)
+    check(isinstance(extracted, dict), "extractor returns dict")
+    check(extracted.get("parallelism") == "expert_parallel", "extractor keeps parallelism")
+    check(extracted.get("rank_count") == 4, "extractor keeps rank_count")
+    check(extracted.get("reduce") == "peer_rooted_f32", "extractor keeps reduce")
+    check("requested_tp" not in extracted, "extractor must not invent requested_tp")
+
+    # Secret redaction must not capture credential values
+    red = _redacted_environment({"HIPFIRE_API_KEY": "supersecret", "PATH": "/usr/bin", "HOME": "/tmp/h"})
+    check(red.get("HIPFIRE_API_KEY") != "supersecret", "secret env values must be redacted")
+    check(red.get("PATH") == "/usr/bin", "non-secret env values must be retained")
+
+    if failures:
+        for f in failures:
+            sys.stderr.write(f"lmx_continuous_batch self-test FAIL: {f}\n")
+        sys.stderr.flush()
+        return 1
+    sys.stderr.write("lmx_continuous_batch: self-test OK\n")
+    sys.stderr.flush()
+    return 0
+
+
 if __name__ == "__main__":
+    if "--self-test" in sys.argv:
+        try:
+            sys.exit(run_self_tests())
+        except Exception as e:
+            sys.stderr.write(f"lmx_continuous_batch self-test fatal: {e}\n")
+            sys.exit(1)
     try:
         sys.exit(main())
     except SystemExit as e:
