@@ -685,6 +685,113 @@ impl Lfm2DecodeBatchState {
         Ok(())
     }
 
+    /// Pure geometry preflight for equal-length batched prefill.
+    ///
+    /// Validates `prompts` without touching GPU: `n` must be `2..=max_batch`,
+    /// all prompts equal non-zero length and each `< lane_capacity`.
+    /// Returns the common prompt length on success.
+    pub fn batched_prefill_preflight(
+        prompts: &[&[u32]],
+        max_batch: usize,
+        lane_capacity: usize,
+    ) -> Result<usize, String> {
+        let n = prompts.len();
+        if n < 2 {
+            return Err(format!(
+                "batched prefill: requires at least 2 lanes, got {n}"
+            ));
+        }
+        if n > max_batch {
+            return Err(format!(
+                "batched prefill: n={n} exceeds max_batch={max_batch}"
+            ));
+        }
+        if lane_capacity == 0 {
+            return Err("batched prefill: lane_capacity must be non-zero".to_string());
+        }
+        let first_len = prompts[0].len();
+        if first_len == 0 {
+            return Err("batched prefill: prompt length must be non-zero".to_string());
+        }
+        if first_len >= lane_capacity {
+            return Err(format!(
+                "batched prefill: prompt_len {first_len} >= lane_capacity {lane_capacity}"
+            ));
+        }
+        for (i, p) in prompts.iter().enumerate() {
+            if p.len() != first_len {
+                return Err(format!(
+                    "batched prefill: mixed prompt lengths: lane 0 has {first_len}, lane {i} has {}",
+                    p.len()
+                ));
+            }
+            if p.len() >= lane_capacity {
+                return Err(format!(
+                    "batched prefill: prompt_len {} >= lane_capacity {lane_capacity} at lane {i}",
+                    p.len()
+                ));
+            }
+            if p.is_empty() {
+                return Err(format!("batched prefill: lane {i} has empty prompt"));
+            }
+        }
+        Ok(first_len)
+    }
+
+    /// Batched equal-length prefill for lanes `0..n`.
+    ///
+    /// Takes a prefix-contiguous wave `prompts[0..n]` with `n>=2`, equal
+    /// nonzero lengths but arbitrary token contents. Validates all geometry,
+    /// formats, and lengths **before** any `reset_lane`/GPU work. On success,
+    /// clears each lane `0..n` via `reset_lane`, then iterates prompt
+    /// positions calling `forward_decode_batch_lfm` once per position with a
+    /// dense `[n]` token row and equal positions. Final logits/KV/conv state
+    /// equal sequential `prefill_lane`.
+    pub fn prefill_lanes_batched(
+        &mut self,
+        gpu: &mut Gpu,
+        weights: &Lfm2MoeWeights,
+        cfg: &Lfm2MoeConfig,
+        prompts: &[&[u32]],
+    ) -> HipResult<()> {
+        // ---- pure preflight (no GPU, no reset) ----
+        let prompt_len =
+            Self::batched_prefill_preflight(prompts, self.max_batch, self.lane_capacity)
+                .map_err(|e| HipError::new(0, &e))?;
+        // Config / format preflight before any GPU work
+        if cfg.num_experts != 0 {
+            return Err(HipError::new(
+                0,
+                "prefill_lanes_batched: MoE not supported for dense batch",
+            ));
+        }
+        crate::lfm2moe::batch_weight_formats_supported(weights)
+            .map_err(|e| HipError::new(0, &e))?;
+        let n = prompts.len();
+        // ---- reset lanes 0..n (no GPU work yet beyond memset) ----
+        for lane in 0..n {
+            self.reset_lane(gpu, cfg, lane)?;
+        }
+        // ---- batched forward per position: O(prompt_len) forwards, each B=n ----
+        let mut tokens_row = vec![0u32; n];
+        let mut positions_row = vec![0usize; n];
+        for pos in 0..prompt_len {
+            for (lane, prompt) in prompts.iter().enumerate() {
+                tokens_row[lane] = prompt[pos];
+                positions_row[lane] = pos;
+            }
+            crate::forward_batch::forward_decode_batch_lfm(
+                gpu,
+                weights,
+                cfg,
+                &tokens_row,
+                &positions_row,
+                self,
+            )?;
+        }
+        Ok(())
+    }
+
     /// Product sampler for a dense batch.
     #[allow(clippy::too_many_arguments)]
     pub fn sample_product(
@@ -842,5 +949,66 @@ mod tests {
     #[test]
     fn batch_kv_slots_keep_zero_attention_shape_allocatable() {
         assert_eq!(batch_kv_slot_mask(&[MixerKind::Conv]), vec![true]);
+    }
+
+    #[test]
+    fn batched_prefill_preflight_rejects_empty() {
+        let err = Lfm2DecodeBatchState::batched_prefill_preflight(&[], 4, 2048).unwrap_err();
+        assert!(err.contains("at least 2"), "{err}");
+    }
+
+    #[test]
+    fn batched_prefill_preflight_rejects_single() {
+        let a = vec![1u32, 2, 3];
+        let prompts: Vec<&[u32]> = vec![&a];
+        let err = Lfm2DecodeBatchState::batched_prefill_preflight(&prompts, 4, 2048).unwrap_err();
+        assert!(err.contains("at least 2"), "{err}");
+    }
+
+    #[test]
+    fn batched_prefill_preflight_rejects_mixed_length() {
+        let a = vec![1u32, 2, 3];
+        let b = vec![1u32, 2];
+        let c = vec![1u32, 2, 3];
+        let prompts: Vec<&[u32]> = vec![&a, &b, &c];
+        let err = Lfm2DecodeBatchState::batched_prefill_preflight(&prompts, 8, 2048).unwrap_err();
+        assert!(err.contains("mixed"), "{err}");
+    }
+
+    #[test]
+    fn batched_prefill_preflight_rejects_over_capacity() {
+        let a = vec![1u32; 2048];
+        let b = vec![1u32; 2048];
+        let prompts: Vec<&[u32]> = vec![&a, &b];
+        let err = Lfm2DecodeBatchState::batched_prefill_preflight(&prompts, 8, 2048).unwrap_err();
+        assert!(err.contains("lane_capacity"), "{err}");
+    }
+
+    #[test]
+    fn batched_prefill_preflight_rejects_over_max_batch() {
+        let a = vec![1u32, 2];
+        let b = vec![3u32, 4];
+        let c = vec![5u32, 6];
+        let prompts: Vec<&[u32]> = vec![&a, &b, &c];
+        let err = Lfm2DecodeBatchState::batched_prefill_preflight(&prompts, 2, 2048).unwrap_err();
+        assert!(err.contains("max_batch"), "{err}");
+    }
+
+    #[test]
+    fn batched_prefill_preflight_accepts_equal() {
+        let a = vec![1u32, 2, 3];
+        let b = vec![4u32, 5, 6];
+        let prompts: Vec<&[u32]> = vec![&a, &b];
+        let len = Lfm2DecodeBatchState::batched_prefill_preflight(&prompts, 8, 2048).unwrap();
+        assert_eq!(len, 3);
+    }
+
+    #[test]
+    fn batched_prefill_preflight_rejects_zero_prompt_len() {
+        let a: Vec<u32> = vec![];
+        let b: Vec<u32> = vec![];
+        let prompts: Vec<&[u32]> = vec![&a, &b];
+        let err = Lfm2DecodeBatchState::batched_prefill_preflight(&prompts, 8, 2048).unwrap_err();
+        assert!(err.contains("non-zero") || err.contains("empty"), "{err}");
     }
 }

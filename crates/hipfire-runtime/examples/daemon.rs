@@ -602,6 +602,118 @@ where
     Ok(true)
 }
 
+/// Non-mutating fast-path candidate scan for LFM initial wave.
+///
+/// Returns the length of the maximal front prefix of `sched.inbox` that
+/// satisfies: ordinary non-thinking, max_tokens>0, within lane capacity,
+/// same cohort key, equal prompt length, not pre-aborted, and prompt_len < lane_capacity.
+/// Returns 0 if active/awaiting lanes exist, front is exceptional, or
+/// prefix length <2 (caller must require >=2).
+fn lfm_fast_path_candidate_len(sched: &ContinuousBatchScheduler) -> usize {
+    if sched.active_count() != 0 || sched.awaiting_count() != 0 {
+        return 0;
+    }
+    if sched.inbox.len() < 2 {
+        return 0;
+    }
+    // Peek front without mutating.
+    let front_key = match sched.inbox.front() {
+        Some(k) => k.clone(),
+        None => return 0,
+    };
+    let front_req = match sched.pending.get(&front_key) {
+        Some(r) => r,
+        None => return 0,
+    };
+    // Front must be ordinary: non-thinking, max_tokens>0, within capacity, not aborted.
+    if front_req.started_in_think {
+        return 0;
+    }
+    if front_req.max_tokens == 0 {
+        return 0;
+    }
+    if front_req.prompt_tokens.is_empty()
+        || front_req.prompt_tokens.len() >= sched.lane_capacity
+        || !batch_lfm_admission_ok(
+            front_req.prompt_tokens.len(),
+            front_req.max_tokens,
+            sched.lane_capacity,
+        )
+    {
+        return 0;
+    }
+    if batch_check_abort(&front_key.id, front_key.attempt_id) {
+        return 0;
+    }
+    let first_len = front_req.prompt_tokens.len();
+    let first_cohort = match sched.pending_sampling.get(&front_key) {
+        Some(s) => s.key(),
+        None => return 0,
+    };
+    let mut count = 1usize;
+    for key in sched.inbox.iter().skip(1) {
+        if count >= sched.max_batch {
+            break;
+        }
+        let req = match sched.pending.get(key) {
+            Some(r) => r,
+            None => break,
+        };
+        if req.started_in_think {
+            break;
+        }
+        if req.max_tokens == 0 {
+            break;
+        }
+        if req.prompt_tokens.len() != first_len {
+            break;
+        }
+        if req.prompt_tokens.is_empty()
+            || req.prompt_tokens.len() >= sched.lane_capacity
+            || !batch_lfm_admission_ok(req.prompt_tokens.len(), req.max_tokens, sched.lane_capacity)
+        {
+            break;
+        }
+        if batch_check_abort(&key.id, key.attempt_id) {
+            break;
+        }
+        let cohort = match sched.pending_sampling.get(key) {
+            Some(s) => s.key(),
+            None => break,
+        };
+        if cohort != first_cohort {
+            break;
+        }
+        count += 1;
+    }
+    if count >= 2 {
+        count
+    } else {
+        0
+    }
+}
+
+/// Small helper that reuses the existing `sample_lane_product` contract and
+/// populates the same lane fields as the sequential `while let try_assign_one` path.
+fn lfm_populate_lane_after_sample(
+    sched: &mut ContinuousBatchScheduler,
+    lane_idx: usize,
+    next_token: u32,
+    next_rng: u32,
+    prompt_len: usize,
+) {
+    if let BatchLane::Running(lane) = &mut sched.lanes[lane_idx] {
+        lane.prompt_len = prompt_len;
+        lane.seq_pos = prompt_len;
+        lane.next_token = Some(next_token);
+        lane.rng_state = next_rng as u64;
+        lane.conversation_tokens = Vec::new();
+        lane.streamed_tokens = Vec::new();
+        lane.bytes_fed_to_filter = 0;
+        lane.prefill_done_at = Some(Instant::now());
+    }
+}
+
 /// RAII attempt-id scope that restores the prior TLS value on drop. All
 
 // ── Typed lane state ─────────────────────────────────────────────────
@@ -2846,6 +2958,121 @@ fn drive_lfm_continuous_batch(
                 return Ok(());
             }
         }
+        // ---- generic initial-wave fast path (batched prefill, O(prompt_len) vs O(n*prompt_len)) ----
+        // Non-mutating candidate scan ensures a one-request wave is never removed.
+        if sched.active_count() == 0 && sched.awaiting_count() == 0 {
+            let n = lfm_fast_path_candidate_len(sched);
+            if n >= 2 {
+                // Assign exactly n prefix lanes; each try_assign_one pops front and binds.
+                let mut assigned_keys: Vec<AttemptKey> = Vec::with_capacity(n);
+                let mut assigned_tickets: Vec<LaneTicket> = Vec::with_capacity(n);
+                let mut prompts_for_batch: Vec<Vec<u32>> = Vec::with_capacity(n);
+                let mut assign_ok = true;
+                for _ in 0..n {
+                    match sched.try_assign_one() {
+                        Some((key, ticket)) => {
+                            if let Some(req) = sched.pending.get(&key).cloned() {
+                                prompts_for_batch.push(req.prompt_tokens);
+                            } else {
+                                prompts_for_batch.push(Vec::new());
+                            }
+                            assigned_keys.push(key);
+                            assigned_tickets.push(ticket);
+                        }
+                        None => {
+                            assign_ok = false;
+                            break;
+                        }
+                    }
+                }
+                if assign_ok && assigned_keys.len() == n {
+                    let prompt_refs: Vec<&[u32]> =
+                        prompts_for_batch.iter().map(|v| v.as_slice()).collect();
+                    let prefill_res =
+                        batch_state.prefill_lanes_batched(gpu, weights, config, &prompt_refs);
+                    match prefill_res {
+                        Ok(()) => {
+                            for (idx, key) in assigned_keys.iter().enumerate() {
+                                let lane_idx = assigned_tickets[idx].lane;
+                                if batch_check_abort(&key.id, key.attempt_id) {
+                                    if let Err(e) = batch_state.reset_lane(gpu, config, lane_idx) {
+                                        return fail_all(
+                                            sched,
+                                            gpu,
+                                            batch_state,
+                                            stdout,
+                                            format!("reset lane {lane_idx} on batched prefill abort: {e}"),
+                                        );
+                                    }
+                                    let _scope = BatchAttemptScope::enter(key.attempt_id);
+                                    let ep = RollbackEpilogue {
+                                        rolled_back: true,
+                                        context: None,
+                                    };
+                                    emit_spec_cancel_after_rollback(stdout, &key.id, 0, &ep);
+                                    let _ = sched.abort_lane(lane_idx, key);
+                                    continue;
+                                }
+                                let hist: &[u32] = &[];
+                                let (lane_rng, sampling) = match &sched.lanes[lane_idx] {
+                                    BatchLane::Running(l) => {
+                                        (l.rng_state as u32, l.sampling.clone())
+                                    }
+                                    _ => continue,
+                                };
+                                match batch_state.sample_lane_product(
+                                    gpu,
+                                    config,
+                                    lane_idx,
+                                    hist,
+                                    sampling.temp,
+                                    sampling.top_p,
+                                    sampling.top_k,
+                                    sampling.min_p,
+                                    lane_rng,
+                                    sampling.repeat_penalty,
+                                    sampling.presence_penalty,
+                                    sampling.frequency_penalty,
+                                ) {
+                                    Ok((next_token, next_rng)) => {
+                                        let prompt_len = prompts_for_batch[idx].len();
+                                        lfm_populate_lane_after_sample(
+                                            sched, lane_idx, next_token, next_rng, prompt_len,
+                                        );
+                                    }
+                                    Err(e) => {
+                                        return fail_all(
+                                            sched,
+                                            gpu,
+                                            batch_state,
+                                            stdout,
+                                            format!(
+                                                "sample lane {lane_idx} after batched prefill: {e}"
+                                            ),
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            return fail_all(
+                                sched,
+                                gpu,
+                                batch_state,
+                                stdout,
+                                format!("batched prefill lanes 0..{n}: {e}"),
+                            );
+                        }
+                    }
+                } else {
+                    // Partial assign failure: rollback any already-assigned lanes
+                    for (k, t) in assigned_keys.iter().zip(assigned_tickets.iter()) {
+                        let _ = batch_state.reset_lane(gpu, config, t.lane);
+                        let _ = sched.abort_lane(t.lane, k);
+                    }
+                }
+            }
+        }
         while let Some((key, ticket)) = sched.try_assign_one() {
             let lane_idx = ticket.lane;
             let pending_req = match sched.pending.get(&key).cloned() {
@@ -5002,6 +5229,338 @@ mod continuous_batch_tests {
         assert!(!super::batch_messages_are_single_user(
             &serde_json::json!({"messages":"not an array"})
         ));
+    }
+
+    fn req_with_tokens(
+        key: AttemptKey,
+        sampling: BatchSampling,
+        tokens: Vec<u32>,
+        max_tokens: usize,
+        think: bool,
+    ) -> BatchPendingRequest {
+        BatchPendingRequest {
+            key,
+            prompt: "hi".into(),
+            prompt_tokens: tokens,
+            started_in_think: think,
+            system: None,
+            assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix::Plain,
+            max_think_tokens: 0,
+            max_tokens,
+            sampling,
+        }
+    }
+
+    #[test]
+    fn lfm_fast_path_accepts_two_equal_ordinary() {
+        let _l = begin();
+        let mut sched = ContinuousBatchScheduler::new(4, 2048);
+        let k1 = AttemptKey::new("fp-a", 1);
+        let k2 = AttemptKey::new("fp-b", 2);
+        let s = sampling(0.3, 1.0);
+        batch_announce_terminal(&k1.id, k1.attempt_id);
+        batch_announce_terminal(&k2.id, k2.attempt_id);
+        sched.enqueue(req_with_tokens(
+            k1.clone(),
+            s.clone(),
+            vec![1, 2, 3],
+            10,
+            false,
+        ));
+        sched.enqueue(req_with_tokens(
+            k2.clone(),
+            s.clone(),
+            vec![4, 5, 6],
+            10,
+            false,
+        ));
+        let n = super::lfm_fast_path_candidate_len(&sched);
+        assert_eq!(n, 2);
+    }
+
+    #[test]
+    fn lfm_fast_path_mixed_lengths_stop_before_mismatch() {
+        let _l = begin();
+        let mut sched = ContinuousBatchScheduler::new(4, 2048);
+        let k1 = AttemptKey::new("mix-1", 1);
+        let k2 = AttemptKey::new("mix-2", 2);
+        let k3 = AttemptKey::new("mix-3", 3);
+        let s = sampling(0.3, 1.0);
+        batch_announce_terminal(&k1.id, k1.attempt_id);
+        batch_announce_terminal(&k2.id, k2.attempt_id);
+        batch_announce_terminal(&k3.id, k3.attempt_id);
+        sched.enqueue(req_with_tokens(
+            k1.clone(),
+            s.clone(),
+            vec![1, 2, 3],
+            10,
+            false,
+        ));
+        sched.enqueue(req_with_tokens(
+            k2.clone(),
+            s.clone(),
+            vec![4, 5, 6],
+            10,
+            false,
+        ));
+        sched.enqueue(req_with_tokens(
+            k3.clone(),
+            s.clone(),
+            vec![7, 8],
+            10,
+            false,
+        ));
+        let n = super::lfm_fast_path_candidate_len(&sched);
+        assert_eq!(n, 2, "should stop before mismatched length");
+    }
+
+    #[test]
+    fn lfm_fast_path_one_request_remains_sequential() {
+        let _l = begin();
+        let mut sched = ContinuousBatchScheduler::new(4, 2048);
+        let k1 = AttemptKey::new("one-1", 1);
+        let s = sampling(0.3, 1.0);
+        batch_announce_terminal(&k1.id, k1.attempt_id);
+        sched.enqueue(req_with_tokens(
+            k1.clone(),
+            s.clone(),
+            vec![1, 2, 3],
+            10,
+            false,
+        ));
+        let n = super::lfm_fast_path_candidate_len(&sched);
+        assert_eq!(n, 0);
+        // Also ensure inbox not mutated
+        assert_eq!(sched.inbox.len(), 1);
+        assert_eq!(sched.inbox.front().unwrap(), &k1);
+    }
+
+    #[test]
+    fn lfm_fast_path_active_lanes_disable() {
+        let _l = begin();
+        let mut sched = ContinuousBatchScheduler::new(4, 2048);
+        let k1 = AttemptKey::new("act-1", 1);
+        let k2 = AttemptKey::new("act-2", 2);
+        let k3 = AttemptKey::new("act-3", 3);
+        let s = sampling(0.3, 1.0);
+        batch_announce_terminal(&k1.id, k1.attempt_id);
+        batch_announce_terminal(&k2.id, k2.attempt_id);
+        batch_announce_terminal(&k3.id, k3.attempt_id);
+        sched.enqueue(req_with_tokens(
+            k1.clone(),
+            s.clone(),
+            vec![1, 2, 3],
+            10,
+            false,
+        ));
+        sched.enqueue(req_with_tokens(
+            k2.clone(),
+            s.clone(),
+            vec![4, 5, 6],
+            10,
+            false,
+        ));
+        sched.enqueue(req_with_tokens(
+            k3.clone(),
+            s.clone(),
+            vec![7, 8, 9],
+            10,
+            false,
+        ));
+        // Make scheduler active by assigning one lane
+        let _ = sched.try_assign_one();
+        assert!(sched.active_count() > 0);
+        let n = super::lfm_fast_path_candidate_len(&sched);
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn lfm_fast_path_awaiting_disable() {
+        let _l = begin();
+        let mut sched = ContinuousBatchScheduler::new(2, 2048);
+        let k1 = AttemptKey::new("await-1", 1);
+        let k2 = AttemptKey::new("await-2", 2);
+        let k3 = AttemptKey::new("await-3", 3);
+        let s = sampling(0.3, 1.0);
+        batch_announce_terminal(&k1.id, k1.attempt_id);
+        batch_announce_terminal(&k2.id, k2.attempt_id);
+        batch_announce_terminal(&k3.id, k3.attempt_id);
+        sched.enqueue(req_with_tokens(
+            k1.clone(),
+            s.clone(),
+            vec![1, 2, 3],
+            10,
+            false,
+        ));
+        let (_key, ticket) = sched.try_assign_one().unwrap();
+        // Move to awaiting
+        let pending = serde_json::json!({"type":"done","id":k1.id,"attempt_id":k1.attempt_id});
+        assert!(sched.mark_awaiting_commit(ticket.lane, pending));
+        assert!(sched.awaiting_count() > 0);
+        sched.enqueue(req_with_tokens(
+            k2.clone(),
+            s.clone(),
+            vec![4, 5, 6],
+            10,
+            false,
+        ));
+        sched.enqueue(req_with_tokens(
+            k3.clone(),
+            s.clone(),
+            vec![7, 8, 9],
+            10,
+            false,
+        ));
+        let n = super::lfm_fast_path_candidate_len(&sched);
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn lfm_fast_path_front_aborted_disables() {
+        let _l = begin();
+        let mut sched = ContinuousBatchScheduler::new(4, 2048);
+        let k1 = AttemptKey::new("abort-front-1", 1);
+        let k2 = AttemptKey::new("abort-front-2", 2);
+        let s = sampling(0.3, 1.0);
+        batch_announce_terminal(&k1.id, k1.attempt_id);
+        batch_announce_terminal(&k2.id, k2.attempt_id);
+        sched.enqueue(req_with_tokens(
+            k1.clone(),
+            s.clone(),
+            vec![1, 2, 3],
+            10,
+            false,
+        ));
+        sched.enqueue(req_with_tokens(
+            k2.clone(),
+            s.clone(),
+            vec![4, 5, 6],
+            10,
+            false,
+        ));
+        batch_apply_terminal_control("abort", &k1.id, k1.attempt_id);
+        let n = super::lfm_fast_path_candidate_len(&sched);
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn lfm_fast_path_think_front_disables() {
+        let _l = begin();
+        let mut sched = ContinuousBatchScheduler::new(4, 2048);
+        let k1 = AttemptKey::new("think-1", 1);
+        let k2 = AttemptKey::new("think-2", 2);
+        let s = sampling(0.3, 1.0);
+        batch_announce_terminal(&k1.id, k1.attempt_id);
+        batch_announce_terminal(&k2.id, k2.attempt_id);
+        sched.enqueue(req_with_tokens(
+            k1.clone(),
+            s.clone(),
+            vec![1, 2, 3],
+            10,
+            true,
+        ));
+        sched.enqueue(req_with_tokens(
+            k2.clone(),
+            s.clone(),
+            vec![4, 5, 6],
+            10,
+            false,
+        ));
+        let n = super::lfm_fast_path_candidate_len(&sched);
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn lfm_fast_path_zero_max_tokens_front_disables() {
+        let _l = begin();
+        let mut sched = ContinuousBatchScheduler::new(4, 2048);
+        let k1 = AttemptKey::new("zero-1", 1);
+        let k2 = AttemptKey::new("zero-2", 2);
+        let s = sampling(0.3, 1.0);
+        batch_announce_terminal(&k1.id, k1.attempt_id);
+        batch_announce_terminal(&k2.id, k2.attempt_id);
+        sched.enqueue(req_with_tokens(
+            k1.clone(),
+            s.clone(),
+            vec![1, 2, 3],
+            0,
+            false,
+        ));
+        sched.enqueue(req_with_tokens(
+            k2.clone(),
+            s.clone(),
+            vec![4, 5, 6],
+            10,
+            false,
+        ));
+        let n = super::lfm_fast_path_candidate_len(&sched);
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn lfm_fast_path_capacity_front_disables() {
+        let _l = begin();
+        let mut sched = ContinuousBatchScheduler::new(4, 10);
+        let k1 = AttemptKey::new("cap-1", 1);
+        let k2 = AttemptKey::new("cap-2", 2);
+        let s = sampling(0.3, 1.0);
+        batch_announce_terminal(&k1.id, k1.attempt_id);
+        batch_announce_terminal(&k2.id, k2.attempt_id);
+        // prompt len 9 + max 5 =14 > cap 10 => exceeds
+        sched.enqueue(req_with_tokens(
+            k1.clone(),
+            s.clone(),
+            vec![1u32; 9],
+            5,
+            false,
+        ));
+        sched.enqueue(req_with_tokens(
+            k2.clone(),
+            s.clone(),
+            vec![2u32; 9],
+            5,
+            false,
+        ));
+        let n = super::lfm_fast_path_candidate_len(&sched);
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn lfm_fast_path_cohort_mismatch_stops() {
+        let _l = begin();
+        let mut sched = ContinuousBatchScheduler::new(4, 2048);
+        let k1 = AttemptKey::new("cohort-1", 1);
+        let k2 = AttemptKey::new("cohort-2", 2);
+        let k3 = AttemptKey::new("cohort-3", 3);
+        let s1 = sampling(0.3, 1.0);
+        let mut s2 = sampling(0.3, 1.0);
+        s2.top_p = 0.9; // different cohort
+        batch_announce_terminal(&k1.id, k1.attempt_id);
+        batch_announce_terminal(&k2.id, k2.attempt_id);
+        batch_announce_terminal(&k3.id, k3.attempt_id);
+        sched.enqueue(req_with_tokens(
+            k1.clone(),
+            s1.clone(),
+            vec![1, 2, 3],
+            10,
+            false,
+        ));
+        sched.enqueue(req_with_tokens(
+            k2.clone(),
+            s1.clone(),
+            vec![4, 5, 6],
+            10,
+            false,
+        ));
+        sched.enqueue(req_with_tokens(
+            k3.clone(),
+            s2.clone(),
+            vec![7, 8, 9],
+            10,
+            false,
+        ));
+        let n = super::lfm_fast_path_candidate_len(&sched);
+        assert_eq!(n, 2);
     }
 }
 /// Message types pushed from the stdin-reader thread to the main
