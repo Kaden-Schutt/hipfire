@@ -818,9 +818,11 @@ def run_pm4_preflight(args):
             {
                 "type": "bench_decode",
                 "context_tokens": args.context,
-                # The first decode prepares the tape; two more prove replay at
-                # distinct positions without entering benchmark warmup.
-                "iterations": 3,
+                # Dense LFM uses its first decode for allocation warmup, its
+                # second to record/prepare the retained tape, and therefore
+                # needs two further iterations to prove replay at distinct
+                # positions before benchmark warmup.
+                "iterations": 4,
                 "redline_product_route": True,
             }
         )

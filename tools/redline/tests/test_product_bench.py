@@ -748,7 +748,7 @@ class Pm4PreflightTests(unittest.TestCase):
         )
 
     def test_preflight_smoke_tests_pm4_before_any_warmup(self):
-        row = RouteProofTests.route_row(iterations=3, delta=2, retained=True)
+        row = RouteProofTests.route_row(iterations=4, delta=2, retained=True)
         fake = unittest.mock.Mock()
         fake.request.side_effect = [{"type": "loaded"}, row]
         with tempfile.TemporaryDirectory() as work_dir:
@@ -768,7 +768,7 @@ class Pm4PreflightTests(unittest.TestCase):
         self.assertEqual(fake.request.call_args_list[0].args[0]["type"], "load")
         smoke = fake.request.call_args_list[1].args[0]
         self.assertEqual(smoke["type"], "bench_decode")
-        self.assertEqual(smoke["iterations"], 3)
+        self.assertEqual(smoke["iterations"], 4)
         self.assertTrue(smoke["redline_product_route"])
         self.assertEqual(result["redline_route"]["state"], "ready")
         self.assertIn("route_proof", result)
