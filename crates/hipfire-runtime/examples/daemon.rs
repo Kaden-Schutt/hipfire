@@ -3976,16 +3976,6 @@ fn is_qwen_ep_batch_request_eligible(
     true
 }
 
-/// Opt-in stderr phase markers for EP continuous-batch hang diagnosis.
-/// Enabled only when `HIPFIRE_EP_BATCH_TRACE=1`; cached so the hot path is a bool load.
-fn ep_batch_trace_enabled() -> bool {
-    use std::sync::LazyLock;
-    static ENABLED: LazyLock<bool> = LazyLock::new(|| {
-        hipfire_config::developer_var("HIPFIRE_EP_BATCH_TRACE").as_deref() == Ok("1")
-    });
-    *ENABLED
-}
-
 fn drive_qwen35_ep_continuous_batch(
     sched: &mut ContinuousBatchScheduler,
     model: &mut LoadedModel,
@@ -3993,9 +3983,6 @@ fn drive_qwen35_ep_continuous_batch(
     inbox: &mut DaemonInbox,
 ) -> Result<(), BatchDriveError> {
     let batch_size = sched.max_batch;
-    if ep_batch_trace_enabled() {
-        eprintln!("[batch][EP][trace] driver enter batch_size={batch_size}");
-    }
     if batch_size == 0 {
         return Ok(());
     }
@@ -4449,9 +4436,6 @@ fn drive_qwen35_ep_continuous_batch(
                 inbox.push_front(DaemonMsg::Regular(serde_json::json!({"type":"generate","id":key.id,"attempt_id":key.attempt_id,"prompt":prompt})));
                 break;
             }
-            if ep_batch_trace_enabled() {
-                eprintln!("[batch][EP][trace] reset_lane before lane={lane_idx}");
-            }
             if let Err(e) = batch_state.reset_lane(gpus, config, lane_idx) {
                 return fail_all(
                     sched,
@@ -4459,15 +4443,6 @@ fn drive_qwen35_ep_continuous_batch(
                     batch_state,
                     stdout,
                     format!("EP reset lane {lane_idx}: {e}"),
-                );
-            }
-            if ep_batch_trace_enabled() {
-                eprintln!("[batch][EP][trace] reset_lane after lane={lane_idx}");
-            }
-            if ep_batch_trace_enabled() {
-                eprintln!(
-                    "[batch][EP][trace] prefill_lane before lane={lane_idx} prompt_tokens={}",
-                    prompt_tokens.len()
                 );
             }
             let receipt =
@@ -4483,12 +4458,6 @@ fn drive_qwen35_ep_continuous_batch(
                         )
                     }
                 };
-            if ep_batch_trace_enabled() {
-                eprintln!(
-                    "[batch][EP][trace] prefill_lane after lane={lane_idx} prompt_tokens={}",
-                    prompt_tokens.len()
-                );
-            }
             last_receipt = Some(receipt);
             let lane_rng = match &sched.lanes[lane_idx] {
                 BatchLane::Running(lane) => lane.rng_state as u32,
@@ -4496,9 +4465,6 @@ fn drive_qwen35_ep_continuous_batch(
             };
             // Use per-lane sampling that respects readiness; repeat penalties folded via retry window with product if needed.
             // For EP we call sample_lane (full product requires contiguous Ready lanes); per-lane keeps sparsity.
-            if ep_batch_trace_enabled() {
-                eprintln!("[batch][EP][trace] sample_lane before lane={lane_idx}");
-            }
             let (next_token, next_rng) = match batch_state.sample_lane(
                 gpus,
                 config,
@@ -4519,9 +4485,6 @@ fn drive_qwen35_ep_continuous_batch(
                     )
                 }
             };
-            if ep_batch_trace_enabled() {
-                eprintln!("[batch][EP][trace] sample_lane after lane={lane_idx}");
-            }
             if let BatchLane::Running(lane) = &mut sched.lanes[lane_idx] {
                 lane.prompt_len = prompt_tokens.len();
                 lane.seq_pos = prompt_tokens.len();
@@ -4597,12 +4560,6 @@ fn drive_qwen35_ep_continuous_batch(
                 }
             }
         }
-        if ep_batch_trace_enabled() {
-            eprintln!(
-                "[batch][EP][trace] forward_tick before active_mask={active_mask:#x} active_lanes={}",
-                running.len()
-            );
-        }
         let receipt =
             match batch_state.forward_tick(gpus, weights, config, active_mask, &tokens, &positions)
             {
@@ -4617,12 +4574,6 @@ fn drive_qwen35_ep_continuous_batch(
                     )
                 }
             };
-        if ep_batch_trace_enabled() {
-            eprintln!(
-                "[batch][EP][trace] forward_tick after active_mask={active_mask:#x} active_lanes={}",
-                running.len()
-            );
-        }
         last_receipt = Some(receipt);
         let mut to_await: Vec<(usize, AttemptKey, serde_json::Value)> = Vec::new();
         let mut to_abort_running: Vec<(usize, AttemptKey)> = Vec::new();
@@ -14816,19 +14767,6 @@ fn main() {
                     } else {
                         false
                     };
-                    if ep_batch_trace_enabled() {
-                        eprintln!(
-                            "[batch][EP][trace] generate admit id={} attempt_id={} batch_scheduler={} ep_state={} serve_continuous_batch={} ep_batch_eligible={} continuous_batch_size={} pflash_active={}",
-                            id,
-                            gen_attempt_id,
-                            batch_scheduler.is_some(),
-                            m.ep.is_some(),
-                            serve_continuous_batch,
-                            ep_batch_eligible,
-                            continuous_batch_size,
-                            pflash_active,
-                        );
-                    }
                     if ep_batch_eligible {
                         batch_transition_to_queued(id, gen_attempt_id);
                         if batch_check_abort(id, gen_attempt_id) {
@@ -14897,20 +14835,8 @@ fn main() {
                                 max_tokens,
                                 sampling: sampling.clone(),
                             };
-                            if ep_batch_trace_enabled() {
-                                eprintln!(
-                                    "[batch][EP][trace] enqueue before id={} attempt_id={}",
-                                    id, gen_attempt_id
-                                );
-                            }
                             if let Some(sched) = batch_scheduler.as_mut() {
                                 let enq_ok = sched.enqueue(pending);
-                                if ep_batch_trace_enabled() {
-                                    eprintln!(
-                                        "[batch][EP][trace] enqueue after id={} attempt_id={} enq_ok={}",
-                                        id, gen_attempt_id, enq_ok
-                                    );
-                                }
                                 if !enq_ok {
                                     eprintln!("[batch][EP] duplicate enqueue rejected id={} attempt_id={}; preserving live registry", id, gen_attempt_id);
                                     continue;
@@ -14922,12 +14848,6 @@ fn main() {
                                         id,
                                         false,
                                         Some(QWEN_AR_SEMANTIC_CONTRACT_VERSION),
-                                    );
-                                }
-                                if ep_batch_trace_enabled() {
-                                    eprintln!(
-                                        "[batch][EP][trace] driver call before id={} attempt_id={}",
-                                        id, gen_attempt_id
                                     );
                                 }
                                 let drive_res = drive_qwen35_ep_continuous_batch(
@@ -14962,12 +14882,6 @@ fn main() {
                     if ep_batch_staged {
                         // EP requests without serve_continuous_batch or with excluded features must error.
                         if !ep_batch_eligible {
-                            if ep_batch_trace_enabled() {
-                                eprintln!(
-                                    "[batch][EP][trace] staged-ineligible fail-closed id={} attempt_id={}",
-                                    id, gen_attempt_id
-                                );
-                            }
                             let _scope = BatchAttemptScope::enter(gen_attempt_id);
                             let ep = RollbackEpilogue {
                                 rolled_back: true,
