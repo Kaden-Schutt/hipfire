@@ -190,11 +190,92 @@ def build_config(args):
         # Preserve caller-pinned draft env; do not invent a path.
         env_draft = os.environ.get("HIPFIRE_DFLASH_DRAFT")
         draft = os.path.abspath(os.path.expanduser(env_draft)) if env_draft else None
+    ngram = getattr(args, "ngram", "off") or "off"
+    dflash = getattr(args, "dflash", "off") or "off"
+    mtp_ngram = getattr(args, "mtp_ngram", "off") or "off"
+    mtp_ngram_match = None
+    mtp_ngram_min = None
+    mtp_ngram_max = None
+    # One mechanism per run. The CLI's --spec is an enum for the same reason:
+    # silently letting one arm win would certify a path the caller did not ask
+    # for, and the resulting tok/s would be attributed to the wrong speculator.
+    if ngram == "on" and (dflash == "on" or args.mtp == "on"):
+        raise SystemExit(
+            f"serve_harness: --ngram on is exclusive; got dflash={dflash} mtp={args.mtp}. "
+            "Pick one speculative mechanism."
+        )
+    # Opt-in long-gated ngram-mod composition inside native MTP (harness/env only).
+    # Not a separate speculation selector: TOML stays mode=mtp; daemon sees
+    # HIPFIRE_MTP_NGRAM + HIPFIRE_NGRAM_MOD_*. Requires --mtp on, greedy sampling,
+    # thinking off; exclusive with standalone --ngram / --dflash on and with
+    # non-mtp --speculation overrides.
+    if mtp_ngram == "on":
+        if args.mtp != "on":
+            raise SystemExit(
+                "serve_harness: --mtp-ngram on requires --mtp on "
+                "(composition is ngram-mod inside native MTP, not a standalone selector)."
+            )
+        if ngram == "on":
+            raise SystemExit(
+                "serve_harness: --mtp-ngram on is exclusive with standalone --ngram on. "
+                "Pick MTP+ngram-mod composition or standalone ngram, not both."
+            )
+        if dflash == "on":
+            raise SystemExit(
+                "serve_harness: --mtp-ngram on is exclusive with --dflash on. "
+                "Pick one speculative mechanism."
+            )
+        explicit = getattr(args, "speculation", None)
+        if explicit is not None and explicit != "mtp":
+            raise SystemExit(
+                f"serve_harness: --mtp-ngram on is incompatible with --speculation {explicit}; "
+                "omit --speculation or use --speculation mtp."
+            )
+        temp = samp.get("temperature")
+        if not isinstance(temp, (int, float)) or abs(float(temp)) > 1e-6:
+            raise SystemExit(
+                "serve_harness: --mtp-ngram on requires greedy sampling "
+                f"(temperature==0); got temperature={temp!r}."
+            )
+        if selected_budget != "off":
+            raise SystemExit(
+                "serve_harness: --mtp-ngram on requires --thinking off "
+                f"(got thinking_budget={selected_budget!r})."
+            )
+        raw_match = getattr(args, "mtp_ngram_match", None)
+        raw_min = getattr(args, "mtp_ngram_min", None)
+        raw_max = getattr(args, "mtp_ngram_max", None)
+        mtp_ngram_match = 24 if raw_match is None else int(raw_match)
+        mtp_ngram_min = 48 if raw_min is None else int(raw_min)
+        mtp_ngram_max = 64 if raw_max is None else int(raw_max)
+        if mtp_ngram_match < 1:
+            raise SystemExit(
+                f"serve_harness: --mtp-ngram-match must be >= 1, got {mtp_ngram_match}."
+            )
+        if mtp_ngram_min < 1:
+            raise SystemExit(
+                f"serve_harness: --mtp-ngram-min must be >= 1, got {mtp_ngram_min}."
+            )
+        if mtp_ngram_max > 64:
+            raise SystemExit(
+                f"serve_harness: --mtp-ngram-max must be <= 64, got {mtp_ngram_max}."
+            )
+        if mtp_ngram_min > mtp_ngram_max:
+            raise SystemExit(
+                f"serve_harness: --mtp-ngram-min ({mtp_ngram_min}) must be <= "
+                f"--mtp-ngram-max ({mtp_ngram_max})."
+            )
     return {
         "model": args.model, "tag": tag, "kv": kv, "kv_source": kv_source,
         "mtp": args.mtp,
         "kv_backend": getattr(args, "kv_backend", "contiguous") or "contiguous",
-        "dflash": getattr(args, "dflash", "off") or "off",
+        "dflash": dflash,
+        "ngram": ngram,
+        "ngram_k": getattr(args, "ngram_k", None),
+        "mtp_ngram": mtp_ngram,
+        "mtp_ngram_match": mtp_ngram_match,
+        "mtp_ngram_min": mtp_ngram_min,
+        "mtp_ngram_max": mtp_ngram_max,
         "draft": draft,
         "thinking_budget": selected_budget, "thinking_cap_tokens": think_cap,
         "max_tokens": args.max_tokens, "sampling": samp, "sampling_source": samp_src,
@@ -254,6 +335,15 @@ def show_config(cfg):
           f"   kv_backend: {cfg.get('kv_backend', 'contiguous')}"
           f"   mtp_mode: {cfg['mtp']}   mode: {cfg['mode']}")
     print(f"  dflash        : {cfg.get('dflash', 'off')}   draft: {cfg.get('draft') or '(none / filename auto-match)'}")
+    print(f"  ngram         : {cfg.get('ngram', 'off')}   ngram_k: {cfg.get('ngram_k') if cfg.get('ngram_k') is not None else '(loader default 12)'}")
+    _mn_match = cfg.get("mtp_ngram_match")
+    _mn_min = cfg.get("mtp_ngram_min")
+    _mn_max = cfg.get("mtp_ngram_max")
+    if cfg.get("mtp_ngram") == "on":
+        _mn_gate = f"match={_mn_match} min={_mn_min} max={_mn_max} (default gate 24/48/64)"
+    else:
+        _mn_gate = "(off / default gate 24/48/64 when enabled)"
+    print(f"  mtp_ngram     : {cfg.get('mtp_ngram', 'off')}   {_mn_gate}")
     _spec = cfg.get("speculation_mode")
     print(f"  speculation   : {_spec or '(derived from --dflash/--mtp above)'}"
           f"{'   <-- OVERRIDES dflash/mtp' if _spec else ''}")
@@ -441,10 +531,18 @@ def _write_native_config(cfg, home):
     auto-discovered. DeepSeek V4 ships its speculative module inside the
     checkpoint (see the model card: "it comes with a speculative decoding module
     attached"), so `--speculation dspark` is the supported way to exercise it.
+
+    --ngram on is the exclusive model-free selector, mirroring
+    apply_speculation_selector("ngram") in hipfire-cli: mode=ngram, ngram=on,
+    dflash=off, mtp=off. It is REFUSED alongside --dflash on / --mtp on rather
+    than silently losing to the dflash arm — the CLI treats these as one choice,
+    and a harness that quietly picked for you would certify the wrong path.
     """
     explicit = cfg.get("speculation_mode")
     dflash = cfg.get("dflash", "off") or "off"
     mtp = cfg["mtp"]
+    ngram = cfg.get("ngram", "off") or "off"
+    ngram_k = cfg.get("ngram_k")
     if explicit:
         # Mirrors apply_speculation_selector(): each named selector pins every
         # sibling off so the arms are mutually exclusive and legible in the log.
@@ -462,6 +560,32 @@ def _write_native_config(cfg, home):
             f'dflash = {json.dumps(pins[1])}\n'
             f'mtp = {json.dumps(pins[2])}\n'
             f'ngram = {json.dumps(pins[3])}\n'
+        )
+        if ngram_k is not None and pins[0] == "ngram":
+            speculation += f'ngram_k = {int(ngram_k)}\n'
+    elif ngram == "on":
+        # Exclusive model-free selector — mirrors apply_speculation_selector("ngram").
+        speculation = (
+            '[speculation]\n'
+            'mode = "ngram"\n'
+            'ngram = "on"\n'
+            'dflash = "off"\n'
+            'mtp = "off"\n'
+        )
+        if ngram_k is not None:
+            speculation += f'ngram_k = {int(ngram_k)}\n'
+    elif mtp == "on":
+        # Exclusive MTP selector — mirrors apply_speculation_selector("mtp").
+        # WITHOUT `mode = "mtp"` the daemon leaves mode at the schema default and
+        # the MTP head loads but the speculative loop is never selected: measured
+        # 2026-08-08 as gen=0 / empty on mq2r AND mq4r-cvs-mtp, on two machines,
+        # with no error envelope. Setting only the `mtp` sub-key is not enough.
+        speculation = (
+            '[speculation]\n'
+            'mode = "mtp"\n'
+            'mtp = "on"\n'
+            'dflash = "off"\n'
+            'ngram = "off"\n'
         )
     elif dflash == "on":
         # Exclusive DFlash selector — mirrors apply_speculation_selector("dflash").
@@ -787,6 +911,292 @@ def _self_test_kv_resolution():
     print("serve_harness: kv-resolution self-test OK", flush=True)
 
 
+def _self_test_mtp_ngram_config():
+    """Config exclusivity, default 24/48/64 gate, MTP TOML selector, and env isolation."""
+    import argparse
+    import tempfile
+
+    def _ns(**kw):
+        base = dict(
+            model="/models/x.mq4",
+            tag=None,
+            registry=os.path.join(REPO, "registry/v1.json"),
+            kv="auto",
+            kv_backend="contiguous",
+            mtp="off",
+            dflash="off",
+            ngram="off",
+            ngram_k=None,
+            mtp_ngram="off",
+            mtp_ngram_match=None,
+            mtp_ngram_min=None,
+            mtp_ngram_max=None,
+            draft=None,
+            thinking=None,
+            thinking_effort=None,
+            max_tokens=2048,
+            sampling="greedy",
+            mode="battery",
+            port=11520,
+            seed=None,
+            prompts_file=None,
+            prompt_file=None,
+            niah_file=None,
+            speculation=None,
+            deepseek4_experts_per_token=None,
+            deepseek4_compute_placement="single",
+            devices=None,
+            tp=None,
+            replay_route_proof_log=False,
+        )
+        base.update(kw)
+        return argparse.Namespace(**base)
+
+    # Baseline --mtp on leaves composition off and does not invent gate params.
+    cfg = build_config(_ns(mtp="on"))
+    assert cfg["mtp"] == "on"
+    assert cfg["mtp_ngram"] == "off"
+    assert cfg["mtp_ngram_match"] is None
+    assert cfg["mtp_ngram_min"] is None
+    assert cfg["mtp_ngram_max"] is None
+
+    # Composition requires --mtp on.
+    try:
+        build_config(_ns(mtp_ngram="on", thinking="off"))
+        raise AssertionError("expected SystemExit without --mtp on")
+    except SystemExit as exc:
+        assert "--mtp on" in str(exc)
+
+    # Exclusive with standalone ngram / dflash.
+    try:
+        build_config(_ns(mtp="on", mtp_ngram="on", ngram="on", thinking="off"))
+        raise AssertionError("expected SystemExit for ngram+mtp-ngram")
+    except SystemExit as exc:
+        assert "exclusive" in str(exc)
+    try:
+        build_config(_ns(mtp="on", mtp_ngram="on", dflash="on", thinking="off"))
+        raise AssertionError("expected SystemExit for dflash+mtp-ngram")
+    except SystemExit as exc:
+        assert "exclusive" in str(exc)
+
+    # Requires greedy sampling and thinking off.
+    try:
+        build_config(_ns(mtp="on", mtp_ngram="on", thinking="off", sampling="recipe:general"))
+        raise AssertionError("expected SystemExit for non-greedy sampling")
+    except SystemExit as exc:
+        assert "greedy" in str(exc)
+    try:
+        build_config(_ns(mtp="on", mtp_ngram="on", thinking="med"))
+        raise AssertionError("expected SystemExit without thinking off")
+    except SystemExit as exc:
+        assert "thinking off" in str(exc)
+
+    # Defaults 24/48/64; invalid bounds refused.
+    cfg = build_config(_ns(mtp="on", mtp_ngram="on", thinking="off"))
+    assert cfg["mtp_ngram"] == "on"
+    assert cfg["mtp_ngram_match"] == 24
+    assert cfg["mtp_ngram_min"] == 48
+    assert cfg["mtp_ngram_max"] == 64
+    cfg = build_config(_ns(
+        mtp="on", mtp_ngram="on", thinking="off",
+        mtp_ngram_match=16, mtp_ngram_min=32, mtp_ngram_max=48,
+    ))
+    assert cfg["mtp_ngram_match"] == 16
+    assert cfg["mtp_ngram_min"] == 32
+    assert cfg["mtp_ngram_max"] == 48
+    try:
+        build_config(_ns(mtp="on", mtp_ngram="on", thinking="off", mtp_ngram_match=0))
+        raise AssertionError("expected SystemExit for match<1")
+    except SystemExit as exc:
+        assert "mtp-ngram-match" in str(exc)
+    try:
+        build_config(_ns(mtp="on", mtp_ngram="on", thinking="off", mtp_ngram_min=0))
+        raise AssertionError("expected SystemExit for min<1")
+    except SystemExit as exc:
+        assert "mtp-ngram-min" in str(exc)
+    try:
+        build_config(_ns(mtp="on", mtp_ngram="on", thinking="off", mtp_ngram_max=65))
+        raise AssertionError("expected SystemExit for max>64")
+    except SystemExit as exc:
+        assert "mtp-ngram-max" in str(exc)
+    try:
+        build_config(_ns(
+            mtp="on", mtp_ngram="on", thinking="off",
+            mtp_ngram_min=50, mtp_ngram_max=40,
+        ))
+        raise AssertionError("expected SystemExit for min>max")
+    except SystemExit as exc:
+        assert "must be <=" in str(exc)
+
+    # Preflight names the 24/48/64 default gate.
+    import io
+    from contextlib import redirect_stdout
+    cfg = build_config(_ns(mtp="on", mtp_ngram="on", thinking="off"))
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        show_config(cfg)
+    pre = buf.getvalue()
+    assert "default gate 24/48/64" in pre
+    assert "match=24 min=48 max=64" in pre
+
+    # TOML stays mode=mtp (no ngram selector); env is the only composition switch.
+    with tempfile.TemporaryDirectory() as home:
+        Path(home, ".hipfire").mkdir()
+        cfg = {
+            "port": 11520,
+            "model": "/models/x.mq4",
+            "kv": "q8",
+            "mtp": "on",
+            "dflash": "off",
+            "ngram": "off",
+            "mtp_ngram": "on",
+            "mtp_ngram_match": 24,
+            "mtp_ngram_min": 48,
+            "mtp_ngram_max": 64,
+            "thinking_budget": "off",
+            "deepseek4_compute_placement": "single",
+            "devices": None,
+        }
+        _write_native_config(cfg, home)
+        text = Path(home, ".hipfire", "config.toml").read_text(encoding="utf-8")
+        assert 'mode = "mtp"' in text
+        assert 'mtp = "on"' in text
+        assert 'ngram = "off"' in text
+        assert "mtp_ngram" not in text
+        assert "HIPFIRE_MTP_NGRAM" not in text
+
+    # turn_line carries a concise ngram-mod fragment without dropping tau (opt-on only).
+    line_on = turn_line(1, {
+        "runaway": False, "empty": False, "attractor": False,
+        "decode_tok_s": 100.0, "decode_estimated": False,
+        "prefill_tok_s": 500.0, "prefill_ms": 10,
+        "finish": "stop", "ctx": 32, "cached": 0, "gen": 16,
+        "think_words": 0, "ans_words": 4, "tau": 2.5,
+        "mtp_ngram": True,
+        "ngram_mod_accepted": 6, "ngram_mod_drafts": 10,
+        "ngram_mod_accept_rate": 0.6,
+        "mtp_windows": 3, "ar_windows": 2, "mtp_retired": True,
+        "ans_preview": "ok",
+    })
+    assert "tau=2.5" in line_on
+    assert "ngram=6/10@0.60" in line_on
+    assert "win=3/2" in line_on
+    assert "retired=1" in line_on
+    assert "pld=" not in line_on
+
+    # Opt-off / absent mtp_ngram: no ngram fragment even if metrics leak in.
+    line_off = turn_line(1, {
+        "runaway": False, "empty": False, "attractor": False,
+        "decode_tok_s": 100.0, "decode_estimated": False,
+        "prefill_tok_s": 500.0, "prefill_ms": 10,
+        "finish": "stop", "ctx": 32, "cached": 0, "gen": 16,
+        "think_words": 0, "ans_words": 4, "tau": 2.5,
+        "mtp_ngram": False,
+        "ngram_mod_accepted": 6, "ngram_mod_drafts": 10,
+        "ngram_mod_accept_rate": 0.6,
+        "mtp_windows": 3, "ar_windows": 2, "mtp_retired": True,
+        "ans_preview": "ok",
+    })
+    assert "tau=2.5" in line_off
+    assert "ngram=" not in line_off
+    assert "win=" not in line_off
+    assert "retired=" not in line_off
+    line_absent = turn_line(1, {
+        "runaway": False, "empty": False, "attractor": False,
+        "decode_tok_s": 100.0, "decode_estimated": False,
+        "prefill_tok_s": 500.0, "prefill_ms": 10,
+        "finish": "stop", "ctx": 32, "cached": 0, "gen": 16,
+        "think_words": 0, "ans_words": 4, "tau": 1.0,
+        "ngram_mod_windows": 9, "ngram_mod_drafts": 9, "ans_preview": "ok",
+    })
+    assert "tau=1.0" in line_absent
+    assert "ngram=" not in line_absent
+    assert "pld=" not in line_absent
+
+    # spawn_serve opt-off pops all inherited ngram-mod env (no service start).
+    import unittest.mock as mock
+    captured = {}
+
+    class _FakeProc:
+        pid = 4242
+
+        def poll(self):
+            return None
+
+    def _fake_popen(*_a, **kw):
+        captured["env"] = dict(kw.get("env") or {})
+        return _FakeProc()
+
+    _ENV_KEYS = (
+        "HIPFIRE_MTP_NGRAM",
+        "HIPFIRE_NGRAM_MOD_N_MATCH",
+        "HIPFIRE_NGRAM_MOD_N_MIN",
+        "HIPFIRE_NGRAM_MOD_N_MAX",
+        "HIPFIRE_MTP_NGRAM_K",
+    )
+    with tempfile.TemporaryDirectory() as home:
+        Path(home, ".hipfire").mkdir()
+        log = str(Path(home, "serve.log"))
+        Path(log).write_text("", encoding="utf-8")
+        cfg_off = build_config(_ns(mtp="on", mtp_ngram="off"))
+        cfg_off["serve_warm_timeout_secs"] = 2
+        prev = {k: os.environ.get(k) for k in _ENV_KEYS}
+        os.environ["HIPFIRE_MTP_NGRAM"] = "1"
+        os.environ["HIPFIRE_NGRAM_MOD_N_MATCH"] = "24"
+        os.environ["HIPFIRE_NGRAM_MOD_N_MIN"] = "48"
+        os.environ["HIPFIRE_NGRAM_MOD_N_MAX"] = "64"
+        os.environ["HIPFIRE_MTP_NGRAM_K"] = "12"
+        try:
+            with mock.patch("subprocess.Popen", side_effect=_fake_popen), \
+                 mock.patch(f"{__name__}._native_service_warm", return_value=True), \
+                 mock.patch(f"{__name__}._kill_serve"), \
+                 mock.patch(f"{__name__}._write_pid_file"), \
+                 mock.patch(f"{__name__}._clear_pid_file"), \
+                 mock.patch(f"{__name__}._write_native_config"), \
+                 mock.patch(f"{__name__}._native_cli", return_value="/bin/true"), \
+                 mock.patch("time.sleep"), \
+                 mock.patch("atexit.register"):
+                assert spawn_serve(cfg_off, home, log) is not None
+        finally:
+            for k, v in prev.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+    for k in _ENV_KEYS:
+        assert k not in captured["env"], k
+
+    # Opt-on injects HIPFIRE_MTP_NGRAM + the three NGRAM_MOD knobs.
+    captured.clear()
+    with tempfile.TemporaryDirectory() as home:
+        Path(home, ".hipfire").mkdir()
+        log = str(Path(home, "serve.log"))
+        Path(log).write_text("", encoding="utf-8")
+        cfg_on = build_config(_ns(
+            mtp="on", mtp_ngram="on", thinking="off",
+            mtp_ngram_match=16, mtp_ngram_min=32, mtp_ngram_max=48,
+        ))
+        cfg_on["serve_warm_timeout_secs"] = 2
+        with mock.patch("subprocess.Popen", side_effect=_fake_popen), \
+             mock.patch(f"{__name__}._native_service_warm", return_value=True), \
+             mock.patch(f"{__name__}._kill_serve"), \
+             mock.patch(f"{__name__}._write_pid_file"), \
+             mock.patch(f"{__name__}._clear_pid_file"), \
+             mock.patch(f"{__name__}._write_native_config"), \
+             mock.patch(f"{__name__}._native_cli", return_value="/bin/true"), \
+             mock.patch("time.sleep"), \
+             mock.patch("atexit.register"):
+            assert spawn_serve(cfg_on, home, log) is not None
+    assert captured["env"].get("HIPFIRE_MTP_NGRAM") == "1"
+    assert captured["env"].get("HIPFIRE_NGRAM_MOD_N_MATCH") == "16"
+    assert captured["env"].get("HIPFIRE_NGRAM_MOD_N_MIN") == "32"
+    assert captured["env"].get("HIPFIRE_NGRAM_MOD_N_MAX") == "48"
+    assert "HIPFIRE_MTP_NGRAM_K" not in captured["env"]
+
+    print("serve_harness: mtp-ngram-config self-test OK", flush=True)
+
+
+
 
 def _native_service_warm(port, expected_model=None, proc=None):
     """True only when health is ready for *this* spawn.
@@ -845,6 +1255,20 @@ def spawn_serve(cfg, home, log):
                HIPFIRE_KV_MODE=cfg["kv"], HIPFIRE_CASK_OFF="1", HIPFIRE_MODEL=cfg["model"])
     if cfg["mtp"] == "on":
         env.update(HIPFIRE_QWEN_MTP="1", HIPFIRE_MTP_SAMPLED="1", HIPFIRE_MTP_PREFIX_CACHE="1")
+    # Experimental long-gated ngram-mod inside native MTP (harness-only; no TOML key).
+    # Opt-off must clear inherited vars so a parent shell cannot contradict preflight.
+    if cfg.get("mtp_ngram") == "on":
+        env["HIPFIRE_MTP_NGRAM"] = "1"
+        env["HIPFIRE_NGRAM_MOD_N_MATCH"] = str(int(cfg["mtp_ngram_match"]))
+        env["HIPFIRE_NGRAM_MOD_N_MIN"] = str(int(cfg["mtp_ngram_min"]))
+        env["HIPFIRE_NGRAM_MOD_N_MAX"] = str(int(cfg["mtp_ngram_max"]))
+    else:
+        env.pop("HIPFIRE_MTP_NGRAM", None)
+        env.pop("HIPFIRE_NGRAM_MOD_N_MATCH", None)
+        env.pop("HIPFIRE_NGRAM_MOD_N_MIN", None)
+        env.pop("HIPFIRE_NGRAM_MOD_N_MAX", None)
+    # Retire obsolete short-PLD K env if a parent shell still exports it.
+    env.pop("HIPFIRE_MTP_NGRAM_K", None)
     # Explicit --draft pins HIPFIRE_DFLASH_DRAFT. When absent, preserve any
     # caller-inherited value (do not pop/clear) so parent gates can pin the draft.
     if cfg.get("draft"):
@@ -961,6 +1385,14 @@ def send(cfg, messages):
         "prefill_ms": timings.get("prefill_ms"), "prefill_tok_s": timings.get("prefill_tok_s"),
         "decode_tok_s": decode_ts, "decode_estimated": decode_est, "tau": timings.get("tau"),
         "cycles": timings.get("cycles"), "dflash": timings.get("dflash"), "mtp": timings.get("mtp"),
+        "mtp_ngram": timings.get("mtp_ngram"),
+        "ngram_mod_windows": timings.get("ngram_mod_windows"),
+        "ngram_mod_drafts": timings.get("ngram_mod_drafts"),
+        "ngram_mod_accepted": timings.get("ngram_mod_accepted"),
+        "ngram_mod_accept_rate": timings.get("ngram_mod_accept_rate"),
+        "mtp_windows": timings.get("mtp_windows"),
+        "ar_windows": timings.get("ar_windows"),
+        "mtp_retired": timings.get("mtp_retired"),
         "ttft_s": round(ttft or 0, 3), "wall_s": round(wall, 3),
         "attractor": bad, "empty": (cfg.get("expect_visible", True) and len(visible) == 0),
         "runaway": (finish == "length"),
@@ -979,10 +1411,22 @@ def turn_line(i, r, recall=""):
     dec_str = f"{dec}~" if (dec is not None and r.get("decode_estimated")) else f"{dec}"
     prefill_tok_s = r.get("prefill_tok_s")
     prefill_str = f"{prefill_tok_s}" if prefill_tok_s is not None else "n/a"
+    ngram_mod = ""
+    # ngram-mod fragment is meaningful only for MTP+ngram-mod composition.
+    if r.get("mtp_ngram"):
+        rate = r.get("ngram_mod_accept_rate")
+        rate_s = f"{rate:.2f}" if isinstance(rate, (int, float)) else rate
+        retired = r.get("mtp_retired")
+        retired_s = "1" if retired is True else "0" if retired is False else retired
+        ngram_mod = (
+            f" ngram={r.get('ngram_mod_accepted')}/{r.get('ngram_mod_drafts')}"
+            f"@{rate_s} win={r.get('mtp_windows')}/{r.get('ar_windows')}"
+            f" retired={retired_s}"
+        )
     return (f"  t{i:<2} finish={str(r['finish']):<6} ctx={r['ctx']:<6} cached={r['cached']:<6} "
             f"gen={r['gen']:<5}(think {r['think_words']}/ans {r['ans_words']}w) "
             f"prefill={r['prefill_ms']}ms/{prefill_str}tok/s "
-            f"decode={dec_str}tok/s tau={r['tau']}"
+            f"decode={dec_str}tok/s tau={r['tau']}{ngram_mod}"
             f"{recall}{fl} | {r['ans_preview']!r}")
 
 
@@ -1049,6 +1493,13 @@ def run(cfg, args):
         summary += f" avg_prefill={sum(prefill)/len(prefill):.1f}tok/s"
     if dec:
         summary += f" avg_decode={sum(dec)/len(dec):.1f}tok/s"
+    nm_acc = [r["ngram_mod_accepted"] for r in g if isinstance(r.get("ngram_mod_accepted"), (int, float))]
+    nm_drf = [r["ngram_mod_drafts"] for r in g if isinstance(r.get("ngram_mod_drafts"), (int, float))]
+    if nm_acc or nm_drf or any(r.get("mtp_ngram") for r in g):
+        sa = int(sum(nm_acc)) if nm_acc else 0
+        sd = int(sum(nm_drf)) if nm_drf else 0
+        rate = (sa / sd) if sd else 0.0
+        summary += f" ngram={sa}/{sd}@{rate:.2f}"
     print(summary, flush=True)
     if args.out:
         json.dump(rows, open(args.out, "w"), indent=0)
@@ -1103,6 +1554,48 @@ def main():
                     choices=["none", "low", "high", "max"],
                     help="parent-model reasoning_effort prompt semantics; independent of "
                          "--thinking. With no explicit/registry budget, low/high/max is uncapped.")
+    ap.add_argument("--ngram", default="off", choices=["off", "on"],
+                    help="Model-free n-gram/PLD speculator (default off). 'on' emits the "
+                         "exclusive selector mode=ngram + ngram=on + dflash/mtp off, and is "
+                         "REFUSED alongside --dflash on / --mtp on.")
+    ap.add_argument("--ngram-k", type=int, default=None, dest="ngram_k",
+                    help="Draft block size K for --ngram on (loader default 12). K also sets the "
+                         "PLD copy window: max_extract = K-1, so K caps how many tokens a "
+                         "verbatim context match can copy in one cycle.")
+    ap.add_argument(
+        "--mtp-ngram",
+        default="off",
+        choices=["off", "on"],
+        dest="mtp_ngram",
+        help="Experimental long-gated ngram-mod composition inside native MTP (default off). "
+             "Requires --mtp on, greedy sampling, and --thinking off; exclusive with standalone "
+             "--ngram on and --dflash on. Sets HIPFIRE_MTP_NGRAM=1 plus HIPFIRE_NGRAM_MOD_* "
+             "(no TOML change); still emits mode=mtp selector.",
+    )
+    ap.add_argument(
+        "--mtp-ngram-match",
+        type=int,
+        default=None,
+        dest="mtp_ngram_match",
+        help="ngram-mod match length for --mtp-ngram on (default 24, >=1). "
+             "Sets HIPFIRE_NGRAM_MOD_N_MATCH.",
+    )
+    ap.add_argument(
+        "--mtp-ngram-min",
+        type=int,
+        default=None,
+        dest="mtp_ngram_min",
+        help="ngram-mod minimum draft length for --mtp-ngram on (default 48, >=1, <=max). "
+             "Sets HIPFIRE_NGRAM_MOD_N_MIN. Fresh content pays no ngram verify until this chain exists.",
+    )
+    ap.add_argument(
+        "--mtp-ngram-max",
+        type=int,
+        default=None,
+        dest="mtp_ngram_max",
+        help="ngram-mod maximum draft length for --mtp-ngram on (default 64, <=64). "
+             "Sets HIPFIRE_NGRAM_MOD_N_MAX.",
+    )
     ap.add_argument("--draft", default=None,
                     help="Optional DFlash draft path; sets HIPFIRE_DFLASH_DRAFT for the serve child. "
                          "When omitted, any caller-inherited HIPFIRE_DFLASH_DRAFT is preserved.")
@@ -1164,6 +1657,7 @@ def main():
         _self_test_prompt_sources()
         _self_test_device_config()
         _self_test_kv_resolution()
+        _self_test_mtp_ngram_config()
         return
     if not args.model:
         ap.error("--model is required unless --self-test")

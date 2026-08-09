@@ -5093,6 +5093,14 @@ fn completion_timings(completion: &Completion) -> serde_json::Value {
         "cycles": done.get("cycles"),
         "dflash": done.get("dflash"),
         "mtp": done.get("mtp"),
+        "mtp_ngram": done.get("mtp_ngram"),
+        "ngram_mod_windows": done.get("ngram_mod_windows"),
+        "ngram_mod_drafts": done.get("ngram_mod_drafts"),
+        "ngram_mod_accepted": done.get("ngram_mod_accepted"),
+        "ngram_mod_accept_rate": done.get("ngram_mod_accept_rate"),
+        "mtp_windows": done.get("mtp_windows"),
+        "ar_windows": done.get("ar_windows"),
+        "mtp_retired": done.get("mtp_retired"),
     })
 }
 
@@ -10099,13 +10107,29 @@ mod tests {
                 "cached_tokens": 4,
                 "ttft_ms": 8.5,
                 "decode_tok_s": 115.0,
-                "finish_reason": "stop"
+                "finish_reason": "stop",
+                "mtp_ngram": 3,
+                "ngram_mod_windows": 5,
+                "ngram_mod_drafts": 12,
+                "ngram_mod_accepted": 9,
+                "ngram_mod_accept_rate": 0.75,
+                "mtp_windows": 4,
+                "ar_windows": 2,
+                "mtp_retired": true
             }),
         };
         let json = completion_json(&completion);
         assert_eq!(json["usage"]["total_tokens"], 19);
         assert_eq!(json["usage"]["prompt_tokens_details"]["cached_tokens"], 4);
         assert_eq!(json["timings"]["decode_tok_s"], 115.0);
+        assert_eq!(json["timings"]["mtp_ngram"], 3);
+        assert_eq!(json["timings"]["ngram_mod_windows"], 5);
+        assert_eq!(json["timings"]["ngram_mod_drafts"], 12);
+        assert_eq!(json["timings"]["ngram_mod_accepted"], 9);
+        assert_eq!(json["timings"]["ngram_mod_accept_rate"], 0.75);
+        assert_eq!(json["timings"]["mtp_windows"], 4);
+        assert_eq!(json["timings"]["ar_windows"], 2);
+        assert_eq!(json["timings"]["mtp_retired"], true);
         assert_eq!(json["created"], 7);
 
         let qwen_cached = Completion {

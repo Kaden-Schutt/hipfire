@@ -29,9 +29,11 @@ use hipfire_runtime::llama;
 use hipfire_runtime::loader_api::{CaskConfig, LoadCtx, ModelSource, SpecLoadCfg};
 use hipfire_runtime::multi_gpu::Gpus;
 use hipfire_runtime::spec::{SpecEmit, SpecEmitCtx, SpecTargetGuard, Speculator};
+use hipfire_runtime::ngram_mod::NgramModPool;
 use hipfire_runtime::triattn::{EvictionCtx, TriAttnCenters};
 use rdna_compute::Gpu;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 // ─── Object-safe Carrier trait ──────────────────────────────────────
 
@@ -349,6 +351,12 @@ pub struct LoadedModel {
     pub dflash_checkpoints: Vec<(usize, DeltaNetSnapshot)>,
     pub asst_turn_cache: AsstTurnCache,
     pub decoded_vocab: Option<std::sync::Arc<Vec<String>>>,
+    /// Model-lifetime shared n-gram-mod pool (`HIPFIRE_MTP_NGRAM`). Lazily created
+    /// (or replaced on config mismatch) by the serve path; starts `None` so every
+    /// `skeleton` construction site inherits the opt-in. Host-only — drops with
+    /// `LoadedModel` on unload. Future multi-slot serve must not share one pool
+    /// across concurrent slots without coordination beyond this `Mutex`.
+    pub ngram_mod_pool: Option<Arc<Mutex<NgramModPool>>>,
     pub model_path: String,
     /// The model's speculative-decode drafter+verifier, when a draft model is
     /// loaded (`Box<dyn Speculator>` so the daemon's decode loop is agnostic to
@@ -416,6 +424,7 @@ impl LoadedModel {
             prefill_checkpoints: Vec::new(),
             dflash_checkpoints: Vec::new(),
             decoded_vocab: None,
+            ngram_mod_pool: None,
             model_path,
             speculator: None,
             chat_template,

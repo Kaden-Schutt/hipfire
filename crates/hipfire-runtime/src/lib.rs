@@ -52,6 +52,8 @@ pub mod sampler;
 pub mod spec;
 
 pub mod spec_ngram;
+pub mod ngram_mod;
+
 pub mod tp_shard;
 #[cfg(feature = "deltanet")]
 pub mod triattn;

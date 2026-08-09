@@ -46,7 +46,7 @@ use hipfire_runtime::prompt_frame::ThinkMode;
 use hipfire_runtime::sampler::{self, SamplerConfig};
 use std::io::{BufRead, Write};
 use std::path::Path;
-use std::sync::{mpsc, Condvar, Mutex, OnceLock};
+use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use hipfire_loader::{AsstTurnCache, EpArch, EpState, Eviction, LoadedModel, ModelState};
@@ -13076,6 +13076,7 @@ fn generate_qwen35_mtp(
     use hipfire_arch_qwen35::mtp_head::MtpKvMode;
     use hipfire_arch_qwen35::mtp_spec::{self, MtpSpecState};
     use hipfire_arch_qwen35::speculative::{ModelSlot, ModelSlotConfig};
+    use hipfire_runtime::ngram_mod::{NgramModConfig, NgramModPool};
 
     // Adaptive poison is sticky until unload. Fail at preflight — never
     // reset_with_cache or clear poison on a poisoned controller.
@@ -13089,14 +13090,74 @@ fn generate_qwen35_mtp(
         }
     }
 
-    // ── Resolve the proven-durable MTP config ──────────────────────────
-    // K defaults to 3 (max_n); p_min defaults to 0.4. Both env-overridable so
-    // the GPU-validation thread can sweep. `set_p_min(0.4)` is applied below
-    // unconditionally (the MtpSpecState::new default p_min is arch-derived; we
-    // pin the proven value for the serve path and let HIPFIRE_MTP_P_MIN win).
-    let max_n: usize = Some(hipfire_runtime::config::get().mtp_k)
+    // ── Resolve the proven-durable MTP config + ngram-mod env controls ─
+    // Ordinary MTP draft depth (proposal-buffer / with_k budget). Kept as
+    // `mtp_k` so a larger verify capacity never inflates native MTP depth.
+    // p_min defaults to 0.4. Both env-overridable so the GPU-validation thread
+    // can sweep. `set_p_min(0.4)` is applied below unconditionally (the
+    // MtpSpecState::new default p_min is arch-derived; we pin the proven value
+    // for the serve path and let HIPFIRE_MTP_P_MIN win).
+    let mtp_k: usize = Some(hipfire_runtime::config::get().mtp_k)
         .filter(|k| (1..=8).contains(k))
         .unwrap_or(3);
+    // Upstream-style long-gated ngram-mod: opt-in only for greedy non-thinking
+    // requests. The request contract uses `max_think_tokens == 1` as the
+    // explicit no-thinking sentinel; zero means uncapped thinking.
+    let mtp_ngram_raw = std::env::var("HIPFIRE_MTP_NGRAM").ok().as_deref() == Some("1");
+    let n_match: usize = std::env::var("HIPFIRE_NGRAM_MOD_N_MATCH")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(24);
+    let n_min: usize = std::env::var("HIPFIRE_NGRAM_MOD_N_MIN")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(48);
+    let n_max: usize = std::env::var("HIPFIRE_NGRAM_MOD_N_MAX")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(64);
+    // Validation: max<=64 and min<=max (plus non-zero). Invalid config leaves
+    // legacy path; valid config arms ngram-mod.
+    let ngram_mod_config_valid = n_max <= 64 && n_max >= 1 && n_match >= 1 && n_min <= n_max;
+    let ngram_mod_armed =
+        mtp_ngram_raw && temp <= 1e-6 && max_think_tokens == 1 && ngram_mod_config_valid;
+    let verify_capacity: usize = if ngram_mod_armed {
+        mtp_k.max(n_max)
+    } else {
+        mtp_k
+    };
+    // Lazily create or replace model-lifetime shared pool on config mismatch.
+    // Clone Arc for request-local use; lock is never held over GPU work.
+    let ngram_mod_pool: Option<Arc<Mutex<NgramModPool>>> = if ngram_mod_armed {
+        let cfg = NgramModConfig {
+            capacity: 1 << 22,
+            n_match,
+            n_min,
+            n_max,
+        };
+        let needs_new = match m.ngram_mod_pool.as_ref() {
+            None => true,
+            Some(existing) => {
+                let guard = existing.lock().unwrap();
+                guard.config() != &cfg
+            }
+        };
+        if needs_new {
+            match NgramModPool::new(cfg) {
+                Ok(pool) => {
+                    let arc = Arc::new(Mutex::new(pool));
+                    m.ngram_mod_pool = Some(arc.clone());
+                    Some(arc)
+                }
+                Err(_) => None,
+            }
+        } else {
+            Some(m.ngram_mod_pool.as_ref().unwrap().clone())
+        }
+    } else {
+        None
+    };
+    let mtp_ngram = ngram_mod_pool.is_some();
     let p_min: f32 = std::env::var("HIPFIRE_MTP_P_MIN")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -13291,12 +13352,13 @@ fn generate_qwen35_mtp(
     let dim = target.config.dim;
     let vocab = target.config.vocab_size;
 
-    // Capacity guard: worst case per cycle writes max_n+1 verify slots before
-    // the rollback truncates. seq budget must hold prompt + max*(max_n+1).
+    // Context bound is prompt+max_tokens+verify_capacity+16 (slot reuse via
+    // rollback/replay, not max_tokens*(verify_capacity+1)).
     let max_seq_total = m.physical_cap;
     if prompt_tokens
         .len()
-        .saturating_add(max_tokens.saturating_mul(max_n + 1))
+        .saturating_add(max_tokens)
+        .saturating_add(verify_capacity)
         .saturating_add(16)
         > max_seq_total
     {
@@ -13304,10 +13366,10 @@ fn generate_qwen35_mtp(
             stdout,
             id,
             format!(
-                "prompt ({}) + max ({}) × (max_n+1) ({}) exceeds context capacity {} — reload with a larger max_seq",
+                "prompt ({}) + max ({}) + verify_capacity ({}) +16 exceeds context capacity {} — reload with a larger max_seq",
                 prompt_tokens.len(),
                 max_tokens,
-                max_n + 1,
+                verify_capacity,
                 max_seq_total
             ),
         );
@@ -13332,8 +13394,15 @@ fn generate_qwen35_mtp(
     // alloc below needs &mut state + &mut gpu.
     let cvs_opt = head.weights.compressed_vocab_size;
     let kv_mode = MtpKvMode::Q8;
-    let mut state =
-        match MtpSpecState::new_for_slot_with_kv_mode(gpu, &target, head, max_n, kv_mode) {
+    let mut state = if ngram_mod_pool.is_some() {
+        match MtpSpecState::new_for_slot_with_kv_mode_and_verify_capacity(
+            gpu,
+            &target,
+            head,
+            mtp_k,
+            verify_capacity,
+            kv_mode,
+        ) {
             Ok(s) => s,
             Err(e) => {
                 emit_error_with_id(stdout, id, format!("alloc MtpSpecState: {e:?}"));
@@ -13347,7 +13416,24 @@ fn generate_qwen35_mtp(
                 }));
                 return;
             }
-        };
+        }
+    } else {
+        match MtpSpecState::new_for_slot_with_kv_mode(gpu, &target, head, mtp_k, kv_mode) {
+            Ok(s) => s,
+            Err(e) => {
+                emit_error_with_id(stdout, id, format!("alloc MtpSpecState: {e:?}"));
+                m.state = Some(ModelState::Qwen35(Qwen35Bundle {
+                    config: orig_config,
+                    weights: target.weights,
+                    scratch: target.scratch,
+                    kv_cache: target.kv_cache,
+                    dn_state: target.dn_state,
+                    kv_adaptive: None,
+                }));
+                return;
+            }
+        }
+    };
     // Compressed-serial (cvs) head needs its compressed-logits scratch allocated
     // up front (mtp_only_demo does this; the daemon previously only set up the
     // full-vocab path, so a cvs sidecar panicked inside spec_step). Full-vocab
@@ -13503,6 +13589,25 @@ fn generate_qwen35_mtp(
     let mut generated = 0usize;
     let mut cycles = 0usize;
     let mut accepted_total = 0usize;
+    // Ngram-mod stats (only when ngram_mod is armed). ar_windows counts
+    // post-retirement misses (with_k 0).
+    let mut ngram_mod_windows = 0usize;
+    let mut ngram_mod_drafts = 0usize;
+    let mut ngram_mod_accepted = 0usize;
+    let mut mtp_windows = 0usize;
+    let mut ar_windows = 0usize;
+    let mut mtp_retired = false;
+    // Request context prompt+seed for the shared pool. Pushed incrementally
+    // with actually emitted committed tokens; insert_range learns them.
+    let mut ngram_context: Vec<u32> = Vec::with_capacity(prompt_tokens.len() + max_tokens + 1);
+    ngram_context.extend_from_slice(&prompt_tokens);
+    ngram_context.push(seed_token);
+    let mut ngram_indexed_until: usize = 0;
+    if let Some(pool_arc) = ngram_mod_pool.as_ref() {
+        let mut pool = pool_arc.lock().unwrap();
+        pool.insert_range(&ngram_context, n_match);
+        ngram_indexed_until = ngram_context.len();
+    }
     let mut think_count: usize = 0;
     let mut prev_in_think = false;
     // MTP force-closes only at a committed block boundary so its target/head
@@ -13563,27 +13668,124 @@ fn generate_qwen35_mtp(
         if check_abort(id) {
             break;
         }
-        if cur_pos + max_n + 1 >= max_seq_total {
+        if cur_pos + verify_capacity + 1 >= max_seq_total {
             break;
         }
 
-        let result = match mtp_spec::spec_step_mtp_compressed_serial(
-            gpu,
-            &mut target,
-            head,
-            &mut state,
-            cur_pos,
-            last_committed,
-            eos_token,
-        ) {
-            Ok(r) => r,
-            Err(e) => {
-                step_error = Some(format!("{e:?}"));
-                break;
+        // Ngram-mod draft attempt: short-lock, clone Vec, drop lock before GPU.
+        let remaining_emit = max_tokens.saturating_sub(generated);
+        let spine_budget = remaining_emit.saturating_sub(1); // room for bonus
+        let ngram_cands: Option<Vec<u32>> = if mtp_ngram && spine_budget > 0 {
+            let caller_max = spine_budget.min(verify_capacity);
+            let draft = {
+                let pool = ngram_mod_pool.as_ref().unwrap().lock().unwrap();
+                pool.draft(&ngram_context, caller_max)
+            };
+            draft
+        } else {
+            None
+        };
+        let used_ngram = ngram_cands.as_ref().is_some_and(|c| !c.is_empty());
+        let result = if used_ngram {
+            let cands = ngram_cands.as_ref().unwrap();
+            match mtp_spec::spec_step_mtp_compressed_serial_with_takeover_candidates(
+                gpu,
+                &mut target,
+                head,
+                &mut state,
+                cur_pos,
+                last_committed,
+                eos_token,
+                cands,
+                mtp_retired,
+            ) {
+                Ok(r) => r,
+                Err(e) => {
+                    step_error = Some(format!("{e:?}"));
+                    break;
+                }
+            }
+        } else if mtp_ngram {
+            if mtp_retired {
+                // After retirement, miss verifies trunk only (k=0) – no MTP head.
+                match mtp_spec::spec_step_mtp_compressed_serial_with_k(
+                    gpu,
+                    &mut target,
+                    head,
+                    &mut state,
+                    cur_pos,
+                    last_committed,
+                    eos_token,
+                    0,
+                ) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        step_error = Some(format!("{e:?}"));
+                        break;
+                    }
+                }
+            } else {
+                // Before takeover, miss goes to native MTP K.
+                match mtp_spec::spec_step_mtp_compressed_serial_with_k(
+                    gpu,
+                    &mut target,
+                    head,
+                    &mut state,
+                    cur_pos,
+                    last_committed,
+                    eos_token,
+                    mtp_k,
+                ) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        step_error = Some(format!("{e:?}"));
+                        break;
+                    }
+                }
+            }
+        } else {
+            // Off-path: identical to pre-ngram (legacy entry).
+            match mtp_spec::spec_step_mtp_compressed_serial(
+                gpu,
+                &mut target,
+                head,
+                &mut state,
+                cur_pos,
+                last_committed,
+                eos_token,
+            ) {
+                Ok(r) => r,
+                Err(e) => {
+                    step_error = Some(format!("{e:?}"));
+                    break;
+                }
             }
         };
         cycles += 1;
         accepted_total += result.accept_count;
+        if used_ngram {
+            ngram_mod_windows += 1;
+            ngram_mod_drafts += result.drafts_generated;
+            ngram_mod_accepted += result.accept_count;
+            // Short-lock record_draft_result for every ngram attempt.
+            {
+                let mut pool = ngram_mod_pool.as_ref().unwrap().lock().unwrap();
+                let _ = pool.record_draft_result(result.drafts_generated as u32, result.accept_count as u32);
+            }
+            // Positive ngram acceptance latches retirement; zero-accept before
+            // takeover stays MTP-capable (single-row repair handled in core).
+            if result.accept_count > 0 && !mtp_retired {
+                mtp_retired = true;
+            }
+        } else if mtp_ngram {
+            if mtp_retired {
+                ar_windows += 1;
+            } else {
+                mtp_windows += 1;
+            }
+        } else {
+            mtp_windows += 1;
+        }
 
         let mut hit_eos = false;
         for &tok in &result.committed {
@@ -13598,6 +13800,9 @@ fn generate_qwen35_mtp(
                 break;
             }
             emitted.push(tok);
+            if mtp_ngram {
+                ngram_context.push(tok);
+            }
             render_client_events(
                 stdout,
                 id,
@@ -13635,13 +13840,17 @@ fn generate_qwen35_mtp(
             None => break, // defensive: spec_step always commits ≥ 1
         };
         cur_pos += result.advance;
+        // Incrementally learn actually emitted committed tokens without
+        // holding lock over GPU work. Seed already covers prompt+seed.
+        if mtp_ngram {
+            let mut pool = ngram_mod_pool.as_ref().unwrap().lock().unwrap();
+            pool.insert_range(&ngram_context, ngram_indexed_until);
+            ngram_indexed_until = ngram_context.len();
+        }
         // Adaptive KV: downshift ONLY the committed/live trunk prefix
         // [0, cur_pos) at the block boundary. Spec verify may have written a
-        // rejected suffix at [cur_pos, cur_pos+(max_n+1-advance)); those slots
-        // stay at the pre-transition tier and are guaranteed overwritten
-        // in-order by the next cycle's verify before any new-tier read treats
-        // them as history (mtp_spec trunk KV rollback is intentionally a no-op).
-        // Fail-closed — do not emit further tokens on transition error.
+        // rejected suffix beyond cur_pos; those slots stay at the prior tier
+        // and are overwritten in order by the next verify.
         if let Some(ad) = m.kv_adaptive.as_mut() {
             match ad.maybe_downshift(gpu, &mut target.kv_cache, cur_pos) {
                 Ok(steps) => {
@@ -13685,6 +13894,9 @@ fn generate_qwen35_mtp(
                         break;
                     }
                     emitted.push(ct);
+                    if mtp_ngram {
+                        ngram_context.push(ct);
+                    }
                     render_client_events(
                         stdout,
                         id,
@@ -13750,6 +13962,13 @@ fn generate_qwen35_mtp(
                 }
                 cur_pos += advance_toks.len();
                 last_committed = *close_ids.last().unwrap();
+                // Learn think-force-close committed tokens (also without lock
+                // over GPU). No-op when ngram is off (thinking disables ngram).
+                if mtp_ngram {
+                    let mut pool = ngram_mod_pool.as_ref().unwrap().lock().unwrap();
+                    pool.insert_range(&ngram_context, ngram_indexed_until);
+                    ngram_indexed_until = ngram_context.len();
+                }
                 think_closed = true;
                 prev_in_think = false;
                 if forced_stop {
@@ -13830,6 +14049,11 @@ fn generate_qwen35_mtp(
         0.0
     };
     let _ = accepted_total;
+    let ngram_mod_accept_rate = if ngram_mod_drafts > 0 {
+        ngram_mod_accepted as f64 / ngram_mod_drafts as f64
+    } else {
+        0.0
+    };
     let hit_length_cap = qwen_dflash_hit_length_cap(
         generated,
         max_tokens,
@@ -13876,6 +14100,14 @@ fn generate_qwen35_mtp(
         "cached_tokens": 0,
         "finish_reason": finish_reason,
         "attempt_id": active_attempt_id(),
+        "mtp_ngram": mtp_ngram,
+        "ngram_mod_windows": ngram_mod_windows,
+        "ngram_mod_drafts": ngram_mod_drafts,
+        "ngram_mod_accepted": ngram_mod_accepted,
+        "ngram_mod_accept_rate": (ngram_mod_accept_rate * 1000.0).round() / 1000.0,
+        "mtp_windows": mtp_windows,
+        "ar_windows": ar_windows,
+        "mtp_retired": mtp_retired,
     });
     stage_terminal_tool_calls(&mut pending_done, finish_reason, wire_tool_calls);
     let decision = await_client_terminal_commit(stdout, id, &pending_done);
@@ -13888,7 +14120,7 @@ fn generate_qwen35_mtp(
     // Per-request debug summary (stderr → serve.log): active drafter, τ, tok/s.
     let drafter = m.speculator.as_ref().map(|s| s.name()).unwrap_or("none");
     eprintln!(
-        "[req {id}] drafter={drafter} tau={tau:.2} tok/s={decode_tok_s:.1} decode ({generated} tok, {cycles} windows)"
+        "[req {id}] drafter={drafter} tau={tau:.2} tok/s={decode_tok_s:.1} decode ({generated} tok, {cycles} windows) mtp_ngram={mtp_ngram} ngram_mod_windows={ngram_mod_windows} ngram_mod_drafts={ngram_mod_drafts} ngram_mod_accepted={ngram_mod_accepted} ngram_mod_accept_rate={ngram_mod_accept_rate:.3} mtp_windows={mtp_windows} ar_windows={ar_windows} mtp_retired={mtp_retired}"
     );
 }
 
