@@ -67,6 +67,56 @@ fn gfx1010_release_wait_required(architecture: Pm4Architecture, device_name: &st
     architecture == Pm4Architecture::Gfx10 && device_name.eq_ignore_ascii_case("gfx1010")
 }
 
+/// Diagnostic-only override for exact-gfx1010 retained-PM4 dependency fencing.
+/// Default remains `ReleaseWait`; `CsPartialFlush` is the historical EVENT_WRITE path.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Gfx1010DependencyPolicy {
+    ReleaseWait,
+    CsPartialFlush,
+}
+
+/// Pure parser for `HIPFIRE_REPLAY_PM4_GFX1010_DEPENDENCY`.
+///
+/// Non-exact-gfx1010 devices always resolve to `CsPartialFlush` and ignore `value`.
+/// On exact gfx1010: unset/`release-wait` => `ReleaseWait`, `cs-partial-flush` =>
+/// `CsPartialFlush`; any other value is a hard prepare error naming the key.
+fn gfx1010_dependency_policy_from_value(
+    architecture: Pm4Architecture,
+    device_name: &str,
+    value: Option<&str>,
+) -> Result<Gfx1010DependencyPolicy, String> {
+    if !gfx1010_release_wait_required(architecture, device_name) {
+        return Ok(Gfx1010DependencyPolicy::CsPartialFlush);
+    }
+    match value {
+        None => Ok(Gfx1010DependencyPolicy::ReleaseWait),
+        Some("release-wait") => Ok(Gfx1010DependencyPolicy::ReleaseWait),
+        Some("cs-partial-flush") => Ok(Gfx1010DependencyPolicy::CsPartialFlush),
+        Some(raw) => Err(format!(
+            "invalid HIPFIRE_REPLAY_PM4_GFX1010_DEPENDENCY={raw:?}; \
+             expected unset, \"release-wait\", or \"cs-partial-flush\""
+        )),
+    }
+}
+
+fn gfx1010_dependency_policy_from_config(
+    architecture: Pm4Architecture,
+    device_name: &str,
+) -> Result<Gfx1010DependencyPolicy, String> {
+    let raw = hipfire_config::process_value("HIPFIRE_REPLAY_PM4_GFX1010_DEPENDENCY");
+    let policy =
+        gfx1010_dependency_policy_from_value(architecture, device_name, raw.as_deref())?;
+    if gfx1010_release_wait_required(architecture, device_name) {
+        let source = if raw.is_none() {
+            "default"
+        } else {
+            "explicit"
+        };
+        eprintln!("[redline] gfx1010 PM4 dependency mode={policy:?} ({source})");
+    }
+    Ok(policy)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Gfx11EntryAcquirePolicy {
     System,
@@ -3655,11 +3705,14 @@ impl ReplayController {
         if cu_mask.is_some() && queue_limit != 1 {
             return Err("gfx1151 CU-mask experiments require single-queue PM4 replay".to_owned());
         }
-        let release_wait = gfx1010_release_wait_required(pm4_architecture, device.name());
+        let gfx1010_exact = gfx1010_release_wait_required(pm4_architecture, device.name());
+        let gfx1010_dependency =
+            gfx1010_dependency_policy_from_config(pm4_architecture, device.name())?;
         // Exact gfx1010 admits only single-queue non-native single-phase lowering.
         // Multi-queue / multi-phase / native-sync topologies stay on CS_PARTIAL_FLUSH
         // elsewhere and are fail-closed here rather than silently degraded.
-        if release_wait && queue_limit != 1 {
+        // Restriction holds under both ReleaseWait and CsPartialFlush overrides.
+        if gfx1010_exact && queue_limit != 1 {
             return Err(
                 "gfx1010 RELEASE_MEM/WAIT_REG_MEM dependency fence requires single-queue \
                  non-native single-phase retained PM4"
@@ -3699,23 +3752,24 @@ impl ReplayController {
                     order
                 }
             };
-            let dependency_mode = if release_wait {
-                let fence = pool
-                    .allocate_fine_grained_bytes(4, 4)
-                    .map_err(|error| format!("allocate gfx1010 dependency fence: {error}"))?;
-                let address = fence.address() as u64;
-                if address == 0 || address & 3 != 0 {
-                    return Err(format!(
-                        "gfx1010 dependency fence address {address:#x} is null or unaligned"
-                    ));
+            let dependency_mode = match gfx1010_dependency {
+                Gfx1010DependencyPolicy::ReleaseWait => {
+                    let fence = pool
+                        .allocate_fine_grained_bytes(4, 4)
+                        .map_err(|error| format!("allocate gfx1010 dependency fence: {error}"))?;
+                    let address = fence.address() as u64;
+                    if address == 0 || address & 3 != 0 {
+                        return Err(format!(
+                            "gfx1010 dependency fence address {address:#x} is null or unaligned"
+                        ));
+                    }
+                    dependency_fence = Some(fence);
+                    LegacyDependencyMode::ReleaseWait {
+                        address,
+                        next_epoch: 0,
+                    }
                 }
-                dependency_fence = Some(fence);
-                LegacyDependencyMode::ReleaseWait {
-                    address,
-                    next_epoch: 0,
-                }
-            } else {
-                LegacyDependencyMode::CsPartialFlush
+                Gfx1010DependencyPolicy::CsPartialFlush => LegacyDependencyMode::CsPartialFlush,
             };
             let mut commands = Pm4Commands::new_with_dependency(
                 pm4_architecture,
@@ -4724,6 +4778,109 @@ mod tests {
             Pm4Architecture::Gfx11,
             "gfx1010"
         ));
+    }
+
+    #[test]
+    fn gfx1010_dependency_policy_defaults_to_release_wait() {
+        assert_eq!(
+            gfx1010_dependency_policy_from_value(Pm4Architecture::Gfx10, "gfx1010", None)
+                .unwrap(),
+            Gfx1010DependencyPolicy::ReleaseWait
+        );
+        assert_eq!(
+            gfx1010_dependency_policy_from_value(
+                Pm4Architecture::Gfx10,
+                "GFX1010",
+                Some("release-wait")
+            )
+            .unwrap(),
+            Gfx1010DependencyPolicy::ReleaseWait
+        );
+    }
+
+    #[test]
+    fn gfx1010_dependency_policy_accepts_cs_partial_flush() {
+        assert_eq!(
+            gfx1010_dependency_policy_from_value(
+                Pm4Architecture::Gfx10,
+                "gfx1010",
+                Some("cs-partial-flush")
+            )
+            .unwrap(),
+            Gfx1010DependencyPolicy::CsPartialFlush
+        );
+    }
+
+    #[test]
+    fn gfx1010_dependency_policy_rejects_unknown_exact_values() {
+        for raw in [
+            "partial-flush",
+            "",
+            "cs",
+            "CS-PARTIAL-FLUSH",
+            "cs_partial_flush",
+            "RELEASE-WAIT",
+            "0",
+            "1",
+            "true",
+            "falsé",
+        ] {
+            let err = gfx1010_dependency_policy_from_value(
+                Pm4Architecture::Gfx10,
+                "gfx1010",
+                Some(raw),
+            )
+            .unwrap_err();
+            assert!(
+                err.contains("HIPFIRE_REPLAY_PM4_GFX1010_DEPENDENCY"),
+                "missing key in error for {raw:?}: {err}"
+            );
+            assert!(
+                err.contains(raw),
+                "missing offending value {raw:?} in error: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn gfx1010_dependency_policy_ignored_off_exact_device() {
+        // Non-exact devices stay on CsPartialFlush and ignore the override key.
+        for (arch, name, value) in [
+            (Pm4Architecture::Gfx10, "gfx1030", Some("release-wait")),
+            (Pm4Architecture::Gfx10, "gfx1011", Some("cs-partial-flush")),
+            (Pm4Architecture::Gfx11, "gfx1100", Some("release-wait")),
+            (Pm4Architecture::Gfx11, "gfx1010", Some("release-wait")),
+            (Pm4Architecture::Gfx12, "gfx1201", Some("bogus")),
+            (Pm4Architecture::Gfx10, "gfx1030", None),
+        ] {
+            assert_eq!(
+                gfx1010_dependency_policy_from_value(arch, name, value).unwrap(),
+                Gfx1010DependencyPolicy::CsPartialFlush,
+                "arch={arch:?} name={name} value={value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn gfx1010_cs_partial_flush_override_emits_event_write_only() {
+        // Encoding path for the diagnostic CsPartialFlush override: no fence
+        // allocation/sentinel; historical EVENT_WRITE CS_PARTIAL_FLUSH only.
+        let mut commands = Pm4Commands::new_with_dependency(
+            Pm4Architecture::Gfx10,
+            Pm4RegisterPolicy::Legacy,
+            Gfx10DispatchInitiatorPolicy::Legacy,
+            None,
+            Gfx11ComputeResourceLimitsPolicy::Legacy,
+            LegacyDependencyMode::CsPartialFlush,
+        );
+        assert_eq!(
+            commands.dependency_mode(),
+            Some(LegacyDependencyMode::CsPartialFlush)
+        );
+        commands.emit_entry_sentinel_reset().unwrap();
+        commands.wait_compute_idle().unwrap();
+        let dwords = commands.dwords().unwrap();
+        assert_eq!(dwords, &[0xc000_4600, 0x407]);
     }
 
     #[test]
