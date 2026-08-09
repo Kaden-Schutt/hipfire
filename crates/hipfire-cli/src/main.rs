@@ -547,6 +547,9 @@ struct ServeArgs {
     /// Expert-parallel degree.
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..=64))]
     tp: Option<u64>,
+    /// Maximum concurrent eligible batched lanes; 1 preserves sequential behavior.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..=32))]
+    continuous_batch_size: Option<u64>,
     /// Internal marker used by the detached child.
     #[arg(long, hide = true)]
     foreground_child: bool,
@@ -2154,6 +2157,7 @@ fn chat_command(paths: &Paths, args: ChatArgs) -> Result<()> {
             kv_backend: None,
             idle_timeout: None,
             tp: None,
+            continuous_batch_size: None,
             foreground_child: false,
         };
         detach_serve(paths, &serve_args, &host, port)?;
@@ -2279,11 +2283,13 @@ struct ServeRuntime {
     registry: RegistryV1,
     current_path: Option<PathBuf>,
     current_arch: Option<String>,
+    continuous_batch_capable: bool,
     current_max_seq: u64,
     cache_capable: bool,
     kv_override: Option<String>,
     kv_backend_override: Option<String>,
     tp: Option<u64>,
+    continuous_batch_size: u64,
 }
 
 struct ServeShared {
@@ -2485,8 +2491,10 @@ fn longest_control_prefix_suffix(text: &str) -> usize {
 
 #[derive(Debug, Default)]
 struct AdmissionState {
-    busy: bool,
+    eligible: usize,
+    ineligible_busy: bool,
     queued: usize,
+    batch_model: Option<String>,
 }
 
 #[derive(Debug)]
@@ -2495,6 +2503,7 @@ struct Admission {
     available: Condvar,
     max_queue: usize,
     timeout: Duration,
+    capacity: usize,
 }
 
 #[derive(Debug)]
@@ -2514,24 +2523,71 @@ impl std::error::Error for AdmissionError {}
 #[derive(Debug)]
 struct AdmissionGuard {
     admission: Arc<Admission>,
+    is_eligible: bool,
+    model: Option<String>,
 }
 
 impl Admission {
     fn new(max_queue: usize, timeout: Duration) -> Self {
+        Self::new_with_capacity(max_queue, timeout, 1)
+    }
+
+    fn new_with_capacity(max_queue: usize, timeout: Duration, capacity: usize) -> Self {
         Self {
             state: Mutex::new(AdmissionState::default()),
             available: Condvar::new(),
             max_queue,
             timeout,
+            capacity: capacity.max(1),
         }
     }
 
+    fn is_model_compatible(current: &Option<String>, requested: Option<&str>) -> bool {
+        match (current, requested) {
+            (None, _) => true,
+            (Some(cur), Some(req)) => cur == req,
+            (Some(_), None) => true,
+        }
+    }
+
+    fn capacity(&self) -> usize {
+        self.capacity
+    }
+
     fn acquire(self: &Arc<Self>) -> std::result::Result<AdmissionGuard, AdmissionError> {
+        self.acquire_for(false, None)
+    }
+
+    fn acquire_for(
+        self: &Arc<Self>,
+        is_eligible: bool,
+        model: Option<&str>,
+    ) -> std::result::Result<AdmissionGuard, AdmissionError> {
+        let model_owned = model.map(|s| s.to_owned());
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        if !state.busy {
-            state.busy = true;
+        // Fast path when no queued waiters and resource is available.
+        if is_eligible {
+            if !state.ineligible_busy
+                && state.eligible < self.capacity
+                && state.queued == 0
+                && Self::is_model_compatible(&state.batch_model, model_owned.as_deref())
+            {
+                state.eligible += 1;
+                if state.batch_model.is_none() {
+                    state.batch_model = model_owned.clone();
+                }
+                return Ok(AdmissionGuard {
+                    admission: Arc::clone(self),
+                    is_eligible: true,
+                    model: model_owned,
+                });
+            }
+        } else if state.eligible == 0 && !state.ineligible_busy && state.queued == 0 {
+            state.ineligible_busy = true;
             return Ok(AdmissionGuard {
                 admission: Arc::clone(self),
+                is_eligible: false,
+                model: None,
             });
         }
         if self.max_queue != 0 && state.queued >= self.max_queue {
@@ -2568,30 +2624,60 @@ impl Admission {
                     .wait_timeout(state, remaining)
                     .unwrap_or_else(|error| error.into_inner());
                 state = next;
-                if wait.timed_out() && state.busy {
-                    state.queued = state.queued.saturating_sub(1);
-                    return Err(AdmissionError {
-                        message: format!(
-                            "serve queue wait exceeded {}ms",
-                            self.timeout.as_millis()
-                        ),
-                        retry_after_seconds: self.retry_after_seconds(),
-                    });
+                if wait.timed_out() {
+                    let can_acquire = if is_eligible {
+                        !state.ineligible_busy
+                            && state.eligible < self.capacity
+                            && Self::is_model_compatible(&state.batch_model, model_owned.as_deref())
+                    } else {
+                        state.eligible == 0 && !state.ineligible_busy
+                    };
+                    if !can_acquire {
+                        state.queued = state.queued.saturating_sub(1);
+                        return Err(AdmissionError {
+                            message: format!(
+                                "serve queue wait exceeded {}ms",
+                                self.timeout.as_millis()
+                            ),
+                            retry_after_seconds: self.retry_after_seconds(),
+                        });
+                    }
                 }
             }
-            if !state.busy {
+            let can_acquire = if is_eligible {
+                !state.ineligible_busy
+                    && state.eligible < self.capacity
+                    && Self::is_model_compatible(&state.batch_model, model_owned.as_deref())
+            } else {
+                state.eligible == 0 && !state.ineligible_busy
+            };
+            if can_acquire {
                 state.queued = state.queued.saturating_sub(1);
-                state.busy = true;
-                return Ok(AdmissionGuard {
-                    admission: Arc::clone(self),
-                });
+                if is_eligible {
+                    state.eligible += 1;
+                    if state.batch_model.is_none() {
+                        state.batch_model = model_owned.clone();
+                    }
+                    return Ok(AdmissionGuard {
+                        admission: Arc::clone(self),
+                        is_eligible: true,
+                        model: model_owned.clone(),
+                    });
+                } else {
+                    state.ineligible_busy = true;
+                    return Ok(AdmissionGuard {
+                        admission: Arc::clone(self),
+                        is_eligible: false,
+                        model: None,
+                    });
+                }
             }
         }
     }
 
     fn inflight(&self) -> usize {
         let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        usize::from(state.busy) + state.queued
+        state.eligible + usize::from(state.ineligible_busy) + state.queued
     }
 
     fn retry_after_seconds(&self) -> u64 {
@@ -2610,9 +2696,88 @@ impl Drop for AdmissionGuard {
             .state
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        state.busy = false;
-        self.admission.available.notify_one();
+        if self.is_eligible {
+            state.eligible = state.eligible.saturating_sub(1);
+            if state.eligible == 0 {
+                state.batch_model = None;
+            }
+        } else {
+            state.ineligible_busy = false;
+        }
+        self.admission.available.notify_all();
     }
+}
+
+/// Conservative batch eligibility for independent Qwen3.5 decode.
+///
+/// Eligible only for Qwen arch 5/6, single-GPU, stateless text with no
+/// tools/images/stops/spec/adaptive/prefix behavior. All others fall back to
+/// sequential. Check is intentionally strict and synchronous; model arch is
+/// taken from `current_arch` when available, otherwise inferred from the
+/// requested model name containing `qwen`.
+fn is_batch_eligible_request(
+    body: &serde_json::Value,
+    tp: Option<u64>,
+    current_arch: Option<&str>,
+    daemon_batch_capable: bool,
+) -> bool {
+    if !daemon_batch_capable {
+        return false;
+    }
+    // Single-GPU exact HIP only for initial route.
+    if tp.unwrap_or(1) != 1 {
+        return false;
+    }
+    // Qwen arch 5/6 only. Prefer runtime arch when known.
+    let is_qwen = if let Some(arch) = current_arch {
+        arch.contains("qwen")
+    } else if let Some(model) = body.get("model").and_then(|v| v.as_str()) {
+        model.to_ascii_lowercase().contains("qwen")
+    } else {
+        false
+    };
+    if !is_qwen {
+        return false;
+    }
+    // Stateless text: no tools, no images, no stops, no spec, no adaptive, no prefix.
+    if body
+        .get("tools")
+        .and_then(|v| v.as_array())
+        .is_some_and(|a| !a.is_empty())
+    {
+        return false;
+    }
+    if body.get("tool_choice").is_some() {
+        return false;
+    }
+    // Images via messages containing image_url or explicit image_base64.
+    if body.get("image_base64").is_some() {
+        return false;
+    }
+    if let Some(messages) = body.get("messages") {
+        let serialized = messages.to_string();
+        if serialized.contains("image_url") {
+            return false;
+        }
+    }
+    if body.get("stop").is_some() {
+        return false;
+    }
+    // Speculation / adaptive / prefix behavior disqualifies.
+    for key in [
+        "speculation",
+        "dflash_mode",
+        "mtp_mode",
+        "ngram_draft",
+        "prefill_sparse_threshold",
+        "kv_adaptive",
+        "prefix",
+    ] {
+        if body.get(key).is_some() {
+            return false;
+        }
+    }
+    true
 }
 
 fn serve_command(paths: &Paths, mut args: ServeArgs) -> Result<()> {
@@ -2761,6 +2926,11 @@ fn detach_serve(paths: &Paths, args: &ServeArgs, host: &str, port: u16) -> Resul
     if let Some(tp) = args.tp {
         command.arg("--tp").arg(tp.to_string());
     }
+    if let Some(batch) = args.continuous_batch_size {
+        command
+            .arg("--continuous-batch-size")
+            .arg(batch.to_string());
+    }
     let mut child = command.spawn().context("failed to detach native serve")?;
     let probe_host = match host {
         "0.0.0.0" => "127.0.0.1",
@@ -2825,6 +2995,12 @@ fn serve_foreground(
     let max_request_bytes = config_u64(&global, "serve.max_request_bytes")?;
     let max_queue = config_u64(&global, "serve.max_queue")? as usize;
     let queue_timeout = Duration::from_millis(config_u64(&global, "serve.queue_timeout_ms")?);
+    let continuous_batch_size = args
+        .continuous_batch_size
+        .unwrap_or(config_u64(&global, "serve.continuous_batch_size")?);
+    if continuous_batch_size == 0 || continuous_batch_size > 32 {
+        bail!("--continuous-batch-size must be between 1 and 32");
+    }
     let retry_enabled = config_bool(&global, "serve.retry_enabled")?;
     let retry_backoff = Duration::from_millis(config_u64(&global, "serve.retry_backoff_ms")?);
     let idle_timeout = Duration::from_secs(
@@ -2843,11 +3019,13 @@ fn serve_foreground(
             registry: registry.clone(),
             current_path: None,
             current_arch: None,
+            continuous_batch_capable: false,
             current_max_seq: 0,
             cache_capable: false,
             kv_override: args.kv_mode.clone(),
             kv_backend_override: args.kv_backend.clone(),
             tp: args.tp,
+            continuous_batch_size,
         }),
         meta: Mutex::new(ServeMeta {
             current_model: None,
@@ -2861,13 +3039,16 @@ fn serve_foreground(
             last_activity: Instant::now(),
         }),
         max_request_bytes,
-        admission: Arc::new(Admission::new(max_queue, queue_timeout)),
+        admission: Arc::new(Admission::new_with_capacity(
+            max_queue,
+            queue_timeout,
+            continuous_batch_size as usize,
+        )),
         idle_timeout,
         retry_enabled,
         retry_backoff,
         backoff_hook: Mutex::new(None),
     });
-
     let bind = format_bind(host, port);
     let server = Server::http(&bind).map_err(|error| anyhow!("failed to bind {bind}: {error}"))?;
     fs::create_dir_all(&paths.root)?;
@@ -3069,11 +3250,42 @@ fn handle_http(mut request: Request, shared: Arc<ServeShared>) -> Result<()> {
                     return Ok(());
                 }
             };
-            let guard = match shared.admission.acquire() {
-                Ok(guard) => guard,
-                Err(error) => {
-                    request.respond(admission_error_response(&error))?;
-                    return Ok(());
+            // Class-aware admission: eligible requests share capacity up to
+            // continuous_batch_size, ineligible are exclusive single-flight.
+            let (is_eligible, model_for_lease) = {
+                let runtime = shared
+                    .runtime
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                let tp = runtime.tp;
+                let arch = runtime.current_arch.clone();
+                let batch_capable = runtime.continuous_batch_capable;
+                drop(runtime);
+                let eligible = is_batch_eligible_request(&body, tp, arch.as_deref(), batch_capable);
+                let model = body
+                    .get("model")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_owned());
+                (eligible, model)
+            };
+            let guard = if is_eligible {
+                match shared
+                    .admission
+                    .acquire_for(true, model_for_lease.as_deref())
+                {
+                    Ok(g) => g,
+                    Err(e) => {
+                        request.respond(admission_error_response(&e))?;
+                        return Ok(());
+                    }
+                }
+            } else {
+                match shared.admission.acquire() {
+                    Ok(g) => g,
+                    Err(e) => {
+                        request.respond(admission_error_response(&e))?;
+                        return Ok(());
+                    }
                 }
             };
             // Tools require a lossless endpoint adapter before any generation.
@@ -4208,7 +4420,7 @@ fn fold_complete_request_stream(
 fn complete_request_attempt(
     shared: &ServeShared,
     body: &serde_json::Value,
-    _guard: AdmissionGuard,
+    guard: AdmissionGuard,
     identity: &(String, u64),
     attempt_id: u64,
     force_reset: bool,
@@ -4227,105 +4439,116 @@ fn complete_request_attempt(
         .ok_or_else(|| anyhow!("model is required"))?
         .to_owned();
     let image_base64 = request_image_base64(body.get("messages"))?;
-    let mut runtime = shared
-        .runtime
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
-    // Attempt id is allocated by the retry driver before any cold reset /
-    // generate so reset ack, generate request, and the semantic fold share one
-    // wire id.
-    let resolved = runtime.ensure_model(&model, &shared.meta, None)?;
-    if force_reset || !runtime.cache_capable {
-        if let Err(error) = runtime.engine.reset(attempt_id) {
-            if force_reset {
-                // Rollback could not be attested: model state is unknown, so
-                // the next request must full-reload rather than trust it.
-                runtime.current_path = None;
-                runtime.current_arch = None;
-                runtime.current_max_seq = 0;
-                runtime.cache_capable = false;
+    // Acquire runtime, ensure model, and build the generate request while
+    // holding the lock. Clone the engine handle before dropping the lock so
+    // concurrent eligible requests can share the multiplexed transport.
+    let (generate, resolved, engine_clone) = {
+        let mut runtime = shared
+            .runtime
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        // Attempt id is allocated by the retry driver before any cold reset /
+        // generate so reset ack, generate request, and the semantic fold share one
+        // wire id.
+        let resolved = runtime.ensure_model(&model, &shared.meta, None)?;
+        if force_reset || (!runtime.cache_capable && !runtime.continuous_batch_capable) {
+            if let Err(error) = runtime.engine.reset(attempt_id) {
+                if force_reset {
+                    // Rollback could not be attested: model state is unknown, so
+                    // the next request must full-reload rather than trust it.
+                    runtime.current_path = None;
+                    runtime.current_arch = None;
+                    runtime.continuous_batch_capable = false;
+                    runtime.current_max_seq = 0;
+                    runtime.cache_capable = false;
+                }
+                return Err(error.into());
             }
-            return Err(error.into());
         }
-    }
-    let max_tokens = body
-        .get("max_tokens")
-        .or_else(|| body.get("max_completion_tokens"))
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(config_u64(&resolved, "generation.max_tokens")?);
-    if max_tokens == 0 || max_tokens > 393_216 {
-        bail!("max_tokens must be between 1 and 393216");
-    }
-    let required_max_seq = max_tokens.saturating_add(1024);
-    if runtime.current_max_seq < required_max_seq {
-        runtime.ensure_model(&model, &shared.meta, Some(required_max_seq))?;
-    }
-    let mut normalized_messages = normalize_openai_messages(body.get("messages"));
-    let default_system = request_string(&resolved, "prompt.system", None)?;
-    inject_default_system_message(&mut normalized_messages, default_system.as_deref());
-    let mut generate = serde_json::json!({
-        "type": "generate",
-        "id": request_id(),
-        "prompt": last_user_prompt(&normalized_messages).unwrap_or_else(|| "Hello".into()),
-        "messages": normalized_messages,
-        "max_tokens": max_tokens,
-        "attempt_id": attempt_id,
-    });
-    if let Some(image) = image_base64 {
-        generate["image_base64"] = serde_json::Value::String(image);
-    }
-    for (key, config_key) in [
-        ("temperature", "generation.temperature"),
-        ("top_p", "generation.top_p"),
-        ("repeat_penalty", "generation.repeat_penalty"),
-    ] {
-        let explicit = body.get(key).and_then(serde_json::Value::as_f64);
-        insert_optional_f64(
-            &mut generate,
-            key,
-            request_f64(&resolved, config_key, explicit)?,
-        );
-    }
-    for name in [
-        "tools",
-        "tool_choice",
-        "frequency_penalty",
-        "stop",
-        "reasoning_effort",
-    ] {
-        if let Some(value) = body.get(name) {
-            generate[name] = value.clone();
+        let max_tokens = body
+            .get("max_tokens")
+            .or_else(|| body.get("max_completion_tokens"))
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(config_u64(&resolved, "generation.max_tokens")?);
+        if max_tokens == 0 || max_tokens > 393_216 {
+            bail!("max_tokens must be between 1 and 393216");
         }
-    }
-    if let Some(value) = body.get("top_k") {
-        generate["top_k"] = value.clone();
-    } else {
-        insert_optional_u64(
-            &mut generate,
-            "top_k",
-            request_u64(&resolved, "generation.top_k", None)?,
-        );
-    }
-    for (key, config_key) in [
-        ("min_p", "generation.min_p"),
-        ("presence_penalty", "generation.presence_penalty"),
-    ] {
-        if let Some(value) = body.get(key) {
-            generate[key] = value.clone();
-        } else {
+        let required_max_seq = max_tokens.saturating_add(1024);
+        if runtime.current_max_seq < required_max_seq {
+            runtime.ensure_model(&model, &shared.meta, Some(required_max_seq))?;
+        }
+        let mut normalized_messages = normalize_openai_messages(body.get("messages"));
+        let default_system = request_string(&resolved, "prompt.system", None)?;
+        inject_default_system_message(&mut normalized_messages, default_system.as_deref());
+        let mut generate = serde_json::json!({
+            "type": "generate",
+            "id": request_id(),
+            "prompt": last_user_prompt(&normalized_messages).unwrap_or_else(|| "Hello".into()),
+            "messages": normalized_messages,
+            "max_tokens": max_tokens,
+            "attempt_id": attempt_id,
+        });
+        if let Some(image) = image_base64 {
+            generate["image_base64"] = serde_json::Value::String(image);
+        }
+        for (key, config_key) in [
+            ("temperature", "generation.temperature"),
+            ("top_p", "generation.top_p"),
+            ("repeat_penalty", "generation.repeat_penalty"),
+        ] {
+            let explicit = body.get(key).and_then(serde_json::Value::as_f64);
             insert_optional_f64(
                 &mut generate,
                 key,
-                request_f64(&resolved, config_key, None)?,
+                request_f64(&resolved, config_key, explicit)?,
             );
         }
-    }
-    let deepseek4_effort_contract = runtime.current_arch.as_deref() == Some("deepseek4");
-    apply_http_reasoning_request(body, &resolved, &mut generate, deepseek4_effort_contract)?;
+        for name in [
+            "tools",
+            "tool_choice",
+            "frequency_penalty",
+            "stop",
+            "reasoning_effort",
+        ] {
+            if let Some(value) = body.get(name) {
+                generate[name] = value.clone();
+            }
+        }
+        if let Some(value) = body.get("top_k") {
+            generate["top_k"] = value.clone();
+        } else {
+            insert_optional_u64(
+                &mut generate,
+                "top_k",
+                request_u64(&resolved, "generation.top_k", None)?,
+            );
+        }
+        for (key, config_key) in [
+            ("min_p", "generation.min_p"),
+            ("presence_penalty", "generation.presence_penalty"),
+        ] {
+            if let Some(value) = body.get(key) {
+                generate[key] = value.clone();
+            } else {
+                insert_optional_f64(
+                    &mut generate,
+                    key,
+                    request_f64(&resolved, config_key, None)?,
+                );
+            }
+        }
+        let deepseek4_effort_contract = runtime.current_arch.as_deref() == Some("deepseek4");
+        apply_http_reasoning_request(body, &resolved, &mut generate, deepseek4_effort_contract)?;
+        let (id, created) = identity.clone();
+        generate["id"] = serde_json::Value::String(id.clone());
+        generate["attempt_id"] = serde_json::json!(attempt_id);
+        if guard.is_eligible {
+            generate["serve_continuous_batch"] = serde_json::Value::Bool(true);
+        }
+        let engine_clone = runtime.engine.clone();
+        (generate, resolved, engine_clone)
+    };
     let (id, created) = identity.clone();
-    generate["id"] = serde_json::Value::String(id.clone());
-    generate["attempt_id"] = serde_json::json!(attempt_id);
-
     // Dual route gated by StreamContractGate:
     // - first event must be gen_start with matching request id + attempt_id
     // - contract_version is read only after correlation succeeds
@@ -4345,8 +4568,13 @@ fn complete_request_attempt(
         .pointer("/chat_template_kwargs/preserve_thinking")
         .and_then(serde_json::Value::as_bool)
         == Some(true);
+    let model_for_fold = body
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+        .to_owned();
 
-    let done = runtime.engine.generate(&generate, |event| {
+    let done = engine_clone.generate(&generate, |event| {
         let event_type = event.get("type").and_then(serde_json::Value::as_str);
 
         // Staged terminal: commit_ready carries done fields with type != done.
@@ -4772,6 +5000,7 @@ impl ServeRuntime {
             if let Some(tp) = self.tp {
                 params["tp"] = serde_json::json!(tp);
             }
+            params["continuous_batch_size"] = serde_json::json!(self.continuous_batch_size);
             let loaded_max_seq = params["max_seq"].as_u64().unwrap_or(0);
             if minimum_max_seq.is_some() {
                 eprintln!("[hipfire] bumping load max_seq to {loaded_max_seq} for request budget");
@@ -4789,6 +5018,10 @@ impl ServeRuntime {
                 .get("arch")
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_owned);
+            self.continuous_batch_capable = loaded
+                .get("continuous_batch_capable")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
             self.current_max_seq = loaded_max_seq;
             meta.lock()
                 .unwrap_or_else(|error| error.into_inner())
@@ -5042,11 +5275,7 @@ fn completion_json(completion: &Completion) -> serde_json::Value {
         }],
         "usage": completion_usage(completion),
         "timings": completion_timings(completion),
-        "hipfire": {
-            "tok_s": completion.done.get("tok_s"),
-            "prefill_tok_s": completion.done.get("prefill_tok_s"),
-            "decode_tok_s": completion.done.get("decode_tok_s"),
-        }
+        "hipfire": completion_hipfire(completion),
     })
 }
 
@@ -5089,6 +5318,7 @@ fn completion_timings(completion: &Completion) -> serde_json::Value {
         "prefill_ms": done.get("prefill_ms"),
         "prefill_tok_s": done.get("prefill_tok_s"),
         "decode_tok_s": done.get("decode_tok_s").or_else(|| done.get("tok_s")),
+        "latency_ms": done.get("latency_ms"),
         "tau": done.get("tau"),
         "cycles": done.get("cycles"),
         "dflash": done.get("dflash"),
@@ -5102,6 +5332,18 @@ fn completion_timings(completion: &Completion) -> serde_json::Value {
         "ar_windows": done.get("ar_windows"),
         "mtp_retired": done.get("mtp_retired"),
         "mtp_window_timings": done.get("mtp_window_timings"),
+    })
+}
+
+/// Shared hipfire evidence projection for normal and streaming terminals.
+fn completion_hipfire(completion: &Completion) -> serde_json::Value {
+    let done = &completion.done;
+    serde_json::json!({
+        "tok_s": done.get("tok_s"),
+        "prefill_tok_s": done.get("prefill_tok_s"),
+        "decode_tok_s": done.get("decode_tok_s"),
+        "execution_mode": done.get("execution_mode"),
+        "continuous_batch": done.get("continuous_batch"),
     })
 }
 
@@ -5229,6 +5471,7 @@ fn openai_stream_terminal_chunks(
         "model": completion.model,
         "choices": [{ "index": 0, "delta": {}, "finish_reason": finish_reason }],
         "timings": completion_timings(completion),
+        "hipfire": completion_hipfire(completion),
     }));
 
     if include_usage {
@@ -5894,6 +6137,7 @@ fn load_params(
         "prefill_drafter_device": config_i64(resolved, "speculation.prefill.drafter_device")?,
         "prefill_sparse_threshold": config_u64(resolved, "speculation.prefill.sparse_threshold")?,
         "speculation": config_string(resolved, "speculation.mode")?,
+        "continuous_batch_size": config_u64(resolved, "serve.continuous_batch_size")?,
     });
     if let Some(experts_per_token) =
         config_optional_u64(resolved, "model.deepseek4_experts_per_token")?
@@ -8791,6 +9035,122 @@ mod tests {
     }
 
     #[test]
+    fn completion_timings_projects_latency_ms() {
+        let completion = Completion {
+            id: "req-lat".into(),
+            created: 0,
+            model: "test-model".into(),
+            content: String::new(),
+            reasoning_content: String::new(),
+            preserve_thinking: false,
+            tool_calls: Vec::new(),
+            done: serde_json::json!({
+                "ttft_ms": 12.5,
+                "prefill_ms": 10.0,
+                "prefill_tok_s": 100.0,
+                "decode_tok_s": 40.0,
+                "latency_ms": 250.5,
+                "tok_s": 20.0,
+            }),
+        };
+        let timings = completion_timings(&completion);
+        assert_eq!(timings["latency_ms"], 250.5);
+        assert_eq!(timings["ttft_ms"], 12.5);
+        // Absent latency stays null-like (serde_json::Value::Null via .get).
+        let no_lat = completion_timings(&Completion {
+            id: "req-lat".into(),
+            created: 0,
+            model: "test-model".into(),
+            content: String::new(),
+            reasoning_content: String::new(),
+            preserve_thinking: false,
+            tool_calls: Vec::new(),
+            done: serde_json::json!({"ttft_ms": 1.0}),
+        });
+        assert!(no_lat["latency_ms"].is_null());
+    }
+
+    #[test]
+    fn completion_hipfire_projects_batch_route_evidence() {
+        let batch = serde_json::json!({
+            "executed": true,
+            "slots": 4,
+            "lane": 1,
+            "lane_capacity": 4096,
+            "max_active_lanes": 2,
+            "refill": "continuous",
+        });
+        let completion = Completion {
+            id: "req-batch".into(),
+            created: 0,
+            model: "test-model".into(),
+            content: "hi".into(),
+            reasoning_content: String::new(),
+            preserve_thinking: false,
+            tool_calls: Vec::new(),
+            done: serde_json::json!({
+                "tok_s": 18.5,
+                "prefill_tok_s": 200.0,
+                "decode_tok_s": 22.0,
+                "latency_ms": 300.0,
+                "execution_mode": "continuous_batch_independent",
+                "continuous_batch": batch,
+                "finish_reason": "stop",
+                "tokens": 3,
+                "prefill_tokens": 8,
+            }),
+        };
+        let hip = completion_hipfire(&completion);
+        assert_eq!(hip["execution_mode"], "continuous_batch_independent");
+        assert_eq!(hip["continuous_batch"]["max_active_lanes"], 2);
+        assert_eq!(hip["continuous_batch"]["slots"], 4);
+        assert_eq!(hip["continuous_batch"]["lane"], 1);
+        assert_eq!(hip["tok_s"], 18.5);
+
+        let json = completion_json(&completion);
+        assert_eq!(json["timings"]["latency_ms"], 300.0);
+        assert_eq!(
+            json["hipfire"]["execution_mode"],
+            "continuous_batch_independent"
+        );
+        assert_eq!(json["hipfire"]["continuous_batch"]["refill"], "continuous");
+
+        let chunks = openai_stream_terminal_chunks(&completion, false);
+        let terminal = chunks.last().unwrap();
+        assert_eq!(terminal["timings"]["latency_ms"], 300.0);
+        assert_eq!(
+            terminal["hipfire"]["execution_mode"],
+            "continuous_batch_independent"
+        );
+        assert_eq!(
+            terminal["hipfire"]["continuous_batch"]["max_active_lanes"],
+            2
+        );
+
+        // Sequential done without route evidence stays null (unchanged fields).
+        let sequential = Completion {
+            id: "req-seq".into(),
+            created: 0,
+            model: "test-model".into(),
+            content: String::new(),
+            reasoning_content: String::new(),
+            preserve_thinking: false,
+            tool_calls: Vec::new(),
+            done: serde_json::json!({
+                "tok_s": 10.0,
+                "prefill_tok_s": 50.0,
+                "decode_tok_s": 12.0,
+                "finish_reason": "stop",
+                "tokens": 2,
+            }),
+        };
+        let seq_hip = completion_hipfire(&sequential);
+        assert!(seq_hip["execution_mode"].is_null());
+        assert!(seq_hip["continuous_batch"].is_null());
+        assert_eq!(seq_hip["tok_s"], 10.0);
+    }
+
+    #[test]
     fn artifact_urls_honor_endpoint_precedence() {
         struct EnvRestore(&'static str, Option<std::ffi::OsString>);
 
@@ -10216,6 +10576,120 @@ mod tests {
         let timeout = admission.acquire().unwrap_err();
         assert!(timeout.message.contains("wait exceeded"));
         assert_eq!(admission.inflight(), 1);
+    }
+
+    #[test]
+    fn admission_eligible_concurrent_up_to_capacity() {
+        let admission = Arc::new(Admission::new_with_capacity(8, Duration::from_secs(1), 2));
+        let g1 = admission.acquire_for(true, Some("qwen3.5:7b")).unwrap();
+        let g2 = admission.acquire_for(true, Some("qwen3.5:7b")).unwrap();
+        assert_eq!(admission.inflight(), 2);
+        // Third eligible same model should queue, then timeout quickly.
+        let admission2 = Arc::clone(&admission);
+        let handle =
+            thread::spawn(move || admission2.acquire_for(true, Some("qwen3.5:7b")).unwrap());
+        thread::sleep(Duration::from_millis(50));
+        assert_eq!(admission.inflight(), 3); // 2 held + 1 queued
+        drop(g1);
+        let g3 = handle.join().unwrap();
+        assert_eq!(admission.inflight(), 2);
+        drop(g2);
+        drop(g3);
+        assert_eq!(admission.inflight(), 0);
+    }
+
+    #[test]
+    fn admission_ineligible_is_exclusive() {
+        let admission = Arc::new(Admission::new_with_capacity(8, Duration::from_secs(1), 2));
+        let g1 = admission.acquire_for(true, Some("qwen3.5:7b")).unwrap();
+        // Ineligible must wait for eligible to finish, even though capacity not full.
+        let admission2 = Arc::clone(&admission);
+        let handle = thread::spawn(move || admission2.acquire().unwrap());
+        thread::sleep(Duration::from_millis(50));
+        assert!(admission.inflight() == 2); // 1 eligible + 1 queued ineligible
+        drop(g1);
+        let g_inelig = handle.join().unwrap();
+        assert_eq!(admission.inflight(), 1);
+        // While ineligible holds, eligible must wait.
+        let admission3 = Arc::clone(&admission);
+        let handle2 =
+            thread::spawn(move || admission3.acquire_for(true, Some("qwen3.5:7b")).unwrap());
+        thread::sleep(Duration::from_millis(50));
+        assert_eq!(admission.inflight(), 2);
+        drop(g_inelig);
+        let g2 = handle2.join().unwrap();
+        assert_eq!(admission.inflight(), 1);
+        drop(g2);
+    }
+
+    #[test]
+    fn admission_model_lease_prevents_cross_model_batch() {
+        let admission = Arc::new(Admission::new_with_capacity(8, Duration::from_secs(1), 2));
+        let g1 = admission.acquire_for(true, Some("qwen3.5:7b")).unwrap();
+        // Different model cannot share batch lanes, must wait for exclusive.
+        let admission2 = Arc::clone(&admission);
+        let handle =
+            thread::spawn(move || admission2.acquire_for(true, Some("qwen3.5:14b")).unwrap());
+        thread::sleep(Duration::from_millis(50));
+        assert_eq!(admission.inflight(), 2); // 1 held + 1 queued due to model mismatch
+        drop(g1);
+        let g2 = handle.join().unwrap();
+        assert_eq!(admission.inflight(), 1);
+        drop(g2);
+    }
+
+    #[test]
+    fn batch_eligibility_conservative_checks() {
+        // Eligible: single-GPU qwen with stateless text.
+        let body =
+            serde_json::json!({"model":"qwen3.5:7b","messages":[{"role":"user","content":"hi"}]});
+        assert!(is_batch_eligible_request(
+            &body,
+            Some(1),
+            Some("qwen35"),
+            true
+        ));
+        // Tools disqualify.
+        let body = serde_json::json!({"model":"qwen3.5:7b","tools":[{"type":"function","function":{"name":"x"}}]});
+        assert!(!is_batch_eligible_request(
+            &body,
+            Some(1),
+            Some("qwen35"),
+            true
+        ));
+        // Images disqualify.
+        let body = serde_json::json!({"model":"qwen3.5:7b","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:"}}]}]});
+        assert!(!is_batch_eligible_request(
+            &body,
+            Some(1),
+            Some("qwen35"),
+            true
+        ));
+        // Multi-GPU disqualifies.
+        let body = serde_json::json!({"model":"qwen3.5:7b"});
+        assert!(!is_batch_eligible_request(
+            &body,
+            Some(2),
+            Some("qwen35"),
+            true
+        ));
+        // Non-qwen disqualifies.
+        let body = serde_json::json!({"model":"deepseek4:671b"});
+        assert!(!is_batch_eligible_request(
+            &body,
+            Some(1),
+            Some("deepseek4"),
+            true
+        ));
+        // Daemon load says batch incapable: HTTP admission must not invent it.
+        let body =
+            serde_json::json!({"model":"qwen3.5:7b","messages":[{"role":"user","content":"hi"}]});
+        assert!(!is_batch_eligible_request(
+            &body,
+            Some(1),
+            Some("qwen35"),
+            false
+        ));
     }
 
     #[test]
@@ -12880,11 +13354,13 @@ for line in sys.stdin:
                     registry,
                     current_path: None,
                     current_arch: None,
+                    continuous_batch_capable: false,
                     current_max_seq: 0,
                     cache_capable: false,
                     kv_override: None,
                     kv_backend_override: None,
                     tp: None,
+                    continuous_batch_size: 1,
                 }),
                 meta: Mutex::new(ServeMeta {
                     current_model: None,

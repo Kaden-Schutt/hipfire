@@ -942,6 +942,18 @@ pub static FIELDS: &[ConfigField] = &[
         "Maximum queued serve requests; zero is uncapped."
     ),
     field!(
+        "serve.continuous_batch_size",
+        "continuous_batch_size",
+        Serve,
+        Process,
+        DefaultValue::Integer(1),
+        ValueRule::Integer { min: 1, max: 32 },
+        false,
+        false,
+        Some("HIPFIRE_CONTINUOUS_BATCH_SIZE"),
+        "Maximum coexisting eligible batch lanes for serve; 1 preserves sequential behavior."
+    ),
+    field!(
         "serve.queue_timeout_ms",
         "serve_queue_timeout_ms",
         Serve,

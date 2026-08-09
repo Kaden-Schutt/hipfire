@@ -132,6 +132,2315 @@ fn clear_terminal_control() {
     cell.cv.notify_all();
 }
 
+/// Key for multiplexed terminal control and inbox, as required by the
+/// continuous-batch contract: every lifecycle event is keyed by
+/// `(id, attempt_id)` and unknown/stale keys fail closed.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct AttemptKey {
+    id: String,
+    attempt_id: u64,
+}
+
+impl AttemptKey {
+    fn new(id: &str, attempt_id: u64) -> Self {
+        Self {
+            id: id.to_string(),
+            attempt_id,
+        }
+    }
+}
+
+/// Generation-owned lane ticket. Prevents a stale control from releasing a
+/// reused slot even when (id, attempt_id) would otherwise alias.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct LaneTicket {
+    lane: usize,
+    generation: u64,
+}
+
+// ── Batch sampling controls and cohort key ───────────────────────────────
+
+/// Validated sampling controls for a single request. One active cohort has
+/// exactly one key because `sample_product` accepts scalar controls but
+/// per-row RNG/history.
+#[derive(Debug, Clone)]
+struct BatchSampling {
+    temp: f32,
+    top_p: f32,
+    top_k: Option<u32>,
+    min_p: Option<f32>,
+    repeat_penalty: f32,
+    presence_penalty: f32,
+    frequency_penalty: f32,
+    repeat_window: usize,
+}
+
+impl BatchSampling {
+    fn key(&self) -> BatchSamplingKey {
+        BatchSamplingKey {
+            temp_bits: self.temp.to_bits(),
+            top_p_bits: self.top_p.to_bits(),
+            top_k: self.top_k,
+            min_p_bits: self.min_p.map(|v| v.to_bits()),
+            repeat_bits: self.repeat_penalty.to_bits(),
+            presence_bits: self.presence_penalty.to_bits(),
+            frequency_bits: self.frequency_penalty.to_bits(),
+            repeat_window: self.repeat_window,
+        }
+    }
+}
+
+/// Canonical sampling key made from validated values via `f32::to_bits`.
+/// Derived Eq/Hash is bit-exact; no epsilon.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct BatchSamplingKey {
+    temp_bits: u32,
+    top_p_bits: u32,
+    top_k: Option<u32>,
+    min_p_bits: Option<u32>,
+    repeat_bits: u32,
+    presence_bits: u32,
+    frequency_bits: u32,
+    repeat_window: usize,
+}
+
+// ── Keyed terminal registry ────────────────────────────────────────────
+
+/// Registry state for a single `(id, attempt_id)`. Each variant can retain
+/// an Abort; only Ready accepts Commit. Deadline is 30 s after Ready.
+#[derive(Debug, Clone)]
+enum BatchRegistryState {
+    Announced,
+    Queued,
+    Active { owner: LaneTicket },
+    Ready { owner: LaneTicket },
+}
+
+#[derive(Debug, Clone)]
+struct BatchRegistryEntry {
+    state: BatchRegistryState,
+    abort_latched: bool,
+    commit_latched: bool,
+    pending_done: Option<serde_json::Value>,
+    deadline: Option<Instant>,
+}
+
+struct BatchTerminalState {
+    entries: std::collections::HashMap<AttemptKey, BatchRegistryEntry>,
+}
+
+impl BatchTerminalState {
+    fn new() -> Self {
+        Self {
+            entries: std::collections::HashMap::new(),
+        }
+    }
+}
+
+struct BatchTerminalCell {
+    mu: Mutex<BatchTerminalState>,
+    cv: Condvar,
+}
+
+fn batch_terminal_control() -> &'static BatchTerminalCell {
+    static CELL: OnceLock<BatchTerminalCell> = OnceLock::new();
+    CELL.get_or_init(|| BatchTerminalCell {
+        mu: Mutex::new(BatchTerminalState::new()),
+        cv: Condvar::new(),
+    })
+}
+
+/// Announce a generate key before queueing. Closes generate-then-immediate-
+/// abort races for requests that arrive while GPU work is active. Returns
+/// true if newly announced, false if already present.
+fn batch_announce_terminal(id: &str, attempt_id: u64) -> bool {
+    let cell = batch_terminal_control();
+    let mut g = cell.mu.lock().unwrap();
+    let key = AttemptKey::new(id, attempt_id);
+    if g.entries.contains_key(&key) {
+        return false;
+    }
+    g.entries.insert(
+        key,
+        BatchRegistryEntry {
+            state: BatchRegistryState::Announced,
+            abort_latched: false,
+            commit_latched: false,
+            pending_done: None,
+            deadline: None,
+        },
+    );
+    cell.cv.notify_all();
+    true
+}
+
+/// Compatibility alias: current daemon generate arm still calls
+/// `batch_activate_terminal`. Keep it as Announced insertion and do not
+/// mutate the sequential singleton.
+fn batch_activate_terminal(id: &str, attempt_id: u64) {
+    batch_announce_terminal(id, attempt_id);
+}
+
+fn batch_transition_to_queued(id: &str, attempt_id: u64) -> bool {
+    let cell = batch_terminal_control();
+    let mut g = cell.mu.lock().unwrap();
+    if let Some(e) = g.entries.get_mut(&AttemptKey::new(id, attempt_id)) {
+        if matches!(e.state, BatchRegistryState::Announced) {
+            e.state = BatchRegistryState::Queued;
+            cell.cv.notify_all();
+            return true;
+        }
+    }
+    false
+}
+
+fn batch_bind_active(id: &str, attempt_id: u64, owner: LaneTicket) -> bool {
+    let cell = batch_terminal_control();
+    let mut g = cell.mu.lock().unwrap();
+    if let Some(e) = g.entries.get_mut(&AttemptKey::new(id, attempt_id)) {
+        if matches!(e.state, BatchRegistryState::Queued) {
+            e.state = BatchRegistryState::Active { owner };
+            cell.cv.notify_all();
+            return true;
+        }
+    }
+    false
+}
+
+fn batch_mark_ready_with_pending(
+    id: &str,
+    attempt_id: u64,
+    owner: LaneTicket,
+    pending_done: serde_json::Value,
+) -> bool {
+    let cell = batch_terminal_control();
+    let mut g = cell.mu.lock().unwrap();
+    if let Some(e) = g.entries.get_mut(&AttemptKey::new(id, attempt_id)) {
+        match e.state {
+            BatchRegistryState::Active { owner: o } if o == owner => {
+                e.state = BatchRegistryState::Ready { owner };
+                e.pending_done = Some(pending_done);
+                e.deadline = Some(Instant::now() + CLIENT_TERMINAL_COMMIT_TIMEOUT);
+                cell.cv.notify_all();
+                return true;
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Legacy ready marker without payload. Transitions Active->Ready with a
+/// deadline and empty pending_done. Preserved for host-only tests that do
+/// not carry a full terminal payload yet.
+fn batch_mark_ready(id: &str, attempt_id: u64) -> bool {
+    let cell = batch_terminal_control();
+    let mut g = cell.mu.lock().unwrap();
+    if let Some(e) = g.entries.get_mut(&AttemptKey::new(id, attempt_id)) {
+        match e.state {
+            BatchRegistryState::Active { owner } => {
+                e.state = BatchRegistryState::Ready { owner };
+                e.deadline = Some(Instant::now() + CLIENT_TERMINAL_COMMIT_TIMEOUT);
+                if e.pending_done.is_none() {
+                    e.pending_done =
+                        Some(serde_json::json!({"type":"done","id":id,"attempt_id":attempt_id}));
+                }
+                cell.cv.notify_all();
+                return true;
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+fn batch_clear_terminal(id: &str, attempt_id: u64) {
+    let cell = batch_terminal_control();
+    let mut g = cell.mu.lock().unwrap();
+    g.entries.remove(&AttemptKey::new(id, attempt_id));
+    cell.cv.notify_all();
+}
+
+fn batch_clear_all_terminals() {
+    let cell = batch_terminal_control();
+    let mut g = cell.mu.lock().unwrap();
+    g.entries.clear();
+    cell.cv.notify_all();
+}
+
+/// Apply abort/commit control. Abort latches in any state; Commit only in
+/// Ready with matching owner. Stale or unknown keys are ignored and fail
+/// closed elsewhere. Never mutates the sequential singleton.
+fn batch_apply_terminal_control(kind: &str, id: &str, attempt_id: u64) {
+    let cell = batch_terminal_control();
+    let mut g = cell.mu.lock().unwrap();
+    if let Some(e) = g.entries.get_mut(&AttemptKey::new(id, attempt_id)) {
+        match kind {
+            "abort" => {
+                if !e.abort_latched {
+                    e.abort_latched = true;
+                    cell.cv.notify_all();
+                }
+            }
+            "commit" => {
+                if e.abort_latched {
+                    return;
+                }
+                if matches!(e.state, BatchRegistryState::Ready { .. }) && !e.commit_latched {
+                    e.commit_latched = true;
+                    cell.cv.notify_all();
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn batch_check_abort(id: &str, attempt_id: u64) -> bool {
+    let cell = batch_terminal_control();
+    let g = cell.mu.lock().unwrap();
+    g.entries
+        .get(&AttemptKey::new(id, attempt_id))
+        .is_some_and(|e| e.abort_latched)
+}
+
+/// Non-mutating poll. Returns Commit only if Ready and commit latched and
+/// not aborted; Abort if abort latched or deadline expired; None otherwise.
+/// Never latches or mutates.
+fn batch_poll_decision(id: &str, attempt_id: u64) -> Option<ClientTerminalDecision> {
+    let cell = batch_terminal_control();
+    let g = cell.mu.lock().unwrap();
+    let e = g.entries.get(&AttemptKey::new(id, attempt_id))?;
+    if e.abort_latched {
+        return Some(ClientTerminalDecision::Abort);
+    }
+    if let Some(deadline) = e.deadline {
+        if Instant::now() >= deadline {
+            return Some(ClientTerminalDecision::Abort);
+        }
+    }
+    if e.commit_latched {
+        if matches!(e.state, BatchRegistryState::Ready { .. }) {
+            return Some(ClientTerminalDecision::Commit);
+        }
+    }
+    None
+}
+
+/// Blocking wait used by lane commit polling (30 s deadline). Unlike the
+/// 5 ms host-sim poll, this waits on the condvar and respects the lane's
+/// deadline. Returns Abort on timeout/expiry.
+fn batch_wait_decision(id: &str, attempt_id: u64, timeout: Duration) -> ClientTerminalDecision {
+    let cell = batch_terminal_control();
+    let mut g = cell.mu.lock().unwrap();
+    let deadline = Instant::now() + timeout;
+    loop {
+        let entry = g.entries.get(&AttemptKey::new(id, attempt_id)).cloned();
+        match entry {
+            None => return ClientTerminalDecision::Abort,
+            Some(e) => {
+                if e.abort_latched {
+                    return ClientTerminalDecision::Abort;
+                }
+                if let Some(dl) = e.deadline {
+                    if Instant::now() >= dl {
+                        return ClientTerminalDecision::Abort;
+                    }
+                }
+                if e.commit_latched && matches!(e.state, BatchRegistryState::Ready { .. }) {
+                    return ClientTerminalDecision::Commit;
+                }
+            }
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return ClientTerminalDecision::Abort;
+        }
+        let remaining = deadline - now;
+        let (guard, wait_res) = cell.cv.wait_timeout(g, remaining).unwrap();
+        g = guard;
+        if wait_res.timed_out() {
+            continue;
+        }
+    }
+}
+
+/// If an announced request becomes a sequential barrier, transfer any
+/// pre-latched Abort into the sequential singleton before invoking the
+/// unchanged sequential route, then remove the keyed announcement. Early
+/// Commit is ignored.
+fn batch_transfer_abort_to_singleton_and_clear(id: &str, attempt_id: u64) -> bool {
+    let had_abort = batch_check_abort(id, attempt_id);
+    batch_clear_terminal(id, attempt_id);
+    if had_abort {
+        activate_terminal_control(id, attempt_id);
+        apply_terminal_control("abort", id, attempt_id);
+        return true;
+    }
+    false
+}
+
+/// Pure commit-teardown classifier: success `done` is allowed only after both
+/// fallible GPU reset and host `commit_lane` succeed. Used by the driver and
+/// covered by same-file tests so ordering cannot regress silently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BatchCommitTeardownClass {
+    /// `reset_lane` failed — use fail_all; never emit done.
+    ResetFailed,
+    /// Reset ok but `commit_lane` failed — fail closed for that key; no done.
+    CommitFailed,
+    /// Both transitions ok — emit the staged terminal done.
+    EmitDone,
+}
+
+fn batch_commit_teardown_class(reset_ok: bool, commit_ok: bool) -> BatchCommitTeardownClass {
+    if !reset_ok {
+        BatchCommitTeardownClass::ResetFailed
+    } else if !commit_ok {
+        BatchCommitTeardownClass::CommitFailed
+    } else {
+        BatchCommitTeardownClass::EmitDone
+    }
+}
+
+/// After the current token is committed, `seq_pos` is the next decode index.
+/// A lane is at capacity when that index is no longer strictly below capacity.
+fn batch_lane_at_capacity(seq_pos: usize, lane_capacity: usize) -> bool {
+    seq_pos >= lane_capacity
+}
+
+/// Length-cap terminal when max_tokens or lane capacity is hit without a
+/// competing stop cause (EOS / filter / loop guard).
+fn batch_hit_length_cap(
+    hit_max_tokens: bool,
+    hit_lane_capacity: bool,
+    is_eos: bool,
+    stopped: bool,
+    loop_hit: bool,
+) -> bool {
+    (hit_max_tokens || hit_lane_capacity) && !is_eos && !stopped && !loop_hit
+}
+
+fn batch_should_finish_decode(
+    is_eos: bool,
+    hit_max_tokens: bool,
+    hit_lane_capacity: bool,
+    stopped: bool,
+    loop_hit: bool,
+) -> bool {
+    is_eos || hit_max_tokens || hit_lane_capacity || stopped || loop_hit
+}
+
+fn batch_pending_deadline(id: &str, attempt_id: u64) -> Option<Instant> {
+    let cell = batch_terminal_control();
+    let g = cell.mu.lock().unwrap();
+    g.entries
+        .get(&AttemptKey::new(id, attempt_id))
+        .and_then(|e| e.deadline)
+}
+
+fn batch_is_ready(id: &str, attempt_id: u64) -> bool {
+    let cell = batch_terminal_control();
+    let g = cell.mu.lock().unwrap();
+    matches!(
+        g.entries.get(&AttemptKey::new(id, attempt_id)),
+        Some(e) if matches!(e.state, BatchRegistryState::Ready { .. })
+    )
+}
+
+/// RAII attempt-id scope that restores the prior TLS value on drop. All
+/// per-lane wire helpers execute under this scope.
+struct BatchAttemptScope {
+    prev: u64,
+}
+impl BatchAttemptScope {
+    fn enter(attempt_id: u64) -> Self {
+        let prev = active_attempt_id();
+        set_active_attempt_id(attempt_id);
+        Self { prev }
+    }
+}
+impl Drop for BatchAttemptScope {
+    fn drop(&mut self) {
+        set_active_attempt_id(self.prev);
+    }
+}
+
+// ── Typed lane state ─────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+struct QwenBatchLane {
+    key: AttemptKey,
+    ticket: LaneTicket,
+    sampling: BatchSampling,
+    prompt_len: usize,
+    seq_pos: usize,
+    next_token: Option<u32>,
+    rng_state: u64,
+    conversation_tokens: Vec<u32>,
+    streamed_tokens: Vec<u32>,
+    bytes_fed_to_filter: usize,
+    created_at: Instant,
+    /// Host Instant after successful lane prefill + first sample.
+    prefill_done_at: Option<Instant>,
+    /// Host Instant stamped immediately before the first classified token emit.
+    first_token_at: Option<Instant>,
+    /// Peak concurrent Running lanes observed while this lane was active.
+    max_active_lanes: usize,
+}
+
+#[derive(Debug, Clone)]
+struct BatchPendingTerminal {
+    key: AttemptKey,
+    ticket: LaneTicket,
+    sampling: BatchSampling,
+    prompt_len: usize,
+    seq_pos: usize,
+    pending_done: serde_json::Value,
+    deadline: Instant,
+}
+
+#[derive(Debug)]
+enum BatchLane {
+    Empty { generation: u64 },
+    Seeding(QwenBatchLane),
+    Running(QwenBatchLane),
+    AwaitingClient(BatchPendingTerminal),
+}
+
+impl BatchLane {
+    fn generation(&self) -> u64 {
+        match self {
+            BatchLane::Empty { generation } => *generation,
+            BatchLane::Seeding(l) => l.ticket.generation,
+            BatchLane::Running(l) => l.ticket.generation,
+            BatchLane::AwaitingClient(t) => t.ticket.generation,
+        }
+    }
+    fn is_empty(&self) -> bool {
+        matches!(self, BatchLane::Empty { .. })
+    }
+    fn is_awaiting(&self) -> bool {
+        matches!(self, BatchLane::AwaitingClient(_))
+    }
+    fn key(&self) -> Option<&AttemptKey> {
+        match self {
+            BatchLane::Empty { .. } => None,
+            BatchLane::Seeding(l) => Some(&l.key),
+            BatchLane::Running(l) => Some(&l.key),
+            BatchLane::AwaitingClient(t) => Some(&t.key),
+        }
+    }
+}
+
+/// Host-side continuous-batch scheduler (no GPU). Owns fixed slots, pending
+/// inbox keyed by `(id, attempt_id)`, cohort sampling key, and per-lane
+/// lifecycle. GPU batch state (`Qwen35DecodeBatchState`) is layered above
+/// when available; tests drive this scheduler directly.
+struct ContinuousBatchScheduler {
+    max_batch: usize,
+    lane_capacity: usize,
+    lanes: Vec<BatchLane>,
+    inbox: std::collections::VecDeque<AttemptKey>,
+    pending: std::collections::HashMap<AttemptKey, BatchPendingRequest>,
+    pending_sampling: std::collections::HashMap<AttemptKey, BatchSampling>,
+    cohort_key: Option<BatchSamplingKey>,
+    next_generation: u64,
+}
+
+#[derive(Debug, Clone)]
+struct BatchPendingRequest {
+    key: AttemptKey,
+    prompt: String,
+    prompt_tokens: Vec<u32>,
+    started_in_think: bool,
+    system: Option<String>,
+    assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix,
+    max_think_tokens: usize,
+    max_tokens: usize,
+    sampling: BatchSampling,
+}
+
+impl ContinuousBatchScheduler {
+    fn new(max_batch: usize, lane_capacity: usize) -> Self {
+        let lanes = (0..max_batch)
+            .map(|_| BatchLane::Empty { generation: 0 })
+            .collect();
+        Self {
+            max_batch,
+            lane_capacity,
+            lanes,
+            inbox: std::collections::VecDeque::new(),
+            pending: std::collections::HashMap::new(),
+            pending_sampling: std::collections::HashMap::new(),
+            cohort_key: None,
+            next_generation: 1,
+        }
+    }
+
+    fn capacity(&self) -> usize {
+        self.max_batch
+    }
+
+    fn active_count(&self) -> usize {
+        self.lanes
+            .iter()
+            .filter(|l| {
+                matches!(
+                    l,
+                    BatchLane::Seeding(_) | BatchLane::Running(_) | BatchLane::AwaitingClient(_)
+                )
+            })
+            .count()
+    }
+    fn running_count(&self) -> usize {
+        self.lanes
+            .iter()
+            .filter(|l| matches!(l, BatchLane::Running(_)))
+            .count()
+    }
+    fn awaiting_count(&self) -> usize {
+        self.lanes
+            .iter()
+            .filter(|l| matches!(l, BatchLane::AwaitingClient(_)))
+            .count()
+    }
+
+    fn empty_lanes(&self) -> Vec<usize> {
+        self.lanes
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.is_empty())
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    fn enqueue(&mut self, req: BatchPendingRequest) -> bool {
+        let key = req.key.clone();
+        if self.pending.contains_key(&key) || self.inbox.contains(&key) {
+            return false;
+        }
+        let sampling = req.sampling.clone();
+        self.inbox.push_back(key.clone());
+        self.pending.insert(key.clone(), req);
+        self.pending_sampling.insert(key, sampling);
+        true
+    }
+
+    fn cohort_key_for(&self, key: &AttemptKey) -> Option<BatchSamplingKey> {
+        self.pending_sampling.get(key).map(|s| s.key())
+    }
+
+    fn try_assign_one(&mut self) -> Option<(AttemptKey, LaneTicket)> {
+        let lane_idx = self.lanes.iter().position(|l| l.is_empty())?;
+        let front_key = self.inbox.front()?.clone();
+        let req_sampling_key = self.cohort_key_for(&front_key)?;
+        if let Some(cohort) = &self.cohort_key {
+            if cohort != &req_sampling_key {
+                return None;
+            }
+        }
+        let key = self.inbox.pop_front()?;
+        let req = self.pending.get(&key)?.clone();
+        let gen = self.next_generation;
+        self.next_generation += 1;
+        let ticket = LaneTicket {
+            lane: lane_idx,
+            generation: gen,
+        };
+        let lane = QwenBatchLane {
+            key: key.clone(),
+            ticket,
+            sampling: req.sampling.clone(),
+            prompt_len: req.prompt_tokens.len(),
+            seq_pos: 0,
+            next_token: None,
+            rng_state: batch_rng_for_key(&key),
+            conversation_tokens: Vec::new(),
+            streamed_tokens: Vec::new(),
+            bytes_fed_to_filter: 0,
+            created_at: Instant::now(),
+            prefill_done_at: None,
+            first_token_at: None,
+            max_active_lanes: 0,
+        };
+        self.lanes[lane_idx] = BatchLane::Running(lane);
+        if self.cohort_key.is_none() {
+            self.cohort_key = Some(req_sampling_key);
+        }
+        if batch_terminal_control()
+            .mu
+            .lock()
+            .unwrap()
+            .entries
+            .contains_key(&key)
+        {
+            batch_transition_to_queued(&key.id, key.attempt_id);
+            batch_bind_active(&key.id, key.attempt_id, ticket);
+        }
+        Some((key, ticket))
+    }
+
+    fn mark_awaiting_commit(&mut self, lane: usize, pending_done: serde_json::Value) -> bool {
+        if lane >= self.lanes.len() {
+            return false;
+        }
+        let lane_state =
+            std::mem::replace(&mut self.lanes[lane], BatchLane::Empty { generation: 0 });
+        match lane_state {
+            BatchLane::Running(q) => {
+                let key = q.key.clone();
+                let ticket = q.ticket;
+                let sampling = q.sampling.clone();
+                let prompt_len = q.prompt_len;
+                let seq_pos = q.seq_pos;
+                let deadline = Instant::now() + CLIENT_TERMINAL_COMMIT_TIMEOUT;
+                let term = BatchPendingTerminal {
+                    key: key.clone(),
+                    ticket,
+                    sampling,
+                    prompt_len,
+                    seq_pos,
+                    pending_done: pending_done.clone(),
+                    deadline,
+                };
+                self.lanes[lane] = BatchLane::AwaitingClient(term);
+                batch_mark_ready_with_pending(&key.id, key.attempt_id, ticket, pending_done);
+                true
+            }
+            other => {
+                self.lanes[lane] = other;
+                false
+            }
+        }
+    }
+
+    fn commit_lane(&mut self, lane: usize, expected: &AttemptKey) -> bool {
+        if lane >= self.lanes.len() {
+            return false;
+        }
+        let is_awaiting =
+            matches!(&self.lanes[lane], BatchLane::AwaitingClient(t) if &t.key == expected);
+        if !is_awaiting {
+            return false;
+        }
+        match batch_poll_decision(&expected.id, expected.attempt_id) {
+            Some(ClientTerminalDecision::Commit) => {}
+            _ => return false,
+        }
+        {
+            let g = batch_terminal_control().mu.lock().unwrap();
+            if let Some(e) = g.entries.get(expected) {
+                if let BatchRegistryState::Ready { owner } = e.state {
+                    let lane_gen = self.lanes[lane].generation();
+                    if owner.generation != lane_gen {
+                        return false;
+                    }
+                } else {
+                    return false;
+                }
+            } else {
+                return false;
+            }
+        }
+        let gen = self.lanes[lane].generation();
+        self.lanes[lane] = BatchLane::Empty {
+            generation: gen + 1,
+        };
+        self.pending.remove(expected);
+        self.pending_sampling.remove(expected);
+        batch_clear_terminal(&expected.id, expected.attempt_id);
+        self.maybe_clear_cohort();
+        true
+    }
+
+    fn abort_lane(&mut self, lane: usize, expected: &AttemptKey) -> bool {
+        if lane >= self.lanes.len() {
+            return false;
+        }
+        let lane_key = self.lanes[lane].key().cloned();
+        if lane_key.as_ref() != Some(expected) {
+            return false;
+        }
+        {
+            let g = batch_terminal_control().mu.lock().unwrap();
+            if let Some(e) = g.entries.get(expected) {
+                match e.state {
+                    BatchRegistryState::Active { owner } | BatchRegistryState::Ready { owner } => {
+                        if owner.generation != self.lanes[lane].generation() {
+                            return false;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let gen = self.lanes[lane].generation();
+        self.lanes[lane] = BatchLane::Empty {
+            generation: gen + 1,
+        };
+        self.pending.remove(expected);
+        self.pending_sampling.remove(expected);
+        self.inbox.retain(|k| k != expected);
+        batch_clear_terminal(&expected.id, expected.attempt_id);
+        self.maybe_clear_cohort();
+        true
+    }
+
+    fn abort_queued(&mut self, key: &AttemptKey) -> bool {
+        if !self.inbox.contains(key) {
+            return false;
+        }
+        let state_ok = {
+            let g = batch_terminal_control().mu.lock().unwrap();
+            if let Some(e) = g.entries.get(key) {
+                matches!(
+                    e.state,
+                    BatchRegistryState::Announced | BatchRegistryState::Queued
+                )
+            } else {
+                false
+            }
+        };
+        if !state_ok {
+            return false;
+        }
+        if !batch_check_abort(&key.id, key.attempt_id) {
+            return false;
+        }
+        self.inbox.retain(|k| k != key);
+        self.pending.remove(key);
+        self.pending_sampling.remove(key);
+        batch_clear_terminal(&key.id, key.attempt_id);
+        true
+    }
+
+    fn reset_lane_for_reuse(&mut self, lane: usize) -> bool {
+        if lane >= self.lanes.len() {
+            return false;
+        }
+        if !self.lanes[lane].is_empty() {
+            return false;
+        }
+        true
+    }
+
+    fn fail_all_active(&mut self) -> Vec<AttemptKey> {
+        let mut failed = Vec::new();
+        for lane in &mut self.lanes {
+            match lane {
+                BatchLane::Running(q) | BatchLane::Seeding(q) => {
+                    failed.push(q.key.clone());
+                }
+                BatchLane::AwaitingClient(t) => {
+                    failed.push(t.key.clone());
+                }
+                BatchLane::Empty { .. } => {}
+            }
+            if !matches!(lane, BatchLane::Empty { .. }) {
+                let gen = lane.generation();
+                *lane = BatchLane::Empty {
+                    generation: gen + 1,
+                };
+            }
+        }
+        for k in failed.iter() {
+            self.pending.remove(k);
+            self.pending_sampling.remove(k);
+            batch_clear_terminal(&k.id, k.attempt_id);
+        }
+        for k in self.inbox.drain(..) {
+            self.pending.remove(&k);
+            self.pending_sampling.remove(&k);
+            batch_clear_terminal(&k.id, k.attempt_id);
+        }
+        self.cohort_key = None;
+        failed
+    }
+
+    fn maybe_clear_cohort(&mut self) {
+        let has_active = self.lanes.iter().any(|l| {
+            matches!(
+                l,
+                BatchLane::Seeding(_) | BatchLane::Running(_) | BatchLane::AwaitingClient(_)
+            )
+        });
+        if !has_active {
+            self.cohort_key = None;
+        }
+        if !has_active && self.inbox.is_empty() {
+            self.cohort_key = None;
+        }
+    }
+
+    fn find_lane_by_key(&self, key: &AttemptKey) -> Option<usize> {
+        self.lanes
+            .iter()
+            .position(|l| l.key().is_some_and(|k| k == key))
+    }
+    fn pending_done_for(&self, lane: usize) -> Option<serde_json::Value> {
+        match &self.lanes[lane] {
+            BatchLane::AwaitingClient(t) => Some(t.pending_done.clone()),
+            _ => None,
+        }
+    }
+    fn deadline_for(&self, lane: usize) -> Option<Instant> {
+        match &self.lanes[lane] {
+            BatchLane::AwaitingClient(t) => Some(t.deadline),
+            _ => None,
+        }
+    }
+}
+/// Deterministic per-request RNG derived from canonical base 0x13579BDF mixed
+/// with the key's id bytes and attempt_id. Ensures each lane/request gets a
+/// distinct stream rather than the same fixed seed.
+fn batch_rng_for_key(key: &AttemptKey) -> u64 {
+    let mut h = 0x13579BDFu64;
+    h = h.wrapping_add(key.attempt_id.wrapping_mul(0x9E3779B97F4A7C15));
+    h ^= h >> 30;
+    h = h.wrapping_mul(0xBF58476D1CE4E5B9);
+    h ^= h >> 27;
+    for &b in key.id.as_bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+        h ^= h >> 33;
+    }
+    h = h.wrapping_mul(0xFF51AFD7ED558CCD);
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xC4CEB9FE1A85EC53);
+    h ^= h >> 33;
+    if h == 0 {
+        0x13579BDF
+    } else {
+        h
+    }
+}
+
+/// Eligibility for continuous batching. Conservative: only single-GPU
+/// exact HIP Qwen 5/6 stateless text without excluded features.
+fn is_batch_eligible(
+    arch_id: usize,
+    pp: usize,
+    ep_is_some: bool,
+    has_image: bool,
+    has_tools: bool,
+    has_stop: bool,
+    has_speculator: bool,
+    has_adaptive: bool,
+    has_pflash: bool,
+    has_messages_history: bool,
+    think_mode_is_nonthink: bool,
+    serve_continuous_batch: bool,
+    continuous_batch_size: usize,
+) -> bool {
+    if !serve_continuous_batch {
+        return false;
+    }
+    if continuous_batch_size <= 1 {
+        return false;
+    }
+    if arch_id != 5 && arch_id != 6 {
+        return false;
+    }
+    if pp != 1 || ep_is_some {
+        return false;
+    }
+    if has_image || has_tools || has_stop {
+        return false;
+    }
+    if has_speculator || has_adaptive || has_pflash {
+        return false;
+    }
+    if has_messages_history {
+        return false;
+    }
+    if !think_mode_is_nonthink {
+        return false;
+    }
+    true
+}
+
+/// Formats the independent Qwen decode-batch path can actually execute.
+/// Must stay aligned with `lm_head_batched` + `prepare_decode_batch_inputs`
+/// in hipfire-arch-qwen35 — unsupported lm_head or F32 embedding must never
+/// advertise `continuous_batch_capable` or enter the batch route.
+fn qwen_batch_weight_formats_supported(weights: &qwen35::Qwen35Weights) -> bool {
+    use hipfire_runtime::llama::EmbeddingFormat;
+    use rdna_compute::DType;
+    let embd_ok = matches!(
+        weights.embd_format,
+        EmbeddingFormat::HFQ4G256 | EmbeddingFormat::Q8_0
+    );
+    let lm_ok = matches!(
+        weights.output.gpu_dtype,
+        DType::Q8_0
+            | DType::HFQ4G256
+            | DType::MQ4G256
+            | DType::HFQ6G256
+            | DType::MQ6G256
+            | DType::MQ3G256
+    );
+    embd_ok && lm_ok
+}
+
+/// Return the sole user message's text when the request has an eligible
+/// single-user `messages` array. Prompt-only requests return `None`.
+fn batch_single_user_content(msg: &serde_json::Value) -> Option<String> {
+    let arr = msg.get("messages")?.as_array()?;
+    if arr.len() != 1 {
+        return None;
+    }
+    arr[0]
+        .get("content")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned)
+}
+
+/// HTTP/OpenAI `messages` are batch-eligible only when absent (prompt path)
+/// or exactly one user turn. Multi-turn, system/assistant/tool roles, and
+/// tool_call payloads stay on the sequential route.
+fn batch_messages_are_single_user(msg: &serde_json::Value) -> bool {
+    let Some(messages) = msg.get("messages") else {
+        return true;
+    };
+    let Some(arr) = messages.as_array() else {
+        return false;
+    };
+    if arr.is_empty() {
+        return true;
+    }
+    if arr.len() != 1 {
+        return false;
+    }
+    let m0 = &arr[0];
+    if m0.get("role").and_then(|v| v.as_str()) != Some("user") {
+        return false;
+    }
+    // Tool-call payloads on the sole message force sequential (batch v1 has
+    // no tools path). Empty / missing tool_calls is fine.
+    if let Some(tc) = m0.get("tool_calls") {
+        if tc.as_array().is_some_and(|a| !a.is_empty()) || tc.is_object() {
+            return false;
+        }
+    }
+    true
+}
+
+/// Parse `params.continuous_batch_size` with backward-compatible default 1.
+fn parse_continuous_batch_size(params: Option<&serde_json::Value>) -> usize {
+    params
+        .and_then(|p| p.get("continuous_batch_size"))
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize)
+        .unwrap_or(1)
+}
+
+/// Parse `serve_continuous_batch` request flag with default false.
+fn parse_serve_continuous_batch(msg: &serde_json::Value) -> bool {
+    msg.get("serve_continuous_batch")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+        || msg
+            .get("params")
+            .and_then(|p| p.get("serve_continuous_batch"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+}
+/// Shared sampling resolver: exactly the same ladder the sequential generate
+/// arm uses. Preserves `.hfq` recommendations and request aliases; never
+/// invents fake defaults (`0.3/0.8/max=4`) or drops min-p/penalties.
+fn resolve_batch_sampling(msg: &serde_json::Value, m: &LoadedModel) -> BatchSampling {
+    let (arch_default_temp, arch_default_top_p) = if m.arch_id == 11 {
+        (0.1_f64, 0.80_f64)
+    } else if m.arch_id == 9 {
+        (0.0_f64, 1.0_f64)
+    } else if m.arch_id == 10 {
+        (1.0_f64, 1.0_f64)
+    } else if m.arch_id == 12 {
+        (1.0_f64, 0.95_f64)
+    } else {
+        (0.3_f64, 0.8_f64)
+    };
+    let default_temp = m
+        .rec_temperature
+        .map(|x| x as f64)
+        .unwrap_or(arch_default_temp);
+    let default_top_p = m.rec_top_p.map(|x| x as f64).unwrap_or(arch_default_top_p);
+    let temp = msg
+        .get("temperature")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(default_temp) as f32;
+    let top_p = msg
+        .get("top_p")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(default_top_p) as f32;
+    let default_repeat = if m.arch_id == 11 { 1.05_f64 } else { 1.0_f64 };
+    let repeat_penalty = msg
+        .get("repeat_penalty")
+        .or_else(|| msg.get("repetition_penalty"))
+        .and_then(|v| v.as_f64())
+        .unwrap_or(default_repeat) as f32;
+    let repeat_window = msg
+        .get("repeat_window")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(128) as usize;
+    let presence_penalty =
+        (msg.get("presence_penalty")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(m.rec_presence_penalty.unwrap_or(0.0) as f64) as f32)
+            .max(0.0);
+    let frequency_penalty = (msg
+        .get("frequency_penalty")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0) as f32)
+        .max(0.0);
+    let top_k: Option<u32> = msg
+        .get("top_k")
+        .and_then(|v| v.as_u64())
+        .map(|k| k as u32)
+        .or_else(|| m.rec_top_k.map(|k| k as u32))
+        .filter(|&k| k > 0);
+    let min_p: Option<f32> = msg
+        .get("min_p")
+        .and_then(|v| v.as_f64())
+        .map(|p| p as f32)
+        .or(m.rec_min_p)
+        .filter(|&p| p > 0.0);
+    BatchSampling {
+        temp,
+        top_p,
+        top_k,
+        min_p,
+        repeat_penalty,
+        presence_penalty,
+        frequency_penalty,
+        repeat_window,
+    }
+}
+
+/// Stateless prompt rendering for a batch lane, reusing the production
+/// `ChatFrame`/`JinjaChatFrame` path. Called with `seq_pos=0`, no tools/
+/// messages/PFlash, retains `started_in_think` for barrier gating.
+/// Plain fallback on Jinja render failure is preserved.
+fn batch_render_prompt_tokens(
+    prompt: &str,
+    system: Option<&str>,
+    assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix,
+    tokenizer: &hipfire_runtime::tokenizer::Tokenizer,
+    chat_template: Option<&String>,
+    max_think_tokens: usize,
+    messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
+) -> Result<(Vec<u32>, bool), String> {
+    let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
+    let try_jinja = jinja_enabled && chat_template.is_some();
+    let mut started_in_think = matches!(
+        assistant_prefix,
+        hipfire_runtime::prompt_frame::AssistantPrefix::OpenThink
+    );
+    let q_tokens = tokenizer.encode(prompt);
+    let system_prompt = system;
+    let new_tokens = if try_jinja {
+        let template = chat_template.unwrap();
+        let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
+            tokenizer,
+            template,
+            system: system_prompt,
+            user: prompt,
+            enable_thinking: max_think_tokens != 1,
+            bos_token: None,
+        };
+        let render_result = if let Some(messages) = messages_history {
+            frame.render_messages(messages, None, None)
+        } else {
+            frame.render()
+        };
+        match render_result {
+            Ok(rendered) => {
+                started_in_think = render_tail_opens_think(&rendered);
+                tokenizer.encode(&rendered)
+            }
+            Err(e) => {
+                eprintln!("[daemon] jinja render failed ({e}) — falling back to Plain");
+                hipfire_runtime::prompt_frame::ChatFrame {
+                    tokenizer,
+                    system: system_prompt,
+                    user: "",
+                    assistant_prefix,
+                    raw: false,
+                }
+                .build_with_user_tokens(&q_tokens)
+            }
+        }
+    } else {
+        hipfire_runtime::prompt_frame::ChatFrame {
+            tokenizer,
+            system: system_prompt,
+            user: "",
+            assistant_prefix,
+            raw: false,
+        }
+        .build_with_user_tokens(&q_tokens)
+    };
+    Ok((new_tokens, started_in_think))
+}
+
+/// Tightened admission: require Qwen 5/6, pp=1, no EP, GenerationRoute::QwenAr,
+/// model-owned batch state present, and no excluded features. Rendered prompts
+/// that open a think span stay on the sequential barrier route.
+fn is_batch_request_eligible(
+    msg: &serde_json::Value,
+    m: &LoadedModel,
+    continuous_batch_size: usize,
+    serve_continuous_batch: bool,
+    pflash_active: bool,
+) -> bool {
+    let has_image = msg.get("image").is_some() || msg.get("image_base64").is_some();
+    let has_tools = msg
+        .get("tools")
+        .and_then(|v| v.as_array())
+        .is_some_and(|a| !a.is_empty());
+    let has_stop = msg
+        .get("stop")
+        .and_then(|v| v.as_array())
+        .is_some_and(|a| !a.is_empty());
+    // messages: absent OR exactly one user turn (HTTP chat shape).
+    let has_spec = m.speculator.is_some();
+    let has_adaptive = m.kv_adaptive.is_some();
+    // For route check we need temp etc to compute GenerationRoute; use resolved sampling temp
+    let sampling = resolve_batch_sampling(msg, m);
+    let user_explicit = [
+        "top_p",
+        "top_k",
+        "min_p",
+        "repeat_penalty",
+        "presence_penalty",
+        "frequency_penalty",
+    ]
+    .iter()
+    .any(|k| msg.get(*k).is_some());
+    let ngram_can_sample = m
+        .speculator
+        .as_ref()
+        .map(|s| !s.requires_greedy())
+        .unwrap_or(false);
+    let supports_temp_swor = m
+        .speculator
+        .as_ref()
+        .is_some_and(|s| s.supports_temp_verify());
+    let route_inputs = GenerationRouteInputs {
+        arch_id: m.arch_id,
+        ep: m.ep.is_some(),
+        pp: m.pp,
+        has_speculator: has_spec,
+        qwen_mtp_head: m.qwen35_mtp_head.is_some(),
+        qwen_mtp_opt_in: std::env::var("HIPFIRE_QWEN_MTP").ok().as_deref() == Some("1"),
+        mtp_sampled_on: std::env::var("HIPFIRE_MTP_SAMPLED").ok().as_deref() == Some("1"),
+        deepseek4_spec_requested: false,
+        ngram_can_sample,
+        temp: sampling.temp,
+        user_explicit_sampling: user_explicit,
+        min_p: sampling.min_p,
+        force_ar_chat: false,
+        temp_spec_env_off: std::env::var("HIPFIRE_DFLASH_TEMP_SPEC").ok().as_deref() == Some("0"),
+        fast_sample_on: std::env::var("HIPFIRE_FAST_SAMPLE").ok().as_deref() != Some("0"),
+        supports_temp_swor,
+        kv_adaptive: has_adaptive,
+    };
+    let route = select_generation_route(&route_inputs);
+    if route != GenerationRoute::QwenAr {
+        return false;
+    }
+    if m.qwen35_decode_batch.is_none() {
+        return false;
+    }
+    // Formats must match what the batch kernels can run (also gated at load).
+    if let Some(ModelState::Qwen35(bundle)) = m.state.as_ref() {
+        if !qwen_batch_weight_formats_supported(&bundle.weights) {
+            return false;
+        }
+    } else {
+        return false;
+    }
+    // No multi-turn/history/tools/images/custom stops etc.
+    if !batch_messages_are_single_user(msg) || has_tools || has_image || has_stop {
+        return false;
+    }
+    if has_spec || has_adaptive || m.eviction.is_some() || pflash_active {
+        return false;
+    }
+    if m.pp != 1 || m.ep.is_some() {
+        return false;
+    }
+    if !(m.arch_id == 5 || m.arch_id == 6) {
+        return false;
+    }
+    if !serve_continuous_batch || continuous_batch_size <= 1 {
+        return false;
+    }
+    // Forced-think/budget injection is sequential-only, but 0 (uncapped),
+    // 1 (non-think), and the ordinary CLI-resolved reasoning budget are valid
+    // batch controls.
+    let max_think = msg
+        .get("max_think_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as usize;
+    let _ = max_think;
+    let has_budget_alert =
+        msg.get("budget_alert_at_tok").is_some() || msg.get("budget_alert_text").is_some();
+    if has_budget_alert {
+        return false;
+    }
+    true
+}
+
+// ── Daemon inbox with barrier pushback ─────────────────────────────────
+
+/// Async inbox for DaemonMsg. The reader announces keys before queuing;
+/// the main loop drains via `try_recv` between GPU ticks. A non-generate
+/// or cohort-incompatible message is `push_front`ed as a barrier so it is
+/// not lost and returns to the outer `inbox.recv()` for sequential handling.
+struct DaemonInbox {
+    rx: mpsc::Receiver<DaemonMsg>,
+    backlog: std::collections::VecDeque<DaemonMsg>,
+}
+
+impl DaemonInbox {
+    fn new(rx: mpsc::Receiver<DaemonMsg>) -> Self {
+        Self {
+            rx,
+            backlog: std::collections::VecDeque::new(),
+        }
+    }
+    fn recv(&mut self) -> Result<DaemonMsg, mpsc::RecvError> {
+        if let Some(msg) = self.backlog.pop_front() {
+            return Ok(msg);
+        }
+        self.rx.recv()
+    }
+    fn try_recv(&mut self) -> Result<DaemonMsg, mpsc::TryRecvError> {
+        if let Some(msg) = self.backlog.pop_front() {
+            return Ok(msg);
+        }
+        self.rx.try_recv()
+    }
+    fn push_front(&mut self, msg: DaemonMsg) {
+        self.backlog.push_front(msg);
+    }
+}
+
+/// Error from the real GPU batch driver. Host stub never errors.
+#[derive(Debug)]
+enum BatchDriveError {
+    Gpu(String),
+    Poisoned(String),
+}
+impl std::fmt::Display for BatchDriveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BatchDriveError::Gpu(s) => write!(f, "batch gpu error: {}", s),
+            BatchDriveError::Poisoned(s) => write!(f, "batch poisoned: {}", s),
+        }
+    }
+}
+impl std::error::Error for BatchDriveError {}
+
+fn drive_qwen_continuous_batch(
+    sched: &mut ContinuousBatchScheduler,
+    gpu: &mut rdna_compute::Gpu,
+    model: &mut LoadedModel,
+    stdout: &mut std::io::Stdout,
+    inbox: &mut DaemonInbox,
+) -> Result<(), BatchDriveError> {
+    let batch_size = sched.max_batch;
+    if batch_size == 0 {
+        return Ok(());
+    }
+    // SAFETY: borrow disjoint fields via raw pointers to avoid &mut aliasing
+    let batch_state_ptr = match model.qwen35_decode_batch.as_mut() {
+        Some(s) => s as *mut qwen35::Qwen35DecodeBatchState,
+        None => {
+            return Err(BatchDriveError::Gpu(
+                "batch state not allocated".to_string(),
+            ))
+        }
+    };
+    let batch_state = unsafe { &mut *batch_state_ptr };
+    let (config_ptr, weights_ptr, scratch_ptr, tokenizer_ptr, chat_template_clone) =
+        match model.state.as_ref() {
+            Some(ModelState::Qwen35(b)) => (
+                &b.config as *const qwen35::Qwen35Config,
+                &b.weights as *const qwen35::Qwen35Weights,
+                &b.scratch as *const qwen35::Qwen35Scratch,
+                match model.tokenizer.as_ref() {
+                    Some(t) => t as *const _,
+                    None => return Err(BatchDriveError::Gpu("tokenizer missing".to_string())),
+                },
+                model.chat_template.clone(),
+            ),
+            _ => return Err(BatchDriveError::Gpu("batch model not Qwen35".to_string())),
+        };
+    let config = unsafe { &*config_ptr };
+    let weights = unsafe { &*weights_ptr };
+    let scratch = unsafe { &*scratch_ptr };
+    let tokenizer: &hipfire_runtime::tokenizer::Tokenizer = unsafe { &*tokenizer_ptr };
+    let chat_template = chat_template_clone;
+    let im_end_tok = tokenizer.special_token_id("<|im_end|>").unwrap_or(0);
+    let eos_tok = config.eos_token;
+    let mut producers: Vec<Option<QwenArSemanticProducer>> =
+        (0..batch_size).map(|_| None).collect();
+    let mut loop_guards: Vec<hipfire_runtime::loop_guard::LoopGuard> = (0..batch_size)
+        .map(
+            |_| hipfire_runtime::loop_guard::LoopGuard::from_config(hipfire_runtime::config::get()),
+        )
+        .collect();
+    let mut tokens = vec![0u32; batch_size];
+    let mut positions = vec![0usize; batch_size];
+    let fail_all = |sched: &mut ContinuousBatchScheduler,
+                    gpu: &mut rdna_compute::Gpu,
+                    batch_state: &mut qwen35::Qwen35DecodeBatchState,
+                    stdout: &mut std::io::Stdout,
+                    reason: String|
+     -> Result<(), BatchDriveError> {
+        let mut uniq_set = std::collections::HashSet::new();
+        let mut uniq: Vec<AttemptKey> = Vec::new();
+        for l in sched.lanes.iter() {
+            if let Some(k) = l.key() {
+                if uniq_set.insert(k.clone()) {
+                    uniq.push(k.clone());
+                }
+            }
+        }
+        for k in sched.inbox.iter().cloned() {
+            if uniq_set.insert(k.clone()) {
+                uniq.push(k);
+            }
+        }
+        for k in sched.pending.keys().cloned() {
+            if uniq_set.insert(k.clone()) {
+                uniq.push(k);
+            }
+        }
+        let mut first_err: Option<String> = None;
+        if let Err(e) = batch_state.reset(gpu) {
+            first_err = Some(format!("batch reset: {e}"));
+        }
+        fail_closed_invalidate_graphs_and_replay(gpu);
+        let sync = fail_closed_device_sync(gpu);
+        let prior = match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        };
+        let ep = fail_closed_epilogue_after_sync(prior, sync);
+        for key in &uniq {
+            let _scope = BatchAttemptScope::enter(key.attempt_id);
+            emit_fail_closed_error(
+                stdout,
+                Some(&key.id),
+                &format!("batch GPU error: {reason}"),
+                "gpu",
+                ep.rolled_back,
+                &ep,
+            );
+        }
+        let _ = sched.fail_all_active();
+        for k in &uniq {
+            batch_clear_terminal(&k.id, k.attempt_id);
+        }
+        if !ep.rolled_back {
+            return Err(BatchDriveError::Poisoned(format!(
+                "{reason}; {}",
+                ep.context.unwrap_or_default()
+            )));
+        }
+        Err(BatchDriveError::Gpu(reason))
+    };
+    loop {
+        let mut to_commit: Vec<(usize, AttemptKey, serde_json::Value)> = Vec::new();
+        let mut to_abort: Vec<(usize, AttemptKey)> = Vec::new();
+        for idx in 0..batch_size {
+            if let BatchLane::AwaitingClient(term) = &sched.lanes[idx] {
+                let key = term.key.clone();
+                let expired = Instant::now() >= term.deadline;
+                if batch_check_abort(&key.id, key.attempt_id) || expired {
+                    to_abort.push((idx, key));
+                } else if let Some(ClientTerminalDecision::Commit) =
+                    batch_poll_decision(&key.id, key.attempt_id)
+                {
+                    to_commit.push((idx, key.clone(), term.pending_done.clone()));
+                }
+            }
+        }
+        for (idx, key) in to_abort {
+            if let Err(e) = batch_state.reset_lane(gpu, &config, idx) {
+                return fail_all(
+                    sched,
+                    gpu,
+                    batch_state,
+                    stdout,
+                    format!("reset lane {idx} on abort: {e}"),
+                );
+            }
+            let _scope = BatchAttemptScope::enter(key.attempt_id);
+            emit_qwen_ar_cancelled(stdout, &key.id, 0);
+            let _ = sched.abort_lane(idx, &key);
+            producers[idx] = None;
+        }
+        for (idx, key, pending_done) in to_commit {
+            let _scope = BatchAttemptScope::enter(key.attempt_id);
+            // Transactional commit: reset GPU first, then host commit_lane,
+            // and only then emit the staged done. Never done+error.
+            let reset_ok = match batch_state.reset_lane(gpu, &config, idx) {
+                Ok(()) => true,
+                Err(e) => {
+                    return fail_all(
+                        sched,
+                        gpu,
+                        batch_state,
+                        stdout,
+                        format!("reset lane {idx} on commit: {e}"),
+                    );
+                }
+            };
+            let commit_ok = sched.commit_lane(idx, &key);
+            match batch_commit_teardown_class(reset_ok, commit_ok) {
+                BatchCommitTeardownClass::ResetFailed => unreachable!("reset_ok handled above"),
+                BatchCommitTeardownClass::CommitFailed => {
+                    // GPU lane already reset; host release failed — no success
+                    // terminal. Fail closed for this key only and free the slot.
+                    let ep = RollbackEpilogue {
+                        rolled_back: true,
+                        context: None,
+                    };
+                    emit_fail_closed_error(
+                        stdout,
+                        Some(&key.id),
+                        "batch commit_lane failed after reset",
+                        "internal",
+                        false,
+                        &ep,
+                    );
+                    let _ = sched.abort_lane(idx, &key);
+                    producers[idx] = None;
+                }
+                BatchCommitTeardownClass::EmitDone => {
+                    emit_staged_terminal_done(stdout, &pending_done);
+                    producers[idx] = None;
+                }
+            }
+        }
+        let mut queued_abort: Vec<AttemptKey> = Vec::new();
+        for k in sched.inbox.iter().cloned().collect::<Vec<_>>() {
+            if batch_check_abort(&k.id, k.attempt_id) {
+                queued_abort.push(k);
+            }
+        }
+        for k in queued_abort {
+            let _scope = BatchAttemptScope::enter(k.attempt_id);
+            emit_qwen_ar_cancelled(stdout, &k.id, 0);
+            let _ = sched.abort_queued(&k);
+        }
+        let mut running_abort: Vec<(usize, AttemptKey)> = Vec::new();
+        for idx in 0..batch_size {
+            if let Some(k) = sched.lanes[idx].key().cloned() {
+                if matches!(
+                    sched.lanes[idx],
+                    BatchLane::Running(_) | BatchLane::Seeding(_)
+                ) && batch_check_abort(&k.id, k.attempt_id)
+                {
+                    running_abort.push((idx, k));
+                }
+            }
+        }
+        for (idx, key) in running_abort {
+            if let Err(e) = batch_state.reset_lane(gpu, &config, idx) {
+                return fail_all(
+                    sched,
+                    gpu,
+                    batch_state,
+                    stdout,
+                    format!("reset lane {idx} on running abort: {e}"),
+                );
+            }
+            let _scope = BatchAttemptScope::enter(key.attempt_id);
+            emit_qwen_ar_cancelled(stdout, &key.id, 0);
+            let _ = sched.abort_lane(idx, &key);
+            producers[idx] = None;
+        }
+        let mut barrier: Option<DaemonMsg> = None;
+        loop {
+            let dm = match inbox.try_recv() {
+                Ok(m) => m,
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => break,
+            };
+            match dm {
+                DaemonMsg::ParseError(e) => {
+                    emit_uncorrelated_error(
+                        stdout,
+                        None,
+                        &format!("invalid JSON: {e}"),
+                        "validation",
+                        false,
+                        false,
+                    );
+                    let _ = stdout.flush();
+                }
+                DaemonMsg::Regular(json) => {
+                    let t = json.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                    if t == "generate" {
+                        let attempt_id = match json.get("attempt_id").and_then(|v| v.as_u64()) {
+                            Some(v) => v,
+                            None => {
+                                emit_uncorrelated_error(
+                                    stdout,
+                                    json.get("id").and_then(|v| v.as_str()),
+                                    "generate missing attempt_id",
+                                    "validation",
+                                    false,
+                                    false,
+                                );
+                                continue;
+                            }
+                        };
+                        let id = json
+                            .get("id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("0")
+                            .to_string();
+                        batch_announce_terminal(&id, attempt_id);
+                        if batch_check_abort(&id, attempt_id) {
+                            let _scope = BatchAttemptScope::enter(attempt_id);
+                            emit_gen_start(
+                                stdout,
+                                &id,
+                                false,
+                                Some(QWEN_AR_SEMANTIC_CONTRACT_VERSION),
+                            );
+                            emit_qwen_ar_cancelled(stdout, &id, 0);
+                            batch_clear_terminal(&id, attempt_id);
+                            continue;
+                        }
+                        if !is_batch_request_eligible(
+                            &json,
+                            model,
+                            batch_size,
+                            parse_serve_continuous_batch(&json),
+                            false,
+                        ) {
+                            barrier = Some(DaemonMsg::Regular(json));
+                            break;
+                        }
+                        let prompt_str = batch_single_user_content(&json).unwrap_or_else(|| {
+                            json.get("prompt")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("Hello")
+                                .to_string()
+                        });
+                        let system_str = json
+                            .get("system")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string());
+                        let assistant_prefix = match json
+                            .get("assistant_prefix")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("plain")
+                        {
+                            "open_think" => {
+                                hipfire_runtime::prompt_frame::AssistantPrefix::OpenThink
+                            }
+                            "closed_think" => {
+                                hipfire_runtime::prompt_frame::AssistantPrefix::ClosedThink
+                            }
+                            _ => hipfire_runtime::prompt_frame::AssistantPrefix::Plain,
+                        };
+                        let max_think = json
+                            .get("max_think_tokens")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0) as usize;
+                        let max_tokens_req = json
+                            .get("max_tokens")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(4096) as usize;
+                        let batch_messages = match json.get("messages") {
+                            Some(v) => match serde_json::from_value::<
+                                Vec<hipfire_runtime::prompt_frame::Message>,
+                            >(v.clone())
+                            {
+                                Ok(v) => Some(v),
+                                Err(e) => {
+                                    let _scope = BatchAttemptScope::enter(attempt_id);
+                                    emit_uncorrelated_error(
+                                        stdout,
+                                        Some(&id),
+                                        &format!("invalid messages field: {e}"),
+                                        "validation",
+                                        false,
+                                        false,
+                                    );
+                                    batch_clear_terminal(&id, attempt_id);
+                                    continue;
+                                }
+                            },
+                            None => None,
+                        };
+                        let (prompt_tokens, started_in_think) = match batch_render_prompt_tokens(
+                            &prompt_str,
+                            system_str.as_deref(),
+                            assistant_prefix,
+                            tokenizer,
+                            chat_template.as_ref(),
+                            max_think,
+                            batch_messages.as_deref(),
+                        ) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                let _scope = BatchAttemptScope::enter(attempt_id);
+                                emit_uncorrelated_error(
+                                    stdout,
+                                    Some(&id),
+                                    &format!("render failed: {e}"),
+                                    "validation",
+                                    false,
+                                    false,
+                                );
+                                batch_clear_terminal(&id, attempt_id);
+                                continue;
+                            }
+                        };
+                        if started_in_think {
+                            // Pre-latched abort must move to the sequential
+                            // singleton before this key leaves the batch plane.
+                            // Transfer clears the keyed entry exactly once.
+                            let _ = batch_transfer_abort_to_singleton_and_clear(&id, attempt_id);
+                            barrier = Some(DaemonMsg::Regular(json));
+                            break;
+                        }
+                        if prompt_tokens.is_empty() || prompt_tokens.len() >= sched.lane_capacity {
+                            let _scope = BatchAttemptScope::enter(attempt_id);
+                            emit_uncorrelated_error(
+                                stdout,
+                                Some(&id),
+                                "prompt exceeds lane capacity or empty",
+                                "validation",
+                                false,
+                                false,
+                            );
+                            batch_clear_terminal(&id, attempt_id);
+                            continue;
+                        }
+                        batch_transition_to_queued(&id, attempt_id);
+                        let sampling = resolve_batch_sampling(&json, model);
+                        let req = BatchPendingRequest {
+                            key: AttemptKey::new(&id, attempt_id),
+                            prompt: prompt_str.clone(),
+                            prompt_tokens: prompt_tokens.clone(),
+                            started_in_think,
+                            system: system_str.clone(),
+                            assistant_prefix,
+                            max_think_tokens: max_think,
+                            max_tokens: max_tokens_req,
+                            sampling,
+                        };
+                        if !sched.enqueue(req) {
+                            // Defensive: a live registry/channel already owns this
+                            // key. Do not emit a keyed error or clear the original.
+                            eprintln!(
+                                "[batch] duplicate enqueue rejected id={} attempt_id={}; preserving live registry",
+                                id, attempt_id
+                            );
+                            continue;
+                        }
+                        {
+                            let _scope = BatchAttemptScope::enter(attempt_id);
+                            emit_gen_start(
+                                stdout,
+                                &id,
+                                started_in_think,
+                                Some(QWEN_AR_SEMANTIC_CONTRACT_VERSION),
+                            );
+                        }
+                    } else if t == "abort" || t == "commit" {
+                        if let (Some(id), Some(aid), Some(kind)) = (
+                            json.get("id").and_then(|v| v.as_str()),
+                            json.get("attempt_id").and_then(|v| v.as_u64()),
+                            json.get("type").and_then(|v| v.as_str()),
+                        ) {
+                            batch_apply_terminal_control(kind, id, aid);
+                        }
+                    } else {
+                        barrier = Some(DaemonMsg::Regular(json));
+                        break;
+                    }
+                }
+            }
+        }
+        if let Some(msg) = barrier {
+            inbox.push_front(msg);
+            if sched.active_count() == 0 && sched.inbox.is_empty() {
+                return Ok(());
+            }
+        }
+        while let Some((key, ticket)) = sched.try_assign_one() {
+            let lane_idx = ticket.lane;
+            let pending_req = match sched.pending.get(&key).cloned() {
+                Some(r) => r,
+                None => continue,
+            };
+            let sampling = pending_req.sampling.clone();
+            // Use admission-rendered tokens/semantics; do not re-render with None/Plain/0.
+            let prompt_tokens = pending_req.prompt_tokens.clone();
+            let started_in_think = pending_req.started_in_think;
+            if started_in_think {
+                // Defensive: think-open prompts are sequential barriers. Transfer
+                // any pre-latched abort once, free the just-assigned lane, and
+                // push the generate back for outer sequential handling.
+                let prompt = pending_req.prompt.clone();
+                let _ = batch_transfer_abort_to_singleton_and_clear(&key.id, key.attempt_id);
+                let _ = sched.abort_lane(lane_idx, &key);
+                if let Err(err) = batch_state.reset_lane(gpu, &config, lane_idx) {
+                    return fail_all(
+                        sched,
+                        gpu,
+                        batch_state,
+                        stdout,
+                        format!("reset lane {lane_idx} on think barrier: {err}"),
+                    );
+                }
+                inbox.push_front(DaemonMsg::Regular(serde_json::json!({
+                    "type": "generate",
+                    "id": key.id,
+                    "attempt_id": key.attempt_id,
+                    "prompt": prompt
+                })));
+                break;
+            }
+
+            if let Err(e) = batch_state.reset_lane(gpu, &config, lane_idx) {
+                return fail_all(
+                    sched,
+                    gpu,
+                    batch_state,
+                    stdout,
+                    format!("reset lane {lane_idx}: {e}"),
+                );
+            }
+            if let Err(e) =
+                batch_state.prefill_lane(gpu, &weights, &config, &scratch, lane_idx, &prompt_tokens)
+            {
+                return fail_all(
+                    sched,
+                    gpu,
+                    batch_state,
+                    stdout,
+                    format!("prefill lane {lane_idx}: {e}"),
+                );
+            }
+            let hist: &[u32] = &[];
+            let lane_rng = match &sched.lanes[lane_idx] {
+                BatchLane::Running(lane) => lane.rng_state as u32,
+                _ => continue,
+            };
+            let (next_token, next_rng) = match batch_state.sample_lane_product(
+                gpu,
+                &config,
+                lane_idx,
+                hist,
+                sampling.temp,
+                sampling.top_p,
+                sampling.top_k,
+                sampling.min_p,
+                lane_rng,
+                sampling.repeat_penalty,
+                sampling.presence_penalty,
+                sampling.frequency_penalty,
+            ) {
+                Ok(v) => v,
+                Err(e) => {
+                    return fail_all(
+                        sched,
+                        gpu,
+                        batch_state,
+                        stdout,
+                        format!("sample lane {lane_idx}: {e}"),
+                    )
+                }
+            };
+            if let BatchLane::Running(lane) = &mut sched.lanes[lane_idx] {
+                lane.prompt_len = prompt_tokens.len();
+                lane.seq_pos = prompt_tokens.len();
+                lane.next_token = Some(next_token);
+                lane.rng_state = next_rng as u64;
+                lane.conversation_tokens = Vec::new();
+                lane.streamed_tokens = Vec::new();
+                lane.bytes_fed_to_filter = 0;
+                lane.prefill_done_at = Some(Instant::now());
+            }
+            producers[lane_idx] = Some(QwenArSemanticProducer::new(
+                key.id.clone(),
+                started_in_think,
+            ));
+        }
+        let running: Vec<usize> = sched
+            .lanes
+            .iter()
+            .enumerate()
+            .filter_map(|(i, l)| {
+                if matches!(l, BatchLane::Running(_)) {
+                    Some(i)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let awaiting: Vec<usize> = sched
+            .lanes
+            .iter()
+            .enumerate()
+            .filter_map(|(i, l)| {
+                if matches!(l, BatchLane::AwaitingClient(_)) {
+                    Some(i)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if running.is_empty()
+            && awaiting.is_empty()
+            && sched.inbox.is_empty()
+            && inbox.backlog.is_empty()
+        {
+            break;
+        }
+        if running.is_empty() {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            continue;
+        }
+        // Peak concurrent Running occupancy observed while each lane is live.
+        let active_now = running.len();
+        for &idx in &running {
+            if let BatchLane::Running(lane) = &mut sched.lanes[idx] {
+                if active_now > lane.max_active_lanes {
+                    lane.max_active_lanes = active_now;
+                }
+            }
+        }
+        for i in 0..batch_size {
+            match &sched.lanes[i] {
+                BatchLane::Running(lane) => {
+                    tokens[i] = lane.next_token.unwrap_or(eos_tok);
+                    positions[i] = lane.seq_pos;
+                }
+                _ => {
+                    tokens[i] = eos_tok;
+                    positions[i] = 0;
+                }
+            }
+        }
+        if let Err(e) = qwen35::forward_decode_batch(
+            gpu,
+            &weights,
+            &config,
+            &tokens,
+            &positions,
+            batch_state,
+            &scratch,
+        ) {
+            return fail_all(
+                sched,
+                gpu,
+                batch_state,
+                stdout,
+                format!("forward_decode_batch: {e}"),
+            );
+        }
+        let mut repeat_tokens: Vec<u32> = vec![0; batch_size * batch_state.sample_repeat_capacity];
+        let mut repeat_lengths: Vec<u32> = vec![0; batch_size];
+        let mut rng_states: Vec<u32> = vec![0; batch_size];
+        let mut survivors: Vec<usize> = Vec::new();
+        let mut to_await: Vec<(usize, AttemptKey, serde_json::Value)> = Vec::new();
+        let mut to_abort_running: Vec<(usize, AttemptKey)> = Vec::new();
+        for idx in running.clone() {
+            let key = match sched.lanes[idx].key().cloned() {
+                Some(k) => k,
+                None => continue,
+            };
+            if batch_check_abort(&key.id, key.attempt_id) {
+                to_abort_running.push((idx, key));
+                continue;
+            }
+            let lane_ptr = match &mut sched.lanes[idx] {
+                BatchLane::Running(l) => l as *mut QwenBatchLane,
+                _ => continue,
+            };
+            let lane = unsafe { &mut *lane_ptr };
+            let cur_token = lane.next_token.unwrap_or(eos_tok);
+            let prod_ptr = match producers[idx].as_mut() {
+                Some(p) => p as *mut QwenArSemanticProducer,
+                None => continue,
+            };
+            let producer = unsafe { &mut *prod_ptr };
+            let mut future_streamed = lane.streamed_tokens.clone();
+            future_streamed.push(cur_token);
+            let all_bytes = tokenizer.decode_bytes(&future_streamed);
+            let prev_fed = lane.bytes_fed_to_filter.min(all_bytes.len());
+            let token_bytes = all_bytes[prev_fed..].to_vec();
+            let _scope = BatchAttemptScope::enter(key.attempt_id);
+            // TTFT: host Instant immediately before the first classified emit.
+            if lane.first_token_at.is_none() {
+                lane.first_token_at = Some(Instant::now());
+            }
+            let stopped = {
+                let lane_seq = &mut lane.seq_pos as *mut usize;
+                let lane_conv = &mut lane.conversation_tokens as *mut Vec<u32>;
+                let lane_stream = &mut lane.streamed_tokens as *mut Vec<u32>;
+                let lane_fed = &mut lane.bytes_fed_to_filter as *mut usize;
+                let all_len = all_bytes.len();
+                let mut res: Result<bool, _> = Ok(false);
+                unsafe {
+                    res = producer.commit_and_classify(
+                        stdout,
+                        cur_token,
+                        || {
+                            let pos = qwen_ar_raw_commit_token(
+                                &mut *lane_conv,
+                                &mut *lane_stream,
+                                &mut *lane_seq,
+                                cur_token,
+                                QwenArRawCommitDisposition::ClassifiedVisible,
+                            );
+                            *lane_fed = all_len;
+                            (pos, token_bytes.clone())
+                        },
+                        |_, _| {},
+                    );
+                }
+                match res {
+                    Ok(s) => s,
+                    Err(e) => {
+                        return fail_all(
+                            sched,
+                            gpu,
+                            batch_state,
+                            stdout,
+                            format!("semantic classify lane {idx}: {e}"),
+                        )
+                    }
+                }
+            };
+            let loop_hit = loop_guards[idx].check(&lane.streamed_tokens).is_some();
+            let is_eos = cur_token == eos_tok || cur_token == im_end_tok;
+            let hit_max = lane.streamed_tokens.len() >= lane_max_tokens(&key, sched);
+            // After committing the current token, seq_pos is the next decode
+            // index and must stay strictly below lane_capacity.
+            let hit_lane_cap = batch_lane_at_capacity(lane.seq_pos, sched.lane_capacity);
+            let should_finish =
+                batch_should_finish_decode(is_eos, hit_max, hit_lane_cap, stopped, loop_hit);
+            if should_finish {
+                let hit_length_cap =
+                    batch_hit_length_cap(hit_max, hit_lane_cap, is_eos, stopped, loop_hit);
+
+                let producer_owned = match producers[idx].take() {
+                    Some(p) => p,
+                    None => continue,
+                };
+                let (finish, visible_text) = match producer_owned.finish(stdout, hit_length_cap) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        return fail_all(
+                            sched,
+                            gpu,
+                            batch_state,
+                            stdout,
+                            format!("semantic finish lane {idx}: {e}"),
+                        )
+                    }
+                };
+                if matches!(finish.cause, QwenArTerminalCause::OpenThink) && !is_eos {
+                    // A single lane's semantic validation error is not a GPU core
+                    // failure. Roll the lane back and report this key only; peers
+                    // keep decoding and the lane is reset before any refill.
+                    if let Err(e) = batch_state.reset_lane(gpu, &config, idx) {
+                        return fail_all(
+                            sched,
+                            gpu,
+                            batch_state,
+                            stdout,
+                            format!("reset lane {idx} on open think: {e}"),
+                        );
+                    }
+                    let ep = RollbackEpilogue {
+                        rolled_back: true,
+                        context: None,
+                    };
+                    let _scope = BatchAttemptScope::enter(key.attempt_id);
+                    emit_qwen_ar_open_think_terminal(
+                        stdout,
+                        &key.id,
+                        lane.streamed_tokens.len(),
+                        &ep,
+                    );
+                    let _ = sched.abort_lane(idx, &key);
+                    producers[idx] = None;
+                    continue;
+                }
+                if !finish.wire_tool_calls.is_empty() {
+                    return fail_all(
+                        sched,
+                        gpu,
+                        batch_state,
+                        stdout,
+                        format!("semantic finish lane {idx}: unexpected tool calls"),
+                    );
+                }
+                let finish_reason = match finish.finish_reason {
+                    "length" => "length",
+                    "tool_calls" => "tool_calls",
+                    _ => "stop",
+                };
+                let generated = lane.streamed_tokens.len();
+                let metrics = batch_lane_done_metrics(
+                    lane.created_at,
+                    lane.prefill_done_at,
+                    lane.first_token_at,
+                    Instant::now(),
+                    lane.prompt_len,
+                    generated,
+                );
+                let mut pending_done = qwen_ar_done_value(
+                    &key.id,
+                    finish_reason,
+                    generated,
+                    metrics.tok_s,
+                    lane.prompt_len,
+                    metrics.prefill_ms,
+                    metrics.prefill_tok_s,
+                    metrics.decode_tok_s,
+                    metrics.ttft_ms,
+                    0,
+                    "",
+                );
+                pending_done["latency_ms"] =
+                    serde_json::json!((metrics.latency_ms * 10.0).round() / 10.0);
+                attach_continuous_batch_route_evidence(
+                    &mut pending_done,
+                    /*slots=*/ batch_size,
+                    /*lane=*/ idx,
+                    /*lane_capacity=*/ sched.lane_capacity,
+                    /*max_active_lanes=*/ lane.max_active_lanes.max(1),
+                );
+                let _ = visible_text;
+                let mut envelope = pending_done.clone();
+                envelope["type"] = serde_json::json!("commit_ready");
+                to_await.push((idx, key.clone(), pending_done));
+                {
+                    let _scope2 = BatchAttemptScope::enter(key.attempt_id);
+                    let _ = writeln!(stdout, "{}", envelope);
+                    let _ = stdout.flush();
+                }
+            } else {
+                survivors.push(idx);
+                let window = lane
+                    .sampling
+                    .repeat_window
+                    .min(batch_state.sample_repeat_capacity);
+                let hist = if lane.streamed_tokens.len() > window {
+                    &lane.streamed_tokens[lane.streamed_tokens.len() - window..]
+                } else {
+                    &lane.streamed_tokens[..]
+                };
+                for (i, &tok) in hist.iter().enumerate() {
+                    repeat_tokens[idx * batch_state.sample_repeat_capacity + i] = tok;
+                }
+                repeat_lengths[idx] = hist.len() as u32;
+                rng_states[idx] = lane.rng_state as u32;
+            }
+        }
+        for (idx, key) in to_abort_running {
+            if let Err(e) = batch_state.reset_lane(gpu, &config, idx) {
+                return fail_all(
+                    sched,
+                    gpu,
+                    batch_state,
+                    stdout,
+                    format!("reset lane {idx} on abort post-forward: {e}"),
+                );
+            }
+            let _scope = BatchAttemptScope::enter(key.attempt_id);
+            emit_qwen_ar_cancelled(stdout, &key.id, 0);
+            let _ = sched.abort_lane(idx, &key);
+            producers[idx] = None;
+        }
+        for (idx, key, pending_done) in to_await {
+            let _ = sched.mark_awaiting_commit(idx, pending_done);
+        }
+        if survivors.is_empty() {
+            continue;
+        }
+        for i in 0..batch_size {
+            if !survivors.contains(&i) {
+                repeat_lengths[i] = 0;
+                rng_states[i] = 0;
+            }
+        }
+        let sampling = if let Some(idx) = survivors.first() {
+            match &sched.lanes[*idx] {
+                BatchLane::Running(l) => l.sampling.clone(),
+                _ => continue,
+            }
+        } else {
+            continue;
+        };
+        let sampled = match batch_state.sample_product(
+            gpu,
+            &config,
+            batch_size,
+            &repeat_tokens,
+            &repeat_lengths,
+            &rng_states,
+            sampling.temp,
+            sampling.top_p,
+            sampling.top_k,
+            sampling.min_p,
+            sampling.repeat_penalty,
+            sampling.presence_penalty,
+            sampling.frequency_penalty,
+        ) {
+            Ok(v) => v,
+            Err(e) => {
+                return fail_all(
+                    sched,
+                    gpu,
+                    batch_state,
+                    stdout,
+                    format!("sample_product: {e}"),
+                )
+            }
+        };
+        for lane_idx in survivors.iter() {
+            let (tok, rng) = sampled[*lane_idx];
+            if let BatchLane::Running(lane) = &mut sched.lanes[*lane_idx] {
+                lane.next_token = Some(tok);
+                lane.rng_state = rng as u64;
+            }
+        }
+    }
+    Ok(())
+}
+fn lane_max_tokens(key: &AttemptKey, sched: &ContinuousBatchScheduler) -> usize {
+    sched.pending.get(key).map(|r| r.max_tokens).unwrap_or(4096)
+}
+
+/// Finite rate helper: `count / seconds`, zero when duration or count is empty.
+fn batch_finite_rate(count: usize, seconds: f64) -> f64 {
+    if count == 0 || !(seconds > 0.0) || !seconds.is_finite() {
+        0.0
+    } else {
+        let rate = count as f64 / seconds;
+        if rate.is_finite() {
+            rate
+        } else {
+            0.0
+        }
+    }
+}
+
+/// Host-side continuous-batch done metrics from per-lane Instants.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct BatchLaneDoneMetrics {
+    latency_ms: f64,
+    ttft_ms: f64,
+    prefill_ms: f64,
+    prefill_tok_s: f64,
+    tok_s: f64,
+    decode_tok_s: f64,
+}
+
+/// Compute honest continuous-batch done metrics.
+///
+/// Guards zero durations and zero/one-token edges so callers never see NaN/inf.
+fn batch_lane_done_metrics(
+    created_at: Instant,
+    prefill_done_at: Option<Instant>,
+    first_token_at: Option<Instant>,
+    finished_at: Instant,
+    prefill_tokens: usize,
+    generated: usize,
+) -> BatchLaneDoneMetrics {
+    let wall_s = finished_at
+        .saturating_duration_since(created_at)
+        .as_secs_f64();
+    let latency_ms = if wall_s.is_finite() && wall_s > 0.0 {
+        wall_s * 1000.0
+    } else {
+        0.0
+    };
+
+    let prefill_s = prefill_done_at
+        .map(|t| t.saturating_duration_since(created_at).as_secs_f64())
+        .filter(|s| s.is_finite() && *s > 0.0)
+        .unwrap_or(0.0);
+    let prefill_ms = prefill_s * 1000.0;
+    let prefill_tok_s = batch_finite_rate(prefill_tokens, prefill_s);
+
+    let ttft_s = first_token_at
+        .map(|t| t.saturating_duration_since(created_at).as_secs_f64())
+        .filter(|s| s.is_finite() && *s > 0.0)
+        .unwrap_or(prefill_s);
+    let ttft_ms = if ttft_s > 0.0 {
+        ttft_s * 1000.0
+    } else {
+        prefill_ms
+    };
+    let tok_s = batch_finite_rate(generated, wall_s);
+
+    // Decode rate over the post-first-token interval. Zero/one-token and missing
+    // first-token stamps stay finite zero (no positive span to amortize).
+    let decode_tok_s = match first_token_at {
+        Some(ft) if generated > 0 => {
+            let decode_s = finished_at.saturating_duration_since(ft).as_secs_f64();
+            batch_finite_rate(generated, decode_s)
+        }
+        _ => 0.0,
+    };
+
+    BatchLaneDoneMetrics {
+        latency_ms: if latency_ms.is_finite() {
+            latency_ms
+        } else {
+            0.0
+        },
+        ttft_ms: if ttft_ms.is_finite() { ttft_ms } else { 0.0 },
+        prefill_ms: if prefill_ms.is_finite() {
+            prefill_ms
+        } else {
+            0.0
+        },
+        prefill_tok_s,
+        tok_s,
+        decode_tok_s,
+    }
+}
+
+/// Attach actual continuous-batch route evidence to a batch-driver done envelope.
+/// Only the real batch driver emits this; sequential fallbacks must not call it.
+fn attach_continuous_batch_route_evidence(
+    envelope: &mut serde_json::Value,
+    slots: usize,
+    lane: usize,
+    lane_capacity: usize,
+    max_active_lanes: usize,
+) {
+    envelope["execution_mode"] = serde_json::json!("continuous_batch_independent");
+    envelope["continuous_batch"] = serde_json::json!({
+        "executed": true,
+        "slots": slots,
+        "lane": lane,
+        "lane_capacity": lane_capacity,
+        "max_active_lanes": max_active_lanes,
+        "refill": "continuous",
+    });
+}
+
 /// Drop guard: clears the active terminal-control transaction.
 struct TerminalControlGuard;
 impl Drop for TerminalControlGuard {
@@ -580,12 +2889,613 @@ mod terminal_control_tests {
     }
 }
 
+/// Deterministic protocol/state-machine coverage for continuous batching.
+/// No GPU. Exercises lane assignment, refill, commit_ready reservation,
+/// abort/commit lifecycle, and fail-closed stale handling.
+#[cfg(test)]
+mod continuous_batch_tests {
+    use super::{
+        batch_announce_terminal, batch_apply_terminal_control, batch_check_abort,
+        batch_clear_all_terminals, batch_clear_terminal, batch_commit_teardown_class,
+        batch_hit_length_cap, batch_lane_at_capacity, batch_mark_ready,
+        batch_mark_ready_with_pending, batch_poll_decision, batch_should_finish_decode,
+        batch_terminal_control, batch_transfer_abort_to_singleton_and_clear, is_batch_eligible,
+        parse_continuous_batch_size, parse_serve_continuous_batch, AttemptKey,
+        BatchCommitTeardownClass, BatchPendingRequest, BatchSampling, BatchSamplingKey,
+        ClientTerminalDecision, ContinuousBatchScheduler, DaemonInbox, DaemonMsg, LaneTicket,
+    };
+
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+    use std::time::{Duration, Instant};
+
+    fn lock() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn begin() -> MutexGuard<'static, ()> {
+        let g = lock();
+        batch_clear_all_terminals();
+        super::clear_terminal_control();
+        super::set_active_attempt_id(0);
+        g
+    }
+
+    fn sampling(temp: f32, repeat: f32) -> BatchSampling {
+        BatchSampling {
+            temp,
+            top_p: 0.8,
+            top_k: None,
+            min_p: None,
+            repeat_penalty: repeat,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
+            repeat_window: 128,
+        }
+    }
+    fn sampling_with_window(temp: f32, window: usize) -> BatchSampling {
+        BatchSampling {
+            temp,
+            top_p: 0.8,
+            top_k: None,
+            min_p: None,
+            repeat_penalty: 1.0,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
+            repeat_window: window,
+        }
+    }
+    fn req(key: AttemptKey, sampling: BatchSampling) -> BatchPendingRequest {
+        BatchPendingRequest {
+            key,
+            prompt: "hi".into(),
+            prompt_tokens: vec![1, 2, 3],
+            started_in_think: false,
+            system: None,
+            assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix::Plain,
+            max_think_tokens: 0,
+            max_tokens: 10,
+            sampling,
+        }
+    }
+
+    #[test]
+    fn batch_eligible_only_qwen_text_single_gpu() {
+        let _l = begin();
+        assert!(is_batch_eligible(
+            5, 1, false, false, false, false, false, false, false, false, true, true, 4
+        ));
+        assert!(is_batch_eligible(
+            6, 1, false, false, false, false, false, false, false, false, true, true, 2
+        ));
+        assert!(!is_batch_eligible(
+            5, 1, false, false, false, false, false, false, false, false, true, false, 4
+        ));
+        assert!(!is_batch_eligible(
+            5, 1, false, false, false, false, false, false, false, false, true, true, 1
+        ));
+        assert!(!is_batch_eligible(
+            9, 1, false, false, false, false, false, false, false, false, true, true, 4
+        ));
+        assert!(!is_batch_eligible(
+            5, 2, false, false, false, false, false, false, false, false, true, true, 4
+        ));
+        assert!(!is_batch_eligible(
+            5, 1, true, false, false, false, false, false, false, false, true, true, 4
+        ));
+        assert!(!is_batch_eligible(
+            5, 1, false, true, false, false, false, false, false, false, true, true, 4
+        ));
+        assert!(!is_batch_eligible(
+            5, 1, false, false, true, false, false, false, false, false, true, true, 4
+        ));
+        assert!(!is_batch_eligible(
+            5, 1, false, false, false, true, false, false, false, false, true, true, 4
+        ));
+        assert!(!is_batch_eligible(
+            5, 1, false, false, false, false, true, false, false, false, true, true, 4
+        ));
+        assert!(!is_batch_eligible(
+            5, 1, false, false, false, false, false, true, false, false, true, true, 4
+        ));
+        assert!(!is_batch_eligible(
+            5, 1, false, false, false, false, false, false, true, false, true, true, 4
+        ));
+        assert!(!is_batch_eligible(
+            5, 1, false, false, false, false, false, false, false, true, true, true, 4
+        ));
+    }
+
+    #[test]
+    fn parse_defaults_backward_compatible() {
+        let _l = begin();
+        assert_eq!(parse_continuous_batch_size(None), 1);
+        assert_eq!(parse_continuous_batch_size(Some(&serde_json::json!({}))), 1);
+        assert_eq!(
+            parse_continuous_batch_size(Some(&serde_json::json!({"continuous_batch_size":4}))),
+            4
+        );
+        assert!(!parse_serve_continuous_batch(&serde_json::json!({})));
+        assert!(parse_serve_continuous_batch(
+            &serde_json::json!({"serve_continuous_batch":true})
+        ));
+        assert!(parse_serve_continuous_batch(
+            &serde_json::json!({"params":{"serve_continuous_batch":true}})
+        ));
+    }
+
+    #[test]
+    fn announcement_race_abort_before_queue_is_latched() {
+        let _l = begin();
+        let k = AttemptKey::new("r1", 7);
+        assert!(batch_announce_terminal(&k.id, k.attempt_id));
+        batch_apply_terminal_control("abort", &k.id, k.attempt_id);
+        assert!(batch_check_abort(&k.id, k.attempt_id));
+        let mut sched = ContinuousBatchScheduler::new(1, 4096);
+        let pending = req(k.clone(), sampling(0.3, 1.0));
+        assert!(sched.enqueue(pending));
+        assert!(batch_check_abort(&k.id, k.attempt_id));
+        assert!(sched.abort_queued(&k));
+        assert!(sched.inbox.is_empty());
+        assert!(!sched.pending.contains_key(&k));
+        batch_apply_terminal_control("abort", &k.id, k.attempt_id);
+        assert!(!batch_check_abort(&k.id, k.attempt_id));
+    }
+
+    #[test]
+    fn early_commit_before_ready_rejected_and_poll_is_nonmutating() {
+        let _l = begin();
+        let k = AttemptKey::new("r1", 7);
+        batch_announce_terminal(&k.id, k.attempt_id);
+        let mut sched = ContinuousBatchScheduler::new(1, 4096);
+        sched.enqueue(req(k.clone(), sampling(0.3, 1.0)));
+        let (_key, ticket) = sched.try_assign_one().unwrap();
+        batch_apply_terminal_control("commit", &k.id, k.attempt_id);
+        assert_eq!(batch_poll_decision(&k.id, k.attempt_id), None);
+        assert_eq!(batch_poll_decision(&k.id, k.attempt_id), None);
+        let pending =
+            serde_json::json!({"type":"done","id":k.id,"attempt_id":k.attempt_id,"tokens":3});
+        assert!(sched.mark_awaiting_commit(ticket.lane, pending.clone()));
+        assert_eq!(batch_poll_decision(&k.id, k.attempt_id), None);
+        batch_apply_terminal_control("commit", &k.id, k.attempt_id);
+        assert_eq!(
+            batch_poll_decision(&k.id, k.attempt_id),
+            Some(ClientTerminalDecision::Commit)
+        );
+        assert_eq!(
+            batch_poll_decision(&k.id, k.attempt_id),
+            Some(ClientTerminalDecision::Commit)
+        );
+        assert!(sched.commit_lane(ticket.lane, &k));
+        assert!(sched.lanes[ticket.lane].is_empty());
+    }
+
+    #[test]
+    fn stale_owner_generation_prevents_release_of_reused_slot() {
+        let _l = begin();
+        let mut sched = ContinuousBatchScheduler::new(1, 4096);
+        let k1 = AttemptKey::new("r1", 1);
+        batch_announce_terminal(&k1.id, k1.attempt_id);
+        sched.enqueue(req(k1.clone(), sampling(0.3, 1.0)));
+        let (_k, t1) = sched.try_assign_one().unwrap();
+        let pending =
+            serde_json::json!({"type":"done","id":k1.id,"attempt_id":k1.attempt_id,"tokens":1});
+        assert!(sched.mark_awaiting_commit(t1.lane, pending));
+        batch_apply_terminal_control("commit", &k1.id, k1.attempt_id);
+        assert!(sched.commit_lane(t1.lane, &k1));
+        let gen_after = sched.lanes[t1.lane].generation();
+        assert!(gen_after > t1.generation);
+        let k2 = AttemptKey::new("r2", 2);
+        batch_announce_terminal(&k2.id, k2.attempt_id);
+        sched.enqueue(req(k2.clone(), sampling(0.3, 1.0)));
+        let (_k2, t2) = sched.try_assign_one().unwrap();
+        assert_eq!(t2.lane, t1.lane);
+        assert_ne!(t2.generation, t1.generation);
+        batch_apply_terminal_control("abort", &k1.id, k1.attempt_id);
+        assert!(!batch_check_abort(&k2.id, k2.attempt_id));
+        batch_apply_terminal_control("commit", &k1.id, k1.attempt_id);
+        assert_eq!(batch_poll_decision(&k2.id, k2.attempt_id), None);
+        assert!(matches!(sched.lanes[t2.lane], super::BatchLane::Running(_)));
+        batch_apply_terminal_control("abort", &k2.id, k2.attempt_id);
+        assert!(sched.abort_lane(t2.lane, &k2));
+        assert!(sched.lanes[t2.lane].is_empty());
+    }
+
+    #[test]
+    fn queued_abort_drains_without_assigning_lane() {
+        let _l = begin();
+        let k = AttemptKey::new("r1", 9);
+        batch_announce_terminal(&k.id, k.attempt_id);
+        let mut sched = ContinuousBatchScheduler::new(1, 4096);
+        sched.enqueue(req(k.clone(), sampling(0.3, 1.0)));
+        batch_apply_terminal_control("abort", &k.id, k.attempt_id);
+        assert!(sched.abort_queued(&k));
+        assert!(sched.inbox.is_empty());
+        assert!(sched.lanes[0].is_empty());
+        assert!(sched.try_assign_one().is_none());
+    }
+
+    #[test]
+    fn immutable_ready_payload_preserved_until_commit() {
+        let _l = begin();
+        let k = AttemptKey::new("r1", 11);
+        batch_announce_terminal(&k.id, k.attempt_id);
+        let mut sched = ContinuousBatchScheduler::new(1, 4096);
+        sched.enqueue(req(k.clone(), sampling(0.3, 1.0)));
+        let (_key, ticket) = sched.try_assign_one().unwrap();
+        let mut pending = serde_json::json!({"type":"done","id":k.id,"attempt_id":k.attempt_id,"tokens":5,"finish_reason":"length"});
+        let pending_clone = pending.clone();
+        assert!(sched.mark_awaiting_commit(ticket.lane, pending.clone()));
+        let stored = sched.pending_done_for(ticket.lane).unwrap();
+        assert_eq!(stored, pending_clone);
+        pending["tokens"] = serde_json::json!(999);
+        let stored2 = sched.pending_done_for(ticket.lane).unwrap();
+        assert_eq!(stored2["tokens"], 5);
+        let different =
+            serde_json::json!({"type":"done","id":k.id,"attempt_id":k.attempt_id,"tokens":999});
+        assert!(!sched.mark_awaiting_commit(ticket.lane, different));
+        let stored3 = sched.pending_done_for(ticket.lane).unwrap();
+        assert_eq!(stored3["tokens"], 5);
+        assert_eq!(batch_poll_decision(&k.id, k.attempt_id), None);
+        batch_apply_terminal_control("commit", &k.id, k.attempt_id);
+        assert!(sched.commit_lane(ticket.lane, &k));
+        assert!(sched.lanes[ticket.lane].is_empty());
+        assert_eq!(batch_poll_decision(&k.id, k.attempt_id), None);
+    }
+
+    #[test]
+    fn deadline_30s_is_set_and_poll_returns_abort_after_expiry() {
+        let _l = begin();
+        let k = AttemptKey::new("r1", 13);
+        batch_announce_terminal(&k.id, k.attempt_id);
+        let mut sched = ContinuousBatchScheduler::new(1, 4096);
+        sched.enqueue(req(k.clone(), sampling(0.3, 1.0)));
+        let (_key, ticket) = sched.try_assign_one().unwrap();
+        let pending =
+            serde_json::json!({"type":"done","id":k.id,"attempt_id":k.attempt_id,"tokens":2});
+        assert!(sched.mark_awaiting_commit(ticket.lane, pending));
+        let deadline = sched.deadline_for(ticket.lane).unwrap();
+        let now = Instant::now();
+        assert!(deadline > now);
+        assert!(deadline <= now + Duration::from_secs(30) + Duration::from_millis(100));
+        assert!(deadline >= now + Duration::from_secs(29));
+        assert_eq!(batch_poll_decision(&k.id, k.attempt_id), None);
+        {
+            let mut g = batch_terminal_control().mu.lock().unwrap();
+            if let Some(e) = g.entries.get_mut(&k) {
+                e.deadline = Some(Instant::now() - Duration::from_secs(1));
+            }
+        }
+        assert_eq!(
+            batch_poll_decision(&k.id, k.attempt_id),
+            Some(ClientTerminalDecision::Abort)
+        );
+        assert_eq!(
+            batch_poll_decision(&k.id, k.attempt_id),
+            Some(ClientTerminalDecision::Abort)
+        );
+        assert!(sched.abort_lane(ticket.lane, &k));
+        assert!(sched.lanes[ticket.lane].is_empty());
+    }
+
+    #[test]
+    fn fifo_cohort_incompatible_head_blocks_later_compatible() {
+        let _l = begin();
+        let mut sched = ContinuousBatchScheduler::new(2, 4096);
+        let k1 = AttemptKey::new("r1", 1);
+        let k2 = AttemptKey::new("r2", 2);
+        let k3 = AttemptKey::new("r3", 3);
+        let samp_a = sampling(0.3, 1.0);
+        let samp_b = sampling(0.7, 1.0);
+        batch_announce_terminal(&k1.id, k1.attempt_id);
+        batch_announce_terminal(&k2.id, k2.attempt_id);
+        batch_announce_terminal(&k3.id, k3.attempt_id);
+        sched.enqueue(req(k1.clone(), samp_a.clone()));
+        sched.enqueue(req(k2.clone(), samp_b.clone()));
+        sched.enqueue(req(k3.clone(), samp_a.clone()));
+        let (_a1, t1) = sched.try_assign_one().unwrap();
+        assert_eq!(t1.lane, 0);
+        assert!(sched.try_assign_one().is_none());
+        assert_eq!(sched.inbox.front().unwrap(), &k2);
+        assert_eq!(sched.inbox.len(), 2);
+        let pending =
+            serde_json::json!({"type":"done","id":k1.id,"attempt_id":k1.attempt_id,"tokens":1});
+        assert!(sched.mark_awaiting_commit(t1.lane, pending));
+        batch_apply_terminal_control("commit", &k1.id, k1.attempt_id);
+        assert!(sched.commit_lane(t1.lane, &k1));
+        let (_b, t2) = sched.try_assign_one().unwrap();
+        assert_eq!(t2.lane, 0);
+        assert_eq!(sched.inbox.front().unwrap(), &k3);
+        assert!(sched.try_assign_one().is_none());
+        let pending2 =
+            serde_json::json!({"type":"done","id":k2.id,"attempt_id":k2.attempt_id,"tokens":1});
+        let lane_for_k2 = sched.find_lane_by_key(&k2).unwrap();
+        assert!(sched.mark_awaiting_commit(lane_for_k2, pending2));
+        batch_apply_terminal_control("commit", &k2.id, k2.attempt_id);
+        assert!(sched.commit_lane(lane_for_k2, &k2));
+        let (_a3, t3) = sched.try_assign_one().unwrap();
+        assert_eq!(t3.lane, 0);
+        let pending3 =
+            serde_json::json!({"type":"done","id":k3.id,"attempt_id":k3.attempt_id,"tokens":1});
+        let lane_for_k3 = sched.find_lane_by_key(&k3).unwrap();
+        assert!(sched.mark_awaiting_commit(lane_for_k3, pending3));
+        batch_apply_terminal_control("commit", &k3.id, k3.attempt_id);
+        assert!(sched.commit_lane(lane_for_k3, &k3));
+    }
+
+    #[test]
+    fn refill_reservation_awaiting_client_not_reused_until_commit() {
+        let _l = begin();
+        let mut sched = ContinuousBatchScheduler::new(1, 4096);
+        let k1 = AttemptKey::new("r1", 1);
+        let k2 = AttemptKey::new("r2", 2);
+        batch_announce_terminal(&k1.id, k1.attempt_id);
+        batch_announce_terminal(&k2.id, k2.attempt_id);
+        sched.enqueue(req(k1.clone(), sampling(0.3, 1.0)));
+        sched.enqueue(req(k2.clone(), sampling(0.3, 1.0)));
+        let (_k1, t1) = sched.try_assign_one().unwrap();
+        assert_eq!(sched.running_count(), 1);
+        let pending =
+            serde_json::json!({"type":"done","id":k1.id,"attempt_id":k1.attempt_id,"tokens":4});
+        assert!(sched.mark_awaiting_commit(t1.lane, pending));
+        assert_eq!(sched.awaiting_count(), 1);
+        assert_eq!(sched.empty_lanes().len(), 0);
+        assert!(sched.try_assign_one().is_none());
+        assert_eq!(sched.inbox.front().unwrap(), &k2);
+        batch_apply_terminal_control("commit", &k1.id, k1.attempt_id);
+        assert!(sched.commit_lane(t1.lane, &k1));
+        assert_eq!(sched.empty_lanes().len(), 1);
+        let (_k2, t2) = sched.try_assign_one().unwrap();
+        assert_eq!(t2.lane, t1.lane);
+        assert_ne!(t2.generation, t1.generation);
+        let pending2 =
+            serde_json::json!({"type":"done","id":k2.id,"attempt_id":k2.attempt_id,"tokens":1});
+        let lane = sched.find_lane_by_key(&k2).unwrap();
+        assert!(sched.mark_awaiting_commit(lane, pending2));
+        batch_apply_terminal_control("commit", &k2.id, k2.attempt_id);
+        assert!(sched.commit_lane(lane, &k2));
+    }
+
+    #[test]
+    fn inbox_pushback_restores_barrier_for_outer_recv() {
+        let _l = begin();
+        let (tx, rx) = std::sync::mpsc::channel::<DaemonMsg>();
+        let mut inbox = DaemonInbox::new(rx);
+        let barrier = DaemonMsg::Regular(serde_json::json!({"type":"reset","attempt_id":99}));
+        let gen = DaemonMsg::Regular(
+            serde_json::json!({"type":"generate","id":"r1","attempt_id":1,"prompt":"hi"}),
+        );
+        tx.send(gen).unwrap();
+        tx.send(barrier.clone()).unwrap();
+        let m1 = inbox.try_recv().unwrap();
+        match m1 {
+            DaemonMsg::Regular(v) => assert_eq!(v["type"], "generate"),
+            _ => panic!("expected generate"),
+        }
+        let m2 = inbox.try_recv().unwrap();
+        match &m2 {
+            DaemonMsg::Regular(v) if v["type"] == "reset" => {
+                inbox.push_front(m2);
+            }
+            _ => panic!("expected reset"),
+        }
+        let m3 = inbox.recv().unwrap();
+        match m3 {
+            DaemonMsg::Regular(v) => assert_eq!(v["type"], "reset"),
+            _ => panic!("expected barrier after pushback"),
+        }
+        assert!(inbox.try_recv().is_err());
+    }
+
+    #[test]
+    fn barrier_transfer_abort_into_singleton() {
+        let _l = begin();
+        let k = AttemptKey::new("rX", 42);
+        batch_announce_terminal(&k.id, k.attempt_id);
+        batch_apply_terminal_control("abort", &k.id, k.attempt_id);
+        assert!(batch_check_abort(&k.id, k.attempt_id));
+        assert!(batch_transfer_abort_to_singleton_and_clear(
+            &k.id,
+            k.attempt_id
+        ));
+        assert!(!batch_check_abort(&k.id, k.attempt_id));
+        assert!(super::check_abort(&k.id));
+        super::clear_terminal_control();
+    }
+
+    #[test]
+    fn sampling_key_is_bit_exact_and_distinguishes_cohorts() {
+        let _l = begin();
+        let a = sampling(0.3, 1.0);
+        let b = sampling(0.31, 1.0);
+        assert_ne!(a.key(), b.key());
+        let c = BatchSampling {
+            temp: 0.3,
+            top_p: 0.8,
+            top_k: Some(5),
+            min_p: None,
+            repeat_penalty: 1.0,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
+            repeat_window: 128,
+        };
+        let d = BatchSampling {
+            temp: 0.3,
+            top_p: 0.8,
+            top_k: Some(6),
+            min_p: None,
+            repeat_penalty: 1.0,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
+            repeat_window: 128,
+        };
+        assert_ne!(c.key(), d.key());
+    }
+
+    #[test]
+    fn commit_teardown_classifies_done_only_after_reset_and_commit() {
+        let _l = begin();
+        assert_eq!(
+            batch_commit_teardown_class(false, false),
+            BatchCommitTeardownClass::ResetFailed
+        );
+        assert_eq!(
+            batch_commit_teardown_class(false, true),
+            BatchCommitTeardownClass::ResetFailed
+        );
+        assert_eq!(
+            batch_commit_teardown_class(true, false),
+            BatchCommitTeardownClass::CommitFailed
+        );
+        assert_eq!(
+            batch_commit_teardown_class(true, true),
+            BatchCommitTeardownClass::EmitDone
+        );
+    }
+
+    #[test]
+    fn think_barrier_transfers_abort_without_prior_clear() {
+        let _l = begin();
+        let k = AttemptKey::new("think-barrier", 77);
+        assert!(batch_announce_terminal(&k.id, k.attempt_id));
+        batch_apply_terminal_control("abort", &k.id, k.attempt_id);
+        assert!(batch_check_abort(&k.id, k.attempt_id));
+        // Production paths must call transfer exactly once; it clears the key
+        // and latches abort into the sequential singleton.
+        assert!(batch_transfer_abort_to_singleton_and_clear(
+            &k.id,
+            k.attempt_id
+        ));
+        assert!(!batch_check_abort(&k.id, k.attempt_id));
+        assert!(super::check_abort(&k.id));
+        // A second transfer is a no-op (key already gone) and must not clear
+        // the sequential singleton abort that was just latched.
+        assert!(!batch_transfer_abort_to_singleton_and_clear(
+            &k.id,
+            k.attempt_id
+        ));
+        assert!(super::check_abort(&k.id));
+        super::clear_terminal_control();
+    }
+
+    #[test]
+    fn lane_capacity_is_length_terminal_before_out_of_range_decode() {
+        let _l = begin();
+        let cap = 8usize;
+        assert!(!batch_lane_at_capacity(cap - 1, cap));
+        assert!(batch_lane_at_capacity(cap, cap));
+        assert!(batch_lane_at_capacity(cap + 1, cap));
+        // Capacity alone forces finish + length classification.
+        assert!(batch_should_finish_decode(false, false, true, false, false));
+        assert!(batch_hit_length_cap(false, true, false, false, false));
+        // Competing stop causes beat length.
+        assert!(!batch_hit_length_cap(true, true, true, false, false));
+        assert!(!batch_hit_length_cap(true, true, false, true, false));
+        assert!(!batch_hit_length_cap(false, true, false, false, true));
+        // max_tokens alone still finishes as length when no other stop.
+        assert!(batch_should_finish_decode(false, true, false, false, false));
+        assert!(batch_hit_length_cap(true, false, false, false, false));
+    }
+
+    #[test]
+    fn duplicate_announce_and_enqueue_preserve_live_registry() {
+        let _l = begin();
+        let k = AttemptKey::new("live-key", 3);
+        assert!(batch_announce_terminal(&k.id, k.attempt_id));
+        batch_apply_terminal_control("abort", &k.id, k.attempt_id);
+        assert!(batch_check_abort(&k.id, k.attempt_id));
+        // Second announce must fail closed without clearing the original.
+        assert!(!batch_announce_terminal(&k.id, k.attempt_id));
+        assert!(batch_check_abort(&k.id, k.attempt_id));
+        let mut sched = ContinuousBatchScheduler::new(2, 4096);
+        assert!(sched.enqueue(req(k.clone(), sampling(0.3, 1.0))));
+        // Defensive scheduler rejection: no registry mutation.
+        assert!(!sched.enqueue(req(k.clone(), sampling(0.3, 1.0))));
+        assert!(batch_check_abort(&k.id, k.attempt_id));
+        assert_eq!(sched.inbox.len(), 1);
+        assert!(sched.pending.contains_key(&k));
+        // Original pending/active lane path still intact for assign.
+        let (assigned, ticket) = sched.try_assign_one().unwrap();
+        assert_eq!(assigned, k);
+        assert!(matches!(
+            sched.lanes[ticket.lane],
+            super::BatchLane::Running(_)
+        ));
+        assert!(batch_check_abort(&k.id, k.attempt_id));
+    }
+
+    #[test]
+    fn batch_lane_done_metrics_guard_zero_and_one_token() {
+        let t0 = Instant::now();
+        // Zero wall / missing stamps: all rates and ms stay finite zeros.
+        let z = super::batch_lane_done_metrics(t0, None, None, t0, 0, 0);
+        assert_eq!(z.latency_ms, 0.0);
+        assert_eq!(z.ttft_ms, 0.0);
+        assert_eq!(z.prefill_ms, 0.0);
+        assert_eq!(z.prefill_tok_s, 0.0);
+        assert_eq!(z.tok_s, 0.0);
+        assert_eq!(z.decode_tok_s, 0.0);
+        assert!(z.latency_ms.is_finite() && z.tok_s.is_finite() && z.decode_tok_s.is_finite());
+
+        // Single generated token: tok_s uses wall; decode_tok_s uses post-first span.
+        let t1 = t0 + Duration::from_millis(100);
+        let t2 = t0 + Duration::from_millis(150);
+        let t3 = t0 + Duration::from_millis(200);
+        let one = super::batch_lane_done_metrics(t0, Some(t1), Some(t2), t3, 16, 1);
+        assert!((one.latency_ms - 200.0).abs() < 1e-6);
+        assert!((one.prefill_ms - 100.0).abs() < 1e-6);
+        assert!((one.ttft_ms - 150.0).abs() < 1e-6);
+        assert!((one.prefill_tok_s - 160.0).abs() < 1e-6); // 16 / 0.1s
+        assert!((one.tok_s - 5.0).abs() < 1e-6); // 1 / 0.2s
+        assert!((one.decode_tok_s - 20.0).abs() < 1e-6); // 1 / 0.05s
+        assert!(one.tok_s.is_finite() && one.decode_tok_s.is_finite());
+
+        // Zero generated keeps decode rate at 0 even with stamps.
+        let zero_gen = super::batch_lane_done_metrics(t0, Some(t1), Some(t2), t3, 16, 0);
+        assert_eq!(zero_gen.decode_tok_s, 0.0);
+        assert_eq!(zero_gen.tok_s, 0.0);
+    }
+    #[test]
+    fn batch_lane_done_metrics_multi_token_decode_rate() {
+        let t0 = Instant::now();
+        let prefill = t0 + Duration::from_millis(50);
+        let first = t0 + Duration::from_millis(80);
+        let end = t0 + Duration::from_millis(280);
+        // 5 generated over 200ms post-first ⇒ 5 / 0.2s = 25 tok/s
+        let m = super::batch_lane_done_metrics(t0, Some(prefill), Some(first), end, 32, 5);
+        assert!((m.latency_ms - 280.0).abs() < 1e-6);
+        assert!((m.prefill_ms - 50.0).abs() < 1e-6);
+        assert!((m.ttft_ms - 80.0).abs() < 1e-6);
+        assert!((m.prefill_tok_s - 640.0).abs() < 1e-6); // 32 / 0.05s
+        assert!((m.tok_s - (5.0 / 0.28)).abs() < 1e-6);
+        assert!((m.decode_tok_s - 25.0).abs() < 1e-6);
+        assert!(m.tok_s.is_finite() && m.decode_tok_s.is_finite() && m.prefill_tok_s.is_finite());
+    }
+
+    #[test]
+    fn continuous_batch_route_evidence_shape() {
+        let mut env = serde_json::json!({"type":"done","id":"r1","tokens":3});
+        super::attach_continuous_batch_route_evidence(&mut env, 4, 2, 4096, 3);
+        assert_eq!(env["execution_mode"], "continuous_batch_independent");
+        let cb = &env["continuous_batch"];
+        assert_eq!(cb["executed"], true);
+        assert_eq!(cb["slots"], 4);
+        assert_eq!(cb["lane"], 2);
+        assert_eq!(cb["lane_capacity"], 4096);
+        assert_eq!(cb["max_active_lanes"], 3);
+        assert_eq!(cb["refill"], "continuous");
+    }
+}
+
 /// Message types pushed from the stdin-reader thread to the main
 /// processing loop. Abort/commit control messages are NOT forwarded —
 /// they're handled inline in the reader thread via
 /// [`apply_terminal_control`]. This is what lets the abort signal
 /// interrupt a mid-flight prefill; the main loop is blocked on prefill
 /// compute and would only see new stdin lines after that prefill completed.
+#[derive(Debug, Clone)]
 enum DaemonMsg {
     Regular(serde_json::Value),
     ParseError(String),
@@ -3381,8 +6291,12 @@ fn fail_closed_reset_target_and_spec(
                 ad.reset();
             }
         }
+        if let Some(bs) = m.qwen35_decode_batch.as_mut() {
+            if let Err(e) = bs.reset(gpu) {
+                push_reset_err(&mut first_err, "qwen35_decode_batch.reset", e);
+            }
+        }
     }
-
     // Always free host checkpoint rings. When a Speculator is present its own
     // ring is freed by `reset` below; these are AR/vestigial rings on `m`.
     free_checkpoints(&mut m.prefill_checkpoints, gpu);
@@ -6211,6 +9125,13 @@ fn main() {
     // routes maybe_compress_prompt to this handle, decode stays on target.
     // None means the drafter shares the target gpu (single-card, unchanged).
     let mut pflash_drafter_gpu: Option<rdna_compute::Gpu> = None;
+    // Continuous-batch host scheduler + GPU batch state (if available).
+    // Initialized on successful load when `continuous_batch_size` > 1 and
+    // the loaded arch is batch-capable (qwen 5/6, single-GPU, Q8 KV/state).
+    // None => sequential fallback.
+    let mut continuous_batch_size: usize = 1;
+    let mut batch_scheduler: Option<ContinuousBatchScheduler> = None;
+    let mut batch_poisoned: Option<String> = None;
 
     // Background stdin reader. Drains stdin into an mpsc channel so
     // the main loop can pull non-blockingly between messages. Abort /
@@ -6256,6 +9177,7 @@ fn main() {
                                 kind, id, attempt_id
                             );
                             apply_terminal_control(kind, id, attempt_id);
+                            batch_apply_terminal_control(kind, id, attempt_id);
                         }
                         continue;
                     }
@@ -6271,6 +9193,23 @@ fn main() {
                         }
                         continue;
                     }
+                    // Batch: announce every well-formed generate key before queueing.
+                    // Duplicate (id, attempt_id) must not enqueue or mutate the live registry.
+                    if msg.get("type").and_then(|v| v.as_str()) == Some("generate") {
+                        if let (Some(id), Some(attempt_id)) = (
+                            msg.get("id").and_then(|v| v.as_str()),
+                            msg.get("attempt_id").and_then(|v| v.as_u64()),
+                        ) {
+                            if !batch_announce_terminal(id, attempt_id) {
+                                eprintln!(
+                                    "[batch] duplicate generate dropped id={} attempt_id={}; preserving live registry",
+                                    id, attempt_id
+                                );
+                                continue;
+                            }
+                        }
+                    }
+
                     if msg_tx.send(DaemonMsg::Regular(msg)).is_err() {
                         break;
                     }
@@ -6283,7 +9222,8 @@ fn main() {
             }
         }
     });
-    while let Ok(daemon_msg) = msg_rx.recv() {
+    let mut inbox = DaemonInbox::new(msg_rx);
+    while let Ok(daemon_msg) = inbox.recv() {
         let msg = match daemon_msg {
             DaemonMsg::Regular(m) => m,
             DaemonMsg::ParseError(e) => {
@@ -6337,6 +9277,7 @@ fn main() {
                     .and_then(|p| p.get("tp"))
                     .and_then(|v| v.as_u64())
                     .unwrap_or(1) as usize;
+                let parsed_continuous_batch_size = parse_continuous_batch_size(msg.get("params"));
                 // Unload previous if any. PFlash drafter goes first so
                 // its tensors join the pool before unload_model drains
                 // it -- otherwise free_tensor would queue them into the
@@ -7034,6 +9975,87 @@ fn main() {
                             }
                         }
 
+                        // ── Continuous batch staging (must be before `loaded` ack) ──
+                        // Stage Qwen35DecodeBatchState + host scheduler before publishing.
+                        // `continuous_batch_capable` reflects the newly staged state, not the previous.
+                        // Allocation failure advertises false and preserves sequential service.
+                        let mut staged_batch_scheduler: Option<ContinuousBatchScheduler> = None;
+                        let mut staged_batch_capable = false;
+                        if parsed_continuous_batch_size > 1
+                            && matches!(m.arch_id, 5 | 6)
+                            && m.pp == 1
+                            && m.ep.is_none()
+                        {
+                            if let Some(ModelState::Qwen35(bundle)) = m.state.as_ref() {
+                                if !qwen_batch_weight_formats_supported(&bundle.weights) {
+                                    eprintln!(
+                                        "[daemon] continuous batch requested but weight formats unsupported (embd={:?} lm_head={:?}) — fallback to sequential",
+                                        bundle.weights.embd_format,
+                                        bundle.weights.output.gpu_dtype
+                                    );
+                                } else {
+                                    let repeat_cap =
+                                        (bundle.scratch.repeat_buf.buf.size() / 4).max(1);
+                                    let max_attention_lane = gpu
+                                        .attention_q8_0_kv_independent_max_lane_capacity(
+                                            bundle.config.head_dim,
+                                        );
+                                    let batch_lane_capacity = m.max_seq.min(max_attention_lane);
+                                    if batch_lane_capacity == 0 {
+                                        eprintln!(
+                                            "[daemon] continuous batch unavailable: independent attention admits no lanes — fallback to sequential"
+                                        );
+                                    } else {
+                                        if batch_lane_capacity < m.max_seq {
+                                            eprintln!(
+                                                "[daemon] continuous batch lane capacity clamped: requested={} supported={}",
+                                                m.max_seq,
+                                                batch_lane_capacity
+                                            );
+                                        }
+                                        match qwen35::Qwen35DecodeBatchState::new(
+                                            &mut gpu,
+                                            &bundle.config,
+                                            parsed_continuous_batch_size,
+                                            batch_lane_capacity,
+                                            repeat_cap,
+                                        ) {
+                                            Ok(batch_state) => {
+                                                m.qwen35_decode_batch = Some(batch_state);
+                                                staged_batch_scheduler =
+                                                    Some(ContinuousBatchScheduler::new(
+                                                        parsed_continuous_batch_size,
+                                                        batch_lane_capacity,
+                                                    ));
+                                                staged_batch_capable = true;
+                                                eprintln!(
+                                                    "[daemon] continuous batch staged: slots={} lane_cap={} repeat_cap={}",
+                                                    parsed_continuous_batch_size,
+                                                    batch_lane_capacity,
+                                                    repeat_cap
+                                                );
+                                            }
+                                            Err(e) => {
+                                                eprintln!(
+                                                    "[daemon] continuous batch allocation failed: {e} — fallback to sequential"
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                            } else {
+                                eprintln!("[daemon] continuous batch requested but model state not Qwen35 — fallback to sequential");
+                            }
+                        } else if parsed_continuous_batch_size > 1 {
+                            eprintln!("[daemon] continuous batch requested but not capable (arch_id={} pp={} ep={:?}) — fallback to sequential", m.arch_id, m.pp, m.ep.is_some());
+                        }
+                        continuous_batch_size = if staged_batch_capable {
+                            parsed_continuous_batch_size
+                        } else {
+                            1
+                        };
+                        batch_scheduler = staged_batch_scheduler;
+
                         // `cache_capable`: the daemon implements LCP prompt-cache
                         // reuse for these arches' AR generate path (qwen3.5/3.6
                         // = 5/6, deepseek4 = 9, minimax-m2 = 10, Cohere2-MoE
@@ -7047,10 +10069,18 @@ fn main() {
                         // lives here, next to the cache implementation.
                         let cache_capable = matches!(m.arch_id, 5 | 6 | 9 | 10 | 12);
                         let retry_reset_eligible = model_retry_reset_eligible(m.arch_id);
+                        let continuous_batch_capable = staged_batch_capable;
                         let _ = writeln!(
                             stdout,
-                            r#"{{"type":"loaded","arch":"{}","dim":{},"layers":{},"vocab":{},"vl":{},"cache_capable":{},"retry_reset_eligible":{}}}"#,
-                            arch, dim, layers, vocab, vl, cache_capable, retry_reset_eligible
+                            r#"{{"type":"loaded","arch":"{}","dim":{},"layers":{},"vocab":{},"vl":{},"cache_capable":{},"retry_reset_eligible":{},"continuous_batch_capable":{}}}"#,
+                            arch,
+                            dim,
+                            layers,
+                            vocab,
+                            vl,
+                            cache_capable,
+                            retry_reset_eligible,
+                            continuous_batch_capable
                         );
 
                         // ── PFlash drafter load (Phase 4.0) ──────────────
@@ -7087,6 +10117,7 @@ fn main() {
                                     );
                                     let _ = stdout.flush();
                                     model = Some(m);
+                                    batch_poisoned = None;
                                     continue;
                                 }
                                 let pf_cfg = hipfire_arch_qwen35::pflash::PflashConfig {
@@ -7181,6 +10212,7 @@ fn main() {
                         }
 
                         model = Some(m);
+                        batch_poisoned = None;
                     }
                     Err(e) => {
                         let (vram_free, vram_total) = gpu.hip.get_vram_info().unwrap_or((0, 0));
@@ -7213,6 +10245,7 @@ fn main() {
                 };
                 set_active_attempt_id(gen_attempt_id);
                 let _attempt_guard = ActiveAttemptGuard;
+                let id = msg.get("id").and_then(|v| v.as_str()).unwrap_or("0");
                 #[cfg(feature = "serve-fault-inject")]
                 let _fault_guard = {
                     let want = msg
@@ -7227,7 +10260,7 @@ fn main() {
                     None => {
                         emit_active_attempt_error(
                             &mut stdout,
-                            None,
+                            Some(id),
                             "no model loaded",
                             "validation",
                             false,
@@ -7237,8 +10270,21 @@ fn main() {
                         continue;
                     }
                 };
+                if let Some(reason) = batch_poisoned.as_ref() {
+                    emit_active_attempt_error(
+                        &mut stdout,
+                        Some(id),
+                        &format!(
+                            "continuous batch GPU state poisoned; unload/reload required: {reason}"
+                        ),
+                        "gpu",
+                        false,
+                        false,
+                    );
+                    let _ = stdout.flush();
+                    continue;
+                }
 
-                let id = msg.get("id").and_then(|v| v.as_str()).unwrap_or("0");
                 // Fresh terminal-control transaction for this generate attempt.
                 // Cleared by TerminalControlGuard on all exits from this arm.
                 activate_terminal_control(id, gen_attempt_id);
@@ -7798,6 +10844,160 @@ fn main() {
                         let _ = stdout.flush();
                         continue;
                     }
+                    // ── Continuous batch admission (tightened to actual route) ──
+                    // This check must stay above the sequential `generate()` call so
+                    // eligible requests are aggregated into the fixed-shape decode loop.
+                    let serve_continuous_batch = parse_serve_continuous_batch(&msg);
+                    let batch_eligible = if batch_scheduler.is_some() {
+                        is_batch_request_eligible(
+                            &msg,
+                            m,
+                            continuous_batch_size,
+                            serve_continuous_batch,
+                            pf_cfg_owned.as_ref().is_some_and(|c| {
+                                !matches!(c.mode, hipfire_arch_qwen35::pflash::PflashMode::Off)
+                            }),
+                        )
+                    } else {
+                        false
+                    };
+                    if batch_eligible {
+                        // Current request was already announced by the reader; promote to Queued.
+                        batch_transition_to_queued(id, gen_attempt_id);
+                        // If already aborted, emit cancelled and do not enqueue.
+                        if batch_check_abort(id, gen_attempt_id) {
+                            let _scope = BatchAttemptScope::enter(gen_attempt_id);
+                            emit_gen_start(
+                                &mut stdout,
+                                id,
+                                false,
+                                Some(QWEN_AR_SEMANTIC_CONTRACT_VERSION),
+                            );
+                            emit_qwen_ar_cancelled(&mut stdout, id, 0);
+                            batch_clear_terminal(id, gen_attempt_id);
+                            continue;
+                        }
+                        let sampling = resolve_batch_sampling(&msg, m);
+                        // Render prompt once at admission and store tokens/started flag; do not render twice at lane assignment.
+                        let prompt_owned =
+                            batch_single_user_content(&msg).unwrap_or_else(|| prompt.to_string());
+                        let (prompt_tokens, started_in_think) = match batch_render_prompt_tokens(
+                            &prompt_owned,
+                            system,
+                            assistant_prefix,
+                            m.tokenizer.as_ref().unwrap(),
+                            m.chat_template.as_ref(),
+                            max_think_tokens,
+                            messages_history.as_deref(),
+                        ) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                let _scope = BatchAttemptScope::enter(gen_attempt_id);
+                                emit_uncorrelated_error(
+                                    &mut stdout,
+                                    Some(id),
+                                    &format!("render failed: {e}"),
+                                    "validation",
+                                    false,
+                                    false,
+                                );
+                                batch_clear_terminal(id, gen_attempt_id);
+                                continue;
+                            }
+                        };
+                        if started_in_think {
+                            // Rendered prompts that open a think span are sequential
+                            // barriers. Transfer any pre-latched abort exactly once
+                            // (transfer itself clears the keyed entry).
+                            let _ = batch_transfer_abort_to_singleton_and_clear(id, gen_attempt_id);
+                            // Fall through to sequential generate below (do not enqueue).
+                        } else {
+                            if prompt_tokens.is_empty() || prompt_tokens.len() >= m.max_seq {
+                                let _scope = BatchAttemptScope::enter(gen_attempt_id);
+                                emit_uncorrelated_error(
+                                    &mut stdout,
+                                    Some(id),
+                                    "prompt exceeds lane capacity or empty",
+                                    "validation",
+                                    false,
+                                    false,
+                                );
+                                batch_clear_terminal(id, gen_attempt_id);
+                                continue;
+                            }
+                            let pending = BatchPendingRequest {
+                                key: AttemptKey::new(id, gen_attempt_id),
+                                prompt: prompt_owned.clone(),
+                                prompt_tokens: prompt_tokens.clone(),
+                                started_in_think,
+                                system: system.map(|s| s.to_string()),
+                                assistant_prefix,
+                                max_think_tokens,
+                                max_tokens,
+                                sampling: sampling.clone(),
+                            };
+                            if let Some(sched) = batch_scheduler.as_mut() {
+                                // Check cohort head: if enqueue would make head incompatible, keep as barrier?
+                                // But for the current first request, cohort is empty so always compatible.
+                                let enq_ok = sched.enqueue(pending);
+                                if !enq_ok {
+                                    // Defensive: do not emit a keyed error or clear the
+                                    // original live registry/channel for this key.
+                                    eprintln!(
+                                        "[batch] duplicate enqueue rejected id={} attempt_id={}; preserving live registry",
+                                        id, gen_attempt_id
+                                    );
+                                    continue;
+                                }
+
+                                {
+                                    let _scope = BatchAttemptScope::enter(gen_attempt_id);
+                                    emit_gen_start(
+                                        &mut stdout,
+                                        id,
+                                        false,
+                                        Some(QWEN_AR_SEMANTIC_CONTRACT_VERSION),
+                                    );
+                                }
+                                // Run the real GPU driver. It will drain further batch-eligible
+                                // generates via `inbox.try_recv()` between ticks, refill empty lanes,
+                                // handle commit/abort/deadline, and pad fixed-B forward. Ineligible
+                                // or non-generate messages are push_fronted as barriers and return
+                                // to the outer `inbox.recv()` for sequential handling.
+                                let drive_res = drive_qwen_continuous_batch(
+                                    sched,
+                                    &mut gpu,
+                                    m,
+                                    &mut stdout,
+                                    &mut inbox,
+                                );
+                                match drive_res {
+                                    Ok(()) => {}
+                                    Err(BatchDriveError::Gpu(e)) => {
+                                        eprintln!("[batch] drive failed (attested): {e}");
+                                    }
+                                    Err(BatchDriveError::Poisoned(e)) => {
+                                        eprintln!("[batch] drive poisoned (unattested): {e} — generation poisoned until unload/reload");
+                                        // A failed full-batch reset + device sync cannot prove the
+                                        // GPU/shared scratch quiesced. Do not free possibly-live
+                                        // buffers and do not fall back to sequential on this model.
+                                        batch_scheduler = None;
+                                        continuous_batch_size = 1;
+                                        batch_poisoned = Some(e);
+                                        batch_clear_all_terminals();
+                                    }
+                                }
+                            }
+                            continue;
+                        }
+                    } else {
+                        // Sequential/default mode does not need the keyed batch
+                        // announcement the reader made for this generate. Transfer
+                        // any pre-latched abort into the singleton, then clear the
+                        // keyed entry so default service cannot leak state across
+                        // request-key reuse or a later batch-enabled load.
+                        let _ = batch_transfer_abort_to_singleton_and_clear(id, gen_attempt_id);
+                    }
                     // Did the request explicitly set a non-temperature sampling
                     // control? (gates temp>0 spec routing — see generate()).
                     let user_explicit_sampling = [
@@ -7868,6 +11068,23 @@ fn main() {
                 // Single production epilogue owns ordering + graph/replay
                 // invalidate + sync attestation (same path as fail-closed turns).
                 if let Some(m) = &mut model {
+                    // Batch guard: reset is forbidden while any lane is active (would corrupt disjoint KV/state).
+                    if batch_scheduler
+                        .as_ref()
+                        .is_some_and(|s| s.active_count() > 0)
+                    {
+                        write_error_envelope(
+                            &mut stdout,
+                            None,
+                            "reset refused: continuous batch lanes active",
+                            "validation",
+                            false,
+                            false,
+                            reset_attempt_id,
+                        );
+                        let _ = stdout.flush();
+                        continue;
+                    }
                     if std::env::var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
                         eprintln!("[qwen-cache RESET] daemon received reset — clearing conversation_tokens (was {})", m.conversation_tokens.len());
                     }
@@ -7890,8 +11107,12 @@ fn main() {
                     }
                     // Host counters must already be zero before ack (set in epilogue).
                     debug_assert_eq!(m.seq_pos, 0);
-                    debug_assert!(m.conversation_tokens.is_empty());
                     state_epoch = state_epoch.saturating_add(1);
+                    // Clear batch scheduler host state on successful cold reset
+                    if let Some(sched) = batch_scheduler.as_mut() {
+                        let _ = sched.fail_all_active();
+                    }
+                    batch_clear_all_terminals();
                     let ack = serde_json::json!({
                         "type": "reset",
                         "rolled_back": true,
@@ -7917,6 +11138,24 @@ fn main() {
             }
 
             "unload" => {
+                // Batch guard: unload is forbidden while lanes active.
+                if batch_scheduler
+                    .as_ref()
+                    .is_some_and(|s| s.active_count() > 0)
+                {
+                    let attempt = msg.get("attempt_id").and_then(|v| v.as_u64()).unwrap_or(0);
+                    write_error_envelope(
+                        &mut stdout,
+                        None,
+                        "unload refused: continuous batch lanes active",
+                        "validation",
+                        false,
+                        false,
+                        attempt,
+                    );
+                    let _ = stdout.flush();
+                    continue;
+                }
                 // PFlash drafter goes FIRST: its weights/scratch/KV
                 // tensors are released via Gpu::free_tensor, which only
                 // queues into the GPU pool. The actual hipFree happens
@@ -7928,7 +11167,7 @@ fn main() {
                 if let Some(mut pf) = pflash_state.take() {
                     if let Some(mut dg) = pflash_drafter_gpu.take() {
                         dg.bind_thread_or_warn();
-                        pf.unload_drafter(&mut dg); // sibling-device drafter: free on its own handle, then drop
+                        pf.unload_drafter(&mut dg);
                         gpu.bind_thread_or_warn();
                     } else {
                         pf.unload_drafter(&mut gpu);
@@ -7956,9 +11195,11 @@ fn main() {
                         );
                     }
                 }
+                batch_scheduler = None;
+                continuous_batch_size = 1;
+                batch_clear_all_terminals();
                 let _ = stdout.flush();
             }
-
             "ping" => {
                 let _ = writeln!(stdout, r#"{{"type":"pong"}}"#);
                 let _ = stdout.flush();

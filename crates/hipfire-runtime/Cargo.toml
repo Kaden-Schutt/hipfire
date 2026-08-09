@@ -193,6 +193,10 @@ name = "a3b_multiturn_oneshot"
 required-features = ["arch-qwen35"]
 
 [[example]]
+name = "qwen35_batch_generate"
+required-features = ["arch-qwen35", "deltanet"]
+
+[[example]]
 name = "a3b_smoke_forward"
 required-features = ["arch-qwen35"]
 

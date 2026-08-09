@@ -4860,6 +4860,9 @@ pub const SAMPLE_TOP_P_SRC: &str = include_str!("../../../kernels/src/sample_top
 pub const SAMPLE_TOP_P_PARALLEL_SRC: &str =
     include_str!("../../../kernels/src/sample_top_p_parallel.hip");
 
+/// Product-semantics sampler for independent continuous-batch lanes.
+pub const SAMPLE_ROWS_PF_SRC: &str = include_str!("../../../kernels/src/sample_rows_pf.hip");
+
 /// Per-row temperature-scaled softmax probability gather. For each row r,
 /// returns the softmax prob of `indices[r]` under temp-scaled row logits.
 /// Used by MTP residual-acceptance sampling: gathers p_draft(c_k) and

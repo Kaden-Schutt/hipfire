@@ -20,13 +20,10 @@
 // buffer, matching the wqkv projection output. Total n_channels =
 // 2*k_dim + v_dim.
 //
-// Batched mode: `n_tokens` > 1 processes a sequence of N tokens through
-// the conv in order. The state ring buffer is advanced N times inside
-// the kernel (exactly the same state trajectory as calling the kernel
-// N times sequentially). `input` is [N × n_channels], `q_out` is
-// [N × k_dim], `k_out` is [N × k_dim], `v_out` is [N × v_dim], all
-// row-major. For decode, `n_tokens = 1` gives byte-identical behaviour
-// to the pre-batching version (the loop runs once).
+// blockIdx.y selects an independent sequence lane.  The normal prefill path
+// launches grid.y=1 and is byte-identical to the original implementation.
+// Continuous-batch decode launches grid.y=batch with n_tokens=1; input/output
+// are `[lane, token, channel]` and state is `[lane, channel, 3]`.
 
 extern "C" __global__ void conv1d_silu_split_f32(
     float* __restrict__ q_out,
@@ -40,6 +37,7 @@ extern "C" __global__ void conv1d_silu_split_f32(
     int n_tokens
 ) {
     int c = blockIdx.x * blockDim.x + threadIdx.x;
+    int lane = blockIdx.y;
     int n_channels = 2 * k_dim + v_dim;
     if (c >= n_channels) return;
 
@@ -51,10 +49,12 @@ extern "C" __global__ void conv1d_silu_split_f32(
     // numerics by ~1 ULP, which cascades over 2k+ greedy tokens.
     for (int t = 0; t < n_tokens; t++) {
         // Same math as conv1d_silu.hip — 4-tap causal depthwise conv + SiLU.
-        float x = input[t * n_channels + c];
-        float s0 = state[c * 3];
-        float s1 = state[c * 3 + 1];
-        float s2 = state[c * 3 + 2];
+        int row = lane * n_tokens + t;
+        int state_base = lane * n_channels * 3;
+        float x = input[row * n_channels + c];
+        float s0 = state[state_base + c * 3];
+        float s1 = state[state_base + c * 3 + 1];
+        float s2 = state[state_base + c * 3 + 2];
 
         float y = weight[c * 4 + 3] * x + weight[c * 4 + 2] * s0
                 + weight[c * 4 + 1] * s1 + weight[c * 4] * s2;
@@ -63,17 +63,17 @@ extern "C" __global__ void conv1d_silu_split_f32(
         float result = y / (1.0f + expf(-y));
 
         // Update ring buffer state
-        state[c * 3 + 2] = s1;
-        state[c * 3 + 1] = s0;
-        state[c * 3]     = x;
+        state[state_base + c * 3 + 2] = s1;
+        state[state_base + c * 3 + 1] = s0;
+        state[state_base + c * 3]     = x;
 
         // Write to Q/K/V based on channel index.
         if (c < k_dim) {
-            q_out[t * k_dim + c] = result;
+            q_out[row * k_dim + c] = result;
         } else if (c < 2 * k_dim) {
-            k_out[t * k_dim + (c - k_dim)] = result;
+            k_out[row * k_dim + (c - k_dim)] = result;
         } else {
-            v_out[t * v_dim + (c - 2 * k_dim)] = result;
+            v_out[row * v_dim + (c - 2 * k_dim)] = result;
         }
     }
 }

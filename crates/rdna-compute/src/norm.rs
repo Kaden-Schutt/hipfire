@@ -2714,6 +2714,155 @@ impl Gpu {
         result
     }
 
+    /// One-token recurrent update for several independent sequence lanes.
+    /// State tensors are lane-major; the kernel uses grid.z as the lane id.
+    #[cfg(feature = "deltanet")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn gated_delta_net_q8_independent(
+        &mut self,
+        q_batch: &GpuTensor,
+        k_batch: &GpuTensor,
+        v_batch: &GpuTensor,
+        gate_batch: &GpuTensor,
+        beta_batch: &GpuTensor,
+        s_q8: &GpuTensor,
+        s_scales: &GpuTensor,
+        output_batch: &GpuTensor,
+        batch_size: usize,
+        n_heads: usize,
+        head_dim: usize,
+        ef_residual: Option<&GpuTensor>,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let use_fast = !dn_requant_per_token();
+        let kernel_name = if use_fast {
+            "gated_delta_net_q8_fast"
+        } else {
+            "gated_delta_net_q8"
+        };
+        let kernel_src = if use_fast {
+            kernels::GATED_DELTA_NET_Q8_FAST_SRC
+        } else {
+            kernels::GATED_DELTA_NET_Q8_SRC
+        };
+        let kernel_fn = if use_fast {
+            "gated_delta_net_q8_fast"
+        } else {
+            "gated_delta_net_q8"
+        };
+        self.ensure_kernel(kernel_name, kernel_src, kernel_fn)?;
+        let n_tiles = (128 / 4) as u32;
+        let mut qp = q_batch.buf.as_ptr();
+        let mut kp = k_batch.buf.as_ptr();
+        let mut vp = v_batch.buf.as_ptr();
+        let mut gp = gate_batch.buf.as_ptr();
+        let mut bp = beta_batch.buf.as_ptr();
+        let mut sp = s_q8.buf.as_ptr();
+        let mut scp = s_scales.buf.as_ptr();
+        let mut op = output_batch.buf.as_ptr();
+        let mut nt = 1i32;
+        let mut nh = n_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut fr = reserve_gdn_requant_frames(batch_size as u32) as i32;
+        let mut efp: *mut c_void = ef_residual
+            .map(|t| t.buf.as_ptr())
+            .unwrap_or(std::ptr::null_mut());
+        let mut rpt = dn_requant_per_token() as i32;
+        let bytes = crate::profile::gated_delta_net_q8_bytes(1, n_heads, head_dim) * batch_size;
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "deltanet",
+            "gated_delta_net_q8_batch_seq",
+            bytes,
+        );
+        let result = if use_fast {
+            let mut params: Vec<*mut c_void> = vec![
+                &mut qp as *mut _ as *mut c_void,
+                &mut kp as *mut _ as *mut c_void,
+                &mut vp as *mut _ as *mut c_void,
+                &mut gp as *mut _ as *mut c_void,
+                &mut bp as *mut _ as *mut c_void,
+                &mut sp as *mut _ as *mut c_void,
+                &mut scp as *mut _ as *mut c_void,
+                &mut op as *mut _ as *mut c_void,
+                &mut nt as *mut _ as *mut c_void,
+                &mut nh as *mut _ as *mut c_void,
+                &mut hd as *mut _ as *mut c_void,
+                &mut fr as *mut _ as *mut c_void,
+                &mut efp as *mut _ as *mut c_void,
+            ];
+            self.launch_maybe_blob(
+                "gated_delta_net_q8_fast",
+                [n_heads as u32, n_tiles, batch_size as u32],
+                [32, 1, 1],
+                0,
+                &mut params,
+                || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(qp);
+                    b.push_ptr(kp);
+                    b.push_ptr(vp);
+                    b.push_ptr(gp);
+                    b.push_ptr(bp);
+                    b.push_ptr(sp);
+                    b.push_ptr(scp);
+                    b.push_ptr(op);
+                    b.push_i32(nt);
+                    b.push_i32(nh);
+                    b.push_i32(hd);
+                    b.push_i32(fr);
+                    b.push_ptr(efp);
+                    b
+                },
+            )
+        } else {
+            let mut params: Vec<*mut c_void> = vec![
+                &mut qp as *mut _ as *mut c_void,
+                &mut kp as *mut _ as *mut c_void,
+                &mut vp as *mut _ as *mut c_void,
+                &mut gp as *mut _ as *mut c_void,
+                &mut bp as *mut _ as *mut c_void,
+                &mut sp as *mut _ as *mut c_void,
+                &mut scp as *mut _ as *mut c_void,
+                &mut op as *mut _ as *mut c_void,
+                &mut nt as *mut _ as *mut c_void,
+                &mut nh as *mut _ as *mut c_void,
+                &mut hd as *mut _ as *mut c_void,
+                &mut fr as *mut _ as *mut c_void,
+                &mut efp as *mut _ as *mut c_void,
+                &mut rpt as *mut _ as *mut c_void,
+            ];
+            self.launch_maybe_blob(
+                "gated_delta_net_q8",
+                [n_heads as u32, n_tiles, batch_size as u32],
+                [32, 1, 1],
+                0,
+                &mut params,
+                || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(qp);
+                    b.push_ptr(kp);
+                    b.push_ptr(vp);
+                    b.push_ptr(gp);
+                    b.push_ptr(bp);
+                    b.push_ptr(sp);
+                    b.push_ptr(scp);
+                    b.push_ptr(op);
+                    b.push_i32(nt);
+                    b.push_i32(nh);
+                    b.push_i32(hd);
+                    b.push_i32(fr);
+                    b.push_ptr(efp);
+                    b.push_i32(rpt);
+                    b
+                },
+            )
+        };
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
     /// Tree-aware variant of `gated_delta_net_q8_batch_seq`. Per-token
     /// S-tile persist-write so sibling tokens read the parent's post-update
     /// state via `s_tape_q8[parent_indices[t]]`. `parent_indices[t] < 0`
@@ -3788,6 +3937,79 @@ impl Gpu {
         result
     }
 
+    /// Independent-sequence decode variant of [`Self::conv1d_silu_split_f32_n`].
+    /// Each row owns a distinct convolution ring; no token in one lane can
+    /// advance another lane's state.
+    #[cfg(feature = "deltanet")]
+    pub fn conv1d_silu_split_f32_independent(
+        &mut self,
+        q_out: &GpuTensor,
+        k_out: &GpuTensor,
+        v_out: &GpuTensor,
+        input: &GpuTensor,
+        weight: &GpuTensor,
+        state: &GpuTensor,
+        k_dim: usize,
+        v_dim: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "conv1d_silu_split",
+            kernels::CONV1D_SILU_SPLIT_SRC,
+            "conv1d_silu_split_f32",
+        )?;
+        let qp = q_out.buf.as_ptr();
+        let kp = k_out.buf.as_ptr();
+        let vp = v_out.buf.as_ptr();
+        let ip = input.buf.as_ptr();
+        let wp = weight.buf.as_ptr();
+        let sp = state.buf.as_ptr();
+        let kd = k_dim as i32;
+        let vd = v_dim as i32;
+        let mut nt = 1i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &qp as *const _ as *mut c_void,
+            &kp as *const _ as *mut c_void,
+            &vp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &kd as *const _ as *mut c_void,
+            &vd as *const _ as *mut c_void,
+            &mut nt as *mut _ as *mut c_void,
+        ];
+        let n_channels = 2 * k_dim + v_dim;
+        let block = 256u32;
+        let grid = ((n_channels as u32) + block - 1) / block;
+        let bytes = crate::profile::conv1d_silu_bytes(n_channels) * batch_size;
+        let timer =
+            crate::profile::begin_timer(&self.hip, "deltanet", "conv1d_silu_split_f32_n", bytes);
+        let result = self.launch_maybe_blob(
+            "conv1d_silu_split_f32",
+            [grid, batch_size as u32, 1],
+            [block, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(qp);
+                b.push_ptr(kp);
+                b.push_ptr(vp);
+                b.push_ptr(ip);
+                b.push_ptr(wp);
+                b.push_ptr(sp);
+                b.push_i32(kd);
+                b.push_i32(vd);
+                b.push_i32(nt);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
     /// Tree-aware variant of `conv1d_silu_split_f32_n`. `parent_indices[t]`
     /// is the linear slot index of token t's parent within the block, or
     /// a negative sentinel for pre-block ancestors: -1 selects conv_state[0]

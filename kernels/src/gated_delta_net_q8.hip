@@ -43,6 +43,7 @@ __global__ void gated_delta_net_q8(
 ) {
     const int h = blockIdx.x;
     const int tile = blockIdx.y;
+    const int lane = blockIdx.z;
     if (h >= n_heads) return;
     const int tid = threadIdx.x;
     const int stride = n_heads * HD;
@@ -53,10 +54,11 @@ __global__ void gated_delta_net_q8(
     // Dequant Q8 tile → FP32 in LDS. Stride-32 traversal is coalesced for
     // the global char read AND conflict-free for the LDS float write
     // (consecutive tids hit consecutive banks modulo 32).
-    signed char* sq_base = s_q8 + h * HD * HD + row_start * HD;
+    const size_t state_lane_base = (size_t)lane * n_heads * HD * HD;
+    signed char* sq_base = s_q8 + state_lane_base + h * HD * HD + row_start * HD;
     for (int i = tid; i < TILE_ROWS * HD; i += 32) {
         int r = i / HD;
-        float scale = s_scales[h * HD + row_start + r];
+        float scale = s_scales[lane * n_heads * HD + h * HD + row_start + r];
         S_tile[i] = scale * (float)sq_base[i];
     }
 
@@ -74,11 +76,12 @@ __global__ void gated_delta_net_q8(
     // reduced value is identical modulo fp32 rounding order.
 
     for (int t = 0; t < n_tokens; t++) {
-        const float* q_t = q + t * stride + h * HD;
-        const float* k_t = k + t * stride + h * HD;
-        const float* v_t = v + t * stride + h * HD;
-        float alpha = expf(gate[t * n_heads + h]);
-        float beta_v = beta[t * n_heads + h];
+        const int bt = lane * n_tokens + t;
+        const float* q_t = q + bt * stride + h * HD;
+        const float* k_t = k + bt * stride + h * HD;
+        const float* v_t = v + bt * stride + h * HD;
+        float alpha = expf(gate[bt * n_heads + h]);
+        float beta_v = beta[bt * n_heads + h];
 
         float k0 = k_t[tid], k1 = k_t[tid+32], k2 = k_t[tid+64], k3 = k_t[tid+96];
         float q0 = q_t[tid], q1 = q_t[tid+32], q2 = q_t[tid+64], q3 = q_t[tid+96];
@@ -105,7 +108,7 @@ __global__ void gated_delta_net_q8(
             for (int o = 16; o > 0; o >>= 1)
                 out_v += __shfl_down(out_v, o);
             if (tid == 0)
-                output[t * stride + h * HD + row] = out_v;
+                output[bt * stride + h * HD + row] = out_v;
         }
 
         // Q8 requant. Cadence gated by `requant_per_token`:
@@ -129,7 +132,7 @@ __global__ void gated_delta_net_q8(
 
             // EF (sigma-delta): fold the carried per-element quant residual into
             // the state BEFORE requant; efr layout matches s_q8 (h*HD*HD+row*HD+col).
-            __half* efr = use_ef ? (s_ef_residual + h * HD * HD + rr * HD) : nullptr;
+            __half* efr = use_ef ? (s_ef_residual + state_lane_base + h * HD * HD + rr * HD) : nullptr;
             if (use_ef) {
                 s0 += __half2float(efr[tid]);
                 s1 += __half2float(efr[tid+32]);
@@ -162,7 +165,8 @@ __global__ void gated_delta_net_q8(
                 // for fresh per-token entropy (data-independent; the old
                 // my_max-derived seed was correlated/biased over the recurrence).
                 unsigned int rng = (unsigned int)(h * 1664525u + rr * 1013904223u
-                                 + tid * 214013u + (frame + (unsigned int)t) * 2531011u);
+                                 + tid * 214013u
+                                 + (frame + (unsigned int)bt) * 2531011u);
                 #define STOCH_ROUND(val) ({ \
                     rng = rng * 1664525u + 1013904223u; \
                     float noise = (float)(rng >> 8) * (1.0f / 16777216.0f); \
@@ -184,7 +188,7 @@ __global__ void gated_delta_net_q8(
                 signed char* dst = sq_base + r * HD;
                 dst[tid]    = (signed char)q0; dst[tid+32] = (signed char)q1;
                 dst[tid+64] = (signed char)q2; dst[tid+96] = (signed char)q3;
-                if (tid == 0) s_scales[h * HD + rr] = scale;
+                if (tid == 0) s_scales[lane * n_heads * HD + h * HD + rr] = scale;
             }
         }
     }

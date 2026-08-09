@@ -84,6 +84,16 @@ extern "C" __global__ void attention_q8_0_kv_batched(
     const int blocks_per_head = head_dim / 32;
     const int total_blocks_per_pos = n_kv_heads * blocks_per_head;
     const int kv_head_block_start = kv_h * blocks_per_head;
+    // A negative max_seq is the independent-sequence decode contract.  Its
+    // magnitude is the capacity of one lane; each batch row reads only its
+    // own `[lane * capacity, (lane + 1) * capacity)` cache slice.  Ordinary
+    // sequential prefill passes a positive max_seq and retains the shared
+    // cache semantics byte-for-byte.
+    const bool independent = max_seq < 0;
+    const int lane_capacity = independent ? -max_seq : max_seq;
+    const size_t lane_bytes = (size_t)lane_capacity * total_blocks_per_pos * 34;
+    const unsigned char* k_lane = k_cache + (independent ? (size_t)b * lane_bytes : 0);
+    const unsigned char* v_lane = v_cache + (independent ? (size_t)b * lane_bytes : 0);
 
     float* scores = sdata;
     float* workspace = sdata + seq_len;
@@ -99,7 +109,7 @@ extern "C" __global__ void attention_q8_0_kv_batched(
     for (int t = tid; t < seq_len; t += nthreads) {
         float dot = 0.0f;
         for (int bi = 0; bi < blocks_per_head; bi++) {
-            const unsigned char* blk = k_cache + (size_t)t * total_blocks_per_pos * 34
+            const unsigned char* blk = k_lane + (size_t)t * total_blocks_per_pos * 34
                                       + (kv_head_block_start + bi) * 34;
             float d = (float)*((const _Float16*)blk);
             const float* qb = q_shared + bi * 32;
@@ -159,7 +169,7 @@ extern "C" __global__ void attention_q8_0_kv_batched(
         int bi = d / 32;
         int bj = d % 32;
         for (int t = 0; t < seq_len; t++) {
-            const unsigned char* blk = v_cache + (size_t)t * total_blocks_per_pos * 34
+            const unsigned char* blk = v_lane + (size_t)t * total_blocks_per_pos * 34
                                       + (kv_head_block_start + bi) * 34;
             float vd = (float)*((const _Float16*)blk) * (float)(signed char)blk[2 + bj];
             val += scores[t] * vd;

@@ -1019,6 +1019,57 @@ impl DeltaNetState {
         self.s_ef_residual.get(idx)
     }
 
+    /// Non-owning single-lane view into state allocated by
+    /// [`Self::new_batched_with_quant`]. Used only to seed prompts through the
+    /// existing sequential prefill path. The returned view must not be freed.
+    fn q8_lane_view(&self, config: &Qwen35Config, lane: usize, batch: usize) -> HipResult<Self> {
+        if self.quant != StateQuant::Q8 || lane >= batch {
+            return Err(HipError::new(
+                0,
+                "DeltaNet q8_lane_view requires Q8 state and a valid lane",
+            ));
+        }
+        let n_heads = config.linear_num_value_heads;
+        let hd = config.linear_value_head_dim;
+        let s_elems = n_heads * hd * hd;
+        let scale_elems = n_heads * hd;
+        let conv_channels = config.linear_num_key_heads * config.linear_key_head_dim * 2
+            + config.linear_num_value_heads * config.linear_value_head_dim;
+        let conv_elems = conv_channels * (config.conv_kernel_dim - 1);
+
+        let byte_view = |t: &GpuTensor, off: usize, bytes: usize, dtype: DType| {
+            let ptr = unsafe { (t.buf.as_ptr() as *mut u8).add(off) as *mut std::ffi::c_void };
+            GpuTensor {
+                buf: unsafe { hip_bridge::DeviceBuffer::from_raw(ptr, bytes) },
+                shape: vec![bytes / dtype.size()],
+                dtype,
+            }
+        };
+        Ok(Self {
+            s_matrices: self
+                .s_matrices
+                .iter()
+                .map(|t| byte_view(t, lane * s_elems, s_elems, DType::Raw))
+                .collect(),
+            s_scales: self
+                .s_scales
+                .iter()
+                .map(|t| byte_view(t, lane * scale_elems * 4, scale_elems * 4, DType::F32))
+                .collect(),
+            conv_states: self
+                .conv_states
+                .iter()
+                .map(|t| byte_view(t, lane * conv_elems * 4, conv_elems * 4, DType::F32))
+                .collect(),
+            s_ef_residual: self
+                .s_ef_residual
+                .iter()
+                .map(|t| byte_view(t, lane * s_elems * 2, s_elems * 2, DType::F16))
+                .collect(),
+            quant: StateQuant::Q8,
+        })
+    }
+
     pub fn new(gpu: &mut Gpu, config: &Qwen35Config) -> HipResult<Self> {
         Self::new_with_quant(gpu, config, StateQuant::Q8)
     }
@@ -1028,6 +1079,23 @@ impl DeltaNetState {
         config: &Qwen35Config,
         quant: StateQuant,
     ) -> HipResult<Self> {
+        Self::new_batched_with_quant(gpu, config, quant, 1)
+    }
+
+    /// Allocate lane-major recurrent state for independent-sequence decode.
+    ///
+    /// The ordinary state has an implicit batch of one.  This variant keeps
+    /// the same per-layer vectors, but every tensor is laid out as
+    /// `[batch, ...single-lane shape...]`.  It is intentionally consumed only
+    /// by [`Qwen35DecodeBatchState`]: passing it to sequential prefill would
+    /// advance lane 0 and leave the other lanes stale.
+    pub fn new_batched_with_quant(
+        gpu: &mut Gpu,
+        config: &Qwen35Config,
+        quant: StateQuant,
+        batch: usize,
+    ) -> HipResult<Self> {
+        assert!(batch > 0, "DeltaNetState batch must be non-zero");
         let n_delta_layers = config
             .layer_types
             .iter()
@@ -1035,11 +1103,12 @@ impl DeltaNetState {
             .count();
         let s_dim = config.linear_key_head_dim; // 128
         let n_heads = config.linear_num_value_heads; // 16
-        let s_size = n_heads * s_dim * s_dim; // 16 * 128 * 128 = 262144
+        let s_size_per_lane = n_heads * s_dim * s_dim; // 16 * 128 * 128 = 262144
+        let s_size = batch * s_size_per_lane;
 
         let conv_channels = config.linear_num_key_heads * config.linear_key_head_dim * 2
             + config.linear_num_value_heads * config.linear_value_head_dim;
-        let conv_state_size = conv_channels * (config.conv_kernel_dim - 1);
+        let conv_state_size = batch * conv_channels * (config.conv_kernel_dim - 1);
 
         // Error-feedback (sigma-delta) requant for Q8 state — DEFAULT ON as of
         // 2026-06-08. q8_ef ≈ FP32 coherence at −0.7% decode vs FP32's −4.5% (best
@@ -1054,43 +1123,66 @@ impl DeltaNetState {
                 .map(|v| v != "0")
                 .unwrap_or(true);
 
+        // GpuTensor has no freeing Drop (free needs &mut Gpu). Mirror
+        // alloc_k_v_vmm_filtered: on any mid-loop failure free every tensor
+        // already pushed before propagating.
         let mut s_matrices = Vec::with_capacity(n_delta_layers);
         let mut s_scales = Vec::with_capacity(n_delta_layers);
         let mut conv_states = Vec::with_capacity(n_delta_layers);
         let mut s_ef_residual = Vec::with_capacity(if ef_enabled { n_delta_layers } else { 0 });
-        for _ in 0..n_delta_layers {
-            match quant {
-                StateQuant::FP32 => {
-                    s_matrices.push(gpu.zeros(&[s_size], DType::F32)?);
-                    s_scales.push(gpu.zeros(&[n_heads], DType::F32)?);
+        let result = (|| -> HipResult<()> {
+            for _ in 0..n_delta_layers {
+                match quant {
+                    StateQuant::FP32 => {
+                        s_matrices.push(gpu.zeros(&[s_size], DType::F32)?);
+                        s_scales.push(gpu.zeros(&[batch * n_heads], DType::F32)?);
+                    }
+                    StateQuant::Q8 => {
+                        // int8 state: s_size bytes (1 byte each), per-row scales
+                        let buf = gpu.hip.malloc(s_size)?;
+                        if let Err(e) = gpu.hip.memset(&buf, 0, s_size) {
+                            let _ = gpu.hip.free(buf);
+                            return Err(e);
+                        }
+                        s_matrices.push(GpuTensor {
+                            buf,
+                            shape: vec![s_size],
+                            dtype: DType::F32,
+                        });
+                        s_scales.push(gpu.zeros(&[batch * n_heads * s_dim], DType::F32)?);
+                    }
+                    StateQuant::Q4 => {
+                        // 4-bit nibble-packed: s_size/2 bytes, per-row scales
+                        let buf = gpu.hip.malloc(s_size / 2)?;
+                        if let Err(e) = gpu.hip.memset(&buf, 0, s_size / 2) {
+                            let _ = gpu.hip.free(buf);
+                            return Err(e);
+                        }
+                        s_matrices.push(GpuTensor {
+                            buf,
+                            shape: vec![s_size / 2],
+                            dtype: DType::F32,
+                        });
+                        s_scales.push(gpu.zeros(&[batch * n_heads * s_dim], DType::F32)?);
+                    }
                 }
-                StateQuant::Q8 => {
-                    // int8 state: s_size bytes (1 byte each), per-row scales
-                    let buf = gpu.hip.malloc(s_size)?;
-                    gpu.hip.memset(&buf, 0, s_size)?;
-                    s_matrices.push(GpuTensor {
-                        buf,
-                        shape: vec![s_size],
-                        dtype: DType::F32,
-                    });
-                    s_scales.push(gpu.zeros(&[n_heads * s_dim], DType::F32)?);
+                if ef_enabled {
+                    s_ef_residual.push(gpu.zeros(&[s_size], DType::F16)?);
                 }
-                StateQuant::Q4 => {
-                    // 4-bit nibble-packed: s_size/2 bytes, per-row scales
-                    let buf = gpu.hip.malloc(s_size / 2)?;
-                    gpu.hip.memset(&buf, 0, s_size / 2)?;
-                    s_matrices.push(GpuTensor {
-                        buf,
-                        shape: vec![s_size / 2],
-                        dtype: DType::F32,
-                    });
-                    s_scales.push(gpu.zeros(&[n_heads * s_dim], DType::F32)?);
-                }
+                conv_states.push(gpu.zeros(&[conv_state_size], DType::F32)?);
             }
-            if ef_enabled {
-                s_ef_residual.push(gpu.zeros(&[s_size], DType::F16)?);
+            Ok(())
+        })();
+        if let Err(err) = result {
+            for tensor in s_matrices
+                .drain(..)
+                .chain(s_scales.drain(..))
+                .chain(conv_states.drain(..))
+                .chain(s_ef_residual.drain(..))
+            {
+                let _ = gpu.free_tensor(tensor);
             }
-            conv_states.push(gpu.zeros(&[conv_state_size], DType::F32)?);
+            return Err(err);
         }
         Ok(Self {
             s_matrices,
@@ -6202,6 +6294,7 @@ impl PrefillBatchScratch {
             self.ffn_hidden_batch,
             self.dn_normed_rot_batch,
             self.positions,
+            self.rope_positions,
             self.tokens,
             self.fa_q_full_batch,
             self.fa_q_batch,
@@ -6247,6 +6340,737 @@ impl PrefillBatchScratch {
             }
         }
     }
+}
+/// Persistent fixed-slot state for independent-sequence Qwen3.5 decode.
+///
+/// Weights remain shared through [`Qwen35Weights`].  Only mutable sequence
+/// state is multiplied by `max_batch`: Q8 KV, Q8 DeltaNet matrices, conv rings,
+/// and the reusable batched scratch/logit buffers.  V1 intentionally uses Q8
+/// KV/state because those are the production decode defaults and the first
+/// independent attention/recurrent kernels target their exact layouts.
+pub struct Qwen35DecodeBatchState {
+    pub max_batch: usize,
+    pub lane_capacity: usize,
+    pub sample_repeat_capacity: usize,
+    pub kv_cache: llama::KvCache,
+    pub dn_state: DeltaNetState,
+    pub pbs: PrefillBatchScratch,
+    pub final_hidden: GpuTensor,
+    pub logits: GpuTensor,
+    pub lm_rot: GpuTensor,
+    pub sample_out: GpuTensor,
+    pub sample_repeat_tokens: GpuTensor,
+    pub sample_repeat_lengths: GpuTensor,
+    pub sample_rng_states: GpuTensor,
+}
+
+impl Qwen35DecodeBatchState {
+    pub fn new(
+        gpu: &mut Gpu,
+        config: &Qwen35Config,
+        max_batch: usize,
+        lane_capacity: usize,
+        sample_repeat_capacity: usize,
+    ) -> HipResult<Self> {
+        if max_batch == 0 || lane_capacity == 0 || sample_repeat_capacity == 0 {
+            return Err(HipError::new(
+                0,
+                "decode batch size, lane capacity, and repeat capacity must be non-zero",
+            ));
+        }
+        // Fail closed before any GPU allocation: independent Q8 attention's
+        // dynamic LDS is O(lane_capacity). Cap that the kernel cannot launch
+        // must not be admitted into DecodeBatchState.
+        gpu.ensure_attention_q8_0_kv_independent_lds(lane_capacity, config.head_dim)?;
+        let total_capacity = max_batch
+            .checked_mul(lane_capacity)
+            .ok_or_else(|| HipError::new(0, "decode batch KV capacity multiplication overflow"))?;
+        let repeat_tokens_len = max_batch
+            .checked_mul(sample_repeat_capacity)
+            .ok_or_else(|| {
+                HipError::new(0, "decode batch repeat capacity multiplication overflow")
+            })?;
+        let is_kv_layer: Vec<bool> = config
+            .layer_types
+            .iter()
+            .map(|t| *t == LayerType::FullAttention)
+            .collect();
+
+        // GpuTensor / KvCache / DeltaNetState / PrefillBatchScratch have no
+        // freeing Drop (free needs &mut Gpu). A mid-`new` `?` would leak every
+        // prior stage while the daemon falls back to sequential with the leak
+        // still resident. Stage each compound owner, then ordinary tensors
+        // through a ledger of non-owning aliases (same pattern as
+        // PrefillBatchScratch::new_opt): on error free aliases + compound
+        // owners before propagating; on success aliases drop as no-ops.
+        let kv_cache = llama::KvCache::new_gpu_q8_filtered(
+            gpu,
+            &is_kv_layer,
+            config.n_kv_heads,
+            config.head_dim,
+            total_capacity,
+        )?;
+        let dn_state =
+            match DeltaNetState::new_batched_with_quant(gpu, config, StateQuant::Q8, max_batch) {
+                Ok(s) => s,
+                Err(e) => {
+                    let _ = kv_cache.free_gpu(gpu);
+                    return Err(e);
+                }
+            };
+        let pbs = match PrefillBatchScratch::new_opt(gpu, config, max_batch, false) {
+            Ok(p) => p,
+            Err(e) => {
+                dn_state.free_gpu(gpu);
+                let _ = kv_cache.free_gpu(gpu);
+                return Err(e);
+            }
+        };
+
+        let mut ledger: Vec<GpuTensor> = Vec::with_capacity(7);
+        macro_rules! zeros {
+            ($shape:expr) => {
+                match gpu.zeros($shape, DType::F32) {
+                    Ok(t) => {
+                        // SAFETY: alias lives only inside `new`. On error it is
+                        // freed below (original field drops without freeing);
+                        // on success it drops untouched while the original
+                        // moves into Self.
+                        ledger.push(GpuTensor {
+                            buf: unsafe { t.buf.alias() },
+                            shape: t.shape.clone(),
+                            dtype: t.dtype,
+                        });
+                        t
+                    }
+                    Err(e) => {
+                        for prev in ledger.drain(..) {
+                            let _ = gpu.free_tensor(prev);
+                        }
+                        pbs.free_gpu(gpu);
+                        dn_state.free_gpu(gpu);
+                        let _ = kv_cache.free_gpu(gpu);
+                        return Err(e);
+                    }
+                }
+            };
+        }
+
+        let final_hidden = zeros!(&[max_batch * config.dim]);
+        let logits = zeros!(&[max_batch * config.vocab_size]);
+        let lm_rot = zeros!(&[max_batch * config.dim]);
+        let sample_out = zeros!(&[max_batch * 2]);
+        let sample_repeat_tokens = zeros!(&[repeat_tokens_len]);
+        let sample_repeat_lengths = zeros!(&[max_batch]);
+        let sample_rng_states = zeros!(&[max_batch]);
+        Ok(Self {
+            max_batch,
+            lane_capacity,
+            sample_repeat_capacity,
+            kv_cache,
+            dn_state,
+            pbs,
+            final_hidden,
+            logits,
+            lm_rot,
+            sample_out,
+            sample_repeat_tokens,
+            sample_repeat_lengths,
+            sample_rng_states,
+        })
+    }
+
+    pub fn reset(&mut self, gpu: &mut Gpu) -> HipResult<()> {
+        self.kv_cache.clear_gpu(gpu)?;
+        self.dn_state.reset(gpu)?;
+        // Clear the batched scratch buffers (x_batch, etc.) — PrefillBatchScratch has no
+        // clear_gpu in this branch, so memset its core tensors directly.
+        for t in [
+            &self.pbs.x_batch,
+            &self.pbs.x_rot_batch,
+            &self.pbs.x_norm_batch,
+            &self.pbs.positions,
+            &self.pbs.tokens,
+            &self.final_hidden,
+            &self.logits,
+            &self.lm_rot,
+            &self.sample_out,
+            &self.sample_repeat_tokens,
+            &self.sample_repeat_lengths,
+            &self.sample_rng_states,
+        ] {
+            gpu.hip.memset(&t.buf, 0, t.buf.size())?;
+        }
+        Ok(())
+    }
+
+    pub fn reset_lane(
+        &mut self,
+        gpu: &mut Gpu,
+        config: &Qwen35Config,
+        lane: usize,
+    ) -> HipResult<()> {
+        let mut kv_lane = self.kv_cache.q8_lane_view(lane, self.lane_capacity)?;
+        kv_lane.clear_gpu(gpu)?;
+        let mut dn_lane = self.dn_state.q8_lane_view(config, lane, self.max_batch)?;
+        dn_lane.reset(gpu)?;
+        // Zero the lane's row in the batched output buffers.
+        let hidden_lane = self.final_hidden.sub_offset(lane * config.dim, config.dim);
+        gpu.hip
+            .memset(&hidden_lane.buf, 0, hidden_lane.buf.size())?;
+        let logits_lane = self
+            .logits
+            .sub_offset(lane * config.vocab_size, config.vocab_size);
+        gpu.hip
+            .memset(&logits_lane.buf, 0, logits_lane.buf.size())?;
+        let rot_lane = self.lm_rot.sub_offset(lane * config.dim, config.dim);
+        gpu.hip.memset(&rot_lane.buf, 0, rot_lane.buf.size())?;
+        Ok(())
+    }
+
+    /// Seed one lane with a complete prompt through the production sequential
+    /// prefill path.  The final prompt logits are copied into this lane's row
+    /// of [`Self::logits`], so the caller can sample the first completion token
+    /// for every seeded lane in one batch.
+    pub fn prefill_lane(
+        &mut self,
+        gpu: &mut Gpu,
+        weights: &Qwen35Weights,
+        config: &Qwen35Config,
+        scratch: &Qwen35Scratch,
+        lane: usize,
+        tokens: &[u32],
+    ) -> HipResult<()> {
+        if lane >= self.max_batch || tokens.is_empty() || tokens.len() >= self.lane_capacity {
+            return Err(HipError::new(
+                0,
+                "prefill lane/token count is invalid or leaves no decode capacity",
+            ));
+        }
+        // Formats the independent decode-batch path can actually execute.
+        // Must stay aligned with `lm_head_batched` + `prepare_decode_batch_inputs`
+        // (and daemon `qwen_batch_weight_formats_supported`): reject unsupported
+        // lm_head / F32 embedding before any lane work so capability is never
+        // silently half-advertised at the first prefill.
+        if !matches!(
+            weights.embd_format,
+            EmbeddingFormat::HFQ4G256 | EmbeddingFormat::Q8_0
+        ) {
+            return Err(HipError::new(
+                0,
+                "prefill_lane: F32/unsupported embedding is not supported for batched decode",
+            ));
+        }
+        if !matches!(
+            weights.output.gpu_dtype,
+            DType::Q8_0
+                | DType::HFQ4G256
+                | DType::MQ4G256
+                | DType::HFQ6G256
+                | DType::MQ6G256
+                | DType::MQ3G256
+        ) {
+            return Err(HipError::new(
+                0,
+                &format!(
+                    "prefill_lane: unsupported lm_head dtype {:?} for batched decode",
+                    weights.output.gpu_dtype
+                ),
+            ));
+        }
+        let mut kv_lane = self.kv_cache.q8_lane_view(lane, self.lane_capacity)?;
+        let mut dn_lane = self.dn_state.q8_lane_view(config, lane, self.max_batch)?;
+        forward_prefill_batch(
+            gpu,
+            weights,
+            config,
+            tokens,
+            0,
+            &mut kv_lane,
+            &mut dn_lane,
+            scratch,
+            None,
+            None,
+            None,
+            None,
+        )?;
+        gpu.memcpy_dtod_at_auto(
+            &self.logits.buf,
+            lane * config.vocab_size * 4,
+            &scratch.logits.buf,
+            0,
+            config.vocab_size * 4,
+        )
+    }
+
+    pub fn sample(
+        &self,
+        gpu: &mut Gpu,
+        config: &Qwen35Config,
+        batch_size: usize,
+        temperature: f32,
+        top_p: f32,
+        top_k: Option<u32>,
+        rng_state: u32,
+    ) -> HipResult<(Vec<u32>, u32)> {
+        if batch_size == 0 || batch_size > self.max_batch {
+            return Err(HipError::new(0, "sample batch size is out of range"));
+        }
+        // Emulate the former sample_rows_f32 via the product sampler with
+        // empty histories and uniform RNG. This preserves the exact HIP kernel
+        // used for product sampling while keeping the simple API.
+        let vocab = config.vocab_size;
+        let logits = self.logits.sub_offset(0, batch_size * vocab);
+        // Zero histories
+        gpu.hip.memset(
+            &self.sample_repeat_tokens.buf,
+            0,
+            self.sample_repeat_tokens.buf.size(),
+        )?;
+        gpu.hip.memset(
+            &self.sample_repeat_lengths.buf,
+            0,
+            self.sample_repeat_lengths.buf.size(),
+        )?;
+        let rng_vec = vec![rng_state; batch_size];
+        let rng_bytes =
+            unsafe { std::slice::from_raw_parts(rng_vec.as_ptr() as *const u8, rng_vec.len() * 4) };
+        gpu.hip
+            .memcpy_htod(&self.sample_rng_states.buf, rng_bytes)?;
+        let out = gpu.sample_rows_pf_f32(
+            &logits,
+            &self.sample_repeat_tokens,
+            &self.sample_repeat_lengths,
+            &self.sample_rng_states,
+            &self.sample_out,
+            batch_size,
+            vocab,
+            self.sample_repeat_capacity,
+            temperature,
+            top_p,
+            1.0,
+            0.0,
+            0.0,
+            top_k,
+            None,
+        )?;
+        // sample_rows_pf_f32 returns Vec<(token, rng)>, collapse to (tokens, next_rng)
+        let tokens: Vec<u32> = out.iter().map(|(t, _)| *t).collect();
+        let next_rng = out.first().map(|(_, r)| *r).unwrap_or(rng_state);
+        Ok((tokens, next_rng))
+    }
+
+    /// Sample independent rows with the full product sampling surface and
+    /// per-lane RNG state.
+    #[allow(clippy::too_many_arguments)]
+    pub fn sample_product(
+        &self,
+        gpu: &mut Gpu,
+        config: &Qwen35Config,
+        batch_size: usize,
+        repeat_tokens: &[u32],
+        repeat_lengths: &[u32],
+        rng_states: &[u32],
+        temperature: f32,
+        top_p: f32,
+        top_k: Option<u32>,
+        min_p: Option<f32>,
+        repeat_penalty: f32,
+        presence_penalty: f32,
+        frequency_penalty: f32,
+    ) -> HipResult<Vec<(u32, u32)>> {
+        if batch_size == 0
+            || batch_size > self.max_batch
+            || repeat_tokens.len() != batch_size * self.sample_repeat_capacity
+            || repeat_lengths.len() != batch_size
+            || rng_states.len() != batch_size
+        {
+            return Err(HipError::new(
+                0,
+                "product sampler inputs do not match the active batch shape",
+            ));
+        }
+        let repeat_bytes = unsafe {
+            std::slice::from_raw_parts(repeat_tokens.as_ptr() as *const u8, repeat_tokens.len() * 4)
+        };
+        let length_bytes = unsafe {
+            std::slice::from_raw_parts(
+                repeat_lengths.as_ptr() as *const u8,
+                repeat_lengths.len() * 4,
+            )
+        };
+        let rng_bytes = unsafe {
+            std::slice::from_raw_parts(rng_states.as_ptr() as *const u8, rng_states.len() * 4)
+        };
+        gpu.hip
+            .memcpy_htod(&self.sample_repeat_tokens.buf, repeat_bytes)?;
+        gpu.hip
+            .memcpy_htod(&self.sample_repeat_lengths.buf, length_bytes)?;
+        gpu.hip
+            .memcpy_htod(&self.sample_rng_states.buf, rng_bytes)?;
+        let logits = self.logits.sub_offset(0, batch_size * config.vocab_size);
+        gpu.sample_rows_pf_f32(
+            &logits,
+            &self.sample_repeat_tokens,
+            &self.sample_repeat_lengths,
+            &self.sample_rng_states,
+            &self.sample_out,
+            batch_size,
+            config.vocab_size,
+            self.sample_repeat_capacity,
+            temperature,
+            top_p,
+            repeat_penalty,
+            presence_penalty,
+            frequency_penalty,
+            top_k,
+            min_p,
+        )
+    }
+
+    /// Single-row refill sampler. Continuous batching uses this only when a
+    /// completed lane is replaced; steady-state decode samples all rows with
+    /// [`Self::sample`] and pays one D2H for the whole batch.
+    pub fn sample_lane(
+        &self,
+        gpu: &mut Gpu,
+        config: &Qwen35Config,
+        lane: usize,
+        temperature: f32,
+        top_p: f32,
+        top_k: Option<u32>,
+        rng_state: u32,
+    ) -> HipResult<(u32, u32)> {
+        if lane >= self.max_batch {
+            return Err(HipError::new(0, "sample lane is out of range"));
+        }
+        let logits = self
+            .logits
+            .sub_offset(lane * config.vocab_size, config.vocab_size);
+        gpu.sample_top_p_pf(
+            &logits,
+            &self.sample_out,
+            &self.sample_out,
+            config.vocab_size,
+            temperature,
+            top_p,
+            rng_state,
+            0,
+            1.0,
+            0.0,
+            0.0,
+            top_k,
+            None,
+        )
+    }
+
+    /// Product-semantics refill sample for one lane. Refill is deliberately
+    /// outside the steady-state batched draw, so a single-row sampler here
+    /// does not serialize active lanes.
+    #[allow(clippy::too_many_arguments)]
+    pub fn sample_lane_product(
+        &self,
+        gpu: &mut Gpu,
+        config: &Qwen35Config,
+        lane: usize,
+        repeat_tokens: &[u32],
+        temperature: f32,
+        top_p: f32,
+        top_k: Option<u32>,
+        min_p: Option<f32>,
+        rng_state: u32,
+        repeat_penalty: f32,
+        presence_penalty: f32,
+        frequency_penalty: f32,
+    ) -> HipResult<(u32, u32)> {
+        if lane >= self.max_batch || repeat_tokens.len() > self.sample_repeat_capacity {
+            return Err(HipError::new(0, "sample lane/history is out of range"));
+        }
+        let repeat_bytes = unsafe {
+            std::slice::from_raw_parts(repeat_tokens.as_ptr() as *const u8, repeat_tokens.len() * 4)
+        };
+        gpu.hip
+            .memcpy_htod(&self.sample_repeat_tokens.buf, repeat_bytes)?;
+        let logits = self
+            .logits
+            .sub_offset(lane * config.vocab_size, config.vocab_size);
+        gpu.sample_top_p_pf(
+            &logits,
+            &self.sample_out,
+            &self.sample_repeat_tokens,
+            config.vocab_size,
+            temperature,
+            top_p,
+            rng_state,
+            repeat_tokens.len(),
+            repeat_penalty,
+            presence_penalty,
+            frequency_penalty,
+            top_k,
+            min_p,
+        )
+    }
+
+    pub fn free_gpu(self, gpu: &mut Gpu) {
+        let _ = self.kv_cache.free_gpu(gpu);
+        self.dn_state.free_gpu(gpu);
+        self.pbs.free_gpu(gpu);
+        let _ = gpu.free_tensor(self.final_hidden);
+        let _ = gpu.free_tensor(self.logits);
+        let _ = gpu.free_tensor(self.lm_rot);
+        let _ = gpu.free_tensor(self.sample_out);
+        let _ = gpu.free_tensor(self.sample_repeat_tokens);
+        let _ = gpu.free_tensor(self.sample_repeat_lengths);
+        let _ = gpu.free_tensor(self.sample_rng_states);
+    }
+}
+
+#[derive(Clone, Copy)]
+enum BatchSemantics<'a> {
+    Sequential,
+    Independent {
+        positions: &'a [usize],
+        lane_capacity: usize,
+    },
+}
+
+impl BatchSemantics<'_> {
+    #[inline]
+    fn is_independent(self) -> bool {
+        matches!(self, Self::Independent { .. })
+    }
+}
+
+fn lm_head_batched(
+    gpu: &mut Gpu,
+    output: &WeightTensor,
+    hidden: &GpuTensor,
+    rot: &GpuTensor,
+    logits: &GpuTensor,
+    batch_size: usize,
+) -> HipResult<()> {
+    match output.gpu_dtype {
+        DType::Q8_0 => {
+            gpu.gemm_q8_0_batched(&output.buf, hidden, logits, output.m, output.k, batch_size)
+        }
+        DType::HFQ4G256 => gpu.gemm_hfq4g256_batched_lmhead(
+            &output.buf,
+            hidden,
+            logits,
+            output.m,
+            output.k,
+            batch_size,
+        ),
+        DType::MQ4G256 => {
+            llama::rotate_x_mq_batched_for(gpu, output, hidden, rot, output.k, batch_size)?;
+            gpu.gemm_hfq4g256_batched_lmhead(
+                &output.buf,
+                rot,
+                logits,
+                output.m,
+                output.k,
+                batch_size,
+            )
+        }
+        DType::HFQ6G256 => gpu.gemm_hfq6g256_batched_lmhead(
+            &output.buf,
+            hidden,
+            logits,
+            output.m,
+            output.k,
+            batch_size,
+        ),
+        DType::MQ6G256 => {
+            llama::rotate_x_mq_batched_for(gpu, output, hidden, rot, output.k, batch_size)?;
+            gpu.gemm_hfq6g256_batched_lmhead(
+                &output.buf,
+                rot,
+                logits,
+                output.m,
+                output.k,
+                batch_size,
+            )
+        }
+        DType::MQ3G256 => {
+            llama::rotate_x_mq_batched_for(gpu, output, hidden, rot, output.k, batch_size)?;
+            gpu.gemm_hfq3g256_batched_lmhead(
+                &output.buf,
+                rot,
+                logits,
+                output.m,
+                output.k,
+                batch_size,
+            )
+        }
+        other => Err(HipError::new(
+            0,
+            &format!("lm_head_batched: unsupported dtype {other:?}"),
+        )),
+    }
+}
+
+/// Populate the changing inputs that intentionally stay outside a retained
+/// independent-batch replay: token embeddings and per-lane positions.
+pub fn prepare_decode_batch_inputs(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    tokens: &[u32],
+    positions: &[usize],
+    state: &Qwen35DecodeBatchState,
+) -> HipResult<usize> {
+    let n = tokens.len();
+    if n == 0 {
+        return Err(HipError::new(
+            0,
+            "independent batch input preparation requires at least one lane",
+        ));
+    }
+    if n > state.max_batch || positions.len() != n {
+        return Err(HipError::new(
+            0,
+            "decode batch inputs exceed max_batch or positions length differs",
+        ));
+    }
+    if positions.iter().any(|&p| p >= state.lane_capacity) {
+        return Err(HipError::new(
+            0,
+            "decode batch position exceeds lane capacity",
+        ));
+    }
+    // Reject unsupported formats before any device work (aligned with
+    // `prefill_lane` / daemon `qwen_batch_weight_formats_supported`).
+    match weights.embd_format {
+        EmbeddingFormat::HFQ4G256 | EmbeddingFormat::Q8_0 => {}
+        EmbeddingFormat::F32 => {
+            return Err(HipError::new(
+                0,
+                "prepare_decode_batch_inputs: F32 embedding not supported for batched decode",
+            ));
+        }
+        _ => {
+            return Err(HipError::new(
+                0,
+                "independent batch requires a batched HFQ4G256 or Q8 embedding",
+            ));
+        }
+    }
+
+    let tokens_host: Vec<i32> = tokens.iter().map(|&token| token as i32).collect();
+    let token_bytes: &[u8] = unsafe {
+        std::slice::from_raw_parts(tokens_host.as_ptr() as *const u8, tokens_host.len() * 4)
+    };
+    gpu.hip.memcpy_htod(&state.pbs.tokens.buf, token_bytes)?;
+    match weights.embd_format {
+        EmbeddingFormat::HFQ4G256 => gpu.embedding_lookup_hfq4g256_batched(
+            &weights.token_embd,
+            &state.pbs.x_batch,
+            &state.pbs.tokens,
+            n,
+            config.dim,
+        )?,
+        EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8_batched(
+            &weights.token_embd,
+            &state.pbs.x_batch,
+            &state.pbs.tokens,
+            n,
+            config.dim,
+        )?,
+        // Unreachable: guarded above.
+        _ => unreachable!("embedding format pre-checked"),
+    }
+
+    let positions_host: Vec<i32> = positions.iter().map(|&position| position as i32).collect();
+    let position_bytes: &[u8] = unsafe {
+        std::slice::from_raw_parts(
+            positions_host.as_ptr() as *const u8,
+            positions_host.len() * 4,
+        )
+    };
+    gpu.hip
+        .memcpy_htod(&state.pbs.positions.buf, position_bytes)?;
+    Ok(positions.iter().copied().max().unwrap_or(0))
+}
+
+/// Advance one token in each independent sequence lane and write
+/// `[batch, vocab]` logits into `state.logits`.
+pub fn forward_decode_batch(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    tokens: &[u32],
+    positions: &[usize],
+    state: &mut Qwen35DecodeBatchState,
+    scratch: &Qwen35Scratch,
+) -> HipResult<()> {
+    let n = tokens.len();
+    if n == 0 {
+        return Ok(());
+    }
+    let position = prepare_decode_batch_inputs(gpu, weights, config, tokens, positions, state)?;
+    forward_decode_batch_prepared(
+        gpu, weights, config, tokens, positions, position, state, scratch,
+    )
+}
+
+/// Execute an independent batch whose embeddings and position buffer were
+/// already populated by [`prepare_decode_batch_inputs`].
+#[allow(clippy::too_many_arguments)]
+pub fn forward_decode_batch_prepared(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    tokens: &[u32],
+    positions: &[usize],
+    position: usize,
+    state: &mut Qwen35DecodeBatchState,
+    scratch: &Qwen35Scratch,
+) -> HipResult<()> {
+    let n = tokens.len();
+    if n == 0
+        || n > state.max_batch
+        || positions.len() != n
+        || positions.iter().any(|&value| value >= state.lane_capacity)
+        || position != positions.iter().copied().max().unwrap_or(0)
+    {
+        return Err(HipError::new(
+            0,
+            "prepared independent batch inputs do not match the admitted shape",
+        ));
+    }
+
+    let final_hidden = state.final_hidden.sub_offset(0, n * config.dim);
+    forward_batch_chunk_impl(
+        gpu,
+        weights,
+        config,
+        tokens,
+        0,
+        &mut state.kv_cache,
+        &mut state.dn_state,
+        scratch,
+        &state.pbs,
+        None,
+        Some((&final_hidden, 0)),
+        None,
+        0,
+        None,
+        true,
+        true,
+        None,
+        None,
+        false,
+        None,
+        None,
+        BatchSemantics::Independent {
+            positions,
+            lane_capacity: state.lane_capacity,
+        },
+    )?;
+
+    let logits = state.logits.sub_offset(0, n * config.vocab_size);
+    let lm_rot = state.lm_rot.sub_offset(0, n * config.dim);
+    lm_head_batched(gpu, &weights.output, &final_hidden, &lm_rot, &logits, n)
 }
 
 /// Batched prefill entry point: processes N prompt tokens in one call,
@@ -8957,16 +9781,141 @@ fn forward_prefill_chunk(
     mask_override: Option<MaskEmbedOverride<'_>>,
     needs_last_token_logits: bool,
     max_layer: Option<usize>,
+    routed_out: Option<&GpuTensor>,
+) -> HipResult<()> {
+    forward_batch_chunk_impl(
+        gpu,
+        weights,
+        config,
+        tokens,
+        start_pos,
+        kv_cache,
+        dn_state,
+        s,
+        pbs,
+        hidden_rb,
+        per_token_hidden_out,
+        gdn_tape,
+        tape_offset,
+        tree_verify,
+        pre_uploaded,
+        false,
+        band,
+        mask_override,
+        needs_last_token_logits,
+        max_layer,
+        routed_out,
+        BatchSemantics::Sequential,
+    )
+}
+#[allow(clippy::too_many_arguments)]
+fn run_independent_q8_attention(
+    gpu: &mut Gpu,
+    pbs: &PrefillBatchScratch,
+    kv_cache: &llama::KvCache,
+    config: &Qwen35Config,
+    layer_idx: usize,
+    batch_size: usize,
+    lane_capacity: usize,
+    max_ctx_len: usize,
+) -> HipResult<()> {
+    debug_assert!(kv_cache.quant_q8);
+    gpu.kv_cache_write_q8_0_independent(
+        &kv_cache.k_gpu[layer_idx],
+        &pbs.fa_k_batch,
+        &pbs.positions,
+        config.n_kv_heads,
+        config.head_dim,
+        batch_size,
+        lane_capacity,
+    )?;
+    gpu.kv_cache_write_q8_0_independent(
+        &kv_cache.v_gpu[layer_idx],
+        &pbs.fa_v_batch,
+        &pbs.positions,
+        config.n_kv_heads,
+        config.head_dim,
+        batch_size,
+        lane_capacity,
+    )?;
+    gpu.attention_q8_0_kv_independent(
+        &pbs.fa_q_batch,
+        &kv_cache.k_gpu[layer_idx],
+        &kv_cache.v_gpu[layer_idx],
+        &pbs.fa_attn_out_batch,
+        &pbs.positions,
+        config.n_heads,
+        config.n_kv_heads,
+        config.head_dim,
+        lane_capacity,
+        max_ctx_len,
+        batch_size,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn forward_batch_chunk_impl(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    tokens: &[u32],
+    start_pos: usize,
+    kv_cache: &mut llama::KvCache,
+    dn_state: &mut DeltaNetState,
+    s: &Qwen35Scratch,
+    pbs: &PrefillBatchScratch,
+    hidden_rb: Option<&HiddenStateRingBuffer>,
+    per_token_hidden_out: Option<(&GpuTensor, usize)>,
+    gdn_tape: Option<&mut crate::speculative::GdnTape>,
+    tape_offset: usize,
+    tree_verify: Option<TreeVerifyCtx<'_>>,
+    pre_uploaded: bool,
+    pre_embedded: bool,
+    band: Option<&PrefillBandCtx<'_>>,
+    mask_override: Option<MaskEmbedOverride<'_>>,
+    needs_last_token_logits: bool,
+    max_layer: Option<usize>,
     // EP (Ship 6 substrate-EP prefill): per-MoE-layer routed partial. ONLY set
     // by the EP driver, which calls this with a SINGLE-layer band so the routed
     // combine of that one MoE layer lands in the zeroed partial (all-reduced by
     // the driver after the call). Always `None` for multi-layer bands (PP /
     // single-GPU full stack) — a shared partial across >1 MoE layer would be wrong.
     routed_out: Option<&GpuTensor>,
+    batch_semantics: BatchSemantics<'_>,
 ) -> HipResult<()> {
     let n = tokens.len();
     debug_assert!(n > 0);
     debug_assert!(n <= pbs.max_batch);
+    if let BatchSemantics::Independent {
+        positions,
+        lane_capacity,
+    } = batch_semantics
+    {
+        if positions.len() != n {
+            return Err(HipError::new(
+                0,
+                "independent decode positions length must equal token batch length",
+            ));
+        }
+        if positions.iter().any(|&p| p >= lane_capacity) {
+            return Err(HipError::new(
+                0,
+                "independent decode position exceeds lane KV capacity",
+            ));
+        }
+        if dn_state.quant != StateQuant::Q8 || !kv_cache.quant_q8 {
+            return Err(HipError::new(
+                0,
+                "independent decode currently requires Q8 DeltaNet state and Q8 KV",
+            ));
+        }
+        if tree_verify.is_some() || gdn_tape.is_some() {
+            return Err(HipError::new(
+                0,
+                "independent decode does not support tree or GDN tape modes",
+            ));
+        }
+    }
     // Target verification is a distinct performance regime from prompt
     // prefill. DFlash, DSpark/MTP, and tree verify expose that semantic here
     // through per-position hidden output, a rollback tape, or a tree mask.
@@ -9050,6 +9999,7 @@ fn forward_prefill_chunk(
     // The activation already lives in `pbs.x_batch` from a peer-copy of
     // the previous band's `pbs.x_batch`.
     if do_embed
+        && !pre_embedded
         && matches!(
             weights.embd_format,
             EmbeddingFormat::HFQ4G256 | EmbeddingFormat::Q8_0
@@ -9082,7 +10032,7 @@ fn forward_prefill_chunk(
             }
             _ => unreachable!(),
         }
-    } else if do_embed {
+    } else if do_embed && !pre_embedded {
         for (i, &tok) in tokens.iter().enumerate() {
             match weights.embd_format {
                 EmbeddingFormat::HFQ4G256 => unreachable!(),
@@ -9172,7 +10122,13 @@ fn forward_prefill_chunk(
     // while KV writes + attention seq_len keep the flat physical slots
     // (no sibling write race, contiguous-cache invariants intact).
     if !pre_uploaded {
-        let positions_host: Vec<i32> = (0..n).map(|i| (start_pos + i) as i32).collect();
+        let positions_host: Vec<i32> = match batch_semantics {
+            BatchSemantics::Sequential => (0..n).map(|i| (start_pos + i) as i32).collect(),
+            BatchSemantics::Independent { positions, .. } => {
+                debug_assert_eq!(positions.len(), n);
+                positions.iter().map(|&p| p as i32).collect()
+            }
+        };
         let positions_bytes: &[u8] =
             unsafe { std::slice::from_raw_parts(positions_host.as_ptr() as *const u8, n * 4) };
         gpu.hip.memcpy_htod(&pbs.positions.buf, positions_bytes)?;
@@ -9232,10 +10188,22 @@ fn forward_prefill_chunk(
     // cap instead (LDS sized for the worst case). The kernel still iterates
     // over the actual `positions[b] + 1` per-row seq_len from a device buffer,
     // so correctness is preserved; only the LDS allocation is over-provisioned.
+    let logical_max_ctx = match batch_semantics {
+        BatchSemantics::Sequential => start_pos + n,
+        BatchSemantics::Independent { positions, .. } => {
+            positions.iter().copied().max().unwrap_or(0) + 1
+        }
+    };
+    if batch_semantics.is_independent() && !fa_batched_ok {
+        return Err(HipError::new(
+            0,
+            "independent decode requires the fully batched FullAttention weight path",
+        ));
+    }
     let max_ctx_len = if gpu.graphs.capture_mode {
         kv_cache.physical_cap
     } else {
-        start_pos + n
+        logical_max_ctx
     };
 
     // ── 2. Per-layer loop ────────────────────────────────────────────────
@@ -9562,6 +10530,18 @@ fn forward_prefill_chunk(
                         v_dim,
                         n,
                     )?;
+                } else if batch_semantics.is_independent() {
+                    gpu.conv1d_silu_split_f32_independent(
+                        &pbs.dn_q_raw_batch,
+                        &pbs.dn_k_raw_batch,
+                        &pbs.dn_v_batch,
+                        &pbs.dn_qkv_batch,
+                        &layer.conv_weight,
+                        &dn_state.conv_states[delta_layer_idx],
+                        k_dim,
+                        v_dim,
+                        n,
+                    )?;
                 } else {
                     gpu.conv1d_silu_split_f32_n(
                         &pbs.dn_q_raw_batch,
@@ -9718,20 +10698,39 @@ fn forward_prefill_chunk(
                                 )?
                             }
                         }
-                        StateQuant::Q8 => gpu.gated_delta_net_q8_batch_seq(
-                            &pbs.dn_q_batch,
-                            &pbs.dn_k_batch,
-                            &pbs.dn_v_batch,
-                            &pbs.dn_alpha_batch,
-                            &pbs.dn_beta_batch,
-                            &dn_state.s_matrices[delta_layer_idx],
-                            &dn_state.s_scales[delta_layer_idx],
-                            &pbs.dn_attn_out_batch,
-                            n,
-                            n_v_heads,
-                            config.linear_value_head_dim,
-                            dn_state.ef_residual(delta_layer_idx),
-                        )?,
+                        StateQuant::Q8 => {
+                            if batch_semantics.is_independent() {
+                                gpu.gated_delta_net_q8_independent(
+                                    &pbs.dn_q_batch,
+                                    &pbs.dn_k_batch,
+                                    &pbs.dn_v_batch,
+                                    &pbs.dn_alpha_batch,
+                                    &pbs.dn_beta_batch,
+                                    &dn_state.s_matrices[delta_layer_idx],
+                                    &dn_state.s_scales[delta_layer_idx],
+                                    &pbs.dn_attn_out_batch,
+                                    n,
+                                    n_v_heads,
+                                    config.linear_value_head_dim,
+                                    dn_state.ef_residual(delta_layer_idx),
+                                )?
+                            } else {
+                                gpu.gated_delta_net_q8_batch_seq(
+                                    &pbs.dn_q_batch,
+                                    &pbs.dn_k_batch,
+                                    &pbs.dn_v_batch,
+                                    &pbs.dn_alpha_batch,
+                                    &pbs.dn_beta_batch,
+                                    &dn_state.s_matrices[delta_layer_idx],
+                                    &dn_state.s_scales[delta_layer_idx],
+                                    &pbs.dn_attn_out_batch,
+                                    n,
+                                    n_v_heads,
+                                    config.linear_value_head_dim,
+                                    dn_state.ef_residual(delta_layer_idx),
+                                )?
+                            }
+                        }
                         StateQuant::Q4 => gpu.gated_delta_net_q4(
                             &pbs.dn_q_batch,
                             &pbs.dn_k_batch,
@@ -10581,8 +11580,29 @@ fn forward_prefill_chunk(
                     output_gate: None,
                     output: &pbs.fa_attn_out_batch,
                 };
-                execute_steps(gpu, &ctx, &[Step::Attend { plan, io }])
-                    .map_err(|e| HipError::new(0, &e.to_string()))?;
+                if batch_semantics.is_independent() {
+                    if let BatchSemantics::Independent {
+                        positions: _,
+                        lane_capacity,
+                    } = batch_semantics
+                    {
+                        run_independent_q8_attention(
+                            gpu,
+                            pbs,
+                            kv_cache,
+                            config,
+                            layer_idx,
+                            n,
+                            lane_capacity,
+                            max_ctx_len,
+                        )?;
+                    } else {
+                        unreachable!();
+                    }
+                } else {
+                    execute_steps(gpu, &ctx, &[Step::Attend { plan, io }])
+                        .map_err(|e| HipError::new(0, &e.to_string()))?;
+                }
 
                 // 8. Fused sigmoid(gate) * attn_out, element-wise over the
                 // full [N × q_dim] tensor.
@@ -11382,6 +12402,18 @@ fn forward_prefill_chunk(
                         v_dim,
                         n,
                     )?;
+                } else if batch_semantics.is_independent() {
+                    gpu.conv1d_silu_split_f32_independent(
+                        &pbs.dn_q_raw_batch,
+                        &pbs.dn_k_raw_batch,
+                        &pbs.dn_v_batch,
+                        &pbs.dn_qkv_batch,
+                        &layer.conv_weight,
+                        &dn_state.conv_states[delta_layer_idx],
+                        k_dim,
+                        v_dim,
+                        n,
+                    )?;
                 } else {
                     gpu.conv1d_silu_split_f32_n(
                         &pbs.dn_q_raw_batch,
@@ -11543,20 +12575,39 @@ fn forward_prefill_chunk(
                                 )?
                             }
                         }
-                        StateQuant::Q8 => gpu.gated_delta_net_q8_batch_seq(
-                            &pbs.dn_q_batch,
-                            &pbs.dn_k_batch,
-                            &pbs.dn_v_batch,
-                            &pbs.dn_alpha_batch,
-                            &pbs.dn_beta_batch,
-                            &dn_state.s_matrices[delta_layer_idx],
-                            &dn_state.s_scales[delta_layer_idx],
-                            &pbs.dn_attn_out_batch,
-                            n,
-                            n_v_heads,
-                            config.linear_value_head_dim,
-                            dn_state.ef_residual(delta_layer_idx),
-                        )?,
+                        StateQuant::Q8 => {
+                            if batch_semantics.is_independent() {
+                                gpu.gated_delta_net_q8_independent(
+                                    &pbs.dn_q_batch,
+                                    &pbs.dn_k_batch,
+                                    &pbs.dn_v_batch,
+                                    &pbs.dn_alpha_batch,
+                                    &pbs.dn_beta_batch,
+                                    &dn_state.s_matrices[delta_layer_idx],
+                                    &dn_state.s_scales[delta_layer_idx],
+                                    &pbs.dn_attn_out_batch,
+                                    n,
+                                    n_v_heads,
+                                    config.linear_value_head_dim,
+                                    dn_state.ef_residual(delta_layer_idx),
+                                )?
+                            } else {
+                                gpu.gated_delta_net_q8_batch_seq(
+                                    &pbs.dn_q_batch,
+                                    &pbs.dn_k_batch,
+                                    &pbs.dn_v_batch,
+                                    &pbs.dn_alpha_batch,
+                                    &pbs.dn_beta_batch,
+                                    &dn_state.s_matrices[delta_layer_idx],
+                                    &dn_state.s_scales[delta_layer_idx],
+                                    &pbs.dn_attn_out_batch,
+                                    n,
+                                    n_v_heads,
+                                    config.linear_value_head_dim,
+                                    dn_state.ef_residual(delta_layer_idx),
+                                )?
+                            }
+                        }
                         StateQuant::Q4 => gpu.gated_delta_net_q4(
                             &pbs.dn_q_batch,
                             &pbs.dn_k_batch,
@@ -12121,8 +13172,29 @@ fn forward_prefill_chunk(
                     output_gate: None,
                     output: &pbs.fa_attn_out_batch,
                 };
-                execute_steps(gpu, &ctx, &[Step::Attend { plan, io }])
-                    .map_err(|e| HipError::new(0, &e.to_string()))?;
+                if batch_semantics.is_independent() {
+                    if let BatchSemantics::Independent {
+                        positions: _,
+                        lane_capacity,
+                    } = batch_semantics
+                    {
+                        run_independent_q8_attention(
+                            gpu,
+                            pbs,
+                            kv_cache,
+                            config,
+                            layer_idx,
+                            n,
+                            lane_capacity,
+                            max_ctx_len,
+                        )?;
+                    } else {
+                        unreachable!();
+                    }
+                } else {
+                    execute_steps(gpu, &ctx, &[Step::Attend { plan, io }])
+                        .map_err(|e| HipError::new(0, &e.to_string()))?;
+                }
                 gpu.sigmoid_mul_f32(&pbs.fa_attn_out_batch, &pbs.fa_gate_batch)?;
                 // wo + residual. Mirrors the dense FA wo dispatch at
                 // qwen35.rs:5591-5623 — Q8 wo skips rotation (un-rotated
@@ -15362,10 +16434,7 @@ fn moe_combine_next_rms_enabled(gpu: &Gpu, weights: &Qwen35Weights, config: &Qwe
             || ffn.experts.first().is_some_and(|expert| {
                 !matches!(
                     expert.down.gpu_dtype,
-                    DType::MQ2G256Lloyd
-                        | DType::MQ3G256Lloyd
-                        | DType::MQ2G256GL
-                        | DType::MQ3G256GL
+                    DType::MQ2G256Lloyd | DType::MQ3G256Lloyd | DType::MQ2G256GL | DType::MQ3G256GL
                 )
             })
     };
@@ -18439,7 +19508,6 @@ mod tests {
         ));
     }
 
-
     /// The antirez asymmetric routed pair (gate_up MQ2-Lloyd / down MQ3-Lloyd)
     /// on an MQ4 shared expert + MQ4 router — the shape every current low-bit
     /// a3b SKU ships. Rejected without the codebook admit (today's behavior:
@@ -18517,7 +19585,7 @@ mod tests {
     /// pairs through both predicates and asserts they never disagree that way.
     #[test]
     fn mq3_refusal_never_fires_on_an_admitted_codebook_pair() {
-        use DType::{MQ2G256Lloyd, MQ2G256GL, MQ3G256, MQ3G256GL, MQ3G256Lloyd, MQ4G256, MQ6G256};
+        use DType::{MQ2G256Lloyd, MQ3G256Lloyd, MQ2G256GL, MQ3G256, MQ3G256GL, MQ4G256, MQ6G256};
         let pairs = [
             (MQ2G256Lloyd, MQ3G256Lloyd),
             (MQ3G256Lloyd, MQ3G256Lloyd),
@@ -18565,15 +19633,11 @@ mod tests {
         let pair = (MQ2G256Lloyd, MQ3G256Lloyd);
         // Uniform supported pair, admit on -> no refusal.
         assert!(!unsupported_mq3_experts_uniform_from_dtypes(
-            false,
-            [pair; 8],
-            true
+            false, [pair; 8], true
         ));
         // Same file, admit off -> refusal stands (today's behavior).
         assert!(unsupported_mq3_experts_uniform_from_dtypes(
-            false,
-            [pair; 8],
-            false
+            false, [pair; 8], false
         ));
         // Mixed routed dtypes with NO tag table -> refusal stands even with the
         // admit on; the grouped GEMM would use experts[0]'s stride for all.
@@ -18625,7 +19689,11 @@ mod tests {
                 "{arch} should admit under an explicit opt-in"
             );
             // Path 2 disabled => never admit, whatever the codebook var says.
-            assert!(!codebook_batched_admit_enabled_from_env(None, Some("0"), arch));
+            assert!(!codebook_batched_admit_enabled_from_env(
+                None,
+                Some("0"),
+                arch
+            ));
             assert!(!codebook_batched_admit_enabled_from_env(
                 Some("1"),
                 Some("off"),

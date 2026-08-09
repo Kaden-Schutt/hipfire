@@ -28,8 +28,8 @@ use hipfire_runtime::kv_backend::KvBackend;
 use hipfire_runtime::llama;
 use hipfire_runtime::loader_api::{CaskConfig, LoadCtx, ModelSource, SpecLoadCfg};
 use hipfire_runtime::multi_gpu::Gpus;
-use hipfire_runtime::spec::{SpecEmit, SpecEmitCtx, SpecTargetGuard, Speculator};
 use hipfire_runtime::ngram_mod::NgramModPool;
+use hipfire_runtime::spec::{SpecEmit, SpecEmitCtx, SpecTargetGuard, Speculator};
 use hipfire_runtime::triattn::{EvictionCtx, TriAttnCenters};
 use rdna_compute::Gpu;
 use std::path::Path;
@@ -303,6 +303,7 @@ pub struct LoadedModel {
     pub ep: Option<EpState>,
     // Shared arch state
     pub state: Option<ModelState>,
+    pub qwen35_decode_batch: Option<hipfire_arch_qwen35::qwen35::Qwen35DecodeBatchState>,
     pub kv_cache: Option<llama::KvCache>,
     pub dn_state: Option<DeltaNetState>,
     // Reusable Qwen2 recurrent state (used by dots_ocr and Qwen2 non-core falcon)
@@ -399,6 +400,7 @@ impl LoadedModel {
             pp_scratch_set: None,
             pp_dn_la_to_device: None,
             state: None,
+            qwen35_decode_batch: None,
             kv_cache: None,
             dn_state: None,
             qwen2_state: None,
@@ -2080,6 +2082,12 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(
     }
     if m.pp > 1 {
         let mut gpus = m.pp_gpus.expect("pp>1 must carry pp_gpus");
+        if let Some(batch_state) = m.qwen35_decode_batch.take() {
+            // Single-GPU batch state is not expected for pp>1, but free it on
+            // the provided single gpu before multi-device teardown to avoid
+            // leaking if a test ever stages it.
+            batch_state.free_gpu(gpu);
+        }
         if let Some(scratch_set) = m.pp_scratch_set {
             scratch_set.free_gpu_multi(&mut gpus);
         }
@@ -2144,6 +2152,9 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(
     }
     for (_, snap) in m.dflash_checkpoints {
         snap.free_gpu(gpu);
+    }
+    if let Some(batch_state) = m.qwen35_decode_batch.take() {
+        batch_state.free_gpu(gpu);
     }
     // Free arch-specific GPU state from the carrier bundle
     if let Some(state) = m.state {
@@ -2245,8 +2256,7 @@ mod registry_tests {
         // implemented storage below F32 — a widening relative to what these
         // ask for. Only unrecognised strings still fail closed.
         for mode in [
-            "q8", "asym2", "asym3", "asym4", "fwht2", "fwht3", "fwht4", "turbo", "turbo3",
-            "turbo4",
+            "q8", "asym2", "asym3", "asym4", "fwht2", "fwht3", "fwht4", "turbo", "turbo3", "turbo4",
         ] {
             assert_eq!(
                 resolve_deepseek4_compressor_cache_kv_mode(Some(mode)).unwrap(),
