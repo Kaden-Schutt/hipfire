@@ -3991,6 +3991,9 @@ fn drive_qwen35_ep_continuous_batch(
     inbox: &mut DaemonInbox,
 ) -> Result<(), BatchDriveError> {
     let batch_size = sched.max_batch;
+    if ep_batch_trace_enabled() {
+        eprintln!("[batch][EP][trace] driver enter batch_size={batch_size}");
+    }
     if batch_size == 0 {
         return Ok(());
     }
@@ -14811,6 +14814,19 @@ fn main() {
                     } else {
                         false
                     };
+                    if ep_batch_trace_enabled() {
+                        eprintln!(
+                            "[batch][EP][trace] generate admit id={} attempt_id={} batch_scheduler={} ep_state={} serve_continuous_batch={} ep_batch_eligible={} continuous_batch_size={} pflash_active={}",
+                            id,
+                            gen_attempt_id,
+                            batch_scheduler.is_some(),
+                            m.ep.is_some(),
+                            serve_continuous_batch,
+                            ep_batch_eligible,
+                            continuous_batch_size,
+                            pflash_active,
+                        );
+                    }
                     if ep_batch_eligible {
                         batch_transition_to_queued(id, gen_attempt_id);
                         if batch_check_abort(id, gen_attempt_id) {
@@ -14879,8 +14895,20 @@ fn main() {
                                 max_tokens,
                                 sampling: sampling.clone(),
                             };
+                            if ep_batch_trace_enabled() {
+                                eprintln!(
+                                    "[batch][EP][trace] enqueue before id={} attempt_id={}",
+                                    id, gen_attempt_id
+                                );
+                            }
                             if let Some(sched) = batch_scheduler.as_mut() {
                                 let enq_ok = sched.enqueue(pending);
+                                if ep_batch_trace_enabled() {
+                                    eprintln!(
+                                        "[batch][EP][trace] enqueue after id={} attempt_id={} enq_ok={}",
+                                        id, gen_attempt_id, enq_ok
+                                    );
+                                }
                                 if !enq_ok {
                                     eprintln!("[batch][EP] duplicate enqueue rejected id={} attempt_id={}; preserving live registry", id, gen_attempt_id);
                                     continue;
@@ -14892,6 +14920,12 @@ fn main() {
                                         id,
                                         false,
                                         Some(QWEN_AR_SEMANTIC_CONTRACT_VERSION),
+                                    );
+                                }
+                                if ep_batch_trace_enabled() {
+                                    eprintln!(
+                                        "[batch][EP][trace] driver call before id={} attempt_id={}",
+                                        id, gen_attempt_id
                                     );
                                 }
                                 let drive_res = drive_qwen35_ep_continuous_batch(
@@ -14926,6 +14960,12 @@ fn main() {
                     if ep_batch_staged {
                         // EP requests without serve_continuous_batch or with excluded features must error.
                         if !ep_batch_eligible {
+                            if ep_batch_trace_enabled() {
+                                eprintln!(
+                                    "[batch][EP][trace] staged-ineligible fail-closed id={} attempt_id={}",
+                                    id, gen_attempt_id
+                                );
+                            }
                             let _scope = BatchAttemptScope::enter(gen_attempt_id);
                             let ep = RollbackEpilogue {
                                 rolled_back: true,

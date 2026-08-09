@@ -2792,6 +2792,17 @@ fn is_batch_eligible_request(
     true
 }
 
+/// Opt-in stderr phase markers for EP continuous-batch hang diagnosis on the
+/// serve HTTP path. Enabled only when `HIPFIRE_EP_BATCH_TRACE=1`; cached so the
+/// hot path is a bool load when disabled.
+fn ep_batch_trace_enabled() -> bool {
+    use std::sync::LazyLock;
+    static ENABLED: LazyLock<bool> = LazyLock::new(|| {
+        hipfire_config::developer_var("HIPFIRE_EP_BATCH_TRACE").as_deref() == Ok("1")
+    });
+    *ENABLED
+}
+
 /// HTTP/OpenAI `messages` are batch-eligible only when absent/empty (prompt
 /// path) or exactly one user turn with plain string content. Multi-turn,
 /// system/assistant/tool roles, tool_call payloads, and multipart/image
@@ -3304,11 +3315,17 @@ fn handle_http(mut request: Request, shared: Arc<ServeShared>) -> Result<()> {
             };
             // Class-aware admission: eligible requests share capacity up to
             // continuous_batch_size, ineligible are exclusive single-flight.
+            if ep_batch_trace_enabled() {
+                eprintln!("[serve][EP][trace] runtime eligibility lock before");
+            }
             let (is_eligible, model_for_lease) = {
                 let runtime = shared
                     .runtime
                     .lock()
                     .unwrap_or_else(|error| error.into_inner());
+                if ep_batch_trace_enabled() {
+                    eprintln!("[serve][EP][trace] runtime eligibility lock after");
+                }
                 let tp = runtime.tp;
                 let arch = runtime.current_arch.clone();
                 let batch_capable = runtime.continuous_batch_capable;
@@ -3318,8 +3335,16 @@ fn handle_http(mut request: Request, shared: Arc<ServeShared>) -> Result<()> {
                     .get("model")
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_owned());
+                if ep_batch_trace_enabled() {
+                    eprintln!(
+                        "[serve][EP][trace] eligibility computed is_eligible={eligible} tp={tp:?} current_arch={arch:?} daemon_batch_capable={batch_capable} model={model:?}"
+                    );
+                }
                 (eligible, model)
             };
+            if ep_batch_trace_enabled() {
+                eprintln!("[serve][EP][trace] admission acquire before is_eligible={is_eligible}");
+            }
             let guard = if is_eligible {
                 match shared
                     .admission
@@ -3340,6 +3365,12 @@ fn handle_http(mut request: Request, shared: Arc<ServeShared>) -> Result<()> {
                     }
                 }
             };
+            if ep_batch_trace_enabled() {
+                eprintln!(
+                    "[serve][EP][trace] admission acquire after is_eligible={}",
+                    guard.is_eligible
+                );
+            }
             // Tools require a lossless endpoint adapter before any generation.
             if let Err(error) = gate_chat_completions_tools(&body) {
                 request.respond(openai_error(&error.to_string(), 400))?;
@@ -4495,14 +4526,38 @@ fn complete_request_attempt(
     // holding the lock. Clone the engine handle before dropping the lock so
     // concurrent eligible requests can share the multiplexed transport.
     let (generate, resolved, engine_clone) = {
+        if ep_batch_trace_enabled() {
+            eprintln!(
+                "[serve][EP][trace] attempt runtime lock before id={} attempt_id={attempt_id}",
+                identity.0
+            );
+        }
         let mut runtime = shared
             .runtime
             .lock()
             .unwrap_or_else(|error| error.into_inner());
+        if ep_batch_trace_enabled() {
+            eprintln!(
+                "[serve][EP][trace] attempt runtime lock after id={} attempt_id={attempt_id}",
+                identity.0
+            );
+        }
         // Attempt id is allocated by the retry driver before any cold reset /
         // generate so reset ack, generate request, and the semantic fold share one
         // wire id.
+        if ep_batch_trace_enabled() {
+            eprintln!(
+                "[serve][EP][trace] ensure_model before id={} attempt_id={attempt_id} model={model}",
+                identity.0
+            );
+        }
         let resolved = runtime.ensure_model(&model, &shared.meta, None)?;
+        if ep_batch_trace_enabled() {
+            eprintln!(
+                "[serve][EP][trace] ensure_model after id={} attempt_id={attempt_id} model={model}",
+                identity.0
+            );
+        }
         if force_reset || (!runtime.cache_capable && !runtime.continuous_batch_capable) {
             if let Err(error) = runtime.engine.reset(attempt_id) {
                 if force_reset {
@@ -4527,7 +4582,19 @@ fn complete_request_attempt(
         }
         let required_max_seq = max_tokens.saturating_add(1024);
         if runtime.current_max_seq < required_max_seq {
+            if ep_batch_trace_enabled() {
+                eprintln!(
+                    "[serve][EP][trace] ensure_model max_seq before id={} attempt_id={attempt_id} required_max_seq={required_max_seq}",
+                    identity.0
+                );
+            }
             runtime.ensure_model(&model, &shared.meta, Some(required_max_seq))?;
+            if ep_batch_trace_enabled() {
+                eprintln!(
+                    "[serve][EP][trace] ensure_model max_seq after id={} attempt_id={attempt_id} required_max_seq={required_max_seq}",
+                    identity.0
+                );
+            }
         }
         let mut normalized_messages = normalize_openai_messages(body.get("messages"));
         let default_system = request_string(&resolved, "prompt.system", None)?;
@@ -4597,6 +4664,16 @@ fn complete_request_attempt(
         if guard.is_eligible {
             generate["serve_continuous_batch"] = serde_json::Value::Bool(true);
         }
+        if ep_batch_trace_enabled() {
+            let serve_continuous_batch = generate
+                .get("serve_continuous_batch")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            eprintln!(
+                "[serve][EP][trace] generate request built id={id} attempt_id={attempt_id} serve_continuous_batch={serve_continuous_batch} is_eligible={}",
+                guard.is_eligible
+            );
+        }
         let engine_clone = runtime.engine.clone();
         (generate, resolved, engine_clone)
     };
@@ -4626,7 +4703,10 @@ fn complete_request_attempt(
         .unwrap_or("unknown")
         .to_owned();
 
-    let done = engine_clone.generate(&generate, |event| {
+    if ep_batch_trace_enabled() {
+        eprintln!("[serve][EP][trace] engine.generate before id={id} attempt_id={attempt_id}");
+    }
+    let gen_result = engine_clone.generate(&generate, |event| {
         let event_type = event.get("type").and_then(serde_json::Value::as_str);
 
         // Staged terminal: commit_ready carries done fields with type != done.
@@ -4797,7 +4877,18 @@ fn complete_request_attempt(
             }
         }
         Ok(())
-    })?;
+    });
+    if ep_batch_trace_enabled() {
+        match &gen_result {
+            Ok(_) => eprintln!(
+                "[serve][EP][trace] engine.generate after ok id={id} attempt_id={attempt_id}"
+            ),
+            Err(error) => eprintln!(
+                "[serve][EP][trace] engine.generate after err id={id} attempt_id={attempt_id} error={error}"
+            ),
+        }
+    }
+    let done = gen_result?;
     let mut meta = shared
         .meta
         .lock()
