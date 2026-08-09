@@ -5606,7 +5606,6 @@ impl Gpu {
             kernels::ATTENTION_Q8_0_KV_SRC,
             "attention_q8_0_kv",
         )?;
-        let func = &self.functions["attention_q8_0_kv"];
         let scale = 1.0f32 / (head_dim as f32).sqrt();
         let mut q_ptr = q.buf.as_ptr();
         let mut k_ptr = k_cache.buf.as_ptr();
@@ -5639,16 +5638,27 @@ impl Gpu {
         let bytes =
             crate::profile::attention_q8_0_kv_bytes(n_heads, n_kv_heads, head_dim, seq_len_hint);
         let timer = crate::profile::begin_timer(&self.hip, "attention", "attention_q8_0_kv", bytes);
-        let result = unsafe {
-            self.hip.launch_kernel(
-                func,
-                [n_heads as u32, 1, 1],
-                [block_size, 1, 1],
-                shared_mem,
-                self.stream_ref(),
-                &mut params,
-            )
-        };
+        let result = self.launch_maybe_blob(
+            "attention_q8_0_kv",
+            [n_heads as u32, 1, 1],
+            [block_size, 1, 1],
+            shared_mem,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(q_ptr);
+                b.push_ptr(k_ptr);
+                b.push_ptr(v_ptr);
+                b.push_ptr(out_ptr);
+                b.push_ptr(pos_ptr);
+                b.push_i32(nh);
+                b.push_i32(nkv);
+                b.push_i32(hd);
+                b.push_i32(ms);
+                b.push_f32(sc);
+                b
+            },
+        );
         if let Some(t) = timer {
             t.finish(&self.hip);
         }

@@ -2034,35 +2034,42 @@ impl Gpu {
             kernels::CONV1D_GATED_DECODE_SRC,
             "conv1d_gated_decode_f32",
         )?;
-        let func = &self.functions["conv1d_gated_decode_f32"];
-        let mut bp = bcx.buf.as_ptr();
-        let mut sp = state.buf.as_ptr();
-        let mut wp = weight.buf.as_ptr();
-        let mut oyp = out_y.buf.as_ptr();
-        let mut bb = batch as i32;
-        let mut cc = channels as i32;
-        let mut kk = kernel_size as i32;
+        let bp = bcx.buf.as_ptr();
+        let sp = state.buf.as_ptr();
+        let wp = weight.buf.as_ptr();
+        let oyp = out_y.buf.as_ptr();
+        let bb = batch as i32;
+        let cc = channels as i32;
+        let kk = kernel_size as i32;
         let mut params: Vec<*mut c_void> = vec![
-            &mut bp as *mut _ as *mut c_void,
-            &mut sp as *mut _ as *mut c_void,
-            &mut wp as *mut _ as *mut c_void,
-            &mut oyp as *mut _ as *mut c_void,
-            &mut bb as *mut _ as *mut c_void,
-            &mut cc as *mut _ as *mut c_void,
-            &mut kk as *mut _ as *mut c_void,
+            &bp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &oyp as *const _ as *mut c_void,
+            &bb as *const _ as *mut c_void,
+            &cc as *const _ as *mut c_void,
+            &kk as *const _ as *mut c_void,
         ];
         let block = 256u32;
         let grid = (((batch * channels) as u32) + block - 1) / block;
-        unsafe {
-            self.hip.launch_kernel(
-                func,
-                [grid, 1, 1],
-                [block, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        }
+        self.launch_maybe_blob(
+            "conv1d_gated_decode_f32",
+            [grid, 1, 1],
+            [block, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(bp);
+                b.push_ptr(sp);
+                b.push_ptr(wp);
+                b.push_ptr(oyp);
+                b.push_i32(bb);
+                b.push_i32(cc);
+                b.push_i32(kk);
+                b
+            },
+        )
     }
 
     /// Gated output norm: rmsnorm(x) * silu(z). Fused kernel.
