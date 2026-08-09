@@ -6845,6 +6845,28 @@ fn ar_graph_trace_enabled() -> bool {
     })
 }
 
+#[inline]
+fn ep_batch_trace_enabled() -> bool {
+    static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        hipfire_config::developer_var("HIPFIRE_EP_BATCH_TRACE")
+            .ok()
+            .as_deref()
+            == Some("1")
+    });
+    *ENABLED
+}
+
+#[inline]
+fn ep_batch_first_collective_sync_enabled() -> bool {
+    static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        hipfire_config::developer_var("HIPFIRE_EP_BATCH_FIRST_COLLECTIVE_SYNC")
+            .ok()
+            .as_deref()
+            == Some("1")
+    });
+    *ENABLED
+}
+
 /// Zero-alloc forward pass using pre-allocated scratch buffers.
 /// Logits stay on GPU in scratch.logits. Returns nothing — caller uses scratch.logits.
 pub fn forward_scratch(
@@ -9760,9 +9782,23 @@ impl Qwen35DecodeBatchEpState {
         hipfire_runtime::ep::ensure_rank_streams(gpus)
             .map_err(|e| HipError::new(0, &e.to_string()))?;
         let dim = config.dim;
+        let trace = ep_batch_trace_enabled();
+        let first_collective_sync = ep_batch_first_collective_sync_enabled();
+        if trace {
+            eprintln!(
+                "[qwen35-ep-batch] prefill_lane enter lane={lane} tokens={} chunks={num_chunks} expected_collectives={expected_collectives}",
+                tokens.len()
+            );
+        }
         let inner = (|| -> HipResult<u32> {
             // First device mutation is reset_lane_internal — after this, every error poisons.
+            if trace {
+                eprintln!("[qwen35-ep-batch] prefill_lane reset before lane={lane}");
+            }
             self.reset_lane_internal(gpus, config, lane)?;
+            if trace {
+                eprintln!("[qwen35-ep-batch] prefill_lane reset after lane={lane}");
+            }
             self.lane_states[lane] = LaneState::Seeding;
             let mut kv_lanes: Vec<llama::KvCache> = Vec::with_capacity(n);
             let mut dn_lanes: Vec<DeltaNetState> = Vec::with_capacity(n);
@@ -9838,6 +9874,11 @@ impl Qwen35DecodeBatchEpState {
                         let rank_pbs = &self.seed_pbs[rank];
                         let rank_kv = &mut kv_lanes[rank];
                         let rank_dn = &mut dn_lanes[rank];
+                        if trace {
+                            eprintln!(
+                                "[qwen35-ep-batch] prefill_lane forward before lane={lane} chunk={chunk_idx} layer={layer_idx} rank={rank} is_moe={is_moe}"
+                            );
+                        }
                         forward_batch_chunk_impl(
                             &mut gpus.devices[rank],
                             &weights_per_rank[rank],
@@ -9862,24 +9903,65 @@ impl Qwen35DecodeBatchEpState {
                             routed_out.as_ref(),
                             BatchSemantics::Sequential,
                         )?;
+                        if trace {
+                            eprintln!(
+                                "[qwen35-ep-batch] prefill_lane forward after lane={lane} chunk={chunk_idx} layer={layer_idx} rank={rank} is_moe={is_moe}"
+                            );
+                        }
                     }
                     if is_moe {
                         let count = chunk_n * dim;
+                        if first_collective_sync && observed == 0 {
+                            for rank in 0..n {
+                                if trace {
+                                    eprintln!(
+                                        "[qwen35-ep-batch] prefill_lane first_collective_sync before lane={lane} rank={rank}"
+                                    );
+                                }
+                                gpus.devices[rank].bind_thread()?;
+                                gpus.devices[rank].hip.device_synchronize()?;
+                                if trace {
+                                    eprintln!(
+                                        "[qwen35-ep-batch] prefill_lane first_collective_sync after lane={lane} rank={rank}"
+                                    );
+                                }
+                            }
+                        }
                         let bufs: Vec<&hip_bridge::DeviceBuffer> =
                             self.seed_partials.iter().map(|t| &t.buf).collect();
                         let lease = self
                             .peer_lease
                             .as_ref()
                             .ok_or_else(|| HipError::new(0, "prefill_lane: missing peer lease"))?;
+                        if trace {
+                            eprintln!(
+                                "[qwen35-ep-batch] prefill_lane collective before lane={lane} chunk={chunk_idx} layer={layer_idx} count={count} observed={observed}"
+                            );
+                        }
                         gpus.all_reduce_sum_f32_peer_rooted_leased(lease, &bufs, count)?;
+                        if trace {
+                            eprintln!(
+                                "[qwen35-ep-batch] prefill_lane collective after lane={lane} chunk={chunk_idx} layer={layer_idx} count={count} observed={observed}"
+                            );
+                        }
                         observed = observed
                             .checked_add(1)
                             .ok_or_else(|| HipError::new(0, "prefill observed overflow"))?;
                         for rank in 0..n {
+                            if trace && observed == 1 {
+                                eprintln!(
+                                    "[qwen35-ep-batch] prefill_lane residual_add before lane={lane} rank={rank}"
+                                );
+                            }
                             gpus.devices[rank].bind_thread()?;
                             let dst = self.seed_pbs[rank].x_batch.sub_offset(0, chunk_n * dim);
                             let src = self.seed_partials[rank].sub_offset(0, chunk_n * dim);
                             gpus.devices[rank].add_inplace_f32(&dst, &src)?;
+                            if trace && observed == 1 {
+                                eprintln!(
+                                    "[qwen35-ep-batch] prefill_lane residual_add after lane={lane} rank={rank}"
+                                );
+                            }
                         }
                     }
                     match config.layer_types[layer_idx] {
@@ -9918,8 +10000,18 @@ impl Qwen35DecodeBatchEpState {
                 lm_head_batched(gpu, &weights_per_rank[0].output, tmp, rot, &logits_lane, 1)?;
             }
             for rank in 0..n {
+                if trace {
+                    eprintln!(
+                        "[qwen35-ep-batch] prefill_lane device_synchronize before lane={lane} rank={rank}"
+                    );
+                }
                 gpus.devices[rank].bind_thread()?;
                 gpus.devices[rank].hip.device_synchronize()?;
+                if trace {
+                    eprintln!(
+                        "[qwen35-ep-batch] prefill_lane device_synchronize after lane={lane} rank={rank}"
+                    );
+                }
             }
             Ok(observed)
         })();
@@ -9930,6 +10022,11 @@ impl Qwen35DecodeBatchEpState {
                 };
                 self.poison_mask &= !lane_mask;
                 self.epoch = reserved_epoch;
+                if trace {
+                    eprintln!(
+                        "[qwen35-ep-batch] prefill_lane exit ok lane={lane} observed={observed} epoch={reserved_epoch}"
+                    );
+                }
                 Ok(Qwen35EpBatchReceipt::new_attested(
                     reserved_epoch,
                     rows_u32,

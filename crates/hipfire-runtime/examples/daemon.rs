@@ -3974,6 +3974,16 @@ fn is_qwen_ep_batch_request_eligible(
     true
 }
 
+/// Opt-in stderr phase markers for EP continuous-batch hang diagnosis.
+/// Enabled only when `HIPFIRE_EP_BATCH_TRACE=1`; cached so the hot path is a bool load.
+fn ep_batch_trace_enabled() -> bool {
+    use std::sync::LazyLock;
+    static ENABLED: LazyLock<bool> = LazyLock::new(|| {
+        hipfire_config::developer_var("HIPFIRE_EP_BATCH_TRACE").as_deref() == Ok("1")
+    });
+    *ENABLED
+}
+
 fn drive_qwen35_ep_continuous_batch(
     sched: &mut ContinuousBatchScheduler,
     model: &mut LoadedModel,
@@ -4434,6 +4444,9 @@ fn drive_qwen35_ep_continuous_batch(
                 inbox.push_front(DaemonMsg::Regular(serde_json::json!({"type":"generate","id":key.id,"attempt_id":key.attempt_id,"prompt":prompt})));
                 break;
             }
+            if ep_batch_trace_enabled() {
+                eprintln!("[batch][EP][trace] reset_lane before lane={lane_idx}");
+            }
             if let Err(e) = batch_state.reset_lane(gpus, config, lane_idx) {
                 return fail_all(
                     sched,
@@ -4441,6 +4454,15 @@ fn drive_qwen35_ep_continuous_batch(
                     batch_state,
                     stdout,
                     format!("EP reset lane {lane_idx}: {e}"),
+                );
+            }
+            if ep_batch_trace_enabled() {
+                eprintln!("[batch][EP][trace] reset_lane after lane={lane_idx}");
+            }
+            if ep_batch_trace_enabled() {
+                eprintln!(
+                    "[batch][EP][trace] prefill_lane before lane={lane_idx} prompt_tokens={}",
+                    prompt_tokens.len()
                 );
             }
             let receipt =
@@ -4456,6 +4478,12 @@ fn drive_qwen35_ep_continuous_batch(
                         )
                     }
                 };
+            if ep_batch_trace_enabled() {
+                eprintln!(
+                    "[batch][EP][trace] prefill_lane after lane={lane_idx} prompt_tokens={}",
+                    prompt_tokens.len()
+                );
+            }
             last_receipt = Some(receipt);
             let lane_rng = match &sched.lanes[lane_idx] {
                 BatchLane::Running(lane) => lane.rng_state as u32,
@@ -4463,6 +4491,9 @@ fn drive_qwen35_ep_continuous_batch(
             };
             // Use per-lane sampling that respects readiness; repeat penalties folded via retry window with product if needed.
             // For EP we call sample_lane (full product requires contiguous Ready lanes); per-lane keeps sparsity.
+            if ep_batch_trace_enabled() {
+                eprintln!("[batch][EP][trace] sample_lane before lane={lane_idx}");
+            }
             let (next_token, next_rng) = match batch_state.sample_lane(
                 gpus,
                 config,
@@ -4483,6 +4514,9 @@ fn drive_qwen35_ep_continuous_batch(
                     )
                 }
             };
+            if ep_batch_trace_enabled() {
+                eprintln!("[batch][EP][trace] sample_lane after lane={lane_idx}");
+            }
             if let BatchLane::Running(lane) = &mut sched.lanes[lane_idx] {
                 lane.prompt_len = prompt_tokens.len();
                 lane.seq_pos = prompt_tokens.len();
@@ -4558,6 +4592,12 @@ fn drive_qwen35_ep_continuous_batch(
                 }
             }
         }
+        if ep_batch_trace_enabled() {
+            eprintln!(
+                "[batch][EP][trace] forward_tick before active_mask={active_mask:#x} active_lanes={}",
+                running.len()
+            );
+        }
         let receipt =
             match batch_state.forward_tick(gpus, weights, config, active_mask, &tokens, &positions)
             {
@@ -4572,6 +4612,12 @@ fn drive_qwen35_ep_continuous_batch(
                     )
                 }
             };
+        if ep_batch_trace_enabled() {
+            eprintln!(
+                "[batch][EP][trace] forward_tick after active_mask={active_mask:#x} active_lanes={}",
+                running.len()
+            );
+        }
         last_receipt = Some(receipt);
         let mut to_await: Vec<(usize, AttemptKey, serde_json::Value)> = Vec::new();
         let mut to_abort_running: Vec<(usize, AttemptKey)> = Vec::new();
