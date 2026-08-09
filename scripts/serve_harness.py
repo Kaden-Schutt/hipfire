@@ -1113,6 +1113,53 @@ def _self_test_mtp_ngram_config():
     assert "ngram=" not in line_absent
     assert "pld=" not in line_absent
 
+    # mtp_window_timings: production projection preserves nested host-timing
+    # records for --out JSON (opt-in HIPFIRE_HOST_TIMING path).
+    windows = [{
+        "kind": "mtp",
+        "wall_us": 1234,
+        "draft_lookup_us": 12,
+        "launch_us": 34,
+        "h2d_us": 56,
+        "d2h_us": 78,
+        "d2d_us": 90,
+        "memset_us": 11,
+        "stream_sync_us": 22,
+        "event_sync_us": 33,
+        "device_sync_us": 44,
+        "graph_launch_us": 55,
+    }]
+    timings_on = {
+        "mtp": True,
+        "mtp_ngram": True,
+        "mtp_windows": 1,
+        "ar_windows": 0,
+        "mtp_retired": True,
+        "mtp_window_timings": windows,
+        "ngram_mod_windows": 1,
+        "ngram_mod_drafts": 2,
+        "ngram_mod_accepted": 1,
+        "ngram_mod_accept_rate": 0.5,
+    }
+    row_on = _project_mtp_ngram_timings(timings_on)
+    assert row_on["mtp_window_timings"] is windows
+    assert row_on["mtp_window_timings"] == windows
+    assert row_on["mtp_window_timings"][0]["kind"] == "mtp"
+    assert row_on["mtp_window_timings"][0]["wall_us"] == 1234
+    assert row_on["mtp"] is True
+    assert row_on["mtp_ngram"] is True
+    assert row_on["mtp_windows"] == 1
+    assert row_on["ngram_mod_accepted"] == 1
+    # --out path is json.dump(rows); nested records must survive round-trip.
+    dumped = json.loads(json.dumps([row_on], indent=0))
+    assert dumped[0]["mtp_window_timings"] == windows
+    # Disabled / missing / explicit null → None (no fabricated empty list).
+    assert _project_mtp_ngram_timings({}).get("mtp_window_timings") is None
+    assert _project_mtp_ngram_timings(None).get("mtp_window_timings") is None
+    assert _project_mtp_ngram_timings({"mtp_window_timings": None})["mtp_window_timings"] is None
+
+
+
     # spawn_serve opt-off pops all inherited ngram-mod env (no service start).
     import unittest.mock as mock
     captured = {}
@@ -1331,6 +1378,27 @@ def gram3(toks):
     from collections import Counter
     c = Counter(g); return sum(v for v in c.values() if v > 1) / len(g)
 
+def _project_mtp_ngram_timings(timings):
+    """Project MTP/ngram timing fields from a daemon timings object for report rows.
+
+    Nested mtp_window_timings (when present) are passed through by reference so
+    --out JSON keeps ordered per-window kind + microsecond records unchanged.
+    """
+    t = timings or {}
+    return {
+        "mtp": t.get("mtp"),
+        "mtp_ngram": t.get("mtp_ngram"),
+        "ngram_mod_windows": t.get("ngram_mod_windows"),
+        "ngram_mod_drafts": t.get("ngram_mod_drafts"),
+        "ngram_mod_accepted": t.get("ngram_mod_accepted"),
+        "ngram_mod_accept_rate": t.get("ngram_mod_accept_rate"),
+        "mtp_windows": t.get("mtp_windows"),
+        "ar_windows": t.get("ar_windows"),
+        "mtp_retired": t.get("mtp_retired"),
+        "mtp_window_timings": t.get("mtp_window_timings"),
+    }
+
+
 def send(cfg, messages):
     body = {"model": cfg["model"], "messages": messages, "max_tokens": cfg["max_tokens"],
             "stream": True, "stream_options": {"include_usage": True}}
@@ -1384,15 +1452,8 @@ def send(cfg, messages):
         "think_words": len(re.findall(r"\S+", think_s)), "ans_words": len(re.findall(r"\S+", visible)),
         "prefill_ms": timings.get("prefill_ms"), "prefill_tok_s": timings.get("prefill_tok_s"),
         "decode_tok_s": decode_ts, "decode_estimated": decode_est, "tau": timings.get("tau"),
-        "cycles": timings.get("cycles"), "dflash": timings.get("dflash"), "mtp": timings.get("mtp"),
-        "mtp_ngram": timings.get("mtp_ngram"),
-        "ngram_mod_windows": timings.get("ngram_mod_windows"),
-        "ngram_mod_drafts": timings.get("ngram_mod_drafts"),
-        "ngram_mod_accepted": timings.get("ngram_mod_accepted"),
-        "ngram_mod_accept_rate": timings.get("ngram_mod_accept_rate"),
-        "mtp_windows": timings.get("mtp_windows"),
-        "ar_windows": timings.get("ar_windows"),
-        "mtp_retired": timings.get("mtp_retired"),
+        "cycles": timings.get("cycles"), "dflash": timings.get("dflash"),
+        **_project_mtp_ngram_timings(timings),
         "ttft_s": round(ttft or 0, 3), "wall_s": round(wall, 3),
         "attractor": bad, "empty": (cfg.get("expect_visible", True) and len(visible) == 0),
         "runaway": (finish == "length"),

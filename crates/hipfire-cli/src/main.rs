@@ -5101,6 +5101,7 @@ fn completion_timings(completion: &Completion) -> serde_json::Value {
         "mtp_windows": done.get("mtp_windows"),
         "ar_windows": done.get("ar_windows"),
         "mtp_retired": done.get("mtp_retired"),
+        "mtp_window_timings": done.get("mtp_window_timings"),
     })
 }
 
@@ -8762,13 +8763,31 @@ mod tests {
         assert_eq!(dflash["dflash"], true);
         assert!(dflash["mtp"].is_null());
 
+        let mtp_window_timings = serde_json::json!([{
+            "kind": "mtp",
+            "wall_us": 1234,
+            "draft_lookup_us": 12,
+            "launch_us": 34,
+            "h2d_us": 56,
+            "d2h_us": 78,
+            "d2d_us": 90,
+            "memset_us": 11,
+            "stream_sync_us": 22,
+            "event_sync_us": 33,
+            "device_sync_us": 44,
+            "graph_launch_us": 55,
+        }]);
         let mtp = completion_timings(&completion(serde_json::json!({
             "mtp": true,
             "tau": 2.0,
             "cycles": 6,
+            "mtp_window_timings": mtp_window_timings,
         })));
         assert!(mtp["dflash"].is_null());
         assert_eq!(mtp["mtp"], true);
+        assert_eq!(mtp["mtp_window_timings"], mtp_window_timings);
+        assert_eq!(mtp["mtp_window_timings"][0]["kind"], "mtp");
+        assert_eq!(mtp["mtp_window_timings"][0]["wall_us"], 1234);
     }
 
     #[test]

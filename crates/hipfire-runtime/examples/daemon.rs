@@ -5624,6 +5624,112 @@ mod mtp_adaptive_route_contract {
     }
 }
 
+/// Opt-in MTP host-timing wire helpers: route kind, record shape, done-field gate.
+/// Pure — no GPU, no launch counters, no Instant reads under test.
+#[cfg(test)]
+mod mtp_host_timing_contract {
+    use super::{
+        attach_mtp_window_timings, mtp_window_timing_kind, mtp_window_timing_record,
+    };
+
+    #[test]
+    fn route_kind_covers_ngram_mtp_and_ar() {
+        // Ngram hit wins regardless of retirement latch.
+        assert_eq!(mtp_window_timing_kind(true, true, false), "ngram");
+        assert_eq!(mtp_window_timing_kind(true, true, true), "ngram");
+        assert_eq!(mtp_window_timing_kind(true, false, false), "ngram");
+        // Miss after retirement → AR (trunk-only k=0).
+        assert_eq!(mtp_window_timing_kind(false, true, true), "ar");
+        // Miss before retirement / ngram off → native MTP.
+        assert_eq!(mtp_window_timing_kind(false, true, false), "mtp");
+        assert_eq!(mtp_window_timing_kind(false, false, false), "mtp");
+        assert_eq!(mtp_window_timing_kind(false, false, true), "mtp");
+    }
+
+    #[test]
+    fn timing_record_preserves_exact_wire_fields() {
+        let rec = mtp_window_timing_record(
+            "ngram", 11, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12,
+        );
+        let obj = rec.as_object().expect("object");
+        let expected = [
+            "kind",
+            "wall_us",
+            "draft_lookup_us",
+            "launch_us",
+            "h2d_us",
+            "d2h_us",
+            "d2d_us",
+            "memset_us",
+            "stream_sync_us",
+            "event_sync_us",
+            "device_sync_us",
+            "graph_launch_us",
+        ];
+        assert_eq!(obj.len(), expected.len());
+        for key in expected {
+            assert!(obj.contains_key(key), "missing wire field {key}");
+        }
+        assert_eq!(rec["kind"], "ngram");
+        assert_eq!(rec["wall_us"], 11);
+        assert_eq!(rec["draft_lookup_us"], 2);
+        assert_eq!(rec["launch_us"], 3);
+        assert_eq!(rec["h2d_us"], 4);
+        assert_eq!(rec["d2h_us"], 5);
+        assert_eq!(rec["d2d_us"], 6);
+        assert_eq!(rec["memset_us"], 7);
+        assert_eq!(rec["stream_sync_us"], 8);
+        assert_eq!(rec["event_sync_us"], 9);
+        assert_eq!(rec["device_sync_us"], 10);
+        assert_eq!(rec["graph_launch_us"], 12);
+        // All eleven numeric fields are nonnegative integers on the wire.
+        for key in [
+            "wall_us",
+            "draft_lookup_us",
+            "launch_us",
+            "h2d_us",
+            "d2h_us",
+            "d2d_us",
+            "memset_us",
+            "stream_sync_us",
+            "event_sync_us",
+            "device_sync_us",
+            "graph_launch_us",
+        ] {
+            assert!(rec[key].as_u64().is_some(), "{key} must be u64");
+        }
+    }
+
+    #[test]
+    fn attach_omits_field_when_disabled_preserves_order_when_enabled() {
+        let r0 = mtp_window_timing_record("mtp", 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+        let r1 = mtp_window_timing_record("ngram", 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+        let r2 = mtp_window_timing_record("ar", 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+        let ordered = vec![r0.clone(), r1.clone(), r2.clone()];
+
+        let mut disabled = serde_json::json!({"tokens": 1});
+        attach_mtp_window_timings(&mut disabled, false, ordered.clone());
+        assert!(
+            disabled.get("mtp_window_timings").is_none(),
+            "disabled must omit the field entirely"
+        );
+
+        let mut enabled = serde_json::json!({"tokens": 1});
+        attach_mtp_window_timings(&mut enabled, true, ordered);
+        let arr = enabled["mtp_window_timings"]
+            .as_array()
+            .expect("enabled attaches array");
+        assert_eq!(arr.len(), 3);
+        assert_eq!(arr[0]["kind"], "mtp");
+        assert_eq!(arr[1]["kind"], "ngram");
+        assert_eq!(arr[2]["kind"], "ar");
+        assert_eq!(arr[0]["wall_us"], 1);
+        assert_eq!(arr[1]["wall_us"], 2);
+        assert_eq!(arr[2]["wall_us"], 3);
+    }
+}
+
+
 /// Daemon writer contract: active-attempt errors cannot take a caller-chosen
 /// attempt_id (including hard-coded 0). Uncorrelated rejects are a separate API.
 #[cfg(test)]
@@ -13008,6 +13114,114 @@ fn generate_spec(
     })
 }
 
+/// Wire `kind` for one successful MTP decode window. Classified from the route
+/// actually taken *before* the step (and before ngram acceptance can retire MTP).
+fn mtp_window_timing_kind(used_ngram: bool, mtp_ngram: bool, mtp_retired: bool) -> &'static str {
+    if used_ngram {
+        "ngram"
+    } else if mtp_ngram && mtp_retired {
+        "ar"
+    } else {
+        "mtp"
+    }
+}
+
+/// Build one `mtp_window_timings[]` record from already-measured microsecond deltas.
+/// Pure: no clocks or launch counters. Field names match the wire schema exactly.
+fn mtp_window_timing_record(
+    kind: &str,
+    wall_us: u64,
+    draft_lookup_us: u64,
+    launch_us: u64,
+    h2d_us: u64,
+    d2h_us: u64,
+    d2d_us: u64,
+    memset_us: u64,
+    stream_sync_us: u64,
+    event_sync_us: u64,
+    device_sync_us: u64,
+    graph_launch_us: u64,
+) -> serde_json::Value {
+    serde_json::json!({
+        "kind": kind,
+        "wall_us": wall_us,
+        "draft_lookup_us": draft_lookup_us,
+        "launch_us": launch_us,
+        "h2d_us": h2d_us,
+        "d2h_us": d2h_us,
+        "d2d_us": d2d_us,
+        "memset_us": memset_us,
+        "stream_sync_us": stream_sync_us,
+        "event_sync_us": event_sync_us,
+        "device_sync_us": device_sync_us,
+        "graph_launch_us": graph_launch_us,
+    })
+}
+
+/// Opt-in per-window HIP host/API snapshot. Constructed only when
+/// `HIPFIRE_HOST_TIMING=1`; the disabled path never reads clocks or counters.
+struct MtpWindowTimingSnap {
+    wall_start: Instant,
+    l_start: u64,
+    htod_start: u64,
+    dtoh_start: u64,
+    dtod_start: u64,
+    memset_start: u64,
+    ssync_start: u64,
+    esync_start: u64,
+    dsync_start: u64,
+    glaunch_start: u64,
+}
+
+impl MtpWindowTimingSnap {
+    fn take() -> Self {
+        use hip_bridge::launch_counters as lc;
+        Self {
+            wall_start: Instant::now(),
+            l_start: lc::launch_kernel::time_ns(),
+            htod_start: lc::memcpy_htod::time_ns(),
+            dtoh_start: lc::memcpy_dtoh::time_ns(),
+            dtod_start: lc::memcpy_dtod::time_ns(),
+            memset_start: lc::memset::time_ns(),
+            ssync_start: lc::stream_sync::time_ns(),
+            esync_start: lc::event_sync::time_ns(),
+            dsync_start: lc::device_sync::time_ns(),
+            glaunch_start: lc::graph_launch::time_ns(),
+        }
+    }
+
+    /// Consume the snapshot after a successful step into one ordered wire record.
+    fn into_record(self, kind: &str, draft_lookup_us: u64) -> serde_json::Value {
+        use hip_bridge::launch_counters as lc;
+        mtp_window_timing_record(
+            kind,
+            self.wall_start.elapsed().as_micros() as u64,
+            draft_lookup_us,
+            (lc::launch_kernel::time_ns() - self.l_start) / 1000,
+            (lc::memcpy_htod::time_ns() - self.htod_start) / 1000,
+            (lc::memcpy_dtoh::time_ns() - self.dtoh_start) / 1000,
+            (lc::memcpy_dtod::time_ns() - self.dtod_start) / 1000,
+            (lc::memset::time_ns() - self.memset_start) / 1000,
+            (lc::stream_sync::time_ns() - self.ssync_start) / 1000,
+            (lc::event_sync::time_ns() - self.esync_start) / 1000,
+            (lc::device_sync::time_ns() - self.dsync_start) / 1000,
+            (lc::graph_launch::time_ns() - self.glaunch_start) / 1000,
+        )
+    }
+}
+
+/// Attach `mtp_window_timings` to the staged `done` object only when host timing
+/// is enabled. Disabled path leaves the field absent (not null).
+fn attach_mtp_window_timings(
+    pending_done: &mut serde_json::Value,
+    host_timing: bool,
+    timings: Vec<serde_json::Value>,
+) {
+    if host_timing {
+        pending_done["mtp_window_timings"] = serde_json::Value::Array(timings);
+    }
+}
+
 /// Qwen3.5/3.6 native-MTP (NextN) speculative decode serve path.
 ///
 /// Analog of [`generate_deepseek4`]'s spec branch and [`generate_dflash`], but
@@ -13597,6 +13811,10 @@ fn generate_qwen35_mtp(
     let mut mtp_windows = 0usize;
     let mut ar_windows = 0usize;
     let mut mtp_retired = false;
+    // Opt-in per-window HIP host/API timing (HIPFIRE_HOST_TIMING=1). Empty
+    // Vec + one env check when disabled — no launch-counter work on the hot path.
+    let host_timing = std::env::var("HIPFIRE_HOST_TIMING").ok().as_deref() == Some("1");
+    let mut mtp_window_timings: Vec<serde_json::Value> = Vec::new();
     // Request context prompt+seed for the shared pool. Pushed incrementally
     // with actually emitted committed tokens; insert_range learns them.
     let mut ngram_context: Vec<u32> = Vec::with_capacity(prompt_tokens.len() + max_tokens + 1);
@@ -13673,19 +13891,38 @@ fn generate_qwen35_mtp(
         }
 
         // Ngram-mod draft attempt: short-lock, clone Vec, drop lock before GPU.
+        // When host_timing is on, snapshot launch counters before lookup so
+        // draft_lookup_us is separable from the GPU step; wall spans both.
+        // Disabled path: no Instant::now and no launch-counter reads per window.
         let remaining_emit = max_tokens.saturating_sub(generated);
         let spine_budget = remaining_emit.saturating_sub(1); // room for bonus
-        let ngram_cands: Option<Vec<u32>> = if mtp_ngram && spine_budget > 0 {
+        let timing_snap = if host_timing {
+            Some(MtpWindowTimingSnap::take())
+        } else {
+            None
+        };
+        let (ngram_cands, draft_lookup_us) = if mtp_ngram && spine_budget > 0 {
             let caller_max = spine_budget.min(verify_capacity);
+            let t_lookup = if host_timing {
+                Some(Instant::now())
+            } else {
+                None
+            };
             let draft = {
                 let pool = ngram_mod_pool.as_ref().unwrap().lock().unwrap();
                 pool.draft(&ngram_context, caller_max)
             };
-            draft
+            let draft_lookup_us = t_lookup
+                .map(|t| t.elapsed().as_micros() as u64)
+                .unwrap_or(0);
+            (draft, draft_lookup_us)
         } else {
-            None
+            (None, 0)
         };
         let used_ngram = ngram_cands.as_ref().is_some_and(|c| !c.is_empty());
+        // Classify planned route before the step (and before ngram acceptance
+        // can retire MTP) so timing kind matches the path actually taken.
+        let timing_kind = mtp_window_timing_kind(used_ngram, mtp_ngram, mtp_retired);
         let result = if used_ngram {
             let cands = ngram_cands.as_ref().unwrap();
             match mtp_spec::spec_step_mtp_compressed_serial_with_takeover_candidates(
@@ -13761,6 +13998,10 @@ fn generate_qwen35_mtp(
                 }
             }
         };
+        // Record only after a successful step; failed windows leave no row.
+        if let Some(snap) = timing_snap {
+            mtp_window_timings.push(snap.into_record(timing_kind, draft_lookup_us));
+        }
         cycles += 1;
         accepted_total += result.accept_count;
         if used_ngram {
@@ -14109,6 +14350,43 @@ fn generate_qwen35_mtp(
         "ar_windows": ar_windows,
         "mtp_retired": mtp_retired,
     });
+    // Build concise per-route wall summary before moving timings into pending_done.
+    let host_timing_summary = if host_timing && !mtp_window_timings.is_empty() {
+        let summarize = |kind: &str| {
+            let mut walls: Vec<u64> = mtp_window_timings
+                .iter()
+                .filter(|r| r.get("kind").and_then(|k| k.as_str()) == Some(kind))
+                .filter_map(|r| r.get("wall_us").and_then(|v| v.as_u64()))
+                .collect();
+            if walls.is_empty() {
+                return None;
+            }
+            let n = walls.len();
+            let sum: u64 = walls.iter().sum();
+            let mean = sum / n as u64;
+            walls.sort_unstable();
+            let median = if n % 2 == 1 {
+                walls[n / 2]
+            } else {
+                (walls[n / 2 - 1] + walls[n / 2]) / 2
+            };
+            Some((n, mean, median))
+        };
+        let mut parts: Vec<String> = Vec::new();
+        for kind in ["ngram", "mtp", "ar"] {
+            if let Some((n, mean, median)) = summarize(kind) {
+                parts.push(format!("{kind}:n={n} mean={mean} median={median}"));
+            }
+        }
+        if parts.is_empty() {
+            None
+        } else {
+            Some(parts.join(" "))
+        }
+    } else {
+        None
+    };
+    attach_mtp_window_timings(&mut pending_done, host_timing, mtp_window_timings);
     stage_terminal_tool_calls(&mut pending_done, finish_reason, wire_tool_calls);
     let decision = await_client_terminal_commit(stdout, id, &pending_done);
     if decision != ClientTerminalDecision::Commit {
@@ -14122,6 +14400,9 @@ fn generate_qwen35_mtp(
     eprintln!(
         "[req {id}] drafter={drafter} tau={tau:.2} tok/s={decode_tok_s:.1} decode ({generated} tok, {cycles} windows) mtp_ngram={mtp_ngram} ngram_mod_windows={ngram_mod_windows} ngram_mod_drafts={ngram_mod_drafts} ngram_mod_accepted={ngram_mod_accepted} ngram_mod_accept_rate={ngram_mod_accept_rate:.3} mtp_windows={mtp_windows} ar_windows={ar_windows} mtp_retired={mtp_retired}"
     );
+    if let Some(summary) = host_timing_summary {
+        eprintln!("[req {id}] mtp_window_timings wall_us {summary}");
+    }
 }
 
 /// Multi-GPU pipeline-parallel AR decode (Stage 7 of #58). Mirrors the pp=1

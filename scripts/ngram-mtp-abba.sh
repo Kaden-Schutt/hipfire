@@ -10,7 +10,7 @@
 # Optional env:
 #   DEVICE OUT_ROOT LABEL ORDER A_NGRAM B_NGRAM WARMUP ALLOW_NO_GPU_GUARD RESUME
 #   KERNEL_CACHE KV SAMPLING THINKING MAX_TOKENS MAX_SEQ MTP_NGRAM_MATCH MTP_NGRAM_MIN
-#   MTP_NGRAM_MAX PORT SERVE_WARM_TIMEOUT_SECS MODE
+#   MTP_NGRAM_MAX PORT SERVE_WARM_TIMEOUT_SECS MODE HOST_TIMING
 set -uo pipefail
 
 usage() {
@@ -53,6 +53,7 @@ Optional environment (defaults):
   PORT                    11520
   SERVE_WARM_TIMEOUT_SECS 180
   MODE                    battery
+  HOST_TIMING             0    (1 = seal HIPFIRE_HOST_TIMING=1 into arm env for per-window MTP host/API timings)
 
 Output layout under $OUT_ROOT/$LABEL/:
   contract.txt, identity.txt, git-status.txt, git-diff.txt, ledger.jsonl,
@@ -123,6 +124,7 @@ MTP_NGRAM_MAX=${MTP_NGRAM_MAX:-64}
 PORT=${PORT:-11520}
 SERVE_WARM_TIMEOUT_SECS=${SERVE_WARM_TIMEOUT_SECS:-180}
 MODE=${MODE:-battery}
+HOST_TIMING=${HOST_TIMING:-0}
 ALLOW_NO_GPU_GUARD=${ALLOW_NO_GPU_GUARD:-}
 KERNEL_CACHE=${KERNEL_CACHE:-"$REPO/.hipfire_kernels"}
 
@@ -155,6 +157,7 @@ case "$A_NGRAM" in on|off) ;; *) die "A_NGRAM must be on|off, got: $A_NGRAM" ;; 
 case "$B_NGRAM" in on|off) ;; *) die "B_NGRAM must be on|off, got: $B_NGRAM" ;; esac
 case "$WARMUP" in 0|1) ;; *) die "WARMUP must be 0|1, got: $WARMUP" ;; esac
 case "$RESUME" in 0|1) ;; *) die "RESUME must be 0|1, got: $RESUME" ;; esac
+case "$HOST_TIMING" in 0|1) ;; *) die "HOST_TIMING must be 0|1, got: $HOST_TIMING" ;; esac
 
 # ORDER must be one or more exact A B B A blocks (length multiple of 4).
 read -r -a ORDER_ARMS <<< "$ORDER"
@@ -230,6 +233,7 @@ write_contract_to() {
     printf 'PORT=%s\n' "$PORT"
     printf 'SERVE_WARM_TIMEOUT_SECS=%s\n' "$SERVE_WARM_TIMEOUT_SECS"
     printf 'WARMUP=%s\n' "$WARMUP"
+    printf 'HOST_TIMING=%s\n' "$HOST_TIMING"
     printf 'A_NGRAM=%s\n' "$A_NGRAM"
     printf 'B_NGRAM=%s\n' "$B_NGRAM"
     printf 'A_DAEMON=%s\n' "$A_DAEMON"
@@ -305,7 +309,7 @@ cat >"$REPORT_VALIDATE_PY" <<'PY'
 """Shared ABBA report measurement contract validator.
 
 CLI:
-  python3 report_validate.py <report.json> <expected_ngram on|off> [diag_out]
+  python3 report_validate.py <report.json> <expected_ngram on|off> <host_timing 0|1> [diag_out]
 Exit 0 iff VALID.
 
 Import:
@@ -318,6 +322,21 @@ import math
 import sys
 from pathlib import Path
 from typing import Any, List, Optional, Tuple
+
+TIMING_KINDS = frozenset({"ngram", "mtp", "ar"})
+TIMING_US_FIELDS = (
+    "wall_us",
+    "draft_lookup_us",
+    "launch_us",
+    "h2d_us",
+    "d2h_us",
+    "d2d_us",
+    "memset_us",
+    "stream_sync_us",
+    "event_sync_us",
+    "device_sync_us",
+    "graph_launch_us",
+)
 
 
 def is_finite_number(v: Any) -> bool:
@@ -332,6 +351,10 @@ def is_int_like(v: Any) -> bool:
     if isinstance(v, float):
         return math.isfinite(v) and v == int(v)
     return False
+
+
+def is_nonneg_int(v: Any) -> bool:
+    return isinstance(v, int) and not isinstance(v, bool) and v >= 0
 
 
 def load_first(report_path: Path) -> Tuple[Optional[dict], List[str]]:
@@ -356,8 +379,80 @@ def load_first(report_path: Path) -> Tuple[Optional[dict], List[str]]:
     return first, errors
 
 
-def validate_first(first: Any, expected_ngram: str) -> Tuple[bool, List[str]]:
-    """Validate first report object against assigned ngram route ('on'|'off')."""
+def validate_mtp_window_timings(first: dict) -> List[str]:
+    """HOST_TIMING=1 contract for mtp_window_timings records."""
+    errors: List[str] = []
+    cycles = first.get("cycles", None)
+    if not (isinstance(cycles, int) and not isinstance(cycles, bool) and cycles >= 1):
+        errors.append(f"cycles must be integer >= 1 when host_timing=1, got {cycles!r}")
+        cycles_n: Optional[int] = None
+    else:
+        cycles_n = cycles
+
+    timings = first.get("mtp_window_timings", None)
+    if not isinstance(timings, list) or len(timings) == 0:
+        errors.append(
+            f"mtp_window_timings must be a non-empty list when host_timing=1, got {type(timings).__name__ if timings is not None else None}"
+        )
+        return errors
+
+    if cycles_n is not None and len(timings) != cycles_n:
+        errors.append(
+            f"mtp_window_timings length must equal cycles ({cycles_n}), got {len(timings)}"
+        )
+
+    kind_counts = {"ngram": 0, "mtp": 0, "ar": 0}
+    for i, rec in enumerate(timings):
+        if not isinstance(rec, dict):
+            errors.append(f"mtp_window_timings[{i}] must be an object, got {type(rec).__name__}")
+            continue
+        kind = rec.get("kind", None)
+        if kind not in TIMING_KINDS:
+            errors.append(
+                f"mtp_window_timings[{i}].kind must be exactly ngram|mtp|ar, got {kind!r}"
+            )
+        else:
+            kind_counts[str(kind)] += 1
+        for field in TIMING_US_FIELDS:
+            v = rec.get(field, None)
+            if not is_nonneg_int(v):
+                errors.append(
+                    f"mtp_window_timings[{i}].{field} must be integer >= 0 (bool rejected), got {v!r}"
+                )
+
+    for key in ("ngram_mod_windows", "mtp_windows", "ar_windows"):
+        raw = first.get(key, None)
+        if not is_nonneg_int(raw):
+            errors.append(
+                f"{key} must be integer >= 0 when host_timing=1 (for kind counts), got {raw!r}"
+            )
+
+    ngram_w = first.get("ngram_mod_windows", None)
+    mtp_w = first.get("mtp_windows", None)
+    ar_w = first.get("ar_windows", None)
+    if is_nonneg_int(ngram_w) and kind_counts["ngram"] != int(ngram_w):
+        errors.append(
+            f"mtp_window_timings kind=ngram count {kind_counts['ngram']} != ngram_mod_windows {int(ngram_w)}"
+        )
+    if is_nonneg_int(mtp_w) and kind_counts["mtp"] != int(mtp_w):
+        errors.append(
+            f"mtp_window_timings kind=mtp count {kind_counts['mtp']} != mtp_windows {int(mtp_w)}"
+        )
+    if is_nonneg_int(ar_w) and kind_counts["ar"] != int(ar_w):
+        errors.append(
+            f"mtp_window_timings kind=ar count {kind_counts['ar']} != ar_windows {int(ar_w)}"
+        )
+
+    return errors
+
+
+def validate_first(
+    first: Any, expected_ngram: str, host_timing: int = 0
+) -> Tuple[bool, List[str]]:
+    """Validate first report object against assigned ngram route ('on'|'off').
+
+    When host_timing=1, also require ordered mtp_window_timings telemetry.
+    """
     errors: List[str] = []
     want_ngram = expected_ngram == "on"
     if not isinstance(first, dict):
@@ -406,22 +501,59 @@ def validate_first(first: Any, expected_ngram: str) -> Tuple[bool, List[str]]:
         if not is_finite_number(rate) or not (0.0 <= float(rate) <= 1.0):
             errors.append(f"ngram_mod_accept_rate must be numeric finite in [0,1], got {rate!r}")
 
+    if host_timing == 1:
+        errors.extend(validate_mtp_window_timings(first))
+
     # Runaway / finish=length remains valid for this fixture (do not reject).
     return (not errors), errors
 
 
-def validate_report_file(report_path: Path, expected_ngram: str) -> Tuple[bool, List[str], Optional[dict]]:
+def validate_report_file(
+    report_path: Path, expected_ngram: str, host_timing: int = 0
+) -> Tuple[bool, List[str], Optional[dict]]:
     first, load_errs = load_first(report_path)
     if load_errs:
         return False, load_errs, None
-    ok, errs = validate_first(first, expected_ngram)
+    ok, errs = validate_first(first, expected_ngram, host_timing=host_timing)
     return ok, errs, first
 
 
-def format_diag(ok: bool, expected_ngram: str, errs: List[str], first: Optional[dict]) -> str:
+def _timing_diag_lines(first: Optional[dict], host_timing: int) -> List[str]:
+    lines = [f"host_timing={host_timing}"]
+    if host_timing != 1 or not isinstance(first, dict):
+        return lines
+    timings = first.get("mtp_window_timings", None)
+    if isinstance(timings, list):
+        lines.append(f"mtp_window_timings_len={len(timings)}")
+        kind_counts = {"ngram": 0, "mtp": 0, "ar": 0}
+        for rec in timings:
+            if isinstance(rec, dict):
+                k = rec.get("kind")
+                if k in kind_counts:
+                    kind_counts[str(k)] += 1
+        lines.append(f"kind_ngram={kind_counts['ngram']}")
+        lines.append(f"kind_mtp={kind_counts['mtp']}")
+        lines.append(f"kind_ar={kind_counts['ar']}")
+    else:
+        lines.append(f"mtp_window_timings_len=missing")
+    lines.append(f"cycles={first.get('cycles')}")
+    lines.append(f"ngram_mod_windows={first.get('ngram_mod_windows')}")
+    lines.append(f"mtp_windows={first.get('mtp_windows')}")
+    lines.append(f"ar_windows={first.get('ar_windows')}")
+    return lines
+
+
+def format_diag(
+    ok: bool,
+    expected_ngram: str,
+    errs: List[str],
+    first: Optional[dict],
+    host_timing: int = 0,
+) -> str:
     lines: List[str] = []
     if not ok:
         lines.append("VALID=0")
+        lines.extend(_timing_diag_lines(first, host_timing))
         for e in errs:
             lines.append(f"error: {e}")
         return "\n".join(lines) + "\n"
@@ -429,6 +561,7 @@ def format_diag(ok: bool, expected_ngram: str, errs: List[str], first: Optional[
     want_ngram = expected_ngram == "on"
     lines.append("VALID=1")
     lines.append(f"expected_ngram={expected_ngram}")
+    lines.extend(_timing_diag_lines(first, host_timing))
     lines.append(f"assistant_content_len={len(first.get('assistant_content', ''))}")
     lines.append(f"decode_tok_s={first.get('decode_tok_s')}")
     lines.append(f"tau={first.get('tau')}")
@@ -443,15 +576,31 @@ def format_diag(ok: bool, expected_ngram: str, errs: List[str], first: Optional[
     return "\n".join(lines) + "\n"
 
 
+def _parse_host_timing(raw: str) -> int:
+    if raw == "1":
+        return 1
+    if raw == "0":
+        return 0
+    raise ValueError(f"host_timing must be 0|1, got {raw!r}")
+
+
 def main(argv: List[str]) -> int:
-    if len(argv) < 3:
-        print("usage: report_validate.py <report.json> <on|off> [diag_out]", file=sys.stderr)
+    if len(argv) < 4:
+        print(
+            "usage: report_validate.py <report.json> <on|off> <host_timing 0|1> [diag_out]",
+            file=sys.stderr,
+        )
         return 2
     report_path = Path(argv[1])
     expected = argv[2]
-    diag_out = Path(argv[3]) if len(argv) > 3 else None
-    ok, errs, first = validate_report_file(report_path, expected)
-    text = format_diag(ok, expected, errs, first)
+    try:
+        host_timing = _parse_host_timing(argv[3])
+    except ValueError as e:
+        print(str(e), file=sys.stderr)
+        return 2
+    diag_out = Path(argv[4]) if len(argv) > 4 else None
+    ok, errs, first = validate_report_file(report_path, expected, host_timing=host_timing)
+    text = format_diag(ok, expected, errs, first, host_timing=host_timing)
     if diag_out is not None:
         diag_out.write_text(text, encoding="utf-8")
     else:
@@ -482,12 +631,13 @@ ngram_for_arm() {
 
 # Shared report validator wrapper around $REPORT_VALIDATE_PY.
 # Usage: validate_report <report.json> <expected_ngram on|off> [diag_out]
+# Threads campaign HOST_TIMING (0|1) into the Python validator.
 validate_report() {
   local report=$1 expected_ngram=$2 diag_out=${3:-}
   if [[ -n "$diag_out" ]]; then
-    python3 "$REPORT_VALIDATE_PY" "$report" "$expected_ngram" "$diag_out"
+    python3 "$REPORT_VALIDATE_PY" "$report" "$expected_ngram" "$HOST_TIMING" "$diag_out"
   else
-    python3 "$REPORT_VALIDATE_PY" "$report" "$expected_ngram" >/dev/null
+    python3 "$REPORT_VALIDATE_PY" "$report" "$expected_ngram" "$HOST_TIMING" >/dev/null
   fi
 }
 
@@ -653,6 +803,9 @@ run_arm() {
       printf 'HIPFIRE_DAEMON_BIN=%s\n' "$daemon"
       printf 'HIPFIRE_CLI_BIN=%s\n' "$CLI_BIN"
       printf 'HIPFIRE_KERNEL_CACHE=%s\n' "$KERNEL_CACHE"
+      if [[ "$HOST_TIMING" == "1" ]]; then
+        printf 'HIPFIRE_HOST_TIMING=1\n'
+      fi
       printf 'cwd=%s\n' "$REPO"
       printf 'kind=%s run_index=%s mtp_ngram=%s\n' "$kind" "$run_index" "$ngram"
       printf 'argv:'
@@ -681,6 +834,9 @@ run_arm() {
   )
   if [[ -n "${LD_LIBRARY_PATH:-}" ]]; then
     sealed_env+=("LD_LIBRARY_PATH=$LD_LIBRARY_PATH")
+  fi
+  if [[ "$HOST_TIMING" == "1" ]]; then
+    sealed_env+=("HIPFIRE_HOST_TIMING=1")
   fi
   (
     cd "$REPO" || exit 90
@@ -871,7 +1027,7 @@ A_NGRAM_EXP=$A_NGRAM
 B_NGRAM_EXP=$B_NGRAM
 
 # --- output parity (assistant_content only across successful validated recorded reports) ---
-python3 - "$CAMPAIGN" "$ORDER_STR" "$A_NGRAM_EXP" "$B_NGRAM_EXP" <<'PY' >"$CAMPAIGN/output-parity.txt"
+python3 - "$CAMPAIGN" "$ORDER_STR" "$A_NGRAM_EXP" "$B_NGRAM_EXP" "$HOST_TIMING" <<'PY' >"$CAMPAIGN/output-parity.txt"
 import hashlib, sys
 from pathlib import Path
 
@@ -882,6 +1038,7 @@ from report_validate import validate_report_file  # noqa: E402
 order = sys.argv[2].split()
 a_ngram = sys.argv[3]
 b_ngram = sys.argv[4]
+host_timing = 1 if sys.argv[5] == "1" else 0
 
 def expected_ngram(arm: str) -> str:
     return a_ngram if arm == "A" else b_ngram
@@ -899,7 +1056,7 @@ for idx, arm in enumerate(order, start=1):
     if rc != 0 or not report.is_file():
         contents.append((name, rc, False, None, "arm_failed_or_missing_report"))
         continue
-    ok, errs, first = validate_report_file(report, ngram)
+    ok, errs, first = validate_report_file(report, ngram, host_timing=host_timing)
     if not ok or first is None:
         contents.append((name, rc, False, None, "; ".join(errs) if errs else "invalid_report"))
         continue
@@ -943,7 +1100,7 @@ sys.exit(0)
 PY
 
 # --- summary ---
-python3 - "$CAMPAIGN" "$ORDER_STR" "$A_NGRAM_EXP" "$B_NGRAM_EXP" "$WARMUP_FAILED" <<'PY' >"$CAMPAIGN/summary.txt"
+python3 - "$CAMPAIGN" "$ORDER_STR" "$A_NGRAM_EXP" "$B_NGRAM_EXP" "$WARMUP_FAILED" "$HOST_TIMING" <<'PY' >"$CAMPAIGN/summary.txt"
 import json, sys
 from collections import Counter
 from pathlib import Path
@@ -956,6 +1113,7 @@ order = sys.argv[2].split()
 a_ngram = sys.argv[3]
 b_ngram = sys.argv[4]
 warmup_failed_flag = sys.argv[5] == "1"
+host_timing = 1 if sys.argv[6] == "1" else 0
 
 def expected_ngram(arm: str) -> str:
     return a_ngram if arm == "A" else b_ngram
@@ -1003,7 +1161,7 @@ for idx, arm in enumerate(order, start=1):
         if "VALID=1" not in val_txt.splitlines():
             any_report_invalid = True
     if report.is_file():
-        ok, errs, first = validate_report_file(report, ngram)
+        ok, errs, first = validate_report_file(report, ngram, host_timing=host_timing)
         if ok and first is not None:
             report_ok = True
             decode = first.get("decode_tok_s", "n/a")
@@ -1104,7 +1262,7 @@ for idx, arm in enumerate(order, start=1):
         print(f"ledger_parse_error index={idx} {row.get('parse_error')}")
         continue
     metrics = row.get("metrics")
-    ok, errs = validate_first(metrics, expected_ngram(arm))
+    ok, errs = validate_first(metrics, expected_ngram(arm), host_timing=host_timing)
     if not ok:
         ledger_ok = False
         print(f"ledger_metrics_invalid index={idx} errs={','.join(errs)}")
