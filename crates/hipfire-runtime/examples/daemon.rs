@@ -3939,7 +3939,9 @@ fn is_qwen_ep_batch_request_eligible(
     .any(|k| msg.get(*k).is_some());
     let route_inputs = GenerationRouteInputs {
         arch_id: m.arch_id,
-        ep: true,
+        // Topology already proven/staged above; ep:true would hit the global EP
+        // short-circuit to Unknown for Qwen and make this QwenAr gate unreachable.
+        ep: false,
         pp: m.pp,
         has_speculator: m.speculator.is_some(),
         qwen_mtp_head: m.qwen35_mtp_head.is_some(),
@@ -37708,6 +37710,25 @@ mod generation_route_matrix_tests {
             ..base()
         };
         assert_eq!(select_generation_route(&i), GenerationRoute::Unknown);
+    }
+
+    #[test]
+    fn qwen_ep_batch_semantic_route_clears_ep_for_qwen_ar() {
+        // Global selector: arch 6 + EP topology → Unknown (EP short-circuit).
+        let with_ep = GenerationRouteInputs {
+            arch_id: 6,
+            ep: true,
+            ..base()
+        };
+        assert_eq!(select_generation_route(&with_ep), GenerationRoute::Unknown);
+        // Batch eligibility clears EP after independent topology gates so the
+        // non-spec Qwen AR ladder remains reachable (exact callsite invariant).
+        let cleared = GenerationRouteInputs {
+            arch_id: 6,
+            ep: false,
+            ..base()
+        };
+        assert_eq!(select_generation_route(&cleared), GenerationRoute::QwenAr);
     }
 
     #[test]
