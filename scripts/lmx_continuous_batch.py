@@ -596,7 +596,7 @@ def build_parser() -> argparse.ArgumentParser:
     # Required
     p.add_argument("--model", required=True, help="Model file path to serve (passed to hipfire serve --model)")
     p.add_argument("--prompt-file", required=True, help="UTF-8 prompt file; byte-identical content sent for every request")
-    p.add_argument("--batch-size", required=True, type=int, dest="batch_size", help="Continuous batch size B (1..64); maps to hipfire serve --continuous-batch-size")
+    p.add_argument("--batch-size", required=True, type=int, dest="batch_size", help="Continuous batch size B (1..128); maps to hipfire serve --continuous-batch-size")
     p.add_argument("--requests", required=True, type=int, help="Concurrent requests per run R (1..128)")
     p.add_argument("--runs", required=True, type=int, help="Number of measured runs (must be >=3)")
     p.add_argument("--max-tokens", required=True, type=int, dest="max_tokens", help="max_tokens per request")
@@ -622,9 +622,9 @@ def parse_args(argv=None) -> argparse.Namespace:
     if args.runs < 3:
         parser.error("--runs must be >=3")
 
-    # Validate batch-size 1..64
-    if not (1 <= args.batch_size <= 64):
-        parser.error("--batch-size must be between 1 and 64")
+    # Validate batch-size 1..128
+    if not (1 <= args.batch_size <= 128):
+        parser.error("--batch-size must be between 1 and 128")
 
     # Validate requests 1..128
     if not (1 <= args.requests <= 128):

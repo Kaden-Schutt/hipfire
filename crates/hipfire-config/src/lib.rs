@@ -951,7 +951,7 @@ pub static FIELDS: &[ConfigField] = &[
         Serve,
         Process,
         DefaultValue::Integer(1),
-        ValueRule::Integer { min: 1, max: 64 },
+        ValueRule::Integer { min: 1, max: 128 },
         false,
         false,
         Some("HIPFIRE_CONTINUOUS_BATCH_SIZE"),

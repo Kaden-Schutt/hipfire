@@ -549,7 +549,7 @@ struct ServeArgs {
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..=64))]
     tp: Option<u64>,
     /// Maximum concurrent eligible batched lanes; 1 preserves sequential behavior.
-    #[arg(long, value_parser = clap::value_parser!(u64).range(1..=64))]
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..=128))]
     continuous_batch_size: Option<u64>,
     /// Internal marker used by the detached child.
     #[arg(long, hide = true)]
@@ -3040,8 +3040,8 @@ fn serve_foreground(
     let continuous_batch_size = args
         .continuous_batch_size
         .unwrap_or(config_u64(&global, "serve.continuous_batch_size")?);
-    if continuous_batch_size == 0 || continuous_batch_size > 64 {
-        bail!("--continuous-batch-size must be between 1 and 64");
+    if continuous_batch_size == 0 || continuous_batch_size > 128 {
+        bail!("--continuous-batch-size must be between 1 and 128");
     }
     let retry_enabled = config_bool(&global, "serve.retry_enabled")?;
     let retry_backoff = Duration::from_millis(config_u64(&global, "serve.retry_backoff_ms")?);
