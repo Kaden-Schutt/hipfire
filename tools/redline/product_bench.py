@@ -83,6 +83,36 @@ CERTIFIED_PM4_POLICY = {
 }
 
 
+def pm4_policy_with_overrides(overrides):
+    """Apply explicit, reportable experiment overrides to certified PM4 policy."""
+    policy = dict(CERTIFIED_PM4_POLICY)
+    forbidden = {
+        "HIPFIRE_REPLAY_BACKEND",
+        "HIPFIRE_REPLAY_MANUAL_CAPTURE",
+        "HIPFIRE_REPLAY_TRANSPORT",
+    }
+    for item in overrides:
+        key, separator, value = item.partition("=")
+        if (
+            not separator
+            or not key.startswith("HIPFIRE_REPLAY_PM4_")
+            or key in forbidden
+            or not value
+        ):
+            raise ValueError(
+                "--pm4-policy-override expects "
+                "HIPFIRE_REPLAY_PM4_<NAME>=<VALUE>; backend, transport, and "
+                "manual-capture controls are not policy overrides"
+            )
+        policy[key] = value
+    return policy
+
+
+def pm4_policy_for(args):
+    """Resolve a parsed candidate policy, retaining library-call compatibility."""
+    return getattr(args, "pm4_policy", CERTIFIED_PM4_POLICY)
+
+
 def backend_config_value(backend):
     """Map report-arm vocabulary to the typed replay config vocabulary."""
     return "redline" if backend == "auto" else backend
@@ -571,6 +601,7 @@ class Daemon:
         timeout: float,
         kv_mode: str,
         dpm_warmup_secs: float,
+        pm4_policy,
     ):
         self.timeout = timeout
         log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -590,7 +621,7 @@ class Daemon:
             HIPFIRE_GRAPH="1",
             HIPFIRE_DPM_WARMUP_SECS=str(dpm_warmup_secs),
         )
-        env.update(CERTIFIED_PM4_POLICY)
+        env.update(pm4_policy)
         env.pop("HIPFIRE_REPLAY_MANUAL_CAPTURE", None)
         self.proc = subprocess.Popen(
             [str(binary)],
@@ -641,6 +672,7 @@ def run_pm4_preflight(args):
         args.timeout,
         args.kv_mode,
         0.0,
+        pm4_policy_for(args),
     )
     started = time.monotonic()
     try:
@@ -652,6 +684,7 @@ def run_pm4_preflight(args):
                     "max_seq": args.max_seq,
                     "kv_mode": args.kv_mode,
                     "dflash_mode": "off",
+                    "dspark_mode": "off",
                 },
             }
         )
@@ -1150,7 +1183,7 @@ def run_coherence_smoke(args, backend):
     ]
 
     env = dict(os.environ)
-    env.update(CERTIFIED_PM4_POLICY)
+    env.update(pm4_policy_for(args))
     env.update(
         HIPFIRE_CLI_BIN=str(cli),
         HIPFIRE_DAEMON_BIN=str(unique_daemon),
@@ -1439,7 +1472,7 @@ def run_pm4_multiturn_session(args):
     ]
 
     env = dict(os.environ)
-    env.update(CERTIFIED_PM4_POLICY)
+    env.update(pm4_policy_for(args))
     env.update(
         HIPFIRE_CLI_BIN=str(cli),
         HIPFIRE_DAEMON_BIN=str(unique_daemon),
@@ -1629,6 +1662,7 @@ def run_arm(args, backend):
         args.timeout,
         args.kv_mode,
         args.dpm_warmup_secs,
+        pm4_policy_for(args),
     )
     try:
         loaded = daemon.request(
@@ -1639,6 +1673,7 @@ def run_arm(args, backend):
                     "max_seq": args.max_seq,
                     "kv_mode": args.kv_mode,
                     "dflash_mode": "off",
+                    "dspark_mode": "off",
                 },
             }
         )
@@ -1848,6 +1883,17 @@ def main(argv=None):
         help="fail before loading the GPU when the model digest differs",
     )
     parser.add_argument(
+        "--pm4-policy-override",
+        action="append",
+        default=[],
+        metavar="HIPFIRE_REPLAY_PM4_NAME=VALUE",
+        help=(
+            "explicit candidate-only override layered onto the certified PM4 "
+            "policy; repeat for multiple settings and inspect pm4_policy in "
+            "the output report"
+        ),
+    )
+    parser.add_argument(
         "--pm4-multiturn-session",
         default=None,
         help=(
@@ -1856,6 +1902,10 @@ def main(argv=None):
         ),
     )
     args = parser.parse_args(argv)
+    try:
+        args.pm4_policy = pm4_policy_with_overrides(args.pm4_policy_override)
+    except ValueError as error:
+        parser.error(str(error))
 
     if args.settle_window < 3:
         parser.error("--settle-window must be at least 3")
@@ -1971,7 +2021,7 @@ def main(argv=None):
         "dpm_warmup_secs": args.dpm_warmup_secs,
         "runs": args.runs,
         "transport": args.transport,
-        "pm4_policy": dict(CERTIFIED_PM4_POLICY),
+        "pm4_policy": dict(args.pm4_policy),
         "kv_mode": args.kv_mode,
         "pm4_preflight": pm4_preflight,
         "coherence": {

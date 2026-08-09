@@ -25,6 +25,8 @@
 //!   HIPFIRE_DEEPSEEK4_WARMUP  throwaway warmup tokens before the timed run (default 24)
 //!   HIPFIRE_DEEPSEEK4_DSPARK  =0 forces MTP; else DSpark
 //!   HIPFIRE_DEEPSEEK4_BENCH_RAW=1  base completion (no chat framing)
+//!   HIPFIRE_DEEPSEEK4_BENCH_EXPERTS_PER_TOK=N
+//!                              benchmark-only routed-expert override
 
 use hipfire_arch_deepseek4::dspark_speculator::build_deepseek4_dspark_speculator;
 use hipfire_arch_deepseek4::mtp_speculator::build_deepseek4_mtp_speculator;
@@ -149,10 +151,31 @@ fn main() -> Result<(), String> {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
+    let bench_experts_per_tok = std::env::var("HIPFIRE_DEEPSEEK4_BENCH_EXPERTS_PER_TOK")
+        .ok()
+        .map(|value| {
+            value.parse::<usize>().map_err(|error| {
+                format!("invalid benchmark experts-per-token override '{value}': {error}")
+            })
+        })
+        .transpose()?;
 
     eprintln!("Loading DeepSeek V4 trunk from {path}...");
     let mut hfq = HfqFile::open(Path::new(&path)).map_err(|e| format!("open: {e:?}"))?;
-    let cfg = DeepseekV4::config_from_hfq(&hfq)?;
+    let mut cfg = DeepseekV4::config_from_hfq(&hfq)?;
+    if let Some(experts_per_tok) = bench_experts_per_tok {
+        if experts_per_tok == 0 || experts_per_tok > cfg.num_experts_per_tok {
+            return Err(format!(
+                "benchmark experts-per-token override must be in 1..={}, got {experts_per_tok}",
+                cfg.num_experts_per_tok
+            ));
+        }
+        eprintln!(
+            "[benchmark override: num_experts_per_tok {} -> {}]",
+            cfg.num_experts_per_tok, experts_per_tok
+        );
+        cfg.num_experts_per_tok = experts_per_tok;
+    }
     let tokenizer = Tokenizer::from_hfq_metadata(&hfq.metadata_json)
         .map_err(|e| format!("tokenizer not found in HFQ metadata: {e:?}"))?;
 
@@ -239,11 +262,11 @@ fn main() -> Result<(), String> {
     // trunk one token at a time (1 forward/token), the apples-to-apples
     // denominator for the MTP / DSpark tok/s wins. Same prompt, same warmup.
     if std::env::var("HIPFIRE_DEEPSEEK4_AR").ok().as_deref() == Some("1") {
-        let pbs = forward::PrefillBatchScratch::new(&mut gpu, &bundle.config, 256)?;
+        let mut pbs = forward::PrefillBatchScratch::new(&mut gpu, &bundle.config, 256)?;
         // Greedy AR decode from a fresh prefill; returns the generated tokens.
-        let run = |bundle: &mut Deepseek4Bundle,
-                   gpu: &mut Gpu,
-                   n_max: usize|
+        let mut run = |bundle: &mut Deepseek4Bundle,
+                       gpu: &mut Gpu,
+                       n_max: usize|
          -> Result<Vec<u32>, String> {
             bundle.state.reset();
             bundle.state.zero_decode_caches(gpu);
@@ -255,7 +278,7 @@ fn main() -> Result<(), String> {
                 gpu,
                 &prompt_tokens,
                 0,
-                &pbs,
+                &mut pbs,
             )?;
             let mut tok = logits_argmax(&last) as u32;
             let mut pos = prompt_tokens.len();
@@ -271,7 +294,7 @@ fn main() -> Result<(), String> {
                     gpu,
                     &[tok],
                     pos as u32,
-                    &pbs,
+                    &mut pbs,
                 )?;
                 tok = logits_argmax(&lg) as u32;
                 pos += 1;

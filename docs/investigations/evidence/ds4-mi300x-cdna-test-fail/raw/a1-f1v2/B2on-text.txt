@@ -1,0 +1,23 @@
+## Measurement Contract: DeepSeek V4 Flash on AMD MI300X (gfx942) – Technical Specification
+
+This document establishes the exact measurement contract for a production-grade benchmark of a single-batch, greedy-decoding inference run on a DeepSeek V4 Flash-style Mixture-of-Experts (MoE) model running on an AMD Instinct MI300X (gfx942) GPU. The measurement is for a specific, frozen configuration with no speculation, no approximations, and no shortcuts. This is a technical specification for a benchmark fixture, not a marketing document.
+
+### 1. The Core Measurement: The "Golden" Fixture
+
+The benchmark is defined by a single, immutable "golden" fixture. This fixture is a single text prompt, exactly 2048 tokens long, tokenized by the **exact same tokenizer instance** that the inference engine will use at runtime. The prompt is a deterministic, non-degenerate sequence of text (e.g., a technical document, not random words or repeated phrases). The fixture is stored as:
+
+- **A file containing the raw bytes of the text** (e.g., `prom.txt`). This file must have no trailing newline.
+- **A file containing the token IDs** as a contiguous sequence of little-endian 32-bit unsigned integers (e.g., `prom.tokens`). This is produced by the `tokenize_slice` function of the runtime tokenizer.
+- **A cryptographic hash (MD5 and SHA-256) of the raw bytes file.** This is a ledger field, not optional.
+
+The generation request is:
+- **Prompt Length:** Exactly 2048 tokens.
+- **Generated Length:** Exactly 510 tokens.
+- **Sampling:** Greedy (temperature=0, no top-p/k, no sampling).
+- **KV Cache Mode:** Q8 (quantized to 8-bit).
+- **Speculation:** Disabled (no draft model, no tree verification, no MTP, no dspark, no dflash). The `HIPFIRE_SPECULATION=off` environment variable is set.
+- **Batch Size:** 1 (single user, no batching).
+
+### 2. The "Why" of the Prompt Fixture
+
+The prompt fixture is the single most critical element for reproducibility. The text must be a real, non-tr piece of text. The reason is that the behavior of the MoE router is highly dependent on the input. A degenerate prompt (e.g

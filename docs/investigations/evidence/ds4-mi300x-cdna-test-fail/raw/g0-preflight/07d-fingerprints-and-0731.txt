@@ -1,0 +1,625 @@
+=== MAJOR WEIGHT FINGERPRINTS ===
+---- /mnt/scratch/models/deepseek-v4-flash-mq2r/deepseek-v4-flash.mq2r ----
+SIZE=82191362222 MTIME=2026-07-24 22:20:40.157517809 +0000
+HEAD64:
+00000000: 4846 514d 0100 0000 0900 0000 af85 0000  HFQM............
+00000010: 2000 0000 0000 0000 00d0 8b00 0000 0000   ...............
+00000020: 7b22 6172 6368 6974 6563 7475 7265 223a  {"architecture":
+00000030: 2264 6565 7073 6565 6b5f 7634 222c 2263  "deepseek_v4","c
+HEAD4096_SHA256=04607e941e54cbca13af6f3f1e6c027489254c1f5656e70b03b3f6e741b0a655  -
+TAIL4096_SHA256=32f00859364d4f7aa46efa5c57a5a34d7f790d5c986fd495fbba1f3a3b9d1cbc  -
+HEAD8_ASCII=  48  46  51  4d  01  00  00  00
+   H   F   Q   M 001  \0  \0  \0
+
+---- /mnt/scratch/models/existing-deepseek-v4-flash/deepseek-v4-flash.mq2lloyd ----
+SIZE=86184307283 MTIME=2026-05-27 03:11:10.098000731 +0000
+HEAD64:
+00000000: 4846 514d 0100 0000 0900 0000 af85 0000  HFQM............
+00000010: 2000 0000 0000 0000 a5c5 8b00 0000 0000   ...............
+00000020: 7b22 6172 6368 6974 6563 7475 7265 223a  {"architecture":
+00000030: 2264 6565 7073 6565 6b5f 7634 222c 2263  "deepseek_v4","c
+HEAD4096_SHA256=70212da2e13587609981fb7ae1f294940bc4ccee27eeced5d89245d0fcbcf9c3  -
+TAIL4096_SHA256=32f00859364d4f7aa46efa5c57a5a34d7f790d5c986fd495fbba1f3a3b9d1cbc  -
+HEAD8_ASCII=  48  46  51  4d  01  00  00  00
+   H   F   Q   M 001  \0  \0  \0
+
+---- /mnt/scratch/models/existing-deepseek-v4-flash/deepseek-v4-flash-mtp.mq2lloyd ----
+SIZE=1998047355 MTIME=2026-05-27 03:03:15.078827775 +0000
+HEAD64:
+00000000: 4846 514d 0100 0000 0900 0000 1d03 0000  HFQM............
+00000010: 2000 0000 0000 0000 8519 6e00 0000 0000   .........n.....
+00000020: 7b22 6172 6368 6974 6563 7475 7265 223a  {"architecture":
+00000030: 2264 6565 7073 6565 6b5f 7634 222c 2263  "deepseek_v4","c
+HEAD4096_SHA256=0ccd64e27265b97b431d1ca2565ca06f911ca71c886b73366165a23ba2dd878e  -
+TAIL4096_SHA256=2f5acead90c602ad4b249c1240b69ceb99e81b048c3eb828e7dff8ac83160c18  -
+HEAD8_ASCII=  48  46  51  4d  01  00  00  00
+   H   F   Q   M 001  \0  \0  \0
+
+---- /root/.hipfire/models/hipfire-deepseek-v4-flash/deepseek-v4-flash-mtp.mq2lloyd ----
+SIZE=24117248 MTIME=2026-08-01 08:28:58.382013971 +0000
+HEAD64:
+00000000: 4846 514d 0100 0000 0900 0000 1d03 0000  HFQM............
+00000010: 2000 0000 0000 0000 8519 6e00 0000 0000   .........n.....
+00000020: 7b22 6172 6368 6974 6563 7475 7265 223a  {"architecture":
+00000030: 2264 6565 7073 6565 6b5f 7634 222c 2263  "deepseek_v4","c
+HEAD4096_SHA256=0ccd64e27265b97b431d1ca2565ca06f911ca71c886b73366165a23ba2dd878e  -
+TAIL4096_SHA256=d37aec54845637fe7d014c42fbebced484a12d1f689fccab985b6a86f116bd25  -
+HEAD8_ASCII=  48  46  51  4d  01  00  00  00
+   H   F   Q   M 001  \0  \0  \0
+
+---- /mnt/scratch/models/qwen3.5-0.8b/qwen3.5-0.8b.mq4 ----
+SIZE=549221504 MTIME=2026-04-11 00:03:16.340546734 +0000
+HEAD64:
+00000000: 4846 514d 0100 0000 0500 0000 4001 0000  HFQM........@...
+00000010: 2000 0000 0000 0000 00e0 da00 0000 0000   ...............
+00000020: 7b22 6172 6368 6974 6563 7475 7265 223a  {"architecture":
+00000030: 2271 7765 6e33 5f35 222c 2263 6f6e 6669  "qwen3_5","confi
+HEAD4096_SHA256=ec1fea7b6d41f35643db692deeb9ae76efafb9449489884fdae0bc52a46cc755  -
+TAIL4096_SHA256=62e74940a356d928942c2bd89f410b994de371756ef34169c9c1088b33cbe586  -
+HEAD8_ASCII=  48  46  51  4d  01  00  00  00
+   H   F   Q   M 001  \0  \0  \0
+
+---- /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00001-of-00048.safetensors ----
+SIZE=1059061856 MTIME=2026-08-01 08:31:57.055757387 +0000
+HEAD64:
+00000000: 5800 0000 0000 0000 7b22 656d 6265 642e  X.......{"embed.
+00000010: 7765 6967 6874 223a 7b22 6474 7970 6522  weight":{"dtype"
+00000020: 3a22 4246 3136 222c 2273 6861 7065 223a  :"BF16","shape":
+00000030: 5b31 3239 3238 302c 3430 3936 5d2c 2264  [129280,4096],"d
+HEAD4096_SHA256=3e4db2ab44cb31366208d818d27ef3930a20e311d63955d00e3b3a940294da41  -
+TAIL4096_SHA256=50d8b21c67d331f54b3bf879aafbd7af0c9b53d00b61845c317da994d881af1c  -
+HEAD8_ASCII=  58  00  00  00  00  00  00  00
+   X  \0  \0  \0  \0  \0  \0  \0
+
+---- /mnt/scratch/models/DeepSeek-V4-Flash-0731/model.safetensors.index.json ----
+SIZE=5602871 MTIME=2026-08-01 08:32:28.192141151 +0000
+HEAD64:
+00000000: 7b0a 2020 226d 6574 6164 6174 6122 3a20  {.  "metadata": 
+00000010: 7b0a 2020 2020 2274 6f74 616c 5f73 697a  {.    "total_siz
+00000020: 6522 3a20 3136 3638 3738 3533 3634 3430  e": 166878536440
+00000030: 0a20 207d 2c0a 2020 2277 6569 6768 745f  .  },.  "weight_
+HEAD4096_SHA256=f4727f6eb9b3d3bce1af65dcc5b3765aed849c3025b6c634169951b615329ada  -
+TAIL4096_SHA256=f717263fac7d53adf45125285b8ac64f9155c4d12341ce2d9cbd9c6f32424ffc  -
+HEAD8_ASCII=  7b  0a  20  20  22  6d  65  74
+   {  \n           "   m   e   t
+
+---- /mnt/scratch/models/DeepSeek-V4-Flash-0731/config.json ----
+SIZE=1888 MTIME=2026-08-01 08:31:55.989780778 +0000
+HEAD64:
+00000000: 7b0a 2020 2261 7263 6869 7465 6374 7572  {.  "architectur
+00000010: 6573 223a 205b 0a20 2020 2022 4465 6570  es": [.    "Deep
+00000020: 7365 656b 5634 466f 7243 6175 7361 6c4c  seekV4ForCausalL
+00000030: 4d22 0a20 205d 2c0a 2020 2261 7474 656e  M".  ],.  "atten
+HEAD4096_SHA256=6c8f3d2d3b48707541b88f32f22ef3f0f8a6b57d8523281e2b8d3cdb0ae9a023  -
+TAIL4096_SHA256=6c8f3d2d3b48707541b88f32f22ef3f0f8a6b57d8523281e2b8d3cdb0ae9a023  -
+HEAD8_ASCII=  7b  0a  20  20  22  61  72  63
+   {  \n           "   a   r   c
+
+---- /mnt/scratch/models/DeepSeek-V4-Flash-0731/tokenizer_config.json ----
+SIZE=801 MTIME=2026-08-01 08:32:28.357138207 +0000
+HEAD64:
+00000000: 7b0a 2020 2261 6464 5f62 6f73 5f74 6f6b  {.  "add_bos_tok
+00000010: 656e 223a 2066 616c 7365 2c0a 2020 2261  en": false,.  "a
+00000020: 6464 5f65 6f73 5f74 6f6b 656e 223a 2066  dd_eos_token": f
+00000030: 616c 7365 2c0a 2020 2262 6f73 5f74 6f6b  alse,.  "bos_tok
+HEAD4096_SHA256=6ac8c8dc065ed118161d02dd532749ae3f52c243deac27872134fae2f50d8547  -
+TAIL4096_SHA256=6ac8c8dc065ed118161d02dd532749ae3f52c243deac27872134fae2f50d8547  -
+HEAD8_ASCII=  7b  0a  20  20  22  61  64  64
+   {  \n           "   a   d   d
+
+=== 0731 incomplete/lock presence ===
+incomplete_count=0
+lock_count=74
+nonempty_locks:
+shard_count=48
+total_shard_bytes=166886535336
+
+=== config.json ===
+{
+  "architectures": [
+    "DeepseekV4ForCausalLM"
+  ],
+  "attention_bias": false,
+  "attention_dropout": 0.0,
+  "bos_token_id": 0,
+  "eos_token_id": 1,
+  "expert_dtype": "fp4",
+  "hc_eps": 1e-06,
+  "hc_mult": 4,
+  "hc_sinkhorn_iters": 20,
+  "head_dim": 512,
+  "hidden_act": "silu",
+  "hidden_size": 4096,
+  "index_head_dim": 128,
+  "index_n_heads": 64,
+  "index_topk": 512,
+  "initializer_range": 0.02,
+  "max_position_embeddings": 1048576,
+  "model_type": "deepseek_v4",
+  "moe_intermediate_size": 2048,
+  "n_routed_experts": 256,
+  "n_shared_experts": 1,
+  "norm_topk_prob": true,
+  "num_attention_heads": 64,
+  "num_experts_per_tok": 6,
+  "num_hidden_layers": 43,
+  "num_hash_layers": 3,
+  "num_key_value_heads": 1,
+  "num_nextn_predict_layers": 1,
+  "o_groups": 8,
+  "o_lora_rank": 1024,
+  "q_lora_rank": 1024,
+  "qk_rope_head_dim": 64,
+  "quantization_config": {
+    "activation_scheme": "dynamic",
+    "fmt": "e4m3",
+    "quant_method": "fp8",
+    "scale_fmt": "ue8m0",
+    "weight_block_size": [
+      128,
+      128
+    ]
+  },
+  "rms_norm_eps": 1e-06,
+  "rope_scaling": {
+    "beta_fast": 32,
+    "beta_slow": 1,
+    "factor": 16,
+    "original_max_position_embeddings": 65536,
+    "type": "yarn"
+  },
+  "rope_theta": 10000,
+  "routed_scaling_factor": 1.5,
+  "scoring_func": "sqrtsoftplus",
+  "sliding_window": 128,
+  "swiglu_limit": 10.0,
+  "tie_word_embeddings": false,
+  "topk_method": "noaux_tc",
+  "torch_dtype": "bfloat16",
+  "transformers_version": "4.57.1",
+  "use_cache": true,
+  "vocab_size": 129280,
+  "compress_rope_theta": 160000,
+  "compress_ratios": [0, 0, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 0, 0, 0],
+  "dspark_block_size": 5,
+  "dspark_noise_token_id": 128799,
+  "dspark_target_layer_ids": [40, 41, 42],
+  "dspark_markov_rank": 256
+}
+
+=== index metadata via python ===
+keys ['metadata', 'weight_map']
+metadata {'total_size': 166878536440}
+num_tensors 72317
+num_shards 48
+SHARD model-00001-of-00048.safetensors
+SHARD model-00002-of-00048.safetensors
+SHARD model-00003-of-00048.safetensors
+SHARD model-00004-of-00048.safetensors
+SHARD model-00005-of-00048.safetensors
+SHARD model-00006-of-00048.safetensors
+SHARD model-00007-of-00048.safetensors
+SHARD model-00008-of-00048.safetensors
+SHARD model-00009-of-00048.safetensors
+SHARD model-00010-of-00048.safetensors
+SHARD model-00011-of-00048.safetensors
+SHARD model-00012-of-00048.safetensors
+SHARD model-00013-of-00048.safetensors
+SHARD model-00014-of-00048.safetensors
+SHARD model-00015-of-00048.safetensors
+SHARD model-00016-of-00048.safetensors
+SHARD model-00017-of-00048.safetensors
+SHARD model-00018-of-00048.safetensors
+SHARD model-00019-of-00048.safetensors
+SHARD model-00020-of-00048.safetensors
+SHARD model-00021-of-00048.safetensors
+SHARD model-00022-of-00048.safetensors
+SHARD model-00023-of-00048.safetensors
+SHARD model-00024-of-00048.safetensors
+SHARD model-00025-of-00048.safetensors
+SHARD model-00026-of-00048.safetensors
+SHARD model-00027-of-00048.safetensors
+SHARD model-00028-of-00048.safetensors
+SHARD model-00029-of-00048.safetensors
+SHARD model-00030-of-00048.safetensors
+SHARD model-00031-of-00048.safetensors
+SHARD model-00032-of-00048.safetensors
+SHARD model-00033-of-00048.safetensors
+SHARD model-00034-of-00048.safetensors
+SHARD model-00035-of-00048.safetensors
+SHARD model-00036-of-00048.safetensors
+SHARD model-00037-of-00048.safetensors
+SHARD model-00038-of-00048.safetensors
+SHARD model-00039-of-00048.safetensors
+SHARD model-00040-of-00048.safetensors
+SHARD model-00041-of-00048.safetensors
+SHARD model-00042-of-00048.safetensors
+SHARD model-00043-of-00048.safetensors
+SHARD model-00044-of-00048.safetensors
+SHARD model-00045-of-00048.safetensors
+SHARD model-00046-of-00048.safetensors
+SHARD model-00047-of-00048.safetensors
+SHARD model-00048-of-00048.safetensors
+total_size 166878536440
+
+=== existing-deepseek listing with links ===
+total 86115660
+drwx------ 3 1000 1000        4096 May 27 03:11 .
+drwxr-xr-x 6 root root        4096 Aug  1 08:41 ..
+drwx------ 3 1000 1000        4096 May 27 03:02 .cache
+-rw------- 1 1000 1000  1998047355 May 27 03:03 deepseek-v4-flash-mtp.mq2lloyd
+-rw------- 1 1000 1000 86184307283 May 27 03:11 deepseek-v4-flash.mq2lloyd
+total 23564
+drwx------ 3 1000 1000     4096 Aug  1 08:28 .
+drwxr-xr-x 3 root root     4096 Aug  1 08:28 ..
+drwx------ 3 1000 1000     4096 Aug  1 08:28 .cache
+-rw------- 1 root root 24117248 Aug  1 08:28 deepseek-v4-flash-mtp.mq2lloyd
+/root/.hipfire/models/hipfire-deepseek-v4-flash/deepseek-v4-flash-mtp.mq2lloyd
+total 23564
+drwx------ 3 1000 1000     4096 Aug  1 08:28 .
+drwxr-xr-x 3 root root     4096 Aug  1 08:28 ..
+drwx------ 3 1000 1000     4096 Aug  1 08:28 .cache
+-rw------- 1 root root 24117248 Aug  1 08:28 deepseek-v4-flash-mtp.mq2lloyd
+  7100110      4 drwxr-xr-x   3 root     root         4096 Aug  1 08:28 /root/.hipfire/models
+  7100111      4 drwx------   3 1000     1000         4096 Aug  1 08:28 /root/.hipfire/models/hipfire-deepseek-v4-flash
+  7100116  23552 -rw-------   1 root      root     24117248 Aug  1 08:28 /root/.hipfire/models/hipfire-deepseek-v4-flash/deepseek-v4-flash-mtp.mq2lloyd
+  7100113      4 drwx------   3 1000     1000         4096 Aug  1 08:28 /root/.hipfire/models/hipfire-deepseek-v4-flash/.cache
+  7100114      4 drwx------   3 1000     1000         4096 Aug  1 08:28 /root/.hipfire/models/hipfire-deepseek-v4-flash/.cache/huggingface
+  7100115      4 drwx------   2 1000     1000         4096 May 27 03:11 /root/.hipfire/models/hipfire-deepseek-v4-flash/.cache/huggingface/download
+
+=== registry.cache.json model paths ===
+registry.models = dict
+registry.models.carnice:27b.file = carnice-27b.mq4
+registry.models.carnice:27b.quant_recipe = None
+registry.models.carnice:27b.sampling_profiles = None
+registry.models.carnice:27b.arch_id = 5
+registry.models.carnice:27b.quant = mq4
+registry.models.carnice:27b-mq6 = dict
+registry.models.carnice:27b-mq6.file = carnice-27b.mq6
+registry.models.carnice:27b-mq6.quant_recipe = None
+registry.models.carnice:27b-mq6.sampling_profiles = None
+registry.models.carnice:27b-mq6.arch_id = 5
+registry.models.carnice:27b-mq6.quant = mq6
+registry.models.carnice:9b.file = carnice-9b.mq4
+registry.models.carnice:9b.quant_recipe = None
+registry.models.carnice:9b.sampling_profiles = None
+registry.models.carnice:9b.arch_id = 5
+registry.models.carnice:9b.quant = mq4
+registry.models.carnice:9b-mq6 = dict
+registry.models.carnice:9b-mq6.file = carnice-9b.mq6
+registry.models.carnice:9b-mq6.quant_recipe = None
+registry.models.carnice:9b-mq6.sampling_profiles = None
+registry.models.carnice:9b-mq6.arch_id = 5
+registry.models.carnice:9b-mq6.quant = mq6
+registry.models.deepseek-v4-flash.file = deepseek-v4-flash.mq2lloyd
+registry.models.deepseek-v4-flash.mtp.file = deepseek-v4-flash-mtp.mq2lloyd
+registry.models.deepseek-v4-flash.quant_recipe = None
+registry.models.deepseek-v4-flash.sampling_profiles = None
+registry.models.deepseek-v4-flash.arch_id = 9
+registry.models.deepseek-v4-flash.quant = mq2lloyd
+registry.models.lfm2.5:1.2b.file = lfm2.5-1.2b.mq4
+registry.models.lfm2.5:1.2b.quant_recipe = v3-awq-f1
+registry.models.lfm2.5:1.2b.sampling_profiles = None
+registry.models.lfm2.5:1.2b.arch_id = 11
+registry.models.lfm2.5:1.2b.quant = mq4
+registry.models.lfm2.5:1.2b-thinking.file = lfm2.5-1.2b-thinking.mq4
+registry.models.lfm2.5:1.2b-thinking.quant_recipe = v3-awq-f1
+registry.models.lfm2.5:1.2b-thinking.sampling_profiles = None
+registry.models.lfm2.5:1.2b-thinking.arch_id = 11
+registry.models.lfm2.5:1.2b-thinking.quant = mq4
+registry.models.lfm2.5:350m.file = lfm2.5-350m.q8
+registry.models.lfm2.5:350m.quant_recipe = q8
+registry.models.lfm2.5:350m.sampling_profiles = None
+registry.models.lfm2.5:350m.arch_id = 11
+registry.models.lfm2.5:350m.quant = q8
+registry.models.lfm2.5:8b-a1b.file = lfm2.5-8b-a1b.mq4
+registry.models.lfm2.5:8b-a1b.quant_recipe = mq4-moe
+registry.models.lfm2.5:8b-a1b.sampling_profiles = None
+registry.models.lfm2.5:8b-a1b.arch_id = 11
+registry.models.lfm2.5:8b-a1b.quant = mq4
+registry.models.minimax-m2.7.file = MiniMax-M2.7.mq2
+registry.models.minimax-m2.7.quant_recipe = None
+registry.models.minimax-m2.7.sampling_profiles = None
+registry.models.minimax-m2.7.arch_id = 10
+registry.models.minimax-m2.7.quant = mq2
+registry.models.nex-n2:mini.file = nex-n2-mini.mq4p
+registry.models.nex-n2:mini.quant_recipe = a3b-tiermap-T3-3L
+registry.models.nex-n2:mini.sampling_profiles = None
+registry.models.nex-n2:mini.arch_id = 6
+registry.models.nex-n2:mini.quant = mq4p
+registry.models.north-mini-code.file = north-mini-code.mq4.hfq
+registry.models.north-mini-code.quant_recipe = None
+registry.models.north-mini-code.sampling_profiles = None
+registry.models.north-mini-code.arch_id = 12
+registry.models.north-mini-code.quant = mq4
+registry.models.qwen3.5:0.8b.file = qwen3.5-0.8b.mq4
+registry.models.qwen3.5:0.8b.quant_recipe = v3-awq-f1
+registry.models.qwen3.5:0.8b.sampling_profiles = None
+registry.models.qwen3.5:0.8b.arch_id = 5
+registry.models.qwen3.5:0.8b.quant = mq4
+registry.models.qwen3.5:0.8b-mq6 = dict
+registry.models.qwen3.5:0.8b-mq6.file = qwen3.5-0.8b.mq6
+registry.models.qwen3.5:0.8b-mq6.quant_recipe = v3-awq-f1
+registry.models.qwen3.5:0.8b-mq6.sampling_profiles = None
+registry.models.qwen3.5:0.8b-mq6.arch_id = 5
+registry.models.qwen3.5:0.8b-mq6.quant = mq6
+registry.models.qwen3.5:27b.file = qwen3.5-27b.mq4
+registry.models.qwen3.5:27b.quant_recipe = None
+registry.models.qwen3.5:27b.sampling_profiles = None
+registry.models.qwen3.5:27b.arch_id = 5
+registry.models.qwen3.5:27b.quant = mq4
+registry.models.qwen3.5:27b-draft.file = qwen35-27b-dflash-mq4.hfq
+registry.models.qwen3.5:27b-draft.quant_recipe = None
+registry.models.qwen3.5:27b-draft.sampling_profiles = None
+registry.models.qwen3.5:27b-draft.arch_id = 20
+registry.models.qwen3.5:27b-draft.quant = mq4
+registry.models.qwen3.5:27b-draft-mq3 = dict
+registry.models.qwen3.5:27b-draft-mq3.file = qwen35-27b-dflash-mq3.hfq
+registry.models.qwen3.5:27b-draft-mq3.quant_recipe = None
+registry.models.qwen3.5:27b-draft-mq3.sampling_profiles = None
+registry.models.qwen3.5:27b-draft-mq3.arch_id = 20
+registry.models.qwen3.5:27b-draft-mq3.quant = mq3
+registry.models.qwen3.5:27b-mq3 = dict
+registry.models.qwen3.5:27b-mq3.file = qwen3.5-27b.mq3
+registry.models.qwen3.5:27b-mq3.quant_recipe = None
+registry.models.qwen3.5:27b-mq3.sampling_profiles = None
+registry.models.qwen3.5:27b-mq3.arch_id = 5
+registry.models.qwen3.5:27b-mq3.quant = mq3
+registry.models.qwen3.5:27b-mq6 = dict
+registry.models.qwen3.5:27b-mq6.file = qwen3.5-27b.mq6
+registry.models.qwen3.5:27b-mq6.quant_recipe = None
+registry.models.qwen3.5:27b-mq6.sampling_profiles = None
+registry.models.qwen3.5:27b-mq6.arch_id = 5
+registry.models.qwen3.5:27b-mq6.quant = mq6
+registry.models.qwen3.5:2b.file = qwen3.5-2b.mq4
+registry.models.qwen3.5:2b.quant_recipe = v3-awq-f1
+registry.models.qwen3.5:2b.sampling_profiles = None
+registry.models.qwen3.5:2b.arch_id = 5
+registry.models.qwen3.5:2b.quant = mq4
+registry.models.qwen3.5:2b-hf6.file = qwen3.5-2b.hf6
+registry.models.qwen3.5:2b-hf6.quant_recipe = None
+registry.models.qwen3.5:2b-hf6.sampling_profiles = None
+registry.models.qwen3.5:2b-hf6.arch_id = 5
+registry.models.qwen3.5:2b-hf6.quant = hf6
+registry.models.qwen3.5:2b-mq3 = dict
+registry.models.qwen3.5:2b-mq3.file = qwen3.5-2b.mq3
+registry.models.qwen3.5:2b-mq3.quant_recipe = v3-awq-f1
+registry.models.qwen3.5:2b-mq3.sampling_profiles = None
+registry.models.qwen3.5:2b-mq3.arch_id = 5
+registry.models.qwen3.5:2b-mq3.quant = mq3
+registry.models.qwen3.5:2b-mq6 = dict
+registry.models.qwen3.5:2b-mq6.file = qwen3.5-2b.mq6
+registry.models.qwen3.5:2b-mq6.quant_recipe = v3-awq-f1
+registry.models.qwen3.5:2b-mq6.sampling_profiles = None
+registry.models.qwen3.5:2b-mq6.arch_id = 5
+registry.models.qwen3.5:2b-mq6.quant = mq6
+registry.models.qwen3.5:35b-a3b.file = qwen3.5-35b-a3b.mq4
+registry.models.qwen3.5:35b-a3b.quant_recipe = None
+registry.models.qwen3.5:35b-a3b.sampling_profiles = None
+registry.models.qwen3.5:35b-a3b.arch_id = 6
+registry.models.qwen3.5:35b-a3b.quant = mq4
+registry.models.qwen3.5:4b.file = qwen3.5-4b.mq4
+registry.models.qwen3.5:4b.quant_recipe = v3-awq-f1
+registry.models.qwen3.5:4b.sampling_profiles = None
+registry.models.qwen3.5:4b.arch_id = 5
+registry.models.qwen3.5:4b.quant = mq4
+registry.models.qwen3.5:4b-mq3 = dict
+registry.models.qwen3.5:4b-mq3.file = qwen3.5-4b.mq3
+registry.models.qwen3.5:4b-mq3.quant_recipe = v3-awq-f1
+registry.models.qwen3.5:4b-mq3.sampling_profiles = None
+registry.models.qwen3.5:4b-mq3.arch_id = 5
+registry.models.qwen3.5:4b-mq3.quant = mq3
+registry.models.qwen3.5:4b-mq6 = dict
+registry.models.qwen3.5:4b-mq6.file = qwen3.5-4b.mq6
+registry.models.qwen3.5:4b-mq6.quant_recipe = v3-awq-f1
+registry.models.qwen3.5:4b-mq6.sampling_profiles = None
+registry.models.qwen3.5:4b-mq6.arch_id = 5
+registry.models.qwen3.5:4b-mq6.quant = mq6
+registry.models.qwen3.5:9b.file = qwen3.5-9b.mq4
+registry.models.qwen3.5:9b.quant_recipe = v3-awq-f1
+registry.models.qwen3.5:9b.sampling_profiles = None
+registry.models.qwen3.5:9b.arch_id = 5
+registry.models.qwen3.5:9b.quant = mq4
+registry.models.qwen3.5:9b-draft.file = qwen35-9b-dflash-mq4.hfq
+registry.models.qwen3.5:9b-draft.quant_recipe = None
+registry.models.qwen3.5:9b-draft.sampling_profiles = None
+registry.models.qwen3.5:9b-draft.arch_id = 20
+registry.models.qwen3.5:9b-draft.quant = mq4
+registry.models.qwen3.5:9b-mq3 = dict
+registry.models.qwen3.5:9b-mq3.file = qwen3.5-9b.mq3
+registry.models.qwen3.5:9b-mq3.quant_recipe = v3-awq-f1
+registry.models.qwen3.5:9b-mq3.sampling_profiles = None
+registry.models.qwen3.5:9b-mq3.arch_id = 5
+registry.models.qwen3.5:9b-mq3.quant = mq3
+registry.models.qwen3.5:9b-mq6 = dict
+registry.models.qwen3.5:9b-mq6.file = qwen3.5-9b.mq6
+registry.models.qwen3.5:9b-mq6.quant_recipe = v3-awq-f1
+registry.models.qwen3.5:9b-mq6.sampling_profiles = None
+registry.models.qwen3.5:9b-mq6.arch_id = 5
+registry.models.qwen3.5:9b-mq6.quant = mq6
+registry.models.qwen3.6:27b.file = qwen3.6-27b.mq4
+registry.models.qwen3.6:27b.triattn.file = qwen3.6-27b.mq4.triattn.blended_v3.bin
+registry.models.qwen3.6:27b.quant_recipe = None
+registry.models.qwen3.6:27b.sampling_profiles = None
+registry.models.qwen3.6:27b.arch_id = 5
+registry.models.qwen3.6:27b.quant = mq4
+registry.models.qwen3.6:27b-draft.file = qwen36-27b-dflash-mq4.hfq
+registry.models.qwen3.6:27b-draft.quant_recipe = None
+registry.models.qwen3.6:27b-draft.sampling_profiles = None
+registry.models.qwen3.6:27b-draft.arch_id = 20
+registry.models.qwen3.6:27b-draft.quant = mq4
+registry.models.qwen3.6:27b-draft-mq3 = dict
+registry.models.qwen3.6:27b-draft-mq3.file = qwen36-27b-dflash-mq3.hfq
+registry.models.qwen3.6:27b-draft-mq3.quant_recipe = None
+registry.models.qwen3.6:27b-draft-mq3.sampling_profiles = None
+registry.models.qwen3.6:27b-draft-mq3.arch_id = 20
+registry.models.qwen3.6:27b-draft-mq3.quant = mq3
+registry.models.qwen3.6:27b-mq3 = dict
+registry.models.qwen3.6:27b-mq3.file = qwen3.6-27b.mq3
+registry.models.qwen3.6:27b-mq3.quant_recipe = None
+registry.models.qwen3.6:27b-mq3.sampling_profiles = None
+registry.models.qwen3.6:27b-mq3.arch_id = 5
+registry.models.qwen3.6:27b-mq3.quant = mq3
+registry.models.qwen3.6:35b-a3b.file = qwen3.6-35b-a3b.mq4p
+registry.models.qwen3.6:35b-a3b.mtp.file = qwen3.6-35b-a3b.mtp
+registry.models.qwen3.6:35b-a3b.quant_recipe = None
+registry.models.qwen3.6:35b-a3b.sampling_profiles = None
+registry.models.qwen3.6:35b-a3b.arch_id = 6
+registry.models.qwen3.6:35b-a3b.quant = mq4p
+registry.models.qwen3.6:35b-a3b-mfp4.file = qwen3.6-35b-a3b.mfp4
+registry.models.qwen3.6:35b-a3b-mfp4.mtp.file = qwen3.6-35b-a3b.mtp
+registry.models.qwen3.6:35b-a3b-mfp4.quant_recipe = None
+registry.models.qwen3.6:35b-a3b-mfp4.sampling_profiles = None
+registry.models.qwen3.6:35b-a3b-mfp4.arch_id = 6
+registry.models.qwen3.6:35b-a3b-mfp4.quant = mfp4
+registry.models.qwen3.6:35b-a3b-mq2 = dict
+registry.models.qwen3.6:35b-a3b-mq2.file = qwen3.6-35b-a3b.mq2
+registry.models.qwen3.6:35b-a3b-mq2.mtp.file = qwen3.6-35b-a3b.mtp
+registry.models.qwen3.6:35b-a3b-mq2.quant_recipe = None
+registry.models.qwen3.6:35b-a3b-mq2.sampling_profiles = None
+registry.models.qwen3.6:35b-a3b-mq2.arch_id = 6
+registry.models.qwen3.6:35b-a3b-mq2.quant = mq2
+registry.models.qwen3.6:35b-a3b-mq3p = dict
+registry.models.qwen3.6:35b-a3b-mq3p.file = qwen3.6-35b-a3b.mq3p
+registry.models.qwen3.6:35b-a3b-mq3p.mtp.file = qwen3.6-35b-a3b.mtp
+registry.models.qwen3.6:35b-a3b-mq3p.quant_recipe = None
+registry.models.qwen3.6:35b-a3b-mq3p.sampling_profiles = None
+registry.models.qwen3.6:35b-a3b-mq3p.arch_id = 6
+registry.models.qwen3.6:35b-a3b-mq3p.quant = mq3p
+registry.models.qwen3.6:35b-a3b-mq4p = dict
+registry.models.qwen3.6:35b-a3b-mq4p.file = qwen3.6-35b-a3b.mq4p
+registry.models.qwen3.6:35b-a3b-mq4p.mtp.file = qwen3.6-35b-a3b.mtp
+registry.models.qwen3.6:35b-a3b-mq4p.quant_recipe = None
+registry.models.qwen3.6:35b-a3b-mq4p.sampling_profiles = None
+registry.models.qwen3.6:35b-a3b-mq4p.arch_id = 6
+registry.models.qwen3.6:35b-a3b-mq4p.quant = mq4p
+registry.models.qwen3.6:35b-a3b-mq4r = dict
+registry.models.qwen3.6:35b-a3b-mq4r.file = qwen3.6-35b-a3b.mq4r
+registry.models.qwen3.6:35b-a3b-mq4r.mtp.file = qwen3.6-35b-a3b.mtp
+registry.models.qwen3.6:35b-a3b-mq4r.quant_recipe = None
+registry.models.qwen3.6:35b-a3b-mq4r.sampling_profiles = None
+registry.models.qwen3.6:35b-a3b-mq4r.arch_id = 6
+registry.models.qwen3.6:35b-a3b-mq4r.quant = mq4r
+registry.models.qwen3.6:35b-a3b-mq5 = dict
+registry.models.qwen3.6:35b-a3b-mq5.file = qwen3.6-35b-a3b.mq5
+registry.models.qwen3.6:35b-a3b-mq5.mtp.file = qwen3.6-35b-a3b.mtp
+registry.models.qwen3.6:35b-a3b-mq5.quant_recipe = None
+registry.models.qwen3.6:35b-a3b-mq5.sampling_profiles = None
+registry.models.qwen3.6:35b-a3b-mq5.arch_id = 6
+registry.models.qwen3.6:35b-a3b-mq5.quant = mq5
+registry.models.qwen3.6:35b-a3b-mq6 = dict
+registry.models.qwen3.6:35b-a3b-mq6.file = qwen3.6-35b-a3b.mq6
+registry.models.qwen3.6:35b-a3b-mq6.mtp.file = qwen3.6-35b-a3b.mtp
+registry.models.qwen3.6:35b-a3b-mq6.quant_recipe = None
+registry.models.qwen3.6:35b-a3b-mq6.sampling_profiles = None
+registry.models.qwen3.6:35b-a3b-mq6.arch_id = 6
+registry.models.qwen3.6:35b-a3b-mq6.quant = mq6
+registry.models.qwen3:0.6b.file = qwen3-0.6b.hf4
+registry.models.qwen3:0.6b.quant_recipe = None
+registry.models.qwen3:0.6b.sampling_profiles = None
+registry.models.qwen3:0.6b.arch_id = 1
+registry.models.qwen3:0.6b.quant = hf4
+registry.models.qwen3:8b.file = qwen3-8b.hf4
+registry.models.qwen3:8b.quant_recipe = None
+registry.models.qwen3:8b.sampling_profiles = None
+registry.models.qwen3:8b.arch_id = 1
+registry.models.qwen3:8b.quant = hf4
+registry.models.qwopus3.6:27b-coder.file = qwopus3.6-27b-coder.mq4
+registry.models.qwopus3.6:27b-coder.quant_recipe = v3-awq-f1
+registry.models.qwopus3.6:27b-coder.sampling_profiles = None
+registry.models.qwopus3.6:27b-coder.arch_id = 5
+registry.models.qwopus3.6:27b-coder.quant = mq4
+registry.models.qwopus:27b.file = qwopus-27b.mq4
+registry.models.qwopus:27b.quant_recipe = None
+registry.models.qwopus:27b.sampling_profiles = None
+registry.models.qwopus:27b.arch_id = 5
+registry.models.qwopus:27b.quant = mq4
+registry.models.qwopus:27b-mq6 = dict
+registry.models.qwopus:27b-mq6.file = qwopus-27b.mq6
+registry.models.qwopus:27b-mq6.quant_recipe = None
+registry.models.qwopus:27b-mq6.sampling_profiles = None
+registry.models.qwopus:27b-mq6.arch_id = 5
+registry.models.qwopus:27b-mq6.quant = mq6
+registry.models.qwopus:4b.file = qwopus-4b.mq4
+registry.models.qwopus:4b.quant_recipe = None
+registry.models.qwopus:4b.sampling_profiles = None
+registry.models.qwopus:4b.arch_id = 5
+registry.models.qwopus:4b.quant = mq4
+registry.models.qwopus:4b-mq6 = dict
+registry.models.qwopus:4b-mq6.file = qwopus-4b.mq6
+registry.models.qwopus:4b-mq6.quant_recipe = None
+registry.models.qwopus:4b-mq6.sampling_profiles = None
+registry.models.qwopus:4b-mq6.arch_id = 5
+registry.models.qwopus:4b-mq6.quant = mq6
+registry.models.qwopus:9b.file = qwopus-9b.mq4
+registry.models.qwopus:9b.quant_recipe = None
+registry.models.qwopus:9b.sampling_profiles = None
+registry.models.qwopus:9b.arch_id = 5
+registry.models.qwopus:9b.quant = mq4
+registry.models.qwopus:9b-mq6 = dict
+registry.models.qwopus:9b-mq6.file = qwopus-9b.mq6
+registry.models.qwopus:9b-mq6.quant_recipe = None
+registry.models.qwopus:9b-mq6.sampling_profiles = None
+registry.models.qwopus:9b-mq6.arch_id = 5
+registry.models.qwopus:9b-mq6.quant = mq6
+registry.aliases.qwen3.5:0.8b-mq4 = qwen3.5:0.8b
+registry.aliases.qwen3.5:27b-mq4 = qwen3.5:27b
+registry.aliases.qwen3.5:2b-mq4 = qwen3.5:2b
+registry.aliases.qwen3.5:4b-mq4 = qwen3.5:4b
+registry.aliases.qwen3.5:9b-mq4 = qwen3.5:9b
+registry.aliases.qwopus:27b-mq4 = qwopus:27b
+registry.aliases.qwopus:4b-mq4 = qwopus:4b
+registry.aliases.qwopus:9b-mq4 = qwopus:9b
+TOP <class 'dict'> ['fetched_at', 'url', 'registry']
+K fetched_at int 1785574068643
+K url str https://raw.githubusercontent.com/warpfront/hipfire/master/registry/v1.json
+K registry dict ['schema_version', 'generated_at', '_comment', 'models', 'aliases']
+=== rustup/cargo paths ===
+total 20360
+drwxr-xr-x 2 root root     4096 Aug  1 08:32 .
+drwxr-xr-x 4 root root     4096 Aug  1 11:04 ..
+lrwxrwxrwx 1 root root        6 Aug  1 08:32 cargo -> rustup
+lrwxrwxrwx 1 root root        6 Aug  1 08:32 cargo-clippy -> rustup
+lrwxrwxrwx 1 root root        6 Aug  1 08:32 cargo-fmt -> rustup
+lrwxrwxrwx 1 root root        6 Aug  1 08:32 cargo-miri -> rustup
+lrwxrwxrwx 1 root root        6 Aug  1 08:32 clippy-driver -> rustup
+lrwxrwxrwx 1 root root        6 Aug  1 08:32 rls -> rustup
+lrwxrwxrwx 1 root root        6 Aug  1 08:32 rust-analyzer -> rustup
+lrwxrwxrwx 1 root root        6 Aug  1 08:32 rust-gdb -> rustup
+lrwxrwxrwx 1 root root        6 Aug  1 08:32 rust-gdbgui -> rustup
+lrwxrwxrwx 1 root root        6 Aug  1 08:32 rust-lldb -> rustup
+lrwxrwxrwx 1 root root        6 Aug  1 08:32 rustc -> rustup
+lrwxrwxrwx 1 root root        6 Aug  1 08:32 rustdoc -> rustup
+lrwxrwxrwx 1 root root        6 Aug  1 08:32 rustfmt -> rustup
+-rwxr-xr-x 1 root root 20838840 Aug  1 08:32 rustup
+cargo 1.97.1 (c980f4866 2026-06-30)
+rustc 1.97.1 (8bab26f4f 2026-07-14)
+cargo 1.97.1 (c980f4866 2026-06-30)
+rustc 1.97.1 (8bab26f4f 2026-07-14)
+/opt/rocm/lib/llvm/bin/clang
+/opt/rocm/lib/llvm/bin/clang++
+/opt/rocm/lib/llvm/bin/clang++.cfg
+/opt/rocm/lib/llvm/bin/clang-20
+/opt/rocm/lib/llvm/bin/clang-20.cfg
+/opt/rocm/lib/llvm/bin/clang-build-select-link
+/opt/rocm/lib/llvm/bin/clang-cl
+/opt/rocm/lib/llvm/bin/clang-cl.cfg
+/opt/rocm/lib/llvm/bin/clang-cpp
+/opt/rocm/lib/llvm/bin/clang-cpp.cfg
+AMD clang version 20.0.0git (https://github.com/RadeonOpenCompute/llvm-project roc-7.0.2 25385 0dda3adf56766e0aac0d03173ced3759e1ffecbc)
+Target: x86_64-unknown-linux-gnu
+Thread model: posix
+InstalledDir: /opt/rocm-7.0.2/lib/llvm/bin
+Configuration file: /opt/rocm-7.0.2/lib/llvm/bin/clang++.cfg
+=== hipfire daemon ===
+36765
+    PID USER     CMD
+root        1318  0.0  0.0 429192 37568 ?        Ssl  08:22   0:05 /usr/bin/python3 /usr/bin/fail2ban-server -xf start
+=== gpuagent ===
+    PID USER                      STARTED CMD
+   1823 root     Sat Aug  1 08:22:14 2026 /usr/local/bin/gpuagent
+=== scratch free ===
+Filesystem         1B-blocks         Used     Available Use% Mounted on
+/dev/vdc1      5453049012224 338406813696 4839747522560   7% /mnt/scratch
+Filesystem     Type  Size  Used Avail Use% Mounted on
+/dev/vdc1      ext4  5.0T  316G  4.5T   7% /mnt/scratch

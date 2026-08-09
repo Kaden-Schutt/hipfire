@@ -1,0 +1,1 @@
+This is a rigorous, production-grade explanation of the measurement contract for a specific inference

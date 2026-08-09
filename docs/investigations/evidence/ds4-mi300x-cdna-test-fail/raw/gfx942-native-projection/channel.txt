@@ -1,0 +1,5 @@
+GPU dev 0: gfx942 (205.8 GB VRAM, HIP 7.14)
+  pre-compiled kernels: /mnt/scratch/hipfire-kernels/rocm714/gfx942
+[rocblas] loaded for gfx942
+CHANNEL G=8 M=1024 K=4096 values=8192 raw_bit_mismatches=6891 max_abs=2.343750000e-2 max_rel=9.088155348e-4 numerical_violations=0 first_raw=Some((0, 1169759094, 1169759095)) first_bad=None baseline_guards=true candidate_guards=true
+MICRO repeats=40 retained_grouped_ms=0.022311 wave64x4_candidate_ms=0.023039 speedup=0.9684x retained_grid=512x8x64 candidate_grid=256x8x256

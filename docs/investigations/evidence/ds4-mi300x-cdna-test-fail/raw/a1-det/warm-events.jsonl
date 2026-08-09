@@ -1,0 +1,18 @@
+{"type":"pong"}
+{"type":"loaded","arch":"deepseek4","dim":0,"layers":0,"vocab":0,"vl":false,"cache_capable":true,"retry_reset_eligible":false}
+{"type":"token","id":"g0-warm","text":"The fol","attempt_id":1}
+{"type":"token","id":"g0-warm","text":"lowing","attempt_id":1}
+{"type":"token","id":"g0-warm","text":" is a prod","attempt_id":1}
+{"type":"token","id":"g0-warm","text":"uction-gra","attempt_id":1}
+{"type":"token","id":"g0-warm","text":"de ","attempt_id":1}
+{"type":"token","id":"g0-warm","text":"tech","attempt_id":1}
+{"type":"token","id":"g0-warm","text":"nical breakd","attempt_id":1}
+{"type":"token","id":"g0-warm","text":"own of th","attempt_id":1}
+{"type":"token","id":"g0-warm","text":"e me","attempt_id":1}
+{"type":"token","id":"g0-warm","text":"as","attempt_id":1}
+{"type":"token","id":"g0-warm","text":"urement","attempt_id":1}
+{"type":"token","id":"g0-warm","text":" co","attempt_id":1}
+{"type":"token","id":"g0-warm","text":"ntract for a single‑","attempt_id":1}
+{"type":"commit_ready","id":"g0-warm","tokens":16,"tok_s":14.571948998178506,"prompt_tokens":2052,"prefill_tokens":2052,"cached_tokens":0,"prefill_ms":20789,"total_ms":21888,"finish_reason":"length","drafter":"ar","attempt_id":1}
+{"type":"aborted","id":"g0-warm","reason":"client_cancelled","attempt_id":1}
+{"type":"done","id":"g0-warm","finish_reason":"aborted","prompt_tokens":0,"completion_tokens":16,"prefill_ms":0,"decode_ms":0,"attempt_id":1}

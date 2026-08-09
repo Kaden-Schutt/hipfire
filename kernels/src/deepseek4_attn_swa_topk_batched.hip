@@ -128,7 +128,7 @@ extern "C" __global__ __launch_bounds__(512, 1) void deepseek4_attn_swa_topk_bat
     }
     // Warp-shuffle reduction within each 32-thread warp.
     for (int off = 16; off > 0; off >>= 1) {
-        local_max = fmaxf(local_max, __shfl_down(local_max, off));
+        local_max = fmaxf(local_max, __shfl_down(local_max, off, 32));
     }
     const int warp_id = t >> 5;
     const int lane_id = t & 31;
@@ -142,7 +142,7 @@ extern "C" __global__ __launch_bounds__(512, 1) void deepseek4_attn_swa_topk_bat
         const int n_warps = (blockDim.x + 31) >> 5;
         float v = (lane_id < n_warps) ? warp_scratch[lane_id] : -1e30f;
         for (int off = 16; off > 0; off >>= 1) {
-            v = fmaxf(v, __shfl_down(v, off));
+            v = fmaxf(v, __shfl_down(v, off, 32));
         }
         if (lane_id == 0) {
             warp_scratch[0] = v;
@@ -166,12 +166,15 @@ extern "C" __global__ __launch_bounds__(512, 1) void deepseek4_attn_swa_topk_bat
     }
 
     // Phase 4c: every lane builds the same warp-wide sum via direct
-    // __shfl broadcasts in fixed lane order 0..31. __shfl(v, src)
-    // requires all wave lanes active (which holds here — no early-return
-    // since the top-of-kernel one is block-uniform). Each iteration
-    // broadcasts lane `src`'s thread_sum to every lane; every lane
-    // accumulates in the same deterministic order, so every lane ends
-    // with the identical sum. Lane 0 then commits to warp_scratch.
+    // __shfl broadcasts in fixed lane order 0..31. Width is explicit 32
+    // because HIP defaults __shfl width to warpSize, which is 64 on CDNA3;
+    // without it every lane would read physical lanes 0..31 only and
+    // upper-half partials would be dropped. __shfl(v, src, 32) requires
+    // all wave lanes active (which holds here — no early-return since the
+    // top-of-kernel one is block-uniform). Each iteration broadcasts lane
+    // `src`'s thread_sum within the 32-lane logical group; every lane in
+    // that group accumulates in the same deterministic order, so every
+    // lane ends with the identical sum. Lane 0 then commits to warp_scratch.
     //
     // Different from __shfl_down butterfly reduction (which was non-
     // deterministic across runs on RDNA3+, commit 734e371) — plain
@@ -181,7 +184,7 @@ extern "C" __global__ __launch_bounds__(512, 1) void deepseek4_attn_swa_topk_bat
     float ws = 0.0f;
     #pragma unroll
     for (int src = 0; src < 32; ++src) {
-        ws += __shfl(thread_sum, src);
+        ws += __shfl(thread_sum, src, 32);
     }
     if (lane_id4 == 0) {
         warp_scratch[warp_id4] = ws;

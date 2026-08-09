@@ -1,0 +1,15 @@
+--- warm f1=on maxtok=16 ---
+{"type":"commit_ready","id":"g0-warm","tokens":16,"tok_s":15.36983669548511,"prompt_tokens":2052,"prefill_tokens":2052,"cached_tokens":0,"prefill_ms":20836,"total_ms":21877,"finish_reason":"length","drafter":"ar","attempt_id":1}
+--- f1off-32 f1=off maxtok=32 ---
+{"type":"commit_ready","id":"g0-f1off-32","tokens":32,"tok_s":2.2968705139247776,"prompt_tokens":2052,"prefill_tokens":2052,"cached_tokens":0,"prefill_ms":20798,"total_ms":34730,"finish_reason":"length","drafter":"ar","attempt_id":1}
+--- f1on-32 f1=on maxtok=32 ---
+{"type":"commit_ready","id":"g0-f1on-32","tokens":32,"tok_s":32.42147922998987,"prompt_tokens":2052,"prefill_tokens":2052,"cached_tokens":0,"prefill_ms":20833,"total_ms":21821,"finish_reason":"length","drafter":"ar","attempt_id":1}
+--- f1off-510 f1=off maxtok=510 ---
+{"type":"commit_ready","id":"g0-f1off-510","tokens":510,"tok_s":2.032350233720277,"prompt_tokens":2052,"prefill_tokens":2052,"cached_tokens":0,"prefill_ms":20849,"total_ms":271791,"finish_reason":"length","drafter":"ar","attempt_id":1}
+--- f1on-510 f1=on maxtok=510 ---
+{"type":"commit_ready","id":"g0-f1on-510","tokens":510,"tok_s":32.715376226826606,"prompt_tokens":2052,"prefill_tokens":2052,"cached_tokens":0,"prefill_ms":20842,"total_ms":36432,"finish_reason":"length","drafter":"ar","attempt_id":1}
+=== greedy 510 byte-identity ===
+d7966bff99b6bf085f59e89d46fc60ee  /mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/a1-f1/f1off-510-text.txt
+0ae75201a0295a0b9c0d55f7909b1756  /mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/a1-f1/f1on-510-text.txt
+BYTE_IDENTICAL=NO
+F1DONE

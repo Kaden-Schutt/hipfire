@@ -141,6 +141,55 @@ impl Runtime {
         Ok(frequency)
     }
 
+    /// Enable or disable public ROCr asynchronous-copy profiling globally.
+    ///
+    /// ROCr stores the most recent copy's system-clock timestamps on its
+    /// completion signal. Optional symbol resolution keeps ordinary replay
+    /// usable on runtimes which do not expose this profiling extension.
+    pub fn set_async_copy_profiling(&self, enable: bool) -> Result<(), RuntimeError> {
+        let function = self.inner.symbols.profiling_async_copy_enable.ok_or(
+            RuntimeError::ProfilingUnavailable("hsa_amd_profiling_async_copy_enable"),
+        )?;
+        // SAFETY: `Symbols::load` established the optional function ABI.
+        let status = unsafe { function(enable) };
+        check_status(
+            &self.inner.symbols,
+            "hsa_amd_profiling_async_copy_enable",
+            status,
+        )
+    }
+
+    /// Retrieve the system-clock interval recorded for one completed async
+    /// copy. Profiling must have been enabled before submitting that copy.
+    pub fn async_copy_time(
+        &self,
+        signal: &CompletionSignal,
+    ) -> Result<abi::ProfilingAsyncCopyTime, RuntimeError> {
+        if !Arc::ptr_eq(&self.inner, &signal.runtime) {
+            return Err(RuntimeError::InvalidRuntimeObject(
+                "profiling signal belongs to another HSA runtime",
+            ));
+        }
+        let function = self.inner.symbols.profiling_get_async_copy_time.ok_or(
+            RuntimeError::ProfilingUnavailable("hsa_amd_profiling_get_async_copy_time"),
+        )?;
+        let mut time = abi::ProfilingAsyncCopyTime { start: 0, end: 0 };
+        // SAFETY: the owned completion signal remains live and has completed;
+        // `time` is valid output for the public ROCr call.
+        let status = unsafe { function(signal.raw(), &mut time) };
+        check_status(
+            &self.inner.symbols,
+            "hsa_amd_profiling_get_async_copy_time",
+            status,
+        )?;
+        if time.end < time.start {
+            return Err(RuntimeError::InvalidRuntimeObject(
+                "HSA async-copy profiling timestamp runs backward",
+            ));
+        }
+        Ok(time)
+    }
+
     fn agents(&self) -> Result<Vec<AgentInfo>, RuntimeError> {
         unsafe extern "C" fn collect(agent: abi::Agent, data: *mut c_void) -> abi::Status {
             // SAFETY: `data` points at the live vector below for the synchronous
@@ -538,6 +587,139 @@ impl GpuDevice {
         self.gpu.handle
     }
 
+    /// Return the available SDMA-engine bit mask for copies from `source` to
+    /// this destination agent.
+    pub fn copy_engine_mask(&self, source: &GpuDevice) -> Result<u32, RuntimeError> {
+        self.require_same_runtime(source)?;
+        let mut mask = 0_u32;
+        // SAFETY: both agents belong to this live runtime and `mask` is valid
+        // output for the public ROCr ABI.
+        let status = unsafe {
+            (self.runtime.symbols.memory_copy_engine_status)(
+                self.gpu_agent(),
+                source.gpu_agent(),
+                &mut mask,
+            )
+        };
+        check_status(
+            &self.runtime.symbols,
+            "hsa_amd_memory_copy_engine_status",
+            status,
+        )?;
+        Ok(mask)
+    }
+
+    /// Return ROCr's preferred SDMA-engine mask for copies from `source`.
+    pub fn preferred_copy_engine_mask(&self, source: &GpuDevice) -> Result<u32, RuntimeError> {
+        self.require_same_runtime(source)?;
+        let mut mask = 0_u32;
+        // SAFETY: both agents belong to this live runtime and `mask` is valid
+        // output for the public ROCr ABI.
+        let status = unsafe {
+            (self.runtime.symbols.memory_get_preferred_copy_engine)(
+                self.gpu_agent(),
+                source.gpu_agent(),
+                &mut mask,
+            )
+        };
+        check_status(
+            &self.runtime.symbols,
+            "hsa_amd_memory_get_preferred_copy_engine",
+            status,
+        )?;
+        Ok(mask)
+    }
+
+    /// Submit one public-ROCr asynchronous peer copy.
+    ///
+    /// `engine` is one single-bit engine ID returned by [`Self::copy_engine_mask`].
+    /// `None` leaves engine selection to ROCr. Dependencies and completion are
+    /// persistent HSA signals; the caller must not reset or destroy them while
+    /// the copy is in flight.
+    ///
+    /// # Safety
+    ///
+    /// `dst` and `src` must each name at least `size` accessible bytes owned by
+    /// their corresponding agents, and must remain live until completion.
+    pub unsafe fn memory_async_copy(
+        &self,
+        dst: *mut c_void,
+        source: &GpuDevice,
+        src: *const c_void,
+        size: usize,
+        dependencies: &[&CompletionSignal],
+        completion: &CompletionSignal,
+        engine: Option<u32>,
+    ) -> Result<(), RuntimeError> {
+        self.require_same_runtime(source)?;
+        if !Arc::ptr_eq(&self.runtime, &completion.runtime)
+            || dependencies
+                .iter()
+                .any(|signal| !Arc::ptr_eq(&self.runtime, &signal.runtime))
+        {
+            return Err(RuntimeError::InvalidRuntimeObject(
+                "async-copy signal belongs to another HSA runtime",
+            ));
+        }
+        if dst.is_null() || src.is_null() || size == 0 {
+            return Err(RuntimeError::InvalidRuntimeObject(
+                "async-copy pointers must be non-null and size must be nonzero",
+            ));
+        }
+        let dep_signals = dependencies
+            .iter()
+            .map(|signal| signal.raw())
+            .collect::<Vec<_>>();
+        let dep_count = u32::try_from(dep_signals.len()).map_err(|_| {
+            RuntimeError::InvalidRuntimeObject("async-copy dependency count exceeds u32")
+        })?;
+        let dep_pointer = if dep_signals.is_empty() {
+            ptr::null()
+        } else {
+            dep_signals.as_ptr()
+        };
+        // SAFETY: upheld by this method's contract; all handles are owned by
+        // this runtime and the dependency array lives through the synchronous
+        // submission call.
+        let status = unsafe {
+            match engine {
+                Some(engine) => (self.runtime.symbols.memory_async_copy_on_engine)(
+                    dst,
+                    self.gpu_agent(),
+                    src,
+                    source.gpu_agent(),
+                    size,
+                    dep_count,
+                    dep_pointer,
+                    completion.raw(),
+                    engine,
+                    true,
+                ),
+                None => (self.runtime.symbols.memory_async_copy)(
+                    dst,
+                    self.gpu_agent(),
+                    src,
+                    source.gpu_agent(),
+                    size,
+                    dep_count,
+                    dep_pointer,
+                    completion.raw(),
+                ),
+            }
+        };
+        check_status(&self.runtime.symbols, "hsa_amd_memory_async_copy", status)
+    }
+
+    fn require_same_runtime(&self, other: &GpuDevice) -> Result<(), RuntimeError> {
+        if Arc::ptr_eq(&self.runtime, &other.runtime) {
+            Ok(())
+        } else {
+            Err(RuntimeError::InvalidRuntimeObject(
+                "GPU agents belong to different HSA runtimes",
+            ))
+        }
+    }
+
     pub fn validate_geometry(&self, geometry: LaunchGeometry) -> Result<(), RuntimeError> {
         for axis in 0..3 {
             if geometry.workgroup[axis] > self.gpu.workgroup_max_dim[axis] {
@@ -640,6 +822,14 @@ impl CompletionSignal {
     pub fn is_complete(&self) -> bool {
         // SAFETY: the owned signal remains valid for this load.
         unsafe { (self.runtime.symbols.signal_load_scacquire)(self.raw) < 1 }
+    }
+
+    /// System-scope acquire load of the current signal value. Async-copy
+    /// callers use this to distinguish success (`0`) from a negative ROCr
+    /// asynchronous error indication.
+    pub fn value_scacquire(&self) -> i64 {
+        // SAFETY: the owned signal remains valid for this load.
+        unsafe { (self.runtime.symbols.signal_load_scacquire)(self.raw) }
     }
 
     /// Wait for completion using the default finite host-side bound.
@@ -1236,6 +1426,34 @@ impl QueueSet {
         })
     }
 
+    /// Create one queue for each explicitly supplied GPU agent.
+    ///
+    /// This is the mixed-agent counterpart to [`Self::create`]. All devices
+    /// must belong to one initialized ROCr runtime; queue order follows device
+    /// order so packet batches remain lane-stable across replays.
+    pub fn create_for_devices(
+        devices: &[GpuDevice],
+        queue_size: u32,
+    ) -> Result<Self, RuntimeError> {
+        let Some(first) = devices.first() else {
+            return Err(RuntimeError::ZeroQueues);
+        };
+        let mut queues = Vec::with_capacity(devices.len());
+        for device in devices {
+            first.require_same_runtime(device)?;
+            queues.push(AqlQueue::create(device, queue_size)?);
+        }
+        let mut ids = queues.iter().map(AqlQueue::id).collect::<Vec<_>>();
+        ids.sort_unstable();
+        if ids.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(RuntimeError::DuplicateQueueId);
+        }
+        Ok(Self {
+            prepared_doorbells: vec![None; queues.len()],
+            queues,
+        })
+    }
+
     pub fn len(&self) -> usize {
         self.queues.len()
     }
@@ -1671,13 +1889,13 @@ impl KernargPool {
         if let Some((pool, granule, alignment)) = fine_grained_fallback {
             return Ok(Self {
                 inner: Arc::new(KernargPoolInner {
-                        runtime: device.runtime.clone(),
-                        pool,
-                        gpu: device.gpu_agent(),
-                        cpu: device.cpu.as_ref().map(|c| c.handle),
-                        granule,
-                        alignment,
-                        device_local: true,
+                    runtime: device.runtime.clone(),
+                    pool,
+                    gpu: device.gpu_agent(),
+                    cpu: device.cpu.as_ref().map(|c| c.handle),
+                    granule,
+                    alignment,
+                    device_local: true,
                 }),
             });
         }
@@ -2381,6 +2599,7 @@ pub enum RuntimeError {
     ZeroQueues,
     DuplicateQueueId,
     InvalidCuMask(&'static str),
+    ProfilingUnavailable(&'static str),
     InvalidRuntimeObject(&'static str),
     NoKernargPool,
     InvalidKernargAlignment(usize),
@@ -2474,6 +2693,9 @@ impl fmt::Display for RuntimeError {
             Self::ZeroQueues => write!(f, "at least one HSA queue is required"),
             Self::DuplicateQueueId => write!(f, "ROCr returned duplicate IDs for distinct queues"),
             Self::InvalidCuMask(message) => write!(f, "invalid HSA CU mask: {message}"),
+            Self::ProfilingUnavailable(symbol) => {
+                write!(f, "ROCr profiling capability is unavailable: {symbol}")
+            }
             Self::InvalidRuntimeObject(message) => write!(f, "invalid ROCr object: {message}"),
             Self::NoKernargPool => write!(
                 f,
@@ -2719,8 +2941,8 @@ mod device_local_pool_tests {
             eprintln!("probe skipped (set HIPFIRE_REDLINE_PROBE_VMEMAP=1)");
             return;
         }
-        let runtime = Runtime::initialize(crate::load_symbols().expect("symbols"))
-            .expect("runtime init");
+        let runtime =
+            Runtime::initialize(crate::load_symbols().expect("symbols")).expect("runtime init");
         let device = runtime
             .select_gpu(GpuSelector::Ordinal(0))
             .expect("gpu select");
@@ -2739,7 +2961,10 @@ mod device_local_pool_tests {
         let pattern: Vec<u8> = (0..4096).map(|i| (i % 251) as u8).collect();
         buf.as_mut_bytes().copy_from_slice(&pattern);
         let readback: Vec<u8> = buf.as_mut_bytes().to_vec();
-        assert_eq!(pattern, readback, "host memcpy round-trip mismatch on device-local pool");
+        assert_eq!(
+            pattern, readback,
+            "host memcpy round-trip mismatch on device-local pool"
+        );
         eprintln!("device-local pool host memcpy probe: OK");
     }
 }

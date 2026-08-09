@@ -1,0 +1,53 @@
+[feed] label=f1off-32
+[feed] daemon=/mnt/scratch/hipfire-work/ds4-mi300x-agentmaxx/target/release/examples/daemon
+[feed] model=/mnt/scratch/models/deepseek-v4-flash-mq2r/deepseek-v4-flash.mq2r
+[feed] >> {"type":"ping"}
+GPU dev 0: gfx942 (205.8 GB VRAM, HIP 7.0)
+  pre-compiled kernels: /mnt/scratch/hipfire-work/ds4-mi300x-agentmaxx/.hipfire_kernels/gfx942
+[feed] << {"type":"pong"}
+[feed] pong in 0.25s
+[feed] >> {"type":"load","model":"/mnt/scratch/models/deepseek-v4-flash-mq2r/deepseek-v4-flash.mq2r","params":{"max_seq":4096,"kv_mode":"q8","kv_backend":"contiguous","speculation":"off","dflash_mode":"off","mtp_mode":"off","ngram_draft":false,"dspark_mode":"off"}}
+[rocblas] loaded for gfx942
+deepseek4: MQ2R P3 tensor recipe verified; gfx1151 route v2 is ineligible on gfx942, using portable dispatch
+[feed] << {"type":"loaded","arch":"deepseek4","dim":0,"layers":0,"vocab":0,"vl":false,"cache_capable":true,"retry_reset_eligible":false}
+[feed] loaded in 77.11s
+[feed] DECODE_PHASE_BEGIN
+[feed] >> {"type":"generate","id":"g0-f1off-32","attempt_id":1,"prompt":"User: I need a production-grade explanation of ordinary batch-1 autoregressive decode on a DeepSeek V4 Flash style mixture-of-experts model running on AMD Instinct MI300X (gfx942). Please treat this as a measurement contract discussion rather than marketing. Cover the end-to-end path from a frozen prompt fixture through tokenizer identity, prefill, KV write, and token-by-token decode under Q8 KV with speculation fully disabled. I wil
+[feed] << {"type":"token","id":"g0-f1off-32","text":"The f","attempt_id":1}
+[feed] << {"type":"token","id":"g0-f1off-32","text":"ollowing i","attempt_id":1}
+[feed] << {"type":"token","id":"g0-f1off-32","text":"s a detai","attempt_id":1}
+[feed] << {"type":"token","id":"g0-f1off-32","text":"led ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-f1off-32","text":"te","attempt_id":1}
+[feed] << {"type":"token","id":"g0-f1off-32","text":"chnical brie","attempt_id":1}
+[feed] << {"type":"token","id":"g0-f1off-32","text":"fing for ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-f1off-32","text":"a measurem","attempt_id":1}
+[feed] << {"type":"token","id":"g0-f1off-32","text":"en","attempt_id":1}
+[feed] << {"type":"token","id":"g0-f1off-32","text":"t con","attempt_id":1}
+[feed] << {"type":"token","id":"g0-f1off-32","text":"tr","attempt_id":1}
+[feed] << {"type":"token","id":"g0-f1off-32","text":"ac","attempt_id":1}
+[feed] << {"type":"token","id":"g0-f1off-32","text":"t ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-f1off-32","text":"i","attempt_id":1}
+[feed] << {"type":"token","id":"g0-f1off-32","text":"nvolvi","attempt_id":1}
+[feed] << {"type":"token","id":"g0-f1off-32","text":"ng a D","attempt_id":1}
+[feed] << {"type":"token","id":"g0-f1off-32","text":"eep","attempt_id":1}
+[feed] << {"type":"token","id":"g0-f1off-32","text":"Seek ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-f1off-32","text":"V4 ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-f1off-32","text":"F","attempt_id":1}
+[feed] << {"type":"token","id":"g0-f1off-32","text":"lash-st","attempt_id":1}
+[feed] << {"type":"token","id":"g0-f1off-32","text":"yl","attempt_id":1}
+[feed] << {"type":"token","id":"g0-f1off-32","text":"e ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-f1off-32","text":"M","attempt_id":1}
+[feed] << {"type":"token","id":"g0-f1off-32","text":"i","attempt_id":1}
+[feed] << {"type":"token","id":"g0-f1off-32","text":"xture-","attempt_id":1}
+[feed] << {"type":"token","id":"g0-f1off-32","text":"of-Exper","attempt_id":1}
+[feed] << {"type":"token","id":"g0-f1off-32","text":"ts ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-f1off-32","text":"(MoE) model running on","attempt_id":1}
+[feed] << {"type":"commit_ready","id":"g0-f1off-32","tokens":32,"tok_s":2.2968705139247776,"prompt_tokens":2052,"prefill_tokens":2052,"cached_tokens":0,"prefill_ms":20798,"total_ms":34730,"finish_reason":"length","drafter":"ar","attempt_id":1}
+[feed] >> {"type":"commit","id":"g0-f1off-32","attempt_id":1}
+[feed] << {"type":"aborted","id":"g0-f1off-32","reason":"client_cancelled","attempt_id":1}
+[feed] terminal aborted: {'type': 'aborted', 'id': 'g0-f1off-32', 'reason': 'client_cancelled', 'attempt_id': 1}
+[feed] DECODE_PHASE_END
+[feed] >> {"type":"unload"}
+deepseek4 gfx942 A2 levers: L1 compressor_gate=ON (HIPFIRE_DEEPSEEK4_GFX942_COMPRESSOR_GATE default ON on gfx942 MQ2R) ; L3 e8_wo_grouped=OFF (HIPFIRE_DEEPSEEK4_GFX942_E8_WO_GROUPED default OFF, =1 enables) ; F1 indexer_topk_parallel=OFF (HIPFIRE_DEEPSEEK4_GFX942_INDEXER_TOPK_PARALLEL default OFF, =1 enables)
+[daemon-control] received commit for id=g0-f1off-32 attempt_id=1
+[feed] << {"type":"done","id":"g0-f1off-32","finish_reason":"aborted","prompt_tokens":0,"completion_tokens":32,"prefill_ms":0,"decode_ms":0,"attempt_id":1}

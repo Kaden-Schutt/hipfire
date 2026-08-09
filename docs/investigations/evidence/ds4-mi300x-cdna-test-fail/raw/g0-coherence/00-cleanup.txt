@@ -1,0 +1,25 @@
+stopping pid=53356 cmd=/mnt/scratch/hipfire-work/ds4-mi300x-agentmaxx/target/release/examples/daemon 
+stopping pid=53355 cmd=python3 /mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/g0-build/06-daemon-driver.py 
+stopping pid=53354 cmd=
+=== after cleanup KFD ===
+
+
+============================ ROCm System Management Interface ============================
+===================================== KFD Processes ======================================
+KFD process information:
+PID 	PROCESS NAME	GPU(s)	VRAM USED	SDMA USED	CU OCCUPANCY	
+1823	gpuagent    	0     	0        	0        	0           	
+==========================================================================================
+================================== End of ROCm SMI Log ===================================
+
+
+============================ ROCm System Management Interface ============================
+================================== Memory Usage (Bytes) ==================================
+GPU[0]		: VRAM Total Memory (B): 205822885888
+GPU[0]		: VRAM Total Used Memory (B): 299687936
+==========================================================================================
+================================== End of ROCm SMI Log ===================================
+1312 @dbus-daemon --system --address=systemd: --nofork --nopidfile --systemd-activation --syslog-only
+54224 bash -c set -euo pipefail E=/mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/g0-coherence # Kill only the stuck campaign driver/daemon tree — never gpuagent for pid in 53356 53355 53354 53343; do   if [ -d /proc/$pid ]; then     cmd=$(tr "\0" " " < /proc/$pid/cmdline 2>/dev/null || true)     echo "stopping pid=$pid cmd=$cmd" | tee -a "$E/00-cleanup.txt"     case "$cmd" in       *gpuagent*) echo "REFUSE gpuagent" | tee -a "$E/00-cleanup.txt"; continue ;;     esac     kill -TERM $pid 2>/dev/null || true   fi done sleep 2 for pid in 53356 53355 53354; do   if [ -d /proc/$pid ]; then     cmd=$(tr "\0" " " < /proc/$pid/cmdline 2>/dev/null || true)     case "$cmd" in *gpuagent*) continue ;; esac     echo "SIGKILL pid=$pid" | tee -a "$E/00-cleanup.txt"     kill -KILL $pid 2>/dev/null || true   fi done sleep 1 {   echo "=== after cleanup KFD ==="   rocm-smi --showpids 2>/dev/null || true   rocm-smi --showmeminfo vram 2>/dev/null || true   pgrep -af "daemon|hipfire" || true } | tee -a "$E/00-cleanup.txt" 
+54254 bash -c set -euo pipefail E=/mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/g0-coherence # Kill only the stuck campaign driver/daemon tree — never gpuagent for pid in 53356 53355 53354 53343; do   if [ -d /proc/$pid ]; then     cmd=$(tr "\0" " " < /proc/$pid/cmdline 2>/dev/null || true)     echo "stopping pid=$pid cmd=$cmd" | tee -a "$E/00-cleanup.txt"     case "$cmd" in       *gpuagent*) echo "REFUSE gpuagent" | tee -a "$E/00-cleanup.txt"; continue ;;     esac     kill -TERM $pid 2>/dev/null || true   fi done sleep 2 for pid in 53356 53355 53354; do   if [ -d /proc/$pid ]; then     cmd=$(tr "\0" " " < /proc/$pid/cmdline 2>/dev/null || true)     case "$cmd" in *gpuagent*) continue ;; esac     echo "SIGKILL pid=$pid" | tee -a "$E/00-cleanup.txt"     kill -KILL $pid 2>/dev/null || true   fi done sleep 1 {   echo "=== after cleanup KFD ==="   rocm-smi --showpids 2>/dev/null || true   rocm-smi --showmeminfo vram 2>/dev/null || true   pgrep -af "daemon|hipfire" || true } | tee -a "$E/00-cleanup.txt" 
+54255 tee -a /mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/g0-coherence/00-cleanup.txt

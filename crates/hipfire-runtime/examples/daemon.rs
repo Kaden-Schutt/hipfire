@@ -36,8 +36,8 @@ use hipfire_arch_qwen35::Qwen35Bundle;
 use hipfire_arch_qwen35_vl::image;
 use hipfire_arch_qwen35_vl::qwen35_vl;
 use hipfire_runtime::emit_text::{
-    currently_in_think, extract_tool_calls_from_text, ToolOutputRouter, ToolRouteError,
-    ToolRouteEvent,
+    currently_in_think, extract_tool_calls_from_text, ThinkOutputRouter, ThinkRouteEvent,
+    ToolOutputRouter, ToolRouteError, ToolRouteEvent,
 };
 use hipfire_runtime::eos_filter::{EosFilter, EosFilterConfig, FilterAction};
 use hipfire_runtime::hfq::HfqFile;
@@ -653,6 +653,96 @@ impl RedlineQwenSnapshot {
     }
 }
 
+#[derive(PartialEq)]
+struct RedlineRegionHash {
+    name: String,
+    bytes: usize,
+    hash: u64,
+}
+
+#[derive(PartialEq)]
+struct RedlineDeepseek4Snapshot {
+    logits: Vec<u8>,
+    kv: Vec<u8>,
+    kv_regions: Vec<RedlineRegionHash>,
+    recurrent: Vec<u8>,
+}
+
+impl RedlineDeepseek4Snapshot {
+    fn json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "logits_bytes": self.logits.len(),
+            "logits_hash": format!("{:016x}", redline_hash(&self.logits)),
+            "kv_bytes": self.kv.len(),
+            "kv_hash": format!("{:016x}", redline_hash(&self.kv)),
+            "kv_regions": self.kv_regions.iter().map(|region| serde_json::json!({
+                "name": region.name,
+                "bytes": region.bytes,
+                "hash": format!("{:016x}", region.hash),
+            })).collect::<Vec<_>>(),
+            "recurrent_bytes": self.recurrent.len(),
+            "recurrent_hash": format!("{:016x}", redline_hash(&self.recurrent)),
+        })
+    }
+}
+
+#[derive(PartialEq)]
+struct RedlineDsparkVerifySnapshot {
+    target: RedlineDeepseek4Snapshot,
+    captures: Vec<u8>,
+    streams: Vec<u8>,
+    picks: Vec<u32>,
+}
+
+impl RedlineDsparkVerifySnapshot {
+    fn json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "target": self.target.json(),
+            "captures_bytes": self.captures.len(),
+            "captures_hash": format!("{:016x}", redline_hash(&self.captures)),
+            "streams_bytes": self.streams.len(),
+            "streams_hash": format!("{:016x}", redline_hash(&self.streams)),
+            "picks": self.picks,
+        })
+    }
+}
+
+#[derive(PartialEq)]
+enum RedlineSnapshot {
+    Qwen(RedlineQwenSnapshot),
+    Deepseek4(RedlineDeepseek4Snapshot),
+}
+
+impl RedlineSnapshot {
+    fn logits(&self) -> &[u8] {
+        match self {
+            Self::Qwen(snapshot) => &snapshot.logits,
+            Self::Deepseek4(snapshot) => &snapshot.logits,
+        }
+    }
+
+    fn kv(&self) -> &[u8] {
+        match self {
+            Self::Qwen(snapshot) => &snapshot.kv,
+            Self::Deepseek4(snapshot) => &snapshot.kv,
+        }
+    }
+
+    fn recurrent(&self) -> &[u8] {
+        match self {
+            Self::Qwen(snapshot) => &snapshot.recurrent,
+            Self::Deepseek4(snapshot) => &snapshot.recurrent,
+        }
+    }
+
+    fn json(&self) -> serde_json::Value {
+        match self {
+            Self::Qwen(snapshot) => snapshot.json(),
+            Self::Deepseek4(snapshot) => snapshot.json(),
+        }
+    }
+}
+
 fn redline_hash(bytes: &[u8]) -> u64 {
     let mut hash = 0xcbf29ce484222325_u64;
     for byte in bytes {
@@ -707,6 +797,214 @@ fn redline_qwen_snapshot(
         kv,
         recurrent,
     })
+}
+
+fn redline_append_tensor(
+    gpu: &rdna_compute::Gpu,
+    output: &mut Vec<u8>,
+    tensor: &Option<rdna_compute::GpuTensor>,
+) -> Result<(), String> {
+    if let Some(tensor) = tensor {
+        redline_append_buffer(gpu, output, &tensor.buf)?;
+    }
+    Ok(())
+}
+
+fn redline_append_tensor_region(
+    gpu: &rdna_compute::Gpu,
+    output: &mut Vec<u8>,
+    regions: &mut Vec<RedlineRegionHash>,
+    name: String,
+    tensor: &Option<rdna_compute::GpuTensor>,
+) -> Result<(), String> {
+    let Some(tensor) = tensor else {
+        return Ok(());
+    };
+    let start = output.len();
+    redline_append_buffer(gpu, output, &tensor.buf)?;
+    let bytes = output.len() - start;
+    regions.push(RedlineRegionHash {
+        name,
+        bytes,
+        hash: redline_hash(&output[start..]),
+    });
+    Ok(())
+}
+
+fn redline_deepseek4_snapshot(
+    gpu: &rdna_compute::Gpu,
+    bundle: &deepseek4::Deepseek4Bundle,
+) -> Result<RedlineDeepseek4Snapshot, String> {
+    let mut logits = Vec::new();
+    redline_append_tensor(gpu, &mut logits, &bundle.state.logits)?;
+
+    let mut kv = Vec::new();
+    let mut kv_regions = Vec::new();
+    for (layer_idx, layer) in bundle.state._indexer.iter().enumerate() {
+        redline_append_tensor_region(
+            gpu,
+            &mut kv,
+            &mut kv_regions,
+            format!("indexer.{layer_idx}.main_kv_cache"),
+            &layer.main_kv_cache,
+        )?;
+        redline_append_tensor_region(
+            gpu,
+            &mut kv,
+            &mut kv_regions,
+            format!("indexer.{layer_idx}.indexer_kv_cache"),
+            &layer.indexer_kv_cache,
+        )?;
+    }
+    for (layer_idx, layer) in bundle.state._attention.iter().enumerate() {
+        for (field, tensor) in [
+            ("swa_k", &layer.swa_k),
+            ("swa_v", &layer.swa_v),
+            ("full_k_cache", &layer.full_k_cache),
+            ("full_v_cache", &layer.full_v_cache),
+        ] {
+            redline_append_tensor_region(
+                gpu,
+                &mut kv,
+                &mut kv_regions,
+                format!("attention.{layer_idx}.{field}"),
+                tensor,
+            )?;
+        }
+    }
+
+    let mut recurrent = Vec::new();
+    for layer in &bundle.state._indexer {
+        redline_append_tensor(gpu, &mut recurrent, &layer.main_kv_state)?;
+        redline_append_tensor(gpu, &mut recurrent, &layer.main_score_state)?;
+        redline_append_tensor(gpu, &mut recurrent, &layer.indexer_kv_state)?;
+        redline_append_tensor(gpu, &mut recurrent, &layer.indexer_score_state)?;
+    }
+    redline_append_tensor(gpu, &mut recurrent, &bundle.state.residual_streams)?;
+    redline_append_tensor(gpu, &mut recurrent, &bundle.state.residual_streams_next)?;
+    redline_append_tensor(gpu, &mut recurrent, &bundle.state.attn_state_buf)?;
+
+    Ok(RedlineDeepseek4Snapshot {
+        logits,
+        kv,
+        kv_regions,
+        recurrent,
+    })
+}
+
+fn redline_append_tensor_slice(
+    gpu: &rdna_compute::Gpu,
+    output: &mut Vec<u8>,
+    tensor: &rdna_compute::GpuTensor,
+    offset: usize,
+    len: usize,
+) -> Result<(), String> {
+    if offset.saturating_add(len) > tensor.numel() {
+        return Err(format!(
+            "redline tensor slice {}+{} exceeds {}",
+            offset,
+            len,
+            tensor.numel()
+        ));
+    }
+    let view = tensor.sub_offset(offset, len);
+    redline_append_buffer(gpu, output, &view.buf)
+}
+
+fn redline_dspark_verify_snapshot(
+    gpu: &rdna_compute::Gpu,
+    bundle: &deepseek4::Deepseek4Bundle,
+    batch: usize,
+    picks: Vec<u32>,
+) -> Result<RedlineDsparkVerifySnapshot, String> {
+    let target = redline_deepseek4_snapshot(gpu, bundle)?;
+    let hidden = bundle.config.hidden_size;
+    let n_targets = bundle.state.dspark_target_layers.len();
+    let mut captures = Vec::new();
+    if let Some(tensor) = bundle.state.dspark_caps.as_ref() {
+        redline_append_tensor_slice(gpu, &mut captures, tensor, 0, batch * n_targets * hidden)?;
+    }
+    let pbs = bundle
+        .state
+        .dspark_verify_pbs
+        .as_ref()
+        .ok_or_else(|| "DSpark verify snapshot: PBS missing".to_string())?;
+    let mut streams = Vec::new();
+    redline_append_tensor_slice(
+        gpu,
+        &mut streams,
+        &pbs.streams_batch,
+        0,
+        batch * bundle.config.hc_mult * hidden,
+    )?;
+    Ok(RedlineDsparkVerifySnapshot {
+        target,
+        captures,
+        streams,
+        picks,
+    })
+}
+
+/// Hash one inactive row from the highest-risk batch-shaped verify buffers.
+/// The row immediately after the active batch is a same-allocation red zone:
+/// every fixed-node B-shaped kernel must leave it byte-identical.
+fn redline_dspark_verify_guard(
+    gpu: &rdna_compute::Gpu,
+    bundle: &deepseek4::Deepseek4Bundle,
+    batch: usize,
+) -> Result<Vec<u8>, String> {
+    let pbs = bundle
+        .state
+        .dspark_verify_pbs
+        .as_ref()
+        .ok_or_else(|| "DSpark verify guard: PBS missing".to_string())?;
+    if batch >= pbs.max_batch {
+        return Err(format!(
+            "DSpark verify guard needs inactive row after B={batch}, max_batch={}",
+            pbs.max_batch
+        ));
+    }
+    let cfg = &bundle.config;
+    let hidden = cfg.hidden_size;
+    let mut guard = Vec::new();
+    for (tensor, row) in [
+        (&pbs.embed_batch, hidden),
+        (&pbs.streams_batch, cfg.hc_mult * hidden),
+        (&pbs.q_batch, cfg.num_attention_heads * cfg.head_dim),
+        (&pbs.kv_batch, cfg.num_key_value_heads * cfg.head_dim),
+        (&pbs.attn_out_batch, hidden),
+        (&pbs.ffn_out_batch, hidden),
+        (&pbs.moe_scores_batch, cfg.n_routed_experts),
+        (&pbs.moe_topk_indices_batch, cfg.num_experts_per_tok),
+        (&pbs.moe_topk_weights_batch, cfg.num_experts_per_tok),
+        (&pbs.idx_q_batch, cfg.index_n_heads * cfg.index_head_dim),
+        (&pbs.idx_topk_indices_batch, cfg.index_topk),
+    ] {
+        redline_append_tensor_slice(gpu, &mut guard, tensor, batch * row, row)?;
+    }
+    let n_targets = bundle.state.dspark_target_layers.len();
+    if n_targets > 0 {
+        if let Some(caps) = bundle.state.dspark_caps.as_ref() {
+            let row = n_targets * hidden;
+            redline_append_tensor_slice(gpu, &mut guard, caps, batch * row, row)?;
+        }
+    }
+    Ok(guard)
+}
+
+fn redline_snapshot(
+    gpu: &rdna_compute::Gpu,
+    loaded: &LoadedModel,
+) -> Result<RedlineSnapshot, String> {
+    match loaded.state.as_ref() {
+        Some(ModelState::Qwen35(bundle)) => {
+            redline_qwen_snapshot(gpu, bundle).map(RedlineSnapshot::Qwen)
+        }
+        Some(ModelState::Deepseek4(bundle)) => {
+            redline_deepseek4_snapshot(gpu, bundle).map(RedlineSnapshot::Deepseek4)
+        }
+        _ => Err("retained snapshot requires Qwen3.5 or DeepSeek4".to_string()),
+    }
 }
 
 fn redline_qwen_debug_hashes(
@@ -868,6 +1166,807 @@ fn redline_prime_qwen(
     gpu.hip
         .device_synchronize()
         .map_err(|error| error.to_string())
+}
+
+fn redline_reset_deepseek4(
+    gpu: &mut rdna_compute::Gpu,
+    bundle: &mut deepseek4::Deepseek4Bundle,
+) -> Result<(), String> {
+    bundle.state.reset();
+    bundle.state.zero_decode_caches(gpu);
+    gpu.invalidate_graph_state();
+    gpu.hip
+        .device_synchronize()
+        .map_err(|error| error.to_string())
+}
+
+fn redline_prime_deepseek4(
+    gpu: &mut rdna_compute::Gpu,
+    bundle: &mut deepseek4::Deepseek4Bundle,
+    pbs: &mut deepseek4::forward::PrefillBatchScratch,
+    context: usize,
+) -> Result<(), String> {
+    let synthetic = (0..context as u32)
+        .map(|index| 10 + (index % 1000))
+        .collect::<Vec<_>>();
+    deepseek4::forward::forward_prefill_batch_chunked(
+        &bundle.config,
+        &bundle.weights,
+        &mut bundle.state,
+        gpu,
+        &synthetic,
+        0,
+        pbs,
+    )?;
+    bundle.state.n_tokens = context as u64;
+    gpu.hip
+        .device_synchronize()
+        .map_err(|error| error.to_string())
+}
+
+fn redline_run_deepseek4_decode(
+    gpu: &mut rdna_compute::Gpu,
+    bundle: &mut deepseek4::Deepseek4Bundle,
+    context: usize,
+    iterations: usize,
+) -> Result<(), String> {
+    for index in 0..iterations {
+        let token = 101 + (index as u32 % 1000);
+        deepseek4::forward::decode_step_with_graph(
+            &bundle.config,
+            &bundle.weights,
+            &mut bundle.state,
+            gpu,
+            token,
+            (context + index) as u32,
+        )?;
+    }
+    Ok(())
+}
+
+fn redline_prime_retained_fixture(
+    gpu: &mut rdna_compute::Gpu,
+    loaded: &mut LoadedModel,
+    context: usize,
+) -> Result<(), String> {
+    match loaded.state.as_mut() {
+        Some(ModelState::Qwen35(bundle)) => {
+            redline_reset_qwen(gpu, bundle)?;
+            redline_prime_qwen(gpu, bundle, context)
+        }
+        Some(ModelState::Deepseek4(bundle)) => {
+            let pbs = loaded
+                .deepseek4_pbs
+                .as_mut()
+                .ok_or_else(|| "DeepSeek4 prefill scratch missing".to_string())?;
+            redline_reset_deepseek4(gpu, bundle)?;
+            redline_prime_deepseek4(gpu, bundle, pbs, context)
+        }
+        _ => Err("retained fixture requires Qwen3.5 or DeepSeek4".to_string()),
+    }
+}
+
+fn redline_prepare_retained_fixture(
+    gpu: &mut rdna_compute::Gpu,
+    loaded: &mut LoadedModel,
+    token_id: u32,
+    context: usize,
+) -> Result<(), String> {
+    match loaded.state.as_mut() {
+        Some(ModelState::Qwen35(bundle)) => qwen35::prepare_scratch_inputs(
+            gpu,
+            &bundle.weights,
+            &bundle.config,
+            token_id,
+            context,
+            &bundle.scratch,
+        )
+        .map_err(|error| error.to_string()),
+        Some(ModelState::Deepseek4(bundle)) => {
+            bundle.state.n_tokens = context as u64;
+            deepseek4::forward::prepare_retained_decode_inputs(
+                &bundle.config,
+                &bundle.weights,
+                &mut bundle.state,
+                gpu,
+                token_id,
+                context as u32,
+            )
+        }
+        _ => Err("retained fixture requires Qwen3.5 or DeepSeek4".to_string()),
+    }
+}
+
+fn redline_run_direct_fixture(
+    gpu: &mut rdna_compute::Gpu,
+    loaded: &mut LoadedModel,
+    context: usize,
+    iterations: usize,
+) -> Result<(), String> {
+    match loaded.state.as_mut() {
+        Some(ModelState::Qwen35(bundle)) => {
+            for index in 0..iterations {
+                qwen35::forward_scratch(
+                    gpu,
+                    &bundle.weights,
+                    &bundle.config,
+                    101 + index as u32,
+                    context + index,
+                    &mut bundle.kv_cache,
+                    &mut bundle.dn_state,
+                    &bundle.scratch,
+                )
+                .map_err(|error| error.to_string())?;
+            }
+            Ok(())
+        }
+        Some(ModelState::Deepseek4(bundle)) => {
+            for index in 0..iterations {
+                bundle.state.n_tokens = (context + index) as u64;
+                deepseek4::forward::decode_step(
+                    &bundle.config,
+                    &bundle.weights,
+                    &mut bundle.state,
+                    gpu,
+                    101 + index as u32,
+                    (context + index) as u32,
+                )?;
+            }
+            Ok(())
+        }
+        _ => Err("retained fixture requires Qwen3.5 or DeepSeek4".to_string()),
+    }
+}
+
+fn redline_bench_decode_deepseek4(
+    gpu: &mut rdna_compute::Gpu,
+    loaded: &mut LoadedModel,
+    msg: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    if loaded.pp > 1
+        || loaded.ep.is_some()
+        || !matches!(loaded.state.as_ref(), Some(ModelState::Deepseek4(_)))
+    {
+        return Err("bench_decode requires a loaded single-GPU DeepSeek4 model".to_string());
+    }
+    let context = msg
+        .get("context_tokens")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(128) as usize;
+    let iterations = msg
+        .get("iterations")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(1) as usize;
+    let capture = msg
+        .get("redline_capture")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    let product_route = msg
+        .get("redline_product_route")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    let capture_detail = msg
+        .get("redline_detail")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    if capture && product_route {
+        return Err("redline_capture and redline_product_route are mutually exclusive".to_string());
+    }
+    if context == 0 || iterations == 0 {
+        return Err("bench_decode context_tokens and iterations must be non-zero".to_string());
+    }
+    if context.saturating_add(iterations).saturating_add(32) > loaded.physical_cap {
+        return Err(format!(
+            "bench_decode context+iterations exceeds loaded physical_cap={}",
+            loaded.physical_cap
+        ));
+    }
+
+    loaded.seq_pos = 0;
+    loaded.conversation_tokens.clear();
+    let pbs = loaded
+        .deepseek4_pbs
+        .as_mut()
+        .ok_or_else(|| "DeepSeek4 prefill scratch missing".to_string())?;
+    let ModelState::Deepseek4(bundle) = loaded.state.as_mut().unwrap() else {
+        unreachable!()
+    };
+    redline_reset_deepseek4(gpu, bundle)?;
+    redline_prime_deepseek4(gpu, bundle, pbs, context)
+        .map_err(|error| format!("bench_decode prefill prime failed: {error}"))?;
+    loaded.seq_pos = context;
+
+    if capture || (product_route && gpu.replay.prepared_route_identity().is_some()) {
+        // Manual capture and prepared product routes are already warm paths.
+        // The first product warmup must still materialize lazy allocations and
+        // record the route; later requests replay from their first timed token.
+        bundle.state.ar_forward_warmed_up = true;
+    }
+    if capture {
+        gpu.replay
+            .begin_capture()
+            .map_err(|reason| format!("redline decode capture refused: {reason}"))?;
+    }
+
+    if product_route {
+        gpu.replay.begin_replay_observation_window();
+    }
+    let replay_before = gpu.replay.replay_observation();
+    gpu.hip
+        .device_synchronize()
+        .map_err(|error| error.to_string())?;
+    let started = Instant::now();
+    redline_run_deepseek4_decode(gpu, bundle, context, iterations)
+        .map_err(|error| format!("bench_decode forward failed: {error}"))?;
+    gpu.hip
+        .device_synchronize()
+        .map_err(|error| error.to_string())?;
+    let elapsed = started.elapsed().as_secs_f64();
+    let replay_after = gpu.replay.replay_observation();
+    let capture_summary = if capture {
+        Some(
+            gpu.replay
+                .finish_capture()
+                .map_err(|reason| format!("redline decode capture failed: {reason}"))?,
+        )
+    } else {
+        None
+    };
+
+    loaded.seq_pos = 0;
+    loaded.conversation_tokens.clear();
+    redline_reset_deepseek4(gpu, bundle)?;
+
+    let mut response = serde_json::json!({
+        "type": "decode_result",
+        "context_tokens": context,
+        "iterations": iterations,
+        "ms": elapsed * 1000.0,
+        "us_per_token": elapsed * 1_000_000.0 / iterations as f64,
+        "tok_s": iterations as f64 / elapsed.max(f64::MIN_POSITIVE),
+    });
+    if let Some(summary) = capture_summary {
+        response["redline_capture"] = redline_capture_json(gpu, summary, capture_detail);
+    }
+    if product_route {
+        let prepared = gpu.replay.prepared_route_identity().map(|identity| {
+            serde_json::json!({
+                "dispatches": identity.dispatch_count,
+                "packets": identity.packet_count,
+                "queue_id": identity.queue_id,
+                "command_dwords": identity.command_dwords,
+                "queues": identity.queue_count,
+                "phases": identity.phase_count,
+            })
+        });
+        let sequence = gpu.replay.capture_summary();
+        let replay_delta = replay_after.count.saturating_sub(replay_before.count);
+        response["redline_route"] = serde_json::json!({
+            "requested_backend": format!("{:?}", gpu.replay.request()).to_ascii_lowercase(),
+            "transport": gpu.replay.transport_name(),
+            "state": format!("{:?}", gpu.replay.state()).to_ascii_lowercase(),
+            "fallback_reason": gpu.replay.fallback_reason(),
+            "execution_mode": "plain_ar",
+            "prepared": prepared,
+            "sequence": {
+                "launches": sequence.launch_count,
+                "unique_kernels": sequence.unique_kernel_count,
+                "hash": format!("{:016x}", sequence.sequence_hash),
+            },
+            "observed": {
+                "count_before": replay_before.count,
+                "count_after": replay_after.count,
+                "count_delta": replay_delta,
+                "first_position": replay_after.first_position,
+                "last_position": replay_after.last_position,
+            },
+            "retained_replay_observed": replay_delta > 0,
+        });
+    }
+    Ok(response)
+}
+
+fn redline_shadow_deepseek4(
+    gpu: &mut rdna_compute::Gpu,
+    loaded: &mut LoadedModel,
+    pm4: bool,
+    context: usize,
+    iterations: usize,
+) -> Result<serde_json::Value, String> {
+    if loaded.pp > 1
+        || loaded.ep.is_some()
+        || !matches!(loaded.state.as_ref(), Some(ModelState::Deepseek4(_)))
+    {
+        return Err("redline shadow requires a loaded single-GPU DeepSeek4 model".to_string());
+    }
+    let prepared = if pm4 {
+        let launch_count = gpu.replay.recorded_launches().len();
+        gpu.replay
+            .prepare_pm4_prefix(gpu.device_id as usize, launch_count)
+            .map(|(dispatches, dwords, queue)| (dispatches, 1, queue, Some(dwords)))
+    } else {
+        gpu.replay
+            .prepare_linear_aql(gpu.device_id as usize)
+            .map(|(dispatches, packets, queue)| (dispatches, packets, queue, None))
+    }
+    .map_err(|reason| format!("redline AQL prepare failed: {reason}"))?;
+    let frame_checkpoint = rdna_compute::norm::gdn_requant_frame_checkpoint();
+
+    redline_prime_retained_fixture(gpu, loaded, context)?;
+    let started = Instant::now();
+    let mut gpu_us = 0.0;
+    for index in 0..iterations {
+        redline_prepare_retained_fixture(gpu, loaded, 101 + index as u32, context + index)?;
+        if pm4 {
+            let timing = unsafe { gpu.replay.replay_pm4(context + index) }?;
+            gpu_us += timing.span_microseconds();
+        } else {
+            let timing = unsafe { gpu.replay.replay_linear_aql(context + index) }?;
+            gpu_us += timing.span_microseconds();
+        }
+    }
+    gpu.hip
+        .device_synchronize()
+        .map_err(|error| error.to_string())?;
+    let aql_host_us = started.elapsed().as_secs_f64() * 1_000_000.0;
+    let aql_snapshot = redline_snapshot(gpu, loaded)?;
+
+    redline_prime_retained_fixture(gpu, loaded, context)?;
+    for index in 0..iterations {
+        redline_prepare_retained_fixture(gpu, loaded, 101 + index as u32, context + index)?;
+        gpu.replay_recorded_hip_prefix(prepared.0)
+            .map_err(|error| error.to_string())?;
+    }
+    gpu.hip
+        .device_synchronize()
+        .map_err(|error| error.to_string())?;
+    let blob_snapshot = redline_snapshot(gpu, loaded)?;
+
+    rdna_compute::norm::restore_gdn_requant_frame_checkpoint(frame_checkpoint);
+    redline_prime_retained_fixture(gpu, loaded, context)?;
+    gpu.hip
+        .device_synchronize()
+        .map_err(|error| error.to_string())?;
+    let started = Instant::now();
+    redline_run_direct_fixture(gpu, loaded, context, iterations)?;
+    gpu.hip
+        .device_synchronize()
+        .map_err(|error| error.to_string())?;
+    let hip_host_us = started.elapsed().as_secs_f64() * 1_000_000.0;
+    let hip_snapshot = redline_snapshot(gpu, loaded)?;
+
+    let logits_equal = aql_snapshot.logits() == hip_snapshot.logits();
+    let kv_equal = aql_snapshot.kv() == hip_snapshot.kv();
+    let recurrent_equal = aql_snapshot.recurrent() == hip_snapshot.recurrent();
+    let blob_bit_exact = aql_snapshot.logits() == blob_snapshot.logits()
+        && aql_snapshot.kv() == blob_snapshot.kv()
+        && aql_snapshot.recurrent() == blob_snapshot.recurrent();
+    Ok(serde_json::json!({
+        "type": "redline_shadow_result",
+        "backend": if pm4 { "pm4_ib" } else { "aql_packets" },
+        "context_tokens": context,
+        "iterations": iterations,
+        "dispatches": prepared.0,
+        "packets": prepared.1,
+        "queue_id": prepared.2,
+        "command_dwords": prepared.3,
+        "bit_exact": logits_equal && kv_equal && recurrent_equal,
+        "blob_bit_exact": blob_bit_exact,
+        "logits_equal": logits_equal,
+        "kv_equal": kv_equal,
+        "recurrent_equal": recurrent_equal,
+        "aql_host_us": aql_host_us,
+        "aql_gpu_us": gpu_us,
+        "hip_host_us": hip_host_us,
+        "aql": aql_snapshot.json(),
+        "hip": hip_snapshot.json(),
+        "blob": blob_snapshot.json(),
+    }))
+}
+
+struct RedlineDsparkArm {
+    snapshot: RedlineDsparkVerifySnapshot,
+    guard_before: Vec<u8>,
+    guard_after: Vec<u8>,
+    host_us: f64,
+}
+
+impl RedlineDsparkArm {
+    fn guard_unchanged(&self) -> bool {
+        self.guard_before == self.guard_after
+    }
+
+    fn json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "host_us": self.host_us,
+            "guard_unchanged": self.guard_unchanged(),
+            "guard_bytes": self.guard_after.len(),
+            "guard_before_hash": format!("{:016x}", redline_hash(&self.guard_before)),
+            "guard_after_hash": format!("{:016x}", redline_hash(&self.guard_after)),
+            "snapshot": self.snapshot.json(),
+        })
+    }
+}
+
+fn redline_prime_dspark_shadow_arm(
+    gpu: &mut rdna_compute::Gpu,
+    loaded: &mut LoadedModel,
+    context: usize,
+) -> Result<(), String> {
+    let pbs = loaded
+        .deepseek4_pbs
+        .as_mut()
+        .ok_or_else(|| "DSpark shadow: prefill scratch missing".to_string())?;
+    let bundle = match loaded.state.as_mut() {
+        Some(ModelState::Deepseek4(bundle)) => bundle,
+        _ => return Err("DSpark shadow requires DeepSeek4".to_string()),
+    };
+    redline_reset_deepseek4(gpu, bundle)?;
+    redline_prime_deepseek4(gpu, bundle, pbs, context)?;
+    bundle.state.n_tokens = context as u64;
+    Ok(())
+}
+
+fn redline_dspark_shadow_block(step: usize, batch: usize) -> Vec<u32> {
+    (0..batch)
+        .map(|slot| 101 + ((step * batch + slot) % 1000) as u32)
+        .collect()
+}
+
+fn redline_run_dspark_direct_arm(
+    gpu: &mut rdna_compute::Gpu,
+    loaded: &mut LoadedModel,
+    context: usize,
+    batch: usize,
+    iterations: usize,
+    capture_safe: bool,
+) -> Result<RedlineDsparkArm, String> {
+    redline_prime_dspark_shadow_arm(gpu, loaded, context)?;
+    let bundle = match loaded.state.as_mut() {
+        Some(ModelState::Deepseek4(bundle)) => bundle,
+        _ => unreachable!(),
+    };
+    let guard_before = redline_dspark_verify_guard(gpu, bundle, batch)?;
+    let started = Instant::now();
+    let mut picks = Vec::with_capacity(batch * iterations);
+    for step in 0..iterations {
+        let block = redline_dspark_shadow_block(step, batch);
+        let position = context + step * batch;
+        picks.extend(bundle.redline_dspark_verify_direct(gpu, &block, position, capture_safe)?);
+    }
+    gpu.hip
+        .device_synchronize()
+        .map_err(|error| error.to_string())?;
+    let host_us = started.elapsed().as_secs_f64() * 1_000_000.0;
+    let guard_after = redline_dspark_verify_guard(gpu, bundle, batch)?;
+    let snapshot = redline_dspark_verify_snapshot(gpu, bundle, batch, picks)?;
+    Ok(RedlineDsparkArm {
+        snapshot,
+        guard_before,
+        guard_after,
+        host_us,
+    })
+}
+
+fn redline_run_dspark_capture_arm(
+    gpu: &mut rdna_compute::Gpu,
+    loaded: &mut LoadedModel,
+    controller: &mut rdna_compute::replay::ReplayController,
+    context: usize,
+    batch: usize,
+    iterations: usize,
+) -> Result<
+    (
+        RedlineDsparkArm,
+        deepseek4::spec_impl::DsparkVerifyCaptureInfo,
+    ),
+    String,
+> {
+    redline_prime_dspark_shadow_arm(gpu, loaded, context)?;
+    let bundle = match loaded.state.as_mut() {
+        Some(ModelState::Deepseek4(bundle)) => bundle,
+        _ => unreachable!(),
+    };
+    let guard_before = redline_dspark_verify_guard(gpu, bundle, batch)?;
+    let started = Instant::now();
+    let first_block = redline_dspark_shadow_block(0, batch);
+    let (first_picks, capture) =
+        bundle.redline_dspark_verify_capture_pm4(gpu, controller, &first_block, context)?;
+    let mut picks = Vec::with_capacity(batch * iterations);
+    picks.extend(first_picks);
+    for step in 1..iterations {
+        let block = redline_dspark_shadow_block(step, batch);
+        picks.extend(bundle.redline_dspark_verify_direct(
+            gpu,
+            &block,
+            context + step * batch,
+            true,
+        )?);
+    }
+    gpu.hip
+        .device_synchronize()
+        .map_err(|error| error.to_string())?;
+    let host_us = started.elapsed().as_secs_f64() * 1_000_000.0;
+    let guard_after = redline_dspark_verify_guard(gpu, bundle, batch)?;
+    let snapshot = redline_dspark_verify_snapshot(gpu, bundle, batch, picks)?;
+    Ok((
+        RedlineDsparkArm {
+            snapshot,
+            guard_before,
+            guard_after,
+            host_us,
+        },
+        capture,
+    ))
+}
+
+#[derive(Clone, Copy)]
+enum RedlineDsparkReplayArm {
+    CapturedHip,
+    Pm4,
+}
+
+fn redline_run_dspark_replay_arm(
+    gpu: &mut rdna_compute::Gpu,
+    loaded: &mut LoadedModel,
+    controller: &mut rdna_compute::replay::ReplayController,
+    context: usize,
+    batch: usize,
+    iterations: usize,
+    route: RedlineDsparkReplayArm,
+) -> Result<RedlineDsparkArm, String> {
+    redline_prime_dspark_shadow_arm(gpu, loaded, context)?;
+    let bundle = match loaded.state.as_mut() {
+        Some(ModelState::Deepseek4(bundle)) => bundle,
+        _ => unreachable!(),
+    };
+    let guard_before = redline_dspark_verify_guard(gpu, bundle, batch)?;
+    let started = Instant::now();
+    let mut picks = Vec::with_capacity(batch * iterations);
+    for step in 0..iterations {
+        let block = redline_dspark_shadow_block(step, batch);
+        let position = context + step * batch;
+        let window = match route {
+            RedlineDsparkReplayArm::CapturedHip => {
+                bundle.redline_dspark_verify_captured_hip(gpu, controller, &block, position)?
+            }
+            RedlineDsparkReplayArm::Pm4 => {
+                bundle.redline_dspark_verify_pm4(gpu, controller, &block, position)?
+            }
+        };
+        picks.extend(window);
+    }
+    gpu.hip
+        .device_synchronize()
+        .map_err(|error| error.to_string())?;
+    let host_us = started.elapsed().as_secs_f64() * 1_000_000.0;
+    let guard_after = redline_dspark_verify_guard(gpu, bundle, batch)?;
+    let snapshot = redline_dspark_verify_snapshot(gpu, bundle, batch, picks)?;
+    Ok(RedlineDsparkArm {
+        snapshot,
+        guard_before,
+        guard_after,
+        host_us,
+    })
+}
+
+/// DSpark-specific retained-verify parity oracle.
+///
+/// Four arms start from an identical synthetic prefill state:
+/// shipping ordinary HIP, capture-safe HIP, exact captured HIP blobs, and one
+/// conservative single-queue PM4 IB. Dynamic tokens/positions/counts change at
+/// every window.  Promotion requires equality of outputs, logits, KV,
+/// compressor/recurrent state, hidden captures, active streams, and inactive
+/// same-allocation guard rows.
+fn redline_shadow_dspark_verify_pm4(
+    gpu: &mut rdna_compute::Gpu,
+    loaded: &mut LoadedModel,
+    context: usize,
+    batch: usize,
+    iterations: usize,
+) -> Result<serde_json::Value, String> {
+    if loaded.pp > 1
+        || loaded.ep.is_some()
+        || !matches!(loaded.state.as_ref(), Some(ModelState::Deepseek4(_)))
+    {
+        return Err("DSpark shadow requires a loaded single-GPU DeepSeek4 model".to_string());
+    }
+    if batch == 0 || iterations == 0 {
+        return Err("DSpark shadow batch and iterations must be non-zero".to_string());
+    }
+    if context
+        .saturating_add(batch.saturating_mul(iterations))
+        .saturating_add(32)
+        > loaded.physical_cap
+    {
+        return Err(format!(
+            "DSpark shadow context+windows exceeds physical_cap={}",
+            loaded.physical_cap
+        ));
+    }
+    {
+        let bundle = match loaded.state.as_mut() {
+            Some(ModelState::Deepseek4(bundle)) => bundle,
+            _ => unreachable!(),
+        };
+        if bundle.weights.dspark.is_none() {
+            return Err("DSpark shadow requires a loaded DSpark sidecar".to_string());
+        }
+        bundle.redline_ensure_dspark_verify_pbs(gpu, batch + 1)?;
+    }
+
+    // Materialize lazy verify allocations and code objects before any arm takes
+    // a guard snapshot or starts recording.
+    redline_prime_dspark_shadow_arm(gpu, loaded, context)?;
+    {
+        let bundle = match loaded.state.as_mut() {
+            Some(ModelState::Deepseek4(bundle)) => bundle,
+            _ => unreachable!(),
+        };
+        let warm_block = redline_dspark_shadow_block(0, batch);
+        let _ = bundle.redline_dspark_verify_direct(gpu, &warm_block, context, false)?;
+    }
+    gpu.hip
+        .device_synchronize()
+        .map_err(|error| error.to_string())?;
+
+    let direct = redline_run_dspark_direct_arm(gpu, loaded, context, batch, iterations, false)?;
+    let mut controller = rdna_compute::replay::ReplayController::new_manual_pm4();
+    let (capture_safe, capture_info) =
+        redline_run_dspark_capture_arm(gpu, loaded, &mut controller, context, batch, iterations)?;
+    let captured_hip = redline_run_dspark_replay_arm(
+        gpu,
+        loaded,
+        &mut controller,
+        context,
+        batch,
+        iterations,
+        RedlineDsparkReplayArm::CapturedHip,
+    )?;
+    controller.begin_replay_observation_window();
+    let pm4 = redline_run_dspark_replay_arm(
+        gpu,
+        loaded,
+        &mut controller,
+        context,
+        batch,
+        iterations,
+        RedlineDsparkReplayArm::Pm4,
+    )?;
+
+    let direct_capture_exact = direct.snapshot == capture_safe.snapshot;
+    let blob_bit_exact = capture_safe.snapshot == captured_hip.snapshot;
+    let pm4_bit_exact = capture_safe.snapshot == pm4.snapshot;
+    let guard_exact = direct.guard_unchanged()
+        && capture_safe.guard_unchanged()
+        && captured_hip.guard_unchanged()
+        && pm4.guard_unchanged();
+    let observation = controller.replay_observation();
+    let identity = controller
+        .prepared_route_identity()
+        .ok_or_else(|| "DSpark shadow PM4 identity missing after prepare".to_string())?;
+    let response = serde_json::json!({
+        "type": "redline_dspark_shadow_result",
+        "backend": "pm4_ib",
+        "execution_mode": "dspark_verify",
+        "context_tokens": context,
+        "verify_batch": batch,
+        "iterations": iterations,
+        "bit_exact": direct_capture_exact && blob_bit_exact && pm4_bit_exact && guard_exact,
+        "direct_capture_exact": direct_capture_exact,
+        "blob_bit_exact": blob_bit_exact,
+        "pm4_bit_exact": pm4_bit_exact,
+        "guard_exact": guard_exact,
+        "pm4_components": {
+            "picks_equal": capture_safe.snapshot.picks == pm4.snapshot.picks,
+            "logits_equal": capture_safe.snapshot.target.logits == pm4.snapshot.target.logits,
+            "kv_equal": capture_safe.snapshot.target.kv == pm4.snapshot.target.kv,
+            "recurrent_equal": capture_safe.snapshot.target.recurrent == pm4.snapshot.target.recurrent,
+            "captures_equal": capture_safe.snapshot.captures == pm4.snapshot.captures,
+            "streams_equal": capture_safe.snapshot.streams == pm4.snapshot.streams,
+        },
+        "capture": {
+            "launches": capture_info.capture.launch_count,
+            "unique_kernels": capture_info.capture.unique_kernel_count,
+            "sequence_hash": format!("{:016x}", capture_info.capture.sequence_hash),
+            "aql_contracts": capture_info.aql_contracts,
+        },
+        "prepared": {
+            "dispatches": identity.dispatch_count,
+            "packets": identity.packet_count,
+            "queue_id": identity.queue_id,
+            "command_dwords": identity.command_dwords,
+            "queue_count": identity.queue_count,
+            "phase_count": identity.phase_count,
+        },
+        "observed": {
+            "replays": observation.count,
+            "first_position": observation.first_position,
+            "last_position": observation.last_position,
+            "failed": observation.failed,
+        },
+        "direct": direct.json(),
+        "capture_safe": capture_safe.json(),
+        "captured_hip": captured_hip.json(),
+        "pm4": pm4.json(),
+    });
+    if let Some(ModelState::Deepseek4(bundle)) = loaded.state.as_mut() {
+        redline_reset_deepseek4(gpu, bundle)?;
+    }
+    Ok(response)
+}
+
+fn redline_pm4_prefix_profile_deepseek4(
+    gpu: &mut rdna_compute::Gpu,
+    loaded: &mut LoadedModel,
+    context: usize,
+    start: usize,
+    step: usize,
+    repeats: usize,
+    steady_state: bool,
+) -> Result<serde_json::Value, String> {
+    if loaded.pp > 1
+        || loaded.ep.is_some()
+        || !matches!(loaded.state.as_ref(), Some(ModelState::Deepseek4(_)))
+    {
+        return Err("prefix profile requires a loaded single-GPU DeepSeek4 model".to_string());
+    }
+    let launch_count = gpu.replay.recorded_launches().len();
+    if launch_count == 0 || step == 0 || repeats == 0 || start == 0 || start > launch_count {
+        return Err(
+            "prefix profile requires captured launches and valid start/step/repeats".into(),
+        );
+    }
+    let mut prefixes = (start..launch_count).step_by(step).collect::<Vec<_>>();
+    if prefixes.last().copied() != Some(launch_count) {
+        prefixes.push(launch_count);
+    }
+    let frame_checkpoint = rdna_compute::norm::gdn_requant_frame_checkpoint();
+    if steady_state {
+        rdna_compute::norm::restore_gdn_requant_frame_checkpoint(frame_checkpoint);
+        redline_prime_retained_fixture(gpu, loaded, context)?;
+    }
+    let mut rows = Vec::with_capacity(prefixes.len());
+    for prefix in prefixes {
+        let launch = gpu.replay.recorded_launches()[prefix - 1].clone();
+        let (_, dwords, _) = gpu
+            .replay
+            .prepare_pm4_prefix(gpu.device_id as usize, prefix)?;
+        let mut samples = Vec::with_capacity(repeats);
+        for _ in 0..repeats {
+            if !steady_state {
+                rdna_compute::norm::restore_gdn_requant_frame_checkpoint(frame_checkpoint);
+                redline_prime_retained_fixture(gpu, loaded, context)?;
+            }
+            redline_prepare_retained_fixture(gpu, loaded, 101, context)?;
+            gpu.hip
+                .device_synchronize()
+                .map_err(|error| error.to_string())?;
+            let timing = unsafe { gpu.replay.replay_pm4(context) }?;
+            samples.push(timing.span_microseconds());
+        }
+        let mut ordered = samples.clone();
+        ordered.sort_by(f64::total_cmp);
+        rows.push(serde_json::json!({
+            "prefix": prefix,
+            "last_kernel": launch.kernel,
+            "last_grid": launch.grid,
+            "last_block": launch.block,
+            "command_dwords": dwords,
+            "samples_gpu_us": samples,
+            "median_gpu_us": ordered[ordered.len() / 2],
+        }));
+    }
+    Ok(serde_json::json!({
+        "type": "redline_pm4_prefix_profile",
+        "context_tokens": context,
+        "launches": launch_count,
+        "start": start,
+        "step": step,
+        "repeats": repeats,
+        "steady_state": steady_state,
+        "rows": rows,
+    }))
 }
 
 /// Acquire a machine-wide exclusive lock on ~/.hipfire/daemon.pid.
@@ -1235,6 +2334,18 @@ fn emit_visible_token(stdout: &mut impl std::io::Write, id: &str, text: &str) {
     let _ = stdout.flush();
 }
 
+/// Emit one producer-classified reasoning fragment.
+fn emit_reasoning_token(stdout: &mut impl std::io::Write, id: &str, text: &str) {
+    let envelope = serde_json::json!({
+        "type": "reasoning",
+        "id": id,
+        "text": text,
+        "attempt_id": active_attempt_id(),
+    });
+    let _ = writeln!(stdout, "{}", envelope);
+    let _ = stdout.flush();
+}
+
 /// Canonical `{name, arguments}` array for staged terminal / tool_calls events.
 fn tool_calls_canonical_json(
     calls: &[hipfire_runtime::prompt_frame::ToolCall],
@@ -1331,29 +2442,52 @@ fn emit_spec_cancel_after_rollback(
     );
 }
 
-/// Feed EosFilter-emitted UTF-8 into the AR semantic router and write only
-/// visible prose token events. Complete tool calls stay buffered in the
-/// router until [`qwen_ar_finish_route`].
-fn qwen_ar_route_filter_text(
+/// Route already-classified think/content events in order. Reasoning bypasses
+/// tool parsing; answer content remains subject to ToolOutputRouter.
+fn qwen_ar_route_think_events(
     stdout: &mut impl std::io::Write,
     id: &str,
     router: &mut ToolOutputRouter,
-    text: &str,
+    channel_events: Vec<ThinkRouteEvent>,
     visible_acc: &mut String,
 ) -> Result<(), ToolRouteError> {
-    let events = router.push(text)?;
-    for ev in events {
-        match ev {
-            ToolRouteEvent::VisibleText(vt) => {
-                visible_acc.push_str(vt.as_str());
-                emit_visible_token(stdout, id, vt.as_str());
+    for channel_event in channel_events {
+        match channel_event {
+            ThinkRouteEvent::Reasoning(reasoning) => {
+                emit_reasoning_token(stdout, id, &reasoning);
             }
-            ToolRouteEvent::ToolCall(_) => {
-                // Retained in router.tool_calls(); released only at safe terminal.
+            ThinkRouteEvent::Content(content) => {
+                let events = router.push(&content)?;
+                for ev in events {
+                    match ev {
+                        ToolRouteEvent::VisibleText(vt) => {
+                            visible_acc.push_str(vt.as_str());
+                            emit_visible_token(stdout, id, vt.as_str());
+                        }
+                        ToolRouteEvent::ToolCall(_) => {
+                            // Retained in router.tool_calls(); safe terminal releases it.
+                        }
+                    }
+                }
             }
         }
     }
     Ok(())
+}
+
+/// Feed EosFilter-emitted UTF-8 through think-channel routing, then pass only
+/// answer content to the tool router.
+fn qwen_ar_route_filter_text(
+    stdout: &mut impl std::io::Write,
+    id: &str,
+    think_router: &mut ThinkOutputRouter,
+    router: &mut ToolOutputRouter,
+    text: &str,
+    visible_acc: &mut String,
+) -> Result<(), ToolRouteError> {
+    let mut channel_events = Vec::new();
+    think_router.push_into(text, &mut channel_events);
+    qwen_ar_route_think_events(stdout, id, router, channel_events, visible_acc)
 }
 
 /// Outcome of finishing the Qwen AR semantic router for one turn.
@@ -1483,13 +2617,12 @@ fn qwen_ar_finish_route(
     }
 }
 
-/// EosFilter config for Qwen AR contract-v2 producer path: strip think
-/// spans (including `started_in_think` / orphan closer) and stop without
-/// emitting decoded ChatML / aux EOT marker bytes.
-fn qwen_ar_eos_filter_config(started_in_think: bool) -> EosFilterConfig {
+/// EosFilter config for Qwen AR contract-v2 producer path. EosFilter owns
+/// UTF-8/EOT filtering only; ThinkOutputRouter owns think-channel routing.
+fn qwen_ar_eos_filter_config() -> EosFilterConfig {
     EosFilterConfig {
-        strip_think: true,
-        started_in_think,
+        strip_think: false,
+        started_in_think: false,
         stop_at: vec![b"<|im_end|>".to_vec(), b"<|endoftext|>".to_vec()],
         holdback_prefixes: Vec::new(),
     }
@@ -1502,6 +2635,7 @@ fn qwen_ar_observe_and_route(
     stdout: &mut impl std::io::Write,
     id: &str,
     filter: &mut EosFilter,
+    think_router: &mut ThinkOutputRouter,
     router: &mut ToolOutputRouter,
     new_bytes: &[u8],
     visible_acc: &mut String,
@@ -1510,14 +2644,14 @@ fn qwen_ar_observe_and_route(
         FilterAction::Emit(text_bytes) => {
             let text = std::str::from_utf8(&text_bytes).unwrap_or("");
             if !text.is_empty() {
-                qwen_ar_route_filter_text(stdout, id, router, text, visible_acc)?;
+                qwen_ar_route_filter_text(stdout, id, think_router, router, text, visible_acc)?;
             }
             Ok(false)
         }
         FilterAction::EmitAndStop(text_bytes) => {
             let text = std::str::from_utf8(&text_bytes).unwrap_or("");
             if !text.is_empty() {
-                qwen_ar_route_filter_text(stdout, id, router, text, visible_acc)?;
+                qwen_ar_route_filter_text(stdout, id, think_router, router, text, visible_acc)?;
             }
             Ok(true)
         }
@@ -1527,29 +2661,27 @@ fn qwen_ar_observe_and_route(
 }
 
 /// Shared end-of-stream drain used by production decode and deterministic
-/// tests. Flushes ordinary pending marker-prefix prose into the router;
-/// never drains open think content or completed decoded stop markers.
+/// tests. Flushes EOT-prefix prose through think routing, then classifies any
+/// trailing partial think marker as ordinary text in its current channel.
 fn qwen_ar_drain_pending_into_router(
     stdout: &mut impl std::io::Write,
     id: &str,
     filter: &mut EosFilter,
+    think_router: &mut ThinkOutputRouter,
     router: &mut ToolOutputRouter,
     visible_acc: &mut String,
 ) -> Result<(), ToolRouteError> {
-    if filter.in_think() {
-        // Open think: drop residual; do not flush hidden bytes.
-        let _ = filter.flush_pending();
-        return Ok(());
-    }
     let pending = filter.flush_pending();
-    if pending.is_empty() {
-        return Ok(());
+    if !pending.is_empty() {
+        let text = std::str::from_utf8(&pending).unwrap_or("");
+        if !text.is_empty() {
+            qwen_ar_route_filter_text(stdout, id, think_router, router, text, visible_acc)?;
+        }
     }
-    let text = std::str::from_utf8(&pending).unwrap_or("");
-    if text.is_empty() {
-        return Ok(());
-    }
-    qwen_ar_route_filter_text(stdout, id, router, text, visible_acc)
+
+    let mut channel_events = Vec::new();
+    think_router.finish_into(&mut channel_events);
+    qwen_ar_route_think_events(stdout, id, router, channel_events, visible_acc)
 }
 
 /// Raw-commit bookkeeping shared by production and tests. Advances
@@ -1762,6 +2894,7 @@ fn emit_qwen_ar_open_think_terminal(
 struct QwenArSemanticProducer {
     id: String,
     filter: EosFilter,
+    think_router: ThinkOutputRouter,
     router: ToolOutputRouter,
     visible_acc: String,
     /// Tokens that completed raw-commit before classify for this producer.
@@ -1775,7 +2908,8 @@ impl QwenArSemanticProducer {
     fn new(id: impl Into<String>, started_in_think: bool) -> Self {
         Self {
             id: id.into(),
-            filter: EosFilter::new(qwen_ar_eos_filter_config(started_in_think)),
+            filter: EosFilter::new(qwen_ar_eos_filter_config()),
+            think_router: ThinkOutputRouter::new(started_in_think),
             router: ToolOutputRouter::new(),
             visible_acc: String::new(),
             raw_committed: Vec::new(),
@@ -1821,6 +2955,7 @@ impl QwenArSemanticProducer {
                     stdout,
                     &self.id,
                     &mut self.filter,
+                    &mut self.think_router,
                     &mut self.router,
                     new_bytes.as_ref(),
                     &mut self.visible_acc,
@@ -1892,7 +3027,7 @@ impl QwenArSemanticProducer {
         )
     }
 
-    /// Shared finish: drain pending (when not filter-stopped), then classify.
+    /// Shared finish: drain pending, finalize think routing, then classify.
     /// Emits trailing visible prose only. Tool-call release is deferred to the
     /// caller until after a successful client terminal Commit decision.
     /// Returns `(route_finish, final_visible_text)`.
@@ -1901,22 +3036,19 @@ impl QwenArSemanticProducer {
         stdout: &mut impl std::io::Write,
         hit_length_cap: bool,
     ) -> Result<(QwenArRouteFinish, String), ToolRouteError> {
-        let open_think = self.filter.in_think();
-        if !self.stopped_by_filter {
-            qwen_ar_drain_pending_into_router(
-                stdout,
-                &self.id,
-                &mut self.filter,
-                &mut self.router,
-                &mut self.visible_acc,
-            )?;
-        }
-        // Re-check after drain (drain never leaves think; open_think sticky).
-        let open_think = open_think || self.filter.in_think();
+        qwen_ar_drain_pending_into_router(
+            stdout,
+            &self.id,
+            &mut self.filter,
+            &mut self.think_router,
+            &mut self.router,
+            &mut self.visible_acc,
+        )?;
+        let open_think = self.think_router.in_think();
         let cause =
             QwenArTerminalCause::resolve(self.stopped_by_filter, hit_length_cap, open_think);
         if matches!(cause, QwenArTerminalCause::OpenThink) {
-            // Fail-closed: no hidden bytes/calls, no cache. Caller owns the
+            // Fail-closed: no calls/cache/done. Caller owns the
             // production rollback epilogue + single correlated error terminal
             // (tests call `emit_qwen_ar_open_think_terminal` after finish).
             let finish = QwenArRouteFinish {
@@ -2615,6 +3747,19 @@ fn write_test_state_snapshot(
 /// (or this DS4 helper) rather than a test-only constant.
 fn ds4_gen_start_contract_version() -> Option<u32> {
     gen_start_contract_version_for_arch(9)
+}
+
+/// Open the DS4 EP wire contract before prefill can eventually emit tokens.
+///
+/// EP owns its generation loop instead of routing through the single-device
+/// AR/spec emitters, so it must establish the same contract latch explicitly.
+fn emit_ds4_ep_gen_start(stdout: &mut impl std::io::Write, id: &str, think_mode: ThinkMode) {
+    emit_gen_start(
+        stdout,
+        id,
+        !matches!(think_mode, ThinkMode::NonThink),
+        ds4_gen_start_contract_version(),
+    );
 }
 
 /// Pure `gen_start.contract_version` selection used by the live generate path.
@@ -5561,12 +6706,57 @@ fn main() {
                     continue;
                 }
 
+                let deepseek4_experts_per_token = msg
+                    .get("params")
+                    .and_then(|p| p.get("deepseek4_experts_per_token"))
+                    .and_then(|v| v.as_u64())
+                    .map(|value| value as usize);
+                let deepseek4_compute_placement = match msg
+                    .get("params")
+                    .and_then(|p| p.get("deepseek4_compute_placement"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("single")
+                    .parse::<hipfire_config::Deepseek4ComputePlacement>()
+                {
+                    Ok(placement) => placement,
+                    Err(error) => {
+                        emit_uncorrelated_error(
+                            &mut stdout,
+                            None,
+                            &format!("invalid DeepSeek V4 compute placement: {error}"),
+                            "validation",
+                            false,
+                            false,
+                        );
+                        let _ = stdout.flush();
+                        continue;
+                    }
+                };
                 let loaded = if tp > 1 {
-                    hipfire_loader::load_model_ep(path, max_seq, tp)
+                    if deepseek4_experts_per_token.is_some() {
+                        emit_uncorrelated_error(
+                            &mut stdout,
+                            None,
+                            "DeepSeek V4 experts-per-token override requires tp=1",
+                            "unsupported",
+                            false,
+                            false,
+                        );
+                        let _ = stdout.flush();
+                        continue;
+                    }
+                    hipfire_loader::load_model_ep_with_kv_mode(
+                        path,
+                        max_seq,
+                        tp,
+                        kv_mode_override.as_deref(),
+                    )
                 } else {
                     hipfire_loader::load_model_with_kv_backend(
                         path,
                         max_seq,
+                        deepseek4_experts_per_token,
+                        deepseek4_compute_placement,
                         draft_path.as_deref(),
                         kv_mode_override.as_deref(),
                         kv_backend_override.as_deref(),
@@ -5639,12 +6829,21 @@ fn main() {
                             12 => "north_mini_code",
                             _ => "qwen3",
                         };
-                        let redline_default =
-                            hipfire_runtime::config::mq4r_redline_default(&gpu.arch, path, pp, tp);
+                        let drafter = m.speculator.as_ref().map(|speculator| speculator.name());
+                        let redline_default = hipfire_runtime::config::retained_redline_default(
+                            &gpu.arch,
+                            arch,
+                            path,
+                            pp,
+                            tp,
+                            drafter.is_some(),
+                        );
                         if gpu.replay.configure_model_default(redline_default) && redline_default {
                             eprintln!(
-                                "[redline] enabling fail-closed MQ4R default on {} (transport={})",
+                                "[redline] enabling fail-closed retained default on {} \
+                                 (model_arch={arch}, drafter={}, transport={})",
                                 gpu.arch,
+                                drafter.unwrap_or("off"),
                                 gpu.replay.transport_name()
                             );
                         }
@@ -6743,10 +7942,12 @@ fn main() {
             }
 
             "bench_prefill" => {
-                // Synthetic prefill benchmark — measures forward_prefill_batch on N
-                // deterministic tokens from a zeroed state. Used by `hipfire bench`
-                // to produce canonical pp128/pp512/pp1024 numbers that don't depend
-                // on the user's prompt tokenizing to a round number.
+                // Synthetic prefill benchmark — measures the architecture's
+                // production prefill entry on N deterministic tokens from a
+                // zeroed state. Used by `hipfire bench` to produce canonical
+                // pp128/pp512/pp1024 numbers that don't depend on a prompt
+                // tokenizing to a round number. This stays a synthetic workload;
+                // only the forward path must match production.
                 let m = match model.as_mut() {
                     Some(m) => m,
                     None => {
@@ -6819,6 +8020,11 @@ fn main() {
                 if let Some(b) = m.cohere2moe_mut() {
                     let _ = b.state.reset(&mut gpu);
                 }
+                if let Some(ModelState::Deepseek4(b)) = m.state.as_mut() {
+                    b.state.reset();
+                    b.state.zero_decode_caches(&mut gpu);
+                    gpu.invalidate_graph_state();
+                }
 
                 // Flush any residual GPU work so it doesn't bleed into the
                 // measured interval, then time forward_prefill_batch + a
@@ -6859,26 +8065,27 @@ fn main() {
                     }
                     ok
                 } else if m.arch_id == 9 {
-                    // DeepSeek V4 warm-pass: per-token decode_step. Saturates
-                    // the kernel cache (HC, indexer, compressor,
-                    // attention, MoE) on a short synthetic prompt
-                    // before any user-facing generate. Not the
-                    // production prefill path (that's
-                    // forward_prefill_batch_chunked in `generate`).
-                    let b = m.deepseek4_mut().unwrap();
+                    // DeepSeek V4: exercise the same chunked batched prefill
+                    // entry as `generate_deepseek4`, while retaining the
+                    // deterministic synthetic-token contract of bench_prefill.
+                    // Borrow the PBS and model state as disjoint LoadedModel
+                    // fields, matching the production generate path.
+                    let pbs = m
+                        .deepseek4_pbs
+                        .as_mut()
+                        .expect("deepseek4_pbs missing on arch_id=9 bench_prefill");
+                    let Some(ModelState::Deepseek4(b)) = m.state.as_mut() else {
+                        unreachable!("arch_id=9 requires deepseek4 bundle")
+                    };
                     let config = &b.config;
                     let weights = &b.weights;
                     let state = &mut b.state;
-                    let mut ok = true;
-                    for (i, &tok) in synthetic.iter().enumerate() {
-                        if deepseek4::forward::decode_step(
-                            config, weights, state, &mut gpu, tok, i as u32,
-                        )
-                        .is_err()
-                        {
-                            ok = false;
-                            break;
-                        }
+                    let ok = deepseek4::forward::forward_prefill_batch_chunked(
+                        config, weights, state, &mut gpu, &synthetic, 0, pbs,
+                    )
+                    .is_ok();
+                    if ok {
+                        state.n_tokens = n as u64;
                     }
                     ok
                 } else if m.arch_id == 11 {
@@ -7029,6 +8236,11 @@ fn main() {
                 if let Some(b) = m.minimax_mut() {
                     b.state.reset();
                 }
+                if let Some(ModelState::Deepseek4(b)) = m.state.as_mut() {
+                    b.state.reset();
+                    b.state.zero_decode_caches(&mut gpu);
+                    gpu.invalidate_graph_state();
+                }
 
                 if run_ok {
                     let tok_s = if elapsed > 0.0 {
@@ -7076,6 +8288,22 @@ fn main() {
                         continue;
                     }
                 };
+                if m.arch_id == 9 {
+                    match redline_bench_decode_deepseek4(&mut gpu, m, &msg) {
+                        Ok(response) => {
+                            let _ = writeln!(stdout, "{response}");
+                        }
+                        Err(reason) => {
+                            let _ = writeln!(
+                                stdout,
+                                "{}",
+                                serde_json::json!({"type": "error", "message": reason})
+                            );
+                        }
+                    }
+                    let _ = stdout.flush();
+                    continue;
+                }
                 if m.pp > 1 || m.ep.is_some() || (m.arch_id != 5 && m.arch_id != 6) {
                     emit_uncorrelated_error(
                         &mut stdout,
@@ -7361,6 +8589,43 @@ fn main() {
                 let _ = stdout.flush();
             }
 
+            "redline_dspark_shadow_pm4" => {
+                let context = msg
+                    .get("context_tokens")
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(128) as usize;
+                let batch = msg
+                    .get("verify_batch")
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(3) as usize;
+                let iterations = msg
+                    .get("iterations")
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(15) as usize;
+                let response = model
+                    .as_mut()
+                    .ok_or_else(|| "DSpark shadow requires a loaded model".to_string())
+                    .and_then(|loaded| {
+                        redline_shadow_dspark_verify_pm4(
+                            &mut gpu, loaded, context, batch, iterations,
+                        )
+                    });
+                match response {
+                    Ok(response) => {
+                        let _ = writeln!(stdout, "{response}");
+                    }
+                    Err(reason) => {
+                        let _ = writeln!(
+                            stdout,
+                            "{}",
+                            serde_json::json!({"type": "error", "message": reason})
+                        );
+                    }
+                }
+                let _ = stdout.flush();
+                continue;
+            }
+
             "redline_shadow_aql" | "redline_shadow_pm4" => {
                 let pm4 =
                     msg.get("type").and_then(|value| value.as_str()) == Some("redline_shadow_pm4");
@@ -7372,6 +8637,25 @@ fn main() {
                     .get("iterations")
                     .and_then(|value| value.as_u64())
                     .unwrap_or(1) as usize;
+                if model.as_ref().is_some_and(|loaded| {
+                    matches!(loaded.state.as_ref(), Some(ModelState::Deepseek4(_)))
+                }) {
+                    let loaded = model.as_mut().expect("DeepSeek4 route checked");
+                    match redline_shadow_deepseek4(&mut gpu, loaded, pm4, context, iterations) {
+                        Ok(response) => {
+                            let _ = writeln!(stdout, "{response}");
+                        }
+                        Err(reason) => {
+                            let _ = writeln!(
+                                stdout,
+                                "{}",
+                                serde_json::json!({"type": "error", "message": reason})
+                            );
+                        }
+                    }
+                    let _ = stdout.flush();
+                    continue;
+                }
                 let eligible = model.as_ref().is_some_and(|loaded| {
                     loaded.pp == 1
                         && loaded.ep.is_none()
@@ -7842,6 +9126,37 @@ fn main() {
                     .get("steady_state")
                     .and_then(|value| value.as_bool())
                     .unwrap_or(false);
+                if model.as_ref().is_some_and(|loaded| {
+                    matches!(loaded.state.as_ref(), Some(ModelState::Deepseek4(_)))
+                }) {
+                    let start = msg
+                        .get("start")
+                        .and_then(|value| value.as_u64())
+                        .unwrap_or(step as u64) as usize;
+                    let loaded = model.as_mut().expect("DeepSeek4 route checked");
+                    match redline_pm4_prefix_profile_deepseek4(
+                        &mut gpu,
+                        loaded,
+                        context,
+                        start,
+                        step,
+                        repeats,
+                        steady_state,
+                    ) {
+                        Ok(response) => {
+                            let _ = writeln!(stdout, "{response}");
+                        }
+                        Err(reason) => {
+                            let _ = writeln!(
+                                stdout,
+                                "{}",
+                                serde_json::json!({"type": "error", "message": reason})
+                            );
+                        }
+                    }
+                    let _ = stdout.flush();
+                    continue;
+                }
                 let eligible = model.as_ref().is_some_and(|loaded| {
                     loaded.pp == 1
                         && loaded.ep.is_none()
@@ -8656,7 +9971,9 @@ fn ep_serve_ds4(
     m.conversation_tokens.clear();
 
     let mut parser = match think_mode {
-        ThinkMode::High | ThinkMode::Max => deepseek4::dsml::StreamParser::new_in_think(),
+        ThinkMode::Low | ThinkMode::High | ThinkMode::Max => {
+            deepseek4::dsml::StreamParser::new_in_think()
+        }
         ThinkMode::NonThink => deepseek4::dsml::StreamParser::new(),
     };
     let tool_schemas: Vec<deepseek4::grammar::ToolSchema> = tools
@@ -8726,6 +10043,12 @@ fn ep_serve_ds4(
         );
     };
 
+    // The HTTP stream contract rejects any token before `gen_start`.  EP has
+    // a bespoke decode loop, so unlike the single-device AR/spec paths it does
+    // not inherit their emitter-side latch.  Open it after all early request
+    // validation but before prefill/decode can produce a client event.
+    emit_ds4_ep_gen_start(stdout, id, think_mode);
+
     let t_prefill = Instant::now();
     // FIX #1 (ep-prefill-abort): set when check_abort fires inside the prefill
     // loop. Declared outside the borrow scope so the post-loop abort guard can
@@ -8738,6 +10061,7 @@ fn ep_serve_ds4(
             weights,
             state,
             partials,
+            prefill,
         } = inner
         else {
             emit_active_attempt_error(
@@ -8751,36 +10075,64 @@ fn ep_serve_ds4(
             let _ = stdout.flush();
             return;
         };
-        for (pos, &t) in prompt_ids.iter().enumerate() {
-            // FIX #1 (ep-prefill-abort): check the cancel signal at the TOP of
-            // every prefill iteration, not just after the loop. A long prompt
-            // (thousands of tokens) means the post-loop check below would still
-            // run the entire multi-GPU prefill before honoring a cancel. Mirror
-            // the decode loop: on abort, emit aborted+done, reset KV cursors,
-            // and stop. We must drop the `gpus`/`state` borrow before calling
-            // `ep_emit_abort` (which re-borrows `m.ep`), so break out and let
-            // the post-loop guard fire — but set the abort flag is consumed by
-            // check_abort, so call it here and short-circuit via a flag.
+        if !prefill.is_empty() {
             if check_abort(id) {
-                // Drop the EpState borrow by breaking; the post-loop guard
-                // re-checks via a sentinel. Simpler: emit + return is blocked
-                // by the borrow, so we set `aborted` and break.
                 aborted_in_prefill = true;
-                break;
-            }
-            if let Err(e) = deepseek4::forward::forward_ep(
-                gpus, weights, config, state, partials, t, pos as u32,
+            } else if let Err(e) = deepseek4::forward::forward_ep_prefill_batch_chunked(
+                gpus,
+                weights,
+                config,
+                state,
+                prefill,
+                &prompt_ids,
+                0,
             ) {
                 emit_active_attempt_error(
                     stdout,
                     Some(id),
-                    &format!("forward_ep prefill: {}", format!("{e}").replace('"', "'")),
+                    &format!(
+                        "forward_ep batched prefill: {}",
+                        format!("{e}").replace('"', "'")
+                    ),
                     "validation",
                     false,
                     false,
                 );
                 let _ = stdout.flush();
                 return;
+            }
+        } else {
+            for (pos, &t) in prompt_ids.iter().enumerate() {
+                // FIX #1 (ep-prefill-abort): check the cancel signal at the TOP of
+                // every prefill iteration, not just after the loop. A long prompt
+                // (thousands of tokens) means the post-loop check below would still
+                // run the entire multi-GPU prefill before honoring a cancel. Mirror
+                // the decode loop: on abort, emit aborted+done, reset KV cursors,
+                // and stop. We must drop the `gpus`/`state` borrow before calling
+                // `ep_emit_abort` (which re-borrows `m.ep`), so break out and let
+                // the post-loop guard fire — but set the abort flag is consumed by
+                // check_abort, so call it here and short-circuit via a flag.
+                if check_abort(id) {
+                    // Drop the EpState borrow by breaking; the post-loop guard
+                    // re-checks via a sentinel. Simpler: emit + return is blocked
+                    // by the borrow, so we set `aborted` and break.
+                    aborted_in_prefill = true;
+                    break;
+                }
+                if let Err(e) = deepseek4::forward::forward_ep(
+                    gpus, weights, config, state, partials, t, pos as u32,
+                ) {
+                    emit_active_attempt_error(
+                        stdout,
+                        Some(id),
+                        &format!("forward_ep prefill: {}", format!("{e}").replace('"', "'")),
+                        "validation",
+                        false,
+                        false,
+                    );
+                    let _ = stdout.flush();
+                    return;
+                }
             }
         }
     }
@@ -8906,6 +10258,7 @@ fn ep_serve_ds4(
             weights,
             state,
             partials,
+            ..
         } = inner
         else {
             break;
@@ -12145,9 +13498,6 @@ fn generate_qwen35_mtp(
     // ── Decode loop ─────────────────────────────────────────────────────
     let t_prefill = Instant::now();
     let mut emitted: Vec<u32> = vec![seed_token];
-    let mut streamed_tokens: Vec<u32> = Vec::new();
-    let mut bytes_fed_to_filter = 0usize;
-    let mut filter = EosFilter::new(EosFilterConfig::default());
     let mut last_committed = seed_token;
     let mut cur_pos = prompt_tokens.len();
     let mut generated = 0usize;
@@ -12155,42 +13505,58 @@ fn generate_qwen35_mtp(
     let mut accepted_total = 0usize;
     let mut think_count: usize = 0;
     let mut prev_in_think = false;
-    // Once the cap closes the first reasoning span, stop counting and continue
-    // into the visible answer. The close is applied at a spec-block boundary so
-    // the emitted stream and trunk/MTP caches remain aligned.
+    // MTP force-closes only at a committed block boundary so its target/head
+    // caches stay aligned. Keep that policy local; the shared emitter owns only
+    // byte filtering plus reasoning/content/tool routing for this path.
     let mut think_closed = false;
+    let mut grammar_violated = false;
+    let emit_tools = hipfire_runtime::prompt_frame::qwen35_grammar_on(
+        std::env::var("HIPFIRE_QWEN35_GRAMMAR").ok().as_deref(),
+        &m.model_path,
+    )
+    .then_some(tools)
+    .flatten();
+    let mut emit =
+        hipfire_arch_qwen35::spec_emit::Qwen35Emit::from_ctx(hipfire_runtime::spec::SpecEmitCtx {
+            tokenizer,
+            eos: eos_token,
+            im_end: im_end_token,
+            tools: emit_tools,
+            stop: stop.to_vec(),
+            max_think: 0,
+            max_tokens,
+            assistant_prefix: spec_assistant_prefix(started_in_think),
+            think_mode: ThinkMode::NonThink,
+            decoded_vocab: None,
+        });
 
-    // Emit the seed token first (TTFT = prefill).
-    streamed_tokens.push(seed_token);
-    emit_committed_event(
+    // Open the user-facing stream contract before the seed's committed/token
+    // events. MTP performs its own decode loop and therefore does not inherit
+    // the AR/DFlash gen_start emission.
+    emit_gen_start(
         stdout,
         id,
-        seed_token,
-        streamed_tokens.len() - 1,
-        t0.elapsed().as_millis() as u64,
+        started_in_think,
+        gen_start_contract_version_for_arch(m.arch_id),
     );
-    {
-        let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
-        let new_bytes = &all_bytes[bytes_fed_to_filter..];
-        bytes_fed_to_filter = all_bytes.len();
-        if let FilterAction::Emit(text_bytes) = filter.observe(new_bytes) {
-            if let Ok(text) = std::str::from_utf8(&text_bytes) {
-                let _ = writeln!(
-                    stdout,
-                    r#"{{"type":"token","id":"{}","text":{},"attempt_id":{}}}"#,
-                    id,
-                    serde_json::to_string(&text).unwrap_or_default(),
-                    active_attempt_id()
-                );
-                let _ = stdout.flush();
-            }
-        }
-    }
-    generated += 1;
 
-    let seed_is_eos = seed_token == eos_token
-        || im_end_token == Some(seed_token)
-        || tokenizer.is_terminator(seed_token);
+    // Emit the seed token first (TTFT = prefill) through the shared semantic
+    // router so an open reasoning prefix never leaks into visible content.
+    let seed_begin = emit.begin(seed_token);
+    render_client_events(
+        stdout,
+        id,
+        &seed_begin.events,
+        t0.elapsed().as_millis() as u64,
+        false,
+    );
+    generated += 1;
+    let mut semantic_stop = if spec_stop_is_semantic(seed_begin.stop) {
+        seed_begin.stop
+    } else {
+        None
+    };
+    let seed_is_eos = seed_begin.stop.is_some();
 
     let mut step_error: Option<String> = None;
     while !seed_is_eos && generated < max_tokens {
@@ -12224,44 +13590,31 @@ fn generate_qwen35_mtp(
             if generated >= max_tokens {
                 break;
             }
-            emitted.push(tok);
-            streamed_tokens.push(tok);
-            emit_committed_event(
-                stdout,
-                id,
-                tok,
-                streamed_tokens.len() - 1,
-                t0.elapsed().as_millis() as u64,
-            );
-            let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
-            let new_bytes = &all_bytes[bytes_fed_to_filter..];
-            bytes_fed_to_filter = all_bytes.len();
-            if let FilterAction::Emit(text_bytes) = filter.observe(new_bytes) {
-                if let Ok(text) = std::str::from_utf8(&text_bytes) {
-                    let _ = writeln!(
-                        stdout,
-                        r#"{{"type":"token","id":"{}","text":{},"attempt_id":{}}}"#,
-                        id,
-                        serde_json::to_string(&text).unwrap_or_default(),
-                        active_attempt_id()
-                    );
-                    let _ = stdout.flush();
-                }
-            }
-            generated += 1;
-            if tok == eos_token || im_end_token == Some(tok) || tokenizer.is_terminator(tok) {
+            emit.set_generated_hint(generated);
+            let outcome = emit.observe(tok);
+            if outcome.stop == Some(StopReason::GrammarViolation) {
+                grammar_violated = true;
                 hit_eos = true;
                 break;
             }
-            if !stop.is_empty() {
-                let decoded_suffix = tokenizer.decode(&streamed_tokens);
-                if stop.iter().any(|s| decoded_suffix.ends_with(s.as_str())) {
-                    hit_eos = true;
-                    break;
-                }
+            emitted.push(tok);
+            render_client_events(
+                stdout,
+                id,
+                &outcome.events,
+                t0.elapsed().as_millis() as u64,
+                false,
+            );
+            generated += 1;
+            if semantic_stop.is_none() && spec_stop_is_semantic(outcome.stop) {
+                semantic_stop = outcome.stop;
+            }
+            if outcome.stop.is_some() {
+                hit_eos = true;
+                break;
             }
             if max_think_tokens > 0 && !think_closed {
-                let raw_so_far = tokenizer.decode_bytes(&streamed_tokens);
+                let raw_so_far = tokenizer.decode_bytes(&emitted);
                 let raw_str = std::str::from_utf8(&raw_so_far).unwrap_or("");
                 let in_think = currently_in_think(raw_str, started_in_think);
                 if in_think && !prev_in_think {
@@ -12319,35 +13672,34 @@ fn generate_qwen35_mtp(
         {
             let close_ids = tokenizer.encode(&think_continuation());
             if !close_ids.is_empty() {
+                let mut forced_stop = false;
                 for &ct in &close_ids {
                     if generated >= max_tokens {
                         break;
                     }
+                    emit.set_generated_hint(generated);
+                    let outcome = emit.observe(ct);
+                    if outcome.stop == Some(StopReason::GrammarViolation) {
+                        grammar_violated = true;
+                        forced_stop = true;
+                        break;
+                    }
                     emitted.push(ct);
-                    streamed_tokens.push(ct);
-                    emit_committed_event(
+                    render_client_events(
                         stdout,
                         id,
-                        ct,
-                        streamed_tokens.len() - 1,
+                        &outcome.events,
                         t0.elapsed().as_millis() as u64,
+                        false,
                     );
-                    let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
-                    let new_bytes = &all_bytes[bytes_fed_to_filter..];
-                    bytes_fed_to_filter = all_bytes.len();
-                    if let FilterAction::Emit(text_bytes) = filter.observe(new_bytes) {
-                        if let Ok(text) = std::str::from_utf8(&text_bytes) {
-                            let _ = writeln!(
-                                stdout,
-                                r#"{{"type":"token","id":"{}","text":{},"attempt_id":{}}}"#,
-                                id,
-                                serde_json::to_string(&text).unwrap_or_default(),
-                                active_attempt_id()
-                            );
-                            let _ = stdout.flush();
-                        }
-                    }
                     generated += 1;
+                    if semantic_stop.is_none() && spec_stop_is_semantic(outcome.stop) {
+                        semantic_stop = outcome.stop;
+                    }
+                    if outcome.stop.is_some() {
+                        forced_stop = true;
+                        break;
+                    }
                 }
 
                 // Match the MTP loop's deferred-token invariant: advance the
@@ -12400,12 +13752,21 @@ fn generate_qwen35_mtp(
                 last_committed = *close_ids.last().unwrap();
                 think_closed = true;
                 prev_in_think = false;
+                if forced_stop {
+                    break;
+                }
             }
         }
     }
 
     let t_end = Instant::now();
     let aborted = check_abort(id);
+    let finish = if step_error.is_none() && !aborted {
+        Some(emit.finish())
+    } else {
+        drop(emit);
+        None
+    };
 
     // ── Free the per-request MtpSpecState + put the bundle back ─────────
     // CRITICAL (state-bleed guard): free_gpu releases the MTP-private KV cache
@@ -12438,6 +13799,8 @@ fn generate_qwen35_mtp(
         emit_spec_cancel_after_rollback(stdout, id, generated, &ep);
         return;
     }
+    let finish = finish.expect("normal MTP exit must finalize its emitter");
+    render_client_events(stdout, id, &finish.events, 0, true);
 
     // ── Done envelope ──────────────────────────────────────────────────
     // Timing + pending done fixed before handshake so commit_ready carries
@@ -12467,9 +13830,37 @@ fn generate_qwen35_mtp(
         0.0
     };
     let _ = accepted_total;
-    let hit_length_cap = generated >= max_tokens;
-    let finish_reason = if hit_length_cap { "length" } else { "stop" };
-    let pending_done = serde_json::json!({
+    let hit_length_cap = qwen_dflash_hit_length_cap(
+        generated,
+        max_tokens,
+        finish.decoded_eot,
+        semantic_stop.is_some(),
+    );
+    let visible = if !finish.visible_text.is_empty() {
+        finish.visible_text.clone()
+    } else {
+        qwen_dflash_visible_from_finish(&finish)
+    };
+    let terminal =
+        qwen_dflash_wire_terminal(&finish, hit_length_cap, grammar_violated, &visible, false);
+    let (finish_reason, wire_tool_calls) = match &terminal {
+        QwenDflashWireTerminal::Malformed {
+            message,
+            class,
+            retryable,
+            ..
+        } => {
+            let ep = production_fail_closed_rollback(m, gpu, None, None);
+            emit_qwen_dflash_malformed_terminal(stdout, id, message, class, *retryable, &ep);
+            return;
+        }
+        QwenDflashWireTerminal::Done {
+            finish_reason,
+            wire_tool_calls,
+            ..
+        } => (*finish_reason, wire_tool_calls.as_slice()),
+    };
+    let mut pending_done = serde_json::json!({
         "type": "done",
         "id": id,
         "tokens": generated,
@@ -12486,6 +13877,7 @@ fn generate_qwen35_mtp(
         "finish_reason": finish_reason,
         "attempt_id": active_attempt_id(),
     });
+    stage_terminal_tool_calls(&mut pending_done, finish_reason, wire_tool_calls);
     let decision = await_client_terminal_commit(stdout, id, &pending_done);
     if decision != ClientTerminalDecision::Commit {
         let ep = production_fail_closed_rollback(m, gpu, None, None);
@@ -16972,6 +18364,56 @@ fn generate(
 /// On context overflow the DeepSeek V4 state is hard-reset — DeepSeek V4 has no
 /// eviction path of its own and the SWA cache wraps automatically below
 /// the sliding-window bound.
+// Exact DeepSeek-V4-Flash-0731 effort prefixes from the model's MIT-licensed
+// encoding/encoding_dsv4.py. Keep the trailing blank line: it is part of the
+// parent checkpoint's prompt contract.
+const DEEPSEEK4_REASONING_HIGH_PREFIX: &str = concat!(
+    "Reasoning Effort: Absolute maximum with no shortcuts permitted.\n",
+    "You MUST be very thorough in your thinking and comprehensively decompose the problem to resolve the root cause, rigorously stress-testing your logic against all potential paths, edge cases, and adversarial scenarios.\n",
+    "Explicitly write out your entire deliberation process, documenting every intermediate step, considered alternative, and rejected hypothesis to ensure absolutely no assumption is left unchecked.\n\n",
+);
+const DEEPSEEK4_REASONING_MAX_PREFIX: &str = concat!(
+    "Reasoning Effort: Beyond maximum — exhaustive, relentless, and uncompromising.\n",
+    "You MUST reason with the utmost depth and rigor, leaving absolutely nothing to chance: exhaustively decompose the problem into its most fundamental components, trace every causal chain to its root, and resolve the underlying cause rather than any surface symptom.\n",
+    "Do not stop reasoning until you have independently verified the solution from multiple angles and are certain that no assumption remains unchecked and no error remains undiscovered.\n\n",
+);
+
+fn deepseek4_reasoning_prefix(mode: ThinkMode) -> &'static str {
+    match mode {
+        ThinkMode::High => DEEPSEEK4_REASONING_HIGH_PREFIX,
+        ThinkMode::Max => DEEPSEEK4_REASONING_MAX_PREFIX,
+        ThinkMode::NonThink | ThinkMode::Low => "",
+    }
+}
+
+#[cfg(test)]
+mod deepseek4_reasoning_prefix_tests {
+    use super::{
+        deepseek4_reasoning_prefix, ThinkMode, DEEPSEEK4_REASONING_HIGH_PREFIX,
+        DEEPSEEK4_REASONING_MAX_PREFIX,
+    };
+
+    #[test]
+    fn parent_effort_prefixes_are_distinct_and_low_is_empty() {
+        assert_eq!(deepseek4_reasoning_prefix(ThinkMode::NonThink), "");
+        assert_eq!(deepseek4_reasoning_prefix(ThinkMode::Low), "");
+        assert_eq!(
+            deepseek4_reasoning_prefix(ThinkMode::High),
+            DEEPSEEK4_REASONING_HIGH_PREFIX
+        );
+        assert_eq!(
+            deepseek4_reasoning_prefix(ThinkMode::Max),
+            DEEPSEEK4_REASONING_MAX_PREFIX
+        );
+        assert_ne!(
+            DEEPSEEK4_REASONING_HIGH_PREFIX,
+            DEEPSEEK4_REASONING_MAX_PREFIX
+        );
+        assert!(DEEPSEEK4_REASONING_HIGH_PREFIX.ends_with("\n\n"));
+        assert!(DEEPSEEK4_REASONING_MAX_PREFIX.ends_with("\n\n"));
+    }
+}
+
 fn build_deepseek4_dsml_prompt(
     tokenizer: &hipfire_runtime::tokenizer::Tokenizer,
     system_prompt: Option<&str>,
@@ -17004,12 +18446,6 @@ fn build_deepseek4_dsml_prompt(
     let user_tok = lookup("<｜User｜>");
     let asst_tok = lookup("<｜Assistant｜>");
 
-    // HF "Reasoning Effort: Absolute maximum..." preamble for `Max` mode.
-    // Quoted from the model card's encoding/README.md.
-    const MAX_THINK_PREAMBLE: &str =
-        "Reasoning Effort: Absolute maximum with no shortcuts permitted. \
-You MUST be very thorough in your thinking and comprehensively decompose the problem.";
-
     // Build the effective system message: optional user-supplied system
     // text + (if request has tools) the DSML "## Tools" preamble.
     //
@@ -17040,8 +18476,9 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
     if let Some(b) = bos_tok {
         prompt_ids.push(b);
     }
-    if matches!(think_mode, ThinkMode::Max) {
-        prompt_ids.extend(tokenizer.encode(MAX_THINK_PREAMBLE));
+    let effort_prefix = deepseek4_reasoning_prefix(think_mode);
+    if !effort_prefix.is_empty() {
+        prompt_ids.extend(tokenizer.encode(effort_prefix));
     }
     if let Some(ref sys) = effective_system {
         prompt_ids.extend(tokenizer.encode(sys));
@@ -17223,26 +18660,49 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
     }
     // Thinking-mode signal token immediately after `<｜Assistant｜>`:
     //   NonThink → `</think>`   (skip reasoning, respond directly)
-    //   High|Max → `<think>`    (open a reasoning block)
+    //   Low|High|Max → `<think>` (open a reasoning block)
     match think_mode {
         ThinkMode::NonThink => prompt_ids.extend(tokenizer.encode("</think>")),
-        ThinkMode::High | ThinkMode::Max => prompt_ids.extend(tokenizer.encode("<think>")),
+        ThinkMode::Low | ThinkMode::High | ThinkMode::Max => {
+            prompt_ids.extend(tokenizer.encode("<think>"));
+        }
     }
 
     prompt_ids
 }
 
-/// Resolve whether deepseek4 spec-decode is requested for this model from the
-/// typed process policy.
-/// The dispatch uses this (plus `temp <= 1e-6` and `m.speculator.is_some()`) to
-/// route the spec path through the unified `generate_spec`; the AR path (and the
-/// no-speculator fallback) stay in `generate_deepseek4`.
-fn deepseek4_spec_requested(m: &LoadedModel) -> bool {
-    match hipfire_runtime::config::get().mtp_mode.as_str() {
+/// Resolve whether DeepSeek4 spec-decode is requested from the installed
+/// drafter and typed MTP policy.
+///
+/// DSpark is a distinct speculation selector, not an MTP mode.  The loader has
+/// already applied the typed `dspark_mode` policy before installing the
+/// speculator, so an installed DSpark drafter is authoritative here.  Falling
+/// through to `mtp_mode` for DSpark made `speculation = "dspark"` load and build
+/// the sidecar, then silently route the request through AR because that selector
+/// correctly pins MTP off.
+fn deepseek4_spec_requested_from_policy(
+    drafter_name: Option<&str>,
+    process_mtp_mode: &str,
+    model_mtp_mode: &str,
+    model_mtp_weights_present: bool,
+) -> bool {
+    if drafter_name == Some("dspark") {
+        return true;
+    }
+    match process_mtp_mode {
         "on" => true,
         "off" => false,
-        _ => m.mtp_mode == "on" || (m.mtp_mode == "auto" && m.mtp_weights_present),
+        _ => model_mtp_mode == "on" || (model_mtp_mode == "auto" && model_mtp_weights_present),
     }
+}
+
+fn deepseek4_spec_requested(m: &LoadedModel) -> bool {
+    deepseek4_spec_requested_from_policy(
+        m.speculator.as_ref().map(|s| s.name()),
+        hipfire_runtime::config::get().mtp_mode.as_str(),
+        &m.mtp_mode,
+        m.mtp_weights_present,
+    )
 }
 
 /// deepseek4 MTP spec-decode through the unified `generate_spec` (Phase 4 T4c-2).
@@ -17365,6 +18825,26 @@ fn generate_deepseek4_spec(
         return;
     }
 
+    let required_tokens = plan
+        .start_pos
+        .saturating_add(suffix.len())
+        .saturating_add(max_tokens);
+    if let Some(ModelState::Deepseek4(bundle)) = m.state.as_mut() {
+        if let Err(error) = deepseek4::forward::ensure_compressor_capacity(
+            &bundle.config,
+            &mut bundle.state,
+            gpu,
+            required_tokens,
+        ) {
+            emit_error_with_id(
+                stdout,
+                id,
+                format!("deepseek4 context-capacity preflight failed: {error}"),
+            );
+            return;
+        }
+    }
+
     // DSA decode-cache miss teardown (the part NOT done by the drafter's
     // cache-miss `state.reset()` or generate_spec's seq_pos/conversation clear):
     // zero the position-indexed rings + invalidate the captured decode graph so a
@@ -17402,6 +18882,28 @@ fn generate_deepseek4_spec(
     if let Some(spec) = m.speculator.as_mut() {
         spec.set_sampling(temp, top_p, top_k, cactus_delta);
     }
+
+    // Open the wire contract before any token can reach the client. The CLI's
+    // stream latch (`StreamContractError::PreStartEvent`) fail-closes on any
+    // event that precedes `gen_start`, so without this every DS4 request over
+    // `hipfire serve` dies with "stream must begin with gen_start; got token
+    // before contract latch". Mirrors generate_dflash's emit before
+    // generate_spec.
+    //
+    // `ds4_gen_start_contract_version()` is None for arch 9 — DS4 does not
+    // advertise semantic contract v2, so the client keeps whole-output tool
+    // extraction. That helper exists precisely for this call site.
+    //
+    // started_in_think follows the DS4 frame mapping documented on ThinkMode
+    // (prompt_frame.rs): NonThink renders `<｜Assistant｜></think>`, so the model
+    // begins in visible-answer mode; High/Max render the `<think>` open-token,
+    // so it begins inside the reasoning span.
+    emit_gen_start(
+        stdout,
+        id,
+        !matches!(think_mode, ThinkMode::NonThink),
+        ds4_gen_start_contract_version(),
+    );
     let prompt_tokens_total = prompt_ids.len();
     let run = match generate_spec(
         m,
@@ -17433,6 +18935,11 @@ fn generate_deepseek4_spec(
     // ── ds4 done envelope ────────────────────────────────────────
     let tok_s = if run.decode_s > 0.0 {
         run.generated as f64 / run.decode_s
+    } else {
+        0.0
+    };
+    let prefill_tok_s = if run.prefill_s > 0.0 {
+        run.prefill_tokens_len as f64 / run.prefill_s
     } else {
         0.0
     };
@@ -17508,6 +19015,8 @@ fn generate_deepseek4_spec(
                 "prefill_tokens": run.prefill_tokens_len,
                 "cached_tokens": cached_tokens,
                 "prefill_ms": (run.prefill_s * 1000.0) as u128,
+                "prefill_tok_s": (prefill_tok_s * 10.0).round() / 10.0,
+                "decode_tok_s": (tok_s * 10.0).round() / 10.0,
                 "total_ms": (run.total_s * 1000.0) as u128,
                 "finish_reason": finish_reason,
                 "drafter": drafter,
@@ -17594,6 +19103,25 @@ fn generate_deepseek4(
     tools: Option<&[serde_json::Value]>,
     messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
 ) {
+    if matches!(
+        m.state.as_ref(),
+        Some(ModelState::Deepseek4Heterogeneous(_))
+    ) {
+        generate_deepseek4_heterogeneous(
+            m,
+            stdout,
+            id,
+            prompt,
+            system_prompt,
+            temp,
+            top_p,
+            max_tokens,
+            think_mode,
+            tools,
+            messages_history,
+        );
+        return;
+    }
     let tokenizer = match m.tokenizer.as_ref() {
         Some(t) => t,
         None => {
@@ -17610,7 +19138,7 @@ fn generate_deepseek4(
     // the bundle's `&mut state` below.
     let pbs = m
         .deepseek4_pbs
-        .as_ref()
+        .as_mut()
         .expect("deepseek4_pbs missing on arch_id=9 generate");
     // The single-GPU ds4 bundle (config/weights/state/eos) lives in
     // `ModelState::Deepseek4`. Field-borrow it disjointly so `cfg`/`weights`
@@ -17776,6 +19304,22 @@ fn generate_deepseek4(
         lcp
     };
 
+    // Select/map the complete request's compressed-cache bucket before any
+    // cache reset, prefill, HipGraph capture, or retained-PM4 replay. DS4's
+    // VMM owner addresses remain stable; crossing a geometry bucket re-arms
+    // replay automatically so the new tape is captured once at that shape.
+    let required_tokens = prompt_ids.len().saturating_add(max_tokens);
+    if let Err(error) =
+        deepseek4::forward::ensure_request_capacity(cfg, state, gpu, pbs, required_tokens)
+    {
+        emit_error_with_id(
+            stdout,
+            id,
+            format!("deepseek4 context-capacity preflight failed: {error}"),
+        );
+        return;
+    }
+
     if lcp == 0 {
         // Cache miss — start a fresh conversation in V4F's state.
         state.reset();
@@ -17822,7 +19366,7 @@ fn generate_deepseek4(
     {
         let _ = writeln!(
             stdout,
-            r#"{{"type":"error","id":"{}","message":"prompt exceeds context capacity: prompt={} + max_tokens={} > capacity={} — reload model with a larger max_seq"}}"#,
+            r#"{{"type":"error","id":"{}","message":"prompt exceeds checkpoint context capacity: prompt={} + max_tokens={} > capacity={}"}}"#,
             id,
             start_pos as usize + suffix_tokens.len(),
             max_tokens,
@@ -17957,7 +19501,9 @@ fn generate_deepseek4(
         // `message.content`. NonThink mode appends `</think>` (closing
         // a zero-length think block) so the response starts in Normal.
         let mut parser = match think_mode {
-            ThinkMode::High | ThinkMode::Max => deepseek4::dsml::StreamParser::new_in_think(),
+            ThinkMode::Low | ThinkMode::High | ThinkMode::Max => {
+                deepseek4::dsml::StreamParser::new_in_think()
+            }
             ThinkMode::NonThink => deepseek4::dsml::StreamParser::new(),
         };
 
@@ -18039,6 +19585,18 @@ fn generate_deepseek4(
             .map(|v| v.as_slice())
             .unwrap_or(&empty_vocab);
         let mut grammar_mask: Vec<bool> = vec![true; decoded_vocab.len()];
+
+        // Open the wire contract before the first sample. Same fail-closed CLI
+        // latch as the spec path: any event ahead of `gen_start` aborts the
+        // stream with "stream must begin with gen_start; got token before
+        // contract latch". Placed after prefill and grammar setup but before
+        // the first `sample_token`, so no token can outrun it.
+        emit_gen_start(
+            stdout,
+            id,
+            !matches!(think_mode, ThinkMode::NonThink),
+            ds4_gen_start_contract_version(),
+        );
 
         // Apply mask to the prefill-returned logits before the first
         // sample (matcher is in `Out` here so this is a no-op, but the
@@ -18197,6 +19755,11 @@ fn generate_deepseek4(
         };
         let prompt_tokens_total = prompt_ids.len();
         let prefill_tokens_actual = suffix_tokens.len();
+        let prefill_tok_s = if prefill_ms > 0 {
+            prefill_tokens_actual as f64 * 1000.0 / prefill_ms as f64
+        } else {
+            0.0
+        };
         let mut pending_done = serde_json::json!({
             "type": "done",
             "id": id,
@@ -18206,6 +19769,8 @@ fn generate_deepseek4(
             "prefill_tokens": prefill_tokens_actual,
             "cached_tokens": cached_tokens,
             "prefill_ms": prefill_ms,
+            "prefill_tok_s": (prefill_tok_s * 10.0).round() / 10.0,
+            "decode_tok_s": (tok_s * 10.0).round() / 10.0,
             "total_ms": total_ms,
             "finish_reason": finish_reason,
             "drafter": "ar",
@@ -18283,6 +19848,309 @@ fn generate_deepseek4(
         let _ = tool_calls_parsed_count;
         eprintln!("[req {id}] drafter=ar tau=1.00 tok/s={tok_s:.1} decode ({generated_count} tok, autoregressive)");
     }
+}
+
+fn ds4_heterogeneous_client_abort(
+    model: &mut hipfire_arch_deepseek4::heterogeneous::DeepseekV4HeterogeneousModel,
+    seq_pos: &mut usize,
+    conversation_tokens: &mut Vec<u32>,
+    stdout: &mut impl std::io::Write,
+    id: &str,
+    completion_tokens: usize,
+) {
+    *seq_pos = 0;
+    conversation_tokens.clear();
+    let reset = model.reset_for_request_attested();
+    match reset {
+        Ok(()) => {
+            eprintln!(
+                "[req {id}] drafter=ar-heterogeneous abort=client rollback=attested post_join=true completion_tokens={completion_tokens}"
+            );
+            let (aborted, done) =
+                ds4_ep_abort_wire_events(id, completion_tokens, active_attempt_id());
+            let _ = writeln!(stdout, "{aborted}");
+            let _ = writeln!(stdout, "{done}");
+            let _ = stdout.flush();
+        }
+        Err(error) => emit_active_attempt_error(
+            stdout,
+            Some(id),
+            &format!("client cancelled; heterogeneous rollback failed: {error}"),
+            "runtime",
+            false,
+            false,
+        ),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn generate_deepseek4_heterogeneous(
+    m: &mut LoadedModel,
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    prompt: &str,
+    system_prompt: Option<&str>,
+    temp: f32,
+    top_p: f32,
+    max_tokens: usize,
+    think_mode: ThinkMode,
+    tools: Option<&[serde_json::Value]>,
+    messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
+) {
+    if tools.is_some_and(|items| !items.is_empty()) {
+        emit_active_attempt_error(
+            stdout,
+            Some(id),
+            "tools are not yet admitted on the DeepSeek V4 heterogeneous G4 route",
+            "unsupported",
+            false,
+            false,
+        );
+        let _ = stdout.flush();
+        return;
+    }
+    let Some(tokenizer) = m.tokenizer.as_ref() else {
+        emit_error_with_id(stdout, id, "tokenizer not loaded");
+        return;
+    };
+    let eos_tok = match m.state.as_ref() {
+        Some(ModelState::Deepseek4Heterogeneous(bundle)) => bundle.eos_tok,
+        _ => {
+            emit_error_with_id(stdout, id, "deepseek4 heterogeneous state missing");
+            return;
+        }
+    };
+    let prompt_ids = build_deepseek4_dsml_prompt(
+        tokenizer,
+        system_prompt,
+        None,
+        messages_history,
+        prompt,
+        think_mode,
+        eos_tok,
+        &mut m.asst_turn_cache,
+    );
+    if prompt_ids.is_empty() {
+        emit_error_with_id(stdout, id, "empty prompt after tokenize");
+        return;
+    }
+    if prompt_ids.len().saturating_add(max_tokens) > m.physical_cap {
+        emit_error_with_id(
+            stdout,
+            id,
+            format!(
+                "prompt exceeds checkpoint context capacity: prompt={} + max_tokens={} > capacity={}",
+                prompt_ids.len(),
+                max_tokens,
+                m.physical_cap
+            ),
+        );
+        return;
+    }
+
+    let total_t0 = Instant::now();
+    let prefill_t0 = Instant::now();
+    let (mut logits, prefill_ms) = {
+        let Some(ModelState::Deepseek4Heterogeneous(bundle)) = m.state.as_mut() else {
+            emit_error_with_id(stdout, id, "deepseek4 heterogeneous state missing");
+            return;
+        };
+        if let Err(error) = bundle.model.reset_for_request() {
+            emit_error_with_id(
+                stdout,
+                id,
+                format!("deepseek4 heterogeneous reset failed: {error}"),
+            );
+            return;
+        }
+        let mut logits = Vec::new();
+        for (position, &token) in prompt_ids.iter().enumerate() {
+            match bundle
+                .model
+                .decode_step_with_abort(token, position as u32, &|| check_abort(id))
+            {
+                Ok(Some(next)) => logits = next,
+                Ok(None) => {
+                    ds4_heterogeneous_client_abort(
+                        &mut bundle.model,
+                        &mut m.seq_pos,
+                        &mut m.conversation_tokens,
+                        stdout,
+                        id,
+                        0,
+                    );
+                    return;
+                }
+                Err(error) => {
+                    emit_error_with_id(
+                        stdout,
+                        id,
+                        format!("deepseek4 heterogeneous prefill failed: {error}"),
+                    );
+                    return;
+                }
+            }
+        }
+        if let Some(state) = bundle.model.state.as_mut() {
+            state.n_tokens = prompt_ids.len() as u64;
+        }
+        let _ = bundle.model.dense_gpu.hip.device_synchronize();
+        (logits, prefill_t0.elapsed().as_millis())
+    };
+
+    emit_gen_start(
+        stdout,
+        id,
+        !matches!(think_mode, ThinkMode::NonThink),
+        ds4_gen_start_contract_version(),
+    );
+    let top_k = std::env::var("HIPFIRE_DEEPSEEK4_TOP_K")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0);
+    let mut rng = deepseek4::sampling::Xorshift::new(0x1357_9bdf);
+    let mut parser = match think_mode {
+        ThinkMode::Low | ThinkMode::High | ThinkMode::Max => {
+            deepseek4::dsml::StreamParser::new_in_think()
+        }
+        ThinkMode::NonThink => deepseek4::dsml::StreamParser::new(),
+    };
+    let mut next_tok = deepseek4::sampling::sample_token(&logits, temp, top_k, top_p, &mut rng);
+    let decode_t0 = Instant::now();
+    let mut generated = 0usize;
+    let mut pos = prompt_ids.len() as u32;
+    let mut emitted_tokens = Vec::with_capacity(max_tokens);
+    let mut emit_text_buf = String::new();
+    let mut emit_tool_calls_buf = Vec::new();
+    let mut dsml_malformed = None;
+
+    while generated < max_tokens && next_tok != eos_tok {
+        let fragment = tokenizer.decode(&[next_tok]);
+        for event in parser.feed(&fragment) {
+            ds4_absorb_stream_event(
+                &event,
+                &mut emit_text_buf,
+                &mut emit_tool_calls_buf,
+                &mut dsml_malformed,
+            );
+            emit_stream_event(stdout, id, event);
+        }
+        emit_committed_event(
+            stdout,
+            id,
+            next_tok,
+            generated,
+            decode_t0.elapsed().as_millis() as u64,
+        );
+        let _ = stdout.flush();
+        emitted_tokens.push(next_tok);
+        generated += 1;
+        if generated >= max_tokens {
+            break;
+        }
+        let Some(ModelState::Deepseek4Heterogeneous(bundle)) = m.state.as_mut() else {
+            emit_error_with_id(stdout, id, "deepseek4 heterogeneous state disappeared");
+            return;
+        };
+        match bundle
+            .model
+            .decode_step_with_abort(next_tok, pos, &|| check_abort(id))
+        {
+            Ok(Some(next)) => logits = next,
+            Ok(None) => {
+                ds4_heterogeneous_client_abort(
+                    &mut bundle.model,
+                    &mut m.seq_pos,
+                    &mut m.conversation_tokens,
+                    stdout,
+                    id,
+                    generated,
+                );
+                return;
+            }
+            Err(error) => {
+                emit_error_with_id(
+                    stdout,
+                    id,
+                    format!("deepseek4 heterogeneous decode failed: {error}"),
+                );
+                return;
+            }
+        }
+        pos = pos.saturating_add(1);
+        if let Some(state) = bundle.model.state.as_mut() {
+            state.n_tokens = pos as u64;
+        }
+        next_tok = deepseek4::sampling::sample_token(&logits, temp, top_k, top_p, &mut rng);
+    }
+    for event in parser.finish() {
+        ds4_absorb_stream_event(
+            &event,
+            &mut emit_text_buf,
+            &mut emit_tool_calls_buf,
+            &mut dsml_malformed,
+        );
+        emit_stream_event(stdout, id, event);
+    }
+    let terminal =
+        ds4_ar_ep_finish_route(dsml_malformed, emit_tool_calls_buf, generated >= max_tokens);
+    let (finish_reason, wire_tool_calls) = match terminal {
+        Ds4ArEpRouteTerminal::Malformed(action) => {
+            emit_ds4_malformed_action(stdout, id, &action);
+            return;
+        }
+        Ds4ArEpRouteTerminal::Safe {
+            finish_reason,
+            wire_tool_calls,
+            ..
+        } => (finish_reason, wire_tool_calls),
+    };
+    let decode_ms = decode_t0.elapsed().as_millis().max(1);
+    let tok_s = generated as f64 * 1000.0 / decode_ms as f64;
+    let mut pending_done = serde_json::json!({
+        "type": "done",
+        "id": id,
+        "tokens": generated,
+        "tok_s": tok_s,
+        "prompt_tokens": prompt_ids.len(),
+        "prefill_tokens": prompt_ids.len(),
+        "cached_tokens": 0,
+        "prefill_ms": prefill_ms,
+        "total_ms": total_t0.elapsed().as_millis().max(1),
+        "finish_reason": finish_reason,
+        "drafter": "ar-heterogeneous",
+        "attempt_id": active_attempt_id(),
+    });
+    stage_terminal_tool_calls(&mut pending_done, finish_reason, &wire_tool_calls);
+    let decision = await_client_terminal_commit(stdout, id, &pending_done);
+    let effects = ds4_client_commit_effects(decision, !wire_tool_calls.is_empty(), true);
+    if !effects.emit_done {
+        let Some(ModelState::Deepseek4Heterogeneous(bundle)) = m.state.as_mut() else {
+            emit_error_with_id(
+                stdout,
+                id,
+                "deepseek4 heterogeneous state disappeared on abort",
+            );
+            return;
+        };
+        ds4_heterogeneous_client_abort(
+            &mut bundle.model,
+            &mut m.seq_pos,
+            &mut m.conversation_tokens,
+            stdout,
+            id,
+            generated,
+        );
+        return;
+    }
+    m.seq_pos = pos as usize;
+    m.conversation_tokens.clear();
+    m.conversation_tokens.extend_from_slice(&prompt_ids);
+    m.conversation_tokens.extend_from_slice(&emitted_tokens);
+    emit_staged_terminal_done(stdout, &pending_done);
+    eprintln!(
+        "[req {id}] drafter=ar-heterogeneous tau=1.00 tok/s={tok_s:.1} decode ({generated} tok)"
+    );
 }
 
 fn generate_lfm2moe(
@@ -22196,11 +24064,14 @@ mod qwen_ar_semantic_route_tests {
     }
 
     #[test]
-    fn started_in_think_suppresses_reasoning_until_close() {
+    fn started_in_think_routes_reasoning_until_close() {
         let (out, visible, fin, _, _, _) =
             drive_ar_semantic_path(&["hidden reasoning", "</think>answer"], true, false);
         let fin = fin.expect("finish");
-        assert!(!out.contains("hidden reasoning"));
+        let events = parse_jsonl(&out);
+        assert!(events
+            .iter()
+            .any(|e| { e["type"] == "reasoning" && e["text"] == "hidden reasoning" }));
         assert!(!out.contains("</think>"));
         assert!(!visible.contains("hidden"));
         assert!(visible.contains("answer") || out.contains("answer"));
@@ -22209,13 +24080,16 @@ mod qwen_ar_semantic_route_tests {
     }
 
     #[test]
-    fn paired_think_markers_stripped_from_visible() {
+    fn paired_think_markers_route_reasoning_separately() {
         let (out, visible, fin, _, _, _) =
             drive_ar_semantic_path(&["pre ", "<think>secret</think>", " post"], false, false);
         let fin = fin.expect("finish");
+        let events = parse_jsonl(&out);
         assert!(!out.contains("<think>"));
         assert!(!out.contains("</think>"));
-        assert!(!out.contains("secret"));
+        assert!(events
+            .iter()
+            .any(|e| e["type"] == "reasoning" && e["text"] == "secret"));
         assert!(!visible.contains("secret"));
         assert!(visible.contains("pre ") || out.contains("pre "));
         assert!(
@@ -22319,10 +24193,10 @@ mod qwen_ar_semantic_route_tests {
     }
 
     #[test]
-    fn eos_filter_config_enables_strip_and_both_terminators() {
-        let cfg = qwen_ar_eos_filter_config(true);
-        assert!(cfg.strip_think);
-        assert!(cfg.started_in_think);
+    fn eos_filter_config_delegates_think_and_keeps_both_terminators() {
+        let cfg = qwen_ar_eos_filter_config();
+        assert!(!cfg.strip_think);
+        assert!(!cfg.started_in_think);
         assert!(cfg.stop_at.contains(&b"<|im_end|>".to_vec()));
         assert!(cfg.stop_at.contains(&b"<|endoftext|>".to_vec()));
     }
@@ -22523,7 +24397,7 @@ mod qwen_ar_semantic_route_tests {
 
     #[test]
     fn open_think_is_fail_closed_validation_no_cache() {
-        // Finding 2: open think → no hidden bytes/calls, validation terminal, no cache.
+        // Open think streams reasoning, then fails closed: no calls/done/cache.
         let (out, visible, fin, _, _, _) = drive_ar_semantic_path(&["still thinking"], true, false);
         let fin = fin.expect("open think returns Ok finish with error cause");
         assert_eq!(fin.cause, QwenArTerminalCause::OpenThink);
@@ -22531,9 +24405,11 @@ mod qwen_ar_semantic_route_tests {
         assert!(fin.wire_tool_calls.is_empty());
         assert!(!fin.store_cache);
         assert!(visible.is_empty());
-        assert!(!out.contains("still thinking"));
-        assert!(!out.contains("<think>"));
         let events = parse_jsonl(&out);
+        assert!(events
+            .iter()
+            .any(|e| { e["type"] == "reasoning" && e["text"] == "still thinking" }));
+        assert!(!out.contains("<think>"));
         assert!(
             events
                 .iter()
@@ -22577,10 +24453,13 @@ mod qwen_ar_semantic_route_tests {
         let (out, visible, fin, _, _, _) =
             drive_ar_semantic_path(&["pre ", "<think>secret"], false, false);
         let fin = fin.expect("open think");
+        let events = parse_jsonl(&out);
         assert_eq!(fin.cause, QwenArTerminalCause::OpenThink);
         assert!(!fin.store_cache);
         assert!(visible.is_empty() || !visible.contains("secret"));
-        assert!(!out.contains("secret"));
+        assert!(events
+            .iter()
+            .any(|e| e["type"] == "reasoning" && e["text"] == "secret"));
         assert!(!out.contains("\"type\":\"tool_calls\""));
     }
 
@@ -22751,7 +24630,10 @@ mod qwen_ar_semantic_route_tests {
             let (out, visible, fin, _, _, _) = drive_ar_semantic_path(&chunks, false, false);
             let fin = fin.expect("finish");
             assert!(!out.contains("<think>"), "open split={split}");
-            assert!(!out.contains("secret"));
+            let events = parse_jsonl(&out);
+            assert!(events
+                .iter()
+                .any(|e| e["type"] == "reasoning" && e["text"] == "secret"));
             assert_eq!(fin.finish_reason, "stop");
             assert!(visible.contains("pre ") || out.contains("pre "));
             assert!(
@@ -22767,7 +24649,10 @@ mod qwen_ar_semantic_route_tests {
             let (out, visible, fin, _, _, _) = drive_ar_semantic_path(&chunks, false, false);
             let fin = fin.expect("finish");
             assert!(!out.contains("</think>"), "close split={split}");
-            assert!(!out.contains("secret"));
+            let events = parse_jsonl(&out);
+            assert!(events
+                .iter()
+                .any(|e| e["type"] == "reasoning" && e["text"] == "secret"));
             assert_eq!(fin.finish_reason, "stop");
             assert!(visible.contains("pre ") || out.contains("pre "));
         }
@@ -23229,10 +25114,11 @@ mod ds4_malformed_terminal_tests {
         ds4_ar_ep_finish_route, ds4_cache_action, ds4_client_commit_effects,
         ds4_ep_abort_wire_events, ds4_gen_start_contract_version, ds4_malformed_terminal_action,
         ds4_spec_finish_route, ds4_spec_wire_terminal, ds4_stream_event_wireable,
-        emit_ds4_malformed_action, emit_ds4_malformed_terminal,
-        gen_start_contract_version_for_arch, normalize_asst_turn_for_fingerprint,
-        set_active_attempt_id, spec_outcome_seed_committable, spec_should_flush_pending_seed,
-        ClientTerminalDecision, Ds4ArEpRouteTerminal, Ds4ClientCommitEffects, Ds4SpecWireTerminal,
+        emit_ds4_ep_gen_start, emit_ds4_malformed_action, emit_ds4_malformed_terminal,
+        emit_visible_token, gen_start_contract_version_for_arch,
+        normalize_asst_turn_for_fingerprint, set_active_attempt_id, spec_outcome_seed_committable,
+        spec_should_flush_pending_seed, ClientTerminalDecision, Ds4ArEpRouteTerminal,
+        Ds4ClientCommitEffects, Ds4SpecWireTerminal,
     };
     use hipfire_arch_deepseek4::dsml::{
         DsmlDeferredCalls, DsmlDeferredOutcome, StreamEvent, StreamParser, TOOL_CALLS_CLOSE,
@@ -23562,6 +25448,31 @@ mod ds4_malformed_terminal_tests {
         assert_eq!(gen_start_contract_version_for_arch(5), Some(2));
         assert_eq!(gen_start_contract_version_for_arch(6), Some(2));
         assert_eq!(super::QWEN_AR_SEMANTIC_CONTRACT_VERSION, 2);
+    }
+
+    #[test]
+    fn ds4_ep_opens_wire_contract_before_first_token() {
+        use hipfire_runtime::prompt_frame::ThinkMode;
+
+        set_active_attempt_id(31);
+        let mut sink = Vec::new();
+        emit_ds4_ep_gen_start(&mut sink, "req-ep", ThinkMode::NonThink);
+        emit_visible_token(&mut sink, "req-ep", "hello");
+
+        let events: Vec<serde_json::Value> = String::from_utf8(sink)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0]["type"], "gen_start");
+        assert_eq!(events[0]["id"], "req-ep");
+        assert_eq!(events[0]["started_in_think"], false);
+        assert_eq!(events[0]["attempt_id"], 31);
+        assert_eq!(events[1]["type"], "token");
+        assert_eq!(events[1]["text"], "hello");
+        assert_eq!(events[1]["attempt_id"], 31);
+        set_active_attempt_id(0);
     }
 
     // ── Task 4 definitive terminal-edge blockers (DS4 cache + empty EOS) ──
@@ -24474,7 +26385,15 @@ mod qwen_dflash_semantic_terminal_tests {
     fn open_think_is_error_xor_done_no_cache() {
         // Production emitter (prompt-started OpenThink) -> real FinishSummary
         // -> production wire terminal. No hand-built open_think mirrors.
-        let (_stream, fin, _raw) = drive_qwen_emit("still thinking", AssistantPrefix::OpenThink);
+        let (stream, fin, _raw) = drive_qwen_emit("still thinking", AssistantPrefix::OpenThink);
+        let reasoning: String = stream
+            .iter()
+            .filter_map(|e| match e {
+                ClientEvent::Reasoning(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(reasoning, "still thinking");
         assert!(fin.open_think, "emitter must latch open_think");
         assert_eq!(fin.finish_reason, "open_think");
         assert!(fin.events.is_empty());
@@ -24526,7 +26445,20 @@ mod qwen_dflash_semantic_terminal_tests {
             ("generated", AssistantPrefix::Plain, "pre <think>secret"),
         ];
         for (label, prefix, body) in cases {
-            let (_stream, fin, _raw) = drive_qwen_emit(body, prefix);
+            let (stream, fin, _raw) = drive_qwen_emit(body, prefix);
+            let reasoning: String = stream
+                .iter()
+                .filter_map(|e| match e {
+                    ClientEvent::Reasoning(text) => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect();
+            let expected_reasoning = if label == "prompt" {
+                "still thinking"
+            } else {
+                "secret"
+            };
+            assert_eq!(reasoning, expected_reasoning, "{label}");
             assert!(fin.open_think, "{label}: open_think");
             assert_eq!(fin.finish_reason, "open_think", "{label}");
             assert_eq!(fin.tool_calls, 0, "{label}");
@@ -27217,7 +29149,10 @@ mod qwen_dflash_semantic_terminal_tests {
 /// Production symbols only — no generate() side effects.
 #[cfg(test)]
 mod generation_route_matrix_tests {
-    use super::{select_generation_route, GenerationRoute, GenerationRouteInputs};
+    use super::{
+        deepseek4_spec_requested_from_policy, select_generation_route, GenerationRoute,
+        GenerationRouteInputs,
+    };
 
     /// Baseline inputs that select nothing special (unknown arch, no EP/PP/spec).
     fn base() -> GenerationRouteInputs {
@@ -27240,6 +29175,22 @@ mod generation_route_matrix_tests {
             supports_temp_swor: false,
             kv_adaptive: false,
         }
+    }
+
+    #[test]
+    fn dspark_request_is_independent_of_mtp_mode() {
+        assert!(deepseek4_spec_requested_from_policy(
+            Some("dspark"),
+            "off",
+            "off",
+            false,
+        ));
+        assert!(!deepseek4_spec_requested_from_policy(
+            None, "off", "auto", true,
+        ));
+        assert!(deepseek4_spec_requested_from_policy(
+            None, "auto", "auto", true,
+        ));
     }
 
     /// One canonical input row that selects each ALL variant (coverage guard).

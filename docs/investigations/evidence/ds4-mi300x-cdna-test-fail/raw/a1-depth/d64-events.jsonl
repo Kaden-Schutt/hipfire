@@ -1,0 +1,33 @@
+{"type":"pong"}
+{"type":"loaded","arch":"deepseek4","dim":0,"layers":0,"vocab":0,"vl":false,"cache_capable":true,"retry_reset_eligible":false}
+{"type":"token","id":"g0-depth-64","text":"This is a","attempt_id":1}
+{"type":"token","id":"g0-depth-64","text":" techn","attempt_id":1}
+{"type":"token","id":"g0-depth-64","text":"ical, prod","attempt_id":1}
+{"type":"token","id":"g0-depth-64","text":"uct","attempt_id":1}
+{"type":"token","id":"g0-depth-64","text":"ion-","attempt_id":1}
+{"type":"token","id":"g0-depth-64","text":"grade brea","attempt_id":1}
+{"type":"token","id":"g0-depth-64","text":"kdown","attempt_id":1}
+{"type":"token","id":"g0-depth-64","text":" of ","attempt_id":1}
+{"type":"token","id":"g0-depth-64","text":"th","attempt_id":1}
+{"type":"token","id":"g0-depth-64","text":"e i","attempt_id":1}
+{"type":"token","id":"g0-depth-64","text":"nfer","attempt_id":1}
+{"type":"token","id":"g0-depth-64","text":"en","attempt_id":1}
+{"type":"token","id":"g0-depth-64","text":"c","attempt_id":1}
+{"type":"token","id":"g0-depth-64","text":"e","attempt_id":1}
+{"type":"token","id":"g0-depth-64","text":" p","attempt_id":1}
+{"type":"token","id":"g0-depth-64","text":"ath ","attempt_id":1}
+{"type":"token","id":"g0-depth-64","text":"for a ","attempt_id":1}
+{"type":"token","id":"g0-depth-64","text":"**D","attempt_id":1}
+{"type":"token","id":"g0-depth-64","text":"e","attempt_id":1}
+{"type":"token","id":"g0-depth-64","text":"epSeV4","attempt_id":1}
+{"type":"token","id":"g0-depth-64","text":"-F","attempt_id":1}
+{"type":"token","id":"g0-depth-64","text":"las","attempt_id":1}
+{"type":"token","id":"g0-depth-64","text":"h-s","attempt_id":1}
+{"type":"token","id":"g0-depth-64","text":"tyl","attempt_id":1}
+{"type":"token","id":"g0-depth-64","text":"e M","attempt_id":1}
+{"type":"token","id":"g0-depth-64","text":"oE ","attempt_id":1}
+{"type":"token","id":"g0-depth-64","text":"mod","attempt_id":1}
+{"type":"token","id":"g0-depth-64","text":"el** on an **AMD MI300","attempt_id":1}
+{"type":"commit_ready","id":"g0-depth-64","tokens":32,"tok_s":35.35911602209945,"prompt_tokens":69,"prefill_tokens":69,"cached_tokens":0,"prefill_ms":860,"total_ms":1765,"finish_reason":"length","drafter":"ar","attempt_id":1}
+{"type":"aborted","id":"g0-depth-64","reason":"client_cancelled","attempt_id":1}
+{"type":"done","id":"g0-depth-64","finish_reason":"aborted","prompt_tokens":0,"completion_tokens":32,"prefill_ms":0,"decode_ms":0,"attempt_id":1}

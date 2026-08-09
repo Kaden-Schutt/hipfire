@@ -22,7 +22,7 @@
 
 use hip_bridge::{
     DeviceBuffer, Event, HipError, HipResult, RcclComms, HIP_ERROR_PEER_ACCESS_ALREADY_ENABLED,
-    HIP_ERROR_PEER_ACCESS_UNSUPPORTED,
+    HIP_ERROR_PEER_ACCESS_UNSUPPORTED, HIP_EVENT_DISABLE_TIMING, HIP_EVENT_RELEASE_TO_SYSTEM,
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
 
@@ -82,6 +82,14 @@ pub struct Gpus {
     /// `count` seen. Leaked on teardown (raw `DeviceBuffer`, no Drop-free).
     peer_ar_tmp: Vec<Vec<DeviceBuffer>>,
     peer_ar_tmp_bytes: usize,
+    /// One process-lifetime dependency event per rank for peer-consumer
+    /// collectives. Re-recording avoids 86 create/destroy pairs per DS4 token.
+    rank_barrier_events: Vec<Event>,
+    /// One 8-byte system-visible epoch per rank for the exact-gated gfx1201
+    /// TP3/TP4 graph route. Each captured barrier advances the epoch.
+    tp_graph_signals: Vec<DeviceBuffer>,
+    tp_graph_barrier_count: usize,
+    tp_graph_capture_epoch: usize,
 }
 
 const DEFAULT_VRAM_TOLERANCE_GB: f64 = 2.0;
@@ -166,6 +174,10 @@ impl Gpus {
             givens_sin_per_dev: Vec::new(),
             peer_ar_tmp: Vec::new(),
             peer_ar_tmp_bytes: 0,
+            rank_barrier_events: Vec::new(),
+            tp_graph_signals: Vec::new(),
+            tp_graph_barrier_count: 0,
+            tp_graph_capture_epoch: 0,
         }
     }
 
@@ -215,6 +227,10 @@ impl Gpus {
             givens_sin_per_dev: Vec::new(),
             peer_ar_tmp: Vec::new(),
             peer_ar_tmp_bytes: 0,
+            rank_barrier_events: Vec::new(),
+            tp_graph_signals: Vec::new(),
+            tp_graph_barrier_count: 0,
+            tp_graph_capture_epoch: 0,
         })
     }
 
@@ -398,6 +414,310 @@ impl Gpus {
         wait_result.and(destroy_result)
     }
 
+    /// Enqueue an all-rank producer barrier using process-lifetime events.
+    ///
+    /// Each rank records its event after producing a peer-visible tensor, then
+    /// every other rank waits before launching its fused peer consumer. Events
+    /// are deliberately reused: HIP wait semantics bind to the most recent
+    /// record visible when the wait is enqueued, and each next record follows
+    /// the prior consumer on the same FIFO stream.
+    pub fn barrier_rank_streams_reuse(&mut self) -> HipResult<()> {
+        if self.tp_graph_signals.len() == self.devices.len()
+            && matches!(self.devices.len(), 3 | 4)
+            && self.devices.iter().all(|device| device.graphs.capture_mode)
+        {
+            return self.capture_tp_graph_barrier();
+        }
+
+        let n = self.devices.len();
+        if self.rank_barrier_events.is_empty() {
+            let mut events = Vec::with_capacity(n);
+            for rank in 0..n {
+                let gpu = &self.devices[rank];
+                gpu.bind_thread()?;
+                match gpu
+                    .hip
+                    .event_create_with_flags(HIP_EVENT_DISABLE_TIMING | HIP_EVENT_RELEASE_TO_SYSTEM)
+                {
+                    Ok(event) => events.push(event),
+                    Err(error) => {
+                        for (owner, event) in events.drain(..).enumerate() {
+                            let _ = self.devices[owner].hip.event_destroy(event);
+                        }
+                        return Err(error);
+                    }
+                }
+            }
+            self.rank_barrier_events = events;
+        } else if self.rank_barrier_events.len() != n {
+            return Err(HipError::new(
+                0,
+                &format!(
+                    "barrier_rank_streams_reuse: event count {} != device count {n}",
+                    self.rank_barrier_events.len()
+                ),
+            ));
+        }
+
+        for rank in 0..n {
+            let gpu = &self.devices[rank];
+            gpu.bind_thread()?;
+            let stream = gpu.active_stream.as_ref().ok_or_else(|| {
+                HipError::new(
+                    0,
+                    &format!("barrier_rank_streams_reuse: device {rank} has no active_stream"),
+                )
+            })?;
+            gpu.hip
+                .event_record(&self.rank_barrier_events[rank], Some(stream))?;
+        }
+
+        for destination in 0..n {
+            let gpu = &self.devices[destination];
+            gpu.bind_thread()?;
+            let stream = gpu.active_stream.as_ref().expect("validated above");
+            for source in 0..n {
+                if source != destination {
+                    gpu.hip
+                        .stream_wait_event(stream, &self.rank_barrier_events[source])?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// One-way stream-event handoff from a rank that produced peer-visible
+    /// state to every other rank that will consume it next.
+    ///
+    /// Unlike [`Self::barrier_rank_streams_reuse`], this does not wait for the
+    /// destination ranks and therefore can be inserted between an owner-first
+    /// producer launch and the remaining peer consumers without deadlocking.
+    /// The event uses a system-scope release and is reused with FIFO stream
+    /// ordering, matching the full-rank barrier's lifetime contract.
+    pub fn handoff_rank_stream_reuse(&mut self, source: usize) -> HipResult<()> {
+        let n = self.devices.len();
+        if source >= n {
+            return Err(HipError::new(
+                0,
+                &format!("handoff_rank_stream_reuse: source={source} out of range (n_devices={n})"),
+            ));
+        }
+        if self.rank_barrier_events.is_empty() {
+            let mut events = Vec::with_capacity(n);
+            for rank in 0..n {
+                let gpu = &self.devices[rank];
+                gpu.bind_thread()?;
+                match gpu
+                    .hip
+                    .event_create_with_flags(HIP_EVENT_DISABLE_TIMING | HIP_EVENT_RELEASE_TO_SYSTEM)
+                {
+                    Ok(event) => events.push(event),
+                    Err(error) => {
+                        for (owner, event) in events.drain(..).enumerate() {
+                            let _ = self.devices[owner].hip.event_destroy(event);
+                        }
+                        return Err(error);
+                    }
+                }
+            }
+            self.rank_barrier_events = events;
+        } else if self.rank_barrier_events.len() != n {
+            return Err(HipError::new(
+                0,
+                &format!(
+                    "handoff_rank_stream_reuse: event count {} != device count {n}",
+                    self.rank_barrier_events.len()
+                ),
+            ));
+        }
+
+        let producer = &self.devices[source];
+        producer.bind_thread()?;
+        let producer_stream = producer.active_stream.as_ref().ok_or_else(|| {
+            HipError::new(
+                0,
+                &format!("handoff_rank_stream_reuse: source device {source} has no active_stream"),
+            )
+        })?;
+        producer
+            .hip
+            .event_record(&self.rank_barrier_events[source], Some(producer_stream))?;
+
+        for destination in 0..n {
+            if destination == source {
+                continue;
+            }
+            let consumer = &self.devices[destination];
+            consumer.bind_thread()?;
+            let consumer_stream = consumer.active_stream.as_ref().ok_or_else(|| {
+                HipError::new(
+                    0,
+                    &format!(
+                        "handoff_rank_stream_reuse: destination device {destination} has no active_stream"
+                    ),
+                )
+            })?;
+            consumer
+                .hip
+                .stream_wait_event(consumer_stream, &self.rank_barrier_events[source])?;
+        }
+        Ok(())
+    }
+
+    /// Allocate one fixed gfx1201 TP3/TP4 graph epoch before peer access is
+    /// enabled. ROCm signal memory accepts the proven 8-byte allocation; a
+    /// monotonically increasing epoch reuses it for every layer boundary.
+    pub fn prepare_tp_graph_signals(&mut self, barriers: usize) -> HipResult<()> {
+        if !matches!(self.devices.len(), 3 | 4)
+            || !self
+                .devices
+                .iter()
+                .all(|device| device.arch_caps.is_gfx1201())
+        {
+            return Err(HipError::new(
+                0,
+                "prepare_tp_graph_signals requires three or four gfx1201 devices",
+            ));
+        }
+        if barriers == 0 {
+            return Err(HipError::new(
+                0,
+                "prepare_tp_graph_signals requires at least one barrier",
+            ));
+        }
+        if !self.tp_graph_signals.is_empty() {
+            return if self.tp_graph_barrier_count == barriers {
+                Ok(())
+            } else {
+                Err(HipError::new(
+                    0,
+                    "prepare_tp_graph_signals cannot resize a live signal tape",
+                ))
+            };
+        }
+
+        let bytes = std::mem::size_of::<u64>();
+        let n = self.devices.len();
+        let mut signals = Vec::with_capacity(n);
+        for rank in 0..n {
+            let gpu = &self.devices[rank];
+            gpu.bind_thread()?;
+            match gpu.hip.malloc_signal(bytes) {
+                Ok(signal) => {
+                    if let Err(error) = gpu.hip.memset(&signal, 0, bytes) {
+                        let _ = gpu.hip.free(signal);
+                        for (owner, allocated) in signals.drain(..).enumerate() {
+                            let _ = self.devices[owner].hip.free(allocated);
+                        }
+                        return Err(error);
+                    }
+                    signals.push(signal);
+                }
+                Err(error) => {
+                    for (owner, allocated) in signals.drain(..).enumerate() {
+                        let _ = self.devices[owner].hip.free(allocated);
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        self.tp_graph_signals = signals;
+        self.tp_graph_barrier_count = barriers;
+        self.tp_graph_capture_epoch = 0;
+        Ok(())
+    }
+
+    /// Reset every captured producer epoch before launching any rank graph.
+    pub fn reset_tp_graph_signals(&mut self) -> HipResult<()> {
+        if self.tp_graph_signals.len() != self.devices.len() || self.tp_graph_barrier_count == 0 {
+            return Err(HipError::new(0, "TP graph signal tape is not prepared"));
+        }
+        let bytes = std::mem::size_of::<u64>();
+        for rank in 0..self.devices.len() {
+            let gpu = &self.devices[rank];
+            gpu.bind_thread()?;
+            gpu.hip.memset(&self.tp_graph_signals[rank], 0, bytes)?;
+        }
+        Ok(())
+    }
+
+    /// Rewind the capture-time barrier cursor. The next 86 DS4 boundaries map
+    /// deterministically to signal slots 0..85 in every rank graph.
+    pub fn begin_tp_graph_signal_capture(&mut self) -> HipResult<()> {
+        if self.tp_graph_signals.len() != self.devices.len() || self.tp_graph_barrier_count == 0 {
+            return Err(HipError::new(0, "TP graph signal tape is not prepared"));
+        }
+        self.tp_graph_capture_epoch = 0;
+        Ok(())
+    }
+
+    pub fn tp_graph_captured_signal_count(&self) -> usize {
+        self.tp_graph_capture_epoch
+    }
+
+    pub fn tp_graph_signals_ready(&self, barriers: usize) -> bool {
+        self.tp_graph_signals.len() == self.devices.len()
+            && matches!(self.devices.len(), 3 | 4)
+            && self.tp_graph_barrier_count == barriers
+    }
+
+    /// Free the exact-gated TP4 signal tape after every captured rank graph has
+    /// been invalidated. Idempotent so failed-load and ordinary unload paths can
+    /// share it.
+    pub fn free_tp_graph_signals(&mut self) -> HipResult<()> {
+        let signals = std::mem::take(&mut self.tp_graph_signals);
+        let mut first_error = None;
+        for (rank, signal) in signals.into_iter().enumerate() {
+            if let Err(error) = self.devices[rank]
+                .bind_thread()
+                .and_then(|_| self.devices[rank].hip.free(signal))
+            {
+                first_error.get_or_insert(error);
+            }
+        }
+        self.tp_graph_barrier_count = 0;
+        self.tp_graph_capture_epoch = 0;
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    fn capture_tp_graph_barrier(&mut self) -> HipResult<()> {
+        let epoch_index = self.tp_graph_capture_epoch;
+        if epoch_index >= self.tp_graph_barrier_count {
+            return Err(HipError::new(
+                0,
+                &format!(
+                    "TP graph barrier epoch {epoch_index} exceeds prepared capacity {}",
+                    self.tp_graph_barrier_count
+                ),
+            ));
+        }
+        let epoch = u32::try_from(epoch_index + 1)
+            .map_err(|_| HipError::new(0, "TP graph barrier epoch exceeds u32"))?;
+        let signals = &self.tp_graph_signals;
+        let devices = &mut self.devices;
+        let n = devices.len();
+        for rank in 0..n {
+            devices[rank].tp_graph_signal_store_gfx1201(&signals[rank], epoch)?;
+        }
+        for destination in 0..n {
+            let peers: Vec<&DeviceBuffer> = (0..n)
+                .filter(|&source| source != destination)
+                .map(|source| &signals[source])
+                .collect();
+            if n == 3 {
+                devices[destination].tp_graph_signal_wait2_gfx1201([peers[0], peers[1]], epoch)?;
+            } else {
+                devices[destination]
+                    .tp_graph_signal_wait3_gfx1201([peers[0], peers[1], peers[2]], epoch)?;
+            }
+        }
+        self.tp_graph_capture_epoch += 1;
+        Ok(())
+    }
+
     fn from_parts(devices: Vec<Gpu>, per_device: Vec<usize>, n_layers: usize) -> HipResult<Self> {
         debug_assert_eq!(per_device.iter().sum::<usize>(), n_layers);
         debug_assert_eq!(per_device.len(), devices.len());
@@ -423,6 +743,10 @@ impl Gpus {
             givens_sin_per_dev: Vec::new(),
             peer_ar_tmp: Vec::new(),
             peer_ar_tmp_bytes: 0,
+            rank_barrier_events: Vec::new(),
+            tp_graph_signals: Vec::new(),
+            tp_graph_barrier_count: 0,
+            tp_graph_capture_epoch: 0,
         })
     }
 
@@ -646,6 +970,78 @@ impl Gpus {
             for src in &srcs {
                 self.devices[r].add_inplace_f32(&dst, src)?;
             }
+        }
+        Ok(())
+    }
+
+    /// Deterministic rooted peer all-reduce for batched TP activations.
+    ///
+    /// Every rank observes the exact same left-associated sum
+    /// `rank0 + rank1 + ... + rankN`: peer inputs are first copied into
+    /// rank 0 scratch, rank 0 accumulates them in rank order, and the result
+    /// is broadcast back to every peer. This both avoids rank-dependent
+    /// floating-point order and cuts peer traffic from `N * (N - 1)` copies
+    /// to `2 * (N - 1)` copies. Buffers are updated in place.
+    pub fn all_reduce_sum_f32_peer_rooted(
+        &mut self,
+        buffers: &[&DeviceBuffer],
+        count: usize,
+    ) -> HipResult<()> {
+        let n = self.devices.len();
+        if buffers.len() != n {
+            return Err(HipError::new(
+                0,
+                &format!(
+                    "all_reduce_sum_f32_peer_rooted: buffers.len()={} != n_devices={n}",
+                    buffers.len()
+                ),
+            ));
+        }
+        if n == 1 {
+            return Ok(());
+        }
+        let bytes = count * 4;
+        self.ensure_peer_ar_tmp(bytes)?;
+
+        // Preserve every non-root input before rank 0 starts writing its sum.
+        let mut gather_events = Vec::with_capacity(n - 1);
+        for rank in 1..n {
+            gather_events.push(self.boundary_copy(
+                rank,
+                0,
+                buffers[rank],
+                &self.peer_ar_tmp[0][rank - 1],
+                bytes,
+            )?);
+        }
+        for event in gather_events {
+            self.wait_boundary(event)?;
+        }
+
+        let root = GpuTensor {
+            buf: unsafe { buffers[0].alias() },
+            shape: vec![count],
+            dtype: DType::F32,
+        };
+        self.devices[0].bind_thread()?;
+        for slot in 0..n - 1 {
+            let peer = GpuTensor {
+                buf: unsafe { self.peer_ar_tmp[0][slot].alias() },
+                shape: vec![count],
+                dtype: DType::F32,
+            };
+            self.devices[0].add_inplace_f32(&root, &peer)?;
+        }
+
+        // boundary_copy is enqueued on rank 0's active stream, after the
+        // ordered add kernels above. Waiting makes the result visible before
+        // any peer starts its HC mix.
+        let mut broadcast_events = Vec::with_capacity(n - 1);
+        for rank in 1..n {
+            broadcast_events.push(self.boundary_copy(0, rank, buffers[0], buffers[rank], bytes)?);
+        }
+        for event in broadcast_events {
+            self.wait_boundary(event)?;
         }
         Ok(())
     }

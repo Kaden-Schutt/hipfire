@@ -1,0 +1,53 @@
+{
+  "archs": [
+    "gfx1010",
+    "gfx1030",
+    "gfx1100",
+    "gfx1151",
+    "gfx1201"
+  ],
+  "boxes": [
+    "k9lin",
+    "hipx",
+    "hiptrx"
+  ],
+  "collapsed": {
+    "attempts": 5331,
+    "kernels": 164
+  },
+  "collisions": {
+    "attempts": 30,
+    "kernels": 0
+  },
+  "distinct_kernels": 28,
+  "harvest_iso": "2026-07-23T23:44:06Z",
+  "harvest_ts": 1784850246,
+  "key_confidence": {
+    "canonical": 204,
+    "collision": 30,
+    "weak": 698
+  },
+  "malformed": {},
+  "raw": {
+    "attempts": 6263,
+    "kernels": 321
+  },
+  "unique": {
+    "attempts": 932,
+    "bod": 25,
+    "kernels": 157
+  },
+  "unreachable": {},
+  "verdicts": {
+    "COHERENCE_FAIL": 1,
+    "CROSS_ARCH": 2,
+    "DEAD": 632,
+    "DEAD_FILE": 5,
+    "INCONCLUSIVE": 20,
+    "LOSS": 11,
+    "NOISE": 87,
+    "NO_OP": 2,
+    "VOID": 25,
+    "WIN": 107
+  }
+}

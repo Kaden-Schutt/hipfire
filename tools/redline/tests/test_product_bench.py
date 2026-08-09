@@ -28,6 +28,7 @@ from tools.redline.product_bench import (
     analyze_stationarity,
     backend_config_value,
     load_pm4_multiturn_session,
+    pm4_policy_with_overrides,
     require_retained_pm4,
     run_coherence_smoke,
     run_pm4_multiturn_session,
@@ -377,6 +378,20 @@ class BackendConfigTests(unittest.TestCase):
             CERTIFIED_PM4_POLICY["HIPFIRE_REPLAY_PM4_ACQUIRE_POLICY"],
             "required-only",
         )
+
+    def test_product_policy_override_is_explicit_and_reportable(self):
+        policy = pm4_policy_with_overrides(
+            ["HIPFIRE_REPLAY_PM4_SINGLE_IB_REORDER=16"]
+        )
+        self.assertEqual(policy["HIPFIRE_REPLAY_PM4_SINGLE_IB_REORDER"], "16")
+        self.assertEqual(
+            CERTIFIED_PM4_POLICY.get("HIPFIRE_REPLAY_PM4_SINGLE_IB_REORDER"),
+            None,
+        )
+
+    def test_product_policy_override_rejects_non_pm4_controls(self):
+        with self.assertRaises(ValueError):
+            pm4_policy_with_overrides(["HIPFIRE_REPLAY_BACKEND=hip"])
 
 
 class RouteProofTests(unittest.TestCase):
@@ -747,6 +762,7 @@ class Pm4PreflightTests(unittest.TestCase):
             30.0,
             "q8",
             0.0,
+            CERTIFIED_PM4_POLICY,
         )
         self.assertEqual(fake.request.call_args_list[0].args[0]["type"], "load")
         smoke = fake.request.call_args_list[1].args[0]
@@ -2282,6 +2298,34 @@ class ServeHarnessWarmTests(unittest.TestCase):
             row = sh.send(cfg, [{"role": "user", "content": "hello"}])
         self.assertEqual(row["request_id"], "chatcmpl-turn-1")
 
+    def test_prompt_file_preserves_exact_text_and_lowers_to_one_prose_row(self):
+        sh = self._load_serve_harness()
+        fixtures = (
+            b"alpha\r\nbeta\r\n",
+            b"alpha\r\nbeta",
+        )
+        with tempfile.TemporaryDirectory() as work_dir:
+            prompt_path = Path(work_dir) / "prompt.txt"
+            for fixture in fixtures:
+                with self.subTest(fixture=fixture):
+                    prompt_path.write_bytes(fixture)
+                    rows = sh.load_prompt_battery(None, str(prompt_path))
+                    self.assertEqual(rows, [("prose", fixture.decode("utf-8"))])
+
+    def test_prompt_file_and_prompts_file_are_mutually_exclusive(self):
+        sh = self._load_serve_harness()
+        argv = [
+            "serve_harness.py",
+            "--self-test",
+            "--prompt-file",
+            "prompt.txt",
+            "--prompts-file",
+            "prompts.json",
+        ]
+        with patch.object(sh.sys, "argv", argv), self.assertRaises(SystemExit) as raised:
+            sh.main()
+        self.assertEqual(raised.exception.code, 2)
+
     def test_write_native_config_emits_route_proof_log_when_requested(self):
         sh = self._load_serve_harness()
         with tempfile.TemporaryDirectory() as home:
@@ -2316,6 +2360,22 @@ class ServeHarnessWarmTests(unittest.TestCase):
             text = Path(home, ".hipfire", "config.toml").read_text()
             self.assertNotIn("route_proof_log", text)
             self.assertNotIn("[diagnostic.replay]", text)
+
+    def test_write_native_config_makes_off_off_plain_ar(self):
+        sh = self._load_serve_harness()
+        with tempfile.TemporaryDirectory() as home:
+            cfg = {
+                "model": "/tmp/model.hfq",
+                "port": 11520,
+                "max_seq": 2048,
+                "kv": "q8",
+                "mtp": "off",
+                "thinking_budget": "low",
+            }
+            os.makedirs(os.path.join(home, ".hipfire"), exist_ok=True)
+            sh._write_native_config(cfg, home)
+            text = Path(home, ".hipfire", "config.toml").read_text()
+            self.assertIn('[speculation]\nmode = "off"\n', text)
 
     def test_spawn_serve_strips_harness_pid_file_from_child_env(self):
         """HIPFIRE_SERVE_HARNESS_PID_FILE is parent IPC only — never hand to serve."""

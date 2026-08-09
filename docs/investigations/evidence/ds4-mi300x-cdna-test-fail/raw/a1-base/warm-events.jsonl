@@ -1,0 +1,14 @@
+{"type":"pong"}
+{"type":"loaded","arch":"deepseek4","dim":0,"layers":0,"vocab":0,"vl":false,"cache_capable":true,"retry_reset_eligible":false}
+{"type":"reasoning","id":"g0-base-warm","text":"I need","attempt_id":1}
+{"type":"reasoning","id":"g0-base-warm","text":" ","attempt_id":1}
+{"type":"reasoning","id":"g0-base-warm","text":"to produce ","attempt_id":1}
+{"type":"reasoning","id":"g0-base-warm","text":"a thor","attempt_id":1}
+{"type":"reasoning","id":"g0-base-warm","text":"ough, produc","attempt_id":1}
+{"type":"reasoning","id":"g0-base-warm","text":"tio","attempt_id":1}
+{"type":"reasoning","id":"g0-base-warm","text":"n-gr","attempt_id":1}
+{"type":"reasoning","id":"g0-base-warm","text":"ade explan","attempt_id":1}
+{"type":"reasoning","id":"g0-base-warm","text":"ation of the requested","attempt_id":1}
+{"type":"commit_ready","id":"g0-base-warm","tokens":16,"tok_s":2.304479331700994,"prompt_tokens":2052,"prefill_tokens":2052,"cached_tokens":0,"prefill_ms":24318,"total_ms":31262,"finish_reason":"length","drafter":"ar","attempt_id":1}
+{"type":"aborted","id":"g0-base-warm","reason":"client_cancelled","attempt_id":1}
+{"type":"done","id":"g0-base-warm","finish_reason":"aborted","prompt_tokens":0,"completion_tokens":16,"prefill_ms":0,"decode_ms":0,"attempt_id":1}

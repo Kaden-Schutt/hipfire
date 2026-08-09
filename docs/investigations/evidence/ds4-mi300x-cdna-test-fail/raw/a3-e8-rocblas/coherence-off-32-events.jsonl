@@ -1,0 +1,34 @@
+{"type":"pong"}
+{"type":"loaded","arch":"deepseek4","dim":0,"layers":0,"vocab":0,"vl":false,"cache_capable":true,"retry_reset_eligible":false}
+{"type":"token","id":"g0-coherence-off-32","text":"I a","attempt_id":1}
+{"type":"token","id":"g0-coherence-off-32","text":"pprec","attempt_id":1}
+{"type":"token","id":"g0-coherence-off-32","text":"iate the","attempt_id":1}
+{"type":"token","id":"g0-coherence-off-32","text":" ","attempt_id":1}
+{"type":"token","id":"g0-coherence-off-32","text":"dept","attempt_id":1}
+{"type":"token","id":"g0-coherence-off-32","text":"h o","attempt_id":1}
+{"type":"token","id":"g0-coherence-off-32","text":"f this ","attempt_id":1}
+{"type":"token","id":"g0-coherence-off-32","text":"requ","attempt_id":1}
+{"type":"token","id":"g0-coherence-off-32","text":"es","attempt_id":1}
+{"type":"token","id":"g0-coherence-off-32","text":"t. You're","attempt_id":1}
+{"type":"token","id":"g0-coherence-off-32","text":" ","attempt_id":1}
+{"type":"token","id":"g0-coherence-off-32","text":"asking for ","attempt_id":1}
+{"type":"token","id":"g0-coherence-off-32","text":"a rigo","attempt_id":1}
+{"type":"token","id":"g0-coherence-off-32","text":"rous, prod","attempt_id":1}
+{"type":"token","id":"g0-coherence-off-32","text":"uction-grade t","attempt_id":1}
+{"type":"token","id":"g0-coherence-off-32","text":"echn","attempt_id":1}
+{"type":"token","id":"g0-coherence-off-32","text":"ical specific","attempt_id":1}
+{"type":"token","id":"g0-coherence-off-32","text":"at","attempt_id":1}
+{"type":"token","id":"g0-coherence-off-32","text":"ion for b","attempt_id":1}
+{"type":"token","id":"g0-coherence-off-32","text":"enchmarkin","attempt_id":1}
+{"type":"token","id":"g0-coherence-off-32","text":"g a speci","attempt_id":1}
+{"type":"token","id":"g0-coherence-off-32","text":"fic","attempt_id":1}
+{"type":"token","id":"g0-coherence-off-32","text":" i","attempt_id":1}
+{"type":"token","id":"g0-coherence-off-32","text":"nference ","attempt_id":1}
+{"type":"token","id":"g0-coherence-off-32","text":"scenario ","attempt_id":1}
+{"type":"token","id":"g0-coherence-off-32","text":"on a specific","attempt_id":1}
+{"type":"token","id":"g0-coherence-off-32","text":" ","attempt_id":1}
+{"type":"token","id":"g0-coherence-off-32","text":"hardw","attempt_id":1}
+{"type":"token","id":"g0-coherence-off-32","text":"are architecture. This","attempt_id":1}
+{"type":"commit_ready","id":"g0-coherence-off-32","tokens":32,"tok_s":27.538726333907057,"prompt_tokens":2052,"prefill_tokens":2052,"cached_tokens":0,"prefill_ms":23747,"total_ms":24909,"finish_reason":"length","drafter":"ar","attempt_id":1}
+{"type":"aborted","id":"g0-coherence-off-32","reason":"client_cancelled","attempt_id":1}
+{"type":"done","id":"g0-coherence-off-32","finish_reason":"aborted","prompt_tokens":0,"completion_tokens":32,"prefill_ms":0,"decode_ms":0,"attempt_id":1}

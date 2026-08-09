@@ -1,0 +1,15 @@
+Loading DeepSeek V4 from /mnt/scratch/models/deepseek-v4-flash-mq2r/deepseek-v4-flash.mq2r...
+GPU dev 0: gfx942 (205.8 GB VRAM, HIP 7.0)
+  pre-compiled kernels: /mnt/scratch/hipfire-work/ds4-mi300x-agentmaxx/.hipfire_kernels/gfx942
+[rocblas] loaded for gfx942
+GPU: gfx942
+deepseek4: MQ2R P3 tensor recipe verified; gfx1151 route v2 is ineligible on gfx942, using portable dispatch
+deepseek4 gfx942 A2 levers: L1 compressor_gate=ON (HIPFIRE_DEEPSEEK4_GFX942_COMPRESSOR_GATE default ON on gfx942 MQ2R) ; L3 e8_wo_grouped=OFF (HIPFIRE_DEEPSEEK4_GFX942_E8_WO_GROUPED default OFF, =1 enables) ; F1 indexer_topk_parallel=OFF (HIPFIRE_DEEPSEEK4_GFX942_INDEXER_TOPK_PARALLEL default OFF, =1 enables)
+Loaded weights in 76.3s
+Config: layers=43 hidden=4096 vocab=129280 window=128 | prefill tokens=1024 batches=[1024]
+[batch 1024 e8b 0 0] 1024 tok in 10.2059s = 100.33 tok/s (warmup)
+[batch 1024 e8b 0 1] 1024 tok in 10.1771s = 100.62 tok/s
+[batch 1024 e8b 0 2] 1024 tok in 10.1695s = 100.69 tok/s
+[batch 1024 e8b 0 3] 1024 tok in 10.1817s = 100.57 tok/s
+[batch 1024 e8b 0 4] 1024 tok in 10.2053s = 100.34 tok/s
+[batch 1024 e8b 0 5] 1024 tok in 10.1896s = 100.49 tok/s

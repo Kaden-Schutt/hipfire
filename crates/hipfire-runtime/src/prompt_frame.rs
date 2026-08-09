@@ -76,13 +76,17 @@ pub enum AssistantPrefix {
 /// per-arch emitters can interpret it. The arch-specific *frame* mapping — e.g.
 /// DeepSeek V4's `<｜Assistant｜></think>` vs `<think>` open-token, or its `Max`
 /// extended-reasoning preamble — lives in the arch crate that consumes this.
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ThinkMode {
     /// Non-thinking: model skips reasoning and replies directly.
     NonThink,
-    /// Thinking: model produces a `<think>` block before responding.
+    /// Thinking with the model's default/low effort. Architectures that encode
+    /// effort as prompt text must not add a high-effort prefix for this mode.
+    Low,
+    /// Thinking with the model's high-effort framing.
     High,
-    /// Thinking-max: same as `High` plus an extended-reasoning preamble (the
+    /// Thinking-max: same output protocol as `Low`/`High`, plus the model's
+    /// maximum-effort preamble (the
     /// consuming arch decides what that means). Some models recommend a large
     /// context window for this mode.
     Max,
@@ -91,15 +95,31 @@ pub enum ThinkMode {
 impl ThinkMode {
     /// Map a JSONL field value (OpenAI-compatible `reasoning_effort` or
     /// project-custom `thinking_mode`) to a mode.
-    /// Accepted: "none|off|chat|minimal" → NonThink;
-    ///           "low|medium|high|thinking" → High;
-    ///           "max" → Max. Anything else → NonThink (safe default).
+    /// Accepted: "none|off|chat" → NonThink;
+    ///           "minimal|low|medium|med|thinking" → Low;
+    ///           "high" → High; "max" → Max.
+    /// Anything else → NonThink (safe default).
     pub fn from_str(s: &str) -> Self {
         match s.to_ascii_lowercase().as_str() {
             "max" => Self::Max,
-            "high" | "thinking" | "low" | "medium" => Self::High,
+            "high" => Self::High,
+            "minimal" | "low" | "medium" | "med" | "thinking" => Self::Low,
             _ => Self::NonThink,
         }
+    }
+}
+
+#[cfg(test)]
+mod think_mode_tests {
+    use super::ThinkMode;
+
+    #[test]
+    fn reasoning_effort_levels_remain_distinct() {
+        assert_eq!(ThinkMode::from_str("none"), ThinkMode::NonThink);
+        assert_eq!(ThinkMode::from_str("low"), ThinkMode::Low);
+        assert_eq!(ThinkMode::from_str("medium"), ThinkMode::Low);
+        assert_eq!(ThinkMode::from_str("high"), ThinkMode::High);
+        assert_eq!(ThinkMode::from_str("max"), ThinkMode::Max);
     }
 }
 

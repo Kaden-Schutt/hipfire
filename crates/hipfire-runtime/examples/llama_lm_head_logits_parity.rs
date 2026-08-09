@@ -48,6 +48,8 @@ fn main() {
     let mut ctx = LoadCtx {
         path: &model_path,
         max_seq: 2048,
+        deepseek4_compute_placement: Default::default(),
+        deepseek4_experts_per_token: None,
         draft_path: None,
         kv_mode_override: None,
         kv_backend: hipfire_runtime::kv_backend::KvBackend::Contiguous,

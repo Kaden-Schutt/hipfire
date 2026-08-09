@@ -157,6 +157,8 @@ fn main() -> Result<(), String> {
     let mut ctx = LoadCtx {
         path: &path,
         max_seq,
+        deepseek4_compute_placement: Default::default(),
+        deepseek4_experts_per_token: None,
         draft_path: None,
         kv_mode_override: None,
         kv_backend: hipfire_runtime::kv_backend::KvBackend::Contiguous,
@@ -394,6 +396,7 @@ fn main() -> Result<(), String> {
             max_seq,
             conf_threshold,
             true, // llama supports sampled verify → temp>0 testable
+            0.5,
         )
     } else {
         // n-gram (or DSpark fallback when sidecar absent).

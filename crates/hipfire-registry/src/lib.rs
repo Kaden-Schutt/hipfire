@@ -90,6 +90,14 @@ pub struct RecommendedSettings {
     pub repeat_penalty: Option<f64>,
     #[serde(default)]
     pub system_prompt: Option<String>,
+    /// Parent-model reasoning effort. This is prompt semantics, independent of
+    /// any explicit token cap selected by `thinking_budget`.
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
+    /// Optional named cap policy for reasoning tokens
+    /// (`off|low|med|high|xhigh|max|uncapped`).
+    #[serde(default)]
+    pub thinking_budget: Option<String>,
 }
 
 impl RecommendedSettings {
@@ -131,17 +139,28 @@ impl RecommendedSettings {
                 .set("prompt.system", ConfigValue::String(value.clone()))
                 .map_err(|error| error.to_string())?;
         }
+        if let Some(value) = &self.reasoning_effort {
+            layer
+                .set("reasoning.effort", ConfigValue::String(value.clone()))
+                .map_err(|error| error.to_string())?;
+        }
+        if let Some(value) = &self.thinking_budget {
+            layer
+                .set("reasoning.budget", ConfigValue::String(value.clone()))
+                .map_err(|error| error.to_string())?;
+        }
         Ok(layer)
     }
 }
 
 /// Per-mode sampling profiles for a model, mirroring the model card's
-/// documented modes. Each is a full [`RecommendedSettings`] blob. `general`
-/// is the thinking-mode default (equals the entry's `recommended_settings`);
-/// `coding` is the precise thinking-coding profile; `instruct` is the
-/// non-thinking profile. Profiles are entry-level metadata and are selected
-/// client-side (e.g. serve_harness `--sampling registry:<profile>`), lowering
-/// through the same `generation.*` config keys — no daemon request-JSON change.
+/// documented modes. Each is a full [`RecommendedSettings`] blob, including
+/// optional reasoning effort and explicit budget policy. `general` is the thinking-mode
+/// default (equals the entry's `recommended_settings`); `coding` is the precise
+/// thinking-coding profile; `instruct` is the non-thinking profile. Profiles
+/// are entry-level metadata and are selected client-side (e.g. serve_harness
+/// `--sampling registry:<profile>`), lowering through the typed config/request
+/// path rather than architecture-specific environment variables.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SamplingProfiles {
@@ -588,6 +607,34 @@ mod tests {
     }
 
     #[test]
+    fn bundled_0731_mq2r_identity_is_separate_from_mq2lloyd_and_preview() {
+        let registry = bundled().unwrap();
+        let (_, mq2lloyd) = registry.model("deepseek-v4-flash").unwrap();
+        let (_, mq2r) = registry.model("deepseek-v4-flash:mq2r").unwrap();
+
+        assert_eq!(mq2lloyd.file, "deepseek-v4-flash-0731.mq2lloyd");
+        assert_eq!(mq2r.file, "deepseek-v4-flash-0731.mq2r");
+        assert_eq!(mq2lloyd.default_kv_mode.as_deref(), Some("f32"));
+        assert_eq!(mq2r.default_kv_mode.as_deref(), Some("f32"));
+        assert_eq!(
+            mq2r.sha256.as_deref(),
+            Some("cbf2bbcfa3f47b1712a071836b2c48232dad7dfb763813a720f7d348a9318cce")
+        );
+        assert_eq!(
+            mq2r.quant_recipe.as_deref(),
+            Some("deepseek4-mq2r-e8-p3-v1")
+        );
+
+        assert_eq!(
+            mq2r.dspark
+                .as_ref()
+                .and_then(|sidecar| sidecar.sha256.as_deref()),
+            Some("bc695a000643801d26e5ae96c9f4ac4c222a36d9db40566f4cc1de0e9d3d5d2e")
+        );
+        assert!(registry.model("deepseek4:preview-mq2r").is_none());
+    }
+
+    #[test]
     fn aliases_and_filenames_resolve_to_canonical_tags() {
         let registry = bundled().unwrap();
         assert_eq!(registry.resolve_tag("qwen3.6"), "qwen3.6:35b-a3b");
@@ -595,6 +642,25 @@ mod tests {
             registry.resolve_tag("qwen3.6-35b-a3b.mq4r"),
             "qwen3.6:35b-a3b-mq4r"
         );
+        assert_eq!(registry.resolve_tag("deepseek4"), "deepseek-v4-flash");
+        assert_eq!(registry.resolve_tag("deepseek4:0731"), "deepseek-v4-flash");
+        assert_eq!(
+            registry.resolve_tag("deepseek4:0731-mq2r"),
+            "deepseek-v4-flash:mq2r"
+        );
+        assert_eq!(
+            registry.resolve_tag("deepseek-v4-flash-0731.mq2r"),
+            "deepseek-v4-flash:mq2r"
+        );
+        assert_eq!(
+            registry.resolve_tag("deepseek4:preview"),
+            "deepseek-v4-flash-preview"
+        );
+        assert!(registry.model("deepseek4:preview-mq2r").is_none());
+        let (_, mq2lloyd) = registry.model("deepseek4:0731").unwrap();
+        let settings = mq2lloyd.recommended_settings.as_ref().unwrap();
+        assert_eq!(settings.reasoning_effort.as_deref(), Some("low"));
+        assert_eq!(settings.thinking_budget.as_deref(), Some("uncapped"));
     }
 
     #[test]
@@ -607,6 +673,8 @@ mod tests {
             presence_penalty: Some(1.5),
             repeat_penalty: Some(1.05),
             system_prompt: Some("You are MiniMax.".into()),
+            reasoning_effort: Some("high".into()),
+            thinking_budget: Some("xhigh".into()),
         };
         let layer = settings.config_layer().unwrap();
         assert_eq!(
@@ -636,6 +704,14 @@ mod tests {
         assert_eq!(
             layer.get("prompt.system"),
             Some(&ConfigValue::String("You are MiniMax.".into()))
+        );
+        assert_eq!(
+            layer.get("reasoning.effort"),
+            Some(&ConfigValue::String("high".into()))
+        );
+        assert_eq!(
+            layer.get("reasoning.budget"),
+            Some(&ConfigValue::String("xhigh".into()))
         );
     }
 

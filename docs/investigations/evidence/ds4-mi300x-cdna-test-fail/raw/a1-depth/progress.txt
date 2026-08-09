@@ -1,0 +1,6 @@
+baseline done, starting depth sweep Sat Aug  1 02:57:06 PM UTC 2026
+{"type":"commit_ready","id":"g0-depth-64","tokens":32,"tok_s":35.35911602209945,"prompt_tokens":69,"prefill_tokens":69,"cached_tokens":0,"prefill_ms":860,"total_ms":1765,"finish_reason":"length","drafter":"ar","attempt_id":1}
+{"type":"commit_ready","id":"g0-depth-256","tokens":32,"tok_s":34.85838779956427,"prompt_tokens":259,"prefill_tokens":259,"cached_tokens":0,"prefill_ms":2793,"total_ms":3711,"finish_reason":"length","drafter":"ar","attempt_id":1}
+{"type":"commit_ready","id":"g0-depth-1024","tokens":32,"tok_s":34.33476394849785,"prompt_tokens":1019,"prefill_tokens":1019,"cached_tokens":0,"prefill_ms":10141,"total_ms":11073,"finish_reason":"length","drafter":"ar","attempt_id":1}
+{"type":"commit_ready","id":"g0-depth-2048","tokens":32,"tok_s":2.293906810035842,"prompt_tokens":2052,"prefill_tokens":2052,"cached_tokens":0,"prefill_ms":20804,"total_ms":34755,"finish_reason":"length","drafter":"ar","attempt_id":1}
+DEPTHDONE

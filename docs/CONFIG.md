@@ -203,11 +203,12 @@ startup.
 | `min_p` | `0.0` | number 0.0–1.0 | Relative-probability cutoff; zero disables it. |
 | `presence_penalty` | `0.0` | number 0.0–2.0 | OpenAI-style flat penalty over the repeat window; zero disables it. |
 | `repeat_penalty` | `1.05` | number 1.0–3.0 | Kept low; higher values harm some MQ4 greedy paths (source comment). Stored default only; see send path below. |
-| `max_tokens` | `4096` | int 1–131072 | Per-turn generation cap for run / OpenAI fallback. |
-| `max_seq` | `32768` | int 512–524288 | KV logical capacity at load. |
+| `max_tokens` | `4096` | int 1–393216 | Per-turn generation cap for run / OpenAI fallback; 384 Ki tokens matches DeepSeek V4 Flash 0731's documented maximum output length. |
+| `max_seq` | `32768` | int 512–1048576 | KV logical capacity at load; the 1 Mi-token ceiling is serviced by VMM growth where supported. |
 | `thinking` | `"on"` | `on` \| `off` | Whether visible `<think>` is kept/stripped in client paths. |
+| `reasoning_effort` | `"auto"` | `auto` \| `none` \| `low` \| `high` \| `max` | Parent-model prompt semantics. It is independent of the reasoning token cap; `max` does not imply a hidden cap. |
 | `thinking_budget` | `"med"` | `low` \| `med` \| `high` \| `xhigh` \| `max` \| `uncapped` | Named preset → effective think cap (below). |
-| `max_think_tokens` | *(absent)* | int 0–32768 when set | Optional raw override. If unset, preset drives. `0` = unlimited. |
+| `max_think_tokens` | *(absent)* | int 0–393216 when set | Optional explicit raw override. If unset, preset drives. `0` = unlimited. |
 | `max_total_think_tokens` | `0` | int 0–1000000 | Cross-reopen total `<think>` budget; `0` = off. |
 
 **Thinking budget map** (`hipfire-config` schema, lowered by `hipfire-cli`):
@@ -220,6 +221,11 @@ startup.
 | `xhigh` | 24576 |
 | `max` | 32768 |
 | `uncapped` | 0 (unlimited) |
+
+`reasoning_effort` and `thinking_budget` are deliberately orthogonal. An
+explicit HTTP `reasoning_effort=low|high|max` is uncapped unless the same
+request also supplies `max_think_tokens`. Registry profiles can select
+`thinking_budget=uncapped`; no effort level silently substitutes a hipfire cap.
 
 **Effective sampling send order** (`request_f64` / `request_u64` / `run`): explicit CLI or HTTP request **>** per-model TOML overlay **>** registry `recommended_settings` **>** daemon/HFQ/arch fallback. This applies to `temperature`, `top_p`, `top_k`, `min_p`, `presence_penalty`, and `repeat_penalty`. Bare global sampling values are deliberately not transmitted on the current run/serve path; if one shadows a registry recommendation, the card value is recovered for that model. Registry entry `sampling` blocks are legacy metadata — the resolver reads `recommended_settings`; see [`MODELS.md`](MODELS.md).
 
@@ -350,17 +356,17 @@ Collapse `\n{3,}` → `\n\n` at engine entry. Legacy alias:
 | Key | Default | Range / values |
 |---|---|---|
 | `prefill_compression` | `"off"` | `off` \| `auto` \| `always` |
-| `prefill_threshold` | `32768` | int 0–524288 |
+| `prefill_threshold` | `32768` | int 0–1048576 |
 | `prefill_keep_ratio` | `0.05` | (0, 1] |
 | `prefill_alpha` | `0.85` | [0, 1] |
-| `prefill_min_keep` | `2048` | int 0–524288 |
+| `prefill_min_keep` | `2048` | int 0–1048576 |
 | `prefill_sink` | `256` | int 0–65536 |
 | `prefill_recent` | `1024` | int 0–65536 |
 | `prefill_block` | `128` | int 1–4096 |
 | `prefill_drafter` | `""` | path |
 | `prefill_drafter_device` | `-1` | int −1–15 (`-1` = same device as target) |
 | `prefill_profile` | `false` | bool |
-| `prefill_sparse_threshold` | `32768` | int 0–524288 |
+| `prefill_sparse_threshold` | `32768` | int 0–1048576 |
 
 Off by default. Typed fields cover product PFlash policy; remaining experiments
 live under `[developer]` and retain matching `HIPFIRE_PREFILL_*` one-shot

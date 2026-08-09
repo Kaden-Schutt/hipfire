@@ -1,0 +1,19 @@
+{"type":"pong"}
+{"type":"loaded","arch":"deepseek4","dim":0,"layers":0,"vocab":0,"vl":false,"cache_capable":true,"retry_reset_eligible":false}
+{"type":"token","id":"g0-warm","text":"*","attempt_id":1}
+{"type":"token","id":"g0-warm","text":"*Meas","attempt_id":1}
+{"type":"token","id":"g0-warm","text":"ur","attempt_id":1}
+{"type":"token","id":"g0-warm","text":"em","attempt_id":1}
+{"type":"token","id":"g0-warm","text":"en","attempt_id":1}
+{"type":"token","id":"g0-warm","text":"t","attempt_id":1}
+{"type":"token","id":"g0-warm","text":" Contr","attempt_id":1}
+{"type":"token","id":"g0-warm","text":"act","attempt_id":1}
+{"type":"token","id":"g0-warm","text":": De","attempt_id":1}
+{"type":"token","id":"g0-warm","text":"epS","attempt_id":1}
+{"type":"token","id":"g0-warm","text":"eek","attempt_id":1}
+{"type":"token","id":"g0-warm","text":" ","attempt_id":1}
+{"type":"token","id":"g0-warm","text":"V4","attempt_id":1}
+{"type":"token","id":"g0-warm","text":" Flash on AMD MI300X (","attempt_id":1}
+{"type":"commit_ready","id":"g0-warm","tokens":16,"tok_s":32.19315895372233,"prompt_tokens":2052,"prefill_tokens":2052,"cached_tokens":0,"prefill_ms":20840,"total_ms":21338,"finish_reason":"length","drafter":"ar","attempt_id":1}
+{"type":"aborted","id":"g0-warm","reason":"client_cancelled","attempt_id":1}
+{"type":"done","id":"g0-warm","finish_reason":"aborted","prompt_tokens":0,"completion_tokens":16,"prefill_ms":0,"decode_ms":0,"attempt_id":1}

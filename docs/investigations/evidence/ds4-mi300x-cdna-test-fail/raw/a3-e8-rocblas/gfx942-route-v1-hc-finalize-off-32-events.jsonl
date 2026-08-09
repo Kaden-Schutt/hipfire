@@ -1,0 +1,30 @@
+{"type":"pong"}
+{"type":"loaded","arch":"deepseek4","dim":0,"layers":0,"vocab":0,"vl":false,"cache_capable":true,"retry_reset_eligible":false}
+{"type":"reasoning","id":"g0-gfx942-route-v1-hc-finalize-off-32","text":"I need","attempt_id":1}
+{"type":"reasoning","id":"g0-gfx942-route-v1-hc-finalize-off-32","text":" to provid","attempt_id":1}
+{"type":"reasoning","id":"g0-gfx942-route-v1-hc-finalize-off-32","text":"e a detai","attempt_id":1}
+{"type":"reasoning","id":"g0-gfx942-route-v1-hc-finalize-off-32","text":"led te","attempt_id":1}
+{"type":"reasoning","id":"g0-gfx942-route-v1-hc-finalize-off-32","text":"chni","attempt_id":1}
+{"type":"reasoning","id":"g0-gfx942-route-v1-hc-finalize-off-32","text":"cal response","attempt_id":1}
+{"type":"reasoning","id":"g0-gfx942-route-v1-hc-finalize-off-32","text":" about th","attempt_id":1}
+{"type":"reasoning","id":"g0-gfx942-route-v1-hc-finalize-off-32","text":"e me","attempt_id":1}
+{"type":"reasoning","id":"g0-gfx942-route-v1-hc-finalize-off-32","text":"as","attempt_id":1}
+{"type":"reasoning","id":"g0-gfx942-route-v1-hc-finalize-off-32","text":"urement c","attempt_id":1}
+{"type":"reasoning","id":"g0-gfx942-route-v1-hc-finalize-off-32","text":"ont","attempt_id":1}
+{"type":"reasoning","id":"g0-gfx942-route-v1-hc-finalize-off-32","text":"ract for a","attempt_id":1}
+{"type":"reasoning","id":"g0-gfx942-route-v1-hc-finalize-off-32","text":" specific","attempt_id":1}
+{"type":"reasoning","id":"g0-gfx942-route-v1-hc-finalize-off-32","text":" ","attempt_id":1}
+{"type":"reasoning","id":"g0-gfx942-route-v1-hc-finalize-off-32","text":"AI i","attempt_id":1}
+{"type":"reasoning","id":"g0-gfx942-route-v1-hc-finalize-off-32","text":"nfere","attempt_id":1}
+{"type":"reasoning","id":"g0-gfx942-route-v1-hc-finalize-off-32","text":"nce sc","attempt_id":1}
+{"type":"reasoning","id":"g0-gfx942-route-v1-hc-finalize-off-32","text":"en","attempt_id":1}
+{"type":"reasoning","id":"g0-gfx942-route-v1-hc-finalize-off-32","text":"ario. The u","attempt_id":1}
+{"type":"reasoning","id":"g0-gfx942-route-v1-hc-finalize-off-32","text":"ser wa","attempt_id":1}
+{"type":"reasoning","id":"g0-gfx942-route-v1-hc-finalize-off-32","text":"nts a produc","attempt_id":1}
+{"type":"reasoning","id":"g0-gfx942-route-v1-hc-finalize-off-32","text":"tio","attempt_id":1}
+{"type":"reasoning","id":"g0-gfx942-route-v1-hc-finalize-off-32","text":"n-","attempt_id":1}
+{"type":"reasoning","id":"g0-gfx942-route-v1-hc-finalize-off-32","text":"grade exp","attempt_id":1}
+{"type":"reasoning","id":"g0-gfx942-route-v1-hc-finalize-off-32","text":"lanation of a specific","attempt_id":1}
+{"type":"commit_ready","id":"g0-gfx942-route-v1-hc-finalize-off-32","tokens":32,"tok_s":30.505243088655863,"prompt_tokens":2052,"prefill_tokens":2052,"cached_tokens":0,"prefill_ms":23799,"total_ms":24848,"finish_reason":"length","drafter":"ar","attempt_id":1}
+{"type":"aborted","id":"g0-gfx942-route-v1-hc-finalize-off-32","reason":"client_cancelled","attempt_id":1}
+{"type":"done","id":"g0-gfx942-route-v1-hc-finalize-off-32","finish_reason":"aborted","prompt_tokens":0,"completion_tokens":32,"prefill_ms":0,"decode_ms":0,"attempt_id":1}

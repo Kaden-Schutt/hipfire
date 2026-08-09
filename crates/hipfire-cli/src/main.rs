@@ -53,6 +53,8 @@ const MODEL_SUFFIXES: &[&str] = &[
     ".hfq",
     ".mq2",
     ".mq2lloyd",
+    ".mq2r",
+    ".mq2rxt",
     ".mq3",
     ".mq3p",
     ".mq4",
@@ -432,6 +434,9 @@ struct BenchArgs {
     ctx: Vec<usize>,
     #[arg(long, default_value_t = 128)]
     tg: usize,
+    /// Generated tokens per standard-bench measurement run.
+    #[arg(long, default_value_t = 128)]
+    max_tokens: usize,
     #[arg(long)]
     sustained_tg: Option<usize>,
     #[arg(long, value_delimiter = ',', default_value = "128,8192")]
@@ -444,6 +449,12 @@ struct BenchArgs {
     kv_backend: Option<String>,
     #[arg(long)]
     redline: bool,
+    /// Speculation mode to benchmark (off, dflash, mtp, ngram, dspark, or auto).
+    #[arg(long = "spec")]
+    speculation: Option<String>,
+    /// Start generation in answer mode, matching `hipfire run` when reasoning is off.
+    #[arg(long)]
+    reasoning_off: bool,
     /// Prompt words for the standard benchmark.
     #[arg(num_args = 0..)]
     prompt: Vec<String>,
@@ -1830,8 +1841,8 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
     let resolved = resolved_for_model(paths, &args.model, canonical.as_deref(), entry)?;
     let configured_max_tokens = config_u64(&resolved, "generation.max_tokens")?;
     let max_tokens = args.max_tokens.unwrap_or(configured_max_tokens);
-    if max_tokens == 0 || max_tokens > 131_072 {
-        bail!("--max-tokens must be between 1 and 131072");
+    if max_tokens == 0 || max_tokens > 393_216 {
+        bail!("--max-tokens must be between 1 and 393216");
     }
     let temperature = request_f64(&resolved, "generation.temperature", args.temp)?;
     let top_p = request_f64(&resolved, "generation.top_p", args.top_p)?;
@@ -1961,8 +1972,16 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
     let mut request = serde_json::json!({
         "type": "generate",
         "id": "run",
+        "attempt_id": next_attempt_id(),
         "prompt": prompt,
         "max_tokens": max_tokens,
+        // `Engine::generate` rejects a request without `attempt_id`
+        // (hipfire-client lib.rs:557 -> "generate request missing attempt_id"),
+        // and `hipfire run` never set one, so EVERY `hipfire run` failed with a
+        // daemon protocol error. `run` is a one-shot, non-retrying caller, so a
+        // literal 1 is correct — same as `bench_generate_request` (main.rs:6407).
+        // The retrying serve path threads a real counter instead (main.rs:4234).
+        "attempt_id": 1,
     });
     insert_optional_f64(&mut request, "temperature", temperature);
     insert_optional_f64(&mut request, "top_p", top_p);
@@ -2111,8 +2130,8 @@ fn chat_command(paths: &Paths, args: ChatArgs) -> Result<()> {
     let max_tokens = args
         .max_tokens
         .unwrap_or(config_u64(&resolved, "generation.max_tokens")?);
-    if max_tokens == 0 || max_tokens > 131_072 {
-        bail!("--max-tokens must be between 1 and 131072");
+    if max_tokens == 0 || max_tokens > 393_216 {
+        bail!("--max-tokens must be between 1 and 393216");
     }
     if let Some(value) = args.temp {
         if !(0.0..=2.0).contains(&value) {
@@ -2228,6 +2247,19 @@ struct ServeMeta {
     last_activity: Instant,
 }
 
+fn finish_prewarm(meta: &mut ServeMeta, succeeded: bool) {
+    meta.loading_model = None;
+    if succeeded {
+        meta.last_activity = Instant::now();
+    }
+}
+
+fn idle_model_expired(meta: &ServeMeta, idle_timeout: Duration) -> bool {
+    meta.loading_model.is_none()
+        && meta.current_model.is_some()
+        && meta.last_activity.elapsed() >= idle_timeout
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 struct ServePidRecord {
     pid: u32,
@@ -2246,6 +2278,7 @@ struct ServeRuntime {
     paths: Paths,
     registry: RegistryV1,
     current_path: Option<PathBuf>,
+    current_arch: Option<String>,
     current_max_seq: u64,
     cache_capable: bool,
     kv_override: Option<String>,
@@ -2809,6 +2842,7 @@ fn serve_foreground(
             paths: paths.clone(),
             registry: registry.clone(),
             current_path: None,
+            current_arch: None,
             current_max_seq: 0,
             cache_capable: false,
             kv_override: args.kv_mode.clone(),
@@ -2869,11 +2903,13 @@ fn serve_foreground(
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
                 .ensure_model(&default_model, &shared.meta, None);
-            shared
-                .meta
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .loading_model = None;
+            {
+                let mut meta = shared
+                    .meta
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                finish_prewarm(&mut meta, result.is_ok());
+            }
             match result {
                 Ok(_) => eprintln!("[hipfire] pre-warmed {default_model}"),
                 Err(error) => eprintln!("[hipfire] pre-warm failed: {error:#}; serving lazily"),
@@ -2892,7 +2928,7 @@ fn serve_foreground(
                     .meta
                     .lock()
                     .unwrap_or_else(|error| error.into_inner());
-                meta.current_model.is_some() && meta.last_activity.elapsed() >= shared.idle_timeout
+                idle_model_expired(&meta, shared.idle_timeout)
             };
             if !expired {
                 continue;
@@ -2906,6 +2942,7 @@ fn serve_foreground(
                     let result = runtime.engine.unload();
                     if result.is_ok() {
                         runtime.current_path = None;
+                        runtime.current_arch = None;
                         runtime.current_max_seq = 0;
                         runtime.cache_capable = false;
                     }
@@ -4204,6 +4241,7 @@ fn complete_request_attempt(
                 // Rollback could not be attested: model state is unknown, so
                 // the next request must full-reload rather than trust it.
                 runtime.current_path = None;
+                runtime.current_arch = None;
                 runtime.current_max_seq = 0;
                 runtime.cache_capable = false;
             }
@@ -4215,6 +4253,9 @@ fn complete_request_attempt(
         .or_else(|| body.get("max_completion_tokens"))
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(config_u64(&resolved, "generation.max_tokens")?);
+    if max_tokens == 0 || max_tokens > 393_216 {
+        bail!("max_tokens must be between 1 and 393216");
+    }
     let required_max_seq = max_tokens.saturating_add(1024);
     if runtime.current_max_seq < required_max_seq {
         runtime.ensure_model(&model, &shared.meta, Some(required_max_seq))?;
@@ -4279,7 +4320,8 @@ fn complete_request_attempt(
             );
         }
     }
-    apply_http_reasoning_request(body, &resolved, &mut generate)?;
+    let deepseek4_effort_contract = runtime.current_arch.as_deref() == Some("deepseek4");
+    apply_http_reasoning_request(body, &resolved, &mut generate, deepseek4_effort_contract)?;
     let (id, created) = identity.clone();
     generate["id"] = serde_json::Value::String(id.clone());
     generate["attempt_id"] = serde_json::json!(attempt_id);
@@ -4643,6 +4685,51 @@ fn forward_think_fragments(
     Ok(())
 }
 
+fn should_prewarm_qwen_mq4r_decode(
+    path: &Path,
+    loaded: &serde_json::Value,
+    tp: Option<u64>,
+) -> bool {
+    let qwen = loaded
+        .get("arch")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|arch| arch.starts_with("qwen3_5"));
+    let mq4r = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("mq4r"));
+    qwen && mq4r && tp.unwrap_or(1) == 1
+}
+
+fn prewarm_qwen_mq4r_decode(engine: &mut Engine) -> Result<()> {
+    let response = engine.request(&serde_json::json!({
+        "type": "bench_decode",
+        "context_tokens": 64,
+        "iterations": 32,
+    }))?;
+    match response.get("type").and_then(serde_json::Value::as_str) {
+        Some("decode_result") => {
+            let tok_s = response
+                .get("tok_s")
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or(0.0);
+            eprintln!("[hipfire] pre-warmed Qwen MQ4R decode route ({tok_s:.1} tok/s)");
+            Ok(())
+        }
+        Some("error") => bail!(
+            "Qwen MQ4R decode pre-warm failed: {}",
+            response
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("daemon returned an unspecified error")
+        ),
+        other => bail!(
+            "Qwen MQ4R decode pre-warm expected decode_result, received {}",
+            other.unwrap_or("missing type")
+        ),
+    }
+}
+
 impl ServeRuntime {
     fn ensure_model(
         &mut self,
@@ -4690,11 +4777,18 @@ impl ServeRuntime {
                 eprintln!("[hipfire] bumping load max_seq to {loaded_max_seq} for request budget");
             }
             let loaded = self.engine.load(&path, params)?;
+            if should_prewarm_qwen_mq4r_decode(&path, &loaded, self.tp) {
+                prewarm_qwen_mq4r_decode(&mut self.engine)?;
+            }
             self.cache_capable = loaded
                 .get("cache_capable")
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false);
             self.current_path = Some(path);
+            self.current_arch = loaded
+                .get("arch")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned);
             self.current_max_seq = loaded_max_seq;
             meta.lock()
                 .unwrap_or_else(|error| error.into_inner())
@@ -5236,6 +5330,7 @@ fn finish_sse_stream(sender: mpsc::Sender<ResponseChunk>, result: Result<Complet
                 drop(sender);
                 return;
             }
+            eprintln!("[hipfire] streaming completion failed: {error:#}");
             // Unclean failure: poison the reader instead of framing success/error.
             let _ = sender.send(ResponseChunk {
                 bytes: Vec::new(),
@@ -5756,6 +5851,10 @@ fn load_params(
     }
     let mut params = serde_json::json!({
         "max_seq": max_seq,
+        "deepseek4_compute_placement": config_string(
+            resolved,
+            "hardware.deepseek4_compute_placement",
+        )?,
         "kv_mode": kv_mode,
         "kv_backend": kv_backend,
         "kv_adaptive": config_string(resolved, "memory.kv_adaptive")?,
@@ -5787,6 +5886,11 @@ fn load_params(
         "prefill_sparse_threshold": config_u64(resolved, "speculation.prefill.sparse_threshold")?,
         "speculation": config_string(resolved, "speculation.mode")?,
     });
+    if let Some(experts_per_token) =
+        config_optional_u64(resolved, "model.deepseek4_experts_per_token")?
+    {
+        params["deepseek4_experts_per_token"] = serde_json::json!(experts_per_token);
+    }
     let selector = config_string(resolved, "speculation.mode")?;
     apply_speculation_selector(&mut params, &selector)?;
     project_dflash_draft(&mut params, developer_dflash_draft(resolved));
@@ -5903,6 +6007,18 @@ fn apply_reasoning_request(
         }
     };
     request["max_think_tokens"] = serde_json::json!(max_think);
+    match config_string(resolved, "reasoning.effort")?.as_str() {
+        "auto" => {}
+        "none" => {
+            request["max_think_tokens"] = serde_json::json!(1);
+            request["assistant_prefix"] = serde_json::json!("closed_think");
+            request["reasoning_effort"] = serde_json::json!("none");
+        }
+        effort @ ("low" | "high" | "max") => {
+            request["reasoning_effort"] = serde_json::json!(effort);
+        }
+        effort => bail!("unknown reasoning effort '{effort}'"),
+    }
     Ok(())
 }
 
@@ -5910,6 +6026,7 @@ fn apply_http_reasoning_request(
     body: &serde_json::Value,
     resolved: &hipfire_config::ResolvedConfig,
     request: &mut serde_json::Value,
+    deepseek4_effort_contract: bool,
 ) -> Result<()> {
     let thinking_disabled = body
         .pointer("/chat_template_kwargs/enable_thinking")
@@ -5929,19 +6046,56 @@ fn apply_http_reasoning_request(
         return Ok(());
     }
     if let Some(effort) = effort {
-        let max_think = match effort {
-            "minimal" => 64,
-            "low" => 256,
-            "medium" | "med" => 1024,
-            "high" => 4096,
-            "xhigh" | "max" | "uncapped" => 0,
+        if !deepseek4_effort_contract {
+            let max_think = match effort {
+                "minimal" => 64,
+                "low" => 256,
+                "medium" | "med" => 1024,
+                "high" => 4096,
+                "xhigh" | "max" | "uncapped" => 0,
+                other => bail!("unknown reasoning effort '{other}'"),
+            };
+            request["max_think_tokens"] = serde_json::json!(max_think);
+            request["reasoning_effort"] = serde_json::json!(effort);
+            return Ok(());
+        }
+        let normalized = match effort {
+            "minimal" | "medium" | "med" | "low" => "low",
+            "high" => "high",
+            "xhigh" | "max" | "uncapped" => "max",
             other => bail!("unknown reasoning effort '{other}'"),
         };
-        request["max_think_tokens"] = serde_json::json!(max_think);
-        request["reasoning_effort"] = serde_json::json!(effort);
+        let explicit_cap = body
+            .get("max_think_tokens")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        if explicit_cap > 393_216 {
+            bail!("max_think_tokens must be between 0 and 393216");
+        }
+        // Effort selects the parent model's prompt semantics. It never invents
+        // a hipfire token cap; absent an explicit cap, 0 means uncapped.
+        request["max_think_tokens"] = serde_json::json!(explicit_cap);
+        request["reasoning_effort"] = serde_json::json!(normalized);
         return Ok(());
     }
-    apply_reasoning_request(resolved, request)
+    apply_reasoning_request(resolved, request)?;
+    if deepseek4_effort_contract
+        && request
+            .get("reasoning_effort")
+            .and_then(serde_json::Value::as_str)
+            != Some("none")
+    {
+        if let Some(explicit_cap) = body
+            .get("max_think_tokens")
+            .and_then(serde_json::Value::as_u64)
+        {
+            if explicit_cap > 393_216 {
+                bail!("max_think_tokens must be between 0 and 393216");
+            }
+            request["max_think_tokens"] = serde_json::json!(explicit_cap);
+        }
+    }
+    Ok(())
 }
 
 fn config_value<'a>(
@@ -5978,6 +6132,22 @@ fn config_i64(resolved: &hipfire_config::ResolvedConfig, key: &str) -> Result<i6
 fn config_u64(resolved: &hipfire_config::ResolvedConfig, key: &str) -> Result<u64> {
     let value = config_i64(resolved, key)?;
     u64::try_from(value).map_err(|_| anyhow!("{key} cannot be negative"))
+}
+
+fn config_optional_u64(
+    resolved: &hipfire_config::ResolvedConfig,
+    key: &str,
+) -> Result<Option<u64>> {
+    match config_value(resolved, key)? {
+        hipfire_config::ConfigValue::Null => Ok(None),
+        hipfire_config::ConfigValue::Integer(value) => u64::try_from(*value)
+            .map(Some)
+            .map_err(|_| anyhow!("{key} cannot be negative")),
+        value => bail!(
+            "{key} resolved as {}, expected integer or null",
+            value.kind()
+        ),
+    }
 }
 
 fn config_f64(resolved: &hipfire_config::ResolvedConfig, key: &str) -> Result<f64> {
@@ -6258,16 +6428,22 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
             .unwrap_or("unknown")
     );
     eprintln!("  runs:   {}", args.runs);
+    eprintln!("  max_tokens: {}", args.max_tokens);
     if args.matrix || args.redline {
         bench_matrix(&mut engine, &args, &loaded, &post_diag)
     } else {
-        let _ = bench_generate(&mut engine, "Hello", 16)?;
+        let _ = bench_generate_with_reasoning(&mut engine, "Hello", 16, args.reasoning_off)?;
         let mut decode = Vec::new();
         let mut prefill = Vec::new();
         let mut wall = Vec::new();
         let mut ttft = Vec::new();
         for _ in 0..args.runs {
-            let done = bench_generate(&mut engine, &prompt, 128)?;
+            let done = bench_generate_with_reasoning(
+                &mut engine,
+                &prompt,
+                args.max_tokens as u64,
+                args.reasoning_off,
+            )?;
             if let Some(value) = done.get("decode_tok_s").and_then(serde_json::Value::as_f64) {
                 decode.push(value);
             }
@@ -6293,6 +6469,9 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
             "loaded": loaded,
             "gpu": post_diag,
             "vram_free_before_mb": pre_diag.get("vram_free_mb"),
+            "max_tokens": args.max_tokens,
+            "runs": args.runs,
+            "batch": 1,
             "decode_tok_s": sample_stats(&decode),
             "prefill_tok_s": sample_stats(&prefill),
             "wall_tok_s": sample_stats(&wall),
@@ -6378,6 +6557,9 @@ fn open_bench_engine(
         args.kv_mode.as_deref(),
         args.kv_backend.as_deref(),
     )?;
+    if let Some(selector) = args.speculation.as_deref() {
+        apply_speculation_selector(&mut params, selector)?;
+    }
     if args.matrix || args.redline {
         let requested = longest_prefill.max(longest_decode).saturating_add(32);
         let configured = params["max_seq"].as_u64().unwrap_or(0);
@@ -6402,10 +6584,22 @@ fn bench_generate_request(prompt: &str, max_tokens: u64) -> serde_json::Value {
 }
 
 fn bench_generate(engine: &mut Engine, prompt: &str, max_tokens: u64) -> Result<serde_json::Value> {
-    Ok(engine.generate(
-        &bench_generate_request(prompt, max_tokens),
-        |_| Ok(()),
-    )?)
+    Ok(engine.generate(&bench_generate_request(prompt, max_tokens), |_| Ok(()))?)
+}
+
+fn bench_generate_with_reasoning(
+    engine: &mut Engine,
+    prompt: &str,
+    max_tokens: u64,
+    reasoning_off: bool,
+) -> Result<serde_json::Value> {
+    let mut request = bench_generate_request(prompt, max_tokens);
+    if reasoning_off {
+        request["max_think_tokens"] = serde_json::json!(1);
+        request["assistant_prefix"] = serde_json::json!("closed_think");
+        request["reasoning_effort"] = serde_json::json!("none");
+    }
+    Ok(engine.generate(&request, |_| Ok(()))?)
 }
 
 fn bench_probe(
@@ -6608,12 +6802,15 @@ fn profile_command(paths: &Paths, args: ProfileArgs) -> Result<()> {
             pp: vec![128],
             ctx: vec![128],
             tg: 1,
+            max_tokens: 128,
             sustained_tg: None,
             sustained_ctx: vec![128],
             warmups: 1,
             kv_mode: None,
             kv_backend: None,
             redline: false,
+            speculation: None,
+            reasoning_off: false,
             prompt: Vec::new(),
         };
         let (mut engine, _, _, _) = open_bench_engine(paths, &bench, None)?;
@@ -8242,6 +8439,10 @@ fn config_rule_json(rule: ValueRule) -> serde_json::Value {
             "type": "string",
             "format": "kv-adaptive-policy",
         }),
+        ValueRule::Deepseek4Placement => serde_json::json!({
+            "type": "string",
+            "format": "deepseek4-compute-placement",
+        }),
     }
 }
 
@@ -8261,6 +8462,7 @@ fn config_rule_label(rule: ValueRule) -> &'static str {
         ValueRule::NullableInteger { .. } => "integer|null",
         ValueRule::NullableFloat { .. } => "number|null",
         ValueRule::KvAdaptive => "kv-adaptive",
+        ValueRule::Deepseek4Placement => "deepseek4-placement",
     }
 }
 
@@ -8313,10 +8515,41 @@ mod tests {
         }
     }
 
+    fn idle_test_meta() -> ServeMeta {
+        ServeMeta {
+            current_model: Some("model.hfq".to_owned()),
+            loading_model: Some("model.hfq".to_owned()),
+            instance_token: "test".to_owned(),
+            requests_served: 0,
+            retries_attempted: 0,
+            retries_succeeded: 0,
+            recent_tok_s: None,
+            started: Instant::now(),
+            last_activity: Instant::now() - Duration::from_secs(600),
+        }
+    }
+
+    #[test]
+    fn idle_timeout_does_not_evict_a_loading_model() {
+        let meta = idle_test_meta();
+        assert!(!idle_model_expired(&meta, Duration::from_secs(300)));
+    }
+
+    #[test]
+    fn successful_prewarm_starts_a_fresh_idle_window() {
+        let mut meta = idle_test_meta();
+        finish_prewarm(&mut meta, true);
+        assert!(meta.loading_model.is_none());
+        assert!(!idle_model_expired(&meta, Duration::from_secs(300)));
+        assert!(meta.last_activity.elapsed() < Duration::from_secs(1));
+    }
+
     #[test]
     fn model_suffix_filter_covers_current_formats() {
         assert!(is_model_file("qwen3.6-35b-a3b.mq4r"));
         assert!(is_model_file("deepseek.mq2lloyd"));
+        assert!(is_model_file("deepseek-v4-flash-0731.mq2r"));
+        assert!(is_model_file("deepseek-v4-flash-0731.mq2rxt"));
         assert!(is_model_file("draft.hfq"));
         assert!(!is_model_file("model.triattn.bin"));
         assert!(!is_model_file("README.md"));
@@ -8386,6 +8619,55 @@ mod tests {
         let params =
             load_params(&defaults, None, &model_path, 64, Some("q8"), Some("vmm")).unwrap();
         assert_eq!(params["kv_backend"], "vmm");
+    }
+
+    #[test]
+    fn load_params_only_forwards_explicit_deepseek4_expert_fanout() {
+        let model_path = PathBuf::from("/tmp/test-model.mq2r");
+        let defaults = resolve(Vec::<NamedLayer>::new()).unwrap();
+        let params = load_params(&defaults, None, &model_path, 64, Some("q8"), None).unwrap();
+        assert_eq!(params["deepseek4_compute_placement"], "single");
+        assert!(params.get("deepseek4_experts_per_token").is_none());
+
+        let mut explicit = ConfigLayer::default();
+        explicit
+            .set_cli("model.deepseek4_experts_per_token", "4")
+            .unwrap();
+        let resolved = resolve([NamedLayer {
+            source: ConfigSource::OneShot {
+                argument: "model.deepseek4_experts_per_token=4".into(),
+            },
+            layer: explicit,
+        }])
+        .unwrap();
+        let params = load_params(&resolved, None, &model_path, 64, Some("q8"), None).unwrap();
+        assert_eq!(params["deepseek4_experts_per_token"], 4);
+    }
+
+    #[test]
+    fn load_params_forwards_typed_deepseek4_compute_placement() {
+        let raw = "dense-expert-split(dense=arch:gfx1100,experts=arch:gfx1151)";
+        let mut explicit = ConfigLayer::default();
+        explicit
+            .set_cli("hardware.deepseek4_compute_placement", raw)
+            .unwrap();
+        let resolved = resolve([NamedLayer {
+            source: ConfigSource::OneShot {
+                argument: format!("hardware.deepseek4_compute_placement={raw}"),
+            },
+            layer: explicit,
+        }])
+        .unwrap();
+        let params = load_params(
+            &resolved,
+            None,
+            Path::new("/tmp/test-model.mq2r"),
+            64,
+            Some("q8"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(params["deepseek4_compute_placement"], raw);
     }
 
     #[test]
@@ -9760,9 +10042,36 @@ mod tests {
             &serde_json::json!({ "reasoning_effort": "high" }),
             &resolved,
             &mut request,
+            false,
         )
         .unwrap();
+        assert_eq!(request["reasoning_effort"], "high");
         assert_eq!(request["max_think_tokens"], 4096);
+
+        let mut deepseek_uncapped = serde_json::json!({});
+        apply_http_reasoning_request(
+            &serde_json::json!({ "reasoning_effort": "max" }),
+            &resolved,
+            &mut deepseek_uncapped,
+            true,
+        )
+        .unwrap();
+        assert_eq!(deepseek_uncapped["reasoning_effort"], "max");
+        assert_eq!(deepseek_uncapped["max_think_tokens"], 0);
+
+        let mut deepseek_explicitly_capped = serde_json::json!({});
+        apply_http_reasoning_request(
+            &serde_json::json!({
+                "reasoning_effort": "max",
+                "max_think_tokens": 1234
+            }),
+            &resolved,
+            &mut deepseek_explicitly_capped,
+            true,
+        )
+        .unwrap();
+        assert_eq!(deepseek_explicitly_capped["reasoning_effort"], "max");
+        assert_eq!(deepseek_explicitly_capped["max_think_tokens"], 1234);
 
         let mut disabled = serde_json::json!({});
         apply_http_reasoning_request(
@@ -9771,6 +10080,7 @@ mod tests {
             }),
             &resolved,
             &mut disabled,
+            false,
         )
         .unwrap();
         assert_eq!(disabled["reasoning_effort"], "none");
@@ -12526,6 +12836,7 @@ for line in sys.stdin:
                     paths: paths.clone(),
                     registry,
                     current_path: None,
+                    current_arch: None,
                     current_max_seq: 0,
                     cache_capable: false,
                     kv_override: None,
@@ -13390,26 +13701,47 @@ for line in sys.stdin:
     #[test]
     fn bench_generate_request_includes_numeric_first_attempt() {
         let req = bench_generate_request("bench prompt", 37);
-        assert_eq!(
-            req.get("type").and_then(|v| v.as_str()),
-            Some("generate")
-        );
-        assert_eq!(
-            req.get("attempt_id").and_then(|v| v.as_u64()),
-            Some(1)
-        );
-        let id = req
-            .get("id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        assert_eq!(req.get("type").and_then(|v| v.as_str()), Some("generate"));
+        assert_eq!(req.get("attempt_id").and_then(|v| v.as_u64()), Some(1));
+        let id = req.get("id").and_then(|v| v.as_str()).unwrap_or("");
         assert!(!id.is_empty(), "id must be a non-empty string");
         assert_eq!(
             req.get("prompt").and_then(|v| v.as_str()),
             Some("bench prompt")
         );
-        assert_eq!(
-            req.get("max_tokens").and_then(|v| v.as_u64()),
-            Some(37)
-        );
+        assert_eq!(req.get("max_tokens").and_then(|v| v.as_u64()), Some(37));
+    }
+
+    #[test]
+    fn qwen_mq4r_decode_prewarm_is_fail_closed_to_the_exact_route() {
+        let qwen = serde_json::json!({ "arch": "qwen3_5_moe" });
+        let qwen_dense = serde_json::json!({ "arch": "qwen3_5" });
+        let deepseek = serde_json::json!({ "arch": "deepseek4" });
+
+        assert!(should_prewarm_qwen_mq4r_decode(
+            Path::new("qwen3.6-35b-a3b.mq4r"),
+            &qwen,
+            None,
+        ));
+        assert!(should_prewarm_qwen_mq4r_decode(
+            Path::new("QWEN3.6-9B.MQ4R"),
+            &qwen_dense,
+            Some(1),
+        ));
+        assert!(!should_prewarm_qwen_mq4r_decode(
+            Path::new("qwen3.6-35b-a3b.mq4"),
+            &qwen,
+            None,
+        ));
+        assert!(!should_prewarm_qwen_mq4r_decode(
+            Path::new("deepseek-v4-flash.mq4r"),
+            &deepseek,
+            None,
+        ));
+        assert!(!should_prewarm_qwen_mq4r_decode(
+            Path::new("qwen3.6-35b-a3b.mq4r"),
+            &qwen,
+            Some(2),
+        ));
     }
 }

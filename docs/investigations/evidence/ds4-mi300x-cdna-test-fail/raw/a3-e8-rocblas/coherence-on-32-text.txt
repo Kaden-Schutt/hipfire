@@ -1,0 +1,1 @@
+Here is the requested production-grade technical briefing for the measurement contract. The text below is written for operators and implementers who must keep the measurement honest, avoid hidden

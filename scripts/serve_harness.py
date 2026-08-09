@@ -11,7 +11,7 @@ to tell coherent output from runaway/empty and to read real perf:
 
 TWO-STEP DISCIPLINE: `--show-config` resolves and prints the CONCRETE config —
 every sampling value with its source ([registry]/[default]/[recipe]/[explicit]),
-`thinking_budget med -> 2048 tok`, `max_tokens`, `kv`, `mtp`, model — WITHOUT
+the resolved effort and independent thinking cap, `max_tokens`, `kv`, `mtp`, model — WITHOUT
 running, so you eyeball exactly what is and isn't set before anything fires. The
 sampling DEFAULT is production-sampled (the model's registry recommended_settings),
 never greedy or the 0.3 CLI fallback.
@@ -24,7 +24,8 @@ Modes:
   session — an existing N-turn session file (recall + attractor), e.g. the 8-turn
             session_coding.json the coherence gate uses.
 """
-import argparse, atexit, errno, json, os, re, shutil, signal, subprocess, sys, tempfile, time, urllib.request
+import argparse, atexit, errno, hashlib, json, os, re, shutil, signal, subprocess, sys, tempfile, time, urllib.request
+from pathlib import Path
 
 # Mirror of the Rust configuration schema's reasoning budgets (resolved here so the pre-flight shows the
 # concrete token cap, not just the preset name).
@@ -57,6 +58,23 @@ GENRE_BATTERY = [
 ]
 
 REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+
+
+def resolve_kv_mode(explicit, tag, registry_path):
+    """Resolve the cache mode from an explicit override or the model registry."""
+    if explicit is not None:
+        return explicit, "explicit(--kv)"
+    try:
+        registry = json.load(open(registry_path))
+        canonical = (registry.get("aliases") or {}).get(tag, tag)
+        entry = (registry.get("models") or {}).get(canonical, {})
+        mode = entry.get("default_kv_mode")
+        if mode:
+            return mode, f"registry({canonical})"
+    except Exception as e:
+        print(f"  [warn] could not resolve default_kv_mode from {registry_path}: {e}",
+              file=sys.stderr)
+    return "auto", "default(auto)"
 
 
 def resolve_sampling(spec, tag, registry_path):
@@ -95,17 +113,18 @@ def resolve_sampling(spec, tag, registry_path):
             print(f"  [warn] could not read registry {registry_path}: {e}", file=sys.stderr)
         label = f"registry({tag}:{profile})" if profile else f"registry({tag})"
         vals, source = {}, {}
-        for k in ["temperature", "top_p", "top_k", "min_p", "presence_penalty", "repeat_penalty"]:
+        for k in ["temperature", "top_p", "top_k", "min_p", "presence_penalty",
+                  "repeat_penalty", "reasoning_effort", "thinking_budget"]:
             if k in rec:
                 vals[k] = rec[k]; source[k] = label
         # The instruct profile is the non-thinking mode: drive reasoning_effort=none
         # through the existing budget machinery (no daemon request-JSON change).
-        if profile == "instruct":
+        if profile == "instruct" and "reasoning_effort" not in vals:
             vals["reasoning_effort"] = "none"; source["reasoning_effort"] = label
         # Registry stays the PREFERENCE; this only covers entries that carry nothing
         # usable. Guard on the sampling keys, not on `vals` — the instruct profile has
         # already inserted reasoning_effort above, so `not vals` would never fire here.
-        if not [k for k in vals if k != "reasoning_effort"]:
+        if not [k for k in vals if k not in ("reasoning_effort", "thinking_budget")]:
             # 38/54 registry models still lack recommended_settings, and a hard exit
             # strands callers that cannot pass --sampling (tools.redline bench's
             # coherence smoke hard-codes "registry" and forwards no --tag).
@@ -128,6 +147,11 @@ def infer_tag(model_path):
     those tags, so the size group must admit a fractional part.
     """
     b = os.path.basename(model_path)
+    if b.startswith("deepseek-v4-flash-0731"):
+        if b.endswith(".mq2r"):
+            return "deepseek-v4-flash:mq2r"
+        if b.endswith(".mq2lloyd"):
+            return "deepseek-v4-flash"
     m = re.match(r"(qwen3\.\d+)-(\d+(?:\.\d+)?b(?:-a\d+b)?)", b)
     if m:
         return f"{m.group(1)}:{m.group(2)}"
@@ -136,10 +160,29 @@ def infer_tag(model_path):
 
 def build_config(args):
     tag = args.tag or infer_tag(args.model)
+    kv, kv_source = resolve_kv_mode(args.kv, tag, args.registry)
     samp, samp_src = resolve_sampling(args.sampling, tag, args.registry)
-    think_cap = THINKING_BUDGET.get(args.thinking)
+    # Effort is parent-model prompt semantics. Budget is an independent hipfire
+    # cap policy and must never be inferred from the effort level.
+    registry_budget = samp.pop("thinking_budget", None)
+    samp_src.pop("thinking_budget", None)
+    effort = getattr(args, "thinking_effort", None)
+    if effort:
+        samp = dict(samp)
+        samp["reasoning_effort"] = effort
+        samp_src = dict(samp_src)
+        samp_src["reasoning_effort"] = "explicit(--thinking-effort)"
+    selected_budget = args.thinking
+    if selected_budget is None:
+        if registry_budget is not None:
+            selected_budget = registry_budget
+        elif samp.get("reasoning_effort") in ("low", "high", "max"):
+            selected_budget = "uncapped"
+        else:
+            selected_budget = "med"
+    think_cap = THINKING_BUDGET.get(selected_budget)
     if think_cap is None:
-        sys.exit(f"thinking_budget {args.thinking!r} not a key of {list(THINKING_BUDGET)}")
+        sys.exit(f"thinking_budget {selected_budget!r} not a key of {list(THINKING_BUDGET)}")
     draft = getattr(args, "draft", None)
     if draft:
         draft = os.path.abspath(os.path.expanduser(draft))
@@ -148,40 +191,89 @@ def build_config(args):
         env_draft = os.environ.get("HIPFIRE_DFLASH_DRAFT")
         draft = os.path.abspath(os.path.expanduser(env_draft)) if env_draft else None
     return {
-        "model": args.model, "tag": tag, "kv": args.kv, "mtp": args.mtp,
+        "model": args.model, "tag": tag, "kv": kv, "kv_source": kv_source,
+        "mtp": args.mtp,
         "kv_backend": getattr(args, "kv_backend", "contiguous") or "contiguous",
         "dflash": getattr(args, "dflash", "off") or "off",
         "draft": draft,
-        "thinking_budget": args.thinking, "thinking_cap_tokens": think_cap,
+        "thinking_budget": selected_budget, "thinking_cap_tokens": think_cap,
         "max_tokens": args.max_tokens, "sampling": samp, "sampling_source": samp_src,
         "mode": args.mode, "port": args.port, "seed": getattr(args, "seed", None),
         "prompts_file": getattr(args, "prompts_file", None),
+        "prompt_file": getattr(args, "prompt_file", None),
+        "niah_file": getattr(args, "niah_file", None),
+        "speculation_mode": getattr(args, "speculation", None),
+        "deepseek4_experts_per_token": getattr(args, "deepseek4_experts_per_token", None),
+        "deepseek4_compute_placement": getattr(args, "deepseek4_compute_placement", "single"),
+        "devices": getattr(args, "devices", None),
+        "tp": getattr(args, "tp", None),
         "replay_route_proof_log": bool(getattr(args, "replay_route_proof_log", False)),
     }
 
 
 
 
-def load_prompt_battery(prompts_file):
-    """Return [(genre, prompt), ...] from a --prompts-file JSON, else the built-in GENRE_BATTERY."""
+def load_prompt_battery(prompts_file, prompt_file=None, niah_file=None):
+    """Return ``(genre, prompt, expected_substrings)`` prompt rows.
+
+    ``--niah-file`` consumes the repository's committed long-context fixture
+    format directly.  Keeping the JSON fixture as the source of truth avoids a
+    second flattened prompt whose whitespace could silently drift.
+    """
+    if prompt_file:
+        text = Path(prompt_file).read_bytes().decode("utf-8")
+        return [("prose", text, [])]
+    if niah_file:
+        raw = Path(niah_file).read_text(encoding="utf-8")
+        stripped = raw.lstrip()
+        records = json.loads(raw) if stripped.startswith("[") else [json.loads(line) for line in raw.splitlines() if line.strip()]
+        rows = []
+        for index, record in enumerate(records):
+            filler = record.get("filler_text")
+            question = record.get("question")
+            if not isinstance(filler, str) or not isinstance(question, str):
+                raise ValueError(f"NIAH row {index} requires string filler_text and question")
+            expected = record.get("expected_answer_substrings")
+            if expected is None:
+                expected = [record.get("expected_answer_substring")]
+            if not isinstance(expected, list) or not expected or not all(isinstance(item, str) and item for item in expected):
+                raise ValueError(f"NIAH row {index} requires nonempty expected answer substring(s)")
+            rows.append((record.get("genre", "longctx-niah"), f"{filler}\n\n{question}", expected))
+        return rows
     if not prompts_file:
-        return list(GENRE_BATTERY)
-    import json
+        return [(genre, prompt, []) for genre, prompt in GENRE_BATTERY]
     rows = json.load(open(prompts_file))
-    return [(r.get("genre", "prose"), r["prompt"]) for r in rows]
+    return [(r.get("genre", "prose"), r["prompt"], r.get("expect", [])) for r in rows]
 
 
 def show_config(cfg):
     print("==================== serve_harness pre-flight (CONFIRM before run) ====================")
     print(f"  model         : {cfg['model']}")
     print(f"  registry tag  : {cfg['tag'] or '(none — sampling cannot be registry-resolved)'}")
-    print(f"  kv_mode       : {cfg['kv']}   kv_backend: {cfg.get('kv_backend', 'contiguous')}   mtp_mode: {cfg['mtp']}   mode: {cfg['mode']}")
+    print(f"  kv_mode       : {cfg['kv']} [{cfg.get('kv_source', 'unknown')}]"
+          f"   kv_backend: {cfg.get('kv_backend', 'contiguous')}"
+          f"   mtp_mode: {cfg['mtp']}   mode: {cfg['mode']}")
     print(f"  dflash        : {cfg.get('dflash', 'off')}   draft: {cfg.get('draft') or '(none / filename auto-match)'}")
-    print(f"  seed          : {cfg.get('seed')}   prompts_file: {cfg.get('prompts_file') or '(built-in battery)'}")
+    _spec = cfg.get("speculation_mode")
+    print(f"  speculation   : {_spec or '(derived from --dflash/--mtp above)'}"
+          f"{'   <-- OVERRIDES dflash/mtp' if _spec else ''}")
+    print(
+        "  ds4 experts/tok: "
+        f"{cfg.get('deepseek4_experts_per_token') or '(checkpoint default)'}"
+    )
+    print(f"  ds4 placement : {cfg.get('deepseek4_compute_placement', 'single')}")
+    print(f"  devices       : {cfg.get('devices') or '(runtime default)'}")
+    print(f"  expert parallel: tp={cfg.get('tp') or 1}")
+    prompt_source = cfg.get("prompt_file") or cfg.get("prompts_file") or cfg.get("niah_file") or "(built-in battery)"
+    print(f"  seed          : {cfg.get('seed')}   prompt_source: {prompt_source}")
     _cap = cfg['thinking_cap_tokens']
     _thinking_off = cfg['thinking_budget'] == 'off'
-    _resolved = 'thinking DISABLED (sentinel cap 1)' if _thinking_off else f'{_cap} tok (CONCRETE cap)'
+    _resolved = ('thinking DISABLED (sentinel cap 1)' if _thinking_off
+                 else 'uncapped' if _cap == 0
+                 else f'{_cap} tok (CONCRETE cap)')
     print(f"  thinking_budget: {cfg['thinking_budget']} -> {_resolved}")
+    print(f"  reasoning_effort: {cfg['sampling'].get('reasoning_effort', 'auto')}"
+          "  (parent prompt semantics; independent of cap)")
     _note = ('no think block emitted' if _thinking_off
              else 'uncapped think budget' if _cap == 0
              else f'> think cap {_cap} — model can answer' if cfg['max_tokens'] > _cap
@@ -270,18 +362,45 @@ def _kill_serve():
     if pgid is None and _serve_proc is not None:
         pgid = _serve_proc.pid
     if pgid is not None:
-        try:
-            os.killpg(pgid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        except OSError as err:
-            # ESRCH: group already gone (benign race). Other errors: last-ditch
-            # kill the Popen handle if it is still around.
-            if getattr(err, "errno", None) != errno.ESRCH and _serve_proc is not None:
-                try:
-                    _serve_proc.kill()
-                except Exception:
-                    pass
+        # rocprof must observe a normal target shutdown to flush its CSV trace.
+        # The default remains the historical exact/fast SIGKILL cleanup; this
+        # opt-in is developer tooling for HIPFIRE_DAEMON_BIN wrappers such as
+        # scripts/rocprof-daemon-wrap.sh and never changes product serving.
+        graceful = os.environ.get("HIPFIRE_SERVE_HARNESS_GRACEFUL_CLEANUP") == "1"
+        if graceful:
+            try:
+                os.killpg(pgid, signal.SIGINT)
+            except ProcessLookupError:
+                pgid = None
+            except OSError as err:
+                if getattr(err, "errno", None) == errno.ESRCH:
+                    pgid = None
+            if pgid is not None:
+                deadline = time.monotonic() + 30.0
+                while time.monotonic() < deadline:
+                    try:
+                        os.killpg(pgid, 0)
+                    except ProcessLookupError:
+                        pgid = None
+                        break
+                    except OSError as err:
+                        if getattr(err, "errno", None) == errno.ESRCH:
+                            pgid = None
+                            break
+                    time.sleep(0.1)
+        if pgid is not None:
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            except OSError as err:
+                # ESRCH: group already gone (benign race). Other errors:
+                # last-ditch kill the Popen handle if it is still around.
+                if getattr(err, "errno", None) != errno.ESRCH and _serve_proc is not None:
+                    try:
+                        _serve_proc.kill()
+                    except Exception:
+                        pass
     _serve_proc = None
     _serve_pgid = None
     _clear_pid_file()
@@ -312,11 +431,39 @@ def _write_native_config(cfg, home):
     DFlash selection uses the canonical speculation selector:
       --dflash on  → mode=dflash, dflash=on, mtp=off, ngram=off
       --dflash auto → mode=auto, dflash=auto (mtp left as requested)
-      --dflash off  → dflash=off (default; mode left auto so other mechanisms stay available)
+      --dflash off + --mtp off → mode=off (plain AR; no sidecar auto-discovery)
+      --dflash off + other MTP setting → dflash=off (mode remains auto)
+
+    `--speculation MODE` overrides all of the above with an explicit selector,
+    mirroring the CLI's apply_speculation_selector. This is the only way to ask
+    for DSpark: the DFlash/MTP matrix above can reach it solely by accident, by
+    leaving `mode` at its schema default of `auto` so the sidecar is
+    auto-discovered. DeepSeek V4 ships its speculative module inside the
+    checkpoint (see the model card: "it comes with a speculative decoding module
+    attached"), so `--speculation dspark` is the supported way to exercise it.
     """
+    explicit = cfg.get("speculation_mode")
     dflash = cfg.get("dflash", "off") or "off"
     mtp = cfg["mtp"]
-    if dflash == "on":
+    if explicit:
+        # Mirrors apply_speculation_selector(): each named selector pins every
+        # sibling off so the arms are mutually exclusive and legible in the log.
+        pins = {
+            "off":    ('off',    'off',  'off', 'off'),
+            "dflash": ('dflash', 'on',   'off', 'off'),
+            "mtp":    ('mtp',    'off',  'on',  'off'),
+            "ngram":  ('ngram',  'off',  'off', 'on'),
+            "dspark": ('dspark', 'off',  'off', 'off'),
+            "auto":   ('auto',   'auto', mtp,   'off'),
+        }[explicit]
+        speculation = (
+            '[speculation]\n'
+            f'mode = {json.dumps(pins[0])}\n'
+            f'dflash = {json.dumps(pins[1])}\n'
+            f'mtp = {json.dumps(pins[2])}\n'
+            f'ngram = {json.dumps(pins[3])}\n'
+        )
+    elif dflash == "on":
         # Exclusive DFlash selector — mirrors apply_speculation_selector("dflash").
         speculation = (
             '[speculation]\n'
@@ -334,30 +481,48 @@ def _write_native_config(cfg, home):
             'ngram = "off"\n'
         )
     else:
-        # Default product path: DFlash hard-off; leave mode at schema default (auto)
-        # so MTP/n-gram knobs remain independently selectable via --mtp.
+        # `--dflash off --mtp off` is the ordinary-AR contract. Leaving mode
+        # at its schema default (`auto`) would still auto-discover DSpark.
+        mode = 'mode = "off"\n' if mtp == "off" else ""
         speculation = (
             '[speculation]\n'
+            f'{mode}'
             f'dflash = "off"\n'
             f'mtp = {json.dumps(mtp)}\n'
             'ngram = "off"\n'
         )
+    model = ""
+    if cfg.get("deepseek4_experts_per_token") is not None:
+        model = (
+            "[model]\n"
+            f"deepseek4_experts_per_token = {cfg['deepseek4_experts_per_token']}\n\n"
+        )
+    placement = cfg.get("deepseek4_compute_placement", "single")
+    devices = cfg.get("devices")
+    devices_line = f"devices = {json.dumps(devices)}\n" if devices else ""
+    hardware = f"""[hardware]
+{devices_line}deepseek4_compute_placement = {json.dumps(placement)}
+
+"""
     text = f"""[serve]
 host = "127.0.0.1"
 port = {cfg["port"]}
 default_model = {json.dumps(cfg["model"])}
 
-[memory]
+{model}{hardware}[memory]
 max_seq = {cfg.get("max_seq", 32768)}
 kv_cache = {json.dumps(cfg["kv"])}
 
 {speculation}
 [generation]
-max_tokens = 16384
+max_tokens = {cfg.get("max_tokens", 16384)}
 
 [reasoning]
 budget = {json.dumps(cfg["thinking_budget"])}
 """
+    effort = cfg.get("sampling", {}).get("reasoning_effort")
+    if effort:
+        text += f"effort = {json.dumps(effort)}\n"
     if cfg.get("replay_route_proof_log"):
         text += """
 [diagnostic.replay]
@@ -565,6 +730,63 @@ def _self_test_serve_path_proofs():
     print("serve_harness: path-proof self-test OK", flush=True)
 
 
+def _self_test_prompt_sources():
+    """Exercise NIAH lowering without touching a model or GPU."""
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as tmp:
+        json.dump({
+            "filler_text": "alpha needle omega",
+            "question": "What was in the middle?",
+            "expected_answer_substring": "needle",
+        }, tmp)
+        path = tmp.name
+    try:
+        rows = load_prompt_battery(None, niah_file=path)
+        assert rows == [("longctx-niah", "alpha needle omega\n\nWhat was in the middle?", ["needle"])]
+    finally:
+        os.unlink(path)
+    print("serve_harness: prompt-source self-test OK", flush=True)
+
+
+def _self_test_device_config():
+    """Prove multi-device visibility is explicit in the isolated TOML."""
+    with tempfile.TemporaryDirectory() as home:
+        Path(home, ".hipfire").mkdir()
+        cfg = {
+            "port": 11520,
+            "model": "/models/deepseek4.mq2r",
+            "kv": "q8",
+            "mtp": "off",
+            "dflash": "off",
+            "thinking_budget": "off",
+            "deepseek4_compute_placement":
+                "dense-expert-split(dense=arch:gfx1100,experts=arch:gfx1151)",
+            "devices": "0,1",
+        }
+        _write_native_config(cfg, home)
+        config = Path(home, ".hipfire", "config.toml").read_text(encoding="utf-8")
+        assert '[hardware]\ndevices = "0,1"\n' in config
+    print("serve_harness: device-config self-test OK", flush=True)
+
+
+def _self_test_kv_resolution():
+    """Prove registry defaults, aliases, explicit overrides, and fallback."""
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as tmp:
+        json.dump({
+            "models": {"deepseek-v4-flash:mq2r": {"default_kv_mode": "f32"}},
+            "aliases": {"deepseek4:mq2r": "deepseek-v4-flash:mq2r"},
+        }, tmp)
+        path = tmp.name
+    try:
+        assert resolve_kv_mode(None, "deepseek4:mq2r", path) == (
+            "f32", "registry(deepseek-v4-flash:mq2r)")
+        assert resolve_kv_mode("f16", "deepseek4:mq2r", path) == (
+            "f16", "explicit(--kv)")
+        assert resolve_kv_mode(None, "missing", path) == ("auto", "default(auto)")
+    finally:
+        os.unlink(path)
+    print("serve_harness: kv-resolution self-test OK", flush=True)
+
+
 
 def _native_service_warm(port, expected_model=None, proc=None):
     """True only when health is ready for *this* spawn.
@@ -635,6 +857,8 @@ def spawn_serve(cfg, home, log):
     cli = _native_cli()
     serve_cmd = [cli, "serve", "127.0.0.1", str(cfg["port"]),
                  "--kv-backend", cfg.get("kv_backend", "contiguous")]
+    if cfg.get("tp"):
+        serve_cmd.extend(["--tp", str(cfg["tp"])])
     atexit.register(_kill_serve)
     # Append-only log: prior attempts remain for debugging; proofs use per-attempt offsets.
     os.makedirs(os.path.dirname(os.path.abspath(log)) or ".", exist_ok=True)
@@ -652,10 +876,16 @@ def spawn_serve(cfg, home, log):
         # Leader PID == PGID under start_new_session; retain it for dead-leader cleanup.
         _serve_pgid = _serve_proc.pid
         _write_pid_file(_serve_pgid)
-        for _ in range(90):
+        warm_timeout_secs = max(1, int(cfg.get("serve_warm_timeout_secs", 180)))
+        for _ in range((warm_timeout_secs + 1) // 2):
             txt = _serve_log_text(log, log_offset)
             if _native_service_warm(cfg["port"], expected_model=cfg.get("model"), proc=_serve_proc):
                 return log_offset
+            # A CLI that has already exited cannot become warm. Waiting the
+            # full 180-second startup window hid immediate config-validation
+            # failures behind four long retries.
+            if _serve_proc.poll() is not None:
+                break
             if re.search(r"out of memory|error loading|panic", txt, re.I):
                 break
             time.sleep(2)
@@ -747,9 +977,12 @@ def turn_line(i, r, recall=""):
     fl = (" !" + ",".join(flags)) if flags else ""
     dec = r["decode_tok_s"]
     dec_str = f"{dec}~" if (dec is not None and r.get("decode_estimated")) else f"{dec}"
+    prefill_tok_s = r.get("prefill_tok_s")
+    prefill_str = f"{prefill_tok_s}" if prefill_tok_s is not None else "n/a"
     return (f"  t{i:<2} finish={str(r['finish']):<6} ctx={r['ctx']:<6} cached={r['cached']:<6} "
             f"gen={r['gen']:<5}(think {r['think_words']}/ans {r['ans_words']}w) "
-            f"prefill={r['prefill_ms']}ms decode={dec_str} tau={r['tau']}"
+            f"prefill={r['prefill_ms']}ms/{prefill_str}tok/s "
+            f"decode={dec_str}tok/s tau={r['tau']}"
             f"{recall}{fl} | {r['ans_preview']!r}")
 
 
@@ -757,18 +990,30 @@ def run(cfg, args):
     label = f"{os.path.basename(cfg['model'])}|{cfg['mtp']}|{cfg['mode']}"
     print(f"### RUN {label}  kv={cfg['kv']} sampling={cfg['sampling']} seed={cfg.get('seed')} ###", flush=True)
     rows = []
-    battery = load_prompt_battery(cfg.get("prompts_file"))
+    battery = load_prompt_battery(
+        cfg.get("prompts_file"), cfg.get("prompt_file"), cfg.get("niah_file")
+    )
     if cfg["mode"] == "battery":
-        for genre, prompt in battery:
+        for genre, prompt, expected in battery:
             r = send(cfg, [{"role": "user", "content": prompt}])
-            rows.append(r); print(f"  [{genre}]" + turn_line(len(rows), r)[2:], flush=True)
+            r["prompt_md5"] = hashlib.md5(prompt.encode("utf-8")).hexdigest()
+            missing = [item for item in expected if item.lower() not in r["assistant_content"].lower()]
+            r["expected_substrings"] = expected
+            r["retrieval_missing"] = missing
+            recall = f" recall={len(expected) - len(missing)}/{len(expected)}" if expected else ""
+            rows.append(r); print(f"  [{genre}]" + turn_line(len(rows), r, recall)[2:], flush=True)
     elif cfg["mode"] == "chain":
         messages = []
-        for genre, prompt in battery:
+        for genre, prompt, expected in battery:
             messages.append({"role": "user", "content": prompt})
             r = send(cfg, messages)
+            r["prompt_md5"] = hashlib.md5(prompt.encode("utf-8")).hexdigest()
             messages.append({"role": "assistant", "content": r["assistant_content"]})
-            rows.append(r); print(f"  [{genre}]" + turn_line(len(rows), r)[2:], flush=True)
+            missing = [item for item in expected if item.lower() not in r["assistant_content"].lower()]
+            r["expected_substrings"] = expected
+            r["retrieval_missing"] = missing
+            recall = f" recall={len(expected) - len(missing)}/{len(expected)}" if expected else ""
+            rows.append(r); print(f"  [{genre}]" + turn_line(len(rows), r, recall)[2:], flush=True)
     elif cfg["mode"] == "session":
         turns = json.load(open(args.session))
         messages = []
@@ -777,16 +1022,34 @@ def run(cfg, args):
             r = send(cfg, messages)
             messages.append({"role": "assistant", "content": r["assistant_content"]})
             recall = ""
-            if t.get("expect"):
-                hit = sum(1 for e in t["expect"] if e.lower() in r["assistant_content"].lower())
-                recall = f" recall={hit}/{len(t['expect'])}"
+            expected = t.get("expect", [])
+            missing = [
+                item
+                for item in expected
+                if item.lower() not in r["assistant_content"].lower()
+            ]
+            r["expected_substrings"] = expected
+            r["retrieval_missing"] = missing
+            if expected:
+                recall = f" recall={len(expected) - len(missing)}/{len(expected)}"
             rows.append(r); print(turn_line(i+1, r, recall), flush=True)
     g = rows
     dec = [r["decode_tok_s"] for r in g if isinstance(r["decode_tok_s"], (int, float))]
-    pf = [(r["prefill_ms"] or 0)/1000 for r in g]
-    print(f"[{label} DONE] turns={len(g)} runaway={sum(r['runaway'] for r in g)} "
-          f"empty={sum(r['empty'] for r in g)} attractor={sum(r['attractor'] for r in g)} "
-          f"avg_decode={sum(dec)/len(dec):.1f}tok/s" if dec else f"[{label} DONE] turns={len(g)}", flush=True)
+    prefill = [
+        r["prefill_tok_s"]
+        for r in g
+        if isinstance(r.get("prefill_tok_s"), (int, float))
+    ]
+    summary = (
+        f"[{label} DONE] turns={len(g)} runaway={sum(r['runaway'] for r in g)} "
+        f"empty={sum(r['empty'] for r in g)} attractor={sum(r['attractor'] for r in g)} "
+        f"retrieval_miss={sum(bool(r.get('retrieval_missing')) for r in g)}"
+    )
+    if prefill:
+        summary += f" avg_prefill={sum(prefill)/len(prefill):.1f}tok/s"
+    if dec:
+        summary += f" avg_decode={sum(dec)/len(dec):.1f}tok/s"
+    print(summary, flush=True)
     if args.out:
         json.dump(rows, open(args.out, "w"), indent=0)
     return rows
@@ -795,20 +1058,58 @@ def run(cfg, args):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default=None, help="model file path to serve")
+    ap.add_argument(
+        "--deepseek4-compute-placement",
+        default="single",
+        help="typed DS4 placement, for example dense-expert-split(dense=arch:gfx1100,experts=arch:gfx1151)",
+    )
+    ap.add_argument(
+        "--devices",
+        default=None,
+        help="physical GPU selectors written to [hardware].devices, for example 0,1",
+    )
+    ap.add_argument(
+        "--tp",
+        type=int,
+        choices=range(1, 65),
+        default=None,
+        help="expert-parallel degree forwarded to native hipfire serve",
+    )
     ap.add_argument("--tag", default=None, help="registry tag for recommended_settings (else inferred)")
     ap.add_argument("--registry", default=os.path.join(REPO, "registry/v1.json"))
-    ap.add_argument("--kv", default="fwht3")
+    ap.add_argument("--kv", default=None,
+                    help="cache mode override; omitted resolves the registry default")
     ap.add_argument("--kv-backend", default="contiguous", choices=["contiguous", "vmm"],
                     help="hipfire serve --kv-backend override (default contiguous; use vmm for PR #549 path)")
     ap.add_argument("--mtp", default="off", choices=["off", "on", "auto"])
     ap.add_argument("--dflash", default="off", choices=["off", "auto", "on"],
                     help="DFlash mode written to temporary [speculation] TOML (default off). "
                          "'on' emits mode=dflash + dflash=on + mtp/ngram off.")
+    ap.add_argument("--speculation", default=None,
+                    choices=["off", "auto", "ngram", "dflash", "mtp", "dspark"],
+                    help="explicit speculation selector; overrides --dflash/--mtp and mirrors the "
+                         "CLI's apply_speculation_selector. Required to reach DSpark: the "
+                         "--dflash/--mtp matrix can only get there by accident, via the schema "
+                         "default mode=auto auto-discovering the sidecar. DeepSeek V4 ships its "
+                         "speculative module in the checkpoint, so use --speculation dspark.")
+    ap.add_argument(
+        "--deepseek4-experts-per-token",
+        type=int,
+        choices=range(1, 7),
+        default=None,
+        help="DeepSeek V4 routed experts per token for this model load; omitted preserves the checkpoint default.",
+    )
+    ap.add_argument("--thinking-effort", default=None,
+                    choices=["none", "low", "high", "max"],
+                    help="parent-model reasoning_effort prompt semantics; independent of "
+                         "--thinking. With no explicit/registry budget, low/high/max is uncapped.")
     ap.add_argument("--draft", default=None,
                     help="Optional DFlash draft path; sets HIPFIRE_DFLASH_DRAFT for the serve child. "
                          "When omitted, any caller-inherited HIPFIRE_DFLASH_DRAFT is preserved.")
-    ap.add_argument("--thinking", default="med", choices=list(THINKING_BUDGET),
-                    help="reasoning budget preset; \"off\" disables thinking (cap sentinel 1)")
+    ap.add_argument("--thinking", default=None, choices=list(THINKING_BUDGET),
+                    help="explicit reasoning cap policy. Default: registry thinking_budget; "
+                         "otherwise uncapped for an explicit effort, med for legacy callers. "
+                         "\"off\" disables thinking (cap sentinel 1).")
     ap.add_argument("--max-tokens", type=int, default=2048)
     ap.add_argument("--max-seq", type=int, default=32768)
     ap.add_argument("--sampling", default="registry",
@@ -818,15 +1119,33 @@ def main():
     ap.add_argument("--port", type=int, default=11520)
     ap.add_argument("--home", default=os.path.expanduser("~/.cache/serve_harness_home"))
     ap.add_argument("--serve-log", default="/tmp/serve_harness.serve.log")
+    ap.add_argument(
+        "--serve-warm-timeout-secs",
+        type=int,
+        default=180,
+        help="seconds to wait for a spawned serve to finish loading (default 180)",
+    )
     ap.add_argument("--out", default=None, help="write per-turn json")
     ap.add_argument("--show-config", action="store_true", help="resolve+print config, do NOT run")
     ap.add_argument("--no-spawn", action="store_true", help="connect to an already-running serve")
     ap.add_argument("--seed", type=int, default=None,
                     help="per-request sampler seed (sent in the body -> daemon initial rng_state). The "
                          "certify's coherence arm invokes with a seed-SET (one seed per call) for the rate test.")
-    ap.add_argument("--prompts-file", default=None,
-                    help="JSON [{\"genre\":..,\"prompt\":..}] replacing the built-in genre battery "
-                         "(e.g. battery + the coherence_prompts_<arch> guard set).")
+    prompt_source = ap.add_mutually_exclusive_group()
+    prompt_source.add_argument("--prompts-file", default=None,
+                               help="JSON [{\"genre\":..,\"prompt\":..}] replacing the built-in genre battery "
+                                    "(e.g. battery + the coherence_prompts_<arch> guard set).")
+    prompt_source.add_argument(
+        "--prompt-file",
+        default=None,
+        help="UTF-8 prompt bytes lowered to one prose battery row without newline normalization.",
+    )
+    prompt_source.add_argument(
+        "--niah-file",
+        default=None,
+        help="Committed NIAH JSON/JSONL fixture. Lowers filler_text + question exactly and "
+             "fails when expected_answer_substring(s) are absent.",
+    )
     ap.add_argument(
         "--replay-route-proof-log",
         action="store_true",
@@ -842,10 +1161,14 @@ def main():
     args = ap.parse_args()
     if args.self_test or os.environ.get("HIPFIRE_SERVE_HARNESS_SELFTEST") == "1":
         _self_test_serve_path_proofs()
+        _self_test_prompt_sources()
+        _self_test_device_config()
+        _self_test_kv_resolution()
         return
     if not args.model:
         ap.error("--model is required unless --self-test")
     cfg = build_config(args); cfg["max_seq"] = args.max_seq
+    cfg["serve_warm_timeout_secs"] = args.serve_warm_timeout_secs
     show_config(cfg)
     if args.show_config:
         return
@@ -874,6 +1197,9 @@ def main():
     if not args.no_spawn:
         _assert_dflash_request_proofs(cfg, rows, args.serve_log, offset=log_offset)
         _kill_serve()
+    missing = [r.get("retrieval_missing") for r in rows if r.get("retrieval_missing")]
+    if missing:
+        sys.exit(f"serve_harness: retrieval gate failed; missing expected substrings: {missing}")
 
 
 if __name__ == "__main__":

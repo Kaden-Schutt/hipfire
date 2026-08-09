@@ -6,6 +6,7 @@
 
 pub mod arch_caps;
 pub mod attention;
+pub mod cdna;
 mod compiler;
 mod dispatch;
 pub mod embedding;
@@ -20,6 +21,7 @@ pub mod pool;
 pub mod profile;
 pub mod profile_rocprof;
 pub mod profiler;
+pub mod rdna;
 pub mod replay;
 pub mod sampling;
 pub mod scratch;

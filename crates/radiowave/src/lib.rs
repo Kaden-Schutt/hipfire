@@ -192,12 +192,10 @@ pub struct CompileRequest {
     pub extra_args: Vec<OsString>,
     pub manifest: Option<PathBuf>,
     pub inspect: bool,
-    /// hipfire-local delta: environment applied to the hipcc invocation.
+    /// Environment applied only to the hipcc invocation.
     ///
-    /// hipcc resolves its own LLVM and device libraries through `ROCM_PATH`.
-    /// On a ROCm rooted outside `/opt/rocm` it reports a valid `--version` and
-    /// then fails every compile with `clang++: not found`, so the caller must
-    /// be able to pin the resolved root explicitly.
+    /// This lets callers pin a non-default ROCm root without mutating the
+    /// process environment used by inspection and replay.
     pub envs: Vec<(OsString, OsString)>,
 }
 
@@ -215,7 +213,7 @@ impl CompileRequest {
             hipcc: resolve_hipcc(),
             working_directory: None,
             optimization_level: 3,
-            fast_math: false,
+            fast_math: true,
             scheduler_profile: SchedulerProfile::Default,
             defines: Vec::new(),
             extra_args: Vec::new(),
@@ -230,7 +228,6 @@ impl CompileRequest {
         self
     }
 
-    /// hipfire-local delta: pin one environment variable for the hipcc call.
     pub fn env(mut self, key: impl Into<OsString>, value: impl Into<OsString>) -> Self {
         self.envs.push((key.into(), value.into()));
         self
@@ -346,6 +343,31 @@ pub enum MutableReadCache {
     VmemOnly,
 }
 
+/// Compiler-derived access mode for one global-buffer kernarg.
+///
+/// AMDGPU code-object metadata emits `.actual_access` after whole-body memory
+/// analysis. Radiowave preserves that result so submission layers do not need
+/// a kernel-name table to recover pointer effects.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KernelArgumentAccess {
+    ReadOnly,
+    WriteOnly,
+    ReadWrite,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct KernelArgumentReport {
+    pub offset: u32,
+    pub size: u32,
+    #[serde(default)]
+    pub value_kind: String,
+    #[serde(default)]
+    pub address_space: Option<String>,
+    #[serde(default)]
+    pub actual_access: Option<KernelArgumentAccess>,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct KernelReport {
     pub name: String,
@@ -357,6 +379,8 @@ pub struct KernelReport {
     pub private_segment_fixed_size: u32,
     #[serde(default)]
     pub mutable_read_cache: MutableReadCache,
+    #[serde(default)]
+    pub arguments: Vec<KernelArgumentReport>,
     pub instructions: InstructionStats,
 }
 
@@ -468,6 +492,34 @@ impl CodeObjectCertification {
                 kernel.mutable_read_cache
             })
     }
+
+    /// Exact global-buffer effects certified from AMDGPU `.actual_access`.
+    ///
+    /// Older manifests fail closed. AMDGPU omits `.actual_access` for some
+    /// mutable or in-place pointers; those are conservatively `ReadWrite`,
+    /// never inferred as read-only.
+    pub fn argument_effects(&self, symbol: &str) -> Option<Vec<(usize, KernelArgumentAccess)>> {
+        if self.manifest.schema_version < 4 {
+            return None;
+        }
+        let kernel = self.kernel(symbol)?;
+        let mut effects = Vec::new();
+        for argument in &kernel.arguments {
+            if argument.value_kind != "global_buffer" {
+                continue;
+            }
+            if argument.size != 8 {
+                return None;
+            }
+            effects.push((
+                usize::try_from(argument.offset).ok()?,
+                argument
+                    .actual_access
+                    .unwrap_or(KernelArgumentAccess::ReadWrite),
+            ));
+        }
+        (!effects.is_empty()).then_some(effects)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -516,7 +568,7 @@ impl Compiler {
         rendered_command.push(request.hipcc.to_string_lossy().into_owned());
         rendered_command.extend(args.iter().map(|arg| arg.to_string_lossy().into_owned()));
         let manifest = CompileManifest {
-            schema_version: 3,
+            schema_version: 4,
             compiler: "radiowave".to_owned(),
             generated_unix_seconds: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -576,7 +628,7 @@ impl Compiler {
             fs::create_dir_all(parent)?;
         }
         let manifest = CompileManifest {
-            schema_version: 3,
+            schema_version: 4,
             compiler: "radiowave".to_owned(),
             generated_unix_seconds: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -873,15 +925,55 @@ fn sha256_bytes(bytes: &[u8]) -> String {
 fn parse_metadata(notes: &str) -> Vec<KernelReport> {
     let mut reports = Vec::new();
     let mut current: Option<KernelReport> = None;
+    let mut current_argument: Option<KernelArgumentReport> = None;
+    let mut in_arguments = false;
+
+    let flush_argument = |current: &mut Option<KernelReport>,
+                          argument: &mut Option<KernelArgumentReport>| {
+        if let (Some(report), Some(argument)) = (current.as_mut(), argument.take()) {
+            report.arguments.push(argument);
+        }
+    };
+
     for line in notes.lines() {
-        if let Some(name) = line.strip_prefix("    .name:") {
-            if let Some(report) = current.take() {
+        if line.starts_with("  - .args:") {
+            flush_argument(&mut current, &mut current_argument);
+            if let Some(report) = current.take().filter(|report| !report.name.is_empty()) {
                 reports.push(report);
             }
-            current = Some(KernelReport {
-                name: name.trim().trim_matches('"').to_owned(),
-                ..KernelReport::default()
-            });
+            current = Some(KernelReport::default());
+            in_arguments = true;
+            continue;
+        }
+        if in_arguments && line.starts_with("      - .") {
+            flush_argument(&mut current, &mut current_argument);
+            let mut argument = KernelArgumentReport::default();
+            parse_argument_metadata_field(
+                &mut argument,
+                line.trim_start().strip_prefix("- ").unwrap_or_default(),
+            );
+            current_argument = Some(argument);
+            continue;
+        }
+        if in_arguments && line.starts_with("        .") {
+            if let Some(argument) = current_argument.as_mut() {
+                parse_argument_metadata_field(argument, line.trim());
+            }
+            continue;
+        }
+        if in_arguments && line.starts_with("    .") {
+            flush_argument(&mut current, &mut current_argument);
+            in_arguments = false;
+        }
+        if let Some(name) = line.strip_prefix("    .name:") {
+            if current
+                .as_ref()
+                .is_some_and(|report| !report.name.is_empty())
+            {
+                reports.push(current.take().unwrap());
+            }
+            let report = current.get_or_insert_with(KernelReport::default);
+            report.name = name.trim().trim_matches('"').to_owned();
             continue;
         }
         let Some(report) = current.as_mut() else {
@@ -904,11 +996,34 @@ fn parse_metadata(notes: &str) -> Vec<KernelReport> {
             }
         }
     }
+    flush_argument(&mut current, &mut current_argument);
     if let Some(report) = current {
         reports.push(report);
     }
     reports.retain(|report| !report.name.is_empty());
     reports
+}
+
+fn parse_argument_metadata_field(argument: &mut KernelArgumentReport, field: &str) {
+    let Some((name, value)) = field.split_once(':') else {
+        return;
+    };
+    let value = value.trim().trim_matches('"');
+    match name.trim() {
+        ".actual_access" => {
+            argument.actual_access = match value {
+                "read_only" => Some(KernelArgumentAccess::ReadOnly),
+                "write_only" => Some(KernelArgumentAccess::WriteOnly),
+                "read_write" => Some(KernelArgumentAccess::ReadWrite),
+                _ => None,
+            };
+        }
+        ".address_space" => argument.address_space = Some(value.to_owned()),
+        ".offset" => argument.offset = value.parse().unwrap_or_default(),
+        ".size" => argument.size = value.parse().unwrap_or_default(),
+        ".value_kind" => argument.value_kind = value.to_owned(),
+        _ => {}
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1229,6 +1344,120 @@ mod tests {
     }
 
     #[test]
+    fn parses_compiler_derived_global_buffer_effects() {
+        let notes = r#"
+amdhsa.kernels:
+  - .args:
+      - .actual_access:  read_only
+        .address_space:  global
+        .offset:         0
+        .size:           8
+        .value_kind:     global_buffer
+      - .actual_access:  write_only
+        .address_space:  global
+        .offset:         8
+        .size:           8
+        .value_kind:     global_buffer
+      - .offset:         16
+        .size:           4
+        .value_kind:     by_value
+    .kernarg_segment_size: 24
+    .name:           effects
+    .wavefront_size: 32
+"#;
+        let reports = parse_metadata(notes);
+        assert_eq!(reports.len(), 1);
+        assert_eq!(
+            reports[0].arguments,
+            vec![
+                KernelArgumentReport {
+                    offset: 0,
+                    size: 8,
+                    value_kind: "global_buffer".to_owned(),
+                    address_space: Some("global".to_owned()),
+                    actual_access: Some(KernelArgumentAccess::ReadOnly),
+                },
+                KernelArgumentReport {
+                    offset: 8,
+                    size: 8,
+                    value_kind: "global_buffer".to_owned(),
+                    address_space: Some("global".to_owned()),
+                    actual_access: Some(KernelArgumentAccess::WriteOnly),
+                },
+                KernelArgumentReport {
+                    offset: 16,
+                    size: 4,
+                    value_kind: "by_value".to_owned(),
+                    address_space: None,
+                    actual_access: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn schema_four_certification_exposes_argument_effects() {
+        let code = b"schema-four code object";
+        let manifest = CompileManifest {
+            schema_version: 4,
+            compiler: "radiowave".to_owned(),
+            generated_unix_seconds: 0,
+            source: "kernel.hip".into(),
+            output: "kernel.hsaco".into(),
+            arch: "gfx1151".to_owned(),
+            wavefront: Wavefront::Wave32,
+            scheduler_profile: SchedulerProfile::Default,
+            hipcc: "hipcc".into(),
+            hipcc_version: "test".to_owned(),
+            command: Vec::new(),
+            source_sha256: "source".to_owned(),
+            support_header_sha256: "header".to_owned(),
+            output_sha256: sha256_bytes(code),
+            inspection: Some(CodeObjectInspection {
+                bundle_target: "hipv4-amdgcn-amd-amdhsa--gfx1151".to_owned(),
+                identity: None,
+                kernels: vec![KernelReport {
+                    name: "effects".to_owned(),
+                    arguments: vec![
+                        KernelArgumentReport {
+                            offset: 0,
+                            size: 8,
+                            value_kind: "global_buffer".to_owned(),
+                            address_space: Some("global".to_owned()),
+                            actual_access: Some(KernelArgumentAccess::ReadOnly),
+                        },
+                        KernelArgumentReport {
+                            offset: 8,
+                            size: 8,
+                            value_kind: "global_buffer".to_owned(),
+                            address_space: Some("global".to_owned()),
+                            actual_access: Some(KernelArgumentAccess::ReadWrite),
+                        },
+                        KernelArgumentReport {
+                            offset: 16,
+                            size: 8,
+                            value_kind: "global_buffer".to_owned(),
+                            address_space: Some("global".to_owned()),
+                            actual_access: None,
+                        },
+                    ],
+                    ..KernelReport::default()
+                }],
+            }),
+        };
+        let encoded = serde_json::to_string(&manifest).unwrap();
+        let certification = CodeObjectCertification::from_json(code, &encoded).unwrap();
+        assert_eq!(
+            certification.argument_effects("effects.kd"),
+            Some(vec![
+                (0, KernelArgumentAccess::ReadOnly),
+                (8, KernelArgumentAccess::ReadWrite),
+                (16, KernelArgumentAccess::ReadWrite),
+            ])
+        );
+    }
+
+    #[test]
     fn counts_addressing_instruction_classes() {
         let disassembly = r#"
 0000000000001000 <memory_gather>:
@@ -1396,6 +1625,27 @@ mod tests {
     }
 
     #[test]
+    fn compile_request_preserves_fast_math_unless_explicitly_disabled() {
+        let mut request = CompileRequest::new("kernel.hip", "kernel.hsaco", "gfx1151");
+        let default_args = compile_args(
+            &request,
+            Path::new("/tmp/kernel.hip"),
+            Path::new("/tmp/kernel.hsaco"),
+            Path::new("/tmp/radiowave.h"),
+        );
+        assert!(default_args.iter().any(|arg| arg == "-ffast-math"));
+
+        request.fast_math = false;
+        let strict_args = compile_args(
+            &request,
+            Path::new("/tmp/kernel.hip"),
+            Path::new("/tmp/kernel.hsaco"),
+            Path::new("/tmp/radiowave.h"),
+        );
+        assert!(!strict_args.iter().any(|arg| arg == "-ffast-math"));
+    }
+
+    #[test]
     fn compile_target_is_forwarded_without_a_gpu_family_allowlist() {
         let request = CompileRequest::new("kernel.hip", "kernel.hsaco", "future-amdgpu");
         let args = compile_args(
@@ -1405,27 +1655,6 @@ mod tests {
             Path::new("/tmp/radiowave.h"),
         );
         assert!(args.iter().any(|arg| arg == "--offload-arch=future-amdgpu"));
-    }
-
-    #[test]
-    fn compile_request_uses_strict_math_unless_fast_math_is_explicit() {
-        let mut request = CompileRequest::new("kernel.hip", "kernel.hsaco", "gfx1201");
-        let strict_args = compile_args(
-            &request,
-            Path::new("/tmp/kernel.hip"),
-            Path::new("/tmp/kernel.hsaco"),
-            Path::new("/tmp/radiowave.h"),
-        );
-        assert!(!strict_args.iter().any(|arg| arg == "-ffast-math"));
-
-        request.fast_math = true;
-        let fast_args = compile_args(
-            &request,
-            Path::new("/tmp/kernel.hip"),
-            Path::new("/tmp/kernel.hsaco"),
-            Path::new("/tmp/radiowave.h"),
-        );
-        assert!(fast_args.iter().any(|arg| arg == "-ffast-math"));
     }
 
     #[test]

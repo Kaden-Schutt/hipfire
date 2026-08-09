@@ -777,6 +777,7 @@ impl Carrier for LlamaCarrier {
                 // (fused sample_top_p_pf, honors temp+top_p+top_k). The daemon routes
                 // temp>0 llama through the chain path (requires_greedy()==false).
                 true,
+                0.5,
             ))
         } else if let Some(dp) = ctx.draft_path {
             // Peek at the draft's arch_id without consuming the path; the builder
@@ -951,6 +952,26 @@ impl Carrier for DotsOcrCarrier {
 
 // ─── Deepseek4Carrier ────────────────────────────────────────────────
 
+fn apply_deepseek4_experts_per_token(
+    config: &mut hipfire_arch_deepseek4::DeepseekV4Config,
+    requested: Option<usize>,
+) -> Result<(), String> {
+    let Some(requested) = requested else {
+        return Ok(());
+    };
+    let checkpoint = config.num_experts_per_tok;
+    if requested == 0 || requested > checkpoint {
+        return Err(format!(
+            "deepseek4: experts-per-token override must be in 1..={checkpoint}, got {requested}"
+        ));
+    }
+    if requested != checkpoint {
+        eprintln!("deepseek4: runtime experts-per-token override {checkpoint} -> {requested}");
+        config.num_experts_per_tok = requested;
+    }
+    Ok(())
+}
+
 pub struct Deepseek4Carrier;
 impl Carrier for Deepseek4Carrier {
     fn name(&self) -> &'static str {
@@ -963,6 +984,9 @@ impl Carrier for Deepseek4Carrier {
     ) -> Result<Box<dyn SpecTargetGuard + 'm>, String> {
         match state.as_mut() {
             Some(ModelState::Deepseek4(bundle)) => Ok(Box::new(InPlaceGuard { bundle })),
+            Some(ModelState::Deepseek4Heterogeneous(_)) => {
+                Err("deepseek4 heterogeneous route is direct-AR only until G6".into())
+            }
             _ => Err("deepseek4: spec target state mismatch".into()),
         }
     }
@@ -987,6 +1011,61 @@ impl Carrier for Deepseek4Carrier {
         }
         dir_diag(&src);
         let meta = resolve_source_meta(&src, ctx.path)?;
+        let compressor_cache =
+            crate::resolve_deepseek4_compressor_cache_kv_mode(ctx.kv_mode_override)?;
+
+        if !matches!(
+            ctx.deepseek4_compute_placement,
+            hipfire_config::Deepseek4ComputePlacement::Single
+        ) {
+            if compressor_cache == hipfire_config::Deepseek4CompressorCache::F16 {
+                return Err(
+                    "deepseek4: kv_cache=f16 currently requires gfx1201 MQ2R TP3/TP4".into(),
+                );
+            }
+            if !matches!(&src, ModelSource::Hfq(_)) {
+                return Err(
+                    "deepseek4 heterogeneous placement requires the frozen MQ2R HFQ artifact"
+                        .into(),
+                );
+            }
+            if ctx
+                .deepseek4_experts_per_token
+                .is_some_and(|value| value != 6)
+            {
+                return Err("deepseek4 heterogeneous placement requires checkpoint top-k 6".into());
+            }
+            if ctx.draft_path.is_some() || ctx.spec.dspark == Some(true) {
+                return Err(
+                    "deepseek4 heterogeneous placement is direct-AR only until G6/G7".into(),
+                );
+            }
+            let artifact =
+                hipfire_arch_deepseek4::DeepseekV4VerifiedArtifact::verify(ctx.path.as_ref())?;
+            let plan = hipfire_arch_deepseek4::DeepseekV4HeterogeneousLoadPlan {
+                placement: ctx.deepseek4_compute_placement.clone(),
+                prefill_max_batch: 1024,
+                ..Default::default()
+            };
+            let model = hipfire_arch_deepseek4::DeepseekV4HeterogeneousModel::load_verified(
+                &artifact, plan,
+            )?;
+            let eos_tok = resolve_eos_tok(&meta.tokenizer, &["<｜end▁of▁sentence｜>"]);
+            let advertised_context = model.config.max_position_embeddings;
+            return Ok(LoadedModel {
+                state: Some(crate::ModelState::Deepseek4Heterogeneous(
+                    crate::Deepseek4HeterogeneousBundle { model, eos_tok },
+                )),
+                ..LoadedModel::skeleton(
+                    meta.arch_id,
+                    meta.tokenizer,
+                    advertised_context,
+                    advertised_context,
+                    ctx.path.to_string(),
+                    meta.chat_template,
+                )
+            });
+        }
 
         use hipfire_arch_deepseek4 as deepseek4;
         use hipfire_runtime::arch::Architecture;
@@ -1000,6 +1079,7 @@ impl Carrier for Deepseek4Carrier {
         let (config, weights) = match src {
             ModelSource::Hfq(mut hfq) => {
                 let mut config = <deepseek4::DeepseekV4 as Architecture>::config_from_hfq(&hfq)?;
+                apply_deepseek4_experts_per_token(&mut config, ctx.deepseek4_experts_per_token)?;
                 config.load_dspark = load_dspark;
                 let weights = <deepseek4::DeepseekV4 as Architecture>::load_weights(
                     &mut hfq, &config, ctx.gpu,
@@ -1010,6 +1090,7 @@ impl Carrier for Deepseek4Carrier {
                 let mut config = deepseek4::config_from_safetensors(&source).ok_or_else(|| {
                     "deepseek4: failed to parse config from safetensors".to_string()
                 })?;
+                apply_deepseek4_experts_per_token(&mut config, ctx.deepseek4_experts_per_token)?;
                 config.load_dspark = load_dspark;
                 let weights = deepseek4::DeepseekV4::load_weights_from_safetensors(
                     &source, &config, ctx.gpu,
@@ -1017,7 +1098,28 @@ impl Carrier for Deepseek4Carrier {
                 (config, weights)
             }
         };
-        let state = deepseek4::DeepseekV4State::new(&config)?;
+        // F16 compressor cache on the single-device path: gfx1201 (certified)
+        // and gfx1151 (ported — the indexer score kernel's WMMA is
+        // generation-selected in the kernel source). Storage is confined to
+        // main_kv_cache and indexer_kv_cache; every other compressor buffer
+        // stays F32 and commit arithmetic completes in F32 before the single
+        // F32-to-F16 store.
+        let f16_ok = config.mq2r
+            && !config.mq2rxt
+            && ctx.gpu.arch_caps.supports_ds4_f16_compressor_cache();
+        if compressor_cache == hipfire_config::Deepseek4CompressorCache::F16 && !f16_ok {
+            return Err(format!(
+                "deepseek4: kv_cache=f16 requires MQ2R on an architecture with wave32 WMMA (RDNA3/RDNA4); got arch={}, mq2r={}, mq2rxt={}",
+                ctx.gpu.arch, config.mq2r, config.mq2rxt
+            ));
+        }
+        let mut state = deepseek4::DeepseekV4State::new(&config)?;
+        state.compressor_cache_dtype =
+            if compressor_cache == hipfire_config::Deepseek4CompressorCache::F16 {
+                rdna_compute::DType::F16
+            } else {
+                rdna_compute::DType::F32
+            };
         let pbs_max_batch: usize = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_PP_BATCH")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -1084,6 +1186,10 @@ impl Carrier for Deepseek4Carrier {
         } else {
             None
         };
+        let advertised_context = config.max_position_embeddings;
+        eprintln!(
+            "  deepseek4 compressed cache: automatic VMM growth to advertised context {advertised_context}"
+        );
         Ok(LoadedModel {
             state: Some(crate::ModelState::Deepseek4(deepseek4::Deepseek4Bundle {
                 config,
@@ -1096,8 +1202,8 @@ impl Carrier for Deepseek4Carrier {
             ..LoadedModel::skeleton(
                 meta.arch_id,
                 meta.tokenizer,
-                ctx.max_seq,
-                ctx.max_seq,
+                advertised_context,
+                advertised_context,
                 ctx.path.to_string(),
                 meta.chat_template,
             )

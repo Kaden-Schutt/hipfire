@@ -260,6 +260,15 @@ pub enum ModelState {
     Minimax(MiniMaxBundle),
     Cohere2Moe(Cohere2MoeBundle),
     Deepseek4(hipfire_arch_deepseek4::Deepseek4Bundle),
+    Deepseek4Heterogeneous(Deepseek4HeterogeneousBundle),
+}
+
+/// Self-owned gfx1100+dense / gfx1151+routed DeepSeek V4 state. The model
+/// owns both HIP devices and tears them down in its `Drop` implementation;
+/// the daemon's ordinary single-device `Gpu` must never free these buffers.
+pub struct Deepseek4HeterogeneousBundle {
+    pub model: hipfire_arch_deepseek4::DeepseekV4HeterogeneousModel,
+    pub eos_tok: u32,
 }
 
 /// LFM2.5-MoE (arch_id=11) GPU bundle. Re-exported from the arch crate, which
@@ -535,6 +544,9 @@ pub enum EpArch {
         weights: Vec<hipfire_arch_deepseek4::DeepseekV4Weights>,
         state: Vec<hipfire_arch_deepseek4::DeepseekV4State>,
         partials: Vec<rdna_compute::GpuTensor>,
+        /// Exact gfx1201 MQ2R TP3/TP4 batched-prefill scratch, one per rank.
+        /// Empty for every other EP route.
+        prefill: Vec<hipfire_arch_deepseek4::forward::PrefillBatchScratch>,
     },
     Minimax {
         config: minimax::MiniMaxConfig,
@@ -850,12 +862,13 @@ fn finish_qwen35_load(
                                             physical_cap,
                                             conf_threshold,
                                             true, // sampled verify (temp>0) supported
+                                            0.5,
                                         ))
                                         }
                                         Err(e) => {
                                             eprintln!(
                                             "  qwen35: DSpark body build failed: {e} — AR/other"
-                                        );
+                                            );
                                             None
                                         }
                                     }
@@ -1095,6 +1108,8 @@ pub fn load_model(
     load_model_with_kv_backend(
         path,
         max_seq,
+        None,
+        hipfire_config::Deepseek4ComputePlacement::Single,
         draft_path,
         kv_mode_override,
         None,
@@ -1112,6 +1127,8 @@ pub fn load_model(
 pub fn load_model_with_kv_backend(
     path: &str,
     max_seq: usize,
+    deepseek4_experts_per_token: Option<usize>,
+    deepseek4_compute_placement: hipfire_config::Deepseek4ComputePlacement,
     draft_path: Option<&str>,
     kv_mode_override: Option<&str>,
     kv_backend_override: Option<&str>,
@@ -1217,6 +1234,8 @@ pub fn load_model_with_kv_backend(
     let mut ctx = LoadCtx {
         path,
         max_seq,
+        deepseek4_compute_placement,
+        deepseek4_experts_per_token,
         draft_path,
         kv_mode_override,
         kv_backend,
@@ -1243,9 +1262,9 @@ pub fn load_model_with_kv_backend(
             other.name()
         ));
     }
-    if kv_backend == KvBackend::Vmm && carrier.name() != "qwen35" {
+    if kv_backend == KvBackend::Vmm && !matches!(carrier.name(), "qwen35" | "deepseek4") {
         return Err(format!(
-            "KV backend 'vmm' currently supports qwen3.5 only (selected carrier: {})",
+            "KV backend 'vmm' currently supports qwen3.5 and deepseek4 only (selected carrier: {})",
             carrier.name()
         ));
     }
@@ -1346,6 +1365,7 @@ struct Ds4EpStaging {
     weights: Vec<deepseek4::DeepseekV4Weights>,
     state: Vec<deepseek4::DeepseekV4State>,
     partials: Vec<rdna_compute::GpuTensor>,
+    prefill: Vec<deepseek4::forward::PrefillBatchScratch>,
 }
 
 impl Ds4EpStaging {
@@ -1355,6 +1375,7 @@ impl Ds4EpStaging {
             weights: Vec::new(),
             state: Vec::new(),
             partials: Vec::new(),
+            prefill: Vec::new(),
         }
     }
     fn gpus_mut(&mut self) -> &mut Gpus {
@@ -1368,12 +1389,14 @@ impl Ds4EpStaging {
         Vec<deepseek4::DeepseekV4Weights>,
         Vec<deepseek4::DeepseekV4State>,
         Vec<rdna_compute::GpuTensor>,
+        Vec<deepseek4::forward::PrefillBatchScratch>,
     ) {
         let gpus = self.gpus.take().expect("into_parts called twice");
         let weights = std::mem::take(&mut self.weights);
         let state = std::mem::take(&mut self.state);
         let partials = std::mem::take(&mut self.partials);
-        (gpus, weights, state, partials)
+        let prefill = std::mem::take(&mut self.prefill);
+        (gpus, weights, state, partials, prefill)
     }
 }
 
@@ -1404,12 +1427,19 @@ impl Drop for Ds4EpStaging {
                 let _ = dev.free_tensor(p);
             }
         }
+        for (r, pbs) in self.prefill.drain(..).enumerate() {
+            if let Some(dev) = gpus.devices.get_mut(r) {
+                let _ = dev.bind_thread();
+                pbs.free_gpu(dev);
+            }
+        }
         for dev in gpus.devices.iter_mut() {
             let _ = dev.bind_thread();
             dev.invalidate_weight_caches();
             dev.invalidate_graph_state();
             dev.drain_pool();
         }
+        let _ = gpus.free_tp_graph_signals();
     }
 }
 
@@ -1501,9 +1531,65 @@ impl Drop for MinimaxEpStaging {
 /// tests the completed-rank cleanup path (which IS fixed), not this inner window.
 /// The proper fix is an unwind-safe allocation-tracking loader refactor. Deferred.
 pub fn load_model_ep(path: &str, max_seq: usize, tp: usize) -> Result<LoadedModel, String> {
+    load_model_ep_with_compressor_cache(
+        path,
+        max_seq,
+        tp,
+        hipfire_config::Deepseek4CompressorCache::F32,
+    )
+}
+
+/// DeepSeek V4 stores its long-lived compressor cache as F32 or F16 only; it
+/// has no block-quantised path. Rather than reject the quantised selectors,
+/// map every sub-F16 request up to F16 — the nearest storage the model
+/// actually implements, and the one whose intent ("smaller than F32") the
+/// caller expressed. Redirecting rather than failing keeps `q8`, the historic
+/// DS4 default, and the `asym`/`fwht`/`turbo` families usable, and it is a
+/// widening in precision terms: F16 carries more of the value than any of
+/// them would have.
+///
+/// This is deliberately not silent. A caller that asked for `q8` and received
+/// F16 storage is running a different configuration from the F32 golden, so
+/// the redirect is reported once at resolve time.
+fn resolve_deepseek4_compressor_cache_kv_mode(
+    kv_mode: Option<&str>,
+) -> Result<hipfire_config::Deepseek4CompressorCache, String> {
+    let raw = kv_mode.unwrap_or("f32").to_ascii_lowercase();
+    match raw.as_str() {
+        "" | "auto" | "f32" => Ok(hipfire_config::Deepseek4CompressorCache::F32),
+        "f16" => Ok(hipfire_config::Deepseek4CompressorCache::F16),
+        "q8" | "asym2" | "asym3" | "asym4" | "fwht2" | "fwht3" | "fwht4" | "turbo" | "turbo3"
+        | "turbo4" => {
+            eprintln!(
+                "[deepseek4] kv_cache={raw} has no DeepSeek V4 implementation; \
+                 using the F16 compressor cache instead (nearest supported storage \
+                 below F32). Pass --kv f32 for the golden configuration."
+            );
+            Ok(hipfire_config::Deepseek4CompressorCache::F16)
+        }
+        other => Err(format!(
+            "DeepSeek V4 kv_cache={other} is not recognised; use f32 (golden/default) or f16"
+        )),
+    }
+}
+
+/// EP load using the standard user-facing KV selector. DeepSeek V4 maps f32/f16
+/// to its long-lived compressor-cache storage; MiniMax retains its historical
+/// EP behavior and does not inherit DeepSeek-specific policy.
+pub fn load_model_ep_with_kv_mode(
+    path: &str,
+    max_seq: usize,
+    tp: usize,
+    kv_mode: Option<&str>,
+) -> Result<LoadedModel, String> {
     let hfq = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
     match hfq.arch_id {
-        9 => load_model_ep_ds4(path, max_seq, tp),
+        9 => load_model_ep_ds4(
+            path,
+            max_seq,
+            tp,
+            resolve_deepseek4_compressor_cache_kv_mode(kv_mode)?,
+        ),
         10 => load_model_ep_minimax(path, max_seq, tp),
         id => Err(format!(
             "EP not supported for arch_id={id} (expected 9 for DeepSeek V4 or 10 for MiniMax)"
@@ -1511,14 +1597,45 @@ pub fn load_model_ep(path: &str, max_seq: usize, tp: usize) -> Result<LoadedMode
     }
 }
 
-fn load_model_ep_ds4(path: &str, max_seq: usize, tp: usize) -> Result<LoadedModel, String> {
+/// Expert-parallel load with an explicit DeepSeek V4 compressor-cache storage
+/// policy. The compatibility wrapper above deliberately retains the historical
+/// F32 route.
+pub fn load_model_ep_with_compressor_cache(
+    path: &str,
+    max_seq: usize,
+    tp: usize,
+    compressor_cache: hipfire_config::Deepseek4CompressorCache,
+) -> Result<LoadedModel, String> {
+    let hfq = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
+    match hfq.arch_id {
+        9 => load_model_ep_ds4(path, max_seq, tp, compressor_cache),
+        10 if compressor_cache == hipfire_config::Deepseek4CompressorCache::F32 => {
+            load_model_ep_minimax(path, max_seq, tp)
+        }
+        10 => Err("DeepSeek V4 compressor-cache storage cannot be applied to MiniMax".to_string()),
+        id => Err(format!(
+            "EP not supported for arch_id={id} (expected 9 for DeepSeek V4 or 10 for MiniMax)"
+        )),
+    }
+}
+
+fn load_model_ep_ds4(
+    path: &str,
+    max_seq: usize,
+    tp: usize,
+    compressor_cache: hipfire_config::Deepseek4CompressorCache,
+) -> Result<LoadedModel, String> {
     use hipfire_runtime::arch::Architecture;
     use hipfire_runtime::tp_shard::{ExpertAssign, ShardConfig};
 
     let hfq = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
     let tokenizer = hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
         .map_err(|e| format!("tokenizer not found: {e}"))?;
-    let config = <deepseek4::DeepseekV4 as Architecture>::config_from_hfq(&hfq)?;
+    let mut config = <deepseek4::DeepseekV4 as Architecture>::config_from_hfq(&hfq)?;
+    // The EP/TP serve path has no speculative verifier. Do not auto-discover
+    // and replicate an adjacent DSpark sidecar onto every rank when it cannot
+    // be selected; ordinary AR must retain that memory for per-rank KV state.
+    config.load_dspark = false;
     let arch_id = hfq.arch_id;
     let n_exp = config.n_routed_experts;
 
@@ -1543,7 +1660,7 @@ fn load_model_ep_ds4(path: &str, max_seq: usize, tp: usize) -> Result<LoadedMode
         ));
     }
     eprintln!("[loader] EP load: tp={tp} arch=ds4 experts={n_exp} (rank r owns e%{tp}==r)");
-    let shard = ShardConfig::new(
+    let shard = ShardConfig::new_uneven_experts(
         tp,
         /*tp_kv_replicate=*/ true,
         n_exp,
@@ -1585,6 +1702,116 @@ fn load_model_ep_ds4(path: &str, max_seq: usize, tp: usize) -> Result<LoadedMode
             .map_err(|e| format!("partial {r}: {e:?}"))?;
         staging.partials.push(p);
     }
+    // Exact-gated gfx1201 MQ2R TP3/TP4 graph + batched-prefill substrate.
+    // Allocate every long-lived pointer before enabling peer access so peer
+    // mappings and later graph capture observe the final allocation layout.
+    let gfx1201_mq2r_tp = matches!(tp, 3 | 4)
+        && config.mq2r
+        && !config.mq2rxt
+        && staging
+            .gpus_mut()
+            .devices
+            .iter()
+            .all(|device| device.arch_caps.is_gfx1201());
+    if gfx1201_mq2r_tp {
+        // Keep compressor caches replicated and device-local on the normal
+        // path. Peer-reading the block-cyclic experiment was exact but reduced
+        // 21K NIAH decode from 41.15 to 11.10 tok/s. Capacity growth therefore
+        // remains entirely device-local; F16 storage is what makes 1M feasible.
+        // B=1024 is the certified short-context throughput schedule. At a
+        // declared long-context ceiling, B=512 gives back about 1.34 GiB/rank
+        // while retaining most grouped-MoE occupancy. Preserve that established
+        // F32 schedule. An explicitly selected F16 cache may trade prefill
+        // throughput for additional physical depth with B=128 at an extreme
+        // declared ceiling. Replicated TP3 still tops out below 1M; the smaller
+        // batch maximizes its measured F16 capacity without regressing F32.
+        const SHORT_CONTEXT_BATCH: usize = 1024;
+        const LONG_CONTEXT_BATCH: usize = 512;
+        const EXTREME_CONTEXT_BATCH: usize = 128;
+        const LONG_CONTEXT_THRESHOLD: usize = 32 * 1024;
+        const EXTREME_CONTEXT_THRESHOLD: usize = 256 * 1024;
+        let compressor_cache_dtype = match compressor_cache {
+            hipfire_config::Deepseek4CompressorCache::F32 => rdna_compute::DType::F32,
+            hipfire_config::Deepseek4CompressorCache::F16 => rdna_compute::DType::F16,
+        };
+        for state in &mut staging.state {
+            state.compressor_cache_dtype = compressor_cache_dtype;
+        }
+        let ep_prefill_max_batch = if compressor_cache
+            == hipfire_config::Deepseek4CompressorCache::F16
+            && max_seq > EXTREME_CONTEXT_THRESHOLD
+        {
+            EXTREME_CONTEXT_BATCH
+        } else if max_seq > LONG_CONTEXT_THRESHOLD {
+            LONG_CONTEXT_BATCH
+        } else {
+            SHORT_CONTEXT_BATCH
+        };
+        let projected = deepseek4::forward::PrefillBatchScratch::projected_allocation_bytes(
+            &config,
+            ep_prefill_max_batch,
+        )?;
+        for rank in 0..n {
+            let dev = &mut staging.gpus_mut().devices[rank];
+            dev.bind_thread()
+                .map_err(|e| format!("bind gfx1201 TP prefill rank {rank}: {e:?}"))?;
+            let (free, _total) = dev
+                .hip
+                .get_vram_info()
+                .map_err(|e| format!("query gfx1201 TP prefill VRAM rank {rank}: {e:?}"))?;
+            if free < projected {
+                return Err(format!(
+                    "gfx1201 TP prefill rank {rank}: need {:.2} GiB scratch, only {:.2} GiB free",
+                    projected as f64 / (1u64 << 30) as f64,
+                    free as f64 / (1u64 << 30) as f64,
+                ));
+            }
+            let pbs =
+                deepseek4::forward::PrefillBatchScratch::new(dev, &config, ep_prefill_max_batch)
+                    .map_err(|e| format!("allocate gfx1201 TP prefill rank {rank}: {e}"))?;
+            staging.prefill.push(pbs);
+        }
+        eprintln!(
+            "[loader] gfx1201 TP{tp} batched prefill: B={} scratch={:.2} GiB/rank compressor_cache={compressor_cache}",
+            ep_prefill_max_batch,
+            projected as f64 / (1u64 << 30) as f64,
+        );
+        staging
+            .gpus_mut()
+            .prepare_tp_graph_signals(config.num_hidden_layers * 2)
+            .map_err(|e| format!("prepare gfx1201 TP graph signals: {e:?}"))?;
+    } else if compressor_cache == hipfire_config::Deepseek4CompressorCache::F16 {
+        // Single-device MQ2R also carries the F16 compressor cache on any
+        // architecture whose kernels can compile it. Admission is the
+        // capability predicate rather than a chip list: the two F16 sources
+        // select their WMMA fragment layout in-source, so the set that can run
+        // them is "wave32 WMMA on RDNA3 or RDNA4", and that fact belongs in
+        // arch_caps next to the kernels it describes. Storage stays confined
+        // to main_kv_cache and indexer_kv_cache; commit arithmetic remains F32
+        // before the single F32-to-F16 store.
+        let f16_single = tp <= 1
+            && config.mq2r
+            && !config.mq2rxt
+            && staging
+                .gpus_mut()
+                .devices
+                .iter()
+                .all(|device| device.arch_caps.supports_ds4_f16_compressor_cache());
+        if !f16_single {
+            return Err(format!(
+                "DeepSeek V4 compressor_cache=f16 requires MQ2R on TP3/TP4 gfx1201, or single-device MQ2R on an architecture with wave32 WMMA (RDNA3/RDNA4); got tp={tp}, mq2r={}, mq2rxt={}, devices={}",
+                config.mq2r,
+                config.mq2rxt,
+                staging
+                    .gpus_mut()
+                    .devices
+                    .iter()
+                    .map(|device| device.arch.as_str())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ));
+        }
+    }
     let peer = staging
         .gpus_mut()
         .enable_peer_all()
@@ -1592,7 +1819,7 @@ fn load_model_ep_ds4(path: &str, max_seq: usize, tp: usize) -> Result<LoadedMode
     hipfire_runtime::ep::ensure_rank_streams(staging.gpus_mut())
         .map_err(|e| format!("ensure_rank_streams: {e:?}"))?;
     eprintln!("[loader] EP load complete: {n} ranks, peer_access={peer}");
-    let (gpus, weights, state, partials) = staging.into_parts();
+    let (gpus, weights, state, partials, prefill) = staging.into_parts();
 
     let eos_tok: u32 = {
         let ids = tokenizer.encode("<｜end▁of▁sentence｜>");
@@ -1611,6 +1838,7 @@ fn load_model_ep_ds4(path: &str, max_seq: usize, tp: usize) -> Result<LoadedMode
                 weights,
                 state,
                 partials,
+                prefill,
             },
         }),
         deepseek4_eos_tok: eos_tok,
@@ -1776,6 +2004,7 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(
                 weights,
                 state,
                 partials,
+                prefill,
                 ..
             } => {
                 for (r, w) in weights.into_iter().enumerate() {
@@ -1794,6 +2023,12 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(
                     if let Some(dev) = gpus.devices.get_mut(r) {
                         let _ = dev.bind_thread();
                         let _ = dev.free_tensor(p);
+                    }
+                }
+                for (r, pbs) in prefill.into_iter().enumerate() {
+                    if let Some(dev) = gpus.devices.get_mut(r) {
+                        let _ = dev.bind_thread();
+                        pbs.free_gpu(dev);
                     }
                 }
             }
@@ -1829,6 +2064,7 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(
             dev.invalidate_graph_state();
             dev.drain_pool();
         }
+        let _ = gpus.free_tp_graph_signals();
         let _ = gpu;
         return Ok(());
         // `gpus` drops here, tearing down comms + devices.
@@ -1856,6 +2092,7 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(
             | Some(ModelState::Minimax(_))
             | Some(ModelState::Cohere2Moe(_))
             | Some(ModelState::Deepseek4(_))
+            | Some(ModelState::Deepseek4Heterogeneous(_))
             | None => {}
         }
         for g in gpus.devices.iter_mut() {
@@ -1933,6 +2170,11 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(
                 b.state.free_gpu(gpu);
                 b.weights.free_gpu(gpu);
             }
+            ModelState::Deepseek4Heterogeneous(b) => {
+                // Self-owned two-device transaction. Dropping `model` frees
+                // each resource on its exact owner and drains both pools.
+                drop(b);
+            }
         }
     }
     // Non-core arch weights
@@ -1967,7 +2209,45 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(
 
 #[cfg(test)]
 mod registry_tests {
-    use super::REGISTRY;
+    use super::{resolve_deepseek4_compressor_cache_kv_mode, REGISTRY};
+
+    #[test]
+    fn deepseek4_kv_mode_is_truthful_and_fail_closed() {
+        use hipfire_config::Deepseek4CompressorCache::{F16, F32};
+
+        assert_eq!(
+            resolve_deepseek4_compressor_cache_kv_mode(None).unwrap(),
+            F32
+        );
+        assert_eq!(
+            resolve_deepseek4_compressor_cache_kv_mode(Some("auto")).unwrap(),
+            F32
+        );
+        assert_eq!(
+            resolve_deepseek4_compressor_cache_kv_mode(Some("f32")).unwrap(),
+            F32
+        );
+        assert_eq!(
+            resolve_deepseek4_compressor_cache_kv_mode(Some("f16")).unwrap(),
+            F16
+        );
+        // Sub-F16 selectors redirect to F16 rather than failing: DS4 stores
+        // its compressor cache as F32 or F16 only, and F16 is the nearest
+        // implemented storage below F32 — a widening relative to what these
+        // ask for. Only unrecognised strings still fail closed.
+        for mode in [
+            "q8", "asym2", "asym3", "asym4", "fwht2", "fwht3", "fwht4", "turbo", "turbo3",
+            "turbo4",
+        ] {
+            assert_eq!(
+                resolve_deepseek4_compressor_cache_kv_mode(Some(mode)).unwrap(),
+                F16,
+                "{mode} should redirect to F16"
+            );
+        }
+        let error = resolve_deepseek4_compressor_cache_kv_mode(Some("nonsense")).unwrap_err();
+        assert!(error.contains("not recognised"), "{error}");
+    }
 
     /// Every known arch_id must be claimed by AT MOST one carrier, for both
     /// source namespaces (HFQ header ids and `derive_arch_id` dir ids). This

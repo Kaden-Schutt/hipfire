@@ -3,7 +3,7 @@
 **Owner:** registry-backed model surface (`docs/INDEX.md`).
 **Machine sources:** curated `registry/models.json`; generated and bundled
 `registry/v1.json` (loaded by `hipfire-registry`).
-**Last checked:** 2026-07-22 against `origin/beta@202282de8759dfa6963ea5184ad2bf2b9259cef6`.
+**Last checked:** 2026-08-05 against `ds4-beta-staging`.
 
 This page projects **registry availability**: tags, default artifact filenames, declared download size, and declared VRAM floor. It is **not** a product admission table and **not** a guarantee that every GPU/route runs every tag.
 
@@ -26,7 +26,7 @@ hipfire run qwen3.5:9b "hello"
 hipfire list -r
 ```
 
-Default serve pre-warm tag is `qwen3.5:9b` (`CONFIG.md` → `default_model`). Per-tag sampling defaults come from registry `recommended_settings` only (applied by the native CLI request resolver). Registry `sampling` blocks (present on e.g. `deepseek-v4-flash`, `north-mini-code`) are **metadata only today** — they are not promoted by `RecommendedSettings::config_layer` or the native request resolver. See [`CONFIG.md`](CONFIG.md).
+Default serve pre-warm tag is `qwen3.5:9b` (`CONFIG.md` → `default_model`). Per-tag sampling defaults come from registry `recommended_settings` only (applied by the native CLI request resolver). This includes optional `reasoning_effort` prompt semantics and an independent `thinking_budget` cap policy. Registry `sampling` blocks are legacy metadata and are not promoted by the native request resolver. See [`CONFIG.md`](CONFIG.md).
 
 ---
 
@@ -119,7 +119,9 @@ Draft **loading** is controlled by `dflash_mode` / `speculation` / `HIPFIRE_DFLA
 
 | Tag | File | Size GB | Min VRAM | Notes |
 |---|---|---:|---:|---|
-| `deepseek-v4-flash` | `deepseek-v4-flash.mq2lloyd` | 82 | 96 | arch_id=9; registry lists MTP + DSpark sidecars; entry carries a `sampling` block (temp=1.0 / top_p=1.0) that is **inert metadata** today — not applied by the CLI resolver |
+| `deepseek-v4-flash` | `deepseek-v4-flash-0731.mq2lloyd` | 86.2 | 96 | current 0731 release; DSpark sidecar; low effort and uncapped thinking by default |
+| `deepseek-v4-flash:mq2r` | `deepseek-v4-flash-0731.mq2r` | 82 | 96 | current 0731 golden MQ2R; MQ2-Lloyd routed experts + MFP4-E8 dense route; matching `.mq2r` DSpark sidecar |
+| `deepseek-v4-flash-preview` | `deepseek-v4-flash.mq2lloyd` | 82 | 96 | prior nwoolmer preview package, retained under an explicit preview identity |
 | `minimax-m2.7` | `MiniMax-M2.7.mq2` | 79.2 | 96 | arch_id=10 Mixtral-style MoE |
 | `north-mini-code` | `north-mini-code.mq4.hfq` | 16 | 24 | Cohere2-MoE arch_id=12; registry `sampling` block is **inert metadata** today |
 | `vibethinker:3b` | `vibethinker-3b.mq4.hfq` | 1.82 | 3.5 | Qwen2 MQ4 |
@@ -156,6 +158,8 @@ downloads). **Partial table** — for the complete surface read that file or run
 | `qwopus` | `qwopus:9b` |
 | `qwopus:{4b,9b,27b}-{mq4,hf4}` | matching primary `qwopus:{4b,9b,27b}` tag |
 | `deepseek4` / `deepseek-v4` | `deepseek-v4-flash` |
+| `deepseek4:mq2r` / `deepseek-v4:mq2r` | `deepseek-v4-flash:mq2r` |
+| `deepseek4:preview` / `deepseek-v4:preview` | `deepseek-v4-flash-preview` |
 | `vibethinker` | `vibethinker:3b` |
 | `qwen3.5:*-mq4` / `*-hf4` / several `*-hf6` | same-size primary or mq6 tag (see registry) |
 | `qwen3.5:9b:draft` etc. | matching `*-draft` tags |
@@ -235,7 +239,7 @@ Dequant path support is format-specific (common Q4_0 / Q8_0 / Q4_K / Q6_K / F16 
   optional sibling drafts / .triattn*.bin sidecars
 ```
 
-Extension hints (loader recognizes several): `.mq4`, `.mq6`, `.mq4p`, `.mq4r`, `.mq2`, `.mq2lloyd`, `.mfp4`, `.hf4`, `.hf6`, `.hfq`, `.q8`, and related graded names as produced by quant tooling. Exact dtype routing is loader/kernel source, not this table.
+Extension hints (loader recognizes several): `.mq4`, `.mq6`, `.mq4p`, `.mq4r`, `.mq2`, `.mq2lloyd`, `.mq2r`, `.mfp4`, `.hf4`, `.hf6`, `.hfq`, `.q8`, and related graded names as produced by quant tooling. Exact dtype routing is loader/kernel source, not this table.
 
 ---
 

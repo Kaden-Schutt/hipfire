@@ -126,7 +126,7 @@ impl MtpDrafter for Deepseek4MtpDrafter {
                     .map_err(|e| format!("Deepseek4MtpDrafter: alloc PrefillBatchScratch: {e}"))?,
             );
         }
-        let pbs = self.pbs.as_ref().expect("just built");
+        let pbs = self.pbs.as_mut().expect("just built");
 
         let logits = crate::forward::prefill_with_mtp_fill(
             config,
@@ -154,7 +154,7 @@ impl MtpDrafter for Deepseek4MtpDrafter {
     ) -> Result<MtpWindow, String> {
         let pbs = self
             .pbs
-            .as_ref()
+            .as_mut()
             .ok_or("Deepseek4MtpDrafter: mtp_step called before mtp_prefill")?;
 
         // Per-call k from MtpSpeculator is authoritative (already max_emit-clamped).
@@ -268,7 +268,7 @@ impl MtpDrafter for Deepseek4MtpDrafter {
                     .map_err(|e| format!("Deepseek4MtpDrafter forced: alloc PBS: {e}"))?,
             );
         }
-        let pbs = self.pbs.as_ref().expect("just built");
+        let pbs = self.pbs.as_mut().expect("just built");
         crate::forward::prefill_with_mtp_fill(
             config,
             weights,

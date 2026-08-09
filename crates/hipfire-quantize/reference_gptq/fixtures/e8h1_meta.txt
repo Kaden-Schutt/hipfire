@@ -1,0 +1,5 @@
+name=layers.0.mlp.experts.3.gate_up_proj.weight
+key=layers.0.mlp.experts.3.gate_up_proj.weight
+k=512
+n_blocks=2
+entry_b1_3_5=-2.38317594537400756e+00

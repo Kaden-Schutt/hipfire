@@ -1,0 +1,52 @@
+{"type":"pong"}
+{"type":"loaded","arch":"deepseek4","dim":0,"layers":0,"vocab":0,"vl":false,"cache_capable":true,"retry_reset_eligible":false}
+{"type":"token","id":"g0-postfix","text":"A GP","attempt_id":1}
+{"type":"token","id":"g0-postfix","text":"U k","attempt_id":1}
+{"type":"token","id":"g0-postfix","text":"ernel ","attempt_id":1}
+{"type":"token","id":"g0-postfix","text":"is a fun","attempt_id":1}
+{"type":"token","id":"g0-postfix","text":"ction or","attempt_id":1}
+{"type":"token","id":"g0-postfix","text":" sm","attempt_id":1}
+{"type":"token","id":"g0-postfix","text":"al","attempt_id":1}
+{"type":"token","id":"g0-postfix","text":"l pro","attempt_id":1}
+{"type":"token","id":"g0-postfix","text":"gram ","attempt_id":1}
+{"type":"token","id":"g0-postfix","text":"wri","attempt_id":1}
+{"type":"token","id":"g0-postfix","text":"tten by a","attempt_id":1}
+{"type":"token","id":"g0-postfix","text":" us","attempt_id":1}
+{"type":"token","id":"g0-postfix","text":"er that i","attempt_id":1}
+{"type":"token","id":"g0-postfix","text":"s execu","attempt_id":1}
+{"type":"token","id":"g0-postfix","text":"ted i","attempt_id":1}
+{"type":"token","id":"g0-postfix","text":"n parall","attempt_id":1}
+{"type":"token","id":"g0-postfix","text":"el ","attempt_id":1}
+{"type":"token","id":"g0-postfix","text":"acro","attempt_id":1}
+{"type":"token","id":"g0-postfix","text":"ss m","attempt_id":1}
+{"type":"token","id":"g0-postfix","text":"an","attempt_id":1}
+{"type":"token","id":"g0-postfix","text":"y thre","attempt_id":1}
+{"type":"token","id":"g0-postfix","text":"a","attempt_id":1}
+{"type":"token","id":"g0-postfix","text":"ds ","attempt_id":1}
+{"type":"token","id":"g0-postfix","text":"on the G","attempt_id":1}
+{"type":"token","id":"g0-postfix","text":"PU's","attempt_id":1}
+{"type":"token","id":"g0-postfix","text":" cores. It d","attempt_id":1}
+{"type":"token","id":"g0-postfix","text":"efi","attempt_id":1}
+{"type":"token","id":"g0-postfix","text":"nes","attempt_id":1}
+{"type":"token","id":"g0-postfix","text":" the compu","attempt_id":1}
+{"type":"token","id":"g0-postfix","text":"tat","attempt_id":1}
+{"type":"token","id":"g0-postfix","text":"ion t","attempt_id":1}
+{"type":"token","id":"g0-postfix","text":"o be perfor","attempt_id":1}
+{"type":"token","id":"g0-postfix","text":"med by ","attempt_id":1}
+{"type":"token","id":"g0-postfix","text":"e","attempt_id":1}
+{"type":"token","id":"g0-postfix","text":"ach indivi","attempt_id":1}
+{"type":"token","id":"g0-postfix","text":"dual threa","attempt_id":1}
+{"type":"token","id":"g0-postfix","text":"d, ","attempt_id":1}
+{"type":"token","id":"g0-postfix","text":"ty","attempt_id":1}
+{"type":"token","id":"g0-postfix","text":"pically","attempt_id":1}
+{"type":"token","id":"g0-postfix","text":" operati","attempt_id":1}
+{"type":"token","id":"g0-postfix","text":"ng ","attempt_id":1}
+{"type":"token","id":"g0-postfix","text":"on","attempt_id":1}
+{"type":"token","id":"g0-postfix","text":" a sin","attempt_id":1}
+{"type":"token","id":"g0-postfix","text":"gle e","attempt_id":1}
+{"type":"token","id":"g0-postfix","text":"lement","attempt_id":1}
+{"type":"token","id":"g0-postfix","text":" ","attempt_id":1}
+{"type":"token","id":"g0-postfix","text":"of a large data array.","attempt_id":1}
+{"type":"commit_ready","id":"g0-postfix","tokens":51,"tok_s":3.041144901610018,"prompt_tokens":14,"prefill_tokens":14,"cached_tokens":0,"prefill_ms":18937,"total_ms":35707,"finish_reason":"stop","drafter":"ar","attempt_id":1}
+{"type":"done","id":"g0-postfix","tokens":51,"tok_s":3.041144901610018,"prompt_tokens":14,"prefill_tokens":14,"cached_tokens":0,"prefill_ms":18937,"total_ms":35707,"finish_reason":"stop","drafter":"ar","attempt_id":1}
+{"type":"unloaded"}

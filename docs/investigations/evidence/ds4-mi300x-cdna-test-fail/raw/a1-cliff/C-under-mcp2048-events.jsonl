@@ -1,0 +1,35 @@
+{"type":"pong"}
+{"type":"loaded","arch":"deepseek4","dim":0,"layers":0,"vocab":0,"vl":false,"cache_capable":true,"retry_reset_eligible":false}
+{"type":"token","id":"g0-C-under-mcp2048","text":"I ","attempt_id":1}
+{"type":"token","id":"g0-C-under-mcp2048","text":"app","attempt_id":1}
+{"type":"token","id":"g0-C-under-mcp2048","text":"recia","attempt_id":1}
+{"type":"token","id":"g0-C-under-mcp2048","text":"te the c","attempt_id":1}
+{"type":"token","id":"g0-C-under-mcp2048","text":"l","attempt_id":1}
+{"type":"token","id":"g0-C-under-mcp2048","text":"arity","attempt_id":1}
+{"type":"token","id":"g0-C-under-mcp2048","text":" of","attempt_id":1}
+{"type":"token","id":"g0-C-under-mcp2048","text":" y","attempt_id":1}
+{"type":"token","id":"g0-C-under-mcp2048","text":"our framing.","attempt_id":1}
+{"type":"token","id":"g0-C-under-mcp2048","text":" This is ","attempt_id":1}
+{"type":"token","id":"g0-C-under-mcp2048","text":"a","attempt_id":1}
+{"type":"token","id":"g0-C-under-mcp2048","text":" mea","attempt_id":1}
+{"type":"token","id":"g0-C-under-mcp2048","text":"surement c","attempt_id":1}
+{"type":"token","id":"g0-C-under-mcp2048","text":"o","attempt_id":1}
+{"type":"token","id":"g0-C-under-mcp2048","text":"ntract","attempt_id":1}
+{"type":"token","id":"g0-C-under-mcp2048","text":", n","attempt_id":1}
+{"type":"token","id":"g0-C-under-mcp2048","text":"ot m","attempt_id":1}
+{"type":"token","id":"g0-C-under-mcp2048","text":"arket","attempt_id":1}
+{"type":"token","id":"g0-C-under-mcp2048","text":"ing. Below","attempt_id":1}
+{"type":"token","id":"g0-C-under-mcp2048","text":" is the fu","attempt_id":1}
+{"type":"token","id":"g0-C-under-mcp2048","text":"ll t","attempt_id":1}
+{"type":"token","id":"g0-C-under-mcp2048","text":"ec","attempt_id":1}
+{"type":"token","id":"g0-C-under-mcp2048","text":"hni","attempt_id":1}
+{"type":"token","id":"g0-C-under-mcp2048","text":"cal ","attempt_id":1}
+{"type":"token","id":"g0-C-under-mcp2048","text":"br","attempt_id":1}
+{"type":"token","id":"g0-C-under-mcp2048","text":"ea","attempt_id":1}
+{"type":"token","id":"g0-C-under-mcp2048","text":"kd","attempt_id":1}
+{"type":"token","id":"g0-C-under-mcp2048","text":"o","attempt_id":1}
+{"type":"token","id":"g0-C-under-mcp2048","text":"wn for","attempt_id":1}
+{"type":"token","id":"g0-C-under-mcp2048","text":" a **DeepSeek V4 Flash","attempt_id":1}
+{"type":"commit_ready","id":"g0-C-under-mcp2048","tokens":32,"tok_s":32.9557157569516,"prompt_tokens":1903,"prefill_tokens":1903,"cached_tokens":0,"prefill_ms":19270,"total_ms":20241,"finish_reason":"length","drafter":"ar","attempt_id":1}
+{"type":"done","id":"g0-C-under-mcp2048","tokens":32,"tok_s":32.9557157569516,"prompt_tokens":1903,"prefill_tokens":1903,"cached_tokens":0,"prefill_ms":19270,"total_ms":20241,"finish_reason":"length","drafter":"ar","attempt_id":1}
+{"type":"unloaded"}

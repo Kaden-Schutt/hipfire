@@ -7,7 +7,9 @@
 
 Loads one model once, measures synthetic prefill and single-token decode
 separately, and asks the daemon to delimit/fingerprint exactly one HIP launch
-sequence for each phase. It never enables AQL routing.
+sequence for each phase. The optional DSpark verify oracle additionally lowers
+one isolated fixed-B verify body and compares ordinary HIP, captured HIP, and
+retained PM4 state without installing that route into serving.
 """
 
 import argparse
@@ -174,6 +176,24 @@ def main():
         action="store_true",
         help="lower --prefix to one retained PM4 indirect buffer",
     )
+    parser.add_argument(
+        "--dspark-verify-shadow",
+        action="store_true",
+        help=(
+            "run the DSpark verify ordinary-HIP/capture-safe/blob/PM4 state oracle "
+            "instead of the plain-AR phase harness"
+        ),
+    )
+    parser.add_argument(
+        "--draft",
+        help="explicit DSpark sidecar path (required by --dspark-verify-shadow)",
+    )
+    parser.add_argument(
+        "--verify-batch",
+        type=int,
+        default=3,
+        help="fixed target verify batch for the DSpark shadow (default: 3)",
+    )
     args = parser.parse_args()
 
     model = Path(args.model).expanduser().resolve()
@@ -182,10 +202,22 @@ def main():
         sys.exit(f"model not found: {model}")
     if not daemon_path.is_file():
         sys.exit(f"daemon not found: {daemon_path}")
+    draft = Path(args.draft).expanduser().resolve() if args.draft else None
+    if args.dspark_verify_shadow and (draft is None or not draft.is_file()):
+        sys.exit("--dspark-verify-shadow requires an existing --draft sidecar")
+    if args.dspark_verify_shadow:
+        discovered_draft = model.with_name(f"{model.stem}-dspark{model.suffix}").resolve()
+        if draft != discovered_draft:
+            sys.exit(
+                "DeepSeek4 discovers DSpark only as the sibling "
+                f"{discovered_draft}; --draft resolved to {draft}"
+            )
 
     report = {
         "model": str(model),
         "model_bytes": model.stat().st_size,
+        "draft": str(draft) if draft is not None else None,
+        "draft_bytes": draft.stat().st_size if draft is not None else None,
         "daemon": str(daemon_path),
         "kv_mode": args.kv_mode,
         "automatic_clocks_required": True,
@@ -194,14 +226,21 @@ def main():
     }
     daemon = Daemon(daemon_path, Path(args.log), args.timeout, args.kv_mode)
     try:
+        load_params = {
+            "max_seq": args.max_seq,
+            "kv_mode": args.kv_mode,
+            "dflash_mode": "off",
+            "dspark_mode": "on" if args.dspark_verify_shadow else "off",
+        }
+        # DeepSeek4 discovers `<stem>-dspark.<ext>` itself. Passing the same file
+        # through params.draft would incorrectly enter the Qwen DFlash lm_head
+        # eligibility gate before architecture dispatch.
         loaded = daemon.request(
             {
                 "type": "load",
                 "model": str(model),
                 "params": {
-                    "max_seq": args.max_seq,
-                    "kv_mode": args.kv_mode,
-                    "dflash_mode": "off",
+                    **load_params,
                     **(
                         {"state_quant": args.state_quant}
                         if args.state_quant
@@ -218,6 +257,32 @@ def main():
             f"layers={loaded.get('layers')} vocab={loaded.get('vocab')}",
             flush=True,
         )
+
+        if args.dspark_verify_shadow:
+            shadow = daemon.request(
+                {
+                    "type": "redline_dspark_shadow_pm4",
+                    "context_tokens": args.decode_context,
+                    "verify_batch": args.verify_batch,
+                    "iterations": args.shadow_iterations,
+                }
+            )
+            report["dspark_verify_shadow"] = shadow
+            report["pass"] = bool(shadow.get("bit_exact"))
+            print(
+                f"dspark-verify-shadow: B={args.verify_batch} "
+                f"positions={args.shadow_iterations} exact={report['pass']} "
+                f"launches={shadow.get('capture', {}).get('launches')} "
+                f"hash={shadow.get('capture', {}).get('sequence_hash')}",
+                flush=True,
+            )
+            output = Path(args.out)
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_text(json.dumps(report, indent=2) + "\n")
+            print(f"report={output} pass={report['pass']}", flush=True)
+            if not report["pass"]:
+                raise SystemExit(1)
+            return
 
         for tokens in ([] if args.skip_prefill else args.prefill):
             captures = [

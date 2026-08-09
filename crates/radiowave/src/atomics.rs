@@ -411,22 +411,18 @@ fn int16_support(op: AtomicOp) -> Support {
 fn int32_support(op: AtomicOp, _arch: AtomicArch, _scope: Scope) -> Support {
     // int32/uint32 Add/Min/Max/Exch/CAS native on all covered RDNA families.
     match op {
-        AtomicOp::Add
-        | AtomicOp::Min
-        | AtomicOp::Max
-        | AtomicOp::Exchange
-        | AtomicOp::Cas => Support::Native,
+        AtomicOp::Add | AtomicOp::Min | AtomicOp::Max | AtomicOp::Exchange | AtomicOp::Cas => {
+            Support::Native
+        }
     }
 }
 
 fn uint64_support(op: AtomicOp, _arch: AtomicArch, _scope: Scope) -> Support {
     // Header overloads: atomicAdd/Exch/CAS/Min/Max on unsigned long long.
     match op {
-        AtomicOp::Add
-        | AtomicOp::Min
-        | AtomicOp::Max
-        | AtomicOp::Exchange
-        | AtomicOp::Cas => Support::Native,
+        AtomicOp::Add | AtomicOp::Min | AtomicOp::Max | AtomicOp::Exchange | AtomicOp::Cas => {
+            Support::Native
+        }
     }
 }
 
@@ -554,14 +550,7 @@ fn host_memory_support(
     granularity: Granularity,
 ) -> Support {
     // Classify as if the address were device-local first.
-    let device = native_support_with_memory(
-        op,
-        ty,
-        arch,
-        scope,
-        granularity,
-        AtomicMemory::Device,
-    );
+    let device = native_support_with_memory(op, ty, arch, scope, granularity, AtomicMemory::Device);
     match device {
         Support::Unsupported => Support::Unsupported,
         other => {
@@ -616,13 +605,8 @@ mod tests {
     fn rdna4_packed_bf16_add_requires_unsafe_fp_atomics() {
         for arch in [AtomicArch::Gfx1200, AtomicArch::Gfx1201] {
             for ty in [AtomicType::PackedBF16x2, AtomicType::PackedF16x2] {
-                let support = native_support(
-                    AtomicOp::Add,
-                    ty,
-                    arch,
-                    Scope::Device,
-                    Granularity::Fine,
-                );
+                let support =
+                    native_support(AtomicOp::Add, ty, arch, Scope::Device, Granularity::Fine);
                 assert!(
                     matches!(
                         &support,
@@ -702,11 +686,7 @@ mod tests {
                     Scope::Device,
                     Granularity::Fine,
                 );
-                assert_eq!(
-                    support,
-                    Support::Unsupported,
-                    "{arch:?} {op:?}",
-                );
+                assert_eq!(support, Support::Unsupported, "{arch:?} {op:?}",);
             }
         }
     }
@@ -726,13 +706,7 @@ mod tests {
                 AtomicOp::Cas,
             ] {
                 assert_eq!(
-                    native_support(
-                        op,
-                        AtomicType::Int8,
-                        arch,
-                        Scope::Device,
-                        Granularity::Fine,
-                    ),
+                    native_support(op, AtomicType::Int8, arch, Scope::Device, Granularity::Fine,),
                     Support::Unsupported,
                     "{arch:?} {op:?}",
                 );
@@ -1010,7 +984,13 @@ mod tests {
                 AtomicOp::Cas,
             ] {
                 assert_eq!(
-                    native_support(op, AtomicType::UInt64, arch, Scope::Device, Granularity::Fine),
+                    native_support(
+                        op,
+                        AtomicType::UInt64,
+                        arch,
+                        Scope::Device,
+                        Granularity::Fine
+                    ),
                     Support::Native,
                     "{arch:?} UInt64 {op:?}",
                 );
@@ -1080,7 +1060,13 @@ mod tests {
                 AtomicOp::Cas,
             ] {
                 assert_eq!(
-                    native_support(op, AtomicType::Int32, arch, Scope::Device, Granularity::Fine),
+                    native_support(
+                        op,
+                        AtomicType::Int32,
+                        arch,
+                        Scope::Device,
+                        Granularity::Fine
+                    ),
                     Support::Native,
                     "{arch:?} Int32 {op:?}",
                 );

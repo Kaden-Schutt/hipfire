@@ -16,6 +16,7 @@ byteorder = "1"
 rayon = "1"
 libc = "0.2"
 hipfire-reap = { path = "../hipfire-reap" }
+hipfire-runtime = { path = "../hipfire-runtime", default-features = false }
 
 [dev-dependencies]
 tempfile = "3"

@@ -8,7 +8,10 @@
 use rdna_compute::{DType, Gpu};
 
 fn env_usize(k: &str, d: usize) -> usize {
-    std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+    std::env::var(k)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(d)
 }
 
 fn main() {
@@ -74,10 +77,15 @@ fn main() {
     let qf16 = std::env::var("QF16").as_deref() == Ok("1");
     let q = gpu.upload_f32(&q_data, &[n * nh * hd]).expect("q upload");
     let q_cand = if qf16 {
-        let rounded: Vec<f32> = q_data.iter().map(|&v| f32::from_bits(round_f16(v))).collect();
-        gpu.upload_f32(&rounded, &[n * nh * hd]).expect("q_cand upload")
+        let rounded: Vec<f32> = q_data
+            .iter()
+            .map(|&v| f32::from_bits(round_f16(v)))
+            .collect();
+        gpu.upload_f32(&rounded, &[n * nh * hd])
+            .expect("q_cand upload")
     } else {
-        gpu.upload_f32(&q_data, &[n * nh * hd]).expect("q_cand upload")
+        gpu.upload_f32(&q_data, &[n * nh * hd])
+            .expect("q_cand upload")
     };
 
     // POS=tail  : positions[b] = ctx - n + b   (contiguous tail chunk)
@@ -182,7 +190,9 @@ fn main() {
         "only {compared} of {} vectors were comparable",
         n * nh
     );
-    println!("kernel={kernel} nh={nh} nkv={nkv} hd={hd} n={n} ctx={ctx} br={br} bc={bc} pos={pos_mode}");
+    println!(
+        "kernel={kernel} nh={nh} nkv={nkv} hd={hd} n={n} ctx={ctx} br={br} bc={bc} pos={pos_mode}"
+    );
     println!(
         "max_abs={max_abs_all:.3e} worst_tol_ratio={worst_ratio:.3} \
          (at {worst_at}: ref={:.6e} new={:.6e}) min_cos={min_cos:.9} rel_l2={max_rel_l2:.3e}",
@@ -198,7 +208,10 @@ fn main() {
             max_rel_l2 <= 5e-3,
             "wmma relative L2 {max_rel_l2:.3e} > 5e-3 — too large for f16 rounding"
         );
-        assert!(min_cos >= 1.0 - 1e-5, "wmma min cosine {min_cos:.9} < 1-1e-5");
+        assert!(
+            min_cos >= 1.0 - 1e-5,
+            "wmma min cosine {min_cos:.9} < 1-1e-5"
+        );
     } else {
         assert!(
             worst_ratio <= 1.0,

@@ -748,6 +748,7 @@ version = "0.3.0"
 dependencies = [
  "hipfire-config",
  "libloading",
+ "redline-rocr",
  "thiserror 2.0.18",
 ]
 
@@ -773,6 +774,8 @@ dependencies = [
  "hipfire-dispatch",
  "hipfire-reap",
  "hipfire-runtime",
+ "libloading",
+ "memmap2",
  "rdna-compute",
  "serde",
  "serde_json",
@@ -1939,8 +1942,10 @@ version = "0.3.0"
 dependencies = [
  "hip-bridge",
  "hipfire-config",
+ "radiowave",
  "rayon",
  "redline-dispatch",
+ "redline-rocr",
 ]
 
 [[package]]

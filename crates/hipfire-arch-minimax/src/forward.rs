@@ -481,6 +481,7 @@ fn decode_step_body(
                     hidden,
                     inter,
                     k_top,
+                    false,
                 )
                 .map_err(|e| format!("minimax L{l}: down mq2l: {e:?}"))?;
             }
@@ -837,6 +838,7 @@ fn minimax_moe_block(
                 hidden,
                 inter,
                 k_top,
+                false,
             )
             .map_err(|e| format!("minimax L{l}: down mq2l: {e:?}"))?;
         }
