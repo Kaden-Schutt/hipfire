@@ -13510,12 +13510,18 @@ fn generate_qwen35_mtp(
     // byte filtering plus reasoning/content/tool routing for this path.
     let mut think_closed = false;
     let mut grammar_violated = false;
+    let emit_tools = hipfire_runtime::prompt_frame::qwen35_grammar_on(
+        std::env::var("HIPFIRE_QWEN35_GRAMMAR").ok().as_deref(),
+        &m.model_path,
+    )
+    .then_some(tools)
+    .flatten();
     let mut emit =
         hipfire_arch_qwen35::spec_emit::Qwen35Emit::from_ctx(hipfire_runtime::spec::SpecEmitCtx {
             tokenizer,
             eos: eos_token,
             im_end: im_end_token,
-            tools: None,
+            tools: emit_tools,
             stop: stop.to_vec(),
             max_think: 0,
             max_tokens,
