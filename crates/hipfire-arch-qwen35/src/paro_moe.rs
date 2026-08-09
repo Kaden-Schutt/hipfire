@@ -216,5 +216,7 @@ pub(crate) fn paro_load_moe_ffn(
         layer_idx,
         expert_shape: None,
         paro_shared: Some(shared),
+        global_expert_dtypes: None,
+        ep_dummy_buffers: Vec::new(),
     })
 }

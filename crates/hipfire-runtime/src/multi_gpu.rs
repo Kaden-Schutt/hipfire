@@ -897,6 +897,26 @@ impl Gpus {
         self.peer_ar_tmp_bytes = bytes;
         Ok(())
     }
+    /// Public wrapper for `ensure_peer_ar_tmp` used by the EP batch route.
+    /// Reserves peer-direct all-reduce scratch of at least `bytes` on each device.
+    pub fn reserve_peer_reduce_scratch(&mut self, bytes: usize) -> HipResult<()> {
+        self.ensure_peer_ar_tmp(bytes)
+    }
+
+    /// Release peer-direct all-reduce scratch. No-op if not allocated; frees otherwise.
+    pub fn release_peer_reduce_scratch(&mut self) {
+        if self.peer_ar_tmp.is_empty() {
+            return;
+        }
+        for (r, row) in std::mem::take(&mut self.peer_ar_tmp).into_iter().enumerate() {
+            let _ = self.devices[r].bind_thread();
+            for buf in row {
+                let _ = self.devices[r].hip.free(buf);
+            }
+        }
+        self.peer_ar_tmp_bytes = 0;
+    }
+
 
     /// All-reduce-sum of f32 buffers across all ranks via **direct peer copy +
     /// local add** — bypassing RCCL. On consumer/prosumer RDNA P2P (no xGMI,
