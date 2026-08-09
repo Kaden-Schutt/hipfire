@@ -2711,8 +2711,10 @@ impl Drop for AdmissionGuard {
 /// Conservative batch eligibility for independent continuous-batch decode.
 ///
 /// Eligible only for Qwen (arch 5/6) or dense LFM2 (`lfm` arch identity),
-/// single-GPU, stateless text with no tools/images/stops/spec/adaptive/prefix
-/// behavior. All others fall back to sequential. Check is intentionally strict
+/// stateless text with no tools/images/stops/spec/adaptive/prefix behavior.
+/// TP policy: Qwen admits ordinary tp=1 or pure expert-parallel tp=4 when the
+/// daemon advertises batch capability; dense LFM remains tp=1 only. All other
+/// tp/arch combinations fall back to sequential. Check is intentionally strict
 /// and synchronous; model arch is taken from `current_arch` when available,
 /// otherwise inferred from the requested model name containing `qwen` or `lfm`.
 ///
@@ -2728,21 +2730,27 @@ fn is_batch_eligible_request(
     if !daemon_batch_capable {
         return false;
     }
-    // Single-GPU exact HIP only for initial route.
-    if tp.unwrap_or(1) != 1 {
-        return false;
-    }
     // Qwen or LFM2 only. Prefer runtime arch when known.
-    let is_batch_arch = if let Some(arch) = current_arch {
+    let (is_qwen, is_lfm) = if let Some(arch) = current_arch {
         let arch_l = arch.to_ascii_lowercase();
-        arch_l.contains("qwen") || arch_l.contains("lfm")
+        (arch_l.contains("qwen"), arch_l.contains("lfm"))
     } else if let Some(model) = body.get("model").and_then(|v| v.as_str()) {
         let model_l = model.to_ascii_lowercase();
-        model_l.contains("qwen") || model_l.contains("lfm")
+        (model_l.contains("qwen"), model_l.contains("lfm"))
     } else {
-        false
+        (false, false)
     };
-    if !is_batch_arch {
+    if !is_qwen && !is_lfm {
+        return false;
+    }
+    // TP policy: Qwen tp=1 ordinary or tp=4 pure EP; dense LFM tp=1 only.
+    let tp_degree = tp.unwrap_or(1);
+    let tp_ok = if is_qwen {
+        tp_degree == 1 || tp_degree == 4
+    } else {
+        tp_degree == 1
+    };
+    if !tp_ok {
         return false;
     }
     // Stateless text: no tools, no images, no stops, no spec, no adaptive, no prefix.
@@ -10692,7 +10700,7 @@ mod tests {
 
     #[test]
     fn batch_eligibility_conservative_checks() {
-        // Eligible: single-GPU qwen with one plain user string.
+        // Eligible: tp=1 qwen with one plain user string.
         let body =
             serde_json::json!({"model":"qwen3.5:7b","messages":[{"role":"user","content":"hi"}]});
         assert!(is_batch_eligible_request(
@@ -10775,7 +10783,16 @@ mod tests {
             Some("qwen35"),
             true
         ));
-        // Multi-GPU disqualifies.
+        // Qwen tp=4 pure EP is eligible when daemon admits batch.
+        let body =
+            serde_json::json!({"model":"qwen3.5:7b","messages":[{"role":"user","content":"hi"}]});
+        assert!(is_batch_eligible_request(
+            &body,
+            Some(4),
+            Some("qwen35"),
+            true
+        ));
+        // Qwen tp=2 (and any non-1/non-4) disqualifies.
         let body = serde_json::json!({"model":"qwen3.5:7b"});
         assert!(!is_batch_eligible_request(
             &body,
@@ -10800,7 +10817,7 @@ mod tests {
             Some("qwen35"),
             false
         ));
-        // Eligible: single-GPU LFM2 dense with one plain user string when daemon admits batch.
+        // Eligible: tp=1 LFM2 dense with one plain user string when daemon admits batch.
         let body =
             serde_json::json!({"model":"lfm2.5:1.2b","messages":[{"role":"user","content":"hi"}]});
         assert!(is_batch_eligible_request(
@@ -10867,6 +10884,15 @@ mod tests {
         assert!(!is_batch_eligible_request(
             &body,
             Some(1),
+            Some("lfm2"),
+            true
+        ));
+        // LFM tp=4 disqualifies (dense remains tp=1 only).
+        let body =
+            serde_json::json!({"model":"lfm2.5:1.2b","messages":[{"role":"user","content":"hi"}]});
+        assert!(!is_batch_eligible_request(
+            &body,
+            Some(4),
             Some("lfm2"),
             true
         ));
