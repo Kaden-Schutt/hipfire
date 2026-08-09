@@ -10068,6 +10068,14 @@ impl Qwen35DecodeBatchEpState {
                         }
                     }
                 }
+                // Invariant: decode `pbs` per rank and `seed_pbs` are separate
+                // allocations; `prefill_lane` correctly uses `seed_pbs` with
+                // `false,false`, while `forward_tick` has no external
+                // `prepare_decode_batch_inputs` and no peer-copy. Only band 0
+                // on every rank owns staging of host token/position/embedding
+                // inputs; later bands must reuse the transformed residual in
+                // `pbs.x_batch` and must not re-upload or re-embed.
+                let inputs_prepared = ep_tick_inputs_prepared(layer_idx);
                 for rank in 0..n {
                     gpus.devices[rank].bind_thread()?;
                     let band = PrefillBandCtx {
@@ -10103,8 +10111,8 @@ impl Qwen35DecodeBatchEpState {
                         None,
                         0,
                         None,
-                        true,
-                        true,
+                        inputs_prepared,
+                        inputs_prepared,
                         Some(&band),
                         None,
                         false,
@@ -10439,9 +10447,18 @@ impl BatchSemantics<'_> {
         }
     }
 }
+/// EP tick input residency: decode `pbs` per rank and `seed_pbs` are separate
+/// allocations. `prefill_lane` correctly uses `seed_pbs` with `false,false`
+/// and has no bearing on `forward_tick`'s per-rank decode `pbs`, which has
+/// no external `prepare_decode_batch_inputs`. Therefore only band 0 on every
+/// rank owns staging of host token/position/embedding inputs into `pbs`; later
+/// bands must reuse the transformed residual already in `pbs.x_batch`.
+#[inline]
+fn ep_tick_inputs_prepared(layer_idx: usize) -> bool {
+    layer_idx != 0
+}
 
 /// Central lane helpers — single source for max_batch bounds and shifts.
-#[inline]
 pub(crate) fn valid_lane_mask(max_batch: usize) -> HipResult<u64> {
     if max_batch == 0 || max_batch > 64 {
         return Err(HipError::new(0, "valid_lane_mask: max_batch must be 1..64"));
@@ -24324,5 +24341,19 @@ mod tests {
         assert_eq!(Qwen35EpBatchReceipt::rows_from_usize(0).unwrap(), 0);
         assert_eq!(Qwen35EpBatchReceipt::rows_from_usize(7).unwrap(), 7);
         assert!(Qwen35EpBatchReceipt::rows_from_usize(usize::MAX).is_err());
+    }
+
+    #[test]
+    fn qwen35_ep_tick_first_band_owns_input_preparation() {
+        // CPU-pure guard for the EP tick residency decision: only layer 0
+        // stages host tokens/positions/embeddings into each rank's decode
+        // `pbs` (separate allocation from `seed_pbs`). Later bands must not
+        // overwrite the transformed residual; they are logically pre-prepared.
+        assert!(!ep_tick_inputs_prepared(0));
+        assert!(ep_tick_inputs_prepared(1));
+        assert!(ep_tick_inputs_prepared(39));
+        assert!(ep_tick_inputs_prepared(usize::MAX));
+        // Saturating representative: any non-zero later band is prepared.
+        assert!(ep_tick_inputs_prepared(usize::MAX.saturating_sub(1)));
     }
 }
