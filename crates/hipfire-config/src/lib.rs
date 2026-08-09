@@ -97,7 +97,9 @@ impl std::str::FromStr for DeviceSelector {
             )),
             "uuid" => Ok(Self::Uuid(value.to_owned())),
             "arch" if value.starts_with("gfx") => Ok(Self::ExactArch(value.to_ascii_lowercase())),
-            "arch" => Err(format!("architecture selector '{raw}' must name an exact gfx target")),
+            "arch" => Err(format!(
+                "architecture selector '{raw}' must name an exact gfx target"
+            )),
             _ => Err(format!("unknown device selector kind '{kind}'")),
         }
     }
@@ -596,7 +598,9 @@ macro_rules! process_field {
 
 macro_rules! diagnostic_field {
     ($key:literal, $legacy:literal, $default:expr, $rule:expr, $env:literal, $help:literal) => {
-        bridge_field!($key, $legacy, Diagnostic, Diagnostic, $default, $rule, true, $env, $help)
+        bridge_field!(
+            $key, $legacy, Diagnostic, Diagnostic, $default, $rule, true, $env, $help
+        )
     };
 }
 
@@ -947,7 +951,7 @@ pub static FIELDS: &[ConfigField] = &[
         Serve,
         Process,
         DefaultValue::Integer(1),
-        ValueRule::Integer { min: 1, max: 32 },
+        ValueRule::Integer { min: 1, max: 64 },
         false,
         false,
         Some("HIPFIRE_CONTINUOUS_BATCH_SIZE"),
@@ -982,10 +986,7 @@ pub static FIELDS: &[ConfigField] = &[
         "retry_backoff_ms",
         Serve,
         DefaultValue::Integer(50),
-        ValueRule::Integer {
-            min: 0,
-            max: 60000
-        },
+        ValueRule::Integer { min: 0, max: 60000 },
         true,
         "HIPFIRE_SERVE_RETRY_BACKOFF_MS",
         "Backoff before the single serve retry; slept outside runtime and admission locks."
@@ -4532,12 +4533,16 @@ mod tests {
             .set_cli("diagnostic.kernel.rdna2_variant", "5")
             .unwrap();
         layer.set_cli("kernel.lm_head_f16", "f32").unwrap();
-        assert!(layer
-            .set_cli("diagnostic.kernel.gate_up_variant", "unknown")
-            .is_err());
-        assert!(layer
-            .set_cli("diagnostic.kernel.rdna2_variant", "6")
-            .is_err());
+        assert!(
+            layer
+                .set_cli("diagnostic.kernel.gate_up_variant", "unknown")
+                .is_err()
+        );
+        assert!(
+            layer
+                .set_cli("diagnostic.kernel.rdna2_variant", "6")
+                .is_err()
+        );
 
         write_global_toml(&paths, &layer).unwrap();
         let loaded = load_global(&paths).unwrap();
@@ -4673,10 +4678,12 @@ mod tests {
         let wrong_version = encoded.replace("\"schema_version\":1", "\"schema_version\":2");
         let decoded: ProcessConfig = serde_json::from_str(&wrong_version).unwrap();
         assert!(decoded.validate().is_err());
-        assert!(serde_json::from_str::<ProcessConfig>(
-            r#"{"schema_version":1,"values":{"values":{}},"unknown":true}"#
-        )
-        .is_err());
+        assert!(
+            serde_json::from_str::<ProcessConfig>(
+                r#"{"schema_version":1,"values":{"values":{}},"unknown":true}"#
+            )
+            .is_err()
+        );
     }
 
     #[test]

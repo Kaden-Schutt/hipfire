@@ -7,20 +7,20 @@
 //! This binary owns hipfire's operator surface and never shells out to a
 //! JavaScript or TypeScript runtime.
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Parser, Subcommand};
 use hipfire_client::{
-    complete_openai_chat, probe_host, service_ready, service_url, stream_openai_chat, Engine,
-    OpenAiSseEvent,
+    Engine, OpenAiSseEvent, complete_openai_chat, probe_host, service_ready, service_url,
+    stream_openai_chat,
 };
 use hipfire_config::{
-    apply_config_profile, canonical_config_key, create_config_profile, developer_env_for_key,
-    field, fields, is_developer_key, load_catalog, load_env_layer, load_global, resolve,
-    write_catalog_toml, write_global_toml, CatalogFormat, ConfigFormat, ConfigLayer, ConfigPaths,
-    ConfigSource, NamedLayer, ValueRule, CONFIG_SCHEMA_VERSION,
+    CONFIG_SCHEMA_VERSION, CatalogFormat, ConfigFormat, ConfigLayer, ConfigPaths, ConfigSource,
+    NamedLayer, ValueRule, apply_config_profile, canonical_config_key, create_config_profile,
+    developer_env_for_key, field, fields, is_developer_key, load_catalog, load_env_layer,
+    load_global, resolve, write_catalog_toml, write_global_toml,
 };
 use hipfire_registry::{
-    load as load_registry, LoadedRegistry, ModelEntry, RegistryPaths, RegistrySource, RegistryV1,
+    LoadedRegistry, ModelEntry, RegistryPaths, RegistrySource, RegistryV1, load as load_registry,
 };
 use hipfire_runtime::prompt_frame::ToolCall;
 use serde::{Deserialize, Serialize};
@@ -36,8 +36,9 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, Command},
     sync::{
+        Arc, Condvar, Mutex,
         atomic::{AtomicBool, Ordering},
-        mpsc, Arc, Condvar, Mutex,
+        mpsc,
     },
     thread,
     time::{Duration, Instant},
@@ -548,7 +549,7 @@ struct ServeArgs {
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..=64))]
     tp: Option<u64>,
     /// Maximum concurrent eligible batched lanes; 1 preserves sequential behavior.
-    #[arg(long, value_parser = clap::value_parser!(u64).range(1..=32))]
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..=64))]
     continuous_batch_size: Option<u64>,
     /// Internal marker used by the detached child.
     #[arg(long, hide = true)]
@@ -596,7 +597,6 @@ fn main() {
         std::process::exit(1);
     }
 }
-
 fn run() -> Result<()> {
     let cli = Cli::parse_from(env::args_os().map(|argument| {
         if argument == "-md" {
@@ -3040,8 +3040,8 @@ fn serve_foreground(
     let continuous_batch_size = args
         .continuous_batch_size
         .unwrap_or(config_u64(&global, "serve.continuous_batch_size")?);
-    if continuous_batch_size == 0 || continuous_batch_size > 32 {
-        bail!("--continuous-batch-size must be between 1 and 32");
+    if continuous_batch_size == 0 || continuous_batch_size > 64 {
+        bail!("--continuous-batch-size must be between 1 and 64");
     }
     let retry_enabled = config_bool(&global, "serve.retry_enabled")?;
     let retry_backoff = Duration::from_millis(config_u64(&global, "serve.retry_backoff_ms")?);
@@ -3141,48 +3141,50 @@ fn serve_foreground(
     }
     if !shared.idle_timeout.is_zero() {
         let shared = Arc::clone(&shared);
-        thread::spawn(move || loop {
-            thread::sleep(Duration::from_secs(1));
-            if shared.admission.inflight() != 0 {
-                continue;
-            }
-            let expired = {
-                let meta = shared
-                    .meta
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner());
-                idle_model_expired(&meta, shared.idle_timeout)
-            };
-            if !expired {
-                continue;
-            }
-            let unloaded = {
-                let mut runtime = shared
-                    .runtime
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner());
-                if runtime.current_path.is_some() {
-                    let result = runtime.engine.unload();
-                    if result.is_ok() {
-                        runtime.current_path = None;
-                        runtime.current_arch = None;
-                        runtime.current_max_seq = 0;
-                        runtime.cache_capable = false;
-                    }
-                    result
-                } else {
-                    Ok(())
+        thread::spawn(move || {
+            loop {
+                thread::sleep(Duration::from_secs(1));
+                if shared.admission.inflight() != 0 {
+                    continue;
                 }
-            };
-            if unloaded.is_ok() {
-                let mut meta = shared
-                    .meta
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner());
-                meta.current_model = None;
-                meta.loading_model = None;
-                meta.last_activity = Instant::now();
-                eprintln!("[hipfire] unloaded idle model");
+                let expired = {
+                    let meta = shared
+                        .meta
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner());
+                    idle_model_expired(&meta, shared.idle_timeout)
+                };
+                if !expired {
+                    continue;
+                }
+                let unloaded = {
+                    let mut runtime = shared
+                        .runtime
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner());
+                    if runtime.current_path.is_some() {
+                        let result = runtime.engine.unload();
+                        if result.is_ok() {
+                            runtime.current_path = None;
+                            runtime.current_arch = None;
+                            runtime.current_max_seq = 0;
+                            runtime.cache_capable = false;
+                        }
+                        result
+                    } else {
+                        Ok(())
+                    }
+                };
+                if unloaded.is_ok() {
+                    let mut meta = shared
+                        .meta
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner());
+                    meta.current_model = None;
+                    meta.loading_model = None;
+                    meta.last_activity = Instant::now();
+                    eprintln!("[hipfire] unloaded idle model");
+                }
             }
         });
     }
@@ -7347,7 +7349,9 @@ fn ensure_update_not_interrupted() -> Result<()> {
 
 fn update_command(paths: &Paths, args: UpdateArgs) -> Result<()> {
     if !cfg!(target_os = "linux") {
-        bail!("hipfire update is Linux-only; re-run the platform installer with a revision selector on this OS");
+        bail!(
+            "hipfire update is Linux-only; re-run the platform installer with a revision selector on this OS"
+        );
     }
     // Install before any fetch/mutation so SIGINT cannot race past the guard.
     install_update_interrupt_handler();
@@ -8862,10 +8866,12 @@ mod tests {
             find_model_path(&paths, &registry, "example-model"),
             Some(fs::canonicalize(&nested).unwrap())
         );
-        assert!(list_local_models(&paths, &registry)
-            .unwrap()
-            .iter()
-            .any(|model| model.path == fs::canonicalize(&nested).unwrap()));
+        assert!(
+            list_local_models(&paths, &registry)
+                .unwrap()
+                .iter()
+                .any(|model| model.path == fs::canonicalize(&nested).unwrap())
+        );
         fs::remove_dir_all(&paths.root).unwrap();
     }
 
@@ -10021,10 +10027,12 @@ mod tests {
             "role": "user",
             "content": [{ "type": "image_url", "image_url": { "url": "https://example/image.png" } }]
         }]);
-        assert!(request_image_base64(Some(&remote))
-            .unwrap_err()
-            .to_string()
-            .contains("remote"));
+        assert!(
+            request_image_base64(Some(&remote))
+                .unwrap_err()
+                .to_string()
+                .contains("remote")
+        );
     }
 
     #[test]
@@ -10585,9 +10593,11 @@ mod tests {
             preserved_json["choices"][0]["message"]["content"],
             "<think>private chain</think>\nanswer"
         );
-        assert!(preserved_json["choices"][0]["message"]
-            .get("reasoning_content")
-            .is_none());
+        assert!(
+            preserved_json["choices"][0]["message"]
+                .get("reasoning_content")
+                .is_none()
+        );
     }
 
     #[test]
@@ -11060,16 +11070,20 @@ mod tests {
             Some(serde_json::json!({ "reasoning_content": "plan" }))
         );
         // Mid-stream tool_calls must never become an SSE delta.
-        assert!(openai_stream_delta_for_event(&serde_json::json!({
-            "type": "tool_calls",
-            "calls": [{ "name": "read_file", "arguments": {} }]
-        }))
-        .is_none());
-        assert!(openai_stream_delta_for_event(&serde_json::json!({
-            "type": "done",
-            "finish_reason": "stop"
-        }))
-        .is_none());
+        assert!(
+            openai_stream_delta_for_event(&serde_json::json!({
+                "type": "tool_calls",
+                "calls": [{ "name": "read_file", "arguments": {} }]
+            }))
+            .is_none()
+        );
+        assert!(
+            openai_stream_delta_for_event(&serde_json::json!({
+                "type": "done",
+                "finish_reason": "stop"
+            }))
+            .is_none()
+        );
     }
 
     #[test]
@@ -11198,11 +11212,13 @@ mod tests {
         );
 
         // Mid-stream fold forward never includes tool_calls.
-        assert!(openai_stream_delta_for_event(&serde_json::json!({
-            "type": "tool_calls",
-            "calls": fold.executable_tool_calls()
-        }))
-        .is_none());
+        assert!(
+            openai_stream_delta_for_event(&serde_json::json!({
+                "type": "tool_calls",
+                "calls": fold.executable_tool_calls()
+            }))
+            .is_none()
+        );
 
         let stream_chunks = openai_stream_terminal_chunks(&completion, true);
         assert_eq!(
@@ -11261,17 +11277,21 @@ mod tests {
 
         let nonstream = completion_json(&completion);
         assert_eq!(nonstream["choices"][0]["finish_reason"], "length");
-        assert!(nonstream["choices"][0]["message"]
-            .get("tool_calls")
-            .is_none());
+        assert!(
+            nonstream["choices"][0]["message"]
+                .get("tool_calls")
+                .is_none()
+        );
         assert_eq!(nonstream["choices"][0]["message"]["content"], "partial");
 
         let stream_chunks = openai_stream_terminal_chunks(&completion, true);
         assert_eq!(stream_chunks.len(), 2); // terminal + usage, no tool release
         assert_eq!(stream_chunks[0]["choices"][0]["finish_reason"], "length");
-        assert!(stream_chunks[0]["choices"][0]["delta"]
-            .get("tool_calls")
-            .is_none());
+        assert!(
+            stream_chunks[0]["choices"][0]["delta"]
+                .get("tool_calls")
+                .is_none()
+        );
         assert_eq!(stream_chunks[1]["choices"], serde_json::json!([]));
     }
 
