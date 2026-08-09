@@ -276,9 +276,7 @@ impl Gpus {
         let device_ids = resolve_device_ids(tp_size)?;
         let devices = construct_devices(&device_ids)?;
         preflight_vram_with_opts(&devices, /*check_vram_delta=*/ true)?;
-        let band_starts = (0..=tp_size)
-            .map(|rank| if rank == 0 { 0 } else { n_layers })
-            .collect();
+        let band_starts = tp_band_starts(tp_size, n_layers);
 
         // PP=1 TP topology: every device runs every layer. Encode the layer
         // map so PP helpers see device 0 owning all layers and devices ≥1
@@ -1524,6 +1522,14 @@ impl Gpus {
     }
 }
 
+/// Pure-TP PP band metadata: length `tp_size`, rank 0 owns every layer and
+/// ranks ≥1 hold empty bands (`[0, n_layers, n_layers, …]`).
+fn tp_band_starts(tp_size: usize, n_layers: usize) -> Vec<usize> {
+    (0..tp_size)
+        .map(|rank| if rank == 0 { 0 } else { n_layers })
+        .collect()
+}
+
 fn uniform_split_counts(n_devices: usize, n_layers: usize) -> Vec<usize> {
     let base = n_layers / n_devices;
     let rem = n_layers % n_devices;
@@ -1632,6 +1638,16 @@ mod tests {
         assert_eq!(uniform_split_counts(2, 25), vec![13, 12]);
         assert_eq!(uniform_split_counts(3, 64), vec![22, 21, 21]);
         assert_eq!(uniform_split_counts(4, 7), vec![2, 2, 2, 1]);
+    }
+
+    #[test]
+    fn tp_band_starts_length_and_values() {
+        // TP=1: single entry, rank 0 owns all layers.
+        assert_eq!(tp_band_starts(1, 40), vec![0]);
+        // TP=4: exactly 4 entries — rank 0 owns [0, n_layers), others empty.
+        // Would fail against the old `0..=tp_size` (5-entry) construction.
+        assert_eq!(tp_band_starts(4, 40), vec![0, 40, 40, 40]);
+        assert_eq!(tp_band_starts(4, 40).len(), 4);
     }
 
     #[test]
