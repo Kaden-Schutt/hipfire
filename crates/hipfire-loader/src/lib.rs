@@ -2128,13 +2128,11 @@ fn load_model_ep_qwen35(path: &str, max_seq: usize, tp: usize) -> Result<LoadedM
             ));
         }
     }
-    let peer = staging
-        .gpus_mut()
-        .enable_peer_all()
-        .map_err(|e| format!("enable_peer_all: {e:?}"))?;
     hipfire_runtime::ep::ensure_rank_streams(staging.gpus_mut())
         .map_err(|e| format!("ensure_rank_streams: {e:?}"))?;
-    eprintln!("[loader] EP load complete: {n} ranks, peer_access={peer}");
+    eprintln!(
+        "[loader] EP load complete: {n} ranks, peer access deferred until post-batch allocation"
+    );
     let (gpus, weights) = staging.into_parts();
     let eos_tok: u32 = {
         let ids = tokenizer.encode("<|im_end|>");

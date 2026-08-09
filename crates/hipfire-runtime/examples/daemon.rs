@@ -13902,13 +13902,30 @@ fn main() {
                                                                 // Attest receipt getters work before publishing.
                                                                 let _ = ep_batch.max_batch();
                                                                 let _ = ep_batch.lane_capacity();
-                                                                *batch = Some(ep_batch);
-                                                                staged_batch_scheduler = Some(ContinuousBatchScheduler::new(parsed_continuous_batch_size, batch_lane_capacity));
-                                                                staged_batch_capable = true;
-                                                                staged_ep_batch = true;
-                                                                staged_ep_slots = parsed_continuous_batch_size;
-                                                                staged_ep_lane_cap = batch_lane_capacity;
-                                                                eprintln!("[daemon][EP] expert-parallel batch staged: slots={} lane_cap={} repeat_cap={} prefill_chunk={} reduce=peer_rooted_f32 rank_count=4", parsed_continuous_batch_size, batch_lane_capacity, repeat_cap, prefill_chunk);
+                                                                // Peer access MUST follow every peer-visible batch
+                                                                // allocation (partials + leased scratch); ROCm may
+                                                                // not retroactively map late allocs.
+                                                                match ep.gpus.enable_peer_all() {
+                                                                    Ok(peer_access) => {
+                                                                        *batch = Some(ep_batch);
+                                                                        staged_batch_scheduler = Some(ContinuousBatchScheduler::new(parsed_continuous_batch_size, batch_lane_capacity));
+                                                                        staged_batch_capable = true;
+                                                                        staged_ep_batch = true;
+                                                                        staged_ep_slots = parsed_continuous_batch_size;
+                                                                        staged_ep_lane_cap = batch_lane_capacity;
+                                                                        eprintln!("[daemon][EP] expert-parallel batch staged: slots={} lane_cap={} repeat_cap={} prefill_chunk={} reduce=peer_rooted_f32 rank_count=4 peer_access={}", parsed_continuous_batch_size, batch_lane_capacity, repeat_cap, prefill_chunk, peer_access);
+                                                                    }
+                                                                    Err(enable_err) => {
+                                                                        match ep_batch.free_gpu(&mut ep.gpus) {
+                                                                            Ok(()) => {
+                                                                                eprintln!("[daemon][EP] enable_peer_all failed after batch alloc: {enable_err:?} — fail closed (batch freed)");
+                                                                            }
+                                                                            Err(cleanup_err) => {
+                                                                                eprintln!("[daemon][EP] enable_peer_all failed after batch alloc: {enable_err:?}; cleanup also failed: {cleanup_err:?} — fail closed");
+                                                                            }
+                                                                        }
+                                                                    }
+                                                                }
                                                             }
                                                             Err(e) => {
                                                                 eprintln!("[daemon][EP] expert-parallel batch allocation failed: {e} — fail closed");
