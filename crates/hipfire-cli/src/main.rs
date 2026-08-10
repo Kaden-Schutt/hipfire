@@ -6703,9 +6703,17 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
         bail!("decode lengths must be positive");
     }
     if let Some(mode) = args.kv_mode.as_deref() {
-        if !matches!(mode, "q8" | "fwht2" | "fwht3" | "fwht4") {
-            bail!("--kv-mode must be q8, fwht2, fwht3, or fwht4");
-        }
+        // Validate against the canonical `memory.kv_cache` schema instead of a
+        // local subset. The old hardcoded list accepted only q8/fwht{2,3,4} and
+        // so rejected `f32`/`f16` — the only KV formats DeepSeek V4 implements,
+        // and precisely what the loader tells you to pass when it falls back
+        // ("Pass --kv f32 for the golden configuration"). That made the advised
+        // configuration unreachable through `bench`.
+        let field = hipfire_config::field("memory.kv_cache")
+            .ok_or_else(|| anyhow!("missing memory.kv_cache configuration field"))?;
+        field
+            .validate(&hipfire_config::ConfigValue::String(mode.to_owned()))
+            .map_err(|err| anyhow!("--kv-mode {mode}: {err}"))?;
     }
 
     if args.exp {
