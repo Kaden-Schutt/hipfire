@@ -1801,12 +1801,6 @@ impl Carrier for MuseGlimmerCarrier {
             }
             .into());
         }
-        if ctx.draft_path.is_some() {
-            return Err(
-                "params.draft (qwen3.5 DFlash) is not supported on arch_id=14 (Muse Glimmer).                  Remove params.draft for AR-only decode."
-                    .to_string(),
-            );
-        }
         if ctx.gemma4_drafter_path.is_some() {
             return Err(
                 "params.drafter (Gemma4 EAGLE) is not supported on arch_id=14 (Muse Glimmer).                  Remove params.drafter for AR-only decode."
@@ -1839,6 +1833,51 @@ impl Carrier for MuseGlimmerCarrier {
                     );
                     if tok == 1 { 200001 } else { tok }
                 };
+                // Optional DFlash drafter (arch 23). OFF by default — daemon
+                // only populates ctx.draft_path when HIPFIRE_DFLASH_DRAFT is set
+                // (or params.draft) and dflash_mode != "off". When present, load
+                // the 5-layer diffusion draft head (encoder.fc / layers.* / norm)
+                // and stash it on the bundle for the speculator to consume.
+                // On any failure, log and fall back to AR-only (never fail the
+                // target load because the draft is auxiliary).
+                let drafter: Option<crate::GlimmerDrafterBundle> = if let Some(dp) = ctx.draft_path.clone() {
+                    match (|| -> Result<crate::GlimmerDrafterBundle, String> {
+                        let dhfq = hipfire_runtime::hfq::HfqFile::open(std::path::Path::new(&dp))
+                            .map_err(|e| format!("open glimmer drafter '{dp}': {e}"))?;
+                        if dhfq.arch_id != hipfire_arch_muse_glimmer::drafter::GLIMMER_DRAFTER_ARCH_ID {
+                            return Err(format!(
+                                "glimmer drafter '{}' arch_id {} != {} (muse_glimmer_assistant); a DFlash draft (arch 20) or Gemma4 draft (22) does not match",
+                                dp, dhfq.arch_id, hipfire_arch_muse_glimmer::drafter::GLIMMER_DRAFTER_ARCH_ID
+                            ));
+                        }
+                        let dcfg = hipfire_arch_muse_glimmer::drafter::GlimmerDrafterConfig::from_hfq(&dhfq)?;
+                        if dcfg.hidden != config.dim {
+                            return Err(format!(
+                                "glimmer drafter hidden {} != target dim {} (cross-attention concat invariant)",
+                                dcfg.hidden, config.dim
+                            ));
+                        }
+                        if dcfg.block_size != 16 {
+                            eprintln!("glimmer drafter: WARNING block_size {} != 16 (expected diffusion recipe)", dcfg.block_size);
+                        }
+                        let dweights = hipfire_arch_muse_glimmer::drafter::GlimmerDrafterWeights::load(&dhfq, &dcfg, ctx.gpu)?;
+                        let dscratch = hipfire_arch_muse_glimmer::drafter::GlimmerDrafterScratch::new(ctx.gpu, &dcfg, ctx.max_seq)
+                            .map_err(|e| format!("glimmer drafter scratch: {e}"))?;
+                        eprintln!(
+                            "  glimmer DFlash drafter loaded: {} (layers={}, hidden={}, block={}, mask={})",
+                            dp, dcfg.n_layers, dcfg.hidden, dcfg.block_size, dcfg.mask_token_id
+                        );
+                        Ok(crate::GlimmerDrafterBundle { config: dcfg, weights: dweights, scratch: dscratch })
+                    })() {
+                        Ok(b) => Some(b),
+                        Err(e) => {
+                            eprintln!("  glimmer DFlash drafter load failed ({}): {} — falling back to AR only", ctx.draft_path.as_deref().unwrap_or(""), e);
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
                 let speculator = crate::spec_build::build_speculator(
                     meta.arch_id,
                     None,
@@ -1853,6 +1892,7 @@ impl Carrier for MuseGlimmerCarrier {
                         weights,
                         state,
                         eos_tok,
+                        drafter,
                     })),
                     speculator,
                     ..LoadedModel::skeleton(

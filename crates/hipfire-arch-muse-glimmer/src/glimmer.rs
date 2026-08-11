@@ -443,6 +443,7 @@ pub struct GlimmerState {
     pub x: GpuTensor,        // [dim]
     pub residual: GpuTensor, // [dim]
     pub tmp: GpuTensor,      // [dim] norm scratch
+    pub x_rot: GpuTensor,    // [dim] FWHT scratch for shared rotation (MQ4)
 
     // attention scratch (uniform dims)
     pub q: GpuTensor,        // [q_dim]
@@ -521,6 +522,11 @@ impl GlimmerState {
             }
         }
 
+        // FWHT sign LUT must exist before any fused_rmsnorm_rotate_mq
+        // launch (the shared-rotation path). Mirrors gemma4's ensure at state init.
+        gpu.ensure_mq_signs()
+            .map_err(|e| format!("glimmer: ensure_mq_signs: {e:?}"))?;
+
         let pos_buf = gpu
             .hip
             .malloc(4)
@@ -566,6 +572,7 @@ impl GlimmerState {
             x: alloc(gpu, dim, "x")?,
             residual: alloc(gpu, dim, "residual")?,
             tmp: alloc(gpu, dim, "tmp")?,
+            x_rot: alloc(gpu, dim, "x_rot")?,
             q: alloc(gpu, q_dim, "q")?,
             k: alloc(gpu, kv_dim, "k")?,
             v: alloc(gpu, kv_dim, "v")?,
@@ -594,6 +601,7 @@ impl GlimmerState {
             self.x,
             self.residual,
             self.tmp,
+            self.x_rot,
             self.q,
             self.k,
             self.v,

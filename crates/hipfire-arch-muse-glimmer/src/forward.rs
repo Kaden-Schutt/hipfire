@@ -29,8 +29,17 @@
 
 use crate::config::{GlimmerConfig, GlimmerLayerType};
 use crate::glimmer::{GlimmerState, GlimmerWeights};
-use hipfire_runtime::llama::{weight_gemv, EmbeddingFormat};
+use hipfire_runtime::llama::{
+    fused_rmsnorm_rotate_for_mq, weight_gemv, weight_gemv_prerotated, EmbeddingFormat,
+};
 use rdna_compute::Gpu;
+
+// ───────────────────── Shared rotation gate ─────────────────────
+// HIPFIRE_GLIMMER_SHARED_ROT default ON (=1 or unset), =0 selects old path.
+// Mirrors Gemma4's attn_input_qkv and Qwen35's run_fa_layer_body precedent.
+fn shared_rot_enabled() -> bool {
+    std::env::var("HIPFIRE_GLIMMER_SHARED_ROT").as_deref() != Ok("0")
+}
 
 // ───────────────────────────── Decode ─────────────────────────────
 
@@ -169,19 +178,54 @@ fn glimmer_layer_decode(
     gpu.memcpy_dtod_auto(&state.residual.buf, &state.x.buf, dim_bytes)
         .map_err(|e| format!("glimmer L{layer_idx}: save residual: {e:?}"))?;
 
-    // n1 = input_layernorm(x) -> tmp
-    gpu.rmsnorm_f32(&state.x, &lw.input_layernorm, &state.tmp, rms_eps)
-        .map_err(|e| format!("glimmer L{layer_idx}: input rmsnorm: {e:?}"))?;
-
-    // q/k/v/gate projections from the SAME normed input (tmp)
-    weight_gemv(gpu, &lw.q_proj, &state.tmp, &state.q)
-        .map_err(|e| format!("glimmer L{layer_idx}: q_proj: {e}"))?;
-    weight_gemv(gpu, &lw.k_proj, &state.tmp, &state.k)
-        .map_err(|e| format!("glimmer L{layer_idx}: k_proj: {e}"))?;
-    weight_gemv(gpu, &lw.v_proj, &state.tmp, &state.v)
-        .map_err(|e| format!("glimmer L{layer_idx}: v_proj: {e}"))?;
-    weight_gemv(gpu, &lw.attn_gate_proj, &state.tmp, &state.attn_gate)
-        .map_err(|e| format!("glimmer L{layer_idx}: attn gate_proj: {e}"))?;
+    // n1 = input_layernorm(x) -> tmp/tmp_rot
+    // Shared FWHT rotation: 4 projections (q/k/v/gate) read the SAME normed
+    // input. Each weight_gemv on MQ4G256 internally rotates its input (6656-
+    // element FWHT), so the old path rotated the identical vector 4 times.
+    // Rotate once via fused_rmsnorm_rotate_for_mq (precedent:
+    // crates/hipfire-arch-qwen35/src/qwen35.rs:17515 and
+    // crates/hipfire-arch-gemma4/src/forward.rs:192-199 — the latter states
+    // "Prerotated GEMVs share tmp_rot (NO re-rotation -- byte-identical math)").
+    // Byte-identical when the fused kernel's rmsnorm+FWHT sequence matches
+    // the separate rmsnorm_f32 + rotate_x_mq sequence (same per-group
+    // butterfly, same sign tables from ensure_mq_signs). Accumulation order
+    // in the GEMVs is unchanged (each GEMV still accumulates its own M rows).
+    let use_shared_attn = shared_rot_enabled()
+        && hipfire_dispatch::types::dtype_rotation_plan(lw.q_proj.gpu_dtype)
+            != hipfire_dispatch::types::RotationPlan::None;
+    if use_shared_attn {
+        // Fused rmsnorm+rotate: x --rmsnorm--> x_rot (FWHT). Returns Some(&x_rot)
+        // when rotation was applied, None for non-rotating dtypes (fallback,
+        // though we already checked rotation is needed, so this is Some).
+        // The plain tmp is not populated in the fused path; weight_gemv_prerotated
+        // ignores its `x` arg when `x_rot` is Some (see llama.rs:1221).
+        let x_rot_opt = fused_rmsnorm_rotate_for_mq(
+            gpu, &lw.q_proj, &state.x, &lw.input_layernorm, &state.tmp, &state.x_rot, rms_eps,
+        )
+        .map_err(|e| format!("glimmer L{layer_idx}: fused input rmsnorm+rotate: {e:?}"))?;
+        let x_rot = x_rot_opt.as_ref().copied();
+        // x param is ignored when x_rot is Some; pass &state.x as placeholder
+        // (matches Gemma4's weight_gemv_prerotated(gpu, q_proj, x, Some(tmp_rot), q_out)).
+        weight_gemv_prerotated(gpu, &lw.q_proj, &state.x, x_rot, &state.q)
+            .map_err(|e| format!("glimmer L{layer_idx}: q_proj (prerot): {e:?}"))?;
+        weight_gemv_prerotated(gpu, &lw.k_proj, &state.x, x_rot, &state.k)
+            .map_err(|e| format!("glimmer L{layer_idx}: k_proj (prerot): {e:?}"))?;
+        weight_gemv_prerotated(gpu, &lw.v_proj, &state.x, x_rot, &state.v)
+            .map_err(|e| format!("glimmer L{layer_idx}: v_proj (prerot): {e:?}"))?;
+        weight_gemv_prerotated(gpu, &lw.attn_gate_proj, &state.x, x_rot, &state.attn_gate)
+            .map_err(|e| format!("glimmer L{layer_idx}: attn gate_proj (prerot): {e:?}"))?;
+    } else {
+        gpu.rmsnorm_f32(&state.x, &lw.input_layernorm, &state.tmp, rms_eps)
+            .map_err(|e| format!("glimmer L{layer_idx}: input rmsnorm: {e:?}"))?;
+        weight_gemv(gpu, &lw.q_proj, &state.tmp, &state.q)
+            .map_err(|e| format!("glimmer L{layer_idx}: q_proj: {e}"))?;
+        weight_gemv(gpu, &lw.k_proj, &state.tmp, &state.k)
+            .map_err(|e| format!("glimmer L{layer_idx}: k_proj: {e}"))?;
+        weight_gemv(gpu, &lw.v_proj, &state.tmp, &state.v)
+            .map_err(|e| format!("glimmer L{layer_idx}: v_proj: {e}"))?;
+        weight_gemv(gpu, &lw.attn_gate_proj, &state.tmp, &state.attn_gate)
+            .map_err(|e| format!("glimmer L{layer_idx}: attn gate_proj: {e}"))?;
+    }
 
     // Scale-less QK-norm (no learned weight tensors; ones-filled weight)
     // Still runs RMSNorm per head, then Q *= qk_scale_factor.
@@ -280,13 +324,30 @@ fn glimmer_layer_decode(
         .map_err(|e| format!("glimmer L{layer_idx}: save ffn residual: {e:?}"))?;
 
     // ── SwiGLU FFN (silu, not gelu_tanh) ──────────────────────────
-    // pre_feedforward_layernorm(x) -> tmp
-    gpu.rmsnorm_f32(&state.x, &lw.pre_feedforward_layernorm, &state.tmp, rms_eps)
-        .map_err(|e| format!("glimmer L{layer_idx}: pre_ffn rmsnorm: {e:?}"))?;
-    weight_gemv(gpu, &lw.gate_proj, &state.tmp, &state.gate_ffn)
-        .map_err(|e| format!("glimmer L{layer_idx}: gate_proj: {e}"))?;
-    weight_gemv(gpu, &lw.up_proj, &state.tmp, &state.up_ffn)
-        .map_err(|e| format!("glimmer L{layer_idx}: up_proj: {e}"))?;
+    // Shared rotation for gate/up: 2 projections sharing the same normed
+    // input. Precedent: qwen35.rs:17799-17800 (w_gate/w_up sharing x_rot)
+    // and gemma4's fused FFN path. Saves 1 redundant FWHT per layer.
+    let use_shared_ffn = shared_rot_enabled()
+        && hipfire_dispatch::types::dtype_rotation_plan(lw.gate_proj.gpu_dtype)
+            != hipfire_dispatch::types::RotationPlan::None;
+    if use_shared_ffn {
+        let x_rot_opt = fused_rmsnorm_rotate_for_mq(
+            gpu, &lw.gate_proj, &state.x, &lw.pre_feedforward_layernorm, &state.tmp, &state.x_rot, rms_eps,
+        )
+        .map_err(|e| format!("glimmer L{layer_idx}: fused pre_ffn rmsnorm+rotate: {e:?}"))?;
+        let x_rot = x_rot_opt.as_ref().copied();
+        weight_gemv_prerotated(gpu, &lw.gate_proj, &state.x, x_rot, &state.gate_ffn)
+            .map_err(|e| format!("glimmer L{layer_idx}: gate_proj (prerot): {e:?}"))?;
+        weight_gemv_prerotated(gpu, &lw.up_proj, &state.x, x_rot, &state.up_ffn)
+            .map_err(|e| format!("glimmer L{layer_idx}: up_proj (prerot): {e:?}"))?;
+    } else {
+        gpu.rmsnorm_f32(&state.x, &lw.pre_feedforward_layernorm, &state.tmp, rms_eps)
+            .map_err(|e| format!("glimmer L{layer_idx}: pre_ffn rmsnorm: {e:?}"))?;
+        weight_gemv(gpu, &lw.gate_proj, &state.tmp, &state.gate_ffn)
+            .map_err(|e| format!("glimmer L{layer_idx}: gate_proj: {e}"))?;
+        weight_gemv(gpu, &lw.up_proj, &state.tmp, &state.up_ffn)
+            .map_err(|e| format!("glimmer L{layer_idx}: up_proj: {e}"))?;
+    }
     // silu(gate) * up -> ffn_hidden
     gpu.silu_mul_f32(&state.gate_ffn, &state.up_ffn, &state.ffn_hidden)
         .map_err(|e| format!("glimmer L{layer_idx}: silu_mul: {e:?}"))?;

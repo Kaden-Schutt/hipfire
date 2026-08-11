@@ -41,8 +41,10 @@ them for ordinary dispatch.
 
 | arch_id | Role | Where defined | Notes |
 |---:|---|---|---|
-| 20 | DFlash draft artifact | `hipfire-quantize` `dflash_convert` (`ARCH_ID_DFLASH_DRAFT`); loader draft open checks `draft_hfq.arch_id == 20` | Loaded as a draft alongside a compatible target, not as a standalone serve model via the primary registry. |
+| 20 | DFlash draft artifact (generic) | `hipfire-quantize` `dflash_convert` (`ARCH_ID_DFLASH_DRAFT`); loader draft open checks `draft_hfq.arch_id == 20` | Generic Qwen-family diffusion draft (fc/hidden_norm/norm naming, `dflash` metadata). Loaded as a draft alongside a compatible target, not as a standalone serve model. |
 | 21 | Qwen3.5 MTP head | `hipfire-quantize` `mtp_extract` (`ARCH_ID_QWEN35_MTP_HEAD`); consumed as `.mq4-mtp` trailer / `.mtp` sidecar on qwen35 trunks | Attached onto arch 5/6 loads (`LoadedModel.qwen35_mtp_head`), not a carrier `arch_id`. |
+| 22 | Gemma4 EAGLE draft | `hipfire-arch-gemma4` `DRAFTER_ARCH_ID` | `model_type gemma4_unified_assistant` — hidden-state-consuming EAGLE (pre/post projections, KV-shared layers). Loaded via `params.drafter` on arch 13. |
+| 23 | Muse Glimmer DFlash draft | `hipfire-arch-muse-glimmer` `GLIMMER_DRAFTER_ARCH_ID` | `model_type muse_glimmer_assistant` — 5-layer block-diffusion draft (encoder.fc/output_norm_enc, block 16, target_layer_ids [1,13,25,37,49], mask 201818). Loaded via `HIPFIRE_DFLASH_DRAFT` on arch 14. NOT a `dflash_convert` 20 artifact (different tensor naming: encoder.fc vs fc, separate `config` envelope). Quantizer auto-maps `muse_glimmer_assistant` → 23 (`hipfire-quantize/src/main.rs:8607`, `hipfire-runtime/src/safetensors_source.rs:271`); HFQ on disk is `arch 23`. |
 | 0xFF | Toy / template | `hipfire-arch-toy` | Never ship; daemon must not dispatch. No current carrier claims it. Registry disjointness tests include `0xFF` and assert at most one claimer — they do **not** assert zero claimers / hard-reserved. |
 | `u32::MAX` | Unclaimed dir sentinel | `safetensors_source::UNCLAIMED_ARCH_ID` | Emitted for unrecognized `model_type`; no carrier matches → fail closed. |
 

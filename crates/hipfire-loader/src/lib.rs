@@ -358,6 +358,24 @@ pub struct MuseGlimmerBundle {
     pub weights: glimmer::glimmer::GlimmerWeights,
     pub state: glimmer::glimmer::GlimmerState,
     pub eos_tok: u32,
+    /// Optional DFlash drafter (arch 23, 5-layer diffusion) loaded when
+    /// `HIPFIRE_DFLASH_DRAFT` (or `params.draft`) is set. OFF by default
+    /// (`dflash_mode=off` forces `ctx.draft_path=None`). When `None`, the
+    /// daemon runs AR-only; when `Some`, the target can be driven via the
+    /// generic DFlash `Speculator` (see `carriers.rs`).
+    pub drafter: Option<GlimmerDrafterBundle>,
+}
+
+/// Muse Glimmer DFlash drafter (arch 23) — `muse_glimmer_assistant` 5-layer
+/// diffusion draft head (encoder.fc + output_norm_enc, block 16, mask 201818,
+/// target_layer_ids [1,13,25,37,49]). No embed/lm_head (uses target's).
+/// Stored alongside the arch-14 target when `HIPFIRE_DFLASH_DRAFT` is set.
+pub struct GlimmerDrafterBundle {
+    pub config: glimmer::drafter::GlimmerDrafterConfig,
+    pub weights: glimmer::drafter::GlimmerDrafterWeights,
+    /// Scratch sized to `max_seq` (target's ctx capacity). Allocated once at
+    /// load time, freed on unload.
+    pub scratch: glimmer::drafter::GlimmerDrafterScratch,
 }
 
 /// v1 draft length for gemma4 EAGLE (`params.spec`). dl=3 is the validated
@@ -2643,6 +2661,10 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(
                 // Freeing only one side leaks ~1.3 GB over 5 cycles (the
                 // weights are ~650 MB + state ~650 MB; each reload without
                 // the companion free retains the prior cycle's allocation).
+                if let Some(drafter) = b.drafter {
+                    drafter.scratch.free_gpu(gpu);
+                    drafter.weights.free_gpu(gpu);
+                }
                 b.state.free_gpu(gpu);
                 b.weights.free_gpu(gpu);
             }
