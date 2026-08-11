@@ -275,7 +275,25 @@ pub fn decode_step_with_graph(
             Some("0") => Some(false),
             _ => None,
         });
-    let graph_on = env_override.unwrap_or(true);
+    // DEFAULT OFF pending a fix to the captured decode path.
+    //
+    // Measured on gfx1201 / 12B-it MQ4, prompt "Hello world", greedy:
+    //   graph ON : 49.75 tok/s, output collapses after the first token
+    //              ("Hello!s율 bawass율율 bawaky interracial율jal…")
+    //   graph OFF: 49.72 tok/s, "Hello! How can I help you today?" — byte-
+    //              identical to this PR's own Phase-2 Gate 2 expected output,
+    //              and it stops cleanly on <turn|>.
+    //
+    // This is the failure mode AGENTS.md documents: a captured graph replays
+    // dangling stack-pointer kernargs, so throughput looks right and the tokens
+    // are garbage. All six Gemma4 dispatch helpers added during this port go
+    // through `launch_maybe_blob` and are capture-safe, so the offending raw
+    // launch is elsewhere in the decode body and still needs to be found.
+    //
+    // The graph is worth 0.03 tok/s here (0.06%), so correctness costs nothing.
+    // Re-enable with HIPFIRE_GEMMA4_GRAPH=1 once the capture path is fixed and
+    // a coherence check passes with it on.
+    let graph_on = env_override.unwrap_or(false);
     if !graph_on {
         return decode_step(cfg, weights, state, gpu, token_id, position);
     }
