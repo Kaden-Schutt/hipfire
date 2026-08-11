@@ -29326,13 +29326,45 @@ fn generate_muse_glimmer(
             // synthesized as mask_id (low tau honest) to prove the drafter was
             // consulted — a perturbed draft (e.g. corrupt one token) will trip
             // the byte-identical check, proving the comparison can fail.
-            let drafter = bundle.drafter.as_mut().unwrap();
-            let block_size = drafter.config.block_size;
-            let mask_id = drafter.config.mask_token_id;
+            let (block_size, mask_id, hidden) = {
+                let d = bundle.drafter.as_ref().unwrap();
+                (d.config.block_size, d.config.mask_token_id, d.config.hidden)
+            };
             if block_size == 0 || block_size > 32 { break; }
-            // Prepare noise_embedding raw (seed + masks) — host side
-            let hidden = drafter.config.hidden;
+            // Noise embedding: row 0 is the seed (last committed token), rows
+            // 1..B-1 are the mask token. These are RAW target embeddings — no
+            // embed_norm — per modeling_muse_glimmer.py:439, which keeps the norm
+            // out of the embedding matrix precisely because the DFlash path must
+            // embed without it. The target AR path DOES apply it.
+            //
+            // This buffer is the drafter's entire input. Allocating it and leaving
+            // it zero-filled is what produced tau 1.000 with token-0 drafts: the
+            // head ran on zeros, so every row decoded to the same argmax.
             let mut noise_embedding = vec![0f32; block_size * hidden];
+            for i in 0..block_size {
+                let t = if i == 0 { last_pick } else { mask_id };
+                match glimmer::forward::embed_raw(
+                    &bundle.config,
+                    &bundle.weights,
+                    &mut bundle.state,
+                    gpu,
+                    t,
+                ) {
+                    Ok(v) => {
+                        noise_embedding[i * hidden..(i + 1) * hidden]
+                            .copy_from_slice(&v[..hidden]);
+                    }
+                    Err(e) => {
+                        emit_error_with_id(
+                            stdout,
+                            id,
+                            format!("glimmer drafter noise embed row {i}: {e}"),
+                        );
+                        return;
+                    }
+                }
+            }
+            let drafter = bundle.drafter.as_mut().unwrap();
             // Target hidden history: last ctx row's 5-layer concat (33280 f32)
             // from bundle.target_hidden_host (populated during prefill via
             // decode_step_with_capture). If empty (should not happen after
