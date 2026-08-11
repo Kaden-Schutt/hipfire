@@ -4945,6 +4945,18 @@ fn is_promote_pair_supported(base: GgufFormat, promote: GgufFormat) -> bool {
 /// Handles both safetensors (`layers.{N}.`) and GGUF (`blk.{N}.`) patterns.
 /// Uses unanchored search to handle any prefix (model.layers, model.language_model.layers, etc.).
 fn parse_layer_idx(name: &str) -> Option<usize> {
+    // Vision towers contain `vision_tower.layers.N` — don't treat that as a
+    // text layer index (would pick up edge-layer Promote6 for vision). Return
+    // None early for vision prefixes additively (no behaviour change for text).
+    if name.starts_with("model.vision_tower.")
+        || name.starts_with("vision_tower.")
+        || name.starts_with("model.vision_adapter.")
+        || name.starts_with("model.vision_projection.")
+        || name.starts_with("model.visual.")
+        || name.starts_with("visual.")
+    {
+        return None;
+    }
     // Try safetensors pattern: "layers.{N}."
     if let Some(pos) = name.find("layers.") {
         let after = &name[pos + 7..]; // skip "layers."
@@ -4999,6 +5011,19 @@ fn kmap_resolve(name: &str, n_layers: usize, is_moe: bool) -> QuantLevel {
 }
 
 fn kmap_resolve_mode(name: &str, n_layers: usize, is_moe: bool, kmap_mode: u8) -> QuantLevel {
+    // Vision tensors (809 on Glimmer) stay F16 and must not be mis-classified
+    // as text. This also prevents `vision_tower.layers.N` from being parsed
+    // as a text layer index for edge-layer Promote6. Additive: text tensors
+    // never match these prefixes, so no existing arch changes.
+    if name.starts_with("model.vision_tower.")
+        || name.starts_with("vision_tower.")
+        || name.starts_with("model.vision_adapter.")
+        || name.starts_with("model.vision_projection.")
+        || name.starts_with("model.visual.")
+        || name.starts_with("visual.")
+    {
+        return QuantLevel::F16;
+    }
     // Rule 1: norms, biases, 1D (GGUF path mainly)
     if name.contains("norm") || name.contains("bias") {
         return QuantLevel::F16;
@@ -5385,14 +5410,18 @@ fn find_safetensors(dir: &Path) -> Vec<PathBuf> {
 fn should_quantize(name: &str) -> bool {
     // Vision encoder weights stay FP16 (only ~500M params, run once per image).
     // Qwen3.5-VL uses `model.visual.*` / `visual.*`; dots.ocr uses
-    // `vision_tower.*`. Both arches keep vision F16 during bring-up so the
-    // per-stage diff against the HF reference activations
-    // (`benchmarks/references/<image>_activations/`) doesn't have to absorb
-    // both forward-pass implementation noise AND quant noise — clean
+    // `vision_tower.*`. Glimmer uses `model.vision_tower.*`,
+    // `model.vision_adapter.*`, `model.vision_projection.*`. All vision stays
+    // F16 during bring-up so the per-stage diff against the HF reference
+    // activations (`benchmarks/references/<image>_activations/`) doesn't have
+    // to absorb both forward-pass implementation noise AND quant noise — clean
     // attribution. See memory `feedback_dots_ocr_vision_f16_during_bringup`.
     if name.starts_with("model.visual.")
         || name.starts_with("visual.")
         || name.starts_with("vision_tower.")
+        || name.starts_with("model.vision_tower.")
+        || name.starts_with("model.vision_adapter.")
+        || name.starts_with("model.vision_projection.")
     {
         return false;
     }
@@ -8569,6 +8598,13 @@ fn main() {
         // the next free slot after 21 (Qwen3.5 MTP head). Crate (future):
         // hipfire-arch-gemma4 drafter loader.
         "gemma4_unified_assistant" => 22,
+        // Muse Glimmer (arch_id 14) and its DFlash drafter (23).
+        // Glimmer is dense 52-layer text + ViT tower; model_type "muse_glimmer"
+        // (and "muse_glimmer_text" for text-only exports). The assistant
+        // drafter uses model_type "muse_glimmer_assistant" (5 layers, DFlash).
+        // Arch 14 = dense text tower, 23 = assistant drafter.
+        "muse_glimmer" | "muse_glimmer_text" => 14,
+        "muse_glimmer_assistant" => 23,
         other => {
             eprintln!("Warning: unknown architecture '{other}', treating as llama");
             0
@@ -9173,12 +9209,16 @@ fn main() {
         }
         // Skip MTP head; optionally include vision encoder for VL inference.
         // Qwen3.5-VL names vision tensors `model.visual.*` / `visual.*`;
-        // dots.ocr names them `vision_tower.*`. Both fall through to the
-        // F16 fallback path (see should_quantize: vision_tower.* is
-        // skipped from quantization) when --include-vision is set.
+        // dots.ocr names them `vision_tower.*`; Glimmer names them
+        // `model.vision_tower.*`, `model.vision_adapter.*`,
+        // `model.vision_projection.*`. All fall through to the F16 fallback
+        // path (see should_quantize) when --include-vision is set.
         let is_vision = name.starts_with("model.visual.")
             || name.starts_with("visual.")
-            || name.starts_with("vision_tower.");
+            || name.starts_with("vision_tower.")
+            || name.starts_with("model.vision_tower.")
+            || name.starts_with("model.vision_adapter.")
+            || name.starts_with("model.vision_projection.");
         if is_vision && !include_vision {
             let (meta, _) = st_files[*file_idx].tensor_data(name).unwrap();
             let n: usize = meta.shape.iter().product();
@@ -15161,6 +15201,136 @@ mod tests {
                 / rotated.len() as f32
         };
         assert!(mse(&q_repaired) <= mse(&q_regular));
+    }
+
+    // ── Muse Glimmer (arch 14) classification locks ────────────────────────
+    // These pin the new Glimmer tensor names to their intended quant decisions so a
+    // future refactor cannot silently move them. Existing arches must not change.
+
+    #[test]
+    fn glimmer_lm_head_is_q8_separate_untied() {
+        // Glimmer tie_word_embeddings=false — lm_head is SEPARATE from embed (unlike
+        // Gemma4 which ties). Must land Q8 via Rule 2 (kmap_resolve_mode:50xx) and
+        // via q8_class_of:is_q8_tensor (56xx). should_quantize keeps it quantizable
+        // (contains "weight", not norm/bias, not vision).
+        let name = "lm_head.weight";
+        assert!(should_quantize(name), "lm_head must be quantizable (should_quantize:53xx)");
+        assert_eq!(q8_class_of(name), Some("lm_head"), "q8_class_of:55xx lm_head");
+        assert!(is_q8_tensor(name), "is_q8_tensor:59xx must be Q8");
+        assert_eq!(kmap_resolve(name, 52, false), QuantLevel::Q8, "kmap Rule2 Q8");
+        assert_eq!(kmap_resolve_mode(name, 52, false, 0), QuantLevel::Q8);
+        assert_eq!(kmap_resolve_mode(name, 52, false, 3), QuantLevel::Q8);
+    }
+
+    #[test]
+    fn glimmer_embed_tokens_is_q8() {
+        let name = "model.language_model.embed_tokens.weight";
+        assert!(should_quantize(name));
+        assert_eq!(q8_class_of(name), Some("embed"));
+        assert!(is_q8_tensor(name));
+        assert_eq!(kmap_resolve(name, 52, false), QuantLevel::Q8);
+        assert_eq!(kmap_resolve_mode(name, 52, false, 1), QuantLevel::Q8);
+    }
+
+    #[test]
+    fn glimmer_self_attn_gate_proj_is_attention_not_mlp_or_router() {
+        // NEW name in Glimmer: self_attn.gate_proj gates attention output before
+        // o_proj (see hipfire-arch-muse-glimmer lib.rs:24-27). Must be attn class,
+        // not MLP gate and not MoE router.
+        let attn_gate = "model.language_model.layers.0.self_attn.gate_proj.weight";
+        let mlp_gate = "model.language_model.layers.0.mlp.gate_proj.weight";
+        // q8_class_of:55xx — self_attn substring => "attn"; mlp gate has no
+        // self_attn/attn_q/class and is not a router, so None.
+        assert_eq!(q8_class_of(attn_gate), Some("attn"), "self_attn.gate_proj => attn (q8_class_of)");
+        assert_eq!(q8_class_of(mlp_gate), None, "mlp.gate_proj must not be attn/router");
+        assert!(is_q8_tensor(attn_gate), "attn gate must be fixed-tier Q8");
+        assert!(!is_q8_tensor(mlp_gate), "mlp gate is not fixed-tier (unless --q8-router on MoE)");
+        // should_quantize:53xx — both are weights, not norms/bias/vision => true
+        assert!(should_quantize(attn_gate));
+        assert!(should_quantize(mlp_gate));
+        // awq_eligible:61xx — ends_with("gate_proj.weight") catches BOTH. This is
+        // CORRECT for the attention gate: it is an input-side projection from the
+        // normed hidden (post_input_layernorm) whose runtime path is the same
+        // fused_rmsnorm_rotate AWQ kernel as mlp gate/up. The scale s[j] multiplies
+        // the gate's input channels and is divided at inference before the gate;
+        // the gate's output then scales attn_out via sigmoid. Input-side AWQ is
+        // mathematically valid regardless of where the gate's output is applied.
+        assert!(awq_eligible(attn_gate), "attn gate must be AWQ-eligible (input-side)");
+        assert!(awq_eligible(mlp_gate), "mlp gate must be AWQ-eligible");
+        // kmap: dense edge-layer rule promotes FFN only, not attn — so even in
+        // edge layer 0, the attn gate stays Base (not Promote6). This matches the
+        // dense policy (attn promotion regresses PPL +3.1%).
+        assert_eq!(kmap_resolve(attn_gate, 52, false), QuantLevel::Base);
+        // MoE is irrelevant for Glimmer (dense), but verify router rule does not
+        // mis-fire even if is_moe were true: attn gate is not mlp.gate.weight.
+        // For MoE edge-layer (0 is edge), full promotion returns Promote6 for every
+        // tensor including attn — that is the expected MoE policy, not a router.
+        assert_eq!(kmap_resolve_mode("model.layers.0.self_attn.gate_proj.weight", 52, true, 0), QuantLevel::Promote6);
+    }
+
+    #[test]
+    fn glimmer_norms_are_f16_never_lowbit() {
+        // Sandwich RMSNorms: input, post_attn, pre_ffn, post_ffn + final norm.
+        // All contain "norm" => Rule1 F16 (kmap_resolve_mode:50xx) and
+        // should_quantize:false (53xx). Must never be quantized.
+        let norms = [
+            "model.language_model.layers.0.input_layernorm.weight",
+            "model.language_model.layers.0.post_attention_layernorm.weight",
+            "model.language_model.layers.0.pre_feedforward_layernorm.weight",
+            "model.language_model.layers.0.post_feedforward_layernorm.weight",
+            "model.language_model.layers.51.input_layernorm.weight",
+            "model.language_model.norm.weight",
+        ];
+        for name in norms {
+            assert!(!should_quantize(name), "norm {name} must not be quantizable");
+            assert_eq!(kmap_resolve(name, 52, false), QuantLevel::F16, "kmap F16 for {name}");
+            assert_eq!(kmap_resolve_mode(name, 52, false, 1), QuantLevel::F16);
+            assert_eq!(kmap_resolve_mode(name, 52, false, 2), QuantLevel::F16);
+            assert_eq!(kmap_resolve_mode(name, 52, false, 3), QuantLevel::F16);
+            assert_eq!(kmap_resolve(name, 52, true), QuantLevel::F16, "even MoE must be F16");
+            // q8_class_of is unrelated to norms — must be None / not Q8
+            assert!(!is_q8_tensor(name));
+        }
+    }
+
+    #[test]
+    fn glimmer_vision_prefixes_are_f16_and_not_parsed_as_text_layers() {
+        // Glimmer vision tensors are model.vision_tower.*, model.vision_adapter.*,
+        // model.vision_projection.* (809 total). Previously is_vision/should_quantize
+        // only matched model.visual./visual./vision_tower. — so
+        // model.vision_tower.* fell through to text quant. Now extended additively
+        // (should_quantize:53xx, main is_vision, parse_layer_idx:49xx).
+        let vision = [
+            "model.vision_tower.layers.0.attn.q_proj.weight",
+            "model.vision_tower.layers.49.mlp.fc2.weight",
+            "model.vision_tower.layers.25.norm1.weight",
+            "model.vision_adapter.fc1.weight",
+            "model.vision_projection.weight",
+        ];
+        for name in vision {
+            assert!(!should_quantize(name), "vision {name} must stay F16 (should_quantize)");
+            assert_eq!(kmap_resolve(name, 52, false), QuantLevel::F16, "kmap vision F16 for {name}");
+            assert_eq!(kmap_resolve_mode(name, 52, false, 0), QuantLevel::F16);
+            assert_eq!(kmap_resolve_mode(name, 52, true, 1), QuantLevel::F16);
+            // parse_layer_idx must NOT extract vision_tower.layers.N as text layer
+            assert_eq!(parse_layer_idx(name), None, "vision {name} must not parse as layer idx");
+            // The old unanchored find("layers.") would have returned Some(0/49)
+            // and edge-layer Promote6 could have fired — locked to None now.
+        }
+        // Plain vision_tower. prefix (dots.ocr style) must still be F16
+        assert_eq!(kmap_resolve("vision_tower.layers.0.attn.q_proj.weight", 52, false), QuantLevel::F16);
+        assert_eq!(parse_layer_idx("vision_tower.layers.0.attn.q_proj.weight"), None);
+        // model.visual.* (Qwen3.5-VL) unchanged
+        assert!(!should_quantize("model.visual.patch_embed.weight"));
+        assert_eq!(parse_layer_idx("model.visual.layers.0.weight"), None);
+    }
+
+    #[test]
+    fn glimmer_text_layers_still_parse() {
+        // Sanity: text layers must still parse correctly (no regression for non-vision).
+        assert_eq!(parse_layer_idx("model.language_model.layers.0.self_attn.q_proj.weight"), Some(0));
+        assert_eq!(parse_layer_idx("model.language_model.layers.51.mlp.down_proj.weight"), Some(51));
+        assert_eq!(parse_layer_idx("model.layers.3.self_attn.gate_proj.weight"), Some(3));
     }
 
     #[test]

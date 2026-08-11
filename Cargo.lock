@@ -845,6 +845,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "hipfire-arch-muse-glimmer"
+version = "0.3.0"
+dependencies = [
+ "hip-bridge",
+ "hipfire-dispatch",
+ "hipfire-runtime",
+ "rdna-compute",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "hipfire-arch-qwen2"
 version = "0.3.0"
 dependencies = [
