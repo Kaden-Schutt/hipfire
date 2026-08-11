@@ -2,6 +2,46 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
+//! # STATUS: wired, correct, and NOT worth enabling (measured 2026-08-11)
+//!
+//! This path is complete and byte-identical to AR at temp 0, and it is also a
+//! large REGRESSION. Measured on hiptrx gfx1201 (R9700), 64 tokens, greedy,
+//! prompt md5 `2ef49ee70df1483079b1f73c1f768339`:
+//!
+//! | mode | tok/s | tau | accepted |
+//! |---|---:|---:|---:|
+//! | AR | 33.04 | — | — |
+//! | DFlash | 1.77 | 1.000 | 0 / 945 |
+//!
+//! 18.7x SLOWER. Every cycle pays the draft head plus a 16-position verify and
+//! accepts nothing, so only the bonus token survives per window — which is why
+//! the output is still byte-identical while the throughput collapses. Enabled
+//! only on explicit `HIPFIRE_DFLASH_DRAFT`; never on by default.
+//!
+//! ## Read the zero carefully — this is a BUG signature, not a tuning result
+//!
+//! A drafter that is merely mis-aligned with its target still proposes
+//! plausible tokens and lands occasional agreement; tau drifts to ~1.2-1.5, not
+//! to exactly 1.000. Here acceptance is 0 across 945 proposals and the drafts
+//! come back as token 0 for every position. That is a degenerate draft
+//! distribution, i.e. something upstream is feeding the head zeros or garbage,
+//! NOT the Gemma4-EAGLE situation of a genuinely disagreeing drafter.
+//!
+//! Do not "tune" this. The next diagnostic is to dump `target_hidden_host`
+//! after capture and confirm it is non-zero and correctly ordered: the
+//! `encoder.fc` input is the 5 captured layer states CONCATENATED, so both the
+//! zero-check and the ordering must hold. Suspects, in order: (1) the capture
+//! writes nothing because it runs on a path the prompt does not take, (2) the
+//! concat order does not match fc's expected layer order, (3) ctx_len=1
+//! broadcasting the last row is not what the head was trained against.
+//!
+//! Verified working around it: the loop itself, the accept rule
+//! (`accept_greedy_prefix`, shared — not reimplemented), the fail-hard on a
+//! requested-but-broken drafter, and the `HIPFIRE_GLIMMER_SPEC_PERTURB=1`
+//! liveness control which asserts the drafter actually ran rather than silently
+//! falling back to AR. That control is what turned an earlier "byte-identical,
+//! therefore passing" null result into a caught failure.
+//!
 //! Muse Glimmer DFlash drafter (`model_type = muse_glimmer_assistant`, arch_id = 23).
 //!
 //! A 5-layer block-diffusion draft head for the arch-14 Glimmer target.
