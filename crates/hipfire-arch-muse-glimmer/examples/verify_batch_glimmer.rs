@@ -16,15 +16,15 @@ fn main() {
     let mut gpu = Gpu::init().expect("gpu init");
     let hfq = HfqFile::open(std::path::Path::new(&model)).expect("open");
     let cfg = GlimmerConfig::from_hfq(&hfq).expect("cfg");
+    let weights = GlimmerWeights::load(&hfq, &cfg, &mut gpu).expect("weights");
     eprintln!(
-        "glimmer dim={} layers={} vocab={} window={} q8_lm={}",
+        "glimmer dim={} layers={} vocab={} window={} lm_head_dtype={:?}",
         cfg.dim,
         cfg.n_layers,
         cfg.vocab_size,
         cfg.sliding_window,
-        cfg.vocab_size // placeholder
+        weights.lm_head.gpu_dtype
     );
-    let weights = GlimmerWeights::load(&hfq, &cfg, &mut gpu).expect("weights");
     // Deterministic token ids (avoid tokenizer dependency). First is BOS.
     let prompt_tokens: Vec<u32> = {
         let mut v = vec![200000];

@@ -29341,6 +29341,8 @@ fn generate_muse_glimmer(
         let mut total_accepted: usize = 0;
         let mut windows: usize = 0;
         loop {
+            let t_window = std::time::Instant::now();
+            let do_window_timing = std::env::var("HIPFIRE_GLIMMER_TIMING").ok().as_deref() == Some("1");
             if generated_count >= max_tokens { break; }
             if bundle.state.n_tokens >= cache_cap { break; }
             // --- Draft: B-1 tokens via glimmer_drafter_forward (raw noise) ---
@@ -29389,6 +29391,7 @@ fn generate_muse_glimmer(
                     }
                 }
             }
+            let t_after_noise = t_window.elapsed();
             let drafter = bundle.drafter.as_mut().unwrap();
             // Target hidden history: last ctx_len rows of 5-layer concat
             // (33280 f32 each) from bundle.target_hidden_host (populated during
@@ -29458,6 +29461,7 @@ fn generate_muse_glimmer(
                 }
                 continue;
             }
+            let t_after_drafter = t_window.elapsed();
             // Bring-up diagnostic: HIPFIRE_GLIMMER_SPEC_DIAG=1 reports the L2 norm of
             // each stage so a degenerate (all-zero) draft can be localised to the
             // stage that produced it, rather than inferred from the argmax.
@@ -29511,21 +29515,38 @@ fn generate_muse_glimmer(
             // The drafter has no lm_head; this is the contract at qwen speculative.rs:3184.
             // Use the shared lm_head routine so draft and verify cannot diverge
             // on near-ties (Q8 batched vs per-row flips halved tau on Q8-head).
-            let all_picks = match hipfire_arch_muse_glimmer::forward::glimmer_lm_head_picks(
+            // Use a fresh allocation for the draft hidden (skip seed row) so the
+            // Q8 batched GEMM hits the same fast path as verify (fixed scratch
+            // address caused 66ms vs 4ms due to convert_fp16 cache).
+            let hidden_for_draft = {
+                let n = (block_size - 1) * hidden;
+                let t = gpu
+                    .alloc_tensor(&[n], rdna_compute::DType::F32)
+                    .map_err(|e| format!("drafter hidden alloc: {e:?}"))
+                    .unwrap();
+                gpu.hip
+                    .memcpy_dtod_at(&t.buf, 0, &drafter.scratch.x.buf, hidden * 4, n * 4)
+                    .map_err(|e| format!("drafter hidden copy: {e:?}"))
+                    .unwrap();
+                t
+            };
+            let drafts = match hipfire_arch_muse_glimmer::forward::glimmer_lm_head_picks(
                 gpu,
                 &bundle.config,
                 &bundle.weights,
-                &drafter.scratch.x,
-                block_size,
+                &hidden_for_draft,
+                block_size - 1,
                 &bundle.state.logits,
             ) {
                 Ok(p) => p,
                 Err(e) => {
+                    gpu.free_tensor(hidden_for_draft).ok();
                     emit_error_with_id(stdout, id, format!("glimmer drafter lm_head: {e}"));
                     return;
                 }
             };
-            let mut drafts: Vec<u32> = all_picks[1..].to_vec();
+            gpu.free_tensor(hidden_for_draft).ok();
+            let t_after_draft_lm = t_window.elapsed();
             total_proposed += drafts.len();
             // Log first draft for visibility
             if windows < 2 {
@@ -29541,6 +29562,7 @@ fn generate_muse_glimmer(
                 Ok(p) => p,
                 Err(e) => { emit_error_with_id(stdout, id, format!("muse_glimmer verify failed: {e:?}")); return; }
             };
+            let t_after_verify = t_window.elapsed();
             // verify_block_with_capture appended B rows; truncate to committed prefix
             // picks[0] is argmax after seed, picks[1..] after each draft
             // --- Accept via shared rule (do NOT write a second impl) ---
@@ -29566,6 +29588,25 @@ fn generate_muse_glimmer(
                 cur_pos = target_pos as u32;
             } else {
                 cur_pos += block_size as u32;
+            }
+            if do_window_timing {
+                let t_total = t_window.elapsed();
+                eprintln!(
+                    "[glimmer-window-timing] win {} noise={:.1}ms drafter={:.1}ms draft_lm={:.1}ms verify={:.1}ms total={:.1}ms ctx_len={} B={}",
+                    windows,
+                    t_after_noise.as_secs_f64() * 1000.0,
+                    (t_after_drafter - t_after_noise).as_secs_f64() * 1000.0,
+                    (t_after_draft_lm - t_after_drafter).as_secs_f64() * 1000.0,
+                    (t_after_verify - t_after_draft_lm).as_secs_f64() * 1000.0,
+                    t_total.as_secs_f64() * 1000.0,
+                    {
+                        let ne = drafter.config.num_extract();
+                        let hidden = drafter.config.hidden;
+                        let row_elems = ne * hidden;
+                        (bundle.target_hidden_host.len() / row_elems).min(drafter.config.sliding_window)
+                    },
+                    block_size
+                );
             }
             // Need the logits for the bonus token's NEXT prediction — they are picks[accept+1]'s logits?
             // Our verify_block already advanced state to cur_pos-1's KV and last_logits is stale.

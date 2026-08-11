@@ -751,8 +751,9 @@ pub fn verify_block_with_capture(
     let rms_eps = cfg.rms_norm_eps;
     let post_eps = cfg.post_norm_eps;
     let seq_len = position as usize + b;
-    // KV physical cap (max_seq)
     let phys_cap = state.max_seq;
+    let t_verify_start = std::time::Instant::now();
+    let do_timing = std::env::var("HIPFIRE_GLIMMER_TIMING").ok().as_deref() == Some("1");
 
     // ── Batched scratch (per call; verify is not the hot per-kernel loop) ──
     let alloc = |g: &mut Gpu, n: usize, label: &str| -> Result<GpuTensor, String> {
@@ -783,6 +784,7 @@ pub fn verify_block_with_capture(
     gpu.hip
         .memcpy_htod(&pos_array.buf, &pos_bytes)
         .map_err(|e| format!("glimmer verify_batch htod pos: {e:?}"))?;
+    let t_after_alloc = t_verify_start.elapsed();
 
     // Attention mask: for max_seq 2048 sliding_window 2048 == max_seq, causal suffices.
     // For larger max_seq where window < seq_len we would need a windowed mask via
@@ -807,6 +809,7 @@ pub fn verify_block_with_capture(
         }
         gpu.free_tensor(x_single).ok();
     }
+    let t_after_embed = t_verify_start.elapsed();
 
     // ── Capture buffer (position-major) ──
     let mut sorted_caps: Vec<usize> = capture_layers.to_vec();
@@ -935,6 +938,7 @@ pub fn verify_block_with_capture(
             }
         }
     }
+    let t_after_layers = t_verify_start.elapsed();
     // Extend hidden_out in position-major order (pos0 cap0,cap1,... pos1 cap0,...)
     if cap_cnt > 0 {
         hidden_out.extend_from_slice(&cap_buf);
@@ -943,9 +947,26 @@ pub fn verify_block_with_capture(
 
     // ── Final norm + lm_head per position → picks (shared with draft) ──
     let normed = alloc(gpu, b * dim, "normed")?;
+    let t_after_norm = t_verify_start.elapsed();
     gpu.rmsnorm_batched(&x, &weights.final_norm, &normed, b, dim, rms_eps).map_err(|e| format!("glimmer batch final rmsnorm: {e:?}"))?;
 
     let picks = glimmer_lm_head_picks(gpu, cfg, weights, &normed, b, &state.logits)?;
+    let t_after_lm = t_verify_start.elapsed();
+    if do_timing {
+        let total = t_verify_start.elapsed();
+        eprintln!(
+            "[glimmer-verify-timing] B={} alloc={:.1}ms embed={:.1}ms layers={:.1}ms norm={:.1}ms lm={:.1}ms total={:.1}ms cap={} seq_len={}",
+            b,
+            t_after_alloc.as_secs_f64() * 1000.0,
+            (t_after_embed - t_after_alloc).as_secs_f64() * 1000.0,
+            (t_after_layers - t_after_embed).as_secs_f64() * 1000.0,
+            (t_after_norm - t_after_layers).as_secs_f64() * 1000.0,
+            (t_after_lm - t_after_norm).as_secs_f64() * 1000.0,
+            total.as_secs_f64() * 1000.0,
+            cap_cnt,
+            seq_len
+        );
+    }
 
     // Free batched scratch
     for t in [x, residual, nrm, x_rot, q, k, v, attn_gate, attn_out, o_rot, o_out, gate_ffn, up_ffn, ffn_hidden, ffn_out, down_rot, pos_array, normed] {
