@@ -29003,6 +29003,30 @@ fn generate_gemma4(
 ///      intentionally ABSENT from the `cache_capable` allowlist.
 ///   5. No hipGraph-captured decode path (per spec).
 #[allow(clippy::too_many_arguments)]
+/// Tap layers whose residual stream feeds the DFlash drafter's `encoder.fc`.
+///
+/// HF's `output_hidden_states` tuple is 1-indexed with entry 0 being the
+/// EMBEDDING output, so a config `target_layer_ids = [1,13,25,37,49]` most
+/// likely names `hidden_states[i]` — the output of decoder layers
+/// `[0,12,24,36,48]`. We capture after `glimmer_layer_decode(l)`, where `l` is a
+/// 0-based decoder index, so the two conventions differ by exactly one.
+///
+/// This is invisible in every check except the acceptance rate: a one-layer
+/// shift still produces well-formed hidden states of the right magnitude, so
+/// nothing errors and nothing looks wrong — the drafter simply never agrees.
+/// `HIPFIRE_GLIMMER_TAP_LAYERS=0,12,24,36,48` selects the other convention so
+/// the two can be compared on hardware instead of argued about.
+fn glimmer_tap_layers(n_layers: usize) -> Vec<usize> {
+    match std::env::var("HIPFIRE_GLIMMER_TAP_LAYERS") {
+        Ok(v) if !v.trim().is_empty() => v
+            .split(',')
+            .filter_map(|t| t.trim().parse::<usize>().ok())
+            .filter(|l| *l < n_layers)
+            .collect(),
+        _ => vec![1, 13, 25, 37, 49],
+    }
+}
+
 fn generate_muse_glimmer(
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
@@ -29198,7 +29222,8 @@ fn generate_muse_glimmer(
     {
         let mut position = bundle.state.n_tokens as u32;
         let capture = bundle.drafter.is_some();
-        let target_layers: &[usize] = if capture { &[1,13,25,37,49] } else { &[] };
+        let tap_layers: Vec<usize> = glimmer_tap_layers(bundle.config.n_layers);
+        let target_layers: &[usize] = if capture { &tap_layers } else { &[] };
         for &tok in &prompt_ids {
             if capture {
                 let mut hidden_buf = Vec::new();
@@ -29504,7 +29529,7 @@ fn generate_muse_glimmer(
             block.extend_from_slice(&drafts);
             let row_elems2 = drafter.config.num_extract() * hidden;
             let hidden_before2 = bundle.target_hidden_host.len();
-            let picks = match glimmer::forward::verify_block_with_capture(&bundle.config, &bundle.weights, &mut bundle.state, gpu, &block, cur_pos, &[1,13,25,37,49], &mut bundle.target_hidden_host) {
+            let picks = match glimmer::forward::verify_block_with_capture(&bundle.config, &bundle.weights, &mut bundle.state, gpu, &block, cur_pos, &glimmer_tap_layers(bundle.config.n_layers), &mut bundle.target_hidden_host) {
                 Ok(p) => p,
                 Err(e) => { emit_error_with_id(stdout, id, format!("muse_glimmer verify failed: {e:?}")); return; }
             };
