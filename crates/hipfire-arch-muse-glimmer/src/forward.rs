@@ -35,6 +35,123 @@ use hipfire_runtime::llama::{
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
 
+// ─────────────────── Prefill dispatch helpers ───────────────────
+// Route Glimmer's chunked batched PREFILL projections through hipfire-dispatch
+// (caller picks KernelKey, no shared selector touched). This is the migration
+// qwen35 and gemma4 already did via run_plain_gemm_key / run_residual_gemm_key.
+// We add prefill-only helpers beside proj_gemm_batched; DFlash verify keeps
+// the old helpers unchanged. MQ4 GEMMs always read x_rot (FWHT-rotated), Q8
+// reads the unrotated buffer — never convert the unrotated buffer for MQ4.
+#[inline]
+fn run_prefill_plain_gemm_key(
+    gpu: &mut Gpu,
+    key: hipfire_dispatch::types::KernelKey,
+    w_buf: &GpuTensor,
+    w_dtype: DType,
+    x: &GpuTensor,
+    y: &GpuTensor,
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<(), String> {
+    use hipfire_dispatch::context::DispatchCtx;
+    use hipfire_dispatch::families::gemm::GemmParams;
+    use hipfire_dispatch::families::gemv::WeightRef;
+    let ctx = DispatchCtx::new(gpu);
+    let w = WeightRef {
+        buf: w_buf,
+        dtype: w_dtype,
+        m,
+        k,
+        row_stride: k,
+        rotation: None,
+        awq_scale: None,
+    };
+    let params = GemmParams {
+        w: &w,
+        x,
+        y,
+        batch_size: n,
+    };
+    hipfire_runtime::llama::gemm_family()
+        .run_key(key, &ctx, gpu, &params)
+        .map_err(|e| format!("{e:?}"))
+}
+
+#[inline]
+fn run_prefill_residual_gemm_key(
+    gpu: &mut Gpu,
+    key: hipfire_dispatch::types::KernelKey,
+    w_buf: &GpuTensor,
+    w_dtype: DType,
+    x: &GpuTensor,
+    y: &GpuTensor,
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<(), String> {
+    use hipfire_dispatch::context::DispatchCtx;
+    use hipfire_dispatch::families::gemm::GemmParams;
+    use hipfire_dispatch::families::gemv::WeightRef;
+    let ctx = DispatchCtx::new(gpu);
+    let w = WeightRef {
+        buf: w_buf,
+        dtype: w_dtype,
+        m,
+        k,
+        row_stride: k,
+        rotation: None,
+        awq_scale: None,
+    };
+    let params = GemmParams {
+        w: &w,
+        x,
+        y,
+        batch_size: n,
+    };
+    hipfire_runtime::llama::gemm_family()
+        .run_key(key, &ctx, gpu, &params)
+        .map_err(|e| format!("{e:?}"))
+}
+
+#[inline]
+fn run_prefill_fused_qkvza_key(
+    gpu: &mut Gpu,
+    key: hipfire_dispatch::types::KernelKey,
+    w_q: &GpuTensor,
+    w_k: &GpuTensor,
+    w_v: &GpuTensor,
+    w_gate: &GpuTensor,
+    x: &GpuTensor,
+    y_q: &GpuTensor,
+    y_k: &GpuTensor,
+    y_v: &GpuTensor,
+    y_gate: &GpuTensor,
+    q_m: usize,
+    k_m: usize,
+    v_m: usize,
+    gate_m: usize,
+    k: usize,
+    n: usize,
+) -> Result<(), String> {
+    use hipfire_dispatch::context::DispatchCtx;
+    use hipfire_dispatch::families::fused_qkv::FusedQkvParams;
+    let ctx = DispatchCtx::new(gpu);
+    let params = FusedQkvParams {
+        kind: key,
+        weights: &[w_q, w_k, w_v, w_gate],
+        x,
+        outputs: &[y_q, y_k, y_v, y_gate],
+        m: &[q_m, k_m, v_m, gate_m],
+        k,
+        rot_scratch: &[],
+        batch_size: Some(n),
+    };
+    hipfire_runtime::llama::fused_qkv_family()
+        .run(&ctx, gpu, &params)
+        .map_err(|e| format!("{e:?}"))
+}
+
 // ───────────────────── Shared rotation gate ─────────────────────
 // HIPFIRE_GLIMMER_SHARED_ROT default ON (=1 or unset), =0 selects old path.
 // Mirrors Gemma4's attn_input_qkv and Qwen35's run_fa_layer_body precedent.
@@ -627,6 +744,125 @@ fn proj_gemm_batched_prerotated(
         }
     }
 }
+// ─── Prefill-only projection helpers (dispatch-routed) ─────────────────────
+//
+// These are PREFILL-ONLY and live beside proj_gemm_batched; DFlash verify
+// keeps using proj_gemm_batched / proj_gemm_batched_prerotated unchanged.
+// Caller picks KernelKey → no shared selector, no cross-arch clobber.
+//   Q8_0            → GemmQ8_0BatchedChunked  (WMMA on gfx12, byte-identical)
+//   MQ4G256/HFQ4G256 → GemmHfq4G256BatchedLmhead (prerotated, x_rot, byte-identical)
+//   MQ6G256         → direct gemm_mq6g256_batched_lmhead (NO KernelKey, leave direct)
+//   o/down plain GEMM + sandwich post-norm + add_inplace → NOT residual-fused,
+//     so Gemm*Residual keys do not map 1:1 and are NOT forced.
+//   others          → per-row weight_gemv fallback
+// Always keep fused_rmsnorm_rotate_mq_batched_for and feed x_rot to every MQ4
+// GEMM — never quantize/convert the unrotated nrm buffer.
+fn prefill_proj_gemm_batched(
+    gpu: &mut Gpu,
+    w: &WeightTensor,
+    x: &GpuTensor,
+    y: &GpuTensor,
+    x_rot: &GpuTensor,
+    b: usize,
+    label: &str,
+) -> Result<(), String> {
+    match w.gpu_dtype {
+        DType::Q8_0 => run_prefill_plain_gemm_key(
+            gpu,
+            hipfire_dispatch::types::KernelKey::GemmQ8_0BatchedChunked,
+            &w.buf,
+            w.gpu_dtype,
+            x,
+            y,
+            w.m,
+            w.k,
+            b,
+        )
+        .map_err(|e| format!("glimmer prefill {label} (q8 dispatch): {e}")),
+        DType::MQ4G256 | DType::HFQ4G256 => {
+            rotate_x_mq_batched_for(gpu, w, x, x_rot, w.k, b)
+                .map_err(|e| format!("glimmer prefill {label} rotate: {e:?}"))?;
+            run_prefill_plain_gemm_key(
+                gpu,
+                hipfire_dispatch::types::KernelKey::GemmHfq4G256BatchedLmhead,
+                &w.buf,
+                w.gpu_dtype,
+                x_rot,
+                y,
+                w.m,
+                w.k,
+                b,
+            )
+            .map_err(|e| format!("glimmer prefill {label} (mq4 dispatch): {e}"))
+        }
+        DType::MQ6G256 => {
+            // No KernelKey — leave on direct call (shipped artifact is MQ4G256).
+            rotate_x_mq_batched_for(gpu, w, x, x_rot, w.k, b)
+                .map_err(|e| format!("glimmer prefill {label} rotate: {e:?}"))?;
+            gpu.gemm_mq6g256_batched_lmhead(&w.buf, x_rot, y, w.m, w.k, b)
+                .map_err(|e| format!("glimmer prefill {label} (mq6 direct): {e:?}"))
+        }
+        _ => {
+            for i in 0..b {
+                let x_row = x.sub_offset(i * w.k, w.k);
+                let y_row = y.sub_offset(i * w.m, w.m);
+                weight_gemv(gpu, w, &x_row, &y_row)
+                    .map_err(|e| format!("glimmer prefill {label} row {i}: {e}"))?;
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Prerotated prefill variant: x_rot already FWHT-rotated for MQ4.
+fn prefill_proj_gemm_batched_prerotated(
+    gpu: &mut Gpu,
+    w: &WeightTensor,
+    x_unrot: &GpuTensor,
+    x_rot: &GpuTensor,
+    y: &GpuTensor,
+    b: usize,
+    label: &str,
+) -> Result<(), String> {
+    match w.gpu_dtype {
+        DType::Q8_0 => run_prefill_plain_gemm_key(
+            gpu,
+            hipfire_dispatch::types::KernelKey::GemmQ8_0BatchedChunked,
+            &w.buf,
+            w.gpu_dtype,
+            x_unrot,
+            y,
+            w.m,
+            w.k,
+            b,
+        )
+        .map_err(|e| format!("glimmer prefill {label} (q8 prerot dispatch): {e}")),
+        DType::MQ4G256 | DType::HFQ4G256 => run_prefill_plain_gemm_key(
+            gpu,
+            hipfire_dispatch::types::KernelKey::GemmHfq4G256BatchedLmhead,
+            &w.buf,
+            w.gpu_dtype,
+            x_rot,
+            y,
+            w.m,
+            w.k,
+            b,
+        )
+        .map_err(|e| format!("glimmer prefill {label} (mq4 prerot dispatch): {e}")),
+        DType::MQ6G256 => gpu
+            .gemm_mq6g256_batched_lmhead(&w.buf, x_rot, y, w.m, w.k, b)
+            .map_err(|e| format!("glimmer prefill {label} (mq6 prerot direct): {e:?}")),
+        _ => {
+            for i in 0..b {
+                let x_row = x_unrot.sub_offset(i * w.k, w.k);
+                let y_row = y.sub_offset(i * w.m, w.m);
+                weight_gemv(gpu, w, &x_row, &y_row)
+                    .map_err(|e| format!("glimmer prefill {label} prerot row {i}: {e}"))?;
+            }
+            Ok(())
+        }
+    }
+}
 /// Shared lm_head routine for draft and verify. `hidden_batch` is [B*hidden]
 /// already RMSNormed (the lm_head input). Returns argmax picks for rows
 /// [0..batch) in order. Uses batched Q8 path when enabled and dtype is
@@ -1019,17 +1255,23 @@ pub fn verify_block_with_capture(
 /// `proj_gemm_batched` / `fused_rmsnorm_rotate_mq_batched_for` helpers,
 /// same QK-norm/scale, same RoPE, same KV-write, same sandwich norms.
 /// Attention is causal within chunk + attends to all prior KV.
-/// For sliding layers (window=2048) where `seq_len > window`, the
-/// windowed mask cannot be expressed with the existing
-/// `attention_q8_0_kv_batched` / `attention_q8_0_kv_batched_masked`
-/// kernels (masked kernel is tree-mode and leaves prefix unmasked,
-/// so it cannot hide old prefix tokens outside the window). No new
-/// kernel is added per constraints; instead those layers fall back to
-/// per-row `attention_q8_0_kv_swa(window)` — byte-identical to the
-/// single-token path and honest about the win. Full layers and early
-/// chunks where `seq_len <= window` stay on the fast batched causal
-/// path. This is the "if cannot be expressed, fallback" honest path
-/// the contract allows, not silent garbage.
+/// For sliding layers (window=2048) where `seq_len > window`, attention goes
+/// through `attention_flash_q8_0_batched_masked_windowed` with `tree_bias=None`
+/// — a batched windowed path that expresses the sliding mask natively. Full /
+/// NoPE layers (`layer_rope_theta == 0`) and any chunk with `seq_len <= window`
+/// stay on the fast batched causal `attention_q8_0_kv_batched`.
+///
+/// Do NOT reach for `attention_q8_0_kv_batched_masked` here. Passing it a
+/// non-null bias silently switches it into DDTree mode, where it substitutes
+/// `positions[0]` for the scalar `block_start` and sets its key extent to
+/// `positions[0] + block_cols`, leaving `[0, positions[0])` unmasked by
+/// contract. An earlier revision did exactly that with `block_cols` already
+/// equal to `P+B`, so it read `2P+B` keys, shifted the bias by `P`, masked the
+/// real current block, and exposed stale prefix plus unwritten KV — at the
+/// final chunk addressing 8337 slots of an 8192-entry cache. It returned
+/// well-formed tensors and fluent-looking garbage above 2048, and every chunk
+/// size agreed with every other chunk size, so only an oracle comparison
+/// caught it. That kernel cannot express a sliding window at any bias value.
 ///
 /// If `need_logits` is true, final norm + single-row lm_head is run on
 /// the LAST position only (not over the whole chunk). This avoids
@@ -1131,24 +1373,76 @@ fn prefill_chunk_batched(
 
         gpu.hip.memcpy_dtod_at(&residual.buf, 0, &x.buf, 0, b * dim * 4).map_err(|e| format!("glimmer prefill L{layer_idx} save residual: {e:?}"))?;
 
-        let need_shared = shared_rot_enabled()
-            && hipfire_dispatch::types::dtype_rotation_plan(lw.q_proj.gpu_dtype) != hipfire_dispatch::types::RotationPlan::None;
-        if need_shared {
-            fused_rmsnorm_rotate_mq_batched_for(
-                gpu, &x, &lw.input_layernorm, &lw.q_proj, &x_rot, dim, rms_eps, b,
-            ).map_err(|e| format!("glimmer prefill L{layer_idx} fused input rmsnorm+rotate: {e:?}"))?;
-            proj_gemm_batched_prerotated(gpu, &lw.q_proj, &nrm, &x_rot, &q, b, "q_proj")?;
-            proj_gemm_batched_prerotated(gpu, &lw.k_proj, &nrm, &x_rot, &k, b, "k_proj")?;
-            proj_gemm_batched_prerotated(gpu, &lw.v_proj, &nrm, &x_rot, &v, b, "v_proj")?;
-            proj_gemm_batched_prerotated(gpu, &lw.attn_gate_proj, &nrm, &x_rot, &attn_gate, b, "attn_gate")?;
+        // ── Q/K/V/attn_gate: fused qkvza on gfx12 ──
+        // Microbench: gemm_qkvza_hfq4g256_wmma_gfx12 ONE call = 2.65x at B256
+        // vs four sequential GemmHfq4G256BatchedLmhead calls. Arch-gated so
+        // non-gfx12 keeps the old four-call path. FWHT contract: feed x_rot.
+        let qkvza_fused_eligible = b > 1
+            && gpu.arch_caps.has_wmma_w32_gfx12()
+            && matches!(lw.q_proj.gpu_dtype, DType::MQ4G256 | DType::HFQ4G256)
+            && lw.q_proj.gpu_dtype == lw.k_proj.gpu_dtype
+            && lw.q_proj.gpu_dtype == lw.v_proj.gpu_dtype
+            && lw.q_proj.gpu_dtype == lw.attn_gate_proj.gpu_dtype;
+        if qkvza_fused_eligible {
+            let need_shared_qkv = shared_rot_enabled()
+                && hipfire_dispatch::types::dtype_rotation_plan(lw.q_proj.gpu_dtype) != hipfire_dispatch::types::RotationPlan::None;
+            if need_shared_qkv {
+                fused_rmsnorm_rotate_mq_batched_for(
+                    gpu, &x, &lw.input_layernorm, &lw.q_proj, &x_rot, dim, rms_eps, b,
+                ).map_err(|e| format!("glimmer prefill L{layer_idx} fused input rmsnorm+rotate: {e:?}"))?;
+            } else {
+                gpu.rmsnorm_batched(&x, &lw.input_layernorm, &nrm, b, dim, rms_eps).map_err(|e| format!("glimmer prefill L{layer_idx} input rmsnorm: {e:?}"))?;
+                rotate_x_mq_batched_for(gpu, &lw.q_proj, &nrm, &x_rot, dim, b).map_err(|e| format!("glimmer prefill L{layer_idx} rotate for fused qkvza: {e:?}"))?;
+            }
+            // Same pointer-keyed F16 hazard as the FFN site below: `x_rot` is
+            // reused across all 52 layers, so without this the qkvza call in
+            // layer N could be handed layer N-1's converted activations.
+            // Inert on RDNA (the ensure_fp16_x is behind `is_cdna3()`); live on
+            // CDNA3, and silent if it ever fires.
+            gpu.invalidate_fp16_cache();
+            // Glimmer's gate multiplies attn_out by sigmoid(gate) BEFORE o_proj.
+            // The qkvza kernel was written for DeltaNet z/beta/alpha, but
+            // mathematically it is 4 plain GEMMs sharing one x_rot:
+            //   Y_i = W_i · x_rot  (i = q, k, v, gate)
+            // No DeltaNet recurrence is fused. Fourth output is attn_gate.
+            run_prefill_fused_qkvza_key(
+                gpu,
+                hipfire_dispatch::types::KernelKey::FusedQkvzaHfq4G256,
+                &lw.q_proj.buf,
+                &lw.k_proj.buf,
+                &lw.v_proj.buf,
+                &lw.attn_gate_proj.buf,
+                &x_rot,
+                &q,
+                &k,
+                &v,
+                &attn_gate,
+                lw.q_proj.m,
+                lw.k_proj.m,
+                lw.v_proj.m,
+                lw.attn_gate_proj.m,
+                lw.q_proj.k,
+                b,
+            ).map_err(|e| format!("glimmer prefill L{layer_idx} fused qkvza: {e}"))?;
         } else {
-            gpu.rmsnorm_batched(&x, &lw.input_layernorm, &nrm, b, dim, rms_eps).map_err(|e| format!("glimmer prefill L{layer_idx} input rmsnorm: {e:?}"))?;
-            proj_gemm_batched(gpu, &lw.q_proj, &nrm, &q, &x_rot, b, "q_proj")?;
-            proj_gemm_batched(gpu, &lw.k_proj, &nrm, &k, &x_rot, b, "k_proj")?;
-            proj_gemm_batched(gpu, &lw.v_proj, &nrm, &v, &x_rot, b, "v_proj")?;
-            proj_gemm_batched(gpu, &lw.attn_gate_proj, &nrm, &attn_gate, &x_rot, b, "attn_gate")?;
+            let need_shared = shared_rot_enabled()
+                && hipfire_dispatch::types::dtype_rotation_plan(lw.q_proj.gpu_dtype) != hipfire_dispatch::types::RotationPlan::None;
+            if need_shared {
+                fused_rmsnorm_rotate_mq_batched_for(
+                    gpu, &x, &lw.input_layernorm, &lw.q_proj, &x_rot, dim, rms_eps, b,
+                ).map_err(|e| format!("glimmer prefill L{layer_idx} fused input rmsnorm+rotate: {e:?}"))?;
+                prefill_proj_gemm_batched_prerotated(gpu, &lw.q_proj, &nrm, &x_rot, &q, b, "q_proj")?;
+                prefill_proj_gemm_batched_prerotated(gpu, &lw.k_proj, &nrm, &x_rot, &k, b, "k_proj")?;
+                prefill_proj_gemm_batched_prerotated(gpu, &lw.v_proj, &nrm, &x_rot, &v, b, "v_proj")?;
+                prefill_proj_gemm_batched_prerotated(gpu, &lw.attn_gate_proj, &nrm, &x_rot, &attn_gate, b, "attn_gate")?;
+            } else {
+                gpu.rmsnorm_batched(&x, &lw.input_layernorm, &nrm, b, dim, rms_eps).map_err(|e| format!("glimmer prefill L{layer_idx} input rmsnorm: {e:?}"))?;
+                prefill_proj_gemm_batched(gpu, &lw.q_proj, &nrm, &q, &x_rot, b, "q_proj")?;
+                prefill_proj_gemm_batched(gpu, &lw.k_proj, &nrm, &k, &x_rot, b, "k_proj")?;
+                prefill_proj_gemm_batched(gpu, &lw.v_proj, &nrm, &v, &x_rot, b, "v_proj")?;
+                prefill_proj_gemm_batched(gpu, &lw.attn_gate_proj, &nrm, &attn_gate, &x_rot, b, "attn_gate")?;
+            }
         }
-
         if !abl("HIPFIRE_GLIMMER_NO_QK_NORM") {
             gpu.rmsnorm_batched(&q, &state.qk_norm_ones, &q, b * n_heads, hd, rms_eps).map_err(|e| format!("glimmer prefill L{layer_idx} q_norm: {e:?}"))?;
             gpu.rmsnorm_batched(&k, &state.qk_norm_ones, &k, b * n_kv, hd, rms_eps).map_err(|e| format!("glimmer prefill L{layer_idx} k_norm: {e:?}"))?;
@@ -1177,13 +1471,47 @@ fn prefill_chunk_batched(
         gpu.kv_cache_write_q8_0_batched(&k_cache_t, &k, &pos_array, n_kv, hd, b).map_err(|e| format!("glimmer prefill L{layer_idx} kv write k: {e:?}"))?;
         gpu.kv_cache_write_q8_0_batched(&v_cache_t, &v, &pos_array, n_kv, hd, b).map_err(|e| format!("glimmer prefill L{layer_idx} kv write v: {e:?}"))?;
 
-        // Attention: window-aware dispatch — honest fallback for over-window sliding.
-        // Full layers (window 0) and early chunks (seq_len <= window) use fast batched causal.
-        // Sliding layers where seq_len > window cannot be expressed with the existing
-        // batched kernels (tree mask leaves prefix unmasked), so fall back to per-row
-        // attention_q8_0_kv_swa which is byte-identical to the single-token path.
-        if window != 0 && seq_len > window {
-            // Per-row SWA — B launches, but projections are already batched.
+        // Attention: batched windowed flash for over-window sliding.
+        // Full layers (window 0) and early chunks (seq_len <= window) stay on
+        // the fast batched causal path. Sliding layers where seq_len > window
+        // use the existing batched windowed Q8 flash kernel:
+        //   attention_flash_q8_0_batched_masked_windowed with window=2048,
+        //   tree_bias=None, block_start=0, block_cols=0.
+        // Precedent: crates/hipfire-arch-cohere2moe/src/forward.rs:705-757.
+        // Toggle HIPFIRE_GLIMMER_NO_FLASH=1 to force per-row SWA for debugging.
+        let use_flash = window != 0 && seq_len > window
+            && std::env::var("HIPFIRE_GLIMMER_NO_FLASH").as_deref() != Ok("1");
+        if use_flash {
+            if state.prefill_flash_partials.is_none() {
+                let n_tiles = (state.max_seq + 127) / 128;
+                let flash_elems = cfg.n_heads * n_tiles * (2 + cfg.head_dim) * 64;
+                let buf = gpu
+                    .alloc_tensor(&[flash_elems], DType::F32)
+                    .map_err(|e| format!("glimmer prefill flash partials alloc: {e:?}"))?;
+                state.prefill_flash_partials = Some(buf);
+            }
+            let partials = state.prefill_flash_partials.as_ref().unwrap();
+            gpu.attention_flash_q8_0_batched_masked_windowed(
+                &q,
+                &k_cache_t,
+                &v_cache_t,
+                &attn_out,
+                &pos_array,
+                n_heads,
+                n_kv,
+                hd,
+                state.max_seq,
+                seq_len,
+                b,
+                partials,
+                None,
+                0,
+                0,
+                window as i32,
+            )
+            .map_err(|e| format!("glimmer prefill L{layer_idx} flash windowed: {e:?}"))?;
+        } else if window != 0 && seq_len > window {
+            // Per-row SWA fallback when flash disabled (debug) or if flash not available.
             for b_idx in 0..b {
                 let pos = position + b_idx as u32;
                 state.pos_host[0] = pos as i32;
@@ -1201,31 +1529,111 @@ fn prefill_chunk_batched(
             gpu.sigmoid_mul_f32(&attn_out, &attn_gate).map_err(|e| format!("glimmer prefill L{layer_idx} sigmoid_mul: {e:?}"))?;
         }
 
-        proj_gemm_batched(gpu, &lw.o_proj, &attn_out, &o_out, &o_rot, b, "o_proj")?;
+        // o_proj stays on the current baseline (29.8 TF best measured); leave it.
+        prefill_proj_gemm_batched(gpu, &lw.o_proj, &attn_out, &o_out, &o_rot, b, "o_proj")?;
         gpu.rmsnorm_batched(&o_out, &lw.post_attention_layernorm, &o_out, b, dim, post_eps).map_err(|e| format!("glimmer prefill L{layer_idx} post_attn rmsnorm: {e:?}"))?;
         gpu.hip.memcpy_dtod_at(&x.buf, 0, &residual.buf, 0, b * dim * 4).map_err(|e| format!("glimmer prefill L{layer_idx} reset x (attn): {e:?}"))?;
         gpu.add_inplace_f32(&x, &o_out).map_err(|e| format!("glimmer prefill L{layer_idx} attn residual add: {e:?}"))?;
         gpu.hip.memcpy_dtod_at(&residual.buf, 0, &x.buf, 0, b * dim * 4).map_err(|e| format!("glimmer prefill L{layer_idx} save ffn residual: {e:?}"))?;
 
+        // ── FFN gate/up: residual_wmma_gfx12 on gfx12 ──
+        // Microbench: gemm_hfq4g256_residual_wmma_gfx12 @ B384 = 65 TF, 1.11x baseline.
+        // Plain GEMM (overwrite) via residual kernel: zero y then y += W·x_rot.
+        // Arch-gated so non-gfx12 keeps the batched-lmhead path.
         let ffn_shared = shared_rot_enabled()
             && hipfire_dispatch::types::dtype_rotation_plan(lw.gate_proj.gpu_dtype) != hipfire_dispatch::types::RotationPlan::None;
-        if ffn_shared {
+        let ffn_use_residual = b > 1
+            && gpu.arch_caps.has_wmma_w32_gfx12()
+            && matches!(lw.gate_proj.gpu_dtype, DType::MQ4G256 | DType::HFQ4G256)
+            && lw.gate_proj.gpu_dtype == lw.up_proj.gpu_dtype;
+        if ffn_use_residual {
+            if ffn_shared {
+                fused_rmsnorm_rotate_mq_batched_for(
+                    gpu, &x, &lw.pre_feedforward_layernorm, &lw.gate_proj, &x_rot, dim, rms_eps, b,
+                ).map_err(|e| format!("glimmer prefill L{layer_idx} fused pre_ffn rmsnorm+rotate: {e:?}"))?;
+            } else {
+                gpu.rmsnorm_batched(&x, &lw.pre_feedforward_layernorm, &nrm, b, dim, rms_eps).map_err(|e| format!("glimmer prefill L{layer_idx} pre_ffn rmsnorm: {e:?}"))?;
+                rotate_x_mq_batched_for(gpu, &lw.gate_proj, &nrm, &x_rot, dim, b).map_err(|e| format!("glimmer prefill L{layer_idx} rotate for ffn gate/up residual: {e:?}"))?;
+            }
+            // `x_rot` was just overwritten with FFN-normed content, but it is the
+            // SAME device pointer the attention qkvza call rotated into earlier in
+            // this layer. `ensure_fp16_x` keys its F32->F16 conversion purely on
+            // that pointer (scratch.rs: `must_convert = capture_mode ||
+            // fp16_x_source_ptr != src_ptr`), so a cached hit here would feed
+            // gate/up the ATTENTION-normed activations. Invalidate explicitly.
+            //
+            // This is dead weight on RDNA today: the only `ensure_fp16_x` in the
+            // residual path sits behind `rocblas_arch_eligible()`, which is
+            // `is_cdna3()`, so gfx11/gfx12 never reach it. It becomes live on
+            // CDNA3 or under the `rocblas_all_archs` flag, and the failure mode
+            // would be silent wrong activations rather than an error — so the
+            // guard is cheap insurance, not redundancy.
+            //
+            // Deliberately placed BEFORE gate rather than between gate and up:
+            // those two share one rotation of identical content, so up's cache
+            // hit is correct and is the win we want to keep.
+            gpu.invalidate_fp16_cache();
+            gpu.hip.memset(&gate_ffn.buf, 0, b * lw.gate_proj.m * 4).map_err(|e| format!("glimmer prefill L{layer_idx} zero gate_ffn: {e:?}"))?;
+            run_prefill_residual_gemm_key(
+                gpu,
+                hipfire_dispatch::types::KernelKey::GemmHfq4G256Residual,
+                &lw.gate_proj.buf,
+                lw.gate_proj.gpu_dtype,
+                &x_rot,
+                &gate_ffn,
+                lw.gate_proj.m,
+                lw.gate_proj.k,
+                b,
+            ).map_err(|e| format!("glimmer prefill L{layer_idx} gate residual: {e}"))?;
+            gpu.hip.memset(&up_ffn.buf, 0, b * lw.up_proj.m * 4).map_err(|e| format!("glimmer prefill L{layer_idx} zero up_ffn: {e:?}"))?;
+            run_prefill_residual_gemm_key(
+                gpu,
+                hipfire_dispatch::types::KernelKey::GemmHfq4G256Residual,
+                &lw.up_proj.buf,
+                lw.up_proj.gpu_dtype,
+                &x_rot,
+                &up_ffn,
+                lw.up_proj.m,
+                lw.up_proj.k,
+                b,
+            ).map_err(|e| format!("glimmer prefill L{layer_idx} up residual: {e}"))?;
+        } else if ffn_shared {
             fused_rmsnorm_rotate_mq_batched_for(
                 gpu, &x, &lw.pre_feedforward_layernorm, &lw.gate_proj, &x_rot, dim, rms_eps, b,
             ).map_err(|e| format!("glimmer prefill L{layer_idx} fused pre_ffn rmsnorm+rotate: {e:?}"))?;
-            proj_gemm_batched_prerotated(gpu, &lw.gate_proj, &nrm, &x_rot, &gate_ffn, b, "gate_proj")?;
-            proj_gemm_batched_prerotated(gpu, &lw.up_proj, &nrm, &x_rot, &up_ffn, b, "up_proj")?;
+            prefill_proj_gemm_batched_prerotated(gpu, &lw.gate_proj, &nrm, &x_rot, &gate_ffn, b, "gate_proj")?;
+            prefill_proj_gemm_batched_prerotated(gpu, &lw.up_proj, &nrm, &x_rot, &up_ffn, b, "up_proj")?;
         } else {
             gpu.rmsnorm_batched(&x, &lw.pre_feedforward_layernorm, &nrm, b, dim, rms_eps).map_err(|e| format!("glimmer prefill L{layer_idx} pre_ffn rmsnorm: {e:?}"))?;
-            proj_gemm_batched(gpu, &lw.gate_proj, &nrm, &gate_ffn, &x_rot, b, "gate_proj")?;
-            proj_gemm_batched(gpu, &lw.up_proj, &nrm, &up_ffn, &x_rot, b, "up_proj")?;
+            prefill_proj_gemm_batched(gpu, &lw.gate_proj, &nrm, &gate_ffn, &x_rot, b, "gate_proj")?;
+            prefill_proj_gemm_batched(gpu, &lw.up_proj, &nrm, &up_ffn, &x_rot, b, "up_proj")?;
         }
         gpu.silu_mul_f32(&gate_ffn, &up_ffn, &ffn_hidden).map_err(|e| format!("glimmer prefill L{layer_idx} silu_mul: {e:?}"))?;
-        proj_gemm_batched(gpu, &lw.down_proj, &ffn_hidden, &ffn_out, &down_rot, b, "down_proj")?;
+        // ── down_proj: residual_wmma_gfx12 on gfx12 ──
+        let down_use_residual = b > 1
+            && gpu.arch_caps.has_wmma_w32_gfx12()
+            && matches!(lw.down_proj.gpu_dtype, DType::MQ4G256 | DType::HFQ4G256);
+        if down_use_residual {
+            // ffn_hidden is [B, hidden_dim]; down needs FWHT-rotated input for MQ4.
+            rotate_x_mq_batched_for(gpu, &lw.down_proj, &ffn_hidden, &down_rot, lw.down_proj.k, b).map_err(|e| format!("glimmer prefill L{layer_idx} rotate for down residual: {e:?}"))?;
+            gpu.hip.memset(&ffn_out.buf, 0, b * lw.down_proj.m * 4).map_err(|e| format!("glimmer prefill L{layer_idx} zero ffn_out: {e:?}"))?;
+            run_prefill_residual_gemm_key(
+                gpu,
+                hipfire_dispatch::types::KernelKey::GemmHfq4G256Residual,
+                &lw.down_proj.buf,
+                lw.down_proj.gpu_dtype,
+                &down_rot,
+                &ffn_out,
+                lw.down_proj.m,
+                lw.down_proj.k,
+                b,
+            ).map_err(|e| format!("glimmer prefill L{layer_idx} down residual: {e}"))?;
+        } else {
+            prefill_proj_gemm_batched(gpu, &lw.down_proj, &ffn_hidden, &ffn_out, &down_rot, b, "down_proj")?;
+        }
         gpu.rmsnorm_batched(&ffn_out, &lw.post_feedforward_layernorm, &ffn_out, b, dim, post_eps).map_err(|e| format!("glimmer prefill L{layer_idx} post_ffn rmsnorm: {e:?}"))?;
         gpu.hip.memcpy_dtod_at(&x.buf, 0, &residual.buf, 0, b * dim * 4).map_err(|e| format!("glimmer prefill L{layer_idx} reset x (ffn): {e:?}"))?;
         gpu.add_inplace_f32(&x, &ffn_out).map_err(|e| format!("glimmer prefill L{layer_idx} ffn residual add: {e:?}"))?;
-
         if let Some(ci) = cap_index[layer_idx] {
             let host = gpu.download_f32(&x).map_err(|e| format!("glimmer prefill capture L{layer_idx}: {e:?}"))?;
             for row in 0..b {

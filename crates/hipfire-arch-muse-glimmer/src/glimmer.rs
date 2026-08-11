@@ -484,6 +484,11 @@ pub struct GlimmerState {
     /// SECOND (verify's, reusing the block the first had just freed) cost 7.6 ms
     /// for the same weight through the same kernel.
     pub logits_batch: GpuTensor, // [GLIMMER_MAX_SPEC_BLOCK * vocab]
+    /// Batched flash-attention partials for prefill over-window recovery.
+    /// Lazily allocated on first over-window sliding chunk: n_heads *
+    /// ceil(max_seq/128) * (2+head_dim) * 64 floats (~65 MiB at max_seq=8192).
+    /// Factor-64 precedent: crates/hipfire-arch-cohere2moe/src/cohere2moe.rs:496-511.
+    pub prefill_flash_partials: Option<GpuTensor>,
 }
 
 impl GlimmerState {
@@ -603,6 +608,7 @@ impl GlimmerState {
                 GLIMMER_MAX_SPEC_BLOCK * cfg.vocab_size,
                 "logits_batch",
             )?,
+            prefill_flash_partials: None,
         })
     }
 
@@ -631,7 +637,11 @@ impl GlimmerState {
             self.ffn_hidden,
             self.ffn_out,
             self.logits,
+            self.logits_batch,
         ] {
+            let _ = gpu.free_tensor(t);
+        }
+        if let Some(t) = self.prefill_flash_partials {
             let _ = gpu.free_tensor(t);
         }
     }
