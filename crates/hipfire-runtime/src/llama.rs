@@ -5715,7 +5715,7 @@ impl KvCache {
             }
             KvMode::Asym2 | KvMode::Asym3 | KvMode::Asym4 => {
                 let ok_hd = match mode {
-                    KvMode::Asym3 => head_dim == 256 || head_dim == 512,
+                    KvMode::Asym3 => head_dim == 256,
                     _ => head_dim == 128 || head_dim == 256,
                 };
                 if !ok_hd {
@@ -5743,7 +5743,7 @@ impl KvCache {
             KvMode::Fwht2 | KvMode::Fwht3 | KvMode::Fwht4 => match v_mode {
                 VMode::Q8 => {
                     let ok_hd = match mode {
-                        KvMode::Fwht3 => head_dim == 256 || head_dim == 512,
+                        KvMode::Fwht3 => head_dim == 256,
                         _ => head_dim == 128 || head_dim == 256,
                     };
                     if !ok_hd {
@@ -5987,7 +5987,7 @@ impl KvCache {
                 "KV mode Asym3Auto must be resolved before allocation",
             ));
         }
-        if matches!(mode, KvMode::Asym4 | KvMode::Asym3) && dims.head_dim != 256 && dims.head_dim != 512 {
+        if matches!(mode, KvMode::Asym4 | KvMode::Asym3) && dims.head_dim != 256 {
             return Err(hip_bridge::HipError::new(
                 0,
                 &format!(
@@ -8457,6 +8457,25 @@ impl KvCache {
         )
     }
 
+    /// Gemma4 variant of `new_gpu_asym3` (global 512). Delegates to the
+    /// gemma4-capped door so the shared 256-only guard stays unchanged.
+    pub fn new_gpu_asym3_gemma4(
+        gpu: &mut Gpu,
+        n_layers: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+    ) -> HipResult<Self> {
+        Self::new_gpu_asym3_capped_gemma4(
+            gpu,
+            n_layers,
+            n_kv_heads,
+            head_dim,
+            max_seq_len,
+            max_seq_len,
+        )
+    }
+
     /// Filtered variant of [`new_gpu_asym3`]: skips KV allocation for layers
     /// flagged as non-KV (LinearAttention/DeltaNet in hybrid arches). See
     /// [`alloc_k_v_filtered`].
@@ -8487,8 +8506,8 @@ impl KvCache {
         physical_cap: usize,
     ) -> HipResult<Self> {
         assert!(
-            head_dim == 256 || head_dim == 512,
-            "asym3 requires head_dim=256 or 512 (hd=512 added for gemma4)"
+            head_dim == 256,
+            "asym3 currently requires head_dim=256 (Qwen 3.5)"
         );
         assert!(head_dim % 32 == 0);
         assert!(
@@ -8624,6 +8643,52 @@ impl KvCache {
             head_dim == 256,
             "fwht3 currently requires head_dim=256 (Qwen 3.5)"
         );
+        Self::new_gpu_fwht3_capped_filtered_inner(
+            gpu,
+            is_kv_layer,
+            n_kv_heads,
+            head_dim,
+            max_seq_len,
+            physical_cap,
+        )
+    }
+
+    /// Gemma 4 door for the global-attention KV, whose `global_head_dim` is
+    /// 512. Deliberately a SEPARATE entry point: the shared constructor above
+    /// keeps its exact 256-only guard for Qwen 3.5/3.6 and every other
+    /// architecture. Gemma gets its own door rather than a bound widened on
+    /// everyone's behalf — a relaxed shared guard silently admits misconfigured
+    /// geometry for architectures that were previously protected from it.
+    pub fn new_gpu_fwht3_capped_filtered_gemma4(
+        gpu: &mut Gpu,
+        is_kv_layer: &[bool],
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+        physical_cap: usize,
+    ) -> HipResult<Self> {
+        assert!(
+            head_dim == 256 || head_dim == 512,
+            "fwht3 (gemma4) requires head_dim=256 or 512 (got {head_dim})"
+        );
+        Self::new_gpu_fwht3_capped_filtered_inner(
+            gpu,
+            is_kv_layer,
+            n_kv_heads,
+            head_dim,
+            max_seq_len,
+            physical_cap,
+        )
+    }
+
+    fn new_gpu_fwht3_capped_filtered_inner(
+        gpu: &mut Gpu,
+        is_kv_layer: &[bool],
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+        physical_cap: usize,
+    ) -> HipResult<Self> {
         assert!(head_dim % 32 == 0);
         assert!(
             physical_cap > 0 && physical_cap <= max_seq_len,
@@ -8694,9 +8759,42 @@ impl KvCache {
         physical_cap: usize,
     ) -> HipResult<Self> {
         assert!(
-            head_dim == 256 || head_dim == 512,
-            "asym3 requires head_dim=256 or 512 (hd=512 added for gemma4)"
+            head_dim == 256,
+            "asym3 currently requires head_dim=256 (Qwen 3.5)"
         );
+        Self::new_gpu_asym3_capped_inner(
+            gpu, n_layers, n_kv_heads, head_dim, max_seq_len, physical_cap,
+        )
+    }
+
+    /// Gemma 4 door for the global-attention KV, whose `global_head_dim` is
+    /// 512. Separate entry point so the shared constructor above keeps its
+    /// exact 256-only guard for Qwen 3.5/3.6 and every other architecture.
+    pub fn new_gpu_asym3_capped_gemma4(
+        gpu: &mut Gpu,
+        n_layers: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+        physical_cap: usize,
+    ) -> HipResult<Self> {
+        assert!(
+            head_dim == 256 || head_dim == 512,
+            "asym3 (gemma4) requires head_dim=256 or 512 (got {head_dim})"
+        );
+        Self::new_gpu_asym3_capped_inner(
+            gpu, n_layers, n_kv_heads, head_dim, max_seq_len, physical_cap,
+        )
+    }
+
+    fn new_gpu_asym3_capped_inner(
+        gpu: &mut Gpu,
+        n_layers: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+        physical_cap: usize,
+    ) -> HipResult<Self> {
         assert!(head_dim % 32 == 0);
         assert!(
             physical_cap > 0 && physical_cap <= max_seq_len,

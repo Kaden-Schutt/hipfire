@@ -76,6 +76,15 @@ pub struct LoadCtx<'a> {
     pub pp: usize,
     pub spec: SpecLoadCfg,
     pub gpu: &'a mut Gpu,
+    /// Gemma4 EAGLE drafter path (arch 22 `gemma4_unified_assistant`), separate
+    /// from `draft_path` (Qwen DFlash) so a DFlash .hfq can never be routed
+    /// into the EAGLE loader by accident. `None` = no drafter (AR-only).
+    /// Only `Gemma4Carrier` reads this.
+    pub gemma4_drafter_path: Option<&'a str>,
+    /// Gemma4 EAGLE draft_len (verify block = draft_len + 1). Validated at
+    /// load time via `gemma4_eagle_spec_len` (1..=5, default 3). Meaningful
+    /// only when `gemma4_drafter_path` is `Some`.
+    pub gemma4_draft_len: usize,
 }
 
 /// Per-load model-free n-gram speculator settings, resolved by the CLI through

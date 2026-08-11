@@ -25,6 +25,7 @@ use base64::Engine;
 use hipfire_arch_cohere2moe as cohere2moe;
 use hipfire_arch_deepseek4 as deepseek4;
 use hipfire_arch_dots_ocr::dots_ocr;
+use hipfire_arch_gemma4 as gemma4;
 use hipfire_arch_lfm2moe as lfm2moe;
 use hipfire_arch_lfm2moe::batch::Lfm2DecodeBatchState;
 use hipfire_arch_lfm2moe::forward_batch::{
@@ -1311,6 +1312,8 @@ fn resolve_batch_sampling(msg: &serde_json::Value, m: &LoadedModel) -> BatchSamp
     } else if m.arch_id == 10 {
         (1.0_f64, 1.0_f64)
     } else if m.arch_id == 12 {
+        (1.0_f64, 0.95_f64)
+    } else if m.arch_id == 13 {
         (1.0_f64, 0.95_f64)
     } else {
         (0.3_f64, 0.8_f64)
@@ -9985,6 +9988,13 @@ fn fail_closed_reset_target_and_spec(
                 push_reset_err(&mut first_err, "cohere2moe.reset", e);
             }
         }
+        if let Some(ModelState::Gemma4(bundle)) = m.state.as_mut() {
+            // Gemma4State::reset is cursor-only (n_tokens = 0); the
+            // captured decode hipGraph stays valid across resets (position
+            // is re-staged via pos_host on every replay and attention
+            // geometry is sized for max_seq).
+            bundle.state.reset();
+        }
         if let Some(ad) = m.kv_adaptive.as_mut() {
             if let Some(ModelState::Qwen35(b)) = m.state.as_mut() {
                 ad.reset_with_cache(gpu, &mut b.kv_cache);
@@ -10083,6 +10093,7 @@ fn reset_core_arch_key(arch_id: u32) -> &'static str {
         10 => "minimax",
         11 => "lfm2moe",
         12 => "cohere2moe",
+        13 => "gemma4",
         _ => "unknown",
     }
 }
@@ -13598,6 +13609,7 @@ fn main() {
                             10 => "minimax_m2",
                             11 => "lfm2moe",
                             12 => "north_mini_code",
+                            13 => "gemma4",
                             _ => "qwen3",
                         };
                         let drafter = m.speculator.as_ref().map(|speculator| speculator.name());
@@ -13636,6 +13648,9 @@ fn main() {
                                 b.config.num_hidden_layers,
                                 b.config.vocab_size,
                             ),
+                            Some(ModelState::Gemma4(b)) => {
+                                (b.config.dim, b.config.n_layers, b.config.vocab_size)
+                            },
                             _ => {
                                 if let Some(ref c) = m.dots_ocr_config {
                                     (
@@ -13955,6 +13970,11 @@ fn main() {
                         };
                         batch_scheduler = staged_batch_scheduler;
                         // `cache_capable` is the daemon's prompt-cache source of truth.
+                        // arch_id 13 (gemma4) is intentionally ABSENT: generate_gemma4 has
+                        // no LCP prefix-cache block and always cold-prefills the full
+                        // Jinja-rendered prompt. Enabling the cache would corrupt KV
+                        // slot offsets after turn 1 (stale prefix reuse). Wire when
+                        // generate_gemma4 gains an LCP block matching other archs.
                         let cache_capable = matches!(m.arch_id, 5 | 6 | 9 | 10 | 12);
                         let retry_reset_eligible = model_retry_reset_eligible(m.arch_id);
                         let continuous_batch_capable = staged_batch_capable;
@@ -14357,6 +14377,11 @@ fn main() {
                     // Cohere2-MoE / North-Mini-Code: Cohere-style agentic
                     // markers are sampled best with the model-card nucleus
                     // defaults.
+                    (1.0_f64, 0.95_f64)
+                } else if m.arch_id == 13 {
+                    // Gemma4: Gemma family model cards recommend
+                    // temperature=1.0, top_p=0.95, top_k=64. The daemon
+                    // sampler is temp + top_p (top-K is fixed candidate gather).
                     (1.0_f64, 0.95_f64)
                 } else {
                     (0.3_f64, 0.8_f64)
@@ -15313,6 +15338,7 @@ fn main() {
                         10 => "minimax_m2",
                         11 => "lfm2moe",
                         12 => "north_mini_code",
+                        13 => "gemma4",
                         _ => "qwen3",
                     })
                     .unwrap_or("none");
@@ -15455,6 +15481,9 @@ fn main() {
                 }
                 if let Some(b) = m.cohere2moe_mut() {
                     let _ = b.state.reset(&mut gpu);
+                }
+                if let Some(ModelState::Gemma4(bundle)) = m.state.as_mut() {
+                    bundle.state.reset();
                 }
                 if let Some(ModelState::Deepseek4(b)) = m.state.as_mut() {
                     b.state.reset();
@@ -15616,6 +15645,27 @@ fn main() {
                         }
                     }
                     ok
+                } else if m.arch_id == 13 {
+                    // Gemma4 warm-pass: per-token decode_step over the
+                    // synthetic prompt. Uses eager dense path (no lowered).
+                    let Some(ModelState::Gemma4(bundle)) = m.state.as_mut() else {
+                        unreachable!("arch_id=13 requires gemma4 bundle")
+                    };
+                    let config = &bundle.config;
+                    let weights = &bundle.weights;
+                    let state = &mut bundle.state;
+                    let mut ok = true;
+                    for (i, &tok) in synthetic.iter().enumerate() {
+                        if gemma4::forward::decode_step(
+                            config, weights, state, &mut gpu, tok, i as u32,
+                        )
+                        .is_err()
+                        {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    ok
                 } else if m.arch_id == 8 {
                     // dots.ocr: Qwen2 text decoder via qwen2_state + dots_ocr fields.
                     let state = m.qwen2_state.as_mut().unwrap();
@@ -15671,6 +15721,9 @@ fn main() {
                 // reset its cursor (no gpu) for a cold prefill on the next request.
                 if let Some(b) = m.minimax_mut() {
                     b.state.reset();
+                }
+                if let Some(ModelState::Gemma4(bundle)) = m.state.as_mut() {
+                    bundle.state.reset();
                 }
                 if let Some(ModelState::Deepseek4(b)) = m.state.as_mut() {
                     b.state.reset();
@@ -23426,6 +23479,55 @@ fn generate(
         return;
     }
 
+    // arch_id=13 (Gemma 4 dense): eager AR path. Same shape as the
+    // lfm2moe/minimax short-circuits: bypass the DFlash/spec/sampler-budget
+    // scaffolding below (all refused at load for arch 13). Without this arm
+    // arch 13 falls through to the Qwen AR arm — the bug this fixes.
+    if m.arch_id == 13 {
+        // The loader publishes one of two mutually-exclusive Gemma4 states:
+        // eager dense (ModelState::Gemma4) and lowered/MoE
+        // (ModelState::Gemma4Lowered). The generate body is eager-only, so a
+        // lowered load must fail loudly here rather than silently run eager
+        // against lowered weights.
+        if matches!(m.state.as_ref(), Some(ModelState::Gemma4Lowered(_))) {
+            emit_error_with_id(
+                stdout,
+                id,
+                "gemma4 lowered/MoE generate not yet wired on this build (eager dense only) —                  reload without batched/WMMA prefill opt-in or the MoE variant",
+            );
+            return;
+        }
+        let _ = (
+            budget_alert_at_tok,
+            budget_alert_text,
+            assistant_prefix,
+            pflash_state,
+            pflash_cfg,
+            think_mode,
+            user_explicit_sampling,
+            top_k,
+            min_p,
+            cactus_delta,
+        );
+        let _ = (repeat_penalty, repeat_window, presence_penalty, frequency_penalty);
+        let _ = stop;
+        generate_gemma4(
+            m,
+            gpu,
+            stdout,
+            id,
+            prompt,
+            system_prompt,
+            temp,
+            top_p,
+            max_tokens,
+            max_think_tokens,
+            tools,
+            messages_history,
+        );
+        return;
+    }
+
     // hunt3 M-E: seed the process-global CPU sampler RNG with this request's
     // fixed seed so the grammar/CPU-fallback sample stream is deterministic per
     // request and does not carry RNG state across requests. Matches the u32 the
@@ -28297,6 +28399,298 @@ fn generate_deepseek4_heterogeneous(
     eprintln!(
         "[req {id}] drafter=ar-heterogeneous tau=1.00 tok/s={tok_s:.1} decode ({generated} tok)"
     );
+}
+
+
+/// Gemma 4 dense text (arch_id=13) eager AR path.
+///
+/// Ported from `origin/feat/gemma4-union` and rehomed onto the beta
+/// `ModelState::Gemma4(bundle)` design: reads `bundle.config` /
+/// `bundle.weights` / `bundle.state` / `bundle.eos_tok` instead of the PR's
+/// `m.gemma4_*` Option fields. Same shape as `generate_lfm2moe` (prefill loop,
+/// decode loop, JSONL `token` / `done` events) with four gemma4-specifics:
+///
+///   1. Prompt build goes through the model's chat template (Jinja), rendered
+///      with an EXPLICIT `bos_token: Some("<bos>")` — gemma4's tokenizer
+///      decodes `<bos>` to id 2 but the raw-encode fallback doesn't prepend
+///      it, so the BOS guard below handles the fallback path.
+///   2. Prefill is per-token eager `gemma4::forward::decode_step`; decode is
+///      `gemma4::forward::decode_step_with_graph` (hipGraph, default ON).
+///   3. Sampling is host-side from the returned logits vector via
+///      `deepseek4::sampling::sample_token`.
+///   4. Stop set: `<eos>` (config.eos_token, id 1) UNION `bundle.eos_tok`
+///      (loader-resolved `<end_of_turn>` / `<turn|>`) UNION documented 106 —
+///      the HF `eos_token_id` list is `[1, 106]`; parsing as a scalar drops
+///      106 and decode loops `<turn|>` forever.
+///
+/// Prompt-cache: arch 13 is intentionally ABSENT from the `cache_capable`
+/// allowlist (see load handler) — this path has no LCP prefix-cache block and
+/// always cold-prefills the full Jinja render. Enabling cache would corrupt
+/// KV slot offsets after turn 1.
+///
+/// EAGLE / lowered-MoE variants are not wired on beta yet: the loader bundle
+/// only carries the eager triple, so those paths are routed to a loud error
+/// rather than silently falling through.
+#[allow(clippy::too_many_arguments)]
+fn generate_gemma4(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    prompt: &str,
+    system_prompt: Option<&str>,
+    temp: f32,
+    top_p: f32,
+    max_tokens: usize,
+    max_think_tokens: usize,
+    tools: Option<&[serde_json::Value]>,
+    messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
+) {
+    // v1 is non-thinking; the think budget only gates thinking-capable paths.
+    let _ = max_think_tokens;
+
+    if m.tokenizer.is_none() {
+        emit_error_with_id(stdout, id, "tokenizer not loaded");
+        return;
+    }
+    let Some(ModelState::Gemma4(bundle)) = m.state.as_mut() else {
+        // The loader currently only builds the eager dense bundle. If a
+        // lowered/MoE or EAGLE variant lands before this path is extended,
+        // fail loudly instead of silently falling through to the Qwen arm.
+        emit_error_with_id(
+            stdout,
+            id,
+            "gemma4 bundle missing on arch_id=13 generate (eager dense only;              EAGLE/lowered not yet wired)",
+        );
+        return;
+    };
+
+    let bos_tok = bundle.config.bos_token;
+    let cfg_eos_tok = bundle.config.eos_token;
+
+    // ── Prompt build (same two-path branch as the lfm2moe AR path) ──
+    let prompt_ids: Vec<u32> = {
+        let tokenizer = m.tokenizer.as_ref().unwrap();
+        // Jinja default-ON: render through the model's chat template; opt out
+        // with HIPFIRE_JINJA_CHAT=0. Arch 13 always resolves a template
+        // (embedded or bundled), so the fallback below is render-failure /
+        // opt-out only.
+        let jinja_enabled =
+            std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
+        let try_jinja = jinja_enabled && m.chat_template.is_some();
+        let mut ids: Vec<u32> = if try_jinja {
+            let template = m.chat_template.as_ref().unwrap();
+            let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
+                tokenizer,
+                template,
+                system: system_prompt,
+                user: prompt,
+                enable_thinking: false,
+                bos_token: Some("<bos>"),
+            };
+            let render_result = if tools.is_some() || messages_history.is_some() {
+                let synthesized: Vec<hipfire_runtime::prompt_frame::Message>;
+                let messages_slice: &[hipfire_runtime::prompt_frame::Message] =
+                    match messages_history {
+                        Some(h) => h,
+                        None => {
+                            let mut v = Vec::new();
+                            if let Some(sys) = system_prompt {
+                                v.push(hipfire_runtime::prompt_frame::Message {
+                                    role: hipfire_runtime::prompt_frame::Role::System,
+                                    content: sys.to_string(),
+                                    tool_calls: Vec::new(),
+                                    tool_call_id: None,
+                                    tool_plan: String::new(),
+                                });
+                            }
+                            v.push(hipfire_runtime::prompt_frame::Message {
+                                role: hipfire_runtime::prompt_frame::Role::User,
+                                content: prompt.to_string(),
+                                tool_calls: Vec::new(),
+                                tool_call_id: None,
+                                tool_plan: String::new(),
+                            });
+                            synthesized = v;
+                            &synthesized
+                        }
+                    };
+                frame.render_messages(messages_slice, tools, None)
+            } else {
+                frame.render()
+            };
+            match render_result {
+                Ok(rendered) => tokenizer.encode(&rendered),
+                Err(e) => {
+                    eprintln!(
+                        "[daemon] jinja render failed in gemma4 path ({e}) —                          falling back to BOS + raw prompt"
+                    );
+                    // Raw fallback (NOT Plain ChatML — gemma4 never trained
+                    // on <|im_start|> framing): BOS + raw user prompt, same
+                    // shape as the infer_gemma4 example. Degraded (no
+                    // instruct framing) but coherent.
+                    tokenizer.encode(prompt)
+                }
+            }
+        } else {
+            tokenizer.encode(prompt)
+        };
+        // BOS guard: the jinja render emits `{{ bos_token }}` itself
+        // ("<bos>" → single id 2 via special-token segmentation); the raw
+        // fallback doesn't. Prepend only when absent so it is never doubled.
+        if ids.first() != Some(&bos_tok) {
+            ids.insert(0, bos_tok);
+        }
+        ids
+    };
+
+    if prompt_ids.is_empty() {
+        emit_error_with_id(stdout, id, "empty prompt after tokenize");
+        return;
+    }
+
+    // Stop set (see doc comment item 4). `bundle.eos_tok` already resolved
+    // `<end_of_turn>` / `<turn|>` at load; union with config.eos_token
+    // (`<eos>`, id 1) and the documented 106 for robustness across exports.
+    let stop_set: Vec<u32> = {
+        let mut s = vec![cfg_eos_tok, bundle.eos_tok];
+        if !s.contains(&106) {
+            s.push(106);
+        }
+        s.dedup();
+        s
+    };
+
+    // Capacity guard. No eviction on arch_id=13 — reset the KV cursors when
+    // the requested run would overflow the physical cache.
+    let overflow = {
+        bundle.state.n_tokens + prompt_ids.len() + max_tokens > bundle.state.max_seq
+    };
+    if overflow {
+        let (n, cap) = (bundle.state.n_tokens, bundle.state.max_seq);
+        eprintln!("[daemon] arch_id=13 context full ({n}/{cap}) — resetting Gemma4State");
+        bundle.state.reset();
+        m.seq_pos = 0;
+        m.conversation_tokens.clear();
+    }
+    // Hard refusal: even from a cold cache the prompt alone must fit (KV
+    // writes at pos >= max_seq would be out of bounds).
+    let cache_cap = bundle.state.max_seq;
+    if prompt_ids.len() >= cache_cap {
+        emit_error_with_id(
+            stdout,
+            id,
+            format!(
+                "gemma4 prompt is {} tokens but max_seq is {cache_cap}",
+                prompt_ids.len()
+            ),
+        );
+        return;
+    }
+
+    let t0 = Instant::now();
+
+    // ── Prefill: eager decode_step per prompt token. The LAST decode_step's
+    // logits are the predictions for the first generated token. ──
+    let mut last_logits: Vec<f32> = Vec::new();
+    {
+        let mut position = bundle.state.n_tokens as u32;
+        for &tok in &prompt_ids {
+            match gemma4::forward::decode_step(
+                &bundle.config,
+                &bundle.weights,
+                &mut bundle.state,
+                gpu,
+                tok,
+                position,
+            ) {
+                Ok(logits) => last_logits = logits,
+                Err(e) => {
+                    emit_error_with_id(stdout, id, format!("gemma4 prefill failed: {e:?}"));
+                    return;
+                }
+            }
+            position += 1;
+        }
+    }
+    for &tok in &prompt_ids {
+        m.conversation_tokens.push(tok);
+    }
+    let prefill_ms = t0.elapsed().as_millis();
+
+    // ── Decode loop. Sample host-side from the running logits vector. ──
+    let seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0x9E3779B97F4A7C15);
+    let mut rng = deepseek4::sampling::Xorshift::new(seed);
+
+    let mut generated_count: usize = 0;
+    let decode_t0 = Instant::now();
+    loop {
+        if generated_count >= max_tokens {
+            break;
+        }
+        let next_tok =
+            deepseek4::sampling::sample_token(&last_logits, temp, 0, top_p, &mut rng);
+        if stop_set.contains(&next_tok) {
+            break;
+        }
+
+        let frag = {
+            let tokenizer = m.tokenizer.as_ref().unwrap();
+            tokenizer.decode(&[next_tok])
+        };
+        let envelope = serde_json::json!({
+            "type": "token",
+            "id": id,
+            "text": frag,
+        });
+        let _ = writeln!(stdout, "{}", envelope);
+        let _ = stdout.flush();
+        m.conversation_tokens.push(next_tok);
+        generated_count += 1;
+
+        // KV-capacity guard: the next forward writes KV at slot n_tokens;
+        // forwarding at pos >= max_seq would write out of bounds. Stop
+        // cleanly here — the just-emitted token is still valid.
+        if bundle.state.n_tokens >= cache_cap {
+            break;
+        }
+
+        let position = bundle.state.n_tokens as u32;
+        let step = gemma4::forward::decode_step_with_graph(
+            &bundle.config,
+            &bundle.weights,
+            &mut bundle.state,
+            gpu,
+            next_tok,
+            position,
+        );
+        match step {
+            Ok(logits) => last_logits = logits,
+            Err(e) => {
+                emit_error_with_id(stdout, id, format!("gemma4 decode failed: {e:?}"));
+                return;
+            }
+        }
+    }
+
+    m.seq_pos = bundle.state.n_tokens;
+
+    let decode_ms = decode_t0.elapsed().as_millis().max(1);
+    let total_ms = t0.elapsed().as_millis().max(1);
+    let tok_s = if generated_count > 0 {
+        (generated_count as f64 * 1000.0) / decode_ms as f64
+    } else {
+        0.0
+    };
+    let _ = writeln!(
+        stdout,
+        r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.2},"prefill_ms":{},"total_ms":{}}}"#,
+        id, generated_count, tok_s, prefill_ms, total_ms,
+    );
+    let _ = stdout.flush();
 }
 
 fn generate_lfm2moe(

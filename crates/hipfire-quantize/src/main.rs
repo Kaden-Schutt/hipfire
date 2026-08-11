@@ -5036,19 +5036,40 @@ fn kmap_resolve_mode(name: &str, n_layers: usize, is_moe: bool, kmap_mode: u8) -
         return QuantLevel::Promote6;
     }
 
-    // Mode 2 (typed): promote ffn_down, attn_v, and edge-layer FFN everywhere.
-    // attn q/k/o are deliberately excluded — dense attn promotion regresses PPL
-    // +3.1% on 27B (see ppl_kmap_20260508.md). Edge layers promote FFN + v_proj
-    // only; attn q/k/o stay at Base even for edge layers.
-    // This mode is the default for gemma4 (arch_id 13).
+    // Mode 2 (typed): promote ffn_down and attn_v in all layers.
+    // UNCHANGED semantics — every model that already ships with `--kmap-mode
+    // typed` must keep producing byte-identical output. Gemma 4's variant of
+    // this rule lives in mode 3 below rather than mutating this one.
     if kmap_mode == 2 {
         let is_down = name.contains("down_proj") || name.contains("ffn_down");
         let is_v = name.contains("v_proj") || name.contains("attn_v");
-        // Unconditionally promote down_proj and v_proj in all layers.
         if is_down || is_v {
             return QuantLevel::Promote6;
         }
-        // Edge layers: promote FFN tensors only — NOT attn q/k/o.
+        if n_layers > 0 {
+            if let Some(idx) = parse_layer_idx(name) {
+                if idx < 2 || idx >= n_layers.saturating_sub(2) {
+                    return QuantLevel::Promote6;
+                }
+            }
+        }
+        return QuantLevel::Base;
+    }
+
+    // Mode 3 (typed-gemma4): mode 2, except edge layers promote FFN + v_proj
+    // only and leave attn q/k/o at Base — dense attn promotion regresses PPL
+    // +3.1% on 27B (see ppl_kmap_20260508.md).
+    //
+    // This is a SEPARATE mode rather than a tweak to mode 2 so that no model
+    // already quantized with `--kmap-mode typed` changes bytes. Selected
+    // automatically for gemma4 (arch_id 13); reachable explicitly as
+    // `--kmap-mode typed-gemma4`.
+    if kmap_mode == 3 {
+        let is_down = name.contains("down_proj") || name.contains("ffn_down");
+        let is_v = name.contains("v_proj") || name.contains("attn_v");
+        if is_down || is_v {
+            return QuantLevel::Promote6;
+        }
         if n_layers > 0 {
             if let Some(idx) = parse_layer_idx(name) {
                 if idx < 2 || idx >= n_layers.saturating_sub(2) {
@@ -8306,6 +8327,7 @@ fn main() {
         "full" | "0" => 0,
         "alternating" | "alt" | "1" => 1,
         "typed" | "2" => 2,
+        "typed-gemma4" | "3" => 3,
         _ => {
             eprintln!(
                 "warning: unknown --kmap-mode '{}', using alternating",
@@ -8598,12 +8620,12 @@ fn main() {
     // tied + scaled by √3840 making AWQ scale saliency meaningless there.
     let is_gemma4_family = arch_id == 13 || arch_id == 22;
     let is_moe_like = is_moe || is_deepseek4 || is_lfm2moe || is_minimax || is_cohere2moe || is_gemma4;
-    // Gemma4 (arch_id 13) defaults to kmap_mode=2 (typed): promote down_proj,
+    // Gemma4 (arch_id 13) defaults to kmap_mode=3 (typed-gemma4): promote down_proj,
     // v_proj, and edge-layer non-attn-qko tensors. Attn q/k/o are excluded even
     // in edge layers (dense attn promotion regresses PPL +3.1% on 27B).
     // The explicit --kmap-mode flag overrides this default.
     if is_gemma4 && args.kmap_mode == "alternating" {
-        kmap_mode = 2;
+        kmap_mode = 3;
     }
     // Q8 "router" — a misnomer: `is_q8_tensor` covers the whole FIXED tier
     // (attention q/k/v/o, linear_attn projections, conv1d, lm_head, embed, and

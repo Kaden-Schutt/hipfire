@@ -747,7 +747,7 @@ impl Gemma4State {
 
         // Full layers: fwht3 hd=512 (K = FWHT-512 3-bit, V = Q8_0).
         let all_true: Vec<bool> = vec![true; cfg.n_full_layers()];
-        let kv_full = KvCache::new_gpu_fwht3_capped_filtered(
+        let kv_full = KvCache::new_gpu_fwht3_capped_filtered_gemma4(
             gpu,
             &all_true,
             cfg.full_n_kv_heads,

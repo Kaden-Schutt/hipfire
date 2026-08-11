@@ -168,6 +168,8 @@ fn main() -> Result<(), String> {
         pp: 1,
         spec: SpecLoadCfg::default(),
         gpu: &mut gpu,
+        gemma4_drafter_path: None,
+        gemma4_draft_len: 3,
     };
     let mut bundle = load_llama_bundle(src, &mut ctx)?;
 

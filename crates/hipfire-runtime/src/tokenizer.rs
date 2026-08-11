@@ -301,11 +301,20 @@ fn sp_dummy_prefix_from_hf_json(tok: &serde_json::Value) -> bool {
             _ => false,
         }
     }
-    tok.get("normalizer").map(normalizer_prepends).unwrap_or(false)
-        || tok
-            .get("pre_tokenizer")
-            .map(pretokenizer_prepends)
-            .unwrap_or(false)
+    let normalizer = tok.get("normalizer").filter(|v| !v.is_null());
+    let pre_tokenizer = tok.get("pre_tokenizer").filter(|v| !v.is_null());
+    // A tokenizer.json that declares NEITHER stage tells us nothing, and the
+    // historic behaviour for those was an unconditional dummy prefix (the
+    // LLaMA convention). Preserve that exactly — changing the default here
+    // would silently re-tokenize every already-supported SentencePiece model.
+    // Gemma 4 is not affected by this fallback: it DOES declare a normalizer
+    // (a bare `Replace(" "→"▁")`), so it reaches the derived answer below and
+    // correctly resolves to false.
+    if normalizer.is_none() && pre_tokenizer.is_none() {
+        return true;
+    }
+    normalizer.map(normalizer_prepends).unwrap_or(false)
+        || pre_tokenizer.map(pretokenizer_prepends).unwrap_or(false)
 }
 
 
@@ -521,12 +530,24 @@ impl Tokenizer {
         };
 
         // GPT-2 byte-level BPE uses Ġ-prefixed space tokens (Qwen); SentencePiece
-        // BPE uses ▁ (Gemma, LLaMA). A single stray "Ġ" token is NOT enough to
-        // call it GPT-2 — decide by which space-marker DOMINATES (Gemma has 1 Ġ
-        // token but ~137k ▁ tokens, and must take the SP path or byte-coverage fails).
+        // BPE uses ▁ (Gemma, LLaMA).
+        //
+        // The historic test was `contains("Ġthe") || contains("Ġ")`. Gemma 4
+        // carries exactly ONE stray Ġ token against ~137k ▁ tokens, so the bare
+        // `contains("Ġ")` clause misfired and sent it down the GPT-2 path, where
+        // byte-coverage construction fails.
+        //
+        // The added `n_gpt2 > n_sp` guard is deliberately conjunctive with the
+        // original Ġ clause rather than replacing it, so this can only change
+        // the verdict for a vocabulary in which ▁ strictly OUTNUMBERS Ġ. Such a
+        // vocabulary is SentencePiece by construction and was already being
+        // misclassified; every vocabulary the old test got right keeps its
+        // previous answer. Real GPT-2 BPE vocabularies match "Ġthe" and never
+        // reach the second clause at all.
         let n_gpt2 = token_to_id.keys().filter(|t| t.starts_with('Ġ')).count();
         let n_sp = token_to_id.keys().filter(|t| t.starts_with('▁')).count();
-        let is_gpt2_bpe = token_to_id.contains_key("Ġthe") || n_gpt2 > n_sp;
+        let is_gpt2_bpe =
+            token_to_id.contains_key("Ġthe") || (token_to_id.contains_key("Ġ") && n_gpt2 > n_sp);
         // SP dummy prefix is a property of the model's normalizer /
         // pre_tokenizer config, NOT of SentencePiece itself — read it from
         // the tokenizer.json instead of assuming the LLaMA convention.
@@ -2553,8 +2574,19 @@ mod sp_dummy_prefix_tests {
             "normalizer": {"type": "Replace", "pattern": {"String": " "}, "content": "▁"},
             "pre_tokenizer": {"type": "Split", "pattern": {"String": " "}, "behavior": "MergedWithPrevious"}
         })));
-        assert!(!sp_dummy_prefix_from_hf_json(&json!({})));
-        assert!(!sp_dummy_prefix_from_hf_json(&json!({"normalizer": null, "pre_tokenizer": null})));
+        // Empty tokenizer.json declares neither stage — same class as the
+        // null/null case below: historic LLaMA default (prepend).
+        assert!(sp_dummy_prefix_from_hf_json(&json!({})));
+        // Neither stage declared -> historic LLaMA default (prepend). Changing
+        // this to false would silently re-tokenize every existing SP model.
+        assert!(sp_dummy_prefix_from_hf_json(
+            &json!({"normalizer": null, "pre_tokenizer": null})
+        ));
+        // Gemma 4 shape: a normalizer IS declared but does not prepend.
+        assert!(!sp_dummy_prefix_from_hf_json(&json!({
+            "normalizer": {"type": "Replace"},
+            "pre_tokenizer": null
+        })));
         assert!(sp_dummy_prefix_from_hf_json(&json!({
             "normalizer": {"type": "Prepend", "prepend": "▁"}
         })));
