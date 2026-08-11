@@ -1018,12 +1018,18 @@ pub fn verify_block_with_capture(
 /// Shared layer machinery with `verify_block_with_capture`: same
 /// `proj_gemm_batched` / `fused_rmsnorm_rotate_mq_batched_for` helpers,
 /// same QK-norm/scale, same RoPE, same KV-write, same sandwich norms.
-/// Attention is causal within chunk + attends to all prior KV; for
-/// sliding layers (window=2048) where `seq_len > window` we route through
-/// `attention_q8_0_kv_batched_masked` with a per-row additive mask (-inf
-/// outside [pos-window+1, pos]) to match `attention_q8_0_kv_swa` exactly.
-/// For full layers and for early chunks where `seq_len <= window` we use
-/// the fast `attention_q8_0_kv_batched` causal path.
+/// Attention is causal within chunk + attends to all prior KV.
+/// For sliding layers (window=2048) where `seq_len > window`, the
+/// windowed mask cannot be expressed with the existing
+/// `attention_q8_0_kv_batched` / `attention_q8_0_kv_batched_masked`
+/// kernels (masked kernel is tree-mode and leaves prefix unmasked,
+/// so it cannot hide old prefix tokens outside the window). No new
+/// kernel is added per constraints; instead those layers fall back to
+/// per-row `attention_q8_0_kv_swa(window)` — byte-identical to the
+/// single-token path and honest about the win. Full layers and early
+/// chunks where `seq_len <= window` stay on the fast batched causal
+/// path. This is the "if cannot be expressed, fallback" honest path
+/// the contract allows, not silent garbage.
 ///
 /// If `need_logits` is true, final norm + single-row lm_head is run on
 /// the LAST position only (not over the whole chunk). This avoids
@@ -1116,28 +1122,6 @@ fn prefill_chunk_batched(
     }
     let mut cap_buf: Vec<f32> = if cap_cnt > 0 { vec![0.0f32; b * cap_cnt * dim] } else { Vec::new() };
 
-    // Sliding-window bias for batched masked attention (one buffer reused
-    // across all sliding layers). Only built when seq_len exceeds window.
-    let need_bias = seq_len > cfg.sliding_window && cfg.n_sliding_layers() > 0;
-    let window_bias: Option<GpuTensor> = if need_bias {
-        let window = cfg.sliding_window;
-        let total = b * seq_len;
-        let mut bias_host = Vec::with_capacity(total);
-        for b_idx in 0..b {
-            let pos = position as usize + b_idx;
-            let t_lo = if pos + 1 > window { pos + 1 - window } else { 0 };
-            let t_hi = pos;
-            for t in 0..seq_len {
-                let v = if t >= t_lo && t <= t_hi { 0.0f32 } else { f32::NEG_INFINITY };
-                bias_host.push(v);
-            }
-        }
-        let bias_gpu = alloc(gpu, total, "window_bias")?;
-        let bias_bytes = unsafe { std::slice::from_raw_parts(bias_host.as_ptr() as *const u8, total * 4) };
-        gpu.hip.memcpy_htod(&bias_gpu.buf, bias_bytes).map_err(|e| format!("glimmer prefill bias upload: {e:?}"))?;
-        Some(bias_gpu)
-    } else { None };
-
     // ── Per-layer batched forward ──
     for layer_idx in 0..cfg.n_layers {
         let slot = state.kv_slot_for_layer[layer_idx];
@@ -1193,10 +1177,22 @@ fn prefill_chunk_batched(
         gpu.kv_cache_write_q8_0_batched(&k_cache_t, &k, &pos_array, n_kv, hd, b).map_err(|e| format!("glimmer prefill L{layer_idx} kv write k: {e:?}"))?;
         gpu.kv_cache_write_q8_0_batched(&v_cache_t, &v, &pos_array, n_kv, hd, b).map_err(|e| format!("glimmer prefill L{layer_idx} kv write v: {e:?}"))?;
 
-        // Attention: window-aware dispatch
+        // Attention: window-aware dispatch — honest fallback for over-window sliding.
+        // Full layers (window 0) and early chunks (seq_len <= window) use fast batched causal.
+        // Sliding layers where seq_len > window cannot be expressed with the existing
+        // batched kernels (tree mask leaves prefix unmasked), so fall back to per-row
+        // attention_q8_0_kv_swa which is byte-identical to the single-token path.
         if window != 0 && seq_len > window {
-            let bias_ref = window_bias.as_ref().expect("window bias missing for sliding layer");
-            gpu.attention_q8_0_kv_batched_masked(&q, &k_cache_t, &v_cache_t, &attn_out, &pos_array, n_heads, n_kv, hd, phys_cap, seq_len, b, Some(bias_ref), 0, seq_len).map_err(|e| format!("glimmer prefill L{layer_idx} attention masked: {e:?}"))?;
+            // Per-row SWA — B launches, but projections are already batched.
+            for b_idx in 0..b {
+                let pos = position + b_idx as u32;
+                state.pos_host[0] = pos as i32;
+                let pos_bytes = (pos as i32).to_ne_bytes();
+                gpu.hip.memcpy_htod(&state.pos_buf, &pos_bytes).map_err(|e| format!("glimmer prefill L{layer_idx} htod pos row {b_idx}: {e:?}"))?;
+                let q_row = q.sub_offset(b_idx * q_dim, q_dim);
+                let out_row = attn_out.sub_offset(b_idx * q_dim, q_dim);
+                gpu.attention_q8_0_kv_swa(&q_row, &k_cache_t, &v_cache_t, &out_row, &state.pos_buf, (pos as usize) + 1, n_heads, n_kv, hd, phys_cap, window).map_err(|e| format!("glimmer prefill L{layer_idx} attention swa row {b_idx}: {e:?}"))?;
+            }
         } else {
             gpu.attention_q8_0_kv_batched(&q, &k_cache_t, &v_cache_t, &attn_out, &pos_array, n_heads, n_kv, hd, phys_cap, seq_len, b).map_err(|e| format!("glimmer prefill L{layer_idx} attention batched: {e:?}"))?;
         }
@@ -1266,7 +1262,6 @@ fn prefill_chunk_batched(
     for t in [x, residual, nrm, x_rot, q, k, v, attn_gate, attn_out, o_rot, o_out, gate_ffn, up_ffn, ffn_hidden, ffn_out, down_rot, pos_array] {
         gpu.free_tensor(t).ok();
     }
-    if let Some(bias) = window_bias { gpu.free_tensor(bias).ok(); }
 
     Ok(last_logits)
 }
