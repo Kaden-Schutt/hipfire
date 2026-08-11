@@ -11288,6 +11288,22 @@ fn main() {
                     if k_dim % 256 == 0 {
                         let signs1 = gen_fwht_signs(42, 256);
                         let signs2 = gen_fwht_signs(1042, 256);
+                        // ── Gemma4 (arch 13/22): embed/lm_head MUST NOT reach AWQ ──
+                        // They are always routed to Q8 by the K-map before this
+                        // branch, so they cannot arrive here. Assert the invariant
+                        // rather than leave it implicit: Gemma4's tied embed/lm_head
+                        // carries an implicit sqrt(d_model) scaling with no RMSNorm
+                        // anchor on the embedding dimension, which makes AWQ's
+                        // imatrix-saliency ratio meaningless and the per-channel
+                        // pre-scale actively harmful.
+                        debug_assert!(
+                            !(is_gemma4_family
+                                && (name.contains("embed_tokens") || name.contains("lm_head"))),
+                            "gemma4 embed/lm_head reached the MQ4 AWQ path — the kmap Q8 \
+                             guard should have prevented this (arch {} tensor {})",
+                            arch_id,
+                            name
+                        );
                         match override_fmt {
                             GgufFormat::Mq4 => {
                                 // Inline AWQ + MQ4 dance (mirrors the Base MQ4 arm).
