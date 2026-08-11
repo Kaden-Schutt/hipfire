@@ -783,44 +783,32 @@ impl Engine {
         rx: &mpsc::Receiver<Value>,
         staged_commit_ready: &Value,
     ) -> Result<Value> {
-        loop {
-            let value = match self.recv_control(rx) {
-                Ok(v) => v,
-                Err(err) => {
-                    return Err(err);
-                }
-            };
-            if let Some(err) = reject_stale_lifecycle_event(&value, request_id, Some(attempt_id)) {
-                return Err(err);
-            }
-            match value.get("type").and_then(Value::as_str) {
-                Some("done") => {
-                    let finish = value.get("finish_reason").and_then(Value::as_str);
-                    if finish == Some("aborted") {
-                        return Err(ClientError::Protocol(
-                            "committed drain rejected aborted done after commit".into(),
-                        ));
-                    }
-                    if let Some(err) = committed_done_payload_mismatch(staged_commit_ready, &value)
-                    {
-                        return Err(err);
-                    }
-                    return Ok(value);
-                }
-                Some("error") => {
-                    return Err(daemon_error_from_value(&value));
-                }
-                Some(other) => {
-                    return Err(ClientError::Protocol(format!(
-                        "committed drain unexpected event type={other}"
-                    )));
-                }
-                None => {
+        // Reads exactly one control event and dispatches on it; every arm is
+        // terminal, so this is deliberately not a loop.
+        let value = self.recv_control(rx)?;
+        if let Some(err) = reject_stale_lifecycle_event(&value, request_id, Some(attempt_id)) {
+            return Err(err);
+        }
+        match value.get("type").and_then(Value::as_str) {
+            Some("done") => {
+                let finish = value.get("finish_reason").and_then(Value::as_str);
+                if finish == Some("aborted") {
                     return Err(ClientError::Protocol(
-                        "committed drain event missing type".into(),
+                        "committed drain rejected aborted done after commit".into(),
                     ));
                 }
+                if let Some(err) = committed_done_payload_mismatch(staged_commit_ready, &value) {
+                    return Err(err);
+                }
+                Ok(value)
             }
+            Some("error") => Err(daemon_error_from_value(&value)),
+            Some(other) => Err(ClientError::Protocol(format!(
+                "committed drain unexpected event type={other}"
+            ))),
+            None => Err(ClientError::Protocol(
+                "committed drain event missing type".into(),
+            )),
         }
     }
 
