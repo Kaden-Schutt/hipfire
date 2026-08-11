@@ -2537,4 +2537,200 @@ mod tests {
             pick, vocab[pick]
         );
     }
+
+    // ─── PR #567 regression: free text must not arm the <tool_call> mask ──
+    //
+    // Defect: Matcher::is_free() returned false for State::Out whenever the
+    // buffer ended with any prefix of "<tool_call>" (starting at a bare "<").
+    // The sampler then masked free text to only tokens continuing the marker,
+    // stranding prose like "<p>hi</p>", "2 < 3", or even "</think>".
+    // Fix: State::Out is unconditionally free; masking engages only after a
+    // full "<tool_call>" lands (transition to AfterOpen).
+
+    #[test]
+    fn pr567_genuine_tool_call_still_constrains() {
+        // No regression: a real <tool_call> must still arm the grammar.
+        let mut m = Matcher::new(schemas(&["bash"]));
+        m.advance("<tool_call>");
+        assert!(matches!(m.state(), State::AfterOpen));
+        assert!(!m.is_free(), "full <tool_call> must constrain");
+        assert!(!m.is_token_allowed("<|im_start|>"));
+        assert!(m.is_token_allowed("\n"));
+        assert!(m.is_token_allowed("\n{\"name\": \"bash\""));
+        let vocab = vec![
+            "<|im_start|>".to_string(),
+            "\n".to_string(),
+            "hello".to_string(),
+        ];
+        let mut mask = vec![false; vocab.len()];
+        m.token_mask(&vocab, &mut mask);
+        assert!(!mask[0], "attractor must be blocked after genuine open");
+        assert!(mask[1], "header prefix must be allowed");
+        assert!(!mask[2], "free prose must be blocked in AfterOpen");
+    }
+
+    #[test]
+    fn pr567_partial_prefixes_do_not_arm_mask() {
+        // Every strict prefix of "<tool_call>" must leave the sampler free.
+        let prefixes = [
+            "<",
+            "<t",
+            "<to",
+            "<too",
+            "<tool",
+            "<tool_",
+            "<tool_c",
+            "<tool_ca",
+            "<tool_cal",
+            "<tool_call",
+        ];
+        for prefix in prefixes {
+            let mut m = Matcher::new(schemas(&["bash"]));
+            m.advance(&format!("hello {}", prefix));
+            assert!(
+                m.is_free(),
+                "prefix {:?} must not arm mask; partial={:?}",
+                prefix,
+                m.partial()
+            );
+            assert!(matches!(m.state(), State::Out));
+            for tok in ["p>", "table>", " ", " hello", " 3", "</think>", ">"] {
+                assert!(
+                    m.is_token_allowed(tok),
+                    "prefix {:?} must allow token {:?}",
+                    prefix, tok
+                );
+            }
+            let vocab = vec![
+                "p>".to_string(),
+                "table>".to_string(),
+                "</think>".to_string(),
+                "<".to_string(),
+                "hello".to_string(),
+            ];
+            let mut mask = vec![false; vocab.len()];
+            m.token_mask(&vocab, &mut mask);
+            assert!(
+                mask.iter().all(|&b| b),
+                "prefix {:?} must leave token_mask all-true",
+                prefix
+            );
+        }
+        // Bare prefix at buffer start is also free.
+        let mut m = Matcher::new(schemas(&["bash"]));
+        m.advance("<");
+        assert!(m.is_free(), "bare '<' must be free");
+        assert!(m.is_token_allowed("p>"));
+        assert!(m.is_token_allowed("</think>"));
+    }
+
+    #[test]
+    fn pr567_false_start_diverging_is_not_masked() {
+        // A buffer that looked like a prefix then diverged must stay free.
+        let mut m = Matcher::new(schemas(&["bash"]));
+        m.advance("<tool");
+        assert!(m.is_free());
+        assert!(m.is_token_allowed("box>"), "<tool + box> diverges from marker");
+        m.advance("box>");
+        assert!(m.is_free());
+        assert!(matches!(m.state(), State::Out));
+
+        let mut m = Matcher::new(schemas(&["bash"]));
+        m.advance("<tool_cal");
+        assert!(m.is_free());
+        assert!(m.is_token_allowed("X"), "<tool_cal + X diverges");
+        assert!(m.is_token_allowed("x>"));
+
+        let mut m = Matcher::new(schemas(&["bash"]));
+        m.advance("<tool_call");
+        assert!(m.is_free());
+        assert!(m.is_token_allowed("X"), "<tool_call + X is not the marker");
+        assert!(m.is_token_allowed(" extra"));
+
+        // Whole false markers in one advance must not transition.
+        for txt in ["prefix <toolbox> suffix", "<tool_calX", "<tool-call>", "<tool_callX"] {
+            let mut m = Matcher::new(schemas(&["bash"]));
+            m.advance(txt);
+            assert!(
+                matches!(m.state(), State::Out),
+                "{:?} must not transition to AfterOpen",
+                txt
+            );
+            assert!(m.is_free(), "{:?} must be free", txt);
+        }
+    }
+
+    #[test]
+    fn pr567_partial_prefix_at_eos_stays_free() {
+        // Partial prefix at end-of-stream: next sampler step must be unconstrained.
+        let mut m = Matcher::new(schemas(&["bash"]));
+        m.advance("2 <");
+        assert!(m.is_free(), "'2 <' at EOS must be free");
+        for tok in [" 3", ">", " p>", "</think>", " hello", "\n"] {
+            assert!(m.is_token_allowed(tok), "'2 <' must allow {:?}", tok);
+        }
+        let vocab = vec![
+            " 3".to_string(),
+            ">".to_string(),
+            " p>".to_string(),
+            "</think>".to_string(),
+            "<".to_string(),
+        ];
+        let mut mask = vec![false; vocab.len()];
+        m.token_mask(&vocab, &mut mask);
+        assert!(mask.iter().all(|&b| b), "EOS partial must be all-true mask");
+
+        // Another EOS shape: HTML tag start cut off mid-token.
+        let mut m2 = Matcher::new(schemas(&["bash"]));
+        m2.advance("HTML: <table");
+        assert!(m2.is_free(), "HTML prefix at EOS must be free");
+        assert!(m2.is_token_allowed("><tr>"));
+        assert!(m2.is_token_allowed("</think>"));
+    }
+
+    #[test]
+    fn pr567_prefix_split_across_tokens() {
+        // Free-text prefix split across two token emissions must stay free.
+        let mut m = Matcher::new(schemas(&["bash"]));
+        m.advance("<");
+        assert!(m.is_free(), "'<' split must be free");
+        assert!(m.is_token_allowed("p>"));
+        m.advance("p>");
+        assert!(m.is_free());
+        assert!(matches!(m.state(), State::Out));
+
+        let mut m2 = Matcher::new(schemas(&["bash"]));
+        m2.advance("<tool");
+        assert!(m2.is_free());
+        assert!(m2.is_token_allowed("box>"));
+        m2.advance("box>");
+        assert!(m2.is_free());
+
+        // Genuine marker split across tokens must still transition.
+        let mut m3 = Matcher::new(schemas(&["bash"]));
+        m3.advance("<tool");
+        assert!(m3.is_free(), "partial genuine must be free before completion");
+        assert!(m3.is_token_allowed("_call>"));
+        m3.advance("_call>");
+        assert!(matches!(m3.state(), State::AfterOpen));
+        assert!(!m3.is_free(), "full marker split must constrain");
+
+        // Multi-token free sequence: "2" + " <" + " 3"
+        let mut m4 = Matcher::new(schemas(&["bash"]));
+        m4.advance("2");
+        m4.advance(" <");
+        assert!(m4.is_free(), "'2 <' split must be free");
+        assert!(m4.is_token_allowed(" 3"));
+        assert!(m4.is_token_allowed("</think>"));
+
+        // HTML split: "HTML: " + "<" + "t" + "able>"
+        let mut m5 = Matcher::new(schemas(&["bash"]));
+        m5.advance("HTML: ");
+        m5.advance("<");
+        assert!(m5.is_free());
+        m5.advance("t");
+        assert!(m5.is_free());
+        m5.advance("able>");
+        assert!(m5.is_free());
+    }
 }
