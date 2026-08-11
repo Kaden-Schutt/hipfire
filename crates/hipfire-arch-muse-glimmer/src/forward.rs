@@ -35,6 +35,13 @@ use rdna_compute::Gpu;
 // ───────────────────────────── Decode ─────────────────────────────
 
 /// Decode one token; returns the full logits vector.
+/// Diagnostic ablation switches. Bring-up only: each disables ONE architectural
+/// feature so a divergence can be bisected across GPUs in parallel. All default
+/// OFF (i.e. the feature is ON) — setting the var disables that feature.
+fn abl(name: &str) -> bool {
+    std::env::var(name).ok().as_deref() == Some("1")
+}
+
 pub fn decode_step(
     cfg: &GlimmerConfig,
     weights: &GlimmerWeights,
@@ -110,13 +117,13 @@ fn decode_step_body(
         .map_err(|e| format!("glimmer: lm_head: {e}"))?;
 
     // output_multiplier BEFORE softcap (brief RESOLVED)
-    if cfg.output_multiplier != 1.0 {
+    if cfg.output_multiplier != 1.0 && !abl("HIPFIRE_GLIMMER_NO_OUTMUL") {
         gpu.scale_f32(&state.logits, cfg.output_multiplier)
             .map_err(|e| format!("glimmer: output_multiplier scale: {e:?}"))?;
     }
 
     // Final logit softcapping: tanh(x/cap)*cap with cap 20.0
-    if cfg.final_logit_softcapping > 0.0 {
+    if cfg.final_logit_softcapping > 0.0 && !abl("HIPFIRE_GLIMMER_NO_SOFTCAP") {
         gpu.logit_softcap_f32(&state.logits, cfg.vocab_size, cfg.final_logit_softcapping)
             .map_err(|e| format!("glimmer: logit softcap: {e:?}"))?;
     }
@@ -159,16 +166,20 @@ fn glimmer_layer_decode(
 
     // Scale-less QK-norm (no learned weight tensors; ones-filled weight)
     // Still runs RMSNorm per head, then Q *= qk_scale_factor.
-    gpu.rmsnorm_batched(&state.q, &state.qk_norm_ones, &state.q, n_heads, head_dim, rms_eps)
-        .map_err(|e| format!("glimmer L{layer_idx}: q_norm: {e:?}"))?;
-    gpu.rmsnorm_batched(&state.k, &state.qk_norm_ones, &state.k, n_kv, head_dim, rms_eps)
-        .map_err(|e| format!("glimmer L{layer_idx}: k_norm: {e:?}"))?;
+    if !abl("HIPFIRE_GLIMMER_NO_QK_NORM") {
+        gpu.rmsnorm_batched(&state.q, &state.qk_norm_ones, &state.q, n_heads, head_dim, rms_eps)
+            .map_err(|e| format!("glimmer L{layer_idx}: q_norm: {e:?}"))?;
+        gpu.rmsnorm_batched(&state.k, &state.qk_norm_ones, &state.k, n_kv, head_dim, rms_eps)
+            .map_err(|e| format!("glimmer L{layer_idx}: k_norm: {e:?}"))?;
+    }
     // Do NOT pre-scale by sqrt(head_dim); Glimmer wants kernel 1/sqrt AND 3.87
-    gpu.scale_f32(&state.q, cfg.qk_scale_factor)
-        .map_err(|e| format!("glimmer L{layer_idx}: q scale qk_factor: {e:?}"))?;
+    if !abl("HIPFIRE_GLIMMER_NO_QK_SCALE") {
+        gpu.scale_f32(&state.q, cfg.qk_scale_factor)
+            .map_err(|e| format!("glimmer L{layer_idx}: q scale qk_factor: {e:?}"))?;
+    }
 
     // RoPE only on layers whose layer_rope_theta != 0 (copy cohere2moe shape)
-    if cfg.has_rope(layer_idx) {
+    if cfg.has_rope(layer_idx) || abl("HIPFIRE_GLIMMER_ROPE_ALL") {
         let theta = cfg.rope_theta_for(layer_idx);
         gpu.rope_f32(
             &state.q,
@@ -210,8 +221,10 @@ fn glimmer_layer_decode(
 
     // Gated attention: attn_out *= sigmoid(attn_gate) BEFORE o_proj
     // Uses gpu.sigmoid_mul_f32 (norm.rs:2006) — do not write a new kernel.
-    gpu.sigmoid_mul_f32(&state.attn_out, &state.attn_gate)
+    if !abl("HIPFIRE_GLIMMER_NO_ATTN_GATE") {
+        gpu.sigmoid_mul_f32(&state.attn_out, &state.attn_gate)
         .map_err(|e| format!("glimmer L{layer_idx}: sigmoid_mul: {e:?}"))?;
+    }
 
     // o_proj(attn_out) -> tmp
     weight_gemv(gpu, &lw.o_proj, &state.attn_out, &state.tmp)
