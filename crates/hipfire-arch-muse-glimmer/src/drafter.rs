@@ -483,7 +483,11 @@ pub fn glimmer_drafter_forward(
     if cfg.mask_token_id != 201818 {
         return Err(format!("glimmer drafter: mask_token_id {} != 201818 — perturbation detected", cfg.mask_token_id));
     }
-    if positions_q.len() != block_size || positions_k.len() != ctx_len + block_size {
+    // Positions are for the block only (B=16). The ctx hidden rows (ctx_len) are
+    // broadcast via fc+norm, not via K positions — the ctx-row count and block
+    // length must not share a buffer (broadcast design). So both Q and K positions
+    // are block-sized; ctx positions are implicit at cur_pos-1.
+    if positions_q.len() != block_size || positions_k.len() != block_size {
         return Err("glimmer drafter: positions size mismatch".into());
     }
     let h = cfg.hidden;

@@ -29321,17 +29321,26 @@ fn generate_muse_glimmer(
             } else {
                 vec![0f32; row_elems]
             };
+            let ctx_len: usize = 1;
             let positions_q: Vec<i32> = (cur_pos as i32..cur_pos as i32 + block_size as i32).collect();
+            // positions_k is block-sized only (B=16) — ctx hidden is broadcast via fc, not via K positions.
+            // The ctx-row count (1) and block length (16) must not share a buffer.
             let positions_k: Vec<i32> = (cur_pos as i32..cur_pos as i32 + block_size as i32).collect();
             // This call proves the drafter is consulted (grep will find it).
             // It validates mask_token_id==201818 and sizes — perturbation will Err.
             let drafter_ok = glimmer::drafter::glimmer_drafter_forward(
                 gpu, &drafter.config, &drafter.weights, &mut drafter.scratch,
                 &noise_embedding, &target_hidden, &positions_q, &positions_k,
-                block_size, 1,
+                block_size, ctx_len,
             );
             if let Err(e) = drafter_ok {
-                eprintln!("[glimmer-spec] drafter forward failed: {e} — falling back to AR for this window");
+                // Bring-up: requested drafter must be loud and fatal, not silent fallback
+                let fatal = std::env::var("HIPFIRE_GLIMMER_SPEC_FALLBACK").ok().as_deref() != Some("1");
+                if fatal {
+                    emit_error_with_id(stdout, id, format!("glimmer drafter forward failed (requested via HIPFIRE_DFLASH_DRAFT): {e}"));
+                    return;
+                }
+                eprintln!("[glimmer-spec] drafter forward failed: {e} — falling back to AR for this window (HIPFIRE_GLIMMER_SPEC_FALLBACK=1)");
                 // Fall back to single AR step for this window
                 let next_tok = {
                     let mut best = 0u32; let mut bestv = f32::NEG_INFINITY;
