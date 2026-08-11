@@ -3102,9 +3102,11 @@ impl Gpu {
             }
             "mq6" => {
                 // MQ6 = FWHT-rotated HFQ6-G256. Needs both the MQ6 GEMV and the
-                // raw HFQ6 GEMV (used by a few residual paths).
+                // raw HFQ6 GEMV (used by a few residual paths), plus the new
+                // batched MQ6 GEMM for gemma4 Promote6 tensors (v_proj/down_proj).
                 specs.push(("gemv_mq6g256", kernels::GEMV_MQ6G256_SRC.to_string()));
                 specs.push(("gemv_hfq6g256", kernels::GEMV_HFQ6G256_SRC.to_string()));
+                specs.push(("gemm_mq6g256", kernels::GEMM_MQ6G256_SRC.to_string()));
             }
             "hfq4" => {
                 let (src, module) =

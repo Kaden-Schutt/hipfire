@@ -967,6 +967,16 @@ fn proj_gemm_batched(
             gpu.gemm_hfq4g256_batched_lmhead(&w.buf, x_rot, y, w.m, w.k, b)
                 .map_err(|e| format!("gemma4 batch {label} (mq4): {e:?}"))
         }
+        DType::MQ6G256 => {
+            // Same two-step as MQ4G256: rotate the shared input once, then
+            // run the prerotated scalar batched GEMM. MQ6 = HFQ6 packing
+            // (200 B/group, 6-bit values) with the weights pre-rotated at
+            // quant time; the inner loop is rotation-free.
+            rotate_x_mq_batched_for(gpu, w, x, x_rot, w.k, b)
+                .map_err(|e| format!("gemma4 batch {label} rotate: {e:?}"))?;
+            gpu.gemm_mq6g256_batched_lmhead(&w.buf, x_rot, y, w.m, w.k, b)
+                .map_err(|e| format!("gemma4 batch {label} (mq6): {e:?}"))
+        }
         other => Err(format!(
             "gemma4 batch {label}: dtype {other:?} has no batched proj kernel"
         )),

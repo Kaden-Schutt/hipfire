@@ -18010,6 +18010,61 @@ impl Gpu {
         self.gemm_hfq6g256_residual(a_raw, x, y, m, k, batch_size)
     }
 
+    /// MQ6G256 batched GEMM for pre-rotated activations.
+    ///
+    /// MQ6 = FWHT-rotated HFQ6-G256 (6-bit MagnumQuant, 200 B/group:
+    /// [f32 scale][f32 zero][192 B packed 6-bit data]). Caller must run
+    /// `rotate_x_mq_batched` (or the fused `fused_rmsnorm_rotate_mq`) once
+    /// over `x` before dispatch — this kernel performs no rotation.
+    ///
+    /// Scalar correctness-first baseline mirroring `gemm_hfq4g256.hip`:
+    /// grid = [M, ceil(batch/8), 1], block = [32,1,1], BATCH_TILE=8 with
+    /// per-thread __shfl_down reduction. No LDS, no WMMA.
+    pub fn gemm_mq6g256_batched_lmhead(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("gemm_mq6g256", kernels::GEMM_MQ6G256_SRC, "gemm_mq6g256")?;
+
+        let mut a_ptr = a_raw.buf.as_ptr();
+        let mut x_ptr = x.buf.as_ptr();
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut bs_val = batch_size as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut bs_val as *mut _ as *mut c_void,
+        ];
+
+        const BATCH_TILE: usize = 8;
+        let batch_tiles = ((batch_size + BATCH_TILE - 1) / BATCH_TILE) as u32;
+        let grid = [m as u32, batch_tiles, 1];
+        let block = [32u32, 1, 1];
+
+        self.launch_maybe_blob("gemm_mq6g256", grid, block, 0, &mut params, || {
+            let mut blob = hip_bridge::KernargBlob::new();
+            blob.push_ptr(a_ptr);
+            blob.push_ptr(x_ptr);
+            blob.push_ptr(y_ptr);
+            blob.push_i32(m_val);
+            blob.push_i32(k_val);
+            blob.push_i32(bs_val);
+            blob
+        })
+    }
+
     /// HFQ3-G256 sister of `gemm_hfq4g256_batched_lmhead`. Same FP16-X cache
     /// stomp + zero-init of Y, then `gemm_hfq3g256_residual_wmma` to compute
     /// y[b][row] = A[row] · x[b]. Used by `dflash::gemm_dispatch` for MQ3

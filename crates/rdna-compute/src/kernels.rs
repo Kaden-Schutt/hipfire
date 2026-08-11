@@ -1053,6 +1053,10 @@ pub const GEMV_MQ4G128_SRC: &str = include_str!("../../../kernels/src/gemv_mq4g1
 pub const GEMV_MQ8G256_SRC: &str = include_str!("../../../kernels/src/gemv_mq8g256.hip");
 /// MQ6-G256 GEMV: FWHT-rotated HFQ6 (6-bit, 200 B/group). Uses pre-rotated x.
 pub const GEMV_MQ6G256_SRC: &str = include_str!("../../../kernels/src/gemv_mq6g256.hip");
+/// MQ6-G256 batched GEMM for pre-rotated x. Scalar baseline mirroring
+/// gemm_hfq4g256.hip (BATCH_TILE=8, 32 threads/row, __shfl_down reduction).
+/// Used by gemma4 `proj_gemm_batched` for Promote6 tensors (v_proj, down_proj).
+pub const GEMM_MQ6G256_SRC: &str = include_str!("../../../kernels/src/gemm_mq6g256.hip");
 /// MQ5-G256 GEMV: FWHT-rotated HFQ5 (5-bit, 168 B/group). Uses pre-rotated x.
 pub const GEMV_MQ5G256_SRC: &str = include_str!("../../../kernels/src/gemv_mq5g256.hip");
 pub const FUSED_RMSNORM_MQ_ROTATE_SRC: &str =
