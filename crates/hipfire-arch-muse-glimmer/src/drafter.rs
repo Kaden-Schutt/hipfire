@@ -113,8 +113,93 @@
 //! skip the inactive side), attention is `attention_dflash_f32`.
 
 use hipfire_runtime::hfq::HfqFile;
-use hipfire_runtime::llama::WeightTensor;
+use hipfire_runtime::llama::{rotate_x_mq_batched_for, weight_gemv, WeightTensor};
 use rdna_compute::{DType, Gpu, GpuTensor};
+
+// ─── Shared rotation gate (mirrors forward.rs) ───────────────────────────
+// HIPFIRE_GLIMMER_SHARED_ROT default ON (=1 or unset), =0 selects old path.
+fn shared_rot_enabled() -> bool {
+    std::env::var("HIPFIRE_GLIMMER_SHARED_ROT").as_deref() != Ok("0")
+}
+
+// ─── Batched projection dispatch (mirrors forward.rs::proj_gemm_batched) ──
+// Q8_0      → gemm_q8_0_batched_chunked (WMMA on gfx12)
+// MQ4G256/HFQ4G256 → rotate + gemm_hfq4g256_batched_lmhead (prerotated)
+// MQ6G256   → rotate + gemm_mq6g256_batched_lmhead
+// others    → per-row weight_gemv fallback (explicit, no approximation)
+//   Fallback dtypes: F32, Q4K, HFQ4G128, HFQ6G256, HFQ3G256, HFQ2G256, MQ3G256,
+//   MQ2G256, MQ2G256Lloyd, MQ3G256Lloyd, MQ4G256Lloyd, MFP4G32, etc. — any
+//   dtype without a batched GEMM kernel. Drafter weights are Q8_0 so the
+//   Q8_0 batched path is taken; fallback is listed explicitly for
+//   correctness parity with forward.rs and never taken on current artifacts.
+fn proj_gemm_batched(
+    gpu: &mut Gpu,
+    w: &WeightTensor,
+    x: &GpuTensor,
+    y: &GpuTensor,
+    x_rot: &GpuTensor,
+    b: usize,
+    label: &str,
+) -> Result<(), String> {
+    match w.gpu_dtype {
+        DType::Q8_0 => gpu
+            .gemm_q8_0_batched_chunked(&w.buf, x, y, w.m, w.k, b)
+            .map_err(|e| format!("glimmer batch {label} (q8): {e:?}")),
+        DType::MQ4G256 | DType::HFQ4G256 => {
+            rotate_x_mq_batched_for(gpu, w, x, x_rot, w.k, b)
+                .map_err(|e| format!("glimmer batch {label} rotate: {e:?}"))?;
+            gpu.gemm_hfq4g256_batched_lmhead(&w.buf, x_rot, y, w.m, w.k, b)
+                .map_err(|e| format!("glimmer batch {label} (mq4): {e:?}"))
+        }
+        DType::MQ6G256 => {
+            rotate_x_mq_batched_for(gpu, w, x, x_rot, w.k, b)
+                .map_err(|e| format!("glimmer batch {label} rotate: {e:?}"))?;
+            gpu.gemm_mq6g256_batched_lmhead(&w.buf, x_rot, y, w.m, w.k, b)
+                .map_err(|e| format!("glimmer batch {label} (mq6): {e:?}"))
+        }
+        _ => {
+            for i in 0..b {
+                let x_row = x.sub_offset(i * w.k, w.k);
+                let y_row = y.sub_offset(i * w.m, w.m);
+                weight_gemv(gpu, w, &x_row, &y_row)
+                    .map_err(|e| format!("glimmer batch {label} row {i}: {e}"))?;
+            }
+            Ok(())
+        }
+    }
+}
+
+// Prerotated variant: x_rot already FWHT-rotated for MQ. Q8 still reads unrotated x.
+fn proj_gemm_batched_prerotated(
+    gpu: &mut Gpu,
+    w: &WeightTensor,
+    x_unrot: &GpuTensor,
+    x_rot: &GpuTensor,
+    y: &GpuTensor,
+    b: usize,
+    label: &str,
+) -> Result<(), String> {
+    match w.gpu_dtype {
+        DType::Q8_0 => gpu
+            .gemm_q8_0_batched_chunked(&w.buf, x_unrot, y, w.m, w.k, b)
+            .map_err(|e| format!("glimmer batch {label} (q8 prerot): {e:?}")),
+        DType::MQ4G256 | DType::HFQ4G256 => gpu
+            .gemm_hfq4g256_batched_lmhead(&w.buf, x_rot, y, w.m, w.k, b)
+            .map_err(|e| format!("glimmer batch {label} (mq4 prerot): {e:?}")),
+        DType::MQ6G256 => gpu
+            .gemm_mq6g256_batched_lmhead(&w.buf, x_rot, y, w.m, w.k, b)
+            .map_err(|e| format!("glimmer batch {label} (mq6 prerot): {e:?}")),
+        _ => {
+            for i in 0..b {
+                let x_row = x_unrot.sub_offset(i * w.k, w.k);
+                let y_row = y.sub_offset(i * w.m, w.m);
+                weight_gemv(gpu, w, &x_row, &y_row)
+                    .map_err(|e| format!("glimmer batch {label} prerot row {i}: {e}"))?;
+            }
+            Ok(())
+        }
+    }
+}
 
 pub const GLIMMER_DRAFTER_ARCH_ID: u32 = 23;
 
@@ -455,11 +540,16 @@ pub struct GlimmerDrafterScratch {
     pub k: GpuTensor,          // [(max_ctx + block) * kv_dim] — ctx ++ block
     pub v: GpuTensor,          // [(max_ctx + block) * kv_dim] — ctx ++ block
     pub attn_out: GpuTensor,   // [block * q_dim]
-    pub tmp: GpuTensor,        // [block*hidden] scratch (also stages one fc input row)
+    pub tmp: GpuTensor,        // [block*hidden] scratch
     pub gate_ffn: GpuTensor,
     pub up_ffn: GpuTensor,
     pub ffn_hidden: GpuTensor,
     pub logits_tmp: GpuTensor, // [hidden] for final norm
+    /// Batched GEMM rotation scratch.
+    pub x_rot: GpuTensor,           // [block * hidden] — shared rotation for q / gate/up
+    pub kv_input: GpuTensor,        // [(max_ctx+block)*hidden] — cat[target_hidden_proj, tmp]
+    pub kv_input_rot: GpuTensor,    // [(max_ctx+block)*hidden] — FWHT-rotated kv_input
+    pub ffn_hidden_rot: GpuTensor,  // [block*intermediate] — FWHT-rotated ffn_hidden for down_proj
     /// Device positions for RoPE, sized for the full ctx+block span and
     /// allocated ONCE. Uploaded each forward; views feed `rope_batched_f32`.
     ///
@@ -499,6 +589,10 @@ impl GlimmerDrafterScratch {
             up_ffn: alloc(gpu, block * cfg.intermediate, "up_ffn")?,
             ffn_hidden: alloc(gpu, block * cfg.intermediate, "ffn_hidden")?,
             logits_tmp: alloc(gpu, h, "logits_tmp")?,
+            x_rot: alloc(gpu, block * h, "x_rot")?,
+            kv_input: alloc(gpu, kv_rows * h, "kv_input")?,
+            kv_input_rot: alloc(gpu, kv_rows * h, "kv_input_rot")?,
+            ffn_hidden_rot: alloc(gpu, block * cfg.intermediate, "ffn_hidden_rot")?,
             pos_buf,
         })
     }
@@ -516,6 +610,10 @@ impl GlimmerDrafterScratch {
             self.up_ffn,
             self.ffn_hidden,
             self.logits_tmp,
+            self.x_rot,
+            self.kv_input,
+            self.kv_input_rot,
+            self.ffn_hidden_rot,
         ] {
             let _ = gpu.free_tensor(t);
         }
@@ -547,7 +645,6 @@ pub fn glimmer_drafter_forward(
     block_size: usize,
     ctx_len: usize,
 ) -> Result<(), String> {
-    use hipfire_runtime::llama::weight_gemv;
     if block_size != cfg.block_size {
         return Err(format!(
             "glimmer drafter: block_size {} != cfg.block_size {}",
@@ -593,30 +690,50 @@ pub fn glimmer_drafter_forward(
     let h = cfg.hidden;
     let ne = cfg.num_extract();
     let eps = cfg.norm_eps;
-    let qd = cfg.q_dim();
     let kvd = cfg.kv_dim();
     let l = ctx_len + block_size; // K/V length
 
-    // --- 1. target_hidden_proj = rmsnorm(fc * target_hidden) once for every ctx row ---
-    // Reused by all 5 layers. No ctx_len==1 fast path.
+    // --- 1. encoder.fc over ctx rows — batched GEMM (was per-row loop) ---
+    // This runs once per drafter call over up to 2048 rows, so batching
+    // matters at longer context even though ctx is small on the fixture.
+    // Same dispatch-by-dtype as forward.rs::proj_gemm_batched.
     if ctx_len > 0 {
         let ne_h = ne * h;
-        for row in 0..ctx_len {
-            let in_slice = &target_hidden[row * ne_h..(row + 1) * ne_h];
-            let tmp_in = scratch.tmp.sub_offset(0, ne_h);
-            // Direct htod into tmp_in's buffer (upload_f32 allocates a new tensor and would leak + leave tmp_in zero).
-            let bytes = unsafe {
-                std::slice::from_raw_parts(in_slice.as_ptr() as *const u8, in_slice.len() * 4)
-            };
-            gpu.hip
-                .memcpy_htod(&tmp_in.buf, bytes)
-                .map_err(|e| format!("drafter htod target_hidden row {row}: {e:?}"))?;
-            let out = scratch.target_hidden_proj.sub_offset(row * h, h);
-            weight_gemv(gpu, &weights.fc, &tmp_in, &out)
-                .map_err(|e| format!("drafter fc row {row}: {e}"))?;
-            gpu.rmsnorm_f32(&out, &weights.output_norm_enc, &out, eps)
-                .map_err(|e| format!("drafter output_norm row {row}: {e:?}"))?;
-        }
+        // Upload the entire target_hidden batch [ctx*ne_h] into a temporary
+        // GPU buffer, then batched GEMM: Y[ctx,h] = W[h,ne_h] * X[ctx,ne_h].
+        let fc_in = gpu
+            .alloc_tensor(&[ctx_len * ne_h], DType::F32)
+            .map_err(|e| format!("drafter fc_input alloc: {e:?}"))?;
+        let bytes = unsafe {
+            std::slice::from_raw_parts(target_hidden.as_ptr() as *const u8, target_hidden.len() * 4)
+        };
+        gpu.hip
+            .memcpy_htod(&fc_in.buf, bytes)
+            .map_err(|e| format!("drafter htod fc_input: {e:?}"))?;
+        let target_slice = scratch.target_hidden_proj.sub_offset(0, ctx_len * h);
+        // For fc, x_rot is dummy unless dtype is MQ — pass scratch.x_rot (or kv_input_rot)
+        // sized enough for ctx*h dummy; use kv_input_rot's prefix.
+        let fc_rot = scratch.kv_input_rot.sub_offset(0, ctx_len * h);
+        proj_gemm_batched(
+            gpu,
+            &weights.fc,
+            &fc_in,
+            &target_slice,
+            &fc_rot,
+            ctx_len,
+            "fc",
+        )
+        .map_err(|e| format!("drafter fc batched: {e}"))?;
+        gpu.free_tensor(fc_in).ok();
+        gpu.rmsnorm_batched(
+            &target_slice,
+            &weights.output_norm_enc,
+            &target_slice,
+            ctx_len,
+            h,
+            eps,
+        )
+        .map_err(|e| format!("drafter output_norm batched: {e:?}"))?;
     }
 
     // --- 2. noise_embedding into scratch.x (context is NOT added into x) ---
@@ -634,7 +751,6 @@ pub fn glimmer_drafter_forward(
         let bytes = unsafe {
             std::slice::from_raw_parts(positions.as_ptr() as *const u8, positions.len() * 4)
         };
-        // pos_buf is sized (max_ctx+block)*4; only the leading l entries are written.
         let pos_view =
             unsafe { hip_bridge::DeviceBuffer::from_raw(scratch.pos_buf.as_ptr(), l * 4) };
         gpu.hip
@@ -655,31 +771,73 @@ pub fn glimmer_drafter_forward(
         )
         .map_err(|e| format!("drafter L{li} input norm: {e:?}"))?;
 
-        // q over B block rows from n1=tmp
-        for pos in 0..block_size {
-            let n1 = scratch.tmp.sub_offset(pos * h, h);
-            let qdst = scratch.q.sub_offset(pos * qd, qd);
-            weight_gemv(gpu, &layer.q_proj, &n1, &qdst)
-                .map_err(|e| format!("drafter L{li} q pos {pos}: {e}"))?;
-        }
+        // q_proj over B block rows from n1=tmp — batched
+        proj_gemm_batched(
+            gpu,
+            &layer.q_proj,
+            &scratch.tmp,
+            &scratch.q,
+            &scratch.x_rot,
+            block_size,
+            "q_proj",
+        )
+        .map_err(|e| format!("drafter L{li} q batched: {e}"))?;
+
         // k/v over ctx+B: first ctx_len rows from target_hidden_proj, tail B from tmp
-        for row in 0..ctx_len {
-            let src = scratch.target_hidden_proj.sub_offset(row * h, h);
-            let kdst = scratch.k.sub_offset(row * kvd, kvd);
-            let vdst = scratch.v.sub_offset(row * kvd, kvd);
-            weight_gemv(gpu, &layer.k_proj, &src, &kdst)
-                .map_err(|e| format!("drafter L{li} k ctx row {row}: {e}"))?;
-            weight_gemv(gpu, &layer.v_proj, &src, &vdst)
-                .map_err(|e| format!("drafter L{li} v ctx row {row}: {e}"))?;
+        // Materialize contiguous kv_input = cat[target_hidden_proj[0:ctx], tmp[0:B]]
+        let kv_in = scratch.kv_input.sub_offset(0, l * h);
+        let kv_in_rot = scratch.kv_input_rot.sub_offset(0, l * h);
+        if ctx_len > 0 {
+            gpu.hip
+                .memcpy_dtod_at(
+                    &kv_in.buf,
+                    0,
+                    &scratch.target_hidden_proj.buf,
+                    0,
+                    ctx_len * h * 4,
+                )
+                .map_err(|e| format!("drafter L{li} kv cat ctx copy: {e:?}"))?;
+            gpu.hip
+                .memcpy_dtod_at(
+                    &kv_in.buf,
+                    ctx_len * h * 4,
+                    &scratch.tmp.buf,
+                    0,
+                    block_size * h * 4,
+                )
+                .map_err(|e| format!("drafter L{li} kv cat block copy: {e:?}"))?;
+        } else {
+            gpu.hip
+                .memcpy_dtod_at(&kv_in.buf, 0, &scratch.tmp.buf, 0, block_size * h * 4)
+                .map_err(|e| format!("drafter L{li} kv cat block copy: {e:?}"))?;
         }
-        for pos in 0..block_size {
-            let n1 = scratch.tmp.sub_offset(pos * h, h);
-            let kdst = scratch.k.sub_offset((ctx_len + pos) * kvd, kvd);
-            let vdst = scratch.v.sub_offset((ctx_len + pos) * kvd, kvd);
-            weight_gemv(gpu, &layer.k_proj, &n1, &kdst)
-                .map_err(|e| format!("drafter L{li} k block pos {pos}: {e}"))?;
-            weight_gemv(gpu, &layer.v_proj, &n1, &vdst)
-                .map_err(|e| format!("drafter L{li} v block pos {pos}: {e}"))?;
+        let k_full = scratch.k.sub_offset(0, l * kvd);
+        let v_full = scratch.v.sub_offset(0, l * kvd);
+        // k_proj / v_proj share the same input, so rotate once and reuse
+        // (mirrors forward.rs q/k/v/gate shared FWHT).
+        let need_kv_rot = shared_rot_enabled()
+            && hipfire_dispatch::types::dtype_rotation_plan(layer.k_proj.gpu_dtype)
+                != hipfire_dispatch::types::RotationPlan::None;
+        if need_kv_rot {
+            rotate_x_mq_batched_for(gpu, &layer.k_proj, &kv_in, &kv_in_rot, h, l)
+                .map_err(|e| format!("drafter L{li} kv rotate: {e:?}"))?;
+            proj_gemm_batched_prerotated(
+                gpu, &layer.k_proj, &kv_in, &kv_in_rot, &k_full, l, "k_proj",
+            )
+            .map_err(|e| format!("drafter L{li} k batched: {e}"))?;
+            proj_gemm_batched_prerotated(
+                gpu, &layer.v_proj, &kv_in, &kv_in_rot, &v_full, l, "v_proj",
+            )
+            .map_err(|e| format!("drafter L{li} v batched: {e}"))?;
+        } else {
+            proj_gemm_batched(
+                gpu, &layer.k_proj, &kv_in, &k_full, &kv_in_rot, l, "k_proj",
+            )
+            .map_err(|e| format!("drafter L{li} k batched: {e}"))?;
+            proj_gemm_batched(
+                gpu, &layer.v_proj, &kv_in, &v_full, &kv_in_rot, l, "v_proj",
+            )
+            .map_err(|e| format!("drafter L{li} v batched: {e}"))?;
         }
 
         // per-head WEIGHTED q/k norm (real q_norm/k_norm weights)
@@ -693,7 +851,6 @@ pub fn glimmer_drafter_forward(
             eps,
         )
         .map_err(|e| format!("drafter L{li} q_norm: {e:?}"))?;
-        let k_full = scratch.k.sub_offset(0, l * kvd);
         gpu.rmsnorm_batched(
             &k_full,
             &layer.k_norm,
@@ -745,7 +902,6 @@ pub fn glimmer_drafter_forward(
 
         // Attention: B queries attend bidirectionally to L=ctx+B keys/values.
         // Full bidirectional (no sliding window) — exact while L <= 2048.
-        let v_full = scratch.v.sub_offset(0, l * kvd);
         gpu.attention_dflash_f32(
             &scratch.q,
             &k_full,
@@ -759,13 +915,17 @@ pub fn glimmer_drafter_forward(
         )
         .map_err(|e| format!("drafter L{li} attention_dflash_f32: {e:?}"))?;
 
-        // o_proj per row
-        for pos in 0..block_size {
-            let attn = scratch.attn_out.sub_offset(pos * qd, qd);
-            let out = scratch.tmp.sub_offset(pos * h, h);
-            weight_gemv(gpu, &layer.o_proj, &attn, &out)
-                .map_err(|e| format!("drafter L{li} o pos {pos}: {e}"))?;
-        }
+        // o_proj over B rows — batched
+        proj_gemm_batched(
+            gpu,
+            &layer.o_proj,
+            &scratch.attn_out,
+            &scratch.tmp,
+            &scratch.x_rot,
+            block_size,
+            "o_proj",
+        )
+        .map_err(|e| format!("drafter L{li} o batched: {e}"))?;
         // residual: x = x + tmp (NO post_attention_layernorm on attn output)
         gpu.add_inplace_f32(&scratch.x, &scratch.tmp)
             .map_err(|e| format!("drafter L{li} attn residual: {e:?}"))?;
@@ -779,23 +939,68 @@ pub fn glimmer_drafter_forward(
             eps,
         )
         .map_err(|e| format!("drafter L{li} post_attn/pre_ffn norm: {e:?}"))?;
-        for pos in 0..block_size {
-            let n2 = scratch.tmp.sub_offset(pos * h, h);
-            let g = scratch.gate_ffn.sub_offset(pos * cfg.intermediate, cfg.intermediate);
-            let u = scratch.up_ffn.sub_offset(pos * cfg.intermediate, cfg.intermediate);
-            weight_gemv(gpu, &layer.gate_proj, &n2, &g)
-                .map_err(|e| format!("drafter L{li} gate pos {pos}: {e}"))?;
-            weight_gemv(gpu, &layer.up_proj, &n2, &u)
-                .map_err(|e| format!("drafter L{li} up pos {pos}: {e}"))?;
+        // gate_proj / up_proj share input — one rotation, then batched
+        let need_ffn_rot = shared_rot_enabled()
+            && hipfire_dispatch::types::dtype_rotation_plan(layer.gate_proj.gpu_dtype)
+                != hipfire_dispatch::types::RotationPlan::None;
+        if need_ffn_rot {
+            rotate_x_mq_batched_for(gpu, &layer.gate_proj, &scratch.tmp, &scratch.x_rot, h, block_size)
+                .map_err(|e| format!("drafter L{li} ffn rotate: {e:?}"))?;
+            proj_gemm_batched_prerotated(
+                gpu,
+                &layer.gate_proj,
+                &scratch.tmp,
+                &scratch.x_rot,
+                &scratch.gate_ffn,
+                block_size,
+                "gate_proj",
+            )
+            .map_err(|e| format!("drafter L{li} gate batched: {e}"))?;
+            proj_gemm_batched_prerotated(
+                gpu,
+                &layer.up_proj,
+                &scratch.tmp,
+                &scratch.x_rot,
+                &scratch.up_ffn,
+                block_size,
+                "up_proj",
+            )
+            .map_err(|e| format!("drafter L{li} up batched: {e}"))?;
+        } else {
+            proj_gemm_batched(
+                gpu,
+                &layer.gate_proj,
+                &scratch.tmp,
+                &scratch.gate_ffn,
+                &scratch.x_rot,
+                block_size,
+                "gate_proj",
+            )
+            .map_err(|e| format!("drafter L{li} gate batched: {e}"))?;
+            proj_gemm_batched(
+                gpu,
+                &layer.up_proj,
+                &scratch.tmp,
+                &scratch.up_ffn,
+                &scratch.x_rot,
+                block_size,
+                "up_proj",
+            )
+            .map_err(|e| format!("drafter L{li} up batched: {e}"))?;
         }
         gpu.silu_mul_f32(&scratch.gate_ffn, &scratch.up_ffn, &scratch.ffn_hidden)
             .map_err(|e| format!("drafter L{li} silu: {e:?}"))?;
-        for pos in 0..block_size {
-            let fh = scratch.ffn_hidden.sub_offset(pos * cfg.intermediate, cfg.intermediate);
-            let out = scratch.tmp.sub_offset(pos * h, h);
-            weight_gemv(gpu, &layer.down_proj, &fh, &out)
-                .map_err(|e| format!("drafter L{li} down pos {pos}: {e}"))?;
-        }
+        // down_proj batched over B rows
+        proj_gemm_batched(
+            gpu,
+            &layer.down_proj,
+            &scratch.ffn_hidden,
+            &scratch.tmp,
+            &scratch.ffn_hidden_rot,
+            block_size,
+            "down_proj",
+        )
+        .map_err(|e| format!("drafter L{li} down batched: {e}"))?;
         gpu.add_inplace_f32(&scratch.x, &scratch.tmp)
             .map_err(|e| format!("drafter L{li} ffn residual: {e:?}"))?;
     }
