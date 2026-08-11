@@ -1087,6 +1087,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a ROCm installation (ROCM_PATH / HIPFIRE_ROCM_PATH / /opt/rocm)"]
     fn probe_environment_gfx942_succeeds() {
         let (producer, engine) =
             ParentManifest::probe_environment("gfx942").expect("probe_environment must succeed");
