@@ -1544,9 +1544,9 @@ fn batch_attn_block(
         shape: kv.v_gpu[a.slot].shape.clone(),
         dtype: kv.v_gpu[a.slot].dtype,
     };
-    gpu.kv_cache_write_q8_0_batched(&k_cache_t, k, pos_array, n_kv, hd, b, 0)
+    gpu.kv_cache_write_q8_0_batched(&k_cache_t, k, pos_array, n_kv, hd, b)
         .map_err(|e| format!("gemma4 batch attn kv write k: {e:?}"))?;
-    gpu.kv_cache_write_q8_0_batched(&v_cache_t, v, pos_array, n_kv, hd, b, 0)
+    gpu.kv_cache_write_q8_0_batched(&v_cache_t, v, pos_array, n_kv, hd, b)
         .map_err(|e| format!("gemma4 batch attn kv write v: {e:?}"))?;
 
     // Masked batched attention: tree-bias mode with block_start=0,

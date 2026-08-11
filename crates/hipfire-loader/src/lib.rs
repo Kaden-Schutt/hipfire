@@ -13,6 +13,7 @@ pub use carriers::*;
 pub mod spec_build;
 
 use hipfire_arch_cohere2moe as cohere2moe;
+use hipfire_arch_gemma4 as gemma4;
 use hipfire_arch_deepseek4 as deepseek4;
 use hipfire_arch_dots_ocr::dots_ocr;
 use hipfire_arch_lfm2moe as lfm2moe;
@@ -103,6 +104,7 @@ const REGISTRY: &[&dyn Carrier] = &[
     &MinimaxCarrier,
     &Lfm2MoeCarrier,
     &Cohere2MoeCarrier,
+    &Gemma4Carrier,
 ];
 
 // ─── Constants ────────────────────────────────────────────────────────
@@ -115,6 +117,10 @@ const FROGGERIC_QWEN35_TEMPLATE: &str =
 /// Built-in LFM2.5 chat template.
 const LFM2_TEMPLATE: &str =
     include_str!("../../hipfire-runtime/templates/eval/lfm2-liquidai.jinja");
+
+/// Built-in Gemma 4 IT chat template (arch_id=13).
+const GEMMA4_TEMPLATE: &str =
+    include_str!("../../hipfire-runtime/templates/gemma-4-it.jinja");
 
 // ─── Eviction policy wrapper ──────────────────────────────────────────
 
@@ -261,6 +267,7 @@ pub enum ModelState {
     Lfm2Moe(Lfm2MoeBundle),
     Minimax(MiniMaxBundle),
     Cohere2Moe(Cohere2MoeBundle),
+    Gemma4(Gemma4Bundle),
     Deepseek4(hipfire_arch_deepseek4::Deepseek4Bundle),
     Deepseek4Heterogeneous(Deepseek4HeterogeneousBundle),
 }
@@ -291,6 +298,16 @@ pub use minimax::MiniMaxBundle;
 /// n-gram verify seam) lives next to the forward it drives (orphan rule).
 /// Field-identical to the prior loader-local struct.
 pub use cohere2moe::Cohere2MoeBundle;
+
+/// Gemma 4 dense text (arch_id=13) GPU bundle. Re-exported from the arch crate,
+/// which owns config/weights/state so `impl SpecTarget` can live there when
+/// needed. Field-identical to prior inline struct.
+pub struct Gemma4Bundle {
+    pub config: gemma4::config::Gemma4Config,
+    pub weights: gemma4::gemma4::Gemma4Weights,
+    pub state: gemma4::gemma4::Gemma4State,
+    pub eos_tok: u32,
+}
 
 // ─── LoadedModel ──────────────────────────────────────────────────────
 
@@ -2324,6 +2341,7 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(
             | Some(ModelState::Lfm2Moe(_))
             | Some(ModelState::Minimax(_))
             | Some(ModelState::Cohere2Moe(_))
+            | Some(ModelState::Gemma4(_))
             | Some(ModelState::Deepseek4(_))
             | Some(ModelState::Deepseek4Heterogeneous(_))
             | None => {}
@@ -2402,6 +2420,10 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(
                 b.weights.free_gpu(gpu);
             }
             ModelState::Cohere2Moe(b) => {
+                b.state.free_gpu(gpu);
+                b.weights.free_gpu(gpu);
+            }
+            ModelState::Gemma4(b) => {
                 b.state.free_gpu(gpu);
                 b.weights.free_gpu(gpu);
             }

@@ -40,7 +40,7 @@ description = "Inference orchestrator for RDNA GPUs"
 # block below) which serves both as documentation of which features
 # each example needs and as the gate for downstream library consumers
 # who attempt to build examples through their own build script.
-default = ["arch-qwen35", "arch-qwen35-vl", "arch-llama", "arch-qwen2", "arch-deepseek4", "arch-cohere2moe", "arch-dots-ocr", "deltanet"]
+default = ["arch-qwen35", "arch-qwen35-vl", "arch-llama", "arch-qwen2", "arch-deepseek4", "arch-cohere2moe", "arch-dots-ocr", "arch-gemma4", "deltanet"]
 deltanet = ["rdna-compute/deltanet", "hipfire-dispatch/deltanet"]
 arch-qwen35 = []
 arch-qwen35-vl = []
@@ -49,6 +49,7 @@ arch-qwen2 = []
 arch-deepseek4 = []
 arch-cohere2moe = []
 arch-dots-ocr = []
+arch-gemma4 = []
 # ep-fault-inject: enables the EP partial-load fault-injection knob
 # (HIPFIRE_EP_FAIL_RANK) in the daemon example, which makes a chosen EP rank
 # return a synthetic Err after uploading its weights so the staging-guard VRAM
@@ -128,6 +129,7 @@ hipfire-arch-minimax = { path = "../hipfire-arch-minimax" }
 hipfire-arch-cohere2moe = { path = "../hipfire-arch-cohere2moe" }
 hipfire-arch-deepseek4 = { path = "../hipfire-arch-deepseek4" }
 hipfire-arch-dots-ocr = { path = "../hipfire-arch-dots-ocr" }
+hipfire-arch-gemma4 = { path = "../hipfire-arch-gemma4" }
 hipfire-loader = { path = "../hipfire-loader" }
 hipfire-detect = { path = "../hipfire-detect" }
 hipfire-atlas = { path = "../hipfire-atlas" }
@@ -146,7 +148,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"]
 
 [[example]]
 name = "daemon"
-required-features = ["arch-qwen35", "arch-qwen35-vl", "arch-llama", "arch-qwen2", "arch-deepseek4", "arch-cohere2moe", "arch-dots-ocr"]
+required-features = ["arch-qwen35", "arch-qwen35-vl", "arch-llama", "arch-qwen2", "arch-deepseek4", "arch-cohere2moe", "arch-dots-ocr", "arch-gemma4"]
 
 [[example]]
 name = "hfq_split"

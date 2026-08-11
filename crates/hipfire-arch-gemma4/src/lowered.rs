@@ -2200,6 +2200,9 @@ fn sliding_layer_decode_impl(
             quant_fwht: kv_cache.quant_fwht,
             quant_hfq4: false,
             quant_q4: false,
+            quant_int8: false,
+            quant_hfq8: false,
+            f32_policy: hipfire_dispatch::families::kv_tier::F32AttnPolicy::Simple,
             v_mode_bits: kv_cache.v_mode_bits(),
             pos,
             flash_mode: 2, // forced flash — sliding layers need window masking
@@ -2207,9 +2210,8 @@ fn sliding_layer_decode_impl(
             batch_size: 1,
             is_tree: false,
             is_boundary: false,
-            cache_capacity: sliding_cap,
-            head_dim,
-            window_size: config.sliding_window as u32,
+            q8_windowed: false,
+            window: config.sliding_window as i32,
         };
         let plan = KvTierPlan::derive(tier_inputs)
             .map_err(|e| hip_bridge::HipError::new(0, &format!("{:?}", e)))?;
@@ -2228,8 +2230,6 @@ fn sliding_layer_decode_impl(
             n_kv_heads: n_kv,
             head_dim,
             physical_cap: kv_cache.max_seq,
-            cache_capacity: sliding_cap,
-            window_size: config.sliding_window as u32,
             batch_size: 1,
             max_ctx_len: 0,
             flash_partials: Some(&scratch.flash_partials),
@@ -2238,6 +2238,7 @@ fn sliding_layer_decode_impl(
             tree_bias: None,
             block_start: 0,
             block_cols: 0,
+            output_gate: None,
             output: &scratch.attn_out,
         };
         execute_steps(gpu, &ctx, &[Step::Attend { plan, io }])
@@ -2460,6 +2461,9 @@ fn full_layer_decode_impl(
             quant_fwht: kv_cache.quant_fwht,
             quant_hfq4: false,
             quant_q4: false,
+            quant_int8: false,
+            quant_hfq8: false,
+            f32_policy: hipfire_dispatch::families::kv_tier::F32AttnPolicy::Simple,
             v_mode_bits: kv_cache.v_mode_bits(),
             pos,
             flash_mode: 2,
@@ -2467,9 +2471,8 @@ fn full_layer_decode_impl(
             batch_size: 1,
             is_tree: false,
             is_boundary: false,
-            cache_capacity: 0,
-            head_dim,
-            window_size: 0,
+            q8_windowed: false,
+            window: 0,
         };
         let plan = KvTierPlan::derive(tier_inputs)
             .map_err(|e| hip_bridge::HipError::new(0, &format!("{:?}", e)))?;
@@ -2488,8 +2491,6 @@ fn full_layer_decode_impl(
             n_kv_heads: n_kv,
             head_dim,
             physical_cap: kv_cache.max_seq,
-            cache_capacity: 0,
-            window_size: 0,
             batch_size: 1,
             max_ctx_len: 0,
             flash_partials: Some(&scratch.flash_partials),
@@ -2498,6 +2499,7 @@ fn full_layer_decode_impl(
             tree_bias: None,
             block_start: 0,
             block_cols: 0,
+            output_gate: None,
             output: &scratch.attn_out,
         };
         execute_steps(gpu, &ctx, &[Step::Attend { plan, io }])
@@ -2889,6 +2891,9 @@ fn forward_prefill_batch_v2(
                         quant_fwht: kv_sliding.quant_fwht,
                         quant_hfq4: false,
                         quant_q4: false,
+                        quant_int8: false,
+                        quant_hfq8: false,
+                        f32_policy: hipfire_dispatch::families::kv_tier::F32AttnPolicy::Simple,
                         v_mode_bits: kv_sliding.v_mode_bits(),
                         pos,
                         flash_mode: 2,
@@ -2896,9 +2901,8 @@ fn forward_prefill_batch_v2(
                         batch_size: 1,
                         is_tree: false,
                         is_boundary: false,
-                        cache_capacity: sliding_cap,
-                        head_dim,
-                        window_size: sliding_cap,
+                        q8_windowed: false,
+                        window: sliding_cap as i32,
                     };
                     let plan = KvTierPlan::derive(tier_inputs)
                         .map_err(|e| hip_bridge::HipError::new(0, &format!("{:?}", e)))?;
@@ -2917,8 +2921,6 @@ fn forward_prefill_batch_v2(
                         n_kv_heads: n_kv,
                         head_dim,
                         physical_cap: kv_sliding.max_seq,
-                        cache_capacity: plan.cache_capacity,
-                        window_size: plan.window_size,
                         batch_size: 1,
                         max_ctx_len: 0,
                         flash_partials: Some(&scratch.flash_partials),
@@ -2927,6 +2929,7 @@ fn forward_prefill_batch_v2(
                         tree_bias: None,
                         block_start: 0,
                         block_cols: 0,
+                        output_gate: None,
                         output: &scratch.attn_out,
                     };
                     let ctx = DispatchCtx::new(gpu);
@@ -3028,6 +3031,9 @@ fn forward_prefill_batch_v2(
                     quant_fwht: kv_full.quant_fwht,
                     quant_hfq4: false,
                     quant_q4: false,
+                    quant_int8: false,
+                    quant_hfq8: false,
+                    f32_policy: hipfire_dispatch::families::kv_tier::F32AttnPolicy::Simple,
                     v_mode_bits: kv_full.v_mode_bits(),
                     pos: start_pos + n_batch - 1,
                     flash_mode: 2,
@@ -3035,9 +3041,8 @@ fn forward_prefill_batch_v2(
                     batch_size: n_batch,
                     is_tree: false,
                     is_boundary: false,
-                    cache_capacity: 0,
-                    head_dim,
-                    window_size: 0,
+                    q8_windowed: false,
+                    window: 0,
                 };
                 let plan = KvTierPlan::derive(tier_inputs)
                     .map_err(|e| hip_bridge::HipError::new(0, &format!("{:?}", e)))?;
@@ -3056,8 +3061,6 @@ fn forward_prefill_batch_v2(
                     n_kv_heads: n_kv,
                     head_dim,
                     physical_cap: kv_full.max_seq,
-                    cache_capacity: plan.cache_capacity,
-                    window_size: plan.window_size,
                     batch_size: n_batch,
                     max_ctx_len: start_pos + n_batch,
                     flash_partials: Some(&scratch.pb_flash_partials),
@@ -3066,6 +3069,7 @@ fn forward_prefill_batch_v2(
                     tree_bias: None,
                     block_start: 0,
                     block_cols: 0,
+                    output_gate: None,
                     output: &scratch.pb_attn_q,
                 };
                 let ctx = DispatchCtx::new(gpu);
@@ -3083,10 +3087,11 @@ fn forward_prefill_batch_v2(
                             quant_asym4: kv_full.quant_asym4, quant_asym3: kv_full.quant_asym3,
                             quant_asym2: kv_full.quant_asym2, quant_q8: kv_full.quant_q8,
                             quant_fwht: kv_full.quant_fwht, quant_hfq4: false, quant_q4: false,
+                            quant_int8: false, quant_hfq8: false,
+                            f32_policy: hipfire_dispatch::families::kv_tier::F32AttnPolicy::Simple,
                             v_mode_bits: kv_full.v_mode_bits(), pos, flash_mode: 2,
                             capture_mode: gpu.graphs.capture_mode, batch_size: 1,
-                            is_tree: false, is_boundary: false, cache_capacity: 0,
-                            head_dim, window_size: 0,
+                            is_tree: false, is_boundary: false, q8_windowed: false, window: 0,
                         };
                         let p1 = KvTierPlan::derive(ti)
                             .map_err(|e| hip_bridge::HipError::new(0, &format!("{:?}", e)))?;
@@ -3096,11 +3101,12 @@ fn forward_prefill_batch_v2(
                             k_scales: None, v_scales: None,
                             pos_buf: &scratch.pos_buf, pos, positions: None,
                             n_heads, n_kv_heads: n_kv, head_dim,
-                            physical_cap: kv_full.max_seq, cache_capacity: 0, window_size: 0,
+                            physical_cap: kv_full.max_seq,
                             batch_size: 1, max_ctx_len: 0,
                             flash_partials: Some(&scratch.flash_partials),
                             givens_cos: kv_full.givens_cos.as_ref(), givens_sin: kv_full.givens_sin.as_ref(),
                             tree_bias: None, block_start: 0, block_cols: 0,
+                            output_gate: None,
                             output: &scratch.attn_out,
                         };
                         let c1 = DispatchCtx::new(gpu);
@@ -3580,6 +3586,9 @@ impl<'a> ForwardBindings for Gemma4Bindings<'a> {
                     quant_fwht: kv.quant_fwht,
                     quant_hfq4: false,
                     quant_q4: false,
+                    quant_int8: false,
+                    quant_hfq8: false,
+                    f32_policy: hipfire_dispatch::families::kv_tier::F32AttnPolicy::Simple,
                     v_mode_bits: kv.v_mode_bits(),
                     pos,
                     flash_mode: 2,
@@ -3587,9 +3596,8 @@ impl<'a> ForwardBindings for Gemma4Bindings<'a> {
                     batch_size: 1,
                     is_tree: false,
                     is_boundary: false,
-                    cache_capacity: sliding_cap,
-                    head_dim,
-                    window_size: config.sliding_window as u32,
+                    q8_windowed: false,
+                    window: config.sliding_window as i32,
                 };
                 let plan = KvTierPlan::derive(tier_inputs)
                     .map_err(|e| hipfire_dispatch::types::DispatchError::Hip(format!("{:?}", e)))?;
@@ -3601,14 +3609,13 @@ impl<'a> ForwardBindings for Gemma4Bindings<'a> {
                     pos_buf: &s.pos_buf, pos, positions: None,
                     n_heads, n_kv_heads: n_kv, head_dim,
                     physical_cap: kv.max_seq,
-                    cache_capacity: sliding_cap,
-                    window_size: config.sliding_window as u32,
                     batch_size: 1, max_ctx_len: 0,
                     flash_partials: Some(&s.flash_partials),
                     givens_cos: kv.givens_cos.as_ref(),
                     givens_sin: kv.givens_sin.as_ref(),
                     tree_bias: None,
                     block_start: 0, block_cols: 0,
+                    output_gate: None,
                     output: &s.attn_out,
                 };
                 execute_steps(gpu, &ctx, &[Step::Attend { plan, io }])
@@ -3656,6 +3663,9 @@ impl<'a> ForwardBindings for Gemma4Bindings<'a> {
                     quant_fwht: kv.quant_fwht,
                     quant_hfq4: false,
                     quant_q4: false,
+                    quant_int8: false,
+                    quant_hfq8: false,
+                    f32_policy: hipfire_dispatch::families::kv_tier::F32AttnPolicy::Simple,
                     v_mode_bits: kv.v_mode_bits(),
                     pos,
                     flash_mode: 2,
@@ -3663,9 +3673,8 @@ impl<'a> ForwardBindings for Gemma4Bindings<'a> {
                     batch_size: 1,
                     is_tree: false,
                     is_boundary: false,
-                    cache_capacity: 0,
-                    head_dim,
-                    window_size: 0,
+                    q8_windowed: false,
+                    window: 0,
                 };
                 let plan = KvTierPlan::derive(tier_inputs)
                     .map_err(|e| hipfire_dispatch::types::DispatchError::Hip(format!("{:?}", e)))?;
@@ -3677,14 +3686,13 @@ impl<'a> ForwardBindings for Gemma4Bindings<'a> {
                     pos_buf: &s.pos_buf, pos, positions: None,
                     n_heads, n_kv_heads: n_kv, head_dim,
                     physical_cap: kv.max_seq,
-                    cache_capacity: 0,
-                    window_size: 0,
                     batch_size: 1, max_ctx_len: 0,
                     flash_partials: Some(&s.flash_partials),
                     givens_cos: kv.givens_cos.as_ref(),
                     givens_sin: kv.givens_sin.as_ref(),
                     tree_bias: None,
                     block_start: 0, block_cols: 0,
+                    output_gate: None,
                     output: &s.attn_out,
                 };
                 execute_steps(gpu, &ctx, &[Step::Attend { plan, io }])

@@ -5715,7 +5715,7 @@ impl KvCache {
             }
             KvMode::Asym2 | KvMode::Asym3 | KvMode::Asym4 => {
                 let ok_hd = match mode {
-                    KvMode::Asym3 => head_dim == 256,
+                    KvMode::Asym3 => head_dim == 256 || head_dim == 512,
                     _ => head_dim == 128 || head_dim == 256,
                 };
                 if !ok_hd {
@@ -5743,7 +5743,7 @@ impl KvCache {
             KvMode::Fwht2 | KvMode::Fwht3 | KvMode::Fwht4 => match v_mode {
                 VMode::Q8 => {
                     let ok_hd = match mode {
-                        KvMode::Fwht3 => head_dim == 256,
+                        KvMode::Fwht3 => head_dim == 256 || head_dim == 512,
                         _ => head_dim == 128 || head_dim == 256,
                     };
                     if !ok_hd {
@@ -5987,7 +5987,7 @@ impl KvCache {
                 "KV mode Asym3Auto must be resolved before allocation",
             ));
         }
-        if matches!(mode, KvMode::Asym4 | KvMode::Asym3) && dims.head_dim != 256 {
+        if matches!(mode, KvMode::Asym4 | KvMode::Asym3) && dims.head_dim != 256 && dims.head_dim != 512 {
             return Err(hip_bridge::HipError::new(
                 0,
                 &format!(
@@ -8487,8 +8487,8 @@ impl KvCache {
         physical_cap: usize,
     ) -> HipResult<Self> {
         assert!(
-            head_dim == 256,
-            "asym3 currently requires head_dim=256 (Qwen 3.5)"
+            head_dim == 256 || head_dim == 512,
+            "asym3 requires head_dim=256 or 512 (hd=512 added for gemma4)"
         );
         assert!(head_dim % 32 == 0);
         assert!(
@@ -8694,8 +8694,8 @@ impl KvCache {
         physical_cap: usize,
     ) -> HipResult<Self> {
         assert!(
-            head_dim == 256,
-            "asym3 currently requires head_dim=256 (Qwen 3.5)"
+            head_dim == 256 || head_dim == 512,
+            "asym3 requires head_dim=256 or 512 (hd=512 added for gemma4)"
         );
         assert!(head_dim % 32 == 0);
         assert!(

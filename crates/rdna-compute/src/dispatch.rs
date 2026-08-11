@@ -2724,6 +2724,16 @@ impl Gpu {
         }
     }
 
+    /// Invalidate the pointer-keyed F16 conversion cache. Must be called
+    /// between layers in batched prefill when the same activation buffer
+    /// (e.g. `pb_tmp`) is reused with different contents each layer —
+    /// the cache sees the same GPU pointer and skips the F32→F16
+    /// conversion, silently serving stale F16 data from the previous
+    /// layer.
+    pub fn invalidate_fp16_cache(&mut self) {
+        self.scratch.fp16_x_source_ptr = std::ptr::null_mut();
+    }
+
     /// Tear down all captured hipGraphs + their kernarg blobs. Captured
     /// graphs hold device pointers into the model's KV cache, scratch, and
     /// draft weights baked into kernarg memory by hipStreamEndCapture. Once
