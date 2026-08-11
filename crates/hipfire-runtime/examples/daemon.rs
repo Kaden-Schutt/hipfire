@@ -29385,6 +29385,42 @@ fn generate_muse_glimmer(
                 }
                 continue;
             }
+            // Bring-up diagnostic: HIPFIRE_GLIMMER_SPEC_DIAG=1 reports the L2 norm of
+            // each stage so a degenerate (all-zero) draft can be localised to the
+            // stage that produced it, rather than inferred from the argmax.
+            if std::env::var("HIPFIRE_GLIMMER_SPEC_DIAG").ok().as_deref() == Some("1")
+                && windows < 2
+            {
+                let l2 = |v: &[f32]| -> f32 { v.iter().map(|x| x * x).sum::<f32>().sqrt() };
+                let nz = |v: &[f32]| -> usize { v.iter().filter(|x| **x != 0.0).count() };
+                eprintln!(
+                    "[glimmer-diag] target_hidden: len {} l2 {:.4} nonzero {} head {:?}",
+                    target_hidden.len(),
+                    l2(&target_hidden),
+                    nz(&target_hidden),
+                    &target_hidden[..4.min(target_hidden.len())]
+                );
+                eprintln!(
+                    "[glimmer-diag] noise_embedding: len {} l2 {:.4} nonzero {}",
+                    noise_embedding.len(),
+                    l2(&noise_embedding),
+                    nz(&noise_embedding)
+                );
+                if let Ok(dx) = gpu.download_f32(&drafter.scratch.x) {
+                    for r in [0usize, 1, 2] {
+                        let s = r * hidden;
+                        if s + hidden <= dx.len() {
+                            let row = &dx[s..s + hidden];
+                            eprintln!(
+                                "[glimmer-diag] draft hidden row {r}: l2 {:.4} nonzero {} head {:?}",
+                                l2(row),
+                                nz(row),
+                                &row[..4]
+                            );
+                        }
+                    }
+                }
+            }
             // Real drafts: run TARGET lm_head over drafter hidden rows 1..B-1.
             // The drafter has no lm_head; this is the contract at qwen speculative.rs:3184.
             // For ctx we still pass a single zero row (hidden capture TODO) — tau will be honest
