@@ -395,6 +395,14 @@ pub struct GlimmerDrafterScratch {
     pub up_ffn: GpuTensor,
     pub ffn_hidden: GpuTensor,
     pub logits_tmp: GpuTensor, // [hidden] for final norm
+    /// Device positions for RoPE, sized for one block and allocated ONCE.
+    ///
+    /// This was originally malloc'd and freed inside the per-layer loop, which
+    /// is both a hipMalloc per layer per window and a lifetime hazard — the
+    /// freed pointer is what surfaced as `hipMemcpy H2D: an illegal memory
+    /// access` on the second window. The target's `GlimmerState` already keeps
+    /// a persistent `pos_buf` for exactly this reason; the drafter now matches.
+    pub pos_buf: hip_bridge::DeviceBuffer,
 }
 
 impl GlimmerDrafterScratch {
@@ -403,6 +411,10 @@ impl GlimmerDrafterScratch {
         let qd = cfg.q_dim();
         let kvd = cfg.kv_dim();
         let block = cfg.block_size;
+        let pos_buf = gpu
+            .hip
+            .malloc(4 * block)
+            .map_err(|e| format!("glimmer drafter: alloc pos_buf: {e:?}"))?;
         let alloc = |g: &mut Gpu, n: usize, label: &str| -> Result<GpuTensor, String> {
             g.zeros(&[n], DType::F32)
                 .map_err(|e| format!("glimmer drafter scratch {label}: {e:?}"))
@@ -419,6 +431,7 @@ impl GlimmerDrafterScratch {
             up_ffn: alloc(gpu, block * cfg.intermediate, "up_ffn")?,
             ffn_hidden: alloc(gpu, block * cfg.intermediate, "ffn_hidden")?,
             logits_tmp: alloc(gpu, h, "logits_tmp")?,
+            pos_buf,
         })
     }
 
@@ -584,12 +597,14 @@ pub fn glimmer_drafter_forward(
         // Need pos_buf for RoPE — allocate a temporary DeviceBuffer for positions
         // For now, skip RoPE if theta==0 (not here) — do it
         // Create a DeviceBuffer for positions_q
-        let pos_buf = gpu.hip.malloc(4 * block_size).map_err(|e| format!("drafter pos_buf: {e:?}"))?;
-        let pos_bytes = unsafe { std::slice::from_raw_parts(positions_q.as_ptr() as *const u8, positions_q.len()*4) };
-        gpu.hip.memcpy_htod(&pos_buf, pos_bytes).map_err(|e| format!("drafter htod pos: {e:?}"))?;
+        let pos_bytes = unsafe {
+            std::slice::from_raw_parts(positions_q.as_ptr() as *const u8, positions_q.len() * 4)
+        };
+        gpu.hip
+            .memcpy_htod(&scratch.pos_buf, pos_bytes)
+            .map_err(|e| format!("drafter htod pos: {e:?}"))?;
         // RoPE on Q and K (block only) — use head_dim full
-        gpu.rope_f32(&scratch.q, &scratch.k, &pos_buf, cfg.n_heads, cfg.n_kv_heads, cfg.head_dim, cfg.rope_theta).map_err(|e| format!("drafter L{li} rope: {e:?}"))?;
-        let _ = gpu.hip.free(pos_buf);
+        gpu.rope_f32(&scratch.q, &scratch.k, &scratch.pos_buf, cfg.n_heads, cfg.n_kv_heads, cfg.head_dim, cfg.rope_theta).map_err(|e| format!("drafter L{li} rope: {e:?}"))?;
         // Attention: for minimal, just do o_proj over q (skip KV gather) — still uses o_proj weight
         // Real impl would do attention_q8_0_kv_swa over [target_hidden_proj | block hidden]
         // Here we approximate: attn_out = q truncated/padded to q_dim
