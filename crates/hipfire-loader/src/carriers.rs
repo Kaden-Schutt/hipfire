@@ -1893,6 +1893,7 @@ impl Carrier for MuseGlimmerCarrier {
                         state,
                         eos_tok,
                         drafter,
+                        target_hidden_host: Vec::new(),
                     })),
                     speculator,
                     ..LoadedModel::skeleton(

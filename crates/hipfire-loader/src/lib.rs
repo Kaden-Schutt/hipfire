@@ -364,6 +364,13 @@ pub struct MuseGlimmerBundle {
     /// daemon runs AR-only; when `Some`, the target can be driven via the
     /// generic DFlash `Speculator` (see `carriers.rs`).
     pub drafter: Option<GlimmerDrafterBundle>,
+    /// Host-side target hidden history for DFlash: per-position concat of
+    /// residual hidden at target_layer_ids [1,13,25,37,49] (5*6656=33280 f32/pos)
+    /// in that order. Grows by 1 row per committed token; used as
+    /// `target_hidden` input to the drafter's encoder.fc. Empty until first
+    /// prefill completes. Order matches the concat the drafter's fc expects —
+    /// mixing layers silently degrades tau.
+    pub target_hidden_host: Vec<f32>,
 }
 
 /// Muse Glimmer DFlash drafter (arch 23) — `muse_glimmer_assistant` 5-layer

@@ -369,3 +369,173 @@ fn glimmer_layer_decode(
 
     Ok(())
 }
+
+// ─── Block-parallel verify (DFlash) ──────────────────────────────────
+
+/// Verify a block of `B` tokens at `position` in parallel-AR fashion,
+/// returning per-position argmax. Leaves `state` advanced by `B` (KV written
+/// at positions [position .. position+B-1], n_tokens bumped). Caller must
+/// handle partial-accept rollback via `rollback_to`.
+///
+/// This is the B-position analogue of `decode_step`: same embed (WITH
+/// embed_norm — this is the AR verify path, not the draft noise path),
+/// same layer loop (via `glimmer_layer_decode`), same final norm +
+/// lm_head * output_multiplier + softcap. No new kernels — it reuses the
+/// per-token `decode_step_body` logic in a loop, but batches the lm_head
+/// downloads per position so the caller sees per-position logits.
+///
+/// For `B==1` this is byte-identical to `decode_step` (modulo the extra
+/// per-pos alloc). For `B>1` it is the speculative-verify primitive the
+/// drafter's accept rule consumes at `spec.rs:130-183`.
+pub fn verify_block(
+    cfg: &GlimmerConfig,
+    weights: &GlimmerWeights,
+    state: &mut GlimmerState,
+    gpu: &mut Gpu,
+    block: &[u32],
+    position: u32,
+) -> Result<Vec<u32>, String> {
+    let mut picks = Vec::with_capacity(block.len());
+    for (i, &tok) in block.iter().enumerate() {
+        let pos = position + i as u32;
+        // embed (WITH norm — verify is AR) → layers → final_norm → lm_head → scale → softcap
+        let logits = decode_step(cfg, weights, state, gpu, tok, pos)?;
+        let pick = logits
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .map(|(idx, _)| idx as u32)
+            .unwrap();
+        picks.push(pick);
+    }
+    Ok(picks)
+}
+
+/// Roll back `state` to `target_pos` after a partial accept. For the
+/// pure-attention Glimmer target (no DeltaNet recurrent state), the only
+/// state to truncate is `n_tokens`; KV entries beyond `target_pos` will be
+/// overwritten by the next verify at that position (see `spec.rs:312-319`
+/// stateless commit_prefix contract). No GPU memset needed.
+pub fn rollback_to(state: &mut GlimmerState, target_pos: usize) {
+    state.n_tokens = target_pos;
+}
+
+/// Raw embedding lookup WITHOUT embed_norm — for DFlash draft noise.
+/// Mirrors the daemon's `speculative.rs:3087` raw `embedding_lookup_*` and the
+/// HF comment at `/tmp/modeling_muse_glimmer.py:439` ("Dflash needs to embed
+/// without the norm"). The AR `embed_lookup` DOES apply `rmsnorm_f32` with
+/// `embed_norm_ones`; this one deliberately does not.
+pub fn embed_raw(
+    cfg: &GlimmerConfig,
+    weights: &GlimmerWeights,
+    state: &mut GlimmerState,
+    gpu: &mut Gpu,
+    token_id: u32,
+) -> Result<Vec<f32>, String> {
+    // Reuse the same scratch `state.x` but skip the norm.
+    let dim = cfg.dim;
+    match weights.embd_format {
+        hipfire_runtime::llama::EmbeddingFormat::HFQ4G256 => gpu
+            .embedding_lookup_hfq4g256(&weights.embed_tokens, &state.x, token_id, dim)
+            .map_err(|e| format!("glimmer embed_raw hfq4g256: {e:?}"))?,
+        hipfire_runtime::llama::EmbeddingFormat::HFQ4G128 => gpu
+            .embedding_lookup_hfq4g128(&weights.embed_tokens, &state.x, token_id, dim)
+            .map_err(|e| format!("glimmer embed_raw hfq4g128: {e:?}"))?,
+        hipfire_runtime::llama::EmbeddingFormat::Q8_0 => gpu
+            .embedding_lookup_q8(&weights.embed_tokens, &state.x, token_id, dim)
+            .map_err(|e| format!("glimmer embed_raw q8: {e:?}"))?,
+        hipfire_runtime::llama::EmbeddingFormat::F32 => gpu
+            .embedding_lookup(&weights.embed_tokens, &state.x, token_id, dim)
+            .map_err(|e| format!("glimmer embed_raw f32: {e:?}"))?,
+        hipfire_runtime::llama::EmbeddingFormat::Q4K => {
+            return Err("glimmer embed_raw: Q4K unsupported".into())
+        }
+    }
+    let host = gpu
+        .download_f32(&state.x)
+        .map_err(|e| format!("glimmer embed_raw download: {e:?}"))?;
+    Ok(host[..dim].to_vec())
+}
+
+/// Decode one token and capture residual hidden at `capture_layers` (0-based).
+/// Captured hidden is appended to `hidden_out` as `capture_layers.len()*dim` f32
+/// in the order of `capture_layers` (which must be sorted ascending like
+/// [1,13,25,37,49] from dflash_extract_layer_ids(52,5)). The capture is the
+/// post-layer residual `x` (same tensor the target's `target_hidden` concat
+/// expects per dflash.rs:target_hidden contract). Uses `gpu.download_f32`
+/// per captured layer — slower but correct for the speculative path; prefill
+/// should use a batched variant if hot.
+pub fn decode_step_with_capture(
+    cfg: &GlimmerConfig,
+    weights: &GlimmerWeights,
+    state: &mut GlimmerState,
+    gpu: &mut Gpu,
+    token_id: u32,
+    position: u32,
+    capture_layers: &[usize],
+    hidden_out: &mut Vec<f32>,
+) -> Result<Vec<f32>, String> {
+    // Embed + per-layer loop, capturing when layer_idx in capture_layers
+    embed_lookup(cfg, weights, state, gpu, token_id)?;
+    // Need to track which capture idx we are at
+    let mut cap_set = std::collections::HashSet::new();
+    for &l in capture_layers { cap_set.insert(l); }
+    state.pos_host[0] = position as i32;
+    {
+        let pos_bytes = unsafe { std::slice::from_raw_parts(state.pos_host.as_ptr() as *const u8, 4) };
+        gpu.memcpy_htod_auto(&state.pos_buf, pos_bytes)
+            .map_err(|e| format!("glimmer capture: htod pos: {e:?}"))?;
+    }
+    for layer_idx in 0..cfg.n_layers {
+        let slot = state.kv_slot_for_layer[layer_idx];
+        let lw = &weights.layers[layer_idx];
+        glimmer_layer_decode(gpu, cfg, lw, layer_idx, slot, state)?;
+        if cap_set.contains(&layer_idx) {
+            // Download current residual stream `state.x` (dim f32)
+            let host = gpu.download_f32(&state.x).map_err(|e| format!("glimmer capture download L{}: {e:?}", layer_idx))?;
+            hidden_out.extend_from_slice(&host[..cfg.dim]);
+        }
+    }
+    state.n_tokens = position as usize + 1;
+    gpu.rmsnorm_f32(&state.x, &weights.final_norm, &state.tmp, cfg.rms_norm_eps)
+        .map_err(|e| format!("glimmer capture: final rmsnorm: {e:?}"))?;
+    weight_gemv(gpu, &weights.lm_head, &state.tmp, &state.logits)
+        .map_err(|e| format!("glimmer capture: lm_head: {e}"))?;
+    if cfg.output_multiplier != 1.0 {
+        gpu.scale_f32(&state.logits, cfg.output_multiplier)
+            .map_err(|e| format!("glimmer capture: outmul: {e:?}"))?;
+    }
+    if cfg.final_logit_softcapping > 0.0 {
+        gpu.logit_softcap_f32(&state.logits, cfg.vocab_size, cfg.final_logit_softcapping)
+            .map_err(|e| format!("glimmer capture: softcap: {e:?}"))?;
+    }
+    gpu.download_f32(&state.logits).map_err(|e| format!("glimmer capture: download logits: {e:?}"))
+}
+
+/// Block verify that also captures hidden at `capture_layers` for each
+/// position in the block, appending to `hidden_out` (same order as
+/// decode_step_with_capture). Used by the DFlash spec loop to keep
+/// `bundle.target_hidden_host` in sync with the committed prefix.
+pub fn verify_block_with_capture(
+    cfg: &GlimmerConfig,
+    weights: &GlimmerWeights,
+    state: &mut GlimmerState,
+    gpu: &mut Gpu,
+    block: &[u32],
+    position: u32,
+    capture_layers: &[usize],
+    hidden_out: &mut Vec<f32>,
+) -> Result<Vec<u32>, String> {
+    let mut picks = Vec::with_capacity(block.len());
+    for (i, &tok) in block.iter().enumerate() {
+        let pos = position + i as u32;
+        let logits = if !capture_layers.is_empty() {
+            decode_step_with_capture(cfg, weights, state, gpu, tok, pos, capture_layers, hidden_out)?
+        } else {
+            decode_step(cfg, weights, state, gpu, tok, pos)?
+        };
+        let pick = logits.iter().enumerate().max_by(|a,b| a.1.partial_cmp(b.1).unwrap()).map(|(idx,_)| idx as u32).unwrap();
+        picks.push(pick);
+    }
+    Ok(picks)
+}
