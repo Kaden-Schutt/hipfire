@@ -36,6 +36,34 @@ which is the AR-only bring-up baseline for the same arch.
 temp 0 is the required contract, not a bonus: acceptance is greedy-argmax, so
 divergence would be a correctness bug rather than an acceptance-rate matter.
 
+## Cross-architecture: DFlash wins on two of three
+
+Same MQ4 target, same drafter, same prompt, 64 tokens greedy, tau 8.333 and
+byte-identical output on every arch:
+
+| GPU | AR | DFlash | ratio |
+|---|---:|---:|---:|
+| gfx1201 (R9700, hiptrx) | 32.99 | 41.16 | **1.25x** |
+| gfx1151 (Strix Halo, hipx) | 13.85 | 16.59 | **1.20x** |
+| gfx1100 (hipx) | 40.00 | 11.62 | **0.29x** |
+
+gfx1100 is a REGRESSION and the arch is not DFlash-ready. Note what is and is not
+implicated: tau is 8.333 there, identical to gfx1201, and the output is
+byte-identical — so the drafter, the acceptance rule, and the whole numerical
+path are correct on RDNA3. Only the throughput collapses.
+
+That isolates it to the batched verify. gfx1100 has the fastest AR of the three
+(40.0 tok/s, highest bandwidth), yet its batched verify is roughly 4x less
+efficient relative to its own AR than gfx1201's is. The suspicion is that one or
+more of the batched kernels the verify depends on — the batched Q8/MQ4
+projections, or `attention_q8_0_kv_batched` — is falling back to a scalar path on
+RDNA3 rather than taking a WMMA route. `gemm_q8_0_batched_chunked` documents
+exactly this class of bug in its own comment: a former `is_rdna4()` gate left
+gfx11 on the scalar 1-wave-per-row kernel despite the RDNA3 WMMA kernel being
+validated, and that cost ~31% of gfx11 MTP verify GPU time on A3B.
+
+Until that is found, DFlash should stay off on gfx1100 — it is a 3.4x loss there.
+
 ## The tau gap is quantization noise, not a drafter difference
 
 Target B has a strictly more faithful lm_head, yet tau HALVES. The obvious
