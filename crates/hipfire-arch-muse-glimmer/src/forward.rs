@@ -49,6 +49,28 @@ fn batched_lm_head_enabled() -> bool {
     )
 }
 
+/// Chunk size for batched prefill. Default 256, overridable via
+/// `HIPFIRE_GLIMMER_PREFILL_CHUNK` for tuning (128-512 range).
+///
+/// VRAM cost (transient per-chunk scratch):
+///   dim=6656, q_dim=4096, kv_dim=256, hidden=19968, n_layers=52
+///   B=128: ~ 70 MB, B=256: ~140 MB, B=512: ~280 MB
+///   Computed as sum of batched tensors:
+///   x/residual/nrm/x_rot/o_out/normed ~ B*dim*6 *4 bytes
+///   q/attn_gate/attn_out/o_rot ~ B*q_dim*4 *4
+///   gate/up/ffn_hidden/down_rot ~ B*hidden*4 *4
+///   plus small k/v/pos. Model weights are 15.5 GB on 16 GB card leaving
+///   ~500 MB headroom, so B=256 (140 MB) is safe, B=512 (280 MB) is still
+///   within budget but closer to limit; B=128 is more conservative.
+///   We default to 256 as the mid-point and clamp env to [1,512].
+pub fn glimmer_prefill_chunk_size() -> usize {
+    std::env::var("HIPFIRE_GLIMMER_PREFILL_CHUNK")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(256)
+        .clamp(1, 512)
+}
+
 // ───────────────────────────── Decode ─────────────────────────────
 
 /// Decode one token; returns the full logits vector.
@@ -990,3 +1012,306 @@ pub fn verify_block_with_capture(
 
     Ok(picks)
 }
+// ─── Chunked batched prefill ─────────────────────────────────────────────
+
+/// Inner batched forward for one prefill chunk (B = chunk.len()).
+/// Shared layer machinery with `verify_block_with_capture`: same
+/// `proj_gemm_batched` / `fused_rmsnorm_rotate_mq_batched_for` helpers,
+/// same QK-norm/scale, same RoPE, same KV-write, same sandwich norms.
+/// Attention is causal within chunk + attends to all prior KV; for
+/// sliding layers (window=2048) where `seq_len > window` we route through
+/// `attention_q8_0_kv_batched_masked` with a per-row additive mask (-inf
+/// outside [pos-window+1, pos]) to match `attention_q8_0_kv_swa` exactly.
+/// For full layers and for early chunks where `seq_len <= window` we use
+/// the fast `attention_q8_0_kv_batched` causal path.
+///
+/// If `need_logits` is true, final norm + single-row lm_head is run on
+/// the LAST position only (not over the whole chunk). This avoids
+/// re-streaming the 202048-wide lm_head weight B times; we stream it
+/// once instead of B times. Say what we did: prefill discards
+/// intermediate logits, so we compute vocab only for position `pos+B-1`.
+fn prefill_chunk_batched(
+    cfg: &GlimmerConfig,
+    weights: &GlimmerWeights,
+    state: &mut GlimmerState,
+    gpu: &mut Gpu,
+    chunk: &[u32],
+    position: u32,
+    capture_layers: &[usize],
+    hidden_out: &mut Vec<f32>,
+    need_logits: bool,
+) -> Result<Option<Vec<f32>>, String> {
+    let b = chunk.len();
+    if b == 0 {
+        return Ok(None);
+    }
+    if b > 512 {
+        return Err(format!("glimmer prefill: B={b} exceeds chunk cap 512"));
+    }
+    let dim = cfg.dim;
+    let q_dim = cfg.q_dim();
+    let kv_dim = cfg.kv_dim();
+    let hd = cfg.head_dim;
+    let n_heads = cfg.n_heads;
+    let n_kv = cfg.n_kv_heads;
+    let rms_eps = cfg.rms_norm_eps;
+    let post_eps = cfg.post_norm_eps;
+    let seq_len = position as usize + b;
+    let phys_cap = state.max_seq;
+
+    let alloc = |g: &mut Gpu, n: usize, label: &str| -> Result<GpuTensor, String> {
+        g.alloc_tensor(&[n], DType::F32)
+            .map_err(|e| format!("glimmer prefill alloc {label}: {e:?}"))
+    };
+    let x = alloc(gpu, b * dim, "x")?;
+    let residual = alloc(gpu, b * dim, "residual")?;
+    let nrm = alloc(gpu, b * dim, "nrm")?;
+    let x_rot = alloc(gpu, b * dim, "x_rot")?;
+    let q = alloc(gpu, b * q_dim, "q")?;
+    let k = alloc(gpu, b * kv_dim, "k")?;
+    let v = alloc(gpu, b * kv_dim, "v")?;
+    let attn_gate = alloc(gpu, b * q_dim, "attn_gate")?;
+    let attn_out = alloc(gpu, b * q_dim, "attn_out")?;
+    let o_rot = alloc(gpu, b * q_dim, "o_rot")?;
+    let o_out = alloc(gpu, b * dim, "o_out")?;
+    let gate_ffn = alloc(gpu, b * cfg.hidden_dim, "gate_ffn")?;
+    let up_ffn = alloc(gpu, b * cfg.hidden_dim, "up_ffn")?;
+    let ffn_hidden = alloc(gpu, b * cfg.hidden_dim, "ffn_hidden")?;
+    let ffn_out = alloc(gpu, b * dim, "ffn_out")?;
+    let down_rot = alloc(gpu, b * cfg.hidden_dim, "down_rot")?;
+
+    let pos_data: Vec<i32> = (0..b).map(|i| (position + i as u32) as i32).collect();
+    let pos_bytes: Vec<u8> = pos_data.iter().flat_map(|p| p.to_ne_bytes()).collect();
+    let pos_array = alloc(gpu, b, "pos_array")?;
+    gpu.hip
+        .memcpy_htod(&pos_array.buf, &pos_bytes)
+        .map_err(|e| format!("glimmer prefill htod pos: {e:?}"))?;
+
+    // ── Embedding ──
+    {
+        let x_single = alloc(gpu, dim, "x_single")?;
+        for (i, &tok) in chunk.iter().enumerate() {
+            match weights.embd_format {
+                EmbeddingFormat::HFQ4G256 => gpu.embedding_lookup_hfq4g256(&weights.embed_tokens, &x_single, tok, dim).map_err(|e| format!("glimmer prefill embed hfq4g256: {e:?}"))?,
+                EmbeddingFormat::HFQ4G128 => gpu.embedding_lookup_hfq4g128(&weights.embed_tokens, &x_single, tok, dim).map_err(|e| format!("glimmer prefill embed hfq4g128: {e:?}"))?,
+                EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8(&weights.embed_tokens, &x_single, tok, dim).map_err(|e| format!("glimmer prefill embed q8: {e:?}"))?,
+                EmbeddingFormat::F32 => gpu.embedding_lookup(&weights.embed_tokens, &x_single, tok, dim).map_err(|e| format!("glimmer prefill embed f32: {e:?}"))?,
+                EmbeddingFormat::Q4K => return Err("glimmer prefill: Q4K embed unsupported".to_string()),
+            }
+            if !abl("HIPFIRE_GLIMMER_NO_EMBED_NORM") {
+                gpu.rmsnorm_f32(&x_single, &state.embed_norm_ones, &x_single, rms_eps).map_err(|e| format!("glimmer prefill embed_norm: {e:?}"))?;
+            }
+            gpu.hip.memcpy_dtod_at(&x.buf, i * dim * 4, &x_single.buf, 0, dim * 4).map_err(|e| format!("glimmer prefill embed copy: {e:?}"))?;
+        }
+        gpu.free_tensor(x_single).ok();
+    }
+
+    // Capture prep
+    let mut sorted_caps: Vec<usize> = capture_layers.to_vec();
+    sorted_caps.sort_unstable();
+    let cap_cnt = sorted_caps.len();
+    let mut cap_index = vec![None; cfg.n_layers];
+    for (ci, &li) in sorted_caps.iter().enumerate() {
+        if li < cfg.n_layers { cap_index[li] = Some(ci); }
+    }
+    let mut cap_buf: Vec<f32> = if cap_cnt > 0 { vec![0.0f32; b * cap_cnt * dim] } else { Vec::new() };
+
+    // Sliding-window bias for batched masked attention (one buffer reused
+    // across all sliding layers). Only built when seq_len exceeds window.
+    let need_bias = seq_len > cfg.sliding_window && cfg.n_sliding_layers() > 0;
+    let window_bias: Option<GpuTensor> = if need_bias {
+        let window = cfg.sliding_window;
+        let total = b * seq_len;
+        let mut bias_host = Vec::with_capacity(total);
+        for b_idx in 0..b {
+            let pos = position as usize + b_idx;
+            let t_lo = if pos + 1 > window { pos + 1 - window } else { 0 };
+            let t_hi = pos;
+            for t in 0..seq_len {
+                let v = if t >= t_lo && t <= t_hi { 0.0f32 } else { f32::NEG_INFINITY };
+                bias_host.push(v);
+            }
+        }
+        let bias_gpu = alloc(gpu, total, "window_bias")?;
+        let bias_bytes = unsafe { std::slice::from_raw_parts(bias_host.as_ptr() as *const u8, total * 4) };
+        gpu.hip.memcpy_htod(&bias_gpu.buf, bias_bytes).map_err(|e| format!("glimmer prefill bias upload: {e:?}"))?;
+        Some(bias_gpu)
+    } else { None };
+
+    // ── Per-layer batched forward ──
+    for layer_idx in 0..cfg.n_layers {
+        let slot = state.kv_slot_for_layer[layer_idx];
+        let lw = &weights.layers[layer_idx];
+        let has_rope = cfg.has_rope(layer_idx);
+        let window = cfg.window_for(layer_idx);
+
+        gpu.hip.memcpy_dtod_at(&residual.buf, 0, &x.buf, 0, b * dim * 4).map_err(|e| format!("glimmer prefill L{layer_idx} save residual: {e:?}"))?;
+
+        let need_shared = shared_rot_enabled()
+            && hipfire_dispatch::types::dtype_rotation_plan(lw.q_proj.gpu_dtype) != hipfire_dispatch::types::RotationPlan::None;
+        if need_shared {
+            fused_rmsnorm_rotate_mq_batched_for(
+                gpu, &x, &lw.input_layernorm, &lw.q_proj, &x_rot, dim, rms_eps, b,
+            ).map_err(|e| format!("glimmer prefill L{layer_idx} fused input rmsnorm+rotate: {e:?}"))?;
+            proj_gemm_batched_prerotated(gpu, &lw.q_proj, &nrm, &x_rot, &q, b, "q_proj")?;
+            proj_gemm_batched_prerotated(gpu, &lw.k_proj, &nrm, &x_rot, &k, b, "k_proj")?;
+            proj_gemm_batched_prerotated(gpu, &lw.v_proj, &nrm, &x_rot, &v, b, "v_proj")?;
+            proj_gemm_batched_prerotated(gpu, &lw.attn_gate_proj, &nrm, &x_rot, &attn_gate, b, "attn_gate")?;
+        } else {
+            gpu.rmsnorm_batched(&x, &lw.input_layernorm, &nrm, b, dim, rms_eps).map_err(|e| format!("glimmer prefill L{layer_idx} input rmsnorm: {e:?}"))?;
+            proj_gemm_batched(gpu, &lw.q_proj, &nrm, &q, &x_rot, b, "q_proj")?;
+            proj_gemm_batched(gpu, &lw.k_proj, &nrm, &k, &x_rot, b, "k_proj")?;
+            proj_gemm_batched(gpu, &lw.v_proj, &nrm, &v, &x_rot, b, "v_proj")?;
+            proj_gemm_batched(gpu, &lw.attn_gate_proj, &nrm, &attn_gate, &x_rot, b, "attn_gate")?;
+        }
+
+        if !abl("HIPFIRE_GLIMMER_NO_QK_NORM") {
+            gpu.rmsnorm_batched(&q, &state.qk_norm_ones, &q, b * n_heads, hd, rms_eps).map_err(|e| format!("glimmer prefill L{layer_idx} q_norm: {e:?}"))?;
+            gpu.rmsnorm_batched(&k, &state.qk_norm_ones, &k, b * n_kv, hd, rms_eps).map_err(|e| format!("glimmer prefill L{layer_idx} k_norm: {e:?}"))?;
+        }
+        if !abl("HIPFIRE_GLIMMER_NO_QK_SCALE") {
+            gpu.scale_f32(&q, cfg.qk_scale_factor).map_err(|e| format!("glimmer prefill L{layer_idx} q scale: {e:?}"))?;
+        }
+
+        if has_rope || abl("HIPFIRE_GLIMMER_ROPE_ALL") {
+            let theta = cfg.rope_theta_for(layer_idx);
+            if abl("HIPFIRE_GLIMMER_ROPE_INTERLEAVED") {
+                gpu.rope_interleaved_f32_batched(&q, &k, &pos_array, n_heads, n_kv, hd, hd, theta, b).map_err(|e| format!("glimmer prefill L{layer_idx} rope interleaved batched: {e:?}"))?;
+            } else {
+                gpu.rope_batched_f32(&q, &k, &pos_array, n_heads, n_kv, hd, theta, b).map_err(|e| format!("glimmer prefill L{layer_idx} rope batched: {e:?}"))?;
+            }
+        }
+
+        let kv = match cfg.layer_types[layer_idx] {
+            GlimmerLayerType::Sliding => &state.kv_sliding,
+            GlimmerLayerType::Full => &state.kv_full,
+        };
+        let k_cache = unsafe { kv.k_gpu[slot].buf.alias() };
+        let v_cache = unsafe { kv.v_gpu[slot].buf.alias() };
+        let k_cache_t = GpuTensor { buf: k_cache, shape: kv.k_gpu[slot].shape.clone(), dtype: kv.k_gpu[slot].dtype };
+        let v_cache_t = GpuTensor { buf: v_cache, shape: kv.v_gpu[slot].shape.clone(), dtype: kv.v_gpu[slot].dtype };
+        gpu.kv_cache_write_q8_0_batched(&k_cache_t, &k, &pos_array, n_kv, hd, b).map_err(|e| format!("glimmer prefill L{layer_idx} kv write k: {e:?}"))?;
+        gpu.kv_cache_write_q8_0_batched(&v_cache_t, &v, &pos_array, n_kv, hd, b).map_err(|e| format!("glimmer prefill L{layer_idx} kv write v: {e:?}"))?;
+
+        // Attention: window-aware dispatch
+        if window != 0 && seq_len > window {
+            let bias_ref = window_bias.as_ref().expect("window bias missing for sliding layer");
+            gpu.attention_q8_0_kv_batched_masked(&q, &k_cache_t, &v_cache_t, &attn_out, &pos_array, n_heads, n_kv, hd, phys_cap, seq_len, b, Some(bias_ref), 0, seq_len).map_err(|e| format!("glimmer prefill L{layer_idx} attention masked: {e:?}"))?;
+        } else {
+            gpu.attention_q8_0_kv_batched(&q, &k_cache_t, &v_cache_t, &attn_out, &pos_array, n_heads, n_kv, hd, phys_cap, seq_len, b).map_err(|e| format!("glimmer prefill L{layer_idx} attention batched: {e:?}"))?;
+        }
+
+        if !abl("HIPFIRE_GLIMMER_NO_ATTN_GATE") {
+            gpu.sigmoid_mul_f32(&attn_out, &attn_gate).map_err(|e| format!("glimmer prefill L{layer_idx} sigmoid_mul: {e:?}"))?;
+        }
+
+        proj_gemm_batched(gpu, &lw.o_proj, &attn_out, &o_out, &o_rot, b, "o_proj")?;
+        gpu.rmsnorm_batched(&o_out, &lw.post_attention_layernorm, &o_out, b, dim, post_eps).map_err(|e| format!("glimmer prefill L{layer_idx} post_attn rmsnorm: {e:?}"))?;
+        gpu.hip.memcpy_dtod_at(&x.buf, 0, &residual.buf, 0, b * dim * 4).map_err(|e| format!("glimmer prefill L{layer_idx} reset x (attn): {e:?}"))?;
+        gpu.add_inplace_f32(&x, &o_out).map_err(|e| format!("glimmer prefill L{layer_idx} attn residual add: {e:?}"))?;
+        gpu.hip.memcpy_dtod_at(&residual.buf, 0, &x.buf, 0, b * dim * 4).map_err(|e| format!("glimmer prefill L{layer_idx} save ffn residual: {e:?}"))?;
+
+        let ffn_shared = shared_rot_enabled()
+            && hipfire_dispatch::types::dtype_rotation_plan(lw.gate_proj.gpu_dtype) != hipfire_dispatch::types::RotationPlan::None;
+        if ffn_shared {
+            fused_rmsnorm_rotate_mq_batched_for(
+                gpu, &x, &lw.pre_feedforward_layernorm, &lw.gate_proj, &x_rot, dim, rms_eps, b,
+            ).map_err(|e| format!("glimmer prefill L{layer_idx} fused pre_ffn rmsnorm+rotate: {e:?}"))?;
+            proj_gemm_batched_prerotated(gpu, &lw.gate_proj, &nrm, &x_rot, &gate_ffn, b, "gate_proj")?;
+            proj_gemm_batched_prerotated(gpu, &lw.up_proj, &nrm, &x_rot, &up_ffn, b, "up_proj")?;
+        } else {
+            gpu.rmsnorm_batched(&x, &lw.pre_feedforward_layernorm, &nrm, b, dim, rms_eps).map_err(|e| format!("glimmer prefill L{layer_idx} pre_ffn rmsnorm: {e:?}"))?;
+            proj_gemm_batched(gpu, &lw.gate_proj, &nrm, &gate_ffn, &x_rot, b, "gate_proj")?;
+            proj_gemm_batched(gpu, &lw.up_proj, &nrm, &up_ffn, &x_rot, b, "up_proj")?;
+        }
+        gpu.silu_mul_f32(&gate_ffn, &up_ffn, &ffn_hidden).map_err(|e| format!("glimmer prefill L{layer_idx} silu_mul: {e:?}"))?;
+        proj_gemm_batched(gpu, &lw.down_proj, &ffn_hidden, &ffn_out, &down_rot, b, "down_proj")?;
+        gpu.rmsnorm_batched(&ffn_out, &lw.post_feedforward_layernorm, &ffn_out, b, dim, post_eps).map_err(|e| format!("glimmer prefill L{layer_idx} post_ffn rmsnorm: {e:?}"))?;
+        gpu.hip.memcpy_dtod_at(&x.buf, 0, &residual.buf, 0, b * dim * 4).map_err(|e| format!("glimmer prefill L{layer_idx} reset x (ffn): {e:?}"))?;
+        gpu.add_inplace_f32(&x, &ffn_out).map_err(|e| format!("glimmer prefill L{layer_idx} ffn residual add: {e:?}"))?;
+
+        if let Some(ci) = cap_index[layer_idx] {
+            let host = gpu.download_f32(&x).map_err(|e| format!("glimmer prefill capture L{layer_idx}: {e:?}"))?;
+            for row in 0..b {
+                let src_off = row * dim;
+                let dst_off = (row * cap_cnt + ci) * dim;
+                cap_buf[dst_off..dst_off + dim].copy_from_slice(&host[src_off..src_off + dim]);
+            }
+        }
+    }
+    if cap_cnt > 0 {
+        hidden_out.extend_from_slice(&cap_buf);
+    }
+    state.n_tokens = seq_len;
+
+    // ── Final norm + lm_head: ONLY last row when needed ──
+    let last_logits: Option<Vec<f32>> = if need_logits {
+        let normed = alloc(gpu, b * dim, "normed")?;
+        gpu.rmsnorm_batched(&x, &weights.final_norm, &normed, b, dim, rms_eps).map_err(|e| format!("glimmer prefill final rmsnorm: {e:?}"))?;
+        let last_norm = normed.sub_offset((b - 1) * dim, dim);
+        weight_gemv(gpu, &weights.lm_head, &last_norm, &state.logits)
+            .map_err(|e| format!("glimmer prefill lm_head: {e}"))?;
+        if cfg.output_multiplier != 1.0 && !abl("HIPFIRE_GLIMMER_NO_OUTMUL") {
+            gpu.scale_f32(&state.logits, cfg.output_multiplier).map_err(|e| format!("glimmer prefill outmul: {e:?}"))?;
+        }
+        if cfg.final_logit_softcapping > 0.0 && !abl("HIPFIRE_GLIMMER_NO_SOFTCAP") {
+            gpu.logit_softcap_f32(&state.logits, cfg.vocab_size, cfg.final_logit_softcapping).map_err(|e| format!("glimmer prefill softcap: {e:?}"))?;
+        }
+        let host = gpu.download_f32(&state.logits).map_err(|e| format!("glimmer prefill download logits: {e:?}"))?;
+        gpu.free_tensor(normed).ok();
+        Some(host)
+    } else { None };
+
+    // Free batched scratch
+    for t in [x, residual, nrm, x_rot, q, k, v, attn_gate, attn_out, o_rot, o_out, gate_ffn, up_ffn, ffn_hidden, ffn_out, down_rot, pos_array] {
+        gpu.free_tensor(t).ok();
+    }
+    if let Some(bias) = window_bias { gpu.free_tensor(bias).ok(); }
+
+    Ok(last_logits)
+}
+
+/// Chunked batched prefill entry point. Processes `prompt` in chunks of
+/// `HIPFIRE_GLIMMER_PREFILL_CHUNK` (default 256, env overridable, 1-512).
+/// Reuses the batched layer machinery from `verify_block_with_capture`
+/// (same `proj_gemm_batched` helpers, same fused rotate, same attention)
+/// but over larger B. Returns the last prompt token's logits, which seed
+/// greedy decode. When `capture_layers` is non-empty, `hidden_out` is
+/// extended with `B*len(capture_layers)*dim` floats per chunk in ascending
+/// tap-layer order, position-major — identical to the per-token
+/// `decode_step_with_capture` contract.
+///
+/// Intermediate chunks skip the lm_head entirely (only the final position's
+/// logits are needed to seed generation). This is the "do NOT run it over
+/// the whole chunk" optimization: we run one `weight_gemv` on the last row
+/// instead of a batched GEMM over B rows, streaming the 700 MB lm_head once
+/// instead of B times.
+pub fn prefill_with_capture(
+    cfg: &GlimmerConfig,
+    weights: &GlimmerWeights,
+    state: &mut GlimmerState,
+    gpu: &mut Gpu,
+    prompt: &[u32],
+    start_pos: u32,
+    capture_layers: &[usize],
+    hidden_out: &mut Vec<f32>,
+) -> Result<Vec<f32>, String> {
+    if prompt.is_empty() {
+        return Err("glimmer prefill: empty prompt".to_string());
+    }
+    let chunk_size = glimmer_prefill_chunk_size();
+    let mut last_logits: Option<Vec<f32>> = None;
+    let mut pos = start_pos;
+    let mut offset = 0usize;
+    while offset < prompt.len() {
+        let end = (offset + chunk_size).min(prompt.len());
+        let chunk = &prompt[offset..end];
+        let is_last = end == prompt.len();
+        let logits_opt = prefill_chunk_batched(cfg, weights, state, gpu, chunk, pos, capture_layers, hidden_out, is_last)?;
+        if let Some(l) = logits_opt { last_logits = Some(l); }
+        pos += chunk.len() as u32;
+        offset = end;
+    }
+    last_logits.ok_or_else(|| "glimmer prefill: no logits produced".to_string())
+}
+

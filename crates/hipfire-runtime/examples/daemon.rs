@@ -29212,57 +29212,36 @@ fn generate_muse_glimmer(
 
     let t0 = Instant::now();
 
-    // ── Prefill: eager decode_step per prompt token. The LAST decode_step's
-    // logits are the predictions for the first generated token.
-    // When a DFlash drafter is present, capture residual hidden at
-    // target_layer_ids [1,13,25,37,49] (0-based, dflash_extract_layer_ids(52,5))
-    // in the order the drafter's encoder.fc expects (5*6656 concat).
-    // The capture is host-side Vec<f32> growing by 33280 per committed token.
+    // ── Prefill: chunked batched forward reusing the verify path's batched
+    // layer machinery (proj_gemm_batched, fused rotate, QK-norm, RoPE, KV
+    // write, attention, sandwich norms, FFN). One full 52-layer forward per
+    // CHUNK (default 256 tokens) instead of per token → each weight is
+    // streamed once per chunk instead of once per token.
+    // Correctness: KV written for every prompt position in order, per-layer
+    // sliding(2048)/full split and NoPE (theta==0) identical to single path,
+    // causal within chunk + prior KV, last token's logits seed decode,
+    // DFlash capture contract preserved (5*6656 per position, asc order).
     let mut last_logits: Vec<f32> = Vec::new();
     {
-        let mut position = bundle.state.n_tokens as u32;
         let capture = bundle.drafter.is_some();
         let tap_layers: Vec<usize> = glimmer_tap_layers(bundle.config.n_layers);
         let target_layers: &[usize] = if capture { &tap_layers } else { &[] };
-        for &tok in &prompt_ids {
-            if capture {
-                let mut hidden_buf = Vec::new();
-                match glimmer::forward::decode_step_with_capture(
-                    &bundle.config,
-                    &bundle.weights,
-                    &mut bundle.state,
-                    gpu,
-                    tok,
-                    position,
-                    target_layers,
-                    &mut hidden_buf,
-                ) {
-                    Ok(logits) => {
-                        last_logits = logits;
-                        bundle.target_hidden_host.extend_from_slice(&hidden_buf);
-                    },
-                    Err(e) => {
-                        emit_error_with_id(stdout, id, format!("muse_glimmer prefill failed: {e:?}"));
-                        return;
-                    }
-                }
-            } else {
-                match glimmer::forward::decode_step(
-                    &bundle.config,
-                    &bundle.weights,
-                    &mut bundle.state,
-                    gpu,
-                    tok,
-                    position,
-                ) {
-                    Ok(logits) => last_logits = logits,
-                    Err(e) => {
-                        emit_error_with_id(stdout, id, format!("muse_glimmer prefill failed: {e:?}"));
-                        return;
-                    }
-                }
+        let start_pos = bundle.state.n_tokens as u32;
+        match glimmer::forward::prefill_with_capture(
+            &bundle.config,
+            &bundle.weights,
+            &mut bundle.state,
+            gpu,
+            &prompt_ids,
+            start_pos,
+            target_layers,
+            &mut bundle.target_hidden_host,
+        ) {
+            Ok(logits) => last_logits = logits,
+            Err(e) => {
+                emit_error_with_id(stdout, id, format!("muse_glimmer prefill failed: {e:?}"));
+                return;
             }
-            position += 1;
         }
     }
     for &tok in &prompt_ids {
