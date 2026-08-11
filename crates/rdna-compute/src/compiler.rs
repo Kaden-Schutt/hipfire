@@ -258,7 +258,7 @@ fn seed_hot_from_cold(cold: &Path, hot: &Path) -> std::io::Result<()> {
 /// Cache-key version. Bump when the kernel ABI or hipcc invocation changes in a
 /// way that makes previously-cached `.hsaco` blobs incompatible, to force a clean
 /// recompile instead of loading a stale "invalid device image".
-const KERNEL_CACHE_ABI: u32 = 2;
+const KERNEL_CACHE_ABI: u32 = 3;
 
 /// Compiles HIP kernel sources to code objects, with caching.
 ///
@@ -800,10 +800,14 @@ impl KernelCompiler {
         obj_path: &Path,
         passthrough: Vec<String>,
     ) -> Vec<String> {
+        // clang ≥19 compresses offload bundles by default. HIP's loader accepts the
+        // compressed container; the public HSA reader Redline uses does not, so a
+        // CCOB blob demotes every retained route to plain HIP.
         let mut args: Vec<String> = vec![
             "--genco".into(),
             format!("--offload-arch={arch}"),
             "-O3".into(),
+            "--no-offload-compress".into(),
         ];
         args.extend(passthrough);
         args.push("-o".into());
@@ -1195,7 +1199,7 @@ mod tests {
 
     #[test]
     fn cache_abi_invalidates_pre_radiowave_compiler_entries() {
-        assert_eq!(KERNEL_CACHE_ABI, 2);
+        assert_eq!(KERNEL_CACHE_ABI, 3);
     }
 
     #[test]
@@ -1564,6 +1568,7 @@ mod tests {
                 "--genco",
                 "--offload-arch=gfx1100",
                 "-O3",
+                "--no-offload-compress",
                 "-I/opt/rocm/include",
                 "-o",
                 "kernel.hsaco",
