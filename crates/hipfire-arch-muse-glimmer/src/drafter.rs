@@ -571,8 +571,8 @@ pub fn glimmer_drafter_forward(
     // This keeps the kernel set identical to forward.rs (weight_gemv, rmsnorm, rope, silu_mul).
     // We keep the attention as identity + o_proj to prove the path is live.
     for (li, layer) in weights.layers.iter().enumerate() {
-        // rmsnorm x -> tmp
-        gpu.rmsnorm_f32(&scratch.x, &layer.input_layernorm, &scratch.tmp, eps).map_err(|e| format!("drafter L{li} input norm: {e:?}"))?;
+        // rmsnorm x -> tmp (batched over block)
+        gpu.rmsnorm_batched(&scratch.x, &layer.input_layernorm, &scratch.tmp, block_size, h, eps).map_err(|e| format!("drafter L{li} input norm: {e:?}"))?;
         // q/k/v/o
         // For block-parallel, we need batched gemv per row; weight_gemv handles batched via gemm dispatch when input is [block*h]
         // But our weight_gemv is single-row; we need to loop per block row for now (correct but slower).
@@ -618,7 +618,7 @@ pub fn glimmer_drafter_forward(
         // Residual add: x = x + tmp
         gpu.add_inplace_f32(&scratch.x, &scratch.tmp).map_err(|e| format!("drafter L{li} attn residual: {e:?}"))?;
         // FFN
-        gpu.rmsnorm_f32(&scratch.x, &layer.input_layernorm, &scratch.tmp, eps).map_err(|e| format!("drafter L{li} pre ffn norm: {e:?}"))?; // reuse input_ln as pre_ffn for drafter (it has no separate pre_ffn)
+        gpu.rmsnorm_batched(&scratch.x, &layer.input_layernorm, &scratch.tmp, block_size, h, eps).map_err(|e| format!("drafter L{li} pre ffn norm: {e:?}"))?; // reuse input_ln as pre_ffn for drafter (it has no separate pre_ffn)
         for pos in 0..block_size {
             let n2 = scratch.tmp.sub_offset(pos * h, h);
             let g = scratch.gate_ffn.sub_offset(pos * cfg.intermediate, cfg.intermediate);
@@ -634,7 +634,7 @@ pub fn glimmer_drafter_forward(
         }
         gpu.add_inplace_f32(&scratch.x, &scratch.tmp).map_err(|e| format!("drafter L{li} ffn residual: {e:?}"))?;
     }
-    gpu.rmsnorm_f32(&scratch.x, &weights.norm, &scratch.x, eps).map_err(|e| format!("drafter final norm: {e:?}"))?;
+    gpu.rmsnorm_batched(&scratch.x, &weights.norm, &scratch.x, block_size, h, eps).map_err(|e| format!("drafter final norm: {e:?}"))?;
     Ok(())
 }
 

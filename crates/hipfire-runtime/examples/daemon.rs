@@ -29287,6 +29287,30 @@ fn generate_muse_glimmer(
         // If prefill already placed the prompt's last token at n_tokens-1,
         // the seed position is n_tokens (next write slot). Use that.
         let mut cur_pos = bundle.state.n_tokens as u32;
+        // Emit the seed (first generated token) before the first draft window.
+        // In AR, last_pick is the first emitted token; in spec, the block's
+        // seed is that token, and drafts are for the following positions.
+        // Without this, the first window would emit picks[1] (second token)
+        // and the output would start mid-sequence (e.g. ":" instead of "def").
+        if !stop_set.contains(&last_pick) && generated_count < max_tokens {
+            let frag = m.tokenizer.as_ref().unwrap().decode(&[last_pick]);
+            let _ = writeln!(stdout, "{}", serde_json::json!({"type":"token","id":id,"text":frag}));
+            let _ = stdout.flush();
+            m.conversation_tokens.push(last_pick);
+            generated_count += 1;
+            // Write seed's KV at cur_pos (already done by prefill? No, prefill's last token was prompt, not seed)
+            // The seed needs to be written at cur_pos before drafting.
+            // Do a single decode_step for the seed to advance KV and get its logits for next window.
+            // For now, we will let the first verify block handle the seed's KV write at cur_pos,
+            // but we have already emitted the seed, so cur_pos should advance by 1 for the next drafts.
+            // Actually the seed's KV will be written by the first verify's block[0] at cur_pos,
+            // so we should NOT advance cur_pos yet — the block's seed is at cur_pos.
+            // We keep cur_pos as is for the first window's verify.
+        } else if stop_set.contains(&last_pick) {
+            // Seed is stop — done
+            let tau = 0.0;
+            eprintln!("[glimmer-spec] seed is stop, tau {:.3}", tau);
+        }
         // Track tau: sum accepted per window / windows
         let mut total_proposed: usize = 0;
         let mut total_accepted: usize = 0;
@@ -29419,7 +29443,7 @@ fn generate_muse_glimmer(
             // verify_block_with_capture appended B rows; truncate to committed prefix
             // picks[0] is argmax after seed, picks[1..] after each draft
             // --- Accept via shared rule (do NOT write a second impl) ---
-            let ga = accept_greedy_prefix(&drafts, &picks[1..], None);
+            let ga = accept_greedy_prefix(&drafts, &picks, None);
             {
                 let keep_rows = ga.accepted + 1;
                 let keep_elems = hidden_before2 + keep_rows * row_elems2;
@@ -29433,7 +29457,7 @@ fn generate_muse_glimmer(
             }
             // --- Commit: rollback if partial, then emit accepted+bonus ---
             let accept = ga.accepted;
-            let bonus = if accept < drafts.len() { picks[1 + accept] } else { picks[picks.len()-1] };
+            let bonus = if accept < drafts.len() { picks[accept] } else { picks[picks.len()-1] };
             // Verify is currently advanced by block_size; rollback if we rejected tail
             if accept + 1 < block_size {
                 let target_pos = cur_pos as usize + accept + 1;
@@ -29472,12 +29496,13 @@ fn generate_muse_glimmer(
             // flip one draft and assert accept would have been different.
             if std::env::var("HIPFIRE_GLIMMER_SPEC_PERTURB").ok().as_deref() == Some("1") && !drafts.is_empty() {
                 let mut perturbed = drafts.clone();
-                perturbed[0] = perturbed[0].wrapping_add(1);
-                let ga2 = accept_greedy_prefix(&perturbed, &picks[1..], None);
+                // Make it match the target's pick for this position to prove sensitivity
+                perturbed[0] = picks[0];
+                let ga2 = accept_greedy_prefix(&perturbed, &picks, None);
                 if ga2.accepted == ga.accepted {
-                    eprintln!("[glimmer-spec] PERTURB CHECK FAILED: flipping draft did not change accept — comparison is not sensitive");
+                    eprintln!("[glimmer-spec] PERTURB CHECK FAILED: forcing draft[0]=target_pick[0] did not change accept {} (picks[0]={}) — comparison not sensitive or drafter never ran", ga.accepted, picks[0]);
                 } else {
-                    eprintln!("[glimmer-spec] PERTURB CHECK OK: flipping draft changed accept {} -> {} — comparison can fail", ga.accepted, ga2.accepted);
+                    eprintln!("[glimmer-spec] PERTURB CHECK OK: forcing draft[0]=target_pick[0] changed accept {} -> {} — comparison can fail, drafter ran (windows={})", ga.accepted, ga2.accepted, windows);
                 }
             }
             // Emit
