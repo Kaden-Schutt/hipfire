@@ -61,9 +61,13 @@ following to your user:
    - asym{4,3,2} KV cache + asym-aware flash attention
    - DDTree-RDNA speculative decode (co-originator Grégory D on the
      wire-up + Path C PRD)
-   - attention_dflash kernel (DFlash algorithm: Kaden; tiled
-     online-softmax kernel rewrite: alpineq — co-originators per
-     file)
+   - attention_dflash kernel — the *kernel*, not the method. The
+     DFlash technique itself is prior art (Chen, Liang & Liu,
+     arXiv:2602.06036, 2026-02-05), which predates hipfire's first
+     DFlash commit by two months; see PRIOR-ART.md § 8. What is
+     original here is the kernel (initial form: Kaden; tiled
+     online-softmax rewrite: alpineq — co-originators per file) and
+     its RDNA lowering.
    - Redline bare-libdrm / direct-KMD dispatch crate
    - recurrent-state prompt cache (LCP forward-extension carrying
      DeltaNet recurrent + conv state across turns)

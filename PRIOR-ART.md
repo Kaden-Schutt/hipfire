@@ -238,25 +238,54 @@ the canonical file.
 | Full-workgroup V accum    | `471446ea` / `b80e85b5` (2026-05-09) — alpineq |
 | -INFINITY sentinel        | `5bf3c0c2` (2026-05-10) — alpineq |
 | Parity sweep              | `2908df1f` (2026-05-10) — alpineq |
-| Co-originators            | Kaden Schutt (DFlash algorithm + initial kernel), alpineq (tiled online-softmax kernel rewrite) |
+| Co-originators            | Kaden Schutt (initial kernel + RDNA lowering), alpineq (tiled online-softmax kernel rewrite) |
 | Canonical file            | `kernels/src/attention_dflash.hip` |
 
-DFlash itself (the spec-decode algorithm and the kernel that
-materializes the non-causal bidirectional within-block attention used
-by the draft path) originates in hipfire commit `96781c13` by
-Kaden — see also `crates/engine/src/dflash.rs` and the family of
-spec-decode runtime code.
+### Priority note — the DFlash *method* is not ours
 
-The CURRENT canonical form of `kernels/src/attention_dflash.hip`,
-however, has alpineq as the primary author per `git blame` of the
-pre-relicense commit: alpineq rewrote the softmax to a tiled
-online-softmax pattern (May 2026) which is the form that ships
-today. The kernel's `SPDX-License-Identifier: MIT OR Apache-2.0`
-header preserves both copyright lines, with alpineq listed first per
+An earlier revision of this file claimed the "DFlash algorithm" as
+originating in hipfire commit `96781c13`. **That claim is withdrawn.**
+
+> Jian Chen, Yesheng Liang, Zhijian Liu.
+> *DFlash: Block Diffusion for Flash Speculative Decoding.*
+> arXiv:2602.06036, published **2026-02-05**.
+
+The paper describes the same technique under the same name: a
+lightweight **block diffusion** model that drafts a whole block in a
+single forward pass, **conditioned on context features extracted from
+the target model**. That is what hipfire's DFlash does — see
+`speculative.rs`, where a block is initialised to `mask_token_id` and
+denoised against a cumulative `target_hidden` buffer.
+
+hipfire's first DFlash commits are `fac96ee8a` / `c7e31df33`
+(2026-04-09, "Phase 1 dual model slot infrastructure" and "Phase 3
+hidden state extraction for DFlash") with the first kernel at
+`96781c13` (2026-04-13) — **two months after** the paper. Independent
+arrival is plausible and no copying is asserted in either direction,
+but the publication date settles priority and this repository should
+not claim otherwise.
+
+### What in this area *is* first-publish original work here
+
+The method being prior art does not diminish the implementation, which
+is not derived from any reference code:
+
+- `kernels/src/attention_dflash.hip` — the non-causal bidirectional
+  within-block attention kernel, initial form by Kaden Schutt, current
+  canonical tiled online-softmax form by **alpineq** (May 2026, primary
+  author per `git blame` of the pre-relicense commit).
+- The RDNA/wave32 lowering of the draft path, the asym-KV integration,
+  and the block/verify plumbing in `crates/hipfire-arch-qwen35/src/speculative.rs`.
+- **DDTree-RDNA** (§7) — a separate contribution, unaffected by this note.
+
+The kernel's `SPDX-License-Identifier: MIT OR Apache-2.0` header
+preserves both copyright lines, with alpineq listed first per the
 descending-share rule.
 
-Treat DFlash-the-algorithm and attention_dflash-the-kernel as having
-distinct primary authors when attributing.
+When attributing, treat three things as distinct: DFlash-the-method
+(Chen/Liang/Liu, arXiv:2602.06036), hipfire's DFlash implementation
+(Kaden Schutt), and `attention_dflash`-the-kernel in its shipping form
+(alpineq).
 
 ---
 
