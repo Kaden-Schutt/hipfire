@@ -2724,6 +2724,16 @@ impl Gpu {
         }
     }
 
+    /// Invalidate the pointer-keyed F16 conversion cache. Must be called
+    /// between layers in batched prefill when the same activation buffer
+    /// (e.g. `pb_tmp`) is reused with different contents each layer —
+    /// the cache sees the same GPU pointer and skips the F32→F16
+    /// conversion, silently serving stale F16 data from the previous
+    /// layer.
+    pub fn invalidate_fp16_cache(&mut self) {
+        self.scratch.fp16_x_source_ptr = std::ptr::null_mut();
+    }
+
     /// Tear down all captured hipGraphs + their kernarg blobs. Captured
     /// graphs hold device pointers into the model's KV cache, scratch, and
     /// draft weights baked into kernarg memory by hipStreamEndCapture. Once
@@ -3092,9 +3102,11 @@ impl Gpu {
             }
             "mq6" => {
                 // MQ6 = FWHT-rotated HFQ6-G256. Needs both the MQ6 GEMV and the
-                // raw HFQ6 GEMV (used by a few residual paths).
+                // raw HFQ6 GEMV (used by a few residual paths), plus the new
+                // batched MQ6 GEMM for gemma4 Promote6 tensors (v_proj/down_proj).
                 specs.push(("gemv_mq6g256", kernels::GEMV_MQ6G256_SRC.to_string()));
                 specs.push(("gemv_hfq6g256", kernels::GEMV_HFQ6G256_SRC.to_string()));
+                specs.push(("gemm_mq6g256", kernels::GEMM_MQ6G256_SRC.to_string()));
             }
             "hfq4" => {
                 let (src, module) =

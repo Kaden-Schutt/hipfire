@@ -36,4 +36,5 @@ hipfire-arch-dots-ocr = { path = "../hipfire-arch-dots-ocr", optional = true }
 hipfire-arch-lfm2moe = { path = "../hipfire-arch-lfm2moe" }
 hipfire-arch-minimax = { path = "../hipfire-arch-minimax" }
 hipfire-arch-cohere2moe = { path = "../hipfire-arch-cohere2moe" }
+hipfire-arch-gemma4 = { path = "../hipfire-arch-gemma4" }
 serde_json = "1"

@@ -222,6 +222,12 @@ fn derive_arch_id(config: &serde_json::Value) -> u32 {
         if arch_lower.contains("llama") || arch_lower.contains("mistral") {
             return 0;
         }
+        if arch_lower.contains("gemma4_unified_assistant") {
+            return 22;
+        }
+        if arch_lower.contains("gemma4") {
+            return 13;
+        }
     }
 
     // Fallback: check model_type
@@ -253,6 +259,8 @@ fn derive_arch_id(config: &serde_json::Value) -> u32 {
         "minimax_m2" => 10,
         "lfm2_moe" | "lfm2" => 11,
         "cohere2_moe" => 12,
+        "gemma4_text" | "gemma4" => 13,
+        "gemma4_unified_assistant" => 22,
         _ => {
             // C1: unrecognized model_type → an explicit unclaimed sentinel that NO
             // carrier matches, so `load_model` fails cleanly with "no carrier for

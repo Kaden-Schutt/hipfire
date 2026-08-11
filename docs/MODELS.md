@@ -138,6 +138,79 @@ Draft **loading** is controlled by `dflash_mode` / `speculation` / `HIPFIRE_DFLA
 
 Registry `recommended_settings` for LFM tags is low temperature (0.05–0.2) with `repeat_penalty` 1.05 — applied by the CLI resolver. Do not treat a registry `sampling` field as active defaults.
 
+### Gemma4 (registry — no published artifact yet)
+
+> **No hipfire-quantized Gemma4 `.hfq`/`.mq4` artifact has been published.** The
+> rows below are the *intended* tag layout for when the quantize + upload lane
+> publishes; the current `registry/models.json` intentionally lists **zero**
+> `gemma4:` tags so that no registry row can point at a 404. See the report at
+> the bottom of this section for the exact repos/files to publish.
+
+**Architecture ground truth** (`crates/hipfire-arch-gemma4/src/config.rs`,
+`crates/hipfire-arch-gemma4/src/lowered.rs`, and
+`crates/hipfire-arch-gemma4/src/gemma4.rs`):
+
+- **Hybrid 5:1 sliding:global** — every 6th layer is global (full) attention.
+  The per-layer `layer_types` array is authoritative; on the 12B dense text
+  config (`hidden_size=3840`, `num_hidden_layers=48`, `vocab_size=262144`) that
+  is 40 sliding + 8 full. Do not assume the period in code.
+- **Sliding-window layers:** `window = 1024` (`sliding_window`), `head_dim = 256`
+  (`sliding_head_dim` / `head_dim`), `RoPE θ = 10_000` (`sliding_rope_theta`),
+  `RopeType::Default` on full head_dim, `attention scale = 1.0` (kernels bake
+  `1/√d` so decode pre-scales Q by `√head_dim`), Q/K per-head RMSNorm.
+- **Global (full) layers:** `head_dim = 512` (`global_head_dim` / `full_head_dim`),
+  `window = 0` (full causal), `RoPE θ = 1_000_000` (`full_rope_theta`),
+  `RopeType::Proportional` with `partial_rotary_factor = 0.25` (only first 64 of
+  512 dims rotate; remainder NoPE), `attention_k_eq_v = true` — **V shares the
+  pre-`k_norm` output of `k_proj`** (no `v_proj` on those layers; `v_norm` is
+  weight-less, implemented with a ones-filled scratch buffer).
+- **KV head counts (variant-dependent):** 12B text — `num_attention_heads = 16`,
+  `num_key_value_heads = 8` (sliding) and `num_global_key_value_heads` defaults
+  to sliding when absent; 31B target (per `lowered.rs` comments) — `n_heads = 32`,
+  `sliding_n_kv_heads = 16`, `full_n_kv_heads = 4`, `sliding_head_dim = 256`,
+  `full_head_dim = 512`, `hidden_dim = 21504`. The 12B `hidden_dim` is
+  `intermediate_size = 15360`, `dim = 3840`.
+- **FFN:** SwiGLU with `gelu_pytorch_tanh` activation, `intermediate_size`
+  (above) per-layer.
+- **Norms:** Sandwich RMSNorm — `input_layernorm`, `post_attention_layernorm`,
+  `pre_feedforward_layernorm`, `post_feedforward_layernorm` per layer plus a
+  learned scalar `layer_scalar [1]` at layer end. Gemma4 uses plain `x * w`
+  (weights init 1.0); the `HIPFIRE_GEMMA4_NORM_PLUS_ONE=1` toggle bakes the
+  Gemma-2/3 `x * (1+w)` form at load time.
+- **Embeddings:** `embed_scale = sqrt(hidden_size)` multiplied on every lookup;
+  **`lm_head` is TIED to `embed_tokens`** (single GPU allocation, aliased
+  `WeightTensor`; `free` skips the head to avoid double-free).
+- **Output:** `final_logit_softcapping = 30.0` — `tanh(logits/30)*30` before
+  sampling. `norm_eps = 1e-6`, `max_position_embeddings = 262144` (12B).
+- **Stop / EOS:** HF `eos_token_id` is the **list** `[1, 106]` (`<eos>` = 1 and
+  `<end_of_turn>` / `<turn|>` = 106); parsing it as a scalar drops 106 and lets
+  decode loop on `<turn|>` forever. The loader resolves `eos_tok` against
+  `["<end_of_turn>", …]` and masks both.
+- **Sampling defaults (Gemma card):** `temperature 1.0`, `top_p 0.95`,
+  `top_k 64` — the registry will carry these in `recommended_settings` /
+  `sampling_profiles` when tags land (today no Gemma rows exist to carry them).
+- **Crate:** `hipfire-arch-gemma4` (`Gemma4Config`, `Gemma4Weights`,
+  `Gemma4State`), `Gemma4Bundle { config, weights, state, eos_tok }` in
+  `hipfire-loader`. `Gemma4Carrier` claims arch ids **13** (`gemma4_text`) and
+  **22** (`gemma4_unified_assistant` EAGLE drafter) — see
+  [`architecture-ids.md`](architecture-ids.md).
+
+| Intended tag | Intended file | Repo (to publish) | Notes |
+|---|---|---|---|
+| `gemma4:12b` | `gemma4-12b.mq4` | `schuttdev/hipfire-gemma4-12b` or `hipfire-models/hipfire-gemma4-12b` | 12B dense text, MQ4 default; `hipfire quantize google/gemma-4-12B-it --arch-id 13 --format mq4` |
+| `gemma4:12b-mq4` | `gemma4-12b.mq4` | same as above | alias-style explicit quant suffix |
+| `gemma4:12b-hfq` | `gemma4-12b.hfq` | same repo | HFQ4 variant if published |
+| `gemma4:12b-draft` | `gemma4-12b-draft.mq4.hfq` | same repo or `…-drafter` side-repo | EAGLE draft (arch_id 22) paired with `gemma4:12b` |
+
+No Gemma4 rows are registered until the files above (or the 27B/31B MoE
+variants) are actually on the Hub and pass `scripts/registry_gen.py` LFS
+probing — that script is the admission gate and will fail-closed on a missing
+file or mismatched `size_gb`. Publishing steps: `hipfire quantize` → upload to
+the Hub → add a `models.json` entry mirroring a dense neighbour like
+`qwen3.6:27b` (fields: `repo`, `file`, `size_gb`, `min_vram_gb`, `desc`,
+`recommended_settings` with temp 1.0/top_p 0.95/top_k 64) → run
+`scripts/registry_gen.py` to stamp `sha256`/`size_bytes`/`arch_id`/`quant`.
+
 ---
 
 ## Aliases
@@ -180,6 +253,8 @@ Runtime dispatch uses HFQ `arch_id` ([`architecture-ids.md`](architecture-ids.md
 | MiniMax-M2 | 10 | `hipfire-arch-minimax` | `minimax-m2.7` |
 | LFM2.5 dense **and** MoE | 11 | `hipfire-arch-lfm2moe` | all `lfm2.5:*` |
 | Cohere2-MoE | 12 | `hipfire-arch-cohere2moe` | `north-mini-code` |
+| Gemma4 text (dense) | 13 | `hipfire-arch-gemma4` | *(none yet — awaiting publish; intended `gemma4:12b`)* |
+| Gemma4 unified-assistant (EAGLE drafter) | 22 | `hipfire-arch-gemma4` `drafter` | *(none yet; intended `gemma4:12b-draft` sidecar for 13)* |
 
 **Dense LFM2.5 is supported on arch_id 11.** The LFM config parser treats `num_experts == 0` as dense SwiGLU on every layer (`crates/hipfire-arch-lfm2moe/src/config.rs`). Do **not** claim dense LFM is unsupported.
 

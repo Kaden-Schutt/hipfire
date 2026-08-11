@@ -795,6 +795,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "hipfire-arch-gemma4"
+version = "0.3.0"
+dependencies = [
+ "hip-bridge",
+ "hipfire-dispatch",
+ "hipfire-runtime",
+ "rdna-compute",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "hipfire-arch-lfm2moe"
 version = "0.1.0"
 dependencies = [
@@ -965,6 +977,7 @@ dependencies = [
  "hipfire-arch-cohere2moe",
  "hipfire-arch-deepseek4",
  "hipfire-arch-dots-ocr",
+ "hipfire-arch-gemma4",
  "hipfire-arch-lfm2moe",
  "hipfire-arch-llama",
  "hipfire-arch-minimax",
@@ -1029,6 +1042,7 @@ dependencies = [
  "hipfire-arch-cohere2moe",
  "hipfire-arch-deepseek4",
  "hipfire-arch-dots-ocr",
+ "hipfire-arch-gemma4",
  "hipfire-arch-lfm2moe",
  "hipfire-arch-llama",
  "hipfire-arch-minimax",

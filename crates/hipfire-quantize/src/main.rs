@@ -5014,7 +5014,11 @@ fn kmap_resolve_mode(name: &str, n_layers: usize, is_moe: bool, kmap_mode: u8) -
     }
 
     // Rule 3: MoE routers
-    if is_moe && (name.ends_with("mlp.gate.weight") || name.contains("shared_expert_gate")) {
+    if is_moe
+        && (name.ends_with("mlp.gate.weight")
+            || name.contains("shared_expert_gate")
+            || name.ends_with("router.proj.weight"))
+    {
         return QuantLevel::Q8;
     }
 
@@ -5033,6 +5037,9 @@ fn kmap_resolve_mode(name: &str, n_layers: usize, is_moe: bool, kmap_mode: u8) -
     }
 
     // Mode 2 (typed): promote ffn_down and attn_v in all layers.
+    // UNCHANGED semantics — every model that already ships with `--kmap-mode
+    // typed` must keep producing byte-identical output. Gemma 4's variant of
+    // this rule lives in mode 3 below rather than mutating this one.
     if kmap_mode == 2 {
         let is_down = name.contains("down_proj") || name.contains("ffn_down");
         let is_v = name.contains("v_proj") || name.contains("attn_v");
@@ -5043,6 +5050,38 @@ fn kmap_resolve_mode(name: &str, n_layers: usize, is_moe: bool, kmap_mode: u8) -
             if let Some(idx) = parse_layer_idx(name) {
                 if idx < 2 || idx >= n_layers.saturating_sub(2) {
                     return QuantLevel::Promote6;
+                }
+            }
+        }
+        return QuantLevel::Base;
+    }
+
+    // Mode 3 (typed-gemma4): mode 2, except edge layers promote FFN + v_proj
+    // only and leave attn q/k/o at Base — dense attn promotion regresses PPL
+    // +3.1% on 27B (see ppl_kmap_20260508.md).
+    //
+    // This is a SEPARATE mode rather than a tweak to mode 2 so that no model
+    // already quantized with `--kmap-mode typed` changes bytes. Selected
+    // automatically for gemma4 (arch_id 13); reachable explicitly as
+    // `--kmap-mode typed-gemma4`.
+    if kmap_mode == 3 {
+        let is_down = name.contains("down_proj") || name.contains("ffn_down");
+        let is_v = name.contains("v_proj") || name.contains("attn_v");
+        if is_down || is_v {
+            return QuantLevel::Promote6;
+        }
+        if n_layers > 0 {
+            if let Some(idx) = parse_layer_idx(name) {
+                if idx < 2 || idx >= n_layers.saturating_sub(2) {
+                    let is_attn_qko = name.contains("q_proj")
+                        || name.contains("attn_q")
+                        || name.contains("k_proj")
+                        || name.contains("attn_k")
+                        || name.contains("o_proj")
+                        || name.contains("attn_o");
+                    if !is_attn_qko {
+                        return QuantLevel::Promote6;
+                    }
                 }
             }
         }
@@ -5518,7 +5557,10 @@ fn q8_class_of(name: &str) -> Option<&'static str> {
         Some("lm_head")
     } else if name.contains("embed") {
         Some("embed")
-    } else if name.ends_with("mlp.gate.weight") || name.ends_with("mlp.shared_expert_gate.weight") {
+    } else if name.ends_with("mlp.gate.weight")
+        || name.ends_with("mlp.shared_expert_gate.weight")
+        || name.ends_with("router.proj.weight")
+    {
         Some("router")
     } else if name.contains("self_attn")
         || name.contains("attn_q")
@@ -6179,7 +6221,10 @@ fn awq_eligible(name: &str) -> bool {
         // as mlp.gate.weight: q8_router (set for is_minimax via is_moe_like)
         // keeps the router at Q8 so HFQ4 noise can't flip top-k selection.
         || name.ends_with("block_sparse_moe.gate.weight")
-        || name.ends_with("router.weight");
+        || name.ends_with("router.weight")
+        // Gemma4 26B-A4B MoE router: `router.proj.weight` (hidden_size × num_experts).
+        // Same precision-sensitivity as Qwen3.5's `mlp.gate.weight`.
+        || name.ends_with("router.proj.weight");
     if f1_only {
         return f1_match;
     }
@@ -6463,6 +6508,14 @@ fn run_gguf_pipeline(
         "qwen3" | "qwen2" => 1,
         "qwen3_5" | "qwen3_5_text" | "qwen35" => 5,
         "qwen3moe" => 6,
+        // Gemma4 EAGLE drafter (arch_id 22) — must come before the gemma4
+        // catch-all below so that a GGUF with general.architecture =
+        // "gemma4_unified_assistant" is not mis-tagged as arch 13.
+        "gemma4_unified_assistant" => 22,
+        // Gemma 4 family (dense + MoE) => hipfire-arch-gemma4 (arch_id 13).
+        // Require a "gemma4"-prefixed arch string; bare "gemma"/"gemma2"/
+        // "gemma3" GGUFs are different architectures and must not be mis-tagged.
+        g4 if g4.starts_with("gemma4") => 13,
         other => {
             // Structural-pillar guard: a qwen3* GGUF that doesn't match an
             // explicit arm above must NOT be silently stamped arch_id=0
@@ -6540,6 +6593,7 @@ fn run_gguf_pipeline(
 
     // K-map setup for GGUF path
     let is_moe = arch_id == 6;
+    let is_gemma4 = arch_id == 13;
     let n_layers: usize = config_json
         .get("num_hidden_layers")
         .and_then(|v| v.as_u64())
@@ -6554,7 +6608,10 @@ fn run_gguf_pipeline(
     // ship-default is the conservative shape per maintainer directive
     // (2026-05-08): never silently change dense quantization. Users who
     // want K-map on dense pass `--kmap-dense` (see flag parsing below).
-    let kmap: HashMap<String, QuantLevel> = if no_kmap || (!is_moe && !kmap_dense) {
+    // K-map is enabled for: MoE models (default), gemma4 (arch_id 13,
+    // default mode=2), or any dense model with --kmap-dense.
+    // Suppress with --no-kmap / --uniform.
+    let kmap: HashMap<String, QuantLevel> = if no_kmap || (!is_moe && !is_gemma4 && !kmap_dense) {
         HashMap::new()
     } else {
         let mut map = HashMap::new();
@@ -8266,10 +8323,11 @@ fn main() {
     // K-map mode: 0=full (all candidates promoted), 1=alternating (edge + every 3rd),
     // 2=typed (ffn_down+attn_v everywhere). Default: alternating — same PPL as full
     // at 17% less model size on MoE (22.9 vs 27.7 GB, PPL 8K: 19.96 vs 20.07).
-    let kmap_mode: u8 = match args.kmap_mode.as_str() {
+    let mut kmap_mode: u8 = match args.kmap_mode.as_str() {
         "full" | "0" => 0,
         "alternating" | "alt" | "1" => 1,
         "typed" | "2" => 2,
+        "typed-gemma4" | "3" => 3,
         _ => {
             eprintln!(
                 "warning: unknown --kmap-mode '{}', using alternating",
@@ -8488,6 +8546,29 @@ fn main() {
         // Per-expert pre-split tensors (mlp.experts.{j}.{gate,up,down}_proj) like
         // lfm2/deepseek. Crate hipfire-arch-cohere2moe (arch_id 12).
         "cohere2_moe" => 12,
+        // Gemma 4 family (dense + MoE) -> hipfire-arch-gemma4 (arch_id 13).
+        // 12B-unified (google/gemma-4-12B-it, model_type "gemma4_unified") is
+        // dense unified multimodal; we quantize ONLY the text decoder
+        // (model.language_model.*). GQA + SWA + dual-RoPE + GeGLU + 4 sandwich
+        // norms + logit softcap. 26B-A4B MoE uses model_type "gemma4" (3D
+        // stacked experts.gate_up_proj/down_proj + router.proj/router.scale).
+        // NOTE: flat-MQ4 is a known-poor recipe for this architecture — do not
+        // use `--format mq4` as a quality baseline. Qwen 9B flat-MQ4 measured
+        // 0.3215 KLD and AWQ+GPTQ v3 reached 0.1257 at identical file size;
+        // gemma4 shows the same flat-MQ4 degradation. The intended path is
+        // AWQ+GPTQ (see docs/investigations/2026-05-18-awq-gptq-sub-0.10-kld/).
+        "gemma4_unified" | "gemma4_unified_text" | "gemma4" | "gemma4_text" => 13,
+        // Gemma4 EAGLE drafter (google/gemma-4-12B-it-assistant): the 422M
+        // single-block speculative-decode draft head for the arch-13 target.
+        // FLAT `model.*` names (NOT `model.language_model.`-prefixed) + two
+        // top-level projections (pre_projection / post_projection). Text-only:
+        // no vision/audio tower to skip. 5 decoder layers, hybrid 3:1
+        // sliding(hd256)/full(hd512) attn, tied lm_head, per-layer scalar.
+        // Quantize everything Q8 (`--format q8`): it is a tiny draft model and
+        // draft accuracy directly gates spec-decode acceptance. arch_id 22 is
+        // the next free slot after 21 (Qwen3.5 MTP head). Crate (future):
+        // hipfire-arch-gemma4 drafter loader.
+        "gemma4_unified_assistant" => 22,
         other => {
             eprintln!("Warning: unknown architecture '{other}', treating as llama");
             0
@@ -8532,7 +8613,20 @@ fn main() {
     // kernel family). Raw HF tensor names are written verbatim (no rename);
     // the hipfire loader looks them up.
     let is_minimax = arch_id == 10;
-    let is_moe_like = is_moe || is_deepseek4 || is_lfm2moe || is_minimax || is_cohere2moe;
+    let is_gemma4 = arch_id == 13;
+    // Covers both the dense arch-13 (12B/26B unified) and the EAGLE drafter
+    // (arch-22). Both have the same AWQ-unsuitability: √d_model embedding scale
+    // (not RMSNorm-anchored) corrupts AWQ saliency for FFN; embed/lm_head are
+    // tied + scaled by √3840 making AWQ scale saliency meaningless there.
+    let is_gemma4_family = arch_id == 13 || arch_id == 22;
+    let is_moe_like = is_moe || is_deepseek4 || is_lfm2moe || is_minimax || is_cohere2moe || is_gemma4;
+    // Gemma4 (arch_id 13) defaults to kmap_mode=3 (typed-gemma4): promote down_proj,
+    // v_proj, and edge-layer non-attn-qko tensors. Attn q/k/o are excluded even
+    // in edge layers (dense attn promotion regresses PPL +3.1% on 27B).
+    // The explicit --kmap-mode flag overrides this default.
+    if is_gemma4 && args.kmap_mode == "alternating" {
+        kmap_mode = 3;
+    }
     // Q8 "router" — a misnomer: `is_q8_tensor` covers the whole FIXED tier
     // (attention q/k/v/o, linear_attn projections, conv1d, lm_head, embed, and
     // the MoE router), not just `mlp.gate.weight`. On for MoE-class models by
@@ -8710,9 +8804,16 @@ fn main() {
                 continue;
             }
             if let Some(stem) = name.strip_suffix(".scale") {
-                // Sibling weight name (drop `.scale`, add `.weight`).
-                let w_name = format!("{stem}.weight");
-                fp8_scale_for.insert(w_name, (fi, name.to_string()));
+                // FP8 scale siblings: `foo.scale` is the per-tensor scale for
+                // `foo.weight`. Skip from quantization; attach at quant time.
+                // Exception: Gemma4's `router.scale` is a real model weight
+                // (multiplicative scale on router input), NOT an FP8 scale.
+                if name.contains("router.scale") {
+                    all_tensors.push((name, fi));
+                } else {
+                    let w_name = format!("{stem}.weight");
+                    fp8_scale_for.insert(w_name, (fi, name.to_string()));
+                }
                 continue;
             }
             all_tensors.push((name, fi));
@@ -8898,7 +8999,10 @@ fn main() {
     // the K-map default-on path because the routed-expert promotion is
     // the headline win and the empirical regression there is tighter
     // (+1.7% PPL at 2K, gated below the dense regression threshold).
-    let kmap: HashMap<String, QuantLevel> = if no_kmap || (!is_moe && !kmap_dense) {
+    // K-map is enabled for: MoE models (default), gemma4 (arch_id 13,
+    // default mode=2), or any dense model with --kmap-dense.
+    // Suppress with --no-kmap / --uniform.
+    let kmap: HashMap<String, QuantLevel> = if no_kmap || (!is_moe && !is_gemma4 && !kmap_dense) {
         HashMap::new()
     } else {
         let mut map = HashMap::new();
@@ -9048,6 +9152,15 @@ fn main() {
     // gate_proj's up_proj sibling (which may live in a different shard).
     let name_to_file: std::collections::HashMap<&str, usize> =
         all_tensors.iter().map(|(n, fi)| (*n, *fi)).collect();
+    // Gemma4 (arch 13): unified multimodal checkpoints prefix the text decoder
+    // with `model.language_model.`; text-only checkpoints (model_type
+    // "gemma4_text") use flat `model.*` names. Only arm the tower-skip when the
+    // multimodal prefix actually exists, else a text-only checkpoint would be
+    // skipped wholesale.
+    let gemma4_skip_non_lm = arch_id == 13
+        && all_tensors
+            .iter()
+            .any(|(n, _)| n.starts_with("model.language_model."));
     for (name, file_idx) in &all_tensors {
         // --include-prefix filter (highest priority — runs before mtp/vision skips).
         if let Some(p) = include_prefix {
@@ -9067,6 +9180,14 @@ fn main() {
             || name.starts_with("visual.")
             || name.starts_with("vision_tower.");
         if is_vision && !include_vision {
+            let (meta, _) = st_files[*file_idx].tensor_data(name).unwrap();
+            let n: usize = meta.shape.iter().product();
+            skipped_params += n as u64;
+            continue;
+        }
+        // Gemma4 unified (arch 13): text-only bring-up — skip the vision/audio
+        // towers + multimodal projectors; quantize only the text decoder.
+        if gemma4_skip_non_lm && !name.starts_with("model.language_model.") {
             let (meta, _) = st_files[*file_idx].tensor_data(name).unwrap();
             let n: usize = meta.shape.iter().product();
             skipped_params += n as u64;
@@ -10141,11 +10262,16 @@ fn main() {
             // Fall through to standard path for non-MQ2 formats.
         }
 
-        if is_moe
-            && name.contains("mlp.experts.")
-            && (name.ends_with("gate_up_proj") || name.ends_with("down_proj"))
-            && meta.shape.len() == 3
-        {
+        // Gemma 4 26B-A4B uses the SAME layout but at a different prefix
+        // (no `mlp.` — tensors live directly under `.experts.`):
+        //   model.language_model.layers.{N}.experts.gate_up_proj
+        //   model.language_model.layers.{N}.experts.down_proj
+        // Name-suffix match + shape check handles both qwen3.5 (mlp.experts.*)
+        // and gemma4 (experts.*) without prefix-specific conditions.
+        let is_moe_expert_3d = (is_moe || is_gemma4)
+            && (name.ends_with("experts.gate_up_proj") || name.ends_with("experts.down_proj"))
+            && meta.shape.len() == 3;
+        if is_moe_expert_3d {
             let n_experts = meta.shape[0];
             let inner_n: usize = meta.shape[1..].iter().product();
             let elem_size = match meta.dtype.as_str() {
@@ -11162,6 +11288,22 @@ fn main() {
                     if k_dim % 256 == 0 {
                         let signs1 = gen_fwht_signs(42, 256);
                         let signs2 = gen_fwht_signs(1042, 256);
+                        // ── Gemma4 (arch 13/22): embed/lm_head MUST NOT reach AWQ ──
+                        // They are always routed to Q8 by the K-map before this
+                        // branch, so they cannot arrive here. Assert the invariant
+                        // rather than leave it implicit: Gemma4's tied embed/lm_head
+                        // carries an implicit sqrt(d_model) scaling with no RMSNorm
+                        // anchor on the embedding dimension, which makes AWQ's
+                        // imatrix-saliency ratio meaningless and the per-channel
+                        // pre-scale actively harmful.
+                        debug_assert!(
+                            !(is_gemma4_family
+                                && (name.contains("embed_tokens") || name.contains("lm_head"))),
+                            "gemma4 embed/lm_head reached the MQ4 AWQ path — the kmap Q8 \
+                             guard should have prevented this (arch {} tensor {})",
+                            arch_id,
+                            name
+                        );
                         match override_fmt {
                             GgufFormat::Mq4 => {
                                 // Inline AWQ + MQ4 dance (mirrors the Base MQ4 arm).

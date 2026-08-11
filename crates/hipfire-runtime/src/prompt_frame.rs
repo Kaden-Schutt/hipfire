@@ -1660,6 +1660,122 @@ mod tests {
     }
 
     #[test]
+    fn gemma4_bundled_template_renders() {
+        // The daemon bundles `templates/gemma-4-it.jinja` as the arch-13
+        // fallback chat template (resolve_chat_template). This test renders
+        // it through the production JinjaChatFrame environment (strict
+        // undefined + pycompat + trim/lstrip + raise_exception + hf tojson)
+        // so a minijinja regression or template edit that breaks parsing /
+        // rendering fails HERE at unit-test time instead of silently falling
+        // back to a raw un-framed prompt at serve time.
+        let t = make_tokenizer();
+        let template = include_str!("../templates/gemma-4-it.jinja");
+
+        // Plain system+user turn, non-thinking (the daemon's v1 default):
+        // generation prompt must pre-fill the empty thought channel.
+        let frame = JinjaChatFrame {
+            tokenizer: &t,
+            template,
+            system: Some("Be brief."),
+            user: "What is the capital of France?",
+            enable_thinking: false,
+            bos_token: Some("<bos>"),
+        };
+        let rendered = frame.render().expect("gemma4 template renders plain turn");
+        assert!(
+            rendered.starts_with("<bos>"),
+            "render must start with the explicit bos_token: got {:?}",
+            &rendered[..rendered.len().min(60)],
+        );
+        assert!(
+            rendered.contains("<|turn>system\n"),
+            "system turn must render: got {rendered:?}",
+        );
+        assert!(
+            rendered.contains("<|turn>user\nWhat is the capital of France?<turn|>"),
+            "user turn must render: got {rendered:?}",
+        );
+        assert!(
+            rendered.ends_with("<|turn>model\n<|channel>thought\n<channel|>"),
+            "non-thinking generation prompt must pre-fill the empty thought              channel: got tail {:?}",
+            &rendered[rendered.len().saturating_sub(80)..],
+        );
+
+        // Tools branch: one OpenAI-shape function definition must survive the
+        // template's format_function_declaration macro tree.
+        let messages = vec![Message {
+            role: Role::User,
+            content: "weather in SF?".to_string(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            tool_plan: String::new(),
+        }];
+        let tools = vec![serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Get current weather",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "city": {"type": "string", "description": "City name"},
+                    },
+                    "required": ["city"],
+                },
+            }
+        })];
+        let with_tools = frame
+            .render_messages(&messages, Some(&tools), None)
+            .expect("gemma4 template renders tools turn");
+        assert!(
+            with_tools.contains("<|tool>") && with_tools.contains("get_weather"),
+            "tools block must render the declaration: got {with_tools:?}",
+        );
+
+        // Agentic replay: assistant turn with a FLAT hipfire ToolCall
+        // ({name, arguments} — not the nested OpenAI {function:{…}} shape)
+        // followed by a tool-role response. Exercises the template's
+        // tool_call replay + forward-scan tool_response branches.
+        let history = vec![
+            Message {
+                role: Role::User,
+                content: "weather in SF?".to_string(),
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                tool_plan: String::new(),
+            },
+            Message {
+                role: Role::Assistant,
+                content: String::new(),
+                tool_calls: vec![ToolCall {
+                    name: "get_weather".to_string(),
+                    arguments: serde_json::json!({"city": "SF"}),
+                }],
+                tool_call_id: None,
+                tool_plan: String::new(),
+            },
+            Message {
+                role: Role::Tool,
+                content: "72F sunny".to_string(),
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                tool_plan: String::new(),
+            },
+        ];
+        let replay = frame
+            .render_messages(&history, Some(&tools), None)
+            .expect("gemma4 template renders tool-call replay history");
+        assert!(
+            replay.contains(r#"<|tool_call>call:get_weather{city:<|"|>SF<|"|>}<tool_call|>"#),
+            "assistant tool_call must replay from the flat shape: got {replay:?}",
+        );
+        assert!(
+            replay.contains("<|tool_response>"),
+            "tool response must render: got {replay:?}",
+        );
+    }
+
+    #[test]
     fn render_messages_with_tools_fires_tools_block() {
         // Smoke test: a minimal template gated on `{% if tools %}`
         // must render the tools branch when the caller supplies a
