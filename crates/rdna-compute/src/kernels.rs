@@ -4943,6 +4943,11 @@ pub const DSPARK_STAGE_KV_SRC: &str = include_str!("../../../kernels/src/dspark_
 pub const EMBEDDING_HFQ4G128_SRC: &str =
     include_str!("../../../kernels/src/embedding_hfq4g128.hip");
 
+/// Batched HFQ4-G128 embedding lookup. Mirrors the G256 device-token-id
+/// contract while using the 72-byte / 128-element wire layout.
+pub const EMBEDDING_HFQ4G128_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/embedding_hfq4g128_batched.hip");
+
 /// Q4_LUT GEMV: 4-bit with LDS codebook lookup.
 /// Block: f16 codebook[16] (32 bytes) + u8 quants[16] (16 bytes) = 48 bytes per 32 elements.
 /// Dequant: nibble → LDS[nibble] → f16 → FMA. No scale arithmetic per element.

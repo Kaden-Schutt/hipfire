@@ -23272,6 +23272,73 @@ fn select_generation_route(i: &GenerationRouteInputs) -> GenerationRoute {
     }
 }
 
+#[inline]
+fn llama_qwen3_batched_prefill_eligible(
+    gpu_arch: &str,
+    model_arch: llama::ModelArch,
+    prefill_batched_enabled: bool,
+    quant_q8: bool,
+    has_eviction: bool,
+    token_count: usize,
+) -> bool {
+    model_arch == llama::ModelArch::Qwen3
+        && (gpu_arch.starts_with("gfx11") || gpu_arch == "gfx1201")
+        && prefill_batched_enabled
+        && quant_q8
+        && !has_eviction
+        && token_count >= 4
+}
+
+#[inline]
+fn llama_prefill_sample_seed(mut seed: u32, token_count: usize, temperature: f32) -> u32 {
+    // The legacy sequential prefill sampled after every prompt token. Sampling
+    // at temperature=0 does not advance xorshift32; sampled generation advances
+    // once per token. Batched prefill only samples the final logits, so advance
+    // over the discarded intermediate draws to preserve the final draw + state.
+    if temperature > 1e-6 {
+        for _ in 1..token_count {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+        }
+    }
+    seed
+}
+
+#[cfg(test)]
+mod llama_batched_prefill_tests {
+    use super::{llama_prefill_sample_seed, llama_qwen3_batched_prefill_eligible};
+    use hipfire_runtime::llama::ModelArch;
+
+    #[test]
+    fn route_stays_inside_validated_qwen3_q8_envelope() {
+        let cases = [
+            ("gfx1100", ModelArch::Qwen3, true, true, false, 256, true),
+            ("gfx1201", ModelArch::Qwen3, true, true, false, 4, true),
+            ("gfx1200", ModelArch::Qwen3, true, true, false, 256, false),
+            ("gfx1100", ModelArch::Llama, true, true, false, 256, false),
+            ("gfx1100", ModelArch::Qwen3, true, false, false, 256, false),
+            ("gfx1100", ModelArch::Qwen3, true, true, true, 256, false),
+            ("gfx1100", ModelArch::Qwen3, true, true, false, 3, false),
+            ("gfx1100", ModelArch::Qwen3, false, true, false, 256, false),
+        ];
+        for (arch, model, enabled, q8, eviction, tokens, expected) in cases {
+            assert_eq!(
+                llama_qwen3_batched_prefill_eligible(arch, model, enabled, q8, eviction, tokens,),
+                expected,
+                "arch={arch} model={model:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn sampled_prefill_preserves_discarded_xorshift_draws() {
+        assert_eq!(llama_prefill_sample_seed(42, 4, 0.0), 42);
+        assert_eq!(llama_prefill_sample_seed(42, 1, 1.0), 42);
+        assert_eq!(llama_prefill_sample_seed(42, 4, 1.0), 476_557_059);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn generate(
     m: &mut LoadedModel,
@@ -26189,6 +26256,7 @@ fn generate(
         emit_staged_terminal_done(stdout, &pending_done);
     } else {
         // LLaMA path -- multi-turn aware
+        let has_eviction = m.eviction.is_some();
         let ModelState::Llama(b) = m.state.as_mut().unwrap() else {
             unreachable!()
         };
@@ -26198,26 +26266,62 @@ fn generate(
         let kv = &mut b.kv;
 
         let mut rng_state = 42u32;
-        for (i, &tok) in new_tokens.iter().enumerate() {
-            let pos = m.seq_pos + i;
-            let (_, rng) = llama::forward_scratch(
-                gpu, weights, config, tok, pos, kv, scratch, temp, top_p, rng_state, 0, 1.0,
+        let batched_prefill = llama_qwen3_batched_prefill_eligible(
+            &gpu.arch,
+            config.arch,
+            hipfire_runtime::config::get().prefill_batched,
+            kv.quant_q8,
+            has_eviction,
+            new_tokens.len(),
+        );
+        let (mut next_token, sampled_rng) = if batched_prefill {
+            llama::forward_prefill_batch(
+                gpu,
+                weights,
+                config,
+                &new_tokens,
+                m.seq_pos,
+                kv,
+                scratch,
+                None,
             )
             .unwrap();
-            rng_state = rng;
-        }
+            let sample_seed = llama_prefill_sample_seed(rng_state, new_tokens.len(), temp);
+            gpu.sample_top_p(
+                &scratch.logits,
+                &scratch.sample_buf,
+                &scratch.repeat_buf,
+                config.vocab_size,
+                temp,
+                top_p,
+                sample_seed,
+                0,
+                1.0,
+            )
+            .unwrap()
+        } else {
+            for (i, &tok) in new_tokens.iter().enumerate() {
+                let pos = m.seq_pos + i;
+                let (_, rng) = llama::forward_scratch(
+                    gpu, weights, config, tok, pos, kv, scratch, temp, top_p, rng_state, 0, 1.0,
+                )
+                .unwrap();
+                rng_state = rng;
+            }
+            let mut out_bytes = [0u8; 8];
+            gpu.hip
+                .memcpy_dtoh(&mut out_bytes, &scratch.sample_buf.buf)
+                .unwrap();
+            (
+                u32::from_ne_bytes([out_bytes[0], out_bytes[1], out_bytes[2], out_bytes[3]]),
+                u32::from_ne_bytes([out_bytes[4], out_bytes[5], out_bytes[6], out_bytes[7]]),
+            )
+        };
+        rng_state = sampled_rng;
         let this_turn_prompt_len_llama = new_tokens.len();
         m.seq_pos += new_tokens.len();
         m.conversation_tokens.extend_from_slice(&new_tokens);
         let ngram_scope_start_llama = m.conversation_tokens.len() - this_turn_prompt_len_llama;
-
-        let mut out_bytes = [0u8; 8];
-        gpu.hip
-            .memcpy_dtoh(&mut out_bytes, &scratch.sample_buf.buf)
-            .unwrap();
-        let mut next_token =
-            u32::from_ne_bytes([out_bytes[0], out_bytes[1], out_bytes[2], out_bytes[3]]);
-        rng_state = u32::from_ne_bytes([out_bytes[4], out_bytes[5], out_bytes[6], out_bytes[7]]);
         // Prefill ends here: prompt is processed AND first token is ready (D2H
         // sync is the user-observable "time to first token" boundary). Decode
         // below measures the pure forward+sample steady-state.

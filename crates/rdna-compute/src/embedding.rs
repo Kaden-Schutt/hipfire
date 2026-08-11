@@ -362,4 +362,49 @@ impl Gpu {
             )
         }
     }
+
+    /// Batched HFQ4-G128 embedding lookup. `output` is `[n × dim]` row-major
+    /// and `token_ids` is a device-resident i32-compatible buffer.
+    pub fn embedding_lookup_hfq4g128_batched(
+        &mut self,
+        table: &GpuTensor,
+        output: &GpuTensor,
+        token_ids: &GpuTensor,
+        n: usize,
+        dim: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "embedding_hfq4g128_batched",
+            kernels::EMBEDDING_HFQ4G128_BATCHED_SRC,
+            "embedding_hfq4g128_batched",
+        )?;
+
+        let mut tp = table.buf.as_ptr();
+        let mut op = output.buf.as_ptr();
+        let mut tidp = token_ids.buf.as_ptr();
+        let mut d = dim as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut tp as *mut _ as *mut c_void,
+            &mut op as *mut _ as *mut c_void,
+            &mut tidp as *mut _ as *mut c_void,
+            &mut d as *mut _ as *mut c_void,
+        ];
+
+        self.launch_maybe_blob(
+            "embedding_hfq4g128_batched",
+            [n as u32, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(tp);
+                b.push_ptr(op);
+                b.push_ptr(tidp);
+                b.push_i32(d);
+                b
+            },
+        )
+    }
 }
