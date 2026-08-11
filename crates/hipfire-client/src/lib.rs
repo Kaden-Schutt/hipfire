@@ -761,6 +761,13 @@ impl Engine {
             }
 
             if let Err(cb_err) = event(&value) {
+                // A terminal event has already closed the transaction daemon-side, so
+                // `apply_terminal_control` drops the abort and never emits the
+                // `aborted`+`done` pair this drain blocks on. Same rule the post-commit
+                // path already follows.
+                if matches!(ty, Some("error") | Some("done")) {
+                    return Err(cb_err);
+                }
                 return self.abort_and_drain_with_rx(request_id, attempt_id, rx, cb_err);
             }
 
@@ -2328,6 +2335,70 @@ done
         );
         engine.unload().unwrap();
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generate_terminal_error_must_not_abort_or_hang() {
+        let root = env::temp_dir().join(format!(
+            "hipfire-client-terminal-error-{}-{}",
+            std::process::id(),
+            "te"
+        ));
+        let log = root.join("in.log");
+        let daemon = write_fake_daemon(
+            &root,
+            &format!(
+                r#"#!/bin/sh
+LOG="{log}"
+: > "$LOG"
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$LOG"
+  case "$line" in
+    *'"generate"'*)
+      echo '{{"type":"error","id":"req-te","message":"request exceeds loaded KV budget","class":"context_length","retryable":false,"rolled_back":false,"attempt_id":7}}'
+      ;;
+    *'"unload"'*) echo '{{"type":"unloaded"}}'; exit 0 ;;
+  esac
+done
+"#,
+                log = log.display()
+            ),
+        );
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker_daemon = daemon.clone();
+        std::thread::spawn(move || {
+            let mut engine = spawn_fake_engine(&worker_daemon);
+            let outcome = engine.generate(
+                &serde_json::json!({
+                    "type": "generate",
+                    "id": "req-te",
+                    "attempt_id": 7,
+                }),
+                |ev| match ev.get("type").and_then(Value::as_str) {
+                    Some("error") => Err(ClientError::Cancelled),
+                    _ => Ok(()),
+                },
+            );
+            let _ = tx.send(format!("{outcome:?}"));
+            let _ = engine.unload();
+        });
+
+        let outcome = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("generate never returned: abort_and_drain waits for a terminal pair the daemon will not send");
+
+        assert!(
+            outcome.contains("Cancelled"),
+            "callback error must propagate unchanged: {outcome}"
+        );
+        let logged = fs::read_to_string(&log).unwrap_or_default();
+        assert!(
+            !logged.contains(r#""type":"abort""#),
+            "must not abort a transaction the daemon already terminated: {logged}"
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[cfg(unix)]
