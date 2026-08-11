@@ -43,13 +43,34 @@ fn load_f32_vec(hfq: &HfqFile, name: &str, expected_n: usize) -> Result<Vec<f32>
     Ok(f32_data)
 }
 
+/// Load an RMSNorm weight, applying Muse Glimmer's **centered** convention.
+///
+/// HF's `MuseGlimmerTextCenteredRMSNorm` computes `x_norm * (1 + w)` with the
+/// weight zero-initialised, so the checkpoint stores `w`, not the scale. Baking
+/// `1 + w` at load keeps the hot path on the ordinary `rmsnorm_f32` kernel — no
+/// new kernel, no per-call cost — exactly as gemma4 does for its own `(1 + w)`
+/// convention.
+///
+/// This is not a guess. The released BF16 checkpoint stores NEGATIVE weights for
+/// the post-norms (`post_attention_layernorm` starts −0.523, −0.480, −0.237;
+/// `post_feedforward_layernorm` −0.357, −0.371, −0.192), which are impossible
+/// under the plain `x * w` convention: they would flip the residual's sign and
+/// scale it toward zero. Under `1 + w` they become sensible scales of ~0.48–0.89,
+/// and the pre-norms' +0.10..+0.45 become ~1.10–1.45.
+///
+/// Opt out with `HIPFIRE_GLIMMER_NO_CENTERED_NORM=1` for A/B during bring-up.
 fn load_norm(
     hfq: &HfqFile,
     gpu: &mut Gpu,
     name: &str,
     dim: usize,
 ) -> Result<GpuTensor, String> {
-    let f32_data = load_f32_vec(hfq, name, dim)?;
+    let mut f32_data = load_f32_vec(hfq, name, dim)?;
+    if std::env::var("HIPFIRE_GLIMMER_NO_CENTERED_NORM").ok().as_deref() != Some("1") {
+        for v in f32_data.iter_mut() {
+            *v += 1.0;
+        }
+    }
     gpu.upload_f32(&f32_data, &[dim])
         .map_err(|e| format!("glimmer: upload norm {name}: {e:?}"))
 }
