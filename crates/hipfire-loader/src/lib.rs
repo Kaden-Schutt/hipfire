@@ -14,6 +14,7 @@ pub mod spec_build;
 
 use hipfire_arch_cohere2moe as cohere2moe;
 use hipfire_arch_gemma4 as gemma4;
+use hipfire_arch_muse_glimmer as glimmer;
 use hipfire_arch_deepseek4 as deepseek4;
 use hipfire_arch_dots_ocr::dots_ocr;
 use hipfire_arch_lfm2moe as lfm2moe;
@@ -105,6 +106,7 @@ const REGISTRY: &[&dyn Carrier] = &[
     &Lfm2MoeCarrier,
     &Cohere2MoeCarrier,
     &Gemma4Carrier,
+    &MuseGlimmerCarrier,
 ];
 
 // ─── Constants ────────────────────────────────────────────────────────
@@ -271,6 +273,7 @@ pub enum ModelState {
     Gemma4Lowered(Gemma4LoweredBundle),
     Deepseek4(hipfire_arch_deepseek4::Deepseek4Bundle),
     Deepseek4Heterogeneous(Deepseek4HeterogeneousBundle),
+    MuseGlimmer(MuseGlimmerBundle),
 }
 
 /// Self-owned gfx1100+dense / gfx1151+routed DeepSeek V4 state. The model
@@ -345,6 +348,15 @@ pub struct Gemma4LoweredBundle {
     pub scratch: gemma4::lowered::Gemma4Scratch,
     pub kv_sliding: llama::KvCache,
     pub kv_full: llama::KvCache,
+    pub eos_tok: u32,
+}
+
+/// Muse Glimmer 30B dense text (arch_id=14) GPU bundle — eager dense path.
+/// Mirrors Gemma4Bundle exactly (per cross-agent contract).
+pub struct MuseGlimmerBundle {
+    pub config: glimmer::config::GlimmerConfig,
+    pub weights: glimmer::glimmer::GlimmerWeights,
+    pub state: glimmer::glimmer::GlimmerState,
     pub eos_tok: u32,
 }
 
@@ -2521,6 +2533,7 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(
             | Some(ModelState::Gemma4Lowered(_))
             | Some(ModelState::Deepseek4(_))
             | Some(ModelState::Deepseek4Heterogeneous(_))
+            | Some(ModelState::MuseGlimmer(_))
             | None => {}
         }
         for g in gpus.devices.iter_mut() {
@@ -2623,6 +2636,15 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(
                 // Self-owned two-device transaction. Dropping `model` frees
                 // each resource on its exact owner and drains both pools.
                 drop(b);
+            }
+            ModelState::MuseGlimmer(b) => {
+                // Glimmer teardown is exactly the PR #566 pattern: free BOTH
+                // the per-layer scratch/KV state AND the weight allocations.
+                // Freeing only one side leaks ~1.3 GB over 5 cycles (the
+                // weights are ~650 MB + state ~650 MB; each reload without
+                // the companion free retains the prior cycle's allocation).
+                b.state.free_gpu(gpu);
+                b.weights.free_gpu(gpu);
             }
         }
     }

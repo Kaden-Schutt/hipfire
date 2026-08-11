@@ -26,6 +26,7 @@ use hipfire_arch_cohere2moe as cohere2moe;
 use hipfire_arch_deepseek4 as deepseek4;
 use hipfire_arch_dots_ocr::dots_ocr;
 use hipfire_arch_gemma4 as gemma4;
+use hipfire_arch_muse_glimmer as glimmer;
 use hipfire_arch_lfm2moe as lfm2moe;
 use hipfire_arch_lfm2moe::batch::Lfm2DecodeBatchState;
 use hipfire_arch_lfm2moe::forward_batch::{
@@ -10094,6 +10095,7 @@ fn reset_core_arch_key(arch_id: u32) -> &'static str {
         11 => "lfm2moe",
         12 => "cohere2moe",
         13 => "gemma4",
+        14 => "muse_glimmer",
         _ => "unknown",
     }
 }
@@ -13649,6 +13651,7 @@ fn main() {
                             11 => "lfm2moe",
                             12 => "north_mini_code",
                             13 => "gemma4",
+                            14 => "muse_glimmer",
                             _ => "qwen3",
                         };
                         let drafter = m.speculator.as_ref().map(|speculator| speculator.name());
@@ -13688,6 +13691,9 @@ fn main() {
                                 b.config.vocab_size,
                             ),
                             Some(ModelState::Gemma4(b)) => {
+                                (b.config.dim, b.config.n_layers, b.config.vocab_size)
+                            },
+                            Some(ModelState::MuseGlimmer(b)) => {
                                 (b.config.dim, b.config.n_layers, b.config.vocab_size)
                             },
                             _ => {
@@ -14009,7 +14015,7 @@ fn main() {
                         };
                         batch_scheduler = staged_batch_scheduler;
                         // `cache_capable` is the daemon's prompt-cache source of truth.
-                        // arch_id 13 (gemma4) is intentionally ABSENT: generate_gemma4 has
+                        // arch_id 13 (gemma4) and 14 (muse_glimmer) are intentionally ABSENT: generate_gemma4 has
                         // no LCP prefix-cache block and always cold-prefills the full
                         // Jinja-rendered prompt. Enabling the cache would corrupt KV
                         // slot offsets after turn 1 (stale prefix reuse). Wire when
@@ -15378,6 +15384,7 @@ fn main() {
                         11 => "lfm2moe",
                         12 => "north_mini_code",
                         13 => "gemma4",
+                        14 => "muse_glimmer",
                         _ => "qwen3",
                     })
                     .unwrap_or("none");
@@ -15522,6 +15529,9 @@ fn main() {
                     let _ = b.state.reset(&mut gpu);
                 }
                 if let Some(ModelState::Gemma4(bundle)) = m.state.as_mut() {
+                    bundle.state.reset();
+                }
+                if let Some(ModelState::MuseGlimmer(bundle)) = m.state.as_mut() {
                     bundle.state.reset();
                 }
                 if let Some(ModelState::Deepseek4(b)) = m.state.as_mut() {
@@ -15705,6 +15715,28 @@ fn main() {
                         }
                     }
                     ok
+                } else if m.arch_id == 14 {
+                    // Muse Glimmer warm-pass: per-token decode_step over the
+                    // synthetic prompt. Uses eager dense path (no hipGraph).
+                    // Mirrors the Gemma4 warm-pass shape.
+                    let Some(ModelState::MuseGlimmer(bundle)) = m.state.as_mut() else {
+                        unreachable!("arch_id=14 requires muse_glimmer bundle")
+                    };
+                    let config = &bundle.config;
+                    let weights = &bundle.weights;
+                    let state = &mut bundle.state;
+                    let mut ok = true;
+                    for (i, &tok) in synthetic.iter().enumerate() {
+                        if glimmer::forward::decode_step(
+                            config, weights, state, &mut gpu, tok, i as u32,
+                        )
+                        .is_err()
+                        {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    ok
                 } else if m.arch_id == 8 {
                     // dots.ocr: Qwen2 text decoder via qwen2_state + dots_ocr fields.
                     let state = m.qwen2_state.as_mut().unwrap();
@@ -15762,6 +15794,9 @@ fn main() {
                     b.state.reset();
                 }
                 if let Some(ModelState::Gemma4(bundle)) = m.state.as_mut() {
+                    bundle.state.reset();
+                }
+                if let Some(ModelState::MuseGlimmer(bundle)) = m.state.as_mut() {
                     bundle.state.reset();
                 }
                 if let Some(ModelState::Deepseek4(b)) = m.state.as_mut() {
@@ -23567,6 +23602,41 @@ fn generate(
         return;
     }
 
+    // arch_id=14 (Muse Glimmer dense): eager AR path. Same shape as the
+    // gemma4 short-circuit: bypass the DFlash/spec/sampler-budget scaffolding
+    // below. Without this arm arch 14 falls through to the Qwen AR arm.
+    if m.arch_id == 14 {
+        let _ = (
+            budget_alert_at_tok,
+            budget_alert_text,
+            assistant_prefix,
+            pflash_state,
+            pflash_cfg,
+            think_mode,
+            user_explicit_sampling,
+            top_k,
+            min_p,
+            cactus_delta,
+        );
+        let _ = (repeat_penalty, repeat_window, presence_penalty, frequency_penalty);
+        let _ = stop;
+        generate_muse_glimmer(
+            m,
+            gpu,
+            stdout,
+            id,
+            prompt,
+            system_prompt,
+            temp,
+            top_p,
+            max_tokens,
+            max_think_tokens,
+            tools,
+            messages_history,
+        );
+        return;
+    }
+
     // hunt3 M-E: seed the process-global CPU sampler RNG with this request's
     // fixed seed so the grammar/CPU-fallback sample stream is deterministic per
     // request and does not carry RNG state across requests. Matches the u32 the
@@ -28889,6 +28959,307 @@ fn generate_gemma4(
             Ok(logits) => last_logits = logits,
             Err(e) => {
                 emit_error_with_id(stdout, id, format!("gemma4 decode failed: {e:?}"));
+                return;
+            }
+        }
+    }
+
+    m.seq_pos = bundle.state.n_tokens;
+
+    let decode_ms = decode_t0.elapsed().as_millis().max(1);
+    let total_ms = t0.elapsed().as_millis().max(1);
+    let tok_s = if generated_count > 0 {
+        (generated_count as f64 * 1000.0) / decode_ms as f64
+    } else {
+        0.0
+    };
+    let _ = writeln!(
+        stdout,
+        r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.2},"prefill_ms":{},"total_ms":{}}}"#,
+        id, generated_count, tok_s, prefill_ms, total_ms,
+    );
+    let _ = stdout.flush();
+}
+
+/// Muse Glimmer dense text (arch_id=14) eager AR path.
+///
+/// Mirrors `generate_gemma4` shape (prefill loop / decode loop, JSONL
+/// `token` / `done` events) with Glimmer specifics:
+///
+///   1. Prompt build goes through `JinjaChatFrame` when `HIPFIRE_JINJA_CHAT=1`
+///      and the model carries a chat_template, falling back to
+///      `tokenizer.encode` (BOS-prepended) otherwise.
+///   2. `glimmer::forward::decode_step` returns the full logits `Vec<f32>`
+///      (the state does NOT stash a greedy next-token), so sampling runs
+///      host-side via `deepseek4::sampling::sample_token` on that vector.
+///   3. Stop set: config `eos_token` (scalar 200001) UNION any
+///      tokenizer-resolved end-of-turn token (e.g. `<end_of_turn>` /
+///      `<|im_end|>` if present). Glimmer's `eos_token_id` is a scalar
+///      (200001), unlike Gemma4's HF list [1, 106] which required a
+///      special-cased 106 fallback — do not copy that workaround.
+///   4. No LCP prompt-cache block (same reason as gemma4): this path
+///      always cold-prefills the full Jinja render. Arch 14 is therefore
+///      intentionally ABSENT from the `cache_capable` allowlist.
+///   5. No hipGraph-captured decode path (per spec).
+#[allow(clippy::too_many_arguments)]
+fn generate_muse_glimmer(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    prompt: &str,
+    system_prompt: Option<&str>,
+    temp: f32,
+    top_p: f32,
+    max_tokens: usize,
+    max_think_tokens: usize,
+    tools: Option<&[serde_json::Value]>,
+    messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
+) {
+    // Glimmer has no thinking budget; silence the param explicitly.
+    let _ = max_think_tokens;
+
+    if m.tokenizer.is_none() {
+        emit_error_with_id(stdout, id, "tokenizer not loaded");
+        return;
+    }
+    // Contract: ModelState::MuseGlimmer(bundle) — see cross-agent contract.
+    // If the loader has not yet published this variant, this match will fail
+    // to compile, which is intentional (loud Err rather than silent drop).
+    let Some(ModelState::MuseGlimmer(bundle)) = m.state.as_mut() else {
+        emit_error_with_id(
+            stdout,
+            id,
+            "muse_glimmer bundle missing on arch_id=14 generate (expected ModelState::MuseGlimmer)",
+        );
+        return;
+    };
+
+    let bos_tok = bundle.config.bos_token;
+    let cfg_eos_tok = bundle.config.eos_token;
+
+    // ── Prompt build (same two-path branch as the gemma4 AR path) ──
+    let prompt_ids: Vec<u32> = {
+        let tokenizer = m.tokenizer.as_ref().unwrap();
+        let jinja_enabled =
+            std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
+        let try_jinja = jinja_enabled && m.chat_template.is_some();
+        let mut ids: Vec<u32> = if try_jinja {
+            let template = m.chat_template.as_ref().unwrap();
+            let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
+                tokenizer,
+                template,
+                system: system_prompt,
+                user: prompt,
+                enable_thinking: false,
+                bos_token: Some("<bos>"),
+            };
+            let render_result = if tools.is_some() || messages_history.is_some() {
+                let synthesized: Vec<hipfire_runtime::prompt_frame::Message>;
+                let messages_slice: &[hipfire_runtime::prompt_frame::Message] =
+                    match messages_history {
+                        Some(h) => h,
+                        None => {
+                            let mut v = Vec::new();
+                            if let Some(sys) = system_prompt {
+                                v.push(hipfire_runtime::prompt_frame::Message {
+                                    role: hipfire_runtime::prompt_frame::Role::System,
+                                    content: sys.to_string(),
+                                    tool_calls: Vec::new(),
+                                    tool_call_id: None,
+                                    tool_plan: String::new(),
+                                });
+                            }
+                            v.push(hipfire_runtime::prompt_frame::Message {
+                                role: hipfire_runtime::prompt_frame::Role::User,
+                                content: prompt.to_string(),
+                                tool_calls: Vec::new(),
+                                tool_call_id: None,
+                                tool_plan: String::new(),
+                            });
+                            synthesized = v;
+                            &synthesized
+                        }
+                    };
+                frame.render_messages(messages_slice, tools, None)
+            } else {
+                frame.render()
+            };
+            match render_result {
+                Ok(rendered) => tokenizer.encode(&rendered),
+                Err(e) => {
+                    eprintln!(
+                        "[daemon] jinja render failed in muse_glimmer path ({e}) —                          falling back to BOS + raw prompt"
+                    );
+                    tokenizer.encode(prompt)
+                }
+            }
+        } else {
+            tokenizer.encode(prompt)
+        };
+        if ids.first() != Some(&bos_tok) {
+            ids.insert(0, bos_tok);
+        }
+        ids
+    };
+
+    if prompt_ids.is_empty() {
+        emit_error_with_id(stdout, id, "empty prompt after tokenize");
+        return;
+    }
+
+    // Stop set: scalar eos_token (200001) plus any tokenizer-resolved
+    // end-of-turn token. Do NOT copy Gemma4's 106 fallback — Glimmer's
+    // HF eos_token_id is a scalar, not a list. Check tokenizer for
+    // end-of-turn / im_end style tokens and include if present.
+    let stop_set: Vec<u32> = {
+        let tokenizer = m.tokenizer.as_ref().unwrap();
+        let mut s = vec![cfg_eos_tok];
+        // Bundle eos_tok may be same as cfg_eos_tok; dedup below.
+        if !s.contains(&bundle.eos_tok) {
+            s.push(bundle.eos_tok);
+        }
+        // Candidate end-of-turn / chat-boundary tokens. Use special_token_id
+        // (covers vocab-registered specials) plus a single-id encode probe
+        // for tokenizers that expose the string via encode.
+        for candidate in [
+            "<end_of_turn>",
+            "<|end_of_turn|>",
+            "<|im_end|>",
+            "<|endoftext|>",
+            "</s>",
+            "<eos>",
+        ] {
+            if let Some(tid) = tokenizer.special_token_id(candidate) {
+                if !s.contains(&tid) {
+                    s.push(tid);
+                }
+            } else {
+                let ids = tokenizer.encode(candidate);
+                if ids.len() == 1 && !s.contains(&ids[0]) {
+                    // Only accept single-id encodings to avoid polluting stop
+                    // set with subword fragments.
+                    // For <|endoftext|> this will typically be multi-token and
+                    // thus ignored; special_token_id above is the reliable path
+                    // for that token.
+                    s.push(ids[0]);
+                }
+            }
+        }
+        s.dedup();
+        s
+    };
+
+    // Capacity guard. No eviction on arch_id=14 — reset the KV cursors when
+    // the requested run would overflow the physical cache.
+    let overflow = {
+        bundle.state.n_tokens + prompt_ids.len() + max_tokens > bundle.state.max_seq
+    };
+    if overflow {
+        let (n, cap) = (bundle.state.n_tokens, bundle.state.max_seq);
+        eprintln!("[daemon] arch_id=14 context full ({n}/{cap}) — resetting GlimmerState");
+        bundle.state.reset();
+        m.seq_pos = 0;
+        m.conversation_tokens.clear();
+    }
+    // Hard refusal: even from a cold cache the prompt alone must fit (KV
+    // writes at pos >= max_seq would be out of bounds).
+    let cache_cap = bundle.state.max_seq;
+    if prompt_ids.len() >= cache_cap {
+        emit_error_with_id(
+            stdout,
+            id,
+            format!(
+                "muse_glimmer prompt is {} tokens but max_seq is {cache_cap}",
+                prompt_ids.len()
+            ),
+        );
+        return;
+    }
+
+    let t0 = Instant::now();
+
+    // ── Prefill: eager decode_step per prompt token. The LAST decode_step's
+    // logits are the predictions for the first generated token. ──
+    let mut last_logits: Vec<f32> = Vec::new();
+    {
+        let mut position = bundle.state.n_tokens as u32;
+        for &tok in &prompt_ids {
+            match glimmer::forward::decode_step(
+                &bundle.config,
+                &bundle.weights,
+                &mut bundle.state,
+                gpu,
+                tok,
+                position,
+            ) {
+                Ok(logits) => last_logits = logits,
+                Err(e) => {
+                    emit_error_with_id(stdout, id, format!("muse_glimmer prefill failed: {e:?}"));
+                    return;
+                }
+            }
+            position += 1;
+        }
+    }
+    for &tok in &prompt_ids {
+        m.conversation_tokens.push(tok);
+    }
+    let prefill_ms = t0.elapsed().as_millis();
+
+    // ── Decode loop. Sample host-side from the running logits vector. ──
+    let seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0x9E3779B97F4A7C15);
+    let mut rng = deepseek4::sampling::Xorshift::new(seed);
+
+    let mut generated_count: usize = 0;
+    let decode_t0 = Instant::now();
+    loop {
+        if generated_count >= max_tokens {
+            break;
+        }
+        let next_tok =
+            deepseek4::sampling::sample_token(&last_logits, temp, 0, top_p, &mut rng);
+        if stop_set.contains(&next_tok) {
+            break;
+        }
+
+        let frag = {
+            let tokenizer = m.tokenizer.as_ref().unwrap();
+            tokenizer.decode(&[next_tok])
+        };
+        let envelope = serde_json::json!({
+            "type": "token",
+            "id": id,
+            "text": frag,
+        });
+        let _ = writeln!(stdout, "{}", envelope);
+        let _ = stdout.flush();
+        m.conversation_tokens.push(next_tok);
+        generated_count += 1;
+
+        // KV-capacity guard: the next forward writes KV at slot n_tokens;
+        // forwarding at pos >= max_seq would write out of bounds. Stop
+        // cleanly here — the just-emitted token is still valid.
+        if bundle.state.n_tokens >= cache_cap {
+            break;
+        }
+
+        let position = bundle.state.n_tokens as u32;
+        let step = glimmer::forward::decode_step(
+            &bundle.config,
+            &bundle.weights,
+            &mut bundle.state,
+            gpu,
+            next_tok,
+            position,
+        );
+        match step {
+            Ok(logits) => last_logits = logits,
+            Err(e) => {
+                emit_error_with_id(stdout, id, format!("muse_glimmer decode failed: {e:?}"));
                 return;
             }
         }

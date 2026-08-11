@@ -1769,3 +1769,109 @@ fn load_gemma4_eagle_state(
         draft_len,
     })
 }
+
+// ─── MuseGlimmerCarrier ────────────────────────────────────────────────
+
+pub struct MuseGlimmerCarrier;
+impl Carrier for MuseGlimmerCarrier {
+    fn name(&self) -> &'static str {
+        "muse_glimmer"
+    }
+    fn spec_target_guard<'m>(
+        &self,
+        _state: &'m mut Option<ModelState>,
+        _model_path: &str,
+    ) -> Result<Box<dyn SpecTargetGuard + 'm>, String> {
+        Err("muse_glimmer: spec decode not yet wired (AR-only)".into())
+    }
+    fn make_spec_emitter<'a>(
+        &self,
+        _ctx: SpecEmitCtx<'a>,
+    ) -> Result<Box<dyn SpecEmit + 'a>, String> {
+        Err("muse_glimmer: spec emitter not yet wired".into())
+    }
+    fn claims_arch_id(&self, arch_id: u32, _is_dir: bool) -> bool {
+        arch_id == 14
+    }
+    fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
+        if ctx.pp > 1 {
+            return Err(match &src {
+                ModelSource::Hfq(_) => "muse_glimmer: pipeline-parallel (pp>1) unsupported",
+                ModelSource::Dir(_) => "muse_glimmer: safetensors + pp>1 unsupported",
+            }
+            .into());
+        }
+        if ctx.draft_path.is_some() {
+            return Err(
+                "params.draft (qwen3.5 DFlash) is not supported on arch_id=14 (Muse Glimmer).                  Remove params.draft for AR-only decode."
+                    .to_string(),
+            );
+        }
+        if ctx.gemma4_drafter_path.is_some() {
+            return Err(
+                "params.drafter (Gemma4 EAGLE) is not supported on arch_id=14 (Muse Glimmer).                  Remove params.drafter for AR-only decode."
+                    .to_string(),
+            );
+        }
+        dir_diag(&src);
+        let meta = resolve_source_meta(&src, ctx.path)?;
+        match src {
+            ModelSource::Hfq(hfq) => {
+                // HFQ load path via the crate API (contract: from_hfq / load / new_with_max_seq)
+                let config = hipfire_arch_muse_glimmer::config::GlimmerConfig::from_hfq(&hfq)?;
+                let weights = hipfire_arch_muse_glimmer::glimmer::GlimmerWeights::load(
+                    &hfq, &config, ctx.gpu,
+                )?;
+                let state = hipfire_arch_muse_glimmer::glimmer::GlimmerState::new_with_max_seq(
+                    ctx.gpu, &config, ctx.max_seq,
+                )
+                .map_err(|e| format!("muse_glimmer: GlimmerState::new_with_max_seq failed: {e}"))?;
+                // eos resolution by name with 200001 as the documented fallback.
+                // 200001 is Glimmer's eos_token_id (config.eos_token, bos 200000).
+                // Try tokenizer encode of common EOS surface forms first; if none
+                // tokenize to a single id, fall back to 200001 (never 1 — the
+                // generic fallback in resolve_eos_tok would be silently wrong
+                // for Glimmer and would cause runaway generation).
+                let eos_tok = {
+                    let tok = resolve_eos_tok(
+                        &meta.tokenizer,
+                        &["<end_of_turn>", "<|im_end|>", "</s>", "<|endoftext|>", "<eos>"],
+                    );
+                    if tok == 1 { 200001 } else { tok }
+                };
+                let speculator = crate::spec_build::build_speculator(
+                    meta.arch_id,
+                    None,
+                    None,
+                    true,
+                    ctx.max_seq,
+                    ctx.spec,
+                );
+                Ok(LoadedModel {
+                    state: Some(ModelState::MuseGlimmer(crate::MuseGlimmerBundle {
+                        config,
+                        weights,
+                        state,
+                        eos_tok,
+                    })),
+                    speculator,
+                    ..LoadedModel::skeleton(
+                        meta.arch_id,
+                        meta.tokenizer,
+                        ctx.max_seq,
+                        ctx.max_seq,
+                        ctx.path.to_string(),
+                        meta.chat_template,
+                    )
+                })
+            }
+            ModelSource::Dir(source) => {
+                let _ = source;
+                return Err(
+                    "muse_glimmer: safetensors Dir load not yet wired — use HFQ (quantize with --arch-id 14) or add config_from_source to hipfire-arch-muse-glimmer".into()
+                );
+            }
+        }
+    }
+}
+

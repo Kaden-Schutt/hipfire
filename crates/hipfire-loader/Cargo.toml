@@ -37,4 +37,5 @@ hipfire-arch-lfm2moe = { path = "../hipfire-arch-lfm2moe" }
 hipfire-arch-minimax = { path = "../hipfire-arch-minimax" }
 hipfire-arch-cohere2moe = { path = "../hipfire-arch-cohere2moe" }
 hipfire-arch-gemma4 = { path = "../hipfire-arch-gemma4" }
+hipfire-arch-muse-glimmer = { path = "../hipfire-arch-muse-glimmer" }
 serde_json = "1"
