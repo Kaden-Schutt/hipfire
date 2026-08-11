@@ -181,16 +181,34 @@ fn glimmer_layer_decode(
     // RoPE only on layers whose layer_rope_theta != 0 (copy cohere2moe shape)
     if cfg.has_rope(layer_idx) || abl("HIPFIRE_GLIMMER_ROPE_ALL") {
         let theta = cfg.rope_theta_for(layer_idx);
-        gpu.rope_f32(
-            &state.q,
-            &state.k,
-            &state.pos_buf,
-            n_heads,
-            n_kv,
-            head_dim,
-            theta,
-        )
-        .map_err(|e| format!("glimmer L{layer_idx}: rope: {e:?}"))?;
+        // RoPE convention. HF reports rope_type "default" (Llama half-split),
+        // which is `rope_f32`. HIPFIRE_GLIMMER_ROPE_INTERLEAVED=1 selects the
+        // GPT-J interleaved variant for A/B during bring-up — getting this
+        // backwards scrambles attention into plausible-looking noise.
+        if abl("HIPFIRE_GLIMMER_ROPE_INTERLEAVED") {
+            gpu.rope_interleaved_f32(
+                &state.q,
+                &state.k,
+                &state.pos_buf,
+                n_heads,
+                n_kv,
+                head_dim,
+                head_dim, // n_rot = full head_dim (no partial rotation)
+                theta,
+            )
+            .map_err(|e| format!("glimmer L{layer_idx}: rope interleaved: {e:?}"))?;
+        } else {
+            gpu.rope_f32(
+                &state.q,
+                &state.k,
+                &state.pos_buf,
+                n_heads,
+                n_kv,
+                head_dim,
+                theta,
+            )
+            .map_err(|e| format!("glimmer L{layer_idx}: rope: {e:?}"))?;
+        }
     }
 
     // KV write (Q8) + windowed/full attention via attention_q8_0_kv_swa
