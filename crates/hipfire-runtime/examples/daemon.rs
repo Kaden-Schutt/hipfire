@@ -29399,7 +29399,15 @@ fn generate_muse_glimmer(
             let hidden = drafter.config.hidden; // 6656
             let row_elems = ne * hidden; // 33280
             let n_rows = bundle.target_hidden_host.len() / row_elems;
-            let ctx_cap = drafter.config.sliding_window; // 2048
+            // Context window handed to the drafter. Upstream keeps the context
+            // K/V in a DFlashCache and only appends newly accepted rows; we
+            // currently re-project all ctx rows every window, so this cap is
+            // also the per-cycle cost knob. HIPFIRE_GLIMMER_CTX_CAP overrides it
+            // so the tau-vs-cost curve can be measured rather than guessed.
+            let ctx_cap = std::env::var("HIPFIRE_GLIMMER_CTX_CAP")
+                .ok()
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .unwrap_or(drafter.config.sliding_window);
             let ctx_len = n_rows.min(ctx_cap);
             let target_hidden: Vec<f32> = if ctx_len == 0 {
                 Vec::new()
