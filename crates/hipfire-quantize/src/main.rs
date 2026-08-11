@@ -8679,6 +8679,38 @@ fn main() {
     let no_q8_router_flag = args.no_q8_router
         || std::env::var("HIPFIRE_NO_Q8_ROUTER").ok().as_deref() == Some("1");
     let q8_router = (is_moe_like || q8_router_flag) && !no_q8_router_flag;
+    // Muse Glimmer (arch 14): untied lm_head defaults to Q8, like embed.
+    //
+    // Glimmer sets `tie_word_embeddings=false`, so `lm_head.weight` is a
+    // SEPARATE [202048, 6656] tensor rather than an alias of the embedding
+    // table. `embed_tokens` stays Q8 through its own `is_embed` arm, but an
+    // untied lm_head has no such arm — on a dense model `q8_router` is off by
+    // default, so the K-map's Q8 verdict for lm_head is never reached and it
+    // follows `--format` down to MQ4. That is a 4-bit output projection over a
+    // 202k vocab, and nothing in the pipeline flags it. The first Glimmer MQ4
+    // build shipped exactly that way while the K-map unit tests passed.
+    //
+    // Rather than widen the shared `is_moe_like` default (which would drag
+    // attention into Q8 for every dense arch and change their artifacts), this
+    // enables the fixed tier for arch 14 only and narrows it to the two classes
+    // that must be Q8. `--no-q8-router` still wins, and an explicit
+    // HIPFIRE_Q8_CLASSES still wins, so both levers stay available.
+    //
+    // Cost on the 30B: 15.51 GB -> 16.26 GB, decode 33.06 -> 31.62 tok/s
+    // (gfx1201, 64 tok greedy). Both artifacts decode coherently.
+    let glimmer_q8_head = arch_id == 14 && !no_q8_router_flag;
+    if glimmer_q8_head {
+        if std::env::var("HIPFIRE_Q8_CLASSES").is_err() {
+            // SAFETY: single-threaded CLI setup, before any worker threads spawn.
+            unsafe { std::env::set_var("HIPFIRE_Q8_CLASSES", "lm_head,embed") };
+        }
+        eprintln!(
+            "note: muse_glimmer (arch 14) — untied lm_head + embed held at Q8F16;\n\
+             all other tensors follow --format. Override with HIPFIRE_Q8_CLASSES\n\
+             or disable with --no-q8-router."
+        );
+    }
+    let q8_router = q8_router || glimmer_q8_head;
     if no_q8_router_flag {
         eprintln!(
             "note: --no-q8-router — the fixed tier (attention / lm_head / router /\n\
@@ -15220,6 +15252,39 @@ mod tests {
         assert_eq!(kmap_resolve(name, 52, false), QuantLevel::Q8, "kmap Rule2 Q8");
         assert_eq!(kmap_resolve_mode(name, 52, false, 0), QuantLevel::Q8);
         assert_eq!(kmap_resolve_mode(name, 52, false, 3), QuantLevel::Q8);
+    }
+
+    #[test]
+    fn glimmer_q8_classes_narrowing_keeps_lm_head_and_embed_only() {
+        // The arch-14 default sets HIPFIRE_Q8_CLASSES=lm_head,embed and turns the
+        // fixed tier on. This locks in what that narrowing actually selects: the
+        // two output-side tensors are held at Q8, and attention is NOT — dragging
+        // attention in would inflate the artifact for no stated requirement.
+        //
+        // Regression value: the first Glimmer MQ4 build shipped lm_head at
+        // MQ4G256 even though `kmap_resolve` returns Q8 for it, because on a
+        // dense model the fixed tier is off and the K-map verdict is never
+        // consulted. The K-map assertions in the sibling test passed the entire
+        // time. Only a check that pins the CLASS SELECTION catches that gap.
+        //
+        // SAFETY: single-threaded test; env is restored before returning.
+        let prev = std::env::var("HIPFIRE_Q8_CLASSES").ok();
+        unsafe { std::env::set_var("HIPFIRE_Q8_CLASSES", "lm_head,embed") };
+
+        assert!(is_q8_tensor("lm_head.weight"), "lm_head must be Q8");
+        assert!(
+            is_q8_tensor("model.language_model.embed_tokens.weight"),
+            "embed_tokens must be Q8"
+        );
+        let attn_q8 = is_q8_tensor("model.language_model.layers.0.self_attn.q_proj.weight");
+        let gate_q8 = is_q8_tensor("model.language_model.layers.0.self_attn.gate_proj.weight");
+        assert!(!attn_q8, "attention must NOT be pulled into Q8 by the glimmer default");
+        assert!(!gate_q8, "the Glimmer attention gate is a projection and must follow --format");
+
+        match prev {
+            Some(v) => unsafe { std::env::set_var("HIPFIRE_Q8_CLASSES", v) },
+            None => unsafe { std::env::remove_var("HIPFIRE_Q8_CLASSES") },
+        }
     }
 
     #[test]
