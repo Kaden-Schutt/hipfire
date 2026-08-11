@@ -457,11 +457,25 @@ For dataclass benches:
 
 ### Where to put bench results
 
-- **Numerical perf-checkpoints:** in the commit message body of the
-  commit that produced the numbers, or in the PR description. The
-  prior `docs/perf-checkpoints/` tree was archived 2026-04-27 — first-
-  class artifacts now live in git history, not in a parallel doc tree
-  that drifts.
+- **Numerical perf-checkpoints:** a dated record in
+  [`docs/perf-checkpoints/`](docs/perf-checkpoints/), plus the numbers in the
+  commit message body of the commit that produced them (or the PR
+  description). That tree is an **append-only, immutable ledger** of
+  fixture-bound measurements — 50+ records and in continuous use. Read
+  [`docs/perf-checkpoints/README.md`](docs/perf-checkpoints/README.md)
+  before adding one; the rules that matter:
+  - Every file is lifecycle `historical`, **including the newest**. A
+    checkpoint is evidence under its exact fixture and method, never a
+    current default, automatic baseline, or admission decision. Newest
+    file != current baseline.
+  - **Never modify or delete an existing checkpoint.** Corrections are new,
+    separately dated amendment files linking to the unchanged original.
+  - Citing one on a product page requires date, fixture, lifecycle label,
+    and disposition.
+  - Current product claims live in [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md)
+    (admission-gated), routes in [`docs/VALIDATION.md`](docs/VALIDATION.md),
+    protocol in
+    [`docs/methodology/perf-benchmarking.md`](docs/methodology/perf-benchmarking.md).
 - **Forensic discoveries (e.g. "I found X regresses Y"):** in the
   commit message of the fix (or the bisect commit). For longer
   writeups, the PR description. Local-only scratch goes to
