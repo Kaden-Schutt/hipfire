@@ -29390,28 +29390,36 @@ fn generate_muse_glimmer(
                 }
             }
             let drafter = bundle.drafter.as_mut().unwrap();
-            // Target hidden history: last ctx row's 5-layer concat (33280 f32)
-            // from bundle.target_hidden_host (populated during prefill via
-            // decode_step_with_capture). If empty (should not happen after
-            // prefill), fall back to zeros. The concat order is
+            // Target hidden history: last ctx_len rows of 5-layer concat
+            // (33280 f32 each) from bundle.target_hidden_host (populated during
+            // prefill via decode_step_with_capture). Truncate to sliding_window
+            // by dropping OLDEST rows (suffix keep). Concat order is
             // [1,13,25,37,49] 0-based as verified via dflash_extract_layer_ids(52,5).
-            let ne = drafter.config.num_extract();
-            let row_elems = ne * hidden;
-            let mut target_hidden = if bundle.target_hidden_host.len() >= row_elems {
-                bundle.target_hidden_host[bundle.target_hidden_host.len() - row_elems..].to_vec()
+            let ne = drafter.config.num_extract(); // 5
+            let hidden = drafter.config.hidden; // 6656
+            let row_elems = ne * hidden; // 33280
+            let n_rows = bundle.target_hidden_host.len() / row_elems;
+            let ctx_cap = drafter.config.sliding_window; // 2048
+            let ctx_len = n_rows.min(ctx_cap);
+            let target_hidden: Vec<f32> = if ctx_len == 0 {
+                Vec::new()
             } else {
-                vec![0f32; row_elems]
+                let start = (n_rows - ctx_len) * row_elems; // SUFFIX — most recent rows
+                bundle.target_hidden_host[start..].to_vec()
             };
-            let ctx_len: usize = 1;
-            let positions_q: Vec<i32> = (cur_pos as i32..cur_pos as i32 + block_size as i32).collect();
-            // positions_k is block-sized only (B=16) — ctx hidden is broadcast via fc, not via K positions.
-            // The ctx-row count (1) and block length (16) must not share a buffer.
-            let positions_k: Vec<i32> = (cur_pos as i32..cur_pos as i32 + block_size as i32).collect();
+            // Single position span: ctx rows then block rows (Q sits on the tail).
+            let positions: Vec<i32> =
+                (cur_pos as i32 - ctx_len as i32..cur_pos as i32 + block_size as i32).collect();
+            debug_assert_eq!(
+                positions.len(),
+                ctx_len + block_size,
+                "positions.len() must equal ctx_len + block_size"
+            );
             // This call proves the drafter is consulted (grep will find it).
             // It validates mask_token_id==201818 and sizes — perturbation will Err.
             let drafter_ok = glimmer::drafter::glimmer_drafter_forward(
                 gpu, &drafter.config, &drafter.weights, &mut drafter.scratch,
-                &noise_embedding, &target_hidden, &positions_q, &positions_k,
+                &noise_embedding, &target_hidden, &positions,
                 block_size, ctx_len,
             );
             if let Err(e) = drafter_ok {
@@ -29450,6 +29458,19 @@ fn generate_muse_glimmer(
             {
                 let l2 = |v: &[f32]| -> f32 { v.iter().map(|x| x * x).sum::<f32>().sqrt() };
                 let nz = |v: &[f32]| -> usize { v.iter().filter(|x| **x != 0.0).count() };
+                eprintln!(
+                    "[glimmer-diag] ctx_len {} ctx_cap {} cur_pos {} positions len {} head {:?} tail {:?}",
+                    ctx_len,
+                    ctx_cap,
+                    cur_pos,
+                    positions.len(),
+                    positions.get(..4.min(positions.len())),
+                    if positions.len() > 4 {
+                        &positions[positions.len() - 4..]
+                    } else {
+                        &positions[..]
+                    },
+                );
                 eprintln!(
                     "[glimmer-diag] target_hidden: len {} l2 {:.4} nonzero {} head {:?}",
                     target_hidden.len(),
