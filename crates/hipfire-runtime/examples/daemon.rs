@@ -29537,6 +29537,7 @@ fn generate_muse_glimmer(
                 &hidden_for_draft,
                 block_size - 1,
                 &bundle.state.logits,
+                &bundle.state.logits_batch,
             ) {
                 Ok(p) => p,
                 Err(e) => {

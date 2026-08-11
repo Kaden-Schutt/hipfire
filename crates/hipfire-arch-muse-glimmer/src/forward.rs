@@ -28,7 +28,7 @@
 //!   logits = lm_head(tmp); logits *= output_multiplier; logits = softcap(logits, 20)
 
 use crate::config::{GlimmerConfig, GlimmerLayerType};
-use crate::glimmer::{GlimmerState, GlimmerWeights};
+use crate::glimmer::{GLIMMER_MAX_SPEC_BLOCK, GlimmerState, GlimmerWeights};
 use hipfire_runtime::llama::{
     fused_rmsnorm_rotate_for_mq, rotate_x_mq_batched_for, weight_gemv,
     weight_gemv_prerotated, EmbeddingFormat, WeightTensor,
@@ -620,6 +620,7 @@ pub fn glimmer_lm_head_picks(
     hidden_batch: &GpuTensor,
     batch: usize,
     logits_scratch: &GpuTensor,
+    logits_batch: &GpuTensor,
 ) -> Result<Vec<u32>, String> {
     let dim = cfg.dim;
     let vocab = cfg.vocab_size;
@@ -628,9 +629,16 @@ pub fn glimmer_lm_head_picks(
     if is_q8_lm {
         // Batched Q8: one GEMM reads lm_head once for all B rows (WMMA on gfx12).
         // Fallback to per-row if batched disabled via HIPFIRE_GLIMMER_BATCHED_LM_HEAD=0.
-        let logits_b = gpu
-            .alloc_tensor(&[batch * vocab], DType::F32)
-            .map_err(|e| format!("glimmer lm_head_picks alloc logits_b: {e:?}"))?;
+        // Persistent buffer, NOT a per-call alloc. A cold hipMalloc of this
+        // ~12.9 MB is slow and synchronizing, and it was the entire reason the
+        // first batched lm_head of a window cost 69 ms while the second cost
+        // 7.6 ms for the same weight through the same kernel.
+        if batch > GLIMMER_MAX_SPEC_BLOCK {
+            return Err(format!(
+                "glimmer lm_head_picks: batch {batch} exceeds GLIMMER_MAX_SPEC_BLOCK {GLIMMER_MAX_SPEC_BLOCK}"
+            ));
+        }
+        let logits_b = logits_batch.sub_offset(0, batch * vocab);
         gpu.gemm_q8_0_batched_chunked(&weights.lm_head.buf, hidden_batch, &logits_b, vocab, dim, batch)
             .map_err(|e| format!("glimmer lm_head_picks q8 batched: {e:?}"))?;
         for i in 0..batch {
@@ -657,7 +665,6 @@ pub fn glimmer_lm_head_picks(
                 .unwrap();
             picks.push(pick);
         }
-        gpu.free_tensor(logits_b).ok();
     } else {
         // MQ4 and disabled-Q8: per-row weight_gemv (re-streams lm_head B times).
         // Explicit fallback - same as draft side, so near-tie argmax cannot flip.
@@ -950,7 +957,7 @@ pub fn verify_block_with_capture(
     let t_after_norm = t_verify_start.elapsed();
     gpu.rmsnorm_batched(&x, &weights.final_norm, &normed, b, dim, rms_eps).map_err(|e| format!("glimmer batch final rmsnorm: {e:?}"))?;
 
-    let picks = glimmer_lm_head_picks(gpu, cfg, weights, &normed, b, &state.logits)?;
+    let picks = glimmer_lm_head_picks(gpu, cfg, weights, &normed, b, &state.logits, &state.logits_batch)?;
     let t_after_lm = t_verify_start.elapsed();
     if do_timing {
         let total = t_verify_start.elapsed();

@@ -13,6 +13,10 @@ use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama::{f16_to_f32, EmbeddingFormat, KvCache, WeightTensor};
 use rdna_compute::{DType, Gpu, GpuTensor};
 
+/// Upper bound on the DFlash speculation block, used to size `logits_batch`
+/// once at init. The Glimmer assistant's trained `block_size` is 16.
+pub const GLIMMER_MAX_SPEC_BLOCK: usize = 32;
+
 // ───────────────────────── HFQ load helpers ─────────────────────────
 
 fn load_f32_vec(hfq: &HfqFile, name: &str, expected_n: usize) -> Result<Vec<f32>, String> {
@@ -471,6 +475,15 @@ pub struct GlimmerState {
 
     // head
     pub logits: GpuTensor, // [vocab]
+    /// Persistent [block_max * vocab] logits buffer for the batched lm_head.
+    ///
+    /// Allocated ONCE. The batched lm_head previously did `alloc_tensor` +
+    /// `free_tensor` of this ~12.9 MB buffer on every call, and a cold
+    /// `hipMalloc` is both slow and synchronizing — which is what made the
+    /// FIRST batched lm_head of each window (the draft's) cost 69 ms while the
+    /// SECOND (verify's, reusing the block the first had just freed) cost 7.6 ms
+    /// for the same weight through the same kernel.
+    pub logits_batch: GpuTensor, // [GLIMMER_MAX_SPEC_BLOCK * vocab]
 }
 
 impl GlimmerState {
@@ -585,6 +598,11 @@ impl GlimmerState {
             ffn_hidden: alloc(gpu, cfg.hidden_dim, "ffn_hidden")?,
             ffn_out: alloc(gpu, dim, "ffn_out")?,
             logits: alloc(gpu, cfg.vocab_size, "logits")?,
+            logits_batch: alloc(
+                gpu,
+                GLIMMER_MAX_SPEC_BLOCK * cfg.vocab_size,
+                "logits_batch",
+            )?,
         })
     }
 
