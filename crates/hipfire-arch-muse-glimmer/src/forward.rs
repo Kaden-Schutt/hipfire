@@ -81,7 +81,26 @@ fn embed_lookup(
             return Err("glimmer: Q4K embedding format unsupported".to_string())
         }
     }
-    // No embed_scale for Glimmer (brief RESOLVED: NO embed_scale field)
+    // Scale-less RMSNorm over the embedding.
+    //
+    // HF wraps the table in `MuseGlimmerTextNormedEmbedding`:
+    //     forward(ids) = embed_norm(Embedding::forward(ids))
+    // with `MuseGlimmerRMSNorm(eps=config.rms_norm_eps, with_scale=False)`.
+    // Upstream explicitly does NOT fold this into the embedding matrix because
+    // the DFlash path needs to embed without it, so it runs per lookup here.
+    //
+    // There is no Gemma-style sqrt(dim) embed_scale in Glimmer — this norm is
+    // what takes its place, and omitting it leaves the residual stream at the
+    // wrong magnitude for every downstream layer.
+    if !abl("HIPFIRE_GLIMMER_NO_EMBED_NORM") {
+        gpu.rmsnorm_f32(
+            &state.x,
+            &state.embed_norm_ones,
+            &state.x,
+            _cfg.rms_norm_eps,
+        )
+        .map_err(|e| format!("glimmer: embed_norm: {e:?}"))?;
+    }
     Ok(())
 }
 

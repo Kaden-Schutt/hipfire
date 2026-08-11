@@ -43,36 +43,71 @@ fn load_f32_vec(hfq: &HfqFile, name: &str, expected_n: usize) -> Result<Vec<f32>
     Ok(f32_data)
 }
 
-/// Load an RMSNorm weight, applying Muse Glimmer's **centered** convention.
+/// Load an RMSNorm weight.
 ///
-/// HF's `MuseGlimmerTextCenteredRMSNorm` computes `x_norm * (1 + w)` with the
-/// weight zero-initialised, so the checkpoint stores `w`, not the scale. Baking
-/// `1 + w` at load keeps the hot path on the ordinary `rmsnorm_f32` kernel — no
-/// new kernel, no per-call cost — exactly as gemma4 does for its own `(1 + w)`
-/// convention.
+/// Muse Glimmer uses **two different norm conventions**, and mixing them up is a
+/// silent-wrongness trap. Per HF `modeling_muse_glimmer.py`:
 ///
-/// This is not a guess. The released BF16 checkpoint stores NEGATIVE weights for
-/// the post-norms (`post_attention_layernorm` starts −0.523, −0.480, −0.237;
-/// `post_feedforward_layernorm` −0.357, −0.371, −0.192), which are impossible
-/// under the plain `x * w` convention: they would flip the residual's sign and
-/// scale it toward zero. Under `1 + w` they become sensible scales of ~0.48–0.89,
-/// and the pre-norms' +0.10..+0.45 become ~1.10–1.45.
+/// | tensor | class | convention |
+/// |---|---|---|
+/// | `input_layernorm` | `MuseGlimmerTextCenteredRMSNorm` | `x_norm * (1 + w)` |
+/// | `post_attention_layernorm` | `MuseGlimmerTextCenteredRMSNorm` | `x_norm * (1 + w)` |
+/// | `pre_feedforward_layernorm` | `MuseGlimmerTextCenteredRMSNorm` | `x_norm * (1 + w)` |
+/// | `post_feedforward_layernorm` | `MuseGlimmerTextCenteredRMSNorm` | `x_norm * (1 + w)` |
+/// | final `norm` | `MuseGlimmerRMSNorm` | plain `x_norm * w` |
+/// | `qk_norm`, `embed_norm` | `MuseGlimmerRMSNorm(with_scale=False)` | scale-less |
 ///
-/// Opt out with `HIPFIRE_GLIMMER_NO_CENTERED_NORM=1` for A/B during bring-up.
-fn load_norm(
+/// `centered` bakes `1 + w` at load so the hot path stays on the ordinary
+/// `rmsnorm_f32` kernel — no new kernel, no per-call cost.
+///
+/// The centered classification is corroborated by the checkpoint itself: the
+/// post-norms store NEGATIVE weights (`post_attention_layernorm` −0.523, −0.480,
+/// −0.237; `post_feedforward_layernorm` −0.357, −0.371, −0.192), impossible under
+/// plain `x * w` since they would flip the residual's sign. Under `1 + w` they
+/// become sensible scales of ~0.48–0.89. The final `norm` stores ±3.x, which is
+/// only sensible under the PLAIN convention — centering it was a real bug.
+///
+/// Opt out of centering with `HIPFIRE_GLIMMER_NO_CENTERED_NORM=1` for A/B.
+fn load_norm_with(
     hfq: &HfqFile,
     gpu: &mut Gpu,
     name: &str,
     dim: usize,
+    centered: bool,
 ) -> Result<GpuTensor, String> {
     let mut f32_data = load_f32_vec(hfq, name, dim)?;
-    if std::env::var("HIPFIRE_GLIMMER_NO_CENTERED_NORM").ok().as_deref() != Some("1") {
+    if centered
+        && std::env::var("HIPFIRE_GLIMMER_NO_CENTERED_NORM")
+            .ok()
+            .as_deref()
+            != Some("1")
+    {
         for v in f32_data.iter_mut() {
             *v += 1.0;
         }
     }
     gpu.upload_f32(&f32_data, &[dim])
         .map_err(|e| format!("glimmer: upload norm {name}: {e:?}"))
+}
+
+/// Centered (`1 + w`) norm — the four per-decoder-layer norms.
+fn load_norm(
+    hfq: &HfqFile,
+    gpu: &mut Gpu,
+    name: &str,
+    dim: usize,
+) -> Result<GpuTensor, String> {
+    load_norm_with(hfq, gpu, name, dim, true)
+}
+
+/// Plain (`w`) norm — the final `model.language_model.norm`.
+fn load_norm_plain(
+    hfq: &HfqFile,
+    gpu: &mut Gpu,
+    name: &str,
+    dim: usize,
+) -> Result<GpuTensor, String> {
+    load_norm_with(hfq, gpu, name, dim, false)
 }
 
 
@@ -244,7 +279,10 @@ impl GlimmerWeights {
         // Separate tensor "lm_head.weight" [vocab, dim], not alias of embed.
         let lm_head = load_wt(hfq, gpu, "lm_head.weight", cfg.vocab_size, dim)?;
 
-        let final_norm = load_norm(
+        // PLAIN norm: HF builds the final `norm` as MuseGlimmerRMSNorm
+        // (with_scale=True), NOT MuseGlimmerTextCenteredRMSNorm. Centering it
+        // shifts every logit and was a real bring-up bug.
+        let final_norm = load_norm_plain(
             hfq,
             gpu,
             "model.language_model.norm.weight",
@@ -415,6 +453,14 @@ pub struct GlimmerState {
 
     /// Ones-filled weight for scale-less QK-norm (head_dim ones).
     pub qk_norm_ones: GpuTensor, // [head_dim]
+    /// Ones-filled weight for the scale-less embedding norm (hidden_size ones).
+    ///
+    /// HF wraps the embedding table in `MuseGlimmerTextNormedEmbedding`, whose
+    /// `forward` is `embed_norm(Embedding::forward(ids))` with
+    /// `MuseGlimmerRMSNorm(eps=rms_norm_eps, with_scale=False)`. The norm is
+    /// deliberately NOT folded into the embedding matrix upstream ("Dflash
+    /// implem needs to embed without the norm"), so it must run per lookup.
+    pub embed_norm_ones: GpuTensor, // [hidden_size]
 
     // FFN scratch
     pub gate_ffn: GpuTensor,   // [hidden_dim]
@@ -500,6 +546,15 @@ impl GlimmerState {
                 .map_err(|e| format!("glimmer: init qk_norm_ones: {e:?}"))?;
         }
 
+        let embed_norm_ones = alloc(gpu, dim, "embed_norm_ones")?;
+        {
+            let ones: Vec<f32> = vec![1.0; dim];
+            let bytes =
+                unsafe { std::slice::from_raw_parts(ones.as_ptr() as *const u8, ones.len() * 4) };
+            gpu.hip.memcpy_htod(&embed_norm_ones.buf, bytes)
+                .map_err(|e| format!("glimmer: upload embed_norm_ones: {e:?}"))?;
+        }
+
         Ok(GlimmerState {
             kv_sliding,
             kv_full,
@@ -517,6 +572,7 @@ impl GlimmerState {
             attn_out: alloc(gpu, q_dim, "attn_out")?,
             attn_gate: alloc(gpu, q_dim, "attn_gate")?,
             qk_norm_ones,
+            embed_norm_ones,
             gate_ffn: alloc(gpu, cfg.hidden_dim, "gate_ffn")?,
             up_ffn: alloc(gpu, cfg.hidden_dim, "up_ffn")?,
             ffn_hidden: alloc(gpu, cfg.hidden_dim, "ffn_hidden")?,
