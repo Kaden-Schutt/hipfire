@@ -7,20 +7,20 @@
 //! This binary owns hipfire's operator surface and never shells out to a
 //! JavaScript or TypeScript runtime.
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Parser, Subcommand};
 use hipfire_client::{
-    complete_openai_chat, probe_host, service_ready, service_url, stream_openai_chat, Engine,
-    OpenAiSseEvent,
+    Engine, OpenAiSseEvent, complete_openai_chat, probe_host, service_ready, service_url,
+    stream_openai_chat,
 };
 use hipfire_config::{
-    apply_config_profile, canonical_config_key, create_config_profile, developer_env_for_key,
-    field, fields, is_developer_key, load_catalog, load_env_layer, load_global, resolve,
-    write_catalog_toml, write_global_toml, CatalogFormat, ConfigFormat, ConfigLayer, ConfigPaths,
-    ConfigSource, NamedLayer, ValueRule, CONFIG_SCHEMA_VERSION,
+    CONFIG_SCHEMA_VERSION, CatalogFormat, ConfigFormat, ConfigLayer, ConfigPaths, ConfigSource,
+    NamedLayer, ValueRule, apply_config_profile, canonical_config_key, create_config_profile,
+    developer_env_for_key, field, fields, is_developer_key, load_catalog, load_env_layer,
+    load_global, resolve, write_catalog_toml, write_global_toml,
 };
 use hipfire_registry::{
-    load as load_registry, LoadedRegistry, ModelEntry, RegistryPaths, RegistrySource, RegistryV1,
+    LoadedRegistry, ModelEntry, RegistryPaths, RegistrySource, RegistryV1, load as load_registry,
 };
 use hipfire_runtime::prompt_frame::ToolCall;
 use serde::{Deserialize, Serialize};
@@ -36,8 +36,9 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, Command},
     sync::{
+        Arc, Condvar, Mutex,
         atomic::{AtomicBool, Ordering},
-        mpsc, Arc, Condvar, Mutex,
+        mpsc,
     },
     thread,
     time::{Duration, Instant},
@@ -547,6 +548,9 @@ struct ServeArgs {
     /// Expert-parallel degree.
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..=64))]
     tp: Option<u64>,
+    /// Maximum concurrent eligible batched lanes; 1 preserves sequential behavior.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..=256))]
+    continuous_batch_size: Option<u64>,
     /// Internal marker used by the detached child.
     #[arg(long, hide = true)]
     foreground_child: bool,
@@ -593,7 +597,6 @@ fn main() {
         std::process::exit(1);
     }
 }
-
 fn run() -> Result<()> {
     let cli = Cli::parse_from(env::args_os().map(|argument| {
         if argument == "-md" {
@@ -2154,6 +2157,7 @@ fn chat_command(paths: &Paths, args: ChatArgs) -> Result<()> {
             kv_backend: None,
             idle_timeout: None,
             tp: None,
+            continuous_batch_size: None,
             foreground_child: false,
         };
         detach_serve(paths, &serve_args, &host, port)?;
@@ -2279,11 +2283,13 @@ struct ServeRuntime {
     registry: RegistryV1,
     current_path: Option<PathBuf>,
     current_arch: Option<String>,
+    continuous_batch_capable: bool,
     current_max_seq: u64,
     cache_capable: bool,
     kv_override: Option<String>,
     kv_backend_override: Option<String>,
     tp: Option<u64>,
+    continuous_batch_size: u64,
 }
 
 struct ServeShared {
@@ -2485,8 +2491,10 @@ fn longest_control_prefix_suffix(text: &str) -> usize {
 
 #[derive(Debug, Default)]
 struct AdmissionState {
-    busy: bool,
+    eligible: usize,
+    ineligible_busy: bool,
     queued: usize,
+    batch_model: Option<String>,
 }
 
 #[derive(Debug)]
@@ -2495,6 +2503,7 @@ struct Admission {
     available: Condvar,
     max_queue: usize,
     timeout: Duration,
+    capacity: usize,
 }
 
 #[derive(Debug)]
@@ -2514,24 +2523,71 @@ impl std::error::Error for AdmissionError {}
 #[derive(Debug)]
 struct AdmissionGuard {
     admission: Arc<Admission>,
+    is_eligible: bool,
+    model: Option<String>,
 }
 
 impl Admission {
     fn new(max_queue: usize, timeout: Duration) -> Self {
+        Self::new_with_capacity(max_queue, timeout, 1)
+    }
+
+    fn new_with_capacity(max_queue: usize, timeout: Duration, capacity: usize) -> Self {
         Self {
             state: Mutex::new(AdmissionState::default()),
             available: Condvar::new(),
             max_queue,
             timeout,
+            capacity: capacity.max(1),
         }
     }
 
+    fn is_model_compatible(current: &Option<String>, requested: Option<&str>) -> bool {
+        match (current, requested) {
+            (None, _) => true,
+            (Some(cur), Some(req)) => cur == req,
+            (Some(_), None) => true,
+        }
+    }
+
+    fn capacity(&self) -> usize {
+        self.capacity
+    }
+
     fn acquire(self: &Arc<Self>) -> std::result::Result<AdmissionGuard, AdmissionError> {
+        self.acquire_for(false, None)
+    }
+
+    fn acquire_for(
+        self: &Arc<Self>,
+        is_eligible: bool,
+        model: Option<&str>,
+    ) -> std::result::Result<AdmissionGuard, AdmissionError> {
+        let model_owned = model.map(|s| s.to_owned());
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        if !state.busy {
-            state.busy = true;
+        // Fast path when no queued waiters and resource is available.
+        if is_eligible {
+            if !state.ineligible_busy
+                && state.eligible < self.capacity
+                && state.queued == 0
+                && Self::is_model_compatible(&state.batch_model, model_owned.as_deref())
+            {
+                state.eligible += 1;
+                if state.batch_model.is_none() {
+                    state.batch_model = model_owned.clone();
+                }
+                return Ok(AdmissionGuard {
+                    admission: Arc::clone(self),
+                    is_eligible: true,
+                    model: model_owned,
+                });
+            }
+        } else if state.eligible == 0 && !state.ineligible_busy && state.queued == 0 {
+            state.ineligible_busy = true;
             return Ok(AdmissionGuard {
                 admission: Arc::clone(self),
+                is_eligible: false,
+                model: None,
             });
         }
         if self.max_queue != 0 && state.queued >= self.max_queue {
@@ -2568,30 +2624,60 @@ impl Admission {
                     .wait_timeout(state, remaining)
                     .unwrap_or_else(|error| error.into_inner());
                 state = next;
-                if wait.timed_out() && state.busy {
-                    state.queued = state.queued.saturating_sub(1);
-                    return Err(AdmissionError {
-                        message: format!(
-                            "serve queue wait exceeded {}ms",
-                            self.timeout.as_millis()
-                        ),
-                        retry_after_seconds: self.retry_after_seconds(),
-                    });
+                if wait.timed_out() {
+                    let can_acquire = if is_eligible {
+                        !state.ineligible_busy
+                            && state.eligible < self.capacity
+                            && Self::is_model_compatible(&state.batch_model, model_owned.as_deref())
+                    } else {
+                        state.eligible == 0 && !state.ineligible_busy
+                    };
+                    if !can_acquire {
+                        state.queued = state.queued.saturating_sub(1);
+                        return Err(AdmissionError {
+                            message: format!(
+                                "serve queue wait exceeded {}ms",
+                                self.timeout.as_millis()
+                            ),
+                            retry_after_seconds: self.retry_after_seconds(),
+                        });
+                    }
                 }
             }
-            if !state.busy {
+            let can_acquire = if is_eligible {
+                !state.ineligible_busy
+                    && state.eligible < self.capacity
+                    && Self::is_model_compatible(&state.batch_model, model_owned.as_deref())
+            } else {
+                state.eligible == 0 && !state.ineligible_busy
+            };
+            if can_acquire {
                 state.queued = state.queued.saturating_sub(1);
-                state.busy = true;
-                return Ok(AdmissionGuard {
-                    admission: Arc::clone(self),
-                });
+                if is_eligible {
+                    state.eligible += 1;
+                    if state.batch_model.is_none() {
+                        state.batch_model = model_owned.clone();
+                    }
+                    return Ok(AdmissionGuard {
+                        admission: Arc::clone(self),
+                        is_eligible: true,
+                        model: model_owned.clone(),
+                    });
+                } else {
+                    state.ineligible_busy = true;
+                    return Ok(AdmissionGuard {
+                        admission: Arc::clone(self),
+                        is_eligible: false,
+                        model: None,
+                    });
+                }
             }
         }
     }
 
     fn inflight(&self) -> usize {
         let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        usize::from(state.busy) + state.queued
+        state.eligible + usize::from(state.ineligible_busy) + state.queued
     }
 
     fn retry_after_seconds(&self) -> u64 {
@@ -2610,8 +2696,137 @@ impl Drop for AdmissionGuard {
             .state
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        state.busy = false;
-        self.admission.available.notify_one();
+        if self.is_eligible {
+            state.eligible = state.eligible.saturating_sub(1);
+            if state.eligible == 0 {
+                state.batch_model = None;
+            }
+        } else {
+            state.ineligible_busy = false;
+        }
+        self.admission.available.notify_all();
+    }
+}
+
+/// Conservative batch eligibility for independent continuous-batch decode.
+///
+/// Eligible only for Qwen (arch 5/6) or dense LFM2 (`lfm` arch identity),
+/// stateless text with no tools/images/stops/spec/adaptive/prefix behavior.
+/// TP policy: Qwen admits ordinary tp=1 or pure expert-parallel tp=4 when the
+/// daemon advertises batch capability; dense LFM remains tp=1 only. All other
+/// tp/arch combinations fall back to sequential. Check is intentionally strict
+/// and synchronous; model arch is taken from `current_arch` when available,
+/// otherwise inferred from the requested model name containing `qwen` or `lfm`.
+///
+/// Message-shape gate matches daemon admission: absent/empty `messages` are
+/// eligible; otherwise only exactly one `user` message with plain string
+/// content (no tool_calls, no multipart/array content).
+fn is_batch_eligible_request(
+    body: &serde_json::Value,
+    tp: Option<u64>,
+    current_arch: Option<&str>,
+    daemon_batch_capable: bool,
+) -> bool {
+    if !daemon_batch_capable {
+        return false;
+    }
+    // Qwen or LFM2 only. Prefer runtime arch when known.
+    let (is_qwen, is_lfm) = if let Some(arch) = current_arch {
+        let arch_l = arch.to_ascii_lowercase();
+        (arch_l.contains("qwen"), arch_l.contains("lfm"))
+    } else if let Some(model) = body.get("model").and_then(|v| v.as_str()) {
+        let model_l = model.to_ascii_lowercase();
+        (model_l.contains("qwen"), model_l.contains("lfm"))
+    } else {
+        (false, false)
+    };
+    if !is_qwen && !is_lfm {
+        return false;
+    }
+    // TP policy: Qwen tp=1 ordinary or tp=4 pure EP; dense LFM tp=1 only.
+    let tp_degree = tp.unwrap_or(1);
+    let tp_ok = if is_qwen {
+        tp_degree == 1 || tp_degree == 4
+    } else {
+        tp_degree == 1
+    };
+    if !tp_ok {
+        return false;
+    }
+    // Stateless text: no tools, no images, no stops, no spec, no adaptive, no prefix.
+    if body
+        .get("tools")
+        .and_then(|v| v.as_array())
+        .is_some_and(|a| !a.is_empty())
+    {
+        return false;
+    }
+    if body.get("tool_choice").is_some() {
+        return false;
+    }
+    // Images via explicit image_base64.
+    if body.get("image_base64").is_some() {
+        return false;
+    }
+    // Message history must match daemon single-user plain-string shape.
+    if !batch_messages_are_single_user(body) {
+        return false;
+    }
+    if body.get("stop").is_some() {
+        return false;
+    }
+    // Speculation / adaptive / prefix behavior disqualifies.
+    for key in [
+        "speculation",
+        "dflash_mode",
+        "mtp_mode",
+        "ngram_draft",
+        "prefill_sparse_threshold",
+        "kv_adaptive",
+        "prefix",
+    ] {
+        if body.get(key).is_some() {
+            return false;
+        }
+    }
+    true
+}
+
+/// HTTP/OpenAI `messages` are batch-eligible only when absent/empty (prompt
+/// path) or exactly one user turn with plain string content. Multi-turn,
+/// system/assistant/tool roles, tool_call payloads, and multipart/image
+/// content stay on the sequential route — same contract as the daemon.
+fn batch_messages_are_single_user(body: &serde_json::Value) -> bool {
+    let Some(messages) = body.get("messages") else {
+        return true;
+    };
+    let Some(arr) = messages.as_array() else {
+        return false;
+    };
+    if arr.is_empty() {
+        return true;
+    }
+    if arr.len() != 1 {
+        return false;
+    }
+    let m0 = &arr[0];
+    if m0.get("role").and_then(|v| v.as_str()) != Some("user") {
+        return false;
+    }
+    // Tool-call payloads on the sole message force sequential (batch v1 has
+    // no tools path). Empty / missing tool_calls is fine.
+    if let Some(tc) = m0.get("tool_calls") {
+        if tc.as_array().is_some_and(|a| !a.is_empty()) || tc.is_object() {
+            return false;
+        }
+    }
+    // Content must be a plain string (reject multipart/array/image parts).
+    match m0.get("content") {
+        Some(serde_json::Value::String(_)) => true,
+        // Missing content is not a plain user string turn.
+        None => false,
+        // Arrays (multipart/text+image), objects, numbers, bool, null.
+        Some(_) => false,
     }
 }
 
@@ -2761,6 +2976,11 @@ fn detach_serve(paths: &Paths, args: &ServeArgs, host: &str, port: u16) -> Resul
     if let Some(tp) = args.tp {
         command.arg("--tp").arg(tp.to_string());
     }
+    if let Some(batch) = args.continuous_batch_size {
+        command
+            .arg("--continuous-batch-size")
+            .arg(batch.to_string());
+    }
     let mut child = command.spawn().context("failed to detach native serve")?;
     let probe_host = match host {
         "0.0.0.0" => "127.0.0.1",
@@ -2825,6 +3045,12 @@ fn serve_foreground(
     let max_request_bytes = config_u64(&global, "serve.max_request_bytes")?;
     let max_queue = config_u64(&global, "serve.max_queue")? as usize;
     let queue_timeout = Duration::from_millis(config_u64(&global, "serve.queue_timeout_ms")?);
+    let continuous_batch_size = args
+        .continuous_batch_size
+        .unwrap_or(config_u64(&global, "serve.continuous_batch_size")?);
+    if continuous_batch_size == 0 || continuous_batch_size > 256 {
+        bail!("--continuous-batch-size must be between 1 and 256");
+    }
     let retry_enabled = config_bool(&global, "serve.retry_enabled")?;
     let retry_backoff = Duration::from_millis(config_u64(&global, "serve.retry_backoff_ms")?);
     let idle_timeout = Duration::from_secs(
@@ -2843,11 +3069,13 @@ fn serve_foreground(
             registry: registry.clone(),
             current_path: None,
             current_arch: None,
+            continuous_batch_capable: false,
             current_max_seq: 0,
             cache_capable: false,
             kv_override: args.kv_mode.clone(),
             kv_backend_override: args.kv_backend.clone(),
             tp: args.tp,
+            continuous_batch_size,
         }),
         meta: Mutex::new(ServeMeta {
             current_model: None,
@@ -2861,13 +3089,16 @@ fn serve_foreground(
             last_activity: Instant::now(),
         }),
         max_request_bytes,
-        admission: Arc::new(Admission::new(max_queue, queue_timeout)),
+        admission: Arc::new(Admission::new_with_capacity(
+            max_queue,
+            queue_timeout,
+            continuous_batch_size as usize,
+        )),
         idle_timeout,
         retry_enabled,
         retry_backoff,
         backoff_hook: Mutex::new(None),
     });
-
     let bind = format_bind(host, port);
     let server = Server::http(&bind).map_err(|error| anyhow!("failed to bind {bind}: {error}"))?;
     fs::create_dir_all(&paths.root)?;
@@ -2918,48 +3149,50 @@ fn serve_foreground(
     }
     if !shared.idle_timeout.is_zero() {
         let shared = Arc::clone(&shared);
-        thread::spawn(move || loop {
-            thread::sleep(Duration::from_secs(1));
-            if shared.admission.inflight() != 0 {
-                continue;
-            }
-            let expired = {
-                let meta = shared
-                    .meta
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner());
-                idle_model_expired(&meta, shared.idle_timeout)
-            };
-            if !expired {
-                continue;
-            }
-            let unloaded = {
-                let mut runtime = shared
-                    .runtime
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner());
-                if runtime.current_path.is_some() {
-                    let result = runtime.engine.unload();
-                    if result.is_ok() {
-                        runtime.current_path = None;
-                        runtime.current_arch = None;
-                        runtime.current_max_seq = 0;
-                        runtime.cache_capable = false;
-                    }
-                    result
-                } else {
-                    Ok(())
+        thread::spawn(move || {
+            loop {
+                thread::sleep(Duration::from_secs(1));
+                if shared.admission.inflight() != 0 {
+                    continue;
                 }
-            };
-            if unloaded.is_ok() {
-                let mut meta = shared
-                    .meta
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner());
-                meta.current_model = None;
-                meta.loading_model = None;
-                meta.last_activity = Instant::now();
-                eprintln!("[hipfire] unloaded idle model");
+                let expired = {
+                    let meta = shared
+                        .meta
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner());
+                    idle_model_expired(&meta, shared.idle_timeout)
+                };
+                if !expired {
+                    continue;
+                }
+                let unloaded = {
+                    let mut runtime = shared
+                        .runtime
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner());
+                    if runtime.current_path.is_some() {
+                        let result = runtime.engine.unload();
+                        if result.is_ok() {
+                            runtime.current_path = None;
+                            runtime.current_arch = None;
+                            runtime.current_max_seq = 0;
+                            runtime.cache_capable = false;
+                        }
+                        result
+                    } else {
+                        Ok(())
+                    }
+                };
+                if unloaded.is_ok() {
+                    let mut meta = shared
+                        .meta
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner());
+                    meta.current_model = None;
+                    meta.loading_model = None;
+                    meta.last_activity = Instant::now();
+                    eprintln!("[hipfire] unloaded idle model");
+                }
             }
         });
     }
@@ -3069,11 +3302,42 @@ fn handle_http(mut request: Request, shared: Arc<ServeShared>) -> Result<()> {
                     return Ok(());
                 }
             };
-            let guard = match shared.admission.acquire() {
-                Ok(guard) => guard,
-                Err(error) => {
-                    request.respond(admission_error_response(&error))?;
-                    return Ok(());
+            // Class-aware admission: eligible requests share capacity up to
+            // continuous_batch_size, ineligible are exclusive single-flight.
+            let (is_eligible, model_for_lease) = {
+                let runtime = shared
+                    .runtime
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                let tp = runtime.tp;
+                let arch = runtime.current_arch.clone();
+                let batch_capable = runtime.continuous_batch_capable;
+                drop(runtime);
+                let eligible = is_batch_eligible_request(&body, tp, arch.as_deref(), batch_capable);
+                let model = body
+                    .get("model")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_owned());
+                (eligible, model)
+            };
+            let guard = if is_eligible {
+                match shared
+                    .admission
+                    .acquire_for(true, model_for_lease.as_deref())
+                {
+                    Ok(g) => g,
+                    Err(e) => {
+                        request.respond(admission_error_response(&e))?;
+                        return Ok(());
+                    }
+                }
+            } else {
+                match shared.admission.acquire() {
+                    Ok(g) => g,
+                    Err(e) => {
+                        request.respond(admission_error_response(&e))?;
+                        return Ok(());
+                    }
                 }
             };
             // Tools require a lossless endpoint adapter before any generation.
@@ -4208,7 +4472,7 @@ fn fold_complete_request_stream(
 fn complete_request_attempt(
     shared: &ServeShared,
     body: &serde_json::Value,
-    _guard: AdmissionGuard,
+    guard: AdmissionGuard,
     identity: &(String, u64),
     attempt_id: u64,
     force_reset: bool,
@@ -4227,105 +4491,116 @@ fn complete_request_attempt(
         .ok_or_else(|| anyhow!("model is required"))?
         .to_owned();
     let image_base64 = request_image_base64(body.get("messages"))?;
-    let mut runtime = shared
-        .runtime
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
-    // Attempt id is allocated by the retry driver before any cold reset /
-    // generate so reset ack, generate request, and the semantic fold share one
-    // wire id.
-    let resolved = runtime.ensure_model(&model, &shared.meta, None)?;
-    if force_reset || !runtime.cache_capable {
-        if let Err(error) = runtime.engine.reset(attempt_id) {
-            if force_reset {
-                // Rollback could not be attested: model state is unknown, so
-                // the next request must full-reload rather than trust it.
-                runtime.current_path = None;
-                runtime.current_arch = None;
-                runtime.current_max_seq = 0;
-                runtime.cache_capable = false;
+    // Acquire runtime, ensure model, and build the generate request while
+    // holding the lock. Clone the engine handle before dropping the lock so
+    // concurrent eligible requests can share the multiplexed transport.
+    let (generate, resolved, engine_clone) = {
+        let mut runtime = shared
+            .runtime
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        // Attempt id is allocated by the retry driver before any cold reset /
+        // generate so reset ack, generate request, and the semantic fold share one
+        // wire id.
+        let resolved = runtime.ensure_model(&model, &shared.meta, None)?;
+        if force_reset || (!runtime.cache_capable && !runtime.continuous_batch_capable) {
+            if let Err(error) = runtime.engine.reset(attempt_id) {
+                if force_reset {
+                    // Rollback could not be attested: model state is unknown, so
+                    // the next request must full-reload rather than trust it.
+                    runtime.current_path = None;
+                    runtime.current_arch = None;
+                    runtime.continuous_batch_capable = false;
+                    runtime.current_max_seq = 0;
+                    runtime.cache_capable = false;
+                }
+                return Err(error.into());
             }
-            return Err(error.into());
         }
-    }
-    let max_tokens = body
-        .get("max_tokens")
-        .or_else(|| body.get("max_completion_tokens"))
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(config_u64(&resolved, "generation.max_tokens")?);
-    if max_tokens == 0 || max_tokens > 393_216 {
-        bail!("max_tokens must be between 1 and 393216");
-    }
-    let required_max_seq = max_tokens.saturating_add(1024);
-    if runtime.current_max_seq < required_max_seq {
-        runtime.ensure_model(&model, &shared.meta, Some(required_max_seq))?;
-    }
-    let mut normalized_messages = normalize_openai_messages(body.get("messages"));
-    let default_system = request_string(&resolved, "prompt.system", None)?;
-    inject_default_system_message(&mut normalized_messages, default_system.as_deref());
-    let mut generate = serde_json::json!({
-        "type": "generate",
-        "id": request_id(),
-        "prompt": last_user_prompt(&normalized_messages).unwrap_or_else(|| "Hello".into()),
-        "messages": normalized_messages,
-        "max_tokens": max_tokens,
-        "attempt_id": attempt_id,
-    });
-    if let Some(image) = image_base64 {
-        generate["image_base64"] = serde_json::Value::String(image);
-    }
-    for (key, config_key) in [
-        ("temperature", "generation.temperature"),
-        ("top_p", "generation.top_p"),
-        ("repeat_penalty", "generation.repeat_penalty"),
-    ] {
-        let explicit = body.get(key).and_then(serde_json::Value::as_f64);
-        insert_optional_f64(
-            &mut generate,
-            key,
-            request_f64(&resolved, config_key, explicit)?,
-        );
-    }
-    for name in [
-        "tools",
-        "tool_choice",
-        "frequency_penalty",
-        "stop",
-        "reasoning_effort",
-    ] {
-        if let Some(value) = body.get(name) {
-            generate[name] = value.clone();
+        let max_tokens = body
+            .get("max_tokens")
+            .or_else(|| body.get("max_completion_tokens"))
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(config_u64(&resolved, "generation.max_tokens")?);
+        if max_tokens == 0 || max_tokens > 393_216 {
+            bail!("max_tokens must be between 1 and 393216");
         }
-    }
-    if let Some(value) = body.get("top_k") {
-        generate["top_k"] = value.clone();
-    } else {
-        insert_optional_u64(
-            &mut generate,
-            "top_k",
-            request_u64(&resolved, "generation.top_k", None)?,
-        );
-    }
-    for (key, config_key) in [
-        ("min_p", "generation.min_p"),
-        ("presence_penalty", "generation.presence_penalty"),
-    ] {
-        if let Some(value) = body.get(key) {
-            generate[key] = value.clone();
-        } else {
+        let required_max_seq = max_tokens.saturating_add(1024);
+        if runtime.current_max_seq < required_max_seq {
+            runtime.ensure_model(&model, &shared.meta, Some(required_max_seq))?;
+        }
+        let mut normalized_messages = normalize_openai_messages(body.get("messages"));
+        let default_system = request_string(&resolved, "prompt.system", None)?;
+        inject_default_system_message(&mut normalized_messages, default_system.as_deref());
+        let mut generate = serde_json::json!({
+            "type": "generate",
+            "id": request_id(),
+            "prompt": last_user_prompt(&normalized_messages).unwrap_or_else(|| "Hello".into()),
+            "messages": normalized_messages,
+            "max_tokens": max_tokens,
+            "attempt_id": attempt_id,
+        });
+        if let Some(image) = image_base64 {
+            generate["image_base64"] = serde_json::Value::String(image);
+        }
+        for (key, config_key) in [
+            ("temperature", "generation.temperature"),
+            ("top_p", "generation.top_p"),
+            ("repeat_penalty", "generation.repeat_penalty"),
+        ] {
+            let explicit = body.get(key).and_then(serde_json::Value::as_f64);
             insert_optional_f64(
                 &mut generate,
                 key,
-                request_f64(&resolved, config_key, None)?,
+                request_f64(&resolved, config_key, explicit)?,
             );
         }
-    }
-    let deepseek4_effort_contract = runtime.current_arch.as_deref() == Some("deepseek4");
-    apply_http_reasoning_request(body, &resolved, &mut generate, deepseek4_effort_contract)?;
+        for name in [
+            "tools",
+            "tool_choice",
+            "frequency_penalty",
+            "stop",
+            "reasoning_effort",
+        ] {
+            if let Some(value) = body.get(name) {
+                generate[name] = value.clone();
+            }
+        }
+        if let Some(value) = body.get("top_k") {
+            generate["top_k"] = value.clone();
+        } else {
+            insert_optional_u64(
+                &mut generate,
+                "top_k",
+                request_u64(&resolved, "generation.top_k", None)?,
+            );
+        }
+        for (key, config_key) in [
+            ("min_p", "generation.min_p"),
+            ("presence_penalty", "generation.presence_penalty"),
+        ] {
+            if let Some(value) = body.get(key) {
+                generate[key] = value.clone();
+            } else {
+                insert_optional_f64(
+                    &mut generate,
+                    key,
+                    request_f64(&resolved, config_key, None)?,
+                );
+            }
+        }
+        let deepseek4_effort_contract = runtime.current_arch.as_deref() == Some("deepseek4");
+        apply_http_reasoning_request(body, &resolved, &mut generate, deepseek4_effort_contract)?;
+        let (id, created) = identity.clone();
+        generate["id"] = serde_json::Value::String(id.clone());
+        generate["attempt_id"] = serde_json::json!(attempt_id);
+        if guard.is_eligible {
+            generate["serve_continuous_batch"] = serde_json::Value::Bool(true);
+        }
+        let engine_clone = runtime.engine.clone();
+        (generate, resolved, engine_clone)
+    };
     let (id, created) = identity.clone();
-    generate["id"] = serde_json::Value::String(id.clone());
-    generate["attempt_id"] = serde_json::json!(attempt_id);
-
     // Dual route gated by StreamContractGate:
     // - first event must be gen_start with matching request id + attempt_id
     // - contract_version is read only after correlation succeeds
@@ -4345,8 +4620,13 @@ fn complete_request_attempt(
         .pointer("/chat_template_kwargs/preserve_thinking")
         .and_then(serde_json::Value::as_bool)
         == Some(true);
+    let model_for_fold = body
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+        .to_owned();
 
-    let done = runtime.engine.generate(&generate, |event| {
+    let gen_result = engine_clone.generate(&generate, |event| {
         let event_type = event.get("type").and_then(serde_json::Value::as_str);
 
         // Staged terminal: commit_ready carries done fields with type != done.
@@ -4517,7 +4797,8 @@ fn complete_request_attempt(
             }
         }
         Ok(())
-    })?;
+    });
+    let done = gen_result?;
     let mut meta = shared
         .meta
         .lock()
@@ -4772,6 +5053,7 @@ impl ServeRuntime {
             if let Some(tp) = self.tp {
                 params["tp"] = serde_json::json!(tp);
             }
+            params["continuous_batch_size"] = serde_json::json!(self.continuous_batch_size);
             let loaded_max_seq = params["max_seq"].as_u64().unwrap_or(0);
             if minimum_max_seq.is_some() {
                 eprintln!("[hipfire] bumping load max_seq to {loaded_max_seq} for request budget");
@@ -4789,6 +5071,10 @@ impl ServeRuntime {
                 .get("arch")
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_owned);
+            self.continuous_batch_capable = loaded
+                .get("continuous_batch_capable")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
             self.current_max_seq = loaded_max_seq;
             meta.lock()
                 .unwrap_or_else(|error| error.into_inner())
@@ -5042,11 +5328,7 @@ fn completion_json(completion: &Completion) -> serde_json::Value {
         }],
         "usage": completion_usage(completion),
         "timings": completion_timings(completion),
-        "hipfire": {
-            "tok_s": completion.done.get("tok_s"),
-            "prefill_tok_s": completion.done.get("prefill_tok_s"),
-            "decode_tok_s": completion.done.get("decode_tok_s"),
-        }
+        "hipfire": completion_hipfire(completion),
     })
 }
 
@@ -5089,10 +5371,32 @@ fn completion_timings(completion: &Completion) -> serde_json::Value {
         "prefill_ms": done.get("prefill_ms"),
         "prefill_tok_s": done.get("prefill_tok_s"),
         "decode_tok_s": done.get("decode_tok_s").or_else(|| done.get("tok_s")),
+        "latency_ms": done.get("latency_ms"),
         "tau": done.get("tau"),
         "cycles": done.get("cycles"),
         "dflash": done.get("dflash"),
         "mtp": done.get("mtp"),
+        "mtp_ngram": done.get("mtp_ngram"),
+        "ngram_mod_windows": done.get("ngram_mod_windows"),
+        "ngram_mod_drafts": done.get("ngram_mod_drafts"),
+        "ngram_mod_accepted": done.get("ngram_mod_accepted"),
+        "ngram_mod_accept_rate": done.get("ngram_mod_accept_rate"),
+        "mtp_windows": done.get("mtp_windows"),
+        "ar_windows": done.get("ar_windows"),
+        "mtp_retired": done.get("mtp_retired"),
+        "mtp_window_timings": done.get("mtp_window_timings"),
+    })
+}
+
+/// Shared hipfire evidence projection for normal and streaming terminals.
+fn completion_hipfire(completion: &Completion) -> serde_json::Value {
+    let done = &completion.done;
+    serde_json::json!({
+        "tok_s": done.get("tok_s"),
+        "prefill_tok_s": done.get("prefill_tok_s"),
+        "decode_tok_s": done.get("decode_tok_s"),
+        "execution_mode": done.get("execution_mode"),
+        "continuous_batch": done.get("continuous_batch"),
     })
 }
 
@@ -5220,6 +5524,7 @@ fn openai_stream_terminal_chunks(
         "model": completion.model,
         "choices": [{ "index": 0, "delta": {}, "finish_reason": finish_reason }],
         "timings": completion_timings(completion),
+        "hipfire": completion_hipfire(completion),
     }));
 
     if include_usage {
@@ -5885,6 +6190,7 @@ fn load_params(
         "prefill_drafter_device": config_i64(resolved, "speculation.prefill.drafter_device")?,
         "prefill_sparse_threshold": config_u64(resolved, "speculation.prefill.sparse_threshold")?,
         "speculation": config_string(resolved, "speculation.mode")?,
+        "continuous_batch_size": config_u64(resolved, "serve.continuous_batch_size")?,
     });
     if let Some(experts_per_token) =
         config_optional_u64(resolved, "model.deepseek4_experts_per_token")?
@@ -6397,9 +6703,17 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
         bail!("decode lengths must be positive");
     }
     if let Some(mode) = args.kv_mode.as_deref() {
-        if !matches!(mode, "q8" | "fwht2" | "fwht3" | "fwht4") {
-            bail!("--kv-mode must be q8, fwht2, fwht3, or fwht4");
-        }
+        // Validate against the canonical `memory.kv_cache` schema instead of a
+        // local subset. The old hardcoded list accepted only q8/fwht{2,3,4} and
+        // so rejected `f32`/`f16` — the only KV formats DeepSeek V4 implements,
+        // and precisely what the loader tells you to pass when it falls back
+        // ("Pass --kv f32 for the golden configuration"). That made the advised
+        // configuration unreachable through `bench`.
+        let field = hipfire_config::field("memory.kv_cache")
+            .ok_or_else(|| anyhow!("missing memory.kv_cache configuration field"))?;
+        field
+            .validate(&hipfire_config::ConfigValue::String(mode.to_owned()))
+            .map_err(|err| anyhow!("--kv-mode {mode}: {err}"))?;
     }
 
     if args.exp {
@@ -7052,7 +7366,9 @@ fn ensure_update_not_interrupted() -> Result<()> {
 
 fn update_command(paths: &Paths, args: UpdateArgs) -> Result<()> {
     if !cfg!(target_os = "linux") {
-        bail!("hipfire update is Linux-only; re-run the platform installer with a revision selector on this OS");
+        bail!(
+            "hipfire update is Linux-only; re-run the platform installer with a revision selector on this OS"
+        );
     }
     // Install before any fetch/mutation so SIGINT cannot race past the guard.
     install_update_interrupt_handler();
@@ -8567,10 +8883,12 @@ mod tests {
             find_model_path(&paths, &registry, "example-model"),
             Some(fs::canonicalize(&nested).unwrap())
         );
-        assert!(list_local_models(&paths, &registry)
-            .unwrap()
-            .iter()
-            .any(|model| model.path == fs::canonicalize(&nested).unwrap()));
+        assert!(
+            list_local_models(&paths, &registry)
+                .unwrap()
+                .iter()
+                .any(|model| model.path == fs::canonicalize(&nested).unwrap())
+        );
         fs::remove_dir_all(&paths.root).unwrap();
     }
 
@@ -8754,13 +9072,147 @@ mod tests {
         assert_eq!(dflash["dflash"], true);
         assert!(dflash["mtp"].is_null());
 
+        let mtp_window_timings = serde_json::json!([{
+            "kind": "mtp",
+            "wall_us": 1234,
+            "draft_lookup_us": 12,
+            "launch_us": 34,
+            "h2d_us": 56,
+            "d2h_us": 78,
+            "d2d_us": 90,
+            "memset_us": 11,
+            "stream_sync_us": 22,
+            "event_sync_us": 33,
+            "device_sync_us": 44,
+            "graph_launch_us": 55,
+        }]);
         let mtp = completion_timings(&completion(serde_json::json!({
             "mtp": true,
             "tau": 2.0,
             "cycles": 6,
+            "mtp_window_timings": mtp_window_timings,
         })));
         assert!(mtp["dflash"].is_null());
         assert_eq!(mtp["mtp"], true);
+        assert_eq!(mtp["mtp_window_timings"], mtp_window_timings);
+        assert_eq!(mtp["mtp_window_timings"][0]["kind"], "mtp");
+        assert_eq!(mtp["mtp_window_timings"][0]["wall_us"], 1234);
+    }
+
+    #[test]
+    fn completion_timings_projects_latency_ms() {
+        let completion = Completion {
+            id: "req-lat".into(),
+            created: 0,
+            model: "test-model".into(),
+            content: String::new(),
+            reasoning_content: String::new(),
+            preserve_thinking: false,
+            tool_calls: Vec::new(),
+            done: serde_json::json!({
+                "ttft_ms": 12.5,
+                "prefill_ms": 10.0,
+                "prefill_tok_s": 100.0,
+                "decode_tok_s": 40.0,
+                "latency_ms": 250.5,
+                "tok_s": 20.0,
+            }),
+        };
+        let timings = completion_timings(&completion);
+        assert_eq!(timings["latency_ms"], 250.5);
+        assert_eq!(timings["ttft_ms"], 12.5);
+        // Absent latency stays null-like (serde_json::Value::Null via .get).
+        let no_lat = completion_timings(&Completion {
+            id: "req-lat".into(),
+            created: 0,
+            model: "test-model".into(),
+            content: String::new(),
+            reasoning_content: String::new(),
+            preserve_thinking: false,
+            tool_calls: Vec::new(),
+            done: serde_json::json!({"ttft_ms": 1.0}),
+        });
+        assert!(no_lat["latency_ms"].is_null());
+    }
+
+    #[test]
+    fn completion_hipfire_projects_batch_route_evidence() {
+        let batch = serde_json::json!({
+            "executed": true,
+            "slots": 4,
+            "lane": 1,
+            "lane_capacity": 4096,
+            "max_active_lanes": 2,
+            "refill": "continuous",
+        });
+        let completion = Completion {
+            id: "req-batch".into(),
+            created: 0,
+            model: "test-model".into(),
+            content: "hi".into(),
+            reasoning_content: String::new(),
+            preserve_thinking: false,
+            tool_calls: Vec::new(),
+            done: serde_json::json!({
+                "tok_s": 18.5,
+                "prefill_tok_s": 200.0,
+                "decode_tok_s": 22.0,
+                "latency_ms": 300.0,
+                "execution_mode": "continuous_batch_independent",
+                "continuous_batch": batch,
+                "finish_reason": "stop",
+                "tokens": 3,
+                "prefill_tokens": 8,
+            }),
+        };
+        let hip = completion_hipfire(&completion);
+        assert_eq!(hip["execution_mode"], "continuous_batch_independent");
+        assert_eq!(hip["continuous_batch"]["max_active_lanes"], 2);
+        assert_eq!(hip["continuous_batch"]["slots"], 4);
+        assert_eq!(hip["continuous_batch"]["lane"], 1);
+        assert_eq!(hip["tok_s"], 18.5);
+
+        let json = completion_json(&completion);
+        assert_eq!(json["timings"]["latency_ms"], 300.0);
+        assert_eq!(
+            json["hipfire"]["execution_mode"],
+            "continuous_batch_independent"
+        );
+        assert_eq!(json["hipfire"]["continuous_batch"]["refill"], "continuous");
+
+        let chunks = openai_stream_terminal_chunks(&completion, false);
+        let terminal = chunks.last().unwrap();
+        assert_eq!(terminal["timings"]["latency_ms"], 300.0);
+        assert_eq!(
+            terminal["hipfire"]["execution_mode"],
+            "continuous_batch_independent"
+        );
+        assert_eq!(
+            terminal["hipfire"]["continuous_batch"]["max_active_lanes"],
+            2
+        );
+
+        // Sequential done without route evidence stays null (unchanged fields).
+        let sequential = Completion {
+            id: "req-seq".into(),
+            created: 0,
+            model: "test-model".into(),
+            content: String::new(),
+            reasoning_content: String::new(),
+            preserve_thinking: false,
+            tool_calls: Vec::new(),
+            done: serde_json::json!({
+                "tok_s": 10.0,
+                "prefill_tok_s": 50.0,
+                "decode_tok_s": 12.0,
+                "finish_reason": "stop",
+                "tokens": 2,
+            }),
+        };
+        let seq_hip = completion_hipfire(&sequential);
+        assert!(seq_hip["execution_mode"].is_null());
+        assert!(seq_hip["continuous_batch"].is_null());
+        assert_eq!(seq_hip["tok_s"], 10.0);
     }
 
     #[test]
@@ -9592,10 +10044,12 @@ mod tests {
             "role": "user",
             "content": [{ "type": "image_url", "image_url": { "url": "https://example/image.png" } }]
         }]);
-        assert!(request_image_base64(Some(&remote))
-            .unwrap_err()
-            .to_string()
-            .contains("remote"));
+        assert!(
+            request_image_base64(Some(&remote))
+                .unwrap_err()
+                .to_string()
+                .contains("remote")
+        );
     }
 
     #[test]
@@ -10099,13 +10553,29 @@ mod tests {
                 "cached_tokens": 4,
                 "ttft_ms": 8.5,
                 "decode_tok_s": 115.0,
-                "finish_reason": "stop"
+                "finish_reason": "stop",
+                "mtp_ngram": 3,
+                "ngram_mod_windows": 5,
+                "ngram_mod_drafts": 12,
+                "ngram_mod_accepted": 9,
+                "ngram_mod_accept_rate": 0.75,
+                "mtp_windows": 4,
+                "ar_windows": 2,
+                "mtp_retired": true
             }),
         };
         let json = completion_json(&completion);
         assert_eq!(json["usage"]["total_tokens"], 19);
         assert_eq!(json["usage"]["prompt_tokens_details"]["cached_tokens"], 4);
         assert_eq!(json["timings"]["decode_tok_s"], 115.0);
+        assert_eq!(json["timings"]["mtp_ngram"], 3);
+        assert_eq!(json["timings"]["ngram_mod_windows"], 5);
+        assert_eq!(json["timings"]["ngram_mod_drafts"], 12);
+        assert_eq!(json["timings"]["ngram_mod_accepted"], 9);
+        assert_eq!(json["timings"]["ngram_mod_accept_rate"], 0.75);
+        assert_eq!(json["timings"]["mtp_windows"], 4);
+        assert_eq!(json["timings"]["ar_windows"], 2);
+        assert_eq!(json["timings"]["mtp_retired"], true);
         assert_eq!(json["created"], 7);
 
         let qwen_cached = Completion {
@@ -10140,9 +10610,11 @@ mod tests {
             preserved_json["choices"][0]["message"]["content"],
             "<think>private chain</think>\nanswer"
         );
-        assert!(preserved_json["choices"][0]["message"]
-            .get("reasoning_content")
-            .is_none());
+        assert!(
+            preserved_json["choices"][0]["message"]
+                .get("reasoning_content")
+                .is_none()
+        );
     }
 
     #[test]
@@ -10173,6 +10645,326 @@ mod tests {
         let timeout = admission.acquire().unwrap_err();
         assert!(timeout.message.contains("wait exceeded"));
         assert_eq!(admission.inflight(), 1);
+    }
+
+    #[test]
+    fn admission_eligible_concurrent_up_to_capacity() {
+        let admission = Arc::new(Admission::new_with_capacity(8, Duration::from_secs(1), 2));
+        let g1 = admission.acquire_for(true, Some("qwen3.5:7b")).unwrap();
+        let g2 = admission.acquire_for(true, Some("qwen3.5:7b")).unwrap();
+        assert_eq!(admission.inflight(), 2);
+        // Third eligible same model should queue, then timeout quickly.
+        let admission2 = Arc::clone(&admission);
+        let handle =
+            thread::spawn(move || admission2.acquire_for(true, Some("qwen3.5:7b")).unwrap());
+        thread::sleep(Duration::from_millis(50));
+        assert_eq!(admission.inflight(), 3); // 2 held + 1 queued
+        drop(g1);
+        let g3 = handle.join().unwrap();
+        assert_eq!(admission.inflight(), 2);
+        drop(g2);
+        drop(g3);
+        assert_eq!(admission.inflight(), 0);
+    }
+
+    #[test]
+    fn admission_ineligible_is_exclusive() {
+        let admission = Arc::new(Admission::new_with_capacity(8, Duration::from_secs(1), 2));
+        let g1 = admission.acquire_for(true, Some("qwen3.5:7b")).unwrap();
+        // Ineligible must wait for eligible to finish, even though capacity not full.
+        let admission2 = Arc::clone(&admission);
+        let handle = thread::spawn(move || admission2.acquire().unwrap());
+        thread::sleep(Duration::from_millis(50));
+        assert!(admission.inflight() == 2); // 1 eligible + 1 queued ineligible
+        drop(g1);
+        let g_inelig = handle.join().unwrap();
+        assert_eq!(admission.inflight(), 1);
+        // While ineligible holds, eligible must wait.
+        let admission3 = Arc::clone(&admission);
+        let handle2 =
+            thread::spawn(move || admission3.acquire_for(true, Some("qwen3.5:7b")).unwrap());
+        thread::sleep(Duration::from_millis(50));
+        assert_eq!(admission.inflight(), 2);
+        drop(g_inelig);
+        let g2 = handle2.join().unwrap();
+        assert_eq!(admission.inflight(), 1);
+        drop(g2);
+    }
+
+    #[test]
+    fn admission_model_lease_prevents_cross_model_batch() {
+        let admission = Arc::new(Admission::new_with_capacity(8, Duration::from_secs(1), 2));
+        let g1 = admission.acquire_for(true, Some("qwen3.5:7b")).unwrap();
+        // Different model cannot share batch lanes, must wait for exclusive.
+        let admission2 = Arc::clone(&admission);
+        let handle =
+            thread::spawn(move || admission2.acquire_for(true, Some("qwen3.5:14b")).unwrap());
+        thread::sleep(Duration::from_millis(50));
+        assert_eq!(admission.inflight(), 2); // 1 held + 1 queued due to model mismatch
+        drop(g1);
+        let g2 = handle.join().unwrap();
+        assert_eq!(admission.inflight(), 1);
+        drop(g2);
+    }
+
+    #[test]
+    fn batch_eligibility_conservative_checks() {
+        // Eligible: tp=1 qwen with one plain user string.
+        let body =
+            serde_json::json!({"model":"qwen3.5:7b","messages":[{"role":"user","content":"hi"}]});
+        assert!(is_batch_eligible_request(
+            &body,
+            Some(1),
+            Some("qwen35"),
+            true
+        ));
+        // Eligible: absent messages (prompt path) for Qwen.
+        let body = serde_json::json!({"model":"qwen3.5:7b","prompt":"hi"});
+        assert!(is_batch_eligible_request(
+            &body,
+            Some(1),
+            Some("qwen35"),
+            true
+        ));
+        // Eligible: empty messages array for Qwen.
+        let body = serde_json::json!({"model":"qwen3.5:7b","messages":[]});
+        assert!(is_batch_eligible_request(
+            &body,
+            Some(1),
+            Some("qwen35"),
+            true
+        ));
+        // Tools disqualify.
+        let body = serde_json::json!({"model":"qwen3.5:7b","tools":[{"type":"function","function":{"name":"x"}}]});
+        assert!(!is_batch_eligible_request(
+            &body,
+            Some(1),
+            Some("qwen35"),
+            true
+        ));
+        // Image / multipart content disqualifies.
+        let body = serde_json::json!({"model":"qwen3.5:7b","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:"}}]}]});
+        assert!(!is_batch_eligible_request(
+            &body,
+            Some(1),
+            Some("qwen35"),
+            true
+        ));
+        // Multipart text-only array content also disqualifies (must be plain string).
+        let body = serde_json::json!({"model":"qwen3.5:7b","messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]});
+        assert!(!is_batch_eligible_request(
+            &body,
+            Some(1),
+            Some("qwen35"),
+            true
+        ));
+        // system+user history disqualifies.
+        let body = serde_json::json!({"model":"qwen3.5:7b","messages":[
+            {"role":"system","content":"be brief"},
+            {"role":"user","content":"hi"}
+        ]});
+        assert!(!is_batch_eligible_request(
+            &body,
+            Some(1),
+            Some("qwen35"),
+            true
+        ));
+        // user+assistant multi-turn disqualifies.
+        let body = serde_json::json!({"model":"qwen3.5:7b","messages":[
+            {"role":"user","content":"hi"},
+            {"role":"assistant","content":"hello"}
+        ]});
+        assert!(!is_batch_eligible_request(
+            &body,
+            Some(1),
+            Some("qwen35"),
+            true
+        ));
+        // Tool-call content on the sole message disqualifies.
+        let body = serde_json::json!({"model":"qwen3.5:7b","messages":[{
+            "role":"user",
+            "content":"hi",
+            "tool_calls":[{"id":"c0","type":"function","function":{"name":"x","arguments":"{}"}}]
+        }]});
+        assert!(!is_batch_eligible_request(
+            &body,
+            Some(1),
+            Some("qwen35"),
+            true
+        ));
+        // Qwen tp=4 pure EP is eligible when daemon admits batch.
+        let body =
+            serde_json::json!({"model":"qwen3.5:7b","messages":[{"role":"user","content":"hi"}]});
+        assert!(is_batch_eligible_request(
+            &body,
+            Some(4),
+            Some("qwen35"),
+            true
+        ));
+        // Qwen tp=2 (and any non-1/non-4) disqualifies.
+        let body = serde_json::json!({"model":"qwen3.5:7b"});
+        assert!(!is_batch_eligible_request(
+            &body,
+            Some(2),
+            Some("qwen35"),
+            true
+        ));
+        // Non-qwen disqualifies.
+        let body = serde_json::json!({"model":"deepseek4:671b"});
+        assert!(!is_batch_eligible_request(
+            &body,
+            Some(1),
+            Some("deepseek4"),
+            true
+        ));
+        // Daemon load says batch incapable: HTTP admission must not invent it.
+        let body =
+            serde_json::json!({"model":"qwen3.5:7b","messages":[{"role":"user","content":"hi"}]});
+        assert!(!is_batch_eligible_request(
+            &body,
+            Some(1),
+            Some("qwen35"),
+            false
+        ));
+        // Eligible: tp=1 LFM2 dense with one plain user string when daemon admits batch.
+        let body =
+            serde_json::json!({"model":"lfm2.5:1.2b","messages":[{"role":"user","content":"hi"}]});
+        assert!(is_batch_eligible_request(
+            &body,
+            Some(1),
+            Some("lfm2"),
+            true
+        ));
+        // Eligible: absent messages for LFM.
+        let body = serde_json::json!({"model":"lfm2.5:1.2b","prompt":"hi"});
+        assert!(is_batch_eligible_request(
+            &body,
+            Some(1),
+            Some("lfm2"),
+            true
+        ));
+        // Eligible: empty messages for LFM.
+        let body = serde_json::json!({"model":"lfm2.5:1.2b","messages":[]});
+        assert!(is_batch_eligible_request(
+            &body,
+            Some(1),
+            Some("lfm2"),
+            true
+        ));
+        // LFM rejects system+user the same way.
+        let body = serde_json::json!({"model":"lfm2.5:1.2b","messages":[
+            {"role":"system","content":"be brief"},
+            {"role":"user","content":"hi"}
+        ]});
+        assert!(!is_batch_eligible_request(
+            &body,
+            Some(1),
+            Some("lfm2"),
+            true
+        ));
+        // LFM rejects user+assistant.
+        let body = serde_json::json!({"model":"lfm2.5:1.2b","messages":[
+            {"role":"user","content":"hi"},
+            {"role":"assistant","content":"hello"}
+        ]});
+        assert!(!is_batch_eligible_request(
+            &body,
+            Some(1),
+            Some("lfm2"),
+            true
+        ));
+        // LFM rejects tool-call content.
+        let body = serde_json::json!({"model":"lfm2.5:1.2b","messages":[{
+            "role":"user",
+            "content":"hi",
+            "tool_calls":[{"id":"c0","type":"function","function":{"name":"x","arguments":"{}"}}]
+        }]});
+        assert!(!is_batch_eligible_request(
+            &body,
+            Some(1),
+            Some("lfm2"),
+            true
+        ));
+        // LFM rejects image/multipart content.
+        let body = serde_json::json!({"model":"lfm2.5:1.2b","messages":[{"role":"user","content":[
+            {"type":"text","text":"describe"},
+            {"type":"image_url","image_url":{"url":"data:image/png;base64,YWJj"}}
+        ]}]});
+        assert!(!is_batch_eligible_request(
+            &body,
+            Some(1),
+            Some("lfm2"),
+            true
+        ));
+        // LFM tp=4 disqualifies (dense remains tp=1 only).
+        let body =
+            serde_json::json!({"model":"lfm2.5:1.2b","messages":[{"role":"user","content":"hi"}]});
+        assert!(!is_batch_eligible_request(
+            &body,
+            Some(4),
+            Some("lfm2"),
+            true
+        ));
+        // Daemon load says batch incapable: LFM HTTP admission must not invent it.
+        let body =
+            serde_json::json!({"model":"lfm2.5:1.2b","messages":[{"role":"user","content":"hi"}]});
+        assert!(!is_batch_eligible_request(
+            &body,
+            Some(1),
+            Some("lfm2"),
+            false
+        ));
+    }
+
+    #[test]
+    fn batch_messages_shape_matches_daemon_contract() {
+        // Absent / empty → eligible shape.
+        assert!(batch_messages_are_single_user(&serde_json::json!({})));
+        assert!(batch_messages_are_single_user(
+            &serde_json::json!({"messages":[]})
+        ));
+        // Exactly one plain user string → eligible.
+        assert!(batch_messages_are_single_user(&serde_json::json!({
+            "messages":[{"role":"user","content":"hi"}]
+        })));
+        // system+user, user+assistant → reject.
+        assert!(!batch_messages_are_single_user(&serde_json::json!({
+            "messages":[
+                {"role":"system","content":"sys"},
+                {"role":"user","content":"hi"}
+            ]
+        })));
+        assert!(!batch_messages_are_single_user(&serde_json::json!({
+            "messages":[
+                {"role":"user","content":"hi"},
+                {"role":"assistant","content":"yo"}
+            ]
+        })));
+        // Non-user sole role → reject.
+        assert!(!batch_messages_are_single_user(&serde_json::json!({
+            "messages":[{"role":"system","content":"sys"}]
+        })));
+        // tool_calls payload → reject.
+        assert!(!batch_messages_are_single_user(&serde_json::json!({
+            "messages":[{
+                "role":"user",
+                "content":"hi",
+                "tool_calls":[{"id":"c0"}]
+            }]
+        })));
+        // Multipart / image array content → reject.
+        assert!(!batch_messages_are_single_user(&serde_json::json!({
+            "messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]
+        })));
+        assert!(!batch_messages_are_single_user(&serde_json::json!({
+            "messages":[{"role":"user","content":[
+                {"type":"image_url","image_url":{"url":"data:"}}
+            ]}]
+        })));
+        // Non-array messages → reject.
+        assert!(!batch_messages_are_single_user(&serde_json::json!({
+            "messages":"not-an-array"
+        })));
     }
 
     #[test]
@@ -10313,16 +11105,20 @@ mod tests {
             Some(serde_json::json!({ "reasoning_content": "plan" }))
         );
         // Mid-stream tool_calls must never become an SSE delta.
-        assert!(openai_stream_delta_for_event(&serde_json::json!({
-            "type": "tool_calls",
-            "calls": [{ "name": "read_file", "arguments": {} }]
-        }))
-        .is_none());
-        assert!(openai_stream_delta_for_event(&serde_json::json!({
-            "type": "done",
-            "finish_reason": "stop"
-        }))
-        .is_none());
+        assert!(
+            openai_stream_delta_for_event(&serde_json::json!({
+                "type": "tool_calls",
+                "calls": [{ "name": "read_file", "arguments": {} }]
+            }))
+            .is_none()
+        );
+        assert!(
+            openai_stream_delta_for_event(&serde_json::json!({
+                "type": "done",
+                "finish_reason": "stop"
+            }))
+            .is_none()
+        );
     }
 
     #[test]
@@ -10451,11 +11247,13 @@ mod tests {
         );
 
         // Mid-stream fold forward never includes tool_calls.
-        assert!(openai_stream_delta_for_event(&serde_json::json!({
-            "type": "tool_calls",
-            "calls": fold.executable_tool_calls()
-        }))
-        .is_none());
+        assert!(
+            openai_stream_delta_for_event(&serde_json::json!({
+                "type": "tool_calls",
+                "calls": fold.executable_tool_calls()
+            }))
+            .is_none()
+        );
 
         let stream_chunks = openai_stream_terminal_chunks(&completion, true);
         assert_eq!(
@@ -10514,17 +11312,21 @@ mod tests {
 
         let nonstream = completion_json(&completion);
         assert_eq!(nonstream["choices"][0]["finish_reason"], "length");
-        assert!(nonstream["choices"][0]["message"]
-            .get("tool_calls")
-            .is_none());
+        assert!(
+            nonstream["choices"][0]["message"]
+                .get("tool_calls")
+                .is_none()
+        );
         assert_eq!(nonstream["choices"][0]["message"]["content"], "partial");
 
         let stream_chunks = openai_stream_terminal_chunks(&completion, true);
         assert_eq!(stream_chunks.len(), 2); // terminal + usage, no tool release
         assert_eq!(stream_chunks[0]["choices"][0]["finish_reason"], "length");
-        assert!(stream_chunks[0]["choices"][0]["delta"]
-            .get("tool_calls")
-            .is_none());
+        assert!(
+            stream_chunks[0]["choices"][0]["delta"]
+                .get("tool_calls")
+                .is_none()
+        );
         assert_eq!(stream_chunks[1]["choices"], serde_json::json!([]));
     }
 
@@ -12837,11 +13639,13 @@ for line in sys.stdin:
                     registry,
                     current_path: None,
                     current_arch: None,
+                    continuous_batch_capable: false,
                     current_max_seq: 0,
                     cache_capable: false,
                     kv_override: None,
                     kv_backend_override: None,
                     tp: None,
+                    continuous_batch_size: 1,
                 }),
                 meta: Mutex::new(ServeMeta {
                     current_model: None,

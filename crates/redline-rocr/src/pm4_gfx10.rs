@@ -426,6 +426,18 @@ impl Gfx10Pm4CommandBuffer {
         ]);
     }
 
+    /// Publish `value` at `address` after prior compute completes, then stall
+    /// this queue until the word equals `value`.
+    ///
+    /// Emits Mesa's RELEASE_MEM fence shape followed by WAIT_REG_MEM on the
+    /// same word. Does not emit EVENT_WRITE / CS_PARTIAL_FLUSH.
+    pub fn dependency_fence(&mut self, address: u64, value: u32) {
+        debug_assert_ne!(address, 0);
+        debug_assert_eq!(address & 3, 0);
+        self.release_memory_value(address, value);
+        self.wait_memory_value(address, value);
+    }
+
     /// Append one HSA-ABI dispatch, explicitly materializing gfx10's enabled
     /// implicit user SGPRs.
     pub fn dispatch(
@@ -913,6 +925,39 @@ mod tests {
                 4,
             ]
         );
+    }
+
+    #[test]
+    fn dependency_fence_is_release_then_wait_without_event_write() {
+        let address = 0x1234_5678_9abc_def0;
+        let mut commands = Gfx10Pm4CommandBuffer::new();
+        commands.dependency_fence(address, 7);
+        assert_eq!(
+            commands.dwords(),
+            &[
+                0xc006_4900,
+                0x528,
+                0x2300_0000,
+                0x9abc_def0,
+                0x1234_5678,
+                7,
+                0,
+                0,
+                0xc005_3c00,
+                0x13,
+                0x9abc_def0,
+                0x1234_5678,
+                7,
+                u32::MAX,
+                4,
+            ]
+        );
+        assert!(
+            !commands
+                .dwords()
+                .contains(&packet3(PACKET3_EVENT_WRITE, 1, false))
+        );
+        assert!(!commands.ends_with_compute_idle());
     }
 
     #[test]

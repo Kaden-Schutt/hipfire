@@ -2213,6 +2213,13 @@ pub const GEMV_HFQ4G256_MOE_NINEPATH_D3_SRC: &str =
 /// Byte-exact with that pair at down_k=512. See kernel header.
 pub const GEMV_HFQ4G256_MOE_NINEPATH_D4_SRC: &str =
     include_str!("../../../kernels/src/gemv_hfq4g256_moe_ninepath_d4.hip");
+
+/// MQ3-Lloyd codebook port of the nine-path fused MoE down + weighted combine.
+/// Stages the rotated activation ONCE for all 8 routed experts (the incumbent
+/// re-reads it in each of 16,384 single-wave workgroups) and folds the 8
+/// partials in LDS in ascending krank order — single owner per row, no atomics.
+pub const GEMV_MQ3G256_LLOYD_MOE_NINEPATH_D4_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mq3g256_lloyd_moe_ninepath_d4.hip");
 /// Exact gfx1151 temporal-buffer candidate for the K=512 routed down stream.
 /// The kernel ABI, four-row mapping, reduction tree, and launch geometry stay
 /// unchanged; only weight addressing is lowered differently.
@@ -4853,6 +4860,9 @@ pub const SAMPLE_TOP_P_SRC: &str = include_str!("../../../kernels/src/sample_top
 pub const SAMPLE_TOP_P_PARALLEL_SRC: &str =
     include_str!("../../../kernels/src/sample_top_p_parallel.hip");
 
+/// Product-semantics sampler for independent continuous-batch lanes.
+pub const SAMPLE_ROWS_PF_SRC: &str = include_str!("../../../kernels/src/sample_rows_pf.hip");
+
 /// Per-row temperature-scaled softmax probability gather. For each row r,
 /// returns the softmax prob of `indices[r]` under temp-scaled row logits.
 /// Used by MTP residual-acceptance sampling: gathers p_draft(c_k) and
@@ -5177,6 +5187,51 @@ pub const GEMV_MQ3G256_LLOYD_MOE_GATE_UP_INDEXED_SRC: &str =
 pub const GEMV_MQ3G256_LLOYD_MOE_DOWN_INDEXED_SRC: &str =
     include_str!("../../../kernels/src/gemv_mq3g256_lloyd_moe_down_indexed.hip");
 
+/// Row-tiled (R=2 / R=4) siblings of
+/// `gemv_mq3g256_lloyd_moe_down_residual_scaled_k8_indexed`, bit-exact per row
+/// with the incumbent but launched on a `ceil(M/R)` grid so each wave carries R
+/// rows and stages the whole quad-step codebook into disjoint LDS slots behind
+/// one barrier. OPT-IN ONLY via `HIPFIRE_MQ3_DOWN_ROWS={2,4}`; unset (or 1)
+/// keeps the incumbent. See the header comment in the .hip for the static
+/// analysis that motivated it.
+pub const GEMV_MQ3G256_LLOYD_MOE_DOWN_INDEXED_R4_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mq3g256_lloyd_moe_down_indexed_r4.hip");
+
+/// Row-tiled MQ2-Lloyd MoE-down GEMV (R=2 / R=4). Same defect pair as the MQ3
+/// sibling at the a3b decode shape: 16384 single-wave workgroups, and a K4 main
+/// loop that is dead at K=moe_intermediate=512. OPT-IN, default OFF.
+pub const GEMV_MQ2G256_LLOYD_MOE_DOWN_INDEXED_R4_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mq2g256_lloyd_moe_down_indexed_r4.hip");
+
+// ─── MQ*-G256-GL ("global Lloyd") MoE indexed family ─────────────────────────
+//
+// Same call shape as the MQ2/MQ3-Lloyd MoE indexed kernels above (device-side
+// topk routing + per-expert pointer table, X must be FWHT-pre-rotated), with
+// two differences that matter to the launchers in gemv.rs:
+//
+//   1. THE CODEBOOK IS A SCALAR KERNEL ARG, not a per-group fp16 header. The
+//      MQ2-GL kernels take 4 floats (`cb0..cb3` = `GL_CB2`), the MQ3-GL kernels
+//      take 8 (`cb0..cb7` = `GL_CB3`), inserted between the pointer args and
+//      the trailing `int M, int K`.
+//   2. THE BLOB IS SoA, two regions: `[M*gpr*IDX B indices][M*gpr*2 B fp16
+//      scales]` with IDX = 64 (MQ2-GL) / 96 (MQ3-GL) — not an interleaved
+//      per-group stride.
+//
+// Both DOWN kernels are ATOMIC SELF-COMBINING (they atomicAdd
+// `topk_weights[krank] * acc` straight into `x_residual`), exactly like their
+// Lloyd siblings — the caller MUST skip `moe_down_combine_k8_batched`.
+pub const GEMV_MQ2G256GL_MOE_GATE_UP_INDEXED_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mq2g256gl_moe_gate_up_indexed.hip");
+
+pub const GEMV_MQ2G256GL_MOE_DOWN_INDEXED_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mq2g256gl_moe_down_indexed.hip");
+
+pub const GEMV_MQ3G256GL_MOE_GATE_UP_INDEXED_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mq3g256gl_moe_gate_up_indexed.hip");
+
+pub const GEMV_MQ3G256GL_MOE_DOWN_INDEXED_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mq3g256gl_moe_down_indexed.hip");
+
 /// Strict superset of fused_rmsnorm_mq_rotate that ALSO writes the
 /// plain (non-FWHT) RMSNormed output to a second buffer. Eliminates the
 /// follow-up rmsnorm_f32 / rmsnorm_batched launch in call sites that
@@ -5197,6 +5252,55 @@ pub const V4F_FUSED_SILU_MUL_CLAMP_MQ_ROTATE_SRC: &str =
 /// crosses 50 % only above that batch size).
 pub const GEMM_MQ2G256_LLOYD_MOE_GROUPED_WMMA_K2_SRC: &str =
     include_str!("../../../kernels/src/gemm_mq2g256_lloyd_moe_grouped_wmma_k2.hip");
+
+/// gfx12 (RDNA4) sister of `GEMM_MQ2G256_LLOYD_MOE_GROUPED_WMMA_K2_SRC`.
+/// Identical 9-arg kernarg contract and grid; the port deltas are the four
+/// standard gfx11->gfx12 WMMA rules (half8_t operands, K split across wave
+/// halves, `_gfx12` builtin/symbol suffix, 8-row-block accumulator). Landed
+/// unwired in be65e2c2c; wired here so a UNIFORM MQ2-Lloyd routed gate_up can
+/// take grouped-WMMA batched prefill on gfx1200/gfx1201 instead of falling back
+/// to the per-token loop. Correctness bench:
+/// `crates/rdna-compute/examples/bench_mq2g256_lloyd_grouped_gfx12.rs`.
+pub const GEMM_MQ2G256_LLOYD_MOE_GROUPED_WMMA_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mq2g256_lloyd_moe_grouped_wmma.gfx12.hip");
+
+/// `(entry_point_name, source)` for the uniform MQ2-Lloyd MoE grouped-WMMA
+/// GEMM on the current arch. Single source of truth shared by
+/// `Gpu::gemm_mq2g256_lloyd_moe_grouped_wmma` and its no-GPU resolution tests,
+/// so a test can prove the launcher names a real `extern "C"` entry point in a
+/// real registered source rather than a fallback or a typo.
+///
+/// The two module names MUST stay distinct: the JIT kernel cache is keyed by
+/// module name only, so a shared name would silently make the second arch's
+/// source dead code and run the wrong ISA.
+pub fn mq2g256_lloyd_moe_grouped_wmma_source(is_gfx12: bool) -> (&'static str, &'static str) {
+    if is_gfx12 {
+        (
+            "gemm_mq2g256_lloyd_moe_grouped_wmma_gfx12",
+            GEMM_MQ2G256_LLOYD_MOE_GROUPED_WMMA_GFX12_SRC,
+        )
+    } else {
+        (
+            "gemm_mq2g256_lloyd_moe_grouped_wmma_k2",
+            GEMM_MQ2G256_LLOYD_MOE_GROUPED_WMMA_K2_SRC,
+        )
+    }
+}
+
+/// MQ3-Lloyd twin of [`mq2g256_lloyd_moe_grouped_wmma_source`].
+pub fn mq3g256_lloyd_moe_grouped_wmma_source(is_gfx12: bool) -> (&'static str, &'static str) {
+    if is_gfx12 {
+        (
+            "gemm_mq3g256_lloyd_moe_grouped_wmma_gfx12",
+            GEMM_MQ3G256_LLOYD_MOE_GROUPED_WMMA_GFX12_SRC,
+        )
+    } else {
+        (
+            "gemm_mq3g256_lloyd_moe_grouped_wmma_k2",
+            GEMM_MQ3G256_LLOYD_MOE_GROUPED_WMMA_K2_SRC,
+        )
+    }
+}
 
 /// 4-warp MoE-grouped MQ2-Lloyd WMMA GEMM for gfx1151 (RDNA3.5). 64-row
 /// × 16-slot tile (vs 16×16 single-warp baseline), LDS-staged X shared
@@ -5342,6 +5446,11 @@ pub const HC_FINALIZE_INPUT_MAP_SRC: &str =
     include_str!("../../../kernels/src/hc_finalize_input_map.hip");
 
 pub const ZERO_F32_SRC: &str = include_str!("../../../kernels/src/zero_f32.hip");
+
+/// Zero inactive rows for EP routed partials / final hidden isolation.
+/// Masked sibling writes exact +0.0f only to inactive rows (row = lane).
+pub const ZERO_INACTIVE_ROWS_F32_SRC: &str =
+    include_str!("../../../kernels/src/zero_inactive_rows_f32.hip");
 
 pub const SQRT_SOFTPLUS_F32_SRC: &str = include_str!("../../../kernels/src/sqrt_softplus_f32.hip");
 

@@ -123,6 +123,30 @@ pub struct MoeResolution {
     /// Uniform all-MQ3-Lloyd routed experts (gate_up == down == MQ3G256Lloyd).
     /// Same indexed-Lloyd decode path as mq2lloyd, MQ3 launchers.
     pub routed_indexable_mq3lloyd: bool,
+    /// Routed experts whose gate_up and down are each drawn, INDEPENDENTLY, from
+    /// the codebook family `{MQ2G256Lloyd, MQ3G256Lloyd, MQ2G256GL, MQ3G256GL}` —
+    /// the per-projection allocation (e.g. gate_up 2-bit, down 3-bit) that puts
+    /// the cheap bits on the larger projection and the accurate ones on the
+    /// residual write. Indexable because `run_moe_decode` already picks the
+    /// gate_up and down GEMVs from their own dtypes rather than a coupled flag,
+    /// and because ALL FOUR down kernels self-combine via atomicAdd — so
+    /// `routed_down_self_combines` (keyed on `routed_down` alone) stays correct
+    /// and the shared down-combine is skipped exactly once. silu+rotate is
+    /// weight-agnostic (it reads activations only). Subsumes the two uniform
+    /// Lloyd arms above and the uniform GL cases.
+    ///
+    /// Lloyd and GL are freely mixable across the two projections: both are
+    /// FWHT-G256 formats consuming the same rotated activation, and each GEMV is
+    /// selected from its own projection's dtype. The ONLY thing that differs is
+    /// where the codebook comes from (per-group fp16 header vs scalar kernel
+    /// args), which is entirely inside the launcher.
+    ///
+    /// Decode-only: batched prefill rejects MoE MQ3-Lloyd outright (see
+    /// `moe_ffn_has_mq3_experts_uniform` in hipfire-arch-qwen35), which already
+    /// blocks the pre-existing uniform MQ3-Lloyd path too; the GL dtypes are
+    /// likewise not admitted by `moe_ffn_batched_admissible_for_dtypes`, so a
+    /// GL model prefills through the per-token path.
+    pub routed_indexable_mixed_lloyd: bool,
     /// Per-expert N-tier graded routed experts (MQ6 hot / MQ4 mid / MQ2L or
     /// MQ3L cold, applied to BOTH gate_up and down). Indexable on the decode
     /// GPU-top-K path via the merged dtype-tag-branched gate_up AND down
@@ -174,6 +198,23 @@ impl MoeResolution {
         let routed_indexable_mixed_gu4_dn6 = routed_gate_up_mq4 && (d.routed_down == MQ6G256);
         let routed_indexable_mq2lloyd = (d.routed_down == MQ2G256Lloyd) && routed_gate_up_mq2lloyd;
         let routed_indexable_mq3lloyd = (d.routed_down == MQ3G256Lloyd) && routed_gate_up_mq3lloyd;
+        // gate_up on one of the codebook (Lloyd / GL) formats — needed both for
+        // the per-projection mix below and for `needs_x_rot_local` (all four are
+        // FwhtG256 and consume the pre-rotated activation).
+        let routed_gate_up_gl = matches!(d.routed_gate_up, MQ2G256GL | MQ3G256GL);
+        // Per-projection codebook mix (e.g. gate_up MQ2-GL + down MQ3-GL, the
+        // 2-bit-gate/3-bit-down allocation; or any Lloyd×GL cross). Subsumes the
+        // two uniform Lloyd arms above and the uniform GL cases; the OR below
+        // makes the overlap harmless.
+        //
+        // SAFETY INVARIANT: every dtype admitted here MUST have (a) an indexed
+        // gate_up GEMV arm in `run_moe_decode`, (b) an ATOMIC SELF-COMBINING
+        // down GEMV arm there, and (c) membership in the
+        // `routed_down_self_combines` set in pipeline/mod.rs. Admitting a dtype
+        // that misses (c) double-counts every MoE layer, silently.
+        const CODEBOOK_INDEXABLE: [DType; 4] = [MQ2G256Lloyd, MQ3G256Lloyd, MQ2G256GL, MQ3G256GL];
+        let routed_indexable_mixed_lloyd = CODEBOOK_INDEXABLE.contains(&d.routed_gate_up)
+            && CODEBOOK_INDEXABLE.contains(&d.routed_down);
         let routed_indexable_paro =
             (d.routed_down == ParoQ4G128 && d.has_paro_shared) && routed_gate_up_paro;
         // Per-expert mixed: the model already verified the experts carry
@@ -198,6 +239,7 @@ impl MoeResolution {
             || routed_indexable_mixed_per_expert
             || routed_indexable_mq2lloyd
             || routed_indexable_mq3lloyd
+            || routed_indexable_mixed_lloyd
             || routed_indexable_paro
             || routed_indexable_e8;
 
@@ -209,6 +251,10 @@ impl MoeResolution {
             || routed_gate_up_mq6
             || routed_gate_up_mq2lloyd
             || routed_gate_up_mq3lloyd
+            // MQ2/MQ3-G256-GL are FWHT-G256 formats: their gate_up kernel reads
+            // `x_rot`, so the local rotation MUST be produced. Missing this is a
+            // silent garbage-output failure (unrotated x into a rotated weight).
+            || routed_gate_up_gl
             || routed_gate_up_paro
             || routed_indexable_e8;
 
@@ -233,6 +279,7 @@ impl MoeResolution {
             routed_indexable_mixed_gu4_dn6,
             routed_indexable_mq2lloyd,
             routed_indexable_mq3lloyd,
+            routed_indexable_mixed_lloyd,
             routed_indexable_mixed_per_expert,
             routed_indexable_paro,
             use_gpu_topk,
@@ -249,6 +296,7 @@ impl MoeResolution {
             || self.routed_indexable_mixed_per_expert
             || self.routed_indexable_mq2lloyd
             || self.routed_indexable_mq3lloyd
+            || self.routed_indexable_mixed_lloyd
             || self.routed_indexable_paro
     }
 }

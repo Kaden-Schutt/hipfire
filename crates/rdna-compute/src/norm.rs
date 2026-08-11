@@ -339,6 +339,73 @@ impl Gpu {
             },
         )
     }
+    /// Zero inactive rows of a 2D F32 tensor [rows, cols] row-major.
+    /// `active_mask` lane bit i selects row i as active. Only inactive rows
+    /// are written with exact +0.0f; active rows are left byte-identical.
+    /// Full-mask callers skip the dispatch for exact parity. Supports up to
+    /// 64 rows without unsafe shift. Allocation-free.
+    pub fn zero_inactive_rows_f32(
+        &mut self,
+        data: &GpuTensor,
+        rows: usize,
+        cols: usize,
+        active_mask: u64,
+    ) -> HipResult<()> {
+        let full_mask = if rows >= 64 {
+            u64::MAX
+        } else if rows == 0 {
+            0u64
+        } else {
+            (1u64 << rows) - 1
+        };
+        if active_mask == full_mask {
+            return Ok(());
+        }
+        if rows == 0 || cols == 0 {
+            return Ok(());
+        }
+        let total = rows
+            .checked_mul(cols)
+            .ok_or_else(|| hip_bridge::HipError::new(0, "zero_inactive_rows_f32 total overflow"))?;
+        // If every inactive row is already zero, the caller could skip, but we
+        // still need to guarantee the write for isolation; cheap no-op if mask==full.
+        // Early exit if active_mask == 0 is handled by the kernel (zeros all rows)
+        // but we still launch; the full-mask early return above already handled the
+        // no-op case.
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "zero_inactive_rows_f32",
+            kernels::ZERO_INACTIVE_ROWS_F32_SRC,
+            "zero_inactive_rows_f32",
+        )?;
+        let dp = data.buf.as_ptr();
+        let r = rows as i32;
+        let c = cols as i32;
+        let mask = active_mask;
+        let mut params: Vec<*mut c_void> = vec![
+            &dp as *const _ as *mut c_void,
+            &r as *const _ as *mut c_void,
+            &c as *const _ as *mut c_void,
+            &mask as *const _ as *mut c_void,
+        ];
+        let block = 256u32;
+        let grid = (total as u32).div_ceil(block);
+        self.launch_maybe_blob(
+            "zero_inactive_rows_f32",
+            [grid, 1, 1],
+            [block, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(dp);
+                b.push_i32(r);
+                b.push_i32(c);
+                b.push_u64(mask);
+                b
+            },
+        )
+    }
 
     /// c = a * b (element-wise)
     pub fn mul_f32(&mut self, a: &GpuTensor, b: &GpuTensor, c: &GpuTensor) -> HipResult<()> {
@@ -2034,35 +2101,42 @@ impl Gpu {
             kernels::CONV1D_GATED_DECODE_SRC,
             "conv1d_gated_decode_f32",
         )?;
-        let func = &self.functions["conv1d_gated_decode_f32"];
-        let mut bp = bcx.buf.as_ptr();
-        let mut sp = state.buf.as_ptr();
-        let mut wp = weight.buf.as_ptr();
-        let mut oyp = out_y.buf.as_ptr();
-        let mut bb = batch as i32;
-        let mut cc = channels as i32;
-        let mut kk = kernel_size as i32;
+        let bp = bcx.buf.as_ptr();
+        let sp = state.buf.as_ptr();
+        let wp = weight.buf.as_ptr();
+        let oyp = out_y.buf.as_ptr();
+        let bb = batch as i32;
+        let cc = channels as i32;
+        let kk = kernel_size as i32;
         let mut params: Vec<*mut c_void> = vec![
-            &mut bp as *mut _ as *mut c_void,
-            &mut sp as *mut _ as *mut c_void,
-            &mut wp as *mut _ as *mut c_void,
-            &mut oyp as *mut _ as *mut c_void,
-            &mut bb as *mut _ as *mut c_void,
-            &mut cc as *mut _ as *mut c_void,
-            &mut kk as *mut _ as *mut c_void,
+            &bp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &oyp as *const _ as *mut c_void,
+            &bb as *const _ as *mut c_void,
+            &cc as *const _ as *mut c_void,
+            &kk as *const _ as *mut c_void,
         ];
         let block = 256u32;
         let grid = (((batch * channels) as u32) + block - 1) / block;
-        unsafe {
-            self.hip.launch_kernel(
-                func,
-                [grid, 1, 1],
-                [block, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        }
+        self.launch_maybe_blob(
+            "conv1d_gated_decode_f32",
+            [grid, 1, 1],
+            [block, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(bp);
+                b.push_ptr(sp);
+                b.push_ptr(wp);
+                b.push_ptr(oyp);
+                b.push_i32(bb);
+                b.push_i32(cc);
+                b.push_i32(kk);
+                b
+            },
+        )
     }
 
     /// Gated output norm: rmsnorm(x) * silu(z). Fused kernel.
@@ -2714,6 +2788,339 @@ impl Gpu {
         result
     }
 
+    /// One-token recurrent update for several independent sequence lanes.
+    /// State tensors are lane-major; the kernel uses grid.z as the lane id.
+    #[cfg(feature = "deltanet")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn gated_delta_net_q8_independent(
+        &mut self,
+        q_batch: &GpuTensor,
+        k_batch: &GpuTensor,
+        v_batch: &GpuTensor,
+        gate_batch: &GpuTensor,
+        beta_batch: &GpuTensor,
+        s_q8: &GpuTensor,
+        s_scales: &GpuTensor,
+        output_batch: &GpuTensor,
+        batch_size: usize,
+        n_heads: usize,
+        head_dim: usize,
+        ef_residual: Option<&GpuTensor>,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let use_fast = !dn_requant_per_token();
+        let kernel_name = if use_fast {
+            "gated_delta_net_q8_fast"
+        } else {
+            "gated_delta_net_q8"
+        };
+        let kernel_src = if use_fast {
+            kernels::GATED_DELTA_NET_Q8_FAST_SRC
+        } else {
+            kernels::GATED_DELTA_NET_Q8_SRC
+        };
+        let kernel_fn = if use_fast {
+            "gated_delta_net_q8_fast"
+        } else {
+            "gated_delta_net_q8"
+        };
+        self.ensure_kernel(kernel_name, kernel_src, kernel_fn)?;
+        let n_tiles = (128 / 4) as u32;
+        let mut qp = q_batch.buf.as_ptr();
+        let mut kp = k_batch.buf.as_ptr();
+        let mut vp = v_batch.buf.as_ptr();
+        let mut gp = gate_batch.buf.as_ptr();
+        let mut bp = beta_batch.buf.as_ptr();
+        let mut sp = s_q8.buf.as_ptr();
+        let mut scp = s_scales.buf.as_ptr();
+        let mut op = output_batch.buf.as_ptr();
+        let mut nt = 1i32;
+        let mut nh = n_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut fr = reserve_gdn_requant_frames(batch_size as u32) as i32;
+        let mut efp: *mut c_void = ef_residual
+            .map(|t| t.buf.as_ptr())
+            .unwrap_or(std::ptr::null_mut());
+        let mut rpt = dn_requant_per_token() as i32;
+        let bytes = crate::profile::gated_delta_net_q8_bytes(1, n_heads, head_dim) * batch_size;
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "deltanet",
+            "gated_delta_net_q8_batch_seq",
+            bytes,
+        );
+        let result = if use_fast {
+            let mut params: Vec<*mut c_void> = vec![
+                &mut qp as *mut _ as *mut c_void,
+                &mut kp as *mut _ as *mut c_void,
+                &mut vp as *mut _ as *mut c_void,
+                &mut gp as *mut _ as *mut c_void,
+                &mut bp as *mut _ as *mut c_void,
+                &mut sp as *mut _ as *mut c_void,
+                &mut scp as *mut _ as *mut c_void,
+                &mut op as *mut _ as *mut c_void,
+                &mut nt as *mut _ as *mut c_void,
+                &mut nh as *mut _ as *mut c_void,
+                &mut hd as *mut _ as *mut c_void,
+                &mut fr as *mut _ as *mut c_void,
+                &mut efp as *mut _ as *mut c_void,
+            ];
+            self.launch_maybe_blob(
+                "gated_delta_net_q8_fast",
+                [n_heads as u32, n_tiles, batch_size as u32],
+                [32, 1, 1],
+                0,
+                &mut params,
+                || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(qp);
+                    b.push_ptr(kp);
+                    b.push_ptr(vp);
+                    b.push_ptr(gp);
+                    b.push_ptr(bp);
+                    b.push_ptr(sp);
+                    b.push_ptr(scp);
+                    b.push_ptr(op);
+                    b.push_i32(nt);
+                    b.push_i32(nh);
+                    b.push_i32(hd);
+                    b.push_i32(fr);
+                    b.push_ptr(efp);
+                    b
+                },
+            )
+        } else {
+            let mut params: Vec<*mut c_void> = vec![
+                &mut qp as *mut _ as *mut c_void,
+                &mut kp as *mut _ as *mut c_void,
+                &mut vp as *mut _ as *mut c_void,
+                &mut gp as *mut _ as *mut c_void,
+                &mut bp as *mut _ as *mut c_void,
+                &mut sp as *mut _ as *mut c_void,
+                &mut scp as *mut _ as *mut c_void,
+                &mut op as *mut _ as *mut c_void,
+                &mut nt as *mut _ as *mut c_void,
+                &mut nh as *mut _ as *mut c_void,
+                &mut hd as *mut _ as *mut c_void,
+                &mut fr as *mut _ as *mut c_void,
+                &mut efp as *mut _ as *mut c_void,
+                &mut rpt as *mut _ as *mut c_void,
+            ];
+            self.launch_maybe_blob(
+                "gated_delta_net_q8",
+                [n_heads as u32, n_tiles, batch_size as u32],
+                [32, 1, 1],
+                0,
+                &mut params,
+                || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(qp);
+                    b.push_ptr(kp);
+                    b.push_ptr(vp);
+                    b.push_ptr(gp);
+                    b.push_ptr(bp);
+                    b.push_ptr(sp);
+                    b.push_ptr(scp);
+                    b.push_ptr(op);
+                    b.push_i32(nt);
+                    b.push_i32(nh);
+                    b.push_i32(hd);
+                    b.push_i32(fr);
+                    b.push_ptr(efp);
+                    b.push_i32(rpt);
+                    b
+                },
+            )
+        };
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+    /// Masked independent-sequence variant of `gated_delta_net_q8_independent`.
+    /// Derives physical lane from grid z (blockIdx.z, same as the unmasked
+    /// independent kernel) and returns before any inactive-lane read/write.
+    /// Full-mask callers are routed through the existing unmasked API for
+    /// exact parity. Supports up to 64 lanes without unsafe shift. Selects
+    /// the fast (single-end requant) or non-fast sibling by the same
+    /// `dn_requant_per_token()` gate as the unmasked path.
+    #[cfg(feature = "deltanet")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn gated_delta_net_q8_independent_masked(
+        &mut self,
+        q_batch: &GpuTensor,
+        k_batch: &GpuTensor,
+        v_batch: &GpuTensor,
+        gate_batch: &GpuTensor,
+        beta_batch: &GpuTensor,
+        s_q8: &GpuTensor,
+        s_scales: &GpuTensor,
+        output_batch: &GpuTensor,
+        batch_size: usize,
+        n_heads: usize,
+        head_dim: usize,
+        ef_residual: Option<&GpuTensor>,
+        active_mask: u64,
+    ) -> HipResult<()> {
+        let full_mask = if batch_size >= 64 {
+            u64::MAX
+        } else if batch_size == 0 {
+            0u64
+        } else {
+            (1u64 << batch_size) - 1
+        };
+        if active_mask == full_mask {
+            return self.gated_delta_net_q8_independent(
+                q_batch,
+                k_batch,
+                v_batch,
+                gate_batch,
+                beta_batch,
+                s_q8,
+                s_scales,
+                output_batch,
+                batch_size,
+                n_heads,
+                head_dim,
+                ef_residual,
+            );
+        }
+        if active_mask == 0 {
+            return Ok(());
+        }
+        self.bind_thread()?;
+        let use_fast = !dn_requant_per_token();
+        let (kernel_name, kernel_src, kernel_fn) = if use_fast {
+            (
+                "gated_delta_net_q8_fast_independent_masked",
+                kernels::GATED_DELTA_NET_Q8_FAST_SRC,
+                "gated_delta_net_q8_fast_independent_masked",
+            )
+        } else {
+            (
+                "gated_delta_net_q8_independent_masked",
+                kernels::GATED_DELTA_NET_Q8_SRC,
+                "gated_delta_net_q8_independent_masked",
+            )
+        };
+        self.ensure_kernel(kernel_name, kernel_src, kernel_fn)?;
+        let n_tiles = (128 / 4) as u32;
+        let mut qp = q_batch.buf.as_ptr();
+        let mut kp = k_batch.buf.as_ptr();
+        let mut vp = v_batch.buf.as_ptr();
+        let mut gp = gate_batch.buf.as_ptr();
+        let mut bp = beta_batch.buf.as_ptr();
+        let mut sp = s_q8.buf.as_ptr();
+        let mut scp = s_scales.buf.as_ptr();
+        let mut op = output_batch.buf.as_ptr();
+        let mut nt = 1i32;
+        let mut nh = n_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut fr = reserve_gdn_requant_frames(batch_size as u32) as i32;
+        let mut efp: *mut c_void = ef_residual
+            .map(|t| t.buf.as_ptr())
+            .unwrap_or(std::ptr::null_mut());
+        let mut rpt = dn_requant_per_token() as i32;
+        let mut mask = active_mask;
+        let bytes = crate::profile::gated_delta_net_q8_bytes(1, n_heads, head_dim) * batch_size;
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "deltanet",
+            "gated_delta_net_q8_batch_seq",
+            bytes,
+        );
+        let result = if use_fast {
+            let mut params: Vec<*mut c_void> = vec![
+                &mut qp as *mut _ as *mut c_void,
+                &mut kp as *mut _ as *mut c_void,
+                &mut vp as *mut _ as *mut c_void,
+                &mut gp as *mut _ as *mut c_void,
+                &mut bp as *mut _ as *mut c_void,
+                &mut sp as *mut _ as *mut c_void,
+                &mut scp as *mut _ as *mut c_void,
+                &mut op as *mut _ as *mut c_void,
+                &mut nt as *mut _ as *mut c_void,
+                &mut nh as *mut _ as *mut c_void,
+                &mut hd as *mut _ as *mut c_void,
+                &mut fr as *mut _ as *mut c_void,
+                &mut efp as *mut _ as *mut c_void,
+                &mut mask as *mut _ as *mut c_void,
+            ];
+            self.launch_maybe_blob(
+                "gated_delta_net_q8_fast_independent_masked",
+                [n_heads as u32, n_tiles, batch_size as u32],
+                [32, 1, 1],
+                0,
+                &mut params,
+                || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(qp);
+                    b.push_ptr(kp);
+                    b.push_ptr(vp);
+                    b.push_ptr(gp);
+                    b.push_ptr(bp);
+                    b.push_ptr(sp);
+                    b.push_ptr(scp);
+                    b.push_ptr(op);
+                    b.push_i32(nt);
+                    b.push_i32(nh);
+                    b.push_i32(hd);
+                    b.push_i32(fr);
+                    b.push_ptr(efp);
+                    b.push_u64(mask);
+                    b
+                },
+            )
+        } else {
+            let mut params: Vec<*mut c_void> = vec![
+                &mut qp as *mut _ as *mut c_void,
+                &mut kp as *mut _ as *mut c_void,
+                &mut vp as *mut _ as *mut c_void,
+                &mut gp as *mut _ as *mut c_void,
+                &mut bp as *mut _ as *mut c_void,
+                &mut sp as *mut _ as *mut c_void,
+                &mut scp as *mut _ as *mut c_void,
+                &mut op as *mut _ as *mut c_void,
+                &mut nt as *mut _ as *mut c_void,
+                &mut nh as *mut _ as *mut c_void,
+                &mut hd as *mut _ as *mut c_void,
+                &mut fr as *mut _ as *mut c_void,
+                &mut efp as *mut _ as *mut c_void,
+                &mut rpt as *mut _ as *mut c_void,
+                &mut mask as *mut _ as *mut c_void,
+            ];
+            self.launch_maybe_blob(
+                "gated_delta_net_q8_independent_masked",
+                [n_heads as u32, n_tiles, batch_size as u32],
+                [32, 1, 1],
+                0,
+                &mut params,
+                || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(qp);
+                    b.push_ptr(kp);
+                    b.push_ptr(vp);
+                    b.push_ptr(gp);
+                    b.push_ptr(bp);
+                    b.push_ptr(sp);
+                    b.push_ptr(scp);
+                    b.push_ptr(op);
+                    b.push_i32(nt);
+                    b.push_i32(nh);
+                    b.push_i32(hd);
+                    b.push_i32(fr);
+                    b.push_ptr(efp);
+                    b.push_i32(rpt);
+                    b.push_u64(mask);
+                    b
+                },
+            )
+        };
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
     /// Tree-aware variant of `gated_delta_net_q8_batch_seq`. Per-token
     /// S-tile persist-write so sibling tokens read the parent's post-update
     /// state via `s_tape_q8[parent_indices[t]]`. `parent_indices[t] < 0`
@@ -3788,6 +4195,173 @@ impl Gpu {
         result
     }
 
+    /// Independent-sequence decode variant of [`Self::conv1d_silu_split_f32_n`].
+    /// Each row owns a distinct convolution ring; no token in one lane can
+    /// advance another lane's state.
+    #[cfg(feature = "deltanet")]
+    pub fn conv1d_silu_split_f32_independent(
+        &mut self,
+        q_out: &GpuTensor,
+        k_out: &GpuTensor,
+        v_out: &GpuTensor,
+        input: &GpuTensor,
+        weight: &GpuTensor,
+        state: &GpuTensor,
+        k_dim: usize,
+        v_dim: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "conv1d_silu_split",
+            kernels::CONV1D_SILU_SPLIT_SRC,
+            "conv1d_silu_split_f32",
+        )?;
+        let qp = q_out.buf.as_ptr();
+        let kp = k_out.buf.as_ptr();
+        let vp = v_out.buf.as_ptr();
+        let ip = input.buf.as_ptr();
+        let wp = weight.buf.as_ptr();
+        let sp = state.buf.as_ptr();
+        let kd = k_dim as i32;
+        let vd = v_dim as i32;
+        let mut nt = 1i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &qp as *const _ as *mut c_void,
+            &kp as *const _ as *mut c_void,
+            &vp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &kd as *const _ as *mut c_void,
+            &vd as *const _ as *mut c_void,
+            &mut nt as *mut _ as *mut c_void,
+        ];
+        let n_channels = 2 * k_dim + v_dim;
+        let block = 256u32;
+        let grid = ((n_channels as u32) + block - 1) / block;
+        let bytes = crate::profile::conv1d_silu_bytes(n_channels) * batch_size;
+        let timer =
+            crate::profile::begin_timer(&self.hip, "deltanet", "conv1d_silu_split_f32_n", bytes);
+        let result = self.launch_maybe_blob(
+            "conv1d_silu_split_f32",
+            [grid, batch_size as u32, 1],
+            [block, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(qp);
+                b.push_ptr(kp);
+                b.push_ptr(vp);
+                b.push_ptr(ip);
+                b.push_ptr(wp);
+                b.push_ptr(sp);
+                b.push_i32(kd);
+                b.push_i32(vd);
+                b.push_i32(nt);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+    /// Masked independent-sequence variant of `conv1d_silu_split_f32_independent`.
+    /// Derives physical lane from grid y (blockIdx.y, same as the unmasked
+    /// independent kernel) and returns before any inactive-lane read/write.
+    /// Full-mask callers are routed through the existing unmasked API for
+    /// exact parity. Supports up to 64 lanes without unsafe shift.
+    #[cfg(feature = "deltanet")]
+    pub fn conv1d_silu_split_f32_independent_masked(
+        &mut self,
+        q_out: &GpuTensor,
+        k_out: &GpuTensor,
+        v_out: &GpuTensor,
+        input: &GpuTensor,
+        weight: &GpuTensor,
+        state: &GpuTensor,
+        k_dim: usize,
+        v_dim: usize,
+        batch_size: usize,
+        active_mask: u64,
+    ) -> HipResult<()> {
+        let full_mask = if batch_size >= 64 {
+            u64::MAX
+        } else if batch_size == 0 {
+            0u64
+        } else {
+            (1u64 << batch_size) - 1
+        };
+        if active_mask == full_mask {
+            return self.conv1d_silu_split_f32_independent(
+                q_out, k_out, v_out, input, weight, state, k_dim, v_dim, batch_size,
+            );
+        }
+        if active_mask == 0 {
+            return Ok(());
+        }
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "conv1d_silu_split_f32_masked",
+            kernels::CONV1D_SILU_SPLIT_SRC,
+            "conv1d_silu_split_f32_masked",
+        )?;
+        let qp = q_out.buf.as_ptr();
+        let kp = k_out.buf.as_ptr();
+        let vp = v_out.buf.as_ptr();
+        let ip = input.buf.as_ptr();
+        let wp = weight.buf.as_ptr();
+        let sp = state.buf.as_ptr();
+        let kd = k_dim as i32;
+        let vd = v_dim as i32;
+        let mut nt = 1i32;
+        let mask = active_mask;
+        let mut params: Vec<*mut c_void> = vec![
+            &qp as *const _ as *mut c_void,
+            &kp as *const _ as *mut c_void,
+            &vp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &kd as *const _ as *mut c_void,
+            &vd as *const _ as *mut c_void,
+            &mut nt as *mut _ as *mut c_void,
+            &mask as *const _ as *mut c_void,
+        ];
+        let n_channels = 2 * k_dim + v_dim;
+        let block = 256u32;
+        let grid = ((n_channels as u32) + block - 1) / block;
+        let bytes = crate::profile::conv1d_silu_bytes(n_channels) * batch_size;
+        let timer =
+            crate::profile::begin_timer(&self.hip, "deltanet", "conv1d_silu_split_f32_n", bytes);
+        let result = self.launch_maybe_blob(
+            "conv1d_silu_split_f32_masked",
+            [grid, batch_size as u32, 1],
+            [block, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(qp);
+                b.push_ptr(kp);
+                b.push_ptr(vp);
+                b.push_ptr(ip);
+                b.push_ptr(wp);
+                b.push_ptr(sp);
+                b.push_i32(kd);
+                b.push_i32(vd);
+                b.push_i32(nt);
+                b.push_u64(mask);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
     /// Tree-aware variant of `conv1d_silu_split_f32_n`. `parent_indices[t]`
     /// is the linear slot index of token t's parent within the block, or
     /// a negative sentinel for pre-block ancestors: -1 selects conv_state[0]

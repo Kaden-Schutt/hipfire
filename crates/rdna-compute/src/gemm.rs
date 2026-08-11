@@ -14262,6 +14262,104 @@ impl Gpu {
         result
     }
 
+    /// MQ2-Lloyd sister of `gemm_hfq4g256_moe_grouped_wmma_k2` for MoE Path-2.
+    /// Same scatter contract + 9-tuple kernarg. gfx11 dispatches the `_k2`
+    /// (half16) kernel; gfx12 (RDNA4) the `.gfx12` (half8/k_grp) kernel.
+    /// 72 B/group = 8 B (4 × fp16 codebook) + 64 B (256 × 2-bit indices).
+    ///
+    /// Arch-selecting twin of the bare `gemm_mq2g256_lloyd_moe_grouped_wmma_k2`
+    /// entry (which is gfx11-only and is what the DeepSeek-V4 variant selector
+    /// calls directly). Prefer THIS entry from any arch-agnostic dispatch site:
+    /// the `_k2` kernel calls `__builtin_amdgcn_wmma_f32_16x16x16_f16_w32`,
+    /// which does not exist on RDNA4, so calling it on gfx12 fails the JIT.
+    ///
+    /// Module names are distinct per arch (`..._k2` vs `..._gfx12`) - the JIT
+    /// kernel cache is keyed by module name only, so a shared name would make
+    /// the second arch's source dead code.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_mq2g256_lloyd_moe_grouped_wmma(
+        &mut self,
+        expert_weight_ptrs: &GpuTensor, // [E] u64
+        expert_tile_ids: &GpuTensor,    // [m_total / 16] i32
+        sorted_slot_index: &GpuTensor,  // [m_total] i32
+        x_src: &GpuTensor,              // [x_src_rows × K] f32 (auto-converted to FP16)
+        y_grouped: &GpuTensor,          // [m_total × M] f32, written direct
+        m: usize,
+        k: usize,
+        x_row_div: usize,
+        m_total: usize,
+        x_src_rows: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let is_gfx12 = self.arch_caps.is_rdna4();
+        if !is_gfx12 && !self.arch_caps.has_wmma_w32() {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "gemm_mq2g256_lloyd_moe_grouped_wmma: requires WMMA (gfx11 or gfx12); \
+                     current arch = {}",
+                    self.arch
+                ),
+            ));
+        }
+        let (kernel_name, kernel_src) = kernels::mq2g256_lloyd_moe_grouped_wmma_source(is_gfx12);
+        self.ensure_kernel(kernel_name, kernel_src, kernel_name)?;
+        let x_f16_ptr = self.ensure_fp16_x(x_src, x_src_rows * k)?;
+
+        let ep = expert_weight_ptrs.buf.as_ptr();
+        let tp = expert_tile_ids.buf.as_ptr();
+        let sp = sorted_slot_index.buf.as_ptr();
+        let xp = x_f16_ptr;
+        let yp = y_grouped.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let xrd_val = x_row_div as i32;
+        let mt_val = m_total as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &ep as *const _ as *mut c_void,
+            &tp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+            &xrd_val as *const _ as *mut c_void,
+            &mt_val as *const _ as *mut c_void,
+        ];
+
+        let row_tiles = ((m + 15) / 16) as u32;
+        let slot_tiles = ((m_total + 15) / 16) as u32;
+        // BW estimate: MQ2-Lloyd row footprint = groups_per_row × 72 B.
+        let mq2_weight_bytes = m * (k / 256) * 72;
+        let bytes = m_total * k * 2 + (m_total * m) * 4 + mq2_weight_bytes;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel_name, bytes);
+        let result = self.launch_maybe_blob(
+            kernel_name,
+            [row_tiles, slot_tiles, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ep);
+                b.push_ptr(tp);
+                b.push_ptr(sp);
+                b.push_ptr(xp);
+                b.push_ptr(yp);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(xrd_val);
+                b.push_i32(mt_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
     /// MQ3-Lloyd sister of `gemm_hfq4g256_moe_grouped_wmma_k2` for MoE Path-2.
     /// Same scatter contract + 9-tuple kernarg. gfx11 dispatches the `_k2`
     /// (half16) kernel; gfx12 (RDNA4) the `.gfx12` (half8/k_grp) kernel.
@@ -14292,17 +14390,7 @@ impl Gpu {
                 ),
             ));
         }
-        let (kernel_name, kernel_src) = if is_gfx12 {
-            (
-                "gemm_mq3g256_lloyd_moe_grouped_wmma_gfx12",
-                kernels::GEMM_MQ3G256_LLOYD_MOE_GROUPED_WMMA_GFX12_SRC,
-            )
-        } else {
-            (
-                "gemm_mq3g256_lloyd_moe_grouped_wmma_k2",
-                kernels::GEMM_MQ3G256_LLOYD_MOE_GROUPED_WMMA_K2_SRC,
-            )
-        };
+        let (kernel_name, kernel_src) = kernels::mq3g256_lloyd_moe_grouped_wmma_source(is_gfx12);
         self.ensure_kernel(kernel_name, kernel_src, kernel_name)?;
         let x_f16_ptr = self.ensure_fp16_x(x_src, x_src_rows * k)?;
 

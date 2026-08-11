@@ -46,6 +46,17 @@ COHERENCE_MODE = "battery"
 COHERENCE_MTP = "off"
 assert COHERENCE_MAX_TOKENS > COHERENCE_THINKING_CAP_TOKENS
 
+# Custom coherence maps thinking budget to concrete cap (mirrors serve_harness).
+COHERENCE_THINKING_BUDGET = {
+    "off": 1,
+    "low": 512,
+    "med": 2048,
+    "high": 8192,
+    "xhigh": 24576,
+    "max": 32768,
+    "uncapped": 0,
+}
+
 # Opt-in retained-replay proof marker. Product coherence enables it via temporary
 # serve_harness TOML (`diagnostic.replay.route_proof_log`); the runtime still lowers
 # through HIPFIRE_REPLAY_ROUTE_PROOF_LOG / process_value.
@@ -213,6 +224,121 @@ def _flagstaff_answer_errors(content):
             "(named/name/origin/1876/centennial/boston party/fourth of july/4th of july)"
         )
     return errors
+
+
+def _coherence_thinking_cap(thinking: str) -> int:
+    """Concretem thinking cap for a budget string (mirrors serve_harness)."""
+    return COHERENCE_THINKING_BUDGET.get(thinking, COHERENCE_THINKING_CAP_TOKENS)
+
+
+def _custom_coherence_answer_errors(content: str, expected_substrings) -> list[str]:
+    """Validate custom prompt answer: non-empty plus all expected substrings."""
+    errors: list[str] = []
+    if not isinstance(content, str) or not content.strip():
+        errors.append("assistant_content must be a nonempty string")
+        return errors
+    lowered = content.lower()
+    if expected_substrings:
+        for sub in expected_substrings:
+            if not isinstance(sub, str) or not sub:
+                errors.append(f"invalid expected substring {sub!r}")
+                continue
+            if sub.lower() not in lowered:
+                errors.append(
+                    f"answer missing expected substring {sub!r} (case-insensitive)"
+                )
+    return errors
+
+def sampled_output_parity_errors(hip_rows: object, replay_rows: object, *, label: str) -> list[str]:
+    """Pure helper: exact sampled-output parity for paired rows.
+
+    Compares paired dict rows with exact Python equality for
+    ``assistant_content``, ``ctx``, and ``gen``. Rejects non-list,
+    count, type, and missing-field mismatches with deterministic
+    actionable errors. Performs no normalization, case folding, or
+    substring matching; byte-identical rows pass.
+    """
+    errors: list[str] = []
+    prefix = f"{label} " if label else ""
+    prefix_colon = f"{label}: " if label else ""
+    if not isinstance(hip_rows, list):
+        errors.append(f"{prefix_colon}hip_rows must be a list, got {type(hip_rows).__name__}")
+        if not isinstance(replay_rows, list):
+            errors.append(f"{prefix_colon}replay_rows must be a list, got {type(replay_rows).__name__}")
+        return errors
+    if not isinstance(replay_rows, list):
+        errors.append(f"{prefix_colon}replay_rows must be a list, got {type(replay_rows).__name__}")
+        return errors
+    if len(hip_rows) != len(replay_rows):
+        errors.append(
+            f"{prefix_colon}sampled-output row count differs: hip {len(hip_rows)} vs replay {len(replay_rows)}"
+        )
+        return errors
+    for idx, (hip_row, replay_row) in enumerate(zip(hip_rows, replay_rows), 1):
+        if not isinstance(hip_row, dict):
+            errors.append(f"{prefix}turn {idx}: hip row must be an object, got {type(hip_row).__name__}")
+            continue
+        if not isinstance(replay_row, dict):
+            errors.append(f"{prefix}turn {idx}: replay row must be an object, got {type(replay_row).__name__}")
+            continue
+        for field in ("assistant_content", "ctx", "gen"):
+            hip_has = field in hip_row
+            replay_has = field in replay_row
+            if not hip_has or not replay_has:
+                if not hip_has and not replay_has:
+                    errors.append(f"{prefix}turn {idx}: {field} is missing from both rows")
+                elif not hip_has:
+                    errors.append(f"{prefix}turn {idx}: hip {field} is missing")
+                else:
+                    errors.append(f"{prefix}turn {idx}: replay {field} is missing")
+                continue
+            hip_val = hip_row[field]
+            replay_val = replay_row[field]
+            if hip_val != replay_val:
+                if field == "assistant_content":
+                    errors.append(f"{prefix}turn {idx}: sampled output differs between HIP and PM4")
+                elif field == "ctx":
+                    errors.append(
+                        f"{prefix}turn {idx}: prompt-token count differs between HIP and PM4 (ctx hip={hip_val!r} vs replay={replay_val!r})"
+                    )
+                else:  # gen
+                    errors.append(
+                        f"{prefix}turn {idx}: generated-token count differs between HIP and PM4 (gen hip={hip_val!r} vs replay={replay_val!r})"
+                    )
+    return errors
+
+
+def _is_coherence_custom(args) -> bool:
+    return getattr(args, "coherence_prompt_file", None) is not None
+
+
+def _coherence_custom_files(args):
+    """Return resolved custom prompt file, bytes, md5, sha256, text."""
+    raw = getattr(args, "coherence_prompt_file", None)
+    if raw is None:
+        return None
+    path = Path(raw).expanduser().resolve()
+    data = path.read_bytes()
+    # Hash exact byte sequence (no newline normalization).
+    md5 = hashlib.md5(data).hexdigest()
+    sha256 = hashlib.sha256(data).hexdigest()
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise RuntimeError(
+            f"coherence prompt file {path} must be valid UTF-8: {exc}"
+        ) from exc
+    if not text.strip():
+        raise RuntimeError(
+            f"coherence prompt file {path} must be nonempty"
+        )
+    return {
+        "path": path,
+        "bytes": data,
+        "text": text,
+        "md5": md5,
+        "sha256": sha256,
+    }
 
 
 def sha256_file(path):
@@ -692,9 +818,11 @@ def run_pm4_preflight(args):
             {
                 "type": "bench_decode",
                 "context_tokens": args.context,
-                # The first decode prepares the tape; two more prove replay at
-                # distinct positions without entering benchmark warmup.
-                "iterations": 3,
+                # Dense LFM uses its first decode for allocation warmup, its
+                # second to record/prepare the retained tape, and therefore
+                # needs two further iterations to prove replay at distinct
+                # positions before benchmark warmup.
+                "iterations": 4,
                 "redline_product_route": True,
             }
         )
@@ -1117,14 +1245,54 @@ def _unique_smoke_dir(work_root: Path, label: str) -> Path:
 
 
 def run_coherence_smoke(args, backend):
-    """One Flagstaff turn via scripts/serve_harness.py; quality gate only (no tok/s)."""
+    """One coherence turn via scripts/serve_harness.py; quality gate only (no tok/s)."""
     if backend not in ("hip", "auto"):
         raise ValueError(f"unsupported coherence backend {backend!r}")
-    if COHERENCE_MAX_TOKENS <= COHERENCE_THINKING_CAP_TOKENS:
-        raise RuntimeError(
-            f"coherence max_tokens ({COHERENCE_MAX_TOKENS}) must exceed "
-            f"thinking cap ({COHERENCE_THINKING_CAP_TOKENS})"
-        )
+
+    # Resolve custom prompt (byte-identical for both arms) vs default Flagstaff.
+    is_custom = _is_coherence_custom(args)
+    if is_custom:
+        info = _coherence_custom_files(args)
+        if info is None:
+            raise RuntimeError("coherence custom prompt file missing")
+        prompt_text = info["text"]
+        prompt_md5 = info["md5"]
+        prompt_sha256 = info["sha256"]
+        prompt_resolved = str(info["path"])
+        expected = getattr(args, "coherence_expected_substring", None)
+        if expected is None:
+            expected = getattr(args, "coherence_expected_substrings", None)
+        if expected is None:
+            expected = []
+        # Normalize to list of strings.
+        if isinstance(expected, str):
+            expected = [expected]
+        expected = [str(s) for s in expected if isinstance(s, str) and s]
+        thinking = getattr(args, "coherence_thinking", None) or COHERENCE_THINKING
+        raw_max = getattr(args, "coherence_max_tokens", None)
+        max_tokens = int(raw_max) if raw_max is not None else COHERENCE_MAX_TOKENS
+        sampling = getattr(args, "coherence_sampling", None) or COHERENCE_SAMPLING
+        cap = _coherence_thinking_cap(thinking)
+        if cap != 0 and max_tokens <= cap:
+            raise RuntimeError(
+                f"coherence max_tokens ({max_tokens}) must exceed "
+                f"thinking cap ({cap}) for thinking={thinking!r}"
+            )
+    else:
+        if COHERENCE_MAX_TOKENS <= COHERENCE_THINKING_CAP_TOKENS:
+            raise RuntimeError(
+                f"coherence max_tokens ({COHERENCE_MAX_TOKENS}) must exceed "
+                f"thinking cap ({COHERENCE_THINKING_CAP_TOKENS})"
+            )
+        prompt_text = COHERENCE_PROMPT
+        prompt_md5 = None
+        prompt_sha256 = None
+        prompt_resolved = None
+        expected = None
+        thinking = COHERENCE_THINKING
+        cap = COHERENCE_THINKING_CAP_TOKENS
+        max_tokens = COHERENCE_MAX_TOKENS
+        sampling = COHERENCE_SAMPLING
 
     model = Path(args.model).expanduser().resolve()
     daemon_src = Path(args.daemon).expanduser().resolve()
@@ -1136,8 +1304,9 @@ def run_coherence_smoke(args, backend):
     out_path = smoke_dir / "harness.json"
     home_path = smoke_dir / "home"
     serve_log = smoke_dir / "serve.log"
+    # Prompts file: identical byte-identical prompt text for both HIP and auto.
     prompts_path.write_text(
-        json.dumps([{"genre": "factual", "prompt": COHERENCE_PROMPT}], indent=2) + "\n"
+        json.dumps([{"genre": "custom" if is_custom else "factual", "prompt": prompt_text}], indent=2) + "\n"
     )
     if out_path.exists():
         out_path.unlink()
@@ -1156,13 +1325,13 @@ def run_coherence_smoke(args, backend):
         "--mtp",
         COHERENCE_MTP,
         "--thinking",
-        COHERENCE_THINKING,
+        thinking,
         "--max-tokens",
-        str(COHERENCE_MAX_TOKENS),
+        str(max_tokens),
         "--max-seq",
         str(args.max_seq),
         "--sampling",
-        COHERENCE_SAMPLING,
+        sampling,
         "--mode",
         COHERENCE_MODE,
         "--seed",
@@ -1209,16 +1378,21 @@ def run_coherence_smoke(args, backend):
         "backend": backend,
         "configured_backend": configured_backend,
         "transport": args.transport,
-        "thinking": COHERENCE_THINKING,
-        "thinking_cap_tokens": COHERENCE_THINKING_CAP_TOKENS,
-        "max_tokens": COHERENCE_MAX_TOKENS,
+        "thinking": thinking,
+        "thinking_cap_tokens": cap,
+        "max_tokens": max_tokens,
         "seed": COHERENCE_SEED,
-        "sampling": COHERENCE_SAMPLING,
+        "sampling": sampling,
         "mode": COHERENCE_MODE,
         "mtp": COHERENCE_MTP,
         "kv_mode": args.kv_mode,
         "max_seq": args.max_seq,
-        "prompt": COHERENCE_PROMPT,
+        "prompt": prompt_text,
+        "prompt_file": prompt_resolved,
+        "prompt_md5": prompt_md5,
+        "prompt_sha256": prompt_sha256,
+        "expected_substrings": list(expected) if is_custom else None,
+        "coherence_mode": "custom" if is_custom else "flagstaff",
         "port": port,
         "smoke_dir": str(smoke_dir),
         "home": str(home_path),
@@ -1290,7 +1464,10 @@ def run_coherence_smoke(args, backend):
             if not isinstance(content, str) or not content.strip():
                 errors.append("assistant_content must be a nonempty string")
             else:
-                errors.extend(_flagstaff_answer_errors(content))
+                if is_custom:
+                    errors.extend(_custom_coherence_answer_errors(content, expected))
+                else:
+                    errors.extend(_flagstaff_answer_errors(content))
             if row.get("empty"):
                 errors.append("empty generation")
             if row.get("runaway"):
@@ -1312,7 +1489,15 @@ def run_coherence_smoke(args, backend):
         "valid": not errors,
         "errors": errors,
         "speed_checked": False,
-        "prompt": COHERENCE_PROMPT,
+        "prompt": prompt_text,
+        "prompt_file": prompt_resolved,
+        "prompt_md5": prompt_md5,
+        "prompt_sha256": prompt_sha256,
+        "expected_substrings": list(expected) if is_custom else None,
+        "coherence_mode": "custom" if is_custom else "flagstaff",
+        "thinking": thinking,
+        "max_tokens": max_tokens,
+        "sampling": sampling,
         "config": config,
         "row": row,
         "rows": rows,
@@ -1901,6 +2086,55 @@ def main(argv=None):
             "on auto/redline PM4 via serve_harness --mode session (requires --transport pm4)"
         ),
     )
+    parser.add_argument(
+        "--coherence-prompt-file",
+        default=None,
+        help=(
+            "opt-in capability-appropriate prompt file (UTF-8 text) that replaces "
+            "the default Flagstaff prompt for both HIP and auto coherence smokes. "
+            "Requires --coherence-expected-substring and is byte-identical for both arms; "
+            "MD5/SHA256 and resolved path are recorded in the report"
+        ),
+    )
+    parser.add_argument(
+        "--coherence-expected-substring",
+        action="append",
+        dest="coherence_expected_substring",
+        default=None,
+        help=(
+            "repeatable case-insensitive substring that must appear in the custom "
+            "prompt's assistant answer (all values required); requires "
+            "--coherence-prompt-file"
+        ),
+    )
+    parser.add_argument(
+        "--coherence-thinking",
+        choices=list(COHERENCE_THINKING_BUDGET.keys()),
+        default=None,
+        help=(
+            "thinking budget for the custom coherence prompt (default low); "
+            "only valid with --coherence-prompt-file; exposed for 0.8B/LFM"
+        ),
+    )
+    parser.add_argument(
+        "--coherence-max-tokens",
+        type=int,
+        default=None,
+        help=(
+            "max_tokens for the custom coherence prompt (default 1024, must exceed "
+            "thinking cap); only valid with --coherence-prompt-file"
+        ),
+    )
+    parser.add_argument(
+        "--coherence-sampling",
+        default=None,
+        help=(
+            "serve_harness sampling spec pinned identically on both custom HIP and auto "
+            "coherence smokes (default registry); only valid with --coherence-prompt-file; "
+            "accepts the same nonempty specs as serve_harness --sampling "
+            "(registry | registry:… | greedy | recipe:… | json:{…})"
+        ),
+    )
     args = parser.parse_args(argv)
     try:
         args.pm4_policy = pm4_policy_with_overrides(args.pm4_policy_override)
@@ -1921,7 +2155,50 @@ def main(argv=None):
         parser.error("--runs must be at least 5 for measurement validation")
     if args.pm4_multiturn_session is not None and args.transport != "pm4":
         parser.error("--pm4-multiturn-session requires --transport pm4")
-
+    # Custom coherence: require paired file + expected substrings; reject partial config
+    # before any GPU work and keep default Flagstaff bit-for-bit when absent.
+    has_custom_file = args.coherence_prompt_file is not None
+    has_custom_expected = args.coherence_expected_substring is not None
+    has_custom_thinking = args.coherence_thinking is not None
+    has_custom_max = args.coherence_max_tokens is not None
+    has_custom_sampling = args.coherence_sampling is not None
+    if (
+        has_custom_file
+        or has_custom_expected
+        or has_custom_thinking
+        or has_custom_max
+        or has_custom_sampling
+    ):
+        if args.skip_coherence:
+            parser.error("cannot combine --skip-coherence with custom coherence prompt")
+        if not has_custom_file:
+            parser.error(
+                "--coherence-prompt-file is required when "
+                "--coherence-expected-substring/--coherence-thinking/"
+                "--coherence-max-tokens/--coherence-sampling is used"
+            )
+        if not has_custom_expected:
+            parser.error(
+                "--coherence-expected-substring is required when "
+                "--coherence-prompt-file is used (repeatable, case-insensitive)"
+            )
+        for sub in args.coherence_expected_substring:
+            if not isinstance(sub, str) or not sub.strip():
+                parser.error(
+                    "--coherence-expected-substring must be a nonempty string (no coercion)"
+                )
+        if args.coherence_max_tokens is not None and args.coherence_max_tokens <= 0:
+            parser.error("--coherence-max-tokens must be positive")
+        if has_custom_sampling and (
+            not isinstance(args.coherence_sampling, str)
+            or not args.coherence_sampling.strip()
+        ):
+            parser.error(
+                "--coherence-sampling must be a nonempty serve_harness sampling spec"
+            )
+    # Thinking/max_tokens/sampling alone without a file is already rejected above; no extra
+    # branching needed. The file existence / UTF-8 / hash validation happens after
+    # model checks but before any GPU work (same order as multiturn session).
 
     model = Path(args.model).expanduser().resolve()
     daemon = Path(args.daemon).expanduser().resolve()
@@ -1941,13 +2218,39 @@ def main(argv=None):
             "model SHA-256 mismatch: "
             f"expected {args.expected_model_sha256.lower()}, got {model_sha256}"
         )
+    # Validate custom coherence prompt file bytes/hashes before any GPU work.
+    if has_custom_file:
+        try:
+            info = _coherence_custom_files(args)
+        except Exception as error:
+            raise SystemExit(f"coherence prompt file invalid before GPU work: {error}")
+        # Validate thinking cap vs max_tokens before GPU.
+        thinking = args.coherence_thinking or COHERENCE_THINKING
+        cap = _coherence_thinking_cap(thinking)
+        max_tok = (
+            args.coherence_max_tokens
+            if args.coherence_max_tokens is not None
+            else COHERENCE_MAX_TOKENS
+        )
+        if cap != 0 and max_tok <= cap:
+            raise SystemExit(
+                f"coherence max_tokens ({max_tok}) must exceed "
+                f"thinking cap ({cap}) for thinking={thinking!r} before GPU work"
+            )
+        # Stash resolved values for identical HIP/auto smokes and report.
+        args.coherence_prompt_text = info["text"]
+        args.coherence_prompt_md5 = info["md5"]
+        args.coherence_prompt_sha256 = info["sha256"]
+        args.coherence_prompt_resolved = str(info["path"])
+        # Resolve sampling once so both arms and the report share one pin.
+        if args.coherence_sampling is None:
+            args.coherence_sampling = COHERENCE_SAMPLING
     # Validate optional multiturn session JSON before any GPU work.
     if args.pm4_multiturn_session is not None:
         try:
             load_pm4_multiturn_session(args.pm4_multiturn_session)
         except Exception as error:
             raise SystemExit(f"PM4 multiturn session invalid before GPU work: {error}")
-
     pm4_preflight = None
     if args.transport == "pm4":
         print("pm4: preflighting retained replay before benchmark warmup...", flush=True)
@@ -1995,6 +2298,20 @@ def main(argv=None):
             f"coherence: auto passed ({coherence_auto['seconds']:.2f}s)",
             flush=True,
         )
+        # Sampled-output parity is exact; substring/semantic checks are health hints only.
+        hip_rows = coherence_hip.get("rows")
+        auto_rows = coherence_auto.get("rows")
+        if hip_rows is not None or auto_rows is not None:
+            parity_errors = sampled_output_parity_errors(
+                hip_rows,
+                auto_rows,
+                label="coherence",
+            )
+            if parity_errors:
+                raise SystemExit(
+                    "coherence sampled outputs differ between HIP and replay: "
+                    + "; ".join(parity_errors)
+                )
 
     report = {
         "started_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -2025,9 +2342,36 @@ def main(argv=None):
         "kv_mode": args.kv_mode,
         "pm4_preflight": pm4_preflight,
         "coherence": {
+            "mode": (
+                "skipped"
+                if args.skip_coherence
+                else "custom" if has_custom_file else "flagstaff"
+            ),
             "hip": coherence_hip,
             "auto": coherence_auto,
             "multiturn": None,
+            "prompt_file": str(Path(args.coherence_prompt_file).expanduser().resolve())
+            if has_custom_file
+            else None,
+            "prompt_md5": getattr(args, "coherence_prompt_md5", None)
+            if has_custom_file
+            else None,
+            "prompt_sha256": getattr(args, "coherence_prompt_sha256", None)
+            if has_custom_file
+            else None,
+            "expected_substrings": list(args.coherence_expected_substring)
+            if has_custom_file and args.coherence_expected_substring is not None
+            else None,
+            "thinking": args.coherence_thinking or COHERENCE_THINKING
+            if has_custom_file
+            else COHERENCE_THINKING,
+            "max_tokens": args.coherence_max_tokens
+            if has_custom_file and args.coherence_max_tokens is not None
+            else COHERENCE_MAX_TOKENS,
+            "sampling": args.coherence_sampling
+            if has_custom_file
+            else COHERENCE_SAMPLING,
+            "default_prompt": COHERENCE_PROMPT,
         },
         "hip": run_arm(args, "hip"),
         "auto": run_arm(args, "auto"),

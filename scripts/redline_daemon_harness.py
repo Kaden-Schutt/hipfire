@@ -133,6 +133,17 @@ def main():
         default=1,
         help="consecutive token positions compared by the AQL/HIP/blob parity gate",
     )
+    parser.add_argument(
+        "--state-quant",
+        choices=("q8", "fp32", "q4"),
+        help=(
+            "DeltaNet state precision for the run. Pass fp32 for any BYTE-PARITY "
+            "claim: Q8 state uses stochastic rounding, which makes a bit-exact "
+            "PM4/HIP path report exact=False and misattributes the failure to the "
+            "lowering (see CLAUDE.md 'Byte-parity validation is meaningless under "
+            "stochastic state'). Omit to keep the daemon default (q8)."
+        ),
+    )
     parser.add_argument("--max-seq", type=int, default=2048)
     parser.add_argument("--timeout", type=float, default=120.0)
     parser.add_argument("--prefix", type=int, help="compare only the first N captured launches")
@@ -228,7 +239,14 @@ def main():
             {
                 "type": "load",
                 "model": str(model),
-                "params": load_params,
+                "params": {
+                    **load_params,
+                    **(
+                        {"state_quant": args.state_quant}
+                        if args.state_quant
+                        else {}
+                    ),
+                },
             }
         )
         if loaded.get("type") != "loaded":

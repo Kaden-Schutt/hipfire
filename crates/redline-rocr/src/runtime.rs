@@ -1912,6 +1912,19 @@ impl KernargPool {
         )
     }
 
+    /// Allocate retained zeroed host-resident fine-grained standard memory.
+    ///
+    /// Same pool and zeroing path as [`Self::allocate_for`], with an explicit
+    /// length/alignment for non-kernarg GPU-visible host words (e.g. PM4
+    /// dependency-fence counters).
+    pub fn allocate_fine_grained_bytes(
+        &self,
+        length: usize,
+        alignment: usize,
+    ) -> Result<KernargBuffer, RuntimeError> {
+        self.allocate_bytes(length, alignment, abi::AMD_MEMORY_POOL_STANDARD_FLAG)
+    }
+
     /// Allocate CPU-writable, GPU-accessible command memory. The executable
     /// flag is required for MEC indirect-buffer fetches even though the PM4
     /// words are data rather than shader ISA.

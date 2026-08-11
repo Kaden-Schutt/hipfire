@@ -18,7 +18,7 @@ use hipfire_arch_dots_ocr::dots_ocr;
 use hipfire_arch_lfm2moe as lfm2moe;
 use hipfire_arch_minimax as minimax;
 use hipfire_arch_qwen2::qwen2;
-use hipfire_arch_qwen35::qwen35::{DeltaNetState, Qwen35ScratchSet};
+use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, Qwen35ScratchSet};
 use hipfire_arch_qwen35::speculative::DeltaNetSnapshot;
 use hipfire_arch_qwen35::Qwen35Bundle;
 use hipfire_arch_qwen35_vl::qwen35_vl;
@@ -28,10 +28,12 @@ use hipfire_runtime::kv_backend::KvBackend;
 use hipfire_runtime::llama;
 use hipfire_runtime::loader_api::{CaskConfig, LoadCtx, ModelSource, SpecLoadCfg};
 use hipfire_runtime::multi_gpu::Gpus;
+use hipfire_runtime::ngram_mod::NgramModPool;
 use hipfire_runtime::spec::{SpecEmit, SpecEmitCtx, SpecTargetGuard, Speculator};
 use hipfire_runtime::triattn::{EvictionCtx, TriAttnCenters};
 use rdna_compute::Gpu;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 // ─── Object-safe Carrier trait ──────────────────────────────────────
 
@@ -301,6 +303,8 @@ pub struct LoadedModel {
     pub ep: Option<EpState>,
     // Shared arch state
     pub state: Option<ModelState>,
+    pub qwen35_decode_batch: Option<hipfire_arch_qwen35::qwen35::Qwen35DecodeBatchState>,
+    pub lfm2_decode_batch: Option<hipfire_arch_lfm2moe::batch::Lfm2DecodeBatchState>,
     pub kv_cache: Option<llama::KvCache>,
     pub dn_state: Option<DeltaNetState>,
     // Reusable Qwen2 recurrent state (used by dots_ocr and Qwen2 non-core falcon)
@@ -317,6 +321,10 @@ pub struct LoadedModel {
     // `ep` (EpArch::Minimax), NOT in `state`, so `minimax()` is None for EP
     // models — the eos must be carried here (mirrors `deepseek4_eos_tok`).
     pub minimax_eos_tok: u32,
+    // Qwen3.5/3.6 (arch_id=5|6) EP serve eos. The EP path stores model state in
+    // `ep` (EpArch::Qwen35), NOT in `state`, so the eos must be carried here
+    // (mirrors `deepseek4_eos_tok` / `minimax_eos_tok`).
+    pub qwen35_eos_tok: u32,
     // LFM2.5-8B-A1B (arch_id=11) and MiniMax-M2 (arch_id=10) live in
     // `state` as ModelState::{Lfm2Moe,Minimax} so unload teardown is
     // compiler-enforced (see ModelState).
@@ -349,6 +357,12 @@ pub struct LoadedModel {
     pub dflash_checkpoints: Vec<(usize, DeltaNetSnapshot)>,
     pub asst_turn_cache: AsstTurnCache,
     pub decoded_vocab: Option<std::sync::Arc<Vec<String>>>,
+    /// Model-lifetime shared n-gram-mod pool (`HIPFIRE_MTP_NGRAM`). Lazily created
+    /// (or replaced on config mismatch) by the serve path; starts `None` so every
+    /// `skeleton` construction site inherits the opt-in. Host-only — drops with
+    /// `LoadedModel` on unload. Future multi-slot serve must not share one pool
+    /// across concurrent slots without coordination beyond this `Mutex`.
+    pub ngram_mod_pool: Option<Arc<Mutex<NgramModPool>>>,
     pub model_path: String,
     /// The model's speculative-decode drafter+verifier, when a draft model is
     /// loaded (`Box<dyn Speculator>` so the daemon's decode loop is agnostic to
@@ -391,12 +405,15 @@ impl LoadedModel {
             pp_scratch_set: None,
             pp_dn_la_to_device: None,
             state: None,
+            qwen35_decode_batch: None,
+            lfm2_decode_batch: None,
             kv_cache: None,
             dn_state: None,
             qwen2_state: None,
             deepseek4_pbs: None,
             deepseek4_eos_tok: 0,
             minimax_eos_tok: 0,
+            qwen35_eos_tok: 0,
             mtp_mode: "auto".to_string(),
             mtp_k: 3,
             mtp_weights_present: false,
@@ -416,6 +433,7 @@ impl LoadedModel {
             prefill_checkpoints: Vec::new(),
             dflash_checkpoints: Vec::new(),
             decoded_vocab: None,
+            ngram_mod_pool: None,
             model_path,
             speculator: None,
             chat_template,
@@ -553,6 +571,11 @@ pub enum EpArch {
         weights: Vec<minimax::MiniMaxWeights>,
         state: Vec<minimax::MiniMaxState>,
         partials: Vec<rdna_compute::GpuTensor>,
+    },
+    Qwen35 {
+        config: hipfire_arch_qwen35::qwen35::Qwen35Config,
+        weights: Vec<hipfire_arch_qwen35::qwen35::Qwen35Weights>,
+        batch: Option<hipfire_arch_qwen35::qwen35::Qwen35DecodeBatchEpState>,
     },
 }
 
@@ -1516,6 +1539,59 @@ impl Drop for MinimaxEpStaging {
         }
     }
 }
+/// Staging guard for the Qwen3.5 EP load — mirror of `MinimaxEpStaging` with
+/// the Qwen weight types. Owns the `Gpus` orchestrator plus per-rank weights
+/// as they are built up. If the load fails mid-way (`?` early return, or the
+/// `HIPFIRE_EP_FAIL_RANK` fault), `Drop` explicitly frees every rank's VRAM
+/// on its owning device and drains each device's pool, so a failed EP load
+/// leaks NO VRAM and publishes NO partial object. On success the caller calls
+/// `into_parts()` to disarm the guard and move ownership into the `LoadedModel`.
+struct Qwen35EpStaging {
+    gpus: Option<Gpus>,
+    weights: Vec<qwen35::Qwen35Weights>,
+}
+
+impl Qwen35EpStaging {
+    fn new(gpus: Gpus) -> Self {
+        Self {
+            gpus: Some(gpus),
+            weights: Vec::new(),
+        }
+    }
+    fn gpus_mut(&mut self) -> &mut Gpus {
+        self.gpus.as_mut().expect("staging gpus taken")
+    }
+    fn into_parts(mut self) -> (Gpus, Vec<qwen35::Qwen35Weights>) {
+        let gpus = self.gpus.take().expect("into_parts called twice");
+        let weights = std::mem::take(&mut self.weights);
+        (gpus, weights)
+    }
+}
+
+impl Drop for Qwen35EpStaging {
+    fn drop(&mut self) {
+        let Some(mut gpus) = self.gpus.take() else {
+            return;
+        };
+        eprintln!(
+            "[loader] EP qwen35 load failed — freeing {} partially-loaded rank(s) (no VRAM leak)",
+            self.weights.len()
+        );
+        for (r, w) in self.weights.drain(..).enumerate() {
+            if let Some(dev) = gpus.devices.get_mut(r) {
+                let _ = dev.bind_thread();
+                w.free_gpu(dev);
+            }
+        }
+        for dev in gpus.devices.iter_mut() {
+            let _ = dev.bind_thread();
+            dev.invalidate_weight_caches();
+            dev.invalidate_graph_state();
+            dev.drain_pool();
+        }
+        let _ = gpus.free_tp_graph_signals();
+    }
+}
 
 /// Expert-parallel (EP) model load — shards the routed experts across `tp` ranks
 /// (`Gpus::init_tp` + per-arch sharded weight load), wrapped in a staging guard so
@@ -1591,8 +1667,9 @@ pub fn load_model_ep_with_kv_mode(
             resolve_deepseek4_compressor_cache_kv_mode(kv_mode)?,
         ),
         10 => load_model_ep_minimax(path, max_seq, tp),
+        5 | 6 => load_model_ep_qwen35(path, max_seq, tp),
         id => Err(format!(
-            "EP not supported for arch_id={id} (expected 9 for DeepSeek V4 or 10 for MiniMax)"
+            "EP not supported for arch_id={id} (expected 5|6 for Qwen3.5, 9 for DeepSeek V4 or 10 for MiniMax)"
         )),
     }
 }
@@ -1613,8 +1690,12 @@ pub fn load_model_ep_with_compressor_cache(
             load_model_ep_minimax(path, max_seq, tp)
         }
         10 => Err("DeepSeek V4 compressor-cache storage cannot be applied to MiniMax".to_string()),
+        5 | 6 if compressor_cache == hipfire_config::Deepseek4CompressorCache::F32 => {
+            load_model_ep_qwen35(path, max_seq, tp)
+        }
+        5 | 6 => Err("DeepSeek V4 compressor-cache storage cannot be applied to Qwen3.5".to_string()),
         id => Err(format!(
-            "EP not supported for arch_id={id} (expected 9 for DeepSeek V4 or 10 for MiniMax)"
+            "EP not supported for arch_id={id} (expected 5|6 for Qwen3.5, 9 for DeepSeek V4 or 10 for MiniMax)"
         )),
     }
 }
@@ -1977,6 +2058,113 @@ fn load_model_ep_minimax(path: &str, max_seq: usize, tp: usize) -> Result<Loaded
         )
     })
 }
+fn load_model_ep_qwen35(path: &str, max_seq: usize, tp: usize) -> Result<LoadedModel, String> {
+    use hipfire_runtime::tp_shard::{ExpertAssign, ShardConfig};
+
+    if tp != 4 {
+        return Err(format!(
+            "EP qwen35 requires tp=4, got tp={tp} (only 4×gfx1201 expert-parallel is supported)"
+        ));
+    }
+    let hfq_probe = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
+    if hfq_probe.arch_id != 5 && hfq_probe.arch_id != 6 {
+        return Err(format!(
+            "EP qwen35 requires arch 5 or 6, got {}",
+            hfq_probe.arch_id
+        ));
+    }
+    let tokenizer =
+        hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq_probe.metadata_json)
+            .map_err(|e| format!("tokenizer not found: {e}"))?;
+    let config = qwen35::config_from_hfq(&hfq_probe).map_err(|e| format!("qwen35 config: {e}"))?;
+    if config.paged_experts {
+        return Err("EP qwen35: paged_experts must be false".to_string());
+    }
+    if config.reap_keep.is_some() {
+        return Err("EP qwen35: REAP keep-map incompatible with EP".to_string());
+    }
+    if config.num_experts == 0 {
+        return Err("EP qwen35: config has no routed experts".to_string());
+    }
+    let arch_id = hfq_probe.arch_id;
+    let n_exp = config.num_experts;
+    let chat_template = resolve_chat_template(&hfq_probe, path);
+    let rec = hfq_probe.recommended_sampling();
+    let gpus = Gpus::init_tp(tp, config.n_layers).map_err(|e| format!("init_tp: {e:?}"))?;
+    let n = gpus.devices.len();
+    if n != tp {
+        return Err(format!(
+            "init_tp gave {n} devices, expected tp={tp} (check ROCR_VISIBLE_DEVICES / HIP_VISIBLE_DEVICES)"
+        ));
+    }
+    for (idx, dev) in gpus.devices.iter().enumerate() {
+        if !dev.arch_caps.is_gfx1201() {
+            return Err(format!(
+                "EP qwen35 requires all 4×gfx1201, rank {idx} is {}",
+                dev.arch.as_str()
+            ));
+        }
+    }
+    eprintln!(
+        "[loader] EP load: tp={tp} arch=qwen35 experts={n_exp} (rank r owns e%{tp}==r via Stride, replicated KV)"
+    );
+    let shard = ShardConfig::new(tp, true, n_exp, ExpertAssign::Stride)
+        .map_err(|e| format!("ShardConfig: {e:?}"))?;
+    let fail_rank = ep_fail_rank();
+    let _ = fail_rank;
+    let mut staging = Qwen35EpStaging::new(gpus);
+    for r in 0..n {
+        staging.gpus_mut().devices[r]
+            .bind_thread()
+            .map_err(|e| format!("bind {r}: {e:?}"))?;
+        let mut h = HfqFile::open(Path::new(path)).map_err(|e| format!("reopen rank {r}: {e}"))?;
+        let dev = &mut staging.gpus_mut().devices[r];
+        let w = qwen35::load_weights_ep_rank(&mut h, dev, &config, shard.clone(), r)
+            .map_err(|e| format!("shard load rank {r}: {e:?}"))?;
+        staging.weights.push(w);
+        if fail_rank == Some(r) {
+            return Err(format!(
+                "HIPFIRE_EP_FAIL_RANK={r}: synthetic qwen35 EP load failure after rank {r} (testing partial-load cleanup)"
+            ));
+        }
+    }
+    hipfire_runtime::ep::ensure_rank_streams(staging.gpus_mut())
+        .map_err(|e| format!("ensure_rank_streams: {e:?}"))?;
+    eprintln!(
+        "[loader] EP load complete: {n} ranks, peer access deferred until post-batch allocation"
+    );
+    let (gpus, weights) = staging.into_parts();
+    let eos_tok: u32 = {
+        let ids = tokenizer.encode("<|im_end|>");
+        if ids.len() == 1 {
+            ids[0]
+        } else {
+            config.eos_token
+        }
+    };
+    Ok(LoadedModel {
+        ep: Some(EpState {
+            gpus,
+            inner: EpArch::Qwen35 {
+                config,
+                weights,
+                batch: None,
+            },
+        }),
+        qwen35_eos_tok: eos_tok,
+        rec_temperature: rec.and_then(|r| r.temperature),
+        rec_top_p: rec.and_then(|r| r.top_p),
+        rec_top_k: rec.and_then(|r| r.top_k.map(|k| k as f32)),
+        ..LoadedModel::skeleton(
+            arch_id,
+            tokenizer,
+            max_seq,
+            max_seq,
+            path.to_string(),
+            chat_template,
+        )
+    })
+}
 
 /// Retry pending VMM arenas and refuse progress while any remain registered.
 pub fn ensure_vmm_ready_for_load(gpu: &mut rdna_compute::Gpu) -> Result<(), String> {
@@ -1999,6 +2187,7 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(
     // all-reduce buffer that would otherwise leak per load/unload cycle.)
     if let Some(ep) = m.ep.take() {
         let EpState { mut gpus, inner } = ep;
+        let mut ep_first_err: Option<String> = None;
         match inner {
             EpArch::Ds4 {
                 weights,
@@ -2057,6 +2246,23 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(
                     }
                 }
             }
+            EpArch::Qwen35 { weights, batch, .. } => {
+                if let Some(b) = batch {
+                    if let Err(e) = b.free_gpu(&mut gpus) {
+                        if ep_first_err.is_none() {
+                            ep_first_err = Some(e.to_string());
+                        }
+                    }
+                }
+                for (r, w) in weights.into_iter().enumerate() {
+                    if let Some(dev) = gpus.devices.get_mut(r) {
+                        let _ = dev.bind_thread();
+                        w.free_gpu(dev);
+                    } else if ep_first_err.is_none() {
+                        ep_first_err = Some(format!("unload qwen35: missing device for rank {r}"));
+                    }
+                }
+            }
         }
         for dev in gpus.devices.iter_mut() {
             let _ = dev.bind_thread();
@@ -2065,12 +2271,39 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(
             dev.drain_pool();
         }
         let _ = gpus.free_tp_graph_signals();
+        if let Some(batch_state) = m.lfm2_decode_batch.take() {
+            // Single-GPU dense LFM batch is not expected on EP, but free it on
+            // the provided single gpu before multi-device teardown to avoid
+            // leaking if staging ever leaves residual state.
+            batch_state.free_gpu(gpu);
+        }
+        if let Some(batch_state) = m.qwen35_decode_batch.take() {
+            // Single-GPU Qwen batch is not expected on EP, but free it on the
+            // provided single gpu before multi-device teardown to avoid leaking
+            // if staging ever leaves residual state.
+            batch_state.free_gpu(gpu);
+        }
         let _ = gpu;
+        if let Some(err) = ep_first_err {
+            return Err(err);
+        }
         return Ok(());
         // `gpus` drops here, tearing down comms + devices.
     }
     if m.pp > 1 {
         let mut gpus = m.pp_gpus.expect("pp>1 must carry pp_gpus");
+        if let Some(batch_state) = m.qwen35_decode_batch.take() {
+            // Single-GPU batch state is not expected for pp>1, but free it on
+            // the provided single gpu before multi-device teardown to avoid
+            // leaking if a test ever stages it.
+            batch_state.free_gpu(gpu);
+        }
+        if let Some(batch_state) = m.lfm2_decode_batch.take() {
+            // Single-GPU batch state is not expected for pp>1, but free it on
+            // the provided single gpu before multi-device teardown to avoid
+            // leaking if a test ever stages it.
+            batch_state.free_gpu(gpu);
+        }
         if let Some(scratch_set) = m.pp_scratch_set {
             scratch_set.free_gpu_multi(&mut gpus);
         }
@@ -2135,6 +2368,12 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(
     }
     for (_, snap) in m.dflash_checkpoints {
         snap.free_gpu(gpu);
+    }
+    if let Some(batch_state) = m.qwen35_decode_batch.take() {
+        batch_state.free_gpu(gpu);
+    }
+    if let Some(batch_state) = m.lfm2_decode_batch.take() {
+        batch_state.free_gpu(gpu);
     }
     // Free arch-specific GPU state from the carrier bundle
     if let Some(state) = m.state {
@@ -2236,8 +2475,7 @@ mod registry_tests {
         // implemented storage below F32 — a widening relative to what these
         // ask for. Only unrecognised strings still fail closed.
         for mode in [
-            "q8", "asym2", "asym3", "asym4", "fwht2", "fwht3", "fwht4", "turbo", "turbo3",
-            "turbo4",
+            "q8", "asym2", "asym3", "asym4", "fwht2", "fwht3", "fwht4", "turbo", "turbo3", "turbo4",
         ] {
             assert_eq!(
                 resolve_deepseek4_compressor_cache_kv_mode(Some(mode)).unwrap(),

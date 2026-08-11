@@ -134,6 +134,15 @@ struct QuantizeArgs {
     #[arg(long)]
     no_q8_conv1d: bool,
 
+    /// Let the FIXED tier (attention / lm_head / embed / router) follow
+    /// `--format` instead of being pinned to Q8F16. The fixed tier is ~66% of
+    /// per-token decode bytes on a3b, so pinning it at Q8 (1.0625 B/w) rather
+    /// than MQ4 (0.53125) doubles the dominant term — this is why `.mq2` reads
+    /// 45% MORE bytes/token than `.mq4r` despite being 7 GB smaller on disk.
+    /// Required to reproduce `.mq4r`.
+    #[arg(long)]
+    no_q8_router: bool,
+
     /// Disable K-map precision promotion.
     #[arg(long)]
     no_kmap: bool,
@@ -3046,6 +3055,28 @@ fn f32_to_fp16_bits(v: f32) -> u16 {
     sign | ((exp as u16) << 10) | m16
 }
 
+/// Lloyd's-algorithm iteration cap, shared by EVERY per-block Lloyd codebook fit
+/// (MQ2/MQ3/MQ4, plain / weighted / GPTQ).
+///
+/// **8, not 16.** History: `f8cd234` (2026-05-19) raised 8 → 16 on the strength of
+/// the `lloyd_iteration_headroom` synthetic probe (+0.4–0.9% MSE on heavy-tailed +
+/// sparse distributions). On 2026-05-20 a DeepSeek V4 re-quant at 16 iterations
+/// measured **60× worse wikitext2 PPL (758 vs 12)** against the byte-identical
+/// 8-iter build, and the plain path was reverted. The synthetic probe never
+/// captured FWHT-rotated MoE statistics — classic synth-win → prod-falsify.
+///
+/// The revert only landed on the plain arm. `quantize_mq2g256_lloyd_weighted` and
+/// `quantize_mq2g256_lloyd_gptq` were left at 16, each carrying a comment claiming
+/// it "matches the plain Lloyd path" — which was false. Any `--imatrix` build
+/// therefore silently took the falsified iteration count, confounding every
+/// calibration A/B with a known-bad knob. Hoisted to one constant so the three
+/// arms cannot drift again.
+///
+/// Do NOT raise this without first running wikitext2 PPL on a DeepSeek V4 build.
+/// Note the 8-vs-16 difference does NOT show up in block MSE (11.19% vs 11.15%) —
+/// it is a pathological-local-minimum effect, so MSE is not a valid gate for it.
+pub(crate) const LLOYD_MAX_ITER: usize = 8;
+
 /// MagnumQuant HFQ3-G256-Lloyd: per-block 8-entry fp16 codebook fitted via
 /// Lloyd's algorithm. 16 B header (8 fp16) + 96 B packed 3-bit indices = 112 B/group
 /// (vs uniform MQ3's 104 B — only +7.7% bandwidth). Direct extension of MQ2-Lloyd
@@ -3574,10 +3605,10 @@ fn quantize_mq2g256_lloyd_weighted(
             let range = sorted[255] - sorted[0];
             let mut indices = [0u8; 256];
             if range > 0.0 {
-                // 16-iter cap matches the plain Lloyd path; per the
-                // lloyd_iteration_headroom probe, this reaches the MSE
-                // plateau on heavy-tailed + sparse distributions.
-                let max_iter = 16;
+                // Shared with the plain + GPTQ arms — see LLOYD_MAX_ITER. This
+                // arm ran 16 until 2026-08-04 while claiming to match the plain
+                // path, which had been reverted to 8 on 2026-05-20.
+                let max_iter = LLOYD_MAX_ITER;
                 let mut prev_assignments = [0u8; 256];
                 for it in 0..max_iter {
                     // Weighted centroid update: cb[k] = sum_{i in k} w_i * v_i / sum_{i in k} w_i.
@@ -3766,8 +3797,8 @@ fn quantize_mq2g256_lloyd_gptq_with_damping(
             ];
             let range = sorted[255] - sorted[0];
             if range > 0.0 {
-                // 16-iter cap matches plain Lloyd; see lloyd_iteration_headroom.
-                let max_iter = 16;
+                // Shared with the plain + weighted arms — see LLOYD_MAX_ITER.
+                let max_iter = LLOYD_MAX_ITER;
                 let mut prev_assignments = [0u8; 256];
                 for it in 0..max_iter {
                     let mut weighted_sums = [0.0f64; 4];
@@ -3925,7 +3956,10 @@ pub(crate) fn quantize_mq2g256_lloyd(f32_data: &[f32], signs1: &[f32], signs2: &
                 // a real-model coherence-gated sweep validates a different
                 // value. Do NOT raise this back to 16 (or higher) without
                 // running wikitext2 PPL on a DeepSeek V4 build first.
-                let max_iter = 8;
+                //
+                // 2026-08-04: hoisted to LLOYD_MAX_ITER (see its doc comment) so
+                // the weighted + GPTQ arms cannot silently diverge again.
+                let max_iter = LLOYD_MAX_ITER;
                 let mut prev_assignments = [0u8; 256];
                 for it in 0..max_iter {
                     let mut sums = [0.0f64; 4];
@@ -4164,6 +4198,200 @@ fn dequantize_mq2g256_lloyd_to_f32(
             cpu_inv_fwht_256(&mut group, signs1, signs2);
             let actual = out_chunk.len();
             out_chunk.copy_from_slice(&group[..actual]);
+        });
+    out
+}
+
+/// MQ2-GL ("global Lloyd") round-trip: quantize → dequantize, returning weights
+/// in the ORIGINAL (unrotated) basis. Same pipeline as
+/// `quantize_mq2g256_lloyd` + `dequantize_mq2g256_lloyd_to_f32`, except the
+/// per-block 4-entry fitted codebook is replaced by ONE tensor-global codebook
+/// plus a per-block fp16 scale.
+///
+/// The codebook is the textbook Lloyd–Max optimum for a unit Gaussian. That is
+/// not an approximation of convenience: post-FWHT blocks are Gaussian by CLT,
+/// and fitting a global codebook on 28.3M real a3b expert weights reproduces
+/// these levels to three decimals (measured 2026-08-04, see
+/// docs/investigations/2026-08-04-a3b-lowbit-quality.md §5c).
+///
+/// Cost/benefit on those same real weights: +2.35% NRMSE for −0.1875 bpw
+/// (72 B/group → 64 B payload + 2 B scale).
+///
+/// Used by `--format mq4-mq2glexp`, the GL twin of `mq4-mq2lloydexp`: it injects
+/// the GL codec's noise and re-packs as HFQ4G256 so the file loads on today's
+/// runtime with no engine, loader, or kernel changes. Both probes land in the
+/// same HFQ4 container, so a KLD delta between them isolates the codec.
+fn mq2g256gl_roundtrip_f32(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<f32> {
+    /// Lloyd–Max levels for a unit Gaussian at 2 bit.
+    const CB: [f32; 4] = [-1.5104, -0.4528, 0.4528, 1.5104];
+    let group_size = 256;
+    let n = f32_data.len();
+    let mut out = vec![0.0f32; n];
+    use rayon::prelude::*;
+    out.par_chunks_mut(group_size)
+        .enumerate()
+        .for_each(|(b, out_chunk)| {
+            let start = b * group_size;
+            let end = (start + group_size).min(n);
+            let actual = end - start;
+
+            let mut group = [0.0f32; 256];
+            group[..actual].copy_from_slice(&f32_data[start..end]);
+            cpu_fwht_256(&mut group, signs1, signs2);
+
+            // Per-block scale, rounded through fp16 exactly as the on-disk
+            // format would store it.
+            let ss: f64 = group.iter().map(|v| (*v as f64) * (*v as f64)).sum();
+            let rms = (ss / 256.0).sqrt() as f32;
+            let scale = if rms > 0.0 {
+                f16_to_f32(f32_to_fp16_bits(rms))
+            } else {
+                0.0
+            };
+            let inv = if scale > 0.0 { 1.0 / scale } else { 0.0 };
+
+            for v in group.iter_mut() {
+                let z = *v * inv;
+                let mut best = 0usize;
+                let mut best_d = (z - CB[0]).abs();
+                for (k, &c) in CB.iter().enumerate().skip(1) {
+                    let d = (z - c).abs();
+                    if d < best_d {
+                        best_d = d;
+                        best = k;
+                    }
+                }
+                *v = scale * CB[best];
+            }
+
+            cpu_inv_fwht_256(&mut group, signs1, signs2);
+            let take = out_chunk.len();
+            out_chunk.copy_from_slice(&group[..take]);
+        });
+    out
+}
+
+/// Lloyd–Max optimal reconstruction levels for a unit Gaussian.
+/// 2-bit MSE = 0.1175, 3-bit MSE = 0.03454 — both reproduced to 3 decimals by
+/// fitting on 28.3M real a3b post-FWHT expert weights (2026-08-04).
+pub(crate) const GL_CB2: [f32; 4] = [-1.5104, -0.4528, 0.4528, 1.5104];
+pub(crate) const GL_CB3: [f32; 8] = [
+    -2.1520, -1.3439, -0.7560, -0.2451, 0.2451, 0.7560, 1.3439, 2.1520,
+];
+
+/// Encode one FWHT-rotated 256-block against a global codebook.
+/// Returns the fp16-rounded per-block scale and writes indices into `idx`.
+#[inline]
+fn gl_encode_block(group: &[f32; 256], cb: &[f32], idx: &mut [u8; 256]) -> u16 {
+    let ss: f64 = group.iter().map(|v| (*v as f64) * (*v as f64)).sum();
+    let rms = (ss / 256.0).sqrt() as f32;
+    let sbits = f32_to_fp16_bits(rms);
+    let scale = f16_to_f32(sbits);
+    let inv = if scale > 0.0 { 1.0 / scale } else { 0.0 };
+    for (i, v) in group.iter().enumerate() {
+        let z = *v * inv;
+        let mut best = 0usize;
+        let mut best_d = (z - cb[0]).abs();
+        for (k, &c) in cb.iter().enumerate().skip(1) {
+            let d = (z - c).abs();
+            if d < best_d {
+                best_d = d;
+                best = k;
+            }
+        }
+        idx[i] = best as u8;
+    }
+    sbits
+}
+
+/// MQ2-G256-GL: 2-bit codes vs one tensor-global codebook + per-block fp16
+/// scale, structure-of-arrays. 2.0625 bpw.
+///
+/// Layout: `[m*gpr*64 B packed indices][m*gpr*2 B fp16 scales]`, both regions
+/// row-major in (row, group). Index packing matches MQ2-Lloyd (4 codes/byte,
+/// little-endian) so the GEMV decode path is unchanged apart from where the
+/// codebook comes from. `k` must be a multiple of 256.
+pub(crate) fn quantize_mq2g256gl(
+    f32_data: &[f32],
+    m: usize,
+    k: usize,
+    signs1: &[f32],
+    signs2: &[f32],
+) -> Vec<u8> {
+    assert_eq!(k % 256, 0, "MQ2GL: K must be a multiple of 256 (got {k})");
+    let gpr = k / 256;
+    let idx_bytes = m * gpr * 64;
+    let mut out = vec![0u8; idx_bytes + m * gpr * 2];
+    let (idx_region, scale_region) = out.split_at_mut(idx_bytes);
+    use rayon::prelude::*;
+    idx_region
+        .par_chunks_mut(gpr * 64)
+        .zip(scale_region.par_chunks_mut(gpr * 2))
+        .enumerate()
+        .for_each(|(row, (row_idx, row_scale))| {
+            for g in 0..gpr {
+                let start = row * k + g * 256;
+                let mut group = [0.0f32; 256];
+                group.copy_from_slice(&f32_data[start..start + 256]);
+                cpu_fwht_256(&mut group, signs1, signs2);
+                let mut codes = [0u8; 256];
+                let sbits = gl_encode_block(&group, &GL_CB2, &mut codes);
+                let base = g * 64;
+                for b in 0..64 {
+                    row_idx[base + b] = codes[4 * b]
+                        | (codes[4 * b + 1] << 2)
+                        | (codes[4 * b + 2] << 4)
+                        | (codes[4 * b + 3] << 6);
+                }
+                row_scale[g * 2] = (sbits & 0xFF) as u8;
+                row_scale[g * 2 + 1] = (sbits >> 8) as u8;
+            }
+        });
+    out
+}
+
+/// MQ3-G256-GL: 3-bit sibling of `quantize_mq2g256gl`. 3.0625 bpw.
+/// 96 B of indices per group — 8 codes packed into every 3 bytes,
+/// little-endian bitstream (same convention as HFQ3-G256).
+pub(crate) fn quantize_mq3g256gl(
+    f32_data: &[f32],
+    m: usize,
+    k: usize,
+    signs1: &[f32],
+    signs2: &[f32],
+) -> Vec<u8> {
+    assert_eq!(k % 256, 0, "MQ3GL: K must be a multiple of 256 (got {k})");
+    let gpr = k / 256;
+    let idx_bytes = m * gpr * 96;
+    let mut out = vec![0u8; idx_bytes + m * gpr * 2];
+    let (idx_region, scale_region) = out.split_at_mut(idx_bytes);
+    use rayon::prelude::*;
+    idx_region
+        .par_chunks_mut(gpr * 96)
+        .zip(scale_region.par_chunks_mut(gpr * 2))
+        .enumerate()
+        .for_each(|(row, (row_idx, row_scale))| {
+            for g in 0..gpr {
+                let start = row * k + g * 256;
+                let mut group = [0.0f32; 256];
+                group.copy_from_slice(&f32_data[start..start + 256]);
+                cpu_fwht_256(&mut group, signs1, signs2);
+                let mut codes = [0u8; 256];
+                let sbits = gl_encode_block(&group, &GL_CB3, &mut codes);
+                let base = g * 96;
+                // 8 codes × 3 bits = 24 bits = 3 bytes.
+                for c in 0..32 {
+                    let mut acc: u32 = 0;
+                    for j in 0..8 {
+                        acc |= ((codes[8 * c + j] & 0x7) as u32) << (3 * j);
+                    }
+                    row_idx[base + 3 * c] = (acc & 0xFF) as u8;
+                    row_idx[base + 3 * c + 1] = ((acc >> 8) & 0xFF) as u8;
+                    row_idx[base + 3 * c + 2] = ((acc >> 16) & 0xFF) as u8;
+                }
+                row_scale[g * 2] = (sbits & 0xFF) as u8;
+                row_scale[g * 2 + 1] = (sbits >> 8) as u8;
+            }
         });
     out
 }
@@ -4607,6 +4835,22 @@ pub(crate) enum QuantType {
     MFP4G32E8 = 34, // mfp4-E8: mfp4+P container (E4M3 block scale, NO prefix, same row_bytes)
     // with the 32 E2M1 nibbles replaced by 4x32-bit E8-lattice codewords
     // (8 weights/codeword, QUANT_STEP=0.88). 4.25 bpw, FWHT rotation.
+    // MQ*-GL ("global Lloyd"): N-bit codes against ONE tensor-global codebook
+    // plus a per-block fp16 scale, in structure-of-arrays layout:
+    //     [0 .. M*gpr*P)                  packed N-bit indices, P B/group
+    //     [M*gpr*P .. +M*gpr*2)           fp16 per-block scales
+    // vs the per-block Lloyd formats (qt 19/20), which interleave a fitted
+    // 2^N-entry fp16 codebook into every group.
+    //
+    // Rationale (measured 2026-08-04, docs/investigations/2026-08-04-a3b-lowbit-quality.md):
+    // post-FWHT blocks are Gaussian by CLT, so the optimal LEVEL SHAPE is the
+    // same in every block — a per-block fit re-derives it ~4000x per tensor and
+    // differs only by scale. Fitting a global codebook on 28.3M real a3b expert
+    // weights reproduces the textbook Lloyd-Max Gaussian levels to 3 decimals.
+    // Cost on real weights: +2.35% NRMSE / +1.16% end-to-end KLD, for -0.1875 bpw
+    // (MQ2) — and the group base becomes naturally aligned (64 B vs 72 B stride).
+    MQ2G256GL = 38, // 2-bit + global codebook: 64 B idx/group + 2 B scale = 2.0625 bpw
+    MQ3G256GL = 39, // 3-bit + global codebook: 96 B idx/group + 2 B scale = 3.0625 bpw
     MFP4G32E8SOA = 35, // mfp4-E8 SoA: same E8 data as qt=34 but in structure-of-arrays layout.
     // [16B hdr] + [n_blocks B E4M3 scales, pad 16B] + [n_blocks*16B codewords].
     MFP3G32E8 = 36, // mfp3-E8: MFP4G32E8 frame, 3-bit lattice (center 3), 13 B/blk, 3.25 bpw.
@@ -5265,21 +5509,101 @@ mod mq2rxt_recipe_tests {
 /// For mixed quant: should this tensor be Q8 (fast) or Q4 (compressed)?
 /// Q8: attention weights, embeddings, lm_head (need occupancy)
 /// Q4: FFN weights (bulk of model, benefits from compression)
-fn is_q8_tensor(name: &str) -> bool {
-    name.contains("self_attn") || name.contains("attn_q") || name.contains("attn_k")
-        || name.contains("attn_v") || name.contains("attn_output")
-        || name.contains("q_proj") || name.contains("k_proj")
-        || name.contains("v_proj") || name.contains("o_proj")
-        || name.contains("embed") || name.contains("lm_head")
+/// Which fixed-tier classes a tensor belongs to, for `HIPFIRE_Q8_CLASSES`.
+/// Ordered cheapest-to-keep first by measured per-token bytes on a3b:
+/// router+gate 11.1 MB, lm_head 270 MB, attention 682 MB (of a 1031 MB fixed
+/// tier at MQ4). Attention is 66% of the fixed tier, lm_head 26%.
+fn q8_class_of(name: &str) -> Option<&'static str> {
+    if name.contains("lm_head") {
+        Some("lm_head")
+    } else if name.contains("embed") {
+        Some("embed")
+    } else if name.ends_with("mlp.gate.weight") || name.ends_with("mlp.shared_expert_gate.weight") {
+        Some("router")
+    } else if name.contains("self_attn")
+        || name.contains("attn_q")
+        || name.contains("attn_k")
+        || name.contains("attn_v")
+        || name.contains("attn_output")
+        || name.contains("q_proj")
+        || name.contains("k_proj")
+        || name.contains("v_proj")
+        || name.contains("o_proj")
         // Qwen3.5 DeltaNet attention
         || name.contains("linear_attn")
-        // Qwen3.5-MoE: the router (`mlp.gate.weight`, hidden_size × num_experts)
-        // is small but precision-sensitive — flat-routing on a quantized router
-        // shifts which experts a token sees. Same for the per-layer scalar
-        // `mlp.shared_expert_gate.weight` that scales the shared expert. Keep
-        // both at Q8 even in Q4-bulk modes.
-        || name.ends_with("mlp.gate.weight")
-        || name.ends_with("mlp.shared_expert_gate.weight")
+    {
+        Some("attn")
+    } else {
+        None
+    }
+}
+
+/// Fixed-tier tensors held at Q8F16 regardless of `--format`.
+///
+/// `HIPFIRE_Q8_CLASSES=<comma list>` narrows this to a subset of
+/// {`lm_head`, `embed`, `router`, `attn`} — the lever for attributing which
+/// fixed class actually carries the quality. Measured 2026-08-04: dropping the
+/// WHOLE fixed tier Q8 -> MQ4 costs **+35.2% KLD** (0.1742 -> 0.2356) while
+/// buying 1.75x decode speed, so the tier is emphatically not free — but the
+/// +35% is unattributed across classes whose byte costs differ by 25x.
+/// `--no-q8-router` (all classes off) still wins if both are set.
+///
+/// Note the router (`mlp.gate.weight`) is small but precision-sensitive —
+/// flat-routing on a quantized router shifts which experts a token sees — so
+/// prefer keeping `router` in the set unless you are explicitly testing it.
+fn is_q8_tensor(name: &str) -> bool {
+    let Some(class) = q8_class_of(name) else {
+        return false;
+    };
+    // A class named in HIPFIRE_FIXED_TIER is held above --format even if it is
+    // not in HIPFIRE_Q8_CLASSES — it just lands on the named dtype instead of Q8.
+    if fixed_tier_dtype_for(name).is_some() {
+        return true;
+    }
+    match std::env::var("HIPFIRE_Q8_CLASSES") {
+        Ok(list) => list.split(',').any(|c| c.trim() == class),
+        Err(_) => true,
+    }
+}
+
+/// `HIPFIRE_FIXED_TIER=lm_head:mfp4e8soa,attn:mq4` — per-class dtype for the
+/// fixed tier. Returns the dtype token for `name`'s class, or `None` to fall
+/// back to Q8F16 (the historic behaviour).
+///
+/// Accepted dtypes: `q8`, `mq4`, `mq3l`, `mfp4e8`, `mfp4e8soa`. Accepted
+/// classes: `lm_head`, `embed`, `router`, `attn` (see `q8_class_of`).
+fn fixed_tier_dtype_for(name: &str) -> Option<&'static str> {
+    let class = q8_class_of(name)?;
+    let spec = std::env::var("HIPFIRE_FIXED_TIER").ok()?;
+    for entry in spec.split(',') {
+        // NOT `?` — a `?` here aborts the whole lookup on the FIRST malformed
+        // entry and silently returns None, i.e. every class quietly falls back
+        // to Q8 and the encode looks like it worked. Fail loudly instead.
+        let Some((c, d)) = entry.split_once(':') else {
+            eprintln!(
+                "error: HIPFIRE_FIXED_TIER: malformed entry '{entry}' \
+                 (expected <class>:<dtype>, e.g. attn:mfp4e8soa)"
+            );
+            std::process::exit(2);
+        };
+        if c.trim() == class {
+            return match d.trim() {
+                "mfp4e8soa" => Some("mfp4e8soa"),
+                "mfp4e8" => Some("mfp4e8"),
+                "mq4" => Some("mq4"),
+                "mq3l" => Some("mq3l"),
+                "q8" => None, // explicit q8 == default
+                other => {
+                    eprintln!(
+                        "error: HIPFIRE_FIXED_TIER: unknown dtype '{other}' \
+                         (expected q8|mq4|mq3l|mfp4e8|mfp4e8soa)"
+                    );
+                    std::process::exit(2);
+                }
+            };
+        }
+    }
+    None
 }
 
 /// Qwen3.5 DeltaNet conv1d weight: `{prefix}.linear_attn.conv1d.weight`,
@@ -7499,12 +7823,19 @@ fn main() {
                 "MQ4" => QuantType::MQ4G256,
                 "MQ3L" => QuantType::MQ3G256Lloyd,
                 "MQ2L" => QuantType::MQ2G256Lloyd,
+                // GL = global codebook (one per tensor, shipped as kernel scalar
+                // args) + per-block fp16 scale, SoA. 2.0625 / 3.0625 bpw vs the
+                // per-block Lloyd family's 2.25 / 3.5 -- 0.1875 bpw cheaper for a
+                // measured +1.16% KLD and -0.08% decode. DECODE-ONLY: no grouped
+                // or batched GL kernels exist, so a GL model prefills per-token.
+                "MQ2GL" => QuantType::MQ2G256GL,
+                "MQ3GL" => QuantType::MQ3G256GL,
                 "E8" | "MFP4E8" | "MFP4G32E8" => QuantType::MFP4G32E8,
                 "MFP3E8" | "MFP3G32E8" => QuantType::MFP3G32E8,
                 "MFP2E8" | "MFP2G32E8" => QuantType::MFP2G32E8,
                 other => {
                     eprintln!(
-                        "error: {path}:{}: unknown dtype '{}' (expected MQ6/MQ4/MQ3L/MQ2L/E8/MFP3E8/MFP2E8)",
+                        "error: {path}:{}: unknown dtype '{}' (expected MQ6/MQ4/MQ3L/MQ2L/MQ2GL/MQ3GL/E8/MFP3E8/MFP2E8)",
                         lineno + 1,
                         other
                     );
@@ -7532,6 +7863,24 @@ fn main() {
     let use_mq4_mq2lloydexp = format == "mq4-mq2lloydexp"
         || format == "mq4-mq2lloydexperts"
         || format == "mq4-mq2lloyd-exp";
+    // GL twin of the probe above: identical pipeline, but routed experts go
+    // through the GLOBAL-codebook codec (one tensor-wide Lloyd–Max Gaussian
+    // codebook + per-block fp16 scale) instead of a per-block fitted codebook.
+    // Ships as HFQ4G256 exactly like `mq4-mq2lloydexp`, so both probes land in
+    // the same container and a KLD delta between them isolates the codec —
+    // no engine, loader, or kernel changes on either arm.
+    let use_mq4_mq2glexp =
+        format == "mq4-mq2glexp" || format == "mq4-mq2glexperts" || format == "mq4-mq2gl-exp";
+    if use_mq4_mq2glexp {
+        eprintln!(
+            "note: --format mq4-mq2glexp is a quality probe — routed MoE experts\n\
+             go through the GLOBAL-codebook 2-bit codec (one tensor-wide\n\
+             Lloyd–Max Gaussian codebook + per-block fp16 scale) round-trip\n\
+             (quantize → dequantize) and ship as HFQ4G256. Identical container\n\
+             to --format mq4-mq2lloydexp, so a KLD delta between the two\n\
+             isolates the codec. No engine/loader/kernel changes on either arm."
+        );
+    }
     if use_mq4_mq2lloydexp {
         eprintln!(
             "note: --format mq4-mq2lloydexp is a quality probe — routed MoE\n\
@@ -7618,6 +7967,32 @@ fn main() {
     // MQ-family: 2-bit on gate_up, 3-bit on down.
     let use_mq4_mqlloyd_antirez =
         format == "mq4-mqlloyd-antirez" || format == "mq4-mqlloyd-asym" || format == "antirez-mq";
+    // HIPFIRE_ROUTED_GL=1: keep the per-projection bit allocation but swap the
+    // per-block fp16 codebook for a GLOBAL one (qt=38/39). Post-FWHT blocks are
+    // Gaussian by CLT, so the optimal LEVEL SHAPE is identical in every block and
+    // a per-block fit re-derives it ~4000x per tensor, differing only by scale —
+    // which the fp16 per-block scale already carries. Costs 0.1875 bpw less
+    // (2.0625/3.0625 vs 2.25/3.5) for a measured +1.16% KLD and -0.08% decode.
+    //
+    // DECODE-ONLY: GL ships five kernels, all single-token indexed MoE GEMVs
+    // (gemv_mq{2,3}g256gl_moe_{gate_up,down}_indexed + the sym gate_up). There
+    // is no grouped-WMMA GEMM and no batched indexed GEMV for the SoA
+    // global-codebook layout, and the merged dtype-tag kernel has no GL branch,
+    // so a GL model still takes the per-token prefill path. The per-block Lloyd
+    // pair does NOT: MQ2G256Lloyd / MQ3G256Lloyd both have grouped-WMMA GEMMs on
+    // gfx11 and gfx12 and are batched-prefill admissible. Choosing GL therefore
+    // trades ~0.19 bpw against prefill throughput, not just KLD.
+    let routed_gl = std::env::var("HIPFIRE_ROUTED_GL").ok().as_deref() == Some("1");
+    if routed_gl {
+        eprintln!(
+            "note: HIPFIRE_ROUTED_GL=1 — routed experts ship the GLOBAL-codebook\n\
+             variants (MQ2G256GL qt=38 / MQ3G256GL qt=39) instead of the per-block\n\
+             Lloyd ones. Decode-only: batched prefill rejects GL (no grouped-WMMA\n\
+             kernel exists for the SoA layout), so prefill runs the per-token\n\
+             fallback. The per-block Lloyd pair DOES batch — prefer it when\n\
+             prefill throughput matters."
+        );
+    }
     // Lever 2: same recipe as antirez but with sequential-GPTQ Lloyd
     // on the gate_up_proj path instead of plain imatrix-weighted Lloyd.
     // Aims to reduce attractor risk at 2 bpw — if successful, opens path
@@ -7957,6 +8332,7 @@ fn main() {
             == Some("1");
     if (use_mq2g256_lloyd
         || use_mq4_mq2lloydexp
+        || use_mq4_mq2glexp
         || use_mq4_mq2lloyd_native
         || use_mq4_mq2lloyd_kmap
         || use_mq4_mq2lloyd_imatrix
@@ -8157,8 +8533,30 @@ fn main() {
     // the hipfire loader looks them up.
     let is_minimax = arch_id == 10;
     let is_moe_like = is_moe || is_deepseek4 || is_lfm2moe || is_minimax || is_cohere2moe;
-    // Q8 router: always on for MoE-class models.
-    let q8_router = is_moe_like || q8_router_flag;
+    // Q8 "router" — a misnomer: `is_q8_tensor` covers the whole FIXED tier
+    // (attention q/k/v/o, linear_attn projections, conv1d, lm_head, embed, and
+    // the MoE router), not just `mlp.gate.weight`. On for MoE-class models by
+    // default, since the fixed tier is quality-critical and cheap relative to
+    // the routed experts *by parameter count*.
+    //
+    // `--no-q8-router` restores the historic opt-out. It matters far more than
+    // the name suggests: the fixed tier is **66% of per-token decode bytes** on
+    // a3b (mq4r: 1030.8 MB fixed vs 534.8 MB routed), so forcing it to Q8
+    // (1.0625 B/w) instead of MQ4 (0.53125 B/w) doubles the dominant term. That
+    // is why `.mq2` reads 45% MORE bytes/token than `.mq4r` despite being 7 GB
+    // smaller on disk, and why `.mq4r` — which needs this flag off — is not
+    // byte-reproducible from HEAD without it.
+    let no_q8_router_flag = args.no_q8_router
+        || std::env::var("HIPFIRE_NO_Q8_ROUTER").ok().as_deref() == Some("1");
+    let q8_router = (is_moe_like || q8_router_flag) && !no_q8_router_flag;
+    if no_q8_router_flag {
+        eprintln!(
+            "note: --no-q8-router — the fixed tier (attention / lm_head / router /\n\
+             embed / conv1d) follows --format instead of being forced to Q8F16.\n\
+             This is the mq4r recipe and the lever for a sub-MQ4 fixed tier;\n\
+             embed_tokens still stays Q8 via its own arm."
+        );
+    }
     if is_moe {
         eprintln!("  MoE detected — will split 3D expert tensors per-expert before quantization.");
     }
@@ -9868,6 +10266,8 @@ fn main() {
             // noise specifically on the routed-expert tensors, so even
             // K-map "Promote6" experts get the MQ2-Lloyd round-trip here.
             let expert_mq2lloyd_roundtrip = use_mq4_mq2lloydexp && supports_g256;
+            // GL twin — same "always hits routed experts" intent as above.
+            let expert_mq2gl_roundtrip = use_mq4_mq2glexp && supports_g256;
             // Native MQ2-Lloyd: ship qt=19 bytes directly, no round-trip.
             // Requires runtime support for DType::MQ2G256Lloyd on experts.
             // For -native (no kmap respect): always MQ2-Lloyd on every expert.
@@ -9990,6 +10390,10 @@ fn main() {
                 && !expert_mq3lloyd_native
                 && !expert_mq2lloyd_native
                 && !expert_mq2lloyd_roundtrip
+                // GL twin of the line above. Without it, `--format mq4-mq2glexp
+                // --awq --imatrix` takes the AWQ arm and the GL codec never runs,
+                // so the probe silently measures AWQ-MQ4 instead of GL.
+                && !expert_mq2gl_roundtrip
                 && !expert_mq6
                 && !expert_hfq6
                 && !expert_hfq4;
@@ -10124,6 +10528,25 @@ fn main() {
                                 QuantType::MQ2G256Lloyd,
                                 256u32,
                             ),
+                            // GL = GLOBAL codebook: one codebook for the whole tensor
+                            // (GL_CB2/GL_CB3, passed to the kernel as scalar args) plus a
+                            // per-block fp16 scale, in a two-region SoA blob. Saves the
+                            // 0.1875 bpw the per-block fp16 codebook costs — measured at
+                            // +1.16% KLD and -0.08% decode, i.e. size for free.
+                            //
+                            // NOTE these take the 2D (m, k) form like the E8 encoders, NOT
+                            // the flat form the Lloyd ones use — the SoA layout needs the
+                            // row count to place the scale region.
+                            QuantType::MQ2G256GL => (
+                                quantize_mq2g256gl(&f32_slice, inner_m, inner_k_e, &signs1, &signs2),
+                                QuantType::MQ2G256GL,
+                                256u32,
+                            ),
+                            QuantType::MQ3G256GL => (
+                                quantize_mq3g256gl(&f32_slice, inner_m, inner_k_e, &signs1, &signs2),
+                                QuantType::MQ3G256GL,
+                                256u32,
+                            ),
                             // T3-3L-E8 experiment: mfp4-E8 mid tier (4.25 bpw,
                             // MQ6-class quality) in place of MQ4. group_size 32.
                             QuantType::MFP4G32E8 => (
@@ -10235,9 +10658,23 @@ fn main() {
                                 256u32,
                             )
                         }
+                    } else if expert_mq3lloyd_native && routed_gl {
+                        // GL swap: same 3-bit allocation, global codebook instead of
+                        // a per-block fp16 one. 3.0625 vs 3.5 bpw.
+                        let q = quantize_mq3g256gl(&f32_slice, inner_m, inner_k_e, &signs1, &signs2);
+                        (q, QuantType::MQ3G256GL, 256u32)
                     } else if expert_mq3lloyd_native {
                         let q = quantize_mq3g256_lloyd(&f32_slice, &signs1, &signs2);
                         (q, QuantType::MQ3G256Lloyd, 256u32)
+                    } else if expert_mq2lloyd_native && routed_gl {
+                        // GL swap: 2.0625 vs 2.25 bpw. NOTE the imatrix-weighted and
+                        // GPTQ arms below are DELIBERATELY not mirrored here — the
+                        // weighted fit is provably inert after the FWHT (every
+                        // R[i][j]^2 = 1/256, so a rotated diagonal importance vector
+                        // is constant), so plain Lloyd is the honest baseline and
+                        // there is nothing to lose by taking it.
+                        let q = quantize_mq2g256gl(&f32_slice, inner_m, inner_k_e, &signs1, &signs2);
+                        (q, QuantType::MQ2G256GL, 256u32)
                     } else if expert_mq2lloyd_native {
                         // Native MQ2-Lloyd: ship qt=19 bytes (72 B / 256 weights).
                         // Selection order:
@@ -10273,6 +10710,15 @@ fn main() {
                             &signs1,
                             &signs2,
                         );
+                        let q = quantize_hfq4g256(&dequant);
+                        (q, QuantType::HFQ4G256, 256u32)
+                    } else if expert_mq2gl_roundtrip {
+                        // MQ2-GL → F32 → HFQ4 round-trip. Identical to the arm
+                        // above except the 2-bit step uses ONE tensor-global
+                        // codebook + per-block fp16 scale rather than a
+                        // per-block fitted codebook. Same HFQ4G256 output, so
+                        // the two arms differ ONLY in the injected codec noise.
+                        let dequant = mq2g256gl_roundtrip_f32(&f32_slice, &signs1, &signs2);
                         let q = quantize_hfq4g256(&dequant);
                         (q, QuantType::HFQ4G256, 256u32)
                     } else if expert_mq5 || down_mq5 {
@@ -10657,6 +11103,7 @@ fn main() {
                     if (use_mq4g256
                         || use_mq4_mq6exp
                         || use_mq4_mq2lloydexp
+                        || use_mq4_mq2glexp
                         || use_mq4_mq2lloyd_native
                         || use_mq4_mq2lloyd_kmap
                         || use_mq4_mq2lloyd_imatrix
@@ -10987,13 +11434,56 @@ fn main() {
                             (q, QuantType::Q8F16, 32u32, "Q8_F16")
                         }
                     } else if q8_router && is_q8_tensor(name) {
-                        // Q8 router for MoE: keep mlp.gate.weight and
-                        // shared_expert_gate.weight at Q8 regardless of --format.
-                        let q = quantize_q8f16(&f32_data);
-                        (q, QuantType::Q8F16, 32u32, "Q8_F16")
+                        // Fixed tier (attention / lm_head / embed / router) held above
+                        // --format. Default Q8F16; `HIPFIRE_FIXED_TIER=<class>:<dtype>`
+                        // overrides per class — the bit-allocation lever.
+                        //
+                        // Why this matters: the fixed tier is 66% of per-token decode
+                        // bytes on a3b, and dropping the WHOLE tier Q8 -> MQ4 measured
+                        // +35.2% KLD (0.1742 -> 0.2356) for 1.75x speed. MFP4G32E8SOA
+                        // is the interesting middle: ~same bytes as MQ4 (4.3 vs 4.25
+                        // bpw) but E8 lattice VQ instead of scalar affine, and it is
+                        // already dispatchable for lm_head (plain GEMV, gemv_table.rs
+                        // registers it Plain + Prerotated). NOTE it is NOT a whole-tier
+                        // replacement: FusedQkvza's E8 arm is gfx1151-decode-only and
+                        // there is no E8 residual GEMV for o_proj.
+                        match fixed_tier_dtype_for(name) {
+                            Some(dt) => {
+                                // Canonical FWHT sign seeds — identical to every other
+                                // rotated encoder, so bytes match `--format <tier>`.
+                                let s1 = gen_fwht_signs(42, 256);
+                                let s2 = gen_fwht_signs(1042, 256);
+                                let m = meta.shape[0];
+                                let k = meta.shape[1];
+                                match dt {
+                                    "mfp4e8soa" => {
+                                        let q =
+                                            quantize_mfp4g32_e8_soa_2d(&f32_data, m, k, &s1, &s2);
+                                        (q, QuantType::MFP4G32E8SOA, 32u32, "MFP4G32E8SOA")
+                                    }
+                                    "mfp4e8" => {
+                                        let q = quantize_mfp4g32_e8_2d(&f32_data, m, k, &s1, &s2);
+                                        (q, QuantType::MFP4G32E8, 32u32, "MFP4G32E8")
+                                    }
+                                    "mq3l" => {
+                                        let q = quantize_mq3g256_lloyd(&f32_data, &s1, &s2);
+                                        (q, QuantType::MQ3G256Lloyd, 256u32, "MQ3G256L")
+                                    }
+                                    _ => {
+                                        let q = quantize_mq4g256(&f32_data, &s1, &s2);
+                                        (q, QuantType::MQ4G256, 256u32, "MQ4G256")
+                                    }
+                                }
+                            }
+                            None => {
+                                let q = quantize_q8f16(&f32_data);
+                                (q, QuantType::Q8F16, 32u32, "Q8_F16")
+                            }
+                        }
                     } else if (use_mq4g256
                         || use_mq4_mq6exp
                         || use_mq4_mq2lloydexp
+                        || use_mq4_mq2glexp
                         || use_mq4_mq2lloyd_native
                         || use_mq4_mq2lloyd_kmap
                         || use_mq4_mq2lloyd_imatrix
@@ -11009,6 +11499,7 @@ fn main() {
                     } else if use_mq4g256
                         || use_mq4_mq6exp
                         || use_mq4_mq2lloydexp
+                        || use_mq4_mq2glexp
                         || use_mq4_mq2lloyd_native
                         || use_mq4_mq2lloyd_kmap
                         || use_mq4_mq2lloyd_imatrix
@@ -13993,6 +14484,60 @@ mod hfq_block_diag {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The MQ*-G256-GL codebooks are NOT stored in the `.hfq` file: the encoder
+    /// bakes them in via `gl_encode_block(&GL_CB2 | &GL_CB3, ..)` and the runtime
+    /// re-supplies them as scalar kernel args from
+    /// `rdna_compute::{GL_CB2, GL_CB3}`. Drift between the two arrays is a
+    /// SILENT accuracy failure — every weight decodes to a plausible-but-wrong
+    /// level and nothing errors. This test is the only thing standing between
+    /// the two copies, so keep it.
+    ///
+    /// If it fails: fix whichever side you did NOT intend to change. Bumping the
+    /// codebook is a FORMAT CHANGE — existing qt-38/39 `.hfq` files decode wrong
+    /// against a new codebook, so it needs a new quant_type, not an edit.
+    #[test]
+    fn gl_codebooks_match_runtime() {
+        assert_eq!(
+            GL_CB2,
+            rdna_compute::GL_CB2,
+            "hipfire-quantize GL_CB2 has drifted from rdna_compute::GL_CB2 — \
+             qt=38 weights would decode against the wrong 2-bit levels"
+        );
+        assert_eq!(
+            GL_CB3,
+            rdna_compute::GL_CB3,
+            "hipfire-quantize GL_CB3 has drifted from rdna_compute::GL_CB3 — \
+             qt=39 weights would decode against the wrong 3-bit levels"
+        );
+    }
+
+    /// Pins the GL on-disk geometry the runtime loader + kernels assume:
+    /// SoA `[m*gpr*IDX B indices][m*gpr*2 B fp16 scales]`, IDX = 64 (MQ2-GL) /
+    /// 96 (MQ3-GL). The kernels derive the scale-region base as `M*gpr*IDX`, so
+    /// a size change here is a silent read past/short of the scales.
+    #[test]
+    fn gl_blob_layout_matches_runtime_constants() {
+        let (m, k) = (4usize, 512usize);
+        let gpr = k / 256;
+        let signs1 = vec![1.0f32; 256];
+        let signs2 = vec![1.0f32; 256];
+        let w: Vec<f32> = (0..m * k).map(|i| (i % 17) as f32 * 0.01 - 0.08).collect();
+
+        let b2 = quantize_mq2g256gl(&w, m, k, &signs1, &signs2);
+        assert_eq!(
+            b2.len(),
+            m * gpr * (rdna_compute::GL_MQ2_GROUP_IDX_BYTES + rdna_compute::GL_GROUP_SCALE_BYTES),
+            "MQ2G256GL blob size disagrees with GL_MQ2_GROUP_IDX_BYTES/GL_GROUP_SCALE_BYTES"
+        );
+
+        let b3 = quantize_mq3g256gl(&w, m, k, &signs1, &signs2);
+        assert_eq!(
+            b3.len(),
+            m * gpr * (rdna_compute::GL_MQ3_GROUP_IDX_BYTES + rdna_compute::GL_GROUP_SCALE_BYTES),
+            "MQ3G256GL blob size disagrees with GL_MQ3_GROUP_IDX_BYTES/GL_GROUP_SCALE_BYTES"
+        );
+    }
 
     #[test]
     fn e2m1_lookup_matches_ocp_spec() {

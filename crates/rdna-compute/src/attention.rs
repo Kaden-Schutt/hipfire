@@ -12,6 +12,50 @@ use hip_bridge::{DeviceBuffer, HipResult};
 use std::ffi::c_void;
 use std::sync::OnceLock;
 
+/// HIP `hipDeviceAttributeMaxSharedMemoryPerBlock` (CUDA-compatible block).
+/// Verified against ROCm 5.x/6.x/7.x headers: ordinal 74.
+const HIP_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK: i32 = 74;
+
+/// Conservative per-block shared-memory ceiling when the device attribute is
+/// unavailable. Matches the RDNA3/4 hard launch limit used elsewhere in-tree.
+const ATTENTION_Q8_INDEPENDENT_LDS_FALLBACK_BYTES: usize = 64 * 1024;
+
+/// Dynamic LDS bytes for [`Gpu::attention_q8_0_kv_independent`].
+///
+/// Kernel layout (see `attention_q8_0_kv_batched.hip`):
+/// `scores[lane_capacity] + workspace[block] + q_shared[head_dim]`, all f32,
+/// with `block = next_power_of_two(max(lane_capacity, head_dim)).min(256)`.
+/// Independent lanes never need more scores than one lane's capacity.
+#[inline]
+pub fn attention_q8_0_kv_independent_lds_bytes(lane_capacity: usize, head_dim: usize) -> usize {
+    let block = (lane_capacity.max(head_dim) as u32)
+        .next_power_of_two()
+        .min(256) as usize;
+    lane_capacity
+        .saturating_add(block)
+        .saturating_add(head_dim)
+        .saturating_mul(4)
+}
+
+/// Largest independent lane capacity admitted by this GPU's shared-memory
+/// limit. Zero means independent batching cannot launch on this device.
+pub fn attention_q8_0_kv_independent_max_lane_capacity(
+    shared_mem_limit: usize,
+    head_dim: usize,
+) -> usize {
+    let mut lo = 0usize;
+    let mut hi = shared_mem_limit / 4;
+    while lo < hi {
+        let mid = (lo + hi + 1) / 2;
+        if attention_q8_0_kv_independent_lds_bytes(mid, head_dim) <= shared_mem_limit {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    lo
+}
+
 fn q8_flash_default_tile_size(
     arch: &str,
     n_heads: usize,
@@ -1539,6 +1583,141 @@ impl Gpu {
         )
     }
 
+    /// Lane-major Q8 KV write for independent-sequence decode.
+    pub fn kv_cache_write_q8_0_independent(
+        &mut self,
+        dst: &GpuTensor,
+        src: &GpuTensor,
+        positions: &GpuTensor,
+        n_kv_heads: usize,
+        head_dim: usize,
+        batch_size: usize,
+        lane_capacity: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "kv_cache_write_q8_0_independent",
+            kernels::KV_CACHE_WRITE_Q8_0_BATCHED_SRC,
+            "kv_cache_write_q8_0_independent",
+        )?;
+        let mut d = dst.buf.as_ptr();
+        let mut s = src.buf.as_ptr();
+        let mut p = positions.buf.as_ptr();
+        let mut nkv = n_kv_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut bs = batch_size as i32;
+        let mut cap = lane_capacity as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut d as *mut _ as *mut c_void,
+            &mut s as *mut _ as *mut c_void,
+            &mut p as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+            &mut cap as *mut _ as *mut c_void,
+        ];
+        let total_blocks = (n_kv_heads * head_dim / 32) as u32;
+        self.launch_maybe_blob(
+            "kv_cache_write_q8_0_independent",
+            [total_blocks, batch_size as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(d);
+                b.push_ptr(s);
+                b.push_ptr(p);
+                b.push_i32(nkv);
+                b.push_i32(hd);
+                b.push_i32(bs);
+                b.push_i32(cap);
+                b
+            },
+        )
+    }
+    /// Masked independent-sequence Q8_0 KV write. Derives physical lane from
+    /// grid y (blockIdx.y, same as the unmasked independent kernel) and
+    /// returns before any inactive-lane read/write. Full-mask callers are
+    /// routed through the existing unmasked `kv_cache_write_q8_0_independent`
+    /// for exact ABI parity. Supports up to 64 lanes without unsafe shift.
+    pub fn kv_cache_write_q8_0_independent_masked(
+        &mut self,
+        dst: &GpuTensor,
+        src: &GpuTensor,
+        positions: &GpuTensor,
+        n_kv_heads: usize,
+        head_dim: usize,
+        batch_size: usize,
+        lane_capacity: usize,
+        active_mask: u64,
+    ) -> HipResult<()> {
+        let full_mask = if batch_size >= 64 {
+            u64::MAX
+        } else if batch_size == 0 {
+            0u64
+        } else {
+            (1u64 << batch_size) - 1
+        };
+        if active_mask == full_mask {
+            return self.kv_cache_write_q8_0_independent(
+                dst,
+                src,
+                positions,
+                n_kv_heads,
+                head_dim,
+                batch_size,
+                lane_capacity,
+            );
+        }
+        if active_mask == 0 {
+            return Ok(());
+        }
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "kv_cache_write_q8_0_independent_masked",
+            kernels::KV_CACHE_WRITE_Q8_0_BATCHED_SRC,
+            "kv_cache_write_q8_0_independent_masked",
+        )?;
+        let mut d = dst.buf.as_ptr();
+        let mut s = src.buf.as_ptr();
+        let mut p = positions.buf.as_ptr();
+        let mut nkv = n_kv_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut bs = batch_size as i32;
+        let mut cap = lane_capacity as i32;
+        let mut mask = active_mask;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut d as *mut _ as *mut c_void,
+            &mut s as *mut _ as *mut c_void,
+            &mut p as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+            &mut cap as *mut _ as *mut c_void,
+            &mut mask as *mut _ as *mut c_void,
+        ];
+        let total_blocks = (n_kv_heads * head_dim / 32) as u32;
+        self.launch_maybe_blob(
+            "kv_cache_write_q8_0_independent_masked",
+            [total_blocks, batch_size as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(d);
+                b.push_ptr(s);
+                b.push_ptr(p);
+                b.push_i32(nkv);
+                b.push_i32(hd);
+                b.push_i32(bs);
+                b.push_i32(cap);
+                b.push_u64(mask);
+                b
+            },
+        )
+    }
     /// Write KV vector to Q8_0 quantized cache (same format as GGML Q8_0).
     pub fn kv_cache_write_q8_0(
         &mut self,
@@ -1810,6 +1989,148 @@ impl Gpu {
             t.finish(&self.hip);
         }
         result
+    }
+
+    /// Q8 attention for a batch of independent decode sequences. Every row
+    /// reads a private lane-major KV slice of `lane_capacity` positions.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_q8_0_kv_independent(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        lane_capacity: usize,
+        max_ctx_len: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let checked_shared_mem =
+            self.ensure_attention_q8_0_kv_independent_lds(lane_capacity, head_dim)?;
+        self.ensure_kernel(
+            "attention_q8_0_kv_batched",
+            kernels::ATTENTION_Q8_0_KV_BATCHED_SRC,
+            "attention_q8_0_kv_batched",
+        )?;
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let mut q_ptr = q.buf.as_ptr();
+        let mut k_ptr = k_cache.buf.as_ptr();
+        let mut v_ptr = v_cache.buf.as_ptr();
+        let mut out_ptr = out.buf.as_ptr();
+        let mut pos_ptr = positions.buf.as_ptr();
+        let mut bias_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+        let mut nh = n_heads as i32;
+        let mut nkv = n_kv_heads as i32;
+        let mut hd = head_dim as i32;
+        assert!(
+            lane_capacity <= i32::MAX as usize,
+            "Q8 KV capacity exceeds i32"
+        );
+        let mut ms = -(lane_capacity as i32);
+        let mut sc = scale;
+        let mut bs = 0i32;
+        let mut bc = 0i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut q_ptr as *mut _ as *mut c_void,
+            &mut k_ptr as *mut _ as *mut c_void,
+            &mut v_ptr as *mut _ as *mut c_void,
+            &mut out_ptr as *mut _ as *mut c_void,
+            &mut pos_ptr as *mut _ as *mut c_void,
+            &mut bias_ptr as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut ms as *mut _ as *mut c_void,
+            &mut sc as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+            &mut bc as *mut _ as *mut c_void,
+        ];
+        // LDS / block geometry are locked to lane_capacity (not live max_ctx_len
+        // or physical_cap): independent rows only ever score one lane.
+        let block_size = (lane_capacity.max(head_dim) as u32)
+            .next_power_of_two()
+            .min(256);
+        let shared_mem = checked_shared_mem;
+        let bytes =
+            crate::profile::attention_q8_0_kv_bytes(n_heads, n_kv_heads, head_dim, max_ctx_len)
+                * batch_size;
+        let timer =
+            crate::profile::begin_timer(&self.hip, "attention", "attention_q8_0_kv_batched", bytes);
+        let bias_raw = bias_ptr;
+        let result = self.launch_maybe_blob(
+            "attention_q8_0_kv_batched",
+            [n_heads as u32, batch_size as u32, 1],
+            [block_size, 1, 1],
+            shared_mem,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(q_ptr);
+                b.push_ptr(k_ptr);
+                b.push_ptr(v_ptr);
+                b.push_ptr(out_ptr);
+                b.push_ptr(pos_ptr);
+                b.push_ptr(bias_raw);
+                b.push_i32(nh);
+                b.push_i32(nkv);
+                b.push_i32(hd);
+                b.push_i32(ms);
+                b.push_f32(sc);
+                b.push_i32(bs);
+                b.push_i32(bc);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// Shared-memory ceiling for independent Q8 attention on this device.
+    /// Prefers `hipDeviceGetAttribute(MaxSharedMemoryPerBlock)`; falls back to
+    /// the documented 64 KiB RDNA hard limit when the query fails.
+    pub fn attention_q8_0_kv_independent_shared_mem_limit(&self) -> usize {
+        match self.hip.get_device_attribute(
+            HIP_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK,
+            self.device_id,
+        ) {
+            Ok(v) if v > 0 => v as usize,
+            _ => ATTENTION_Q8_INDEPENDENT_LDS_FALLBACK_BYTES,
+        }
+    }
+
+    /// Largest lane capacity admitted by this GPU's shared-memory limit.
+    pub fn attention_q8_0_kv_independent_max_lane_capacity(&self, head_dim: usize) -> usize {
+        attention_q8_0_kv_independent_max_lane_capacity(
+            self.attention_q8_0_kv_independent_shared_mem_limit(),
+            head_dim,
+        )
+    }
+
+    /// Reject lane capacities whose exact independent-Q8 LDS exceeds the GPU
+    /// shared-memory limit. Returns the launch `shared_mem` when admitted.
+    pub fn ensure_attention_q8_0_kv_independent_lds(
+        &self,
+        lane_capacity: usize,
+        head_dim: usize,
+    ) -> HipResult<u32> {
+        let lds_bytes = attention_q8_0_kv_independent_lds_bytes(lane_capacity, head_dim);
+        let limit = self.attention_q8_0_kv_independent_shared_mem_limit();
+        if lds_bytes > limit {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "attention_q8_0_kv_independent: LDS {lds_bytes} exceeds device shared-memory \
+                     limit {limit} (lane_capacity={lane_capacity}, head_dim={head_dim})"
+                ),
+            ));
+        }
+        Ok(lds_bytes as u32)
     }
 
     /// Query-tiled Q8_0 flash prefill attention.
@@ -5367,7 +5688,6 @@ impl Gpu {
             kernels::ATTENTION_Q8_0_KV_SRC,
             "attention_q8_0_kv",
         )?;
-        let func = &self.functions["attention_q8_0_kv"];
         let scale = 1.0f32 / (head_dim as f32).sqrt();
         let mut q_ptr = q.buf.as_ptr();
         let mut k_ptr = k_cache.buf.as_ptr();
@@ -5400,16 +5720,27 @@ impl Gpu {
         let bytes =
             crate::profile::attention_q8_0_kv_bytes(n_heads, n_kv_heads, head_dim, seq_len_hint);
         let timer = crate::profile::begin_timer(&self.hip, "attention", "attention_q8_0_kv", bytes);
-        let result = unsafe {
-            self.hip.launch_kernel(
-                func,
-                [n_heads as u32, 1, 1],
-                [block_size, 1, 1],
-                shared_mem,
-                self.stream_ref(),
-                &mut params,
-            )
-        };
+        let result = self.launch_maybe_blob(
+            "attention_q8_0_kv",
+            [n_heads as u32, 1, 1],
+            [block_size, 1, 1],
+            shared_mem,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(q_ptr);
+                b.push_ptr(k_ptr);
+                b.push_ptr(v_ptr);
+                b.push_ptr(out_ptr);
+                b.push_ptr(pos_ptr);
+                b.push_i32(nh);
+                b.push_i32(nkv);
+                b.push_i32(hd);
+                b.push_i32(ms);
+                b.push_f32(sc);
+                b
+            },
+        );
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
@@ -8737,11 +9068,7 @@ impl Gpu {
         assert!(self.arch_caps.supports_ds4_f16_compressor_cache());
         assert_eq!(cache.dtype, DType::F16);
         let symbol = "indexer_relu_score_f16_buf";
-        self.ensure_kernel(
-            symbol,
-            kernels::DEEPSEEK4_COMPRESSOR_CACHE_F16_SRC,
-            symbol,
-        )?;
+        self.ensure_kernel(symbol, kernels::DEEPSEEK4_COMPRESSOR_CACHE_F16_SRC, symbol)?;
         let qp = q.buf.as_ptr();
         let kp = cache.buf.as_ptr();
         let wp = weights.buf.as_ptr();
@@ -8795,11 +9122,7 @@ impl Gpu {
         assert!(self.arch_caps.supports_ds4_f16_compressor_cache());
         assert_eq!(cache.dtype, DType::F16);
         let symbol = "indexer_relu_score_batched_f16";
-        self.ensure_kernel(
-            symbol,
-            kernels::DEEPSEEK4_COMPRESSOR_CACHE_F16_SRC,
-            symbol,
-        )?;
+        self.ensure_kernel(symbol, kernels::DEEPSEEK4_COMPRESSOR_CACHE_F16_SRC, symbol)?;
         let qp = q.buf.as_ptr();
         let kp = cache.buf.as_ptr();
         let wp = weights.buf.as_ptr();
@@ -8860,11 +9183,7 @@ impl Gpu {
         assert_eq!(cache.dtype, DType::F16);
         assert_eq!((h, d), (64, 128));
         let symbol = "indexer_relu_score_wmma_batched_f16";
-        self.ensure_kernel(
-            symbol,
-            kernels::DEEPSEEK4_COMPRESSOR_CACHE_F16_SRC,
-            symbol,
-        )?;
+        self.ensure_kernel(symbol, kernels::DEEPSEEK4_COMPRESSOR_CACHE_F16_SRC, symbol)?;
         let qp = q.buf.as_ptr();
         let kp = cache.buf.as_ptr();
         let wp = weights.buf.as_ptr();

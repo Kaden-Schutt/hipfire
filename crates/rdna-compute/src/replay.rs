@@ -49,6 +49,74 @@ enum Pm4Architecture {
     Gfx12,
 }
 
+/// Per-stream producer/consumer visibility for legacy (gfx10/gfx11) PM4 IBs.
+///
+/// `CsPartialFlush` retains the historical EVENT_WRITE path. `ReleaseWait` is
+/// admitted only for exact gfx1010 single-queue retained replay and pairs a
+/// fine-grained host word with RELEASE_MEM + WAIT_REG_MEM epochs.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LegacyDependencyMode {
+    CsPartialFlush,
+    ReleaseWait { address: u64, next_epoch: u32 },
+}
+
+/// Exact gfx1010 gate for the RELEASE_MEM/WAIT_REG_MEM dependency fence.
+/// Architecture must already be the gfx10 family map; the device name is
+/// matched ASCII-case-insensitively so only the Navi10 agent is selected.
+fn gfx1010_release_wait_required(architecture: Pm4Architecture, device_name: &str) -> bool {
+    architecture == Pm4Architecture::Gfx10 && device_name.eq_ignore_ascii_case("gfx1010")
+}
+
+/// Diagnostic-only override for exact-gfx1010 retained-PM4 dependency fencing.
+/// Default remains `ReleaseWait`; `CsPartialFlush` is the historical EVENT_WRITE path.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Gfx1010DependencyPolicy {
+    ReleaseWait,
+    CsPartialFlush,
+}
+
+/// Pure parser for `HIPFIRE_REPLAY_PM4_GFX1010_DEPENDENCY`.
+///
+/// Non-exact-gfx1010 devices always resolve to `CsPartialFlush` and ignore `value`.
+/// On exact gfx1010: unset/`release-wait` => `ReleaseWait`, `cs-partial-flush` =>
+/// `CsPartialFlush`; any other value is a hard prepare error naming the key.
+fn gfx1010_dependency_policy_from_value(
+    architecture: Pm4Architecture,
+    device_name: &str,
+    value: Option<&str>,
+) -> Result<Gfx1010DependencyPolicy, String> {
+    if !gfx1010_release_wait_required(architecture, device_name) {
+        return Ok(Gfx1010DependencyPolicy::CsPartialFlush);
+    }
+    match value {
+        None => Ok(Gfx1010DependencyPolicy::ReleaseWait),
+        Some("release-wait") => Ok(Gfx1010DependencyPolicy::ReleaseWait),
+        Some("cs-partial-flush") => Ok(Gfx1010DependencyPolicy::CsPartialFlush),
+        Some(raw) => Err(format!(
+            "invalid HIPFIRE_REPLAY_PM4_GFX1010_DEPENDENCY={raw:?}; \
+             expected unset, \"release-wait\", or \"cs-partial-flush\""
+        )),
+    }
+}
+
+fn gfx1010_dependency_policy_from_config(
+    architecture: Pm4Architecture,
+    device_name: &str,
+) -> Result<Gfx1010DependencyPolicy, String> {
+    let raw = hipfire_config::process_value("HIPFIRE_REPLAY_PM4_GFX1010_DEPENDENCY");
+    let policy =
+        gfx1010_dependency_policy_from_value(architecture, device_name, raw.as_deref())?;
+    if gfx1010_release_wait_required(architecture, device_name) {
+        let source = if raw.is_none() {
+            "default"
+        } else {
+            "explicit"
+        };
+        eprintln!("[redline] gfx1010 PM4 dependency mode={policy:?} ({source})");
+    }
+    Ok(policy)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Gfx11EntryAcquirePolicy {
     System,
@@ -80,6 +148,7 @@ enum Pm4Commands {
     Legacy {
         architecture: Pm4Architecture,
         commands: Gfx10Pm4CommandBuffer,
+        dependency_mode: LegacyDependencyMode,
     },
     Gfx12(Gfx12Pm4CommandBuffer),
 }
@@ -102,6 +171,7 @@ fn create_phased_pm4_graph(
                             Pm4Commands::Legacy {
                                 architecture: actual,
                                 commands,
+                                ..
                             } if *actual == architecture => Ok(commands.clone()),
                             _ => Err("mixed PM4 architecture in phased graph".to_owned()),
                         })
@@ -158,6 +228,24 @@ impl Pm4Commands {
         dispatch_interleave: Option<Gfx11DispatchInterleave>,
         resource_limits_policy: Gfx11ComputeResourceLimitsPolicy,
     ) -> Self {
+        Self::new_with_dependency(
+            architecture,
+            policy,
+            dispatch_initiator_policy,
+            dispatch_interleave,
+            resource_limits_policy,
+            LegacyDependencyMode::CsPartialFlush,
+        )
+    }
+
+    fn new_with_dependency(
+        architecture: Pm4Architecture,
+        policy: Pm4RegisterPolicy,
+        dispatch_initiator_policy: Gfx10DispatchInitiatorPolicy,
+        dispatch_interleave: Option<Gfx11DispatchInterleave>,
+        resource_limits_policy: Gfx11ComputeResourceLimitsPolicy,
+        dependency_mode: LegacyDependencyMode,
+    ) -> Self {
         match architecture {
             Pm4Architecture::Gfx10 | Pm4Architecture::Gfx11 => {
                 let commands = match policy {
@@ -172,9 +260,14 @@ impl Pm4Commands {
                 Self::Legacy {
                     architecture,
                     commands,
+                    dependency_mode,
                 }
             }
             Pm4Architecture::Gfx12 => {
+                debug_assert!(
+                    matches!(dependency_mode, LegacyDependencyMode::CsPartialFlush),
+                    "gfx12 never uses legacy dependency fences"
+                );
                 let commands = match policy {
                     Pm4RegisterPolicy::Legacy => Gfx12Pm4CommandBuffer::new(),
                     Pm4RegisterPolicy::Static => Gfx12Pm4CommandBuffer::new_static_stateful(),
@@ -198,6 +291,31 @@ impl Pm4Commands {
         }
     }
 
+    /// Emit the sentinel epoch-0 release/wait before entry acquire so every
+    /// immutable replay starts from a known fence word (ABA prevention).
+    fn emit_entry_sentinel_reset(&mut self) -> Result<(), String> {
+        match self {
+            Self::Legacy {
+                commands,
+                dependency_mode:
+                    LegacyDependencyMode::ReleaseWait {
+                        address,
+                        next_epoch,
+                    },
+                ..
+            } => {
+                if *next_epoch != 0 {
+                    return Err(format!(
+                        "gfx1010 dependency fence entry sentinel requires next_epoch=0, got {next_epoch}"
+                    ));
+                }
+                commands.dependency_fence(*address, 0);
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
     fn acquire_inter_node(&mut self, gfx12_gcr_trim: bool, vmem_only: bool) {
         match self {
             Self::Legacy { commands, .. } if vmem_only => commands.acquire_inter_node_vmem(),
@@ -211,10 +329,50 @@ impl Pm4Commands {
         matches!(self, Self::Legacy { .. })
     }
 
-    fn wait_compute_idle(&mut self) {
+    fn wait_compute_idle(&mut self) -> Result<(), String> {
         match self {
-            Self::Legacy { commands, .. } => commands.wait_compute_idle(),
-            Self::Gfx12(commands) => commands.wait_compute_idle(),
+            Self::Legacy {
+                commands,
+                dependency_mode:
+                    LegacyDependencyMode::ReleaseWait {
+                        address,
+                        next_epoch,
+                    },
+                ..
+            } => {
+                let epoch = next_epoch.checked_add(1).ok_or_else(|| {
+                    "gfx1010 dependency fence epoch overflow (u32 exhausted)".to_owned()
+                })?;
+                *next_epoch = epoch;
+                commands.dependency_fence(*address, epoch);
+                Ok(())
+            }
+            Self::Legacy { commands, .. } => {
+                commands.wait_compute_idle();
+                Ok(())
+            }
+            Self::Gfx12(commands) => {
+                commands.wait_compute_idle();
+                Ok(())
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn dependency_mode(&self) -> Option<LegacyDependencyMode> {
+        match self {
+            Self::Legacy {
+                dependency_mode, ..
+            } => Some(*dependency_mode),
+            Self::Gfx12(_) => None,
+        }
+    }
+
+    #[cfg(test)]
+    fn dwords(&self) -> Option<&[u32]> {
+        match self {
+            Self::Legacy { commands, .. } => Some(commands.dwords()),
+            Self::Gfx12(_) => None,
         }
     }
 
@@ -286,10 +444,12 @@ impl Pm4Commands {
             Self::Legacy {
                 architecture: Pm4Architecture::Gfx10,
                 commands,
+                ..
             } => SingleQueuePm4Ib::create_profiled_gfx10(device, pool, commands),
             Self::Legacy {
                 architecture: Pm4Architecture::Gfx11,
                 commands,
+                ..
             } => SingleQueuePm4Ib::create_profiled_gfx11(device, pool, commands),
             Self::Legacy {
                 architecture: Pm4Architecture::Gfx12,
@@ -473,6 +633,20 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
     }
     if matches!(
         kernel,
+        "gemv_mq2g256_lloyd_moe_gate_up_k8_indexed"
+            | "gemv_mq3g256_lloyd_moe_gate_up_k8_indexed"
+            | "gemv_mq2g256gl_moe_gate_up_k8_indexed"
+            | "gemv_mq3g256gl_moe_gate_up_k8_indexed"
+            // Batched-K4 prefill siblings: same pointer set and modes, but a
+            // K_TOP scalar makes the kernarg block 52 B, not 48 (see below).
+            | "gemv_mq2g256_lloyd_moe_gate_up_k8_indexed_batched_k4"
+            | "gemv_mq3g256_lloyd_moe_gate_up_k8_indexed_batched_k4"
+    ) {
+        return Some(vec![read(0), read(8), read(16), write(24), write(32)]);
+    }
+
+    if matches!(
+        kernel,
         "fused_qkvza_hfq4g256_k2048_all_buffer_dlc_gfx1151"
             | "fused_qkvza_hfq4g256_k2048_all_buffer_gfx1151"
             | "fused_qkvza_hfq4g256_k2048_all_buffer_glc_gfx1151"
@@ -506,6 +680,24 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
     ) {
         return Some(vec![read(0), read(8), read(16), write(24)]);
     }
+    if matches!(
+        kernel,
+        "gemv_mq2g256_lloyd_moe_down_residual_scaled_k8_indexed"
+            | "gemv_mq2g256_lloyd_moe_down_residual_scaled_k8_indexed_r2"
+            | "gemv_mq2g256_lloyd_moe_down_residual_scaled_k8_indexed_r4"
+            | "gemv_mq3g256_lloyd_moe_down_residual_scaled_k8_indexed"
+            | "gemv_mq3g256_lloyd_moe_down_residual_scaled_k8_indexed_r2"
+            | "gemv_mq3g256_lloyd_moe_down_residual_scaled_k8_indexed_r4"
+            | "gemv_mq3g256_lloyd_moe_ninepath_d4"
+            | "gemv_mq2g256gl_moe_down_residual_scaled_k8_indexed"
+            | "gemv_mq3g256gl_moe_down_residual_scaled_k8_indexed"
+            // Batched-K4 prefill siblings; 52 B kernarg (K_TOP scalar).
+            | "gemv_mq2g256_lloyd_moe_down_residual_scaled_k8_indexed_batched_k4"
+            | "gemv_mq3g256_lloyd_moe_down_residual_scaled_k8_indexed_batched_k4"
+    ) {
+        return Some(vec![read(0), read(8), read(16), read(24), write(32)]);
+    }
+
     if kernel == "moe_router_softmax_topk_k8_wave64_exact_shared_silu_mq_rotate" {
         return Some(vec![
             read(0),
@@ -707,6 +899,10 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             write(64),
         ]),
         "fused_sigmoid_alpha_gate_f32" => Some(vec![write(0), write(8), read(16), read(24)]),
+        // LFM retained-PM4 fallback: state is RMW at @8 (write covers RMW).
+        "conv1d_gated_decode_f32" => Some(vec![read(0), write(8), read(16), write(24)]),
+        // LFM retained-PM4 fallback: q/k/v read, out write, pos read.
+        "attention_q8_0_kv" => Some(vec![read(0), read(8), read(16), write(24), read(32)]),
         "conv1d_silu_split_f32" => Some(vec![
             write(0),
             write(8),
@@ -987,6 +1183,47 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
     ) {
         return Some(48);
     }
+    if matches!(
+        kernel,
+        "gemv_mq2g256_lloyd_moe_gate_up_k8_indexed"
+            | "gemv_mq3g256_lloyd_moe_gate_up_k8_indexed"
+            | "gemv_mq2g256_lloyd_moe_down_residual_scaled_k8_indexed"
+            | "gemv_mq2g256_lloyd_moe_down_residual_scaled_k8_indexed_r2"
+            | "gemv_mq2g256_lloyd_moe_down_residual_scaled_k8_indexed_r4"
+            | "gemv_mq3g256_lloyd_moe_down_residual_scaled_k8_indexed"
+            | "gemv_mq3g256_lloyd_moe_down_residual_scaled_k8_indexed_r2"
+            | "gemv_mq3g256_lloyd_moe_down_residual_scaled_k8_indexed_r4"
+            | "gemv_mq3g256_lloyd_moe_ninepath_d4"
+    ) {
+        return Some(48);
+    }
+    // Batched-K4 codebook MoE: 5 pointers (40 B) + M, K, K_TOP (12 B) = 52 B.
+    // The trailing K_TOP is what makes these NOT 48 like their decode siblings;
+    // assuming 48 here would make every kernarg length check fail closed.
+    if matches!(
+        kernel,
+        "gemv_mq2g256_lloyd_moe_gate_up_k8_indexed_batched_k4"
+            | "gemv_mq3g256_lloyd_moe_gate_up_k8_indexed_batched_k4"
+            | "gemv_mq2g256_lloyd_moe_down_residual_scaled_k8_indexed_batched_k4"
+            | "gemv_mq3g256_lloyd_moe_down_residual_scaled_k8_indexed_batched_k4"
+    ) {
+        return Some(52);
+    }
+    if matches!(
+        kernel,
+        "gemv_mq2g256gl_moe_gate_up_k8_indexed"
+            | "gemv_mq2g256gl_moe_down_residual_scaled_k8_indexed"
+    ) {
+        return Some(64);
+    }
+    if matches!(
+        kernel,
+        "gemv_mq3g256gl_moe_gate_up_k8_indexed"
+            | "gemv_mq3g256gl_moe_down_residual_scaled_k8_indexed"
+    ) {
+        return Some(80);
+    }
+
     if kernel.starts_with("gated_delta_net_q8_compact2_") {
         return Some(96);
     }
@@ -1059,7 +1296,8 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "kv_cache_write_q8_0_pair"
         | "mq_rotate_x"
         | "repeat_interleave_qk_f32"
-        | "rope_partial_halfsplit_f32" => Some(48),
+        | "rope_partial_halfsplit_f32"
+        | "conv1d_gated_decode_f32" => Some(48),
         "conv1d_silu_split_f32"
         | "gated_norm_mq_rotate_gfx1100"
         | "gated_norm_mq_rotate_gfx1151"
@@ -1068,7 +1306,8 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1100"
         | "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1151"
         | "fused_rmsnorm_mq_rotate_wavegrid"
-        | "rotate_with_rms_gfx1100" => Some(64),
+        | "rotate_with_rms_gfx1100"
+        | "attention_q8_0_kv" => Some(64),
         "moe_down_combine_rmsnorm_mq_rotate_vecsum"
         | "moe_down_combine_rmsnorm_mq_rotate_vecsum_gfx1151" => Some(72),
         "gemv_hfq4g256_moe_down_k8_indexed_last_combine" => Some(64),
@@ -2122,6 +2361,12 @@ fn required_mid_acquire(previous: &str, current: &str) -> bool {
     if previous == "fused_silu_mul_mq_rotate" && current.starts_with("gemv_hfq4g256_residual") {
         return true;
     }
+    // LFM's rotated projection buffer is consumed immediately by GEMV. A
+    // compute-idle wait orders execution, but gfx12 needs a vector-cache
+    // acquire before the consumer reads mq_rotate_x output.
+    if previous == "mq_rotate_x" {
+        return true;
+    }
     matches!(
         previous,
         "repeat_interleave_qk_f32" | "rope_partial_halfsplit_f32"
@@ -2377,8 +2622,8 @@ pub struct PreparedReplayIdentity {
     pub phase_count: usize,
 }
 
-fn pm4_packet_identity(queue_count: usize, phase_count: usize) -> Option<usize> {
-    (queue_count == 1 && phase_count == 1).then_some(1)
+fn pm4_packet_identity(packet_count: usize) -> Option<usize> {
+    (packet_count > 0).then_some(packet_count)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2531,6 +2776,13 @@ impl PreparedPm4Graph {
         }
     }
 
+    fn packet_count(&self) -> usize {
+        match self {
+            Self::Single(_) => 1,
+            Self::Phased(graph) => graph.packet_count(),
+        }
+    }
+
     fn patch_dispatch_dimensions(
         &mut self,
         dispatch: usize,
@@ -2569,6 +2821,11 @@ pub struct PreparedPm4Replay {
     // programmed into the immutable indirect buffer.
     _kernels: Vec<Kernel>,
     kernargs: Vec<KernargBuffer>,
+    /// gfx1010 RELEASE_MEM/WAIT_REG_MEM fence word. Owned for the full
+    /// executable lifetime of `graph` so the IB's absolute address stays valid
+    /// through every replay; dropped only after queue quiescence via normal
+    /// PreparedPm4Replay teardown (field order: graph first).
+    _dependency_fence: Option<KernargBuffer>,
     dynamic_gdn_frames: Vec<usize>,
     dynamic_grids: Vec<(usize, ReplayGridBinding, [u32; 3], [u32; 3])>,
     pm4_architecture: Pm4Architecture,
@@ -2659,6 +2916,10 @@ impl PreparedPm4Replay {
 
     pub fn phase_count(&self) -> usize {
         self.graph.phase_count()
+    }
+
+    pub fn packet_count(&self) -> usize {
+        self.graph.packet_count()
     }
 }
 
@@ -2934,10 +3195,7 @@ impl ReplayController {
                     .as_ref()
                     .map(|prepared| PreparedReplayIdentity {
                         dispatch_count: prepared.dispatch_count(),
-                        packet_count: pm4_packet_identity(
-                            prepared.queue_count(),
-                            prepared.phase_count(),
-                        ),
+                        packet_count: pm4_packet_identity(prepared.packet_count()),
                         queue_id: prepared.queue_id(),
                         command_dwords: Some(prepared.command_dwords()),
                         queue_count: prepared.queue_count(),
@@ -3175,11 +3433,14 @@ impl ReplayController {
                 launch.kernel.as_str(),
                 "fused_silu_mul_mq_rotate" | "mq_rotate_x" | "rope_partial_halfsplit_f32"
             ) {
-                headers[index] = if launch.kernel == "mq_rotate_x" {
-                    HeaderPolicy::BATCH_INTERNAL_RELEASE_SYSTEM
+                if launch.kernel == "mq_rotate_x" {
+                    headers[index] = HeaderPolicy::BATCH_INTERNAL_RELEASE_SYSTEM;
+                    if index + 1 < headers.len() {
+                        headers[index + 1] = HeaderPolicy::BATCH_INTERNAL_ACQUIRE_SYSTEM;
+                    }
                 } else {
-                    HeaderPolicy::RECORDED_DISPATCH
-                };
+                    headers[index] = HeaderPolicy::RECORDED_DISPATCH;
+                }
             }
         }
         for index in 1..headers.len() {
@@ -3444,6 +3705,21 @@ impl ReplayController {
         if cu_mask.is_some() && queue_limit != 1 {
             return Err("gfx1151 CU-mask experiments require single-queue PM4 replay".to_owned());
         }
+        let gfx1010_exact = gfx1010_release_wait_required(pm4_architecture, device.name());
+        let gfx1010_dependency =
+            gfx1010_dependency_policy_from_config(pm4_architecture, device.name())?;
+        // Exact gfx1010 admits only single-queue non-native single-phase lowering.
+        // Multi-queue / multi-phase / native-sync topologies stay on CS_PARTIAL_FLUSH
+        // elsewhere and are fail-closed here rather than silently degraded.
+        // Restriction holds under both ReleaseWait and CsPartialFlush overrides.
+        if gfx1010_exact && queue_limit != 1 {
+            return Err(
+                "gfx1010 RELEASE_MEM/WAIT_REG_MEM dependency fence requires single-queue \
+                 non-native single-phase retained PM4"
+                    .to_owned(),
+            );
+        }
+        let mut dependency_fence = None;
         let mut dispatch_boundaries = Vec::new();
         let (graph, command_dwords) = if queue_limit == 1 {
             let recorded = &self.recorded[..prefix];
@@ -3476,13 +3752,37 @@ impl ReplayController {
                     order
                 }
             };
-            let mut commands = Pm4Commands::new(
+            let dependency_mode = match gfx1010_dependency {
+                Gfx1010DependencyPolicy::ReleaseWait => {
+                    let fence = pool
+                        .allocate_fine_grained_bytes(4, 4)
+                        .map_err(|error| format!("allocate gfx1010 dependency fence: {error}"))?;
+                    let address = fence.address() as u64;
+                    if address == 0 || address & 3 != 0 {
+                        return Err(format!(
+                            "gfx1010 dependency fence address {address:#x} is null or unaligned"
+                        ));
+                    }
+                    dependency_fence = Some(fence);
+                    LegacyDependencyMode::ReleaseWait {
+                        address,
+                        next_epoch: 0,
+                    }
+                }
+                Gfx1010DependencyPolicy::CsPartialFlush => LegacyDependencyMode::CsPartialFlush,
+            };
+            let mut commands = Pm4Commands::new_with_dependency(
                 pm4_architecture,
                 self.pm4_register_policy,
                 dispatch_initiator_policy,
                 dispatch_interleave,
                 resource_limits_policy,
+                dependency_mode,
             );
+            // Sentinel epoch 0 before entry acquire: every immutable replay
+            // re-submits this prefix so a stale prior epoch cannot satisfy the
+            // next run (ABA).
+            commands.emit_entry_sentinel_reset()?;
             commands.acquire_entry(gfx12_gcr_trim, entry_acquire_policy);
             let mut resource_frontier = ResourceFrontier::default();
             let mut dependency_waits = 0usize;
@@ -3506,7 +3806,7 @@ impl ReplayController {
                     if !independent {
                         dependency_waits += 1;
                         boundary.wait_compute_idle = true;
-                        commands.wait_compute_idle();
+                        commands.wait_compute_idle()?;
                     }
                     resource_frontier.advance(current_launch, resources_independent);
                     let acquire = (!independent && commands.requires_dependency_acquire())
@@ -3538,7 +3838,7 @@ impl ReplayController {
                     dispatch_boundaries.push(boundary);
                 }
             }
-            commands.wait_compute_idle();
+            commands.wait_compute_idle()?;
             if dispatch_profile {
                 commands.populate_dispatch_span_boundaries(&mut dispatch_boundaries)?;
             }
@@ -3694,7 +3994,7 @@ impl ReplayController {
                                 let resources_independent =
                                     resource_frontier.independent(current_launch);
                                 if !resources_independent {
-                                    lane.wait_compute_idle();
+                                    lane.wait_compute_idle()?;
                                 }
                                 resource_frontier.advance(current_launch, resources_independent);
                                 if (!resources_independent && lane.requires_dependency_acquire())
@@ -3724,7 +4024,7 @@ impl ReplayController {
                         }
                     }
                     for commands in &mut lanes {
-                        commands.wait_compute_idle();
+                        commands.wait_compute_idle()?;
                         command_dwords = command_dwords
                             .checked_add(commands.len_dwords())
                             .ok_or_else(|| "PM4 command dword count overflow".to_owned())?;
@@ -3759,7 +4059,7 @@ impl ReplayController {
                             Pm4WaitPolicy::Resource => resources_independent,
                         };
                         if !independent {
-                            commands.wait_compute_idle();
+                            commands.wait_compute_idle()?;
                         }
                         resource_frontier.advance(current_launch, resources_independent);
                         if (!independent && commands.requires_dependency_acquire())
@@ -3789,7 +4089,7 @@ impl ReplayController {
                         )
                         .map_err(|error| format!("{}: {error}", self.recorded[index].kernel))?;
                 }
-                commands.wait_compute_idle();
+                commands.wait_compute_idle()?;
                 command_dwords = command_dwords
                     .checked_add(commands.len_dwords())
                     .ok_or_else(|| "PM4 command dword count overflow".to_owned())?;
@@ -3825,6 +4125,7 @@ impl ReplayController {
             graph,
             _kernels: kernels,
             kernargs,
+            _dependency_fence: dependency_fence,
             dynamic_gdn_frames,
             dynamic_grids,
             pm4_architecture,
@@ -4442,6 +4743,348 @@ mod tests {
     }
 
     #[test]
+    fn gfx1010_release_wait_selector_is_exact() {
+        assert!(gfx1010_release_wait_required(
+            Pm4Architecture::Gfx10,
+            "gfx1010"
+        ));
+        assert!(gfx1010_release_wait_required(
+            Pm4Architecture::Gfx10,
+            "GFX1010"
+        ));
+        assert!(!gfx1010_release_wait_required(
+            Pm4Architecture::Gfx10,
+            "gfx1030"
+        ));
+        assert!(!gfx1010_release_wait_required(
+            Pm4Architecture::Gfx10,
+            "gfx1011"
+        ));
+        assert!(!gfx1010_release_wait_required(
+            Pm4Architecture::Gfx11,
+            "gfx1100"
+        ));
+        assert!(!gfx1010_release_wait_required(
+            Pm4Architecture::Gfx11,
+            "gfx1151"
+        ));
+        assert!(!gfx1010_release_wait_required(
+            Pm4Architecture::Gfx12,
+            "gfx1201"
+        ));
+        // Architecture gate is conjunctive: wrong family never selects even if
+        // the name string matches by accident.
+        assert!(!gfx1010_release_wait_required(
+            Pm4Architecture::Gfx11,
+            "gfx1010"
+        ));
+    }
+
+    #[test]
+    fn gfx1010_dependency_policy_defaults_to_release_wait() {
+        assert_eq!(
+            gfx1010_dependency_policy_from_value(Pm4Architecture::Gfx10, "gfx1010", None)
+                .unwrap(),
+            Gfx1010DependencyPolicy::ReleaseWait
+        );
+        assert_eq!(
+            gfx1010_dependency_policy_from_value(
+                Pm4Architecture::Gfx10,
+                "GFX1010",
+                Some("release-wait")
+            )
+            .unwrap(),
+            Gfx1010DependencyPolicy::ReleaseWait
+        );
+    }
+
+    #[test]
+    fn gfx1010_dependency_policy_accepts_cs_partial_flush() {
+        assert_eq!(
+            gfx1010_dependency_policy_from_value(
+                Pm4Architecture::Gfx10,
+                "gfx1010",
+                Some("cs-partial-flush")
+            )
+            .unwrap(),
+            Gfx1010DependencyPolicy::CsPartialFlush
+        );
+    }
+
+    #[test]
+    fn gfx1010_dependency_policy_rejects_unknown_exact_values() {
+        for raw in [
+            "partial-flush",
+            "",
+            "cs",
+            "CS-PARTIAL-FLUSH",
+            "cs_partial_flush",
+            "RELEASE-WAIT",
+            "0",
+            "1",
+            "true",
+            "falsé",
+        ] {
+            let err = gfx1010_dependency_policy_from_value(
+                Pm4Architecture::Gfx10,
+                "gfx1010",
+                Some(raw),
+            )
+            .unwrap_err();
+            assert!(
+                err.contains("HIPFIRE_REPLAY_PM4_GFX1010_DEPENDENCY"),
+                "missing key in error for {raw:?}: {err}"
+            );
+            assert!(
+                err.contains(raw),
+                "missing offending value {raw:?} in error: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn gfx1010_dependency_policy_ignored_off_exact_device() {
+        // Non-exact devices stay on CsPartialFlush and ignore the override key.
+        for (arch, name, value) in [
+            (Pm4Architecture::Gfx10, "gfx1030", Some("release-wait")),
+            (Pm4Architecture::Gfx10, "gfx1011", Some("cs-partial-flush")),
+            (Pm4Architecture::Gfx11, "gfx1100", Some("release-wait")),
+            (Pm4Architecture::Gfx11, "gfx1010", Some("release-wait")),
+            (Pm4Architecture::Gfx12, "gfx1201", Some("bogus")),
+            (Pm4Architecture::Gfx10, "gfx1030", None),
+        ] {
+            assert_eq!(
+                gfx1010_dependency_policy_from_value(arch, name, value).unwrap(),
+                Gfx1010DependencyPolicy::CsPartialFlush,
+                "arch={arch:?} name={name} value={value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn gfx1010_cs_partial_flush_override_emits_event_write_only() {
+        // Encoding path for the diagnostic CsPartialFlush override: no fence
+        // allocation/sentinel; historical EVENT_WRITE CS_PARTIAL_FLUSH only.
+        let mut commands = Pm4Commands::new_with_dependency(
+            Pm4Architecture::Gfx10,
+            Pm4RegisterPolicy::Legacy,
+            Gfx10DispatchInitiatorPolicy::Legacy,
+            None,
+            Gfx11ComputeResourceLimitsPolicy::Legacy,
+            LegacyDependencyMode::CsPartialFlush,
+        );
+        assert_eq!(
+            commands.dependency_mode(),
+            Some(LegacyDependencyMode::CsPartialFlush)
+        );
+        commands.emit_entry_sentinel_reset().unwrap();
+        commands.wait_compute_idle().unwrap();
+        let dwords = commands.dwords().unwrap();
+        assert_eq!(dwords, &[0xc000_4600, 0x407]);
+    }
+
+    #[test]
+    fn gfx1010_release_wait_emits_sentinel_then_checked_epochs() {
+        const FENCE_ADDR: u64 = 0x1234_5678_9abc_def0;
+        let mut commands = Pm4Commands::new_with_dependency(
+            Pm4Architecture::Gfx10,
+            Pm4RegisterPolicy::Legacy,
+            Gfx10DispatchInitiatorPolicy::Legacy,
+            None,
+            Gfx11ComputeResourceLimitsPolicy::Legacy,
+            LegacyDependencyMode::ReleaseWait {
+                address: FENCE_ADDR,
+                next_epoch: 0,
+            },
+        );
+        commands.emit_entry_sentinel_reset().unwrap();
+        commands.wait_compute_idle().unwrap();
+        commands.wait_compute_idle().unwrap();
+
+        let dwords = commands.dwords().expect("legacy dwords");
+        // One fence is RELEASE_MEM (8 dwords) + WAIT_REG_MEM (7 dwords) = 15.
+        assert_eq!(dwords.len(), 15 * 3);
+        // Sentinel epoch 0, then dependency epochs 1 and 2.
+        assert_eq!(dwords[5], 0);
+        assert_eq!(dwords[12], 0);
+        assert_eq!(dwords[15 + 5], 1);
+        assert_eq!(dwords[15 + 12], 1);
+        assert_eq!(dwords[30 + 5], 2);
+        assert_eq!(dwords[30 + 12], 2);
+        // No CS_PARTIAL_FLUSH EVENT_WRITE on the selected path.
+        const EVENT_WRITE_IDLE: u32 = 0xc000_4600;
+        assert!(!dwords.contains(&EVENT_WRITE_IDLE));
+        assert_eq!(
+            commands.dependency_mode(),
+            Some(LegacyDependencyMode::ReleaseWait {
+                address: FENCE_ADDR,
+                next_epoch: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn gfx1010_release_wait_rejects_u32_epoch_overflow() {
+        let mut commands = Pm4Commands::new_with_dependency(
+            Pm4Architecture::Gfx10,
+            Pm4RegisterPolicy::Legacy,
+            Gfx10DispatchInitiatorPolicy::Legacy,
+            None,
+            Gfx11ComputeResourceLimitsPolicy::Legacy,
+            LegacyDependencyMode::ReleaseWait {
+                address: 0x1000,
+                next_epoch: u32::MAX,
+            },
+        );
+        let err = commands.wait_compute_idle().unwrap_err();
+        assert!(
+            err.contains("epoch overflow"),
+            "unexpected overflow error: {err}"
+        );
+    }
+
+    #[test]
+    fn gfx1010_release_wait_aba_reset_starts_each_stream_at_zero() {
+        // Two independently constructed immutable streams both begin with the
+        // sentinel epoch-0 fence, so a stale prior epoch cannot satisfy the
+        // next replay (reset-to-zero / ABA shape).
+        const FENCE_ADDR: u64 = 0xaaa0;
+        let mut first = Pm4Commands::new_with_dependency(
+            Pm4Architecture::Gfx10,
+            Pm4RegisterPolicy::Legacy,
+            Gfx10DispatchInitiatorPolicy::Legacy,
+            None,
+            Gfx11ComputeResourceLimitsPolicy::Legacy,
+            LegacyDependencyMode::ReleaseWait {
+                address: FENCE_ADDR,
+                next_epoch: 0,
+            },
+        );
+        first.emit_entry_sentinel_reset().unwrap();
+        first.wait_compute_idle().unwrap();
+
+        let mut second = Pm4Commands::new_with_dependency(
+            Pm4Architecture::Gfx10,
+            Pm4RegisterPolicy::Legacy,
+            Gfx10DispatchInitiatorPolicy::Legacy,
+            None,
+            Gfx11ComputeResourceLimitsPolicy::Legacy,
+            LegacyDependencyMode::ReleaseWait {
+                address: FENCE_ADDR,
+                next_epoch: 0,
+            },
+        );
+        second.emit_entry_sentinel_reset().unwrap();
+
+        let first_dwords = first.dwords().unwrap();
+        let second_dwords = second.dwords().unwrap();
+        assert_eq!(first_dwords[5], 0);
+        assert_eq!(second_dwords[5], 0);
+        assert_eq!(&first_dwords[..15], &second_dwords[..15]);
+        // First stream advanced past the sentinel; second is still at epoch 0.
+        assert_eq!(
+            first.dependency_mode(),
+            Some(LegacyDependencyMode::ReleaseWait {
+                address: FENCE_ADDR,
+                next_epoch: 1,
+            })
+        );
+        assert_eq!(
+            second.dependency_mode(),
+            Some(LegacyDependencyMode::ReleaseWait {
+                address: FENCE_ADDR,
+                next_epoch: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn default_dependency_mode_keeps_cs_partial_flush() {
+        let mut commands = Pm4Commands::new(
+            Pm4Architecture::Gfx10,
+            Pm4RegisterPolicy::Legacy,
+            Gfx10DispatchInitiatorPolicy::Legacy,
+            None,
+            Gfx11ComputeResourceLimitsPolicy::Legacy,
+        );
+        assert_eq!(
+            commands.dependency_mode(),
+            Some(LegacyDependencyMode::CsPartialFlush)
+        );
+        commands.emit_entry_sentinel_reset().unwrap();
+        commands.wait_compute_idle().unwrap();
+        let dwords = commands.dwords().unwrap();
+        // EVENT_WRITE CS_PARTIAL_FLUSH only — no RELEASE_MEM / WAIT_REG_MEM.
+        assert_eq!(dwords, &[0xc000_4600, 0x407]);
+    }
+
+    #[test]
+    fn sequence_hash_inputs_unchanged_by_dependency_mode() {
+        // Fence selection must not alter capture identity / sequence hashing.
+        let launches = [
+            RecordedHipLaunch {
+                kernel: "a".to_owned(),
+                artifact: None,
+                grid: [1, 2, 3],
+                block: [32, 1, 1],
+                shared_mem: 0,
+                grid_binding: None,
+                kernarg: vec![1, 2, 3, 4],
+                accesses: None,
+            },
+            RecordedHipLaunch {
+                kernel: "b".to_owned(),
+                artifact: None,
+                grid: [4, 5, 6],
+                block: [64, 1, 1],
+                shared_mem: 128,
+                grid_binding: None,
+                kernarg: vec![5, 6],
+                accesses: None,
+            },
+        ];
+        let hash = replay_sequence_hash(&launches);
+        assert_eq!(hash, replay_sequence_hash(launches.iter()));
+        assert_ne!(hash, 0);
+    }
+
+    #[test]
+    fn lfm_retained_effect_contracts() {
+        assert_eq!(expected_kernarg_bytes("conv1d_gated_decode_f32"), Some(48));
+        let conv = pointer_effects("conv1d_gated_decode_f32").expect("conv contract");
+        assert_eq!(conv.len(), 4);
+        assert_eq!(conv[0].offset, 0);
+        assert_eq!(conv[0].mode, RecordedAccessMode::Read);
+        assert_eq!(conv[1].offset, 8);
+        assert_eq!(
+            conv[1].mode,
+            RecordedAccessMode::Write,
+            "conv state @8 is RMW, recorded as write"
+        );
+        assert_eq!(conv[2].offset, 16);
+        assert_eq!(conv[2].mode, RecordedAccessMode::Read);
+        assert_eq!(conv[3].offset, 24);
+        assert_eq!(conv[3].mode, RecordedAccessMode::Write);
+
+        assert_eq!(expected_kernarg_bytes("attention_q8_0_kv"), Some(64));
+        let attn = pointer_effects("attention_q8_0_kv").expect("attn contract");
+        assert_eq!(attn.len(), 5);
+        assert_eq!(attn[0].offset, 0);
+        assert_eq!(attn[0].mode, RecordedAccessMode::Read);
+        assert_eq!(attn[1].offset, 8);
+        assert_eq!(attn[1].mode, RecordedAccessMode::Read);
+        assert_eq!(attn[2].offset, 16);
+        assert_eq!(attn[2].mode, RecordedAccessMode::Read);
+        assert_eq!(attn[3].offset, 24);
+        assert_eq!(attn[3].mode, RecordedAccessMode::Write);
+        assert_eq!(attn[4].offset, 32);
+        assert_eq!(attn[4].mode, RecordedAccessMode::Read);
+
+        assert!(expected_kernarg_bytes("unknown_kernel_xyz").is_none());
+        assert!(pointer_effects("unknown_kernel_xyz").is_none());
+    }
+
+    #[test]
     fn gfx1151_radiowave_symbols_keep_resource_contracts() {
         let gate = "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_all_buffer_gfx1151";
         let gate_hybrid = "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_hybrid_gfx1151";
@@ -4561,6 +5204,114 @@ mod tests {
         );
     }
 
+    // Fail if a codebook MoE kernel variant is added without resource-contract registration.
+    #[test]
+    fn codebook_moe_symbols_have_resource_contracts() {
+        let gate_up_effects = vec![read(0), read(8), read(16), write(24), write(32)];
+        let down_effects = vec![read(0), read(8), read(16), read(24), write(32)];
+        for (symbol, kernarg_bytes, effects) in [
+            (
+                "gemv_mq2g256_lloyd_moe_gate_up_k8_indexed",
+                48usize,
+                &gate_up_effects,
+            ),
+            (
+                "gemv_mq3g256_lloyd_moe_gate_up_k8_indexed",
+                48,
+                &gate_up_effects,
+            ),
+            (
+                "gemv_mq2g256gl_moe_gate_up_k8_indexed",
+                64,
+                &gate_up_effects,
+            ),
+            (
+                "gemv_mq3g256gl_moe_gate_up_k8_indexed",
+                80,
+                &gate_up_effects,
+            ),
+            (
+                "gemv_mq2g256_lloyd_moe_down_residual_scaled_k8_indexed",
+                48,
+                &down_effects,
+            ),
+            (
+                "gemv_mq2g256_lloyd_moe_down_residual_scaled_k8_indexed_r2",
+                48,
+                &down_effects,
+            ),
+            (
+                "gemv_mq2g256_lloyd_moe_down_residual_scaled_k8_indexed_r4",
+                48,
+                &down_effects,
+            ),
+            (
+                "gemv_mq3g256_lloyd_moe_down_residual_scaled_k8_indexed",
+                48,
+                &down_effects,
+            ),
+            (
+                "gemv_mq3g256_lloyd_moe_down_residual_scaled_k8_indexed_r2",
+                48,
+                &down_effects,
+            ),
+            (
+                "gemv_mq3g256_lloyd_moe_down_residual_scaled_k8_indexed_r4",
+                48,
+                &down_effects,
+            ),
+            ("gemv_mq3g256_lloyd_moe_ninepath_d4", 48, &down_effects),
+            (
+                "gemv_mq2g256gl_moe_down_residual_scaled_k8_indexed",
+                64,
+                &down_effects,
+            ),
+            (
+                "gemv_mq3g256gl_moe_down_residual_scaled_k8_indexed",
+                80,
+                &down_effects,
+            ),
+            // Batched-K4 prefill siblings. 52 B, NOT 48: the K_TOP scalar is
+            // exactly the kind of quiet ABI difference that makes a
+            // pattern-matched contract fail closed instead of loudly.
+            (
+                "gemv_mq2g256_lloyd_moe_gate_up_k8_indexed_batched_k4",
+                52,
+                &gate_up_effects,
+            ),
+            (
+                "gemv_mq3g256_lloyd_moe_gate_up_k8_indexed_batched_k4",
+                52,
+                &gate_up_effects,
+            ),
+            (
+                "gemv_mq2g256_lloyd_moe_down_residual_scaled_k8_indexed_batched_k4",
+                52,
+                &down_effects,
+            ),
+            (
+                "gemv_mq3g256_lloyd_moe_down_residual_scaled_k8_indexed_batched_k4",
+                52,
+                &down_effects,
+            ),
+        ] {
+            assert_eq!(expected_kernarg_bytes(symbol), Some(kernarg_bytes));
+            let got = pointer_effects(symbol).expect("codebook MoE pointer contract");
+            assert_eq!(got.len(), effects.len());
+            for (got_effect, want) in got.iter().zip(effects.iter()) {
+                assert_eq!(got_effect.offset, want.offset);
+                assert_eq!(got_effect.mode, want.mode);
+            }
+            // Offset 24 is Write for gate_up and Read for down/ninepath.
+            assert_eq!(got[3].offset, 24);
+            if symbol.contains("gate_up") {
+                assert_eq!(got[3].mode, RecordedAccessMode::Write);
+            } else {
+                assert_eq!(got[3].mode, RecordedAccessMode::Read);
+            }
+        }
+    }
+
     #[test]
     fn moe_shared_down_and_routed_gate_up_are_independent_siblings() {
         assert!(independent_sibling(
@@ -4629,6 +5380,8 @@ mod tests {
         assert!(
             !Pm4MidAcquirePolicy::WithoutMqRotate.acquire_between("mq_rotate_x", "gemv_hfq4g256")
         );
+        assert!(Pm4MidAcquirePolicy::RequiredOnly
+            .acquire_between("mq_rotate_x", "gemv_hfq4g256_multirow_r2"));
         assert!(Pm4MidAcquirePolicy::RequiredOnly
             .acquire_between("rmsnorm_f32", "rope_partial_halfsplit_f32"));
         assert!(Pm4MidAcquirePolicy::RequiredOnly
@@ -5486,11 +6239,11 @@ mod tests {
     }
 
     #[test]
-    fn pm4_packet_identity_fails_closed_for_phased_or_multiqueue() {
-        assert_eq!(pm4_packet_identity(1, 1), Some(1));
-        assert_eq!(pm4_packet_identity(1, 2), None);
-        assert_eq!(pm4_packet_identity(2, 1), None);
-        assert_eq!(pm4_packet_identity(2, 2), None);
+    fn pm4_packet_identity_reports_actual_count() {
+        // Phased multi-queue graphs legitimately carry barrier + IB packets per lane.
+        assert_eq!(pm4_packet_identity(0), None);
+        assert_eq!(pm4_packet_identity(1), Some(1));
+        assert_eq!(pm4_packet_identity(260), Some(260));
     }
 
     #[test]

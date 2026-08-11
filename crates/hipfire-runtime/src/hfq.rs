@@ -50,6 +50,37 @@ pub struct HfqTensorInfo {
     pub data_offset: usize,
     pub data_size: usize,
 }
+/// Ordered absolute tensor manifest entry for source identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HfqTensorManifestEntry {
+    pub name: String,
+    pub quant_type: u8,
+    pub shape: Vec<u32>,
+    pub group_size: u32,
+    pub data_offset: usize,
+    pub data_size: usize,
+}
+
+/// Exact immutable source seal for an HFQ file.
+///
+/// Equality is exact byte/field equality over canonical path, platform file
+/// identity (dev/ino), file length, mtime, arch, metadata_json, and the
+/// ordered absolute tensor manifest (name, quant_type, shape, group_size,
+/// data_offset, data_size). The opened base offset is captured through the
+/// absolute data_offset values. This is an immutable value; callers store it
+/// behind an `Arc` and never mutate it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HfqSourceIdentity {
+    pub canonical_path: std::path::PathBuf,
+    pub dev: u64,
+    pub ino: u64,
+    pub len: u64,
+    pub mtime_secs: i64,
+    pub mtime_nanos: u32,
+    pub arch_id: u32,
+    pub metadata_json: String,
+    pub manifest: Vec<HfqTensorManifestEntry>,
+}
 
 /// Author-recommended sampling defaults baked into a .hfq's
 /// `generation_config` metadata, surfaced by [`HfqFile::recommended_sampling`].
@@ -790,6 +821,67 @@ impl HfqFile {
     /// `tensor_data_vec`.
     pub fn tensors(&self) -> &[HfqTensorInfo] {
         &self.tensors
+    }
+
+    /// Compute the exact immutable source identity for this opened HFQ file.
+    ///
+    /// Equality is over canonical path, platform file identity (dev/ino on
+    /// Unix), file length, mtime, arch_id, exact metadata_json, and the
+    /// ordered absolute tensor manifest (name, quant_type, shape, group_size,
+    /// data_offset, data_size). The base offset is captured via the absolute
+    /// data_offset values. This must be called before any EP GPU allocation
+    /// so the admitted seal binds the exact bytes that will be loaded.
+    pub fn load_identity(&self) -> HipResult<HfqSourceIdentity> {
+        let canonical_path =
+            std::fs::canonicalize(&self.path).unwrap_or_else(|_| self.path.clone());
+        let meta = std::fs::metadata(&self.path).map_err(|e| {
+            HipError::new(
+                0,
+                &format!("HfqFile::load_identity: metadata({:?}): {}", self.path, e),
+            )
+        })?;
+        let len = meta.len();
+        #[cfg(unix)]
+        let (dev, ino) = {
+            use std::os::unix::fs::MetadataExt;
+            (meta.dev(), meta.ino())
+        };
+        #[cfg(not(unix))]
+        let (dev, ino) = (0u64, 0u64);
+        let (mtime_secs, mtime_nanos) = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| (d.as_secs() as i64, d.subsec_nanos()))
+            .unwrap_or((0, 0));
+        let manifest = self
+            .tensors
+            .iter()
+            .map(|t| HfqTensorManifestEntry {
+                name: t.name.clone(),
+                quant_type: t.quant_type,
+                shape: t.shape.clone(),
+                group_size: t.group_size,
+                data_offset: t.data_offset,
+                data_size: t.data_size,
+            })
+            .collect();
+        Ok(HfqSourceIdentity {
+            canonical_path,
+            dev,
+            ino,
+            len,
+            mtime_secs,
+            mtime_nanos,
+            arch_id: self.arch_id,
+            metadata_json: self.metadata_json.clone(),
+            manifest,
+        })
+    }
+
+    /// Convenience: load the source identity wrapped in an immutable `Arc`.
+    pub fn load_identity_arc(&self) -> HipResult<std::sync::Arc<HfqSourceIdentity>> {
+        self.load_identity().map(std::sync::Arc::new)
     }
 }
 

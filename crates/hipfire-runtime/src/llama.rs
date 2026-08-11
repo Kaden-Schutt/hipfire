@@ -5863,6 +5863,128 @@ impl KvCache {
         Ok(())
     }
 
+    /// Non-owning view of one lane inside a parent contiguous Q8 cache.
+    ///
+    /// `self` must have been allocated with total physical capacity
+    /// `lanes * lane_capacity`. The returned cache presents ordinary
+    /// single-sequence Q8 addressing, so existing prefill kernels can seed one
+    /// lane without copying weights or allocating a second cache. The view must
+    /// never be passed to [`KvCache::free_gpu`].
+    ///
+    /// Rejects asym / FWHT / INT8 / HFQ4 / VMM layouts rather than fabricating
+    /// support: continuous-batch only targets exact contiguous Q8 HIP.
+    pub fn q8_lane_view(&self, lane: usize, lane_capacity: usize) -> HipResult<Self> {
+        if !self.quant_q8
+            || self.quant_int8
+            || self.quant_hfq4
+            || self.quant_asym4
+            || self.quant_asym3
+            || self.quant_asym2
+            || self.quant_fwht
+            || self.v_mode != VMode::Q8
+            || lane_capacity == 0
+        {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "q8_lane_view requires a contiguous Q8 cache and non-zero lane capacity",
+            ));
+        }
+        if self.head_dim == 0 || !self.head_dim.is_multiple_of(32) {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "q8_lane_view requires head_dim divisible by 32 (got {})",
+                    self.head_dim
+                ),
+            ));
+        }
+        // Fail closed on VMM-backed parent storage: lane views only slice
+        // contiguous hipMalloc buffers via borrowed DeviceBuffer pointers.
+        for t in self.k_gpu.iter().chain(self.v_gpu.iter()) {
+            if t.buf.is_vmm_owner() {
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    "q8_lane_view does not support VMM-backed KV caches",
+                ));
+            }
+        }
+        let lane_end = lane
+            .checked_add(1)
+            .and_then(|n| n.checked_mul(lane_capacity))
+            .ok_or_else(|| hip_bridge::HipError::new(0, "q8_lane_view capacity overflow"))?;
+        if lane_end > self.physical_cap {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "q8_lane_view lane exceeds backing cache capacity",
+            ));
+        }
+        let blocks_per_pos = self
+            .n_kv_heads
+            .checked_mul(self.head_dim / 32)
+            .ok_or_else(|| hip_bridge::HipError::new(0, "q8_lane_view blocks_per_pos overflow"))?;
+        let bytes_per_pos = blocks_per_pos
+            .checked_mul(34)
+            .ok_or_else(|| hip_bridge::HipError::new(0, "q8_lane_view bytes_per_pos overflow"))?;
+        let byte_offset = lane
+            .checked_mul(lane_capacity)
+            .and_then(|n| n.checked_mul(bytes_per_pos))
+            .ok_or_else(|| hip_bridge::HipError::new(0, "q8_lane_view byte_offset overflow"))?;
+        let lane_bytes = lane_capacity
+            .checked_mul(bytes_per_pos)
+            .ok_or_else(|| hip_bridge::HipError::new(0, "q8_lane_view lane_bytes overflow"))?;
+        let lane_elems = Self::bytes_to_f32_elems("q8_lane_view lane", lane_bytes)?;
+        let view = |t: &GpuTensor| -> HipResult<GpuTensor> {
+            if t.numel() <= 1 {
+                // Filtered placeholder layer — keep a non-owning alias.
+                return Ok(t.shallow_clone());
+            }
+            let parent_bytes = t.buf.size();
+            let end = byte_offset.checked_add(lane_bytes).ok_or_else(|| {
+                hip_bridge::HipError::new(0, "q8_lane_view parent byte range overflow")
+            })?;
+            if end > parent_bytes {
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    "q8_lane_view lane byte range exceeds parent buffer",
+                ));
+            }
+            let ptr =
+                unsafe { (t.buf.as_ptr() as *mut u8).add(byte_offset) as *mut std::ffi::c_void };
+            Ok(GpuTensor {
+                buf: unsafe { hip_bridge::DeviceBuffer::from_raw(ptr, lane_bytes) },
+                shape: vec![lane_elems],
+                dtype: DType::F32,
+            })
+        };
+        let k_gpu = self.k_gpu.iter().map(view).collect::<HipResult<Vec<_>>>()?;
+        let v_gpu = self.v_gpu.iter().map(view).collect::<HipResult<Vec<_>>>()?;
+        Ok(Self {
+            k_gpu,
+            v_gpu,
+            k_scales: Vec::new(),
+            v_scales: Vec::new(),
+            kv_dim: self.kv_dim,
+            max_seq: lane_capacity,
+            physical_cap: lane_capacity,
+            n_kv_heads: self.n_kv_heads,
+            head_dim: self.head_dim,
+            quantized: true,
+            quant_q8: true,
+            quant_int8: false,
+            quant_hfq4: false,
+            quant_asym4: false,
+            quant_asym3: false,
+            quant_asym2: false,
+            boundary_layers: self.boundary_layers,
+            givens_cos: None,
+            givens_sin: None,
+            quant_fwht: false,
+            v_mode: VMode::Q8,
+            layer_is_boundary: self.layer_is_boundary.clone(),
+            compact_offset: 0,
+        })
+    }
+
     /// Check if a given KV layer ordinal is a boundary layer (first N + last N).
     pub fn is_boundary(&self, kv_ordinal: usize) -> bool {
         kv_ordinal < self.layer_is_boundary.len() && self.layer_is_boundary[kv_ordinal]
@@ -6196,14 +6318,26 @@ impl KvCache {
         let n = is_kv_layer.len();
         let mut k_gpu = Vec::with_capacity(n);
         let mut v_gpu = Vec::with_capacity(n);
-        for &is_kv in is_kv_layer {
-            if is_kv {
-                k_gpu.push(gpu.zeros(&[k_elems], DType::F32)?);
-                v_gpu.push(gpu.zeros(&[v_elems], DType::F32)?);
-            } else {
-                k_gpu.push(gpu.zeros(&[1], DType::F32)?);
-                v_gpu.push(gpu.zeros(&[1], DType::F32)?);
+        // Contiguous path mirrors alloc_k_v_vmm_filtered: on any mid-loop
+        // failure free every tensor already pushed so a partial build never
+        // leaks device memory (GpuTensor has no freeing Drop).
+        let result = (|| -> HipResult<()> {
+            for &is_kv in is_kv_layer {
+                if is_kv {
+                    k_gpu.push(gpu.zeros(&[k_elems], DType::F32)?);
+                    v_gpu.push(gpu.zeros(&[v_elems], DType::F32)?);
+                } else {
+                    k_gpu.push(gpu.zeros(&[1], DType::F32)?);
+                    v_gpu.push(gpu.zeros(&[1], DType::F32)?);
+                }
             }
+            Ok(())
+        })();
+        if let Err(err) = result {
+            for tensor in k_gpu.drain(..).chain(v_gpu.drain(..)) {
+                let _ = gpu.free_tensor(tensor);
+            }
+            return Err(err);
         }
         Ok((k_gpu, v_gpu))
     }
