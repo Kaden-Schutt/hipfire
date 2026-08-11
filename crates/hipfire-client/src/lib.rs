@@ -1481,17 +1481,12 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn jsonl_transport_frames_ping_and_unload() {
-        use std::os::unix::fs::PermissionsExt;
         let root = env::temp_dir().join(format!("hipfire-client-test-{}", std::process::id()));
-        fs::create_dir_all(&root).unwrap();
-        let daemon = root.join("daemon");
-        fs::write(
-            &daemon,
+        let daemon = write_fake_daemon(
+            &root,
             "#!/bin/sh\nwhile IFS= read -r line; do\n case \"$line\" in *'\"ping\"'*) echo '{\"type\":\"pong\"}' ;; *'\"unload\"'*) echo '{\"type\":\"unloaded\"}'; exit 0 ;; esac\ndone\n",
-        )
-        .unwrap();
-        fs::set_permissions(&daemon, fs::Permissions::from_mode(0o755)).unwrap();
-        let mut engine = Engine::spawn(&daemon, &BTreeMap::new()).unwrap();
+        );
+        let mut engine = spawn_fake_engine(&daemon);
         engine.ping().unwrap();
         engine.unload().unwrap();
         let _ = fs::remove_dir_all(root);
@@ -1500,19 +1495,14 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn configured_spawn_sends_process_policy_before_ping() {
-        use std::os::unix::fs::PermissionsExt;
         let root = env::temp_dir().join(format!(
             "hipfire-client-configured-test-{}",
             std::process::id()
         ));
-        fs::create_dir_all(&root).unwrap();
-        let daemon = root.join("daemon");
-        fs::write(
-            &daemon,
+        let daemon = write_fake_daemon(
+            &root,
             "#!/bin/sh\nconfigured=0\nwhile IFS= read -r line; do\n case \"$line\" in *'\"configure\"'*) if [ \"$HIP_VISIBLE_DEVICES\" = '0,1' ] && [ \"$ROCR_VISIBLE_DEVICES\" = '2,3' ]; then configured=1; echo '{\"type\":\"configured\"}'; else echo '{\"type\":\"error\",\"message\":\"device visibility is not synchronized\"}'; fi ;; *'\"ping\"'*) if [ \"$configured\" = 1 ]; then echo '{\"type\":\"pong\"}'; else echo '{\"type\":\"error\",\"message\":\"not configured\"}'; fi ;; *'\"unload\"'*) echo '{\"type\":\"unloaded\"}'; exit 0 ;; esac\ndone\n",
-        )
-        .unwrap();
-        fs::set_permissions(&daemon, fs::Permissions::from_mode(0o755)).unwrap();
+        );
         let mut layer = hipfire_config::ConfigLayer::default();
         layer.set_cli("hardware.devices", "2,3").unwrap();
         let resolved = hipfire_config::resolve([hipfire_config::NamedLayer {
@@ -1523,7 +1513,7 @@ mod tests {
         }])
         .unwrap();
         let config = hipfire_config::ProcessConfig::from_resolved(&resolved).unwrap();
-        let mut engine = Engine::spawn_configured(&daemon, &BTreeMap::new(), &config).unwrap();
+        let mut engine = spawn_fake_engine_configured(&daemon, &config);
         engine.ping().unwrap();
         engine.unload().unwrap();
         let _ = fs::remove_dir_all(root);
@@ -1974,7 +1964,7 @@ done
         )
         .unwrap();
         fs::set_permissions(&daemon, fs::Permissions::from_mode(0o755)).unwrap();
-        let mut engine = Engine::spawn(&daemon, &BTreeMap::new()).unwrap();
+        let mut engine = spawn_fake_engine(&daemon);
         engine.reset(5).unwrap();
         assert_eq!(engine.last_state_epoch(), Some(1));
         assert_eq!(engine.last_retry_reset_eligible(), Some(true));
@@ -2057,7 +2047,7 @@ done
         )
         .unwrap();
         fs::set_permissions(&daemon, fs::Permissions::from_mode(0o755)).unwrap();
-        let mut engine = Engine::spawn(&daemon, &BTreeMap::new()).unwrap();
+        let mut engine = spawn_fake_engine(&daemon);
         let loaded = engine
             .load(Path::new("/tmp/m.hfq"), serde_json::json!({}))
             .unwrap();
@@ -2152,6 +2142,35 @@ done
         }
         panic!(
             "spawn_fake_engine exhausted ETXTBSY retries: {}",
+            last.map(|e| e.to_string()).unwrap_or_default()
+        );
+    }
+
+    /// Same bounded ETXTBSY retry as `spawn_fake_engine`, for the configured path.
+    #[cfg(unix)]
+    fn spawn_fake_engine_configured(
+        daemon: &std::path::Path,
+        config: &hipfire_config::ProcessConfig,
+    ) -> Engine {
+        const ETXTBSY: i32 = 26;
+        const MAX_ATTEMPTS: usize = 8;
+        let mut last = None;
+        for attempt in 0..MAX_ATTEMPTS {
+            match Engine::spawn_configured(daemon, &BTreeMap::new(), config) {
+                Ok(engine) => return engine,
+                Err(ClientError::Spawn { source, path })
+                    if source.raw_os_error() == Some(ETXTBSY) =>
+                {
+                    last = Some(ClientError::Spawn { path, source });
+                    std::thread::sleep(std::time::Duration::from_millis(
+                        5u64.saturating_mul(1 + attempt as u64),
+                    ));
+                }
+                Err(err) => panic!("spawn_fake_engine_configured non-retryable: {err}"),
+            }
+        }
+        panic!(
+            "spawn_fake_engine_configured exhausted ETXTBSY retries: {}",
             last.map(|e| e.to_string()).unwrap_or_default()
         );
     }
